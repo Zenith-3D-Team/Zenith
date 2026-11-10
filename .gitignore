@@ -7,3 +7,7 @@ dist/
 
 # UI reference capture: its own Factorio config, write-data and save copies
 tools/ui_reference/run/
+docs/tracker/github.json
+
+# The modellers' folder (models/ beside Zenith): models being tried, not the project's own
+/models/

@@ -34,7 +34,9 @@ MODELS = os.path.join(REPO, "client", "assets", "models")
 OUT = os.path.join(REPO, "art-src", "compare")
 SOURCES = os.path.join(HERE, "model_sources.json")
 BLENDER = os.environ.get("BLENDER", r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe")
-FACTORIO = os.environ.get("FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio")
+sys.path.append(os.path.dirname(HERE))
+import factorio_install  # noqa: E402
+FACTORIO = factorio_install.install()
 WUBE_GENERATOR = "factorio-3d tools/models/wube.py"
 
 # compare.py arguments per building, copied from Factorio's prototype definitions

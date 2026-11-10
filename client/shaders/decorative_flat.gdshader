@@ -13,13 +13,18 @@ render_mode blend_mix, depth_draw_never, cull_disabled;
 
 uniform sampler2D atlas : source_color, filter_linear_mipmap_anisotropic, repeat_disable;
 
+// How level the hills are where the picture lies (ground_height.gdshaderinc): flat pictures
+// lying across a terrace's step would stretch down its side, so they fade out on steep ground.
+varying float level;
+
 void vertex() {
 	UV = vec2(INSTANCE_CUSTOM.x + UV.x * INSTANCE_CUSTOM.y, UV.y * INSTANCE_CUSTOM.z);
+	level = ground_n((MODEL_MATRIX * vec4(VERTEX, 1.0)).xz).y;
 	VERTEX = ground_lift(VERTEX, MODEL_MATRIX);
 }
 
 void fragment() {
 	vec4 c = texture(atlas, UV);
 	ALBEDO = c.rgb;
-	ALPHA = c.a;
+	ALPHA = c.a * smoothstep(0.75, 0.9, level);
 }

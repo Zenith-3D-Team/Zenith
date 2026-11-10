@@ -23,6 +23,7 @@ const Info := preload("res://scripts/ui/factorio/info_text.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
+const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 
 signal close_requested
 
@@ -151,9 +152,6 @@ var _bars := {}
 var _in_graph: Graph:
 	get:
 		return _sides[0]["graph"] if _sides.size() > 0 else null
-var _out_graph: Graph:
-	get:
-		return _sides[1]["graph"] if _sides.size() > 1 else null
 
 
 func _ready() -> void:
@@ -350,12 +348,12 @@ func toggle(new_kind: String, new_target := {}) -> void:
 	if visible and new_target == target and (kind == new_kind or (new_kind == "item" and kind in PRODUCTION)):
 		visible = false
 		return
-	var was_electric := kind == "electric"
+	var was_kind := kind
 	kind = new_kind
 	target = new_target
 	visible = true
-	if was_electric != (kind == "electric"):
-		graph_names = []
+	if new_kind != was_kind:
+		graph_names = []  # another kind's names (P's items asked for as K's kills drew nothing)
 	_rows = []
 	_storage = []
 	_setup()
@@ -422,10 +420,7 @@ func _setup() -> void:
 func _planet_texture(planet: String) -> Texture2D:
 	if planet in ["", "space"]:
 		return GuiAssets.data_sprite("space-age/graphics/icons/space-platform-hub.png")
-	var icon := GuiAssets.data_sprite("space-age/graphics/icons/%s.png" % planet)
-	if icon == null:
-		icon = GuiAssets.data_sprite("base/graphics/icons/%s.png" % planet)
-	return icon
+	return SpacePanels.planet_icon(planet)
 
 
 ## Factorio's size and place: centred, near the top, nearly the whole height.
@@ -436,6 +431,7 @@ func _layout() -> void:
 	custom_minimum_size = Vector2(w, maxf(h, Kit.px(400)))
 	size = custom_minimum_size
 	position = Vector2(roundf((view.x - size.x) / 2.0), minf(Kit.px(TOP), maxf(0.0, view.y - size.y)))
+	position += Vector2(get_meta("drag_offset", Vector2.ZERO))  # where its title bar was dragged (kit.gd)
 
 
 func _switch_tab(k: String) -> void:

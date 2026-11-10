@@ -17,6 +17,8 @@ extends RefCounted
 ## the shaders keep the map colour with procedural detail.
 
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ModFiles := preload("res://scripts/world/mod_files.gd")
+const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 
 const PX := 64  # Factorio's high-resolution tiles: 64 px each (scale 0.5 of 128 px/tile)
@@ -147,6 +149,13 @@ static var _loaded := {}  # tile name -> Image (or null), written by the workers
 static var _loaded_mutex := Mutex.new()
 ## Goes up whenever lookup() can answer more tiles than before.
 static var generation := 0
+## Goes up when tiles' layers change under meshes already built (a trim, or a graphics list that
+## gives pictures to tiles drawn in map colours): world.gd's kept terrain meshes are then stale.
+static var layout := 0
+static var _list_generation := 0  # ModGraphics.generation last seen
+## Set when a new list dropped tiles drawn in map colours: world.gd builds every chunk's ground
+## again (and clears it), as those chunks aren't waiting for a picture.
+static var relook := false
 static var _changed := false
 
 
@@ -165,6 +174,20 @@ static func lookup(tile_name: String) -> TileGfx:
 	if not disabled and ItemIcons.factorio_data_dir() != "":
 		_read_defs()
 		block = _defs.get(tile_name, "")
+	var rec := _record(tile_name)
+	if not rec.is_empty():
+		# The bridge's list (mod_graphics.gd): a mod's tile, read from the mod's own files.
+		var group := str(rec.get("group", "ground-natural"))
+		g.water = g.water or int(rec.get("water", 0)) == 1
+		g.priority = int(GROUP_RANK.get(group, 2)) * 1000 + int(rec.get("layer", 0))
+		g.spills = group in ["ground-natural", "zero", "water-overlay"]
+		if _images.size() + _pending.size() >= MAX_LAYERS:
+			push_warning("Terrain textures: no room for %s (%d kinds of ground in use)" % [tile_name, MAX_LAYERS])
+			_gfx[tile_name] = g
+			_changed = true
+			return g
+		_pending[tile_name] = [WorkerThreadPool.add_task(_load_record.bind(g, rec)), g]
+		return null
 	if block != "":
 		var group := _str(block, "layer_group", "water" if g.water else "ground-natural")
 		g.priority = int(GROUP_RANK.get(group, 2)) * 1000 + int(_layer_of.get(tile_name, 0))
@@ -184,6 +207,9 @@ static func lookup(tile_name: String) -> TileGfx:
 static func is_water_tile(tile_name: String) -> bool:
 	if "water" in tile_name or tile_name in WATER_NAMES:
 		return true
+	var rec := _record(tile_name)
+	if not rec.is_empty():
+		return int(rec.get("water", 0)) == 1
 	if disabled or ItemIcons.factorio_data_dir() == "":
 		return false
 	_read_defs()
@@ -192,17 +218,46 @@ static func is_water_tile(tile_name: String) -> bool:
 
 ## After a surface change, once the chunks drawn with them are gone: forgets every layer if many
 ## are in use, so the new surface's ground has room. Pictures still being read land in the new
-## table. True if it dropped them.
-static func trim() -> bool:
+## table. True if it dropped them. A surface seen before (`next_surface`, note()) whose ground
+## fits beside the layers loaded keeps them: going in and out of a Factorissimo building (Nauvis'
+## 39 kinds of ground with Space Exploration, the factory floor's 4) dropped and read them all
+## again on every door, and its terrain meshes kept (world.gd) with them.
+static func trim(next_surface := -1) -> bool:
 	if _images.size() < TRIM_LAYERS:
 		return false
+	var seen: Dictionary = _seen_on.get(next_surface, {})
+	if not seen.is_empty():
+		var more := 0
+		for tile_name in seen:
+			if not _gfx.has(tile_name) and not _pending.has(tile_name):
+				more += 1
+		if _images.size() + _pending.size() + more <= MAX_LAYERS:
+			return false
 	_gfx.clear()
 	_images.clear()
 	_infos = PackedColorArray()
 	_reflects = PackedFloat32Array()
 	_changed = true
 	generation += 1
+	layout += 1
 	return true
+
+
+## The kinds of ground each surface has shown: surface index -> {tile name: true}.
+static var _seen_on := {}
+
+
+## A chunk of `surface` has this kind of ground (world.gd, as chunks arrive).
+static func note(surface: int, tile_name: String) -> void:
+	var seen: Dictionary = _seen_on.get(surface, {})
+	if seen.is_empty():
+		_seen_on[surface] = seen
+	seen[tile_name] = true
+
+
+## Another game: no surface's ground is known.
+static func forget_surfaces() -> void:
+	_seen_on.clear()
 
 
 ## How many layers are in use (for tests).
@@ -215,6 +270,124 @@ static func peek(tile_name: String) -> TileGfx:
 	return _gfx.get(tile_name)
 
 
+## The bridge's record for a tile when it should be drawn from it: a tile the game's own Lua files
+## don't define (a mod's), or one a mod has given pictures from outside the built-in mods. The
+## built-in tiles keep the path tuned for them (copies of water, frozen floors). {} for none.
+static func _record(tile_name: String) -> Dictionary:
+	if disabled:
+		return {}
+	var rec = ModGraphics.tiles.get(tile_name)
+	if not rec is Dictionary:
+		return {}
+	# Whether the game's own files define it decides which path draws it, so read them first:
+	# is_water_tile() asks before lookup() has, and a built-in tile taken for a mod's got the list's
+	# water flag (empty space round every platform drawn as water).
+	if ItemIcons.factorio_data_dir() != "":
+		_read_defs()
+	if _defs.has(tile_name):
+		var first := ""
+		if rec.get("mat") is Array:
+			first = str(rec.mat[0])
+		elif rec.get("main") is Array and not (rec.main as Array).is_empty():
+			first = str(rec.main[0][0])
+		if ModFiles.split(first)[0] in ModFiles.BUILT_IN:
+			return {}
+	return rec
+
+
+static func _load_record(g: TileGfx, rec: Dictionary) -> void:
+	var t0 := Time.get_ticks_msec()
+	var image := _build_layer_from_record(g, rec)
+	_loaded_mutex.lock()
+	_loaded[g.name] = image
+	_loaded_mutex.unlock()
+	if image != null:
+		print_verbose("Terrain: %s from its mod's graphics (layer %d, %d ms)" % [g.name, g.priority, Time.get_ticks_msec() - t0])
+
+
+## One layer from the bridge's record (gfx_extract.lua's tile format), as _build_layer does from
+## the Lua files. Pictures drawn at another scale than Factorio's usual 0.5 (64 px a tile) are
+## resized to it.
+static func _build_layer_from_record(g: TileGfx, rec: Dictionary) -> Image:
+	var layer := Image.create_empty(COLS * PX, ROWS * PX, false, Image.FORMAT_RGBA8)
+	if rec.get("fx") is String:
+		var effect := _sheet(str(rec.fx))
+		var mc := Color.BLACK
+		if rec.get("map") is Array and (rec.map as Array).size() >= 3:
+			mc = Color(float(rec.map[0]), float(rec.map[1]), float(rec.map[2]))
+		if effect != null and _effect_into(g, layer, effect, mc):
+			return _finish_layer(layer)
+	var any := false
+	if rec.get("mat") is Array and (rec.mat as Array).size() >= 2:
+		var m: Array = rec.mat
+		var sheet := _scaled(_sheet(str(m[0])), float(m[2]) if m.size() > 2 else 0.5)
+		var count := int(m[1])
+		if sheet == null or count <= 0:
+			return null
+		var w := sheet.get_width() / count / PX
+		var h := sheet.get_height() / PX
+		if w <= 0 or h <= 0 or w > COLS or h > ROWS:
+			return null
+		var per_row := COLS / w
+		count = mini(count, per_row * (ROWS / h))
+		for v in count:
+			layer.blit_rect(sheet, Rect2i(v * w * PX, 0, w * PX, h * PX), Vector2i((v % per_row) * w, (v / per_row) * h) * PX)
+		g.material = Vector2i(w, h)
+		g.material_count = count
+		any = true
+	elif rec.get("main") is Array:
+		var by_size := {}
+		for e in rec.main:
+			if e is Array and (e as Array).size() >= 8:
+				var sz := int(e[2])
+				if sz in [1, 2, 4] and not by_size.has(sz):
+					by_size[sz] = e
+		var sheets := {}
+		for sz in [4, 2, 1]:
+			if not by_size.has(sz):
+				continue
+			var e: Array = by_size[sz]
+			var scale := float(e[8]) if e.size() > 8 else 1.0
+			var key := "%s@%s" % [e[0], scale]
+			if not sheets.has(key):
+				sheets[key] = _scaled(_sheet(str(e[0])), scale)
+			var sheet: Image = sheets[key]
+			if sheet == null:
+				continue
+			var k := 2.0 * scale  # source pixels to ours
+			var count := mini(16, int(e[1]))
+			var x0 := roundi(float(e[3]) * k)
+			var y0 := roundi(float(e[4]) * k)
+			var line := maxi(1, int(e[5]))
+			var placed := 0
+			for v in count:
+				var src := Vector2i(x0 + (v % line) * sz * PX, y0 + (v / line) * sz * PX)
+				if src.x + sz * PX > sheet.get_width() or src.y + sz * PX > sheet.get_height():
+					break
+				layer.blit_rect(sheet, Rect2i(src, Vector2i(sz, sz) * PX), _slot_px(sz, v))
+				placed += 1
+			if placed > 0:
+				var weights := PackedFloat32Array()
+				if e[7] is Array:
+					for wv in e[7]:
+						weights.append(float(wv))
+				g.sizes.append([sz, float(e[6]) if sz > 1 else 1.0, _cumulative(weights, placed), placed])
+				any = true
+	if not any:
+		return null
+	_fill_empty_slots(layer)
+	return _finish_layer(layer)
+
+
+## A sheet drawn at `scale` brought to Factorio's usual 0.5 (64 px a tile).
+static func _scaled(sheet: Image, scale: float) -> Image:
+	if sheet == null or is_equal_approx(scale, 0.5) or scale <= 0.0:
+		return sheet
+	var k := 2.0 * scale
+	sheet.resize(maxi(1, roundi(sheet.get_width() * k)), maxi(1, roundi(sheet.get_height() * k)), Image.INTERPOLATE_BILINEAR)
+	return sheet
+
+
 static func _load(g: TileGfx, block: String) -> void:
 	var t0 := Time.get_ticks_msec()
 	var image := _build_layer(g, block)
@@ -222,12 +395,21 @@ static func _load(g: TileGfx, block: String) -> void:
 	_loaded[g.name] = image
 	_loaded_mutex.unlock()
 	if image != null:
-		print("Terrain: %s from Factorio's graphics (layer %d, %d ms)" % [g.name, g.priority, Time.get_ticks_msec() - t0])
+		print_verbose("Terrain: %s from Factorio's graphics (layer %d, %d ms)" % [g.name, g.priority, Time.get_ticks_msec() - t0])
 
 
 ## Hands out the pictures read since the last call and puts them on the GPU. Main thread, once a
 ## frame. True when lookup() can answer more tiles than before.
 static func poll() -> bool:
+	if _list_generation != ModGraphics.generation:
+		# A graphics list arrived: tiles drawn in their map colour so far may have pictures now.
+		_list_generation = ModGraphics.generation
+		for tile_name in _gfx.keys():
+			if (_gfx[tile_name] as TileGfx).layer < 0:
+				_gfx.erase(tile_name)
+				_changed = true
+				relook = true
+				layout += 1
 	for tile_name in _pending.keys():
 		var task: int = _pending[tile_name][0]
 		if not WorkerThreadPool.is_task_completed(task):
@@ -431,18 +613,8 @@ static func _str(block: String, key: String, default: String) -> String:
 	return m.get_string(1) if m != null else default
 
 
-static func _path(lua_path: String) -> String:
-	var m := RegEx.create_from_string("^__(.+?)__/(.*)$").search(lua_path)
-	if m == null:
-		return ""
-	return ItemIcons.factorio_data_dir().path_join(m.get_string(1)).path_join(m.get_string(2))
-
-
 static func _sheet(lua_path: String, tint := Color.WHITE) -> Image:
-	var path := _path(lua_path)
-	if path == "" or not FileAccess.file_exists(path):
-		return null
-	var image := Image.load_from_file(path)
+	var image := ModFiles.load_image(lua_path)
 	if image == null:
 		return null
 	image.convert(Image.FORMAT_RGBA8)
@@ -470,26 +642,8 @@ static func _build_layer(g: TileGfx, block: String) -> Image:
 	var template := RegEx.create_from_string("\\w*template\\w*\\(\\s*\"([^\"]+)\"").search(block)
 	var main := RegEx.create_from_string("main\\s*=\\s*\\{").search(block)
 	var effect := _effect_picture(block)
-	if effect != null:
-		# Gleba's wetlands and Aquilo's brash ice: Factorio draws them with its water shader from
-		# one seamless picture (2048 x 1024: 32 x 16 tiles, the whole layer).
-		var w := mini(effect.get_width() / PX, COLS)
-		var h := mini(effect.get_height() / PX, ROWS)
-		if w > 0 and h > 0:
-			# Several tiles share a picture and the shader sets each one's shade (light and dark
-			# dead skin, the deep lake): their map colours say how light, so the picture is
-			# scaled to that (Factorio's ground draws about MAP_TO_GROUND times its map colour).
-			var target := _luma(_rgb(_str_table(block, "map_color"))) * MAP_TO_GROUND
-			var own := _mean_luma(effect)
-			if target > 0.0 and own > 0.0:
-				effect.adjust_bcs(clampf(target / own, 0.3, 1.5), 1.0, 1.0)
-			layer.blit_rect(effect, Rect2i(0, 0, w * PX, h * PX), Vector2i.ZERO)
-			g.material = Vector2i(w, h)
-			g.material_count = 1
-			g.reflect = MURKY_REFLECT
-			# No _fill_empty_slots: the picture fills the layer, and its alpha (a mask for
-			# Factorio's shader, often under a half) would pass for empty slots.
-			return _finish_layer(layer)
+	if effect != null and _effect_into(g, layer, effect, _rgb(_str_table(block, "map_color"))):
+		return _finish_layer(layer)
 	if mat != null:
 		var sheet := _sheet(mat.get_string(1) if mat.get_string(1) != "" else mat.get_string(3))
 		var count := int(mat.get_string(2) if mat.get_string(2) != "" else mat.get_string(4))
@@ -572,6 +726,29 @@ static func _build_layer(g: TileGfx, block: String) -> Image:
 	return _finish_layer(layer)
 
 
+## Gleba's wetlands and Aquilo's brash ice: Factorio draws them with its water shader from one
+## seamless picture (2048 x 1024: 32 x 16 tiles, the whole layer). False if it doesn't fit.
+static func _effect_into(g: TileGfx, layer: Image, effect: Image, map_color: Color) -> bool:
+	var w := mini(effect.get_width() / PX, COLS)
+	var h := mini(effect.get_height() / PX, ROWS)
+	if w <= 0 or h <= 0:
+		return false
+	# Several tiles share a picture and the shader sets each one's shade (light and dark dead
+	# skin, the deep lake): their map colours say how light, so the picture is scaled to that
+	# (Factorio's ground draws about MAP_TO_GROUND times its map colour).
+	var target := _luma(map_color) * MAP_TO_GROUND
+	var own := _mean_luma(effect)
+	if target > 0.0 and own > 0.0:
+		effect.adjust_bcs(clampf(target / own, 0.3, 1.5), 1.0, 1.0)
+	layer.blit_rect(effect, Rect2i(0, 0, w * PX, h * PX), Vector2i.ZERO)
+	g.material = Vector2i(w, h)
+	g.material_count = 1
+	g.reflect = MURKY_REFLECT
+	# No _fill_empty_slots: the picture fills the layer, and its alpha (a mask for Factorio's
+	# shader, often under a half) would pass for empty slots.
+	return true
+
+
 ## The picture of the tile's effect, when that is a "wetland-water" water shader with one.
 static func _effect_picture(block: String) -> Image:
 	var effect_name := _str(block, "effect", "")
@@ -599,6 +776,10 @@ static func _finish_layer(layer: Image) -> Image:
 	layer.convert(Image.FORMAT_RGB8)
 	layer.generate_mipmaps()
 	if _compress != 0:
+		# On the CPU (project.godot: rendering/textures/vram_compression/compress_with_gpu=false).
+		# Godot 4.7.2's GPU compressor (Betsy) runs as a pool task that, while it waits, can run
+		# this very task on its own thread, which then waits for Betsy for ever: the client froze
+		# loading or quitting, no CPU used (on 4 threads all of Zenith's tasks share one slot).
 		var err := layer.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_SRGB)
 		_compress = 1 if err == OK else 0
 	return layer

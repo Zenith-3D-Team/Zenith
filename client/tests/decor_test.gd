@@ -7,6 +7,7 @@ extends Node3D
 
 const Decoratives := preload("res://scripts/world/decoratives.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 
 var fails := 0
 
@@ -39,6 +40,7 @@ func _ready() -> void:
 			"pics": [["base/graphics/decorative/test.png", 0, 0, 32, 32, 0.5, 0.1, 0]]},
 		"no-pictures": {"layer": "decorative", "box": [-0.5, -0.5, 0.5, 0.5], "pics": [["base/graphics/decorative/missing.png", 0, 0, 8, 8, 1, 0, 0]]},
 	}
+	Decoratives._index_generation = ModGraphics.generation
 	var world := FakeWorld.new()
 	add_child(world)
 	world.chunks[Vector2i(0, 0)] = true
@@ -75,6 +77,7 @@ func _ready() -> void:
 	Decoratives._flat_order = {}
 	Decoratives._index = {"a-decal": {"layer": "decals"}, "b-floor": {"layer": "floor"}, "c-plant": {"layer": "decorative"},
 		"d-standing": {"layer": "object"}}
+	Decoratives._index_generation = ModGraphics.generation
 	var order := [Decoratives._flat_priority("a-decal"), Decoratives._flat_priority("b-floor"), Decoratives._flat_priority("c-plant")]
 	check(flat != null and upright != null and order[0] < order[1] and order[1] < order[2] and order[2] < 0
 		and order[0] >= Material.RENDER_PRIORITY_MIN,
@@ -87,6 +90,7 @@ func _ready() -> void:
 			"pics": [["base/graphics/decorative/test.png", 0, 0, 32, 32, 0.5, 0.1, 0]]},
 		"no-pictures": {"layer": "decorative", "box": [-0.5, -0.5, 0.5, 0.5], "pics": [["base/graphics/decorative/missing.png", 0, 0, 8, 8, 1, 0, 0]]},
 	}
+	Decoratives._index_generation = ModGraphics.generation
 
 	d.set_options(true, 0.5)
 	d.finish_jobs()
@@ -111,6 +115,28 @@ func _ready() -> void:
 	d.finish_jobs()
 	check(_instances(d) == 1, "a good list after bad ones draws: %d" % _instances(d))
 
+	# Another surface of the same game: the mod sends no `dprotos` for it, so the names stay.
+	d.reset(true)
+	d.handle({"t": "dec", "cx": 1, "cy": 0, "part": 1, "parts": 1, "l": [1, 2, 3, 4]})
+	d.finish_jobs()
+	check(_instances(d) == 1, "after a surface change the decoratives' names stay: %d" % _instances(d))
+	# A build still running when the world is dropped never shows on the new one, even over a chunk
+	# at the same place that has nothing.
+	d.handle({"t": "dec", "cx": 0, "cy": 0, "part": 1, "parts": 1, "l": [1, 3, 3, 1]})
+	d.reset(true)
+	d.handle({"t": "dec", "cx": 0, "cy": 0, "part": 1, "parts": 1, "l": {}})
+	d.finish_jobs()
+	check(_instances(d) == 0, "an old build doesn't show after a reset: %d" % _instances(d))
+	# A new game forgets the names until its own `dprotos`.
+	d.reset()
+	d.handle({"t": "dec", "cx": 1, "cy": 0, "part": 1, "parts": 1, "l": [1, 2, 3, 4]})
+	d.finish_jobs()
+	check(_instances(d) == 0, "a new game's ids aren't the last game's")
+	d.handle({"t": "dprotos", "l": [[1, "green-carpet-grass"]]})
+	d.handle({"t": "dec", "cx": 1, "cy": 0, "part": 1, "parts": 1, "l": [1, 2, 3, 4]})
+	d.finish_jobs()
+	check(_instances(d) == 1, "then its own: %d" % _instances(d))
+
 	# A chunk the world no longer has is dropped.
 	world.chunks.erase(Vector2i(1, 0))
 	d._sweep = 10.0
@@ -125,7 +151,8 @@ func _ready() -> void:
 func _instances(d: Node) -> int:
 	var n := 0
 	for inst in _all(d):
-		if not inst.is_queued_for_deletion() and not inst.get_parent().is_queued_for_deletion():
+		# A world left is hidden at once and freed over the next frames (decoratives.gd _freeing).
+		if not inst.is_queued_for_deletion() and not inst.get_parent().is_queued_for_deletion() and not d._freeing.has(inst.get_parent()):
 			n += inst.multimesh.instance_count
 	return n
 

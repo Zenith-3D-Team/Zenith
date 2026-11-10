@@ -68,11 +68,25 @@ data:extend({
     order = "f",
   },
   {
+    type = "bool-setting",
+    name = "f3d-act-as-player",
+    setting_type = "runtime-global",
+    default_value = true,
+    order = "h",
+  },
+  {
     type = "string-setting",
     name = "f3d-player",
     setting_type = "runtime-global",
     default_value = "",
     allow_blank = true,
     order = "g",
+  },
+  {
+    type = "bool-setting",
+    name = "f3d-zenith-button",
+    setting_type = "runtime-per-user",
+    default_value = true,
+    order = "z",
   },
 })

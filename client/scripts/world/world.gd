@@ -5,7 +5,9 @@ extends Node3D
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const ChunkView := preload("res://scripts/world/chunk_view.gd")
 const Anim := preload("res://scripts/world/anim.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const TerrainMesher := preload("res://scripts/world/terrain_mesher.gd")
 const TerrainTextures := preload("res://scripts/world/terrain_textures.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
@@ -18,34 +20,38 @@ const SUBSCRIBE_REFRESH := 5.0  # resend the subscription now and then in case i
 ## drawn: walking at a long view distance, every chunk edge crossed asked for a whole new row (29
 ## at Ultra), which arrived and was built together and stuttered (owner's desktop, 18 fps running).
 ## While the focus moves at most STREAM_MOVING chunks are on their way, standing STREAM_STILL (the
-## first load), checked every STREAM_STEP seconds.
+## first load), checked every STREAM_STEP seconds, or sooner standing once they are all drawn.
 const STREAM_MOVING := 8
 const STREAM_STILL := 32
 const STREAM_STEP := 0.15
+const STREAM_STEP_QUICK := 0.03  # standing, once every chunk on its way is drawn (_all_came)
+## Chunks kept after they leave the view (their messages as they came), so coming back needs no
+## snapshot: the bridge answers `same` when the chunk hasn't changed since (its change count and
+## entity count match: world.lua M.rev). The most kept, oldest dropped first, and none older than
+## CACHE_AGE_MSEC (what changes without an event, a furnace's recipe from its ore, heals by then).
+const CACHE_CHUNKS := 1500
+const CACHE_AGE_MSEC := 600000
 const MOVING_FOR := 1.5  # seconds after the focus last changed chunk that it counts as moving
+const JUMP_CHUNKS := 3  # the focus changing chunk by more than this is a jump, not moving
 const FOCUS_INTERVAL := 0.25
+# Main-thread time a frame may spend rebuilding chunks' entities is their slice in frame_budget.gd
+# (`build`, at least one rebuilt): a busy chunk takes 10-30 ms, and six of them in a frame made
+# walking into a big base stutter.
 const REBUILDS_PER_FRAME := 6
-# Main-thread time a frame may spend rebuilding chunks' entities (at least one is rebuilt): a busy
-# chunk takes 10-30 ms, and six of them in a frame made walking into a big base stutter.
-const REBUILD_USEC := 6000
-## Message handling (Bridge) and chunk rebuilds share this much of a frame: walking into new chunks
-## on the owner's save, both at their own full allowance plus everything else made 20 ms frames.
-## Rebuilds get what handling left, at least REBUILD_MIN_USEC so chunks keep coming.
+## With --frame-budget=separate (the old slices, for comparing), message handling (Bridge) and
+## chunk rebuilds share this much of a frame: walking into new chunks on the owner's save, both at
+## their own full allowance plus everything else made 20 ms frames. Rebuilds get what handling
+## left, at least the build's floor in frame_budget.gd, so chunks keep coming.
 const FRAME_WORK_USEC := 7000
-const REBUILD_MIN_USEC := 1500
 # New MultiMeshes a frame may add, in their meshes' surfaces (ChunkView.Budget): what the renderer
 # takes on outside any script. A chunk's MultiMeshes drawn before are filled again in place, and
 # don't count.
 const NEW_SURFACES := 160
-# Main-thread time a frame may spend freeing chunks no longer wanted (at least one).
-const UNLOAD_USEC := 1500
 # Terrain meshes take 4-6 ms each with Factorio's tile textures and transitions, and come in
 # bursts (a chunk arriving also rebuilds its neighbours), so they're built on worker threads
 # (terrain_mesher.gd): this many at once, chunks without ground first, nearest first. Two a frame
 # on the main thread left holes for seconds on a big base and made the frames that built them slow.
 const TERRAIN_JOBS := 4
-# Main-thread time a frame may spend turning finished jobs into meshes.
-const TERRAIN_APPLY_USEC := 3000
 # A chunk still empty this long after subscribing was lost along with whatever resync should
 # have recovered it (a gap can't say which chunks it hit). Asking again for one still on its way
 # costs nothing: the mod queues each chunk once. Not waiting for the stream to go quiet: on a
@@ -81,7 +87,7 @@ var focus_radius := 96
 var remote_view := false
 ## The sun, whose shadow map decides which chunks cast shadows (_update_shadow_casters).
 var sun: DirectionalLight3D
-## Chunks that cast shadows now (for --perf probes and the UI test).
+## Chunks that cast shadows now (for --stutter-probe and the UI test).
 var shadow_casters := 0
 var _shadow_key: Array = []
 
@@ -95,11 +101,16 @@ var _cargo := {}  # key of a hub, cargo bay or landing pad -> Rect2i of its tile
 var _cargo_tiles := {}  # Vector2i tile -> how many of them cover it
 var _cargo_ghosts := {}  # the same for ghosts of them: ghost bays join each other, built ones don't
 var _cargo_ghost_tiles := {}
+## Hubs, bays and pads whose record left with its unloaded chunk: key -> that chunk. Their area is
+## kept, so the bays next door stay framed as last seen, and goes when the chunk is drawn again
+## (_on_chunk), so one mined meanwhile no longer frames its neighbours as joined.
+var _cargo_left := {}
 ## Keys of remnants (ModelLibrary.REMNANT_TYPES): building over one removes it in the game, which
 ## raises no event, so a new entity clears those under it here (_clear_remnants_under).
 var _remnants := {}
 var working := {}  # unit -> 0/1
-## Turns moving parts and fades glows in the chunks near the focus.
+## Machines' moving parts and glows: written as states change for the shader to move, everywhere;
+## turret heads, collectors' arms and worms moved here each frame near the camera (anim.gd).
 var animator := Anim.new()
 ## Far chunks' buildings merged into one mesh each.
 var far_chunks := FarChunks.new()
@@ -115,7 +126,15 @@ var _dirty := {}  # Vector2i -> true
 var _pending := {}  # Vector2i -> true: chunks built with MultiMeshes still to add (ChunkView.pending)
 var _unloaded: Array = []  # ChunkViews no longer wanted, still to free
 var _dirty_terrain := {}
-var _terrain_jobs := {}  # Vector2i -> [task id, TerrainMesher, ChunkView]
+var _terrain_jobs := {}  # Vector2i -> [task id, TerrainMesher, ChunkView, signature, own signature]
+## Terrain meshes kept by Vector3i(surface index, cx, cy): [signature, ArrayMesh, variant slots,
+## its own tiles' signature], oldest first. A chunk drawn again with the same ground round it (back
+## from another surface, a factory building's inside, or walking back) takes its mesh from here
+## instead of a worker's 4-6 ms; the signature hashes the 3x3 chunks' tiles and the picture layers'
+## layout, so a changed tile or neighbour builds it again. Only meshes with every picture loaded
+## are kept.
+var _terrain_cache := {}
+const TERRAIN_CACHE := 1200
 ## Chunks drawn without some tile pictures, which were still loading: Vector2i -> missing ids.
 var _waiting_gfx := {}
 ## Per tile id, the graphics terrain jobs use (TerrainMesher.gfx_of). Replaced, never changed,
@@ -126,16 +145,19 @@ var _watchdog_timer := 0.0
 ## Terrain builds so far, their main-thread time and their time on worker threads (for
 ## --terrain-probe).
 var terrain_builds := 0
+var terrain_cache_hits := 0
 var terrain_build_usec := 0
 var terrain_worker_usec := 0
 var entity_builds := 0
 var entity_build_usec := 0
-## Main-thread time by part of this node's _process, microseconds so far (for --stutter-probe).
+## Main-thread time by part of this node's _process, microseconds so far (for --stutter-probe:
+## kept only while it runs, Probing.on).
 var prof := {}
 
 
 func _prof(key: String, t0: int) -> void:
-	prof[key] = int(prof.get(key, 0)) + Time.get_ticks_usec() - t0
+	if Probing.on:
+		prof[key] = int(prof.get(key, 0)) + Time.get_ticks_usec() - t0
 
 
 func _ready() -> void:
@@ -171,8 +193,9 @@ static func chunk_of(pos: Vector2) -> Vector2i:
 	return Vector2i(floori(pos.x / CHUNK), floori(pos.y / CHUNK))
 
 
-## Forgets the world. A surface change (`surface`) keeps the prototype dictionaries.
-func reset(keep_protos := false) -> void:
+## Forgets the world. A surface change (`surface`) keeps the prototype dictionaries; `next_surface`
+## is the surface coming (its index), whose ground pictures may still be loaded.
+func reset(keep_protos := false, next_surface := -1) -> void:
 	# Hidden now and freed over the next frames (_free_unloaded): freeing all 441 at once after a
 	# respawn or a surface change took a quarter of a second.
 	for cv in chunks.values():
@@ -188,21 +211,28 @@ func reset(keep_protos := false) -> void:
 	_cargo_tiles.clear()
 	_cargo_ghosts.clear()
 	_cargo_ghost_tiles.clear()
+	_cargo_left.clear()
+	_remnants.clear()
 	working.clear()
 	_stated.clear()
 	animator.reset()
 	if not keep_protos:
 		protos.clear()
+		_cache.clear()  # another game, or its prototype ids: nothing kept is valid
+		_terrain_cache.clear()
+		TerrainTextures.forget_surfaces()
+	_filling.clear()
 	_subscribed = []
 	_asked = {}
 	_coming = {}
+	_moved_msec = 0  # a new world loads as a standing start, walked into a door or not
 	_dirty.clear()
 	_pending.clear()
 	_partial.clear()
 	_dirty_terrain.clear()
 	_waiting_gfx.clear()
 	# Every chunk drawn with the old surface's ground is gone: room for the new one's.
-	TerrainTextures.trim()
+	TerrainTextures.trim(next_surface)
 	_last_focus_sent = Vector2(INF, INF)
 
 
@@ -241,8 +271,13 @@ func handle(msg: Dictionary) -> void:
 			_asked = {}
 			_coming = {}
 		"chunk":
+			if msg.has("same"):
+				_on_same(msg)
+				return
+			_keep_chunk(msg)
 			_on_chunk(msg)
 		"ents":
+			_keep_part(msg, "msgs")
 			var cv: ChunkView = chunks.get(Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0))))
 			if cv != null:
 				cv.got_part(int(msg.get("part", 1)))
@@ -267,6 +302,67 @@ func handle(msg: Dictionary) -> void:
 			_on_alt_fluids(_array(msg.get("fa")))
 
 
+## A snapshot into the cache (a refresh of a kept chunk replaces it).
+func _keep_chunk(msg: Dictionary) -> void:
+	if _replaying or msg.get("none", false) or not msg.has("rv") or not msg.has("rs"):
+		return
+	var c := Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0)))
+	var k := Vector3i(int(msg["rs"]), c.x, c.y)
+	_cache.erase(k)
+	_cache[k] = {"rv": int(msg["rv"]), "n": int(msg.get("n", 0)), "msgs": [msg], "dec": [], "msec": Time.get_ticks_msec()}
+	_filling[c] = k
+	while _cache.size() > CACHE_CHUNKS:
+		_cache.erase(_cache.keys()[0])
+
+
+## One of a kept chunk's ents or dec messages, after its `chunk`.
+func _keep_part(msg: Dictionary, list: String) -> void:
+	if _replaying:
+		return
+	var c := Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0)))
+	var entry: Dictionary = _cache.get(_filling.get(c, Vector3i(-1, 0, 0)), {})
+	if entry.is_empty():
+		return
+	if list == "dec" and int(msg.get("part", 1)) == 1:
+		entry["dec"] = []  # decoratives sent again (changed): the new ones replace them
+	(entry[list] as Array).append(msg)
+
+
+## main.gd: a `dec` message, kept with its chunk.
+func keep_dec(msg: Dictionary) -> void:
+	_keep_part(msg, "dec")
+
+
+## The bridge says a chunk is as the cache has it: drawn from there. Gone from the cache meanwhile,
+## it is asked for again.
+func _on_same(msg: Dictionary) -> void:
+	var c := Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0)))
+	var k := Vector3i(int(msg.get("rs", -1)), c.x, c.y)
+	var entry: Dictionary = _cache.get(k, {})
+	if entry.is_empty() or int(entry["rv"]) != int(msg["same"]):
+		Bridge.send({"t": "resync", "c": [[c.x, c.y]]})
+		return
+	ChunkView.count("cache_hit")
+	_cache.erase(k)
+	_cache[k] = entry  # the newest again
+	_filling[c] = k
+	_replaying = true
+	for m: Dictionary in entry["msgs"]:
+		handle(m)
+	if replay_dec.is_valid():
+		for m: Dictionary in entry["dec"]:
+			replay_dec.call(m)
+	_replaying = false
+
+
+## [surface index, cx, cy, rv, n] for a chunk the cache has, fresh enough; empty otherwise.
+func _cached_offer(c: Vector2i) -> Array:
+	var entry: Dictionary = _cache.get(Vector3i(surface_index, c.x, c.y), {})
+	if entry.is_empty() or Time.get_ticks_msec() - int(entry["msec"]) > CACHE_AGE_MSEC:
+		return []
+	return [surface_index, c.x, c.y, int(entry["rv"]), int(entry["n"])]
+
+
 func _on_chunk(msg: Dictionary) -> void:
 	var c := Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0)))
 	var cv: ChunkView = chunks.get(c)
@@ -274,9 +370,13 @@ func _on_chunk(msg: Dictionary) -> void:
 		return  # no longer wanted
 	for key in cv.entities.keys():
 		entities.erase(key)
+		_forget(key, cv.entities[key])
 		if _cargo.has(key) or _cargo_ghosts.has(key):
 			_remove_cargo(key)  # a bay gone while the chunk was resent must open its neighbours' sides
 	cv.clear_entities()
+	for key in _cargo_left.keys():
+		if _cargo_left[key] == c:
+			_remove_cargo(key)  # left with the chunk before: the snapshot adds it again if it's there
 	var before := cv.tile_ids
 	var was_loaded := cv.loaded
 	if msg.get("none", false):
@@ -293,6 +393,7 @@ func _on_chunk(msg: Dictionary) -> void:
 			var id := int(rle[i])
 			if id < protos.tile_names.size() and not protos.is_void(id):
 				TerrainTextures.lookup(protos.tile_names[id])
+				TerrainTextures.note(surface_index, protos.tile_names[id])
 	_dirty[c] = true
 	# The mod resends every chunk now and then to heal losses; the ground rarely changed.
 	if was_loaded and cv.tile_ids == before:
@@ -427,11 +528,11 @@ func _clear_remnants_under(a) -> void:
 
 
 func _remove(key) -> void:
+	_remnants.erase(key)
 	var r: Rec = entities.get(key)
 	if r == null:
 		return
 	entities.erase(key)
-	_remnants.erase(key)
 	if _ghosts.get(r.fixed) == key:
 		_ghosts.erase(r.fixed)
 	var tile := Vector2i(floori(r.pos.x), floori(r.pos.y))
@@ -451,6 +552,35 @@ func _remove(key) -> void:
 		cv.alt.erase(key)
 		cv.pick_grid = []
 		_dirty[r.chunk] = true
+
+
+## A record that leaves with its chunk (resent, or unloaded) out of the tables kept beside
+## `entities`, without redrawing its neighbours: a resent chunk adds its records again at once,
+## an unloaded one isn't drawn. Cargo areas are the caller's (_on_chunk, _left_with_chunk).
+func _forget(key, r: Rec) -> void:
+	_remnants.erase(key)
+	if _ghosts.get(r.fixed) == key:
+		_ghosts.erase(r.fixed)
+	var tile := _tile_of(r)
+	if _tile_ghosts.get(tile) == key:
+		_tile_ghosts.erase(tile)
+	if _pipes.get(tile) == key:
+		_pipes.erase(tile)
+	if _walls.get(tile) == key:
+		_walls.erase(tile)
+
+
+## A record of an unloaded chunk leaving `entities` (_free_unloaded). A hub's or bay's area stays
+## while its chunk is away (_cargo_left); if the chunk is back and drawn without it, it is gone.
+func _left_with_chunk(key, r: Rec) -> void:
+	_forget(key, r)
+	if not (_cargo.has(key) or _cargo_ghosts.has(key)):
+		return
+	var back: ChunkView = chunks.get(r.chunk)
+	if back != null and back.loaded:
+		_remove_cargo(key)
+	else:
+		_cargo_left[key] = r.chunk
 
 
 ## Pipes are drawn with the piece of Factorio's pipe kit that matches their connections
@@ -578,6 +708,7 @@ func _add_cargo(r: Rec, ghost: bool) -> void:
 
 
 func _remove_cargo(key) -> void:
+	_cargo_left.erase(key)
 	var ghost := _cargo_ghosts.has(key)
 	var area := _cargo_ghosts if ghost else _cargo
 	var tiles := _cargo_ghost_tiles if ghost else _cargo_tiles
@@ -743,10 +874,14 @@ func _process(delta: float) -> void:
 	_free_unloaded()
 	_update_focus(delta)
 	t0 = Time.get_ticks_usec()
-	if ModelLibrary.poll():
-		# Models made on worker threads are ready: draw the chunks that left them out.
+	var models_made := ModelLibrary.poll()
+	var cards_made := SpriteStandins.poll()
+	if models_made or cards_made:
+		# Models (or sprite stand-ins) made on worker threads are ready: draw the chunks that left
+		# them out, and with new cards those drawn with placeholder boxes.
 		for c in chunks:
-			if (chunks[c] as ChunkView).waiting_models:
+			var cv := chunks[c] as ChunkView
+			if cv.waiting_models or (cards_made and not cv.placeholder_keys.is_empty()):
 				_dirty[c] = true
 	_prof("models_poll", t0)
 	_rebuild_dirty()
@@ -844,7 +979,20 @@ var _wanted: Array = []  # the chunks round the focus, nearest first
 var _wanted_center := Vector2i(0x7fffffff, 0)
 var _wanted_radius := -1
 var _asked := {}  # _subscribed as a set
+## The chunk cache: Vector3i(surface index, cx, cy) -> {rv, n, msgs: [chunk, ents...], dec: [...],
+## msec}, oldest first. _filling: chunk -> the key its ents and dec messages go to.
+var _cache := {}
+var _filling := {}
+var _replaying := false
+## The surface the bridge streams (welcome and surface `si`, set by main.gd): chunks offered from the cache.
+var surface_index := -1
+## Replays a cached `dec` message (main.gd: decoratives.handle).
+var replay_dec := Callable()
 var _coming := {}  # chunks asked for and not drawn yet
+## The most chunks the bridge subscribes to (world.lua MAX_SUBSCRIPTIONS, a 25x25 square): it drops
+## the rest of a longer list, so asking for more left those chunks waiting in `_coming` for good,
+## taking the places of chunks that could come. Past it the nearest are asked for, a rounder view.
+const MAX_SUBSCRIPTIONS := 625
 var _wanted_moved := false  # _wanted changed since the last step
 
 
@@ -878,18 +1026,23 @@ func _update_subscription(delta: float) -> void:
 	var center := chunk_of(_focus)
 	# The wanted list only changes with the focus's chunk or the view radius.
 	if center != _wanted_center or view_radius != _wanted_radius:
+		# Walking into the next chunks; a jump (a teleport, another surface, a factory building's
+		# door) has nothing of its new square yet and loads it as a standing start does.
 		if center != _wanted_center:
-			_moved_msec = Time.get_ticks_msec()
+			var walked := not chunks.is_empty() and maxi(absi(center.x - _wanted_center.x), absi(center.y - _wanted_center.y)) <= JUMP_CHUNKS
+			_moved_msec = Time.get_ticks_msec() if walked else 0
 		_wanted_center = center
 		_wanted_radius = view_radius
 		_wanted = []
 		for offset: Vector2i in ring_order(view_radius):
+			if _wanted.size() >= MAX_SUBSCRIPTIONS:
+				break
 			_wanted.append(center + offset)
 		_wanted_moved = true
 		_stream_timer = STREAM_STEP  # the next step now: the chunks no longer wanted go at once
 	_sub_timer += delta
 	_stream_timer += delta
-	if _stream_timer < STREAM_STEP and _sub_timer < SUBSCRIBE_REFRESH:
+	if _stream_timer < STREAM_STEP and _sub_timer < SUBSCRIBE_REFRESH and not _all_came():
 		return
 	_stream_timer = 0.0
 	# What was asked for and is still wanted stays; then the nearest of the rest, while fewer than
@@ -908,6 +1061,7 @@ func _update_subscription(delta: float) -> void:
 	# chunks in this order).
 	var list: Array = []
 	var keep := {}
+	var have: Array = []  # chunks offered from the cache
 	for c in _wanted:
 		if _asked.has(c):
 			list.append(c)
@@ -917,6 +1071,9 @@ func _update_subscription(delta: float) -> void:
 			keep[c] = true
 			_coming[c] = true
 			if not chunks.has(c):
+				var offer := _cached_offer(c)
+				if not offer.is_empty():
+					have.append(offer)
 				var cv := ChunkView.new()
 				cv.coord = c
 				cv.name = "Chunk_%d_%d" % [c.x, c.y]
@@ -938,7 +1095,23 @@ func _update_subscription(delta: float) -> void:
 		var out: Array = []
 		for c in list:
 			out.append([c.x, c.y])
-		Bridge.send({"t": "sub", "c": out})
+		var sub := {"t": "sub", "c": out}
+		if not have.is_empty():
+			sub["h"] = have
+		Bridge.send(sub)
+
+
+## Standing, with more to ask for: whether every chunk asked for is drawn already, so the next
+## ones needn't wait for the step. Chunks the client kept (`same`) and empty ones come back within a
+## frame or two, and a whole view of them waited 0.15 s for every 32 (2 s back from a factory).
+func _all_came() -> bool:
+	var moving := Time.get_ticks_msec() - _moved_msec < MOVING_FOR * 1000.0
+	if moving or _stream_timer < STREAM_STEP_QUICK or _subscribed.size() >= _wanted.size():
+		return false
+	for c in _coming:
+		if not _drawn(c):
+			return false
+	return true
 
 
 ## Builds a chunk's entities again (far_chunks.gd, when it swaps between merged and full).
@@ -974,7 +1147,8 @@ func _unload(c: Vector2i) -> void:
 var _unload_keys := {}
 
 
-## Takes unloaded chunks apart within UNLOAD_USEC a frame (at least one step): their records out of
+## Takes unloaded chunks apart within their slice of the frame (frame_budget.gd `unload`, at least
+## one step): their records out of
 ## `entities` (only those still theirs: the chunk may have come back meanwhile), entities_changed,
 ## then their nodes one by one (a busy chunk's took up to 5 ms freed at once), then the chunk.
 func _free_unloaded() -> void:
@@ -998,8 +1172,10 @@ func _free_unloaded() -> void:
 			var i := int(job[1])
 			while i < keys.size():
 				var key = keys[i]
-				if entities.get(key) == cv.entities.get(key):
+				var gone: Rec = cv.entities.get(key)
+				if gone != null and entities.get(key) == gone:
 					entities.erase(key)
+					_left_with_chunk(key, gone)
 				i += 1
 				steps += 1
 				if (i & 63) == 0 and Time.get_ticks_usec() - t0 > allow:
@@ -1065,8 +1241,16 @@ func _update_focus(delta: float) -> void:
 
 func _rebuild_dirty() -> void:
 	var tp := Time.get_ticks_usec()
+	if protos.refresh_water():
+		_terrain_cache.clear()  # what is water changed: banks and shores with it
+		for c in chunks:
+			_dirty_terrain[c] = true  # a mod's water, known from the graphics list that came after
 	if TerrainTextures.poll():
 		_refresh_gfx_table()
+		if TerrainTextures.relook:
+			TerrainTextures.relook = false
+			for c in chunks:
+				_dirty_terrain[c] = true
 		# Chunks drawn without a picture that is ready now are built again with it.
 		for c in _waiting_gfx.keys():
 			for id in _waiting_gfx[c]:
@@ -1081,8 +1265,6 @@ func _rebuild_dirty() -> void:
 	tp = Time.get_ticks_usec()
 	_start_terrain_jobs()
 	_prof("terrain_start", tp)
-	var center := chunk_of(_focus)
-	var nearer := func(a: Vector2i, b: Vector2i) -> bool: return (a - center).length_squared() < (b - center).length_squared()
 	# One budget object, filled again each frame: a build part-way through holds on to it.
 	var surfaces := _surfaces
 	surfaces.left = NEW_SURFACES
@@ -1094,6 +1276,9 @@ func _rebuild_dirty() -> void:
 	if FrameBudget.shared and granted <= 0:
 		FrameBudget.spent(&"build", 0, _dirty.size() + _partial.size() + _pending.size())
 		return
+	# Made only when there is something to build (it was made every frame).
+	var center := chunk_of(_focus)
+	var nearer := func(a: Vector2i, b: Vector2i) -> bool: return (a - center).length_squared() < (b - center).length_squared()
 	# Chunks already built go on adding what they left for later first, nearest first.
 	if not _pending.is_empty():
 		tp = Time.get_ticks_usec()
@@ -1110,12 +1295,7 @@ func _rebuild_dirty() -> void:
 		_prof("pending", tp)
 	# The time for builds starts after the MultiMeshes left for later were added (as before).
 	var started := Time.get_ticks_usec()
-	var allowed := clampi(FRAME_WORK_USEC - Bridge.frame_handle_usec, REBUILD_MIN_USEC, REBUILD_USEC)
-	# Builds stop part-way at the deadline instead of finishing a busy chunk whatever it costs (10-24
-	# ms), so when chunks queue up they get the whole REBUILD_USEC: as many built as before, in frames
-	# of a bounded length.
-	if _dirty.size() + _partial.size() > REBUILDS_PER_FRAME:
-		allowed = REBUILD_USEC
+	var allowed: int
 	# With the frame's work shared (frame_budget.gd) the builds take what the scheduler gives them,
 	# and nothing at all when it gives nothing.
 	if FrameBudget.shared:
@@ -1123,6 +1303,14 @@ func _rebuild_dirty() -> void:
 		if allowed <= 0:
 			FrameBudget.spent(&"build", Time.get_ticks_usec() - build_t0, _dirty.size() + _partial.size() + _pending.size())
 			return
+	else:
+		# The old slice (`granted` is the build's own): what message handling left of FRAME_WORK_USEC.
+		# Builds stop part-way at the deadline instead of finishing a busy chunk whatever it costs
+		# (10-24 ms), so when chunks queue up they get the whole slice: as many built as before, in
+		# frames of a bounded length.
+		allowed = clampi(FRAME_WORK_USEC - Bridge.frame_handle_usec, int(FrameBudget.SYSTEMS[&"build"][2]), granted)
+		if _dirty.size() + _partial.size() > REBUILDS_PER_FRAME:
+			allowed = granted
 	var until := started + allowed
 	var budget := REBUILDS_PER_FRAME
 	# Builds part-way through carry on first, nearest first.
@@ -1422,7 +1610,44 @@ func _start_terrain_jobs() -> void:
 		job.gfx_of = _gfx_table
 		job.textured = TerrainTextures.active()
 		job.slots = cv.slots
-		_terrain_jobs[c] = [WorkerThreadPool.add_task(job.run, false, "terrain"), job, cv]
+		var sig := hash([job.around, job.textured, TerrainTextures.layout])
+		var own := hash([cv.tile_ids, job.textured, TerrainTextures.layout])
+		var kept: Array = _terrain_cache.get(Vector3i(surface_index, c.x, c.y), [])
+		if not kept.is_empty() and (int(kept[0]) == sig or (int(kept[3]) == own and _neighbour_missing(job.around))):
+			# The same ground round it; or its own ground the same while a neighbour is still on its
+			# way, which the kept mesh shows as it was (built again when the neighbour arrives, and
+			# taken from here once more if that is unchanged too).
+			cv.apply_kept_terrain(kept[1], kept[2])
+			terrain_cache_hits += 1
+			ChunkView.count("terrain_kept")
+			_waiting_gfx.erase(c)
+			continue
+		_terrain_jobs[c] = [WorkerThreadPool.add_task(job.run, false, "terrain"), job, cv, sig, own]
+
+
+## A chunk's finished terrain mesh into the cache (the newest last, the oldest dropped).
+func _keep_terrain(c: Vector2i, sig: int, own: int, cv: ChunkView) -> void:
+	var mesh := cv.terrain_mesh()
+	if mesh == null:
+		return
+	var k := Vector3i(surface_index, c.x, c.y)
+	_terrain_cache.erase(k)
+	_terrain_cache[k] = [sig, mesh, cv.slots, own]
+	while _terrain_cache.size() > TERRAIN_CACHE:
+		_terrain_cache.erase(_terrain_cache.keys()[0])
+
+
+## Whether any of a terrain job's 8 neighbours isn't loaded (TerrainMesher.around, the chunk at 4).
+static func _neighbour_missing(around: Array) -> bool:
+	for i in around.size():
+		if i != 4 and (around[i] as PackedInt32Array).is_empty():
+			return true
+	return false
+
+
+## How many terrain meshes are kept (tests).
+func terrain_cache_size() -> int:
+	return _terrain_cache.size()
 
 
 ## Shows the terrain jobs that are done, within a time budget.
@@ -1451,6 +1676,7 @@ func _finish_terrain_jobs() -> void:
 		terrain_builds += 1
 		_waiting_gfx.erase(c)
 		if job.missing.is_empty():
+			_keep_terrain(c, int(entry[3]), int(entry[4]), cv)
 			continue
 		# Drawn in map colours where pictures are missing: read them, and build again when ready.
 		_waiting_gfx[c] = job.missing

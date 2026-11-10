@@ -39,6 +39,7 @@ F = {
   tags = {}, -- the player force's chart tags
   tag_number = 0,
   on_init = nil,
+  on_load = nil, -- script.on_load's handler: F.on_load() plays loading a save
   players = {}, -- game.players: index -> LuaPlayer (F.make_offline_player)
   players_by = {}, -- index and name -> LuaPlayer
   game_surfaces = {}, -- game.surfaces: index -> LuaSurface
@@ -60,11 +61,12 @@ end
 -- defines
 
 local event_names = {
-  "on_tick", "on_udp_packet_received", "on_built_entity", "on_robot_built_entity",
+  "on_tick", "on_udp_packet_received", "on_built_entity", "on_robot_built_entity", "on_pre_build",
+  "on_pre_player_mined_item", "on_pre_entity_settings_pasted", "on_gui_opened",
   "on_space_platform_built_entity", "script_raised_built", "script_raised_revive",
   "on_entity_cloned", "on_player_mined_entity", "on_robot_mined_entity",
   "on_space_platform_mined_entity", "on_entity_died", "on_post_entity_died", "script_raised_destroy",
-  "on_resource_depleted", "on_player_rotated_entity", "on_player_flipped_entity", "on_entity_settings_pasted", "on_gui_closed",
+  "on_resource_depleted", "on_player_rotated_entity", "on_player_flipped_entity", "on_entity_settings_pasted", "on_gui_closed", "on_gui_click", "on_player_created",
   "on_player_built_tile", "on_robot_built_tile", "on_space_platform_built_tile",
   "on_player_mined_tile", "on_robot_mined_tile", "on_space_platform_mined_tile",
   "script_raised_set_tiles", "on_chunk_generated", "on_entity_damaged", "on_research_finished",
@@ -112,6 +114,7 @@ defines = strict("defines", {
   }),
   build_check_type = strict("defines.build_check_type", { script = 0, manual = 1, manual_ghost = 2 }),
   build_mode = strict("defines.build_mode", { normal = 0, forced = 1, superforced = 2 }),
+  gui_type = strict("defines.gui_type", { none = 0, entity = 1, custom = 13 }),
   logistic_member_index = strict("defines.logistic_member_index", { logistic_container = 0, logistic_container_trash_provider = 1 }),
   flow_precision_index = strict("defines.flow_precision_index", {
     five_seconds = 0, one_minute = 1, ten_minutes = 2, one_hour = 3, ten_hours = 4, fifty_hours = 5,
@@ -160,8 +163,8 @@ defines = strict("defines", {
 script = strict("LuaBootstrap", {
   active_mods = { ["factorio-3d-bridge"] = "0.1.0", base = "2.1.23" },
   on_init = function(f) F.on_init = f end,
-  on_configuration_changed = function(f) F.on_config = f end,
   on_load = function(f) F.on_load = f end,
+  on_configuration_changed = function(f) F.on_config = f end,
   on_event = function(ids, f)
     if type(ids) ~= "table" then
       ids = { ids }
@@ -212,6 +215,7 @@ settings = strict("LuaSettings", {
     ["f3d-detail-interval"] = { value = 6 },
     ["f3d-starter-kit"] = { value = true },
     ["f3d-player"] = { value = "" },
+    ["f3d-act-as-player"] = { value = true },
   },
 })
 
@@ -223,6 +227,17 @@ function print(msg)
   F.printed[#F.printed + 1] = "STDOUT " .. tostring(msg)
 end
 
+-- Factorio's core lualib mod-gui (the top-left button flow every mod shares), as 2.1 builds it.
+package.preload["mod-gui"] = function()
+  local M = { button_style = "mod_gui_button", frame_style = "non_draggable_frame" }
+  function M.get_button_flow(player)
+    local top = player.gui.top
+    local outer = top.mod_gui_top_frame or top.add({ type = "frame", name = "mod_gui_top_frame", direction = "horizontal" })
+    return outer.mod_gui_inner_frame or outer.add({ type = "frame", name = "mod_gui_inner_frame", direction = "horizontal" })
+  end
+  return M
+end
+
 -- remote.add_interface: the `zenith` interface (console.lua); F.remote[name][fn] calls it.
 F.remote = {}
 remote = strict("LuaRemote", {
@@ -230,6 +245,11 @@ remote = strict("LuaRemote", {
     assert(type(name) == "string" and type(functions) == "table", "add_interface(name, functions)")
     assert(not F.remote[name], "add_interface: interface " .. name .. " already exists")
     F.remote[name] = functions
+  end,
+  interfaces = F.remote,
+  call = function(name, fn, ...)
+    assert(F.remote[name] and F.remote[name][fn], "remote.call: no " .. tostring(name) .. "." .. tostring(fn))
+    return F.remote[name][fn](...)
   end,
 })
 
@@ -282,6 +302,9 @@ local entity_protos = {
   ["offshore-pump"] = entity_proto("offshore-pump", "offshore-pump", 1, 2, { rotatable = true,
     fluidbox_prototypes = { { pipe_connections = { { connection_type = "normal", flow_direction = "output", direction = 0,
       positions = { { x = 0, y = -0.5 }, { x = 0.5, y = 0 }, { x = 0, y = 0.5 }, { x = -0.5, y = 0 } } } } } } }),
+  -- A boiler with fluid boxes and no fuel inventory (heat source): it opens with no inventory.
+  ["heat-exchanger"] = entity_proto("heat-exchanger", "boiler", 3, 2, { rotatable = true,
+    fluidbox_prototypes = { { pipe_connections = {} }, { pipe_connections = {} } } }),
   splitter = entity_proto("splitter", "splitter", 2, 1, { rotatable = true }),
   ["power-switch"] = entity_proto("power-switch", "power-switch", 2, 2),
   ["gun-turret"] = entity_proto("gun-turret", "ammo-turret", 2, 2),
@@ -400,6 +423,8 @@ end
 entity_protos["assembling-machine-1"].electric_energy_source_prototype = { usage_priority = "secondary-input", drain = 2500 / 60,
   buffer_capacity = 1000, render_no_power_icon = true, render_no_network_icon = true }
 -- What stands on tiles (tiles the entity's layers hit are where it can't be built, e.g. empty space).
+-- The character's, as 2.1's: its player layer is what water tiles stop.
+entity_protos.character.collision_mask = { layers = { player = true, train = true, consider_tile_transitions = true } }
 for _, n in pairs({ "wooden-chest", "assembling-machine-1", "burner-inserter" }) do
   entity_protos[n].collision_mask = { layers = { object = true, item = true, player = true, water_tile = true } }
 end
@@ -468,8 +493,10 @@ item_protos.grenade = { name = "grenade", place_result = nil, capsule_action = (
 item_protos["cliff-explosives"] = { name = "cliff-explosives", place_result = nil, capsule_action = ({
   type = "destroy-cliffs", attack_parameters = { range = 10 }, radius = 1.5, timeout = 0 }) }
 item_protos["burner-inserter"] = { name = "burner-inserter", place_result = entity_protos["burner-inserter"] }
+-- Ammo named like the projectile it fires, which it doesn't build (issue #2).
+item_protos.rocket = { name = "rocket", type = "ammo", place_result = nil }
 entity_protos["burner-inserter"].items_to_place_this = { { name = "burner-inserter", count = 1 } }
-for _, n in pairs({ "iron-plate", "wood", "pistol", "firearm-magazine", "burner-mining-drill", "iron-ore", "iron-gear-wheel",
+for _, n in pairs({ "iron-plate", "copper-plate", "wood", "pistol", "firearm-magazine", "burner-mining-drill", "iron-ore", "iron-gear-wheel",
   "space-platform-starter-pack" }) do
   item_protos[n] = { name = n, place_result = nil }
 end
@@ -495,7 +522,6 @@ for name, e in pairs(equipment_protos) do
     { name = name, type = e.type, shape = e.shape }) }
 end
 item_protos["power-armor"] = { name = "power-armor", place_result = nil }
-F.equipment_protos = equipment_protos
 item_protos["repair-pack"] = { name = "repair-pack", place_result = nil, type = "repair-tool" }
 
 local fluid_protos = {
@@ -572,7 +598,22 @@ for _, n in pairs({ "gravity", "pressure", "magnetic-field", "solar-power", "day
   surface_properties[n] = strict("LuaSurfacePropertyPrototype", { name = n })
 end
 
+-- The bridge's graphics list (data-final-fixes.lua), as LuaModData: get(key) only. F.mod_data is
+-- its data, which tests may change.
+F.mod_data = {
+  fp = "00c0ffee12345678", n = 2, v = 1, b = 0,
+  p1 = '{"icons":{"item":{"gizmo":[["__my-mod__/graphics/icons/gizmo.png",64,null,null,null]]}}}',
+  p2 = '{"tiles":{"my-floor":{"group":"ground-artificial","layer":60,"mat":["__my-mod__/graphics/terrain/floor.png",4,0.5],"water":0}}}',
+}
+local mod_data = {
+  ["zenith-graphics"] = strict("LuaModData", {
+    name = "zenith-graphics", data_type = "zenith-graphics",
+    get = function(key) return F.mod_data[key] end,
+  }),
+}
+
 prototypes = strict("LuaPrototypes", {
+  mod_data = mod_data,
   entity = entity_protos, tile = tile_protos, item = item_protos, fluid = fluid_protos,
   space_location = space_locations, space_connection = space_connections, surface_property = surface_properties,
   asteroid_chunk = asteroid_chunks, quality = qualities, recipe = recipe_protos, decorative = decorative_protos, technology = {},
@@ -611,10 +652,12 @@ local function make_recipe(name, enabled, category, extra)
     name = name, enabled = enabled, hidden = false, categories = { category }, energy = 0.5, order = "a",
     group = group("intermediate-products", "c"), subgroup = group("intermediate-product", "a"),
     ingredients = {}, products = { { type = "item", name = name, amount = 1 } },
+    object_name = "LuaRecipe", prototype = { parameter = false },
   }
   for k, v in pairs(extra or {}) do
     r[k] = v
   end
+  r.prototype = strict("LuaRecipePrototype", r.prototype)
   return strict("LuaRecipe", r)
 end
 
@@ -667,8 +710,13 @@ forces.player = setmetatable({
     end
     return true
   end,
+  -- As Factorio: the stopped technology keeps its progress as saved_progress.
   cancel_current_research = function()
-    rawset(forces.player, "current_research", nil)
+    local f = forces.player
+    if rawget(f, "current_research") then
+      rawset(rawget(f, "current_research"), "saved_progress", f.research_progress)
+    end
+    rawset(f, "current_research", nil)
   end,
   manual_mining_speed_modifier = 0,
   character_logistic_requests = false,
@@ -686,6 +734,8 @@ forces.player = setmetatable({
       products = { { type = "fluid", name = "petroleum-gas", amount = 45 } } }),
     ["laser-turret"] = make_recipe("laser-turret", false, "crafting"),
     ["iron-plate"] = make_recipe("iron-plate", true, "smelting"),
+    -- Factorio's parameter recipes (blueprint parameters): crafting category, not hidden, never made.
+    ["parameter-0"] = make_recipe("parameter-0", true, "crafting", { prototype = { parameter = true } }),
   },
   get_spawn_position = function(surface) return { x = 0, y = 0 } end,
   find_logistic_network_by_position = function(position, surface)
@@ -810,6 +860,7 @@ local function raise(name, data)
   end
 end
 F.raise = raise
+F.player_events = {} -- player events the fake raised for as_player.lua's checks
 
 local STACK_SIZE = { ["iron-plate"] = 100, ["copper-plate"] = 100, wood = 100, coal = 50, ["iron-ore"] = 50,
   ["iron-gear-wheel"] = 100, ["transport-belt"] = 100, pistol = 5, ["firearm-magazine"] = 200 }
@@ -1097,6 +1148,10 @@ local function make_inventory(size)
     return next(slots) == nil
   end
   inv.find_item_stack = function(name)
+    if type(name) == "table" then -- ItemWithQualityID (2.x): the fake keeps no quality on items
+      assert(type(name.name) == "string", "find_item_stack{name, quality?}")
+      name = name.name
+    end
     for k = 1, size do
       if slots[k] and slots[k].name == name then
         return item_stack(slots, k), k
@@ -1112,16 +1167,24 @@ local function make_inventory(size)
     end
     return nil
   end
-  -- Slot filters (the character's middle click): item name by slot.
+  -- Slot filters (the character's middle click): an ItemFilter by slot. A name alone means normal
+  -- quality, "=" (2.1's ItemFilter); a table without a quality matches any quality.
   local filters = {}
   inv.supports_filters = function() return true end
   inv.get_filter = function(i)
     assert(i >= 1 and i <= size, "get_filter: index out of range")
-    return filters[i] and { name = filters[i], quality = "normal", comparator = "=" } or nil
+    local f = filters[i]
+    return f and { name = f.name, quality = f.quality, comparator = f.comparator } or nil
   end
   inv.set_filter = function(i, f)
     assert(i >= 1 and i <= size, "set_filter: index out of range")
-    assert(f == nil or type(f) == "string", "set_filter: an item name or nil")
+    assert(f == nil or type(f) == "string" or (type(f) == "table" and type(f.name) == "string"),
+      "set_filter: an ItemFilter (an item name, or {name, quality?, comparator?}) or nil")
+    if type(f) == "string" then
+      f = { name = f, quality = "normal", comparator = "=" }
+    elseif f then
+      f = { name = f.name, quality = f.quality, comparator = f.comparator or "=" }
+    end
     filters[i] = f
     return true
   end
@@ -1155,8 +1218,6 @@ local function make_inventory(size)
     __len = function() return size end,
   })
 end
-F.make_inventory = function(size) return make_inventory(size) end
-
 F.make_inventory = make_inventory -- for blueprint books' pages (item_stack is defined first)
 
 -- A gun or ammo inventory: numbered slots, read as inv[i] and #inv like the real LuaInventory.
@@ -1215,14 +1276,8 @@ end
 -- front edge of the entity and run away from it, so their items are outside it.
 local belt_lines = setmetatable({}, { __mode = "k" }) -- entity -> {line index -> items}
 
--- entity -> {line index -> {inputs, outputs}}: the lines either side, shared by every object for it.
-local line_links = setmetatable({}, { __mode = "k" })
-
 local function make_transport_line(e, index)
   local items = belt_lines[e][index]
-  line_links[e] = line_links[e] or {}
-  line_links[e][index] = line_links[e][index] or { inputs = {}, outputs = {} }
-  local links = line_links[e][index]
   local angle = e.direction / 16 * 2 * math.pi
   local fx, fy = math.sin(angle), -math.cos(angle)
   local rx, ry = -fy, fx
@@ -1300,15 +1355,8 @@ local function make_transport_line(e, index)
         unique_id = F.next_item_id }
       return true
     end,
-    -- The lines either side along the belt (set by the harness: F.link_lines), the belt, equality.
-    input_lines = links.inputs,
-    output_lines = links.outputs,
     owner = e,
     valid = true,
-    line_equals = function(other)
-      return other ~= nil and rawequal(other.owner, e) and other.__index_of == index
-    end,
-    __index_of = index,
     get_line_item_position = function(position)
       local p = e.position
       local along = index <= 2 and 0.5 - position or 0.5 + position
@@ -1317,6 +1365,21 @@ local function make_transport_line(e, index)
   })
   -- #line: the number of item stacks on it (2.1.23: a stack from a stack inserter is one entry).
   getmetatable(line).__len = function() return #items end
+  -- line[k]: the k-th stack from the front, a LuaItemStack (2.1.24: `line[1].name`).
+  local strict_index = getmetatable(line).__index
+  getmetatable(line).__index = function(t, k)
+    if type(k) == "number" then
+      local sorted = {}
+      for _, it in ipairs(items) do
+        sorted[#sorted + 1] = it
+      end
+      table.sort(sorted, function(a, b) return a.position < b.position end)
+      local it = assert(sorted[k], "line[k]: no item " .. tostring(k))
+      F.stack_reads = (F.stack_reads or 0) + 1
+      return strict("LuaItemStack", { valid_for_read = true, name = it.name, count = it.count or 1 })
+    end
+    return strict_index(t, k)
+  end
   return line
 end
 
@@ -1552,7 +1615,6 @@ function F.make_cell(owner, logistic_radius, construction_radius)
     valid = true, owner = owner, logistic_radius = logistic_radius, construction_radius = construction_radius,
     mobile = owner.type ~= "roboport",
     is_in_construction_range = function(position) return in_square(owner, construction_radius, position) end,
-    is_in_logistic_range = function(position) return in_square(owner, logistic_radius, position) end,
   })
 end
 
@@ -1662,17 +1724,41 @@ local function make_entity(surface, params)
     if data.ghost_type == "underground-belt" then
       data.belt_to_ground_type = params.type or "input"
     end
+    -- A rolling stock ghost faces its way by orientation; its direction reads north (issue #13: the
+    -- client drew every train ghost facing one way). Reviving it builds the carriage turned so.
+    local stock = { locomotive = true, ["cargo-wagon"] = true, ["fluid-wagon"] = true, ["artillery-wagon"] = true }
+    local stock_direction
+    if stock[data.ghost_type] then
+      stock_direction = data.direction
+      data.orientation = (params.orientation or data.direction / 16) % 1
+      data.direction = 0
+    end
     -- Fills the ghost in: the real entity where it stood (2.x returns collided items, the entity
-    -- and an item request proxy).
+    -- and an item request proxy). Items lying on the ground in its footprint are picked up and
+    -- returned as array[ItemWithQualityCount], as 2.1's revive does.
     data.revive = function(p)
-      local spec = { name = data.ghost_name, position = data.position, direction = data.direction, force = data.force,
-        type = data.belt_to_ground_type }
+      local spec = { name = data.ghost_name, position = data.position, direction = stock_direction or data.direction,
+        force = data.force, type = data.belt_to_ground_type }
+      local b = entity_protos[data.ghost_name].collision_box
+      local x, y = data.position.x, data.position.y
+      local collided, lying = {}, {}
+      for _, other in ipairs(surface.entities) do
+        local q = other.position
+        if other.type == "item-entity" and q.x >= x + b.left_top.x and q.x <= x + b.right_bottom.x
+            and q.y >= y + b.left_top.y and q.y <= y + b.right_bottom.y then
+          lying[#lying + 1] = other
+        end
+      end
+      for _, other in ipairs(lying) do
+        collided[#collided + 1] = { name = other.stack.name, count = other.stack.count, quality = "normal" }
+        other.destroy()
+      end
       data.destroy()
       local real = surface.create_entity(spec)
       if p and p.raise_revive then
         raise("script_raised_revive", { entity = real })
       end
-      return {}, real, nil
+      return collided, real, nil
     end
   end
   -- Units are commandable; the harness sets the command and distraction (LuaCommandable's
@@ -1726,15 +1812,24 @@ local function make_entity(surface, params)
     relative_turret_orientation = true, torso_orientation = "harness", driver_is_gunner = true,
     crafting_queue_progress = "harness", status = "harness", energy = "harness",
     signal_state = "harness", chain_signal_state = "harness",
-    electric_network_id = "harness",
+    electric_network_id = "harness", is_flying = "harness", flight_height = "harness",
     color = true, character_inventory_slots_bonus = true, grid = "harness", allow_dispatching_robots = true,
     ignore_unprioritised_targets = true,
     mirroring = true, use_filters = true, inserter_filter_mode = true, inserter_stack_size_override = true,
     request_from_buffers = true,
     splitter_input_priority = true, splitter_output_priority = true, splitter_filter = true, power_switch_state = true,
     rocket_silo_status = "harness", send_to_orbit_automatically = true, providing_to_other_platforms = true,
-    ignore_unprioritised_targets = true,
+    ignore_unprioritised_targets = true, belt_shape = "harness",
   }
+  -- What an inserter takes from and puts on, and where a drill drops its ore (nil: nothing there);
+  -- set by the harness (`e.pickup_target = belt`), only on the kinds that have them.
+  if proto.type == "inserter" then
+    optional.pickup_target, optional.drop_target = true, true
+    writable.pickup_target, writable.drop_target = "harness", "harness"
+  elseif proto.type == "mining-drill" then
+    optional.drop_target = true
+    writable.drop_target = "harness"
+  end
   -- Fluid storages (pipes one, machines as the harness sets) and wire connectors, empty until the
   -- harness fills them (F.set_fluid, F.connect). 2.1 has no LuaEntity.fluidbox: storages are read
   -- by index with get_fluid / get_fluid_capacity up to fluids_count, and written with set_fluid.
@@ -1932,6 +2027,9 @@ local function make_entity(surface, params)
     data.entity_label = ""
     data.orientation, data.speed = 0, 0
     data.color = { r = 1, g = 0.5, b = 0, a = 1 }
+    -- Its seats, as a car's (turrets.lua asks who fires its guns); nobody gets in in the tests.
+    data.get_driver = function() return nil end
+    data.get_passenger = function() return nil end
     local targeting = { auto_target_without_gunner = true, auto_target_with_gunner = false }
     local waypoints = {}
     data.add_autopilot_destination = function(p)
@@ -1995,7 +2093,7 @@ local function make_entity(surface, params)
   elseif t == "logistic-container" or t == "roboport" then
     data.logistic_network = F.network
     if t == "roboport" then
-      -- Its logistic cell (H14): neighbours are the roboports whose logistic squares meet its own.
+      -- Its logistic cell: neighbours are the roboports whose logistic squares meet its own.
       local r = proto.logistic_radius or 25
       data.logistic_cell = setmetatable({ valid = true, object_name = "LuaLogisticCell", logistic_radius = r,
         construction_radius = proto.construction_radius or 55, logistics_connection_distance = r }, {
@@ -2069,10 +2167,6 @@ local function make_entity(surface, params)
       end
     end
     data.get_passenger = function() return passenger end
-    data.force_finish_ascending = function()
-      assert(data.cargo_pod_destination.type ~= defines.cargo_destination.invalid, "force_finish_ascending: no destination")
-      data.cargo_pod_state = "descending"
-    end
   elseif t == "space-platform-hub" then
     data.create_cargo_pod = function(...)
       assert(select("#", ...) == 0, "create_cargo_pod: leave the optional params out")
@@ -2404,8 +2498,12 @@ local function make_entity(surface, params)
   F.inventories[e] = invs
   data.mirroring = false
   -- Copies what the fake knows of settings: an assembler's recipe (the old ingredients come back).
-  data.copy_settings = function(source)
+  data.copy_settings = function(source, by_player)
     assert(source and source.valid, "copy_settings: a valid entity")
+    if by_player ~= nil then
+      raise("on_pre_entity_settings_pasted", { source = source, destination = e, player_index = by_player.index })
+      F.player_events[#F.player_events + 1] = "on_entity_settings_pasted"
+    end
     if t == "assembling-machine" and source.type == "assembling-machine" then
       local r = source.get_recipe()
       return data.set_recipe(r and r.name or nil)
@@ -2607,7 +2705,12 @@ local function make_entity(surface, params)
     return true
   end
   data.rotate = function(p)
+    local before = data.direction
     data.direction = (data.direction + ((p and p.reverse) and -4 or 4)) % 16
+    if p and p.by_player ~= nil then
+      F.player_events[#F.player_events + 1] = "on_player_rotated_entity"
+      raise("on_player_rotated_entity", { entity = e, previous_direction = before, player_index = p.by_player.index })
+    end
     return true
   end
   data.deplete = function()
@@ -2652,6 +2755,7 @@ local function make_entity(surface, params)
       return nil
     end
     data.walking_state = { walking = false, direction = 0 }
+    F.walkers[#F.walkers + 1] = data
     data.riding_state = { acceleration = defines.riding.acceleration.nothing, direction = defines.riding.direction.straight }
     data.vehicle_seat = function(v)
       if v then
@@ -2669,6 +2773,8 @@ local function make_entity(surface, params)
     data.item_pickup_distance = 1
     data.character_mining_speed_modifier = 0
     data.crafting_queue_size = 0
+    data.is_flying = false
+    data.flight_height = 0
     data.get_main_inventory = function() return inventory end
     -- Guns and ammo go to their own inventories, the way the game sorts them.
     data.insert = function(stack)
@@ -2790,6 +2896,20 @@ local function make_entity(surface, params)
       if not writable[k] then
         error("LuaEntity: can't write " .. tostring(k), 2)
       end
+      -- A direction is one of defines.direction's 16 and a position finite, as the game insists.
+      if k == "walking_state" and type(v) == "table" and v.direction ~= nil then
+        local d = v.direction
+        if not (type(d) == "number" and d == math.floor(d) and d >= 0 and d < 16) then
+          error("LuaEntity: walking_state.direction must be a defines.direction, not " .. tostring(d), 2)
+        end
+      end
+      if k == "shooting_state" and type(v) == "table" and type(v.position) == "table" then
+        local p = v.position
+        local x, y = p.x or p[1], p.y or p[2]
+        if not (type(x) == "number" and type(y) == "number" and x == x and y == y and math.abs(x) < 1e7 and math.abs(y) < 1e7) then
+          error("LuaEntity: shooting_state.position must be a finite position on the map", 2)
+        end
+      end
       data[k] = v
     end,
   })
@@ -2871,7 +2991,6 @@ local function make_surface(index, name, default_tile)
       surface.tiles[t.position.x .. "," .. t.position.y] = t.name
       changed[#changed + 1] = { position = t.position, old_tile = tile_protos["grass-1"] }
     end
-    F.set_tiles_calls = (F.set_tiles_calls or 0) + 1
     if raise_event then
       raise("script_raised_set_tiles", { surface_index = surface.index, tiles = changed })
     end
@@ -2957,7 +3076,19 @@ local function make_surface(index, name, default_tile)
       return { x = cx, y = cy, area = { left_top = { x = cx * 32, y = cy * 32 }, right_bottom = { x = cx * 32 + 32, y = cy * 32 + 32 } } }
     end
   end
-  surface.find_non_colliding_position = function(name, center) return center end
+  -- A character is put on the nearest land eastwards (the fake map is water west of x = -40).
+  surface.find_non_colliding_position = function(name, center, radius)
+    if name ~= "character" then
+      return center
+    end
+    local x, y = center.x or center[1], center.y or center[2]
+    for d = 0, radius or 10 do
+      if surface.get_tile(math.floor(x + d), math.floor(y)).name ~= "water" then
+        return { x = x + d, y = y }
+      end
+    end
+    return nil
+  end
   surface.find_nearest_enemy = function(p)
     assert(p.position and p.force and p.max_distance, "find_nearest_enemy{position, max_distance, force}")
     local best, best_d
@@ -3677,7 +3808,9 @@ helpers = strict("LuaHelpers", {
     assert(type(port) == "number", "send_udp: port must be a number")
     assert(type(data) == "string", "send_udp: data must be a string")
     if F.multiplayer then
-      assert(who == 0, "send_udp: on a server the bridge must send from the server (0)")
+      -- From the server (0); only the launcher request goes from the pressing player's machine.
+      assert(who == 0 or (port == 34209 and type(who) == "number" and who > 0),
+        "send_udp: on a server the bridge must send from the server (0)")
     else
       assert(who == nil, "send_udp: single-player must not pass for_player")
     end
@@ -3689,8 +3822,25 @@ helpers = strict("LuaHelpers", {
 ---------------------------------------------------------------------------------------------
 -- harness entry points
 
+-- With F.walk_moves on (the walking checks), characters walk as Factorio moves them: each tick a
+-- character whose walking_state says walking steps 0.15 tiles its way, unless F.walk_blocked(x, y)
+-- says the place it would step to is taken (a test's wall). Off, positions stay where tests put them.
+F.walkers = {}
+F.walk_moves = false
+F.walk_blocked = nil
+
 function F.tick()
   game.tick = game.tick + 1
+  for _, w in ipairs(F.walk_moves and F.walkers or {}) do
+    local ws = rawget(w, "walking_state")
+    if ws and ws.walking and w.position then
+      local a = (ws.direction or 0) / 16 * 2 * math.pi
+      local x, y = w.position.x + 0.15 * math.sin(a), w.position.y - 0.15 * math.cos(a)
+      if not (F.walk_blocked and F.walk_blocked(x, y)) then
+        w.position = { x = x, y = y }
+      end
+    end
+  end
   -- The game raises on_object_destroyed later, not inside destroy().
   local queue = F.destroyed_queue
   F.destroyed_queue = {}
@@ -3700,8 +3850,9 @@ function F.tick()
   raise("on_tick", {})
 end
 
-function F.packet(payload, port)
-  raise("on_udp_packet_received", { payload = payload, source_port = port, player_index = 0 })
+-- player_index: the player whose machine the packet came in on (0, the server itself, by default).
+function F.packet(payload, port, player_index)
+  raise("on_udp_packet_received", { payload = payload, source_port = port, player_index = player_index or 0 })
 end
 
 -- A LuaSegmentedUnit (a demolisher) on a surface: segments {{x, y, orientation}, ...}, head first.
@@ -3789,22 +3940,139 @@ end
 
 -- A LuaPlayer playing this character (single-player, hybrid mode), with a quickbar of 10 pages
 -- of 10 item filters. game.get_player returns it.
+-- A player's GUI (mod_gui.lua reads it): LuaGuiElement-like tables with add, destroy, children.
+local gui_index = 0
+function F.gui_element(props, mod)
+  gui_index = gui_index + 1
+  local e = { children = {}, index = gui_index, valid = true, visible = true, enabled = true }
+  for k, v in pairs(props) do
+    e[k] = v
+  end
+  e.style = { name = props.style or props.type }
+  e.add = function(p)
+    local child = F.gui_element(p, mod)
+    child.parent = e
+    e.children[#e.children + 1] = child
+    if p.name then
+      e[p.name] = child  -- LuaGuiElement[name]: a child by name
+    end
+    return child
+  end
+  e.get_mod = function() return mod end
+  e.force_auto_center = function() e.auto_centered = true end
+  e.destroy = function()
+    e.valid = false
+    if e.parent and e.name and e.parent[e.name] == e then
+      e.parent[e.name] = nil
+    end
+    local siblings = e.parent and e.parent.children or {}
+    for i, c in ipairs(siblings) do
+      if c == e then
+        table.remove(siblings, i)
+        break
+      end
+    end
+  end
+  return e
+end
+
 function F.make_player(character)
   local quickbar, active = {}, { 1 }
   local selected = nil
+  local gui = {}
+  for _, root in ipairs({ "top", "left", "center", "screen", "relative", "goal" }) do
+    gui[root] = F.gui_element({ type = "empty-widget", name = root }, "core")
+  end
+  F.player_gui = gui
   local function key(page, slot)
     assert(type(page) == "number" and page >= 1 and page <= 10, "quick bar page " .. tostring(page))
     assert(type(slot) == "number" and slot >= 1 and slot <= 10, "quick bar slot " .. tostring(slot))
     return (page - 1) * 10 + slot
   end
+  -- The cursor (one slot), what's open, and the player methods as_player.lua uses: building from
+  -- the cursor and mining as the player raise the player events, as 2.1.24's docs say.
+  local cursor_slots = {}
+  local cursor = item_stack(cursor_slots, 1)
+  local opened = nil
+  local this
+  local function main_inventory()
+    return character.get_main_inventory()
+  end
+  local methods = {
+    can_build_from_cursor = function(p)
+      assert(p.mirror == nil, "can_build_from_cursor has no mirror")
+      if not cursor.valid_for_read then
+        return false
+      end
+      local item = prototypes.item[cursor.name]
+      local place = item and item.place_result
+      if not place then
+        return false
+      end
+      return character.surface.can_place_entity({ name = place.name, position = p.position, direction = p.direction,
+        force = character.force, build_check_type = defines.build_check_type.manual })
+    end,
+    build_from_cursor = function(p)
+      if not this.can_build_from_cursor({ position = p.position, direction = p.direction }) then
+        return
+      end
+      local place = prototypes.item[cursor.name].place_result
+      raise("on_pre_build", { player_index = 1, position = p.position, direction = p.direction or 0 })
+      local built = character.surface.create_entity({ name = place.name, position = p.position,
+        direction = p.direction or 0, force = character.force })
+      if built then
+        cursor.count = cursor.count - 1
+        if cursor.count == 0 then
+          cursor.clear()
+        end
+        F.player_events[#F.player_events + 1] = "on_built_entity"
+        raise("on_built_entity", { entity = built, player_index = 1 })
+      end
+    end,
+    clear_cursor = function()
+      if cursor.valid_for_read then
+        main_inventory().insert({ name = cursor.name, count = cursor.count })
+        cursor.clear()
+      end
+      return true
+    end,
+    mine_entity = function(target, force)
+      assert(force == nil, "mine_entity: leave out force")
+      if not (target and target.valid) then
+        return false
+      end
+      F.player_events[#F.player_events + 1] = "on_player_mined_entity"
+      raise("on_pre_player_mined_item", { entity = target, player_index = 1 })
+      raise("on_player_mined_entity", { entity = target, player_index = 1, buffer = nil })
+      return character.mine_entity(target)
+    end,
+  }
   local player = setmetatable({}, {
     __index = function(_, k)
-      if k == "character" then
+      if methods[k] then
+        return methods[k]
+      elseif k == "valid" then
+        return true
+      elseif k == "surface" then
+        return character.surface
+      elseif k == "cursor_stack" then
+        return cursor
+      elseif k == "cursor_ghost" or k == "cursor_record" then
+        return nil
+      elseif k == "opened" then
+        return opened
+      elseif k == "opened_gui_type" then
+        return opened and defines.gui_type.entity or defines.gui_type.none
+      elseif k == "character" then
         return character
+      elseif k == "gui" then
+        return gui
       elseif k == "index" then
         return 1
       elseif k == "connected" then
         return true
+      elseif k == "admin" then
+        return F.player_admin ~= false  -- the single-player or hosting player is an admin
       elseif k == "name" then
         return "player"
       elseif k == "chat_color" then
@@ -3812,7 +4080,7 @@ function F.make_player(character)
       elseif k == "selected" then
         return selected
       elseif k == "print" then
-        return function(msg) F.printed[#F.printed + 1] = "PLAYER " .. tostring(msg) end
+        return function(msg) F.printed[#F.printed + 1] = "PLAYER " .. (type(msg) == "table" and tostring(msg[1]) or tostring(msg)) end
       elseif k == "get_quick_bar_slot" then
         return function(page, slot)
           local name = quickbar[key(page, slot)]
@@ -3839,10 +4107,27 @@ function F.make_player(character)
         F.cheat_mode = v
         return
       end
+      if k == "opened" then
+        if opened and opened ~= v then
+          F.player_events[#F.player_events + 1] = "on_gui_closed"
+          if type(opened) == "table" and rawget(opened, "get_mod") then  -- a GUI element (a mod's window); entities are strict proxies
+            raise("on_gui_closed", { element = opened, player_index = 1, gui_type = defines.gui_type.custom })
+          else
+            raise("on_gui_closed", { entity = opened, player_index = 1, gui_type = defines.gui_type.entity })
+          end
+        end
+        opened = v
+        if v then
+          F.player_events[#F.player_events + 1] = "on_gui_opened"
+          raise("on_gui_opened", { entity = v, player_index = 1, gui_type = defines.gui_type.entity })
+        end
+        return
+      end
       assert(k == "selected", "LuaPlayer: can't write " .. tostring(k))
       selected = v
     end,
   })
+  this = player
   character.player = player
   F.player = player
   F.quickbar = quickbar
@@ -3857,11 +4142,15 @@ function F.make_offline_player(index, name, x, y)
   local requester = make_sections(true)
   local quickbar, active = {}, { 1 }
   local d = {
-    index = index, name = name, connected = false, controller_type = defines.controllers.character,
+    index = index, name = name, connected = false, admin = false, controller_type = defines.controllers.character,
     last_online = 50, physical_surface = surfaces[1], physical_position = { x = x, y = y },
     force = forces.player, color = { r = 1, g = 0.5, b = 0, a = 0.5 }, character_inventory_slots_bonus = 0,
     blueprints = F.player_blueprints,
+    gui = {}, valid = true,
   }
+  for _, root in ipairs({ "top", "left", "center", "screen", "relative", "goal" }) do
+    d.gui[root] = F.gui_element({ type = "empty-widget", name = root }, "core")
+  end
   d.get_main_inventory = function() return main end
   d.get_inventory = function(i)
     return ({ [defines.inventory.character_main] = main, [defines.inventory.character_guns] = guns,
@@ -3870,7 +4159,7 @@ function F.make_offline_player(index, name, x, y)
   end
   d.get_requester_point = function() return requester end
   d.insert = function(stack) return main.insert(stack) end
-  d.print = function(msg) F.printed[#F.printed + 1] = "PLAYER " .. tostring(msg) end
+  d.print = function(msg) F.printed[#F.printed + 1] = "PLAYER " .. (type(msg) == "table" and tostring(msg[1]) or tostring(msg)) end
   d.get_quick_bar_slot = function(page, slot)
     local n = quickbar[(page - 1) * 10 + slot]
     return n and { type = "filter", filter = { name = n, quality = "normal" } } or nil
@@ -3890,7 +4179,7 @@ function F.make_offline_player(index, name, x, y)
       return v
     end,
     __newindex = function(_, k, v)
-      assert(k == "character_inventory_slots_bonus" or k == "cheat_mode", "LuaPlayer: can't write " .. tostring(k))
+      assert(k == "character_inventory_slots_bonus" or k == "cheat_mode" or k == "admin", "LuaPlayer: can't write " .. tostring(k))
       d[k] = v
     end,
   })

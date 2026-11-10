@@ -84,8 +84,8 @@ my-addon/
 | Field | |
 |---|---|
 | `id` | Lower case letters, digits, `-` and `_`. Names the add-on's keys, data folder and node |
-| `name`, `version`, `description`, `author` | Shown in the Mods window and Settings → Controls |
-| `api` | The add-on API it was written for: `1` (any 1.x) or `1.1` (needs the additions below). Zenith refuses an add-on that needs a newer API than it has, and says so in the Add-ons menu: update Zenith |
+| `name`, `version`, `description`, `author` | Shown in the Add-ons menu, the Mods window and Settings → Controls |
+| `api` | The add-on API it was written for: `1` (any 1.x), or `1.1` or `1.2` (needs the additions marked with that level below). Zenith refuses an add-on that needs a newer API than it has, and says so in the Add-ons menu: update Zenith |
 | `entry` | The entry script, a `.gd` file in the folder |
 
 This page describes add-on API **1.2**: version 1 with additions that keep every 1.0 add-on
@@ -143,7 +143,7 @@ A few GDScript notes:
 | | |
 |---|---|
 | `api.version` | The add-on API this Zenith offers (1) |
-| `api.level` | *(1.1)* The exact level, with the additions within the version (1.1). Absent on 1.0 |
+| `api.level` | *(1.1)* The exact level, with the additions within the version (1.2). Absent on 1.0 |
 | `api.zenith_version` | Zenith's version, for messages |
 | `api.id`, `api.name`, `api.addon_version`, `api.dir` | From your `addon.json`, and the add-on's folder |
 | `api.in_game()` | A game is on |

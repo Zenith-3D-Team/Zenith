@@ -1,5 +1,4 @@
 extends MeshInstance3D
-const GroundHeight := preload("res://scripts/world/ground_height.gd")
 ## Factorio's selection and placement marks, drawn flat just above the ground and over everything
 ## (no depth test, like Factorio's overlays on its sprites): the selection box's corner brackets
 ## round the hovered entity or vehicle; the yellow arrows of inserters (where they pick up and
@@ -9,7 +8,9 @@ const GroundHeight := preload("res://scripts/world/ground_height.gd")
 ## roboports (H14, roboport_links.gd).
 ##
 ## marks_for() works the marks out as plain data from the mod's `eprops` overlay (ui_model.eprops
-## "x"), so the UI test can check them; show() draws a list of marks.
+## "x"), so the UI test can check them; show_marks() draws a list of marks.
+
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const YELLOW := Color(1.0, 0.8, 0.1, 0.95)
 const SELECTION := Color(1.0, 0.86, 0.3, 0.95)

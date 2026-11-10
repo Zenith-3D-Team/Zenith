@@ -5,7 +5,6 @@
 -- so it stays deterministic.
 
 local transport = require("scripts.transport")
-local world = require("scripts.world")
 local puppet = require("scripts.puppet")
 local crafting = require("scripts.crafting")
 local pedia = require("scripts.pedia")
@@ -16,6 +15,13 @@ local M = {}
 
 local STATUS_INTERVAL = 60
 local TECHS_PER_MESSAGE = 40
+-- A message's records stay under MESSAGE_BYTES, and one record under RECORD_BYTES: a datagram holds
+-- 65,507 bytes and the transport joins messages into datagrams of up to 60,000. A recycling
+-- technology with thousands of modded recipes is one record of 103-187 KB (textplates, Space
+-- Exploration with Space Age), which was dropped and lost its 40 neighbours with it; its effects
+-- are cut to fit and the record says how many were left out.
+local MESSAGE_BYTES = 40000
+local RECORD_BYTES = 30000
 
 local function force()
   local c = puppet.get()
@@ -55,7 +61,8 @@ end
 -- [name, order, prerequisites, ingredients [[name, amount], ...], unit count, seconds per unit,
 --  state, trigger, effects [[type, recipe or modifier target, value], ...], level, max level (-1
 --  infinite), trigger detail [type, target, count] or [], saved progress (thousandths), count
---  formula or "", essential (1: shown with "Show only essential technologies", else 0)]
+--  formula or "", essential (1: shown with "Show only essential technologies", else 0),
+--  effects left out to keep the record small (only when some were)]
 local INFINITE = 4294967295
 
 local function record(tech)
@@ -93,7 +100,25 @@ local function start_techs()
     end
   end
   table.sort(names)
-  storage.f3d.techs_job = { names = names, part = 1, parts = math.max(1, math.ceil(#names / TECHS_PER_MESSAGE)) }
+  storage.f3d.techs_job = { names = names, block = 1, blocks = math.max(1, math.ceil(#names / TECHS_PER_MESSAGE)), sent = 0 }
+end
+
+-- A record that would be over RECORD_BYTES keeps as many effects as fit, and says how many it left out.
+local function fit(rec)
+  local size = #helpers.table_to_json(rec)
+  if size <= RECORD_BYTES then
+    return rec, size
+  end
+  local effects = rec[9]
+  local per = math.max(1, (size - 64) / math.max(1, #effects))
+  local keep = math.max(0, math.floor((RECORD_BYTES - (size - per * #effects)) / per) - 1)
+  local kept = {}
+  for i = 1, math.min(keep, #effects) do
+    kept[i] = effects[i]
+  end
+  rec[9] = kept
+  rec[16] = #effects - #kept
+  return rec, #helpers.table_to_json(rec)
 end
 
 -- Sends parts while the budget lasts; true when the last one went.
@@ -101,20 +126,34 @@ local function send_tech_parts()
   local s = storage.f3d
   local job = s.techs_job
   local techs = force().technologies
-  while job.part <= job.parts do
+  while job.block <= job.blocks do
     if not budget.can(TECHS_PER_MESSAGE * TECH_PRICE, "techs", 0.5) then
       return false
     end
     budget.spend(TECHS_PER_MESSAGE * TECH_PRICE, "techs")
-    local slice = {}
-    for i = (job.part - 1) * TECHS_PER_MESSAGE + 1, math.min(job.part * TECHS_PER_MESSAGE, #job.names) do
+    -- A block of names, as messages of up to MESSAGE_BYTES. The client gathers until a message's
+    -- part reaches its parts, so `parts` counts the messages sent, this block's and one per block
+    -- left: it grows when a block needs more than one, and only the very last message reaches it.
+    local messages, slice, bytes = {}, {}, 0
+    for i = (job.block - 1) * TECHS_PER_MESSAGE + 1, math.min(job.block * TECHS_PER_MESSAGE, #job.names) do
       local tech = techs[job.names[i]]
       if tech then
-        slice[#slice + 1] = record(tech)
+        local rec, size = fit(record(tech))
+        if #slice > 0 and bytes + size > MESSAGE_BYTES then
+          messages[#messages + 1] = slice
+          slice, bytes = {}, 0
+        end
+        slice[#slice + 1] = rec
+        bytes = bytes + size + 1
       end
     end
-    transport.send_reliable({ t = "techs", part = job.part, parts = job.parts, l = slice })
-    job.part = job.part + 1
+    messages[#messages + 1] = slice
+    local parts = job.sent + #messages + (job.blocks - job.block)
+    for _, l in ipairs(messages) do
+      job.sent = job.sent + 1
+      transport.send_reliable({ t = "techs", part = job.sent, parts = parts, l = l })
+    end
+    job.block = job.block + 1
   end
   s.techs_job = nil
   return true
@@ -122,7 +161,7 @@ end
 
 function M.queue_length()
   local job = storage.f3d.techs_job
-  return job and (job.parts - job.part + 1) or 0
+  return job and job.block and (job.blocks - job.block + 1) or 0
 end
 budget.register_queue("techs", M.queue_length)
 
@@ -136,35 +175,6 @@ local function queue_names(f)
 end
 
 -- What is being researched now (or ""), its progress, and the queue.
--- defines.entity_status number -> name, built once from the defines.
-local STATUS_NAMES
-local function status_name(status)
-  if not STATUS_NAMES then
-    STATUS_NAMES = {}
-    for name, value in pairs(defines.entity_status) do
-      STATUS_NAMES[value] = name
-    end
-  end
-  return status and STATUS_NAMES[status] or "unknown"
-end
-
--- [[unit, status name], ...] for labs near the camera: "working", "missing_science_packs",
--- "no_research_in_progress", "no_power"... what keeps research from going.
-local function labs()
-  local s = storage.f3d
-  local f = s.focus
-  local out = {}
-  for _, lab in pairs(world.surface().find_entities_filtered({
-    area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } },
-    type = "lab",
-  })) do
-    if lab.unit_number then
-      out[#out + 1] = { lab.unit_number, status_name(lab.status) }
-    end
-  end
-  return out
-end
-
 local function send_status()
   local f = force()
   local current = f.current_research
@@ -173,19 +183,7 @@ local function send_status()
     cur = current and current.name or "",
     pr = current and math.floor(f.research_progress * 1000 + 0.5) or 0,
     q = queue_names(f),
-    labs = labs(),
   })
-end
-
--- The recipes a technology unlocks, for the "research completed" notification.
-local function unlocks(tech)
-  local out = {}
-  for _, effect in pairs(tech.prototype.effects or {}) do
-    if effect.type == "unlock-recipe" then
-      out[#out + 1] = effect.recipe
-    end
-  end
-  return out
 end
 
 ---------------------------------------------------------------------------------------------
@@ -212,6 +210,9 @@ function M.research_cancel(cmd)
   local current = f.current_research
   if current and current.name == name then
     f.cancel_current_research()
+    -- Its progress is now the technology's saved progress, which only `techs` carries (the
+    -- window's "researched before it was stopped").
+    storage.f3d.techs_dirty = true
   else
     local keep = {}
     for _, queued in ipairs(queue_names(f)) do
@@ -231,12 +232,11 @@ end
 function M.on_research_changed(event)
   storage.f3d.techs_dirty = true
   crafting.invalidate()
-  -- A notification for the client; `tech` and `unlocks` let it show names in the player's
+  -- A notification for the client; `tech` lets it show the name in the player's
   -- language (the text is internal names, a headless server can't translate).
   local tech = event.research
   if event.name == defines.events.on_research_finished and tech and storage.f3d.client then
-    local ok, list = pcall(unlocks, tech)
-    transport.send_now({ t = "msg", text = "Research completed: " .. tech.name, tech = tech.name, unlocks = ok and list or {} })
+    transport.send_now({ t = "msg", text = "Research completed: " .. tech.name, tech = tech.name })
   end
 end
 
@@ -249,6 +249,12 @@ end
 
 function M.tick()
   local s = storage.f3d
+  -- A save made while an older bridge was sending the tree keeps its job as `part`/`parts`: start
+  -- the tree over rather than stop the game on the missing `block`.
+  if s.techs_job and not s.techs_job.block then
+    s.techs_job = nil
+    s.techs_dirty = true
+  end
   if s.techs_dirty and not s.techs_job then
     s.techs_dirty = nil
     start_techs()

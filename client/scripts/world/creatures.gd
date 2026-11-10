@@ -12,9 +12,9 @@ extends Node3D
 ## into another square.
 ##
 ## Attacking and dying creatures are posed here every frame instead (their bites, spits and falls),
-## each frame's poses appended after a layer's walkers; so are other players' characters (posed on
-## the CPU, character_pose.gd) and creatures whose model can't walk on the GPU, from their nodes,
-## which movers.gd moves.
+## each frame's poses appended after a layer's walkers; so are other players' characters (at rest:
+## only the player's own avatar is posed, by character_pose.gd) and creatures whose model can't walk
+## on the GPU, from their nodes, which movers.gd moves.
 ##
 ## Attacks come from the mod's `en` (units in range of their attack target, worms with a shooting
 ## target); with a mod too old to send it, one that stands still near the player's character
@@ -71,8 +71,6 @@ const SPIT_SECONDS := 27.0 / 0.4 / 60.0
 const SPIT_SWAP := 0.1
 ## An attack lapses when its unit hasn't been in `en` for this long (it comes every 10 ticks).
 const ATTACK_HOLD := 0.5
-## Without an `en` for this long, attacks are guessed again (a mod that doesn't send it).
-const EN_TIMEOUT := 30.0
 const TURN_RATE := 10.0  # how fast an attacker turns to its target (1 / seconds)
 const STILL_SPEED := 0.4  # tiles per second
 const STILL_SECONDS := 0.25
@@ -205,7 +203,9 @@ var _dying: Array[Dying] = []
 var _attacks := {}  # unit -> [target Vector3, when it was last listed]
 var _looks := {}  # another player's character unit -> its armour's look (set_looks)
 var _clock := 0.0
-var _en_time := -1e9  # when the last `en` came
+## An `en` has come: the mod says who attacks (it sends none while nobody does), so nothing is
+## guessed from then on, whatever the quiet between fights. Kept from game to game (one bridge).
+var _en_seen := false
 var _layers := {}  # model name -> {LIVE_CELL square: Layer}
 var _posed := {}  # unit -> Creature: posed here every frame (attacking, characters, no GPU model)
 var _mover_meshes := {}  # model name -> its copy with the mover shader, or null where it can't walk on the GPU
@@ -246,14 +246,6 @@ func count() -> int:
 
 func corpse_count() -> int:
 	return _corpses.size() + _dying.size()
-
-
-## MultiMeshes drawing corpses and their puddles (for tests).
-func corpse_layers() -> int:
-	var n := 0
-	for cell: CorpseCell in _cells.values():
-		n += cell.layers.size() + cell.puddles.size()
-	return n
 
 
 ## Draws prototype `name` until removed: walking from record `slot` on the GPU (movers.gd writes it;
@@ -368,9 +360,6 @@ func _pose(c: Creature) -> void:
 func _pose_now(c: Creature) -> Transform3D:
 	if c.slot >= 0 and records != null:
 		return Transform3D(Basis(Vector3.UP, records.yaw_at(c.slot, records.tick)), records.position(c.slot))
-	if c.slot >= 0 and pose_source.is_valid():
-		var st: Dictionary = pose_source.call(c.slot)
-		return Transform3D(Basis(Vector3.UP, st["yaw"]), st["pos"])
 	return c.node.transform
 
 
@@ -442,7 +431,7 @@ func handle_attacks(msg: Dictionary) -> void:
 	var l = msg.get("l")
 	if not l is Array:
 		return
-	_en_time = _clock
+	_en_seen = true
 	for i in range(0, l.size() - 2, 3):
 		var unit := int(l[i])
 		_attacks[unit] = [Vector3(float(l[i + 1]) / 256.0, 0.0, float(l[i + 2]) / 256.0), _clock]
@@ -459,9 +448,9 @@ func attack_target(unit: int) -> Variant:
 	return a[0]
 
 
-## True while the mod is sending `en` (attacks aren't guessed then).
+## True once the mod has sent an `en` (attacks aren't guessed then).
 func attacks_reported() -> bool:
-	return _clock - _en_time < EN_TIMEOUT
+	return _en_seen
 
 
 ## `died`: it collapses where it was, then leaves its corpse.

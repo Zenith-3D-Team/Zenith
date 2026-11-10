@@ -171,16 +171,20 @@ class Graph:
 		generation += 1
 
 	## The belts among a chunk's records, as [how many, a sum of each one's place, way, prototype and
-	## shape]: the same whatever order the records come in.
+	## shape]: the same whatever order the records come in. On belt_items.gd's worker, over the world's
+	## live records: a splitter's or loader's `extra` is written on the main thread (Alt-mode's `aiu`),
+	## so only a belt's and an underground's (whose shape is all that's read) are looked at.
 	func signature(recs: Array) -> Vector2i:
 		var n := 0
 		var sum := 0
 		for r: WorldMirror.Rec in recs:
-			if not kinds.has(r.proto_id):
+			var k: int = kinds.get(r.proto_id, -1)
+			if k < 0:
 				continue
 			n += 1
+			var shape = r.extra.get("s", "") if k == STRAIGHT else (r.extra.get("u", "") if k == UG_IN else "")
 			sum += ((r.fixed.x * 73856093) ^ (r.fixed.y * 19349663) ^ ((r.dir * 4099 + r.proto_id) * 83492791)
-				^ hash(r.extra.get("s", r.extra.get("u", "")))) & 0x7fffffff
+				^ hash(shape)) & 0x7fffffff
 		return Vector2i(n, sum & 0x7fffffff)
 
 	static func piece_point(pc: PackedFloat64Array, s: float) -> Vector2:

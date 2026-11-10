@@ -169,15 +169,16 @@ end
 -- So each surface's radars are kept in storage.f3d_radars[surface index] (one list for every
 -- client): found once by a scan that walks squares of RADAR_REGION tiles in rings out from the
 -- map's centre, a few squares a tick under the work budget, until a whole ring holds nothing; and
--- kept current by tracker.listeners (built and removed radars; a removed one is dropped once it is
--- no longer valid). The scan starts again now and then (RADAR_RESCAN_TICKS) for radars made
+-- kept current by tracker.listeners (built and removed radars; M.tick drops removed ones every
+-- RADAR_PRUNE_TICKS, never the reads, which a module-local cache times). The scan starts again now and then (RADAR_RESCAN_TICKS) for radars made
 -- without an event. The same scan finds the cargo landing pads (reg.pads), which the map view
--- centres on when it switches to a planet (H23).
+-- centres on when it switches to a planet.
 local SCANNED = { "radar", "cargo-landing-pad" }
 local RADAR_REGION = 4 * CHUNK
 local RADAR_REGION_PRICE = 32       -- units for one square (16 chunks; ~0.4 ms on a busy base)
 local RADAR_SHARE = 0.3
 local RADAR_RESCAN_TICKS = 36000
+local RADAR_PRUNE_TICKS = 600    -- how often gone radars and pads leave the lists
 
 local function radar_registry(surface)
   storage.f3d_radars = storage.f3d_radars or {}
@@ -259,18 +260,52 @@ local function radar_touched(entity)
 end
 tracker.listeners[#tracker.listeners + 1] = radar_touched
 
--- The force's radars on the surface, as far as they are known (valid ones).
+-- The force's radars on the surface, as far as they are known (valid ones). Read only: it is
+-- called where a module-local cache decides (radar_coverage), so it must not change storage; gone
+-- radars are dropped by prune_radars from M.tick.
 local function radars_of(surface, force)
   local out = {}
-  local reg = radar_registry(surface)
-  for unit, r in pairs(reg.list) do
-    if not r.valid then
-      reg.list[unit] = nil
-    elseif r.force == force then
+  local reg = storage.f3d_radars and storage.f3d_radars[surface.index]
+  for _, r in pairs(reg and reg.list or {}) do
+    if r.valid and r.force == force then
       out[#out + 1] = r
     end
   end
   return out
+end
+
+-- How many chunks round itself a radar keeps revealed: its prototype's, the same on every peer.
+local reveal_of_proto = {}
+local function reveal_of(r)
+  local d = reveal_of_proto[r.name]
+  if not d then
+    local okd, v = pcall(function() return r.prototype.max_distance_of_nearby_sector_revealed end)
+    d = okd and tonumber(v) or 3
+    reveal_of_proto[r.name] = d
+  end
+  return d
+end
+
+-- Drops radars and landing pads no longer valid from a surface's lists (from M.tick).
+local function prune_radars(reg)
+  for unit, r in pairs(reg.list) do
+    if not r.valid then
+      reg.list[unit] = nil
+    end
+  end
+  for unit, pad in pairs(reg.pads or {}) do
+    if not pad.valid then
+      reg.pads[unit] = nil
+    end
+  end
+end
+
+-- Starts (or keeps) the look for a surface's radars, which M.tick then carries on. Only from
+-- commands and events: M.covered and radar_coverage only read the lists.
+function M.watch_radars(surface)
+  if surface and surface.valid then
+    radar_registry(surface)
+  end
 end
 
 -- Surfaces whose radars are still being looked for.
@@ -285,7 +320,7 @@ function M.radar_queue()
 end
 budget.register_queue("radars", M.radar_queue)
 
--- Roboports reveal too (owner's H13; Factorio's own don't): a chunk counts as seen when its centre
+-- Roboports reveal too (; Factorio's own don't): a chunk counts as seen when its centre
 -- lies in a roboport's construction area, the larger of its two and where its robots reach, so a
 -- network shows whole. Mobile cells (a character's or a spidertron's personal roboport) don't count.
 -- Read from the game (a few API calls), so it is the same on every peer.
@@ -354,8 +389,7 @@ function M.covered(surface, force, position)
   for _, r in pairs(radars_of(surface, force)) do
     local status = r.status
     if status == working or status == low then
-      local okd, d = pcall(function() return r.prototype.max_distance_of_nearby_sector_revealed end)
-      d = okd and tonumber(d) or 3
+      local d = reveal_of(r)
       if math.abs(math.floor(r.position.x / CHUNK) - cx) <= d and math.abs(math.floor(r.position.y / CHUNK) - cy) <= d then
         return true
       end
@@ -911,57 +945,81 @@ local TRAIN_ASK_TICKS = 20     -- more asks than this are ignored (a client can'
 local LOCO_COLOR = 0xEB1200    -- Factorio's default locomotive colour {0.92, 0.07, 0}
 local WAGON_COLOR = 0x9A9A9A
 local carriage_size = {}       -- prototype name -> {length, width}: prototypes only
-local last_train_ask = -TRAIN_ASK_TICKS
 local COVERAGE_TICKS = 60      -- the radars' statuses are read at most this often (only what is sent)
 local coverage = { tick = -COVERAGE_TICKS }
+local coverage_sets = { key = nil, set = nil }
+
+-- The chunks a radar list ([cx, cy, d, ...]) covers ("cx,cy" -> true), made again only when the
+-- list changed: worked out from the list alone, so the same on every peer.
+local function coverage_set(si, list)
+  local key = si .. ":" .. table.concat(list, ",")
+  if coverage_sets.key == key then
+    return coverage_sets.set
+  end
+  local set = {}
+  for i = 1, #list, 3 do
+    local rx, ry, d = list[i], list[i + 1], list[i + 2]
+    for cx = rx - d, rx + d do
+      for cy = ry - d, ry + d do
+        set[cx .. "," .. cy] = true
+      end
+    end
+  end
+  coverage_sets.key, coverage_sets.set = key, set
+  return set
+end
 
 -- [cx, cy, d, ...] for the force's working radars on the surface (as far as the scan has found
--- them), and a set of the chunks they cover ("cx,cy" -> true). Kept a second; it only decides what
--- is sent, never what is stored.
-local function radar_coverage(surface, force)
-  if coverage.surface == surface.index and coverage.force == force.name and game.tick - coverage.tick < COVERAGE_TICKS then
+-- them), and a set of the chunks they cover ("cx,cy" -> true). Kept a second, which only suits what
+-- is sent: a peer that loaded since has another second's statuses (or none). With `exact`, read
+-- now, for what decides what goes in storage (belt items' rounds).
+local function radar_coverage(surface, force, exact)
+  if not exact and coverage.surface == surface.index and coverage.force == force.name
+    and game.tick - coverage.tick < COVERAGE_TICKS then
     return coverage.list, coverage.set
   end
-  local list, set = {}, {}
+  local list = {}
   local working, low = defines.entity_status.working, defines.entity_status.low_power
   for _, r in pairs(radars_of(surface, force)) do
     local status = r.status
     if status == working or status == low then
-      local okd, d = pcall(function() return r.prototype.max_distance_of_nearby_sector_revealed end)
-      d = okd and tonumber(d) or 3
-      local rx, ry = math.floor(r.position.x / CHUNK), math.floor(r.position.y / CHUNK)
-      list[#list + 1] = rx
-      list[#list + 1] = ry
-      list[#list + 1] = d
-      for cx = rx - d, rx + d do
-        for cy = ry - d, ry + d do
-          set[cx .. "," .. cy] = true
-        end
-      end
+      list[#list + 1] = math.floor(r.position.x / CHUNK)
+      list[#list + 1] = math.floor(r.position.y / CHUNK)
+      list[#list + 1] = reveal_of(r)
     end
   end
-  coverage = { tick = game.tick, surface = surface.index, force = force.name, list = list, set = set }
+  local set = coverage_set(surface.index, list)
+  if not exact then
+    coverage = { tick = game.tick, surface = surface.index, force = force.name, list = list, set = set }
+  end
   return list, set
 end
 
 -- The 3D remote view (`focus` with rv = 1) shows moving things only where radars or the character
 -- see, as Factorio's remote view does elsewhere: there the client greys the world out. A chunk is
 -- seen when a working radar covers it or its centre lies within the character's charting radius
--- (as the map's dimming counts it). Platforms are always seen. Only what is sent depends on this.
+-- (as the map's dimming counts it). Platforms are always seen.
+--
+-- Multiplayer: the plain filter keeps radars' statuses a second and roboports' coverage one to two
+-- (radar_coverage, roboport_seen), module-local, so a peer that loaded since sees a little
+-- differently: it may only decide what is sent. What decides what goes in storage (belt items'
+-- rounds keep the belts they found) asks for the `exact` one: the game as it is this tick.
 local VIEW_NEAR = (CHART_RADIUS + CHUNK / 2) ^ 2
-local view = { tick = -1 }
+local views = { [false] = { tick = -1 }, [true] = { tick = -1 } }
 
 -- nil outside the remote view (everything is sent), else a function (x, y) -> whether that map
--- position is seen. Built once a tick, chunks memoised.
-function M.view_filter()
+-- position is seen. Built once a tick per client, chunks memoised.
+function M.view_filter(exact)
   local s = storage.f3d
   if not s.remote_view then
     return nil
   end
-  if view.tick == game.tick then
+  exact = exact and true or false
+  local view = views[exact]
+  if view.tick == game.tick and view.state == s then
     return view.fn
   end
-  view.tick = game.tick
+  view.tick, view.state = game.tick, s
   view.fn = nil
   local surface = world.surface()
   local okp, platform = pcall(function() return surface.platform end)
@@ -970,7 +1028,7 @@ function M.view_filter()
   end
   local c = puppet.get()
   local force = c and c.force or game.forces.player
-  local _, set = radar_coverage(surface, force)
+  local _, set = radar_coverage(surface, force, exact)
   local near = c and c.valid and c.surface == surface and c.position or nil
   local f = s.focus
   if near and f then
@@ -980,6 +1038,7 @@ function M.view_filter()
       return nil
     end
   end
+  local sees = exact and roboport_sees or roboport_seen
   local floor, memo = math.floor, {}
   view.fn = function(x, y)
     local cx, cy = floor(x / CHUNK), floor(y / CHUNK)
@@ -996,7 +1055,7 @@ function M.view_filter()
         seen = dx * dx + dy * dy <= VIEW_NEAR
       end
       if not seen then
-        seen = roboport_seen(surface, force, cx, cy)
+        seen = sees(surface, force, cx, cy)
       end
       row[cy] = seen
     end
@@ -1005,9 +1064,9 @@ function M.view_filter()
   return view.fn
 end
 
--- The entities of a list the remote view sees (all of them outside it).
-function M.view_only(entities)
-  local seen = M.view_filter()
+-- The entities of a list the remote view sees (all of them outside it); `exact` as view_filter.
+function M.view_only(entities, exact)
+  local seen = M.view_filter(exact)
   if not seen then
     return entities
   end
@@ -1075,17 +1134,22 @@ local function colour_of(car)
   return car.type == "locomotive" and LOCO_COLOR or WAGON_COLOR
 end
 
+-- When the last ask was answered is kept in storage, the same on every peer.
 function M.trains(cmd)
-  if game.tick - last_train_ask < TRAIN_ASK_TICKS then
-    return
-  end
-  last_train_ask = game.tick
   local c = puppet.get()
   local surface = surface_of(cmd, c)
+  M.watch_radars(surface)  -- from the command itself, not behind the limit below
+  local s = storage.f3d
+  if game.tick - (s.mtr_ask or -TRAIN_ASK_TICKS) < TRAIN_ASK_TICKS then
+    return
+  end
+  s.mtr_ask = game.tick
   local force = c and c.force or game.forces.player
   local ok, list = pcall(function() return game.train_manager.get_trains({ surface = surface, force = force }) end)
   local radars, covered_set = radar_coverage(surface, force)
   local near = c and c.valid and c.surface == surface and c.position or nil
+  -- A space platform is seen whole (as `cov` says with `all`); it has no radars to list.
+  local okp, platform = pcall(function() return surface.platform end)
   local parts, current = {}, {}
   for _, train in pairs(ok and list or {}) do
     for _, car in pairs(train.carriages) do
@@ -1122,12 +1186,15 @@ function M.trains(cmd)
     local msg = { t = "mtr", si = surface.index, part = i, parts = #parts, l = l }
     if i == 1 then
       msg.cov = radars
+      if okp and platform then
+        msg.all = 1
+      end
     end
     transport.send_now(msg)
   end
 end
 
--- The map's logistic networks layer (H13): Factorio's map draws every roboport's logistic and
+-- The map's logistic networks layer: Factorio's map draws every roboport's logistic and
 -- construction area on the surface, not only the ones in the charts the client happened to load,
 -- and the client counts the ground in their construction areas as seen (roboport_sees).
 -- {si?, q}: the client asks every few seconds while a map or the remote view needs them, and gets
@@ -1246,7 +1313,7 @@ function M.roboport_queue()
 end
 budget.register_queue("roboports", M.roboport_queue)
 
--- {si, q}: where the map view centres on switching to a planet (H23), the force's cargo landing pad
+-- {si, q}: where the map view centres on switching to a planet, the force's cargo landing pad
 -- there (the lowest unit number if there are several): `lpad` {si, q, x?, y?} (1/256 tile), without
 -- x, y when the surface has none. The pads come from the radars' scan of that surface (started now
 -- if it hasn't been), so the answer waits until a pad is found or the scan is done (at most
@@ -1336,9 +1403,14 @@ function M.tick()
       transport.send_now({ t = "msg", text = "Map error: " .. tostring(err) })
     end
   end
-  -- Radars still being looked for on any surface (radars_of starts a surface's scan when asked).
+  -- Radars still being looked for on any surface (the shown surface's, and those asked about:
+  -- M.watch_radars, M.landing_pad).
   radar_registry(world.surface())
+  local prune = game.tick % RADAR_PRUNE_TICKS == 0
   for si, reg in pairs(storage.f3d_radars) do
+    if prune then
+      prune_radars(reg)
+    end
     if not reg.done or game.tick - (reg.done_tick or 0) >= RADAR_RESCAN_TICKS then
       local surface = game.get_surface(si)
       if surface and surface.valid then

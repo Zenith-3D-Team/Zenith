@@ -13,7 +13,7 @@ uniform float roughness = 0.8;
 uniform float exposure = 1.0;
 
 void vertex() {
-	VERTEX = belt_vertex(VERTEX, INSTANCE_CUSTOM);
+	belt_place(VERTEX, NORMAL, INSTANCE_ID);
 	VERTEX.y += ground_h(VERTEX.xz);  // world coordinates here
 }
 

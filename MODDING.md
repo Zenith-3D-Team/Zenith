@@ -122,6 +122,15 @@ What happens to a mod's content today:
 - **Their screens are picked by Factorio type**, so a modded furnace gets the furnace screen and
   a modded assembler the assembler screen. Mods that open their own GUI in Factorio don't show it here,
   because there is no player for Factorio to draw it for.
+- **Mods that react to what a player does** (building, mining, rotating, pasting settings,
+  opening a machine) hear what you do in Zenith when the client plays a player's own character:
+  single-player, or the server's "Player to play as" while that player is connected. The bridge
+  then acts through that player, so Factorio raises its own player events (`on_built_entity`,
+  `on_player_mined_entity`, `on_player_rotated_entity`, `on_entity_settings_pasted`,
+  `on_gui_opened`) and applies its own reach and placement rules, other mods' reach bonuses
+  included. The bridge's own character on a server has no player, so it builds by script and
+  mods see only `script_raised_built`. The map setting "Act as the player for other mods" turns
+  this off.
 - **Big overhaul mods haven't been tried.** Small mods that add entities of normal types are the
   most likely to work.
 

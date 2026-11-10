@@ -11,8 +11,6 @@ const Visuals := preload("res://scripts/world/visuals.gd")
 
 const MAX_SIZE := 32
 const REPEAT := 0.1
-## The character's build_distance (player_input.gd's too).
-const BUILD_REACH := 10.0
 const COLORS := {"ok": Color(0.35, 1.0, 0.45, 0.35), "bad": Color(1.0, 0.3, 0.25, 0.35), "ghost": Color(0.45, 0.65, 1.0, 0.35),
 	"mine": Color(1.0, 0.75, 0.3, 0.3)}
 
@@ -93,7 +91,7 @@ func tile_states(item: String, at: Vector2, ghost_mode: bool) -> Array:
 			state = "bad"
 		elif ghost_mode:
 			state = "ghost"
-		elif (Vector2(t) + Vector2(0.5, 0.5)).distance_to(reach_from) > BUILD_REACH + 1.5:
+		elif (Vector2(t) + Vector2(0.5, 0.5)).distance_to(reach_from) > pi.build_reach() + 1.5:
 			state = "bad"
 		out.append([t, state])
 	return out

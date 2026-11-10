@@ -91,12 +91,6 @@ static func walks(name: String) -> bool:
 	return rig(model).get("mode", "") in ["walk", "pose"]
 
 
-## True for worms (rig mode "worm"): anim.gd raises, folds and aims them.
-static func is_worm(name: String) -> bool:
-	var model := base_model(name)
-	return rig(name if model == "" else model).get("mode", "") == "worm"
-
-
 ## The limb table of a model (creature_rigs.json), or {}.
 static func rig(model: String) -> Dictionary:
 	if not _loaded:

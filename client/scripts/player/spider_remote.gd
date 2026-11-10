@@ -32,11 +32,13 @@ func _on_message(msg: Dictionary) -> void:
 	if str(msg.get("t", "")) != "spd" or not (msg.get("l") is Array):
 		return
 	for rec in msg["l"]:
-		if rec is Array and rec.size() >= 2 and rec[1] is Array:
+		# A spidertron with no waypoints left: Factorio writes its empty list as {}.
+		if rec is Array and rec.size() >= 2 and (rec[1] is Array or rec[1] is Dictionary):
 			var points: Array = []
-			for p in rec[1]:
-				if p is Array and p.size() >= 2:
-					points.append(Vector2(int(p[0]), int(p[1])) / 256.0)
+			if rec[1] is Array:
+				for p in rec[1]:
+					if p is Array and p.size() >= 2:
+						points.append(Vector2(int(p[0]), int(p[1])) / 256.0)
 			waypoints[int(rec[0])] = points
 
 

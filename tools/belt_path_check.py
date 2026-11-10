@@ -7,12 +7,14 @@ base, cutting across curves, over splitters and undergrounds).
         and a left curve, a splitter, an underground and side-loading, fed with items on both lanes
     python tools/belt_path_check.py record --out truth.json [--rcon-port 34198] [--area x0,y0,x1,y1] [--ticks 600]
         records the belts there, every lane's line (get_line_item_position along it) and every
-        item's place each tick: the truth the client's drawing is measured against
-    python tools/belt_path_check.py check truth.json drawn.json [...]
-        compares where the client drew each item (client/tests/belt_path_replay.tscn, or
-        --belt-path-probe in the client against the same server) with the lanes: the distance from
-        each drawn item to the nearest lane's centre line where items show, items drawn over an
-        underground's gap, and items hidden where they should show
+        item's place each tick: the truth the client's drawing is measured against; the belts and
+        lanes --belt-margin (16) tiles further out, so a replay knows the belts its items go on to
+    python tools/belt_path_check.py check truth.json drawn.json [...] [--within x0,y0,x1,y1]
+        compares where the client drew each item (client/tests/belt_path_replay.tscn or
+        belt_stream_replay.tscn, or --belt-path-probe in the client against the same server) with the
+        lanes: the distance from each drawn item to the nearest lane's centre line where items show,
+        items drawn over an underground's gap, and items hidden where they should show; --within
+        counts only drawn and game items inside that rectangle (a recording of part of what is drawn)
 
 Positions are tiles; lanes and tracks are recorded in 1/256 tile, as the mod sends them.
 """
@@ -26,15 +28,16 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
+from percentile import pct  # noqa: E402
 
 LAYOUT_LUA = r"""
 local s = game.surfaces.nauvis
 local f = game.forces.player
 local X, Y = %(x)d, %(y)d
-local area = {{X - 2, Y - 2}, {X + 18, Y + 40}}
+local area = {{X - 2, Y - 2}, {X + 18, Y + 54}}
 for _, e in pairs(s.find_entities_filtered({area = area})) do if e.type ~= "character" then e.destroy() end end
 local tiles = {}
-for x = X - 2, X + 17 do for y = Y - 2, Y + 39 do tiles[#tiles + 1] = {name = "refined-concrete", position = {x, y}} end end
+for x = X - 2, X + 17 do for y = Y - 2, Y + 53 do tiles[#tiles + 1] = {name = "refined-concrete", position = {x, y}} end end
 s.set_tiles(tiles)
 local N, E, W = defines.direction.north, defines.direction.east, defines.direction.west
 local S = defines.direction.south
@@ -72,6 +75,10 @@ for i, t in ipairs(tiers) do
     bt.sources[#bt.sources + 1] = s.find_entity(belt, {X + 0.5, Y + y0 + 0.5})
     bt.sinks[#bt.sinks + 1] = s.find_entity(belt, {X + 7.5, Y + y0 + 1.5})
     bt.sinks[#bt.sinks + 1] = s.find_entity(belt, {X + 12.5, Y + y0 + 0.5})
+    local py = 41 + (i - 1) * 3
+    for x = 0, 13 do put(belt, x + 0.5, py + 0.5, E) end
+    bt.packed = bt.packed or {}
+    bt.packed[#bt.packed + 1] = { s.find_entity(belt, {X + 0.5, Y + py + 0.5}), s.find_entity(belt, {X + 13.5, Y + py + 0.5}) }
   end
 end
 script.on_nth_tick(1, function()
@@ -97,6 +104,24 @@ script.on_nth_tick(1, function()
       end
     end
   end
+  for _, pr in pairs(bt.packed or {}) do
+    local src, sink = pr[1], pr[2]
+    if src.valid and sink.valid then
+      for i = 1, 2 do
+        local l = src.get_transport_line(i)
+        if l.can_insert_at(0) then l.insert_at(0, {name = "iron-plate", count = 1}) end
+      end
+      local l1, l2 = sink.get_transport_line(1), sink.get_transport_line(2)
+      if game.tick %% 30 == 0 then
+        for _, it in pairs(l1.get_detailed_contents()) do
+          if it.position < 0.3 then l1.remove_item({name = it.stack.name, count = 1}) break end
+        end
+      end
+      for _, it in pairs(l2.get_detailed_contents()) do
+        if it.position < 0.3 then l2.remove_item({name = it.stack.name, count = 1}) end
+      end
+    end
+  end
 end)
 rcon.print("built " .. #bt.sources .. " rows at " .. X .. "," .. Y)
 """
@@ -104,6 +129,10 @@ rcon.print("built " .. #bt.sources .. " rows at " .. X .. "," .. Y)
 RECORD_LUA = r"""
 local s = game.surfaces.nauvis
 local area = {{%(x0)f, %(y0)f}, {%(x1)f, %(y1)f}}
+-- The belts and lanes a margin further out than the items: a replay indexes only these, and an item
+-- going on past the last belt it knows is held at that lane's end (piled up there: the replay's
+-- doing, not the client's, which knows every belt round its square).
+local belt_area = {{%(x0)f - %(margin)f, %(y0)f - %(margin)f}, {%(x1)f + %(margin)f, %(y1)f + %(margin)f}}
 local types = {"transport-belt", "underground-belt", "splitter"}
 local belts, lanes = {}, {}
 local function extra(e)
@@ -111,7 +140,7 @@ local function extra(e)
   if e.type == "underground-belt" then return string.sub(e.belt_to_ground_type, 1, 1) end
   return ""
 end
-for _, e in pairs(s.find_entities_filtered({area = area, type = types})) do
+for _, e in pairs(s.find_entities_filtered({area = belt_area, type = types})) do
   belts[#belts + 1] = {e.name, e.type, e.position.x, e.position.y, e.direction, extra(e)}
   for i = 1, e.get_max_transport_line_index() do
     local l = e.get_transport_line(i)
@@ -147,6 +176,24 @@ script.on_nth_tick(1, function()
           for _, it in pairs(l.get_detailed_contents()) do
             if it.position < 0.3 then l.remove_item({name = it.stack.name, count = 1}) end
           end
+        end
+      end
+    end
+    for _, pr in pairs(bt.packed or {}) do
+      local src, sink = pr[1], pr[2]
+      if src.valid and sink.valid then
+        for i = 1, 2 do
+          local l = src.get_transport_line(i)
+          if l.can_insert_at(0) then l.insert_at(0, {name = "iron-plate", count = 1}) end
+        end
+        local l1, l2 = sink.get_transport_line(1), sink.get_transport_line(2)
+        if game.tick %% 30 == 0 then
+          for _, it in pairs(l1.get_detailed_contents()) do
+            if it.position < 0.3 then l1.remove_item({name = it.stack.name, count = 1}) break end
+          end
+        end
+        for _, it in pairs(l2.get_detailed_contents()) do
+          if it.position < 0.3 then l2.remove_item({name = it.stack.name, count = 1}) end
         end
       end
     end
@@ -264,7 +311,7 @@ def pct(values, p):
     return s[min(len(s) - 1, int(len(s) * p))]
 
 
-def check(truth_path, drawn_path, warmup=60):
+def check(truth_path, drawn_path, warmup=60, within=None):
     truth = json.loads(pathlib.Path(truth_path).read_text())
     drawn = json.loads(pathlib.Path(drawn_path).read_text())
     visible = Lanes([l for l in truth["lanes"] if not is_hidden_lane(l)])
@@ -291,13 +338,76 @@ def check(truth_path, drawn_path, warmup=60):
     shown_n = 0
     lag = []
     worst = []
+    # Where the game had items, tick by tick (those showing), for measures that don't go by unique
+    # id: items the client makes itself (belt groups) have ids of their own.
+    showing = {}
+    for uid, tr in tracks.items():
+        for t, (tx, ty, flags) in tr.items():
+            if not flags & 1:
+                showing.setdefault(t, []).append((tx, ty))
+    grids = {}
+
+    def grid_at(t):
+        if t not in grids:
+            g = {}
+            for tx, ty in showing.get(t, []):
+                g.setdefault((math.floor(tx * 4), math.floor(ty * 4)), []).append((tx, ty))
+            grids[t] = g
+        return grids[t]
+
+    def nearest(g, x, y):
+        cx, cy = math.floor(x * 4), math.floor(y * 4)
+        best = 9.0
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for tx, ty in g.get((cx + dx, cy + dy), []):
+                    best = min(best, math.hypot(x - tx, y - ty))
+        return best
+
+    near_any = []
+    phantom = 0
+    missing = 0
+    game_items = 0
     frames = drawn["frames"]
+
+    def inside(x, y):
+        return within is None or (within[0] <= x <= within[2] and within[1] <= y <= within[3])
+
     for row in frames[warmup:]:
         tick, drawn_tick = row[0], row[1]
+        t_near = round(drawn_tick)
+        g = grid_at(t_near)
+        drawn_grid = {}
+        lo_x = lo_y = math.inf
+        hi_x = hi_y = -math.inf
+        for i in range(2, len(row), 4):
+            x, y, shown = row[i + 1], row[i + 2], row[i + 3]
+            if shown and g and inside(x, y):
+                d = nearest(g, x, y)
+                near_any.append(d)
+                if d > 0.15:
+                    phantom += 1
+                drawn_grid.setdefault((math.floor(x * 4), math.floor(y * 4)), []).append((x, y))
+                lo_x, lo_y, hi_x, hi_y = min(lo_x, x), min(lo_y, y), max(hi_x, x), max(hi_y, y)
+        if drawn_grid:
+            for tx, ty in showing.get(t_near, []):
+                if lo_x <= tx <= hi_x and lo_y <= ty <= hi_y and inside(tx, ty):
+                    game_items += 1
+                    if nearest(drawn_grid, tx, ty) > 0.15:
+                        missing += 1
         for i in range(2, len(row), 4):
             uid, x, y, shown = row[i], row[i + 1], row[i + 2], row[i + 3]
+            if not inside(x, y):
+                continue
             tr = tracks.get(uid)
             if tr is None:
+                if shown:
+                    shown_n += 1
+                    d = visible.distance(x, y)
+                    key = tiles.get((math.floor(x), math.floor(y)), ("off belts", ""))
+                    dist.setdefault(key[0], []).append(d)
+                    dist.setdefault("all", []).append(d)
+                    dist.setdefault("made here", []).append(d)
                 continue
             # Where the game had it at the drawn tick.
             t0 = math.floor(drawn_tick)
@@ -346,6 +456,11 @@ def check(truth_path, drawn_path, warmup=60):
     print("  shown while under the ground (in the game): %d; hidden where the game shows it: %d" % (over_gap, hidden_wrong))
     if lag:
         print("  from where the game had it at the drawn tick: p50 %.3f  p99 %.3f" % (pct(lag, 0.5), pct(lag, 0.99)))
+    if near_any:
+        print("  from the nearest item the game had at the drawn tick, by place (groups too): p50 %.3f  p99 %.3f;"
+              " drawn with none within 0.15: %.2f%%; the game's with none drawn within 0.15: %.2f%% of %d" % (
+                  pct(near_any, 0.5), pct(near_any, 0.99), 100.0 * phantom / len(near_any),
+                  100.0 * missing / max(1, game_items), game_items))
     for e in list(hidden_examples.values())[:6]:
         print("    hidden at tick %d: item %d, the game had it at (%.2f, %.2f)" % e)
     for w in sorted(worst, reverse=True)[:8]:
@@ -370,28 +485,32 @@ def main():
     rec.add_argument("--rcon-port", type=int, default=34198)
     rec.add_argument("--area", default="-2,18,18,60")
     rec.add_argument("--ticks", type=int, default=600)
+    rec.add_argument("--belt-margin", type=float, default=16.0,
+                     help="tiles past the area the belts are recorded (the items only inside it)")
     rec.add_argument("--out", required=True)
     rec.add_argument("--script-output", default=str(ROOT / "server" / "data" / "script-output"))
     chk = sub.add_parser("check")
     chk.add_argument("truth")
     chk.add_argument("drawn", nargs="+")
+    chk.add_argument("--within", default="", help="x0,y0,x1,y1: only items inside it count")
     a = ap.parse_args()
     if a.cmd == "layout":
         print(rcon_run(LAYOUT_LUA % {"x": a.x, "y": a.y, "every": a.every}, a.rcon_port))
     elif a.cmd == "record":
         x0, y0, x1, y1 = (float(v) for v in a.area.split(","))
         name = "belt_truth_%d.json" % int(time.time())
-        print(rcon_run(RECORD_LUA % {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "ticks": a.ticks, "file": name}, a.rcon_port))
+        print(rcon_run(RECORD_LUA % {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "margin": a.belt_margin, "ticks": a.ticks, "file": name}, a.rcon_port))
         path = pathlib.Path(a.script_output) / name
-        deadline = time.time() + a.ticks / 60.0 * 3 + 30
+        deadline = time.time() + a.ticks / 60.0 * 20 + 60
         while time.time() < deadline and not path.exists():
             time.sleep(1.0)
         time.sleep(1.0)
         pathlib.Path(a.out).write_text(path.read_text())
         print("wrote", a.out)
     else:
+        within = tuple(float(v) for v in a.within.split(",")) if a.within else None
         for d in a.drawn:
-            check(a.truth, d)
+            check(a.truth, d, within=within)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 extends Node3D
 ## Sound and effects for what the bridge reports: working machines (loops, chimney smoke,
 ## steam), the character (footsteps by ground, dust, mining hits and sparks, gunshots and
-## muzzle flashes), building, rotating and mining things out, deaths (explosions, scorch marks,
-## corpses and remnants), biters calling, cars and trains driving. Sounds and sprite sheets are
-## Factorio's own, from the player's install (sound_bank.gd, sprite_fx.gd); without one it is
-## silent and the effects are plain blobs.
+## muzzle flashes), building, rotating and mining things out, deaths (explosions and scorch marks;
+## corpses are creatures.gd's, remnants the world's), biters calling, cars and trains driving.
+## Sounds and sprite sheets are Factorio's own, from the player's install (sound_bank.gd,
+## sprite_fx.gd); without one it is silent and the effects are plain blobs.
 ##
 ## main.gd hands every message to handle() before routing it, so a deleted entity or a dead
 ## mover can still be looked up here.
@@ -34,10 +34,7 @@ const MAX_EMITTERS := 24
 const STEP_INTERVAL := 0.3
 const MINE_INTERVAL := 0.5
 const BUILD_RANGE := 16.0
-const CORPSE_LIMIT := 40
-const CORPSE_SECONDS := 30.0
 const REMNANT_SECONDS := 60.0
-const SINK_SECONDS := 4.0
 const WIND := Vector3(0.35, 0.0, 0.12)  # tiles per second; Factorio's smoke drifts too
 const ENEMY_TYPES := ["unit", "spider-unit", "segmented-unit"]
 
@@ -115,9 +112,7 @@ var _last_mining_at := Vector2.ZERO
 var _last_mining_progress := -1
 var _shot_clock := 0.0
 var _biter_wait := 0.0
-var _corpses: Array = []  # [MeshInstance3D, age, life, start y]
 var _burning := {}  # unit -> [remaining seconds, last position]
-var _corpse_material: StandardMaterial3D
 var _tops := {}  # proto name -> height of the model's top
 var _states := {}  # unit -> working state last scan, for activate/deactivate sounds
 
@@ -133,7 +128,6 @@ func _ready() -> void:
 	weapons.sprites = sprites
 	weapons.sfx = sfx
 	add_child(weapons)
-	_corpse_material = Visuals.solid_material(Color(0.2, 0.14, 0.1))
 	# After the player's input (which sets combat's aim each frame) and fx_demo.gd.
 	process_priority = 2
 	for arg in OS.get_cmdline_user_args():
@@ -165,9 +159,6 @@ func reset() -> void:
 	_emitters.clear()
 	sprites.clear()
 	sfx.stop_all()
-	for c in _corpses:
-		(c[0] as Node3D).queue_free()
-	_corpses.clear()
 	weapons.reset()
 	_burning.clear()
 	_tops.clear()
@@ -227,7 +218,6 @@ func _process(delta: float) -> void:
 	sprites.visible = FxSettings.effects_enabled  # the Settings window can change it in the game
 	if FxSettings.effects_enabled:
 		_update_emitters(delta)
-	_update_corpses(delta)
 	_update_combat_fx(delta)
 
 
@@ -363,17 +353,32 @@ func _track(msg: Dictionary) -> void:
 	if not (list is Array):
 		return
 	var now := Time.get_ticks_msec()
+	# z = 1: a record's first four numbers are the differences from the record before it (as movers.gd).
+	var deltas := int(msg.get("z", 0)) == 1
+	var unit := 0
+	var proto := 0
+	var x := 0
+	var y := 0
 	for rec in list:
 		if not (rec is Array) or rec.size() < 4:
 			continue
-		var unit := int(rec[0])
+		if deltas:
+			unit += int(rec[0])
+			proto += int(rec[1])
+			x += int(rec[2])
+			y += int(rec[3])
+		else:
+			unit = int(rec[0])
+			proto = int(rec[1])
+			x = int(rec[2])
+			y = int(rec[3])
 		var t: Tracked = _tracked.get(unit)
-		var pos := Vector2(int(rec[2]), int(rec[3])) / 256.0
+		var pos := Vector2(x, y) / 256.0
 		if t == null:
 			t = Tracked.new()
 			t.scan_pos = pos
 			_tracked[unit] = t
-		t.proto_id = int(rec[1])
+		t.proto_id = proto
 		t.pos = pos
 		t.seen = now
 
@@ -736,46 +741,6 @@ func _on_died(msg: Dictionary) -> void:
 		scorch.angle = randf() * TAU
 	# What is left of it is a remnants entity in the game, streamed and drawn with the world
 	# (ModelLibrary.remnant_mesh).
-
-
-func _add_corpse(proto: ProtoDB.EntityProto, at: Vector3, yaw: float, life: float, material: Material, squash: float) -> void:
-	var mi := MeshInstance3D.new()
-	var mesh := ModelLibrary.mesh_for(proto.name)
-	var shape := Transform3D.IDENTITY
-	if mesh != null:
-		mi.mesh = mesh
-	else:
-		mi.mesh = Visuals.box_mesh()
-		shape = Visuals.placeholder_transform(proto, Vector2.ZERO, 0, Visuals.height_for(proto))
-	mi.material_override = material
-	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	var holder := Node3D.new()
-	holder.position = at
-	holder.basis = Basis(Vector3.UP, yaw) * Basis.from_scale(Vector3(1.0, squash, 1.0))
-	mi.transform = shape
-	holder.add_child(mi)
-	add_child(holder)
-	_corpses.append([holder, 0.0, life, at.y])
-	while _corpses.size() > CORPSE_LIMIT:
-		(_corpses.pop_front()[0] as Node3D).queue_free()
-
-
-func _update_corpses(delta: float) -> void:
-	for i in range(_corpses.size() - 1, -1, -1):
-		var c: Array = _corpses[i]
-		var age: float = c[1] + delta
-		c[1] = age
-		var node: Node3D = c[0]
-		var life: float = c[2]
-		if age >= life:
-			node.queue_free()
-			_corpses.remove_at(i)
-		elif age > life - SINK_SECONDS:
-			node.position.y = float(c[3]) - (age - (life - SINK_SECONDS)) / SINK_SECONDS * 0.6
-
-
-func corpse_count() -> int:
-	return _corpses.size()
 
 
 func status() -> String:

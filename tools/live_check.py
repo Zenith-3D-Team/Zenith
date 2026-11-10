@@ -1579,6 +1579,15 @@ def check_walk(c, hello):
     if not clean_spot(c, hello):
         report(False, "walk: no clean spot found", SPOT_WHY)
         return
+    # The walks reach about 22 tiles from the spot, past clean_spot's square: whatever the map
+    # put there (trees, rocks, cliffs, water) would turn the character aside and fail the path
+    # checks on some maps and not others, so the route is cleared first.
+    mod_lua("local c = storage.f3d.puppet local s = c.surface local p = c.position "
+            "local area = { { p.x - 32, p.y - 32 }, { p.x + 32, p.y + 32 } } "
+            "for _, e in pairs(s.find_entities_filtered({ area = area, type = { 'tree', 'simple-entity', 'cliff', 'fish' } })) do e.destroy() end "
+            "local tiles = {} for _, t in pairs(s.find_tiles_filtered({ area = area, collision_mask = 'water_tile' })) do "
+            "tiles[#tiles + 1] = { name = 'landfill', position = t.position } end "
+            "if #tiles > 0 then s.set_tiles(tiles) end rcon.print('ok')")
     c.pump(0.5, every=hello)
 
     def walk(msg, seconds):
@@ -2394,6 +2403,68 @@ def check_mine_vehicles(c, hello):
     mod_lua(f'for _, r in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ area = {{ {{ {x - 23}, {y - 10} }}, '
             f'{{ {x + 23}, {y + 6} }} }}, name = {{ "straight-rail", "locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon", '
             '"car", "tank", "spidertron" } })) do r.destroy() end rcon.print("ok")')
+
+
+def check_mod_graphics(c, hello, welcome):
+    """Mods' graphics (docs/MOD-GRAPHICS-PLAN.md): the data stage's list in a mod-data prototype
+    (prototypes.mod_data, LuaModData.get), named in the welcome with the game's mods, sent in
+    parts on `gfx`. Run with the fixture mod tools/mod_tests/fixtures/zenith-gfx-test in the
+    server's mods to check its own entries; without it only the base game's are checked."""
+    mods = welcome.get("mods", {})
+    report(isinstance(mods, dict) and mods.get("base") and mods.get("factorio-3d-bridge"),
+           "modgfx: the welcome lists the game's mods (script.active_mods)", str(mods)[:200])
+    fp, n = welcome.get("gf"), welcome.get("gn")
+    report(isinstance(fp, str) and isinstance(n, int) and n > 0, "modgfx: the welcome names the graphics list", f"gf={fp} gn={n}")
+    if not fp:
+        return
+    out = mod_lua('local p = prototypes.mod_data["zenith-graphics"] rcon.print(p.data_type .. " " .. p.get("n") .. " " .. p.get("b") .. " " .. p.get("fp"))')
+    report(out.split()[1:2] == [str(n)] and out.split()[3:4] == [fp] and out.startswith("zenith-graphics "),
+           "modgfx: prototypes.mod_data has the list, read with LuaModData.get", out)
+    t0 = time.time()
+    c.send({"t": "gfx", "fp": fp})
+    got = {}
+    msgs = c.pump(20, every=hello, until=lambda m: m.get("t") == "gfx" and (got.__setitem__(m["part"], m) or len(got) == n))
+    took = time.time() - t0
+    report(len(got) == n, "modgfx: every part arrives", f"{len(got)}/{n} parts in {took:.2f} s")
+    total = sum(len(json.dumps(m["d"], separators=(",", ":"))) for m in got.values())
+    icons, tiles, decor, ents = {}, {}, {}, {}
+    for m in got.values():
+        ents.update(m["d"].get("ents", {}))
+        for kind, names in m["d"].get("icons", {}).items():
+            icons.setdefault(kind, {}).update(names)
+        tiles.update(m["d"].get("tiles", {}))
+        decor.update(m["d"].get("decor", {}))
+    counts = {k: len(v) for k, v in icons.items()}
+    print(f"  list: {n} parts, {total} bytes; icons {counts}; {len(tiles)} tiles, {len(decor)} decoratives, {len(ents)} entities' pictures")
+    report(icons.get("item", {}).get("iron-plate") == [["__base__/graphics/icons/iron-plate.png", 64, None, None, None]],
+           "modgfx: the iron plate's icon", str(icons.get("item", {}).get("iron-plate")))
+    report(tiles.get("grass-1", {}).get("main") and tiles.get("water", {}).get("water") == 1,
+           "modgfx: grass's variants and water's mask", str(tiles.get("water"))[:200])
+    report(len(decor) > 20, "modgfx: decoratives", str(len(decor)))
+    c.send({"t": "gfx", "fp": fp, "need": [n]})
+    again = [m["part"] for m in of_type(c.pump(2.0, every=hello), "gfx")]
+    report(again == [n], "modgfx: a part asked for again", str(again))
+    c.send({"t": "gfx", "fp": "0000000000000000"})
+    report(not of_type(c.pump(1.5, every=hello), "gfx"), "modgfx: nothing for another fingerprint")
+    if "zenith-gfx-test" not in mods:
+        print("  (the fixture mod isn't on this server: its own entries not checked)")
+        return
+    t = "__zenith-gfx-test__/graphics/"
+    report(icons.get("item", {}).get("zenith-test-gizmo") == [[t + "icons/gizmo.png", 64, None, None, None]],
+           "modgfx: the fixture's item icon", str(icons.get("item", {}).get("zenith-test-gizmo")))
+    tinted = icons.get("item", {}).get("zenith-test-tinted") or []
+    report(len(tinted) == 2 and tinted[1][2] == [0, 1, 0, 1], "modgfx: its tinted layer, 0-255 read as 0-1", str(tinted))
+    report(tiles.get("zenith-test-floor", {}).get("mat") == [t + "terrain/floor.png", 4, 0.5]
+           and tiles["zenith-test-floor"].get("layer") == 60, "modgfx: the fixture's tile", str(tiles.get("zenith-test-floor")))
+    report(ents.get("zenith-test-crate") == {"n": [[t + "entity/crate.png", 0, 0, 128, 160, 0.5, 0, -0.25, None]]},
+           "modgfx: the fixture chest's picture at rest, its shadow layer left out", str(ents.get("zenith-test-crate")))
+    spin = ents.get("zenith-test-spinner", {})
+    report(spin.get("n") == [[t + "entity/spinner.png", 0, 0, 128, 128, 0.5, 0, 0, None, {"f": 4, "l": 4, "s": 0.25, "x": 0, "y": 0}]]
+           and (spin.get("kn") or [[None] * 10])[0][0] == t + "entity/spinner-lamp.png" and spin["kn"][0][9].get("f") == 2,
+           "modgfx: an animated machine's frames and what it shows while working", str(spin)[:300])
+    peb = decor.get("zenith-test-pebbles", {})
+    report(len(peb.get("pics", [])) == 4 and peb["pics"][3][1] == 192, "modgfx: the fixture's decorative, 4 variations",
+           str(peb)[:200])
 
 
 def check_alt(c, hello, keep=False):
@@ -4455,17 +4526,113 @@ def handshake(c):
     return welcome
 
 
+def check_as_player(c, hello):
+    """Acting as the player (as_player.lua): with a player connected whose character the bridge plays,
+    the bridge's building, rotating, opening, pasting and mining raise Factorio's own player events,
+    seen by tools/mod_tests/fixtures/zenith-event-probe (a mod that counts events, which must be in the
+    server's mods); with the map setting off, building raises only script_raised_built. Needs a real
+    Factorio client joined as the player the bridge plays."""
+    who = mod_lua("local c = storage.f3d.puppet local p = c and c.player "
+                  "rcon.print(p and p.connected and (p.index .. ' ' .. p.name) or 'none') ")
+    has_probe = rcon.run("/c rcon.print(remote.interfaces.probe and 'yes' or 'no')").strip() == "yes"
+    if who == "none" or not has_probe:
+        report(False, "as player: needs a connected player playing the bridge's character and the zenith-event-probe mod",
+               f"player {who}, probe {has_probe}")
+        return
+    index = int(who.split()[0])
+    if not clean_spot(c, hello):
+        report(False, "as player: an empty spot", SPOT_WHY)
+        return
+    x, y = c.me["x"] / 256, c.me["y"] / 256
+    bx, by = math.floor(x) + 4.5, math.floor(y) + 0.5
+
+    def probe():
+        out = rcon.run("/c rcon.print(remote.call('probe', 'get'))").strip()
+        return json.loads(out) if out.startswith("{") else {"c": {}, "p": {}}
+
+    def heard(name):
+        d = probe()
+        return d["c"].get(name, 0) > 0 and d["p"].get(name) == index
+
+    def unit_at(name, px, py):
+        return int(mod_lua(f"local e = storage.f3d.puppet.surface.find_entity('{name}', {{ {px}, {py} }}) "
+                           "rcon.print(e and e.unit_number or 0)") or 0)
+
+    def ident(name, px, py):
+        return {"u": unit_at(name, px, py), "p": c.proto_id(name), "x": int(px * 256), "y": int(py * 256)}
+
+    mod_lua("storage.f3d.puppet.insert({ name = 'transport-belt', count = 10 }) "
+            "storage.f3d.puppet.insert({ name = 'assembling-machine-1', count = 2 })")
+    rcon.run("/c remote.call('probe', 'reset')")
+    c.send({"t": "build", "item": "transport-belt", "x": int(bx * 256), "y": int(by * 256), "d": 4})
+    c.pump(1.0, every=hello)
+    report(unit_at("transport-belt", bx, by) and heard("on_built_entity") and heard("on_pre_build"),
+           "as player: building raises on_pre_build and on_built_entity for the player", json.dumps(probe()["c"]))
+    left = mod_lua("local p = storage.f3d.puppet.player rcon.print(p.cursor_stack.valid_for_read and p.cursor_stack.name or 'empty')")
+    report(left == "empty", "as player: the cursor is given back empty", left)
+
+    c.send({"t": "rotate", **ident("transport-belt", bx, by)})
+    c.pump(0.6, every=hello)
+    report(heard("on_player_rotated_entity"), "as player: rotating raises on_player_rotated_entity")
+
+    ax, ay = bx + 3.0, by + 3.0
+    c.send({"t": "build", "item": "assembling-machine-1", "x": int(ax * 256), "y": int(ay * 256), "d": 0})
+    c.send({"t": "build", "item": "assembling-machine-1", "x": int((ax + 4) * 256), "y": int(ay * 256), "d": 0})
+    c.pump(1.0, every=hello)
+    a, b = ident("assembling-machine-1", ax, ay), ident("assembling-machine-1", ax + 4, ay)
+    c.send({"t": "open", **a})
+    c.pump(0.6, every=hello)
+    opened = mod_lua("local p = storage.f3d.puppet.player rcon.print(p.opened and p.opened.unit_number or 0)")
+    report(heard("on_gui_opened") and opened == str(a["u"]), "as player: opening a machine opens it for the player (on_gui_opened)", opened)
+    c.send({"t": "close"})
+    c.pump(0.6, every=hello)
+    report(heard("on_gui_closed"), "as player: closing it raises on_gui_closed")
+    mod_lua(f"for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ name = 'assembling-machine-1' }})) do "
+            f"if e.unit_number == {a['u']} then e.set_recipe('iron-gear-wheel') end end")
+    c.send({"t": "paste_settings", "f": [a["u"], a["p"], a["x"], a["y"]], **b})
+    c.pump(0.6, every=hello)
+    report(heard("on_entity_settings_pasted"), "as player: pasting settings raises on_entity_settings_pasted")
+
+    belt = ident("transport-belt", bx, by)
+    c.pump(3.0, every=(0.2, {"t": "mine", **belt}))
+    report(not unit_at("transport-belt", bx, by) and heard("on_player_mined_entity"),
+           "as player: mining raises on_player_mined_entity for the player")
+
+    # Far reach: the bridge goes by the character's real build distance (a mod's bonus too).
+    fx_, fy_ = math.floor(x) + 14.5, math.floor(y) + 0.5
+    c.send({"t": "build", "item": "transport-belt", "x": int(fx_ * 256), "y": int(fy_ * 256), "d": 4})
+    c.pump(0.8, every=hello)
+    before = unit_at("transport-belt", fx_, fy_)
+    mod_lua("storage.f3d.puppet.character_build_distance_bonus = 10")
+    c.send({"t": "build", "item": "transport-belt", "x": int(fx_ * 256), "y": int(fy_ * 256), "d": 4})
+    c.pump(0.8, every=hello)
+    report(not before and unit_at("transport-belt", fx_, fy_), "as player: 14 tiles away is out of reach, and in reach with a +10 build bonus")
+    mod_lua("storage.f3d.puppet.character_build_distance_bonus = 0")
+
+    # Only the mod that owns a setting may change it: set it in the bridge's own state.
+    mod_lua('settings.global["f3d-act-as-player"] = { value = false }')
+    rcon.run("/c remote.call('probe', 'reset')")
+    c.send({"t": "build", "item": "transport-belt", "x": int(bx * 256), "y": int((by + 6) * 256), "d": 4})
+    c.pump(1.0, every=hello)
+    d = probe()["c"]
+    report(unit_at("transport-belt", bx, by + 6) and not d.get("on_built_entity") and d.get("script_raised_built"),
+           "as player off: the bridge builds by script (script_raised_built only)", json.dumps(d))
+    mod_lua('settings.global["f3d-act-as-player"] = { value = true }')
+
+
 def parse_args():
     global FACTORIO_PORT, CLIENT_PORT, SECOND_CLIENT_PORT
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--factorio-port", type=int, default=FACTORIO_PORT, help="the server's --enable-lua-udp port")
     parser.add_argument("--client-port", type=int, default=CLIENT_PORT, help="the port this binds, as the client would")
     parser.add_argument("--rcon-port", type=int, default=rcon.PORT)
+    parser.add_argument("--rcon-password", help="default: server/data/rcon-password.txt")
     parser.add_argument("--second-client-port", type=int, default=0, help="the two-client check's second client (default: the client port + 1)")
     parser.add_argument("--only", choices=["platforms", "planets", "space", "ride", "collectors", "ui", "input", "cliffs", "save", "gear", "planners", "circuits", "build", "info",
-                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt"], help="run just these checks after the handshake")
+                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx"], help="run just these checks after the handshake")
     args = parser.parse_args()
     FACTORIO_PORT, CLIENT_PORT, rcon.PORT = args.factorio_port, args.client_port, args.rcon_port
+    rcon.PASSWORD = args.rcon_password
     SECOND_CLIENT_PORT = args.second_client_port
     return args
 
@@ -4486,6 +4653,16 @@ def main():
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
+    if args.only == "modgfx":
+        welcome = handshake(c)
+        if welcome:
+            hello = (1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1})
+            c.pump(1.0, every=hello)
+            check_mod_graphics(c, hello, welcome[0])
+            report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+        print(f"\n{results.count(True)} passed, {results.count(False)} failed")
+        sys.exit(0 if all(results) else 1)
+
     if args.only == "console":
         if handshake(c):
             hello = (1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1})
@@ -4495,14 +4672,14 @@ def main():
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
-    if args.only in ("cliffs", "save", "gear", "build", "alerts", "multi", "remnants", "turrets", "weapons", "enemies", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt"):
+    if args.only in ("cliffs", "save", "gear", "build", "alerts", "multi", "remnants", "turrets", "weapons", "enemies", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt", "asplayer"):
         if handshake(c):
             hello = (1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1})
             c.pump(1.0, every=hello)
             {"cliffs": check_cliffs, "save": check_save, "gear": check_gear, "build": check_build_tools,
              "alerts": check_alerts, "multi": check_multi, "remnants": check_remnants, "turrets": check_turrets, "weapons": check_weapons,
              "enemies": check_enemies, "remote": check_remote_view, "walk": check_walk, "states": check_states,
-             "mapinfo": check_map_info, "triggers": check_triggers, "minevehicles": check_mine_vehicles, "alt": check_alt}[args.only](c, hello)
+             "mapinfo": check_map_info, "triggers": check_triggers, "minevehicles": check_mine_vehicles, "alt": check_alt, "asplayer": check_as_player}[args.only](c, hello)
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
@@ -5071,22 +5248,9 @@ table.sort(done) rcon.print(table.concat(done, " "))
         msgs = c.pump(1.0, every=hello)
         done = [m for m in of_type(msgs, "msg") if m.get("tech") == first]
         techs_now = {r[0]: r[6] for m in of_type(msgs, "techs") for r in m["l"]}
-        report(bool(done) and techs_now.get(first) == 2, "research finished: a msg with tech and unlocks, and the tree resent",
+        report(bool(done) and techs_now.get(first) == 2, "research finished: a msg naming the tech, and the tree resent",
                f"{done[:1]}; state {techs_now.get(first)}")
         mod_lua(f'storage.f3d.puppet.force.technologies["{first}"].researched = false')
-        # A lab beside the character (no power, no packs): rs lists it with its status. With no
-        # lab near, labs is [] and comes as {} (table_to_json), so one is placed.
-        out = mod_lua("local c = storage.f3d.puppet local s = c.surface "
-                      "local p = s.find_non_colliding_position('lab', { c.position.x + 4, c.position.y }, 8, 1) "
-                      "local e = p and s.create_entity({ name = 'lab', position = p, force = c.force, raise_built = true }) "
-                      "rcon.print(e and e.unit_number or 0)")
-        lab_u = int(out) if out.isdigit() else 0
-        c.send({"t": "focus", "x": c.me["x"], "y": c.me["y"], "r": 48})  # labs are looked for around the focus
-        rs = latest(c.pump(1.2, every=hello), "rs")
-        labs = rs.get("labs") if rs else None
-        report(isinstance(labs, list) and any(r[0] == lab_u and isinstance(r[1], str) for r in labs),
-               "rs carries lab statuses near the camera (lab.status)", f"lab {lab_u}: {labs}")
-        destroy_units([lab_u])
     if unlocked:
         mod_lua(f"for _, n in pairs({{ {', '.join(repr(n) for n in unlocked)} }}) do game.forces.player.technologies[n].researched = false end")
 

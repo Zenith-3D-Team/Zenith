@@ -11,7 +11,7 @@ local M = {}
 
 -- b: boolean (0/1 on the wire); s: SignalID ({type, name} or {}); c: circuit condition
 -- ({first_signal?, comparator, constant? | second_signal?, ful: 0/1}); e:<define>: an enum from
--- defines.control_behavior.<define>, by name; n: CircuitNetworkSelection ({r, g}: 0/1).
+-- defines.control_behavior.<define>, by name.
 local G = {
   { "circuit_enable_disable", "b" }, { "circuit_condition", "c" },
   { "connect_to_logistic_network", "b" }, { "logistic_condition", "c" },
@@ -217,8 +217,6 @@ local function value_out(kind, v)
     return M.signal_out(v)
   elseif kind == "c" then
     return M.condition_out(v)
-  elseif kind == "n" then
-    return { r = (type(v) ~= "table" or v.red ~= false) and 1 or 0, g = (type(v) ~= "table" or v.green ~= false) and 1 or 0 }
   end
   return enum(kind:sub(3)).values[v]
 end
@@ -236,19 +234,17 @@ local function value_in(kind, v)
     return M.signal_in(v) or false -- false: clear it
   elseif kind == "c" then
     return M.condition_in(v)
-  elseif kind == "n" then
-    return type(v) == "table" and { red = v.r ~= 0, green = v.g ~= 0 } or nil
   end
   return type(v) == "string" and enum(kind:sub(3)).names[v] or nil
 end
 
--- Which connectors read the circuit: a combinator's input side, everything else its own.
+-- The id of the network on one wire connector, 0 when none.
 local function network_id(e, id)
   local ok, net = pcall(function() return e.get_circuit_network(id) end)
   return ok and net and net.network_id or 0
 end
 
--- The entity's red and green network ids (0: not on one), and its output side's for combinators.
+-- The entity's red and green network ids (0: not on one). Combinators aren't asked (circuits.lua).
 function M.networks(e)
   local ids = defines.wire_connector_id
   local r, g = network_id(e, ids.circuit_red), network_id(e, ids.circuit_green)

@@ -9,7 +9,6 @@ extends RefCounted
 ##              for each platform in orbit, Launch (to its hub, or its starter pack) and Ride (the
 ##              character goes up in the rocket, scripts/world/ride.gd)
 ##   pad        a cargo landing pad: its requests from orbit and its circuit settings
-##   bay        a cargo bay: what it is connected to
 ##   collector  an asteroid collector's chunk filters
 ##   effects    a machine's module and beacon effects (quality among them)
 ## and quality_row, the quality buttons of recipe pickers and request editors.
@@ -20,6 +19,7 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const EntityPanels := preload("res://scripts/ui/factorio/entity_panels.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.gd")
@@ -77,23 +77,6 @@ static func _array(v) -> Array:
 
 
 # --- the hub -------------------------------------------------------------------------------------
-
-## gui.hub (space.lua): the platform, its schedule and its requests.
-static func hub(screen, h: Dictionary) -> Control:
-	var box := EntityPanels.column(10)
-	box.add_child(_platform_state(screen, h))
-	box.add_child(EntityPanels.pane(_schedule(screen, h)))
-	var sec: Array = _array(h.get("sec")).duplicate(true)
-	box.add_child(EntityPanels.pane(sections(screen, sec, _array(h.get("dest")), true)))
-	# The schedule and requests grow long on a real platform: they scroll, so the window fits.
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	scroll.focus_mode = Control.FOCUS_NONE
-	scroll.custom_minimum_size = Vector2(0, Kit.px(HUB_HEIGHT))
-	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	scroll.add_child(box)
-	return scroll
-
 
 ## The hub window's third column, as Factorio's: the platform (its state, trip, speed, weight,
 ## thrusters and fuel, pause) and its schedule with interrupts, scrolling when long.
@@ -424,10 +407,14 @@ static func _interrupts(screen, interrupts: Array, dest: Array) -> Control:
 	return box
 
 
-## A planet's (or space location's) icon from the player's install, or null.
+## A planet's (or space location's) icon: the bridge's graphics list (every mod's planets), else
+## the player's install, or null.
 static func planet_icon(name: String) -> Texture2D:
 	if name == "":
 		return null
+	var listed := ItemIcons.texture_for_kind("space-location", name)
+	if listed != null:
+		return listed
 	for path in ["space-age/graphics/icons/%s.png", "base/graphics/icons/%s.png"]:
 		var t := GuiAssets.data_sprite(path % name)
 		if t != null:
@@ -580,7 +567,7 @@ static func quality_row(qualities: Array, current: String, on_pick: Callable) ->
 	return r
 
 
-# --- silo, landing pad, bay, collector, effects ---------------------------------------------------
+# --- silo, landing pad, collector, effects ---------------------------------------------------
 
 ## gui.rk: {parts, need, st, auto, to: [[platform, name, state], ...]}.
 static func silo(screen, rk: Dictionary) -> Control:
@@ -629,26 +616,6 @@ static func silo(screen, rk: Dictionary) -> Control:
 		r.add_child(ride)
 		box.add_child(r)
 	return box
-
-
-## gui.pad: {sec, cb?: {read, req, empty}}.
-static func pad(screen, p: Dictionary) -> Control:
-	var box := EntityPanels.column(8)
-	box.add_child(sections(screen, _array(p.get("sec")).duplicate(true), [], false))
-	var cb: Dictionary = p.get("cb") if p.get("cb") is Dictionary else {}
-	var unit: int = screen.unit
-	box.add_child(EntityPanels.heading("Circuit connection"))
-	for opt in [["read", "Read contents"], ["req", "Set requests"], ["empty", "Read empty slots"]]:
-		var key := str(opt[0])
-		var on := func(v: bool) -> void: Bridge.send({"t": "set_pad", "u": unit, key: 1 if v else 0})
-		box.add_child(EntityPanels.checkbox(str(opt[1]), int(cb.get(key, 0)) == 1, on))
-	return EntityPanels.pane(box)
-
-
-static func bay(b: Dictionary) -> Control:
-	var owner := int(b.get("owner", 0))
-	return EntityPanels.pane(Kit.label("Connected: its slots are part of the hub's or landing pad's inventory" if owner != 0
-		else "Not connected to a hub or landing pad"))
 
 
 ## gui.col: {n, f: [chunk or ""]}. Click a filter: the next asteroid chunk; right click clears it.

@@ -871,10 +871,56 @@ static func title_bar(title: String, closable: bool) -> HBoxContainer:
 	# sits at its top.
 	space.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
 	space.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	space.mouse_filter = Control.MOUSE_FILTER_IGNORE  # the bar under it takes the drag
 	bar.add_child(space)
 	if closable:
 		bar.add_child(close_button())
+	# Dragging the title moves the window, as in Factorio (the close button takes its own clicks).
+	make_drag_handle(bar)
 	return bar
+
+
+## Dragging `handle` with the left button moves the window it is in: the first ancestor placed
+## freely (its parent isn't a container), by its offsets, so anchors and centring stay as they are.
+## The distance moved is kept in the window's "drag_offset" meta for code that places it again.
+static func make_drag_handle(handle: Control) -> void:
+	if handle.has_meta("drag_handle"):
+		return
+	handle.set_meta("drag_handle", true)
+	handle.mouse_filter = Control.MOUSE_FILTER_STOP
+	handle.gui_input.connect(func(event: InputEvent) -> void: _drag_event(handle, event))
+
+
+static func _drag_event(handle: Control, event: InputEvent) -> void:
+	if event is InputEventMouseButton and (event as InputEventMouseButton).button_index == MOUSE_BUTTON_LEFT:
+		handle.set_meta("dragging", (event as InputEventMouseButton).pressed)
+		handle.accept_event()
+	elif event is InputEventMouseMotion and bool(handle.get_meta("dragging", false)):
+		if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+			handle.set_meta("dragging", false)
+			return
+		var target := drag_target(handle)
+		if target != null:
+			move_window(target, (event as InputEventMouseMotion).relative)
+		handle.accept_event()
+
+
+## The window a drag handle moves (see make_drag_handle).
+static func drag_target(handle: Control) -> Control:
+	var n: Node = handle
+	while n.get_parent() is Control:
+		if not (n.get_parent() is Container):
+			return n as Control
+		n = n.get_parent()
+	return n as Control
+
+
+static func move_window(target: Control, by: Vector2) -> void:
+	target.set_meta("drag_offset", Vector2(target.get_meta("drag_offset", Vector2.ZERO)) + by)
+	target.offset_left += by.x
+	target.offset_right += by.x
+	target.offset_top += by.y
+	target.offset_bottom += by.y
 
 
 ## frame_action_button with Factorio's cross (black when hovered, like the game's inverted icon).

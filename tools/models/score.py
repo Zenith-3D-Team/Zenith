@@ -25,7 +25,7 @@ sys.path.insert(0, HERE)
 import compare  # noqa: E402
 import sprite_projection as sp  # noqa: E402
 
-FACTORIO = os.environ.get("FACTORIO", sp.FACTORIO)
+FACTORIO = sp.FACTORIO
 DIRS = ("N", "E", "S", "W")
 
 

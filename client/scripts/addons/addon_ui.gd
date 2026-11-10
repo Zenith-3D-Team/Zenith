@@ -38,11 +38,7 @@ func window(title: String) -> Dictionary:
 	close.pressed.connect(func() -> void:
 		Sfx.play_ui("gui-click")
 		show(frame, false))
-	var bar: Control = (parts[1] as VBoxContainer).get_child(0)
-	bar.gui_input.connect(func(ev: InputEvent) -> void:
-		var mm := ev as InputEventMouseMotion
-		if mm != null and mm.button_mask & MOUSE_BUTTON_MASK_LEFT:
-			frame.position += mm.relative)
+	# Its title bar already drags it: Kit.title_bar makes it a drag handle that moves the frame.
 	_host.ui_root.add_child(frame)
 	_windows.append(frame)
 	return {"frame": frame, "box": parts[1], "close": close}

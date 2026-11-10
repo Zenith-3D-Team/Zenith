@@ -83,8 +83,6 @@ func show_for(what: String) -> void:
 	visible = what != ""
 	if what != "":
 		mode = what
-	if not visible and map_view != null:
-		map_view.placing = {}
 
 
 func _process(_delta: float) -> void:

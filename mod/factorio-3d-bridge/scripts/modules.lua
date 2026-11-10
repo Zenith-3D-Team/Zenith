@@ -7,6 +7,9 @@
 --
 -- {u, p, x, y (the target, as `open` finds it), item, q? (quality), s? (a module slot from the
 -- machine screen, 1-based), clr? (1: take the requests back: slot s's, or all)}.
+--
+-- Also the hover panel's answer (`hinfo`, M.hover): modules and their effects, beacons, the
+-- electricity Factorio's entity info shows, and a roboport's links.
 
 local puppet = require("scripts.puppet")
 local transport = require("scripts.transport")
@@ -58,7 +61,7 @@ local function round(v)
   return math.floor(v + 0.5)
 end
 
--- What Factorio's entity info shows under "Consumes electricity" (H20) for something that draws
+-- What Factorio's entity info shows under "Consumes electricity" for something that draws
 -- power: {e (joules in its buffer), b (the buffer's size: the Electricity bar is e / b), mx (Max.
 -- consumption: the most it uses with its modules and beacons, plus its drain, in watts), mn (Min.
 -- consumption: its drain, watts)}; nil for generators, accumulators and what isn't electric.

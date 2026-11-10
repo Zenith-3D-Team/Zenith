@@ -45,7 +45,7 @@ func adopt(new_hud: CanvasLayer) -> void:
 	hud.reparent(viewport, false)
 
 
-## Gives the HUD back to `parent` (leaving VR) or frees it with the game.
+## The game ended: frees its HUD, which lives in the panel's viewport.
 func release() -> void:
 	if hud != null and is_instance_valid(hud) and hud.get_parent() == viewport:
 		hud.queue_free()

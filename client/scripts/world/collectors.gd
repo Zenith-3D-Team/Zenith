@@ -18,11 +18,11 @@ extends Node3D
 ## is the model's own parts, the others are drawn here with the same meshes.
 
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const Rockets := preload("res://scripts/world/rockets.gd")
 
 const CATCH_RADIUS := 7.5
 const CATCH_OFFSET := 5.0
 const HEAD_RADIUS := 0.6     # the head grabs a chunk this close (head_collection_radius)
-const DEPOSIT := 1.5         # the chunk drops into the collector this close to its centre
 const DEFAULT_SPEED := 0.2   # tiles a tick, arm_speed_base
 const CATCH_UP := 2.0        # how much faster an arm turns to a chunk the game says it caught
 const CHUNK_HEIGHT := 0.6    # rockets.gd draws the chunks this high
@@ -457,12 +457,14 @@ static func _bezier_tangent(p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, 
 func _chunk_mesh(name: String) -> Mesh:
 	if _chunk_meshes.has(name):
 		return _chunk_meshes[name]
-	var mesh := ModelLibrary.mesh_for("small-%s-asteroid" % name.trim_suffix("-asteroid-chunk"))
+	# Read on a worker thread (mesh_for alone parsed the .glb in the frame the arm caught it): the
+	# ball until it is there.
+	var model_name := "small-%s-asteroid" % name.trim_suffix("-asteroid-chunk")
+	if not ModelLibrary.ready(model_name):
+		return Rockets.chunk_ball()
+	var mesh := ModelLibrary.mesh_for(model_name)
 	if mesh == null:
-		var s := SphereMesh.new()
-		s.radius = 0.5
-		s.height = 0.9
-		mesh = s
+		mesh = Rockets.chunk_ball()
 	_chunk_meshes[name] = mesh
 	return mesh
 

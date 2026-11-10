@@ -41,6 +41,7 @@ import mock_creature_showcase
 import mock_enemy_showcase
 import mock_logistics
 import mock_shots
+import mock_mod_gfx
 
 import mock_info
 
@@ -57,7 +58,7 @@ MOVERS_PER_MESSAGE = 200
 MAX_EXTRA_CLIENTS = 7
 # What each client has of its own (MockGame.serving swaps these); the rest is the shared world.
 PER_CLIENT = ("client", "rseq", "outbox", "subs", "queue", "focus", "player", "guns_sig", "inv_sig", "layout",
-              "slots_sig", "craftable_sig", "quickbar", "queue_sent", "screen", "char_logistics", "char_color", "map_queue",
+              "slots_sig", "craftable_sig", "quickbar", "queue_sent", "queue_empty_tick", "screen", "char_logistics", "char_color", "map_queue",
               "map_res", "tags_dirty", "map_si", "alt", "filters", "clipboard", "remote_view", "work_budget")
 EQUIPMENT_SHAPES = {"solar-panel-equipment": (1, 1), "battery-equipment": (1, 2), "energy-shield-equipment": (2, 2),
                     "personal-roboport-equipment": (2, 2)}
@@ -311,6 +312,7 @@ FUELS = {"coal", "wood"}
 CRAFT_TICKS = 60
 SCREEN_INTERVAL = 30
 RECIPE_LIST_EVERY = 10
+MOD_WINDOW = False  # --mod-window: send a mod's window (mgui) once a second
 REACH = 10.0  # to the entity's edge, like LuaControl::can_reach_entity
 SCREEN_KINDS = {"container": "container", "assembling-machine": "crafter", "furnace": "furnace", "lab": "lab",
                 "constant-combinator": "combinator", "arithmetic-combinator": "combinator",
@@ -458,7 +460,8 @@ STARTING_ITEMS = {
 MAIN_SLOTS = 80
 QUICKBAR_SIZE = 100
 # Entity types Factorio 2.1.23 opens no window for (entity_ui.lua NO_WINDOW).
-NO_WINDOW = {"fluid-wagon", "lightning-attractor", "fusion-generator", "thruster"}
+# A cargo bay opens its hub's window (open_screen), one on its own nothing.
+NO_WINDOW = {"fluid-wagon", "lightning-attractor", "fusion-generator", "thruster", "cargo-bay"}
 # Modules (`iuse` "m") and their category; `modreq` asks for them (F6).
 MODULES = {"speed-module": "speed", "productivity-module": "productivity"}
 
@@ -533,6 +536,13 @@ EQUIPMENT = {
     "solar-panel-equipment": (1, 1, 0, 0, 0.0),
 }
 ARMOR = "power-armor-mk2"
+# --fly: the mech flies (`me` fl, fh), at Factorio 2.1's measured height and rates (tiles, tiles a tick).
+FLY = ""
+FLY_HEIGHT = 1.03
+FLY_UP = 1 / 32
+FLY_DOWN = 3 / 64
+FLY_CYCLE = 600  # ticks: on the ground, then up, hovering, down
+FLY_GROUND = 180
 GEAR_START = [("fission-reactor-equipment", 0, 0), ("energy-shield-mk2-equipment", 4, 0), ("energy-shield-mk2-equipment", 6, 0),
               ("battery-mk2-equipment", 8, 0), ("battery-mk2-equipment", 9, 0), ("exoskeleton-equipment", 0, 4),
               ("exoskeleton-equipment", 2, 4), ("night-vision-equipment", 4, 2), ("personal-roboport-mk2-equipment", 6, 2)]
@@ -696,6 +706,7 @@ class MockGame(mock_info.InfoMixin):
         self.quickbar = {"page": 1, "sel": 0, "items": [""] * QUICKBAR_SIZE}
         self.researched, self.research, self.research_queue, self.research_progress = {"automation"}, None, [], 0
         self.queue_sent = False
+        self.queue_empty_tick = None  # when the empty queue was last sent (it goes again every 5 s, as the mod)
         self.machines = {}  # unit -> {"recipe", "progress", "inv": {role: {item: count}}}, made on first open
         self.screen = None  # {"unit", "sent", "due"} while the client has a machine screen open
         self.movers = self._make_movers()
@@ -731,6 +742,7 @@ class MockGame(mock_info.InfoMixin):
         # A ride in progress: {"legs", "leg", "t", "up", "ground", "unit", "to" (surface), "land"}, or
         # None; `hub` is set while the character sits in the platform's hub.
         self.trip = None
+        self.fly_ramp = 0.0
         self.in_hub = False
         self.alt = False  # Alt-mode: `ai` once a second
         self.filters = {}  # main inventory slot -> item filter (middle click)
@@ -1277,6 +1289,8 @@ class MockGame(mock_info.InfoMixin):
         return out
 
     LANE_REFRESH = 64
+    GROUPS_PER_PART = 150
+    MOVES_PER_PART = 400
 
     @staticmethod
     def lane_key(x, y):
@@ -1289,21 +1303,52 @@ class MockGame(mock_info.InfoMixin):
         """bi for a client that says bl, as belt_items.lua sends it: a lane whose items didn't
         change since its last read is read again once (settled) and then held, not sent, until it
         changes, every LANE_REFRESH updates, or leaves the square (dl). ln says which lane each
-        run of a part's items came from."""
+        run of a part's items came from. For a client that also says bg, packed lanes are groups
+        (bg, bm; packed_lane)."""
         lanes = {}
         for i in range(0, len(flat), 4):
             lanes.setdefault(self.lane_key(flat[i + 2] / 256, flat[i + 3] / 256), []).append(flat[i:i + 4])
         self.lane_count = getattr(self, "lane_count", 0) + 1
-        sent, emptied = [], []
+        # Straight runs (br): the belt field's lanes but a column's first and last belt are plain,
+        # sent with pl once (and every LANE_REFRESH updates) and then moved by the client.
+        plain = self.plain_lanes(extra) if self.client.get("br") else {}
+        sent, emptied, groups, moves, pl = [], [], [], [], []
+        for key, info in sorted(plain.items()):
+            rec = self.lanes.get(key)
+            lanes.setdefault(key, [])
+            if rec and rec[1] == "plain" and (key + self.lane_count) % self.LANE_REFRESH:
+                continue
+            pl += [key] + info
         for key, items in sorted(lanes.items()):
             sig = tuple(tuple(it) for it in items)
             rec = self.lanes.get(key)
-            if rec and rec[0] == sig and rec[1] and (key + self.lane_count) % self.LANE_REFRESH:
+            refresh = not (key + self.lane_count) % self.LANE_REFRESH
+            if key in plain:
+                if rec and rec[1] == "plain" and not refresh:
+                    continue
+                self.lanes[key] = [sig, "plain"]
+                sent.append((key, items))
+                continue
+            group = self.client.get("bg") and self.packed_lane(key, items)
+            if group:
+                # A group (bg): sent once, then its front item's place when it moved (bm), and again
+                # at its refresh; a lane that stops being packed is sent as items, which ends it.
+                front, kind = group[6], (group[1], group[7], group[9])
+                if rec and rec[0] == "group" and rec[1] == kind:
+                    if rec[2] != front:
+                        moves += [key, front, self.tick - rec[3]]
+                    if refresh:
+                        groups += group
+                else:
+                    groups += group
+                self.lanes[key] = ["group", kind, front, self.tick]
+                continue
+            if rec and rec[0] == sig and rec[1] and not refresh:
                 continue
             self.lanes[key] = [sig, bool(rec and rec[0] == sig)]
             sent.append((key, items))
         dropped = []
-        for key in sorted(set(self.lanes) - set(lanes)):
+        for key in sorted(set(self.lanes) - set(lanes) - set(plain)):
             del self.lanes[key]
             tx, ty = key // 8 // 65536 - 32768, key // 8 % 65536 - 32768
             if (tx + 0.5 - self.focus[0]) ** 2 + (ty + 0.5 - self.focus[1]) ** 2 < (extra["fr"] + 1) ** 2 * 2 and                     any(b.x == tx + 0.5 and b.y == ty + 0.5 for b in self.belt_tiles()):
@@ -1322,14 +1367,65 @@ class MockGame(mock_info.InfoMixin):
                 else:
                     ln += [key, 1]
         parts.append((part, ln))
+        # As belt_items.lua: GROUPS_PER_PART groups and MOVES_PER_PART moves to a part, more parts
+        # if need be.
+        per_g, per_m = self.GROUPS_PER_PART * 10, self.MOVES_PER_PART * 3
+        while len(parts) < max(math.ceil(len(groups) / per_g), math.ceil(len(moves) / per_m)):
+            parts.append(([], []))
         for i, (items, ln) in enumerate(parts):
             more = dict(extra, ln=([k for key in emptied for k in (key, 0)] if i == 0 else []) + ln)
             if i == 0:
                 more["dl"] = dropped
+                if pl:
+                    more["pl"] = pl
+            if moves[i * per_m:(i + 1) * per_m]:
+                more["bm"] = moves[i * per_m:(i + 1) * per_m]
+            if groups[i * per_g:(i + 1) * per_g]:
+                more["bg"] = groups[i * per_g:(i + 1) * per_g]
             st = self.stacks_in(items)
             if st:
                 more["st"] = st
             self.send_list("bi", i + 1, len(parts), items, 4, more)
+
+    def packed_lane(self, key, items):
+        """belt_items.lua's belt groups: the lane `key`'s items as a `bg` group if it is packed (the
+        belt field's full lanes: four items of one kind and stack size a quarter tile apart, on a
+        belt that runs south), else None. [lane key, item id, x, y of line position 0 (where items
+        leave, the belt's south edge), x, y of 1 (1/256 tile), front item's line position, gap
+        (1/256), speed (line positions a tick, 1/65536), stack size]."""
+        if len(items) != 4 or len({it[1] for it in items}) != 1 or items[0][0] < 20_000_000:
+            return None
+        if len({self.belt_stack(it[0]) for it in items}) != 1 or len({it[2] for it in items}) != 1:
+            return None
+        ys = sorted(it[3] for it in items)
+        if any(abs(b - a - 64) > 1 for a, b in zip(ys, ys[1:])):
+            return None
+        tx, ty = key // 8 // 65536 - 32768, key // 8 % 65536 - 32768
+        # Line positions fall as items go south; the front item below one gap (an item on the
+        # tile's north edge, at 1, is the tile to the north's at 0).
+        front = ((ty + 1) * 256 - ys[-1]) % 64
+        return [key, items[0][1], items[0][2], (ty + 1) * 256, items[0][2], ty * 256, front, 64,
+                round(BELT_SPEED * 65536), self.belt_stack(items[0][0])]
+
+    def plain_lanes(self, extra):
+        """{lane key: [key behind, key in front, x0, y0, x1, y1 (1/256), speed (1/65536)]} for the belt
+        field's plain lanes within the square: every column runs south, line position 0 at a belt's
+        south edge."""
+        fx, fy = extra["fx"] / 256, extra["fy"] / 256
+        r = extra["fr"]
+        out = {}
+        for column in getattr(self, "belt_field", []):
+            for j in range(1, len(column) - 1):
+                b = column[j]
+                if b.key() not in self.entities or column[j - 1].key() not in self.entities or column[j + 1].key() not in self.entities:
+                    continue
+                if abs(b.x - fx) >= r or abs(b.y - fy) >= r:
+                    continue
+                for dx in (-0.25, 0.25):
+                    x = b.x + dx
+                    out[self.lane_key(x, b.y)] = [self.lane_key(x, b.y - 1), self.lane_key(x, b.y + 1),
+                                                   fixed(x), fixed(b.y + 0.5), fixed(x), fixed(b.y - 0.5), int(BELT_SPEED * 65536)]
+        return out
 
     def belt_tiles(self):
         return list(self.belt or []) + [b for column in getattr(self, "belt_field", []) for b in column]
@@ -1566,8 +1662,12 @@ class MockGame(mock_info.InfoMixin):
         self.rseq, self.outbox = 0, []
         self.subs, self.queue = {}, []
         p = self.player
-        self.send_reliable(self.surface_fields({"t": "welcome", "v": PROTOCOL, "mod": "mock", "u": p["unit"],
-                                                "x": fixed(p["x"]), "y": fixed(p["y"]), "mp": True}))
+        welcome = self.surface_fields({"t": "welcome", "v": PROTOCOL, "mod": "mock", "u": p["unit"],
+                                       "x": fixed(p["x"]), "y": fixed(p["y"]), "mp": True,
+                                       "mods": {"base": "2.1.24", "factorio-3d-bridge": "mock"}})
+        if getattr(self, "mod_gfx", None):
+            self.mod_gfx.welcome_fields(welcome)
+        self.send_reliable(welcome)
         recs = []
         for name, etype, w, h, color in ENTITY_PROTOS:
             recs.append([EID[name], name, etype, -w / 2, -h / 2, w / 2, h / 2, *color, math.ceil(w), math.ceil(h)])
@@ -1622,8 +1722,16 @@ class MockGame(mock_info.InfoMixin):
                     last, count = tid, 1
         rle += [last, count]
         records = [self.entities[k].record() for k in self.by_chunk.get((cx, cy), set())]
+        # The mod counts changes per chunk (world.lua M.rev); the mock stands in with its content's
+        # checksum, which changes whenever the chunk does. A client that kept it gets `same`.
+        si = self.surface_index()
+        rv = zlib.crc32(json.dumps([rle, records], sort_keys=True).encode()) & 0x7fffffff
+        have = getattr(self, "have", {}).pop((cx, cy), None)
+        if have == (si, rv, len(records)):
+            self.send_reliable({"t": "chunk", "cx": cx, "cy": cy, "rs": si, "same": rv})
+            return
         parts = max(1, math.ceil(len(records) / ENTITIES_PER_MESSAGE))
-        self.send_reliable({"t": "chunk", "cx": cx, "cy": cy, "tiles": rle, "parts": parts})
+        self.send_reliable({"t": "chunk", "cx": cx, "cy": cy, "tiles": rle, "parts": parts, "rs": si, "rv": rv, "n": len(records)})
         for i in range(parts):
             self.send_reliable({"t": "ents", "cx": cx, "cy": cy, "part": i + 1, "parts": parts,
                                 "e": records[i * ENTITIES_PER_MESSAGE:(i + 1) * ENTITIES_PER_MESSAGE]})
@@ -1694,6 +1802,10 @@ class MockGame(mock_info.InfoMixin):
 
     def handle_message(self, msg, addr):
         t = msg.get("t")
+        if t == "gfx":
+            if getattr(self, "mod_gfx", None):
+                self.mod_gfx.ask(msg)
+            return
         if t == "hello":
             sid = str(msg.get("sid", ""))
             if self.client is None or self.client["sid"] != sid or self.client["addr"] != addr:
@@ -1701,7 +1813,8 @@ class MockGame(mock_info.InfoMixin):
                 self.client = {"addr": addr, "sid": sid, "last_seen": self.tick, "handshake": self.tick, "resync": -1000,
                                "chat_at": self.tick + 240,
                                "z": msg.get("z") == 1, "dc": msg.get("dc") == 1, "b": msg.get("b") == 1,
-                               "bl": msg.get("bl") == 1}
+                               "bl": msg.get("bl") == 1, "bg": msg.get("bl") == 1 and msg.get("bg") == 1,
+                               "br": msg.get("bl") == 1 and msg.get("br") == 1}
                 self.lanes = {}
                 self.rate, self.rate_from, self.rate_at = 0, 0, -10 ** 9
                 self.handshake()
@@ -1709,9 +1822,13 @@ class MockGame(mock_info.InfoMixin):
                 self.client["last_seen"] = self.tick
                 self.client["z"] = msg.get("z") == 1
                 self.client["b"] = msg.get("b") == 1
-                if self.client.get("bl") != (msg.get("bl") == 1):
+                bg = msg.get("bl") == 1 and msg.get("bg") == 1
+                br = msg.get("bl") == 1 and msg.get("br") == 1
+                if self.client.get("bl") != (msg.get("bl") == 1) or self.client.get("bg") != bg or self.client.get("br") != br:
                     self.lanes = {}
                 self.client["bl"] = msg.get("bl") == 1
+                self.client["bg"] = bg
+                self.client["br"] = br
                 if msg.get("dc") == 1 and not self.client.get("dc"):
                     self.client["dc"] = True
                     self.send_parts("dprotos", [[DID[name], name] for name in DECORATIVE_PROTOS])
@@ -1746,8 +1863,15 @@ class MockGame(mock_info.InfoMixin):
             for c in wanted:
                 if c not in old and c not in self.queue:
                     self.queue.append(c)
+            # The client's kept chunks it subscribes to again: [si, cx, cy, rv, n].
+            self.have = {}
+            for h in msg.get("h", []) if isinstance(msg.get("h"), list) else []:
+                if isinstance(h, list) and len(h) >= 5 and all(isinstance(v, int) for v in h[:5]):
+                    if (h[1], h[2]) in self.queue:
+                        self.have[(h[1], h[2])] = (h[0], h[3], h[4])
         elif t == "focus":
-            self.focus = (msg.get("x", 0) / 256, msg.get("y", 0) / 256, min(float(msg.get("r", 48)), 64.0))
+            # As session.lua: 8 to f3d-max-focus-radius (192 by default).
+            self.focus = (msg.get("x", 0) / 256, msg.get("y", 0) / 256, max(8.0, min(float(msg.get("r", 32)), 192.0)))
             was = self.remote_view
             self.remote_view = msg.get("rv") == 1
             if self.remote_view and not was:
@@ -1848,6 +1972,10 @@ class MockGame(mock_info.InfoMixin):
             if name not in answers:
                 reply["ok"] = 0
             self.send_reliable(reply)
+        elif t == "mpress":
+            # mod_gui.lua presses a button of a mod with a remote interface (ck); the mock's turns the page.
+            if int(msg.get("ix", 0)) == 918:
+                self.mgui_page = getattr(self, "mgui_page", 1) + 1
         elif t == "unghost":
             x, y = msg.get("x", 0) / 256, msg.get("y", 0) / 256
             hit = next((e for e in list(self.entities.values()) if e.type == "entity-ghost"
@@ -1877,10 +2005,14 @@ class MockGame(mock_info.InfoMixin):
             if level != getattr(self, "rate", 0):
                 self.rate_from, self.rate_at = getattr(self, "rate", 0), self.tick
             self.rate = level
+        elif t == "bre":
+            # belt_items.lua's resend: plain lanes the client has otherwise are read (sent) again.
+            for key in msg.get("l", []) if isinstance(msg.get("l"), list) else []:
+                self.lanes.pop(key, None)
         elif t == "bfar":
             self.far_r = max(0, min(1024, int(msg.get("r", 0) or 0)))
             n = msg.get("n")
-            self.near_r = max(0, min(320, int(n))) if isinstance(n, (int, float)) else None
+            self.near_r = max(0, min(640, int(n))) if isinstance(n, (int, float)) else None  # belt_items.lua's MAX_NEAR
             m = msg.get("m")
             self.bi_cap = max(200, min(100000, int(m))) if isinstance(m, (int, float)) and m > 0 else None
         elif t == "budget":
@@ -1896,10 +2028,15 @@ class MockGame(mock_info.InfoMixin):
                         x, y, o = self.mover_state(m)
                         colour = 0xEB1200 if m["name"] == "locomotive" else 0x9A9A9A
                         cars += [round(x * 256), round(y * 256), round(o * 1000) % 1000, round(5.8 * 256), round(1.8 * 256), colour]
-            # No radars in the mock: only the ground round the character is covered (cov empty).
-            self.send_now({"t": "mtr", "si": si, "part": 1, "parts": 1, "l": cars, "cov": []})
+            # As map.lua: the surface's radars (the mock's world is the one shown), and on the
+            # platform (surface 2 in send_surfaces) everything seen.
+            reply = {"t": "mtr", "si": si, "part": 1, "parts": 1, "l": cars,
+                     "cov": self.radars() if si == self.surface_index() and self.surface != PLATFORM_SURFACE else []}
+            if si == 2:
+                reply["all"] = 1
+            self.send_now(reply)
         elif t == "mrp":
-            # map.lua's roboport listing (H13): every roboport on the surface, in one part here.
+            # map.lua's roboport listing: every roboport on the surface, in one part here.
             si = msg.get("si") if isinstance(msg.get("si"), int) else self.surface_index()
             ports = []
             if si == self.surface_index():
@@ -1907,7 +2044,7 @@ class MockGame(mock_info.InfoMixin):
                     ports += [fixed(x), fixed(y), fixed(lr), fixed(cr)]
             self.send_now({"t": "mrp", "si": si, "q": (int(msg["q"]) if isinstance(msg.get("q"), int) else 0), "part": 1, "last": 1, "l": ports})
         elif t == "lpad":
-            # Where the map centres on switching to a planet (H23): its landing pad.
+            # Where the map centres on switching to a planet: its landing pad.
             si = msg.get("si") if isinstance(msg.get("si"), int) else 0
             out = {"t": "lpad", "si": si, "q": (int(msg["q"]) if isinstance(msg.get("q"), int) else 0)}
             if si == self.surface_index():
@@ -2334,11 +2471,16 @@ class MockGame(mock_info.InfoMixin):
         cancel = bool(msg.get("cancel"))
         # down: Factorio's right-drag downgrade, the mappings the other way round.
         mapping = {v: k for k, v in UPGRADES.items()} if msg.get("down") == 1 else UPGRADES
-        if t == "decon" and not cancel:
+        # decon u: one entity by its unit number (planners.lua: a train mined from the remote view, not
+        # the rail under it). The mock's trains are movers it can't mark, so that marks nothing.
+        only = msg.get("u") if t == "decon" and isinstance(msg.get("u"), int) and msg.get("u") > 0 else 0
+        if t == "decon" and not cancel and not only:
             self.remove_ghosts(x1, y1, x2, y2)
         changed = []
         for e in list(self.entities.values()):
             if not (x1 <= e.x <= x2 and y1 <= e.y <= y2) or e.type in ("resource", "entity-ghost", "tile-ghost"):
+                continue
+            if only and e.unit != only:
                 continue
             key = "d" if t == "decon" else "up"
             if t == "upgrade" and e.name not in mapping and not cancel:
@@ -2762,7 +2904,7 @@ class MockGame(mock_info.InfoMixin):
 
     def view_seen(self, x, y):
         """map.lua's view_filter: what the 3D remote view shows moving things in."""
-        if not self.remote_view:
+        if not self.remote_view or self.surface == PLATFORM_SURFACE:
             return True
         cx, cy = math.floor(x / 32), math.floor(y / 32)
         if math.hypot(cx * 32 + 16 - self.player["x"], cy * 32 + 16 - self.player["y"]) <= 96 + 16:
@@ -2773,7 +2915,11 @@ class MockGame(mock_info.InfoMixin):
         return self.roboport_sees(cx, cy)
 
     def send_view_coverage(self):
-        """`cov`, as map.lua sends it about once a second while the 3D remote view is on."""
+        """`cov`, as map.lua sends it about once a second while the 3D remote view is on: on the
+        platform everything is seen (`all`), elsewhere the radars and the character (on that surface)."""
+        if self.surface == PLATFORM_SURFACE:
+            self.send_now({"t": "cov", "si": self.surface_index(), "l": [], "all": 1})
+            return
         self.send_now({"t": "cov", "si": self.surface_index(), "l": self.radars(),
                        "x": fixed(self.player["x"]), "y": fixed(self.player["y"]), "cr": 96})
 
@@ -2788,6 +2934,7 @@ class MockGame(mock_info.InfoMixin):
         return self.roboport_sees(cx, cy)
 
     def open_screen(self, msg):
+        self.screen = None  # screens.lua: opening another entity ends the open screen, even if it fails
         target = self.find(msg)
         if target is not None and target.type == "cargo-bay":  # a bay opens its hub's window, as in Factorio
             target = self.entities.get(self.platform.get("hub") or 0) or target
@@ -3134,7 +3281,7 @@ class MockGame(mock_info.InfoMixin):
             text = str(msg.get("text", ""))[:500]
             if text:
                 print(f"chat: {text}")
-                self.send_now({"t": "chat", "from": "3D", "text": text})
+                self.send_now({"t": "chat", "from": "Zenith", "text": text})
         elif t == "tile":
             self.place_tiles(msg)
         elif t == "tile_mine":
@@ -3526,8 +3673,11 @@ class MockGame(mock_info.InfoMixin):
 
     def send_queue(self, force=False):
         runs = self.craft_queue()
-        if runs or self.queue_sent or force:
+        resend = self.queue_empty_tick is None or self.tick - self.queue_empty_tick >= 300
+        if runs or self.queue_sent or force or resend:
             self.queue_sent = bool(runs)
+            if not runs:
+                self.queue_empty_tick = self.tick
             self.send_now({"t": "cq", "pr": int((self.tick % 30) * 1000 / 30) if runs else 0, "l": runs})
 
     def send_techs(self):
@@ -3540,17 +3690,15 @@ class MockGame(mock_info.InfoMixin):
         self.send_parts("techs", recs)
 
     def send_research_status(self):
-        labs = [[e.unit, "working" if self.research else "no_research_in_progress"]
-                for e in self.entities.values() if e.type == "lab" and self.watched(e)]
         self.send_now({"t": "rs", "cur": self.research or "", "pr": int(self.research_progress * 1000 / RESEARCH_TICKS),
-                       "q": list(self.research_queue), "labs": labs})
+                       "q": list(self.research_queue)})
 
     def tick_ui(self):
         if self.research:
             self.research_progress += 1
             if self.research_progress >= RESEARCH_TICKS:
                 self.researched.add(self.research)
-                self.send_now({"t": "msg", "text": f"Research completed: {self.research}", "tech": self.research, "unlocks": []})
+                self.send_now({"t": "msg", "text": f"Research completed: {self.research}", "tech": self.research})
                 self.research = self.research_queue.pop(0) if self.research_queue else None
                 self.research_progress = 0
                 self.send_techs()
@@ -3627,8 +3775,23 @@ class MockGame(mock_info.InfoMixin):
         elif self.in_hub:
             msg["hub"] = self.platform["hub"] or 1
 
+    def flight_height(self):
+        """--fly: how high the mech-armoured character flies now (tiles; 0 on the ground). "loop" takes off
+        and lands on a timer; "walk" flies while walking, as Factorio's mech does over water. Factorio 2.1's
+        own rates (measured): up 1/32 tile a tick to about 1, down 3/64 a tick, `fl` 1 until it touches down."""
+        if FLY == "loop":
+            want = self.tick % FLY_CYCLE >= FLY_GROUND
+        else:
+            p = self.player
+            want = bool(p["walk"] and self.tick <= p["walk"][1])
+        rate = FLY_UP if want else -FLY_DOWN
+        self.fly_ramp = min(FLY_HEIGHT, max(0.0, self.fly_ramp + rate))
+        return self.fly_ramp
+
     def tick_player(self):
         p, inv = self.player, self.player["inventory"]
+        if FLY:
+            self.flight_height()
         if self.trip:
             self.step_trip()
         if p["walk"] and self.tick <= p["walk"][1]:
@@ -3676,6 +3839,10 @@ class MockGame(mock_info.InfoMixin):
                    "sh": 1 if self.tick - p["fired"] <= FIRING_TICKS else 0}
             if p["walk"] and len(p["walk"]) > 2:
                 msg["a"] = p["walk"][2]
+            if FLY and p["vehicle"] is None:
+                height = self.fly_ramp
+                if height > 0.0:
+                    msg.update(fl=1, fh=int(round(height * 1000)))
             sd, msd = self.shields()
             if msd:
                 msg.update(sd=sd, msd=msd)
@@ -3859,6 +4026,27 @@ class MockGame(mock_info.InfoMixin):
         if self.tick % 60 == 0:
             self.send_now(self.character_info())
             self.send_now({"t": "pl", "me": 0, "u": self.player["unit"], "l": MOCK_PLAYERS})
+            if MOD_WINDOW:
+                # mod_gui.lua's `mgui`: a mod's window on the player's screen and its top button, one
+                # message per window, each with Factorio's window size and UI scale (ds). The window
+                # changes every time (its tick); the button is sent first and then every 5 s, as all are.
+                # Every element has its index (ix); "Next page" is one the bridge can press itself (ck,
+                # as Informatron's menu: `mpress` turns the page), and the page's text is a label
+                # Factorio wraps (ml, at mw pixels).
+                page = getattr(self, "mgui_page", 1)
+                windows = [{"i": 901, "r": "screen", "at": [240, 160], "e": {"t": "frame", "ix": 901, "d": "vertical", "a": [
+                    {"t": "flow", "ix": 910, "dr": True, "a": [{"t": "label", "ix": 911, "c": "Mock mod", "st": "frame_title"},
+                                                               {"t": "empty-widget", "ix": 912, "st": "draggable_space_header"}]},
+                    {"t": "label", "ix": 913, "c": ["", "Tick ", self.tick]},
+                    {"t": "label", "ix": 914, "ml": True, "mw": 400, "c": "Page %d. " % page + "A long paragraph that Factorio wraps at the label's width, as Informatron's pages do. " * 3},
+                    {"t": "table", "ix": 915, "cc": 3, "a": [{"t": "sprite-button", "ix": 916, "sp": "item/iron-plate", "nu": 50},
+                                                             {"t": "button", "ix": 917, "c": "Do the thing"},
+                                                             {"t": "button", "ix": 918, "c": "Next page", "ck": True}]}]}}]
+                if self.tick % 300 == 0 or not getattr(self, "mgui_button_sent", False):
+                    self.mgui_button_sent = True
+                    windows.append({"i": 902, "r": "top", "e": {"t": "sprite-button", "ix": 902, "sp": "item/iron-gear-wheel"}})
+                for w in windows:
+                    self.send_now({"t": "mgui", "ids": [901, 902], "l": [w], "ds": [1920, 1080, 1]})
         return True
 
     # --- combat ----------------------------------------------------------------------------
@@ -3948,9 +4136,12 @@ class MockGame(mock_info.InfoMixin):
             return
         m, x, y = target
         m["hp"] -= SHOT_DAMAGE
+        fx, fy, fr = self.focus
+        if abs(x - fx) <= fr and abs(y - fy) <= fr:
+            # combat.lua's hit effect: blood, or burning from a flamethrower.
+            self.send_now({"t": "afx", "fx": "burn" if "flame" in gun[0] else "blood", "u": m["unit"], "x": fixed(x), "y": fixed(y)})
         if m["hp"] <= 0:
             m["dead_until"] = self.tick + RESPAWN_TICKS
-            fx, fy, fr = self.focus
             if abs(x - fx) <= fr and abs(y - fy) <= fr:
                 self.send_now({"t": "died", "u": m["unit"], "p": EID[m["name"]], "x": fixed(x), "y": fixed(y)})
 
@@ -3968,6 +4159,8 @@ class MockGame(mock_info.InfoMixin):
                 print(f"client {addr[0]}:{addr[1]} dropped")
                 del self.extras[addr]
                 self.characters.pop(state["player"]["unit"], None)
+        if getattr(self, "mod_gfx", None) and self.client:
+            self.mod_gfx.tick(self.send_now)
         for addr in list(self.batches):
             self.send_batch(addr)
 
@@ -4068,7 +4261,8 @@ class MockGame(mock_info.InfoMixin):
         near = getattr(self, "near_r", None)
         if self.rate_due("bi", BELT_ITEM_INTERVAL):
             fx, fy, fr = self.focus
-            r = min(BELT_ITEM_RADIUS if near is None else near, fr)
+            # belt_items.lua's near_radius: the client's distance as asked, else the map setting within the focus.
+            r = min(BELT_ITEM_RADIUS, fr) if near is None else near
             moving = self.belt_items() + self.belt_field_items()
             cap = getattr(self, "bi_cap", None)
             if cap:
@@ -4094,7 +4288,9 @@ class MockGame(mock_info.InfoMixin):
             if fresh:
                 self.send_now({"t": "bf", "part": 1, "parts": 1, "l": fresh})
             self.space.belt_quality(flat[0::4])
-            extra = {"fx": fixed(fx), "fy": fixed(fy), "fr": int(r), "p": self.rate_period("bi", BELT_ITEM_INTERVAL)}
+            # w: the work the reading took (belt_items.lua's units: about 6 an item read and written).
+            extra = {"fx": fixed(fx), "fy": fixed(fy), "fr": int(r), "p": self.rate_period("bi", BELT_ITEM_INTERVAL),
+                     "w": len(flat) // 4 * 6}
             if self.client.get("bl"):
                 self.send_belt_lanes(flat, extra)
             else:
@@ -4543,6 +4739,8 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=34200, help="port the client sends to (Factorio's --enable-lua-udp port)")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--mod-gfx", action="store_true",
+                        help="send a graphics list pointing at the fixture mod's pictures (tools/mock_mod_gfx.py)")
     parser.add_argument("--drop", type=float, default=0.0, help="fraction of packets to lose, both ways")
     parser.add_argument("--day-length", type=int, default=25000, help="ticks per day; Factorio's is 25000 (about 7 minutes)")
     parser.add_argument("--start", default="-3,0.5", help="the character's starting position X,Y in tiles")
@@ -4570,6 +4768,8 @@ def main():
     parser.add_argument("--armor", help="the armour the character wears instead of power armour MK2, or none (each "
                         "armour has its look: light-armor plain, heavy-armor and modular-armor level 2, power-armor level 3, "
                         "mech-armor the mech)")
+    parser.add_argument("--fly", choices=["loop", "walk"], help="the character flies as in mech armour (me fl, fh): loop "
+                        "takes off and lands every 10 s, walk flies while walking; use with --armor mech-armor")
     parser.add_argument("--other-armor", help="the armour the other player's character (walking round near the start) "
                         "wears instead of power armour, or none")
     parser.add_argument("--vehicles", action="store_true", help="a walking spidertron, a driving tank, working "
@@ -4592,6 +4792,8 @@ def main():
                         "before leaving for PLACE (and never leaves): Factorio's waiting_for_departure")
     parser.add_argument("--travel", metavar="PLACE", help="the platform sets off for this place at the start "
                         "(a 30 s trip), for its journey in the map view and the platform panel")
+    parser.add_argument("--mod-window", action="store_true", help="a mod's window and top button sent as mgui "
+                        "(mod_gui.lua), as a real player's mods would have")
     parser.add_argument("--beacon", action="store_true", help="a beacon with two speed modules north of the "
                         "starter assemblers, for the hover panel's effects")
     parser.add_argument("--radar", action="append", metavar="X,Y", help="a working radar there with a row of "
@@ -4603,8 +4805,10 @@ def main():
         global REACH
         REACH = args.reach
     if args.armor:
-        global ARMOR
+        global ARMOR, FLY
         ARMOR = "" if args.armor == "none" else args.armor
+    if args.fly:
+        FLY = args.fly
     if args.other_armor:
         MOCK_PLAYERS[0][11] = "" if args.other_armor == "none" else args.other_armor
     for armor in (ARMOR, MOCK_PLAYERS[0][11]):
@@ -4624,6 +4828,8 @@ def main():
     game.build_starter_base()
     game.build_cliffs()
     game.mortal = args.mortal
+    if args.mod_gfx:
+        game.mod_gfx = mock_mod_gfx.Sender()
     if args.guns:
         mock_shots.arm(game, args.guns.split(","))
         for name in mock_shots.CAPSULES:
@@ -4646,10 +4852,13 @@ def main():
     if args.travel:
         game.platform["sched"], game.platform["pa"] = {"c": 1, "l": [args.travel]}, 0
     if args.wait or args.depart:
-        # Waiting at its stop (H7): the schedule's current record is where it is and the next one
+        # Waiting at its stop: the schedule's current record is where it is and the next one
         # elsewhere; or done there, the current record the next stop, held for cargo on its way.
         game.platform["sched"] = {"c": 2 if args.depart else 1, "l": [game.platform["loc"], args.depart or args.wait]}
         game.platform["pa"], game.platform["hold"] = 0, True
+    if args.mod_window:
+        global MOD_WINDOW
+        MOD_WINDOW = True
     if args.beacon:
         game.add(Entity(game._unit(), "beacon", 8.5, -6.5))
     for spot in args.radar or []:

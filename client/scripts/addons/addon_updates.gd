@@ -8,7 +8,7 @@ extends RefCounted
 ##   entity  tiles round the focus with moving things and machine states
 ##   near    tiles round the focus within which items on belts may move
 ##   far     tiles out to which items on belts are drawn at all (0: none)
-##   updates the most belt items sent moving an update (Belt updates)
+##   updates the most belt items sent moving an update (Moving belt items)
 ##   view    chunks drawn round the focus
 ##   map     how many times longer the minimap waits between refreshes
 

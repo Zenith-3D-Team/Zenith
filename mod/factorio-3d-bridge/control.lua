@@ -37,9 +37,19 @@ local profile = require("scripts.profile")
 local budget = require("scripts.budget")
 local requests = require("scripts.requests")
 local alt_mode = require("scripts.alt_mode")
+local gfx = require("scripts.gfx")
+local mod_gui = require("scripts.mod_gui")
 
-script.on_init(session.init_storage)
-script.on_configuration_changed(function() session.each_client(session.init_storage) end)
+local zenith_button = require("scripts.zenith_button")
+script.on_init(function()
+  session.init_storage()
+  zenith_button.update_all()
+end)
+script.on_load(session.on_load)
+script.on_configuration_changed(function()
+  session.each_client(session.init_storage)
+  zenith_button.update_all()
+end)
 
 script.on_event(defines.events.on_udp_packet_received, session.on_packet)
 
@@ -56,7 +66,7 @@ local STEPS = {
   { "ground_items", ground_items.tick }, { "fluids_power", fluids_power.tick },
   { "inserters", inserters.tick }, { "sky", sky.tick }, { "ui_actions", ui_actions.tick }, { "alt_mode", alt_mode.tick },
   { "alerts", alerts.tick }, { "equipment", equipment.tick }, { "players", players.tick },
-  { "enemies", enemies.tick }, { "requests", requests.tick },
+  { "enemies", enemies.tick }, { "requests", requests.tick }, { "gfx", gfx.tick }, { "mod_gui", mod_gui.tick },
 }
 
 local function serve()
@@ -65,6 +75,8 @@ local function serve()
   end
   -- The tick's work budget (budget.lua): jobs that can be big take their slices from it.
   budget.begin()
+  -- Belt items' share of this tick first, so the periodic jobs that may wait keep off it.
+  budget.commit(belt_items.planned_units(), "bi")
   if session.handshaking() then
     profile.run("transport", transport.flush)
     profile.run("handshake", session.handshake_tick)
@@ -100,25 +112,44 @@ script.on_event(defines.events.on_tick, function()
   profile.run("poll", transport.poll)
   profile.run("bridge", function() session.each_client(serve) end)
   profile.run("transport", transport.end_tick)
+  session.launch_tick()
   profile.end_tick()
 end)
 
 tracker.register()
 puppet.register()
 combat.register()
-shots.register()
+-- on_object_destroyed takes one handler: shots' projectiles and tracker's rolling stock ghosts.
+script.on_event(defines.events.on_object_destroyed, function(event)
+  shots.on_object_destroyed(event)
+  tracker.on_object_destroyed(event)
+end)
 research.register()
 map.register()
 planets.register()
 trains.register()
 script.on_event(defines.events.on_console_chat, ui_actions.on_console_chat)
 
-commands.add_command("f3d-status", { "command-help.f3d-status" }, session.status_command)
-commands.add_command("f3d-selftest", { "command-help.f3d-selftest" }, session.selftest_command)
-commands.add_command("f3d-platform", { "command-help.f3d-platform" }, session.platform_command)
-commands.add_command("f3d-player", { "command-help.f3d-player" }, session.player_command)
-commands.add_command("f3d-profile", { "command-help.f3d-profile" }, session.profile_command)
-commands.add_command("f3d-rate", { "command-help.f3d-rate" }, session.rate_command)
+-- Factorio lets any player run a mod's command: in a multiplayer game these are for admins
+-- (console.allowed). The server's own console and RCON have no player and always may.
+local function admins_only(fn)
+  return function(cmd)
+    if cmd.player_index and not console.allowed(cmd.player_index) then
+      local p = game.get_player(cmd.player_index)
+      if p then
+        p.print("[Zenith] /" .. tostring(cmd.name) .. " is for admins in a multiplayer game")
+      end
+      return
+    end
+    return fn(cmd)
+  end
+end
+commands.add_command("f3d-status", { "command-help.f3d-status" }, admins_only(session.status_command))
+commands.add_command("f3d-selftest", { "command-help.f3d-selftest" }, admins_only(session.selftest_command))
+commands.add_command("f3d-platform", { "command-help.f3d-platform" }, admins_only(session.platform_command))
+commands.add_command("f3d-player", { "command-help.f3d-player" }, admins_only(session.player_command))
+commands.add_command("f3d-profile", { "command-help.f3d-profile" }, admins_only(session.profile_command))
+commands.add_command("f3d-rate", { "command-help.f3d-rate" }, admins_only(session.rate_command))
 -- game.player for the client's Lua commands over RCON (console.lua).
 console.register_remote()
 
@@ -134,4 +165,33 @@ end
 
 -- The real game's "Show in Zenith" key (data.lua): the client playing that player's character
 -- comes to the front.
-script.on_event("f3d-show-3d", function(event) session.each_client(session.show_3d, event) end)
+local function show_in_zenith(event)
+  log("[Zenith] Show in Zenith pressed by player " .. tostring(event.player_index) .. " at tick " .. game.tick)
+  local raised = false
+  session.each_client(function(e) raised = session.show_3d(e) or raised end, event)
+  if not raised then
+    session.ask_launch(event)  -- no Zenith to raise: the launcher beside Factorio starts one
+  end
+end
+script.on_event("f3d-show-3d", show_in_zenith)
+-- The bridge's own windows and buttons (the launcher help, the Zenith button): not per client, so
+-- registered after the loop above.
+script.on_event(defines.events.on_gui_click, function(event)
+  if zenith_button.is_button(event.element) then
+    return show_in_zenith(event)
+  end
+  session.on_gui_click(event)
+end)
+-- The Zenith button for each player, on top of what these events already do (puppet.lua).
+local function also(id, fn)
+  local before = script.get_event_handler(id)
+  script.on_event(id, function(event)
+    if before then
+      before(event)
+    end
+    fn(event)
+  end)
+end
+also(defines.events.on_player_created, zenith_button.on_player)
+also(defines.events.on_player_joined_game, zenith_button.on_player)
+also(defines.events.on_runtime_mod_setting_changed, zenith_button.on_player)

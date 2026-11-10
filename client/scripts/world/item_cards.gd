@@ -4,10 +4,9 @@ extends Node3D
 ## item type, refilled from the positions it is given. Used for items on belts, on the ground
 ## and in inserter hands.
 ##
-## Each instance is a turn about +Y and a position, plus in its custom data a glide: how far the
-## item moves until the next update, or where its lane's path is in the `belt_paths` texture
-## (set_paths(), belt_path.gdshaderinc). The shaders move it `glide` (0 to 1, set_glide()) of the
-## way, so items on belts move every frame without their transforms being rewritten (belt_items.gd).
+## Each instance is a turn about +Y and a position. Items on belts are drawn from records instead
+## (put_records(), belt_records.gd): the shaders place each from its record and the drawn clock, so
+## their instances are never written after a kind's size changes (belt_items.gd).
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
@@ -33,19 +32,23 @@ var _lift := {}  # item id -> Vector3, raises blocks so they sit on what carries
 var _turns := {}  # item id -> true when it is drawn as a model (turned by its yaw)
 var _pile := {}  # item id -> the step between a pile's copies (pile_step())
 var _buffers := {}  # item id -> PackedFloat32Array, the MultiMesh's instances
-var _materials := {}  # ShaderMaterial -> true, the ones set_glide() updates
+var _materials := {}  # ShaderMaterial -> true, the ones set_paths() updates
 var _paths: Texture2D = null  # set_paths(): kept across reset(), given to every new material
 var _look := -1
 var epoch := 0  # bumped by reset(), when every buffer handed out before is gone
 ## Settings → Graphics → Item icons: off draws every item without a model as its coloured block.
 static var use_icons := true
-## Settings → Graphics → Items on belts: 3D models, or Factorio's icons as before.
+## Off when Settings → Graphics → Items in 3D is "Icons only": every item as its icon.
 static var use_models := true:
 	set(value):
 		if value != use_models:
 			use_models = value
 			_look_changes += 1
 static var _look_changes := 0
+## Settings → Graphics → Items in 3D: the most items on belts drawn as models, nearest the focus
+## first; the rest show their icon. -1 for all. belt_items.gd asks for those as icon kinds: a kind
+## key below zero, -(item id + 1), is that item drawn as its icon whatever use_models says.
+static var model_cap := -1
 static var _card_mesh: PlaneMesh
 static var _block_mesh: BoxMesh
 
@@ -73,6 +76,7 @@ func reset() -> void:
 	_buffers.clear()
 	_materials.clear()
 	_loading.clear()
+	_bounded.clear()
 	epoch += 1
 
 
@@ -107,7 +111,7 @@ func draw(groups: Dictionary, yaws := {}) -> void:
 # `epoch` changes whenever the buffers are dropped (then every slot must be written again).
 
 
-## Applies a change of Settings → Items on belts.
+## Applies a change of Settings → Items in 3D (models on or off).
 func begin() -> void:
 	if _look != _look_changes:
 		_look = _look_changes
@@ -149,6 +153,45 @@ func put(item_id: int, buf: PackedFloat32Array, n: int, cap: int) -> void:
 		mm.instance_count = cap
 	mm.buffer = buf
 	mm.visible_instance_count = n
+
+
+## A kind drawn from records (belt_items.gd, belt_records.gd): `cap` instances reading records `base`
+## on, the first n drawn. Its buffer is only identity transforms, written when its size changes.
+func put_records(item_id: int, base: int, n: int, cap: int, bounds: AABB) -> void:
+	var mmi := _kind(item_id)
+	var mm := mmi.multimesh
+	if mm.instance_count != cap:
+		mm.visible_instance_count = 0
+		mm.instance_count = cap
+		mm.buffer = _identity(cap)
+	mm.custom_aabb = bounds
+	mm.visible_instance_count = n
+	mmi.set_instance_shader_parameter("belt_base", base)
+	_bounded[item_id] = true
+
+
+## Every record-drawn kind's bounds: where its items can be (the square they come from).
+func set_bounds(bounds: AABB) -> void:
+	for id in _bounded:
+		var mmi: MultiMeshInstance3D = _kinds.get(id)
+		if mmi != null:
+			mmi.multimesh.custom_aabb = bounds
+
+
+var _bounded := {}
+static var _identities := {}
+
+
+## n instances with no turn, no move (doubling copies, not a loop per instance).
+static func _identity(n: int) -> PackedFloat32Array:
+	var buf: PackedFloat32Array = _identities.get(n, PackedFloat32Array())
+	if not buf.is_empty():
+		return buf
+	buf = PackedFloat32Array([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+	while buf.size() < n * STRIDE:
+		buf.append_array(buf.slice(0, mini(buf.size(), n * STRIDE - buf.size())))
+	_identities[n] = buf
+	return buf
 
 
 ## What raises this kind above the position it is given (blocks stand on it).
@@ -203,12 +246,6 @@ static func clear_slot(buf: PackedFloat32Array, o: int) -> void:
 		buf[o + k] = 0.0
 
 
-## How far along their glide the items are, 0 to 1.
-func set_glide(t: float) -> void:
-	for m: ShaderMaterial in _materials:
-		m.set_shader_parameter("glide", t)
-
-
 ## The texture of the belt items' paths (belt_items.gd), for every material from now on.
 func set_paths(texture: Texture2D) -> void:
 	_paths = texture
@@ -216,21 +253,31 @@ func set_paths(texture: Texture2D) -> void:
 		m.set_shader_parameter("belt_paths", texture)
 
 
+## The item a kind key is for (icon_key()'s keys are below zero).
+static func item_of(key: int) -> int:
+	return key if key >= 0 else -key - 1
+
+
+## The kind key that draws an item as its icon even when it has a model.
+static func icon_key(item_id: int) -> int:
+	return -item_id - 1
+
+
 func _kind(item_id: int) -> MultiMeshInstance3D:
 	if _kinds.has(item_id):
 		return _kinds[item_id]
 	var item := ""
 	if protos != null:
-		item = protos.item_name(item_id)
+		item = protos.item_name(item_of(item_id))
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_custom_data = true
 	var mmi := MultiMeshInstance3D.new()
 	mmi.multimesh = mm
-	mmi.name = "Items_%s" % (item if item != "" else str(item_id))
+	mmi.name = "Items_%s%s" % [item if item != "" else str(item_of(item_id)), "_icon" if item_id < 0 else ""]
 	add_child(mmi)
 	_kinds[item_id] = mmi
-	if _look_ready(item):
+	if _look_ready(item, item_id < 0):
 		_dress(item_id, item, mmi)
 	else:
 		# Drawn once its model or icon is read (_process); its instances are kept meanwhile.
@@ -251,7 +298,7 @@ func _process(_delta: float) -> void:
 		return
 	for id in _loading.keys():
 		var item: String = _loading[id]
-		if not _look_ready(item):
+		if not _look_ready(item, id < 0):
 			continue
 		_loading.erase(id)
 		var mmi: MultiMeshInstance3D = _kinds.get(id)
@@ -263,10 +310,10 @@ func _process(_delta: float) -> void:
 ## Whether an item's look is known: its model read (or none), and without one its icon. Otherwise
 ## they are read on threads meanwhile: on the main thread a model or a composed icon cost 10-60 ms
 ## the first time an item came into view (on belts, the ground, in inserters' hands).
-static func _look_ready(item: String) -> bool:
+static func _look_ready(item: String, icon := false) -> bool:
 	if item == "":
 		return true
-	if use_models:
+	if use_models and not icon:
 		if not ItemModels.ready(item):
 			return false
 		if ItemModels.mesh_for(item) != null:
@@ -291,7 +338,7 @@ static func _look_ready(item: String) -> bool:
 ## Gives a kind its model, icon card or block.
 func _dress(item_id: int, item: String, mmi: MultiMeshInstance3D) -> void:
 	var mm := mmi.multimesh
-	var model: Mesh = ItemModels.mesh_for(item) if use_models else null
+	var model: Mesh = ItemModels.mesh_for(item) if use_models and item_id >= 0 else null
 	var texture: Texture2D = null
 	if model == null and item != "" and use_icons:
 		texture = ItemIcons.texture_for(item)

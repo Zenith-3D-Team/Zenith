@@ -213,9 +213,14 @@ def main():
     msgs = take()
     check(any(m.get("t") == "welcome" for m in msgs), "a new client gets a welcome after fuzzing")
     send({"t": "sub", "c": [[0, 0]]})
-    tick(6, "a sub")
-    msgs = take()
-    check(any(m.get("t") == "chunk" for m in msgs), "and its chunk")
+    # The handshake's stages and the chunk share the work budget a tick, which what was fuzzed may
+    # have filled for a while: the chunk comes within seconds (12 ticks with seed 1), not always 6.
+    waited, got = 0, False
+    while waited < 300 and not got:
+        tick(6, "a sub")
+        waited += 6
+        got = any(m.get("t") == "chunk" for m in take())
+    check(got, f"and its chunk (within {waited} ticks)")
     for _ in range(3):
         send({"t": "walk", "d": 4})
         tick(3, "walking")

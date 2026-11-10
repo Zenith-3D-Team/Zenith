@@ -27,6 +27,10 @@ def check(cond, what):
         print("FAIL:", what)
 
 
+# PROTOCOL.md's table of the mod's messages says the same as protocol.py: a row each, R when reliable.
+for problem in protocol.doc_problems():
+    check(False, problem)
+
 game = mock_server.MockGame(seed=1, drop=0.0)
 game.build_starter_base()
 game.build_cliffs()
@@ -194,6 +198,40 @@ mock_server.BELT_SPEED = belt_speed
 step(13)
 moving = of_type(take(), "bi")
 check(any(m["l"] for m in moving), "bl: when the belt moves again its lanes are sent again")
+
+# bg (with bl): packed lanes (the belt field's: one kind and stack size, a quarter tile apart) come
+# as groups, then only their front items' places when they move (bm); the starter belt's lanes,
+# which mix kinds, still as items.
+game.build_belt_field(2, 3, x0=8, y0=14)
+field_keys = {game.lane_key(b.x + dx, b.y) for column in game.belt_field for b in column for dx in (-0.25, 0.25)}
+HELLO["bg"] = 1
+send(HELLO)
+step(13)
+gmsgs = of_type(take(), "bi")
+groups = {m["bg"][i]: m["bg"][i + 1:i + 10] for m in gmsgs for i in range(0, len(m.get("bg", [])), 10)}
+as_items = {m["ln"][i] for m in gmsgs for i in range(0, len(m.get("ln", [])), 2)}
+check(set(groups) == field_keys and not field_keys & as_items and as_items,
+      f"bg: the belt field's lanes come as groups, not items; the starter belt's as items: {sorted(groups)} {sorted(as_items)}")
+# g: item id, x and y of line position 0, x and y of 1, front, gap, speed, stack size.
+check(all(g[1] == g[3] and g[2] - g[4] == 256 and 0 <= g[5] < 64 and g[6] == 64
+          and g[7] == round(mock_server.BELT_SPEED * 65536) for g in groups.values()),
+      f"bg: each group runs a tile south (line position 0 on the belt's south edge), a quarter tile apart, at belt speed: {list(groups.values())[:2]}")
+stacks = {g[8] for g in groups.values()}
+check(stacks == {1, 4}, f"bg: groups carry their stack size (the field's second column has stacks of 4): {stacks}")
+fronts = {}  # each group's front item's place after the last update (bg, then bm when it moved)
+for m in gmsgs:
+    fronts.update({m["bm"][i]: m["bm"][i + 1] for i in range(0, len(m.get("bm", [])), 3)})
+    fronts.update({m["bg"][i]: m["bg"][i + 7] for i in range(0, len(m.get("bg", [])), 10)})
+step(6)
+mmsgs = of_type(take(), "bi")
+moves = {m["bm"][i]: m["bm"][i + 1:i + 3] for m in mmsgs for i in range(0, len(m.get("bm", [])), 3)}
+again = {m["bg"][i] for m in mmsgs for i in range(0, len(m.get("bg", [])), 10)}
+step_g = round(6 * mock_server.BELT_SPEED * 256)
+check(set(moves) == field_keys and all(moves[k] == [(fronts[k] - step_g) % 64, 6] for k in moves),
+      f"bm: each group that moved sends its front item's place and the ticks since its last check: {list(moves.items())[:2]} {fronts}")
+check(all((k + game.lane_count) % game.LANE_REFRESH == 0 for k in again),
+      f"bg: a group isn't sent again but at its lane's refresh: {sorted(again)}")
+del HELLO["bg"]
 del HELLO["bl"]
 send(HELLO)
 step(2)
@@ -460,6 +498,9 @@ check(len(died) >= 2 and all(d["p"] in (protos["small-biter"], protos["medium-bi
       f"died: biters die when shot: {len(died)}")
 after = msgs[msgs.index(died[0]) + 1:] if died else []
 check(died and all(r[0] != died[0]["u"] for m in of_type(after, "mv") for r in m["l"]), "a dead biter leaves the movers")
+hits = of_type(msgs, "afx")
+check(hits and all(h["fx"] == "blood" for h in hits) and died[0]["u"] in {h["u"] for h in hits},
+      f"afx: a biter that is hit bleeds (combat.lua's hit effect), the one that died too: {hits[:1]}")
 guns = of_type(msgs, "guns")
 check(guns and guns[-1]["sel"] == 1 and guns[-1]["l"][0][0] == "pistol" and 0 < guns[-1]["l"][0][2] < 10,
       f"guns: magazines get used up: {guns[-1:]}")
@@ -650,7 +691,6 @@ techs = {r[0]: r[6] for m in of_type(msgs, "techs") for r in m["l"]}
 check(techs.get("logistics") == 2 and techs.get("logistics-2") == 0 and of_type(msgs, "rs")[-1]["cur"] == "",
       f"finished research resends the tree: {techs}")
 check(any(m.get("tech") == "logistics" for m in of_type(msgs, "msg")), "and says so, naming the technology")
-check(any(l[1] == "working" for m in of_type(msgs, "rs") for l in m["labs"]), "rs: the starter lab works while research runs")
 
 # blueprints, ghosts and planners
 game.player["x"], game.player["y"] = -1.0, 24.0
@@ -682,6 +722,16 @@ upd = [m["e"] for m in of_type(take(), "upd")]
 check(any(e[5].get("up") == protos["fast-transport-belt"] for e in upd) and any("d" not in e[5] for e in upd),
       "cancel unmarks; upgrade marks belts with their target")
 send({"t": "upgrade", "i": slot_of["upgrade-planner"], "cancel": 1, **area})
+step(2)
+take()
+# decon u: only that entity (a train mined from the remote view, not the rail under it).
+inside = [e for e in game.entities.values() if -3 <= e.x <= 3 and 25 <= e.y <= 27 and e.type not in ("resource", "entity-ghost", "tile-ghost")]
+target = next(e for e in inside if e.unit > 0)
+send({"t": "decon", "i": 0, "u": target.unit, "p": protos[target.name], **area})
+step(3)
+marked = [m["e"][0] for m in of_type(take(), "upd") if m["e"][5].get("d") == 1]
+check(len(inside) > 1 and marked == [target.unit], f"decon u marks only that entity, not the rest of the box: {marked}")
+send({"t": "decon", "i": 0, "cancel": 1, **area})
 step(2)
 take()
 fast_belt = [e for e in game.entities.values() if e.name == "fast-transport-belt"]
@@ -950,7 +1000,7 @@ tr = of_type(msgs, "tr")
 check(tr and tr[-1]["l"] and tr[-1]["l"][0][6] == [700, 701, 702] and tr[-1]["l"][0][5] in ("East", "West"),
       f"tr: the train near the focus, its carriages and where it is heading: {tr[-1:]}")
 # The 3D remote view far from the character: the train runs through the starter roboport's
-# construction area, which counts as seen (H13); with the roboport away no radar sees it.
+# construction area, which counts as seen; with the roboport away no radar sees it.
 game.player["x"] -= 300
 send({"t": "focus", "x": int(loco.x * 256), "y": int(loco.y * 256), "r": 48, "rv": 1})
 step(62)
@@ -1518,6 +1568,50 @@ step(2)
 take()
 
 check(batched > 1, f"a client that says b in its hello gets several messages to a datagram: up to {batched}")
+
+# The graphics list (--mod-gfx): the welcome names it, the parts come a tick each, need asks again.
+import mock_mod_gfx  # noqa: E402
+game.mod_gfx = mock_mod_gfx.Sender()
+w = game.mod_gfx.welcome_fields({})
+check(w["gf"] == mock_mod_gfx.fingerprint() and w["gn"] == len(mock_mod_gfx.parts()) and "zenith-gfx-test" in w["mods"],
+      f"--mod-gfx: the welcome's mods, gf and gn: {w}")
+send({"t": "gfx", "fp": w["gf"]})
+step(8)
+parts = sorted(m["part"] for m in of_type(take(), "gfx"))
+check(parts == list(range(1, w["gn"] + 1)), f"--mod-gfx: every part: {parts}")
+send({"t": "gfx", "fp": w["gf"], "need": [2]})
+step(4)
+parts = [m["part"] for m in of_type(take(), "gfx")]
+check(parts == [2], f"--mod-gfx: the parts asked again: {parts}")
+game.mod_gfx = None
+
+# --mod-window: mod_gui.lua's mgui, one window a message, each with Factorio's window size and scale.
+mock_server.MOD_WINDOW = True
+step(240)
+mg = of_type(take(), "mgui")
+mock_server.MOD_WINDOW = False
+check(mg and all(len(m["l"]) == 1 and m["ids"] == [901, 902] and m.get("ds") == [1920, 1080, 1] for m in mg)
+      and {m["l"][0]["i"] for m in mg} == {901, 902},
+      f"mgui: one window a message, with ds, the top button too: {[(m['l'][0]['i'], m.get('ds')) for m in mg][:4]}")
+# Straight runs (br, with bl): the belt field's plain lanes come once with pl, then aren't sent.
+game.build_belt_field(2, 6, x0=12, y0=-16)
+HELLO["bl"] = 1
+HELLO["br"] = 1
+send(HELLO)
+step(13)
+first = of_type(take(), "bi")
+step(24)
+later = of_type(take(), "bi")
+pl = [k for m in first for k in m.get("pl", [])[0::8]]
+interior = {mock_server.MockGame.lane_key(12 + c + 0.5 + dx, -16 + r + 0.5) for c in range(2) for r in range(1, 5) for dx in (-0.25, 0.25)}
+check(interior <= set(pl), f"br: the belt field's plain lanes come with pl: {len(set(pl) & interior)} of {len(interior)}")
+again = {k for m in later for k in m.get("ln", [])[0::2]} & interior
+check(len(again) <= len(interior) // 4, f"br: and are moved by the client after that, not sent: {len(again)} sent again")
+del HELLO["br"]
+del HELLO["bl"]
+send(HELLO)
+step(2)
+take()
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

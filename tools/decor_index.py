@@ -77,7 +77,7 @@ def box_of(b):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--factorio", default=os.environ.get("FACTORIO", icon_index.FACTORIO))
+    parser.add_argument("--factorio", default=icon_index.FACTORIO)
     parser.add_argument("--out", default=OUT)
     args = parser.parse_args()
     raw = icon_index.dump(args.factorio)

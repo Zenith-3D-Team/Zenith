@@ -15,6 +15,25 @@ local M = {}
 M.extra = {}
 -- While a command runs for the client, session.reply adds its lines here instead of printing.
 M.capture = nil
+-- The player whose machine the packet being handled came in on (on_udp_packet_received's
+-- player_index, set by session.on_packet for each packet), 0 for the server itself. Event data, so
+-- the same on every peer.
+M.from_player = 0
+
+-- In a multiplayer game console commands are for admins (owner's rule), from Zenith's console
+-- (`cmd`) and the mod's own commands in Factorio's (control.lua). What counts is who sent it: a
+-- packet that came in on a player's machine (or a command typed by a player) is that player's, and
+-- they must be an admin. A packet that came in on the server itself (a Zenith beside a headless
+-- server, whatever character it plays) is from the server's own machine, whose console and RCON
+-- are its owner's anyway.
+function M.allowed(player_index)
+  local idx = tonumber(player_index) or 0
+  if idx == 0 or not game.is_multiplayer() then
+    return true
+  end
+  local p = game.get_player(idx)
+  return p ~= nil and p.admin == true
+end
 
 -- The kit /cheat all gives the bridge's character. Factorio's own kit is chosen inside the
 -- engine and isn't listed anywhere the mod can read, so this one is ours: armour, its equipment
@@ -144,10 +163,19 @@ function commands.admins(words)
   return lines
 end
 
+-- A save holds the game still for everyone (seconds on a big base), and anything on localhost can
+-- send this: one a minute at most.
+local SAVE_EVERY = 3600
+
 commands["server-save"] = function()
   if not game.is_multiplayer() then
     return { "Only a multiplayer game saves on the server" }
   end
+  local last = storage.f3d_server_save
+  if last and game.tick - last < SAVE_EVERY then
+    return { string.format("Saved %d seconds ago: once a minute at most from here", math.floor((game.tick - last) / 60)) }
+  end
+  storage.f3d_server_save = game.tick
   game.server_save()
   return { "Saving the map on the server" }
 end
@@ -213,7 +241,9 @@ function M.run(cmd)
   local name = table.remove(words, 1) or ""
   local reply = { t = "cmdr", id = tonumber(cmd.id) or 0 }
   local fn = commands[name]
-  if fn then
+  if not M.allowed(M.from_player) then
+    reply.l = { "Console commands are for admins in a multiplayer game" }
+  elseif fn then
     local ok, lines = pcall(fn, words)
     reply.l = ok and lines or { "Error: " .. tostring(lines) }
   elseif M.extra[name] then

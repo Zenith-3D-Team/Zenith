@@ -8,7 +8,8 @@ extends Node
 ## the UPS governor, per-save and global data, events from the bridge's messages, settings (API 1.1)
 ## and the Add-ons menu (settings changed, a key rebound, the switch), keeping Zenith drawing for a
 ## recorder, add-ons in zips (unpacked, relative preloads, a broken zip, a zip and a folder of one
-## id: the newer wins), and switching an add-on off. Exits with 1 if a check fails.
+## id: the newer wins), api.terrain (1.2: the height field, tile kinds, cliffs, buildings and changed
+## chunks read from a fake world), and switching an add-on off. Exits with 1 if a check fails.
 ##
 ##   godot --headless --path client res://tests/addon_test.tscn
 
@@ -23,6 +24,8 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const UpsGovernor := preload("res://scripts/world/ups_governor.gd")
 const ModsWindow := preload("res://scripts/menu/mods_window.gd")
 const AddonsWindow := preload("res://scripts/menu/addons_window.gd")
+const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const BeltLaneLayer := preload("res://scripts/world/belt_lanes.gd")
 
 const TEST_SETTINGS := "user://addon-test-settings.cfg"
 const DISK := "user://addon-test/addons"
@@ -75,6 +78,68 @@ class FakeRide extends Node:
 class FakeSky extends Node:
 	var forced_daytime := -1.0
 	var planet := "nauvis"
+
+
+## A world as api.terrain reads it (world.gd's chunks, records, prototypes and entities_changed).
+class FakeProto extends RefCounted:
+	var type := ""
+	var _size := Vector2.ONE
+
+	func _init(t: String, sz: Vector2) -> void:
+		type = t
+		_size = sz
+
+	func size() -> Vector2:
+		return _size
+
+
+class FakeProtos extends RefCounted:
+	var tile_is_water := PackedByteArray([0, 1, 2])
+	var by_id := {}
+	var entities_by_name := {}
+
+	func entity(id: int):
+		return by_id.get(id)
+
+
+class FakeRec extends RefCounted:
+	var proto_id := 0
+	var pos := Vector2.ZERO
+	var dir := 0
+	var extra := {}
+
+
+class FakeChunk extends RefCounted:
+	var tile_ids := PackedInt32Array()
+	var entities := {}
+
+
+class FakeWorld extends Node:
+	signal entities_changed(chunk: Vector2i)
+	var chunks := {}
+	var protos := FakeProtos.new()
+
+
+## movers.gd as api.world reads it: one logistic robot (unit 7), drawn by the GPU from its record, so
+## its node stays where it first appeared while position_of and yaw_of say where it is drawn now.
+class FakeMovers extends Node:
+	var protos := FakeProtos.new()
+	var node := Node3D.new()
+
+	func units_of_type(type: String) -> Array:
+		return [[7, node]] if type == "logistic-robot" else []
+
+	func node_of(unit: int) -> Node3D:
+		return node if unit == 7 else null
+
+	func position_of(unit: int) -> Variant:
+		return Vector3(30, 2.2, 40) if unit == 7 else null
+
+	func yaw_of(unit: int) -> float:
+		return PI / 2.0 if unit == 7 else 0.0
+
+	func proto_name_of(unit: int) -> String:
+		return "logistic-robot" if unit == 7 else ""
 
 
 ## Zenith's controls further back in the tree than the add-ons: what reaches it, Zenith would see.
@@ -329,12 +394,39 @@ func _ready() -> void:
 	check(api.ui.is_open(win["frame"]) and not (win["frame"] as Control).visible, "an add-on's window stays out of sight while hidden")
 	api.view.hide_interface(false)
 	check(hud_layer.visible and (win["frame"] as Control).visible, "and both come back")
+	# Its title bar drags it through Kit's drag handle alone: a second handler of its own moved the
+	# window twice as far as the mouse.
+	var bar: Control = (win["box"] as VBoxContainer).get_child(0)
+	check(bar.has_meta("drag_handle") and Kit.drag_target(bar) == win["frame"] and bar.gui_input.get_connections().size() == 1,
+		"the window's title bar drags it once, by Kit's handle: %d handlers" % bar.gui_input.get_connections().size())
+	var at: Vector2 = (win["frame"] as Control).position
+	var stray := InputEventMouseMotion.new()
+	stray.relative = Vector2(30, 20)
+	stray.button_mask = MOUSE_BUTTON_MASK_LEFT
+	bar.gui_input.emit(stray)
+	check((win["frame"] as Control).position == at, "and a motion that didn't start on the bar moves nothing")
 	_key(KEY_ESCAPE)
 	check(not api.ui.is_open(win["frame"]), "Esc closes the add-on's window")
 	api.view.hold_daytime(0.0)
 	check(is_equal_approx(fake._planet_sky.forced_daytime, 0.0), "hold_daytime holds the sky at noon")
 	api.view.hold_daytime(-1.0)
 	check(fake._planet_sky.forced_daytime < 0.0, "and lets it run again")
+
+	# Moving things where they are drawn: a robot's node stays where it first appeared (the GPU
+	# draws it from its record), so api.world reads movers.gd's position_of and yaw_of.
+	var movers := FakeMovers.new()
+	movers.protos.entities_by_name = {"logistic-robot": FakeProto.new("logistic-robot", Vector2.ONE)}
+	add_child(movers)
+	fake.movers = movers
+	var robots: Array = api.world.movers(["logistic-robot"])
+	check(robots.size() == 1 and robots[0]["position"] == Vector3(30, 2.2, 40) and (robots[0]["forward"] as Vector3).is_equal_approx(Vector3(-1, 0, 0)),
+		"world: a robot where it is drawn, facing west, not where its node was left: %s" % [robots])
+	var one: Dictionary = api.world.mover(7)
+	check(one.get("type") == "logistic-robot" and one.get("name") == "logistic-robot" and one.get("position") == Vector3(30, 2.2, 40),
+		"world: mover() the same: %s" % [one])
+	check(api.world.mover(8).is_empty() and api.world.movers(["car"]).is_empty(), "world: nothing for a unit or type not there")
+	fake.movers = null
+	movers.queue_free()
 
 	# Lighter updates, under the governor.
 	api.updates.request({"rate": 2, "entity": 64, "near": 8})
@@ -343,6 +435,10 @@ func _ready() -> void:
 	fake.ups_governor._caps = {"rate": 3}
 	check(int(fake.ups_governor.limit("rate", 0.0)) == 3, "the governor still wins where it holds back more")
 	fake.ups_governor._caps = {}
+	# The fewest belt items moving is the smallest cap: 0 there means Unlimited (main.gd, cap_of).
+	api.updates.request({"updates": 0})
+	var fewest: float = fake.ups_governor.limit("updates", BeltLaneLayer.UNLIMITED)
+	check(BeltLaneLayer.cap_of(fewest) == 500, "an updates request of 0 is the smallest cap, not Unlimited: %s -> %d" % [fewest, BeltLaneLayer.cap_of(fewest)])
 	api.updates.clear()
 	check(int(fake.ups_governor.limit("rate", 0.0)) == 0 and AddonRequests.requests.is_empty(), "clear() gives it back")
 
@@ -358,7 +454,7 @@ func _ready() -> void:
 	var started: Array = []
 	api.events.fight_started.connect(func(at: Vector3, _n: int) -> void: started.append(at))
 	Bridge.message_received.emit({"t": "en", "l": [77, 2560, 1280]})
-	Bridge.message_received.emit({"t": "tf", "u": 9, "w": "bullet", "sx": 2600, "sy": 1300, "x": 2570, "y": 1290})
+	Bridge.message_received.emit({"t": "tf", "u": 9, "x": 2570, "y": 1290})
 	check(started.size() == 1 and started[0].is_equal_approx(Vector3(10, 0, 5)), "an attack starts one fight there, a turret's shot joins it")
 	check(api.events.fights().size() == 1 and int(api.events.fights()[0]["size"]) == 2, "fights() lists it with its attackers and turrets")
 	check(api.events.recent(5.0).size() == 1 and api.events.recent(5.0)[0]["kind"] == "fight_started", "recent() has it")
@@ -439,6 +535,8 @@ func _ready() -> void:
 	api.settings.reset("look")
 	api.settings.reset("folder")
 
+	_terrain(api, host)
+
 	# Keeping Zenith drawing while recording (API 1.1).
 	api.view.keep_drawing(50)
 	fake.ups_governor._caps = {"fps": 45}
@@ -464,6 +562,83 @@ func _ready() -> void:
 		"bundled.json gives a download's add-ons their first state (the camera on, the hills off)")
 	DirAccess.remove_absolute(ProjectSettings.globalize_path("user://bundled-test.json"))
 	_finish()
+
+
+## api.terrain (1.2): the height field (set, read between texels, its square, cleared, and only by
+## the add-on that set it), and what the Terrain Elevation add-on reads of the world: tile kinds,
+## cliffs, buildings (turned, without trees or units) and the chunks whose buildings changed.
+func _terrain(api, host) -> void:
+	var world := FakeWorld.new()
+	add_child(world)
+	(host.main as FakeMain).world = world
+	var t = api.terrain
+	check(not t.is_on() and t.area() == Rect2() and t.height_at(5, 5) == 0.0, "terrain: flat until a field is set")
+	var img := Image.create(4, 4, false, Image.FORMAT_RF)
+	for y in 4:
+		for x in 4:
+			img.set_pixel(x, y, Color(float(x), 0, 0))
+	t.set_heights(img, Vector2(-8, -8), 4.0)
+	check(t.is_on() and t.area() == Rect2(-8, -8, 16, 16), "terrain: a 4 x 4 field of 4-tile texels covers 16 x 16 tiles: %s" % [t.area()])
+	check(is_equal_approx(t.height_at(-6, -6), 0.0) and is_equal_approx(t.height_at(-2, 0), 1.0) and is_equal_approx(t.height_at(0, 0), 1.5),
+		"terrain: heights at texel centres and between them: %s %s %s" % [t.height_at(-6, -6), t.height_at(-2, 0), t.height_at(0, 0)])
+	check(t.height_at(100, 100) == 0.0, "terrain: 0 outside the field")
+	var other = load("res://scripts/addons/addon_terrain.gd").new(host, {"id": "someone-else"})
+	other.clear()
+	check(t.is_on(), "terrain: another add-on's clear leaves this one's field")
+	t.clear()
+	check(not t.is_on() and t.height_at(0, 0) == 0.0, "terrain: cleared")
+	t.set_heights(img, Vector2(-8, -8), 4.0)
+	host.game_ended()
+	check(not t.is_on(), "terrain: the game's end clears the field")
+	host.game_started()
+
+	check(t.chunk_kinds(Vector2i(0, 0)).is_empty() and t.buildings_in_chunk(Vector2i(0, 0)).is_empty() and t.cliffs_in_chunk(Vector2i(0, 0)).is_empty(),
+		"terrain: nothing for a chunk that isn't loaded")
+	world.protos.by_id = {1: FakeProto.new("assembling-machine", Vector2(3, 3)), 2: FakeProto.new("tree", Vector2(1, 1)),
+		3: FakeProto.new("splitter", Vector2(2, 1)), 4: FakeProto.new("cliff", Vector2(4, 4)), 5: FakeProto.new("unit", Vector2(1, 1))}
+	var cv := FakeChunk.new()
+	cv.tile_ids.resize(32 * 32)
+	cv.tile_ids[0] = 1
+	cv.tile_ids[1] = 2
+	cv.tile_ids[2] = 99  # an id the prototypes don't know: land
+	var recs := [[1, Vector2(5.5, 5.5), 0, {}], [2, Vector2(9, 9), 0, {}], [3, Vector2(12, 3.5), 4, {}],
+		[4, Vector2(16, 16), 0, {"co": "west-to-east"}], [5, Vector2(20, 20), 0, {}]]
+	for i in recs.size():
+		var r := FakeRec.new()
+		r.proto_id = recs[i][0]
+		r.pos = recs[i][1]
+		r.dir = recs[i][2]
+		r.extra = recs[i][3]
+		cv.entities[i] = r
+	world.chunks[Vector2i(0, 0)] = cv
+	var kinds: PackedByteArray = t.chunk_kinds(Vector2i(0, 0))
+	check(kinds.size() == 1024 and kinds[0] == 1 and kinds[1] == 2 and kinds[2] == 0 and kinds[3] == 0, "terrain: tile kinds (land, water, empty space): %s" % [kinds.slice(0, 4)])
+	var cliffs: Array = t.cliffs_in_chunk(Vector2i(0, 0))
+	check(cliffs.size() == 1 and cliffs[0].position == Vector2(16, 16) and cliffs[0].orientation == "west-to-east", "terrain: the chunk's cliffs: %s" % [cliffs])
+	var builds: Array = t.buildings_in_chunk(Vector2i(0, 0))
+	check(builds.size() == 2 and builds[0] == [Vector2(5.5, 5.5), Vector2(1.5, 1.5)] and builds[1] == [Vector2(12, 3.5), Vector2(0.5, 1.0)],
+		"terrain: buildings with half sizes, a splitter facing east turned, no trees, cliffs or units: %s" % [builds])
+	check(t.take_changed_chunks().is_empty(), "terrain: the first call starts the watch")
+	world.entities_changed.emit(Vector2i(0, 0))
+	world.entities_changed.emit(Vector2i(1, 0))
+	world.entities_changed.emit(Vector2i(0, 0))
+	var changed: Array = t.take_changed_chunks()
+	changed.sort()
+	check(changed == [Vector2i(0, 0), Vector2i(1, 0)] and t.take_changed_chunks().is_empty(), "terrain: changed chunks, each once, then none: %s" % [changed])
+	# The next game has a world of its own (main.gd makes one per game): watched afresh, and nothing
+	# from the last one.
+	var world2 := FakeWorld.new()
+	add_child(world2)
+	(host.main as FakeMain).world = world2
+	world.entities_changed.emit(Vector2i(5, 5))
+	var first: Array = t.take_changed_chunks()
+	check(first.is_empty(), "terrain: a new game's first call starts its watch, nothing from the last game: %s" % [first])
+	world2.entities_changed.emit(Vector2i(2, 2))
+	var next_game: Array = t.take_changed_chunks()
+	check(next_game == [Vector2i(2, 2)], "terrain: the next game's changed chunks are heard: %s" % [next_game])
+	(host.main as FakeMain).world = null
+	world2.queue_free()
+	world.queue_free()
 
 
 func _event(code: Key, shift := false) -> InputEventKey:

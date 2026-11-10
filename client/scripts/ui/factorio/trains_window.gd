@@ -1,18 +1,17 @@
 extends PanelContainer
-## Factorio 2.1's "Train overview" (from a train's or train stop's window, "All trains", and the map
-## view): nearly the whole screen, a surface dropdown at the top left, then the tabs Trains,
+## Factorio 2.1's "Train overview" (the side menu's Trains button): nearly the whole screen, a surface dropdown at the top left, then the tabs Trains,
 ## Stations and Groups with their counts. Each tab has a striped list on the left that filters the
 ## grid of cards on the right (All, then each station or group); "No Trains found." in a red banner
 ## when the grid is empty. A train's card shows a live view of the train from above
-## (train_view.gd), its state, carriages and what it carries most; clicking it looks at the train
-## in remote view. The search button filters by station, group and state. From the mod's `trl`
+## (train_view.gd) and its state, with its carriages, cargo and fluids in the tooltip; clicking it
+## looks at the train in remote view. The search button filters by station, group and state. From the mod's `trl`
 ## (every train of the force, on every surface), asked for again every few seconds while open.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const RichText := preload("res://scripts/ui/factorio/rich_text.gd")
-const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 const TrainView := preload("res://scripts/ui/factorio/train_view.gd")
 
@@ -40,6 +39,8 @@ var filter := ""
 ## The surface shown (index), -1 the character's.
 var surface := -1
 var search := ""
+## The planet shown while the character's surface isn't in the dropdown (a platform), else 0.
+var _unlisted_si := 0
 
 var _surfaces := OptionButton.new()
 var _tab_buttons := {}
@@ -172,6 +173,8 @@ func is_open() -> bool:
 func open(on: bool) -> void:
 	visible = on
 	if on:
+		# Asked for at once: the list would otherwise be empty (or the last one) for REFRESH seconds.
+		model.request_trains_overview()
 		_timer = REFRESH
 		_fill_surfaces()
 		_layout()
@@ -186,6 +189,14 @@ func toggle_search() -> void:
 		_search_box.text = ""
 		search = ""
 		_rebuild()
+
+
+## Ctrl+F: the search, as its button says (factorio_ui.gd would open crafting's behind it).
+func _unhandled_key_input(event: InputEvent) -> void:
+	var k := event as InputEventKey
+	if visible and k != null and k.pressed and k.ctrl_pressed and k.keycode == KEY_F:
+		toggle_search()
+		get_viewport().set_input_as_handled()
 
 
 func show_tab(t: String) -> void:
@@ -217,24 +228,30 @@ func _fill_surfaces() -> void:
 	_surfaces.clear()
 	var shown: int = surface if surface > 0 else model.character_si
 	var i := 0
+	var listed := false
+	_unlisted_si = 0
 	for s in model.map_surfaces:
 		if str(s["planet"]) == "":
 			continue  # platforms have no trains
 		var planet := str(s["planet"])
-		var icon := GuiAssets.data_sprite("space-age/graphics/icons/%s.png" % planet)
-		if icon == null:
-			icon = GuiAssets.data_sprite("base/graphics/icons/%s.png" % planet)
-		_surfaces.add_icon_item(icon, LocaleNames.space_location(planet), int(s["si"]))
+		_surfaces.add_icon_item(SpacePanels.planet_icon(planet), LocaleNames.space_location(planet), int(s["si"]))
 		if int(s["si"]) == shown:
 			_surfaces.select(i)
+			listed = true
 		i += 1
 	if _surfaces.item_count == 0:
 		_surfaces.add_item(LocaleNames.space_location(str(model.planet.get("name", "nauvis"))), model.character_si)
+	elif not listed:
+		# The character is on a platform (no trains): the first planet, as the dropdown shows.
+		_surfaces.select(0)
+		_unlisted_si = _surfaces.get_item_id(0)
 	_surfaces.add_theme_constant_override("icon_max_width", Kit.px(20))
 
 
 func _shown_si() -> int:
-	return surface if surface > 0 else model.character_si
+	if surface > 0:
+		return surface
+	return _unlisted_si if _unlisted_si > 0 else model.character_si
 
 
 ## The trains on the shown surface that match the search.
@@ -293,7 +310,7 @@ func _rebuild() -> void:
 		_grid.remove_child(c)
 		c.queue_free()
 	var entries := _entries(trains)
-	_list.add_child(_list_row("All", trains.size(), filter == "", 0))
+	_list.add_child(_list_row("All", trains.size(), filter == "", 0, true))
 	for i in entries.size():
 		_list.add_child(_list_row(str(entries[i][0]), int(entries[i][1]), filter == str(entries[i][0]), i + 1))
 	for i in maxi(0, 30 - entries.size() - 1):
@@ -327,7 +344,8 @@ func _entries_for(t: String, trains: Array) -> Array:
 
 
 ## A row of the striped list: the name and how many trains; clicking it filters the grid.
-func _list_row(text: String, n: int, selected: bool, index: int) -> Control:
+## `all`: the first row, every train (a station may be called "All" too).
+func _list_row(text: String, n: int, selected: bool, index: int, all := false) -> Control:
 	var b := Button.new()
 	b.focus_mode = Control.FOCUS_NONE
 	b.alignment = HORIZONTAL_ALIGNMENT_LEFT
@@ -342,14 +360,14 @@ func _list_row(text: String, n: int, selected: bool, index: int) -> Control:
 		b.add_theme_stylebox_override("disabled", s)
 		b.disabled = true
 		return b
-	b.name = "List_" + (text if text != "All" else "All")
+	b.name = "List_" + text
 	b.theme_type_variation = "FListItemSelected" if selected else "FListItem"
-	if text != "All":
+	if not all:
 		RichText.decorate_button(b, text)
 		b.text = "%s (%d)" % [b.text, n]
 	else:
 		b.text = "All trains (%d)" % n
-	var name := "" if text == "All" else text
+	var name := "" if all else text
 	b.pressed.connect(func() -> void:
 		filter = name
 		_rebuild())
@@ -430,6 +448,9 @@ func _card(t: Dictionary) -> Control:
 	v.add_child(box)
 	var cargo: Array = []
 	for entry in t["cargo"]:
+		if entry is Array and entry.size() >= 2:
+			cargo.append("%s × %s" % [Kit.count_text(int(entry[1])), Kit.pretty(str(entry[0]))])
+	for entry in t["fluid"]:
 		if entry is Array and entry.size() >= 2:
 			cargo.append("%s × %s" % [Kit.count_text(int(entry[1])), Kit.pretty(str(entry[0]))])
 	cargo.push_front("%d carriages" % int(t["carriages"]))

@@ -13,6 +13,7 @@ local rate = require("scripts.rate")
 local M = {}
 
 local INTERVAL = 60
+local read_n = 0  -- entities read this run (rate.read)
 local BOXES_PER_MESSAGE = 200
 
 local function area(f, r)
@@ -48,7 +49,9 @@ local function collect_fluids(surface, f, r)
   if #types == 0 then
     return flat
   end
-  for _, e in pairs(surface.find_entities_filtered({ area = area(f, r), type = types })) do
+  local found = surface.find_entities_filtered({ area = area(f, r), type = types })
+  read_n = read_n + #found
+  for _, e in pairs(found) do
     local unit = e.unit_number
     if unit then
       for i, box in ipairs(M.storages(e)) do
@@ -74,7 +77,9 @@ local function collect_heat(surface, f, r)
   if #types == 0 then
     return flat
   end
-  for _, e in pairs(surface.find_entities_filtered({ area = area(f, r), type = types })) do
+  local found = surface.find_entities_filtered({ area = area(f, r), type = types })
+  read_n = read_n + #found
+  for _, e in pairs(found) do
     local ok, temperature = pcall(function() return e.temperature end)
     if e.unit_number and ok and temperature then
       flat[#flat + 1] = e.unit_number
@@ -108,7 +113,9 @@ local function collect_power(surface, f, r)
     return flat
   end
   local states = power_states()
-  for _, e in pairs(surface.find_entities_filtered({ area = area(f, r), type = types })) do
+  local found = surface.find_entities_filtered({ area = area(f, r), type = types })
+  read_n = read_n + #found
+  for _, e in pairs(found) do
     local state = states[e.status]
     if state == 0 and e.electric_network_id == nil then
       state = 2
@@ -128,11 +135,13 @@ function M.tick()
   local s = storage.f3d
   local r = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
   local surface = world.surface()
+  read_n = 0
   if r > 0 then
     send_parts("fl", collect_fluids(surface, s.focus, r), 6)
     send_parts("ht", collect_heat(surface, s.focus, r), 2)
   end
   send_parts("pw", collect_power(surface, s.focus, s.focus.r), 2)
+  rate.read("fp", read_n)
 end
 
 return M

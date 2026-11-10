@@ -5,6 +5,7 @@
 local registry = require("scripts.registry")
 local transport = require("scripts.transport")
 local tracker = require("scripts.tracker")
+local as_player = require("scripts.as_player")
 local puppet = require("scripts.puppet")
 local map = require("scripts.map")
 local space = require("scripts.space")
@@ -289,6 +290,19 @@ function M.build(cmd)
     return puppet.message("Out of reach")
   end
 
+  -- With a player to act as, build from their cursor, so Factorio raises on_built_entity for other
+  -- mods and applies its own rules (fast-replace, ghosts, undergrounds); see as_player.lua.
+  local same_first = same_entity(surface, proto, position)
+  if not (same_first and quality_name(same_first) == quality) and not ROLLING_STOCK[proto.type] then
+    local built = as_player.build(c, item_name, quality, position, direction, cmd.m == 1, surface)
+    if built ~= nil then
+      if not built then
+        puppet.message(space.cant_build(surface, proto) or "Can't place that there")
+      end
+      return
+    end
+  end
+
   -- Building over a ghost of it fills the ghost in (keeping its settings), like a player does.
   local ghost = ghost_at(surface, proto, position)
   if ghost then
@@ -298,8 +312,9 @@ function M.build(cmd)
       if removal then
         transport.send_reliable(removal)
       end
-      for name, count in pairs(collided or {}) do
-        give(c, { name = name, count = count })
+      -- What lay in the way (array[ItemWithQualityCount] in 2.1) goes to the character.
+      for _, it in pairs(collided or {}) do
+        give(c, { name = it.name, count = it.count, quality = it.quality })
       end
       local stack = { name = item_name, count = 1 }
       if quality ~= "normal" then

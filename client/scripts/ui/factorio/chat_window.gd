@@ -179,7 +179,7 @@ func _submit(text: String) -> void:
 
 func _process(_delta: float) -> void:
 	# Fading lines only change with time; redraw a few times a second.
-	if Engine.get_process_frames() % 10 == 0:
+	if Engine.get_process_frames() % 10 == 0 and not _idle():
 		_refresh()
 	if right_edge > 0.0:
 		offset_right = maxf(offset_left + Kit.px(200), right_edge)
@@ -192,6 +192,19 @@ func _process(_delta: float) -> void:
 func _draw() -> void:
 	if backdrop_shown:
 		draw_rect(Rect2(Vector2.ZERO, size), Color(0, 0, 0, 0.5))
+
+
+## Closed, no line shown and the newest line past its fade (lines are stamped as they come, so
+## every other one is too): a refresh would show nothing again, so the log isn't filtered and
+## sorted every tenth frame while nobody chats.
+func _idle() -> bool:
+	if is_open() or _lines.get_child_count() > 0:
+		return false
+	var now := Time.get_ticks_msec()
+	for lines: Array in [model.chat_log, _local]:
+		if not lines.is_empty() and (now - int(lines[-1][2])) / 1000.0 < SHOW_SECONDS + FADE_SECONDS:
+			return false
+	return true
 
 
 func _refresh() -> void:

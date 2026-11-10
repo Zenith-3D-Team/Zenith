@@ -95,7 +95,7 @@ local function thousandths(v)
   return math.floor((tonumber(v) or 0) * 1000 + 0.5)
 end
 
--- {name, props, day, always, mb, sol, dusk, evening, morning, dawn, heat}; see PROTOCOL.md.
+-- {name, props, day, always, mb, sol, dusk, evening, morning, dawn, heat, nb}; see PROTOCOL.md.
 function M.planet_message(surface)
   local name = platforms.planet_of(surface) or (platforms.of_surface(surface) and "space") or surface.name
   local props = {}
@@ -548,11 +548,16 @@ function M.tick()
   end
   if rate.due("life", LIFE_INTERVAL) then
     local r = detail_radius()
+    local n = 0
     if r > 0 then
-      send_list("pg", plants(surface, f, r))
+      local pg = plants(surface, f, r)
+      n = n + #pg
+      send_list("pg", pg)
     end
-    send_list("sp", spawners(surface, f))
-    send_list("fz", frozen(surface, f))
+    local sp, fz = spawners(surface, f), frozen(surface, f)
+    send_list("sp", sp)
+    send_list("fz", fz)
+    rate.read("life", n + #sp + #fz)
   end
 end
 

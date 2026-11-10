@@ -5,7 +5,7 @@ extends RefCounted
 ## then the command line (after `--`), which wins for that run and isn't saved:
 ##
 ##   --volume=0.8 --sfx-volume=1 --music-volume=0.3 --ui-volume=1 --mute
-##   --max-voices=12 --sfx-log --no-fx (no smoke, flashes or corpses)
+##   --max-voices=12 --sfx-log --no-fx (no smoke, dust, flashes or explosions)
 ##
 ## Volumes are linear, 0 to 1. Music is off (0) unless asked for.
 
@@ -88,11 +88,6 @@ static func _on_setting(section: String, key: String) -> void:
 		setup_buses()
 		if key == "output_device":
 			apply_device()
-
-
-## Kept for older callers: the settings file is written as each value changes.
-static func save() -> void:
-	Settings.save()
 
 
 ## Changes a volume now (for a settings screen); `persist` writes the file too.

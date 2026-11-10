@@ -26,8 +26,6 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const EntityPanels := preload("res://scripts/ui/factorio/entity_panels.gd")
-const CircuitPanel := preload("res://scripts/ui/factorio/circuit_panel.gd")
-const EntitySettings := preload("res://scripts/ui/factorio/entity_settings.gd")
 const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
@@ -48,8 +46,6 @@ const ROLE_TITLES := {
 }
 const OTHER_ROLES := ["input", "output", "fuel", "burnt", "modules", "chest", "cargo", "ammo", "trunk", "turret_ammo",
 	"car_ammo", "robots", "repair", "rocket", "trash"]
-## Slots of the vanilla chests, for mods that don't send `gui.slots` (which gives the real size).
-const CHEST_SLOTS := {"wooden-chest": 16, "iron-chest": 32, "steel-chest": 48}
 ## Space Age's hub and landing pad hold hundreds of slots: their inventories scroll after this
 ## many rows, so the platform's settings under them stay on screen.
 const SCROLL_ROWS := 4
@@ -91,6 +87,9 @@ var hand_slot: Array = []
 var _title: Label
 var _body := VBoxContainer.new()
 var _columns := HBoxContainer.new()
+var _fit := ScrollContainer.new()  # round _columns: the screen's height bounded by Zenith's window
+## Zenith's window height the screen leaves free: the title bar, the HUD below, a margin.
+const WINDOW_ROOM := 220
 var _progress: ProgressBar = null
 var _recipes: Array = []  # what the assembler can make (`rl`), kept between messages
 var _recipe_groups: Array = []  # their item groups (`rg`), for the chooser's tabs
@@ -134,7 +133,15 @@ func _ready() -> void:
 	# Factorio's bigger windows (silo, landing pad, hub) add columns of their own beside the first.
 	_columns.add_theme_constant_override("separation", Kit.px(12))
 	_columns.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	box.add_child(_columns)
+	# Bounded by Zenith's window: as tall as the screen needs, but no taller than the room above the
+	# HUD, then it scrolls (owner: a modded storehouse's slots and requests ran off the bottom).
+	_fit.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_fit.focus_mode = Control.FOCUS_NONE
+	_fit.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_fit.add_child(_columns)
+	box.add_child(_fit)
+	_columns.minimum_size_changed.connect(_fit_to_window)
+	get_viewport().size_changed.connect(_fit_to_window)
 	var shallow := Kit.panel("FShallowFrame")
 	shallow.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	shallow.custom_minimum_size.x = Kit.px(Kit.SLOT * Kit.COLUMNS + 24)
@@ -147,6 +154,18 @@ func _ready() -> void:
 	_body.add_theme_constant_override("separation", Kit.px(8))
 	_body.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	pad.add_child(_body)
+
+
+## The screen as tall as its contents, up to what Zenith's window has room for; beyond, it scrolls.
+func _fit_to_window() -> void:
+	if not is_inside_tree():
+		return
+	var want := _columns.get_combined_minimum_size()
+	var cap := maxf(Kit.px(200), get_viewport_rect().size.y - Kit.px(WINDOW_ROOM))
+	var scrolls := want.y > cap
+	var fitted := Vector2(want.x + (Kit.px(12) if scrolls else 0.0), minf(want.y, cap))
+	if not _fit.custom_minimum_size.is_equal_approx(fitted):
+		_fit.custom_minimum_size = fitted
 
 
 ## Asks the mod to open an entity. The panel shows once its first state arrives.
@@ -331,9 +350,11 @@ func handle(msg: Dictionary) -> void:
 	var inv = msg.get("inv")
 	if not (inv is Dictionary):
 		inv = {}
-	var sig := "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % [kind, str(msg.get("recipe", "")), JSON.stringify(inv),
+	# Not `pw` (the buffer's fill): no row shows it, as in Factorio, and it changes on nearly every
+	# message of a working machine, which rebuilt the whole screen each time.
+	var sig := "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % [kind, str(msg.get("recipe", "")), JSON.stringify(inv),
 		JSON.stringify(msg.get("slots", {})), _picking, JSON.stringify(_recipes), str(msg.get("status", "")),
-		JSON.stringify(msg.get("fb", [])), str(msg.get("pw", -1)), JSON.stringify(hand_slot), _setting_bar, _panel_sig(msg) + _production_sig(msg) + LogicWindows.sig_extra(self, msg)]
+		JSON.stringify(msg.get("fb", [])), JSON.stringify(hand_slot), _setting_bar, _panel_sig(msg) + _production_sig(msg) + LogicWindows.sig_extra(self, msg)]
 	# Not while a text field of the screen is being typed in: rebuilding would take it away.
 	if sig != _sig and not _editing():
 		_sig = sig
@@ -380,7 +401,7 @@ func _panel_sig(msg: Dictionary) -> String:
 	var hub_part = [hub.get("n"), hub.get("pa"), hub.get("prov"), hub.get("sched"), hub.get("sec"), hub.get("dest")] if hub is Dictionary else null
 	return JSON.stringify([ins, msg.get("ao"), msg.get("desc"), msg.get("guns"), msg.get("spl"), msg.get("sw"), msg.get("rk"), msg.get("dp"), msg.get("bar"),
 		msg.get("cb"), msg.get("stop"), msg.get("lg"), msg.get("sig"), train_part, msg.get("cc"), msg.get("col"), msg.get("spk"),
-		msg.get("pf"), msg.get("tgt"), hub_part, msg.get("pad"), msg.get("bay"), msg.get("eff"), msg.get("rq"), msg.get("ql")])
+		msg.get("pf"), msg.get("tgt"), hub_part, msg.get("pad"), msg.get("eff"), msg.get("rq"), msg.get("ql")])
 
 
 ## machine_info.lua's fields that change the layout (the progress bar updates in place).
@@ -401,6 +422,12 @@ func _set_open(open: bool) -> void:
 		opened_changed.emit(open)
 	if not open:
 		circuit_dock.refresh({}, "")
+		# The train window's "Change train group" popup hangs off the screen itself, not its body:
+		# left behind, it showed over the next screen and moved that one's train.
+		var group_popup := get_node_or_null("TrainGroupDialog")
+		if group_popup != null:
+			remove_child(group_popup)
+			group_popup.queue_free()
 
 
 ## The screen is rebuilt whenever what it shows changes (a hub's inventory every second on a busy
@@ -408,13 +435,19 @@ func _set_open(open: bool) -> void:
 ## scrolled. Their places are kept across rebuilds of the same entity's screen.
 func _build(kind: String, recipe: String, inv: Dictionary) -> void:
 	var kept: Array = []
-	if _scroll_key == "%d|%s" % [unit, kind]:
+	var same := _scroll_key == "%d|%s" % [unit, kind]
+	var outer := _fit.scroll_vertical if same else 0
+	if same:
 		for sc in _columns.find_children("*", "ScrollContainer", true, false):
 			kept.append((sc as ScrollContainer).scroll_vertical)
 	_scroll_key = "%d|%s" % [unit, kind]
 	_build_screen(kind, recipe, inv)
 	if kept.any(func(v: int) -> bool: return v > 0):
 		_keep_scrolls(_columns.find_children("*", "ScrollContainer", true, false), kept)
+	if outer > 0:
+		_keep_scrolls([_fit], [outer])
+	elif not same:
+		_fit.scroll_vertical = 0
 
 
 ## Puts the new scroll boxes back where the old ones were, once their contents are laid out (the
@@ -537,7 +570,7 @@ func _build_screen(kind: String, recipe: String, inv: Dictionary) -> void:
 						if kind in SCROLLED_KINDS and _slot_list(role).size() > Kit.COLUMNS * SCROLL_ROWS:
 							grid = _scrolled(grid)
 						_body.add_child(grid)
-	_add_panels(kind, own)
+	_add_panels(kind)
 	if not (ptype in ProductionPanels.NO_FLUID_TYPES or kind in ["crafter", "furnace", "lab", "silo"] or LogicWindows.hides_fluids(self)):
 		var fluids := _fluid_boxes()
 		if fluids != null:
@@ -609,11 +642,7 @@ func _scrolled(labelled: Control) -> Control:
 
 ## What the kinds logic_windows.gd doesn't draw add, then logistics. The circuit and logistic
 ## connection and the network's signals are in the docked circuit window (circuit_window.gd).
-func _add_panels(kind: String, own := false) -> void:
-	match "" if own else kind:
-		"bay":
-			if _last.get("bay") is Dictionary:
-				_body.add_child(SpacePanels.bay(_last["bay"]))
+func _add_panels(kind: String) -> void:
 	if _last.get("eff") is Dictionary:
 		_body.add_child(SpacePanels.effects(_last["eff"]))
 	if _last.get("lg") is Dictionary and kind != "container":
@@ -678,7 +707,7 @@ func _bar_role() -> String:
 	return "cargo" if knows_slots("cargo") or (_last.get("inv") is Dictionary and _last["inv"].has("cargo")) else "chest"
 
 
-## Factorio's entity status: the dot and the status, and the electric buffer for electric machines.
+## Factorio's entity status: the dot and the status.
 func _status_row(kind: String, recipe: String) -> Control:
 	var status := str(_last.get("status", ""))
 	if status == "" and kind == "crafter":
@@ -767,7 +796,9 @@ static func _amount_text(v: float) -> String:
 func _rebuild_now() -> void:
 	_sig = ""
 	if not _last.is_empty():
+		var heard := _last_msec  # a local rebuild isn't word from the mod (STALE_MSEC)
 		handle(_last)
+		_last_msec = heard
 
 
 func _labelled_grid(title: String, role: String, inv: Dictionary, columns: int) -> Control:
@@ -801,8 +832,8 @@ func _slot_list(role: String) -> Array:
 
 
 ## A deep frame holding one inventory as slots: every slot when the mod sends them, else its
-## stacks padded with empty slots to the known size or the end of the row.
-func _grid_frame(role: String, _inv: Dictionary, columns: int, min_slots := 0) -> Control:
+## stacks padded with empty slots to the end of the row.
+func _grid_frame(role: String, _inv: Dictionary, columns: int) -> Control:
 	var frame := Kit.panel("FDeepFrame")
 	frame.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 	var stacks := _slot_list(role)
@@ -815,7 +846,7 @@ func _grid_frame(role: String, _inv: Dictionary, columns: int, min_slots := 0) -
 	var cells := stacks.size()
 	var target := cells
 	if not exact:
-		target = maxi(min_slots, cells) if min_slots > 0 else maxi(1, ceili(cells / float(cols)) * cols)
+		target = maxi(1, ceili(cells / float(cols)) * cols)
 	while cells < target:
 		grid.add_child(_stack_slot(role, 0, {}))
 		cells += 1

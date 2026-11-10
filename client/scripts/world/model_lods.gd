@@ -81,6 +81,10 @@ class Job:
 	var view_lods := true
 	## Whether to make the shadow stand-in (off: only the view LODs, see request_view_lods).
 	var proxy := true
+	## The stand-in without LODs of its own: a tree's crown is separate leaf cards, and the first
+	## LOD step kept only 13-24% of Nauvis trees' crowns (seen from above), so trees a little way
+	## off cast a trunk's shadow and no crown's (owner: "some trees have no shadows").
+	var proxy_lods := true
 	var vertices := PackedVector3Array()
 	var normals := PackedVector3Array()
 	var indices := PackedInt32Array()
@@ -104,7 +108,7 @@ class Job:
 		normals = ModelLodsMath.smooth_normals(vertices, indices, sign)
 		var simplified := ModelLodsMath.simplify(vertices, normals, indices)
 		indices = simplified[0]
-		lods = simplified[1]
+		lods = simplified[1] if proxy_lods else {}
 		if not view_lods:
 			return
 		for s in surfaces:
@@ -341,6 +345,7 @@ static func _job_for(mesh: ArrayMesh) -> Job:
 		# mesh in view; their shadow stand-in still simplifies.
 		if sm != null and sm.resource_name.begins_with("leafcard"):
 			job.view_lods = false
+			job.proxy_lods = false
 		if mesh.surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
 			return null
 		var arrays := arrays_of(mesh, i)

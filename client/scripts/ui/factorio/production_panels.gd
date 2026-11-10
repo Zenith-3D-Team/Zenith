@@ -650,7 +650,12 @@ static func chest_grid(screen, role: String, x_button: Control, scroll_rows := 0
 	while cells == 0 or cells % Kit.COLUMNS != 0:
 		grid.add_child(faint_cell())
 		cells += 1
-	if scroll_rows > 0 and cells > Kit.COLUMNS * scroll_rows:  # a hub's hundreds of slots scroll
+	if scroll_rows <= 0:
+		# As many rows as fit in the window with the screen's heading, status and preview above them:
+		# a modded warehouse's hundreds of slots (Space Exploration's) ran off the bottom of the screen.
+		var fit: float = (screen.get_viewport_rect().size.y - Kit.px(320)) / float(Kit.px(Kit.SLOT))
+		scroll_rows = maxi(4, floori(fit))
+	if cells > Kit.COLUMNS * scroll_rows:  # a hub's or warehouse's hundreds of slots scroll
 		var scroll := ScrollContainer.new()
 		scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 		scroll.focus_mode = Control.FOCUS_NONE

@@ -1,18 +1,12 @@
 extends RefCounted
-## Pieces of entity windows the others share (logic_windows.gd): the colour of a gui.col, and a
-## display panel's message row (its icon, text and condition, sent as gui.dp.msgs).
+## Pieces of entity windows the others share (logic_windows.gd): a display panel's message row
+## (its icon, text and condition, sent as gui.dp.msgs).
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const EntityPanels := preload("res://scripts/ui/factorio/entity_panels.gd")
 
 const SIGNAL_KINDS := ["item", "fluid", "virtual"]
-
-
-static func _col(c) -> Color:
-	if c is Array and (c as Array).size() >= 3:
-		return Color8(int(c[0]), int(c[1]), int(c[2]))
-	return Color.WHITE
 
 
 ## A display panel message: its icon, text, the condition that shows it, and remove.

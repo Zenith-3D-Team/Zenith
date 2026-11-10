@@ -10,7 +10,8 @@ extends Control
 ##
 ## Mouse, as in Factorio's remote view: drag to move the view, the wheel zooms round the mouse. A
 ## click on a planet shows it in remote view (show_place); a click on a platform selects it (its
-## panel shows under the tag icons, platform_selected), a second click looks at it. From the mod's
+## panel shows in the frame's right column: factorio_ui.gd reads `selected`), a second click looks
+## at it. From the mod's
 ## `smap` (asked for on opening) and `plat` (platform_panel.gd).
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
@@ -21,8 +22,6 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 signal close_requested
 ## A place to look at: a planet's name, or a platform's index (planet "").
 signal show_place(planet: String, platform: int)
-## The platform clicked (its index), or 0 when the selection goes.
-signal platform_selected(index: int)
 
 ## Star map units a planet of magnitude 1 is across.
 const PLANET_SIZE := 3.2
@@ -85,7 +84,6 @@ func open(on: bool) -> void:
 
 func select(index: int) -> void:
 	selected = index
-	platform_selected.emit(index)
 	queue_redraw()
 
 
@@ -428,6 +426,8 @@ func _gui_input(event: InputEvent) -> void:
 
 ## Zooms by `f` keeping the star map point under `at` still.
 func zoom_at(at: Vector2, f: float) -> void:
+	if view_scale <= 0.0:
+		return  # not fitted yet (the solar system hasn't come): there is no scale to zoom from
 	var before := to_map(at)
 	view_scale = clampf(view_scale * f, 0.5, 400.0)
 	view_center += before - to_map(at)
@@ -459,7 +459,7 @@ func _get_tooltip(at: Vector2) -> String:
 		for c in model.space_connections:
 			if c["from"] == h["planet"] or c["to"] == h["planet"]:
 				var other := str(c["to"] if c["from"] == h["planet"] else c["from"])
-				lines.append("%s: %s km" % [LocaleNames.space_location(other), Kit.count_text(int(c["length"]))])
+				lines.append("%s: %s km" % [LocaleNames.space_location(other), km(int(c["length"]))])
 		return "\n".join(lines)
 	if h.has("route"):
 		var c: Dictionary = model.space_connections[int(h["route"])]

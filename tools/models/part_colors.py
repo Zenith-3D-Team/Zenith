@@ -72,7 +72,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 MODELS = os.path.join(REPO, "client", "assets", "models")
 ENTRIES = os.path.join(REPO, "client", "data", "sprite_projection.json")
-FACTORIO = os.environ.get("FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio")
+sys.path.append(os.path.dirname(HERE))
+import factorio_install  # noqa: E402
+FACTORIO = factorio_install.install()
 
 SIN, COS = math.sin(math.radians(48.0)), math.cos(math.radians(48.0))
 VIEW = np.array([0.0, SIN, COS])  # towards Factorio's camera, glTF axes (x east, y up, z south)

@@ -1,7 +1,8 @@
 -- The logistic network: what logistic chests and roboports show in their screens (mode, requests,
 -- a storage chest's filter, the network's robots and contents), the character's own logistic
 -- requests (`clog`), the network the character stands in (`ln`) and what robots near the focus
--- carry (`rc`). 2.x keeps requests in logistic sections: section 1 is the one the client edits.
+-- carry (`rc`). 2.x keeps requests in logistic sections: the client edits every active section's
+-- requests as one list (write_requests), or the sections one by one (set_section).
 
 local registry = require("scripts.registry")
 local transport = require("scripts.transport")
@@ -222,7 +223,7 @@ function M.screen_info(e)
   return info
 end
 
--- {l: requests}: a requester or buffer chest's requests (section 1).
+-- {l: requests}: a requester or buffer chest's requests, every active section's (write_requests).
 function M.set_requests(e, cmd)
   local mode = logistic_mode(e)
   if not (mode == "requester" or mode == "buffer") or type(cmd.l) ~= "table" then
@@ -380,7 +381,8 @@ end
 
 ---------------------------------------------------------------------------------------------
 
--- [unit, item id, count, ...] for robots near the focus that carry something.
+-- [unit, item id, count, ...] for robots near the focus that carry something, and how many robots
+-- were looked at.
 local function robot_cargo(s, r)
   local flat = {}
   local types = {}
@@ -390,7 +392,7 @@ local function robot_cargo(s, r)
     end
   end
   if #types == 0 then
-    return flat
+    return flat, 0
   end
   local f = s.focus
   local index = defines.inventory.robot_cargo
@@ -406,7 +408,7 @@ local function robot_cargo(s, r)
       flat[#flat + 1] = stack.count
     end
   end
-  return flat
+  return flat, #found
 end
 
 function M.tick()
@@ -427,9 +429,12 @@ function M.tick()
   end
   if rate.due("rc", CARGO_INTERVAL) then
     local r = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
+    local flat, read = {}, 0
     if r > 0 then
-      transport.send_now({ t = "rc", l = robot_cargo(s, r) })
+      flat, read = robot_cargo(s, r)
+      transport.send_now({ t = "rc", l = flat })
     end
+    rate.read("rc", read)
   end
 end
 

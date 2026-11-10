@@ -29,7 +29,9 @@ redistribute Factorio's pictures: look at them, don't put them in your files.
 - **Materials and textures:** a base colour texture (and optionally a roughness/metal one: glTF's
   green = roughness, blue = metal), embedded in the `.glb`, read through the first UV map. One
   material with one texture atlas per model is cheapest. Keep the material's base colour white.
-  Normal maps are ignored for now. A model without textures is coloured from its materials'
+  Texture filtering follows the file: set Blender's Image Texture node to **Closest** and Zenith
+  draws that texture crisp, texel by texel (still mipmapped far away, so it doesn't shimmer); Linear
+  (the default) draws it smooth. Normal maps are ignored for now. A model without textures is coloured from its materials'
   colours.
 - **One mesh:** the game flattens each model into one mesh for speed, so skeletons and animations
   in the file are ignored. Anything that moves is a separate object (below).
@@ -77,9 +79,13 @@ to the maintainer before starting one.
 
 ## Trying a model in the game
 
-1. Put your `.glb` files in a folder of your own.
-2. Start Zenith with `--models=<that folder> --models-first` (from the command line, or the
-   shortcut's target). Your models then replace the built-in ones of the same name.
+1. Put your `.glb` files in the `models` folder beside Zenith (`Zenith.exe` on Windows), named as
+   above. At its next start Zenith uses each in place of its own model of that name, and its own
+   for everything else. Settings > Graphics > Your models says how many are in use and opens the
+   folder. Start Zenith with `-- --no-custom-models` to see its own models again without moving yours.
+2. Another folder works too: start Zenith with `--models=<that folder> --models-first`, after a `--`
+   (Godot passes the game only what follows it): on Windows a shortcut whose target is
+   `"C:\Games\Zenith\Zenith.exe" -- --models="D:\My models" --models-first`.
 3. Look at it from the default view and from Factorio's view (F6), beside the real entities.
 
 With the source code, `python3 tools/models/check.py <name>` checks the name, footprint, origin,
@@ -99,7 +105,7 @@ How that works:
    what's short; agree the list with the maintainer so two people don't redo the same model.
 2. **Start from what's there or from scratch.** The current `.glb` files are a fine base to
    refine, or replace one entirely, as long as the result follows this guide.
-3. **Try it in the game** with `--models=<your folder> --models-first` (above), from the default
+3. **Try it in the game** by putting it in the `models` folder (above), from the default
    view and Factorio's view (F6), beside the real entities.
 4. **Send the files** (the `.glb`, any textures inside it, and a line on what changed). The
    maintainer checks them (`check.py`: name, size, origin, facing, triangles), looks at them in the

@@ -23,6 +23,8 @@ import json
 import statistics
 import sys
 
+from percentile import pct
+
 # Godot's render steps (the names of its RENDER_TIMESTAMP marks), grouped as rows.
 GPU_GROUPS = [
     ("GPU: depth pre-pass", ["Render Depth Pre-Pass"]),
@@ -63,13 +65,6 @@ def group_of(name, groups):
             if name == p or name.startswith(p):
                 return row
     return None
-
-
-def pct(values, p):
-    if not values:
-        return 0.0
-    s = sorted(values)
-    return s[min(len(s) - 1, max(0, int(round(p * len(s))) - 1))]
 
 
 def frame_rows(f):

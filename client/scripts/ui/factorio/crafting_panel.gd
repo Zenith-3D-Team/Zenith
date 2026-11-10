@@ -26,7 +26,6 @@ var _tab_strip := Kit.panel("FDeepFrame")
 var _grid := Kit.slot_grid()
 var _scroll: ScrollContainer
 var _group := ""
-var _shown_sig := ""
 ## Factorio's recipe search: shown with Ctrl+F; while it has text the grid holds every match.
 var search: LineEdit
 
@@ -53,12 +52,26 @@ func _ready() -> void:
 	model.recipes_changed.connect(_rebuild)
 	model.inventory_changed.connect(_refresh_counts)
 	visibility_changed.connect(func() -> void:
-		if _counts_stale and is_visible_in_tree():
+		if not is_visible_in_tree():
+			return
+		if _rebuild_stale:
+			_rebuild()
+		elif _counts_stale:
 			_refresh_counts())
 	_rebuild()
 
 
+## The whole grid is built again only while it shows: a new recipe list or details (`recipes`,
+## `rdet`, `craftable` all end in recipes_changed) cost 16-27 ms a time on the owner's save, while
+## the panel was shut. Built when it next shows.
+var _rebuild_stale := false
+
+
 func _rebuild() -> void:
+	if is_inside_tree() and not is_visible_in_tree():
+		_rebuild_stale = true
+		return
+	_rebuild_stale = false
 	if model.groups.size() > 0 and not model.groups.has(_group):
 		_group = model.groups[0]
 	var with_tabs := model.groups.size() > 1

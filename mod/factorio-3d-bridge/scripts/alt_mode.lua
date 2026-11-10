@@ -292,13 +292,4 @@ function M.tick()
   end
 end
 
--- How many machines are watched, for /f3d-status.
-function M.watched()
-  local n = 0
-  for _ in pairs(storage.f3d.altw or {}) do
-    n = n + 1
-  end
-  return n
-end
-
 return M

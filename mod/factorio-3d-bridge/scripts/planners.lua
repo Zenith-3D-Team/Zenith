@@ -49,7 +49,6 @@ local function stack_at(c, i, empty)
   end
   return nil
 end
-M.stack_at = stack_at
 -- ui_actions.copy writes a reselected blueprint through this (planners requires ui_actions).
 ui_actions.blueprint_stack = stack_at
 
@@ -64,10 +63,13 @@ local function blueprint_of(stack)
   return stack
 end
 
+-- The command's area, or nil (and the reason said) when it is bigger than world.MAX_AREA a side.
 local function area_of(cmd)
-  local x1, y1 = (tonumber(cmd.x1) or 0) / 256, (tonumber(cmd.y1) or 0) / 256
-  local x2, y2 = (tonumber(cmd.x2) or 0) / 256, (tonumber(cmd.y2) or 0) / 256
-  return { { math.min(x1, x2), math.min(y1, y2) }, { math.max(x1, x2), math.max(y1, y2) } }
+  local area, why = world.area_in(cmd)
+  if not area then
+    puppet.message(why)
+  end
+  return area
 end
 
 local function centre_of(area)
@@ -106,7 +108,6 @@ local RAIL_MIRROR = {
   ["curved-rail-a"] = function(d) return (18 - d) % 16 end, ["elevated-curved-rail-a"] = function(d) return (18 - d) % 16 end,
   ["curved-rail-b"] = function(d) return (18 - d) % 16 end, ["elevated-curved-rail-b"] = function(d) return (18 - d) % 16 end,
 }
-M.FLIP_REFUSED = FLIP_REFUSED
 
 local function flip_side(v)
   if v == "left" then
@@ -163,7 +164,6 @@ local function mirrored(bp)
   end
   return copy
 end
-M.mirrored = mirrored
 
 -- {i (main inventory slot, -1 the library one), x, y (fixed), d, sf? (1: super-forced), bm? (0
 -- normal, 1 forced, 2 super-forced), m? (1: flipped east-west)}: the blueprint's ghosts, centred
@@ -245,7 +245,7 @@ function M.decon(cmd)
     return
   end
   local spec = { surface = puppet.surface(c), force = c.force, area = area_of(cmd) }
-  if not map.check_charted(c, centre_of(spec.area)) then
+  if not spec.area or not map.check_charted(c, centre_of(spec.area)) then
     return
   end
   local cancel = cmd.cancel == 1 or cmd.cancel == true
@@ -317,7 +317,7 @@ function M.upgrade(cmd)
   -- Unlike deconstruction planners, upgrade planners have no area methods (2.1): the surface
   -- takes the planner as `item`.
   local spec = { force = c.force, area = area_of(cmd), item = stack }
-  if not map.check_charted(c, centre_of(spec.area)) then
+  if not spec.area or not map.check_charted(c, centre_of(spec.area)) then
     return
   end
   local cancel = cmd.cancel == 1 or cmd.cancel == true
@@ -399,6 +399,9 @@ function M.get(cmd)
 end
 
 -- Parts of a string the client sends (`bp_set` with id, part, parts, d): kept until all have arrived.
+-- The client cuts them 8000 characters long; longer parts are refused, so an upload never kept
+-- in storage stays under UP_PARTS x UP_PART (32 MB) instead of 4096 whole datagrams (about 260 MB).
+local UP_PARTS, UP_PART = 4096, 8192
 local function assemble(cmd)
   if type(cmd.s) == "string" then
     return cmd.s
@@ -407,7 +410,7 @@ local function assemble(cmd)
   local id = math.floor(tonumber(cmd.id) or 0)
   local n = math.floor(tonumber(cmd.parts) or 0)
   local k = math.floor(tonumber(cmd.part) or 0)
-  if n < 1 or k < 1 or k > n or n > 4096 or type(cmd.d) ~= "string" then
+  if n < 1 or k < 1 or k > n or n > UP_PARTS or type(cmd.d) ~= "string" or #cmd.d > UP_PART then
     return nil
   end
   if not (s.bp_up and s.bp_up.id == id) then

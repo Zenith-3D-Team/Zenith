@@ -1,7 +1,7 @@
 """Space Age's screens for the mock server (mock_server.py), like the mod's space.lua: the space
 platform hub (state, weight, thrusters, schedule with interrupts, requests from planets), the
 rocket silo (parts, status, automatic launch, launch to a platform), cargo landing pads (requests,
-circuit settings), cargo bays, asteroid collectors (chunk filters), module effects and recipe
+circuit settings), asteroid collectors (chunk filters), module effects and recipe
 quality, the solar system (`smap`), new platforms (`plat_new`), asteroid chunks on the platform
 (`ach`) caught by the platform's asteroid collectors (`acol`: an arm each reaching 0.2 tiles a tick
 for a chunk in its catch circle, as in 2.1.23), quality on belt items (`bq`) and what can't be built on a surface (`planet.nb`).
@@ -13,8 +13,8 @@ import math
 
 QUALITIES = ["normal", "uncommon", "rare"]
 # Entity type -> screen kind, merged into mock_server.SCREEN_KINDS.
-SPACE_KINDS = {"space-platform-hub": "hub", "cargo-landing-pad": "pad", "cargo-bay": "bay",
-               "asteroid-collector": "collector", "rocket-silo": "silo"}
+SPACE_KINDS = {"space-platform-hub": "hub", "cargo-landing-pad": "pad", "asteroid-collector": "collector",
+               "rocket-silo": "silo"}
 ENTITY_PROTOS = [
     ("rocket-silo", "rocket-silo", 9, 9, (130, 130, 135)),
     ("cargo-landing-pad", "cargo-landing-pad", 8, 8, (120, 120, 125)),
@@ -136,8 +136,6 @@ class Space:
             if m["pcb"] is not None:
                 out["pad"]["cb"] = m["pcb"]
             out["ql"] = QUALITIES
-        elif kind == "bay":
-            out["bay"] = {"owner": self.s.platform["hub"] or 0}
         elif kind == "collector":
             out["col"] = m["col"]
         elif kind == "silo":

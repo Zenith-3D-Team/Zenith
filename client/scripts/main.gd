@@ -40,9 +40,12 @@ const LampLayer := preload("res://scripts/world/lamp_lights.gd")
 const FluidsPowerLayer := preload("res://scripts/world/fluids_power.gd")
 const WireLayer := preload("res://scripts/world/wires.gd")
 const GhostLayer := preload("res://scripts/world/ghosts.gd")
+const Predicted := preload("res://scripts/world/predicted.gd")
 const CombatLayer := preload("res://scripts/world/combat.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ModFiles := preload("res://scripts/world/mod_files.gd")
+const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const Avatar := preload("res://scripts/player/avatar.gd")
 const CameraRig := preload("res://scripts/player/camera_rig.gd")
 const PlayerInput := preload("res://scripts/player/player_input.gd")
@@ -91,9 +94,11 @@ var ground_items: GroundItemLayer
 var decoratives: DecorativeLayer
 var arms: InserterArmLayer
 var lamps: LampLayer
+var working_glow: WorkingGlow
 var fluids_power: FluidsPowerLayer
 var wires: WireLayer
 var ghosts: GhostLayer
+var predicted: Predicted
 var combat: CombatLayer
 var avatar: Avatar
 var rig: CameraRig
@@ -143,14 +148,24 @@ var _space_material: ShaderMaterial
 var _planet_sky: PlanetSky
 var _planet_sky_res: Sky
 var _space_sky: Sky
+## The solar system (`smap`) was asked for, to tell another mod's planets from other places.
+var _asked_space_map := false
 
 
 func _ready() -> void:
+	# Factorio's own settings are the defaults (factorio_settings.gd), so they are read before any
+	# is applied; the install is found the same way the graphics are (--factorio-data first).
+	ItemIcons.configure_from_command_line()
+	Settings.reload_factorio_settings()
 	Settings.apply_startup(DisplayServer.window_get_size().y)
 	Settings.apply_window(get_tree().root)
 	FxSettings.load_settings()
 	ModelLibrary.configure_from_command_line()
-	ItemIcons.configure_from_command_line()
+	ModFiles.configure_from_command_line()
+	# Names in the language set in Factorio, unless --factorio-locale says otherwise.
+	var locale = Settings.factorio_default("general", "locale")
+	if locale != null:
+		LocaleNames.language = str(locale)
 	LocaleNames.configure_from_command_line()
 	PlayerInput.define_actions()
 	Settings.apply_bindings()
@@ -177,6 +192,7 @@ func _ready() -> void:
 	addons = AddonHost.new()
 	addons.main = self
 	add_child(addons)
+	_forward_while_joining()
 	var direct := false
 	for option in DIRECT_OPTIONS:
 		if Settings.has_arg(option):
@@ -313,6 +329,14 @@ func start_game() -> void:
 			if spec.size() > 1:
 				soak.minutes = float(spec[1])
 			add_child(soak)
+		elif arg.begins_with("--predict-probe="):
+			var predict: Node = preload("res://scripts/debug/predict_probe.gd").new()
+			var pspec := arg.get_slice("=", 1).split("@")
+			predict.main = self
+			predict.out_path = pspec[0]
+			if pspec.size() > 1:
+				predict.builds = int(pspec[1])
+			add_child(predict)
 		elif arg.begins_with("--ups-probe="):
 			var ups_probe: Node = preload("res://scripts/debug/ups_probe.gd").new()
 			ups_probe.main = self
@@ -356,10 +380,10 @@ func start_game() -> void:
 	lamps.protos = world.protos
 	lamps.world = world
 	_game.add_child(lamps)
-	var glow := WorkingGlow.new()
-	glow.name = "WorkingGlow"
-	glow.world = world
-	_game.add_child(glow)
+	working_glow = WorkingGlow.new()
+	working_glow.name = "WorkingGlow"
+	working_glow.world = world
+	_game.add_child(working_glow)
 
 	fluids_power = FluidsPowerLayer.new()
 	fluids_power.name = "FluidsPower"
@@ -378,6 +402,11 @@ func start_game() -> void:
 	ghosts.name = "Ghosts"
 	ghosts.world = world
 	_game.add_child(ghosts)
+
+	predicted = Predicted.new()
+	predicted.name = "Predicted"
+	predicted.world = world
+	_game.add_child(predicted)
 
 	avatar = Avatar.new()
 	avatar.name = "Avatar"
@@ -456,7 +485,6 @@ func start_game() -> void:
 	hud.add_child(platform_panel)
 	hud.move_child(platform_panel, 0)  # under the windows, as Factorio's HUD panels are
 	hud.ui.platform_panel = platform_panel  # under the minimap, top right (factorio_ui.gd layout)
-	platform_panel.space_map_requested.connect(func() -> void: hud.ui.open_space_map(true))
 	# Mech armour changes how the character is drawn (avatar.set_armor).
 	var armor_changed := func() -> void:
 		avatar.set_armor(str(hud.ui.model.stack_at("armor", 1).get("item", "")))
@@ -471,6 +499,8 @@ func start_game() -> void:
 	hud.ui.model.players_changed.connect(looks_changed)
 	# Lightning rods and collectors glow where a strike lands (anim.gd).
 	hud.ui.model.lightning_struck.connect(world.animator.strike)
+	# Another mod's planet goes in a platform's sky once the solar system says it is one.
+	hud.ui.model.space_map_changed.connect(func() -> void: _show_planet_for(platform_panel.current()))
 
 	player_tags = PlayerTags.new()
 	player_tags.name = "PlayerTags"
@@ -488,6 +518,7 @@ func start_game() -> void:
 	input.avatar = avatar
 	input.movers = movers
 	input.wires = wires
+	input.predicted = predicted
 	_game.add_child(input)
 	fluids_power.input = input
 
@@ -503,6 +534,7 @@ func start_game() -> void:
 	turrets.name = "Turrets"
 	turrets.movers = movers
 	turrets.fx = fx
+	turrets.world = world
 	_game.add_child(turrets)
 	world.animator.turrets = turrets
 	movers.vehicles.model = hud.ui.model
@@ -540,6 +572,7 @@ func end_game() -> void:
 	fluids_power = null
 	wires = null
 	ghosts = null
+	predicted = null
 	combat = null
 	avatar = null
 	rig = null
@@ -622,10 +655,18 @@ func _apply_game_settings() -> void:
 	world.view_radius = clampi(int(held.limit("view", float(Settings.get_value("graphics", "view_radius")))), 1, 20)
 	ModelLods.apply_quality(str(Settings.get_value("graphics", "lod_quality")), get_viewport())
 	world.far_chunks.enabled = bool(Settings.get_value("graphics", "merge_far"))
+	var animate_cards := bool(Settings.get_value("graphics", "animate_mod_buildings"))
+	if SpriteStandins.animate != animate_cards:
+		SpriteStandins.animate = animate_cards
+		SpriteStandins.clear()  # the cards are made again, still or moving
 	belt_lanes.distance = clampi(int(held.limit("far", float(Settings.get_value("graphics", "belt_distance")))), 0, 640)
 	# Items move as far out as the cap allows, within the distance (an add-on may ask for less: near).
 	belt_lanes.near = clampi(int(held.limit("near", float(belt_lanes.distance))), 0, BeltLaneLayer.MOVING_MAX)
 	belt_lanes.cap = BeltLaneLayer.cap_of(held.limit("updates", BeltLaneLayer.cap_wanted(float(Settings.get_value("graphics", "belt_updates")))))
+	# Automatic: belt_lanes.gd moves its own cap with the room there is, under the governor's hold.
+	belt_lanes.auto = int(Settings.get_value("graphics", "belt_updates")) == BeltLaneLayer.AUTO
+	belt_lanes.updates_hold = held.limit("updates", BeltLaneLayer.UNLIMITED)
+	belt_lanes.governor = held
 	belt_lanes.smooth = bool(Settings.get_value("graphics", "belt_smooth")) and held.limit("smooth", 1.0) >= 1.0
 	decoratives.set_options(bool(Settings.get_value("graphics", "decoratives")), float(Settings.get_value("graphics", "decorative_density")))
 	decoratives.distance = clampf(float(Settings.get_value("graphics", "decorative_distance")), 32.0, 320.0)
@@ -653,19 +694,42 @@ func _save_screenshot_later(path: String, delay: float) -> void:
 	print("screenshot %s: %s" % [path, error_string(err)])
 
 
+var _came_from_factorio := false
+
+
+## Started by Ctrl+F9 in Factorio: joining a big save takes a while, so the window comes forward
+## at once with its loading screen, or the key looks dead meanwhile. Factorio stays as it is until
+## the welcome (it is minimised then), in case Zenith can't join.
+func _forward_while_joining() -> void:
+	if not "--from-factorio" in OS.get_cmdline_user_args() or DisplayServer.get_name() == "headless":
+		return
+	await get_tree().process_frame
+	await get_tree().process_frame
+	if not _came_from_factorio:
+		GameSwap.show_client(false)
+
+
 func _on_welcome(msg: Dictionary) -> void:
 	if _game == null:
 		return
+	# Started by Ctrl+F9 in Factorio (server/factorio-with-zenith.ps1): come to the front over it.
+	if "--from-factorio" in OS.get_cmdline_user_args() and not _came_from_factorio:
+		_came_from_factorio = true
+		GameSwap.show_client(bool(Settings.get_value("factorio", "minimize_factorio")))
 	world.reset()
+	world.surface_index = int(msg.get("si", -1))
+	world.replay_dec = decoratives.handle
 	movers.reset()
 	belt_items.reset()
 	belt_lanes.reset()
 	ground_items.reset()
 	decoratives.reset()
 	arms.reset()
+	working_glow.reset()
 	fluids_power.reset()
 	wires.reset()
 	ghosts.reset()
+	predicted.reset()
 	combat.reset()
 	fx.reset()
 	turrets.reset()
@@ -691,19 +755,22 @@ func _on_welcome(msg: Dictionary) -> void:
 ## The character is on another surface now (a space platform or back): drop the world, keep
 ## the prototypes, inventory and the rest of the UI, and let the world subscribe around it again.
 func _on_surface(msg: Dictionary) -> void:
-	world.reset(true)
+	world.reset(true, int(msg.get("si", -1)))
+	world.surface_index = int(msg.get("si", -1))
 	movers.reset()
 	belt_items.reset()
 	belt_lanes.reset()
 	ground_items.reset()
-	decoratives.reset()
+	decoratives.reset(true)  # the ids stay: no `dprotos` for a surface
 	arms.reset()
+	working_glow.reset()
 	fluids_power.reset()
 	wires.reset()
 	ghosts.reset()
+	predicted.reset()
 	combat.reset()
 	fx.reset()
-	turrets.reset()
+	turrets.reset(true)  # the bridge still sends the game's beams (`pj`)
 	rockets.reset()
 	rockets.surface = str(msg.get("surface", ""))
 	collectors.reset()
@@ -763,6 +830,8 @@ func _on_message(msg: Dictionary) -> void:
 				ground_items.handle(msg)
 		"dprotos", "dec":
 			decoratives.handle(msg)
+			if str(msg.get("t", "")) == "dec":
+				world.keep_dec(msg)
 		"hp":
 			combat.handle_health(msg)
 		"tf":
@@ -794,7 +863,7 @@ func _on_message(msg: Dictionary) -> void:
 		"surface":
 			_on_surface(msg)
 		"raise":
-			GameSwap.show_client()
+			GameSwap.show_client(bool(Settings.get_value("factorio", "minimize_factorio")))
 		"cov":
 			remote_fog.handle(msg)
 		"plat":
@@ -861,7 +930,7 @@ func _update_status(elapsed: float) -> void:
 	if Bridge.bind_error != OK:
 		hud.status.text = "Can't open UDP port %d. Is another client already running?" % Bridge.listen_port
 	elif not Bridge.connected:
-		hud.status.text = "Waiting for Factorio on 127.0.0.1:%d\nStart it with --enable-lua-udp %d and the factorio-3d-bridge mod (see docs/RUNNING.md)" % [Bridge.factorio_port, Bridge.factorio_port]
+		hud.status.text = "Waiting for Factorio on %s:%d\nStart it with --enable-lua-udp %d and the factorio-3d-bridge mod (see docs/RUNNING.md)" % [Bridge.factorio_host, Bridge.factorio_port, Bridge.factorio_port]
 	elif not Bridge.world_ready:
 		hud.status.text = "Connected. Loading prototypes..."
 	else:
@@ -960,12 +1029,15 @@ func _show_planet(location: String, size := 1.0) -> void:
 	if _space_material == null:
 		return
 	_space_material.set_shader_parameter("planet_radius", PLANET_RADIUS * maxf(size, 0.05))
-	_space_material.set_shader_parameter("planet_on", 1.0 if PLANET_COLORS.has(location) else 0.0)
+	# The real planet: Factorio's star map picture of it, where the install has one.
+	var tex := planet_picture(location)
+	# Another mod's planet has no colour here: it shows as its picture, if it is a planet at all
+	# (platforms also stop at places that aren't, such as the solar system's edge).
+	var shown := PLANET_COLORS.has(location) or (tex != null and _is_planet(location))
+	_space_material.set_shader_parameter("planet_on", 1.0 if shown else 0.0)
 	if PLANET_COLORS.has(location):
 		var c: Color = PLANET_COLORS[location]
 		_space_material.set_shader_parameter("planet_color", Vector3(c.r, c.g, c.b))
-	# The real planet: Factorio's star map picture of it, where the install has one.
-	var tex := planet_picture(location)
 	_space_material.set_shader_parameter("planet_tex_on", 1.0 if tex != null else 0.0)
 	if tex != null:
 		_space_material.set_shader_parameter("planet_tex", tex)
@@ -1032,7 +1104,8 @@ static func _load_planet_maps(location: String, base: String) -> void:
 	_planet_lock.unlock()
 
 
-## Factorio's picture of a planet (its star map sprite), or null without the install or one.
+## Factorio's picture of a planet (its star map sprite), else its icon from the bridge's graphics
+## list (another mod's planet), or null.
 static func planet_picture(location: String) -> Texture2D:
 	if location == "":
 		return null
@@ -1040,7 +1113,20 @@ static func planet_picture(location: String) -> Texture2D:
 		var t := GuiAssets.data_sprite(path % location)
 		if t != null:
 			return t
-	return null
+	return ItemIcons.texture_for_kind("space-location", location)
+
+
+## Whether the solar system (`smap`) lists `location` as a planet. Until it has come it is asked
+## for once, and the sky is drawn again when it arrives.
+func _is_planet(location: String) -> bool:
+	var model = hud.ui.model
+	for loc: Dictionary in model.space_locations:
+		if loc["name"] == location:
+			return loc["type"] == "planet"
+	if model.space_locations.is_empty() and not _asked_space_map:
+		_asked_space_map = true
+		model.request_space_map()
+	return false
 
 
 ## Eases towards the game's time of day (it only arrives once a second) and lights the scene

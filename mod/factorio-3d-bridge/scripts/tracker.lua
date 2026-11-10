@@ -11,7 +11,7 @@ local M = {}
 local WIRE_INTERVAL = 30
 
 -- Belt shapes depend on their neighbours, so a change to one belt can bend the ones next to it.
-local BELT_TYPES = { ["transport-belt"] = true, ["underground-belt"] = true, ["splitter"] = true, ["lane-splitter"] = true, ["loader"] = true, ["loader-1x1"] = true }
+local BELT_TYPES = registry.BELT_SET
 
 local function watched(entity)
   return entity and entity.valid and registry.is_static(entity.type) and world.is_subscribed(entity.surface, entity.position)
@@ -48,13 +48,21 @@ local function refresh_pipes_near(surface, box)
   end
 end
 
+-- Only with a client: tracker.tick, which empties `pipe_refresh`, runs only then, and the list is
+-- saved with the game (on a server nobody plays through, it grew with every pipe removed).
 local function fluid_neighbours_changed(entity, later)
-  if not (entity and entity.valid and registry.is_fluid(entity.type)) then
+  if not (storage.f3d.client and entity and entity.valid and registry.is_fluid(entity.type)) then
+    return
+  end
+  -- Only pipes the client watches are sent (watched: a client, its surface), and tick() only runs
+  -- with a client: without this every fluid entity removed on a server with no client connected
+  -- was queued in storage until the next handshake, and every one built anywhere searched its box.
+  local s = storage.f3d
+  if not (s.client and entity.surface.index == s.surface_index) then
     return
   end
   local b = entity.bounding_box
   if later then
-    local s = storage.f3d
     s.pipe_refresh[#s.pipe_refresh + 1] = {
       surface = entity.surface.index,
       box = { left_top = { x = b.left_top.x, y = b.left_top.y }, right_bottom = { x = b.right_bottom.x, y = b.right_bottom.y } },
@@ -131,6 +139,21 @@ function M.removed(entity)
   end
 end
 
+-- A rolling stock ghost the client was sent is gone (world.lua, stock_ghost): built by robots,
+-- mined or cancelled, none of which the client otherwise hears of for a ghost of a mover.
+function M.on_object_destroyed(event)
+  local s = storage.f3d
+  local g = s and s.stock_ghosts and s.stock_ghosts[event.registration_number]
+  if not g then
+    return
+  end
+  s.stock_ghosts[event.registration_number] = nil
+  local surface = game.get_surface(g.s)
+  if surface and world.is_subscribed(surface, { x = g.x / 256, y = g.y / 256 }) then
+    transport.send_reliable({ t = "del", u = g.u, p = g.p, x = g.x, y = g.y })
+  end
+end
+
 -- Deconstructing an area (planner, shortcut, cut) deletes the ghosts in it at once and raises no
 -- event for them, so `act` runs between a look at the ghosts before and after: those gone get `del`.
 function M.deconstructing(surface, area, force, act)
@@ -163,6 +186,7 @@ local function watch_wires(s)
     area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } },
     type = types,
   })
+  rate.read("wires", #found)
   for _, e in pairs(found) do
     local unit = e.unit_number
     if unit then
@@ -239,6 +263,9 @@ function M.register()
   -- What a building leaves when destroyed: its remnants, sent like a new entity.
   script.on_event(defines.events.on_post_entity_died, function(event)
     for _, corpse in pairs(event.corpses or {}) do
+      if corpse.valid and registry.remnant_of(corpse.name) then
+        world.bump(corpse.surface.index, corpse.position)
+      end
       if corpse.valid and registry.remnant_of(corpse.name)
           and world.is_subscribed(corpse.surface, corpse.position) then
         transport.send_reliable({ t = "add", e = world.record(corpse) })
@@ -250,10 +277,16 @@ function M.register()
   -- machine's window (where its recipe or filters are set). The bridge's own paste sends `upd`.
   script.on_event(defines.events.on_entity_settings_pasted, function(event)
     alt_mode.check(event.destination)
+    if event.destination and event.destination.valid then
+      world.bump(event.destination.surface.index, event.destination.position)
+    end
   end)
   script.on_event(defines.events.on_gui_closed, function(event)
     if event.entity then
       alt_mode.check(event.entity)
+      if event.entity.valid then
+        world.bump(event.entity.surface.index, event.entity.position)
+      end
     end
   end)
 

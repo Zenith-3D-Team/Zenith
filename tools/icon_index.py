@@ -35,7 +35,9 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 OUT = os.path.join(REPO, "client", "data", "icons.json")
-FACTORIO = r"C:\Program Files (x86)\Steam\steamapps\common\Factorio"
+import factorio_install  # noqa: E402
+
+FACTORIO = factorio_install.install()
 # Every prototype type that is an item (data.raw has one table per type).
 ITEM_TYPES = ["item", "ammo", "armor", "blueprint", "blueprint-book", "capsule", "copy-paste-tool",
               "deconstruction-item", "gun", "item-with-entity-data", "item-with-inventory", "item-with-label",
@@ -94,7 +96,7 @@ def layers(proto):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--factorio", default=os.environ.get("FACTORIO", FACTORIO))
+    parser.add_argument("--factorio", default=FACTORIO)
     parser.add_argument("--check", action="store_true", help="report missing icons, write nothing")
     args = parser.parse_args()
     raw = dump(args.factorio)

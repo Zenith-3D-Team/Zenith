@@ -169,7 +169,8 @@ function M.tick()
   end
 end
 
--- A projectile or stream we last saw in flight is gone: it hit or ran out of range there.
+-- A projectile or stream we last saw in flight is gone: it hit or ran out of range there. (Called
+-- from control.lua's on_object_destroyed handler, which tracker.lua shares.)
 function M.on_object_destroyed(event)
   local s = storage.f3d
   local sh = s and s.shots
@@ -182,10 +183,6 @@ function M.on_object_destroyed(event)
   e[#e + 1] = event.registration_number
   e[#e + 1] = fixed(last[1])
   e[#e + 1] = fixed(last[2])
-end
-
-function M.register()
-  script.on_event(defines.events.on_object_destroyed, M.on_object_destroyed)
 end
 
 function M.reset()

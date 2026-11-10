@@ -70,6 +70,12 @@ uniform bool use_albedo_tex = false;
 uniform sampler2D albedo_tex : source_color, filter_linear_mipmap_anisotropic, repeat_enable;
 uniform bool use_orm_tex = false;
 uniform sampler2D orm_tex : hint_default_white, filter_linear_mipmap, repeat_enable;
+// The same pictures where the model's .glb asks for nearest filtering (Blender's Closest): texel by
+// texel up close, mipmapped further off (model_textures.gd NEAREST_META).
+uniform bool albedo_nearest = false;
+uniform sampler2D albedo_tex_nearest : source_color, filter_nearest_mipmap_anisotropic, repeat_enable;
+uniform bool orm_nearest = false;
+uniform sampler2D orm_tex_nearest : hint_default_white, filter_nearest_mipmap, repeat_enable;
 // The sampled colours already carry Factorio's grime and wear on average: the weathering on top of
 // them is scaled by these (rust and streaks, worn edges, grime, dust), and they skip the palette's
 // greying (desaturate, value). Worn edges and dust most of all: converted models are full of small
@@ -134,7 +140,6 @@ uniform float sprite_fallback_tint = 0.6;
 // ... and how far its brightness moves to the sprite's (0: keeps the material's own). Without it
 // a light pipe's hidden underside stays the palette's dark steel.
 uniform float sprite_fallback_luma = 0.5;
-uniform bool sprite_debug = false;
 // Per-pixel occlusion for the projection (tools/models/projector_depth.py): the frontmost
 // surface's closeness to Factorio's camera (tiles) per projector pixel, a cell per direction.
 // A fragment clearly behind it doesn't take the sprite (it would get its occluder's pixels).
@@ -828,7 +833,8 @@ void fragment() {
 	// material's own uniforms.
 	if (use_albedo_tex && !merged) {
 		pc = 1.0;
-		part_rgb = texture(albedo_tex, UV).rgb * albedo.rgb;
+		vec3 tex_rgb = albedo_nearest ? texture(albedo_tex_nearest, UV).rgb : texture(albedo_tex, UV).rgb;
+		part_rgb = tex_rgb * albedo.rgb;
 	}
 	vec3 col = mix(m_albedo.rgb, part_rgb, pc) * tint * model_tint;
 	vec4 wear = mix(vec4(1.0), m_wear, pc);
@@ -838,7 +844,7 @@ void fragment() {
 	float rough = mix(m_rough, 0.85, pc);
 	float metal = m_metal * mix(1.0, 0.1, pc);
 	if (use_orm_tex && !merged) {
-		vec3 orm = texture(orm_tex, UV).rgb;
+		vec3 orm = orm_nearest ? texture(orm_tex_nearest, UV).rgb : texture(orm_tex, UV).rgb;
 		rough = roughness * orm.g;
 		metal = metallic * orm.b;
 	}
@@ -956,9 +962,6 @@ void fragment() {
 	rough = mix(rough, 0.7, sprite_w);
 	metal = mix(metal, 0.15, sprite_w);
 	shade = mix(shade, 1.0 - 0.3 * (1.0 - shade), sprite_w);
-	if (sprite_debug) {
-		col = mix(vec3(0.8, 0.1, 0.1), vec3(0.1, 0.8, 0.1), sprite_w);
-	}
 	ALBEDO = col * mix(1.0, shade, 0.65);
 	ALBEDO *= mix(vec3(1.0), f3d_paint * 1.4, 0.6 * step(dot(f3d_paint, vec3(1.0)), 2.99));
 #ifdef LEAF_CUT

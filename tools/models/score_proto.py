@@ -29,7 +29,9 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "tools"))
 
 BLENDER = os.environ.get("BLENDER", r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe")
-FACTORIO = os.environ.get("FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio")
+import factorio_install  # noqa: E402
+
+FACTORIO = factorio_install.install()
 DIRS = ("north", "east", "south", "west")
 STRETCH = 1.346  # 1 / sin 48 degrees
 PROJECTION = json.load(open(os.path.join(REPO, "client", "data", "sprite_projection.json"), encoding="utf-8"))

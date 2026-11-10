@@ -5,6 +5,7 @@
 -- The open entity lives in storage and only changes from client commands and on_tick, which every
 -- peer replays in the same order, so it stays deterministic in multiplayer.
 
+local as_player = require("scripts.as_player")
 local registry = require("scripts.registry")
 local transport = require("scripts.transport")
 local puppet = require("scripts.puppet")
@@ -133,7 +134,8 @@ local function machine_categories(e)
 end
 
 local function can_make(e, recipe)
-  if not (recipe and recipe.enabled and not recipe.hidden) then
+  -- (Parameter recipes are in every machine's categories but no machine makes them.)
+  if not (recipe and recipe.enabled and not recipe.hidden) or puppet.is_parameter(recipe) then
     return false
   end
   local cats = machine_categories(e)
@@ -382,6 +384,11 @@ function M.open(cmd)
   if not c then
     return
   end
+  -- The client opens another entity without a `close` and drops the old screen's messages, even
+  -- when this one fails: the open screen ends here (its Alt-mode icon, the player's `opened`).
+  if s.screen then
+    M.close()
+  end
   -- From the remote view (`rv`), on the surface the map shows (`si`).
   local surface = c.surface
   if cmd.rv and tonumber(cmd.si) then
@@ -402,17 +409,28 @@ function M.open(cmd)
   end
   local remote = false
   if not puppet.can_reach(c, e) then
+    if cmd.rv then
+      map.watch_radars(e.surface)  -- from the command, so the same on every peer
+    end
     if not (cmd.rv and map.covered(e.surface, c.force, e.position)) then
       return puppet.message(cmd.rv and "Not in radar or roboport coverage" or "Out of reach")
     end
     remote = true
   end
   local kind = kind_of(e)
-  if kind == "other" and #inventories(e, kind) == 0 and not circuits.signals(e) and not entity_ui.openable(e) then
+  -- (A machine with fluid boxes has a screen even with no inventory: a boiler run on fluid,
+  -- Corrundum's red boiler. 2.1 has no LuaEntity.fluidbox, so the prototype says.)
+  local ok_fb, boxes = pcall(function() return e.prototype.fluidbox_prototypes end)
+  local fluid = ok_fb and type(boxes) == "table" and #boxes > 0
+  if kind == "other" and #inventories(e, kind) == 0 and not fluid and not circuits.signals(e) and not entity_ui.openable(e) then
     return puppet.message("Nothing to open there")
   end
   s.screen = { entity = e, unit = e.unit_number, sent = 0, due = game.tick, remote = remote or nil,
     ai = alt_mode.TYPES[e.type] and select(3, alt_mode.state(e)) or nil }
+  -- Mods that show their own window for a machine listen for on_gui_opened (as_player.lua).
+  if not remote then
+    as_player.opened(c, e)
+  end
 end
 
 function M.close()
@@ -420,6 +438,9 @@ function M.close()
   storage.f3d.screen = nil
   if sc and sc.entity.valid then
     alt_mode.check(sc.entity, sc.ai)
+    if not sc.remote then
+      as_player.opened(puppet.get(), nil)
+    end
   end
 end
 

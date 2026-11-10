@@ -58,7 +58,7 @@ const COMMANDS := {
 	"toggle-heavy-mode": [RCON, [], "/toggle-heavy-mode: looks for desyncs (makes multiplayer unplayable)"],
 	"f3d-status": [MOD, [], "/f3d-status: the bridge's state"],
 	"f3d-selftest": [MOD, [], "/f3d-selftest: checks the bridge's character API in this game"],
-	"f3d-platform": [MOD, [], "/f3d-platform new [planet] | board <platform> | leave [planet] | list"],
+	"f3d-platform": [MOD, [], "/f3d-platform board <platform> | leave [planet] | list (new: in Factorio's console or over RCON)"],
 	"f3d-player": [MOD, [], "/f3d-player [name | none]: which player's character the bridge plays"],
 	"f3d-profile": [MOD, [], "/f3d-profile [trace]: times each part of the bridge (then /f3d-status)"],
 	"f3d-rate": [MOD, [], "/f3d-rate <0-3>: the bridge sends its costliest updates less often"],

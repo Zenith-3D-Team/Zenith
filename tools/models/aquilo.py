@@ -8,8 +8,8 @@ import math
 
 import detail
 import kit
-from kit import Part, R, S, T, model
-from space_kit import (COS_P, SIN_P, bent, blob, dome, flange, hose, lathe, ring, rock, sweep, ys,
+from kit import Part, R, T, model
+from space_kit import (COS_P, SIN_P, bent, dome, flange, hose, lathe, ring, rock, sweep, ys,
                        zs)
 
 kit.MATERIALS.update({
@@ -507,20 +507,6 @@ def railgun_turret():
 # Aquilo resources: lithium brine and fluorine vents (variation 0 of their sheets). Their
 # selection box is one tile, the picture about three across.
 
-def _rock_ring(p, radius, count, size, height, mat, seed, jitter=0.12, tilt=0.35):
-    """Rocks round a ring, leaning outward a little, like the rim of a crater."""
-    from kit import rng
-    rnd = rng(seed)
-    for i in range(count):
-        a = 2 * math.pi * (i + rnd.uniform(-0.3, 0.3)) / count
-        r = radius * (1 + rnd.uniform(-jitter, jitter))
-        s = size * rnd.uniform(0.75, 1.25)
-        h = height * rnd.uniform(0.7, 1.3)
-        x, y = r * math.cos(a), r * math.sin(a)
-        m = T(x, y, 0) @ R("Z", math.degrees(a)) @ R("Y", -math.degrees(tilt) * rnd.uniform(0.3, 1.0))
-        rock(p, (0, 0, 0.0), (s, s * rnd.uniform(0.7, 1.0), h), mat, seed=seed * 100 + i, matrix=m)
-
-
 import kit  # noqa: E402
 import bmesh  # noqa: E402
 
@@ -748,23 +734,6 @@ def fluorine_vent():
 
 # ---------------------------------------------------------------------------------------------
 # Lithium icebergs (simple entities; picture 1 of big, 2 of huge).
-
-def _peak(p, base, size, peak, mat, seed, segs=10, rings=7, jag=0.12):
-    """A craggy ice lump `size` across whose top is drawn over towards `peak` (x, y, z): the
-    higher a vertex, the further it leans to the peak."""
-    q = Part()
-    rock(q, (0, 0, 0), size, mat, seed=seed, segs=segs, rings=rings, jag=jag)
-    px_, py_, pz = peak
-    sz = size[2]
-
-    def lean(co):
-        t = max(0.0, co.z) / sz
-        k = t ** 1.6
-        return (co.x + (px_ - base[0] - co.x * 0.7) * k, co.y + (py_ - base[1] - co.y * 0.7) * k,
-                co.z + (pz - sz) * t ** 2)
-    q.warp(lean)
-    p.add_part(q, T(*base))
-
 
 # The icebergs' outlines from Factorio's camera, per column: (x, screen-up of the foot, of the
 # top) in tiles, from picture 1 of the big one's sprite and picture 2 of the huge one's.

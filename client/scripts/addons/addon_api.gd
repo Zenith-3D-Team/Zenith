@@ -2,7 +2,7 @@ extends RefCounted
 ## The one object an add-on gets (its entry script's addon_start(api)); docs/ADDONS.md is the
 ## reference for add-on authors. Versioned: `version` is the add-on API this Zenith offers
 ## (AddonLoader.API_VERSION) and `level` the exact one with its additions (AddonLoader.API_LEVEL,
-## 1.1); an add-on whose addon.json asks for a newer one isn't loaded.
+## 1.2); an add-on whose addon.json asks for a newer one isn't loaded.
 ## Everything here only reads the game or changes what this client shows: nothing an add-on does
 ## through it changes the game.
 ##
@@ -33,8 +33,9 @@ signal game_ended
 
 ## The add-on API this Zenith offers.
 var version := AddonLoader.API_VERSION
-## The add-on API with its additions within the version (1.1: settings, view.keep_drawing). Check it
-## before using a 1.1 call to keep working on a Zenith with 1.0: `if api.get("level") != null and api.level >= 1.1`.
+## The add-on API with its additions within the version (1.1: settings, view.keep_drawing; 1.2:
+## terrain). Check it before using a 1.1 call to keep working on a Zenith with 1.0:
+## `if api.get("level") != null and api.level >= 1.1`.
 var level := AddonLoader.API_LEVEL
 ## Zenith's own version, for messages.
 var zenith_version := "Zenith %s" % str(ProjectSettings.get_setting("application/config/version", "(development build)"))

@@ -1,0 +1,37 @@
+-- Zenith's graphics test fixture (tools/mod_tests/fixtures/make_gfx_test_mod.py draws the pictures).
+local p = "__zenith-gfx-test__/graphics/"
+data:extend({
+  { type = "item", name = "zenith-test-gizmo", icon = p .. "icons/gizmo.png", subgroup = "intermediate-product",
+    order = "z[zenith]-a", stack_size = 50 },
+  { type = "item", name = "zenith-test-tinted", subgroup = "intermediate-product", order = "z[zenith]-b", stack_size = 50,
+    icons = { { icon = p .. "icons/tinted-base.png" }, { icon = p .. "icons/tinted-mask.png", tint = { r = 0, g = 255, b = 0, a = 255 } } } },
+  { type = "item", name = "zenith-test-crate", icon = p .. "icons/crate.png", subgroup = "storage", order = "z[zenith]",
+    place_result = "zenith-test-crate", stack_size = 50 },
+  { type = "item", name = "zenith-test-floor", icon = p .. "icons/floor.png", subgroup = "terrain", order = "z[zenith]",
+    stack_size = 100, place_as_tile = { result = "zenith-test-floor", condition_size = 1, condition = { layers = { water_tile = true } } } },
+  { type = "recipe", name = "zenith-test-gizmo", enabled = true, ingredients = { { type = "item", name = "iron-plate", amount = 1 } },
+    results = { { type = "item", name = "zenith-test-gizmo", amount = 1 } } },
+  { type = "container", name = "zenith-test-crate", icon = p .. "icons/crate.png", flags = { "placeable-player", "player-creation" },
+    minable = { mining_time = 0.2, result = "zenith-test-crate" }, max_health = 200,
+    collision_box = { { -0.9, -0.9 }, { 0.9, 0.9 } }, selection_box = { { -1, -1 }, { 1, 1 } }, inventory_size = 16,
+    picture = { layers = {
+      { filename = p .. "entity/crate.png", width = 128, height = 160, shift = { 0, -0.25 }, scale = 0.5 },
+      { filename = p .. "entity/crate-shadow.png", width = 160, height = 96, shift = { 0.5, 0.25 }, scale = 0.5, draw_as_shadow = true },
+    } } },
+  { type = "assembling-machine", name = "zenith-test-spinner", icon = p .. "icons/gizmo.png", flags = { "placeable-player", "player-creation" },
+    max_health = 200, collision_box = { { -0.9, -0.9 }, { 0.9, 0.9 } }, selection_box = { { -1, -1 }, { 1, 1 } },
+    crafting_categories = { "crafting" }, crafting_speed = 1, energy_usage = "10kW", energy_source = { type = "void" },
+    graphics_set = {
+      animation = { filename = p .. "entity/spinner.png", width = 128, height = 128, frame_count = 4, line_length = 4,
+        animation_speed = 0.25, scale = 0.5 },
+      working_visualisations = { { animation = { filename = p .. "entity/spinner-lamp.png", width = 32, height = 32,
+        frame_count = 2, scale = 0.5, shift = { 0.5, -0.5 } } } },
+    } },
+  { type = "tile", name = "zenith-test-floor", order = "z", layer = 60, layer_group = "ground-artificial",
+    collision_mask = { layers = { ground_tile = true } }, map_color = { 0, 180, 255 }, walking_speed_modifier = 1.2,
+    minable = { mining_time = 0.1, result = "zenith-test-floor" }, mined_sound = { filename = "__base__/sound/deconstruct-bricks.ogg" },
+    variants = { empty_transitions = true, material_background = { picture = p .. "terrain/floor.png", count = 4, scale = 0.5 } } },
+  { type = "optimized-decorative", name = "zenith-test-pebbles", order = "z", render_layer = "decorative",
+    collision_box = { { -0.5, -0.5 }, { 0.5, 0.5 } },
+    pictures = { sheet = { filename = p .. "decorative/pebbles.png", width = 64, height = 64, variation_count = 4, scale = 0.5 } } },
+})

@@ -18,6 +18,8 @@
 -- Deterministic: the level lives in storage.f3d (set from a client command, like `focus`), each
 -- job's last runs too (from on_tick), and everything else is worked out from them and game.tick.
 
+local budget = require("scripts.budget")
+
 local M = {}
 
 M.MAX_LEVEL = 3
@@ -26,23 +28,25 @@ local EASE_TICKS = 120
 -- tier: the level a job first slows down at. max: its longest period, in ticks. phase: the tick
 -- (modulo its period) a stretched job runs on; odd, so off the 30th and 60th ticks where
 -- crafting, research, trains and the rest land, and apart from each other.
+-- slack: how many ticks the job may wait for a lighter tick (budget.admit); none, it runs on time.
+-- price: units per entity it reads, a unit being ~20 us (calibrated on the owner's save, Zenith Test,
+-- from /f3d-profile trace beside `f3dunits`), cost: what it is expected to cost before it has run once.
 local JOBS = {
   bi = { tier = 1, max = 48, phase = 1, ease = true },  -- items on belts: the costliest by far
-  lanes = { tier = 1, max = 8, phase = 0 },   -- far belt lanes: a factor on their rounds, not a tick
+  lanes = { tier = 1 },   -- far belt lanes: only a factor on their rounds (M.factor), no period or tick
   mv = { tier = 1, max = 16, phase = 1, ease = true },  -- movers' positions (and how often they are searched)
-  st = { tier = 2, max = 120, phase = 17 },   -- machine working states
-  wires = { tier = 2, max = 120, phase = 23 }, -- tracker's look for changed wires
+  st = { tier = 2, max = 120, phase = 17, slack = 8, price = 0.28, cost = 500 },   -- machine working states
+  wires = { tier = 2, max = 120, phase = 23, slack = 12, price = 0.9, cost = 460 }, -- tracker's look for changed wires
   seg = { tier = 2, max = 8, phase = 1 },     -- demolishers' segments (planets.lua)
-  en = { tier = 2, max = 40, phase = 7 },     -- enemies attacking
-  life = { tier = 2, max = 240, phase = 43 }, -- plants, spawners, frozen machines (planets.lua): ~30 ms a run on the owner's save
-  fp = { tier = 3, max = 240, phase = 41 },   -- fluids, heat, power (fluids_power.lua)
-  tr = { tier = 3, max = 120, phase = 37 },   -- trains
+  en = { tier = 2, max = 40, phase = 7, slack = 3, price = 0.2, cost = 10 },     -- enemies attacking
+  life = { tier = 2, max = 240, phase = 43, slack = 20, price = 0.3, cost = 250 }, -- plants, spawners, frozen machines (planets.lua): ~30 ms a run on the owner's save
+  fp = { tier = 3, max = 240, phase = 41, slack = 15, price = 0.14, cost = 380 },   -- fluids, heat, power (fluids_power.lua)
+  tr = { tier = 3, max = 120, phase = 37, slack = 8, price = 5.8, cost = 150 },   -- trains
   ts = { tier = 3, max = 24, phase = 5 },     -- turrets' aim
   ih = { tier = 3, max = 24, phase = 3 },     -- inserter hands
-  gi = { tier = 3, max = 120, phase = 29 },   -- items on the ground
-  rc = { tier = 3, max = 40, phase = 13 },    -- robots' cargo
+  gi = { tier = 3, max = 120, phase = 29, slack = 6, price = 0.1, cost = 10 },   -- items on the ground
+  rc = { tier = 3, max = 40, phase = 13, slack = 6, price = 0.1, cost = 10 },    -- robots' cargo
 }
-M.JOBS = JOBS
 
 function M.level()
   local s = storage.f3d
@@ -111,14 +115,37 @@ function M.due(name, interval, double)
   if not now and JOBS[name].ease and s.rate_at and (s.rate_from or 0) < (s.rate or 0) and t < s.rate_at + EASE_TICKS then
     now = on_ticks(name, interval, s.rate_from or 0, double)
   end
-  if not now then
+  local job = JOBS[name]
+  if job.slack then
+    -- Due now or waiting since: it runs when the tick has room for it, or its slack ran out.
+    s.rate_wait = s.rate_wait or {}
+    local since = s.rate_wait[name]
+    if now and not since then
+      since = t
+    end
+    if not since then
+      return false
+    end
+    if not budget.admit(name, job.cost, t - since >= math.min(job.slack, p - 1)) then
+      s.rate_wait[name] = since
+      return false
+    end
+    s.rate_wait[name] = nil
+  elseif not now then
     return false
   end
-  local s = storage.f3d
   s.rate_jobs = s.rate_jobs or {}
   local j = s.rate_jobs[name]
   s.rate_jobs[name] = { prev = j and j.last or t - p, last = t }
   return true
+end
+
+-- Job `name` (one with a slack) read `count` entities this run: what it is expected to cost next.
+function M.read(name, count)
+  local job = JOBS[name]
+  if job and job.slack then
+    budget.learn(name, (count or 0) * job.price)
+  end
 end
 
 -- Whether a multiple of `every` passed since the job's run before this one (due just said yes):
@@ -131,6 +158,7 @@ end
 -- A new world (handshake, resync): each job starts over.
 function M.reset()
   storage.f3d.rate_jobs = nil
+  storage.f3d.rate_wait = nil
 end
 
 return M

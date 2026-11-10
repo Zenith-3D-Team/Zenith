@@ -23,11 +23,13 @@ const UiModel := preload("res://scripts/ui/factorio/ui_model.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const MachineScreen := preload("res://scripts/ui/factorio/machine_screen.gd")
 const UiSettings := preload("res://scripts/ui/ui_settings.gd")
+const PLANNER_UI := preload("res://scripts/ui/factorio/planner_ui.gd")
 const Controls := preload("res://scripts/player/controls.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const SettingsWindow := preload("res://scripts/menu/settings_window.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
+const FxScript := preload("res://scripts/fx/fx.gd")
 const ColorFilter := preload("res://scripts/menu/color_filter.gd")
 const PlayerInput := preload("res://scripts/player/player_input.gd")
 const BeltLanesScript := preload("res://scripts/world/belt_lanes.gd")
@@ -37,15 +39,19 @@ const EntityInfoScript := preload("res://scripts/ui/factorio/entity_info.gd")
 const FluidsPowerScript := preload("res://scripts/world/fluids_power.gd")
 const RoboportLinksScript := preload("res://scripts/world/roboport_links.gd")
 const BeltItemsScript := preload("res://scripts/world/belt_items.gd")
+const BeltRecordsScript := preload("res://scripts/world/belt_records.gd")
 const MapGen := preload("res://scripts/menu/map_gen.gd")
 const MapGeneratorWindow := preload("res://scripts/menu/map_generator_window.gd")
 const ModsWindow := preload("res://scripts/menu/mods_window.gd")
 const FrontEndScript := preload("res://scripts/menu/front_end.gd")
+const BugReport := preload("res://scripts/menu/bug_report.gd")
 const CreatureModels := preload("res://scripts/world/creature_models.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
 const ServerLauncher := preload("res://scripts/menu/server_launcher.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
 const ChunkView := preload("res://scripts/world/chunk_view.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
+const Predicted := preload("res://scripts/world/predicted.gd")
 const AnimScript := preload("res://scripts/world/anim.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
 const RemoteFog := preload("res://scripts/world/remote_fog.gd")
@@ -72,6 +78,8 @@ const RailPlanner := preload("res://scripts/player/rail_planner.gd")
 const RichText := preload("res://scripts/ui/factorio/rich_text.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
+const FarChunks := preload("res://scripts/world/far_chunks.gd")
 const TerrainTextures := preload("res://scripts/world/terrain_textures.gd")
 const AltOverlay := preload("res://scripts/ui/factorio/alt_overlay.gd")
 const AltArrowsScript := preload("res://scripts/world/alt_arrows.gd")
@@ -128,7 +136,7 @@ func _check_ride(cam_rig, viewer, ui) -> void:
 	var held: Dictionary = me.call({"x": 2944, "y": -1352, "pod": 50, "ps": "awaiting_launch", "up": 1, "gx": 2944, "gy": -128})
 	check(ride.state == Ride.BOARDING and held["x"] == 4 * 256 and held["w"] == 1 and not lock.is_processing()
 		and cam_rig.target != rider and cam_rig.in_cinematic(),
-		"ride: the character walks into the rocket from where it stood, input locked, the camera on the silo")
+		"ride: the character walks into the rocket from where it stood, input locked, the camera on the silo (#10)")
 	for i in 90:
 		ride._process(1.0 / 60.0)
 	check(ride.state == Ride.UP and not rider.visible, "ride: inside the rocket the character is hidden")
@@ -146,9 +154,9 @@ func _check_ride(cam_rig, viewer, ui) -> void:
 	for i in 10:
 		ride._process(1.0 / 60.0)
 	check(ride.state == Ride.IN_HUB and ui.remote and ui.in_hub() and lock.is_processing() and not rider.visible
-		and not cam_rig.in_cinematic(), "in the hub: the remote view round it, input back, no avatar")
+		and not cam_rig.in_cinematic(), "in the hub: the remote view round it, input back, no avatar (#17)")
 	ui.end_remote_view()
-	check(ui.remote and ui.in_hub(), "in the hub: leaving the remote view comes back to the hub, not the character")
+	check(ui.remote and ui.in_hub(), "in the hub: leaving the remote view comes back to the hub, not the character (#17)")
 	check(ui._at_hub() and not ui.escape(), "in the hub: Esc on the hub itself goes on to the game menu")
 	me.call({"x": -512, "y": 0, "pod": 51, "ps": "awaiting_launch", "up": 1, "gx": 0, "gy": 0})
 	check(ride.state == Ride.LEAVING and not ui.in_hub() and not lock.is_processing(), "land: out of the hub into a pod, input locked")
@@ -220,9 +228,11 @@ func _ready() -> void:
 	Settings.legacy = {}
 	DirAccess.remove_absolute(TEST_SETTINGS)
 	Settings.use_file(TEST_SETTINGS)
+	# The player's own Factorio controls (config.ini) mustn't change the keys the test presses.
+	Settings.set_value("factorio", "use_factorio_keys", false)
 	FxSettings.load_settings()
 	var gs := GDScript.new()
-	gs.source_code = "extends Node\nvar cursor_item := \"\"\nvar cursor_slot := 0\nvar remembered: Array = []\nfunc hold(i: String, slot := 0) -> void:\n\tcursor_item = i\n\tcursor_slot = slot\nfunc remember_mod(h: int, what: String) -> void:\n\tremembered.append([h, what])\nvar cursor_tool := \"\"\nvar reselect_slot := 0\nfunc hold_tool(t: String) -> void:\n\tcursor_tool = t\n"
+	gs.source_code = "extends Node\nvar cursor_item := \"\"\nvar cursor_slot := 0\nvar remembered: Array = []\nfunc hold(i: String, slot := 0) -> void:\n\tcursor_item = i\n\tcursor_slot = slot\nfunc remember_mod(h: int, what: String) -> void:\n\tremembered.append([h, what])\nvar cursor_tool := \"\"\nvar reselect_slot := 0\nfunc hold_tool(t: String) -> void:\n\tcursor_tool = t\nvar _undo: Array = []\nvar _redo: Array = []\n"
 	gs.reload()
 	var player: Node = gs.new()
 	add_child(player)
@@ -348,7 +358,11 @@ func _ready() -> void:
 	await _gear(hud, player)
 	await _planners(hud, player)
 	await _space(hud, player)
+	await _modded_planets(hud)
 	await _world_marks(hud)
+	await _predictions(hud)
+	await _mod_windows(hud)
+	await _window_bounds(hud)
 	await _wires(hud)
 	await _build_tools(hud)
 	await _menus()
@@ -357,6 +371,7 @@ func _ready() -> void:
 	_turrets()
 	_collectors()
 	_asteroid_chunks()
+	_fx_movers()
 	await _weapons()
 	await _console(hud)
 	await _performance()
@@ -369,8 +384,10 @@ func _ready() -> void:
 	_belt_stand_ins()
 	_ups_governor()
 	_terrain()
+	_surface_change()
 	_gpu_anim()
 	_belt_paths()
+	_belt_records()
 	if DisplayServer.get_name() != "headless" and OS.get_cmdline_user_args().size() > 0 and OS.get_cmdline_user_args()[-1].ends_with(".png"):
 		await _picture(hud, player)
 	print("FAILS: %d" % fails)
@@ -394,14 +411,15 @@ func _gpu_anim() -> void:
 		["offshore-pump", "bob_b", 0.5, 2.5], ["power-switch", "switch", 0.5, 0.8],
 		["rocket-silo", "door_silo_e", 0.2, 3.0], ["rail-signal", "lit_green", 0.5, 2.0]]
 	var unit := 9000
+	var swapped: Array[String] = []
 	for case in cases:
-		var part: ModelLibrary.AnimPart = null
-		for p: ModelLibrary.AnimPart in ModelLibrary.parts_for(str(case[0])):
-			if p.kind == case[1]:
-				part = p
-		# Models replaced by another project's (assets/models/fue5/) may not have our moving parts.
-		if part == null and ModelLibrary._source(str(case[0])).contains("/assets/models/fue5/"):
-			continue
+		var part := _part_of(str(case[0]), str(case[1]))
+		# Models replaced by another project's (assets/models/fue5/) may not have our moving parts:
+		# our own model is checked then.
+		if part == null and _theirs_in_use(str(case[0])):
+			_ours([case[0]])
+			swapped.append(str(case[0]))
+			part = _part_of(str(case[0]), str(case[1]))
 		if part == null:
 			check(false, "%s has a %s part" % [case[0], case[1]])
 			continue
@@ -475,6 +493,7 @@ func _gpu_anim() -> void:
 				for v in corners:
 					worst = maxf(worst, (old_xf * v).distance_to(base * _shader_part_pos(part, group.customs[0], anim.clock(), v)))
 		check(worst < 0.03, "%s's %s moves in the shader as anim.gd turned it every frame (worst %.4f tiles apart over 4 s)" % [case[0], case[1], worst])
+	_restore_models(swapped)
 	# A furnace's fire fades in and out with its working state, as it did frame by frame.
 	var furnace := ModelLibrary.mesh_for("stone-furnace")
 	var glow_group := _anim_group(null, 9500, Transform3D(Basis(), Vector3(4.0, 0.0, 4.0)), furnace)
@@ -499,17 +518,18 @@ func _gpu_anim() -> void:
 	check(AnimScript.kind_of(glow_group) == AnimScript.KIND_GLOW and glow_worst < 0.02 and glow_peak > 0.95,
 		"a furnace's fire glows in the shader as anim.gd eased it every frame (worst %.4f apart, up to %.2f)" % [glow_worst, glow_peak])
 	# A roboport's door opens when its group next looks and finds a robot near, then the shader
-	# slides it: nothing is written between looks.
-	var door: ModelLibrary.AnimPart = null
-	for p: ModelLibrary.AnimPart in ModelLibrary.parts_for("roboport"):
-		if p.kind == "door_n":
-			door = p
+	# slides it: nothing is written between looks. FUE5's roboport has no doors: ours is checked.
+	var door_swapped := _theirs_in_use("roboport")
+	if door_swapped:
+		_ours(["roboport"])
+	var door := _part_of("roboport", "door_n")
 	var robots := FakeRobots.new()
 	anim.movers = robots
-	if door == null:  # FUE5's roboport has no doors
-		print("skip a roboport's door: its model has none")
-	else:
+	check(door != null, "the roboport has a door_n part")
+	if door != null:
 		_check_roboport_door(anim, door)
+	if door_swapped:
+		_restore_models(["roboport"])
 	robots.queue_free()
 	anim.queue_free()
 	await _gpu_anim_world()
@@ -531,6 +551,37 @@ func _check_roboport_door(anim: AnimScript, door: ModelLibrary.AnimPart) -> void
 	check(floori(-shut.b - 1.0) % 2 == 0 and floori(-opened.b - 1.0) % 2 == 1 and anim.writes == door_writes
 		and slid.distance_to(door.slide * AnimScript.DOOR_TRAVEL) < 0.01,
 		"a roboport's door opens for a robot near at its group's look and slides open in the shader (%s, %d writes after)" % [slid, anim.writes - door_writes])
+
+
+## The moving part of `kind` in the model `model`, or null.
+func _part_of(model: String, kind: String) -> ModelLibrary.AnimPart:
+	for p: ModelLibrary.AnimPart in ModelLibrary.parts_for(model):
+		if p.kind == kind:
+			return p
+	return null
+
+
+## True when `model` is drawn with another project's model (assets/models/fue5/) in place of ours.
+func _theirs_in_use(model: String) -> bool:
+	return ModelLibrary._source(model).contains("/assets/models/fue5/")
+
+
+## The project's own models of `names` (res://assets/models/<name>.glb) in place of the ones
+## another project's replace them with in play, whose moving parts differ, so checks of our parts
+## still run; _restore_models() puts the others back.
+func _ours(names: Array) -> void:
+	for n: String in names:
+		ModelLibrary.mesh_for(n)  # finishes a worker's job still reading the other file
+		ModelLibrary._sources[n] = ModelLibrary.GLTF_SOURCE + "res://assets/models/%s.glb" % n
+		ModelLibrary._cache.erase(n)
+		ModelLibrary._parts.erase(n)
+
+
+func _restore_models(names: Array) -> void:
+	for n: String in names:
+		ModelLibrary._sources.erase(n)
+		ModelLibrary._cache.erase(n)
+		ModelLibrary._parts.erase(n)
 
 
 func _gpu_anim_world() -> void:
@@ -657,6 +708,98 @@ static func _shader_glow(c: Color, clock: Vector2) -> float:
 ## lane, every tick) are fed as the mod sends them, every 6 and every 24 ticks. Drawn, they stay on
 ## their own track (a splitter's jump across halves aside), out of sight under the ground, and their
 ## paths reach the GPU as the shader reads them; in straight lines they cut the curve.
+## Items on belts drawn from GPU records (belt_records.gd, docs/PERFORMANCE-PLAN.md item 7): each slot's
+## record puts its item where position_of() says; an item going on along its straight run as its
+## record says, or standing, has nothing written; a lane held (not sent) writes nothing; set_motion()
+## gives an item's motion from outside, written once, removed by remove_item().
+func _belt_records() -> void:
+	var protos := ProtoDB.new()
+	protos.add_entities([[1, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 170, 50, 1, 1]])
+	protos.add_items([[1, ""]])
+	var recs: Array = []
+	for r in 24:
+		var rec := WorldMirror.Rec.new()
+		rec.unit = r + 1
+		rec.key = rec.unit
+		rec.proto_id = 1
+		rec.pos = Vector2(0.5, r + 0.5)
+		rec.dir = 0
+		rec.extra = {"s": "straight"}
+		rec.chunk = WorldMirror.chunk_of(rec.pos)
+		recs.append(rec)
+	var items = BeltItemsScript.new()
+	items.protos = protos
+	add_child(items)
+	items._sync = true
+	items.index_chunk(Vector2i(0, 0), recs)
+	# Lane 1 moves north at a yellow belt's speed, lane 2 stands.
+	var written: Array = []
+	var kept: Array = []
+	var match_ok := true
+	var compared := 0
+	for u in 14:
+		var k := 3000 + u * 6
+		var l: Array = []
+		for n in 6:
+			l.append_array([100 + n, 1, roundi((0.5 - 0.234) * 256), roundi((20.0 - n * 0.25 - u * 6 * 0.03125) * 256)])
+		var ln: Array = [1, 6]
+		if u < 2 or u == 8:
+			for n in 6:
+				l.append_array([200 + n, 1, roundi((0.5 + 0.234) * 256), roundi((10.0 + n * 0.25) * 256)])
+			ln.append_array([2, 6])
+		var before: int = items.stats.get("records_written", 0)
+		var kept_before: int = items.stats.get("kept_records", 0)
+		items.handle({"t": "bi", "k": k, "p": 6, "fx": 128, "fy": 12 * 256, "fr": 20, "l": l, "ln": ln})
+		for f in 6:
+			items._process(1.0 / 60.0)
+		written.append(int(items.stats.get("records_written", 0)) - before)
+		kept.append(int(items.stats.get("kept_records", 0)) - kept_before)
+		# What the shader draws from each record against position_of().
+		var drawn: Array = items.drawn(1)
+		var kind = items._state.kinds.get(1)
+		if kind != null:
+			for uid in [100, 103, 200, 205]:
+				var it = items._state.items.get(uid)
+				var p = items.position_of(uid)
+				if it == null or p == null or it.slot < 0 or it.slot >= drawn.size() or drawn[it.slot] == null:
+					continue
+				compared += 1
+				var at: Vector3 = drawn[it.slot][0]
+				if Vector2(at.x, at.z).distance_to(Vector2(p.x, p.z)) > 0.01:
+					match_ok = false
+	check(match_ok and compared > 20, "belt records: every item is drawn from its record where position_of() has it (%d compared)" % compared)
+	# (A steady lane's records are made longer every few updates: OPEN_UPDATES, OPEN_LEFT.)
+	var steady_kept := 0
+	var steady_written := 0
+	for u in range(8, 14):
+		steady_kept += kept[u]
+		steady_written += written[u] if u != 8 else 0
+	check(steady_kept >= 30 and steady_written <= 6 and written[9] == 0 and written[10] == 0,
+		"belt records: items going on along their straight run as their records say write nothing (kept %d in the last updates, written %s)" % [steady_kept, written])
+	check(written[8] <= 8, "belt records: a standing lane sent again where it stood writes nothing for its items (%d written)" % written[8])
+	# set_motion(): an item given from outside goes along the belt to its stop at its speed, written once.
+	var before_ext: int = items.stats.get("records_written", 0)
+	items.set_motion(-(1 << 41), 1, Vector3(0.5 + 0.234, 0.0, 16.0), 3100.0, 0.05, Vector3(0.5 + 0.234, 0.0, 4.0))
+	items._process(1.0 / 60.0)
+	var ext = items._state.items.get(-(1 << 41))
+	var ext_ok: bool = ext != null and ext.slot >= 0
+	if ext_ok:
+		var r: int = items._state.kinds[1].base + ext.slot
+		var p60: Vector3 = items._state.records.position(r, 3160.0)
+		var p_end: Vector3 = items._state.records.position(r, 3400.0)
+		ext_ok = absf(p60.z - 13.0) < 0.02 and absf(p_end.z - 4.0) < 0.02 and absf(p60.x - 0.734) < 0.02
+	var ext_written: int = int(items.stats.get("records_written", 0)) - before_ext
+	for f in 3:
+		items.handle({"t": "bi", "k": 3200 + f * 6, "p": 6, "fx": 128, "fy": 12 * 256, "fr": 20, "l": [], "ln": []})
+		items._process(1.0 / 60.0)
+	var still: bool = items._state.items.has(-(1 << 41))
+	items.remove_item(-(1 << 41))
+	items._process(1.0 / 60.0)
+	check(ext_ok and ext_written == 1 and still and not items._state.items.has(-(1 << 41)),
+		"set_motion(): an item from outside is written once, goes along the belt at its speed to its stop, stays through updates and goes on remove_item()")
+	items.queue_free()
+
+
 func _belt_paths() -> void:
 	var fx = JSON.parse_string(FileAccess.get_file_as_string("res://tests/belt_paths_2.1.23.json"))
 	var protos := ProtoDB.new()
@@ -721,7 +864,9 @@ func _belt_paths() -> void:
 				var l: Array = []
 				for uid in tracks:
 					var at = tracks[uid].get(tick)
-					if at != null and (int(at.z) & 2) == 0:  # the mod sends what is inside a belt
+					# The mod sends what is inside a belt and in sight: not an entrance's lines 3 and 4, under
+					# the ground from its middle (belt_items.lua, truth-findings 7).
+					if at != null and (int(at.z) & 3) == 0:
 						l.append_array([uid, 1, roundi(at.x * 256), roundi(at.y * 256)])
 				items.handle({"t": "bi", "k": 1000 + tick, "p": period, "fx": 8 * 256, "fy": 24 * 256, "fr": 16, "l": l})
 			items._process(1.0 / 60.0)
@@ -747,7 +892,7 @@ func _belt_paths() -> void:
 				var path: PackedFloat32Array = items._positions[uid][2]
 				var it = items._state.items.get(uid)
 				if path.size() >= 8 and it != null and it.slot >= 0 and items._paths_image != null:
-					var code := int(items._state.kinds[1].buf[it.slot * BeltItemsScript.STRIDE + 15]) - 1
+					var code := int(items._state.records.data[(items._state.kinds[1].base + it.slot) * BeltRecordsScript.FLOATS + 11]) - 1
 					var img: Image = items._paths_image
 					var first := code / 64
 					var n := code % 64 + 2
@@ -765,9 +910,77 @@ func _belt_paths() -> void:
 			check(on_curve > 0.15 and hidden == 0,
 				"in straight lines (no belts known), every %d ticks the same items cut the curve by %.3f tiles and never go out of sight" % [period, on_curve])
 		items.queue_free()
+	_belt_under_crossing()
 
 
-## Gleba's and Aquilo's ground. Water is told by its collision mask (the wetlands, the
+## An underground passing under a belt that crosses its way (truth-findings 7: items under the ground
+## were drawn standing on the belt above). The mod sends an item while it is in sight only: on the
+## lanes up to the entrance's middle and from the exit's middle on (BELT-RULES section 3), nothing in
+## between (belt_items.lua: an entrance's lines 3 and 4 aren't read, an item that went in isn't
+## carried on). The client carries it under the ground: out of sight from the entrance's middle to the
+## exit's, never on the crossing belt, and it comes up at the exit's middle when the game has it there.
+func _belt_under_crossing() -> void:
+	var protos := ProtoDB.new()
+	protos.add_entities([[1, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 170, 50, 1, 1],
+		[2, "underground-belt", "underground-belt", -0.5, -0.5, 0.5, 0.5, 200, 170, 50, 1, 1]])
+	protos.add_items([[1, ""]])
+	# South: a belt, the entrance at y 60.5, the exit at 64.5 (a gap of 3), a belt; three east belts
+	# cross over the gap at y 61.5 to 63.5.
+	var recs: Array = []
+	for b in [[1, 40.5, 59.5, 8, "s"], [2, 40.5, 60.5, 8, "i"], [2, 40.5, 64.5, 8, "o"], [1, 40.5, 65.5, 8, "s"],
+			[1, 40.5, 66.5, 8, "s"], [1, 40.5, 61.5, 4, "s"], [1, 40.5, 62.5, 4, "s"], [1, 40.5, 63.5, 4, "s"]]:
+		var r := WorldMirror.Rec.new()
+		r.unit = recs.size() + 1
+		r.key = r.unit
+		r.proto_id = int(b[0])
+		r.pos = Vector2(float(b[1]), float(b[2]))
+		r.dir = int(b[3])
+		r.extra = {"s": str(b[4])} if int(b[0]) == 1 else {"u": str(b[4])}
+		r.chunk = WorldMirror.chunk_of(r.pos)
+		recs.append(r)
+	var items = BeltItemsScript.new()
+	items.protos = protos
+	add_child(items)
+	items._sync = true
+	items.index_chunk(Vector2i(1, 1), recs)
+	# A south belt's lane 1 is on its east side; a yellow belt's 1/32 a tick, an update every 6 ticks.
+	var lane_x := 40.5 + 0.234
+	var v := 0.03125
+	var over := 0  # frames drawn between the ends' middles (over the gap, on the crossing belts)
+	var off_lane := 0.0
+	var hidden := 0
+	var shown_late := 0.0  # drawn short of where the game had it, once it came up at the exit
+	var came_up := false
+	for tick in range(0, 300):
+		var y := 59.1 + v * tick
+		if tick % 6 == 0:
+			var l: Array = []
+			if y <= 60.5 or y >= 64.5:
+				l = [9101, 1, roundi(lane_x * 256), roundi(y * 256)]
+			items.handle({"t": "bi", "k": 2000 + tick, "p": 6, "fx": 40 * 256, "fy": 62 * 256, "fr": 16, "l": l})
+		items._process(1.0 / 60.0)
+		var known: bool = items._positions.has(9101)
+		var p = items.position_of(9101)
+		if not known:
+			continue
+		if p == null:
+			hidden += 1
+			continue
+		off_lane = maxf(off_lane, absf(p.x - lane_x))
+		if p.z > 60.6 and p.z < 64.4:
+			over += 1
+		if p.z >= 64.5:
+			came_up = true
+		# (Drawn a job's margin and an update behind the game: within two updates' travel of it.)
+		if came_up and y < 67.0:
+			shown_late = maxf(shown_late, (59.1 + v * (items._drawn - 2000.0)) - p.z)
+	check(over == 0 and hidden > 60 and came_up and off_lane < 0.02 and shown_late < 0.2,
+		"an item under the ground is out of sight from the entrance's middle to the exit's (%d frames hidden), never drawn over the gap or on the belt crossing it (%d), and comes up at the exit on its lane (%s, %.3f off it, %.3f behind the game)"
+		% [hidden, over, came_up, off_lane, shown_late])
+	items.queue_free()
+
+
+## G11, G14: Gleba's and Aquilo's ground. Water is told by its collision mask (the wetlands, the
 ## deep lake, brash ice, the ammoniacal ocean), `layer = gleba_tile_offset + 8` is worked out so
 ## the planets' tiles blend in Factorio's order, the water shaders' own pictures fill the swamps
 ## and brash ice, and a surface change makes room in the layer table.
@@ -775,6 +988,27 @@ func _terrain() -> void:
 	var db := ProtoDB.new()
 	db.add_tiles([[0, "ammoniacal-ocean", 15, 13, 25], [1, "gleba-deep-lake", 18, 37, 51], [2, "snow-flat", 190, 194, 197], [3, "water", 51, 83, 95]])
 	check(db.is_water(0) and db.is_water(1) and not db.is_water(2) and db.is_water(3), "Aquilo's ocean and Gleba's deep lake are water, snow isn't")
+	# 0.1.3's graphics list marked every tile with `water_tile` in its mask as water, and empty space,
+	# lava and out-of-map have it too: the empty space round every platform was drawn as water.
+	var kept_tiles := ModGraphics.tiles
+	ModGraphics.tiles = {"empty-space": {"main": [["__space-age__/graphics/terrain/empty-space.png", 1, 1, 0, 0, 1, 1, null, 1]], "water": 1},
+		"lava": {"main": [["__space-age__/graphics/terrain/lava.png", 1, 1, 0, 0, 1, 1, null, 1]], "water": 1}}
+	var space := ProtoDB.new()
+	space.add_tiles([[0, "empty-space", 0, 0, 0], [1, "lava", 200, 60, 0]])
+	check(space.is_void(0) and not space.is_water(0), "empty space is space, not water, whatever the graphics list says")
+	if ItemIcons.find_data_dir() != "" and not TerrainTextures.disabled:
+		check(not space.is_water(1), "a tile the game's own files define (lava) keeps the client's rule, not the list's flag")
+	ModGraphics.tiles = kept_tiles
+	# A mod's pond is water by the graphics list's record, and the list comes after `tprotos`.
+	var modded := ProtoDB.new()
+	modded.add_tiles([[0, "zz-mod-pond", 40, 60, 90], [1, "grass-1", 60, 90, 30]])
+	check(not modded.is_water(0) and not modded.refresh_water(), "a mod's pond before the list: land, and nothing to redo")
+	ModGraphics.tiles = {"zz-mod-pond": {"mat": ["__zz-mod__/graphics/pond.png", 4, 0.5], "water": 1}}
+	ModGraphics.generation += 1
+	check(modded.refresh_water() and modded.is_water(0) and not modded.is_water(1), "once the list is applied it is water")
+	check(not modded.refresh_water(), "and is worked out once a list")
+	ModGraphics.tiles = kept_tiles
+	ModGraphics.generation += 1
 	check(TerrainTextures._sum("gleba_lowland_tile_offset+4", {"gleba_lowland_tile_offset": 32}) == 36
 		and TerrainTextures._sum("aquilo_tile_offset_frozen + 2", {"aquilo_tile_offset_frozen": 50}) == 52
 		and TerrainTextures._sum("7", {}) == 7, "a tile's layer from its file's constants")
@@ -815,6 +1049,8 @@ func _terrain() -> void:
 			check(repeats == 0, "brash ice isn't one square repeated (its low alpha passed for empty slots): %d" % repeats)
 			var ocean: TerrainTextures.TileGfx = g["ammoniacal-ocean"]
 			check(ocean.tint.b < 0.5 and ocean.tint.r < 0.5, "the ammoniacal ocean is water's picture darkened to its map colour: %s" % ocean.tint)
+	else:
+		print("skip G11/G14's tile pictures: no Factorio install (or terrain textures off)")
 	# A session that visits every planet runs out of layers unless a surface change makes room.
 	var gen := TerrainTextures.generation
 	while TerrainTextures.layer_count() < TerrainTextures.TRIM_LAYERS:
@@ -824,6 +1060,109 @@ func _terrain() -> void:
 	check(TerrainTextures.trim() and TerrainTextures.layer_count() == 0 and TerrainTextures.generation > gen
 		and TerrainTextures.peek("snow-flat") == null, "a surface change with many layers in use drops them all")
 	check(not TerrainTextures.trim(), "and with few in use keeps them")
+
+
+## Factorissimo's buildings: every door is a surface change, and going back must not rebuild
+## everything it had seconds before. The left world's clutter is freed a few nodes a frame (all at
+## once made a 35-60 ms frame), terrain meshes come back from the cache when the ground round them
+## is the same, and the ground's pictures stay loaded when the surface coming back fits beside them.
+func _surface_change() -> void:
+	var decor := DecorativeLayer.new()
+	add_child(decor)
+	var nodes: Array = []
+	for i in 40:
+		var n := Node3D.new()
+		for k in 3:
+			n.add_child(MultiMeshInstance3D.new())
+		decor.add_child(n)
+		decor._chunks[Vector2i(i, 0)] = n
+		nodes.append(n)
+	decor.reset(true)
+	var hidden := nodes.all(func(n) -> bool: return is_instance_valid(n) and not (n as Node3D).visible)
+	check(hidden and decor._chunks.is_empty() and decor.freeing_count() == 40, "a world left hides its clutter at once and frees it later")
+	var frames := 0
+	while decor.freeing_count() > 0 and frames < 100:
+		decor._free_some()
+		frames += 1
+	check(nodes.all(func(n) -> bool: return not is_instance_valid(n)), "and frees it over the next frames (%d)" % frames)
+	decor.queue_free()
+	# Terrain meshes kept: the same ground round a chunk takes the kept mesh, other ground is built.
+	var w := WorldMirror.new()
+	add_child(w)
+	w.surface_index = 5
+	w.protos.add_tiles([[0, "zz-test-ground", 90, 90, 90], [1, "zz-test-other", 30, 30, 30]])
+	var ids := PackedInt32Array()
+	ids.resize(32 * 32)
+	var place := func(tiles: PackedInt32Array) -> ChunkView:
+		var cv := ChunkView.new()
+		cv.coord = Vector2i.ZERO
+		cv.loaded = true
+		cv.tile_ids = tiles
+		w.chunks[Vector2i.ZERO] = cv
+		w.add_child(cv)
+		w._dirty_terrain[Vector2i.ZERO] = true
+		return cv
+	var first: ChunkView = place.call(ids)
+	w._start_terrain_jobs()
+	var entry: Array = w._terrain_jobs.get(Vector2i.ZERO, [])
+	check(entry.size() == 5, "a chunk's ground is built on a worker")
+	if entry.size() == 5:
+		WorkerThreadPool.wait_for_task_completion(entry[0])
+		w._terrain_jobs.erase(Vector2i.ZERO)
+		first.apply_terrain(entry[1])
+		w._keep_terrain(Vector2i.ZERO, int(entry[3]), int(entry[4]), first)  # as if every picture were loaded
+		check(w.terrain_cache_size() == 1, "and its mesh kept")
+		w.reset(true, 5)
+		w.surface_index = 5
+		var back: ChunkView = place.call(ids.duplicate())
+		var hits := w.terrain_cache_hits
+		w._start_terrain_jobs()
+		check(not w._terrain_jobs.has(Vector2i.ZERO) and w.terrain_cache_hits == hits + 1 and back.terrain_mesh() == first.terrain_mesh(),
+			"back on the surface, the same chunk takes its kept mesh without a worker's job")
+		w.reset(true, 5)
+		w.surface_index = 5
+		var changed := ids.duplicate()
+		changed[100] = 1
+		place.call(changed)
+		w._start_terrain_jobs()
+		check(w._terrain_jobs.has(Vector2i.ZERO), "a tile changed since: built again")
+		w.reset(true, 6)
+		w.surface_index = 6
+		place.call(ids.duplicate())
+		w._start_terrain_jobs()
+		check(w._terrain_jobs.has(Vector2i.ZERO), "the same chunk on another surface: built, not taken from the first")
+		for e: Array in w._terrain_jobs.values():
+			WorkerThreadPool.wait_for_task_completion(e[0])
+		w._terrain_jobs.clear()
+	w.reset()
+	check(w.terrain_cache_size() == 0, "another game forgets the kept meshes")
+	w.queue_free()
+	# The ground's pictures: Nauvis with Space Exploration has 39 kinds, a factory floor 4 more, and
+	# past TRIM_LAYERS every door dropped them all and read them again.
+	TerrainTextures.trim()
+	var names: Array = []
+	while TerrainTextures.layer_count() < TerrainTextures.TRIM_LAYERS + 3:
+		var n := "zz-test-layer-%d" % TerrainTextures.layer_count()
+		TerrainTextures._images.append(Image.create_empty(4, 4, false, Image.FORMAT_RGB8))
+		TerrainTextures._infos.append(Color(0, 1, 1, 1))
+		TerrainTextures._reflects.append(1.0)
+		var g := TerrainTextures.TileGfx.new()
+		g.layer = names.size()
+		TerrainTextures._gfx[n] = g
+		names.append(n)
+	for n in names.slice(0, 39):
+		TerrainTextures.note(1, n)
+	for n in names.slice(39):
+		TerrainTextures.note(3, n)
+	var layout := TerrainTextures.layout
+	check(not TerrainTextures.trim(1) and not TerrainTextures.trim(3) and TerrainTextures.layer_count() == names.size() and TerrainTextures.layout == layout,
+		"going back to a surface whose ground is loaded keeps the layers (and the meshes built with them)")
+	TerrainTextures.note(4, "zz-test-not-loaded")
+	for i in TerrainTextures.MAX_LAYERS:
+		TerrainTextures.note(4, "zz-test-not-loaded-%d" % i)
+	check(TerrainTextures.trim(4) and TerrainTextures.layer_count() == 0 and TerrainTextures.layout > layout,
+		"a surface whose ground doesn't fit beside them makes room")
+	TerrainTextures.forget_surfaces()
 
 
 ## Walking on a big base (stutters as chunks stream in): a chunk built again fills its MultiMeshes
@@ -934,9 +1273,6 @@ func _streaming() -> void:
 	layers.queue_free()
 
 
-## Chunk streaming spread over frames (docs/PERFORMANCE-AUDIT.md 4.7): the subscription list without
-## a sort, builds that stop part-way and carry on, shadow tiers and unloading a slice a frame. Each
-## gives what doing it at once gave, and its queue drains.
 ## While moving: the main thread's sliced work shares one allowance a frame (frame_budget.gd),
 ## handed out by priority, every queue still draining; the bridge's JSON is read off the main thread.
 func _frame_budget() -> void:
@@ -1087,6 +1423,9 @@ func _working_near() -> void:
 	w.queue_free()
 
 
+## Chunk streaming spread over frames (docs/PERFORMANCE-AUDIT.md 4.7): the subscription list without
+## a sort, builds that stop part-way and carry on, shadow tiers and unloading a slice a frame. Each
+## gives what doing it at once gave, and its queue drains.
 func _stream_spread() -> void:
 	# The nearest-first order of a square of chunks, worked out without sorting.
 	var order := WorldMirror.ring_order(14)
@@ -1118,13 +1457,15 @@ func _stream_spread() -> void:
 		var center := WorldMirror.chunk_of(sw.focus())
 		var expect := {}
 		var on_way := 0
+		# Walking a few at a time; the first steps are a standing start (nothing drawn yet).
+		var allowance := WorldMirror.STREAM_MOVING if Time.get_ticks_msec() - sw._moved_msec < WorldMirror.MOVING_FOR * 1000.0 else WorldMirror.STREAM_STILL
 		for off: Vector2i in WorldMirror.ring_order(6):
 			if asked_before.has(center + off):
 				expect[center + off] = true
 				if coming_before.has(center + off) and not sw._drawn(center + off):
 					on_way += 1
 		for off: Vector2i in WorldMirror.ring_order(6):
-			if not expect.has(center + off) and on_way < WorldMirror.STREAM_MOVING:
+			if not expect.has(center + off) and on_way < allowance:
 				expect[center + off] = true
 				on_way += 1
 		var got := {}
@@ -1150,6 +1491,20 @@ func _stream_spread() -> void:
 			break
 	check(sw._unloaded.is_empty() and sw._unload_keys.is_empty(), "and the chunks left behind are all freed over frames")
 	sw.queue_free()
+	# A view wider than the bridge subscribes to (Ultra's 29x29, the slider's 41x41) asks for the
+	# nearest MAX_SUBSCRIPTIONS only: the bridge drops the rest, which would wait in _coming for good.
+	var big := WorldMirror.new()
+	add_child(big)
+	big.view_radius = 20
+	big.set_focus(Vector2(16.0, 16.0))
+	big._update_subscription(WorldMirror.STREAM_STEP)
+	var nearest_kept := big._wanted.size() == WorldMirror.MAX_SUBSCRIPTIONS
+	var far_cut := ((WorldMirror.ring_order(20)[WorldMirror.MAX_SUBSCRIPTIONS - 1]) as Vector2i).length_squared()
+	for c: Vector2i in big._wanted:
+		nearest_kept = nearest_kept and c.length_squared() <= far_cut
+	check(nearest_kept and big._subscribed.size() <= WorldMirror.MAX_SUBSCRIPTIONS,
+		"a view past the bridge's 625 chunks asks for the nearest 625 only (%d wanted)" % big._wanted.size())
+	big.queue_free()
 	# A build stopped part-way and carried on draws exactly what one build at once draws.
 	var protos := ProtoDB.new()
 	protos.add_entities([[1, "zz-test-box", "container", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
@@ -1387,6 +1742,12 @@ func _far_chunks() -> void:
 	cv.add_pending({}, null, ChunkView.Budget.new(100))
 	check(shown.call() == 3 and cv.far.node == null and cv.far.full,
 		"and goes once they are all in (%d shown, merged mesh %s, full %s)" % [shown.call(), cv.far.node, cv.far.full])
+	# With a graphics list a building without a model is a card, far away too: never merged as a box.
+	var kept_fp := ModGraphics.fingerprint
+	check(FarChunks.merges("container", null), "without a list a placeholder box is merged far away")
+	ModGraphics.fingerprint = "a list"
+	check(not FarChunks.merges("container", null), "with a list a mod's building keeps its card far away, not a merged box")
+	ModGraphics.fingerprint = kept_fp
 	w.queue_free()
 
 
@@ -1668,11 +2029,28 @@ func _sun_shadows(cam: Camera3D, sun: DirectionalLight3D) -> void:
 	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
 
 
-## What keeps a big base smooth. Shadows only from chunks that can shade what the
+## D5, D6, D13: what keeps a big base smooth. Shadows only from chunks that can shade what the
 ## camera sees, through simplified stand-ins; models get LODs of their own; the Level of detail
 ## setting; batched datagrams from the mod; messages handled within a frame's budget; chunk
 ## rebuilds within a time budget.
 func _performance() -> void:
+	# The probes' own timings are kept only while --stutter-probe runs (Probing.on), so a normal
+	# game doesn't time each animated group every frame.
+	var probed := WorldMirror.new()
+	var probing_was := Probing.on
+	Probing.on = false
+	ChunkView.counters.clear()
+	probed._prof("test", Time.get_ticks_usec() - 5)
+	ChunkView.count("test")
+	var kept_off := probed.prof.size() + ChunkView.counters.size()
+	Probing.on = true
+	probed._prof("test", Time.get_ticks_usec() - 5)
+	ChunkView.count("test")
+	var kept_on := probed.prof.has("test") and int(ChunkView.counters.get("test", 0)) == 1
+	Probing.on = probing_was
+	ChunkView.counters.clear()
+	probed.free()
+	check(kept_off == 0 and kept_on, "probe timings and counts are kept only while a probe reads them (off: %d kept)" % kept_off)
 	# The region whose casters can shade the view, and the rectangle test against it.
 	var hull := PackedVector2Array([Vector2(0, 0), Vector2(100, 0), Vector2(100, 100), Vector2(0, 0)])
 	check(WorldMirror._rect_meets_hull(Rect2(10, 10, 32, 32), hull) and not WorldMirror._rect_meets_hull(Rect2(10, 60, 20, 20), hull)
@@ -1772,14 +2150,39 @@ func _performance() -> void:
 	sw.view_radius = 10
 	sw._update_subscription(0.2)
 	var first: Array = sw._subscribed.duplicate()
-	var nearest := first.all(func(c: Vector2i) -> bool: return c.length_squared() <= 5)
+	var nearest := first.all(func(c: Vector2i) -> bool: return c.length_squared() <= 10)  # the 32 nearest
 	for c in first:
 		var cv: ChunkView = sw.chunks[c]
 		cv.loaded = true
 		cv.tile_ids = PackedInt32Array()
+	sw.set_focus(Vector2(40.0, 0.0))  # walked into the next chunk east
 	sw._update_subscription(0.2)
-	check(first.size() == WorldMirror.STREAM_MOVING and nearest and sw._subscribed.size() == 2 * WorldMirror.STREAM_MOVING,
-		"chunks are asked for a few at a time, nearest first, more once those are drawn: %d then %d" % [first.size(), sw._subscribed.size()])
+	check(first.size() == WorldMirror.STREAM_STILL and nearest and sw._subscribed.size() == WorldMirror.STREAM_STILL + WorldMirror.STREAM_MOVING,
+		"chunks are asked for a few at a time, nearest first, a standing start's worth, then fewer while walking once those are drawn: %d then %d" % [first.size(), sw._subscribed.size()])
+	# A jump (a teleport, another surface, a Factorissimo building's door) has nothing of its new
+	# square yet: it loads as a standing start, not a few chunks at a time as walking does, even
+	# straight after walking (into the door). Walking into the door had it at 8 for 1.5 s.
+	for c in sw._subscribed:
+		var cv: ChunkView = sw.chunks[c]
+		cv.loaded = true
+		cv.tile_ids = PackedInt32Array()
+	sw.set_focus(Vector2(32.0 * 60.0, 32.0 * 40.0))
+	sw._update_subscription(0.2)
+	var jumped := sw._subscribed.filter(func(c: Vector2i) -> bool: return (c - Vector2i(60, 40)).length_squared() <= 100)
+	check(jumped.size() == WorldMirror.STREAM_STILL, "after a jump a standing start's worth of chunks is asked for at once: %d" % jumped.size())
+	sw.reset(true, 7)
+	sw.set_focus(Vector2(32.0 * 60.0 + 40.0, 32.0 * 40.0))
+	sw._update_subscription(0.2)
+	check(sw._subscribed.size() == WorldMirror.STREAM_STILL, "and after a surface change, the chunk next door or not: %d" % sw._subscribed.size())
+	sw._update_subscription(0.05)
+	var waited := sw._subscribed.size()
+	for c in sw._subscribed:
+		var cv: ChunkView = sw.chunks[c]
+		cv.loaded = true
+		cv.tile_ids = PackedInt32Array()
+	sw._update_subscription(0.05)
+	check(waited == WorldMirror.STREAM_STILL and sw._subscribed.size() == 2 * WorldMirror.STREAM_STILL,
+		"standing, the next chunks are asked for as soon as those on their way are drawn, not a step later: %d, %d" % [waited, sw._subscribed.size()])
 	sw.queue_free()
 	# Copies of models' materials made without asking the RenderingServer (copy_material) match duplicate().
 	var source_mat := ModelLibrary.mesh_for("assembling-machine-1").surface_get_material(0) as ShaderMaterial
@@ -1860,7 +2263,7 @@ func _performance() -> void:
 	check(leaf_shader != null and include_text.contains("// Leaves keep their base roughness")
 		and include_text.contains("ROUGHNESS = mix(m_rough, 0.85, pc);"),
 		"leaf cards' roughness skips the weathering, so the SSAO prepass stays cheap in forests")
-	# A model's first appearance is made on a worker thread. Its chunk leaves it out meanwhile
+	# D6: a model's first appearance is made on a worker thread. Its chunk leaves it out meanwhile
 	# (nothing blocks the frame), and draws it when built again once the model is ready.
 	var fresh := "cryogenic-plant"
 	if ModelLibrary._cache.has(fresh):
@@ -1908,7 +2311,8 @@ func _performance() -> void:
 	var b = load("res://scripts/net/bridge.gd").new()
 	var got: Array = []
 	b.message_received.connect(func(msg: Dictionary) -> void: got.append(str(msg.get("t"))))
-	b.receive('{"t":"welcome","r":1,"v":1,"k":1}'.to_utf8_buffer())
+	b.receive('{"t":"welcome","r":1,"v":1,"k":1,"mod":"0.1.3"}'.to_utf8_buffer())
+	check(b.mod_version == "0.1.3", "the welcome's mod version is kept (for a bug report): %s" % b.mod_version)
 	b.receive('{"t":"sky","k":2}\n{"t":"me","k":2}\n{"t":"mv","k":2,"l":[]}'.to_utf8_buffer())
 	check(got == ["sky", "me", "mv"], "several messages in one datagram, joined by newlines, are each handled: %s" % [got])
 	got.clear()
@@ -1926,7 +2330,8 @@ func _performance() -> void:
 	check(got.size() == 3000, "... and they are all handled in order over the next frames")
 	b.free()
 	# Chunk rebuilds stop at their time budget (at least one a frame).
-	check(WorldMirror.REBUILD_USEC > 0 and WorldMirror.REBUILD_USEC <= 8000, "chunk rebuilds have a frame time budget")
+	var build_slice := int(preload("res://scripts/world/frame_budget.gd").SYSTEMS[&"build"][1])
+	check(build_slice > 0 and build_slice <= 8000, "chunk rebuilds have a frame time budget")
 
 
 ## The console (chat_window.gd, console_commands.gd): each command goes where it can run, Lua
@@ -2074,6 +2479,20 @@ func _turrets() -> void:
 	layer.handle_states({"t": "ts", "l": [[8, 0, 1, 0, 10 * 256, 0]]})
 	step.call(0.5)
 	check(laser.fired == 2 and laser.beam_left <= 0.0, "turrets: once the game's beams come (pj), the laser fires without drawing its own beam")
+	# Gone from the world (mined, destroyed, out of the area) and not heard of for a while: let go.
+	var fake := GDScript.new()
+	fake.source_code = "extends Node\nvar entities := {}\n"
+	fake.reload()
+	var w: Node = fake.new()
+	w.entities[8] = true
+	layer.world = w
+	step.call(TurretLayer.FORGET_AFTER + TurretLayer.FORGET_INTERVAL + 0.5)
+	check(layer.state_of(7) == null and layer.state_of(8) != null, "turrets: a turret gone from the world is forgotten, one still there kept")
+	layer.reset(true)
+	check(layer.game_beams, "turrets: another surface keeps the game's beams")
+	layer.reset()
+	check(not layer.game_beams, "turrets: a new game waits for its own `pj` before leaving beams to it")
+	w.free()
 	layer.queue_free()
 
 
@@ -2101,15 +2520,17 @@ func _asteroid_chunks() -> void:
 	layer._place_chunks()
 	var mmi: MultiMeshInstance3D = layer._chunk_meshes["metallic-asteroid-chunk"]
 	var before: Transform3D = mmi.multimesh.get_instance_transform(0)
+	var phase_before := float(cm.asteroid_chunks[0]["phase"])
 	# The game's next update has it a little further on than the client's estimate.
 	cm.set_chunks([{"name": "metallic-asteroid-chunk", "position": Vector2(10.4, 0.1), "velocity": Vector2(3, 0)}])
 	layer._place_chunks()
 	var after: Transform3D = mmi.multimesh.get_instance_transform(0)
 	check(after.origin.distance_to(before.origin) < 0.05 and after.basis.x.distance_to(before.basis.x) < 0.05,
 		"an asteroid chunk's next update keeps its place and tumble (F5): moved %.3f tiles" % after.origin.distance_to(before.origin))
-	check(is_equal_approx(float(cm.asteroid_chunks[0]["phase"]), float(cm.asteroid_chunks[0]["phase"])) and cm.asteroid_chunks[0].has("offset"),
-		"the chunk carries its matched phase and the gap to ease off")
-	# A chunk whose sent movement is wrong (here none, as on a travelling platform) moves on by
+	# A new chunk's phase comes from its place, so an unmatched one at 10.4 would get another.
+	check(is_equal_approx(float(cm.asteroid_chunks[0]["phase"]), phase_before) and cm.asteroid_chunks[0].has("offset"),
+		"the chunk carries its matched phase and the gap to ease off: %.3f for %.3f" % [float(cm.asteroid_chunks[0]["phase"]), phase_before])
+	# G2: a chunk whose sent movement is wrong (here none, as on a travelling platform) moves on by
 	# how far it really went, so later updates land where it is drawn (each 1/6 s apart).
 	cm.set_chunks([{"name": "carbonic-asteroid-chunk", "position": Vector2(20, 0), "velocity": Vector2.ZERO}])
 	var offsets: Array = []
@@ -2117,7 +2538,7 @@ func _asteroid_chunks() -> void:
 		layer._chunks_msec = Time.get_ticks_msec() - 167
 		cm.set_chunks([{"name": "carbonic-asteroid-chunk", "position": Vector2(20 + 0.5 * i, 0), "velocity": Vector2.ZERO}])
 		offsets.append((cm.asteroid_chunks[0]["offset"] as Vector2).length())
-	check(offsets[0] > 0.4 and offsets[2] < 0.1, "asteroid chunks move on by their measured speed, not the sent one: gaps %s" % [offsets])
+	check(offsets[0] > 0.4 and offsets[2] < 0.1, "asteroid chunks move on by their measured speed, not the sent one: gaps %s (G2)" % [offsets])
 	# H1, H6, H11: launches only on the surface shown; a waiting rocket stands down in its silo; robots fly high.
 	layer.surface = "nauvis"
 	layer._on_launch(1, Vector2(5, 5), "platform-1")
@@ -2197,12 +2618,29 @@ func _collectors() -> void:
 	run.call(0.2)
 	check(layer.arm_state(5, 0)[0] == "reach" and layer.arm_state(5, 1)[0] == "reach"
 		and layer.head_of(5, 0).distance_to(layer.head_of(5, 1)) > 1.0, "collectors: two arms go for two chunks at once")
-	# Switched off (2), arms reaching out turn back and fold home; held (0) they'd stay out.
+	# G10: switched off (2), arms reaching out turn back and fold home; held (0) they'd stay out.
 	layer.handle({"t": "acol", "l": [[5, 2, 250, 2, []]]})
 	run.call(2.0)
 	check(layer.arm_state(5, 0)[0] == "idle" and layer.arm_state(5, 1)[0] == "idle" and layer.head_of(5, 0).distance_to(rest) < 0.01
-		and layer.head_of(5, 1).distance_to(rest) < 0.01, "collectors: switched off, the arms fold back home")
+		and layer.head_of(5, 1).distance_to(rest) < 0.01, "collectors: switched off, the arms fold back home (G10)")
 	layer.queue_free()
+
+
+## fx.gd follows movers for their sounds (engines, biters) from the same `mv` as movers.gd, which
+## the bridge delta-codes (z = 1) for every client that says z in its hello.
+func _fx_movers() -> void:
+	var fx := FxScript.new()
+	fx.handle({"t": "mv", "k": 10, "z": 1, "l": [[700, 3, 256, 512, 0], [1, 1, 256, -256, 0]]})
+	var a = fx._tracked.get(700)
+	var b = fx._tracked.get(701)
+	check(a != null and b != null and a.pos == Vector2(1, 2) and b.pos == Vector2(2, 1) and a.proto_id == 3 and b.proto_id == 4,
+		"fx: delta-coded movers (z 1) are followed where they are, not their differences: %s" % [fx._tracked.keys()])
+	fx.handle({"t": "mv", "k": 12, "l": [[702, 5, 768, 256, 0]]})
+	var c = fx._tracked.get(702)
+	check(c != null and c.pos == Vector2(3, 1) and c.proto_id == 5, "fx: and plain records as they are")
+	# Never in the tree, so its own nodes were never made its children.
+	for n in [fx.sfx, fx.sprites, fx.weapons, fx]:
+		n.free()
 
 
 ## What weapons fire (weapon_fx.gd): projectiles tracked by id and played out where they end,
@@ -2216,6 +2654,8 @@ func _weapons() -> void:
 	add_child(wf)
 	await get_tree().process_frame
 	var installed := SoundBank.data_dir() != ""
+	if not installed:
+		print("skip weapons' sheets and sounds: no Factorio install")
 	if installed:
 		# The world's sounds decode on a worker: null on first ask, ready shortly after.
 		var oggs := Array(DirAccess.get_files_at(SoundBank.data_dir().path_join("base/sound"))).filter(func(f: String) -> bool: return f.ends_with(".ogg"))
@@ -2269,17 +2709,12 @@ func _weapons() -> void:
 	wf.in_space = true
 	var before := sprites.count()
 	wf._scorch("small-scorchmark-tintable", Vector3.ZERO)
-	check(sprites.count() == before, "no scorch marks on a space platform")
+	check(sprites.count() == before, "no scorch marks on a space platform (the owner's #16)")
 	wf.reset()
 	wf.queue_free()
 	sprites.queue_free()
 
 
-## The information windows: the alert bar (`al`: buttons, counts, tooltips, clicking through the
-## entities, icons in the world), Factoriopedia (F2, Alt+click, the index's tabs and grid, pages,
-## links, history), item tooltips' stats, the logistic networks window (L), the statistics' tabs,
-## surfaces and graphs, rich text in the chat (icons, colours, gps links and pings) and the
-## technology screen's details (effects, trigger tasks, infinite levels).
 ## The HUD and character screen as Factorio 2.1 has them (ui-hud): the top-right side menu
 ## (research, the 6+4 buttons, the minimap's place), the shortcut bar's chooser and new shortcuts,
 ## the quickbar's page chooser, the character screen's parts, chat, recipe tooltips.
@@ -2302,7 +2737,7 @@ func _hud(hud: Hud, player: Node) -> void:
 	check(menu.encloses(ui.research_hud.get_global_rect()), "the research panel is in it")
 	check(not ui.minimap.visible or menu.encloses(ui.minimap.get_global_rect().grow(-0.5)), "the minimap sits in it, under the buttons")
 	check(ui.research_hud.get_global_rect().end.y < ui.minimap.get_global_rect().position.y, "research above the minimap")
-	if ui.minimap.visible:  # the frame sat up and to the left of its place
+	if ui.minimap.visible:  # owner's #7: the frame sat up and to the left of its place
 		var slot_rect: Rect2 = ui.side_menu.minimap_slot.get_global_rect()
 		var map_rect: Rect2 = ui.minimap._frame.get_global_rect()
 		check(map_rect.size.x == ui.minimap.side_px() and ui.minimap.size == map_rect.size, "the minimap's Control is its frame's size: %s, %s" % [ui.minimap.size, map_rect])
@@ -2405,10 +2840,13 @@ func _hud(hud: Hud, player: Node) -> void:
 		"the shortcuts in Factorio's order: planners, the equipment toggles, copper, green, red wire: %s" % [order])
 	check(bar.button("red-wire").theme_type_variation == "FPageButton" and bar.button("green-wire").theme_type_variation == "FPageButton",
 		"the wire shortcuts are plain grey buttons, as Factorio's")
-	if ui.player != null and ui.player.get("_redo") is Array:
-		(ui.player.get("_redo") as Array).clear()
-		await get_tree().process_frame
-		check(bar.button("redo").disabled, "redo is greyed with nothing to redo")
+	# The fake player has PlayerInput's undo and redo stacks.
+	(ui.player.get("_redo") as Array).append({"t": "rotate"})
+	await get_tree().process_frame
+	var redo_lit: bool = not bar.button("redo").disabled
+	(ui.player.get("_redo") as Array).clear()
+	await get_tree().process_frame
+	check(redo_lit and bar.button("redo").disabled, "redo is greyed with nothing to redo, lit with something")
 	sent()
 
 	# --- the side menu's windows: bonuses, achievements, alerts settings, tips and tricks ---------
@@ -2426,6 +2864,8 @@ func _hud(hud: Hud, player: Node) -> void:
 		var first := str(ui.tips.tips()[0][0])
 		ui.tips.select(first)
 		check(ui.tips.find_child("Tip_" + first, true, false) != null and ui.tips.selected == first, "a tip is listed and can be selected")
+	else:
+		print("skip selecting a tip: no Factorio install (the tips come from it)")
 	ui.close_all()
 	check(not ui.tips.is_open(), "Esc / close_all closes the tips")
 	ui.chat.console.run("/permissions")
@@ -2468,6 +2908,7 @@ func _hud(hud: Hud, player: Node) -> void:
 	ui.minimap._on_area_input(wheel)
 	check(float(ui.minimap.settings.get_value("map/minimap_zoom")) > zoom_was, "Shift + wheel does")
 	ui.minimap.settings.set_value("map/minimap_zoom", zoom_was)
+	check(ui.minimap.find_children("*", "BaseButton", true, false).is_empty(), "the minimap has no zoom buttons, as Factorio's")
 
 	# --- the character's logistic sections and colour -----------------------------------------------
 	m.handle({"t": "clog", "on": 1, "trash": 0, "l": [["iron-plate", 100, -1]], "lgs": ["Main"],
@@ -2499,6 +2940,13 @@ func _hud(hud: Hud, player: Node) -> void:
 
 	# --- the quickbar's page chooser --------------------------------------------------------------
 	var qb = ui.quickbar
+	# As in Factorio, the page in use (keys 1-0) is the top row, the second page below it; their
+	# page buttons the same way round (it was the bottom row).
+	var top_row: Control = qb._slots[0].get_parent()
+	var second_row: Control = qb._second[0].get_parent()
+	check(top_row.get_index() == 0 and second_row.get_index() == 1 and qb._pages[1].get_index() == 0
+		and qb._pages[0].get_index() == 1 and top_row.get_global_rect().position.y < second_row.get_global_rect().position.y,
+		"the quickbar's page in use is its top row, as in Factorio: %s %s" % [top_row.get_global_rect(), second_row.get_global_rect()])
 	qb._pages[0].pressed.emit()
 	await get_tree().process_frame
 	check(qb.chooser_open() and qb._chooser_row == 0, "a page button opens the page chooser for its row")
@@ -2510,10 +2958,10 @@ func _hud(hud: Hud, player: Node) -> void:
 		"the chooser sits over the quickbar, on its left edge (or at the top when there's no room): %s %s" % [cr, fr])
 	qb.pick_page(7)
 	check(m.quickbar_upper_page() == 7 and not qb.chooser_open(), "picking a page shows it in that row and closes the chooser")
-	check(str(qb._pages[0].text) == "7", "the upper row's button says 7")
+	check(str(qb._pages[0].text) == "7", "the second row's button says 7")
 	qb.open_chooser(1, true)
 	qb.pick_page(4)
-	check(not m.server_quickbar or sent_one("qb_page").get("p") == 4, "the lower row asks the mod for its page")
+	check(not m.server_quickbar or sent_one("qb_page").get("p") == 4, "the top row (the page in use) asks the mod for its page")
 	m.quickbar_upper = 0
 	qb.refresh()
 	qb.open_chooser(1, true)
@@ -2560,6 +3008,11 @@ func _hud(hud: Hud, player: Node) -> void:
 	sent()
 
 
+## The information windows: the alert bar (`al`: buttons, counts, tooltips, clicking through the
+## entities, icons in the world), Factoriopedia (F2, Alt+click, the index's tabs and grid, pages,
+## links, history), item tooltips' stats, the logistic networks window (L), the statistics' tabs,
+## surfaces and graphs, rich text in the chat (icons, colours, gps links and pings) and the
+## technology screen's details (effects, trigger tasks, infinite levels).
 func _info(hud: Hud, player: Node) -> void:
 	var ui = hud.ui
 	var m = ui.model
@@ -2594,7 +3047,7 @@ func _info(hud: Hud, player: Node) -> void:
 	check(looked == [Vector2(10, 0), Vector2(20, 0), Vector2(10, 0)], "clicking an alert looks at its entities one after another: %s" % [looked])
 	check(ui.alerts._icons != null and ui.alerts._icons.shown.get("no_ammo") == 2 and ui.alerts._icons.shown.get("no_material") == 1,
 		"alert icons over the entities in the world: %s" % [ui.alerts._icons.shown if ui.alerts._icons != null else null])
-	# Icons only over entities the 3D world holds. The mod's lists are seconds old, so a
+	# Owner's G19: icons only over entities the 3D world holds. The mod's lists are seconds old, so a
 	# building mined since (or one on a surface the world doesn't show) left its icon on empty ground.
 	var fake_world := GDScript.new()
 	fake_world.source_code = "extends RefCounted\nvar entities := {}\n"
@@ -2646,7 +3099,7 @@ func _info(hud: Hud, player: Node) -> void:
 	pwld.free()
 	icons.world = null
 	icons.movers = null
-	# An alert on another surface opens that surface's map, centred on it.
+	# Owner's #18: an alert on another surface opens that surface's map, centred on it.
 	var si_was: int = m.character_si
 	m.character_si = 1
 	m.handle({"t": "al", "l": [["no_ammo", 1, [[40 * 256, 8 * 256, 3, "gun-turret", 21]]]]})
@@ -2765,7 +3218,7 @@ func _info(hud: Hud, player: Node) -> void:
 	await get_tree().process_frame
 	check(ui.remote and ui.remote_frame.visible and ui.remote_frame.networks_open and not ui.map_view.surfaces_panel.visible
 		and not (ui.remote_frame.title_bar.find_child("Search", true, false) as Control).visible,
-		"as in Factorio it opens in the remote view: the frame's title bar without search, its frames where the Surfaces panel was %s")
+		"as in Factorio it opens in the remote view: the frame's title bar without search, its frames where the Surfaces panel was")
 	ui.networks.open(true)
 	key(KEY_L)
 	await get_tree().process_frame
@@ -2886,7 +3339,7 @@ func _info(hud: Hud, player: Node) -> void:
 	check(pw.selected == "Admin" and _texts(pw._members) == ["Carol"], "clicking a group shows its players")
 	key(KEY_ESCAPE)
 	await get_tree().process_frame
-	check(not pw.is_open(), "Esc closes it")
+	check(not pw.is_open(), "Esc closes the permissions window")
 
 	# --- rich text and the chat ----------------------------------------------------------------------
 	check(RichText.plain("[item=iron-plate] for [color=1,0,0]Alice[/color] at [gps=10,-5]") == "[Iron plate] for Alice at [10, -5]",
@@ -2963,6 +3416,281 @@ func _find_slot_item(node: Node, item: String) -> Control:
 		if found != null:
 			return found
 	return null
+
+
+## Mods' windows (mgui, mod_gui.gd): built from the tree, placed, a click says to use Factorio,
+## gone when the bridge no longer lists them.
+func _mod_windows(hud: Hud) -> void:
+	var mg = hud.ui.mod_gui
+	# Off by default (owner: not usable yet): a mod's window isn't drawn.
+	Settings.reset_value("interface", "mod_windows")
+	mg.handle({"t": "mgui", "ids": [3], "l": [{"i": 3, "r": "screen", "at": [10, 10], "e": {"t": "frame", "a": [{"t": "label", "c": "Off"}]}}]})
+	check(mg.count() == 0, "mod windows: off by default, a mod's window isn't drawn")
+	Settings.set_value("interface", "mod_windows", true)
+	var said := []
+	var keep: Callable = mg.message
+	mg.message = func(t: String) -> void: said.append(t)
+	mg.handle({"t": "mgui", "ids": [5, 6], "l": [
+		{"i": 5, "r": "screen", "at": [100, 50], "e": {"t": "frame", "c": ["", "Mod ", "info"], "d": "vertical", "a": [
+			{"t": "label", "c": "Hello from a mod"},
+			{"t": "table", "cc": 2, "a": [{"t": "sprite-button", "sp": "item/iron-plate", "nu": 3}, {"t": "button", "c": "Go"}]}]}},
+		{"i": 6, "r": "top", "e": {"t": "sprite-button", "sp": "informatron", "c": "I"}}]})
+	await get_tree().process_frame
+	check(mg.count() == 2, "mod windows: a screen window and a top button are built (%d)" % mg.count())
+	var window: Control = mg._windows[5]["node"]
+	var texts := _texts(window)
+	check(texts.has("Mod info") and texts.has("Hello from a mod") and texts.has("Go"),
+		"mod windows: the frame's localised caption, its label and button are drawn: %s" % [texts])
+	check(window.position.is_equal_approx(Vector2(100, 50) * Kit.scale_for(mg.get_viewport_rect().size.y)),
+		"mod windows: a screen window sits where the mod put it (%s)" % window.position)
+	var go: Button = window.find_children("*", "Button", true, false).filter(func(b): return b.text == "Go")[0]
+	go.pressed.emit()
+	check(said.size() == 1 and said[0].contains("Ctrl+F9"), "mod windows: pressing a mod's button says to use it in Factorio: %s" % [said])
+	# With Factorio's window size and UI scale (`ds`), a button maps to Factorio's pixels: the
+	# window where the mod put it at Factorio's scale, the button just inside its corner.
+	mg.handle({"t": "mgui", "ids": [5, 6], "l": [], "ds": [1920, 1080, 1.5]})
+	var zs := Kit.scale_for(mg.get_viewport_rect().size.y)
+	var r := go.get_global_rect()
+	var aim := r.position + Vector2(minf(r.size.x * 0.5, 10.0 * zs), minf(r.size.y * 0.5, 10.0 * zs))
+	var want := Vector2(100, 50) * 1.5 + (aim - window.global_position) * (1.5 / zs)
+	check(mg.factorio_point(go).is_equal_approx(want) and mg.display == [1920.0, 1080.0, 1.5],
+		"mod windows: a button's place in Factorio's window (%s, want %s)" % [mg.factorio_point(go), want])
+	var top_button: Control = mg._windows[6]["node"]
+	check(mg.factorio_point(top_button).x >= 0.0, "mod windows: a top button maps too")
+	Settings.set_value("interface", "mod_clicks", false)
+	go.pressed.emit()
+	Settings.reset_value("interface", "mod_clicks")
+	check(said.size() == 2 and mg.forwarded.is_empty(), "mod windows: with clicks in Factorio off, the button says to use Factorio")
+	# The click helper's answers (read every frame while clicks wait): a click done says nothing,
+	# one with no Factorio window to click (or an error) says to use Factorio.
+	mg.heard(PackedStringArray(["ok front=other minimised=False"]))
+	check(said.size() == 2, "mod windows: a click done in Factorio says nothing more")
+	mg.heard(PackedStringArray(["none"]))
+	check(said.size() == 3 and said[2].contains("Ctrl+F9"), "mod windows: a click with no Factorio window says to use Factorio")
+	check(preload("res://scripts/ui/factorio/factorio_clicks.gd").poll().is_empty(), "mod windows: no helper, nothing to read")
+	# Dragging its title bar moves it, and the move outlasts the bridge's next placement.
+	var bar: Control = window.find_children("*", "HBoxContainer", true, false).filter(func(b): return b.has_meta("drag_handle"))[0]
+	check(Kit.drag_target(bar) == window, "mod windows: the title bar drags its own window")
+	var before := window.position
+	Kit.move_window(window, Vector2(30, 20))
+	mg._place()
+	check(window.position.is_equal_approx(before + Vector2(30, 20)), "mod windows: a dragged window stays where it was dragged (%s -> %s)" % [before, window.position])
+	var cw: Control = hud.ui.window
+	var cw_bar: Control = cw.find_children("*", "HBoxContainer", true, false).filter(func(b): return b.has_meta("drag_handle"))[0]
+	check(Kit.drag_target(cw_bar) == cw._center, "windows: the character window's title drags the whole window")
+	var LocaleNames := preload("res://scripts/world/locale_names.gd")
+	check(LocaleNames._plurals("__plural_for_parameter__1__{1=day|rest=days}__", [1]) == "day"
+		and LocaleNames._plurals("__plural_for_parameter__1__{1=day|rest=days}__", [3]) == "days"
+		and LocaleNames.localise(["", "a", 2, "b"]) == "a2b", "locale: plural forms and joined strings")
+	# A button the bridge can press itself (ck: Informatron's, through its remote interface) goes to
+	# the bridge as `mpress`, never clicked in Factorio's window (owner: those clicks missed). A label
+	# Factorio wraps (ml) wraps at its maximal width (mw), rich text too, instead of running off the screen.
+	var long_text := "A long paragraph [item=iron-plate] that Factorio wraps at the label's width. " .repeat(6)
+	mg.handle({"t": "mgui", "ids": [6, 7], "l": [
+		{"i": 7, "r": "screen", "at": [100, 50], "e": {"t": "frame", "ix": 7, "d": "vertical", "a": [
+			{"t": "label", "ix": 71, "ml": true, "mw": 400, "c": long_text},
+			{"t": "button", "ix": 72, "c": "Page two", "ck": true}]}}]})
+	await get_tree().process_frame
+	var info: Control = mg._windows[7]["node"]
+	var page_b: Button = info.find_children("*", "Button", true, false).filter(func(b): return b.text == "Page two")[0]
+	var before_forwarded: int = mg.forwarded.size()
+	page_b.pressed.emit()
+	check(mg.pressed_by_bridge == [72] and mg.forwarded.size() == before_forwarded,
+		"mod windows: a ck button is sent to the bridge (mpress %s), not clicked in Factorio" % [mg.pressed_by_bridge])
+	var para: Control = info.find_children("*", "RichTextLabel", true, false)[0] if not info.find_children("*", "RichTextLabel", true, false).is_empty() else null
+	var zs7 := Kit.scale_for(mg.get_viewport_rect().size.y)
+	check(para != null and (para as RichTextLabel).autowrap_mode != TextServer.AUTOWRAP_OFF and info.size.x < 600.0 * zs7,
+		"mod windows: a long rich text label wraps at its width (window %.0f px wide)" % info.size.x)
+	# Informatron rebuilds its window on every page: the new one (another index, the same name) keeps
+	# the old one's place until Factorio places it, instead of jumping to the top left (owner).
+	var view7 := mg.get_viewport_rect().size
+	mg.handle({"t": "mgui", "ids": [6, 7], "l": [{"i": 7, "r": "screen", "at": [300, 200], "e": {"t": "frame", "n": "informatron", "a": [{"t": "label", "c": "Page one"}]}}]})
+	await get_tree().process_frame
+	var held_at: Vector2 = mg._windows[7]["node"].position
+	mg.handle({"t": "mgui", "ids": [6, 8], "l": [{"i": 8, "r": "screen", "at": [0, 0], "e": {"t": "frame", "n": "informatron", "a": [{"t": "label", "c": "Page two"}]}}]})
+	await get_tree().process_frame
+	check(mg._windows.has(8) and mg._windows[8]["node"].position.is_equal_approx(held_at),
+		"mod windows: a rebuilt window of the same name keeps its place (%s, was %s)" % [mg._windows[8]["node"].position if mg._windows.has(8) else null, held_at])
+	mg.handle({"t": "mgui", "ids": [6, 8], "l": [{"i": 8, "r": "screen", "at": [300, 200], "e": {"t": "frame", "n": "informatron", "a": [{"t": "label", "c": "Page two"}]}}]})
+	await get_tree().process_frame
+	check(not mg._windows[8].has("hold"), "mod windows: once Factorio places it, the bridge's place is used again")
+	# A window at 0, 0 that wasn't one before (the mod centres it, Factorio hasn't yet) is drawn centred.
+	mg.handle({"t": "mgui", "ids": [6, 9], "l": [{"i": 9, "r": "screen", "at": [0, 0], "e": {"t": "frame", "n": "other", "a": [{"t": "label", "c": "Centred"}]}}]})
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var c9: Control = mg._windows[9]["node"]
+	check(c9.position.is_equal_approx(((view7 - c9.size) / 2.0).floor()), "mod windows: a window at 0, 0 is drawn centred (%s in %s)" % [c9.position, view7])
+	# Taller than Zenith's window: its content scrolls, the window stays on the screen.
+	var tall_rows: Array = []
+	for k in 80:
+		tall_rows.append({"t": "label", "c": "Row %d" % k})
+	mg.handle({"t": "mgui", "ids": [6, 10], "l": [{"i": 10, "r": "screen", "at": [10, 10], "e": {"t": "frame", "n": "tall", "a": tall_rows}}]})
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var tall: Control = mg._windows[10]["node"]
+	var tall_scroll: ScrollContainer = tall.find_children("*", "ScrollContainer", true, false)[0]
+	var tall_inner: Control = tall_scroll.get_child(0)
+	check(tall_scroll.custom_minimum_size.y <= maxf(view7.y - Kit.px(120), Kit.px(120)) + 0.5 and tall_inner.get_combined_minimum_size().y > tall_scroll.custom_minimum_size.y,
+		"mod windows: a window taller than the screen scrolls (%.0f of its %.0f px shown, screen %.0f)" % [tall_scroll.custom_minimum_size.y, tall_inner.get_combined_minimum_size().y, view7.y])
+	# Factorio lays a window out by its styles (owner: Informatron's came out a thin strip): a fixed
+	# height (sz) makes the window that tall, a stretched scroll pane (vs) fills it.
+	mg.handle({"t": "mgui", "ids": [6, 12], "l": [{"i": 12, "r": "screen", "at": [10, 10], "e": {"t": "frame", "n": "styled", "sz": [0, 0, 40, 40], "a": [
+		{"t": "scroll-pane", "vs": true, "a": [{"t": "label", "c": "Inside"}]}]}}]})
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var styled: Control = mg._windows[12]["node"]
+	var want_h := minf(Kit.px(40), view7.y - Kit.px(80))
+	var pane: ScrollContainer = styled.find_children("*", "ScrollContainer", true, false).filter(func(c): return c.name == "scroll-pane")[0]
+	check(styled.custom_minimum_size.y >= want_h - 0.5 and pane.size_flags_vertical == Control.SIZE_EXPAND_FILL,
+		"mod windows: a style's fixed height sizes the window (%.0f, want %.0f) and a stretched pane fills it" % [styled.custom_minimum_size.y, want_h])
+	# Space Exploration's watermark: a frame clicks go through, the size of the screen: no panel, faint,
+	# its text in the bottom-right corner, the mouse never stopped by it.
+	mg.handle({"t": "mgui", "ids": [6, 11], "l": [{"i": 11, "r": "screen", "at": [0, 0], "e": {"t": "frame", "n": "se_watermark_string_frame", "ig": true, "fs": true, "d": "horizontal",
+		"a": [{"t": "label", "n": "se_watermark_string_label", "c": "SE 0.7.64 T602"}]}}]})
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var wm: Control = mg._windows[11]["node"]
+	var wm_label: Control = wm.find_children("*", "Label", true, false)[0]
+	check(wm.find_children("*", "PanelContainer", true, false).is_empty() and wm.mouse_filter == Control.MOUSE_FILTER_IGNORE
+		and wm_label.mouse_filter == Control.MOUSE_FILTER_IGNORE and wm.size.is_equal_approx(view7)
+		and absf(wm_label.get_global_rect().end.x - wm.get_global_rect().end.x) < 4.0 and absf(wm_label.get_global_rect().end.y - wm.get_global_rect().end.y) < 4.0,
+		"mod windows: a full-screen frame clicks go through is drawn as a watermark in the bottom-right corner (%s)" % wm_label.get_global_rect())
+	mg.handle({"t": "mgui", "ids": [6], "l": []})
+	await get_tree().process_frame
+	check(mg.count() == 1 and not mg._windows.has(5), "mod windows: a window the bridge no longer lists goes")
+	mg.handle({"t": "mgui", "ids": [], "l": []})
+	Settings.reset_value("interface", "mod_windows")
+	mg.message = keep
+
+
+## Windows held to Zenith's height (owner: a modded storehouse ran off the bottom) and the
+## top-left Factorio button (Ctrl+F9's swap, owner).
+func _window_bounds(hud: Hud) -> void:
+	var screen: MachineScreen = hud.ui.screen
+	var tall := Control.new()
+	tall.custom_minimum_size = Vector2(Kit.px(400), 5000)
+	screen._columns.add_child(tall)
+	screen._fit_to_window()
+	var cap := maxf(Kit.px(200), screen.get_viewport_rect().size.y - Kit.px(MachineScreen.WINDOW_ROOM))
+	check(screen._fit.custom_minimum_size.y <= cap + 0.5 and screen._fit.get_child(0) == screen._columns,
+		"windows: a machine screen taller than Zenith's window is held to it and scrolls (%.0f of %.0f, room %.0f)" % [screen._fit.custom_minimum_size.y, 5000.0, cap])
+	tall.queue_free()
+	await get_tree().process_frame
+	screen._fit_to_window()
+	var button: Button = hud.ui.factorio_button
+	var keep: Callable = hud.ui.show_factorio
+	hud.ui.show_factorio = Callable()
+	await get_tree().process_frame
+	check(button != null and not button.visible, "the Factorio button is hidden outside a game")
+	var pressed := [0]
+	hud.ui.show_factorio = func() -> void: pressed[0] += 1
+	await get_tree().process_frame
+	button.pressed.emit()
+	check(button.visible and pressed[0] == 1 and button.position.is_equal_approx(Kit.pxv(8, 8)),
+		"the Factorio button sits at the top left in a game and does what Ctrl+F9 does")
+	hud.ui.show_factorio = keep
+
+
+## The latency layer (FFF #83): what is built shows at once, before the game confirms it, and
+## goes when the game's entity is drawn or the game has moved on without it.
+func _predictions(hud: Hud) -> void:
+	var m: UiModel = hud.ui.model
+	var world := WorldMirror.new()
+	world.protos.add_entities([
+		[1, "wooden-chest", "container", -0.35, -0.35, 0.35, 0.35, 120, 90, 60, 1, 1],
+		[2, "stone-furnace", "furnace", -0.9, -0.9, 0.9, 0.9, 120, 120, 120, 2, 2],
+		[3, "underground-belt", "underground-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
+		[4, "inserter", "inserter", -0.15, -0.15, 0.15, 0.15, 200, 180, 0, 1, 1],
+		[5, "splitter", "splitter", -0.9, -0.4, 0.9, 0.4, 200, 180, 0, 2, 1],
+	])
+	world.protos.item_places = {"wooden-chest": "wooden-chest", "stone-furnace": "stone-furnace", "underground-belt": "underground-belt"}
+	world.chunks[Vector2i.ZERO] = ChunkView.new()
+	var pred := Predicted.new()
+	pred.world = world
+	add_child(pred)
+	var input := PlayerInput.new()
+	input.world = world
+	input.hud = hud
+	input.predicted = pred
+	input.drag.pi = input
+	var had: Array = m.main_slots
+	var had_slots := m.has_slots
+	var had_counts: Dictionary = m.counts.duplicate()
+	m.handle({"t": "slots", "l": {"main": [["wooden-chest", 2], ["stone-furnace", 5], ["underground-belt", 4]]}})
+	var chest: ProtoDB.EntityProto = world.protos.entity(1)
+	var tick0 := Bridge.server_tick
+	# Clicked off the tile's centre: the mod snaps the point to the grid, and so does the prediction
+	# (drawn at the click it stood up to half a tile off the game's and never matched it).
+	input.drag.begin("wooden-chest", chest, Vector2(3.83, 3.21), false)
+	input.drag.end()
+	check(pred.count() == 1 and pred.get_child_count() == 1, "a chest built shows at once, before the game answers")
+	check(pred.count() == 1 and pred._pending[0].pos == Vector2(3.5, 3.5), "a click off the tile's centre is shown on the tile, where the mod builds it")
+	input.drag.begin("wooden-chest", chest, Vector2(5.5, 3.5), false)
+	input.drag.end()
+	input.drag.begin("wooden-chest", chest, Vector2(7.5, 3.5), false)
+	input.drag.end()
+	check(pred.count() == 2, "no more shown than the inventory holds (2 chests: the third may be refused)")
+	input.drag.begin("underground-belt", world.protos.entity(3), Vector2(3.5, 8.5), false)
+	input.drag.end()
+	check(pred.count() == 2, "an underground isn't shown: the mod decides entrance or exit")
+	world._add([70, 2, 10 * 256, 10 * 256, 0])  # a furnace already standing there
+	input.drag.begin("stone-furnace", world.protos.entity(2), Vector2(10, 10), false)
+	input.drag.end()
+	check(pred.count() == 2, "nothing is shown over what is already there")
+	# The game's chest arrives: kept until its chunk has drawn it, then the prediction goes.
+	world._add([71, 1, 3 * 256 + 128, 3 * 256 + 128, 0])
+	pred._on_entities_changed(Vector2i.ZERO)
+	check(pred.pending_of(chest) == 1, "the game's chest confirms the prediction at its place")
+	pred._process(0.0)
+	check(pred.count() == 2, "while the chunk isn't drawn yet the prediction stays, so nothing blinks")
+	var cv: ChunkView = world.chunks[Vector2i.ZERO]
+	cv.loaded = true
+	world._dirty.erase(Vector2i.ZERO)
+	pred._process(0.0)
+	check(pred.count() == 1 and pred.waits.size() == 1, "once drawn the prediction goes and its wait is recorded")
+	# The other chest never comes back: the game moved on without it, so it was refused.
+	Bridge.server_tick = tick0 + Predicted.REFUSED_TICKS
+	pred._pending[0].msec -= Predicted.REFUSED_MSEC
+	pred._process(0.0)
+	check(pred.count() == 0 and pred.refused == 1, "a build the game moved on without (refused) disappears")
+	Bridge.server_tick = tick0
+	# R: an inserter turns at once in the world mirror, twice turns twice, and goes back if the game
+	# moves on without turning it.
+	world._add([80, 4, 12 * 256 + 128, 12 * 256 + 128, 0])
+	var ins: WorldMirror.Rec = world.entities[80]
+	world._dirty.erase(Vector2i.ZERO)
+	check(pred.turn(ins, false) and ins.dir == 4 and world._dirty.has(Vector2i.ZERO), "R turns an inserter at once and redraws its chunk")
+	pred.turn(ins, false)
+	check(ins.dir == 8, "a second R before the game answers turns it on from there")
+	Bridge.server_tick = tick0 + Predicted.REFUSED_TICKS
+	pred._turns[80].msec -= Predicted.REFUSED_MSEC
+	pred._process(0.0)
+	check(ins.dir == 0 and pred._turns.is_empty(), "turned back to where it was when the game didn't turn it")
+	Bridge.server_tick = tick0
+	pred.turn(ins, true)
+	world._add([80, 4, 12 * 256 + 128, 12 * 256 + 128, 12])  # the game's `upd`
+	Bridge.server_tick = tick0 + Predicted.REFUSED_TICKS * 2
+	pred._process(0.0)
+	check((world.entities[80] as WorldMirror.Rec).dir == 12 and pred._turns.is_empty(), "the game's own record replaces the turn; nothing is turned back")
+	check(not pred.turn(world.entities[70], false), "a furnace isn't turned ahead (Factorio may refuse)")
+	# As 2.1.23 turns them: longer one way, half way round; an underground, half way round as its other end.
+	world._add([81, 5, 15 * 256, 12 * 256 + 128, 0])
+	var spl: WorldMirror.Rec = world.entities[81]
+	pred.turn(spl, false)
+	var after_r := spl.dir
+	pred.turn(spl, true)
+	check(after_r == 8 and spl.dir == 0, "a splitter flips half way round on R and on Shift+R, as Factorio turns it")
+	world._add([82, 3, 18 * 256 + 128, 12 * 256 + 128, 4, {"u": "i"}])
+	var ug: WorldMirror.Rec = world.entities[82]
+	pred.turn(ug, false)
+	check(ug.dir == 12 and str(ug.extra.get("u")) == "o", "an underground entrance turns into an exit facing back")
+	Bridge.server_tick = tick0
+	sent()
+	m.main_slots = had
+	m.counts = had_counts
+	m.has_slots = had_slots
+	input.free()
+	pred.queue_free()
 
 
 ## Factorio's marks in the world: the build cursor's model ghost (its model, end and way, red where
@@ -3100,6 +3828,48 @@ func _world_marks(hud: Hud) -> void:
 	cw._remove(6)
 	check(ghost_cells.call(-6.0, -2.0)[0] == ["cargo-bay-corner-nw"], "cargo bays: a ghost taken away opens its neighbour ghost's side")
 	cw.free()
+	# Records leaving with their chunk (unloaded, or resent without them) leave the tables kept
+	# beside `entities`, so nothing seen once stays there for good. A bay's area stays while its
+	# chunk is away (the bay next door keeps its frame) and goes when the chunk comes back without it.
+	var lw := WorldMirror.new()
+	add_child(lw)
+	lw.protos.add_entities([[1, "cargo-bay", "cargo-bay", -2, -2, 2, 2, 120, 120, 120, 4, 4],
+		[2, "stone-furnace-remnants", "corpse", -1, -1, 1, 1, 120, 120, 120, 2, 2],
+		[3, "pipe", "pipe", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1],
+		[4, "entity-ghost", "entity-ghost", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1]])
+	var new_chunk := func(c: Vector2i) -> void:
+		var lcv := ChunkView.new()
+		lcv.coord = c
+		lw.chunks[c] = lcv
+		lw.add_child(lcv)
+	new_chunk.call(Vector2i(0, 0))
+	new_chunk.call(Vector2i(1, 0))
+	lw._add([11, 1, 30 * 256, 16 * 256, 0])  # a bay in chunk (0, 0)...
+	lw._add([12, 1, 34 * 256, 16 * 256, 0])  # ...and one beside it in chunk (1, 0)
+	lw._add([0, 2, 40 * 256 + 128, 5 * 256 + 128, 0])  # remnants
+	lw._add([0, 3, 41 * 256 + 128, 8 * 256 + 128, 0])  # a pipe
+	lw._add([13, 4, 42 * 256 + 128, 9 * 256 + 128, 0, {"gh": 3}])  # a pipe's ghost
+	lw._add([0, 2, 10 * 256 + 128, 5 * 256 + 128, 0])  # remnants in chunk (0, 0)
+	var joined := int(lw.entities[11].extra.get("cb", -1))
+	lw._unload(Vector2i(1, 0))
+	for f in 10:
+		lw._free_unloaded()
+	check(lw._remnants.size() == 1 and lw._pipes.is_empty() and lw._ghosts.is_empty() and lw.entities.size() == 2
+		and lw._cargo.has(12) and lw._cargo_left.get(12) == Vector2i(1, 0) and int(lw.entities[11].extra.get("cb", -1)) == joined,
+		"an unloaded chunk's records leave the remnants, pipes and ghosts; its bay's area stays, the bay next door framed as before")
+	new_chunk.call(Vector2i(1, 0))
+	lw.handle({"t": "chunk", "cx": 1, "cy": 0, "tiles": [], "parts": 0})  # back, the bay mined meanwhile
+	var lone_cells: Array = [0, 1, 2, 3].map(func(k): return ModelLibrary.cargo_pieces((int(lw.entities[11].extra.get("cb", -1)) >> (8 * k)) & 255))
+	check(not lw._cargo.has(12) and lw._cargo_left.is_empty()
+		and lone_cells == [["cargo-bay-corner-nw"], ["cargo-bay-corner-ne"], ["cargo-bay-corner-sw"], ["cargo-bay-corner-se"]],
+		"the chunk back without its bay: the bay next door is framed alone: %s" % [lone_cells])
+	lw.handle({"t": "chunk", "cx": 0, "cy": 0, "tiles": [], "parts": 1})
+	lw.handle({"t": "ents", "cx": 0, "cy": 0, "part": 1, "parts": 1, "e": [[11, 1, 30 * 256, 16 * 256, 0]]})
+	check(lw._remnants.is_empty() and lw._cargo.has(11), "a chunk resent without its remnants forgets them")
+	lw._add([0, 2, 10 * 256 + 128, 5 * 256 + 128, 0])
+	lw.reset(true)
+	check(lw._remnants.is_empty() and lw._cargo.is_empty() and lw._cargo_left.is_empty(), "a reset forgets remnants too")
+	lw.queue_free()
 	# Inserter platforms: Factorio's four renders sit a little differently, a model for each.
 	var platforms_ok := true
 	for ins in ["burner-inserter", "inserter", "long-handed-inserter", "fast-inserter", "bulk-inserter", "stack-inserter"]:
@@ -3112,21 +3882,27 @@ func _world_marks(hud: Hud) -> void:
 	# The pumpjack and the chemical plant too: every direction its own model, unturned, with the
 	# pumpjack's beam rocking on its upright frame and the plant's light blinking in each.
 	var facing_ok := true
-	# FUE5's models (assets/models/fue5/) have no upright beam or lamp: only their facings are checked.
-	var jack_ours := not ModelLibrary._source("pumpjack").contains("/assets/models/fue5/")
-	var plant_ours := not ModelLibrary._source("chemical-plant").contains("/assets/models/fue5/")
+	# FUE5's models (assets/models/fue5/) replace them in play with no upright beam or lamp: ours are
+	# checked.
+	var facing_models: Array[String] = []
+	for base in ["pumpjack", "chemical-plant"]:
+		for side in ["", "-east", "-south", "-west"]:
+			if _theirs_in_use(base + side):
+				facing_models.append(base + side)
+	_ours(facing_models)
 	for dir in [0, 4, 8, 12]:
 		var jack := {}
 		for part: ModelLibrary.AnimPart in ModelLibrary.parts_for_entity("pumpjack", "mining-drill", {}, dir):
 			jack[part.kind] = part.upright
 		var plant := ModelLibrary.mesh_for_entity("chemical-plant", "assembling-machine", {}, dir)
-		facing_ok = facing_ok and (not jack_ours or (jack.get("rock_beam", false) and jack.get("spin_crank", false) and jack.has("still"))) \
-			and (not plant_ours or ModelLibrary.glows(plant)) and ModelLibrary.turn_dir("mining-drill", dir, {}, "pumpjack") == 0 \
+		facing_ok = facing_ok and jack.get("rock_beam", false) and jack.get("spin_crank", false) and jack.has("still") \
+			and ModelLibrary.glows(plant) and ModelLibrary.turn_dir("mining-drill", dir, {}, "pumpjack") == 0 \
 			and ModelLibrary.turn_dir("assembling-machine", dir, {}, "chemical-plant") == 0
 	check(facing_ok and ModelLibrary.model_name("pumpjack", "mining-drill", {}, 8) == "pumpjack-south"
 		and ModelLibrary.model_name("chemical-plant", "assembling-machine", {}, 4) == "chemical-plant-east"
 		and ModelLibrary.mesh_for_entity("chemical-plant", "assembling-machine", {}, 12) != ModelLibrary.mesh_for("chemical-plant"),
 		"the pumpjack and chemical plant: a model per direction, unturned, beam, crank and light moving in each")
+	_restore_models(facing_models)
 	world._add([51, 6, 20 * 256, 20 * 256 + 128, 0])
 	check(input._blocked(belt, Vector2(20.5, 20.5), Vector2i.ONE), "something in the way blocks the build (the ghost turns red)")
 
@@ -3316,7 +4092,7 @@ func _world_marks(hud: Hud) -> void:
 	check(fog_chunks[Vector2i(10, 10)].visible and fog_chunks[Vector2i(14, 10)].visible
 		and not fog_chunks[Vector2i(20, 20)].visible and not world.chunks[Vector2i.ZERO].visible and fog.hidden_chunks() == 2,
 		"remote view: chunks wholly under the fog aren't drawn; a seen one and its neighbour (under the soft edge) are")
-	# Wires starting in a chunk no radar sees are hidden under the fog too.
+	# G18: wires starting in a chunk no radar sees are hidden under the fog too.
 	var fog_wires := WireLayerScript.new()
 	fog_wires.fog = fog
 	var seen_wire := MeshInstance3D.new()
@@ -3329,7 +4105,7 @@ func _world_marks(hud: Hud) -> void:
 	var wires_fogged := seen_wire.visible and not unseen_wire.visible
 	fog.update(false, Vector2(50, 50))
 	fog_wires._apply_fog()
-	check(wires_fogged and unseen_wire.visible, "remote view: wires where no radar sees are hidden, and back on leaving it")
+	check(wires_fogged and unseen_wire.visible, "remote view: wires where no radar sees are hidden, and back on leaving it (G18)")
 	fog_wires.free()
 	fog.update(true, Vector2(50, 50))
 	# H13: a roboport's construction area counts as seen too (the UI model's list from `mrp`): one at
@@ -3422,6 +4198,24 @@ func _build_tools(hud: Hud) -> void:
 	var train_mine := sent_one("mine")
 	input._rmb_down = false
 	input._update_mining(0.1)
+	# Issue #13: Q over a train or wagon picks its item, turned the way it faces (a ghost cursor
+	# when there are none); a blueprint's rolling stock faces by its orientation.
+	world.protos.item_places["test-locomotive-item"] = "test-locomotive"
+	input.hovered_mover = [900, 9901, Vector2i(60 * 256, 60 * 256), Vector2(60, 60), Vector2(1, 3), Visuals.orientation_yaw(0.25)]
+	input._pipette_or_clear()
+	var piped_item := input.cursor_item
+	var piped_dir := input.build_dir
+	hud.ui.clear_cursor()
+	input.hold("")
+	input.build_dir = 0
+	world.protos.item_places.erase("test-locomotive-item")
+	check(piped_item == "test-locomotive-item" and piped_dir == 4,
+		"#13: Q over a locomotive picks its item, facing its way (east): %s %d" % [piped_item, piped_dir])
+	check(PlayerInput.yaw_direction(Visuals.orientation_yaw(0.5)) == 8 and PlayerInput.yaw_direction(Visuals.orientation_yaw(0.875)) == 14
+		and PLANNER_UI.entity_direction({"name": "cargo-wagon", "orientation": 0.25}) == 4
+		and PLANNER_UI.entity_direction({"name": "cargo-wagon", "orientation": 0.5}) == 8
+		and PLANNER_UI.entity_direction({"name": "inserter", "direction": 12}) == 12,
+		"#13: movers' yaw and blueprint rolling stock's orientation give 16-way directions")
 	input.hovered_mover = []
 	input.movers = null
 	mine_movers.queue_free()
@@ -3430,8 +4224,44 @@ func _build_tools(hud: Hud) -> void:
 	check(PlayerInput.MINEABLE_MOVERS.has("fluid-wagon") and PlayerInput.MINEABLE_MOVERS.has("cargo-wagon")
 		and PlayerInput.MINEABLE_MOVERS.has("artillery-wagon") and PlayerInput.MINEABLE_MOVERS.has("car")
 		and PlayerInput.MINEABLE_MOVERS.has("spider-vehicle"), "#10: every vehicle and wagon can be mined")
+	# Issue #2: the rocket item is named like the rocket projectile, which it doesn't build. Q over
+	# a turret's rockets with none in the inventory held a "rocket" to build, so clicks tried to
+	# build it and the turret couldn't be opened. Neither the mod's "" nor an old mod's plain
+	# record makes it buildable; Q then says there are none and leaves the cursor empty.
+	world.protos.add_entities([[9902, "rocket", "projectile", -0.1, -0.1, 0.1, 0.1, 0, 0, 0, 1, 1]])
+	world.protos.add_items([[9903, "rocket"]])
+	var old_mod := world.protos.placed_entity("rocket")
+	world.protos.add_items([[9903, "rocket", ""]])
+	check(old_mod == null and world.protos.placed_entity("rocket") == null and world.protos.placed_entity("wooden-chest") != null,
+		"#2: the rocket item builds nothing (not its projectile)")
+	var hud_player = hud.ui.player
+	hud.ui.player = input
+	var slot := Hud.FactorioUi.Slot.new()
+	slot.filter_item = "rocket"
+	var piped: bool = hud.ui.pipette_slot(slot)
+	check(piped and input.cursor_item == "",
+		"#2: Q over a turret's rocket slot with no rockets holds nothing to build: %s '%s'" % [piped, input.cursor_item])
+	slot.free()
+	hud.ui.player = hud_player
+	input.hold("")
+	# Issue #12: held rolling stock is previewed where the mod builds it, on the nearest straight
+	# rail (green there), not blocked by that rail; off the rails it is red with the reason.
+	world._add([9911, 7, 11 * 256, 11 * 256, 0, {}])
+	world._add([9912, 7, 21 * 256, 11 * 256, 4, {}])
+	var on_ns := input.rolling_stock_spot(Vector2(12.2, 10.4), 8)
+	var on_ew := input.rolling_stock_spot(Vector2(20.0, 12.5), 0)
+	var off_rail := input.rolling_stock_spot(Vector2(16.0, 20.0), 0)
+	check(on_ns.size() == 2 and on_ns[0] == Vector2(11, 11) and int(on_ns[1]) == 8
+		and on_ew.size() == 2 and on_ew[0] == Vector2(21, 11) and int(on_ew[1]) == 4 and off_rail.is_empty(),
+		"#12: rolling stock goes on the nearest rail, facing along it: %s %s %s" % [on_ns, on_ew, off_rail])
+	var loco_proto: ProtoDB.EntityProto = world.protos.entity(9901)
+	check(input._blocked(loco_proto, Vector2(11, 11), Vector2i(2, 6)) and PlayerInput.ROLLING_STOCK.has("locomotive")
+		and PlayerInput.ROLLING_STOCK.has("fluid-wagon"),
+		"#12: the rail is what _blocked sees under a train, so rolling stock skips that check (red over rails before)")
+	world._remove(9911)
+	world._remove(9912)
 	sent()
-	# From the remote view an open asks the mod for remote use (rv); from the character's view not.
+	# D10: from the remote view an open asks the mod for remote use (rv); from the character's view not.
 	hud.ui.remote = true
 	input._request_open(77, {"t": "open", "u": 77, "p": 1, "x": 0, "y": 0})
 	await get_tree().process_frame
@@ -3440,7 +4270,7 @@ func _build_tools(hud: Hud) -> void:
 	input._request_open(77, {"t": "open", "u": 77, "p": 1, "x": 0, "y": 0})
 	await get_tree().process_frame
 	var near_open := sent_one("open")
-	check(remote_open.get("rv") == 1 and not near_open.has("rv"), "opening from the remote view asks for remote use (rv): %s %s" % [remote_open, near_open])
+	check(remote_open.get("rv") == 1 and not near_open.has("rv"), "opening from the remote view asks for remote use (rv, D10): %s %s" % [remote_open, near_open])
 	hud.screen.close_local()
 	sent()
 	# F6: a module held and clicked on a building (or ghost) asks the mod for it (modreq), from the
@@ -3481,7 +4311,7 @@ func _build_tools(hud: Hud) -> void:
 	var picked: WorldMirror.Rec = world.pick(Vector2(7.7, 6.4))
 	check(picked != null and picked.unit == 95 and world.pick(Vector2(8.2, 7.0)) == null, "a ghost is picked by its entity's box (F6)")
 	world._remove(95)
-	# Hovering a beacon asks the mod about it (hinfo); the entity info then lists its modules,
+	# G12: hovering a beacon asks the mod about it (hinfo); the entity info then lists its modules,
 	# effectivity, the machines it reaches and what it hands on; a machine its beacons and effects.
 	world.protos.add_entities([[10, "beacon", "beacon", -1.5, -1.5, 1.5, 1.5, 130, 120, 130, 3, 3],
 		[11, "assembling-machine-2", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 110, 140, 170, 3, 3]])
@@ -3503,7 +4333,7 @@ func _build_tools(hud: Hud) -> void:
 	check(int(hask.get("u", 0)) == 96 and int(hask.get("x", 0)) == 2560 and btext.contains("Modules:") and btext.contains("x2")
 		and btext.contains("Distribution effectivity: 150%") and btext.contains("Machines affected: 3")
 		and btext.contains("Module effects:") and btext.contains("Speed: +150%") and btext.contains("Consumption: +210%") and btext.contains("Quality: -2.5%"),
-		"hovering a beacon asks hinfo and shows what it hands on: %s %s" % [hask, btext])
+		"hovering a beacon asks hinfo and shows what it hands on (G12): %s %s" % [hask, btext])
 	einfo.show_entity(brec)
 	check(sent_one("hinfo").is_empty(), "the same beacon isn't asked about again within a second")
 	var arec := WorldMirror.Rec.new()
@@ -3519,7 +4349,7 @@ func _build_tools(hud: Hud) -> void:
 	einfo.show_entity(arec)
 	var atext := "|".join(PackedStringArray(_texts(einfo._lines))).replace(":| ", ": ")
 	check(int(aask.get("u", 0)) == 97 and atext.contains("Beacons: 2") and atext.contains("Speed: +300%") and not atext.contains("Machines affected"),
-		"hovering a machine shows the beacons reaching it and its effects: %s" % atext)
+		"hovering a machine shows the beacons reaching it and its effects (G12): %s" % atext)
 	# H20: an electric machine's "Consumes electricity": Max. and Min. consumption from the mod's
 	# hinfo (with its modules) and the Electricity bar from its buffer, at the panel's foot.
 	m.pedia_pages["entity/assembling-machine-2"] = {"found": true, "d": {"etype": "electric", "energy": 150000.0, "drain": 5000.0, "hp": 350}}
@@ -3537,7 +4367,7 @@ func _build_tools(hud: Hud) -> void:
 	m.pedia_pages.erase("entity/assembling-machine-2")
 	einfo.show_entity(null)
 	einfo.player = einfo_player
-	# W walks the way the camera looks, at any angle (`a`, thousandths of a turn), with the
+	# B7: W walks the way the camera looks, at any angle (`a`, thousandths of a turn), with the
 	# nearest of Factorio's 8 directions as `d` for mods without `a`; letting go stops.
 	var walk_rig := CameraRig.new()
 	add_child(walk_rig)
@@ -3557,7 +4387,37 @@ func _build_tools(hud: Hud) -> void:
 	var want_turn := posmod(roundi(atan2(fwd.x, -fwd.z) / TAU * 1000.0), 1000)
 	check(int(walk_go.get("a", -1)) == want_turn and want_turn % 125 != 0 and int(walk_go.get("d", -1)) == posmod(roundi(want_turn / 125.0), 8) * 2
 		and int(walk_stop.get("d", 0)) == -1 and not walk_stop.has("a"),
-		"WASD walks at the camera's angle (a) and stops on release: %s %s, want %d" % [walk_go, walk_stop, want_turn])
+		"WASD walks at the camera's angle (a) and stops on release (B7): %s %s, want %d" % [walk_go, walk_stop, want_turn])
+	# The stick walks only for a pad Godot maps as a gamepad, once it was seen centred: the owner's
+	# Thrustmaster sim pedals (unknown to Godot, axes resting at -1) walked the bridge's character
+	# off for as long as the client ran, with no key pressed.
+	var centred := {}
+	var pedals := [{"id": 0, "known": false, "v": Vector2(-1, 1)}]
+	var pad_rest := [{"id": 1, "known": true, "v": Vector2(0.03, -0.02)}]
+	var pad_push := [{"id": 1, "known": true, "v": Vector2(0.9, 0.1)}]
+	var stick_seen := [PlayerInput.stick_of(pedals, centred), PlayerInput.stick_of(pad_push, centred),
+		PlayerInput.stick_of(pad_rest, centred), PlayerInput.stick_of(pad_push, centred),
+		PlayerInput.stick_of(pedals, centred), PlayerInput.stick_of(pad_push, centred)]
+	check(stick_seen == [Vector2.ZERO, Vector2.ZERO, Vector2.ZERO, Vector2(0.9, 0.1), Vector2.ZERO, Vector2.ZERO],
+		"the stick walks only on a mapped gamepad once seen centred, never an unknown device's axes (sim pedals at -1), and starts unseen once unplugged: %s" % [stick_seen])
+	input.joypads_for_test = pedals
+	sent()
+	for i in 20:
+		input._update_walk(0.05)
+	await get_tree().process_frame
+	var pedal_walk := sent_one("walk")
+	input.joypads_for_test = pad_rest
+	input._update_walk(0.05)
+	input.joypads_for_test = pad_push
+	input._update_walk(0.05)
+	input.joypads_for_test = pad_rest
+	input._update_walk(0.05)
+	await get_tree().process_frame
+	var pad_walks := sent().filter(func(m): return m.get("t", "") == "walk")
+	check(pedal_walk.is_empty() and pad_walks.size() == 2 and int(pad_walks[0].get("d", -1)) >= 0 and pad_walks[0].has("a")
+		and int(pad_walks[1].get("d", 0)) == -1,
+		"sim pedals plugged in send no walk with nothing pressed; a gamepad's stick walks and stops: %s %s" % [pedal_walk, pad_walks])
+	input.joypads_for_test = null
 	input.rig = null
 	walk_rig.queue_free()
 
@@ -3630,18 +4490,26 @@ func _build_tools(hud: Hud) -> void:
 	var ms := (Time.get_ticks_usec() - t0) / 1000.0
 	check(not far.is_empty() and ms < 100.0, "a long winding path is found quickly (%.1f ms, %d pieces)" % [ms, far.size()])
 	input.cursor_item = "rail"
-	# Factorio's green arrows mark the free rail ends near the cursor before anchoring.
+	# D2: Factorio's green arrows mark the free rail ends near the cursor before anchoring.
 	input.rail_planner.update("rail", true, Vector2(2, 1), false)
 	var free_arrows: Array = input.rail_planner.arrows.duplicate()
 	check(not free_arrows.is_empty() and free_arrows.all(func(e): return e[3] == "free")
 		and free_arrows.any(func(e): return e[0] == Vector2i(1, 0)) and input.rail_planner._arrows[0].visible,
-		"holding rails shows Factorio's arrows at the free rail ends near the cursor: %s" % [free_arrows])
+		"holding rails shows Factorio's arrows at the free rail ends near the cursor (D2): %s" % [free_arrows])
 	check(input.rail_planner.click("rail", Vector2(1.2, -0.4), false) and input.rail_planner.anchor["pos"] == Vector2i(1, 0),
 		"a click by a free rail end anchors the planner there")
 	input.rail_planner.update("rail", true, Vector2(1, -10), false)
 	check(input.rail_planner.arrows.size() == 1 and input.rail_planner.arrows[0][3] == "anchored",
 		"once anchored only the anchored end's arrow is drawn")
 	check(input.rail_planner.path.size() == 5 and input.rail_planner.rails_needed() == 5, "the path to the cursor is planned (5 rails)")
+	# Shift pressed or let go with the mouse still: the planned rails turn ghost blue and back at once.
+	var states_of := func() -> Array: return input.rail_planner.path.map(func(p): return str(p["state"]))
+	var paid_states: Array = states_of.call()
+	input.rail_planner.update("rail", true, Vector2(1, -10), true)
+	var shift_states: Array = states_of.call()
+	input.rail_planner.update("rail", true, Vector2(1, -10), false)
+	check(paid_states.has("ok") and shift_states.size() == 5 and shift_states.all(func(s): return s == "ghost") and states_of.call() == paid_states,
+		"the rail planner's path follows Shift with the mouse still: %s, %s, %s" % [paid_states, shift_states, states_of.call()])
 	input.rail_planner.click("rail", Vector2(1, -10), false)
 	await get_tree().process_frame
 	var rails := sent_one("rails")
@@ -3654,6 +4522,31 @@ func _build_tools(hud: Hud) -> void:
 		"toggle rail layer: a ramp up, elevated rails, their supports listed first: %s" % [names])
 	input.rail_planner.clear()
 	check(not input.rail_planner.click("rail", Vector2(20, 20), false), "away from a rail end a click builds a plain straight rail")
+	# Issue #15: a line forks off an existing one. Two straight rails meet at (25, 26): no free end
+	# there, but a click on the line anchors at that joint, and the path leaves it whichever way
+	# along the line faces the cursor, turning off it.
+	world._add([61, 7, 25 * 256, 25 * 256, 0])
+	world._add([62, 7, 25 * 256, 27 * 256, 0])
+	var joint_free := input.rail_planner.free_ends(Vector2(25, 26), 0.5)
+	check(joint_free.is_empty() and input.rail_planner.click("rail", Vector2(25.3, 26.4), false)
+		and input.rail_planner.anchor.get("pos") == Vector2i(25, 26) and input.rail_planner.anchor.get("fork", false),
+		"#15: a click on a line where two rails meet anchors the planner there: %s %s" % [joint_free, input.rail_planner.anchor])
+	input.rail_planner.update("rail", true, Vector2(38, 14), false)
+	var fork_north: Array = input.rail_planner.path.duplicate()
+	input.rail_planner.update("rail", true, Vector2(38, 40), false)
+	var fork_south: Array = input.rail_planner.path.duplicate()
+	var first_curves := func(p: Array) -> bool: return not p.is_empty() and str(p[0]["name"]).begins_with("curved")
+	check(first_curves.call(fork_north) and first_curves.call(fork_south) and int(fork_north[0]["pos"].y) < 26 and int(fork_south[0]["pos"].y) > 26,
+		"#15: from the joint the new line turns off towards the cursor, north or south: %s / %s" % [fork_north.slice(0, 1), fork_south.slice(0, 1)])
+	input.rail_planner.update("rail", true, Vector2(38, 14), false)
+	input.rail_planner.click("rail", Vector2(38, 14), false)
+	await get_tree().process_frame
+	var fork_cmd := sent_one("rails")
+	check(not fork_north.is_empty() and (fork_cmd.get("l", []) as Array).size() == fork_north.size() and not input.rail_planner.anchor.get("fork", false),
+		"#15: the fork is built (`rails`) and the planner carries on from its end")
+	input.rail_planner.clear()
+	world._remove(61)
+	world._remove(62)
 
 	# --- drag building ------------------------------------------------------------------------------
 	var belt: ProtoDB.EntityProto = world.protos.entity(1)
@@ -3898,7 +4791,7 @@ func _map(ui) -> void:
 	key(KEY_M)
 	await get_tree().process_frame
 	check(not ui.map_open(), "M again closes it")
-	# The game menu (front_end.gd) gets Esc before the HUD and asks ui.escape(), so
+	# Owner's #1: the game menu (front_end.gd) gets Esc before the HUD and asks ui.escape(), so
 	# everything the HUD can have open must say yes there, not only the windows in is_open().
 	check(not ui.escape(), "with nothing open Esc is left to the game menu")
 	var esc_cases := {
@@ -3960,7 +4853,7 @@ func _map(ui) -> void:
 	check(turrets != null and not turrets.button_pressed and not view.layers._groups["turret"][0].visible, "turret coverage is off by default")
 	check(turrets.toggle_mode and turrets.theme_type_variation == "FSideButton" and turrets.tooltip_text == "Turret coverage"
 		and view.panel.find_child("TrainsOverview", true, false) == null,
-		"Factorio's map view settings: an icon toggle per layer with its name as the tooltip, no extra Trains button")
+		"Factorio's map view settings: an icon toggle per layer with its name as the tooltip, no extra Trains button (C5)")
 	turrets.button_pressed = true
 	await get_tree().process_frame
 	await get_tree().process_frame
@@ -4050,7 +4943,7 @@ func _map(ui) -> void:
 	view.dialog.text_field.text = "Here"
 	view.dialog._confirm()
 	check(int(sent_one("tag_add").get("si", 0)) == 3, "a tag goes on the shown surface")
-	# Factorio's Remote view frame: title bar and Surfaces; no Add tag / Add ping panel (on purpose).
+	# Factorio's Remote view frame: title bar and Surfaces; no Add tag / Add ping panel (the owner's call).
 	await get_tree().process_frame
 	var frame = ui.remote_frame
 	check(frame.visible and frame.mode == "map" and view.surfaces_panel.get_parent() == frame and _texts(frame).has("Remote view")
@@ -4072,7 +4965,7 @@ func _map(ui) -> void:
 	view._gui_input(right)
 	var ask := sent_one("unghost")
 	check(not view.dialog.is_open() and ask.get("x") == 3 * 256 and ask.get("y") == 3 * 256,
-		"a right-click on the map first asks the mod to remove a ghost there: %s" % [ask])
+		"a right-click on the map first asks the mod to remove a ghost there (owner's #22): %s" % [ask])
 	m.handle({"t": "unghost", "q": int(ask.get("q", 0)), "n": 1})
 	check(not view.dialog.is_open(), "a ghost was removed: no tag dialog")
 	right = right.duplicate()
@@ -4134,6 +5027,12 @@ func _map(ui) -> void:
 ## The Settings window's tabs, key bindings, the map generator and the mods list, with the server
 ## folders pointed at a test folder.
 func _menus() -> void:
+	# A modded save whose mod is missing (or at another version): Factorio 2.1.24's --sync-mods tries
+	# to download it, fails without a login and says only "unknown error"; its log names the mod.
+	var sync_out := "   4.689 Info ModPortal.cpp:612: Downloading /download/space-exploration-graphics/6a762ff78fa6a8630ec108e9?username=<private>&token=<private> to C:\\Users\\x\\Temp\\data\\temp\\space-exploration-graphics_0.7.7.zip\n   4.890 Info HttpSharedState.cpp:187: Status code: 403\nFailed to sync mods with save: Failed to sync mods, unknown error - check the log file."
+	var missing := ServerLauncher.missing_from_sync(sync_out)
+	check(missing.size() == 1 and missing[0].contains("space-exploration-graphics 0.7.7"),
+		"a modded save's mod missing from the mods folder is named with its version, not \"unknown error\": %s" % [missing])
 	var data := OS.get_user_data_dir().path_join("ui-test-server")
 	DirAccess.make_dir_recursive_absolute(data.path_join("mods/factorio-3d-bridge"))
 	DirAccess.make_dir_recursive_absolute(data.path_join("mods/some-mod"))
@@ -4270,7 +5169,8 @@ func _menus() -> void:
 
 	w.open_tab("Mod settings")
 	await get_tree().process_frame
-	check(w.current_tab() == "Mod settings", "mod settings explain where to change them without a launched server")
+	check(w.current_tab() == "Mod settings" and _texts(w).any(func(s: String) -> bool: return s.contains("type them in the server's console")),
+		"mod settings explain where to change them without a launched server")
 
 	# Factorio's way in the game: one page at a time from the Settings list, titled "<Page> settings"
 	var page: Node = SettingsWindow.new()
@@ -4289,9 +5189,79 @@ func _menus() -> void:
 
 	PlayerInput.define_actions()
 	Settings.apply_bindings()
+	# Issue #14: the keys changed in Factorio's own controls (config.ini's [controls], the rest
+	# written as comments) are the defaults; a key Zenith can't take (a mouse button) leaves its own.
+	var fk = load("res://scripts/player/factorio_keys.gd")
+	var ini := char(10).join(["[path]", "read-data=__PATH__executable__/../../data", "[controls]", "; toggle-driving=RETURN",
+		"toggle-driving=TAB", "next-weapon=", "next-weapon-alternative=CONTROL + SHIFT + N", "pipette=mouse-button-3",
+		"open-factoriopedia-alternative=KP_PLUS", "made-up-control=K", "[other]", "rotate=Y"])
+	var theirs: Dictionary = fk.keys_from(ini)
+	check(theirs == {"enter_vehicle": [KEY_TAB, -1], "next_gun": [0, KEY_N | KEY_MASK_CTRL | KEY_MASK_SHIFT],
+		"toggle_factoriopedia": [-1, KEY_KP_ADD]}, "#14: config.ini's [controls] is read as Zenith's actions: %s" % [theirs])
+	check(fk.key_code("ALT + B") == (KEY_B | KEY_MASK_ALT) and fk.key_code("RETURN") == KEY_ENTER and fk.key_code("F5") == KEY_F5
+		and fk.key_code("KP_ENTER") == KEY_KP_ENTER and fk.key_code("GRAVE") == KEY_QUOTELEFT and fk.key_code("mouse-wheel-up") == -1
+		and fk.key_code("") == 0, "#14: Factorio's key sequences become Godot keys")
+	Settings.apply_factorio_keys(theirs)
+	var tab := InputEventKey.new()
+	tab.physical_keycode = KEY_TAB
+	tab.pressed = true
+	var enter := InputEventKey.new()
+	enter.physical_keycode = KEY_ENTER
+	enter.pressed = true
+	check(Controls.pressed(tab, "enter_vehicle") and not Controls.pressed(enter, "enter_vehicle") and not Controls.pressed(tab, "next_gun")
+		and Settings.keys_for("enter_vehicle") == [KEY_TAB, KEY_KP_ENTER] and Settings.keys_for("pipette") == [KEY_Q, 0],
+		"#14: with TAB for Enter/leave vehicle in Factorio, TAB gets in and out and Enter doesn't: %s" % [Settings.keys_for("enter_vehicle")])
+	Settings.bind_slot("enter_vehicle", 0, KEY_G)
+	check(Settings.keys_for("enter_vehicle")[0] == KEY_G, "#14: a key changed in Zenith's Settings still wins over Factorio's")
+	Settings.bind("enter_vehicle", [])
+	check(Settings.keys_for("enter_vehicle")[0] == KEY_TAB, "#14: and Default puts Factorio's back")
+	Settings.apply_factorio_keys({})
+	check(Settings.keys_for("enter_vehicle") == [KEY_ENTER, KEY_KP_ENTER] and Settings.keys_for("next_gun")[0] == KEY_TAB,
+		"#14: with the setting off, Zenith's own defaults are back")
+	# Factorio's own settings (config.ini's set lines, factorio_settings.gd) are the defaults too:
+	# in config version 12's form, a comment and a [controls] line with a setting's name left alone.
+	var fs = load("res://scripts/menu/factorio_settings.gd")
+	var settings_ini := char(10).join(["; version=12", "[path]", "read-data=x", "[general]", "locale=de", "[other]", "autosave-interval=0",
+		"[interface]", "ui-scale-mode=custom", "custom-ui-scale=1.3", "; smart-belt-building=false", "show-minimap=false",
+		"[controls]", "show-minimap=true", "[sound]", "master-volume=0.300000", "music-volume=0.000000", "; game-effects-volume=0.9",
+		"walking-sound-volume=loud", "[graphics]", "show-clouds=false", "show-smoke=false", "full-screen=true",
+		"color-filter=deuteranopia", "brightness=0.2"])
+	var got: Dictionary = fs.values_from(settings_ini)
+	check(got == {"general": {"locale": "de"}, "factorio": {"autosave_interval": 0}, "interface": {"ui_scale": "1.25"},
+		"map": {"minimap": false}, "sound": {"master": 0.3, "music": 0.0},
+		"graphics": {"clouds": false, "effects": false, "window_mode": "fullscreen", "color_filter": "deuteranopia"}},
+		"Factorio's settings: config.ini's set lines become Zenith's, comments and unknown values left out: %s" % [got])
+	var older: Dictionary = fs.values_from(char(10).join(["; version=9", "[interface]", "automatic-ui-scale=true", "ui-scale=1.5",
+		"[general]", "locale=auto", "[graphics]", "full-screen=false", "color-filter="]))
+	check(older == {"interface": {"ui_scale": "auto"}, "graphics": {"window_mode": "windowed", "color_filter": "none"}},
+		"Factorio's settings: an older config.ini's UI scale, and an automatic language left to Zenith: %s" % [older])
+	Settings.factorio_values = {"sound": {"master": 0.3}, "map": {"minimap": false}}
+	var theirs_now: bool = is_equal_approx(float(Settings.get_value("sound", "master")), 0.3) and Settings.factorio_default("map", "minimap") == false
+	Settings.set_value("sound", "master", 0.6)
+	var own_wins := is_equal_approx(float(Settings.get_value("sound", "master")), 0.6)
+	Settings.reset_value("sound", "master")
+	var back := is_equal_approx(float(Settings.get_value("sound", "master")), 0.3)
+	Settings.reload_factorio_settings()  # the test's own settings file: the machine's Factorio isn't read
+	var off: bool = Settings.factorio_values.is_empty() and is_equal_approx(float(Settings.get_value("sound", "master")), float(Settings.DEFAULTS["sound"]["master"]))
+	check(theirs_now and own_wins and back and off,
+		"Factorio's settings are the defaults: Zenith's own change wins, Default puts Factorio's back, a test's settings file reads none (%s %s %s %s)" % [theirs_now, own_wins, back, off])
+	w.open_tab("Factorio")
+	await get_tree().process_frame
+	check(find.call("factorio-use_factorio_settings") != null and _texts(w).has("Use the settings set in Factorio"),
+		"Settings → Factorio install has the switch for Factorio's settings")
+	var root := "user://fake-factorio"
+	DirAccess.make_dir_recursive_absolute(root + "/bin/x64")
+	var cfg_file := FileAccess.open(root + "/config-path.cfg", FileAccess.WRITE)
+	cfg_file.store_string(char(10).join(["config-path=__PATH__executable__/../../config", "use-system-read-write-data-directories=false"]))
+	cfg_file.close()
+	var places: Array = fk.candidates(ProjectSettings.globalize_path(root + "/bin/x64/factorio.exe"))
+	check(not places.is_empty() and str(places[0]).ends_with("fake-factorio/config/config.ini"),
+		"#14: a zip install's config.ini is in its own config folder: %s" % [places])
 	w.open_tab("Controls")
 	await get_tree().process_frame
 	check(find.call("controls-rotate-1") != null and _texts(w).has("Basic interaction") and _texts(w).has("Movement"), "controls are grouped like Factorio's")
+	check(find.call("factorio-use_factorio_keys") != null and _texts(w).has("Use the keys set in Factorio"),
+		"#14: Settings → Controls has the switch for Factorio's keys")
 	(find.call("controls-rotate-1") as Button).pressed.emit()
 	var ev := InputEventKey.new()
 	ev.physical_keycode = KEY_H
@@ -4314,6 +5284,9 @@ func _menus() -> void:
 	check(not plain_h.is_action_pressed("rotate") and with_shift.is_action_pressed("rotate"), "Shift + H fires it, H alone doesn't")
 	Settings.bind_slot("pick_up", 1, KEY_R)
 	check(Settings.conflicts("pick_up", KEY_R).has("rotate"), "a key used twice is a conflict")
+	check(Settings.conflicts("pipette", KEY_Q).is_empty() and Settings.conflicts("clear_cursor", KEY_Q).is_empty()
+		and Settings.conflicts("give_red_wire", KEY_R | KEY_MASK_ALT).is_empty() and Settings.conflicts("toggle_rail_layer", KEY_R | KEY_MASK_ALT).is_empty(),
+		"Q (clear cursor, pipette) and Alt+R (red wire, rail layer) share their key by design: no clash out of the box")
 	w.open_tab("Controls")
 	await get_tree().process_frame
 	check((find.call("controls-pick_up-1") as Button).tooltip_text.contains("Rotate"), "and the binding says what else uses it")
@@ -4384,6 +5357,57 @@ func _menus() -> void:
 	mods.queue_free()
 	Settings.reset_value("factorio", "server_data")
 	await _issue_folders_and_install()
+	_bug_report()
+	_user_data_layout()
+
+
+## A downloaded build keeps its saves and server data in Zenith's user folder, so they outlive an
+## update (paths.gd); an older build's server/saves and server mods beside the exe come over once.
+func _user_data_layout() -> void:
+	var root := OS.get_user_data_dir().path_join("ui-test-user-layout")
+	_remove_tree(root)
+	var install := root.path_join("old-install")
+	var user := root.path_join("user")
+	for f in ["server/saves/base.zip", "server/saves/Space Age/run.zip", "server/saves/notes.txt",
+			"server/data/mods/some-mod_1.0.0.zip", "server/data/mods/mod-list.json", "server/data/factorio-current.log"]:
+		DirAccess.make_dir_recursive_absolute(install.path_join(f).get_base_dir())
+		_write(install.path_join(f), "x")
+	var was: Array = [Paths.keep_in_user_data, Paths.user_data_dir, Paths._moved]
+	Paths._moved = true  # not this checkout's own server/ folder
+	Paths.keep_in_user_data = true
+	Paths.user_data_dir = user
+	var saves := Paths.saves_dir()
+	var data := Paths.server_data_dir()
+	Paths.move_from_install(install)
+	var copied := FileAccess.file_exists(user.path_join("saves/base.zip")) and FileAccess.file_exists(user.path_join("saves/Space Age/run.zip"))
+	var mods := FileAccess.file_exists(user.path_join("server-data/mods/some-mod_1.0.0.zip")) and FileAccess.file_exists(user.path_join("server-data/mods/mod-list.json"))
+	var left_out := not FileAccess.file_exists(user.path_join("saves/notes.txt")) and not FileAccess.file_exists(user.path_join("server-data/factorio-current.log"))
+	# Once there: a newer world in the user folder isn't replaced by the old one again.
+	_write(user.path_join("saves/base.zip"), "newer")
+	Paths.move_from_install(install)
+	var kept := FileAccess.get_file_as_string(user.path_join("saves/base.zip")) == "newer"
+	Settings.set_value("factorio", "saves", root.path_join("chosen"))
+	var setting_wins := Paths.saves_dir() == root.path_join("chosen")
+	Settings.reset_value("factorio", "saves")
+	Paths.keep_in_user_data = false
+	var checkout := Paths.saves_dir() == Paths.repo_dir().path_join("server/saves") and Paths.server_data_dir() == Paths.repo_dir().path_join("server/data")
+	Paths.keep_in_user_data = was[0]
+	Paths.user_data_dir = was[1]
+	Paths._moved = was[2]
+	_remove_tree(root)
+	check(saves == user.path_join("saves") and data == user.path_join("server-data") and copied and mods and left_out and kept and setting_wins and checkout,
+		"a download keeps saves and server data in the user folder, brings an old install's over once, a setting still wins (%s, %s; copied %s, mods %s, left out %s, kept %s)" % [saves, data, copied, mods, left_out, kept])
+
+
+func _remove_tree(path: String) -> void:
+	var dir := DirAccess.open(path)
+	if dir == null:
+		return
+	for f in dir.get_files():
+		DirAccess.remove_absolute(path.path_join(f))
+	for sub in dir.get_directories():
+		_remove_tree(path.path_join(sub))
+	DirAccess.remove_absolute(path)
 
 
 ## Issue #3: saves in folders, browsed as Factorio's load screen does; issue #6: the Factorio
@@ -4414,7 +5438,7 @@ func _issue_folders_and_install() -> void:
 		and deeper == ["[..]", "old"] and up_once == inside and at_top,
 		"issue #3: the load screen shows folders, opens them at any depth and goes back up (%s / %s / %s)" % [top, inside, deeper])
 	Settings.reset_value("factorio", "saves")
-	# A standalone install anywhere (D:/Factorio_2.1 in the report), found from the exe set.
+	# #6: a standalone install anywhere (D:/Factorio_2.1 in the report), found from the exe set.
 	var install := OS.get_user_data_dir().path_join("ui-test-factorio")
 	DirAccess.make_dir_recursive_absolute(install.path_join("bin/x64"))
 	DirAccess.make_dir_recursive_absolute(install.path_join("data/base/graphics/icons"))
@@ -4436,6 +5460,35 @@ func _issue_folders_and_install() -> void:
 	check(found == install.path_join("data") and by_folder == found and folder_ok and Paths.configured_exe() == ""
 		and says.begins_with("Restart Zenith"),
 		"issue #6: the data folder comes from the factorio.exe (or folder) set in Settings, which says to restart (%s)" % says)
+	check(Paths.read_data_dir("/Applications/factorio.app/Contents/MacOS/factorio") == "/Applications/factorio.app/Contents/data"
+		and Paths.read_data_dir("D:/Factorio_2.1/bin/x64/factorio.exe") == "D:/Factorio_2.1/data",
+		"the install's data folder on macOS (factorio.app/Contents/data) and elsewhere (bin/x64/../../data)")
+
+
+## Report a bug: the zip holds system.txt and this run's log, and GitHub's page has the versions and
+## the zip's name in its text.
+func _bug_report() -> void:
+	var path := BugReport.make_bundle()
+	var names := PackedStringArray()
+	var reader := ZIPReader.new()
+	if path != "" and reader.open(path) == OK:
+		names = reader.get_files()
+		reader.close()
+	var url := BugReport.issue_url(path.get_file())
+	var body := url.get_slice("body=", 1).uri_decode()
+	if path != "":
+		DirAccess.remove_absolute(path)
+	check("system.txt" in names and "zenith/godot.log" in names and url.begins_with(BugReport.ISSUES + "?labels=bug")
+		and body.contains("Zenith " + str(ProjectSettings.get_setting("application/config/version"))) and body.contains(path.get_file()),
+		"report a bug: the logs' zip (%s) and GitHub's page with the versions and the zip's name" % ", ".join(names))
+	var kept_mod: String = Bridge.mod_version
+	Bridge.mod_version = "9.8.7"
+	var with_mod := BugReport.system_text(true)
+	Bridge.mod_version = ""
+	var without_mod := BugReport.system_text(true)
+	Bridge.mod_version = kept_mod
+	check(with_mod.contains("\nZenith Bridge mod 9.8.7\n") and not without_mod.contains("Bridge mod"),
+		"a bug report lists the bridge mod's version once a game has said it")
 
 
 func _write(path: String, text: String) -> void:
@@ -4569,10 +5622,20 @@ func _play(hud: Hud, player: Node) -> void:
 	var texts := _texts(screen)
 	check(texts.has("No fuel") and texts.has("30%") and not texts.has("Energy") and not texts.has("Fluids"),
 		"a furnace shows its status and progress, and no energy or fluid rows (as in Factorio)")
+	var furnace_sig: String = screen._sig
+	screen.handle({"t": "gui", "u": 77, "p": 0, "kind": "furnace", "inv": {"input": [["iron-ore", 5]], "fuel": [["coal", 2]], "output": []},
+		"slots": {"input": [["iron-ore", 5]], "fuel": [["coal", 2]], "output": [0]}, "status": "no_fuel", "pw": 950,
+		"fb": [["water", 150, 200, 15]], "recipe": "iron-plate", "pr": 310})
+	check(screen._sig == furnace_sig, "a screen isn't rebuilt when only its buffer's fill (pw, not drawn) changes")
+	# The furnace's fuel picked up: a machine stack in the cursor.
+	screen.slot_clicked.emit("fuel", 1, "coal", 2, MOUSE_BUTTON_LEFT, false, false)
+	await get_tree().process_frame
+	var held_fuel: bool = player.cursor_item == "coal" and not ui.hand.is_empty()
 	key(KEY_ESCAPE)
 	await get_tree().process_frame
 	check(not screen.is_open() and not ui.is_open() and sent_one("close").size() > 0, "Esc closes the machine and the window and tells the mod")
-	check(player.cursor_item == "" or ui.hand.is_empty(), "a machine stack in the cursor is dropped when its screen closes")
+	check(held_fuel and player.cursor_item == "" and ui.hand.is_empty(),
+		"a machine stack in the cursor is dropped when its screen closes (held: %s)" % held_fuel)
 	player.cursor_item = ""
 
 	# --- production windows laid out as Factorio's (production_panels.gd) ----------------------
@@ -5142,6 +6205,13 @@ func _planners(hud: Hud, player: Node) -> void:
 	var input := PlayerInput.new()
 	input.world = world
 	input.hud = hud
+	# The build reach is the character's own (cinfo's build: research and other mods add to it).
+	var info_before: Dictionary = hud.ui.model.character_info.duplicate()
+	hud.ui.model.character_info = {"build": 250}
+	check(is_equal_approx(input.build_reach(), 25.0), "a far-reach bonus (cinfo build 250) gives 25 tiles of build reach")
+	hud.ui.model.character_info = {}
+	check(is_equal_approx(input.build_reach(), 10.0), "without cinfo yet: Factorio's base 10 tiles")
+	hud.ui.model.character_info = info_before
 	input.hold("deconstruction-planner", -1)
 	check(input.planner_slot() == -1 and sent_one("bp_get").get("i") == -1, "a planner held from the library is slot -1; its settings are fetched")
 	var area := Rect2(1, 1, 5, 3)
@@ -5184,7 +6254,7 @@ func _planners(hud: Hud, player: Node) -> void:
 		and PlayerInput.selection_color("upgrade", false) == Color8(71, 255, 73) and PlayerInput.selection_color("upgrade", false, true) == Color8(246, 255, 0)
 		and PlayerInput.selection_color("blueprint", false) == Color8(57, 156, 251) and PlayerInput.selection_color("copy", false) == Color(1, 1, 1),
 		"selection boxes in Factorio's colours: deconstruct red, cancel orange, upgrade green, downgrade yellow, blueprint blue, copy white")
-	# The copied buildings follow the mouse where Factorio pastes them. A clipboard real
+	# Owner's #21: the copied buildings follow the mouse where Factorio pastes them. A clipboard real
 	# Factorio 2.1.23 sent (three chests and an assembler) and where its paste put them.
 	world.protos.add_entities([[4, "assembling-machine-1", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 150, 150, 150, 3, 3]])
 	var clip := [{"p": 1, "at": Vector2(-3, -1), "d": 0}, {"p": 1, "at": Vector2(-2, -1), "d": 0},
@@ -5268,10 +6338,20 @@ func _parity(hud: Hud, player: Node) -> void:
 	var ctrl_c := Controls.key_event(KEY_C | KEY_MASK_CTRL)
 	ctrl_c.pressed = true
 	check(Controls.pressed(ctrl_c, "copy") and not Controls.pressed(ctrl_c, "shoot_cursor"), "Ctrl+C copies, it doesn't shoot")
-	check(OS.find_keycode_from_string(OS.get_keycode_string(KEY_V | KEY_MASK_CTRL)) == (KEY_V | KEY_MASK_CTRL), "a binding with modifiers survives being saved as text")
+	# Stored in the settings as text ("Ctrl+Shift+V") and read back from it (settings.gd bind / keys_for).
+	var ctrl_shift_v := KEY_V | KEY_MASK_CTRL | KEY_MASK_SHIFT
+	# A test action of its own (add-ons' way in), so no real control's binding changes.
+	Settings.add_action("ui_test_binding", [KEY_F12, 0])
+	Settings.bind_slot("ui_test_binding", 1, ctrl_shift_v)
+	var test_keys := Settings.keys_for("ui_test_binding")
+	Settings.bind("ui_test_binding", [])
+	check(test_keys == [KEY_F12, ctrl_shift_v], "a binding with modifiers survives being saved as text: %s" % [test_keys])
 	check(ControlsInfo.name_of("drop_item") == "Drop item" and ControlsInfo.group_of("quickbar_page_3") == "Quickbar"
 		and ControlsInfo.name_of("give_blueprint") == "Blueprint",
 		"actions carry Factorio's names for the Controls tab")
+	var unnamed: Array = ControlsInfo.ACTIONS.keys().filter(func(a: String) -> bool: return not InputMap.has_action(a))
+	check(unnamed.is_empty() and ControlsInfo.group_of("toggle_factoriopedia") == "Panels",
+		"every action the Controls tab names exists (F2 under Panels): %s" % [unnamed])
 
 	# --- quickbar pages (Shift+1-0, X) ------------------------------------------------------------
 	var qb_swap: Array = []
@@ -5292,8 +6372,8 @@ func _parity(hud: Hud, player: Node) -> void:
 	await get_tree().process_frame
 	check(m.quickbar_upper_page() == 7 and m.quickbar_page == 3
 		and str(ui.quickbar._pages[0].text) == "7" and str(ui.quickbar._pages[1].text) == "3"
-		and ui.quickbar._upper[0].item == "transport-belt" and ui.quickbar._slots[1].item == "wooden-chest"
-		and ui.quickbar._upper[0].button_pressed and not ui.quickbar._slots[0].button_pressed,
+		and ui.quickbar._second[0].item == "transport-belt" and ui.quickbar._slots[1].item == "wooden-chest"
+		and ui.quickbar._second[0].button_pressed and not ui.quickbar._slots[0].button_pressed,
 		"the two quickbar rows show pages 7 (upper) and 3 (lower)")
 	ui.quickbar.open_chooser(1, true)
 	check(ui.quickbar._pages[1].button_pressed and (ui.quickbar._chooser_pages[3] as Button).button_pressed
@@ -5303,15 +6383,15 @@ func _parity(hud: Hud, player: Node) -> void:
 	await get_tree().process_frame
 	check(sent_one("qb_page").get("p") == 7 and m.quickbar_page == 7 and m.quickbar_upper_page() == 3
 		and str(ui.quickbar._pages[0].text) == "3" and str(ui.quickbar._pages[1].text) == "7"
-		and ui.quickbar._slots[0].item == "transport-belt" and ui.quickbar._upper[1].item == "wooden-chest"
-		and ui.quickbar._slots[0].button_pressed and not ui.quickbar._upper[0].button_pressed,
+		and ui.quickbar._slots[0].item == "transport-belt" and ui.quickbar._second[1].item == "wooden-chest"
+		and ui.quickbar._slots[0].button_pressed and not ui.quickbar._second[0].button_pressed,
 		"X swaps the two active quickbar rows")
 	check(ui.quickbar._pages[1].button_pressed and (ui.quickbar._chooser_pages[7] as Button).button_pressed
 		and not (ui.quickbar._chooser_pages[3] as Button).button_pressed,
 		"and the highlighted page button follows")
 	ui.quickbar.open_chooser(0, true)
 	check(ui.quickbar._pages[0].button_pressed and (ui.quickbar._chooser_pages[3] as Button).button_pressed,
-		"upper row's chooser highlights its swapped page")
+		"the second row's chooser highlights its swapped page")
 	key(KEY_X)
 	await get_tree().process_frame
 	check(sent_one("qb_page").get("p") == 3 and m.quickbar_page == 3 and m.quickbar_upper_page() == 7
@@ -5369,7 +6449,7 @@ func _parity(hud: Hud, player: Node) -> void:
 	m.handle({"t": "rs", "cur": "automation", "pr": 500, "q": []})
 	check(ui.research_hud.visible and _texts(ui.research_hud).size() > 0, "the research in progress shows (top right, in the side menu)")
 	ui.set_alt_mode(true)
-	check(sent_one("alt").is_empty() and ui.alt_overlay.on, "Alt-mode on asks the mod for nothing (the icons come with the records)")
+	check(sent_one("alt").is_empty() and ui.alt_overlay.on, "Alt-mode on asks the mod for nothing (the icons come with the records, #9)")
 	ui.set_alt_mode(false)
 	check(not ui.alt_overlay.on, "and goes off")
 	m.handle({"t": "clip", "l": [[5, 256, -512, 4]]})
@@ -5397,9 +6477,19 @@ func _parity(hud: Hud, player: Node) -> void:
 	crafting.search.text = ""
 	crafting.search.release_focus()
 	crafting._fill_grid()
-	ui.window.show_tab("Logistics")
-	check(_texts(ui.window._logistics).size() >= 1, "the Logistics tab shows something (requests or a note)")
+	check(_texts(ui.window._logistics).size() >= 1, "the Logistics part shows something (its switches and sections)")
 	ui.window.show_tab("Crafting")
+	ui.close_all()
+	await get_tree().process_frame
+	# Shut, the crafting grid isn't built again for a new recipe list (16-27 ms on the owner's
+	# save each time); it is when it next shows.
+	crafting._rebuild_stale = false
+	ui.model.recipes_changed.emit()
+	var stale_while_shut: bool = crafting._rebuild_stale
+	ui.window.open_crafting(true)
+	await get_tree().process_frame
+	check(stale_while_shut and ui.window.is_open() and not crafting._rebuild_stale and _find_recipe_slot(ui, "iron-gear-wheel") != null,
+		"a shut crafting panel only notes a new recipe list, and builds it when it shows")
 	ui.close_all()
 
 	# --- inventory slot filters (middle click) ------------------------------------------------------
@@ -5539,9 +6629,10 @@ func _parity(hud: Hud, player: Node) -> void:
 		interrupt_field.text_submitted.emit("Depot")
 	var ints: Array = sent_one("set_interrupts").get("interrupts", [])
 	check(ints.size() == 2 and ints[1]["name"] == "Depot", "a new interrupt is added by name")
-	m.request_trains_overview(true)
-	await get_tree().process_frame
-	check(sent_one("trains_list").get("t") == "trains_list" and ui.trains_window.is_open(), "All trains opens the trains overview")
+	sent()
+	ui.trains_window.open(true)  # the side menu's Trains button
+	check(sent_one("trains_list").get("t") == "trains_list" and ui.trains_window.is_open(),
+		"the train overview opens and asks for the trains at once (it showed none for 3 s)")
 	m.handle({"t": "trl", "part": 1, "parts": 1, "l": [[1, "wait_station", 0, "Iron", "", 3, 700, 2560, 2560, 1, 0, [["iron-plate", 400]], []],
 		[2, "manual_control", 1, "", "", 2, 710, 0, 0, 1, 0, [], []]]})
 	await get_tree().process_frame
@@ -5551,12 +6642,12 @@ func _parity(hud: Hud, player: Node) -> void:
 	var view: Node = row2.find_child("View", true, false) if row2 != null else null
 	check(view != null and view.unit == 710 and _find_button(row2, "Manual") == null and _find_button(row2, "Automatic") == null,
 		"a card shows a live view of the train from above (its locomotive), and no automatic / manual switch (Factorio's has none)")
-	# A train the client isn't drawing (far away) gets no 3D view, only the chart, asked for.
+	# Owner's C8: a train the client isn't drawing (far away) gets no 3D view, only the chart, asked for.
 	var no_view: bool = view != null and view.find_children("*", "SubViewport", true, false).is_empty()
 	if view != null:
 		view._asked_at = -1e9
 		view._ask_chart()
-	check(no_view and ui.map_cache.spots.size() > 0, "a far train's card makes no 3D view; it asks for the chart around the train: %s" % [ui.map_cache.spots])
+	check(no_view and ui.map_cache.spots.size() > 0, "a far train's card makes no 3D view; it asks for the chart around the train (C8): %s" % [ui.map_cache.spots])
 	ui.map_cache.spots.clear()
 	if view != null:
 		view._make_view()
@@ -5590,6 +6681,28 @@ func _parity(hud: Hud, player: Node) -> void:
 	m.handle({"t": "trl", "part": 1, "parts": 1, "l": []})
 	await get_tree().process_frame
 	check(tw._banner.visible, "no trains: Factorio's red \"No Trains found.\" banner")
+	# A stop may be called "All": its row filters to it, not to every train; fluids in the tooltip.
+	m.handle({"t": "trl", "part": 1, "parts": 1, "l": [[1, "wait_station", 0, "All", "", 2, 700, 0, 0, 1, 0, [], [["water", 25000]]],
+		[2, "wait_station", 0, "Iron", "", 2, 710, 0, 0, 1, 0, [], []]]})
+	await get_tree().process_frame
+	var all_stop: Button = null
+	for row in tw._list.get_children():
+		if row is Button and (row as Button).text.begins_with("All ("):
+			all_stop = row
+	var found_all := all_stop != null
+	if found_all:
+		all_stop.pressed.emit()  # the list is rebuilt: the button is freed
+	await get_tree().process_frame
+	var all_card := tw.find_child("Train1", true, false) as Control
+	check(found_all and tw.filter == "All" and all_card != null and tw.find_child("Train2", true, false) == null
+		and all_card.tooltip_text.contains("Water"), "a stop called All filters to its trains; a train's fluid is in its tooltip")
+	var ctrl_f := InputEventKey.new()
+	ctrl_f.keycode = KEY_F
+	ctrl_f.ctrl_pressed = true
+	ctrl_f.pressed = true
+	tw._unhandled_key_input(ctrl_f)
+	check(tw._search_box.visible, "Ctrl+F opens the overview's search, as its button says")
+	tw.toggle_search()
 	ui.trains_window.open(false)
 	await _logic_windows(screen, ui)
 	await _logic2_windows(screen, ui)
@@ -5827,6 +6940,9 @@ func _gear(hud: Hud, player: Node) -> void:
 	# The Character tab.
 	m.handle({"t": "cinfo", "craft": 1000, "mine": 1500, "run": 1000, "speed": 195, "eqmv": 300, "reach": 100, "build": 100,
 		"rreach": 27, "pick": 11, "loot": 20, "drop": 100, "invb": 10, "eqinv": 20, "trash": 10, "hp": 250, "hpb": 0, "robots": 4, "slots": 110})
+	if ui.window.side != null:
+		ui.window.hide_side(ui.window.side)  # the armour's grid has the right half: the tab shows without it
+	ui.window.open_crafting(true)
 	ui.window.show_tab("Character")
 	var info: Array = _texts(ui.window)
 	check(info.has("Mining speed") and info.has("150%  (+50%)") and info.has("2.7") and info.has("110  (+10 bonus, +20 armor)")
@@ -5877,7 +6993,7 @@ func _gear(hud: Hud, player: Node) -> void:
 	check(m.player_of_unit(900).get("name") == "friend", "a player by their character")
 	key(KEY_ESCAPE)
 	await get_tree().process_frame
-	check(not ui.players_window.visible, "Esc closes it")
+	check(not ui.players_window.visible, "Esc closes the players window")
 	var movers := MoverLayer.new()
 	var protos := ProtoDB.new()
 	protos.add_entities([[3, "character", "character", -0.2, -0.2, 0.2, 0.2, 1, 1, 1, 1, 1]])
@@ -6261,6 +7377,19 @@ func _layout(hud: Hud) -> void:
 	await get_tree().process_frame
 	check(not hud.help.visible, "the help panel hides while a window is open")
 	ui.close_all()
+	# It names the keys bound now (Settings → Controls, or Factorio's own), not the defaults.
+	var drop_was := "%s: drop" % Hud._key("drop_item")
+	var help_was := str(hud.help.get_meta("full_text", ""))
+	Settings.bind("drop_item", [KEY_J])
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var help_rebound := str(hud.help.get_meta("full_text", ""))
+	Settings.bind("drop_item", [])
+	await get_tree().process_frame
+	await get_tree().process_frame
+	check(help_was.contains(drop_was) and help_rebound.contains("J: drop") and not help_rebound.contains(drop_was)
+		and str(hud.help.get_meta("full_text", "")).contains(drop_was) and help_was.contains("hide help"),
+		"the help (F1) names the keys bound now: %s, J once rebound, back after reset" % drop_was)
 	Settings.set_value("interface", "show_help", had_help)
 	ui.debug_overlay = false
 
@@ -6290,6 +7419,58 @@ func _picture(hud: Hud, player: Node) -> void:
 	await get_tree().create_timer(0.5).timeout
 	await RenderingServer.frame_post_draw
 	get_viewport().get_texture().get_image().save_png(OS.get_cmdline_user_args()[-1])
+
+
+## Another mod's planet: its icon from the bridge's graphics list (here the fixture mod's) on the
+## space map, the platform panel and the statistics, and below a platform once the solar system
+## (`smap`) says it is a planet (a platform also stops at places that aren't, such as the edge).
+func _modded_planets(hud: Hud) -> void:
+	var ui = hud.ui
+	var m = ui.model
+	var Files = load("res://scripts/world/mod_files.gd")
+	var Graphics = load("res://scripts/world/mod_graphics.gd")
+	var Panels = load("res://scripts/ui/factorio/space_panels.gd")
+	var MainScript = load("res://scripts/main.gd")
+	var dirs_were: Array[String] = Files.extra_dirs.duplicate()
+	var mods_were: Dictionary = Files.active_mods().duplicate()
+	var locations_were: Array = m.space_locations.duplicate()
+	var dirs: Array[String] = [ProjectSettings.globalize_path("res://").path_join("../tools/mod_tests/fixtures").simplify_path()]
+	Files.extra_dirs = dirs
+	Files.set_mods({"zenith-gfx-test": "1.0.0"})
+	var until := Time.get_ticks_msec() + 5000
+	while not Files.is_ready() and Time.get_ticks_msec() < until:
+		await get_tree().process_frame
+	var icon := [["__zenith-gfx-test__/graphics/icons/gizmo.png", 64, null, null, null]]
+	# (mod_graphics.gd's use() went in the code review: what it did, by hand.)
+	Graphics._want = "ui-test-planets"
+	Graphics._apply("ui-test-planets", {"icons": {"space-location": {"zenith-test-planet": icon, "zenith-test-edge": icon}}})
+	check(Panels.planet_icon("zenith-test-planet") != null and ui.space_map._planet_texture("zenith-test-planet") != null
+		and ui.stats._planet_texture("zenith-test-planet") != null and MainScript.planet_picture("zenith-test-planet") != null
+		and ui.map_view._surface_icon("zenith-test-planet") != null,
+		"another mod's planet has its icon on the space map, the platform panel, the statistics, the map's surfaces and below a platform")
+	var main = MainScript.new()
+	main.hud = hud
+	main._space_material = ShaderMaterial.new()
+	main._space_material.shader = MainScript.SPACE_SKY
+	m.space_locations = []  # the solar system not here yet
+	sent()
+	main._show_planet("zenith-test-planet")
+	var before = main._space_material.get_shader_parameter("planet_on")
+	var asked := sent_one("smap")
+	m.handle({"t": "smap", "loc": [["zenith-test-planet", "planet", 0, 0, 1, 1], ["zenith-test-edge", "space-location", 0, 0, 1, 0]], "con": []})
+	main._show_planet("zenith-test-planet")
+	var planet_on = main._space_material.get_shader_parameter("planet_on")
+	var tex_on = main._space_material.get_shader_parameter("planet_tex_on")
+	main._show_planet("zenith-test-edge")
+	var edge_on = main._space_material.get_shader_parameter("planet_on")
+	check(before == 0.0 and asked.get("t") == "smap" and planet_on == 1.0 and tex_on == 1.0 and edge_on == 0.0,
+		"a modded planet shows below a platform once smap says it is a planet, a space location doesn't: %s %s %s %s %s"
+		% [before, asked, planet_on, tex_on, edge_on])
+	main.free()
+	m.space_locations = locations_were
+	Graphics.clear()
+	Files.extra_dirs = dirs_were
+	Files.set_mods(mods_were)
 
 
 ## Space Age's screens (space_panels.gd, space_map.gd, planet_info.gd): the hub, a silo, a landing
@@ -6367,7 +7548,7 @@ func _space(hud: Hud, player: Node) -> void:
 	moving["hub"]["d"] = 700
 	screen.handle(moving)
 	check(_texts(screen).any(func(t): return str(t).contains("10k / 15k km")), "the trip moves on without rebuilding the window")
-	# A long schedule scrolled down stays where it is when the screen is rebuilt (the
+	# Owner's G6: a long schedule scrolled down stays where it is when the screen is rebuilt (the
 	# hub's inventory changes every second on a busy platform).
 	var long_msg: Dictionary = moving.duplicate(true)
 	var stops: Array = []
@@ -6392,7 +7573,7 @@ func _space(hud: Hud, player: Node) -> void:
 		await get_tree().process_frame
 	var after: ScrollContainer = hub_scroll.call()
 	check(room > 150.0 and after != null and after != before and after.scroll_vertical == 150,
-		"the hub's schedule keeps its scroll place when the screen is rebuilt: %s of %s" % [after.scroll_vertical if after != null else -1, room])
+		"the hub's schedule keeps its scroll place when the screen is rebuilt (G6): %s of %s" % [after.scroll_vertical if after != null else -1, room])
 	screen.close()
 	sent()
 
@@ -6416,13 +7597,13 @@ func _space(hud: Hud, player: Node) -> void:
 		launch.pressed.emit()
 	check(sent_one("silo_launch").get("to") == 2, "launches to the platform waiting for its starter pack")
 	var no_ride := _find_button(screen, "Ride")
-	check(no_ride != null and no_ride.disabled, "no ride to a platform still waiting for its starter pack")
+	check(no_ride != null and no_ride.disabled, "no ride to a platform still waiting for its starter pack (#10)")
 	screen.handle({"t": "gui", "u": 601, "p": 0, "kind": "silo", "inv": {"input": [], "rocket": []},
 		"slots": {"input": [0, 0, 0], "rocket": [0, 0]}, "status": "working",
 		"rk": {"parts": 50, "need": 50, "st": "rocket_ready", "auto": 0, "to": [[3, "Orbiter", "waiting_at_station"]]}})
 	await get_tree().process_frame
 	var ride_button := _find_button(screen, "Ride")
-	check(ride_button != null and not ride_button.disabled, "Ride, with the rocket ready and a platform with a hub in orbit")
+	check(ride_button != null and not ride_button.disabled, "Ride, with the rocket ready and a platform with a hub in orbit (#10)")
 	if ride_button != null:
 		ride_button.pressed.emit()
 	var rode := sent()
@@ -6492,7 +7673,7 @@ func _space(hud: Hud, player: Node) -> void:
 	check(ui.remote_frame.visible and ui.remote_frame.mode == "space" and ui.space_map.size.x > 0.0 and not ui.minimap.visible
 		and ui.map_view.surfaces_panel.visible and (ui.map_view.surfaces_panel.find_child("SpaceMap", true, false) as Button).theme_type_variation == "FListItemSelected",
 		"the space map is full screen in the Remote view frame, its row chosen in the Surfaces panel, the minimap hidden")
-	# Hovering a route between planets highlights it and tells its distance and danger.
+	# Owner's B6: hovering a route between planets highlights it and tells its distance and danger.
 	var map_scale_was: float = ui.space_map.view_scale
 	ui.space_map.view_center = Vector2(4.5, -0.5)
 	ui.space_map.view_scale = 40.0  # the test's window is tiny: zoom in so the planets don't cover the route
@@ -6553,12 +7734,12 @@ func _space(hud: Hud, player: Node) -> void:
 	check(jbar != null and jbar.value == 250 and jfrom != null and jfrom.tooltip_text == "Nauvis" and icons_ok
 		and jto != null and jto.tooltip_text == "Vulcanus" and jtexts.contains("3 750 km") and jtexts.contains(" 150.00 km/s")
 		and jtexts.contains(" 86.6 tons") and not jtexts.contains("Stopped at"),
-		"the map of a travelling platform shows Factorio's strip: planet left, bar with the distance come, next planet: %s" % jtexts)
+		"the map of a travelling platform shows Factorio's strip: planet left, bar with the distance come, next planet (G1): %s" % jtexts)
 	var settings_r: Rect2 = ui.map_view.panel.get_global_rect()
 	check(ui.map_view.panel.is_visible_in_tree() and info_p.get_global_rect().position.y >= settings_r.end.y - 0.5,
 		"the platform's panel sits under the map view settings, as Factorio's: %s under %s" % [info_p.get_global_rect(), settings_r])
 	# Stopped (paused, waiting at its stop, or done and waiting for cargo before it leaves) Factorio says
-	# "Stopped at Nauvis" with the planet's icon; ours adds where it goes next (H7), with that planet's icon.
+	# "Stopped at Nauvis" with the planet's icon; ours adds where it goes next, with that planet's icon.
 	pf_stub.platforms[5] = {"i": 5, "n": "Orbiter", "st": "waiting_for_departure", "pa": 0, "hub": 9, "sp": 0.0, "w": 60000,
 		"loc": "nauvis", "nx": "vulcanus"}
 	await get_tree().process_frame
@@ -6793,6 +7974,13 @@ func _logic2_windows(screen: MachineScreen, ui) -> void:
 		cam.gui_input.emit(click)
 	check(followed.size() == 1 and followed[0][0] == 900 and followed[0][1] == Vector2(10, 2), "clicking the camera follows the train in remote view: %s" % [followed])
 	screen.remote_follow = old_follow
+	await get_tree().process_frame  # the popup Enter closed is gone
+	if change != null:
+		change.pressed.emit()
+	var popup_open := screen.get_node_or_null("TrainGroupDialog") != null
+	screen.close_local()
+	check(popup_open and screen.get_node_or_null("TrainGroupDialog") == null,
+		"closing the window takes Change train group with it (it showed over the next screen and moved that one's train)")
 	# The spidertron remote: a click sends the selection, Shift queues; spd draws the waypoints.
 	var remote := SpiderRemote.new()
 	check(remote.left(null, Vector2(5, 5), Vector2(5, 5), false) != "" and sent_one("spider_go").is_empty(), "with nothing selected a click only says so")
@@ -6803,6 +7991,8 @@ func _logic2_windows(screen: MachineScreen, ui) -> void:
 		"Shift+click queues a waypoint for the selection: %s" % [go])
 	remote._on_message({"t": "spd", "l": [[610, [[1280, 256], [2560, 512]]]]})
 	check(remote.waypoints.get(610) == [Vector2(5, 1), Vector2(10, 2)], "spd: each spidertron's waypoints")
+	remote._on_message({"t": "spd", "l": [[610, {}]]})
+	check(remote.waypoints.get(610) == [], "spd: a spidertron's last waypoint reached clears its markers (Factorio writes the empty list as {})")
 	remote.left(null, Vector2(0, 0), Vector2(20, 20), false)
 	check(remote.selected.is_empty(), "a drag over no spidertron empties the selection")
 	check(PlayerInput.OPENABLE_TYPES.has("pipe") and PlayerInput.OPENABLE_TYPES.has("land-mine") and not PlayerInput.OPENABLE_TYPES.has("generator")
@@ -6950,21 +8140,21 @@ func _logic_windows(screen: MachineScreen, ui) -> void:
 	var recs: Array = sent_one("set_schedule").get("records", [])
 	check(recs.size() == 1 and recs[0].get("wait_conditions", []).size() == 1 and recs[0]["wait_conditions"][0].get("type") == "time",
 		"+ Add wait condition adds the chosen condition")
-	# Rich text icons in names players write: a stop's name, a schedule's stations and the
+	# G8: rich text icons in names players write: a stop's name, a schedule's stations and the
 	# "+ Add station" list, a train group's name, a logistic group's name and the overview's cards.
 	var g8_plain = RichText.text_label("Iron")
 	var g8_rich = RichText.text_label("[item=iron-plate] Iron", "FHeading")
 	var g8_split: Array = RichText.icon_and_text("[item=iron-plate] Iron [virtual-signal=signal-A]")
 	check(g8_plain is Label and g8_rich is RichTextLabel and (g8_rich as RichTextLabel).get_parsed_text().contains("Iron")
 		and not (g8_rich as RichTextLabel).get_parsed_text().contains("[item") and g8_split[0] != null and str(g8_split[1]).begins_with("Iron [") and not str(g8_split[1]).contains("item="),
-		"names with rich text icons get a label that draws them; one icon and plain text where only one fits: %s" % [g8_split])
+		"names with rich text icons get a label that draws them; one icon and plain text where only one fits (G8): %s" % [g8_split])
 	g8_plain.free()
 	g8_rich.free()
 	gui.call("stop", {"p": 17, "col": [242, 0, 0], "stop": {"name": "[item=iron-plate] Iron", "limit": 2, "count": 1, "pri": 50, "train": 0, "trs": []}})
 	await get_tree().process_frame
 	var g8_stop = screen.find_child("StopName", true, false)
 	check(g8_stop is RichTextLabel and (g8_stop as RichTextLabel).get_parsed_text().strip_edges() == "Iron",
-		"a train stop's name draws its icon: %s" % [g8_stop])
+		"a train stop's name draws its icon (G8): %s" % [g8_stop])
 	gui.call("train", {"p": 14, "col": [242, 120, 0], "inv": {"fuel": []}, "slots": {"fuel": [0, 0, 0]}, "bu": 500,
 		"tr": {"id": 1, "state": "on_the_path", "manual": 0, "station": "", "dest": "", "name": "", "stops": ["[item=copper-plate] Copper", "Iron"],
 			"sched": {"current": 1, "group": "[item=coal] Coal run", "records": [{"station": "[item=copper-plate] Copper", "wait_conditions": []}]}}})
@@ -6975,10 +8165,10 @@ func _logic_windows(screen: MachineScreen, ui) -> void:
 	check(g8_station is RichTextLabel and (g8_station as RichTextLabel).get_parsed_text().strip_edges() == "Copper" and g8_group is RichTextLabel
 		and g8_add != null and g8_add.get_popup().get_item_text(0) == "Copper" and g8_add.get_popup().get_item_icon(0) != null
 		and g8_add.get_popup().get_item_text(1) == "Iron",
-		"a schedule's station, the train group and + Add station's list draw their icons")
+		"a schedule's station, the train group and + Add station's list draw their icons (G8)")
 	var g8_card: Button = ui.trains_window._station_card("[item=iron-plate] Iron", 2)
 	check(g8_card.text == "Iron\n2 trains" and g8_card.icon == RichText.icon("item", "iron-plate"),
-		"the train overview's station card shows the name's icon: %s" % g8_card.text)
+		"the train overview's station card shows the name's icon (G8): %s" % g8_card.text)
 	g8_card.free()
 	# Cargo wagon: only its cargo and the red X.
 	gui.call("train", {"p": 15, "inv": {"cargo": [["iron-plate", 50]]}, "slots": {"cargo": [["iron-plate", 50], 0, 0, 0]}, "bar": 4,
@@ -7033,7 +8223,7 @@ func _icons(hud: Hud) -> void:
 	var book_slot: Slot = ui.window._grid.get_child(0)
 	var plate_slot: Slot = ui.window._grid.get_child(2)
 	check(book_slot.item == "blueprint-book" and book_slot.record_icons.size() == 2 and plate_slot.record_icons.is_empty(),
-		"the inventory's book slot draws its two icons over the book")
+		"the inventory's book slot draws its two icons over the book (owner's #13)")
 	ui.close_all()
 	var bar: Array = []
 	bar.resize(100)
@@ -7048,7 +8238,7 @@ func _icons(hud: Hud) -> void:
 	m.handle({"t": "qb", "p": 1, "sel": 0, "held": "", "l": bar})
 	m.handle({"t": "slots", "l": {"main": [["blueprint-book", 1], 0, 0, 0, 0, 0, 0, 0, 0, 0]}})
 	check(not m.main_slots[0].has("icons"), "icons cleared again without ic")
-	# A filter inserter's Alt-mode icon shows every filter, shrunk to fit the one icon's room.
+	# #23: a filter inserter's Alt-mode icon shows every filter, shrunk to fit the one icon's room.
 	var filter_rec := WorldMirror.Rec.new()
 	filter_rec.extra = {"ai": ["item", "iron-plate", ["copper-plate", "coal", "stone", "wood"]]}
 	check(WorldMirror.alt_icon(filter_rec) == ["item", "iron-plate", "copper-plate", "coal", "stone", "wood"],
@@ -7065,7 +8255,7 @@ func _icons(hud: Hud) -> void:
 				fits = fits and rects[i].intersection(rects[j]).get_area() < 0.0001
 	check(fits and AltOverlay.grid(1)[0][1] == 1.0 and AltOverlay.grid(2)[0][1] == 0.5 and AltOverlay.grid(5)[0][1] == 1.0 / 3.0,
 		"1 to 5 filters fit in the icon's square without overlapping (one alone keeps the full size)")
-	# In first person the icons are 3D quads with the depth test on, so buildings hide them.
+	# C9: in first person the icons are 3D quads with the depth test on, so buildings hide them.
 	var holder := Node3D.new()
 	add_child(holder)
 	var w3 := WorldMirror.new()
@@ -7093,11 +8283,11 @@ func _icons(hud: Hud) -> void:
 	overlay.collect()
 	var shown_quads := overlay._quads.filter(func(q): return q.visible)
 	check(shown_quads.size() == 2 and (shown_quads[0].material_override as ShaderMaterial).shader == load("res://shaders/billboard_icon_depth.gdshader")
-		and shown_quads[0].position.y > 1.0, "first person: Alt-mode icons are depth-tested quads over the building")
+		and shown_quads[0].position.y > 1.0, "first person: Alt-mode icons are depth-tested quads over the building (C9)")
 	fp_rig.first_person = false
 	overlay._quads_used = 0
 	overlay._hide_quads()
-	# From above, only chunks in the camera's view are looked at; a machine far off draws nothing.
+	# #9: from above, only chunks in the camera's view are looked at; a machine far off draws nothing.
 	w3.chunks[Vector2i(40, 40)] = ChunkView.new()
 	w3._add([951, 8, 40 * 32 * 256 + 128, 40 * 32 * 256 + 128, 0, {"ai": ["recipe", "iron-gear-wheel"]}])
 	fp_rig.camera.position = Vector3(5.5, 30, 12)
@@ -7106,6 +8296,21 @@ func _icons(hud: Hud) -> void:
 	check(overlay.drawn == 2 and AltOverlay._chunk_in_view(Vector2i.ZERO, fp_rig.camera.get_frustum())
 		and not AltOverlay._chunk_in_view(Vector2i(40, 40), fp_rig.camera.get_frustum()),
 		"Alt-mode draws the icons in view (an inserter's two filters) and skips chunks out of view: %d" % overlay.drawn)
+	# On an add-on's hills (ground_height.gd) the icons sit over the lifted building, not on the flat ground.
+	fp_rig.camera.position = Vector3(5.5, 12, 30)
+	fp_rig.camera.look_at(Vector3(5.5, 0, 5.5))
+	overlay.collect()
+	var flat_icon: Rect2 = (overlay._icons.values()[0] as Array)[0]
+	var hill := Image.create(16, 16, false, Image.FORMAT_RF)
+	hill.fill(Color(6.0, 0, 0))
+	var GroundHeightT := preload("res://scripts/world/ground_height.gd")
+	GroundHeightT.set_field(hill, Vector2(-8, -8), 2.0)
+	overlay.collect()
+	var hill_icon: Rect2 = (overlay._icons.values()[0] as Array)[0]
+	var lifted: float = fp_rig.camera.unproject_position(Vector3(5.5, 6.0, 5.5)).y - fp_rig.camera.unproject_position(Vector3(5.5, 0.0, 5.5)).y
+	GroundHeightT.clear()
+	check(overlay.drawn == 2 and absf((hill_icon.position.y - flat_icon.position.y) / lifted - 1.0) < 0.2 and lifted < -5.0,
+		"Alt-mode icons rise with the hill under their building: %.1f px (the hill: %.1f)" % [hill_icon.position.y - flat_icon.position.y, lifted])
 	overlay.on = false
 	overlay._process(0.0)
 	check(overlay._quads.all(func(q): return not q.visible), "and none are left in the world once Alt-mode is off")
@@ -7115,15 +8320,15 @@ func _icons(hud: Hud) -> void:
 	check(techs.size() > 250 and techs.has("recycling") and techs.has("planet-discovery-vulcanus") and techs.has("follower-robot-count-1"),
 		"icons.json has every technology's icon, those technology.lua doesn't name too: %d" % techs.size())
 	check((techs.get("physical-projectile-damage-1", []) as Array).size() == 2, "a bonus technology's icon is its picture and the badge")
-	# Copper wires between poles ride with the chart and are drawn with the electric layer.
+	# C10: copper wires between poles ride with the chart and are drawn with the electric layer.
 	m.handle({"t": "chart", "cx": 0, "cy": 0, "n": 1, "pal": [[20, 220, 40]], "px": [0],
 		"ov": [["e", 5 * 256, 5 * 256, 2.5], ["w", 5 * 256, 5 * 256, 12 * 256, 5 * 256]]})
 	var wire_entries: Array = (m.map_overlays.get(Vector2i(0, 0), []) as Array).filter(func(r): return str(r[0]) == "w")
 	check(wire_entries.size() == 1 and is_equal_approx(float(wire_entries[0][3]), 12.0) and is_equal_approx(float(wire_entries[0][4]), 5.0),
-		"a chart's copper wire keeps both ends, in tiles: %s" % [wire_entries])
+		"a chart's copper wire keeps both ends, in tiles (C10): %s" % [wire_entries])
 	ui.map_view.layers.redraw(Vector2(8, 5), 8.0)
 	await get_tree().process_frame
-	# The minimap preloads what the map view shows on opening, once in a while, when idle.
+	# C15: the minimap preloads what the map view shows on opening, once in a while, when idle.
 	var mm = ui.minimap
 	var mcache = ui.map_cache
 	mcache._blocks.clear()
@@ -7141,7 +8346,7 @@ func _icons(hud: Hud) -> void:
 	var half_view: Vector2 = mm.get_viewport_rect().size / 2.0 / (mm.PRELOAD_ZOOM * Kit.scale)
 	var expected: Rect2i = MapCache.chunks_of(Rect2(-half_view, half_view * 2.0))
 	check(preloading_now and big == expected and not mm._preloading and mcache._goal == own,
-		"the minimap asks once for the map view's opening area, then for its own again: %s then %s" % [big, mcache._goal])
+		"the minimap asks once for the map view's opening area, then for its own again (C15): %s then %s" % [big, mcache._goal])
 	mm._ask(own, 4, Vector2.ZERO)
 	check(not mm._preloading, "and not again until PRELOAD_EVERY has passed")
 	mcache._blocks.clear()
@@ -7149,24 +8354,24 @@ func _icons(hud: Hud) -> void:
 	mcache.spots.clear()
 	mcache.spots.append(Rect2i(40, 40, 3, 3))
 	mm._ask(own, 4, Vector2.ZERO)
-	check(mcache._goal == Rect2i(40, 40, 3, 3) and mcache.spots.is_empty(), "a train card's spot is charted by the minimap when idle")
+	check(mcache._goal == Rect2i(40, 40, 3, 3) and mcache.spots.is_empty(), "a train card's spot is charted by the minimap when idle (C8)")
 	mcache._blocks.clear()
 	mcache._pending.clear()
 	mm._ask(own, 4, Vector2.ZERO)
 	mm._ask(own, 4, Vector2.ZERO)
-	# Demolisher territories' borders, from `terr` in two parts: two chunks side by side have six
+	# #4: demolisher territories' borders, from `terr` in two parts: two chunks side by side have six
 	# outer sides (the shared one isn't a border); a lone chunk four.
 	m.handle({"t": "terr", "part": 1, "parts": 2, "l": [[1, 2, 2, 2]]})
 	var after_first: int = m.territory_edges.size()
 	m.handle({"t": "terr", "part": 2, "parts": 2, "l": [[-5, 0]]})
 	check(after_first == 0 and m.territory_edges.size() == 20 and m.territory_edges.has(Vector2(32, 64)),
-		"terr parts make the territories' borders, in tiles: %d points" % m.territory_edges.size())
+		"terr parts make the territories' borders, in tiles (owner's #4): %d points" % m.territory_edges.size())
 	var terr_layer := TerritoryLayer.new()
 	terr_layer.model = m
 	add_child(terr_layer)
 	check(terr_layer.mesh != null and terr_layer.mesh.get_surface_count() == 1, "the borders are drawn on the ground in the world")
-	# The map view stripes the territories' ground, on the surface they are on only.
-	check(m.territory_chunks.size() == 3 and m.territories_shown(), "terr keeps the territories' chunks for the map's stripes")
+	# G20: the map view stripes the territories' ground, on the surface they are on only.
+	check(m.territory_chunks.size() == 3 and m.territories_shown(), "terr keeps the territories' chunks for the map's stripes (G20)")
 	var stripe_area := 0.0
 	var tarea := Rect2(32, 64, 32, 32)
 	var speriod := MapLayersScript.stripe_period(1.0)
@@ -7179,9 +8384,9 @@ func _icons(hud: Hud) -> void:
 			stripe_area += (sa.x * sb.y - sb.x * sa.y) / 2.0
 		sk += speriod
 	check(absf(stripe_area - 512.0) < 0.5 and speriod * 1.0 >= MapLayersScript.STRIPE_PX * 2.0 and MapLayersScript.stripe_period(0.1) > speriod,
-		"the stripes cover half of each territory chunk, wider in tiles when zoomed out: %.1f of 1024, speriod %d" % [stripe_area, speriod])
+		"the stripes cover half of each territory chunk, wider in tiles when zoomed out (G20): %.1f of 1024, speriod %d" % [stripe_area, speriod])
 	m.handle({"t": "terr", "part": 1, "parts": 1, "si": 7, "l": [[1, 2]]})
-	check(not m.territories_shown(), "territories on another surface aren't drawn on this map")
+	check(not m.territories_shown(), "territories on another surface aren't drawn on this map (G20)")
 	var tl := MapLayersScript.new()
 	tl.model = m
 	tl.size = Vector2(400, 300)
@@ -7189,7 +8394,7 @@ func _icons(hud: Hud) -> void:
 	m.handle({"t": "terr", "part": 1, "parts": 1, "si": m.shown_surface(), "l": [[1, 2]]})
 	tl.redraw(Vector2(48, 80), 4.0)
 	await get_tree().process_frame
-	check(m.territories_shown(), "the world's own surface's territories are drawn")
+	check(m.territories_shown(), "the world's own surface's territories are drawn (G20)")
 	tl.queue_free()
 	m.handle({"t": "terr", "part": 1, "parts": 1, "l": []})
 	check(m.territory_edges.is_empty() and terr_layer.mesh == null and m.territory_chunks.is_empty(), "an empty terr clears them")
@@ -7251,20 +8456,31 @@ func _icons(hud: Hud) -> void:
 	snode.queue_free()
 	smov.free()
 	vanim.queue_free()
-	# Pollution from the charts, a map view switch, tinted stronger where there is more.
+	# C12: pollution from the charts, a map view switch, tinted stronger where there is more.
 	m.handle({"t": "chart", "cx": 2, "cy": 0, "n": 1, "pal": [[20, 220, 40]], "px": [0], "pol": 900})
 	check(m.map_pollution.get(Vector2i(2, 0)) == 900 and UiSettings.MAP_LAYERS.any(func(l): return l[0] == "map/show_pollution")
 		and MapLayersScript.pollution_alpha(9000.0) > MapLayersScript.pollution_alpha(90.0) and MapLayersScript.pollution_alpha(0.0) == 0.0,
-		"a chart's pollution is kept and the map's Pollution switch tints it, more for more")
+		"a chart's pollution is kept and the map's Pollution switch tints it, more for more (C12)")
 	m.handle({"t": "chart", "cx": 2, "cy": 0, "n": 1, "pal": [[20, 220, 40]], "px": [0]})
 	check(not m.map_pollution.has(Vector2i(2, 0)), "and a chart without pol clears it")
-	# Recipe icons, robots, signals and stops on the map are drawn over the coverage areas.
+	# C11: recipe icons, robots, signals and stops on the map are drawn over the coverage areas.
 	for layers in [ui.map_view.layers, ui.minimap._layers]:
 		var lroot: Node = layers.marks.get_parent()
 		check(lroot.get_child(lroot.get_child_count() - 1) == layers.marks and lroot.get_child(lroot.get_child_count() - 2) == layers.trains
 			and lroot.get_child(0) is CanvasGroup and not layers.has_method("_draw"),
-			"the map's markers draw last, over the electric, logistic and turret areas")
-	# Trains on the map: asked for while a map is open, at most once a second, kept per surface.
+			"the map's markers draw last, over the electric, logistic and turret areas (C11)")
+	# Factorio's minimap draws none of the map view's layers (checked in 2.1.24): with coverage
+	# switched on, the map view shows it and the minimap doesn't; both still mark the stations.
+	var kept_layers := {}
+	for key in ["map/show_electric", "map/show_logistic", "map/show_turrets", "map/show_stops"]:
+		kept_layers[key] = ui.map_view.layers.settings.get_value(key)
+		ui.map_view.layers.settings.set_value(key, key != "map/show_stops", false)
+	check(ui.minimap._layers.minimap and not ui.map_view.layers.minimap
+		and ["electric", "logistic", "turret"].all(func(k): return ui.map_view.layers._shown(k) and not ui.minimap._layers._shown(k)),
+		"the minimap draws no coverage areas while the map view does (as Factorio's)")
+	for key in kept_layers:
+		ui.map_view.layers.settings.set_value(key, kept_layers[key], false)
+	# D11: trains on the map: asked for while a map is open, at most once a second, kept per surface.
 	sent()
 	var was_ready: bool = Bridge.world_ready
 	Bridge.world_ready = true
@@ -7274,33 +8490,35 @@ func _icons(hud: Hud) -> void:
 	Bridge.world_ready = was_ready
 	await get_tree().process_frame
 	var train_asks := sent().filter(func(c): return c.get("t", "") == "mtr")
-	check(train_asks.size() == 1, "a map asks for the trains on it (mtr), at most once a second: %s" % [train_asks])
+	check(train_asks.size() == 1, "a map asks for the trains on it (mtr), at most once a second (D11): %s" % [train_asks])
 	var here: int = m.shown_surface()
 	m.handle({"t": "mtr", "si": here, "part": 1, "parts": 2, "l": [256, 512, 250, 1485, 460, 0xEB1200]})
 	var after_part: int = m.map_trains.size()
 	m.handle({"t": "mtr", "si": here, "part": 2, "parts": 2, "l": [2048, 512, 250, 1485, 460, 0x9A9A9A]})
 	m.handle({"t": "mtr", "si": here + 7, "part": 1, "parts": 1, "l": []})
 	check(after_part == 0 and m.map_trains.size() == 12 and m.map_trains[6] == 2048,
-		"mtr parts make the map's trains, and another surface's don't replace them")
+		"mtr parts make the map's trains, and another surface's don't replace them (D11)")
 	ui.map_view.layers.redraw(Vector2.ZERO, 4.0)
 	await get_tree().process_frame
 	m.handle({"t": "mtr", "si": here, "part": 1, "parts": 1, "l": {}})
 	check(m.map_trains.is_empty(), "an empty mtr clears the map's trains")
-	# What radars cover (cov): the rest of the charted map is dimmed, except round the character.
+	# D12: what radars cover (cov): the rest of the charted map is dimmed, except round the character.
 	m.handle({"t": "mtr", "si": here, "part": 1, "parts": 1, "l": [], "cov": [20, 0, 3]})
 	check(m.map_coverage_known and m.chunk_covered(Vector2i(22, 3), Vector2.ZERO) and not m.chunk_covered(Vector2i(24, 0), Vector2.ZERO)
 		and m.chunk_covered(Vector2i(1, 1), Vector2.ZERO) and not m.chunk_covered(Vector2i(10, 0), Vector2.ZERO),
-		"cov: a radar's square of chunks and the ground round the character count as seen, the rest not")
+		"cov: a radar's square of chunks and the ground round the character count as seen, the rest not (D12)")
 	ui.map_view.layers.redraw(Vector2.ZERO, 0.5)
 	await get_tree().process_frame
+	# A space platform's map: no radars, and the whole platform seen (all), from another surface too.
+	m.handle({"t": "mtr", "si": here, "part": 1, "parts": 1, "l": [], "cov": [], "all": 1})
+	check(m.chunk_covered(Vector2i(40, 40), Vector2(-5000, 0)), "mtr all: a platform's map is seen whole, nothing dimmed")
 	m.handle({"t": "mtr", "si": here, "part": 1, "parts": 1, "l": [], "cov": []})
+	check(not m.chunk_covered(Vector2i(40, 40), Vector2(-5000, 0)), "and the next surface's mtr without all dims again")
 	# D3/D9: quality marks only in Alt-mode; quality marks and alert icons depth tested and cut out.
-	var qm := QualityMarksScript.new()
-	check(qm.alt_mode == false and QualityMarksScript.IconShader.resource_path.ends_with("billboard_icon_cut.gdshader")
+	check(QualityMarksScript.IconShader.resource_path.ends_with("billboard_icon_cut.gdshader")
 		and AlertIconsScript.IconShader.resource_path.ends_with("billboard_icon_cut.gdshader")
 		and ui.has_signal("alt_mode_changed"),
-		"quality marks wait for Alt-mode; quality marks and alert icons are hidden behind buildings and don't flicker")
-	qm.free()
+		"quality marks and alert icons are hidden behind buildings and don't flicker (D3, D9)")
 	# Quality marks are gathered per chunk: a change in one chunk doesn't go through every record.
 	var qw := WorldMirror.new()
 	add_child(qw)
@@ -7319,9 +8537,19 @@ func _icons(hud: Hud) -> void:
 	qm2._gather_entities()
 	check(all_rare == 2 and (qm2._entity_marks.get("rare", []) as Array).size() == 1 and qm2._chunk_marks.has(Vector2i.ZERO)
 		and not qm2._chunk_marks.has(Vector2i(1, 0)), "quality marks: a changed chunk is gathered again alone")
+	qm2.model = ui.model
+	qm2._process(0.0)
+	var marks_off := 0
+	for mmi in qm2._layers.values():
+		marks_off += (mmi as MultiMeshInstance3D).multimesh.visible_instance_count
+	qm2.alt_mode = true
+	qm2._process(0.0)
+	var rare_layer = qm2._layers.get("rare")
+	check(marks_off == 0 and rare_layer != null and (rare_layer as MultiMeshInstance3D).multimesh.visible_instance_count == 1,
+		"quality marks show only in Alt-mode (D3): %d without it, the rare building's with it" % marks_off)
 	qm2.queue_free()
 	qw.queue_free()
-	# Belts far away show an icon per lane (bfar), and the client asks for them (bfar r).
+	# #2 / B2: belts far away show an icon per lane (bfar), and the client asks for them (bfar r).
 	var lanes := BeltLanesScript.new()
 	add_child(lanes)
 	check(lanes._materials.size() == 1, "lane icons' shader is set up at start-up, not with the first far belt (21 ms on a real base)")
@@ -7351,8 +8579,8 @@ func _icons(hud: Hud) -> void:
 	lane_world.free()
 	lanes.handle({"t": "bfar", "cx": 3, "cy": 1, "l": []})
 	check(lane_icons == 3 and lanes.icons_in(Vector2i(3, 1)) == 0 and Settings.get_value("graphics", "belt_distance") != null,
-		"bfar: an icon per lane carrying something, an empty list clears the chunk, with a distance setting")
-	# A lane is drawn with as many icons as it holds, spread along the belt, neighbours a step apart.
+		"bfar: an icon per lane carrying something, an empty list clears the chunk, with a distance setting (#2, B2)")
+	# G17: a lane is drawn with as many icons as it holds, spread along the belt, neighbours a step apart.
 	var dense: Dictionary = BeltLanesScript.Job.build([100 * 256, 40 * 256, 4, 1, 2, 101 * 256, 40 * 256, 4, 0, 2], [4, 4, 0, 2], 0.2)
 	var dense_xs: Array = []
 	var dense_buf: PackedFloat32Array = dense.get(1, PackedFloat32Array())
@@ -7361,16 +8589,16 @@ func _icons(hud: Hud) -> void:
 		dense_xs.append(snappedf(dense_buf[j * stride + 3], 0.001))
 	check(BeltLanesScript.Job.icon_count(dense) == 10 and dense_xs == [99.625, 99.875, 100.125, 100.375]
 		and dense_buf.size() >= stride * 2 and dense_buf[7] != dense_buf[stride + 7],
-		"bfar c: a full lane is four icons along its belt (an east belt's along x), every other one a step higher: %s" % [dense_xs])
+		"bfar c: a full lane is four icons along its belt (an east belt's along x), every other one a step higher (G17): %s" % [dense_xs])
 	# Each icon carries its belt's centre (custom data), and the shader hands over belt by belt: no
 	# band where a belt shows both its moving items and its icons (owner: overlap between far and close).
 	check(dense_buf[12] == 100.0 and dense_buf[13] == 40.0 and dense_buf[stride * 3 + 12] == 100.0
 		and BeltLanesScript.LaneShader.code.contains("INSTANCE_CUSTOM") and BeltLanesScript.LaneShader.code.contains("abs(belt - focus)"),
 		"lane icons carry their belt's centre, and the shader leaves out whole belts inside the square")
 	lanes.near = 48
-	check(int(Settings.DEFAULTS["graphics"]["belt_distance"]) == 160 and int(Settings.DEFAULTS["graphics"]["belt_updates"]) == 6000
+	check(int(Settings.DEFAULTS["graphics"]["belt_distance"]) == 160 and int(Settings.DEFAULTS["graphics"]["belt_updates"]) == -1
 		and not Settings.DEFAULTS["graphics"].has("belt_near_distance") and is_equal_approx(lanes.near_edge(), 46.0),
-		"one Belt item distance (160) and Belt updates (6,000) by default; before the mod says its square, lane icons start just inside it")
+		"one Belt item distance (160) and Moving belt items Automatic by default; before the mod says its square, lane icons start just inside it")
 	# Stacks far away: each lane's icons are piles as high as its stacks (bfar h), a step apart.
 	var piled: Dictionary = BeltLanesScript.Job.build([100 * 256, 40 * 256, 4, 1, 2], [2, 1], 0.2, [4, 1])
 	var piled_buf: PackedFloat32Array = piled.get(1, PackedFloat32Array())
@@ -7382,14 +8610,14 @@ func _icons(hud: Hud) -> void:
 		piled_ok = piled_ok and absf(float(piled_ys[j]) - (0.2 + 0.07 * j)) < 0.002
 	check(piled_ok,
 		"bfar h: a lane of stacks of 4 is two piles of four icons, each a step higher in one place: %s" % [piled_ys])
-	# Lane icons start where the items drawn now were read (bi fx, fy, fr), not round the camera,
+	# G16: lane icons start where the items drawn now were read (bi fx, fy, fr), not round the camera,
 	# which runs ahead while panning; at any Belt items in full distance; exactly there, no overlap.
 	lanes.focus = Vector2(300, 0)
 	lanes.covered = Vector3(200, 10, 64)
 	var handover_ok := lanes.hand_over_centre() == Vector2(200, 10) and is_equal_approx(lanes.near_edge(), 64.0)
 	lanes.covered = Vector3(0, 0, -1)
 	check(handover_ok and lanes.hand_over_centre() == Vector2(300, 0) and is_equal_approx(lanes.near_edge(), 46.0),
-		"lane icons hand over exactly at the square belt items cover, else round the focus")
+		"lane icons hand over exactly at the square belt items cover, else round the focus (G16)")
 	# The worker path: messages wait for a job, chunks are made within the frame budget.
 	lanes.sync = false
 	lanes.handle({"t": "bfar", "cx": 4, "cy": 1, "l": [130 * 256, 40 * 256, 0, 1, 2], "c": [4, 3]})
@@ -7411,8 +8639,40 @@ func _icons(hud: Hud) -> void:
 		await get_tree().process_frame
 	check(not icon_was_cached and lanes.icons_in(Vector2i(5, 1)) == 2 and BeltLanesScript.ItemIcons.is_cached("zenith-test-lane-item")
 		and lanes._icon_task < 0, "bfar: a new item's icon is loaded on a worker and cached, then its chunk is drawn")
+	# Moving belt items' Automatic keeps the bridge's reading within its share of the server's tick:
+	# each update says what it took (bi w over p ticks), and with frames and the game to spare the cap
+	# grows a fifth only while that would still fit AUTO_WORK units a tick; a quarter over shrinks it.
+	var work_items = BeltItemsScript.new()
+	add_child(work_items)
+	work_items._sync = true
+	work_items.lanes = lanes
+	work_items.handle({"t": "bi", "k": 600, "p": 6, "w": 9000, "l": []})
+	var work_heard: float = lanes.bridge_work
+	work_items.queue_free()
+	var cap_was: float = BeltLanesScript.auto_cap
+	var ready_was: bool = Bridge.world_ready
+	Bridge.world_ready = true
+	var auto_caps: Array = []
+	var covered_was: Vector3 = lanes.covered
+	# The last: the mod's square reaches the whole belt item distance (bi fr = n), so the cap stops
+	# nothing (an empty stretch) and growing it would only make the next busy belts dear.
+	for work in [-1.0, 500.0, BeltLanesScript.AUTO_WORK * 0.9, BeltLanesScript.AUTO_WORK * 1.3, 400.0]:
+		BeltLanesScript.auto_cap = 6000.0
+		lanes.bridge_work = work
+		lanes.covered = Vector3(0.0, 0.0, float(lanes.near)) if work == 400.0 else Vector3(0.0, 0.0, 12.0)
+		lanes._frames = PackedFloat32Array()
+		lanes._auto_t = 0.0
+		for i in 101:
+			lanes._auto(0.01)  # a second of 10 ms frames: room to spare
+		auto_caps.append(roundi(BeltLanesScript.auto_cap))
+	Bridge.world_ready = ready_was
+	BeltLanesScript.auto_cap = cap_was
+	lanes.bridge_work = -1.0
+	lanes.covered = covered_was
+	check(is_equal_approx(work_heard, 1500.0) and auto_caps == [7200, 7200, 6000, 4800, 6000],
+		"Moving belt items' Automatic grows only while the bridge's reading fits its share of the tick (bi w / p) and the cap is what stops it (bi fr < n): heard %.0f a tick, caps %s" % [work_heard, auto_caps])
 	lanes.queue_free()
-	# An update drops at once the items outside the square it covers (lane icons take over there).
+	# G16: an update drops at once the items outside the square it covers (lane icons take over there).
 	var sq_items = BeltItemsScript.new()
 	add_child(sq_items)
 	sq_items._sync = true
@@ -7421,7 +8681,7 @@ func _icons(hud: Hud) -> void:
 	sq_items.handle({"t": "bi", "k": 606, "fx": 30 * 256, "fy": 0, "fr": 24, "l": [2, 1, 20 * 256, 0]})
 	sq_items._process(0.016)
 	check(sq_items.count() == 1 and sq_items.covered() == Vector3(30, 0, 24),
-		"belt items: an item outside the new update's square goes at once, and the square is known: %d, %s" % [sq_items.count(), sq_items.covered()])
+		"belt items: an item outside the new update's square goes at once, and the square is known (G16): %d, %s" % [sq_items.count(), sq_items.covered()])
 	sq_items.queue_free()
 	# Items on a real server's belts were thought invisible: a full loop of plain iron plates far from
 	# the map's origin (busy_base.py --big), sent as differences with the square round the character.
@@ -7448,11 +8708,11 @@ func _icons(hud: Hud) -> void:
 	var far_mmi: MultiMeshInstance3D = far_items._cards._kinds.get(1)
 	var far_ok := far_mmi != null and far_mmi.multimesh.visible_instance_count == 40
 	if far_ok:
-		var fb: PackedFloat32Array = far_mmi.multimesh.buffer
-		for n in 40:
-			var o := n * BeltItemsScript.STRIDE
+		var fb: Array = far_items.drawn(1)
+		far_ok = fb.size() == 40
+		for n in fb.size():
 			var want := Vector2(-48.5 + n * 0.25, 56.5 + (0.25 if n % 2 == 0 else -0.25))
-			if Vector2(fb[o + 3], fb[o + 11]).distance_to(want) > 0.01 or fb[o + 7] <= belt_top or fb[o] == 0.0:
+			if fb[n] == null or Vector2(fb[n][0].x, fb[n][0].z).distance_to(want) > 0.01 or fb[n][0].y <= belt_top or float(fb[n][1]) == 0.0:
 				far_ok = false
 	check(far_ok and far_items.count() == 40, "belt items far from the origin, as a real server sends them, are all drawn where sent and above the belt (%d tracked, top %.3f)" % [far_items.count(), belt_top])
 	far_items.queue_free()
@@ -7467,15 +8727,10 @@ func _icons(hud: Hud) -> void:
 		pile_items.handle(pile_msg.duplicate())
 		pile_items._process(0.016)
 	var drawn_at := func(items, x: float) -> Array:
-		var mmi: MultiMeshInstance3D = items._cards._kinds.get(1)
 		var ys: Array = []
-		if mmi == null:
-			return ys
-		var buf: PackedFloat32Array = mmi.multimesh.buffer
-		for n in mmi.multimesh.visible_instance_count:
-			var o: int = n * BeltItemsScript.STRIDE
-			if buf[o] != 0.0 and absf(buf[o + 3] - x) < 0.01:
-				ys.append(snappedf(buf[o + 7], 0.001))
+		for e in items.drawn(1):
+			if e != null and absf(e[0].x - x) < 0.01:
+				ys.append(snappedf(e[0].y, 0.001))
 		ys.sort()
 		return ys
 	var pile_ys: Array = drawn_at.call(pile_items, 2.0)
@@ -7554,13 +8809,66 @@ func _icons(hud: Hud) -> void:
 	belt_cfg.set_value("graphics", "belt_near_distance", 48)
 	belt_cfg.save("user://ui-test-belt-rename.cfg")
 	Settings.use_file("user://ui-test-belt-rename.cfg")
-	var renamed_ok: bool = int(Settings.get_value("graphics", "belt_distance")) == 320 and int(Settings.get_value("graphics", "belt_updates")) == 6000
+	var renamed_ok: bool = int(Settings.get_value("graphics", "belt_distance")) == 320 and int(Settings.get_value("graphics", "belt_updates")) == -1
 	belt_cfg = ConfigFile.new()
 	belt_cfg.load("user://ui-test-belt-rename.cfg")
 	renamed_ok = renamed_ok and not belt_cfg.has_section_key("graphics", "belt_far_distance") and not belt_cfg.has_section_key("graphics", "belt_near_distance")
 	Settings.use_file(belt_path_was)
 	DirAccess.remove_absolute(ProjectSettings.globalize_path("user://ui-test-belt-rename.cfg"))
 	check(renamed_ok, "a settings file with the two old belt distances keeps the far one as the Belt item distance and drops both")
+	# The old Items on belts (models or icons) is Items in 3D's 0: an old file's icons carry over,
+	# and Items in 3D alone decides the look.
+	var cards_script := preload("res://scripts/world/item_cards.gd")
+	var look_cfg := ConfigFile.new()
+	look_cfg.set_value("graphics", "item_models", false)
+	look_cfg.save("user://ui-test-item-look.cfg")
+	Settings.use_file("user://ui-test-item-look.cfg")
+	Settings.apply_item_look()
+	var look_ok: bool = int(Settings.get_value("graphics", "item_models_max")) == 0 and not cards_script.use_models
+	Settings.set_value("graphics", "item_models_max", 500)
+	look_ok = look_ok and cards_script.use_models and cards_script.model_cap == 500
+	Settings.use_file(belt_path_was)
+	Settings.apply_item_look()
+	DirAccess.remove_absolute(ProjectSettings.globalize_path("user://ui-test-item-look.cfg"))
+	check(look_ok, "an old file's Items on belts: Icons becomes Items in 3D 0 (icons); Items in 3D above 0 brings the models back")
+	# A 0.1.2 file moved over to 0.1.3's belt settings: Items on belts: Icons is Items in 3D's 0;
+	# Smooth belt items and item icons, which left the menu, come back on; High's Belt updates of
+	# 6,000 is Automatic, as High is now (once: a 6,000 chosen afterwards stays).
+	var old_cfg := ConfigFile.new()
+	old_cfg.set_value("meta", "migrated", true)
+	old_cfg.set_value("meta", "ssao_off", true)
+	for key in Settings.PRESETS["high"]:
+		old_cfg.set_value("graphics", key, Settings.PRESETS["high"][key])
+	old_cfg.set_value("graphics", "belt_updates", 6000)
+	old_cfg.set_value("graphics", "item_models", false)
+	old_cfg.set_value("graphics", "item_icons", false)
+	old_cfg.set_value("graphics", "belt_smooth", false)
+	old_cfg.save("user://ui-test-012.cfg")
+	Settings.use_file("user://ui-test-012.cfg")
+	var moved_012: Array = [int(Settings.get_value("graphics", "item_models_max")), Settings.get_value("graphics", "item_icons"),
+		Settings.get_value("graphics", "belt_smooth"), int(Settings.get_value("graphics", "belt_updates")), Settings.preset_now()]
+	Settings.set_value("graphics", "belt_updates", 6000)
+	Settings.use_file("user://ui-test-012.cfg")
+	var chosen_after := int(Settings.get_value("graphics", "belt_updates"))
+	old_cfg = ConfigFile.new()
+	old_cfg.load("user://ui-test-012.cfg")
+	var gone_012: bool = not old_cfg.has_section_key("graphics", "item_models") and not old_cfg.has_section_key("graphics", "item_icons")
+	# On a preset of its own (Ultra's view distance with 6,000): the player's own cap, kept.
+	old_cfg = ConfigFile.new()
+	old_cfg.set_value("meta", "migrated", true)
+	old_cfg.set_value("graphics", "belt_updates", 6000)
+	old_cfg.set_value("graphics", "view_radius", 14)
+	old_cfg.set_value("graphics", "item_models", "yes")  # not a bool: dropped, not read as one
+	old_cfg.save("user://ui-test-012.cfg")
+	Settings.use_file("user://ui-test-012.cfg")
+	var custom_cap := int(Settings.get_value("graphics", "belt_updates"))
+	var odd_models := int(Settings.get_value("graphics", "item_models_max"))
+	Settings.use_file(belt_path_was)
+	DirAccess.remove_absolute(ProjectSettings.globalize_path("user://ui-test-012.cfg"))
+	check(moved_012 == [0, true, true, -1, "high"] and chosen_after == 6000 and gone_012
+		and custom_cap == 6000 and odd_models == Settings.ITEM_MODELS_ALL,
+		"a 0.1.2 settings file is moved over: Icons to Items in 3D 0, hidden belt switches back on, High's 6,000 to Automatic once (%s, then %d; custom %d, %d)"
+		% [moved_012, chosen_after, custom_cap, odd_models])
 	# Factorio's table_to_json writes a float that isn't finite as a bare inf or nan: such a message
 	# (4 in a 30-minute session on a real busy base) was dropped whole. It is read, those as numbers.
 	var bad_before := int(Bridge.stats.get("bad_json", 0))
@@ -7609,8 +8917,8 @@ func _icons(hud: Hud) -> void:
 	var lifts: Dictionary = DecorativeLayer.LAYER_LIFT
 	check(lifts["decals"] < lifts["ground-layer-1"] and lifts["ground-layer-4"] < lifts["floor"] and lifts["floor"] < lifts["decorative"]
 		and DecorativeLayer.TILE_STEP * DecorativeLayer.TILE_STEPS <= lifts["ground-layer-1"] - lifts["decals"],
-		"flat decoratives lie in Factorio's layer order, steps within a layer never reaching the next")
-	check(BeltItemsScript.LAYERS > 1 and BeltItemsScript.LAYER_STEP > 0.0, "items on belts sit a step apart by id, so overlapping cards don't flicker")
+		"flat decoratives lie in Factorio's layer order, steps within a layer never reaching the next (D1)")
+	check(BeltItemsScript.LAYERS > 1 and BeltItemsScript.LAYER_STEP > 0.0, "items on belts sit a step apart by id, so overlapping cards don't flicker (D4)")
 	# Gleba fights: the premature wrigglers a dying stomper lets out are wrigglers of their tier, not
 	# orange boxes, and stomper shells have models of their own (not a cream box).
 	var premature_ok := true
@@ -7659,7 +8967,7 @@ func _icons(hud: Hud) -> void:
 	var glide_at = layers[0][1]
 	check(glide_at != null and (glide_at as Vector3).x >= 5.5 - 0.01 and (glide_at as Vector3).x <= 5.75 + 0.01,
 		"an item continues its glide across an update (x %s between 5.5 and 5.75)" % [glide_at])
-	# Ground clutter is drawn around the character (the rig's target), not the camera.
+	# C4: ground clutter is drawn around the character (the rig's target), not the camera.
 	var decor := DecorativeLayer.new()
 	var follow := Node3D.new()
 	add_child(decor)
@@ -7685,13 +8993,13 @@ func _icons(hud: Hud) -> void:
 	decor._cull()
 	var drawn := func(c: Vector2i) -> int: return (decor._chunks[c].get_child(0) as MultiMeshInstance3D).multimesh.visible_instance_count
 	check(decor._chunks[Vector2i(15, 15)].visible and decor._chunks[Vector2i(19, 15)].visible and not decor._chunks[Vector2i(0, 0)].visible,
-		"clutter shows around the character and not around the camera")
+		"clutter shows around the character and not around the camera (C4)")
 	check(drawn.call(Vector2i(15, 15)) == 100 and drawn.call(Vector2i(19, 15)) == 50 and drawn.call(Vector2i(20, 15)) == 25
 		and not decor._chunks[Vector2i(22, 15)].visible,
-		"clutter thins with distance (all, half, a quarter) out to 192 tiles")
+		"clutter thins with distance (all, half, a quarter) out to 192 tiles (B9)")
 	for n in [decor, follow, rig_node]:
 		n.queue_free()
-	# A robot sent every 2 ticks, the messages arriving unevenly (two at once, then a gap),
+	# #3 / #12: a robot sent every 2 ticks, the messages arriving unevenly (two at once, then a gap),
 	# moves the same distance every frame instead of lurching and stalling.
 	var bots := MoverLayer.new()
 	var bot_protos := ProtoDB.new()
@@ -7766,7 +9074,7 @@ func _icons(hud: Hud) -> void:
 	bots.handle({"t": "mv", "k": sent_tick, "l": [[901, 5, 500 * 256, 0]]})
 	bots._process(1.0 / 60.0)
 	check((bots.position_of(901) as Vector3).x > 400.0, "a long jump is a teleport, not a slow glide")
-	# Locomotives carry two headlights that come on at night, as Factorio's front_light.
+	# B3: locomotives carry two headlights that come on at night, as Factorio's front_light.
 	bot_protos.add_entities([[6, "locomotive", "locomotive", -1.0, -3.0, 1.0, 3.0, 1, 1, 1, 2, 6]])
 	bots.handle({"t": "mv", "k": sent_tick + 1, "l": [[903, 6, 0, 10 * 256, 0]]})
 	var loco = bots._movers[903]
@@ -7774,13 +9082,13 @@ func _icons(hud: Hud) -> void:
 	var dark_by_day: bool = loco.headlights.size() == 2 and not loco.headlights[0].visible
 	bots.set_night(1.0)
 	check(dark_by_day and loco.headlights[0].visible and loco.headlights[0].light_energy > 1.0 and loco.headlights[1].position.z < -2.0,
-		"a locomotive's two headlights at its nose, on at night only")
+		"a locomotive's two headlights at its nose, on at night only (B3)")
 	bots.set_night(0.0)
-	# A train appears facing its way instead of swinging round from north.
+	# C1: a train appears facing its way instead of swinging round from north.
 	bots.handle({"t": "mv", "k": sent_tick + 2, "l": [[902, 5, 0, 0, 250]]})
-	check(is_equal_approx(bots.yaw_of(902), Visuals.orientation_yaw(0.25)), "a new mover appears facing its orientation")
+	check(is_equal_approx(bots.yaw_of(902), Visuals.orientation_yaw(0.25)), "a new mover appears facing its orientation (C1)")
 	bots.queue_free()
-	# No instant boarding of a platform in orbit, and no list of them on a planet either (owner).
+	# #10: no instant boarding of a platform in orbit, and no list of them on a planet either (owner).
 	var pp := PlatformPanel.new()
 	add_child(pp)
 	pp.handle({"on": 0, "here": "nauvis", "dest": [], "l": [{"i": 2, "n": "Orbiter", "loc": "nauvis", "st": "paused"}]})
@@ -7797,7 +9105,7 @@ func _icons(hud: Hud) -> void:
 	check(pp.visible and drop != null and drop.is_visible_in_tree() and to_nauvis != null and sent_one("land").get("t") == "land",
 		"on board over Nauvis, Drop to a planet and Nauvis ride a cargo pod down at once (land), not the old instant drop")
 	pp.queue_free()
-	# Zooming the map in past its closest level drops into Factorio's angle there, and back out.
+	# #6: zooming the map in past its closest level drops into Factorio's angle there, and back out.
 	var cam_holder := Node3D.new()
 	add_child(cam_holder)
 	var cam_rig := CameraRig.new()
@@ -7817,7 +9125,7 @@ func _icons(hud: Hud) -> void:
 	var dropped: bool = ui.remote and cam_rig.in_factorio_view() and cam_rig.orthographic
 	ui.end_remote_view()
 	check(dropped and not cam_rig.in_factorio_view() and not cam_rig.orthographic and cam_rig.target == walker,
-		"zooming the map in drops into the world at Factorio's angle, leaving puts the camera back")
+		"zooming the map in drops into the world at Factorio's angle, leaving puts the camera back (owner's #6)")
 	# Issue #4: zooming back out of that view goes to the map there, at the distance set in Settings >
 	# Camera (past Furthest zoom).
 	var map_out_was = Settings.get_value("camera", "map_zoom_out")
@@ -7875,7 +9183,7 @@ func _icons(hud: Hud) -> void:
 	var normal_f7: bool = cam_rig.orthographic and bool(Settings.get_value("camera", "orthographic"))
 	cam_rig.toggle_projection()
 	check(map_persp and map_f7 and h17_map_said.begins_with("Map view") and normal_back and normal_f7 and h17_normal_said.begins_with("Normal view")
-		and Controls.LIST.any(func(a: Array) -> bool: return a[0] == "toggle_projection" and a[2] == [KEY_F7]),
+		and Controls.LIST.any(func(a: Array) -> bool: return a[0] == "toggle_projection" and a[1] == [KEY_F7]),
 		"H17: the map's view keeps its own projection, F7 switches the one in use (map, then normal) and saves it")
 	Settings.set_value("camera", "map_orthographic", map_ortho_was)
 	Settings.set_value("camera", "orthographic", ortho_was)
@@ -7893,10 +9201,24 @@ func _icons(hud: Hud) -> void:
 	cam_rig.zoom(100.0)
 	check(is_equal_approx(far_goal, 300.0) and is_equal_approx(near_goal, 60.0) and is_equal_approx(cam_rig._distance_goal, 60.0),
 		"H19: the furthest zoom follows its setting (300 lets the wheel out to 300, 60 pulls the view in): %.0f, %.0f" % [far_goal, near_goal])
+	# A `--camera=` view further out than Furthest zoom starts and stays there (RUNNING.md: "start in
+	# that view"); it had glided in to the setting's distance.
+	var view_was := [cam_rig._yaw_goal, cam_rig.yaw_degrees, cam_rig.pitch_degrees, cam_rig.distance, cam_rig.orthographic]
+	cam_rig.configure_from(PackedStringArray(["--camera=0,30,300"]))
+	cam_rig.apply_settings()
+	cam_rig.zoom(1.1)
+	check(is_equal_approx(cam_rig._distance_goal, 300.0) and is_equal_approx(cam_rig.distance, 300.0) and is_equal_approx(cam_rig.pitch_degrees, 30.0),
+		"--camera=0,30,300 starts and stays 300 tiles out (zoomed out too) with Furthest zoom at 60: %.0f, %.0f" % [cam_rig._distance_goal, cam_rig.distance])
+	cam_rig._arg_distance = 0.0
+	cam_rig._yaw_goal = view_was[0]
+	cam_rig.yaw_degrees = view_was[1]
+	cam_rig.pitch_degrees = view_was[2]
+	cam_rig.distance = view_was[3]
+	cam_rig.orthographic = view_was[4]
 	Settings.set_value("camera", "max_zoom", max_zoom_was)
 	cam_rig.apply_settings()
 	cam_rig._distance_goal = zoom_goal_was
-	# F6 snaps to Factorio's view on every press unless the view is exactly Factorio's.
+	# Owner's G5: F6 snaps to Factorio's view on every press unless the view is exactly Factorio's.
 	# Zoomed, turned or tilted there (the wheel, a nudge of the middle mouse), a press went back to
 	# the view before instead, so it took another to get Factorio's view.
 	cam_rig.pitch_degrees = 60.0
@@ -7914,12 +9236,12 @@ func _icons(hud: Hud) -> void:
 		f6_ok = f6_ok and cam_rig.in_factorio_view() and [cam_rig._yaw_goal, cam_rig.pitch_degrees, cam_rig._distance_goal] == snapped
 	cam_rig.toggle_factorio_view()
 	check(f6_ok and not cam_rig.in_factorio_view() and cam_rig.pitch_degrees == 60.0 and cam_rig._distance_goal == before_f6,
-		"F6 after zooming, turning or tilting Factorio's view snaps back to it at once; once more goes back to the view before")
+		"F6 after zooming, turning or tilting Factorio's view snaps back to it at once; once more goes back to the view before (G5)")
 	cam_rig.first_person = true
 	cam_rig.toggle_factorio_view()
 	var from_fp: bool = cam_rig.in_factorio_view() and not cam_rig.first_person
 	cam_rig.toggle_factorio_view()
-	check(from_fp, "F6 in first person leaves it for Factorio's view")
+	check(from_fp, "F6 in first person leaves it for Factorio's view (G5)")
 	cam_rig.toggle_factorio_view()
 	cam_rig.zoom(1.3)
 	ui._zoom_into_world(Vector2(40, 12))
@@ -7960,7 +9282,7 @@ func _icons(hud: Hud) -> void:
 	ui.hub_at = hub_was
 	ui.remote = remote_was
 	check(hub_map_open, "M opens the map while the character sits in a platform's hub, travelling or not (H8)")
-	# Zooming into another surface's map asks the mod to stream that surface (view), and leaving
+	# #5: zooming into another surface's map asks the mod to stream that surface (view), and leaving
 	# the remote view goes back to the character's.
 	sent()
 	var other_si: int = ui.model.character_si + 5
@@ -7972,13 +9294,13 @@ func _icons(hud: Hud) -> void:
 	var view_back := sent_one("view")
 	check(view_ask.get("si") == other_si and view_ask.get("x") == 8 * 256 and viewing_was == other_si
 		and view_back.get("si") == 0 and ui.viewing_si == 0,
-		"zooming into another surface's map views that surface, and leaving goes back: %s %s" % [view_ask, view_back])
+		"zooming into another surface's map views that surface, and leaving goes back (#5): %s %s" % [view_ask, view_back])
 	ui.model.map_si = 0
 	await _check_ride(cam_rig, viewer, ui)
 	ui.player = player_was
 	viewer.free()
 	cam_holder.queue_free()
-	# The character's own position, sent every 2 ticks and arriving unevenly, moves evenly, so
+	# #19: the character's own position, sent every 2 ticks and arriving unevenly, moves evenly, so
 	# the run cycle steps evenly too (exoskeleton speed: 0.3 tiles a tick).
 	var runner := Avatar.new()
 	add_child(runner)
@@ -7994,7 +9316,7 @@ func _icons(hud: Hud) -> void:
 	var rsteps: Array[float] = []
 	for i in range(60, rx.size()):
 		rsteps.append(rx[i] - rx[i - 1])
-	check(rsteps.min() > 0.27 and rsteps.max() < 0.33, "the character runs at an even speed between uneven updates: %.3f to %.3f a frame at 0.3" % [rsteps.min(), rsteps.max()])
+	check(rsteps.min() > 0.27 and rsteps.max() < 0.33, "the character runs at an even speed between uneven updates (#19): %.3f to %.3f a frame at 0.3" % [rsteps.min(), rsteps.max()])
 	runner.queue_free()
 	# On a busy save the server runs below 60 UPS (here 40, a `me` every 3 frames): the avatar's clock
 	# follows the measured rate, so the character still runs evenly instead of lurching.
@@ -8017,7 +9339,7 @@ func _icons(hud: Hud) -> void:
 		"at 40 UPS the character still runs evenly: %.3f to %.3f tiles a frame (0.100 expected), clock at %.1f ticks a second"
 		% [srsteps.min(), srsteps.max(), slow_runner._clock.rate])
 	slow_runner.queue_free()
-	# Walking at 20 degrees the mod zig-zags between north and north-east (puppet.lua's
+	# B7: walking at 20 degrees the mod zig-zags between north and north-east (puppet.lua's
 	# angle_step); the avatar is drawn straight along the line, facing it, at an even speed.
 	var zig := Avatar.new()
 	add_child(zig)
@@ -8054,7 +9376,7 @@ func _icons(hud: Hud) -> void:
 		zsteps.append(drawn_along[i] - drawn_along[i - 1])
 	var face_off := absf(wrapf(zig.rotation.y + zrad, -PI, PI))
 	check(real_side > 0.02 and jitter < 0.004 and zsteps.min() > 0.12 and zsteps.max() < 0.16 and face_off < 0.02,
-		"walking at an angle is drawn straight along it: the real path strays %.3f tiles, the drawn one moves %.4f sideways a frame at most, %.3f to %.3f along, facing %.3f off"
+		"walking at an angle is drawn straight along it (B7): the real path strays %.3f tiles, the drawn one moves %.4f sideways a frame at most, %.3f to %.3f along, facing %.3f off"
 		% [real_side, jitter, zsteps.min(), zsteps.max(), face_off])
 	# Stopping, the drawn character comes back to where the real one is.
 	for frame in 30:
@@ -8064,14 +9386,14 @@ func _icons(hud: Hud) -> void:
 		zig._process(1.0 / 60.0)
 	check(Vector2(zig.position.x, zig.position.z).distance_to(zpos) < 0.01, "and on stopping it is drawn where the character really is")
 	zig.queue_free()
-	# The character's flashlight, a cone ahead of it at night.
+	# B4: the character's flashlight, a cone ahead of it at night.
 	var me := Avatar.new()
 	add_child(me)
 	me.set_night(0.2)
 	var off: bool = not me._flashlight.visible
 	me.set_night(0.9)
 	check(off and me._flashlight.visible and me._flashlight.light_energy > 1.0 and me._flashlight.rotation.x < 0.0,
-		"the character's flashlight lights the ground ahead, from darkness 0.3 as in Factorio")
+		"the character's flashlight lights the ground ahead, from darkness 0.3 as in Factorio (B4)")
 	# F7: the character's own body and tools cast no shadow from its lights (its head and arms
 	# crossed the flashlight while running), and the facing, which the flashlight follows, keeps an
 	# angled walk's line through a message without the angle and on stopping.
@@ -8102,6 +9424,9 @@ func _icons(hud: Hud) -> void:
 	# distance_per_frame 0.13 / animation_speed 0.6 tiles (the mech's 0.37).
 	var legs := CharacterAnimScript.new()
 	var legs_pose := CharacterPoseScript.new()
+	for i in 60:  # the gait follows the smoothed speed: let it settle at Factorio's running speed
+		legs.running = true
+		legs.step(legs_pose, 1.0 / 60.0, 0.15)
 	var loops := 0.0
 	for i in 100:
 		var before: float = legs._run_phase
@@ -8111,10 +9436,11 @@ func _icons(hud: Hud) -> void:
 	var per_loop := 15.0 / loops
 	legs.mech = true
 	var mech_before: float = legs._run_phase
-	legs.step(legs_pose, 1.0 / 60.0, 1.0)
-	var mech_per_loop := 1.0 / (fposmod(legs._run_phase - mech_before, TAU) / TAU)
+	legs.step(legs_pose, 1.0 / 60.0, 0.15)
+	var mech_per_loop := 0.15 / (fposmod(legs._run_phase - mech_before, TAU) / TAU)
 	check(absf(per_loop - 4.767) < 0.01 and absf(mech_per_loop - 7.73) < 0.01,
 		"the run cycle takes Factorio's 4.77 tiles a loop (7.73 in mech armour), not 2.86 (F8): %.3f, %.3f" % [per_loop, mech_per_loop])
+	_character_motion()
 	# F4: a travelling platform's sky has the planet it left only over the route's first 12% and
 	# the next one only over the last; `d` is thousandths of the route.
 	var MainSky = load("res://scripts/main.gd")
@@ -8249,17 +9575,21 @@ func _icons(hud: Hud) -> void:
 	mech.queue_free()
 	var ents: Dictionary = ItemIcons.index().get("entity", {})
 	check(ents.has("straight-rail") and ents.has("big-rock") and not ents.has("transport-belt"),
-		"icons.json has the icons of entities no item is named after: %d" % ents.size())
+		"icons.json has the icons of entities no item is named after (C3): %d" % ents.size())
+	# Plain maths, so before the install's pictures (CI has no Factorio).
+	var near := func(x: float) -> float: return PlatformPanel.planet_nearness(x, 0.12)
+	check(near.call(0.0) == 1.0 and near.call(0.06) > 0.4 and near.call(0.06) < 0.6 and near.call(0.5) == 0.0 and near.call(0.97) > 0.7,
+		"while travelling, the planet left falls away and the next one comes near (#15)")
 	if ItemIcons.find_data_dir() == "":
 		print("skip technology pictures: no Factorio install")
 		return
 	for e in ["straight-rail", "big-rock", "curved-rail-a"]:
 		var tex := Kit.item_icon(e)
-		check(tex != null and not Kit._swatches.has(e), "%s's tooltip shows its icon, not a coloured square" % e)
-	# The planet below a platform is Factorio's own picture of it.
+		check(tex != null and not Kit._swatches.has(e), "%s's tooltip shows its icon, not a coloured square (C3)" % e)
+	# #15: the planet below a platform is Factorio's own picture of it.
 	var MainScript = load("res://scripts/main.gd")
 	check(MainScript.planet_picture("nauvis") != null and MainScript.planet_picture("vulcanus") != null and MainScript.planet_picture("") == null,
-		"the real planets' pictures for space's sky")
+		"the real planets' pictures for space's sky (owner's #15)")
 	# Their whole-surface maps for the sphere below the platform, read on a worker thread.
 	var first_maps: Dictionary = MainScript.planet_maps_soon("vulcanus")
 	var maps_until := Time.get_ticks_msec() + 10000
@@ -8269,9 +9599,6 @@ func _icons(hud: Hud) -> void:
 	check(first_maps.is_empty() and vmaps.has("map") and vmaps.has("clouds") and vmaps.has("emission")
 		and (vmaps["map"] as Texture2D).get_width() >= 2048 and MainScript.planet_maps_soon("space-location-x").is_empty(),
 		"a planet's 2048-wide surface, cloud and glow maps load on a worker for the sphere below a platform")
-	var near := func(x: float) -> float: return PlatformPanel.planet_nearness(x, 0.12)
-	check(near.call(0.0) == 1.0 and near.call(0.06) > 0.4 and near.call(0.06) < 0.6 and near.call(0.5) == 0.0 and near.call(0.97) > 0.7,
-		"while travelling, the planet left falls away and the next one comes near")
 	var missing := []
 	for t in techs:
 		if GuiAssets.tech_icon(t) == null:
@@ -8283,9 +9610,6 @@ func _icons(hud: Hud) -> void:
 		"the bonus badge is drawn in the bottom-right corner, 256 px as Factorio's tech icons: %s" % [bonus.get_pixel(228, 228)])
 
 
-## Flying robots are drawn together, one MultiMesh per robot kind and part (robot_swarm.gd),
-## with their animation (flying, cargo lamp, working, arms) in each instance's data, instead of a
-## node and several MeshInstance3Ds each.
 ## A server under load slows the mod's costliest updates down (`rate`): movers and belt items then
 ## come two, four or eight times further apart, each message saying how far (`p`). They must still
 ## move the same distance every frame: no stall at the end of each gap, no jump at the next update,
@@ -8433,7 +9757,360 @@ func _belt_lanes_held() -> void:
 	check(lanes.count() == 1 and lanes.position_of(7103) == null,
 		"dl drops a lane's items at once (7103 gone), a lane sent empty lets its items go (7101 going): %d items" % lanes.count())
 	lanes.queue_free()
+	_belt_groups()
 
+
+## Belt groups (`bi` bg, bm; belt_items.lua): a packed lane comes as one record and its items are
+## made here, a gap apart from its front item to the lane's end; when it moves (bm) they glide on
+## under the same ids; sent as items again, the mod's items take over the made ones where they are
+## (handed over, not one vanishing and the other appearing); dl and leaving the square end it.
+func _belt_groups() -> void:
+	var belt = BeltItemsScript.new()
+	add_child(belt)
+	belt._sync = true
+	var key := 9001
+	var lane_y := 40.0 - 0.234
+	var tick := [2000]
+	var send := func(msg: Dictionary) -> void:
+		var m := {"t": "bi", "k": tick[0], "p": 6, "fx": 30 * 256, "fy": 40 * 256, "fr": 24, "l": [], "ln": []}
+		m.merge(msg, true)
+		belt.handle(m)
+		tick[0] += 6
+		for i in 6:
+			belt._process(1.0 / 60.0)
+	var slot_uid := func(s: int) -> int: return -(1 + key * 1048576 + s)
+	var xs := func() -> Array:
+		var out := []
+		for uid in belt._state.items:
+			out.append(snappedf((belt._state.items[uid] as BeltItemsScript.Item).target.x, 0.0001))
+		out.sort()
+		return out
+	# An east belt's north lane: line position 0 at its east edge (x 31), 1 at its west edge.
+	var bg := [key, 1, 31 * 256, roundi(lane_y * 256), 30 * 256, roundi(lane_y * 256), 0, 64, 2048, 1]
+	send.call({"bg": bg})
+	check(belt.count() == 4 and xs.call() == [30.25, 30.5, 30.75, 31.0] and belt._state.items.has(slot_uid.call(0)),
+		"bg: a group's items are made a gap apart from its front to the lane's end: %s" % str(xs.call()))
+	# It creeps on 1/16 tile: front item now at 3/16. The one at the front left the lane, one came in.
+	var second: BeltItemsScript.Item = belt._state.items.get(slot_uid.call(1))
+	send.call({"bm": [key, 48, 6]})
+	check(belt.count() == 4 and xs.call() == [30.0625, 30.3125, 30.5625, 30.8125]
+		and belt._state.items.get(slot_uid.call(1)) == second and not belt._state.items.has(slot_uid.call(0)),
+		"bm: a group that moved has its items glide on under the same ids (the front one gone, one come in): %s" % str(xs.call()))
+	# The one that came in took no one's place: it glides in from behind (where it was an update ago)
+	# rather than standing still a whole update where it appeared.
+	var came: BeltItemsScript.Item = belt._state.items.get(slot_uid.call(4))
+	check(came != null and is_equal_approx(came.from.x, 30.0) and is_equal_approx(came.step.x, 0.0625) and belt.stats["glided_in"] == 1,
+		"a group's item that came in glides in from behind over its move: from %s, step %s, %d glided in"
+		% [came.from if came != null else null, came.step if came != null else null, belt.stats["glided_in"]])
+	var quiet: Array = xs.call()
+	var fresh0: int = belt.stats["fresh"]
+	send.call({})
+	check(xs.call() == quiet and belt.count() == 4 and belt.stats["fresh"] == fresh0 and int(belt._state.lane_frame[key]) < belt._state.frame,
+		"a group not moved in an update stays where it is, its items held rather than made again: %s" % str(xs.call()))
+	# It moves on again after standing: made again from where it is.
+	send.call({"bm": [key, 32, 12]})
+	check(belt.count() == 4 and belt._state.items.get(slot_uid.call(1)) != null
+		and is_equal_approx((belt._state.items.get(slot_uid.call(1)) as BeltItemsScript.Item).target.x, 30.875),
+		"a group that stood still and moves again glides on under the same ids: %s" % str(xs.call()))
+	quiet = xs.call()
+	# Sent as items again: the mod's items are where the made ones are, and take them over.
+	var adopted0: int = belt.stats["adopted"]
+	var items := []
+	var ids := [7301, 7302, 7303, 7304]
+	for j in 4:
+		items.append_array([ids[j], 1, roundi((30.875 - 0.25 * j) * 256), roundi(lane_y * 256)])
+	var drawn = belt._state.items.get(slot_uid.call(1))
+	send.call({"l": items, "ln": [key, 4]})
+	check(belt.count() == 4 and belt._state.groups.is_empty() and belt.stats["adopted"] - adopted0 == 4
+		and belt._state.items.get(7301) == drawn,
+		"a group sent as items again: the mod's items take over the made ones (4 handed over, %d), no group left: %d items"
+		% [belt.stats["adopted"] - adopted0, belt.count()])
+	# A group again, then dropped (dl), then one outside the square.
+	bg[6] = 16
+	send.call({"bg": bg, "ln": [key, 0]})
+	check(not belt._state.groups.is_empty(), "a lane can be a group again")
+	send.call({"dl": [key]})
+	check(belt.count() == 0 and belt._state.groups.is_empty(), "dl drops a group and its items: %d items" % belt.count())
+	var far_bg := [key + 1, 1, 90 * 256, 40 * 256, 89 * 256, 40 * 256, 0, 64, 2048, 2]
+	send.call({"bg": far_bg})
+	check(belt.count() == 0 and belt._state.groups.is_empty(), "a group outside the square the update covers is dropped: %d items" % belt.count())
+	var pile_bg := [key + 2, 1, 31 * 256, 41 * 256, 30 * 256, 41 * 256, 0, 64, 2048, 3]
+	send.call({"bg": pile_bg})
+	var pile: BeltItemsScript.Item = belt._state.items.get(-(1 + (key + 2) * 1048576))
+	check(pile != null and pile.count == 3, "a group of stacks of 3 makes piles of 3")
+	belt.queue_free()
+	_belt_runs()
+	_belt_runs_groups()
+	_belt_runs_backed_up()
+	_belt_runs_past_known()
+
+
+## Straight runs (`bi` pl, belt_items.lua): a plain lane comes once with its items and where it is,
+## and its items are moved here from then on, as Factorio moves them: at the belt's speed, stopping
+## a gap behind the item in front or behind the watched lane in front's hindmost item, never into it
+## until that lane's sending has them; what leaves the watched lane behind goes on into the run.
+func _belt_runs() -> void:
+	var belt = BeltItemsScript.new()
+	add_child(belt)
+	belt._sync = true
+	var lane_y := 40.0 - 0.234
+	var tick := [5000]
+	# An east run of six belts at x 30..36, lane 1: belt j's key, its lane's line position 0 at x 31 + j.
+	var key := func(j: int) -> int: return (700 + j) * 8 + 1
+	var send := func(msg: Dictionary) -> void:
+		var m := {"t": "bi", "k": tick[0], "p": 6, "fx": 33 * 256, "fy": 40 * 256, "fr": 24, "l": [], "ln": []}
+		m.merge(msg, true)
+		belt.handle(m)
+		tick[0] += 6
+		for i in 6:
+			belt._process(1.0 / 60.0)
+	var item := func(uid: int, x: float) -> Array: return [uid, 1, roundi(x * 256), roundi(lane_y * 256)]
+	var x_of := func(uid: int) -> float:
+		var it = belt._state.items.get(uid)
+		return snappedf((it as BeltItemsScript.Item).target.x, 0.0001) if it != null else NAN
+	var pl := []
+	for j in range(1, 5):
+		pl.append_array([key.call(j), key.call(j - 1), key.call(j + 1), (31 + j) * 256, roundi(lane_y * 256), (30 + j) * 256, roundi(lane_y * 256), 2048])
+	# Belt 2's item, the run's ends empty.
+	send.call({"l": item.call(8001, 32.5), "ln": [key.call(0), 0, key.call(2), 1, key.call(5), 0], "pl": pl})
+	check(belt._state.plains.size() == 4 and is_equal_approx(x_of.call(8001), 32.5),
+		"pl: four plain lanes, their item where the mod says: %d lanes, at %s" % [belt._state.plains.size(), x_of.call(8001)])
+	send.call({})
+	check(absf(x_of.call(8001) - 32.6875) < 0.001 and belt.count() == 1,
+		"a plain lane's item goes on at its belt's speed (6 ticks at 1/32: 0.1875) without being sent: at %s" % x_of.call(8001))
+	# Drift checks (pc): one that agrees with what is here asks for nothing; one that doesn't (another
+	# count) has the lane asked for again (bre). The item is 0.5 along belt 2 on the next update's tick.
+	var drift0: int = int(belt.stats.get("drifted", 0))
+	send.call({"pc": [key.call(2), 1, 128, 128, 6]})
+	var agreed: int = int(belt.stats.get("drifted", 0)) - drift0
+	send.call({"pc": [key.call(2), 2, 128, 200, 6]})
+	check(agreed == 0 and int(belt.stats.get("drifted", 0)) - drift0 == 1,
+		"pc: a drift check that agrees asks for nothing (%d), one that doesn't asks for the lane again (%d)" % [agreed, int(belt.stats.get("drifted", 0)) - drift0])
+	for i in 20:
+		send.call({})
+	check(absf(x_of.call(8001) - 35.0) < 0.001 and belt.count() == 1,
+		"it stops at the end of the plain lanes, never into the watched lane in front until that lane has it: at %s" % x_of.call(8001))
+	# Standing here, a drift check is held to a gap from where it stands, not to the belt's pace: 0.3 off
+	# (within a pace-wide tolerance, 0.44 here) asks again.
+	var drift1: int = int(belt.stats.get("drifted", 0))
+	send.call({"pc": [key.call(4), 1, 0, 0, 6]})
+	var agreed1: int = int(belt.stats.get("drifted", 0)) - drift1
+	send.call({"pc": [key.call(4), 1, 77, 77, 6]})
+	check(agreed1 == 0 and int(belt.stats.get("drifted", 0)) - drift1 == 1,
+		"pc on a lane standing here: where it stands agrees (%d), 0.3 off asks again (%d)" % [agreed1, int(belt.stats.get("drifted", 0)) - drift1])
+	send.call({"l": item.call(8001, 35.1), "ln": [key.call(5), 1]})
+	check(absf(x_of.call(8001) - 35.1) < 0.01 and (belt._state.items[8001] as BeltItemsScript.Item).lane == key.call(5),
+		"the watched lane in front's sending has it: it goes on there: at %s" % x_of.call(8001))
+	# The end blocked: four items in the end lane, held; the run's items back up a gap behind them.
+	var full := []
+	for j in 4:
+		full.append_array(item.call(8101 + j, 35.875 - 0.25 * j))
+	var behind: Array = item.call(8201, 33.5) + item.call(8202, 33.25) + item.call(8203, 32.5) + item.call(8204, 31.5)
+	# (The mod sends a plain lane's items with its pl every time it reads it.)
+	send.call({"l": full + behind, "ln": [key.call(5), 4, key.call(3), 2, key.call(2), 1, key.call(1), 1], "pl": pl})
+	for i in 30:
+		send.call({})
+	var backed := [x_of.call(8201), x_of.call(8202), x_of.call(8203), x_of.call(8204)]
+	check(absf(backed[0] - 34.875) < 0.001 and absf(backed[1] - 34.625) < 0.001 and absf(backed[2] - 34.375) < 0.001 and absf(backed[3] - 34.125) < 0.001,
+		"a blocked end backs the run up: each item a gap behind the one in front: %s" % str(backed))
+	# The end freed: the end lane sent empty, the run flows on to its end again.
+	send.call({"ln": [key.call(5), 0]})
+	send.call({})
+	check(x_of.call(8201) > 34.9 and x_of.call(8202) > 34.7,
+		"a freed end lets the run flow: %s %s" % [x_of.call(8201), x_of.call(8202)])
+	# What leaves the watched lane behind goes on into the run.
+	send.call({"l": item.call(8301, 30.9), "ln": [key.call(0), 1]})
+	send.call({"ln": [key.call(0), 0]})
+	var came = belt._state.items.get(8301)
+	check(came != null and (came as BeltItemsScript.Item).lane == key.call(1) and absf(x_of.call(8301) - 31.0875) < 0.005,
+		"an item gone from the lane behind went on into the run, from where it was: lane %s at %s" % [(came as BeltItemsScript.Item).lane if came != null else null, x_of.call(8301)])
+	# A plain lane sent again (the mod reads a chain's lanes again together) without an item: it isn't
+	# on the chain any more (it would be listed in another of its lanes): it goes.
+	var count0: int = belt.count()
+	send.call({"ln": [key.call(1), 0], "pl": pl.slice(0, 8)})
+	send.call({})
+	send.call({})
+	send.call({})
+	check(belt.count() == count0 - 1 and not belt._state.items.has(8301),
+		"a plain lane sent again without an item lets it go: %d items, then %d" % [count0, belt.count()])
+	# Sent in ln without pl: watched again (something was built there); dl drops plain lanes.
+	send.call({"ln": [key.call(3), 0]})
+	check(not belt._state.plains.has(key.call(3)) and belt._state.plains.has(key.call(2)),
+		"a plain lane sent as items without pl is watched again")
+	send.call({"dl": [key.call(1), key.call(2), key.call(4)]})
+	check(belt._state.plains.is_empty(), "dl drops plain lanes: %d left" % belt._state.plains.size())
+	belt.queue_free()
+
+
+
+## A plain chain whose items go on past the last belt the client knows (the stand-in replay's
+## "junction pile": belt_stream_replay.tscn knew only the belts belt_path_check recorded, its chunk
+## indexed whole, so items moved past the last one were held at its lane's end, ~20 at one point at
+## x -284 on the save; recorded with --belt-margin now). A chunk whose snapshot isn't all there yet
+## (walking: indexed part by part) has no such lane ends for real: items go on where the chain has
+## them, a gap apart. In a chunk known whole a lane's end with no belt past it is one: held there.
+func _belt_runs_past_known() -> void:
+	var protos := ProtoDB.new()
+	protos.add_entities([[1, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 170, 50, 1, 1]])
+	protos.add_items([[1, ""]])
+	var lane_y := 43.5 - 0.234  # an east belt's lane 1, north of its centre
+	var key := func(j: int) -> int: return (900 + j) * 8 + 1
+	var pl := []
+	for j in range(1, 5):
+		pl.append_array([key.call(j), key.call(j - 1), key.call(j + 1), (41 + j) * 256, roundi(lane_y * 256), (40 + j) * 256, roundi(lane_y * 256), 2048])
+	var spread := []
+	for whole in [false, true]:
+		var belt = BeltItemsScript.new()
+		belt.protos = protos
+		add_child(belt)
+		belt._sync = true
+		# Only belts x 40..43 known (east, one chunk): the chain's lanes run on to x 45.
+		var recs: Array = []
+		for x in range(40, 43):
+			var r := WorldMirror.Rec.new()
+			r.unit = recs.size() + 1
+			r.key = r.unit
+			r.proto_id = 1
+			r.pos = Vector2(x + 0.5, 43.5)
+			r.dir = 4
+			r.extra = {"s": "s"}
+			r.chunk = WorldMirror.chunk_of(r.pos)
+			recs.append(r)
+		belt.index_chunk(Vector2i(1, 1), recs, whole)
+		var tick := [9000]
+		var send := func(msg: Dictionary) -> void:
+			var m := {"t": "bi", "k": tick[0], "p": 6, "fx": 43 * 256, "fy": 44 * 256, "fr": 24, "l": [], "ln": []}
+			m.merge(msg, true)
+			belt.handle(m)
+			tick[0] += 6
+			for i in 6:
+				belt._process(1.0 / 60.0)
+		var l := []
+		for j in 4:
+			l.append_array([9501 + j, 1, roundi((42.25 - 0.25 * j) * 256), roundi(lane_y * 256)])
+		send.call({"l": l, "ln": [key.call(0), 0, key.call(1), 1, key.call(2), 3, key.call(5), 0], "pl": pl})
+		for i in 40:
+			send.call({})
+		var xs := []
+		for j in 4:
+			var p = belt.position_of(9501 + j)
+			send.call({})
+			p = belt.position_of(9501 + j)
+			xs.append(snappedf((p as Vector3).x, 0.001) if p != null else NAN)
+		spread.append(xs)
+		belt.queue_free()
+	var apart := true
+	for j in 3:
+		apart = apart and (spread[0][j] as float) - (spread[0][j + 1] as float) > 0.2
+	check(apart and (spread[0][0] as float) > 44.5 and (spread[1][0] as float) <= 43.01,
+		"a chain's items past the belts known in a chunk not all indexed are drawn where the chain has them, a gap apart (%s); in a chunk known whole they stop at the last known lane's end (%s)" % [str(spread[0]), str(spread[1])])
+
+
+## Groups at a run's ends (`bi` bg with `br`): a group's item that left its front behind a run goes on
+## into the run; a run's item going into a group's lane in front is taken over by the group's own
+## item that came in (by place), not left waiting at the run's front.
+func _belt_runs_groups() -> void:
+	var belt = BeltItemsScript.new()
+	add_child(belt)
+	belt._sync = true
+	var lane_y := 50.0 - 0.234
+	var tick := [7000]
+	var key := func(j: int) -> int: return (800 + j) * 8 + 1
+	var send := func(msg: Dictionary) -> void:
+		# (8 ticks apart: a group moves a whole gap at 1/32 a tick.)
+		var m := {"t": "bi", "k": tick[0], "p": 8, "fx": 33 * 256, "fy": 50 * 256, "fr": 24, "l": [], "ln": []}
+		m.merge(msg, true)
+		belt.handle(m)
+		tick[0] += 8
+		for i in 8:
+			belt._process(1.0 / 60.0)
+	var pl := []
+	for j in range(1, 5):
+		pl.append_array([key.call(j), key.call(j - 1), key.call(j + 1), (31 + j) * 256, roundi(lane_y * 256), (30 + j) * 256, roundi(lane_y * 256), 2048])
+	var y := roundi(lane_y * 256)
+	# The lane behind the run (belt 0, x 30..31) is a packed group; the lane in front (belt 5) another.
+	var bg := [key.call(0), 1, 31 * 256, y, 30 * 256, y, 0, 64, 2048, 1, key.call(5), 1, 36 * 256, y, 35 * 256, y, 0, 64, 2048, 1]
+	send.call({"bg": bg, "ln": [key.call(1), 0, key.call(2), 0, key.call(3), 0, key.call(4), 0], "pl": pl})
+	# The group behind moves on a gap: its front item left it, into the run.
+	send.call({"bm": [key.call(0), 0, 8]})
+	var into := 0
+	for uid in belt._state.items:
+		if (belt._state.items[uid] as BeltItemsScript.Item).lane == key.call(1):
+			into += 1
+	check(into == 1, "a group's item that left its front went on into the run behind it: %d in the run" % into)
+	# Many updates of both groups moving: the run's items reach the group in front and are taken over
+	# there, never piling up at the run's front.
+	for i in 40:
+		send.call({"bm": [key.call(0), 0, 8, key.call(5), 0, 8]})
+	var on_run := 0
+	for uid in belt._state.items:
+		var lane: int = (belt._state.items[uid] as BeltItemsScript.Item).lane
+		if lane >= key.call(1) and lane <= key.call(4):
+			on_run += 1
+	check(on_run <= 16 and belt.stats["adopted"] > 0,
+		"a run between moving groups doesn't pile up (at most 4 a lane): %d on the run, %d handed over" % [on_run, belt.stats["adopted"]])
+	belt.queue_free()
+
+## A backed-up run behind a group: when the group moves on a gap, one item goes on into it, not
+## every one whose pace since the last update would have taken it past the room (they stand behind
+## it: the run lost several items a move, asked for again by its drift check, lost again).
+func _belt_runs_backed_up() -> void:
+	var belt = BeltItemsScript.new()
+	add_child(belt)
+	belt._sync = true
+	var lane_y := 60.0 - 0.234
+	var tick := [9000]
+	var key := func(j: int) -> int: return (900 + j) * 8 + 1
+	var send := func(msg: Dictionary) -> void:
+		var m := {"t": "bi", "k": tick[0], "p": 8, "fx": 33 * 256, "fy": 60 * 256, "fr": 24, "l": [], "ln": []}
+		m.merge(msg, true)
+		belt.handle(m)
+		tick[0] += 8
+		for i in 8:
+			belt._process(1.0 / 60.0)
+	# Belts 1..4 a run at 1/16 a tick (half a tile an update), belt 5 in front a packed group.
+	var pl := []
+	for j in range(1, 5):
+		pl.append_array([key.call(j), key.call(j - 1), key.call(j + 1), (31 + j) * 256, roundi(lane_y * 256), (30 + j) * 256, roundi(lane_y * 256), 4096])
+	var y := roundi(lane_y * 256)
+	var bg := [key.call(5), 1, 36 * 256, y, 35 * 256, y, 0, 64, 4096, 1]
+	# Belts 3 and 4 full, standing behind the group's hindmost item (line position 0.75 of belt 5).
+	var l := []
+	var uid := 9100
+	for j in [4, 3]:
+		for q in 4:
+			l.append_array([uid, 1, roundi((31 + j - 0.25 * q) * 256), y])
+			uid += 1
+	send.call({"bg": bg, "l": l, "ln": [key.call(1), 0, key.call(2), 0, key.call(4), 4, key.call(3), 4], "pl": pl})
+	for i in 3:
+		send.call({})
+	var on_run := func() -> int:
+		var n := 0
+		for u in belt._state.items:
+			var lane: int = (belt._state.items[u] as BeltItemsScript.Item).lane
+			if lane >= key.call(1) and lane <= key.call(4):
+				n += 1
+		return n
+	var before: int = on_run.call()
+	send.call({"bm": [key.call(5), 0, 8]})
+	var after: int = on_run.call()
+	check(before == 8 and after == 7, "a backed-up run behind a group that moved a gap lets one item go into it: %d, then %d" % [before, after])
+	# A run whose lane in front is outside the square and was never sent: its items wait where they
+	# are, not running on into what isn't known.
+	var key2 := func(j: int) -> int: return (950 + j) * 8 + 1
+	var y2 := roundi((64.0 - 0.234) * 256)
+	var pl2 := []
+	for j in range(1, 5):
+		pl2.append_array([key2.call(j), key2.call(j - 1), key2.call(j + 1), (31 + j) * 256, y2, (30 + j) * 256, y2, 4096])
+	# (The square round 33, 64 reaches 2 tiles: belts 1-4 of this run in it, belt 5 not.)
+	send.call({"l": [9200, 1, roundi(33.5 * 256), y2, 9201, 1, roundi(32.5 * 256), y2], "ln": [key2.call(1), 0, key2.call(2), 1, key2.call(3), 1, key2.call(4), 0], "pl": pl2,
+		"fy": 64 * 256, "fr": 2})
+	for i in 4:
+		send.call({"fy": 64 * 256, "fr": 2})
+	var x1: float = (belt._state.items[9200] as BeltItemsScript.Item).target.x
+	var x2: float = (belt._state.items[9201] as BeltItemsScript.Item).target.x
+	check(absf(x1 - 33.5) < 0.01 and absf(x2 - 32.5) < 0.01, "a run with its lane in front unknown holds its items: x %.3f, %.3f" % [x1, x2])
+	belt.queue_free()
 
 ## Movers drawn on the GPU (mover_records.gd): written only when a position arrives, a record put
 ## where the shader would draw it (records.position, the shader's code on the CPU) must match where
@@ -8574,9 +10251,16 @@ func _gpu_movers() -> void:
 	check(posed and back and dying.size() == 1 and (dying[0].xform.origin as Vector3).distance_to(at_death) < 0.001,
 		"an attacking biter is posed here, back on its record once the attack lapses; one that dies falls where it was drawn: %s %s %d"
 		% [posed, back, dying.size()])
+	# The mod sends no `en` while nobody attacks: a quiet minute after a fight brings back no guesses
+	# (a still biter, or another player's character, by the player was posed biting).
+	cr._clock += 60.0
+	check(cr.attacks_reported(), "once `en` has come, attacks aren't guessed again after a quiet spell")
 	biters.queue_free()
 
 
+## G3: flying robots are drawn together, one MultiMesh per robot kind and part (robot_swarm.gd),
+## with their animation (flying, cargo lamp, working, arms) in each instance's data, instead of a
+## node and several MeshInstance3Ds each.
 func _robot_swarm() -> void:
 	for name in ["logistic-robot", "construction-robot", "defender"]:
 		ModelLibrary.mesh_for(name)
@@ -8609,7 +10293,7 @@ func _robot_swarm() -> void:
 		in_tree += 1 if m.node.is_inside_tree() else 0
 	var parts := swarm.instances()
 	check(layer.count() == 300 and swarm.count() == 300 and meshes == 0 and in_tree == 0 and parts.size() > 0 and parts.size() <= 20,
-		"300 robots are drawn by %d MultiMeshes, not %d nodes of their own" % [parts.size(), in_tree])
+		"300 robots are drawn by %d MultiMeshes, not %d nodes of their own (G3)" % [parts.size(), in_tree])
 	var shader_ok := true
 	for mmi in parts:
 		if mmi.material_override == null:
@@ -8644,3 +10328,125 @@ func _robot_swarm() -> void:
 		"robots that leave are dropped and the others drawn where they are: %d drawn, %d wrong" % [swarm.count(), wrong])
 	layer.vehicles.model = null  # a stand-in: vehicle_anim.gd wants ui_model.gd's signals
 	layer.queue_free()
+
+
+## The run plants its feet, takes exoskeleton speed with a faster cadence and a longer stride, settles
+## when it stops; the mech takes off, hovers, flies and lands (`me` fl, fh) with every bone finite.
+func _character_motion() -> void:
+	var anim := CharacterAnimScript.new()
+	var pose := CharacterPoseScript.new()
+	if not pose.load_rig("character"):
+		check(false, "the character's rig loads for the motion checks")
+		return
+	var dt := 1.0 / 240.0
+	var v := 9.0  # Factorio's running speed, tiles a second
+	for model in ["character", "character-mech-armor"]:
+		var feet := CharacterAnimScript.new()
+		feet.mech = model != "character"
+		var rig := CharacterPoseScript.new()
+		if not rig.load_rig(model):
+			check(false, "the %s rig loads for the motion checks" % model)
+			continue
+		var r := _foot_slide(feet, rig, v, dt)
+		check(r.x < 99.0 and r.y < 0.05 and absf(r.z) < 0.05,
+			"running, a planted foot stays where it touched down (%s): slides %.3f tiles, %.3f off the ground" % [model, r.y, r.z])
+	for i in 240:
+		anim.running = true
+		anim.step(pose, dt, v * dt)
+	# Exoskeletons: three times the speed is about 1.7 times the cadence, not three times.
+	var base_loop: float = anim._loop_length()
+	anim._gait = 3.0
+	var exo_loop: float = anim._loop_length()
+	var cadence := (3.0 / exo_loop) / (1.0 / base_loop)
+	check(absf(base_loop - CharacterAnimScript.RUN_LOOP) < 0.01 and cadence > 1.5 and cadence < 1.9,
+		"at exoskeleton speed the steps quicken by about the root of the speed, the stride takes the rest: %.2f" % cadence)
+	anim._gait = 1.0
+	# Stopping: the legs carry on to a stance instead of freezing mid-stride, and the run fades.
+	var stop_phase: float = anim._run_phase
+	for i in 240:
+		anim.running = false
+		anim.step(pose, dt, 0.0)
+	var settled_u: float = fposmod(anim._run_phase / TAU, 0.5)
+	check(anim._run_phase != stop_phase and absf(settled_u - anim._duty * 0.5) < 0.02 and anim._w["run"] < 0.05,
+		"stopping, the legs finish their step to a stance and the run fades into idle: u %.3f, run %.3f" % [settled_u, anim._w["run"]])
+	# Running backwards (shooting while running away) keeps every bone finite.
+	var finite := true
+	for i in 120:
+		anim.running = true
+		anim.step(pose, dt, -6.0 * dt)
+		finite = finite and _pose_finite(pose)
+	check(finite and anim._speed < -5.0, "running backwards keeps the pose finite: speed %.1f" % anim._speed)
+	# The mech's flight: take-off, the air, flying along, landing.
+	var mech := CharacterAnimScript.new()
+	mech.mech = true
+	var mpose := CharacterPoseScript.new()
+	if not mpose.load_rig("character-mech-armor"):
+		check(false, "the mech's rig loads for the flight checks")
+		return
+	var root_rest: Vector3 = mpose.head_of("spine")
+	var states := []
+	var top := -INF
+	var crouch := INF
+	finite = true
+	var thrust_max := 0.0
+	# 2.5 s: 0.25 s on the ground, then flying (moving for a while); from 1.75 s the height comes
+	# down at Factorio's 3/64 tile a tick with `fl` still 1 until it touches down, as in 2.1.
+	for i in 600:
+		var t := i * dt
+		mech.descending = t >= 1.75
+		mech.flight_height = clampf((t - 0.25) * 60.0 / 32.0, 0.0, 1.0) if t < 1.75 else maxf(0.0, 1.0 - (t - 1.75) * 60.0 * 3.0 / 64.0)
+		mech.flying = t > 0.25 and (t < 1.75 or mech.flight_height > 0.0)
+		mech.running = t > 1.0 and t < 1.6
+		mech.step(mpose, dt, (9.0 * dt) if mech.running else 0.0)
+		finite = finite and _pose_finite(mpose)
+		if states.is_empty() or states.back() != mech.air_state:
+			states.append(mech.air_state)
+		var y: float = mpose.point("spine", root_rest).y - root_rest.y
+		top = maxf(top, y)
+		if mech.air_state == CharacterAnimScript.Air.TAKE_OFF and mech._air_t < CharacterAnimScript.TAKE_OFF * 0.3:
+			crouch = minf(crouch, y)
+		thrust_max = maxf(thrust_max, mech.thrust)
+	var Air = CharacterAnimScript.Air
+	check(finite and states == [Air.GROUND, Air.TAKE_OFF, Air.AIR, Air.LANDING, Air.GROUND],
+		"the mech takes off, flies and lands with every bone finite: %s" % [states])
+	check(crouch < -0.1 and top > 0.7 and thrust_max > 0.5 and mech.thrust == 0.0,
+		"it crouches before the thrust (%.2f), rises by the height sent (%.2f), its thrusters burn while flying (%.2f)" % [crouch, top, thrust_max])
+
+
+## Runs `anim` at `v` tiles a second: (stances seen, the most a planted right foot slid along the
+## ground, its height off the ground), 99 when no stance was seen.
+func _foot_slide(anim, pose, v: float, dt: float) -> Vector3:
+	var tail: Vector3 = pose.tail_of("shin_r")
+	for i in 240:
+		anim.running = true
+		anim.step(pose, dt, v * dt)
+	var walked := 0.0
+	var spans: Array[float] = []
+	var heights: Array[float] = []
+	var zs: Array[float] = []
+	for i in 600:
+		anim.running = true
+		anim.step(pose, dt, v * dt)
+		walked += v * dt
+		var u: float = anim._run_phase / TAU
+		var at: Vector3 = pose.point("shin_r", tail)
+		if u > anim._duty * 0.1 and u < anim._duty * 0.9:
+			zs.append(at.z - walked)  # the model faces -Z: the ground moves +Z under it
+			heights.append(at.y - tail.y)
+		elif not zs.is_empty():
+			spans.append(zs.max() - zs.min())
+			zs.clear()
+	if spans.size() < 2:
+		return Vector3(spans.size(), 99.0, 99.0)
+	var lift := 0.0
+	for h in heights:
+		if absf(h) > absf(lift):
+			lift = h
+	return Vector3(spans.size(), spans.max(), lift)
+
+
+func _pose_finite(pose) -> bool:
+	for r in pose.rows():
+		if not (is_finite(r.x) and is_finite(r.y) and is_finite(r.z) and is_finite(r.w)):
+			return false
+	return true

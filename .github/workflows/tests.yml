@@ -20,6 +20,8 @@ jobs:
         run: pip install lupa "gdtoolkit==4.*"
       - name: Bridge mod against the fake Factorio API
         run: python tools/mod_tests/test_bridge.py
+      - name: The bridge's data stage (the graphics list)
+        run: python tools/mod_tests/test_data_stage.py
       - name: Mock server over UDP
         run: python tools/test_mock_server.py
       - name: GDScript parses
@@ -41,6 +43,8 @@ jobs:
   # model hooks, not looks.
   ui:
     runs-on: ubuntu-latest
+    # A test script that doesn't parse leaves headless Godot running with nothing to quit it.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Cache Godot
@@ -75,6 +79,11 @@ jobs:
           set -o pipefail
           ~/godot/godot --headless --path client res://tests/decor_test.tscn 2>&1 | tee decor.log
           ! grep -n "SCRIPT ERROR" decor.log
+      - name: Mods' files and graphics
+        run: |
+          set -o pipefail
+          ~/godot/godot --headless --path client -s res://tests/mod_files_test.gd 2>&1 | tee modfiles.log
+          ! grep -n "SCRIPT ERROR" modfiles.log
       - name: Add-ons
         run: |
           set -o pipefail
@@ -85,6 +94,11 @@ jobs:
           set -o pipefail
           ~/godot/godot --headless --path client res://tests/vr_test.tscn 2>&1 | tee vr.log
           ! grep -n "SCRIPT ERROR" vr.log
+      - name: Every model loads the same both ways
+        run: |
+          set -o pipefail
+          ~/godot/godot --headless --path client -s res://tests/model_load_test.gd 2>&1 | tee modelload.log
+          ! grep -n "SCRIPT ERROR" modelload.log
 
   # The bridge mod in the real game: Factorio's free Linux headless build, a new map, then
   # tools/live_check.py over UDP and RCON, as on a desktop PC.
@@ -105,6 +119,11 @@ jobs:
         if: steps.factorio-cache.outputs.cache-hit != 'true'
         run: server/download-headless.sh "$FACTORIO_VERSION"
       - name: Start the server
+        # One map for every run: a new random map each time put trees, cliffs or water where
+        # some check works, and a different check failed on each run. Seed 123456 passes them all
+        # (checked on Factorio 2.1.23).
+        env:
+          MAP_SEED: "123456"
         run: |
           server/run-headless.sh > server/server.log 2>&1 &
           for i in $(seq 90); do
@@ -141,6 +160,11 @@ jobs:
         if: steps.factorio-cache.outputs.cache-hit != 'true'
         run: server/download-headless.sh "$FACTORIO_VERSION"
       - name: Start the server
+        # One map for every run: a new random map each time put trees, cliffs or water where
+        # some check works, and a different check failed on each run. Seed 123456 passes them all
+        # (checked on Factorio 2.1.23).
+        env:
+          MAP_SEED: "123456"
         run: |
           server/run-headless.sh > server/server.log 2>&1 &
           for i in $(seq 90); do

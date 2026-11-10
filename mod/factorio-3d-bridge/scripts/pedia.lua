@@ -24,7 +24,8 @@ local function get(obj, key)
   return nil
 end
 
--- A prototype method called without arguments (2.x methods taking an optional quality).
+-- A prototype method, called with `...` (none for 2.x's that take an optional quality); nil when it
+-- throws.
 local function call(obj, key, ...)
   local args = { ... }
   local ok, v = pcall(function() return obj[key](table.unpack(args)) end)
@@ -75,7 +76,7 @@ local function amounts(list)
 end
 
 local function build()
-  local l = { made = {}, used = {}, recycled = {}, machines = {}, unlocked = {}, mined = {}, placed_by = {} }
+  local l = { made = {}, used = {}, recycled = {}, machines = {}, unlocked = {}, mined = {} }
   for name, r in pairs(table_of("recipe")) do
     local recycling = false
     for _, cat in pairs(get(r, "categories") or { get(r, "category") }) do

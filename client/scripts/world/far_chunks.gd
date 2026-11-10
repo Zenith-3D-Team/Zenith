@@ -17,12 +17,14 @@ extends Node
 ## they are all in. A chunk first seen far isn't built in full until it comes near.
 
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
 const ModelTextures := preload("res://scripts/world/model_textures.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const BeltLods := preload("res://scripts/world/belt_lods.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
+const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const MergedShader := preload("res://shaders/far_merged.gdshader")
 const FactorioAlphaShader := preload("res://shaders/factorio_material_alpha.gdshader")
 const FactorioLeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
@@ -42,17 +44,15 @@ const KEEP_TYPES := {"tree": true, "plant": true, "resource": true, "fish": true
 ## How simple each model is merged (tiles): the simplifier's coarsest level within SIMPLIFY_ERROR, then
 ## its vertices clustered in CELL-sized cubes (Bake): about two pixels at MERGE_FROM in a 900-pixel
 ## window. Times the square root of the Level of detail setting's pixels of error (model_lods.gd
-## QUALITY: high 1, medium 1.4, low 2), as set when a model is first merged.
+## QUALITY's first values, 1, 4 and 4: high 1, medium and low 2), as set when a model is first merged.
 const SIMPLIFY_ERROR := 0.25
 const CELL := 0.2
 ## Worker jobs at once: models baked and chunks merged (the pool also meshes terrain and loads models).
 const BAKE_JOBS := 2
 const MERGE_JOBS := 2
-## Main-thread time a frame for gathering far chunks' entities (at least sixteen) and for putting
-## finished merges in (at least one); seconds between looks at which chunks are far (sooner when
-## the camera moved 8 tiles).
-const COLLECT_USEC := 1000
-const INSTALL_USEC := 1500
+## Seconds between looks at which chunks are far (sooner when the camera moved 8 tiles). Gathering
+## far chunks' entities and putting finished merges in take their slices of the frame
+## (frame_budget.gd, `far_collect` and `far_install`).
 const CHECK_INTERVAL := 0.5
 
 ## Where a chunk's merge stands (State.phase).
@@ -85,10 +85,9 @@ var _bake_queue: Array = []
 ## Bakes finished and chunks gathered so far, and as last looked at.
 var _progress := 0
 var _stamp := -1
-## Main-thread and worker time spent, and merges made (for the probe and tests).
+## Main-thread and worker time spent (for the probe).
 var main_usec := 0
 var worker_usec := 0
-var merges_made := 0
 
 
 ## What a chunk's merged drawing stands at (ChunkView.far).
@@ -441,9 +440,13 @@ static func skips(cv) -> bool:
 	return s.far and (s.covers or not s.full)
 
 
-## Whether an entity of this type drawn with `mesh` (null: a placeholder) goes in a merged mesh.
+## Whether an entity of this type drawn with `mesh` (null: a placeholder) goes in a merged mesh. With
+## a graphics list a building without a model is its own picture on a card (chunk_view.gd), never a
+## box, and the card stays as it is far away too.
 static func merges(proto_type: String, mesh: Mesh) -> bool:
-	return not KEEP_TYPES.has(proto_type) and (mesh == null or bakeable(mesh))
+	if mesh == null:
+		return not KEEP_TYPES.has(proto_type) and not SpriteStandins.in_use()
+	return not KEEP_TYPES.has(proto_type) and bakeable(mesh)
 
 
 ## After a chunk's build (`skipped`: whether it left the merged entities out), or after it added
@@ -611,7 +614,8 @@ func _process(delta: float) -> void:
 	_install()
 	var spent := Time.get_ticks_usec() - t0
 	main_usec += spent
-	world.prof["far"] = int(world.prof.get("far", 0)) + spent
+	if Probing.on:
+		world.prof["far"] = int(world.prof.get("far", 0)) + spent
 
 
 ## Which chunks are far: from the camera, MERGE_FROM with SLACK either way, never near the focus. A
@@ -661,6 +665,9 @@ func _decide(delta: float) -> void:
 		else:
 			s.serial += 1  # whatever was on its way is dropped
 			s.phase = IDLE
+			if cv.building:
+				# A build under way decided to leave the merged entities out: built again whole after it.
+				world.redraw(c)
 			if not s.hidden.is_empty():
 				# Its MultiMeshes are still there: shown again, no build.
 				for mmi: MultiMeshInstance3D in s.hidden:
@@ -674,8 +681,8 @@ func _decide(delta: float) -> void:
 				world.redraw(c)  # its MultiMeshes are made again; the merged mesh goes once they are in
 
 
-## Gathers far chunks' mergeable entities, nearest the focus first, a slice at a time within
-## COLLECT_USEC (on the main thread: the models' tables aren't for threads).
+## Gathers far chunks' mergeable entities, nearest the focus first, a slice at a time (at least
+## sixteen; on the main thread: the models' tables aren't for threads).
 func _collect() -> void:
 	if not _asked.is_empty():
 		var focus: Vector2 = world.focus()
@@ -748,6 +755,8 @@ func _gather(cv, s: State, rec) -> void:
 		return
 	var mesh := ModelLibrary.mesh_for_entity(proto.name, proto.type, rec.extra, rec.dir)
 	if mesh == null:
+		if not merges(proto.type, null):
+			return  # a card (sprite_standins.gd), drawn by the chunk itself
 		var color: Color = ModelLibrary.NEUTRAL_COLOR if ModelLibrary.NEUTRAL_PROTOS.has(proto.name) else proto.color
 		var shape: Mesh = Visuals.cone_mesh() if Visuals.is_cone(proto) else Visuals.box_mesh()
 		s.tinted.append([shape, Visuals.placeholder_transform(proto, rec.pos, rec.dir, Visuals.height_for(proto)), color.srgb_to_linear()])
@@ -843,7 +852,7 @@ func _start_merges() -> void:
 		_merging.append([WorkerThreadPool.add_task(merge.run, false, "far merge"), merge, entry[0]])
 
 
-## Puts finished merges in, within INSTALL_USEC.
+## Puts finished merges in, within its slice (at least one).
 func _install() -> void:
 	if _merging.is_empty():
 		FrameBudget.waiting(&"far_install", 0)
@@ -861,6 +870,7 @@ func _install() -> void:
 			return
 		WorkerThreadPool.wait_for_task_completion(entry[0])
 		_merging.remove_at(i)
+		_progress += 1  # a merge slot came free: chunks passed over for want of one are looked at again
 		var merge: Merge = entry[1]
 		worker_usec += merge.usec
 		if not _current([entry[2], merge.serial], MERGING):
@@ -876,7 +886,6 @@ func _install() -> void:
 		s.node.mesh = merge.mesh
 		s.triangles = merge.triangles
 		s.covers = true
-		merges_made += 1
 		cv.count("far_merges")
 		s.node.visible = true
 		if s.full:
@@ -953,8 +962,3 @@ func status() -> String:
 	if int(c[0]) == 0:
 		return ""
 	return "%d far chunks merged (%dk triangles), %d far" % [c[0], int(c[1]) / 1000, c[2]]
-
-
-## Nothing left to gather, bake or merge (for tests).
-func idle() -> bool:
-	return _asked.is_empty() and _collecting.is_empty() and _waiting.is_empty() and _merging.is_empty() and _baking.is_empty() and _bake_queue.is_empty()

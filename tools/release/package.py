@@ -25,7 +25,7 @@ so the zip unpacks into one folder that runs as it is.
 import argparse
 import io
 import json
-import tempfile
+import urllib.error
 import urllib.request
 import os
 import pathlib
@@ -79,13 +79,35 @@ install to factorio.app/Contents/MacOS/factorio. The scripts in server/ are for 
 Zenith's menu starts Factorio by itself.
 """),
 }
-SERVER_FILES = ["server-settings.json", "run-server.ps1", "run-headless.sh", "download-headless.sh"]
+SERVER_FILES = ["server-settings.json", "run-server.ps1", "run-headless.sh", "download-headless.sh", "factorio-with-zenith.ps1"]
 # The models from Wube's printable release (CC BY-NC) and from FUE5 (CC BY-NC-SA) ship inside the game:
 # their per-model lists and licence terms go beside it, as the licences ask.
 DOCS = [("LICENSE", "LICENSE.txt"), ("LICENSING.md", "LICENSING.md"), ("CREDITS.md", "CREDITS.md"), ("docs/USER-GUIDE.md", "USER-GUIDE.md"),
-        ("docs/ADDONS.md", "ADDONS.md"), ("client/assets/models/CREDITS.md", "MODEL-CREDITS.md"),
+        ("docs/ADDONS.md", "ADDONS.md"), ("docs/MODELLERS.md", "MODELLERS.md"), ("client/assets/models/CREDITS.md", "MODEL-CREDITS.md"),
         ("client/assets/models/fue5/README.md", "FUE5-MODELS.md"),
         ("client/assets/branding/README.md", "LOGO-LICENCE.md")]
+MODELS_README = """Your own 3D models for Zenith.
+
+Put a .glb file here named after the Factorio entity it draws, and Zenith uses it in place of its
+own model of that name the next time it starts. Everything not here keeps Zenith's own model; with
+nothing here, Zenith looks as it always does. Settings > Graphics > Your models says how many are
+in use and opens this folder.
+
+Names are Factorio's internal names, for example:
+  transport-belt.glb, transport-belt-curve-left.glb, transport-belt-curve-right.glb
+  inserter.glb, inserter-east.glb, inserter-south.glb, inserter-west.glb (the base, per direction)
+  inserter-arm-basic-upper.glb, inserter-arm-basic-hand-open.glb, inserter-arm-basic-hand-closed.glb
+  burner-mining-drill.glb, burner-mining-drill-east.glb, -south.glb, -west.glb
+
+1 unit = 1 tile, the origin at the footprint's centre on the ground, facing north (Blender +Y).
+MODELLERS.md, beside Zenith, has every name, the moving parts and the materials belts need.
+
+To start Zenith with its own models only, without removing these: start it with
+  -- --no-custom-models
+after the program's name (a shortcut's Target), or empty this folder.
+"""
+
+
 ADDONS_README = """Zenith add-ons go here: each a .zip as you downloaded it (no need to unpack it), or a folder
 with its addon.json (or put them in Zenith's user data folder, which keeps them across updates).
 The Add-ons menu (main menu, Esc menu, Settings) lists them, with a switch, settings and keys for
@@ -101,6 +123,12 @@ graphics, sounds and fonts from your own copy and never copies them.
 2. Single player -> New game (or Load game for one of your saves). Zenith starts Factorio in the
    background with the bridge mod from the mod folder here, and connects by itself.
 3. If Factorio isn't found, set its folder in Settings -> Factorio install.
+
+Your settings, Zenith worlds and server data are kept in Zenith's user folder
+(%APPDATA%\\Godot\\app_userdata\\Zenith on Windows), not in this folder, so updating is just
+unpacking the new version. Older versions kept worlds in their own server\\saves folder:
+unpack this one over such a version to bring them across, or copy them into the user folder's
+saves.
 
 Ctrl+F9 opens the same game in Factorio itself; Ctrl+F9 there comes back.
 USER-GUIDE.md has the controls and everything else. Bug reports are welcome on the project's
@@ -123,23 +151,29 @@ ETC2_SETTING = "textures/vram_compression/import_etc2_astc=true"
 
 
 def export_with_etc2(godot, preset, out_exe):
-    project = ROOT / "client" / "project.godot"
+    client = ROOT / "client"
+    project = client / "project.godot"
     before = project.read_bytes()
+    # Every .import file as it is now, written back afterwards byte for byte. (Put back with git
+    # checkout, they also lost any change made to them before the build: hundreds after an import.)
+    imports = {p: p.read_bytes() for p in client.rglob("*.import") if ".godot" not in p.parts}
     text = before.decode("utf-8")
     nl = "\r\n" if "\r\n" in text else "\n"
     project.write_text(text.replace("[rendering]" + nl, "[rendering]" + nl + nl + ETC2_SETTING + nl, 1),
                        encoding="utf-8", newline="")
     try:
         # An import pass first: the export alone stops at the setting it hasn't imported for yet.
-        subprocess.run([godot, "--headless", "--path", str(ROOT / "client"), "--import"], capture_output=True, text=True)
+        subprocess.run([godot, "--headless", "--path", str(client), "--import"], capture_output=True, text=True)
         export(godot, preset, out_exe)
     finally:
         project.write_bytes(before)
-        # (git status, not diff: a re-import may only rewrite their line endings, which diff ignores)
-        status = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, text=True).stdout
-        changed = [line[3:] for line in status.splitlines() if line.startswith(" M ") and line.endswith(".import")]
-        if changed:
-            subprocess.run(["git", "-C", str(ROOT), "checkout", "--"] + changed)
+        for p in client.rglob("*.import"):
+            if ".godot" in p.parts:
+                continue
+            if p not in imports:
+                p.unlink()  # made by the import pass
+            elif p.read_bytes() != imports[p]:
+                p.write_bytes(imports[p])
 
 
 def export(godot, preset, out_exe):
@@ -212,9 +246,14 @@ def gather_addons(args):
             print(f"add-on {m['id']} {m['version']} from {repo}, {where}, {'on' if on else 'off'}")
             out.append((f"{m['id']}_{m['version']}.zip", data, m["id"], on))
     for spec in args.addon:
-        folder, _, state = spec.partition(":")
+        # Only a trailing :off or :on is the state: a Windows path has its own colon (C:\...).
+        folder, state = spec, "on"
+        if spec.endswith((":off", ":on")):
+            folder, _, state = spec.rpartition(":")
         data = folder_zip(folder)
         m = zip_manifest(data)
+        if not m:
+            sys.exit(f"--addon {folder}: no addon.json in that folder")
         out = [a for a in out if a[2] != m["id"]]
         out.append((f"{m['id']}_{m['version']}.zip", data, m["id"], state != "off"))
     return out
@@ -241,6 +280,8 @@ def package(godot, platform, version, addons=()):
     if platform in UNSUPPORTED:
         what, body = UNSUPPORTED[platform]
         (folder / "UNSUPPORTED.txt").write_text(UNSUPPORTED_HEAD.format(version=version, what=what) + body, encoding="utf-8")
+    (folder / "models").mkdir()
+    (folder / "models" / "README.txt").write_text(MODELS_README, encoding="utf-8")
     (folder / "addons").mkdir()
     (folder / "addons" / "README.txt").write_text(ADDONS_README, encoding="utf-8")
     for name, data, _, _ in addons:

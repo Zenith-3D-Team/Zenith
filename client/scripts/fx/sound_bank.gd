@@ -101,17 +101,6 @@ class Loop:
 	## Seconds (Factorio's fade_in_ticks 8 and fade_out_ticks 20 by default).
 	var fade_in := 8.0 / 60.0
 	var fade_out := 20.0 / 60.0
-	var persistent := false
-	## Kept for older callers: the main sound's files, its volume and reach.
-	var files: PackedStringArray:
-		get:
-			return sound.files
-	var volume: float:
-		get:
-			return sound.max_volumes[0] if sound.max_volumes.size() > 0 else 0.5
-	var reach: float:
-		get:
-			return sound.reach
 
 
 ## A Lua file's text with its braces matched, to find the table round any point.
@@ -221,7 +210,6 @@ static var _tracks: Array = []  # [path, volume, planets (Array, empty: space), 
 static var _ready := false
 static var _lock := Mutex.new()
 static var _started := false
-static var scan_msec := 0
 
 
 static func data_dir() -> String:
@@ -475,7 +463,6 @@ static var _KEYED := {}
 
 
 static func _scan() -> void:
-	var started := Time.get_ticks_msec()
 	var dir := data_dir()
 	var texts: Array = []  # LuaText
 	for mod in PROTOTYPE_MODS:
@@ -493,7 +480,6 @@ static func _scan() -> void:
 		_index_entities(lt)
 		_index_planets(lt)
 		_index_music(lt)
-	scan_msec = Time.get_ticks_msec() - started
 	_lock.lock()
 	_ready = true
 	_lock.unlock()
@@ -717,7 +703,6 @@ static func _parse_working(lt: LuaText, at: int) -> Loop:
 		loop.fade_in = _num(own, "fade_in_ticks", 8.0) / 60.0
 	if own.contains("fade_out_ticks"):
 		loop.fade_out = _num(own, "fade_out_ticks", 20.0) / 60.0
-	loop.persistent = own.contains("persistent = true")
 	if loop.sound.files.is_empty():
 		return null
 	return loop

@@ -45,6 +45,7 @@ extends Node
 ## onto it, a few groups a frame, before the older clock starts again.
 
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 
 ## Entity types the mod reports working states for (ANIMATED_TYPES in the mod's registry.lua).
 ## Others (turrets, chests) count as always working for their glow.
@@ -588,7 +589,7 @@ func state_changed(rec) -> void:
 				_write(group, i, working)
 	var spent := Time.get_ticks_usec() - t0
 	write_usec += spent
-	if "prof" in world:
+	if Probing.on and "prof" in world:
 		world.prof["anim_states"] = int(world.prof.get("anim_states", 0)) + spent
 
 
@@ -666,6 +667,7 @@ func _process(delta: float) -> void:
 	if not _migrate.is_empty():
 		_migrate_some()
 	var focus: Vector2 = world.focus()
+	var timing := Probing.on
 	var spent := {}  # KIND_* -> microseconds this frame (world.prof, for --stutter-probe)
 	var lo := Vector2i(floori((focus.x - RADIUS) / 32.0), floori((focus.y - RADIUS) / 32.0))
 	var hi := Vector2i(floori((focus.x + RADIUS) / 32.0), floori((focus.y + RADIUS) / 32.0))
@@ -680,7 +682,7 @@ func _process(delta: float) -> void:
 			for group: Group in cv.anim_groups:
 				if group.kind < KIND_WORM or group.kind == KIND_STILL or group.kind == KIND_TIMED or group.kind == KIND_LIT or group.kind == KIND_SWITCH:
 					continue
-				var t0 := Time.get_ticks_usec()
+				var t0 := Time.get_ticks_usec() if timing else 0
 				match group.kind:
 					KIND_TURRET:
 						_turrets(group, delta)
@@ -694,8 +696,9 @@ func _process(delta: float) -> void:
 						_roboport(group, delta)
 					KIND_GATE:
 						_gates(group, focus, delta)
-				spent[group.kind] = int(spent.get(group.kind, 0)) + Time.get_ticks_usec() - t0
-	if "prof" in world:
+				if timing:
+					spent[group.kind] = int(spent.get(group.kind, 0)) + Time.get_ticks_usec() - t0
+	if timing and "prof" in world:
 		for kind in spent:
 			var key: String = PROF_KEYS[kind]
 			world.prof[key] = int(world.prof.get(key, 0)) + int(spent[kind])

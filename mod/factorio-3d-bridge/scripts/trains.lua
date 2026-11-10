@@ -8,6 +8,7 @@ local world = require("scripts.world")
 local puppet = require("scripts.puppet")
 local tracker = require("scripts.tracker")
 local rate = require("scripts.rate")
+local requests = require("scripts.requests")
 
 local M = {}
 
@@ -541,7 +542,9 @@ function M.set_mode_by_id(cmd)
     return puppet.message("Not your train")
   end
   train.manual_mode = not (cmd.auto == 1 or cmd.auto == true)
-  M.list(cmd)
+  -- The overview again, queued like `trains_list` (session.lua): listing every train of a big
+  -- base straight from the packet cost each switch a whole list, however many came in a tick.
+  requests.handler("trains_list")({ t = "trains_list" })
 end
 
 ---------------------------------------------------------------------------------------------
@@ -560,12 +563,14 @@ function M.tick()
   local f = s.focus
   local types = registry.rolling_stock_types()
   if #types == 0 then
+    rate.read("tr", 0)
     return
   end
   local found = world.surface().find_entities_filtered({
     area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } },
     type = types,
   })
+  rate.read("tr", #found)
   local seen, list = {}, {}
   for _, e in pairs(found) do
     local train = e.train

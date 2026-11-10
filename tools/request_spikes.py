@@ -97,14 +97,6 @@ class Client:
         return None
 
 
-def lua(code, port):
-    return rcon.run("/sc " + code, port=port, timeout=60.0).strip()
-
-
-def mod_lua(code, port):
-    return rcon.run("/c __factorio-3d-bridge__ " + code, port=port, timeout=60.0).strip()
-
-
 def log_size():
     return LOG.stat().st_size if LOG.exists() else 0
 
@@ -176,23 +168,23 @@ def main():
     other = next((s for s in surfs if s[0] != here_si and s[2]), None) or next((s for s in surfs if s[0] != here_si), None)
 
     def jump():
-        mod_lua("local c = package.loaded['__factorio-3d-bridge__/scripts/puppet.lua'].get() "
-                "c.teleport({c.position.x + 3000, c.position.y}, c.surface)", port)
+        rcon.mod_lua("local c = package.loaded['__factorio-3d-bridge__/scripts/puppet.lua'].get() "
+                     "c.teleport({c.position.x + 3000, c.position.y}, c.surface)", port=port, timeout=60.0)
         c.pos = (home[0] + 3000, home[1])
         c.subscribe()
 
     def jump_back():
-        mod_lua(f"local c = package.loaded['__factorio-3d-bridge__/scripts/puppet.lua'].get() "
-                f"c.teleport({{{home[0]}, {home[1]}}}, c.surface)", port)
+        rcon.mod_lua(f"local c = package.loaded['__factorio-3d-bridge__/scripts/puppet.lua'].get() "
+                     f"c.teleport({{{home[0]}, {home[1]}}}, c.surface)", port=port, timeout=60.0)
         c.pos = home
         c.subscribe()
 
     def hover():
         # An assembler near the character, by RCON, then the client's hover ask for it.
-        out = mod_lua("local c = package.loaded['__factorio-3d-bridge__/scripts/puppet.lua'].get() "
-                      "local e = c.surface.find_entities_filtered({position = c.position, radius = 64, "
-                      "type = {'assembling-machine', 'beacon'}, limit = 1})[1] "
-                      "rcon.print(e and (e.unit_number .. ' ' .. e.position.x .. ' ' .. e.position.y) or '')", port)
+        out = rcon.mod_lua("local c = package.loaded['__factorio-3d-bridge__/scripts/puppet.lua'].get() "
+                           "local e = c.surface.find_entities_filtered({position = c.position, radius = 64, "
+                           "type = {'assembling-machine', 'beacon'}, limit = 1})[1] "
+                           "rcon.print(e and (e.unit_number .. ' ' .. e.position.x .. ' ' .. e.position.y) or '')", port=port, timeout=60.0)
         if not out:
             return
         u, x, y = out.split()

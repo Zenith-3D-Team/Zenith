@@ -1,11 +1,12 @@
 extends VBoxContainer
 ## Factorio's quickbar at the bottom: a slot window (quick_bar_slot_window_frame) with the two
 ## quickbar rows Factorio shows by default, each 10 slot buttons, and left of them the page
-## buttons (quick_bar_page_button) with each row's page number. The lower row is the page in use:
-## number keys 1-0 (factorio_ui.gd) select its slots' items for building; clicking a slot does the
-## same, or pins the held item when the slot is empty or holds something else; right click clears
-## it. The upper row shows another page (the next one until X swaps the rows or the page chooser
-## sets it; the mod keeps 10, while the client's own quickbar has one so it stays empty then). Inventory slots can be dragged onto both. Each slot shows its pinned item and
+## buttons (quick_bar_page_button) with each row's page number. The top row is the page in use, as
+## in Factorio ("the top quickbar", core.cfg's next-active-quick-bar): number keys 1-0
+## (factorio_ui.gd) select its slots' items for building; clicking a slot does the same, or pins the
+## held item when the slot is empty or holds something else; right click clears it. The second row,
+## below it, shows another page (the next one until X swaps the rows or the page chooser sets it;
+## the mod keeps 10, while the client's own quickbar has one so it stays empty then). Inventory slots can be dragged onto both. Each slot shows its pinned item and
 ## how many the inventory has (faded when none). The HUD's mining progress and the character's
 ## health bar sit just above it (add_bar), where Factorio draws them.
 ##
@@ -17,10 +18,10 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const UiModel := preload("res://scripts/ui/factorio/ui_model.gd")
 
-## A slot of the lower row (the page in use) was clicked: index 0-9.
+## A slot of the top row (the page in use) was clicked: index 0-9.
 signal slot_clicked(index: int, button_index: int)
-## A slot of the upper row was clicked: index 0-9.
-signal upper_clicked(index: int, button_index: int)
+## A slot of the second row (below it) was clicked: index 0-9.
+signal second_clicked(index: int, button_index: int)
 ## A slot of a page in the page chooser was clicked: page 1-10, index 0-9.
 signal page_slot_clicked(page: int, index: int, button_index: int)
 
@@ -34,10 +35,10 @@ var held_item := ""
 ## The slot window itself (factorio_ui.gd puts the weapon slots and shortcut bar beside it).
 var frame := Kit.panel("FSlotWindow")  # quick_bar_slot_window_frame
 
-var _slots: Array[Slot] = []  # the lower row
-var _upper: Array[Slot] = []
-var _pages: Array[Button] = []  # [upper, lower]
-## The page chooser (top_level, over the quickbar) and the row it was opened for (0 upper, 1 lower).
+var _slots: Array[Slot] = []  # the top row: the page in use
+var _second: Array[Slot] = []  # the row below it
+var _pages: Array[Button] = []  # [second row's, top row's]
+## The page chooser (top_level, over the quickbar) and the row it was opened for (0 second, 1 top).
 var chooser := PanelContainer.new()
 var _chooser_row := 1
 var _chooser_slots := {}  # page -> Array[Slot]
@@ -75,6 +76,7 @@ func _ready() -> void:
 		b.pressed.connect(func() -> void: open_chooser(row_index, not (chooser.visible and _chooser_row == row_index)))
 		pages.add_child(b)
 		_pages.append(b)
+	pages.move_child(_pages[1], 0)  # the page in use's button on top
 	var inner := Kit.panel("FQuickbarInner")
 	row.add_child(inner)
 	var rows := VBoxContainer.new()
@@ -84,24 +86,25 @@ func _ready() -> void:
 		var cells := HBoxContainer.new()
 		cells.add_theme_constant_override("separation", 0)
 		rows.add_child(cells)
+		# The page in use first, on top, as Factorio draws it (it used to be the lower row).
+		var in_use := r == 0
 		for index in UiModel.QUICKBAR_SLOTS:
 			var s := Slot.new()
 			s.theme_type_variation = "FSlotButton"
 			s.toggle_mode = true
-			var lower := r == 1
 			var on_click := func(button_index: int, _shift: bool) -> void:
-				if lower:
+				if in_use:
 					slot_clicked.emit(index, button_index)
 				else:
-					upper_clicked.emit(index, button_index)
+					second_clicked.emit(index, button_index)
 			s.clicked.connect(on_click)
-			if lower:
+			if in_use:
 				s.on_drop = func(item: String) -> void: model.pin(index, item)
 			else:
 				s.on_drop = func(item: String) -> void: model.pin_on_page(model.quickbar_upper_page(), index, item)
 			s.toggled.connect(func(_on: bool) -> void: refresh.call_deferred())  # only held_item decides
 			cells.add_child(s)
-			(_slots if lower else _upper).append(s)
+			(_slots if in_use else _second).append(s)
 	_build_chooser()
 	model.quickbar_changed.connect(refresh)
 	model.inventory_changed.connect(refresh)
@@ -164,7 +167,7 @@ func _build_chooser() -> void:
 		_chooser_slots[page] = slots
 
 
-## Opens (or closes) the page chooser for a row: 0 the upper, 1 the lower (the page in use).
+## Opens (or closes) the page chooser for a row: 0 the second, 1 the top one (the page in use).
 func open_chooser(row_index: int, on: bool) -> void:
 	_chooser_row = row_index
 	chooser.visible = on
@@ -231,9 +234,9 @@ func add_bar(bar: Control) -> void:
 ## Shows both rows, or only the page in use (windows too low for two, where Factorio's own GUI
 ## would run into the minimap).
 func set_two_rows(on: bool) -> void:
-	if _upper.is_empty() or _upper[0].get_parent().visible == on:
+	if _second.is_empty() or _second[0].get_parent().visible == on:
 		return
-	_upper[0].get_parent().visible = on
+	_second[0].get_parent().visible = on
 	_pages[0].get_parent().visible = on  # the page buttons too: room is short there
 	frame.custom_minimum_size.x = Kit.px(MIN_WIDTH) if on else 0
 	reset_size()
@@ -256,8 +259,8 @@ func refresh() -> void:
 	for i in _slots.size():
 		_show(_slots[i], str(model.quickbar[i]), str((i + 1) % 10))
 	var names := model.quickbar_page_items(upper_page)
-	for i in _upper.size():
-		_show(_upper[i], str(names[i]), "")
+	for i in _second.size():
+		_show(_second[i], str(names[i]), "")
 
 
 func _show(s: Slot, item: String, key: String) -> void:

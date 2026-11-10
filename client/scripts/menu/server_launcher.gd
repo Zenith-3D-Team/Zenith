@@ -46,7 +46,9 @@ var _watch_pid := -1
 
 
 func is_running() -> bool:
-	return pid > 0 and OS.is_process_running(pid)
+	if pid > 0 and not OS.is_process_running(pid):
+		pid = -1  # it ended by itself: its number may soon be another program's, not to be killed
+	return pid > 0
 
 
 func log_path() -> String:
@@ -77,6 +79,7 @@ func create_map(path: String, settings: Variant, seed_text: String, exchange := 
 			OS.kill(creator)
 			break
 		await get_tree().create_timer(0.2).timeout
+	_helper_pid = -1
 	if not FileAccess.file_exists(path) or FileAccess.get_modified_time(path) < int(started) - 1:
 		error = "Map creation failed.\n" + _log_errors(int(started))
 		return false
@@ -106,6 +109,7 @@ func generate_preview(settings: Variant, seed_text: String, exchange := "", plan
 			OS.kill(maker)
 			break
 		await get_tree().create_timer(0.1).timeout
+	_helper_pid = -1
 	var image := Image.new()
 	if not FileAccess.file_exists(out) or image.load(out) != OK:
 		error = "Factorio made no preview.\n" + _log_errors(int(started))
@@ -149,6 +153,9 @@ func start(path: String, host := {}) -> bool:
 		error = "The save %s doesn't exist." % path
 		return false
 	save_path = path
+	progress.emit("Matching the save's mods…", 0.2)
+	if not await _sync_mods(path):
+		return false
 	var base := int(Settings.get_value("factorio", "port_base"))
 	if base < 1024:
 		base = PORT_BASE
@@ -268,6 +275,7 @@ func stop(save_first: bool) -> void:
 			await get_tree().process_frame
 		return
 	_stopping = true
+	var was := pid
 	if is_running():
 		if save_first and rcon.is_open():
 			progress.emit("Saving and stopping the server…", 0.5)
@@ -280,7 +288,7 @@ func stop(save_first: bool) -> void:
 			var started := Time.get_ticks_msec()
 			while is_running() and Time.get_ticks_msec() - started < 5000:
 				await get_tree().create_timer(0.1).timeout
-		print("menu: server pid %d %s" % [pid, "still running!" if is_running() else "stopped"])
+		print("menu: server pid %d %s" % [was, "still running!" if is_running() else "stopped"])
 	rcon.close()
 	pid = -1
 	_end_watch()
@@ -381,6 +389,7 @@ func _prepare() -> bool:
 	var config := "[path]\nread-data=%s\nwrite-data=%s\n" % [_native(Paths.read_data_dir(_exe)), _native(_data)]
 	_write(_data.path_join("config.ini"), config)
 	var link := mods.path_join("factorio-3d-bridge")
+	_unlink(link)
 	if not DirAccess.dir_exists_absolute(link):
 		var out: Array = []
 		if OS.get_name() == "Windows":
@@ -401,6 +410,111 @@ func _prepare() -> bool:
 			_password += chars[b % chars.length()]
 		_write(password_file, _password + "\n")
 	return true
+
+
+## A save made with mods loads with them: the player's own mods (their Factorio's mods folder) are
+## linked into the server's mods folder (hard links and junctions, so nothing is copied), the mod
+## list starts from everything off, and Factorio's `--sync-mods` turns on exactly the save's mods at
+## the save's versions; then the bridge is turned on again. False with `error` when the save needs a
+## mod that isn't there (Factorio's own list of what is missing).
+func _sync_mods(save: String) -> bool:
+	var mods := _data.path_join("mods")
+	var own := Paths.factorio_mods_dir()
+	if own != "":
+		_link_mods(own, mods)
+	var names := {}
+	for f in DirAccess.get_files_at(mods) + DirAccess.get_directories_at(mods):
+		if f == "mod-list.json" or f == "mod-settings.dat":
+			continue
+		names[_mod_name(f)] = true
+	var listed: Array = [{"name": "base", "enabled": true}]
+	for n in ["space-age", "quality", "elevated-rails"]:
+		listed.append({"name": n, "enabled": false})
+	for n in names:
+		if n != "base":
+			listed.append({"name": n, "enabled": false})
+	_write(mods.path_join("mod-list.json"), JSON.stringify({"mods": listed}, " "))
+	var args := _common() + ["--sync-mods", _native(save)]
+	var out: Array = []
+	var task := WorkerThreadPool.add_task(func() -> void: OS.execute(_exe, args, out, true), false, "sync mods")
+	while not WorkerThreadPool.is_task_completed(task):
+		await get_tree().create_timer(0.1).timeout
+	WorkerThreadPool.wait_for_task_completion(task)
+	var text := "\n".join(out)
+	if not text.contains("Mods synced"):
+		var why: Array[String] = []
+		for line in text.split("\n"):
+			if line.strip_edges().begins_with("•"):
+				why.append(line.strip_edges())
+		why.append_array(missing_from_sync(text))
+		var listed_why := ("\n" + "\n".join(why.slice(0, 12))) if not why.is_empty() else ""
+		error = "The save's mods couldn't be set up for the server.%s\nPut the mods it needs in your Factorio mods folder (%s), or start it in Factorio once to download them." % [
+			listed_why, own if own != "" else "none found"]
+		return false
+	_enable_bridge(mods.path_join("mod-list.json"))
+	return true
+
+
+## The mods `--sync-mods` went to download: a save's mod missing from the mods folder, or there at
+## another version. The server has no mod portal login, so the download fails and Factorio says only
+## "unknown error" (checked in 2.1.24); its log names each one it tried ("Downloading
+## /download/<name>/... to ...\<name>_<version>.zip").
+static func missing_from_sync(text: String) -> Array[String]:
+	var found: Array[String] = []
+	var re := RegEx.create_from_string("Downloading /download/[^ ]+ to .*[\\\\/]([^\\\\/]+)_(\\d+\\.\\d+\\.\\d+)\\.zip")
+	for m in re.search_all(text):
+		var line := "• %s %s (missing, or another version in your mods folder)" % [m.get_string(1), m.get_string(2)]
+		if not found.has(line):
+			found.append(line)
+	return found
+
+
+## Links every mod in `from` (zips and folders, not the bridge or the lists) into `to` that isn't
+## there yet: hard links for zips, junctions for folders (Windows), symlinks elsewhere.
+static func _link_mods(from: String, to: String) -> void:
+	if OS.get_name() == "Windows":
+		var script := "$from = '%s'; $to = '%s'; foreach ($f in Get-ChildItem -LiteralPath $from) { if ($f.Name -in @('mod-list.json', 'mod-settings.dat') -or $f.Name -like 'factorio-3d-bridge*') { continue }; $dest = Join-Path $to $f.Name; if (Test-Path -LiteralPath $dest) { continue }; try { if ($f.PSIsContainer) { New-Item -ItemType Junction -Path $dest -Target $f.FullName -ErrorAction Stop | Out-Null } else { New-Item -ItemType HardLink -Path $dest -Target $f.FullName -ErrorAction Stop | Out-Null } } catch { Copy-Item -LiteralPath $f.FullName -Destination $dest -Recurse } }" % [_native(from).replace("'", "''"), _native(to).replace("'", "''")]
+		var out: Array = []
+		OS.execute("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], out)
+	else:
+		var out: Array = []
+		OS.execute("sh", ["-c", "for f in \"$1\"/*; do n=$(basename \"$f\"); case \"$n\" in mod-list.json|mod-settings.dat|factorio-3d-bridge*) continue;; esac; [ -e \"$2/$n\" ] || ln -s \"$f\" \"$2/$n\"; done", "sh", from, to], out)
+
+
+## A mod's name from its file or folder name ("aai-industry_0.7.5.zip" -> "aai-industry").
+static func _mod_name(file: String) -> String:
+	var re := RegEx.create_from_string("^(.+)_\\d+\\.\\d+\\.\\d+(\\.zip)?$")
+	var m := re.search(file)
+	return m.get_string(1) if m != null else file
+
+
+## The bridge on in a mod list (`--sync-mods` turns it off for a save made without it).
+static func _enable_bridge(list_path: String) -> void:
+	var data = JSON.parse_string(FileAccess.get_file_as_string(list_path))
+	if not (data is Dictionary and data.get("mods") is Array):
+		return
+	var found := false
+	for m in data["mods"]:
+		if m is Dictionary and str(m.get("name", "")) == "factorio-3d-bridge":
+			m["enabled"] = true
+			found = true
+	if not found:
+		(data["mods"] as Array).append({"name": "factorio-3d-bridge", "enabled": true})
+	var f := FileAccess.open(list_path, FileAccess.WRITE)
+	if f != null:
+		f.store_string(JSON.stringify(data, " "))
+
+
+## Removes the bridge mod's link, so it is made again to this Zenith's mod: a server folder kept
+## across updates (paths.gd) would otherwise go on loading an older version's mod, or a link to a
+## folder deleted since. Only a link goes: `rmdir` without /s refuses a real folder that has files
+## (a mod copied there by hand stays), and `rm` is only run on a symlink.
+static func _unlink(link: String) -> void:
+	var out: Array = []
+	if OS.get_name() == "Windows":
+		OS.execute("cmd.exe", ["/c", "rmdir", _native(link)], out)
+	else:
+		OS.execute("sh", ["-c", "test -L \"$1\" && rm \"$1\"", "sh", link], out)
 
 
 ## Factorio holds `.lock` in its write-data folder while it runs; it can't be opened then.

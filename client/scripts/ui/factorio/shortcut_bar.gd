@@ -181,7 +181,13 @@ func set_columns(n: int) -> void:
 
 ## The number of shortcuts showing.
 func shown_count() -> int:
-	return _order.filter(func(b: Button) -> bool: return b.visible).size()
+	# Counted in a loop: factorio_ui.gd's layout() asks every frame (filter() made an array and
+	# called a lambda per button each time).
+	var n := 0
+	for b: Button in _order:
+		if b.visible:
+			n += 1
+	return n
 
 
 func button(name: String) -> Button:

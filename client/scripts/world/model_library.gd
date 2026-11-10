@@ -21,9 +21,10 @@ extends RefCounted
 ## models' own palette colours (for comparing). How a surface weathers depends on its material
 ## class, picked from the glTF material's name (MATERIAL_CLASSES).
 ##
-## A model is drawn as one surface per shader (solid, see-through, leaf cards), not one per glTF
-## material: each draw of a MultiMesh is per surface, and per shadow split again. Its materials
-## become the rows of one material (material_rows.gd), each vertex carrying its row (Load.combined).
+## A model is drawn as one surface per glTF material; with Settings > Graphics > Merged materials
+## (merge_materials) as one surface per shader (solid, see-through, leaf cards) instead: each draw of
+## a MultiMesh is per surface, and per shadow split again. Its materials then become the rows of one
+## material (material_rows.gd), each vertex carrying its row (Load.combined).
 ##
 ## Moving parts (assets/models/README.md) are nodes named `anim_<kind>`, pivot at the node's
 ## origin. They are left out of the static mesh and kept as AnimParts (parts_for), each its own
@@ -36,7 +37,8 @@ extends RefCounted
 ## is the paint's median in that tier's own sprite sheet, picked the way the yellow tier's part
 ## colours are (the faster splitters are lighter and the faster undergrounds darker than their
 ## belts, as in Factorio). Factorio's loaders are one grey plate for every tier, the tier showing
-## in the belt under it: theirs follow the belts.
+## in the belt under it: theirs follow the belts. The belts' own colours aren't used: their frame
+## stays steel (STEEL_FRAMES) and their chevrons take BELT_CHEVRONS'.
 const TIER_TINTS := {
 	"fast-transport-belt": ["transport-belt", Color("d41001")],
 	"express-transport-belt": ["transport-belt", Color("009ccf")],
@@ -98,8 +100,9 @@ const SLIDE_KINDS := {"door_n": Vector3(0.0, -0.45, -0.89), "door_s": Vector3(0.
 	# A power switch's contact drops east into the gap between its cabinets; a logistic chest's
 	# hatch halves slide apart under its rim.
 	"switch": Vector3(0.3, -0.3, 0.0), "hatch_e": Vector3(0.19, 0.0, 0.0), "hatch_w": Vector3(-0.19, 0.0, 0.0)}
-## Moving part kinds that cycle while the machine works (anim.gd `_cycle`), once per loop of
-## Factorio's animation: `period` seconds (frame_count / animation_speed / 60). A part with
+## Moving part kinds that cycle while the machine works (set up by anim.gd setup_part, moved by
+## the model shader), once per loop of Factorio's animation: `period` seconds (frame_count /
+## animation_speed / 60). A part with
 ## `slide` moves that far (model space) and back; one with `angle` turns that many radians about
 ## `axis` (the node's frame). `wave` "out" goes there and back once a loop (0 -> 1 -> 0), "swing"
 ## either way of rest (-1 -> 1), "spin" round and round (`angle` a loop: TAU, negative for
@@ -349,22 +352,55 @@ static var look := "colours"
 static var _cache := {}  # name -> Mesh, or null when there is no model
 static var _parts := {}  # name -> Array of AnimPart (empty for models without moving parts)
 static var _glowing := {}  # Mesh -> true when it has surfaces that glow while working
-## Height in tiles above which a model counts as tall (Factorio's tall-entities toggle).
 static var _factorio_cache := {}  # [imported material, has COLOR, UV2, CUSTOM0] -> ShaderMaterial
 
 
+## The modellers' folder: `models/` beside Zenith (beside Zenith.exe in a download, the checkout's
+## root otherwise). A model there replaces Zenith's own of the same name, so a modeller tries one by
+## dropping it in; Zenith's own are used for everything else. --models=<dir> picks another folder,
+## --no-custom-models leaves it out.
+const CUSTOM_MODELS_DIR := "models"
+## How many models in external_dir (Settings > Graphics shows it).
+static var external_count := 0
+
+
+static func custom_models_dir() -> String:
+	# Loaded here, not preloaded: paths.gd preloads settings.gd, which preloads this script.
+	return load("res://scripts/menu/paths.gd").repo_dir().path_join(CUSTOM_MODELS_DIR)
+
+
+static func _count_models(dir: String) -> int:
+	var n := 0
+	for f in DirAccess.get_files_at(dir):
+		if f.get_extension().to_lower() in ["glb", "gltf"]:
+			n += 1
+	return n
+
+
 static func configure_from_command_line() -> void:
+	var custom := true
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--models="):
 			external_dir = arg.get_slice("=", 1)
 		elif arg == "--models-first":
 			external_first = true
+		elif arg == "--no-custom-models":
+			custom = false
 		elif arg == "--no-merged-materials":
 			merge_materials = false
 		elif arg == "--merged-materials":
 			merge_materials = true
 		elif arg.begins_with("--model-look="):
 			set_look(arg.get_slice("=", 1))
+	if external_dir == "" and custom:
+		var dir := custom_models_dir()
+		if _count_models(dir) > 0:
+			external_dir = dir
+			external_first = true
+	if external_dir != "":
+		external_count = _count_models(external_dir)
+		print("[models] %d model(s) from %s %s" % [external_count, external_dir,
+			"replace Zenith's own of the same name" if external_first else "fill in entities without a model"])
 	SpriteProjection.configure_from_command_line()
 	SpriteProjection.build_all()
 	warm_up()
@@ -861,7 +897,7 @@ static func _apply_projection(materials: Array[ShaderMaterial], name: String) ->
 ## A model's first appearance cost 20-250 ms on the main thread: loading the imported scene, then
 ## SurfaceTool reading every mesh back from the GPU to merge it. Now its .glb is parsed and merged on
 ## a worker thread (Load: CPU arrays only, nothing touches the GPU), and the main thread only makes
-## the ArrayMesh and its materials (poll(), within FINISH_USEC a frame). Chunks, ghosts and movers ask
+## the ArrayMesh and its materials (poll(), within its slice of the frame: frame_budget.gd, `models`). Chunks, ghosts and movers ask
 ## with ready() and draw nothing of a model until it is; mesh_for() still answers at once for
 ## everything else, finishing (or doing) the work there. An exported game ships the .glb files too
 ## (addons/zenith_export); only an imported scene without its .glb loads the old way (SCENE_SOURCE).
@@ -869,8 +905,6 @@ const GLTF_SOURCE := "gltf:"
 const SCENE_SOURCE := "scene:"
 ## Models parsed at once (terrain meshing and LODs share the worker pool).
 const LOAD_JOBS := 3
-## Main-thread time a frame spends making the models whose jobs are done (at least one).
-const FINISH_USEC := 4000  # its slice in frame_budget.gd
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 static var _sources := {}  # name -> GLTF_SOURCE + path, SCENE_SOURCE + path, or ""
 static var _jobs := {}  # name -> [task id (-1 while queued), Load]
@@ -889,15 +923,13 @@ class Load:
 	var ok := false
 	var groups: Array = []
 	var parts: Array = []
-	var usec := 0
-	## Off: a surface per material, as before the merge (for comparisons).
+	## On (Settings > Graphics > Merged materials): a surface per shader; off, a surface per material.
 	var combine := true
 	## The format bits of CUSTOM0 and CUSTOM1 (the baked views and part colours).
 	const CUSTOM_KEEP := (Mesh.ARRAY_FORMAT_CUSTOM_MASK << Mesh.ARRAY_FORMAT_CUSTOM_BASE) \
 		| (Mesh.ARRAY_FORMAT_CUSTOM_MASK << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + Mesh.ARRAY_FORMAT_CUSTOM_BITS))
 
 	func run() -> void:
-		var t0 := Time.get_ticks_usec()
 		var doc := GLTFDocument.new()
 		var state := GLTFState.new()
 		if doc.append_from_file(path, state) == OK:
@@ -912,18 +944,17 @@ class Load:
 			for p: Array in parts:
 				p[2] = combined(p[2], combine)
 			ok = true
-		usec = Time.get_ticks_usec() - t0
 
 	## As ModelLibrary._collect, over the glTF's nodes: `in_parts` false inside a moving part.
 	func _walk(nodes: Array, meshes: Array, i: int, parent: Transform3D, tools: Dictionary, order: Array, in_parts: bool, glow: String) -> void:
 		var node: GLTFNode = nodes[i]
 		var xform := parent * node.xform
 		var node_name := str(node.resource_name) if str(node.resource_name) != "" else str(node.original_name)
-		if node_name.begins_with("anim_glow"):
+		if node_name.begins_with(GLOW_PREFIX):
 			glow = kind(node_name).trim_prefix("glow").trim_prefix("_")
 			if glow == "":
 				glow = "on"
-		elif node_name.begins_with("anim_") and in_parts:
+		elif node_name.begins_with(ANIM_PREFIX) and in_parts:
 			var part_tools := {}
 			var part_order: Array = []
 			_walk(nodes, meshes, i, parent, part_tools, part_order, false, glow)
@@ -1008,8 +1039,9 @@ class Load:
 	## merged()'s groups drawn with one shader (variant()) in one surface each, each vertex's group
 	## (its row) in CUSTOM2.r, up to MaterialRows.MAX_ROWS groups a surface: [[keys], arrays, custom
 	## formats], in the order of each shader's first group. A group alone keeps its arrays as they
-	## are. Groups whose custom channels differ in format from the rest stay apart, and so does a
-	## textured material's (FUE5's models, model_textures.gd): its textures are its own uniforms.
+	## are. When any group's custom channels differ in format from the rest, every group of that
+	## shader stays apart; so does a textured material's (FUE5's models, model_textures.gd): its
+	## textures are its own uniforms.
 	static func combined(groups: Array, combine := true) -> Array:
 		var by_shader := {}
 		var order: Array = []
@@ -1117,8 +1149,9 @@ class Load:
 				fill.fill(1.0)
 		return fill
 
+	## A moving part's kind from its node's name (anim_kind's, on the worker that reads the .glb).
 	static func kind(node_name: String) -> String:
-		var k := node_name.substr(5).get_slice(".", 0)
+		var k := node_name.substr(ANIM_PREFIX.length()).get_slice(".", 0)
 		while k.length() > 0 and k[k.length() - 1].is_valid_int():
 			k = k.substr(0, k.length() - 1)
 		return k.trim_suffix("_")
@@ -1194,7 +1227,7 @@ static func entity_ready(proto_name: String, proto_type: String, extra: Dictiona
 	return ready(proto_name)
 
 
-## Starts waiting jobs and makes the models whose jobs are done, within FINISH_USEC. True when
+## Starts waiting jobs and makes the models whose jobs are done, within its slice. True when
 ## some became ready (`generation` went up).
 static func poll() -> bool:
 	var running := 0
@@ -1240,10 +1273,6 @@ static func poll() -> bool:
 
 
 ## True while models are being made on worker threads.
-static func loading() -> bool:
-	return not _jobs.is_empty()
-
-
 ## The finished Load for a model: waits for its job, runs it here if it hasn't started, or (with
 ## no job) reads the file here.
 static func _built(name: String) -> Load:
@@ -1269,7 +1298,6 @@ static func _built(name: String) -> Load:
 
 ## The model's mesh and moving parts (into `parts`) from its Load, on the main thread.
 static func _commit_load(load: Load, parts: Array) -> Mesh:
-	var first := parts.size()
 	var mesh := _commit_groups(load.groups)
 	for p: Array in load.parts:
 		var part := _new_part(str(p[0]), p[1])
@@ -1348,7 +1376,6 @@ static func _load_scene(name: String) -> Node:
 static func _flatten(root: Node, parts: Array) -> Mesh:
 	var tools := {}  # Material (or null) -> SurfaceTool
 	var order: Array = []
-	var first := parts.size()
 	_collect(root, Transform3D.IDENTITY, tools, order, parts, "")
 	var mesh := _commit(tools, order)
 	return mesh
@@ -1430,10 +1457,7 @@ static func _new_part(node_name: String, xform: Transform3D) -> AnimPart:
 ## A moving part's kind from its node name: "anim_spin_drill" -> "spin_drill". Godot names
 ## duplicates "anim_spin_drill2" and Blender "anim_spin_drill.001": both drop the number.
 static func anim_kind(node_name: String) -> String:
-	var kind := node_name.substr(ANIM_PREFIX.length()).get_slice(".", 0)
-	while kind.length() > 0 and kind[kind.length() - 1].is_valid_int():
-		kind = kind.substr(0, kind.length() - 1)
-	return kind.trim_suffix("_")
+	return Load.kind(node_name)
 
 
 ## The Factorio material for an imported one: same colour, roughness, metallic and emission,
@@ -1464,9 +1488,16 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 		if base.albedo_texture != null:
 			out.set_shader_parameter("albedo_tex", base.albedo_texture)
 			out.set_shader_parameter("use_albedo_tex", true)
+			if base.albedo_texture.has_meta(ModelTextures.NEAREST_META):
+				# (Its .glb asks for nearest filtering: drawn from the crisp sampler, model_textures.gd.)
+				out.set_shader_parameter("albedo_tex_nearest", base.albedo_texture)
+				out.set_shader_parameter("albedo_nearest", true)
 		if base.roughness_texture != null:
 			out.set_shader_parameter("orm_tex", base.roughness_texture)
 			out.set_shader_parameter("use_orm_tex", true)
+			if base.roughness_texture.has_meta(ModelTextures.NEAREST_META):
+				out.set_shader_parameter("orm_tex_nearest", base.roughness_texture)
+				out.set_shader_parameter("orm_nearest", true)
 		if base.emission_enabled:
 			out.set_shader_parameter("emission", base.emission)
 			out.set_shader_parameter("emission_energy", base.emission_energy_multiplier)

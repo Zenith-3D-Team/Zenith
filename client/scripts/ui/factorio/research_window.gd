@@ -72,6 +72,11 @@ var _slots := {}
 var _tree_slots := {}
 var _list_sig := ""
 var _tree_key := ""
+## What the queue and the details were built from: `rs` comes every second, and rebuilding them
+## each time put the details' scroll back at the top and closed their tooltips.
+var _queue_sig := ""
+var _details_sig := ""
+var _big: TechSlot
 var _search := LineEdit.new()
 var _history: Array = []
 var _history_at := -1
@@ -170,6 +175,7 @@ void fragment() {
 	bar_bg.content_margin_bottom = Kit.px(4)
 	bar_frame.add_theme_stylebox_override("panel", bar_bg)
 	var bar := Kit.title_bar("Technology tree", true)
+	bar.mouse_filter = Control.MOUSE_FILTER_IGNORE  # Factorio's technology screen fills the screen and doesn't move
 	(bar.get_child(bar.get_child_count() - 1) as Button).pressed.connect(func() -> void: close_requested.emit())
 	_back = _frame_button("Back", "icons/mip/backward-arrow.png", go_back)
 	_forward = _frame_button("Forward", "icons/mip/forward-arrow.png", go_forward)
@@ -288,11 +294,6 @@ func _center_on(tech: String) -> void:
 		_list_scroll.ensure_control_visible(l)
 
 
-## Kept for the earlier name.
-func _scroll_to(tech: String) -> void:
-	_center_on(tech)
-
-
 func refresh() -> void:
 	# Closed, it waits for open(), which refreshes: research progress (`rs`) comes about once a second
 	# and rebuilding the tree each time cost ~9 ms on the main thread.
@@ -307,9 +308,10 @@ func refresh() -> void:
 	_refresh_details()
 
 
-## The research in progress, else the first available technology, else any.
+## The research in progress, else the first available technology, else any (only ones the window
+## has: the list leaves hidden technologies out, and `rs` may name one).
 func _default_selection() -> String:
-	if model.research != "":
+	if model.research != "" and model.techs.has(model.research):
 		return model.research
 	for t in _sorted_techs():
 		if int(model.techs[t]["state"]) == 1:
@@ -343,7 +345,8 @@ func _place(tech: String) -> int:
 
 
 func _refresh_tree() -> void:
-	var sig := JSON.stringify(model.techs) + str(essential_only)
+	# Under "essential only" the selected technology is listed too (_shown): it is part of the key.
+	var sig := JSON.stringify(model.techs) + str(essential_only) + (selected if essential_only else "")
 	if sig != _list_sig:
 		_list_sig = sig
 		_build_list()
@@ -648,6 +651,18 @@ func _cost_lines(info: Dictionary) -> Array:
 	return lines
 
 
+## The details' title and big card as the research moves on, without rebuilding them.
+func _details_progress() -> void:
+	var place := _place(selected)
+	var status: String = STATE_NAMES[int(model.techs[selected]["state"])]
+	if place == 1:
+		status = "Researching %d%%" % roundi(model.research_progress * 100.0)
+	elif place > 1:
+		status = "Queued"
+	_title.text = "%s (%s)" % [title_of(selected), status]
+	_big.set_progress(model.research_progress if selected == model.research else -1.0, place)
+
+
 static func _time_text(seconds: float) -> String:
 	var s := roundi(seconds)
 	if s < 60:
@@ -659,11 +674,21 @@ static func _time_text(seconds: float) -> String:
 
 ## Factorio's queue: seven technology slots, the first being researched; empty places dark.
 func _refresh_queue() -> void:
+	var sig := JSON.stringify([model.research, model.research_queue, selected, model.techs.size()])
+	if sig == _queue_sig:
+		for child in _queue_box.get_children():
+			if child is TechSlot:
+				var t := str(child.get_meta("tech", ""))
+				(child as TechSlot).set_progress(model.research_progress if t == model.research else -1.0, _place(t))
+		return
+	_queue_sig = sig
 	for child in _queue_box.get_children():
 		_queue_box.remove_child(child)
 		child.queue_free()
 	var queued: Array = []
-	if model.research != "":
+	# (Only technologies the window has: one the bridge's list didn't bring, or hasn't yet, would be
+	# a slot with no data, a script error.)
+	if model.research != "" and model.techs.has(model.research):
 		queued.append(model.research)
 	for q in model.research_queue:
 		if not queued.has(str(q)) and model.techs.has(str(q)):
@@ -673,6 +698,7 @@ func _refresh_queue() -> void:
 			var t: String = queued[i]
 			var s := _tech_slot(t)
 			s.name = "Queue_" + t
+			s.set_meta("tech", t)
 			s.set_pressed_no_signal(t == selected)
 			s.set_progress(model.research_progress if t == model.research else -1.0, _place(t))
 			_queue_box.add_child(s)
@@ -689,6 +715,11 @@ func _refresh_queue() -> void:
 
 
 func _refresh_details() -> void:
+	var sig := "%s|%d|%s|%s" % [selected, _place(selected), model.research, JSON.stringify(model.techs.get(selected, {}))]
+	if sig == _details_sig and is_instance_valid(_big):
+		_details_progress()
+		return
+	_details_sig = sig
 	for child in _details.get_children():
 		_details.remove_child(child)
 		child.queue_free()
@@ -699,18 +730,13 @@ func _refresh_details() -> void:
 	var info: Dictionary = model.techs[selected]
 	var state := int(info["state"])
 	var place := _place(selected)
-	var status: String = STATE_NAMES[state]
-	if place == 1:
-		status = "Researching %d%%" % roundi(model.research_progress * 100.0)
-	elif place > 1:
-		status = "Queued"
-	_title.text = "%s (%s)" % [title_of(selected), status]
 	var big := _tech_slot(selected)
 	big.custom_minimum_size = Kit.pxv(BIG_CARD.x, BIG_CARD.y)
 	big.disabled = true
 	big.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
-	big.set_progress(model.research_progress if selected == model.research else -1.0, place)
 	_details.add_child(big)
+	_big = big
+	_details_progress()
 
 	var col := VBoxContainer.new()
 	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -788,6 +814,8 @@ func _refresh_details() -> void:
 				unlocks.add_child(s)
 			else:
 				bonuses.append(Info.effect_line(e))
+	if int(info.get("effects_more", 0)) > 0:
+		bonuses.append(["and %s more" % Kit.count_text(int(info["effects_more"])), "", Kit.DISABLED_TEXT])
 	if unlocks.get_child_count() > 0 or not bonuses.is_empty():
 		v.add_child(Kit.label("Effects", "FHeading"))
 		if unlocks.get_child_count() > 0:

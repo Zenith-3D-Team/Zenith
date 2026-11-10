@@ -5,6 +5,7 @@ extends Node3D
 ## only the ones nearest the camera get a real light, since each light costs rendering time.
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
+const FluidsPower := preload("res://scripts/world/fluids_power.gd")
 
 ## Factorio's lamps switch on at about this darkness.
 const ON_DARKNESS := 0.3
@@ -111,7 +112,7 @@ func _process(delta: float) -> void:
 					continue
 				if power == null or not power.has_no_power(unit):
 					lit.append(rec.pos)
-					if power != null and power.power_state(unit) == 1:
+					if power != null and power.power_state(unit) == FluidsPower.LOW_POWER:
 						dim[rec.pos] = true
 	var near := func(a: Vector2, b: Vector2) -> bool:
 		return a.distance_squared_to(focus) < b.distance_squared_to(focus)

@@ -1,5 +1,5 @@
 extends RefCounted
-## Which roboports are linked into one logistic network (H14), for the lines Factorio draws between
+## Which roboports are linked into one logistic network, for the lines Factorio draws between
 ## them while a roboport is hovered or held. A hovered roboport's links come from the game itself
 ## (`hinfo` `rn`, LuaLogisticCell.neighbours); for the rest (the held one's preview and the others
 ## round it) Factorio's rule stands in: two roboports join when their logistic squares meet, each
@@ -15,7 +15,6 @@ var reach := 160.0
 var radius_of := func(_proto_id: int) -> float: return 25.0
 
 var _ports := {}  # chunk -> [[position (tiles), proto id, unit], ...]
-var _is_port := {}  # proto id -> bool
 
 
 func _init(w: WorldMirror) -> void:
@@ -33,12 +32,9 @@ func _on_entities_changed(c: Vector2i) -> void:
 		return
 	var list: Array = []
 	for rec in cv.entities.values():
-		var port = _is_port.get(rec.proto_id)
-		if port == null:
-			var proto = world.protos.entity(rec.proto_id)
-			port = proto != null and proto.type == "roboport"
-			_is_port[rec.proto_id] = port
-		if port:
+		# (Looked up each time: prototype ids change with the game, and the table is cleared in place.)
+		var proto = world.protos.entity(rec.proto_id)
+		if proto != null and proto.type == "roboport":
 			list.append([rec.pos, rec.proto_id, rec.unit])
 	if list.is_empty():
 		_ports.erase(c)

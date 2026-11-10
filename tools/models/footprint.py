@@ -33,6 +33,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "tools"))
 
 from specs import SPECS  # noqa: E402
+import factorio_install  # noqa: E402
 
 TOLERANCE = 0.10
 # Suffixes of variant models, longest first; "-east"/"-west" models face that way unturned.
@@ -42,12 +43,8 @@ TURNED = ("-east", "-west")
 
 
 def factorio_data():
-    for base in (r"C:\Program Files (x86)\Steam\steamapps\common\Factorio\data",
-                 os.path.expanduser("~/.steam/steam/steamapps/common/Factorio/data"),
-                 r"C:\Program Files\Factorio\data"):
-        if os.path.isdir(base):
-            return base
-    return None
+    folder = factorio_install.find()
+    return os.path.join(folder, "data") if folder and os.path.isdir(os.path.join(folder, "data")) else None
 
 
 def space_age_names():

@@ -128,7 +128,8 @@ func mouse_captured() -> bool:
 	return _mouse and has()
 
 
-## The ground point (Vector3, y = 0) under a screen position, or null.
+## The ground point (Vector3, on the drawn ground: an add-on's hills lift it) under a screen
+## position, or null.
 func ground_point(screen_pos: Vector2):
 	var rig = _host.rig()
 	if rig == null:

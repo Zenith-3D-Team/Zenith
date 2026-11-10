@@ -23,8 +23,13 @@ func _ready() -> void:
 	z_index = 100
 
 
+## Whether the last _draw drew the stack (so hiding it redraws once more, to clear it).
+var _drawn := false
+
+
 func _process(_delta: float) -> void:
-	queue_redraw()
+	if _drawn or shown():
+		queue_redraw()
 
 
 func shown() -> bool:
@@ -32,7 +37,8 @@ func shown() -> bool:
 
 
 func _draw() -> void:
-	if not shown():
+	_drawn = shown()
+	if not _drawn:
 		return
 	var at := get_local_mouse_position() if debug_at.x < 0 else debug_at
 	var side := float(Kit.px(32))

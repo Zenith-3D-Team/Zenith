@@ -25,8 +25,9 @@ const MAX_EXPANSIONS := 6000
 ## The planner plans this far from its rail end at most (the path to a cursor further off isn't drawn).
 const MAX_REACH := 120.0
 const MAX_PIECES := 120
-## The character's build_distance and the mod's slack: pieces further away become ghosts.
-const REACH := 11.5
+## The mod's slack over the character's build distance (pi.build_reach()): pieces further away
+## become ghosts.
+const REACH_SLACK := 1.5
 ## A free rail end this close to the cursor is snapped to when anchoring.
 const SNAP := 2.5
 ## Elevated rails need a support within its range (rail-support: 11 tiles; checked in 2.1.23):
@@ -63,6 +64,8 @@ var arrows: Array = []
 var _materials := {}
 var _last_goal := Vector2i(1 << 30, 1 << 30)
 var _last_anchor := {}
+## The ghost mode and the rails held the path's colours were worked out for.
+var _last_paying := []
 
 
 func _ready() -> void:
@@ -118,6 +121,12 @@ static func ends_of(name: String, pos: Vector2i, dir: int) -> Array:
 ## Free rail ends of existing rails (and their ghosts) near a point: [[pos, dir, layer], ...]. An
 ## end is free when no other rail has an end on the same spot facing back at it.
 func free_ends(near: Vector2, radius: float) -> Array:
+	return rail_ends(near, radius, true)
+
+
+## Rail ends near a point, [[pos, dir, layer], ...]: only the free ones, or (`free_only` false)
+## also the joints where two rails meet, each joint once for each way along the line.
+func rail_ends(near: Vector2, radius: float, free_only: bool) -> Array:
 	var seen := {}  # "x,y,dir,layer" -> count
 	var list: Array = []
 	var center := WorldMirror.chunk_of(near)
@@ -144,23 +153,47 @@ func free_ends(near: Vector2, radius: float) -> Array:
 					seen[k] = int(seen.get(k, 0)) + 1
 					list.append(e)
 	var out: Array = []
+	var taken := {}
 	for e in list:
+		var k := "%d,%d,%d,%d" % [e[0].x, e[0].y, e[1], e[2]]
 		var back := "%d,%d,%d,%d" % [e[0].x, e[0].y, posmod(int(e[1]) + 8, 16), e[2]]
-		if not seen.has(back) and Vector2(e[0]).distance_to(near) <= radius:
-			out.append(e)
+		if (free_only and seen.has(back)) or taken.has(k) or Vector2(e[0]).distance_to(near) > radius:
+			continue
+		taken[k] = true
+		out.append(e)
 	return out
 
 
-## The free end nearest the point within SNAP, or [].
+## The rail end nearest the point within SNAP: a free end, or a joint of an existing line (issue
+## #15: a new line forks off it there, as in Factorio). [] when there is no rail near.
 func nearest_end(near: Vector2) -> Array:
 	var best: Array = []
 	var best_d := SNAP
-	for e in free_ends(near, SNAP):
+	for e in rail_ends(near, SNAP, false):
 		var d := Vector2(e[0]).distance_to(near)
 		if d <= best_d:
 			best = e
 			best_d = d
 	return best
+
+
+## Whether a rail end has another rail's end facing back at it there (a joint, not a free end).
+func is_joint(e: Array) -> bool:
+	for other in rail_ends(Vector2(e[0]), 0.1, false):
+		if other[0] == e[0] and int(other[1]) == posmod(int(e[1]) + 8, 16) and int(other[2]) == int(e[2]):
+			return true
+	return false
+
+
+## The way out of the anchor towards the goal: a joint (anchor "fork") is left either way along
+## its line, whichever faces the cursor; a free end only one way.
+static func anchor_dir(a: Dictionary, goal: Vector2) -> int:
+	var dir := int(a["dir"])
+	if not a.get("fork", false):
+		return dir
+	var to := goal - Vector2(a["pos"])
+	var ang := dir / 16.0 * TAU
+	return dir if Vector2(sin(ang), -cos(ang)).dot(to) >= 0.0 else posmod(dir + 8, 16)
 
 
 ## The cheapest path of pieces from an end (position, direction it points along, layer) to within
@@ -272,7 +305,8 @@ static func supports_for(pieces: Array, support: String, from_ramp: bool) -> Arr
 	return out
 
 
-## Works out the path for this frame (only when the anchor or the cursor tile changed).
+## Works out the path for this frame (only when the anchor, the cursor tile, Shift (or another
+## reason for ghosts) or the rails held changed).
 func update(item: String, has_ground: bool, ground: Vector2, ghost_mode: bool) -> void:
 	var use := use_of(item)
 	if use.is_empty() or not has_ground:
@@ -288,16 +322,18 @@ func update(item: String, has_ground: bool, ground: Vector2, ghost_mode: bool) -
 		free.sort_custom(func(a: Array, b: Array) -> bool: return Vector2(a[0]).distance_squared_to(ground) < Vector2(b[0]).distance_squared_to(ground))
 		_show_arrows(free.slice(0, MAX_ARROWS))
 		return
-	_show_arrows([[anchor["pos"], anchor["dir"], anchor["layer"], "anchored"]])
+	_show_arrows([[anchor["pos"], anchor_dir(anchor, ground), anchor["layer"], "anchored"]])
 	var goal := Vector2i(roundi(ground.x), roundi(ground.y))
-	if goal == _last_goal and anchor == _last_anchor:
+	var have: int = pi.hud.count_of(item)
+	if goal == _last_goal and anchor == _last_anchor and _last_paying == [ghost_mode, have]:
 		_show(path)
 		return
 	_last_goal = goal
 	_last_anchor = anchor.duplicate()
+	_last_paying = [ghost_mode, have]
 	var pieces: Array = []
 	var start: Vector2i = anchor["pos"]
-	var dir: int = anchor["dir"]
+	var dir: int = anchor_dir(anchor, ground)
 	var layer: int = anchor["layer"]
 	var ramped := false
 	if target_layer != layer and dir % 4 == 0 and int(use[1]) == 1:
@@ -315,7 +351,6 @@ func update(item: String, has_ground: bool, ground: Vector2, ghost_mode: bool) -
 		_show([])
 		return
 	var supports := supports_for(pieces, str(use[0]), ramped and layer == 1)
-	var have: int = pi.hud.count_of(item)
 	var reach_from: Vector2 = pi.avatar.ground_position() if pi.avatar != null else ground
 	var spent := 0
 	path = []
@@ -325,7 +360,7 @@ func update(item: String, has_ground: bool, ground: Vector2, ghost_mode: bool) -
 	for p in pieces:
 		var cost := int(COST.get(base_name(str(p["name"])), 1))
 		var state := "ok"
-		if ghost_mode or spent + cost > have or Vector2(p["pos"]).distance_to(reach_from) > REACH:
+		if ghost_mode or spent + cost > have or Vector2(p["pos"]).distance_to(reach_from) > pi.build_reach() + REACH_SLACK:
 			state = "ghost"
 		else:
 			spent += cost
@@ -361,6 +396,8 @@ func click(item: String, ground: Vector2, ghost_mode: bool) -> bool:
 		if e.is_empty():
 			return false  # no rail end nearby: an ordinary straight rail is built
 		anchor = {"pos": e[0], "dir": int(e[1]), "layer": int(e[2])}
+		if is_joint(e):
+			anchor["fork"] = true
 		target_layer = anchor["layer"]
 		return true
 	return build(item, ghost_mode)

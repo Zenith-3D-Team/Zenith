@@ -34,14 +34,6 @@ kit.MATERIALS.update({
 })
 
 
-def _scaled(result, sx, sy, sz):
-    parts = kit.as_parts(result)
-    for p in parts:
-        p.transform(S(sx, sy, sz))
-        p.pivot = Vector((p.pivot.x * sx, p.pivot.y * sy, p.pivot.z * sz))
-    return parts
-
-
 # ---------------------------------------------------------------------------------------------
 # Belt odds: Factorio draws both with their bigger relatives' pictures, smaller.
 

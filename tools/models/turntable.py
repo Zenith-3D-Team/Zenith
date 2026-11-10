@@ -40,7 +40,9 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import sprite_projection as sp  # noqa: E402  (frame numbers only)
 
-FACTORIO = os.environ.get("FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio")
+sys.path.append(os.path.dirname(HERE))
+import factorio_install  # noqa: E402
+FACTORIO = factorio_install.install()
 OUT = os.path.join(REPO, "art-src", "turntable")
 MODELS = os.path.join(REPO, "client", "assets", "models")
 PPT = 64.0                      # pixels per tile of an HR frame at scale 0.5

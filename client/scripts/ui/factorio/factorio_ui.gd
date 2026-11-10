@@ -50,6 +50,7 @@ extends Control
 ## --ui-circuit opens the open entity's circuit connection window after 8 s (with --open=...).
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const UiModel := preload("res://scripts/ui/factorio/ui_model.gd")
 const CharacterWindow := preload("res://scripts/ui/factorio/character_window.gd")
 const MachineScreen := preload("res://scripts/ui/factorio/machine_screen.gd")
@@ -75,6 +76,9 @@ const Alerts := preload("res://scripts/ui/factorio/alerts.gd")
 const TrainsWindow := preload("res://scripts/ui/factorio/trains_window.gd")
 const DeathScreen := preload("res://scripts/ui/factorio/death_screen.gd")
 const PlayersWindow := preload("res://scripts/ui/factorio/players_window.gd")
+const ModGui := preload("res://scripts/ui/factorio/mod_gui.gd")
+const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const Sfx := preload("res://scripts/fx/sfx.gd")
 const EquipmentGrid := preload("res://scripts/ui/factorio/equipment_grid.gd")
 const PlannerUi := preload("res://scripts/ui/factorio/planner_ui.gd")
 const SpaceMap := preload("res://scripts/ui/factorio/space_map.gd")
@@ -106,8 +110,9 @@ const BAR_GAP := 0
 const SHORTCUTS_MIN_HEIGHT := 2 * 40 + 44
 ## Below this many GUI pixels of height the quickbar shows one row.
 const TWO_ROWS_HEIGHT := 600
-const HELP := "E: inventory · T: technologies · M: map · P / K: statistics · L: logistic networks · F2 / Alt+click: Factoriopedia · `: chat · Alt: Alt-mode · 1-0: quickbar (inventory open: pin the hovered item) · F4: debug info"
 ## The open machine's inventories (the rest are the character's).
+## The shortcut buttons _grey_undo greys every frame, with the player's stack each follows.
+const UNDO_BUTTONS := [["undo", "_undo"], ["redo", "_redo"]]
 const MACHINE_ROLES := ["chest", "input", "output", "fuel", "burnt", "modules", "cargo", "trunk", "turret_ammo", "car_ammo",
 	"robots", "repair", "rocket"]
 
@@ -140,6 +145,10 @@ var alerts: Alerts
 ## Factorio's respawn screen while the character is dead, and the players list.
 var death_screen: DeathScreen
 var players_window: PlayersWindow
+var mod_gui: ModGui
+## The top-left Factorio button (Ctrl+F9) and what it does (front_end.gd sets it in a game).
+var factorio_button: Button
+var show_factorio := Callable()
 var pedia: Factoriopedia
 var networks: NetworksWindow
 ## The remote view was started by the logistic networks window (it ends when that closes).
@@ -210,6 +219,8 @@ func _init() -> void:
 
 
 func _ready() -> void:
+	# A graphics list (mod_graphics.gd) brings icons for what was drawn as squares: draw it all again.
+	ModGraphics.listeners.append(_on_graphics_list)
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 	theme = Kit.theme()
@@ -291,7 +302,7 @@ func _ready() -> void:
 	weapons.slot_clicked.connect(_on_character_slot)
 	weapons.open_requested.connect(toggle_inventory)
 	add_child(weapons)
-	quickbar.upper_clicked.connect(_on_upper_quickbar_clicked)
+	quickbar.second_clicked.connect(_on_second_quickbar_clicked)
 	quickbar.page_slot_clicked.connect(_on_page_slot_clicked)
 
 	shortcuts = ShortcutBar.new()
@@ -332,7 +343,7 @@ func _ready() -> void:
 	window.screen = screen
 	window.slot_clicked.connect(_on_character_slot)
 	window.close_requested.connect(close_all)
-	# window.color_requested: the colour goes to the bridge from the window itself (set_char_color).
+	# The colour goes to the bridge from the window itself (ui_model.set_character_color).
 	window.grid_clicked.connect(_on_grid_clicked)
 	add_child(window)
 	screen.slot_clicked.connect(_on_machine_slot)
@@ -359,6 +370,38 @@ func _ready() -> void:
 	players_window = PlayersWindow.new()
 	players_window.model = model
 	add_child(players_window)
+	# Mods' windows from the real player's GUI (mod_gui.lua), beside Zenith's own windows.
+	mod_gui = ModGui.new()
+	mod_gui.anchors = {"controller_gui": window, "entity": screen}
+	mod_gui.message = func(text: String) -> void:
+		var hud = get_parent()
+		if hud != null and hud.has_method("show_message"):
+			hud.show_message(text)
+	add_child(mod_gui)
+	model.mod_gui_received.connect(mod_gui.handle)
+	# Factorio's own icon at the top left, where mods put their buttons in Factorio: the same as
+	# Ctrl+F9, the game in Factorio's window (owner). Shown once the front end gives it something to do.
+	factorio_button = Button.new()
+	factorio_button.name = "ShowInFactorio"
+	factorio_button.theme_type_variation = "FSlotButton"
+	factorio_button.custom_minimum_size = Kit.pxv(40, 40)
+	factorio_button.focus_mode = Control.FOCUS_NONE
+	factorio_button.tooltip_text = "Show in Factorio (Ctrl+F9)"
+	var factorio_icon := GuiAssets.core_sprite("factorio-icon.png")
+	if factorio_icon != null:
+		factorio_button.icon = factorio_icon
+		factorio_button.expand_icon = true
+		factorio_button.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	else:
+		factorio_button.text = "F"
+	factorio_button.position = Kit.pxv(8, 8)
+	factorio_button.visible = false
+	var on_factorio := func() -> void:
+		if show_factorio.is_valid():
+			Sfx.play_ui("gui-click")
+			show_factorio.call()
+	factorio_button.pressed.connect(on_factorio)
+	add_child(factorio_button)
 	death_screen = DeathScreen.new()
 	death_screen.model = model
 	add_child(death_screen)
@@ -447,7 +490,7 @@ func _ready() -> void:
 			window.show_tab.call_deferred("Character")
 		elif arg == "--ui=shortcut-chooser":  # the shortcut bar's ⋮ chooser
 			get_tree().create_timer(3.0).timeout.connect(func() -> void: shortcuts.open_chooser(true))
-		elif arg == "--ui=page-chooser":  # the quickbar's page chooser (the lower row's)
+		elif arg == "--ui=page-chooser":  # the quickbar's page chooser (the top row's: the page in use)
 			get_tree().create_timer(3.0).timeout.connect(func() -> void: quickbar.open_chooser(1, true))
 		elif arg == "--ui=players":
 			players_window.toggle.call_deferred()
@@ -543,6 +586,8 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
+	if factorio_button != null:
+		factorio_button.visible = show_factorio.is_valid()
 	_follow_remote()
 	# Before the minimap's own _process (children run after their parent).
 	minimap.look_at = minimap_look()
@@ -1007,7 +1052,7 @@ func _on_side_button(name: String) -> void:
 func _grey_undo() -> void:
 	if player == null or shortcuts == null:
 		return
-	for pair in [["undo", "_undo"], ["redo", "_redo"]]:
+	for pair: Array in UNDO_BUTTONS:
 		var b := shortcuts.button(pair[0])
 		var stack = player.get(pair[1])
 		if b != null and stack is Array:
@@ -1105,7 +1150,7 @@ func _frame_drop(planet: String) -> void:
 		pp.drop_to(planet)
 
 
-## The platform whose panel goes under the minimap (H3): the one the remote view shows from elsewhere,
+## The platform whose panel goes under the minimap: the one the remote view shows from elsewhere,
 ## else the character's (-1); none (0) while the map or the space map, with panels of their own, is open.
 func _watched_platform() -> int:
 	if map_view.is_open() or space_map.is_open():
@@ -1141,7 +1186,7 @@ func open_map(on: bool) -> void:
 	minimap.set_map_open(space_map.is_open())  # the map view keeps the minimap, following it (H22)
 
 
-## Where the minimap looks (H22), as Factorio's does: the map view's middle while it is open, the 3D
+## Where the minimap looks, as Factorio's does: the map view's middle while it is open, the 3D
 ## remote view's point on the character's surface (another surface's world isn't the map's), else
 ## the character (Vector2.INF).
 func minimap_look() -> Vector2:
@@ -1528,12 +1573,12 @@ func _on_quickbar_clicked(index: int, button_index: int) -> void:
 			_select(index)
 
 
-## The quickbar's upper row: the same as the lower row's clicks, on that page.
-func _on_upper_quickbar_clicked(index: int, button_index: int) -> void:
+## The quickbar's second row: the same as the top row's clicks, on that page.
+func _on_second_quickbar_clicked(index: int, button_index: int) -> void:
 	_on_page_slot_clicked(model.quickbar_upper_page(), index, button_index)
 
 
-## A slot of any quickbar page (the upper row, the page chooser's rows).
+## A slot of any quickbar page (the second row, the page chooser's rows).
 func _on_page_slot_clicked(page: int, index: int, button_index: int) -> void:
 	var item := str(model.quickbar_page_items(page)[index])
 	if button_index == MOUSE_BUTTON_RIGHT or button_index == MOUSE_BUTTON_MIDDLE:
@@ -1961,7 +2006,13 @@ func slot_pipette() -> bool:
 		c = c.get_parent() as Control
 	if c == null:
 		return false
-	var s := c as Slot
+	return pipette_slot(c as Slot)
+
+
+## Q over this slot: its stack into the cursor (a slot of the character's), or the item's first
+## stack from the inventory, or with none a ghost cursor of what it builds; an item that builds
+## nothing (ammo, plates) is only named as missing.
+func pipette_slot(s: Slot) -> bool:
 	var item := s.item if s.item != "" else s.filter_item
 	if item == "" or player == null:
 		return false
@@ -2057,3 +2108,16 @@ func _load_sample() -> void:
 	for i in pins.size():
 		if pins[i] != "":
 			model.pin(i, pins[i])
+
+
+func _on_graphics_list() -> void:
+	if is_inside_tree():
+		_redraw_all(self)
+
+
+static func _redraw_all(node: Node) -> void:
+	if node is CanvasItem:
+		(node as CanvasItem).queue_redraw()
+	for child in node.get_children():
+		_redraw_all(child)
+

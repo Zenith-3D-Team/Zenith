@@ -90,13 +90,12 @@ local function move_inventory(a, b, to, ground)
   local ok, filters = pcall(function() return a.supports_filters() end)
   if ok and filters then
     for i = 1, math.min(#a, #b) do
+      -- The whole ItemFilter: a name alone would mean normal quality only (2.1), so a slot kept for
+      -- a rare item, or for any quality, would change each time the things move.
       local okf, f = pcall(a.get_filter, i)
       if okf and f then
-        local name = type(f) == "table" and f.name or f
-        if type(name) ~= "string" then
-          name = name and name.name
-        end
-        if name and pcall(b.set_filter, i, name) then
+        local okb, set = pcall(b.set_filter, i, f)
+        if okb and set ~= false then
           pcall(a.set_filter, i, nil)
         end
       end

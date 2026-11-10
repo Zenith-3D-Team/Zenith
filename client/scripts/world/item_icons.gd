@@ -9,8 +9,14 @@ extends RefCounted
 ##
 ## <data> is Factorio's `data` folder: --factorio-data=<dir>, or found in the usual Steam and
 ## standalone install places. Items without an icon get a colour instead.
+##
+## In a game whose bridge sent its graphics list (mod_graphics.gd) the list comes first: it has every
+## prototype's icon, a mod's too, read from the mod's own files (mod_files.gd).
 
-const MODS := ["base", "space-age", "quality", "elevated-rails"]
+const ModFiles := preload("res://scripts/world/mod_files.gd")
+const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
+
+const MODS := ["base", "space-age", "quality", "elevated-rails", "recycler"]
 const INDEX := "res://data/icons.json"
 ## Composed icons are drawn this many pixels across (technologies: Factorio's 256 px tech icons).
 const COMPOSED := 64
@@ -35,6 +41,8 @@ static var _searched := false
 static var _textures := {}  # name -> Texture2D, or null when there is no icon
 static var _kinds := {}  # "kind:name" -> Texture2D or null, for fluids, signals and recipes
 static var _index := {}  # kind -> name -> layers (icons.json)
+static var _generation := -1  # ModGraphics.generation the caches were made with
+static var _retired: Array = []  # the caches before the last list, still referenced by drawings
 
 
 static func configure_from_command_line() -> void:
@@ -50,6 +58,7 @@ static func color_for(item: String) -> Color:
 
 
 static func texture_for(item: String) -> Texture2D:
+	_follow_list()
 	if _textures.has(item):
 		return _textures[item]
 	factorio_data_dir()
@@ -60,6 +69,7 @@ static func texture_for(item: String) -> Texture2D:
 
 ## Whether texture_for(item) would answer at once.
 static func is_cached(item: String) -> bool:
+	_follow_list()
 	return _textures.has(item)
 
 
@@ -68,22 +78,43 @@ static func is_cached(item: String) -> bool:
 ## which takes up to tens of milliseconds). store() then puts it in the cache.
 static func load_uncached(item: String) -> Texture2D:
 	var texture: Texture2D = null
-	var layers = index().get("item", {}).get(item)
-	if data_dir != "" and layers is Array:
+	var layers = layers_of("item", item)
+	if layers is Array:
 		texture = _compose(layers)
 	if texture == null and data_dir != "":
 		for mod in MODS:
-			var path := data_dir.path_join(mod).path_join("graphics/icons/%s.png" % item)
-			if FileAccess.file_exists(path):
+			var path := "%s/graphics/icons/%s.png" % [mod, item]
+			if ModFiles.exists(path):
 				texture = _load_icon(path)
 				break
 	return texture
+
+
+## An icon's layers: the bridge's list (every mod's), else icons.json (the game's own), else null.
+static func layers_of(kind: String, name: String):
+	var layers = ModGraphics.icon_layers(kind, name)
+	if layers is Array:
+		return layers
+	return index().get(kind, {}).get(name)
+
+
+## A new graphics list arrived: icons made before may be wrong or missing, so they are made again.
+static func _follow_list() -> void:
+	if _generation != ModGraphics.generation:
+		_generation = ModGraphics.generation
+		# Kept alive: a control that drew one holds only its RID, and a freed texture draws white
+		# until the control redraws (factorio_ui.gd redraws every control on a new list).
+		_retired = [_textures, _kinds]
+		_textures = {}
+		_kinds = {}
 
 
 ## Finds the install and reads the index, so load_uncached() on a worker only reads them.
 static func prepare_for_threads() -> void:
 	factorio_data_dir()
 	index()
+	ModFiles.prepare()
+	_follow_list()
 
 
 ## Puts an icon load_uncached() made in the cache, unless one got there first.
@@ -108,12 +139,14 @@ static func factorio_data_dir() -> String:
 ## "virtual-signal", "recipe", "technology"), or null when the index has none (a recipe named after
 ## its product uses the item's).
 static func texture_for_kind(kind: String, name: String) -> Texture2D:
+	_follow_list()
 	var key := kind + ":" + name
 	if _kinds.has(key):
 		return _kinds[key]
 	var texture: Texture2D = null
-	var layers = index().get(kind, {}).get(name)
-	if factorio_data_dir() != "" and layers is Array:
+	var layers = layers_of(kind, name)
+	factorio_data_dir()
+	if layers is Array:
 		texture = _compose(layers, COMPOSED_TECH if kind == "technology" else COMPOSED)
 	_kinds[key] = texture
 	return texture
@@ -141,14 +174,14 @@ static func _compose(layers: Array, size := COMPOSED) -> Texture2D:
 		return null
 	var first: Array = layers[0]
 	if layers.size() == 1 and first[2] == null and first[3] == null and first[4] == null:
-		return _load_icon(data_dir.path_join(str(first[0])), int(first[1]))
+		return _load_icon(str(first[0]), int(first[1]))
 	var ppu := size / (float(first[1]) * _scale_of(first, size))
 	if layers.all(func(l: Array) -> bool: return l[2] == null):
 		return _compose_plain(layers, size, ppu)
 	var acc := PackedFloat32Array()
 	acc.resize(size * size * 4)
 	for layer: Array in layers:
-		var image := _layer_image(data_dir.path_join(str(layer[0])), int(layer[1]))
+		var image := _layer_image(str(layer[0]), int(layer[1]))
 		if image == null:
 			return null
 		var px := maxi(1, roundi(float(layer[1]) * _scale_of(layer, size) * ppu))
@@ -195,7 +228,7 @@ static func _compose(layers: Array, size := COMPOSED) -> Texture2D:
 static func _compose_plain(layers: Array, size: int, ppu: float) -> Texture2D:
 	var out := Image.create(size, size, false, Image.FORMAT_RGBA8)
 	for layer: Array in layers:
-		var image := _layer_image(data_dir.path_join(str(layer[0])), int(layer[1]))
+		var image := _layer_image(str(layer[0]), int(layer[1]))
 		if image == null:
 			return null
 		var px := maxi(1, roundi(float(layer[1]) * _scale_of(layer, size) * ppu))
@@ -214,11 +247,10 @@ static func _scale_of(layer: Array, size := COMPOSED) -> float:
 	return float(layer[3]) if layer[3] != null else size * 0.5 / float(layer[1])
 
 
-## The full-size picture of an icon file (its left `size` square), or null.
+## The full-size picture of an icon file (its left `size` square), or null. `path` is Factorio's
+## ("__mod__/graphics/..." or "mod/graphics/..."), read through mod_files.gd.
 static func _layer_image(path: String, size: int) -> Image:
-	if not FileAccess.file_exists(path):
-		return null
-	var image := Image.load_from_file(path)
+	var image := ModFiles.load_image(path)
 	if image == null:
 		return null
 	image.convert(Image.FORMAT_RGBA8)
@@ -231,9 +263,7 @@ static func _layer_image(path: String, size: int) -> Image:
 ## Icons hold their own smaller mipmaps to the right of the full-size one (a 64x64 icon is a
 ## 120x64 image); only the square on the left (`size` across when known) is kept.
 static func _load_icon(path: String, size := 0) -> Texture2D:
-	if not FileAccess.file_exists(path):
-		return null
-	var image := Image.load_from_file(path)
+	var image := ModFiles.load_image(path)
 	if image == null:
 		return null
 	var side := image.get_height() if size <= 0 else mini(size, image.get_height())
@@ -252,12 +282,8 @@ static func _find_data_dir() -> String:
 	var paths = load("res://scripts/menu/paths.gd")
 	var exe: String = paths.configured_exe()
 	if exe != "":
-		candidates.append(paths.read_data_dir(exe))
-		candidates.append(exe.get_base_dir().path_join("../data").simplify_path())  # macOS: Contents/MacOS/factorio
-	var libraries: Array[String] = paths._steam_libraries()
-	if OS.get_name() != "Windows":
-		libraries.append(home.path_join("Library/Application Support/Steam"))
-	for lib in libraries:
+		candidates.append(paths.read_data_dir(exe))  # macOS's Contents/MacOS/factorio too
+	for lib: String in paths._steam_libraries():
 		candidates.append(lib.path_join("steamapps/common/Factorio/data"))
 		candidates.append(lib.path_join("steamapps/common/Factorio/factorio.app/Contents/data"))
 	candidates.append("C:/Program Files/Factorio/data")

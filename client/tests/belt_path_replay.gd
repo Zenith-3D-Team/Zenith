@@ -9,7 +9,10 @@ extends Node
 ##
 ## --period: ticks between updates (6 as the mod sends them, 12-48 when it is slowed down);
 ## --straight: no belts given, so items glide in straight lines as before the lane paths;
-## --lead: items carried on from a read this many ticks early, as the mod's slices do.
+## --lead: items carried on from a read this many ticks early, as the mod's slices do;
+## --fold-ahead: each update's glides begin this many ticks past the drawn clock, as a job on the
+## worker whose result is drawn before its fold tick (the live client's jobs; replays run at once),
+## items drawn that much further behind; --items-script: another belt_items.gd (a change compared).
 
 const BeltItems := preload("res://scripts/world/belt_items.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
@@ -39,10 +42,12 @@ func _ready() -> void:
 			list.append([ids[name], name, str(b[1]), -0.5, -0.5, 0.5, 0.5, 128, 128, 128, 1, 1])
 	protos.add_entities(list)
 	protos.add_items([[1, ""]])
-	var items := BeltItems.new()
+	var items: Node = (load(str(args["items-script"])) if args.has("items-script") else BeltItems).new()
 	items.protos = protos
 	add_child(items)
 	items._sync = true  # after _ready, which reads it from the command line
+	items.sync_fold_ahead = float(args.get("fold-ahead", "0"))
+	items._margin += items.sync_fold_ahead  # drawn that much further behind, as the live margin is
 	if not args.has("straight"):
 		var by_chunk := {}
 		var unit := 1

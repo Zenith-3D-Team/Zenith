@@ -13,6 +13,9 @@ local SWEEP = 6          -- ticks between reports (a gun turret fires every 6)
 local REFRESH = 60       -- ticks between looking for the turrets in range
 local FULL = 120         -- ticks between reports of every turret, idle ones too
 local RECORDS_PER_MESSAGE = 200
+-- Ticks between `tf` cues per turret, by what it fires (see M.on_hit).
+local FIRE_INTERVAL = { bullet = 2, laser = 4, flame = 6 }
+local LONGEST_FIRE_INTERVAL = 6
 
 -- Entity type -> how to read it: the inventory with its ammo, and where its weapon points.
 local KINDS = {
@@ -115,6 +118,24 @@ local function find(s)
   for _, e in pairs(surface.find_entities_filtered({ area = area, type = TYPES })) do
     if e.unit_number then
       s.turrets[e.unit_number] = e
+    end
+  end
+  -- M.on_removed only hears of turrets that died: a mined one would keep these for good.
+  for unit, at in pairs(s.turret_fire_ticks or {}) do
+    if game.tick - at >= LONGEST_FIRE_INTERVAL then
+      s.turret_fire_ticks[unit] = nil
+    end
+  end
+  -- Turrets no longer in range are forgotten too (on a walk along a long wall every turret ever
+  -- near the focus stayed until the next handshake).
+  for unit in pairs(s.turret_last or {}) do
+    if not s.turrets[unit] then
+      s.turret_last[unit] = nil
+    end
+  end
+  for unit in pairs(s.turret_hits or {}) do
+    if not s.turrets[unit] then
+      s.turret_hits[unit] = nil
     end
   end
 end
@@ -223,7 +244,7 @@ function M.on_hit(event)
     s.turret_hits[unit] = true
   end
   s.turret_fire_ticks = s.turret_fire_ticks or {}
-  local interval = kind == "flame" and 6 or (kind == "laser" and 4 or 2)
+  local interval = FIRE_INTERVAL[kind]
   if game.tick - (s.turret_fire_ticks[unit] or -interval) >= interval then
     s.turret_fire_ticks[unit] = game.tick
     local target = cause.shooting_target
@@ -233,15 +254,7 @@ function M.on_hit(event)
     if seen and not seen(cause.position.x, cause.position.y) then
       return
     end
-    transport.send_now({
-      t = "tf",
-      u = unit,
-      w = kind,
-      sx = world.fixed(cause.position.x),
-      sy = world.fixed(cause.position.y),
-      x = world.fixed(p.x),
-      y = world.fixed(p.y),
-    })
+    transport.send_now({ t = "tf", u = unit, x = world.fixed(p.x), y = world.fixed(p.y) })
   end
 end
 
@@ -264,6 +277,7 @@ function M.reset()
   s.turrets = nil
   s.turret_last = {}
   s.turret_hits = {}
+  s.turret_fire_ticks = nil
 end
 
 return M

@@ -27,6 +27,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "tools"))
 
 import specs  # noqa: E402
+import factorio_install  # noqa: E402
 
 GODOT = os.environ.get("GODOT", os.path.expandvars(
     r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\GodotEngine.GodotEngine_Microsoft.Winget.Source_8wekyb3d8bbwe"
@@ -63,7 +64,7 @@ PIPE_SHAPES = ["straight-vertical-single", "ending-up", "ending-right", "corner-
                "corner-down-left", "t-left", "t-down", "cross"]  # model_library.gd PIPE_SHAPES
 
 
-FACTORIO = os.environ.get("FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio")
+FACTORIO = factorio_install.install()
 _PROTO_TYPES = None
 
 

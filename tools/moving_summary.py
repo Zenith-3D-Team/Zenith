@@ -18,12 +18,7 @@ import argparse
 import json
 import math
 
-
-def pct(values, p):
-    if not values:
-        return float("nan")
-    s = sorted(values)
-    return s[max(0, min(len(s) - 1, math.ceil(p * len(s)) - 1))]
+from percentile import pct
 
 
 def frame_parts(r):

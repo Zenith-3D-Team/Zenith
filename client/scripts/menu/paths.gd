@@ -32,19 +32,110 @@ static func server_settings_file() -> String:
 	return repo_dir().path_join("server/server-settings.json")
 
 
+## True in an exported build: its servers' data and saves are kept in Zenith's user folder
+## (user://, on Windows %APPDATA%\Godot\app_userdata\Zenith, beside settings.cfg), so they outlive
+## an update, which unpacks into a new folder. A checkout keeps them in server/, where
+## run-server.ps1 and the tools look. Tests set it.
+static var keep_in_user_data := OS.has_feature("template")
+## The user folder that keep_in_user_data uses (tests point it elsewhere).
+static var user_data_dir := OS.get_user_data_dir()
+static var _moved := false
+
+
 ## The server's config, logs, mods link and RCON password, apart from the normal game's.
 static func server_data_dir() -> String:
 	var dir := Settings.arg_value("--server-data=")
 	if dir == "":
 		dir = str(Settings.get_value("factorio", "server_data"))
-	return _absolute(dir) if dir != "" else repo_dir().path_join("server/data")
+	if dir != "":
+		return _absolute(dir)
+	if keep_in_user_data:
+		_move_once()
+	return default_server_data_dir()
+
+
+## The server data folder when none is set: Zenith's user folder in a download, server/data in a
+## checkout.
+static func default_server_data_dir() -> String:
+	return user_data_dir.path_join("server-data") if keep_in_user_data else repo_dir().path_join("server/data")
 
 
 static func saves_dir() -> String:
 	var dir := Settings.arg_value("--saves-dir=")
 	if dir == "":
 		dir = str(Settings.get_value("factorio", "saves"))
-	return _absolute(dir) if dir != "" else repo_dir().path_join("server/saves")
+	if dir != "":
+		return _absolute(dir)
+	if keep_in_user_data:
+		_move_once()
+	return default_saves_dir()
+
+
+## The saves folder when none is set, as default_server_data_dir().
+static func default_saves_dir() -> String:
+	return user_data_dir.path_join("saves") if keep_in_user_data else repo_dir().path_join("server/saves")
+
+
+## Once, while the user folder has no saves and no server mod list yet: copies what earlier
+## versions kept beside Zenith.exe (server/saves, the server's own mods, their mod-list.json and
+## mod settings) into it, so updating in place keeps them. Saves in folders keep their folders.
+## The originals stay where they were. The bridge mod's link is made again at each start.
+static func _move_once() -> void:
+	if not _moved:
+		_moved = true
+		move_from_install(repo_dir())
+
+
+## What _move_once does, from the folder `install` (an older Zenith's, holding server/).
+static func move_from_install(install: String) -> void:
+	var old_saves := install.path_join("server/saves")
+	var new_saves := user_data_dir.path_join("saves")
+	if DirAccess.dir_exists_absolute(old_saves) and not _has_zip(new_saves):
+		_copy_tree(old_saves, new_saves, func(f: String) -> bool: return f.ends_with(".zip"))
+	var old_mods := install.path_join("server/data/mods")
+	var new_mods := user_data_dir.path_join("server-data/mods")
+	if DirAccess.dir_exists_absolute(old_mods) and not FileAccess.file_exists(new_mods.path_join("mod-list.json")):
+		DirAccess.make_dir_recursive_absolute(new_mods)
+		var dir := DirAccess.open(old_mods)
+		if dir != null:
+			for f in dir.get_files():
+				if f.ends_with(".zip") or f == "mod-list.json" or f == "mod-settings.dat":
+					DirAccess.copy_absolute(old_mods.path_join(f), new_mods.path_join(f))
+
+
+static func _has_zip(dir_path: String) -> bool:
+	var dir := DirAccess.open(dir_path)
+	if dir == null:
+		return false
+	for f in dir.get_files():
+		if f.ends_with(".zip"):
+			return true
+	for sub in dir.get_directories():
+		if _has_zip(dir_path.path_join(sub)):
+			return true
+	return false
+
+
+## Copies the files `keep` accepts from `from` into `to`, folders and all, without replacing any.
+static func _copy_tree(from: String, to: String, keep: Callable) -> void:
+	var dir := DirAccess.open(from)
+	if dir == null:
+		return
+	DirAccess.make_dir_recursive_absolute(to)
+	for f in dir.get_files():
+		if keep.call(f) and not FileAccess.file_exists(to.path_join(f)):
+			DirAccess.copy_absolute(from.path_join(f), to.path_join(f))
+	for sub in dir.get_directories():
+		_copy_tree(from.path_join(sub), to.path_join(sub), keep)
+
+
+## The player's own Factorio mods folder (beside Factorio's saves), or "".
+static func factorio_mods_dir() -> String:
+	var saves := factorio_saves_dir()
+	if saves == "":
+		return ""
+	var mods := saves.get_base_dir().path_join("mods")
+	return mods if DirAccess.dir_exists_absolute(mods) else ""
 
 
 ## Factorio's own saves (%APPDATA%\Factorio\saves, ~/.factorio/saves), or "".
@@ -103,9 +194,13 @@ static func find_factorio_exe() -> String:
 	return ""
 
 
-## The install's data folder (read-data in config.ini) for a factorio.exe.
+## The install's data folder (read-data in config.ini) for a factorio.exe: bin/x64/../../data, or
+## on macOS factorio.app/Contents/MacOS/../data.
 static func read_data_dir(exe: String) -> String:
-	return exe.get_base_dir().path_join("../../data").simplify_path()
+	var bin := exe.get_base_dir()
+	if bin.ends_with("Contents/MacOS"):
+		return bin.path_join("../data").simplify_path()
+	return bin.path_join("../../data").simplify_path()
 
 
 ## Factorio's version from the install's base mod, e.g. "2.1.23", or "".
@@ -122,7 +217,8 @@ static func _exe_in(path: String) -> String:
 	path = _absolute(path)
 	if FileAccess.file_exists(path):
 		return path
-	for sub in [EXE, "x64/factorio.exe", "factorio.exe", "bin/x64/factorio"]:
+	for sub in [EXE, "x64/factorio.exe", "factorio.exe", "bin/x64/factorio", "Contents/MacOS/factorio",
+			"factorio.app/Contents/MacOS/factorio"]:
 		if FileAccess.file_exists(path.path_join(sub)):
 			return path.path_join(sub)
 	return path  # missing: the launcher reports it with this path
@@ -136,12 +232,13 @@ static func _absolute(path: String) -> String:
 
 
 ## Steam's folder from the registry (HKCU\Software\Valve\Steam SteamPath) or its default, then
-## the other libraries listed in libraryfolders.vdf.
+## the other libraries listed in libraryfolders.vdf (Linux's and macOS's own folders elsewhere).
 static func _steam_libraries() -> Array[String]:
 	var out: Array[String] = []
 	if OS.get_name() != "Windows":
 		var home := OS.get_environment("HOME")
-		for steam in [home.path_join(".steam/steam"), home.path_join(".local/share/Steam")]:
+		for steam in [home.path_join(".steam/steam"), home.path_join(".local/share/Steam"),
+				home.path_join("Library/Application Support/Steam")]:
 			out.append(steam)
 			out.append_array(ItemIcons._steam_libraries(steam.path_join("steamapps/libraryfolders.vdf")))
 		return out

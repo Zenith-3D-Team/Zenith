@@ -9,11 +9,11 @@ RELIABLE = {"cmdr", "welcome", "protos", "tprotos", "iprotos", "fprotos", "ready
             "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol"}
 IMMEDIATE = {"me", "mv", "bi", "ih", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "plat",
              "ai", "clip", "chat", "stats", "trl", "seg", "lt", "legs", "cp", "pg", "sp", "fz", "rk", "pst", "bf",
-             "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb"}
+             "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui"}
 CHARACTER_ROLES = {"main", "guns", "ammo", "armor", "trash"}
 DICTIONARY_WIDTH = {"protos": 12, "tprotos": 5, "iprotos": 2, "fprotos": 5, "dprotos": 2}
 GUI_KINDS = {"container", "crafter", "furnace", "lab", "combinator", "train", "stop", "roboport", "other",
-             "inserter", "splitter", "switch", "turret", "vehicle", "pole", "silo", "panel", "hub", "pad", "bay", "collector"}
+             "inserter", "splitter", "switch", "turret", "vehicle", "pole", "silo", "panel", "hub", "pad", "collector"}
 GUI_ROLES = {"chest", "input", "output", "fuel", "burnt", "modules", "cargo", "ammo", "trash", "robots", "repair",
              "trunk", "turret_ammo", "car_ammo", "rocket"}
 LOGISTIC_MODES = {"requester", "active-provider", "passive-provider", "buffer", "storage", "none", "roboport"}
@@ -22,9 +22,35 @@ PLANNER_ITEMS = {"", "blueprint", "blueprint-book", "deconstruction-planner", "u
 RECORD_TYPES = {"blueprint", "blueprint-book", "deconstruction-planner", "upgrade-planner"}
 STATS_KINDS = {"item", "fluid", "kill", "electric", "build", "pollution"}
 ALERT_KINDS = {"destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "train_fuel", "train_path",
-               "platform_path", "platform_storage", "collector", "launch", "no_power", "unplugged", "low_power", "no_fuel",
-               "output_full"}
+               "platform_path", "platform_storage", "collector", "launch", "unplugged", "no_fuel", "output_full"}
 PEDIA_KINDS = {"item", "fluid", "entity", "recipe", "technology", "tile", "planet", "space-location", "quality"}
+
+
+def doc_problems(path=None):
+    """docs/PROTOCOL.md's "Mod → client" table against RELIABLE and IMMEDIATE: every type has a
+    row, and its second column says R exactly when the type is reliable."""
+    import pathlib
+    import re
+    path = path or pathlib.Path(__file__).resolve().parent.parent / "docs" / "PROTOCOL.md"
+    lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    start = lines.index("## Mod → client")
+    rows = {}
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if line.startswith("| `") and not line.startswith("| `t` |"):
+            cols = [c.strip() for c in line.split("|")]
+            for t in re.findall(r"`([a-z_0-9]+)`", cols[1]):
+                rows.setdefault(t, cols[2])
+    out = []
+    for t in sorted(RELIABLE | IMMEDIATE):
+        if t not in rows:
+            out.append(f"PROTOCOL.md: no row for {t} in the Mod -> client table")
+        elif (rows[t] == "R") != (t in RELIABLE):
+            out.append(f"PROTOCOL.md: {t}'s row says {rows[t]!r}, protocol.py has it {'reliable' if t in RELIABLE else 'immediate'}")
+    for t in sorted(set(rows) - RELIABLE - IMMEDIATE):
+        out.append(f"PROTOCOL.md: {t} has a row but protocol.py doesn't know it")
+    return out
 
 
 def split_datagram(data):
@@ -51,6 +77,28 @@ def _list(v):
 
 def _items(v):
     return v if isinstance(v, list) else []
+
+
+def belt_group_problem(bg):
+    """bi bg (belt_items.lua, belt groups): [lane key, item id, x, y where line position 0 is, x, y
+    where 1 is (1/256 tile), the front item's line position (1/256, below one gap), the gap (1/256:
+    a quarter or half tile), the belt's speed (line positions a tick, 1/65536), stack size, ...]."""
+    if not _list(bg) or len(_items(bg)) % 10 or not all(_int(v) for v in _items(bg)):
+        return "must be flat groups of 10 integers"
+    v = _items(bg)
+    for i in range(0, len(v), 10):
+        key, item, x0, y0, x1, y1, front, gap, speed, stack = v[i:i + 10]
+        if key <= 0 or item <= 0:
+            return f"group {i // 10 + 1}: lane key and item id must be positive"
+        if (x0, y0) == (x1, y1):
+            return f"group {i // 10 + 1}: line positions 0 and 1 are at the same place"
+        if gap not in (64, 128):
+            return f"group {i // 10 + 1}: the gap must be a quarter or half tile (64 or 128), not {gap}"
+        if not 0 <= front <= gap:
+            return f"group {i // 10 + 1}: the front item must be within one gap of line position 0, not {front}"
+        if speed < 0 or not 1 <= stack <= 4:
+            return f"group {i // 10 + 1}: speed must be >= 0 and stack size 1-4"
+    return None
 
 
 def entity_record_problems(rec, where):
@@ -176,8 +224,9 @@ def tech_problems(rec):
     # 8 values from older mods; 14 with effects, levels, the trigger's detail, saved progress and the
     # count formula.
     # 15: whether it is essential (Factorio's "Show only essential technologies").
-    if not (isinstance(rec, list) and len(rec) in (8, 14, 15)):
-        return [f"techs: record must have 8, 14 or 15 values: {rec!r}"]
+    # 16: how many effects were left out to keep a giant record sendable.
+    if not (isinstance(rec, list) and len(rec) in (8, 14, 15, 16)):
+        return [f"techs: record must have 8, 14, 15 or 16 values: {rec!r}"]
     name, order, pre, ings, count, seconds, state, trigger = rec[:8]
     out = []
     if not (isinstance(name, str) and isinstance(order, str) and _strs(pre) and _int(count) and _num(seconds)
@@ -185,7 +234,9 @@ def tech_problems(rec):
         out.append(f"techs: bad record {rec!r}")
     if not _list(ings) or not all(isinstance(x, list) and len(x) == 2 and isinstance(x[0], str) and _num(x[1]) for x in _items(ings)):
         out.append(f"techs: ingredients must be [[name, amount], ...]: {rec!r}")
-    if len(rec) == 15 and rec[14] not in (0, 1):
+    if len(rec) == 16 and not (_int(rec[15]) and rec[15] > 0):
+        out.append(f"techs: effects left out is a count over 0: {rec!r}")
+    if len(rec) >= 15 and rec[14] not in (0, 1):
         out.append(f"techs: essential is 0 or 1: {rec!r}")
     if len(rec) >= 14:
         effects, level, max_level, detail, saved, formula = rec[8:14]
@@ -588,9 +639,9 @@ def sections_problems(v, where):
 
 
 def space_problems(msg, kind):
-    """The fields space.lua adds to `gui`: hub, pad, bay, col, eff, rq, ql."""
+    """The fields space.lua adds to `gui`: hub, pad, col, eff, rq, ql."""
     out = []
-    owners = {"hub": "hub", "pad": "pad", "bay": "bay", "col": "collector"}
+    owners = {"hub": "hub", "pad": "pad", "col": "collector"}
     for field, owner in owners.items():
         if field in msg and kind != owner and not (field == "col" and isinstance(msg[field], list)):
             out.append(f"gui: only {owner} screens have {field}: {msg!r}")
@@ -626,9 +677,6 @@ def space_problems(msg, kind):
             cb = pad.get("cb")
             if cb is not None and not (isinstance(cb, dict) and all(cb.get(k) in (0, 1) for k in ("read", "req", "empty"))):
                 out.append(f"gui: pad.cb is {{read, req, empty}} (0/1): {cb!r}")
-    bay = msg.get("bay")
-    if bay is not None and not (isinstance(bay, dict) and _int(bay.get("owner"))):
-        out.append(f"gui: bay is {{owner (unit or 0)}}: {bay!r}")
     col = msg.get("col") if kind == "collector" else None
     if col is not None and not (isinstance(col, dict) and _int(col.get("n")) and _strs(col.get("f"))
                                 and len(_items(col.get("f"))) == col["n"]):
@@ -830,6 +878,79 @@ def item_use_problems(rec):
     return []
 
 
+GFX_SECTIONS = {"icons", "tiles", "decor", "ents", "sprites"}
+
+
+def _gfx_layer_ok(layer):
+    return (isinstance(layer, list) and len(layer) == 5 and isinstance(layer[0], str) and _num(layer[1])
+            and (layer[2] is None or (isinstance(layer[2], list) and len(layer[2]) == 4 and all(_num(v) for v in layer[2])))
+            and (layer[3] is None or _num(layer[3]))
+            and (layer[4] is None or (isinstance(layer[4], list) and len(layer[4]) == 2 and all(_num(v) for v in layer[4]))))
+
+
+def _gfx_anim_ok(a):
+    if not (isinstance(a, dict) and _num(a.get("f")) and _num(a.get("l", 0)) and _num(a.get("s", 1))
+            and _num(a.get("x", 0)) and _num(a.get("y", 0)) and _num(a.get("o", 0)) and _num(a.get("r", 1))):
+        return False
+    if "q" in a and not (isinstance(a["q"], list) and all(_num(v) for v in a["q"])):
+        return False
+    if "fs" in a and not (isinstance(a["fs"], list) and all(isinstance(v, str) for v in a["fs"]) and _num(a.get("p", 1))):
+        return False
+    if "st" in a and not (isinstance(a["st"], list) and all(isinstance(t, list) and len(t) == 5 and isinstance(t[0], str)
+                                                             for t in a["st"])):
+        return False
+    return "m" not in a or a["m"] in ("forward", "backward", "forward-then-backward")
+
+
+def _gfx_pic_ok(p):
+    return (isinstance(p, list) and len(p) in (8, 9, 10) and isinstance(p[0], str) and all(_num(v) for v in p[1:8])
+            and (len(p) == 8 or p[8] is None or (isinstance(p[8], list) and len(p[8]) == 4))
+            and (len(p) < 10 or _gfx_anim_ok(p[9])))
+
+
+def gfx_problems(msg):
+    """`gfx`: one part of the bridge's graphics list (scripts/gfx_extract.lua)."""
+    out = []
+    if not (isinstance(msg.get("fp"), str) and _int(msg.get("part")) and _int(msg.get("parts"))
+            and 1 <= msg["part"] <= msg["parts"]):
+        return [f"gfx: needs fp, part and parts: {msg.get('fp')!r} {msg.get('part')!r} {msg.get('parts')!r}"]
+    d = msg.get("d")
+    if not isinstance(d, dict) or not set(d) <= GFX_SECTIONS:
+        return [f"gfx: d must hold only {sorted(GFX_SECTIONS)}: {list(d) if isinstance(d, dict) else d!r}"]
+    for kind, names in d.get("icons", {}).items():
+        for name, layers in (names.items() if isinstance(names, dict) else []):
+            if not (isinstance(layers, list) and layers and all(_gfx_layer_ok(l) for l in layers)):
+                out.append(f"gfx: icon {kind}/{name} must be [[file, size, tint, scale, shift], ...]: {layers!r}")
+    for name, rec in d.get("tiles", {}).items():
+        if not isinstance(rec, dict) or not ("main" in rec or "mat" in rec):
+            out.append(f"gfx: tile {name} needs main or mat: {rec!r}")
+            continue
+        for e in rec.get("main", []):
+            if not (isinstance(e, list) and len(e) == 9 and isinstance(e[0], str) and all(_num(v) for v in e[1:7])
+                    and (e[7] is None or (isinstance(e[7], list) and all(_num(v) for v in e[7]))) and _num(e[8])):
+                out.append(f"gfx: tile {name} variant must be [file, count, size, x, y, line, probability, weights, scale]: {e!r}")
+        if "mat" in rec and not (isinstance(rec["mat"], list) and len(rec["mat"]) == 3 and isinstance(rec["mat"][0], str)
+                                 and _num(rec["mat"][1]) and _num(rec["mat"][2])):
+            out.append(f"gfx: tile {name} mat must be [file, count, scale]: {rec['mat']!r}")
+        if not (_num(rec.get("layer")) and isinstance(rec.get("group"), str) and rec.get("water") in (0, 1)):
+            out.append(f"gfx: tile {name} needs layer, group and water: {rec!r}")
+    for name, rec in d.get("decor", {}).items():
+        if not (isinstance(rec, dict) and isinstance(rec.get("layer"), str) and isinstance(rec.get("box"), list)
+                and len(rec["box"]) == 4 and isinstance(rec.get("pics"), list) and rec["pics"]
+                and all(_gfx_pic_ok(p) and len(p) == 8 for p in rec["pics"])):
+            out.append(f"gfx: decorative {name} must be {{layer, box, pics}}: {rec!r}")
+    for name, rec in d.get("ents", {}).items():
+        if not isinstance(rec, dict) or not rec:
+            out.append(f"gfx: entity {name} needs pictures by direction: {rec!r}")
+            continue
+        for k, layers in rec.items():
+            if k not in ("n", "e", "s", "w", "kn", "ke", "ks", "kw"):
+                out.append(f"gfx: entity {name}: unknown key {k!r}")
+            elif not (isinstance(layers, list) and layers and all(_gfx_pic_ok(p) for p in layers)):
+                out.append(f"gfx: entity {name} {k} must be [[file, x, y, w, h, scale, sx, sy, tint, anim?], ...]: {layers!r}")
+    return out
+
+
 def problems(msg):
     out = []
     if not isinstance(msg, dict):
@@ -853,6 +974,10 @@ def problems(msg):
         need("v", "u", "x", "y")
         need("mp", check=lambda v: isinstance(v, bool))
         out += surface_field_problems(msg, t)
+        if "mods" in msg and not (isinstance(msg["mods"], dict) and all(isinstance(v, str) for v in msg["mods"].values())):
+            out.append(f"welcome: mods must be {{name: version}}: {msg['mods']!r}")
+        if "gf" in msg and not (isinstance(msg["gf"], str) and _int(msg.get("gn")) and msg["gn"] >= 1):
+            out.append(f"welcome: gf is the graphics list's fingerprint, gn its parts: {msg.get('gf')!r} {msg.get('gn')!r}")
     elif t == "surface":
         need("si", "x", "y")
         out += surface_field_problems(msg, t)
@@ -883,7 +1008,13 @@ def problems(msg):
                 out.append(f"tprotos: bad colour {rec!r}")
     elif t == "chunk":
         need("cx", "cy")
-        if msg.get("none") is not True:
+        for k in ("rs", "rv", "n", "same"):
+            if k in msg and not _int(msg[k]):
+                out.append(f"chunk: {k} must be an integer")
+        if "same" in msg:
+            if "rs" not in msg:
+                out.append("chunk: same needs rs")
+        elif msg.get("none") is not True:
             need("parts")
             tiles = msg.get("tiles")
             if not isinstance(tiles, list) or len(tiles) % 2 or not all(_int(v) for v in tiles):
@@ -944,16 +1075,34 @@ def problems(msg):
         elif t == "bi" and any(k in msg for k in ("fx", "fy", "fr")) and not (
                 all(_int(msg.get(k)) for k in ("fx", "fy", "fr")) and msg["fr"] >= 0):
             out.append(f"bi: fx, fy (1/256 tile) and fr (tiles, >= 0) come together, as integers: {msg.get('fx')!r} {msg.get('fy')!r} {msg.get('fr')!r}")
+        elif t == "bi" and "w" in msg and not (_int(msg["w"]) and msg["w"] >= 0):
+            out.append(f"bi: w (the update's work units) must be a non-negative integer: {msg['w']!r}")
         elif t == "bi" and "ln" in msg and not (
                 _list(msg["ln"]) and len(_items(msg["ln"])) % 2 == 0 and all(_int(v) and v >= 0 for v in _items(msg["ln"]))
                 and sum(_items(msg["ln"])[1::2]) == len(_items(l)) // 4):
             out.append(f"bi: ln must be [lane key, count, ...] (non-negative integers) whose counts add up to the part's items: {msg['ln']!r}")
         elif t == "bi" and "dl" in msg and not (_list(msg["dl"]) and all(_int(v) and v > 0 for v in _items(msg["dl"]))):
             out.append(f"bi: dl must be a list of lane keys (positive integers): {msg['dl']!r}")
+        elif t == "bi" and "pc" in msg and not (
+                _list(msg["pc"]) and len(_items(msg["pc"])) % 5 == 0 and all(_int(v) and v >= 0 for v in _items(msg["pc"]))):
+            out.append(f"bi: pc must be [lane key, stacks, front, back (1/256), ticks read early, ...] as non-negative integers: {msg['pc']!r}")
+        elif t == "bi" and "pl" in msg and not (
+                _list(msg["pl"]) and len(_items(msg["pl"])) % 8 == 0 and all(_int(v) for v in _items(msg["pl"]))
+                and all(k > 0 for j in range(0, len(_items(msg["pl"])), 8) for k in _items(msg["pl"])[j:j + 3])
+                and all(v >= 0 for v in _items(msg["pl"])[7::8])):
+            out.append(f"bi: pl must be [lane key, key behind, key in front (positive), x0, y0, x1, y1, speed (>= 0), ...] as integers: {msg['pl']!r}")
         elif t == "bi" and "st" in msg and not (
                 _list(msg["st"]) and len(_items(msg["st"])) % 2 == 0 and all(_int(v) for v in _items(msg["st"]))
                 and all(2 <= v <= 4 for v in _items(msg["st"])[1::2])):
             out.append(f"bi: st must be [unique id, stack size (2-4), ...] as integers: {msg['st']!r}")
+        elif t == "bi" and "bg" in msg and (problem := belt_group_problem(msg["bg"])):
+            out.append(f"bi: bg {problem}: {msg['bg']!r}"[:300])
+        elif t == "bi" and "bm" in msg and not (
+                _list(msg["bm"]) and len(_items(msg["bm"])) % 3 == 0 and all(_int(v) for v in _items(msg["bm"]))
+                and all(v > 0 for v in _items(msg["bm"])[0::3])
+                and all(0 <= v < 256 for v in _items(msg["bm"])[1::3])
+                and all(v >= 0 for v in _items(msg["bm"])[2::3])):
+            out.append(f"bi: bm must be [lane key (> 0), front item's line position (1/256, 0-255), ticks since its last check (>= 0), ...] as integers: {msg['bm']!r}"[:300])
         elif t == "pw" and not all(v in (0, 1, 2) for v in _items(l)[1::2]):
             out.append(f"pw: states must be 0 (no power), 1 (low power) or 2 (not connected): {l!r}")
     elif t == "en":
@@ -982,6 +1131,12 @@ def problems(msg):
             need("sd", "msd")
         if "hub" in msg:
             need("hub")
+        if "fl" in msg and msg["fl"] != 1:
+            out.append(f"me: fl is 1 while flying, else left out: {msg['fl']!r}")
+        if ("fl" in msg) != ("fh" in msg):
+            out.append(f"me: fl (flying) and fh (flight height) come together: {msg!r}")
+        elif "fh" in msg and not (_int(msg["fh"]) and msg["fh"] >= 0):
+            out.append(f"me: fh must be thousandths of a tile, 0 or more: {msg['fh']!r}")
         if "pod" in msg:
             need("pod", "gx", "gy", "up")
             if not isinstance(msg.get("ps"), str):
@@ -1012,6 +1167,38 @@ def problems(msg):
             if not (isinstance(rec, list) and len(rec) == 2 and isinstance(rec[0], str) and _list(rec[1])
                     and all(isinstance(v, str) for v in _items(rec[1]))):
                 out.append(f"perms: entry must be [group name, [player names]]: {rec!r}")
+    elif t == "mgui":
+        need("ids", check=_list)
+        need("l", check=_list)
+        if not all(_int(i) for i in _items(msg.get("ids"))):
+            out.append(f"mgui: ids must be element indexes: {msg.get('ids')!r}")
+        roots = ("top", "left", "center", "screen", "relative")
+        for rec in _items(msg.get("l")):
+            if not (isinstance(rec, dict) and _int(rec.get("i")) and rec.get("r") in roots and isinstance(rec.get("e"), dict)
+                    and isinstance(rec["e"].get("t"), str)):
+                out.append(f"mgui: entry must be {{i index, r root, e element tree}}: {rec!r}")
+            elif "at" in rec and not (isinstance(rec["at"], list) and len(rec["at"]) == 2):
+                out.append(f"mgui: at must be [x, y]: {rec!r}")
+            else:
+                stack = [rec["e"]]
+                while stack:
+                    node = stack.pop()
+                    if not isinstance(node, dict):
+                        continue
+                    if "ix" in node and not _int(node["ix"]):
+                        out.append(f"mgui: ix must be the element's index: {node!r}")
+                    if "mw" in node and not isinstance(node["mw"], (int, float)):
+                        out.append(f"mgui: mw must be a width in pixels: {node!r}")
+                    if "sz" in node and not (isinstance(node["sz"], list) and len(node["sz"]) == 4 and all(_int(v) for v in node["sz"])):
+                        out.append(f"mgui: sz must be [min w, max w, min h, max h]: {node!r}")
+                    for flag in ("ml", "ck", "ig", "fs", "hs", "vs"):
+                        if flag in node and node[flag] is not True:
+                            out.append(f"mgui: {flag} is true when present: {node!r}")
+                    stack.extend(_items(node.get("a")))
+                    for pair in _items(node.get("tb")):
+                        stack.extend(_items(pair))
+        if "ds" in msg and not (isinstance(msg["ds"], list) and len(msg["ds"]) == 3 and all(isinstance(v, (int, float)) for v in msg["ds"])):
+            out.append(f"mgui: ds must be [width, height, scale]: {msg['ds']!r}")
     elif t == "pl":
         need("me", "u")
         need("l", check=_list)
@@ -1035,6 +1222,17 @@ def problems(msg):
             if not (isinstance(rec, list) and len(rec) in (4, 6) and all(_int(v) for v in rec)
                     and 0 <= rec[1] < 1000 and rec[2] >= 0 and rec[3] >= 0):
                 out.append(f"ts: entry must be [unit, orientation 0-999, shots, gun, target x?, target y?]: {rec!r}")
+    elif t == "tf":
+        need("u", "x", "y")
+        if _int(msg.get("u")) and msg["u"] <= 0:
+            out.append(f"tf: u must be the turret's unit number: {msg!r}")
+    elif t == "afx":
+        # (Its kind is `fx`: the transport writes the tick over `k`.)
+        need("u", "x", "y")
+        if msg.get("fx") not in ("blood", "burn"):
+            out.append(f"afx: fx must be blood or burn: {msg.get('fx')!r}")
+        if _int(msg.get("u")) and msg["u"] < 0:
+            out.append(f"afx: u must be a unit number, or 0 for a character without one: {msg['u']!r}")
     elif t == "hp":
         need("part", "parts")
         l = msg.get("l")
@@ -1297,6 +1495,8 @@ def problems(msg):
             cov = _items(msg.get("cov"))
             if not _list(msg.get("cov")) or len(cov) % 3 or not all(_int(v) for v in cov):
                 out.append(f"mtr: cov is [cx, cy, d, ...] as integers: {msg.get('cov')!r}")
+        if "all" in msg and (msg["all"] != 1 or "cov" not in msg):
+            out.append(f"mtr: all is 1, in the part with cov: {msg!r}")
     elif t == "mrp":
         need("si", "q", "part", "last")
         need("l", check=_list)
@@ -1353,8 +1553,8 @@ def problems(msg):
             out.append("recipes: l must be names")
     elif t == "msg":
         need("text", check=lambda v: isinstance(v, str))
-        if "tech" in msg and not (isinstance(msg["tech"], str) and _strs(msg.get("unlocks", []))):
-            out.append(f"msg: a research notification has tech (name) and unlocks (recipe names): {msg!r}")
+        if "tech" in msg and not isinstance(msg["tech"], str):
+            out.append(f"msg: a research notification's tech is its name: {msg!r}")
     elif t == "slots":
         lists = msg.get("l")
         if not isinstance(lists, dict) or not lists:
@@ -1481,6 +1681,8 @@ def problems(msg):
             out.append(f"pidx: g must be [[group, order], ...]: {msg['g']!r}")
     elif t == "pedia":
         out += pedia_problems(msg)
+    elif t == "gfx":
+        out += gfx_problems(msg)
     elif t == "lnets":
         out += lnets_problems(msg)
     elif t == "lnet":
@@ -1513,7 +1715,4 @@ def problems(msg):
         need("pr")
         need("cur", check=lambda v: isinstance(v, str))
         need("q", check=_strs)
-        labs = msg.get("labs", [])
-        if not (_list(labs) and all(isinstance(x, list) and len(x) == 2 and _int(x[0]) and isinstance(x[1], str) for x in _items(labs))):
-            out.append(f"rs: labs must be [[unit, status name], ...]: {labs!r}")
     return out

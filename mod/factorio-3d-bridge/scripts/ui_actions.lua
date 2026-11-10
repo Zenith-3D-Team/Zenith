@@ -7,6 +7,7 @@
 --
 -- Everything here runs from client commands and on_tick, so `storage` stays deterministic.
 
+local as_player = require("scripts.as_player")
 local registry = require("scripts.registry")
 local transport = require("scripts.transport")
 local world = require("scripts.world")
@@ -209,7 +210,7 @@ function M.fast(cmd)
     end
     local ok, err = pcall(belt_transfer, c, e, main, item, n, quality)
     if not ok then
-      log("[f3d] belt fast transfer: " .. tostring(err))
+      log("[factorio-3d-bridge] belt fast transfer: " .. tostring(err))
     end
     puppet.send_inventory_now()
     return
@@ -270,7 +271,14 @@ function M.paste_settings(cmd)
   if not (source and dest) then
     return puppet.message("Nothing to paste to")
   end
-  local ok, removed = pcall(function() return dest.copy_settings(source) end)
+  -- As the player when there is one, so mods get on_entity_settings_pasted (as_player.lua).
+  local by = as_player.by(c)
+  local ok, removed = pcall(function()
+    if by then
+      return dest.copy_settings(source, by)
+    end
+    return dest.copy_settings(source)
+  end)
   if not ok then
     return puppet.message("Can't paste those settings here")
   end
@@ -316,10 +324,9 @@ local function clipboard()
   return s.clipboard[1]
 end
 
+-- The command's area, or nil with why (no side over world.MAX_AREA tiles).
 local function area_of(cmd)
-  local x1, y1 = (tonumber(cmd.x1) or 0) / 256, (tonumber(cmd.y1) or 0) / 256
-  local x2, y2 = (tonumber(cmd.x2) or 0) / 256, (tonumber(cmd.y2) or 0) / 256
-  return { { math.min(x1, x2), math.min(y1, y2) }, { math.max(x1, x2), math.max(y1, y2) } }
+  return world.area_in(cmd)
 end
 
 -- The clipboard's entities for the client to draw while pasting: [[proto id, x, y, d], ...],
@@ -358,9 +365,13 @@ function M.copy(cmd)
   if not c then
     return
   end
+  local area, why = area_of(cmd)
+  if not area then
+    transport.send_now({ t = "clip", l = {} })
+    return puppet.message(why)
+  end
   local stack = clipboard()
   stack.set_stack({ name = "blueprint", count = 1 })
-  local area = area_of(cmd)
   stack.create_blueprint({ surface = puppet.surface(c), force = c.force, area = area, include_modules = true,
     include_station_names = true, include_trains = true, include_fuel = true })
   if not stack.is_blueprint_setup() then
@@ -485,14 +496,14 @@ end
 ---------------------------------------------------------------------------------------------
 -- Chat
 
--- {text}: says it in the game's chat, as the 3D client's character (it has no player name).
+-- {text}: says it in the game's chat, as Zenith's character (it has no player name).
 function M.chat(cmd)
   local text = tostring(cmd.text or ""):sub(1, CHAT_MAX)
   if text == "" then
     return
   end
-  game.print({ "", "[color=0.6,0.8,1][3D][/color]: ", text })
-  transport.send_now({ t = "chat", from = "3D", text = text })
+  game.print({ "", "[color=0.6,0.8,1][Zenith][/color]: ", text })
+  transport.send_now({ t = "chat", from = "Zenith", text = text })
 end
 
 -- What players type in the game's chat reaches the client, with the player's colour (Factorio

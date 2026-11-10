@@ -1,15 +1,14 @@
 extends Control
 ## Factorio's character window, centred on screen: the main inventory as a 10-wide slot grid on
-## the left ("Character") with the armour, gun and ammo slots under it, and on the right either
-## hand-crafting ("Crafting", E) or the open machine's screen. Slots report clicks (inventory role
+## the left ("Character"; the armour, gun and ammo slots are on the tool bar, weapon_hud.gd, as in
+## Factorio 2.1), and on the right either hand-crafting ("Crafting", E) or the open machine's screen. Slots report clicks (inventory role
 ## and 1-based slot) and hovers to factorio_ui.gd, which decides what they do, and inventory
 ## stacks can be dragged onto the quickbar. Over the inventory sit Factorio's colour picker and
 ## colour buttons; under its slot rows Factorio's faint empty rows fill the frame. The Logistics
 ## part is Factorio's: "Personal logistics" and "Trash unrequested" with the network's status dot,
-## the requests as the "Main" section (a 10-wide grid; Factorio's other sections aren't sent by the
-## bridge) with "Add section" under it, then the trash slots, from the logistics data
-## (ui_model.char_requests, network), or a note without it. The Character tab is Factorio's
-## character info: bonuses, distances and speeds (`cinfo`).
+## the logistic sections (`clog.sec`, production_panels.gd; an older mod's requests as one "Main"
+## section) with "Add section" under them, then the trash slots (ui_model.char_requests, network).
+## The Character tab is Factorio's character info: bonuses, distances and speeds (`cinfo`).
 ##
 ## Right click on armour with an equipment grid opens it as Factorio does: one window titled with
 ## the armour's name, the inventory on the left and "Equipment grid" on the right (the whole grid,
@@ -35,8 +34,6 @@ const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.g
 ## A slot of one of the character's inventories was clicked ("main", "guns", "ammo", "armor").
 signal slot_clicked(role: String, index: int, button_index: int, shift: bool, ctrl: bool)
 signal close_requested
-## The colour picker or colour button was clicked.
-signal color_requested
 ## A cell of an equipment grid was clicked ("char" or "veh").
 signal grid_clicked(kind: String, cell: Vector2i, button_index: int, shift: bool)
 
@@ -44,10 +41,6 @@ signal grid_clicked(kind: String, cell: Vector2i, button_index: int, shift: bool
 ## the empty striped rows fill the rest of the part).
 const ROWS := 8
 const MAX_ROWS := 12
-## Factorio's default player colour, shown on the colour button (the bridge doesn't send it).
-const PLAYER_COLOR := Color(0.869, 0.5, 0.13)
-const EQUIPMENT := {"armor": 1, "guns": 3, "ammo": 3}
-const EMPTY_ICONS := {"armor": "empty-armor-slot", "guns": "empty-gun-slot", "ammo": "empty-ammo-slot"}
 
 var model: UiModel
 var screen: MachineScreen
@@ -62,7 +55,6 @@ var crafting_open := false
 var armor_open := false
 
 var _grid := Kit.slot_grid()
-var _equipment := {}  # role -> [Slot]
 var _crafting_frame := Kit.panel("FFrameRight")
 var _logistics_frame := Kit.panel("FFrameMiddle")
 var _char_frame := Kit.panel("FFrameLeft")
@@ -75,19 +67,22 @@ var _stripes: Control
 var _crafting_caption: Label
 var _crafting: CraftingPanel
 var _logistics := VBoxContainer.new()
+## Holds _logistics: many logistic sections scroll in it instead of making the window taller than
+## the inventory beside it (_fit_logistics()).
+var _logistics_scroll := ScrollContainer.new()
 var _tab_buttons := {}
 var _trash_box := VBoxContainer.new()
 var _trash_grid := Kit.slot_grid()
 var _logistics_sig := "-"
 var _color_swatch: ColorPickerButton
 var _info := VBoxContainer.new()
+var _info_stale := false
 ## The armour's grid (left of the inventory) and the open vehicle's (right of its screen).
 var armor_grid: EquipmentGrid
 var vehicle_grid: EquipmentGrid
 var _armor_frame := Kit.panel("FFrame")
 var _armor_title: Label
 var _armor_summary := VBoxContainer.new()
-var _armor_switches := HBoxContainer.new()
 var _vehicle_frame := Kit.panel("FFrame")
 var _vehicle_summary := VBoxContainer.new()
 var _row: HBoxContainer
@@ -108,8 +103,10 @@ func set_bottom_room(px: float) -> void:
 	if _row == null:
 		return
 	var room := clampf(px, 0.0, maxf(0.0, size.y - _row.get_combined_minimum_size().y))
-	if not is_equal_approx(_center.offset_bottom, -room):
-		_center.offset_bottom = -room
+	# Plus how far the player dragged the window down (Kit.make_drag_handle moves it by its offsets).
+	var bottom := -room + Vector2(_center.get_meta("drag_offset", Vector2.ZERO)).y
+	if not is_equal_approx(_center.offset_bottom, bottom):
+		_center.offset_bottom = bottom
 
 
 func _ready() -> void:
@@ -176,15 +173,14 @@ func _ready() -> void:
 	var swatch := ColorPickerButton.new()
 	swatch.name = "ColorSwatch"
 	swatch.edit_alpha = false
-	swatch.color = model.char_color if model != null else PLAYER_COLOR
+	swatch.color = model.char_color
 	swatch.theme_type_variation = "FSlot"
 	swatch.custom_minimum_size = Kit.pxv(28, 28)
 	swatch.focus_mode = Control.FOCUS_NONE
 	swatch.tooltip_text = "Color"
 	swatch.popup_closed.connect(func() -> void:
 		if swatch.color != model.char_color:
-			model.set_character_color(swatch.color)
-		color_requested.emit())
+			model.set_character_color(swatch.color))
 	picker_button.pressed.connect(func() -> void: swatch.get_popup().popup_centered())
 	_color_swatch = swatch
 	var fill := ColorRect.new()
@@ -206,9 +202,6 @@ func _ready() -> void:
 	_stripes = Stripes.new()
 	_stripes.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	inv_box.add_child(_stripes)
-	var equipment := _equipment_row()
-	equipment.visible = false  # Factorio 2.1 has them on the tool bar (weapon_hud.gd) only
-	inv_box.add_child(equipment)
 
 	row.add_child(_logistics_frame)
 	var mid_box := VBoxContainer.new()
@@ -228,7 +221,12 @@ func _ready() -> void:
 	_logistics.theme = EntityPanels.theme()
 	_logistics.add_theme_constant_override("separation", Kit.px(8))
 	_logistics.custom_minimum_size = Kit.pxv(Kit.SLOT * Kit.COLUMNS, Kit.SLOT * 4)
-	mid.add_child(_logistics)
+	_logistics.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_logistics_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_logistics_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_logistics_scroll.add_child(_logistics)
+	_logistics.resized.connect(_fit_logistics)
+	mid.add_child(_logistics_scroll)
 	_trash_box.add_theme_constant_override("separation", Kit.px(2))
 	_trash_box.add_child(Kit.label("Trash slots", "FHeading"))
 	var trash_frame := Kit.panel("FDeepFrame")
@@ -285,6 +283,9 @@ func _ready() -> void:
 	_info.custom_minimum_size = Kit.pxv(Kit.SLOT * Kit.COLUMNS, Kit.SLOT * 6)
 	_info.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_info.visible = false
+	_info.visibility_changed.connect(func() -> void:
+		if _info_stale and _info.is_visible_in_tree():
+			_refresh_info())
 	right_box.add_child(_info)
 
 	screen.size_flags_vertical = Control.SIZE_FILL
@@ -343,8 +344,6 @@ func _armor_panel() -> void:
 	inner.add_child(frame)
 	_armor_summary.add_theme_constant_override("separation", 0)
 	inner.add_child(_armor_summary)
-	_armor_switches.visible = false  # Factorio has them on the shortcut bar (Alt+F, Alt+E) only
-	inner.add_child(_armor_switches)
 	_armor_frame.visible = false
 	_armor_frame.size_flags_vertical = Control.SIZE_FILL
 
@@ -395,6 +394,8 @@ func _refresh_equipment() -> void:
 	if want and side != _armor_frame:
 		show_side(_armor_frame, "Armor")
 	elif not want and side == _armor_frame:
+		# Closed (taken off, or the character died): it would open again by itself with the next grid.
+		armor_open = false
 		side = null
 		_armor_frame.visible = false
 		_update_visibility()
@@ -402,7 +403,6 @@ func _refresh_equipment() -> void:
 		var armor := model.stack_at("armor", 1)
 		set_side_title(_armor_frame, Kit.pretty(str(armor["item"])) if not armor.is_empty() else "Armor")
 		_fill_armor_summary(g)
-		_fill_switches(g)
 	_refresh_vehicle()
 
 
@@ -482,36 +482,12 @@ func _fill_summary(box: VBoxContainer, g: Dictionary) -> void:
 		box.add_child(row)
 
 
-## Factorio's Alt+F and Alt+E switches (on its shortcut bar) as checkboxes under the armour.
-func _fill_switches(g: Dictionary) -> void:
-	var sig := "%d/%s/%s/%s" % [int(g.get("roboport_on", -1)), str(g.get("movement_on", true)), str(_has_part(g, "roboport")),
-		str(_has_part(g, "exoskeleton"))]
-	if str(_armor_switches.get_meta("sig", "")) == sig:
-		return
-	_armor_switches.set_meta("sig", sig)
-	for c in _armor_switches.get_children():
-		_armor_switches.remove_child(c)
-		c.queue_free()
-	if _has_part(g, "roboport"):
-		var roboport_on := int(g.get("roboport_on", 1)) != 0
-		var set_roboport := func(v: bool) -> void: model.toggle_equipment("roboport", v)
-		_armor_switches.add_child(EntityPanels.checkbox("Personal roboport", roboport_on, set_roboport))
-	if _has_part(g, "exoskeleton"):
-		var set_movement := func(v: bool) -> void: model.toggle_equipment("movement", v)
-		_armor_switches.add_child(EntityPanels.checkbox("Exoskeleton", bool(g.get("movement_on", true)), set_movement))
-
-
-static func _has_part(g: Dictionary, part: String) -> bool:
-	for e in g.get("equipment", []):
-		if str(e["name"]).contains(part):
-			return true
-	return false
-
-
 ## The Character tab: Factorio's character info, from `cinfo`.
 func _refresh_info() -> void:
-	if not _info.visible:
+	if not _info.is_visible_in_tree():
+		_info_stale = _info.visible  # the window is shut: built when it shows (show_tab builds it too)
 		return
+	_info_stale = false
 	for c in _info.get_children():
 		_info.remove_child(c)
 		c.queue_free()
@@ -580,32 +556,7 @@ static func _tiles(i: Dictionary, key: String) -> String:
 	return ("%.1f" % (int(i.get(key, 0)) / 10.0)).trim_suffix(".0")
 
 
-## Armour, weapons and ammo under the inventory, each in its own deep frame with Factorio's
-## empty-slot pictures.
-func _equipment_row() -> Control:
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", Kit.px(12))
-	for role in ["armor", "guns", "ammo"]:
-		var box := VBoxContainer.new()
-		box.add_theme_constant_override("separation", Kit.px(2))
-		box.add_child(Kit.label({"armor": "Armor", "guns": "Weapons", "ammo": "Ammo"}[role], "FHeading"))
-		var frame := Kit.panel("FDeepFrame")
-		frame.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
-		var grid := Kit.slot_grid(int(EQUIPMENT[role]))
-		frame.add_child(grid)
-		var list: Array = []
-		for i in int(EQUIPMENT[role]):
-			var s := _new_slot(role, i + 1)
-			s.empty_icon = GuiAssets.core_sprite("icons/mip/%s.png" % EMPTY_ICONS[role])
-			grid.add_child(s)
-			list.append(s)
-		_equipment[role] = list
-		box.add_child(frame)
-		row.add_child(box)
-	return row
-
-
-## "Crafting" or "Logistics" on the right.
+## "Crafting" or "Character" on the right.
 func show_tab(tab: String) -> void:
 	for t in _tab_buttons:
 		(_tab_buttons[t] as Button).set_pressed_no_signal(t == tab)
@@ -624,8 +575,22 @@ func show_tab(tab: String) -> void:
 func focus_search() -> void:
 	if screen.focus_search():  # the recipe chooser's own search
 		return
+	if not _crafting_frame.visible:
+		return  # a machine or an opened item has the right half: no crafting search to show
 	show_tab("Crafting")
 	_crafting.focus_search()
+
+
+## The logistics frame as tall as its sections up to the inventory's full height (and 60% of the
+## window), scrolling past that.
+func _fit_logistics() -> void:
+	var want := _logistics.get_combined_minimum_size()
+	var cap := float(Kit.px(Kit.SLOT * (MAX_ROWS + 1)))
+	var vp := get_viewport()
+	if vp != null:
+		cap = minf(cap, vp.get_visible_rect().size.y * 0.6)
+	var bar := _logistics_scroll.get_v_scroll_bar().get_combined_minimum_size().x if want.y > cap else 0.0
+	_logistics_scroll.custom_minimum_size = Vector2(want.x + bar, minf(want.y, cap))
 
 
 ## The character's logistic requests (`clog`) and its network (`ln`), when the mod sends them.
@@ -641,16 +606,13 @@ func _refresh_logistics() -> void:
 	if sig == _logistics_sig:
 		return
 	_logistics_sig = sig
+	# Rebuilt below: the scroll place is put back once the new sections are laid out.
+	var keep_scroll := _logistics_scroll.scroll_vertical
+	if keep_scroll > 0:
+		(func() -> void: _logistics_scroll.scroll_vertical = keep_scroll).call_deferred()
 	for c in _logistics.get_children():
 		_logistics.remove_child(c)
 		c.queue_free()
-	if requests == null:
-		var note := Kit.label("Personal logistics need the bridge's logistics data (the claude/cloud-logistics branch).")
-		note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		note.custom_minimum_size.x = Kit.px(Kit.SLOT * Kit.COLUMNS)
-		note.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
-		_logistics.add_child(note)
-		return
 	var on := bool(model.get("char_requests_on"))
 	var trash := bool(model.get("char_trash_unrequested"))
 	var list: Array = []
@@ -694,16 +656,16 @@ func _refresh_logistics() -> void:
 		holder._last = {"lgs": model.get("logistic_groups"), "ql": []}
 		_logistics.add_child(holder)
 		var slots := func(sec: Dictionary, filters: Array, send: Callable) -> Control:
+			# Each row keeps its quality as a fourth value (the grid edits the first three): one
+			# item may be requested at two qualities, which a lookup by name turned into one.
 			var plain: Array = []
-			var quality := {}
 			for f in filters:
 				if f is Array and f.size() >= 6:
-					plain.append([str(f[0]), int(f[2]), int(f[3])])
-					quality[str(f[0])] = str(f[1])
+					plain.append([str(f[0]), int(f[2]), int(f[3]), str(f[1])])
 			var back := func(l: Array) -> void:
 				var out: Array = []
 				for r in l:
-					out.append([str(r[0]), quality.get(str(r[0]), "normal"), int(r[1]), int(r[2]), "", -1])
+					out.append([str(r[0]), str(r[3]) if r.size() >= 4 else "normal", int(r[1]), int(r[2]), "", -1])
 				send.call(out)
 			return EntityPanels.request_grid(holder, plain, back, Kit.COLUMNS)
 		var secs := ProductionPanels.sections(holder, (model.get("char_sections") as Array).duplicate(true), slots)
@@ -871,12 +833,6 @@ func _refresh() -> void:
 		last.queue_free()
 	for i in trash.size():
 		_show(_trash_grid.get_child(i), "trash", i + 1, trash[i])
-	for role in _equipment:
-		var list: Array = _equipment[role]
-		var stacks := model.slots_of(role)
-		for i in list.size():
-			_show(list[i], role, i + 1, stacks[i] if i < stacks.size() else {})
-			(list[i] as Slot).set_pressed_no_signal(role == "guns" and i + 1 == model.selected_gun and not stacks.is_empty())
 
 
 func _show(s: Slot, role: String, index: int, stack: Dictionary) -> void:

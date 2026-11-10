@@ -6,6 +6,7 @@ local registry = require("scripts.registry")
 local transport = require("scripts.transport")
 local budget = require("scripts.budget")
 local alt_mode = require("scripts.alt_mode")
+local entity_ui = require("scripts.entity_ui")
 
 local M = {}
 
@@ -21,6 +22,47 @@ local DECORATIVE_INTERVAL = 30     -- ticks between resending chunks whose decor
 -- Positions are sent as integers in 1/256 tile, the engine's own resolution.
 function M.fixed(v)
   return math.floor(v * 256 + 0.5)
+end
+
+-- Numbers from a packet that the tick goes on using. tonumber("1e999") is inf, so a packet can
+-- carry it as a string; the tick isn't under pcall, so an inf or NaN reaching the game's API
+-- there would stop the game. Factorio's maps end a million tiles from the centre.
+M.MAP_LIMIT = 1000000
+local CHUNK_LIMIT = M.MAP_LIMIT / 32 + 1
+
+-- A position in 1/256 tile from a packet: finite and on the map (clamped to its edge), or nil.
+function M.fixed_in(v)
+  v = tonumber(v)
+  if not v or v ~= v then
+    return nil
+  end
+  local lim = M.MAP_LIMIT * 256
+  return math.max(-lim, math.min(lim, v))
+end
+
+-- A chunk coordinate from a packet: a whole number on the map, or nil.
+function M.chunk_in(v)
+  v = tonumber(v)
+  if v and v == v and v >= -CHUNK_LIMIT and v <= CHUNK_LIMIT then
+    return math.floor(v)
+  end
+  return nil
+end
+
+-- The area {x1, y1, x2, y2} (1/256 tile) of a planner or copy, or nil with why: at most MAX_AREA
+-- squared tiles in all. Without the cap a client's area could be the whole map, and the marking,
+-- the history's list of what changed and the blueprint read every entity on the surface in one
+-- tick. A drag across the whole of the client's furthest remote view is a few hundred a side; the
+-- cap is on the area, not each side, so a long thin drag made while panning (a rail line) still goes.
+M.MAX_AREA = 2048
+function M.area_in(cmd)
+  local x1, y1 = M.fixed_in(cmd.x1) or 0, M.fixed_in(cmd.y1) or 0
+  local x2, y2 = M.fixed_in(cmd.x2) or 0, M.fixed_in(cmd.y2) or 0
+  x1, y1, x2, y2 = x1 / 256, y1 / 256, x2 / 256, y2 / 256
+  if math.abs(x2 - x1) * math.abs(y2 - y1) > M.MAX_AREA * M.MAX_AREA then
+    return nil, "That area is too big (at most " .. M.MAX_AREA .. " by " .. M.MAX_AREA .. " tiles)"
+  end
+  return { { math.min(x1, x2), math.min(y1, y2) }, { math.max(x1, x2), math.max(y1, y2) } }
 end
 
 local function key(cx, cy)
@@ -41,6 +83,46 @@ function M.surface()
     return s.puppet.surface
   end
   return game.get_surface(settings.global["f3d-surface"].value) or game.get_surface(1)
+end
+
+-- Each chunk's change count (storage.f3d.revs[surface index][key]), raised by every build, mine,
+-- rotation, death, tile change and generation in it, subscribed or not, from events only (so the
+-- same on every peer). A snapshot carries its chunk's count (`rv`) and entity count (`n`); a client
+-- that kept a chunk lists it when it subscribes again (`sub` h), and a chunk whose counts still
+-- match is answered with `same` instead of being read and sent (the client draws its own copy).
+local function rev_table(si)
+  local s = storage.f3d
+  s.revs = s.revs or {}
+  local t = s.revs[si]
+  if not t then
+    t = {}
+    s.revs[si] = t
+  end
+  return t
+end
+
+function M.rev(si, k)
+  local t = storage.f3d.revs and storage.f3d.revs[si]
+  return t and t[k] or 0
+end
+
+-- Raises the counts of the chunk at `position` and of neighbours within 2 tiles (a belt's or pipe's
+-- look follows the ones next to it, which may be across the edge).
+function M.bump(si, position)
+  local t = rev_table(si)
+  local x, y = position.x or position[1], position.y or position[2]
+  local cx, cy = math.floor(x / CHUNK), math.floor(y / CHUNK)
+  local lx, ly = x - cx * CHUNK, y - cy * CHUNK
+  local x0 = lx < 2 and -1 or 0
+  local x1 = lx > CHUNK - 2 and 1 or 0
+  local y0 = ly < 2 and -1 or 0
+  local y1 = ly > CHUNK - 2 and 1 or 0
+  for dy = y0, y1 do
+    for dx = x0, x1 do
+      local k = key(cx + dx, cy + dy)
+      t[k] = (t[k] or 0) + 1
+    end
+  end
 end
 
 function M.is_subscribed(surface, position)
@@ -192,13 +274,31 @@ local function extra(entity)
     -- The colour the player gave it (H21: trains and stops were drawn in their models' grey).
     local ok, c = pcall(function() return entity.color end)
     if ok and c then
-      local r, g, b = c.r or c[1] or 0, c.g or c[2] or 0, c.b or c[3] or 0
-      local k = (r > 1 or g > 1 or b > 1) and 1 or 255
       x = x or {}
-      x.col = { math.floor(r * k + 0.5), math.floor(g * k + 0.5), math.floor(b * k + 0.5) }
+      x.col = entity_ui.color_out(c)
     end
   end
   return x
+end
+
+-- Ghosts of rolling stock (issue #13). Their `direction` stays north whichever way they face, so
+-- the record gets the nearest of 16 directions to their orientation. And a train the robots build
+-- is a mover, never `add`ed, so the client can't drop its ghost on seeing it built there, as it
+-- does for buildings: the ghost is registered for on_object_destroyed when it is sent, and its
+-- going sends `del` (tracker.on_object_destroyed). Kept per client, in storage.f3d.stock_ghosts.
+local STOCK = { locomotive = true, ["cargo-wagon"] = true, ["fluid-wagon"] = true, ["artillery-wagon"] = true }
+
+local function stock_ghost(entity, rec)
+  local ok, orientation = pcall(function() return entity.orientation end)
+  if ok and type(orientation) == "number" then
+    rec[5] = math.floor(orientation * 16 + 0.5) % 16
+  end
+  local s = storage.f3d
+  local ok_reg, reg = pcall(script.register_on_object_destroyed, entity)
+  if s and ok_reg and reg then
+    s.stock_ghosts = s.stock_ghosts or {}
+    s.stock_ghosts[reg] = { u = rec[1], p = rec[2], x = rec[3], y = rec[4], s = entity.surface.index }
+  end
 end
 
 -- [unit_number or 0, prototype id, x, y, direction, extra?]
@@ -206,6 +306,9 @@ end
 function M.record(entity)
   local p = entity.position
   local rec = { entity.unit_number or 0, registry.entity_id(entity.name), M.fixed(p.x), M.fixed(p.y), entity.direction or 0 }
+  if entity.type == "entity-ghost" and STOCK[entity.ghost_type] then
+    stock_ghost(entity, rec)
+  end
   local x = extra(entity)
   -- Quality, marks and wires (2.x API) in one protected call: a record is made for every entity
   -- in a chunk snapshot, so this is the bridge's busiest path. If it fails, each is tried alone
@@ -277,12 +380,12 @@ M.enqueue = enqueue
 
 -- Replace the subscription set. `list` is ordered nearest first, which is the order chunks
 -- are sent in.
-function M.subscribe(list)
+function M.subscribe(list, have)
   local s = storage.f3d
   local want, order = {}, {}
   for _, c in pairs(list) do
-    if type(c) == "table" and tonumber(c[1]) and tonumber(c[2]) and #order < MAX_SUBSCRIPTIONS then
-      local cx, cy = math.floor(tonumber(c[1])), math.floor(tonumber(c[2]))
+    local cx, cy = type(c) == "table" and M.chunk_in(c[1]), type(c) == "table" and M.chunk_in(c[2])
+    if cx and cy and #order < MAX_SUBSCRIPTIONS then
       local k = key(cx, cy)
       if not want[k] then
         want[k] = { cx, cy }
@@ -315,6 +418,26 @@ function M.subscribe(list)
   for _, k in ipairs(queue) do
     s.queued[k] = true
   end
+  -- The client's own copies of chunks it subscribes to again: [surface index, cx, cy, rv, n].
+  s.have = s.have or {}
+  for k in pairs(s.have) do
+    if not s.queued[k] then
+      s.have[k] = nil
+    end
+  end
+  if type(have) == "table" then
+    local n = 0
+    for _, h in pairs(have) do
+      if type(h) == "table" and tonumber(h[1]) and M.chunk_in(h[2]) and M.chunk_in(h[3]) and tonumber(h[4])
+          and tonumber(h[5]) and n < MAX_SUBSCRIPTIONS then
+        local k = key(M.chunk_in(h[2]), M.chunk_in(h[3]))
+        if s.queued[k] then
+          s.have[k] = { si = math.floor(tonumber(h[1])), rv = math.floor(tonumber(h[4])), n = math.floor(tonumber(h[5])) }
+        end
+        n = n + 1
+      end
+    end
+  end
 end
 
 -- Queue just these chunks again, ignoring any the client isn't subscribed to.
@@ -322,8 +445,9 @@ function M.resend(list)
   local s = storage.f3d
   local n = 0
   for _, c in pairs(list) do
-    if type(c) == "table" and tonumber(c[1]) and tonumber(c[2]) and n < MAX_SUBSCRIPTIONS then
-      local k = key(math.floor(tonumber(c[1])), math.floor(tonumber(c[2])))
+    local cx, cy = type(c) == "table" and M.chunk_in(c[1]), type(c) == "table" and M.chunk_in(c[2])
+    if cx and cy and n < MAX_SUBSCRIPTIONS then
+      local k = key(cx, cy)
       if s.subs[k] then
         enqueue(k)
       end
@@ -342,7 +466,7 @@ end
 
 function M.clear()
   local s = storage.f3d
-  s.subs, s.queue, s.queued, s.dec_dirty, s.rank = {}, {}, {}, {}, {}
+  s.subs, s.queue, s.queued, s.dec_dirty, s.rank, s.have = {}, {}, {}, {}, {}, {}
   s.refresh_cursor, s.snap = nil, nil
 end
 
@@ -404,6 +528,8 @@ end
 
 -- Tiles placed or mined, or something built, can remove decoratives (no event says which):
 -- the chunk is sent again on the next DECORATIVE_INTERVAL.
+-- The callers raised the chunk's change count already (tracker's `touched`, tiles_changed): raising
+-- it here again counted every build and tile change twice.
 function M.decoratives_changed(surface, position)
   local s = storage.f3d
   if not (s.client and s.client.dc) or surface.index ~= s.surface_index then
@@ -469,7 +595,8 @@ end
 local function send_snapshot(job)
   local records = job.records
   local parts = math.max(1, math.ceil(#records / ENTITIES_PER_MESSAGE))
-  transport.send_reliable({ t = "chunk", cx = job.cx, cy = job.cy, tiles = job.tiles, parts = parts })
+  transport.send_reliable({ t = "chunk", cx = job.cx, cy = job.cy, tiles = job.tiles, parts = parts,
+    rs = job.si, rv = job.rev, n = job.count })
   for part = 1, parts do
     local slice = {}
     for i = (part - 1) * ENTITIES_PER_MESSAGE + 1, math.min(part * ENTITIES_PER_MESSAGE, #records) do
@@ -494,6 +621,18 @@ local function snapshot_step(surface, s)
     job.count = surface.count_entities_filtered({
       area = { { x0, y0 }, { x0 + CHUNK, y0 + CHUNK } }, type = registry.excluded_types(), invert = true,
     })
+    job.si = surface.index
+    job.rev = M.rev(surface.index, job.k)
+    -- The client still has this chunk as it is now: nothing to read or send.
+    local h = s.have and s.have[job.k]
+    if h then
+      s.have[job.k] = nil
+      if h.si == job.si and h.rv == job.rev and h.n == job.count then
+        transport.send_reliable({ t = "chunk", cx = cx, cy = cy, rs = job.si, same = job.rev })
+        s.snap = nil
+        return
+      end
+    end
     job.strips = strips_for(job.count)
     job.records = {}
     job.step = 0
@@ -538,6 +677,9 @@ end
 
 -- Something was built, mined or changed at the entity: if its chunk is being read, it is read again.
 function M.touched(entity)
+  if entity and entity.valid then
+    M.bump(entity.surface.index, entity.position)
+  end
   local s = storage.f3d
   local job = s and s.snap
   if job and entity and entity.valid and entity.surface.index == s.surface_index then
@@ -576,7 +718,10 @@ function M.tick()
     send_dirty_decoratives(surface)
   end
   -- At most f3d-chunks-per-tick chunks start a tick, and each is read in slices while the work
-  -- budget lasts.
+  -- budget lasts. Only a chunk that has to be read counts: one the client still has (`same`) or
+  -- that isn't generated (`none`) costs a count of its entities, so a view the client kept comes
+  -- back within a few ticks instead of a chunk a tick (a surface change and back, Factorissimo's
+  -- buildings: 441 chunks took 7.4 s).
   local starts = settings.global["f3d-chunks-per-tick"].value
   while transport.backlog() < MAX_BACKLOG do
     if s.snap and not s.subs[s.snap.k] then
@@ -590,7 +735,6 @@ function M.tick()
       s.queued[k] = nil
       local c = s.subs[k]
       if c then
-        starts = starts - 1
         s.snap = { k = k, cx = c[1], cy = c[2], step = -1 }
       end
     end
@@ -600,12 +744,17 @@ function M.tick()
         return
       end
       budget.spend(price, "chunks")
+      local checking = s.snap.step < 0
       snapshot_step(surface, s)
+      if checking and s.snap then
+        starts = starts - 1 -- it has to be read
+      end
     end
   end
 end
 
 function M.on_chunk_generated(surface, position)
+  M.bump(surface.index, { x = position.x * CHUNK + 16, y = position.y * CHUNK + 16 })
   local s = storage.f3d
   if s.client and surface.index == s.surface_index then
     local k = key(position.x, position.y)
@@ -617,6 +766,15 @@ end
 
 -- Send the current tile at each changed position that the client can see.
 function M.tiles_changed(surface, positions)
+  local seen = {}
+  for _, p in pairs(positions) do
+    local x, y = math.floor(p.x), math.floor(p.y)
+    local k = math.floor(x / 2) .. "," .. math.floor(y / 2)
+    if not seen[k] then
+      seen[k] = true
+      M.bump(surface.index, { x = x, y = y })
+    end
+  end
   local s = storage.f3d
   if not s.client or surface.index ~= s.surface_index then
     return

@@ -46,14 +46,6 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import rcon  # noqa: E402
 
-MOD = "__factorio-3d-bridge__"
-
-
-def lua(code):
-    """Runs Lua in the mod's state (so storage is the bridge's) and returns what it rcon.prints."""
-    return rcon.run(f"/c {MOD} " + " ".join(line.strip() for line in code.strip().splitlines())).strip()
-
-
 # Shared helpers, defined again in every command (each /c is its own chunk). `mk` creates an
 # entity owned by the character's force, raises built, and is remembered for --clear.
 PRELUDE = """
@@ -86,7 +78,7 @@ E, S, W, N = "defines.direction.east", "defines.direction.south", "defines.direc
 
 
 def build_power_at(width, height, y):
-    return lua(PRELUDE + f"""
+    return rcon.mod_lua(PRELUDE + f"""
 eei(ox - 2, oy + {y} - 2)
 for x = 0, {width}, 16 do for y = 0, {height}, 16 do mk({{ name = "substation", position = {{ ox + x + 1, oy + {y} + y + 1 }} }}) end end
 rcon.print(made)
@@ -94,7 +86,7 @@ rcon.print(made)
 
 
 def build_power(width, height):
-    return lua(PRELUDE + f"""
+    return rcon.mod_lua(PRELUDE + f"""
 eei(ox - 2, oy - 2)
 for x = 0, {width}, 16 do for y = 0, {height}, 16 do mk({{ name = "substation", position = {{ ox + x + 1, oy + y + 1 }} }}) end end
 rcon.print(made)
@@ -103,7 +95,7 @@ rcon.print(made)
 
 def build_loop(i, length):
     """One loop: east along row y, south, west along row y + 1, north; then filled with plates."""
-    return lua(PRELUDE + f"""
+    return rcon.mod_lua(PRELUDE + f"""
 local y = oy + 4 + {i} * 3 local x0 = ox + 2 local L = {length}
 local belts = {{}}
 for x = 0, L - 1 do
@@ -123,8 +115,8 @@ rcon.print(made .. " entities, " .. items .. " items")
 def build_assemblers(count, loops, top=None):
     """Rows of assemblers south of the loops: infinity chest -> inserter -> assembler -> inserter -> belt.
     Inserters are turned round if their drop position isn't where it should be (ins). No Lua comments in these strings:
-    lua() joins the lines, so a comment would swallow the rest of the command."""
-    return lua(PRELUDE + f"""
+    rcon.mod_lua() joins the lines, so a comment would swallow the rest of the command."""
+    return rcon.mod_lua(PRELUDE + f"""
 local top = {f"oy + {top}" if top is not None else f"oy + 4 + {loops} * 3 + 2"}
 for i = 0, {count} - 1 do
   local x = ox + 2 + (i % 12) * 5 local y = top + math.floor(i / 12) * 7
@@ -143,7 +135,7 @@ rcon.print(made)
 def build_bus(lanes, length):
     """A main bus west of the character: lanes in pairs, each pair a loop (north up the first
     lane, south down the second), filled with a different item per pair."""
-    return lua(PRELUDE + f"""
+    return rcon.mod_lua(PRELUDE + f"""
 local items = {{ "iron-plate", "copper-plate", "iron-gear-wheel", "electronic-circuit", "coal", "stone", "steel-plate", "copper-cable" }}
 local x0 = ox - 16 - {lanes} local y0 = oy - {length // 2} local L = {length}
 local placed = 0
@@ -167,7 +159,7 @@ rcon.print(made .. " entities, " .. placed .. " items")
 def build_train():
     """Rails east-west north of the base, a stop at each end and a double-headed train (a
     locomotive facing each way, two wagons between) running between them on a schedule."""
-    return lua(PRELUDE + f"""
+    return rcon.mod_lua(PRELUDE + f"""
 local x0 = 2 * math.floor(ox / 2) + 1 local y0 = 2 * math.floor(oy / 2) - 71
 for i = -30, 20 do mk({{ name = "straight-rail", position = {{ x0 + 2 * i, y0 }}, direction = {E} }}) end
 local east = mk({{ name = "train-stop", position = {{ x0 + 36, y0 + 2 }}, direction = {E} }})
@@ -198,7 +190,7 @@ def build_robots(x, y):
     """A powered roboport with 50 logistic robots, an infinity chest feeding a passive provider
     and a requester emptied into an infinity chest that destroys what it gets, so robots fly
     plates across all the time."""
-    return lua(PRELUDE + f"""
+    return rcon.mod_lua(PRELUDE + f"""
 local x, y = ox + {x}, oy + {y}
 eei(x - 4, y)
 mk({{ name = "substation", position = {{ x - 1, y }} }})
@@ -224,7 +216,7 @@ def build_walls(x, y, width, height):
     """A solid block of stone walls: static entities that only cost snapshots and memory."""
     out = []
     for y0 in range(0, height, 25):
-        out.append(lua(PRELUDE + f"""
+        out.append(rcon.mod_lua(PRELUDE + f"""
 for dy = {y0}, math.min({height}, {y0} + 25) - 1 do for dx = 0, {width} - 1 do
   mk({{ name = "stone-wall", position = {{ ox + {x} + dx + 0.5, oy + {y} + dy + 0.5 }} }})
 end end
@@ -234,7 +226,7 @@ rcon.print(made)
 
 
 def clear():
-    return lua("""
+    return rcon.mod_lua("""
 local n = 0
 for _, e in pairs(storage.f3d_busy or {}) do
   if e and e.valid then e.destroy() n = n + 1 end
@@ -247,7 +239,7 @@ rcon.print(n .. " removed")
 def count_near():
     """What the bridge has to look at near the character, and how long the chunk snapshots
     around it take (world.record for every entity, the tiles' ids)."""
-    out = lua("""
+    out = rcon.mod_lua("""
 local world = package.loaded["__factorio-3d-bridge__/scripts/world.lua"]
 local registry = package.loaded["__factorio-3d-bridge__/scripts/registry.lua"]
 local c = storage.f3d.puppet local s = c.surface
@@ -283,7 +275,7 @@ rcon.print({ "", chunks .. " " .. n .. " " .. #belts .. " " .. items .. " " .. i
 def belt_breakdown():
     """What reading the belt items near the character costs, call by call (one pass each), to see
     where belt_items.lua's time goes."""
-    out = lua("""
+    out = rcon.mod_lua("""
 local c = storage.f3d.puppet local s = c.surface
 local belts = s.find_entities_filtered({ position = c.position, radius = 24, type = { "transport-belt", "underground-belt", "splitter" } })
 local function time(fn) local p = helpers.create_profiler() fn() p.stop() return p end
@@ -319,7 +311,7 @@ rcon.print({ "", { "", "lines ", t_lines, "; get_detailed_contents ", t_contents
 
 
 def game_tick():
-    return int(lua("rcon.print(game.tick)"))
+    return int(rcon.mod_lua("rcon.print(game.tick)"))
 
 
 def ups(seconds=5.0):
@@ -356,7 +348,7 @@ def measure(seconds, path):
             status = rcon.run("/f3d-status")
         rcon.run("/f3d-profile")
         result["ups"] = round((game_tick() - tick0) / (time.monotonic() - t0), 1)
-        result["robots"] = lua("""
+        result["robots"] = rcon.mod_lua("""
 local c = storage.f3d.puppet local s = c.surface
 local flying = s.count_entities_filtered({ position = c.position, radius = 120, type = "logistic-robot" })
 local net = ""
@@ -435,7 +427,7 @@ def main():
         args.loops, args.length, args.assemblers = max(args.loops, 20), max(args.length, 60), max(args.assemblers, 120)
 
     rcon.run("/c rcon.print('ok')")  # the first /c in a save only warns about achievements
-    if args.measure and lua("rcon.print(storage.f3d.puppet and storage.f3d.puppet.valid and 1 or 0)") != "1":
+    if args.measure and rcon.mod_lua("rcon.print(storage.f3d.puppet and storage.f3d.puppet.valid and 1 or 0)") != "1":
         # The bridge makes its character for the first client: connect once to get one.
         subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("net_cost.py")), "--port", "34200",
                         "--still", "--seconds", "1"], check=True, stdout=subprocess.DEVNULL)

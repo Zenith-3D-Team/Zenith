@@ -1,12 +1,13 @@
 extends Control
 ## Factorio's minimap in the top-right corner: the charted map around the character (north up),
 ## the character's arrow in the middle and the map tags, in Factorio's minimap_frame (a deep
-## frame), with the map view's layers that are switched on (map_layers.gd). A click opens the map
-## view; the wheel or the + / - buttons zoom it. Size, zoom, tags and whether it shows at all are
-## options (ui_settings.gd, [map]).
+## frame). Over the chart it draws only what Factorio's minimap does, whatever the map view's
+## switches say: trains, train stops' markers, unseen ground dimmed and demolisher territories
+## (map_layers.gd's `minimap`). A click opens the map view; Shift + wheel zooms it. Size, zoom, tags
+## and whether it shows at all are options (ui_settings.gd, [map]).
 ##
 ## It asks for the charts around it every few seconds while shown (map_cache.gd). As in Factorio it
-## shows what the view looks at (H22): while the map view is open, the map's middle (on the map's
+## shows what the view looks at: while the map view is open, the map's middle (on the map's
 ## surface; the map view does the asking), and in the 3D remote view the remote view's point. The
 ## space map hides it.
 
@@ -36,8 +37,6 @@ var settings = UiSettings.shared()
 
 var _frame := PanelContainer.new()
 var _area := Area.new()
-var _zoom_in := Button.new()
-var _zoom_out := Button.new()
 var _drawn_at := Vector2.ZERO
 var _drawn_heading := 0.0
 var _drawn_player := Vector2.ZERO
@@ -73,25 +72,8 @@ func _ready() -> void:
 	_frame.add_child(_area)
 	_layers.model = model
 	_layers.show_text = false
+	_layers.minimap = true  # Factorio's minimap: no coverage, wires or other map view layers
 	_area.add_child(_layers)
-	for b in [_zoom_in, _zoom_out]:
-		b.theme_type_variation = "FFrameAction"
-		b.focus_mode = Control.FOCUS_NONE
-		b.custom_minimum_size = Kit.pxv(24, 24)
-		b.add_theme_font_size_override("font_size", Kit.px(16))
-		b.add_theme_font_override("font", Kit.font("bold"))
-		for c in ["font_color", "font_focus_color"]:
-			b.add_theme_color_override(c, Kit.WHITE)
-		_area.add_child(b)
-	_zoom_in.text = "+"
-	_zoom_in.tooltip_text = "Zoom in"
-	_zoom_in.pressed.connect(func() -> void: zoom(ZOOM_STEP))
-	_zoom_out.text = "−"
-	_zoom_out.tooltip_text = "Zoom out"
-	_zoom_out.pressed.connect(func() -> void: zoom(1.0 / ZOOM_STEP))
-	# Factorio's minimap has no zoom buttons (the wheel zooms it); kept for the UI test.
-	_zoom_in.visible = false
-	_zoom_out.visible = false
 	cache.updated.connect(_queue)
 	model.tags_changed.connect(_queue)
 	model.pinged.connect(_queue)
@@ -134,10 +116,6 @@ func _layout() -> void:
 	_frame.position = Vector2.ZERO
 	_frame.size = Vector2(side, side)
 	_area.custom_minimum_size = Vector2(side, side)
-	var b := Kit.px(24)
-	var gap := Kit.px(4)
-	_zoom_in.position = Vector2(side - b - gap, side - 2 * b - 2 * gap)
-	_zoom_out.position = Vector2(side - b - gap, side - b - gap)
 	_queue()
 
 

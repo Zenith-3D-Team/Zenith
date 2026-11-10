@@ -8,10 +8,6 @@ extends "res://scripts/ui/factorio/platform_info.gd"
 ## scripts/world/ride.gd shows it). Going up is a ride in a rocket from a silo's screen; where a
 ## platform goes and its pause are set in its hub's screen, as in Factorio.
 
-## Kept for main.gd, which connects it; nothing in this panel opens the space map now (the remote
-## view's Surfaces panel does, as Factorio's).
-signal space_map_requested
-
 ## Space locations that aren't planets: nothing to drop to.
 const NOT_PLANETS := ["solar-system-edge", "shattered-planet"]
 

@@ -1,6 +1,8 @@
 -- The character's inventories slot by slot, moving stacks between slots (its own, or an open
--- machine screen's), sorting, and a quickbar. Everything Factorio's inventory window needs; the
--- older `inv` message (totals) stays for old clients.
+-- machine screen's), sorting, and a quickbar. Everything Factorio's inventory window needs. The
+-- older `inv` message (totals, puppet.lua) is still sent: today's client fills its inventory from
+-- it only until the first `slots` arrives (ui_model.gd set_inventory_totals), clients before
+-- `slots` have nothing else.
 --
 -- The quickbar lives in storage and changes only from client commands, so it is deterministic.
 -- A player-less character has no quickbar of its own; this one outlives client restarts.
@@ -436,7 +438,8 @@ function M.qb_set(cmd)
   send_quickbar()
 end
 
--- Selects a quickbar slot (0 for none); its item is what the character holds for building.
+-- Selects a quickbar slot (0 for none), kept and sent back in `qb` (sel, held); nothing in the game
+-- uses it, and no client sends it since the Factorio-style quickbar (kept for tests).
 function M.qb_sel(cmd)
   local qb = quickbar()
   local i = math.floor(tonumber(cmd.i) or 0)

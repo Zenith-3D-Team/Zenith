@@ -32,11 +32,11 @@ local function collect(surface, f, r)
       flat[#flat + 1] = world.fixed(p.y)
       n = n + 1
       if n >= MAX_ITEMS then
-        return flat
+        return flat, #found
       end
     end
   end
-  return flat
+  return flat, #found
 end
 
 -- Like `bi`, every update is the full list, split into parts that share the tick `k`.
@@ -58,7 +58,9 @@ function M.tick()
   if r <= 0 or not rate.due("gi", interval) then
     return
   end
-  send(collect(world.surface(), storage.f3d.focus, r))
+  local flat, read = collect(world.surface(), storage.f3d.focus, r)
+  rate.read("gi", read)
+  send(flat)
 end
 
 return M

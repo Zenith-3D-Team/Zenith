@@ -7,6 +7,7 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const CharacterPose := preload("res://scripts/player/character_pose.gd")
 const CharacterAnim := preload("res://scripts/player/character_anim.gd")
 const GameClock := preload("res://scripts/world/game_clock.gd")
+const Rockets := preload("res://scripts/world/rockets.gd")
 
 const FOLLOW_RATE := 18.0
 
@@ -73,12 +74,28 @@ var _last := Vector3.ZERO
 var _has_state := false
 ## Where the character is shooting (world position), or null: set by combat.gd.
 var aim_target = null
-## --anim-pose=<run|idle|mine|aim|ready|runaim|runready|dead>: hold one animation.
+## --anim-pose=<run|idle|mine|aim|ready|runaim|runready|dead|walk|exo|back|stop|hover|fly|flyloop>: hold one
+## animation (walk and exo: half and three times running speed; back: running backwards; stop: runs
+## and stops every 2 s; hover and fly: in the air, still and moving; flyloop: takes off, hovers and
+## lands every 4 s). --anim-rate=<x> plays it at x times its speed (0.1 for screenshots, which take
+## longer than a frame each).
 var _demo := ""
+var _demo_rate := 1.0
+var _demo_t := 0.0
 ## The item in the armour slot (set_armor), the look drawn for it, and whether that is the mech's.
 var armor := ""
 var look := BODY_MODEL
 var _mech := false
+## Flying in mech armour (`me` fl, fh): the mod's height in tiles, and the height drawn, eased
+## towards it so a jump in the mod's number doesn't jerk the body.
+var flying := false
+var _fly_goal := 0.0
+var _fly_h := 0.0
+var _fly_down := false  # the mod's height is falling (landing)
+const FLY_RATE := 6.0
+## Thruster smoke and flames under the feet while flying (Factorio's mech-armor-smoke puffs: grey,
+## growing from 0.1 to 0.3 over 50 ticks).
+var _jets: Array = []
 
 const BODY_MODEL := "character"
 const MECH_ARMOR := "mech-armor"
@@ -122,6 +139,8 @@ func _ready() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--anim-pose="):
 			_demo = arg.get_slice("=", 1)
+		elif arg.begins_with("--anim-rate="):
+			_demo_rate = clampf(float(arg.get_slice("=", 1)), 0.01, 10.0)
 	var body: GeometryInstance3D = MeshInstance3D.new()
 	var rigged := _make_rig(BODY_MODEL)
 	if rigged != null:
@@ -180,7 +199,8 @@ func _make_rig(model_name: String) -> MultiMeshInstance3D:
 	mm.set_instance_custom_data(0, Color(0, 0, 0, 1))
 	_rig.multimesh = mm
 	# The pose moves vertices outside the mesh's own box (a raised pickaxe, lying dead).
-	_rig.custom_aabb = AABB(Vector3(-2, -1, -2), Vector3(4, 4.5, 4))
+	# Flying lifts it a few tiles more.
+	_rig.custom_aabb = AABB(Vector3(-2, -1, -2), Vector3(4, 8.0, 4))
 	return _rig
 
 
@@ -318,6 +338,11 @@ func update_from(msg: Dictionary) -> void:
 	max_health = maxi(1, int(msg.get("mhp", max_health)))
 	firing = int(msg.get("sh", 0)) == 1
 	craft_queue = int(msg.get("q", 0))
+	flying = int(msg.get("fl", 0)) == 1
+	var goal := int(msg.get("fh", 0)) / 1000.0 if flying else 0.0
+	if goal != _fly_goal:
+		_fly_down = goal < _fly_goal
+	_fly_goal = goal
 	vehicle = int(msg.get("v", 0))
 	# Thousandths of a tile per tick; a tile is a metre.
 	vehicle_speed = int(msg.get("vs", 0)) / 1000.0 * 60.0 * 3.6
@@ -493,8 +518,16 @@ func _animate(delta: float) -> void:
 		var to: Vector3 = aim_target - position
 		_anim.aim_twist = wrapf(atan2(-to.x, -to.z) - rotation.y, -PI, PI)
 	if _demo != "":
+		delta *= _demo_rate
 		distance = _demo_state(delta)
+	_fly_h += (_fly_goal - _fly_h) * (1.0 - exp(-delta * FLY_RATE))
+	if _fly_goal <= 0.0 and _fly_h < 0.002:
+		_fly_h = 0.0
+	_anim.flying = flying and vehicle == 0
+	_anim.flight_height = _fly_h
+	_anim.descending = _fly_down
 	_anim.step(_pose, delta, distance)
+	_update_jets()
 	var rows := _pose.rows()
 	for m in _materials:
 		m.set_shader_parameter("rig_bone", rows)
@@ -526,7 +559,105 @@ func muzzle_position() -> Vector3:
 	return position + Vector3(0, 1.1, 0)
 
 
+## Thruster smoke and a small flame under each foot while the thrusters burn (CharacterAnim.thrust).
+func _update_jets() -> void:
+	var burn := _anim.thrust if vehicle == 0 and visible else 0.0
+	if burn <= 0.01 and _jets.is_empty():
+		return
+	if _jets.is_empty():
+		for side in ["_r", "_l"]:
+			_jets.append(_make_jet(side))
+	for jet in _jets:
+		var side: String = jet["side"]
+		var foot := _pose.point("shin" + side, _pose.tail_of("shin" + side))
+		var at := global_transform * foot
+		var smoke: CPUParticles3D = jet["smoke"]
+		smoke.global_position = at
+		smoke.emitting = burn > 0.05
+		var flame: MeshInstance3D = jet["flame"]
+		flame.visible = burn > 0.05 and not _first_person
+		var flicker := 0.85 + 0.15 * sin(Time.get_ticks_msec() * 0.047 + (0.0 if side == "_r" else 2.0))
+		flame.scale = Vector3(1.0, burn * flicker, 1.0)
+		# The cone's mesh is centred: hang it from the sole.
+		flame.global_position = at - Vector3(0.0, 0.225 * burn * flicker, 0.0)
+
+
+static var _puff: QuadMesh = null
+static func _jet_puff() -> QuadMesh:
+	if _puff == null:
+		_puff = QuadMesh.new()
+		_puff.size = Vector2(0.22, 0.22)
+		_puff.material = Rockets._puff_mesh().material
+	return _puff
+
+
+func _make_jet(side: String) -> Dictionary:
+	var smoke := CPUParticles3D.new()
+	smoke.amount = 24
+	smoke.lifetime = 50.0 / 60.0
+	smoke.local_coords = false
+	smoke.emitting = false
+	smoke.direction = Vector3(0, -1, 0)
+	smoke.spread = 25.0
+	smoke.initial_velocity_min = 1.5
+	smoke.initial_velocity_max = 3.0
+	smoke.gravity = Vector3(0, 0.6, 0)
+	smoke.damping_min = 3.0
+	smoke.damping_max = 4.0
+	# Factorio's puff grows from 0.1 to 0.3 of its picture; a small quad of its own, growing.
+	smoke.scale_amount_min = 0.8
+	smoke.scale_amount_max = 1.2
+	var grow := Curve.new()
+	grow.max_value = 3.0
+	grow.add_point(Vector2(0.0, 1.0))
+	grow.add_point(Vector2(1.0, 3.0))
+	smoke.scale_amount_curve = grow
+	smoke.mesh = _jet_puff()
+	var fade := Gradient.new()
+	fade.set_color(0, Color(0.6, 0.6, 0.6, 0.55))
+	fade.set_color(1, Color(0.5, 0.5, 0.5, 0.0))
+	smoke.color_ramp = fade
+	smoke.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(smoke)
+	# The flame: a short glowing cone pointing down, its length the thrust.
+	var flame := MeshInstance3D.new()
+	var cone := CylinderMesh.new()
+	cone.top_radius = 0.09
+	cone.bottom_radius = 0.0
+	cone.height = 0.45
+	cone.radial_segments = 8
+	cone.rings = 1
+	flame.mesh = cone
+	var hot := StandardMaterial3D.new()
+	hot.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	hot.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	hot.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	hot.albedo_color = Color(1.0, 0.62, 0.25, 0.8)
+	hot.cull_mode = BaseMaterial3D.CULL_DISABLED
+	flame.material_override = hot
+	flame.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(flame)
+	return {"side": side, "smoke": smoke, "flame": flame}
+
+
 func _demo_state(delta: float) -> float:
+	_demo_t += delta
+	var t := _demo_t
+	if _demo in ["hover", "fly", "flyloop"]:
+		# Factorio's own rates (measured): up 1/32 tile a tick, down 3/64, flying until it touches down.
+		var up := _demo != "flyloop" or (fposmod(t, 4.0) > 1.0 and fposmod(t, 4.0) < 3.0)
+		_fly_down = not up
+		_fly_goal = clampf(_fly_goal + (1.0 / 32.0 if up else -3.0 / 64.0) * delta * 60.0, 0.0, 1.0)
+		flying = up or _fly_goal > 0.0
+		_anim.running = _demo == "fly"
+		return DEMO_SPEED * delta if _demo == "fly" else 0.0
+	if _demo == "stop":
+		_anim.running = fposmod(t, 2.0) < 1.2
+		return DEMO_SPEED * delta if _anim.running else 0.0
+	if _demo in ["walk", "exo", "back"]:
+		_anim.running = true
+		var speeds := {"walk": 0.5, "exo": 3.0, "back": -0.7}
+		return DEMO_SPEED * float(speeds[_demo]) * delta
 	_anim.running = _demo in ["run", "runaim", "runready"]
 	_anim.mining = _demo == "mine"
 	_anim.aiming = _demo in ["aim", "runaim"]

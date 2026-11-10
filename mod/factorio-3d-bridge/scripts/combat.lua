@@ -17,6 +17,7 @@ local FIRING_TICKS = 20    -- `me.sh` stays 1 this long after the ammo last went
 local HEALTH_INTERVAL = 10
 local GUNS_INTERVAL = 10
 local PAIRS_PER_MESSAGE = 400
+local HIT_FX_TICKS = 3     -- at most one `afx` per unit this often
 
 -- Within the live-update square around the client's camera.
 local function near_focus(entity)
@@ -60,7 +61,8 @@ end
 function M.shoot(cmd)
   local s = storage.f3d
   local m = tonumber(cmd.m) or -1
-  local x, y = tonumber(cmd.x), tonumber(cmd.y)
+  -- The aim point is used every tick while held (aim_target, shooting_state): finite, on the map.
+  local x, y = world.fixed_in(cmd.x), world.fixed_in(cmd.y)
   if m < 0 or not x or not y then
     s.shooting = nil
     return
@@ -100,7 +102,7 @@ function M.on_damaged(event)
     local s = storage.f3d
     s.hit_fx_ticks = s.hit_fx_ticks or {}
     local hit_key = e.unit_number or ("character:" .. math.floor(p.x) .. ":" .. math.floor(p.y))
-    if game.tick - (s.hit_fx_ticks[hit_key] or -3) >= 3 then
+    if game.tick - (s.hit_fx_ticks[hit_key] or -HIT_FX_TICKS) >= HIT_FX_TICKS then
       s.hit_fx_ticks[hit_key] = game.tick
       transport.send_now({ t = "afx", fx = burning and "burn" or "blood", u = e.unit_number or 0,
         x = world.fixed(p.x), y = world.fixed(p.y) })
@@ -324,6 +326,13 @@ function M.tick()
   end
   if game.tick % HEALTH_INTERVAL == 0 then
     send_health(s)
+    -- Units hit that never die here (gone home into their spawner, walked off, a character that
+    -- lived) would keep their entry for good: only the last HIT_FX_TICKS matter.
+    for key, at in pairs(s.hit_fx_ticks or {}) do
+      if game.tick - at >= HIT_FX_TICKS then
+        s.hit_fx_ticks[key] = nil
+      end
+    end
   end
 end
 
@@ -333,6 +342,7 @@ function M.reset()
   s.shooting = nil
   s.guns_sig = nil
   s.damaged = {}
+  s.hit_fx_ticks = nil
   local c = s.puppet
   if s.shot and c and c.valid then
     c.shooting_state = { state = defines.shooting.not_shooting, position = c.position }

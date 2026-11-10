@@ -13,6 +13,7 @@ extends RefCounted
 ## Without an install everything here returns null and kit.gd falls back to plain Godot styling.
 
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 
 const FONT_FILES := {
 	"regular": "TitilliumWeb-Regular.ttf",
@@ -30,6 +31,7 @@ static var _sprites := {}  # relative path -> Texture2D or null
 static var _tech_icon_paths := {}  # technology -> "<mod>/graphics/technology/x.png", from technology.lua
 static var _tech_paths_loaded := false
 static var _others := {}  # name -> other_icon's texture or null
+static var _others_generation := -1  # ModGraphics.generation _others was filled with
 ## status.png's dots, left to right (utility-sprites.lua: status_working, _not_working, _yellow,
 ## _blue, _inactive).
 const STATUS_DOTS := ["green", "red", "yellow", "blue", "grey"]
@@ -76,6 +78,9 @@ static func shortcut_icon(name: String) -> Texture2D:
 ## Icons that aren't items: fluids ("water", and recipes named after their fluid like
 ## "basic-oil-processing") and virtual signals ("signal-A" is signal/signal_A.png), or null.
 static func other_icon(name: String) -> Texture2D:
+	if _others_generation != ModGraphics.generation:
+		_others_generation = ModGraphics.generation
+		_others.clear()
 	if _others.has(name):
 		return _others[name]
 	_others[name] = null
@@ -102,6 +107,10 @@ static func other_icon(name: String) -> Texture2D:
 
 ## The icon of an item group (crafting tab), e.g. "logistics", or null.
 static func group_icon(group: String) -> Texture2D:
+	# The prototype's own icon from the bridge's list (a mod's groups too).
+	var listed := ItemIcons.texture_for_kind("item-group", group)
+	if listed != null:
+		return listed
 	var dir := ItemIcons.find_data_dir()
 	if dir == "":
 		return null

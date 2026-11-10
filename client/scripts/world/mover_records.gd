@@ -60,9 +60,6 @@ var _epoch := 0
 var _migrate: Array[int] = []
 ## Which store's texture the shaders read (a second one is the main menu's background).
 static var _active: WeakRef
-## Microseconds the last frame() took, and records written since the store was made (probes).
-var frame_usec := 0
-var writes := 0
 
 
 func alloc() -> int:
@@ -170,11 +167,6 @@ func write(slot: int, spots: Array[Vector3], ticks: Array[float], flags: int, he
 	_ticks[to + 4] = now
 	_epochs[slot] = k
 	_dirty = true
-	writes += 1
-
-
-func flags_of(slot: int) -> int:
-	return int(data[slot * FLOATS + 12]) & ~ODD
 
 
 ## Sets or clears flags (HIDDEN, CARGO) without writing the rest.
@@ -223,7 +215,6 @@ func yaw_at(slot: int, t: float) -> float:
 
 ## Once a frame: the clock, records moved onto a newer clock, and the texture if records changed.
 func frame(clock_tick: float, ticks_a_second: float, delta: float) -> void:
-	var t0 := Time.get_ticks_usec()
 	tick = clock_tick
 	rate = ticks_a_second
 	seconds = fposmod(seconds + delta, IDLE_PERIOD)
@@ -242,7 +233,6 @@ func frame(clock_tick: float, ticks_a_second: float, delta: float) -> void:
 		RenderingServer.global_shader_parameter_set(&"f3d_mover_clock", Vector4(c.x, c.y, rate, seconds))
 		if _dirty:
 			_upload()
-	frame_usec = Time.get_ticks_usec() - t0
 
 
 func _set_epoch(k: int) -> void:

@@ -28,6 +28,8 @@ from scipy import ndimage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
+sys.path.append(os.path.join(REPO, "tools"))
+import factorio_install  # noqa: E402
 ENTRIES = os.path.join(REPO, "client", "data", "sprite_projection.json")
 OUT = os.path.join(HERE, "tree_crowns.py")
 # tree-06, the weeping swamp tree, hangs its leaves in strands (trees.tree_06), not lumps.
@@ -95,8 +97,7 @@ def fit(factorio, entry):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--factorio", default=os.environ.get(
-        "FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio"))
+    ap.add_argument("--factorio", default=factorio_install.install())
     args = ap.parse_args()
     entries = json.load(open(ENTRIES, encoding="utf-8"))
     lines = ['"""Each Nauvis tree\'s crown as Factorio\'s sprite draws it (variation a), measured by',

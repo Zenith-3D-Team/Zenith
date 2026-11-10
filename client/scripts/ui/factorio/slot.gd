@@ -159,12 +159,6 @@ func _gui_input(event: InputEvent) -> void:
 		clicked.emit(mb.button_index, mb.shift_pressed)
 
 
-func set_blocked(on: bool) -> void:
-	if on != blocked:
-		blocked = on
-		queue_redraw()
-
-
 func _draw() -> void:
 	var icon_size := float(Kit.px(32))
 	var rect := Rect2((size - Vector2(icon_size, icon_size)) * 0.5, Vector2(icon_size, icon_size))

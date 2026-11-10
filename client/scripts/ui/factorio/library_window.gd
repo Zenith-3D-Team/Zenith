@@ -425,12 +425,6 @@ func _go_up() -> void:
 		_go_to(tab, path.slice(0, path.size() - 1))
 
 
-func _new(kind: String) -> void:
-	tab = "mine"
-	var r: Dictionary = model.empty(kind)
-	library.add(path, r)
-
-
 ## Del over a record of My blueprints removes it.
 func _unhandled_key_input(event: InputEvent) -> void:
 	var key := event as InputEventKey

@@ -1,0 +1,11 @@
+{
+  "name": "zenith-gfx-test",
+  "version": "1.0.0",
+  "title": "Zenith graphics test",
+  "author": "Zenith",
+  "factorio_version": "2.1",
+  "dependencies": [
+    "base"
+  ],
+  "description": "Test fixture: an item, a chest, a tile and a decorative with their own pictures."
+}

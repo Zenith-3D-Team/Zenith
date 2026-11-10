@@ -22,6 +22,7 @@ const GameClock := preload("res://scripts/world/game_clock.gd")
 const VehicleAnim := preload("res://scripts/world/vehicle_anim.gd")
 const RobotSwarm := preload("res://scripts/world/robot_swarm.gd")
 const MoverRecords := preload("res://scripts/world/mover_records.gd")
+const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 
 const MISSING_FRAMES := 3
 const FOLLOW_RATE := 15.0
@@ -54,6 +55,8 @@ const CREATURE_FAR := 80.0
 const FOG_SLICE := 64
 ## Tiles a GPU-drawn robot can be drawn from its newest position (it is drawn about a step behind).
 const DRAWN_SLACK := 3.0
+## A card mover moving less than this a frame (tiles) stands still: its picture stops stepping.
+const CARD_STILL := 0.002
 
 
 class Mover:
@@ -103,6 +106,11 @@ class Mover:
 	var walked := 0.0  # tiles it walked to its newest position (creatures' gait)
 	var recorded := false  # its record has been written (it has a position)
 	var cell := Vector2i(1 << 30, 0)  # its cell in _robot_grid (GPU-drawn robots)
+	## A mod's mover without a model: its own Factorio picture on a card (_update_card), or null.
+	var card: MeshInstance3D
+	var card_quarter := -1  # the direction (0-3, north first) its picture is of
+	var card_generation := -1  # SpriteStandins.generation when it was picked
+	var card_run := -1  # 1 while it moves (its frames step), 0 standing still, -1 not set yet
 
 
 var protos: ProtoDB
@@ -117,6 +125,9 @@ var puppet_unit := 0
 var fog: Node3D = null
 
 var _movers := {}  # unit -> Mover
+## How many movers of each type there are (type -> count), so units_of_type() needn't go through
+## every mover when there are none of that type (rockets.gd asks twice a frame).
+var _type_counts := {}
 ## The movers moved here every frame (not drawn from a record): unit -> Mover.
 var _node_movers := {}
 ## Records of the movers the GPU draws.
@@ -168,6 +179,7 @@ func reset() -> void:
 	for m in _movers.values():
 		_free(m)
 	_movers.clear()
+	_type_counts.clear()
 	_node_movers.clear()
 	_robot_grid.clear()
 	_fog_list.clear()
@@ -243,6 +255,7 @@ func _end_frame() -> void:
 			if m.missing >= MISSING_FRAMES:
 				creatures.remove(unit)
 				_free(m)
+				_count_type(m.type, -1)
 				_movers.erase(unit)
 				_node_movers.erase(unit)
 				_waiting.erase(unit)
@@ -278,6 +291,9 @@ func _update(unit: int, proto_id: int, x: int, y: int, rec: Array) -> void:
 				_dress(unit, m, proto)
 			else:
 				_waiting[unit] = true
+		if m.type != proto.type:
+			_count_type(m.type, -1)
+			_count_type(proto.type, 1)
 		m.type = proto.type
 		m.height = Visuals.flying_height(proto.type)
 		m.on_rails = ROLLING_STOCK.has(proto.type)
@@ -486,6 +502,7 @@ func remove(unit: int) -> void:
 	if m != null:
 		creatures.remove(unit, true)  # first: a GPU-drawn one falls where its record has it
 		_free(m)
+		_count_type(m.type, -1)
 		_movers.erase(unit)
 		_node_movers.erase(unit)
 		_waiting.erase(unit)
@@ -528,11 +545,23 @@ func proto_name_of(unit: int) -> String:
 
 func units_of_type(type: String) -> Array:
 	var out: Array = []
+	if int(_type_counts.get(type, 0)) <= 0:
+		return out
 	for unit in _movers:
 		var m: Mover = _movers[unit]
 		if m.type == type:
 			out.append([unit, m.node])
 	return out
+
+
+func _count_type(type: String, by: int) -> void:
+	if type == "":
+		return
+	var n := int(_type_counts.get(type, 0)) + by
+	if n > 0:
+		_type_counts[type] = n
+	else:
+		_type_counts.erase(type)
 
 
 ## True when a flying robot is drawn within `radius` tiles of `from` (on the ground plane).
@@ -729,6 +758,8 @@ func _process_movers(delta: float) -> void:
 			m.rail_h = move_toward(m.rail_h, goal, delta * 6.0)
 			m.node.position.y = m.rail_h
 		m.node.rotation.y = lerp_angle(m.node.rotation.y, m.yaw_goal, t)
+		if m.card != null:
+			_update_card(m, null, m.node.position.distance_squared_to(was) > CARD_STILL * CARD_STILL)
 		if not m.wheels.is_empty():
 			_roll_wheels(m, m.node.position - was, wrapf(m.node.rotation.y - yaw_was, -PI, PI), delta)
 		if m.shadow != null:
@@ -746,11 +777,9 @@ func _to_record(m: Mover, kind: Vector4, flags: int) -> void:
 	_write(m, false)
 
 
-## Gives a mover its model: biters and the like go to creatures.gd (their node stays empty), the
-## rest get the model's mesh and moving parts under their node.
-## Rolling stock wears the colour its player gave it (H21), from its record's extra.col.
+## Rolling stock wears the colour its player gave it, from its record's extra.col.
 func _paint(unit: int, m: Mover) -> void:
-	if not m.on_rails or world == null:
+	if not m.on_rails or world == null or m.card != null:
 		return
 	var rec = world.entities.get(unit)
 	if rec == null or not (rec.extra is Dictionary) or not rec.extra.has("col"):
@@ -761,6 +790,8 @@ func _paint(unit: int, m: Mover) -> void:
 		(mi as MeshInstance3D).set_instance_shader_parameter("f3d_paint", paint)
 
 
+## Gives a mover its model: biters and the like go to creatures.gd (their node stays empty), the
+## rest get the model's mesh and moving parts under their node, or a mod's picture on a card.
 func _dress(unit: int, m: Mover, proto: ProtoDB.EntityProto) -> void:
 	if m.robot and RobotSwarm.handles(proto.name, proto.type):
 		m.bot = robots.add(unit, proto.name)
@@ -774,9 +805,12 @@ func _dress(unit: int, m: Mover, proto: ProtoDB.EntityProto) -> void:
 		for child in made.get_children():
 			made.remove_child(child)
 			m.node.add_child(child)
+			if child.has_meta("card"):
+				m.card = child
+				_update_card(m, proto, false)
 		made.free()
 		m.wheels = _wheels_of(m.node)
-	if m.robot:
+	if m.robot and m.card == null:  # a card casts its own shadow, as a building's does
 		m.shadow = _make_shadow(m.node)
 		if m.shadow != null:
 			add_child(m.shadow)
@@ -833,6 +867,10 @@ func _make_node(proto: ProtoDB.EntityProto) -> Node3D:
 			elif part.kind == "turret_head":
 				part_mi.set_meta("turret_head", part)  # turned by turrets.gd
 			root.add_child(part_mi)
+	elif SpriteStandins.in_use():
+		# A mod's car, unit or wagon: its own picture (_update_card), as chunk_view.gd draws a mod's
+		# building, never a box; nothing while it is composed or when it has neither picture nor icon.
+		mi.set_meta("card", true)
 	else:
 		var height := Visuals.height_for(proto)
 		mi.mesh = Visuals.box_mesh()
@@ -840,6 +878,30 @@ func _make_node(proto: ProtoDB.EntityProto) -> Node3D:
 		mi.material_override = _material_for(proto)
 	root.add_child(mi)
 	return root
+
+
+## A card mover's picture: that of the nearest of its four directions (the bridge's list keeps a
+## rotated sprite's north, east, south and west), the card kept facing Factorio's camera however the
+## mover turns (SpriteStandins.transform), its frames stepping only while it moves (a mod's car
+## drives, a mod's biter runs; standing still Factorio holds them on one frame).
+func _update_card(m: Mover, proto: ProtoDB.EntityProto, moving: bool) -> void:
+	var yaw := m.node.rotation.y
+	var quarter := posmod(roundi(-yaw / TAU * 4.0), 4)  # orientation = -yaw / TAU (Visuals.orientation_yaw)
+	if quarter != m.card_quarter or m.card_generation != SpriteStandins.generation:
+		if proto == null:
+			proto = protos.entity(m.proto_id)
+		if proto != null:
+			var mesh := SpriteStandins.card(proto.name, quarter * 4, proto.size(), proto.type)
+			# The picture it has stays while the new direction's is composed (no blink).
+			if mesh != null or not SpriteStandins.coming(proto.name, quarter * 4):
+				m.card.mesh = mesh
+		m.card_quarter = quarter
+		m.card_generation = SpriteStandins.generation
+	m.card.basis = Basis(Vector3.UP, -yaw) * SpriteStandins.transform(Vector2.ZERO).basis
+	var run := 1 if moving else 0
+	if run != m.card_run:
+		m.card_run = run
+		m.card.set_instance_shader_parameter("f3d_card_run", Vector2(run, float(posmod(m.unit * 7919, 1000)) / 1000.0))
 
 
 ## Wheel parts (`anim_wheel_*`) of a mover's model, found under its node.

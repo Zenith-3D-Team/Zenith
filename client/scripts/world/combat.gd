@@ -52,10 +52,6 @@ func reset() -> void:
 	_frame_tick = -1
 
 
-func damaged_count() -> int:
-	return _health.size()
-
-
 ## One part of {t: "hp", k, part, parts, l: [unit, health in thousandths, ...]}: the full list of
 ## damaged entities near the camera, used once its last part is in.
 func handle_health(msg: Dictionary) -> void:

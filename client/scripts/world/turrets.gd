@@ -133,11 +133,18 @@ class TurretState:
 	var beam: MeshInstance3D
 	var beam_age := 0.0
 	var fired := 0  # shots drawn (for the UI test)
+	var heard := 0.0  # _clock at its last `ts`
 
 
-## movers.gd (vehicles), fx.gd (its sprites and sounds); set by main.gd.
+## movers.gd (vehicles), fx.gd (its sprites and sounds), world.gd (its entities); set by main.gd.
 var movers: Node
 var fx: Node
+var world: Node
+## Every FORGET_INTERVAL seconds, states not heard of for FORGET_AFTER whose turret or vehicle is
+## in neither the world nor the movers are let go (it was mined, destroyed or left the area).
+const FORGET_INTERVAL := 2.0
+const FORGET_AFTER := 10.0
+var _forget_timer := 0.0
 
 var _states := {}  # unit -> TurretState
 var _clock := 0.0
@@ -147,10 +154,13 @@ var _beam_materials := {}  # kind -> ShaderMaterial (null when the sheet is miss
 var game_beams := false
 
 
-func reset() -> void:
+## A new game, or (`keep_beams`) another surface of the same one, whose bridge still sends `pj`.
+func reset(keep_beams := false) -> void:
 	for st: TurretState in _states.values():
 		_free_nodes(st)
 	_states.clear()
+	if not keep_beams:
+		game_beams = false
 
 
 func count() -> int:
@@ -170,6 +180,7 @@ func handle_states(msg: Dictionary) -> void:
 		if not (rec is Array) or rec.size() < 4:
 			continue
 		var st := _state(int(rec[0]))
+		st.heard = _clock
 		st.goal = int(rec[1]) / 1000.0
 		if not st.seen:
 			st.yaw = st.goal
@@ -190,7 +201,7 @@ func handle_projectiles(_msg: Dictionary) -> void:
 	game_beams = true
 
 
-## {t: "tf", u, w, x, y}: a turret's hit, where it landed (the target's centre).
+## {t: "tf", u, x, y}: a turret's hit, where it landed (the target's centre).
 func handle_fire(msg: Dictionary) -> void:
 	var st: TurretState = _states.get(int(msg.get("u", 0)))
 	if st == null:
@@ -238,6 +249,13 @@ func _process(delta: float) -> void:
 				_vehicle(st, delta)
 	for st: TurretState in _states.values():
 		_update_effects(st, delta)
+	_forget_timer += delta
+	if _forget_timer >= FORGET_INTERVAL and world != null:
+		_forget_timer = 0.0
+		for unit: int in _states.keys():
+			var quiet := _clock - (_states[unit] as TurretState).heard > FORGET_AFTER
+			if quiet and not world.entities.has(unit) and (movers == null or movers.call("node_of", unit) == null):
+				forget(unit)
 
 
 func _state(unit: int) -> TurretState:
@@ -647,7 +665,7 @@ func _free_nodes(st: TurretState) -> void:
 		st.beam.queue_free()
 
 
-## Forgets turrets that are gone (anim.gd's cleanup, by the world's entities and movers).
+## Forgets a turret that is gone (anim.gd's cleanup of its own states, and _process).
 func forget(unit: int) -> void:
 	var st: TurretState = _states.get(unit)
 	if st != null:

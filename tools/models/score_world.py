@@ -30,7 +30,9 @@ sys.path.insert(0, HERE)
 import compare  # noqa: E402
 import placement  # noqa: E402
 
-FACTORIO = os.environ.get("FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio")
+sys.path.append(os.path.dirname(HERE))
+import factorio_install  # noqa: E402
+FACTORIO = factorio_install.install()
 ENTRIES = os.path.join(REPO, "client", "data", "sprite_projection.json")
 
 

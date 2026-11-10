@@ -14,19 +14,19 @@ local timers = {}  -- name -> LuaProfiler for one call
 local totals = {}  -- name -> LuaProfiler summed over the current window
 local last = nil   -- name -> LuaProfiler, average per tick over the last full window
 local ticks = 0
--- `/f3d-profile trace`: each tick's time per module also goes to the game's log, one line a
--- tick ("f3d-trace <tick> name Elapsed: x ms ..."), so the worst ticks can be found afterwards (a
--- LuaProfiler can't be read as a number in Lua, only printed). Short runs: it writes a lot.
-local tracing = false
 
 -- Trace mode (`/f3d-profile trace N`): for N ticks, every module's and packet's time is written to
--- the log, one line each, so single slow ticks can be found (a profiler can't be read as a number,
--- only printed). tools/tick_trace.py reads the lines back.
+-- the log, one line each ("f3dtrace <tick> name Duration: x ms"), so single slow ticks can be found
+-- (a profiler can't be read as a number, only printed). tools/request_spikes.py and
+-- tools/bench/compare_builds.py read the lines back.
 local trace_left = 0
 local trace_tick = {}  -- this tick's {name, profiler} in order
 
+-- At most ten minutes: each traced tick writes a line to the log, and Zenith's console can ask.
+local MAX_TRACE = 36000
+
 function M.trace(n)
-  trace_left = math.max(0, math.floor(tonumber(n) or 0))
+  trace_left = math.max(0, math.min(MAX_TRACE, math.floor(tonumber(n) or 0)))
   trace_tick = {}
   return trace_left
 end
@@ -35,39 +35,44 @@ function M.tracing()
   return trace_left > 0
 end
 
-function M.toggle(trace)
-  enabled = not enabled or (trace and not tracing) or false
-  tracing = enabled and trace or false
+function M.toggle()
+  enabled = not enabled
   order, timers, totals, last, ticks = {}, {}, {}, nil, 0
-  return enabled, tracing
+  return enabled
 end
 
--- Runs fn (one module's tick) and, while profiling, adds its time to the module's total.
+-- Runs fn (one module's tick) once and, while profiling or tracing, times it for both.
 function M.run(name, fn, ...)
-  if trace_left > 0 then
-    local t = helpers.create_profiler()
-    fn(...)
-    t.stop()
-    trace_tick[#trace_tick + 1] = { name, t }
-    if not enabled then
-      return
-    end
-  elseif not enabled then
+  local tracing = trace_left > 0
+  if not enabled and not tracing then
     return fn(...)
   end
-  local t = timers[name]
-  if not t then
-    t = helpers.create_profiler(true)
-    timers[name] = t
-    totals[name] = helpers.create_profiler(true)
-    order[#order + 1] = name
+  local t
+  if enabled then
+    t = timers[name]
+    if not t then
+      t = helpers.create_profiler(true)
+      timers[name] = t
+      totals[name] = helpers.create_profiler(true)
+      order[#order + 1] = name
+    end
+    -- reset, not restart: restart carries on from the last call's time, so every call would add
+    -- all the ones before it.
+    t.reset()
+  else
+    t = helpers.create_profiler()
   end
-  -- reset, not restart: restart carries on from the last call's time, so every call would add
-  -- all the ones before it.
-  t.reset()
   fn(...)
   t.stop()
-  totals[name].add(t)
+  if enabled then
+    totals[name].add(t)
+  end
+  if tracing then
+    -- The trace keeps its own copy: the module's timer is reset on its next call this tick.
+    local copy = helpers.create_profiler(true)
+    copy.add(t)
+    trace_tick[#trace_tick + 1] = { name, copy }
+  end
 end
 
 -- Call once per tick, after the modules ran.
@@ -84,18 +89,6 @@ function M.end_tick()
   end
   if not enabled then
     return
-  end
-  if tracing then
-    -- A localised string takes at most 20 parameters: modules go in nested groups of 8.
-    local line, group = { "", "f3d-trace ", game.tick }, nil
-    for i, name in ipairs(order) do
-      if (i - 1) % 8 == 0 then
-        group = { "" }
-        line[#line + 1] = group
-      end
-      group[#group + 1] = { "", " ", name, " ", timers[name] }
-    end
-    log(line)
   end
   ticks = ticks + 1
   if ticks < WINDOW then

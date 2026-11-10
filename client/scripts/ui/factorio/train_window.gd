@@ -18,7 +18,6 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const RichText := preload("res://scripts/ui/factorio/rich_text.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
-const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const LogicKit := preload("res://scripts/ui/factorio/logic_kit.gd")
 const EntityPanels := preload("res://scripts/ui/factorio/entity_panels.gd")
 
@@ -524,7 +523,7 @@ static func stop(screen, st: Dictionary, body: VBoxContainer) -> void:
 	var left := EntityPanels.column(8)
 	left.custom_minimum_size.x = Kit.px(300)
 	cols.add_child(left)
-	# The name strip: the name with its rename button, then the map button and the colour.
+	# The name strip: the name with its rename button, then the colour.
 	var sh := LogicKit.subheader()
 	var head: HBoxContainer = sh[1]
 	var title := RichText.text_label(str(st.get("name", "")), "FHeading", Kit.WHITE)

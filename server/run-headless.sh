@@ -12,6 +12,7 @@
 #   F3D_GAME_PORT   multiplayer port for normal Factorio clients (default 34197)
 #   F3D_RCON_PORT   RCON port for tools/rcon.py and tools/live_check.py (default 34198)
 #   MAP_GEN         map-gen-settings.json to use when creating a new map
+#   MAP_SEED        the map seed when creating a new map (CI pins one, so every run tests the same land)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +33,8 @@ fi
 
 # Keep the server's settings, logs and mods apart from any normal Factorio install,
 # so it can run next to the game without "another instance is running" errors.
-mkdir -p "$mods" "$(dirname "$save")"
+# data/saves too: /server-save writes there, and Factorio stops the game if it's missing.
+mkdir -p "$mods" "$data/saves" "$(dirname "$save")"
 read_data="$(cd "$(dirname "$factorio")/../.." && pwd)/data"
 cat > "$data/config.ini" <<EOF
 [path]
@@ -53,7 +55,7 @@ common=(--config "$data/config.ini" --mod-directory "$mods")
 
 if [[ ! -f "$save" ]]; then
   echo "Creating a new map at $save"
-  "$factorio" "${common[@]}" --create "$save" ${MAP_GEN:+--map-gen-settings "$MAP_GEN"}
+  "$factorio" "${common[@]}" --create "$save" ${MAP_GEN:+--map-gen-settings "$MAP_GEN"} ${MAP_SEED:+--map-gen-seed "$MAP_SEED"}
 fi
 
 echo "Starting headless Factorio: 3D client UDP on 127.0.0.1:$udp_port, game port $game_port, RCON $rcon_port"

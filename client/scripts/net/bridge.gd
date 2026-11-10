@@ -9,6 +9,7 @@ extends Node
 ## --factorio-port / --port); `disconnect_from` says goodbye and closes the socket.
 ##
 ## Command-line options (after `--`): --factorio-port=34200 --port=34201 --update-rate=0..3
+## --no-belt-groups (no `bg` in the hello: packed lanes come as items, for comparing)
 
 signal welcomed(msg: Dictionary)
 signal message_received(msg: Dictionary)
@@ -38,6 +39,8 @@ var bind_error := OK
 var connected := false
 ## True once the prototype dictionaries are complete ("ready" arrived).
 var world_ready := false
+## The bridge mod's version from the last welcome ("" before one): a bug report lists it.
+var mod_version := ""
 var server_tick := 0
 var stats := {"packets": 0, "bytes": 0, "gaps": 0, "handle_usec": 0, "resyncs": 0, "full_resyncs": 0, "bad_json": 0}
 ## The bridge's last `wb`: its work budget per tick (`b`, in work units), the units it used per tick
@@ -157,10 +160,6 @@ func disconnect_from() -> void:
 	last_reliable_msec = 0
 
 
-func is_active() -> bool:
-	return _udp.is_bound()
-
-
 ## The I/O thread: sends what's queued, then reads everything waiting, about once a millisecond.
 func _io_loop() -> void:
 	while true:
@@ -236,12 +235,15 @@ func _stop_io() -> void:
 
 
 func _process(delta: float) -> void:
+	ModGraphics.poll()
 	if bind_error != OK or not _udp.is_bound():
 		return
 	_hello_timer += delta
 	if _hello_timer >= HELLO_INTERVAL:
 		_hello_timer = 0.0
 		_send_hello()
+	# Datagrams are read and parsed on the I/O and parsing threads (connect_to starts both whenever
+	# the socket is open); the UI test's own socket has neither, and nothing to read.
 	if _io_thread != null:
 		_io_mutex.lock()
 		var parsed := _parsed
@@ -254,9 +256,6 @@ func _process(delta: float) -> void:
 			_waiting_len.append_array(entry[2])
 			if int(entry[3]) > 0:
 				stats["bad_json"] = int(stats.get("bad_json", 0)) + int(entry[3])
-	else:
-		while _udp.get_available_packet_count() > 0:
-			_queue(_udp.get_packet())
 	_drain()
 	# A new session's mod starts at 0, and keeps the level through a resync: sent after each
 	# handshake unless it is 0 and was never anything else.
@@ -280,22 +279,24 @@ func _process(delta: float) -> void:
 var _waiting: Array = []
 var _waiting_len := PackedInt32Array()
 var _waiting_at := 0
-## Main-thread time a frame spends handling messages: a big base sends 6,000 belt items several
-## times a second, which took 20-40 ms to handle in one frame and made the view stutter. The rest
-## wait for the next frame; past BACKLOG_MESSAGES waiting, a frame takes up to twice as long.
-## 4 ms, not 6: the world's chunk rebuilds come after it in the same frame (world.gd shares one
-## allowance with it), and together they made the 20 ms frames walking on the owner's save.
-const HANDLE_USEC := 4000  # its slice in frame_budget.gd
+## Main-thread time a frame spends handling messages is its slice in frame_budget.gd (`messages`): a
+## big base sends 6,000 belt items several times a second, which took 20-40 ms to handle in one frame
+## and made the view stutter. The rest wait for the next frame; past BACKLOG_MESSAGES waiting, a
+## frame takes up to twice as long. 4 ms, not 6: the world's chunk rebuilds come after it in the
+## same frame, and together they made the 20 ms frames walking on the owner's save.
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
+const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const BACKLOG_MESSAGES := 300
 ## This frame's message handling, in µs, for world.gd's share of the frame.
 var frame_handle_usec := 0
-## Messages that took longer than this to handle: [ms, type, bytes] (for --stutter-probe).
+## Messages that took longer than this to handle: [ms, type, bytes] (for --stutter-probe, kept
+## only while it runs).
 const SLOW_MESSAGE_USEC := 8000
 var slow_messages: Array = []
 
 
-## Without the I/O thread: read here.
+## For the UI test: a datagram's messages queued for _drain, as the parsing thread queues them.
 func _queue(packet: PackedByteArray) -> void:
 	stats["packets"] += 1
 	stats["bytes"] += packet.size()
@@ -361,7 +362,7 @@ func _drain() -> void:
 		if msg is Dictionary:
 			_handle(msg)
 			var spent := Time.get_ticks_usec() - t0
-			if spent > SLOW_MESSAGE_USEC and slow_messages.size() < 200:
+			if Probing.on and spent > SLOW_MESSAGE_USEC and slow_messages.size() < 200:
 				slow_messages.append([spent / 1000.0, str(msg.get("t", "")), _waiting_len[_waiting_at - 1]])
 		if Time.get_ticks_usec() - start > limit:
 			break
@@ -430,7 +431,7 @@ func send(cmd: Dictionary) -> void:
 		_outbox.append(data)
 		_io_mutex.unlock()
 	else:
-		_udp.put_packet(data)
+		_udp.put_packet(data)  # the UI test's own socket (_catch_commands), with no I/O thread
 
 
 func request_resync(full: bool) -> void:
@@ -458,7 +459,17 @@ func _send_hello() -> void:
 	# z: bi, ih and mv lists delta-coded (see PROTOCOL.md), most of a busy base's traffic.
 	# dc: decoratives (dprotos, dec), as Settings → Graphics → Decoratives says (main.gd sets it).
 	# bl: belt lanes that didn't change aren't sent again; belt_items.gd keeps their items (bi ln, dl).
+	# bg: packed lanes come as groups whose items belt_items.gd makes and moves (bi bg, bm);
+	# --no-belt-groups leaves it out (comparing).
+	# br: plain lanes of straight runs come once, and belt_items.gd moves their items (bi pl).
+	# Off unless --belt-runs: on Zenith Test runs read further for less server time and walk more
+	# accurately, but standing they still draw more items where the game has none than without
+	# (docs/PERFORMANCE-PLAN.md 10).
 	var hello := {"t": "hello", "v": PROTOCOL, "sid": _session, "w": 1 if connected else 0, "z": 1, "b": 1, "bl": 1}
+	if not "--no-belt-groups" in OS.get_cmdline_user_args():
+		hello["bg"] = 1
+	if "--belt-runs" in OS.get_cmdline_user_args():
+		hello["br"] = 1
 	if decoratives:
 		hello["dc"] = 1
 	send(hello)
@@ -475,12 +486,15 @@ func _handle(msg: Dictionary) -> void:
 		if r < 1 or (connected and r - _expected_r > 1000000):
 			return
 		if t == "welcome":
+			mod_version = str(msg.get("mod", ""))
 			if _int_or(msg.get("v"), 0) != PROTOCOL:
-				push_warning("Bridge mod speaks protocol %s, this client %d" % [str(msg.get("v")), PROTOCOL])
+				push_warning("Bridge mod %s speaks protocol %s, this client %d" % [mod_version, str(msg.get("v")), PROTOCOL])
 			_expected_r = r + 1
 			connected = true
 			world_ready = false
 			_pending_resync = 0
+			# The game's mods and its graphics list (mod_graphics.gd), before anything is drawn.
+			ModGraphics.on_welcome(msg, send)
 			welcomed.emit(msg)
 			return
 		if not connected:
@@ -496,6 +510,9 @@ func _handle(msg: Dictionary) -> void:
 		if t == "ready":
 			world_ready = true
 	elif not connected:
+		return
+	if t == "gfx":
+		ModGraphics.on_part(msg)
 		return
 	if t == "wb":
 		# The bridge's work per tick (once a second): kept here for whatever reads it.

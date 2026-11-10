@@ -77,6 +77,10 @@ func _process(delta: float) -> void:
 	_time += delta
 	if flash > 0.0:
 		flash = maxf(0.0, flash - delta / FLASH_SECONDS)
+	# Hidden and nothing to show: the last _update already set both to 0 (it ran every frame,
+	# setting the material's two parameters on a hidden overlay).
+	if not visible and flash <= 0.0 and low <= 0.0:
+		return
 	_update()
 
 

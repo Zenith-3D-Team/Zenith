@@ -27,10 +27,17 @@ var tile_colors := PackedColorArray()
 var tile_names := PackedStringArray()
 ## Per tile id: 1 water, 2 empty space (a space platform's surroundings: nothing to draw), else 0.
 var tile_is_water := PackedByteArray()
+var _water_list := -1  # the graphics list (ModGraphics.generation) tile_is_water was worked out with
 var item_names := {}  # id -> name
 var fluid_names := {}  # id -> name
 var fluid_colors := {}  # name -> Color
-var item_places := {}  # item name -> the entity it builds, when that has another name (rail)
+var item_places := {}  # item name -> the entity it builds, when that has another name (rail); "" none
+## Entity types no item builds. An item named like one (the rocket and its projectile) builds
+## nothing: picking it with Q put a "rocket" to build in the cursor, so clicks built (and failed)
+## instead of opening the turret (issue #2). The mod also says so (iprotos' "" third value).
+const NEVER_PLACED := {"projectile": true, "artillery-projectile": true, "explosion": true, "smoke-with-trigger": true,
+	"sticker": true, "stream": true, "fire": true, "beam": true, "particle-source": true, "corpse": true,
+	"character-corpse": true, "speech-bubble": true, "flying-text": true, "highlight-box": true}
 
 
 func clear() -> void:
@@ -75,7 +82,34 @@ func add_tiles(list: Array) -> void:
 		var tile_name := str(rec[1])
 		tile_colors[id] = Color8(int(rec[2]), int(rec[3]), int(rec[4]))
 		tile_names[id] = tile_name
-		tile_is_water[id] = 1 if _terrain().is_water_tile(tile_name) else (2 if tile_name.ends_with("empty-space") else 0)
+		tile_is_water[id] = _water_kind(tile_name)
+	_water_list = _mod_graphics().generation
+
+
+## Water again once a graphics list is applied: a mod's water tile is water by the list's record,
+## and the list comes after `tprotos` (read from the cache or the bridge). True when a tile changed
+## (world.gd then meshes the ground again).
+func refresh_water() -> bool:
+	var generation: int = _mod_graphics().generation
+	if generation == _water_list:
+		return false
+	_water_list = generation
+	var changed := false
+	for id in tile_names.size():
+		var kind := _water_kind(tile_names[id]) if tile_names[id] != "" else 0
+		if kind != tile_is_water[id]:
+			tile_is_water[id] = kind
+			changed = true
+	return changed
+
+
+## Empty space first: it carries `water_tile` in its collision mask, and isn't water.
+static func _water_kind(tile_name: String) -> int:
+	return 2 if tile_name.ends_with("empty-space") else (1 if _terrain().is_water_tile(tile_name) else 0)
+
+
+static func _mod_graphics() -> GDScript:
+	return load("res://scripts/world/mod_graphics.gd")
 
 
 ## Water by its collision mask in Factorio's definitions (Gleba's wetlands, Aquilo's ocean), not
@@ -95,7 +129,10 @@ func add_items(list: Array) -> void:
 
 ## The entity an item builds, or null.
 func placed_entity(item: String) -> EntityProto:
-	return entities_by_name.get(item_places.get(item, item))
+	var proto: EntityProto = entities_by_name.get(item_places.get(item, item))
+	if proto != null and NEVER_PLACED.has(proto.type):
+		return null
+	return proto
 
 
 ## [id, name, r, g, b]: the fluid's base colour.

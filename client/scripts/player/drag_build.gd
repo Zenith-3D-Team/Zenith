@@ -29,7 +29,7 @@ var _start := Vector2i.ZERO
 var _axis := Vector2i.ZERO
 ## The tile last stepped onto (belts walk tile by tile to the cursor).
 var _cur := Vector2i.ZERO
-## The last tile built on, its direction, and whether it was an underground.
+## The last tile built on, its direction, and whether anything was built yet.
 var _last_built := Vector2i.ZERO
 var _last_dir := 0
 var _has_last := false
@@ -129,13 +129,13 @@ func _step_belt(next: Vector2i, dir: int) -> void:
 		return
 	# The line turns: the belt where it turns points the new way (Factorio's corner).
 	if _has_last and _last_dir != dir and _gap_dir < 0 and _last_built == next - _vec(dir):
-		_place(_last_built, dir, null)
+		_place(_last_built, dir)
 	if _obstacle(next, dir):
 		if bool(Settings.get_value("interface", "smart_belt_building")) and _under_item("b") != "" and _has_last:
 			_gap_from = _last_built
 			_gap_dir = dir
 		return
-	_place(next, dir, null)
+	_place(next, dir)
 
 
 func _step_pipe(next: Vector2i, dir: int) -> void:
@@ -147,7 +147,7 @@ func _step_pipe(next: Vector2i, dir: int) -> void:
 			_gap_from = _last_built
 			_gap_dir = dir
 		return
-	_place(next, dir, null)
+	_place(next, dir)
 
 
 ## Past the obstacle: an underground (pipe-to-ground) pair when the free tile is within reach, the
@@ -165,7 +165,7 @@ func _continue_gap(next: Vector2i, dir: int, under_item: String) -> void:
 	var dist := absi((next - _gap_from).x) + absi((next - _gap_from).y)
 	_gap_dir = -1
 	if under_proto == null or dist > reach:
-		_place(next, dir, null)  # too far for the underground: the line starts again past it
+		_place(next, dir)  # too far for the underground: the line starts again past it
 		return
 	if under_proto.type == "pipe-to-ground":
 		# A pipe-to-ground's direction is its above-ground connection: back along the line at the
@@ -192,7 +192,7 @@ func _step_pole(next: Vector2i) -> void:
 		while back != _line_last and _obstacle(back, int(pi.build_dir)):
 			back -= _axis
 		if back != _line_last:
-			_place(back, int(pi.build_dir), null)
+			_place(back, int(pi.build_dir))
 			_line_last = back
 
 
@@ -238,7 +238,7 @@ func _obstacle(tile: Vector2i, dir: int) -> bool:
 	return false
 
 
-func _place(tile: Vector2i, dir: int, _ground) -> void:
+func _place(tile: Vector2i, dir: int) -> void:
 	var size: Vector2i = _proto.tile_size
 	if dir == 4 or dir == 12:
 		size = Vector2i(size.y, size.x)
@@ -272,3 +272,26 @@ func _send_at(item: String, at: Vector2, dir: int) -> void:
 	sent.append(cmd)
 	if not cmd.has("ghost"):
 		pi._remember({"do": "build", "item": item, "x": at.x, "y": at.y, "d": dir})
+		_predict(item, at, dir)
+
+
+## Shows what was just built at once (the latency layer, FFF #83), where the client's own check
+## says it can go: within reach and not in the way. The mod's answer replaces or drops it.
+func _predict(item: String, at: Vector2, dir: int) -> void:
+	if pi.predicted == null or pi._lmb_super or pi.build_mirror or pi.hud.ui.remote:
+		return
+	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
+	if proto == null:
+		return
+	var size: Vector2i = proto.tile_size
+	if dir == 4 or dir == 12:
+		size = Vector2i(size.y, size.x)
+	# A click (and a line's later footprints) sends the exact cursor point, which the mod snaps to
+	# the grid: drawn unsnapped, the prediction stood up to half a tile off the game's building and
+	# never matched it, so both showed until it timed out.
+	at = Vector2(pi._snap(at.x, size.x), pi._snap(at.y, size.y))
+	if not pi._in_reach(at, size) or pi._blocked(proto, at, size) or pi._on_void(at, size):
+		return
+	if pi.hud.count_of(item) <= pi.predicted.pending_of(proto):
+		return  # the inventory hasn't caught up: the last ones may be refused for want of items
+	pi.predicted.build(proto, at, dir)

@@ -4,8 +4,8 @@ extends Control
 ## construction areas), turret coverage, train stop names, worker robots, rail signal states and
 ## recipe icons, from the charts' `ov` (ui_model.gd map_overlays), and the whole surface's roboports
 ## from `mrp` (H13: the network shows whole, not only where charts were loaded). Which ones show is
-## ui_settings.gd's map/show_* switches; the minimap and the map view each have one of these over
-## their map, filling it.
+## ui_settings.gd's map/show_* switches. The map view and the minimap each have one of these over
+## their map, filling it; the minimap's draws only what Factorio's minimap does (`minimap`).
 ##
 ## Areas are drawn solid inside a CanvasGroup that is made translucent as a whole, so overlapping
 ## areas read as one covered region, like Factorio's map, instead of getting darker.
@@ -46,6 +46,11 @@ var centre := Vector2.ZERO
 var scale_px := 1.0
 ## Text (train stop names) only where there is room for it: the map view, not the minimap.
 var show_text := true
+## The minimap: Factorio's draws only the map, players, trains, its stations' markers and tags,
+## whatever the map view's switches say (checked in 2.1.24 with logistic, electric and turret
+## coverage on in the map view): no coverage areas, wires, pollution, robots, signals or recipes.
+## Drawing those, and again on every 24 px the view moved, was the minimap's stutter while running.
+var minimap := false
 ## Where the character is (tiles), set by the view: the ground round it counts as seen.
 var character_at := Vector2.ZERO
 ## Charted chunks no radar sees are drawn this much darker, as Factorio's map does.
@@ -326,6 +331,8 @@ func _counted(layer: String) -> void:
 
 
 func _shown(kind: String) -> bool:
+	if minimap:
+		return false
 	match kind:
 		"electric":
 			return bool(settings.get_value("map/show_electric"))
@@ -562,7 +569,7 @@ func _draw_trains() -> void:
 func _draw_shade() -> void:
 	_counted("shade")
 	_draw_unseen(shade)
-	if model != null and bool(settings.get_value("map/show_pollution")) and not model.map_pollution.is_empty():
+	if model != null and not minimap and bool(settings.get_value("map/show_pollution")) and not model.map_pollution.is_empty():
 		var half := size / 2.0 / scale_px + Vector2(32, 32) + _slack()
 		var view := Rect2(centre - half, half * 2.0)
 		for chunk: Vector2i in model.map_pollution:
@@ -583,7 +590,7 @@ func _draw_shade() -> void:
 ## Copper wires between poles, with the electric layer.
 func _draw_wires() -> void:
 	_counted("wires")
-	if bool(settings.get_value("map/show_electric")) and scale_px >= 0.5:
+	if not minimap and bool(settings.get_value("map/show_electric")) and scale_px >= 0.5:
 		# A wire's start can be far outside the view while it crosses it: a wide margin.
 		for r in _entries_of("w", 64.0):
 			wires.draw_line(to_screen(Vector2(r[1], r[2])), to_screen(Vector2(r[3], r[4])), WIRE, maxf(1.0, 0.12 * scale_px), true)
@@ -592,10 +599,10 @@ func _draw_wires() -> void:
 ## Robots, signals, stops and recipe icons.
 func _draw_marks() -> void:
 	_counted("marks")
-	var robots := bool(settings.get_value("map/show_robots"))
-	var signals := bool(settings.get_value("map/show_signals"))
-	var stops := bool(settings.get_value("map/show_stops"))
-	var recipes := bool(settings.get_value("map/show_recipes"))
+	var robots := not minimap and bool(settings.get_value("map/show_robots"))
+	var signals := not minimap and bool(settings.get_value("map/show_signals"))
+	var stops := minimap or bool(settings.get_value("map/show_stops"))  # the minimap marks its stations always
+	var recipes := not minimap and bool(settings.get_value("map/show_recipes"))
 	if not (robots or signals or stops or recipes):
 		return
 	var font := Kit.font("semibold")

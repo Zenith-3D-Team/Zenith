@@ -1,4 +1,28 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.1.3
+Date: 2026-11-07
+  Features:
+    - Lists every prototype's icons, tiles, decoratives and pictures (with their animations) for the 3D client, so modded games are drawn with their mods' own graphics.
+    - Sends the windows mods open for the player, for the 3D client to draw (in hybrid single-player the client clicks their buttons in Factorio's window); Informatron's buttons are pressed through its own remote interface. The client doesn't draw them by default for now.
+    - Sends whether the character is flying in mech armour, and how high, for the 3D client to draw its flight.
+    - A Zenith button (the gear) among the player's top-left mod buttons does what Ctrl+F9 does (per-player setting "Zenith button").
+    - Acts through the player's own character when it plays one, so other mods hear the player's building, mining, rotating, pasting and opening ("Act as the player for other mods", on by default).
+    - Ctrl+F9 in Factorio starts Zenith when none is connected (with server/factorio-with-zenith.ps1).
+    - Belt lanes packed with one kind of item are sent once as a group, then only how far they moved.
+    - Chunks the client kept are answered "unchanged" instead of being sent again.
+    - Kept and ungenerated chunks are answered without waiting their turn (walking in and out of Factorissimo's buildings).
+  Optimizations:
+    - Smooth belt items read each update over the ticks between updates instead of in one tick.
+    - Periodic jobs that can wait a few ticks wait for a tick with room, each with a cost learned on the base.
+    - The search for moving things runs after the focus moved 4 tiles or every 8 ticks, not on every step.
+  Bugfixes:
+    - Train ghosts face their way and go when built.
+    - Ctrl+F9 or the Zenith button with no Zenith connected and no launcher running did nothing: after 0.75 seconds without the launcher's answer, a window says what is missing (Zenith itself, or the launch options), with what to copy.
+    - Ctrl+F9 and the Zenith button right after loading a save raised the Zenith the save was made with, long gone: in single-player a loaded game raises no Zenith until one says hello after the load, and a raised Zenith that doesn't answer in 1.5 seconds falls back to the launcher.
+    - Every press of Ctrl+F9 or the Zenith button says in chat what it is doing.
+    - A full belt lane creeping on is sent where it stands, not carried on at full belt speed (neighbouring belts had drifted apart).
+    - A full belt lane flowing at belt speed checked a whole number of item gaps after its last check is sent as moving, not taken as standing.
+---------------------------------------------------------------------------------------------------
 Version: 0.1.2
 Date: 2026-11-04
   Features:

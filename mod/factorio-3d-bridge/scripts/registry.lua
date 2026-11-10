@@ -87,6 +87,11 @@ local BELT_TYPES = {
   "transport-belt", "underground-belt", "splitter", "lane-splitter", "loader", "loader-1x1",
   "linked-belt",
 }
+-- The same as a set, whether or not the game has them (tracker.lua: a belt's neighbours bend).
+M.BELT_SET = {}
+for _, t in ipairs(BELT_TYPES) do
+  M.BELT_SET[t] = true
+end
 
 local cache
 
@@ -255,12 +260,12 @@ function M.is_mover(type_name)
   return get().movers[type_name] == true
 end
 
--- True for entities that belong in chunk snapshots and add/remove deltas.
 -- Some loaded prototype has this type (find_entities_filtered rejects unknown type names).
 function M.has_type(type_name)
   return get().present[type_name] == true
 end
 
+-- True for entities that belong in chunk snapshots and add/remove deltas.
 function M.is_static(type_name)
   return not get().excluded[type_name]
 end
@@ -315,7 +320,6 @@ function M.entity_records()
   return out
 end
 
--- [id, name, r, g, b]
 function M.decorative_id(name)
   return get().decorative_ids[name] or 0
 end
@@ -329,6 +333,7 @@ function M.decorative_records()
   return out
 end
 
+-- [id, name, r, g, b]: the tile's map colour.
 function M.tile_records()
   local out = {}
   for id, proto in pairs(get().tiles) do
@@ -338,7 +343,6 @@ function M.tile_records()
   return out
 end
 
--- [id, name]. Items have no map colour; the client picks an icon or a colour by name.
 -- What an item builds: its place_result, or for a 2.x rail planner (whose place_result may be
 -- empty) its straight rail. Nil for items that build nothing.
 function M.place_result(item)
@@ -407,13 +411,16 @@ function M.wired_types()
 end
 
 -- [id, name] or, when the item builds something with another name (rail -> straight-rail),
--- [id, name, entity name].
+-- [id, name, entity name]. Items have no map colour; the client picks an icon or a colour by name.
 function M.item_records()
   local out = {}
   for id, name in pairs(get().items) do
     local place = M.place_result(prototypes.item[name])
     if place and place.name ~= name then
       out[#out + 1] = { id, name, place.name }
+    elseif not place and prototypes.entity[name] then
+      -- Named like an entity it doesn't build (the rocket and its projectile, issue #2): "".
+      out[#out + 1] = { id, name, "" }
     else
       out[#out + 1] = { id, name }
     end

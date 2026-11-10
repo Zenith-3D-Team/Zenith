@@ -75,10 +75,6 @@ func reset() -> void:
 		(mm as MultiMeshInstance3D).multimesh.visible_instance_count = 0
 
 
-func launch_count() -> int:
-	return _launches.size()
-
-
 ## Where the rockets climbing now are drawn (add-ons' api.world.rockets()).
 func launch_positions() -> Array:
 	var out: Array = []
@@ -100,12 +96,6 @@ func drive(at: Vector2, height: float, ignition: float) -> void:
 	l["h"] = height
 	l["ign"] = ignition
 	l["seen"] = 0.0
-
-
-## The rocket the ride drives at `at`, or null.
-func driven_rocket(at: Vector2) -> Node3D:
-	var l := _launch_at(at)
-	return l["node"] if not l.is_empty() else null
 
 
 func _launch_at(at: Vector2) -> Dictionary:
@@ -287,7 +277,10 @@ func _update_pods(delta: float) -> void:
 			var f := clampf(1.0 - t / DESCENT_TIME, 0.0, 1.0)
 			h = DESCENT_HEIGHT * f * f
 		node.position.y = h
-		node.visible = h < 200.0
+		# A pod waiting in its rocket (cargo_pod_state "awaiting_launch") is Factorio's own entity
+		# beside the silo's centre; the rocket waiting in the shaft already carries it, so it isn't
+		# drawn on the ground beside the silo (owner: "a rocket pod beside it").
+		node.visible = h < 200.0 and state != "awaiting_launch"
 	for unit in _pods.keys():
 		if not seen.has(unit):
 			_pods.erase(unit)
@@ -348,27 +341,38 @@ func _on_chunks() -> void:
 	_place_chunks()
 
 
-## A chunk's mesh: the small asteroid of its kind ("metallic-asteroid-chunk" -> small-metallic-asteroid), scaled down.
+## A chunk's mesh: the small asteroid of its kind ("metallic-asteroid-chunk" -> small-metallic-asteroid),
+## scaled down. The model is read on a worker thread (asked for with ready(); mesh_for alone parsed
+## the .glb in the frame of the first update), a ball standing in until it is there or if there is none.
 func _chunk_mesh(name: String) -> MultiMeshInstance3D:
-	if _chunk_meshes.has(name):
-		return _chunk_meshes[name]
-	var kind := name.trim_suffix("-asteroid-chunk")
-	var mesh := ModelLibrary.mesh_for("small-%s-asteroid" % kind)
-	if mesh == null:
-		var s := SphereMesh.new()
-		s.radius = 0.5
-		s.height = 0.9
-		mesh = s
-	var mm := MultiMesh.new()
-	mm.transform_format = MultiMesh.TRANSFORM_3D
-	mm.mesh = mesh
-	mm.instance_count = 16
-	mm.visible_instance_count = 0
-	var mmi := MultiMeshInstance3D.new()
-	mmi.multimesh = mm
-	add_child(mmi)
-	_chunk_meshes[name] = mmi
+	var mmi: MultiMeshInstance3D = _chunk_meshes.get(name)
+	if mmi == null:
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = chunk_ball()
+		mm.instance_count = 16
+		mm.visible_instance_count = 0
+		mmi = MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.set_meta("model", "small-%s-asteroid" % name.trim_suffix("-asteroid-chunk"))
+		add_child(mmi)
+		_chunk_meshes[name] = mmi
+	if mmi.has_meta("model") and ModelLibrary.ready(str(mmi.get_meta("model"))):
+		var mesh := ModelLibrary.mesh_for(str(mmi.get_meta("model")))
+		if mesh != null:
+			mmi.multimesh.mesh = mesh
+		mmi.remove_meta("model")
 	return mmi
+
+
+## The ball drawn for an asteroid chunk without its model (here and in collectors.gd's claws).
+static var _ball: SphereMesh = null
+static func chunk_ball() -> SphereMesh:
+	if _ball == null:
+		_ball = SphereMesh.new()
+		_ball.radius = 0.5
+		_ball.height = 0.9
+	return _ball
 
 
 ## Where a chunk is drawn `dt` seconds after its update: moved on by its velocity, with the gap to

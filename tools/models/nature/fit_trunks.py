@@ -32,6 +32,8 @@ from skimage.morphology import disk, skeletonize
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
+sys.path.append(os.path.join(REPO, "tools"))
+import factorio_install  # noqa: E402
 ENTRIES = os.path.join(REPO, "client", "data", "sprite_projection.json")
 OUT = os.path.join(HERE, "tree_trunks.py")
 TREES = ["tree-0%d" % i for i in (1, 2, 3, 4, 5, 7, 8, 9)]
@@ -192,8 +194,7 @@ def colours(factorio, entry):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--factorio", default=os.environ.get(
-        "FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio"))
+    ap.add_argument("--factorio", default=factorio_install.install())
     ap.add_argument("--debug", help="draw the strands over the sprites into this folder (keep it in art-src/)")
     args = ap.parse_args()
     if args.debug:

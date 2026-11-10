@@ -4,6 +4,9 @@ extends Node
 ##   --review-shots=<dir>[@seconds]   start after that many seconds (default 12), then quit
 ##   --review-box=<w>,<d>,<h>         the size to frame and crop to (tiles, default 3,3,3)
 ##   --review-aim=<y>                 the height the side views look at (default 0.4 of the box's)
+##   --review-fly=<path.json>         instead of the views: a camera flight, keyframes of [x, y, z] camera
+##                                    position, [x, y, z] point looked at and frames to reach it, saved as
+##                                    fly/0000.jpg... (world coordinates: Factorio x, height, Factorio y)
 ##   --review-views=<a,b,...>         which shots (default: all of VIEWS); `close+0.3` is the
 ##                                    close view 0.3 s after the shot before (machines moving)
 ##
@@ -34,6 +37,7 @@ var delay := 12.0
 var box := Vector3(3, 3, 3)
 var aim := -1.0
 var views: Array = VIEWS.keys()
+var fly_path := ""
 
 
 static func requested() -> bool:
@@ -55,6 +59,8 @@ func _ready() -> void:
 			box = Vector3(float(p[0]), float(p[1]), float(p[2]))
 		elif arg.begins_with("--review-aim="):
 			aim = float(arg.get_slice("=", 1))
+		elif arg.begins_with("--review-fly="):
+			fly_path = arg.get_slice("=", 1)
 		elif arg.begins_with("--review-views="):
 			views = Array(arg.get_slice("=", 1).split(","))
 	DirAccess.make_dir_recursive_absolute(out_dir)
@@ -68,7 +74,14 @@ func _run() -> void:
 	for layer in game.find_children("*", "CanvasLayer", true, false):
 		(layer as CanvasLayer).visible = false
 	var size := maxf(box.x, maxf(box.y, box.z))
+	if fly_path != "":
+		await _fly(JSON.parse_string(FileAccess.get_file_as_string(fly_path)))
+		get_tree().quit()
+		return
 	for view in views:
+		if str(view).begins_with("turn"):
+			await _turn(int(str(view).substr(4)), size)
+			continue
 		var v: Array = VIEWS[str(view).get_slice("+", 0)]
 		if v[3]:
 			rig._saved_view = {}
@@ -100,6 +113,65 @@ func _run() -> void:
 		var path := out_dir.path_join(str(view) + ".png")
 		print("review shot %s: %s" % [path, error_string(image.save_png(path))])
 	get_tree().quit()
+
+
+## `turn<N>`: a turntable, N frames once round from above the angled view, saved uncropped as
+## turn/000.png... (the model stays in one place on screen) to line up into a video.
+func _turn(frames: int, size: float) -> void:
+	frames = maxi(frames, 1)
+	var dir := out_dir.path_join("turn")
+	DirAccess.make_dir_recursive_absolute(dir)
+	# The camera is placed by hand, the rig left still, so nothing eases or follows.
+	rig.set_process(false)
+	rig.set_physics_process(false)
+	var camera: Camera3D = rig.camera
+	camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+	camera.fov = 40.0
+	camera.h_offset = 0.0
+	camera.v_offset = 0.0
+	var centre := avatar.global_position + Vector3(0.0, box.z * 0.45, 0.0)
+	var dist := 1.6 * maxf(maxf(box.x, box.y), box.z) + 1.5
+	var pitch := deg_to_rad(40.0)
+	for i in frames:
+		var yaw := TAU * i / frames
+		var offset := Vector3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch)) * dist
+		camera.global_position = centre + offset
+		camera.look_at(centre, Vector3.UP)
+		for k in (60 if i == 0 else 2):
+			await get_tree().process_frame
+		await RenderingServer.frame_post_draw
+		get_viewport().get_texture().get_image().save_png(dir.path_join("%03d.png" % i))
+	print("review shot %s: %d frames" % [dir, frames])
+
+
+## `--review-fly`: the camera flies between keyframes ({"pos": [x, y, z], "look": [x, y, z], "frames": n}),
+## eased in and out at each, one frame saved per step.
+func _fly(keys: Array) -> void:
+	var dir := out_dir.path_join("fly")
+	DirAccess.make_dir_recursive_absolute(dir)
+	rig.set_process(false)
+	rig.set_physics_process(false)
+	var camera: Camera3D = rig.camera
+	camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+	camera.fov = 45.0
+	camera.h_offset = 0.0
+	camera.v_offset = 0.0
+	var v3 := func(a: Array) -> Vector3: return Vector3(float(a[0]), float(a[1]), float(a[2]))
+	var n := 0
+	for k in range(1, keys.size()):
+		var a: Dictionary = keys[k - 1]
+		var b: Dictionary = keys[k]
+		var frames := int(b["frames"])
+		for i in frames:
+			var t := smoothstep(0.0, 1.0, float(i) / frames)
+			camera.global_position = (v3.call(a["pos"]) as Vector3).lerp(v3.call(b["pos"]), t)
+			camera.look_at((v3.call(a["look"]) as Vector3).lerp(v3.call(b["look"]), t), Vector3.UP)
+			for f in (90 if n == 0 else 2):
+				await get_tree().process_frame
+			await RenderingServer.frame_post_draw
+			get_viewport().get_texture().get_image().save_jpg(dir.path_join("%04d.jpg" % n), 0.95)
+			n += 1
+	print("review shot %s: %d frames" % [dir, n])
 
 
 ## The box's outline on screen, with a margin, inside the image.

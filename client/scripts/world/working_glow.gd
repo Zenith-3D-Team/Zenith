@@ -89,6 +89,8 @@ func _ready() -> void:
 		_lights.append(light)
 
 
+## Forgets the machines shown (main.gd: a new session or another surface), so the old surface's
+## fires don't fade out over the new one.
 func reset() -> void:
 	_shown.clear()
 

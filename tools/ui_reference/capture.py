@@ -27,7 +27,10 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 RUN = HERE / "run"
 MOD = HERE / "f3d-ui-capture"
-DEFAULT_FACTORIO = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Factorio\bin\x64\factorio.exe")
+sys.path.append(str(HERE.parent))
+import factorio_install  # noqa: E402
+
+DEFAULT_FACTORIO = Path(factorio_install.exe())
 STEAM_APP_ID = "427520"
 
 

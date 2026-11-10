@@ -13,9 +13,12 @@ extends Node3D
 ## decorative's first appearance read its pictures from the install there, up to 300 ms): its
 ## instances' transforms are worked out into a MultiMesh buffer and new pictures loaded into an
 ## atlas image (BuildJob, KindData). The main thread then only makes the MultiMeshes and new
-## decoratives' textures, within FINISH_USEC a frame; the chunk's old clutter stays until then.
+## decoratives' textures, within its slice of the frame (frame_budget.gd, `decoratives`); the
+## chunk's old clutter stays until then.
 
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ModFiles := preload("res://scripts/world/mod_files.gd")
+const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const SHADER := preload("res://shaders/decorative.gdshader")
 const SHADER_FLAT := preload("res://shaders/decorative_flat.gdshader")
@@ -45,8 +48,6 @@ const LAYER_LIFT := {"decals": 0.010, "ground-layer-1": 0.016, "ground-layer-2":
 ## same layer overlapping resolve the same way every frame.
 const TILE_STEP := 0.0012
 const TILE_STEPS := 4
-## Main-thread time a frame spends making finished chunks' MultiMeshes (at least one chunk).
-const FINISH_USEC := 3000  # its slice in frame_budget.gd
 ## Floats per instance in a MultiMesh buffer: a 3x4 transform, then the custom data.
 const STRIDE := 16
 
@@ -87,6 +88,8 @@ class BuildJob:
 ## Shared between games: the index, the pictures read from it (null: none) and the decoratives
 ## made from them.
 static var _index := {}
+static var _index_generation := -1  # ModGraphics.generation the index was merged with
+static var _retired: Array = []
 static var _kind_data := {}
 static var _kinds := {}
 static var _flat_order := {}  # flat decorative -> its rank in the drawing order (_flat_priority)
@@ -112,18 +115,30 @@ var _parts := {}  # Vector2i -> {"parts": n, "got": n, "l": flat list}
 var _chunks := {}  # Vector2i -> Node3D holding that chunk's MultiMeshInstance3Ds
 var _lists := {}  # Vector2i -> the chunk's last full list, to rebuild when the density changes
 var _sweep := 0.0
+var _built_generation := 0  # ModGraphics.generation the chunks were built with
 var _shares := {}  # Vector2i -> the share of the chunk's clutter drawn now (1, 0.5, 0.25, 0)
 var _versions := {}  # Vector2i -> the number of the chunk's latest build (older jobs' results are dropped)
+## Builds are numbered on from game to game, so a job still running from before reset() never
+## matches a new build of the same chunk.
+var _last_version := 0
 var _jobs: Array = []  # [task id, BuildJob], oldest first
+## A world left (another surface, a factory building's door): its chunks' nodes, hidden, freed a
+## few a frame. Freeing all of them at once (441 chunks of clutter) made a 35-60 ms frame.
+var _freeing: Array = []
+const FREE_USEC := 1000
 
 
-func reset() -> void:
-	_names.clear()
+## A new game; `keep_names` on another surface of the same game, whose ids stay (the mod sends
+## `dprotos` only in the handshake).
+func reset(keep_names := false) -> void:
+	if not keep_names:
+		_names.clear()
 	_parts.clear()
 	_lists.clear()
 	_versions.clear()
-	for node in _chunks.values():
-		node.queue_free()
+	for node: Node3D in _chunks.values():
+		node.visible = false
+		_freeing.append(node)
 	_chunks.clear()
 
 
@@ -166,6 +181,13 @@ func handle(msg: Dictionary) -> void:
 
 
 func _process(delta: float) -> void:
+	_free_some()
+	if _built_generation != ModGraphics.generation:
+		# A graphics list (mod_graphics.gd): every chunk's clutter is built again from it.
+		_built_generation = ModGraphics.generation
+		index()
+		for c in _lists.keys():
+			_build(c)
 	if _jobs.is_empty():
 		FrameBudget.waiting(&"decoratives", 0)
 	else:
@@ -182,6 +204,22 @@ func _process(delta: float) -> void:
 	for c in _lists.keys():
 		if not world.chunks.has(c):
 			_drop(c)
+
+
+## Frees the left world's nodes within FREE_USEC a frame (at least one).
+func _free_some() -> void:
+	var t0 := Time.get_ticks_usec()
+	while not _freeing.is_empty():
+		var node: Node3D = _freeing.pop_back()
+		if is_instance_valid(node):
+			node.free()
+		if Time.get_ticks_usec() - t0 > FREE_USEC:
+			break
+
+
+## How many of a left world's nodes are still to be freed (tests).
+func freeing_count() -> int:
+	return _freeing.size()
 
 
 ## Shows the chunks near the focus only: one distance per chunk, again whenever the focus has moved
@@ -227,13 +265,19 @@ func _drop(c: Vector2i) -> void:
 ## Rebuilds a chunk's MultiMeshes from its list: [id, x, y, amount, ...], x and y the tile in the
 ## chunk. The work is done on a worker thread (_run_job); an empty list clears the chunk at once.
 func _build(c: Vector2i) -> void:
-	var version := int(_versions.get(c, 0)) + 1
+	_last_version += 1
+	var version := _last_version
 	_versions[c] = version
 	var l: Array = _lists.get(c, [])
 	var data_dir := ItemIcons.factorio_data_dir()
 	if l.is_empty() or data_dir == "":
 		_replace(c, null)
 		return
+	# The mods' folders are found here, on the main thread: found first on the worker, the search
+	# loads paths.gd there while the main thread may be waiting for that worker (finish_jobs,
+	# quitting), and both wait for ever. Once found, this returns at once.
+	ModFiles.prepare()
+	index()  # a new list's index made here, never on a worker (_kind and _flat_priority read it here)
 	var job := BuildJob.new()
 	job.chunk = c
 	job.version = version
@@ -295,8 +339,6 @@ func _replace(c: Vector2i, node: Node3D) -> void:
 		# made the next frame cull all of them, nearly every frame while walking.
 		if _culled_at.is_finite():
 			_cull_one(c, node, _culled_at)
-		else:
-			_culled_at = Vector2.INF
 
 
 ## The chunk's node with a MultiMesh per decorative from a finished job, or null if it has none.
@@ -424,7 +466,7 @@ static func _kind_data_for(name: String, data_dir: String) -> KindData:
 			var pics: Array = []
 			var files := {}  # path -> Image, as a sheet holds several variants
 			for pic in entry.get("pics", []):
-				var image := _region(data_dir, pic, files)
+				var image := _region(pic, files)
 				if image != null:
 					images.append(image)
 					pics.append(pic)
@@ -482,15 +524,15 @@ static func _flat_priority(name: String) -> int:
 
 
 ## [file, x, y, width, height, scale, shift x, shift y] -> that region of the file, or null.
-static func _region(data_dir: String, pic: Array, files: Dictionary) -> Image:
+## The file is Factorio's path ("base/graphics/..." in decoratives.json, "__mod__/graphics/..." in the
+## bridge's list), read through mod_files.gd.
+static func _region(pic: Array, files: Dictionary) -> Image:
 	if pic.size() < 8:
 		return null
-	var path := data_dir.path_join(str(pic[0]))
+	var path := str(pic[0])
 	var image: Image = files.get(path)
 	if image == null:
-		if not FileAccess.file_exists(path):
-			return null
-		image = Image.load_from_file(path)
+		image = ModFiles.load_image(path)
 		if image == null:
 			return null
 		image.convert(Image.FORMAT_RGBA8)
@@ -501,12 +543,31 @@ static func _region(data_dir: String, pic: Array, files: Dictionary) -> Image:
 	return image.get_region(r)
 
 
-## tools/decor_index.py's {name: {layer, box, pics}}; empty if the file is missing.
+## tools/decor_index.py's {name: {layer, box, pics}}, with the bridge's list (mod_graphics.gd: every
+## mod's decoratives) over it; empty without either. A new list drops the pictures read for names
+## it has, and those found missing, so they are read again from it. Made again on the main thread
+## only (_process, _build): workers (_kind_data_for, under the mutex) read the one there is, as the
+## main thread's _kind and _flat_priority read _kinds and _flat_order without it.
 static func index() -> Dictionary:
-	if _index.is_empty() and FileAccess.file_exists(INDEX):
-		var parsed = JSON.parse_string(FileAccess.get_file_as_string(INDEX))
-		if parsed is Dictionary:
-			_index = parsed
+	if _index_generation != ModGraphics.generation and OS.get_thread_caller_id() == OS.get_main_thread_id():
+		_kind_mutex.lock()  # recursive: _kind_data_for asks while holding it
+		_index_generation = ModGraphics.generation
+		var merged := {}
+		if FileAccess.file_exists(INDEX):
+			var parsed = JSON.parse_string(FileAccess.get_file_as_string(INDEX))
+			if parsed is Dictionary:
+				merged = parsed
+		merged.merge(ModGraphics.decor, true)
+		# The pictures read before stay alive (_retired) until the chunks drawn with them are built
+		# again: a freed texture would draw white meanwhile.
+		_retired = [_kind_data.duplicate(), _kinds.duplicate()]
+		for name in _kind_data.keys():
+			if _kind_data[name] == null or ModGraphics.decor.has(name):
+				_kind_data.erase(name)
+				_kinds.erase(name)
+		_flat_order = {}
+		_index = merged
+		_kind_mutex.unlock()
 	return _index
 
 

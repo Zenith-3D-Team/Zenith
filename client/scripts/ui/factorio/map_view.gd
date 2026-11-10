@@ -25,6 +25,7 @@ const MapTagDialog := preload("res://scripts/ui/factorio/map_tag_dialog.gd")
 const MapLayers := preload("res://scripts/ui/factorio/map_layers.gd")
 const UiSettings := preload("res://scripts/ui/ui_settings.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 
@@ -50,16 +51,8 @@ const LAYERS_SHIFT_PX := 128.0
 signal zoom_to_world(at: Vector2)
 ## The "Space map" button under the surface switcher (Space Age).
 signal space_map_requested
-## Add tag / Add ping / a quick tag icon (remote_frame.gd) armed or done.
-signal placing_changed
 ## A surface was picked in the Surfaces panel (its index; 0 the character's).
 signal surface_chosen(si: int)
-
-## The next left click on the map: {"kind": "tag" (with "icon") or "ping"}, or {} for none.
-var placing := {}:
-	set(v):
-		placing = v
-		placing_changed.emit()
 
 var cache: MapCache
 var model
@@ -86,7 +79,6 @@ var following := true
 
 var _hint := Label.new()
 var _dragging := false
-var _press_at := Vector2(-1, -1)
 var _tag_at := Vector2.ZERO  # where the dialog's new tag goes (tiles)
 var _tag_editing := -1  # id of the tag being edited
 var _unghost := {}  # unghost request id -> the screen point right-clicked
@@ -388,14 +380,12 @@ static func _plain_name(name: String) -> Array:
 	return [out if out != "" else name, first]
 
 
-## A planet's icon, or the platform hub's for a platform, from the player's install (or null).
+## A planet's icon (another mod's from the bridge's graphics list), or the platform hub's for a
+## platform (or null).
 static func _surface_icon(planet: String) -> Texture2D:
 	if planet == "":
 		return GuiAssets.data_sprite("space-age/graphics/icons/space-platform-hub.png")
-	var icon := GuiAssets.data_sprite("space-age/graphics/icons/%s.png" % planet)
-	if icon == null:
-		icon = GuiAssets.data_sprite("base/graphics/icons/%s.png" % planet)
-	return icon
+	return SpacePanels.planet_icon(planet)
 
 
 ## Shows another surface's map (its index from model.map_surfaces), centred on its middle, or the
@@ -550,11 +540,6 @@ func _gui_input(event: InputEvent) -> void:
 					zoom_by(1.0 / ZOOM_STEP, mb.position)
 			MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE:
 				_dragging = mb.pressed
-				if mb.button_index == MOUSE_BUTTON_LEFT:
-					if mb.pressed:
-						_press_at = mb.position
-					elif not placing.is_empty() and _press_at.distance_to(mb.position) < Kit.px(6):
-						place_at(mb.position)
 				if mb.pressed and mb.double_click and mb.button_index == MOUSE_BUTTON_LEFT:
 					_dragging = false
 					edit_tag_at(mb.position)
@@ -570,23 +555,6 @@ func _gui_input(event: InputEvent) -> void:
 		_pad_q = -1
 		_redraw = true
 		accept_event()
-
-
-## Carries out Add tag / Add ping at a screen point: the tag dialog there (with the quick icon
-## chosen), or a ping said in the chat as a gps link (Factorio's ping).
-func place_at(p: Vector2) -> void:
-	var what: Dictionary = placing
-	placing = {}
-	if what.get("kind", "") == "ping":
-		var at := screen_to_tiles(p)
-		model.ping(at)
-		model.say("[gps=%d,%d]" % [roundi(at.x), roundi(at.y)])
-		_redraw = true
-	elif what.get("kind", "") == "tag":
-		_tag_editing = -1
-		_tag_at = screen_to_tiles(p)
-		dialog.open_at(p, {})
-		dialog._pick_quietly(str(what.get("icon", "")))
 
 
 ## Opens the tag dialog for the tag under a screen point, or to create one there.

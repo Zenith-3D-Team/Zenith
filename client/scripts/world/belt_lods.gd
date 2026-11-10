@@ -44,15 +44,11 @@ static var _stand_ins := {}
 static var _ready := {}  # stand-in -> true once it has its shape
 static var _queue: Array = []  # [Job, stand-in, source mesh]
 static var _running: Array = []  # [task id, Job, stand-in, source mesh]
-## Goes up whenever stand-ins become ready: chunks that drew a belt without one are built again.
-static var generation := 0
 ## Chunks with belts (chunk_view.gd track/untrack): ChunkView -> true.
 static var _chunks := {}
 static var _dirty := false
 static var _timer := 0.0
 static var _last_view := []
-## Main-thread time spent here (for probes).
-static var main_usec := 0
 
 
 ## The plan a stand-in is made on: "s" straight, "l"/"r" curves, "u" underground ends, "x" splitters.
@@ -65,7 +61,7 @@ static func kind_of(proto_type: String, extra: Dictionary) -> String:
 	return "x"
 
 
-## The stand-in for `mesh`, or null while it is being made (see made()) or when there is none.
+## The stand-in for `mesh`, or null while it is being made (coming()) or when there is none.
 static func stand_in(mesh: Mesh, kind: String) -> ArrayMesh:
 	if not enabled or mesh == null:
 		return null
@@ -75,14 +71,12 @@ static func stand_in(mesh: Mesh, kind: String) -> ArrayMesh:
 			return null
 		_same_materials(out, mesh as ArrayMesh)
 		return out
-	var t0 := Time.get_ticks_usec()
 	var job := _job_for(mesh as ArrayMesh, kind)
 	var out: ArrayMesh = null
 	if job != null:
 		out = ArrayMesh.new()
 		_queue.append([job, out, mesh])
 	_stand_ins[mesh] = out
-	main_usec += Time.get_ticks_usec() - t0
 	return null
 
 
@@ -116,11 +110,9 @@ static func untrack(cv) -> void:
 ## Each frame (far_chunks.gd): finishes stand-ins made on workers, and sets each chunk with belts
 ## flat or full by how big a tile is drawn at its nearest belt.
 static func update(world, cam: Camera3D, delta: float) -> void:
-	var t0 := Time.get_ticks_usec()
 	_poll(world)
 	_timer += delta
 	if cam == null:
-		main_usec += Time.get_ticks_usec() - t0
 		return
 	var vp := cam.get_viewport()
 	var size := vp.get_visible_rect().size if vp != null else Vector2(1920, 1080)
@@ -129,7 +121,6 @@ static func update(world, cam: Camera3D, delta: float) -> void:
 		scale = vp.scaling_3d_scale
 	var view := [cam.global_transform, cam.projection, cam.fov, cam.size, size, scale, enabled]
 	if not _dirty and _timer < CHECK_INTERVAL and view == _last_view:
-		main_usec += Time.get_ticks_usec() - t0
 		return
 	_timer = 0.0
 	_dirty = false
@@ -147,7 +138,6 @@ static func update(world, cam: Camera3D, delta: float) -> void:
 		elif px < FLAT_BELOW:
 			flat = true
 		cv.set_belt_flat(flat)
-	main_usec += Time.get_ticks_usec() - t0
 
 
 ## How many pixels tall one tile is drawn at the nearest point of `box`: `pixels` is the window's
@@ -174,7 +164,6 @@ static func _poll(world) -> void:
 		_running.append([WorkerThreadPool.add_task((next[0] as Job).run, false, "belt stand-in"), next[0], next[1], next[2]])
 	if not done:
 		return
-	generation += 1
 	if world == null:
 		return
 	for cv in _chunks.keys():
@@ -194,7 +183,6 @@ static func finish_all() -> void:
 		while _running.size() < JOBS and not _queue.is_empty():
 			var next: Array = _queue.pop_front()
 			_running.append([WorkerThreadPool.add_task((next[0] as Job).run, false, "belt stand-in"), next[0], next[1], next[2]])
-	generation += 1
 
 
 static func _commit(job: Job, out: ArrayMesh, mesh: ArrayMesh) -> void:
@@ -209,10 +197,6 @@ static func _commit(job: Job, out: ArrayMesh, mesh: ArrayMesh) -> void:
 	out.set_meta(&"f3d_from", from)
 	out.resource_name = mesh.resource_name + " (far)"
 	_ready[out] = true
-
-
-static func is_ready(out: ArrayMesh) -> bool:
-	return _ready.has(out)
 
 
 ## The job for a model, made from its arrays on the CPU (null: none kept, or bones).
@@ -379,7 +363,7 @@ class Job:
 
 	## A cell's [height, surface, row]: what is on top at nine points inside it, by majority; its
 	## height their median (the belt surface's highest, so items sit on it as on the full model).
-	## Null when most of them hit nothing.
+	## Null when fewer than four of the nine hit something.
 	func _sample_cell(p00: Vector2, p10: Vector2, p11: Vector2, p01: Vector2) -> Variant:
 		var hits: Array = []
 		for u: float in [1.0 / 6.0, 0.5, 5.0 / 6.0]:

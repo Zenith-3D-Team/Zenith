@@ -45,12 +45,9 @@ func movers(types: Array = []) -> Array:
 	var wanted: Array = types if not types.is_empty() else _all_types(layer)
 	for type in wanted:
 		for pair in layer.units_of_type(str(type)):
-			var unit := int(pair[0])
-			var node: Node3D = pair[1]
-			if node == null:
-				continue
-			out.append({"unit": unit, "type": str(type), "name": layer.proto_name_of(unit),
-				"position": node.position, "forward": _forward(node)})
+			var entry := _mover_entry(layer, int(pair[0]), str(type))
+			if not entry.is_empty():
+				out.append(entry)
 	return out
 
 
@@ -59,13 +56,20 @@ func mover(unit: int) -> Dictionary:
 	var layer = _host.game_node("movers")
 	if layer == null:
 		return {}
-	var node: Node3D = layer.node_of(unit)
-	if node == null:
+	var proto = layer.protos.entities_by_name.get(layer.proto_name_of(unit)) if layer.get("protos") != null else null
+	return _mover_entry(layer, unit, str(proto.type) if proto != null else "")
+
+
+## A mover where it is drawn now. Robots and walking creatures are drawn by the GPU from a record
+## (mover_records.gd) and their node stays where they first appeared, so the place and facing come
+## from movers.gd's position_of and yaw_of, not the node.
+func _mover_entry(layer, unit: int, type: String) -> Dictionary:
+	var at = layer.position_of(unit)
+	if not at is Vector3:
 		return {}
-	var name: String = layer.proto_name_of(unit)
-	var proto = layer.protos.entities_by_name.get(name) if layer.get("protos") != null else null
-	return {"unit": unit, "type": str(proto.type) if proto != null else "", "name": name,
-		"position": node.position, "forward": _forward(node)}
+	var yaw: float = layer.yaw_of(unit)
+	return {"unit": unit, "type": type, "name": layer.proto_name_of(unit), "position": at,
+		"forward": Vector3(-sin(yaw), 0.0, -cos(yaw))}
 
 
 ## Trains with a carriage near the focus (sent about every half second):

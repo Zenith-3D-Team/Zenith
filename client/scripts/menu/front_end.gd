@@ -21,6 +21,7 @@ extends CanvasLayer
 ##   --menu-connect=<host:port>   connect as Connect to address would (the mock server, a running bridge)
 ##   --menu-host=<save name>[:<port>]   host that save on the network, as Multiplayer → Host would
 ##   --menu-preview   the map generator (--menu=new) asks Factorio for its preview at once
+##   --menu-esc-after=<s>   once in the game that long, open the Esc menu (screenshots)
 ##   --menu-save-after=<s>   once in the game that long, save as the Esc menu's Save game does
 ##   --menu-save-as=<name>   ... with Save as under that name instead
 ##   --menu-exit-after=<s>   once in the game that long, exit to the menu (saving)
@@ -33,6 +34,7 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const SettingsWindow := preload("res://scripts/menu/settings_window.gd")
 const Saves := preload("res://scripts/menu/saves.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
+const BugReport := preload("res://scripts/menu/bug_report.gd")
 const ServerLauncher := preload("res://scripts/menu/server_launcher.gd")
 const MenuBackground := preload("res://scripts/menu/menu_background.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
@@ -83,6 +85,7 @@ var _worlds_dir := {}
 var _selected := -1
 var _exit_after := -1.0
 var _save_after := -1.0
+var _esc_after := -1.0
 var _quit_after_exit := false
 var _played_seconds := 0.0
 ## The saves page's purpose: "load" (play it here) or "host" (open it to the network).
@@ -90,6 +93,7 @@ var _worlds_mode := "load"
 
 
 func _ready() -> void:
+	GameSwap.write_launch_info()
 	layer = 20
 	name = "FrontEnd"
 	launcher.name = "ServerLauncher"
@@ -107,6 +111,8 @@ func _ready() -> void:
 	if exit_after != "":
 		_exit_after = float(exit_after)
 	_quit_after_exit = Settings.has_arg("--menu-quit-after-exit")
+	if Settings.arg_value("--menu-esc-after=") != "":
+		_esc_after = float(Settings.arg_value("--menu-esc-after="))
 	if Settings.arg_value("--menu-save-after=") != "":
 		_save_after = float(Settings.arg_value("--menu-save-after="))
 
@@ -193,6 +199,11 @@ func _process(delta: float) -> void:
 				_server_died()
 				return
 			_played_seconds += delta
+			if main != null and main.hud != null and not main.hud.ui.show_factorio.is_valid():
+				main.hud.ui.show_factorio = _show_factorio
+			if _esc_after >= 0.0 and _played_seconds >= _esc_after:
+				_esc_after = -1.0
+				_toggle_esc_menu()
 			if _save_after >= 0.0 and _played_seconds >= _save_after:
 				_save_after = -1.0
 				print("menu: --menu-save-after reached, saving")
@@ -206,12 +217,18 @@ func _process(delta: float) -> void:
 				_exit_to_menu(true)
 
 
+## Ctrl+F9 ("Show in Factorio"), or the Factorio button at the HUD's top left: the same game in
+## Factorio's own window, started joined to the menu's server if it isn't open.
+func _show_factorio() -> void:
+	var said := GameSwap.show_factorio(launcher.game_port if session == "launched" and launcher.is_running() else 0)
+	if said != "" and main != null and main.hud != null:
+		main.hud.show_message(said)
+
+
 func _unhandled_input(event: InputEvent) -> void:
 	var key := event as InputEventKey
 	if key != null and key.pressed and not key.echo and state == State.PLAYING and Controls.pressed(event, "show_factorio"):
-		var said := GameSwap.show_factorio(launcher.game_port if session == "launched" and launcher.is_running() else 0)
-		if said != "" and main != null and main.hud != null:
-			main.hud.show_message(said)
+		_show_factorio()
 		get_viewport().set_input_as_handled()
 		return
 	if key == null or not key.pressed or key.echo or key.physical_keycode != KEY_ESCAPE:
@@ -360,6 +377,7 @@ func _show_main_menu(sub := "") -> void:
 			add.call("Settings", func() -> void: _show_settings(""))
 			add.call("Mods", _show_mods, "The mods the server plays with")
 			add.call("Add-ons", func() -> void: _show_addons(""), "Zenith's add-ons: switch them on and off, their settings and keys")
+			add.call("Report a bug", _report_bug, BUG_TIP)
 			add.call("About", _show_about)
 			add.call("Exit", func() -> void: _quit(true))
 
@@ -951,6 +969,17 @@ func _show_message(title: String, text: String) -> void:
 	print("menu: %s: %s" % [title, text.replace("\n", " | ")])
 
 
+const BUG_TIP := "Opens GitHub's bug report page and a zip of Zenith's recent logs to add to it"
+
+
+## Report a bug: what it will open first, then the logs' zip, GitHub's page and the zip's folder
+## (bug_report.gd).
+func _report_bug() -> void:
+	_show_confirm("Report a bug",
+		"Zenith packs its recent logs (and the server's) into one zip, then opens GitHub's bug report page in your browser and the folder with the zip. Drag the zip into the report. A GitHub account is needed to post it. The logs may show your user name in file paths.",
+		"Open", func() -> void: BugReport.open())
+
+
 func _show_confirm(title: String, text: String, confirm_text: String, on_confirm: Callable, danger := false) -> void:
 	var o := MenuKit.overlay(0.35)
 	var parts := MenuKit.window(title)
@@ -1251,6 +1280,11 @@ func _toggle_esc_menu() -> void:
 	addon_button.tooltip_text = "Zenith's add-ons: their settings and keys"
 	_on(addon_button, func() -> void: _show_addons(""))
 	buttons.add_child(addon_button)
+	var bug := MenuKit.menu_button("Report a bug")
+	bug.name = "ReportABug"
+	bug.tooltip_text = BUG_TIP
+	_on(bug, _report_bug)
+	buttons.add_child(bug)
 	var players := MenuKit.menu_button("Players")
 	players.name = "Players"
 	var show_players := func() -> void:

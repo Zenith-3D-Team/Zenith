@@ -5,12 +5,14 @@ extends Node3D
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Anim := preload("res://scripts/world/anim.gd")
 const TerrainMesher := preload("res://scripts/world/terrain_mesher.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const FarChunks := preload("res://scripts/world/far_chunks.gd")
 const BeltLods := preload("res://scripts/world/belt_lods.gd")
+const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 
 const SIZE := 32
 ## Entity types whose models get a per-entity random turn and size (see _model_transform).
@@ -27,7 +29,8 @@ var drawn_msec := 0
 var entities := {}  # key -> WorldMirror.Rec
 var alt := {}  # key -> WorldMirror.Rec: those with an Alt-mode icon (extra.ai, issue #9)
 ## world.gd pick()'s index of `entities` by PICK_CELL square: built when first needed, emptied
-## whenever an entity comes or goes. [protos count it was built with, {cell: [[rec, rect, area]]}]
+## whenever an entity comes or goes. [protos count it was built with, {cell: [[rec, rect, area]]}];
+## while being built a slice a frame, [protos count, grid so far, the records, the next one].
 var pick_grid: Array = []
 ## The snapshot being received: how many `ents` parts its header announced (-1 before any
 ## header), and which have arrived.
@@ -82,12 +85,14 @@ var _shadows := {}
 var pending: Array = []
 ## Shadow stand-ins not made yet: only chunks with some redo their shadows when more are ready.
 var _unready := 0
-## What chunks did this frame, for --stutter-probe (which empties it): {name: count}.
+## What chunks did this frame, for --stutter-probe (which empties it; kept only while it runs):
+## {name: count}.
 static var counters := {}
 
 
 static func count(key: String, n := 1) -> void:
-	counters[key] = int(counters.get(key, 0)) + n
+	if Probing.on:
+		counters[key] = int(counters.get(key, 0)) + n
 
 
 func set_tiles_rle(rle: Array) -> void:
@@ -162,6 +167,23 @@ func apply_terrain(job: TerrainMesher) -> void:
 	_terrain.mesh = mesh
 	if drawn_msec == 0:
 		drawn_msec = Time.get_ticks_msec()
+
+
+## A terrain mesh kept from an earlier build of the same ground (world.gd's terrain cache): shared,
+## not copied; nothing changes a mesh once it is drawn.
+func apply_kept_terrain(mesh: ArrayMesh, kept_slots: PackedInt32Array) -> void:
+	slots = kept_slots
+	if _terrain == null:
+		_terrain = MeshInstance3D.new()
+		_terrain.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		add_child(_terrain)
+	_terrain.mesh = mesh
+	if drawn_msec == 0:
+		drawn_msec = Time.get_ticks_msec()
+
+
+func terrain_mesh() -> ArrayMesh:
+	return _terrain.mesh as ArrayMesh if _terrain != null else null
 
 
 func clear_terrain() -> void:
@@ -251,14 +273,6 @@ static func _cast(on: bool) -> GeometryInstance3D.ShadowCastingSetting:
 	return GeometryInstance3D.SHADOW_CASTING_SETTING_ON if on else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
 
-## Instances whose shadows the stand-ins draw now (for tests and the perf probe).
-func proxy_count() -> int:
-	var n := 0
-	for pair in _shadow_pairs:
-		if (pair[1] as MultiMeshInstance3D).visible:
-			n += 1
-	return n
-
 
 ## Whether there's ground to see, or the chunk has none (not generated on the server).
 func has_ground() -> bool:
@@ -266,7 +280,7 @@ func has_ground() -> bool:
 
 
 ## How many new MultiMeshes the chunks built in one frame may still add, counted in their meshes'
-## surfaces (world.gd makes one a frame and hands it to each chunk it builds). Godot takes on a
+## surfaces (world.gd refills one each frame and hands it to each chunk it builds). Godot takes on a
 ## MultiMesh that starts being drawn at about 0.1 ms of the renderer's time, outside any script,
 ## and a busy chunk has 60-150 of them: several chunks arriving in one frame made 40-90 ms frames
 ## while walking on a big base. What doesn't fit waits in `pending` for the next frames.
@@ -312,6 +326,8 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 	var box_colors: Array[Color] = []
 	var cones: Array[Transform3D] = []
 	var cone_colors: Array[Color] = []
+	var cards := {}  # sprite stand-in Mesh -> Array of Transform3D
+	var card_colors := {}  # sprite stand-in Mesh -> Array of Color (running, phase)
 	var merged := FarChunks.skips(self)
 	_belt_models.clear()
 	belt_waiting = false
@@ -363,10 +379,26 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 				if _add_cargo_pieces(rec, by_model[mesh][-1], by_model, recs_by_model, parts_by_model):
 					waiting_models = true
 			continue
+		# No model: the entity's own picture from the bridge's list (a mod's building), else a box.
+		var card := SpriteStandins.card(proto.name, rec.dir, proto.size(), proto.type) if proto.type != "resource" else null
+		if card == null and SpriteStandins.coming(proto.name, rec.dir):
+			waiting_models = true  # drawn once its picture is composed, not as a box first
+			continue
+		if card == null and proto.type != "resource" and SpriteStandins.in_use():
+			continue  # with a graphics list, no boxes or cones: only pictures (owner's choice)
 		placeholder_keys[rec.key] = true
 		var height := Visuals.height_for(proto)
 		if proto.type == "resource":
 			height = Visuals.resource_height(int(rec.extra.get("a", 1000)))
+		if card != null:
+			if not cards.has(card):
+				cards[card] = []
+				card_colors[card] = []
+			cards[card].append(SpriteStandins.transform(rec.pos))
+			# Animated while the machine works (or always, for what isn't a machine); trees stay still.
+			var running: bool = not VARIED_TYPES.has(proto.type) and (int(working.get(rec.unit, 0)) == 1 or not SpriteStandins.WORKING_TYPES.has(proto.type))
+			card_colors[card].append(SpriteStandins.instance_color(running, rec.pos))
+			continue  # the picture alone: it casts its own shadow (a box under it read as a slab)
 		var color := ModelLibrary.NEUTRAL_COLOR if ModelLibrary.NEUTRAL_PROTOS.has(proto.name) else proto.color
 		if working.get(rec.unit, 0) == 1:
 			color = color.lightened(0.35)
@@ -400,6 +432,8 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 	else:
 		belt_bounds = AABB(Vector3(belt_lo.x - 1.0, 0.0, belt_lo.y - 1.0), Vector3(belt_hi.x - belt_lo.x + 2.0, 1.0, belt_hi.y - belt_lo.y + 2.0))
 		BeltLods.track(self)
+	for card in cards:
+		wants.append(_want(["card", card], card, cards[card], card_colors[card], null, false, [], null, false))
 	if not boxes.is_empty():
 		wants.append(_want("box", Visuals.box_mesh(), boxes, box_colors, Visuals.instance_material(), false, [], null, false))
 	if not cones.is_empty():

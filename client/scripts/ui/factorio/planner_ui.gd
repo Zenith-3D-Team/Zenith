@@ -286,6 +286,14 @@ func held_step(protos, dir: int) -> Vector2i:
 
 ## The held blueprint's (or book's active page's) entities for the cursor's ghosts, like the
 ## clipboard's: [{"p": proto id, "at": offset from the middle (tiles), "d"}, ...], at most 400.
+## A blueprint entity's direction (16-way). Rolling stock has an orientation instead (0-1,
+## clockwise from north), so without this every train in a blueprint faced north (issue #13).
+static func entity_direction(e: Dictionary) -> int:
+	if e.has("orientation") and not e.has("direction"):
+		return posmod(roundi(float(e["orientation"]) * 16.0), 16)
+	return int(e.get("direction", 0))
+
+
 func held_preview(protos) -> Array:
 	var bp := held_blueprint()
 	if bp.is_empty():
@@ -309,7 +317,7 @@ func held_preview(protos) -> Array:
 		if proto == null:
 			continue
 		var at := Vector2(float(e["position"].get("x", 0)), float(e["position"].get("y", 0)))
-		_preview.append({"p": proto.id, "at": at - mid, "d": int(e.get("direction", 0))})
+		_preview.append({"p": proto.id, "at": at - mid, "d": entity_direction(e)})
 		if _preview.size() >= 400:
 			break
 	return _preview

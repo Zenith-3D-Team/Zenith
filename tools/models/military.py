@@ -33,11 +33,6 @@ def octagon(r, turn=22.5):
     return [(r * math.cos(math.radians(turn + 45 * i)), r * math.sin(math.radians(turn + 45 * i))) for i in range(8)]
 
 
-def ring_of(n, r, start=0.0):
-    return [(r * math.cos(math.radians(start + 360.0 * i / n)), r * math.sin(math.radians(start + 360.0 * i / n)))
-            for i in range(n)]
-
-
 # ---------------------------------------------------------------------------------------------
 # Turrets.
 

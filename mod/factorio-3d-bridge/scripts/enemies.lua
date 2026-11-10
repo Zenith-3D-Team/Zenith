@@ -3,7 +3,8 @@
 -- `distraction_command`, or its own command), and worms with a `shooting_target`. The list goes
 -- out a few times a second; the client lets an attack lapse when it stops being listed.
 --
--- Read-only: nothing here touches `storage`, so it is safe in multiplayer.
+-- Nothing in the game is changed. What this keeps in `storage` (rate.lua's schedule, the budget's
+-- learned cost) is written only in on_tick from what the game has, so it is safe in multiplayer.
 
 local transport = require("scripts.transport")
 local world = require("scripts.world")
@@ -67,10 +68,13 @@ end
 
 local function collect(surface, f, r)
   local flat, n = {}, 0
-  local found = map.view_only(surface.find_entities_filtered({
+  local all = surface.find_entities_filtered({
     area = { { f.x - r, f.y - r }, { f.x + r, f.y + r } },
     type = { "unit", "turret" },
-  }))
+  })
+  -- What was read is counted before the remote view's filter: the count goes into storage (the
+  -- learnt cost, rate.read), and the filter's radar coverage is a cache that can differ between peers.
+  local found = map.view_only(all)
   for _, e in pairs(found) do
     local unit = e.unit_number
     local t
@@ -93,7 +97,7 @@ local function collect(surface, f, r)
       end
     end
   end
-  return flat
+  return flat, #all
 end
 
 function M.tick()
@@ -102,9 +106,11 @@ function M.tick()
   end
   local f = storage.f3d.focus
   if f.r <= 0 then
+    rate.read("en", 0)
     return
   end
-  local flat = collect(world.surface(), f, f.r)
+  local flat, read = collect(world.surface(), f, f.r)
+  rate.read("en", read)
   if #flat > 0 then
     transport.send_now({ t = "en", l = flat })
   end

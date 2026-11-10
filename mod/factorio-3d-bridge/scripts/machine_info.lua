@@ -5,6 +5,8 @@
 -- Read-only except for set_chest_logistics. Every read is guarded: what a version or entity lacks
 -- is left out.
 
+local entity_ui = require("scripts.entity_ui")
+
 local M = {}
 
 local function try(fn)
@@ -65,28 +67,6 @@ local function previous_recipe(e)
   end
   local name = name_of(prev.name) or name_of(prev)
   return name and try(function() return e.force.recipes[name] end) or nil
-end
-
--- How much of the burning fuel item is left, in thousandths; nil without a burner.
-local function burner_left(e)
-  local burner = try(function() return e.burner end)
-  if not burner then
-    return nil
-  end
-  local burning = try(function() return burner.currently_burning end)
-  if not burning then
-    return 0
-  end
-  local proto = try(function() return burning.name end) or burning
-  local value = try(function() return proto.fuel_value end)
-  if type(value) ~= "number" then
-    value = try(function() return prototypes.item[proto].fuel_value end)
-  end
-  local left = try(function() return burner.remaining_burning_fuel end) or 0
-  if type(value) ~= "number" or value <= 0 then
-    return 0
-  end
-  return thousandths(left / value)
 end
 
 local function drill_fields(msg, e)
@@ -232,7 +212,9 @@ function M.fill(msg, e, kind, space, with_lists)
   if e.type == "mining-drill" then
     drill_fields(msg, e)
   end
-  msg.bn = burner_left(e)
+  -- The burning fuel left: the same value as entity_ui's `bu`, under the name the production
+  -- windows read.
+  msg.bn = try(function() return entity_ui.burner_left(e) end)
   local temperature = try(function() return e.temperature end)
   if type(temperature) == "number" then
     msg.tc = math.floor(temperature * 100 + 0.5)

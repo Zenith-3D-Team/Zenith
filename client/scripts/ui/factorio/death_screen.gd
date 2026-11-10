@@ -79,10 +79,6 @@ func alive() -> void:
 		died_at = null
 
 
-func is_dead() -> bool:
-	return visible
-
-
 func _process(delta: float) -> void:
 	if not visible:
 		return

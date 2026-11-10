@@ -20,7 +20,7 @@ local STATUS_ONLY = {
   accumulator = true, radar = true, lamp = true, pump = true, ["offshore-pump"] = true, ["storage-tank"] = true,
   ["programmable-speaker"] = true, ["electric-energy-interface"] = true, ["heat-interface"] = true,
   beacon = true, ["agricultural-tower"] = true, ["asteroid-collector"] = true, ["cargo-landing-pad"] = true,
-  ["space-platform-hub"] = true, ["cargo-bay"] = true,
+  ["space-platform-hub"] = true,
   ["rail-signal"] = true, ["rail-chain-signal"] = true,
   -- 2.1.23 opens these too, unwired (tools/ui_reference rules_openable): their fluid, heat or status.
   pipe = true, ["pipe-to-ground"] = true, ["heat-pipe"] = true, ["land-mine"] = true, ["transport-belt"] = true,

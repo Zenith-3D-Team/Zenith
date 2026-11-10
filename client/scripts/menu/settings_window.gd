@@ -15,6 +15,8 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
+const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const GameSwap := preload("res://scripts/menu/game_swap.gd")
 const UiSettings := preload("res://scripts/ui/ui_settings.gd")
 const ColorFilter := preload("res://scripts/menu/color_filter.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
@@ -41,6 +43,7 @@ const MOD_SETTINGS := [
 	["f3d-detail-interval", "Detail update interval (ticks)", "int", 6, 1, 60],
 	["f3d-starter-kit", "Starter kit for the bridge's character", "bool", true],
 	["f3d-player", "Player to play as", "string", ""],
+	["f3d-act-as-player", "Act as the player for other mods", "bool", true],
 ]
 
 var in_game := false
@@ -328,25 +331,39 @@ func _graphics() -> void:
 		return "%d tiles" % int(v), false, false, "moving things and machine states|Vehicles, trains, robots, enemies and working machines are drawn this far round the character. The server can cap it (its Max live-update radius).")
 	_slider(grid, "Belt item distance", "graphics", "belt_distance", 0, 640, 32, func(v: float) -> String:
 		return "Off" if int(v) == 0 else "%d tiles" % int(v), false, false,
-		"how far items on belts show|Items on belts are drawn this far: moving near the character (as many as Belt updates allows), and past that each lane as icons of what it carries.")
-	_dropdown(grid, "Belt updates", "graphics", "belt_updates",
-		[["1,000 items", 1000], ["2,000 items", 2000], ["4,000 items", 4000], ["6,000 items", 6000], ["12,000 items", 12000],
+		"how far items on belts show|Items on belts are drawn this far: moving near the character (as many as Moving belt items allows), and past that standing still on their lanes.")
+	_dropdown(grid, "Moving belt items", "graphics", "belt_updates",
+		[["Automatic", -1], ["1,000 items", 1000], ["2,000 items", 2000], ["4,000 items", 4000], ["6,000 items", 6000], ["12,000 items", 12000],
 		["24,000 items", 24000], ["Unlimited", 0]],
-		"how many belt items move|The most items on belts the server sends moving each update, counted from the character outwards (empty belts count a little too). Unlimited moves every item within the Belt item distance, which costs the server most on a busy base.")
-	_check(grid, "Smooth belt items", "graphics", "belt_smooth",
-		"items follow curves smoothly|On: items on belts update five times a second and follow curves. Off: on a busy base the server reads them a little each tick and they update less often, which is lighter for the server.")
+		"how many belt items move|The most items on belts the server sends moving each update, counted from the character outwards (empty belts count a little too); further out they stand still on their lanes. Automatic raises and lowers it by itself as there is room: frames ending in time and the game at 60 UPS let more items move. Unlimited moves every item within the Belt item distance, which costs the server most on a busy base.")
+	# Smooth belt items (belt_smooth) and item icons (item_icons) are no longer shown (owner: too
+	# many belt settings): both stay on; Hold 60 UPS still eases belt_smooth off under load.
 	_check(grid, "Hold the game at 60 UPS", "graphics", "hold_ups",
 		"eases off when the game slows|While the game runs under 60 UPS, the bridge's updates, the distances above, the minimap's refreshes and then the frame rate go lower for a while (the F4 line says what). Your settings stay as they are.")
-	_check(grid, "Show all smoke and particles", "graphics", "effects", "smoke, dust, flashes, explosions, corpses")
-	_dropdown(grid, "Items on belts", "graphics", "item_models", [["3D models", true], ["Icons", false]], "also on the ground and in hands|The same look for items on the ground and in inserter hands. Items without a model show their icon.")
+	_check(grid, "Show all smoke and particles", "graphics", "effects", "smoke, dust, flashes, explosions")
+	_slider(grid, "Items in 3D", "graphics", "item_models_max", 0, Settings.ITEM_MODELS_ALL, 500, func(v: float) -> String:
+		if int(v) <= 0:
+			return "Icons only"
+		return "All" if int(v) >= Settings.ITEM_MODELS_ALL else "%d" % int(v), false, false,
+		"nearest first, the rest as icons|How many items on belts are drawn as 3D models, nearest the character first; the rest show their icon. All draws every item as a model, far belts too. Icons only draws them all as Factorio's icons, on the ground and in hands too. Fewer models draw faster on a busy base.")
 	_check(grid, "Clouds", "graphics", "clouds", "clouds, their shadows and haze")
 	_check(grid, "Decoratives", "graphics", "decoratives", "grass, flowers and small rocks|Grass, flowers and small rocks on the ground, from Factorio's own pictures.")
 	_slider(grid, "Decorative density", "graphics", "decorative_density", 0.1, 1.0, 0.05, func(v: float) -> String: return "%d%%" % roundi(v * 100.0))
 	_slider(grid, "Decorative distance", "graphics", "decorative_distance", 64, 320, 16, func(v: float) -> String:
 		return "%d tiles" % int(v), false, false, "thinner further out|Full detail to 80 tiles, then half and a quarter further out.")
-	_check(grid, "Item icons on belts and the ground", "graphics", "item_icons", "Factorio's icons, or coloured blocks|Off draws coloured blocks instead. Applies from the next connection.")
 	_dropdown(grid, "Model look", "graphics", "model_look", [["Factorio colours", "colours"],
 		["Factorio sprite projected", "sprite"]], "colours, or the sprite painted on|Each part in its colour from the game's sprite, or the sprite projected onto the model. After a restart.")
+	var open_models := MenuKit.button("Open folder")
+	open_models.name = "graphics-open-models"
+	var on_open := func() -> void:
+		Sfx.play_ui("gui-click")
+		var dir := ModelLibrary.custom_models_dir()
+		DirAccess.make_dir_recursive_absolute(dir)
+		OS.shell_open(dir)
+	open_models.pressed.connect(on_open)
+	var in_use := ("%d in use" % ModelLibrary.external_count) if ModelLibrary.external_count > 0 else "none"
+	_row(grid, "Your models", open_models,
+		"%s|A .glb in Zenith's models folder replaces Zenith's own model of the same name (transport-belt.glb, inserter-east.glb...), at the next start. Empty, Zenith uses its own. The guide for modellers (MODELLERS.md) has every name." % in_use)
 
 	_heading("Advanced")
 	grid = _grid()
@@ -359,7 +376,9 @@ func _graphics() -> void:
 	_dropdown(grid, "Level of detail", "graphics", "lod_quality", [["Low", "low"], ["Medium", "medium"], ["High", "high"]],
 		"simpler models far away|How soon models far away, and their shadows, are drawn simpler. Those near you stay whole.")
 	_check(grid, "Merge far buildings", "graphics", "merge_far",
-		"far chunks as one mesh|Past about four chunks from the camera, each chunk's buildings are drawn as one simplified mesh, still and without their own shadows: far fewer draws at long view distances.")
+		"far chunks as one mesh|Past about four chunks from the camera (or the shadow distance, if further) and away from your character, each chunk's buildings are drawn as one simplified, still mesh, which casts their shadows too: far fewer draws at long view distances. Trees, ore and nests keep their own.")
+	_check(grid, "Animate modded buildings", "graphics", "animate_mod_buildings",
+		"mods' machines move|A mod's building without a Zenith model is drawn with its own Factorio picture; on, its moving part runs while it works (16 frames of its loop, at most a few MB each, only for those in view). Off: still pictures, less memory.")
 	_check(grid, "Merged materials (may help when CPU-bound)", "graphics", "merged_materials",
 		"less CPU, a little more GPU|Each model drawn as one surface with one material: fewer draws and less CPU for the renderer, a little more GPU time. After a restart.")
 	_check(grid, "Ambient occlusion (WIP, high GPU cost)", "graphics", "ssao",
@@ -416,6 +435,19 @@ func _sound() -> void:
 
 func _controls() -> void:
 	_note("Click a binding, then press the key (with Shift, Ctrl or Alt if you like). Right click clears it, Esc cancels. Bindings that clash are red.")
+	# Issue #14: the keys changed in Factorio's own controls are the defaults here.
+	var top := _grid()
+	var use := MenuKit.checkbox("", bool(Settings.get_value("factorio", "use_factorio_keys")))
+	use.name = "factorio-use_factorio_keys"
+	use.toggled.connect(func(on: bool) -> void:
+		Sfx.play_ui("gui-checkbox-click")
+		Settings.set_value("factorio", "use_factorio_keys", on)
+		Settings.reload_factorio_keys()
+		_open_tab.call_deferred(_tab))
+	var found: String = load("res://scripts/player/factorio_keys.gd").config_path()
+	var changed := Settings.factorio_keys.size()
+	var where := ("%d changed there, from %s" % [changed, found]) if found != "" else "Factorio's config.ini wasn't found"
+	_row(top, "Use the keys set in Factorio", use, "Factorio's Settings > Controls; %s|The keys you changed in Factorio's own controls are the defaults here, so Factorio and Zenith answer the same keys. A binding changed on this page still wins; Default puts Factorio's back. Read when Zenith starts and when this is switched: %s" % [where, where])
 	var by_group := {}
 	for action in Settings.bindable_actions():
 		var group := ControlsInfo.group_of(action)
@@ -526,6 +558,8 @@ func _interface() -> void:
 	grid = _grid()
 	_slider(grid, "Tooltip delay", "interface", "tooltip_delay", 0.0, 2.0, 0.05, func(v: float) -> String: return "%d ms" % roundi(v * 1000.0))
 	_check(grid, "Entity tooltip on the side", "interface", "entity_info", "the panel for what the mouse is over, on the right")
+	_check(grid, "Show mods' windows (experimental)", "interface", "mod_windows", "off: use them in Factorio (Ctrl+F9)|Mods' windows (Informatron, Factory Planner...) drawn in Zenith from your Factorio, live. Experimental: their layout and buttons don't match Factorio's yet, so for now they are off and Ctrl+F9 (or the Factorio button at the top left) is the way to use them.")
+	_check(grid, "Click mods' buttons in Factorio", "interface", "mod_clicks", "pressing a mod's button clicks it in your own Factorio window (hybrid)|A mod hears only clicks made in Factorio itself. With this on, pressing a mod's button in Zenith brings Factorio to the front for a moment, clicks the button there and comes back to Zenith (a minimised Factorio is minimised again). Needs Factorio's window on this PC: hybrid single-player, or joined to the server as yourself. Off: the button says to use it in Factorio (Ctrl+F9).")
 
 	_heading("Other")
 	grid = _grid()
@@ -545,7 +579,7 @@ func _interface() -> void:
 	grid = _grid()
 	for layer in UiSettings.MAP_LAYERS:
 		_ui_check(grid, layer[1], layer[0])
-	_note("The map view's switches are also on the map itself (M), and apply to the minimap too.")
+	_note("The map view's switches are also on the map itself (M). The minimap, as Factorio's, shows none of them.")
 
 
 func _other() -> void:
@@ -558,6 +592,18 @@ func _other() -> void:
 	_slider(grid, "Autosave slots", "factorio", "autosave_slots", 1, 20, 1, func(v: float) -> String: return "%d" % int(v))
 	_check(grid, "Verbose logging", "factorio", "verbose_logging", "the server's factorio-current.log")
 	_note("These go into the server-settings.json the menu writes in the server's data folder when it starts a server, and apply from the next start.")
+	_heading("Switching with Factorio (Ctrl+F9)")
+	var swap := _grid()
+	_check(swap, "Minimise Factorio in Zenith", "factorio", "minimize_factorio", "spares its drawing while Zenith shows the game")
+	var copy := MenuKit.button("Copy launch options")
+	copy.name = "factorio-copy-launch"
+	var on_copy := func() -> void:
+		Sfx.play_ui("gui-click")
+		DisplayServer.clipboard_set(launch_options())
+		copy.text = "Copied"
+	copy.pressed.connect(on_copy)
+	_row(swap, "Start Zenith from Factorio", copy,
+		"for Factorio's launch options in Steam|Ctrl+F9 in Factorio starts Zenith only when Factorio was started through Zenith's launcher. Paste this in Steam: Factorio > Properties > Launch options, in place of what is there, and restart Factorio. It opens the bridge's UDP port too, and it is the same line on every PC: Zenith keeps the launcher in Windows' ProgramData folder (its Zenith folder) and updates it each time it starts.")
 
 
 func _mod_settings() -> void:
@@ -656,11 +702,11 @@ func _factorio() -> void:
 	show.call()
 	exe.text_submitted.connect(func(_t: String) -> void: show.call())
 	exe.focus_exited.connect(show)
-	var data := MenuKit.textbox(str(Settings.get_value("factorio", "server_data")), Paths.repo_dir().path_join("server/data"))
+	var data := MenuKit.textbox(str(Settings.get_value("factorio", "server_data")), Paths.default_server_data_dir())
 	data.custom_minimum_size.x = Kit.px(420)
 	_on_text(data, "factorio", "server_data")
 	_row(grid, "Server data folder", data)
-	var saves := MenuKit.textbox(str(Settings.get_value("factorio", "saves")), Paths.repo_dir().path_join("server/saves"))
+	var saves := MenuKit.textbox(str(Settings.get_value("factorio", "saves")), Paths.default_saves_dir())
 	saves.custom_minimum_size.x = Kit.px(420)
 	_on_text(saves, "factorio", "saves")
 	_row(grid, "Saves folder", saves)
@@ -672,6 +718,21 @@ func _factorio() -> void:
 	port.custom_minimum_size = Kit.pxv(160, 28)
 	port.value_changed.connect(func(v: float) -> void: Settings.set_value("factorio", "port_base", int(v)))
 	_row(grid, "First port for servers", port, "four free ports from here up")
+	# Factorio's own settings (its config.ini) are the defaults in the other tabs (factorio_settings.gd).
+	var use := MenuKit.checkbox("", bool(Settings.get_value("factorio", "use_factorio_settings")))
+	use.name = "factorio-use_factorio_settings"
+	use.toggled.connect(func(on: bool) -> void:
+		Sfx.play_ui("gui-checkbox-click")
+		Settings.set_value("factorio", "use_factorio_settings", on)
+		Settings.reload_factorio_settings()
+		Settings.apply_window(get_tree().root)
+		_open_tab.call_deferred(_tab))
+	var config: String = load("res://scripts/player/factorio_keys.gd").config_path()
+	var count := 0
+	for section in Settings.factorio_values:
+		count += (Settings.factorio_values[section] as Dictionary).size()
+	var where := ("%d set there, from %s" % [count, config]) if config != "" else "Factorio's config.ini wasn't found"
+	_row(grid, "Use the settings set in Factorio", use, "sound, graphics, interface, language; %s|The volumes, v-sync, full screen, clouds, smoke, decoratives, colour filter, UI scale, belt building, alt-mode arrows, minimap, autosave interval and language you set in Factorio's own Settings are the defaults here. A setting changed in Zenith still wins, and its Default puts Factorio's back. The language needs a restart. Read when Zenith starts and when this is switched: %s" % [where, where])
 	_note("The server keeps its config, logs, mods and RCON password in the data folder, apart from your normal game, so both can run at once. Leave a field empty for the default.")
 
 
@@ -723,6 +784,11 @@ func _row(grid: GridContainer, text: String, control: Control, note := "") -> vo
 		more.mouse_default_cursor_shape = Control.CURSOR_HELP
 		more.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 		holder.add_child(more)
+
+
+## Factorio's Steam launch options for Ctrl+F9 in Factorio (game_swap.gd).
+static func launch_options() -> String:
+	return GameSwap.launch_options()
 
 
 func _note(text: String) -> void:

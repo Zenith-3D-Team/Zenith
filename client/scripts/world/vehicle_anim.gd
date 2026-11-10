@@ -16,7 +16,9 @@ extends Node
 ## - logistic robots swing their legs (the thrusters) back and light their tips while they fly,
 ##   and show the antenna's red ball while they carry cargo (`rc`), white without; construction
 ##   robots hovering in one place are working: their nozzle light flickers on Factorio's two
-##   working frames, the arms reach forward and Factorio's sparks fly; all robots bob a little;
+##   working frames, the arms reach forward and Factorio's sparks fly; all robots bob a little.
+##   Only for robots on nodes (--robot-nodes): otherwise robot_swarm.gd and the robot shader draw
+##   them all that way;
 ## - capture robots sway their hanging cables on the capture animation's 128-tick loop, the tips
 ##   pulsing;
 ## - cargo pods open high in the sky (antenna up, then three panels out, pod-opening.png) and
@@ -124,7 +126,6 @@ class Rig:
 	var travelled := 0.0
 	var spark := 0.0
 	var legs: Array[Leg] = []
-	var feet_seen := -INF  # when the mod's feet last came for this spider
 	var stepping_group := 0
 	var placed := false
 	var knee_at := KNEE_AT
@@ -141,6 +142,7 @@ var sprites: Node
 var _rigs := {}  # unit -> Rig
 var _time := 0.0
 var _feet_at := {}  # unit -> time the mod's feet for it last came
+var _legs_heard := -1  # ui_model.gd's legs_heard when they were last looked at
 ## The last frame's _process time, microseconds (--robot-probe).
 var process_usec := 0
 
@@ -186,6 +188,7 @@ func attach(unit: int, node: Node3D, proto_name: String) -> void:
 
 func detach(unit: int) -> void:
 	_rigs.erase(unit)
+	_feet_at.erase(unit)
 
 
 func reset() -> void:
@@ -197,9 +200,12 @@ func count() -> int:
 	return _rigs.size()
 
 
+## Planet data came; only a `legs` makes the feet fresh (`seg`, `pg` and the rest come with the same
+## signal, and would keep a spider that left the mod's list on its last feet).
 func _on_planet_data() -> void:
-	if model == null:
+	if model == null or model.legs_heard == _legs_heard:
 		return
+	_legs_heard = model.legs_heard
 	for unit in model.legs:
 		_feet_at[int(unit)] = _time
 

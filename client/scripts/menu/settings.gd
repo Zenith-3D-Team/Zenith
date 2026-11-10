@@ -4,7 +4,7 @@ extends RefCounted
 ## (settings_window.gd). The sections follow Factorio's settings tabs: [graphics], [sound],
 ## [interface], [map] (minimap and map view), [controls] (rebound keys only), [camera],
 ## [factorio] (paths, ports, the server's autosave) and [new_game] (the map generator's last
-## choices). ui_settings.gd ([map], [interface]) and fx_settings.gd ([sound]) are views of it.
+## choices). ui_settings.gd ([map]) and fx_settings.gd ([sound]) are views of it.
 ## The older `ui.cfg` and `audio.cfg` are read into this file once (the keys it doesn't have yet)
 ## and then left alone.
 ##
@@ -20,6 +20,7 @@ extends RefCounted
 const ItemCards := preload("res://scripts/world/item_cards.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const Controls := preload("res://scripts/player/controls.gd")
 
 const PATH := "user://settings.cfg"
 
@@ -40,6 +41,7 @@ const DEFAULTS := {
 		"lod_quality": "medium",
 		# Far chunks' buildings drawn as one simplified mesh each (far_chunks.gd): far fewer draws
 		"merge_far": true,
+		"animate_mod_buildings": false,  # off by the owner (their card animations looked wrong); a setting still
 		# Each model drawn as one surface with one material (material_rows.gd): fewer draws and less
 		# render CPU, but its per-pixel table reads cost GPU time (laptop at Ultra: 1-2 ms more
 		# standing), so off unless the CPU is the limit. Read when models load: after a restart.
@@ -51,24 +53,24 @@ const DEFAULTS := {
 		# Godot's renderer on a thread of its own (faster on busy bases); off: the main thread, as
 		# before. Read at start-up from ENGINE_OVERRIDES, so it applies after a restart.
 		"render_thread": false,  # Godot calls it experimental; no gain measured, rare hangs on quitting
-		"view_radius": 10,  # chunks around the camera that are drawn (doubled from 5)
+		"view_radius": 10,  # chunks around the camera that are drawn (owner's B1: doubled from 5)
 		"entity_radius": 192,  # tiles around the camera where moving things and machine states are shown (doubled from 96)
 		# Items on belts are drawn out to belt_distance (0 off): moving, from the character outwards, as
 		# far as belt_updates allows (the most items and lanes the server reads an update), and past
 		# that each lane as icons of what it carries (owner: one distance and a cap, not two distances).
 		"belt_distance": 160,
-		"belt_updates": 6000,  # 0: Unlimited, every item within belt_distance moves
+		"belt_updates": -1,  # -1: Automatic (belt_lanes.gd follows the room there is); 0: Unlimited, every item within belt_distance moves
 		"belt_smooth": true,  # belt items read in one tick, every update (smooth on curves) rather than spread over ticks
-		"decorative_distance": 192,
+		"decorative_distance": 192,  # tiles out to which ground clutter is drawn, thinner far away (B9)
 		# While the game runs under 60 UPS, ask the bridge for less (distances, minimap refreshes,
 		# frame rate) below these settings, and give it back when it recovers (ups_governor.gd)
-		"hold_ups": true,  # tiles out to which ground clutter is drawn, thinner far away
+		"hold_ups": true,
 		"item_icons": true,  # Factorio's icons on items on belts and on the ground
-		"item_models": true,  # items on belts, on the ground, in hands as 3D models (false: icons)
+		"item_models_max": 20500,  # Items in 3D: the most belt items drawn as models, nearest first; 0 icons only; ITEM_MODELS_ALL every one
 		# Models: "colours" (each part in its colour from Factorio's sprite), "sprite" (Factorio's
 		# sprite projected on as well), "palette" (the models' own colours)
 		"model_look": "colours",
-		"effects": true,  # Factorio's "Show all smoke" and "Show particles": smoke, dust, flashes, corpses
+		"effects": true,  # Factorio's "Show all smoke" and "Show particles": smoke, dust, flashes, explosions
 		"clouds": true,  # clouds in the sky and their shadows on the ground, planets' haze (scripts/world/sky.gd)
 		"decoratives": true,  # grass, flowers and small rocks from Factorio (scripts/world/decoratives.gd)
 		"decorative_density": 1.0,  # the share of them drawn, 0.1 to 1
@@ -87,6 +89,9 @@ const DEFAULTS := {
 	},
 	"interface": {
 		"ui_scale": "auto",  # auto, 0.75 ... 2.0
+		"mod_windows": false,  # mods' windows drawn in Zenith (off: not usable yet, owner; use Factorio with Ctrl+F9)
+		"mod_clicks": true,  # a mod's button pressed in Zenith clicks it in Factorio's own window (hybrid, Windows)
+		"mod_click_mode": "focus",  # focus: Factorio comes forward for the click; post: window messages only
 		"show_help": false,  # Factorio's "Show mouse and keyboard control hints"; Factorio shows no help panel
 		"debug_overlay": false,
 		"tooltip_delay": 0.5,  # seconds before a tooltip shows
@@ -99,7 +104,7 @@ const DEFAULTS := {
 		"alt_machine_arrows": true,
 		"entity_info": true,  # the entity info panel on the right
 		"shortcut_bar": true,  # the shortcut bar right of the quickbar
-		"research_progress": true,  # the research in progress, top left
+		"research_progress": true,  # the research in progress, top right
 		"alerts": true,  # alert icons over the shortcut bar
 		"smart_belt_building": true,  # Factorio's: dragged belts jump obstacles with undergrounds
 		"lock_belt_straight": false,  # Factorio's "Lock belt building to straight line"
@@ -116,12 +121,18 @@ const DEFAULTS := {
 	},
 	"factorio": {
 		"executable": "",  # factorio.exe or the install folder; "" finds it
-		"server_data": "",  # "" is <repo>/server/data
-		"saves": "",  # "" is <repo>/server/saves
+		"server_data": "",  # "": Paths.default_server_data_dir() (server/data, or the user folder in a download)
+		"saves": "",  # "": Paths.default_saves_dir()
 		"port_base": 34500,  # launched servers take free ports from here up
 		"autosave_interval": 10,  # minutes, 0: never (server-settings.json)
 		"autosave_slots": 5,
 		"verbose_logging": false,
+		# the keys set in Factorio's own controls (its config.ini) are Zenith's defaults (issue #14)
+		"use_factorio_keys": true,
+		# so are the sound, graphics and interface settings set there (factorio_settings.gd)
+		"use_factorio_settings": true,
+		# Ctrl+F9 swapping: Factorio's window minimised while Zenith is in front (game_swap.gd)
+		"minimize_factorio": true,
 	},
 	# action -> "<primary>,<alternative>" key names (OS.get_keycode_string, with modifiers such as
 	# "Shift+R"; an empty slot is unbound). Only rebound actions are written.
@@ -161,10 +172,10 @@ const PRESETS := {
 		"belt_updates": 4000, "belt_distance": 96, "decorative_distance": 128, "decorative_density": 0.75,
 		"clouds": true},
 	"high": {"shadows": "high", "ssao": false, "lod_quality": "medium", "view_radius": 10, "entity_radius": 192,
-		"belt_updates": 6000, "belt_distance": 160, "decorative_distance": 192, "decorative_density": 1.0,
+		"belt_updates": -1, "belt_distance": 160, "decorative_distance": 192, "decorative_density": 1.0,
 		"clouds": true},
 	"ultra": {"shadows": "ultra", "ssao": false, "lod_quality": "high", "view_radius": 14, "entity_radius": 256,
-		"belt_updates": 12000, "belt_distance": 320, "decorative_distance": 256, "decorative_density": 1.0,
+		"belt_updates": -1, "belt_distance": 320, "decorative_distance": 256, "decorative_density": 1.0,
 		"clouds": true},
 }
 
@@ -258,6 +269,13 @@ static var _listeners: Array[Callable] = []
 ## The rebindable actions' defaults as player_input.gd defines them: action -> [primary, alternative]
 ## key codes (0: none), in its order.
 static var _default_keys := {}
+## Zenith's own default keys (controls.gd), before Factorio's (apply_factorio_keys).
+static var _own_keys := {}
+## The keys read from Factorio's config.ini (factorio_keys.gd), action -> [primary, alternative].
+static var factorio_keys := {}
+## The settings read from Factorio's config.ini (factorio_settings.gd), {section: {key: value}}:
+## the defaults for those keys, in place of DEFAULTS'. {} when off.
+static var factorio_values := {}
 
 
 static func load_settings() -> void:
@@ -276,7 +294,9 @@ static func load_settings() -> void:
 		_cfg = ConfigFile.new()
 	var renamed := _rename_values()
 	var reset := _ssao_off_once()
-	if _migrate() or renamed or reset or not existed:
+	var belt_auto := _belt_auto_once()
+	var still_cards := _mod_anim_off_once()
+	if _migrate() or renamed or reset or belt_auto or still_cards or not existed:
 		_cfg.save(path)
 
 
@@ -296,6 +316,21 @@ static func _rename_values() -> bool:
 	if _cfg.has_section_key("graphics", "belt_near_distance"):
 		_cfg.erase_section_key("graphics", "belt_near_distance")
 		changed = true
+	# Items on belts (3D models or icons) became Items in 3D's 0.
+	if _cfg.has_section_key("graphics", "item_models"):
+		var models: Variant = _cfg.get_value("graphics", "item_models")
+		if models is bool and not models:
+			_cfg.set_value("graphics", "item_models_max", 0)
+		_cfg.erase_section_key("graphics", "item_models")
+		changed = true
+	# Smooth belt items and item icons left the menu in 0.1.3 and stay on (owner); a file from 0.1.2
+	# with either switched off kept it off, with nothing left to switch it back (coloured blocks
+	# instead of icons, belt items read over several ticks).
+	for key in ["belt_smooth", "item_icons"]:
+		var on: Variant = _cfg.get_value("graphics", key, true)
+		if not (on is bool and on):
+			_cfg.erase_section_key("graphics", key)
+			changed = true
 	return changed
 
 
@@ -307,6 +342,49 @@ static func _ssao_off_once() -> bool:
 	_cfg.set_value("meta", "ssao_off", true)
 	if _cfg.has_section_key("graphics", "ssao"):
 		_cfg.set_value("graphics", "ssao", false)
+	return true
+
+
+## Modded buildings' cards were animated by default in 0.1.3; the owner turned that off. Once, in
+## files saved before, the setting goes off; turned on again it stays on. True when the file changed.
+static func _mod_anim_off_once() -> bool:
+	if bool(_cfg.get_value("meta", "mod_anim_off", false)):
+		return false
+	_cfg.set_value("meta", "mod_anim_off", true)
+	if _cfg.has_section_key("graphics", "animate_mod_buildings"):
+		_cfg.set_value("graphics", "animate_mod_buildings", false)
+	return true
+
+
+## 0.1.2's High and Ultra presets wrote Moving belt items (then Belt updates) as 6,000 and 12,000;
+## since 0.1.3 both presets, and the default, are Automatic. A file left on one of those presets
+## kept the fixed cap and its Preset read Custom. Once, in files saved before: one whose graphics
+## are all that preset's but this cap gets Automatic. True when the file needs saving.
+static func _belt_auto_once() -> bool:
+	if bool(_cfg.get_value("meta", "belt_auto", false)):
+		return false
+	_cfg.set_value("meta", "belt_auto", true)
+	var caps := {"high": 6000, "ultra": 12000}
+	var cap: Variant = _cfg.get_value("graphics", "belt_updates", -1)
+	for preset in caps:
+		if cap is int and cap == caps[preset] and _stored_preset(preset, "belt_updates"):
+			_cfg.set_value("graphics", "belt_updates", -1)
+	return true
+
+
+## Whether the file's graphics settings (the defaults where it has none) are a preset's, leaving
+## out `skip`.
+static func _stored_preset(preset: String, skip: String) -> bool:
+	var values: Dictionary = PRESETS[preset]
+	for key in values:
+		if key == skip:
+			continue
+		var now: Variant = _cfg.get_value("graphics", key, DEFAULTS["graphics"].get(key))
+		if values[key] is float:
+			if not (now is float or now is int) or not is_equal_approx(float(now), float(values[key])):
+				return false
+		elif typeof(now) != typeof(values[key]) or now != values[key]:
+			return false
 	return true
 
 
@@ -360,8 +438,30 @@ static func _migrate() -> bool:
 
 static func get_value(section: String, key: String) -> Variant:
 	load_settings()
-	var fallback = DEFAULTS.get(section, {}).get(key)
+	var fallback = factorio_values.get(section, {}).get(key, DEFAULTS.get(section, {}).get(key))
 	return _cfg.get_value(section, key, fallback)
+
+
+## What a setting is when Zenith's file doesn't have it: Factorio's (factorio_values), else null.
+static func factorio_default(section: String, key: String) -> Variant:
+	load_settings()
+	return factorio_values.get(section, {}).get(key)
+
+
+## Reads Factorio's settings again (the switch was turned, or at start-up) and tells the listeners
+## about every setting whose default that changed. Only for the player's own settings file, or
+## with --factorio-config=<file>, so tests with --settings-file aren't shaped by the machine's
+## Factorio.
+static func reload_factorio_settings() -> void:
+	load_settings()
+	var before := factorio_values
+	var own := path == PATH or arg_value("--factorio-config=") != ""
+	factorio_values = load("res://scripts/menu/factorio_settings.gd").read() if own and bool(get_value("factorio", "use_factorio_settings")) else {}
+	for values in [before, factorio_values]:
+		for section in values:
+			for key in values[section]:
+				if not _cfg.has_section_key(section, key):
+					_notify(section, key)
 
 
 ## Changes a setting, writes the file (unless `persist` is false: a slider being dragged) and
@@ -373,8 +473,8 @@ static func set_value(section: String, key: String, value: Variant, persist := t
 		_cfg.save(path)
 	if section == "interface" and key == "tooltip_delay":
 		apply_interface()
-	if section == "graphics" and key == "item_models":
-		ItemCards.use_models = bool(value)
+	if section == "graphics" and key == "item_models_max":
+		apply_item_look()
 	if section == "graphics" and key == "render_thread" and persist:
 		write_engine_overrides()
 	if section == "interface" and key == "ui_scale":
@@ -448,9 +548,26 @@ static func apply_startup(window_height: float) -> void:
 	ModelLibrary.set_look(str(get_value("graphics", "model_look")))
 	apply_merged_materials()
 	ItemCards.use_icons = bool(get_value("graphics", "item_icons"))
-	ItemCards.use_models = bool(get_value("graphics", "item_models"))
+	apply_item_look()
 	ItemCards.configure_from_command_line()
 	apply_interface()
+
+
+## Settings → Graphics → Items in 3D: the slider's top end draws every item as a model.
+const ITEM_MODELS_ALL := 20500
+
+
+static func models_cap(value: Variant) -> int:
+	var v := int(value)
+	return -1 if v >= ITEM_MODELS_ALL else maxi(v, 0)
+
+
+## Items in 3D at 0 draws every item as its icon (on belts, the ground and in hands), as the old
+## Items on belts: Icons did; above 0 items have their models, belt items up to the cap.
+static func apply_item_look() -> void:
+	var cap := models_cap(get_value("graphics", "item_models_max"))
+	ItemCards.use_models = cap != 0
+	ItemCards.model_cap = cap
 
 
 ## The UI scales Factorio offers (Settings → Interface, Ctrl+= / Ctrl+- step through them), as
@@ -497,8 +614,6 @@ static func apply_interface() -> void:
 	ProjectSettings.set_setting("gui/timers/tooltip_delay_sec", clampf(float(get_value("interface", "tooltip_delay")), 0.0, 5.0))
 
 
-## Window mode, size, screen, vsync, FPS cap, render scale and anti-aliasing. The window's mode
-## and size are skipped for screenshots (--screenshot), so they keep the project's window.
 ## The UPS governor's frame rate cap while it holds one (0: none); main.gd sets it.
 static var fps_hold := 0
 
@@ -511,6 +626,8 @@ static func fps_limit() -> int:
 	return cap
 
 
+## Window mode, size, screen, vsync, FPS cap, render scale and anti-aliasing. The window's mode
+## and size are skipped for screenshots (--screenshot), so they keep the project's window.
 static func apply_window(root: Window) -> void:
 	if DisplayServer.get_name() == "headless":
 		return
@@ -595,8 +712,34 @@ static func apply_bindings() -> void:
 		while keys.size() < 2:
 			keys.append(0)
 		_default_keys[name] = keys
+		_own_keys[name] = keys.duplicate()
+	reload_factorio_keys()
+
+
+## factorio_keys.gd, loaded when used: it preloads this script (and paths.gd, which does too).
+static func _factorio_keys_script() -> GDScript:
+	return load("res://scripts/player/factorio_keys.gd")
+
+
+## Issue #14: the keys set in Factorio's own controls (factorio_keys.gd: action -> [primary,
+## alternative], -1 (FactorioKeys.SKIP) where Zenith's stays) become the defaults; bindings changed in
+## Zenith's Settings still win. {} goes back to Zenith's own defaults.
+static func apply_factorio_keys(keys: Dictionary) -> void:
+	factorio_keys = keys
+	for action in _own_keys:
+		var merged: Array = (_own_keys[action] as Array).duplicate()
+		var theirs: Array = keys.get(action, [])
+		for slot in mini(2, theirs.size()):
+			if int(theirs[slot]) != -1:  # FactorioKeys.SKIP
+				merged[slot] = int(theirs[slot])
+		_default_keys[action] = merged
 	for action in _default_keys:
 		_set_keys(action, keys_for(action))
+
+
+## Reads Factorio's controls again (the setting was switched, or Factorio's changed).
+static func reload_factorio_keys() -> void:
+	apply_factorio_keys(_factorio_keys_script().read() if bool(get_value("factorio", "use_factorio_keys")) else {})
 
 
 ## A key event's code with its modifiers (KEY_MASK_SHIFT...), as OS.get_keycode_string names it.
@@ -702,8 +845,11 @@ static func conflicts(action: String, code: int) -> Array:
 static var contexts := {}
 
 
-## Two actions can both fire: then a shared key clashes.
+## Two actions can both fire: then a shared key clashes. Pairs that share a key by design
+## (Controls.SHARED) never both fire.
 static func _meet(a: String, b: String) -> bool:
+	if Controls.shared(a, b):
+		return false
 	var ca := str(contexts.get(a, ""))
 	var cb := str(contexts.get(b, ""))
 	return ca == cb or ca == "global" or cb == "global"
@@ -746,8 +892,3 @@ static func _set_keys(action: String, keys: Array) -> void:
 		ev.alt_pressed = int(code) & KEY_MASK_ALT != 0
 		ev.meta_pressed = int(code) & KEY_MASK_META != 0
 		InputMap.action_add_event(action, ev)
-
-
-## A readable name for an action ("camera_tilt_up" -> "Camera tilt up").
-static func action_label(action: String) -> String:
-	return action.replace("_", " ").capitalize()

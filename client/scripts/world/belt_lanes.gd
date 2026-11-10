@@ -20,6 +20,9 @@ const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
 const LaneShader := preload("res://shaders/belt_lane_icon.gdshader")
+const LaneModelShader := preload("res://shaders/belt_lane_model.gdshader")
+const ItemCards := preload("res://scripts/world/item_cards.gd")
+const ItemModels := preload("res://scripts/world/item_models.gd")
 
 ## Before the mod says which square it read (an older mod), lane icons start this far inside the
 ## distance round the focus, so there is no gap.
@@ -32,11 +35,15 @@ const ICON := 0.32
 const LANE := 0.234
 ## A pile's copies: as belt_items.gd piles an icon card's (ItemCards.CARD_PILE).
 const PILE := 0.07
+const AHEADS := [Vector2(0, -1), Vector2(1, 0), Vector2(0, 1), Vector2(-1, 0)]
+const RIGHTS := [Vector2(1, 0), Vector2(0, 1), Vector2(-1, 0), Vector2(0, -1)]
+## A far model pile's copies turn this much more each (belt_items.gd's PILE_TURN).
+const PILE_TURN := 0.45
 ## Neighbouring icons on a full lane overlap: every other one sits this much higher, so they don't
 ## fight over the pixels they share (as belt_items.gd's LAYER_STEP).
 const LAYER_STEP := 0.006
-## Main-thread time a frame may spend making chunks' MultiMeshes (at least one chunk is made).
-const APPLY_USEC := 2000  # its slice in frame_budget.gd
+## Main-thread time a frame may spend making chunks' MultiMeshes: its slice in frame_budget.gd
+## (`lanes`).
 
 var protos: ProtoDB
 var world: WorldMirror
@@ -44,7 +51,7 @@ var world: WorldMirror
 var distance := 160
 ## Tiles from the focus within which the mod may send items on belts moving (belt_items.gd draws
 ## them), sent with the `bfar` command (n): the Belt item distance, up to MOVING_MAX. How far they
-## really move is as far as `cap` allows: the most items and lanes an update reads (Belt updates,
+## really move is as far as `cap` allows: the most items and lanes an update reads (Moving belt items,
 ## `bfar` m), ring by ring from the focus; the mod says where it stopped (bi fr) and the icons
 ## start there.
 var near := 24
@@ -52,13 +59,45 @@ const MOVING_MAX := 640
 ## 0: Unlimited (every item within `near` moves).
 var cap := 6000
 var _sent_cap := -1
-## Belt updates' Unlimited (0) as a number the UPS governor's caps compare with (it may still hold
+## Moving belt items. Unlimited (0) as a number the UPS governor's caps compare with (it may still hold
 ## it back while the game runs slow, as it does every distance).
 const UNLIMITED := 1.0e9
 
 
-## The value a knob works with for the setting `v` (0: Unlimited).
+## Moving belt items' Automatic (the setting -1): the cap follows the room the frames and the game
+## have, a rolling value worked out in _auto() between AUTO_MIN and AUTO_MAX.
+const AUTO := -1
+const AUTO_MIN := 1000.0
+const AUTO_MAX := 48000.0
+static var auto_cap := 6000.0
+## Set by main.gd: Automatic is chosen, the UPS governor's hold on the cap, the governor (its UPS).
+var auto := false
+var updates_hold := UNLIMITED
+var governor: Node = null
+var _frames := PackedFloat32Array()  # frame times (ms) since the last decision
+var _auto_t := 0.0
+## And the server's tick: reading the moving items costs the bridge work units (about 2 us each on
+## the owner's PC), which each update reports (`bi` w, set here as units a tick by belt_items.gd; -1
+## before the mod says). Automatic grows the cap only while a fifth more would still fit AUTO_WORK
+## units a tick, and shrinks it once the reading runs a quarter over. (With the frames and the game's
+## speed alone as its guide it grew while they had room, and reading belts costs about what it reads:
+## on Zenith Test at the busy belts 6,000 items took about 1,200 units a tick, 48,000 about 9,200,
+## 17 ms. 0.1.2 had a fixed 6,000; standing there the bridge went from 7.1 ms a tick in 0.1.2 to 12.9
+## in 0.1.3.) 1,500 a tick, about 3 ms there, is a little more than those 6,000 items.
+const AUTO_WORK := 1500.0
+var bridge_work := -1.0
+
+
+## An update's work a tick (belt_items.gd, from bi w / p), smoothed over a few updates: with lanes
+## kept, quiet lanes are checked every other update, so one update's figure goes up and down.
+func heard_work(per_tick: float) -> void:
+	bridge_work = per_tick if bridge_work < 0.0 else bridge_work + (per_tick - bridge_work) * 0.25
+
+
+## The value a knob works with for the setting `v` (0: Unlimited, -1: Automatic's value now).
 static func cap_wanted(v: float) -> float:
+	if v < 0.0:
+		return auto_cap
 	return UNLIMITED if v <= 0.0 else v
 
 
@@ -86,6 +125,9 @@ var _chunks := {}  # Vector2i -> Node3D (a MultiMeshInstance3D per item)
 var _held := {}
 var _unknown := {}
 var _materials := {}  # item id -> ShaderMaterial
+var _model_materials := {}  # item id -> ShaderMaterial for its far model (models())
+var _steps := {}  # item id -> its model's pile step (its height), once its model is read
+var _models := false  # models() when the chunks were last made: a change makes them all again
 var _quad := QuadMesh.new()
 var _height := 0.2
 var _height_known := false
@@ -110,16 +152,22 @@ var worst_apply_usec := 0
 class Job:
 	var msgs: Array = []  # [chunk, l, c, h]
 	var height := 0.2
-	var results: Array = []  # [chunk, {item id: PackedFloat32Array of TRANSFORM_3D + custom instances}]
+	## Far models (models()): item id -> a pile's step for items whose model is known, laid out as
+	## belt_items.gd lays its models (a slight turn each, piles by the model's height, turning).
+	var steps = null
+	## Curved belts in the chunks: Vector2i belt centre (1/256 tile, as `l`) -> 1 turning right,
+	## -1 left; their lanes' items lie along the lane's quarter circle (belt_paths.gd's arcs).
+	var curves := {}
+	var results: Array = []  # [chunk, {item id: PackedFloat32Array of TRANSFORM_3D + custom instances}, steps]
 
 	func run() -> void:
 		for m: Array in msgs:
-			results.append([m[0], build(m[1], m[2], height, m[3])])
+			results.append([m[0], build(m[1], m[2], height, m[3], steps, curves), steps])
 
 	## `l` [x, y, direction, lane 1 item, lane 2 item, ...]; `counts` [lane 1, lane 2, ...] per
 	## belt, or empty (an older mod: one icon a lane); `piles` the same for how high each lane's
 	## stacks are, or empty (no stacks).
-	static func build(l: Array, counts: Array, height: float, piles: Array = []) -> Dictionary:
+	static func build(l: Array, counts: Array, height: float, piles: Array = [], steps = null, curves := {}) -> Dictionary:
 		var by_item := {}  # item id -> PackedFloat32Array
 		var row := 0
 		for i in range(0, l.size() - 4, 5):
@@ -127,6 +175,7 @@ class Job:
 			var a := int(l[i + 2]) / 16.0 * TAU
 			var right := Vector2(cos(a), sin(a))
 			var ahead := Vector2(sin(a), -cos(a))
+			var turn_way := int(curves.get(Vector2i(int(l[i]), int(l[i + 1])), 0))
 			for lane in 2:
 				var item := int(l[i + 3 + lane])
 				if item == 0:
@@ -137,6 +186,11 @@ class Job:
 				var high := 1
 				if row * 2 + lane < piles.size():
 					high = clampi(int(piles[row * 2 + lane]), 1, 4)
+				var step := PILE
+				var turn := false
+				if steps != null and (steps as Dictionary).has(item):
+					step = float(steps[item])
+					turn = true
 				var buf: PackedFloat32Array = by_item.get(item, PackedFloat32Array())
 				var o := buf.size()
 				buf.resize(o + n * high * STRIDE)
@@ -144,13 +198,22 @@ class Job:
 				for j in n:
 					# Spread evenly along the belt, as items ride; lying flat and upright, as Factorio's.
 					var p := side + ahead * ((j + 0.5) / n - 0.5)
+					if turn_way != 0:
+						p = curve_point(at, (int(l[i + 2]) >> 2) & 3, turn_way, lane, (j + 0.5) / n)
+					# Models turn a little each, as near ones (ItemCards.yaw_for), and a pile's copies more.
+					var yaw := ItemCards.yaw_for(hash(Vector3i(int(l[i]), int(l[i + 1]), lane * 4 + j))) if turn else 0.0
 					for h in high:
 						var k := o + (j * high + h) * STRIDE
-						buf[k] = 1.0
+						var a2 := yaw + PILE_TURN * h if turn else 0.0
+						var c := cos(a2)
+						var sn := sin(a2)
+						buf[k] = c
+						buf[k + 2] = sn
 						buf[k + 3] = p.x
 						buf[k + 5] = 1.0
-						buf[k + 7] = height + LAYER_STEP * (j % 2) + PILE * h
-						buf[k + 10] = 1.0
+						buf[k + 7] = height + LAYER_STEP * (j % 2) + step * h
+						buf[k + 8] = -sn
+						buf[k + 10] = c
 						buf[k + 11] = p.y
 						# The belt's centre, which decides whether the icon or the belt's real items show.
 						buf[k + 12] = at.x
@@ -158,6 +221,16 @@ class Job:
 				by_item[item] = buf
 			row += 1
 		return by_item
+
+	## A point `f` (0 to 1) along a curve's lane: a quarter circle about the curve's inner corner,
+	## from the edge items come in at (as belt_paths.gd's arc pieces). d: the way the belt faces (0-3
+	## from north), way: 1 turning right, -1 left; lane 0 the left lane, 1 the right.
+	static func curve_point(at: Vector2, d: int, way: int, lane: int, f: float) -> Vector2:
+		var t := (d + 3) % 4 if way > 0 else (d + 1) % 4  # the way items come in
+		var corner: Vector2 = at - AHEADS[t] * 0.5 + AHEADS[d] * 0.5
+		var v: Vector2 = at - AHEADS[t] * 0.5 + RIGHTS[t] * (LANE if lane == 1 else -LANE) - corner
+		var a := v.angle() + way * f * PI * 0.5
+		return corner + Vector2(cos(a), sin(a)) * v.length()
 
 	## How many icons a chunk's buffers hold.
 	static func icon_count(by_item: Dictionary) -> int:
@@ -183,6 +256,7 @@ func _ready() -> void:
 	# The first material made with the lane shader cost 21 ms on the main thread (Godot sets the
 	# shader up then; seen on a real base): made here at start-up, as model_library.gd's warm_up().
 	_material(0)
+	_model_material(0)
 	if world != null:
 		world.entities_changed.connect(func(c: Vector2i) -> void:
 			if not world.chunks.has(c):
@@ -208,6 +282,7 @@ func reset() -> void:
 	for c in _chunks.keys():
 		_drop(c)
 	covered = Vector3(0.0, 0.0, -1.0)
+	bridge_work = -1.0
 	_sent = -1
 	_sent_near = -1
 	_sent_smooth = -1
@@ -215,6 +290,8 @@ func reset() -> void:
 
 
 func _process(_delta: float) -> void:
+	if auto:
+		_auto(_delta)
 	if not Bridge.world_ready:
 		_sent = -1
 	elif _sent != distance or _sent_near != near or _sent_smooth != int(smooth) or _sent_cap != cap:
@@ -239,18 +316,72 @@ func _process(_delta: float) -> void:
 		if allow > 0:
 			_apply_some(allow)
 		FrameBudget.spent(&"lanes", Time.get_ticks_usec() - t0, _done.size())
-	_set_params()
+	if _models != models():
+		_models = models()
+		for c in _latest:
+			_pending[c] = _latest[c]
+	# Only when what they say changed: three parameters on every item's material every frame (each
+	# queues the material's uniforms to be sent again), while the square moves once an update.
+	if [hand_over_centre(), near_edge(), distance, _materials.size(), _model_materials.size()] != _params_key:
+		_set_params()
+
+
+## Automatic: once a second, from the frames' time over the last second or two (their slowest
+## tenth) against the frame's budget (16.7 ms, or the FPS cap's when it is lower) and the game's
+## UPS: room to spare raises the cap a fifth, frames running long or the game slowing lowers it a
+## fifth. Not while a game loads (its frames are long for other reasons).
+func _auto(delta: float) -> void:
+	if not Bridge.world_ready:
+		_frames.clear()
+		_auto_t = 0.0
+		return
+	_frames.append(delta * 1000.0)
+	_auto_t += delta
+	if _auto_t < 1.0 or _frames.size() < 20:
+		return
+	_auto_t = 0.0
+	var sorted := _frames.duplicate()
+	sorted.sort()
+	var slow := sorted[int(sorted.size() * 0.9)]
+	_frames.clear()
+	var budget := 1000.0 / 60.0
+	if Engine.max_fps > 0 and Engine.max_fps < 60:
+		budget = 1000.0 / Engine.max_fps
+	var ups := float(governor.get("ups")) if governor != null and is_instance_valid(governor) else 0.0
+	var was := auto_cap
+	# And it grows only while it is what stops the reading (the mod's square, bi fr, inside the belt
+	# item distance): in an empty stretch it grew to 48,000 for nothing, and the first busy belts after
+	# it were read 100,000 units at once (a 673 ms tick on Zenith Test).
+	var binding := covered.z < 0.0 or covered.z < float(near) - 0.5
+	if slow > budget * 1.05 or (ups > 0.0 and ups < 57.0) or bridge_work > AUTO_WORK * 1.25:
+		auto_cap = maxf(auto_cap * 0.8, AUTO_MIN)
+	elif slow < budget * 0.8 and (ups <= 0.0 or ups >= 59.0) and bridge_work * 1.2 <= AUTO_WORK and binding:
+		auto_cap = minf(auto_cap * 1.2, AUTO_MAX)
+	if auto_cap != was:
+		cap = cap_of(minf(auto_cap, updates_hold))
+
+
+## Far belts' items drawn as their small models: Items in 3D is
+## All (with a cap the items past it are icons, and the far ones are past it).
+static func models() -> bool:
+	return ItemCards.use_models and ItemCards.model_cap < 0
 
 
 ## Every icon material's square and distance (an item belt_items.gd doesn't draw yet: no square).
+## What _set_params last set: [centre, edge, distance, materials, model materials].
+var _params_key: Array = []
+
+
 func _set_params() -> void:
 	var centre := hand_over_centre()
 	var edge := near_edge()
-	for item in _materials:
-		var m: ShaderMaterial = _materials[item]
-		m.set_shader_parameter("focus", centre)
-		m.set_shader_parameter("near", -1.0 if _unknown.has(int(item)) else edge)
-		m.set_shader_parameter("far", float(distance))
+	_params_key = [centre, edge, distance, _materials.size(), _model_materials.size()]
+	for mats: Dictionary in [_materials, _model_materials]:
+		for item in mats:
+			var m: ShaderMaterial = mats[item]
+			m.set_shader_parameter("focus", centre)
+			m.set_shader_parameter("near", -1.0 if _unknown.has(int(item)) else edge)
+			m.set_shader_parameter("far", float(distance))
 
 
 ## Called by belt_items.gd in the frame its job's result is drawn: the square its items cover,
@@ -328,12 +459,25 @@ func _belt_height() -> float:
 func _start() -> void:
 	var job := Job.new()
 	job.height = _belt_height()
+	if _models:
+		job.steps = _steps.duplicate()
 	for c in _pending:
 		var m: Array = _pending[c]
+		_curves_of(c, job.curves)
 		job.msgs.append([c, m[0], m[1], m[2] if m.size() > 2 else []])
 	_pending.clear()
 	_job = job
 	_task = WorkerThreadPool.add_task(job.run, false, "belt lanes")
+
+
+## A chunk's curved belts into `out` (Job.curves).
+func _curves_of(c: Vector2i, out: Dictionary) -> void:
+	if world == null or not world.chunks.has(c):
+		return
+	for r: WorldMirror.Rec in world.chunks[c].entities.values():
+		var shape = r.extra.get("s") if r.extra != null else null
+		if shape is String and (shape == "l" or shape == "r"):
+			out[Vector2i(roundi(r.pos.x * 256.0), roundi(r.pos.y * 256.0))] = 1 if shape == "r" else -1
 
 
 ## Waits for the running job and queues what it made.
@@ -374,7 +518,18 @@ func _apply_some(usec: int) -> void:
 		var r: Array = _done[0]
 		var by_item: Dictionary = r[1]
 		var missing := false
+		var relay := false
 		for item in by_item:
+			if _models and protos != null:
+				var name := protos.item_name(int(item))
+				if not ItemModels.ready(name):
+					missing = true  # its model is read on a thread meanwhile
+				elif not _steps.has(item):
+					var mesh := ItemModels.mesh_for(name)
+					if mesh != null:
+						_steps[item] = clampf(mesh.get_aabb().size.y, 0.03, 0.2)
+				if _steps.has(item) and (r.size() < 3 or r[2] == null or not (r[2] as Dictionary).has(item)):
+					relay = true  # laid out before its model was known: again, as a model
 			if not _materials.has(item):
 				var name := protos.item_name(int(item)) if protos != null else ""
 				if name == "" or ItemIcons.is_cached(name):
@@ -386,6 +541,10 @@ func _apply_some(usec: int) -> void:
 		if missing:
 			return
 		_done.pop_front()
+		if relay:
+			if _latest.has(r[0]):
+				_pending[r[0]] = _latest[r[0]]
+			continue
 		_make(r[0], by_item)
 		var spent := Time.get_ticks_usec() - start
 		worst_apply_usec = maxi(worst_apply_usec, spent)
@@ -404,12 +563,15 @@ func _make(c: Vector2i, by_item: Dictionary) -> void:
 		var mm := MultiMesh.new()
 		mm.transform_format = MultiMesh.TRANSFORM_3D
 		mm.use_custom_data = true
-		mm.mesh = _quad
+		var model: Mesh = null
+		if _models and protos != null:
+			model = ItemModels.mesh_for(protos.item_name(int(item)))
+		mm.mesh = model if model != null else _quad
 		mm.instance_count = buf.size() / STRIDE
 		mm.buffer = buf
 		var inst := MultiMeshInstance3D.new()
 		inst.multimesh = mm
-		inst.material_override = _material(int(item))
+		inst.material_override = _model_material(int(item)) if model != null else _material(int(item))
 		inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		node.add_child(inst)
 	node.visible = not _held.has(c)
@@ -432,6 +594,19 @@ func _drop(c: Vector2i) -> void:
 	if node != null:
 		node.queue_free()
 		_chunks.erase(c)
+
+
+func _model_material(item: int) -> ShaderMaterial:
+	if _model_materials.has(item):
+		return _model_materials[item]
+	var m := ShaderMaterial.new()
+	m.shader = LaneModelShader
+	m.set_shader_parameter("exposure", ItemModels.EXPOSURE)
+	m.set_shader_parameter("focus", hand_over_centre())
+	m.set_shader_parameter("near", near_edge())
+	m.set_shader_parameter("far", float(distance))
+	_model_materials[item] = m
+	return m
 
 
 func _material(item: int) -> ShaderMaterial:

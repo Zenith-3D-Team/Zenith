@@ -10,7 +10,9 @@ param(
   [string]$Factorio = "",
   [int]$UdpPort = 34200,
   [int]$GamePort = 34197,
-  [int]$RconPort = 34198
+  [int]$RconPort = 34198,
+  # The map seed when a new map is created (0: Factorio picks one).
+  [long]$Seed = 0
 )
 $ErrorActionPreference = "Stop"
 
@@ -52,7 +54,11 @@ write-data=$data
 "@ | Set-Content -Encoding ASCII (Join-Path $data "config.ini")
 
 # Link the mod from the repo (a junction needs no admin rights), so edits apply on restart.
+# Made again each run, as run-headless.sh and the menu do: an old link may point to a checkout
+# moved or deleted since (Test-Path is true even for a broken junction). rmdir without /s only
+# removes a link or an empty folder, never a mod copied there by hand.
 $link = Join-Path $mods "factorio-3d-bridge"
+if (Test-Path $link) { cmd /c "rmdir `"$link`" 2>nul" | Out-Null }
 if (-not (Test-Path $link)) {
   New-Item -ItemType Junction -Path $link -Target (Join-Path $repo "mod\factorio-3d-bridge") | Out-Null
 }
@@ -70,7 +76,9 @@ if (-not (Test-Path $Save)) {
   Write-Host "Creating a new map at $Save"
   # factorio.exe is a windowed program, so & wouldn't wait for it: the server would start
   # before the map exists.
-  $quoted = ($common + @("--create", $Save)) | ForEach-Object { '"' + $_ + '"' }
+  $create = @("--create", $Save)
+  if ($Seed -ne 0) { $create += @("--map-gen-seed", "$Seed") }
+  $quoted = ($common + $create) | ForEach-Object { '"' + $_ + '"' }
   Start-Process -FilePath $Factorio -ArgumentList $quoted -Wait -NoNewWindow
   if (-not (Test-Path $Save)) { Write-Error "Map creation failed; see $data\factorio-current.log" }
 }

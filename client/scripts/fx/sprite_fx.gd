@@ -61,6 +61,8 @@ class Pool:
 	var fade_out := 0.3
 	var glow := false  # draws itself lit: not dimmed at night (Factorio's draw_as_glow)
 	var buffer := PackedFloat32Array()
+	var shown := 0  # cards drawn after the last _step
+	var brightness := -1.0  # the material's brightness as last set
 
 
 var _pools := {}  # name -> Pool
@@ -195,6 +197,7 @@ func clear() -> void:
 	for pool: Pool in _pools.values():
 		pool.cards.clear()
 		pool.mm.visible_instance_count = 0
+		pool.shown = 0
 
 
 ## The last frame's _process time, microseconds (--stutter-probe).
@@ -205,8 +208,12 @@ func _process(delta: float) -> void:
 	var t0 := Time.get_ticks_usec()
 	var brightness := lerpf(1.0, 0.3, night)
 	for pool: Pool in _pools.values():
-		if not pool.additive and not pool.glow:
+		# Set only when it changes: each set queues the material's uniforms to be sent again.
+		if not pool.additive and not pool.glow and pool.brightness != brightness:
+			pool.brightness = brightness
 			pool.material.set_shader_parameter("brightness", brightness)
+		if pool.cards.is_empty() and pool.shown == 0:
+			continue
 		_step(pool, delta)
 	process_usec = Time.get_ticks_usec() - t0
 
@@ -261,6 +268,7 @@ func _step(pool: Pool, delta: float) -> void:
 	if n > 0:
 		pool.mm.buffer = buf
 	pool.mm.visible_instance_count = n
+	pool.shown = n
 
 
 static func _load_sheet(file: String) -> Texture2D:

@@ -55,6 +55,8 @@ signal platform_state_changed(platform: int, state: String, old_state: String, l
 signal equipment_changed(kind: String)
 signal character_info_changed
 signal players_changed
+## A mod's windows (mgui): mod_gui.gd builds them.
+signal mod_gui_received(msg: Dictionary)
 ## The client's character is dead (`dead`): ticks until the respawn, where it died (Vector2 tiles or null).
 signal died(ticks: int, at)
 ## Space Age (space.lua): the solar system arrived (`smap`), asteroid chunks moved (`ach`).
@@ -111,7 +113,8 @@ var craft_queue_size := 0
 var other_slots := {}
 ## The mod's whole quickbar (100 names, 10 pages) and the page shown.
 var quickbar_page := 1
-## The upper quickbar row's page when the page chooser set it (0: the page after quickbar_page).
+## The second quickbar row's page (drawn below the page in use; "upper" is where it used to be)
+## when the page chooser set it (0: the page after quickbar_page).
 var quickbar_upper := 0
 var _server_quickbar: Array = []
 
@@ -121,8 +124,6 @@ var techs := {}
 var research := ""
 var research_progress := 0.0
 var research_queue: Array = []
-## [[lab unit, status name], ...] for labs near the camera ("working", "missing_science_packs"...).
-var labs: Array = []
 
 ## The map, chunk by chunk as requested with request_map(): Vector2i -> Image (n x n pixels, one per
 ## tiles-per-pixel square, north-west first), or null for a chunk the force hasn't charted yet.
@@ -137,6 +138,8 @@ var map_trains := PackedInt32Array()
 ## With the ground round the character (COVERED_RADIUS) the rest of the map is dimmed, as Factorio's.
 var map_coverage: Array[Rect2i] = []
 var map_coverage_known := false
+## A space platform's map (`mtr` all): everything on it counts as seen.
+var map_coverage_all := false
 const COVERED_RADIUS := 96.0
 var _map_train_parts := PackedInt32Array()
 var _map_trains_asked := -1000000
@@ -248,6 +251,7 @@ var demolishers_serial := 0  # counts `seg`s, so demolishers.gd sees each one
 var plant_growth := {}
 var spawner_units := {}
 var legs := {}
+var legs_heard := 0  # `legs` messages so far (vehicle_anim.gd: which planet data is new feet)
 var belt_freshness := {}
 ## Aquilo: units of frozen machines (`fz`).
 var frozen := {}
@@ -297,8 +301,7 @@ var _pedia_index_asked := -100000
 ## by id ({"id", "logistic", "construction", "items": [[item, count, quality?], ...]}).
 var lnets: Array = []
 var lnet := {}
-## The last statistics reply's surface (0: all) and graph lines ([[name, [in...], [out...]], ...]).
-var stats_si := 0
+## The last statistics reply's graph lines ([[name, [in...], [out...]], ...]).
 var stats_graph: Array = []
 ## An electric network's accumulators (`stats` kind electric, `st`): [[name, stored J averaged over the
 ## time scale, stored J now], ...].
@@ -319,6 +322,12 @@ var _craftable := {}  # recipe -> count, from `craftable`
 var _rdet: Array = []  # the latest complete `rdet` records
 var _parts := {}  # message type -> the multi-part list being received
 
+
+
+## The character's build distance in tiles, from `cinfo` (bonuses from research and other mods
+## included); Factorio's base 10 until the first `cinfo` arrives.
+func build_reach() -> float:
+	return float(character_info.get("build", 100)) / 10.0
 
 func _init() -> void:
 	quickbar.resize(QUICKBAR_SLOTS)
@@ -399,6 +408,9 @@ func handle(msg: Dictionary) -> bool:
 							t["saved"] = int(r[12]) / 1000.0
 							t["formula"] = str(r[13])
 						techs[str(r[0])]["essential"] = int(r[14]) == 1 if r.size() >= 15 else true
+						# Effects the bridge left out to keep a giant record sendable (a recycling
+						# technology with thousands of modded recipes).
+						techs[str(r[0])]["effects_more"] = int(r[15]) if r.size() >= 16 else 0
 				research_changed.emit()
 		"chart":
 			if not _shown_surface(msg):
@@ -498,6 +510,7 @@ func handle(msg: Dictionary) -> bool:
 				i += 2
 			planet_data_changed.emit()
 		"legs":
+			legs_heard += 1
 			legs.clear()
 			for r in _array(msg.get("l")):
 				if r is Array and r.size() >= 2:
@@ -668,6 +681,7 @@ func handle(msg: Dictionary) -> bool:
 							var d := int(cov[i + 2])
 							map_coverage.append(Rect2i(int(cov[i]) - d, int(cov[i + 1]) - d, 2 * d + 1, 2 * d + 1))
 						map_coverage_known = true
+						map_coverage_all = int(msg.get("all", 0)) == 1
 				for v in _array(msg.get("l")):
 					_map_train_parts.append(int(v))
 				if int(msg.get("part", 1)) >= int(msg.get("parts", 1)):
@@ -730,7 +744,6 @@ func handle(msg: Dictionary) -> bool:
 			perm_me = str(msg.get("me", ""))
 			perms_changed.emit()
 		"stats":
-			stats_si = int(msg.get("si", 0))
 			stats_graph = _array(msg.get("gr"))
 			stats_storage = _array(msg.get("st"))
 			stats_flow = _array(msg.get("ef"))
@@ -757,6 +770,8 @@ func handle(msg: Dictionary) -> bool:
 			character_info.erase("t")
 			character_info.erase("k")
 			character_info_changed.emit()
+		"mgui":
+			mod_gui_received.emit(msg)
 		"pl":
 			players.clear()
 			me_player = int(msg.get("me", 0))
@@ -816,7 +831,6 @@ func handle(msg: Dictionary) -> bool:
 			research = str(msg.get("cur", ""))
 			research_progress = int(msg.get("pr", 0)) / 1000.0
 			research_queue = _array(msg.get("q"))
-			labs = _array(msg.get("labs"))
 			research_changed.emit()
 		_:
 			return false
@@ -1134,7 +1148,7 @@ func pin(index: int, item: String) -> void:
 	quickbar_changed.emit()
 
 
-## Factorio shows two quickbar rows: the page in use and, above it, another page: the next one
+## Factorio shows two quickbar rows: the page in use on top and, below it, another page: the next one
 ## (1-10 wrap) until X swaps the rows or the page chooser sets it (quickbar_upper, kept by the client).
 func quickbar_upper_page() -> int:
 	return quickbar_upper if quickbar_upper > 0 else quickbar_page % 10 + 1
@@ -1173,7 +1187,7 @@ func unpin(index: int) -> void:
 	quickbar_changed.emit()
 
 
-## Shows quickbar page p (1-10; Shift+1-0, page chooser) in the lower row. Only the mod keeps
+## Shows quickbar page p (1-10; Shift+1-0, page chooser) in the top row, the page in use. Only the mod keeps
 ## pages; the client's own quickbar has one.
 func select_quickbar_page(p: int) -> void:
 	p = clampi(p, 1, 10)
@@ -1291,13 +1305,6 @@ func player_of_unit(unit: int) -> Dictionary:
 
 # --- crafting queue --------------------------------------------------------------------------
 
-## The queue's length from `me.q`.
-func set_queue_size(n: int) -> void:
-	if n != craft_queue_size:
-		craft_queue_size = n
-		queue_changed.emit()
-
-
 ## The queue's entries, [{"recipe", "count", "progress", "index"?}] (index: for cancel_craft).
 func set_craft_queue(entries: Array) -> void:
 	craft_queue = entries
@@ -1322,11 +1329,6 @@ func say(text: String) -> void:
 		Bridge.send({"t": "chat", "text": text})
 
 
-## Statistics: kind "item", "fluid", "kill", "build", "pollution", or "electric" with a pole's
-## identity in `target` ({u, p, x, y}); prec 1-8 is Factorio's time scale (5 s, 1 min, 10 min, 1 h,
-## 10 h, 50 h, 250 h, 1000 h); `si` a surface index (0: all, -1: the character's); `graph` the names
-## to draw lines for ([] the busiest, null none). The answer arrives as stats_received, with
-## stats_si and stats_graph set.
 func request_bonuses() -> void:
 	Bridge.send({"t": "bonuses"})
 
@@ -1335,6 +1337,11 @@ func request_perms() -> void:
 	Bridge.send({"t": "perms"})
 
 
+## Statistics: kind "item", "fluid", "kill", "build", "pollution", or "electric" with a pole's
+## identity in `target` ({u, p, x, y}); prec 1-8 is Factorio's time scale (5 s, 1 min, 10 min, 1 h,
+## 10 h, 50 h, 250 h, 1000 h); `si` a surface index (0: all, -1: the character's); `graph` the names
+## to draw lines for ([] the busiest, null none). The answer arrives as stats_received, with
+## stats_graph set.
 func request_stats(kind: String, prec: int, target := {}, si := -1, graph = null) -> void:
 	var cmd := {"t": "stats", "kind": kind, "prec": prec}
 	cmd.merge(target)
@@ -1367,6 +1374,14 @@ func pedia_page(kind: String, name: String) -> Dictionary:
 		_pedia_asked[key] = now
 		Bridge.send({"t": "pedia", "kind": kind, "name": name})
 	return {}
+
+
+## Forgets a page so the next pedia_page() asks for it again at once (a technology's page changes
+## with research: the mod builds it fresh each time, pedia.lua FORCE_PAGES).
+func forget_pedia_page(kind: String, name: String) -> void:
+	var key := "%s/%s" % [kind, name]
+	pedia_pages.erase(key)
+	_pedia_asked.erase(key)
 
 
 ## An item's or entity's page data ("d"), the entity's own part for an item that builds one; {}
@@ -1444,10 +1459,6 @@ func set_switch(unit: int, on: bool) -> void:
 	Bridge.send({"t": "set_switch", "u": unit, "on": 1 if on else 0})
 
 
-func set_panel_text(unit: int, text: String) -> void:
-	Bridge.send({"t": "set_panel", "u": unit, "text": text})
-
-
 ## A display panel's settings: any of text, icon ({type, name} or {}), show, chart (0/1) and msgs
 ## ([{text, icon, cond}]).
 func set_panel(unit: int, settings: Dictionary) -> void:
@@ -1519,14 +1530,6 @@ func request_space_map() -> void:
 	Bridge.send({"t": "smap"})
 
 
-## Factorio's "new platform" over a planet: waits there for one of the character's starter packs.
-func new_platform(planet := "") -> void:
-	var cmd := {"t": "plat_new"}
-	if planet != "":
-		cmd["planet"] = planet
-	Bridge.send(cmd)
-
-
 ## "Can't build here: ..." for an entity prototype on this surface (Space Age's surface
 ## conditions), or "".
 func cant_build_reason(proto_id: int) -> String:
@@ -1560,16 +1563,6 @@ func set_character_color(c: Color) -> void:
 func set_character_requests(requests: Array, on := true, trash_unrequested := false) -> void:
 	Bridge.send({"t": "set_char_requests", "l": _request_list(requests), "on": 1 if on else 0,
 		"trash": 1 if trash_unrequested else 0})
-
-
-## A requester or buffer chest's requests (the open screen's `u`), as `gui.lg.requests` shows them.
-func set_chest_requests(unit: int, requests: Array) -> void:
-	Bridge.send({"t": "set_requests", "u": unit, "l": _request_list(requests)})
-
-
-## What a storage chest takes ("" for anything).
-func set_storage_filter(unit: int, item: String) -> void:
-	Bridge.send({"t": "set_storage_filter", "u": unit, "item": item})
 
 
 ## [[item, min, max, quality?], ...] from the wire into dictionaries.
@@ -1636,11 +1629,6 @@ func request_trains_overview(show := false) -> void:
 		trains_overview_requested.emit()
 
 
-## Automatic or manual for any train of the force, from the overview.
-func set_train_automatic_by_id(id: int, automatic: bool) -> void:
-	Bridge.send({"t": "train_mode_id", "id": id, "auto": 1 if automatic else 0})
-
-
 ## Renames a train stop ("" keeps the name) and sets its trains limit (-1 none, -2 unchanged).
 func set_stop(unit: int, stop_name := "", limit := -2) -> void:
 	var cmd := {"t": "set_stop", "u": unit}
@@ -1678,6 +1666,7 @@ func set_map_surface(si: int) -> void:
 	map_trains.clear()
 	map_coverage.clear()
 	map_coverage_known = false
+	map_coverage_all = false
 	tags_changed.emit()
 	map_surfaces_changed.emit()
 	map_trains_changed.emit()
@@ -1761,7 +1750,7 @@ func has_roboport_at(si: int, fixed_at: Vector2i) -> bool:
 	return _roboports.has(si) and _roboports[si]["at"].has(fixed_at)
 
 
-## Whether a roboport's construction area on surface `si` holds this chunk's centre (H13).
+## Whether a roboport's construction area on surface `si` holds this chunk's centre.
 func roboport_covers(si: int, chunk: Vector2i) -> bool:
 	# Asked for every chunk round the view several times a second: no dictionary made on the way.
 	return _roboports.has(si) and _roboports[si]["chunks"].has(chunk)
@@ -1788,11 +1777,11 @@ func ask_map_trains() -> void:
 	Bridge.send(cmd)
 
 
-## Whether radars, roboports' construction areas (H13) or the character (at `character_at` on the
+## Whether radars, roboports' construction areas or the character (at `character_at` on the
 ## character's surface) see this chunk. Until the mod has said where its radars are, everything
 ## counts as seen.
 func chunk_covered(chunk: Vector2i, character_at: Vector2) -> bool:
-	if not map_coverage_known:
+	if not map_coverage_known or map_coverage_all:
 		return true
 	if map_si == 0 and (Vector2(chunk) * 32.0 + Vector2(16, 16)).distance_to(character_at) <= COVERED_RADIUS + 16.0:
 		return true

@@ -36,7 +36,6 @@ var _icon: TextureRect
 var _status: Label
 var _dot: TextureRect
 var _lines := VBoxContainer.new()
-var _health: ProgressBar
 var _key := ""
 
 
@@ -89,10 +88,6 @@ func _ready() -> void:
 	status.add_child(_dot)
 	_status = Kit.label("")
 	status.add_child(_status)
-	# Factorio shows health as a line; the bar is kept for nothing but compatibility
-	_health = Kit.progress_bar(Color(0.1, 0.9, 0.1))
-	_health.max_value = 1000
-	_health.visible = false
 	_lines.add_theme_constant_override("separation", Kit.px(2))
 	_lines.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	column.add_child(_lines)
@@ -146,7 +141,6 @@ func show_entity(r) -> void:
 	_icon.texture = Kit.item_icon(shown_name)
 	if r.extra.has("q"):
 		_line("Quality: %s" % str(r.extra["q"]).capitalize(), Kit.YELLOW_TEXT)
-	_health.value = roundi(maxf(health, 0.0) * 1000.0)
 	# Factorio's status: a coloured dot and the word; short of power says so, as Factorio's does
 	_status.get_parent().visible = working >= 0 or power >= 0
 	if power >= 0:
@@ -188,7 +182,7 @@ func show_entity(r) -> void:
 	reset_size()
 
 
-## Factorio's "Consumes electricity" part at the foot of the panel (H20): a rule across, the
+## Factorio's "Consumes electricity" part at the foot of the panel: a rule across, the
 ## lightning and the yellow heading over a fainter rule, Max. and Min. consumption (the mod's live
 ## figures with modules and beacons, else the prototype's), and the Electricity bar: the machine's
 ## buffer, full when it has all the power it wants.

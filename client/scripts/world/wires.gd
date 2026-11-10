@@ -21,7 +21,6 @@ const SEGMENTS := 12
 ## of small poles sags about 0.35 tiles, as in Factorio).
 const SAG_PER_TILE := 0.045
 const REBUILDS_PER_FRAME := 4
-const REBUILD_USEC := 1500  # its slice in frame_budget.gd
 
 ## Where wires attach, in tiles from the pole's position (x east, y up, z south), for poles
 ## facing north: Factorio's `connection_points[1].wire`, in pixels on the sprite, with heights
@@ -95,7 +94,7 @@ func _process(_delta: float) -> void:
 	var started := Time.get_ticks_usec()
 	var allow := FrameBudget.grant(&"wires")
 	for c in _dirty.keys():
-		# Also within REBUILD_USEC (at least one): each new chunk dirties its eight neighbours, and on
+		# Also within its slice (frame_budget.gd `wires`, at least one): each new chunk dirties its eight neighbours, and on
 		# the owner's busy save a frame of rebuilds took 4-7 ms while walking.
 		if allow <= 0 or budget <= 0 or (budget < REBUILDS_PER_FRAME and Time.get_ticks_usec() - started > allow):
 			break

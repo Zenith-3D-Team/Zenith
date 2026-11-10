@@ -12,6 +12,7 @@ local M = {}
 local DETAILS_INTERVAL = 600   -- research unlocks recipes; research.lua also asks for a resend
 local CRAFTABLE_INTERVAL = 30
 local QUEUE_INTERVAL = 10
+local QUEUE_RESEND = 300   -- the empty queue again every 5 s, as `cq` is sent unreliably
 local RECIPES_PER_MESSAGE = 40
 
 -- The force's enabled, visible recipes the character can craft by hand, sorted by name. The
@@ -118,11 +119,15 @@ local function send_craftable(c, s)
   end
 end
 
--- The queue while it has something in it, and once more when it empties.
+-- The queue while it has something in it, once more when it empties, and then the empty queue
+-- every QUEUE_RESEND ticks: a lost last one would leave the client showing a finished craft.
 local function send_queue(c, s)
   local queue = c.crafting_queue or {}
-  if #queue == 0 and not s.queue_sent then
+  if #queue == 0 and not s.queue_sent and game.tick - (s.queue_empty_tick or -QUEUE_RESEND) < QUEUE_RESEND then
     return
+  end
+  if #queue == 0 then
+    s.queue_empty_tick = game.tick
   end
   local list = {}
   for _, item in ipairs(queue) do

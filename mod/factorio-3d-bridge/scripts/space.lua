@@ -6,7 +6,8 @@
 --              whether it provides to other platforms
 --   silo       a rocket silo: its status, automatic launches, and where its rocket can go; `ride`
 --              takes the character up in the rocket
---   pad        a cargo landing pad: its requests and its circuit settings; bays show their owner
+--   pad        a cargo landing pad: its requests and its circuit settings (a cargo bay opens its
+--              hub's or pad's screen: screens.lua)
 --   collector  an asteroid collector's chunk filters
 --   eff, rq    a machine's module effects (quality among them) and its recipe's quality
 --   smap       the solar system: space locations with their star map positions, the connections
@@ -63,8 +64,6 @@ function M.kind(e)
     return "hub"
   elseif t == "cargo-landing-pad" then
     return "pad"
-  elseif t == "cargo-bay" then
-    return "bay"
   elseif t == "asteroid-collector" then
     return "collector"
   end
@@ -73,7 +72,7 @@ end
 
 -- Kinds whose get_output_inventory isn't shown as "output".
 function M.no_output(kind)
-  return kind == "hub" or kind == "pad" or kind == "bay"
+  return kind == "hub" or kind == "pad"
 end
 
 -- Adds this module's inventories through add(role, inventory): the hub's and pad's trash, the
@@ -625,9 +624,6 @@ function M.fill(msg, e, kind)
     if #q > 1 then
       msg.ql = q
     end
-  elseif kind == "bay" then
-    local owner = try(function() return e.cargo_bay_connection_owner end)
-    msg.bay = { owner = owner and owner.valid and owner.unit_number or 0 }
   elseif kind == "collector" then
     msg.col = try(collector_info, e)
   elseif kind == "silo" and msg.rk then
@@ -743,8 +739,6 @@ end
 ---------------------------------------------------------------------------------------------
 -- Asteroid chunks near the focus (on a platform)
 
-local sent_chunks = false
-
 -- [[name, x, y, vx, vy], ...]: positions fixed, movement in 1/256 tile per second.
 local function chunks(surface, f)
   local out = {}
@@ -763,15 +757,19 @@ local function chunks(surface, f)
   return out
 end
 
+-- An empty list goes once after the last chunks, to clear them. Whether one is owed is kept per
+-- client (storage.f3d): each client's tick runs in turn, and a shared flag let one client's empty
+-- list use up another's.
 function M.tick()
   if game.tick % CHUNK_INTERVAL ~= 0 then
     return
   end
-  local list = chunks(world.surface(), storage.f3d.focus)
-  if #list > 0 or sent_chunks then
+  local s = storage.f3d
+  local list = chunks(world.surface(), s.focus)
+  if #list > 0 or s.ach_sent then
     transport.send_now({ t = "ach", l = list })
   end
-  sent_chunks = #list > 0
+  s.ach_sent = #list > 0 or nil
 end
 
 ---------------------------------------------------------------------------------------------
@@ -845,10 +843,6 @@ function M.add_handlers(handlers, screens)
   handlers.ride = screens.space_command({ silo = true }, M.ride, "That isn't a rocket silo")
   handlers.set_pad = screens.space_command({ pad = true }, M.set_pad, "That isn't a landing pad")
   handlers.set_collector = screens.space_command({ collector = true }, M.set_collector, "That isn't an asteroid collector")
-end
-
-function M.reset()
-  sent_chunks = false
 end
 
 return M

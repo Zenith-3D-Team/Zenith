@@ -28,18 +28,6 @@ kit.MATERIALS.update({
 })
 
 
-def plate_door(p, pts, z, mat="steel_dark", stripes=6):
-    """A flat door: a plate through `pts` with a band of hazard stripes along its first edge."""
-    p.prism(pts, z - 0.06, z, mat, bevel=0.02)
-    a, b = Vector((*pts[0], 0)), Vector((*pts[1], 0))
-    inward = (Vector((*pts[-1], 0)) - a).normalized() * 0.3
-    for k in range(stripes):
-        q0 = a + (b - a) * (k / stripes)
-        q1 = a + (b - a) * ((k + 1) / stripes)
-        p.prism([(q0.x, q0.y), (q1.x, q1.y), (q1.x + inward.x, q1.y + inward.y), (q0.x + inward.x, q0.y + inward.y)],
-                 z, z + 0.012, "hazard" if k % 2 == 0 else "hazard_black")
-
-
 # ---------------------------------------------------------------------------------------------
 # Rocket silo.
 

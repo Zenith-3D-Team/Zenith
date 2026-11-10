@@ -13,13 +13,10 @@ const FactorioUi := preload("res://scripts/ui/factorio/factorio_ui.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const DamageOverlay := preload("res://scripts/ui/damage_overlay.gd")
+const Controls := preload("res://scripts/player/controls.gd")
 
-const HELP := [
-	"WASD walk · Right mouse: mine · F: pick up · Left mouse: build or open · R rotate · Q pipette / put away · Z drop",
-	"Shift+click: ghost / paste settings · Shift+right: copy settings · Ctrl+click: fast transfer · Ctrl+C/X/V · Ctrl+Z",
-	"Space: shoot nearby enemies · C: shoot at the cursor · Tab: next weapon · Enter: get in or out",
-	", . or middle drag: turn camera · PgUp/PgDn tilt · Wheel zoom · F6 Factorio view · F5 first person",
-]
+## Short names for keys in the help (OS.get_keycode_string's are long).
+const KEY_SHORT := {"QuoteLeft": "`", "Comma": ",", "Period": ".", "Slash": "/", "PageUp": "PgUp", "PageDown": "PgDn"}
 ## Factorio's health bar goes from green through yellow to red.
 const HEALTH_COLORS := [Color(0.9, 0.1, 0.1), Color(1.0, 0.85, 0.1), Color(0.1, 0.9, 0.1)]
 ## style.lua's shield_progressbar colour, and the batteries' charge.
@@ -71,7 +68,8 @@ func _ready() -> void:
 	# Factorio has no help text: a small panel in the free space on the left, wrapped to its width.
 	# factorio_ui.gd's layout places it, smaller and then cut short when the window is crowded, so
 	# the first line is the one to keep.
-	help.text = "F1: hide help\n" + "\n".join(HELP) + "\n" + FactorioUi.HELP
+	refresh_help()
+	Settings.listen(_on_setting)
 	help.theme_type_variation = "FSmallLabel"
 	help.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	var back := StyleBoxFlat.new()
@@ -122,6 +120,71 @@ func _ready() -> void:
 	cursor_label.theme_type_variation = "FSmallLabel"
 	cursor_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(cursor_label)
+
+
+func _exit_tree() -> void:
+	Settings.unlisten(_on_setting)
+
+
+func _on_setting(section: String, key: String) -> void:
+	# Rebound in Settings → Controls, or Factorio's own keys switched on or off (read after this).
+	if section == "controls" or (section == "factorio" and key == "use_factorio_keys"):
+		refresh_help.call_deferred()
+
+
+## The help with the keys bound now; factorio_ui.gd fits it to its room again (`full_text`).
+func refresh_help() -> void:
+	var text := help_text()
+	help.text = text
+	help.set_meta("full_text", text)
+
+
+## The help's lines, each control under the key bound to it now (Settings → Controls, or Factorio's
+## own keys); a control with no key is left out. The mouse's are fixed.
+static func help_text() -> String:
+	var lines: Array = [
+		_say([[_keys(["toggle_help"]), "hide help"]]),
+		_say([[_keys(["move_up", "move_left", "move_down", "move_right"], ""), "walk"], "Right mouse: mine",
+			[_keys(["pick_up"]), "pick up"], "Left mouse: build or open", [_keys(["rotate"]), "rotate"],
+			[_keys(["pipette"]), "pipette / put away"], [_keys(["drop_item"]), "drop"]]),
+		_say(["Shift+click: ghost / paste settings", "Shift+right: copy settings", "Ctrl+click: fast transfer",
+			[_keys(["copy", "cut", "paste"]), "copy, cut, paste"], [_keys(["undo"]), "undo"]]),
+		_say([[_keys(["shoot_enemies"]), "shoot nearby enemies"], [_keys(["shoot_cursor"]), "shoot at the cursor"],
+			[_keys(["next_gun"]), "next weapon"], [_keys(["enter_vehicle"]), "get in or out"]]),
+		_say([[_keys(["camera_left", "camera_right"]), "turn camera (or middle drag)"],
+			[_keys(["camera_tilt_up", "camera_tilt_down"]), "tilt"], "Wheel: zoom",
+			[_keys(["factorio_view"]), "Factorio view"], [_keys(["first_person"]), "first person"]]),
+		_say([[_keys(["open_screen"]), "inventory"], [_keys(["open_technology"]), "technologies"],
+			[_keys(["toggle_map"]), "map"], [_keys(["production_statistics", "kill_statistics"]), "statistics"],
+			[_keys(["logistic_networks"]), "logistic networks"], [_keys(["toggle_factoriopedia"]), "Factoriopedia (or Alt+click)"],
+			[_keys(["toggle_console"]), "chat"], [_keys(["alt_mode"]), "Alt-mode"],
+			[_keys(["quickbar_1", "quickbar_10"], "-"), "quickbar (inventory open: pin the hovered item)"],
+			[_keys(["debug_line"]), "debug info"]]),
+	]
+	return "\n".join(lines.filter(func(l: String) -> bool: return l != ""))
+
+
+## "keys: what · text · ..." from [keys, what] pairs and fixed texts; a pair without keys is left out.
+static func _say(items: Array) -> String:
+	var out: Array = []
+	for item in items:
+		if item is String:
+			out.append(item)
+		elif str(item[0]) != "":
+			out.append("%s: %s" % [item[0], item[1]])
+	return " · ".join(out)
+
+
+## The first key bound to an action, short ("" when none).
+static func _key(action: String) -> String:
+	var k := Controls.keys_text(action).get_slice(" / ", 0)
+	return str(KEY_SHORT.get(k, k))
+
+
+## Several actions' first keys joined (WASD with "", "1-0" with "-"); "" unless all have one.
+static func _keys(actions: Array, sep := " / ") -> String:
+	var keys: Array = actions.map(func(a: String) -> String: return _key(a))
+	return "" if keys.has("") else sep.join(keys)
 
 
 func reset() -> void:

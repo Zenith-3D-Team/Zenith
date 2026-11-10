@@ -4,7 +4,7 @@ extends Node
 ## near the focus, far belt lanes, moving things and machine states within the entity distance,
 ## chunks within the view distance and the minimap's charts are all worked out in the game's tick,
 ## and on the same PC the client's own frames take CPU from the server. Measured on the owner's
-## save (REPORT-ACCT2.md): the bridge cost ~14 ms a tick standing at its belts and ~23 walking,
+## save (PROGRESS.md's session log): the bridge cost ~14 ms a tick standing at its belts and ~23 walking,
 ## so the game ran at 50 and 35 UPS.
 ##
 ## This watches the game's UPS (server ticks per real second, over the last WINDOW seconds) and,
@@ -25,12 +25,13 @@ const AddonRequests := preload("res://scripts/addons/addon_requests.gd")
 signal changed
 
 ## Steps from the first taken to the last, cheapest in looks for the UPS they buy first (measured on
-## the owner's save; REPORT-ACCT2.md). [knob, value]: the knob's value is at most the smallest of
-## the steps taken. map: how much longer the minimap waits between refreshes; entity: tiles round
-## the focus with moving things and machine states; far: the belt item distance (tiles); updates:
-## the most belt items sent moving (Belt updates); view: chunks drawn round the focus; fps: the frame rate cap (frees CPU for the
-## server on the same PC); rate: the bridge sends its costliest updates less often (`rate`, 1-3),
-## which the client glides over, so it goes first. The last value of each knob is its floor.
+## the owner's save, each knob alone; PROGRESS.md's session log). [knob, value]: the knob's value
+## is at most the smallest of the steps taken. map: how much longer the minimap waits between
+## refreshes; entity: tiles round the focus with moving things and machine states; far: the belt
+## item distance (tiles); updates: the most belt items sent moving (Moving belt items); view:
+## chunks drawn round the focus; fps: the frame rate cap (frees CPU for the server on the same PC);
+## rate: the bridge sends its costliest updates less often (`rate`, 1-3), which the client glides
+## over, so it goes first. The last value of each knob is its floor.
 const STEPS := [
 	["rate", 1],
 	["rate", 2],
@@ -50,7 +51,7 @@ const STEPS := [
 	["fps", 45],
 ]
 const LABELS := {"map": "minimap refreshes %s× apart", "entity": "entity distance %s", "far": "belt item distance %s",
-	"updates": "belt updates %s", "view": "view distance %s", "fps": "FPS limit %s",
+	"updates": "moving belt items %s", "view": "view distance %s", "fps": "FPS limit %s",
 	"rate": "updates slowed to level %s"}
 
 const LOW := 57.0  # UPS under this, for HOLD_DOWN seconds, takes a step down
@@ -131,7 +132,7 @@ func _on_setting(section: String, key: String) -> void:
 			reset()
 
 
-## Everything back to the player's settings (a new game, switched off).
+## Everything back to the player's settings (switched off; a new game makes a new governor).
 func reset() -> void:
 	_samples.clear()
 	_ready_for = 0.0

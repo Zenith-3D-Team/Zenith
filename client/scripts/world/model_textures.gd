@@ -4,11 +4,19 @@ extends RefCounted
 ## reader makes them without mipmaps, which shimmer on a model a few tiles away, so each picture is
 ## decoded again from the file's own bytes, mipmapped and put back on its material. A small copy
 ## (SMALL px) rides along as meta, for far_chunks.gd to colour a merged far chunk's vertices from.
-## Models without textures pass through untouched.
+## Models without textures pass through untouched. A texture whose glTF sampler says NEAREST
+## (Blender's Image Texture node set to Closest, which its exporter writes so) is marked
+## NEAREST_META, and the model shader draws it crisp, texel by texel, still mipmapped far away
+## (modeller's request: hand-painted low-resolution textures read better unblended).
 
 ## Meta on a Texture2D: a SMALL x SMALL Image of it (RGBA8, sRGB as stored).
 const SMALL_META := &"f3d_small"
 const SMALL := 64
+## Meta on a Texture2D: true when its glTF sampler filters NEAREST.
+const NEAREST_META := &"f3d_nearest"
+const GL_NEAREST := 9728
+const GL_NEAREST_MIPMAP_NEAREST := 9984
+const GL_NEAREST_MIPMAP_LINEAR := 9986
 
 
 ## Mipmapped copies of the base colour and roughness textures of every material in `state`, read
@@ -24,7 +32,8 @@ static func prepare(path: String, state: GLTFState) -> void:
 			wanted = true
 	if not wanted:
 		return
-	var images := _images(path)
+	var nearest := {}  # image index -> true when a texture of it samples NEAREST
+	var images := _images(path, nearest)
 	var done := {}  # original texture -> mipmapped one
 	for m in materials:
 		var base := m as BaseMaterial3D
@@ -35,12 +44,13 @@ static func prepare(path: String, state: GLTFState) -> void:
 			if tex == null:
 				continue
 			if not done.has(tex):
-				done[tex] = _mipmapped(tex, state, images)
+				done[tex] = _mipmapped(tex, state, images, nearest)
 			base.set_texture(param, done[tex])
 
 
-## Image index -> the picture's bytes decoded, from the .glb's JSON and binary chunk.
-static func _images(path: String) -> Dictionary:
+## Image index -> the picture's bytes decoded, from the .glb's JSON and binary chunk; `nearest` gets
+## the image indices a NEAREST sampler draws.
+static func _images(path: String, nearest: Dictionary) -> Dictionary:
 	var out := {}
 	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null or f.get_32() != 0x46546C67:
@@ -57,6 +67,15 @@ static func _images(path: String) -> Dictionary:
 		var bin_len := f.get_32()
 		f.get_32()
 		bin = f.get_buffer(bin_len)
+	var samplers: Array = doc.get("samplers", [])
+	for t in doc.get("textures", []):
+		if not t is Dictionary or not t.has("source") or not t.has("sampler"):
+			continue
+		var si := int(t["sampler"])
+		if si >= 0 and si < samplers.size() and samplers[si] is Dictionary:
+			var mag := int((samplers[si] as Dictionary).get("magFilter", 0))
+			if mag == GL_NEAREST or mag == GL_NEAREST_MIPMAP_NEAREST or mag == GL_NEAREST_MIPMAP_LINEAR:
+				nearest[int(t["source"])] = true
 	var views: Array = doc.get("bufferViews", [])
 	var pictures: Array = doc.get("images", [])
 	for src in pictures.size():
@@ -74,13 +93,15 @@ static func _images(path: String) -> Dictionary:
 	return out
 
 
-static func _mipmapped(tex: Texture2D, state: GLTFState, images: Dictionary) -> Texture2D:
+static func _mipmapped(tex: Texture2D, state: GLTFState, images: Dictionary, nearest: Dictionary) -> Texture2D:
 	# GLTFState keeps the file's images in its order: this texture's index there is the file's.
 	var img: Image = null
+	var crisp := false
 	var made := state.get_images()
 	for i in made.size():
 		if made[i] == tex and images.has(i):
 			img = images[i]
+			crisp = nearest.has(i)
 	if img == null:
 		return tex
 	if img.get_format() != Image.FORMAT_RGBA8 and img.get_format() != Image.FORMAT_RGB8:
@@ -91,4 +112,6 @@ static func _mipmapped(tex: Texture2D, state: GLTFState, images: Dictionary) -> 
 	img.generate_mipmaps()
 	var out := ImageTexture.create_from_image(img)
 	out.set_meta(SMALL_META, small)
+	if crisp:
+		out.set_meta(NEAREST_META, true)
 	return out

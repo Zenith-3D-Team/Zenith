@@ -49,22 +49,20 @@ static func lighter(knob: String, wanted: float) -> float:
 static func set_request(id: String, knobs: Dictionary) -> bool:
 	var clean := {}
 	for k in knobs:
-		if str(k) in KNOBS:
-			clean[str(k)] = clampf(float(knobs[k]), 0.0, 3.0) if str(k) == "rate" else maxf(float(knobs[k]), 0.0)
+		var knob := str(k)
+		if not knob in KNOBS:
+			continue
+		var v := float(knobs[k])
+		if knob == "rate":
+			v = clampf(v, 0.0, 3.0)
+		elif knob == "updates":
+			v = maxf(v, 1.0)  # 0 would read as Unlimited (BeltLaneLayer.cap_of); 1 is its smallest cap
+		else:
+			v = maxf(v, 0.0)
+		clean[knob] = v
 	var before: Dictionary = requests.get(id, {})
 	if clean.is_empty():
 		requests.erase(id)
 	else:
 		requests[id] = clean
 	return before != clean
-
-
-## What is asked for now, all add-ons together: {knob: value}.
-static func combined() -> Dictionary:
-	var out := {}
-	for id in requests:
-		var r: Dictionary = requests[id]
-		for k in r:
-			var v := float(r[k])
-			out[k] = (maxf(float(out[k]), v) if k in UPWARD else minf(float(out[k]), v)) if out.has(k) else v
-	return out

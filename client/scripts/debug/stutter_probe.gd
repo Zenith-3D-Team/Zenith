@@ -10,6 +10,7 @@ extends Node
 ## the default route walks from the start south through the factory, east along it and back north.
 
 const Settings := preload("res://scripts/menu/settings.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 const WARMUP := 15.0
 ## --probe-warmup=<s>: a longer warm-up (a big save at long distances takes a while to load); with
 ## --probe-variants the variants also wait until no chunk is left to build (or 3 minutes).
@@ -122,6 +123,7 @@ var _merged: Array = []
 
 func _ready() -> void:
 	process_priority = 1000  # last in the frame: the counters hold this frame's work
+	Probing.on = true  # the world, animator, far chunks and bridge keep their timings from now
 	if Settings.has_arg("--probe-timing="):
 		var t := Settings.arg_value("--probe-timing=").split(",")
 		VARIANT_SETTLE = float(t[0])
@@ -201,6 +203,10 @@ func _process(delta: float) -> void:
 	var walking := _warm >= _warmup and (not _variants or _settled() or _warm > 180.0)
 	if walking and _frames.is_empty():
 		world.drawn_latency.clear()  # what appears while it walks, not while it joined
+		# --probe-trace=<ticks>: the bridge logs each module's time per tick from here (f3dtrace
+		# lines in Factorio's log), asked through the console, so single-player needs no RCON.
+		if Settings.has_arg("--probe-trace="):
+			Bridge.send({"t": "cmd", "id": 9999, "text": "/f3d-profile trace %d" % int(Settings.arg_value("--probe-trace="))})
 	if not walking:
 		_warm += delta
 	elif _leg >= _route.size():
@@ -678,10 +684,11 @@ func _set_variant(name: String, on: bool) -> void:
 			print("VARIANT %s hides %d nodes (%d meshes matched)" % [name, _hidden.size(), trees.size()])
 
 
-## This frame's subtrees taking over a millisecond: {name: ms}. A marker sits right after its
+## This frame's subtrees taking over SEGMENT_MIN_MS: {name: ms}. A marker sits right after its
 ## subtree, so the time from the marker before it (in time) to it is that subtree's; "before" is
 ## everything up to the first marker (autoloads such as Bridge, and main itself).
-## --probe-fine: subtrees down to 0.01 ms (an average frame's breakdown), not only those over 0.1.
+## --probe-fine: subtrees over 0.005 ms, kept to 0.01 ms (an average frame's breakdown), not only
+## those over 0.1 ms.
 var SEGMENT_MIN_MS := 0.005 if "--probe-fine" in OS.get_cmdline_user_args() else 0.1
 
 

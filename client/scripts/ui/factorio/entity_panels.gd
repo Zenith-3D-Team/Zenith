@@ -171,10 +171,6 @@ static func _signal_name(sig) -> String:
 	return ""
 
 
-static func _signal_type(sig) -> String:
-	return str(sig.get("type", "item")) if sig is Dictionary else "item"
-
-
 # --- conditions and trains -----------------------------------------------------------------------
 
 ## A circuit condition {first_signal, comparator, constant | second_signal} as Factorio edits it:

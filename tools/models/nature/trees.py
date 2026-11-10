@@ -298,37 +298,6 @@ def leaf_tint(m, tints):
     return (t[0] * k, t[1] * k, t[2] * k)
 
 
-def clump(m, center, radius, leaf, tints=(PLAIN,), scale=(1.0, 1.0, 0.85), jitter=0.3, subdiv=2, vary=0.5):
-    """One lump of foliage: a jagged ball, each facet a slightly different shade so it reads
-    as a mass of leaves."""
-    return m.blob(center, radius, leaf, scale=scale, jitter=jitter, subdiv=subdiv, tint=leaf_tint(m, tints),
-                  vary=vary, smooth=True)
-
-
-def crown(m, center, radii, count, size, leaf, tints=(PLAIN,), core=0.8, below=1.0, squash=0.85, jitter=0.3,
-          depth=(0.8, 1.0)):
-    """A canopy: clumps spread over an ellipsoid (centre, radii), plus a core blob filling the
-    middle. `below` < 1 leaves the underside open (umbrella crowns, trunks showing)."""
-    c = Vector(center)
-    rx, ry, rz = radii
-    if core:
-        m.blob(c, 1.0, leaf, scale=(rx * core, ry * core, rz * core), jitter=0.15, subdiv=2,
-               tint=leaf_tint(m, tints), vary=0.3, smooth=True)
-    golden = math.pi * (3.0 - math.sqrt(5.0))
-    a0 = m.rng.uniform(0.0, math.tau)
-    placed = []
-    for i in range(count):
-        # Fibonacci sphere: an even spread, nudged at random.
-        zf = 1.0 - (i + 0.5) / count * (1.0 + below)
-        r = math.sqrt(max(0.0, 1.0 - zf * zf))
-        a = a0 + golden * i + m.rng.uniform(-0.3, 0.3)
-        d = Vector((math.cos(a) * r, math.sin(a) * r, zf))
-        p = c + Vector((d.x * rx, d.y * ry, d.z * rz)) * m.rng.uniform(*depth)
-        clump(m, p, size * m.rng.uniform(0.8, 1.2), leaf, tints, scale=(1.0, 1.0, squash), jitter=jitter)
-        placed.append(p)
-    return placed
-
-
 def shade_tree(m, center, radii, ground=0.0, leaf_dark=0.5, bark_dark=0.55, bark_top=None):
     """Bakes the sprites' shading into face colours: foliage darkens towards the inside and
     the underside of the crown, bark darkens near the ground and under the leaves."""
@@ -354,39 +323,6 @@ def shade_tree(m, center, radii, ground=0.0, leaf_dark=0.5, bark_dark=0.55, bark
         side = 0.85 + 0.15 * max(0.0, n.z)
         return (bark_dark + (1.0 - bark_dark) * min(1.0, 0.35 + h * 1.6)) * under * side
     m.shade(fn)
-
-
-def outline_crown(m, bands, leaf, tints=(PLAIN,), size=0.5, depth=0.75, step=0.5):
-    """A canopy filled out to the sprite's outline, so no ground or trunk shows through where
-    the sprite has leaves (the client projects the sprite onto the model). `bands`: (up, x0, x1)
-    for each `step`-tile band of the sprite, measured up from the entity's position, across from
-    x0 to x1 tiles. Each band gets a core blob, a clump at each end and, if wide, one in front;
-    each placed at the height that shows on its band from Factorio's camera (z * 0.669 + y * 0.743
-    up the sprite). Returns the crown's centre and radii, for shade_tree."""
-    def z_at(up, y):
-        return (up - y * 0.743) / 0.669
-    lo = min(b[0] for b in bands)
-    hi = max(b[0] for b in bands) + step
-    for k, (up, x0, x1) in enumerate(bands):
-        # Kept a little inside the outline: the sprite's leaves are ragged at the edge.
-        u = up + step / 2 - (size * 0.35 if k == len(bands) - 1 else 0.0) + (size * 0.2 if k == 0 else 0.0)
-        half = (x1 - x0) / 2
-        cx = (x0 + x1) / 2
-        # Thinner front to back at the top and bottom: from Factorio's camera the crown's far
-        # side shows higher and its near side lower than the band.
-        n = len(bands)
-        d = half * depth * min(1.0, (0.25, 0.55)[n - 1 - k] if n - 1 - k < 2 else 1.0, (0.4, 0.8)[k] if k < 2 else 1.0)
-        m.blob((cx, 0.0, z_at(u, 0.0)), 1.0, leaf, scale=(max(half - size * 0.8, 0.2), max(d * 0.8, 0.15), 0.4),
-               jitter=0.15, subdiv=2, tint=leaf_tint(m, tints), vary=0.3, smooth=True, tilt=0.05)
-        for x in (x0 + size * 1.05, x1 - size * 1.05):
-            clump(m, (x, 0.0, z_at(u, 0.0)), size * m.rng.uniform(0.85, 1.0), leaf, tints, scale=(1.0, 1.0, 0.8),
-                  jitter=0.25)
-        if half > 2.0:
-            y = -d * 0.6
-            clump(m, (cx + m.rng.uniform(-0.3, 0.3), y, z_at(u, y)), size, leaf, tints, scale=(1.0, 0.8, 0.8))
-    xs = [b[1] for b in bands] + [b[2] for b in bands]
-    centre = Vector(((min(xs) + max(xs)) / 2, 0.0, z_at((lo + hi) / 2, 0.0)))
-    return centre, ((max(xs) - min(xs)) / 2, (max(xs) - min(xs)) / 2 * depth, (hi - lo) / 2 / 0.669)
 
 
 def crown_lumps(m, name, inset=0.95):

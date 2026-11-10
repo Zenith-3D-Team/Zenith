@@ -14,6 +14,7 @@ import socket
 import struct
 
 AUTH, EXEC = 3, 2
+PASSWORD = None  # set by tools that take --rcon-password (live_check.py)
 DEFAULT_PASSWORD_FILE = pathlib.Path(__file__).resolve().parent.parent / "server" / "data" / "rcon-password.txt"
 # run()'s default port; live_check.py --rcon-port changes it for a second server instance.
 PORT = 34198
@@ -43,7 +44,7 @@ def read_packet(sock):
 def run(command, host="127.0.0.1", port=None, password=None, timeout=10.0):
     port = port or PORT
     if password is None:
-        password = DEFAULT_PASSWORD_FILE.read_text().strip()
+        password = PASSWORD or DEFAULT_PASSWORD_FILE.read_text().strip()
     with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.sendall(packet(1, AUTH, password))
         while True:
@@ -55,6 +56,13 @@ def run(command, host="127.0.0.1", port=None, password=None, timeout=10.0):
         sock.sendall(packet(2, EXEC, command))
         _, _, body = read_packet(sock)
         return body
+
+
+def mod_lua(code, port=None, timeout=10.0):
+    """Runs Lua in the bridge mod's state (so storage is the bridge's) and returns what it
+    rcon.prints. The lines are joined into one command, so a `--` comment would swallow the rest."""
+    lines = " ".join(line.strip() for line in code.strip().splitlines())
+    return run("/c __factorio-3d-bridge__ " + lines, port=port, timeout=timeout).strip()
 
 
 def main():

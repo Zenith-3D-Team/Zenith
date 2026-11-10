@@ -1,7 +1,8 @@
 extends Node3D
 ## Entity ghosts and planner marks, drawn like Factorio's: a ghost (a record with `extra.gh`, the
-## prototype it stands for) is that entity's model, or placeholder box, in a translucent
-## blue-white; an entity marked for deconstruction (`extra.d`) gets Factorio's red cross over
+## prototype it stands for) is that entity's model, or its picture card when it has none (a mod's
+## building, as chunk_view.gd draws it built: sprite_standins.gd), else the placeholder box, in a
+## translucent blue-white; an entity marked for deconstruction (`extra.d`) gets Factorio's red cross over
 ## it, one marked for upgrade (`extra.up`) the green upgrade arrow. Per chunk, rebuilt when the
 ## world redraws the chunk (chunk_view.gd leaves ghosts out).
 
@@ -10,10 +11,12 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const FluidsPower := preload("res://scripts/world/fluids_power.gd")
+const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const GhostShader := preload("res://shaders/ghost.gdshader")
 const IconShader := preload("res://shaders/billboard_icon.gdshader")
 
 const MARK_SIZE := 0.9
+const GHOST_TINT := Color(0.58, 0.68, 1.0, 0.42)  # ghost.gdshader's
 const REBUILDS_PER_FRAME := 4
 
 var world: WorldMirror
@@ -83,6 +86,7 @@ func _rebuild(c: Vector2i) -> void:
 		return
 	var by_model := {}  # Mesh -> Array of Transform3D
 	var boxes: Array = []
+	var cards := {}  # card Mesh -> Array of Transform3D
 	var marks := {"d": [], "up": []}
 	var ghosts := 0
 	var tiles: Array = []
@@ -109,7 +113,17 @@ func _rebuild(c: Vector2i) -> void:
 				if shown.type == "cargo-bay" and not _add_cargo_pieces(shown, rec, by_model):
 					cv.waiting_models = true
 			else:
-				boxes.append(Visuals.placeholder_transform(shown, rec.pos, rec.dir, Visuals.height_for(shown)))
+				# No model: its picture card, as the built one (no box while it is composed, and none
+				# at all with a graphics list, as chunk_view.gd).
+				var card := SpriteStandins.card(shown.name, rec.dir, shown.size(), shown.type) if shown.type != "resource" else null
+				if card != null:
+					if not cards.has(card):
+						cards[card] = []
+					(cards[card] as Array).append(SpriteStandins.transform(rec.pos))
+				elif SpriteStandins.coming(shown.name, rec.dir):
+					cv.waiting_models = true
+				elif not SpriteStandins.in_use():
+					boxes.append(Visuals.placeholder_transform(shown, rec.pos, rec.dir, Visuals.height_for(shown)))
 		if shown == null:
 			continue
 		for key in marks:
@@ -127,6 +141,8 @@ func _rebuild(c: Vector2i) -> void:
 	_ghosts += ghosts
 	for mesh in by_model:
 		_add(node, mesh, by_model[mesh], _ghost_material)
+	for card in cards:
+		_add(node, card, cards[card], SpriteStandins.ghost_material(card, GHOST_TINT))
 	_add(node, Visuals.box_mesh(), boxes, _ghost_material)
 	_add(node, Visuals.box_mesh(), tiles, _ghost_material)
 	for key in marks:

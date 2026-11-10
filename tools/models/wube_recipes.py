@@ -59,7 +59,6 @@ EXTRA_MATERIALS = {
 }
 LOGISTIC_SCALE, LOGISTIC_UNTAPER, LOGISTIC_SHIFT = (1.184, 1.120, 0.891), 0.078, (-0.006, -0.082)
 
-BELTS = "Belts High Precision"
 RECIPES = {}
 
 # --- Belts: a frame ("Bottom") and the moving surface ("Top") that sits in it -----------------
@@ -411,7 +410,6 @@ RECIPES["electric-mining-drill"] = {"parts": [
 # inserter by the client; fingers and claws are steel, as the sprites draw them. Basic arms are
 # shared by the burner, yellow and fast inserters (their sprites differ only in colour).
 # "High Precision" files: pieces of one plate are told apart by where they lie (`pick_box`).
-INSERTERS = "Inserters High Precision"
 _ARMS = {
     # family: (file stem, shoulder y, elbow y, upper-arm box, hand box, claw box or None)
     "basic": ("basic-inserter", -11.9, 7.9, (-41, -10, -35, 10.5), (-41, 5, -35, 24.5), (-45, 23.5, -31, 31)),

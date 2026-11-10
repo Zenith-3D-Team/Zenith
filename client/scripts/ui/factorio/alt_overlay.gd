@@ -15,6 +15,7 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const DepthIcon := preload("res://shaders/billboard_icon_depth.gdshader")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 ## The icon is this many tiles across (measured on Factorio's alt-mode over assemblers).
 const ICON_TILES := 1.2
@@ -115,8 +116,9 @@ func collect() -> void:
 
 ## Whether a chunk's box (the ground up to 8 tiles) is at least partly inside the camera's frustum.
 static func _chunk_in_view(c: Vector2i, planes: Array[Plane]) -> bool:
-	var lo := Vector3(c.x * 32.0, -1.0, c.y * 32.0)
-	var hi := lo + Vector3(32.0, 9.0, 32.0)
+	var lo := Vector3(c.x * 32.0, -17.0 if GroundHeight.is_on() else -1.0, c.y * 32.0)
+	# An add-on's hills (ground_height.gd) lift the icons with the buildings under them.
+	var hi := lo + Vector3(32.0, 65.0 if GroundHeight.is_on() else 9.0, 32.0)
 	for plane in planes:
 		# The box's corner furthest into the frustum (against the plane's outward normal).
 		var n := plane.normal
@@ -170,8 +172,11 @@ func _draw_icon(world, camera: Camera3D, r: WorldMirror.Rec, textures: Array[Tex
 		return
 	var at := Vector3(c.x, Visuals.height_for(proto), c.y)
 	if _in_3d:
+		# Lifted onto the hills by the quads' shader.
 		_place_quads(world, camera, at + Vector3(0, tiles * 0.5, 0), textures, tiles)
 		return
+	# Over the building where an add-on's hills put it, not on the flat ground under the hill.
+	at.y += GroundHeight.at(at.x, at.z)
 	if camera.is_position_behind(at):
 		return
 	var p := camera.unproject_position(at)

@@ -12,25 +12,21 @@ import json
 import math
 import os
 import struct
+import sys
 
 import numpy as np
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import factorio_install  # noqa: E402
 from PIL import Image
 
 MODS = ("base", "space-age", "quality", "elevated-rails")
 
 
 def find_factorio():
-    env = os.environ.get("FACTORIO")
-    candidates = [env] if env else []
-    candidates += [
-        r"C:\Program Files (x86)\Steam\steamapps\common\Factorio",
-        r"C:\Program Files\Factorio",
-        os.path.expanduser("~/.steam/steam/steamapps/common/Factorio"),
-        os.path.expanduser("~/.local/share/Steam/steamapps/common/Factorio"),
-    ]
-    for c in candidates:
-        if c and os.path.isdir(os.path.join(c, "data", "base", "graphics", "icons")):
-            return c
+    folder = factorio_install.find()
+    if folder and os.path.isdir(os.path.join(folder, "data", "base", "graphics", "icons")):
+        return folder
     return None
 
 

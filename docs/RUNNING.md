@@ -46,36 +46,44 @@ made by `tools/record_menu_world.py`):
   - **Connect to address**: `host:port` of a bridge that is already running (a server started by
     hand, `server/run-server.ps1`, or the mock: `127.0.0.1:34200`). Joining a normal Factorio
     server isn't possible: the bridge only talks to a client on the same computer.
-- **Settings**: as in Factorio, a list of pages (Graphics, Controls, Sounds, Interface, Other, Mod settings, then ours: Camera, Factorio install), each opening alone with Back and Confirm; every option is wired to what it changes:
+- **Settings**: as in Factorio, a list of pages (Graphics, Controls, Sounds, Interface, Other, Mod settings, then ours: Camera, Factorio install, and Add-ons, which opens the Add-ons menu), each opening alone with Back and Confirm; every option is wired to what it changes:
   - **Graphics**: a **Preset** (Low, Medium, High, Ultra, or Custom once anything differs; it sets
     shadows, SSAO (off in every preset), level of detail, the view, entity, belt and decorative distances, decorative
     density and clouds together; High is the defaults) and **For this PC** (Recommended: the preset
     this PC should hold at a steady 60 UPS and 60 FPS, from its CPU threads and graphics card; in a
-    game it measures six seconds first; it also turns on the two belt and UPS options below); full
+    game it measures six seconds first; it also turns on Hold the game at 60 UPS and smooth belt
+    items, and sets merged materials below); full
     screen (windowed, borderless, exclusive), resolution, preferred screen, minimize on focus loss,
     VSync, FPS limit, game render scaling (50% to 200%), view distance (2 to 20 chunks round the
-    camera, default 10), entity distance (32 to 256 tiles, default 192; the server's "Max
+    camera, default 10; the bridge streams at most 625 chunks, so past 12 the view is the nearest
+    625, a circle about 14 chunks round), entity distance (32 to 256 tiles, default 192; the server's "Max
     live-update radius" caps it), belt item distance (0 off to 640 tiles, default 160: items on
-    belts drawn that far, moving near the character and as icons of what each lane carries past
-    that), belt updates (1,000 to 24,000 or Unlimited, default 6,000: the most items, and a little
-    for each lane, the server reads an update, from the character outwards; items move as far out
-    as that reaches, and the icons take over there; Unlimited moves every item within the belt
-    item distance), smooth belt items (on: belt items
-    read in one tick every update, so they follow curves; off: read a little each tick, lighter
-    for a busy server), hold the game at 60 UPS (on; see Troubleshooting), shadow distance (Automatic, the Shadows
-    quality's 80 to 200 tiles, or 60 to 400 tiles from the camera), smoke and particles,
-    items on belts (3D models or icons), clouds, decoratives, decorative density and distance (64
-    to 320 tiles, default 192), item icons, model look (each part in Factorio's colours, or
-    Factorio's sprite projected on). **Advanced:** anti-aliasing (FXAA, TAA, MSAA), shadows (off,
+    belts drawn that far, moving near the character and standing still on their lanes past
+    that), moving belt items (Automatic, the default, or 1,000 to 24,000 items, or Unlimited: the
+    most items, and a little for each lane, the server sends moving an update, from the character
+    outwards; further out they stand still; Automatic follows the frames' room, the game's speed and
+    what the reading costs the server, which each update reports (`bi` w), keeping it within about
+    1,500 work units a tick; Unlimited moves every item within the belt item distance), hold the game at
+    60 UPS (on; see Troubleshooting), smoke and particles, Items in 3D (Icons only, up to 20,000
+    or All, default All: how many belt items are 3D models, nearest the character first, the rest
+    their icons; Icons only draws every item as its icon, on the ground and in hands too), clouds,
+    decoratives, decorative density and distance (64 to 320 tiles, default 192), model look (each
+    part in Factorio's colours, or Factorio's sprite projected on). Smooth belt items (belt items
+    read in one tick every update, so they follow curves) and item icons are no longer shown and
+    stay on; Hold the game at 60 UPS still eases smooth belt items off under load. **Advanced:**
+    anti-aliasing (FXAA, TAA, MSAA), shadows (off,
     low, medium, high, ultra: the sun's shadow map is fitted to the ground in view, one map from
     the angled view and Godot's splits when the view reaches the horizon; Low one 2048 map out to
     80 tiles, Medium 4096 to 110, High 4096 to 150, Ultra 8192 to 200,
-    `scripts/world/sun_shadows.gd`), level of detail (low, medium, high: how soon far models and
+    `scripts/world/sun_shadows.gd`), shadow distance (Automatic, the Shadows quality's 80 to 200
+    tiles, or 60 to 400 tiles from the camera), level of detail (low, medium, high: how soon far models and
     their shadows are drawn simpler: 4, 4 and 1 pixels of error), merge far buildings (on: past
     128 tiles from the camera, or the shadow distance if further, and 40 tiles from the character,
-    each chunk's buildings are one simplified mesh with no moving parts; trees, ore and nests keep
-    their own; `scripts/world/far_chunks.gd`),
-    merged materials (off: each model drawn as one surface with one material, fewer draws and
+    each chunk's buildings are one simplified mesh with no moving parts, which casts their
+    shadows; trees, ore and nests keep their own; `scripts/world/far_chunks.gd`), animate modded
+    buildings (off by default, and turned off once in settings saved before: still pictures, less
+    memory; on: a mod's building drawn with its own Factorio picture runs its moving part while it
+    works), merged materials (off: each model drawn as one surface with one material, fewer draws and
     less render CPU for a little more GPU time; after a restart; `-- --merged-materials` or
     `--no-merged-materials` override it; Recommended turns it on for a big desktop GPU whose frames
     the CPU holds up, the presets leave it), Ambient occlusion (WIP, high GPU cost; off by default, and turned off once in settings saved before), render on a separate thread (off: Godot's experimental mode, after a restart).
@@ -89,16 +97,24 @@ made by `tools/record_menu_world.py`):
     listed greyed. `client/scripts/menu/controls_info.gd` says where an action goes.
   - **Interface**: under Factorio's headings: show minimap, control hints (F1; the help panel is off
     by default and hides while a window is open), Alt-mode and its inserter, pump and machine arrows (Factorio's defaults: inserters off), smart belt building, lock belt building to a straight line, UI scale, tooltip delay, the entity tooltip,
-    chat message delay; then the client's own: shortcut bar, research, alerts, debug line (F4), the
-    minimap's size, zoom and tags, and the map view's switches.
+    show mods' windows (off: mods' windows aren't drawn in Zenith for now, as their layout and
+    buttons don't match Factorio's yet; use them in Factorio with Ctrl+F9), click mods' buttons in
+    Factorio (with mods' windows shown: on, pressing a mod's button in Zenith clicks it in your own
+    Factorio window, hybrid on Windows; off, it says to use Factorio), chat message delay; then the
+    client's own: shortcut bar, research, alerts, debug line (F4), the minimap's size, zoom and
+    tags, and the map view's switches.
   - **Other**: the server's autosave interval and slots and verbose logging (written into the
-    `server-settings.json` the menu puts in the server's data folder; from the next start).
+    `server-settings.json` the menu puts in the server's data folder; from the next start), and
+    minimise Factorio in Zenith (on: Ctrl+F9 from Factorio minimises its window while Zenith
+    shows the game).
   - **Mod settings**: the bridge mod's map settings, changed over RCON in a game started from the menu.
   - **Camera**: the view a game starts in (Angled view, Factorio's view or First person), the
     angled view's projection (Perspective or Orthographic; Factorio's view, F6, is always
     orthographic), the map's remote view's projection (F7 switches the view in use and keeps it),
     the furthest zoom (60-400 tiles, 140 by default), how far the view zoomed in from the map zooms
-    out before the map comes back (80-480 tiles, 240 by default), mouse sensitivity, invert mouse look.
+    out before the map comes back (80-480 tiles, 240 by default), mouse sensitivity, invert mouse look,
+    camera follows the hills (off: over an add-on's hills the camera stays level and only first
+    person rides them).
   - **Factorio install**: path to `factorio.exe` (or its folder; empty finds it), the server's
     data and saves folders, the first port servers use.
 - **Mods**: base, the DLC and the mods in the server's mods folder, with versions and on/off boxes,
@@ -111,7 +127,14 @@ Every setting is in one file, `user://settings.cfg`
 (`%APPDATA%\Godot\app_userdata\Zenith\settings.cfg`; sections graphics, sound, interface, map,
 controls, camera, factorio, alerts, new_game). The older `ui.cfg` and `audio.cfg` are read into it
 once and then left alone. Settings from the project's old name (`app_userdata\Factorio 3D`) are
-copied over once. Most settings apply
+copied over once. The settings you changed in Factorio's own Settings window are the defaults
+(`client/scripts/menu/factorio_settings.gd`, read from Factorio's `config.ini` at start-up, the
+file the #14 keys come from): the volumes, v-sync, full screen, clouds, smoke and particles,
+decoratives, colour filter, UI scale, belt building, alt-mode arrows, the minimap, the autosave
+interval and the language of item names. A setting changed in Zenith still wins and its Default
+goes back to Factorio's; Settings → Factorio install → "Use the settings set in Factorio" turns
+it off. Settings left at Factorio's default (comments in `config.ini`) keep Zenith's. With
+`--settings-file` it is off unless `--factorio-config=<file>` names one. Most settings apply
 at once, the UI scale too (Settings → Interface, or Factorio's keys Ctrl+= / Ctrl+- / Ctrl+0 in
 the game and the menus; "Automatic" follows the window's height as it's resized). The UI is built
 at the scale it started with and scaled from there, so after a big change text is a little softer
@@ -121,7 +144,7 @@ uses another file (tests and screenshots).
 
 Starting a save runs Factorio exactly as `server/run-server.ps1` does (same `server/data` write-data
 folder, mod junction, `--enable-lua-udp`, RCON on 127.0.0.1 with the password in
-`server/data/rcon-password.txt`), but on free ports from 34500 up (Settings → Factorio install; UDP, game port, RCON, then the
+`server/data/rcon-password.txt`), but on free ports from 34500 up (Settings → Factorio → First port for servers; UDP, game port, RCON, then the
 client's own port), so servers started by hand keep theirs. A progress window shows Creating map →
 Starting server → Loading map → Connecting → Loading world; Cancel stops it. Errors (Factorio not
 found, map creation failed, the server stopping, no free ports, another Factorio using
@@ -145,6 +168,10 @@ groups; Tab completes a command's name, Up and Down go back through what you typ
   the `/f3d-*` commands; and, without RCON, `/version`, `/seed`, `/time`, `/evolution`, `/players`,
   `/admins`, `/server-save`. Cheat mode itself is a player's setting: the bridge's own character on
   a map nobody has joined gets the research and the kit but still crafts at the normal speed.
+  In a multiplayer game these are for admins: a player who joined the server and plays through
+  Zenith on their own machine must be an admin, and so must one typing the mod's `/f3d-*` commands
+  into Factorio's console. A Zenith on the server's own machine always may (the server's console
+  and RCON are there too).
 - **Over RCON** (a server the menu started): Lua (`/c`, `/sc`, `/mc`) and the server's commands
   (`/kick`, `/ban`, `/promote`, `/whisper`, `/config get`, ...). In Lua, `game.player` is the player
   whose character the client plays; on a map nobody has joined it stands for the bridge's own
@@ -177,8 +204,14 @@ to the menu (saving and stopping the server) and quit. `--factorio=<exe>`, `--se
 The zip holds one folder: `Zenith.exe` (Linux: `Zenith.x86_64`, marked executable), the bridge mod
 in `mod/factorio-3d-bridge`, the server scripts in `server/`, the licence, credits, this project's
 player's guide and `START HERE.txt`. The exported client finds `mod/` and `server/` next to its own
-executable (on macOS next to `Zenith.app`), so its servers keep their data in `server/data` and
-saves in `server/saves` there. Windows and Linux are the supported downloads; the Linux build has
+executable (on macOS next to `Zenith.app`). Its servers' data and saves are kept in Zenith's user
+folder instead, beside `settings.cfg` (`%APPDATA%\Godot\app_userdata\Zenith\server-data` and
+`...\saves` on Windows), so an update, unpacked into a new folder, finds them; a checkout keeps
+using `server/data` and `server/saves`, where `run-server.ps1` and the tools look. The first start
+of such a build copies what an older one kept in `server/saves` and `server/data/mods` beside it
+(saves, the server's own mods, `mod-list.json`, `mod-settings.dat`) while the user folder has
+none, and the bridge mod's link in the server's mods is made again at every start, so it always
+points at this version's mod. Settings → Factorio install's folders still override both. Windows and Linux are the supported downloads; the Linux build has
 not been run yet.
 
 **Unsupported downloads (owner's label):** `linux-arm64` (issue #8), `windows-arm64` and `macos`
@@ -365,8 +398,8 @@ view, Factoriopedia, statistics, the trains on the map, hover info) is done in s
 300 work units a tick by default (about one entity read each); the client may change it
 (`budget`, 50 to 20000) and hears once a second how it is used (`wb`, docs/PROTOCOL.md "Work
 budget"). **Update rates** (`scripts/rate.lua`): at `rate` level 1 to 3 the costliest periodic
-updates (belt items, far lanes, movers, then machine states, enemies, then fluids, trains, turrets,
-inserter hands) come less often, each level doubling their interval; the character's own
+updates (belt items, far lanes, movers, then machine states, enemies, plants and spawners, then
+fluids, trains, turrets, inserter hands) come less often, each level doubling their interval; the character's own
 updates never slow. Hold the game at 60 UPS sets both; `/f3d-rate 0-3` sets the level by hand.
 
 ### Watching with the normal game
@@ -378,8 +411,40 @@ you host on). You get your own character next to the 3D client's, with all the n
 **Ctrl+F9** (Show in Factorio) in the client brings Factorio's window to the front, or starts
 Factorio joined to the server the client started. While you play there, the bridge drives your
 player's character, so both windows show the same one. The mod adds the same key in Factorio
-("Show in Zenith"), which brings the client back. The swap with a real Factorio window hasn't been
-tried yet.
+("Show in Zenith"), which brings the client back and minimises Factorio (Settings → Other →
+Minimise Factorio in Zenith turns that off). Checked with a real Factorio 2.1.24 window in
+single-player: a minimised Factorio keeps running the game at 60 UPS.
+
+**Modded saves from the menu.** Opening a save from Zenith's menu starts its server with the save's
+mods: every mod in your Factorio mods folder (beside Factorio's saves) is linked into the server's mods
+folder (hard links for zips, junctions for folders), the mod list starts from everything off, and
+`factorio --sync-mods <save>` turns on the save's mods at its versions; the bridge is then turned on
+again. A mod the save needs that isn't in your folder stops the start with Factorio's list of what is
+missing.
+
+**Starting Zenith from Factorio.** Start Factorio through `server/factorio-with-zenith.ps1` and
+Ctrl+F9 in the game starts Zenith when none is connected: Zenith joins that game, comes to the
+front and minimises Factorio. With Steam, set Factorio's launch options (Properties → General) to
+
+```
+powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\ProgramData\Zenith\factorio-with-zenith.ps1" %command%
+```
+
+the same line on every PC: each time Zenith starts it puts its launcher (`server/factorio-with-zenith.ps1`,
+in every download) in `C:\ProgramData\Zenith`, updating it with each version (add `--enable-lua-udp <port>` after `%command%` for a port other than 34200). The script opens
+the bridge's port, listens on 127.0.0.1:34209 while Factorio runs, and starts whatever Zenith ran
+last on this PC (Zenith writes how to start it to `launch.json` in its user folder each time it
+starts, so run it once first). Factorio's opening cutscene holds keys back: Ctrl+F9 works once
+it has ended (Tab skips it). Settings → Other → Copy launch options puts that line on the clipboard.
+Open Zenith before setting the line: until Zenith has put the launcher there, Steam can't start
+Factorio with it. The script answers the bridge (`launching`). If nothing answers within 0.75 s
+(Factorio wasn't started with the launch options), the bridge's window in the game lists the two
+steps with boxes to copy from: get Zenith (the releases page) and open it once, then the launch
+options line. If the script answers but has no Zenith to start (never opened on this PC, or moved
+or removed since), the window shows only the first step. A player who has the bridge from the mod
+portal and no Zenith gets the same window. Each step is logged to `factorio-current.log` as a
+`[Zenith] Show in Zenith` line. If Zenith is already open (its menu), the script brings it to the
+front.
 
 ### Several 3D clients on one server
 
@@ -414,9 +479,13 @@ puts back what it borrowed. On a server the same command answers over RCON
 
 ## Client controls
 
+These are the defaults. The keys you changed in Factorio's own Settings → Controls (its `config.ini`)
+replace them, so both answer the same keys (Settings → Controls → "Use the keys set in Factorio";
+a binding changed in Zenith's Settings still wins). Mouse bindings set in Factorio aren't used.
+
 | Input | Action |
 |---|---|
-| WASD / arrows (or a gamepad's left stick) | Walk, relative to the camera, at any angle (the bridge steers Factorio's 8-way character to follow it) |
+| WASD / arrows (or a gamepad's left stick) | Walk, relative to the camera, at any angle (the bridge steers Factorio's 8-way character to follow it). The stick walks only on a gamepad Godot recognises, once it has been seen centred: pedals, wheels and throttles are left alone |
 | Right mouse (hold) | Mine what's under the cursor; a train, wagon, car, tank or spidertron under it first (issue #10: not the rail beneath), with what is inside it |
 | Enter | Get into the nearest vehicle (car, tank, train, spidertron) or out of it |
 | Spidertron remote (shortcut bar) | Drag: select spidertrons · Shift+drag: add · right-drag: remove · click: send them there · Shift+click: queue a waypoint |
@@ -445,12 +514,12 @@ puts back what it borrowed. On a server the same command answers over RCON
 | Ctrl+mouse wheel | The held item's quality (the qualities your force has) |
 | Ctrl+Shift+left | Super-forced build: a ghost, and what stands in the way is marked for deconstruction |
 | Holding tiles (stone brick, concrete, landfill, foundation...) | The brush shows at the cursor (green, red where the tile can't go, blue as ghosts with Shift). Left mouse paints, right mouse mines placed tiles back; Numpad + / - change the tile area; R turns hazard concrete |
-| Holding rails | Click a rail end to start the rail planner there: the path of straight and curved rails to the cursor shows, click (or drag from the end) builds it and carries on from its end; ghosts where your rails run out. Alt+R (while holding rails; otherwise it gives red wire): rail layer (a ramp up, elevated rails with supports). Right click lets go |
+| Holding rails | Click a rail end, or anywhere along a line to fork a new one off it, to start the rail planner there: the path of straight and curved rails to the cursor shows, click (or drag from the end) builds it and carries on from its end; ghosts where your rails run out. Alt+R (while holding rails; otherwise it gives red wire): rail layer (a ramp up, elevated rails with supports). Right click lets go |
 | Holding grenades, cliff explosives, capsules | The throw range and blast show; left click throws at the cursor (hold to keep throwing). Fish heal you |
 | R / Shift+R | Rotate the held item (rails by 45°), or the hovered entity. Building the same belt over a belt turns it; a faster belt (or anything that fast-replaces) replaces it |
 | Left mouse with nothing held | Open the hovered building's screen (chests, assemblers, furnaces, labs, drills, boilers...) beside your inventory: its name, status (Working, No ingredients, No fuel, No power...), energy, slots and fluid boxes. E, Esc or its × closes it |
 | Recipe slot in an assembler's screen | Click to pick its recipe from the grid below; right click clears it. Items it was holding come back to you |
-| Q | Put the held item (the cursor stack) away; with nothing held over an entity, the pipette: hold its item, turned the same way (a ghost cursor when you have none) |
+| Q | Put the held item (the cursor stack) away; with nothing held over an entity, a train, wagon or vehicle, the pipette: hold its item, turned the same way (a ghost cursor when you have none) |
 | Z (hold) | Drop one of the held item: into the machine or chest under the mouse, onto a belt, or on the ground |
 | Shift+left click | Holding an item: build a ghost of it for robots. Holding nothing: paste the settings copied with Shift+right click (recipe, filters, requests, combinator settings) |
 | Ctrl+left / Ctrl+right click an entity | Fast transfer: the held stack (half) into it, or with nothing held its output (half) into your inventory |
@@ -486,11 +555,13 @@ puts back what it borrowed. On a server the same command answers over RCON
 Client command-line options go after `--` (Godot: Project → Project Settings → Run, or the
 command line): `--factorio-port=34200 --port=34201 --models=/path/to/glb/folder
 --factorio-data=/path/to/Factorio/data`. `--models=` only fills in entities without a model of
-their own; add `--models-first` to let the folder's models replace the built-in ones.
+their own; add `--models-first` to let the folder's models replace the built-in ones. Without `--models=`, the
+`models` folder beside Zenith (the checkout's root, or beside Zenith.exe) is used that way when it
+holds any; `--no-custom-models` leaves it out.
 `--addons=<folder>[,<folder>...]` loads add-ons from those folders (an add-on's own folder or a
 folder of add-ons), always on, ahead of installed ones with the same id ([ADDONS.md](ADDONS.md)). `--camera=factorio`, `--camera=first-person` or
 `--camera=<yaw>,<pitch>,<distance>[,ortho]` start in that view instead of the Camera setting's
-(`--camera=0,48,14,ortho` is close to Factorio's own). `--screenshot=<file.png>[@seconds]` saves
+(`--camera=0,48,14,ortho` is close to Factorio's own; a distance past Furthest zoom is kept for that run). `--screenshot=<file.png>[@seconds]` saves
 the window once (default after 10 s; needs a window). `--open=<unit>` opens that entity's machine screen once
 it has loaded (for screenshots and debugging). Also for screenshots: `--ui=inventory` opens the
 character window at start, `--ui-sample` feeds sample recipe details (crafting tabs, ingredients)
@@ -536,6 +607,24 @@ standalone locations; `--factorio-data` points it at the `data` folder otherwise
 found once at start-up: after changing that setting, restart Zenith (Settings and the main menu say so). Without icons, items are small coloured blocks. The headless build
 has no graphics, so it can't supply icons.
 
+### Modded games
+
+A modded game shows each mod's own icons, ground, decoratives, names and, for buildings Zenith
+has no model of, the mod's own picture on a card facing Factorio's camera.
+The bridge lists every prototype's graphics at the data stage and sends the list once per set of
+mods (`gfx`, docs/PROTOCOL.md); the client keeps it in `user://mod-graphics/` and reads the pictures
+from the mods themselves, never copying them: the server's mods folder (`server/data/mods`, which
+the menu's servers use), then your own (`%APPDATA%\Factorio\mods`, `~/.factorio/mods`), then a
+portable install's, or `--factorio-mods=<folder>[;<folder>...]` first. Mods may be folders or zips;
+the version the game runs is picked when a folder holds several. Load game on a modded save links
+your own mods folder's mods into the server's and runs Factorio's `--sync-mods` on the save, so the
+server runs exactly the save's mods at its versions, then turns the bridge on; a mod missing there
+(or there at another version) is named with its version, since Factorio, with no mod portal login on
+the server, says only "unknown error". Their machines' pictures move while
+they work (16 frames of each loop, when Settings > Graphics > Animate modded buildings is on; off by default). What
+isn't drawn yet: those cards' working lights at night, and a mod that changes graphics in its own `data-final-fixes`
+after the bridge's (its list is made before) shows the earlier pictures.
+
 The ground uses Factorio's own tile pictures from the same install: `base/prototypes/tile/tiles.lua`
 (and Space Age's) say which picture, variant sizes, weights and layer each tile has, and the
 pictures come from `*/graphics/terrain/`. Each tile shows one of Factorio's 1x1, 2x2 or 4x4
@@ -568,7 +657,8 @@ icon buttons under the side menu, lit orange when on; also in Settings → Inter
 networks (poles' supply areas and their copper wires), logistic networks (roboports' logistic and
 construction areas), turret coverage, train stop names, worker robots, rail signal states, recipe
 icons and pollution. Trains are drawn live in their own colours where radars see them. The mod sends them with each chunk's chart (`ov`, see
-docs/PROTOCOL.md "Map"); the minimap shows the same layers. The logistic layer shows every roboport
+docs/PROTOCOL.md "Map"); the minimap, as Factorio's, draws none of them (only trains, train stops'
+markers and tags). The logistic layer shows every roboport
 on the surface, not only those on the charts loaded: the client asks the mod for the whole list
 (`mrp`) every 10 s while a map or the remote view needs it. Overlapping areas read as one region,
 as on Factorio's map.
@@ -593,8 +683,9 @@ within reach it goes straight in), and so does clicking a module slot of a scree
 remote view; right click on that slot takes the request back.
 
 **Trains.** The side menu's Trains button, or "All trains" in a train's or stop's window, opens
-Factorio's trains overview: every train of the force with its state, stop, size and cargo, a switch
-between automatic and manual, and View (remote view at the train).
+Factorio's trains overview: Trains, Stations and Groups tabs, and a card for every train of the
+force with a live view of it from above, its state, carriages and cargo; clicking a card looks at
+the train in remote view.
 
 The map's options are in the `[map]` section of `user://settings.cfg`;
 `client/scripts/ui/ui_settings.gd` gives them limits and a `changed` signal
@@ -604,9 +695,9 @@ The map's options are in the `[map]` section of `user://settings.cfg`;
 [map]
 minimap=true        ; show the minimap
 minimap_size=240    ; its side in Factorio GUI pixels (times the UI scale), 120 to 480
-minimap_zoom=1.0    ; GUI pixels per tile, 0.25 to 4 (the minimap's + / - buttons change it)
+minimap_zoom=1.0    ; GUI pixels per tile, 0.25 to 4 (Shift + wheel over the minimap changes it)
 minimap_tags=true   ; tags on the minimap
-show_tags=true      ; the map view's switches (both views): show_tags, show_electric,
+show_tags=true      ; the map view's switches (the map view only): show_tags, show_electric,
 show_turrets=false  ; show_logistic, show_turrets, show_stops, show_robots, show_signals,
                     ; show_recipes, show_pollution (off by default)
 ```
@@ -642,7 +733,7 @@ walking_on=true ; <name>_on=false mutes that slider
 max_voices=12   ; machine and vehicle loops playing at once
 output_device="Default"
 [graphics]
-effects=true    ; smoke, flashes, explosions, corpses
+effects=true    ; smoke, dust, flashes, explosions
 ```
 
 Command-line options (after `--`) override the file for that run: `--volume=0.5` (master),
@@ -766,14 +857,15 @@ the server console or RCON, for example `/c settings.global["f3d-chunks-per-tick
 | Setting | Default | |
 |---|---|---|
 | Surface to stream | nauvis | Where the server's character lives |
-| Chunk snapshots per tick | 1 | Faster world loading vs. script time per tick |
+| Chunk snapshots per tick | 1 | Faster world loading vs. script time per tick. Only chunks that must be read count: chunks the client kept (answered `same`) and ungenerated ones (`none`) don't wait for it, so going back to a surface (a Factorissimo building's door, a platform and back) takes a few ticks |
 | Bytes sent per tick | 32768 | Caps queued world data per tick |
 | Max live-update radius | 192 | Movers and machine states beyond this aren't sent; caps the client's "Entity distance" (Settings → Graphics, default 192). A save keeps the value it had; on a server raise it with `/c settings.global["f3d-max-focus-radius"] = {value = 192}` |
 | Moving entity update interval | 2 | Ticks between mover updates |
-| Belt item, ground item and inserter radius | 24 | Items on belts, items on the ground and inserter hands within this many tiles of the camera are sent; 0 turns them off. Lower it if a dense base costs too much script time |
+| Belt item, ground item and inserter radius | 24 | Items on the ground, inserter hands, fluids, heat, robots' cargo and plants' growth within this many tiles of the camera are sent; 0 turns them off. Items on belts go as far as the client's Belt item distance (Settings → Graphics), which Zenith always sends; this radius is used for them only by clients that don't. Lower it if a dense base costs too much script time |
 | Belt item and inserter update interval | 6 | Ticks between updates; the client glides items and arms in between |
 | Starter kit | on | Freeplay items for the bridge's own character |
 | Player to play as | (empty) | Whose character the client plays on a server; empty: the player who was online last. `/f3d-player` changes it while the game runs |
+| Act as the player for other mods | on | When the client plays a player's own character (single-player, or the player to play as while they're connected), building, mining, rotating, pasting settings and opening machines go through that player, so other mods get Factorio's own player events (`on_built_entity`, `on_player_mined_entity`, `on_gui_opened`...) and Factorio's own reach and placement rules apply. The bridge's own character (no player) always acts by script |
 
 ## Troubleshooting
 
@@ -797,7 +889,7 @@ the server console or RCON, for example `/c settings.global["f3d-chunks-per-tick
   and view distances go below your settings (floors 64 tiles, 8, 32, 5 chunks), then a 45 FPS cap; it gives a step back after 30 s at 60. It also keeps
   the bridge's work budget to the room the game has, so a big request doesn't make a slow tick.
   Your settings stay as they are; the F4 line says what it holds back. Otherwise `/f3d-profile`, then `/f3d-status`, shows which module costs most: lower "Belt
-  item, ground item and inserter radius", or the client's "Belt updates", "Belt item distance"
+  item, ground item and inserter radius", or the client's "Moving belt items", "Belt item distance"
   and "Entity distance". `python tools/ups_probe.py --port <rcon> --seconds 30 --profile`
   measures the server's UPS and the bridge's cost; `-- --ups-probe=out.json[@walk]` lowers each
   of the client's knobs in turn and prints the UPS each buys (`@governed=<s>` logs the governor).
@@ -839,6 +931,8 @@ With the separate render thread the renderer's own times are only read with
 `--probe-render-times` (each read waits for that thread). `--belt-items-sync` handles belt items on
 the main thread instead of a worker, for comparing. `--no-belt-stand-ins` draws every belt whole
 (belts drawn under 20 pixels a tile are otherwise light stand-ins, belt_lods.gd), for comparing.
+`--far-merge-from=<tiles>` merges far chunks' buildings from that distance instead of about four
+chunks (far_chunks.gd), for screenshots of merged buildings up close.
 Each frame also records the sliced systems' books (`fb`: each one's µs used, granted and work
 waiting, frame_budget.gd), the chunks wanted round the focus but not drawn yet (`q_undrawn`, and
 `q_near_undrawn` within two chunks), and at the end the time from a chunk being wanted to its
@@ -865,20 +959,144 @@ a server (`godot --headless --path client res://tests/belt_path_replay.tscn -- -
 --out=drawn.json --period=6`, `--straight` for straight glides, `--lead=20` for the mod's light mode)
 or from the client against that server, `-- --belt-path-probe=drawn.json@20` (records 20 s after
 10 s, prints belt items' main-thread and worker time, then quits; `-` as the path for the costs only).
+The layout also has packed rows (a straight belt per tier fed iron plates on both lanes and emptied at
+its far end, one lane as fast as they come and the other one plate every 30 ticks, so it backs up
+and creeps), which the bridge sends as belt groups (`bi` bg in
+docs/PROTOCOL.md). Items the client makes itself for a group have ids of their own, so `check`
+also prints a line measured by place: each drawn item's distance from the nearest item the game had
+at that tick (p50, p99), the share drawn with no game item within 0.15 tile, and the share of the
+game's items with none drawn within 0.15. The client's `-- --no-belt-groups` leaves `bg` out of its
+hello, so every lane comes item by item as before, for comparing, and straight runs (`br`,
+`bi` pl in docs/PROTOCOL.md) are off unless the client is started with `-- --belt-runs` (until
+standing with runs is as accurate as without; `--no-belt-runs` is no longer needed). `check ... --within x0,y0,x1,y1` counts only drawn and game items inside that
+rectangle, for a recording of part of what the client draws (the save's busy belts: record
+`--area -284,-26,-260,-2` round -272,-14 and check `--within` the same).
+
+A captured stream replayed against the game: `belt_bench.py ... --capture bi.jsonl` writes every
+`bi` message the stand-in client gets, from its first, while `belt_path_check.py record` records the
+game over part of the square; `godot --headless --path client res://tests/belt_stream_replay.tscn --
+--truth=truth.json --stream=bi.jsonl --out=drawn.json --within=x0,y0,x1,y1` feeds them through
+belt_items.gd on their ticks (the belts indexed from the recording) and writes where every item is
+drawn each tick, for `check` (by place: the made and moved items have the game's unique ids, but
+groups' have ids of their own). `record` takes the belts `--belt-margin` (16) tiles past the area:
+the replay knows only the recorded belts, and an item going on past the last one is held at its
+lane's end (recorded without the margin, 10-20 items piled up at the area's edges, x -284 and
+y -2 on the save: the replay's doing, not the client's).
+
+The client's own model of straight runs (plain lanes it moves itself, `br`), tick by tick against the
+game: `python tools/belt_truth.py survey --at -272,-14` lists the straight runs round a point (length,
+tier, items, stacks, whether they moved, inserters' targets, side-loads, what is behind and in front);
+`record --out DIR --runs "x,y;x,y;..." --udp-port <port> --rcon-port <port>` connects a stand-in client
+(hello `z b bl bg br`, `--no-runs` without `br`) that keeps every `bi` (DIR/stream.jsonl) while the
+game records, every tick, every lane of the runs through those belts and the lanes either side: each
+item's unique id, line position (1/256) and stack size (DIR/truth.jsonl; `--from-start` from before
+the client's hello). `godot --headless --path client res://tests/belt_truth_replay.tscn --
+--dir=DIR` replays the stream through belt_items.gd and writes each item's record at every update's
+tick (DIR/model.json) and what is drawn every frame (DIR/drawn.json); `--items-script=res://...` replays
+another copy of belt_items.gd (a fix tried against the same stream), `--stream=` another stream file,
+`--out=<name>` names the outputs, `--trace=uid,...` prints what the stream said of those items and what
+the client made of them each update. `compare DIR [--name <name>]` matches the game's items and the
+client's along each run by order (the client's items keep the ids they came with, but groups' and
+plain chains' are moved here), per lane and update: the first update they differ, counts, offsets,
+items missing and extra, by thirds of the recording and by the mod's near and far tiers, and the drawn
+share of the game's items with no drawn item within 0.15 tile (and of drawn items with no game item).
+`oracle DIR` writes a stream with every item on the recorded lanes where the game had it (what is left
+is the client's own model), `--edges` also sends every watched lane of the runs whole each update,
+`--outside` takes plain lanes whose lane in front leaves the square out of `pl`: mod fixes tried
+without changing the mod.
+
+Factorio's belt rules, measured in the running game: `python tools/belt_rules.py --rcon-port <port>
+all` (or `lengths speed gap line sideload splitter inserter`) builds small rows on a lab surface of its
+own (`zenith-belt-rules`) and records their lanes every tick; docs/BELT-RULES.md has the results.
+
+What items on belts cost the bridge, without the windowed client: `python3 tools/belt_bench.py
+--udp-port 34200 --teleport -272,-16 --seconds 40 --json out.json` against a running server (on a
+copy of a save: it uses `/c`) connects a stand-in client that asks for belt items as Zenith does
+(the High distances by default: `--near 160`, `--cap 6000`, `--units` for Smooth belt items),
+`--groups` to say `bg` too, `--runs` to say `br` (straight runs moved by the client). It warms up for
+`--warmup` seconds (20 by default) and then records the bridge's per-module times, the game's UPS,
+the bytes of each message type, how far moving items reached (`bi` fr: mean, min, max) and
+belt_items.lua's counts per update (lanes checked, held, read in full, held as groups, plain lanes
+not checked and read, far lanes held, far icon chunks skipped, items read). Its docstring has the
+usage.
+
+#### The other probes and debug options
+
+The client's other probes (client/scripts/debug/, each file's header has the details). Each runs
+after the `--`, writes its file or prints its lines, and quits when done; run them windowed
+against the mock or your own server unless said.
+
+- `--robot-probe=<out.json>[@seconds]`: stands still and records what each frame costs with the
+  movers in view (frame, movers' script time, draw calls, GPU); with the mock's `--robots N`.
+  `--robot-nodes` draws robots a node each, as before robot_swarm.gd, for comparing.
+- `--glide-probe=<out.json>[@seconds]`: goes through the bridge's `rate` levels 0 to 3 (30 s each)
+  and reports, per kind of mover and for belt items, the speed and how often they stall or jump.
+- `--soak-probe=<out.json>[@minutes]`: a long session (30 minutes): walks a square, opens windows,
+  builds and mines a wooden chest, and samples memory, objects, frame times, the bridge's gaps and
+  resyncs and the server's UPS.
+- `--predict-probe=<out.json>[@builds]`: builds a wooden chest beside the character over and over
+  and times each click to the game's chest drawn (what scripts/world/predicted.gd hides).
+- `--quit-probe=<seconds>`: quits after that long without the exit guard, so a hang on quitting
+  stays visible; `python tools/quit_soak.py` starts and quits the client many times with it.
+- `--flicker-probe=<folder>[@degrees a frame]`: saves frames while the camera turns slowly;
+  `@pan` moves Factorio's view one pixel a frame instead. `python tools/flicker_count.py` (`--pan`)
+  counts the pixels that change and change back.
+- `--terrain-probe`: every 5 s prints how long chunks waited for their tiles and their ground, and
+  how long chunks near the focus were holes.
+- `--mod-click-probe=<name>[,<name>...]`: presses mods' buttons in Zenith's copies of their windows
+  and logs the windows before and after (no names: lists the buttons); `--mod-click-probe-quit`
+  quits after the last.
+- With `--stutter-probe`: `--probe-trace=<ticks>` has the bridge log each module's time per tick
+  (`f3dtrace` lines in Factorio's log) once the walk starts, asked through the console so
+  single-player needs no RCON; `--probe-fine` keeps subtrees over 0.005 ms, not only over 0.1.
+- Screenshots of models and animations: `--review-shots=<dir>[@seconds]` (what
+  tools/models/review.py starts) with `--review-box=<w>,<d>,<h>`, `--review-aim=<height>`,
+  `--review-views=<a,b,...>` and `--review-fly=<path.json>` (a camera flight);
+  `--anim-shots=<dir>@<start>,<count>,<step>` saves `count` frames `step` seconds apart
+  (`--anim-hud` keeps the HUD), with `--anim-pose=<run|mine|aim|...>` holding the character in one
+  animation (also `walk`, `exo`, `back`, `stop`, and in mech armour `hover`, `fly` and `flyloop`:
+  take-off, hovering and landing every 4 s), `--anim-rate=<x>` playing it at x times its speed (0.1
+  to step through a loop, as each screenshot takes longer than a frame) and `--worm-state=<0|1|2>`
+  every worm folded, up or attacking. The mock's `--fly loop|walk` (with `--armor mech-armor`) makes
+  the character fly at Factorio's own rates, on a timer or while walking.
+- For screenshots and comparing: `--far-merge-from=<tiles>` merges far chunks' buildings from that
+  distance (under 40 tiles, up close too); `--rail-from=<x>,<y>` starts the rail planner there once
+  rails are held; `--map-surface=<index>` shows that surface on the map after 6 s and
+  `--remote-surface=<index>` its world in the remote view; `--update-rate=<0-3>` asks the bridge
+  for that `rate` level from the start; `--factorio-locale=<code>` uses that language's names
+  instead of Factorio's setting.
+- `--from-factorio` is what server/factorio-with-zenith.ps1 passes when Ctrl+F9 in Factorio starts
+  Zenith: it comes to the front once joined and minimises Factorio (Settings → Other).
+
+Two more measurements against a running server, without the windowed client (their docstrings
+have the usage): `python tools/alt_cost.py` streams the chunks round a spot and measures what
+Alt-mode costs the bridge, off and on; `python tools/request_spikes.py` sends the client's requests
+one at a time while the bridge traces every tick, and reports the slowest tick round each.
 
 ## Tests
 
 ```
 python3 -m venv .venv && .venv/bin/pip install lupa "gdtoolkit==4.*"   # once (Windows: .venv\Scripts\pip)
 .venv/bin/python tools/mod_tests/test_bridge.py   # the mod, against a fake Factorio API
+.venv/bin/python tools/mod_tests/test_data_stage.py   # the mod's data stage (the graphics list)
+.venv/bin/python tools/mod_tests/test_fuzz.py     # the mod against malformed, truncated, out-of-order packets
 python3 tools/test_mock_server.py                 # the mock server, over real UDP
+python3 tools/test_mock_fuzz.py                   # the mock, fuzzed the same way
 for f in $(find client -name '*.gd'); do .venv/bin/gdparse "$f" >/dev/null || echo "FAIL $f"; done
+python3 tools/models/check.py                     # after model changes: name, footprint, origin, triangle budget
 godot --headless --path client res://tests/ui_test.tscn   # the UI's input paths; exits 1 on failure
 godot --headless --path client res://tests/addon_test.tscn   # add-ons: loading, keys, the camera, data
+godot --headless --path client res://tests/bridge_fuzz_test.tscn   # the client's packet parsing, fuzzed
+godot --headless --path client res://tests/decor_test.tscn   # decoratives
+godot --headless --path client res://tests/vr_test.tscn      # VR panel and session without a headset
 godot --headless --path client -s res://tests/model_load_test.gd   # after model changes: every model loads the same both ways
+godot --headless --path client -s res://tests/mod_files_test.gd    # mods' files and the graphics list
 ```
 
-The first two check every message against the protocol (`tools/protocol.py`). `lupa` embeds Lua
+CI (`.github/workflows/tests.yml`) runs all of these on every push, and `tools/live_check.py`
+and `tools/busy_base.py` against Factorio's Linux headless build.
+
+`test_bridge.py` and `test_mock_server.py` check every message against the protocol (`tools/protocol.py`). `lupa` embeds Lua
 5.2, the version Factorio uses. `tools/live_check.py` (above) checks the mod in real Factorio.
 
 ## Not done yet
@@ -895,5 +1113,8 @@ The first two check every message against the protocol (`tools/protocol.py`). `l
   clutter has no 3D foliage.
 - Forests are the graphics card's biggest cost on High.
 - Tips and tricks has no pictures (Factorio's tips are simulations the client can't play).
-- Hybrid single-player has only been played once (on Factorio 2.1.24); Ctrl+F9's swap to a real
-  Factorio window hasn't been tried.
+- A mod's buildings without a model are their picture on a card: animated at 16 frames of each
+  loop, no working lights at night; a mod that changes graphics in its own `data-final-fixes` after the bridge's shows the
+  earlier pictures.
+- Hybrid single-player has been played only a little (on Factorio 2.1.24). Starting Zenith from
+  Factorio's Ctrl+F9 needs Factorio started through `server/factorio-with-zenith.ps1`, on Windows.

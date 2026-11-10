@@ -23,12 +23,11 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import rcon  # noqa: E402
 
-MOD = "__factorio-3d-bridge__"
 PORT = None
 
 
 def lua(code):
-    return rcon.run(f"/c {MOD} " + " ".join(line.strip() for line in code.strip().splitlines()), port=PORT, timeout=60.0).strip()
+    return rcon.mod_lua(code, port=PORT, timeout=60.0)
 
 
 PRELUDE = """

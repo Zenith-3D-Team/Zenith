@@ -43,6 +43,9 @@ var orthographic := false
 var camera := Camera3D.new()
 ## How far the wheel zooms out (Settings > Camera > Furthest zoom).
 var max_distance := MAX_DISTANCE
+## A `--camera=` view's distance (0: none): Furthest zoom reaches at least that far for the run, so
+## the view starts and stays where it was asked for.
+var _arg_distance := 0.0
 ## In the remote view (factorio_ui.gd sets it), the map's own projection applies instead of
 ## `orthographic` (Settings > Camera, one for the map and one for the normal view).
 var in_remote := false
@@ -90,7 +93,7 @@ func _ready() -> void:
 	camera.far = 2000.0
 	add_child(camera)
 	camera.make_current()
-	_configure_from_command_line()
+	configure_from(OS.get_cmdline_user_args())
 	if target != null:
 		global_position = _follow(target.global_position)
 	# --camera=factorio starts in Factorio's view (handy for screenshots).
@@ -114,7 +117,7 @@ func _ready() -> void:
 func apply_settings() -> void:
 	look_speed = clampf(float(Settings.get_value("camera", "look_sensitivity")), 0.05, 10.0)
 	look_sign = -1.0 if bool(Settings.get_value("camera", "invert_y")) else 1.0
-	max_distance = clampf(float(Settings.get_value("camera", "max_zoom")), MAX_ZOOM_RANGE.x, MAX_ZOOM_RANGE.y)
+	max_distance = maxf(clampf(float(Settings.get_value("camera", "max_zoom")), MAX_ZOOM_RANGE.x, MAX_ZOOM_RANGE.y), _arg_distance)
 	_distance_goal = minf(_distance_goal, max_distance)
 	remote_orthographic = bool(Settings.get_value("camera", "map_orthographic"))
 	if Settings.has_arg("--camera="):
@@ -137,7 +140,10 @@ func _process(delta: float) -> void:
 			global_position = GroundHeight.lift(target.global_position)
 		var look := Basis(Vector3.UP, deg_to_rad(_look_yaw)) * Basis(Vector3.RIGHT, -deg_to_rad(_look_pitch))
 		camera.transform = Transform3D(look, Vector3(0.0, EYE_HEIGHT, 0.0))
-		camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+		# Set only when it differs: Camera3D's setters don't check, and each one updates the
+		# rendering server's camera and emits property_list_changed.
+		if camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
+			camera.projection = Camera3D.PROJECTION_PERSPECTIVE
 		return
 	if target != null:
 		global_position = global_position.lerp(_follow(target.global_position), 1.0 - exp(-delta * 8.0))
@@ -150,9 +156,10 @@ func _process(delta: float) -> void:
 	var turn := Basis(Vector3.UP, deg_to_rad(yaw_degrees)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
 	camera.transform = Transform3D(turn, turn * Vector3(0.0, 0.0, distance))
 	if (remote_orthographic if in_remote else orthographic):
-		camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+		if camera.projection != Camera3D.PROJECTION_ORTHOGONAL:
+			camera.projection = Camera3D.PROJECTION_ORTHOGONAL
 		camera.size = distance * ORTHO_SCALE
-	else:
+	elif camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
 		camera.projection = Camera3D.PROJECTION_PERSPECTIVE
 
 
@@ -225,9 +232,9 @@ func toggle_projection() -> String:
 
 
 ## `--camera=<yaw>,<pitch>,<distance>[,ortho]` starts with that view, for repeatable screenshots
-## (`--camera=0,48,14,ortho` is close to Factorio's own view).
-func _configure_from_command_line() -> void:
-	for arg in OS.get_cmdline_user_args():
+## (`--camera=0,48,14,ortho` is close to Factorio's own view). `args`: the command line's.
+func configure_from(args: PackedStringArray) -> void:
+	for arg in args:
 		if not arg.begins_with("--camera=") or arg in ["--camera=factorio", "--camera=first-person"]:
 			continue
 		var parts := arg.get_slice("=", 1).split(",")
@@ -237,10 +244,10 @@ func _configure_from_command_line() -> void:
 			pitch_degrees = clampf(float(parts[1]), MIN_PITCH, MAX_PITCH)
 			_distance_goal = clampf(float(parts[2]), MIN_DISTANCE, MAX_ZOOM_RANGE.y)
 			distance = _distance_goal
+			_arg_distance = _distance_goal
 		orthographic = parts.size() >= 4 and parts[3] == "ortho"
 
 
-## Into the character's eyes, facing the way the camera faced, or back out to the view before.
 ## A ride's camera (ride.gd): eases to this pitch and distance, out of first person and Factorio's
 ## view, until cinematic_end() puts the view back.
 func cinematic(pitch: float, dist: float) -> void:
@@ -324,6 +331,7 @@ func own_view() -> Transform3D:
 	return Transform3D(turn, at + turn * Vector3(0.0, 0.0, _distance_goal))
 
 
+## Into the character's eyes, facing the way the camera faced, or back out to the view before.
 func toggle_first_person() -> void:
 	first_person = not first_person
 	if first_person:
@@ -404,7 +412,6 @@ func zoom(factor: float) -> void:
 	_distance_goal = clampf(_distance_goal * factor, MIN_DISTANCE, far)
 
 
-## Where the camera looks, on the ground (tiles).
 ## Where the camera's focus sits over a point: on an add-on's hills when the player asks for it
 ## (Settings > Camera > Camera follows the hills), else level at the flat world's height (owner:
 ## "camera elevation on terrain off").
@@ -414,6 +421,7 @@ static func _follow(p: Vector3) -> Vector3:
 	return Vector3(p.x, 0.0, p.z)
 
 
+## Where the camera looks, on the ground (tiles).
 func focus_point() -> Vector2:
 	if vr_focus != Vector2.INF:
 		return vr_focus

@@ -164,7 +164,7 @@ local function reach_of(bp)
 end
 
 -- Builds a blueprint stack as a player would, remembering it for undo. `mode`: a defines.build_mode.
-function M.place(c, bp, position, direction, mode, what)
+function M.place(c, bp, position, direction, mode)
   local r = reach_of(bp)
   local area = { { position[1] - r, position[2] - r }, { position[1] + r, position[2] + r } }
   local before = M.unmarked(puppet.surface(c), area, false)
@@ -180,7 +180,7 @@ function M.place(c, bp, position, direction, mode, what)
   end
   local ok, data = pcall(function() return bp.export_stack() end)
   M.blueprint(c, ghosts, marked, ok and data or nil, { surface = puppet.surface(c).index, position = position,
-    direction = direction, mode = mode, area = area, what = what })
+    direction = direction, mode = mode, area = area })
   return ghosts
 end
 

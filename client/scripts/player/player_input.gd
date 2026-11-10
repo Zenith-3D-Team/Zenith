@@ -42,6 +42,7 @@ extends Node
 
 const Settings := preload("res://scripts/menu/settings.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
+const Predicted := preload("res://scripts/world/predicted.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const CameraRig := preload("res://scripts/player/camera_rig.gd")
@@ -51,6 +52,7 @@ const Avatar := preload("res://scripts/player/avatar.gd")
 const Controls := preload("res://scripts/player/controls.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const CursorOverlay := preload("res://scripts/player/cursor_overlay.gd")
 const RoboportLinks := preload("res://scripts/world/roboport_links.gd")
 const WireTool := preload("res://scripts/player/wire_tool.gd")
@@ -67,7 +69,7 @@ const REPEAT := 0.15
 ## moved this many thousandths of a turn (about 1 degree).
 const TURN_STEP := 3
 const STICK_DEAD_ZONE := 0.25
-## The character's build_distance in Factorio.
+## The character's build_distance in Factorio without bonuses (`build_reach()` has the real one).
 const BUILD_REACH := 10.0
 ## Held like a building but used on release: a blueprint (or book) is placed, a planner dragged.
 const PLANNERS := ["blueprint", "blueprint-book", "deconstruction-planner", "upgrade-planner"]
@@ -126,6 +128,8 @@ var world: WorldMirror
 var remote_fog: Node
 var rig: CameraRig
 var hud: Hud
+## What was just built, drawn before the game confirms it (scripts/world/predicted.gd).
+var predicted: Predicted
 var combat: CombatLayer
 var avatar: Avatar
 ## Vehicles and wagons are movers, not world entities: they are opened through this.
@@ -145,6 +149,20 @@ var cursor_quality := "normal"
 ## A tool from a shortcut instead of an item (TOOLS), or "".
 var cursor_tool := ""
 var build_dir := 0
+## Train carriages, which the mod builds on a rail (rolling_stock_spot; building.lua's list).
+const ROLLING_STOCK := {"locomotive": true, "cargo-wagon": true, "fluid-wagon": true, "artillery-wagon": true}
+## The rails rolling stock is put on, and how far from the cursor one is looked for (building.lua).
+const STOCK_RAILS := {"straight-rail": true, "legacy-straight-rail": true}
+const RAIL_SEARCH := 3.0
+## The line over the quickbar while a tool is held (a constant: it was a dictionary made every frame).
+const TOOL_HINTS := {"copy": "Drag to copy · Right click: cancel", "cut": "Drag to cut · Right click: cancel",
+	"paste": "Click to paste · R: rotate · Right click: cancel", "blueprint": "Drag to make a blueprint · Right click: cancel",
+	"decon": "Drag to deconstruct · Shift: cancel deconstruction",
+	"red-wire": "Click two entities to connect them (again: disconnect) · Right click: let go",
+	"green-wire": "Click two entities to connect them (again: disconnect) · Right click: let go",
+	"copper-wire": "Click two poles to connect them (again: disconnect) · Shift+click a pole: remove its cables",
+	"spidertron": "Drag: select spidertrons · Shift+drag: add · Right-drag: remove · Click: send · Shift+click: queue"}
+
 ## Flip what is built (H / V): the entity is mirrored.
 var build_mirror := false
 var hovered: WorldMirror.Rec = null
@@ -162,6 +180,10 @@ var copied_settings := {}
 var _walk_dir := -1
 var _walk_turn := -1  # the angle last sent with walk, thousandths of a turn, or -1
 var _walk_timer := 0.0
+## Joypads whose left stick has been seen centred since they were plugged in (stick_of).
+var _sticks_centred := {}
+## Tests set it: the joypads _stick reads, as stick_of takes them, instead of Input's.
+var joypads_for_test = null
 var _drive_code := 0  # the last drive command sent, as accelerate * 3 + steer; 0 is none
 var _mine_timer := 0.0
 var _mining := false
@@ -194,7 +216,6 @@ var _remote_marked: WorldMirror.Rec = null  # marked for deconstruction during t
 var _lmb_shift := false  # Shift was held when the left button went down: ghosts, cancel boxes
 var _lmb_super := false  # Ctrl+Shift: super-forced build (obstacles marked for deconstruction)
 var _drag_from := Vector2.ZERO  # where a planner drag started
-var _last_build_tile := Vector2i(1 << 30, 1 << 30)
 var _rail_click := false  # this left click was the rail planner's (anchoring or building)
 var _ghost := MeshInstance3D.new()
 var _drag_box := MeshInstance3D.new()
@@ -215,7 +236,7 @@ var _ghost_model_materials := {}
 var _ghost_pieces: Array[MeshInstance3D] = []
 ## Selection brackets, arrows and areas (cursor_overlay.gd).
 var _overlay := CursorOverlay.new()
-## Which roboports are linked, for the lines between them (H14).
+## Which roboports are linked, for the lines between them.
 var roboport_links: RoboportLinks = null
 var _paste_ghosts: Array[MeshInstance3D] = []
 var _open_on_start := 0
@@ -440,7 +461,6 @@ func _mouse_button(mb: InputEventMouseButton) -> void:
 			if mb.alt_pressed and _open_pedia():
 				return
 			_drag_from = ground
-			_last_build_tile = Vector2i(1 << 30, 1 << 30)
 			_lmb_shift = mb.shift_pressed
 			_lmb_super = mb.shift_pressed and mb.ctrl_pressed
 			if mb.ctrl_pressed and not mb.shift_pressed:
@@ -584,13 +604,7 @@ func _process(delta: float) -> void:
 			hud.cursor_label.text = "%d rails · Click: build · Right click: let go%s" % [rail_planner.rails_needed(),
 				" · elevated" if rail_planner.target_layer == 1 else ""]
 	elif cursor_tool != "":
-		hud.cursor_label.text = {"copy": "Drag to copy · Right click: cancel", "cut": "Drag to cut · Right click: cancel",
-			"paste": "Click to paste · R: rotate · Right click: cancel", "blueprint": "Drag to make a blueprint · Right click: cancel",
-			"decon": "Drag to deconstruct · Shift: cancel deconstruction",
-			"red-wire": "Click two entities to connect them (again: disconnect) · Right click: let go",
-			"green-wire": "Click two entities to connect them (again: disconnect) · Right click: let go",
-			"copper-wire": "Click two poles to connect them (again: disconnect) · Shift+click a pole: remove its cables",
-			"spidertron": "Drag: select spidertrons · Shift+drag: add · Right-drag: remove · Click: send · Shift+click: queue"}.get(cursor_tool, "")
+		hud.cursor_label.text = TOOL_HINTS.get(cursor_tool, "")
 	elif cursor_quality != "normal" and cursor_item != "":
 		hud.cursor_label.text = "Quality: %s · Ctrl+wheel: change" % cursor_quality.capitalize()
 	elif cursor_item == "deconstruction-planner" or cursor_item == "upgrade-planner":
@@ -650,11 +664,37 @@ func _update_walk(delta: float) -> void:
 
 ## A gamepad's left stick, as the move actions' vector (up positive), or zero.
 func _stick() -> Vector2:
-	for pad in Input.get_connected_joypads():
-		var v := Vector2(Input.get_joy_axis(pad, JOY_AXIS_LEFT_X), -Input.get_joy_axis(pad, JOY_AXIS_LEFT_Y))
-		if v.length() > STICK_DEAD_ZONE:
-			return v
-	return Vector2.ZERO
+	var pads = joypads_for_test
+	if pads == null:
+		pads = []
+		for pad in Input.get_connected_joypads():
+			pads.append({"id": pad, "known": Input.is_joy_known(pad),
+				"v": Vector2(Input.get_joy_axis(pad, JOY_AXIS_LEFT_X), -Input.get_joy_axis(pad, JOY_AXIS_LEFT_Y))})
+	return stick_of(pads, _sticks_centred)
+
+
+## The stick that walks among `pads` ([{id, known, v}]), or zero. Only a pad Godot maps as a
+## gamepad (Input.is_joy_known): an unknown device's first two axes aren't a stick. The owner's
+## Thrustmaster sim pedals are one, resting at -1, and walked the character off (due west on
+## Zenith Test, 2,500 tiles in 140 s) for as long as the client ran. And only once its
+## stick was seen centred since it was plugged in (`centred`, kept by the caller), so a mapped
+## device resting off centre doesn't walk either.
+static func stick_of(pads: Array, centred: Dictionary) -> Vector2:
+	var out := Vector2.ZERO
+	var present := {}
+	for pad in pads:
+		present[pad.id] = true
+		var v: Vector2 = pad.v
+		if not pad.known:
+			continue
+		if v.length() <= STICK_DEAD_ZONE:
+			centred[pad.id] = true
+		elif centred.has(pad.id) and out == Vector2.ZERO:
+			out = v
+	for id in centred.keys():
+		if not present.has(id):
+			centred.erase(id)  # unplugged: whatever comes in under its id starts unseen
+	return out
 
 
 ## In a vehicle W and S accelerate and reverse, A and D steer, relative to the vehicle as in
@@ -794,9 +834,8 @@ func _next_gun() -> void:
 			return
 
 
-## Holding the left button builds on every new tile the cursor passes, like dragging belts.
-## Planners are used on release, over the dragged area (Shift: cancel the marks; an upgrade
-## planner's right-drag: downgrade).
+## A planner used on release, over the dragged area (Shift: cancel the marks; an upgrade planner's
+## right-drag: downgrade).
 func _use_planner(cancel: bool, reverse := false) -> void:
 	var slot := planner_slot()
 	if slot == 0:
@@ -950,7 +989,10 @@ func _rotate(reverse: bool) -> void:
 		build_dir = posmod(build_dir + (-step if reverse else step), 16)
 	elif hovered != null:
 		# Nothing that builds in the cursor (or an item that doesn't, like a plate): R turns the
-		# entity under the mouse, as in Factorio.
+		# entity under the mouse, as in Factorio. Shown turned at once (predicted.gd) where the game
+		# always turns it; the game's answer replaces it.
+		if predicted != null and not hud.ui.remote:
+			predicted.turn(hovered, reverse)
 		Bridge.send({"t": "rotate", "u": hovered.unit, "p": hovered.proto_id, "x": hovered.fixed.x, "y": hovered.fixed.y, "rev": 1 if reverse else 0})
 
 
@@ -974,17 +1016,23 @@ func _pipette_or_clear() -> void:
 	# Over an entity Q is the pipette, also with something else held (that goes back first, as in
 	# 2.1.23); over nothing, or over what is already held, it clears the cursor.
 	var item := item_for(hovered) if hovered != null and not over_gui and cursor_tool == "" else ""
+	# Issue #13: a train, wagon or vehicle under the mouse is picked too, turned its way.
+	var vehicle: Array = []
+	if hovered == null and not over_gui and cursor_tool == "":
+		vehicle = _mineable_mover_under_mouse()
+		if not vehicle.is_empty():
+			item = item_for_proto(world.protos.entity(int(vehicle[1])))
 	if item != "" and item != cursor_item:
 		hud.ui.clear_cursor()
 		hold("")
 	if cursor_item == "" and item != "":
-		var quality := str(hovered.extra.get("q", "normal"))
+		var quality := str(hovered.extra.get("q", "normal")) if hovered != null else "normal"
 		hud.ui.pick_from_inventory(item)
 		if cursor_item != item:
 			hold(item)
 		# Factorio's smart pipette picks the entity's own quality (a ghost's too).
 		cursor_quality = quality if quality != "" else "normal"
-		build_dir = hovered.dir
+		build_dir = hovered.dir if hovered != null else yaw_direction(float(vehicle[5]))
 		if hud.count_of(item) == 0:
 			hud.show_message("None in the inventory: builds ghosts")
 		return
@@ -995,12 +1043,20 @@ func _pipette_or_clear() -> void:
 ## The item that builds an entity (its ghost's entity for a ghost), or "".
 func item_for(r: WorldMirror.Rec) -> String:
 	var proto: ProtoDB.EntityProto = world.protos.entity(r.proto_id)
+	if proto != null and proto.type == "entity-ghost" and r.extra.has("gh"):
+		proto = world.protos.entity(int(r.extra["gh"]))
+	return item_for_proto(proto)
+
+
+## The 16-way direction nearest a mover's yaw (Visuals.orientation_yaw's inverse).
+static func yaw_direction(yaw: float) -> int:
+	return posmod(roundi(-yaw / TAU * 16.0), 16)
+
+
+## The item that places this entity prototype, or "".
+func item_for_proto(proto: ProtoDB.EntityProto) -> String:
 	if proto == null:
 		return ""
-	if proto.type == "entity-ghost" and r.extra.has("gh"):
-		proto = world.protos.entity(int(r.extra["gh"]))
-		if proto == null:
-			return ""
 	if world.protos.item_names.values().has(proto.name):
 		return proto.name
 	for item in world.protos.item_places:
@@ -1270,16 +1326,29 @@ func _update_highlights() -> void:
 		var pos := Vector2(_snap(ground.x, size.x), _snap(ground.y, size.y))
 		if proto.type == "straight-rail":
 			pos = Vector2(floorf(ground.x / 2.0) * 2.0 + 1.0, floorf(ground.y / 2.0) * 2.0 + 1.0)
+		# Rolling stock goes on a rail (issue #12): drawn where the mod will put it, green on the
+		# rails and red off them, never "blocked" by the rail it stands on.
+		var on_rails := ROLLING_STOCK.has(proto.type)
+		var dir := build_dir
+		if on_rails:
+			var spot := rolling_stock_spot(ground, build_dir)
+			if spot.is_empty():
+				_build_refusal = "Rolling stock goes on rails"
+				pos = ground
+			else:
+				pos = spot[0]
+				dir = spot[1]
 		# Space Age: the planet's pressure, gravity or magnetic field may forbid it (planet.nb).
-		_build_refusal = hud.ui.model.cant_build_reason(proto.id)
+		if _build_refusal == "":
+			_build_refusal = hud.ui.model.cant_build_reason(proto.id)
 		# Empty space (round a platform) holds nothing up: red, as Factorio draws it (F6).
 		if _build_refusal == "" and _on_void(pos, size):
 			_build_refusal = "Can't build on empty space"
-		var ok := (ghost_mode or (hud.ui.can_build_from_hand() and _in_reach(pos, size))) and not _blocked(proto, pos, size) \
+		var ok := (ghost_mode or (hud.ui.can_build_from_hand() and _in_reach(pos, size))) and (on_rails or not _blocked(proto, pos, size)) \
 			and _build_refusal == ""
-		show_build_ghost(proto, pos, ok, ghost_mode)
+		show_build_ghost(proto, pos, ok, ghost_mode, dir)
 		var x: Dictionary = hud.ui.model.eprops.get(proto.id, {}).get("x", {})
-		marks.append_array(CursorOverlay.marks_for(proto.type, x, pos, build_dir, true))
+		marks.append_array(CursorOverlay.marks_for(proto.type, x, pos, dir, true))
 		if proto.type == "roboport" and roboport_links != null:
 			for l in roboport_links.held_lines(pos, _logistic_radius(proto.id)):
 				marks.append(CursorOverlay.line(l[0], l[1]))
@@ -1292,24 +1361,39 @@ func _logistic_radius(proto_id: int) -> float:
 	return float(hud.ui.model.eprops.get(proto_id, {}).get("x", {}).get("lr", 25.0))
 
 
-## The held item's entity where it would go: its model (or a box without one) turned and flipped
-## as it would be built, translucent, red when it can't be built there.
-func show_build_ghost(proto: ProtoDB.EntityProto, pos: Vector2, ok: bool, ghost_mode: bool) -> void:
-	var extra := build_extra(proto, pos, build_dir)
-	var model := ModelLibrary.mesh_for_entity(proto.name, proto.type, extra, build_dir)
+## The held item's entity where it would go: its model (or its picture card, a mod's building as the
+## world draws it, or else a box) turned and flipped as it would be built, translucent, red when it
+## can't be built there.
+func show_build_ghost(proto: ProtoDB.EntityProto, pos: Vector2, ok: bool, ghost_mode: bool, dir := -1) -> void:
+	if dir < 0:
+		dir = build_dir
+	var extra := build_extra(proto, pos, dir)
+	# The model is read on a worker thread the first time (mesh_for alone parsed its .glb here, in
+	# the frame the item was first held): nothing shows for the few frames until it is made.
+	if not ModelLibrary.entity_ready(proto.name, proto.type, extra, dir):
+		return
+	var model := ModelLibrary.mesh_for_entity(proto.name, proto.type, extra, dir)
 	var flip := Basis.from_scale(Vector3(-1, 1, 1)) if build_mirror else Basis.IDENTITY
 	if model != null:
 		_ghost_model.mesh = model
-		_ghost_model.transform = ModelLibrary.placed(proto.name, proto.type, build_dir, extra, Vector3(pos.x, 0.0, pos.y), flip)
+		_ghost_model.transform = ModelLibrary.placed(proto.name, proto.type, dir, extra, Vector3(pos.x, 0.0, pos.y), flip)
 		_ghost_model.material_override = _ghost_model_materials[("ghost" if ghost_mode else "ok") if ok else "bad"]
 		_ghost_model.visible = true
 		if proto.type == "cargo-bay":
 			_show_cargo_pieces(proto, pos, _ghost_model.material_override)
-	else:
-		_ghost.transform = Visuals.placeholder_transform(proto, pos, build_dir, Visuals.height_for(proto))
-		_ghost.transform.basis = _ghost.transform.basis * flip
-		_ghost.material_override = (_ghost_blue if ghost_mode else _ghost_ok) if ok else _ghost_bad
-		_ghost.visible = true
+		return
+	var card := SpriteStandins.card(proto.name, dir, proto.size(), proto.type) if proto.type != "resource" else null
+	if card != null:
+		# The card faces Factorio's camera whatever the direction (the direction picks the picture).
+		_ghost_model.mesh = card
+		_ghost_model.transform = SpriteStandins.transform(pos)
+		_ghost_model.material_override = SpriteStandins.ghost_material(card, _ghost_model_tints[("ghost" if ghost_mode else "ok") if ok else "bad"])
+		_ghost_model.visible = true
+		return
+	_ghost.transform = Visuals.placeholder_transform(proto, pos, dir, Visuals.height_for(proto))
+	_ghost.transform.basis = _ghost.transform.basis * flip
+	_ghost.material_override = (_ghost_blue if ghost_mode else _ghost_ok) if ok else _ghost_bad
+	_ghost.visible = true
 
 
 ## The held bay's frame: without it the preview is only the bay's machine, about 3 by 2 of its tiles.
@@ -1331,17 +1415,6 @@ func _show_cargo_pieces(proto: ProtoDB.EntityProto, pos: Vector2, material: Mate
 		piece.material_override = material
 		piece.visible = piece.mesh != null
 		i += 1
-
-
-## The held cargo bay's edge pieces shown: their model names, for tests.
-func build_ghost_pieces() -> Array:
-	return _ghost_pieces.filter(func(p): return p.visible).map(func(p): return p.get_meta("model"))
-
-
-## Whether the build ghost is drawn, and red: [visible, can't place], for tests.
-func build_ghost_state() -> Array:
-	var shown := _ghost_model if _ghost_model.visible else _ghost
-	return [shown.visible, shown.material_override == _ghost_model_materials["bad"] or shown.material_override == _ghost_bad]
 
 
 ## What hovering over an entity shows, like Factorio: its selection box's corners, and from its
@@ -1623,7 +1696,14 @@ func _in_reach(pos: Vector2, size: Vector2i) -> bool:
 	var c := avatar.ground_position()
 	var half := Vector2(size) * 0.5
 	var d := Vector2(maxf(0.0, absf(c.x - pos.x) - half.x), maxf(0.0, absf(c.y - pos.y) - half.y))
-	return d.length() <= BUILD_REACH
+	return d.length() <= build_reach()
+
+
+## The character's build distance now (other mods and research may add to it), from `cinfo`.
+func build_reach() -> float:
+	if hud != null and hud.ui != null and hud.ui.model != null:
+		return hud.ui.model.build_reach()
+	return BUILD_REACH
 
 
 ## Something other than ore, ghosts or what the item can replace (the same entity: it turns; the
@@ -1643,6 +1723,34 @@ func _blocked(proto: ProtoDB.EntityProto, pos: Vector2, size: Vector2i) -> bool:
 				if WorldMirror.selection_rect(other, r.pos, r.dir).intersects(area):
 					return true
 	return false
+
+
+## Where held rolling stock goes, as the mod builds it (building.lua, on_rail): on the nearest
+## straight rail within RAIL_SEARCH tiles of `at`, facing along it (`dir` picks which way along).
+## [position, direction], or [] with no rail there.
+func rolling_stock_spot(at: Vector2, dir: int) -> Array:
+	var best: WorldMirror.Rec = null
+	var best_d := RAIL_SEARCH
+	var center := WorldMirror.chunk_of(at)
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			var cv = world.chunks.get(center + Vector2i(dx, dy))
+			if cv == null:
+				continue
+			for r in cv.entities.values():
+				if absf(r.pos.x - at.x) > RAIL_SEARCH or absf(r.pos.y - at.y) > RAIL_SEARCH:
+					continue
+				var other: ProtoDB.EntityProto = world.protos.entity(r.proto_id)
+				if other == null or not STOCK_RAILS.has(other.type):
+					continue
+				var d: float = r.pos.distance_to(at)
+				if d <= best_d:
+					best = r
+					best_d = d
+	if best == null:
+		return []
+	var axis := best.dir % 8
+	return [best.pos, dir if axis == dir % 8 else axis]
 
 
 ## Whether a tile under the footprint is empty space (nothing to stand on, as round a platform).

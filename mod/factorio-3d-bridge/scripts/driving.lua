@@ -68,6 +68,23 @@ end
 
 -- Gets out of the vehicle the character is in, or into the nearest one: the driver's seat, or a
 -- car's passenger seat if someone is driving.
+-- Whether the tile under the character blocks it (water for a boat's driver: Factorio finds a player
+-- a free spot when they get out, but not a script's character, which stayed standing in the water
+-- and could be run over by its own boat).
+local function on_blocking_tile(c)
+  local ok, blocked = pcall(function()
+    local pos = c.position
+    local tile = c.surface.get_tile(math.floor(pos.x), math.floor(pos.y)).prototype.collision_mask.layers
+    for layer in pairs(c.prototype.collision_mask.layers) do
+      if tile[layer] then
+        return true
+      end
+    end
+    return false
+  end)
+  return ok and blocked
+end
+
 function M.enter()
   local s = storage.f3d
   local c = puppet.get()
@@ -78,10 +95,25 @@ function M.enter()
   if v then
     s.drive = nil
     stop_riding(c)
-    if v.type == "car" and not is_driver(v, c) then
-      v.set_passenger(nil)
-    else
+    local driver = not (v.type == "car" and not is_driver(v, c))
+    if driver then
       v.set_driver(nil)
+    else
+      v.set_passenger(nil)
+    end
+    if on_blocking_tile(c) then
+      local spot = c.surface.find_non_colliding_position(c.name, c.position, 20, 0.5)
+      if spot then
+        c.teleport(spot)
+      else
+        -- Nowhere to stand within reach: back in the seat.
+        if driver then
+          v.set_driver(c)
+        else
+          v.set_passenger(c)
+        end
+        puppet.message("Nowhere to get out here")
+      end
     end
     return
   end

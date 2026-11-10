@@ -8,6 +8,7 @@ local transport = require("scripts.transport")
 local world = require("scripts.world")
 local tracker = require("scripts.tracker")
 local takeover = require("scripts.takeover")
+local as_player = require("scripts.as_player")
 
 local M = {}
 
@@ -368,17 +369,27 @@ end
 -- Factorio's character walks only 8 ways, so each tick steps one of the two 8-way directions either
 -- side of the angle, whichever brings the sideways drift accumulated so far (`err`, in steps) back
 -- towards the line: the path zig-zags a few hundredths of a tile about the line while the game's own
--- collisions and speed stay as they are. Against a wall the blocked direction simply doesn't move,
--- so the character slides along it at the other direction's share.
+-- collisions and speed stay as they are. Against a wall a step that went nowhere makes the next
+-- tick try the other direction either side of the angle, then the two beside those, so the
+-- character slides along it (angle_step).
 function M.walk(cmd)
   local s = storage.f3d
   local d = tonumber(cmd.d)
   local a = tonumber(cmd.a)
+  -- One of the 16 directions or a stop: a huge d ("1e999" is inf) made walk_direction NaN, which
+  -- the tick then wrote into walking_state, outside any pcall.
+  if d and d >= 16 then
+    d = -1
+  end
   if a and a >= 0 and a < 1000 and (not d or d >= 0) then
     local w = s.walk
-    local err = (w and w.angle and game.tick <= w.until_tick) and w.err or 0
+    local going = w and w.angle and game.tick <= w.until_tick
     s.walk = { dir = w and w.dir or walk_direction(math.floor(a * 16 / 1000 + 0.5)), angle = math.floor(a),
-      err = err, until_tick = game.tick + HOLD_TICKS }
+      err = going and w.err or 0, until_tick = game.tick + HOLD_TICKS,
+      -- Where the character stood at the last step and what that step was, kept across the
+      -- repeated walk commands, so a step a wall stopped is seen (angle_step).
+      lx = going and w.lx or nil, ly = going and w.ly or nil,
+      last = going and w.last or nil, stuck = going and w.stuck or nil, moved = going and w.moved or nil }
   elseif d and d >= 0 then
     s.walk = { dir = walk_direction(d), until_tick = game.tick + HOLD_TICKS }
   elseif s.walk then
@@ -482,6 +493,12 @@ local function finish_mining(c, e)
   if e.type == "resource" then
     return mine_resource(c, e)
   end
+  -- As the player when there is one (as_player.lua): Factorio raises on_player_mined_entity, whose
+  -- handler (tracker.lua) sends the removal.
+  local mined = as_player.mine(c, e)
+  if mined ~= nil then
+    return mined, (not mined) and "Inventory full" or nil
+  end
   local removal = tracker.removal_message(e)
   if not c.mine_entity(e) then
     return false, "Inventory full"
@@ -499,7 +516,8 @@ function M.rotate(cmd)
   end
   local e = M.find_target(M.surface(c), cmd)
   if e and e.rotatable and e.force == c.force then
-    e.rotate({ reverse = cmd.rev == 1 or cmd.rev == true })
+    -- by_player raises on_player_rotated_entity for other mods (as_player.lua).
+    e.rotate({ reverse = cmd.rev == 1 or cmd.rev == true, by_player = as_player.by(c) })
     tracker.changed(e)
   end
 end
@@ -613,6 +631,16 @@ local function send_state(c, s)
   if s.walk and s.walk.angle and msg.w == 1 and not v then
     msg.a = s.walk.angle
   end
+  -- Flying in mech armour (Space Age): the client lifts the body and draws take-off, hover and
+  -- landing. Read under pcall: a game without these keys (older 2.x) throws on reading them.
+  if not v then
+    local okf, flying = pcall(function() return c.is_flying end)
+    if okf and flying then
+      msg.fl = 1
+      local okh, height = pcall(function() return c.flight_height end)
+      msg.fh = okh and height and math.floor(height * 1000 + 0.5) or 0
+    end
+  end
   local mhp = max_health(c)
   if mhp then
     msg.mhp = math.floor(mhp)
@@ -694,6 +722,20 @@ end
 -- instead of every recipe of the force (over a thousand with Space Age).
 local hand_recipes = {}
 
+-- Factorio's parameter recipes (parameter-0..9, for blueprint parameters) sit in every crafting
+-- category and aren't hidden, but nothing makes them and Factorio's choosers leave them out.
+-- 2.1 says so on the prototype (`parameter`); a force's LuaRecipe through its `prototype`. The
+-- prototype is read first: asking a LuaRecipe for `parameter` would throw (an error built and
+-- caught for every recipe in a chooser), and the pcall only guards a version without the key.
+function M.is_parameter(recipe)
+  local proto = recipe
+  if recipe.object_name == "LuaRecipe" then
+    proto = recipe.prototype
+  end
+  local ok, p = pcall(function() return proto.parameter end)
+  return ok and p == true
+end
+
 function M.hand_recipe_names(c)
   local proto = c.prototype
   local list = hand_recipes[proto.name]
@@ -701,7 +743,7 @@ function M.hand_recipe_names(c)
     local hand = proto.crafting_categories or {}
     list = {}
     for name, recipe in pairs(prototypes.recipe) do
-      if not recipe.hidden then
+      if not recipe.hidden and not M.is_parameter(recipe) then
         for _, cat in pairs(M.recipe_categories(recipe)) do
           if hand[cat] then
             list[#list + 1] = name
@@ -736,7 +778,7 @@ end
 ---------------------------------------------------------------------------------------------
 
 -- The 8-way direction (an even one of the 16) for this tick of an angled walk; see M.walk.
-local function angle_step(w)
+local function angle_step(w, c)
   local turn = w.angle / 1000 * 8 -- in eighths of a turn
   local lo = math.floor(turn) % 8
   local hi = (lo + 1) % 8
@@ -750,7 +792,28 @@ local function angle_step(w)
   if math.abs(w.err + shi) < math.abs(w.err + slo) then
     pick, step = hi, shi
   end
+  -- The drift is counted from the steps chosen, not the ground covered: a step a wall stopped
+  -- would count as taken, and the next pick would go the same blocked way again and again. So
+  -- when the last step went nowhere the next try goes round: the other direction either side of
+  -- the angle, then the two beside those (east and west along a wall across a northward walk),
+  -- and the line is measured again from where the character stands, so it doesn't turn back
+  -- to the old line once past the wall.
+  local p = c.position
+  local still = w.lx and math.abs(p.x - w.lx) < 0.001 and math.abs(p.y - w.ly) < 0.001
+  if w.lx and not still then
+    w.moved = true  -- only once it has walked: a character that hasn't moved yet isn't blocked
+  end
+  if w.last and w.moved and still then
+    w.stuck = (w.stuck or 0) + 1
+    local tries = { (w.last == lo) and hi or lo, (hi + 1) % 8, (lo + 7) % 8 }
+    pick = tries[(w.stuck - 1) % 3 + 1]
+    w.err = 0
+    step = 0
+  else
+    w.stuck = 0
+  end
   w.err = w.err + step
+  w.lx, w.ly, w.last = p.x, p.y, pick
   return pick * 2
 end
 
@@ -760,7 +823,7 @@ local function tick_walk(c, s)
   end
   if game.tick <= s.walk.until_tick then
     if s.walk.angle then
-      s.walk.dir = angle_step(s.walk)
+      s.walk.dir = angle_step(s.walk, c)
     end
     c.walking_state = { walking = true, direction = s.walk.dir }
   else

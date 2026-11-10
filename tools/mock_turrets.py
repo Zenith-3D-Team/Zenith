@@ -17,8 +17,9 @@ ENTITY_PROTOS = [
     ("railgun-turret", "ammo-turret", 3, 5, (90, 90, 95)),
 ]
 
-# Prototype values: range, min_range, rotation (turns per tick), cooldown (ticks), the `tf` kind
-# its hits send (None for weapons whose damage lands later), turn_range (None: all round).
+# Prototype values: range, min_range, rotation (turns per tick), cooldown (ticks), what its hits
+# are as the mod tells them apart for `tf` (None for weapons whose damage lands later: no `tf`),
+# turn_range (None: all round).
 WEAPONS = {
     "gun-turret": (18, 0, 0.015, 6, "bullet", None),
     "laser-turret": (24, 0, 0.01, 40, "laser", None),
@@ -105,7 +106,7 @@ def tick(game):
             if low <= d <= reach and (best is None or d < best[0]):
                 goal = orientation(ex - x, ey - y)
                 if arc is None or abs((goal - t["base"] + 0.5) % 1.0 - 0.5) <= arc:
-                    best = (d, ex, ey)
+                    best = (d, ex, ey, m)
         was = t["o"]
         shots = 0
         if best:
@@ -119,7 +120,9 @@ def tick(game):
                     shots += 1
                 t["next"] = max(t["next"], game.tick - cooldown)
                 if kind:
-                    game.send_now({"t": "tf", "u": unit, "w": kind, "sx": int(x * 256), "sy": int(y * 256),
+                    game.send_now({"t": "tf", "u": unit, "x": int(best[1] * 256), "y": int(best[2] * 256)})
+                    # combat.lua's hit effect on the creature hit (blood, or burning from a flame).
+                    game.send_now({"t": "afx", "fx": "burn" if kind == "flame" else "blood", "u": best[3]["unit"],
                                    "x": int(best[1] * 256), "y": int(best[2] * 256)})
         else:
             t["next"] = game.tick

@@ -20,7 +20,9 @@ from skimage.measure import approximate_polygon
 from skimage.morphology import disk, remove_small_objects, skeletonize
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FACTORIO = os.environ.get("FACTORIO", r"C:\Program Files (x86)\Steam\steamapps\common\Factorio")
+sys.path.append(os.path.dirname(HERE))
+import factorio_install  # noqa: E402
+FACTORIO = factorio_install.install()
 G = os.path.join(FACTORIO, "data", "base", "graphics", "entity", "crash-site-spaceship")
 PPT = 64          # high-resolution sprites: 64 pixels a tile
 REL = 0.25        # how much darker than its surroundings a seam pixel is

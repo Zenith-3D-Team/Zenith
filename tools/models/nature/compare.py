@@ -36,7 +36,10 @@ sys.path.insert(0, HERE)
 
 import build_nature  # noqa: E402
 
-FACTORIO = r"C:\Program Files (x86)\Steam\steamapps\common\Factorio"
+sys.path.append(os.path.dirname(os.path.dirname(HERE)))
+import factorio_install  # noqa: E402
+
+FACTORIO = factorio_install.install()
 PX = 64  # sprite pixels per tile (HR sheets drawn at scale 0.5)
 BACKGROUND = (0.30, 0.31, 0.21)
 DEAD = ("dead-dry-hairy-tree", "dead-grey-trunk", "dead-tree-desert", "dry-hairy-tree", "dry-tree")

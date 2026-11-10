@@ -46,14 +46,10 @@ local function state()
   return b
 end
 
-function M.limit()
-  return state().limit
-end
-
 -- Called before the client's modules run each tick.
 function M.begin()
   local b = state()
-  b.used = 0
+  b.used, b.load = 0, 0
   for k in pairs(b.jobs) do
     b.jobs[k] = 0
   end
@@ -95,10 +91,79 @@ function M.slice(least)
   return math.max(least or 25, math.floor(state().limit / 2))
 end
 
+-- The periodic jobs (rate.lua's with a `slack`: machine states, the wire check, fluids and power,
+-- plants and spawners, trains, the movers' search...) share the tick with the queues above. Each
+-- would run on its own ticks, and on the owner's save several landed on one tick now and then
+-- (366 of 3,600 bridge ticks over 16.7 ms, each job cheap alone). So when one is due it asks
+-- `admit` with what it is expected to cost: it runs if that fits PERIODIC times the budget (1.25: 2 left as many slow ticks on
+-- the owner's save as before) beside
+-- what this tick already holds (the queues' slices, belt items' share, `commit`), or if the tick
+-- holds little; otherwise it waits for a lighter tick, at most its slack. Their units are kept
+-- apart from the queues' (`load`), so the queues keep their whole budget. What it is expected to cost is learned:
+-- after each run it says what it read (`learn`, entities found times its price), kept as a moving
+-- average per job in storage, so it follows each base (and the client's budget, which Hold 60 UPS
+-- shrinks on a slower PC, sets how full a tick may get). Deterministic: estimates come from game
+-- state only.
+M.PERIODIC = 1.25
+local LEARN = 0.3
+
+local function costs()
+  local b = state()
+  b.cost = b.cost or {}
+  b.charged = b.charged or {}
+  return b
+end
+
+-- What job `name` is expected to cost, in units (`default` until it has run).
+function M.estimate(name, default)
+  return costs().cost[name] or default or 25
+end
+
+-- Whether periodic job `name` may run this tick (`force`: its slack ran out). Charges its estimate.
+function M.admit(name, default, force)
+  local b = costs()
+  local est = M.estimate(name, default)
+  local cap = b.limit * M.PERIODIC
+  local held = b.used + (b.load or 0)
+  -- (A job dearer than a whole tick runs on a tick that holds little else.)
+  if not force and held + est > cap and held > cap / 4 then
+    return false
+  end
+  b.charged[name] = est
+  M.commit(est, name)
+  return true
+end
+
+-- Work this tick will do whatever happens (belt items' share): periodic jobs keep off it.
+function M.commit(units, job)
+  local b = state()
+  units = math.max(0, math.floor(units or 0))
+  b.load = (b.load or 0) + units
+  if job then
+    b.jobs[job] = (b.jobs[job] or 0) + units
+  end
+end
+
+-- Job `name` just ran and read this many units' worth: the tick's figure is corrected to it and the
+-- job's estimate moves towards it.
+function M.learn(name, units)
+  local b = costs()
+  units = math.max(0, math.floor(units or 0))
+  local charged = b.charged[name]
+  if charged then
+    b.charged[name] = nil
+    local d = units - charged
+    b.load = math.max(0, (b.load or 0) + d)
+    b.jobs[name] = math.max(0, (b.jobs[name] or 0) + d)
+  end
+  local old = b.cost[name]
+  b.cost[name] = old and math.floor(old + (units - old) * LEARN + 0.5) or units
+end
+
 -- Called after the client's modules ran: the tick's figures, and `wb` once a second.
 function M.finish()
   local b = state()
-  if profile.tracing() and b.used > 0 then
+  if profile.tracing() and b.used + (b.load or 0) > 0 then
     -- Beside /f3d-profile trace's times, to price the units (tools/request_spikes.py).
     local parts = {}
     for job, n in pairs(b.jobs) do

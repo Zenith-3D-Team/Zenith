@@ -21,7 +21,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 OUT = os.path.join(REPO, "client", "data", "sprite_projection.json")
-FACTORIO = r"C:\Program Files (x86)\Steam\steamapps\common\Factorio"
+sys.path.append(os.path.dirname(HERE))
+import factorio_install  # noqa: E402
+FACTORIO = factorio_install.install()
 BUILDING_ANCHOR = 0.3   # tools/models/compare.py FACTORIO_ANCHOR_Z
 NATURE_ANCHOR = 0.0     # tools/models/nature/compare.py anchors on the ground
 G = "base/graphics/entity/"

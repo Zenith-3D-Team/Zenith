@@ -220,6 +220,14 @@ func _title_button(name: String, sprite: String, tip: String) -> Button:
 	return b
 
 
+## Ctrl+F: the search, as its button says (factorio_ui.gd would open crafting's behind it).
+func _unhandled_key_input(event: InputEvent) -> void:
+	var k := event as InputEventKey
+	if visible and k != null and k.pressed and k.ctrl_pressed and k.keycode == KEY_F:
+		toggle_search()
+		get_viewport().set_input_as_handled()
+
+
 func toggle_search() -> void:
 	_search.visible = not _search.visible
 	if _search.visible:
@@ -236,6 +244,7 @@ func _layout() -> void:
 	var h := minf(Kit.px(HEIGHT), view.y - Kit.px(TOP) - Kit.px(70))
 	_frame.size = Vector2(w, h)
 	_frame.position = Vector2(roundf((view.x - w) * 0.5), minf(Kit.px(TOP), maxf(0.0, view.y - h)))
+	_frame.position += Vector2(_frame.get_meta("drag_offset", Vector2.ZERO))  # dragged by its title bar
 
 
 func is_open() -> bool:
@@ -304,6 +313,8 @@ func show_page(new_kind: String, name: String, remember := true) -> void:
 		for row in grid_rows():
 			for b in row_things(row):
 				_mark(b)
+	if kind == "technology":
+		model.forget_pedia_page(kind, thing)  # its level and progress move on with research
 	_build_page()
 	_page_scroll.scroll_vertical = 0
 

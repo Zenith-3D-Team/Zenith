@@ -1,19 +1,19 @@
 extends RefCounted
 ## The UI's options with their limits, as keys "section/key" (e.g. "map/minimap"), and a `changed`
 ## signal for whoever uses them. They are kept with every other setting in settings.gd's file
-## (`user://settings.cfg`, sections [map] and [interface]); this is the view the HUD uses. One
-## shared instance: `UiSettings.shared()`. The Settings window and the map view's own switches
-## change them; `changed` fires however they were changed.
+## (`user://settings.cfg`, section [map]); this is the view the HUD uses. One shared instance:
+## `UiSettings.shared()`. The Settings window and the map view's own switches change them;
+## `changed` fires however they were changed.
 ##
 ##   [map]
 ##   minimap=true          show the minimap in the top-right corner
 ##   minimap_size=240      its side in Factorio GUI pixels (times the UI scale), 120 to 480
-##   minimap_zoom=1.0      screen (GUI) pixels per tile, 0.25 to 4; the minimap's +/- buttons change it
+##   minimap_zoom=1.0      screen (GUI) pixels per tile, 0.25 to 4; Shift + wheel over the minimap changes it
 ##   minimap_tags=true     map tags on the minimap
-##   show_tags=true        map view switches (Factorio's map view settings), on the map view and
-##   show_electric=true      the minimap both: tags, electric networks, logistic networks, turret
-##   show_logistic=true      coverage, train stop names, worker robots, rail signal states,
-##   show_turrets=false      recipe icons
+##   show_tags=true        map view switches (Factorio's map view settings), on the map view only
+##   show_electric=true      (Factorio's minimap shows none of them): tags, electric networks,
+##   show_logistic=true      logistic networks, turret coverage, train stop names, worker robots,
+##   show_turrets=false      rail signal states, recipe icons
 ##   show_stops=true
 ##   show_robots=true
 ##   show_signals=false
@@ -26,7 +26,6 @@ signal changed(key: String)
 
 const Settings := preload("res://scripts/menu/settings.gd")
 
-const PATH := "user://settings.cfg"
 ## Default, minimum, maximum (no range for booleans).
 const OPTIONS := {
 	"map/minimap": [true],
@@ -56,16 +55,11 @@ const MAP_LAYERS := [
 	["map/show_pollution", "Pollution"],
 ]
 
-## Kept for tests written before the settings were one file: pointing it elsewhere before the first
-## shared() uses that file for every setting (Settings.use_file).
-static var path := PATH
 static var _shared = null
 
 
 static func shared():
 	if _shared == null:
-		if path != PATH and Settings.path != path:
-			Settings.use_file(path)
 		_shared = new()
 		Settings.listen(_shared._on_settings_changed)
 	return _shared
@@ -75,20 +69,11 @@ func _on_settings_changed(section: String, key: String) -> void:
 	changed.emit(section + "/" + key)
 
 
-## Kept for callers of the old API: settings are read from the file as they are asked for.
-func load_settings() -> void:
-	Settings.load_settings()
-
-
-func save() -> void:
-	Settings.save()
-
-
 func get_value(key: String) -> Variant:
 	var fallback = OPTIONS[key][0] if OPTIONS.has(key) else null
 	var section := key.get_slice("/", 0)
 	var name := key.get_slice("/", 1)
-	if not Settings.has_value(section, name) and Settings.DEFAULTS.get(section, {}).get(name) == null:
+	if not Settings.has_value(section, name) and Settings.DEFAULTS.get(section, {}).get(name) == null and Settings.factorio_default(section, name) == null:
 		return fallback
 	return _clean(key, Settings.get_value(section, name)) if OPTIONS.has(key) else Settings.get_value(section, name)
 

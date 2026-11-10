@@ -45,6 +45,8 @@ local modules = require("scripts.modules")
 local rate = require("scripts.rate")
 local budget = require("scripts.budget")
 local requests = require("scripts.requests")
+local gfx = require("scripts.gfx")
+local mod_gui = require("scripts.mod_gui")
 
 local M = {}
 
@@ -124,7 +126,8 @@ function M.handshake(keep_view)
   local p = c and c.position or { x = 0, y = 0 }
   s.focus = { x = p.x, y = p.y, r = 32 }
   s.puppet_unit = c and c.unit_number or 0
-  transport.send_reliable(M.surface_fields(surface, {
+  gfx.reset()
+  transport.send_reliable(gfx.welcome_fields(M.surface_fields(surface, {
     t = "welcome",
     v = M.PROTOCOL,
     mod = script.active_mods["factorio-3d-bridge"],
@@ -132,15 +135,16 @@ function M.handshake(keep_view)
     x = world.fixed(p.x),
     y = world.fixed(p.y),
     mp = game.is_multiplayer(),
-  }))
+  })))
   -- The rest a stage a tick (handshake_tick): together they took 35 ms in one tick on the owner's
   -- save. Meanwhile only the transport and the stages run (control.lua), as before for one tick.
   s.hs_stage = 1
 end
 
 -- The handshake after the welcome, in order, with each stage's price in work units.
--- The dictionaries are made once per load (control.lua's warm-up), so these prices are their
--- sending: building the messages' slices.
+-- The name <-> id dictionaries, the entity records, eprops and item uses are made once per load
+-- (control.lua's warm-up), so those stages' prices are their sending: building the messages'
+-- slices. The tile, item, fluid and decorative records are listed from the dictionaries each time.
 local HANDSHAKE_STAGES = {
   { 100, function() send_records("protos", registry.entity_records()) end },
   { 100, function(s)
@@ -167,6 +171,7 @@ local HANDSHAKE_STAGES = {
     planets.send_initial()
     equipment.send_initial()
     players.send_initial()
+    mod_gui.reset() -- the new client gets every mod window on mod_gui's next round
     s.plat_sent = nil -- platforms.tick sends the panel's data within a second
   end },
 }
@@ -281,16 +286,178 @@ function M.each_client(fn, ...)
 end
 
 -- {player_index}: the player pressed "Show in Zenith" in the real game; the client playing their
--- character (single-player: the one client) is told to come to the front.
+-- character (single-player: the one client) is told to come to the front. True when one was.
+-- A save keeps the client it was saved with: until the timeout drops it, a loaded game would send
+-- `raise` to a Zenith that is gone and the key would do nothing. A live client says hello every
+-- second, so one not heard from in 3 s isn't raised.
+-- The tick goes on from the save's, though, so a client heard just before the save was made still
+-- looks fresh after loading it. In single-player (one peer, so a module-local flag can't desync) a
+-- loaded game raises no client until one says hello after the load.
+M.RAISE_FRESH = 180
+-- Ticks a raised Zenith has to say hello before it is taken for gone (it says hello every second).
+M.RAISE_ANSWER = 90
+local heard_since_load = true
+function M.on_load()
+  heard_since_load = false
+end
 function M.show_3d(event)
   local s = storage.f3d
-  if s.client and (not game.is_multiplayer() or puppet.owner() == game.get_player(event.player_index)) then
+  if s.client and game.tick - (s.client.last_seen or 0) <= M.RAISE_FRESH
+      and (heard_since_load or game.is_multiplayer())
+      and (not game.is_multiplayer() or puppet.owner() == game.get_player(event.player_index)) then
+    log("[Zenith] Show in Zenith: raising the connected Zenith")
     transport.send_now({ t = "raise" })
+    -- Say so, and watch that it answers: a live Zenith says hello within a second. One that
+    -- doesn't (closed, hung) isn't waited for: the launcher is asked, so the key never looks dead.
+    local player = game.get_player(event.player_index)
+    if player and player.valid then
+      player.print({ "f3d-launch.raising" })
+    end
+    s.client.raised = { tick = game.tick, player = event.player_index }
+    return true
+  end
+  return false
+end
+
+-- Where Zenith's launcher listens (server/factorio-with-zenith.ps1, started with Factorio): asked to
+-- start Zenith when "Show in Zenith" finds no client to raise. On a server the datagram goes from
+-- the pressing player's own machine (for_player), where their launcher runs.
+M.LAUNCH_PORT = 34209
+
+-- Ticks the launcher has to answer (`launching`) before the player is told it isn't there. It answers
+-- within milliseconds, and the button should explain itself at once when it can't start Zenith.
+-- Without --enable-lua-udp Factorio takes send_udp and sends nothing (checked in 2.1.24), so this wait
+-- is also how a game started without the launch options is found out.
+M.LAUNCH_WAIT = 45
+M.LAUNCH_HELP = "f3d-launch-help"
+-- Zenith keeps the launcher in C:\ProgramData\Zenith on every PC (game_swap.gd), so the line is whole.
+M.LAUNCH_LINE = 'powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\\ProgramData\\Zenith\\factorio-with-zenith.ps1" %command%'
+
+M.DOWNLOAD_URL = "https://github.com/Zenith-3D-Team/Zenith/releases"
+
+-- Nothing on screen would otherwise say why the button did nothing: a window with what is missing,
+-- step by step. A player may have this mod from the portal and no Zenith yet, or Zenith and a
+-- Factorio started without its launch options; the bridge can't tell those apart (a mod can't look
+-- for a program), so with no launcher both steps show. why:
+--   "none"   no launcher answered: Factorio wasn't started with Zenith's launch options;
+--   "zenith" the launcher answered but has no Zenith to start (never opened here: moved = false;
+--            moved or removed since it was last opened: moved = true).
+function M.launch_help(index, why, moved)
+  log("[Zenith] Show in Zenith: can't start Zenith (" .. tostring(why) .. "), showing what is missing")
+  local player = game.get_player(index)
+  if not (player and player.valid) then
+    return
+  end
+  local screen = player.gui.screen
+  if screen[M.LAUNCH_HELP] then
+    screen[M.LAUNCH_HELP].destroy()
+  end
+  local frame = screen.add({ type = "frame", name = M.LAUNCH_HELP, direction = "vertical",
+    caption = { "f3d-launch.title" } })
+  frame.force_auto_center()
+  local function text(key, bold)
+    local label = frame.add({ type = "label", caption = { key } })
+    label.style.single_line = false
+    label.style.maximal_width = 560
+    if bold then
+      label.style.font = "default-bold"
+    end
+  end
+  local function copy_box(value)
+    local box = frame.add({ type = "textfield", text = value })
+    box.style.width = 560
+  end
+  text("f3d-launch.intro")
+  if why == "zenith" then
+    text(moved and "f3d-launch.step1-moved" or "f3d-launch.step1", true)
+    copy_box(M.DOWNLOAD_URL)
+    text("f3d-launch.step2-done")
+  else
+    text("f3d-launch.step1", true)
+    copy_box(M.DOWNLOAD_URL)
+    text("f3d-launch.step2", true)
+    copy_box(M.LAUNCH_LINE)
+  end
+  text("f3d-launch.copy")
+  text("f3d-launch.then")
+  text("f3d-launch.or")
+  frame.add({ type = "button", name = M.LAUNCH_HELP .. "-close", caption = { "f3d-launch.close" } })
+end
+
+function M.ask_launch(event)
+  log("[Zenith] Show in Zenith: no Zenith connected, asking the launcher on " .. M.LAUNCH_PORT)
+  local data = helpers.table_to_json({ t = "launch", k = game.tick })
+  if game.is_multiplayer() then
+    -- Sent from that player's machine only: whether it failed there isn't known to every peer,
+    -- so nothing here may depend on it (desync). The wait covers both.
+    pcall(helpers.send_udp, M.LAUNCH_PORT, data, event.player_index)
+  else
+    pcall(helpers.send_udp, M.LAUNCH_PORT, data)  -- without --enable-lua-udp it sends nothing: the wait finds out
+  end
+  local s = storage.f3d
+  s.launch_wait = s.launch_wait or {}
+  s.launch_wait[event.player_index] = game.tick + M.LAUNCH_WAIT
+end
+
+-- The launcher answered: it is there, and starts (or brings forward) Zenith itself, or says it has
+-- no Zenith to start (`need` "zenith").
+function M.launch_answered(event, msg)
+  local waits = storage.f3d.launch_wait
+  if not waits then
+    return
+  end
+  local index = tonumber(event.player_index) or 0
+  if waits[index] then
+    waits[index] = nil
+  elseif index == 0 then
+    -- Read by the server (or single-player): the host's own launcher.
+    for i in pairs(waits) do
+      waits[i] = nil
+      index = i
+      break
+    end
+  end
+  local player = index > 0 and game.get_player(index)
+  if not (player and player.valid) then
+    return
+  end
+  if msg and msg.need == "zenith" then
+    return M.launch_help(index, "zenith", msg.moved == 1)
+  end
+  local help = player.gui.screen[M.LAUNCH_HELP]
+  if help then
+    help.destroy()
+  end
+  -- Zenith takes a while to start and join a big save: say it's coming, or the key looks dead.
+  player.print({ "f3d-launch.starting" })
+end
+
+-- Each tick while a player waits: read their own machine's packets (a joined player's launcher
+-- answers there), and show the help once the wait is over.
+function M.launch_tick()
+  local waits = storage.f3d.launch_wait
+  if not waits or next(waits) == nil then
+    return
+  end
+  for index, due in pairs(waits) do
+    if game.is_multiplayer() then
+      pcall(helpers.recv_udp, index)
+    end
+    if game.tick >= due then
+      waits[index] = nil
+      M.launch_help(index, "none")
+    end
   end
 end
 
-function M.client_count()
-  return (storage.f3d.client and 1 or 0) + table_size(extras())
+function M.on_gui_click(event)
+  local e = event.element
+  if e and e.valid and e.name == M.LAUNCH_HELP .. "-close" then
+    local frame = e.parent
+    if frame and frame.valid then
+      frame.destroy()
+    end
+  end
 end
 
 local function drop_client()
@@ -307,11 +474,15 @@ local function drop_client()
   map.reset()
   world.clear()
   transport.reset()
+  s.belt_refresh = {}
+  s.pipe_refresh = {}
   if s.extra and port then
     -- Its character waits for the same client (session id) to come back.
     storage.f3d_parked = storage.f3d_parked or {}
+    storage.f3d_parked_at = storage.f3d_parked_at or {}
     if s.puppet and s.puppet.valid then
       storage.f3d_parked[s.client.sid] = s.puppet
+      storage.f3d_parked_at[s.client.sid] = game.tick
     end
     extras()[port] = nil
   end
@@ -327,16 +498,24 @@ function handlers.hello(msg, port)
   local s = storage.f3d
   local sid = tostring(msg.sid or "")
   if not s.client or s.client.sid ~= sid or s.client.port ~= port then
+    heard_since_load = true
     s.client = { sid = sid, port = port, last_seen = game.tick, z = msg.z == 1, dc = msg.dc == 1, b = msg.b == 1,
-      bl = msg.bl == 1 }
+      bl = msg.bl == 1, bg = msg.bl == 1 and msg.bg == 1, br = msg.bl == 1 and msg.br == 1, v = tonumber(msg.v) or 0 }
     s.rate = nil -- a new client starts at full rate; it sends `rate` if it wants another
+    s.bud = nil -- and with the default work budget, not one the last client set
     M.handshake()
     return
   end
   s.client.last_seen = game.tick
+  heard_since_load = true
+  s.client.v = tonumber(msg.v) or 0
   s.client.z = msg.z == 1
   s.client.b = msg.b == 1
   s.client.bl = msg.bl == 1
+  -- Belt groups (belt_items.lua) build on kept lanes: a client says both.
+  s.client.bg = msg.bl == 1 and msg.bg == 1
+  -- Straight runs (belt_items.lua): plain lanes moved by the client, also on kept lanes.
+  s.client.br = msg.bl == 1 and msg.br == 1
   -- Decoratives turned on in the client's settings: send the dictionary and resend the chunks.
   if msg.dc == 1 and not s.client.dc then
     s.client.dc = true
@@ -357,13 +536,14 @@ end
 
 function handlers.sub(msg)
   if type(msg.c) == "table" then
-    world.subscribe(msg.c)
+    world.subscribe(msg.c, msg.h)
   end
 end
 
 function handlers.focus(msg)
   local s = storage.f3d
-  local x, y, r = tonumber(msg.x), tonumber(msg.y), tonumber(msg.r)
+  -- On the map and finite: every tick's searches round the focus use them (world.fixed_in).
+  local x, y, r = world.fixed_in(msg.x), world.fixed_in(msg.y), tonumber(msg.r)
   if x and y then
     local max_r = settings.global["f3d-max-focus-radius"].value
     s.focus = { x = x / 256, y = y / 256, r = math.max(8, math.min(r or 32, max_r)) }
@@ -460,6 +640,7 @@ handlers.mtr = map.trains
 handlers.mrp = map.roboports
 handlers.lpad = map.landing_pad
 handlers.bfar = belt_items.set_far
+handlers.bre = belt_items.resend
 handlers.rate = rate.set
 handlers.budget = budget.set
 
@@ -479,7 +660,7 @@ function handlers.view(cmd)
   end
   if allowed then
     s.view_si, s.view_from = si, c.surface.index
-    s.view_at = { x = (tonumber(cmd.x) or 0) / 256, y = (tonumber(cmd.y) or 0) / 256 }
+    s.view_at = { x = (world.fixed_in(cmd.x) or 0) / 256, y = (world.fixed_in(cmd.y) or 0) / 256 }
   else
     s.view_si, s.view_at, s.view_from = nil, nil, nil
   end
@@ -557,6 +738,7 @@ handlers.set_section = function(cmd)
   return entity_section(cmd)
 end
 handlers.set_char_color = logistics.set_char_color
+handlers.gfx = gfx.ask
 requests.add("pedia_index", pedia.index, 300)
 handlers.pedia_index = requests.handler("pedia_index")
 requests.add("pedia", pedia.page, 150)
@@ -570,6 +752,7 @@ handlers.bonuses = requests.handler("bonuses")
 requests.add("perms", force_info.permissions, 100)
 handlers.perms = requests.handler("perms")
 handlers.cmd = console.run
+handlers.mpress = mod_gui.press
 handlers.modreq = modules.request
 requests.add("hinfo", modules.hover, 50)
 handlers.hinfo = requests.handler("hinfo")
@@ -612,13 +795,40 @@ local function dispatch(handler, msg, port)
   end
 end
 
+-- At most this many characters wait for their clients. The client makes a new session id each
+-- time it starts, so a restarted client never takes its old character back; and a hello and a
+-- bye from a new id each time made a character (with the starter kit) and a storage entry per
+-- pair, forever. Past the cap a new client takes over the character that has waited longest.
+local MAX_PARKED = 16
+
+local function oldest_parked(parked, at)
+  local best, best_tick
+  for sid, c in pairs(parked) do
+    local t = at[sid] or 0
+    if c.valid and (not best or t < best_tick or (t == best_tick and sid < best)) then
+      best, best_tick = sid, t
+    end
+  end
+  return best
+end
+
 -- A new client next to the first: a fresh state, with its old character if it was here before.
 local function add_client(msg, port)
   local state = { extra = true }
-  local parked = storage.f3d_parked or {}
+  storage.f3d_parked = storage.f3d_parked or {}
+  storage.f3d_parked_at = storage.f3d_parked_at or {}
+  local parked, at = storage.f3d_parked, storage.f3d_parked_at
+  for sid, c in pairs(parked) do
+    if not c.valid then
+      parked[sid], at[sid] = nil, nil
+    end
+  end
   local sid = tostring(msg.sid or "")
+  if not parked[sid] and table_size(parked) >= MAX_PARKED then
+    sid = oldest_parked(parked, at) or sid
+  end
   local c = parked[sid]
-  parked[sid] = nil
+  parked[sid], at[sid] = nil, nil
   extras()[port] = state
   M.serve(state, function()
     M.init_storage()
@@ -634,11 +844,18 @@ function M.on_packet(event)
   if not ok_decode or type(msg) ~= "table" or type(msg.t) ~= "string" then
     return
   end
+  if msg.t == "launching" then
+    if event.source_port == M.LAUNCH_PORT then
+      M.launch_answered(event, msg)
+    end
+    return
+  end
   local handler = handlers[msg.t]
   if not handler then
     return
   end
   local port = event.source_port
+  console.from_player = tonumber(event.player_index) or 0
   local extra = extras()[port]
   if extra then
     return M.serve(extra, dispatch, handler, msg, port)
@@ -660,6 +877,20 @@ function M.tick()
   if game.tick - s.client.last_seen > TIMEOUT then
     drop_client()
     return false
+  end
+  local raised = s.client.raised
+  if raised then
+    if s.client.last_seen > raised.tick then
+      s.client.raised = nil
+    elseif game.tick - raised.tick > M.RAISE_ANSWER then
+      local player = game.get_player(raised.player)
+      log("[Zenith] Show in Zenith: the connected Zenith didn't answer, asking the launcher")
+      s.client.raised = nil  -- silent, it no longer counts as fresh, and the timeout drops it
+      if player and player.valid then
+        player.print({ "f3d-launch.raise-lost" })
+        M.ask_launch({ player_index = raised.player })
+      end
+    end
   end
   -- A new character (a respawn after death) starts over, so the client's avatar is the new one.
   -- The same character on another surface (a space platform, or in single-player wherever the
@@ -695,6 +926,11 @@ function M.status_command(cmd)
     if rate.level() > 0 then
       lines[#lines + 1] = "[Zenith] slowed down to rate level " .. rate.level() .. " (the client's `rate`)"
     end
+    -- The client's protocol (its hello's `v`): one of an incompatible release reads messages wrong.
+    if s.client.v and s.client.v ~= M.PROTOCOL then
+      lines[#lines + 1] = string.format("[Zenith] the client speaks protocol %s and this bridge %d: update the older one",
+        tostring(s.client.v), M.PROTOCOL)
+    end
   else
     lines[#lines + 1] = "[Zenith] no client connected. Is Factorio running with --enable-lua-udp <port>?"
   end
@@ -725,8 +961,19 @@ end
 -- chat.
 function M.reply(cmd, lines)
   if console.capture then
+    -- Only text goes back (`cmdr` is JSON kept in the outbox): /f3d-profile's lines carry
+    -- profilers, which only Factorio can print, so they stay in Factorio's console and RCON.
+    local held = false
     for _, line in ipairs(lines) do
-      console.capture[#console.capture + 1] = line
+      if type(line) == "string" then
+        console.capture[#console.capture + 1] = line
+      else
+        held = true
+      end
+    end
+    if held then
+      console.capture[#console.capture + 1] =
+        "[Zenith] the profiler's times print only in Factorio: /f3d-status in its console or over RCON"
     end
     return
   end
@@ -744,6 +991,13 @@ function M.reply(cmd, lines)
 end
 
 function M.platform_command(cmd)
+  -- `new` makes a platform and its surface out of nothing, for tests: from Factorio's console or
+  -- RCON only. From Zenith's console (`cmd` over UDP, which anything on localhost can send) each
+  -- packet made another surface, for good.
+  if console.capture and tostring(cmd.parameter or ""):match("^%s*(%S+)") == "new" then
+    M.reply(cmd, { "[Zenith] /f3d-platform new works from Factorio's console or RCON, not from Zenith's" })
+    return
+  end
   M.reply(cmd, platforms.console(cmd))
 end
 
@@ -768,7 +1022,6 @@ function M.profile_command(cmd)
   end
   local on = profile.toggle()
   M.reply(cmd, { on and "[Zenith] profiling on: /f3d-status shows each module's time per tick after 10 s"
-    .. (trace and "; each tick's times also go to the log (f3d-trace lines)" or "")
     or "[Zenith] profiling off" })
 end
 

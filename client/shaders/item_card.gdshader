@@ -10,7 +10,7 @@ render_mode world_vertex_coords;
 uniform sampler2D icon : source_color, filter_linear_mipmap_anisotropic;
 
 void vertex() {
-	VERTEX = belt_vertex(VERTEX, INSTANCE_CUSTOM);
+	belt_place(VERTEX, NORMAL, INSTANCE_ID);
 	VERTEX.y += ground_h(VERTEX.xz);  // world coordinates here
 }
 

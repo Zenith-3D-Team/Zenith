@@ -164,18 +164,6 @@ static func item_lines(d: Dictionary) -> Array:
 	return lines
 
 
-## A recipe's ingredients, time and products as tooltip lines.
-static func recipe_lines(d: Dictionary) -> Array:
-	var lines: Array = [["Ingredients:"]]
-	for i in d.get("ing", []):
-		lines.append(["%s × %s" % [num(float(i[2])), Kit.pretty(str(i[1]))], str(i[1])])
-	lines.append(["%s Crafting time" % seconds(float(d.get("time", 0.5)))])
-	lines.append(["Products:"])
-	for p in d.get("prod", []):
-		lines.append(["%s × %s" % [num(float(p[2])), Kit.pretty(str(p[1]))], str(p[1])])
-	return lines
-
-
 ## What a technology's trigger asks for ("Craft 50 Iron plate").
 static func trigger_text(detail: Array, trigger: String) -> String:
 	var t := str(detail[0]) if detail.size() > 0 else trigger

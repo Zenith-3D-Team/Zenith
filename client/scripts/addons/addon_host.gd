@@ -14,7 +14,6 @@ const AddonLoader := preload("res://scripts/addons/addon_loader.gd")
 const AddonApi := preload("res://scripts/addons/addon_api.gd")
 const AddonEvents := preload("res://scripts/addons/addon_events.gd")
 const AddonWorld := preload("res://scripts/addons/addon_world.gd")
-const AddonRequests := preload("res://scripts/addons/addon_requests.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 
 ## The list changed, or an add-on started or stopped (the Mods window redraws).

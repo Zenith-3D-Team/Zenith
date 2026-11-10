@@ -115,10 +115,7 @@ local function send_if_changed(s, key, msg, sig)
   transport.send_now(msg)
 end
 
-local function send_grids(c, s, force)
-  if force then
-    s.eq_sent = {}
-  end
+local function send_grids(c, s)
   local own = grid_message("char", c, M.grid_of(c))
   send_if_changed(s, "char", own, signature(own))
   local v = vehicle_of(c)
@@ -133,7 +130,7 @@ local function number(v)
   return tonumber(v) or 0
 end
 
-local function send_info(c, s, force)
+local function send_info(c, s)
   local f = c.force
   local g = M.grid_of(c)
   local mhp = get(c, "max_health") or 0
@@ -168,7 +165,7 @@ local function send_info(c, s, force)
     parts[#parts + 1] = info[k]
   end
   local sig = table.concat(parts, ",")
-  if not force and s.info_sig == sig and game.tick - (s.info_tick or 0) < RESEND_TICKS then
+  if s.info_sig == sig and game.tick - (s.info_tick or 0) < RESEND_TICKS then
     return
   end
   s.info_sig, s.info_tick = sig, game.tick
@@ -327,11 +324,11 @@ function M.tick()
     return
   end
   if game.tick % GRID_INTERVAL == 0 or not s.eq_sent or not next(s.eq_sent) then
-    send_grids(c, s, false)
+    send_grids(c, s)
   end
   -- Its own phase: the bridge's periodic jobs all fell on the same tick once a second (budget.lua).
   if (game.tick + 53) % INFO_INTERVAL == 0 or not s.info_sig then
-    send_info(c, s, false)
+    send_info(c, s)
   end
 end
 

@@ -96,7 +96,9 @@ const NOT_BUILDINGS := ["cliff", "tree", "simple-entity", "resource", "fish", "c
 	"asteroid", "asteroid-chunk", "plant", "entity-ghost", "tile-ghost", "deconstructible-tile-proxy"]
 
 var _changed := {}  # Vector2i -> true: chunks whose buildings came or changed (take_changed_chunks)
-var _watching := false
+## The world whose entities_changed is watched, by instance id: main.gd makes a new one for every
+## game, so each game's is watched afresh (an id isn't reused, a freed node's address may be).
+var _watched := 0
 
 
 ## The buildings in a loaded chunk, for levelling the ground under them: [[Vector2 centre, Vector2
@@ -122,12 +124,17 @@ func buildings_in_chunk(chunk: Vector2i) -> Array:
 
 
 ## Chunks whose buildings came, went or changed since the last call (a chunk loaded late, a
-## building placed or mined): an add-on reads them again. The first call starts the watch.
+## building placed or mined): an add-on reads them again. The first call in a game starts the watch.
 func take_changed_chunks() -> Array:
 	var w = _host.game_node("world")
-	if not _watching and w != null:
-		_watching = true
-		w.entities_changed.connect(func(c: Vector2i) -> void: _changed[c] = true)
+	if w != null and w.get_instance_id() != _watched:
+		_watched = w.get_instance_id()
+		_changed = {}  # the last game's chunks
+		w.entities_changed.connect(_on_entities_changed)
 	var out := _changed.keys()
 	_changed = {}
 	return out
+
+
+func _on_entities_changed(chunk: Vector2i) -> void:
+	_changed[chunk] = true

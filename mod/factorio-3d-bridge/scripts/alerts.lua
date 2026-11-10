@@ -168,11 +168,12 @@ end
 ---------------------------------------------------------------------------------------------
 -- Scans
 
--- Factorio's warnings over machines: no power (unplugged when no pole reaches it), no fuel,
--- output full.
+-- Factorio's warnings over machines: unplugged (no pole reaches it), no fuel, output full. No power
+-- and low power aren't listed: Factorio has no alert for them, and the client draws the no-power
+-- icon from `pw` (fluids_power.lua); 2.1 says no_power for a machine no pole reaches, hence the read.
 local STATUS_KINDS = { no_power = "no_power", not_plugged_in_electric_network = "unplugged", no_fuel = "no_fuel",
-  full_output = "output_full", full_burnt_result_output = "output_full", low_power = "low_power" }
-local PASS_KINDS = { "no_ammo", "no_power", "unplugged", "no_fuel", "output_full", "low_power", "launch", "collector",
+  full_output = "output_full", full_burnt_result_output = "output_full" }
+local PASS_KINDS = { "no_ammo", "unplugged", "no_fuel", "output_full", "launch", "collector",
   "no_material", "no_robots" }
 
 local function networks_at(e)
@@ -218,8 +219,8 @@ local function check_entity(e, found)
   end
   local name = status_name(e.status)
   local kind = name and STATUS_KINDS[name]
-  if kind == "no_power" and not e.electric_network_id then
-    kind = "unplugged"
+  if kind == "no_power" then
+    kind = not e.electric_network_id and "unplugged" or nil
   end
   if e.type == "rocket-silo" and (name == "waiting_for_space_in_destination" or name == "not_connected_to_hub_or_pad") then
     kind = "launch"
@@ -396,7 +397,7 @@ local SCANS = { scan_repair, scan_trains, scan_platforms }
 
 -- The order of Factorio's alert bar, then the machine warnings.
 local ORDER = { "destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "train_fuel", "train_path",
-  "platform_path", "platform_storage", "collector", "launch", "no_power", "unplugged", "low_power", "no_fuel", "output_full" }
+  "platform_path", "platform_storage", "collector", "launch", "unplugged", "no_fuel", "output_full" }
 
 local function from_events(al, kind)
   local list = {}

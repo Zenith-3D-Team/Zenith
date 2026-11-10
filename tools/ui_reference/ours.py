@@ -13,6 +13,7 @@ your install, so these pictures stay out of git too.
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -23,7 +24,9 @@ REPO = HERE.parent.parent
 sys.path.insert(0, str(HERE))
 from capture import main_checkout  # noqa: E402
 
-GODOT = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/WinGet/Packages/GodotEngine.GodotEngine_Microsoft.Winget.Source_8wekyb3d8bbwe/Godot_v4.7.2-stable_win64_console.exe"
+# $GODOT, as the other tools (models/review.py, bench/compare_builds.py); then winget's copy; then PATH.
+_WINGET = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/WinGet/Packages/GodotEngine.GodotEngine_Microsoft.Winget.Source_8wekyb3d8bbwe/Godot_v4.7.2-stable_win64_console.exe"
+GODOT = Path(os.environ.get("GODOT") or (_WINGET if _WINGET.exists() else shutil.which("godot") or _WINGET))
 
 # reference name -> the client's options that show the same thing ([] = just the game and HUD).
 # Entity windows open the nearest entity of that prototype (--open=<name>); the mock has a
@@ -54,7 +57,7 @@ SHOTS: dict[str, list[str]] = {
     "upgrade_planner": ["--ui-planner=5"],
     "blueprint_book": ["--ui-game-record=2"],
     "blueprint_library": ["--ui=library"],
-    # hover.py's pictures (art-src/ui_reference/hover/)
+    # hover.py's pictures
     "click_shortcut_expand": ["--ui=shortcut-chooser"],
     "click_quickbar_page": ["--ui=page-chooser"],
     "hover_entity_alt_48": ["--alt-mode", "--ui-hover=1125,745"],
@@ -74,7 +77,7 @@ SHOTS: dict[str, list[str]] = {
     "factoriopedia_fluid": ["--pedia=fluid:water"],
     "factoriopedia_planet": ["--pedia=planet:vulcanus"],
     "factoriopedia_tile": ["--pedia=tile:grass-1"],
-    "trains_nauvis": ["--ui=trains", "--start=40,0"],
+    "trains_nauvis": ["--ui=trains"],  # the mock's train (Factorio's picture: a card on Nauvis)
     "logistic_networks_click": ["--ui=networks"],
 }
 MOCK_ENTITIES = ["wooden-chest", "requester-chest", "storage-chest", "assembling-machine-1", "stone-furnace",

@@ -143,9 +143,9 @@ Factorio for most client work, since a mock server plays a fake game.
 Next for modding: model packs for other mods, their icons, and more hooks as add-ons need them.
 [MODDING.md](MODDING.md) covers what works today, how other mods behave, and what's planned.
 
-**Roadmap.** Releases go by milestone: 0.2 stability, 0.3 performance, 0.4 UI polish, 0.5 models,
-0.6 Space Age polish, 0.7 add-ons and modding, 0.8 feature complete, 0.9 final touch-ups and 1.0
-the full release. [docs/ROADMAP.md](docs/ROADMAP.md) says what each one covers.
+**Roadmap.** Six goals worked on side by side, in priority order: stability, performance, the
+interface, models and animation, Space Age, and mods and add-ons. Each release carries progress on
+any of them; 1.0 comes when all six are met. [docs/ROADMAP.md](docs/ROADMAP.md) says what each covers.
 
 ## Docs
 
@@ -153,7 +153,7 @@ the full release. [docs/ROADMAP.md](docs/ROADMAP.md) says what each one covers.
 - [docs/RUNNING.md](docs/RUNNING.md): setup, controls, troubleshooting
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the pieces fit together, for anyone reading the code
 - [docs/PROTOCOL.md](docs/PROTOCOL.md): messages between the mod and the client
-- [docs/ROADMAP.md](docs/ROADMAP.md): the milestones to 1.0 and how versions are numbered
+- [docs/ROADMAP.md](docs/ROADMAP.md): the goals to 1.0, their priorities, and how versions are numbered
 - [docs/PLAN.md](docs/PLAN.md): the approach, where each part stands, the art pipeline and risks
 - [docs/ASSET-INVENTORY.md](docs/ASSET-INVENTORY.md): every entity's 3D model, family by family
 - [CONTRIBUTING.md](CONTRIBUTING.md): no pull requests; notes for working on a fork

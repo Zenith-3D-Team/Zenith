@@ -9,7 +9,6 @@ extends "res://scripts/ui/factorio/global_window.gd"
 ## none count as earned here, as Factorio's own note says for modded games.
 
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
-const ItemIcons := preload("res://scripts/world/item_icons.gd")
 
 const ROW_HEIGHT := 120
 const WIDTH := 420
