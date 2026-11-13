@@ -48,15 +48,20 @@ made by `tools/record_menu_world.py`):
     server isn't possible: the bridge only talks to a client on the same computer.
 - **Settings**: as in Factorio, a list of pages (Graphics, Controls, Sounds, Interface, Other, Mod settings, then ours: Camera, Factorio install, and Add-ons, which opens the Add-ons menu), each opening alone with Back and Confirm; every option is wired to what it changes:
   - **Graphics**: a **Preset** (Low, Medium, High, Ultra, or Custom once anything differs; it sets
-    shadows, SSAO (off in every preset), level of detail, the view, entity, belt and decorative distances, decorative
-    density and clouds together; High is the defaults) and **For this PC** (Recommended: the preset
+    shadows, SSAO (on in High and Ultra), contact shading (on in every preset), level of detail, the view, entity, belt
+    and decorative distances, decorative density, 3D grass and clouds together; High is the defaults) and **For this PC** (Recommended: the preset
     this PC should hold at a steady 60 UPS and 60 FPS, from its CPU threads and graphics card; in a
     game it measures six seconds first; it also turns on Hold the game at 60 UPS and smooth belt
     items, and sets merged materials below); full
-    screen (windowed, borderless, exclusive), resolution, preferred screen, minimize on focus loss,
-    VSync, FPS limit, game render scaling (50% to 200%), view distance (2 to 20 chunks round the
-    camera, default 10; the bridge streams at most 625 chunks, so past 12 the view is the nearest
-    625, a circle about 14 chunks round), entity distance (32 to 256 tiles, default 192; the server's "Max
+    screen (windowed, borderless, exclusive), resolution (windowed: the window's size; in full
+    screen the size the world is drawn at, scaled up to fill the monitor undistorted, with the
+    interface sharp and laid out as at that size, up to the monitor's own), preferred screen,
+    minimize on focus loss, VSync, FPS limit, game render scaling (50% to 200%, multiplying the
+    resolution), view distance (2 to 50 chunks round the
+    camera, default 10; its value shows yellow past 10 and red past 20, since what is drawn grows with
+    its square; past 14 chunks the ground is drawn simpler, a quad per 4x4 tiles; a bridge mod from before
+    square subscriptions (no welcome `sq`) streams at most 625 chunks, so with one the view past 12 is the
+    nearest 625, a circle about 14 chunks round; Factorio only has ground where its map is generated), entity distance (32 to 256 tiles, default 192; the server's "Max
     live-update radius" caps it), belt item distance (0 off to 640 tiles, default 160: items on
     belts drawn that far, moving near the character and standing still on their lanes past
     that), moving belt items (Automatic, the default, or 1,000 to 24,000 items, or Unlimited: the
@@ -64,14 +69,24 @@ made by `tools/record_menu_world.py`):
     outwards; further out they stand still; Automatic follows the frames' room, the game's speed and
     what the reading costs the server, which each update reports (`bi` w), keeping it within about
     1,500 work units a tick; Unlimited moves every item within the belt item distance), hold the game at
-    60 UPS (on; see Troubleshooting), smoke and particles, Items in 3D (Icons only, up to 20,000
+    60 UPS (on; see Troubleshooting), give the server the CPU first (on; `--server-first=off`: with the
+    server on this PC, connected to 127.0.0.1, the client's process runs at below-normal priority from the
+    welcome on, so Factorio's tick gets a core first whenever every core is busy; measured on a 4-core PC
+    at a busy base, the join's first 75 s ran the game at 34 UPS median at normal priority and 56 below,
+    steady 59-60 either way, the client's frame rate unchanged; Windows sets it with wmic, elsewhere
+    renice), smoke and particles, Items in 3D (Icons only, up to 20,000
     or All, default All: how many belt items are 3D models, nearest the character first, the rest
     their icons; Icons only draws every item as its icon, on the ground and in hands too), clouds,
-    decoratives, decorative density and distance (64 to 320 tiles, default 192), model look (each
-    part in Factorio's colours, or Factorio's sprite projected on). Smooth belt items (belt items
+    decoratives, decorative density and distance (64 to 320 tiles, default 192), 3D grass (off, 30
+    tiles still, 40 or 50 tiles with wind; default 40; see Decoratives). Models always wear each
+    part's colour from Factorio's sprites (the projected-sprite model look is gone). Smooth belt items (belt items
     read in one tick every update, so they follow curves) and item icons are no longer shown and
     stay on; Hold the game at 60 UPS still eases smooth belt items off under load. **Advanced:**
-    anti-aliasing (FXAA, TAA, MSAA), shadows (off,
+    anti-aliasing (Off, FXAA, SMAA, TAA, MSAA 2x/4x/8x; default SMAA, the sharp one; TAA softens moving
+    belts; under a look that draws full-screen passes, such as the Cinematic shaders, the MSAA choices are
+    greyed out and a saved MSAA is switched to SMAA in the settings (at the start, or when such a look
+    comes on, with a message), since the passes read a depth MSAA averages at every edge; a look's TAA
+    still runs over it), shadows (off,
     low, medium, high, ultra: the sun's shadow map is fitted to the ground in view, one map from
     the angled view and Godot's splits when the view reaches the horizon; Low one 2048 map out to
     80 tiles, Medium 4096 to 110, High 4096 to 150, Ultra 8192 to 200,
@@ -86,7 +101,13 @@ made by `tools/record_menu_world.py`):
     works), merged materials (off: each model drawn as one surface with one material, fewer draws and
     less render CPU for a little more GPU time; after a restart; `-- --merged-materials` or
     `--no-merged-materials` override it; Recommended turns it on for a big desktop GPU whose frames
-    the CPU holds up, the presets leave it), Ambient occlusion (WIP, high GPU cost; off by default, and turned off once in settings saved before), render on a separate thread (off: Godot's experimental mode, after a restart).
+    the CPU holds up, the presets leave it), Ambient occlusion (SSAO, tuned to Factorio's tight corner shading: radius 0.7 tiles, no detail pass, half
+    size, half its effect on direct light, faded out 60-140 tiles away; on by default and in High and Ultra, off in Low and Medium, about 0.7 ms of
+    GPU at a busy base on a desktop card; turned off once in settings saved before it was retuned), Contact shading
+    (on: the dark rim on the ground round each building's foot that Factorio's sprites have, faint under chests,
+    none under belts, rails, walls, pipes and trees, a broad patch under drills, labs, radars and centrifuges;
+    contact_shade.gd, one draw per chunk), render on a separate thread (off: Godot's experimental mode, after a
+    restart).
     **Accessibility:** brightness, contrast, saturation and Factorio's colour filters
     (protanopia, deuteranopia, tritanopia and their corrections, over the whole window).
   - **Sound**: master, game effects and its parts (walking, environment = machines and vehicles,
@@ -138,8 +159,8 @@ it off. Settings left at Factorio's default (comments in `config.ini`) keep Zeni
 at once, the UI scale too (Settings → Interface, or Factorio's keys Ctrl+= / Ctrl+- / Ctrl+0 in
 the game and the menus; "Automatic" follows the window's height as it's resized). The UI is built
 at the scale it started with and scaled from there, so after a big change text is a little softer
-until the next start. The model look applies after a restart (`-- --model-look=colours|sprite|palette`
-overrides it). `-- --settings-file=user://other.cfg`
+until the next start. `-- --model-look=palette` draws the models in their own palette colours, for
+comparing. `-- --settings-file=user://other.cfg`
 uses another file (tests and screenshots).
 
 Starting a save runs Factorio exactly as `server/run-server.ps1` does (same `server/data` write-data
@@ -225,6 +246,30 @@ project back after), exported on Windows with only an ad-hoc signature and no no
 asks to be told to open it (right-click > Open, or `xattr -dr com.apple.quarantine Zenith.app`);
 Factorio's own macOS build is found in Steam or /Applications.
 
+**Build channels (owner: public downloads carry no testing tools; development builds do).**
+`--channel public` (the default) is the release on the public repo; `--channel dev` builds
+`dist/Zenith-<version>-dev-<platform>.zip` a development build for testers. A dev export
+carries Godot's custom feature tag `zenith_dev`: package.py adds it to that platform's export preset
+for the export alone and puts `client/export_presets.cfg` back after, so the presets stay one list.
+`Settings.dev_tools()` (client/scripts/menu/settings.gd) is the one switch everything asks: true in
+a dev export and when running from source (the editor, `godot --path client`; `-- --public-build`
+shows what players get), false in a public export. Public builds hide the main menu's Performance
+test and `--perf-test`, the debug menu with its Ctrl+F12 binding, and its overlays; the code stays in.
+A dev zip also has PERFORMANCE-TEST.md, the docs' dev-build parts (USER-GUIDE.md and ADDONS.md
+mark them `<!-- dev -->` ... `<!-- /dev -->`, cut from a public zip's copies) and a line in
+`START HERE.txt` saying it is a development build. The probes on the command line (`--stutter-probe`,
+`--ups-probe`, `--ups-overlay` and the rest below) and the bridge's `/f3d-debug` stay in both.
+A feature tag rather than a marker file beside the program: the build itself says what it is, so
+there is no file to lose when unpacking, to copy into a public download, or to read at start.
+
+**A modeller's models in the download:** `--models <folder>` copies the `.glb` and `.gltf` files at
+that folder's top (and any `.bin` or textures a `.gltf` points at) into the download's `models/`
+folder beside the program, and adds a note to its README.txt that they are a modeller's, used with
+permission. Zenith reads that folder at start-up, as in a checkout, and a model there replaces its
+own of the same name, so the download shows them with no option set (`-- --no-custom-models` leaves
+them out). The 0.2.0 downloads carry Vasillo's models this way (his permission; CREDITS.md):
+`--models <his models>`.
+
 `python3 tools/release/build_mod_zip.py` builds just the mod
 (`dist/factorio-3d-bridge_<version>.zip`) for Factorio's own mods folder.
 
@@ -243,7 +288,12 @@ made-up contents; `--start 5,-1` starts the character next to an assembler (`4,9
 `--belt-field 24x16 --start=24,-8` adds a block of full belts (about 3,000 items of 24 types)
 to watch the client draw items on belts; the client's `--item-bench` prints frame times and the
 belt items' own time every 5 s, and `--item-models=off` draws icons instead of 3D models for
-comparing. `--item-showcase --start=-20.5,7.5` lays one of every item that has a 3D model on the
+comparing. With `--belts-off 16 --belt-tiers` the field's columns are bare yellow, red, blue
+and green belts in blocks of four, every other one stopping and starting, for watching their
+surfaces (chevrons spaced as Factorio's: yellow every half tile, red and blue one a tile, turbo
+every other tile). Fast belts are smeared over one 60 fps frame's travel so they don't strobe (none
+while TAA is on, which blends frames itself, and none on screenshots); the client's
+`--no-belt-smear` draws them without it, for comparing. `--item-showcase --start=-20.5,7.5` lays one of every item that has a 3D model on the
 ground in a grid. (Much bigger fields don't help: Windows keeps only ~64 KB of a burst of UDP,
 about 3,000 items per update.)
 
@@ -299,7 +349,9 @@ Then start the client and use Play → Connect to address (`127.0.0.1:34200`), o
 menu start the server for you: Play → Load.)
 
 `/f3d-status` shows whether a client is connected, how many chunks are subscribed, and where
-the character is. Both scripts enable RCON on 127.0.0.1:34198 with a random password in
+the character is, and starts with any step of the bridge that failed (`ERROR: step ...`, also in
+`factorio-current.log`): one failing step no longer stops the game (`tools/live_check.py --only barrier`
+fails one on purpose to check that). Both scripts enable RCON on 127.0.0.1:34198 with a random password in
 `server/data/rcon-password.txt`, so console commands work from another terminal:
 
 ```
@@ -400,7 +452,111 @@ view, Factoriopedia, statistics, the trains on the map, hover info) is done in s
 budget"). **Update rates** (`scripts/rate.lua`): at `rate` level 1 to 3 the costliest periodic
 updates (belt items, far lanes, movers, then machine states, enemies, plants and spawners, then
 fluids, trains, turrets, inserter hands) come less often, each level doubling their interval; the character's own
-updates never slow. Hold the game at 60 UPS sets both; `/f3d-rate 0-3` sets the level by hand.
+updates never slow. A `bs` client's belt updates (reads of the input spots, not glided positions) slow
+only at level 3 and only to 12 ticks (`/f3d-bs own_rate`, below). Hold the game at 60 UPS sets both; `/f3d-rate 0-3` sets the level by hand. While
+the bridge makes its first load of the belts (joining, a jump: `bs` with `ld` while the square loaded is
+under 3/4 of the belt item distance) and 3 s after, Hold 60 UPS takes no step and keeps the budget at 150
+or more; the load done, the budget is back at its default (ups_governor.gd).
+
+**Belt simulation switches** (`scripts/belt_sim.lua`, a `bs` client): `/f3d-bs` (console or RCON, no
+restart) lists them; `/f3d-bs <name> on|off|default` sets one for every client (kept in the save), the
+old behaviour back when off. `feed_edges`: lanes fed from outside what is sent are checked on every
+update's tick, never quiet, and sent whenever they changed. `full_area`: every belt within the client's
+belt item distance is simulated (off: its Belt updates cap and the entity distance bound the square, as
+before). `inputs_first`: inserters and drills that use belts are checked themselves (their hands, their
+mining progress) and wake their belts; input spots come before the other checks, the accuracy reads
+outside the steady limit. `line_rereads`: lanes asked for again (`bre`) are read in groups on one tick
+with their packed runs. `/f3d-bs bound <share>`: the share of the work budget the belts' work a tick may
+take before the square is cut from the outside (default 0.6; 0: never cut). What they cost at 160 tiles:
+`actor_backoff` (inserters whose hand stood for 4 checks are checked every other update, drills about when
+their progress comes round), `drift_far` (drift checks half as often from 48 tiles, a quarter as often from
+96), `bre_cap <lanes>` (at most that many asked lanes read an update, in the order asked, the rest
+waiting their turn, at most 2,048; default 192, 0: all), `quiet_backoff` (watched lanes standing for 6 and 12 checks are checked 2 and 4 times
+less often), `pc_ids` (every packed lane's drift check carries its front and back items' ids, `pu`,
+outside the accuracy extras' share: off, only while that share has room, which at 160 tiles was 61 of
+85,080 packed checks, so a packed lane the client had a whole gap or more off by its ids never showed;
+off by default, as it changed nothing measured), `hold_inputs` (a splitter's input found at its check as the
+client's last read of it left it, a packed one by its front and back items' ids too, is sent in `sh`: the
+client puts it back so and holds its items there, not crossing into the outputs, until its next read; the
+game's own update order holds a backed-up balancer's input a tick or more where the belt rules let its item
+go, and a watched lane is sent only when the game's changes, so the client's balancers drained where the
+game's stood). The others on by default. `area square|trace` (the owner's design; default square): with
+`trace` the bridge loads only the belts within `trace_near` tiles of the focus (default 48: what the
+player sees at the normal zoom, about 107 x 60 tiles), the belts feeding them traced back to their
+origins (at most `trace_hops` belts back, default 200; an origin is a belt nothing loaded feeds, whose
+inserters and drills are the input checkpoints) and the belts they feed `trace_down` belts on (default 8;
+where a line is cut its exit lane's wall is watched every update, `ew`). Belts within the belt item
+distance that don't feed what is seen aren't loaded (their far lane icons stay); `fr` is then the near
+square, and the far lanes leave out the traced belts beyond it. `checkpoints` (off by default): the lanes
+where our copy of the belt rules is known to go a tick from the game's (a splitter's inputs, a lane an
+inserter takes from, an underground entrance an inserter drops on) are checked every update, never
+quiet, packed ones by their ids. `crossings sim|game` (default `sim`): with `game` every splitter's output
+lanes (lines 5-8, a lane splitter's 3-4) are checked on every update, never quiet, packed ones by their ids,
+and read (`sl`) whenever anything but an even flow happened, so each crossing reaches the client within an
+update of the game making it; measured offline on the 80 x 80 recording at -62,-26 (docs/BELT-SIM-PLAN.md,
+the cross round) reads of the outputs every 6 ticks made the simulation worse than running the splitters
+itself, so `sim` stays the default. With `/f3d-profile`, `/f3d-status` also lists the belt simulation's parts
+quiet, packed ones by their ids. `own_rate` (on): the updates follow their own rate job (`bs` in
+rate.lua: tier 3, at most 12 ticks), so the client's `rate` levels 1-2 (Hold 60 UPS's first steps) leave
+them every 6 ticks and level 3 doubles them once; every update is a read of every input spot, so a
+longer period is a staler bus, not a smoother glide (off: the glided belt items' job `bi`, 12, 24, 48
+ticks at levels 1-3, as before, which under Hold 60 UPS left the owner's bus with gaps along every lane).
+Hold 60 UPS then buys its UPS from the steps after `rate` (the minimap, the entity distance, the belt
+item distance, which shrinks the square the bridge reads; TODO: its Moving belt items steps, 3000 and
+1500, are the belt cap, which a `bs` client's square ignores under `full_area`, so they buy nothing there).
+Measured live at -62,-26 (Hold 60 UPS on, `--record 60`, 2 runs each): before, updates of 24-48 ticks at
+rate 2-3, live visible 78-80%, phantoms 7-8%, the copper and iron buses mostly empty with streaks; with
+`own_rate`, 12-tick updates at rate 3, live visible 79-81%, phantoms 8-10%, the buses mostly full with
+scattered gaps (the score doesn't tell the pictures apart). The game ran at 30-50 UPS in every run with
+the client's ~1 s jobs up, so the governor reached level 3 either way. `drift_watched` (off): on, watched belts' lanes (an inserter's or
+drill's belt, the belt behind a pickup belt, a splitter, a loader, a wired belt) get drift checks (`pc`) in
+the same turns as the rest, their own checks' quiet timing left as it was; off, as before, they had none:
+a watched lane is sent only when the game's changes, so one the client got wrong while the game's stood
+(a backed-up bus) stayed wrong. On the every-tick capture at -62,-26, 2.0% of the game's items were holes
+on lanes that never got a drift check, 0.6% on lanes not read for 400 ticks or more. Off by default: on that
+recording through the offline harness (600 ticks after a fast first load, `bre` answered) it sent a third
+more drift checks and asks for nothing measurable (by place 95.42% on, 95.49% off; phantoms 2.21 / 2.17%). With `/f3d-profile`, `/f3d-status` also lists the belt simulation's parts
+the client's ~1 s jobs up, so the governor reached level 3 either way. `walk_load` (units a tick, default 1200; 0 or off: as before) and `walk_near` (tiles, default 96): while the
+square every belt of which is loaded (`fr`) reaches less than `walk_near` tiles from the focus (walking,
+a jump: the view isn't all loaded), first loads get at least `walk_load` work units a tick instead of their
+share of the work budget, which at Hold 60 UPS's budget floor is LOAD_MIN (400). Walking laps at
+-62,-26 at the character's own speed, the bridge loaded about 14 lanes a tick: along the bus the loaded
+square fell to 4-8 tiles round the character and the view showed a third of the bus's items
+(tools/belt_walk_check.py, docs/BELT-SIM-PLAN.md's walk round); with `walk_load` 1200, 2 runs each,
+visible while walking went from 65.0 / 87.2% to 91.2 / 93.6%, phantoms 2.1-2.2% on recorded lanes either way,
+for about 0.5 ms a tick more while walking. Standing with the square loaded it changes nothing. `send_cap` (bytes a
+tick, default 30000; 0 or off: as before): an update's parts (about 28 KB each) are sent over the ticks after its
+due tick, about `send_cap` bytes a tick and one part at least, oldest update first, each part still stamped with its
+update's tick (`k`), instead of all on the due tick; under a cap below 30000 the parts are made smaller with it
+(about cap / 7.5 numbers), so a tick's bytes stay near the cap. Windows gives the client's UDP socket 64 KB: of three or more
+parts sent in one tick the client lost the last ones whenever it hadn't read between them (0.1-1% of parts in
+every join at -62,-26, always an update's last parts, lanes that then waited for their next read or a `bre`), and
+the due tick carried the whole text cost (`bse.text`, 7-16 ms a due tick at 6 ticks). The spool is module-local:
+only what is sent depends on it. Measured at -62,-26 (perfbridge round, 2 runs each, the join's first 90 s traced):
+ticks sending over 64 KB 280 / 303 -> 6 / 9, `bs.emit` ticks over 20 ms 40 / 47 -> 3 / 5, the bridge's worst tick
+130 / 130 -> 104 / 91 ms; lost parts 0.34 / 0.17% -> 0.67 / 0.05% (the client's I/O thread, polling every 1 ms at
+below-normal priority, still misses two ticks' datagrams now and then), game UPS unchanged (median 40-44 either
+way: the bridge's steady cost and the client beside it). With `/f3d-profile`, `/f3d-status` also lists the belt simulation's parts
+(`bs.watch` watched belts, `bs.feed`/`bs.edge` lanes fed from outside and leading out, `bs.actor`
+inserters and drills, `bs.drift`, `bs.bre`, `bs.load` first loads, `bs.scan`, `bs.queue` the update's
+queue, `bs.emit` the message text; `bsq.*`, `bse.*` their pieces), each inside `belt_items`.
+`extra_spread` (on; the perfbridge2 round): the reads made for accuracy alone (`extra_units`, 2,000 work units an
+update: the packed runs round lanes the client asked for again, the tails of changed watched belts, the reads round
+a settled one) are spread over the update's ticks, twice an even share (2 * 2000 / (period - 1)) a tick at most, the
+rest of the steady queue waiting a tick (never on the due tick); off, they land wherever their step comes, which for
+the asked lanes' runs was all on the round's first tick (`bs.bre` 6-11 ms there at -62,-26, the update's worst tick
+after the due one; at an even share the asked groups took a tick apiece and held the watched belts' checks back to the
+due tick). The same round made the bridge cheaper without a switch: the parts' numbers are written as text where they
+are read, so a part's text is one `table.concat` a range instead of a loop in Lua over every number (most of
+`bse.text`, 9-10 ms an update at -62,-26: 1.3 -> 0.4 ms a tick live); each lane's meta is kept for its re-sends (`bre`,
+reloads); a lane of one item is read by its totals (one call instead of four); the lines' lengths are cached; the
+movers' list is written as text with each mover's prototype id read once a search (a send of ~150 movers was 6.6 ms,
+`helpers.table_to_json` and five calls a mover); the belts' scan reads at most two fresh chunks a tick once a scan
+exists (`bs.scan` 30-85 ms on one tick when the chunk lists expired together). Measured at -62,-26 (the perfbridge2 round, docs/BELT-SIM-PLAN.md: the join's first 90 s traced, 2 runs each): the
+bridge 13.1 / 12.0 -> 11.5 / 12.3 ms a tick median, p90 31 / 30 -> 26 / 26.5; the join's first 10 s 23.4 / 22.6 ->
+18.6 / 18.4 ms median, ticks over 16.7 ms there 423 / 432 -> 353 / 333 of 600; game UPS median 40.8 / 43.0 -> 45.3 /
+45.8, p10 31 -> 35.5; `bse.text` 1.3 -> 0.45 ms a tick, movers 2.0 -> 1.0-1.2; live visible 95.9% either way, phantoms
+2.4-2.6% -> 2.0-2.8%.
 
 ### Watching with the normal game
 
@@ -497,7 +653,7 @@ a binding changed in Zenith's Settings still wins). Mouse bindings set in Factor
 | E | Open the character window (inventory and armour/weapons/ammo on the left, hand-crafting on the right), whatever is under the mouse. With any window open, E closes it |
 | Esc | Close the open window, machine screen, map view, chooser or remote view; with none open, the Game menu (Resume, Load game, Save game, Save as, Settings, Exit; Players when others play too) |
 | T | The technology screen: the research in progress and queue, the selected technology (cost, time, prerequisites) with Start research / Add to queue / Cancel, and the tree on the right. T, E, Esc or × closes it |
-| M | The map view: the charted map over the whole window (north up) with your character's arrow, the map tags and trains. Drag (left or middle mouse) or WASD/arrows move it (Shift: faster), the wheel zooms about the mouse. Right click: on a tag, edit or delete it; on a ghost, remove it; elsewhere, create a tag there (icon, name, Confirm). Double click also creates or edits a tag. M or Esc closes it (Esc closes the tag dialog first). The game keeps running underneath, and the character doesn't walk while it is open |
+| M | The map view: the charted map over the whole window (north up) with your character's arrow, the map tags and trains. Drag (left or middle mouse) or the movement keys (WASD/arrows, or as rebound) move it (Shift: faster), the wheel zooms about the mouse. Right click: on a tag, edit or delete it; on a ghost, remove it; elsewhere, create a tag there (icon, name, Confirm). Double click also creates or edits a tag. M or Esc closes it (Esc closes the tag dialog first). The game keeps running underneath, and the character doesn't walk while it is open |
 | Minimap (top right) | The charted map around the character (in the map view or remote view, around what that looks at), north up, with tags and trains. Click it to open the map; the wheel or its + / − buttons zoom it |
 | Click a stack (inventory or machine) | Pick it up into the cursor, as in Factorio (right click: half). The cursor shows its icon and count; its slot shows Factorio's hand |
 | With a stack in the cursor, click a slot | Put it there (a different item swaps, so the other stack is now in the cursor); right click drops one; click its own slot, or Q, to put it back. Left mouse in the world builds it (only stacks from the inventory) |
@@ -549,8 +705,12 @@ a binding changed in Zenith's Settings still wins). Mouse bindings set in Factor
 | F6 | Jump to Factorio's own view (north up, from above at Factorio's angle and default zoom); again to go back |
 | F5 | First person: see through the character's eyes, mouse looks, aim with the crosshair; F5 again to go back. The mouse is freed while a window is open |
 | F7 | Perspective or orthographic for the view in use: in the map's remote view it changes the map's projection, elsewhere the normal view's (in Factorio's view, F6, used on leaving it); kept in Settings > Camera |
-| F1 | Show or hide the client's help panel (off by default) |
+| F1 | Show or hide the help panel (off by default): every control under the key bound to it now (rebound in Settings → Controls, or Factorio's own keys), grouped (moving and camera, fighting, building, blueprints and wires, inventory, windows, the map, Zenith's own), then each add-on's while it is on; the debug menu only in dev builds. When the window is too short for it, the mouse wheel over it scrolls it |
 | F4 | Show or hide the debug line (tick, chunks, entities, packets, the game's UPS, FPS) |
+| Alt+L / Alt+F / Alt+E | Personal logistic requests, the personal roboport, exoskeletons on or off (also on the shortcut bar) |
+| Ctrl+= / Ctrl+- / Ctrl+0 | UI scale up, down, back to automatic |
+| Ctrl+F12 | The debug menu (dev builds only, see "The debug menu" below) |
+| Add-ons' keys | Each add-on's own, listed under it in Settings → Controls and in F1's help while it is on. The bundled Cinematic camera: F8 free camera, Shift+F8 its window, Ctrl+F8 idle mode, Alt+F8 camera mode, Ctrl+Shift+F8 record, F11 hide the interface, F12 screenshot; while its camera flies, WASD, E/Space and Q/Ctrl, = and -, O orbit, T follow, N next, V placement, K add a path point, P play the path, B letterbox |
 
 Client command-line options go after `--` (Godot: Project → Project Settings → Run, or the
 command line): `--factorio-port=34200 --port=34201 --models=/path/to/glb/folder
@@ -562,7 +722,9 @@ holds any; `--no-custom-models` leaves it out.
 folder of add-ons), always on, ahead of installed ones with the same id ([ADDONS.md](ADDONS.md)). `--camera=factorio`, `--camera=first-person` or
 `--camera=<yaw>,<pitch>,<distance>[,ortho]` start in that view instead of the Camera setting's
 (`--camera=0,48,14,ortho` is close to Factorio's own; a distance past Furthest zoom is kept for that run). `--screenshot=<file.png>[@seconds]` saves
-the window once (default after 10 s; needs a window). `--open=<unit>` opens that entity's machine screen once
+the window once (default after 10 s; needs a window, which keeps the project's size and mode;
+`--scale-like-full-screen` does full screen's Resolution sums with that window as the monitor). `--full-shot=<file.png or folder>[@seconds][,<width>x<height>]`
+takes one the way the Cinematic camera's F12 does (`api.view.screenshot`: the moment held, full detail, the view's chunks, the game held for the picture), default after 10 s. `--open=<unit>` opens that entity's machine screen once
 it has loaded (for screenshots and debugging). Also for screenshots: `--ui=inventory` opens the
 character window at start, `--ui-sample` feeds sample recipe details (crafting tabs, ingredients)
 through the hooks the mod's full UI data will use and pins a few quickbar items,
@@ -643,7 +805,12 @@ colours, then ore, trees and rocks, then buildings in their map colours; see "Ma
 docs/PROTOCOL.md). The mod sends at most 2 tiles per pixel and 4 chunks a tick, so the client asks
 only for what is on screen, a 32 x 32 chunk block at a time from the middle out, asks again every
 4 s (minimap) or 6 s (map view) for the same area, and skips ground it knows is uncharted except
-at the edge of charted ground and in a full pass once a minute. Every 30 s, when it is idle, the
+at the edge of charted ground and in a full pass once a minute. The mod keeps a chunk's picture
+for 30 s while as many entities stand in it and nothing was built, mined, rotated or destroyed there,
+and (the perfbridge2 round) trusts the count itself for 20 s after it was made unless such an event
+came, so a refresh of a kept chunk reads nothing but its pollution and signals; its robot dots come
+from the movers' last search of the live-update area where that covers the chunk (a chunk outside it
+is searched as before). A change no event tells of (a tree dying) shows within 20 s. Every 30 s, when it is idle, the
 minimap also asks for the area the map view opens on, so the map opens filled in. Uncharted ground
 is black, and charted ground no working radar (or the character) sees is dimmed, as on Factorio's
 map. In Zenith roboports reveal too (Factorio's don't): ground whose chunk has its middle in a
@@ -834,6 +1001,36 @@ clouds, shadows and haze off (`[graphics] clouds=false`); `--clean-shot` and `--
 `--sky=<planet>[@<daytime>]` shows another planet's sky and holds the time of day (0 noon, 0.5
 midnight), for screenshots against the mock: `--sky=fulgora@0.45`.
 
+## Looks
+
+Settings → Graphics → **Look** (`[graphics] look`) sets how the world is lit, tonemapped and
+coloured (`client/scripts/world/looks.gd`):
+
+- **Factorio** (the default): matched to Factorio's own picture of the same scene
+  (`tools/look/factorio_reference.py`). Linear tonemapping; the sun held where Factorio's shadows
+  fall (east and a little south), its shadows as dark as Factorio's; no sky reflection on the
+  ground or grass (it was what washed the colours out); a fill light from the camera's side on
+  models, as Factorio's sprites are lit; and Factorio's own colour lookup for each planet and time
+  of day, read from the install (`core/graphics/color_luts`, `space-age/graphics/lut`; Nauvis by day
+  is Factorio's identity, its darkening at night left to Zenith's light so lamps still light).
+- **Classic Zenith**: the look before 0.1.3 (filmic tonemapping, the sun crossing the sky).
+- Add-ons' looks (`api.shaders`, docs/ADDONS.md), such as the Cinematic shaders add-on
+  (`addons-src/cinematic-shaders`), whose sun really sets: it sinks in the west with long shadows, a
+  colour from the air it crosses and a blue hour after it, each planet in its own colours.
+
+The Factorio look's ground has no sunset (Factorio's has none); from low down its sky shows the sun
+going down, restrained, while the light stays where Factorio's shadows fall.
+`--sky=<planet>@<daytime>` holds a time of day with Factorio's darkness for it, for screenshots.
+
+`--look=<id>` uses a look for one run (`factorio`, `classic`, `cinematic-shaders/cinematic`);
+`--look-file=<file.json>` adds looks from a JSON file, for trying values without an add-on.
+
+`python tools/look/factorio_reference.py [--looks factorio,classic]` makes a map, has a Factorio
+window save its picture of a small scene at noon, takes Zenith's of the same place in Factorio's
+view (F6) once per look on a headless server with the bridge (Zenith's default settings), and
+compares the ground's colour, saturation and contrast (git-ignored `art-src/look/`). It adds and
+removes a `steam_appid.txt` beside factorio.exe for the run, as `hybrid_cost.py` does.
+
 ## Decoratives
 
 Grass, flowers, small rocks and decals lie on the ground as in Factorio, with the pictures from
@@ -848,6 +1045,27 @@ quarter past 136. The bridge sends a chunk's decoratives again when a tile is pl
 it or something is built there; ones another mod's script removes stay drawn until the chunk's
 next refresh.
 
+Settings → Graphics → 3D grass raises grass and low plants near the character (off in the Low
+preset): the same pictures on a small grid, tufts arching from their root and bushes rising where
+the picture is thick, no shadows of their own, the flat picture left under them as their shadow.
+Carpets (the wide patches of short blades most of a Nauvis meadow is) stand up as clumps of blades:
+crossed cards, each a half-tile piece of the patch's own picture where it has plant, about half a
+tile tall, cut out with alpha to coverage, bent by gusts from a drifting noise texture; further from
+the character fewer stand. From Factorio's angle they cover what the picture shows; they fade back
+into the flat picture over the range's last 10 tiles and as the camera zooms out. A chunk raises at
+most 106,496 triangles' worth, tufts and bushes first and carpets from what is left: a real Nauvis
+meadow (600 to 1,400 decoratives a chunk) raises nearly all of them. `-- --grass-stats` prints what it takes every
+5 seconds, with the frame's GPU time and triangles.
+
+When the camera isn't Zenith's own view round the character (an add-on's camera such as the
+Cinematic camera's F8, first person, the remote view), the camera drawing leads instead
+(client/scripts/world/view_priority.gd): 3D grass is centred half its range ahead of the nearest
+ground the camera sees, gliding as the camera turns and fading down and up again across a jump
+longer than the range; and Items in 3D's cap counts only the belt items in the camera's view (3
+tiles' margin at its edges), nearest the camera first, the rest drawn as icons (both records paths,
+GDScript and BeltDrawNative; the lattice's packed lanes are icons under any cap, as before). The bridge's
+square of belt items already follows an add-on's shot (its focus), so nothing more is asked for.
+
 ## Mod settings
 
 In a game the client's menu started: the client's Settings → Mod settings, sent over RCON at once.
@@ -858,11 +1076,13 @@ the server console or RCON, for example `/c settings.global["f3d-chunks-per-tick
 |---|---|---|
 | Surface to stream | nauvis | Where the server's character lives |
 | Chunk snapshots per tick | 1 | Faster world loading vs. script time per tick. Only chunks that must be read count: chunks the client kept (answered `same`) and ungenerated ones (`none`) don't wait for it, so going back to a surface (a Factorissimo building's door, a platform and back) takes a few ticks |
-| Bytes sent per tick | 32768 | Caps queued world data per tick |
+| Bytes sent per tick | 32768 | Caps queued world data per tick. While a screenshot loads its view (photo mode, `photo` in PROTOCOL.md) the bridge sends 4 times this and starts up to 8 chunk snapshots a tick, whatever the setting above |
 | Max live-update radius | 192 | Movers and machine states beyond this aren't sent; caps the client's "Entity distance" (Settings → Graphics, default 192). A save keeps the value it had; on a server raise it with `/c settings.global["f3d-max-focus-radius"] = {value = 192}` |
 | Moving entity update interval | 2 | Ticks between mover updates |
+| Longest wait between searches for moving entities | 32 | The search of the live-update area for movers (6-12 ms every 8 ticks on the owner's save, finding the same few each time: 99% of what movers cost at -62,-26) waits twice as long each time it finds the same movers (by count and unit numbers), up to this many ticks; a search that finds anything else puts them back to every 8 ticks. A mover that appears while nothing else changed (a robot leaving its roboport, a train entering the area) shows up to that many ticks late; the minimap's robot dots come from the same search. 8: every 8 ticks, as before |
 | Belt item, ground item and inserter radius | 24 | Items on the ground, inserter hands, fluids, heat, robots' cargo and plants' growth within this many tiles of the camera are sent; 0 turns them off. Items on belts go as far as the client's Belt item distance (Settings → Graphics), which Zenith always sends; this radius is used for them only by clients that don't. Lower it if a dense base costs too much script time |
 | Belt item and inserter update interval | 6 | Ticks between updates; the client glides items and arms in between |
+| Spread the bridge's periodic jobs | on | The hand-craftable counts (230 recipes, 45-80 ms on one tick whenever the inventory changed, about every 1.5 s on the owner's save), the machine states' search (every animated machine within the focus radius, 20-66 ms twice a second) and the planets' idle looks for spider legs and cargo pods (two area searches, 10-19 ms on the same 30th tick as the counts) run in slices over several ticks (32 recipes a tick; the area in 4 strips, one a tick) and on ticks of their own. The perfbridge round's trace at -62,-26 found these the bridge's biggest single-tick spikes after the belt updates' due tick. Off: as before |
 | Starter kit | on | Freeplay items for the bridge's own character |
 | Player to play as | (empty) | Whose character the client plays on a server; empty: the player who was online last. `/f3d-player` changes it while the game runs |
 | Act as the player for other mods | on | When the client plays a player's own character (single-player, or the player to play as while they're connected), building, mining, rotating, pasting settings and opening machines go through that player, so other mods get Factorio's own player events (`on_built_entity`, `on_player_mined_entity`, `on_gui_opened`...) and Factorio's own reach and placement rules apply. The bridge's own character (no player) always acts by script |
@@ -910,6 +1130,83 @@ the server console or RCON, for example `/c settings.global["f3d-chunks-per-tick
   Untick Settings → Graphics → Render on a separate thread and restart (it is written to
   `user://engine.cfg`), or start once with `--render-thread safe` before the `--`.
 
+### The debug menu (Ctrl+F12)
+
+In a game, **Ctrl+F12** (Settings → Controls → Miscellaneous → Debug menu) opens Zenith's debug
+menu (client/scripts/ui/factorio/debug_menu.gd). Only dev builds have it (`Settings.dev_tools()`,
+"Build channels" under The download): a public download has no key for it, in Settings → Controls or anywhere,
+and it never opens, so neither do its overlays and probes. Esc stops a running benchmark, then closes the report, then the menu. It opens over an add-on's
+camera (the Cinematic camera's F8) and over a hidden interface (F11) too: it has its own layer,
+which the add-on host leaves shown, the mouse shows while it is open (and is captured or hidden again
+as the add-on had it when it closes), and add-ons' camera keys rest meanwhile, so typing in its boxes
+doesn't fly the camera; their other keys (F8, F11) still work.
+
+- **Time**: the time of day (slider; Dawn, Noon, Sunset, Night), freezing the day/night cycle, the
+  game's speed (0.25x to 4x or a number, held to 0.05-16x) and pausing. These change the real game
+  through the bridge's `/f3d-debug` (console.lua; `surface.daytime`, `freeze_daytime`,
+  `game.speed`, `game.tick_paused` on the character's surface). They follow the console's rule: in
+  a multiplayer game only an admin (or a Zenith on the server's own machine) may, and otherwise the
+  controls are greyed with the reason. A bridge older than the client says so too. The slider reads
+  as a clock, midnight at both ends and noon in the middle (Factorio's own daytime counts from noon:
+  0 noon, 0.5 midnight). A paused game runs no mod code, so the bridge neither reads nor sends
+  until it resumes (real 2.1.24): Pause is offered only where Zenith can resume, over RCON (a
+  server its menu started), as a screenshot's pause does (`client/scripts/net/game_pause.gd`); it
+  pauses through `/f3d-debug pause on`, holds the connection's timeout off, greys the other
+  controls meanwhile, and Resume runs `/sc game.tick_paused = false` over RCON. In single-player
+  (hybrid) and on a server started elsewhere Pause is greyed with that reason: pause in Factorio
+  itself (Ctrl+F9). Answers are read as their datagram arrives, ahead of the messages waiting
+  their turn, and one that comes late is still taken; when none comes in 5 s the menu says what
+  the link shows (not connected, nothing sent for a while: paused or stalled, or sending but not
+  answering: an older mod or one far behind sending the world).
+- **Benchmarks** (client/scripts/debug/bench_runner.gd), run in the game being played: standing
+  still 30 s (the stutter probe's `stand`), two laps at the character's speed (its `fast`, the laps
+  of `tools/bench/compare_builds.py`), a 30 s camera flyover 100 tiles round the character, and a
+  zoom out to the furthest zoom and back. Each ends in a report window: frame time p50, p99 and
+  worst, frames over 16.7 and 33 ms, FPS, GPU and render CPU time, scripts, draw calls, triangles,
+  the game's UPS, the bridge's time per tick by module, and what ran (version, graphics preset,
+  look, resolution and the settings that weigh most), each against the last run of the same
+  benchmark. Copy puts it on the clipboard, Save to file writes it as text and JSON to
+  `user://benchmarks/`. The bridge's cost needs RCON (its profiler prints only in Factorio): with a
+  server the menu started it turns `/f3d-profile` on for the run and reads `/f3d-status`; in
+  single-player the report says so. GPU times aren't measured with Render on a separate thread.
+- **Tests**: the bridge's `/f3d-selftest` and `/f3d-status`; overlays (the UPS overlay, a
+  frame-time graph, counters of draw calls, triangles, nodes, chunks, movers, belt items and 3D
+  grass, chunk borders); the probes below run in the game without quitting (terrain streaming,
+  robots in view, belt items' cost, flicker frames into `user://debug/flicker`); the effects demo;
+  redrawing the loaded chunks; and moving the character to its spawn, the map's centre, 500 tiles
+  east or back (`/f3d-debug teleport`, the same rule as Time).
+
+### The performance test (main menu)
+
+The main menu's **Performance test** (or `-- --perf-test[=quick|default|extensive]`; with a mode
+it runs at once and quits at the end, exit code 0, 2 when a test gave no numbers, 1 when it
+stopped) is the testers' benchmark, the same on every PC (docs/PERFORMANCE-TEST.md is
+its guide). Dev builds only: a public download has no button, and `--perf-test` prints that it is
+for dev builds and quits with exit code 3. client/scripts/menu/perf_test.gd picks the tests (Quick: the Factorio look at High,
+standing and laps; Default adds the Cinematic look; Extensive adds Low and Ultra and runs Default
+twice) and writes the results; perf_game.gd does the rest from inside Zenith, no scripts:
+
+- a new map in `user://perf-tests/work/factorio` (the server's own write-data folder, its mods
+  folder holding only the bridge): seed 123456 from Factorio's example settings, peaceful, no enemy
+  bases, no pollution, evolution or expansion (server_launcher.gd's `data_dir`, `player_mods`
+  false, `port_base` 35700, its own server settings: no autosave, no pause);
+- the test base built over RCON, the earlier script's Lua unchanged (2,603 buildings: 12 belt loops and an 8-loop bus full of items, 36 assemblers, a roboport with 50 robots,
+  north-west of the character), noon frozen, exoskeleton running speed;
+- each test in a fresh Zenith started as a child process with APPDATA (XDG folders, HOME) pointed
+  at `user://perf-tests/work/appdata`, so its user folder, settings.cfg (the preset, borderless
+  full screen, vsync off, no FPS cap, Hold 60 UPS off, sound off, the Cinematic shaders add-on for
+  the Cinematic look), logs and add-ons are its own: `--stutter-probe=<file>@stand|fast` and
+  `--probe-trace`, its walk summary and the bridge's f3dtrace lines read back as the earlier
+  script did;
+- `user://perf-tests/Zenith-perf-<version>-<mode>.txt`: the PC from Godot's own calls (processor
+  name and thread count, memory, adapter, vendor and driver, rendering driver and method, the
+  primary screen's size and refresh rate, the system), Factorio's version and Space Age, how it
+  ran, a table per test and a CSV block. The menu shows each test's report in the debug menu's
+  report window, against the last run of the mode (`user://perf-tests/last.json`).
+
+While it runs the menu's own window drops to 10 FPS with nothing 3D behind it. Esc or Cancel stops
+it, and closing Zenith stops the test's Zenith and the server before quitting.
+
 ### Measuring the client
 
 `-- --stutter-probe=<out.json>[@route]` (client/scripts/debug/stutter_probe.gd) records every
@@ -922,11 +1219,21 @@ with other settings, `legacy render` the shadows and levels of detail from befor
 threshold 4`, `shadow distance 60`, `arms|items|wires|movers|terrain no shadow` and others (see
 `_set_variant`). `--probe-ab=3` measures each variant three times between two "base" steps, which
 cancels the graphics card's drift (compare each with the bases beside it), `--probe-timing=2,4`
-sets the seconds to settle and to measure, `--probe-warmup=30` waits longer and until no chunk is
+sets the seconds to settle and to measure, `--probe-stay` leaves the client running after the summary
+(a harness that takes screenshots after the route ends it), `--probe-warmup=30` waits longer and until no chunk is
 left to build, `--probe-shots=<dir>` saves a screenshot of each step. Each step's medians (frame,
 GPU, render CPU, draw calls and triangles of the view and of the shadow passes, casting chunks)
 are printed and kept in the JSON's `variants`. `--legacy-render` starts with the shadows and levels
 of detail from before sun_shadows.gd, for a whole run.
+`@join` measures the join itself: it stands 90 s from the world being ready (pass `--probe-warmup=0`
+so the first load's frames are in), notes when the view was fully drawn (the `JOIN` line: chunks,
+terrain and models settled, the belts' first load done) and with `--probe-stay` keeps the client
+running after writing the file, so `tools/belt_view_check.py --client-arg=--stutter-probe=<out>@join
+--client-arg=--probe-warmup=0 --client-arg=--probe-stay` scores the same run. `python
+tools/join_hitches.py out.json [--windows] [--md]` then gives frame-time percentiles, the frames over 25
+and 50 ms and what each hitch was spent on (the biggest script subtree, world.gd's part of it, the
+renderer's draw with the pipelines it compiled, or the wait for the GPU). belt_view_check's
+`--godot-arg=--gpu-profile` passes Godot its own flag so the probe also gets the render steps' times.
 With the separate render thread the renderer's own times are only read with
 `--probe-render-times` (each read waits for that thread). `--belt-items-sync` handles belt items on
 the main thread instead of a worker, for comparing. `--no-belt-stand-ins` draws every belt whole
@@ -950,60 +1257,328 @@ The probe's frames also record chunk streaming's queues: `q_unasked` (chunks wan
 focus but not asked for yet), `q_partial` (builds stopped part-way), `q_shadow` (chunks whose
 shadow settings are still to be set) and `q_free`, `q_free_records` (unloaded chunks still to go).
 
-Items on belts glide along their lanes between updates (client/scripts/world/belt_paths.gd). To
-measure how far they stray from them: `python tools/belt_path_check.py layout --rcon-port <port>`
-builds a test row per belt tier (both curves, a splitter, an underground, side-loading) on a running
-server, `record --out truth.json` records the belts, every lane's line and every item's place each
-tick, and `check truth.json drawn.json` compares where the client drew them: from a replay without
-a server (`godot --headless --path client res://tests/belt_path_replay.tscn -- --truth=truth.json
---out=drawn.json --period=6`, `--straight` for straight glides, `--lead=20` for the mod's light mode)
-or from the client against that server, `-- --belt-path-probe=drawn.json@20` (records 20 s after
-10 s, prints belt items' main-thread and worker time, then quits; `-` as the path for the costs only).
-The layout also has packed rows (a straight belt per tier fed iron plates on both lanes and emptied at
-its far end, one lane as fast as they come and the other one plate every 30 ticks, so it backs up
-and creeps), which the bridge sends as belt groups (`bi` bg in
-docs/PROTOCOL.md). Items the client makes itself for a group have ids of their own, so `check`
-also prints a line measured by place: each drawn item's distance from the nearest item the game had
-at that tick (p50, p99), the share drawn with no game item within 0.15 tile, and the share of the
-game's items with none drawn within 0.15. The client's `-- --no-belt-groups` leaves `bg` out of its
-hello, so every lane comes item by item as before, for comparing, and straight runs (`br`,
-`bi` pl in docs/PROTOCOL.md) are off unless the client is started with `-- --belt-runs` (until
-standing with runs is as accurate as without; `--no-belt-runs` is no longer needed). `check ... --within x0,y0,x1,y1` counts only drawn and game items inside that
-rectangle, for a recording of part of what the client draws (the save's busy belts: record
-`--area -284,-26,-260,-2` round -272,-14 and check `--within` the same).
+Hitches while joining (the first 90 s), each behind a switch defaulting to what measured better:
+- `--lods-finish-usec=N` (2000): models' levels of detail finished on worker threads are shown
+  (the stand-in's surface made, the model's levels made as meshes of their own) for at most N µs a
+  frame, at least one a frame; 0 shows every finished one at once, as before (a second-long frame
+  on the owner's save, several big models at once, while other processes loaded the PC; on a quiet
+  PC no frame's finishes took over 5 ms either way, and the joins with 2000 were as good or better).
+- `--belt-capture-thread=on`: `--belt-capture` writes each `bs` message on a thread of its own, which
+  takes JSON.stringify of a first load's 28 KB updates (2-3 ms each, 5.5 s over a join) off the main
+  thread; off (the default) writes them inline. On this 4-core PC the thread made the join worse:
+  50-59 frames over 33 ms, the worst belt job 1.3-2.2 s and the first load done at 69-89 s, against
+  30-37, 0.77-0.88 s and 53-57 s inline (joins at -62,-26: three with the thread, two inline, and a
+  third inline one with --gpu-profile agrees).
+- belt_view_check's `--godot-arg=--gpu-profile` is for the render steps' times, not for counting
+  hitches: Godot prints its GPU profile every second and those frames stall 400-750 ms (84 in a
+  110 s join at -62,-26, shown as `present`).
+- The simulation's event queue (lane reads, checks, holds queued for later ticks) is kept by tick
+  (belt_sim.gd and BeltSimNative `_apply_queue`): only the due ticks are taken, where every queued
+  event used to be scanned and moved each tick. Same order as before (by seq), so no switch:
+  belt_sim_native_test shows 0 differences. The probe's `sim_queue_usec` counts applying the queued
+  reads as well, which is most of it: 25.3 s over a 90 s join at -62,-26 before, 23.2-23.8 s after.
+- `--screenshot` frames are marked in the probe's frames (`shot`): the read-back and PNG encode stall
+  that frame about half a second, so `join_hitches.py` leaves them out (`--keep-shots` keeps them).
 
-A captured stream replayed against the game: `belt_bench.py ... --capture bi.jsonl` writes every
-`bi` message the stand-in client gets, from its first, while `belt_path_check.py record` records the
-game over part of the square; `godot --headless --path client res://tests/belt_stream_replay.tscn --
---truth=truth.json --stream=bi.jsonl --out=drawn.json --within=x0,y0,x1,y1` feeds them through
-belt_items.gd on their ticks (the belts indexed from the recording) and writes where every item is
-drawn each tick, for `check` (by place: the made and moved items have the game's unique ids, but
-groups' have ids of their own). `record` takes the belts `--belt-margin` (16) tiles past the area:
-the replay knows only the recorded belts, and an item going on past the last one is held at its
-lane's end (recorded without the margin, 10-20 items piled up at the area's edges, x -284 and
-y -2 on the save: the replay's doing, not the client's).
+Items on belts are run by the client's own copy of Factorio's belt rules (client/scripts/world/belt_sim.gd,
+docs/BELT-SIM-PLAN.md; the bridge sends `bs`). A bridge mod from before `bs` (0.1.4 or older, say a copy
+left in Factorio's own mods folder for hybrid games, or another player's server) still sends `bi`, which this
+client no longer draws: the belts near you stand empty, and the client says so once in its message line
+("The bridge mod ... is older than this Zenith"); update the mod. Its replay test checks it against a recording of the game
+(`python tools/belt_sim/record.py`): `godot --headless --path client -s res://tests/belt_sim_replay.gd --
+[rec.json] [--bench] [--tile=N]` starts from the recording's first tick, steps on by itself given only what
+the game put on and took off, and counts the items that aren't where the game has them (the default
+fixture must have none); `tools/belt_sim/sim.py rec.json --mode free` is the reference it agrees with.
+`-s res://tests/belt_sim_bench.gd -- --items=80000` times it on a synthetic world.
 
-The client's own model of straight runs (plain lanes it moves itself, `br`), tick by tick against the
-game: `python tools/belt_truth.py survey --at -272,-14` lists the straight runs round a point (length,
-tier, items, stacks, whether they moved, inserters' targets, side-loads, what is behind and in front);
-`record --out DIR --runs "x,y;x,y;..." --udp-port <port> --rcon-port <port>` connects a stand-in client
-(hello `z b bl bg br`, `--no-runs` without `br`) that keeps every `bi` (DIR/stream.jsonl) while the
-game records, every tick, every lane of the runs through those belts and the lanes either side: each
-item's unique id, line position (1/256) and stack size (DIR/truth.jsonl; `--from-start` from before
-the client's hello). `godot --headless --path client res://tests/belt_truth_replay.tscn --
---dir=DIR` replays the stream through belt_items.gd and writes each item's record at every update's
-tick (DIR/model.json) and what is drawn every frame (DIR/drawn.json); `--items-script=res://...` replays
-another copy of belt_items.gd (a fix tried against the same stream), `--stream=` another stream file,
-`--out=<name>` names the outputs, `--trace=uid,...` prints what the stream said of those items and what
-the client made of them each update. `compare DIR [--name <name>]` matches the game's items and the
-client's along each run by order (the client's items keep the ids they came with, but groups' and
-plain chains' are moved here), per lane and update: the first update they differ, counts, offsets,
-items missing and extra, by thirds of the recording and by the mod's near and far tiers, and the drawn
-share of the game's items with no drawn item within 0.15 tile (and of drawn items with no game item).
-`oracle DIR` writes a stream with every item on the recorded lanes where the game had it (what is left
-is the client's own model), `--edges` also sends every watched lane of the runs whole each update,
-`--outside` takes plain lanes whose lane in front leaves the square out of `pl`: mod fixes tried
-without changing the mod.
+How the simulation's items are drawn has toggles, all on by default, so the drawing as it was can be
+compared (the client reads them at start-up, `-- --belt-sim-ahead=0` and so on; `tests/belt_bs_replay.gd`
+takes the same):
+- `--belt-sim-ahead=N` (24; was 1 before `--belt-draw-early`): the simulation runs N ticks past the drawn tick, what it says happens after
+  that tick waiting for the next job. 0: stepped to the drawn tick, so items a read moved or put on a lane
+  on that tick are drawn from their old records until the next job.
+- `--belt-draw-gone-order=off`: a job applies every change, then removes every item gone in its ticks (an
+  item dropped and put back in one job stays undrawn till its next change); on, both in the
+  simulation's order (`take_changes()`'s `gone_tick`, `gone_at`).
+- `--belt-draw-lead=off`: a record that ends is made again only once it has ended (the item stands at
+  its end till the next job), and an item past its lane's back end is hidden until its record ends; on,
+  made again a little before, by a path across where it ends that shows it exactly where it comes onto
+  a lane or out of the ground.
+- `--belt-draw-head-move=off`: the simulation's changes say the step a head item was given (items
+  waiting at a splitter or side-load were drawn moving on) and items leaving a line aren't emitted. Both
+  belt_sim.gd and BeltSimNative honour it (`head_move`); the rules don't change.
+- `--belt-sim-read-apply=off`: reads applied as before this round. On (the default): a lane's meta
+  (`lm`) takes effect at the tick of its first read in the update (`set_lane_at`), not when the message
+  comes, so the line behind a lane loaded in that update doesn't run on into it, empty, until its read;
+  a read never leaves an item past its line's back end:
+  what its packed run, the items it pushes back out of its lane and those it spaces out leave there is
+  carried back onto the feeder's line (a splitter output's: the input on that side with more room, the
+  side's turns put back), its items behind going back a gap as needed, up to 8 lines (`_carry_back`;
+  where it can't, they go); and a read of a splitter's output with an item the simulation sent into the
+  side's other output (or on along it) sets that side's output turn too. Both belt_sim.gd and
+  BeltSimNative honour it (`read_bound`).
+- `--belt-sim-read-conserve=off`: reads drop what they don't have as before. On (the default): a read
+  takes off only the items its lane had between the read's own (taken); those behind the read's items
+  in the line's order (all, when none of them is in the line) go out of the lane behind it, those ahead
+  out of it in front, in order (`_rescue`); what that leaves past a back end is carried back up to 32
+  lines, never onto a splitter input nothing feeds. Both alike (`read_conserve`).
+- `--belt-sim-read-forward=off`: the items a read leaves past its line's front (the read lane is the line's
+  first: a splitter's input, a lane whose next is another line, and the read hasn't them) go, as before. On
+  (the default): they are carried on into the line they went on into in the game: across a splitter into
+  the output its turn (or priority, or filter) says where there is room, else the other, the side's turns
+  moving on as for a crossing; into a plain next lane behind its hindmost item (`_carry_forward`). Where
+  the lane leads out of what is sent, or nothing has room, they go, as before. Against the every-tick
+  recording at -62,-26 such drops were 47% of the items reads took off that the game still had (an `sh`
+  hold keeps a splitter input's items while the game crosses them; the read then finds them ahead of its
+  own), and a hole in a packed bus stays until the lane is read again. Replayed on that capture (every tick,
+  by place within 0.15 tile on recorded lanes): 88.6% -> 91.3%, phantoms 3.3% -> 3.2%, items lost while the
+  game still had them 4,042 -> 2,913 in 600 ticks. Both alike (`read_forward`).
+- `--belt-sim-shift-keep=off`: a read's packed-run shift goes on past an item outside the lane that the
+  shift would bring into it where the read hasn't it, and that item goes, as before. On (the default): the
+  run's shift ends at that item, which stays where the simulation had it (`_shift_packed`): against the
+  every-tick recording at -62,-26, 81% of such items were still on the belts, ahead of or behind the lane
+  (814 of the 4,042 items reads took off in 600 ticks that the game still had). Replayed with read_forward:
+  91.3% -> 92.3% by place, but phantoms 3.2% -> 3.9% (kept items the game has elsewhere). Both alike
+  (`shift_keep`).
+- `--belt-sim-read-skip-same=off`: a read (`sl`) that finds the lane exactly as the simulation has it (every
+  item at its place, none else) is applied all the same, as before: the line rebuilt and every item's record
+  written again. On (the default): it is skipped, its items only noted fresh for the tick (`read_skip_same`,
+  both twins alike). Offline on the lattice run's capture at -62,-26, 51% of the bridge's reads were such, and
+  applying reads was 80% of the simulation's time (2.7 of 3.4 ms a tick; stepping 0.7).
+- `--belt-sim-hold=off`: the bridge's `sh` ignored. On (the default): a splitter's input the bridge found as
+  its last read left it is put back so and held (its items don't cross into the outputs) until its next
+  read (`hold_input`). Both alike (`hold_inputs`).
+- `--belt-sim-split-wake=off`: splitters let an item through whenever the belt rules say. On (the default):
+  a splitter side that let an item through one or two ticks ago (three, while its other output moves) takes
+  its turn before the belts that start moving this tick, as the game's update order does: an output that
+  stood last tick and has room only once its items moved on this tick takes nothing from it that tick
+  (docs/BELT-RULES.md section 6). Both alike (`split_wake`).
+- `--belt-early-bs=off`: `bs` parts that come before the world is ready (the bridge's welcome done, the
+  prototypes known) are dropped, as before. On (the default): they are held (up to 4,096) and handed to the
+  belt layer in order once it is. The bridge loads lanes from the hello on and sends each lane's meta (`lm`)
+  once, when it loads it: a dropped part's lanes were read and checked from then on but never placed (two
+  of five captures at -62,-26: a turbo underground and curve beside the character empty for the whole run).
+- `--belt-sim-ask-unknown=off`: a lane read (`sl`) or checked (`pc`) whose meta never came is left out, as
+  before. On (the default): it is asked for again (`bre`, at most every 3 s), which the bridge answers with
+  its meta, as docs/PROTOCOL.md's `bre` says. Covers updates lost on the way too (UDP): a capture at
+  -272,-14 lost three updates during the first load and with them 187 lanes' meta.
+- `--belt-draw-coalesce=off`: every change the simulation emitted in a job's ticks is made into a record,
+  one after another, as before. On (the default): only an item's last change at or before the drawn tick
+  is; the earlier ones would be overwritten before anything is drawn. Live at -62,-26 a job that had
+  fallen 258 ticks behind applied 806,000 changes for 65,000 items (twelve an item) in 8.6 of its 11.4 s.
+- `--belt-draw-view=off`: every item gets a record wherever it is, as before. On (the default): an item
+  whose motion can't show on screen (its record would lie 4 tiles and its reach outside the camera's
+  ground view: the four corner rays met with the items' height, cut 160 tiles out) is parked, its motion
+  kept but no slot and no record, until a change or the camera brings it in (the view the records were
+  planned for is kept 10 tiles wider than the camera's, so panning a little doesn't plan every parked
+  item again). At -62,-26 the camera sees about a tenth of the 160-tile square the client simulates.
+- `--belt-draw-margin=N` (120): the most ticks the drawn clock is held behind the game's clock for the
+  jobs (the margin grows to 1.5 jobs' ticks, from 2). 30 as before: a job longer than 20 ticks (-62,-26's
+  take about a second) then ended past the drawn clock and its records were drawn stale, items standing at
+  their ends while the game's went on. 120: at most two seconds behind, the records fresh when drawn.
+- `--belt-job-high=off`: belt items' job goes to Godot's worker pool as a low-priority task, as before.
+  On (the default): a high-priority one. Low-priority tasks get a share of the pool's threads (0.3 of
+  them: one on a 4-thread PC), and the belt job queued there behind models' levels of detail,
+  decoratives, terrain and far chunks; after main's heavier levels of detail and decoratives came in, a
+  job's result came about twice its own time late, each job stepped 80-110 ticks and the drawn clock sat
+  at the 120-tick margin. Live, Hold 60 UPS, `--record 60`, by day: -62,-26 off a job cycle of 1.6-1.95 s
+  (33-46 jobs a run, margin 120), on 0.33-0.41 s (167-211 jobs, margin 39-56), visible 95.7-95.8% /
+  95.8-95.9% and phantoms 2.7% / 2.6-2.7% either way; -272,-14 off 1.6 s (40 jobs), on 0.16 s (383 jobs,
+  margin 20), PASS both ways (97.5%, 0.9 / 0.8%).
+- `--belt-draw-dump=<file>`: what each job writes for the GPU, as written: a JSON line per job (its
+  cost by part, ticks stepped, the updates it took, changes, records, whether it skipped), then the
+  records of the items it wrote (uid, item, count, lane, pos, t0, v, reach as int64; the 16 floats of
+  each record as the GPU gets them), the uids gone and the paths' texture when it was made again; the
+  main thread writes `<file>.apply.jsonl` with when each job's result was drawn, where the drawn clock
+  was then and how late. tools/belt_view_check.py scores it against the game (below). It costs about
+  0.1 ms a job plus the write of the items' records (a few ms for an update's job).
+- `--belt-draw-native=off`: a job's records are planned and written in GDScript, as before. On (the
+  default, when the extension is loaded and the simulation is BeltSimNative): `BeltDrawNative`
+  (`client/native/belt_sim/src/belt_draw_native.cpp`) does it, from the simulation's changes to the
+  records' pages, item for item as belt_items.gd's Job does, down to the float32 roundings
+  (`python tools/belt_draw_diff.py gd.bin native.bin` compares two dumps of the same capture, from
+  `tests/belt_bs_replay.gd --belt-draw-dump=<file>` with the switch off and on: 0 differences; add
+  `--cap=N` for an Items in 3D cap of N, and `--cam=x,z` for a drifting camera leading it, so both paths'
+  camera-led caps are compared too). Live at
+  -62,-26 a job took about a second in GDScript, 80% of it planning and writing 60-100k records.
+- `--belt-draw-pile=off`: each copy of a pile (a stack on a belt, up to four in one place) gets a full
+  record of its own, written again whenever its item moves, as before. On (the default): a pile is one
+  record, the item's; each copy's record points at it (texel 3: slots to the item, its step k, the kind's
+  pile step) and holds the copy's own turn (texel 2), written once when the copy gets its slot, and the
+  shader (belt_path.gdshaderinc) lifts the copy by k. At -62,-26 86% of the items are stacks of four.
+  Both paths (GDScript and native) take the switch.
+- `--belt-draw-lattice=off`: every lane drawn from the simulation, as before. On (the default): a lane
+  the bridge's last read (`sl`) found full of one kind, while its drift checks (`pc`) since say it is still
+  full, is drawn as a lattice (`client/scripts/world/belt_lattice.gd`): its item every 0.25 tile, each slot
+  cycling within its own gap of the lane at the speed of the simulation's front item on the lane (the
+  record's texel 3 holds the period and the shader takes the drawn clock modulo it; a new speed must hold
+  two checks in a row), and the simulation's own items on it are hidden by a mask of those lanes' centre
+  lines (`f3d_belt_mask`, 4 cells a tile); they stay simulated, and show again as they leave the lane.
+  Items sit 0.25 tile apart, so a full lane drawn at any phase has each game item within 0.125 tile of a
+  drawn one: the owner's concession, a lane the game has packed is drawn packed. A straight lane's phase
+  is the map's (a function of its exit's place and the tick, so a run's lanes agree); curves and splitters
+  take the simulation's front item's. `--belt-draw-lattice=sim`: every lane the simulation's phase (the
+  first build). The lattice is made in GDScript after either records path, with its own records
+  (`f3d_belt_lattice`) and MultiMeshes, so both paths draw it alike (`tools/belt_draw_diff.py`: 0
+  differences). (Full: as many items as whole gaps fit in the lane, every gap at most 66/256; lanes under
+  the ground, loaders, linked belts and lanes longer than 4 tiles keep the simulation's items.) Live at
+  -62,-26 (Hold 60 UPS, `--record 60`, by day): off 87.6% visible, 4.2% phantoms; `sim` 94.5 / 91.9%,
+  3.5 / 3.6%; on 95.7 / 95.2%, 2.4 / 2.5% (inside the screenshots' bounds 97.7 / 97.1%). At -272,-14:
+  97.0 / 97.1%, 1.3% (PASS). docs/BELT-SIM-PLAN.md, the lattice section.
+- `--belt-draw-lattice-pile=off`: every lattice slot one item, whatever the lane's stacks (the lattice's
+  first build: a bus of stacks of four drawn flat, owner: "nothing shows as stacked items any more"). On
+  (the default): a lattice lane's slots are piles as high as the stacks its last read (`sl`) found most
+  often, each slot its record and a copy per step above it pointing at the slot's record as the items'
+  piles do (texel 3: the slot from the copy, its step k, the kind's pile step; texel 2 its own turn,
+  PILE_TURN more each from the slot's yaw, cards and blocks too). The shader reads the slot's texel 3 for a
+  copy, so copies slide with their slot and aren't hidden by the lattice's mask.
+- `--belt-draw-lattice-unison=off`: the lattice as first built: a slice of the drawn lanes has its speed
+  checked against the simulation's each job, and a lane takes a new speed only at two checks in a row.
+  So when a backed-up run started moving its lanes changed speed jobs apart, and at each lane boundary the
+  sliding lane's slots opened and closed a gap of up to 0.25 tile against the standing neighbour (the
+  owner's "shimmer of small gaps"), while at the run's ends the simulation's own items moved away from the
+  standing lattice for two jobs. On (the default): every drawn lane is checked every job and a new speed
+  is taken at once, so a run's lanes change in the same job as the simulation's records; the map's phase
+  keeps their lattices in step. `tools/belt_unison_check.py` measures it (an every-tick recording and the
+  client's `--belt-draw-dump`): the largest deviation of the drawn spacing from 0.25 tile on lanes the game
+  has full, and the share of such lane-ticks showing a gap, overall, in the 30 ticks after a full lane
+  starts moving, and on full lanes moving (a loop).
+- `--belt-draw-early=off`: as before, every change the simulation emits for a tick after the drawn tick
+  waits for the next job (its record would show the item at its new place before its time). On (the
+  default): a change the records can take without showing anything early is taken now: a start of an item
+  whose record stands where the change starts from (a record standing there till t0, then moving, is just
+  what the item does), or a continuation of a moving item's record (it reaches the change's lane and place
+  at the change's tick at the same speed: a line's end, a closed loop's cut, where the simulation's lines
+  hand an item on): the record is made again from where the item is now, across the end, through the
+  lanes ahead. Held, such an item was drawn standing at the cut until the next job's result was drawn:
+  at -62,-26 a job is about 26 ticks, so on a full closed loop items bunched at the cut and jumped 0.8
+  tile, and a run starting between jobs stood and then jumped. With it the simulation is stepped
+  `--belt-sim-ahead` 24 ticks past the drawn tick (was 1; never past the newest update), so such changes
+  are known in time. Both paths (GDScript and native) take the switch. Live at -62,-26 (Hold 60 UPS,
+  `--record 60`, by day): 96.2% visible, 1.9-2.0% phantoms with ahead 64 or 24 (the lattice alone: 95.2-95.7%,
+  2.4-2.5%); lattice lanes of a run drawn sliding against a standing neighbour 1.0% of adjacent pairs a job
+  (11.8-12.2% before). A job cost 505 ms with ahead 64 (the simulation stepping ahead and 122k held changes
+  re-scanned a job) and 426 ms with 24, against about 300 before.
+- `--belt-draw-lattice-native=off`: the lattice made in GDScript (`belt_lattice.gd`), as before. On (the
+  default when the C++ library is loaded and the simulation is `BeltSimNative`): `BeltLatticeNative`
+  (`client/native/belt_sim/src/belt_lattice_native.cpp`), belt_lattice.gd function for function, writes the
+  same records (`tools/belt_draw_diff.py`: 0 differences between the two on a capture; the dump's `lat_native`
+  says which ran). At -62,-26 the GDScript lattice cost 25-70 ms a job (half a second when the view moved and
+  every lane was planned again, so walking paid it every few steps); the C++ one 1-3 ms.
+`godot --headless --path client -s res://tests/belt_bs_replay.gd -- --stream=bs.jsonl --truth=rec.json
+--drawn-check --every-tick [toggles]` replays a capture (`--belt-capture=bs.jsonl`) with a job a tick as
+the client runs them and says, every recorded tick, how far each simulated item is drawn from where the
+simulation has it, by cause (`--drawn-explain=N` examples, `--trace=UID` one item). Experiments: `--oracle-at=TICK` reads every recorded lane
+at the first recorded tick at or after TICK (the simulation starts from the game's state there),
+`--reads-after=none` then applies no lane reads (the simulation alone), `--persist` says per update
+how many of the items the game had then are still exact, within 0.15 tile, on another lane or missing
+(with belt_sim.gd, only lanes whose items go on into recorded lanes alone); `--read-probe` (belt_sim.gd)
+compares each read with the simulation just before it, by distance and lane kind, and says what reads
+took off and whether the game still had it on the next recorded tick. `--replay-bre` answers the job's
+own `bre` from the recording two updates on, as the replay always did before; off by default, since a
+live capture already holds the bridge's answers to the live client's asks (answering again read lanes
+the live client never got: -62,-26 replayed 91.9% visible with it, 87.5% without). `--hold-emu` makes the bridge's `sh` from the recording (a
+recorded splitter input whose items at an update are its last read's), `--confirm-emu=split|all` reads such
+lanes again (splitters' lanes, or all) as their last read had them at every update: what those would do.
+
+To measure where the client draws items against a running server: `python tools/belt_path_check.py
+layout --rcon-port <port>` builds a test row per belt tier (both curves, a splitter, an underground,
+side-loading, packed rows), `record --out truth.json` records every item's place each tick, and
+`check truth.json drawn.json [--within x0,y0,x1,y1]` compares where the client drew them with
+`-- --belt-path-probe=drawn.json@20` (records 20 s after 10 s, prints belt items' main-thread and worker
+time, then quits): by unique id, and by place (each drawn item's distance from the nearest game item
+at that tick, p50 and p99, the share drawn with no game item within 0.15 tile, and the share of the
+game's items with none drawn within 0.15).
+
+Whether a build's belts look right over the whole view, in one command: `python tools/belt_view_check.py
+--worktree <checkout> --ports <udp>,<game>,<rcon> [--at x,y] [--size 64] [--seconds 10] [--settle 40]
+[--settle-max 180] [--first-bs 60] [--settings automatic|unlimited] [--hold60 on|off] [--record
+updates|tick] [--camera top|free|<yaw,pitch,dist[,ortho]>] [--stand-in] [--reuse-server] [--shots <dir>]
+[--json <out>] [--lock <file>] [--keep <dir>] [--replay every-tick|update] [--replay-arg=<arg>] [--tail-wait 30]
+[--record-bounds view|square] [--draw-dump on|off] [--client-arg=<arg>] [--client-setting=<key>=<value>]`. It starts that checkout's server on a copy of its `server/saves/zt.zip`
+(the mod copied into its server folder first), puts the character at `--at`, runs its windowed client
+with `--belt-capture`, a settings file of its own (Hold the game at 60 UPS on, the owner's default;
+`--hold60 off` is a diagnostic; `--client-setting` adds a line to its [graphics], as the settings file writes it,
+such as `grass_3d="off"`, for a diagnostic) and the camera pinned (`--camera top`: the client's
+`--camera=0,85,<size/0.65>,ortho`, straight down, north up, `--size` tiles high, so a branch's and
+main's screenshots frame the same ground; `free` leaves the client's own). It counts the client as
+joined at the capture's first `bs` line (FAIL after `--first-bs` seconds with none), waits until the
+capture's last update has no `ld` (the first load is done) and at least `--settle` seconds have gone
+(FAIL "first load didn't finish" after `--settle-max`; the capture is read as the client's file buffer
+writes it), records the game's belts over a `--size` square round the character
+(`tools/belt_sim/record.py --sample updates`: only the ticks the bridge sends an update on, all the
+replay compares; `--record tick` reads every lane every tick as before, which loads the server enough
+that Hold 60 UPS slows the bridge's updates), saves the client's view every 10 s, waits (up to `--tail-wait` s) for the capture to reach the
+recording's last tick (the client's capture can trail the game by seconds; a capture that still ends
+first is compared only as far as its updates go, and the report's head says so), stops everything and
+replays the capture through that build's belt_items.gd (`tests/belt_bs_replay.gd --view-dump
+--drawn-check --every-tick`: a job a tick with the drawn clock behind the updates, as the client runs
+them; `--replay update` runs a job an update at its tick as before, which puts items the records draw
+on another lane than the simulation's that the client never shows, so the drawn kinds aren't gated
+then; `--replay-arg` passes the drawing's toggles on). The game's belts are recorded over the screenshots'
+whole ground (`--record-bounds view`, the default: the pinned camera's bounds, 107 x 60 tiles at --size
+60; `square` records the --size square only, as before), and the client runs with `--belt-draw-dump`
+(`--draw-dump off` leaves it out): the report's section L scores what the client itself drew, the
+records in effect when its drawn clock showed each recorded tick, placed as the shader places them,
+against the game's items in those bounds (visible by place, one to one by item name within 0.15 tile;
+phantoms; by id; by id on packed lanes, reported only: a packed lane of one kind looks the same whichever
+of its items is where, the owner's concession "a lane the game has packed is drawn packed";
+`--gate-by-id on` makes it a gate again, under 90% failing), with the client's own pace (jobs with updates and their ms, updates
+merged into one job, results drawn late, how far the drawn clock was behind the newest update). PASS
+needs live visible >= 97%, live phantoms <= 2% and coverage >= 98% (and packed lanes by id >= 90% with
+`--gate-by-id on`); the
+replay's score (section 0) is a diagnostic then: replay against game separates the bridge and the
+simulation, live against replay the client not keeping up. `--client-arg=<arg>` (repeatable) passes a
+switch to the client only (`--client-arg=--belt-draw-coalesce=off` for the client as it was). Reading
+every lane on every update tick (`--record updates`) slows the server to 12-30 UPS, which gives the
+client several times the wall time a tick it has in play: `--record 60` (every 60th tick, 10 rows) keeps
+the game near 60 UPS; the report's head says the game's pace while recording. The report's head gives the run's pace: the updates' `p` (ticks between updates) while
+compared and before, when `ld` last showed, the bridge's rate level (/f3d-status) at the recording's
+start and end, Hold 60 UPS (and whether that is the default), the client, whether the server was
+started or reused, and how the recorder sampled (with `--analyze`, from status.txt, settings.cfg and
+run.json beside the stream, or `--status`, `--settings-file`) and how the replay ran. The headline
+(0.) is what the owner sees: every game item in the square on a lane that shows (not an underground's
+hidden lines 3-4) matched one to one with a simulated item of the same item name on the same lane
+within 0.15 tile, at every compared update ("visible"); the simulated items on those lanes with no game
+item matched ("phantoms"); "holes", runs of two or more game items in a row along a lane with no match;
+the misses with some other simulated item there (another kind, or one already taken); kept on the deep
+lanes (4 or more back to an unsimulated feeder, or none) over every update; and what the records draw
+on another lane than the simulation's. The view dump gives each item's kind (the game's by the
+recording's `names`, the simulation's by the `sl` that set it: the bridge's item ids, matched to names
+by the items both have, or the recording's for the `bre` answers the replay makes up). Then, as
+diagnostics: lanes simulated by ring round the
+character; items kept by how many lanes back the nearest unsimulated feeder is, lane by lane (min(sim,
+game) per lane summed, so a lane with too many doesn't make up for a hole on another); items by id
+(right, off, other lane, missing, extra) at the first, middle and last update; what the records draw
+against the simulation (other lane, standing where the simulation moves); and the headline by id, the
+share of every game item in the square whose own id is simulated on its lane within 0.15 tile (beside
+it the same by place, any simulated item within 0.15 tile, which a packed lane nearly always has, so it
+is not a gate, and how many of the last update's by-place hits are another item; by id, an item on
+another lane of a balancer looks the same when another of its kind takes its place, so none of the by-id
+numbers is a gate). PASS needs visible >= 97%, phantoms <= 2%, the deep lanes keeping >= 98%, 98% of
+lanes simulated, and (every tick) at most 0.05% of the item-frames drawn by the records on another lane
+than the simulation's; the exit code is 1 on FAIL. Beside the report,
+`lane_map.png` (copied to `--shots` too): the recorded lanes from above at the last update, each
+coloured right, right and empty, off, on another lane, hole (missing) or not simulated, over the same
+ground and at the same size as the pinned camera's screenshots. `--stand-in` runs `tools/belt_bench.py
+--bs --capture` instead of Zenith (no Godot, no screenshots: for bridge-only runs; `--stand-in-cap`,
+`--stand-in-near` are its `bfar`). `--reuse-server` keeps the server running on its save copy after the
+run and uses it again next time (the character teleported to the new spot), restarting it only when the
+worktree's mod changed (copied in again); `--stop-server` stops it. `--main <checkout>` runs the same
+spot on a checkout without `bs` for screenshots side by side (with `--reuse-server` on the ports + 10);
+`--analyze --stream <bs.jsonl> --truth <rec.json>` reports on a capture already made. A run takes the
+server's ~4 GB: `--lock` waits for that file to be free (polled every 5 s) and holds it while a run's
+server and client are live (a kept server idles without it). `python tools/test_belt_view_check.py`
+tests the report, the lane map, the camera's ground, the lock and record.py's `--sample` on made-up
+data.
+
+`tools/belt_sim/record.py --sample` picks the ticks it records: `tick` (every tick, the default, which
+sim.py and belt_sim_replay need), `updates` (the ticks the bridge's `bi` job ran, read through a
+remote interface, `f3d_rec`, it adds to the bridge mod's Lua state for the recording) or `N[@phase]`
+(every N'th tick where tick % N == phase, phase 1 by default: the bridge's `bi` ticks at every rate
+level with its default interval of 6). Its rows are appended to the script-output file as they are
+made; the recording has the same keys as before plus `sample`, `rows` and, with `updates`,
+`bridge_ticks`.
 
 Factorio's belt rules, measured in the running game: `python tools/belt_rules.py --rcon-port <port>
 all` (or `lengths speed gap line sideload splitter inserter`) builds small rows on a lab surface of its
@@ -1029,6 +1604,30 @@ against the mock or your own server unless said.
 - `--robot-probe=<out.json>[@seconds]`: stands still and records what each frame costs with the
   movers in view (frame, movers' script time, draw calls, GPU); with the mock's `--robots N`.
   `--robot-nodes` draws robots a node each, as before robot_swarm.gd, for comparing.
+- `--ao-probe=<out.txt>[@seconds]`: after 20 s (or the seconds given) lists every model MultiMesh
+  drawn: instances, shadow casting, visibility, triangles, bounds, per surface whether its baked
+  occlusion (COLOR) and second UV map reached it and their mean, the material's `vertex_data` and
+  `ao_strength`, and the contact rims' feet (`feet=`); also the sun's shadow settings, the environment's
+  SSAO and ao_zoom.gd's reading. It doesn't quit, except with `--ao-probe-shots`: then it saves the
+  window with each kind of occlusion off in turn (`<out>-all.png`, `-no-ssao`, `-no-contact`,
+  `-no-baked`, `-none`, and `-all-again` for what moves between two pictures anyway), each after the
+  picture settles, with the GPU's frame time and SSAO's state in `<out>-shots.txt`, and quits.
+  `--ao-probe-ab=<bias>,<normal bias>` saves the window before and after setting the
+  sun's shadow biases (`<out>-a.png`, `<out>-b.png`), `--ao-probe-bias=` holds them there, and
+  `--ao-probe-own-shadows` makes every model cast its own shadow with the stand-ins hidden.
+  `--aa-probe-shots` (with `--ao-probe=`) saves the window under each anti-aliasing choice in turn
+  (`<out>-aa-off.png`, `-fxaa`, `-smaa`, `-taa`, `-msaa4`, `-off-again`), the setting held unsaved and
+  applied as Settings does, with what the window then has in `<out>-aa.txt`, and quits.
+- `--settings-probe=<folder>[@seconds]`: after 25 s (or the seconds given) changes every row of the
+  Settings window the way a player does (a dropdown's item picked, a box ticked, a slider let go),
+  reads back what each should change in the running game and in the settings file, saves a picture
+  before and after the visible ones, goes through each add-on's own settings (did the add-on hear,
+  how much the picture moved), and writes `<folder>/report.txt` (PASS / FAIL / NOTE). Each setting is
+  put back afterwards. `--settings-probe-restart` then writes a set of non-default values for the next
+  start, which `--settings-probe-verify` reads back in the game (`<folder>/verify.txt`). Use a user
+  folder and `--settings-file=` of the probe's own: it changes the window's size and mode.
+- `--settings-scroll-to=<control name>` (with `--menu=settings:<tab>`): that setting scrolled into
+  view, for screenshots (`graphics-antialiasing`).
 - `--glide-probe=<out.json>[@seconds]`: goes through the bridge's `rate` levels 0 to 3 (30 s each)
   and reports, per kind of mover and for belt items, the speed and how often they stall or jump.
 - `--soak-probe=<out.json>[@minutes]`: a long session (30 minutes): walks a square, opens windows,
@@ -1073,6 +1672,55 @@ have the usage): `python tools/alt_cost.py` streams the chunks round a spot and 
 Alt-mode costs the bridge, off and on; `python tools/request_spikes.py` sends the client's requests
 one at a time while the bridge traces every tick, and reports the slowest tick round each.
 
+## The native belt simulation (optional)
+
+The client runs Factorio's belts itself (`client/scripts/world/belt_sim.gd`). The same simulation in
+C++, `BeltSimNative` (`client/native/belt_sim/src/`), is a GDExtension that gives the same results item
+for item, several times faster; `belt_items.gd` uses it whenever it is loaded and belt_sim.gd otherwise.
+The same library holds `BeltDrawNative` (`belt_draw_native.cpp`): belt_items.gd's job from the
+simulation's changes to the GPU records (`--belt-draw-native`, above), the same records as the GDScript
+path (`tools/belt_draw_diff.py`).
+The Windows library, `client/native/bin/belt_sim.windows.template_release.x86_64.dll`, is committed, so
+nothing needs building to use it. Without it (other platforms, or the file deleted) Godot prints three
+`ERROR` lines at start-up ("GDExtension dynamic library not found: 'res://native/belt_sim.gdextension'"),
+and everything runs on belt_sim.gd; the tests pass either way.
+
+`--belt-sim-native=off` runs belt_sim.gd with the library loaded (its drawing and lattice in GDScript
+too). If Zenith ever dies inside the library (an access violation, exit code 3221225477, with no
+backtrace: a loop side-loading onto itself on Aquilo did that), the same spot under belt_sim.gd stops with
+a script error and a GDScript backtrace naming the line, which points at the C++ function of the same name.
+
+Godot loads an extension only once it is listed in `client/.godot/extension_list.cfg`, which an import
+writes: on a fresh checkout run `godot --headless --path client --import` once, or the client and the tests
+run on belt_sim.gd (`belt_sim_native_test.gd` then says "BeltSimNative isn't loaded" and skips).
+
+To build it again after changing `belt_sim_native.cpp` (Windows, MSVC Build Tools 2022 or newer, Python):
+
+```
+git clone --depth 1 -b 4.5 https://github.com/godotengine/godot-cpp client/native/godot-cpp   # once (git-ignored)
+python -m pip install scons                                                                  # once
+client\native\belt_sim\build.bat                                                             # vcvars64 + scons; the first build takes ~10 minutes
+client\native\belt_sim\build.bat godot_cpp=E:/other-worktree/client/native/godot-cpp               # a godot-cpp built elsewhere (6.5 GB built)
+```
+
+The first build takes ~15 minutes (godot-cpp, with link-time code generation); after a change to our own
+source about 2. Symbols and a link map (`.pdb`, `.map`, git-ignored) are written beside the DLL: Godot's
+crash backtraces give `belt_sim...dll+<offset>`, which the map turns into a function.
+
+A change to belt_sim.gd's rules must be made in `belt_sim_native.cpp` too (it follows the GDScript
+function by function, down to belt_sim.gd's own slips: see the test's header). Check them:
+
+```
+godot --headless --path client -s res://tests/belt_sim_native_test.gd   # both step for step: PASS, 0 differences
+godot --headless --path client -s res://tests/belt_sim_replay.gd -- --native   # or --gd: 73,185 right, 0 wrong
+godot --headless --path client -s res://tests/belt_sim_bench.gd -- --native    # or --gd: the cost a tick
+```
+
+On the desktop (i5-6600K), replaying `main_belts.json` (Zenith Test's main belts, 12,800 items, the
+game's oracle at the square's edges): belt_sim.gd 4.4 ms a tick, BeltSimNative 0.17; six copies side by
+side (77,000 items) 23.4 against 0.86 ms; the synthetic bench's 80,000 items (loops and backed-up runs) 17.9 against 0.16 ms. In
+belt_items.gd's job (`tests/belt_bs_perf.gd`, `--gd` for belt_sim.gd) on a captured stream: 3.0 against 0.08 ms a tick.
+
 ## Tests
 
 ```
@@ -1082,7 +1730,7 @@ python3 -m venv .venv && .venv/bin/pip install lupa "gdtoolkit==4.*"   # once (W
 .venv/bin/python tools/mod_tests/test_fuzz.py     # the mod against malformed, truncated, out-of-order packets
 python3 tools/test_mock_server.py                 # the mock server, over real UDP
 python3 tools/test_mock_fuzz.py                   # the mock, fuzzed the same way
-for f in $(find client -name '*.gd'); do .venv/bin/gdparse "$f" >/dev/null || echo "FAIL $f"; done
+.venv/bin/gdparse $(find client -name '*.gd') >/dev/null || echo "FAIL"
 python3 tools/models/check.py                     # after model changes: name, footprint, origin, triangle budget
 godot --headless --path client res://tests/ui_test.tscn   # the UI's input paths; exits 1 on failure
 godot --headless --path client res://tests/addon_test.tscn   # add-ons: loading, keys, the camera, data

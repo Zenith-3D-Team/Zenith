@@ -10,6 +10,7 @@ real one, so wrong property reads show up here instead of as an in-game crash.
 import json
 import math
 import pathlib
+import re
 import sys
 
 from lupa import lua52
@@ -61,6 +62,8 @@ g.package.path = str(MOD / "?.lua") + ";" + g.package.path
 lua.execute((MOD / "control.lua").read_text())
 # As in Factorio, `require` works only while control.lua is being loaded (a module requiring another
 # from inside a function stops the game).
+# The barrier round each step (barrier.lua) would swallow what these tests are here to catch.
+lua.execute('package.loaded["scripts.barrier"].rethrow = true')
 lua.execute('require = function(name) error("Require can not be used outside of control.lua parsing: " .. tostring(name)) end')
 F = g.F
 
@@ -228,7 +231,7 @@ check(not of_type(msgs, "clog"), "no clog before the force has character logisti
 # A save made with an older bridge (on_configuration_changed): what its storage lacks is made again.
 g.storage.f3d.damaged = None
 g.storage.f3d.wire_sigs = None
-F.on_config(lua.table_from({"mod_changes": {}}))
+F.on_config(lua.table_from({"mod_changes": {}}, recursive=True))
 check(g.storage.f3d.damaged is not None and g.storage.f3d.wire_sigs is not None and g.storage.f3d.client is not None,
       "on_configuration_changed makes the tables an older save lacks, and keeps the client")
 
@@ -307,6 +310,43 @@ queue_after = lua.eval("""function()
 end""")()
 check(queue_after == "3,0 4,0 2,0 5,0 1,0|3,0 4,0 2,0 5,0 1,0 9,9",
       f"the chunk queue keeps the client's nearest-first order after a jump and as chunks are generated (D7): {queue_after}")
+# View distance 50: the client sends its square as rows of runs (`sub` o, r, w), not a list.
+square = lua.eval("""function()
+  local W = package.loaded["scripts.world"]
+  local s = storage.f3d
+  local saved = { s.subs, s.queue, s.queued, s.rank, s.order, s.have }
+  s.subs, s.queue, s.queued, s.rank, s.order, s.have = {}, {}, {}, {}, {}, {}
+  local out = {}
+  -- 3x3 round (10, 10), its middle row in two runs, a row outside the square: queued nearest first,
+  -- in the client's ring_order (squared distance, then row by row).
+  W.subscribe_square({ 10, 10 }, 1, { { 9, 9, 3 }, { 10, 9, 1, 10, 2 }, { 11, 9, 3 }, { 30, 0, 5 } })
+  out[#out + 1] = table.concat(s.queue, " ") .. "|" .. #s.order .. "|" .. s.order[1]
+  -- Walked a chunk east: the west column goes, the east one comes, in order round the new middle.
+  s.queue, s.queued = {}, {}
+  W.subscribe_square({ 11, 10 }, 1, { { 9, 10, 3 }, { 10, 10, 3 }, { 11, 10, 3 } })
+  local keys = {}
+  for k in pairs(s.subs) do
+    keys[#keys + 1] = k
+  end
+  table.sort(keys)
+  out[#out + 1] = table.concat(keys, " ") .. "|" .. table.concat(s.queue, " ")
+  -- The same square again changes nothing; a resend queues it all, nearest first.
+  W.subscribe_square({ 11, 10 }, 1, { { 9, 10, 3 }, { 10, 10, 3 }, { 11, 10, 3 } })
+  W.resend_all()
+  out[#out + 1] = table.concat(s.queue, " ")
+  -- Malformed ones are ignored.
+  out[#out + 1] = tostring(W.subscribe_square({ "x" }, 1, {})) .. " " .. tostring(W.subscribe_square({ 0, 0 }, 0 / 0, {}))
+    .. " " .. tostring(W.subscribe_square({ 0, 0 }, 1, "rows"))
+  s.subs, s.queue, s.queued, s.rank, s.order, s.have = saved[1], saved[2], saved[3], saved[4], saved[5], saved[6]
+  s.sub_o, s.sub_r, s.sub_rows, s.sub_n = nil, nil, nil, nil
+  return table.concat(out, "\\n")
+end""")().split("\n")
+check(square[0] == "10,10 10,9 9,10 11,10 10,11 9,9 11,9 9,11 11,11|9|10,10",
+      f"a square subscription queues its chunks nearest its middle first, as the client orders them: {square[0]}")
+check(square[1] == "10,10 10,11 10,9 11,10 11,11 11,9 12,10 12,11 12,9|12,10 12,9 12,11",
+      f"walking, a square subscription drops and adds only the columns that changed: {square[1]}")
+check(square[2] == "11,10 11,9 10,10 12,10 11,11 10,9 12,9 10,11 12,11", f"resend_all keeps a square's order: {square[2]}")
+check(square[3] == "false false false", f"malformed square subscriptions are ignored: {square[3]}")
 belt = [rec for rec in ents.get((1, 0), []) if rec[1] == eid["transport-belt"]]
 check(belt and belt[0][2:5] == [40 * 256 + 128, 3 * 256 + 128, 4] and belt[0][5] == {"s": "s"},
       "belt record: fixed-point position, direction, shape")
@@ -381,6 +421,14 @@ tick(30)
 dec = [(m["cx"], m["cy"]) for m in of_type(take(), "dec")]
 check(dec == [(1, 0)], f"building in a chunk sends its decoratives again: {dec}")
 check(world_mod.rev(1, "1,0") == rev_before + 1, f"and raises its change count once: {rev_before} -> {world_mod.rev(1, '1,0')}")
+wide_e = spawn("assembling-machine-1", 31.5, 20.5, force="player")
+F["raise"]("script_raised_built", lua.table_from({"entity": wide_e}))
+tick(30)
+dec = sorted((m["cx"], m["cy"]) for m in of_type(take(), "dec"))
+check(dec == [(0, 0), (1, 0)], f"a building over a chunk's edge sends both chunks' decoratives again: {dec}")
+wide_e.destroy()
+tick(90)  # 120 ticks in all: the belt checks below run on the tick phase they had
+take()
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
 tick(30)
 F["raise"]("script_raised_built", lua.table_from({"entity": spawn("wooden-chest", 41.5, 5.5, force="player")}))
@@ -435,18 +483,14 @@ kept = of_type(take(), "bi")
 F.move_on_belt(belt_e, 1, 77, None)
 check(kept and all(m.get("fr") == 9 for m in kept),
       f"a count a little over the cap keeps the last edge (fr 9): {[m.get('fr') for m in kept]}")
-# Where plain lanes stop follows the square in at once (a plain lane at the last ring has its lane
-# in front outside the square, which the client doesn't have), out only by two rings or more.
-edge_was = g.storage.f3d.bi.plain_edge
+# A cap well under what the edge holds shrinks the square.
 belt_mod.max_items = 1
 tick(12)
 shrunk = of_type(take(), "bi")
-edge_in = g.storage.f3d.bi.plain_edge
 belt_mod.max_items = 4
 tick(12)
 take()
-check(edge_was == 9 and shrunk and shrunk[-1].get("fr") < 9 and edge_in == shrunk[-1].get("fr") and g.storage.f3d.bi.plain_edge == edge_in,
-      f"plain lanes' edge follows the square in at once, out by two rings: {edge_was} {[m.get('fr') for m in shrunk]} {edge_in} {g.storage.f3d.bi.plain_edge}")
+check(shrunk and shrunk[-1].get("fr") < 9, f"a much smaller cap shrinks the square: {[m.get('fr') for m in shrunk]}")
 belt_mod.max_items = 6000
 tick(6)
 plain = take()
@@ -725,313 +769,7 @@ tick(12)
 take()
 
 
-# Belt groups (`bg` in the hello, with `bl`): a packed lane (one kind, one stack size, a gap apart
-# end to end) is sent once as a group, then only its front item's place when it moved (`bm`),
-# while the cheap check finds it packed the same way; anything else sends it as items again.
-def groups_of(msgs):
-    out = {}
-    for m in of_type(msgs, "bi"):
-        bg = m.get("bg", [])
-        for i in range(0, len(bg), 10):
-            out[bg[i]] = bg[i + 1:i + 10]
-    return out
-
-
-def moves_of(msgs):
-    out = {}
-    for m in of_type(msgs, "bi"):
-        bm = m.get("bm", [])
-        for i in range(0, len(bm), 3):
-            out[bm[i]] = bm[i + 1]
-    return out
-
-
-send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bg": 1})
-ge = spawn("transport-belt", 14.5, 5.5, force="player", direction=4)
-kg = int(ge.unit_number) * 8 + 1
-packed = [61, 62, 63, 64]
-for j, u in enumerate(packed):
-    F.put_on_belt(ge, 1, "iron-plate", 0.25 * j, u)
-tick(12)
-msgs = take()
-made, (made_ln, _) = groups_of(msgs), lane_update(msgs)
-check(kg in made and made[kg][0] == iid["iron-plate"] and made[kg][5:7] == [0, 64] and made[kg][8] == 1 and kg not in made_ln,
-      f"bg: a packed lane is sent as a group (kind, front 0, gap 1/4, stack 1), not as items: {made.get(kg)} {made_ln.get(kg)}")
-# Line position 0 is the belt's east edge, 1 its west one, on the north lane.
-check(made.get(kg, [0] * 5)[1:5] == [15 * 256, fixed(5.5 - 0.234), 14 * 256, fixed(5.5 - 0.234)],
-      f"bg: where its line positions 0 and 1 are on the map: {made.get(kg)}")
-reads0 = F.detailed_reads
-tick(12)
-msgs = take()
-still_ln, _ = lane_update(msgs)
-check(kg not in still_ln and not moves_of(msgs) and not groups_of(msgs) and F.detailed_reads == reads0,
-      f"bg: a group that didn't move: nothing read in full, nothing sent: {still_ln.get(kg)} {moves_of(msgs)}")
-belt_mod.lane_refresh = 1  # every lane refreshed every update
-regrouped0 = belt_mod.counts.regrouped
-tick(6)
-msgs = take()
-belt_mod.lane_refresh = 1000
-refresh_ln, _ = lane_update(msgs)
-check(groups_of(msgs).get(kg) == made.get(kg) and kg not in refresh_ln and belt_mod.counts.regrouped > regrouped0,
-      f"bg: a group's refresh sends it again as it is (its kinds read, not the lane in full): {groups_of(msgs).get(kg)} {refresh_ln.get(kg)}")
-# It creeps on 1/16 of a tile (an assembler took an item at the front, the rest closed up, one came in).
-for j, u in enumerate(packed):
-    F.move_on_belt(ge, 1, u, None)
-packed = [62, 63, 64, 65]
-for j, u in enumerate(packed):
-    F.put_on_belt(ge, 1, "iron-plate", 0.1875 + 0.25 * j, u)
-stack_reads0, reads0 = F.stack_reads or 0, F.detailed_reads
-tick(12)
-msgs = take()
-crept_ln, _ = lane_update(msgs)
-check(moves_of(msgs).get(kg) == 48 and kg not in crept_ln and F.detailed_reads == reads0 and (F.stack_reads or 0) - stack_reads0 == 4,
-      f"bm: a group that moved sends its front item's place (3/16: 48/256), its kinds read, not its items: "
-      f"{moves_of(msgs)} {crept_ln.get(kg)} reads {F.detailed_reads - reads0}, stack reads {(F.stack_reads or 0) - stack_reads0}")
-# Another kind comes in at the back: no longer one kind, sent as items again (which ends the group).
-F.move_on_belt(ge, 1, 65, None)
-F.put_on_belt(ge, 1, "copper-plate", 0.9375, 66)
-F.move_on_belt(ge, 1, 62, None)
-F.move_on_belt(ge, 1, 63, None)
-F.move_on_belt(ge, 1, 64, None)
-F.put_on_belt(ge, 1, "iron-plate", 0.125, 62)
-F.put_on_belt(ge, 1, "iron-plate", 0.375, 63)
-F.put_on_belt(ge, 1, "iron-plate", 0.625, 64)
-F.move_on_belt(ge, 1, 66, None)
-F.put_on_belt(ge, 1, "copper-plate", 0.875, 66)
-tick(12)
-msgs = take()
-mixed_ln, _ = last_update(msgs)
-check(sorted(mixed_ln.get(kg, [])) == [62, 63, 64, 66] and kg not in groups_of(msgs),
-      f"bg: a group where another kind came in is sent as items again: {mixed_ln.get(kg)} {groups_of(msgs).get(kg)}")
-# Stacks of one size make a group too, with their size.
-gs = spawn("transport-belt", 15.5, 5.5, force="player", direction=4)
-ks = int(gs.unit_number) * 8 + 2
-for j in range(4):
-    F.put_on_belt(gs, 2, "copper-plate", 0.25 * j, 71 + j, None, None, 4)
-tick(12)
-stacked = groups_of(take())
-check(stacked.get(ks, [0] * 9)[8] == 4, f"bg: a packed lane of stacks of 4 is a group of stacks of 4: {stacked.get(ks)}")
-# A full lane flowing at its belt's speed moves one gap every 8 ticks on a yellow belt: checked 8
-# ticks apart it looks as if it stood. A group last seen flowing is sent as moved then (and the
-# client takes the belt's speed), not held as if it stood (and then checked as quiet).
-belt_mod.lane_jitter = False
-g_interval = g.settings["global"]["f3d-detail-interval"]
-g_interval_old = g_interval.value
-g_interval.value = 12
-gf = spawn("transport-belt", 17.5, 5.5, force="player", direction=4)
-kf2 = int(gf.unit_number) * 8 + 1
-for j in range(4):
-    F.put_on_belt(gf, 1, "iron-plate", 0.25 * j, 81 + j)
-tick(12)
-take()
-for j in range(4):
-    F.move_on_belt(gf, 1, 81 + j, None)
-for j in range(4):
-    F.put_on_belt(gf, 1, "iron-plate", 0.125 + 0.25 * j, 85 + j)  # 12 ticks at 1/32: a gap and a half
-tick(12)
-flow_moves = [moves_of(take()).get(kf2)]
-g_interval.value = 8
-for _ in range(3):
-    tick(8)  # a gap in 8 ticks: it looks the same
-    flow_moves.append(moves_of(take()).get(kf2))
-check(flow_moves[0] == 32 and all(m == 32 for m in flow_moves[1:]),
-      f"bm: a group flowing whole gaps between checks is still sent as moving, every check: {flow_moves}")
-g_interval.value = g_interval_old
-belt_mod.lane_jitter = True
-gf.destroy()
-ge.destroy()
-gs.destroy()
-send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1})
-tick(12)
-take()
-
-# Straight runs (`br` in the hello, with `bl`): a plain lane (a straight belt in a line of straight
-# belts facing one way that nothing but the belts either side puts items on or takes them off) is
-# read in full once and sent with where it is and its lanes either side (pl); then it isn't checked,
-# the client moves its items. Watched: the run's ends, inserters' and drills' belts, the belt after
-# an inserter's pickup belt, side-loaded belts.
-def plains_of(msgs):
-    out = {}
-    for m in of_type(msgs, "bi"):
-        pl = m.get("pl", [])
-        for i in range(0, len(pl), 8):
-            out[pl[i]] = pl[i + 1:i + 8]
-    return out
-
-
-raise_event = lua.eval("F.raise")
-run = [spawn("transport-belt", -12.5 + j, 10.5, force="player", direction=4) for j in range(6)]
-for a, b in zip(run, run[1:]):
-    F.link_belts(a, b)
-picker = spawn("inserter", -10.5, 9.5, force="player")
-picker.pickup_target = run[2]
-ru = [int(b.unit_number) for b in run]
-rk = [[u * 8 + 1, u * 8 + 2] for u in ru]
-F.put_on_belt(run[1], 1, "iron-plate", 0.5, 501)
-F.put_on_belt(run[4], 2, "copper-plate", 0.25, 502)
-F.put_on_belt(run[5], 1, "iron-plate", 0.75, 503)
-send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bg": 1, "br": 1})
-tick(12)
-msgs = take()
-first_ln, _ = last_update(msgs)
-first_pl = plains_of(msgs)
-plain_keys = {rk[1][0], rk[1][1], rk[4][0], rk[4][1]}
-check(plain_keys <= set(first_pl) and not ({k for r in (rk[0], rk[2], rk[3], rk[5]) for k in r} & set(first_pl)),
-      f"br: plain lanes are sent with pl (the run's 2nd and 5th belts), not its ends, the inserter's pickup belt or the belt after it: "
-      f"{sorted(first_pl)} plain {sorted(plain_keys)}")
-check(first_pl.get(rk[1][0], [0, 0])[:2] == [rk[0][0], rk[2][0]] and first_pl.get(rk[4][1], [0, 0])[:2] == [rk[3][1], rk[5][1]],
-      f"br pl: the lanes behind and in front of a plain lane, the same line of each: {first_pl.get(rk[1][0])} {first_pl.get(rk[4][1])}")
-# The 5th belt is at x -8.5: line position 0 is its east edge, 1 its west one; lane 1 north of the centre.
-check(first_pl.get(rk[4][0], [0] * 7)[2:7] == [fixed(-8.0), fixed(10.5 - 0.234), fixed(-9.0), fixed(10.5 - 0.234), 2048],
-      f"br pl: where its line positions 0 and 1 are and its speed (1/32 tile a tick, 1/65536): {first_pl.get(rk[4][0])}")
-all_ln, _ = lane_update(msgs)
-check(set(all_ln.get(rk[1][0], [])) == {501} and set(all_ln.get(rk[4][1], [])) == {502} and set(all_ln.get(rk[5][0], [])) == {503},
-      f"br: a plain lane's items come in ln the first time, as any lane's: {all_ln}")
-# No plain lanes in a square reaching fewer rings than plain_min: they are watched again (sent without pl).
-belt_mod.plain_min = 100
-tick(12)
-small = take()
-small_ln, _ = lane_update(small)
-belt_mod.plain_min = 10
-check(not plains_of(small) and rk[1][0] in small_ln,
-      f"br: no plain lanes in a square smaller than plain_min (watched again, sent without pl): {sorted(plains_of(small))} {sorted(small_ln)}")
-tick(12)
-again = plains_of(take())
-check(plain_keys <= set(again), f"br: and plain again when the square reaches far enough: {sorted(again)}")
-tick(12)
-take()
-plain0, reads0 = belt_mod.counts.plain + belt_mod.counts.plain_checked, F.detailed_reads
-F.move_on_belt(run[1], 1, 501, 0.25)
-F.move_on_belt(run[5], 1, 503, 0.5)
-tick(6)
-msgs = take()
-moved_ln, _ = lane_update(msgs)
-skipped = belt_mod.counts.plain + belt_mod.counts.plain_checked - plain0
-check(rk[1][0] not in moved_ln and rk[5][0] in moved_ln and not plains_of(msgs) and skipped == 4,
-      f"br: plain lanes aren't read (4 skipped or drift-checked, {skipped}): one that moved isn't sent, a watched one is: {sorted(moved_ln)}")
-# Drift checks: every plain_check updates a plain lane's count, front and back (pc), not its items;
-# a lane the client asks for again (bre) is read in full and sent with pl.
-belt_mod.plain_check = 1
-tick(6)
-msgs = take()
-belt_mod.plain_check = 16
-pc = {}
-for m in of_type(msgs, "bi"):
-    l = m.get("pc", [])
-    for i in range(0, len(l), 5):
-        pc[l[i]] = l[i + 1:i + 5]
-check(pc.get(rk[1][0], [0])[:3] == [1, 64, 64] and rk[1][0] not in lane_update(msgs)[0],
-      f"br pc: a plain lane's drift check, its count and its item's place (1/4: 64), not its items: {pc.get(rk[1][0])}")
-send({"t": "bre", "l": [rk[1][0]]})
-tick(6)
-msgs = take()
-check(rk[1][0] in plains_of(msgs) and rk[1][1] in plains_of(msgs) and rk[4][0] not in plains_of(msgs)
-      and lane_update(msgs)[0].get(rk[1][0]) == [501],
-      f"br bre: a plain lane the client asks for again comes again with its items and pl, with its whole chain "
-      f"(both lanes), not other chains: {lane_update(msgs)[0].get(rk[1][0])} {sorted(plains_of(msgs))}")
-check(rk[1][0] in g.storage.f3d.bl and rk[4][1] in g.storage.f3d.bl and not lane_update(msgs)[1],
-      "br: plain lanes not checked are kept, not dropped (dl)")
-# An item gone from a watched lane into the plain lane in front isn't carried on (sent in no lane):
-# the client moves it on there itself.
-F.put_on_belt(run[0], 1, "iron-plate", 0.1, 504)
-tick(12)
-read_504 = lane_update(take())[0].get(rk[0][0])
-F.move_on_belt(run[0], 1, 504, None)
-F.put_on_belt(run[1], 1, "iron-plate", 0.85, 504)
-tick(12)
-went = lane_update(take())[0]
-check(read_504 and 504 in read_504 and 504 not in [u for ids in went.values() for u in ids] and went.get(rk[0][0]) == [],
-      f"br: an item gone on into a plain lane isn't carried on; the lane it left is sent without it: {went}")
-# A sample: every plain_refresh updates a plain lane is read in full again, with its pl.
-belt_mod.plain_refresh = 1
-tick(6)
-msgs = take()
-belt_mod.plain_refresh = 64
-sampled_ln = lane_update(msgs)[0]
-check(501 in sampled_ln.get(rk[1][0], []) and plain_keys <= set(plains_of(msgs)),
-      f"br: plain lanes are read again every plain_refresh updates, sent with pl: {sampled_ln.get(rk[1][0])} {sorted(plains_of(msgs))}")
-# Something built next to a plain belt: an inserter dropping on the 5th belt makes it watched (on the
-# next tick), sent in ln without pl.
-dropper = spawn("inserter", -8.5, 11.5, force="player")
-dropper.drop_target = run[4]
-raise_event("script_raised_built", lua.table_from({"entity": dropper}))
-tick(12)
-msgs = take()
-built_ln = lane_update(msgs)[0]
-check(rk[4][1] in built_ln and rk[4][1] not in plains_of(msgs) and not g.storage.f3d.bl[rk[4][1]][14],
-      f"br: a belt an inserter now drops on is watched: sent without pl: {built_ln.get(rk[4][1])} {sorted(plains_of(msgs))}")
-# A side-load makes a belt watched; mining a belt makes its neighbours run ends.
-side = spawn("transport-belt", -11.5, 9.5, force="player", direction=8)
-F.link_belts(side, run[1])
-raise_event("script_raised_built", lua.table_from({"entity": side}))
-tick(12)
-msgs = take()
-check(rk[1][0] in lane_update(msgs)[0] and not g.storage.f3d.bl[rk[1][0]][14],
-      f"br: a side-loaded belt is watched: {lane_update(msgs)[0].get(rk[1][0])}")
-check(belt_mod.counts.plain_read > 0 and g.storage.f3d.bw[ru[1]][0 + 1] is True,
-      "br: the watch map (storage f3d.bw) says the side-loaded belt is watched")
-# With bg, a packed watched lane (the run's end) comes as a group.
-for j in range(4):
-    F.put_on_belt(run[5], 2, "iron-plate", 0.25 * j, 511 + j)
-tick(12)
-msgs = take()
-check(rk[5][1] in groups_of(msgs), f"br + bg: a packed watched lane comes as a group: {sorted(groups_of(msgs))}")
-for j in range(4):
-    F.move_on_belt(run[5], 2, 511 + j, None)
-# Rotating a belt makes it and the one in front run ends; mining one makes the belt behind it one.
-run2 = [spawn("transport-belt", -12.5 + j, 13.5, force="player", direction=4) for j in range(5)]
-for a, b in zip(run2, run2[1:]):
-    F.link_belts(a, b)
-for b in run2:
-    raise_event("script_raised_built", lua.table_from({"entity": b}))
-r2 = [int(b.unit_number) * 8 + 1 for b in run2]
-for j in range(4):
-    F.put_on_belt(run2[2], 1, "iron-plate", 0.25 * j, 531 + j)
-# Plain lanes read for the first time: at most first_reads an update (here 2: one belt).
-belt_mod.first_reads = 2
-belt_mod.plain_refresh = 1000000  # (no chain's sample falling due meanwhile)
-per_update = []
-msgs = []
-for _ in range(3):
-    tick(6)
-    got = take()
-    msgs += got
-    per_update.append(len(plains_of(got)))
-belt_mod.first_reads = 400
-belt_mod.plain_refresh = 256
-check({r2[1], r2[2], r2[3]} <= set(plains_of(msgs)) and r2[2] not in groups_of(msgs) and max(per_update) <= 2,
-      f"br: the middle three belts of a new run are plain, a packed one too (never a group), read first at most "
-      f"first_reads lanes an update: {sorted(plains_of(msgs))} {sorted(groups_of(msgs))} {per_update}")
-run2[1].direction = 0
-raise_event("on_player_rotated_entity", lua.table_from({"entity": run2[1]}))
-raise_event("script_raised_destroy", lua.table_from({"entity": run2[4]}))
-run2[4].destroy()
-tick(12)
-take()
-bw = g.storage.f3d.bw
-check(bw[int(run2[1].unit_number)][1] and bw[int(run2[2].unit_number)][1] and bw[int(run2[3].unit_number)][1] and not g.storage.f3d.bl[r2[2]][14],
-      "br: a rotated belt, the belt in front of it and the belt behind a mined one are watched")
-for e in run2[:4]:
-    e.destroy()
-# Distance tiers: a lane near_tier rings out or more is checked about every far_ticks (one update
-# in 5 at 6 ticks), by its key; the nearer ones every update.
-belt_mod.near_tier = 10
-lone = spawn("transport-belt", -14.5, 0.5, force="player", direction=4)
-raise_event("script_raised_built", lua.table_from({"entity": lone}))
-kf = int(lone.unit_number) * 8 + 1
-F.put_on_belt(lone, 1, "iron-plate", 0.9, 601)
-tick(12)
-take()
-far0 = belt_mod.counts.far
-sends = []
-for j in range(10):
-    F.move_on_belt(lone, 1, 601, 0.85 - 0.05 * j)
-    tick(6)
-    sends.append(kf in lane_update(take())[0])
-check(sum(sends) == 2 and belt_mod.counts.far - far0 >= 8,
-      f"br: a far lane is checked on one update in five, held between: sent {sends}, {belt_mod.counts.far - far0} held far")
-belt_mod.near_tier = 16
-lone.destroy()
+section_ticks0 = int(lua.eval("game.tick"))
 # Far lane icons aren't read where the moving items reach: chunks wholly inside the square.
 send({"t": "bfar", "r": 200, "n": 64, "m": 0})
 tick(24)
@@ -1042,19 +780,10 @@ far_chunks = {(m["cx"], m["cy"]) for m in of_type(take(), "bfar")}
 check(belt_mod.counts.far_skipped > skipped0 and (0, 0) not in far_chunks and (-1, 0) not in far_chunks,
       f"bfar: chunks wholly inside the moving items' square (64 tiles) aren't read or sent: {sorted(far_chunks)}")
 send({"t": "bfar", "r": 0})
-# Old clients: no br, no pl, groups as before.
-send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bg": 1})
-tick(12)
-msgs = take()
-check(not plains_of(msgs) and g.storage.f3d.bw is None, "br: a client that doesn't say br gets no pl and no watch map is kept")
-for e in run + [picker, dropper, side]:
-    e.destroy()
+# (The ticks the belt group and straight run checks took once, so the periodic jobs below are
+# where they were in their rounds; a hello keeps the client.)
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1})
-# 576 ticks in all, so the periodic jobs below are where they were in their rounds.
-tick(106)
-take()
-# Back on the 6-tick phase the checks below were written for.
-tick((6 - (int(lua.eval("game.tick")) - section_start) % 6) % 6)
+tick(section_ticks0 + 704 - int(lua.eval("game.tick")))
 take()
 belt_mod.lane_refresh = 64
 F.put_on_belt(belt_e, 1, "iron-plate", 0.25, 7)
@@ -1265,6 +994,26 @@ ks = sorted(by_k)
 want = {7, 8, 9, 600, 601, 602, 603}  # (700 was taken off above)
 check(len(ks) > 2 and all(set(by_k[k]) == want and len(order[k]) == 7 for k in ks[1:]),  # the first round had no estimate: cut for time
       f"a round cut by the cap sends the whole rings before it, each item once: {[sorted(by_k[k]) for k in ks][1:3]}")
+# A round the cap cut, still reading lanes queued along lines that moved on when its due tick comes:
+# it isn't cut again. A second cut dropped what those lanes had just read and, marking the round
+# short for time, let go of the edge the cap had held (fr).
+g.storage.f3d.bi = None
+tick(60)
+take()
+queued_round, cut_update = None, None
+for _ in range(120):
+    r = belt_mod.round()
+    if r is not None and r.cut is None and queued_round is None:
+        queued_round = r.start
+        r.force_q = lua.table_from([lua.table_from([row[0], 1]) for _ in range(3000)])
+    tick()
+    cut_sent = of_type(take(), "bi")
+    if queued_round is not None and cut_sent:
+        cut_update = cut_sent[0]
+        break
+b = g.storage.f3d.bi
+check(cut_update is not None and cut_update.get("fr") == 12 and b.fr == 12 and b.edge_need is not None and b.edge_need > 0,
+      f"a round the cap cut isn't cut short again on its due tick: fr {cut_update and cut_update.get('fr')}, kept {b.fr}, edge_need {b.edge_need}")
 belt_mod.lane_weight = 1
 belt_mod.items_per_message = 300
 belt_mod.max_items = 6000
@@ -1377,6 +1126,13 @@ check(periods[0] == {"st": 30, "wires": 30, "en": 10, "seg": 2, "life": 60, "fp"
       and periods[3] == {"st": 120, "wires": 120, "en": 40, "seg": 8, "life": 240, "fp": 120, "tr": 60, "ts": 12, "gi": 60, "rc": 20},
       f"rate: tier 2 jobs slow from level 2, tier 3 from level 3, each up to its longest: {periods}")
 g.storage.f3d.rate = None
+# The belt simulation's own job: its updates are reads of the input spots, so they slow last and little.
+bs_periods = []
+for level in range(4):
+    g.storage.f3d.rate = level or None
+    bs_periods.append(rate.period("bs", 6))
+g.storage.f3d.rate = None
+check(bs_periods == [6, 6, 6, 12], f"rate: the belt simulation's job (bs) keeps 6-tick updates at levels 1-2 and goes to 12 at 3: {bs_periods}")
 # Far belt lanes: rounds start less often and read fewer belts a tick.
 lane_factors = []
 for level in range(4):
@@ -1396,6 +1152,31 @@ send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1})
 tick(1)
 check(rate.level() == 2, "rate: the level stays while the same client says hello")
 F.commands["f3d-rate"](lua.table_from({"name": "f3d-rate", "parameter": "0"}))
+# /f3d-bs: the belt simulation's switches, set at run time and said back.
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "feed_edges off"}))
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "bound 0.3"}))
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "bound lots"}))
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "nonsense on"}))
+check(lua.eval("storage.f3d_bs.feed_edges") is False and lua.eval("storage.f3d_bs.bound") == 0.3
+      and lua.eval("storage.f3d_bs.nonsense") is None,
+      "/f3d-bs sets a switch (on/off, a number for bound) and leaves bad ones alone")
+said_bs = lua.eval('package.loaded["scripts.belt_sim"]').option_command("")
+check("feed_edges off (set)" in str(said_bs[1]) and "full_area on" in str(said_bs[1]) and "bound 0.3 (set)" in str(said_bs[1]),
+      f"/f3d-bs with no arguments says every switch: {said_bs[1]}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "feed_edges default"}))
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "bound default"}))
+check(lua.eval("storage.f3d_bs.feed_edges") is None and lua.eval("storage.f3d_bs.bound") is None,
+      "/f3d-bs <name> default puts a switch back to its default")
+# A word switch: area square|trace.
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "area trace"}))
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "trace_near 32"}))
+said_bs = lua.eval('package.loaded["scripts.belt_sim"]').option_command("area nonsense")
+check(lua.eval("storage.f3d_bs.area") == "trace" and lua.eval("storage.f3d_bs.trace_near") == 32
+      and "square, trace or default" in str(said_bs[1]) and "area trace (set)" in str(said_bs[2]),
+      f"/f3d-bs area takes square or trace and says so: {said_bs[1]} / {said_bs[2]}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "area default"}))
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "trace_near default"}))
+check(lua.eval("storage.f3d_bs.area") is None, "/f3d-bs area default puts the square back")
 take()
 
 # D5: a client that says b gets each tick's messages joined by newlines (a datagram costs the game
@@ -1521,6 +1302,39 @@ check(any(l[l.index(sig.unit_number) + 1] == 2 for l in (m["l"] for m in of_type
       "a reserved signal is yellow (2)")
 for e in (sig, chain, acc, switch):
     e.destroy()
+
+# A splitter is working (its rollers turn) while items pass through it: off while empty or backed
+# up, on while what its lanes hold changes between checks, and a full lane that moved on by whole
+# gaps counts too (its front item's id changed, though the places read the same).
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1})  # keep-alive: the client times out after 600 ticks
+tick(1)
+spl = spawn("splitter", 12.0, 4.5, force="player")
+spl_state = [None]
+def splitter_after(n=31):
+    tick(n)
+    for m in of_type(take(), "st"):
+        l = m["l"]
+        if spl.unit_number in l[::2]:
+            spl_state[0] = l[l.index(spl.unit_number) + 1]
+    return spl_state[0]
+take()
+empty = splitter_after(30 * 10)
+F.put_on_belt(spl, 2, "iron-plate", 0.5, 7001)
+first = splitter_after()
+backed = splitter_after()
+F.move_on_belt(spl, 2, 7001, 0.8)
+moving = splitter_after()
+stopped = splitter_after()
+F.move_on_belt(spl, 2, 7001, None)
+F.put_on_belt(spl, 2, "iron-plate", 0.8, 7002)
+next_item = splitter_after()
+F.move_on_belt(spl, 2, 7002, None)
+splitter_after()
+gone = splitter_after()
+check((empty, first, backed, moving, stopped, next_item, gone) == (0, 0, 0, 1, 0, 1, 0),
+      "a splitter works while items pass: empty 0, first seen 0, backed up 0, moving 1, stopped 0, "
+      f"a new front item in the same place 1, emptied 0: {(empty, first, backed, moving, stopped, next_item, gone)}")
+spl.destroy()
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1})  # keep-alive: the client times out after 600 ticks
 tick(1)
 take()
@@ -2375,6 +2189,36 @@ again = of_type(take(), "craftable")
 check(not quiet and again
       and dict(map(tuple, again[-1]["l"])).get("iron-gear-wheel") == craftable.get("iron-gear-wheel", 0) + 5,
       f"craftable: not worked out again while the inventory stays the same, then again when it changes: {quiet}, {again[-1:]}")
+# f3d-spread-jobs: the counts are read a slice of recipes a tick and sent when the last slice is done
+# (two hand recipes here: a slice of one takes two ticks after the 30th), off: all on the 30th tick.
+crafting_mod = lua.eval('package.loaded["scripts.crafting"]')
+crafting_mod.craftable_slice = 1
+
+
+def craftable_after(count):
+    """The ticks after the next 30th tick until `craftable` comes, after `count` more plates."""
+    while (g.game.tick + 1) % 30 != 0:
+        tick(1)
+    take()
+    puppet.get_main_inventory().insert(lua.table_from({"name": "iron-plate", "count": count}))
+    for t in range(1, 8):
+        tick(1)
+        got = of_type(take(), "craftable")
+        if got:
+            return t, dict(map(tuple, got[-1]["l"])).get("iron-gear-wheel")
+    return None, None
+
+
+have = inv.get_item_count("iron-plate")
+sliced = craftable_after(10)
+check(sliced[0] == 3 and sliced[1] == (have + 10) // 2,
+      f"craftable, spread jobs: a slice a tick, sent when the last is done (the 30th tick plus two): {sliced}")
+check(g.storage.f3d.craft_job is None, "craftable, spread jobs: the job is closed once sent")
+g.settings["global"]["f3d-spread-jobs"] = lua.table_from({"value": False})
+whole = craftable_after(10)
+check(whole[0] == 2 and whole[1] == (have + 20) // 2, f"craftable, spread jobs off: all on the 30th tick (out a tick later), as before: {whole}")
+g.settings["global"]["f3d-spread-jobs"] = lua.table_from({"value": True})
+crafting_mod.craftable_slice = 32
 puppet.get_main_inventory().remove(lua.table_from({"name": "iron-plate", "count": 10}))
 tick(30)
 take()
@@ -3295,10 +3139,48 @@ focus_at(fx0 + 60)
 tick(3)
 check(g.storage.f3d.mv_scan.tick > first and g.storage.f3d.mv_scan.x == fx0 + 60,
       f"a jump searches it at once: {g.storage.f3d.mv_scan.x} for {fx0 + 60}")
+# perfbridge2: while searches keep finding the same movers the ticks between them double, up to the
+# f3d-mover-rescan setting (8: every 8 ticks, as before); a search that finds anything else goes back to 8.
+g.settings["global"]["f3d-mover-rescan"] = lua.table_from({"value": 32})
+movers_mod = g.package.loaded["scripts.movers"]
+movers_mod.reset()
+every, gaps, last = [], [], None
+for _ in range(140):
+    tick(1)
+    t = int(g.storage.f3d.mv_scan.tick)
+    if t != last:
+        if last is not None:
+            gaps.append(t - last)
+        every.append(int(g.storage.f3d.mv_scan.every))
+        last = t
+check(every[:4] == [8, 16, 32, 32] and gaps[:3] == [8, 16, 32] and max(gaps) <= 32,
+      f"movers: searches finding the same movers come 8, 16, then 32 ticks apart (f3d-mover-rescan 32): every {every[:5]}, gaps {gaps[:5]}")
+newcomer = spawn("car", fx0 + 20, fy0 + 10, force="player")
+for _ in range(40):
+    tick(1)
+    if int(g.storage.f3d.mv_scan.tick) != last:
+        break
+check(int(g.storage.f3d.mv_scan.every) == 8 and any(rec[0] == newcomer.unit_number for m in of_type(take(), "mv") for rec in m["l"]),
+      f"movers: a search that finds a new mover sends it and puts the searches back to every 8 ticks: {g.storage.f3d.mv_scan.every}")
+newcomer.destroy()
+g.settings["global"]["f3d-mover-rescan"] = lua.table_from({"value": 8})
+movers_mod.reset()
+last = None
+every = set()
+for _ in range(40):
+    tick(1)
+    if g.storage.f3d.mv_scan:
+        every.add(int(g.storage.f3d.mv_scan.every))
+check(every == {8}, f"movers: f3d-mover-rescan 8 searches every 8 ticks, as before: {every}")
 # Multiplayer: what sending the movers charges the tick (budget.commit, which decides which periodic
 # jobs run) is the search's count in storage, not the module-local list: a peer that loaded since
 # finds its own, later, which may hold a mover more.
-movers_mod = g.package.loaded["scripts.movers"]
+# (Just after a search, so the ticks below reach no other.)
+last = g.storage.f3d.mv_scan.tick
+for _ in range(20):
+    tick(1)
+    if g.storage.f3d.mv_scan.tick != last:
+        break
 scan_tick = g.storage.f3d.mv_scan.tick
 late_cars = [spawn("car", fx0 + 62, fy0 + dy, force="player") for dy in (0, 3)]
 tick(1)
@@ -3353,12 +3235,51 @@ redone = [m for m in of_type(take(), "chart") if (m["cx"], m["cy"]) == (0, 0)]
 check(redone and redone[0]["pal"][redone[0]["px"][14 * 16 + 14]] != [204, 217, 204],
       "... and charted again once something is built in it")
 chest.destroy()
+# perfbridge2: a chart younger than map.chart_trust ticks of a chunk nothing was built, mined or destroyed in
+# since (an event) is trusted: its entities aren't counted again (the count was most of a minimap refresh's
+# cost). The counts live in storage.f3d_charts, forgotten by the events, so every peer slices the job alike.
+counted = []
+lua.execute("""
+local surface = game.surfaces[1]
+F.real_count = surface.count_entities_filtered
+-- (Only the charts' counts, made at a chart job's first step; world.lua's snapshots count the same way.)
+rawset(surface, "count_entities_filtered", function(f)
+  local m = storage.f3d and storage.f3d.map
+  if m and m.job and m.job.step == -1 then
+    F.counted = (F.counted or 0) + 1
+  end
+  return F.real_count(f)
+end)
+""")
+def map_count_calls(res=2):
+    g.F.counted = 0
+    send({"t": "map", "cx1": 0, "cy1": 0, "cx2": 0, "cy2": 0, "res": res})
+    tick(2)
+    take()
+    return int(g.F.counted)
+g.storage.f3d_charts = None  # (the charts above remembered theirs)
+first_count = map_count_calls()
+trusted = map_count_calls()
+rec = g.storage.f3d_charts and g.storage.f3d_charts[f"1,0,0,2"]
+check(first_count == 1 and trusted == 0 and rec is not None and rec[3] == "player",
+      f"map: a chunk's entity count is remembered in storage and trusted for a young chart: {first_count}, {trusted}, {rec and list(rec.values())}")
+quiet_chest = spawn("wooden-chest", 28.5, 28.5, force="player")
+F["raise"]("script_raised_built", lua.table_from({"entity": quiet_chest}))
+check(g.storage.f3d_charts["1,0,0,2"] is None and map_count_calls() == 1, "map: something built in the chunk forgets the trusted count, and it is counted again")
+g.package.loaded["scripts.map"].chart_trust = 0
+check(map_count_calls() == 1, "map: chart_trust 0 counts every time, as before")
+g.package.loaded["scripts.map"].chart_trust = 1200
+quiet_chest.destroy()
+lua.execute('rawset(game.surfaces[1], "count_entities_filtered", F.real_count)')
 
 # The map view's layers ride with the chart: poles, turrets, roboports, stops, signals, robots.
 layer_ents = [spawn("small-electric-pole", 20.5, 20.5, force="player"), spawn("gun-turret", 22, 22, force="player"),
               spawn("roboport", 26, 26, force="player"), spawn("train-stop", 16, 16, force="player", backer_name="Iron"),
               spawn("rail-signal", 12.5, 12.5, force="player"), spawn("construction-robot", 10.5, 10.5, force="player"),
               spawn("gun-turret", 6, 6, force="enemy"), spawn("small-electric-pole", 40.5, 20.5, force="player")]
+# (The overlay's robots are the movers' last search's (perfbridge2): search again now.)
+movers_mod.reset()
+tick(2)
 send({"t": "map", "cx1": 0, "cy1": 0, "cx2": 0, "cy2": 0, "res": 4})
 tick(2)
 c00 = [m for m in of_type(take(), "chart") if (m["cx"], m["cy"]) == (0, 0)]
@@ -3372,6 +3293,8 @@ check(["b", fixed(10.5), fixed(10.5)] in ov, "a worker robot")
 check(len(ov) == 6, "nothing of other forces, nothing from the next chunk")
 # Owner's C10: the copper wires between poles, each once.
 wired = spawn("small-electric-pole", 25.5, 20.5, force="player")
+# (Built: its event forgets the chunk's chart and trusted count, as in the game; the fake's spawn is silent.)
+F["raise"]("script_raised_built", lua.table_from({"entity": wired}))
 layer_ents[0].get_wire_connector(5, True).connect_to(wired.get_wire_connector(5, True))
 send({"t": "map", "cx1": 0, "cy1": 0, "cx2": 0, "cy2": 0, "res": 4})
 tick(2)
@@ -3488,6 +3411,11 @@ tick(1)
 adds = [m["e"] for m in of_type(take(), "add") if m["e"][0] == stop.unit_number]
 check(adds and adds[0][5].get("n") == "Iron", f"a train stop's record has its name: {adds}")
 check(adds and adds[0][5].get("col") == [255, 128, 0], f"and the colour given to it, 0-255 (H21): {adds}")
+stop.color = lua.table_from({"r": 0, "g": 0, "b": 1, "a": 1})
+F["raise"]("on_entity_color_changed", lua.table_from({"entity": stop}))
+tick(1)
+upds = [m["e"] for m in of_type(take(), "upd") if m["e"][0] == stop.unit_number]
+check(upds and upds[0][5].get("col") == [0, 0, 255], f"a repainted stop sends its new colour (H21): {upds}")
 loco2 = spawn("locomotive", px + 6, py + 1, force="player")
 wagon = spawn("cargo-wagon", px + 6, py + 8, force="player")
 rail = spawn("straight-rail", px + 20, py, force="player")
@@ -3985,21 +3913,27 @@ check(rec_asm and len(rec_asm) > 5 and rec_asm[5].get("ai") == ["recipe", "iron-
 check(rec_furnace and (len(rec_furnace) == 5 or "ai" not in rec_furnace[5]), f"#9: an idle furnace's record has none: {rec_furnace}")
 check(g.storage.f3d.altw[alt_furnace.unit_number] and not g.storage.f3d.altw[asm_r.unit_number],
       "#9: the furnace is watched, the unwired assembler isn't")
+
+
+def between_chunk_refreshes():
+    """To 30 ticks past world.lua's periodic chunk refresh (every 300 ticks, and which chunk comes
+    next is Lua's table order, different each run). A refresh of the furnace's chunk tells the
+    client in its record, and the watch then has nothing to send: 250 ticks from here have none."""
+    send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
+    tick((30 - int(lua.eval("game.tick"))) % 300)
+    send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
+
+
+between_chunk_refreshes()
 fill(alt_furnace, "input", "iron-ore", 3)
-send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
 tick(250)
 aiu = [row for m in of_type(take(), "aiu") for row in m["l"]]
 check([alt_furnace.unit_number, "recipe", "iron-plate"] in aiu, f"#9: the furnace taking ore sends its new icon in aiu: {aiu}")
+between_chunk_refreshes()
 F.inventories[alt_furnace]["input"].remove(lua.table_from({"name": "iron-ore", "count": 3}))
-send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
 tick(250)
-alt_msgs = take()
-aiu = [row for m in of_type(alt_msgs, "aiu") for row in m["l"]]
-# The periodic chunk refresh (world.lua) may resend the furnace's chunk first, its record then
-# carrying no icon, which says the same.
-resent = [r for m in of_type(alt_msgs, "ents") for r in m["e"] if r[0] == alt_furnace.unit_number]
-check([alt_furnace.unit_number, ""] in aiu or (resent and (len(resent[-1]) == 5 or "ai" not in resent[-1][5])),
-      f"#9: and its icon going when it has nothing: {aiu} {resent}")
+aiu = [row for m in of_type(take(), "aiu") for row in m["l"]]
+check([alt_furnace.unit_number, ""] in aiu, f"#9: and its icon going when it has nothing: {aiu}")
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
 tick(250)
 check(not of_type(take(), "aiu"), "#9: nothing more while nothing changes")
@@ -4678,6 +4612,16 @@ rk = of_type(msgs, "rk")
 check(rk and rk[-1]["u"] == silo.unit_number and rk[-1]["s"] == "nauvis", f"rk: a rocket launch at a silo: {rk}")
 cp = [r for m in of_type(msgs, "cp") for r in m["l"] if r[0] == cargo.unit_number]
 check(cp and cp[-1][1:] == ["awaiting_launch", "invalid", ""], f"cp: a cargo pod near the focus: {cp}")
+# Coming down, it says where it lands: the station's place, so the client drops it straight onto it.
+pad = spawn("wooden-chest", px + 6.5, py + 2.5, force="player")
+F.entity_data(cargo).cargo_pod_state = "descending"
+F.entity_data(cargo).cargo_pod_destination = lua.table_from({"type": g.defines.cargo_destination.station, "station": pad})
+tick(60)  # 60: the platform checks further on wait for ticks on the 60s
+cp = [r for m in of_type(take(), "cp") for r in m["l"] if r[0] == cargo.unit_number]
+check(cp and cp[-1][4:] == [int((px + 6.5) * 256), int((py + 2.5) * 256)], f"cp: a descending pod says where it lands: {cp[-1:]}")
+F.entity_data(cargo).cargo_pod_state = "awaiting_launch"
+F.entity_data(cargo).cargo_pod_destination = lua.table_from({"type": g.defines.cargo_destination.invalid})
+pad.destroy()
 send({"t": "land"})
 tick(1)
 check(any("Land from a platform" in m["text"] for m in of_type(take(), "msg")), "land on a planet is refused")
@@ -4775,6 +4719,10 @@ check(pm.get("on") == 0 and pm.get("here") == "nauvis" and pm.get("dest") == ["n
 check(rec.get("i") == 1 and rec.get("st") == "paused" and rec.get("loc") == "nauvis" and rec.get("hub") == plat.hub.unit_number
       and rec.get("pa") == 1 and "from" not in rec and "sch" not in rec, f"plat: a new platform waits in orbit, paused: {rec}")
 check(rec.get("w") == 1250000, f"plat: the platform's mass (weight, kg) for the remote view's info panel: {rec}")
+nauvis_s = g.game.planets.nauvis.surface
+check(pm.get("k") == g.game.tick
+      and pm.get("days") == [["nauvis", nauvis_s.ticks_per_day, round(nauvis_s.daytime * 100000) % 100000, 1 if nauvis_s.freeze_daytime else 0]],
+      f"plat: the game's tick and the day of the planet in the platform's sky (its surface's ticks_per_day, daytime): {pm}")
 # Its map seen from Nauvis (mtr si): a platform has no radars and is seen whole, as cov says.
 send({"t": "mtr", "si": plat.surface.index})
 tick(1)
@@ -4907,7 +4855,15 @@ check(rec.get("loc") == "nauvis" and rec.get("nx") == "vulcanus" and "to" not in
       f"plat: about to leave, the current record is the next stop: {rec}")
 pdata.schedule = lua.table_from({"current": 1, "records": lua.table_from([lua.table_from({"station": "vulcanus"})])})
 F.platform_travel(plat, "nauvis-vulcanus", 0.25, 2.5)
-rec = next_plat()["l"][0]
+pm = next_plat()
+rec = pm["l"][0]
+days = {d[0]: d for d in pm.get("days", [])}
+vday = days.get("vulcanus")
+vsurf = lua.eval("function() return game.planets.vulcanus.surface end")()
+# Without a surface, the prototype's day-night-cycle and the time of day from the tick.
+want_v = ["vulcanus", 25000, 20000, 0] if vsurf else ["vulcanus", 5400, round(g.game.tick % 5400 / 5400 * 100000) % 100000, 0]
+check(sorted(days) == ["nauvis", "vulcanus"] and vday == want_v,
+      f"plat: both ends of the way have their day (vulcanus {'with' if vsurf else 'without'} a surface): {pm.get('days')}")
 check(rec.get("from") == "nauvis" and rec.get("to") == "vulcanus" and rec.get("d") == 250 and rec.get("len") == 15000
       and rec.get("sp") == 150 and rec.get("st") == "on_the_path" and "loc" not in rec,
       f"plat: travelling, with the way done in thousandths and the speed in km/s: {rec}")
@@ -5782,6 +5738,57 @@ guest.admin = False
 check(r and r["l"] == ADMINS_ONLY and r_cheat and r_cheat["l"] == ADMINS_ONLY and r_none and r_none["l"] == ADMINS_ONLY,
       f"multiplayer: a player who isn't an admin (or no player) runs no console command from Zenith: {r} {r_cheat} {r_none}")
 check(r_admin and r_admin["l"] == ["2.1.23"], f"multiplayer: an admin's command runs: {r_admin}")
+check(r.get("na") == 1 and "na" not in r_admin, f"multiplayer: a refused command says so (na), for the debug menu's greyed controls: {r}")
+r_debug = console_from("/f3d-debug speed 4", 21, 9)
+check(r_debug and r_debug.get("na") == 1 and "dbg" not in r_debug and g.game.speed == 1,
+      f"multiplayer: /f3d-debug from a player who isn't an admin changes nothing: {r_debug}")
+# The debug menu's /f3d-debug: time of day, the cycle, speed, pause, teleport; every reply has the state.
+r = console("/f3d-debug", 22)
+check(r and r.get("dbg", {}).get("sp") == 1 and r["dbg"]["s"] == "nauvis" and "x" in r["dbg"] and "sx" in r["dbg"],
+      f"/f3d-debug: the state comes back as dbg: {r}")
+r = console("/f3d-debug daytime 1.25", 23)
+check(abs(g.game.surfaces[1].daytime - 0.25) < 1e-9 and r["dbg"]["dt"] == 0.25, f"/f3d-debug daytime wraps into 0-1: {r}")
+r = console("/f3d-debug freeze on", 24)
+check(g.game.surfaces[1].freeze_daytime and r["dbg"]["fz"] == 1, f"/f3d-debug freeze on: {r}")
+console("/f3d-debug freeze off", 25)
+r = console("/f3d-debug speed 100", 26)
+check(g.game.speed == 16 and r["dbg"]["sp"] == 16, f"/f3d-debug speed is held to 16x at most: {r}")
+r = console("/f3d-debug speed nan", 27)
+check(g.game.speed == 16 and "1 is normal" in r["l"][0], f"/f3d-debug speed: not a number changes nothing: {r}")
+console("/f3d-debug speed 1", 28)
+r = console("/f3d-debug pause on", 29)
+check(g.game.tick_paused and r["dbg"]["pa"] == 1, f"/f3d-debug pause on: {r}")
+console("/f3d-debug pause off", 30)
+check(not g.game.tick_paused, "/f3d-debug pause off")
+# A screenshot's hold: the slowest speed (the bridge still ticks), the speed before back on `hold off`,
+# and by itself after 30 ticks if the client never says.
+console("/f3d-debug speed 2", 33)
+r = console("/f3d-debug hold on", 34)
+check(g.game.speed == 0.01 and r["dbg"]["hd"] == 1 and r["dbg"]["sp"] == 0.01, f"/f3d-debug hold on: the slowest speed: {r}")
+r = console("/f3d-debug hold on", 35)
+check(g.game.speed == 0.01 and r["dbg"]["hd"] == 1, "a second hold on keeps the speed from before")
+r = console("/f3d-debug hold off", 36)
+check(g.game.speed == 2 and r["dbg"]["hd"] == 0, f"/f3d-debug hold off: the speed before is back: {r}")
+console("/f3d-debug hold on", 37)
+tick(31)
+check(g.game.speed == 2 and not g.storage.f3d_hold, "a hold nobody lets go of ends by itself after 30 ticks")
+console("/f3d-debug hold on", 38)
+console("/f3d-debug speed 3", 39)
+tick(1)
+check(g.game.speed == 3 and not g.storage.f3d_hold, "a speed set during the hold is kept, and the hold ends")
+g.game.tick_paused = True
+r = console("/f3d-debug hold on", 40)
+g.game.tick_paused = False
+check(g.game.speed == 3 and not g.storage.f3d_hold and r["dbg"]["hd"] == 0, f"a paused game isn't held (it stays paused): {r}")
+console("/f3d-debug speed 1", 41)
+c = g.storage.f3d.puppet
+home = (c.position.x, c.position.y)
+r = console("/f3d-debug teleport 20 -5", 31)
+check(abs(c.position.x - 20) < 1 and abs(c.position.y + 5) < 1 and r["dbg"]["x"] == round(c.position.x * 256),
+      f"/f3d-debug teleport moves the character: {r} {c.position.x},{c.position.y}")
+r = console("/f3d-debug teleport 1e99 0", 32)
+check("tiles on the character's surface" in r["l"][0], f"/f3d-debug teleport refuses wild numbers: {r}")
+c.teleport(lua.table_from({"x": home[0], "y": home[1]}))
 check(console("/version", 20)["l"] == ["2.1.23"], "multiplayer: from the server's own machine the bridge's character's commands run")
 # The mod's own commands typed into Factorio's console by a player who isn't an admin.
 F.printed = lua.table_from([])
@@ -5868,6 +5875,34 @@ window.destroy()
 tick(30)
 mg = of_type(take(), "mgui")
 check(mg and mg[-1]["ids"] == [by_root["top"]["i"]] and mg[-1]["l"] == [], f"mgui: a closed window leaves the list: {mg}")
+# A client not drawing mods' windows (hello mg 0) costs no server time: they aren't read or sent.
+# One that doesn't say gets them, as older clients always did.
+lua.execute("""
+function F_watch_top()
+  local real = F.player_gui.top
+  F_top_reads = 0
+  F.player_gui.top = setmetatable({}, { __index = function(_, k) F_top_reads = F_top_reads + 1; return real[k] end })
+  return function() F.player_gui.top = real end
+end
+""")
+unwatch = g.F_watch_top()
+send({"t": "hello", "v": 1, "sid": "sp", "w": 1, "mg": 0})
+tick(31)
+off = of_type(take(), "mgui")
+check(off and off[-1]["ids"] == [] and off[-1]["l"] == [] and g.F_top_reads == 0,
+      f"mgui: a client saying mg 0 is told its windows are gone, and they aren't read: {off} ({g.F_top_reads} reads)")
+tick(61)
+check(not of_type(take(), "mgui") and g.F_top_reads == 0, f"mgui: and then nothing is read or sent ({g.F_top_reads} reads)")
+unwatch()
+send({"t": "hello", "v": 1, "sid": "sp", "w": 1, "mg": 1})
+tick(31)
+check([m for m in of_type(take(), "mgui") if m["l"] and m["l"][0]["i"] == by_root["top"]["i"]], "mgui: turned on (mg 1), the windows are sent again")
+send({"t": "hello", "v": 1, "sid": "sp", "w": 1, "mg": 0})
+tick(31)
+take()
+send({"t": "hello", "v": 1, "sid": "sp", "w": 1})
+tick(31)
+check([m for m in of_type(take(), "mgui") if m["l"] and m["l"][0]["i"] == by_root["top"]["i"]], "mgui: a hello without mg gets them, as before")
 
 # Informatron's buttons (mod_gui.lua PRESSERS): the bridge presses them through Informatron's remote
 # interface (owner: clicking its window from Zenith missed nearly every time), and its page text wraps
@@ -6209,6 +6244,923 @@ if kept:
     check(quick.get((0, 0), {}).get("same") is not None and all(quick.get((x, 40), {}).get("none") for x in (40, 41, 42, 43))
           and quick.get((1, 0), {}).get("tiles"),
           f"a kept chunk and ungenerated ones don't wait behind the one chunk read: {sorted(quick)}")
+
+# A belt runs all the time: only one a network switches off stands still, and only one with a wire
+# or a logistic condition is looked at (belt_switch.lua), `st` state 5, 0 running again.
+send({"t": "hello", "v": 1, "sid": "old-saves", "w": 1, "z": 1, "bl": 1})
+wired_belt = spawn("transport-belt", 14.5, 16.5, force="player")
+plain_belt = spawn("transport-belt", 15.5, 16.5, force="player")
+logistic_belt = spawn("transport-belt", 16.5, 16.5, force="player")
+belt_const = spawn("constant-combinator", 14.5, 18.5, force="player")
+wired_belt.get_wire_connector(ids.circuit_red, True).connect_to(belt_const.get_wire_connector(ids.circuit_red, True))
+logistic_belt.get_or_create_control_behavior().connect_to_logistic_network = True
+for e in (wired_belt, plain_belt, logistic_belt, belt_const):
+    F["raise"]("script_raised_built", lua.table_from({"entity": e}))
+tick(2)
+take()
+watched = g.storage.f3d.beltw
+check(watched and watched[wired_belt.unit_number] and watched[logistic_belt.unit_number] and not watched[plain_belt.unit_number],
+      "a belt with a wire or a logistic condition is watched, a plain one isn't")
+
+
+def belt_rows(ticks=35):
+    tick(ticks)
+    send({"t": "hello", "v": 1, "sid": "old-saves", "w": 1, "z": 1, "bl": 1})
+    rows = [v for m in of_type(take(), "st") for v in m["l"]]
+    return dict(zip(rows[0::2], rows[1::2]))
+
+
+quiet = belt_rows()
+check(wired_belt.unit_number not in quiet and plain_belt.unit_number not in quiet, f"belts running say nothing: {quiet}")
+wired_belt.status = g.defines.entity_status.disabled_by_control_behavior
+logistic_belt.status = g.defines.entity_status.disabled_by_control_behavior
+rows = belt_rows()
+check(rows.get(wired_belt.unit_number) == 5 and rows.get(logistic_belt.unit_number) == 5 and plain_belt.unit_number not in rows,
+      f"switched off: st 5 for the belts that went off: {rows}")
+rows = belt_rows()
+check(wired_belt.unit_number not in rows, f"and only once: {rows}")
+retold = {}
+for _ in range(20):
+    retold.update(belt_rows())
+check(retold.get(wired_belt.unit_number) == 5, f"told again now and then, for a client that forgot: {retold}")
+wired_belt.status = g.defines.entity_status.working
+rows = belt_rows()
+check(rows.get(wired_belt.unit_number) == 0, f"running again: st 0: {rows}")
+logistic_belt.get_control_behavior().connect_to_logistic_network = False
+F["raise"]("script_raised_built", lua.table_from({"entity": logistic_belt}))
+tick(1)
+rows = belt_rows(1)
+check(rows.get(logistic_belt.unit_number) == 0 and not g.storage.f3d.beltw[logistic_belt.unit_number],
+      f"a belt off that nothing can switch off any more is told it runs, and forgotten: {rows}")
+# A wire added with no event: the combinator's next look finds it, and the belt at its end is watched.
+late_belt = spawn("transport-belt", 17.5, 16.5, force="player")
+F["raise"]("script_raised_built", lua.table_from({"entity": late_belt}))
+tick(2)
+check(not g.storage.f3d.beltw[late_belt.unit_number], "a belt with no wire yet isn't watched")
+late_belt.get_wire_connector(ids.circuit_red, True).connect_to(belt_const.get_wire_connector(ids.circuit_red, True))
+send({"t": "hello", "v": 1, "sid": "old-saves", "w": 1, "z": 1, "bl": 1})
+tick(40)
+check(g.storage.f3d.beltw[late_belt.unit_number], "a wire put on it later, with no event, is noticed from its combinator")
+take()
+late_belt.destroy()
+wired_belt.destroy()
+plain_belt.destroy()
+logistic_belt.destroy()
+belt_const.destroy()
+send({"t": "hello", "v": 1, "sid": "old-saves", "w": 1, "z": 1, "bl": 1})
+tick(70)
+check(next(iter(g.storage.f3d.beltw.items()), None) is None, "a watched belt gone is forgotten after a round")
+take()
+
+# Where a silo's rocket is, for the doors and its rise (H16).
+_pp = puppet.position
+silo_p = spawn("rocket-silo", _pp.x + 14.5, _pp.y + 0.5, force="player")
+_rss = g.defines.rocket_silo_status
+_states = []
+for _status in (_rss.doors_opening, _rss.rocket_rising, _rss.rocket_ready, _rss.doors_closing, _rss.building_rocket):
+    silo_p.rocket_silo_status = _status
+    tick(61)
+    _sent = [m["l"] for m in of_type(take(), "st")]
+    _states.append(next((l[i + 1] for l in _sent for i in range(0, len(l), 2) if l[i] == silo_p.unit_number), None))
+check(_states == [2, 3, 4, 5, 1], f"a silo's st says where its rocket is: doors opening 2, rising 3, up 4, closing 5, building 1: {_states}")
+silo_p.destroy()
+
+# A save made with another version of the bridge keeps its clients and their half-done jobs, in that
+# version's shape: on loading it they are dropped, so the next hello starts clean. What belongs to
+# the game stays.
+PORT_OLD = 34277
+F.multiplayer = True
+send({"t": "hello", "v": 1, "sid": "old-bridge", "w": 1, "z": 1, "bl": 1})
+send({"t": "hello", "v": 1, "sid": "old-extra", "w": 0}, port=PORT_OLD)
+tick(3)
+F.take_sent()
+st = g.storage.f3d
+old_unit, extra_unit = st.puppet.unit_number, g.storage.f3d_extra[PORT_OLD].puppet.unit_number
+st.techs_job = "half a job from an older bridge"
+st.bi = lua.table_from({"round": {"si": 1}})
+st.hs_stage = 2
+st.quickbar = lua.table_from({"page": 3, "sel": 0, "items": {}})
+F.on_config(lua.table_from({"mod_changes": {"another-mod": {"old_version": "1.0.0", "new_version": "1.1.0"}}}, recursive=True))
+check(st.client is not None and st.techs_job is not None and g.storage.f3d_extra[PORT_OLD] is not None,
+      "another mod's update leaves the bridge's clients and jobs alone")
+F.on_config(lua.table_from({"mod_changes": {"factorio-3d-bridge": {"old_version": "0.1.3", "new_version": "0.1.3"}}}, recursive=True))
+check(st.client is not None and st.techs_job is not None, "the same version of the bridge leaves them alone")
+F.on_config(lua.table_from({"mod_changes": {"factorio-3d-bridge": {"old_version": "0.1.1", "new_version": "0.1.3"}}}, recursive=True))
+check(st.client is None and st.techs_job is None and st.bi is None and st.hs_stage is None,
+      f"a new version of the bridge drops the save's client and half-done jobs: {st.client} {st.techs_job} {st.bi} {st.hs_stage}")
+check(st.puppet.unit_number == old_unit and st.quickbar.page == 3 and st.outbox is not None and st.subs is not None,
+      "and keeps the character and the quickbar, with the tables every client needs")
+check(len(g.storage.f3d_extra) == 0 and g.storage.f3d_parked["old-extra"].unit_number == extra_unit,
+      f"other clients are dropped too, their characters waiting for them: {len(g.storage.f3d_extra)}")
+tick(5)
+check(not list(F.take_sent().values()), "nothing is sent until a client says hello")
+send({"t": "hello", "v": 1, "sid": "old-bridge", "w": 1, "z": 1, "bl": 1})
+tick(2)
+fresh = take()
+welcomes = of_type(fresh, "welcome")
+check(welcomes and welcomes[0]["r"] == 1, f"the client's next hello gets a fresh handshake, numbered from 1: {welcomes}")
+F.multiplayer = False
+
+# The barrier round each step (barrier.lua): a step that fails stops only itself, says so in the log
+# and /f3d-status, runs once a tick whether or not it is being profiled, and writes nothing of its
+# own to storage.
+lua.execute("""
+function F_upvalue(fn, name, depth)
+  depth = depth or 4
+  for i = 1, 255 do
+    local n, v = debug.getupvalue(fn, i)
+    if not n then
+      return nil
+    end
+    if n == name then
+      return v
+    end
+    if type(v) == "function" and depth > 0 then
+      local found = F_upvalue(v, name, depth - 1)
+      if found ~= nil then
+        return found
+      end
+    end
+  end
+end
+function F_fail_step(name)
+  for _, step in ipairs(F_upvalue(F.handlers[defines.events.on_tick], "STEPS")) do
+    if step[1] == name then
+      local before = step[2]
+      F_step_calls = 0
+      step[2] = function()
+        F_step_calls = F_step_calls + 1
+        storage.f3d.half_done = (storage.f3d.half_done or 0) + 1
+        error("boom in the step")
+      end
+      return function() step[2] = before end
+    end
+  end
+end
+function F_fail_event(name)
+  local wrapper = F.handlers[defines.events[name]]
+  for i = 1, 255 do
+    local n, v = debug.getupvalue(wrapper, i)
+    if not n then
+      return nil
+    end
+    if n == "handler" then
+      debug.setupvalue(wrapper, i, function() error("boom in the event") end)
+      return function() debug.setupvalue(wrapper, i, v) end
+    end
+  end
+end
+""")
+barrier = lua.eval('package.loaded["scripts.barrier"]')
+barrier.rethrow = False
+send({"t": "hello", "v": 1, "sid": "old-bridge", "w": 1, "z": 1, "bl": 1})
+tick(20)
+take()
+F.printed = lua.table()
+st = g.storage.f3d
+restore_step = g.F_fail_step("tracker")
+send({"t": "hello", "v": 1, "sid": "old-bridge", "w": 1, "z": 1, "bl": 1})
+tick(30)
+msgs = take()
+logs = [str(p) for p in F.printed.values()]
+errors = [p for p in logs if "ERROR in step 'tracker'" in p]
+check(g.F_step_calls == 30 and st.half_done == 30,
+      f"a failing step runs once a tick, and what it wrote before failing stays: {g.F_step_calls} {st.half_done}")
+check(g.storage.f3d.client.port == CLIENT_PORT and of_type(msgs, "me"), "the game goes on: the steps after it still run for the client")
+check(len(errors) == 1 and "boom in the step" in errors[0] and "tick" in errors[0],
+      f"a failing step is logged with its name and error, once for the first 600 ticks: {errors}")
+check(any("Bridge error in tracker" in m.get("text", "") for m in of_type(msgs, "msg")), "and the client is told")
+keys_before = (set(g.storage.keys()), set(st.keys()))
+barrier.call("direct", lua.eval('function() error("boom") end'))
+check((set(g.storage.keys()), set(st.keys())) == keys_before, "the barrier adds nothing to storage")
+take()
+F.printed = lua.table()
+F.command(lua.table_from({"name": "f3d-status"}))
+status = [str(p) for p in F.printed.values()]
+check(any("ERROR: step 'tracker' failed 30 time(s)" in p and "boom in the step" in p for p in status),
+      f"/f3d-status lists a failing step: {status[:3]}")
+F.printed = lua.table()
+for _ in range(11):
+    send({"t": "hello", "v": 1, "sid": "old-bridge", "w": 1, "z": 1, "bl": 1})
+    tick(60)
+take()
+errors = [str(p) for p in F.printed.values() if "ERROR in step 'tracker'" in str(p)]
+check(len(errors) == 1 and "more times" in errors[0], f"it keeps being logged, at most every 600 ticks: {errors}")
+# Under /f3d-profile and a trace at once: still once a tick.
+g.F_step_calls = 0
+profile_mod = lua.eval('package.loaded["scripts.profile"]')
+F.commands["f3d-profile"](lua.table_from({"name": "f3d-profile"}))
+profile_mod.trace(3)
+send({"t": "hello", "v": 1, "sid": "old-bridge", "w": 1, "z": 1, "bl": 1})
+tick(3)
+profile_mod.trace(0)
+F.commands["f3d-profile"](lua.table_from({"name": "f3d-profile"}))
+check(g.F_step_calls == 3, f"profiling and tracing don't run a failing step twice: {g.F_step_calls} calls in 3 ticks")
+restore_step()
+st.half_done = None
+# An event handler: the same wall, whichever client it is for.
+restore_event = g.F_fail_event("on_built_entity")
+F.printed = lua.table()
+F["raise"]("on_built_entity", lua.table_from({}))
+check(any("ERROR in step 'on_built_entity'" in str(p) and "boom in the event" in str(p) for p in F.printed.values()),
+      f"a failing event handler is caught and logged by its event's name: {list(F.printed.values())}")
+restore_event()
+# live_check's barrier check forgets the steps it failed on purpose; the others stay listed.
+barrier.forget("on_built_entity")
+barrier.forget("never-failed")
+F.printed = lua.table()
+F.command(lua.table_from({"name": "f3d-status"}))
+listed = set(re.findall(r"ERROR: step '([^']+)'", " ".join(str(p) for p in F.printed.values())))
+check(listed == {"tracker", "direct"}, f"barrier.forget drops one step from /f3d-status and keeps the rest: {listed}")
+barrier.rethrow = True
+take()
+
+# --- changes made without events -----------------------------------------------------------
+# A script's create_entity without raise_built and destroy() without raise_destroy raise no event:
+# the chunks near the client are counted in turn (world.lua count_check), and one whose count
+# changed unseen is sent again (trees cleared by a script stayed drawn, filming the B-roll).
+send({"t": "sub", "c": []})
+tick(2)
+send({"t": "sub", "c": [[0, 0], [1, 0]]})
+tick(40)
+take()
+quiet = spawn("tree-01", 40.5, 9.5)
+tick(16)
+resent = [m for m in take() if m["t"] in ("chunk", "ents") and (m["cx"], m["cy"]) == (1, 0)]
+check(any(m["t"] == "chunk" and m.get("tiles") for m in resent)
+      and any(rec[1] == eid["tree-01"] and rec[2] == fixed(40.5) for m in resent if m["t"] == "ents" for rec in m["e"]),
+      f"a tree made by a script without an event: its chunk is counted and sent again with it: {[m['t'] for m in resent]}")
+quiet.destroy()
+tick(16)
+resent = [m for m in take() if m["t"] in ("chunk", "ents") and (m["cx"], m["cy"]) == (1, 0)]
+check(any(m["t"] == "chunk" for m in resent)
+      and not any(rec[1] == eid["tree-01"] for m in resent if m["t"] == "ents" for rec in m["e"]),
+      f"and destroyed without raise_destroy: its chunk is sent again without it: {[m['t'] for m in resent]}")
+tick(40)
+check(not [m for m in take() if m["t"] == "chunk"], "a chunk whose count holds isn't sent again")
+built = spawn("tree-01", 41.5, 9.5)
+F["raise"]("script_raised_built", lua.table_from({"entity": built}))
+tick(16)
+after_event = take()
+check(of_type(after_event, "add") and not of_type(after_event, "chunk"),
+      "an entity made with an event is sent as `add`, and the count starts again from there (no resend)")
+F["raise"]("script_raised_destroy", lua.table_from({"entity": built}))
+built.destroy()
+tick(16)
+after_event = take()
+check(of_type(after_event, "del") and not of_type(after_event, "chunk"), "and removed with one, as `del`, no resend")
+
+# --- belts for a client that simulates them (`bs` in its hello, belt_sim.lua) ----------------------
+def bs_of(msgs):
+    """{lm: {key: [11 numbers]}, sl: {key: (tick, [[uid, item, pos, stack], ...])}, pc: {key: [tick, n,
+    front, back]}, dl, of, qu, heads: [(k, fx, fy, fr)]} over the bs messages in msgs."""
+    out = {"lm": {}, "sl": {}, "pc": {}, "pu": {}, "ew": {}, "sh": {}, "dl": [], "of": [], "qu": [], "heads": []}
+    for m in of_type(msgs, "bs"):
+        out["heads"].append((m["k"], m["fx"], m["fy"], m["fr"]))
+        lm = m.get("lm", [])
+        for i in range(0, len(lm), 12):
+            out["lm"][lm[i]] = lm[i + 1:i + 12]
+        sl, i = m.get("sl", []), 0
+        while i < len(sl):
+            n = sl[i + 2]
+            out["sl"][sl[i]] = (sl[i + 1], [sl[i + 3 + 4 * j:i + 7 + 4 * j] for j in range(n)])
+            i += 3 + 4 * n
+        pc = m.get("pc", [])
+        for i in range(0, len(pc), 5):
+            out["pc"][pc[i]] = pc[i + 1:i + 5]
+        ew = m.get("ew", [])
+        for i in range(0, len(ew), 4):
+            out["ew"][ew[i]] = ew[i + 1:i + 4]
+        pu = m.get("pu", [])
+        for i in range(0, len(pu), 3):
+            out["pu"][pu[i]] = pu[i + 1:i + 3]
+        sh = m.get("sh", [])
+        for i in range(0, len(sh), 2):
+            out["sh"][sh[i]] = sh[i + 1]
+        out["dl"] += m.get("dl", [])
+        out["of"] += m.get("of", [])
+        out["qu"] += m.get("qu", [])
+    return out
+
+
+bs_mod = lua.eval('package.loaded["scripts.belt_sim"]')
+bx, by = 300.5, 300.5
+sb1 = spawn("transport-belt", bx, by, force="player", direction=4)
+sb2 = spawn("transport-belt", bx + 1, by, force="player", direction=4)
+sb3 = spawn("transport-belt", bx + 2, by, force="player", direction=4)
+F.link_belts(sb1, sb2)
+F.link_belts(sb2, sb3)
+s_ins = spawn("inserter", bx + 1, by + 1, force="player")
+s_ins.pickup_target = sb2  # sb2 is a pickup belt, sb1 the belt behind it: both watched; sb3 not
+s_drop = spawn("inserter", bx + 1, by - 1, force="player")
+s_drop.drop_target = sb2  # and a drop belt: s_drop holds a plate till it puts it there
+F.set_hand(s_drop, bx + 1, by - 1, "iron-plate")
+s_in = spawn("underground-belt", bx + 4, by, force="player", direction=4, type="input")
+s_out = spawn("underground-belt", bx + 7, by, force="player", direction=4, type="output")
+F.pair_undergrounds(s_in, s_out)
+s_wired = spawn("transport-belt", bx, by + 3, force="player", direction=4)
+s_lane = spawn("lane-splitter", bx + 3, by + 3, force="player", direction=4)
+F.belt_behaviors[s_wired] = lua.table_from({"enabled": True})
+# A belt leading out of the square: sx (ring 5) feeds sy, 20 tiles out (the square is 16).
+sx = spawn("transport-belt", bx + 5, by + 6, force="player", direction=4)
+sy = spawn("transport-belt", bx + 20, by + 6, force="player", direction=4)
+F.link_belts(sx, sy)
+F.put_on_belt(sx, 1, "iron-plate", 0.5, 8105)
+# A belt fed from outside the square: fz, 20 tiles out, feeds fw (ring 9).
+fz = spawn("transport-belt", bx + 20, by + 9, force="player", direction=12)
+fw = spawn("transport-belt", bx + 5, by + 9, force="player", direction=12)
+F.link_belts(fz, fw)
+F.put_on_belt(fw, 1, "iron-plate", 0.5, 8120)
+# A packed run over three plain belts (four items a lane, a gap apart, from a quarter gap in).
+runs = [spawn("transport-belt", bx - 5 + k, by - 5, force="player", direction=4) for k in range(3)]
+F.link_belts(runs[0], runs[1])
+F.link_belts(runs[1], runs[2])
+for k, e in enumerate(runs):
+    for j in range(4):
+        F.put_on_belt(e, 1, "iron-plate", 0.125 + 0.25 * j, 8130 + 4 * k + j)
+F.put_on_belt(s_lane, 1, "iron-plate", 0.25, 8150)  # a lane splitter's input holding an item (sh below)
+F.put_on_belt(sb1, 1, "iron-plate", 0.5, 8101)
+F.put_on_belt(sb2, 1, "iron-plate", 0.25, 8102)
+F.put_on_belt(sb2, 1, "iron-plate", 0.75, 8103, None, "rare")
+F.put_on_belt(sb3, 2, "copper-plate", 0.5, 8104)
+u1, u2, u3, ui, uo, uw = (int(e.unit_number) for e in (sb1, sb2, sb3, s_in, s_out, s_wired))
+ul = int(s_lane.unit_number)
+ux, uy = int(sx.unit_number), int(sy.unit_number)
+bs_mod.pc_every = 1000
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bs": 1})
+send({"t": "focus", "x": fixed(bx), "y": fixed(by), "r": 48})
+send({"t": "bfar", "r": 0, "n": 16, "m": 0})
+tick(14)
+first_msgs = take()
+first = bs_of(first_msgs)
+keys = {u * 8 + i for u in (u1, u2, u3, uw) for i in (1, 2)} | {u * 8 + i for u in (ui, uo) for i in (1, 2, 3, 4)}
+check(not of_type(first_msgs, "bi") and keys <= set(first["lm"]) and keys <= set(first["sl"]),
+      f"bs: the first load sends every lane's meta (lm) and items (sl): missing lm {sorted(keys - set(first['lm']))}, sl {sorted(keys - set(first['sl']))}")
+check(first["heads"] and first["heads"][-1][1:] == (fixed(bx), fixed(by), 16),
+      f"bs: fx, fy, fr: the square every lane of which is loaded: {first['heads']}")
+t2, items2 = first["sl"].get(u2 * 8 + 1, (None, []))
+check([it[0] for it in items2] == [8102, 8103] and items2[0][1] == iid["iron-plate"] and items2[0][2] == 64 and items2[0][3] == 1
+      and isinstance(t2, int) and t2 > 0 and first["qu"] == [8103, "rare"],
+      f"bs sl: a lane's items front first, [uid, item, position (1/256), stack], with the tick it was read; qu: {t2} {items2} {first['qu']}")
+meta = first["lm"].get(u2 * 8 + 1, [])
+check(meta[:3] == [1, 256, 8] and meta[-1] == 0, f"bs lm: kind 1 (straight), length 256, step (1/256 a tick), next 0: {meta}")
+# Depth first: sb3 (ring 2) is loaded before sb2 (ring 1) that feeds it, so sb2 never leads out.
+check(first["sl"].get(u3 * 8 + 1, (1 << 60,))[0] <= first["sl"].get(u2 * 8 + 1, (0,))[0],
+      f"bs: a belt is loaded after the belts it feeds: sb3 at {first['sl'].get(u3 * 8 + 1, (None,))[0]}, sb2 at {first['sl'].get(u2 * 8 + 1, (None,))[0]}")
+# A belt feeding one outside the square leads out: its lanes' next is -1.
+check(first["lm"].get(ux * 8 + 1, [0] * 11)[-1] == -1 and first["lm"].get(ux * 8 + 2, [0] * 11)[-1] == -1
+      and uy * 8 + 1 not in first["lm"],
+      f"bs lm: a lane leading out of the square has next -1: {first['lm'].get(ux * 8 + 1)}")
+# (The older checks below look at single lanes: the reads round them come back at the end.)
+bs_mod.tails = False
+bs_mod.settle_around = False
+lm_of = lambda k: first["lm"].get(k, [0] * 11)
+check(lm_of(ui * 8 + 1)[0] == 3 and lm_of(ui * 8 + 1)[-1] == ui * 8 + 3 and lm_of(ui * 8 + 3)[0] == 4 and lm_of(ui * 8 + 3)[-1] == uo * 8 + 1
+      and lm_of(uo * 8 + 3)[0] == 8 and lm_of(uo * 8 + 1)[-1] == 0,
+      f"bs lm: an entrance's lines 1-2 go on into its hidden 3-4, those into the exit's 1-2: {[lm_of(k) for k in (ui * 8 + 1, ui * 8 + 3, uo * 8 + 1, uo * 8 + 3)]}")
+check([lm_of(ul * 8 + i)[0] for i in (1, 2, 3, 4)] == [5, 5, 6, 6],
+      f"bs lm: a lane splitter's lines 1-2 are splitter inputs (5), 3-4 outputs (6): {[lm_of(ul * 8 + i) for i in (1, 2, 3, 4)]}")
+# A watched lane that changed is sent again with its read tick; an unwatched one isn't.
+F.move_on_belt(sb2, 1, 8102, None)
+F.move_on_belt(sb3, 2, 8104, 0.25)
+tick(12)
+changed = bs_of(take())
+check(u2 * 8 + 1 in changed["sl"] and [it[0] for it in changed["sl"][u2 * 8 + 1][1]] == [8103]
+      and changed["sl"][u2 * 8 + 1][0] > t2 and u3 * 8 + 2 not in changed["sl"] and u2 * 8 + 1 not in changed["lm"],
+      f"bs: a watched lane that changed is sent (sl, its tick, no lm), an unwatched one isn't: {sorted(changed['sl'])}")
+# A watched lane whose items all moved on alike, nothing coming or going, isn't sent: the client
+# simulates that.
+F.move_on_belt(sb1, 1, 8101, 0.375)
+tick(6)
+flowed = bs_of(take())
+check(u1 * 8 + 1 not in flowed["sl"], f"bs: a watched lane that only flowed on isn't sent: {sorted(flowed['sl'])}")
+# Drift checks: every unwatched lane's count, front and back about every pc_every updates.
+bs_mod.pc_every = 1
+tick(12)
+drift = bs_of(take())
+bs_mod.pc_every = 1000
+check(drift["pc"].get(u3 * 8 + 2, [0])[1:] == [1, 64, 64] and drift["pc"].get(u3 * 8 + 1, [0])[1:] == [0, -1, -1],
+      f"bs pc: [tick, count, front, back] for lanes not watched (-1, -1 when empty): {drift['pc'].get(u3 * 8 + 2)} {drift['pc'].get(u3 * 8 + 1)}")
+check(drift["pu"].get(u3 * 8 + 2) == [8104, 8104] and u3 * 8 + 1 not in drift["pu"],
+      f"bs pu: a packed lane's drift check carries its front and back items' ids, an empty one none: {drift['pu']}")
+# pc_ids: those ids even when the accuracy extras' share (extra_units) has no room (off: only with room).
+bs_mod.pc_every = 1
+saved_extra = bs_mod.extra_units
+bs_mod.extra_units = 0
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "pc_ids on"}))
+tick(12)
+drift_on = bs_of(take())
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "pc_ids default"}))
+tick(12)
+drift_off = bs_of(take())
+bs_mod.extra_units = saved_extra
+bs_mod.pc_every = 1000
+check(drift_on["pu"].get(u3 * 8 + 2) == [8104, 8104] and u3 * 8 + 2 in drift_off["pc"],
+      f"bs pc_ids: a packed lane's drift check carries its ids with no extra share left: {drift_on['pu']} {drift_off['pc'].get(u3 * 8 + 2)}")
+# drift_watched: a watched belt's lanes get drift checks too (off: none, as before).
+bs_mod.pc_every = 1
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "drift_watched on"}))
+tick(12)
+take()  # (an update's work list is made on the tick after the one before is sent)
+tick(12)
+dw_on = bs_of(take())
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "drift_watched off"}))
+tick(12)
+take()
+tick(12)
+dw_off = bs_of(take())
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "drift_watched default"}))
+bs_mod.pc_every = 1000
+check(uw * 8 + 1 in dw_on["pc"] and uw * 8 + 1 not in dw_off["pc"] and u3 * 8 + 2 in dw_off["pc"],
+      f"bs drift_watched: a watched lane's drift check is sent with it on, not off; an unwatched one's either way: "
+      f"{dw_on['pc'].get(uw * 8 + 1)} {dw_off['pc'].get(uw * 8 + 1)}")
+# bre: lanes the client has otherwise are read in full (with their meta) in the next update made.
+# (Each update's work list is made on the tick after the one before is sent: a change shows the
+# update after.)
+send({"t": "bre", "l": [u3 * 8 + 2]})
+tick(12)
+again = bs_of(take())
+check([it[0] for it in again["sl"].get(u3 * 8 + 2, (0, []))[1]] == [8104] and u3 * 8 + 2 in again["lm"],
+      f"bs bre: a lane asked for again is sent in full with its meta: {again['sl'].get(u3 * 8 + 2)}")
+check(again["lm"].get(u3 * 8 + 2) == first["lm"].get(u3 * 8 + 2),
+      f"bs bre: the meta sent again (from the lane's kept meta, perfbridge2) is the first load's: {again['lm'].get(u3 * 8 + 2)} vs {first['lm'].get(u3 * 8 + 2)}")
+said_counts = bs_mod.option_command("counts")
+check("bs counts" in str(said_counts[1]) and "read=" in str(said_counts[1]), f"/f3d-bs counts says what was read and checked: {said_counts[1]}")
+check("extra_spread on" in str(bs_mod.option_command("")[1]), "/f3d-bs lists extra_spread (on)")
+# A belt switched off by the circuit network (of), and on again.
+s_wired.status = g.defines.entity_status.disabled_by_control_behavior
+tick(12)
+off = bs_of(take())["of"]
+s_wired.status = g.defines.entity_status.working
+tick(12)
+on = bs_of(take())["of"]
+check(off == [uw, 1] and on == [uw, 0], f"bs of: a wired belt switched off, then on: {off} {on}")
+# A lane leading out is checked on every update's tick and sent when it changed at all, flowing on
+# too (the client's front there moves only where the bridge's reads say).
+F.move_on_belt(sx, 1, 8105, 0.25)
+tick(6)
+edge = bs_of(take())
+heads = edge["heads"]
+check(edge["ew"].get(ux * 8 + 1) == [heads[-1][0] if heads else None, 8105, 64] and ux * 8 + 1 not in edge["sl"],
+      f"bs ew: a lane leading out that only flowed sends its wall, read on the update's tick: {edge['ew']} {heads}")
+# Something came onto it: read in full (sl).
+F.put_on_belt(sx, 1, "copper-plate", 0.75, 8107)
+tick(6)
+edge2 = bs_of(take())
+check([it[0] for it in edge2["sl"].get(ux * 8 + 1, (None, []))[1]] == [8105, 8107],
+      f"bs: a lane leading out that something came onto is sent in full: {edge2['sl'].get(ux * 8 + 1)} {edge2['ew']}")
+# A lane fed from outside what is sent: checked on every update's tick with no quiet spells, and sent
+# whenever it changed, its items only moving on too (what comes in at its back is news to the client).
+uz, uf = int(fz.unit_number), int(fw.unit_number)
+check(lua.eval(f"storage.f3d.bs.iset[{uf}]") and not lua.eval(f"storage.f3d.bs.iset[{uz}]"),
+      "bs: a belt fed by one outside the square is fed from outside")
+tick(6 * (bs_mod.quiet_after + 3))
+take()
+F.move_on_belt(fw, 1, 8120, 0.375)
+tick(6)
+fed = bs_of(take())
+fed_heads = fed["heads"]
+check([it[0] for it in fed["sl"].get(uf * 8 + 1, (None, []))[1]] == [8120]
+      and fed["sl"][uf * 8 + 1][0] == (fed_heads[-1][0] if fed_heads else None),
+      f"bs: a lane fed from outside that only flowed on is sent, read on the update's tick: {fed['sl'].get(uf * 8 + 1)} {fed_heads}")
+F.put_on_belt(fw, 1, "copper-plate", 0.875, 8121)
+tick(6)
+fed2 = bs_of(take())
+check([it[0] for it in fed2["sl"].get(uf * 8 + 1, (None, []))[1]] == [8120, 8121],
+      f"bs: what came in at the back of a lane fed from outside is sent: {fed2['sl'].get(uf * 8 + 1)}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "feed_edges off"}))
+tick(6 * (bs_mod.quiet_after + 3))
+take()
+F.move_on_belt(fw, 1, 8120, 0.25)
+F.move_on_belt(fw, 1, 8121, 0.75)
+tick(6)
+fed_off = bs_of(take())
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "feed_edges on"}))
+check(uf * 8 + 1 not in fed_off["sl"], f"bs: feed_edges off: a quiet lane fed from outside that only flowed isn't sent (as before): {fed_off['sl'].get(uf * 8 + 1)}")
+# bre: a lane in a packed run is read with the run's belts, ahead and behind, on the same tick; two
+# lanes asked on belts next to each other are read on one tick.
+ur = [int(e.unit_number) for e in runs]
+send({"t": "bre", "l": [ur[1] * 8 + 1]})
+tick(12)
+run = bs_of(take())
+t_run = run["sl"].get(ur[1] * 8 + 1, (None,))[0]
+check(t_run and all(run["sl"].get(u * 8 + 1, (None,))[0] == t_run for u in ur)
+      and [it[0] for it in run["sl"][ur[2] * 8 + 1][1]] == [8138, 8139, 8140, 8141],
+      f"bs bre: a lane is read with the packed run it belongs to on the same tick: {[run['sl'].get(u * 8 + 1) for u in ur]}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "line_rereads off"}))
+send({"t": "bre", "l": [ur[1] * 8 + 1]})
+tick(12)
+alone = bs_of(take())
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "line_rereads on"}))
+check(ur[1] * 8 + 1 in alone["sl"] and ur[0] * 8 + 1 not in alone["sl"] and ur[2] * 8 + 1 not in alone["sl"],
+      f"bs: line_rereads off: a bre lane is read alone (as before): {sorted(alone['sl'])}")
+bs_mod.run_belts = 0
+send({"t": "bre", "l": [ur[0] * 8 + 1, ur[2] * 8 + 1, ur[1] * 8 + 2]})
+tick(12)
+grouped = bs_of(take())
+bs_mod.run_belts = 6
+t_g = [grouped["sl"].get(k, (None,))[0] for k in (ur[0] * 8 + 1, ur[2] * 8 + 1, ur[1] * 8 + 2)]
+check(t_g[0] and t_g[0] == t_g[1] == t_g[2],
+      f"bs bre: lanes asked on belts next to each other are read on one tick: {t_g}")
+# bre_cap: at most that many asked lanes an update, the rest in the next.
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "bre_cap 2"}))
+bs_mod.run_belts = 0
+send({"t": "bre", "l": [ur[0] * 8 + 1, ur[1] * 8 + 1, ur[2] * 8 + 1]})
+tick(18)
+capped_bre = bs_of(take())
+bs_mod.run_belts = 6
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "bre_cap default"}))
+t_c = sorted(capped_bre["sl"].get(u * 8 + 1, (None,))[0] or 0 for u in ur)
+check(t_c[0] > 0 and t_c[0] == t_c[1] < t_c[2],
+      f"bs bre_cap: asked lanes over the cap wait for the next update: {t_c}")
+# The client's Belt updates (bfar m, the old cap) don't bound the square: every belt within n is sent.
+lua.execute("storage.f3d.bi_cap = 5 storage.f3d.bs.rescan = true")
+tick(24)
+capped = bs_of(take())
+check(capped["heads"] and capped["heads"][-1][3] == 16 and not (keys & set(capped["dl"])),
+      f"bs: bfar m doesn't bound the square: {capped['heads'][-1:]} dropped {sorted(keys & set(capped['dl']))}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "full_area off"}))
+tick(24)
+capped_old = bs_of(take())
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "full_area on"}))
+lua.execute("storage.f3d.bi_cap = nil")
+tick(24)
+take()
+check(capped_old["heads"] and capped_old["heads"][-1][3] < 16,
+      f"bs: full_area off: the client's cap bounds the square again (as before): {capped_old['heads'][-1:]}")
+# The bridge's own bound: over it, the square is cut from the outside (fr says so; the lanes past it
+# go, those inside stay); well under it again, it grows back.
+bs_mod.bound, bs_mod.bound_min = 1, 4
+tick(6 * 12)
+cut = bs_of(take())
+cut_fr = cut["heads"][-1][3] if cut["heads"] else None
+inner = {u * 8 + i for u in (u1, u2, u3) for i in (1, 2)}
+check(cut_fr is not None and cut_fr < 16 and uf * 8 + 1 in cut["dl"] and not (inner & set(cut["dl"])),
+      f"bs: over the bound the square is cut from the outside: fr {cut_fr}, dropped {sorted(cut['dl'])[:8]}")
+bs_mod.bound, bs_mod.bound_min = None, 16
+grown_msgs = []
+for _ in range(12):  # (with the hello as keep-alive)
+    send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bs": 1})
+    tick(60)
+    grown_msgs += take()
+grown = bs_of(grown_msgs)
+check(grown["heads"] and grown["heads"][-1][3] == 16 and uf * 8 + 1 in grown["lm"],
+      f"bs: under the bound the square grows back: {grown['heads'][-1:]}")
+# Tails: an inserter put on its drop belt (its hand holds less): the belt is checked at once though
+# quiet, and the belts it feeds are read in the same update (after the input spots' checks).
+# (actor_backoff off: the inserter has stood for a while, so it would be checked an update later.)
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "actor_backoff off"}))
+bs_mod.tails = True
+F.put_on_belt(sb2, 2, "iron-plate", 0.5, 8106)
+F.set_hand(s_drop, bx + 1, by - 0.5, None)
+tick(12)
+tails = bs_of(take())
+t_sb2 = tails["sl"].get(u2 * 8 + 2, (None,))[0]
+check(t_sb2 and tails["sl"].get(u3 * 8 + 1, (None,))[0] == t_sb2 and tails["sl"].get(u3 * 8 + 2, (None,))[0] == t_sb2,
+      f"bs tails: the belt a changed input spot feeds is read on the same tick: {t_sb2} {tails['sl'].get(u3 * 8 + 1)}")
+# Settled: a watched lane unchanged for quiet_after checks after it changed is sent once more, and
+# the belts round it (sb3 it feeds) with it.
+bs_mod.settle_around = True
+tick(6 * (bs_mod.quiet_after + 2))
+settle = bs_of(take())
+t_set = settle["sl"].get(u2 * 8 + 2, (None,))[0]
+check(t_set and t_set > t_sb2 and [it[0] for it in settle["sl"][u2 * 8 + 2][1]] == [8106]
+      and (settle["sl"].get(u3 * 8 + 1, (None,))[0] or 0) >= t_set,
+      f"bs: a watched lane that settled is sent once more, with the belts round it: {settle['sl'].get(u2 * 8 + 2)} {settle['sl'].get(u3 * 8 + 1)}")
+tick(6 * (bs_mod.quiet_after + 2))
+check(u2 * 8 + 2 not in bs_of(take())["sl"], "bs: a settled lane isn't sent again while it stands")
+# actor_backoff: an inserter whose hand stood for a while is checked every other update; when it
+# puts on its quiet belt that is still read within two updates.
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "actor_backoff on"}))
+F.set_hand(s_drop, bx + 1, by - 1, "iron-plate")
+tick(6 * 10)
+take()
+skipped0 = bs_mod.counts.actors_skipped or 0
+tick(6 * 4)
+take()
+skipped1 = bs_mod.counts.actors_skipped or 0
+check(skipped1 - skipped0 >= 2, f"bs actor_backoff: a standing hand is checked less often: {skipped0} -> {skipped1}")
+F.put_on_belt(sb2, 2, "iron-plate", 0.75, 8109)
+F.set_hand(s_drop, bx + 1, by - 0.5, None)
+tick(12)
+late = bs_of(take())
+check(8109 in [it[0] for it in late["sl"].get(u2 * 8 + 2, (None, []))[1]],
+      f"bs actor_backoff: what a standing inserter put on its quiet belt is sent within two updates: {late['sl'].get(u2 * 8 + 2)}")
+# hold_inputs: a splitter's input found as its last read left it is sent in `sh` with its check's tick
+# (an empty one isn't); once it changed it is read (sl) instead; with the switch off, never.
+take()
+tick(60)
+held = bs_of(take())
+check(ul * 8 + 1 in held["sh"] and held["sh"][ul * 8 + 1] > first["sl"][ul * 8 + 1][0] and ul * 8 + 2 not in held["sh"]
+      and ul * 8 + 3 not in held["sh"] and ul * 8 + 1 not in held["sl"],
+      f"bs sh: a lane splitter's input holding what its last read had is sent in sh, its empty input and its outputs not: {held['sh']}")
+F.move_on_belt(s_lane, 1, 8150, None)
+tick(60)
+held2 = bs_of(take())
+tick(60)
+held2b = bs_of(take())
+check(ul * 8 + 1 in held2["sl"] and ul * 8 + 1 not in held2b["sh"],
+      f"bs sh: once it changed it is read again instead (and empty, not held): {held2['sh']} {held2b['sh']} {sorted(held2['sl'])}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "hold_inputs off"}))
+tick(60)
+held3 = bs_of(take())
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "hold_inputs default"}))
+check(not held3["sh"], f"bs sh: none with /f3d-bs hold_inputs off: {held3['sh']}")
+# Something built near belts: their lanes are sent again with lm and sl.
+near = spawn("inserter", bx + 2, by - 1, force="player")
+F["raise"]("script_raised_built", lua.table_from({"entity": near}))
+tick(12)
+rebuilt = bs_of(take())
+check(u3 * 8 + 1 in rebuilt["lm"] and u3 * 8 + 1 in rebuilt["sl"], f"bs: belts near something built are sent again (lm, sl): {sorted(rebuilt['lm'])}")
+# The focus moves away: the lanes leave the square (dl).
+send({"t": "focus", "x": fixed(bx + 200), "y": fixed(by), "r": 48})
+tick(12)
+gone = bs_of(take())
+check(keys <= set(gone["dl"]), f"bs dl: lanes out of the square are dropped: missing {sorted(keys - set(gone['dl']))}")
+# ld: 1 while the square is still loading (one belt a tick here), then left out; w the steady work.
+send({"t": "focus", "x": fixed(bx), "y": fixed(by), "r": 48})
+bs_mod.reset()
+bs_mod.load_cap = 1
+tick(60)
+bs_mod.load_cap = None
+lds = [m.get("ld") for m in of_type(take(), "bs") if m.get("part", 1) == 1]
+check(lds and lds[0] == 1 and lds[-1] is None, f"bs ld: 1 while the square is still loading, then left out: {lds}")
+# crossings game: a splitter's output lanes are checked on every update even while they stand (never
+# quiet), so what crossed is sent within an update; with sim (the default) a standing output goes quiet.
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "bs": 1})  # (keep the session alive through the ticks below)
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "crossings game"}))
+said_x = lua.eval('package.loaded["scripts.belt_sim"]').option_command("crossings nonsense")
+check("game, sim or default" in str(said_x[1]) and "crossings game (set)" in str(said_x[2]),
+      f"/f3d-bs crossings takes sim or game and says so: {said_x[1]} / {said_x[2]}")
+take()
+tick(12)
+x0 = bs_mod.counts.crossings or 0
+tick(6 * 8)
+take()
+x1 = bs_mod.counts.crossings or 0
+check(x1 - x0 >= 10, f"bs crossings game: the lane splitter's standing outputs are checked every update: {x0} -> {x1}")
+F.put_on_belt(s_lane, 3, "iron-plate", 0.3, 8151)  # (as if an input's item crossed into output line 3)
+tick(12)
+crossed = bs_of(take())
+check(8151 in [it[0] for it in crossed["sl"].get(ul * 8 + 3, (None, []))[1]],
+      f"bs crossings game: an item that crossed into an output is sent within an update: {crossed['sl'].get(ul * 8 + 3)}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "crossings default"}))
+tick(6)
+take()
+x2 = bs_mod.counts.crossings or 0
+tick(6 * 4)
+x3 = bs_mod.counts.crossings or 0
+check(x3 == x2, f"bs crossings sim: outputs aren't checked as crossings: {x2} -> {x3}")
+
+
+# own_rate: the updates follow their own rate job (`bs`, tier 3, at most 12 ticks), so Hold 60 UPS's
+# first levels don't make them stale (every update is a read of every input spot); off, `bi`'s as before.
+def bs_spacing(level, ticks):
+    send({"t": "rate", "l": level})
+    for _ in range(13):  # past the ease (a slow-down keeps the old ticks 120 more); the client kept alive
+        tick(10)
+        send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bs": 1})
+    take()
+    for _ in range(ticks // 10):
+        tick(10)
+        send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bs": 1})
+    heads = [m for m in of_type(take(), "bs") if m.get("part", 1) == 1]
+    ks = sorted({m["k"] for m in heads})
+    return {b - a for a, b in zip(ks, ks[1:])}, {m.get("p") for m in heads}
+
+
+bs_mod.pc_every = 1  # (a drift check every update, so a quiet world still sends one)
+own = {level: bs_spacing(level, 150) for level in (1, 2, 3)}
+check(own[1] == ({6}, {6}) and own[2] == ({6}, {6}) and own[3] == ({12}, {12}),
+      f"bs own_rate: updates every 6 ticks at rate 1 and 2, every 12 at 3, p saying so: {own}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "own_rate off"}))
+old_rate = {level: bs_spacing(level, 150) for level in (1, 3)}
+check(old_rate[1] == ({12}, {12}) and old_rate[3] == ({48}, {48}),
+      f"bs own_rate off: the glided belt items' rate, 12 at 1 and 48 at 3, as before: {old_rate}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "own_rate default"}))
+bs_mod.pc_every = 1000
+send({"t": "rate", "l": 0})
+
+
+# walk_load: while the square loaded whole reaches less than walk_near tiles of the focus (walking, a
+# jump), first loads get at least walk_load units a tick; standing with it all loaded, their share as before.
+walk_field = [spawn("transport-belt", 2000.5 + (k % 28) - 14, 2000.5 + k // 28 - 14, force="player", direction=4)
+              for k in range(784)]
+for k, e in enumerate(walk_field):
+    F.put_on_belt(e, 1, "iron-plate", 0.25, 90000 + 2 * k)
+    F.put_on_belt(e, 2, "iron-plate", 0.75, 90001 + 2 * k)
+
+
+def walk_loaded(units, ticks):
+    """Belts loaded after each tick from a reset, with walk_load at `units`."""
+    F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "walk_load %d" % units}))
+    send({"t": "focus", "x": fixed(2000.5), "y": fixed(2000.5), "r": 48})
+    bs_mod.reset()
+    c0 = bs_mod.counts.loaded
+    out = []
+    for t in range(ticks):
+        tick(1)
+        if t % 3 == 2:
+            send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bs": 1})
+        out.append(bs_mod.counts.loaded - c0)
+    take()
+    return out
+
+
+slow = walk_loaded(0, 30)
+fast = walk_loaded(20000, 30)
+check(fast[-1] >= 784 and fast[3] > 2 * slow[3], f"bs walk_load: first loads get walk_load units a tick while the view isn't loaded: {slow} / {fast}")
+check(not lua.eval("storage.f3d.bs.thin"), "bs walk_load: the square all loaded isn't thin")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "walk_load default"}))
+
+
+# send_cap: an update's parts are sent over the ticks after its due tick, about send_cap bytes a tick (one
+# part at least), each still stamped with the update's tick; 0 sends them all on the due tick, as before.
+def spooled_parts(cap, ticks):
+    """[(tick, [(k, part, parts, bytes)...])] for every tick with bs parts, from a reset with send_cap at `cap`."""
+    F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "send_cap %s" % cap}))
+    F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "walk_load 100000"}))
+    send({"t": "focus", "x": fixed(2000.5), "y": fixed(2000.5), "r": 48})
+    bs_mod.reset()
+    take()
+    out = []
+    for t in range(ticks):
+        tick(1)
+        rows = [(m["k"], m.get("part", 1), m.get("parts", 1), len(json.dumps(m, separators=(",", ":")))) for m in of_type(take(), "bs")]
+        if rows:
+            out.append((t, rows))
+    F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "walk_load default"}))
+    return out
+
+
+burst = spooled_parts(0, 40)
+spread = spooled_parts(20000, 40)
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "send_cap default"}))
+big = [rows for _, rows in burst if len(rows) >= 3]
+check(big and all(len({k for k, _, _, _ in rows}) == 1 and len(rows) == rows[0][2] for rows in big),
+      f"bs send_cap 0: every update's parts go out on its due tick: {[(t, len(r)) for t, r in burst]}")
+per_tick = [sum(b for _, _, _, b in rows) for _, rows in spread]
+check(spread and max(per_tick) < 20000 + MAX_DATAGRAM / 2,
+      f"bs send_cap 20000: a tick sends at most the cap and one part more: {per_tick}")
+ks = {}
+for t, rows in spread:
+    for k, part, parts, _ in rows:
+        ks.setdefault(k, {"parts": parts, "got": set(), "ticks": set()})
+        ks[k]["got"].add(part)
+        ks[k]["ticks"].add(t)
+whole = [k for k, v in ks.items() if len(v["got"]) == v["parts"]]
+check(len(whole) >= len(ks) - 1 and any(len(v["ticks"]) >= 2 for v in ks.values()),
+      f"bs send_cap: every part of an update arrives, over more than one tick, stamped with its update's tick: {[(k, v['parts'], sorted(v['ticks'])) for k, v in ks.items()]}")
+order = [k for _, rows in spread for k, _, _, _ in rows]
+check(order == sorted(order), "bs send_cap: parts go out oldest update first")
+for e in walk_field:
+    e.destroy()
+send({"t": "focus", "x": fixed(bx), "y": fixed(by), "r": 48})
+bs_mod.reset()
+tick(12)
+take()
+# Two simulating clients on one server (multiplayer: storage.f3d is swapped per client): each gets
+# the lanes round its own focus. (Both clients' rounds start on the same ticks, and one update being
+# built, module-local, was keyed by that tick alone: the first client sent both clients' lanes and the
+# second nothing.)
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bs": 1})
+tick(12)
+take()
+was_mp = F.multiplayer
+F.multiplayer = True  # (in single-player a hello from another port takes the one client's place)
+
+
+def sync_r(by):
+    """take()'s reliable counter after a take_by_port (which doesn't keep it)."""
+    global expected_r
+    rs = [m["r"] for m in by.get(CLIENT_PORT, []) if "r" in m]
+    if rs:
+        expected_r = rs[-1] + 1
+
+
+ox, oy = 600.5, 600.5
+other = [spawn("transport-belt", ox + k, oy, force="player", direction=4) for k in range(3)]
+F.link_belts(other[0], other[1])
+F.link_belts(other[1], other[2])
+F.put_on_belt(other[1], 1, "iron-plate", 0.5, 8201)
+other_ins = spawn("inserter", ox + 1, oy + 1, force="player")
+other_ins.pickup_target = other[1]  # (watched: a change there is read)
+other_keys = {int(e.unit_number) * 8 + i for e in other for i in (1, 2)}
+send({"t": "hello", "v": 1, "sid": "b", "w": 0, "z": 1, "bl": 1, "bs": 1}, port=PORT_B)
+tick(2)
+send({"t": "focus", "x": fixed(ox), "y": fixed(oy), "r": 48}, port=PORT_B)
+send({"t": "bfar", "r": 0, "n": 16, "m": 0}, port=PORT_B)
+tick(30)
+by_port = take_by_port()
+sync_r(by_port)
+bs_a, bs_b = bs_of(by_port.get(CLIENT_PORT, [])), bs_of(by_port.get(PORT_B, []))
+check(other_keys <= set(bs_b["lm"]) and other_keys <= set(bs_b["sl"]) and not (other_keys & set(bs_a["lm"]))
+      and not (set(bs_a["lm"]) & set(bs_b["lm"])),
+      f"bs: two simulating clients each get the lanes round their own focus: second missing {sorted(other_keys - set(bs_b['lm']))}, first got {sorted(other_keys & set(bs_a['lm']))}")
+# And an update after the first loads: a change at the second client's belts reaches it (its
+# inserter took, so the input spot is woken; quiet, it is checked only every spot_quiet_ticks).
+F.move_on_belt(other[1], 1, 8201, 0.25)
+F.put_on_belt(other[1], 2, "copper-plate", 0.5, 8202)
+F.set_hand(other_ins, ox + 1, oy + 0.5, "iron-plate")
+tick(12)
+by_port = take_by_port()
+sync_r(by_port)
+bs_b2 = bs_of(by_port.get(PORT_B, []))
+ko = int(other[1].unit_number) * 8 + 2
+check(8202 in [it[0] for it in bs_b2["sl"].get(ko, (None, []))[1]] and bs_b2["heads"],
+      f"bs: the second client's updates carry its own changes: {bs_b2['sl'].get(ko)} {bs_b2['heads'][-1:]}")
+send({"t": "bye"}, port=PORT_B)
+tick(1)
+take()
+# The same for two clients that don't simulate (`bi`, main's 0.1.4 client with kept lanes): bi's one
+# update being built was module-local by tick too, so two such clients' rounds on one tick sent both
+# clients both clients' items.
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 0, "bl": 1})
+send({"t": "hello", "v": 1, "sid": "b", "w": 0, "z": 0, "bl": 1}, port=PORT_B)
+tick(2)
+send({"t": "focus", "x": fixed(ox), "y": fixed(oy), "r": 48}, port=PORT_B)
+send({"t": "bfar", "r": 0, "n": 16, "m": 0}, port=PORT_B)
+tick(30)
+by_port = take_by_port()
+sync_r(by_port)
+
+
+def bi_lanes(msgs):
+    """The lane keys named by `ln` over the bi messages, and the unique ids of their items."""
+    keys, ids = set(), set()
+    for m in of_type(msgs, "bi"):
+        ln = m.get("ln", [])
+        keys |= {ln[i] for i in range(0, len(ln), 2)}
+        items = m.get("l", [])
+        ids |= {items[i] for i in range(0, len(items), 4)}
+    return keys, ids
+
+
+bi_a, bi_b = bi_lanes(by_port.get(CLIENT_PORT, [])), bi_lanes(by_port.get(PORT_B, []))
+check(8201 in bi_b[1] and 8201 not in bi_a[1] and not (other_keys & bi_a[0]) and 8106 in bi_a[1] and 8106 not in bi_b[1],
+      f"bi: two kept-lane clients each get the items round their own focus: first {sorted(bi_a[1])[:6]}, second {sorted(bi_b[1])[:6]}")
+send({"t": "bye"}, port=PORT_B)
+tick(1)
+take()
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bs": 1})
+tick(12)
+take()
+F.multiplayer = was_mp
+# The actors (inserters and drills using loaded belts) and the chunk caches (bs.bc, bs.bt) follow the
+# square: those round belts that left it are forgotten when the scan is taken, and found again when
+# it comes back. (They only ever grew as the focus moved, and every actor was checked every update.)
+far_belt = spawn("transport-belt", bx + 200, by, force="player", direction=4)
+far_ins = spawn("inserter", bx + 200, by + 1, force="player")
+far_ins.pickup_target = far_belt
+u_far, u_sins, u_sdrop, u_fins = int(far_belt.unit_number), int(s_ins.unit_number), int(s_drop.unit_number), int(far_ins.unit_number)
+bs_keys = lua.eval("function(name) local t = {} for k in pairs(storage.f3d.bs[name] or {}) do t[#t + 1] = k end table.sort(t) return t end")
+actors_now = lambda: set(to_py(bs_keys("actors")))
+chunks_now = lambda name: set(to_py(bs_keys(name)))
+check({u_sins, u_sdrop} <= actors_now(), f"bs: the inserters using the loaded belts are actors: {sorted(actors_now())}")
+send({"t": "focus", "x": fixed(bx + 200), "y": fixed(by), "r": 48})
+tick(30)
+take()
+far_ck = (int(math.floor((bx + 200) / 32)) + 32768) * 65536 + int(math.floor(by / 32)) + 32768
+near_ck = (int(math.floor(bx / 32)) + 32768) * 65536 + int(math.floor(by / 32)) + 32768
+check(not ({u_sins, u_sdrop} & actors_now()) and u_fins in actors_now()
+      and near_ck not in chunks_now("bc") and near_ck not in chunks_now("bt") and far_ck in chunks_now("bc")
+      and u_far in set(to_py(bs_keys("belts"))),
+      f"bs: actors and chunk caches round belts that left the square are forgotten: actors {sorted(actors_now())}, bc {sorted(chunks_now('bc'))}, bt {sorted(chunks_now('bt'))}")
+send({"t": "focus", "x": fixed(bx), "y": fixed(by), "r": 48})
+tick(30)
+back = bs_of(take())
+alist_now = lambda: set(to_py(lua.eval("function() local t = {} for _, u in ipairs(storage.f3d.bs.alist) do t[#t + 1] = u end return t end")()))
+check({u_sins, u_sdrop} <= actors_now() and u_fins not in actors_now() and u2 * 8 + 1 in back["lm"],
+      f"bs: back in the square, its belts' actors are found again: {sorted(actors_now())}")
+# (And listed again, so they are checked: the list is made again without the forgotten ones, else
+# the seen set kept them off it for good.)
+check({u_sins, u_sdrop} <= alist_now() and u_fins not in alist_now(),
+      f"bs: actors found again are listed again for their checks: {sorted(alist_now())}")
+F.set_hand(s_drop, bx + 1, by - 1, "iron-plate")  # (its hand held nothing: a change)
+F.put_on_belt(sb2, 2, "iron-plate", 0.9, 8203)  # (behind the lane's items: the fake lists them as put)
+tick(18)  # (actor_backoff: a hand that stood is checked every other update, so within two)
+woke_back = bs_of(take())
+check(8203 in [it[0] for it in woke_back["sl"].get(u2 * 8 + 2, (None, []))[1]],
+      f"bs: an actor found again wakes its belt when it acts: {woke_back['sl'].get(u2 * 8 + 2)}")
+far_belt.destroy()
+far_ins.destroy()
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1})
+send({"t": "bfar", "r": 0})
+tick(6)
+check(of_type(take(), "bi") and lua.eval("storage.f3d.bs") is None, "bs: a client that stops saying bs gets bi again")
+
+# A square `sub` over the wire (what the client sends), after a list one: the chunks it adds come
+# nearest its middle first, the ones it keeps aren't sent again, the rest are dropped. Last, so the
+# checks above keep their phase of the periodic jobs.
+send({"t": "sub", "c": [[0, 0], [1, 0], [9, 9]]})
+tick(60)
+take()
+send({"t": "sub", "o": [0, 0], "r": 1, "w": [[-1, -1, 3], [0, -1, 3], [1, -1, 3]]})
+tick(60)
+got = [(m["cx"], m["cy"]) for m in of_type(take(), "chunk")]
+check(sorted(got) == sorted({(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1)} - {(0, 0), (1, 0)}) and got[:1] == [(0, -1)]
+      and g.storage.f3d.subs["9,9"] is None,
+      f"a square `sub` over the wire adds its new chunks nearest first and drops what it leaves out: {got}")
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

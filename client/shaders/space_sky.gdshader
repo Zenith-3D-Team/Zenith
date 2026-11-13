@@ -3,16 +3,23 @@
 // platform, big enough that its curve shows past the deck's edges from the default view (50
 // degrees down, a narrow field of view).
 // Stars are fixed to directions, so they stay put as the camera moves, like distant stars.
+// Space is near black, as Factorio's own behind a platform: about 3/3/7 of 255 before the look's
+// exposure, the nebula barely there, the stars faint points.
+// The planet turns once per its day (planet_spin, from the game's time of day there: planet_spin.gd),
+// lit from the sun that lights the deck (planet_sun).
 shader_type sky;
 
 #include "res://shaders/sky_view.gdshaderinc"
 
 uniform vec3 planet_color = vec3(0.25, 0.42, 0.55);
 uniform float planet_on = 0.0;
-// Where the planet is and how big it looks (radians). Straight below the platform, as Factorio draws
-// the planet under it: fixed in the sky, so it looks the same whichever way the camera turns (F4).
+// Where the planet is and how big it looks (radians). Straight below a stopped platform, as Factorio
+// draws the planet under it; ahead of one coming to it, behind one leaving. Fixed in the sky, so it
+// looks the same whichever way the camera turns (F4).
 uniform vec3 planet_dir = vec3(0.0, -1.0, 0.0);
 uniform float planet_radius = 0.2;
+// Fades it out at the far end of its way, instead of it popping out of the sky.
+uniform float planet_alpha = 1.0;
 // Factorio's own picture of the planet (its star map sprite, from the player's install), drawn
 // over the disc; without one, the procedural sphere below.
 uniform sampler2D planet_tex : source_color, filter_linear_mipmap;
@@ -26,6 +33,12 @@ uniform sampler2D planet_clouds : filter_linear_mipmap, repeat_enable;
 uniform sampler2D planet_emission : source_color, filter_linear_mipmap, repeat_enable;
 uniform float planet_map_on = 0.0;
 uniform float planet_clouds_on = 0.0;
+// How far round the planet has turned (0-1): 0 when the map's middle meridian faces the sun, its noon;
+// a full turn east each day there. Its clouds' turn, a little ahead.
+uniform float planet_spin = 0.0;
+uniform float planet_cloud_spin = 0.0;
+// Towards the sun (the scene's sun, so the planet's day side is the side the deck is lit from).
+uniform vec3 planet_sun = vec3(0.5, 0.8, 0.3);
 uniform float planet_emission_on = 0.0;
 
 float hash13(vec3 p) {
@@ -64,28 +77,32 @@ vec3 stars(vec3 d, float scale, float threshold, float size, float salt) {
 
 void sky() {
 	vec3 d = sky_view_dir(EYEDIR, SCREEN_UV, AT_CUBEMAP_PASS);
-	vec3 col = vec3(0.006, 0.007, 0.016);
+	vec3 col = vec3(0.0009, 0.0009, 0.0021);
 	float band = exp(-pow(dot(d, normalize(vec3(0.4, 0.7, -0.6))), 2.0) * 6.0);
-	col += vec3(0.012, 0.008, 0.02) * band * (0.4 + 0.6 * fbm(d * 6.0));
-	col += stars(d, 150.0, 0.975, 0.16, 0.0) * 2.2;
-	col += stars(d, 380.0, 0.97, 0.22, 11.0) * 0.9;
+	col += vec3(0.0035, 0.0024, 0.006) * band * (0.4 + 0.6 * fbm(d * 6.0));
+	col += stars(d, 150.0, 0.975, 0.14, 0.0) * 1.1;
+	col += stars(d, 380.0, 0.97, 0.2, 11.0) * 0.4;
+	vec3 space = col;
 	if (planet_on > 0.5) {
 		vec3 pd = normalize(planet_dir);
 		float ang = acos(clamp(dot(d, pd), -1.0, 1.0));
 		if (planet_map_on > 0.5 && ang < planet_radius * 1.25) {
 			float r = ang / planet_radius;
-			vec3 ref = abs(pd.y) > 0.99 ? vec3(0.0, 0.0, -1.0) : vec3(0.0, 1.0, 0.0);
+			vec3 ref = vec3(0.0, 0.0, -1.0);  // its way runs north and south, so it is never along this
 			vec3 right = normalize(cross(pd, ref));
 			vec3 up = cross(right, pd);
-			vec3 sun = normalize(vec3(0.5, 0.8, 0.3));
+			vec3 sun = normalize(planet_sun);
+			// The sun's longitude in the sphere's frame: the map turns from there, so the meridian at
+			// its noon faces the sun whichever way the planet lies in the sky.
+			float sun_lon = atan(dot(sun, right), dot(sun, -pd) + 1e-5);
 			if (r < 1.0) {
 				vec3 side = normalize(d - pd * dot(d, pd));
 				vec3 n = normalize(pd * -sqrt(1.0 - r * r) + side * r);
 				// The sphere's own frame: its pole towards the picture's top (north), facing us.
 				vec3 local = vec3(dot(n, right), dot(n, up), dot(n, -pd));
 				float lat = asin(clamp(local.y, -1.0, 1.0));
-				float lon = atan(local.x, local.z);
-				float spin = TIME * 0.004;
+				float lon = atan(local.x, local.z) - sun_lon;
+				float spin = -planet_spin;  // east: what faces the sun moves west on the map
 				vec2 uv = vec2(lon / TAU + 0.5 + spin, 0.5 - lat / PI);
 				// Mip level from a longitude without the wrap's jump, so the seam shows no line.
 				vec2 uv_alt = vec2(fract(lon / TAU + 1.0 + spin), uv.y);
@@ -102,7 +119,7 @@ void sky() {
 				float light = smoothstep(-0.15, 0.35, day);
 				vec3 lit = surface * (0.03 + 1.05 * light);
 				if (planet_clouds_on > 0.5) {
-					vec2 cuv = uv + vec2(TIME * 0.0025, 0.0);
+					vec2 cuv = uv + vec2(planet_spin - planet_cloud_spin, 0.0);
 					vec4 c = textureGrad(planet_clouds, cuv, gx, gy);
 					lit = mix(lit, vec3(c.r) * (0.04 + 1.1 * light), c.g * 0.85);
 				}
@@ -118,7 +135,7 @@ void sky() {
 			col += planet_color * rim * 0.45;
 		} else if (planet_tex_on > 0.5 && ang < planet_radius * 1.05) {
 			// The picture's top towards north (-Z) when the planet is straight below.
-			vec3 ref = abs(pd.y) > 0.99 ? vec3(0.0, 0.0, -1.0) : vec3(0.0, 1.0, 0.0);
+			vec3 ref = vec3(0.0, 0.0, -1.0);  // its way runs north and south, so it is never along this
 			vec3 right = normalize(cross(pd, ref));
 			vec3 up = cross(right, pd);
 			vec2 off = vec2(dot(d, right), dot(d, up)) / sin(planet_radius);
@@ -133,10 +150,18 @@ void sky() {
 			if (r < 1.0) {
 				vec3 side = normalize(d - pd * dot(d, pd));
 				vec3 n = normalize(pd * -sqrt(1.0 - r * r) + side * r);
-				float light = clamp(dot(n, normalize(vec3(0.5, 0.8, 0.3))) * 0.6 + 0.4, 0.0, 1.0);
+				float light = clamp(dot(n, normalize(planet_sun)) * 0.6 + 0.4, 0.0, 1.0);
+				// The sphere turned about its pole (north, as the map's), so its land turns as the
+				// planet's day goes.
+				vec3 ref = vec3(0.0, 0.0, -1.0);
+				vec3 right = normalize(cross(pd, ref));
+				vec3 up = cross(right, pd);
+				vec3 local = vec3(dot(n, right), dot(n, up), dot(n, -pd));
+				float a = -planet_spin * TAU;
+				vec3 q = vec3(local.x * cos(a) + local.z * sin(a), local.y, -local.x * sin(a) + local.z * cos(a));
 				// Land and sea from noise on the sphere, and a few lighter clouds over them.
-				float land = smoothstep(0.45, 0.55, fbm(n * 3.0));
-				float clouds = smoothstep(0.55, 0.75, fbm(n * 5.0 + 9.0));
+				float land = smoothstep(0.45, 0.55, fbm(q * 3.0));
+				float clouds = smoothstep(0.55, 0.75, fbm(q * 5.0 + 9.0));
 				vec3 surface = mix(planet_color * 0.55, planet_color * 1.15, land);
 				surface = mix(surface, vec3(0.85), clouds * 0.6);
 				col = surface * (0.04 + 0.6 * light * light);
@@ -145,6 +170,7 @@ void sky() {
 			float rim = smoothstep(1.25, 1.0, r) * smoothstep(0.8, 1.0, r);
 			col += planet_color * rim * 0.25;
 		}
+		col = mix(space, col, planet_alpha);
 	}
 	COLOR = col;
 }

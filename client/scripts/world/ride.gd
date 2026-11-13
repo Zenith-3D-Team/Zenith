@@ -14,11 +14,13 @@ extends Node3D
 ## so the inventory and the Esc menu work, as in the game).
 
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const Rockets := preload("res://scripts/world/rockets.gd")
+const Visuals := preload("res://scripts/world/visuals.gd")
 
 const BOARD_TIME := 1.2       # seconds to walk into the rocket
-const IGNITE_AFTER := 5.0     # seconds into awaiting_launch (about 7.5 s in 2.1.23) the engine lights
 const FADE_FROM := 120.0      # tiles up the rocket climbs before the view fades out...
 const FADE_OVER := 70.0       # ...over this many more
+const CLIMB_TILT_BY := 90.0   # tiles up the camera has finished tilting down
 const POD_FADE_AFTER := 4.5   # seconds a pod climbs off a hub before the view fades out
 const FADE_IN := 1.2
 const GROUND_WAIT := 2.0      # on a planet the ground needs a moment to stream in before the view opens
@@ -286,13 +288,17 @@ func _rocket(_delta: float) -> void:
 				avatar.visible = false
 	var ignition := 0.0
 	if _ps == "awaiting_launch":
-		ignition = clampf((_t - IGNITE_AFTER) / 2.0, 0.0, 0.6)
+		ignition = Rockets.ignition_at(_t)
 	elif _ps != "":
 		ignition = 1.0
 	if rockets != null:
 		rockets.drive(_ground, _height, ignition)
-	# The camera rises with the rocket, a little below it, and the view fades out high up.
-	_place_anchor(_ground, maxf(2.0, _height * 0.85))
+	# The camera waits while the rocket comes out of its shaft, then rises with it, tilting down to
+	# watch the ground fall away, and the view fades out high up.
+	var base := _height - Visuals.ROCKET_SINK
+	_place_anchor(_ground, maxf(2.0, base + 5.0))
+	var up := clampf(base / CLIMB_TILT_BY, 0.0, 1.0)
+	rig.cinematic(lerpf(22.0, 58.0, up), lerpf(55.0, 80.0, up))
 	if _height > FADE_FROM:
 		_set_fade(clampf((_height - FADE_FROM) / FADE_OVER, 0.0, 1.0))
 	if _ps == "surface_transition":

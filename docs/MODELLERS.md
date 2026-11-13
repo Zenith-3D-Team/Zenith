@@ -31,10 +31,24 @@ redistribute Factorio's pictures: look at them, don't put them in your files.
   material with one texture atlas per model is cheapest. Keep the material's base colour white.
   Texture filtering follows the file: set Blender's Image Texture node to **Closest** and Zenith
   draws that texture crisp, texel by texel (still mipmapped far away, so it doesn't shimmer); Linear
-  (the default) draws it smooth. Normal maps are ignored for now. A model without textures is coloured from its materials'
+  (the default) draws it smooth. Transparency follows the material's Blend Mode: **Alpha Clip**
+  cuts away every pixel whose alpha (the base colour texture's, times the material's) is under its
+  Clip Threshold and draws the rest solid, both sides, with matching shadows: for fences, grilles,
+  leaves and decals. **Alpha Blend** draws the material see-through by that alpha: for glass. Keep
+  Opaque for everything else, as see-through costs more to draw. A **normal map** (glTF
+  normalTexture, OpenGL style as Blender exports it) is drawn, at its Strength. **Emission:** an
+  emission texture says which parts glow and in what colour, times the Emission Strength; they
+  glow only while the machine works. Without an emission texture the whole material glows.
+  Vertex colours from Blender are ignored (Zenith keeps its own baked data in them). A model without textures is coloured from its materials'
   colours.
-- **One mesh:** the game flattens each model into one mesh for speed, so skeletons and animations
-  in the file are ignored. Anything that moves is a separate object (below).
+- **One mesh:** the game flattens each model into one mesh for speed. Anything that moves is either
+  a separate object (below) or a baked animation:
+- **Baked animation:** one skinned mesh on an armature, with one action exported (Blender's glTF
+  export: Animation on, the action's frame range set; up to 4 bones a vertex). The game plays the
+  action on a loop while the machine works, easing it up when the machine starts and coasting to a
+  stop when it stops, at the action's own speed. Triangles only on bones that never move stay part
+  of the still model. An action one frame long (Blender exporting only the current frame) has
+  nothing to play.
 
 ## Moving parts
 
@@ -60,14 +74,14 @@ exactly:
 
 | Entity | Files | Notes |
 |---|---|---|
-| Transport belt | `transport-belt.glb`, `transport-belt-curve-left.glb`, `transport-belt-curve-right.glb` | Everything that moves with the belt (the slats) uses a material named `belt_surface`: the game scrolls it at each tier's speed and paints Factorio's chevrons on it. The frame uses `tier_paint`, which the game recolours for fast, express and turbo. Curves face their output: `-curve-left` takes items in from the west edge and out of the north edge. Items ride on the belt's top surface, so its height shows. |
+| Transport belt | `transport-belt.glb`, `transport-belt-curve-left.glb`, `transport-belt-curve-right.glb` | Everything that moves with the belt (the slats) uses a material whose name contains `belt_surface` (any case): the game scrolls it at each tier's speed. Untextured, it paints Factorio's slats and chevrons on it; with your own texture, it scrolls that texture the way its UVs run along the belt (curves too), and leaves it as it is. To wrap the belt round its ends, model the wrap (apply modifiers and geometry nodes before exporting). The frame uses `tier_paint`, which the game recolours for fast, express and turbo. Curves face their output: `-curve-left` takes items in from the west edge and out of the north edge. Items ride on the belt's top surface, so its height shows. |
 | Underground belt | `underground-belt-input.glb` (entrance), `underground-belt-output.glb` (exit) | Both modelled as Factorio's picture for "north": the hood's mouth opens south. The game turns the exit round. |
-| Splitter | `splitter.glb` | Two tiles wide (east-west). Its belts use `belt_surface`; gears and cranks are `anim_` parts. |
+| Splitter | `splitter.glb` | Two tiles wide (east-west). Its belts use `belt_surface`; gears and cranks are `anim_` parts. Baked gears move only while items pass, as Factorio's do; objects with `Roller` in their name run all the time, as belts do. |
 | Pipe | 16 files, `pipe-<shape>.glb`, one per Factorio pipe picture: `straight-vertical`, `straight-horizontal`, `corner-up-right`, `t-left`, `cross`, `ending-down`, `straight-vertical-single`, ... | The game picks one by which neighbours connect. "up" is north, as in Factorio's sprite names. Heat pipes are the same 16 shapes, `heat-pipe-<shape>.glb`. |
 | Stone wall | `stone-wall-<sides>.glb` named by the sides it joins (`pylon`, `n`, `ew`, `es`, `nesw`, ...) and `stone-wall-fill.glb` | The fill block sits in the middle of a 2x2 group of walls. |
 | Rails | `straight-rail`, `half-diagonal-rail`, `curved-rail-a`, `curved-rail-b` and their `elevated-` versions, each as `<name>.glb` (direction north) and `<name>-ne.glb` (north-east) | The game turns them in quarter turns for the other directions. |
-| Inserters | the base: `<name>.glb`, `-east`, `-south`, `-west`; the arm: `inserter-arm-<family>-upper`, `-hand-open`, `-hand-closed` | The game stretches the arm pieces from the base's shoulder to the inserter's reach. Families: `basic`, `long`, `bulk`, `stack`. |
-| Boiler, steam engine, offshore pump, pipe-to-ground, valves, burner drill, pumpjack, chemical plant | `<name>.glb` (north), `<name>-east`, `-south`, `-west.glb` | Factorio drew each direction separately, so each gets its own model, drawn unturned. |
+| Inserters | the base: `<name>.glb` alone (turned), or with `-east`, `-south`, `-west`; the arm: `inserter-arm-<family>-upper`, `-hand-open`, `-hand-closed` | The game stretches the arm pieces from the base's shoulder to the inserter's reach. Families: `basic`, `long`, `bulk`, `stack`. |
+| Boiler, steam engine, offshore pump, pipe-to-ground, valves, burner drill, pumpjack, chemical plant, crusher | `<name>.glb` alone, facing north; or all four: `<name>.glb` (north), `<name>-east`, `-south`, `-west.glb` | One model is turned to each direction, like any other. Zenith's own have a model per direction, drawn unturned, because Factorio drew each direction separately; put all four in the models folder to do the same. |
 | Cargo bay | `cargo-bay.glb` plus edge pieces (`cargo-bay-wall-n`, `cargo-bay-corner-nw`, `cargo-bay-inner-nw`, ...) | Bays join each other and the hub like Factorio's tileset; see the models README. |
 | Biter and spitter corpses | `<name>-corpse.glb` and `-corpse-1` to `-3` | Factorio's four falls. |
 

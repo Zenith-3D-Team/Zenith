@@ -51,6 +51,11 @@ CHUNK = 32
 BYTES_PER_TICK = 32768
 CHUNKS_PER_TICK = 2
 MAX_BACKLOG = 64
+# Photo mode (`photo`, photo.lua): a screenshot loading reads this many times the chunks a tick, with a
+# longer outbox, for 900 ticks after the client last said it.
+PHOTO_FACTOR = 4
+PHOTO_BACKLOG = 256
+PHOTO_LAPSE = 900
 ENTITIES_PER_MESSAGE = 120
 DECORATIVES_PER_MESSAGE = 1000  # 4 numbers each, as the mod
 RECORDS_PER_MESSAGE = 80
@@ -81,7 +86,8 @@ SKY_INTERVAL = 60
 # Entity types the mod reports working states for (registry.lua ANIMATED_TYPES).
 ANIMATED_TYPES = ("assembling-machine", "furnace", "mining-drill", "lab", "boiler", "generator", "reactor",
                   "radar", "rocket-silo", "pump", "offshore-pump", "beacon", "burner-generator", "fusion-reactor",
-                  "fusion-generator", "agricultural-tower", "asteroid-collector", "lamp", "thruster")
+                  "fusion-generator", "agricultural-tower", "asteroid-collector", "lamp", "thruster",
+                  "splitter", "lane-splitter")
 TIMEOUT_TICKS = 600
 HOLD_TICKS = 30
 BATCH_BYTES = 60000  # a datagram of messages joined by newlines, for a client whose hello says b
@@ -250,7 +256,7 @@ PLATFORM_START = (2.5, 6.5)
 # pod's position runs north of its ground point by its height (Factorio's drawing), and `me` carries
 # pod, ps, up, gx, gy meanwhile, then hub inside the hub. Measured in 2.1.23: up 450 / 1200 / 25 /
 # 350 / 80 ticks, down 85 / 400 / 25 / 600.
-RIDE_UP = [("awaiting_launch", 120), ("ascending", 300), ("surface_transition", 10), ("descending", 150), ("parking", 50)]
+RIDE_UP = [("awaiting_launch", 480), ("ascending", 1200), ("surface_transition", 10), ("descending", 150), ("parking", 50)]
 RIDE_DOWN = [("awaiting_launch", 60), ("ascending", 180), ("surface_transition", 10), ("descending", 240)]
 RIDE_CLIMB = 200.0     # tiles a rocket climbs before it changes surface
 POD_CLIMB = 26.0       # off a hub
@@ -620,6 +626,25 @@ def fixed(v):
     return int(math.floor(v * 256 + 0.5))
 
 
+def square_chunks(msg):
+    """A square `sub` (`o`, `r`, `w`: per row [cy, x, count, ...]) as the mod reads it
+    (world.lua subscribe_square): the chunks within r of o, nearest o first, then row by row."""
+    o, r, w = msg.get("o"), msg.get("r"), msg.get("w")
+    if not (isinstance(o, list) and len(o) >= 2 and isinstance(r, (int, float)) and isinstance(w, list)):
+        return []
+    ox, oy, r = int(o[0]), int(o[1]), max(0, min(50, int(r)))
+    got = set()
+    for row in w:
+        if not (isinstance(row, list) and row and isinstance(row[0], (int, float))) or abs(int(row[0]) - oy) > r:
+            continue
+        cy = int(row[0])
+        for i in range(1, len(row) - 1, 2):
+            if isinstance(row[i], (int, float)) and isinstance(row[i + 1], (int, float)) and row[i + 1] >= 1:
+                for cx in range(max(int(row[i]), ox - r), min(int(row[i]) + int(min(row[i + 1], 2 * r + 1)), ox + r + 1)):
+                    got.add((cx, cy))
+    return sorted(got, key=lambda c: ((c[0] - ox) ** 2 + (c[1] - oy) ** 2, c[1], c[0]))
+
+
 def hash01(x, y, salt):
     h = (x * 374761393 + y * 668265263 + salt * 2147483647) & 0xFFFFFFFF
     h = ((h ^ (h >> 13)) * 1274126177) & 0xFFFFFFFF
@@ -678,6 +703,9 @@ class MockGame(mock_info.InfoMixin):
     def __init__(self, seed, drop, day_length=25000, start=(-3.0, 0.5)):
         self.lanes = {}  # belt lanes a bl client holds: key -> [items, settled] (send_belt_lanes)
         self.seed, self.drop, self.day_length = seed, drop, day_length
+        # /f3d-debug (console.lua): the time of day moved by, frozen at, the game's speed and pause.
+        self.day_offset, self.day_frozen, self.speed, self.paused = 0.0, None, 1.0, False
+        self.hold = None  # /f3d-debug hold: [the speed before, the tick it ends by itself]
         self.rng = random.Random(seed)
         self.tick = 0
         self.next_unit = 1000
@@ -713,6 +741,8 @@ class MockGame(mock_info.InfoMixin):
         mock_vehicles.machines(self)
         self.belt = []  # the starter base's belt, north to south
         self.belt_field = []  # --belt-field: columns of belts, each north to south
+        self.belts_off = []  # --belts-off: belts the circuit network switches off and on every 5 s
+        self.belts_empty = 0  # --belts-off: this many of the field's columns carry nothing
         self.belt_field_rect = None  # (x0, y0, x1, y1) kept clear of trees, with a margin
         self.inserters = []  # (entity, item it carries)
         self.wired = {}  # combinator unit -> the constant combinator feeding it (red)
@@ -728,6 +758,7 @@ class MockGame(mock_info.InfoMixin):
                         for cy in range(-MAP_START_RADIUS, MAP_START_RADIUS + 1)}
         self.map_queue, self.map_res = [], 4
         self.work_budget = WORK_BUDGET  # units a tick (budget.lua); the mock only reports it in `wb`
+        self.photo_until = None  # photo mode (`photo`) lapses at this tick
         # Tags by surface index: [id, x, y, text, icon type, icon name]. map_si: the surface the
         # map asked for (None: the character's).
         self.surface_tags, self.next_tag, self.tags_dirty, self.map_si = {1: [], 2: [], 3: []}, 0, False, None
@@ -982,8 +1013,8 @@ class MockGame(mock_info.InfoMixin):
             self.ground.append([item, -5.0 + (i % 4) * 0.45, 3.0 + (i // 4) * 0.4])
         for x in range(-100, 101, 2):
             self.add(Entity(self._unit(), "straight-rail", float(x), -48.0, 4))
-        add("train-stop", -82.0, -46.0, 12, {"n": "West"})
-        add("train-stop", 82.0, -46.0, 4, {"n": "East"})
+        add("train-stop", -82.0, -46.0, 12, {"n": "West", "col": [242, 0, 0]})
+        add("train-stop", 82.0, -46.0, 4, {"n": "East", "col": [30, 140, 255]})
         self.space.build_nauvis(add)
 
     # --- space platform -------------------------------------------------------------------
@@ -1084,11 +1115,25 @@ class MockGame(mock_info.InfoMixin):
     def send_platforms(self):
         # The remote view moves the mock's character to the viewed surface, the mod's stays put.
         on = self.platform["i"] if self.surface not in PLANETS and getattr(self, "viewing_from", None) is None else 0
-        msg = {"t": "plat", "on": on, "l": [self.platform_record()],
-               "dest": PLATFORM_DESTINATIONS}
+        rec = self.platform_record()
+        msg = {"t": "plat", "on": on, "l": [rec], "dest": PLATFORM_DESTINATIONS, "k": self.tick,
+               "days": self.planet_days({rec.get(k) for k in ("loc", "from", "to")})}
         if self.surface == "nauvis":
             msg["here"] = "nauvis"
         self.send_now(msg)
+
+    def planet_days(self, names):
+        """platforms.lua's planet_days: [name, ticks per day, daytime (1/100000), frozen] per planet
+        in the platforms' skies: the character's planet keeps its own time of day, the others count
+        theirs from the tick."""
+        out = []
+        for name in sorted(n for n in names if n in PLANETS):
+            here = name == self.surface
+            day = int(self.day_length) if here else PLANETS[name]["day"]
+            daytime = self.daytime() if here else (self.tick % day) / day
+            frozen = 1 if here and self.day_frozen is not None else 0
+            out.append([name, day, int(daytime * 100000 + 0.5) % 100000, frozen])
+        return out
 
     # --- the other planets -------------------------------------------------------------------
 
@@ -1289,8 +1334,6 @@ class MockGame(mock_info.InfoMixin):
         return out
 
     LANE_REFRESH = 64
-    GROUPS_PER_PART = 150
-    MOVES_PER_PART = 400
 
     @staticmethod
     def lane_key(x, y):
@@ -1303,55 +1346,26 @@ class MockGame(mock_info.InfoMixin):
         """bi for a client that says bl, as belt_items.lua sends it: a lane whose items didn't
         change since its last read is read again once (settled) and then held, not sent, until it
         changes, every LANE_REFRESH updates, or leaves the square (dl). ln says which lane each
-        run of a part's items came from. For a client that also says bg, packed lanes are groups
-        (bg, bm; packed_lane)."""
+        run of a part's items came from."""
         lanes = {}
         for i in range(0, len(flat), 4):
             lanes.setdefault(self.lane_key(flat[i + 2] / 256, flat[i + 3] / 256), []).append(flat[i:i + 4])
         self.lane_count = getattr(self, "lane_count", 0) + 1
-        # Straight runs (br): the belt field's lanes but a column's first and last belt are plain,
-        # sent with pl once (and every LANE_REFRESH updates) and then moved by the client.
-        plain = self.plain_lanes(extra) if self.client.get("br") else {}
-        sent, emptied, groups, moves, pl = [], [], [], [], []
-        for key, info in sorted(plain.items()):
-            rec = self.lanes.get(key)
-            lanes.setdefault(key, [])
-            if rec and rec[1] == "plain" and (key + self.lane_count) % self.LANE_REFRESH:
-                continue
-            pl += [key] + info
+        sent, emptied = [], []
         for key, items in sorted(lanes.items()):
             sig = tuple(tuple(it) for it in items)
             rec = self.lanes.get(key)
             refresh = not (key + self.lane_count) % self.LANE_REFRESH
-            if key in plain:
-                if rec and rec[1] == "plain" and not refresh:
-                    continue
-                self.lanes[key] = [sig, "plain"]
-                sent.append((key, items))
-                continue
-            group = self.client.get("bg") and self.packed_lane(key, items)
-            if group:
-                # A group (bg): sent once, then its front item's place when it moved (bm), and again
-                # at its refresh; a lane that stops being packed is sent as items, which ends it.
-                front, kind = group[6], (group[1], group[7], group[9])
-                if rec and rec[0] == "group" and rec[1] == kind:
-                    if rec[2] != front:
-                        moves += [key, front, self.tick - rec[3]]
-                    if refresh:
-                        groups += group
-                else:
-                    groups += group
-                self.lanes[key] = ["group", kind, front, self.tick]
-                continue
             if rec and rec[0] == sig and rec[1] and not refresh:
                 continue
             self.lanes[key] = [sig, bool(rec and rec[0] == sig)]
             sent.append((key, items))
         dropped = []
-        for key in sorted(set(self.lanes) - set(lanes) - set(plain)):
+        for key in sorted(set(self.lanes) - set(lanes)):
             del self.lanes[key]
             tx, ty = key // 8 // 65536 - 32768, key // 8 % 65536 - 32768
-            if (tx + 0.5 - self.focus[0]) ** 2 + (ty + 0.5 - self.focus[1]) ** 2 < (extra["fr"] + 1) ** 2 * 2 and                     any(b.x == tx + 0.5 and b.y == ty + 0.5 for b in self.belt_tiles()):
+            if (tx + 0.5 - self.focus[0]) ** 2 + (ty + 0.5 - self.focus[1]) ** 2 < (extra["fr"] + 1) ** 2 * 2 and \
+                    any(b.x == tx + 0.5 and b.y == ty + 0.5 for b in self.belt_tiles()):
                 emptied.append(key)  # its items moved on or were taken off: sent with none
             else:
                 dropped.append(key)
@@ -1367,65 +1381,123 @@ class MockGame(mock_info.InfoMixin):
                 else:
                     ln += [key, 1]
         parts.append((part, ln))
-        # As belt_items.lua: GROUPS_PER_PART groups and MOVES_PER_PART moves to a part, more parts
-        # if need be.
-        per_g, per_m = self.GROUPS_PER_PART * 10, self.MOVES_PER_PART * 3
-        while len(parts) < max(math.ceil(len(groups) / per_g), math.ceil(len(moves) / per_m)):
-            parts.append(([], []))
         for i, (items, ln) in enumerate(parts):
             more = dict(extra, ln=([k for key in emptied for k in (key, 0)] if i == 0 else []) + ln)
             if i == 0:
                 more["dl"] = dropped
-                if pl:
-                    more["pl"] = pl
-            if moves[i * per_m:(i + 1) * per_m]:
-                more["bm"] = moves[i * per_m:(i + 1) * per_m]
-            if groups[i * per_g:(i + 1) * per_g]:
-                more["bg"] = groups[i * per_g:(i + 1) * per_g]
             st = self.stacks_in(items)
             if st:
                 more["st"] = st
             self.send_list("bi", i + 1, len(parts), items, 4, more)
 
-    def packed_lane(self, key, items):
-        """belt_items.lua's belt groups: the lane `key`'s items as a `bg` group if it is packed (the
-        belt field's full lanes: four items of one kind and stack size a quarter tile apart, on a
-        belt that runs south), else None. [lane key, item id, x, y of line position 0 (where items
-        leave, the belt's south edge), x, y of 1 (1/256 tile), front item's line position, gap
-        (1/256), speed (line positions a tick, 1/65536), stack size]."""
-        if len(items) != 4 or len({it[1] for it in items}) != 1 or items[0][0] < 20_000_000:
-            return None
-        if len({self.belt_stack(it[0]) for it in items}) != 1 or len({it[2] for it in items}) != 1:
-            return None
-        ys = sorted(it[3] for it in items)
-        if any(abs(b - a - 64) > 1 for a, b in zip(ys, ys[1:])):
-            return None
-        tx, ty = key // 8 // 65536 - 32768, key // 8 % 65536 - 32768
-        # Line positions fall as items go south; the front item below one gap (an item on the
-        # tile's north edge, at 1, is the tile to the north's at 0).
-        front = ((ty + 1) * 256 - ys[-1]) % 64
-        return [key, items[0][1], items[0][2], (ty + 1) * 256, items[0][2], ty * 256, front, 64,
-                round(BELT_SPEED * 65536), self.belt_stack(items[0][0])]
+    BS_PC_EVERY = 32
+    BS_PART_NUMBERS = 4000
+    BS_LOAD_PER_UPDATE = 32  # lanes loaded a update, nearest ring first (belt_sim.lua's first loads)
 
-    def plain_lanes(self, extra):
-        """{lane key: [key behind, key in front, x0, y0, x1, y1 (1/256), speed (1/65536)]} for the belt
-        field's plain lanes within the square: every column runs south, line position 0 at a belt's
-        south edge."""
-        fx, fy = extra["fx"] / 256, extra["fy"] / 256
-        r = extra["fr"]
-        out = {}
-        for column in getattr(self, "belt_field", []):
-            for j in range(1, len(column) - 1):
-                b = column[j]
-                if b.key() not in self.entities or column[j - 1].key() not in self.entities or column[j + 1].key() not in self.entities:
-                    continue
-                if abs(b.x - fx) >= r or abs(b.y - fy) >= r:
-                    continue
+    def send_belt_sim(self, flat, extra):
+        """bs for a client that simulates belts (belt_sim.lua), kept simple: every lane of the
+        mock's belts in the square (they all run south, line position 0 at a tile's south edge) is
+        sent with its meta (lm) and items (sl) when it comes into the square, again in sl whenever
+        the items on it are other items (the mock's belts wrap items round with new ids, as if put on
+        and taken off: what a watched lane reports) or the client asked (bre); every other lane
+        gets a drift check (pc) about every BS_PC_EVERY updates; lanes leaving go in dl.
+        First loads go BS_LOAD_PER_UPDATE lanes an update, nearest ring first: meanwhile `fr` is the
+        ring loading and `ld` is 1. A lane whose belt feeds a belt that isn't loaded leads out (lm
+        next -1, sent again when that changes); when its items only moved on alike its new front goes
+        in `ew` instead of sl."""
+        fx, fy, r = extra["fx"] / 256, extra["fy"] / 256, extra["fr"]
+        lanes, ring_of = {}, {}
+        present = set()
+        for b in self.belt_tiles():
+            if b.key() in self.entities:
+                present.add((b.x, b.y))
+            if abs(b.x - fx) < r and abs(b.y - fy) < r:
                 for dx in (-0.25, 0.25):
-                    x = b.x + dx
-                    out[self.lane_key(x, b.y)] = [self.lane_key(x, b.y - 1), self.lane_key(x, b.y + 1),
-                                                   fixed(x), fixed(b.y + 0.5), fixed(x), fixed(b.y - 0.5), int(BELT_SPEED * 65536)]
-        return out
+                    key = self.lane_key(b.x + dx, b.y)
+                    lanes[key] = []
+                    ring_of[key] = math.floor(max(abs(b.x - fx), abs(b.y - fy)))
+        for i in range(0, len(flat), 4):
+            uid, item, x, y = flat[i:i + 4]
+            key = self.lane_key(x / 256, y / 256)
+            if key in lanes:
+                ty = key // 8 % 65536 - 32768
+                lanes[key].append((min(256, max(0, (ty + 1) * 256 - y)), uid, item))
+        self.bs_count = getattr(self, "bs_count", 0) + 1
+        loaded = getattr(self, "bs_lanes", {})
+        nexts = getattr(self, "bs_next", {})
+        asked = getattr(self, "bs_bre", set())
+        self.bs_bre = set()
+        # First loads, nearest ring first, at most BS_LOAD_PER_UPDATE an update.
+        waiting = sorted((ring_of[key], key) for key in lanes if key not in loaded)
+        load = {key for _, key in waiting[:self.BS_LOAD_PER_UPDATE]}
+        rest = waiting[self.BS_LOAD_PER_UPDATE:]
+        loading = bool(rest)
+        if loading:
+            r = min(r, rest[0][0])
+        for key in list(lanes):
+            if key not in loaded and key not in load:
+                del lanes[key]
+        step = round(BELT_SPEED * 256)
+        lm, sl, pc, ew = [], [], [], []
+        k = self.tick
+        for key, items in sorted(lanes.items()):
+            items.sort()
+            uids = tuple(it[1] for it in items)
+            tx, ty = key // 8 // 65536 - 32768, key // 8 % 65536 - 32768
+            # The lane it feeds: the same half of the belt to the south, when there is one.
+            ahead = self.lane_key(tx + (0.25 if key % 8 == 1 else 0.75), ty + 1)
+            out = (tx + 0.5, ty + 1.5) in present and ahead not in lanes
+            nxt = -1 if out else 0
+            new = key not in loaded
+            if new or key in asked or nexts.get(key) != nxt:
+                x = fixed(tx + (0.25 if key % 8 == 1 else 0.75))
+                lm += [key, 1, 256, step, x, fixed(ty + 1), x, fixed(ty + 0.5), x, fixed(ty), 0, nxt]
+                sl += [key, k, len(items)]
+                for pos, uid, item in items:
+                    sl += [uid, item, pos, min(4, self.belt_stack(uid))]
+            elif tuple(it[1] for it in loaded[key]) != uids:
+                sl += [key, k, len(items)]
+                for pos, uid, item in items:
+                    sl += [uid, item, pos, min(4, self.belt_stack(uid))]
+            elif out:
+                # Leading out, the same items: moved on alike, its new wall alone (ew); otherwise read.
+                moved = {old[0] - pos for old, (pos, _, _) in zip(loaded[key], items)}
+                if len(moved) == 1 and min(moved) > 0:
+                    ew += [key, k, items[0][1], items[0][0]]
+                elif moved and moved != {0}:
+                    sl += [key, k, len(items)]
+                    for pos, uid, item in items:
+                        sl += [uid, item, pos, min(4, self.belt_stack(uid))]
+            elif (key + self.bs_count) % self.BS_PC_EVERY == 0:
+                pc += [key, k, len(items), items[0][0] if items else -1, items[-1][0] if items else -1]
+            loaded[key] = tuple((pos, uid) for pos, uid, _ in items)
+            nexts[key] = nxt
+        dl = sorted(set(loaded) - set(lanes))
+        for key in dl:
+            del loaded[key]
+            nexts.pop(key, None)
+        self.bs_lanes, self.bs_next = loaded, nexts
+        parts = [{}]
+        size = 0
+        for field, flat_list, width in (("dl", dl, 1), ("lm", lm, 12), ("ew", ew, 4), ("pc", pc, 5)):
+            for j in range(0, len(flat_list), width):
+                if size and size + width > self.BS_PART_NUMBERS:
+                    parts.append({})
+                    size = 0
+                parts[-1].setdefault(field, []).extend(flat_list[j:j + width])
+                size += width
+        j = 0
+        while j < len(sl):
+            w = 3 + sl[j + 2] * 4
+            if size and size + w > self.BS_PART_NUMBERS:
+                parts.append({})
+                size = 0
+            parts[-1].setdefault("sl", []).extend(sl[j:j + w])
+            size += w
+            j += w
+        for i, more in enumerate(parts):
+            self.send_now({"t": "bs", "k": k, "part": i + 1, "parts": len(parts), "p": extra["p"], "w": extra["w"],
+                           "fx": extra["fx"], "fy": extra["fy"], "fr": int(r), **({"ld": 1} if loading else {}), **more})
 
     def belt_tiles(self):
         return list(self.belt or []) + [b for column in getattr(self, "belt_field", []) for b in column]
@@ -1439,7 +1511,7 @@ class MockGame(mock_info.InfoMixin):
         starter = [(b, IID[self.belt_lanes[1]], IID[self.belt_lanes[0]], 2, 1) for b in self.belt]
         field = [(b, IID[BELT_FIELD_ITEMS[(c * 2) % len(BELT_FIELD_ITEMS)]], IID[BELT_FIELD_ITEMS[(c * 2 + 1) % len(BELT_FIELD_ITEMS)]], 4,
                   4 if c % 4 == 1 else 1)
-                 for c, column in enumerate(self.belt_field) for b in column]
+                 for c, column in enumerate(self.belt_field) if c >= self.belts_empty for b in column]
         piles = {}
         for belt, a, b, n, h in starter + field:
             if belt.key() not in self.entities:
@@ -1463,11 +1535,23 @@ class MockGame(mock_info.InfoMixin):
                     msg["h"] = piles[chunk]  # how high the lanes' stacks are piled
                 self.send_now(msg)
 
-    def build_belt_field(self, cols, rows, x0=12, y0=-16):
-        """Full belts side by side running south (--belt-field), every lane its own item."""
+    def build_belt_field(self, cols, rows, x0=12, y0=-16, tiers=False):
+        """Full belts side by side running south (--belt-field), every lane its own item. With
+        `tiers` (--belt-tiers) the columns go yellow, red, blue, green in blocks of four."""
         add = lambda name, x, y: self.add(Entity(self._unit(), name, x, y, 8, {"s": "s"}))
+        name = lambda c: ("", "fast-", "express-", "turbo-")[(c // 4) % 4] + "transport-belt" if tiers else "transport-belt"
         self.belt_field_rect = (x0 - 12, y0 - 12, x0 + cols + 12, y0 + rows + 12)
-        self.belt_field = [[add("transport-belt", x0 + c + 0.5, y0 + r + 0.5) for r in range(rows)] for c in range(cols)]
+        self.belt_field = [[add(name(c), x0 + c + 0.5, y0 + r + 0.5) for r in range(rows)] for c in range(cols)]
+
+    def wire_belts_off(self, cols):
+        """--belts-off: the belt field's first columns empty, every other one wired together and
+        switched off and on every 5 s, to watch bare surfaces run and stop."""
+        self.belts_empty = cols
+        for column in self.belt_field[:cols:2]:
+            for a, b in zip(column, column[1:]):
+                a.extra.setdefault("r", []).append(b.unit)
+                b.extra.setdefault("r", []).append(a.unit)
+            self.belts_off += column
 
     def build_busy_base(self, cols=60, rows=40, x0=-150, y0=40, robots=300):
         """--busy: a factory of about 20,000 entities south of the base for measuring the bridge's
@@ -1546,6 +1630,8 @@ class MockGame(mock_info.InfoMixin):
         out = []
         n = len(BELT_FIELD_ITEMS)
         for c, column in enumerate(self.belt_field):
+            if c < self.belts_empty:
+                continue
             length = len(column)
             top = column[0].y - 0.5
             for lane, dx in enumerate((-0.25, 0.25)):
@@ -1582,7 +1668,68 @@ class MockGame(mock_info.InfoMixin):
         return out
 
     def daytime(self):
-        return (0.15 + self.tick / self.day_length) % 1.0
+        if self.day_frozen is not None:
+            return self.day_frozen
+        return (0.15 + self.day_offset + self.tick / self.day_length) % 1.0
+
+    def release_hold(self):
+        if self.hold is not None and self.speed == 0.01:
+            self.speed = self.hold[0]
+        self.hold = None
+
+    def debug_command(self, words):
+        """console.lua's /f3d-debug: [lines, its dbg state]."""
+        def num(i):
+            try:
+                v = float(words[i])
+            except (IndexError, ValueError):
+                return None
+            return v if math.isfinite(v) else None
+        what = words[0] if words else "state"
+        lines = ["/f3d-debug [state | daytime <0-1> | freeze [on | off] | speed <x> | pause [on | off] | hold [on | off] | teleport <x> <y>]"]
+        p = self.player
+        if what == "state":
+            lines = [f"Time of day {self.daytime():.3f}, speed {self.speed:g}x, on {self.surface}"]
+        elif what == "daytime" and num(1) is not None:
+            v = num(1) % 1.0
+            if self.day_frozen is not None:
+                self.day_frozen = v
+            self.day_offset = v - (0.15 + self.tick / self.day_length)
+            lines = [f"Time of day on {self.surface}: {v:.3f}"]
+        elif what == "freeze":
+            on = {"on": True, "off": False}.get(words[1] if len(words) > 1 else "", self.day_frozen is None)
+            if on and self.day_frozen is None:
+                self.day_frozen = self.daytime()
+            elif not on and self.day_frozen is not None:
+                self.day_offset = self.day_frozen - (0.15 + self.tick / self.day_length)
+                self.day_frozen = None
+            lines = [f"The day/night cycle on {self.surface} " + ("is frozen" if on else "runs")]
+        elif what == "speed" and num(1) is not None:
+            self.speed = max(0.05, min(16.0, num(1)))
+            lines = [f"Game speed {self.speed:g}x"]
+        elif what == "pause":
+            self.paused = {"on": True, "off": False}.get(words[1] if len(words) > 1 else "", not self.paused)
+            lines = ["The game is paused" if self.paused else "The game runs"]
+        elif what == "hold":
+            # A screenshot's hold (console.lua): the slowest speed, the speed before back on off.
+            if len(words) > 1 and words[1] in ("off", "0"):
+                self.release_hold()
+                lines = ["The game runs"]
+            elif self.paused:
+                lines = ["The game is paused already"]
+            else:
+                if self.hold is None:
+                    self.hold = [self.speed, 0]
+                    self.speed = 0.01
+                self.hold[1] = self.tick + 30
+                lines = ["The game is held for a screenshot"]
+        elif what == "teleport" and num(1) is not None and num(2) is not None:
+            p["x"], p["y"] = num(1), num(2)
+            lines = [f"Moved the character to {p['x']:.1f}, {p['y']:.1f}"]
+        state = {"dt": round(self.daytime(), 3), "fz": 0 if self.day_frozen is None else 1, "sp": self.speed,
+                 "pa": 1 if self.paused else 0, "hd": 0 if self.hold is None else 1, "ad": 0, "s": self.surface,
+                 "x": fixed(p["x"]), "y": fixed(p["y"]), "sx": 0, "sy": 0}
+        return lines, state
 
     # --- networking -----------------------------------------------------------------------
 
@@ -1622,6 +1769,12 @@ class MockGame(mock_info.InfoMixin):
         tier, longest, _ = RATE_JOBS[job]
         over = (getattr(self, "rate", 0) if level is None else level) - tier + 1
         return interval if over <= 0 else max(interval, min(interval * 2 ** over, longest))
+
+    def photo_on(self):
+        """A screenshot is loading its chunks (`photo`, photo.lua)."""
+        if self.photo_until is not None and self.tick >= self.photo_until:
+            self.photo_until = None
+        return self.photo_until is not None
 
     def rate_due(self, job, interval):
         def on_ticks(level):
@@ -1663,7 +1816,7 @@ class MockGame(mock_info.InfoMixin):
         self.subs, self.queue = {}, []
         p = self.player
         welcome = self.surface_fields({"t": "welcome", "v": PROTOCOL, "mod": "mock", "u": p["unit"],
-                                       "x": fixed(p["x"]), "y": fixed(p["y"]), "mp": True,
+                                       "x": fixed(p["x"]), "y": fixed(p["y"]), "mp": True, "sq": 50,
                                        "mods": {"base": "2.1.24", "factorio-3d-bridge": "mock"}})
         if getattr(self, "mod_gfx", None):
             self.mod_gfx.welcome_fields(welcome)
@@ -1813,22 +1966,25 @@ class MockGame(mock_info.InfoMixin):
                 self.client = {"addr": addr, "sid": sid, "last_seen": self.tick, "handshake": self.tick, "resync": -1000,
                                "chat_at": self.tick + 240,
                                "z": msg.get("z") == 1, "dc": msg.get("dc") == 1, "b": msg.get("b") == 1,
-                               "bl": msg.get("bl") == 1, "bg": msg.get("bl") == 1 and msg.get("bg") == 1,
-                               "br": msg.get("bl") == 1 and msg.get("br") == 1}
-                self.lanes = {}
+                               "bl": msg.get("bl") == 1, "bs": msg.get("bs") == 1, "mg": msg.get("mg") != 0}
+                self.lanes, self.bs_lanes, self.bs_next = {}, {}, {}
                 self.rate, self.rate_from, self.rate_at = 0, 0, -10 ** 9
+                self.photo_until = None
                 self.handshake()
             else:
                 self.client["last_seen"] = self.tick
                 self.client["z"] = msg.get("z") == 1
                 self.client["b"] = msg.get("b") == 1
-                bg = msg.get("bl") == 1 and msg.get("bg") == 1
-                br = msg.get("bl") == 1 and msg.get("br") == 1
-                if self.client.get("bl") != (msg.get("bl") == 1) or self.client.get("bg") != bg or self.client.get("br") != br:
-                    self.lanes = {}
+                bs = msg.get("bs") == 1
+                if self.client.get("bl") != (msg.get("bl") == 1) or self.client.get("bs") != bs:
+                    self.lanes, self.bs_lanes, self.bs_next = {}, {}, {}
                 self.client["bl"] = msg.get("bl") == 1
-                self.client["bg"] = bg
-                self.client["br"] = br
+                self.client["bs"] = bs
+                # Mods' windows (mod_gui.lua): off only for a client that says so; the ones drawn go.
+                if self.client.get("mg") and msg.get("mg") == 0:
+                    self.send_now({"t": "mgui", "ids": [], "l": []})
+                    self.mgui_button_sent = False
+                self.client["mg"] = msg.get("mg") != 0
                 if msg.get("dc") == 1 and not self.client.get("dc"):
                     self.client["dc"] = True
                     self.send_parts("dprotos", [[DID[name], name] for name in DECORATIVE_PROTOS])
@@ -1856,7 +2012,10 @@ class MockGame(mock_info.InfoMixin):
             self.client = None
         elif t == "sub":
             # Same rules as the mod: newly subscribed chunks are queued nearest first.
-            wanted = [(int(c[0]), int(c[1])) for c in msg.get("c", []) if isinstance(c, list) and len(c) >= 2]
+            if "w" in msg:
+                wanted = square_chunks(msg)
+            else:
+                wanted = [(int(c[0]), int(c[1])) for c in msg.get("c", []) if isinstance(c, list) and len(c) >= 2]
             old = self.subs
             self.subs = {c: True for c in wanted}
             self.queue = [c for c in self.queue if c in self.subs]
@@ -1969,7 +2128,9 @@ class MockGame(mock_info.InfoMixin):
                        "f3d-status": ["[Zenith] the mock server"]}
             name = words[0] if words else ""
             reply = {"t": "cmdr", "id": int(msg.get("id", 0)), "l": answers.get(name, [])}
-            if name not in answers:
+            if name == "f3d-debug":
+                reply["l"], reply["dbg"] = self.debug_command(words[1:])
+            elif name not in answers:
                 reply["ok"] = 0
             self.send_reliable(reply)
         elif t == "mpress":
@@ -2006,15 +2167,18 @@ class MockGame(mock_info.InfoMixin):
                 self.rate_from, self.rate_at = getattr(self, "rate", 0), self.tick
             self.rate = level
         elif t == "bre":
-            # belt_items.lua's resend: plain lanes the client has otherwise are read (sent) again.
-            for key in msg.get("l", []) if isinstance(msg.get("l"), list) else []:
-                self.lanes.pop(key, None)
+            # belt_sim.lua's resend: lanes the client has otherwise are read (sent with lm) again.
+            for key in (msg.get("l", []) if isinstance(msg.get("l"), list) else [])[:512]:
+                if isinstance(key, int):
+                    self.bs_bre = getattr(self, "bs_bre", set()) | {key}
         elif t == "bfar":
             self.far_r = max(0, min(1024, int(msg.get("r", 0) or 0)))
             n = msg.get("n")
             self.near_r = max(0, min(640, int(n))) if isinstance(n, (int, float)) else None  # belt_items.lua's MAX_NEAR
             m = msg.get("m")
             self.bi_cap = max(200, min(100000, int(m))) if isinstance(m, (int, float)) and m > 0 else None
+        elif t == "photo":
+            self.photo_until = self.tick + PHOTO_LAPSE if msg.get("on") == 1 else None
         elif t == "budget":
             u = msg.get("u")
             if isinstance(u, (int, float)) and u == u:
@@ -3377,6 +3541,9 @@ class MockGame(mock_info.InfoMixin):
             if "col" not in m or not (isinstance(msg.get("c"), list) and len(msg["c"]) == 3):
                 return self.message("That has no colour to set")
             m["col"] = [max(0, min(255, int(v))) for v in msg["c"]]
+            if entity.type == "train-stop":
+                entity.extra["col"] = m["col"]
+                self.send_reliable({"t": "upd", "e": entity.record()})
         elif t == "set_pump":
             if "pf" not in m:
                 return self.message("That isn't a pump")
@@ -3741,7 +3908,7 @@ class MockGame(mock_info.InfoMixin):
         f = min(1.0, tr["t"] / ticks)
         gx, gy = tr["ground"]
         if state == "ascending":
-            climb = (RIDE_CLIMB if tr["legs"] is RIDE_UP else POD_CLIMB) * f * f
+            climb = RIDE_CLIMB * f ** 2.42 if tr["legs"] is RIDE_UP else POD_CLIMB * f * f
             p["x"], p["y"] = tr["start"][0] - (0.0 if tr["legs"] is RIDE_UP else 60.0 * f * f), tr["start"][1] - climb
         elif state == "descending":
             drop = (HUB_DROP if tr["legs"] is RIDE_UP else POD_DROP) * (1 - f) ** 2
@@ -4026,7 +4193,7 @@ class MockGame(mock_info.InfoMixin):
         if self.tick % 60 == 0:
             self.send_now(self.character_info())
             self.send_now({"t": "pl", "me": 0, "u": self.player["unit"], "l": MOCK_PLAYERS})
-            if MOD_WINDOW:
+            if MOD_WINDOW and self.client.get("mg"):
                 # mod_gui.lua's `mgui`: a mod's window on the player's screen and its top button, one
                 # message per window, each with Factorio's window size and UI scale (ds). The window
                 # changes every time (its tick); the button is sent first and then every 5 s, as all are.
@@ -4214,8 +4381,11 @@ class MockGame(mock_info.InfoMixin):
         if self.tick % 60 == 0:
             self.send_now(self.alert_message())
             # What the bridge did each tick (budget.lua): the mock does its work in one go, so none.
-            self.send_now({"t": "wb", "b": self.work_budget, "avg": 0, "max": 0, "over": 0, "n": 60,
-                           "q": {"chunks": len(self.queue), "map": len(self.map_queue), "reqs": 0, "radars": 0, "techs": 0}})
+            wb = {"t": "wb", "b": self.work_budget, "avg": 0, "max": 0, "over": 0, "n": 60,
+                  "q": {"chunks": len(self.queue), "map": len(self.map_queue), "reqs": 0, "radars": 0, "techs": 0}}
+            if self.photo_on():
+                wb["ph"] = 1
+            self.send_now(wb)
             if self.remote_view:
                 self.send_view_coverage()
         if self.tick == self.client.get("chat_at", -1):
@@ -4231,8 +4401,10 @@ class MockGame(mock_info.InfoMixin):
         if self.surface == "nauvis":
             self.tick_trains()
             self.tick_logistics()
-        budget = CHUNKS_PER_TICK
-        while budget and self.queue and len(self.outbox) < MAX_BACKLOG:
+        photo = self.photo_on()
+        budget = CHUNKS_PER_TICK * (PHOTO_FACTOR if photo else 1)
+        backlog = PHOTO_BACKLOG if photo else MAX_BACKLOG
+        while budget and self.queue and len(self.outbox) < backlog:
             c = self.queue.pop(0)
             if c in self.subs:
                 self.snapshot(*c)
@@ -4262,9 +4434,12 @@ class MockGame(mock_info.InfoMixin):
         if self.rate_due("bi", BELT_ITEM_INTERVAL):
             fx, fy, fr = self.focus
             # belt_items.lua's near_radius: the client's distance as asked, else the map setting within the focus.
-            r = min(BELT_ITEM_RADIUS, fr) if near is None else near
+            # belt_sim.lua's radius (bs): the client's distance, else the map setting; its Belt updates (bfar m)
+            # don't bound the square.
+            bs = self.client.get("bs")
+            r = (BELT_ITEM_RADIUS if bs else min(BELT_ITEM_RADIUS, fr)) if near is None else near
             moving = self.belt_items() + self.belt_field_items()
-            cap = getattr(self, "bi_cap", None)
+            cap = None if bs else getattr(self, "bi_cap", None)
             if cap:
                 # belt_items.lua: whole rings round the focus up to the client's cap (bfar m).
                 rings = {}
@@ -4291,7 +4466,9 @@ class MockGame(mock_info.InfoMixin):
             # w: the work the reading took (belt_items.lua's units: about 6 an item read and written).
             extra = {"fx": fixed(fx), "fy": fixed(fy), "fr": int(r), "p": self.rate_period("bi", BELT_ITEM_INTERVAL),
                      "w": len(flat) // 4 * 6}
-            if self.client.get("bl"):
+            if self.client.get("bs"):
+                self.send_belt_sim(flat, extra)
+            elif self.client.get("bl"):
                 self.send_belt_lanes(flat, extra)
             else:
                 per = ITEMS_PER_MESSAGE * 4
@@ -4342,11 +4519,16 @@ class MockGame(mock_info.InfoMixin):
             d = self.daytime() if self.surface == "nauvis" else (self.tick % PLANETS[self.surface]["day"]) / PLANETS[self.surface]["day"] \
                 if self.surface in PLANETS else 0.0
             self.send_now({"t": "sky", "d": int(d * 1000) % 1000, "n": int(darkness_at(d) * 1000 + 0.5)})
+        if self.belts_off and self.tick % 300 == 0:
+            state = 5 if self.tick // 300 % 2 else 0
+            self.send_reliable({"t": "st", "l": [v for b in self.belts_off for v in (b.unit, state)]})
         if self.tick % 30 == 0:
             changes = []
             for e in self.entities.values():
                 if e.unit and e.type in ANIMATED_TYPES:
                     on = 1 if e.type == "lamp" or self.always_working or (self.tick // 300 + e.unit) % 3 else 0
+                    if e.type == "rocket-silo" and self.surface == "nauvis":
+                        on = self.space.silo_state(e) or on
                     if self.working.get(e.unit) != on:
                         self.working[e.unit] = on
                         changes += [e.unit, on]
@@ -4724,9 +4906,23 @@ class MockGame(mock_info.InfoMixin):
             self.sock.ioctl(socket.SIO_UDP_CONNRESET, False)
         print(f"mock Factorio listening on {host}:{port} (drop rate {self.drop:.0%}). Start the client.")
         next_tick = time.perf_counter()
+        paused_steps = 0
         while True:
-            self.step()
-            next_tick += 1 / TICKS_PER_SECOND
+            if self.paused:
+                # Paused (/f3d-debug pause): the bridge still reads packets and the client still hears
+                # from it twice a second, but the game stands still.
+                self.receive()
+                paused_steps += 1
+                if paused_steps % 30 == 0 and self.client:
+                    self.send_now({"t": "sky", "d": int(self.daytime() * 1000) % 1000, "n": int(darkness_at(self.daytime()) * 1000 + 0.5)})
+                self.flush()  # the answers to commands meanwhile (resume)
+                for addr in list(self.batches):
+                    self.send_batch(addr)
+            else:
+                self.step()
+                if self.hold is not None and (self.tick >= self.hold[1] or self.speed != 0.01):
+                    self.release_hold()  # nobody let go of the screenshot's hold (console.lua's watchdog)
+            next_tick += 1 / (TICKS_PER_SECOND * (1.0 if self.paused else self.speed))
             delay = next_tick - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)
@@ -4751,6 +4947,10 @@ def main():
                         "ground in a grid west of the start (use --start=-20,8 to look at it)")
     parser.add_argument("--belt-field", metavar="COLSxROWS", help="a block of full belts east of the base (e.g. 40x30) "
                         "for watching thousands of items; use --start 32,0 to stand in it")
+    parser.add_argument("--belts-off", type=int, default=0, metavar="COLS", help="the --belt-field's first COLS columns "
+                        "empty, every other one switched off and on by the circuit network every 5 s")
+    parser.add_argument("--belt-tiers", action="store_true", help="the --belt-field's columns yellow, red, blue and "
+                        "green in blocks of four, for watching their surfaces (with --belts-off; items keep yellow speed)")
     parser.add_argument("--build-demo", action="store_true", help="concrete, hazard concrete, tile ghosts and a rail "
                         "south-west of the start, to look at tiles and the rail planner")
     parser.add_argument("--planet", choices=[p for p in PLANETS if p != "nauvis"], help="start on another planet's surface")
@@ -4842,7 +5042,8 @@ def main():
         game.build_demo(*start)
     if args.belt_field:
         cols, rows = (int(v) for v in args.belt_field.lower().split("x"))
-        game.build_belt_field(cols, rows)
+        game.build_belt_field(cols, rows, tiers=args.belt_tiers)
+        game.wire_belts_off(args.belts_off)
     if args.auto_launch:
         game.machine(game.space.silo)["auto"] = 1
     if args.busy:

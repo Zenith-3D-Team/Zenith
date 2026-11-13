@@ -198,7 +198,7 @@ for _prefix, _k in (("small-", 0.5625), ("medium-", 0.75), ("big-", 1.0)):
 # A dead stomper's shell (gleba.py): its collision box (1.8 x 1.45 either side at the tier's
 # stomper_scale, 1.1 x 0.9 / 1.2 / 1.6), the torso squashed to it, lying a little past it and sunk.
 for _prefix, _ss in (("small-", 0.99), ("medium-", 1.32), ("big-", 1.76)):
-    SPECS[_prefix + "stomper-shell"] = {"size": (3.6 * _ss, 2.9 * _ss), "budget": MACHINE, "fill": (0.5, 0.5),
+    SPECS[_prefix + "stomper-shell"] = {"size": (3.6 * _ss, 2.9 * _ss), "budget": MACHINE * 2, "fill": (0.5, 0.5),
                                         "overhang": 1.0 * _ss, "centre": 0.6 * _ss, "sink": 0.3 * _ss}
 SPECS["big-wriggler-pentapod"] = {"size": (1.8, 1.8), "budget": LOGISTICS * 2, "fill": (0.5, 0.5), "overhang": 2.5,
                                   "centre": 0.3, "sink": 0.05}
@@ -345,7 +345,7 @@ SPECS["crusher-east"] = {"size": (3, 2), "budget": MACHINE, "overhang": 0.3, "ba
 SPECS["foundry"] = {"size": (5, 5), "budget": MACHINE, "overhang": 0.6, "centre": 0.2}
 # Its output chute pokes out north of the footprint.
 SPECS["big-mining-drill"] = {"size": (5, 5), "budget": MACHINE, "overhang": 0.2}
-SPECS["electromagnetic-plant"] = {"size": (4, 4), "budget": MACHINE, "overhang": 0.6, "centre": 0.2}
+SPECS["electromagnetic-plant"] = {"size": (4, 4), "budget": MACHINE * 3 // 2, "overhang": 0.6, "centre": 0.2}
 SPECS["recycler"] = {"size": (1.8, 3.7), "budget": MACHINE, "overhang": 0.36}
 SPECS["lightning-rod"] = {"size": (1, 1), "budget": LOGISTICS * 2, "fill": (0.5, 0.5), "overhang": 0.2}
 SPECS["lightning-collector"] = {"size": (2, 2), "budget": MACHINE, "overhang": 0.25}

@@ -5,9 +5,16 @@
 --     storage, and sent at a bounded byte rate. The client asks for a resync on a gap.
 --   * immediate: frequent state that the next update replaces anyway (player, movers).
 
+local profile = require("scripts.profile")
+local photo = require("scripts.photo")
+
 local M = {}
 
 local warned = false
+
+-- What this tick sent (datagrams, bytes), for the trace (`f3dsend` lines beside `f3dtrace`'s, end_tick):
+-- measuring only, module-local.
+local sent_n, sent_bytes = 0, 0
 
 -- On a server only the server instance talks to the client. Single-player has no separate
 -- server, so the local instance sends.
@@ -36,6 +43,7 @@ local function send_datagram(port, data)
     warned = true
     log("[factorio-3d-bridge] send_udp failed: " .. tostring(err))
   end
+  sent_n, sent_bytes = sent_n + 1, sent_bytes + #data
 end
 
 -- Sending a datagram costs the game about a millisecond whatever its size (helpers.send_udp in
@@ -79,6 +87,11 @@ function M.end_tick()
   for port in pairs(batches) do
     send_batch(port)
   end
+  if profile.tracing() then
+    -- The tick's datagrams and bytes: tools/trace_sends.py reads them beside f3dtrace's times.
+    log("f3dsend " .. game.tick .. " " .. sent_n .. " " .. sent_bytes)
+  end
+  sent_n, sent_bytes = 0, 0
 end
 
 -- Reads pending packets; each one arrives later as on_udp_packet_received.
@@ -102,6 +115,14 @@ function M.send_text(t, fields)
   local client = storage.f3d.client
   if client then
     send_raw(client.port, '{"t":"' .. t .. '","k":' .. game.tick .. fields .. "}")
+  end
+end
+
+-- The same, stamped with tick `k` instead of this one (a part sent after its update's tick).
+function M.send_text_at(t, k, fields)
+  local client = storage.f3d.client
+  if client then
+    send_raw(client.port, '{"t":"' .. t .. '","k":' .. k .. fields .. "}")
   end
 end
 
@@ -237,6 +258,9 @@ function M.flush()
   local s = storage.f3d
   local client = s.client
   local budget = settings.global["f3d-bytes-per-tick"].value
+  if photo.on() then
+    budget = budget * photo.BYTES -- a screenshot loading its chunks (photo.lua)
+  end
   local sent = 0
   while s.outbox_head <= s.outbox_tail and sent < budget do
     local msg = s.outbox[s.outbox_head]

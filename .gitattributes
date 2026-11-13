@@ -1,0 +1,13 @@
+# Git for Windows' default (core.autocrlf) checks text files out with CRLF, while Godot writes its
+# own files with LF. The blobs are LF either way, so `git diff` is empty, but a size that differs
+# from the one in the index makes git report the file as modified without comparing it: 690
+# "modified" .import files after every `godot --import`. These stay LF in every checkout.
+*.import text eol=lf
+*.uid text eol=lf
+
+# Run on Linux and macOS, and packed into the downloads from whatever checkout builds them: with
+# CRLF their #! line doesn't work.
+*.sh text eol=lf
+
+# cmd.exe reads batch files line by line and can misread labels and blocks in one with LF endings.
+*.bat text eol=crlf

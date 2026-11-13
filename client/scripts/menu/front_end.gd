@@ -26,6 +26,10 @@ extends CanvasLayer
 ##   --menu-save-as=<name>   ... with Save as under that name instead
 ##   --menu-exit-after=<s>   once in the game that long, exit to the menu (saving)
 ##   --menu-quit-after-exit   then quit (end-to-end tests)
+##   --perf-test[=quick|default|extensive]   the performance test (perf_test.gd): without a mode its
+##     choice opens; with one it runs at once and Zenith quits when it ends (exit code 0, 2 when a
+##     test gave no numbers, 1 when it stopped), printing where the results file is. Dev builds only
+##     (Settings.dev_tools()): a public download says so and quits with exit code 3
 
 const ExitGuard := preload("res://scripts/menu/exit_guard.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
@@ -46,6 +50,7 @@ const AddonsWindow := preload("res://scripts/menu/addons_window.gd")
 const AddonRequests := preload("res://scripts/addons/addon_requests.gd")
 const GameSwap := preload("res://scripts/menu/game_swap.gd")
 const Controls := preload("res://scripts/player/controls.gd")
+const PerfTest := preload("res://scripts/menu/perf_test.gd")
 
 ## Zenith's version, from the project settings (application/config/version, the same as the mod's
 ## info.json: tools/release/package.py checks the two agree).
@@ -90,6 +95,12 @@ var _quit_after_exit := false
 var _played_seconds := 0.0
 ## The saves page's purpose: "load" (play it here) or "host" (open it to the network).
 var _worlds_mode := "load"
+## The performance test while it runs (perf_test.gd), and what this program's own frames were
+## before it (kept low meanwhile, so the window behind the test's Zenith costs next to nothing).
+var _perf: Node = null
+var _perf_before := {}
+## A stand-in for perf_game.gd (the UI test's), used by the next performance test instead.
+var perf_runner: Node = null
 
 
 func _ready() -> void:
@@ -169,6 +180,15 @@ func open_menu() -> void:
 		if preset == "last":
 			map_settings = MapGen.from_stored(str(Settings.get_value("new_game", "settings")) if Settings.has_value("new_game", "settings") else "")
 		_create_and_launch.call_deferred(parts[0], map_settings, parts[2] if parts.size() > 2 else "")
+	if Settings.has_arg("--perf-test") and not Settings.dev_tools():
+		printerr("--perf-test is in Zenith's development builds only; this is a public download")
+		get_tree().quit.call_deferred(PERF_NOT_IN_BUILD)
+	elif Settings.has_arg("--perf-test"):
+		var perf_mode := Settings.arg_value("--perf-test=").to_lower()
+		if PerfTest.MODES.has(perf_mode):
+			_start_perf_test.call_deferred(perf_mode, true)
+		else:
+			_show_perf_test.call_deferred()
 
 
 ## Started straight into a game (--factorio-port): no menu until Esc → Exit to menu.
@@ -191,6 +211,9 @@ func covers_game() -> bool:
 
 
 func _process(delta: float) -> void:
+	var swapped := GameSwap.poll()
+	if swapped != "" and main != null and main.hud != null:
+		main.hud.show_message(swapped)
 	match state:
 		State.CONNECTING:
 			_update_connecting()
@@ -235,7 +258,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 	if _settings != null:
 		return  # the settings window handles its own Esc (a key being rebound, or close)
-	if not _overlays.is_empty():
+	if _perf != null:
+		_perf.cancel()  # Esc stops the performance test; it cleans up and comes back to the menu
+	elif not _overlays.is_empty():
 		_pop_overlay()
 	elif state == State.PLAYING:
 		# Esc closes what the HUD has open first (windows, the map, choosers, the remote view); this
@@ -377,6 +402,8 @@ func _show_main_menu(sub := "") -> void:
 			add.call("Settings", func() -> void: _show_settings(""))
 			add.call("Mods", _show_mods, "The mods the server plays with")
 			add.call("Add-ons", func() -> void: _show_addons(""), "Zenith's add-ons: switch them on and off, their settings and keys")
+			if Settings.dev_tools():
+				add.call("Performance test", _show_perf_test, PERF_TIP)
 			add.call("Report a bug", _report_bug, BUG_TIP)
 			add.call("About", _show_about)
 			add.call("Exit", func() -> void: _quit(true))
@@ -999,11 +1026,155 @@ func _show_confirm(title: String, text: String, confirm_text: String, on_confirm
 	_push_overlay(o)
 
 
+# --- the performance test --------------------------------------------------------------------
+
+## --perf-test's exit code in a public download, which has no performance test.
+const PERF_NOT_IN_BUILD := 3
+const PERF_TIP := "Measures how smoothly Zenith runs on this PC: Factorio in the background on a test map of its own, Zenith full screen for each test, then one text file to send"
+
+
+## The performance test (perf_test.gd, docs/PERFORMANCE-TEST.md): what it does, and its three modes.
+func _show_perf_test() -> void:
+	if state != State.MENU or _perf != null or not Settings.dev_tools():
+		return
+	var o := MenuKit.overlay(0.35)
+	o.name = "PerfTestChoice"
+	var parts := MenuKit.window("Performance test")
+	MenuKit.overlay_center(o).add_child(parts[0])
+	var box: VBoxContainer = parts[1]
+	box.add_child(MenuKit.paragraph("This measures how smoothly Zenith runs on this PC. It starts Factorio in the background on a test map of its own, builds the same small factory every time and lets Zenith look at it standing still and running laps round it, full screen, a few times. Your own saves, mods and settings are not touched. At the end it writes one text file to send back.\n\nClose other games first. While it runs, please leave the mouse and keyboard alone and don't run anything heavy; Esc stops it.", 540))
+	var inner := Kit.panel("FShallowFrame")
+	var pad := MarginContainer.new()
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, Kit.px(8))
+	var buttons := VBoxContainer.new()
+	buttons.name = "Modes"
+	buttons.add_theme_constant_override("separation", Kit.px(4))
+	pad.add_child(buttons)
+	inner.add_child(pad)
+	box.add_child(inner)
+	for id in PerfTest.MODE_ORDER:
+		var m: Array = PerfTest.MODES[id]
+		var b := MenuKit.menu_button("%s, %s" % [m[0], m[1]], id == "default")
+		b.name = "Perf" + str(m[0])
+		b.tooltip_text = str(m[2])
+		var mode_id: String = id
+		_on(b, func() -> void: _start_perf_test(mode_id), "gui-green-confirm" if id == "default" else "gui-click")
+		buttons.add_child(b)
+		var what := Kit.label("    " + str(m[2]))
+		what.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+		buttons.add_child(what)
+	var row: Array = MenuKit.dialog_buttons("Cancel", "")
+	box.add_child(row[0])
+	_on(row[1], _pop_overlay, "gui-back")
+	_push_overlay(o)
+
+
+## Runs the test in `mode_id`, then shows its results (or quits, for --perf-test=<mode>).
+func _start_perf_test(mode_id: String, quit_after := false) -> void:
+	if state != State.MENU or _perf != null or not PerfTest.MODES.has(mode_id) or not Settings.dev_tools():
+		return
+	state = State.BUSY
+	_clear_overlays()
+	var test := PerfTest.new()
+	test.name = "PerfTest"
+	test.mode = mode_id
+	if perf_runner != null:
+		test.runner = perf_runner
+		perf_runner = null
+	_perf = test
+	add_child(test)
+	_show_progress("Performance test: " + str(PerfTest.MODES[mode_id][0]), "Getting ready…", 0.0, false, func() -> void: test.cancel())
+	test.progress.connect(_set_progress)
+	# This window stays behind the test's Zenith: it draws as little as it can meanwhile.
+	_perf_before = {"fps": Engine.max_fps, "low": OS.low_processor_usage_mode}
+	_show_background(false)
+	Engine.max_fps = 10
+	OS.low_processor_usage_mode = true
+	print("perf test: %s mode" % mode_id)
+	var outcome: Dictionary = await test.run()
+	Engine.max_fps = int(_perf_before["fps"])
+	OS.low_processor_usage_mode = bool(_perf_before["low"])
+	var quit_asked := test.has_meta("quit")
+	_perf = null
+	test.queue_free()
+	_hide_progress()
+	state = State.MENU
+	print("perf test: " + ("results in %s" % outcome["file"] if bool(outcome["ok"]) else "stopped: %s" % str(outcome["error"]).replace("\n", " | ")))
+	if quit_after:
+		Bridge.disconnect_from()
+		ExitGuard.arm()
+		get_tree().quit(int(outcome["exit_code"]))
+		return
+	if quit_asked:
+		_quit(true)
+		return
+	_show_background(true)
+	_show_main_menu()
+	if bool(outcome["ok"]):
+		_show_perf_results(outcome)
+	elif str(outcome["error"]) != "cancelled":
+		_show_message("The performance test stopped", "%s\n\nIts files are in %s" % [outcome["error"], ProjectSettings.globalize_path("user://perf-tests/work")])
+
+
+## The results: a line per test, each test's full report in the debug menu's report window
+## (against the last run of this mode), and the file to send.
+func _show_perf_results(outcome: Dictionary) -> void:
+	var o := MenuKit.overlay(0.35)
+	o.name = "PerfResults"
+	var parts := MenuKit.window("Performance test results")
+	MenuKit.overlay_center(o).add_child(parts[0])
+	var box: VBoxContainer = parts[1]
+	var inner := Kit.panel("FShallowFrame")
+	var pad := MarginContainer.new()
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, Kit.px(12))
+	inner.add_child(pad)
+	box.add_child(inner)
+	var grid := GridContainer.new()
+	grid.name = "Tests"
+	grid.columns = 6
+	grid.add_theme_constant_override("h_separation", Kit.px(20))
+	grid.add_theme_constant_override("v_separation", Kit.px(4))
+	pad.add_child(grid)
+	for h in ["Test", "Middle frame", "Slowest 1%", "FPS", "UPS", ""]:
+		grid.add_child(Kit.label(h, "FHeading"))
+	var details: Control = load("res://scripts/ui/factorio/debug_menu.gd").new()
+	details.name = "PerfReport"
+	for report: Dictionary in outcome["reports"]:
+		grid.add_child(Kit.label(str(report.get("name", "?"))))
+		grid.add_child(Kit.label(PerfTest.fmt(report.get("p50")) + " ms"))
+		grid.add_child(Kit.label(PerfTest.fmt(report.get("p99")) + " ms"))
+		var fps: Variant = null
+		if float(report.get("p50", 0.0)) > 0.0:
+			fps = 1000.0 / float(report["p50"])
+		grid.add_child(Kit.label(PerfTest.fmt(fps, 0)))
+		grid.add_child(Kit.label(PerfTest.fmt(report.get("ups"))))
+		var more := MenuKit.button("Details")
+		var shown := report
+		more.pressed.connect(func() -> void: details.show_report(shown))
+		grid.add_child(more)
+	var file := str(outcome["file"])
+	box.add_child(MenuKit.paragraph("Saved as %s\nPlease send that file. It holds this PC's processor, graphics card, memory, screen and system, and the test's numbers; nothing else (no names, no files of yours)." % file, 600))
+	var row: Array = MenuKit.dialog_buttons("Close", "")
+	var folder := MenuKit.button("Open folder")
+	folder.name = "OpenFolder"
+	_on(folder, func() -> void: OS.shell_show_in_file_manager(file))
+	row[0].add_child(folder)
+	var copy := MenuKit.button("Copy")
+	_on(copy, func() -> void: DisplayServer.clipboard_set(str(outcome["text"])))
+	row[0].add_child(copy)
+	box.add_child(row[0])
+	_on(row[1], _pop_overlay, "gui-back")
+	o.add_child(details)
+	_push_overlay(o)
+
+
 # --- progress --------------------------------------------------------------------------------
 
 ## A window with a progress bar, like Factorio's "Connecting to server"; over the menu (or a dark
 ## screen while the game world loads behind it). Cancel stops the launch.
-func _show_progress(title: String, text: String, fraction: float, opaque: bool) -> void:
+func _show_progress(title: String, text: String, fraction: float, opaque: bool, on_cancel := Callable()) -> void:
 	_hide_progress()
 	var o := MenuKit.overlay(0.35)
 	if opaque:
@@ -1031,7 +1202,7 @@ func _show_progress(title: String, text: String, fraction: float, opaque: bool) 
 	col.add_child(bar)
 	var row: Array = MenuKit.dialog_buttons("Cancel", "")
 	box.add_child(row[0])
-	_on(row[1], _cancel_launch, "gui-back")
+	_on(row[1], on_cancel if on_cancel.is_valid() else _cancel_launch, "gui-back")
 	_root.add_child(o)
 	_progress = {"root": o, "label": label, "bar": bar}
 	if _page != null:
@@ -1212,6 +1383,11 @@ func _exit_to_menu(save: bool) -> void:
 ## Quits the program; our server is stopped first (saved when `save`).
 func _quit(save: bool) -> void:
 	if state == State.BUSY and launcher._stopping:
+		return
+	if _perf != null:
+		# The test's Zenith and server stop first; its own clean-up then quits (_start_perf_test).
+		_perf.set_meta("quit", true)
+		_perf.cancel()
 		return
 	_close_esc_menu()
 	if main != null and state in [State.PLAYING, State.CONNECTING]:

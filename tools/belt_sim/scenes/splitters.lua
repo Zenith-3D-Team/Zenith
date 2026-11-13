@@ -2,6 +2,13 @@
 -- both input belts, both lanes, every tick; one output belt free, the other blocked every other
 -- 200 ticks; then a splitter feeding another (a chain), and one with an output priority. Every
 -- run's front item is taken off where it ends, unless blocked.
+if not s then
+  s = game.create_surface("zenith-belt-rules", {width = 512, height = 512})
+  s.generate_with_lab_tiles = true
+  s.always_day = true
+end
+s.request_to_generate_chunks({0, 0}, 4)
+s.force_generate_chunk_requests()
 for _, e in pairs(s.find_entities_filtered({area = {{-60, -60}, {60, 60}}})) do e.destroy() end
 local E = defines.direction.east
 local f = game.forces.player

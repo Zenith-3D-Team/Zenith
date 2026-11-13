@@ -13,6 +13,9 @@ const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const ADD_SHADER := preload("res://shaders/fx_sprite_add.gdshader")
 
 const RADIUS := 40.0
+## Full detail (full_detail.gd, a screenshot): fires and lab glows this far, with this many lights.
+const FULL_RADIUS := 400.0
+const FULL_LIGHTS := 48
 const REFRESH := 0.25
 const MAX_LIGHTS := 16
 const FADE_IN := 0.4
@@ -49,6 +52,8 @@ var protos: ProtoDB
 
 var _sheets := {}  # sheet -> [MultiMeshInstance3D, aspect, frames, fps]
 var _lights: Array[OmniLight3D] = []
+var radius := RADIUS
+var max_lights := MAX_LIGHTS
 var _shown := {}  # entity key -> [rec, MACHINES entry, level 0-1, seed, prototype name]
 var _timer := 0.0
 var _clock := 0.0
@@ -80,13 +85,25 @@ func _ready() -> void:
 		mmi.custom_aabb = AABB(Vector3(-1e5, -10, -1e5), Vector3(2e5, 20, 2e5))
 		add_child(mmi)
 		_sheets[name] = [mmi, float(spec[2]) / float(spec[1]), int(spec[3]), float(spec[5])]
-	for i in MAX_LIGHTS:
+	_add_lights(MAX_LIGHTS)
+
+
+func _add_lights(n: int) -> void:
+	while _lights.size() < n:
 		var light := OmniLight3D.new()
 		light.omni_range = 4.0
 		light.visible = false
 		light.shadow_enabled = false
 		add_child(light)
 		_lights.append(light)
+
+
+## Fires and glows out to FULL_RADIUS with FULL_LIGHTS lights (a screenshot), or back as before.
+func set_full_detail(on: bool) -> void:
+	radius = FULL_RADIUS if on else RADIUS
+	max_lights = FULL_LIGHTS if on else MAX_LIGHTS
+	_add_lights(max_lights)
+	_timer = REFRESH
 
 
 ## Forgets the machines shown (main.gd: a new session or another surface), so the old surface's
@@ -164,7 +181,7 @@ func _process(delta: float) -> void:
 	lit.sort_custom(func(x: Array, y: Array) -> bool: return float(x[0]) < float(y[0]))
 	for i in _lights.size():
 		var light := _lights[i]
-		light.visible = i < lit.size()
+		light.visible = i < lit.size() and i < max_lights
 		if light.visible:
 			light.position = (lit[i][1] as Vector3) + Vector3(0.0, 0.3, 0.25)
 			light.light_color = lit[i][2]
@@ -174,18 +191,18 @@ func _process(delta: float) -> void:
 ## Which working machines of these kinds are near the focus.
 func _refresh() -> void:
 	var focus: Vector2 = world.focus()
-	for unit in world.working_near(focus, RADIUS):
+	for unit in world.working_near(focus, radius):
 		if int(world.working.get(unit, 0)) != 1 or _shown.has(unit):
 			continue
 		var rec = world.entities.get(unit)
-		if rec == null or rec.pos.distance_to(focus) > RADIUS:
+		if rec == null or rec.pos.distance_to(focus) > radius:
 			continue
 		var proto: ProtoDB.EntityProto = protos.entity(rec.proto_id)
 		if proto == null or not MACHINES.has(proto.name):
 			continue
 		_shown[unit] = [rec, MACHINES[proto.name], 0.0, fposmod(rec.pos.x * 0.37 + rec.pos.y * 0.71, 1.0), proto.name]
 	for key in _shown.keys():
-		if (_shown[key][0].pos as Vector2).distance_to(focus) > RADIUS + 8.0:
+		if (_shown[key][0].pos as Vector2).distance_to(focus) > radius + 8.0:
 			_shown.erase(key)
 
 

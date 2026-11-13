@@ -26,7 +26,9 @@ static var _found := {}  # name -> {version, dir} or {version, zip, root, files}
 static var _scanned := false
 static var _data_dir := ""
 static var _mutex := Mutex.new()
-static var _readers := {}  # thread id -> {zip path: FileAccess}
+static var _readers := {}  # thread id -> {zip path: FileAccess}, the most recent last
+## How many zips each thread keeps open between reads (_file).
+const ZIPS_OPEN := 6
 ## The scan set_mods() started on a worker thread (opening a big modpack's zips takes a few hundred
 ## milliseconds); -1 when none runs. Meanwhile only the built-in mods are found, and is_ready() is false.
 static var _task := -1
@@ -359,11 +361,20 @@ static func _file(path: String) -> FileAccess:
 	_readers[id] = mine
 	_mutex.unlock()
 	var f: FileAccess = mine.get(path)
-	if f == null:
-		f = FileAccess.open(path, FileAccess.READ)
-		if f == null:
-			return null
+	if f != null:
+		mine.erase(path)  # most recent last, so the oldest goes first below
 		mine[path] = f
+		return f
+	f = FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return null
+	# Each thread keeps only a few zips open: a modpack has hundreds, and every worker keeping all of
+	# them open passed the C runtime's 512 open files, after which no model or script would open.
+	while mine.size() >= ZIPS_OPEN:
+		var oldest: String = mine.keys()[0]
+		(mine[oldest] as FileAccess).close()
+		mine.erase(oldest)
+	mine[path] = f
 	return f
 
 

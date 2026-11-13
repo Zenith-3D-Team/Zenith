@@ -43,10 +43,13 @@ local movers = require("scripts.movers")
 local console = require("scripts.console")
 local modules = require("scripts.modules")
 local rate = require("scripts.rate")
+local photo = require("scripts.photo")
 local budget = require("scripts.budget")
 local requests = require("scripts.requests")
 local gfx = require("scripts.gfx")
 local mod_gui = require("scripts.mod_gui")
+local belt_sim = require("scripts.belt_sim")
+local barrier = require("scripts.barrier")
 
 local M = {}
 
@@ -102,6 +105,7 @@ function M.handshake(keep_view)
   belt_items.far_reset()
   movers.reset()
   rate.reset()
+  photo.reset()
   transport.reset()
   world.clear()
   puppet.reset()
@@ -135,6 +139,8 @@ function M.handshake(keep_view)
     x = world.fixed(p.x),
     y = world.fixed(p.y),
     mp = game.is_multiplayer(),
+    -- Square subscriptions (`sub` o, r, w) out to world.MAX_RADIUS: a client asks older bridges for a list.
+    sq = world.MAX_RADIUS,
   })))
   -- The rest a stage a tick (handshake_tick): together they took 35 ms in one tick on the owner's
   -- save. Meanwhile only the transport and the stages run (control.lua), as before for one tick.
@@ -463,7 +469,18 @@ end
 local function drop_client()
   local s = storage.f3d
   local port = s.client and s.client.port
+  if s.extra and port then
+    -- Its character waits for the same client (session id) to come back.
+    storage.f3d_parked = storage.f3d_parked or {}
+    storage.f3d_parked_at = storage.f3d_parked_at or {}
+    if s.puppet and s.puppet.valid then
+      storage.f3d_parked[s.client.sid] = s.puppet
+      storage.f3d_parked_at[s.client.sid] = game.tick
+    end
+    extras()[port] = nil
+  end
   s.rate = nil
+  s.photo_until = nil
   puppet.reset()
   screens.reset()
   combat.reset()
@@ -476,17 +493,49 @@ local function drop_client()
   transport.reset()
   s.belt_refresh = {}
   s.pipe_refresh = {}
-  if s.extra and port then
-    -- Its character waits for the same client (session id) to come back.
-    storage.f3d_parked = storage.f3d_parked or {}
-    storage.f3d_parked_at = storage.f3d_parked_at or {}
-    if s.puppet and s.puppet.valid then
-      storage.f3d_parked[s.client.sid] = s.puppet
-      storage.f3d_parked_at[s.client.sid] = game.tick
-    end
-    extras()[port] = nil
-  end
   s.client = nil
+end
+
+-- What outlives a client when the bridge's version changes: the character and whose it is, what
+-- the player made, and the script inventories (dropped, they would stay in the save for good).
+-- Everything else in a client's state is its connection and its jobs, and a save keeps those half
+-- done in the old version's shape (a research job half sent and 0.1.1's belt round each stopped the
+-- game when a new bridge read them). Nothing else can be needed: a new client beside the first
+-- starts with only `extra`, its character and what init_storage makes (add_client).
+local KEPT_ACROSS_VERSIONS = {
+  extra = true, puppet = true, own_character = true, held_for = true, owner_index = true, owner_checked = true,
+  owner_pick = true, recheck = true, was_mp = true, death = true, respawn = true, trip = true,
+  quickbar = true, hist = true, explored = true, hist_scratch = true, clipboard = true, lib_cursor = true,
+}
+
+local function start_clean()
+  -- (The resets stop the character walking, shooting and riding. An old state may not have what
+  -- they read, and failing here would refuse the save.)
+  local ok, err = pcall(drop_client)
+  if not ok then
+    log("[Zenith] dropping a client from an older bridge: " .. tostring(err))
+  end
+  local s = storage.f3d
+  for key in pairs(s) do
+    if not KEPT_ACROSS_VERSIONS[key] then
+      s[key] = nil
+    end
+  end
+  M.init_storage()
+end
+
+-- A save loaded with other mods. On a new version of the bridge the save's clients and half-done
+-- jobs are dropped, so the next hello starts a clean handshake; only `storage` changes, from what
+-- the save holds, so every peer ends up the same.
+function M.on_configuration_changed(data)
+  M.each_client(M.init_storage)
+  local change = data and data.mod_changes and data.mod_changes["factorio-3d-bridge"]
+  if change and change.old_version and change.old_version ~= change.new_version then
+    log("[Zenith] the bridge went from " .. tostring(change.old_version) .. " to " .. tostring(change.new_version)
+      .. ": this save's clients and their unfinished work are dropped")
+    M.each_client(start_clean)
+    storage.f3d_extra = {}
+  end
 end
 
 ---------------------------------------------------------------------------------------------
@@ -500,7 +549,8 @@ function handlers.hello(msg, port)
   if not s.client or s.client.sid ~= sid or s.client.port ~= port then
     heard_since_load = true
     s.client = { sid = sid, port = port, last_seen = game.tick, z = msg.z == 1, dc = msg.dc == 1, b = msg.b == 1,
-      bl = msg.bl == 1, bg = msg.bl == 1 and msg.bg == 1, br = msg.bl == 1 and msg.br == 1, v = tonumber(msg.v) or 0 }
+      bl = msg.bl == 1, bs = msg.bs == 1, bg = msg.bl == 1 and msg.bg == 1, br = msg.bl == 1 and msg.br == 1,
+      v = tonumber(msg.v) or 0, mg = msg.mg ~= 0 }
     s.rate = nil -- a new client starts at full rate; it sends `rate` if it wants another
     s.bud = nil -- and with the default work budget, not one the last client set
     M.handshake()
@@ -512,10 +562,14 @@ function handlers.hello(msg, port)
   s.client.z = msg.z == 1
   s.client.b = msg.b == 1
   s.client.bl = msg.bl == 1
+  -- A client that simulates belts itself (belt_sim.lua) gets `bs` instead of `bi`.
+  s.client.bs = msg.bs == 1
   -- Belt groups (belt_items.lua) build on kept lanes: a client says both.
   s.client.bg = msg.bl == 1 and msg.bg == 1
   -- Straight runs (belt_items.lua): plain lanes moved by the client, also on kept lanes.
   s.client.br = msg.bl == 1 and msg.br == 1
+  -- Mods' windows (mod_gui.lua): off only for a client that says so; one that doesn't say gets them.
+  s.client.mg = msg.mg ~= 0
   -- Decoratives turned on in the client's settings: send the dictionary and resend the chunks.
   if msg.dc == 1 and not s.client.dc then
     s.client.dc = true
@@ -534,8 +588,11 @@ function handlers.bye()
   drop_client()
 end
 
+-- A square (`o`, `r`, `w`, what the client sends) or a list (`c`, small ones: tests, older clients).
 function handlers.sub(msg)
-  if type(msg.c) == "table" then
+  if msg.w ~= nil then
+    world.subscribe_square(msg.o, msg.r, msg.w, msg.h)
+  elseif type(msg.c) == "table" then
     world.subscribe(msg.c, msg.h)
   end
 end
@@ -643,6 +700,7 @@ handlers.bfar = belt_items.set_far
 handlers.bre = belt_items.resend
 handlers.rate = rate.set
 handlers.budget = budget.set
+handlers.photo = photo.set
 
 -- {si, x, y}: the remote view looks at another surface (a planet or one of the force's
 -- platforms), so the world streamed is that surface's, round (x, y); si 0 (or the character's)
@@ -909,7 +967,7 @@ end
 
 function M.status_command(cmd)
   local s = storage.f3d
-  local lines = {}
+  local lines = barrier.report()  -- first: a step failing is the news
   for port, state in pairs(extras()) do
     local c = state.puppet
     lines[#lines + 1] = string.format("[Zenith] another client on port %d, its character at %s", port,
@@ -1013,6 +1071,12 @@ function M.rate_command(cmd)
   M.reply(cmd, { "[Zenith] rate level " .. rate.level() })
 end
 
+-- /f3d-bs [name on|off|number|default]: the belt simulation's switches (belt_sim.lua), to test its
+-- fixes one by one; with no arguments it says them.
+function M.bs_command(cmd)
+  M.reply(cmd, belt_sim.option_command(cmd.parameter))
+end
+
 function M.profile_command(cmd)
   local n = tostring(cmd.parameter or ""):match("^%s*trace%s*(%d*)")
   if n then
@@ -1031,5 +1095,6 @@ console.extra["f3d-platform"] = M.platform_command
 console.extra["f3d-player"] = M.player_command
 console.extra["f3d-profile"] = M.profile_command
 console.extra["f3d-rate"] = M.rate_command
+console.extra["f3d-bs"] = M.bs_command
 
 return M

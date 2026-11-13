@@ -62,6 +62,15 @@ client crashes.
 The first time, Settings → Factorio install lets you point the client at your Factorio install if
 it wasn't found (Steam installs usually are).
 
+<!-- dev -->
+**Performance test** in the main menu (development builds only: development downloads and Zenith
+run from source; the public downloads leave it out) measures how smoothly Zenith runs on your PC:
+pick Quick (about 3 minutes), Default or Extensive, keep your hands off while Zenith plays by itself
+full screen, then send the text file it writes. PERFORMANCE-TEST.md says what it does and what's in
+the file; your own saves, mods and settings aren't touched.
+
+<!-- /dev -->
+
 ## Playing
 
 Factorio's keys work as in Factorio: WASD walks, the right mouse button mines, E opens your
@@ -80,6 +89,7 @@ starts in the angled view, and the camera is yours to move:
 | F6 | Factorio's own view from above, and back |
 | F5 | First person, and back |
 | F7 | Perspective or orthographic, for the view you're in (the map's remote view or the normal one) |
+| F8 | The Cinematic camera's free camera (an add-on, on by default): WASD flies it, F8 again comes back; F11 hides the interface, F12 takes a screenshot |
 
 The right mouse button mines whatever is under it, trains, wagons, cars, tanks and spidertrons
 too: they go into your inventory with what is inside them (fuel, cargo), and the rails stay.
@@ -97,7 +107,9 @@ roboport draws lines to the roboports it is linked to. On a space platform (and 
 one) Factorio's platform panel under the minimap says where it is stopped or what it is travelling
 between, its speed and mass, and on board has **Drop to a planet**.
 
-Settings → Controls lists and rebinds everything. F1 shows the help, F4 a status line (the
+Settings → Controls lists and rebinds everything. F1 shows the help: every control under the key
+you have it on now, grouped, with each add-on's keys under the add-on while it is on (the mouse wheel
+over it scrolls it when the window is too short). F4 shows a status line (the
 game's UPS beside the frame rate, and what Hold the game at 60 UPS holds back). Ctrl+F9
 opens the same game in Factorio itself, and Ctrl+F9 there comes back, minimising Factorio to save
 its drawing. Started through `server/factorio-with-zenith.ps1` (RUNNING.md says how to set it as
@@ -199,16 +211,50 @@ to 8.
 
 ## Settings worth knowing
 
-- **Graphics → View distance** (chunks drawn around you) and **Entity distance** (how far moving
-  things and machine states are streamed). Lower them if the game stutters.
+- **Graphics → Resolution**: in a window, the window's size. In full screen (borderless or
+  exclusive), the size the world is drawn at, scaled up to fill the monitor: 1920 × 1080 on a 4K
+  monitor costs what 1080p costs. The picture keeps its proportions, the interface stays sharp and
+  is laid out as at that size, and Game render scaling multiplies on top of it. Default puts a
+  window back to its own size, 1600 × 900.
+- **Graphics → View distance** (chunks drawn around you, up to 50) and **Entity distance** (how far
+  moving things and machine states are streamed). Lower them if the game stutters. View distance
+  turns yellow past 10 chunks and red past 20: what is drawn grows with the square of it, so far views
+  cost the graphics card, memory and the server a lot. Past 14 chunks (Ultra's view) the ground is drawn simpler, and
+  there is ground only where Factorio's map has been generated.
 - **Graphics → Level of detail**: how soon far-away models are drawn simpler.
+- **Graphics → Look**: how the world is lit and coloured. **Factorio** (the default) is matched to
+  Factorio's own pictures: its colours, its shadows' angle and darkness, its colour grading on each
+  planet. **Classic Zenith** is the look before 0.1.4. Add-ons can add looks of their own, such as
+  the Cinematic shaders add-on (bloom, soft shadows, ambient occlusion, haze, clouds, film grain, and a
+  real sunrise and sunset, which Factorio's own look doesn't have: Factorio has none to match). The
+  downloads come with it switched on, and while it is on its look is used: switch it off in the
+  Add-ons menu for the Factorio look.
+- **Graphics → Anti-aliasing** (SMAA): how edges are smoothed. SMAA keeps fine detail sharp, FXAA is
+  softer, TAA is the steadiest far away but softens moving belts, MSAA costs the most. While a look that
+  draws its own full-screen passes is on, such as the Cinematic shaders, MSAA is greyed out and a saved
+  MSAA is switched to SMAA: those passes would draw a fringe round every edge with it. Pick MSAA again
+  under the Factorio look if you want it back.
 - **Graphics → Merge far buildings** (on): past about four chunks from the camera (and away from
   your character), each chunk's buildings are drawn as one simplified mesh with no moving parts,
   which costs far fewer draws when the camera is pulled back over a big base. Trees, ore and nests
   keep their own models. Off draws every building in full however far it is.
 - **Graphics → Preset** (Low, Medium, High, Ultra) sets shadows, level of detail, the distances,
-  Moving belt items, decorative density and clouds together, and turns ambient occlusion off; **Shadows** alone (Off to Ultra) sets how far and how sharp
+  Moving belt items, decorative density and clouds together, turns ambient occlusion on in High and Ultra and
+  contact shading on in all of them; **Shadows** alone (Off to Ultra) sets how far and how sharp
   the sun's shadows are.
+- **Graphics → Ambient occlusion** (on in High and Ultra): shading in corners and between machines, kept
+  tight as Factorio's sprites have it. It shows when you are zoomed in close enough to see it and fades
+  out as you zoom out (in the angled view from about 40 to 85 tiles away at 1080p, twice that at 4K;
+  F6's view, first person and add-on cameras by the same measure, the size of a pixel where the view
+  looks), and is off altogether further out, so a zoomed-out view pays nothing for it. Up close it costs
+  about 0.7 ms of graphics time a frame at a busy base on a desktop card, more on a laptop. The Cinematic
+  look's own ambient occlusion fades the same way. While the Cinematic look is on, its own Ambient
+  occlusion setting (Add-ons menu) decides, and this row is greyed out; so is **Clouds**, whose place
+  its own Clouds slider takes.
+- **Graphics → Contact shading** (on): the dark rim on the ground round each building's foot that
+  Factorio's pictures have, so buildings stand in the ground rather than on it. Faint under chests,
+  a light band along belts and splitters, none under rails, walls, pipes and trees. It fades out when
+  zoomed far out, where it would be under a pixel. It costs next to nothing.
 - **Graphics → Merged materials (may help when CPU-bound)** (off): each model is drawn as one
   surface with one material instead of one per material, so the renderer has far fewer draws to
   send, at the cost of a little more GPU time. Try it if your graphics card idles while the frame
@@ -227,7 +273,8 @@ to 8.
   the frames, the game and the server's tick have; counted from the character outwards: past those, out
   to the distance, they stand still on their lanes); and **Items in 3D**, how many are 3D models,
   nearest first, the rest icons (All: every one, far belts too; Icons only: Factorio's icons
-  everywhere, on the ground and in hands too). A stack inserter's stacks are drawn as piles, as
+  everywhere, on the ground and in hands too). In first person, the map's remote view or an add-on's
+  camera they go to what is in front of the camera, nearest it first, as 3D grass does. A stack inserter's stacks are drawn as piles, as
   Factorio draws them.
 - **Camera → View when a game starts** (Angled view, Factorio's view or First person) and
   **Projection** (the angled view in perspective or orthographic), **Projection on the map** (the
@@ -242,6 +289,29 @@ to 8.
   settings in a game the menu started: how much it sends per tick, how far moving things are
   streamed, which player the client plays as on a server.
 
+<!-- dev -->
+## The debug menu
+
+This is a testing tool of the development builds (development downloads and Zenith run from
+source); the public downloads leave it out, with its key.
+
+**Ctrl+F12** in a game opens Zenith's debug menu (rebind it in Settings → Controls →
+Miscellaneous), with the Cinematic camera flying and the interface hidden (F11) too, the mouse shown
+while it's open. It's for testing and for reports when something runs slowly:
+
+- **Time**: set the time of day (or Dawn, Noon, Sunset, Night), freeze the day/night cycle, change
+  the game's speed or pause it. This changes the game itself, for everyone in it, so in a
+  multiplayer game only admins can; otherwise the controls are greyed and say why. The time slider
+  is a clock: midnight at both ends, noon in the middle. Pausing works on a server Zenith's menu
+  started (it resumes the game over RCON); in single-player, pause in Factorio itself.
+- **Benchmarks**: standing still, laps, a camera flyover and a zoom out and back, each measured in
+  your game and ending in a report (frame times, frame rate, GPU time, draw calls, the game's UPS,
+  your settings) compared with your last run of it. Copy it or save it to a file to send with a
+  bug report. Keep your hands off the keys while one runs; Esc stops it.
+- **Tests**: checks and overlays for finding problems (a frame-time graph, counters, chunk borders,
+  the bridge's self-test) and spots to move your character to (the same rule as Time).
+
+<!-- /dev -->
 ## Add-ons
 
 Add-ons add to what Zenith does, for example the [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) for filming your

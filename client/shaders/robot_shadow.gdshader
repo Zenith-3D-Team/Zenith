@@ -4,7 +4,7 @@ shader_type spatial;
 // south), turned and placed from the robot's record (mover_records.gdshaderinc). INSTANCE_CUSTOM.r
 // is the record's slot; the instance transform is a plain translation.
 
-render_mode blend_mix, depth_draw_opaque, cull_disabled, unshaded, shadows_disabled;
+render_mode blend_mix, depth_draw_never, cull_disabled, unshaded, shadows_disabled;
 
 #include "res://shaders/mover_records.gdshaderinc"
 #include "res://shaders/ground_height.gdshaderinc"

@@ -213,7 +213,8 @@ def shoot(name, args):
     out = os.path.join(args.out, name)
     os.makedirs(out, exist_ok=True)
     mock = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--serve", name, "--port", str(args.port),
-                             "--dir", str(args.dir)] + (["--daytime", "0.5"] if args.night else [])
+                             "--dir", str(args.dir)] + (["--daytime", "0.5"] if args.night else
+                                                        ["--daytime", str(args.daytime)] if args.daytime is not None else [])
                             + (["--mover", args.mover] if args.mover else [])
                             + (["--row", str(args.row), "--row-gap", str(args.row_gap)] if args.row > 1 else []),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -228,7 +229,7 @@ def shoot(name, args):
         aim = aim_for(name)
         if fly:
             aim = fly + (aim if aim is not None else 0.3)
-        cmd = [GODOT, "--audio-driver", "Dummy", "--path", os.path.join(REPO, "client"), "--resolution", "1600x1000", "--",
+        cmd = [GODOT, "--audio-driver", "Dummy", "--path", os.path.join(REPO, "client"), "--resolution", args.size, "--",
                "--factorio-port=%d" % args.port, "--port=%d" % (args.port + 1), "--borderless", "--clean-shot",
                "--review-shots=%s@%g" % (out, args.wait), "--review-box=%g,%g,%g" % (w, d, h),
                "--review-views=" + ",".join(views)] + (["--review-aim=%g" % aim] if aim is not None else []) + args.client_arg
@@ -254,10 +255,12 @@ def main(argv):
                         "which opens its hatches")
     parser.add_argument("--client-arg", action="append", default=[],
                         help="extra argument for the client, e.g. --client-arg=--model-look=sprite")
+    parser.add_argument("--size", default="1600x1000", help="window size the shots are rendered at (3840x2400 for 4K)")
     parser.add_argument("--row", type=int, default=1, help="a row of N, wired together (copper, red, green)")
     parser.add_argument("--row-gap", type=float, default=5.0, help="tiles between the row's entities")
     parser.add_argument("--serve", help=argparse.SUPPRESS)
-    parser.add_argument("--daytime", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--daytime", type=float, help="the mock's clock stopped at this time of day (Factorio's "
+                        "0 noon, 0.5 midnight): 0.3 for a low sun and long shadows")
     args = parser.parse_args(argv)
     if args.serve:
         serve(args.serve, args.port, args.daytime, args.dir, args.mover, args.row, args.row_gap)

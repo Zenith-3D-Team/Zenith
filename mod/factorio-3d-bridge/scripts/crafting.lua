@@ -14,6 +14,14 @@ local CRAFTABLE_INTERVAL = 30
 local QUEUE_INTERVAL = 10
 local QUEUE_RESEND = 300   -- the empty queue again every 5 s, as `cq` is sent unreliably
 local RECIPES_PER_MESSAGE = 40
+-- Recipes whose craftable count is read a tick while the counts are worked out in slices
+-- (f3d-spread-jobs): on the owner's save all 230 at once cost a tick 45-80 ms every time the
+-- inventory changed, about every 1.5 s. The counts are sent when the last slice is done.
+M.craftable_slice = 32  -- (a field for tests)
+
+local function spread()
+  return settings.global["f3d-spread-jobs"].value
+end
 
 -- The force's enabled, visible recipes the character can craft by hand, sorted by name. The
 -- candidates come from prototypes (puppet.hand_recipe_names), so this reads `enabled` for those
@@ -96,26 +104,59 @@ local function contents_sig(c, s)
   return table.concat(parts, ",")
 end
 
--- [[recipe, how many the character could craft now], ...] for every non-zero count. The names
--- come from the last details check, so the recipe list isn't walked twice a second.
-local function send_craftable(c, s)
-  local inv_sig = contents_sig(c, s)
-  if inv_sig == s.craftable_inv and s.craftable_sig ~= nil then
-    return
-  end
-  s.craftable_inv = inv_sig
-  local list, parts = {}, {}
-  for _, name in ipairs(s.hand_recipes or {}) do
+-- The counts of recipes first..last of s.hand_recipes, added to `list` and `parts`.
+local function count_slice(c, s, list, parts, first, last)
+  local names = s.hand_recipes or {}
+  for i = first, math.min(last, #names) do
+    local name = names[i]
     local n = c.get_craftable_count(name)
     if n > 0 then
       list[#list + 1] = { name, n }
       parts[#parts + 1] = name .. "=" .. n
     end
   end
+end
+
+local function finish_craftable(s, list, parts)
   local sig = table.concat(parts, ",")
   if sig ~= s.craftable_sig then
     s.craftable_sig = sig
     transport.send_reliable({ t = "craftable", l = list })
+  end
+end
+
+-- [[recipe, how many the character could craft now], ...] for every non-zero count. The names
+-- come from the last details check, so the recipe list isn't walked twice a second. With
+-- f3d-spread-jobs the counts are read CRAFTABLE_SLICE recipes a tick (s.craft_job, in storage: the
+-- same on every peer) and sent when the last slice is done; a change meanwhile starts over.
+local function send_craftable(c, s)
+  local inv_sig = contents_sig(c, s)
+  if inv_sig == s.craftable_inv and s.craftable_sig ~= nil then
+    return
+  end
+  s.craftable_inv = inv_sig
+  if spread() then
+    s.craft_job = { i = 1, list = {}, parts = {} }
+    return
+  end
+  s.craft_job = nil
+  local list, parts = {}, {}
+  count_slice(c, s, list, parts, 1, #(s.hand_recipes or {}))
+  finish_craftable(s, list, parts)
+end
+
+-- One slice of the counts a tick while a job is open.
+local function craftable_slice(c, s)
+  local job = s.craft_job
+  if not job then
+    return
+  end
+  local names = s.hand_recipes or {}
+  count_slice(c, s, job.list, job.parts, job.i, job.i + M.craftable_slice - 1)
+  job.i = job.i + M.craftable_slice
+  if job.i > #names then
+    s.craft_job = nil
+    finish_craftable(s, job.list, job.parts)
   end
 end
 
@@ -228,6 +269,7 @@ function M.tick()
   if game.tick % CRAFTABLE_INTERVAL == 0 then
     send_craftable(c, s)
   end
+  craftable_slice(c, s)
   if game.tick % QUEUE_INTERVAL == 0 then
     send_queue(c, s)
   end
@@ -239,6 +281,7 @@ function M.invalidate()
   s.rdet_sig = nil
   s.craftable_sig = nil
   s.craftable_inv = nil
+  s.craft_job = nil
   s.queue_sent = true
 end
 

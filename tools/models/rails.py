@@ -37,9 +37,9 @@ from kit import Part, model, rng
 # Colours picked from the rail sprites (their lit parts, lighting taken out).
 kit.MATERIALS.update({
     "stone_ballast": ("6e604d", 0.95, 0.0, None, 0),   # rail-stone-path: grey-brown stones
-    "stone_ballast_light": ("9a8f80", 0.95, 0.0, None, 0),
+    "stone_ballast_light": ("847a6b", 0.95, 0.0, None, 0),  # nearer the bed: far away, tiny light stones on dark flickered
     "wood_tie": ("9a7f4a", 0.85, 0.0, None, 0),        # rail-ties: weathered ochre wood
-    "steel_rail": ("a9a9a6", 0.35, 0.9, None, 0),      # rail-metals: bright worn steel
+    "steel_rail": ("a9a9a6", 0.55, 0.9, None, 0),      # rail-metals: bright worn steel (rougher: thin shiny rails sparkled)
     "paint_rail_red": ("a2432f", 0.6, 0.35, None, 0),  # elevated rails' railings and supports
 })
 
@@ -170,9 +170,11 @@ def bed_height(across):
     return max(0.0, BED_Z * (BED_HALF - a) / (BED_HALF - BED_TOP_HALF))
 
 
-def stones(part, track, r, z=0.0, per_tile=60):
+def stones(part, track, r, z=0.0, per_tile=24):
     """Loose stones over the ballast (low octahedra in two shades), so the bed reads as stones
-    from any side, where Factorio's top-down sprite doesn't reach."""
+    from any side, where Factorio's top-down sprite doesn't reach. Fewer, larger and lifted clear of
+    the bed's bumps: 60 a tile of 0.03-0.06, half sunk at the bumps' height, were smaller than a pixel
+    far away and their tops met the bed's within millimetres, so with TAA's jitter they flickered."""
     import bmesh  # noqa: PLC0415  (Blender only)
     count = int(track.length * per_tile)
     for _ in range(count):
@@ -182,14 +184,14 @@ def stones(part, track, r, z=0.0, per_tile=60):
             continue  # not through the rails
         p, t, n = track.at(s)
         q = p + n * across
-        size = r.uniform(0.03, 0.06)
+        size = r.uniform(0.05, 0.09)
         bm = bmesh.new()
         bmesh.ops.create_uvsphere(bm, u_segments=4, v_segments=2, radius=size)  # an octahedron
         bmesh.ops.scale(bm, vec=(r.uniform(0.8, 1.3), r.uniform(0.8, 1.3), r.uniform(0.45, 0.7)), verts=bm.verts)
         bmesh.ops.rotate(bm, verts=bm.verts, cent=(0, 0, 0),
                          matrix=kit.R("Z", r.uniform(0, 360)).to_3x3() @ kit.R("X", r.uniform(-25, 25)).to_3x3())
         part.merge(bm, "stone_ballast" if r.random() < 0.6 else "stone_ballast_light",
-                   kit.T(q.x, q.y, z + bed_height(across) + size * 0.15))
+                   kit.T(q.x, q.y, z + bed_height(across) + 0.012 + size * 0.25))
         bm.free()
 
 

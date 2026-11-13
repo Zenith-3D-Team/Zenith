@@ -221,19 +221,15 @@ func _process(delta: float) -> void:
 		layers.follow(centre, scale, false)
 
 
-## WASD and the arrow keys, unless the tag dialog is being typed in.
+## The movement keys (WASD and the arrows unless rebound, as the help says), unless the tag dialog
+## is being typed in.
 func _pan_input() -> Vector2:
 	if dialog.is_open():
 		return Vector2.ZERO
 	var v := Vector2.ZERO
-	if Input.is_physical_key_pressed(KEY_A) or Input.is_physical_key_pressed(KEY_LEFT):
-		v.x -= 1
-	if Input.is_physical_key_pressed(KEY_D) or Input.is_physical_key_pressed(KEY_RIGHT):
-		v.x += 1
-	if Input.is_physical_key_pressed(KEY_W) or Input.is_physical_key_pressed(KEY_UP):
-		v.y -= 1
-	if Input.is_physical_key_pressed(KEY_S) or Input.is_physical_key_pressed(KEY_DOWN):
-		v.y += 1
+	for a in [["move_left", Vector2.LEFT], ["move_right", Vector2.RIGHT], ["move_up", Vector2.UP], ["move_down", Vector2.DOWN]]:
+		if InputMap.has_action(a[0]) and Input.is_action_pressed(a[0]):  # Shift (faster) held too
+			v += a[1]
 	return v.normalized()
 
 

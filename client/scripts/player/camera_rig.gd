@@ -79,6 +79,8 @@ var _factorio_snap: Array = []
 ## pitch it eases towards.
 var _cine_saved := {}
 var _cine_pitch := 50.0
+## After a ride: the pitch the view is easing back to (NAN once there), so it doesn't cut.
+var _settle_pitch := NAN
 ## An add-on's camera (scripts/addons/addon_host.gd): while one has it, the camera stays where the
 ## add-on puts it (top level, in world space) and the rig itself stands at `taken_focus`, so
 ## focus_point() (where chunks load and live data is asked for) follows the add-on's shot. What
@@ -146,13 +148,20 @@ func _process(delta: float) -> void:
 			camera.projection = Camera3D.PROJECTION_PERSPECTIVE
 		return
 	if target != null:
-		global_position = global_position.lerp(_follow(target.global_position), 1.0 - exp(-delta * 8.0))
+		# A ride's camera goes up with the rocket; only the view on foot stays level.
+		var to := target.global_position if in_cinematic() else _follow(target.global_position)
+		global_position = global_position.lerp(to, 1.0 - exp(-delta * 8.0))
 	yaw_degrees = lerpf(yaw_degrees, _yaw_goal, 1.0 - exp(-delta * 10.0))
 	# A ride's camera moves slowly, as a film's would.
 	var rate := 1.6 if not _cine_saved.is_empty() else 10.0
 	distance = lerpf(distance, _distance_goal, 1.0 - exp(-delta * rate))
 	if not _cine_saved.is_empty():
 		pitch_degrees = lerpf(pitch_degrees, _cine_pitch, 1.0 - exp(-delta * rate))
+	elif not is_nan(_settle_pitch):
+		pitch_degrees = lerpf(pitch_degrees, _settle_pitch, 1.0 - exp(-delta * 3.0))
+		if absf(pitch_degrees - _settle_pitch) < 0.05:
+			pitch_degrees = _settle_pitch
+			_settle_pitch = NAN
 	var turn := Basis(Vector3.UP, deg_to_rad(yaw_degrees)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
 	camera.transform = Transform3D(turn, turn * Vector3(0.0, 0.0, distance))
 	if (remote_orthographic if in_remote else orthographic):
@@ -207,6 +216,7 @@ func leave_factorio_view() -> void:
 func _snap(yaw: float, pitch: float, dist: float, ortho: bool) -> void:
 	_yaw_goal = yaw
 	yaw_degrees = yaw
+	_settle_pitch = NAN
 	pitch_degrees = pitch
 	_distance_goal = clampf(dist, MIN_DISTANCE, max_distance)
 	distance = _distance_goal
@@ -266,8 +276,11 @@ func cinematic_end() -> void:
 		return
 	var saved := _cine_saved
 	_cine_saved = {}
-	pitch_degrees = float(saved["pitch"])
 	_distance_goal = float(saved["distance"])
+	if bool(saved["factorio"]) or bool(saved["fp"]):
+		pitch_degrees = float(saved["pitch"])
+	else:
+		_settle_pitch = float(saved["pitch"])
 	if bool(saved["factorio"]):
 		toggle_factorio_view()
 	if bool(saved["fp"]):
@@ -400,6 +413,7 @@ func rotate_free(degrees: float) -> void:
 
 
 func tilt(degrees: float) -> void:
+	_settle_pitch = NAN
 	pitch_degrees = clampf(pitch_degrees + degrees, MIN_PITCH, MAX_PITCH)
 
 

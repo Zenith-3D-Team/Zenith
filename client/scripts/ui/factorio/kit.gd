@@ -66,6 +66,10 @@ const FLAT := {
 	"tooltip_title": [Color(1.0, 231 / 255.0, 193 / 255.0, 0.88), Color8(0, 0, 0), 0, 2],
 	"quickbar_inner": [Color8(31, 30, 31), Color8(15, 14, 15), 1, 0],
 	"draggable": [Color8(55, 53, 52), Color8(30, 28, 27), 1, 0],
+	"temporary_station": [Color8(60, 90, 130), Color8(25, 24, 25), 1, 0],
+	"dark_button": [Color8(45, 44, 45), Color8(20, 20, 20), 1, 2],
+	"dark_button_hover": [Color8(255, 175, 0), Color8(20, 20, 20), 1, 2],
+	"dark_button_pressed": [Color8(230, 140, 0), Color8(20, 20, 20), 1, 2],
 	"button": [Color8(143, 143, 143), Color8(40, 40, 40), 1, 3],
 	"button_hover": [Color8(255, 175, 0), Color8(40, 40, 40), 1, 3],
 	"button_pressed": [Color8(230, 140, 0), Color8(40, 40, 40), 1, 3],
@@ -358,6 +362,14 @@ static func _layers(name: String) -> Array:
 			return [_frame_button_shadow(), {"parts": {"c": [42, 8, 1, 1]}}]
 		"draggable":  # draggable_space
 			return [_glow(DIRT_FILLER_COLOR), {"parts": {"t": [192, 8, 8, 7], "c": [200, 8, 8, 8], "b": [208, 8, 8, 8]}, "tile": true}]
+		"temporary_station":  # train_schedule_temporary_station_frame
+			return [_glow(SHADOW_COLOR), _base(446, 86)]
+		"dark_button":  # dark_button, train_schedule_delete_button
+			return [{"at": [395, 86], "corner": 8, "outer": true}, _base(68, 0)]
+		"dark_button_hover":
+			return [{"at": [395, 86], "corner": 8, "outer": true}, _base(34, 17), _glow(GLOW_COLOR)]
+		"dark_button_pressed":
+			return [{"at": [395, 86], "corner": 8, "outer": true}, _base(51, 17)]
 		"button":
 			return [dirt, _base(0, 17)]
 		"button_hover":
@@ -730,7 +742,7 @@ static func theme() -> Theme:
 		t.set_color(c, "Button", BLACK)
 	t.set_color("font_disabled_color", "Button", DISABLED_TEXT)
 	t.set_constant("h_separation", "Button", px(4))
-	for v in ["FGreenButton:green_button", "FRedButton:red_button", "FFrameAction:frame_action",
+	for v in ["FGreenButton:green_button", "FRedButton:red_button", "FFrameAction:frame_action", "FDarkButton:dark_button",
 			"FSlot:slot", "FSlotButton:slot_button", "FRedSlotButton:red_slot_button", "FTab:tab",
 			"FPageButton:page_button", "FBluePageButton:blue_page_button", "FRedPageButton:red_page_button",
 			"FGreenPageButton:green_page_button", "FGreenSlot:green_slot", "FYellowSlot:yellow_slot", "FRedSlot:red_slot", "FSideButton:side_button"]:
@@ -789,6 +801,7 @@ static func theme() -> Theme:
 	for v in ["FFrame:frame", "FFrameLeft:frame_left", "FFrameRight:frame_right", "FFrameMiddle:frame_middle", "FSlotWindow:slot_window",
 			"FDeepFrame:deep", "FShallowFrame:shallow", "FTabPane:tab_pane", "FSubheader:subheader",
 			"FTooltip:tooltip", "FTooltipTitle:tooltip_title", "FQuickbarInner:quickbar_inner", "FDraggable:draggable",
+			"FTemporaryStation:temporary_station",
 			"FResearchInactive:research_inactive", "FResearchActive:research_active"]:
 		var type_name: String = v.get_slice(":", 0)
 		_variation(t, type_name, "PanelContainer")

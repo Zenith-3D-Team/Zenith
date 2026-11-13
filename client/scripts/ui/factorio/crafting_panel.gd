@@ -177,7 +177,8 @@ func _recipe_slot(r: Dictionary) -> Slot:
 
 
 ## Factorio's recipe tooltip: "Ingredients:" (have/need in red where the inventory is short),
-## the crafting time, "Products:". The item's own lines follow (Slot.info), as Factorio's second box.
+## the crafting time, "Products:", "Total raw:". The item's own lines follow (Slot.info), as
+## Factorio's second box.
 func _tip_lines(r: Dictionary) -> Array:
 	return recipe_tip_lines(model, r)
 
@@ -200,6 +201,18 @@ static func recipe_tip_lines(m, r: Dictionary) -> Array:
 		for p in products:
 			if p is Array and p.size() >= 2:
 				lines.append(["%s × %s" % [_amount(float(p[1])), Kit.pretty(str(p[0]))], str(p[0])])
+	var raw: Dictionary = m.total_raw(str(r.get("name", "")))
+	if bool(raw["too_complex"]):
+		lines.append(["Total raw:"])
+		lines.append(["Too complex to calculate", "", Kit.DISABLED_TEXT])
+	elif bool(raw["expanded"]):
+		# Only worth a section when something was broken down: otherwise it repeats the ingredients.
+		lines.append(["Total raw:"])
+		lines.append(["⏱ %s s" % str(snappedf(float(raw["time"]), 0.01))])
+		var names: Array = raw["items"].keys()
+		names.sort()
+		for item in names:
+			lines.append(["%s × %s" % [_amount(float(raw["items"][item])), Kit.pretty(str(item))], str(item)])
 	return lines
 
 

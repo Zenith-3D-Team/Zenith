@@ -43,6 +43,14 @@ var _stopping := false
 var _helper_pid := -1
 ## The small process that ends the server if this program dies without stopping it.
 var _watch_pid := -1
+## Set before use to keep a server apart from the menu's own (the performance test, perf_game.gd):
+## its own write-data folder instead of Paths.server_data_dir(), none of the player's mods linked
+## in (Factorio's defaults: the DLC it finds and the bridge), its own first port, and server
+## settings over the repo's server-settings.json.
+var data_dir := ""
+var player_mods := true
+var port_base := 0
+var server_settings_extra := {}
 
 
 func is_running() -> bool:
@@ -52,7 +60,11 @@ func is_running() -> bool:
 
 
 func log_path() -> String:
-	return Paths.server_data_dir().path_join("factorio-current.log")
+	return _data_dir().path_join("factorio-current.log")
+
+
+func _data_dir() -> String:
+	return data_dir if data_dir != "" else Paths.server_data_dir()
 
 
 ## Creates a new map at `path` from map generator settings (map_gen.gd: {"gen", "map"}; a
@@ -153,14 +165,17 @@ func start(path: String, host := {}) -> bool:
 		error = "The save %s doesn't exist." % path
 		return false
 	save_path = path
-	progress.emit("Matching the save's mods…", 0.2)
-	if not await _sync_mods(path):
-		return false
+	if player_mods:
+		progress.emit("Matching the save's mods…", 0.2)
+		if not await _sync_mods(path):
+			return false
 	var base := int(Settings.get_value("factorio", "port_base"))
 	if base < 1024:
 		base = PORT_BASE
 	if Settings.arg_value("--port-base=").is_valid_int():
 		base = int(Settings.arg_value("--port-base="))
+	if port_base >= 1024:
+		base = port_base
 	udp_port = free_udp_port(base)
 	game_port = free_udp_port(udp_port + 1)
 	if not host.is_empty():
@@ -377,7 +392,7 @@ func _prepare() -> bool:
 	if _exe == "" or not FileAccess.file_exists(_exe):
 		error = "Factorio wasn't found%s.\nSet the path to factorio.exe in Settings → Factorio." % (" at " + _exe if _exe != "" else "")
 		return false
-	_data = Paths.server_data_dir()
+	_data = _data_dir()
 	var mods := _data.path_join("mods")
 	DirAccess.make_dir_recursive_absolute(mods)
 	# /server-save <name> writes to <data>/saves, and Factorio stops the game if it's missing.
@@ -572,6 +587,8 @@ func _server_settings(host: Dictionary) -> String:
 		s["max_players"] = int(host.get("max_players", 0))
 		s["visibility"] = {"public": false, "lan": bool(host.get("lan", true))}
 		s["require_user_verification"] = false
+	for key in server_settings_extra:
+		s[key] = server_settings_extra[key]
 	var out := _data.path_join("server-settings.json")
 	_write(out, JSON.stringify(s, "  "))
 	return out

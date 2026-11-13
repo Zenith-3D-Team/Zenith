@@ -26,12 +26,13 @@ extends Node
 ## (RenderingServer.ShadowQuality: its own cost measured under 0.1 ms) and how wide it blurs
 ## (Light3D.shadow_blur, in texels). High's map has about half the texels a tile the old nearest
 ## split had, which blurred thin shadows such as a pole's lattice: blurring 0.6 texels keeps their
-## edges as before.
+## edges as before. "items": how far the camera may be from the belt items round the character for
+## their models to cast shadows (belt_items.gd shadows_within).
 const QUALITY := {
-	"low": {"splits": 1, "horizon_splits": 2, "atlas": 2048, "cap": 80.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_VERY_LOW, "blur": 1.0},
-	"medium": {"splits": 1, "horizon_splits": 2, "atlas": 4096, "cap": 110.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0},
-	"high": {"splits": 1, "horizon_splits": 4, "atlas": 4096, "cap": 150.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 0.6},
-	"ultra": {"splits": 1, "horizon_splits": 4, "atlas": 8192, "cap": 200.0, "fade": 0.8, "blend": true, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0},
+	"low": {"splits": 1, "horizon_splits": 2, "atlas": 2048, "cap": 80.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_VERY_LOW, "blur": 1.0, "items": 30.0},
+	"medium": {"splits": 1, "horizon_splits": 2, "atlas": 4096, "cap": 110.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 45.0},
+	"high": {"splits": 1, "horizon_splits": 4, "atlas": 4096, "cap": 150.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 0.6, "items": 60.0},
+	"ultra": {"splits": 1, "horizon_splits": 4, "atlas": 8192, "cap": 200.0, "fade": 0.8, "blend": true, "filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0, "items": 80.0},
 }
 ## The view reaches "far" (cascades, horizon_splits) once the shadows' distance is this many times
 ## the nearest ground in view; back to one map below the second figure.
@@ -43,6 +44,7 @@ const STEP := 1.15
 ## A shorter step is only taken once the view needs this much less than it (so zooming back and
 ## forth across a step doesn't flip it).
 const HYSTERESIS := 0.9
+const BeltItems := preload("res://scripts/world/belt_items.gd")
 const MODES := {1: DirectionalLight3D.SHADOW_ORTHOGONAL, 2: DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS, 4: DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS}
 ## --legacy-render: the shadows as they were before (a fixed 150 tiles, four splits, two on Low;
 ## and model_lods.gd's levels of detail), for comparisons.
@@ -97,6 +99,7 @@ func apply_legacy() -> void:
 ## Sets the shadows from a QUALITY entry (or one like it: --probe-variants' "fit ...").
 func apply_spec(s: Dictionary) -> void:
 	spec = s
+	BeltItems.shadows_within = float(spec.get("items", 60.0))
 	if sun == null:
 		return
 	RenderingServer.directional_shadow_atlas_set_size(int(spec["atlas"]), true)
@@ -118,6 +121,9 @@ func _fit(force: bool) -> void:
 	if cam == null:
 		return
 	view_depths = ground_depths(cam)
+	if cam.projection == Camera3D.PROJECTION_ORTHOGONAL:
+		_fit_ortho(force)
+		return
 	var cap := cap_for(spec, distance_cap)
 	var want := distance_for(view_depths.y, cap, -1.0 if force else sun.directional_shadow_max_distance, float(spec["fade"]))
 	if want != sun.directional_shadow_max_distance or force:
@@ -136,6 +142,22 @@ func _fit(force: bool) -> void:
 		sun.directional_shadow_split_1 = splits.x
 		sun.directional_shadow_split_2 = splits.y
 		sun.directional_shadow_split_3 = splits.z
+
+
+## Under an orthographic camera (Factorio's view, F6; the map's remote view) Godot's one fitted map
+## and fitted splits drew no shadows of buildings at all (only of robots, whose MultiMeshes have a
+## huge box): its directional shadow fitting assumes a perspective view. The fixed cascades from
+## before the fitting draw them (seen against the mock and real 2.1.24), so they are used there.
+func _fit_ortho(force: bool) -> void:
+	var want := minf(cap_for(spec, distance_cap), 150.0)
+	var mode := DirectionalLight3D.SHADOW_PARALLEL_2_SPLITS if quality == "low" else DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+	far_view = false
+	if force or sun.directional_shadow_max_distance != want or sun.directional_shadow_mode != mode:
+		sun.directional_shadow_max_distance = want
+		sun.directional_shadow_mode = mode
+		sun.directional_shadow_split_1 = 0.1
+		sun.directional_shadow_split_2 = 0.2
+		sun.directional_shadow_split_3 = 0.5
 
 
 ## The nearest and furthest ground (y = 0) the camera sees, as depths along its view: from the

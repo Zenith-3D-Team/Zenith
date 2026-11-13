@@ -39,9 +39,14 @@ CONNECTIONS = [("nauvis", "vulcanus", 15000, 120), ("nauvis", "gleba", 15000, 14
 SILO_AT, PAD_AT = (-18.5, -1.5), (-6.0, -21.0)
 PARTS_NEEDED = 50
 PART_TICKS = 6
-ROCKET_TICKS = 600   # the rocket is drawn rising and leaving for this long
+ROCKET_TICKS = 1800  # the rocket is drawn rising and leaving for this long
+# A finished rocket's way out of the silo, as Factorio's (light_blinking_speed, door_opening_speed,
+# rising_speed): status, ticks, the `st` the bridge sends for it.
+SILO_STEPS = [("lights_blinking_open", 180, 2), ("doors_opening", 255, 2), ("rocket_rising", 420, 3)]
+DOORS_CLOSE = 255
 POD_DELAY = 300      # after the launch, a cargo pod comes down on the pad
 POD_TICKS = 240
+POD_DROP = 40.0      # how far north of the pad it starts falling, in tiles
 CHUNK_INTERVAL = 10
 # Asteroid collectors as 2.1.23's prototype has them: the catch circle 7.5 tiles round a point 5
 # tiles in front, a head that grabs within 0.6, one arm at 0.2 tiles a tick that drops its chunk
@@ -282,10 +287,18 @@ class Space:
         else:
             m["inv"]["rocket"] = {}
         s.send_now({"t": "rk", "u": silo.unit, "x": round(silo.x * 256), "y": round(silo.y * 256), "s": s.surface})
-        rocket = s._unit()
-        s.movers.append({"unit": rocket, "name": "rocket-silo-rocket", "kind": "parked", "x": silo.x, "y": silo.y, "o": 0.0,
-                         "speed": 0.0, "space_until": s.tick + ROCKET_TICKS})
+        for x in s.movers:
+            if x["unit"] == m.get("rocket"):
+                x["space_until"] = s.tick + ROCKET_TICKS
         self.launches.append({"at": s.tick, "pod": None})
+
+    def silo_state(self, entity):
+        """`st` for a silo, as the bridge's: where its rocket is, or None while it is only building one."""
+        status = self.s.machine(entity).get("st", "building_rocket")
+        for name, _, state in SILO_STEPS:
+            if status == name:
+                return state
+        return {"rocket_ready": 4, "launch_started": 4, "doors_closing": 5}.get(status)
 
     # --- every tick -------------------------------------------------------------------------
 
@@ -296,9 +309,18 @@ class Space:
             if m.get("st", "building_rocket") == "building_rocket" and s.tick % PART_TICKS == 0:
                 m["parts"] = m.get("parts", 0) + 1
                 if m["parts"] >= PARTS_NEEDED:
-                    m["parts"], m["st"] = PARTS_NEEDED, "rocket_ready"
+                    m["parts"], m["st"], m["step"] = PARTS_NEEDED, SILO_STEPS[0][0], s.tick
+                    m["rocket"] = s._unit()
+                    s.movers.append({"unit": m["rocket"], "name": "rocket-silo-rocket", "kind": "parked", "x": self.silo.x,
+                                     "y": self.silo.y, "o": 0.0, "speed": 0.0})
             elif m.get("st") == "launch_started" and not any(x.get("name") == "rocket-silo-rocket" for x in s.movers):
+                m["st"], m["step"] = "doors_closing", s.tick
+            elif m.get("st") == "doors_closing" and s.tick - m["step"] >= DOORS_CLOSE:
                 m["st"] = "building_rocket"
+            for i, (status, ticks, _) in enumerate(SILO_STEPS):
+                if m.get("st") == status and s.tick - m["step"] >= ticks:
+                    m["st"], m["step"] = SILO_STEPS[i + 1][0] if i + 1 < len(SILO_STEPS) else "rocket_ready", s.tick
+                    break
             if m.get("st") == "rocket_ready" and m["auto"] == 1 and s.platform["loc"] == "nauvis":
                 self.launch(self.silo, m, s.platform["i"])
             s.movers[:] = [x for x in s.movers if x.get("space_until", s.tick + 1) > s.tick]
@@ -309,8 +331,16 @@ class Space:
                                      "y": self.pad.y, "o": 0.0, "speed": 0.0, "space_until": s.tick + POD_TICKS})
             live = [x for x in self.launches if x["pod"] is None or s.tick - x["at"] < POD_DELAY + POD_TICKS]
             pods = [x["pod"] for x in live if x["pod"] is not None]
+            # As in Factorio, a falling pod has no height: it travels south across the map to where it lands.
+            for launch in live:
+                if launch["pod"] is not None:
+                    left = 1.0 - min(1.0, (s.tick - launch["at"] - POD_DELAY) / POD_TICKS)
+                    for m in s.movers:
+                        if m["unit"] == launch["pod"]:
+                            m["y"] = self.pad.y - POD_DROP * left * left
             if s.tick % 10 == 0 and (pods or len(live) != len(self.launches)):
-                s.send_now({"t": "cp", "l": [[u, "descending", "station", "nauvis"] for u in pods]})
+                spot = [int(self.pad.x * 256), int(self.pad.y * 256)] if self.pad is not None else []
+                s.send_now({"t": "cp", "l": [[u, "descending", "station", "nauvis"] + spot for u in pods]})
             self.launches = live
         on_platform = s.surface not in self.planets
         if on_platform:

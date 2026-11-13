@@ -22,6 +22,7 @@ local machine_info = require("scripts.machine_info")
 local map = require("scripts.map")
 local modules = require("scripts.modules")
 local alt_mode = require("scripts.alt_mode")
+local belt_switch = require("scripts.belt_switch")
 
 local M = {}
 
@@ -579,6 +580,7 @@ function M.set_circuit(cmd)
   if not ok or err then
     puppet.message("Can't set that: " .. tostring(err))
   end
+  belt_switch.configured(e)
 end
 
 -- {u, n}: the open chest's limit bar.

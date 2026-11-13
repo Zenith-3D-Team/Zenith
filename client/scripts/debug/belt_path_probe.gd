@@ -8,8 +8,14 @@ extends Node
 
 const MAX_ITEMS := 4000
 
+## The summary line, as printed (the debug menu shows it).
+signal reported(text: String)
+
 var main: Node  # main.gd: its belt_items
 var out_path := ""
+## False when the debug menu started it: the game goes on after, belt_items.gd watching as before.
+var quit_when_done := true
+var _watch_all_before = null
 
 var _seconds := 20.0
 var _area := PackedFloat64Array()
@@ -24,6 +30,10 @@ var _base := {}
 var _clock_rows: Array = []
 ## Each frame's square (the update's fx, fy, fr) the items drawn were read in: [tick, x, y, half side].
 var _squares: Array = []
+## Each frame's square of the items drawn in it (belt_items.gd covered(): the update drawn, which
+## while walking is behind the newest) and where the character stood: [tick, x, y, half side, char x,
+## char y]. belt_path_check.py counts the game's items only inside it.
+var _covered: Array = []
 ## Frames whose glide had reached the newest update's places (items stood waiting for the next).
 var _waited := 0
 
@@ -47,6 +57,8 @@ func _process(delta: float) -> void:
 		return
 	var belt = main.belt_items
 	if "watch_all" in belt:
+		if _watch_all_before == null:
+			_watch_all_before = belt.watch_all
 		belt.watch_all = true  # items new in an update too (belt groups' take new ids along)
 	_t += delta
 	if _t < _settle:
@@ -56,32 +68,26 @@ func _process(delta: float) -> void:
 		_base = belt.stats.duplicate(true) if "stats" in belt else {}
 		print("belt-path-probe: recording %.0f s" % _seconds)
 	_dt.append(delta)
-	if belt._progress() >= 0.999:
-		_waited += 1
 	if out_path != "-":
 		# (Not while a finished job's result waits for the drawn clock (belt_items.gd _held_job): its
 		# state has the next update's items, what is drawn still the last one's, and items handed over
 		# to a new id meanwhile would be counted as missing.)
-		if belt._task < 0 and ("_held_job" not in belt or belt._held_job == null):
-			# Ids gone from the layer go (belt groups' items take new ids as they move along).
-			for uid in _uids.keys():
-				if not belt._state.items.has(uid):
-					_uids.erase(uid)
-				elif _area.size() == 4:
-					# (And those that left the area: walking, the area's items change.)
-					var at: Vector3 = belt._state.items[uid].target
-					if at.x < _area[0] or at.x > _area[2] or at.z < _area[1] or at.z > _area[3]:
-						_uids.erase(uid)
-			for uid in belt._state.items:
-				if _uids.size() >= MAX_ITEMS:
-					break
-				# (-- --belt-path-area=x0,y0,x1,y1: only items there, the area being recorded, so a
-				# square of more than MAX_ITEMS items isn't measured on whichever it happened to take.)
-				if _area.size() == 4:
-					var at: Vector3 = belt._state.items[uid].target
-					if at.x < _area[0] or at.x > _area[2] or at.z < _area[1] or at.z > _area[3]:
-						continue
-				_uids[uid] = true
+		# Items to follow: from what the main thread has of them (positions of every item: watch_all),
+		# as jobs now run nearly every frame.
+		var known_now: Dictionary = belt._positions
+		for uid in _uids.keys():
+			if not known_now.has(uid):
+				_uids.erase(uid)
+		for uid in known_now:
+			if _uids.size() >= MAX_ITEMS:
+				break
+			if _uids.has(uid):
+				continue
+			if _area.size() == 4:
+				var at: Vector3 = (known_now[uid] as Array)[0]
+				if at.x < _area[0] or at.x > _area[2] or at.z < _area[1] or at.z > _area[3]:
+					continue
+			_uids[uid] = true
 		if _frames.size() % 30 == 0:
 			# How the updates come: the mod's period (bi p), the drawn clock's gap and how far it is
 			# behind the newest message handled, and the bridge's backlog of messages.
@@ -89,6 +95,11 @@ func _process(delta: float) -> void:
 				snappedf(Bridge.server_tick - belt._drawn, 0.1), Bridge.waiting_count()])
 		var sq: Vector3 = belt._state.square
 		_squares.append([Bridge.server_tick, sq.x, sq.y, sq.z])
+		var cov: Vector3 = belt.covered() if belt.has_method("covered") else Vector3(0.0, 0.0, -1.0)
+		var me := Vector2.ZERO
+		if "avatar" in main and main.avatar != null:
+			me = main.avatar.ground_position()
+		_covered.append([Bridge.server_tick, cov.x, cov.y, cov.z, snappedf(me.x, 0.01), snappedf(me.y, 0.01)])
 		var row: Array = [Bridge.server_tick, belt._drawn]
 		for uid in _uids:
 			var known: bool = belt._positions.has(uid)
@@ -115,31 +126,23 @@ func _finish(belt) -> void:
 		return
 	var st: Dictionary = belt.stats
 	var d := {}
-	for k in ["frames", "main_usec", "jobs", "worker_usec", "indexed", "index_usec", "write_usec", "cached", "fresh", "missing"]:
-		d[k] = int(st.get(k, 0)) - int(_base.get(k, 0))
+	for k in st:
+		if st[k] is int:
+			d[k] = int(st[k]) - int(_base.get(k, 0))
 	d["worst_job_usec"] = st["worst_job_usec"]
-	var routes: Array = []
-	for k in 5:
-		routes.append(int(st["routes"][k]) - int(_base["routes"][k]))
-	d["routes"] = routes
-	var summary := "belt-path-probe: %d items now, belt items %.3f ms a frame on the main thread, %.2f ms a job on a worker (%.1f jobs a second, worst %.1f ms; indexing belts %d chunks, %.2f ms a job, writing %.2f ms a job, %d glides on a known run, %d new items, %d missing), glides %s (not known, straight, path, snapped, too far); %s" % [
-		belt.count(), d["main_usec"] / 1000.0 / maxi(d["frames"], 1), d["worker_usec"] / 1000.0 / maxi(d["jobs"], 1),
-		d["jobs"] / _seconds, d["worst_job_usec"] / 1000.0, d["indexed"], d["index_usec"] / 1000.0 / maxi(d["jobs"], 1), d["write_usec"] / 1000.0 / maxi(d["jobs"], 1), d["cached"], d["fresh"], d["missing"], routes, frames]
-	print(summary)
-	print("belt-path-probe: of a job, routing items not on a known run %.2f ms, folding glides %.2f ms (since the start); routes found without a walk %d, walked by the kind of belt they began on (straight, left, right, entrance, exit, splitter, other) %s" % [
-		st.get("route_usec", 0) / 1000.0 / maxi(st["jobs"], 1), st.get("fold_usec", 0) / 1000.0 / maxi(st["jobs"], 1), st.get("runs", 0), st.get("walks", [])])
-	var parts := ""
 	var per := float(maxi(d["jobs"], 1))
-	for k in ["handle_usec", "route_usec", "end_usec", "groups_usec", "missing_usec", "adopt_usec", "carry_usec", "cap_usec", "write_usec", "upload_usec",
-			"kept_records", "records_written", "pages"]:
-		d[k] = int(st.get(k, 0)) - int(_base.get(k, 0))
-		parts += "%s %.2f, " % [k, d[k] / per / (1000.0 if k.ends_with("_usec") else 1.0)]
-	print("belt-path-probe: a job (ms, or counts): %s" % parts)
-	print("belt-path-probe: plain items let go (sent again without it, chain full, into a group, stuck) %s; drift checks that asked again %d (since the start)" % [st.get("let_go", []), st.get("drifted", 0)])
-	var late := int(st.get("late", 0)) - int(_base.get("late", 0))
-	print("belt-path-probe: jobs drawn after their fold tick %d of %d, %.2f ticks late on average" % [late, d["jobs"],
-		(float(st.get("late_ticks", 0.0)) - float(_base.get("late_ticks", 0.0))) / maxi(late, 1)])
-	_write({"period": 0, "frames": _frames, "stats": d, "summary": summary, "clock": _clock_rows, "squares": _squares, "waited": _waited, "frames_n": _dt.size()})
+	var summary := "belt-path-probe: %d items now, belt items %.3f ms a frame on the main thread, %.2f ms a job on a worker (%.1f jobs a second, worst %.1f ms; simulating %.2f ms, writing %.2f ms a job), %.1f changes and %.1f records a job, %d lanes asked again; %s" % [
+		belt.count(), d["main_usec"] / 1000.0 / maxi(d["frames"], 1), d["worker_usec"] / 1000.0 / per,
+		d["jobs"] / _seconds, d["worst_job_usec"] / 1000.0, d["sim_usec"] / 1000.0 / per, d["write_usec"] / 1000.0 / per,
+		d["changes"] / per, d["records_written"] / per, d["asked"], frames]
+	print(summary)
+	var nt := maxf(1.0, float(d.get("ticks", 0)))
+	print("belt-path-probe: a job: handling %.2f, simulating %.2f (relinking %.2f, loads and checks %.2f, stepping %.2f), records %.2f, renewing %.2f, cap %.2f, writing %.2f ms; %.1f ticks a job, %.1f line steps a tick; why stepped every tick %s" % [
+		d.get("handle_usec", 0) / 1000.0 / per, d["sim_usec"] / 1000.0 / per, d.get("sim_relink_usec", 0) / 1000.0 / per,
+		d.get("sim_queue_usec", 0) / 1000.0 / per, d.get("sim_step_usec", 0) / 1000.0 / per, d.get("apply_usec", 0) / 1000.0 / per,
+		d.get("renew_usec", 0) / 1000.0 / per, d.get("cap_usec", 0) / 1000.0 / per, d["write_usec"] / 1000.0 / per, nt / per,
+		d.get("line_steps", 0) / nt, st.get("why_tick", [])])
+	_write({"period": 0, "frames": _frames, "stats": d, "summary": summary, "clock": _clock_rows, "squares": _squares, "covered": _covered, "waited": _waited, "frames_n": _dt.size()})
 
 
 func _write(data: Dictionary) -> void:
@@ -147,4 +150,10 @@ func _write(data: Dictionary) -> void:
 		var f := FileAccess.open(out_path, FileAccess.WRITE)
 		f.store_string(JSON.stringify(data))
 		f.close()
-	get_tree().quit(0)
+	reported.emit(str(data.get("summary", "belt-path-probe: %d frames recorded" % _frames.size())))
+	if quit_when_done:
+		get_tree().quit(0)
+		return
+	if _watch_all_before != null and main.belt_items != null:
+		main.belt_items.watch_all = _watch_all_before
+	queue_free()

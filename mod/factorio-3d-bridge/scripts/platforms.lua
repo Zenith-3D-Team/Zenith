@@ -172,7 +172,38 @@ local function destinations(force)
   return ok and out or {}
 end
 
--- {t = "plat", on, here?, l = [...], dest = [...]}
+-- Each planet in the platforms' skies, so the client turns it once per day there with its lit side
+-- where the game's time of day puts it: [[name, ticks per day, daytime (hundred-thousandths), frozen
+-- 0/1], ...]. A planet without a surface yet has no time of day: its day from the prototype
+-- (surface_properties["day-night-cycle"], ticks) and its time of day counted from the game's tick.
+local function planet_days(names)
+  local out = {}
+  for name in pairs(names) do
+    local planet = game.planets[name]
+    if planet then
+      local ok, surface = pcall(function() return planet.surface end)
+      local day, daytime, frozen
+      if ok and surface and surface.valid then
+        day = surface.ticks_per_day
+        daytime = surface.daytime
+        frozen = surface.freeze_daytime
+      else
+        local okp, props = pcall(function() return planet.prototype.surface_properties end)
+        day = okp and type(props) == "table" and props["day-night-cycle"] or nil
+        if type(day) == "number" and day > 0 then
+          daytime = (game.tick % day) / day
+        end
+      end
+      if type(day) == "number" and day > 0 and type(daytime) == "number" then
+        out[#out + 1] = { name, math.floor(day + 0.5), math.floor(daytime * 100000 + 0.5) % 100000, frozen and 1 or 0 }
+      end
+    end
+  end
+  table.sort(out, function(a, b) return a[1] < b[1] end)
+  return out
+end
+
+-- {t = "plat", on, here?, k, l = [...], dest = [...], days = [...]}
 function M.message()
   local c = puppet.get()
   local force = c and c.force or game.forces.player
@@ -197,6 +228,16 @@ function M.message()
     end
   end
   table.sort(out.l, function(a, b) return a.i < b.i end)
+  local names = {}
+  for _, rec in ipairs(out.l) do
+    for _, key in ipairs({ "loc", "from", "to" }) do
+      if rec[key] then
+        names[rec[key]] = true
+      end
+    end
+  end
+  out.k = game.tick
+  out.days = planet_days(names)
   return out
 end
 

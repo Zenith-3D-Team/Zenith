@@ -14,6 +14,7 @@ from space_kit import (COS_P, SIN_P, bent, blob, dome, flange, hose, lathe, prof
                        sweep, ys, zs)
 import detail
 import kit
+import stomper_shell_data
 
 # Parts under an `anim_glow_*` node glow in their material's colour while the machine works (their
 # colour at rest is sampled from the sprite), so these carry the colour of Factorio's glow layers.
@@ -1371,27 +1372,164 @@ def _strafer(scale):
 
 def _stomper_shell(scale):
     """The shell a dead stomper leaves (a rock-like simple-entity, mined for stone and spoilage),
-    from Factorio's stomper-corpse-head picture: a rounded, lumpy dome of dark mauve-grey armour a
-    little past its collision box, studded with pale spikes and dark pits. In fights it had been a
-    big cream box. `scale` is the tier's (gleba.py PENTAPOD_TIERS: 1 is the big stomper's)."""
+    from Factorio's stomper-corpse-head picture (fit_shell.py, stomper_shell_data.py): a lumpy dome
+    of dark mauve-grey armour, its outline the picture's, knobs raised and pale, pits and the long
+    crack cut in where the picture has them, spikes standing round its rim and over its back. The
+    far side, which the picture doesn't show, wears the same relief turned half round. `scale` is
+    the tier's (gleba.py PENTAPOD_TIERS: 1 is the big stomper's)."""
     ss = 1.76 * scale  # Factorio's stomper_scale for this tier (1.1 x 1.6 for the big one)
-    w, d, rz = 3.6 * ss * 0.55, 2.9 * ss * 0.55, 1.4 * ss  # half width, half depth, half height
-    cz = rz - 0.25 * ss  # sunk a quarter tile (big) so the underside doesn't show
+    data = stomper_shell_data
+    up = Vector((0.0, 0.691, 0.462))    # a step of 1 up Factorio's screen, square to its view
+    cam = Vector((0.0, -COS_P, SIN_P))  # towards the camera
+    cx, cu = data.CENTRE
+    w, d, h = 3.3, 2.75, 2.1            # the dome before the outline shapes it (stomper_scale 1: /1.76)
+    w, d, h = w / 1.76, d / 1.76, h / 1.76
+    z0 = 0.34 * h
+    y0 = cu - COS_P * z0
+    segs, rings = 128, 42
+    e_lo = -0.5
+
+    def screen(q):
+        return q.x, q.y + COS_P * q.z
+
+    def on_dome(a, e):
+        return Vector((cx + w * math.cos(e) * math.cos(a), y0 + d * math.cos(e) * math.sin(a), z0 + h * math.sin(e)))
+
+    grid = [[on_dome(2 * math.pi * s / segs, e_lo + (math.pi / 2 - e_lo) * r / rings) for s in range(segs)]
+            for r in range(rings)]
+    pole = on_dome(0.0, math.pi / 2)
+    # The dome's own outline per direction, then every point moved in its screen plane to the picture's.
+    bins = len(data.OUTLINE)
+    outline = [0.0] * bins
+
+    def polar(q):
+        x, u = screen(q)
+        a = math.atan2(u - cu, x - cx) % (2 * math.pi)
+        return a, math.hypot(x - cx, u - cu)
+
+    for row in grid:
+        for q in row:
+            a, rho = polar(q)
+            k = int(a / (2 * math.pi) * bins) % bins
+            outline[k] = max(outline[k], rho)
+    for k in range(bins):
+        if outline[k] == 0.0:
+            outline[k] = outline[k - 1]
+
+    def fitted(q):
+        a, rho = polar(q)
+        t = a / (2 * math.pi) * bins - 0.5
+        k = int(math.floor(t)) % bins
+        f = t - math.floor(t)
+        ratio = (data.OUTLINE[k] / outline[k]) * (1 - f) + (data.OUTLINE[(k + 1) % bins] / outline[(k + 1) % bins]) * f
+        x, u = screen(q)
+        return q + Vector((1.0, 0.0, 0.0)) * ((x - cx) * (ratio - 1)) + up * ((u - cu) * (ratio - 1))
+
+    def normal_of(q):
+        return Vector(((q.x - cx) / (w * w), (q.y - y0) / (d * d), (q.z - z0) / (h * h))).normalized()
+
+    def relief(q, n):
+        """How far to push the surface out or in: soft lumps under the knobs, dents under pits."""
+        x, u = screen(q)
+        if n.dot(cam) < 0.0:   # round the far side: the near side's relief, turned half round
+            x, u = 2 * cx - x, 2 * cu - u
+        push = 0.0
+        for kx, ku, r, _ in data.KNOBS:
+            r = min(r, 0.13) * 0.8
+            d2 = (x - kx) ** 2 + (u - ku) ** 2
+            if d2 < 9 * r * r:
+                push += math.exp(-d2 / (r * r)) * r * 1.2
+        for kx, ku, r in data.PITS:
+            d2 = (x - kx) ** 2 + (u - ku) ** 2
+            if d2 < 9 * r * r:
+                push -= math.exp(-d2 / (r * r)) * 0.09
+        for kx, ku in data.GROOVES:
+            d2 = (x - kx) ** 2 + (u - ku) ** 2
+            if d2 < 0.012:
+                push = min(push, -0.09 * math.exp(-d2 / 0.003))
+        return min(push, 0.16)
+
     p = Part()
-    blob(p, (0, 0, cz), 1.0, "flesh_shell_husk", segs=20, rings=12, scale=(w, d, rz), seed=11, wobble=0.1)
-    rnd = kit.rng(29)
-    for _ in range(26):
-        # Points on the dome's upper part, each spike standing out along the surface's normal.
-        a = rnd.uniform(0, 2 * math.pi)
-        e = rnd.uniform(0.25, 1.3)
-        n = Vector((math.cos(a) * math.cos(e), math.sin(a) * math.cos(e), math.sin(e)))
-        base = Vector((n.x * w * 0.97, n.y * d * 0.97, cz + n.z * rz * 0.97))
-        out = Vector((n.x / w, n.y / d, n.z / rz)).normalized()
-        if rnd.random() < 0.6:
-            stalk(p, [base, base + out * rnd.uniform(0.15, 0.32) * ss], 0.08 * ss, 0.01, "flesh_shell",
-                  segs=6, smooth=0)
-        else:
-            p.sphere(tuple(base - out * 0.03 * ss), rnd.uniform(0.06, 0.1) * ss, "flesh_eye", segs=6, rings=3)
+    p.sharp_angle = 70.0
+    bm = p.bm
+
+    def vert(q):
+        q = fitted(q)
+        n = normal_of(q)
+        q = q + n * relief(q, n)
+        q.z = max(q.z, -0.26)  # sunk no deeper than its spec allows
+        return bm.verts.new(tuple(c * ss for c in q))
+
+    rows = [[vert(q) for q in row] for row in grid]
+    top = vert(pole)
+    husk = p._mat_index("flesh_shell_husk")
+    for r in range(rings - 1):
+        for s in range(segs):
+            t = (s + 1) % segs
+            bm.faces.new([rows[r][s], rows[r][t], rows[r + 1][t], rows[r + 1][s]]).material_index = husk
+    for s in range(segs):
+        bm.faces.new([rows[-1][s], rows[-1][(s + 1) % segs], top]).material_index = husk
+
+    # What the camera sees of the surface, to find the point under a mark in the picture.
+    seen = [(q, *screen(q)) for q in (fitted(v) for row in grid[3:] for v in row) if normal_of(q).dot(cam) > 0.05]
+
+    def under(x, u):
+        return min(seen, key=lambda c: (c[1] - x) ** 2 + (c[2] - u) ** 2)[0]
+
+    def far_side(q):
+        return fitted(Vector((2 * cx - q.x, 2 * y0 - q.y, q.z)))
+
+    def spike(root, tip, r):
+        stalk(p, [tuple(c * ss for c in root), tuple(c * ss for c in tip)], r * ss, 0.012 * ss, "flesh_shell", segs=6, smooth=0)
+
+    def knob(q, r):
+        n = normal_of(q)
+        p.sphere(tuple(c * ss for c in q + n * r * 0.1), r * ss, "flesh_shell", segs=6, rings=3)
+
+    # Knobs where the picture has them, the far side's from the near side turned half round.
+    knobs = sorted(data.KNOBS, key=lambda k: -k[3])[:45]
+    for i, (kx, ku, r, _) in enumerate(knobs):
+        q = under(kx, ku)
+        size = max(0.04, min(r * 0.55, 0.075))
+        knob(q, size)
+        if i % 3 == 0:
+            knob(far_side(q), size)
+    for kx, ku, r in data.PITS:
+        q = under(kx, ku)
+        p.sphere(tuple(c * ss for c in q), max(0.035, r * 0.9), "flesh_eye", segs=8, rings=3)
+    # The crack: its dots joined up in order, a dark line let into the shell.
+    dots = [under(x, u) for x, u in data.GROOVES]
+    while dots:
+        line = [dots.pop(0)]
+        for end in (0, -1):
+            while dots:
+                near = min(dots, key=lambda q: (q - line[end]).length)
+                if (near - line[end]).length > 0.28:
+                    break
+                dots.remove(near)
+                line.insert(0 if end == 0 else len(line), near)
+        if len(line) >= 2:
+            stalk(p, [tuple(c * ss for c in q) for q in line], 0.03 * ss, 0.03 * ss, "flesh_eye", segs=4, smooth=2)
+
+    # Round the rim: from the shell under each silhouette spike's root, inward a little, out to its tip.
+    for x0, u0, x1, u1, width in data.SPIKES:
+        if math.hypot(x1 - x0, u1 - u0) < 0.1:  # a nick in the outline, not a spike
+            continue
+        mid = under(x0, u0)
+        tip = mid + Vector((x1 - x0, 0.0, 0.0)) + up * (u1 - u0)
+        spike(mid - (tip - mid).normalized() * 0.1, tip, max(0.07, min(width, 0.12)))
+    # Over the back: the brightest small knobs stand up as short spikes, some round the far side.
+    strong = sorted((k for k in data.KNOBS if k[2] < 0.16), key=lambda k: -k[3])[:14]
+    for i, (kx, ku, r, _) in enumerate(strong):
+        q = under(kx, ku)
+        n = normal_of(q)
+        spike(q - n * 0.03, q + n * (0.14 + 0.02 * (i % 4)), 0.07)
+        if i % 2 == 0:
+            b = far_side(q)
+            nb = normal_of(b)
+            spike(b - nb * 0.03, b + nb * 0.16, 0.07)
+    for v in bm.verts:  # nothing sunk deeper than its spec allows
+        v.co.z = max(v.co.z, -0.26 * ss)
     return p
 
 

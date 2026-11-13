@@ -199,39 +199,73 @@ step(13)
 moving = of_type(take(), "bi")
 check(any(m["l"] for m in moving), "bl: when the belt moves again its lanes are sent again")
 
-# bg (with bl): packed lanes (the belt field's: one kind and stack size, a quarter tile apart) come
-# as groups, then only their front items' places when they move (bm); the starter belt's lanes,
-# which mix kinds, still as items.
+# bs: a client that simulates belts gets bs instead of bi: every lane in the square with its meta
+# (lm) and items (sl) when it comes in, then sl only where the items on a lane are others, drift
+# checks (pc) for the rest, bre answered with lm and sl.
 game.build_belt_field(2, 3, x0=8, y0=14)
 field_keys = {game.lane_key(b.x + dx, b.y) for column in game.belt_field for b in column for dx in (-0.25, 0.25)}
-HELLO["bg"] = 1
+HELLO["bs"] = 1
 send(HELLO)
 step(13)
-gmsgs = of_type(take(), "bi")
-groups = {m["bg"][i]: m["bg"][i + 1:i + 10] for m in gmsgs for i in range(0, len(m.get("bg", [])), 10)}
-as_items = {m["ln"][i] for m in gmsgs for i in range(0, len(m.get("ln", [])), 2)}
-check(set(groups) == field_keys and not field_keys & as_items and as_items,
-      f"bg: the belt field's lanes come as groups, not items; the starter belt's as items: {sorted(groups)} {sorted(as_items)}")
-# g: item id, x and y of line position 0, x and y of 1, front, gap, speed, stack size.
-check(all(g[1] == g[3] and g[2] - g[4] == 256 and 0 <= g[5] < 64 and g[6] == 64
-          and g[7] == round(mock_server.BELT_SPEED * 65536) for g in groups.values()),
-      f"bg: each group runs a tile south (line position 0 on the belt's south edge), a quarter tile apart, at belt speed: {list(groups.values())[:2]}")
-stacks = {g[8] for g in groups.values()}
-check(stacks == {1, 4}, f"bg: groups carry their stack size (the field's second column has stacks of 4): {stacks}")
-fronts = {}  # each group's front item's place after the last update (bg, then bm when it moved)
-for m in gmsgs:
-    fronts.update({m["bm"][i]: m["bm"][i + 1] for i in range(0, len(m.get("bm", [])), 3)})
-    fronts.update({m["bg"][i]: m["bg"][i + 7] for i in range(0, len(m.get("bg", [])), 10)})
-step(6)
-mmsgs = of_type(take(), "bi")
-moves = {m["bm"][i]: m["bm"][i + 1:i + 3] for m in mmsgs for i in range(0, len(m.get("bm", [])), 3)}
-again = {m["bg"][i] for m in mmsgs for i in range(0, len(m.get("bg", [])), 10)}
-step_g = round(6 * mock_server.BELT_SPEED * 256)
-check(set(moves) == field_keys and all(moves[k] == [(fronts[k] - step_g) % 64, 6] for k in moves),
-      f"bm: each group that moved sends its front item's place and the ticks since its last check: {list(moves.items())[:2]} {fronts}")
-check(all((k + game.lane_count) % game.LANE_REFRESH == 0 for k in again),
-      f"bg: a group isn't sent again but at its lane's refresh: {sorted(again)}")
-del HELLO["bg"]
+smsgs = take()
+bs = of_type(smsgs, "bs")
+lm = {m["lm"][i]: m["lm"][i + 1:i + 12] for m in bs for i in range(0, len(m.get("lm", [])), 12)}
+
+
+def sl_keys(msgs):
+    out = set()
+    for m in msgs:
+        sl, i = m.get("sl", []), 0
+        while i < len(sl):
+            out.add(sl[i])
+            i += 3 + sl[i + 2] * 4
+    return out
+
+
+loads = sorted({m["k"]: m.get("ld") for m in bs}.items())
+check(len(loads) >= 2 and loads[0][1] == 1 and loads[-1][1] is None and min(m["fr"] for m in bs if m.get("ld")) < 24,
+      f"bs ld: the first load goes over updates, ld 1 and a smaller fr meanwhile, then stops: {loads}")
+check(not of_type(smsgs, "bi") and field_keys <= set(lm) and field_keys <= sl_keys(bs),
+      f"bs: the first load sends every lane's lm and sl, and no bi: {len(set(lm) & field_keys)} of {len(field_keys)}")
+check(all(v[0] == 1 and v[1] == 256 and v[2] == round(mock_server.BELT_SPEED * 256) and v[4] - v[8] == 256 for v in lm.values()),
+      f"bs lm: straight lanes a tile long running south at belt speed: {list(lm.values())[:2]}")
+pcs, later = set(), []
+for _ in range(34):
+    step(6)
+    later += of_type(take(), "bs")
+pcs = {m["pc"][i] for m in later for i in range(0, len(m.get("pc", [])), 5)}
+lm_again = set().union(*({m["lm"][i] for i in range(0, len(m.get("lm", [])), 12)} for m in later))
+check(not lm_again & field_keys and all(not m.get("pc") or len(m["pc"]) % 5 == 0 for m in later),
+      f"bs: no lane's meta again while it stays in the square ({len(pcs)} drift checks): {sorted(lm_again & field_keys)}")
+key = sorted(field_keys)[0]
+send({"t": "bre", "l": [key]})
+step(7)
+again = of_type(take(), "bs")
+check(key in {m["lm"][i] for m in again for i in range(0, len(m.get("lm", [])), 12)} and key in sl_keys(again),
+      f"bs bre: the lane comes again with lm and sl")
+# ew: a column running out of the square's south edge (bfar n 6 round the focus): the lane on the
+# last belt inside leads out (lm next -1), and while its items only move on alike its new front
+# comes as ew (protocol.py checks each; the starter belt runs out of the square too); the lane past
+# it isn't sent.
+fx0, fy0 = math.floor(game.focus[0]), math.floor(game.focus[1])
+game.build_belt_field(1, 6, x0=fx0 + 2, y0=fy0 + 3)
+mock_server.BELT_SPEED = belt_speed / 8  # items rarely cross a tile between updates
+send({"t": "bfar", "r": 0, "n": 6})
+edge, out_keys = [], set()
+for _ in range(20):
+    step(6)
+    edge += of_type(take(), "bs")
+out_keys = {m["lm"][i] for m in edge for i in range(0, len(m.get("lm", [])), 12) if m["lm"][i + 11] == -1}
+edge_lane = {game.lane_key(fx0 + 2.25, fy0 + 5.5), game.lane_key(fx0 + 2.75, fy0 + 5.5)}
+ews = [(m["ew"][i], m["ew"][i + 1] == m["k"]) for m in edge for i in range(0, len(m.get("ew", [])), 4)]
+past = {game.lane_key(fx0 + 2.25, fy0 + 6.5)}
+check(edge_lane <= out_keys and edge_lane & {key for key, _ in ews} and {key for key, _ in ews} <= out_keys
+      and all(on_k for _, on_k in ews)
+      and not past & (set().union(*({m["lm"][i] for i in range(0, len(m.get("lm", [])), 12)} for m in edge))),
+      f"bs ew: the lanes leading out are lm next -1 and send their front as ew: {sorted(out_keys)} {ews[:4]}")
+mock_server.BELT_SPEED = belt_speed
+send({"t": "bfar", "r": 0})
+del HELLO["bs"]
 del HELLO["bl"]
 send(HELLO)
 step(2)
@@ -899,6 +933,18 @@ send({"t": "cmd", "id": 5, "text": "/editor"})
 step(1)
 cmdr = {m["id"]: m for m in of_type(take(), "cmdr")}
 check(cmdr.get(4, {}).get("l") == ["2.1.23"] and cmdr.get(5, {}).get("ok") == 0, f"cmd: the mock answers the bridge's console commands: {cmdr}")
+send({"t": "cmd", "id": 6, "text": "/f3d-debug daytime 0.5"})
+send({"t": "cmd", "id": 7, "text": "/f3d-debug freeze on"})
+send({"t": "cmd", "id": 8, "text": "/f3d-debug speed 2"})
+step(30)
+cmdr = {m["id"]: m for m in of_type(take(), "cmdr")}
+dbg = cmdr.get(8, {}).get("dbg", {})
+check(dbg.get("dt") == 0.5 and dbg.get("fz") == 1 and dbg.get("sp") == 2 and abs(game.daytime() - 0.5) < 1e-9,
+      f"cmd /f3d-debug: the mock's time of day, frozen, and speed, in the reply's dbg: {cmdr.get(8)}")
+send({"t": "cmd", "id": 9, "text": "/f3d-debug freeze off"})
+send({"t": "cmd", "id": 10, "text": "/f3d-debug speed 1"})
+step(1)
+take()
 send({"t": "mtr"})
 step(1)
 mtr = of_type(take(), "mtr")
@@ -1511,7 +1557,7 @@ check(g and g[-1]["kind"] == "silo" and g[-1]["rk"]["to"] and "rocket" in g[-1][
 send({"t": "silo_launch", "u": silo.unit, "to": 1})
 step(1)
 check(any(m["text"] == "The rocket isn't ready" for m in of_type(take(), "msg")), "silo_launch before the rocket is built")
-step(mock_space.PARTS_NEEDED * mock_space.PART_TICKS)
+step(mock_space.PARTS_NEEDED * mock_space.PART_TICKS + sum(n for _, n, _ in mock_space.SILO_STEPS) + 1)
 take()
 send({"t": "silo_launch", "u": silo.unit, "to": 1})
 step(4)
@@ -1519,10 +1565,13 @@ msgs = take()
 rocket_id = protos["rocket-silo-rocket"]
 check(of_type(msgs, "rk") and any(r[1] == rocket_id for m in of_type(msgs, "mv") for r in m["l"]),
       f"silo_launch: rk, and the rocket rises as a mover: {[m['t'] for m in msgs][:20]}")
-step(mock_space.POD_DELAY + 10)
+# It falls from north of the pad, out of the focus at first, as Factorio's pods travel south to land.
+step(mock_space.POD_DELAY + mock_space.POD_TICKS * 3 // 4)
 msgs = take()
-check(any(m["l"] for m in of_type(msgs, "cp")) and any(r[1] == protos["cargo-pod"] for m in of_type(msgs, "mv") for r in m["l"]),
-      "then a cargo pod comes down on the landing pad")
+spots = [r[4:] for m in of_type(msgs, "cp") for r in m["l"]]
+check(spots and spots[-1] == [int(game.space.pad.x * 256), int(game.space.pad.y * 256)]
+      and any(r[1] == protos["cargo-pod"] for m in of_type(msgs, "mv") for r in m["l"]),
+      f"then a cargo pod comes down on the landing pad, saying where it lands: {spots[-1:]}")
 send({"t": "close"})
 pad = game.space.pad
 game.player["x"], game.player["y"] = pad.x, pad.y + 5
@@ -1593,25 +1642,28 @@ mock_server.MOD_WINDOW = False
 check(mg and all(len(m["l"]) == 1 and m["ids"] == [901, 902] and m.get("ds") == [1920, 1080, 1] for m in mg)
       and {m["l"][0]["i"] for m in mg} == {901, 902},
       f"mgui: one window a message, with ds, the top button too: {[(m['l'][0]['i'], m.get('ds')) for m in mg][:4]}")
-# Straight runs (br, with bl): the belt field's plain lanes come once with pl, then aren't sent.
-game.build_belt_field(2, 6, x0=12, y0=-16)
-HELLO["bl"] = 1
-HELLO["br"] = 1
+# A client not drawing them says so in its hello (mg 0): one last empty message, then none.
+mock_server.MOD_WINDOW = True
+HELLO["mg"] = 0  # (step() says hello as a keep-alive)
 send(HELLO)
-step(13)
-first = of_type(take(), "bi")
-step(24)
-later = of_type(take(), "bi")
-pl = [k for m in first for k in m.get("pl", [])[0::8]]
-interior = {mock_server.MockGame.lane_key(12 + c + 0.5 + dx, -16 + r + 0.5) for c in range(2) for r in range(1, 5) for dx in (-0.25, 0.25)}
-check(interior <= set(pl), f"br: the belt field's plain lanes come with pl: {len(set(pl) & interior)} of {len(interior)}")
-again = {k for m in later for k in m.get("ln", [])[0::2]} & interior
-check(len(again) <= len(interior) // 4, f"br: and are moved by the client after that, not sent: {len(again)} sent again")
-del HELLO["br"]
-del HELLO["bl"]
+step(240)
+mg = of_type(take(), "mgui")
+del HELLO["mg"]
 send(HELLO)
 step(2)
 take()
+mock_server.MOD_WINDOW = False
+check(mg and all(m["l"] == [] and m["ids"] == [] for m in mg), f"mgui: mg 0 clears the windows and stops them: {mg[:3]}")
+# Straight runs (br, with bl): the belt field's plain lanes come once with pl, then aren't sent.
+game.build_belt_field(2, 6, x0=12, y0=-16)
+# --belts-off: the column's belts come as `st` 5, then 0, and are wired.
+game.wire_belts_off(1)
+step(600)
+off_rows = [m["l"] for m in of_type(take(), "st") if game.belts_off[0].unit in m["l"]]
+check(len(off_rows) == 2 and {r[1] for r in off_rows} == {0, 5} and "r" in game.belts_off[0].extra,
+      f"--belts-off: st 5 and 0 every 5 s: {[r[:2] for r in off_rows]}")
+game.belts_off = []
+game.belts_empty = 0
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

@@ -100,6 +100,8 @@ func conflicts(name: String) -> Array:
 func _active(name: String) -> bool:
 	if not _actions.has(name) or not _host.in_game() or _host.keys_blocked():
 		return false
+	if _contexts[name] == "camera" and _host.debug_menu_open():
+		return false
 	return _contexts[name] == "global" or _api.camera.has_input()
 
 

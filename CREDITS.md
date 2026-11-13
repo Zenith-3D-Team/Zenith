@@ -44,7 +44,9 @@ David ([u/Vasillo](https://www.reddit.com/user/Vasillo/) on Reddit) made Zenith'
 gear icon: the wordmark in the main menu and the application's icon, with the other versions in
 [client/assets/branding/](client/assets/branding/). They're his, used with his permission, and not
 under the GPL (the folder's README). He is also working on Zenith's future 3D
-models.
+models: the textured transport belts (with their curves and start and end pieces), splitters,
+underground belts, inserters and burner mining drill in the development builds' `models/` folder
+are his, used with his permission, and not under the GPL.
 
 ## Tools and libraries
 

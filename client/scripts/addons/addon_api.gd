@@ -2,20 +2,22 @@ extends RefCounted
 ## The one object an add-on gets (its entry script's addon_start(api)); docs/ADDONS.md is the
 ## reference for add-on authors. Versioned: `version` is the add-on API this Zenith offers
 ## (AddonLoader.API_VERSION) and `level` the exact one with its additions (AddonLoader.API_LEVEL,
-## 1.2); an add-on whose addon.json asks for a newer one isn't loaded.
+## 1.6); an add-on whose addon.json asks for a newer one isn't loaded.
 ## Everything here only reads the game or changes what this client shows: nothing an add-on does
 ## through it changes the game.
 ##
 ##   camera    take the camera and hand it back (addon_camera.gd)
-##   keys      the add-on's own controls, in Settings → Controls (addon_keys.gd)
+##   keys      the add-on's own controls, in Settings â†’ Controls (addon_keys.gd)
 ##   world     what the client knows of the game, read-only (addon_world.gd)
 ##   events    a train leaving, a rocket launching, a fight starting... as signals (addon_events.gd)
-##   view      hide the interface, save frames, hold the time of day (addon_view.gd)
+##   view      hide the interface, save frames, hold the time of day; (1.6) full detail and
+##             screenshots (addon_view.gd)
 ##   ui        windows in Zenith's style, messages, an overlay layer (addon_ui.gd)
 ##   updates   ask the bridge for lighter updates (addon_updates.gd)
 ##   storage   the add-on's data, per save and for all saves (addon_storage.gd)
 ##   settings  (1.1) settings shown on the add-on's page of the Add-ons menu (addon_settings.gd)
 ##   terrain   (1.2) hills under the flat world, drawn only (addon_terrain.gd)
+##   shaders   (1.3) looks and full-screen shader passes, drawn only (addon_shaders.gd)
 
 const AddonLoader := preload("res://scripts/addons/addon_loader.gd")
 const AddonCamera := preload("res://scripts/addons/addon_camera.gd")
@@ -26,6 +28,8 @@ const AddonUpdates := preload("res://scripts/addons/addon_updates.gd")
 const AddonStorage := preload("res://scripts/addons/addon_storage.gd")
 const AddonSettings := preload("res://scripts/addons/addon_settings.gd")
 const AddonTerrain := preload("res://scripts/addons/addon_terrain.gd")
+const AddonShaders := preload("res://scripts/addons/addon_shaders.gd")
+const AddonWorld := preload("res://scripts/addons/addon_world.gd")
 
 ## A game started (the world is being received) or ended (back to the menu).
 signal game_started
@@ -34,7 +38,7 @@ signal game_ended
 ## The add-on API this Zenith offers.
 var version := AddonLoader.API_VERSION
 ## The add-on API with its additions within the version (1.1: settings, view.keep_drawing; 1.2:
-## terrain). Check it before using a 1.1 call to keep working on a Zenith with 1.0:
+## terrain; 1.3: shaders; 1.6: world.hold_chunks, view.full_detail, view.screenshot). Check it before using a 1.1 call to keep working on a Zenith with 1.0:
 ## `if api.get("level") != null and api.level >= 1.1`.
 var level := AddonLoader.API_LEVEL
 ## Zenith's own version, for messages.
@@ -47,7 +51,7 @@ var dir := ""
 
 var camera: AddonCamera
 var keys: AddonKeys
-var world  # addon_world.gd, shared by every add-on
+var world  # addon_world.gd, one per add-on (its reads are the same for all)
 var events  # addon_events.gd, shared by every add-on
 var view: AddonView
 var ui: AddonUi
@@ -55,6 +59,7 @@ var updates: AddonUpdates
 var storage: AddonStorage
 var settings: AddonSettings
 var terrain: AddonTerrain
+var shaders: AddonShaders
 
 var _host  # addon_host.gd
 
@@ -67,7 +72,7 @@ func _setup(host, manifest: Dictionary) -> void:
 	dir = str(manifest["dir"])
 	camera = AddonCamera.new(host, self)
 	keys = AddonKeys.new(host, self)
-	world = host.world
+	world = AddonWorld.new(host, self)  # its own: hold_chunks is per add-on
 	events = host.events
 	view = AddonView.new(host, self)
 	ui = AddonUi.new(host, self)
@@ -75,6 +80,7 @@ func _setup(host, manifest: Dictionary) -> void:
 	storage = AddonStorage.new(host, self)
 	settings = AddonSettings.new(host, self)
 	terrain = AddonTerrain.new(host, self)
+	shaders = AddonShaders.new(host, self)
 
 
 ## Everything the add-on set up through the API, taken away again (it was switched off).
@@ -84,8 +90,10 @@ func _teardown() -> void:
 	ui._close_all()
 	updates.clear()
 	view._release()
+	_host.hold_chunks(self, false)
 	settings._remove_all()
 	terrain.clear()
+	shaders.clear()
 
 
 ## A game is on (the world may still be arriving).

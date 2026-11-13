@@ -9,7 +9,7 @@ RELIABLE = {"cmdr", "welcome", "protos", "tprotos", "iprotos", "fprotos", "ready
             "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol"}
 IMMEDIATE = {"me", "mv", "bi", "ih", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "plat",
              "ai", "clip", "chat", "stats", "trl", "seg", "lt", "legs", "cp", "pg", "sp", "fz", "rk", "pst", "bf",
-             "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui"}
+             "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui", "bs"}
 CHARACTER_ROLES = {"main", "guns", "ammo", "armor", "trash"}
 DICTIONARY_WIDTH = {"protos": 12, "tprotos": 5, "iprotos": 2, "fprotos": 5, "dprotos": 2}
 GUI_KINDS = {"container", "crafter", "furnace", "lab", "combinator", "train", "stop", "roboport", "other",
@@ -79,26 +79,83 @@ def _items(v):
     return v if isinstance(v, list) else []
 
 
-def belt_group_problem(bg):
-    """bi bg (belt_items.lua, belt groups): [lane key, item id, x, y where line position 0 is, x, y
-    where 1 is (1/256 tile), the front item's line position (1/256, below one gap), the gap (1/256:
-    a quarter or half tile), the belt's speed (line positions a tick, 1/65536), stack size, ...]."""
-    if not _list(bg) or len(_items(bg)) % 10 or not all(_int(v) for v in _items(bg)):
-        return "must be flat groups of 10 integers"
-    v = _items(bg)
-    for i in range(0, len(v), 10):
-        key, item, x0, y0, x1, y1, front, gap, speed, stack = v[i:i + 10]
-        if key <= 0 or item <= 0:
-            return f"group {i // 10 + 1}: lane key and item id must be positive"
-        if (x0, y0) == (x1, y1):
-            return f"group {i // 10 + 1}: line positions 0 and 1 are at the same place"
-        if gap not in (64, 128):
-            return f"group {i // 10 + 1}: the gap must be a quarter or half tile (64 or 128), not {gap}"
-        if not 0 <= front <= gap:
-            return f"group {i // 10 + 1}: the front item must be within one gap of line position 0, not {front}"
-        if speed < 0 or not 1 <= stack <= 4:
-            return f"group {i // 10 + 1}: speed must be >= 0 and stack size 1-4"
-    return None
+def bs_problems(msg):
+    """bs (belt_sim.lua: belts for a client that simulates them): part, parts, p, w, fx, fy, fr and
+    optional lm, sl, qu, pc, dl, of lists (docs/PROTOCOL.md)."""
+    out = []
+    for k in ("part", "parts", "p", "w", "fx", "fy", "fr"):
+        if not _int(msg.get(k)):
+            out.append(f"bs: {k} must be an integer: {msg.get(k)!r}")
+    if out:
+        return out
+    if not (1 <= msg["part"] <= msg["parts"]) or msg["p"] < 1 or msg["w"] < 0 or msg["fr"] < 0:
+        out.append(f"bs: part 1..parts, p >= 1, w >= 0, fr >= 0: {msg['part']} {msg['parts']} {msg['p']} {msg['w']} {msg['fr']}")
+    for k in ("lm", "sl", "qu", "pc", "pu", "ew", "dl", "of"):
+        if k in msg and not _list(msg[k]):
+            out.append(f"bs: {k} must be a list")
+    if out:
+        return out
+    lm = _items(msg.get("lm", []))
+    if len(lm) % 12 or not all(_int(v) for v in lm):
+        out.append("bs: lm must be flat groups of 12 integers")
+    else:
+        for i in range(0, len(lm), 12):
+            key, kind, length, step = lm[i:i + 4]
+            nxt = lm[i + 11]
+            # (next: 0 by geometry, > 0 that lane, -1 leads out of what is sent, < -1 leads out into -next.)
+            if key <= 0 or not 1 <= kind <= 8 or length <= 0 or step < 0 or lm[i + 10] < 0 or nxt == key or nxt == -key:
+                out.append(f"bs: lm lane {lm[i:i + 12]!r}: key > 0, kind 1-8, length > 0, step >= 0, extra >= 0, next not itself")
+                break
+    sl = _items(msg.get("sl", []))
+    if not all(_int(v) for v in sl):
+        out.append("bs: sl must be integers")
+    else:
+        i = 0
+        while i < len(sl):
+            if i + 3 > len(sl):
+                out.append(f"bs: sl lane cut short at {i}")
+                break
+            key, tick, n = sl[i:i + 3]
+            items = sl[i + 3:i + 3 + n * 4]
+            if key <= 0 or tick < 0 or n < 0 or len(items) != n * 4:
+                out.append(f"bs: sl lane {key}: key > 0, tick >= 0, then n items of 4 numbers")
+                break
+            pos = items[2::4]
+            if not all(u > 0 and it > 0 and 1 <= st <= 4 for u, it, st in zip(items[0::4], items[1::4], items[3::4])):
+                out.append(f"bs: sl lane {key}: items as [unique id > 0, item id > 0, position, stack 1-4]")
+                break
+            if pos != sorted(pos) or any(v < 0 for v in pos):
+                out.append(f"bs: sl lane {key}: positions >= 0, front first (smallest): {pos}")
+                break
+            i += 3 + n * 4
+    qu = _items(msg.get("qu", []))
+    if len(qu) % 2 or not all(_int(u) and isinstance(q, str) and q != "normal" for u, q in zip(qu[0::2], qu[1::2])):
+        out.append(f"bs: qu must be [unique id, quality name (not normal), ...]: {qu!r}"[:200])
+    pc = _items(msg.get("pc", []))
+    if len(pc) % 5 or not all(_int(v) for v in pc):
+        out.append("bs: pc must be flat groups of 5 integers")
+    else:
+        for i in range(0, len(pc), 5):
+            key, tick, n, front, back = pc[i:i + 5]
+            if key <= 0 or tick < 0 or n < 0 or ((front, back) != (-1, -1) if n == 0 else not 0 <= front <= back):
+                out.append(f"bs: pc {pc[i:i + 5]!r}: key, tick, count, front <= back (-1, -1 when empty)")
+                break
+    if "ld" in msg and msg["ld"] != 1:
+        out.append(f"bs: ld is 1 when present: {msg['ld']!r}")
+    ew = _items(msg.get("ew", []))
+    if len(ew) % 4 or not all(_int(v) for v in ew) or not all(k > 0 and t >= 0 and u > 0 and pos >= 0
+                                                          for k, t, u, pos in zip(ew[0::4], ew[1::4], ew[2::4], ew[3::4])):
+        out.append(f"bs: ew must be [key, tick, front unique id, position, ...]: {ew!r}"[:200])
+    pu = _items(msg.get("pu", []))
+    if len(pu) % 3 or not all(_int(v) and v > 0 for v in pu) or not set(pu[0::3]) <= set(pc[0::5]):
+        out.append("bs: pu must be [key, front unique id, back unique id, ...] for lanes in the part's pc")
+    dl = _items(msg.get("dl", []))
+    if not all(_int(v) and v > 0 for v in dl):
+        out.append("bs: dl must be lane keys (positive integers)")
+    of = _items(msg.get("of", []))
+    if len(of) % 2 or not all(_int(v) for v in of) or not all(v in (0, 1) for v in of[1::2]):
+        out.append(f"bs: of must be [unit number, 0 or 1, ...]: {of!r}"[:200])
+    return out
 
 
 def entity_record_problems(rec, where):
@@ -978,6 +1035,8 @@ def problems(msg):
             out.append(f"welcome: mods must be {{name: version}}: {msg['mods']!r}")
         if "gf" in msg and not (isinstance(msg["gf"], str) and _int(msg.get("gn")) and msg["gn"] >= 1):
             out.append(f"welcome: gf is the graphics list's fingerprint, gn its parts: {msg.get('gf')!r} {msg.get('gn')!r}")
+        if "sq" in msg and not (_int(msg["sq"]) and msg["sq"] >= 1):
+            out.append(f"welcome: sq is the furthest square subscription, in chunks: {msg['sq']!r}")
     elif t == "surface":
         need("si", "x", "y")
         out += surface_field_problems(msg, t)
@@ -987,6 +1046,15 @@ def problems(msg):
         need("dest", check=_strs)
         if "here" in msg and not isinstance(msg["here"], str):
             out.append(f"plat: here is a planet name: {msg['here']!r}")
+        if "k" in msg and not _int(msg["k"]):
+            out.append(f"plat: k is the game's tick: {msg['k']!r}")
+        if "days" in msg and not _list(msg["days"]):
+            out.append(f"plat: days is a list: {msg['days']!r}")
+        for d in _items(msg.get("days")):
+            # [planet, ticks per day, daytime (hundred-thousandths), frozen 0/1]
+            if not (isinstance(d, list) and len(d) == 4 and isinstance(d[0], str) and _int(d[1]) and d[1] > 0
+                    and _int(d[2]) and 0 <= d[2] < 100000 and d[3] in (0, 1)):
+                out.append(f"plat: a day is [planet, ticks per day, daytime 0-99999, frozen 0/1]: {d!r}")
         for rec in _items(msg.get("l")):
             out += platform_problems(rec)
     elif t in DICTIONARY_WIDTH:
@@ -1050,8 +1118,8 @@ def problems(msg):
             out.append("tiles: l must be [x, y, id, ...] integers")
     elif t == "st":
         l = msg.get("l")
-        if not isinstance(l, list) or len(l) % 2 or not all(_int(v) for v in l) or not all(v in (0, 1, 2, 3, 4) for v in l[1::2]):
-            out.append("st: l must be [unit, state 0-4, ...]")
+        if not isinstance(l, list) or len(l) % 2 or not all(_int(v) for v in l) or not all(v in (0, 1, 2, 3, 4, 5) for v in l[1::2]):
+            out.append("st: l must be [unit, state 0-5, ...]")
     elif t == "mv":
         need("part", "parts")
         if msg.get("z", 1) != 1:
@@ -1083,28 +1151,14 @@ def problems(msg):
             out.append(f"bi: ln must be [lane key, count, ...] (non-negative integers) whose counts add up to the part's items: {msg['ln']!r}")
         elif t == "bi" and "dl" in msg and not (_list(msg["dl"]) and all(_int(v) and v > 0 for v in _items(msg["dl"]))):
             out.append(f"bi: dl must be a list of lane keys (positive integers): {msg['dl']!r}")
-        elif t == "bi" and "pc" in msg and not (
-                _list(msg["pc"]) and len(_items(msg["pc"])) % 5 == 0 and all(_int(v) and v >= 0 for v in _items(msg["pc"]))):
-            out.append(f"bi: pc must be [lane key, stacks, front, back (1/256), ticks read early, ...] as non-negative integers: {msg['pc']!r}")
-        elif t == "bi" and "pl" in msg and not (
-                _list(msg["pl"]) and len(_items(msg["pl"])) % 8 == 0 and all(_int(v) for v in _items(msg["pl"]))
-                and all(k > 0 for j in range(0, len(_items(msg["pl"])), 8) for k in _items(msg["pl"])[j:j + 3])
-                and all(v >= 0 for v in _items(msg["pl"])[7::8])):
-            out.append(f"bi: pl must be [lane key, key behind, key in front (positive), x0, y0, x1, y1, speed (>= 0), ...] as integers: {msg['pl']!r}")
         elif t == "bi" and "st" in msg and not (
                 _list(msg["st"]) and len(_items(msg["st"])) % 2 == 0 and all(_int(v) for v in _items(msg["st"]))
                 and all(2 <= v <= 4 for v in _items(msg["st"])[1::2])):
             out.append(f"bi: st must be [unique id, stack size (2-4), ...] as integers: {msg['st']!r}")
-        elif t == "bi" and "bg" in msg and (problem := belt_group_problem(msg["bg"])):
-            out.append(f"bi: bg {problem}: {msg['bg']!r}"[:300])
-        elif t == "bi" and "bm" in msg and not (
-                _list(msg["bm"]) and len(_items(msg["bm"])) % 3 == 0 and all(_int(v) for v in _items(msg["bm"]))
-                and all(v > 0 for v in _items(msg["bm"])[0::3])
-                and all(0 <= v < 256 for v in _items(msg["bm"])[1::3])
-                and all(v >= 0 for v in _items(msg["bm"])[2::3])):
-            out.append(f"bi: bm must be [lane key (> 0), front item's line position (1/256, 0-255), ticks since its last check (>= 0), ...] as integers: {msg['bm']!r}"[:300])
         elif t == "pw" and not all(v in (0, 1, 2) for v in _items(l)[1::2]):
             out.append(f"pw: states must be 0 (no power), 1 (low power) or 2 (not connected): {l!r}")
+    elif t == "bs":
+        out += bs_problems(msg)
     elif t == "en":
         l = msg.get("l")
         if not _list(l) or not _items(l) or len(_items(l)) % 3 or not all(_int(v) for v in _items(l)):
@@ -1168,6 +1222,7 @@ def problems(msg):
                     and all(isinstance(v, str) for v in _items(rec[1]))):
                 out.append(f"perms: entry must be [group name, [player names]]: {rec!r}")
     elif t == "mgui":
+        # (Not sent to a client whose hello says `mg` 0, but for one last empty one when it turns them off.)
         need("ids", check=_list)
         need("l", check=_list)
         if not all(_int(i) for i in _items(msg.get("ids"))):
@@ -1318,8 +1373,9 @@ def problems(msg):
     elif t == "cp":
         need("l", check=_list)
         for rec in _items(msg.get("l")):
-            if not (isinstance(rec, list) and len(rec) == 4 and _int(rec[0]) and all(isinstance(v, str) for v in rec[1:])):
-                out.append(f"cp: entry must be [unit, state, destination type, destination surface]: {rec!r}")
+            if not (isinstance(rec, list) and len(rec) in (4, 6) and _int(rec[0]) and all(isinstance(v, str) for v in rec[1:4])
+                    and all(_int(v) for v in rec[4:])):
+                out.append(f"cp: entry must be [unit, state, destination type, destination surface(, landing x, y)]: {rec!r}")
     elif t in ("pg", "sp", "fz", "bf"):
         if t == "bf":
             need("part", "parts")
@@ -1468,6 +1524,16 @@ def problems(msg):
             out.append(f"cmdr: l is the answer's lines as strings: {msg.get('l')!r}")
         if msg.get("ok", 0) not in (0,):
             out.append(f"cmdr: ok is only sent as 0 (the bridge doesn't run that command): {msg.get('ok')!r}")
+        if msg.get("na", 1) != 1:
+            out.append(f"cmdr: na is only sent as 1 (the sender may not run console commands): {msg.get('na')!r}")
+        if "dbg" in msg:
+            d = msg["dbg"]
+            if not (isinstance(d, dict) and {"dt", "fz", "sp", "pa", "ad", "s"} <= set(d)
+                    and set(d) <= {"dt", "fz", "sp", "pa", "hd", "ad", "s", "x", "y", "sx", "sy"}
+                    and _num(d["dt"]) and 0 <= d["dt"] <= 1 and _num(d["sp"]) and d["sp"] > 0
+                    and all(d[k] in (0, 1) for k in ("fz", "pa", "ad")) and d.get("hd", 0) in (0, 1) and isinstance(d["s"], str)
+                    and all(_int(d[k]) for k in ("x", "y", "sx", "sy") if k in d)):
+                out.append(f"cmdr: dbg is {{dt, fz, sp, pa, hd?, ad, s, x?, y?, sx?, sy?}} (/f3d-debug's state): {d!r}")
     elif t == "bfar":
         need("cx", "cy")
         need("l", check=_list)
@@ -1518,6 +1584,8 @@ def problems(msg):
         q = msg.get("q")
         if not (isinstance(q, dict) or q == []) or not all(isinstance(k, str) and _int(v) and v >= 0 for k, v in (q or {}).items()):
             out.append(f"wb: q maps queue names to lengths: {q!r}")
+        if "ph" in msg and msg["ph"] != 1:
+            out.append(f"wb: ph (photo mode on) is 1 when given: {msg!r}")
     elif t == "cov":
         need("si")
         need("l", check=_list)

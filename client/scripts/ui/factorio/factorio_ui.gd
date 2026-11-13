@@ -93,6 +93,7 @@ const BonusesWindow := preload("res://scripts/ui/factorio/bonuses_window.gd")
 const AlertsConfig := preload("res://scripts/ui/factorio/alerts_config.gd")
 const AchievementsWindow := preload("res://scripts/ui/factorio/achievements_window.gd")
 const PermissionsWindow := preload("res://scripts/ui/factorio/permissions_window.gd")
+const DebugMenu := preload("res://scripts/ui/factorio/debug_menu.gd")
 const TipsWindow := preload("res://scripts/ui/factorio/tips_window.gd")
 
 ## Gap between the HUD's pieces and from the window's edges (GUI pixels).
@@ -162,6 +163,13 @@ var alerts_config: AlertsConfig
 var achievements: AchievementsWindow
 var permissions: PermissionsWindow
 var tips: TipsWindow
+## Zenith's debug menu (Settings > Controls > Debug menu): the game's time, benchmarks, tests.
+var debug_menu: DebugMenu
+## The debug menu's CanvasLayer: over the HUD (1) and add-ons' windows (15).
+var debug_layer: CanvasLayer
+const DEBUG_LAYER := 20
+## addon_host.gd's group of CanvasLayers it doesn't hide with the interface.
+const SHOWN_WITH_INTERFACE_HIDDEN := &"f3d_shown_with_interface_hidden"
 ## Alt-mode (Alt): icons over machines.
 var alt_mode := false
 ## Alt-mode went on or off (quality marks follow it).
@@ -191,7 +199,9 @@ var status_label: Label = null
 var debug_overlay := false
 ## Placed by layout() with the rest: the help (hud.gd, F1), the driving line, and main.gd's
 ## platform panel (Space Age).
-var help_label: Label = null
+var help_label: RichTextLabel = null
+## The help's first line shown while it scrolls (the wheel over it, scroll_help).
+var help_top := 0
 var cursor_label: Label = null
 var platform_panel: Control = null
 ## Where the stack in the cursor came from: {"role", "index" (1-based), "n" (0: all, else how
@@ -470,6 +480,17 @@ func _ready() -> void:
 			return ""
 		return await run_command.call(command)
 	chat.console.has_rcon = func() -> bool: return has_rcon.is_valid() and bool(has_rcon.call())
+
+	# Its own layer, over the HUD and add-ons' windows, which the add-on host leaves shown when the
+	# interface is hidden (F11): the menu opens over a clean shot too, and is gone again when closed.
+	debug_layer = CanvasLayer.new()
+	debug_layer.name = "DebugLayer"
+	debug_layer.layer = DEBUG_LAYER
+	debug_layer.add_to_group(SHOWN_WITH_INTERFACE_HIDDEN)
+	add_child(debug_layer)
+	debug_menu = DebugMenu.new()
+	debug_menu.model = model
+	debug_layer.add_child(debug_menu)
 
 	cursor = CursorStack.new()
 	add_child(cursor)
@@ -784,48 +805,71 @@ func _fit_shortcuts(room: Rect2) -> void:
 	shortcuts.scale = Vector2.ONE * clampf(best, 0.1, 1.0)
 
 
-## The help in `room`: its width, the font smaller when it doesn't fit, then only its first lines
-## (the first says how to hide it). Too little room hides it, leaving F1's visibility alone.
+## The help in `room`: its width, the font smaller when it doesn't fit, and when even the smallest
+## doesn't, the room's height with a scroll bar, the mouse wheel over it scrolling it (scroll_help).
+## Too little room hides it, leaving F1's visibility alone.
 func _fit_help(room: Rect2) -> void:
-	if not help_label.has_meta("full_text"):
-		help_label.set_meta("full_text", help_label.text)
-	var full := str(help_label.get_meta("full_text"))
+	var full := str(help_label.get_meta("full_bbcode", help_label.text))
 	var key := [room, full]
 	if key == _help_fit:
 		help_label.global_position = room.position
 		return
 	_help_fit = key
 	var w := floorf(room.size.x)
-	var lines := full.split("\n")
-	var font := Kit.px(10)
 	var fits := false
+	var height := 0.0
 	if w >= Kit.px(120):
-		for fs in [13, 12, 11, 10]:
-			font = Kit.px(fs)
-			if _help_height(full, w, font) <= room.size.y:
+		for fs in [13, 12, 11]:
+			height = _help_height(full, w, Kit.px(fs))
+			if height <= room.size.y:
 				fits = true
 				break
-		while not fits and lines.size() > 1:
-			lines.resize(lines.size() - 1)
-			fits = _help_height("\n".join(lines), w, font) <= room.size.y
-	help_label.self_modulate.a = 1.0 if fits else 0.0
-	help_label.text = "\n".join(lines)
-	help_label.add_theme_font_size_override("font_size", font)
-	help_label.size = Vector2(w, 0.0)
-	help_label.get_line_count()  # shapes it, so the size below is the text's
-	help_label.update_minimum_size()
-	help_label.size = Vector2(w, 0.0)
+	var scrolls := not fits and w >= Kit.px(120) and room.size.y >= Kit.px(80)
+	if scrolls:
+		_help_height(str(help_label.get_meta("scroll_bbcode", full)), w, Kit.px(12))
+		height = room.size.y
+	help_label.scroll_active = scrolls
+	help_label.self_modulate.a = 1.0 if fits or scrolls else 0.0
+	help_label.size = Vector2(w, maxf(height, 1.0))
 	help_label.global_position = room.position
+	help_top = clampi(help_top, 0, _help_last_top()) if scrolls else 0
+	help_label.scroll_to_line(help_top)
 
 
-## How tall the help is with this text, width and font size.
+## How tall the help is with this text, width and font size, all of it.
 func _help_height(text: String, w: float, font: int) -> float:
+	help_label.scroll_active = false
 	help_label.text = text
-	help_label.add_theme_font_size_override("font_size", font)
+	help_label.add_theme_font_size_override("normal_font_size", font)
+	help_label.add_theme_font_size_override("bold_font_size", font)
 	help_label.size = Vector2(w, help_label.size.y)
+	return help_label.get_content_height() + help_label.get_theme_stylebox("normal").get_minimum_size().y
+
+
+## The last line the help can scroll to: the rest then fills the panel.
+func _help_last_top() -> int:
 	var n := help_label.get_line_count()
-	var spacing := help_label.get_theme_constant("line_spacing")
-	return n * (help_label.get_line_height() + spacing) - spacing + help_label.get_theme_stylebox("normal").get_minimum_size().y
+	if n <= 0:
+		return 0
+	var line := float(help_label.get_content_height()) / n
+	var room := help_label.size.y - help_label.get_theme_stylebox("normal").get_minimum_size().y
+	return maxi(0, n - floori(room / maxf(line, 1.0)))
+
+
+## The mouse wheel over the help while it scrolls (player_input.gd asks before zooming): three lines
+## a step, `steps` up (negative) or down. False when the mouse isn't over a help that scrolls.
+func scroll_help(steps: int) -> bool:
+	if help_label == null or not help_label.is_visible_in_tree() or not help_label.scroll_active:
+		return false
+	if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED or not help_label.get_global_rect().has_point(help_label.get_global_mouse_position()):
+		return false
+	scroll_help_lines(steps * 3)
+	return true
+
+
+func scroll_help_lines(lines: int) -> void:
+	help_top = clampi(help_top + lines, 0, _help_last_top())
+	help_label.scroll_to_line(help_top)
 
 
 func held_item() -> String:
@@ -968,6 +1012,9 @@ func _apply_settings() -> void:
 func _on_setting(section: String, key: String) -> void:
 	if section == "interface" and is_inside_tree():
 		_apply_settings()
+		# Settings > Interface > Alt-mode switches it in the game too, as Alt does.
+		if key == "alt_mode" and bool(Settings.get_value("interface", "alt_mode")) != alt_mode:
+			set_alt_mode(not alt_mode)
 
 
 func _exit_tree() -> void:
@@ -976,9 +1023,10 @@ func _exit_tree() -> void:
 
 ## Alt-mode on or off (Alt, or the shortcut); remembered in the settings, like Factorio's.
 func set_alt_mode(on: bool) -> void:
-	if on != alt_mode:
+	var changed := on != alt_mode
+	alt_mode = on  # before saving it: the setting's listener (_on_setting) then sees it in step
+	if changed:
 		Settings.set_value("interface", "alt_mode", on)
-	alt_mode = on
 	alt_overlay.on = on
 	alt_overlay.queue_redraw()
 	model.set_alt_mode(on)
@@ -1361,6 +1409,8 @@ func escape() -> bool:
 		quickbar.open_chooser(0, false)
 	elif chat.is_open():
 		chat.close()
+	elif debug_menu.escape():
+		pass
 	elif planners.escape():
 		pass
 	elif map_view.escape():
@@ -1394,6 +1444,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		open_map(not map_view.is_open())
 	elif Controls.pressed(event, "debug_line"):
 		debug_overlay = not debug_overlay
+	elif Controls.pressed(event, "debug_menu") and Settings.dev_tools():
+		debug_menu.toggle()
 	elif Controls.pressed(event, "production_statistics"):
 		stats.toggle("item")
 	elif Controls.pressed(event, "kill_statistics"):

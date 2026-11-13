@@ -16,9 +16,8 @@ extends RefCounted
 ## Every surface is drawn with the Factorio material (shaders/factorio_material.gdshader). By
 ## default ("Factorio colours", look "colours") each part wears its own colour, sampled from
 ## Factorio's sprite when the model was built (tools/models/part_colors.py, CUSTOM1), weathered
-## procedurally like Factorio's art. With look "sprite" the player's Factorio install's sprite is
-## also projected onto the faces Factorio's camera sees (sprite_projection.gd); "palette" shows the
-## models' own palette colours (for comparing). How a surface weathers depends on its material
+## procedurally like Factorio's art; "palette" (--model-look=palette) shows the models' own palette
+## colours (for comparing). The sprite projected onto the model (the old "sprite" look) is gone. How a surface weathers depends on its material
 ## class, picked from the glTF material's name (MATERIAL_CLASSES).
 ##
 ## A model is drawn as one surface per glTF material; with Settings > Graphics > Merged materials
@@ -81,6 +80,11 @@ const BELT_SPEED := 1.875
 ## The chevrons on every belt surface by tier: the median of each tier's belt sheet's paint.
 const BELT_CHEVRONS := {"fast-": Color("e21400"), "express-": Color("00a4dd"), "turbo-": Color("91c42e")}
 const BELT_CHEVRON := Color("edac04")
+## Tiles from one chevron to the next by tier, as Factorio's belt sprites space their arrows (yellow
+## every half tile, red and blue one a tile, turbo every other tile: FFF #393 spaced them out so fast
+## belts don't strobe). The shader lines a 2-tile period up along a belt by the tile's position.
+const BELT_CHEVRON_PERIODS := {"fast-": 1.0, "express-": 1.0, "turbo-": 2.0}
+const BELT_CHEVRON_PERIOD := 0.5
 ## Models whose tier_paint is bare steel on every tier (Factorio's belts have no painted frame:
 ## their tier shows in the chevrons alone).
 const STEEL_FRAMES := ["transport-belt"]
@@ -91,7 +95,7 @@ const X_AXIS_KINDS := {"spin_flywheel": true}
 const Z_AXIS_KINDS := {"spin_crank": true, "rock_beam": true, "spin_flywheel_ns": true}
 ## Parts named `anim_upright_<kind>` keep facing north whatever way the entity faces, as
 ## Factorio draws them (the pumpjack's beam, post and gearbox are one layer for every
-## direction; only its ground pipes turn). Their sprite is the model's `<name>.upright` entry.
+## direction; only its ground pipes turn).
 const UPRIGHT_PREFIX := "upright_"
 ## Moving part kinds that slide instead of turning: the offset (model space) per unit of
 ## "angle" (anim.gd counts roboport doors in tiles and gates from 0 to 1 of the way).
@@ -175,8 +179,8 @@ const HATCHES := {
 	"lid_hub_lower_ne": {"axis": Vector3(0.7071, 0, 0.7071), "angle": 1.2, "types": ["cargo-pod"], "reach": 5.0, "time": 0.35},
 	"lid_hub_lower_sw": {"axis": Vector3(-0.7071, 0, -0.7071), "angle": 1.2, "types": ["cargo-pod"], "reach": 5.0, "time": 0.35},
 	"lid_pad": {"axis": Vector3(-0.7071, 0, -0.7071), "angle": 1.6, "types": ["cargo-pod"], "reach": 5.0, "time": 0.35},
-	"door_silo_e": {"slide": Vector3(1.45, -0.3, -0.6), "types": ["rocket-silo-rocket"], "reach": 2.0, "time": 4.25},
-	"door_silo_w": {"slide": Vector3(-1.45, -0.3, 0.6), "types": ["rocket-silo-rocket"], "reach": 2.0, "time": 4.25},
+	"door_silo_e": {"slide": Vector3(2.3, -0.1, -0.95), "types": ["rocket-silo-rocket"], "reach": 2.0, "time": 4.25},
+	"door_silo_w": {"slide": Vector3(-2.3, -0.1, 0.95), "types": ["rocket-silo-rocket"], "reach": 2.0, "time": 4.25},
 }
 ## Glow styles (factorio_material's glow_* uniforms) by `anim_glow_<style>` node name. Emissive
 ## materials whose name says fire, flame or molten flicker as "fire".
@@ -212,10 +216,13 @@ const GLOW_PREFIX := "anim_glow"
 
 
 ## A moving part of a model: everything under a node named anim_<kind>. The mesh is in model
-## space at rest, so the sprite projection and weathering stay put on it; it is drawn turned
+## space at rest, so the weathering stays put on it; it is drawn turned
 ## about `pivot` (the node's transform in the model): pivot * rotation(axis, angle) * pivot^-1.
 class AnimPart:
-	var kind := ""  # "spin_drill", "spin_arms", "spin_flywheel", "turret_head", ...
+	var kind := ""  # "spin_drill", "spin_arms", "spin_flywheel", "turret_head", "baked", ...
+	var roller := false  # a "baked" object named as a roller: on a splitter it runs all the time
+	## A "baked" part's animation (model_skin.gd bake()): frames, duration, the bones' texture.
+	var bake := {}
 	var model := ""  # the model it belongs to
 	var mesh: Mesh
 	var pivot := Transform3D.IDENTITY
@@ -240,16 +247,20 @@ class AnimPart:
 			return Transform3D(Basis.IDENTITY, slide * angle)
 		return pivot * Transform3D(Basis(axis, angle), Vector3.ZERO) * pivot.affine_inverse()
 
-const SpriteProjection := preload("res://scripts/world/sprite_projection.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
 const ModelTextures := preload("res://scripts/world/model_textures.gd")
+const ModelSkin := preload("res://scripts/world/model_skin.gd")
+const ModelRig := preload("res://scripts/world/model_rig.gd")
+const ContactShade := preload("res://scripts/world/contact_shade.gd")
 ## Folders under res://assets/models/ looked in first, in order: models brought in from elsewhere
 ## under their own licence (fue5/: the FUE5 fan project's, CC BY-NC-SA 3.0) replace ours there.
 const MODEL_SUBDIRS := ["fue5/"]
 const CreatureModels := preload("res://scripts/world/creature_models.gd")
 const FactorioShader := preload("res://shaders/factorio_material.gdshader")
 const FactorioAlphaShader := preload("res://shaders/factorio_material_alpha.gdshader")
+## Cut-out materials (Blender's Alpha Clip, glTF MASK): see factorio_material_clip.gdshader.
+const FactorioClipShader := preload("res://shaders/factorio_material_clip.gdshader")
 ## Trees' leaf cards (tools/models/nature/geo.py `card`): leaves cut out, both sides drawn.
 const FactorioLeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
 
@@ -345,13 +356,14 @@ static func _external_path(file: String) -> String:
 		if FileAccess.file_exists(path):
 			return path
 	return ""
-## The models' look: "colours" (part colours), "sprite" (part colours and the projected sprite) or
-## "palette" (neither). Set from Settings → Graphics before the first model is built.
-const LOOKS := ["colours", "sprite", "palette"]
+## The models' look: "colours" (part colours, always in a game) or "palette" (the models' own
+## palette, --model-look=palette for comparing). Set before the first model is built.
+const LOOKS := ["colours", "palette"]
 static var look := "colours"
 static var _cache := {}  # name -> Mesh, or null when there is no model
 static var _parts := {}  # name -> Array of AnimPart (empty for models without moving parts)
 static var _glowing := {}  # Mesh -> true when it has surfaces that glow while working
+static var _rigs := {}  # name -> an inserter rig's parts and numbers (rig_for)
 static var _factorio_cache := {}  # [imported material, has COLOR, UV2, CUSTOM0] -> ShaderMaterial
 
 
@@ -401,8 +413,6 @@ static func configure_from_command_line() -> void:
 		external_count = _count_models(external_dir)
 		print("[models] %d model(s) from %s %s" % [external_count, external_dir,
 			"replace Zenith's own of the same name" if external_first else "fill in entities without a model"])
-	SpriteProjection.configure_from_command_line()
-	SpriteProjection.build_all()
 	warm_up()
 
 
@@ -419,16 +429,9 @@ static func warm_up() -> void:
 		_factorio(m, true, true, true, "", true)
 
 
-## Chooses the look (LOOKS); the sprite is only projected with "sprite".
+## Chooses the look (LOOKS); anything else, the old "sprite" among them, is "colours".
 static func set_look(value: String) -> void:
 	look = value if LOOKS.has(value) else "colours"
-	SpriteProjection.disabled = look != "sprite"
-
-
-## True when the model wears Factorio's sprite: then it is drawn as the sprite shows it, without
-## the random turn trees and rocks otherwise get (chunk_view.gd).
-static func projected(name: String) -> bool:
-	return SpriteProjection.has_entry(name)
 
 
 ## Factorio's pipe pictures by connection mask (world.gd: extra.pc, bits north 1, east 2,
@@ -492,6 +495,82 @@ static func cargo_places(cb: int, origin: Vector3) -> Array:
 	return out
 
 
+## A belt line's end pieces are modelled with the belt running east (start to the west, end to the
+## east), where every other model faces north: this turns them onto the belt.
+static var BELT_END_FACING := Transform3D(Basis(Vector3.UP, PI / 2.0), Vector3.ZERO)
+
+
+## Whether a modeller has made end pieces for belts (`transport-belt-start`, `transport-belt-end`).
+static func has_belt_ends() -> bool:
+	return _source("transport-belt-start") != "" or _source("transport-belt-end") != ""
+
+
+## The models of one belt's ends (`belt` the belt's name, as fast-transport-belt): 1 in `mask` where
+## the line begins, 2 where it ends.
+static func belt_ends(belt: String, mask: int) -> Array:
+	var out: Array = []
+	if mask & 1 and _source("transport-belt-start") != "":
+		out.append(belt + "-start")
+	if mask & 2 and _source("transport-belt-end") != "":
+		out.append(belt + "-end")
+	return out
+
+
+## The belt whose end pieces go on a belt-like entity: a belt its own, a splitter's or an underground's
+## the belt of its tier (fast-splitter: fast-transport-belt), falling back as a belt's do (a tier without
+## its own pieces wears the yellow ones recoloured; a mod's tier without a model, none).
+static func belt_end_family(proto_name: String, proto_type: String) -> String:
+	if proto_type == "transport-belt":
+		return proto_name
+	for kind in ["underground-belt", "lane-splitter", "splitter", "linked-belt"]:
+		if proto_name.contains(kind):
+			return proto_name.replace(kind, "transport-belt")
+	return "transport-belt"
+
+
+## The tiles a belt-like entity stands on from its centre: one, or two side by side for a splitter
+## (centred on a tile's edge), in the order of their bits in a record's belt_ends.
+static func belt_tiles(pos: Vector2) -> Array:
+	var a := Vector2i(floori(pos.x - 0.25), floori(pos.y - 0.25))
+	var b := Vector2i(floori(pos.x + 0.25), floori(pos.y + 0.25))
+	return [a] if a == b else [a, b]
+
+
+## Where a belt-like entity's end pieces go for its record's belt_ends (world.gd): [model, transform].
+## Each of its tiles has two bits, 1 and 2 for the first, 4 and 8 for a splitter's second half; each
+## piece sits on its tile's centre facing the way items travel, as on a belt. That is `dir` itself,
+## also for an underground exit, whose model is turned round (turn_dir) but whose open end is ahead.
+## The pieces need no shift on splitters and undergrounds: their belt surfaces end on the tile's edge
+## as a belt's does (measured on Vasillo's and Zenith's models: +-0.5 along every one).
+static func belt_end_places(proto_name: String, proto_type: String, dir: int, pos: Vector2, mask: int, height := 0.0) -> Array:
+	var out: Array = []
+	var family := belt_end_family(proto_name, proto_type)
+	var basis := Basis(Vector3.UP, -float(dir) / 16.0 * TAU)
+	var tiles := belt_tiles(pos)
+	for i in tiles.size():
+		var tile: Vector2i = tiles[i]
+		var at := Transform3D(basis, Vector3(tile.x + 0.5, height, tile.y + 0.5)) * BELT_END_FACING
+		for piece: String in belt_ends(family, (mask >> (2 * i)) & 3):
+			out.append([piece, at])
+	return out
+
+
+## Whether an end piece's moving part is already in the model it is put on: a modeller's splitter has
+## rollers at both ends of each half, so the start piece's roller would turn inside it (two rollers in
+## one place, out of step). `rel` is the piece's transform in the host model's space.
+static func part_doubled(part: AnimPart, rel: Transform3D, host_parts: Array) -> bool:
+	if part.mesh == null:
+		return false
+	var box := rel * part.mesh.get_aabb()
+	for other: AnimPart in host_parts:
+		if other.mesh == null or other.lit:
+			continue
+		var theirs := other.mesh.get_aabb()
+		if box.get_center().distance_to(theirs.get_center()) < 0.05 and box.size.distance_to(theirs.size) < 0.1:
+			return true
+	return false
+
+
 ## The model an entity record is drawn with. Belts carry their shape in extra.s ("s", "l",
 ## "r": straight, left or right curve) and undergrounds their end in extra.u ("i" entrance,
 ## "o" exit). Curves are modelled facing their output direction, like straight belts. Pipes
@@ -499,7 +578,7 @@ static func cargo_places(cb: int, origin: Vector3) -> Array:
 static func model_name(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> String:
 	if RAIL_TYPES.has(proto_type) and dir % 4 == 2:
 		return proto_name + "-ne"
-	if FACING_MODELS.has(proto_name) and dir % 4 == 0:
+	if FACING_MODELS.has(proto_name) and dir % 4 == 0 and not single_model(proto_name):
 		return proto_name + str(FACING_MODELS[proto_name][(dir >> 2) % 4])
 	match proto_type:
 		"transport-belt":
@@ -595,6 +674,33 @@ const FACING_MODELS := {"burner-mining-drill": ["", "-east", "-south", "-west"],
 	"bulk-inserter": ["", "-east", "-south", "-west"], "stack-inserter": ["", "-east", "-south", "-west"],
 	"pumpjack": ["", "-east", "-south", "-west"], "chemical-plant": ["", "-east", "-south", "-west"],
 	"crusher": ["", "-east", "", "-east"]}
+## True for a material set to Alpha Clip in Blender (glTF alphaMode MASK, which Godot imports as
+## alpha scissor) or alpha hash: drawn cut out (FactorioClipShader).
+static func clipped(material: Material) -> bool:
+	var base := material as BaseMaterial3D
+	return base != null and (base.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+		or base.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_HASH)
+
+
+## True when a FACING_MODELS entity is drawn with one model turned to each direction, as any other:
+## its north model comes from a folder that has no direction models beside it, a modeller's
+## (models/, --models=) or FUE5's (fue5/, one model turned, so no copies are kept). A modeller
+## makes one model; one who makes all four (`<name>-east`, `-south`, `-west`) gets those drawn unturned.
+static func single_model(proto_name: String) -> bool:
+	if not FACING_MODELS.has(proto_name):
+		return false
+	var name: String = MODEL_ALIASES.get(proto_name, proto_name)
+	var base := _source(name)
+	if base == "" or not (base.contains("/fue5/") or (external_dir != "" and base.contains(external_dir))):
+		return false
+	var east := ""
+	for sfx: String in FACING_MODELS[proto_name]:
+		if sfx != "":
+			east = _source(name + sfx)
+			break
+	return east == "" or east.get_base_dir() != base.get_base_dir()
+
+
 ## Factorio draws each of a rail signal's 16 pictures about its own point (2.0 sets a signal
 ## beside the rail it guards, and each picture's housings sit where that direction puts them), so
 ## one model turned about the entity's position misses most of them. Per direction, the model's
@@ -624,7 +730,7 @@ static func placed(proto_name: String, proto_type: String, dir: int, extra: Dict
 
 
 static func turn_dir(proto_type: String, dir: int, extra := {}, proto_name := "") -> int:
-	if PICTURES.has(proto_name):
+	if PICTURES.has(proto_name) and not single_model(proto_name):
 		return dir % (4 * int(PICTURES[proto_name]))
 	if RAIL_TYPES.has(proto_type):
 		return dir - dir % 4
@@ -649,6 +755,33 @@ static func mover_model(proto_name: String) -> Array:
 			if scale > 0.0:
 				return ["demolisher-" + part.substr(1, part.length() - 3), scale]
 	return []
+
+
+## True for a model that may be an inserter's rig (model_rig.gd): any inserter prototype's.
+static func rig_name(name: String) -> bool:
+	return name.ends_with("inserter")
+
+
+## An inserter model's arm rig once its model is ready (ready()): model_rig.gd build()'s numbers and
+## "meshes", per ModelRig.Part its mesh or null; {} for a model without one.
+static func rig_for(name: String) -> Dictionary:
+	return _rigs.get(MODEL_ALIASES.get(name, name), {})
+
+
+## A Load's rig with its parts' meshes made here (on the main thread, as every model's are).
+static func _commit_rig(rig: Dictionary, name: String) -> Dictionary:
+	var out: Dictionary = (rig["data"] as Dictionary).duplicate()
+	var meshes: Array = []
+	for groups: Array in rig["parts"]:
+		meshes.append(_commit_groups(groups) if not groups.is_empty() else null)
+	out["meshes"] = meshes
+	var lengths: Array = out["lengths"]
+	var closes: Array = []
+	for a in out["angles"]:
+		closes.append("-" if a == null else "%.0f" % rad_to_deg(float(a)))
+	print("[models] %s: an arm rig, shoulder %s, elbow %s, grip %s, arm %.3f + %.3f, turned %d degrees, pincers close %s degrees" % [
+		name, out["shoulder"], out["elbow"], out["grip"], lengths[0], lengths[1], roundi(rad_to_deg(float(out["turn"]))), ", ".join(closes)])
+	return out
 
 
 ## Mesh for an entity record: its variant model if there is one, else the prototype's.
@@ -730,19 +863,17 @@ static func _make(name: String) -> Mesh:
 	if root != null or built != null:
 		if built != null:
 			mesh = _commit_load(built, parts)
+			if not built.rig.is_empty():
+				_rigs[name] = _commit_rig(built.rig, name)
 		else:
 			mesh = _flatten(root, parts)
 			root.free()
 		# Creatures: a tier is its family's model scaled and tinted; limbs move in the shader.
 		mesh = CreatureModels.prepare(mesh as ArrayMesh, name)
 		if mesh != null:
-			_project_sprite(mesh as ArrayMesh, name)
 			for part: AnimPart in parts:
 				part.model = name
 				part.slide = MODEL_SLIDES.get(name, {}).get(part.kind, part.slide)
-				var upright_name := name + ".upright"
-				var shown := upright_name if part.upright and SpriteProjection.has_entry(upright_name) else name
-				_project_sprite(part.mesh as ArrayMesh, shown)
 				_mark_animated(part.mesh as ArrayMesh)
 	if mesh == null:
 		mesh = _tier_variant(name)
@@ -780,6 +911,10 @@ static func _setup_belt(mesh: ArrayMesh, name: String) -> void:
 	for prefix in BELT_CHEVRONS:
 		if name.begins_with(prefix):
 			chevron = BELT_CHEVRONS[prefix]
+	var chevron_period := BELT_CHEVRON_PERIOD
+	for prefix in BELT_CHEVRON_PERIODS:
+		if name.begins_with(prefix):
+			chevron_period = BELT_CHEVRON_PERIODS[prefix]
 	# An underground exit's model faces back at its entrance (turn_dir turns it round), so its
 	# belt runs the other way, south in model space.
 	if name.ends_with("-output"):
@@ -789,12 +924,85 @@ static func _setup_belt(mesh: ArrayMesh, name: String) -> void:
 		shape = 1
 	elif name.ends_with("-curve-right"):
 		shape = 2
-	var pick := func(m: ShaderMaterial) -> bool: return m.resource_name.contains(BELT_MATERIAL)
+	var pick := func(m: ShaderMaterial) -> bool: return m.resource_name.to_lower().contains(BELT_MATERIAL)
+	var scroll := _belt_uv_scroll(mesh, shape, name.ends_with("-start") or name.ends_with("-end"))
 	var change := func(m: ShaderMaterial) -> void:
 		m.set_shader_parameter("belt_speed", speed)
 		m.set_shader_parameter("belt_shape", shape)
 		m.set_shader_parameter("belt_chevron", chevron)
+		m.set_shader_parameter("belt_chevron_period", chevron_period)
+		m.set_shader_parameter("belt_uv_scroll", scroll)
 	edit_materials(mesh, pick, change)
+
+
+## How a textured belt surface's UVs change per tile along the belt (a least-squares fit of U and V
+## against the distance along it: -z, or a curve's arc, as the shader's belt_coords), so the shader
+## scrolls the texture the way the modeller laid it out. Zero without a textured belt surface.
+## Only the part facing up is fitted: a surface that wraps round under the belt runs back the other
+## way underneath, and fitting both cancelled to nothing (the belt stood still).
+static func _belt_uv_scroll(mesh: ArrayMesh, shape: int, runs_east := false) -> Vector2:
+	var all: Array = mesh.get_meta(ModelLods.ARRAYS_META, [])
+	for i in mesh.get_surface_count():
+		var m := mesh.surface_get_material(i) as ShaderMaterial
+		if m == null or not m.resource_name.to_lower().contains(BELT_MATERIAL) or m.get_shader_parameter("use_albedo_tex") != true:
+			continue
+		if i >= all.size():
+			continue
+		var a: Array = all[i]
+		var verts: PackedVector3Array = a[Mesh.ARRAY_VERTEX]
+		var uvs: Variant = a[Mesh.ARRAY_TEX_UV]
+		if not uvs is PackedVector2Array or verts.is_empty():
+			continue
+		var normals: Variant = a[Mesh.ARRAY_NORMAL]
+		var top: Array[int] = []
+		if normals is PackedVector3Array and (normals as PackedVector3Array).size() == verts.size():
+			for v in verts.size():
+				if (normals as PackedVector3Array)[v].y > 0.5:
+					top.append(v)
+		if top.size() < 3:
+			top.clear()
+			for v in verts.size():
+				top.append(v)
+		var n := float(top.size())
+		var ms := 0.0
+		var mu := Vector2.ZERO
+		var ss: Array[float] = []
+		for v in top:
+			var p := verts[v]
+			var along := p.x if runs_east else -p.z
+			if shape > 0:
+				var side := 1.0 if shape == 1 else -1.0
+				var d := Vector2(p.x, p.z) - Vector2(-0.5 * side, -0.5)
+				along = atan2(-d.y, d.x * side) / (PI * 0.5) + 0.5
+			ss.append(along)
+			ms += along
+			mu += (uvs as PackedVector2Array)[v]
+		ms /= n
+		mu /= n
+		var var_s := 0.0
+		var cov := Vector2.ZERO
+		for k in top.size():
+			var ds := ss[k] - ms
+			var_s += ds * ds
+			cov += ds * ((uvs as PackedVector2Array)[top[k]] - mu)
+		if var_s > 1e-6:
+			return _clean_scroll(cov / var_s)
+	return Vector2.ZERO
+
+
+## A fit as the modeller laid the texture out: a texture runs along one axis, so a small share of the
+## other is the fit's noise (a curve's uneven vertices gave V 0.003 a tile), which crept the rows
+## sideways for good: within seconds the far edge of the texture wrapped in along a curve's inner
+## edge, a fan of its small plates. Each axis is then a whole number of eighths of a repeat a tile,
+## so a line's straights, curves and ends scroll at one speed (1.0, 0.9993 and 1.023 drifted apart).
+static func _clean_scroll(fit: Vector2) -> Vector2:
+	var noise := maxf(absf(fit.x), absf(fit.y)) * 0.1
+	var out := Vector2.ZERO
+	for axis in 2:
+		if absf(fit[axis]) > noise:
+			var snapped := snappedf(fit[axis], 0.125)
+			out[axis] = snapped if snapped != 0.0 else fit[axis]
+	return out
 
 
 ## A moving part's materials take the entity's position and direction from INSTANCE_CUSTOM,
@@ -860,37 +1068,9 @@ static func _copy(base: ArrayMesh) -> ArrayMesh:
 		out.surface_set_name(i, base.surface_get_name(i))
 		kept.append(arrays)
 	out.set_meta(ModelLods.ARRAYS_META, kept)
+	if base.has_meta(ContactShade.META):
+		out.set_meta(ContactShade.META, base.get_meta(ContactShade.META))
 	return out
-
-
-## Gives every surface of a model its own copy of the material with the model's sprite.
-## A vehicle's projection is still being built on a thread: its materials get their own copies
-## now and the sprite once it's ready (changing a material shows on meshes already drawn).
-static func _project_sprite(mesh: ArrayMesh, name: String) -> void:
-	var pending := SpriteProjection.pending(name)
-	var projection: SpriteProjection.SpriteSheet = null
-	if not pending:
-		projection = SpriteProjection.for_model(name)
-		if projection == null:
-			return
-	var copies: Array[ShaderMaterial] = []
-	for i in mesh.get_surface_count():
-		var material := mesh.surface_get_material(i) as ShaderMaterial
-		if material != null:
-			var copy := ModelLods.copy_material(material)
-			if projection != null:
-				SpriteProjection.apply(copy, projection)
-			mesh.surface_set_material(i, copy)
-			copies.append(copy)
-	if pending:
-		SpriteProjection.when_ready(name, _apply_projection.bind(copies, name))
-
-
-static func _apply_projection(materials: Array[ShaderMaterial], name: String) -> void:
-	var projection := SpriteProjection.for_model(name)
-	if projection != null:
-		for material in materials:
-			SpriteProjection.apply(material, projection)
 
 
 # --- Loading on worker threads ------------------------------------------------------------------
@@ -925,25 +1105,144 @@ class Load:
 	var parts: Array = []
 	## On (Settings > Graphics > Merged materials): a surface per shader; off, a surface per material.
 	var combine := true
+	## From a modeller's folder (models/, --models=): its vertex colours are Blender's own unless it
+	## has Zenith's baked layout (a second UV map beside them), so they aren't read as weathering.
+	var modeller := false
 	## The format bits of CUSTOM0 and CUSTOM1 (the baked views and part colours).
 	const CUSTOM_KEEP := (Mesh.ARRAY_FORMAT_CUSTOM_MASK << Mesh.ARRAY_FORMAT_CUSTOM_BASE) \
-		| (Mesh.ARRAY_FORMAT_CUSTOM_MASK << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + Mesh.ARRAY_FORMAT_CUSTOM_BITS))
+		| (Mesh.ARRAY_FORMAT_CUSTOM_MASK << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + Mesh.ARRAY_FORMAT_CUSTOM_BITS)) \
+		| (Mesh.ARRAY_FORMAT_CUSTOM_MASK << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + 3 * Mesh.ARRAY_FORMAT_CUSTOM_BITS))
+	## A baked part's CUSTOM3 (each vertex's bones and weights, model_skin.gd pack()).
+	const CUSTOM3_FLAGS := Mesh.ARRAY_CUSTOM_RGBA_FLOAT << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + 3 * Mesh.ARRAY_FORMAT_CUSTOM_BITS)
+	## The model's baked animation, if it has one that moves (model_skin.gd).
+	var bake := {}
+	## An inserter's model: a skin rigged as an inserter arm is cut into parts for inserter_arms.gd
+	## (model_rig.gd) instead of drawn whole.
+	var rig_wanted := false
+	## Then {"data": model_rig.gd build()'s numbers, "parts": per ModelRig.Part its groups or []}.
+	var rig := {}
+	var _rig_cut := []  # [split(), the skinned node's transform, its key]
+	## Its feet on the ground (contact_shade.gd feet_of(), for the rim round them).
+	var contact: Array = []
 
 	func run() -> void:
 		var doc := GLTFDocument.new()
 		var state := GLTFState.new()
 		if doc.append_from_file(path, state) == OK:
 			ModelTextures.prepare(path, state)
+			if not state.get_skins().is_empty() or not state.get_animations().is_empty():
+				bake = ModelSkin.bake(path)
 			var nodes := state.get_nodes()
 			var meshes := state.get_meshes()
 			var tools := {}
 			var order: Array = []
 			for r in state.root_nodes:
 				_walk(nodes, meshes, r, Transform3D.IDENTITY, tools, order, true, "")
+			var turn := _finish_rig(tools, order)
 			groups = combined(merged(tools, order), combine)
 			for p: Array in parts:
 				p[2] = combined(p[2], combine)
+			if turn != 0.0:
+				# The rig faced another way than north: the whole model is turned with its arm.
+				var yaw := Transform3D(Basis(Vector3.UP, turn), Vector3.ZERO)
+				for g: Array in groups:
+					_turn_arrays(g[1], yaw.basis)
+				for p: Array in parts:
+					p[1] = yaw * (p[1] as Transform3D)
+					for g: Array in p[2]:
+						_turn_arrays(g[1], yaw.basis)
+			contact = ContactShade.feet_of(groups)
 			ok = true
+
+	## The rig's parts and numbers from the cut skinned surface (model_rig.gd), into `rig`; returns the
+	## yaw it turned them by. When the rig can't be solved the arm's triangles join the static model.
+	func _finish_rig(tools: Dictionary, order: Array) -> float:
+		if _rig_cut.is_empty():
+			return 0.0
+		var cut: Dictionary = _rig_cut[0]
+		var xform: Transform3D = _rig_cut[1]
+		var at: Array = _rig_cut[2]
+		var roles: PackedInt32Array = _rig_cut[3]
+		var base_points := PackedVector3Array()
+		if cut["base"] != null:
+			base_points = xform * (cut["base"][Mesh.ARRAY_VERTEX] as PackedVector3Array)
+		var cut_parts: Array = cut["parts"]
+		var kept: Array = []
+		for a in cut_parts:
+			kept.append((a as Array).duplicate(true) if a != null else null)
+		var data := ModelRig.build(cut_parts, base_points, xform, bake, roles)
+		if data.is_empty():
+			for a in kept:
+				if a != null:
+					if not tools.has(at):
+						tools[at] = []
+						order.append(at)
+					(tools[at] as Array).append([a, Transform3D.IDENTITY])
+			return 0.0
+		var out: Array = []
+		for a in cut_parts:
+			out.append(combined(merged({at: [[a, Transform3D.IDENTITY]]}, [at]), combine) if a != null else [])
+		rig = {"data": data, "parts": out}
+		return float(data["turn"])
+
+	static func _turn_arrays(arrays: Array, basis: Basis) -> void:
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		for v in verts.size():
+			verts[v] = basis * verts[v]
+		arrays[Mesh.ARRAY_VERTEX] = verts
+		if arrays[Mesh.ARRAY_NORMAL] is PackedVector3Array:
+			var normals: PackedVector3Array = arrays[Mesh.ARRAY_NORMAL]
+			for v in normals.size():
+				normals[v] = basis * normals[v]
+			arrays[Mesh.ARRAY_NORMAL] = normals
+
+	## A skinned surface split by its bones: [the triangles on bones that never move (the body), the
+	## rest (the baked part, its bones and weights in CUSTOM3)], either null when empty. Neither keeps
+	## the skin's arrays.
+	func _split_baked(arrays: Array) -> Array:
+		var bones: PackedInt32Array = arrays[Mesh.ARRAY_BONES]
+		var weights: PackedFloat32Array = arrays[Mesh.ARRAY_WEIGHTS]
+		var count := (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+		if bones.size() != count * 4:
+			return [arrays, null]  # 8 bones a vertex: left still
+		var moving := PackedByteArray()
+		moving.resize(count)
+		for v in count:
+			moving[v] = 1 if ModelSkin.moves(bake, bones, weights, v) else 0
+		var idx: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
+		var still := PackedInt32Array()
+		var moved := PackedInt32Array()
+		for t in range(0, idx.size(), 3):
+			var m := moving[idx[t]] == 1 or moving[idx[t + 1]] == 1 or moving[idx[t + 2]] == 1
+			if m:
+				moved.append_array([idx[t], idx[t + 1], idx[t + 2]])
+			else:
+				still.append_array([idx[t], idx[t + 1], idx[t + 2]])
+		var body: Variant = null
+		var part: Variant = null
+		if not still.is_empty():
+			# A deep copy: posing changes the vertex arrays in place, and the moving part keeps the stored ones.
+			body = arrays.duplicate(true)
+			body[Mesh.ARRAY_INDEX] = still
+			ModelSkin.pose(body, bake["rest"])
+			body[Mesh.ARRAY_BONES] = null
+			body[Mesh.ARRAY_WEIGHTS] = null
+		if not moved.is_empty():
+			part = arrays.duplicate()
+			part[Mesh.ARRAY_INDEX] = moved
+			part[Mesh.ARRAY_CUSTOM3] = ModelSkin.pack(bones, weights, count)
+			part[Mesh.ARRAY_BONES] = null
+			part[Mesh.ARRAY_WEIGHTS] = null
+			if not keeps_color(part):
+				part[Mesh.ARRAY_COLOR] = null
+		return [body, part]
+
+	## Whether a surface's COLOR is Zenith's shading data (the baked occlusion in its alpha): always in
+	## Zenith's own models; in a modeller's only beside a second UV map (bake_glb.py writes both), else
+	## it is Blender's vertex paint, which would tint the model. A baked moving part (a belt's base and
+	## rollers, a splitter's body) keeps it too: it was the most of a belt left unshaded.
+	func keeps_color(arrays: Array) -> bool:
+		return arrays[Mesh.ARRAY_COLOR] != null and (not modeller or arrays[Mesh.ARRAY_TEX_UV2] != null)
 
 	## As ModelLibrary._collect, over the glTF's nodes: `in_parts` false inside a moving part.
 	func _walk(nodes: Array, meshes: Array, i: int, parent: Transform3D, tools: Dictionary, order: Array, in_parts: bool, glow: String) -> void:
@@ -971,6 +1270,64 @@ class Load:
 				var material: Material = mesh.get_surface_material(k)
 				if k < overrides.size() and overrides[k] != null:
 					material = overrides[k]
+				if bake.get("animated", false) and bake["node_joints"].has(i):
+					# An object the actions move (a roller): all of it a bone of its own.
+					var joint: int = bake["node_joints"][i]
+					if (bake["moving"] as PackedByteArray)[joint] == 1:
+						var whole: Array = arrays.duplicate()
+						var n := (whole[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+						var c3 := PackedFloat32Array()
+						c3.resize(n * 4)
+						for v in n:
+							c3[v * 4] = float(joint) + 0.999
+						whole[Mesh.ARRAY_CUSTOM3] = c3
+						if not keeps_color(whole):
+							whole[Mesh.ARRAY_COLOR] = null
+						var nkey := [material, whole[Mesh.ARRAY_COLOR] != null, whole[Mesh.ARRAY_TEX_UV2] != null,
+							whole[Mesh.ARRAY_CUSTOM0] != null, glow, whole[Mesh.ARRAY_CUSTOM1] != null]
+						var nat := nkey + [(mesh.get_surface_format(k) & (0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE)) | CUSTOM3_FLAGS]
+						parts.append([BAKED_NODE, xform, merged({nat: [[whole, xform]]}, [nat]), node_name.to_lower().contains("roller")])
+						continue
+				if rig_wanted and _rig_cut.is_empty() and not bake.is_empty() and node.skin >= 0 \
+						and arrays[Mesh.ARRAY_BONES] != null and arrays[Mesh.ARRAY_WEIGHTS] != null:
+					var roles := ModelRig.roles(bake)
+					if not roles.is_empty():
+						# An inserter's arm rig: its parts go to inserter_arms.gd, the rest stays the model.
+						var cut := ModelRig.split(arrays, xform, bake, roles)
+						var strip: bool = modeller and arrays[Mesh.ARRAY_COLOR] != null and arrays[Mesh.ARRAY_TEX_UV2] == null
+						for a in cut["parts"]:
+							if a != null and strip:
+								a[Mesh.ARRAY_COLOR] = null
+						if modeller and material is BaseMaterial3D and (material as BaseMaterial3D).albedo_texture != null:
+							material.set_meta(OWN_LOOK_META, true)
+						var rkey := [material, arrays[Mesh.ARRAY_COLOR] != null and not strip, arrays[Mesh.ARRAY_TEX_UV2] != null,
+							arrays[Mesh.ARRAY_CUSTOM0] != null, glow, arrays[Mesh.ARRAY_CUSTOM1] != null]
+						_rig_cut = [cut, xform, rkey + [mesh.get_surface_format(k) & (0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE)], roles]
+						if cut["base"] == null:
+							continue
+						arrays = cut["base"]
+				if not bake.is_empty() and node.skin >= 0 and arrays[Mesh.ARRAY_BONES] != null and arrays[Mesh.ARRAY_WEIGHTS] != null \
+						and not bake.get("animated", false):
+					# A still skinned mesh: drawn in its rest pose, as Blender shows it.
+					arrays = arrays.duplicate(true)
+					ModelSkin.pose(arrays, bake["rest"])
+					arrays[Mesh.ARRAY_BONES] = null
+					arrays[Mesh.ARRAY_WEIGHTS] = null
+				if bake.get("animated", false) and node.skin >= 0 and arrays[Mesh.ARRAY_BONES] != null and arrays[Mesh.ARRAY_WEIGHTS] != null:
+					var split := _split_baked(arrays)
+					if split[1] != null:
+						var part_arrays: Array = split[1]
+						var pkey := [material, part_arrays[Mesh.ARRAY_COLOR] != null, part_arrays[Mesh.ARRAY_TEX_UV2] != null,
+							part_arrays[Mesh.ARRAY_CUSTOM0] != null, glow, part_arrays[Mesh.ARRAY_CUSTOM1] != null]
+						var pat := pkey + [(mesh.get_surface_format(k) & (0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE)) | CUSTOM3_FLAGS]
+						parts.append([BAKED_NODE, xform, merged({pat: [[part_arrays, xform]]}, [pat])])
+					if split[0] == null:
+						continue
+					arrays = split[0]
+				if modeller and arrays[Mesh.ARRAY_COLOR] != null and arrays[Mesh.ARRAY_TEX_UV2] == null:
+					arrays[Mesh.ARRAY_COLOR] = null
+				if modeller and material is BaseMaterial3D and (material as BaseMaterial3D).albedo_texture != null:
+					material.set_meta(OWN_LOOK_META, true)
 				var key := [material, arrays[Mesh.ARRAY_COLOR] != null, arrays[Mesh.ARRAY_TEX_UV2] != null,
 					arrays[Mesh.ARRAY_CUSTOM0] != null, glow, arrays[Mesh.ARRAY_CUSTOM1] != null]
 				var flags := mesh.get_surface_format(k) & (0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE)
@@ -1046,7 +1403,8 @@ class Load:
 		var by_shader := {}
 		var order: Array = []
 		for g: Array in groups:
-			var v: Variant = variant(g[0][0]) if combine and not textured(g[0][0]) else "alone %d" % order.size()
+			# Textured and cut-out materials keep their own uniforms (textures, cutoff): never merged.
+			var v: Variant = variant(g[0][0]) if combine and not textured(g[0][0]) and variant(g[0][0]) != 3 else "alone %d" % order.size()
 			if not by_shader.has(v):
 				by_shader[v] = []
 				order.append(v)
@@ -1070,19 +1428,22 @@ class Load:
 		return out
 
 	## The shader a key's material is drawn with, as _factorio() picks it: 0 solid, 1 see-through,
-	## 2 leaf cards.
+	## 2 leaf cards, 3 cut out (Alpha Clip).
 	static func variant(material: Material) -> int:
 		var base := material as BaseMaterial3D
 		if base == null:
 			return 0
 		if base.resource_name.begins_with("leafcard"):
 			return 2
+		if base.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR or base.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA_HASH:
+			return 3
 		return 1 if base.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED else 0
 
 	## True for a material with a base colour or roughness texture.
 	static func textured(material: Material) -> bool:
 		var base := material as BaseMaterial3D
-		return base != null and (base.albedo_texture != null or base.roughness_texture != null)
+		return base != null and (base.albedo_texture != null or base.roughness_texture != null
+			or base.emission_texture != null or base.normal_texture != null)
 
 	static func _custom_format(flags: int, c: int) -> int:
 		return (flags >> (Mesh.ARRAY_FORMAT_CUSTOM_BASE + c * Mesh.ARRAY_FORMAT_CUSTOM_BITS)) & Mesh.ARRAY_FORMAT_CUSTOM_MASK
@@ -1203,6 +1564,8 @@ static func ready(name: String) -> bool:
 			var load := Load.new()
 			load.path = source.substr(GLTF_SOURCE.length())
 			load.combine = merge_materials
+			load.modeller = external_dir != "" and load.path.begins_with(external_dir)
+			load.rig_wanted = rig_name(name)
 			_jobs[name] = [-1, load]
 			_job_order.append(name)
 		return false
@@ -1225,6 +1588,11 @@ static func entity_ready(proto_name: String, proto_type: String, extra: Dictiona
 		if _cache[variant] != null:
 			return true
 	return ready(proto_name)
+
+
+## Models still being read on worker threads or waiting to be made (full_detail.gd's settle check).
+static func busy() -> bool:
+	return not _jobs.is_empty() or not _remnant_jobs.is_empty()
 
 
 ## Starts waiting jobs and makes the models whose jobs are done, within its slice. True when
@@ -1291,6 +1659,8 @@ static func _built(name: String) -> Load:
 		load = Load.new()
 		load.path = _source(name).substr(GLTF_SOURCE.length())
 		load.combine = merge_materials
+		load.modeller = external_dir != "" and load.path.begins_with(external_dir)
+		load.rig_wanted = rig_name(name)
 		_parsed_here = true
 		load.run()
 	return load
@@ -1299,9 +1669,17 @@ static func _built(name: String) -> Load:
 ## The model's mesh and moving parts (into `parts`) from its Load, on the main thread.
 static func _commit_load(load: Load, parts: Array) -> Mesh:
 	var mesh := _commit_groups(load.groups)
+	if mesh != null:
+		mesh.set_meta(ContactShade.META, load.contact)
 	for p: Array in load.parts:
 		var part := _new_part(str(p[0]), p[1])
 		part.mesh = _commit_groups(p[2])
+		if part.kind == "baked":
+			part.roller = p.size() > 3 and bool(p[3])
+			part.bake = load.bake
+			part.pivot = Transform3D.IDENTITY
+			if part.mesh is ArrayMesh:
+				(part.mesh as ArrayMesh).custom_aabb = ModelSkin.box_of(load.bake, part.mesh.get_aabb()).grow(0.05)
 		if part.mesh != null:
 			parts.append(part)
 	return mesh
@@ -1431,6 +1809,26 @@ static func _collect(node: Node, parent: Transform3D, tools: Dictionary, order: 
 		_collect(child, xform, tools, order, parts, glow)
 
 
+## The shader's occlusion_channel for BaseMaterial3D.TextureChannel (red, green, blue, alpha, grey).
+const OCCLUSION_CHANNELS := [Vector4(1, 0, 0, 0), Vector4(0, 1, 0, 0), Vector4(0, 0, 1, 0), Vector4(0, 0, 0, 1),
+	Vector4(0.299, 0.587, 0.114, 0)]
+
+
+## Marks a modeller's textured material (Load, from the models folder): drawn with its textures only.
+const OWN_LOOK_META := "f3d_own_look"
+## A textured model's baked occlusion strength (the shader's ao_strength; above 1 a power): its
+## per-vertex bake shows mostly as 0.6-0.9 near corners and feet, which at 1 left Vasillo's belts and
+## inserters and FUE5's buildings looking unshaded beside Factorio's sprites.
+const TEXTURED_AO := 2.0
+## Zenith's procedural weathering off (CLASS_PARAMS' keys at rest).
+const OWN_LOOK := {"rust": 0.0, "streaks": 0.0, "edge_wear": 0.0, "grime": 0.0, "dust": 0.0,
+	"desaturate": 0.0, "value": 1.0, "grain": 0.0}
+
+
+## The part a skinned mesh's moving triangles make (model_skin.gd): its kind is "baked".
+const BAKED_NODE := "anim_baked"
+
+
 ## The moving part a node named `anim_<kind>` makes, its pivot at `xform`; its mesh comes after.
 static func _new_part(node_name: String, xform: Transform3D) -> AnimPart:
 	var part := AnimPart.new()
@@ -1473,8 +1871,12 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 	var out := ShaderMaterial.new()
 	var name := base.resource_name if base != null else ""
 	out.resource_name = name
-	var see_through := base != null and base.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED
-	out.shader = FactorioAlphaShader if see_through else FactorioShader
+	# Alpha Clip (glTF MASK, imported as alpha scissor) cuts pixels out; Alpha Blend (BLEND) is see-through.
+	var clip := clipped(base)
+	var see_through := base != null and not clip and base.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED
+	out.shader = FactorioClipShader if clip else (FactorioAlphaShader if see_through else FactorioShader)
+	if clip:
+		out.set_shader_parameter("alpha_clip", base.alpha_scissor_threshold)
 	if name.begins_with("leafcard"):
 		out.shader = FactorioLeafShader
 	# Cliffs' rock sits on the low ground when there are hills (ground_height.gd).
@@ -1498,9 +1900,26 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 			if base.roughness_texture.has_meta(ModelTextures.NEAREST_META):
 				out.set_shader_parameter("orm_tex_nearest", base.roughness_texture)
 				out.set_shader_parameter("orm_nearest", true)
+		# glTF's occlusionTexture: most files pack it as the red of the metallic-roughness picture.
+		if base.ao_enabled and base.ao_texture != null:
+			var same := base.ao_texture == base.roughness_texture
+			if not same:
+				out.set_shader_parameter("occlusion_tex", base.ao_texture)
+			out.set_shader_parameter("occlusion_mode", 1 if same else 2)
+			out.set_shader_parameter("occlusion_channel", OCCLUSION_CHANNELS[clampi(base.ao_texture_channel, 0, 4)])
+		# A normal map that is the base colour's own picture (a colour image wired to the Normal input in
+		# Blender) isn't one: its dark greys read as normals pointing into the surface, so the same part
+		# went dark or glared white depending on which way it faced the sun.
+		if base.normal_enabled and base.normal_texture != null and base.normal_texture != base.albedo_texture:
+			out.set_shader_parameter("normal_tex", base.normal_texture)
+			out.set_shader_parameter("use_normal_tex", true)
+			out.set_shader_parameter("normal_scale", base.normal_scale)
 		if base.emission_enabled:
 			out.set_shader_parameter("emission", base.emission)
 			out.set_shader_parameter("emission_energy", base.emission_energy_multiplier)
+			if base.emission_texture != null:
+				out.set_shader_parameter("emission_tex", base.emission_texture)
+				out.set_shader_parameter("use_emission_tex", true)
 			out.set_shader_parameter("activity_glow", true)
 			out.set_shader_parameter("glow_fades", see_through)
 		elif glow != "":
@@ -1523,6 +1942,15 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 	var params: Dictionary = CLASS_PARAMS[material_class(name, base != null and base.emission_enabled)]
 	for param in params:
 		out.set_shader_parameter(param, params[param])
+	if base != null and base.has_meta(OWN_LOOK_META):
+		# A modeller's textured material: its own wear and dirt are in its textures. Zenith's laid on
+		# top would sit still in model space while a belt's texture runs under it, and muddy the paint.
+		for param in OWN_LOOK:
+			out.set_shader_parameter(param, OWN_LOOK[param])
+	if base != null and base.albedo_texture != null and has_color:
+		# A textured model's baked occlusion (bake_glb.py), whatever its material's class: an inserter's
+		# emissive material had 0.3 of it, which no one could see.
+		out.set_shader_parameter("ao_strength", TEXTURED_AO)
 	_factorio_cache[key] = out
 	return out
 

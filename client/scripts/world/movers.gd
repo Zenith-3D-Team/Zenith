@@ -19,6 +19,7 @@ const Creatures := preload("res://scripts/world/creatures.gd")
 const CreatureModels := preload("res://scripts/world/creature_models.gd")
 const Avatar := preload("res://scripts/player/avatar.gd")
 const GameClock := preload("res://scripts/world/game_clock.gd")
+const MomentHold := preload("res://scripts/world/moment_hold.gd")
 const VehicleAnim := preload("res://scripts/world/vehicle_anim.gd")
 const RobotSwarm := preload("res://scripts/world/robot_swarm.gd")
 const MoverRecords := preload("res://scripts/world/mover_records.gd")
@@ -543,6 +544,12 @@ func proto_name_of(unit: int) -> String:
 	return proto.name if proto != null else ""
 
 
+## Whether the remote view's fog is hiding this mover.
+func is_fogged(unit: int) -> bool:
+	var m: Mover = _movers.get(unit)
+	return m != null and m.fogged
+
+
 func units_of_type(type: String) -> Array:
 	var out: Array = []
 	if int(_type_counts.get(type, 0)) <= 0:
@@ -718,7 +725,7 @@ func _process_movers(delta: float) -> void:
 				_dress(unit, m, proto)
 	var t := 1.0 - exp(-delta * FOLLOW_RATE)
 	var drawn := clock.advance(delta)
-	records.frame(clock.tick, clock.rate, delta)
+	records.frame(clock.tick, clock.rate, 0.0 if MomentHold.on else delta)
 	var fogging: bool = fog != null and fog.hiding()
 	_fog_records(fogging)
 	var behind := clock.gap * GameClock.DELAY_SENDS

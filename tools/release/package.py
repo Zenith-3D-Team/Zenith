@@ -1,15 +1,32 @@
 """Builds the download players get: the client exported with Godot, with the bridge mod and the
 server scripts beside it, zipped as dist/Zenith-<version>-<platform>.zip. Uploads nothing.
 
-    python3 tools/release/package.py [--godot <godot exe>]
+    python3 tools/release/package.py [--godot <godot exe>] [--channel public|dev]
         [--platform windows|linux|linux-arm64|windows-arm64|macos|supported|unsupported|all]
-        [--no-addons] [--addon <add-on folder>[:off]]...
+        [--no-addons] [--addon <add-on folder>[:off]]... [--models <folder>]
+
+Two channels (owner: public downloads carry no testing tools; development builds do). `public`, the
+default, is the release on the public repo. `dev` is a development build for testers:
+dist/Zenith-<version>-dev-<platform>.zip, exported with the custom feature tag `zenith_dev` (set
+on the export preset for that export alone, export_presets.cfg put back after), which
+Settings.dev_tools() reads: the main menu's Performance test and --perf-test, the debug menu
+(Ctrl+F12) and its overlays are there only then. A dev zip also carries PERFORMANCE-TEST.md and
+the docs' dev-build parts (between <!-- dev --> and <!-- /dev --> marks, cut from a public zip's
+copies), and START HERE.txt says it is a development build.
 
 Every download carries Zenith's own add-ons (BUNDLED: the Cinematic camera, switched on; Terrain
-Elevation, switched off until the player turns it on), each fetched from its GitHub repo's latest
+Elevation, switched off until the player turns it on; the Cinematic shaders, from addons-src, are
+added with --addon addons-src/cinematic-shaders, switched on), each fetched from its GitHub repo's latest
 release (or its default branch when it has none) into addons/<id>_<version>.zip, with
 addons/bundled.json giving each one's first state (addon_loader.gd). --addon <folder>[:off] bundles a
 local folder instead of (or besides) them; --no-addons leaves them all out.
+
+--models <folder> puts a modeller's models (the .glb and .gltf files at the folder's top, with any
+files a .gltf points at) into the download's models/ folder beside the program. Zenith reads that
+folder at start-up and a model there replaces its own of the same name (model_library.gd
+custom_models_dir), so the download shows them out of the box; `-- --no-custom-models` leaves them
+out. Only for builds whose modeller agreed (releases with Vasillo's models): the
+models aren't Zenith's, and the README.txt there says so.
 
 windows and linux are the downloads Zenith supports. linux-arm64 (issue #8), windows-arm64 and
 macos (a universal app: Apple Silicon and Intel) are UNSUPPORTED (owner's label): built the same way, never run by
@@ -20,6 +37,10 @@ Needs Godot's export templates for the same version as the editor (Godot: Editor
 Templates, or the .tpz from Godot's releases page unpacked into its templates folder). The
 exported client finds `mod/` and `server/` next to its own executable (client/scripts/menu/paths.gd),
 so the zip unpacks into one folder that runs as it is.
+
+The native belt simulation (client/native/belt_sim.gdextension, docs/RUNNING.md) is exported by Godot
+itself: the Windows download gets client/native/bin's DLL beside Zenith.exe when it is there (it is
+committed; nothing here builds it). The other platforms have no library and run belt_sim.gd.
 """
 
 import argparse
@@ -36,6 +57,8 @@ import sys
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+# BeltSimNative's library (client/native/belt_sim.gdextension), which Godot exports beside the program.
+NATIVE_DLL = "belt_sim.windows.template_release.x86_64.dll"
 MOD = ROOT / "mod" / "factorio-3d-bridge"
 # platform -> (export preset, the program's name in the folder). macOS's export is a .zip holding
 # Zenith.app, whose entries go into the download as they are.
@@ -83,9 +106,19 @@ SERVER_FILES = ["server-settings.json", "run-server.ps1", "run-headless.sh", "do
 # The models from Wube's printable release (CC BY-NC) and from FUE5 (CC BY-NC-SA) ship inside the game:
 # their per-model lists and licence terms go beside it, as the licences ask.
 DOCS = [("LICENSE", "LICENSE.txt"), ("LICENSING.md", "LICENSING.md"), ("CREDITS.md", "CREDITS.md"), ("docs/USER-GUIDE.md", "USER-GUIDE.md"),
-        ("docs/ADDONS.md", "ADDONS.md"), ("docs/MODELLERS.md", "MODELLERS.md"), ("client/assets/models/CREDITS.md", "MODEL-CREDITS.md"),
+        ("docs/ADDONS.md", "ADDONS.md"), ("docs/MODELLERS.md", "MODELLERS.md"),
+        ("client/assets/models/CREDITS.md", "MODEL-CREDITS.md"),
         ("client/assets/models/fue5/README.md", "FUE5-MODELS.md"),
         ("client/assets/branding/README.md", "LOGO-LICENCE.md")]
+# The testing tools' own docs, only in a dev build.
+DEV_DOCS = [("docs/PERFORMANCE-TEST.md", "PERFORMANCE-TEST.md")]
+CHANNELS = ["public", "dev"]
+# The feature tag a dev export carries (client/scripts/menu/settings.gd DEV_FEATURE).
+DEV_FEATURE = "zenith_dev"
+# A doc's dev-build parts: whole lines between marks on lines of their own, or words between marks
+# inside a line. A dev zip keeps them without the marks, a public one cuts them.
+DEV_BLOCK = re.compile(r"^<!-- dev -->\r?\n(.*?)^<!-- /dev -->\r?\n", re.S | re.M)
+DEV_INLINE = re.compile(r"<!-- dev -->(.*?)<!-- /dev -->", re.S)
 MODELS_README = """Your own 3D models for Zenith.
 
 Put a .glb file here named after the Factorio entity it draws, and Zenith uses it in place of its
@@ -105,6 +138,14 @@ MODELLERS.md, beside Zenith, has every name, the moving parts and the materials 
 To start Zenith with its own models only, without removing these: start it with
   -- --no-custom-models
 after the program's name (a shortcut's Target), or empty this folder.
+"""
+
+
+# Added to the models folder's README.txt when the download comes with models in it (--models).
+MODELS_BUNDLED = """
+This download comes with {count} models already here, made by a modeller for Zenith and used with
+their permission (CREDITS.md beside Zenith says whose). They aren't Zenith's own and aren't under
+its GPL licence. Remove them, or start Zenith with -- --no-custom-models, to see Zenith's own.
 """
 
 
@@ -133,6 +174,11 @@ saves.
 Ctrl+F9 opens the same game in Factorio itself; Ctrl+F9 there comes back.
 USER-GUIDE.md has the controls and everything else. Bug reports are welcome on the project's
 issue tracker.
+"""
+START_HERE_DEV = """
+This is a DEVELOPMENT BUILD, for testers: it has the testing tools the public
+downloads leave out, the main menu's Performance test (PERFORMANCE-TEST.md) and the debug menu
+(Ctrl+F12 in a game). Please don't pass it on.
 """
 
 
@@ -174,6 +220,31 @@ def export_with_etc2(godot, preset, out_exe):
                 p.unlink()  # made by the import pass
             elif p.read_bytes() != imports[p]:
                 p.write_bytes(imports[p])
+
+
+def with_dev_feature(godot, preset, out_exe, export_fn):
+    """Exports with DEV_FEATURE added to the preset's custom features, then puts
+    export_presets.cfg back byte for byte: the presets stay one list for both channels."""
+    presets = ROOT / "client" / "export_presets.cfg"
+    before = presets.read_bytes()
+    text = before.decode("utf-8")
+    line = re.compile(r'(\nname="%s"\r?\n(?:(?!\[preset).*\n)*?custom_features=)"([^"\r\n]*)"' % re.escape(preset))
+    found = line.search(text)
+    if not found:
+        sys.exit(f"export preset {preset} has no custom_features line in {presets}")
+    features = ",".join([f for f in found.group(2).split(",") if f] + [DEV_FEATURE])
+    presets.write_text(text[:found.start()] + found.group(1) + f'"{features}"' + text[found.end():], encoding="utf-8", newline="")
+    try:
+        export_fn(godot, preset, out_exe)
+    finally:
+        presets.write_bytes(before)
+
+
+def channel_doc(text, channel):
+    """A doc as the channel ships it: dev-build parts kept without their marks, or cut."""
+    if channel == "dev":
+        return DEV_INLINE.sub(r"\1", DEV_BLOCK.sub(r"\1", text))
+    return DEV_INLINE.sub("", DEV_BLOCK.sub("", text))
 
 
 def export(godot, preset, out_exe):
@@ -259,29 +330,62 @@ def gather_addons(args):
     return out
 
 
-def package(godot, platform, version, addons=()):
+# Files a modeller's folder can hold for a model: the models themselves, and what a .gltf points at.
+MODEL_FILES = (".glb", ".gltf", ".bin", ".png", ".jpg", ".jpeg", ".webp", ".ktx2")
+
+
+def bundled_models(folder):
+    """The model files in a --models folder (its top level only, as Zenith reads it), sorted."""
+    folder = pathlib.Path(folder)
+    if not folder.is_dir():
+        sys.exit(f"--models {folder}: no such folder")
+    files = sorted(p for p in folder.iterdir()
+                   if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in MODEL_FILES)
+    if not any(p.suffix.lower() in (".glb", ".gltf") for p in files):
+        sys.exit(f"--models {folder}: no .glb or .gltf files in it")
+    return files
+
+
+def package(godot, platform, version, addons=(), channel="public", models=()):
     preset, exe = PRESETS[platform]
-    folder = ROOT / "dist" / f"Zenith-{version}-{platform}{'-unsupported' if platform in UNSUPPORTED else ''}"
+    dev = channel == "dev"
+    folder = ROOT / "dist" / f"Zenith-{version}{'-dev' if dev else ''}-{platform}{'-unsupported' if platform in UNSUPPORTED else ''}"
     if folder.exists():
         shutil.rmtree(folder)
-    if platform == "macos":
-        export_with_etc2(godot, preset, folder / exe)
+    export_fn = export_with_etc2 if platform == "macos" else export
+    if dev:
+        with_dev_feature(godot, preset, folder / exe, export_fn)
     else:
-        export(godot, preset, folder / exe)
+        export_fn(godot, preset, folder / exe)
+    if platform == "windows":
+        dll = ROOT / "client" / "native" / "bin" / NATIVE_DLL
+        print(f"  native belt simulation: {'in the download' if (folder / NATIVE_DLL).exists() else 'not exported'}"
+              f"{'' if dll.exists() else ' (no ' + NATIVE_DLL + ' in client/native/bin: belt_sim.gd only)'}")
     shutil.copytree(MOD, folder / "mod" / "factorio-3d-bridge",
                     ignore=shutil.ignore_patterns("__pycache__", ".DS_Store", "Thumbs.db"))
     (folder / "server").mkdir()
     for name in SERVER_FILES:
         shutil.copy2(ROOT / "server" / name, folder / "server" / name)
-    for src, dst in DOCS:
-        shutil.copy2(ROOT / src, folder / dst)
+    for src, dst in DOCS + (DEV_DOCS if dev else []):
+        if src.endswith(".md"):
+            text = (ROOT / src).read_bytes().decode("utf-8")  # its own line endings kept
+            (folder / dst).write_text(channel_doc(text, channel), encoding="utf-8", newline="")
+        else:
+            shutil.copy2(ROOT / src, folder / dst)
     shown = "Zenith.app" if platform == "macos" else exe
-    (folder / "START HERE.txt").write_text(START_HERE.format(version=version, exe=shown), encoding="utf-8")
+    start = START_HERE.format(version=version, exe=shown) + (START_HERE_DEV if dev else "")
+    (folder / "START HERE.txt").write_text(start, encoding="utf-8")
     if platform in UNSUPPORTED:
         what, body = UNSUPPORTED[platform]
         (folder / "UNSUPPORTED.txt").write_text(UNSUPPORTED_HEAD.format(version=version, what=what) + body, encoding="utf-8")
     (folder / "models").mkdir()
-    (folder / "models" / "README.txt").write_text(MODELS_README, encoding="utf-8")
+    for p in models:
+        shutil.copy2(p, folder / "models" / p.name)
+    count = sum(1 for p in models if p.suffix.lower() in (".glb", ".gltf"))
+    if count:
+        print(f"  {count} model(s) in models/")
+    (folder / "models" / "README.txt").write_text(MODELS_README + (MODELS_BUNDLED.format(count=count) if count else ""),
+                                                  encoding="utf-8")
     (folder / "addons").mkdir()
     (folder / "addons" / "README.txt").write_text(ADDONS_README, encoding="utf-8")
     for name, data, _, _ in addons:
@@ -315,8 +419,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--godot", default=default_godot())
     parser.add_argument("--platform", choices=list(PRESETS) + ["supported", "unsupported", "all"], default="windows")
+    parser.add_argument("--channel", choices=CHANNELS, default="public",
+                        help="public (the release; no testing tools) or dev (development builds: the performance test and debug menu)")
     parser.add_argument("--addon", action="append", default=[], help="a local add-on folder to bundle, :off for off (repeatable)")
     parser.add_argument("--no-addons", action="store_true", help="bundle no add-ons")
+    parser.add_argument("--models", help="a folder of a modeller's models to put in the download's models/ folder")
     args = parser.parse_args()
     version = json.loads((MOD / "info.json").read_text())["version"]
     # The game shows its version from project.godot: a download must say the same as its mod.
@@ -325,9 +432,10 @@ def main():
         sys.exit(f"client/project.godot config/version ({shown.group(1) if shown else 'missing'}) "
                  f"doesn't match the mod's info.json ({version}): set both to the release's version")
     groups = {"all": list(PRESETS), "supported": SUPPORTED, "unsupported": list(UNSUPPORTED)}
+    models = bundled_models(args.models) if args.models else []
     addons = gather_addons(args)
     for platform in groups.get(args.platform, [args.platform]):
-        package(args.godot, platform, version, addons)
+        package(args.godot, platform, version, addons, args.channel, models)
 
 
 if __name__ == "__main__":

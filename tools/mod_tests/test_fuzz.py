@@ -65,6 +65,8 @@ g.package.path = str(MOD / "?.lua") + ";" + g.package.path
 lua.execute((MOD / "control.lua").read_text())
 # As in Factorio, `require` works only while control.lua is being loaded (a module requiring another
 # from inside a function stops the game).
+# The barrier round each step (barrier.lua) would swallow what these tests are here to catch.
+lua.execute('package.loaded["scripts.barrier"].rethrow = true')
 lua.execute('require = function(name) error("Require can not be used outside of control.lua parsing: " .. tostring(name)) end')
 F = g.F
 
@@ -151,8 +153,12 @@ def note_errors(msgs, cmd):
             bridge_errors.setdefault(cmd, set()).add(m["text"].split("\n")[0][:160])
 
 
+# The second half of the rounds the client simulates belts (`bs`: belt_sim.lua instead of bi).
+BS = {"on": False}
+
+
 def hello(sid="fuzz", w=1):
-    send({"t": "hello", "v": 1, "sid": sid, "w": w})
+    send({"t": "hello", "v": 1, "sid": sid, "w": w, "bl": 1, "bs": 1 if BS["on"] else 0})
 
 
 def main():
@@ -173,6 +179,9 @@ def main():
     take()
 
     for i in range(args.rounds):
+        if i == args.rounds // 2:
+            BS["on"] = True
+            hello()
         kind = rng.random()
         if kind < 0.75:
             msg = command(rng)
@@ -191,8 +200,17 @@ def main():
                 hello()  # the real client takes the session back, so the next commands count
             elif pick == "resync":
                 send({"t": "resync", "full": rng.choice([0, 1, junk(rng)]), "c": junk(rng)})
-            elif pick == "sub":
+            elif pick == "sub" and rng.random() < 0.5:
                 send({"t": "sub", "c": [[rng.randint(-50, 50), rng.randint(-50, 50)] for _ in range(rng.randint(0, 40))]})
+            elif pick == "sub":
+                # A square (world.lua subscribe_square), sometimes with junk in its middle, reach or rows.
+                o = [rng.randint(-3, 3), rng.randint(-3, 3)]
+                r = rng.choice([0, 2, 5, 50, 1e9, -4, junk(rng)])
+                rows = [[o[1] + dy] + [v for _ in range(rng.randint(0, 3)) for v in (rng.randint(-60, 60), rng.choice([1, 3, 101, 0, -2, 1e9]))]
+                        for dy in range(-5, 6) if rng.random() < 0.7]
+                if rng.random() < 0.2:
+                    rows.append(junk(rng))
+                send({"t": "sub", "o": rng.choice([o, o, o, junk(rng)]), "r": r, "w": rng.choice([rows, rows, rows, junk(rng)])})
             else:
                 msg = command(rng)
                 for _ in range(3):

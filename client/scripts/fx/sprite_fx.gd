@@ -5,6 +5,7 @@ extends Node3D
 ## without one each sheet is a soft procedural blob.
 
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
+const MomentHold := preload("res://scripts/world/moment_hold.gd")
 const MIX_SHADER := preload("res://shaders/fx_sprite.gdshader")
 const ADD_SHADER := preload("res://shaders/fx_sprite_add.gdshader")
 
@@ -26,6 +27,14 @@ const SHEETS := {
 	"artillery-flash": ["artillery-cannon-muzzle-flash/muzzle-flash.png", 276, 382, 21, false, false, 8, false, 0.0, 0.2],
 	"flame-stream": ["flamethrower-fire-stream/flamethrower-explosion.png", 124, 108, 36, false, false, 400, false, 0.05, 0.25],
 	"flame-muzzle": ["flamethrower-turret/flamethrower-turret-muzzle-fire.png", 16, 30, 32, true, true, 24, false, 0.0, 0.3],
+	# A rocket launch (rockets.gd), its cards held in place. The hole's pictures are squared up to
+	# lie flat on the ground.
+	"rocket-jet": ["rocket-silo/rocket-jet.png", 290, 288, 8, true, true, 8, false, 0.0, 0.0],
+	"rocket-glare": ["rocket-silo/03-rocket-over-glare.png", 481, 481, 1, true, false, 8, false, 0.0, 0.0],
+	"silo-hole": ["rocket-silo/01-rocket-silo-hole.png", 400, 400, 1, false, false, 8, true, 0.0, 0.0],
+	"silo-hole-light": ["rocket-silo/01-rocket-silo-hole-light.png", 400, 400, 1, true, false, 8, true, 0.0, 0.0],
+	"rocket-smoke": ["rocket-silo/12-rocket-smoke.png", 80, 286, 24, false, true, 20, false, 0.0, 0.0],
+	"silo-light": ["rocket-silo/07-red-lights-back/red-light.png", 32, 32, 1, true, false, 44, false, 0.0, 0.0],
 }
 
 
@@ -214,7 +223,7 @@ func _process(delta: float) -> void:
 			pool.material.set_shader_parameter("brightness", brightness)
 		if pool.cards.is_empty() and pool.shown == 0:
 			continue
-		_step(pool, delta)
+		_step(pool, 0.0 if MomentHold.on else delta)  # a screenshot's moment: effects hold where they are
 	process_usec = Time.get_ticks_usec() - t0
 
 

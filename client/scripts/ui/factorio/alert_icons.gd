@@ -7,6 +7,7 @@ extends Node3D
 ## alerts.gd makes this and feeds it the mod's alert lists (the nearest of each kind).
 
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const InterfaceState := preload("res://scripts/ui/interface_state.gd")
 ## Cut out with the depth test on: hidden behind buildings in front, and no blending order to swap
 ## (blended, they flickered against each other and the no-power icons). Shown with or without Alt-mode.
 const IconShader := preload("res://shaders/billboard_icon_cut.gdshader")
@@ -33,6 +34,8 @@ var placed := {}
 
 
 func _ready() -> void:
+	add_to_group(InterfaceState.GROUP)
+	InterfaceState.follow(self)
 	var quad := QuadMesh.new()
 	quad.size = Vector2.ONE
 	for kind in DRAWN:
@@ -52,6 +55,11 @@ func _ready() -> void:
 		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		add_child(mmi)
 		_meshes[kind] = mmi
+
+
+## Gone while the interface is hidden, by whatever hid it (interface_state.gd), on every surface.
+func _process(_delta: float) -> void:
+	InterfaceState.follow(self)
 
 
 ## lists: kind -> [{"position", "si", "unit", ...}]; si: the character's surface (0: unknown, draw all).

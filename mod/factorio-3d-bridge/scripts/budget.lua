@@ -16,6 +16,7 @@
 
 local transport = require("scripts.transport")
 local profile = require("scripts.profile")
+local photo = require("scripts.photo")
 
 local M = {}
 
@@ -53,6 +54,11 @@ function M.begin()
   for k in pairs(b.jobs) do
     b.jobs[k] = 0
   end
+end
+
+-- The budget, units a tick.
+function M.limit()
+  return state().limit
 end
 
 -- Units left this tick. With `job` and `share` (0-1), also no more than that share of the budget
@@ -189,8 +195,9 @@ function M.finish()
     local ok, n = pcall(queues[name])
     q[name] = ok and math.floor(tonumber(n) or 0) or 0
   end
+  -- ph: photo mode is on (photo.lua), so the client knows its screenshot is loading faster.
   transport.send_now({ t = "wb", b = b.limit, avg = math.floor(b.sum / b.n + 0.5), max = b.max, over = b.over,
-    n = b.n, q = q })
+    n = b.n, q = q, ph = photo.on() and 1 or nil })
   b.sum, b.n, b.max, b.over = 0, 0, 0, 0
 end
 
@@ -214,7 +221,8 @@ function M.report()
     local ok, n = pcall(queues[name])
     parts[#parts + 1] = name .. " " .. (ok and tostring(n) or "?")
   end
-  return { string.format("[Zenith] work budget %d units a tick; queues: %s", b.limit, table.concat(parts, ", ")) }
+  return { string.format("[Zenith] work budget %d units a tick; queues: %s%s", b.limit, table.concat(parts, ", "),
+    photo.on() and " (photo mode: a screenshot is loading its chunks)" or "") }
 end
 
 return M

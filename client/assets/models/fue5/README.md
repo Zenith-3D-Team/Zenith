@@ -16,7 +16,7 @@ removed, decimated to the client's triangle budget, and every texture baked into
 
 | File | FUE5 source |
 |---|---|
-| `electric-furnace.glb` | `STRUCTURES/electric-furnace/static.fbx`, its fans from `animated1.fbx` |
+| `electric-furnace.glb` | `STRUCTURES/electric-furnace/static.fbx`, its fans from `animated1.fbx`; then `tools/models/fue5_furnace.py`: the chimney and fan cans squashed to the sprite's height, a grille box added in FUE5's own atlas, the heater loops lit only while it works, the atlas graded towards Factorio's colours |
 | `rocket-silo.glb` | `STRUCTURES/rocket-silo/static.fbx` (its ring on the ground; FUE5 sinks the hatch into a hole in its ground, so the hatch is raised to just over it, cut into two doors, over a dark pit floor; the pointed pod in its south-west corner left out) |
 | `locomotive.glb` | `VEHICLES/locomotive/static.fbx` (its wheel sets as moving parts) |
 | `oil-refinery.glb` | `STRUCTURES/oil-refinery/static.fbx` |
@@ -31,9 +31,9 @@ removed, decimated to the client's triangle budget, and every texture baked into
 | `centrifuge.glb`, `steam-turbine.glb` | `STRUCTURES/<name>/static.fbx`, their rotors and fan from `animated1.fbx` |
 | `electric-mining-drill.glb` | `STRUCTURES/electric-mining-drill/static.fbx`, `animated1.fbx` (the turning drill) and `animated2.fbx` |
 | `cargo-wagon.glb`, `fluid-wagon.glb` | `VEHICLES/<name>/static.fbx` (their wheel sets as moving parts) |
-| `boiler*.glb`, `chemical-plant*.glb`, `pumpjack*.glb` (and `-east`, `-south`, `-west`) | `STRUCTURES/<name>/static.fbx` (the pumpjack with `animated1.fbx` at rest), turned for each direction |
+| `boiler.glb`, `chemical-plant.glb`, `pumpjack.glb` | `STRUCTURES/<name>/static.fbx` (the pumpjack with `animated1.fbx` at rest); one model, which Zenith turns to each direction |
 | `rocket-silo-rocket.glb` | `VEHICLES/rocket/static.fbx`, stretched to Factorio's height (2.89x up, 1.40x across: FUE5's rocket is 5.9 tiles tall, Factorio's 16.9) |
-| `steam-engine.glb`, `steam-engine-east.glb` | `STRUCTURES/steam-engine/static.fbx`, `animated1.fbx` (its wheels turning), `animated2.fbx` |
+| `steam-engine.glb` | `STRUCTURES/steam-engine/static.fbx`, `animated1.fbx` (its wheels turning), `animated2.fbx`; turned to each direction |
 
 Sizes: each model is then matched to the size of our model it replaces (`fue5.py` `our_size`, an
 axis more than 8% off, all axes alike when that is enough, never narrower than 0.9 of its footprint);

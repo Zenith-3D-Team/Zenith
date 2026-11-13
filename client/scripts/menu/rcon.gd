@@ -54,8 +54,9 @@ func open(tree: SceneTree, port: int, password: String) -> bool:
 	return false
 
 
-## Runs a console command; its reply ("" if none came in time, or on error).
-func run(tree: SceneTree, command: String) -> String:
+## Runs a console command; its reply ("" if none came in time, or on error). A long command
+## (making ground, building the performance test's base) can wait longer than TIMEOUT_MSEC.
+func run(tree: SceneTree, command: String, timeout_msec := TIMEOUT_MSEC) -> String:
 	if not is_open():
 		error = "RCON not connected"
 		return ""
@@ -63,7 +64,7 @@ func run(tree: SceneTree, command: String) -> String:
 	var id := _next_id
 	_send(id, EXEC, command)
 	while true:
-		var packet: Array = await _read(tree)
+		var packet: Array = await _read(tree, timeout_msec)
 		if packet.is_empty():
 			return ""
 		if int(packet[0]) == id:
@@ -90,9 +91,9 @@ func _send(id: int, kind: int, body: String) -> void:
 
 
 ## The next packet as [id, type, body], or [] after the timeout or when the connection drops.
-func _read(tree: SceneTree) -> Array:
+func _read(tree: SceneTree, timeout_msec := TIMEOUT_MSEC) -> Array:
 	var started := Time.get_ticks_msec()
-	while Time.get_ticks_msec() - started < TIMEOUT_MSEC:
+	while Time.get_ticks_msec() - started < timeout_msec:
 		_tcp.poll()
 		if _tcp.get_status() != StreamPeerTCP.STATUS_CONNECTED:
 			return []

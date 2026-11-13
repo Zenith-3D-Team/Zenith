@@ -44,8 +44,12 @@ extends Node
 ## odd EPOCH, so it stays small and precise in a long game; each new epoch every state is moved
 ## onto it, a few groups a frame, before the older clock starts again.
 
+## A rocket silo's `st`: the doors open from the first (rockets.gd), and the second shuts them.
+const SILO_OPENING := 2
+const SILO_CLOSING := 5
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
+const MomentHold := preload("res://scripts/world/moment_hold.gd")
 
 ## Entity types the mod reports working states for (ANIMATED_TYPES in the mod's registry.lua).
 ## Others (turrets, chests) count as always working for their glow.
@@ -55,11 +59,19 @@ const STATE_TYPES := {
 	"offshore-pump": true, "beacon": true, "burner-generator": true, "fusion-reactor": true,
 	"fusion-generator": true, "agricultural-tower": true, "asteroid-collector": true, "lamp": true,
 	"thruster": true, "rail-signal": true, "rail-chain-signal": true, "accumulator": true,
-	"power-switch": true,
+	"power-switch": true, "splitter": true, "lane-splitter": true,
 }
+## `st`'s state for a belt or loader switched off by the circuit network (the mod's belt_switch.lua).
+## What can be switched off, and an instance's custom data while its surface stands still (the model
+## shader's BELT_OFF; a glowing model's instances say so with flag 8 of their timed data).
+const SWITCHED_OFF := 5
+const SWITCHABLE_TYPES := {"transport-belt": true, "loader": true, "loader-1x1": true}
+const BELT_STOPPED := Color(0.0, 0.0, 5.0, 0.0)
 ## Chunks whose nearest edge is within this many tiles of the camera's focus have their turrets,
 ## collectors, worms, hatches, doors and gates looked after.
 const RADIUS := 40.0
+## Turrets are looked after further out, as a fight is seen from well past RADIUS.
+const TURRET_RADIUS := 96.0
 ## Parts of an asteroid collector's arm (collectors.gd moves them).
 const COLLECTOR_PREFIX := "reach_collector_"
 ## Full speed by part kind, turns per second, close to Factorio's animation loops (an electric
@@ -80,10 +92,9 @@ const ALWAYS_MOVING := {"cargo-landing-pad": true}
 ## Overrides by model name.
 const MODEL_SPEEDS := {"burner-mining-drill": 0.9, "burner-mining-drill-east": 0.9, "burner-mining-drill-south": 0.9,
 	"burner-mining-drill-west": 0.9}
-## Parts that move whenever the entity is drawn: a splitter's gear wheels, cranks and rack, as
-## its structure animates with the belt, which always runs; a fish's tail.
-const ALWAYS_ON := {"spin_gear": true, "crank_split_wa": true, "crank_split_wb": true, "crank_split_ea": true,
-	"crank_split_eb": true, "slide_split_rack": true, "tail_fish": true}
+## Parts that move whenever the entity is drawn: a fish's tail. (A splitter's gear wheels, cranks
+## and rack move while items pass through it, from the mod's `st`.)
+const ALWAYS_ON := {"tail_fish": true}
 const DEFAULT_SPIN := 0.5
 ## Seconds to get about two thirds of the way to full speed, or to a stop (the shader's ANIM_*).
 const SPIN_UP := 0.35
@@ -153,6 +164,8 @@ const MOTION_BOB := 4
 const MOTION_LIT := 5
 const MOTION_LINEAR := 6
 const MOTION_FADE := 7
+## A modeller's baked (skeletal) animation, played from its bones' texture (model_skin.gd).
+const MOTION_BAKED := 8
 const WAVES := {"out": 0, "swing": 1, "spin": 2}
 ## What this node does with a Group (Group.kind).
 const KIND_GLOW := 0  # a glowing model's instances: written when the working state changes
@@ -217,6 +230,7 @@ class Group:
 class State:
 	var started := false  # the motion and glow below are set
 	var always := false  # parts that move whether or not it works (ALWAYS_ON, ALWAYS_MOVING)
+	var rollers: State  # a splitter's rollers: its belts always run, its gears only as items pass
 	var stateful := true
 	var on := false
 	var glowing := false
@@ -267,6 +281,8 @@ var movers: Node
 var turrets: Node
 ## collectors.gd: asteroid collectors' arms (main.gd sets it).
 var collectors: Node
+## rockets.gd: a launch holds its silo's doors open.
+var rockets: Node
 ## Instances' states written (place, state changes, migration) and the microseconds that took,
 ## for probes and tests.
 var writes := 0
@@ -320,7 +336,7 @@ static func kind_of(group: Group) -> int:
 		return KIND_STILL
 	if kind.begins_with(COLLECTOR_PREFIX):
 		return KIND_COLLECTOR
-	if ModelLibrary.CYCLES.has(kind):
+	if ModelLibrary.CYCLES.has(kind) or kind == "baked":
 		return KIND_TIMED
 	if ModelLibrary.HATCHES.has(kind):
 		return KIND_HATCH
@@ -357,7 +373,11 @@ static func setup_part(part: ModelLibrary.AnimPart) -> void:
 	fake.part = part
 	match kind_of(fake):
 		KIND_TIMED:
-			if ModelLibrary.CYCLES.has(kind):
+			if kind == "baked":
+				# One loop of the action a second at full speed is 1 / its length.
+				motion = MOTION_BAKED
+				part.rate = 1.0 / maxf(float(part.bake.get("duration", 1.0)), 0.01)
+			elif ModelLibrary.CYCLES.has(kind):
 				var c: Dictionary = ModelLibrary.CYCLES[kind]
 				motion = MOTION_CYCLE
 				part.rate = 1.0 / float(c.get("period", 1.0))
@@ -413,7 +433,10 @@ static func setup_part(part: ModelLibrary.AnimPart) -> void:
 			continue
 		m.set_shader_parameter("anim_mode", motion)
 		m.set_shader_parameter("anim_wave", wave)
-		m.set_shader_parameter("anim_rate", part.rate if motion < MOTION_LIT else 0.0)
+		m.set_shader_parameter("anim_rate", part.rate if motion < MOTION_LIT or motion == MOTION_BAKED else 0.0)
+		if motion == MOTION_BAKED:
+			m.set_shader_parameter("bake_tex", part.bake["tex"])
+			m.set_shader_parameter("bake_frames", int(part.bake["frames"]))
 		m.set_shader_parameter("anim_amount", amount)
 		m.set_shader_parameter("anim_slide", part.slide)
 		m.set_shader_parameter("anim_axis", axis)
@@ -430,6 +453,21 @@ static func setup_part(part: ModelLibrary.AnimPart) -> void:
 		for s in steps + 1:
 			box = box.merge(part.turned(lerpf(range_lo, range_hi, float(s) / steps)) * rest)
 		(part.mesh as ArrayMesh).custom_aabb = box.grow(0.05)
+
+
+## Belts and loaders always run (their surfaces always scroll): a modeller's baked animation (its
+## rollers) does too. A splitter's structure moves only while items pass through it (the mod's `st`,
+## as Factorio's structure_animation_movement_cooldown), but its belts always run.
+static func _always_baked(part: ModelLibrary.AnimPart) -> bool:
+	if part.kind != "baked":
+		return false
+	return _splitter_roller(part) or ((part.model.contains("belt") or part.model.contains("loader")) and not part.model.contains("splitter"))
+
+
+## A roller of a modeller's splitter: it runs when the splitter's other parts don't, so it has a
+## motion of its own (State.rollers).
+static func _splitter_roller(part: ModelLibrary.AnimPart) -> bool:
+	return part.kind == "baked" and part.roller and part.model.contains("splitter")
 
 
 ## Turns a second at full speed of a spinning part kind on a model.
@@ -489,8 +527,8 @@ func _write(group: Group, i: int, working: Dictionary) -> void:
 	var custom: Color
 	match group.kind:
 		KIND_GLOW, KIND_TIMED:
-			var always := part != null and (ALWAYS_ON.has(part.kind) or ALWAYS_MOVING.has(part.model))
-			var st := _motion(key, unit, always, group.stateful[i] == 1, working)
+			var always := part != null and (ALWAYS_ON.has(part.kind) or ALWAYS_MOVING.has(part.model) or _always_baked(part))
+			var st := _motion(key, unit, always, group.stateful[i] == 1, working, part != null and _splitter_roller(part))
 			if st.at < start:
 				st.change(start, st.on, st.glowing)  # the same motion, on the current clock
 			var loops := 0.0
@@ -499,7 +537,7 @@ func _write(group: Group, i: int, working: Dictionary) -> void:
 				if ModelLibrary.CYCLES.has(part.kind) and ModelLibrary.CYCLES[part.kind].get("scatter", false):
 					scatter = float(hash(key) & 0xff) / 256.0  # starts out of step
 				loops = fposmod(part.rate * st.dist + part.phase + scatter, 1.0)
-			var flags := (1 if st.on else 0) + parity + (4 if st.glowing else 0)
+			var flags := (1 if st.on else 0) + parity + (4 if st.glowing else 0) + (8 if int(working.get(unit, 0)) == SWITCHED_OFF else 0)
 			custom = Color(st.at - start, loops, -(1.0 + flags + minf(st.speed, 0.999)), st.glow)
 		KIND_LIT:
 			var st := _state(key)
@@ -535,23 +573,29 @@ func _state(key) -> State:
 
 ## An entity's motion and glow, aimed at its working state now (eased on from where they were
 ## when that changed). Seen for the first time, its parts start from rest and its glow at its goal.
-func _motion(key, unit: int, always: bool, stateful: bool, working: Dictionary) -> State:
+func _motion(key, unit: int, always: bool, stateful: bool, working: Dictionary, rollers := false) -> State:
 	var st := _state(key)
+	if rollers:
+		if st.rollers == null:
+			st.rollers = State.new()
+		st = st.rollers
 	var state := int(working.get(unit, 0))
 	if not st.started:
 		st.started = true
 		st.always = always
 		st.stateful = stateful
 		st.at = _time
-		st.on = always or state == 1
+		st.on = (always or state == 1) and state != SWITCHED_OFF
 		st.glowing = not stateful or state == 1
 		st.glow = 1.0 if st.glowing else 0.0
 		return st
 	st.always = st.always or always
-	var on := st.always or state == 1
+	var on := (st.always or state == 1) and state != SWITCHED_OFF
 	var glowing := not st.stateful or state == 1
 	if on != st.on or glowing != st.glowing:
 		st.change(_time, on, glowing)
+		if st.always:
+			st.speed = 1.0 if on else 0.0  # a belt stops and starts dead, with no coasting
 	return st
 
 
@@ -658,7 +702,8 @@ func _migrate_some() -> void:
 
 
 func _process(delta: float) -> void:
-	_time += delta
+	if not MomentHold.on:
+		_time += delta  # a screenshot's moment: every moving part stands still
 	_update_clock()
 	if world == null:
 		return
@@ -669,17 +714,21 @@ func _process(delta: float) -> void:
 	var focus: Vector2 = world.focus()
 	var timing := Probing.on
 	var spent := {}  # KIND_* -> microseconds this frame (world.prof, for --stutter-probe)
-	var lo := Vector2i(floori((focus.x - RADIUS) / 32.0), floori((focus.y - RADIUS) / 32.0))
-	var hi := Vector2i(floori((focus.x + RADIUS) / 32.0), floori((focus.y + RADIUS) / 32.0))
+	var lo := Vector2i(floori((focus.x - TURRET_RADIUS) / 32.0), floori((focus.y - TURRET_RADIUS) / 32.0))
+	var hi := Vector2i(floori((focus.x + TURRET_RADIUS) / 32.0), floori((focus.y + TURRET_RADIUS) / 32.0))
 	for cy in range(lo.y, hi.y + 1):
 		for cx in range(lo.x, hi.x + 1):
 			var cv = world.chunks.get(Vector2i(cx, cy))
 			if cv == null or cv.anim_groups.is_empty():
 				continue
 			var rect := Rect2(Vector2(cx, cy) * 32.0, Vector2(32.0, 32.0))
-			if focus.clamp(rect.position, rect.end).distance_to(focus) > RADIUS:
+			var dist := focus.clamp(rect.position, rect.end).distance_to(focus)
+			if dist > TURRET_RADIUS:
 				continue
+			var near := dist <= RADIUS
 			for group: Group in cv.anim_groups:
+				if not near and group.kind != KIND_TURRET:
+					continue
 				if group.kind < KIND_WORM or group.kind == KIND_STILL or group.kind == KIND_TIMED or group.kind == KIND_LIT or group.kind == KIND_SWITCH:
 					continue
 				var t0 := Time.get_ticks_usec() if timing else 0
@@ -738,8 +787,22 @@ func _hatch(group: Group, delta: float) -> void:
 	var h: Dictionary = ModelLibrary.HATCHES[group.part.kind]
 	for i in group.keys.size():
 		var base := group.bases[i]
-		var near: bool = movers != null and not movers.pick(Vector2(base.origin.x, base.origin.z), h.get("reach", 2.0), h["types"]).is_empty()
+		var at := Vector2(base.origin.x, base.origin.z)
+		var near: bool = movers != null and not movers.pick(at, h.get("reach", 2.0), h["types"]).is_empty()
+		if group.part.kind.begins_with("door_silo"):
+			near = _silo_open(int(group.units[i]), at, near)
 		_set_open(group, i, _state(group.keys[i]), near)
+
+
+## A silo's doors go by where its rocket is (`st`, rockets.gd), and stay open for a launch still in
+## the shaft. A bridge that doesn't say keeps them open while a rocket stands there (`rocket_near`).
+func _silo_open(unit: int, at: Vector2, rocket_near: bool) -> bool:
+	if rockets != null and rockets.in_shaft(at):
+		return true
+	var phase := int(world.working.get(unit, 0)) if world != null else 0
+	if phase >= SILO_OPENING:
+		return phase != SILO_CLOSING
+	return rocket_near
 
 
 ## Sets instance i's transform, only when it changed (an idle turret's head or folded arm stays put).

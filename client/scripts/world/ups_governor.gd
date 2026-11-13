@@ -17,6 +17,16 @@ extends Node
 ## anything is asked: a big request (a map zoom, a jump, another planet's remote view) is worked
 ## through within that budget, so it can't make a slow tick when it comes, it only fills in more
 ## slowly. Reacting once the UPS has dropped would be too late for those (the owner's point).
+##
+## The bridge's first load of the belts round the focus (`bs` with `ld` while the square it has
+## loaded is under BIG_LOAD of the belt item distance when it starts: joining, a jump; it lasts until
+## `ld` clears) is a burst, not the game's steady cost: while it lasts, and AFTER_LOAD seconds after (the
+## readings still hold it, and the client's own join, chunks and movers, goes on a few seconds), no step
+## is taken (measured on Zenith Test at 160 tiles: the load's dip took the bridge to rate level 3, an
+## update every 48 ticks, and the 10 s reading at 59.0-59.4 after it never brought it back), the
+## budget is cut no lower than BUDGET_LOAD_FLOOR (the load is paced by it: at the floor it took
+## minutes), and when it ends the budget is back at its default at least (else the bridge's own bound,
+## a share of the budget, cut the square it had just loaded).
 
 const BeltCaps := preload("res://scripts/world/belt_lanes.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
@@ -55,7 +65,7 @@ const LABELS := {"map": "minimap refreshes %s× apart", "entity": "entity distan
 	"rate": "updates slowed to level %s"}
 
 const LOW := 57.0  # UPS under this, for HOLD_DOWN seconds, takes a step down
-const HIGH := 59.5  # UPS at or over this, for hold_up seconds, takes one back
+const HIGH := 59.0  # UPS at or over this (the 10 s reading), for hold_up seconds, takes one back
 const WINDOW := 3.0  # seconds the UPS is measured over for stepping down
 const LONG_WINDOW := 10.0  # and for stepping back up: a 3 s reading at 60 dips under 59.5 now and then
 const HOLD_DOWN := 2.0
@@ -82,10 +92,20 @@ const NO_GAIN_RETRY := 300.0  # and nothing is held back for this long
 const BUDGET_DEFAULT := 300
 const BUDGET_FLOOR := 60
 const BUDGET_MAX := 600
+## While a screenshot loads its chunks (photo, full_detail.gd cover) the budget may grow to this, by
+## the same rule (only while the game holds HIGH and work waits), and is cut the same way: the shot
+## is a loading screen, the bridge's photo mode gives chunks most of it (photo.lua). Back at
+## BUDGET_MAX at once when the shot ends.
+const BUDGET_PHOTO_MAX := 1200
 const BUDGET_EVERY := 0.5
 const BUDGET_TIGHT := 58.5
 const BUDGET_CUT := 0.7
 const BUDGET_GROW := 1.2
+## The first load (see the top): how much of the belt item distance loaded still counts as one, the
+## seconds after it before the UPS is judged again, and the budget's floor meanwhile.
+const BIG_LOAD := 0.75
+const AFTER_LOAD := 8.0
+const BUDGET_LOAD_FLOOR := 150
 
 signal budget_changed(units: int)
 
@@ -114,6 +134,13 @@ var budget := BUDGET_DEFAULT
 var queued := 0
 var _budget_sent := -1
 var _budget_for := 0.0
+## The bridge is making a first load now (see the top), and seconds since one ended. `loading_probe`
+## (tests) says it instead of the belt lanes' layer (the sibling BeltLanes: its bridge_loading, the
+## square covered, the belt item distance).
+var loading := false
+var loading_probe: Callable
+var lanes: Node = null
+var _since_load := 1e9
 
 
 func _ready() -> void:
@@ -149,7 +176,16 @@ func reset() -> void:
 
 
 ## The value to use for a knob whose player's setting is `wanted`: no more than the steps taken.
+## Full detail (full_detail.gd, a screenshot): nothing is held back, by the governor or an add-on's
+## lighter updates, while it lasts.
+static var lifted := false
+## A screenshot is loading its chunks (full_detail.gd cover): BUDGET_PHOTO_MAX.
+static var photo := false
+
+
 func limit(knob: String, wanted: float) -> float:
+	if lifted:
+		return wanted
 	wanted = AddonRequests.lighter(knob, wanted)  # an add-on's lighter updates (a timelapse), under the setting
 	if not _caps.has(knob):
 		return wanted
@@ -186,7 +222,9 @@ func _process(delta: float) -> void:
 	if q is Dictionary:
 		for v in q.values():
 			queued += int(v)
-	feed(Bridge.server_tick, delta)
+	# The newest tick read, not the last handled: at a low frame rate handling runs behind and catches up in
+	# bursts, which read as the game slowing down and speeding up.
+	feed(Bridge.newest_tick, delta)
 
 
 ## One frame's measurement: the server's latest tick and the frame's seconds. Separate from
@@ -201,8 +239,14 @@ func feed(tick: int, delta: float) -> void:
 		_samples.pop_front()
 	ups = _measure(WINDOW)
 	ups_long = _measure(LONG_WINDOW)
+	var was_loading := loading
+	loading = _big_load()
+	_since_load = 0.0 if loading else _since_load + delta
+	if was_loading and not loading and budget < BUDGET_DEFAULT:
+		budget = BUDGET_DEFAULT  # (sent by _keep_budget now: it differs from what was sent)
+		_budget_for = BUDGET_EVERY
 	_keep_budget(delta)
-	if not enabled or _ready_for < START_DELAY or ups <= 0.0:
+	if not enabled or _ready_for < START_DELAY or ups <= 0.0 or loading or _since_load < AFTER_LOAD:
 		_low_for = 0.0
 		_high_for = 0.0
 		return
@@ -237,12 +281,21 @@ func _keep_budget(delta: float) -> void:
 		return
 	_budget_for = 0.0
 	var want := budget
-	if not enabled:
+	if Settings.has_arg("--bridge-budget="):
+		# For recordings and tests: the budget pinned (the bridge's ceiling runs a big job in a tick or two, as if
+		# it weren't cut into slices; its default slices it).
+		want = int(Settings.arg_value("--bridge-budget="))
+	elif not enabled:
 		want = BUDGET_DEFAULT
+	elif not photo and budget > BUDGET_MAX:
+		want = BUDGET_MAX  # a screenshot's load is over
+	elif not loading and _since_load < AFTER_LOAD:
+		pass  # (the reading is still the load's)
 	elif ups > 0.0 and ups < BUDGET_TIGHT:
-		want = maxi(BUDGET_FLOOR, int(budget * BUDGET_CUT))
+		var floor_units := mini(budget, BUDGET_LOAD_FLOOR) if loading else BUDGET_FLOOR
+		want = maxi(floor_units, int(budget * BUDGET_CUT))
 	elif ups_long >= HIGH:
-		var top := BUDGET_MAX if queued > 0 else BUDGET_DEFAULT
+		var top := (BUDGET_PHOTO_MAX if photo else BUDGET_MAX) if queued > 0 else BUDGET_DEFAULT
 		if budget < top:
 			want = mini(top, int(budget * BUDGET_GROW) + 10)
 		elif budget > top:
@@ -251,6 +304,23 @@ func _keep_budget(delta: float) -> void:
 	if _budget_sent < 0 or absi(budget - _budget_sent) >= maxi(10, _budget_sent / 10):
 		_budget_sent = budget
 		budget_changed.emit(budget)
+
+
+## Whether the bridge is making a first load (see the top).
+func _big_load() -> bool:
+	if loading_probe.is_valid():
+		return bool(loading_probe.call())
+	if lanes == null or not is_instance_valid(lanes):
+		lanes = get_node_or_null("../BeltLanes")
+		if lanes == null:
+			return false
+	if lanes.get("bridge_loading") != true:
+		return false
+	if loading:
+		return true  # (one that started small lasts until `ld` clears)
+	var near := float(lanes.get("near"))
+	var square = lanes.get("covered")
+	return near > 0.0 and square is Vector3 and (square as Vector3).z < near * BIG_LOAD
 
 
 ## UPS over the last `window` seconds, or 0 while there aren't that many yet or the ticks stalled

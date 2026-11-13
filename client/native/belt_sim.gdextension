@@ -1,0 +1,9 @@
+; BeltSimNative (native/belt_sim/src): belt_sim.gd in C++, used by belt_items.gd when the library is
+; there. Without it Godot says it can't load this and belt_items.gd keeps belt_sim.gd.
+[configuration]
+entry_symbol = "belt_sim_library_init"
+compatibility_minimum = "4.5"
+
+[libraries]
+windows.debug.x86_64 = "res://native/bin/belt_sim.windows.template_release.x86_64.dll"
+windows.release.x86_64 = "res://native/bin/belt_sim.windows.template_release.x86_64.dll"

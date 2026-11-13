@@ -28,9 +28,12 @@ void vertex() {
 	}
 }
 
+global uniform float f3d_look_ground_specular;  // looks.gd "ground_specular"
+
 void fragment() {
 	vec4 c = texture(atlas, UV);
 	ALBEDO = c.rgb;
+	SPECULAR = 0.5 * f3d_look_ground_specular;
 	ALPHA = c.a;
 	ALPHA_SCISSOR_THRESHOLD = 0.4;
 	// Alpha to coverage with MSAA: the cut-out's edge is spread over the pixel's samples instead of

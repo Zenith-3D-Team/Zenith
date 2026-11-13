@@ -4,8 +4,8 @@ draw the model in Factorio's colours without projecting the sprite onto it at ru
 
     python tools/models/part_colors.py [names...] [--factorio DIR] [--debug DIR] [--check]
 
-Run it after anything that rewrites a .glb (build.py, wube.py, nature/build_nature.py), like
-projector_depth.py: the colours are stored in the .glb itself. Without names it does every model
+Run it after anything that rewrites a .glb (build.py, wube.py, nature/build_nature.py): the
+colours are stored in the .glb itself. Without names it does every model
 with an entry in client/data/sprite_projection.json (plus DONORS below).
 
 How a colour is chosen:

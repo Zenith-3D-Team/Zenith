@@ -1,4 +1,30 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.2.0
+Date: 2026-11-12
+  Features:
+    - Takes the client's view as a square of up to 101 x 101 chunks, sent as rows, and only touches the chunks that came or went (view distance up to 50 chunks).
+    - A screenshot can ask for every chunk its camera sees, and /f3d-debug hold slows the game to its slowest speed while one is taken (single-player too), back by itself if the client goes.
+    - /f3d-debug for the client's debug menu: the time of day, freezing it, the game's speed and pausing.
+    - Sends each planet's day length and time of day for the planets in a space platform's sky.
+  Bugfixes:
+    - A building by a chunk's edge sends again the decoratives of every chunk it covers, not only its own.
+---------------------------------------------------------------------------------------------------
+Version: 0.1.4
+Date: 2026-11-11
+  Features:
+    - Sends where a rocket silo's rocket is in its launch (doors, rising, lift-off), for the 3D client to draw Factorio's launch.
+    - Sends train stops' colours, and repaints as they happen.
+    - Sends which belts and loaders the circuit or logistic network switches off, so the client stops them; splitters count as working while items pass through.
+    - Things a script removes or makes without an event are caught: the chunks round the client are counted in turn and sent again when one changed.
+    - Mods' windows are only sent to clients that draw them.
+    - Sends where a cargo pod coming down will land, so the client drops it straight onto that spot.
+  Optimizations:
+    - A splitter's working check counts for what it costs in the work budget (it reads up to 8 lanes).
+  Bugfixes:
+    - A step or event handler of the bridge that fails is logged and listed in /f3d-status, and the game goes on.
+    - A save made with an older version of the bridge starts clean: its old clients and half-done jobs are dropped instead of failing.
+    - A belt round that was already cut short isn't cut again.
+---------------------------------------------------------------------------------------------------
 Version: 0.1.3
 Date: 2026-11-07
   Features:

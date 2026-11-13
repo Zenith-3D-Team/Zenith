@@ -37,6 +37,8 @@ var slot_index := 0
 static var spreading := false
 ## 0..1 draws a progress pie over the slot; below 0 none.
 var progress := -1.0
+## The item's picture, GUI pixels across (smaller slots draw it smaller).
+var icon_px := 32
 ## Drawn faintly while the slot is empty (e.g. GuiAssets.core_sprite("icons/mip/empty-gun-slot.png")).
 var empty_icon: Texture2D = null
 var tip_title := ""
@@ -160,7 +162,7 @@ func _gui_input(event: InputEvent) -> void:
 
 
 func _draw() -> void:
-	var icon_size := float(Kit.px(32))
+	var icon_size := float(Kit.px(icon_px))
 	var rect := Rect2((size - Vector2(icon_size, icon_size)) * 0.5, Vector2(icon_size, icon_size))
 	if blocked:
 		draw_rect(Rect2(Vector2.ZERO, size).grow(-Kit.px(2)), Color(0.75, 0.1, 0.1, 0.55))
@@ -225,17 +227,27 @@ static func draw_record_icons(on: CanvasItem, icons: Array, rect: Rect2, modulat
 func _draw_pie(done: float) -> void:
 	if done <= 0.0:
 		return
-	var c := size * 0.5
-	var r := size.length() * 0.5
-	var points := PackedVector2Array([c])
-	var steps := 32
-	for i in steps + 1:
-		var a := TAU * done * i / float(steps) - PI * 0.5
-		points.append(c + Vector2(cos(a), sin(a)) * r)
-	var clip := Rect2(Vector2.ZERO, size).grow(-Kit.px(2))
-	for i in points.size():
-		points[i] = points[i].clamp(clip.position, clip.end)
-	draw_colored_polygon(points, PIE_COLOR)
+	var points := pie_points(Rect2(Vector2.ZERO, size).grow(-Kit.px(2)), done)
+	var colors := PackedColorArray([PIE_COLOR, PIE_COLOR, PIE_COLOR])
+	for i in range(1, points.size() - 1):  # a fan: a sliver right after the top doesn't triangulate
+		draw_primitive(PackedVector2Array([points[0], points[i], points[i + 1]]), colors, PackedVector2Array())
+
+
+## The pie's outline in `rect`: the centre, the top, the corners passed, and where its edge meets the
+## side. Worked out exactly, so the edge sweeps evenly (points clamped to the square wobbled at the
+## corners from frame to frame).
+static func pie_points(rect: Rect2, done: float) -> PackedVector2Array:
+	var c := rect.get_center()
+	var half := rect.size * 0.5
+	var end := TAU * clampf(done, 0.0, 0.9999)
+	var points := PackedVector2Array([c, c + Vector2(0, -half.y)])
+	for corner in [Vector2(half.x, -half.y), half, Vector2(-half.x, half.y), -half]:
+		if fposmod(atan2(corner.x, -corner.y), TAU) < end:
+			points.append(c + corner)
+	var along := Vector2(sin(end), -cos(end))
+	var reach := minf(half.x / maxf(absf(along.x), 0.0001), half.y / maxf(absf(along.y), 0.0001))
+	points.append(c + along * reach)
+	return points
 
 
 func _make_custom_tooltip(_for_text: String) -> Object:

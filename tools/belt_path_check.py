@@ -9,12 +9,16 @@ base, cutting across curves, over splitters and undergrounds).
         records the belts there, every lane's line (get_line_item_position along it) and every
         item's place each tick: the truth the client's drawing is measured against; the belts and
         lanes --belt-margin (16) tiles further out, so a replay knows the belts its items go on to
-    python tools/belt_path_check.py check truth.json drawn.json [...] [--within x0,y0,x1,y1]
+    python tools/belt_path_check.py check truth.json drawn.json [...] [--within x0,y0,x1,y1] [--square-margin 4]
         compares where the client drew each item (client/tests/belt_path_replay.tscn or
         belt_stream_replay.tscn, or --belt-path-probe in the client against the same server) with the
         lanes: the distance from each drawn item to the nearest lane's centre line where items show,
-        items drawn over an underground's gap, and items hidden where they should show; --within
-        counts only drawn and game items inside that rectangle (a recording of part of what is drawn)
+        items drawn over an underground's gap, and items hidden where they should show. Only drawn
+        and game items inside the recorded area count (--within, else the area the truth was recorded
+        in), and of the game's items only those inside the square the client covered in that frame
+        (the probe's `covered`, else its `squares`), grown by --square-margin tiles: while walking the
+        client draws round a square that moves, much of it outside the area, and the area's items
+        away from the square aren't the client's to draw
 
 Positions are tiles; lanes and tracks are recorded in 1/256 tile, as the mod sends them.
 """
@@ -229,7 +233,7 @@ script.on_nth_tick(1, function()
   if t == r.to then
     local tracks = {}
     for uid, tr in pairs(r.tracks) do tracks[#tracks + 1] = {uid, tr} end
-    helpers.write_file("%(file)s", helpers.table_to_json({belts = r.belts, lanes = r.lanes, tracks = tracks}), false)
+    helpers.write_file("%(file)s", helpers.table_to_json({area = {%(x0)f, %(y0)f, %(x1)f, %(y1)f}, belts = r.belts, lanes = r.lanes, tracks = tracks}), false)
     storage.f3d_rec = nil
   end
 end)
@@ -311,9 +315,59 @@ def pct(values, p):
     return s[min(len(s) - 1, int(len(s) * p))]
 
 
-def check(truth_path, drawn_path, warmup=60, within=None):
+def recorded_area(truth):
+    """The area the truth's items were recorded in: its own (recordings since it was written), else
+    the extent of every item's track."""
+    if truth.get("area"):
+        return tuple(truth["area"])
+    x0 = y0 = math.inf
+    x1 = y1 = -math.inf
+    for _uid, l in truth["tracks"]:
+        for i in range(0, len(l), 4):
+            x, y = l[i + 1] / 256, l[i + 2] / 256
+            x0, y0, x1, y1 = min(x0, x), min(y0, y), max(x1, x), max(y1, y)
+    return (x0, y0, x1, y1)
+
+
+def covered_squares(drawn, margin):
+    """Per frame, the rectangle (x0, y0, x1, y1) the client covered, grown by `margin`, or None when
+    the probe didn't say. A probe's `covered` is the square of the items drawn in that frame; older
+    probes recorded only `squares`, the newest update's, which runs ahead of what is drawn while the
+    focus moves: then the square of every update from the drawn tick on, all of them."""
+    frames = drawn["frames"]
+
+    def rect(s):
+        return (s[0] - s[2] - margin, s[1] - s[2] - margin, s[0] + s[2] + margin, s[1] + s[2] + margin)
+
+    cov = drawn.get("covered")
+    if cov and len(cov) == len(frames):
+        return [rect(c[1:]) if c[3] >= 0 else None for c in cov]
+    sq = drawn.get("squares")
+    if not sq or len(sq) != len(frames):
+        return [None] * len(frames)
+    out = []
+    j = 0
+    for i, row in enumerate(frames):
+        drawn_tick = row[1]
+        # The last frame at or before the drawn tick: from then on every newer update's square.
+        while j < i and sq[j + 1][0] <= drawn_tick:
+            j += 1
+        r = None
+        for s in sq[j:i + 1]:
+            if s[3] < 0:
+                continue
+            q = rect(s[1:])
+            r = q if r is None else (max(r[0], q[0]), max(r[1], q[1]), min(r[2], q[2]), min(r[3], q[3]))
+        out.append(r)
+    return out
+
+
+def check(truth_path, drawn_path, warmup=60, within=None, square_margin=4.0):
     truth = json.loads(pathlib.Path(truth_path).read_text())
     drawn = json.loads(pathlib.Path(drawn_path).read_text())
+    if within is None:
+        within = recorded_area(truth)
+    covers = covered_squares(drawn, square_margin)
     visible = Lanes([l for l in truth["lanes"] if not is_hidden_lane(l)])
     tiles = feature_of(truth["belts"])
     # Sideload targets: straight belts whose side another belt points into are counted apart.
@@ -373,8 +427,9 @@ def check(truth_path, drawn_path, warmup=60, within=None):
     def inside(x, y):
         return within is None or (within[0] <= x <= within[2] and within[1] <= y <= within[3])
 
-    for row in frames[warmup:]:
+    for fi, row in enumerate(frames[warmup:], warmup):
         tick, drawn_tick = row[0], row[1]
+        cover = covers[fi]
         t_near = round(drawn_tick)
         g = grid_at(t_near)
         drawn_grid = {}
@@ -391,13 +446,14 @@ def check(truth_path, drawn_path, warmup=60, within=None):
                 lo_x, lo_y, hi_x, hi_y = min(lo_x, x), min(lo_y, y), max(hi_x, x), max(hi_y, y)
         if drawn_grid:
             for tx, ty in showing.get(t_near, []):
-                if lo_x <= tx <= hi_x and lo_y <= ty <= hi_y and inside(tx, ty):
+                if lo_x <= tx <= hi_x and lo_y <= ty <= hi_y and inside(tx, ty) and (
+                        cover is None or (cover[0] <= tx <= cover[2] and cover[1] <= ty <= cover[3])):
                     game_items += 1
                     if nearest(drawn_grid, tx, ty) > 0.15:
                         missing += 1
         for i in range(2, len(row), 4):
             uid, x, y, shown = row[i], row[i + 1], row[i + 2], row[i + 3]
-            if not inside(x, y):
+            if shown and not inside(x, y):  # (a hidden item's place is 0, 0)
                 continue
             tr = tracks.get(uid)
             if tr is None:
@@ -448,6 +504,11 @@ def check(truth_path, drawn_path, warmup=60, within=None):
         pathlib.Path(drawn_path).name, drawn.get("period"), ", straight" if drawn.get("straight") else "",
         ", read %s ticks early" % drawn.get("lead") if drawn.get("lead") else "", len(frames) - warmup, shown_n,
         hidden_right + hidden_wrong))
+    known = [c for c in covers[warmup:] if c is not None]
+    print("  inside (%.1f, %.1f)-(%.1f, %.1f); the game's items counted inside the square the client covered%s" % (
+        within[0], within[1], within[2], within[3],
+        (" (%s, +%.1f tiles) in %d of %d frames" % ("covered" if drawn.get("covered") else "newest updates'", square_margin,
+                                                   len(known), len(frames) - warmup)) if known else ": not recorded"))
     print("  distance from the nearest lane's centre line (tiles):")
     for k in sorted(dist, key=lambda k: (k.startswith("tier"), k)):
         v = dist[k]
@@ -492,7 +553,9 @@ def main():
     chk = sub.add_parser("check")
     chk.add_argument("truth")
     chk.add_argument("drawn", nargs="+")
-    chk.add_argument("--within", default="", help="x0,y0,x1,y1: only items inside it count")
+    chk.add_argument("--within", default="", help="x0,y0,x1,y1: only items inside it count (default: the recorded area)")
+    chk.add_argument("--square-margin", type=float, default=4.0,
+                     help="tiles past the client's square the game's items still count (standing, the client draws up to ~3.5 past it)")
     a = ap.parse_args()
     if a.cmd == "layout":
         print(rcon_run(LAYOUT_LUA % {"x": a.x, "y": a.y, "every": a.every}, a.rcon_port))
@@ -510,7 +573,7 @@ def main():
     else:
         within = tuple(float(v) for v in a.within.split(",")) if a.within else None
         for d in a.drawn:
-            check(a.truth, d, within=within)
+            check(a.truth, d, within=within, square_margin=a.square_margin)
 
 
 if __name__ == "__main__":

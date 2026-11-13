@@ -57,6 +57,7 @@ for _pattern in ("*-stomper-pentapod", "*-strafer-pentapod"):
 for _pattern in ("*-volcanic-rock", "*-volcanic-rock-hot", "fulgoran-ruin-*"):
     OVERRIDES[_pattern] = dict(FINE)
 
+OVERRIDES["*-stomper-shell"] = {"two_tone": "*", "two_tone_blur": 0.05}  # its knobs and pits are the picture's
 OVERRIDES.update({
     # Dead wood and rocks: the sprites' are weathered grey-brown and deeply shadowed; the sun lit
     # ours pale, smooth and yellow (judged against the sprites in the client's shots).

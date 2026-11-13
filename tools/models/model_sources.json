@@ -156,5 +156,8 @@
   "small-promethium-asteroid": "Matched to sprite",
   "medium-promethium-asteroid": "Matched to sprite",
   "big-promethium-asteroid": "Matched to sprite",
-  "huge-promethium-asteroid": "Matched to sprite"
+  "huge-promethium-asteroid": "Matched to sprite",
+  "small-stomper-shell": "Matched to sprite",
+  "medium-stomper-shell": "Matched to sprite",
+  "big-stomper-shell": "Matched to sprite"
 }

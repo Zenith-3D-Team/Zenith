@@ -41,7 +41,9 @@ chooser's groups, productivity, burners, drills, temperature, labs, a requester'
 `--only turrets` turret states (`ts`: every turret, a tank and a spidertron aiming and firing at biters);
 `--only enemies` enemies' attacks (`en`) and the decals round nests; `--only mapinfo` the hover panel's beacon effects (`hinfo`) and `terr`'s surface; `--only console` the client's console
 (Lua commands with its prelude over RCON, `cmd`, and /cheat, which researches everything); `--only remote` the 3D remote view leaving out moving things no radar sees (`cov`); `--only remnants` what destroyed buildings leave (extra.rm) and
-linked belts' ends.
+linked belts' ends; `--only barrier` the error barrier (barrier.lua): a tick step and an event handler
+made to fail, the game and the other steps going on (`--server-log` points at the server's
+factorio-current.log when it isn't server/data's).
 """
 
 import argparse
@@ -62,6 +64,7 @@ import rcon  # noqa: E402
 MOD = "__factorio-3d-bridge__"
 FACTORIO_PORT, CLIENT_PORT = 34200, 34201
 SECOND_CLIENT_PORT = 0  # the two-client check's second client; 0: the client port + 1
+SERVER_LOG = None  # --server-log
 results = []
 
 
@@ -69,6 +72,13 @@ def report(ok, what, detail=""):
     ok = bool(ok)  # a falsy {} or [] must count as a failure too
     results.append(ok)
     print(("PASS " if ok else "FAIL ") + what + (f"  ({detail})" if detail else ""))
+
+
+def report_step_errors():
+    """A step that fails no longer stops the server (barrier.lua), so a passing run has to ask."""
+    status = rcon.run("/f3d-status")
+    report("ERROR: step" not in status, "no step of the bridge failed",
+           " | ".join(l for l in status.splitlines() if "ERROR: step" in l)[:500])
 
 
 def mod_lua(code):
@@ -854,6 +864,15 @@ rcon.print(silo.unit_number .. " " .. silo.position.x .. " " .. silo.position.y 
            "land: out of the hub into a cargo pod, seen from the hub (up 1)", f"{texts} {leave[:1]}")
     report(bool(surf) and surf[0].get("planet") == "nauvis" and down and down[-1]["ps"] == "descending",
            "land: the pod changes surface to Nauvis and comes down (up 0)", f"{surf[:1]} {down[-1:]}")
+    # Factorio gives it no height: it comes in from the north (and from the side: the client ignores
+    # that, drawing it straight above the spot), and the client draws what is left of its way south as height.
+    falling = [m for m in down if m.get("ps") == "descending"]
+    spots = [r[4:6] for m in of_type(msgs, "cp") for r in m["l"] if r[1] == "descending" and len(r) == 6]
+    print("     falling:", [(m["x"] / 256, m["y"] / 256) for m in falling[::max(1, len(falling) // 6)]], "spots:", spots[-1:])
+    report(len(falling) > 5 and all(b["y"] >= a["y"] for a, b in zip(falling, falling[1:])),
+           "land: a falling pod only ever travels south (the client's height)", str(falling[:1] + falling[-1:]))
+    report(bool(spots) and abs(spots[-1][0] - falling[-1]["x"]) < 4 * 256 and abs(spots[-1][1] - falling[-1]["y"]) < 4 * 256,
+           "land: `cp` says where it lands, where it comes down", f"{spots[-1:]} {falling[-1:]}")
     fin = log[-1][1] if log else {}
     report(down and fin and "pod" not in fin and abs(fin["x"] - down[-1]["gx"]) < 4 * 256 and abs(fin["y"] - down[-1]["gy"]) < 4 * 256,
            "land: the character stands on Nauvis where the pod came down", f"{fin} {down[-1:]}")
@@ -2562,6 +2581,78 @@ rcon.print(f.unit_number)""".replace("\n", " "))
     if not keep:
         mod_lua(f'for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ area = {{ {{ {x0 - 30}, {y0 - 30} }}, '
                 f'{{ {x0 + 30}, {y0 + 30} }} }}, name = {{ "steel-furnace", "chemical-plant", "oil-refinery", "assembling-machine-2", "recycler" }} }})) do e.destroy() end rcon.print("ok")')
+
+
+def check_belt_switch(c, hello):
+    """Belts run all the time; only one a network switches off stands still. A belt and a loader with a
+    red wire and a false circuit condition report it (status 61; `disabled_by_control_behavior` is false
+    on a belt, which isn't "updatable"), a belt with a logistic condition and no wire too, and the
+    bridge sends `st` 5 for them, 0 once the condition holds; a plain belt never comes up, nor a
+    splitter or an underground, which no network switches off."""
+    if not clean_spot(c, hello):
+        report(False, "belts off: an empty spot", SPOT_WHY)
+        return
+    x0, y0 = int(c.me["x"] / 256), int(c.me["y"] / 256)
+    out = mod_lua(f"""
+local ch = storage.f3d.puppet local s = ch.surface
+local function put(name, dx, dy, built) return s.create_entity({{ name = name, position = {{ {x0} + dx + 0.5, {y0} + dy + 0.5 }}, direction = defines.direction.east, force = ch.force, raise_built = built }}) end
+local red = defines.wire_connector_id.circuit_red
+local comb = put('constant-combinator', -6, 5, true)
+local belt = put('transport-belt', -6, 4, true)
+local loader = put('loader', -3, 4, true)
+local plain = put('transport-belt', -6, 7, true)
+local logistic = put('transport-belt', -5, 7, true)
+local splitter = put('splitter', -6, 9, true)
+local under = put('underground-belt', -3, 9, true)
+local no_behavior = logistic.get_control_behavior() == nil
+storage.f3d_live_belts = {{ belt = belt, loader = loader, plain = plain, logistic = logistic, splitter = splitter, under = under, comb = comb }}
+rcon.print(belt.unit_number .. ' ' .. loader.unit_number .. ' ' .. plain.unit_number .. ' ' .. logistic.unit_number .. ' ' .. tostring(no_behavior))""".replace("\n", " "))
+    parts = out.split()
+    if len(parts) != 5:
+        report(False, "belts off: built", out)
+        return
+    belt, loader, plain, logistic = (int(v) for v in parts[:4])
+    report(parts[4] == "true", "belts off: a belt with no wire has no control behaviour until asked for", parts[4])
+    # The combinator's wires looked at once first: a wire added after that is what gets noticed.
+    c.pump(2.0, every=hello)
+    out = mod_lua(f"""
+local b = storage.f3d_live_belts local belt, loader, logistic, comb = b.belt, b.loader, b.logistic, b.comb
+local red = defines.wire_connector_id.circuit_red
+local cond = {{ first_signal = {{ type = 'item', name = 'iron-plate' }}, comparator = '>', constant = 0 }}
+for _, e in pairs({{ belt, loader }}) do
+  e.get_wire_connector(red, true).connect_to(comb.get_wire_connector(red, true))
+  local cb = e.get_or_create_control_behavior()
+  cb.circuit_enable_disable = true
+  cb.circuit_condition = cond
+end
+local lb = logistic.get_or_create_control_behavior()
+lb.connect_to_logistic_network = true
+lb.logistic_condition = cond
+package.loaded['__factorio-3d-bridge__/scripts/belt_switch.lua'].configured(logistic)
+rcon.print('ok')""".replace("\n", " "))
+    msgs = c.pump(6.0, every=hello)
+    rows = [m["l"] for m in of_type(msgs, "st")]
+    states = {r[i]: r[i + 1] for r in rows for i in range(0, len(r), 2)}
+    facts = mod_lua("""local b = storage.f3d_live_belts local function f(e) return e.name .. ' off=' .. tostring(e.disabled_by_control_behavior)
+ .. ' status=' .. tostring(e.status) .. ' active=' .. tostring(e.active) .. ' updatable=' .. tostring(e.is_updatable) end
+local cb = b.splitter.get_or_create_control_behavior()
+local uok, ucb = pcall(function() return b.under.get_or_create_control_behavior() end)
+rcon.print(f(b.belt) .. ' | ' .. f(b.loader) .. ' | ' .. f(b.logistic) .. ' | ' .. f(b.plain) .. ' | ' .. f(b.splitter) .. ' cb=' .. cb.object_name
+ .. ' | ' .. f(b.under) .. ' cb=' .. tostring(uok and ucb and ucb.object_name) .. ' | disabled=' .. tostring(defines.entity_status.disabled_by_control_behavior))""".replace("\n", " "))
+    print("  facts:", facts)
+    rows_of = [f.strip() for f in facts.split("|")]
+    report("status=61" in rows_of[0], "belts off: a wired belt with a false condition is status 61", rows_of[0])
+    report("status=61" in rows_of[1], "belts off: a wired loader too", rows_of[1])
+    report("status=61" in rows_of[2], "belts off: and a belt with a logistic condition and no wire", rows_of[2])
+    report("status=1" in rows_of[3] and "status=1" in rows_of[4], "belts off: a plain belt and a splitter run", rows_of[3:5])
+    report(states.get(belt) == 5 and states.get(loader) == 5 and states.get(logistic) == 5, "belts off: the bridge sends st 5 for them", states)
+    report(plain not in states, "belts off: a plain belt is never mentioned", states)
+    mod_lua("""local cond = { first_signal = { type = 'item', name = 'iron-plate' }, comparator = '<', constant = 1 }
+local b = storage.f3d_live_belts b.belt.get_control_behavior().circuit_condition = cond b.loader.get_control_behavior().circuit_condition = cond rcon.print('ok')""".replace("\n", " "))
+    msgs = c.pump(3.0, every=hello)
+    states = {r[i]: r[i + 1] for r in (m["l"] for m in of_type(msgs, "st")) for i in range(0, len(r), 2)}
+    report(states.get(belt) == 0 and states.get(loader) == 0, "belts off: the condition true again: st 0", states)
+    mod_lua("for _, e in pairs(storage.f3d_live_belts) do e.destroy() end storage.f3d_live_belts = nil rcon.print('ok')")
 
 
 def check_save(c, hello):
@@ -4505,6 +4596,25 @@ def check_console(c, hello, cheat=False):
     report(r.get("l") and any("client on port" in l for l in r["l"]), "cmd /f3d-status: the mod's command answers the client", str(r.get("l"))[:200])
     r = ask("/editor", 907)
     report(r.get("ok") == 0, "cmd: a command the bridge doesn't run answers ok = 0", str(r))
+    # The debug menu's /f3d-debug: each change read back from the game over RCON, then put back.
+    r = ask("/f3d-debug", 908)
+    before = r.get("dbg", {})
+    report(before.get("s") and "sp" in before, "cmd /f3d-debug: the game's state as dbg", str(r))
+    ask("/f3d-debug daytime 0.5", 909)
+    ask("/f3d-debug freeze on", 910)
+    got = rcon.run("/sc local c = remote.call('zenith', 'character') rcon.print(string.format('%.3f %s', c.surface.daytime, tostring(c.surface.freeze_daytime)))").strip()
+    report(got == "0.500 true", "cmd /f3d-debug daytime and freeze set the character's surface", got)
+    ask("/f3d-debug speed 2", 911)
+    got = rcon.run("/sc rcon.print(game.speed)").strip()
+    report(got == "2", "cmd /f3d-debug speed sets game.speed", got)
+    ask("/f3d-debug speed 1", 912)
+    ask("/f3d-debug pause on", 913)
+    r = ask("/f3d-debug", 914)
+    report(r.get("dbg", {}).get("pa") == 1, "cmd /f3d-debug pause: the bridge still answers while the game is tick-paused", str(r))
+    ask("/f3d-debug pause off", 915)
+    rcon.run("/sc game.tick_paused = false")  # whether the bridge heard or not
+    ask("/f3d-debug freeze %s" % ("on" if before.get("fz") == 1 else "off"), 916)
+    ask("/f3d-debug daytime %s" % before.get("dt", 0.2), 917)
     if not cheat:
         return
     r = ask("/cheat", 908)
@@ -4517,6 +4627,111 @@ def check_console(c, hello, cheat=False):
         r = ask("/cheat nauvis", 910)
         where = mod_lua("rcon.print(storage.f3d.puppet.surface.name)")
         report(where == "nauvis", "and /cheat nauvis back", f"{r.get('l')}, on {where}")
+
+
+def step_errors():
+    """/f3d-status's failing steps: name -> (times failed, the line)."""
+    out = {}
+    for line in rcon.run("/f3d-status").splitlines():
+        m = re.search(r"ERROR: step '([^']+)' failed (\d+) time", line)
+        if m:
+            out[m.group(1)] = (int(m.group(2)), line)
+    return out
+
+
+def server_log():
+    """This server's factorio-current.log, if it is on this machine: --server-log, else the repo's
+    server/data one when it opened this run's UDP port (another server's log proves nothing)."""
+    path = pathlib.Path(SERVER_LOG) if SERVER_LOG else (
+        pathlib.Path(__file__).resolve().parent.parent / "server" / "data" / "factorio-current.log")
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    return text if SERVER_LOG or f"127.0.0.1:{FACTORIO_PORT}" in text else None
+
+
+def check_barrier(c, hello):
+    """The error barrier (barrier.lua): a tick step and an event handler made to fail. The game goes
+    on, the other steps keep sending, the failing one is retried each tick, /f3d-status names it,
+    the client is told, Factorio's log has it (at most once every 600 ticks), and a step that works
+    again stops counting. The failures are forgotten afterwards, so the run's last check still sees
+    only real ones."""
+    before = step_errors()
+    if "research" in before or "on_research_finished" in before:
+        report(False, "barrier: research hadn't failed before the check", str(before)[:300])
+        return
+    if not clean_spot(c, hello):
+        report(False, "barrier: an empty spot", SPOT_WHY)
+        return
+    c.pump(0.5, every=hello)
+    # A tick step: research's job in a shape it can't read (as a save of another bridge might hold).
+    tick0 = int(rcon.run("/sc rcon.print(game.tick)").strip())
+    mod_lua("storage.f3d.techs_job = { names = false, block = 1, blocks = 2, sent = 0 } rcon.print('ok')")
+    msgs = c.pump(1.2, every=(0.15, {"t": "walk", "d": 4}))
+    c.send({"t": "walk", "d": -1})
+    msgs += c.pump(2.0, every=hello)
+    tick1 = int(rcon.run("/sc rcon.print(game.tick)").strip())
+    errors = step_errors()
+    n1, line = errors.get("research", (0, ""))
+    report(n1 > 0 and "names" in line, "barrier: /f3d-status names the failing step and its error", line[:300])
+    # (A tick the work budget has no room for techs returns before reading the job.)
+    span = re.search(r"first at tick (\d+), last at tick (\d+)", line)
+    span = int(span.group(2)) - int(span.group(1)) if span else 0
+    report(tick1 - tick0 >= 150 and n1 >= 30 and span >= (tick1 - tick0) * 0.7,
+           "barrier: the game goes on, and the failing step is tried again tick after tick",
+           f"{tick1 - tick0} ticks, failed {n1} times over {span}")
+    mes = of_type(msgs, "me")
+    moved = math.hypot(mes[-1]["x"] - mes[0]["x"], mes[-1]["y"] - mes[0]["y"]) / 256 if mes else 0
+    report(len(of_type(msgs, "sky")) >= 2 and moved > 2, "barrier: the other steps keep running (sky sent, the character walked)",
+           f"{len(of_type(msgs, 'sky'))} sky, walked {moved:.1f} tiles")
+    told = [m["text"] for m in of_type(msgs, "msg") if m.get("text", "").startswith("Bridge error in research")]
+    report(len(told) == 1, "barrier: the client is told once, not every tick", str(told)[:200])
+    log = server_log()
+    if log is None:
+        print("SKIP barrier: the server's log isn't on this machine (--server-log)")
+    else:
+        lines = [l for l in log.splitlines() if "[Zenith] ERROR in step 'research' at tick" in l
+                 and tick0 <= int(re.search(r"at tick (\d+)", l).group(1)) <= tick1 + 60]
+        report(1 <= len(lines) <= 1 + (tick1 - tick0) // 600 and "names" in (lines[0] if lines else ""),
+               "barrier: Factorio's log has the step and its error, at most once every 600 ticks",
+               f"{len(lines)} lines in {tick1 - tick0} ticks: {(lines[0] if lines else '')[:200]}")
+    # Working again: the tree is sent and the count stops.
+    mod_lua("storage.f3d.techs_job = nil storage.f3d.techs_dirty = true rcon.print('ok')")
+    msgs = c.pump(2.0, every=hello)
+    n2 = step_errors().get("research", (0, ""))[0]
+    c.pump(1.0, every=hello)
+    n3 = step_errors().get("research", (0, ""))[0]
+    report(of_type(msgs, "techs") and n3 == n2, "barrier: once the step can run again it sends (techs) and stops failing",
+           f"{len(of_type(msgs, 'techs'))} techs parts, failed {n2} then {n3} times")
+
+    # An event handler: on_research_finished's (research.lua) calls crafting.invalidate, replaced
+    # for the length of one command by one that fails. Without the barrier the error would come out
+    # of `researched = true`.
+    out = mod_lua("""
+local t for _, tech in pairs(game.forces.player.technologies) do
+  if not tech.researched and tech.enabled then t = tech break end end
+if not t then rcon.print('none') return end
+local m = package.loaded['__factorio-3d-bridge__/scripts/crafting.lua']
+local orig = m.invalidate
+m.invalidate = function() error('barrier check: a handler failing') end
+local ok, err = pcall(function() t.researched = true end)
+m.invalidate = orig
+local done = t.researched
+t.researched = false
+rcon.print(tostring(ok) .. ' ' .. tostring(done) .. ' ' .. t.name .. ' ' .. tostring(err))
+""".replace("\n", " "))
+    errors = step_errors()
+    n, line = errors.get("on_research_finished", (0, ""))
+    report(out.startswith("true true") and n == 1 and "a handler failing" in line,
+           "barrier: an event handler failing is caught, logged and listed; the game's own change stands", f"{out} | {line[:200]}")
+    msgs = c.pump(1.0, every=hello)
+    report(of_type(msgs, "sky") or of_type(msgs, "me"), "barrier: the bridge keeps sending after the handler failed",
+           f"{len(msgs)} messages")
+    mod_lua("local b = package.loaded['__factorio-3d-bridge__/scripts/barrier.lua'] "
+            "b.forget('research') b.forget('on_research_finished') rcon.print('ok')")
+    left = step_errors()
+    report(left.keys() == before.keys(), "barrier: the check's failures are forgotten, the rest kept", str(list(left))[:200])
 
 
 def handshake(c):
@@ -4621,19 +4836,22 @@ def check_as_player(c, hello):
 
 
 def parse_args():
-    global FACTORIO_PORT, CLIENT_PORT, SECOND_CLIENT_PORT
+    global FACTORIO_PORT, CLIENT_PORT, SECOND_CLIENT_PORT, SERVER_LOG
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--factorio-port", type=int, default=FACTORIO_PORT, help="the server's --enable-lua-udp port")
     parser.add_argument("--client-port", type=int, default=CLIENT_PORT, help="the port this binds, as the client would")
     parser.add_argument("--rcon-port", type=int, default=rcon.PORT)
     parser.add_argument("--rcon-password", help="default: server/data/rcon-password.txt")
     parser.add_argument("--second-client-port", type=int, default=0, help="the two-client check's second client (default: the client port + 1)")
+    parser.add_argument("--server-log", help="the server's factorio-current.log, for the barrier check (default: server/data's, "
+                                             "when it is this server's)")
     parser.add_argument("--only", choices=["platforms", "planets", "space", "ride", "collectors", "ui", "input", "cliffs", "save", "gear", "planners", "circuits", "build", "info",
-                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx"], help="run just these checks after the handshake")
+                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx", "beltswitch", "barrier"], help="run just these checks after the handshake")
     args = parser.parse_args()
     FACTORIO_PORT, CLIENT_PORT, rcon.PORT = args.factorio_port, args.client_port, args.rcon_port
     rcon.PASSWORD = args.rcon_password
     SECOND_CLIENT_PORT = args.second_client_port
+    SERVER_LOG = args.server_log
     return args
 
 
@@ -4650,6 +4868,7 @@ def main():
             {"platforms": check_platforms, "planets": check_planets, "space": check_space, "ride": check_ride,
              "collectors": check_collectors}[args.only](c, hello)
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+        report_step_errors()
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
@@ -4660,6 +4879,7 @@ def main():
             c.pump(1.0, every=hello)
             check_mod_graphics(c, hello, welcome[0])
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+        report_step_errors()
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
@@ -4669,18 +4889,21 @@ def main():
             c.pump(1.0, every=hello)
             check_console(c, hello, cheat=True)
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+        report_step_errors()
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
-    if args.only in ("cliffs", "save", "gear", "build", "alerts", "multi", "remnants", "turrets", "weapons", "enemies", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt", "asplayer"):
+    if args.only in ("cliffs", "save", "gear", "build", "alerts", "multi", "remnants", "turrets", "weapons", "enemies", "remote", "walk", "states", "mapinfo", "triggers", "minevehicles", "alt", "beltswitch", "asplayer", "barrier"):
         if handshake(c):
             hello = (1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1})
             c.pump(1.0, every=hello)
             {"cliffs": check_cliffs, "save": check_save, "gear": check_gear, "build": check_build_tools,
              "alerts": check_alerts, "multi": check_multi, "remnants": check_remnants, "turrets": check_turrets, "weapons": check_weapons,
              "enemies": check_enemies, "remote": check_remote_view, "walk": check_walk, "states": check_states,
-             "mapinfo": check_map_info, "triggers": check_triggers, "minevehicles": check_mine_vehicles, "alt": check_alt, "asplayer": check_as_player}[args.only](c, hello)
+             "mapinfo": check_map_info, "triggers": check_triggers, "minevehicles": check_mine_vehicles, "alt": check_alt, "beltswitch": check_belt_switch, "asplayer": check_as_player,
+             "barrier": check_barrier}[args.only](c, hello)
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+        report_step_errors()
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
@@ -4691,6 +4914,7 @@ def main():
             {"ui": check_ui_parity, "input": check_input, "planners": check_planners, "circuits": check_circuits, "info": check_info,
              "machines": check_machines, "logic": check_logic, "vehicles": check_vehicles, "hud": check_hud}[args.only](c, hello)
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+        report_step_errors()
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
@@ -5903,6 +6127,10 @@ rcon.print({"", "25 chunks, ", tostring(n), " entities: ", profiler})
     # --- the client's console (without /cheat, which would research everything) -----------------
     check_console(c, hello)
 
+    # --- the error barrier: a step and a handler made to fail, then forgotten --------------------
+    check_barrier(c, hello)
+
+    report_step_errors()
     print(f"\n{results.count(True)} passed, {results.count(False)} failed")
     sys.exit(0 if all(results) else 1)
 

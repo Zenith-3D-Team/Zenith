@@ -30,6 +30,16 @@ on top; normal maps are ignored (the merged meshes carry no tangents). Far merge
 per model is cheapest (`tools/models/fue5.py` bakes FUE5's textures that way). Models without
 textures are drawn as before.
 
+Occlusion: a glTF occlusion texture (its red channel, usually packed as the red of the
+metallic-roughness picture) is read and darkens the colour and the light, as the baked per-vertex
+occlusion does. Without one (or with one that is all white), bake it per vertex instead, without
+Blender: `python tools/models/bake_glb.py <file or folder> --out <scratch folder>` writes baked copies
+(COLOR_0 alpha, and a `TEXCOORD_1` of (0, 0.5) if the file has none, which tells the client the
+vertex colours are Zenith's data); look at them with `-- --models=<scratch folder> --models-first`,
+then `--in-place` on the originals. On a textured model the occlusion only shades: its own pictures
+keep their wear, with none of Zenith's crevice grime added. FUE5's models are baked this way
+(`fue5.py` runs it after each conversion).
+
 Models under their own licence live in a subfolder looked in first (`model_library.gd`
 `MODEL_SUBDIRS`): `fue5/` (CC BY-NC-SA 3.0, see its README) replaces ours of the same name.
 
@@ -43,8 +53,8 @@ lights the parts (`factorio_material.gdshaderinc` `anim_vertex`) from each insta
 comes near), so every loaded chunk animates at no script cost; turret heads, the asteroid
 collector's arm and worms are still moved by script, near the camera. A part is drawn at
 `entity * pivot * rotation(axis, angle) * inverse(pivot)`, where `pivot` is the node's transform,
-so put the node's origin on the axis it turns about. The sprite projection and weathering stay
-painted on the part as it turns (it wears the sprite as it looks at rest).
+so put the node's origin on the axis it turns about. The weathering stays painted on the part as
+it turns.
 
 | Node name | Turns about | When | Models using it |
 |---|---|---|---|
@@ -72,8 +82,8 @@ painted on the part as it turns (it wears the sprite as it looks at rest).
 | `anim_crank_split_wa`/`_wb`/`_ea`/`_eb` | node's Z (north-south), `CYCLES` | always: each pair lifts its inner ends 55 degrees and lays them down once per 0.76 s loop, the east pair half a loop behind | splitter and lane splitter (oval cranks, pivoted at their outer ends) |
 | `anim_slide_split_rack` | slides 0.9 tiles west and back (`CYCLES`) | always, once a loop | splitter and lane splitter (rack housing on the front rod) |
 
-`anim_upright_*` parts keep facing north and wear the model's `<name>.upright` projection entry
-(Factorio draws the pumpjack's beam, post and gearbox as one layer for every direction; only its
+`anim_upright_*` parts keep facing north (their part colours come from the model's `<name>.upright`
+sprite entry; Factorio draws the pumpjack's beam, post and gearbox as one layer for every direction; only its
 ground pipes turn). The electric mining drill (Wube's model) spins only its auger.
 
 Cycling parts and hatches are listed by kind in `model_library.gd` (kind names are global, so they
@@ -140,6 +150,22 @@ Higher belt tiers without their own model (`fast-`, `express-`, `turbo-` belts, 
 and splitters) use the yellow model with its `tier_paint` material recoloured
 (`TIER_TINTS` in `model_library.gd`).
 Fast, express and turbo loaders use `loader.glb` the same way.
+
+Belt line ends: a modeller's `transport-belt-start.glb` and `transport-belt-end.glb` (and the tiers'
+own, `fast-transport-belt-start.glb`...; a tier without them wears the yellow ones recoloured) are
+drawn where a line of belts begins and ends, so the belt rolls over a roller there. They are modelled
+with the belt running east (start to the west, end to the east, the belt's tile between) and turned
+onto the belt. The client works out the line ends from the neighbours (`world.gd` `_connect_belt`):
+a start where nothing feeds the tile from behind, an end where nothing in front takes its items
+(a belt from the side counts; one head-on doesn't). They go on straight belts (curves at their
+end only), on each half of a splitter on its own (a lone splitter gets four: both halves' back and
+front, each on its half's tile), and on an underground's open end: an entrance's back, an exit's
+front (facing the way items travel, though the exit's model is turned round). Splitters and
+undergrounds wear the belt pieces of their tier (`fast-splitter`: `fast-transport-belt-start`).
+No shift is needed on them: their belt surfaces end on the tile's edge as a belt's does. A piece's
+moving part that the model already has in the same place is left out on that model (a splitter's
+rollers at its back: the start piece's roller would turn inside it). Nothing is drawn without the
+pieces: Zenith's own belts have none.
 
 Movers (vehicles, robots, the rocket) are drawn by `movers.gd`. Their moving parts are moved by
 `vehicle_anim.gd` (the spidertron's legs and shell, robots' thrusters and lights, cargo pods'
@@ -272,12 +298,11 @@ surfaces and gives the result one material whose table has a row per glTF materi
 as many materials as the look needs: then they cost nothing at draw time. Up to 24 per shader share a
 surface.
 
-Settings → Graphics → **Model look** picks how models are coloured (`-- --model-look=` on the
-command line overrides it): **Factorio colours** (`colours`, the default) draws each part in its
-own colour sampled from Factorio's sprite when the model was built (below), with the weathering
-on top; **Factorio sprite projected** (`sprite`) also projects the sprite itself onto the faces
-Factorio's camera sees (1.); `palette` (command line only, for comparing) shows the palette
-colours the models were built with.
+Models are drawn in **Factorio colours**: each part in its own colour sampled from Factorio's
+sprite when the model was built (below), with the weathering on top. `-- --model-look=palette`
+(for comparing) shows the palette colours the models were built with instead. The old look that
+projected the sprite itself onto the model (Settings → Graphics → Model look, "Factorio sprite
+projected") is gone, and with it the depth maps it needed.
 
 0. **Part colours** (`tools/models/part_colors.py`, stored in the `.glb` as `TEXCOORD_4` and `_5`,
    the shader's `CUSTOM1`). The model is cut into patches (one material's triangles joined across
@@ -297,16 +322,7 @@ colours the models were built with.
    Godot's sun (`part_light`), so a top face shows its colour about as Factorio's view does. Higher belt and inserter tiers and
    the smaller creature tiers, which recolour a material, keep their tint on it. Models without a
    sprite entry keep the palette (pose variants take their family's colours per material).
-1. **Factorio's own sprite, projected** (look `sprite`). Where the player's Factorio install has the model's
-   sprite (`client/data/sprite_projection.json`), the client loads that frame at runtime and
-   projects it onto the model from Factorio's camera (orthographic, looking north, 48° down,
-   32 / scale px per tile, the entity's position `anchor` tiles above the ground). Faces the
-   camera sees get the sprite, with its baked light partly flattened (Godot lights it again);
-   faces turned away or hidden behind other parts (baked visibility, below) get the fallback,
-   tinted towards the sprite's nearby colour so the seams don't show. No Factorio image is
-   copied into the repo: only frame sizes, shifts and file names.
-2. **Procedural fallback**, for hidden faces, models without an entry, and players without
-   Factorio (or `-- --no-sprites`): baked ambient occlusion, grime in crevices and up from the
+1. **Procedural weathering**, on every model: baked ambient occlusion, grime in crevices and up from the
    ground, chipped bright edges, rust patches and streaks, dust on top, greyed colours. How much
    of each depends on the **material class**, picked from the glTF material's name
    (`MATERIAL_CLASSES` in `model_library.gd`, first match wins):
@@ -329,8 +345,7 @@ colours the models were built with.
 
 Name new materials so they land in the right class (`CLASS_PARAMS` holds the numbers).
 Everything varies per part (the baked random) and per instance (a hash of its position), and works
-with MultiMesh: the projection is in model space, and a turned instance picks its direction's
-sprite from its transform.
+with MultiMesh: the weathering is in model space.
 
 ### Vertex data
 
@@ -355,7 +370,8 @@ means "use the face's angle to the camera only".
 
 `client/data/sprite_projection.json` is written by `python tools/models/sprite_projection.py`
 (numbers copied from `data/base/prototypes/entity/*.lua`; trees, rocks and ores parsed from the
-install). One entry per model name:
+install). The model tools (part colours, the scorers, the gallery) read it to find each model's
+sprite, and the client's blueprint window draws its previews from it. One entry per model name:
 
 ```json
 "boiler": {"anchor": 0.3, "mode": "direction", "cells": [
@@ -384,26 +400,7 @@ install). One entry per model name:
   sprites are drawn flat). `across` (rails, 0.72): the sprite keeps the track's centre line where
   the game has it but squashes distances across it north-south, as Factorio's rail sprites do; the
   models store their centre line's x, y in UV (`rails.py`, `centre_uvs`).
-- `deferred`: build on the loading thread with the vehicles (rails: their sheets are 4096x8192).
-  The thread cuts every frame the deferred entries need out of each sheet once, then drops it.
-  `atlas_scale` works for any mode.
-
-Models with an entry are drawn without the random turn trees, rocks and ores otherwise get, so
-the sprite fits them. Without the sheet in the install the model falls back silently.
-
-### Depth maps from Factorio's camera
-
-The sprite is projected straight through the model, so a surface behind another one (the
-roboport's body behind its arms, a tank's back) would get the front's pixels. Per-vertex
-visibility (above) can't see an occluder's outline in the middle of a big face, so
-`python tools/models/projector_depth.py [names...]` also renders every projected model (each
-direction its entry has; not the vehicles) from Factorio's camera into a small depth map:
-`client/data/projector_depth.json` (size, pixels per tile, each direction cell's origin) and
-`client/data/projector_depth/<name>.bin` (zlib float16, the frontmost surface's closeness to the
-camera in tiles). The shader skips the sprite on fragments clearly behind that surface, and on
-faces turned more than about 55 degrees from the camera (the sprite would be stretched over
-them). Rerun it after changing a model or its projection entry; the maps come from our models
-only, so they are committed.
+- `deferred`: rails (their sheets are 4096x8192). `atlas_scale` works for any mode.
 
 ## Building the procedural models
 
@@ -427,8 +424,6 @@ The models here are generated by Blender Python scripts in `tools/models/`, no `
 blender --background --factory-startup --python tools/models/build.py -- [names...]
 # check names, footprint, origin, rotation and triangle budget
 python tools/models/check.py [names...]
-# depth maps for the sprite projection (after sprite_projection.py)
-python tools/models/projector_depth.py [names...]
 # each part's colour from the sprite, after any rebuild (wube.py runs it itself; --debug DIR
 # writes sprite / sampled colour pictures to look at, never into the repo)
 python tools/models/part_colors.py [names...]

@@ -232,20 +232,158 @@ function commands.cheat(words)
 end
 
 ---------------------------------------------------------------------------------------------
+-- /f3d-debug: the client's debug menu (debug_menu.gd): the time of day, the day/night cycle, the
+-- game's speed, pausing, and moving the character to a spot. Every reply carries the state (`dbg`,
+-- M.debug_state), so the menu shows what the game has, not what it asked for.
+
+-- game.speed's range here; past these the client's drawn clock can't keep up anyway.
+local SPEED_MIN, SPEED_MAX = 0.05, 16
+
+local function debug_surface()
+  local c = puppet.get()
+  return c and c.valid and c.surface or game.surfaces["nauvis"] or game.surfaces[1]
+end
+
+-- A screenshot's hold (`/f3d-debug hold on|off`, the client's shot_pause.gd): the game slowed to
+-- Factorio's slowest speed instead of tick-paused, so the bridge still ticks (about once every 1.7 s),
+-- reads the client's packets and can let it go again; works in single-player too, where nothing
+-- else could resume a tick-paused game. The speed before is kept and comes back on `hold off`, and by
+-- itself HOLD_TICKS game ticks after the last `hold on` (about 50 s), so a client that crashed or
+-- left never leaves the game slowed. A player who changes the speed meanwhile keeps theirs.
+local HOLD_SPEED = 0.01
+local HOLD_TICKS = 30
+
+local function release_hold()
+  local h = storage.f3d_hold
+  storage.f3d_hold = nil
+  if h and game.speed == HOLD_SPEED then
+    game.speed = h.speed
+  end
+end
+
+-- Each tick (control.lua), with or without a client: the hold's watchdog.
+function M.hold_tick()
+  local h = storage.f3d_hold
+  if h and (game.tick >= h.ends or game.speed ~= HOLD_SPEED) then
+    release_hold()
+  end
+end
+
+-- {dt time of day (0 noon, 0.5 midnight), fz 1 frozen, sp speed, pa 1 paused, hd 1 held for a
+-- screenshot, ad 1 always day, s surface, x, y the character and sx, sy its force's spawn there
+-- (1/256 tiles)}
+function M.debug_state()
+  local surface = debug_surface()
+  local state = { dt = math.floor(surface.daytime * 1000 + 0.5) / 1000, fz = surface.freeze_daytime and 1 or 0,
+    sp = game.speed, pa = game.tick_paused and 1 or 0, hd = storage.f3d_hold and 1 or 0,
+    ad = surface.always_day and 1 or 0, s = surface.name }
+  local c = puppet.get()
+  if c and c.valid then
+    state.x, state.y = math.floor(c.position.x * 256 + 0.5), math.floor(c.position.y * 256 + 0.5)
+    local spawn = c.force.get_spawn_position(surface)
+    state.sx, state.sy = math.floor(spawn.x * 256 + 0.5), math.floor(spawn.y * 256 + 0.5)
+  end
+  return state
+end
+
+local function on_off(word)
+  if word == "on" or word == "1" then
+    return true
+  elseif word == "off" or word == "0" then
+    return false
+  end
+  return nil
+end
+
+commands["f3d-debug"] = function(words)
+  local what = words[1]
+  local surface = debug_surface()
+  if what == nil or what == "state" then
+    return { string.format("Time of day %.3f%s, speed %gx%s, on %s", surface.daytime, surface.freeze_daytime and " (frozen)" or "",
+      game.speed, game.tick_paused and ", paused" or "", surface.name) }
+  elseif what == "daytime" then
+    local v = tonumber(words[2])
+    if not v or v ~= v or math.abs(v) > 1e6 then
+      return { "/f3d-debug daytime <0-1>: 0 is noon, 0.5 midnight" }
+    end
+    surface.daytime = v - math.floor(v)
+    return { string.format("Time of day on %s: %.3f", surface.name, surface.daytime) }
+  elseif what == "freeze" then
+    local on = on_off(words[2])
+    if on == nil then
+      on = not surface.freeze_daytime
+    end
+    surface.freeze_daytime = on
+    return { (on and "The day/night cycle on %s is frozen" or "The day/night cycle on %s runs"):format(surface.name) }
+  elseif what == "speed" then
+    local v = tonumber(words[2])
+    if not v or v ~= v then
+      return { string.format("/f3d-debug speed <%g-%g>: 1 is normal", SPEED_MIN, SPEED_MAX) }
+    end
+    game.speed = math.max(SPEED_MIN, math.min(SPEED_MAX, v))
+    return { string.format("Game speed %gx", game.speed) }
+  elseif what == "pause" then
+    local on = on_off(words[2])
+    if on == nil then
+      on = not game.tick_paused
+    end
+    game.tick_paused = on
+    return { on and "The game is paused" or "The game runs" }
+  elseif what == "hold" then
+    if on_off(words[2]) == false then
+      release_hold()
+      return { "The game runs" }
+    elseif game.tick_paused then
+      return { "The game is paused already" }
+    end
+    if not storage.f3d_hold then
+      storage.f3d_hold = { speed = game.speed }
+      game.speed = HOLD_SPEED
+    end
+    storage.f3d_hold.ends = game.tick + HOLD_TICKS
+    return { "The game is held for a screenshot" }
+  elseif what == "teleport" then
+    local c = puppet.get()
+    local x, y = tonumber(words[2]), tonumber(words[3])
+    if not c or not c.valid then
+      return { "No character to move" }
+    elseif not x or not y or x ~= x or y ~= y or math.abs(x) > 1e6 or math.abs(y) > 1e6 then
+      return { "/f3d-debug teleport <x> <y>: tiles on the character's surface" }
+    elseif puppet.vehicle(c) then
+      return { "Get out of the vehicle first" }
+    end
+    local spot = c.surface.find_non_colliding_position("character", { x = x, y = y }, 32, 0.5)
+    if not spot or not c.teleport(spot) then
+      return { string.format("Nowhere free to stand near %.0f, %.0f", x, y) }
+    end
+    return { string.format("Moved the character to %.1f, %.1f", spot.x, spot.y) }
+  end
+  return { "/f3d-debug [state | daytime <0-1> | freeze [on | off] | speed <x> | pause [on | off] | hold [on | off] | teleport <x> <y>]" }
+end
+
+---------------------------------------------------------------------------------------------
 -- {id, text}: one console line from the client ("/cheat all"). Answered with {t = "cmdr", id,
--- l = lines, ok = 0 when the bridge doesn't know the command}.
+-- l = lines, ok = 0 when the bridge doesn't know the command, na = 1 when the sender may not run
+-- console commands here, dbg = M.debug_state() after /f3d-debug}.
 
 function M.run(cmd)
   local text = tostring(cmd.text or ""):gsub("^%s*/", "")
   local words = words_of(text)
   local name = table.remove(words, 1) or ""
-  local reply = { t = "cmdr", id = tonumber(cmd.id) or 0 }
+  local reply = { t = "cmdr", id = math.floor(tonumber(cmd.id) or 0) }
   local fn = commands[name]
   if not M.allowed(M.from_player) then
     reply.l = { "Console commands are for admins in a multiplayer game" }
+    reply.na = 1
   elseif fn then
     local ok, lines = pcall(fn, words)
     reply.l = ok and lines or { "Error: " .. tostring(lines) }
+    if name == "f3d-debug" then
+      local got, state = pcall(M.debug_state)
+      if got then
+        reply.dbg = state
+      end
+    end
   elseif M.extra[name] then
     M.capture = {}
     local ok, err = pcall(M.extra[name], { name = name, parameter = table.concat(words, " ") ~= "" and table.concat(words, " ") or nil })

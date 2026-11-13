@@ -66,7 +66,7 @@ local event_names = {
   "on_space_platform_built_entity", "script_raised_built", "script_raised_revive",
   "on_entity_cloned", "on_player_mined_entity", "on_robot_mined_entity",
   "on_space_platform_mined_entity", "on_entity_died", "on_post_entity_died", "script_raised_destroy",
-  "on_resource_depleted", "on_player_rotated_entity", "on_player_flipped_entity", "on_entity_settings_pasted", "on_gui_closed", "on_gui_click", "on_player_created",
+  "on_resource_depleted", "on_player_rotated_entity", "on_player_flipped_entity", "on_entity_settings_pasted", "on_entity_color_changed", "on_gui_closed", "on_gui_click", "on_player_created",
   "on_player_built_tile", "on_robot_built_tile", "on_space_platform_built_tile",
   "on_player_mined_tile", "on_robot_mined_tile", "on_space_platform_mined_tile",
   "script_raised_set_tiles", "on_chunk_generated", "on_entity_damaged", "on_research_finished",
@@ -211,8 +211,11 @@ settings = strict("LuaSettings", {
     ["f3d-bytes-per-tick"] = { value = 32768 },
     ["f3d-max-focus-radius"] = { value = 64 },
     ["f3d-mover-interval"] = { value = 2 },
+    -- (8: a search every 8 ticks, as before the setting; the tests of the longer waits set 32.)
+    ["f3d-mover-rescan"] = { value = 8 },
     ["f3d-detail-radius"] = { value = 24 },
     ["f3d-detail-interval"] = { value = 6 },
+    ["f3d-spread-jobs"] = { value = true },
     ["f3d-starter-kit"] = { value = true },
     ["f3d-player"] = { value = "" },
     ["f3d-act-as-player"] = { value = true },
@@ -534,7 +537,9 @@ local space_locations = {}
 for _, loc in pairs({ { "nauvis", "planet", 0, -5 }, { "vulcanus", "planet", 8.5, 3 }, { "solar-system-edge", "space-location", 0, 60 } }) do
   -- How the star map draws it (magnitude, draw_orbit, label_orientation); the edge has no orbit.
   space_locations[loc[1]] = strict("LuaSpaceLocationPrototype", { name = loc[1], type = loc[2], position = { x = loc[3], y = loc[4] },
-    magnitude = loc[1] == "vulcanus" and 1.5 or 1, draw_orbit = loc[1] ~= "solar-system-edge", label_orientation = 0.25 })
+    magnitude = loc[1] == "vulcanus" and 1.5 or 1, draw_orbit = loc[1] ~= "solar-system-edge", label_orientation = 0.25,
+    -- planet.lua's day lengths in ticks (2.1: Nauvis 7 minutes, Vulcanus 1.5)
+    surface_properties = loc[2] == "planet" and { ["day-night-cycle"] = loc[1] == "vulcanus" and 5400 or 25200 } or {} })
 end
 local space_connections = {
   ["nauvis-vulcanus"] = strict("LuaSpaceConnectionPrototype", {
@@ -566,9 +571,10 @@ end
 -- Remnants: corpses buildings leave (LuaEntityPrototype.corpses: name -> prototype). The
 -- assembler's are its own; the chest and the lab share small-remnants.
 entity_protos["linked-belt"] = entity_proto("linked-belt", "linked-belt", 1, 1, { rotatable = true })
+entity_protos["lane-splitter"] = entity_proto("lane-splitter", "lane-splitter", 1, 1, { rotatable = true })
 -- Belts' speeds in tiles a tick, as 2.1.23's prototypes.
 for name, v in pairs({ ["transport-belt"] = 0.03125, ["fast-transport-belt"] = 0.0625, ["underground-belt"] = 0.03125,
-  splitter = 0.03125, ["linked-belt"] = 0.03125 }) do
+  splitter = 0.03125, ["linked-belt"] = 0.03125, ["lane-splitter"] = 0.03125 }) do
   entity_protos[name].belt_speed = v
 end
 entity_protos["assembling-machine-1-remnants"] = entity_proto("assembling-machine-1-remnants", "corpse", 3, 3,
@@ -1968,8 +1974,20 @@ local function make_entity(surface, params)
   }
   local t = proto.type
   local e = {}
-  if t == "transport-belt" or t == "underground-belt" or t == "splitter" or t == "linked-belt" then
-    local count = (t == "underground-belt") and 4 or 2
+  if t == "transport-belt" then
+    -- Switched off by the circuit or logistic network it reads as its status (and not as
+    -- disabled_by_control_behavior, which is false on a belt in 2.1); no control behaviour until asked for.
+    -- One made here is kept where the harness keeps belts' behaviours (F.belt_behaviors), so
+    -- get_control_behavior (below) returns it either way.
+    data.status = defines.entity_status.working
+    data.get_or_create_control_behavior = function()
+      F.belt_behaviors[e] = F.belt_behaviors[e]
+        or strict("LuaTransportBeltControlBehavior", { connect_to_logistic_network = false })
+      return F.belt_behaviors[e]
+    end
+  end
+  if t == "transport-belt" or t == "underground-belt" or t == "splitter" or t == "linked-belt" or t == "lane-splitter" then
+    local count = (t == "underground-belt" or t == "lane-splitter") and 4 or 2
     belt_lines[e] = {}
     for i = 1, count do
       belt_lines[e][i] = {}
@@ -1986,11 +2004,18 @@ local function make_entity(surface, params)
       assert(belt_lines[e][i], "get_transport_line: no line " .. tostring(i))
       return make_transport_line(e, i)
     end
+    -- A belt's control behaviour exists once it has a circuit connection (F.belt_behaviors[e],
+    -- set by the harness); nil otherwise.
+    data.get_control_behavior = function() return F.belt_behaviors[e] end
   end
   if t == "transport-belt" then
     data.belt_shape = "straight"
   elseif t == "underground-belt" then
     data.belt_to_ground_type = params.type or "input"
+    -- Its other end (2.1's `underground_belt_neighbour`; 2.0 called it `neighbours`), set by the
+    -- harness (F.pair_undergrounds), nil when unpaired.
+    optional.underground_belt_neighbour = true
+    writable.underground_belt_neighbour = "harness"
   elseif t == "linked-belt" then
     data.linked_belt_type = params.linked_belt_type or "input"
   elseif t == "resource" then
@@ -2947,7 +2972,7 @@ end
 local function make_surface(index, name, default_tile)
   local surface = {
     index = index, name = name, entities = {}, tiles = {}, daytime = 0.2, darkness = 0, valid = true,
-    ticks_per_day = 25000, always_day = false, min_brightness = 0.15, solar_power_multiplier = 1,
+    ticks_per_day = 25000, always_day = false, freeze_daytime = false, min_brightness = 0.15, solar_power_multiplier = 1,
     dusk = 0.25, evening = 0.45, morning = 0.55, dawn = 0.75,
     map_gen_settings = { seed = 123456789 }, -- /seed (console.lua)
   }
@@ -3720,6 +3745,7 @@ rawset(forces.player, "get_turret_attack_modifier", function(turret) return turr
 game = strict("LuaGameScript", {
   tick = 0,
   ticks_played = 3725 * 60, -- /time (console.lua): 1 hour, 2 minutes and 5 seconds
+  speed = 1, tick_paused = false, -- /f3d-debug (console.lua)
   server_save = function(name) F.server_saved = true end,
   forces = forces,
   is_multiplayer = function() return F.multiplayer end,
@@ -3893,6 +3919,15 @@ function F.set_stack_count(entity, line, unique_id, count)
       it.count = count
     end
   end
+end
+
+-- Belts' control behaviours (a circuit connection): entity -> behaviour.
+F.belt_behaviors = setmetatable({}, { __mode = "k" })
+
+-- An underground entrance and its exit, each the other's `underground_belt_neighbour`.
+function F.pair_undergrounds(a, b)
+  a.underground_belt_neighbour = b
+  b.underground_belt_neighbour = a
 end
 
 -- Belt a feeds belt b (their belt_neighbours, as the harness sets them).

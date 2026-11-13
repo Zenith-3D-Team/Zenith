@@ -234,6 +234,7 @@ def table(results, before, after):
 
 
 def main():
+    global SAVE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--before", required=True)
     ap.add_argument("--after", required=True)
@@ -242,7 +243,9 @@ def main():
     ap.add_argument("--port", type=int, default=36146, help="UDP; the game, RCON and client ports follow it")
     ap.add_argument("--out", default=None)
     ap.add_argument("--repo", default=REPO, help="the GitHub repository a tag's download comes from")
+    ap.add_argument("--save", default=str(SAVE), help="the save each run plays a fresh copy of (default: Zenith Test)")
     a = ap.parse_args()
+    SAVE = pathlib.Path(a.save)
     ports = (a.port, a.port + 1, a.port + 2, a.port + 3)
     for p in (ports[0], ports[3]):
         if not port_free(p):

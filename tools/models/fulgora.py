@@ -21,6 +21,9 @@ from space_platform import COS_P, SIN_P, ring, ys, zs  # noqa: F401
 kit.MATERIALS.update({
     "paint_fulgora_blue": ("4d6680", 0.55, 0.45, None, 0),
     "paint_fulgora_cream": ("c9c0ad", 0.6, 0.3, None, 0),
+    "paint_fulgora_olive": ("5f6044", 0.6, 0.35, None, 0),   # the capsules on the plant's east side
+    "paint_fulgora_screen": ("6d91a4", 0.3, 0.2, None, 0),   # its panels' pale blue screens
+    "glow_green_lens": ("4f9a3a", 0.3, 0.0, "4fff4a", 0.6),
     "copper_coil": ("b0683a", 0.4, 0.9, None, 0),
     "copper_tip": ("c0703a", 0.45, 0.85, None, 0),   # the collector's tip, sampled apart from its coils
 
@@ -44,135 +47,247 @@ kit.MATERIALS.update({
 
 @model("electromagnetic-plant")
 def electromagnetic_plant():
-    """Factorio's electromagnetic plant (4x4): a round plinth ringed by ribbed rusty hoses, two
-    slate-blue riveted housings arching over it from the west and the east, cream towers with an
-    antenna and a ribbed dome at the back, a corrugated hump at the back left, a brass column under
-    the east arch, a blue pillar at the front right and a banded brass drum lying at the front; in
-    the middle a toothed turntable with a ring of small cogs at its front edge, a dark arch ring
-    behind it, and the copper coil assembly (a wire ball on its post) that spins while it works
-    (anim_spin_arms). Outline fitted to the sprite; the detail pass (detail.py) keeps it."""
+    """Factorio's electromagnetic plant (4x4), at true proportions: a round plinth ringed by a fat
+    ribbed rusty hose, tanks and corrugated humps on the ring at the back and sides; two thin
+    slate-blue arches over an open middle, the west one rising from a boot at the south-west (with
+    the copper coil column on it) along a cream strip to the stepped, louvred cream tower with the
+    antenna, the east one a broad wedge from the second cream tower (the ribbed dome, the louvred
+    white block) out to the east, with a cream and blue control box under it and a brass elbow and
+    column below that; a blue pillar at the south-east; a brass drum lying on the ring at the
+    front. In the open middle a dark turntable with a four-lobed plate and spindle, a toothed rail
+    with cogs at its front edge, a grey C ring standing behind, and the copper wire ball and grey
+    pods that spin while it works (anim_spin_arms). Placed from where each part shows in the
+    sprite: `at` turns a sprite pixel (at 256 pixels a tile) and a height into a point."""
     p = Part()
     blue, cream = "paint_fulgora_blue", "paint_fulgora_cream"
-    p.cyl((0.1, -0.8, 0.03), 1.745, 0.06, "steel_dark", segs=36)
-    p.cyl((0.1, -0.8, 0.09), 1.5, 0.06, "rust_brown", segs=36)
-    # The hoses: a thick ribbed ring at the plinth's rim, a second loop over it at the back
-    # where the sprite shows them stacked, clamped to posts.
-    detail.hose_arc(p, (0.1, -0.8), 1.57, 0.2, 0, 360, 0.18, "rust_brown", rib=0.34, steps=36)
-    detail.hose_arc(p, (0.1, -0.8), 1.57, 0.53, 0, 180, 0.17, "rust_brown", rib=0.34, steps=24)
-    for a in range(0, 360, 45):
+
+    def at(col, row, z):
+        return ((col - 650) / 256.0, (985 - row - 171.3 * z) / 256.0, z)
+
+    def poly(points, z):
+        out = [at(c, r, z)[:2] for c, r in points]
+        area = sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(out, out[1:] + out[:1]))
+        return out if area > 0 else out[::-1]   # prism wants them counter-clockwise
+
+    def hose(radius, z, a0, a1, r, steps):
+        pts = [(ring_c[0] + radius * math.cos(math.radians(a0 + (a1 - a0) * k / steps)),
+                ring_c[1] + radius * math.sin(math.radians(a0 + (a1 - a0) * k / steps)), z) for k in range(steps + 1)]
+        space_kit.hose(p, pts, r, "rust_brown", segs=8, rib=0.21, depth=0.17, smooth=3)
+
+    ring_c = (0.06, -0.05)
+    tt = (-0.04, -0.58)   # the turntable's centre
+    # The plinth, and the hose round it: one fat corrugated ring, a second loop at the back.
+    p.cyl((*ring_c, 0.05), 1.66, 0.1, "steel_black", segs=40)
+    p.cyl((*tt, 0.16), 1.2, 0.12, "steel_dark", segs=32)
+    hose(1.62, 0.2, 0, 360, 0.2, 40)
+    hose(1.56, 0.5, 15, 75, 0.16, 10)
+    for a in (205, 240, 300, 330):
         t = math.radians(a)
-        p.box((0.1 + 1.57 * math.cos(t), -0.8 + 1.57 * math.sin(t), 0.2), (0.1, 0.4, 0.36), "steel_dark",
+        p.box((ring_c[0] + 1.62 * math.cos(t), ring_c[1] + 1.62 * math.sin(t), 0.24), (0.07, 0.46, 0.46), "steel_dark",
               rz=a + 90)
-    # The turntable in the middle: a cone under a toothed gear with cut-outs and a spindle, and
-    # at its front edge a toothed rail with four small cogs.
-    p.cyl((0.04, -0.4, 0.62), 1.047, 0.6, "steel_dark", segs=24, radius_top=0.73, bevel=0.03)
-    detail.gear(p, (0.04, -0.4), 0.68, 0.9, 0.98, "steel", holes=6, teeth=22)
-    p.cyl((0.04, -0.4, 1.0), 0.06, 0.4, "steel_light", segs=8)
-    rail = Part()
-    rail.ring_band((0, 0), 0.92, 1.02, 0.42, 0.5, 200, 340, "steel_dark", segs=14)
-    for k in range(11):
-        a = math.radians(200 + 140 * k / 10)
-        rail.box((0.97 * math.cos(a), 0.97 * math.sin(a), 0.53), (0.05, 0.08, 0.06), "steel", rz=math.degrees(a))
-    p.add_part(rail, T(0.04, -0.4, 0))
-    for a in (225, 250, 290, 315):
-        t = math.radians(a)
-        x, y = 0.04 + 0.8 * math.cos(t), -0.4 + 0.8 * math.sin(t)
-        detail.gear(p, (x, y), 0.13, 0.5, 0.6, "steel_light", teeth=6, hub="steel_dark", segs=8)
-    arch = Part()   # the dark ring standing behind the coil, open to the east
-    arch.ring_band((0, 0), 0.5, 0.6, -0.06, 0.06, 90, 280, "steel_dark", segs=14)
+    # Round the ring: the south-west pots and strap, the west brass tanks, the blue ribbed fan,
+    # the corrugated hump at the back west, the riser at the back east, the olive capsules east.
+    for col, row, r in ((262, 1250, 0.2), (325, 1282, 0.17)):
+        x, y, z = at(col, row, 0.52)
+        p.cyl((x, y, 0.32), r, 0.5, "rust_brown", segs=14, radius_top=r * 0.9, bevel=0.03)
+        p.cyl((x, y, 0.58), r * 0.82, 0.05, "steel", segs=14)
+    p.beam(at(290, 1320, 0.42), at(395, 1400, 0.3), 0.1, 0.05, "steel_dark")
+    for col, row, z, r in ((282, 815, 0.75, 0.31), (262, 950, 0.55, 0.26)):
+        x, y, _ = at(col, row, z)
+        p.cyl((x, y, z / 2), r, z, "brass", segs=18, bevel=0.03)
+        p.cyl((x, y, z + 0.02), r * 0.8, 0.06, "steel_dark", segs=18)
+        detail.gear(p, (x, y), r * 0.55, z + 0.03, z + 0.08, "steel", teeth=10, segs=12)
+    fan = Part()
     for k in range(5):
-        a = math.radians(95 + 180 * k / 4)
-        arch.box((0.6 * math.cos(a), 0.6 * math.sin(a), 0), (0.06, 0.06, 0.13), "steel", rz=math.degrees(a))
-    p.add_part(arch, T(-0.05, 0.05, 1.45) @ R("X", 90))
-    # West: the blue housing and its arm arching over towards the middle, panelled and riveted.
-    detail.panelled(p, (-1.41, -1.05, 0.0), (-0.62, 1.08, 1.5), blue)
-    detail.panelled(p, (-1.24, -0.64, 1.45), (-0.61, 0.89, 1.85), blue, bevel=0.06)
-    detail.panelled(p, (-0.78, -0.6, 1.49), (-0.41, 0.96, 2.1), blue, bevel=0.06)
-    detail.panelled(p, (-1.25, -1.71, 0.33), (-0.82, -0.5, 1.43), blue, bevel=0.06)
-    detail.slots(p, (-1.25, -1.71, 0.45), (-0.82, -0.5, 0.8), "-y", 3)
-    p.slab(-1.32, -1.78, 0.2, -0.75, -1.6, 0.42, "steel_dark", bevel=0.03)
-    # The coil column on the west housing: a steel post, copper windings, a cap.
-    p.cyl((-1.03, -1.1, 1.62), 0.1, 0.44, "steel_dark", segs=10)
-    detail.coil(p, (-1.03, -1.1), 0.13, 1.42, 1.78, "copper_coil")
-    p.cyl((-1.03, -1.1, 1.86), 0.15, 0.08, "steel_light", segs=10, bevel=0.02)
-    detail.cable(p, [(-1.3, -0.4, 1.5), (-1.45, -0.2, 1.2), (-1.42, 0.2, 0.9)], 0.025, "wire_yellow")
-    detail.cable(p, [(-1.2, 0.6, 1.85), (-1.0, 0.75, 2.0), (-0.75, 0.9, 1.9)], 0.02, "wire_green")
-    # East: the arch over the turntable with dark windows on its top and a red cable along it,
-    # the cream control box under its front end, the brass column, the front pillar.
-    detail.panelled(p, (0.22, -0.38, 1.17), (1.27, 0.81, 1.82), blue, faces=("-y", "-x", "+x", "+y"),
-                    bevel=0.12)
-    detail.panelled(p, (-0.34, 0.3, 1.42), (0.3, 0.81, 1.82), blue, faces=("-y",), bevel=0.06)
-    for x0, x1 in ((0.35, 0.72), (0.8, 1.12)):
-        p.slab(x0, -0.2, 1.82, x1, 0.25, 1.835, "grime")
-    p.slab(0.35, 0.38, 1.82, 1.12, 0.66, 1.84, blue)
-    detail.rivet_line(p, (0.3, -0.33, 1.83), (1.2, -0.33, 1.83), 7, "Z")
-    detail.cable(p, [(-0.3, 0.72, 1.86), (0.4, 0.75, 1.9), (1.0, 0.7, 1.88), (1.3, 0.4, 1.6)], 0.022,
-                 "wire_red")
-    p.slab(0.25, -0.4, 1.3, 1.1, -0.36, 1.7, "steel_dark")
-    p.slab(0.36, -0.58, 0.98, 0.94, -0.22, 1.42, cream, bevel=0.04)
-    p.slab(0.42, -0.6, 1.05, 0.62, -0.58, 1.3, "grime")
-    detail.cable(p, [(0.66, -0.6, 1.3), (0.72, -0.66, 1.15), (0.8, -0.6, 1.02)], 0.018, "wire_green")
-    detail.cable(p, [(0.56, -0.6, 1.36), (0.6, -0.68, 1.2), (0.7, -0.62, 1.06)], 0.018, "wire_red")
-    p.cyl((0.66, -0.23, 0.45), 0.093, 0.68, "brass", segs=16, radius_top=0.47)
-    p.sphere((0.49, -0.35, 0.94), 0.355, "brass", segs=14, rings=7)
-    p.cyl((0.49, -0.35, 0.94), 0.37, 0.05, "steel_dark", segs=14)
-    space_kit.bent(p, [(0.75, -0.5, 0.95), (1.05, -0.65, 0.8), (1.15, -0.75, 0.3)], 0.1, "brass", segs=10)
-    p.cyl((1.15, -0.75, 0.15), 0.14, 0.12, "steel_dark", segs=10)
-    detail.panelled(p, (0.92, -2.16, 0.0), (1.6, -1.11, 1.41), blue)
-    p.slab(1.02, -2.18, 0.35, 1.5, -2.16, 0.7, "grime")
-    p.slab(0.45, -2.1, 0.0, 0.95, -1.15, 0.4, "steel_dark", bevel=0.04)
-    p.cyl((0.68, -1.55, 0.75), 0.17, 0.8, "brass", segs=12)
-    for z in (0.5, 1.0):
-        p.cyl((0.68, -1.55, z), 0.19, 0.05, "steel_dark", segs=12)
-    space_kit.bent(p, [(0.68, -1.55, 1.15), (0.66, -1.2, 1.3), (0.6, -0.75, 1.15)], 0.13, "brass", segs=10)
-    p.cyl((1.0, -1.6, 1.55), 0.15, 0.3, "steel_light", segs=10)
-    p.cyl((1.0, -1.6, 1.74), 0.1, 0.08, "ceramic", segs=10)
-    p.sphere((1.0, -1.6, 1.8), 0.07, "steel_light", segs=8, rings=4)
-    # Back: the cream towers (stepped, slotted, the antenna on the left one, the ribbed dome
-    # and a vent on the right), the corrugated hump and the hoses' riser.
-    detail.panelled(p, (-0.67, 0.95, 0.4), (-0.04, 1.36, 1.85), cream, faces=("-y", "-x", "+x"), bevel=0.05)
-    for z in (0.9, 1.3, 1.7):
-        p.slab(-0.69, 0.93, z, -0.02, 0.96, z + 0.06, "steel_dark")
-    p.slab(-0.6, 1.0, 1.85, -0.12, 1.3, 2.05, cream, bevel=0.03)
-    detail.slots(p, (-0.6, 1.0, 1.86), (-0.12, 1.3, 2.05), "-y", 2)
-    for a, b in (((-0.39, 1.2, 2.05), (-0.37, 1.2, 2.6)), ((-0.37, 1.2, 2.6), (-0.3, 1.2, 2.72)),
-                 ((-0.3, 1.2, 2.72), (-0.36, 1.2, 3.02)), ((-0.46, 1.2, 2.2), (-0.46, 1.2, 2.55))):
-        p.beam(a, b, 0.035, 0.035, "rust_brown")
-    detail.panelled(p, (0.06, 0.86, 0.0), (0.7, 1.13, 1.63), cream, faces=("-y", "-x", "+x"), bevel=0.05)
-    detail.slots(p, (0.3, 0.84, 1.15), (0.66, 0.86, 1.5), "-y", 4)
-    p.sphere((0.31, 0.98, 1.95), 0.22, "steel_light", segs=14, rings=7)
-    for r_, z in ((0.225, 1.95), (0.19, 2.06)):
-        p.cyl((0.31, 0.98, z), r_, 0.025, "steel_dark", segs=14)
-    p.cyl((0.31, 0.98, 1.72), 0.16, 0.12, "steel_dark", segs=12)
+        fan.ring_band((0, 0), 0.1 + 0.085 * k, 0.15 + 0.085 * k, 0.0, 0.1 + 0.02 * k, 90, 180, blue, segs=8)
+    p.add_part(fan, T(*at(335, 725, 0.5)))
     hump = Part()
-    hump.cyl((0, 0, 0), 0.47, 0.99, "rust_brown", segs=12, axis="Y")
+    hump.cyl((0, 0, 0), 0.26, 0.7, "rust_brown", segs=12, axis="X")
+    for k in range(8):
+        hump.cyl((-0.31 + k * 0.088, 0, 0), 0.28, 0.045, "steel_dark", segs=12, axis="X")
+    p.add_part(hump, T(*at(305, 590, 0.36)) @ R("Z", 12))
+    p.prism(poly([(215, 620), (235, 545), (390, 510), (410, 580)], 0.1), 0.0, 0.1, "steel_dark")
+    x, y, _ = at(1020, 560, 0.45)
+    p.cyl((x, y, 0.28), 0.3, 0.56, "steel", segs=14, radius_top=0.14, bevel=0.03)
+    p.beam((x, y, 0.5), (x + 0.2, y + 0.05, 0.72), 0.09, 0.09, "steel_dark")
+    for row0, row1, r in ((770, 1010, 0.2),):
+        a, b = at(1085, row0, 0.32), at(1085, row1, 0.32)
+        p.tube(a, b, r, "paint_fulgora_olive", segs=14)
+        p.sphere(a, r, "paint_fulgora_olive", segs=12, rings=6)
+        p.sphere(b, r, "paint_fulgora_olive", segs=12, rings=6)
+        for t in (0.25, 0.75):
+            c = tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+            p.cyl(c, r + 0.02, 0.05, "steel_dark", segs=14, axis="Y")
+    # The turntable: a cone under a plate with four lobes cut round its hub, the spindle.
+    p.cyl((*tt, 0.28), 0.78, 0.14, "steel_black", segs=28)
+    p.cyl((*tt, 0.38), 0.62, 0.05, "steel_dark", segs=28)
+    for a in (45, 135, 225, 315):
+        t = math.radians(a)
+        c = (tt[0] + 0.3 * math.cos(t), tt[1] + 0.3 * math.sin(t))
+        p.box((*c, 0.42), (0.34, 0.2, 0.04), "steel", rz=a + 90)
+        p.cyl((*c, 0.45), 0.09, 0.03, "grime", segs=10)
+    detail.gear(p, tt, 0.26, 0.42, 0.48, "steel_dark", teeth=10, segs=16, hub="steel")
+    p.cyl((*tt, 1.02), 0.05, 1.1, "steel", segs=10)
+    p.cyl((*tt, 1.5), 0.08, 0.08, "steel_light", segs=10)
+    # The toothed rail at its front and the cogs on it.
+    rail = Part()
+    rail.ring_band((0, 0), 0.8, 0.92, 0.46, 0.54, 205, 335, "steel_light", segs=16)
+    rail.ring_band((0, 0), 0.92, 1.02, 0.3, 0.42, 200, 340, "steel_dark", segs=16)
+    for k in range(10):
+        a = math.radians(208 + 124 * k / 9)
+        rail.cyl((0.86 * math.cos(a), 0.86 * math.sin(a), 0.55), 0.02, 0.02, "steel_black", segs=6)
+    p.add_part(rail, T(*tt, 0))
+    for a, r in ((228, 0.13), (252, 0.15), (288, 0.15), (312, 0.13)):
+        t = math.radians(a)
+        c = (tt[0] + 0.66 * math.cos(t), tt[1] + 0.66 * math.sin(t))
+        detail.gear(p, c, r, 0.46, 0.66, "steel", teeth=7, hub="steel_dark", segs=10)
+    # The grey C ring behind the spindle, tilted to the camera, its bolts and hinge.
+    arch = Part()
+    arch.ring_band((0, 0), 0.52, 0.64, -0.05, 0.05, 80, 275, "steel", segs=18)
+    arch.ring_band((0, 0), 0.47, 0.52, -0.03, 0.03, 80, 275, "steel_dark", segs=18)
     for k in range(7):
-        hump.cyl((0, -0.42 + k * 0.14, 0), 0.5, 0.05, "steel_dark", segs=12, axis="Y")
-    p.add_part(hump, T(-1.35, 0.785, 0.53) @ S(0.62, 1, 1.06))
-    p.slab(-1.66, 0.29, 0.0, -1.04, 1.28, 0.2, "steel_dark")
-    p.cyl((1.46, 0.83, 0.72), 0.415, 1.43, "rust_brown", segs=14, radius_top=0.234)
-    for z, r_ in ((0.3, 0.4), (0.6, 0.36), (0.9, 0.32), (1.2, 0.28)):
-        p.cyl((1.46, 0.83, z), r_ + 0.03, 0.06, "steel_dark", segs=14)
-    p.cyl((1.46, 0.83, 1.46), 0.26, 0.06, "steel_dark", segs=14)
+        a = math.radians(92 + 170 * k / 6)
+        arch.cyl((0.58 * math.cos(a), 0.58 * math.sin(a), 0.06), 0.025, 0.02, "steel_light", segs=6)
+    p.add_part(arch, T(*at(640, 860, 1.05)) @ R("X", 62))
+    # West: the boot, its coil column, the arm rising from it, the cream strip along it.
+    boot = [(268, 1085), (345, 955), (470, 965), (522, 1115), (415, 1195), (345, 1160)]
+    p.prism(poly(boot, 0.85), 0.0, 0.85, blue)
+    p.prism(poly([(c + 12, r + 8) for c, r in boot], 0.86), 0.85, 0.87, blue)
+    detail.rivet_line(p, at(300, 1090, 0.875), at(360, 985, 0.875), 5, "Z", mat="rust_brown")
+    detail.rivet_line(p, at(375, 1165, 0.875), at(495, 1105, 0.875), 6, "Z", mat="rust_brown")
+    detail.rivet_line(p, at(365, 975, 0.875), at(465, 982, 0.875), 5, "Z", mat="rust_brown")
+    p.slab(*at(462, 1040, 0.875)[:2], 0.87, *(c + 0.05 for c in at(470, 1075, 0.875)[:2]), 0.875, "grime")
+    x, y, _ = at(400, 1180, 0.4)
+    p.slab(x - 0.17, y - 0.23, 0.0, x + 0.17, y + 0.2, 0.75, blue, bevel=0.03)
+    detail.rivet_line(p, (x - 0.13, y - 0.24, 0.65), (x + 0.13, y - 0.24, 0.65), 4, "Y")
+    p.slab(x - 0.05, y - 0.25, 0.25, x + 0.05, y - 0.23, 0.5, "grime")
+    p.sphere(at(265, 1090, 0.62), 0.18, "steel", segs=12, rings=6)
+    colx, coly = at(405, 1000, 1.0)[:2]
+    p.cyl((colx, coly, 1.02), 0.17, 0.36, "rust_brown", segs=14, radius_top=0.14, bevel=0.02)
+    for z in (0.92, 1.05, 1.18):
+        p.cyl((colx, coly, z), 0.185, 0.03, "steel_dark", segs=14)
+    p.cyl((colx, coly, 1.45), 0.17, 0.5, blue, segs=14, radius_top=0.07, bevel=0.02)
+    p.cyl((colx, coly, 1.74), 0.08, 0.1, "steel_dark", segs=10)
+    detail.coil(p, (colx, coly), 0.1, 1.8, 2.08, "copper_coil", wire=0.024)
+    p.cyl((colx, coly, 2.14), 0.13, 0.08, "steel_light", segs=12, bevel=0.015)
+    wa, wb = at(440, 790, 1.05), at(500, 640, 1.2)
+    p.beam(wa, wb, 0.42, 0.34, blue, bevel=0.04)
+    p.beam(at(388, 845, 1.05), wa, 0.2, 0.22, blue, bevel=0.03)
+    p.cyl(at(430, 715, 1.42), 0.14, 0.18, "steel", segs=12, bevel=0.02)
+    p.sphere(at(430, 712, 1.55), 0.1, blue, segs=10, rings=5)
+    sa, sb = at(325, 835, 1.15), at(470, 525, 1.5)
+    p.beam(sa, sb, 0.13, 0.12, cream, bevel=0.03)
+    d_ = Vector(sb) - Vector(sa)
+    for k in range(5):
+        c = Vector(sa) + d_ * (0.15 + 0.17 * k)
+        p.slab(c.x - 0.06, c.y - 0.05, c.z + 0.08, c.x + 0.06, c.y + 0.05, c.z + 0.1, "steel_dark")
+    detail.cable(p, [at(345, 690, 1.15), at(312, 738, 1.05), at(332, 775, 1.0)], 0.022, "wire_yellow")
+    detail.cable(p, [at(355, 625, 1.25), at(345, 650, 1.1), at(362, 682, 1.1)], 0.018, "wire_red")
+    detail.cable(p, [at(450, 545, 1.5), at(455, 590, 1.35), at(470, 605, 1.3)], 0.02, "wire_green")
+    # The west tower: cream frame, dark bays, the stack of louvres, the top and antenna.
+    tx0, tx1 = (490 - 650) / 256.0, (640 - 650) / 256.0
+    ty0, ty1 = 0.72, 1.05
+    p.slab(tx0, ty0, 0.3, tx1, ty1, 1.68, "steel_dark")
+    p.slab(tx0 - 0.02, ty0 - 0.02, 0.3, tx1 + 0.02, ty1, 0.72, blue, bevel=0.03)
+    p.slab(tx0 - 0.03, ty0 - 0.03, 0.72, tx0 + 0.13, ty0 + 0.12, 1.72, cream, bevel=0.02)
+    detail.slots(p, (tx0, ty0 + 0.1, 0.8), (tx0, ty1 - 0.04, 1.6), "-x", 5, along=1)
+    for z in (0.9, 1.11, 1.32, 1.53):
+        p.slab(tx1 - 0.2, ty0 - 0.04, z - 0.08, tx1 + 0.04, ty1, z + 0.07, cream, bevel=0.02)
+        p.slab(tx1 - 0.2, ty0 - 0.05, z - 0.12, tx1 + 0.04, ty1, z - 0.08, "steel_dark")
+    for z in (0.98, 1.2, 1.42):
+        p.cyl((tx0 + 0.26, ty0 - 0.05, z), 0.07, 0.04, "steel_black", segs=10, axis="Y")
+    p.slab(tx0 - 0.03, ty0 - 0.03, 1.66, tx1 + 0.04, ty1, 1.74, cream, bevel=0.02)
+    p.slab(tx0 + 0.14, ty0 + 0.08, 1.72, tx1 - 0.14, ty1 - 0.06, 1.82, "steel_dark", bevel=0.02)
+    ax, ay = (565 - 650) / 256.0, 0.9
+    for a, b in (((ax, ay, 1.8), (ax - 0.02, ay, 2.42)), ((ax - 0.02, ay, 2.42), (ax + 0.05, ay, 2.52)),
+                 ((ax + 0.05, ay, 2.52), (ax + 0.02, ay, 2.74)), ((ax - 0.04, ay, 2.42), (ax - 0.07, ay, 2.98)),
+                 ((ax + 0.07, ay, 2.3), (ax + 0.1, ay, 2.72))):
+        p.beam(a, b, 0.032, 0.032, "rust_brown")
+    p.beam(at(470, 450, 1.86), at(505, 415, 1.92), 0.08, 0.08, "steel_dark", bevel=0.01)
+    # The second tower with its dome, the louvred white block on its east.
+    bx0, bx1 = 0.0, 0.46
+    p.slab(bx0, 0.66, 0.3, bx1, 0.95, 1.56, cream, bevel=0.03)
+    p.slab(bx0 - 0.02, 0.64, 0.3, bx1 + 0.02, 0.95, 0.74, blue, bevel=0.03)
+    p.slab(bx0 + 0.14, 0.63, 0.86, bx1 - 0.02, 0.67, 1.4, "grime")
+    detail.rivet_line(p, (bx0 + 0.05, 0.655, 0.86), (bx0 + 0.05, 0.655, 1.5), 6, "Y", mat="rust_brown")
+    detail.spring(p, at(722, 650, 1.1), at(698, 548, 1.5), 0.05, "wire_yellow", turns=8, wire=0.018)
+    dome = (0.28, 0.8, 1.78)
+    p.cyl((dome[0], dome[1], 1.58), 0.11, 0.1, "steel_dark", segs=12)
+    p.sphere(dome, 0.21, "steel_light", segs=16, rings=8)
+    for ax_ in ("Z", "X", "Y"):
+        p.cyl(dome, 0.215, 0.025, "steel_dark", segs=16, axis=ax_, caps=False)
+    block = Part()
+    block.slab(-0.27, -0.2, 0.0, 0.27, 0.2, 0.3, cream, bevel=0.03)
+    block.slab(-0.2, -0.13, 0.3, 0.2, 0.13, 0.31, "steel_black")
+    for k in range(5):
+        block.slab(-0.19 + k * 0.08, -0.12, 0.3, -0.14 + k * 0.08, 0.12, 0.325, "steel")
+    p.add_part(block, T(*at(805, 590, 1.25)) @ R("Z", -16) @ R("X", 8))
+    # East: the broad wedge, its screen, its back rim and red cable, the motors set into it.
+    top = 1.3
+    wedge = [(698, 672), (830, 600), (1085, 722), (1065, 815), (1000, 900), (715, 805)]
+    p.prism(poly(wedge, top), top - 0.38, top, blue, bevel=0.03)
+    p.prism(poly([(835, 605), (1080, 725), (1060, 760), (850, 650)], top + 0.04), top, top + 0.04, "steel_black")
+    for c0, r0, c1, r1 in ((885, 695, 985, 745),):
+        m = T(*at((c0 + c1) / 2, (r0 + r1) / 2, top + 0.13)) @ R("Z", -24)
+        for k, (xc, r_) in enumerate(((-0.18, 0.13), (0.02, 0.11), (0.2, 0.09))):
+            p.cyl((xc, 0, 0), r_, 0.2, "steel" if k != 1 else "steel_light", segs=12, axis="X", matrix=m)
+    panel = [(800, 700), (915, 755), (890, 790), (795, 735)]
+    p.prism(poly(panel, top), top, top + 0.015, "paint_fulgora_screen")
+    p.prism(poly([(c - 12, r + 62) for c, r in panel], top), top, top + 0.012, "steel_dark")
+    detail.rivet_line(p, at(720, 802, top + 0.005), at(990, 895, top + 0.005), 9, "Z")
+    detail.cable(p, [at(810, 633, top + 0.08), at(880, 640, top + 0.1), at(905, 618, top + 0.1), at(1015, 680, top + 0.1)],
+                 0.02, "wire_red")
+    detail.cable(p, [at(860, 690, top + 0.1), at(910, 740, top + 0.14), at(975, 765, top + 0.1)], 0.018, "wire_yellow")
+    # The wedge's east foot, then under it the control box, the brass elbow and column.
+    x, y, _ = at(1000, 960, 0.5)
+    p.slab(x - 0.2, y - 0.2, 0.0, x + 0.2, y + 0.3, top - 0.3, blue, bevel=0.03)
+    box0, box1 = 0.3, 0.96
+    p.slab(box0, -0.34, 0.62, box1, 0.14, 1.0, blue, bevel=0.03)
+    p.slab(box0 - 0.02, -0.36, 0.84, box0 + 0.34, 0.14, 1.02, cream, bevel=0.02)
+    p.slab(box0 + 0.03, -0.37, 0.66, box0 + 0.22, -0.34, 0.8, "grime")
+    p.slab(box0 + 0.1, -0.385, 0.68, box0 + 0.15, -0.37, 0.78, "glow_green_lens")
+    p.slab(box1 - 0.22, -0.36, 0.78, box1 - 0.08, -0.34, 0.92, cream)
+    p.sphere((box1 + 0.14, -0.1, 0.8), 0.17, "steel", segs=12, rings=6)
+    cx_, cy_ = (820 - 650) / 256.0, -0.96
+    p.cyl((cx_, cy_, 0.32), 0.17, 0.64, "brass", segs=16, radius_top=0.15, bevel=0.02)
+    for z in (0.08, 0.66, 0.74):
+        p.cyl((cx_, cy_, z), 0.2, 0.05, "steel_dark", segs=16)
+    p.cyl((cx_, cy_, 0.78), 0.12, 0.14, "steel", segs=12)
+    space_kit.bent(p, [(cx_, cy_, 0.84), (cx_ - 0.02, cy_ + 0.08, 1.02), (cx_ + 0.34, cy_ + 0.1, 1.06),
+                       (cx_ + 0.62, cy_ + 0.3, 0.98), (cx_ + 0.68, cy_ + 0.5, 0.82)], 0.13, "brass", segs=12)
+    space_kit.bent(p, [(box0 + 0.1, -0.42, 0.66), (box0 + 0.08, -0.6, 0.72), (cx_ - 0.04, cy_ + 0.12, 0.95)], 0.1, "brass",
+                   segs=10)
+    p.cyl((cx_ + 0.42, cy_ + 0.12, 1.06), 0.16, 0.05, "steel_dark", segs=12, axis="X")
+    # South-east: the blue pillar on its plate, its screen, the insulator on top.
+    p.prism(poly([(820, 1405), (880, 1362), (1075, 1362), (1085, 1408), (1050, 1445), (850, 1445)], 0.05), 0.0, 0.08,
+            "steel_dark")
+    p.slab(0.94, -1.72, 0.05, 1.56, -1.14, 0.72, blue, bevel=0.04)
+    detail.panel(p, (0.94, -1.72, 0.05), (1.56, -1.14, 0.72), "-y", blue, margin=0.08, rivet="steel_light")
+    p.slab(0.98, -1.58, 0.72, 1.5, -1.16, 1.32, blue, bevel=0.04)
+    detail.panel(p, (0.98, -1.58, 0.72), (1.5, -1.16, 1.32), "-y", blue, margin=0.08, rivet="steel_light")
+    p.slab(1.2, -1.74, 0.2, 1.48, -1.72, 0.5, "steel_black")
+    p.slab(1.24, -1.75, 0.24, 1.44, -1.74, 0.46, "paint_fulgora_screen")
+    p.slab(0.98, -1.5, 1.32, 1.5, -1.16, 1.38, "steel_dark", bevel=0.01)
+    p.cyl((1.15, -1.4, 1.46), 0.15, 0.16, "steel_light", segs=12, bevel=0.02)
+    p.cyl((1.15, -1.4, 1.6), 0.1, 0.12, "ceramic", segs=12)
+    p.sphere((1.15, -1.4, 1.7), 0.06, "steel_light", segs=8, rings=4)
     # Front: the brass drum lying in the hose ring, banded and capped.
-    detail.ribbed_drum(p, (-0.09, -2.175, 0.5), 0.325, 0.79, "brass", "steel_dark", ribs=3)
-    for x in (-0.49, 0.31):
-        p.cyl((x, -2.175, 0.5), 0.2, 0.04, "steel_dark", segs=12, axis="X")
-    # The coil assembly: a copper core with a wire ball, on arms with cream pods.
-    cx, cy = 0.1, -0.25
+    x, y, z = at(630, 1405, 0.27)
+    detail.ribbed_drum(p, (x, y, z), 0.225, 0.84, "brass", "steel_dark", ribs=2)
+    for dx in (-0.43, 0.43):
+        p.cyl((x + dx, y, z), 0.235, 0.04, "steel_dark", segs=14, axis="X")
+    # The wire ball and pods, turning round the spindle.
+    cx, cy = tt
     coil = Part("anim_spin_arms", pivot=(cx, cy, 0.0))
-    coil.cyl((cx, cy, 1.05), 0.2, 0.9, "copper_coil", segs=14)
-    detail.coil(coil, (cx, cy), 0.22, 0.65, 1.15, "copper_coil", turns=4)
-    for z in (0.8, 1.05, 1.3):
-        coil.cyl((cx, cy, z), 0.31, 0.04, "steel_dark", segs=14)
-    detail.cage(coil, (cx, cy, 1.42), 0.27, "copper_coil", rings=3, segs=10)
-    coil.cyl((cx, cy, 1.6), 0.08, 0.3, "steel_light", segs=8)
+    detail.cage(coil, (cx, cy, 1.36), 0.21, "copper_coil", rings=4, segs=12)
+    coil.cyl((cx, cy, 1.36), 0.06, 0.26, "copper_coil", segs=10)
     for k in range(3):
         a = 2 * math.pi * k / 3
-        ex, ey = cx + 0.6 * math.cos(a), cy + 0.6 * math.sin(a)
-        coil.beam((cx, cy, 1.3), (ex, ey, 1.1), 0.08, 0.08, "steel_dark")
-        coil.cyl((ex, ey, 0.92), 0.13, 0.4, "paint_fulgora_cream", segs=10, bevel=0.03)
-        coil.cyl((ex, ey, 1.14), 0.09, 0.05, "copper_coil", segs=10)
+        ex, ey = cx + 0.36 * math.cos(a), cy + 0.36 * math.sin(a)
+        coil.beam((cx, cy, 1.12), (ex, ey, 1.08), 0.05, 0.05, "steel_dark")
+        coil.sphere((ex, ey, 1.08), 0.13, "steel", segs=12, rings=6)
+    for z in (0.96, 1.16):
+        coil.cyl((cx, cy, z), 0.11, 0.04, "steel_dark", segs=12)
     return [p, coil]
 
 

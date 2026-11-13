@@ -1,0 +1,9 @@
+{
+  "name": "zenith-look-scene",
+  "version": "0.1.0",
+  "title": "Zenith look scene",
+  "author": "Zenith",
+  "description": "Test only: builds the same small scene in Factorio and in Zenith's server, for tools/look/factorio_reference.py.",
+  "factorio_version": "2.1",
+  "dependencies": ["base >= 2.0"]
+}

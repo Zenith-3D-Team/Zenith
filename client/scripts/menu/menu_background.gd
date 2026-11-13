@@ -14,7 +14,7 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 
 const DATA := "res://data/menu_world.json"
-const LIVE := ["mv", "bi", "ih", "gi"]
+const LIVE := ["mv", "bs", "ih", "gi"]
 const DRIFT_SPEED := 0.035
 const FACTORY_TYPES := ["assembling-machine", "furnace", "transport-belt", "inserter", "mining-drill",
 	"boiler", "generator", "lab", "container", "electric-pole", "splitter", "underground-belt"]
@@ -138,7 +138,21 @@ func _replay(msg: Dictionary) -> void:
 	match str(msg.get("t", "")):
 		"mv":
 			_movers.handle(copy)
-		"bi":
+		"bs":
+			# (Its lanes' read ticks move on with the loop too.)
+			var shift := _loop * _tick_span
+			if copy.has("sl"):
+				var sl: Array = (copy["sl"] as Array).duplicate()
+				var i := 0
+				while i + 2 < sl.size():
+					sl[i + 1] = int(sl[i + 1]) + shift
+					i += 3 + int(sl[i + 2]) * 4
+				copy["sl"] = sl
+			if copy.has("pc"):
+				var pc: Array = (copy["pc"] as Array).duplicate()
+				for j in range(1, pc.size(), 5):
+					pc[j] = int(pc[j]) + shift
+				copy["pc"] = pc
 			_belt_items.handle(copy)
 		"ih":
 			_arms.handle(copy)
@@ -154,7 +168,7 @@ func _build_environment() -> void:
 	env.ambient_light_color = Color(0.78, 0.78, 0.8)
 	env.ambient_light_energy = 0.6
 	env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
-	env.ssao_enabled = bool(Settings.get_value("graphics", "ssao"))
+	Settings.apply_ssao(env)
 	_env = env
 	Settings.apply_environment(env)
 	Settings.listen(_on_setting)
@@ -175,7 +189,7 @@ func _build_environment() -> void:
 func _on_setting(section: String, _key: String) -> void:
 	if section == "graphics" and _env != null and is_inside_tree():
 		Settings.apply_environment(_env)
-		_env.ssao_enabled = bool(Settings.get_value("graphics", "ssao"))
+		Settings.apply_ssao(_env)
 
 
 func _exit_tree() -> void:

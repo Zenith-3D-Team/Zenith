@@ -7,10 +7,17 @@ extends Node3D
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const FluidsPower := preload("res://scripts/world/fluids_power.gd")
 
-## Factorio's lamps switch on at about this darkness.
+## Factorio's lamps come on spread between these two (the lamp prototype's
+## darkness_for_all_lamps_off and _on): each at its own point.
 const ON_DARKNESS := 0.3
+const ALL_ON_DARKNESS := 0.5
 const MAX_LIGHTS := 48
 const MAX_BULBS := 4096
+## Full detail (full_detail.gd, a screenshot): every lit lamp up to these, with a real light each.
+## FULL_LIGHTS stays under Godot's clustered limit (rendering/limits/cluster_builder/max_clustered_elements,
+## 512 lights, decals and probes in view) with room for the rest.
+const FULL_LIGHTS := 448
+const FULL_BULBS := 65536
 const BULB_HEIGHT := 0.8
 const REFRESH := 0.5
 
@@ -26,6 +33,11 @@ var power: Node
 var fog: Node
 
 var _lights: Array[OmniLight3D] = []
+## Lamps given real lights, and bulbs drawn (full_detail.gd raises both, then puts them back).
+var max_lights := MAX_LIGHTS
+var max_bulbs := MAX_BULBS
+## Refreshed since full detail came on or off (full_detail.gd's settle check).
+var refreshed := true
 var _bulbs: MultiMeshInstance3D
 var _timer := 0.0
 var _lit := 0
@@ -56,7 +68,13 @@ func _ready() -> void:
 	_bulbs.material_override = m
 	_bulbs.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_bulbs)
-	for i in MAX_LIGHTS:
+	_add_lights(MAX_LIGHTS)
+	if world != null and world.has_signal("entities_changed"):
+		world.entities_changed.connect(_on_entities_changed)
+
+
+func _add_lights(n: int) -> void:
+	while _lights.size() < n:
 		var light := OmniLight3D.new()
 		light.light_color = Color(1.0, 0.86, 0.6)
 		light.light_energy = 1.6
@@ -64,8 +82,16 @@ func _ready() -> void:
 		light.visible = false
 		add_child(light)
 		_lights.append(light)
-	if world != null and world.has_signal("entities_changed"):
-		world.entities_changed.connect(_on_entities_changed)
+
+
+## Every lit lamp lit and with a light (a screenshot), or back to the nearest MAX_LIGHTS. Refreshed
+## on the next frame; the lights made for it stay, hidden, for the next shot.
+func set_full_detail(on: bool) -> void:
+	max_lights = FULL_LIGHTS if on else MAX_LIGHTS
+	max_bulbs = FULL_BULBS if on else MAX_BULBS
+	_add_lights(max_lights)
+	_timer = REFRESH
+	refreshed = false
 
 
 func _on_entities_changed(c: Vector2i) -> void:
@@ -92,6 +118,12 @@ func lit_count() -> int:
 	return _lit
 
 
+## How dark it must be before this lamp comes on: a point of its own between ON_DARKNESS and
+## ALL_ON_DARKNESS, the same every time (unit numbers run in order; the golden ratio scatters them).
+static func on_at(unit: int) -> float:
+	return lerpf(ON_DARKNESS, ALL_ON_DARKNESS, fposmod(float(unit) * 0.6180339887, 1.0))
+
+
 func _process(delta: float) -> void:
 	_timer += delta
 	if _timer < REFRESH:
@@ -105,7 +137,7 @@ func _process(delta: float) -> void:
 				_lamps.erase(c)
 				continue
 			for unit in _lamps[c]:
-				if int(world.working.get(unit, 0)) != 1:
+				if int(world.working.get(unit, 0)) != 1 or darkness < on_at(unit):
 					continue
 				var rec = world.entities.get(unit)
 				if rec == null or (fog != null and not fog.seen(rec.pos)):
@@ -117,16 +149,17 @@ func _process(delta: float) -> void:
 	var near := func(a: Vector2, b: Vector2) -> bool:
 		return a.distance_squared_to(focus) < b.distance_squared_to(focus)
 	lit.sort_custom(near)
-	_lit = mini(lit.size(), MAX_BULBS)
+	_lit = mini(lit.size(), max_bulbs)
 	var mm := _bulbs.multimesh
 	if mm.instance_count < _lit:
 		mm.instance_count = maxi(_lit, mm.instance_count * 2)
 	mm.visible_instance_count = _lit
 	for i in _lit:
 		mm.set_instance_transform(i, Transform3D(Basis.IDENTITY, Vector3(lit[i].x, BULB_HEIGHT, lit[i].y)))
+	refreshed = true
 	for i in _lights.size():
 		var light := _lights[i]
-		light.visible = i < _lit
+		light.visible = i < _lit and i < max_lights
 		if light.visible:
 			light.position = Vector3(lit[i].x, BULB_HEIGHT + 0.6, lit[i].y)
 			light.light_energy = 0.7 if dim.has(lit[i]) else 1.6

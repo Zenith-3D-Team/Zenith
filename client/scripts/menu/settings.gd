@@ -9,7 +9,7 @@ extends RefCounted
 ## and then left alone.
 ##
 ## Command-line options win over the file for that run and aren't saved: --ui-scale (kit.gd),
-## --camera=... (camera_rig.gd), --factorio-data (item_icons.gd), --no-sprites, the sound options
+## --camera=... (camera_rig.gd), --factorio-data (item_icons.gd), the sound options
 ## (fx_settings.gd), and --factorio=<factorio.exe> --server-data=<dir> --saves-dir=<dir>
 ## --port-base=<port> (here). --settings-file=<path> uses another file, so tests and screenshots
 ## leave the player's own settings alone.
@@ -27,13 +27,20 @@ const PATH := "user://settings.cfg"
 const DEFAULTS := {
 	"graphics": {
 		"window_mode": "windowed",  # windowed, borderless, fullscreen
-		"resolution": "",  # "1920x1080"; "" keeps the project's window size
+		"resolution": "",  # "1920x1080"; "" keeps the window's size, or in full screen the monitor's
 		"screen": -1,  # Factorio's preferred screen; -1: the primary one
 		"minimize_on_focus_loss": false,  # in full screen
 		"vsync": true,
 		"fps_cap": 0,  # 0: unlimited
 		"render_scale": 1.0,
-		"antialiasing": "fxaa",  # off, fxaa, taa, msaa2, msaa4, msaa8
+		# off, fxaa, smaa, taa, msaa2, msaa4, msaa8. SMAA: sharper than FXAA and on the owner's desktop
+		# cheaper (10.7 against 11.4 ms of GPU standing), and it works under every look, where MSAA
+		# doesn't under a look with its own passes (MSAA_UNDER_LOOK).
+		"antialiasing": "smaa",
+		# How the world is lit and graded (looks.gd): "factorio" (matched to Factorio's pictures),
+		# "classic" (Zenith's look before 0.1.4), or an add-on's look
+		"look": "factorio",
+		"look_before": "factorio",  # what an add-on's look replaced, back when the add-on goes
 		"shadows": "high",  # off, low, medium, high, ultra (sun_shadows.gd)
 		"shadow_distance": 0,  # tiles the shadows may reach from the camera; 0: the quality's (sun_shadows.gd)
 		# high, medium, low: how soon far-away models and their shadows simplify (model_lods.gd); the
@@ -46,10 +53,15 @@ const DEFAULTS := {
 		# render CPU, but its per-pixel table reads cost GPU time (laptop at Ultra: 1-2 ms more
 		# standing), so off unless the CPU is the limit. Read when models load: after a restart.
 		"merged_materials": false,
-		# Screen-space ambient occlusion: off (owner's decision; WIP). Its own step is cheap, but it makes
-		# Godot's depth pre-pass work out every pixel's normal and roughness, which runs the models'
-		# weathering: 6-7 ms of GPU a frame at a busy base (PERFORMANCE-AUDIT.md, item 2).
-		"ssao": false,
+		# Screen-space ambient occlusion (apply_ssao), on in High and Ultra. Its own step is cheap, but
+		# it makes Godot's depth pre-pass write every pixel's normal and roughness: 6-7 ms of GPU on the
+		# laptop before the weathering left that pass (PERFORMANCE-AUDIT.md, item 2), about 0.7 ms on
+		# the desktop since. Only drawn zoomed in: ao_zoom.gd fades it out with the zoom and switches it
+		# off past that, so a zoomed-out view pays nothing for it.
+		"ssao": true,
+		# The dark rim on the ground round each building's foot that Factorio's sprites have
+		# (contact_shade.gd): one MultiMesh per chunk, on in every preset.
+		"contact_shading": true,
 		# Godot's renderer on a thread of its own (faster on busy bases); off: the main thread, as
 		# before. Read at start-up from ENGINE_OVERRIDES, so it applies after a restart.
 		"render_thread": false,  # Godot calls it experimental; no gain measured, rare hangs on quitting
@@ -65,15 +77,16 @@ const DEFAULTS := {
 		# While the game runs under 60 UPS, ask the bridge for less (distances, minimap refreshes,
 		# frame rate) below these settings, and give it back when it recovers (ups_governor.gd)
 		"hold_ups": true,
+		# With the server on this PC, the client's process runs at below-normal priority, so Factorio's
+		# tick gets a core first when all are busy (main.gd _apply_priority; --server-first=off)
+		"server_first": true,
 		"item_icons": true,  # Factorio's icons on items on belts and on the ground
 		"item_models_max": 20500,  # Items in 3D: the most belt items drawn as models, nearest first; 0 icons only; ITEM_MODELS_ALL every one
-		# Models: "colours" (each part in its colour from Factorio's sprite), "sprite" (Factorio's
-		# sprite projected on as well), "palette" (the models' own colours)
-		"model_look": "colours",
 		"effects": true,  # Factorio's "Show all smoke" and "Show particles": smoke, dust, flashes, explosions
 		"clouds": true,  # clouds in the sky and their shadows on the ground, planets' haze (scripts/world/sky.gd)
 		"decoratives": true,  # grass, flowers and small rocks from Factorio (scripts/world/decoratives.gd)
 		"decorative_density": 1.0,  # the share of them drawn, 0.1 to 1
+		"grass_3d": "normal",  # grass and low plants near the character in 3D: off, short, normal, far (decoratives.gd)
 		"brightness": 1.0,  # 0.5 to 1.5, as Factorio's sliders
 		"contrast": 1.0,
 		"saturation": 1.0,
@@ -163,20 +176,23 @@ static func write_engine_overrides() -> void:
 
 ## Graphics presets (Settings > Graphics > Preset): the settings each sets together, from cheapest to
 ## dearest. High is the defaults; every setting stays its own, and the preset shows "Custom" once
-## any of these differs from all of them (preset_now()).
+## any of these differs from all of them (preset_now()). High and Ultra have SSAO since its tuned form
+## (apply_ssao) measured about 0.7 ms of GPU at the mock's busy base on a desktop card
+## (PERFORMANCE-AUDIT.md), and ao_zoom.gd switches it off zoomed out. Anti-aliasing isn't a preset's:
+## SMAA (the default) costs about what FXAA does.
 const PRESETS := {
 	"low": {"shadows": "low", "ssao": false, "lod_quality": "low", "view_radius": 5, "entity_radius": 96,
-		"belt_updates": 2000, "belt_distance": 64, "decorative_distance": 96, "decorative_density": 0.5,
-		"clouds": false},
+		"belt_updates": 2000, "belt_distance": 64, "decorative_distance": 96, "decorative_density": 0.5, "grass_3d": "off",
+		"clouds": false, "contact_shading": true},
 	"medium": {"shadows": "medium", "ssao": false, "lod_quality": "medium", "view_radius": 7, "entity_radius": 128,
-		"belt_updates": 4000, "belt_distance": 96, "decorative_distance": 128, "decorative_density": 0.75,
-		"clouds": true},
-	"high": {"shadows": "high", "ssao": false, "lod_quality": "medium", "view_radius": 10, "entity_radius": 192,
-		"belt_updates": -1, "belt_distance": 160, "decorative_distance": 192, "decorative_density": 1.0,
-		"clouds": true},
-	"ultra": {"shadows": "ultra", "ssao": false, "lod_quality": "high", "view_radius": 14, "entity_radius": 256,
-		"belt_updates": -1, "belt_distance": 320, "decorative_distance": 256, "decorative_density": 1.0,
-		"clouds": true},
+		"belt_updates": 4000, "belt_distance": 96, "decorative_distance": 128, "decorative_density": 0.75, "grass_3d": "short",
+		"clouds": true, "contact_shading": true},
+	"high": {"shadows": "high", "ssao": true, "lod_quality": "medium", "view_radius": 10, "entity_radius": 192,
+		"belt_updates": -1, "belt_distance": 160, "decorative_distance": 192, "decorative_density": 1.0, "grass_3d": "normal",
+		"clouds": true, "contact_shading": true},
+	"ultra": {"shadows": "ultra", "ssao": true, "lod_quality": "high", "view_radius": 14, "entity_radius": 256,
+		"belt_updates": -1, "belt_distance": 320, "decorative_distance": 256, "decorative_density": 1.0, "grass_3d": "far",
+		"clouds": true, "contact_shading": true},
 }
 
 
@@ -254,6 +270,9 @@ static func preset_now() -> String:
 ## background and whether the sun casts shadows at all read it here).
 const SHADOW_SIZES := {"low": 2048, "medium": 4096, "high": 4096, "ultra": 8192}
 const MSAA := {"msaa2": Viewport.MSAA_2X, "msaa4": Viewport.MSAA_4X, "msaa8": Viewport.MSAA_8X}
+## Screen-space anti-aliasing: SMAA keeps edges and fine detail sharper than FXAA, and unlike TAA
+## doesn't soften what moves (Godot has no motion vectors for belts' scrolling surfaces).
+const SCREEN_SPACE_AA := {"fxaa": Viewport.SCREEN_SPACE_AA_FXAA, "smaa": Viewport.SCREEN_SPACE_AA_SMAA}
 
 ## The file in use: PATH, --settings-file=<path>, or a test's (use_file()).
 static var path := ""
@@ -265,7 +284,13 @@ static var legacy := {
 
 static var _cfg := ConfigFile.new()
 static var _loaded := false
+## The look in use asks for temporal anti-aliasing (looks.gd), whatever the setting says.
+static var look_taa := false
 static var _listeners: Array[Callable] = []
+## Values held for a while over the player's own without touching the file (full_detail.gd: every
+## distance and level at its most for a screenshot): section -> {key: value}. get_value returns them
+## first; hold() and release() tell the listeners once for the lot.
+static var _held := {}
 ## The rebindable actions' defaults as player_input.gd defines them: action -> [primary, alternative]
 ## key codes (0: none), in its order.
 static var _default_keys := {}
@@ -276,6 +301,25 @@ static var factorio_keys := {}
 ## The settings read from Factorio's config.ini (factorio_settings.gd), {section: {key: value}}:
 ## the defaults for those keys, in place of DEFAULTS'. {} when off.
 static var factorio_values := {}
+
+## The build's channel (tools/release/package.py --channel): the public downloads carry no testing
+## tools, development builds and a checkout do (owner). A dev export has the custom feature tag
+## DEV_FEATURE, baked into its .pck by package.py, so the build itself says what it is: no file
+## beside the program to lose, copy or forge.
+const DEV_FEATURE := "zenith_dev"
+## Tests force dev_tools() one way (1) or the other (0); -1 asks the build.
+static var dev_tools_override := -1
+
+
+## The testing tools are here: the main menu's Performance test and --perf-test, the debug menu
+## (Ctrl+F12) and its overlays. True in a dev build and when running from source (the editor, or
+## `godot --path client`), unless started with `-- --public-build` to see what players get.
+static func dev_tools() -> bool:
+	if dev_tools_override != -1:
+		return dev_tools_override == 1
+	if OS.has_feature(DEV_FEATURE):
+		return true
+	return not OS.has_feature("template") and not has_arg("--public-build")
 
 
 static func load_settings() -> void:
@@ -296,7 +340,9 @@ static func load_settings() -> void:
 	var reset := _ssao_off_once()
 	var belt_auto := _belt_auto_once()
 	var still_cards := _mod_anim_off_once()
-	if _migrate() or renamed or reset or belt_auto or still_cards or not existed:
+	var full_res := _full_screen_resolution_once()
+	var grass := _grass_preset_once()
+	if _migrate() or renamed or reset or belt_auto or still_cards or full_res or grass or not existed:
 		_cfg.save(path)
 
 
@@ -331,11 +377,18 @@ static func _rename_values() -> bool:
 		if not (on is bool and on):
 			_cfg.erase_section_key("graphics", key)
 			changed = true
+	# The Model look's "Factorio sprite projected" is gone (owner): models always wear Factorio's
+	# colours. A file that chose it says "colours" from now on (so an older Zenith reads that too).
+	if _cfg.has_section_key("graphics", "model_look") and str(_cfg.get_value("graphics", "model_look")) != "colours":
+		_cfg.set_value("graphics", "model_look", "colours")
+		changed = true
 	return changed
 
 
 ## SSAO was on by default and in the High and Ultra presets until it measured 6-7 ms of GPU a
-## frame; it is off now (a WIP option), and turned off once in files saved before. True when changed.
+## frame; it was turned off once in files saved before then (this flag). Retuned (about 0.7 ms, faded
+## out with the zoom) it is on by default and in High and Ultra again; files that already have the
+## flag keep the player's choice. True when changed.
 static func _ssao_off_once() -> bool:
 	if bool(_cfg.get_value("meta", "ssao_off", false)):
 		return false
@@ -356,6 +409,18 @@ static func _mod_anim_off_once() -> bool:
 	return true
 
 
+## Resolution did nothing in full screen until it came to scale the picture to the monitor. Once, in
+## files saved before: one in full screen drops the size left over from a window, so the game doesn't
+## turn blurry by itself; picked again it stays. True when the file needs saving.
+static func _full_screen_resolution_once() -> bool:
+	if bool(_cfg.get_value("meta", "full_screen_resolution", false)):
+		return false
+	_cfg.set_value("meta", "full_screen_resolution", true)
+	if str(_cfg.get_value("graphics", "window_mode", "windowed")) != "windowed" and _cfg.has_section_key("graphics", "resolution"):
+		_cfg.erase_section_key("graphics", "resolution")
+	return true
+
+
 ## 0.1.2's High and Ultra presets wrote Moving belt items (then Belt updates) as 6,000 and 12,000;
 ## since 0.1.3 both presets, and the default, are Automatic. A file left on one of those presets
 ## kept the fixed cap and its Preset read Custom. Once, in files saved before: one whose graphics
@@ -369,6 +434,18 @@ static func _belt_auto_once() -> bool:
 	for preset in caps:
 		if cap is int and cap == caps[preset] and _stored_preset(preset, "belt_updates"):
 			_cfg.set_value("graphics", "belt_updates", -1)
+	return true
+
+
+## 3D grass is new, and its default is High's. Once, in files saved before: one on the Low or Medium
+## preset takes that preset's value, so a slower PC doesn't get it unasked. True when the file needs saving.
+static func _grass_preset_once() -> bool:
+	if bool(_cfg.get_value("meta", "grass_preset", false)):
+		return false
+	_cfg.set_value("meta", "grass_preset", true)
+	for preset in ["low", "medium"]:
+		if _stored_preset(preset, "grass_3d"):
+			_cfg.set_value("graphics", "grass_3d", PRESETS[preset]["grass_3d"])
 	return true
 
 
@@ -438,6 +515,8 @@ static func _migrate() -> bool:
 
 static func get_value(section: String, key: String) -> Variant:
 	load_settings()
+	if not _held.is_empty() and _held.has(section) and (_held[section] as Dictionary).has(key):
+		return _held[section][key]
 	var fallback = factorio_values.get(section, {}).get(key, DEFAULTS.get(section, {}).get(key))
 	return _cfg.get_value(section, key, fallback)
 
@@ -482,6 +561,36 @@ static func set_value(section: String, key: String, value: Variant, persist := t
 		if tree != null:
 			apply_ui_scale(tree.root)
 	_notify(section, key)
+
+
+## Holds these values of a section over the player's own (`{key: value}`), not saved; the listeners
+## hear of it once (the last key). release() gives the player's back.
+static func hold(section: String, values: Dictionary) -> void:
+	load_settings()
+	if values.is_empty():
+		return
+	var mine: Dictionary = _held.get(section, {})
+	mine.merge(values, true)
+	_held[section] = mine
+	_held_changed(section, values.keys())
+
+
+static func release(section: String) -> void:
+	if not _held.has(section):
+		return
+	var keys: Array = (_held[section] as Dictionary).keys()
+	_held.erase(section)
+	_held_changed(section, keys)
+
+
+static func held(section: String, key: String) -> bool:
+	return _held.has(section) and (_held[section] as Dictionary).has(key)
+
+
+static func _held_changed(section: String, keys: Array) -> void:
+	if section == "graphics" and keys.has("item_models_max"):
+		apply_item_look()
+	_notify(section, str(keys[-1]))
 
 
 static func save() -> void:
@@ -536,7 +645,7 @@ static func has_arg(prefix: String) -> bool:
 
 # --- startup ---------------------------------------------------------------------------------
 
-## Settings that must be in place before anything is built: the UI scale, models' sprites,
+## Settings that must be in place before anything is built: the UI scale, merged materials,
 ## icons on items, the tooltip delay. Called first thing by main.gd.
 static func apply_startup(window_height: float) -> void:
 	load_settings()
@@ -545,7 +654,6 @@ static func apply_startup(window_height: float) -> void:
 		Kit.scale = clampf(float(ui_scale), 0.5, 4.0)
 		Kit._scale_set = true
 	Kit.configure(window_height)
-	ModelLibrary.set_look(str(get_value("graphics", "model_look")))
 	apply_merged_materials()
 	ItemCards.use_icons = bool(get_value("graphics", "item_icons"))
 	apply_item_look()
@@ -555,6 +663,14 @@ static func apply_startup(window_height: float) -> void:
 
 ## Settings → Graphics → Items in 3D: the slider's top end draws every item as a model.
 const ITEM_MODELS_ALL := 20500
+
+## Settings → Graphics → View distance, in chunks round the camera: the slider's top end (world.gd
+## MAX_VIEW_RADIUS, the bridge's world.lua MAX_RADIUS), and past where its value shows yellow and
+## then red (owner's request). What is drawn grows with the square: 20 is four times 10's ground,
+## 50 twenty-five times.
+const VIEW_RADIUS_MAX := 50
+const VIEW_RADIUS_DEAR := 10
+const VIEW_RADIUS_DEAREST := 20
 
 
 static func models_cap(value: Variant) -> int:
@@ -575,14 +691,27 @@ static func apply_item_look() -> void:
 const UI_SCALES := ["0.75", "1.0", "1.25", "1.5", "1.75", "2.0"]
 
 
-## The UI scale the settings ask for now ("auto" follows the window's height, as Factorio does).
+## The scale the interface is drawn at for a UI scale setting, in a window this many lines high with
+## this full_screen_ratio(): the setting means what it would at the picked resolution ("auto" follows
+## that many lines, as Factorio does), and the interface is that much larger on the monitor's own
+## pixels, so it takes the room it would there and stays sharp.
+static func ui_scale_for(value: String, window_height: float, ratio: float) -> float:
+	var at_resolution := Kit.scale_for(window_height * ratio) if value == "auto" else clampf(float(value), 0.5, 4.0)
+	return at_resolution / ratio
+
+
+## The UI scale the settings ask for now, in screen pixels.
 static func wanted_ui_scale() -> float:
 	if has_arg("--ui-scale="):
 		return clampf(float(arg_value("--ui-scale=")), 0.5, 4.0)
-	var value := str(get_value("interface", "ui_scale"))
-	if value == "auto":
-		return Kit.scale_for(DisplayServer.window_get_size().y)
-	return clampf(float(value), 0.5, 4.0)
+	return ui_scale_for(str(get_value("interface", "ui_scale")), DisplayServer.window_get_size().y, full_screen_ratio())
+
+
+## The UI scale as the player knows it: at the picked resolution, what Settings and Ctrl+= speak of.
+static func chosen_ui_scale() -> float:
+	if has_arg("--ui-scale="):
+		return wanted_ui_scale()
+	return ui_scale_for(str(get_value("interface", "ui_scale")), DisplayServer.window_get_size().y * full_screen_ratio(), 1.0)
 
 
 ## Changes the UI scale without a restart. The UI is built in GUI pixels times Kit.scale, the
@@ -600,7 +729,7 @@ static func apply_ui_scale(root: Window) -> void:
 
 ## One step up or down Factorio's list of UI scales (Ctrl+= / Ctrl+-), from the scale in use.
 static func step_ui_scale(steps: int) -> void:
-	var now := wanted_ui_scale()
+	var now := chosen_ui_scale()
 	var i := 0
 	for k in UI_SCALES.size():
 		if absf(float(UI_SCALES[k]) - now) < absf(float(UI_SCALES[i]) - now):
@@ -626,6 +755,210 @@ static func fps_limit() -> int:
 	return cap
 
 
+## Whether temporal anti-aliasing is on: picked here, or asked for by the look in use.
+static func taa_on() -> bool:
+	return str(get_value("graphics", "antialiasing")) == "taa" or look_taa
+
+
+## MSAA under a look that draws full-screen passes (the Cinematic shaders' grade, or any add-on's
+## look or api.shaders pass; Zenith's own Factorio and Classic looks have none) is switched to SMAA in
+## the settings (owner: "it should be on SMAA"). A pass reads the depth texture, and with MSAA Godot
+## resolves that by averaging each pixel's samples (renderer_rd/shaders/effects/resolve.glsl,
+## MODE_RESOLVE_DEPTH): along every silhouette the depth is half the building's and half the ground's
+## or the sky's, a place that isn't there. The grade's sky test (depth 0), its clouds and their
+## shadows, the sharpening faded by distance and the far softening all go wrong on those pixels, so
+## every edge gets a fringe; and the pass writes one colour into all of a pixel's samples anyway, so
+## MSAA's own edges are lost under it. It also multiplies what the look adds (SSAO's and SSIL's
+## buffers, TAA's) for nothing (docs/SHADER-PERFORMANCE-PLAN.md). The MSAA choices stay greyed out
+## while such a look is on (settings_window.gd _grey_msaa).
+const MSAA_UNDER_LOOK := "smaa"
+const BUILT_IN_LOOKS := ["factorio", "classic"]
+
+
+## Whether the look in use now draws passes of its own (or an add-on's pass is over every look).
+static func look_draws_passes() -> bool:
+	var looks_script = load("res://scripts/world/looks.gd")
+	if not (looks_script.extras as Dictionary).is_empty():
+		return true
+	var id := str(get_value("graphics", "look"))
+	if looks_script.active != null:
+		id = str(looks_script.active.current)
+	var spec: Dictionary = (looks_script.looks as Dictionary).get(id, {})
+	if spec.is_empty():
+		# Not registered: before the add-ons start, an add-on's look is taken to have passes (it will);
+		# after, an id nobody registered falls back to Factorio's look, which has none.
+		return not BUILT_IN_LOOKS.has(id) and not _addons_started
+	return not (spec.get("passes", []) as Array).is_empty()
+
+
+## Set by main.gd once the add-ons switched on have started (their looks are registered by then).
+static var _addons_started := false
+
+
+## The anti-aliasing drawn: the setting, or SMAA in place of an MSAA not switched yet under a look
+## with passes (switch_msaa_for_look() saves it).
+static func antialiasing_in_effect() -> String:
+	var aa := str(get_value("graphics", "antialiasing"))
+	return MSAA_UNDER_LOOK if MSAA.has(aa) and look_draws_passes() else aa
+
+
+## The name of the look in use when it sets `what` itself, so that Settings > Graphics' own row for it
+## does nothing while the look is on (greyed out, settings_window.gd): "ssao" (its environment's
+## ssao_enabled, the Cinematic look's Ambient occlusion) or "clouds" (own_clouds false: its own clouds,
+## its own Clouds slider). "" when the setting applies.
+static func look_overrides(what: String) -> String:
+	var looks_script = load("res://scripts/world/looks.gd")
+	var id := str(get_value("graphics", "look"))
+	if looks_script.active != null:
+		id = str(looks_script.active.current)
+	var spec: Dictionary = (looks_script.looks as Dictionary).get(id, {})
+	var own := false
+	match what:
+		"ssao":
+			own = (spec.get("environment", {}) as Dictionary).has("ssao_enabled")
+		"clouds":
+			own = spec.has("own_clouds") and not bool(spec["own_clouds"])
+	return str(spec.get("name", id)) if own else ""
+
+
+## Under a look with passes a saved MSAA becomes SMAA in the settings, saved, so Settings shows what is
+## drawn. True when it changed something.
+static func switch_msaa_for_look() -> bool:
+	if MSAA.has(str(get_value("graphics", "antialiasing"))) and look_draws_passes():
+		set_value("graphics", "antialiasing", MSAA_UNDER_LOOK)
+		return true
+	return false
+
+
+## What Settings > Graphics > Anti-aliasing adds to its note under a look with passes: why MSAA is
+## greyed out. "" under Zenith's own looks.
+static func antialiasing_look_note() -> String:
+	if look_draws_passes():
+		return "MSAA is off under the look in use: its full-screen passes read a depth that MSAA blurs at every edge."
+	return ""
+
+
+## Once the add-ons switched on have started (main.gd): their looks are known, so a saved MSAA under a
+## look with passes becomes SMAA and the anti-aliasing is applied, before the first frame is drawn.
+static func settle_antialiasing(root: Window) -> void:
+	_addons_started = true
+	switch_msaa_for_look()
+	apply_antialiasing(root)
+
+
+## MSAA, screen-space anti-aliasing and TAA on the window from the settings. TAA (the setting's or
+## the look's) goes with SMAA as it does with any screen-space choice: Godot runs both.
+static func apply_antialiasing(root: Window) -> void:
+	if root == null or DisplayServer.get_name() == "headless":
+		return
+	var aa := antialiasing_in_effect()
+	var msaa: int = MSAA.get(aa, Viewport.MSAA_DISABLED)
+	if root.msaa_3d != msaa:
+		root.msaa_3d = msaa as Viewport.MSAA
+	var ss: int = SCREEN_SPACE_AA.get(aa, Viewport.SCREEN_SPACE_AA_DISABLED)
+	if root.screen_space_aa != ss:
+		root.screen_space_aa = ss as Viewport.ScreenSpaceAA
+	root.use_taa = taa_on()
+
+
+## A Resolution setting ("1920x1080") as a size; (0, 0) for none or one too small to use.
+static func parse_resolution(res: String) -> Vector2i:
+	if res.contains("x"):
+		var wanted := Vector2i(int(res.get_slice("x", 0)), int(res.get_slice("x", 1)))
+		if wanted.x >= 320 and wanted.y >= 240:
+			return wanted
+	return Vector2i.ZERO
+
+
+## How much of a monitor's resolution a Resolution setting comes to in full screen, where the window
+## is the monitor: the fraction of its pixels each way that holds the picked size whole. The world
+## always fills the monitor undistorted, so a size of another shape keeps its rows or columns and
+## shows a little more the other way. Never above 1: a size past the monitor (a saved one, after
+## moving to a smaller screen) is the monitor's own; Game render scaling is there to go beyond it.
+static func resolution_ratio(res: String, monitor: Vector2i) -> float:
+	var wanted := parse_resolution(res)
+	if wanted == Vector2i.ZERO or monitor.x <= 0 or monitor.y <= 0:
+		return 1.0
+	return minf(1.0, maxf(float(wanted.x) / monitor.x, float(wanted.y) / monitor.y))
+
+
+## The 3D scale for Game render scaling and a resolution_ratio(): they multiply. 0.1 is Godot's floor.
+static func render_scale_for(render_scale: float, ratio: float) -> float:
+	return clampf(clampf(render_scale, 0.25, 2.0) * ratio, 0.1, 2.0)
+
+
+## The resolution_ratio() in use now: 1 unless the window really is full screen. VR draws for the
+## headset, whatever the desktop window is. --scale-like-full-screen does the sums with the window
+## as the monitor, so a test can see the scaling without taking the screen over.
+static func full_screen_ratio() -> float:
+	if DisplayServer.get_name() == "headless" or has_arg("--vr"):
+		return 1.0
+	var res := str(get_value("graphics", "resolution"))
+	if has_arg("--scale-like-full-screen"):
+		return resolution_ratio(res, DisplayServer.window_get_size())
+	if str(get_value("graphics", "window_mode")) == "windowed" or DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_WINDOWED:
+		return 1.0
+	# The screen's size, not the window's: it stays right while the window is minimised.
+	return resolution_ratio(res, DisplayServer.screen_get_size(DisplayServer.window_get_current_screen()))
+
+
+## The 3D scale and the interface's for the window as it is now. In full screen the world is drawn at
+## the Resolution and scaled up through scaling_3d_scale, while the interface is drawn on the
+## monitor's own pixels: only the 3D buffer changes size, so screen coordinates, mouse picking and
+## screenshots work as at any render scale. Also called when the window's size changes.
+static func apply_window_scales(root: Window) -> void:
+	if root == null or DisplayServer.get_name() == "headless":
+		return
+	var scale_3d := render_scale_for(float(get_value("graphics", "render_scale")), full_screen_ratio())
+	if not is_equal_approx(root.scaling_3d_scale, scale_3d):
+		root.scaling_3d_scale = scale_3d
+	apply_ui_scale(root)
+
+
+## The screen the Preferred screen setting means.
+static func chosen_screen() -> int:
+	var screen := int(get_value("graphics", "screen"))
+	if screen < 0 or screen >= DisplayServer.get_screen_count():
+		screen = DisplayServer.get_primary_screen()
+	return screen
+
+
+## Settings > Graphics > Resolution's items for a monitor, [label, value]: windowed, the window sizes
+## that fit on it; in full screen the monitor's own and the common sizes it can scale up from.
+static func resolution_choices(monitor: Vector2i, full_screen: bool) -> Array:
+	var own := default_window_size()
+	var choices: Array = [["Monitor's own (%d × %d)" % [monitor.x, monitor.y] if full_screen else "Default (%d × %d)" % [own.x, own.y], ""]]
+	var listed: Array = RESOLUTIONS.duplicate()
+	var native := "%dx%d" % [monitor.x, monitor.y]
+	if not full_screen and not listed.has(native):
+		listed.append(native)
+	for r in listed:
+		var size := parse_resolution(str(r))
+		if size.x <= monitor.x and size.y <= monitor.y and (not full_screen or resolution_ratio(str(r), monitor) < 1.0):
+			choices.append(["%d × %d" % [size.x, size.y], r])
+	return choices
+
+
+## The window's size when Zenith starts with no Resolution set (project.godot's).
+static func default_window_size() -> Vector2i:
+	return Vector2i(int(ProjectSettings.get_setting("display/window/size/viewport_width", 1600)),
+		int(ProjectSettings.get_setting("display/window/size/viewport_height", 900)))
+
+
+## Resolution's Default picked in a window: the window goes back to default_window_size() (a size
+## left empty otherwise keeps the window as it is, dragged bigger or not).
+static func restore_default_window_size() -> void:
+	if DisplayServer.get_name() == "headless" or str(get_value("graphics", "window_mode")) != "windowed" or has_arg("--screenshot="):
+		return
+	if DisplayServer.window_get_mode() != DisplayServer.WINDOW_MODE_WINDOWED:
+		return
+	var size := default_window_size()
+	var area := DisplayServer.screen_get_usable_rect(chosen_screen())
+	size = Vector2i(mini(size.x, area.size.x), mini(size.y, area.size.y))
+	DisplayServer.window_set_size(size)
+	DisplayServer.window_set_position(area.position + (area.size - size) / 2)
+
+
 ## Window mode, size, screen, vsync, FPS cap, render scale and anti-aliasing. The window's mode
 ## and size are skipped for screenshots (--screenshot), so they keep the project's window.
 static func apply_window(root: Window) -> void:
@@ -633,11 +966,7 @@ static func apply_window(root: Window) -> void:
 		return
 	Engine.max_fps = fps_limit()
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_ENABLED if bool(get_value("graphics", "vsync")) else DisplayServer.VSYNC_DISABLED)
-	root.scaling_3d_scale = clampf(float(get_value("graphics", "render_scale")), 0.25, 2.0)
-	var aa := str(get_value("graphics", "antialiasing"))
-	root.msaa_3d = MSAA.get(aa, Viewport.MSAA_DISABLED)
-	root.screen_space_aa = Viewport.SCREEN_SPACE_AA_FXAA if aa == "fxaa" else Viewport.SCREEN_SPACE_AA_DISABLED
-	root.use_taa = aa == "taa"
+	apply_antialiasing(root)
 	# --borderless: a window without a frame, for screenshot runs that shouldn't look like the game opening.
 	if has_arg("--borderless"):
 		# Dropping the frame keeps the outer rectangle, which would grow the picture by the frame's
@@ -645,11 +974,14 @@ static func apply_window(root: Window) -> void:
 		var before := DisplayServer.window_get_size()
 		DisplayServer.window_set_flag(DisplayServer.WINDOW_FLAG_BORDERLESS, true)
 		DisplayServer.window_set_size(before)
-	if has_arg("--screenshot="):
-		return
-	var screen := int(get_value("graphics", "screen"))
-	if screen < 0 or screen >= DisplayServer.get_screen_count():
-		screen = DisplayServer.get_primary_screen()
+	if not has_arg("--screenshot="):
+		_apply_window_mode()
+	apply_window_scales(root)
+
+
+## The window's mode, size and screen from the settings.
+static func _apply_window_mode() -> void:
+	var screen := chosen_screen()
 	var on_screen := DisplayServer.window_get_current_screen() == screen
 	match str(get_value("graphics", "window_mode")):
 		"borderless", "fullscreen":
@@ -663,11 +995,9 @@ static func apply_window(root: Window) -> void:
 			if DisplayServer.window_get_mode() != DisplayServer.WINDOW_MODE_WINDOWED:
 				DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
 			var size := DisplayServer.window_get_size()
-			var res := str(get_value("graphics", "resolution"))
-			if res.contains("x"):
-				var wanted := Vector2i(int(res.get_slice("x", 0)), int(res.get_slice("x", 1)))
-				if wanted.x >= 320 and wanted.y >= 240:
-					size = wanted
+			var wanted := parse_resolution(str(get_value("graphics", "resolution")))
+			if wanted != Vector2i.ZERO:
+				size = wanted
 			if size != DisplayServer.window_get_size() or not on_screen:
 				DisplayServer.window_set_size(size)
 				var area := DisplayServer.screen_get_usable_rect(screen)
@@ -681,10 +1011,33 @@ static func apply_environment(env: Environment) -> void:
 	var b := clampf(float(get_value("graphics", "brightness")), 0.5, 1.5)
 	var c := clampf(float(get_value("graphics", "contrast")), 0.5, 1.5)
 	var s := clampf(float(get_value("graphics", "saturation")), 0.0, 2.0)
-	env.adjustment_enabled = b != 1.0 or c != 1.0 or s != 1.0
+	# A look's colour lookup (look_luts.gd) needs the adjustments on too.
+	env.adjustment_enabled = b != 1.0 or c != 1.0 or s != 1.0 or env.adjustment_color_correction != null
 	env.adjustment_brightness = b
 	env.adjustment_contrast = c
 	env.adjustment_saturation = s
+
+
+## Screen-space ambient occlusion as Zenith's own looks draw it (Settings > Graphics > Ambient
+## occlusion): tight, as Factorio's sprites shade corners (a small radius, no detail pass), half
+## size, darkening direct light 0.85 of the way on the models (Factorio paints its occlusion in, lit or
+## not; the ground takes its own share, terrain.gdshader ssao_on_sunlight), faded out SSAO_FADE tiles
+## from the camera. Godot gives a surface max(its AO_LIGHT_AFFECT, ssao_light_affect) of SSAO on direct
+## light only as far as ssao_ao_channel_affect says: at 0.5 it was 0.4 on the models (0.3 their own)
+## and 0.25 on the ground, so in sunlight SSAO hardly showed. A look's own ssao_* values (the Cinematic
+## look's) go over these while it is on (looks.gd lift()/settle() round this). `on` null: the setting's.
+const SSAO_FACTORIO := {"ssao_radius": 0.7, "ssao_intensity": 1.6, "ssao_power": 1.5, "ssao_detail": 0.0,
+	"ssao_light_affect": 0.85, "ssao_ao_channel_affect": 1.0}
+const SSAO_FADE := Vector2(60.0, 140.0)
+
+
+static func apply_ssao(env: Environment, on: Variant = null) -> void:
+	if env == null:
+		return
+	env.ssao_enabled = bool(get_value("graphics", "ssao")) if on == null else bool(on)
+	for key in SSAO_FACTORIO:
+		env.set(key, SSAO_FACTORIO[key])
+	RenderingServer.environment_set_ssao_quality(RenderingServer.ENV_SSAO_QUALITY_MEDIUM, true, 0.5, 2, SSAO_FADE.x, SSAO_FADE.y)
 
 
 ## The shadow atlas for a quality; "off" turns the sun's shadows off (main.gd).
@@ -713,6 +1066,13 @@ static func apply_bindings() -> void:
 			keys.append(0)
 		_default_keys[name] = keys
 		_own_keys[name] = keys.duplicate()
+	if not dev_tools():
+		# A public build has no key for the testing tools, in Settings → Controls or anywhere.
+		for name in Controls.DEV_ONLY:
+			_default_keys.erase(name)
+			_own_keys.erase(name)
+			if InputMap.has_action(name):
+				InputMap.erase_action(name)
 	reload_factorio_keys()
 
 
@@ -866,6 +1226,7 @@ static func add_action(action: String, keys: Array, context := "global") -> void
 		codes[i] = int(keys[i])
 	_default_keys[action] = codes
 	_set_keys(action, keys_for(action))
+	_notify("controls", action)  # the help (F1) lists it
 
 
 ## Takes an add-on's action away again (the add-on was switched off); its saved binding stays.
@@ -874,6 +1235,7 @@ static func remove_action(action: String) -> void:
 	contexts.erase(action)
 	if InputMap.has_action(action):
 		InputMap.erase_action(action)
+	_notify("controls", action)
 
 
 static func _set_keys(action: String, keys: Array) -> void:

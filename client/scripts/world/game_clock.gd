@@ -6,6 +6,8 @@ extends RefCounted
 ## jumped. The rate is measured over half a second of arrivals, so a message's own jitter (frames,
 ## the UDP thread) doesn't move it.
 
+const MomentHold := preload("res://scripts/world/moment_hold.gd")
+
 ## How many sends behind the newest message things are drawn, so there are positions either side.
 const DELAY_SENDS := 2.0
 const RATE_WINDOW := 0.5  # seconds of arrivals per rate measurement
@@ -49,6 +51,10 @@ func heard(k: float, period := 0.0) -> void:
 	newest = k
 	_newest_t = now
 	if tick < 0.0 or absf(tick - k) > maxf(60.0, gap * 4.0):
+		if MomentHold.on and tick >= 0.0:
+			_anchor_k = k  # a screenshot's moment: the clock stands still, and jumps after it if it must
+			_anchor_t = now
+			return
 		tick = k  # the first message, or the game jumped (a save loaded, a long pause)
 		if _gap_goal > 0.0:
 			gap = _gap_goal
@@ -78,6 +84,8 @@ func advance(delta: float) -> float:
 	_now += delta
 	if tick < 0.0:
 		return -1.0
+	if MomentHold.on:
+		return tick - gap * DELAY_SENDS  # a screenshot's moment: what is drawn stands still
 	if _gap_goal > 0.0 and gap != _gap_goal:
 		# A longer gap draws further behind: eased in, so what is drawn slows down meanwhile and
 		# never stops or runs backwards (the mod keeps its old rate a while: rate.lua). A shorter

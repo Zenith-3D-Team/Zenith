@@ -18,7 +18,7 @@ import pathlib
 import socket
 import time
 
-KEEP = {"protos", "tprotos", "iprotos", "fprotos", "chunk", "ents", "st", "bi", "mv", "ih", "gi", "wires", "fl", "pw"}
+KEEP = {"protos", "tprotos", "iprotos", "fprotos", "chunk", "ents", "st", "bs", "mv", "ih", "gi", "wires", "fl", "pw"}
 OUT = pathlib.Path(__file__).resolve().parent.parent / "client" / "data" / "menu_world.json"
 
 
@@ -49,7 +49,7 @@ def main() -> None:
     while True:
         now = time.time()
         if now - last_hello > 1.0:
-            send({"t": "hello", "v": 1, "sid": "menu-recorder", "w": 1 if ready else 0})
+            send({"t": "hello", "v": 1, "sid": "menu-recorder", "w": 1 if ready else 0, "bs": 1})
             last_hello = now
         if ready and subscribed_at is None:
             send({"t": "sub", "c": chunks})

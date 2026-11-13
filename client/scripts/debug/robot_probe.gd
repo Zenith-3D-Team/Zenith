@@ -11,8 +11,13 @@ const SETTLE := 3.0
 const DEFAULT_SECONDS := 10.0
 const MAX_WAIT := 60.0
 
+## The summary line, as printed (the debug menu shows it).
+signal reported(text: String)
+
 var movers: Node  # movers.gd
 var out_path := ""
+## False when the debug menu started it: the game goes on after.
+var quit_when_done := true
 
 var _seconds := DEFAULT_SECONDS
 var _settled := 0.0
@@ -94,4 +99,8 @@ func _finish() -> void:
 		f.store_string(JSON.stringify({"summary": summary, "frames": _frames}))
 		f.close()
 	print("ROBOTS ", JSON.stringify(summary))
-	get_tree().quit()
+	reported.emit("ROBOTS " + JSON.stringify(summary))
+	if quit_when_done:
+		get_tree().quit()
+	else:
+		queue_free()

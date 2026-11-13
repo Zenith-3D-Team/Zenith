@@ -99,9 +99,14 @@ const LIST := [
 	["first_person", [KEY_F5]],
 	["toggle_projection", [KEY_F7]],
 	["show_factorio", [KEY_F9 | KEY_MASK_CTRL]],
+	["debug_menu", [KEY_F12 | KEY_MASK_CTRL]],
 ]
 
 const MODIFIERS := [KEY_SHIFT, KEY_CTRL, KEY_ALT, KEY_META]
+
+## Actions only dev builds have (Settings.dev_tools()): Settings.apply_bindings takes them away in a
+## public one.
+const DEV_ONLY := ["debug_menu"]
 
 ## Pairs that share a key on purpose, as in Factorio: one press does whichever fits
 ## (player_input.gd). Q clears the cursor, or pipettes with nothing in it; Alt+R changes the rail

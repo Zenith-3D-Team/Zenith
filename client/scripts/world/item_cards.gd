@@ -19,9 +19,13 @@ const CARD_SIZE := 0.32
 ## a stack's icons a little higher each; models and blocks pile by their own height.
 const CARD_PILE := 0.07
 const BLOCK_SIZE := Vector3(0.22, 0.08, 0.22)
-## Models turn by up to this much either way (radians), by item, so a full belt of plates
-## doesn't look tiled. Cards stay square to the map, as Factorio draws its icons.
+## Every loose item turns by up to this much either way (radians), by item, so a full belt of plates
+## doesn't look tiled: models, icon cards and blocks alike (owner: lone plastic bars stood square near
+## and turned far, icon cards always square). One rule for every path, turn_for().
 const MAX_YAW := 0.35
+## A pile's copies turn this much more each, so a pile doesn't look like one tall block (owner: back
+## to 0.1.2's piles after trying Factorio's neat, straight ones).
+const PILE_TURN := 0.45
 ## Floats per instance in a MultiMesh buffer: 12 for the transform's rows, 4 of custom data.
 const STRIDE := 16
 
@@ -29,13 +33,23 @@ var protos: ProtoDB
 
 var _kinds := {}  # item id -> MultiMeshInstance3D
 var _lift := {}  # item id -> Vector3, raises blocks so they sit on what carries them
-var _turns := {}  # item id -> true when it is drawn as a model (turned by its yaw)
+var _turns := {}  # item id -> true when it is drawn as a model
 var _pile := {}  # item id -> the step between a pile's copies (pile_step())
 var _buffers := {}  # item id -> PackedFloat32Array, the MultiMesh's instances
 var _materials := {}  # ShaderMaterial -> true, the ones set_paths() updates
 var _paths: Texture2D = null  # set_paths(): kept across reset(), given to every new material
 var _look := -1
 var epoch := 0  # bumped by reset(), when every buffer handed out before is gone
+## Off for items on belts unless the camera is close (belt_items.gd): a shadow on an item a few
+## pixels across can't be seen, and one MultiMesh a kind can't leave out the far ones, so every item
+## went through the shadow pass. Lone items on the ground and in hands keep theirs.
+var casts_shadow := true:
+	set(value):
+		if value == casts_shadow:
+			return
+		casts_shadow = value
+		for mmi: MultiMeshInstance3D in _kinds.values():
+			mmi.cast_shadow = _shadow_setting()
 ## Settings → Graphics → Item icons: off draws every item without a model as its coloured block.
 static var use_icons := true
 ## Off when Settings → Graphics → Items in 3D is "Icons only": every item as its icon.
@@ -66,6 +80,13 @@ static func yaw_for(seed: int) -> float:
 	return (posmod(hash(seed), 2001) / 1000.0 - 1.0) * MAX_YAW
 
 
+## The one turn every loose item is drawn with (radians about +Y): on belts near (belt_items.gd) and
+## far (belt_lanes.gd), on the ground, in hands; a model, a card or a block; `copy` its place in a
+## pile (0 the bottom or a lone item), each copy PILE_TURN more than the one under it.
+static func turn_for(seed: int, copy := 0) -> float:
+	return yaw_for(seed) + PILE_TURN * copy
+
+
 func reset() -> void:
 	for mmi in _kinds.values():
 		mmi.queue_free()
@@ -85,7 +106,7 @@ func kind_count() -> int:
 
 
 ## `groups`: item id -> Array of Vector3, where each item's base (a card's centre) goes.
-## `yaws`: item id -> Array of floats (radians) in the same order, from yaw_for(); missing
+## `yaws`: item id -> Array of floats (radians) in the same order, from turn_for(); missing
 ## entries draw unturned. Nothing glides.
 func draw(groups: Dictionary, yaws := {}) -> void:
 	begin()
@@ -96,7 +117,7 @@ func draw(groups: Dictionary, yaws := {}) -> void:
 		var positions: Array = groups[id]
 		var n := positions.size()
 		var buf := take(id, n)
-		var turns: Array = yaws.get(id, []) if _turns.has(id) else []
+		var turns: Array = yaws.get(id, [])
 		var up := lift(id)
 		var o := 0
 		for i in n:
@@ -167,6 +188,8 @@ func put_records(item_id: int, base: int, n: int, cap: int, bounds: AABB) -> voi
 	mm.custom_aabb = bounds
 	mm.visible_instance_count = n
 	mmi.set_instance_shader_parameter("belt_base", base)
+	if record_tex != 0:
+		mmi.set_instance_shader_parameter("belt_tex", record_tex)
 	_bounded[item_id] = true
 
 
@@ -180,6 +203,8 @@ func set_bounds(bounds: AABB) -> void:
 
 var _bounded := {}
 static var _identities := {}
+## Which records texture put_records' kinds read: 0 f3d_belt_records, 1 f3d_belt_lattice (belt_lattice.gd).
+var record_tex := 0
 
 
 ## n instances with no turn, no move (doubling copies, not a loop per instance).
@@ -204,9 +229,15 @@ func pile_step(item_id: int) -> float:
 	return _pile.get(item_id, CARD_PILE)
 
 
-## Whether this kind is drawn as a model, which turns by its yaw (cards don't).
+## Whether this kind is drawn as a model (every kind turns by turn_for(), this says only which look).
 func turns(item_id: int) -> bool:
 	return _turns.has(item_id)
+
+
+## Whether the kind has its look (model, card or block): until then lift(), pile_step() and turns()
+## answer for a card, and a model still read on a thread would be taken for one.
+func dressed(item_id: int) -> bool:
+	return _kinds.has(item_id) and not _loading.has(item_id)
 
 
 ## One item's slot from `o`: turned by the angle whose cosine and sine are c and s, at p (with
@@ -263,6 +294,18 @@ static func icon_key(item_id: int) -> int:
 	return -item_id - 1
 
 
+## Main-thread time of a new kind's parts (--stutter-probe shows them as w_ic_<key>; kept only while it
+## runs, Probing.on): look (its model or icon looked up, the icon index and the mods scanned the first
+## time), dress (its material).
+static var prof := {}
+const Probing := preload("res://scripts/debug/probing.gd")
+
+
+static func _prof(key: String, t0: int) -> void:
+	if Probing.on:
+		prof[key] = int(prof.get(key, 0)) + Time.get_ticks_usec() - t0
+
+
 func _kind(item_id: int) -> MultiMeshInstance3D:
 	if _kinds.has(item_id):
 		return _kinds[item_id]
@@ -274,17 +317,27 @@ func _kind(item_id: int) -> MultiMeshInstance3D:
 	mm.use_custom_data = true
 	var mmi := MultiMeshInstance3D.new()
 	mmi.multimesh = mm
+	mmi.cast_shadow = _shadow_setting()
 	mmi.name = "Items_%s%s" % [item if item != "" else str(item_of(item_id)), "_icon" if item_id < 0 else ""]
 	add_child(mmi)
 	_kinds[item_id] = mmi
-	if _look_ready(item, item_id < 0):
+	var t0 := Time.get_ticks_usec()
+	var ready := _look_ready(item, item_id < 0)
+	_prof("look", t0)
+	if ready:
+		t0 = Time.get_ticks_usec()
 		_dress(item_id, item, mmi)
+		_prof("dress", t0)
 	else:
 		# Drawn once its model or icon is read (_process); its instances are kept meanwhile.
 		mm.mesh = _card()
 		mmi.visible = false
 		_loading[item_id] = item
 	return mmi
+
+
+func _shadow_setting() -> GeometryInstance3D.ShadowCastingSetting:
+	return GeometryInstance3D.SHADOW_CASTING_SETTING_ON if casts_shadow else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
 
 ## Kinds whose model or icon is still being read: item id -> item name.
@@ -322,7 +375,9 @@ static func _look_ready(item: String, icon := false) -> bool:
 		return true
 	var job: Array = _icon_jobs.get(item, [])
 	if job.is_empty():
+		var tp := Time.get_ticks_usec()
 		ItemIcons.prepare_for_threads()
+		_prof("icons_prepare", tp)
 		var holder := [null]
 		var load_icon := func() -> void: holder[0] = ItemIcons.load_uncached(item)
 		_icon_jobs[item] = [WorkerThreadPool.add_task(load_icon, false, "item icon"), holder]

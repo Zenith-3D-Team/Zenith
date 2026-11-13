@@ -87,7 +87,8 @@ void fragment() {
 	vec3 base = water * wobble;
 	// Faint bright lines along the ridges of the middle layer, like wave crests, fading in and
 	// out with the broad layer so they don't form an even net.
-	base += sky_share * vec3(0.06, 0.08, 0.09) * pow(1.0 - abs(2.0 * b.x - 1.0), 8.0) * smoothstep(0.25, 0.75, a.x);
+	// (Clamped: b.x can round a hair past 1, and pow() of a negative is NaN.)
+	base += sky_share * vec3(0.06, 0.08, 0.09) * pow(clamp(1.0 - abs(2.0 * b.x - 1.0), 0.0, 1.0), 8.0) * smoothstep(0.25, 0.75, a.x);
 	// Shallow water by the bank is lighter and a little greener.
 	base = mix(base, water * 1.1 + vec3(0.0, 0.04, 0.02), shore * shore * (textured ? 0.0 : 0.6));
 
@@ -105,7 +106,15 @@ void fragment() {
 	if (textured) foam = 0.0;
 
 	ALBEDO = mix(col, foam_color, foam * 0.65);
-	ROUGHNESS = mix(0.07, 0.6, foam);
+	// Specular anti-aliasing (Tokuyoshi and Kaplanyan): where the ripples' normal changes faster than
+	// a pixel shows, the highlight widens instead of the sun glinting off one pixel at hundreds of
+	// times the water's brightness, which sparkled and, through the looks' sharpening, left black
+	// boxes round the specks (B-roll, Aquilo and Gleba). Calm water close by keeps its sharp glint.
+	vec3 ndx = dFdx(n);
+	vec3 ndy = dFdy(n);
+	float kernel = min(0.5 * (dot(ndx, ndx) + dot(ndy, ndy)), 0.18);
+	float r = mix(0.07, 0.6, foam);
+	ROUGHNESS = sqrt(sqrt(clamp(r * r * r * r + kernel, 0.0, 1.0)));
 	SPECULAR = 0.6;
 	METALLIC = 0.0;
 }

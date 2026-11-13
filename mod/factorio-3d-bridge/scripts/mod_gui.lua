@@ -10,6 +10,9 @@
 -- (hybrid, Windows). For mods with a remote interface the bridge presses their buttons itself
 -- (PRESSERS below: what the mod's own click handler does), wherever the player plays: those
 -- elements carry `ck`, and the client sends `mpress` with the element's index instead.
+--
+-- A client not drawing them (its hello says `mg` 0: Settings > Interface > Show mods' windows, off
+-- by default) costs nothing here: its player's windows aren't read at all.
 
 local transport = require("scripts.transport")
 local puppet = require("scripts.puppet")
@@ -318,7 +321,8 @@ function M.tick()
     return
   end
   soon = false
-  local p = the_player()
+  local client = storage.f3d.client
+  local p = not (client and client.mg == false) and the_player()
   if not p then
     if next(sent) then
       sent = {}

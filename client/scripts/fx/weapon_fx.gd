@@ -22,7 +22,8 @@ const CapsuleAim := preload("res://scripts/player/capsule_aim.gd")
 
 const DATA_PATH := "res://data/weapon_fx.json"
 const TICKS := 60.0
-const MAX_LIGHTS := 10
+const MAX_LIGHTS := 16
+const FLASH_MIN_RANGE := 6.0  # a flash reaches the ground round it, however small
 const DEDUP_SECONDS := 0.6
 const DEDUP_RANGE := 1.5
 const SCORCH_SECONDS := 120.0  # the game keeps them 10 minutes; ours fade sooner
@@ -897,7 +898,7 @@ func _update_lights(delta: float) -> void:
 			_flashes.remove_at(i)
 			continue
 		var t := float(fl[4]) / float(fl[5])
-		wants.append([fl[0], fl[1], float(fl[2]) * (1.0 - t), fl[3]])
+		wants.append([fl[0], fl[1], float(fl[2]) * (1.0 - t), maxf(float(fl[3]), FLASH_MIN_RANGE)])
 	for f: Flyer in _flying.values():
 		var l = f.rec.get("l")
 		if l is Array and l.size() >= 3 and not f.cards.is_empty():
@@ -906,7 +907,7 @@ func _update_lights(delta: float) -> void:
 	for g: Ground in _ground.values():
 		if g.fire and not g.cards.is_empty():
 			var c: SpriteFx.Card = g.cards[0][0]
-			wants.append([g.pos + Vector3(0, 0.8, 0), Color(1.0, 0.55, 0.2), 1.2 * c.color.a, 4.0])
+			wants.append([g.pos + Vector3(0, 0.8, 0), Color(1.0, 0.55, 0.2), 2.0 * c.color.a, 7.0])
 	var centre := avatar.position if avatar != null else Vector3.ZERO
 	if wants.size() > MAX_LIGHTS:
 		wants.sort_custom(func(a, b): return (a[0] as Vector3).distance_squared_to(centre) < (b[0] as Vector3).distance_squared_to(centre))

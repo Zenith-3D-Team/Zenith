@@ -22,9 +22,9 @@ const Settings := preload("res://scripts/menu/settings.gd")
 ## addon.json as "api"; one that needs a newer API than this is refused with a message.
 const API_VERSION := 1
 ## The exact API level, with what was added within version 1 (1.1: api.settings, the Add-ons
-## menu's pages, api.view.keep_drawing; 1.2: api.terrain). An addon.json may ask for 1.1 or 1.2;
-## 1 means any 1.x.
-const API_LEVEL := 1.2
+## menu's pages, api.view.keep_drawing; 1.2: api.terrain; 1.3: api.shaders; 1.4: looks' own_clouds, taa, roughness_limiter; 1.5: a look's sunrise and sunset, its passes' sun uniforms, api.shaders.sun(); 1.6: api.world.hold_chunks,
+## api.view.full_detail and api.view.screenshot). An addon.json may ask for 1.1 to 1.6; 1 means any 1.x.
+const API_LEVEL := 1.6
 const MANIFEST := "addon.json"
 ## Ids are folder-like names: lower case letters, digits, - and _.
 const ID_CHARS := "abcdefghijklmnopqrstuvwxyz0123456789-_"

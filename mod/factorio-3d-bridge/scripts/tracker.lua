@@ -5,6 +5,7 @@ local transport = require("scripts.transport")
 local world = require("scripts.world")
 local rate = require("scripts.rate")
 local alt_mode = require("scripts.alt_mode")
+local belt_switch = require("scripts.belt_switch")
 
 local M = {}
 
@@ -85,9 +86,10 @@ end
 function M.added(entity)
   tell(entity)
   fluid_neighbours_changed(entity, false)
-  -- Building removes the decoratives under the entity.
+  -- Building removes the decoratives under the entity: in every chunk its box reaches (a rocket
+  -- silo by a chunk's edge cleared its neighbour's too, which wasn't sent again).
   if entity and entity.valid then
-    world.decoratives_changed(entity.surface, entity.position)
+    world.decoratives_changed_in(entity.surface, entity.bounding_box)
   end
   if watched(entity) then
     transport.send_reliable({ t = "add", e = world.record(entity) })
@@ -96,6 +98,9 @@ function M.added(entity)
     end
   end
 end
+
+local RECOLOURED = { locomotive = true, ["cargo-wagon"] = true, ["fluid-wagon"] = true, ["artillery-wagon"] = true,
+  ["train-stop"] = true }
 
 function M.changed(entity)
   tell(entity)
@@ -195,6 +200,7 @@ local function watch_wires(s)
       seen[unit] = sig
       if before and before ~= sig and watched(e) then
         transport.send_reliable({ t = "upd", e = world.record(e) })
+        pcall(belt_switch.rewired, e)
       end
     end
   end
@@ -277,13 +283,23 @@ function M.register()
   -- machine's window (where its recipe or filters are set). The bridge's own paste sends `upd`.
   script.on_event(defines.events.on_entity_settings_pasted, function(event)
     alt_mode.check(event.destination)
+    if event.destination then
+      belt_switch.configured(event.destination)
+    end
     if event.destination and event.destination.valid then
       world.bump(event.destination.surface.index, event.destination.position)
+    end
+  end)
+  -- A train or stop repainted, from Zenith's screen or in the real game (H21).
+  script.on_event(defines.events.on_entity_color_changed, function(event)
+    if event.entity and event.entity.valid and RECOLOURED[event.entity.type] then
+      M.changed(event.entity)
     end
   end)
   script.on_event(defines.events.on_gui_closed, function(event)
     if event.entity then
       alt_mode.check(event.entity)
+      belt_switch.configured(event.entity)
       if event.entity.valid then
         world.bump(event.entity.surface.index, event.entity.position)
       end

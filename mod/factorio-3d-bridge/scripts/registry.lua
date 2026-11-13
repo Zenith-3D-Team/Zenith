@@ -41,7 +41,7 @@ local ANIMATED_TYPES = {
   "assembling-machine", "furnace", "mining-drill", "lab", "boiler", "generator", "reactor",
   "radar", "rocket-silo", "pump", "offshore-pump", "beacon", "burner-generator",
   "fusion-reactor", "fusion-generator", "agricultural-tower", "asteroid-collector", "lamp",
-  "thruster", "rail-signal", "rail-chain-signal", "accumulator", "power-switch",
+  "thruster", "rail-signal", "rail-chain-signal", "accumulator", "power-switch", "splitter", "lane-splitter",
 }
 
 -- What a character can get into.

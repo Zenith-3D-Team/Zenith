@@ -103,6 +103,15 @@ const BEAMS := {
 		Color(0.55, 0.9, 0.9), 16.0 / 60.0],
 }
 const RAILGUN_LENGTH := 40.0  # the beam runs out to the turret's range
+## A shot's light: how far it reaches (out over the ground round the turret), and how much brighter
+## than the energy asked for, as it has that much further to reach.
+const FLASH_RANGE := 7.5
+const FLASH_GAIN := 1.25
+## The flame's own lights: at the nozzle, and over where the stream lands (high enough to spread).
+const FLAME_ENERGY := 2.4
+const FLAME_LANDING_ENERGY := 2.2
+const FLAME_LANDING_RANGE := 7.0
+const FLAME_LANDING_HEIGHT := 2.0
 
 
 class TurretState:
@@ -130,6 +139,7 @@ class TurretState:
 	var flame_sound := 0.0
 	var light: OmniLight3D
 	var light_energy := 0.0
+	var flame_light: OmniLight3D  # over where the stream lands
 	var beam: MeshInstance3D
 	var beam_age := 0.0
 	var fired := 0  # shots drawn (for the UI test)
@@ -229,7 +239,7 @@ func head_transform(unit: int, part: ModelLibrary.AnimPart, base: Transform3D, d
 	var xf := _pose(part, local_yaw, st.fold, st.cfg, st.since_shot)
 	var world := base * xf
 	st.muzzle = world * _muzzle_point(part, st)
-	st.forward = (world.basis * Vector3.FORWARD).normalized()
+	st.forward = (world.basis * head_front(part)).normalized()
 	_fire_due(st)
 	return xf
 
@@ -289,6 +299,14 @@ func _advance(st: TurretState, delta: float) -> void:
 		st.fold = maxf(0.0, st.fold - float(cfg["fold"]) * 60.0 * delta)
 
 
+## Which way a head's barrels point in its own model. Ours face north; FUE5's gun turret was
+## modelled with its barrels to the west.
+static func head_front(part: ModelLibrary.AnimPart) -> Vector3:
+	if part.model == "gun-turret" and ModelLibrary._source(part.model).contains("/assets/models/fue5/"):
+		return Vector3.LEFT
+	return Vector3.FORWARD
+
+
 ## The head in the model: turned by `yaw` radians about its pivot, posed between folded (0) and
 ## prepared (1), kicked back by the last shot.
 func _pose(part: ModelLibrary.AnimPart, yaw: float, fold: float, cfg: Dictionary, since_shot: float) -> Transform3D:
@@ -301,11 +319,13 @@ func _pose(part: ModelLibrary.AnimPart, yaw: float, fold: float, cfg: Dictionary
 	if float(recoil[0]) > 0.0 and since_shot < float(recoil[1]):
 		var k := 1.0 - since_shot / float(recoil[1])
 		offset.z += float(recoil[0]) * k * k
-	var basis := Basis(Vector3.UP, yaw) * Basis(Vector3.RIGHT, float(pose.get("pitch", 0.0)) * f)
+	var aim := Basis(Vector3.UP, yaw) * Basis(Vector3.RIGHT, float(pose.get("pitch", 0.0)) * f)
 	var squeeze := float(pose.get("squeeze", 1.0))
 	if squeeze != 1.0:
-		basis *= Basis.from_scale(Vector3(lerpf(1.0, squeeze, f), 1.0, 1.0))
-	var moved := Transform3D(basis, basis * offset)
+		aim *= Basis.from_scale(Vector3(lerpf(1.0, squeeze, f), 1.0, 1.0))
+	# A head modelled facing west is brought to north first; its drop and recoil are the aim's.
+	var basis := aim * Basis(Vector3.UP, -PI / 2.0) if head_front(part) == Vector3.LEFT else aim
+	var moved := Transform3D(basis, aim * offset)
 	return part.pivot * moved * part.pivot.affine_inverse()
 
 
@@ -454,11 +474,11 @@ func _smoke(sprites: Node, at: Vector3, n: int, size: float) -> void:
 func _flash(st: TurretState, color: Color, energy: float) -> void:
 	if st.light == null:
 		st.light = OmniLight3D.new()
-		st.light.omni_range = 4.0
+		st.light.omni_range = FLASH_RANGE
 		st.light.shadow_enabled = false
 		add_child(st.light)
 	st.light.light_color = color
-	st.light_energy = maxf(st.light_energy, energy)
+	st.light_energy = maxf(st.light_energy, energy * FLASH_GAIN)
 
 
 func _sound(st: TurretState, key: String) -> void:
@@ -505,6 +525,8 @@ func _update_effects(st: TurretState, delta: float) -> void:
 		_flame(st, delta)
 		if st.flame_left <= 0.0:
 			_sound_path(st, str(_gun_cfg(st).get("end", "")))
+	elif st.flame_light != null and st.flame_light.visible:
+		st.flame_light.visible = false
 
 
 func _draw_beam(st: TurretState) -> void:
@@ -573,7 +595,8 @@ func _flame(st: TurretState, delta: float) -> void:
 	if st.flame_sound <= 0.0:
 		st.flame_sound = 0.9
 		_sound_path(st, str(gcfg.get("sound", "")))
-	_flash(st, Color(1.0, 0.5, 0.0), 1.4)
+	_flash(st, Color(1.0, 0.5, 0.0), FLAME_ENERGY * _flicker(st, 0.0))
+	_light_landing(st)
 	var sprites: Node = fx.get("sprites") if fx != null else null
 	if not FxSettings.effects_enabled or sprites == null:
 		return
@@ -601,6 +624,26 @@ func _flame(st: TurretState, delta: float) -> void:
 		card.spin = randf() * TAU
 
 
+## A fire's unsteady brightness, about 0.65 to 1.05, each turret and light (`phase`) out of step.
+func _flicker(st: TurretState, phase: float) -> float:
+	var t := _clock + phase + float(st.unit % 97) * 0.37
+	return 0.85 + 0.12 * sin(t * 23.0) + 0.08 * sin(t * 41.0)
+
+
+## The light on the ground where the burning stream comes down.
+func _light_landing(st: TurretState) -> void:
+	if st.flame_light == null:
+		st.flame_light = OmniLight3D.new()
+		st.flame_light.omni_range = FLAME_LANDING_RANGE
+		st.flame_light.light_color = Color(1.0, 0.48, 0.1)
+		st.flame_light.shadow_enabled = false
+		add_child(st.flame_light)
+	var at := st.target if _clock - st.target_seen < 1.5 else st.muzzle + st.forward * 10.0
+	st.flame_light.global_position = Vector3(at.x, FLAME_LANDING_HEIGHT, at.z)
+	st.flame_light.light_energy = FLAME_LANDING_ENERGY * _flicker(st, 1.7)
+	st.flame_light.visible = true
+
+
 ## Where shots leave the head, in model space: the middle of its foremost faces (the barrels'
 ## ends); the tesla's from the top of its coil.
 func _muzzle_point(part: ModelLibrary.AnimPart, st: TurretState) -> Vector3:
@@ -614,13 +657,14 @@ func _muzzle_point(part: ModelLibrary.AnimPart, st: TurretState) -> Vector3:
 	elif part.mesh != null:
 		var faces := _faces(part.mesh)
 		if not faces.is_empty():
-			var front := INF
+			var ahead := head_front(part)
+			var front := -INF
 			for v in faces:
-				front = minf(front, v.z)
+				front = maxf(front, v.dot(ahead))
 			var sum := Vector3.ZERO
 			var n := 0
 			for v in faces:
-				if v.z <= front + 0.03:
+				if v.dot(ahead) >= front - 0.03:
 					sum += v
 					n += 1
 			if n > 0:
@@ -661,6 +705,8 @@ static func _load_texture(file: String) -> Texture2D:
 func _free_nodes(st: TurretState) -> void:
 	if st.light != null:
 		st.light.queue_free()
+	if st.flame_light != null:
+		st.flame_light.queue_free()
 	if st.beam != null:
 		st.beam.queue_free()
 

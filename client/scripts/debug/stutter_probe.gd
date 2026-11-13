@@ -20,6 +20,8 @@ var _shots_dir: String = Settings.arg_value("--probe-shots=") if Settings.has_ar
 ## [direction (Factorio's 16-way, -1 stands still), seconds]
 const ROUTES := {
 	"busy": [[8, 28.0], [4, 12.0], [0, 20.0]],
+	# Up and down the owner's main bus (x -370 to -127 at 60 UPS, y -20 and -8) at exoskeleton speed, for the video's B-roll.
+	"bus": [[4, 6.0], [8, 0.3], [12, 6.0], [0, 0.3], [4, 6.0], [8, 0.3], [12, 6.0], [0, 0.3], [4, 6.0], [8, 0.3], [12, 6.0], [0, 0.3], [4, 6.0], [8, 0.3], [12, 6.0], [0, 0.3], [4, 6.0], [8, 0.3], [12, 6.0], [0, 0.3]],
 	"short": [[8, 6.0]],
 	# Two laps of a loop round where it joined, at whatever speed the character runs: on the owner's
 	# save its exoskeletons take it about 30 tiles a second (0.51 a tick), so each lap crosses
@@ -27,8 +29,30 @@ const ROUTES := {
 	# docs/PERFORMANCE-AUDIT.md).
 	"fast": [[4, 5.0], [8, 3.0], [12, 10.0], [0, 6.0], [4, 10.0], [8, 3.0], [12, 5.0],
 		[4, 5.0], [8, 3.0], [12, 10.0], [0, 6.0], [4, 10.0], [8, 3.0], [12, 5.0]],
+	# Back and forth along the busy belts, a few tiles each way: walking, while what is drawn stays
+	# inside a square tools/belt_path_check.py records (belt items' accuracy while moving).
+	"sway": [[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35],
+		[4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35], [4, 0.35], [12, 0.35]],
 	"stand": [[-1, 30.0]],  # stands where it joined: the steady cost of a busy view
+	# The join itself: stands 90 s from the world being ready (pass --probe-warmup=0 so every frame
+	# of the first load is in the frames), and notes when the view was fully drawn (JOIN line).
+	# With --probe-stay the client goes on after writing the file (belt_view_check keeps scoring).
+	"join": [[-1, 90.0]],
 	"stand75": [[-1, 75.0]],  # the same for longer (docs/PERFORMANCE-AUDIT.md: averages over a minute or more)
+	"stand120": [[-1, 120.0]],  # (tools/belt_view_check.py --client-arg: the frames of a whole scored run, --probe-stay)
 	"fight": [[-1, 150.0]],  # stands while tools/attack_wave.py sends enemies at a defended wall
 	"variants": [[-1, 7200.0]],  # stands until --probe-variants has gone through its list
 }
@@ -63,6 +87,7 @@ var _variant := -1
 var _variant_time := 0.0
 var _variant_frames: Array = []
 var _variant_results: Array = []
+var _variant_steps: Array = []  # [variant, {render step: GPU ms p50}] with --gpu-profile
 var _hidden: Array = []  # nodes a variant hid, shown again after it
 var VARIANT_SETTLE := 3.0
 var VARIANT_MEASURE := 8.0
@@ -117,8 +142,18 @@ var _end_usec := 0
 var _pre_usec := 0
 var _post_usec := 0
 var _world_prof := {}
+var _cards_prof := {}
+var _shots := 0
 var _nodes := 0
 var _merged: Array = []
+## The join (route "join"): seconds since the world was ready when the world had nothing left to
+## build and every wanted chunk was drawn (settled), when the belts' first load (`bs` ld) ended, and
+## when both held (fully drawn); -1 while not yet.
+var _elapsed := 0.0
+var _settled_at := -1.0
+var _belt_done_at := -1.0
+var _drawn_at := -1.0
+var _stay := "--probe-stay" in OS.get_cmdline_user_args()
 
 
 func _ready() -> void:
@@ -240,6 +275,19 @@ func _process(delta: float) -> void:
 	_last_usec = now
 	_before = c
 	_end_usec = Time.get_ticks_usec()
+	_elapsed += delta
+	if _settled_at < 0.0 and _settled() and world.undrawn() == 0:
+		_settled_at = _elapsed
+	var bi: Node = world.get_parent().get_node_or_null("BeltItems")
+	if bi != null:
+		var done := int(bi.get("load_done_msec")) > 0
+		if done and _belt_done_at < 0.0:
+			_belt_done_at = _elapsed
+		elif not done and _belt_done_at >= 0.0:
+			_belt_done_at = -1.0  # (the bridge loads again)
+			_drawn_at = -1.0
+	if _drawn_at < 0.0 and _settled_at >= 0.0 and _belt_done_at >= 0.0:
+		_drawn_at = _elapsed
 
 
 ## Draw calls and primitives of the view and of the shadow passes: [view draws, view prims,
@@ -300,6 +348,13 @@ func _phases() -> Dictionary:
 		if ms > 0.05:
 			out["w_" + str(k)] = snappedf(ms, 0.01)
 	_world_prof = world.prof.duplicate()
+	# The item kinds' (belt and ground items) main-thread parts (item_cards.gd prof): w_ic_<key>.
+	const ItemCards := preload("res://scripts/world/item_cards.gd")
+	for k in ItemCards.prof:
+		var ms := (int(ItemCards.prof[k]) - int(_cards_prof.get(k, 0))) / 1000.0
+		if ms > 0.05:
+			out["w_ic_" + str(k)] = snappedf(ms, 0.01)
+	_cards_prof = ItemCards.prof.duplicate()
 	# What waits: chunks to build, chunks with MultiMeshes still to add (and how many), terrain.
 	out["q_dirty"] = world._dirty.size()
 	out["q_pending"] = world._pending.size()
@@ -318,6 +373,11 @@ func _phases() -> Dictionary:
 		var queues: Dictionary = world.stream_queues()
 		for k in queues:
 			out["q_" + str(k)] = queues[k]
+	# A --screenshot saved this frame (main.gd): its GPU read-back and PNG are the harness's, not the game's.
+	const Main := preload("res://scripts/main.gd")
+	if Main.screenshots != _shots:
+		_shots = Main.screenshots
+		out["shot"] = 1
 	out["q_messages"] = Bridge.waiting_count()
 	out["q_undrawn"] = world.undrawn()
 	out["q_near_undrawn"] = world.near_undrawn
@@ -394,6 +454,7 @@ func _step_variant(delta: float) -> void:
 		var col := func(k: int) -> Array: return _variant_frames.filter(func(r: Array) -> bool: return r.size() > 20).map(func(r: Array) -> float: return float(r[20][k]))
 		_variant_results.append([_variant_list[_variant], s["p50"], s["p99"], s["gpu_p50"], s["render_cpu_p50"], s["draw_calls_p50"], s["primitives_p50"],
 			pct(col.call(0), 0.5), pct(col.call(1), 0.5), pct(col.call(2), 0.5), pct(col.call(3), 0.5), world.shadow_casters])
+		_variant_steps.append([_variant_list[_variant], _step_medians(_variant_frames)])
 		_set_variant(_variant_list[_variant], false)
 	_variant += 1
 	if _variant == 0:
@@ -404,9 +465,29 @@ func _step_variant(delta: float) -> void:
 	if _variant >= _variant_list.size():
 		for r in _variant_results:
 			print("VARIANT %-34s frame p50 %5.1f p99 %5.1f ms | gpu p50 %5.2f ms | render cpu p50 %5.2f ms | draw calls %d | primitives %d | view draws %d prims %d | shadow draws %d prims %d | casting chunks %d" % r)
+		for r in _variant_steps:
+			if not (r[1] as Dictionary).is_empty():
+				print("VARIANT GPU %-30s %s" % [r[0], JSON.stringify(r[1])])
 		_leg = _route.size()
 		return
 	_set_variant(_variant_list[_variant], true)
+
+
+## Each render step's GPU time, median over these frames (--gpu-profile; {} without it): steps over 0.05 ms.
+func _step_medians(frames: Array) -> Dictionary:
+	var by := {}
+	for r: Array in frames:
+		if r.size() > 21 and r[21] is Dictionary:
+			for k in r[21]:
+				if not by.has(k):
+					by[k] = []
+				(by[k] as Array).append(float(r[21][k]))
+	var out := {}
+	for k in by:
+		var m := pct(by[k], 0.5)
+		if m > 0.05:
+			out[k] = snappedf(m, 0.01)
+	return out
 
 
 ## The models in the loaded chunks by triangles drawn at full detail (instances x triangles).
@@ -590,6 +671,14 @@ func _set_variant(name: String, on: bool) -> void:
 			RenderingServer.environment_set_ssao_quality(RenderingServer.ENV_SSAO_QUALITY_MEDIUM, not on, 0.5, 2, 50.0, 300.0)
 		"ssao on":
 			env.ssao_enabled = on or bool(_base["ssao"])
+		"ssao factorio":  # Zenith's own SSAO (Settings.apply_ssao), on
+			Settings.apply_ssao(env, on or bool(_base["ssao"]))
+		"ssao factorio low":  # the same at low quality
+			Settings.apply_ssao(env, on or bool(_base["ssao"]))
+			if on:
+				RenderingServer.environment_set_ssao_quality(RenderingServer.ENV_SSAO_QUALITY_LOW, true, 0.5, 2, Settings.SSAO_FADE.x, Settings.SSAO_FADE.y)
+		"contact off":  # contact shading's rings (contact_shade.gd)
+			preload("res://scripts/world/contact_shade.gd").set_enabled(not on, world.chunks.values())
 		"shadow 4 splits":
 			sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS if on else int(_base["mode"])
 		"blend splits":
@@ -808,8 +897,13 @@ func _finish() -> void:
 	print("STUTTER chunks drawn while walking %d: wanted to drawn p50 %.0f p99 %.0f worst %.0f ms; came within 2 chunks of the focus still not drawn %d, from then: p50 %.0f p99 %.0f worst %.0f ms; still not drawn at the end %d; overruns %s" % [
 		lat_ms.size(), pct(lat_ms, 0.5), pct(lat_ms, 0.99), pct(lat_ms, 1.0), near_ms.size(), pct(near_ms, 0.5), pct(near_ms, 0.99), pct(near_ms, 1.0),
 		world.undrawn(), JSON.stringify(preload("res://scripts/world/frame_budget.gd").overruns)])
+	var bi: Node = world.get_parent().get_node_or_null("BeltItems")
+	var join := {"settled_s": snappedf(_settled_at, 0.01), "belt_load_done_s": snappedf(_belt_done_at, 0.01), "drawn_s": snappedf(_drawn_at, 0.01),
+		"elapsed_s": snappedf(_elapsed, 0.01), "belt_stats": bi.stats.duplicate() if bi != null else {}, "belt_flags": bi.flags_text() if bi != null else ""}
+	print("JOIN settled (chunks, terrain, models) at %.1f s, belt first load done at %.1f s, fully drawn at %.1f s (of %.1f s; -1: not yet)" % [
+		_settled_at, _belt_done_at, _drawn_at, _elapsed])
 	var text := JSON.stringify({"summary": phases, "frames": _frames, "load_frames": _load_frames, "variants": _variant_results, "latency": lat,
-		"frame_budget": "shared" if preload("res://scripts/world/frame_budget.gd").shared else "separate"})
+		"frame_budget": "shared" if preload("res://scripts/world/frame_budget.gd").shared else "separate", "join": join})
 	var f := FileAccess.open(out_path, FileAccess.WRITE)
 	if f != null:
 		f.store_string(text)
@@ -841,5 +935,13 @@ func _finish() -> void:
 	print("SLOWEST models made on the main thread (ms, name), %d over 2 ms:" % slow.size())
 	for r in slow.slice(0, 12):
 		print("  ", r)
+	var lods: Array = preload("res://scripts/world/model_lods.gd").slowest.duplicate()
+	lods.sort_custom(func(a: Array, b: Array) -> bool: return a[0] > b[0])
+	print("SLOWEST level-of-detail finishes on the main thread (ms, model, surfaces, kind), %d over 2 ms: %s" % [lods.size(), JSON.stringify(lods.slice(0, 12))])
+	# --probe-stay: the client goes on after the summary (a run harness ends it: belt_view_check's screenshots
+	# and capture tail come after the probe's route).
+	if _stay:
+		print("STUTTER written to %s; staying (--probe-stay)" % out_path)
+		return
 	preload("res://scripts/menu/exit_guard.gd").arm()
 	get_tree().quit()

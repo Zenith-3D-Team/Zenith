@@ -22,6 +22,10 @@ const ICON_TILES := 1.2
 ## A fluid's icon on a pipe.
 const FLUID_TILES := 0.55
 const FLUID_TYPES := ["pipe", "pipe-to-ground", "pump", "storage-tank", "infinity-pipe"]
+## Plain pipes carry the icon only now and then, as Factorio's Alt-mode (owner's P50: one on every
+## pipe covered a run). One tile in this many, on a slanted lattice (`pipe_shows_icon`).
+const PIPE_ICON_EVERY := 5
+const SPARSE_FLUID_TYPES := ["pipe", "infinity-pipe"]
 const SHADOW := Color(0, 0, 0, 0.6)
 
 var model
@@ -116,9 +120,11 @@ func collect() -> void:
 
 ## Whether a chunk's box (the ground up to 8 tiles) is at least partly inside the camera's frustum.
 static func _chunk_in_view(c: Vector2i, planes: Array[Plane]) -> bool:
-	var lo := Vector3(c.x * 32.0, -17.0 if GroundHeight.is_on() else -1.0, c.y * 32.0)
-	# An add-on's hills (ground_height.gd) lift the icons with the buildings under them.
-	var hi := lo + Vector3(32.0, 65.0 if GroundHeight.is_on() else 9.0, 32.0)
+	# An add-on's hills (ground_height.gd) lift the icons with the buildings under them, by no more
+	# than the field's range.
+	var lift := GroundHeight.lift_range()
+	var lo := Vector3(c.x * 32.0, -1.0 + lift.x, c.y * 32.0)
+	var hi := lo + Vector3(32.0, 9.0 + lift.y - lift.x, 32.0)
 	for plane in planes:
 		# The box's corner furthest into the frustum (against the plane's outward normal).
 		var n := plane.normal
@@ -136,12 +142,21 @@ func _draw_fluids(world, camera: Camera3D, fluids_layer) -> void:
 		var proto = world.protos.entity(r.proto_id)
 		if proto == null or not FLUID_TYPES.has(proto.type):
 			continue
+		if SPARSE_FLUID_TYPES.has(proto.type) and not pipe_shows_icon(Vector2i(r.pos.floor())):
+			continue
 		var boxes: Array = fluids_layer.fluids[unit]
 		for b in boxes:
 			var fluid := str(b.get("fluid", ""))
 			if fluid != "" and float(b.get("amount", 0.0)) > 0.0:
 				_draw_icon(world, camera, r, [Kit.item_icon(fluid)], FLUID_TILES)
 				break
+
+
+## Whether a plain pipe on this tile shows its fluid. Decided by the tile alone, so an icon never
+## moves when pipes are built or mined beside it; x + 2y puts one in every PIPE_ICON_EVERY tiles of
+## a straight run either way, and a staircase of pipes crosses it too (x + y would miss some).
+static func pipe_shows_icon(tile: Vector2i) -> bool:
+	return posmod(tile.x + 2 * tile.y, PIPE_ICON_EVERY) == 0
 
 
 ## Cells of a grid for `n` icons in a square of side 1 (top-left corners and the cell's side), as

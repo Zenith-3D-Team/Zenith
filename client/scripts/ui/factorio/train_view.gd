@@ -11,6 +11,7 @@ extends Control
 ## overview slow to open); for a train far away it asks the map cache for the chart around it.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const LoadingSpinner := preload("res://scripts/ui/factorio/loading_spinner.gd")
 
 ## Seconds between a view's frames.
 const REFRESH := 0.5
@@ -18,6 +19,8 @@ const REFRESH := 0.5
 const BUDGET := 3
 ## Tiles the view shows from top to bottom.
 const SPAN := 32.0
+## Seconds a far train's view shows its loading icon for a chart that doesn't come.
+const WAIT_AT_MOST := 10.0
 
 ## The train's locomotive (a mover the client may be drawing), and where the mod last said the
 ## train was (tiles). The view follows the mover while there is one, else glides between the
@@ -38,6 +41,8 @@ var _marker := Control.new()
 var _live_now := false
 var _has_view := false
 var _asked_at := -1e9
+var _spinner := LoadingSpinner.new()
+var _waited := 0.0
 
 static var _frame := -1
 static var _used := 0
@@ -59,6 +64,11 @@ func _ready() -> void:
 			_marker.draw_circle(c, r + Kit.px(2), Color(0, 0, 0, 0.7))
 			_marker.draw_circle(c, r, Color8(255, 166, 0)))
 	add_child(_marker)
+	_spinner.name = "Loading"
+	_spinner.custom_minimum_size = Kit.pxv(36, 36)
+	_spinner.set_anchors_and_offsets_preset(Control.PRESET_CENTER, Control.PRESET_MODE_MINSIZE)
+	_spinner.visible = false
+	add_child(_spinner)
 	_timer = randf() * REFRESH  # cards opened together don't all render in the same frame
 
 
@@ -108,11 +118,21 @@ func _on_screen() -> bool:
 	return get_viewport_rect().intersects(get_global_rect())
 
 
+## A far train whose chart hasn't come yet: the view would be a black square (owner's P46).
+func _waiting_for_chart() -> bool:
+	if _live_now or cache == null or not is_instance_valid(cache) or not cache.has_method("is_charted"):
+		return false
+	return not cache.is_charted(Vector2i(floori(_at.x / 32.0), floori(_at.y / 32.0)))
+
+
 func _process(delta: float) -> void:
 	var live = _live()
 	if (live != null) != _live_now:
 		_live_now = live != null
 		_marker.queue_redraw()
+	if _on_screen():
+		_waited += delta
+		_spinner.visible = _waited < WAIT_AT_MOST and _waiting_for_chart()
 	if live != null:
 		_at = live
 	else:

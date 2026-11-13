@@ -11,7 +11,7 @@ config_version=5
 [application]
 
 config/name="Zenith"
-config/version="0.1.3"
+config/version="0.2.0"
 config/description="3D client for a running Factorio game, via the factorio-3d-bridge mod."
 run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.4", "Forward Plus")
@@ -38,8 +38,7 @@ driver/threads/thread_model=1
 
 textures/default_filters/anisotropic_filtering_level=4
 textures/vram_compression/compress_with_gpu=false
-anti_aliasing/quality/msaa_3d=2
-limits/global_shader_variables/buffer_size=524288
+limits/global_shader_variables/buffer_size=4194304
 
 [shader_globals]
 
@@ -72,6 +71,50 @@ f3d_belt_records={
 "value": ""
 }
 f3d_belt_clock={
+"type": "float",
+"value": 0.0
+}
+f3d_belt_lattice={
+"type": "sampler2DArray",
+"value": ""
+}
+f3d_belt_mask={
+"type": "sampler2D",
+"value": ""
+}
+f3d_belt_lattice_on={
+"type": "float",
+"value": 0.0
+}
+f3d_frame_dt={
+"type": "float",
+"value": 0.0
+}
+f3d_grass={
+"type": "vec4",
+"value": Vector4(0, 0, 0, 0)
+}
+f3d_grass_wind={
+"type": "float",
+"value": 0.0
+}
+f3d_decor_mask={
+"type": "sampler2D",
+"value": ""
+}
+f3d_decor_mask_on={
+"type": "float",
+"value": 0.0
+}
+f3d_look_ground_specular={
+"type": "float",
+"value": 1.0
+}
+f3d_look_model_fill={
+"type": "float",
+"value": 0.0
+}
+f3d_look_roughness_min={
 "type": "float",
 "value": 0.0
 }

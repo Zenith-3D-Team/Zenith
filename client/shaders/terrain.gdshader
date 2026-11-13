@@ -21,7 +21,13 @@ uniform float bump = 1.0;
 // How dark the joins between tiles are. Kept faint: Factorio's ground has no visible grid, but a
 // hint of one helps read distances in 3D. Not drawn on textured ground, whose variants show it.
 uniform float tile_edge = 0.04;
+// How much of SSAO darkens the ground's direct (sun) light (Godot's AO_LIGHT_AFFECT; SSAO always
+// darkens its ambient light). The ground has no occlusion of its own: this is only SSAO's.
+uniform float ssao_on_sunlight = 0.85;
 
+// The look's share of the ground's specular (looks.gd "ground_specular"): the sky's reflection on
+// the ground is what washed its colours out, so the Factorio look leaves it out.
+global uniform float f3d_look_ground_specular;
 uniform bool textured = false;
 uniform sampler2DArray tiles : source_color, filter_linear_mipmap_anisotropic, repeat_disable;
 // Per layer: first slot row, variant width and height in tiles, variant count.
@@ -215,7 +221,13 @@ void fragment() {
 
 	ALBEDO = albedo;
 	ROUGHNESS = roughness;
-	SPECULAR = 0.3;
+	SPECULAR = 0.3 * f3d_look_ground_specular;
+	// SSAO darkens the ground's sunlight too, not only the sky's light: Factorio paints the shade
+	// round a building's foot whatever the light. Without it Godot took a quarter of SSAO to direct
+	// light here (the environment's light affect times its AO channel affect, 0.5 x 0.5), and the
+	// ground round the buildings, nearly all lit by the sun, showed almost none.
+	AO = 1.0;
+	AO_LIGHT_AFFECT = ssao_on_sunlight;
 
 	if (top > 0.5) {
 		// Height = 0.06 * mid + 0.015 * fine; the gradient tilts the normal. Chain rule: the

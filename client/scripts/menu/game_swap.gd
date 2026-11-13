@@ -46,13 +46,56 @@ Get-Process -Name factorio -ErrorAction SilentlyContinue | Where-Object { $_.Mai
 ## The Factorio this client started to join its server, if it's still running.
 static var _game_pid := -1
 
+## The window-focusing script (_focus): started and never waited for, since the main thread blocked
+## in OS.execute until PowerShell and everything holding its output had gone, and the window froze
+## ("Not Responding") whenever that took long. poll() reads its answer; past FOCUS_TIMEOUT_MSEC it
+## is ended and taken as "no window".
+const FOCUS_TIMEOUT_MSEC := 8000
+static var _focus_pid := -1
+static var _focus_started := 0
+static var _focus_then := Callable()  # exit code -> a line for the HUD ("" for none)
+
 
 ## Brings Factorio's window forward, or starts Factorio joined to `game_port` (the server this
-## client started; 0 when the client connected to a game it didn't start). Returns a line for the
-## HUD's message.
+## client started; 0 when the client connected to a game it didn't start). The answer comes from
+## poll() a moment later (the focusing script runs on its own); returns a line for the HUD's message
+## when there is one at once.
 static func show_factorio(game_port: int) -> String:
+	if _focus_pid > 0:
+		return ""  # the last press is still being answered
 	var started := _game_pid > 0 and OS.is_process_running(_game_pid)
-	if _focus(_game_pid if started else 0, "factorio") == 0:
+	var then := func(code: int) -> String: return _after_focus(code, started, game_port)
+	if not _focus(_game_pid if started else 0, "factorio", then):
+		return _after_focus(1, started, game_port)
+	return ""
+
+
+## Once a frame (front_end.gd): the focusing script's answer, a line for the HUD ("" for none, or
+## while it still runs).
+static func poll() -> String:
+	if _focus_pid <= 0:
+		return ""
+	var code := -1
+	if OS.is_process_running(_focus_pid):
+		if Time.get_ticks_msec() - _focus_started < FOCUS_TIMEOUT_MSEC:
+			return ""
+		OS.kill(_focus_pid)
+	else:
+		code = OS.get_process_exit_code(_focus_pid)
+	_focus_pid = -1
+	var then := _focus_then
+	_focus_then = Callable()
+	return str(then.call(code)) if then.is_valid() else ""
+
+
+## Whether a focusing script is running (tests).
+static func focusing() -> bool:
+	return _focus_pid > 0
+
+
+## What a press does once the focusing script answered: nothing more when a window came forward.
+static func _after_focus(code: int, started: bool, game_port: int) -> String:
+	if code == 0:
 		return ""
 	if started:
 		return "Factorio is running: switch to its window"  # never a second one (no wmctrl off Windows)
@@ -74,7 +117,8 @@ static func show_client(minimize_game := true) -> void:
 	if DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_MINIMIZED:
 		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
 	DisplayServer.window_move_to_foreground()
-	_focus(OS.get_process_id(), "")
+	if _focus_pid <= 0:
+		_focus(OS.get_process_id(), "", Callable())  # its answer isn't needed: poll() only tidies up
 	if minimize_game:
 		minimize_factorio()
 
@@ -161,18 +205,27 @@ static func _script_file(file_name: String, text: String) -> String:
 	return script
 
 
-## 0 when the window came forward. Off Windows the window is found by its class name with wmctrl,
-## whatever the process.
-static func _focus(pid: int, process_name: String) -> int:
+## Starts the script that brings a window forward; `then` gets its exit code (0 when the window came
+## forward) from poll(). False when it couldn't be started. Off Windows the window is found by its
+## class name with wmctrl, whatever the process.
+static func _focus(pid: int, process_name: String, then: Callable) -> bool:
+	var exe := "powershell.exe"
+	var args: Array = []
 	if OS.get_name() != "Windows":
 		if process_name == "":
-			return 1
-		var out: Array = []
-		return OS.execute("sh", ["-c", "command -v wmctrl >/dev/null && wmctrl -x -a %s" % process_name], out)
-	var script := _script_file("focus_window.ps1", FOCUS_PS)
-	if script == "":
-		return 1
-	var args := ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-		"-File", script.replace("/", "\\"), "-Id", str(pid), "-Name", process_name if process_name != "" else "none"]
-	var out: Array = []
-	return OS.execute("powershell.exe", args, out)
+			return false
+		exe = "sh"
+		args = ["-c", "command -v wmctrl >/dev/null && wmctrl -x -a %s" % process_name]
+	else:
+		var script := _script_file("focus_window.ps1", FOCUS_PS)
+		if script == "":
+			return false
+		args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+			"-File", script.replace("/", "\\"), "-Id", str(pid), "-Name", process_name if process_name != "" else "none"]
+	var started := OS.create_process(exe, args)
+	if started <= 0:
+		return false
+	_focus_pid = started
+	_focus_started = Time.get_ticks_msec()
+	_focus_then = then
+	return true

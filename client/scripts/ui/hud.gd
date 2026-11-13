@@ -14,9 +14,13 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const DamageOverlay := preload("res://scripts/ui/damage_overlay.gd")
 const Controls := preload("res://scripts/player/controls.gd")
+const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
 
 ## Short names for keys in the help (OS.get_keycode_string's are long).
-const KEY_SHORT := {"QuoteLeft": "`", "Comma": ",", "Period": ".", "Slash": "/", "PageUp": "PgUp", "PageDown": "PgDn"}
+const KEY_SHORT := {"QuoteLeft": "`", "Comma": ",", "Period": ".", "Slash": "/", "PageUp": "PgUp", "PageDown": "PgDn",
+	"Equal": "=", "Minus": "-", "BracketLeft": "[", "BracketRight": "]", "Semicolon": ";", "Apostrophe": "'",
+	"BackSlash": "\\", "Backslash": "\\", "Escape": "Esc", "Kp Add": "Numpad +", "Kp Subtract": "Numpad -",
+	"Kp Multiply": "Numpad *", "Kp Divide": "Numpad /", "Kp Enter": "Numpad Enter"}
 ## Factorio's health bar goes from green through yellow to red.
 const HEALTH_COLORS := [Color(0.9, 0.1, 0.1), Color(1.0, 0.85, 0.1), Color(0.1, 0.9, 0.1)]
 ## style.lua's shield_progressbar colour, and the batteries' charge.
@@ -25,7 +29,8 @@ const ENERGY_COLOR := Color(0.95, 0.8, 0.15)
 
 var status := Label.new()
 var cursor_label := Label.new()
-var help := Label.new()
+var help := RichTextLabel.new()
+var _help_queued := false
 var mining_bar := ProgressBar.new()
 var health_bar := ProgressBar.new()
 var shield_bar := ProgressBar.new()
@@ -65,20 +70,24 @@ func _ready() -> void:
 	_messages.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(_messages)
 
-	# Factorio has no help text: a small panel in the free space on the left, wrapped to its width.
-	# factorio_ui.gd's layout places it, smaller and then cut short when the window is crowded, so
-	# the first line is the one to keep.
+	# Factorio has no help text: a panel in the free space on the left in Factorio's tooltip frame,
+	# headings in its caption colour and keys in the blue its hints use. factorio_ui.gd's layout
+	# places it, smaller when the window is crowded, and scrolled by the mouse wheel over it when
+	# even that doesn't fit. The mouse passes through it to the world (its scroll bar excepted).
+	help.bbcode_enabled = true
+	help.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	help.fit_content = false
+	help.scroll_active = false
+	help.add_theme_stylebox_override("normal", Kit.style("tooltip"))
+	help.add_theme_color_override("default_color", Kit.WHITE)
+	for weight in ["normal", "bold"]:
+		var f := Kit.font("regular" if weight == "normal" else "bold")
+		if f != null:
+			help.add_theme_font_override("%s_font" % weight, f)
+		help.add_theme_font_size_override("%s_font_size" % weight, Kit.px(13))
+	help.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	refresh_help()
 	Settings.listen(_on_setting)
-	help.theme_type_variation = "FSmallLabel"
-	help.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	var back := StyleBoxFlat.new()
-	back.bg_color = Color(0.0, 0.0, 0.0, 0.45)
-	back.set_content_margin_all(Kit.px(6))
-	back.set_corner_radius_all(Kit.px(3))
-	help.add_theme_stylebox_override("normal", back)
-	help.add_theme_font_size_override("font_size", Kit.px(13))
-	help.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(help)
 
 	ui.screen = screen
@@ -127,64 +136,265 @@ func _exit_tree() -> void:
 
 
 func _on_setting(section: String, key: String) -> void:
-	# Rebound in Settings → Controls, or Factorio's own keys switched on or off (read after this).
+	# Rebound in Settings → Controls, an add-on's controls added or taken away, or Factorio's own
+	# keys switched on or off (read after this). An add-on adds its controls one by one: once for all.
 	if section == "controls" or (section == "factorio" and key == "use_factorio_keys"):
-		refresh_help.call_deferred()
+		if not _help_queued:
+			_help_queued = true
+			refresh_help.call_deferred()
 
 
-## The help with the keys bound now; factorio_ui.gd fits it to its room again (`full_text`).
+## The help with the keys bound now; factorio_ui.gd fits it to its room again (`full_bbcode`, or
+## `scroll_bbcode` when it has to scroll). `full_text` is the same without the colours.
 func refresh_help() -> void:
-	var text := help_text()
-	help.text = text
-	help.set_meta("full_text", text)
+	_help_queued = false
+	var sections := help_sections()
+	var bbcode := _bbcode(sections, false)
+	if str(help.get_meta("full_bbcode", "")) == bbcode:
+		return  # as fitted already (the fit may show the scrolling one)
+	help.set_meta("full_text", help_text(sections))
+	help.set_meta("full_bbcode", bbcode)
+	help.set_meta("scroll_bbcode", _bbcode(sections, true))
+	help.text = bbcode
 
 
-## The help's lines, each control under the key bound to it now (Settings → Controls, or Factorio's
-## own keys); a control with no key is left out. The mouse's are fixed.
-static func help_text() -> String:
-	var lines: Array = [
-		_say([[_keys(["toggle_help"]), "hide help"]]),
-		_say([[_keys(["move_up", "move_left", "move_down", "move_right"], ""), "walk"], "Right mouse: mine",
-			[_keys(["pick_up"]), "pick up"], "Left mouse: build or open", [_keys(["rotate"]), "rotate"],
-			[_keys(["pipette"]), "pipette / put away"], [_keys(["drop_item"]), "drop"]]),
-		_say(["Shift+click: ghost / paste settings", "Shift+right: copy settings", "Ctrl+click: fast transfer",
-			[_keys(["copy", "cut", "paste"]), "copy, cut, paste"], [_keys(["undo"]), "undo"]]),
-		_say([[_keys(["shoot_enemies"]), "shoot nearby enemies"], [_keys(["shoot_cursor"]), "shoot at the cursor"],
-			[_keys(["next_gun"]), "next weapon"], [_keys(["enter_vehicle"]), "get in or out"]]),
-		_say([[_keys(["camera_left", "camera_right"]), "turn camera (or middle drag)"],
-			[_keys(["camera_tilt_up", "camera_tilt_down"]), "tilt"], "Wheel: zoom",
-			[_keys(["factorio_view"]), "Factorio view"], [_keys(["first_person"]), "first person"]]),
-		_say([[_keys(["open_screen"]), "inventory"], [_keys(["open_technology"]), "technologies"],
-			[_keys(["toggle_map"]), "map"], [_keys(["production_statistics", "kill_statistics"]), "statistics"],
-			[_keys(["logistic_networks"]), "logistic networks"], [_keys(["toggle_factoriopedia"]), "Factoriopedia (or Alt+click)"],
-			[_keys(["toggle_console"]), "chat"], [_keys(["alt_mode"]), "Alt-mode"],
-			[_keys(["quickbar_1", "quickbar_10"], "-"), "quickbar (inventory open: pin the hovered item)"],
-			[_keys(["debug_line"]), "debug info"]]),
+## What F1 shows: [[heading, [item, ...]], ...]. An item is {a: its actions, w: what it does}, its
+## keys the ones bound to them now (Settings → Controls, or Factorio's own keys) and left out when
+## none of them has one; {k: fixed keys, w: ...} for the mouse and keys that can't be rebound.
+## `r` shows the actions' keys as a range (1-0), `j` joins them otherwise (" / " by default), `all`
+## takes each action's alternative key too (the first only otherwise).
+## Add-ons' controls come last, under each add-on loaded now (api.keys, ControlsInfo.extra).
+static func help_sections() -> Array:
+	var quickbar: Array = range(1, 11).map(func(i: int) -> String: return "quickbar_%d" % i)
+	var pages: Array = range(1, 11).map(func(i: int) -> String: return "quickbar_page_%d" % i)
+	var out: Array = [
+		["", [
+			{"a": ["toggle_help"], "w": "hide help"},
+			{"k": "Keys", "w": "Settings → Controls"}]],
+		["Moving and camera", [
+			{"a": ["move_up", "move_left", "move_down", "move_right"], "j": "", "w": "walk, or drive"},
+			{"a": ["enter_vehicle"], "w": "get in or out (beside a silo: its rocket)"},
+			{"k": "Wheel", "w": "zoom"},
+			{"k": "Middle mouse drag", "w": "turn and tilt"},
+			{"a": ["camera_left", "camera_right"], "w": "turn"},
+			{"a": ["camera_tilt_up", "camera_tilt_down"], "w": "tilt"},
+			{"a": ["first_person"], "w": "first person"},
+			{"a": ["factorio_view"], "w": "Factorio's view"},
+			{"a": ["toggle_projection"], "w": "perspective or orthographic"}]],
+		["Fighting", [
+			{"a": ["shoot_enemies"], "w": "shoot nearby enemies"},
+			{"a": ["shoot_cursor"], "w": "shoot at the cursor"},
+			{"a": ["next_gun"], "w": "next weapon"}]],
+		["Building and mining", [
+			{"k": "Left mouse", "w": "build, or open what's under it"},
+			{"k": "Right mouse", "w": "mine"},
+			{"k": "Shift+left", "w": "ghost"},
+			{"k": "Ctrl+Shift+left", "w": "super-forced"},
+			{"a": ["rotate", "reverse_rotate"], "w": "rotate"},
+			{"a": ["flip_horizontal", "flip_vertical"], "w": "flip"},
+			{"a": ["pipette", "clear_cursor"], "w": "pipette, or put away what you hold"},
+			{"a": ["drop_item"], "w": "drop one"},
+			{"a": ["pick_up"], "w": "pick up from the ground"},
+			{"k": "Shift+right / Shift+left", "w": "copy / paste settings"},
+			{"k": "Ctrl+left / right", "w": "fast transfer / half"},
+			{"k": "Ctrl+wheel", "w": "quality"},
+			{"a": ["cycle_quality_up", "cycle_quality_down"], "w": "quality"},
+			{"a": ["larger_tile_area", "smaller_tile_area"], "w": "tile area"}]],
+		["Blueprints, planners and wires", [
+			{"a": ["copy", "cut", "paste"], "w": "copy, cut, paste"},
+			{"a": ["undo", "redo"], "w": "undo, redo"},
+			{"a": ["give_blueprint"], "w": "blueprint"},
+			{"a": ["blueprint_library"], "w": "blueprint library"},
+			{"k": "Shift+wheel", "w": "book page"},
+			{"a": ["cycle_blueprint_forwards", "cycle_blueprint_backwards"], "w": "book page"},
+			{"a": ["give_deconstruction_planner"], "w": "deconstruction planner"},
+			{"a": ["give_upgrade_planner"], "w": "upgrade planner"},
+			{"k": "Shift+drag", "w": "cancel marks"},
+			{"a": ["give_red_wire", "give_green_wire", "give_copper_wire"], "w": "red, green, copper wire"},
+			{"a": ["toggle_rail_layer"], "w": "rail layer (rails in hand)"}]],
+		["Inventory and crafting", [
+			{"a": ["open_screen"], "w": "inventory, or close windows"},
+			{"a": ["focus_search"], "w": "search"},
+			{"a": quickbar, "r": true, "w": "quickbar (inventory open: pin the hovered item)"},
+			{"a": pages, "r": true, "w": "quickbar page"},
+			{"a": ["rotate_quickbars"], "w": "swap the quickbars"},
+			{"k": "Click a recipe", "w": "craft 1 (right: 5, Shift: all)"},
+			{"k": "Shift / Ctrl+click a stack", "w": "move it / all of the kind"},
+			{"k": "Middle click a slot", "w": "filter"},
+			{"a": ["toggle_personal_logistics", "toggle_personal_roboport", "toggle_equipment_movement_bonus"],
+				"w": "logistic requests, roboport, exoskeletons on or off"}]],
+		["Windows", [
+			{"a": ["open_technology"], "w": "technologies"},
+			{"a": ["toggle_map"], "w": "map"},
+			{"a": ["production_statistics", "kill_statistics"], "w": "production, kill statistics"},
+			{"a": ["logistic_networks"], "w": "logistic networks"},
+			{"a": ["toggle_factoriopedia"], "w": "Factoriopedia"},
+			{"k": "Alt+click", "w": "its page"},
+			{"a": ["toggle_console"], "all": true, "j": " or ", "w": "chat and console"},
+			{"a": ["toggle_players"], "w": "players"},
+			{"a": ["alt_mode"], "w": "Alt-mode"},
+			{"k": "Esc", "w": "close, or the game menu"},
+			{"a": ["increase_ui_scale", "decrease_ui_scale", "reset_ui_scale"], "w": "UI scale"}]],
+		["Map and remote view", [
+			{"a": ["move_up", "move_left", "move_down", "move_right"], "j": "", "w": "move (or drag; Shift: faster)"},
+			{"k": "Wheel", "w": "zoom; in past the closest: the 3D remote view there, out again: the map"},
+			{"k": "Right click", "w": "remove a ghost, or a tag"},
+			{"k": "Double click", "w": "tag"},
+			{"k": "Esc", "w": "close the map, or end the remote view"}]],
+		["Zenith's own", [
+			{"a": ["show_factorio"], "w": "the same game in Factorio"},
+			{"a": ["debug_line"], "w": "status line"}]],
 	]
-	return "\n".join(lines.filter(func(l: String) -> bool: return l != ""))
+	if Settings.dev_tools():
+		(out[-1][1] as Array).append({"a": ["debug_menu"], "w": "debug menu (testing tools, dev builds)"})
+	for addon in _addon_sections():
+		out.append(addon)
+	return out
 
 
-## "keys: what · text · ..." from [keys, what] pairs and fixed texts; a pair without keys is left out.
-static func _say(items: Array) -> String:
+## Each add-on loaded now with its controls (api.keys): its own keys, then those that work only
+## while it has the camera (they may be Zenith's own keys, WASD to fly).
+static func _addon_sections() -> Array:
+	var names: Array = []
+	var own := {}
+	var camera := {}
+	for action in ControlsInfo.extra:
+		var name := str(ControlsInfo.extra[action][0])
+		if not names.has(name):
+			names.append(name)
+			own[name] = []
+			camera[name] = []
+		var item := {"a": [action], "w": _short_label(str(ControlsInfo.extra[action][1]))}
+		(camera[name] if str(Settings.contexts.get(action, "global")).ends_with(":camera") else own[name]).append(item)
 	var out: Array = []
-	for item in items:
-		if item is String:
-			out.append(item)
-		elif str(item[0]) != "":
-			out.append("%s: %s" % [item[0], item[1]])
-	return " · ".join(out)
+	for name in names:
+		var items: Array = own[name]
+		if not (camera[name] as Array).is_empty():
+			items.append({"k": "With its camera", "w": ""})
+			items.append_array(camera[name])
+		out.append(["%s (add-on)" % name, items])
+	return out
 
 
-## The first key bound to an action, short ("" when none).
+## An add-on's label for Settings → Controls without its explanation in brackets, lower case after
+## the key as the rest of the help ("Free camera on/off (also ends any shot)": "free camera on/off").
+static func _short_label(label: String) -> String:
+	var cut := label.find(" (")
+	var s := label.substr(0, cut) if cut > 0 else label
+	if s.length() > 1 and s[1] == s[1].to_lower():  # not an acronym ("UI scale")
+		s = s[0].to_lower() + s.substr(1)
+	return s
+
+
+## The keys of an item as shown, "" when none of its actions has a key.
+static func _item_keys(item: Dictionary) -> String:
+	if item.has("k"):
+		return str(item["k"])
+	var actions: Array = item["a"]
+	if item.get("r", false) and _in_a_row(actions):
+		return _range(str(actions[0]), str(actions[-1]))
+	var keys: Array = []
+	for a in actions:
+		for k in (_all_keys(str(a)) if item.get("all", false) else [_key(str(a))]):
+			if k != "" and not keys.has(k):
+				keys.append(k)
+	return str(item.get("j", " / ")).join(keys)
+
+
+## Every action the help names (the UI test checks each bound one is there).
+static func help_actions(sections: Array = []) -> Array:
+	var out: Array = []
+	for section in (sections if not sections.is_empty() else help_sections()):
+		for item: Dictionary in section[1]:
+			for a in item.get("a", []):
+				if not out.has(a):
+					out.append(a)
+	return out
+
+
+## The help as plain text: a heading per line, then "keys: what · keys: what"; an item without keys
+## is left out, and so is a heading with nothing under it.
+static func help_text(sections: Array = []) -> String:
+	var lines: Array = []
+	for section in (sections if not sections.is_empty() else help_sections()):
+		var parts: Array = []
+		for item: Dictionary in section[1]:
+			var keys := _item_keys(item)
+			if keys != "":
+				parts.append(("%s: %s" % [keys, item["w"]]) if str(item["w"]) != "" else keys + ":")
+		if parts.is_empty():
+			continue
+		if str(section[0]) != "":
+			lines.append(str(section[0]))
+		lines.append(" · ".join(parts))
+	return "\n".join(lines)
+
+
+## The same in Factorio's colours: headings bold in its caption colour, keys in its hints' blue.
+## `scrolls`: the first line also says the wheel scrolls it.
+static func _bbcode(sections: Array, scrolls: bool) -> String:
+	var lines: Array = []
+	var key_color := Kit.KEY_TEXT.to_html(false)
+	for section in sections:
+		var parts: Array = []
+		for item: Dictionary in section[1]:
+			var keys := _item_keys(item)
+			if keys == "":
+				continue
+			var what := str(item["w"])
+			parts.append("[color=#%s]%s[/color]%s" % [key_color, _escape(keys), (": " + _escape(what)) if what != "" else ":"])
+		if parts.is_empty():
+			continue
+		if str(section[0]) == "" and scrolls:
+			parts.append("[color=#%s]Wheel here[/color]: scroll" % key_color)
+		if str(section[0]) != "":
+			lines.append("[b][color=#%s]%s[/color][/b]" % [Kit.CAPTION.to_html(false), _escape(str(section[0]))])
+		lines.append(" · ".join(parts))
+	return "\n".join(lines)
+
+
+static func _escape(s: String) -> String:
+	return s.replace("[", "[lb]")
+
+
+## The first key bound to an action, short ("" when none): the last part of "Ctrl+Comma" shortened.
 static func _key(action: String) -> String:
-	var k := Controls.keys_text(action).get_slice(" / ", 0)
-	return str(KEY_SHORT.get(k, k))
+	return _short(Controls.keys_text(action).get_slice(" / ", 0))
 
 
-## Several actions' first keys joined (WASD with "", "1-0" with "-"); "" unless all have one.
-static func _keys(actions: Array, sep := " / ") -> String:
-	var keys: Array = actions.map(func(a: String) -> String: return _key(a))
-	return "" if keys.has("") else sep.join(keys)
+## Both keys bound to an action (the primary and the alternative), short.
+static func _all_keys(action: String) -> Array:
+	return Array(Controls.keys_text(action).split(" / ", false)).map(func(k: String) -> String: return _short(k))
+
+
+static func _short(k: String) -> String:
+	var plus := k.rfind("+")
+	var last := k.substr(plus + 1)
+	return k.substr(0, plus + 1) + str(KEY_SHORT.get(last, last))
+
+
+## The ten quickbar actions are on 1, 2, ... 9, 0 with the same modifiers (as by default): then the
+## help writes "1-0"; rebound otherwise, it lists their keys.
+static func _in_a_row(actions: Array) -> bool:
+	var first := _key(str(actions[0]))
+	var prefix := first.substr(0, first.rfind("+") + 1)
+	for i in actions.size():
+		if _key(str(actions[i])) != prefix + str((i + 1) % 10):
+			return false
+	return true
+
+
+## Two actions' first keys as a range: "1-0", "Shift+1-0" when they share their modifiers.
+static func _range(first: String, last: String) -> String:
+	var a := _key(first)
+	var b := _key(last)
+	if a == "" or b == "":
+		return a + b
+	var pa := a.rfind("+")
+	var pb := b.rfind("+")
+	if pa >= 0 and pa == pb and a.substr(0, pa) == b.substr(0, pb):
+		return a + "-" + b.substr(pb + 1)
+	return a + "-" + b
 
 
 func reset() -> void:

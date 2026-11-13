@@ -12,6 +12,7 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const InterfaceState := preload("res://scripts/ui/interface_state.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 ## The red no-power alert, depth tested like alert_icons.gd's (no flicker, hidden behind buildings).
 const IconShader := preload("res://shaders/billboard_icon_cut.gdshader")
@@ -62,6 +63,8 @@ func _ready() -> void:
 	m.set_shader_parameter("icon", texture if texture != null else _fallback_texture(Color(0.9, 0.2, 0.15)))
 	m.set_shader_parameter("blink_period", BLINK)
 	_icons = _multimesh(quad, m, false)
+	_icons.add_to_group(InterfaceState.GROUP)  # gone while the interface is hidden (interface_state.gd)
+	InterfaceState.follow(_icons)
 
 	var window := BoxMesh.new()
 	window.size = Vector3.ONE
@@ -153,6 +156,7 @@ func handle(msg: Dictionary) -> void:
 
 
 func _process(_delta: float) -> void:
+	InterfaceState.follow(_icons)
 	if world == null:
 		return
 	if _model_generation != ModelLibrary.generation:

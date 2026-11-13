@@ -13,6 +13,11 @@ extends Node3D
 ## long, bulk, stack) in its own colour (ARM_TINTS, picked from its sprites), stretched along
 ## their length to its reach. Without those models: a placeholder turntable, two boxes and a
 ## hand with two fingers. Everything is instanced: one MultiMesh per part (and per prototype).
+##
+## A modeller's inserter rigged as an arm (model_rig.gd: joints Base, Rotation, Lower Arm, Upper Arm,
+## Pincer1, Pincer2) replaces Wube's pieces for its prototype: its turntable yaws to the hand, its
+## lower and upper arm come from the same two-bone IK with the rig's own joints and lengths, and its
+## pincers turn about their joints to close while the hand holds an item. Its own materials, no tint.
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
@@ -34,6 +39,14 @@ const ITEM_DROP := 0.14  # how far below the wrist the held item hangs
 const FOLLOW_RATE := 30.0
 const STEEL := Color(0.52, 0.52, 0.5)
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const ModelRig := preload("res://scripts/world/model_rig.gd")
+## A rig's grip (between its pincers) goes where the held item is drawn.
+const GRIP_HEIGHT := HAND_HEIGHT - ITEM_DROP
+## How far a rig's arm may straighten before it is stretched to reach (a modeller's arm shorter than
+## the inserter's reach); stretched, the arm is longer than modelled.
+const RIG_REACH := 0.98
+## Pincers close and open in this much of a second.
+const CLOSE_TIME := 0.12
 ## Inserter prototype -> arm family (inserter-arm-<family>-*.glb); anything else is basic.
 const ARM_FAMILIES := {"long-handed-inserter": "long", "bulk-inserter": "bulk", "stack-inserter": "stack"}
 ## Arm paint per prototype: [upper arm, hand], from its sprites (hand-base.png, hand-open.png)
@@ -75,6 +88,8 @@ class Arm:
 	var path_reach := 0.0
 	var angle := 0.0  # where it is drawn
 	var reach := 0.0
+	var placed := Transform3D.IDENTITY  # the base model's transform (ModelLibrary.placed)
+	var close := 0.0  # a rig's pincers: 0 open, 1 closed on an item
 
 
 var protos: ProtoDB:
@@ -94,6 +109,11 @@ var _frame_length := 0.1
 var _parts: Array[MultiMeshInstance3D] = []
 ## Prototype name -> [MultiMeshInstance3D per ArmPiece], or null when its models are missing.
 var _model_parts := {}
+## Prototype name -> its model's arm rig (ModelLibrary.rig_for) with "mmis" (a MultiMeshInstance3D per
+## ModelRig.Part, null for a part it lacks), or {} without one.
+var _rigs := {}
+## Prototypes whose rig had to be stretched to reach (said once).
+var _stretched := {}
 
 
 func _ready() -> void:
@@ -180,6 +200,8 @@ func _update(unit: int, hand: Vector2, item_id: int) -> void:
 	arm.color = proto.color if proto != null else Color.GOLDENROD
 	arm.proto_name = proto.name if proto != null else ""
 	arm.base = rec.pos
+	if proto != null:
+		arm.placed = ModelLibrary.placed(proto.name, proto.type, rec.dir, rec.extra, Vector3(rec.pos.x, 0.0, rec.pos.y))
 	arm.item_id = item_id
 	arm.from_angle = arm.path_angle
 	arm.from_reach = arm.path_reach
@@ -213,6 +235,7 @@ func _process(delta: float) -> void:
 	var held := {}  # item id -> Array of positions
 	var held_yaws := {}  # item id -> Array of turns
 	var model_lists := {}  # proto name -> [Array of Transform3D per ArmPiece]
+	var rig_lists := {}  # proto name -> [Array of Transform3D per ModelRig.Part]
 	for unit in _arms:
 		if world != null and not world.entities.has(unit):
 			continue  # mined since the last update
@@ -222,7 +245,15 @@ func _process(delta: float) -> void:
 		arm.angle = lerp_angle(arm.angle, arm.path_angle, follow)
 		arm.reach = lerpf(arm.reach, arm.path_reach, follow)
 		var wrist: Vector3
-		if _pieces_for(arm.proto_name) != null:
+		var rig = _rig_for(arm.proto_name)
+		if rig == null:
+			continue  # its model is still being read: neither base nor arm is drawn yet
+		if not (rig as Dictionary).is_empty():
+			if not rig_lists.has(arm.proto_name):
+				rig_lists[arm.proto_name] = [[], [], [], [], []]
+			arm.close = move_toward(arm.close, 1.0 if arm.item_id > 0 else 0.0, delta / CLOSE_TIME)
+			wrist = _draw_rig_arm(arm, rig, rig_lists[arm.proto_name])
+		elif _pieces_for(arm.proto_name) != null:
 			if not model_lists.has(arm.proto_name):
 				model_lists[arm.proto_name] = [[], [], []]
 			wrist = _draw_model_arm(arm, model_lists[arm.proto_name])
@@ -234,7 +265,7 @@ func _process(delta: float) -> void:
 				held[arm.item_id] = []
 				held_yaws[arm.item_id] = []
 			held[arm.item_id].append(wrist - Vector3(0.0, ITEM_DROP, 0.0))
-			held_yaws[arm.item_id].append(ItemCards.yaw_for(unit))
+			held_yaws[arm.item_id].append(ItemCards.turn_for(unit))
 	for p in _parts.size():
 		var mm := _parts[p].multimesh
 		var xforms: Array = lists[p]
@@ -258,7 +289,125 @@ func _process(delta: float) -> void:
 			mm.visible_instance_count = xforms.size()
 			for i in xforms.size():
 				mm.set_instance_transform(i, xforms[i])
+	for proto_name in _rigs:
+		var mmis: Array = (_rigs[proto_name] as Dictionary).get("mmis", [])
+		var per_part: Array = rig_lists.get(proto_name, [[], [], [], [], []])
+		for p in mmis.size():
+			if mmis[p] == null:
+				continue
+			var mm: MultiMesh = (mmis[p] as MultiMeshInstance3D).multimesh
+			var xforms: Array = per_part[p]
+			if mm.instance_count < xforms.size():
+				mm.instance_count = maxi(xforms.size(), mm.instance_count * 2)
+			mm.visible_instance_count = xforms.size()
+			for i in xforms.size():
+				mm.set_instance_transform(i, xforms[i])
 	_cards.draw(held, held_yaws)
+
+
+## The arm rig of an inserter prototype's model with its MultiMeshes, made once its model is read;
+## {} when the model has none (Wube's pieces then), null while the model is still being read.
+func _rig_for(proto_name: String):
+	if _rigs.has(proto_name):
+		return _rigs[proto_name]
+	if proto_name == "" or not ModelLibrary.rig_name(proto_name):
+		_rigs[proto_name] = {}
+		return _rigs[proto_name]
+	if not ModelLibrary.ready(proto_name):
+		return null
+	ModelLibrary.mesh_for(proto_name)
+	var rig := ModelLibrary.rig_for(proto_name)
+	if rig.is_empty():
+		_rigs[proto_name] = {}
+		return _rigs[proto_name]
+	var entry := rig.duplicate()
+	var mmis: Array = []
+	var meshes: Array = rig["meshes"]
+	for p in ModelRig.Part.size():
+		if meshes[p] == null:
+			mmis.append(null)
+			continue
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = meshes[p]
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.name = "%s_rig_%d" % [proto_name, p]
+		add_child(mmi)
+		mmis.append(mmi)
+	entry["mmis"] = mmis
+	_rigs[proto_name] = entry
+	return entry
+
+
+## Adds one arm's rig part transforms to `lists` (indexed by ModelRig.Part); returns where the held
+## item hangs from (as the other arms' wrists). Each part's mesh is relative to its joint in the rest
+## pose, so a part is drawn turned from its rest direction to where the IK puts it, about its joint.
+func _draw_rig_arm(arm: Arm, rig: Dictionary, lists: Array) -> Vector3:
+	var turn := Basis(Vector3.UP, -arm.angle)
+	var out := turn * Vector3.RIGHT
+	var across := turn * Vector3.BACK
+	var hinge: Vector3 = rig["hinge"]
+	var pivot_rest: Vector3 = rig["pivot"]
+	var shoulder_rest: Vector3 = rig["shoulder"]
+	var elbow_rest: Vector3 = rig["elbow"]
+	var grip_rest: Vector3 = rig["grip"]
+	var lengths: Array = rig["lengths"]
+	var heads: Array = rig["heads"]
+	# The turntable yaws about its joint, where the base model has it, to face the hand.
+	var table := aim(Vector3.UP, hinge, Vector3.UP, across)
+	var pivot := arm.placed * pivot_rest
+	var shoulder := pivot + table * (shoulder_rest - pivot_rest)
+	var grip := Vector3(arm.base.x, GRIP_HEIGHT, arm.base.y) + out * arm.reach
+	var upper: float = lengths[0]
+	var fore: float = lengths[1]
+	var stretch := 1.0
+	var need := shoulder.distance_to(grip)
+	if need > (upper + fore) * RIG_REACH:
+		stretch = need / ((upper + fore) * RIG_REACH)
+		if not _stretched.has(arm.proto_name):
+			_stretched[arm.proto_name] = true
+			print("[inserters] %s: the model's arm (%.3f) is shorter than the hand's reach (%.3f): stretched to reach" % [
+				arm.proto_name, upper + fore, need])
+	var elbow := _elbow(shoulder, grip, out, upper * stretch, fore * stretch)
+	var lower_dir := elbow_rest - shoulder_rest
+	var upper_dir := grip_rest - elbow_rest
+	var lower_turn := aim(lower_dir, hinge, elbow - shoulder, across) * along(lower_dir, stretch)
+	var upper_turn := aim(upper_dir, hinge, grip - elbow, across) * along(upper_dir, stretch)
+	if heads[ModelRig.Part.TURNTABLE] != null:
+		lists[ModelRig.Part.TURNTABLE].append(Transform3D(table, pivot))
+	lists[ModelRig.Part.LOWER].append(Transform3D(lower_turn, shoulder))
+	lists[ModelRig.Part.UPPER].append(Transform3D(upper_turn, elbow))
+	var axes: Array = rig["axes"]
+	var angles: Array = rig["angles"]
+	for p in [ModelRig.Part.PINCER_A, ModelRig.Part.PINCER_B]:
+		if heads[p] == null or angles[p] == null:
+			continue
+		var head: Vector3 = heads[p]
+		var shut := Basis(axes[p] as Vector3, float(angles[p]) * arm.close)
+		lists[p].append(Transform3D(upper_turn * shut, elbow + upper_turn * (head - elbow_rest)))
+	return grip + Vector3(0.0, ITEM_DROP, 0.0)
+
+
+## The turn taking a part whose bone points along `rest_dir`, bending about `rest_hinge`, to point
+## along `dir` bending about `hinge` (both frames: bone, hinge made square to it, and their cross).
+static func aim(rest_dir: Vector3, rest_hinge: Vector3, dir: Vector3, hinge: Vector3) -> Basis:
+	return _frame(dir, hinge) * _frame(rest_dir, rest_hinge).inverse()
+
+
+static func _frame(dir: Vector3, hinge: Vector3) -> Basis:
+	var y := dir.normalized()
+	var z := (hinge - y * hinge.dot(y)).normalized()
+	return Basis(y.cross(z), y, z)
+
+
+## A stretch by `s` along `dir` (and none across it).
+static func along(dir: Vector3, s: float) -> Basis:
+	if is_equal_approx(s, 1.0):
+		return Basis.IDENTITY
+	var d := dir.normalized()
+	var k := s - 1.0
+	return Basis(Vector3.RIGHT + d * (d.x * k), Vector3.UP + d * (d.y * k), Vector3.BACK + d * (d.z * k))
 
 
 ## The arm pieces of an inserter prototype, made on first use; null without the models.

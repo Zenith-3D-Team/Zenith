@@ -43,6 +43,17 @@ data:extend({
     order = "e",
   },
   {
+    -- The longest the movers' search of the focus area waits while it keeps finding the same movers
+    -- (movers.lua rescan_every): 8 is a search every 8 ticks, as before.
+    type = "int-setting",
+    name = "f3d-mover-rescan",
+    setting_type = "runtime-global",
+    default_value = 32,
+    minimum_value = 8,
+    maximum_value = 300,
+    order = "e1",
+  },
+  {
     type = "int-setting",
     name = "f3d-detail-radius",
     setting_type = "runtime-global",
@@ -59,6 +70,16 @@ data:extend({
     minimum_value = 1,
     maximum_value = 60,
     order = "e3",
+  },
+  {
+    -- The periodic jobs that cost a tick 20-80 ms on the owner's save (the hand-craftable counts, the
+    -- machine states' search, the planets' idle looks) in slices over several ticks, and apart
+    -- (docs/RUNNING.md, "spread jobs").
+    type = "bool-setting",
+    name = "f3d-spread-jobs",
+    setting_type = "runtime-global",
+    default_value = true,
+    order = "e4",
   },
   {
     type = "bool-setting",

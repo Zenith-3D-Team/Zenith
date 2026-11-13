@@ -37,8 +37,8 @@ const LANE := 0.234
 const PILE := 0.07
 const AHEADS := [Vector2(0, -1), Vector2(1, 0), Vector2(0, 1), Vector2(-1, 0)]
 const RIGHTS := [Vector2(1, 0), Vector2(0, 1), Vector2(-1, 0), Vector2(0, -1)]
-## A far model pile's copies turn this much more each (belt_items.gd's PILE_TURN).
-const PILE_TURN := 0.45
+## A far pile's copies turn this much more each, as near ones (ItemCards.turn_for).
+const PILE_TURN := ItemCards.PILE_TURN
 ## Neighbouring icons on a full lane overlap: every other one sits this much higher, so they don't
 ## fight over the pixels they share (as belt_items.gd's LAYER_STEP).
 const LAYER_STEP := 0.006
@@ -90,8 +90,14 @@ var bridge_work := -1.0
 
 ## An update's work a tick (belt_items.gd, from bi w / p), smoothed over a few updates: with lanes
 ## kept, quiet lanes are checked every other update, so one update's figure goes up and down.
-func heard_work(per_tick: float) -> void:
+func heard_work(per_tick: float, loading := false) -> void:
 	bridge_work = per_tick if bridge_work < 0.0 else bridge_work + (per_tick - bridge_work) * 0.25
+	bridge_loading = loading
+
+
+## The bridge is still loading the square (`bs` ld): Automatic waits (its frames and the game run
+## slower meanwhile, and a cap changed now drops and loads thousands of lanes again).
+var bridge_loading := false
 
 
 ## The value a knob works with for the setting `v` (0: Unlimited, -1: Automatic's value now).
@@ -164,6 +170,11 @@ class Job:
 		for m: Array in msgs:
 			results.append([m[0], build(m[1], m[2], height, m[3], steps, curves), steps])
 
+	## The seed of a far icon's turn (ItemCards.turn_for): its belt's centre (1/256 tile, as `l`), its
+	## lane and its place on it, so it stays put while the lane's icons do.
+	static func slot_seed(x: int, y: int, lane: int, j: int) -> int:
+		return hash(Vector3i(x, y, lane * 4 + j))
+
 	## `l` [x, y, direction, lane 1 item, lane 2 item, ...]; `counts` [lane 1, lane 2, ...] per
 	## belt, or empty (an older mod: one icon a lane); `piles` the same for how high each lane's
 	## stacks are, or empty (no stacks).
@@ -187,10 +198,8 @@ class Job:
 				if row * 2 + lane < piles.size():
 					high = clampi(int(piles[row * 2 + lane]), 1, 4)
 				var step := PILE
-				var turn := false
 				if steps != null and (steps as Dictionary).has(item):
 					step = float(steps[item])
-					turn = true
 				var buf: PackedFloat32Array = by_item.get(item, PackedFloat32Array())
 				var o := buf.size()
 				buf.resize(o + n * high * STRIDE)
@@ -200,11 +209,12 @@ class Job:
 					var p := side + ahead * ((j + 0.5) / n - 0.5)
 					if turn_way != 0:
 						p = curve_point(at, (int(l[i + 2]) >> 2) & 3, turn_way, lane, (j + 0.5) / n)
-					# Models turn a little each, as near ones (ItemCards.yaw_for), and a pile's copies more.
-					var yaw := ItemCards.yaw_for(hash(Vector3i(int(l[i]), int(l[i + 1]), lane * 4 + j))) if turn else 0.0
+					# Turned as every item is (ItemCards.turn_for), icons and models alike, a pile's
+					# copies more; seeded by its place (bfar sends no unique ids).
+					var place := slot_seed(int(l[i]), int(l[i + 1]), lane, j)
 					for h in high:
 						var k := o + (j * high + h) * STRIDE
-						var a2 := yaw + PILE_TURN * h if turn else 0.0
+						var a2 := ItemCards.turn_for(place, h)
 						var c := cos(a2)
 						var sn := sin(a2)
 						buf[k] = c
@@ -283,6 +293,7 @@ func reset() -> void:
 		_drop(c)
 	covered = Vector3(0.0, 0.0, -1.0)
 	bridge_work = -1.0
+	bridge_loading = false
 	_sent = -1
 	_sent_near = -1
 	_sent_smooth = -1
@@ -331,7 +342,7 @@ func _process(_delta: float) -> void:
 ## UPS: room to spare raises the cap a fifth, frames running long or the game slowing lowers it a
 ## fifth. Not while a game loads (its frames are long for other reasons).
 func _auto(delta: float) -> void:
-	if not Bridge.world_ready:
+	if not Bridge.world_ready or bridge_loading:
 		_frames.clear()
 		_auto_t = 0.0
 		return

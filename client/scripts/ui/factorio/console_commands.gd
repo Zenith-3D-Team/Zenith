@@ -62,6 +62,7 @@ const COMMANDS := {
 	"f3d-player": [MOD, [], "/f3d-player [name | none]: which player's character the bridge plays"],
 	"f3d-profile": [MOD, [], "/f3d-profile [trace]: times each part of the bridge (then /f3d-status)"],
 	"f3d-rate": [MOD, [], "/f3d-rate <0-3>: the bridge sends its costliest updates less often"],
+	"f3d-debug": [MOD, [], "/f3d-debug [daytime <0-1> | freeze [on | off] | speed <x> | pause [on | off] | teleport <x> <y>]: the debug menu's time, speed and spots"],
 	"editor": [GAME, [], "/editor: the map editor"],
 	"screenshot": [GAME, [], "/screenshot [x y zoom]: a screenshot of the game's view"],
 	"reply": [GAME, ["r"], "/reply <message>: to whoever whispered to you"],

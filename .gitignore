@@ -11,3 +11,13 @@ docs/tracker/github.json
 
 # The modellers' folder (models/ beside Zenith): models being tried, not the project's own
 /models/
+
+# The native belt simulation's build: godot-cpp (downloaded, docs/RUNNING.md) and SCons' leftovers
+client/native/godot-cpp/
+client/native/belt_sim/**/*.obj
+client/native/belt_sim/.sconsign*.dblite
+client/native/bin/*.exp
+client/native/bin/*.lib
+client/native/bin/*.pdb
+client/native/bin/*.map
+client/native/belt_sim/*.pdb

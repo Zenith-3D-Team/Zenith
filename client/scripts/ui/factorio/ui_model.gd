@@ -37,6 +37,9 @@ signal landing_pad_found(si: int, q: int, at: Vector2, found: bool)
 signal hover_info_changed
 ## The mod's answer to command(): its lines; `known` false when the bridge doesn't run that command.
 signal command_answered(id: int, lines: Array, known: bool)
+## The same answer whole (`cmdr`), for what reads more than its lines: `na` (not allowed to run
+## commands here), `dbg` (/f3d-debug's state, debug_menu.gd).
+signal command_reply(id: int, msg: Dictionary)
 signal clipboard_changed
 signal chat_received(from: String, text: String)
 signal stats_received(kind: String, prec: int, rows: Array)
@@ -107,6 +110,15 @@ var server_quickbar := false
 ## Crafting queue: [{"recipe", "count", "progress" (0..1)}]; today only its length (`me.q`).
 var craft_queue: Array = []
 var craft_queue_size := 0
+## The queue as the game last said, and crafts asked for since that aren't in it yet
+## (craft_queue shows both): {"recipe", "count", "tick", "at" (msec), "base" (the game's count then)}.
+var _server_queue: Array = []
+var _pending_crafts: Array = []
+var _last_cq_tick := 0
+## A `cq` this many ticks after the click includes the command; a click unanswered for this long
+## was refused (a slow server's ticks are long).
+const PREDICTED_CRAFT_TICKS := 6
+const PREDICTED_CRAFT_MS := 1500
 
 ## The character's other inventories by slot ("guns", "ammo", "armor", "trash"), each a list like
 ## main_slots. Empty until the mod sends `slots`.
@@ -218,6 +230,8 @@ var item_uses := {}
 ## Chat lines, oldest first: [from, text, time (msec)].
 var chat_log: Array = []
 var _command_id := 0
+## Answers handed over as they were read (answer_read): id -> true, until their turn comes.
+var _answered_early := {}
 ## The character's logistic requests (`clog`): [{"item", "min", "max" (-1 none), "quality"}],
 ## whether they are on, and whether unrequested items go to the trash.
 var char_requests: Array = []
@@ -319,6 +333,9 @@ var pings: Array = []
 const PING_SECONDS := 6.0
 
 var _craftable := {}  # recipe -> count, from `craftable`
+var _raw_cache := {}  # recipe -> total_raw()'s answer
+var _raw_by_product := {}  # item -> the hand recipe that makes it
+const RAW_DEPTH := 32
 var _rdet: Array = []  # the latest complete `rdet` records
 var _parts := {}  # message type -> the multi-part list being received
 
@@ -540,6 +557,8 @@ func handle(msg: Dictionary) -> bool:
 			for r in _array(msg.get("l")):
 				if r is Array and r.size() >= 4:
 					cargo_pods[int(r[0])] = {"state": str(r[1]), "destination": str(r[2]), "surface": str(r[3])}
+					if r.size() >= 6:
+						cargo_pods[int(r[0])]["to"] = Vector2(float(r[4]), float(r[5])) / 256.0
 			planet_data_changed.emit()
 		"smap":
 			space_locations.clear()
@@ -653,10 +672,13 @@ func handle(msg: Dictionary) -> bool:
 				hover_info = info
 				hover_info_changed.emit()
 		"cmdr":
+			if _answered_early.erase(int(msg.get("id", 0))):
+				return true  # answered when it was read
 			var lines: Array = []
 			for l in _array(msg.get("l")):
 				lines.append(str(l))
 			command_answered.emit(int(msg.get("id", 0)), lines, int(msg.get("ok", 1)) != 0)
+			command_reply.emit(int(msg.get("id", 0)), msg)
 		"terr":
 			if int(msg.get("part", 1)) == 1:
 				_territory_parts.clear()
@@ -1006,6 +1028,8 @@ func set_recipe_list(names: Array) -> void:
 		var name := str(n)
 		out.append(_details[name] if _details.has(name) else _recipe({"name": name}))
 	recipes = out
+	_raw_cache.clear()
+	_raw_by_product.clear()
 	_update_groups(_group_order)
 	if not groups.is_empty():  # without details, keep the mod's order
 		recipes.sort_custom(_recipe_before)
@@ -1024,6 +1048,8 @@ func set_recipe_details(list: Array, group_order: Array = []) -> void:
 		_details[r["name"]] = r
 		out.append(r)
 	recipes = out
+	_raw_cache.clear()
+	_raw_by_product.clear()
 	_group_order = group_order.duplicate()
 	_update_groups(_group_order)
 	if not groups.is_empty():  # without details, keep the mod's order
@@ -1044,6 +1070,47 @@ func recipe(name: String) -> Dictionary:
 		if r["name"] == name:
 			return r
 	return {}
+
+
+## Factorio's "Total raw" of a recipe: the time and the items that can't be crafted by hand behind
+## one craft of it, every hand recipe on the way broken down (the setting's words in core.cfg).
+## {"time", "items": {name: amount}, "expanded": whether any ingredient was broken down,
+## "too_complex": a loop of recipes}. Kept until the recipes change: crafting_panel.gd asks for
+## every slot's tooltip on each inventory change.
+func total_raw(name: String) -> Dictionary:
+	if _raw_cache.has(name):
+		return _raw_cache[name]
+	var out := {"time": 0.0, "items": {}, "expanded": false, "too_complex": false}
+	if _raw_by_product.is_empty():
+		for r in recipes:
+			var products: Array = r["products"]
+			if products.size() == 1 and products[0] is Array and float(products[0][1]) > 0.0 and not r["ingredients"].is_empty():
+				var made := str(products[0][0])
+				# An item's own recipe wins over another that makes it.
+				if not _raw_by_product.has(made) or r["name"] == made:
+					_raw_by_product[made] = r
+	var r := recipe(name)
+	if not r.is_empty():
+		_add_raw(r, 1.0, out, [name])
+	_raw_cache[name] = out
+	return out
+
+
+func _add_raw(r: Dictionary, crafts: float, out: Dictionary, path: Array) -> void:
+	out["time"] = float(out["time"]) + maxf(0.0, float(r["energy"])) * crafts
+	for ing in r["ingredients"]:
+		if not (ing is Array and ing.size() >= 2):
+			continue
+		var item := str(ing[0])
+		var amount := float(ing[1]) * crafts
+		var maker: Dictionary = _raw_by_product.get(item, {})
+		if maker.is_empty():
+			out["items"][item] = float(out["items"].get(item, 0.0)) + amount
+		elif path.has(maker["name"]) or path.size() >= RAW_DEPTH:
+			out["too_complex"] = true
+		else:
+			out["expanded"] = true
+			_add_raw(maker, amount / float(maker["products"][0][1]), out, path + [maker["name"]])
 
 
 func _recipe(d: Dictionary) -> Dictionary:
@@ -1124,9 +1191,82 @@ func cancel_craft(index: int, n := 1) -> void:
 	Bridge.send({"t": "cancel_craft", "i": index, "n": n})
 
 
-## Hand-craft n of a recipe.
+## Hand-craft n of a recipe. Shown in the queue at once when the ingredients are there (owner's
+## P48); the game's next `cq` takes over.
 func craft(name: String, n: int) -> void:
 	Bridge.send({"t": "craft", "recipe": name, "n": n})
+	_predict_craft(name, n)
+
+
+## How many of `n` crafts the inventory has the direct ingredients for, counting what crafts already
+## shown but not yet seen by the game will take. A craft needing intermediates waits for the game:
+## only the game knows what it queues in front of it.
+func _craftable_now(r: Dictionary, n: int) -> int:
+	var taken := {}
+	for p in _pending_crafts:
+		for ing in recipe(str(p["recipe"]))["ingredients"]:
+			taken[str(ing[0])] = float(taken.get(str(ing[0]), 0.0)) + float(ing[1]) * int(p["count"])
+	var can := n
+	for ing in r["ingredients"]:
+		if ing is Array and ing.size() >= 2 and float(ing[1]) > 0.0:
+			can = mini(can, floori((count_of(str(ing[0])) - float(taken.get(str(ing[0]), 0.0))) / float(ing[1])))
+	return can
+
+
+func _predict_craft(name: String, n: int) -> void:
+	var r := recipe(name)
+	if r.is_empty() or r["ingredients"].is_empty():
+		return
+	var can := _craftable_now(r, n)
+	if can <= 0:
+		return
+	_pending_crafts.append({"recipe": name, "count": can, "tick": Bridge.server_tick,
+		"at": Time.get_ticks_msec(), "base": _server_craft_count(name)})
+	_show_craft_queue()
+
+
+func _server_craft_count(name: String) -> int:
+	var n := 0
+	for e in _server_queue:
+		if e is Dictionary and str(e.get("recipe", "")) == name:
+			n += int(e.get("count", 0))
+	return n
+
+
+## Forgets predicted crafts the game has answered: the queue shows more of that recipe, a `cq` came
+## late enough to include the command, or too long went by (it refused them: `cq` doesn't come while
+## its queue stays empty). craft_queue.gd asks every frame while one waits.
+func expire_predicted_crafts() -> void:
+	if _pending_crafts.is_empty():
+		return
+	var now := Time.get_ticks_msec()
+	var kept: Array = []
+	for p in _pending_crafts:
+		if now - int(p["at"]) < PREDICTED_CRAFT_MS and _last_cq_tick <= int(p["tick"]) + PREDICTED_CRAFT_TICKS \
+				and _server_craft_count(str(p["recipe"])) <= int(p["base"]):
+			kept.append(p)
+	if kept.size() != _pending_crafts.size():
+		_pending_crafts = kept
+		_show_craft_queue()
+
+
+func _show_craft_queue() -> void:
+	var entries := _server_queue.duplicate()
+	for p in _pending_crafts:
+		var last: Dictionary = entries[-1] if not entries.is_empty() and entries[-1] is Dictionary else {}
+		if str(last.get("recipe", "")) == str(p["recipe"]):
+			# Factorio adds to the last entry when it is the same recipe.
+			last = last.duplicate()
+			last["count"] = int(last.get("count", 0)) + int(p["count"])
+			entries[-1] = last
+		else:
+			entries.append({"recipe": str(p["recipe"]), "count": int(p["count"]), "progress": 0.0, "predicted": true})
+	craft_queue = entries
+	craft_queue_size = 0
+	for e in entries:
+		if e is Dictionary:
+			craft_queue_size += int(e.get("count", 1))
+	queue_changed.emit()
 
 
 # --- quickbar --------------------------------------------------------------------------------
@@ -1307,12 +1447,10 @@ func player_of_unit(unit: int) -> Dictionary:
 
 ## The queue's entries, [{"recipe", "count", "progress", "index"?}] (index: for cancel_craft).
 func set_craft_queue(entries: Array) -> void:
-	craft_queue = entries
-	craft_queue_size = 0
-	for e in entries:
-		if e is Dictionary:
-			craft_queue_size += int(e.get("count", 1))
-	queue_changed.emit()
+	_server_queue = entries
+	_last_cq_tick = Bridge.server_tick
+	expire_predicted_crafts()
+	_show_craft_queue()
 
 
 # --- Factorio's world controls (ui_actions.lua) -------------------------------------------------
@@ -1852,6 +1990,18 @@ func ask_hover_info(unit: int, proto_id: int, fixed: Vector2i) -> void:
 	_hinfo_msec = now
 	_hinfo_q += 1
 	Bridge.send({"t": "hinfo", "q": _hinfo_q, "u": unit, "p": proto_id, "x": fixed.x, "y": fixed.y})
+
+
+## A console command's answer as soon as its datagram is read (Bridge.answer_read), ahead of the
+## messages waiting their turn; handle() then lets it pass when its turn comes.
+func answer_read(msg: Dictionary) -> void:
+	if _answered_early.size() > 256:
+		_answered_early.clear()  # answers whose turn never came (the session ended)
+	var id := int(msg.get("id", 0))
+	if id <= 0 or _answered_early.has(id):
+		return
+	handle(msg)
+	_answered_early[id] = true
 
 
 ## A console command for the bridge to run for its character ("/cheat all"); command_answered

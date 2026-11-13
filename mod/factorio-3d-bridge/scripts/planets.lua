@@ -37,6 +37,10 @@ local POD_INTERVAL = 10
 -- IDLE ticks; once it finds something it runs at its own rate for BUSY_FOR ticks. Lightning
 -- idles shortest so the first strike of a storm is still seen while it lasts.
 local IDLE = { lt = 12, legs = 30, cp = 30 }
+-- With f3d-spread-jobs each idle look runs on its own tick of its period, off the 30th ticks
+-- where the hand-craftable counts and the machine states landed with them (two area searches of
+-- the focus radius, 10-19 ms together on the owner's save).
+local IDLE_PHASE = { lt = 5, legs = 11, cp = 21 }
 local BUSY_FOR = 1800
 local LIFE_INTERVAL = 60
 local STRIKE_MEMORY = 120     -- ticks a strike is remembered so it is sent once
@@ -145,7 +149,8 @@ local function due(t, interval)
   if (busy[t] or -1) >= now then
     return now % interval == 0
   end
-  return now % IDLE[t] == 0
+  local phase = settings.global["f3d-spread-jobs"].value and IDLE_PHASE[t] or 0
+  return now % IDLE[t] == phase % IDLE[t]
 end
 
 local function found(t, n)
@@ -399,7 +404,17 @@ local function cargo_pods(surface, f)
     local ok, state, dest = pcall(function() return e.cargo_pod_state, e.cargo_pod_destination end)
     if ok and e.unit_number then
       local to = dest and dest.surface
-      out[#out + 1] = { e.unit_number, state or "", dest and destination_name(dest.type) or "", to and to.valid and to.name or "" }
+      local row = { e.unit_number, state or "", dest and destination_name(dest.type) or "", to and to.valid and to.name or "" }
+      -- Coming down: where it lands, so the client can drop it straight onto that spot.
+      if state == "descending" and dest then
+        local station = dest.station
+        local spot = station and station.valid and station.position or dest.position
+        if spot then
+          row[5] = world.fixed(spot.x)
+          row[6] = world.fixed(spot.y)
+        end
+      end
+      out[#out + 1] = row
     end
   end
   return out

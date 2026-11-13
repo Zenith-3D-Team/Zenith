@@ -4,7 +4,7 @@ extends RefCounted
 ## tile: at a busy base two thirds of the GPU's work, nearly all of it in triangles smaller than a
 ## pixel once the camera is pulled back. Where a tile is drawn smaller than FLAT_BELOW pixels at a
 ## chunk's nearest belt (from the camera's distance, field of view or orthographic size and the
-## window's height, so zooming, the field of view and the F6 view all count), the chunk's belts,
+## window's height up to MAX_LINES, so zooming, the field of view and the F6 view all count), the chunk's belts,
 ## undergrounds and splitters are drawn with their stand-ins instead, and in full again above
 ## FULL_ABOVE (the gap keeps a chunk at the edge from swapping back and forth).
 ##
@@ -24,10 +24,15 @@ const MaterialRows := preload("res://scripts/world/material_rows.gd")
 
 ## Pixels a tile is drawn at, at a chunk's nearest belt, below which its belts go flat, and above
 ## which they are drawn in full again. The default camera draws its farthest ground at about 28 px a
-## tile in a 1080-pixel window and Factorio's view (F6) at 32, so belts stay whole there; at 20 px
-## the belt's rails are a pixel wide and its rollers half one.
+## tile in a 1080-pixel window, so belts stay whole there; at 20 px the belt's rails are a pixel wide
+## and its rollers half one.
 const FLAT_BELOW := 20.0
 const FULL_ABOVE := 24.0
+## The tallest picture these thresholds count, in lines: a taller one is measured as if this tall,
+## so 4K draws as many belt triangles as 1080p. Measured in real pixels, belts at 4K only went flat
+## 171 tiles out, past the furthest default zoom, and stayed at 1,450 triangles a tile however far
+## the camera went (docs/SHADER-PERFORMANCE-PLAN.md S4).
+const MAX_LINES := 1080.0
 ## Entity types drawn with stand-ins far away.
 const TYPES := {"transport-belt": true, "underground-belt": true, "linked-belt": true, "splitter": true, "lane-splitter": true}
 ## The key of a stand-in's MultiMesh in chunk_view.gd (_nodes[[model, FLAT]]).
@@ -115,7 +120,10 @@ static func update(world, cam: Camera3D, delta: float) -> void:
 	if cam == null:
 		return
 	var vp := cam.get_viewport()
-	var size := vp.get_visible_rect().size if vp != null else Vector2(1920, 1080)
+	# Real pixels: a window's visible rect is in the interface's units, which the UI scale divides.
+	var size := Vector2(1920, 1080)
+	if vp != null:
+		size = Vector2((vp as Window).size) if vp is Window else vp.get_visible_rect().size
 	var scale := 1.0
 	if vp != null and vp.scaling_3d_mode != Viewport.SCALING_3D_MODE_FSR2:
 		scale = vp.scaling_3d_scale
@@ -126,22 +134,37 @@ static func update(world, cam: Camera3D, delta: float) -> void:
 	_dirty = false
 	_last_view = view
 	var at := cam.global_position
-	var pixels := (size.x if cam.keep_aspect == Camera3D.KEEP_WIDTH else size.y) * scale
+	var pixels := view_pixels(size, scale, cam.keep_aspect == Camera3D.KEEP_WIDTH)
+	var orthographic := cam.projection == Camera3D.PROJECTION_ORTHOGONAL
 	for cv in _chunks.keys():
 		if not is_instance_valid(cv):
 			_chunks.erase(cv)
 			continue
 		var px := tile_pixels(cam, at, pixels, cv.belt_bounds)
-		var flat: bool = cv.belt_flat
-		if not enabled or px > FULL_ABOVE:
-			flat = false
-		elif px < FLAT_BELOW:
-			flat = true
-		cv.set_belt_flat(flat)
+		cv.set_belt_flat(enabled and flat_at(px, cv.belt_flat, orthographic))
 
 
-## How many pixels tall one tile is drawn at the nearest point of `box`: `pixels` is the window's
-## height (or width, for a camera keeping its width) in rendered pixels.
+## The window's height (or width, for a camera keeping its width) as tile_pixels() counts it: the
+## lines the world is really rendered at (`size` times the 3D scale, which Render scale and full
+## screen's Resolution set), no more than MAX_LINES. The limit is on what is rendered, so 4K drawn at
+## half scale is a 1080-line picture, not a 540-line one.
+static func view_pixels(size: Vector2, scale: float, keep_width := false) -> float:
+	var fit := minf(1.0, MAX_LINES / maxf(size.y * scale, 1.0))
+	return (size.x if keep_width else size.y) * scale * fit
+
+
+## Whether belts drawn at `px` pixels a tile go flat, from `was_flat`. An orthographic view has no
+## gap: a tile is the same size wherever the camera is, so only zooming can cross the line, and
+## Factorio's view (F6), which shows more ground in a bigger window, comes to 21.5 at 4K: with the
+## gap belts flat when it was snapped to would stay flat there.
+static func flat_at(px: float, was_flat: bool, orthographic: bool) -> bool:
+	if px > (FLAT_BELOW if orthographic else FULL_ABOVE):
+		return false
+	return px < FLAT_BELOW or was_flat
+
+
+## How many pixels tall one tile is drawn at the nearest point of `box`, for `pixels` from
+## view_pixels().
 static func tile_pixels(cam: Camera3D, at: Vector3, pixels: float, box: AABB) -> float:
 	if cam.projection == Camera3D.PROJECTION_ORTHOGONAL:
 		return pixels / maxf(cam.size, 0.001)
@@ -200,8 +223,11 @@ static func _commit(job: Job, out: ArrayMesh, mesh: ArrayMesh) -> void:
 
 
 ## The job for a model, made from its arrays on the CPU (null: none kept, or bones).
+## A modeller's textured belt gets none: a cell's corners copying the nearest vertex's UV smeared its
+## texture over the steps, and its own models (a few hundred triangles a tile, not Wube's 1,450)
+## have their own textured levels (model_lods.gd), which keep UV seams.
 static func _job_for(mesh: ArrayMesh, kind: String) -> Job:
-	if mesh == null or not mesh.has_meta(ModelLods.ARRAYS_META):
+	if mesh == null or not mesh.has_meta(ModelLods.ARRAYS_META) or ModelLods.textured(mesh):
 		return null
 	var job := Job.new()
 	job.kind = kind
@@ -219,7 +245,7 @@ static func _job_for(mesh: ArrayMesh, kind: String) -> Job:
 		var belt := []
 		var rows := MaterialRows.rows(material)
 		for m in (rows if not rows.is_empty() else [material]):
-			belt.append(m != null and str(m.resource_name).contains("belt_surface"))
+			belt.append(m != null and str(m.resource_name).to_lower().contains("belt_surface"))
 		job.belt_rows.append(belt)
 	return job
 

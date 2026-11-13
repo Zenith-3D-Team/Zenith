@@ -19,6 +19,7 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const GameSwap := preload("res://scripts/menu/game_swap.gd")
 const UiSettings := preload("res://scripts/ui/ui_settings.gd")
 const ColorFilter := preload("res://scripts/menu/color_filter.gd")
+const Looks := preload("res://scripts/world/looks.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
 
 const TABS := ["Graphics", "Sound", "Controls", "Interface", "Other", "Mod settings", "Camera", "Factorio"]
@@ -129,6 +130,14 @@ func _ready() -> void:
 	_open_tab(start)
 	if page_mode:
 		(bar.get_child(0) as Label).text = page_title(TABS[start])
+	# --settings-scroll-to=<control name> (screenshots): that setting scrolled into view.
+	var to := Settings.arg_value("--settings-scroll-to=")
+	if to != "":
+		await get_tree().process_frame
+		await get_tree().process_frame
+		var c := _pane.find_child(to, true, false) as Control
+		if c != null:
+			_scroll.ensure_control_visible(c)
 
 
 ## Factorio's page titles: "Graphics settings", "Sound settings", "Mod settings".
@@ -296,37 +305,36 @@ func _graphics() -> void:
 		else:
 			Settings.apply_preset(preset)
 			_open_tab.call_deferred(_tab))
-	_row(grid, "Preset", _preset, "sets the settings below together|Shadows, ambient occlusion, level of detail, the view, entity, belt and decorative distances, decorative density and clouds, from cheapest (Low) to dearest (Ultra). High is the default.")
+	_row(grid, "Preset", _preset, "sets the settings below together|Shadows, ambient occlusion, level of detail, the view, entity, belt and decorative distances, decorative density, 3D grass and clouds, from cheapest (Low) to dearest (Ultra). High is the default.")
 	var recommend := MenuKit.button(_recommended if _recommended != "" else "Recommended")
 	recommend.name = "graphics-recommended"
 	recommend.pressed.connect(_recommend.bind(recommend))
 	_row(grid, "For this PC", recommend,
 		"picks a preset for this PC|The preset this PC holds at a steady 60 UPS and 60 FPS, with Hold the game at 60 UPS and smooth belt items on. In a game it measures for a few seconds first.")
-	_dropdown(grid, "Full screen", "graphics", "window_mode", [["Windowed", "windowed"], ["Borderless full screen", "borderless"], ["Exclusive full screen", "fullscreen"]], "", true)
-	var sizes: Array = [["Default (1600 × 900)", ""]]
-	var screen := DisplayServer.screen_get_size()
-	var listed: Array = Settings.RESOLUTIONS.duplicate()
-	var native := "%dx%d" % [screen.x, screen.y]
-	if not listed.has(native):
-		listed.append(native)
-	for r in listed:
-		var w := int(str(r).get_slice("x", 0))
-		var h := int(str(r).get_slice("x", 1))
-		if w <= screen.x and h <= screen.y:
-			sizes.append(["%d × %d" % [w, h], r])
-	_dropdown(grid, "Resolution", "graphics", "resolution", sizes, "windowed mode", true)
+	# The resolution's list and note follow the mode and the screen.
+	var reopen := func(_i: int) -> void: _open_tab.call_deferred(_tab)
+	_dropdown(grid, "Full screen", "graphics", "window_mode", [["Windowed", "windowed"], ["Borderless full screen", "borderless"], ["Exclusive full screen", "fullscreen"]], "", true).item_selected.connect(reopen)
+	var full_screen := str(Settings.get_value("graphics", "window_mode")) != "windowed"
+	var resolution := _dropdown(grid, "Resolution", "graphics", "resolution", Settings.resolution_choices(DisplayServer.screen_get_size(Settings.chosen_screen()), full_screen),
+		"drawn at this size, scaled to fill the monitor|The world is drawn at this size and scaled up to fill the whole monitor, keeping its proportions; a size of another shape shows a little more instead of black bars. The interface stays sharp and is laid out as at this size. Game render scaling multiplies on top of it." if full_screen else
+		"the window's size|In full screen it is the size the world is drawn at, scaled up to fill the monitor.", true)
+	resolution.item_selected.connect(func(i: int) -> void:
+		if str(resolution.get_item_metadata(i)) == "":
+			Settings.restore_default_window_size())
 	var screens: Array = [["Primary screen (%d)" % (DisplayServer.get_primary_screen() + 1), -1]]
 	for i in DisplayServer.get_screen_count():
 		var s := DisplayServer.screen_get_size(i)
 		screens.append(["Screen %d (%d × %d)" % [i + 1, s.x, s.y], i])
-	_dropdown(grid, "Preferred screen", "graphics", "screen", screens, "", true)
+	_dropdown(grid, "Preferred screen", "graphics", "screen", screens, "", true).item_selected.connect(reopen)
 	_check(grid, "Minimize on focus loss", "graphics", "minimize_on_focus_loss", "full screen only")
 	_check(grid, "Wait for VSync", "graphics", "vsync", "", true)
 	_dropdown(grid, "FPS limit", "graphics", "fps_cap", [["Unlimited", 0], ["30", 30], ["60", 60], ["120", 120], ["144", 144], ["240", 240]], "", true)
 	_slider(grid, "Game render scaling", "graphics", "render_scale", 0.5, 2.0, 0.05, func(v: float) -> String: return "%d%%" % roundi(v * 100.0), true)
-	_slider(grid, "View distance", "graphics", "view_radius", 2, 20, 1, func(v: float) -> String:
+	_slider(grid, "View distance", "graphics", "view_radius", 2, Settings.VIEW_RADIUS_MAX, 1, func(v: float) -> String:
 		var n := int(v) * 2 + 1
-		return "%d chunks around (%d × %d)" % [int(v), n, n])
+		return "%d chunks around (%d × %d)" % [int(v), n, n], false, false,
+		"far views cost a lot|Chunks of 32 tiles drawn round the camera. What is drawn grows with the square of the distance: past %d (yellow) the ground, buildings and trees cost the graphics card, memory and the server noticeably more, past %d (red) a great deal (50 is over 10,000 chunks, six times 20's). Past 14 chunks the ground is drawn simpler." % [Settings.VIEW_RADIUS_DEAR, Settings.VIEW_RADIUS_DEAREST],
+		view_distance_tint)
 	_slider(grid, "Entity distance", "graphics", "entity_radius", 32, 256, 16, func(v: float) -> String:
 		return "%d tiles" % int(v), false, false, "moving things and machine states|Vehicles, trains, robots, enemies and working machines are drawn this far round the character. The server can cap it (its Max live-update radius).")
 	_slider(grid, "Belt item distance", "graphics", "belt_distance", 0, 640, 32, func(v: float) -> String:
@@ -340,6 +348,8 @@ func _graphics() -> void:
 	# many belt settings): both stay on; Hold 60 UPS still eases belt_smooth off under load.
 	_check(grid, "Hold the game at 60 UPS", "graphics", "hold_ups",
 		"eases off when the game slows|While the game runs under 60 UPS, the bridge's updates, the distances above, the minimap's refreshes and then the frame rate go lower for a while (the F4 line says what). Your settings stay as they are.")
+	_check(grid, "Give the server the CPU first", "graphics", "server_first",
+		"with the server on this PC|When the server runs on this PC, the client runs at a lower process priority, so the game's tick gets a core first whenever every core is busy (joining, loading chunks). The client's frame rate stays the same when there is room.")
 	_check(grid, "Show all smoke and particles", "graphics", "effects", "smoke, dust, flashes, explosions")
 	_slider(grid, "Items in 3D", "graphics", "item_models_max", 0, Settings.ITEM_MODELS_ALL, 500, func(v: float) -> String:
 		if int(v) <= 0:
@@ -347,12 +357,15 @@ func _graphics() -> void:
 		return "All" if int(v) >= Settings.ITEM_MODELS_ALL else "%d" % int(v), false, false,
 		"nearest first, the rest as icons|How many items on belts are drawn as 3D models, nearest the character first; the rest show their icon. All draws every item as a model, far belts too. Icons only draws them all as Factorio's icons, on the ground and in hands too. Fewer models draw faster on a busy base.")
 	_check(grid, "Clouds", "graphics", "clouds", "clouds, their shadows and haze")
+	_grey_for_look("graphics-clouds", "clouds", "its own Clouds slider (Add-ons menu) sets them")
 	_check(grid, "Decoratives", "graphics", "decoratives", "grass, flowers and small rocks|Grass, flowers and small rocks on the ground, from Factorio's own pictures.")
 	_slider(grid, "Decorative density", "graphics", "decorative_density", 0.1, 1.0, 0.05, func(v: float) -> String: return "%d%%" % roundi(v * 100.0))
 	_slider(grid, "Decorative distance", "graphics", "decorative_distance", 64, 320, 16, func(v: float) -> String:
 		return "%d tiles" % int(v), false, false, "thinner further out|Full detail to 80 tiles, then half and a quarter further out.")
-	_dropdown(grid, "Model look", "graphics", "model_look", [["Factorio colours", "colours"],
-		["Factorio sprite projected", "sprite"]], "colours, or the sprite painted on|Each part in its colour from the game's sprite, or the sprite projected onto the model. After a restart.")
+	_dropdown(grid, "3D grass", "graphics", "grass_3d", [["Off", "off"], ["30 tiles, still", "short"], ["40 tiles, with wind", "normal"],
+		["50 tiles, with wind", "far"]], "grass and low plants with height, near you|Grass and low plants near the character rise up from their flat pictures, which take over further out. Costs a little GPU; off in the Low preset. Needs Decoratives on.")
+	_dropdown(grid, "Look", "graphics", "look", Looks.choices(),
+		"light and colour|How the world is lit and coloured. Factorio: matched to Factorio's own pictures (its shadows' angle, its colours, its colour grading for each planet and time of day). Classic Zenith: the look before 0.1.4. Add-ons can add their own looks here.").item_selected.connect(reopen)  # rows a look sets itself grey out
 	var open_models := MenuKit.button("Open folder")
 	open_models.name = "graphics-open-models"
 	var on_open := func() -> void:
@@ -367,7 +380,17 @@ func _graphics() -> void:
 
 	_heading("Advanced")
 	grid = _grid()
-	_dropdown(grid, "Anti-aliasing", "graphics", "antialiasing", [["Off", "off"], ["FXAA", "fxaa"], ["TAA", "taa"], ["MSAA 2×", "msaa2"], ["MSAA 4×", "msaa4"], ["MSAA 8×", "msaa8"]], "", true)
+	var aa_note := "how edges are smoothed|SMAA (the default) smooths edges and keeps fine detail sharp. FXAA is softer. TAA is the steadiest on the far distance but softens what moves, belts most (Godot can't tell their surfaces move). MSAA costs the most, 8× above all at high resolutions, and is off under looks that draw their own passes (the Cinematic shaders)."
+	# A saved MSAA under such a look is shown as the SMAA drawn (normally switched at the start already).
+	if Settings._addons_started and Settings.switch_msaa_for_look():
+		Settings.apply_antialiasing(get_tree().root)
+	var under_look := Settings.antialiasing_look_note()
+	if under_look != "":
+		var short := "MSAA off under this look"
+		aa_note = "%s|%s %s" % [short, under_look, aa_note.get_slice("|", 1)]
+	var aa := _dropdown(grid, "Anti-aliasing", "graphics", "antialiasing", [["Off", "off"], ["FXAA", "fxaa"], ["SMAA", "smaa"], ["TAA", "taa"], ["MSAA 2×", "msaa2"], ["MSAA 4×", "msaa4"], ["MSAA 8×", "msaa8"]],
+		aa_note, true)
+	_grey_msaa(aa)
 	_dropdown(grid, "Shadows", "graphics", "shadows", [["Off", "off"], ["Low", "low"], ["Medium", "medium"], ["High", "high"], ["Ultra", "ultra"]],
 		"how sharp shadows are|How sharp shadows are, how far they reach past what you see (unless Shadow distance says otherwise) and how many passes draw them.")
 	_dropdown(grid, "Shadow distance", "graphics", "shadow_distance",
@@ -381,8 +404,11 @@ func _graphics() -> void:
 		"mods' machines move|A mod's building without a Zenith model is drawn with its own Factorio picture; on, its moving part runs while it works (16 frames of its loop, at most a few MB each, only for those in view). Off: still pictures, less memory.")
 	_check(grid, "Merged materials (may help when CPU-bound)", "graphics", "merged_materials",
 		"less CPU, a little more GPU|Each model drawn as one surface with one material: fewer draws and less CPU for the renderer, a little more GPU time. After a restart.")
-	_check(grid, "Ambient occlusion (WIP, high GPU cost)", "graphics", "ssao",
-		"shading in corners; costly|SSAO, off by default: it makes the depth pre-pass shade every pixel twice, about 6-7 ms of GPU a frame at a busy base, for a small difference in look.")
+	_check(grid, "Ambient occlusion", "graphics", "ssao",
+		"shading in corners|SSAO: tight shading in corners and between machines, as Factorio's sprites have it. On in High and Ultra. Drawn only zoomed in: it fades out as you zoom out and is off further out, costing nothing there. Up close it makes the depth pre-pass write every pixel's normal, about 0.7 ms of GPU a frame at a busy base on a desktop graphics card, more on a laptop.")
+	_grey_for_look("graphics-ssao", "ssao", "its own Ambient occlusion setting (Add-ons menu) applies")
+	_check(grid, "Contact shading", "graphics", "contact_shading",
+		"dark rim round buildings' feet|The dark rim on the ground round each building's foot that Factorio's sprites have, so buildings stand in the ground rather than on it. One draw per chunk, a fraction of a millisecond.")
 	_check(grid, "Render on a separate thread", "graphics", "render_thread",
 		"experimental|Godot's own experimental mode: it may help on some PCs and can hang on quitting. Off is the stable choice. After a restart.")
 
@@ -808,15 +834,37 @@ func _check(grid: GridContainer, text: String, section: String, key: String, not
 	_row(grid, text, c, note)
 
 
-## `live`: applied while dragging (saved on release); otherwise set on release.
-func _slider(grid: GridContainer, text: String, section: String, key: String, from: float, to: float, step: float, fmt: Callable, window := false, live := false, note := "") -> void:
+## View distance's value in Factorio's warning colours (the kit's tooltip yellow and red): yellow past
+## VIEW_RADIUS_DEAR chunks, red past VIEW_RADIUS_DEAREST; transparent (the theme's colour) up to it.
+static func view_distance_tint(v: float) -> Color:
+	if v > Settings.VIEW_RADIUS_DEAREST:
+		return Kit.RED_TEXT
+	if v > Settings.VIEW_RADIUS_DEAR:
+		return Kit.YELLOW_TEXT
+	return Color(0, 0, 0, 0)
+
+
+## `live`: applied while dragging (saved on release); otherwise set on release. `tint`, if given,
+## colours the value's text for the value (a Color; a transparent one leaves the theme's).
+func _slider(grid: GridContainer, text: String, section: String, key: String, from: float, to: float, step: float, fmt: Callable, window := false, live := false, note := "", tint := Callable()) -> void:
 	var holder := _hbox()
 	var s := MenuKit.slider(from, to, step, float(Settings.get_value(section, key)))
 	s.name = section + "-" + key
 	var value := Kit.label(fmt.call(s.value))
+	value.name = s.name + "-value"
+	var paint := func(v: float) -> void:
+		if not tint.is_valid():
+			return
+		var c: Color = tint.call(v)
+		if c.a > 0.0:
+			value.add_theme_color_override("font_color", c)
+		else:
+			value.remove_theme_color_override("font_color")
+	paint.call(s.value)
 	var as_value := func(v: float) -> Variant: return int(v) if step >= 1.0 else v
 	s.value_changed.connect(func(v: float) -> void:
 		value.text = fmt.call(v)
+		paint.call(v)
 		if live:
 			Settings.set_value(section, key, as_value.call(v), false))
 	s.drag_ended.connect(func(_changed: bool) -> void:
@@ -829,7 +877,7 @@ func _slider(grid: GridContainer, text: String, section: String, key: String, fr
 	_row(grid, text, holder, note)
 
 
-func _dropdown(grid: GridContainer, text: String, section: String, key: String, items: Array, note := "", window := false) -> void:
+func _dropdown(grid: GridContainer, text: String, section: String, key: String, items: Array, note := "", window := false) -> OptionButton:
 	var o := MenuKit.dropdown(items, Settings.get_value(section, key))
 	o.name = section + "-" + key
 	o.item_selected.connect(func(i: int) -> void:
@@ -838,6 +886,30 @@ func _dropdown(grid: GridContainer, text: String, section: String, key: String, 
 		if window:
 			Settings.apply_window(get_tree().root))
 	_row(grid, text, o, note)
+	return o
+
+
+## A row the look in use sets itself (Settings.look_overrides): greyed out, its note saying where to
+## change it instead. The value stays, for when the look goes.
+func _grey_for_look(name: String, what: String, where: String) -> void:
+	var look := Settings.look_overrides(what)
+	var c := _pane.find_child(name, true, false) as BaseButton
+	if look == "" or c == null:
+		return
+	c.disabled = true
+	var holder := c.get_parent()
+	if holder.get_child_count() > 1 and holder.get_child(1) is Label:
+		(holder.get_child(1) as Label).text = "set by the %s look: %s" % [look, where]
+
+
+## Under a look that draws its own passes the MSAA choices are greyed out, each saying why
+## (Settings.MSAA_UNDER_LOOK); a saved MSAA was switched to SMAA by then (Settings.switch_msaa_for_look).
+func _grey_msaa(o: OptionButton) -> void:
+	var off := Settings.look_draws_passes()
+	for i in o.item_count:
+		if Settings.MSAA.has(str(o.get_item_metadata(i))):
+			o.set_item_disabled(i, off)
+			o.set_item_tooltip(i, "Off under the look in use: its full-screen passes read a depth MSAA blurs at every edge. SMAA is drawn instead." if off else "")
 
 
 func _ui_check(grid: GridContainer, text: String, key: String, note := "") -> void:
@@ -861,7 +933,7 @@ func _ui_slider(grid: GridContainer, text: String, key: String, from: float, to:
 		ui.set_value(key, v, false))
 	s.drag_ended.connect(func(_changed: bool) -> void:
 		Sfx.play_ui("gui-slider")
-		ui.save())
+		ui.set_value(key, s.value))
 	holder.add_child(s)
 	holder.add_child(value)
 	_row(grid, text, holder)

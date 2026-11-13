@@ -15,6 +15,20 @@
 -- saying the new one, and the client eases its delay in meanwhile instead of running out of
 -- positions and stopping.
 --
+-- The belt simulation's updates (`bs`, belt_sim.lua) are not glided positions: each is a read of
+-- every input spot (inserters' and drills' belts, splitters, the edge), checked once an update, and
+-- the client simulates the belts in between from those reads. Stretching them saves the bridge
+-- about as much as stretching `bi` did (the steady queue is one round an update), but every tick
+-- added to the period is a tick longer the client's bus runs on stale inputs: at 48 ticks the owner's
+-- copper bus showed gaps along every lane. So `bs` is its own job, slowed last (tier 3) and only to
+-- 12 ticks (the client's own quiet check spacing): under Hold 60 UPS the client's next steps (the
+-- minimap, the entity distance, the belt item distance `far`, which shrinks the square the bridge
+-- reads) buy the UPS instead, a smaller picture the game's rather than a stale one.
+-- TODO (ups_governor.gd STEPS, the client's ladder): its `updates` steps (3000, 1500: `bfar` m, the
+-- belt cap) buy nothing for a `bs` client, whose square ignores the cap (belt_sim.lua full_area), so
+-- they cost 5 s each of stepping before `far` 96 shrinks the square. Measured live at -62,-26 the
+-- governor reached level 3 either way: with the client's ~1 s jobs the game ran at 30-50 UPS.
+--
 -- Deterministic: the level lives in storage.f3d (set from a client command, like `focus`), each
 -- job's last runs too (from on_tick), and everything else is worked out from them and game.tick.
 
@@ -32,7 +46,8 @@ local EASE_TICKS = 120
 -- price: units per entity it reads, a unit being ~20 us (calibrated on the owner's save, Zenith Test,
 -- from /f3d-profile trace beside `f3dunits`), cost: what it is expected to cost before it has run once.
 local JOBS = {
-  bi = { tier = 1, max = 48, phase = 1, ease = true },  -- items on belts: the costliest by far
+  bi = { tier = 1, max = 48, phase = 1, ease = true },  -- items on belts (glided): the costliest by far
+  bs = { tier = 3, max = 12, phase = 1, ease = true },  -- the belt simulation's updates (reads of the input spots: see the top)
   lanes = { tier = 1 },   -- far belt lanes: only a factor on their rounds (M.factor), no period or tick
   mv = { tier = 1, max = 16, phase = 1, ease = true },  -- movers' positions (and how often they are searched)
   st = { tier = 2, max = 120, phase = 17, slack = 8, price = 0.28, cost = 500 },   -- machine working states

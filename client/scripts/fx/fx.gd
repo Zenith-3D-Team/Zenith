@@ -10,6 +10,7 @@ extends Node3D
 ## mover can still be looked up here.
 
 const WorldMirror := preload("res://scripts/world/world.gd")
+const MomentHold := preload("res://scripts/world/moment_hold.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
 const CombatLayer := preload("res://scripts/world/combat.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
@@ -24,6 +25,7 @@ const FxSettings := preload("res://scripts/fx/fx_settings.gd")
 const FxDemo := preload("res://scripts/fx/fx_demo.gd")
 const WeaponFx := preload("res://scripts/fx/weapon_fx.gd")
 const WeaponsDemo := preload("res://scripts/fx/weapons_demo.gd")
+const Lightning := preload("res://scripts/fx/lightning.gd")
 
 const SCAN_INTERVAL := 0.25
 ## Machines and vehicles further than this from the listener (tiles) are not considered.
@@ -97,6 +99,8 @@ var sfx := Sfx.new()
 var sprites := SpriteFx.new()
 ## What weapons fire: shots, projectiles, beams, explosions, fires and clouds (weapon_fx.gd).
 var weapons := WeaponFx.new()
+## Fulgora's lightning bolts (`lt`).
+var lightning := Lightning.new()
 
 var _tracked := {}  # unit -> Tracked, from mv
 var _gun := "pistol"
@@ -128,6 +132,8 @@ func _ready() -> void:
 	weapons.sprites = sprites
 	weapons.sfx = sfx
 	add_child(weapons)
+	lightning.name = "Lightning"
+	add_child(lightning)
 	# After the player's input (which sets combat's aim each frame) and fx_demo.gd.
 	process_priority = 2
 	for arg in OS.get_cmdline_user_args():
@@ -158,6 +164,7 @@ func reset() -> void:
 	_states.clear()
 	_emitters.clear()
 	sprites.clear()
+	lightning.clear()
 	sfx.stop_all()
 	weapons.reset()
 	_burning.clear()
@@ -186,6 +193,8 @@ func handle(msg: Dictionary) -> void:
 			weapons.handle(msg)
 		"pj", "gf":
 			weapons.handle(msg)
+		"lt":
+			_on_lightning(msg)
 		"guns":
 			var list = msg.get("l")
 			var sel := int(msg.get("sel", 1)) - 1
@@ -206,8 +215,8 @@ func _process(delta: float) -> void:
 	weapons.world = world
 	weapons.hand_stream = avatar.firing and _gun == "flamethrower"
 	weapons.aim = combat.aim if combat != null and combat.aim_mode == 1 else null
-	if not Bridge.world_ready:
-		return
+	if not Bridge.world_ready or MomentHold.on:
+		return  # a screenshot's moment: no new smoke, steps or sounds
 	_scan_timer += delta
 	if _scan_timer >= SCAN_INTERVAL:
 		_scan(_scan_timer)
@@ -589,6 +598,19 @@ func _mining_kind(at: Vector2) -> String:
 
 
 ## A gun's sound for each round the bridge reports (`shot`; weapon_fx.gd draws the flash).
+## Fulgora's strikes: the bolt and the prototype's sound (space-age's lightning-effect, which its
+## definition makes heard from far off).
+func _on_lightning(msg: Dictionary) -> void:
+	var list = msg.get("l")
+	if not (list is Array):
+		return
+	for r in list:
+		if r is Array and r.size() >= 3:
+			var at := Vector2(int(r[0]), int(r[1])) / 256.0
+			lightning.strike(at, int(r[2]) == 1)
+			sfx.play_at(SoundBank.pick("space-age/sound/explosions/lightning-effect"), Vector3(at.x, 1.0, at.y), 0.8, 0.1, 2.25)
+
+
 func _on_shot(msg: Dictionary) -> void:
 	var gun := str(msg.get("g", ""))
 	var at := Vector3(avatar.position.x, CombatLayer.MUZZLE_HEIGHT, avatar.position.z)

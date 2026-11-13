@@ -9,11 +9,15 @@ extends Node
 ## --factorio-port / --port); `disconnect_from` says goodbye and closes the socket.
 ##
 ## Command-line options (after `--`): --factorio-port=34200 --port=34201 --update-rate=0..3
-## --no-belt-groups (no `bg` in the hello: packed lanes come as items, for comparing)
 
 signal welcomed(msg: Dictionary)
 signal message_received(msg: Dictionary)
 signal connection_lost
+## A console command's answer (`cmdr`), as soon as its datagram is read: ahead of the messages
+## waiting for their turn (_drain hands out a few milliseconds of them a frame, so at a low frame
+## rate a busy base's messages queue up for seconds, and the debug menu and a screenshot's pause
+## gave up on answers that had come). It is handled in its turn too: ui_model.gd answers each id once.
+signal answer_read(msg: Dictionary)
 
 const PROTOCOL := 1
 const HELLO_INTERVAL := 1.0
@@ -34,6 +38,8 @@ var listen_port := 34201
 const MORE_PORTS := 7
 ## Ask for decoratives in the hello (main.gd, from the Graphics settings).
 var decoratives := true
+## Ask for mods' windows in the hello (main.gd, from the Interface settings).
+var mod_windows := false
 var bind_error := OK
 ## True between a welcome and a timeout.
 var connected := false
@@ -41,11 +47,21 @@ var connected := false
 var world_ready := false
 ## The bridge mod's version from the last welcome ("" before one): a bug report lists it.
 var mod_version := ""
+## The furthest square subscription the bridge takes (welcome `sq`, chunks; world.gd's `sub`); 0: a
+## bridge from before them, which takes a list of at most 625 chunks.
+var square_subs := 0
+## The tick of the message handled last: what the world mirror has reached.
 var server_tick := 0
+## The newest tick read off the socket: where the game is now. server_tick runs behind it while
+## messages wait their turn (_drain) and catches up in bursts, so the game's UPS is measured on this
+## (a busy base at 6 fps read 161 UPS at game speed 1 on server_tick).
+var newest_tick := 0
 var stats := {"packets": 0, "bytes": 0, "gaps": 0, "handle_usec": 0, "resyncs": 0, "full_resyncs": 0, "bad_json": 0}
 ## The bridge's last `wb`: its work budget per tick (`b`, in work units), the units it used per tick
 ## over the last second (`avg`, `max`), ticks over budget (`over`) and its queues' lengths (`q`).
 var work_budget := {}
+## When it came (Time.get_ticks_msec), 0 before the first.
+var work_budget_msec := 0
 ## Main-thread time spent on each message type so far, in microseconds (for perf probes).
 var handle_usec := {}
 var last_reliable_msec := 0
@@ -56,6 +72,9 @@ var resync_chunks: Callable
 var update_rate := 0
 const MAX_UPDATE_RATE := 3
 var _rate_sent := -1
+
+## The UI test sets this to an array: what would be sent goes there as JSON instead.
+var capture = null
 
 var _udp := PacketPeerUDP.new()
 ## The socket is read on a thread of its own. Windows keeps only ~64 KB of unread datagrams per
@@ -70,7 +89,8 @@ var _outbox: Array[PackedByteArray] = []
 ## The datagrams' JSON is read on a thread of its own too (walking a big base, decoding was about
 ## half of the 2-7 ms a frame spent on messages): the I/O thread hands it what it read (_inbox),
 ## it hands the main thread the messages read (_parsed: [datagram bytes, messages, their lengths,
-## how many had numbers that aren't finite]), and the main thread only handles them. A thread of
+## how many had numbers that aren't finite, the newest tick, the console answers (`cmdr`)]), and
+## the main thread only handles them. A thread of
 ## its own, not the I/O thread's: reading a burst's JSON there would leave the socket unread for
 ## tens of milliseconds. Its own JSON and RegEx: neither is shared between threads.
 var _parse_thread: Thread
@@ -79,7 +99,11 @@ var _parsed: Array = []
 var _session := ""
 var _expected_r := 1
 var _hello_timer := 0.0
-var _last_packet_msec := 0
+var _last_packet_msec := 0  # the last message handled
+var _last_read_msec := 0  # the last datagram read
+## Reasons the game was paused on purpose (a screenshot's pause): a tick-paused game runs no on_tick,
+## so the bridge sends nothing until it resumes, and that silence isn't a lost connection.
+var _quiet_by := {}
 var _last_resync_msec := -100000
 ## 0 none, 1 chunks, 2 full. Sent after the frame's packets are handled, so the chunk list
 ## sees what arrived after the gap, and kept through the cooldown, so packets lost in the middle
@@ -150,6 +174,7 @@ func disconnect_from() -> void:
 	world_ready = false
 	bind_error = OK
 	server_tick = 0
+	newest_tick = 0
 	stats = {"packets": 0, "bytes": 0, "gaps": 0, "handle_usec": 0, "resyncs": 0, "full_resyncs": 0, "bad_json": 0}
 	_waiting.clear()
 	_waiting_len.clear()
@@ -157,7 +182,9 @@ func disconnect_from() -> void:
 	_expected_r = 1
 	_pending_resync = 0
 	_last_packet_msec = 0
+	_last_read_msec = 0
 	last_reliable_msec = 0
+	_quiet_by.clear()
 
 
 ## The I/O thread: sends what's queued, then reads everything waiting, about once a millisecond.
@@ -200,6 +227,8 @@ func _parse_loop() -> void:
 			continue
 		var out: Array = []
 		for packet in raw:
+			var newest := -1
+			var answers: Array = []
 			var text := packet.get_string_from_utf8()
 			var lines := text.split("\n", false) if text.contains("\n") else PackedStringArray([text])
 			var msgs: Array = []
@@ -208,11 +237,15 @@ func _parse_loop() -> void:
 			for line in lines:
 				var got: Array = _parse_with(json, not_finite, line)
 				if got[0] is Dictionary:
-					msgs.append(got[0])
+					var msg: Dictionary = got[0]
+					msgs.append(msg)
 					lengths.append(line.length())
+					newest = maxi(newest, _int_or(msg.get("k"), -1))
+					if msg.get("t") == "cmdr":
+						answers.append(msg)
 				if got[1]:
 					bad += 1
-			out.append([packet.size(), msgs, lengths, bad])
+			out.append([packet.size(), msgs, lengths, bad, newest, answers])
 		_io_mutex.lock()
 		_parsed.append_array(out)
 		_io_mutex.unlock()
@@ -249,6 +282,8 @@ func _process(delta: float) -> void:
 		var parsed := _parsed
 		_parsed = []
 		_io_mutex.unlock()
+		if not parsed.is_empty():
+			_last_read_msec = Time.get_ticks_msec()
 		for entry: Array in parsed:
 			stats["packets"] += 1
 			stats["bytes"] += int(entry[0])
@@ -256,6 +291,14 @@ func _process(delta: float) -> void:
 			_waiting_len.append_array(entry[2])
 			if int(entry[3]) > 0:
 				stats["bad_json"] = int(stats.get("bad_json", 0)) + int(entry[3])
+			var k := int(entry[4])
+			# A tick far behind the newest is a save loaded (or a new session): start from it.
+			if k > newest_tick or (k >= 0 and k < newest_tick - 3600):
+				newest_tick = k
+			for answer: Dictionary in entry[5]:
+				answer_read.emit(answer)
+	if not _holding and not _hold_kinds.is_empty():
+		_release_held()  # before newer messages, which wait behind these meanwhile
 	_drain()
 	# A new session's mod starts at 0, and keeps the level through a resync: sent after each
 	# handshake unless it is 0 and was never anything else.
@@ -268,7 +311,7 @@ func _process(delta: float) -> void:
 		request_resync(true)
 	if _pending_resync > 0 and connected:
 		_send_resync()
-	if connected and Time.get_ticks_msec() - _last_packet_msec > TIMEOUT_MSEC:
+	if connected and _quiet_by.is_empty() and Time.get_ticks_msec() - _last_packet_msec > TIMEOUT_MSEC:
 		connected = false
 		world_ready = false
 		connection_lost.emit()
@@ -380,6 +423,11 @@ func _drain() -> void:
 
 
 ## Messages received but not handled yet (for tests and the F4 line).
+## Milliseconds since the last datagram came: a paused game's bridge sends nothing.
+func silent_msec() -> int:
+	return Time.get_ticks_msec() - maxi(_last_read_msec, _last_packet_msec)
+
+
 func waiting_count() -> int:
 	return _waiting.size() - _waiting_at
 
@@ -423,6 +471,9 @@ func set_work_budget(units: int) -> void:
 
 
 func send(cmd: Dictionary) -> void:
+	if capture != null:
+		capture.append(JSON.stringify(cmd))
+		return
 	if bind_error != OK or not _udp.is_bound():
 		return
 	var data := JSON.stringify(cmd).to_utf8_buffer()
@@ -431,7 +482,16 @@ func send(cmd: Dictionary) -> void:
 		_outbox.append(data)
 		_io_mutex.unlock()
 	else:
-		_udp.put_packet(data)  # the UI test's own socket (_catch_commands), with no I/O thread
+		_udp.put_packet(data)
+
+
+## The game is paused on purpose for `reason` (on), or resumes (off): no timeout meanwhile, and the
+## wait for the first packet after it starts again.
+func expect_quiet(reason: String, on: bool) -> void:
+	if on:
+		_quiet_by[reason] = true
+	elif _quiet_by.erase(reason):
+		_last_packet_msec = Time.get_ticks_msec()
 
 
 func request_resync(full: bool) -> void:
@@ -458,18 +518,12 @@ func _send_resync() -> void:
 func _send_hello() -> void:
 	# z: bi, ih and mv lists delta-coded (see PROTOCOL.md), most of a busy base's traffic.
 	# dc: decoratives (dprotos, dec), as Settings → Graphics → Decoratives says (main.gd sets it).
-	# bl: belt lanes that didn't change aren't sent again; belt_items.gd keeps their items (bi ln, dl).
-	# bg: packed lanes come as groups whose items belt_items.gd makes and moves (bi bg, bm);
-	# --no-belt-groups leaves it out (comparing).
-	# br: plain lanes of straight runs come once, and belt_items.gd moves their items (bi pl).
-	# Off unless --belt-runs: on Zenith Test runs read further for less server time and walk more
-	# accurately, but standing they still draw more items where the game has none than without
-	# (docs/PERFORMANCE-PLAN.md 10).
-	var hello := {"t": "hello", "v": PROTOCOL, "sid": _session, "w": 1 if connected else 0, "z": 1, "b": 1, "bl": 1}
-	if not "--no-belt-groups" in OS.get_cmdline_user_args():
-		hello["bg"] = 1
-	if "--belt-runs" in OS.get_cmdline_user_args():
-		hello["br"] = 1
+	# bs: belts are simulated here (belt_sim.gd): the mod sends each lane once and then only what
+	# changes (`bs`, not `bi`). A bridge older than `bs` sends `bi`, which nothing draws now, so
+	# main's `bi` options (bl, bg, br) aren't asked for.
+	# mg: mods' windows (mgui), as Settings → Interface says; 0 and the bridge doesn't read them.
+	var hello := {"t": "hello", "v": PROTOCOL, "sid": _session, "w": 1 if connected else 0, "z": 1, "b": 1, "bs": 1,
+		"mg": 1 if mod_windows else 0}
 	if decoratives:
 		hello["dc"] = 1
 	send(hello)
@@ -478,6 +532,7 @@ func _send_hello() -> void:
 func _handle(msg: Dictionary) -> void:
 	_last_packet_msec = Time.get_ticks_msec()
 	server_tick = _int_or(msg.get("k"), server_tick)
+	newest_tick = maxi(newest_tick, server_tick)  # (the UI test's messages come without the threads)
 	var t := str(msg.get("t", ""))
 	if msg.has("r"):
 		last_reliable_msec = _last_packet_msec
@@ -486,13 +541,16 @@ func _handle(msg: Dictionary) -> void:
 		if r < 1 or (connected and r - _expected_r > 1000000):
 			return
 		if t == "welcome":
+			newest_tick = server_tick  # a save loaded a little earlier in its game counts from here
 			mod_version = str(msg.get("mod", ""))
+			square_subs = _int_or(msg.get("sq"), 0)
 			if _int_or(msg.get("v"), 0) != PROTOCOL:
 				push_warning("Bridge mod %s speaks protocol %s, this client %d" % [mod_version, str(msg.get("v")), PROTOCOL])
 			_expected_r = r + 1
 			connected = true
 			world_ready = false
 			_pending_resync = 0
+			_clear_held()  # a new session: what waited was the old one's
 			# The game's mods and its graphics list (mod_graphics.gd), before anything is drawn.
 			ModGraphics.on_welcome(msg, send)
 			welcomed.emit(msg)
@@ -517,7 +575,66 @@ func _handle(msg: Dictionary) -> void:
 	if t == "wb":
 		# The bridge's work per tick (once a second): kept here for whatever reads it.
 		work_budget = msg
+		work_budget_msec = Time.get_ticks_msec()
 		return
+	if _hold_kinds.has(t):
+		_held.append(msg)
+		if _holding and _held.size() - _held_at >= HELD_MAX:
+			print("bridge: %d updates held for a screenshot: let go" % HELD_MAX)
+			_holding = false
+		return
+	_emit(msg, t)
+
+
+func _emit(msg: Dictionary, t: String) -> void:
 	var t0 := Time.get_ticks_usec()
 	message_received.emit(msg)
 	handle_usec[t] = int(handle_usec.get(t, 0)) + Time.get_ticks_usec() - t0
+
+
+# --- a screenshot's moment (moment_hold.gd) ------------------------------------------------------
+
+## Message types that wait (`_held`) instead of being handled: set while the moment is held, and kept
+## after it until what waited has been handled, so newer ones of those types stay behind it.
+var _hold_kinds := {}
+var _holding := false
+var _held: Array = []
+var _held_at := 0
+## The most that wait (a few minutes of a busy base's updates); past it they are let go.
+const HELD_MAX := 200000
+## Main-thread time a frame gives to handling what waited (as the messages' own slice).
+const RELEASE_USEC := 4000
+
+
+## `types` (t -> true) wait from now on; {} lets them go, handled in the order they came over the
+## next frames (_release_held).
+func hold_types(types: Dictionary) -> void:
+	if not types.is_empty():
+		_hold_kinds = types
+		_holding = true
+	else:
+		_holding = false
+
+
+## How many messages wait (held or not handled yet after it).
+func held_count() -> int:
+	return _held.size() - _held_at
+
+
+func _release_held() -> void:
+	var start := Time.get_ticks_usec()
+	while _held_at < _held.size():
+		var msg: Dictionary = _held[_held_at]
+		_held_at += 1
+		_emit(msg, str(msg.get("t", "")))
+		if Time.get_ticks_usec() - start > RELEASE_USEC:
+			break
+	if _held_at >= _held.size():
+		_clear_held()
+
+
+func _clear_held() -> void:
+	_held.clear()
+	_held_at = 0
+	if not _holding:
+		_hold_kinds = {}

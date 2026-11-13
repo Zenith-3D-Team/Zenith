@@ -32,11 +32,13 @@ local players = require("scripts.players")
 local alerts = require("scripts.alerts")
 local enemies = require("scripts.enemies")
 local session = require("scripts.session")
+local barrier = require("scripts.barrier")
 local console = require("scripts.console")
 local profile = require("scripts.profile")
 local budget = require("scripts.budget")
 local requests = require("scripts.requests")
 local alt_mode = require("scripts.alt_mode")
+local belt_switch = require("scripts.belt_switch")
 local gfx = require("scripts.gfx")
 local mod_gui = require("scripts.mod_gui")
 
@@ -46,12 +48,12 @@ script.on_init(function()
   zenith_button.update_all()
 end)
 script.on_load(session.on_load)
-script.on_configuration_changed(function()
-  session.each_client(session.init_storage)
+script.on_configuration_changed(function(data)
+  session.on_configuration_changed(data)
   zenith_button.update_all()
 end)
 
-script.on_event(defines.events.on_udp_packet_received, session.on_packet)
+script.on_event(defines.events.on_udp_packet_received, function(event) barrier.call("packet", session.on_packet, event) end)
 
 -- In this order: queued world data goes first, so a fresh client gets its welcome before any
 -- live state.
@@ -64,7 +66,7 @@ local STEPS = {
   { "planets", planets.tick }, { "space", space.tick }, { "collectors", collectors.tick },
   { "world", world.tick }, { "movers", movers.tick }, { "belt_items", belt_items.tick }, { "belt_lanes", belt_items.far_tick },
   { "ground_items", ground_items.tick }, { "fluids_power", fluids_power.tick },
-  { "inserters", inserters.tick }, { "sky", sky.tick }, { "ui_actions", ui_actions.tick }, { "alt_mode", alt_mode.tick },
+  { "inserters", inserters.tick }, { "sky", sky.tick }, { "ui_actions", ui_actions.tick }, { "alt_mode", alt_mode.tick }, { "belt_switch", belt_switch.tick },
   { "alerts", alerts.tick }, { "equipment", equipment.tick }, { "players", players.tick },
   { "enemies", enemies.tick }, { "requests", requests.tick }, { "gfx", gfx.tick }, { "mod_gui", mod_gui.tick },
 }
@@ -78,11 +80,12 @@ local function serve()
   -- Belt items' share of this tick first, so the periodic jobs that may wait keep off it.
   budget.commit(belt_items.planned_units(), "bi")
   if session.handshaking() then
-    profile.run("transport", transport.flush)
-    profile.run("handshake", session.handshake_tick)
+    profile.run("transport", barrier.call, "transport", transport.flush)
+    profile.run("handshake", barrier.call, "handshake", session.handshake_tick)
   else
     for _, step in ipairs(STEPS) do
-      profile.run(step[1], step[2])
+      -- Each step once, inside its own barrier (barrier.lua), so one failing leaves the others.
+      profile.run(step[1], barrier.call, step[1], step[2])
     end
   end
   budget.finish()
@@ -107,13 +110,14 @@ local warmed = 0
 script.on_event(defines.events.on_tick, function()
   if warmed < #WARM then
     warmed = warmed + 1
-    profile.run("warm", WARM[warmed])
+    profile.run("warm", barrier.call, "warm", WARM[warmed])
   end
-  profile.run("poll", transport.poll)
-  profile.run("bridge", function() session.each_client(serve) end)
-  profile.run("transport", transport.end_tick)
-  session.launch_tick()
-  profile.end_tick()
+  profile.run("poll", barrier.call, "poll", transport.poll)
+  profile.run("bridge", session.each_client, barrier.call, "serve", serve)
+  profile.run("transport", barrier.call, "transport", transport.end_tick)
+  barrier.call("launch", session.launch_tick)
+  barrier.call("shot_hold", console.hold_tick)
+  barrier.call("profile", profile.end_tick)
 end)
 
 tracker.register()
@@ -141,7 +145,7 @@ local function admins_only(fn)
       end
       return
     end
-    return fn(cmd)
+    return barrier.call("/" .. tostring(cmd.name), fn, cmd)
   end
 end
 commands.add_command("f3d-status", { "command-help.f3d-status" }, admins_only(session.status_command))
@@ -150,15 +154,16 @@ commands.add_command("f3d-platform", { "command-help.f3d-platform" }, admins_onl
 commands.add_command("f3d-player", { "command-help.f3d-player" }, admins_only(session.player_command))
 commands.add_command("f3d-profile", { "command-help.f3d-profile" }, admins_only(session.profile_command))
 commands.add_command("f3d-rate", { "command-help.f3d-rate" }, admins_only(session.rate_command))
+commands.add_command("f3d-bs", { "command-help.f3d-bs" }, admins_only(session.bs_command))
 -- game.player for the client's Lua commands over RCON (console.lua).
 console.register_remote()
 
 -- Several clients (session.lua): every game event reaches each client's state in turn.
-for _, id in pairs(defines.events) do
+for name, id in pairs(defines.events) do
   if id ~= defines.events.on_tick and id ~= defines.events.on_udp_packet_received then
     local handler = script.get_event_handler(id)
     if handler then
-      script.on_event(id, function(event) session.each_client(handler, event) end)
+      script.on_event(id, function(event) session.each_client(barrier.call, name, handler, event) end)
     end
   end
 end
@@ -173,15 +178,16 @@ local function show_in_zenith(event)
     session.ask_launch(event)  -- no Zenith to raise: the launcher beside Factorio starts one
   end
 end
-script.on_event("f3d-show-3d", show_in_zenith)
+script.on_event("f3d-show-3d", function(event) barrier.call("f3d-show-3d", show_in_zenith, event) end)
 -- The bridge's own windows and buttons (the launcher help, the Zenith button): not per client, so
 -- registered after the loop above.
-script.on_event(defines.events.on_gui_click, function(event)
+local function on_gui_click(event)
   if zenith_button.is_button(event.element) then
     return show_in_zenith(event)
   end
   session.on_gui_click(event)
-end)
+end
+script.on_event(defines.events.on_gui_click, function(event) barrier.call("on_gui_click", on_gui_click, event) end)
 -- The Zenith button for each player, on top of what these events already do (puppet.lua).
 local function also(id, fn)
   local before = script.get_event_handler(id)
@@ -189,7 +195,7 @@ local function also(id, fn)
     if before then
       before(event)
     end
-    fn(event)
+    barrier.call("zenith_button", fn, event)
   end)
 end
 also(defines.events.on_player_created, zenith_button.on_player)

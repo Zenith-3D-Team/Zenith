@@ -54,6 +54,12 @@ const MIN_SLICE := 500
 const OVERRUN_SLACK := 1000
 
 static var shared := true
+## A screenshot settling (addon_host.gd): the interface is hidden and nobody plays meanwhile, so the
+## sliced work may make frames of up to BOOST_TARGET_USEC, each system BOOST times its slice, and the
+## backlog of full detail's wider view (1,681 chunks at view distance 20) drains that much faster.
+static var boost := false
+const BOOST_TARGET_USEC := 50000
+const BOOST := 6
 ## Forced on or off from the command line (--frame-budget=shared|separate).
 static var _arg_checked := false
 
@@ -102,14 +108,12 @@ static func _roll() -> void:
 	var other := float(test_other_usec) if test_other_usec >= 0 \
 		else Performance.get_monitor(Performance.TIME_PROCESS) * 1.0e6 - _last_frame_used
 	_other_ema = lerpf(_other_ema, maxf(other, 0.0), 0.1)
-	var target := TARGET_USEC
-	if Engine.max_fps >= 30 and Engine.max_fps < 60:
-		target = int(1.0e6 / Engine.max_fps)
+	var target := _target()
 	var busy := false
 	for s in queued:
 		if int(queued[s]) > 0 and int(SYSTEMS[s][0]) <= 3:
 			busy = true
-	pool = clampi(int(target - RESERVE_USEC - _other_ema), POOL_MIN, POOL_MAX if busy else POOL_IDLE)
+	pool = clampi(int(target - RESERVE_USEC - _other_ema), POOL_MIN, (POOL_MAX if busy else POOL_IDLE) * (BOOST if boost else 1))
 	_last_frame_used = used_total
 	used_total = 0
 	used.clear()
@@ -120,7 +124,7 @@ static func _roll() -> void:
 ## `scale` multiplies its own slice (messages with a backlog take twice theirs).
 static func grant(system: StringName, scale := 1) -> int:
 	_roll()
-	var own := int(SYSTEMS[system][1]) * scale
+	var own := int(SYSTEMS[system][1]) * scale * (BOOST if boost else 1)
 	if not shared:
 		granted[system] = own
 		return own
@@ -138,8 +142,7 @@ static func grant(system: StringName, scale := 1) -> int:
 		reserve += LOW_RESERVE
 	var left := pool - used_total - reserve
 	if not test_no_deadline:
-		var target := TARGET_USEC if Engine.max_fps < 30 or Engine.max_fps >= 60 else int(1.0e6 / Engine.max_fps)
-		left = mini(left, _frame_start + target - RESERVE_USEC - Time.get_ticks_usec() - reserve)
+		left = mini(left, _frame_start + _target() - RESERVE_USEC - Time.get_ticks_usec() - reserve)
 	var g := mini(left, own)
 	if g < MIN_SLICE:
 		g = 0
@@ -153,6 +156,15 @@ static func grant(system: StringName, scale := 1) -> int:
 		_starved.erase(system)
 	granted[system] = maxi(int(granted.get(system, 0)), g)
 	return g
+
+
+## The frame the sliced work aims for: TARGET_USEC, an FPS cap's under 60, or BOOST_TARGET_USEC.
+static func _target() -> int:
+	if boost:
+		return BOOST_TARGET_USEC
+	if Engine.max_fps >= 30 and Engine.max_fps < 60:
+		return int(1.0e6 / Engine.max_fps)
+	return TARGET_USEC
 
 
 ## `system` ran for `usec` µs and has `waiting` left (0 when its queue is empty).

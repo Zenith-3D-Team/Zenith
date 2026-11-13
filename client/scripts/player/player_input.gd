@@ -426,6 +426,8 @@ func _mouse_button(mb: InputEventMouseButton) -> void:
 			if not mb.pressed:
 				return
 			var up := mb.button_index == MOUSE_BUTTON_WHEEL_UP
+			if not mb.ctrl_pressed and not mb.shift_pressed and hud.ui.scroll_help(-1 if up else 1):
+				return  # the wheel over the help (F1) scrolls it when it doesn't fit
 			# Factorio: Ctrl+wheel the held item's quality, Shift+wheel a held book's pages.
 			if mb.ctrl_pressed and cursor_item != "":
 				cycle_quality(1 if up else -1)
@@ -563,7 +565,7 @@ func _process(delta: float) -> void:
 	var tilt := Input.get_axis("camera_tilt_down", "camera_tilt_up")
 	if tilt != 0.0:
 		rig.tilt(tilt * 60.0 * delta)
-	rig.set_cursor_needed(hud.ui.is_open() or hud.ui.map_open())
+	rig.set_cursor_needed(hud.ui.is_open() or hud.ui.map_open() or hud.ui.debug_menu.is_open())
 	if not Bridge.connected:
 		return
 	_update_ground()

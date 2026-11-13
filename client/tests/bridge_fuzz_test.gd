@@ -8,7 +8,7 @@ extends Node
 ##   godot --headless --path client res://tests/bridge_fuzz_test.tscn
 
 const BridgeScript := preload("res://scripts/net/bridge.gd")
-const TYPES := ["welcome", "ready", "chunk", "ents", "add", "upd", "del", "sky", "me", "mv", "msg", "gui", "bi", "planet", "seg"]
+const TYPES := ["welcome", "ready", "chunk", "ents", "add", "upd", "del", "sky", "me", "mv", "msg", "gui", "bs", "planet", "seg"]
 const ROUNDS := 5000
 
 var fails := 0

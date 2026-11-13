@@ -75,13 +75,47 @@ function M.run(name, fn, ...)
   end
 end
 
+-- A section inside a module (belt_sim.lua's scan, loads, checks...), timed like a module of its own
+-- while profiling or tracing: `local t = profile.start()` ... `profile.stop("name", t)`. Nil (and
+-- nothing timed) otherwise, so it costs a call when off. Its time is also inside its module's.
+function M.start()
+  if not enabled and trace_left <= 0 then
+    return nil
+  end
+  return helpers.create_profiler()
+end
+
+function M.stop(name, t)
+  if not t then
+    return
+  end
+  t.stop()
+  if enabled then
+    local total = totals[name]
+    if not total then
+      total = helpers.create_profiler(true)
+      totals[name] = total
+      if not timers[name] then
+        timers[name] = true
+        order[#order + 1] = name
+      end
+    end
+    total.add(t)
+  end
+  if trace_left > 0 then
+    trace_tick[#trace_tick + 1] = { name, t, true }
+  end
+end
+
 -- Call once per tick, after the modules ran.
 function M.end_tick()
   if trace_left > 0 then
     trace_left = trace_left - 1
     local total = helpers.create_profiler(true)
     for _, row in ipairs(trace_tick) do
-      total.add(row[2])
+      if not row[3] then
+        total.add(row[2])  -- (a section's time is inside its module's already)
+      end
       log({ "", "f3dtrace ", game.tick, " ", row[1], " ", row[2] })
     end
     log({ "", "f3dtrace ", game.tick, " TOTAL ", total })

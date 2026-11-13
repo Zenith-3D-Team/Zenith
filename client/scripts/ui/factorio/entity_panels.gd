@@ -15,13 +15,13 @@ const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const ARITHMETIC_OPS := ["*", "/", "+", "-", "%", "^", "<<", ">>", "AND", "OR", "XOR"]
 const COMPARATORS := [">", "<", "=", "≥", "≤", "≠"]
 ## Factorio's train wait conditions (WaitConditionType), in the order its menu lists them.
-const WAIT_TYPES := [["time", "Time passed"], ["inactivity", "Inactivity"], ["full", "Full cargo"], ["empty", "Empty cargo"],
-	["not_empty", "Has cargo"], ["item_count", "Item count"], ["fluid_count", "Fluid count"], ["circuit", "Circuit condition"],
-	["passenger_present", "Passenger present"], ["passenger_not_present", "Passenger not present"],
-	["fuel_item_count_all", "Fuel count (all locomotives)"], ["fuel_item_count_any", "Fuel count (any locomotive)"],
-	["fuel_full", "Fuel full"], ["destination_full_or_no_path", "Destination full or no path"],
-	["specific_destination_full", "Specific destination full"], ["specific_destination_not_full", "Specific destination not full"],
-	["at_station", "At station"], ["not_at_station", "Not at station"], ["damage_taken", "Damage taken"]]
+const WAIT_TYPES := [["time", "Time passed"], ["full", "Full cargo"], ["empty", "Empty cargo"], ["not_empty", "Has cargo"],
+	["item_count", "Item count"], ["fuel_item_count_all", "Fuel (all locomotives)"], ["fuel_item_count_any", "Fuel (any locomotive)"],
+	["fuel_full", "Full fuel"], ["circuit", "Circuit condition"], ["inactivity", "Inactivity"], ["fluid_count", "Fluid count"],
+	["destination_full_or_no_path", "Destination full or no path"], ["passenger_present", "Passenger present"],
+	["passenger_not_present", "Passenger not present"], ["specific_destination_full", "Station is full"],
+	["specific_destination_not_full", "Station is not full"], ["at_station", "At specified station"],
+	["not_at_station", "Not at specified station"], ["damage_taken", "Damage taken"]]
 ## Wait conditions with a circuit condition, and those naming a station.
 const CONDITION_WAITS := ["item_count", "fluid_count", "circuit", "fuel_item_count_all", "fuel_item_count_any"]
 const STATION_WAITS := ["specific_destination_full", "specific_destination_not_full", "at_station", "not_at_station"]

@@ -56,7 +56,7 @@ func handle(msg: Dictionary) -> void:
 			var x := int(list[i + 1])
 			var y := int(list[i + 2])
 			_groups[id].append(Vector3(x / 256.0, HEIGHT, y / 256.0))
-			_yaws[id].append(ItemCards.yaw_for(x * 92821 + y))
+			_yaws[id].append(ItemCards.turn_for(x * 92821 + y))
 			i += 3
 	if int(msg.get("part", 1)) < int(msg.get("parts", 1)):
 		return

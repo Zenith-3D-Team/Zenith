@@ -14,12 +14,15 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 const TrainView := preload("res://scripts/ui/factorio/train_view.gd")
+const LoadingSpinner := preload("res://scripts/ui/factorio/loading_spinner.gd")
 
 signal close_requested
 ## Look at a train: its position (tiles) on the character's surface.
 signal show_at(at: Vector2)
 
 const REFRESH := 3.0
+## Seconds to show the loading icon for a list that doesn't come, before saying there are no trains.
+const WAIT_AT_MOST := 15.0
 ## Factorio's window at 1920x1080, 100% (GUI pixels).
 const WIDTH := 1588
 const HEIGHT := 917
@@ -49,6 +52,10 @@ var _grid := GridContainer.new()
 var _banner: PanelContainer
 var _search_box := LineEdit.new()
 var _timer := 0.0
+## The window is open with nothing to show yet and the mod's `trl` on its way (owner's P46).
+var _waiting := false
+var _wait_left := 0.0
+var _loading := CenterContainer.new()
 
 
 func _ready() -> void:
@@ -161,7 +168,16 @@ func _ready() -> void:
 	_grid.add_theme_constant_override("h_separation", Kit.px(2))
 	_grid.add_theme_constant_override("v_separation", Kit.px(2))
 	scroll.add_child(_grid)
-	model.trains_overview_changed.connect(_rebuild)
+	_loading.name = "Loading"
+	_loading.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_loading.visible = false
+	var spinner := LoadingSpinner.new()
+	spinner.custom_minimum_size = Kit.pxv(48, 48)
+	_loading.add_child(spinner)
+	right_frame.add_child(_loading)
+	model.trains_overview_changed.connect(func() -> void:
+		_waiting = false
+		_rebuild())
 	model.trains_overview_requested.connect(func() -> void: open(true))
 	show_tab("Trains")
 
@@ -176,6 +192,8 @@ func open(on: bool) -> void:
 		# Asked for at once: the list would otherwise be empty (or the last one) for REFRESH seconds.
 		model.request_trains_overview()
 		_timer = REFRESH
+		_waiting = model.trains_overview.is_empty()
+		_wait_left = WAIT_AT_MOST
 		_fill_surfaces()
 		_layout()
 		_rebuild()
@@ -211,6 +229,11 @@ func _process(delta: float) -> void:
 	if not visible:
 		return
 	_layout()
+	if _waiting:
+		_wait_left -= delta
+		if _wait_left <= 0.0:
+			_waiting = false
+			_rebuild()
 	_timer -= delta
 	if _timer <= 0.0:
 		_timer = REFRESH
@@ -327,7 +350,8 @@ func _rebuild() -> void:
 		for t in shown:
 			_grid.add_child(_card(t))
 	var empty := _grid.get_child_count() == 0
-	_banner.visible = empty
+	_banner.visible = empty and not _waiting
+	_loading.visible = _waiting
 	(_banner.find_child("BannerText", true, false) as Label).text = "No Stations found." if tab == "Stations" and filter == "" else "No Trains found."
 	# Factorio draws the empty grid's cells.
 	var cells := maxi(COLUMNS * 3, _grid.get_child_count() + (COLUMNS - _grid.get_child_count() % COLUMNS) % COLUMNS)

@@ -10,7 +10,7 @@ Content/MyStuff/ENTITIES/STRUCTURES and VEHICLES of its repository, in the git-i
 art-src/fue5/raw/<STRUCTURES|VEHICLES>/<model>/ (never committed). A conversion (fue5_blender.py)
 scales them to tiles (2 units a tile), turns them to face north, drops ground decals, decimates to
 the triangle budget in specs.py and bakes every texture into one atlas; moving parts named in a
-recipe become `anim_*` nodes. Scoring uses fit.py's silhouette overlap against Factorio's sprites.
+recipe become `anim_*` nodes, and bake_glb.py bakes ambient occlusion into COLOR_0. Scoring uses fit.py's silhouette overlap against Factorio's sprites.
 """
 
 import argparse
@@ -144,9 +144,9 @@ RECIPES.update({
                               "bones": {"anim_spin_drill": ["drill"]}},
 })
 
-# Entities drawn with a model per direction (model_library.gd FACING_MODELS): FUE5 has one model,
-# turned for each. `kinds` renames a moving part per direction (a flywheel turning about its own
-# east-west axis is `spin_flywheel`, north-south `spin_flywheel_ns`).
+# Entities Zenith's own models draw with a model per direction (model_library.gd FACING_MODELS): FUE5
+# has one model, so only the north one is written and the client turns it (model_library.gd
+# single_model). Every direction of ours is still measured, so it fits them all.
 FACINGS = {
     "boiler": ({"fbx": ["STRUCTURES/boiler/static.fbx"], "yaw": 0}, ["", "-east", "-south", "-west"]),
     "chemical-plant": ({"fbx": ["STRUCTURES/chemical-plant/static.fbx"], "yaw": 0}, ["", "-east", "-south", "-west"]),
@@ -163,7 +163,7 @@ FACINGS = {
 
 def _facings():
     for base, (recipe, sfxs) in FACINGS.items():
-        for k, sfx in enumerate(sfxs):
+        for k, sfx in enumerate(sfxs[:1]):
             r = dict(recipe, yaw=recipe["yaw"] + 90 * k, spec=base)
             if k % 2 and "bones" in recipe:
                 r["bones"] = {name.replace("anim_spin_flywheel", "anim_spin_flywheel_ns"): b
@@ -255,6 +255,11 @@ def build(name, out_dir, yaw=None):
     if run.returncode != 0 or not os.path.exists(out):
         print(run.stdout[-3000:], run.stderr[-3000:])
         raise SystemExit("%s: Blender failed" % name)
+    # Ambient occlusion per vertex (COLOR_0 alpha), which FUE5's textures don't carry: the client
+    # darkens corners and gaps by it as it does our own models (bake_glb.py).
+    import bake_glb
+    tris, mean = bake_glb.bake_file(out)
+    print("  occlusion baked: %d triangles, mean %.2f" % (tris, mean))
     return out
 
 

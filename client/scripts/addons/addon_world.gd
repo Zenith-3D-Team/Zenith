@@ -14,10 +14,13 @@ const TRAIN_TYPES := ["locomotive", "cargo-wagon", "fluid-wagon", "artillery-wag
 const ROBOT_TYPES := ["logistic-robot", "construction-robot", "combat-robot", "capture-robot"]
 
 var _host
+## The add-on this copy belongs to (each add-on has its own, for hold_chunks); null for the host's.
+var _api
 
 
-func _init(host) -> void:
+func _init(host, api = null) -> void:
 	_host = host
+	_api = api
 
 
 func in_game() -> bool:
@@ -152,6 +155,26 @@ func entities_near(point: Vector2, radius: float, types: Array = []) -> Array:
 				if (e["position"] as Vector2).distance_to(point) <= radius:
 					out.append(e)
 	return out
+
+
+## (API 1.6) Holds the chunks already drawn (on), or lets them go again (off): while on, chunks the
+## camera leaves aren't unloaded, as they were when the bridge last sent them (it no longer updates
+## them), and the chunks round the new focus still come; a screenshot of a long flight shows all of
+## it. Capped by memory: at most world.gd HOLD_MAX_CHUNKS (1,600) chunks held past the view, fewer
+## once the computer has under 1 GB free; past that the farthest go first, and the log says so once.
+## Per add-on: chunks are held while any add-on asks. Switching the add-on off lets them go.
+func hold_chunks(on: bool) -> void:
+	_host.hold_chunks(_api, on)
+
+
+## (API 1.6) Chunks are held now (by any add-on), and how many are held past the view.
+func holding_chunks() -> bool:
+	return _host.holding_chunks()
+
+
+func held_chunks() -> int:
+	var w = _host.game_node("world")
+	return int(w.held_count()) if w != null and w.has_method("held_count") else 0
 
 
 ## The point the world is loaded round (tiles).

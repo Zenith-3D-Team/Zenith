@@ -1,0 +1,21 @@
+#!/usr/bin/env python
+# The native belt simulation (BeltSimNative, a twin of scripts/world/belt_sim.gd) as a GDExtension.
+# godot-cpp (its 4.5 branch) goes in ../godot-cpp; docs/RUNNING.md says how to build.
+#   scons target=template_release        (from a shell with MSVC's vcvars64; build.bat does that)
+import os
+
+# godot_cpp=<dir>: a godot-cpp built elsewhere (another worktree's copy; it is 6.5 GB built).
+godot_cpp = ARGUMENTS.get("godot_cpp", "../godot-cpp")
+env = SConscript(os.path.join(godot_cpp, "SConstruct"))
+env.Append(CPPPATH=["src/"])
+if env["platform"] == "windows" and not env.get("use_mingw"):
+	env.Append(CCFLAGS=["/O2", "/Oi", "/GL"], LINKFLAGS=["/LTCG"])
+# (A clone for our own flags: changing env itself would rebuild all of godot-cpp.) Symbols in a .pdb
+# beside the DLL (git-ignored), for crash backtraces.
+lib_env = env.Clone()
+if env["platform"] == "windows" and not env.get("use_mingw"):
+	lib_env.Append(CCFLAGS=["/Zi", "/FS"], LINKFLAGS=["/DEBUG", "/OPT:REF", "/OPT:ICF", "/MAP"])
+sources = Glob("src/*.cpp")
+name = "belt_sim{}{}".format(env["suffix"], env["SHLIBSUFFIX"])
+library = lib_env.SharedLibrary("../bin/" + name, source=sources)
+Default(library)

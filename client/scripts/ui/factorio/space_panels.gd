@@ -23,6 +23,8 @@ const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const EntityPanels := preload("res://scripts/ui/factorio/entity_panels.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.gd")
+const LogicKit := preload("res://scripts/ui/factorio/logic_kit.gd")
+const ScheduleEditor := preload("res://scripts/ui/factorio/schedule_editor.gd")
 
 ## Factorio's platform wait conditions (WaitConditionType), in the order its menu lists them.
 const PLATFORM_WAITS := [["time", "Time passed"], ["inactivity", "Inactivity"],
@@ -31,7 +33,6 @@ const PLATFORM_WAITS := [["time", "Time passed"], ["inactivity", "Inactivity"],
 	["request_not_satisfied", "Request not satisfied"], ["any_planet_import_zero", "Any planet import zero"],
 	["item_count", "Item count"], ["fluid_count", "Fluid count"], ["circuit", "Circuit condition"],
 	["damage_taken", "Damage taken"]]
-const REQUEST_WAITS := ["request_satisfied", "request_not_satisfied"]
 const STATES := {
 	"waiting_at_station": "Waiting at %s", "on_the_path": "Travelling", "paused": "Paused",
 	"no_schedule": "No schedule", "no_path": "No path", "waiting_for_departure": "Waiting for departure",
@@ -194,10 +195,11 @@ static func refresh(screen, msg: Dictionary) -> void:
 			fuel_box.add_child(r)
 
 
-## The platform's schedule: each stop with its wait conditions (Go, remove), stops to add from the
-## unlocked destinations, and interrupts. Sent with the train commands on the hub's unit.
+## The platform's schedule: Factorio's list (schedule_editor.gd), stops from the unlocked
+## destinations. Sent with the train commands on the hub's unit.
 static func _schedule(screen, h: Dictionary) -> Control:
 	var box := EntityPanels.column(6)
+	box.name = "Schedule"
 	var sched: Dictionary = h.get("sched") if h.get("sched") is Dictionary else {}
 	var dest := _array(h.get("dest"))
 	var head := EntityPanels.row(8)
@@ -208,58 +210,22 @@ static func _schedule(screen, h: Dictionary) -> Control:
 	var records: Array = _array(sched.get("records")).duplicate(true)
 	var unit: int = screen.unit
 	var send := func(l: Array) -> void: screen.model.set_schedule(unit, l)
-	box.add_child(_records(screen, records, int(sched.get("current", 0)), dest, true, send))
-	var interrupts: Array = _array(sched.get("interrupts")).duplicate(true)
-	box.add_child(_interrupts(screen, interrupts, dest))
+	var kind := _schedule_kind(dest)
+	var frame := Kit.panel("FDeepFrame")
+	var list := EntityPanels.column(4)
+	frame.add_child(LogicKit.padded(list, 4, 4))
+	ScheduleEditor.records(screen, list, records, int(sched.get("current", 0)), kind, true, send, "stations")
+	list.add_child(ScheduleEditor.add_station(screen, records, kind, send, true))
+	ScheduleEditor.interrupts(screen, list, _array(sched.get("interrupts")).duplicate(true), kind)
+	box.add_child(frame)
 	return box
 
 
-static func _records(screen, records: Array, current: int, dest: Array, can_go: bool, on_change: Callable) -> Control:
-	var list := EntityPanels.column(4)
-	for i in records.size():
-		var index := i
-		var rec: Dictionary = records[i] if records[i] is Dictionary else {}
-		var r := EntityPanels.row(6)
-		var marker := Kit.label("▶" if i + 1 == current else "")
-		marker.custom_minimum_size.x = Kit.px(16)
-		r.add_child(marker)
-		var icon := TextureRect.new()
-		icon.texture = planet_icon(str(rec.get("station", "")))
-		icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-		icon.custom_minimum_size = Kit.pxv(24, 24)
-		r.add_child(icon)
-		var name := Kit.label(place(str(rec.get("station", ""))))
-		name.custom_minimum_size.x = Kit.px(160)
-		r.add_child(name)
-		if can_go:
-			r.add_child(EntityPanels.button("Go", func() -> void: screen.model.train_go(screen.unit, index + 1), 44))
-		var remove := func() -> void:
-			var l := records.duplicate(true)
-			l.remove_at(index)
-			on_change.call(l)
-		r.add_child(EntityPanels.button("✕", remove, 30))
-		list.add_child(r)
-		var indent := MarginContainer.new()
-		indent.add_theme_constant_override("margin_left", Kit.px(22))
-		var set_waits := func(w: Array) -> void:
-			var l := records.duplicate(true)
-			l[index]["wait_conditions"] = w
-			on_change.call(l)
-		indent.add_child(_waits(screen, _array(rec.get("wait_conditions")).duplicate(true), dest, set_waits))
-		list.add_child(indent)
-	var add := MenuKit.dropdown(dest.map(func(n): return [place(str(n)), n]), "")
-	add.select(-1)
-	add.custom_minimum_size.x = Kit.px(200)
-	var add_stop := func(k: int) -> void:
-		var l := records.duplicate(true)
-		l.append({"station": str(dest[k]), "wait_conditions": [{"type": "all_requests_satisfied", "compare_type": "and"}]})
-		on_change.call(l)
-	add.item_selected.connect(add_stop)
-	var add_row := EntityPanels.row(8)
-	add_row.add_child(Kit.label("+ Add stop"))
-	add_row.add_child(add)
-	list.add_child(add_row)
-	return list
+## What a platform's schedule has where a train's has stations and its conditions.
+static func _schedule_kind(dest: Array) -> Dictionary:
+	return {"stops": dest, "waits": PLATFORM_WAITS, "new_wait": new_wait, "add_wait": "+ Add fly condition",
+		"temporary": false, "unload": true, "stop_text": place, "stop_icon": planet_icon,
+		"new_record": func(n: String) -> Dictionary: return {"station": n, "wait_conditions": [{"type": "all_requests_satisfied", "compare_type": "and"}]}}
 
 
 ## A platform wait condition of that type with Factorio's defaults.
@@ -274,137 +240,6 @@ static func new_wait(t: String, compare := "and") -> Dictionary:
 	elif t == "damage_taken":
 		w["damage"] = 1000
 	return w
-
-
-static func _waits(screen, waits: Array, dest: Array, on_change: Callable) -> Control:
-	var box := EntityPanels.column(2)
-	for i in waits.size():
-		var index := i
-		var w: Dictionary = waits[i] if waits[i] is Dictionary else {}
-		var changed := func(c) -> void:
-			var l := waits.duplicate(true)
-			if c == null:
-				l.remove_at(index)
-			else:
-				l[index] = c
-			on_change.call(l)
-		box.add_child(_wait_row(screen, w, i == 0, dest, changed))
-	var add := MenuKit.dropdown(PLATFORM_WAITS.map(func(p): return [p[1], p[0]]), "")
-	add.select(-1)
-	add.custom_minimum_size.x = Kit.px(190)
-	var add_wait := func(k: int) -> void:
-		var l := waits.duplicate(true)
-		l.append(new_wait(str(PLATFORM_WAITS[k][0])))
-		on_change.call(l)
-	add.item_selected.connect(add_wait)
-	var add_row := EntityPanels.row(6)
-	add_row.add_child(Kit.label("+ Condition"))
-	add_row.add_child(add)
-	box.add_child(add_row)
-	return box
-
-
-static func _wait_row(screen, w: Dictionary, first: bool, dest: Array, on_change: Callable) -> Control:
-	var r := EntityPanels.row(4)
-	if not first:
-		var andor := MenuKit.dropdown([["and", "and"], ["or", "or"]], str(w.get("compare_type", "and")))
-		andor.custom_minimum_size.x = Kit.px(64)
-		var set_andor := func(k: int) -> void:
-			var c := w.duplicate(true)
-			c["compare_type"] = "and" if k == 0 else "or"
-			on_change.call(c)
-		andor.item_selected.connect(set_andor)
-		r.add_child(andor)
-	var t := str(w.get("type", "time"))
-	var types: Array = PLATFORM_WAITS.map(func(p): return [p[1], p[0]])
-	if not PLATFORM_WAITS.any(func(p): return p[0] == t):
-		types.append([t.replace("_", " ").capitalize(), t])
-	var kind := MenuKit.dropdown(types, t)
-	kind.custom_minimum_size.x = Kit.px(190)
-	var compare := str(w.get("compare_type", "and"))
-	kind.item_selected.connect(func(k: int) -> void: on_change.call(new_wait(str(types[k][1]), compare)))
-	r.add_child(kind)
-	var set_field := func(key: String, value) -> void:
-		var c := w.duplicate(true)
-		c[key] = value
-		on_change.call(c)
-	if t == "time" or t == "inactivity":
-		r.add_child(EntityPanels.number_box(int(w.get("ticks", 0)) / 60, func(v: int) -> void: set_field.call("ticks", maxi(0, v) * 60), 56))
-		r.add_child(Kit.label("s"))
-	elif t in ["item_count", "fluid_count", "circuit"]:
-		var cond: Dictionary = (w.get("condition") as Dictionary).duplicate(true) if w.get("condition") is Dictionary else {"comparator": "<", "constant": 0}
-		var kinds: Array = ["fluid"] if t == "fluid_count" else (["item", "fluid", "virtual"] if t == "circuit" else ["item"])
-		r.add_child(EntityPanels._condition_editor(screen, cond, kinds, func(c: Dictionary) -> void: set_field.call("condition", c)))
-	elif t in REQUEST_WAITS:
-		var cond: Dictionary = w.get("condition") if w.get("condition") is Dictionary else {}
-		var set_item := func(_type: String, item: String) -> void:
-			set_field.call("condition", {"name": item, "quality": str(cond.get("quality", "normal"))} if item != "" else {})
-		r.add_child(EntityPanels.choose_slot(screen, EntityPanels._signal_name(cond), ["item"], set_item, "Item"))
-	elif t == "any_planet_import_zero":
-		var planets: Array = dest.duplicate()
-		planets.push_front("")
-		var pick := MenuKit.dropdown(planets.map(func(n): return [place(str(n)) if str(n) != "" else "Any planet", n]), str(w.get("planet", "")))
-		pick.custom_minimum_size.x = Kit.px(150)
-		pick.item_selected.connect(func(k: int) -> void: set_field.call("planet", str(planets[k])))
-		r.add_child(pick)
-	elif t == "damage_taken":
-		r.add_child(EntityPanels.number_box(int(w.get("damage", 0)), func(v: int) -> void: set_field.call("damage", maxi(0, v)), 70))
-	r.add_child(EntityPanels.button("✕", func() -> void: on_change.call(null), 30))
-	return r
-
-
-static func _interrupts(screen, interrupts: Array, dest: Array) -> Control:
-	var box := EntityPanels.column(6)
-	box.add_child(EntityPanels.heading("Interrupts"))
-	var unit: int = screen.unit
-	var send := func(l: Array) -> void: screen.model.set_interrupts(unit, l)
-	for i in interrupts.size():
-		var index := i
-		var it: Dictionary = interrupts[i] if interrupts[i] is Dictionary else {}
-		var r := EntityPanels.row(8)
-		r.add_child(Kit.label(str(it.get("name", "")), "FHeading"))
-		var set_inside := func(on: bool) -> void:
-			var l := interrupts.duplicate(true)
-			l[index]["inside_interrupt"] = on
-			send.call(l)
-		r.add_child(EntityPanels.checkbox("Interrupt other interrupts", bool(it.get("inside_interrupt", false)), set_inside))
-		var remove := func() -> void:
-			var l := interrupts.duplicate(true)
-			l.remove_at(index)
-			send.call(l)
-		r.add_child(EntityPanels.button("✕", remove, 30))
-		box.add_child(r)
-		var inner := MarginContainer.new()
-		inner.add_theme_constant_override("margin_left", Kit.px(22))
-		var parts := EntityPanels.column(4)
-		parts.add_child(_dim("Conditions"))
-		var set_conds := func(w: Array) -> void:
-			var l := interrupts.duplicate(true)
-			l[index]["conditions"] = w
-			send.call(l)
-		parts.add_child(_waits(screen, _array(it.get("conditions")).duplicate(true), dest, set_conds))
-		parts.add_child(_dim("Targets"))
-		var set_targets := func(t: Array) -> void:
-			var l := interrupts.duplicate(true)
-			l[index]["targets"] = t
-			send.call(l)
-		parts.add_child(_records(screen, _array(it.get("targets")).duplicate(true), 0, dest, false, set_targets))
-		inner.add_child(parts)
-		box.add_child(inner)
-	var add_row := EntityPanels.row(8)
-	add_row.add_child(Kit.label("+ Add interrupt"))
-	var field := MenuKit.textbox("", "Name")
-	field.custom_minimum_size.x = Kit.px(180)
-	var add := func(t: String) -> void:
-		if t.strip_edges() == "":
-			return
-		var l := interrupts.duplicate(true)
-		l.append({"name": t.strip_edges(), "conditions": [], "targets": [], "inside_interrupt": false})
-		send.call(l)
-	field.text_submitted.connect(add)
-	add_row.add_child(field)
-	box.add_child(add_row)
-	return box
 
 
 ## A planet's (or space location's) icon: the bridge's graphics list (every mod's planets), else

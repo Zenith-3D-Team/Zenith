@@ -14,6 +14,7 @@ local world = require("scripts.world")
 local puppet = require("scripts.puppet")
 local tracker = require("scripts.tracker")
 local budget = require("scripts.budget")
+local profile = require("scripts.profile")
 
 local M = {}
 
@@ -420,6 +421,10 @@ local MAX_OVERLAY = 400 -- per chunk
 local TURRET_TYPES = { ["ammo-turret"] = true, ["electric-turret"] = true, ["fluid-turret"] = true }
 local SIGNAL_TYPES = { ["rail-signal"] = true, ["rail-chain-signal"] = true }
 local ROBOT_TYPES = { "construction-robot", "logistic-robot" }
+M.ROBOT_TYPES = ROBOT_TYPES
+-- fn(surface, force name, x0, y0, x1, y1) -> the force's robots in that box, or nil when it can't say
+-- (movers.lua sets it: the movers its last search found, where the search covered the box).
+M.robots_in = nil
 
 -- Derived only from prototypes: name -> radius (or {logistic, construction}), false for none.
 local radii = {}
@@ -537,9 +542,12 @@ local function live_overlay(surface, own, x0, y0, fixed_part, signals)
     end
   end
   if #out < MAX_OVERLAY then
-    local robots = surface.find_entities_filtered({
-      area = { { x0, y0 }, { x0 + CHUNK, y0 + CHUNK } }, type = ROBOT_TYPES, force = own, limit = MAX_OVERLAY - #out,
-    })
+    -- (From the movers' last search where it covers the chunk (M.robots_in, set by movers.lua): a
+    -- search of the chunk for every chunk asked for was the other half of a refresh's cost.)
+    local robots = M.robots_in and M.robots_in(surface, own, x0, y0, x0 + CHUNK, y0 + CHUNK)
+      or surface.find_entities_filtered({
+        area = { { x0, y0 }, { x0 + CHUNK, y0 + CHUNK } }, type = ROBOT_TYPES, force = own, limit = MAX_OVERLAY - #out,
+      })
     for _, e in pairs(robots) do
       if #out >= MAX_OVERLAY then
         break
@@ -569,17 +577,55 @@ local function chart_key(si, cx, cy, res)
 end
 
 -- Something was built, mined, rotated or destroyed: its chunk's charts are made again.
+-- A chunk's entity count as its chart found it, by chart key, in storage.f3d_charts (every client's,
+-- like storage.f3d_radars): {tick, count, force name}. A chart younger than M.chart_trust ticks of a
+-- chunk nothing was built, mined, rotated or destroyed in since (tracker.listeners forget it) is
+-- trusted and its count not read again: the count was most of what a minimap refresh cost
+-- (count_entities_filtered over every chunk asked for, a thousand a request, 1 ms a tick at
+-- -62,-26: the perfbridge2 round). From storage, so every peer prices and slices the job alike.
+-- (A field for tests: 0 counts every time, as before.)
+M.chart_trust = 1200
+
+local function trusted_count(key, own)
+  local c = storage.f3d_charts and storage.f3d_charts[key]
+  if c and c[3] == own and game.tick - c[1] < M.chart_trust then
+    return c[2]
+  end
+  return nil
+end
+
+local function remember_count(key, own, count)
+  local charts = storage.f3d_charts
+  if not charts then
+    charts = { n = 0 }
+    storage.f3d_charts = charts
+  end
+  if not charts[key] then
+    charts.n = (charts.n or 0) + 1
+    if charts.n > CHART_CACHE_MAX then
+      -- (Emptied rather than pruned: a request's chunks are counted again, once.)
+      charts = { n = 1 }
+      storage.f3d_charts = charts
+    end
+  end
+  charts[key] = { game.tick, count, own }
+end
+
 local function chunk_touched(entity)
   if not (entity and entity.valid) then
     return
   end
   local p, si = entity.position, entity.surface.index
   local cx, cy = math.floor(p.x / CHUNK), math.floor(p.y / CHUNK)
+  local charts = storage.f3d_charts
   for _, res in ipairs(RESOLUTIONS) do
     local key = chart_key(si, cx, cy, res)
     if chart_cache[key] then
       chart_cache[key] = nil
       chart_cached = chart_cached - 1
+    end
+    if charts and charts[key] then
+      charts[key] = nil
     end
   end
 end
@@ -660,7 +706,13 @@ local function chart_step(surface, force, m)
       m.job = nil
       return
     end
-    job.count = surface.count_entities_filtered({ area = area, type = registry.excluded_types(), invert = true })
+    local trusted = trusted_count(key, own)
+    if trusted then
+      job.count = trusted
+    else
+      job.count = surface.count_entities_filtered({ area = area, type = registry.excluded_types(), invert = true })
+      remember_count(key, own, job.count)
+    end
     job.strips = strips_for(job.count)
     job.step = 0
     return
@@ -1414,7 +1466,9 @@ function M.tick()
     if not reg.done or game.tick - (reg.done_tick or 0) >= RADAR_RESCAN_TICKS then
       local surface = game.get_surface(si)
       if surface and surface.valid then
+        local tp = profile.start()
         scan_radars(surface)
+        profile.stop("map.radars", tp)
       else
         storage.f3d_radars[si] = nil
       end
@@ -1449,7 +1503,12 @@ function M.tick()
     end
     budget.spend(price, "map")
     -- This runs in on_tick, where an error would stop the game: report it and drop the request.
+    -- (Timed by step: map.count the entity count, map.tiles, map.strip the entities of a strip of rows
+    -- and, on the last strip, the overlay and the send.)
+    local step = m.job.step
+    local tp = profile.start()
     local ok, err = pcall(chart_step, surface, force, m)
+    profile.stop(step < 0 and "map.count" or step == 0 and "map.tiles" or "map.strip", tp)
     if not ok then
       m.queue, m.head, m.job = {}, 1, nil
       transport.send_now({ t = "msg", text = "Map error: " .. tostring(err) })

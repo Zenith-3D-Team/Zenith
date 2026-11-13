@@ -24,6 +24,7 @@ const ModelTextures := preload("res://scripts/world/model_textures.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const BeltLods := preload("res://scripts/world/belt_lods.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const MergedShader := preload("res://shaders/far_merged.gdshader")
 const FactorioAlphaShader := preload("res://shaders/factorio_material_alpha.gdshader")
@@ -39,7 +40,7 @@ const SLACK := 24.0
 ## surroundings animate and are what the player works on, however far the camera is pulled back.
 const NEAR_FOCUS := 40.0
 ## Entity types left to their own MultiMeshes in far chunks.
-const KEEP_TYPES := {"tree": true, "plant": true, "resource": true, "fish": true, "unit-spawner": true,
+const KEEP_TYPES := {"train-stop": true, "tree": true, "plant": true, "resource": true, "fish": true, "unit-spawner": true,
 	"turret": true, "spider-leg": true}
 ## How simple each model is merged (tiles): the simplifier's coarsest level within SIMPLIFY_ERROR, then
 ## its vertices clustered in CELL-sized cubes (Bake): about two pixels at MERGE_FROM in a 900-pixel
@@ -301,12 +302,12 @@ class Bake:
 		var ao_strength := 1.0
 		var light := 1.0
 		var metallic := 0.0
-		# A textured model (never merged, so one row): each vertex takes its texture's colour there
-		# (a small copy of it).
+		# A textured model (never merged, so one row): each vertex takes its texture's colour round it
+		# (a small copy of it, _texture_colours).
 		var tex: Image = (params[0] as Dictionary).get("tex")
-		var uv := PackedVector2Array()
+		var tex_rgb := PackedVector3Array()
 		if tex != null and s.size() > 7 and s[7] is PackedVector2Array and (s[7] as PackedVector2Array).size() == n:
-			uv = s[7]
+			tex_rgb = _texture_colours(tex, s[7], s[4] if s[4] is PackedInt32Array and not (s[4] as PackedInt32Array).is_empty() else null)
 		for v in n:
 			var r := clampi(int(rows[v]), 0, last) if not rows.is_empty() else 0
 			if r != row:
@@ -325,12 +326,8 @@ class Bake:
 				metallic = p["metallic"]
 			var rgb := Vector3(albedo.r, albedo.g, albedo.b)
 			var pc := 0.0
-			if not uv.is_empty():
-				var t := uv[v]
-				var w := tex.get_width()
-				var h := tex.get_height()
-				var c := tex.get_pixel(posmod(int(floor(t.x * w)), w), posmod(int(floor(t.y * h)), h)).srgb_to_linear()
-				rgb *= Vector3(c.r, c.g, c.b)
+			if not tex_rgb.is_empty():
+				rgb *= tex_rgb[v]
 				pc = 1.0
 			elif part_share > 0.0 and not c1.is_empty():
 				# Part colours are kept with headroom (rgb / 4, share * 0.25) unless the share is above 0.25.
@@ -346,10 +343,43 @@ class Bake:
 			rgb *= Vector3(tint.r, tint.g, tint.b)
 			var lum := rgb.dot(Vector3(0.299, 0.587, 0.114))
 			rgb = rgb.lerp(Vector3(lum, lum, lum), desaturate * (1.0 - pc)) * lerpf(value, 1.0, pc)
-			rgb *= lerpf(1.0, lerpf(1.0, ao, ao_strength), 0.65) * light
+			# As the model shader shades it (a strength above 1 is a power: textured models).
+			var shade := pow(ao, ao_strength) if ao_strength > 1.0 else lerpf(1.0, ao, ao_strength)
+			rgb *= lerpf(1.0, shade, 0.65) * light
 			var metal := clampf(metallic * lerpf(1.0, 0.1, pc), 0.0, 1.0)
 			var packed := float(roundi(pc * 15.0) + 16 * roundi(metal * 15.0)) / 255.0
 			all_colors.append(Color(sqrt(clampf(rgb.x, 0.0, 1.0)), sqrt(clampf(rgb.y, 0.0, 1.0)), sqrt(clampf(rgb.z, 0.0, 1.0)), packed))
+
+
+	## Each vertex's texture colour (linear) as the faces round it show it: sampled inside each face
+	## using the vertex, half way to the face's middle in UV, and at the middle, averaged. A corner's
+	## own texel lies on its UV island's edge, often in the atlas's padding between islands, and one
+	## texel stood for the whole face a far model draws in a pixel or two.
+	static func _texture_colours(tex: Image, uv: PackedVector2Array, idx: Variant) -> PackedVector3Array:
+		var n := uv.size()
+		var sums := PackedVector3Array()
+		sums.resize(n)
+		var counts := PackedInt32Array()
+		counts.resize(n)
+		var count: int = (idx as PackedInt32Array).size() if idx != null else n
+		for t in range(0, count - 2, 3):
+			var a: int = idx[t] if idx != null else t
+			var b: int = idx[t + 1] if idx != null else t + 1
+			var c: int = idx[t + 2] if idx != null else t + 2
+			var middle := (uv[a] + uv[b] + uv[c]) / 3.0
+			var at_middle := _texel(tex, middle)
+			for v: int in [a, b, c]:
+				sums[v] += (_texel(tex, uv[v].lerp(middle, 0.5)) + at_middle) * 0.5
+				counts[v] += 1
+		for v in n:
+			sums[v] = sums[v] / float(counts[v]) if counts[v] > 0 else _texel(tex, uv[v])
+		return sums
+
+	static func _texel(tex: Image, at: Vector2) -> Vector3:
+		var w := tex.get_width()
+		var h := tex.get_height()
+		var c := tex.get_pixel(posmod(int(floor(at.x * w)), w), posmod(int(floor(at.y * h)), h)).srgb_to_linear()
+		return Vector3(c.r, c.g, c.b)
 
 
 ## A chunk's merged mesh, made on a worker thread: every instance's baked model moved into place.
@@ -527,7 +557,9 @@ static func bakeable(mesh: Mesh) -> bool:
 				ok = false
 				break
 			var sm := mesh.surface_get_material(i) as ShaderMaterial
-			if sm != null and (sm.shader == FactorioLeafShader or int(_param(sm, "rig_mode", 0)) != 0):
+			# Leaf cards and cut-out materials keep their own mesh: the merged shader has no alpha.
+			if sm != null and (sm.shader == FactorioLeafShader or sm.shader == ModelLibrary.FactorioClipShader
+					or int(_param(sm, "rig_mode", 0)) != 0):
 				ok = false
 				break
 	_bakeable[mesh] = ok
@@ -622,6 +654,9 @@ func _process(delta: float) -> void:
 ## chunk going far is gathered for merging; one coming near is built in full again.
 func _decide(delta: float) -> void:
 	_check_timer += delta
+	if _pass_next < _pass_todo.size():
+		_decide_slice()
+		return
 	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
 	var at := cam.global_position if cam != null else Vector3(world.focus().x, 30.0, world.focus().y)
 	if _check_timer < CHECK_INTERVAL and enabled == _last_enabled and at.distance_to(_last_camera) < 8.0:
@@ -631,15 +666,40 @@ func _decide(delta: float) -> void:
 	_check_timer = 0.0
 	_last_camera = at
 	_last_enabled = enabled
-	var focus: Vector2 = world.focus()
-	var from := MERGE_FROM
+	_pass_at = at
+	_pass_focus = world.focus()
+	_pass_from = MERGE_FROM
 	if world.sun != null:
-		from = maxf(from, world.sun.directional_shadow_max_distance)
+		_pass_from = maxf(_pass_from, world.sun.directional_shadow_max_distance)
 	if merge_from > 0.0:
-		from = merge_from
+		_pass_from = merge_from
 	_far_count = 0
-	for c: Vector2i in world.chunks:
-		var cv = world.chunks[c]
+	_pass_todo = world.chunks.keys()
+	_pass_next = 0
+	_decide_slice()
+
+
+## One look's chunks go through a slice a frame: at view distance 50 a look at all 10,201 at once
+## took 10-20 ms. A look under way finishes before the next starts.
+const DECIDE_SLICE := 1500
+var _pass_todo: Array = []
+var _pass_next := 0
+var _pass_at := Vector3.ZERO
+var _pass_focus := Vector2.ZERO
+var _pass_from := MERGE_FROM
+
+
+func _decide_slice() -> void:
+	var at := _pass_at
+	var focus := _pass_focus
+	var from := _pass_from
+	var stop := mini(_pass_next + DECIDE_SLICE, _pass_todo.size())
+	while _pass_next < stop:
+		var c: Vector2i = _pass_todo[_pass_next]
+		_pass_next += 1
+		var cv = world.chunks.get(c)
+		if cv == null:
+			continue
 		var s: State = cv.far
 		var rect := Rect2(Vector2(c * CHUNK), Vector2(CHUNK, CHUNK))
 		var lo := Vector3(rect.position.x, 0.0, rect.position.y)
@@ -765,7 +825,8 @@ func _gather(cv, s: State, rec) -> void:
 		return
 	var xform: Transform3D = cv._model_transform(proto, rec)
 	_add(s, mesh, xform)
-	for part: ModelLibrary.AnimPart in ModelLibrary.parts_for_entity(proto.name, proto.type, rec.extra, rec.dir):
+	var parts := ModelLibrary.parts_for_entity(proto.name, proto.type, rec.extra, rec.dir)
+	for part: ModelLibrary.AnimPart in parts:
 		# Parts at rest; lit parts (signal lenses) show only by state.
 		if part.lit or part.mesh == null or not bakeable(part.mesh):
 			continue
@@ -776,6 +837,21 @@ func _gather(cv, s: State, rec) -> void:
 				var piece := ModelLibrary.mesh_for(place[0])
 				if piece != null and bakeable(piece):
 					_add(s, piece, Transform3D(Basis(), place[1]))
+	if rec.belt_ends != 0:
+		# As near (chunk_view.gd _add_belt_ends): on belts, splitters' halves and undergrounds' open ends,
+		# with their moving parts at rest unless the model has them there already.
+		var inverse := xform.affine_inverse()
+		for place: Array in ModelLibrary.belt_end_places(proto.name, proto.type, rec.dir, rec.pos, rec.belt_ends, xform.origin.y):
+			if not ModelLibrary.ready(place[0]):
+				continue
+			var end := ModelLibrary.mesh_for(place[0])
+			if end == null or not bakeable(end):
+				continue
+			var at: Transform3D = place[1]
+			_add(s, end, at)
+			for part: ModelLibrary.AnimPart in ModelLibrary.parts_for(place[0]):
+				if not part.lit and part.mesh != null and bakeable(part.mesh) and not ModelLibrary.part_doubled(part, inverse * at, parts):
+					_add(s, part.mesh, at)
 
 
 static func _add(s: State, mesh: Mesh, xform: Transform3D) -> void:
@@ -884,6 +960,7 @@ func _install() -> void:
 			s.node.cast_shadow = s.cast
 			cv.add_child(s.node)
 		s.node.mesh = merge.mesh
+		GroundHeight.hold_mesh(s.node)  # on hills, room for their lift
 		s.triangles = merge.triangles
 		s.covers = true
 		cv.count("far_merges")

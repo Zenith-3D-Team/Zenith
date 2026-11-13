@@ -7,7 +7,10 @@ extends RefCounted
 ##   2: its turn (cosine, sine), its lift above that place, and its path: 0 a straight glide, 1 + the
 ##      path's code in the `belt_paths` texture (belt_path.gdshaderinc), -1 not drawn (an empty slot,
 ##      an item under the ground)
-##   3: spare
+##   3: for a pile's copy (belt_items.gd Layer): its item's record from this one (slots apart), its
+##      step k in the pile (0: not a copy, the record is an item's own) and the kind's pile step (how far
+##      each copy lifts); the copy's own turn is in its texel 2, and the shader draws the copy's place
+##      from the item's record, so a pile's motion is one record
 ## The shaders (belt_path.gdshaderinc) place every item from its record and the drawn clock
 ## (`f3d_belt_clock`), so the CPU writes a record only when an item appears, leaves or changes its
 ## motion: an item that goes on as its record says, or stands, costs nothing.

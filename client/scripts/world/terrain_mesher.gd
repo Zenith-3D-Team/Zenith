@@ -32,6 +32,7 @@ const UNKNOWN := 2
 const VOID := 3
 const DECK_BOTTOM := -0.6
 const PADDED := SIZE + 2  # a chunk's tiles plus a one-tile border from its neighbours
+const COARSE := 4  # tiles a side of a far chunk's ground quads (`coarse`)
 const SIDES: Array[Vector2i] = [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
 ## The 8 neighbours in the shaders' mask order: E W S N SE SW NE NW (Factorio's x east, y south).
 const NEIGHBOURS: Array[Vector2i] = [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1),
@@ -49,6 +50,10 @@ var kind_of := PackedByteArray()  # per tile id: 0 land, 1 water, 2 void (ProtoD
 var gfx_of: Array = []  # per tile id: TerrainTextures.TileGfx, or null while its picture isn't loaded
 var textured := false
 var slots := PackedInt32Array()  # cached variant slots (x + 64 * y), empty: work them out
+## Far ground (world.gd COARSE_FROM): one quad per COARSE x COARSE tiles in the block's most common
+## tile, without transitions, banks or shores. A chunk's full ground is about 300 KB of vertices,
+## which at view distance 50 (10,201 chunks) would be 3 GB; this is 64 quads instead of 1,024 and up.
+var coarse := false
 # --- output -----------------------------------------------------------------------------------
 var land: TerrainSurface
 var water: TerrainSurface
@@ -93,6 +98,9 @@ func _mesh() -> void:
 			var s := gs.slot(coord.x * SIZE + tx, coord.y * SIZE + ty, tx, ty, uniform) if gs.layer >= 0 else Vector2i.ZERO
 			slots[i] = s.x + 64 * s.y
 	var slot := TerrainTextures.slot_uv()
+	if coarse:
+		_mesh_coarse(kinds, slot)
+		return
 	var shore := PackedFloat32Array()
 	var x0 := coord.x * SIZE
 	var z0 := coord.y * SIZE
@@ -169,6 +177,47 @@ func _mesh() -> void:
 				var down := Vector3(0.0, DECK_BOTTOM if k == VOID else BANK_BOTTOM, 0.0)
 				land.quad(edge - right, edge + right, edge + right + down, edge - right + down, out,
 					bank_top, bank_top, bank_bottom, bank_bottom, uv, plain, Color())
+
+
+## Far ground (`coarse`): a quad per block of COARSE x COARSE tiles, in the block's most common tile
+## and its picture stretched over the block (at that distance a tile is a pixel or less, so its mip
+## is the tile's colour). Water stays below the land, without foam; no banks or shelves.
+func _mesh_coarse(kinds: PackedByteArray, slot: Vector2) -> void:
+	var x0 := coord.x * SIZE
+	var z0 := coord.y * SIZE
+	var w := float(COARSE)
+	for by in SIZE / COARSE:
+		for bx in SIZE / COARSE:
+			var counts := {}
+			var best_n := 0
+			var best_i := 0
+			for y in range(by * COARSE, by * COARSE + COARSE):
+				for x in range(bx * COARSE, bx * COARSE + COARSE):
+					var i := y * SIZE + x
+					var n: int = counts.get(tile_ids[i], 0) + 1
+					counts[tile_ids[i]] = n
+					if n > best_n:
+						best_n = n
+						best_i = i
+			var id := tile_ids[best_i]
+			var kind := kinds[(best_i / SIZE + 1) * PADDED + best_i % SIZE + 1]
+			if kind == VOID:
+				continue
+			var g := _gfx(id)
+			var uv := Rect2()
+			if g.layer >= 0:
+				var s := slots[best_i]
+				uv = Rect2(Vector2(s % 64, s / 64) * slot, slot)
+			var x := float(x0 + bx * COARSE)
+			var z := float(z0 + by * COARSE)
+			if kind == WATER:
+				var wc := Color(_color(id), 0.0)  # alpha: no shore foam
+				water.quad(Vector3(x, WATER_Y, z), Vector3(x + w, WATER_Y, z), Vector3(x + w, WATER_Y, z + w), Vector3(x, WATER_Y, z + w), Vector3.UP,
+					wc, wc, wc, wc, uv, Color(g.layer, -1.0, 0.0, 0.0))
+				continue
+			var color := Color.WHITE if g.layer >= 0 else _color(id)
+			land.quad(Vector3(x, 0.0, z), Vector3(x + w, 0.0, z), Vector3(x + w, 0.0, z + w), Vector3(x, 0.0, z + w), Vector3.UP,
+				color, color, color, color, uv, Color(g.layer, -1.0, -1.0, 0.0), Color())
 
 
 ## The graphics of tile `id`, or a plain stand-in (map colour, no transitions) while its picture

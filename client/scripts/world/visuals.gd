@@ -38,10 +38,10 @@ const CONE_TYPES := {"tree": true, "plant": true}
 ## Logistic and construction robots: their model's middle (about 0.3 up) at the 1.5 tiles that
 ## lifts them the one tile up the screen Factorio draws them.
 ## How far a waiting rocket's base sits below the ground (its model is 16.9 tiles tall).
-const ROCKET_SINK := 14.0
+const ROCKET_SINK := 15.5
 ## Heights movers are drawn at by type. Robots fly well above the buildings, as Factorio draws them
 ## (H11: at 1.2 they skimmed the machines). A rocket waiting in its silo stands down in the shaft with
-## only its nose in the open hatch (H6: at the ground it towered 17 tiles over the silo); rockets.gd
+## only its nose in the open hatch, under the silo's rim (H6: at the ground it towered 17 tiles over the silo); rockets.gd
 ## starts a launch from there.
 const FLYING := {"logistic-robot": 2.2, "construction-robot": 2.2, "combat-robot": 2.4, "capture-robot": 2.6,
 	"rocket-silo-rocket": -ROCKET_SINK}

@@ -72,6 +72,14 @@ _CH = layer(SA + "crusher/crusher-horizontal.png", 200, 162, (2.5, -5), line=8)
 ENTRIES["crusher"] = single(_CV)
 ENTRIES["crusher-east"] = single(_CH)
 
+# --- A dead stomper's shell (gleba.py, fit_shell.py) ----------------------------------------------
+# Its first picture (Factorio shows one of four, the same shell turned), at each tier's scale, at
+# true proportions and anchored on the picture's middle as the prototype draws it.
+for _prefix, _ss in (("small-", 0.99), ("medium-", 1.32), ("big-", 1.76)):
+    ENTRIES[_prefix + "stomper-shell"] = single(layer(SA + "stomper/stomper-corpse-head.png", 398, 332, line=1, scale=0.5 * _ss),
+                                                anchor=NATURE_ANCHOR)
+    ENTRIES[_prefix + "stomper-shell"]["stretch"] = 1.346
+
 # --- Vulcanus (vulcanus.py) ----------------------------------------------------------------------
 # Foundry: the same building every way round; only the pipe connections on top change.
 _FB = [layer(SA + "foundry/foundry-base.png", 356, 384, (-0.5, -9.5)),
@@ -135,6 +143,7 @@ ENTRIES["big-mining-drill"]["stretch"] = 1.346
 ENTRIES["electromagnetic-plant"] = single(
     layer(SA + "electromagnetic-plant/electromagnetic-plant-base.png", 238, 252, (2.5, 6)),
     layer(SA + "electromagnetic-plant/electromagnetic-plant-main-rotate-1.png", 226, 312, (0, -14.5), line=8))
+ENTRIES["electromagnetic-plant"]["stretch"] = 1.346  # modelled at its true proportions, as the foundry
 _RC = "recycler/graphics/entity/recycler/recycler-"
 ENTRIES["recycler"] = directional(
     [layer(_RC + "N.png", 170, 304, (2, -6.5), line=8)], [layer(_RC + "E.png", 286, 204, (1, -8.5), line=8)],

@@ -9,11 +9,13 @@ extends Node
 ## and the Add-ons menu (settings changed, a key rebound, the switch), keeping Zenith drawing for a
 ## recorder, add-ons in zips (unpacked, relative preloads, a broken zip, a zip and a folder of one
 ## id: the newer wins), api.terrain (1.2: the height field, tile kinds, cliffs, buildings and changed
-## chunks read from a fake world), and switching an add-on off. Exits with 1 if a check fails.
+## chunks read from a fake world), api.shaders (1.3: looks and passes, put on a scene's environment and
+## taken off again), and switching an add-on off. Exits with 1 if a check fails.
 ##
 ##   godot --headless --path client res://tests/addon_test.tscn
 
 const AddonHost := preload("res://scripts/addons/addon_host.gd")
+const MomentHold := preload("res://scripts/world/moment_hold.gd")
 const AddonLoader := preload("res://scripts/addons/addon_loader.gd")
 const AddonRequests := preload("res://scripts/addons/addon_requests.gd")
 const AddonStorage := preload("res://scripts/addons/addon_storage.gd")
@@ -26,11 +28,25 @@ const ModsWindow := preload("res://scripts/menu/mods_window.gd")
 const AddonsWindow := preload("res://scripts/menu/addons_window.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const BeltLaneLayer := preload("res://scripts/world/belt_lanes.gd")
+const Looks := preload("res://scripts/world/looks.gd")
+const PlanetSky := preload("res://scripts/world/sky.gd")
+const LampLights := preload("res://scripts/world/lamp_lights.gd")
+const WorkingGlow := preload("res://scripts/world/working_glow.gd")
+const WorldMirror := preload("res://scripts/world/world.gd")
+const ChunkView := preload("res://scripts/world/chunk_view.gd")
+const ItemCards := preload("res://scripts/world/item_cards.gd")
+const ModelLods := preload("res://scripts/world/model_lods.gd")
+const BeltLods := preload("res://scripts/world/belt_lods.gd")
+const FullDetail := preload("res://scripts/world/full_detail.gd")
+const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 
 const TEST_SETTINGS := "user://addon-test-settings.cfg"
 const DISK := "user://addon-test/addons"
+const TestEnv := preload("res://tests/test_env.gd")
 
 var fails := 0
+## The checks that failed, listed again after FAILS.
+var _failed: PackedStringArray = []
 
 
 class FakeMain extends Node:
@@ -44,6 +60,8 @@ class FakeMain extends Node:
 	var rockets
 	var ups_governor
 	var front_end
+	var lamps
+	var working_glow
 	var _game: Node
 	var _planet_sky
 	var _daytime := 0.25
@@ -59,6 +77,28 @@ class FakeFrontEnd extends Node:
 
 	func covers_game() -> bool:
 		return covered
+
+
+## hud.gd as the host reads it: the UI's open windows and Zenith's debug menu (Ctrl+F12).
+class FakeDebugMenu extends RefCounted:
+	var open := false
+
+	func is_open() -> bool:
+		return open
+
+
+class FakeUi extends RefCounted:
+	var debug_menu := FakeDebugMenu.new()
+
+	func is_open() -> bool:
+		return false
+
+	func map_open() -> bool:
+		return false
+
+
+class FakeHud extends Node:
+	var ui := FakeUi.new()
 
 
 class FakeLauncher extends RefCounted:
@@ -156,6 +196,13 @@ func check(cond: bool, what: String) -> void:
 	print(("ok   " if cond else "FAIL ") + what)
 	if not cond:
 		fails += 1
+		_failed.append(what)
+
+
+func _exit_tree() -> void:
+	for what in _failed:
+		print("FAILED: " + what)
+	TestEnv.clean()
 
 
 func _write(path: String, text: String) -> void:
@@ -206,8 +253,11 @@ func _key(code: Key, shift := false) -> void:
 
 
 func _ready() -> void:
-	DirAccess.remove_absolute(TEST_SETTINGS)
+	TestEnv.isolate("addon-test")
+	Settings.legacy = {}
 	Settings.use_file(TEST_SETTINGS)
+	# The player's own Factorio controls (config.ini) mustn't change the keys the test presses.
+	Settings.set_value("factorio", "use_factorio_keys", false)
 	Controls.define()
 	Settings.apply_bindings()
 	_rmtree("user://addon-test")
@@ -303,7 +353,7 @@ func _ready() -> void:
 	check(node != null and node.started == 1 and node.api != null, "the entry script was started with its API")
 	var api = node.api if node != null else null
 	check(api != null and api.version == AddonLoader.API_VERSION and api.id == "test-addon", "the API says its version and the add-on's id")
-	check(api != null and is_equal_approx(api.level, 1.2), "and its level, 1.2")
+	check(api != null and is_equal_approx(api.level, 1.6), "and its level, 1.6")
 	var disk := host.find("disk-addon")
 	check(disk.has("node") and int(disk["node"].answer) == 42, "a .gd loaded from user:// runs, with its relative preload")
 	check(not host.find("future-addon").has("node") and not host.find("refcounted").has("node"), "refused add-ons aren't started")
@@ -367,6 +417,20 @@ func _ready() -> void:
 	_key(KEY_K)
 	check(node.presses == 1, "the add-on gets its camera key")
 	check(not spy.keys.has(KEY_W) and spy.keys.has(KEY_K), "Zenith doesn't see a camera key (W), other keys pass")
+	# Zenith's debug menu open over the add-on's camera: its camera keys rest (typing in the menu
+	# doesn't fly it) and are still kept from Zenith; its global keys work; the mouse is wanted.
+	fake.hud = FakeHud.new()
+	add_child(fake.hud)
+	fake.hud.ui.debug_menu.open = true
+	check(host.debug_menu_open() and host.windows_open() and not api.keys.pressed(_event(KEY_W), "fly") and not api.keys.held("fly")
+		and api.keys.pressed(_event(KEY_F8), "toggle"), "the debug menu open: camera keys rest, global keys work, the mouse shows")
+	spy.keys.clear()
+	_key(KEY_W)
+	check(not spy.keys.has(KEY_W), "and W still doesn't reach Zenith's controls")
+	fake.hud.ui.debug_menu.open = false
+	check(not host.windows_open() and api.keys.pressed(_event(KEY_W), "fly"), "closed: the camera keys work again")
+	fake.hud.queue_free()
+	fake.hud = null
 	fake.input.set_process(true)  # main.gd turns them on when its menu closes
 	host._process(0.0)
 	check(not fake.input.is_processing(), "the controls stay off while the add-on has the camera")
@@ -387,13 +451,22 @@ func _ready() -> void:
 	fake.ride.on = false
 
 	# The interface hidden, frames, the time of day.
+	# The alert icons over entities are the interface too (Factorio hides them with its GUI).
+	var alert_icons := Node3D.new()
+	alert_icons.add_to_group(&"f3d_hide_with_interface")
+	fake._game.add_child(alert_icons)
+	var debug_layer := CanvasLayer.new()
+	debug_layer.add_to_group(AddonHost.SHOWN_WITH_INTERFACE_HIDDEN)
+	hud_layer.add_child(debug_layer)
 	api.view.hide_interface(true)
 	check(not hud_layer.visible and host.interface_hidden(), "hide_interface hides the HUD's layers")
+	check(debug_layer.visible, "but not the debug menu's layer (it opens over a clean shot)")
+	check(not alert_icons.visible, "and the alert icons over entities")
 	var win: Dictionary = api.ui.window("Test window")
 	api.ui.show(win["frame"])
 	check(api.ui.is_open(win["frame"]) and not (win["frame"] as Control).visible, "an add-on's window stays out of sight while hidden")
 	api.view.hide_interface(false)
-	check(hud_layer.visible and (win["frame"] as Control).visible, "and both come back")
+	check(hud_layer.visible and (win["frame"] as Control).visible and alert_icons.visible, "and they all come back")
 	# Its title bar drags it through Kit's drag handle alone: a second handler of its own moved the
 	# window twice as far as the mouse.
 	var bar: Control = (win["box"] as VBoxContainer).get_child(0)
@@ -536,6 +609,10 @@ func _ready() -> void:
 	api.settings.reset("folder")
 
 	_terrain(api, host)
+	await _shaders(api)
+	_sun_model()
+	await _sunset_look(api)
+	await _screenshot_mode(api, host, fake, hud_layer)
 
 	# Keeping Zenith drawing while recording (API 1.1).
 	api.view.keep_drawing(50)
@@ -561,7 +638,529 @@ func _ready() -> void:
 		and AddonLoader.bundled_defaults("user://no-such-file.json").is_empty(),
 		"bundled.json gives a download's add-ons their first state (the camera on, the hills off)")
 	DirAccess.remove_absolute(ProjectSettings.globalize_path("user://bundled-test.json"))
+	await _cinematic_shaders(fake)
 	_finish()
+
+
+## API 1.6, for the Cinematic camera's screenshot mode: held chunks (the real world.gd's subscription
+## steps), full detail (every distance and limit at its most, then the player's own back, nothing
+## saved; every lamp lit) and a screenshot (the interface hidden, a file written, the interface back).
+func _screenshot_mode(api, host, fake, hud_layer: CanvasLayer) -> void:
+	# Held chunks: a chunk the view left stays while held (one that never arrived doesn't), and goes
+	# when let go.
+	var before_world = fake.world
+	var w := WorldMirror.new()
+	add_child(w)
+	w.view_radius = 1
+	w.hold_min_free = 0  # the PC's free memory doesn't decide the check
+	fake.world = w
+	w.set_focus(Vector2(16, 16))
+	w._update_subscription(1.0)
+	var kept := Vector2i(-1, -1)
+	var came := w.chunks.has(kept) and w.chunks.has(Vector2i(1, 1))
+	if came:
+		(w.chunks[kept] as ChunkView).loaded = true
+	api.world.hold_chunks(true)
+	check(api.world.holding_chunks() and w.hold, "hold_chunks: the world holds its chunks")
+	w.set_focus(Vector2(16 + 32 * 10, 16))
+	w._update_subscription(1.0)
+	check(came and w.chunks.has(kept) and not w.chunks.has(Vector2i(1, 1)) and api.world.held_chunks() == 1,
+		"a chunk the camera left is kept while held, one that never arrived isn't: %d held" % api.world.held_chunks())
+	check(w.chunks.has(Vector2i(10, 0)), "and the chunks round the new focus still come")
+	api.world.hold_chunks(false)
+	w._update_subscription(1.0)
+	check(not w.chunks.has(kept) and api.world.held_chunks() == 0 and not w.hold, "let go: the held chunk is unloaded")
+	_shot_settle(w)
+	fake.world = before_world
+	w.queue_free()
+
+	# Full detail: the settings held at their tops without touching the file, lamps all lit, the
+	# player's own back after.
+	var lamps := LampLights.new()
+	add_child(lamps)
+	fake.lamps = lamps
+	var glow := WorkingGlow.new()
+	fake.working_glow = glow
+	var radius_before: int = int(Settings.get_value("graphics", "view_radius"))
+	var stored_before := Settings.has_value("graphics", "view_radius")
+	var lod_before := str(Settings.get_value("graphics", "lod_quality"))
+	var heard := []
+	var listener := func(section: String, _key: String) -> void: heard.append(section)
+	Settings.listen(listener)
+	api.view.full_detail(true)
+	check(api.view.full_detail_on() and int(Settings.get_value("graphics", "view_radius")) == 20
+		and str(Settings.get_value("graphics", "lod_quality")) == "high" and int(Settings.get_value("graphics", "entity_radius")) == 256
+		and int(Settings.get_value("graphics", "belt_distance")) == 640 and int(Settings.get_value("graphics", "decorative_distance")) == 320
+		and str(Settings.get_value("graphics", "grass_3d")) == "far" and not bool(Settings.get_value("graphics", "merge_far")),
+		"full_detail: every distance at its top (view, entity, belts, decoratives, grass), far chunks whole")
+	check(ItemCards.model_cap < 0 and ModelLods.full_detail and not BeltLods.enabled and UpsGovernor.lifted,
+		"Items in 3D uncapped, models at full level, no belt stand-ins, nothing held back for the UPS")
+	check(lamps.max_lights == LampLights.FULL_LIGHTS and lamps._lights.size() >= LampLights.FULL_LIGHTS and glow.radius == WorkingGlow.FULL_RADIUS,
+		"every lamp gets its light (%d), fires and glows far out" % lamps.max_lights)
+	check(Settings.has_value("graphics", "view_radius") == stored_before and heard.size() == 1,
+		"nothing written to the settings file, the listeners told once (%d)" % heard.size())
+	api.view.full_detail(false)
+	Settings.unlisten(listener)
+	check(not api.view.full_detail_on() and int(Settings.get_value("graphics", "view_radius")) == radius_before
+		and str(Settings.get_value("graphics", "lod_quality")) == lod_before and not ModelLods.full_detail and BeltLods.enabled
+		and not UpsGovernor.lifted and lamps.max_lights == LampLights.MAX_LIGHTS and glow.radius == WorkingGlow.RADIUS,
+		"and off: the player's own settings, levels, lamps and caps back")
+
+	# A screenshot: the interface (and an add-on's overlay) hidden while it is taken, full detail on,
+	# a file written on a worker thread, everything back.
+	var sizes: Array = []
+	host.test_capture = func(size: Vector2i) -> Image:
+		sizes.append(size)
+		return Image.create(8, 8, false, Image.FORMAT_RGB8)
+	var saved := []
+	api.view.screenshot_saved.connect(func(p: String, ok: bool) -> void: saved.append([p, ok]))
+	var overlay: CanvasLayer = api.ui.layer()
+	var folder := "user://addon-test/shots"
+	var path: String = api.view.screenshot(null, {"folder": folder, "timeout": 3.0})
+	check(path == folder.path_join("zenith-1.png") and api.view.screenshot_busy() and api.view.screenshot(null) == "",
+		"screenshot: the next zenith-<n>.png in the folder, one at a time (%s)" % path)
+	await get_tree().process_frame
+	check(not hud_layer.visible and host.interface_hidden() and not overlay.visible and api.view.full_detail_on(),
+		"while it is taken: the HUD and the add-on's overlay hidden, full detail on")
+	check(MomentHold.on, "and the moment held: Zenith's view of time stands still")
+	var t0 := Time.get_ticks_msec()
+	while (api.view.screenshot_busy() or saved.is_empty()) and Time.get_ticks_msec() - t0 < 8000:
+		await get_tree().process_frame
+	check(not saved.is_empty() and saved[0][0] == path and bool(saved[0][1]) and FileAccess.file_exists(path),
+		"the PNG is written and screenshot_saved says so: %s" % [saved])
+	check(hud_layer.visible and overlay.visible and not host.interface_hidden() and not api.view.full_detail_on()
+		and int(Settings.get_value("graphics", "view_radius")) == radius_before,
+		"then the interface, the overlay and the player's settings are back")
+	check(not MomentHold.on, "and time runs again")
+	check(host._toast != null and host._toast.visible, "and \"Screenshot saved\" shows, with Open folder")
+	check(AddonHost.screenshot_path(null, {"folder": folder}) == folder.path_join("zenith-2.png")
+		and AddonHost.screenshot_path("user://x/y.png", {}) == "user://x/y.png", "the next one is zenith-2.png; a .png path is used as it is")
+	check(sizes.size() == 1 and sizes[0] == host._window_size(), "without size or scale, the window's size (%s)" % [sizes])
+	# An 8K one: the size option reaches the capture as it is.
+	saved.clear()
+	path = api.view.screenshot(null, {"folder": folder, "timeout": 3.0, "size": Vector2i(7680, 4320)})
+	t0 = Time.get_ticks_msec()
+	while (api.view.screenshot_busy() or saved.is_empty()) and Time.get_ticks_msec() - t0 < 8000:
+		await get_tree().process_frame
+	check(sizes.size() == 2 and sizes[1] == Vector2i(7680, 4320) and not saved.is_empty() and bool(saved[0][1]),
+		"size: Vector2i(7680, 4320) is drawn at 8K (%s)" % [sizes])
+	check(FullDetail.shot_aspect == 0.0 and not FrameBudget.boost, "after it the view's shape and the frame budget are back")
+	check(host._progress != null and not host._progress.visible, "and its progress bar is gone")
+	# Cancelled: nothing written, everything back.
+	var cancelled := []
+	api.view.screenshot_cancelled.connect(func(p: String) -> void: cancelled.append(p))
+	saved.clear()
+	path = api.view.screenshot(null, {"folder": folder, "timeout": 3.0})
+	await get_tree().process_frame
+	check(host._progress != null and host._progress.visible and not host._shot_layers.has(host._progress),
+		"while it is taken its progress shows, on a layer the shot doesn't hide")
+	check(api.view.screenshot_cancel(), "screenshot_cancel: one is being taken")
+	t0 = Time.get_ticks_msec()
+	while api.view.screenshot_busy() and Time.get_ticks_msec() - t0 < 8000:
+		await get_tree().process_frame
+	check(cancelled == [path] and saved.is_empty() and not FileAccess.file_exists(path) and sizes.size() == 2,
+		"cancelled: screenshot_cancelled, no picture taken, no file (%s, %s)" % [cancelled, saved])
+	check(hud_layer.visible and not host.interface_hidden() and not api.view.full_detail_on() and not host._progress.visible
+		and not api.view.screenshot_cancel(), "and the interface, full detail and the progress are back as they were")
+	_shot_sizes()
+	host.test_capture = Callable()
+	fake.lamps = null
+	fake.working_glow = null
+	lamps.queue_free()
+	glow.free()
+
+
+## The screenshot's size (API 1.6 `size`, `scale`), the MSAA it is drawn with at 8K, and its camera
+## framing the window's height at another shape.
+func _shot_sizes() -> void:
+	var win := Vector2i(1600, 900)
+	check(AddonHost.shot_size({"size": Vector2i(7680, 4320)}, win) == Vector2i(7680, 4320)
+		and AddonHost.shot_size({"size": [3840, 2160]}, win) == Vector2i(3840, 2160)
+		and AddonHost.shot_size({}, win) == win and AddonHost.shot_size({"scale": 2}, win) == Vector2i(3200, 1800)
+		and AddonHost.shot_size({"size": Vector2i(0, 0), "scale": 4}, win) == Vector2i(6400, 3600),
+		"shot_size: `size` as given (a Vector2i or [w, h]), else the window times `scale`")
+	check(AddonHost.shot_size({"size": Vector2i(20000, 10000)}, win) == Vector2i(16384, 8192)
+		and AddonHost.shot_size({"scale": 4}, Vector2i(5120, 2880)) == Vector2i(16384, 9216),
+		"and never past Godot's 16384 a side, the shape kept")
+	check(AddonHost.shot_msaa(Viewport.MSAA_4X, Vector2i(7680, 4320)) == Viewport.MSAA_2X
+		and AddonHost.shot_msaa(Viewport.MSAA_8X, Vector2i(7680, 4320)) == Viewport.MSAA_2X
+		and AddonHost.shot_msaa(Viewport.MSAA_4X, Vector2i(3840, 2160)) == Viewport.MSAA_4X
+		and AddonHost.shot_msaa(Viewport.MSAA_DISABLED, Vector2i(7680, 4320)) == Viewport.MSAA_DISABLED,
+		"8K steps 4x and 8x MSAA down to 2x (video memory); 4K keeps 4x")
+	var cam := Camera3D.new()
+	cam.fov = 60.0
+	cam.size = 20.0
+	check(FullDetail.vertical_frame(cam, Vector2(1600, 900)) == Vector2(60.0, 20.0), "a camera keeping its height is framed as it is")
+	cam.keep_aspect = Camera3D.KEEP_WIDTH
+	var f := FullDetail.vertical_frame(cam, Vector2(1600, 900))
+	var want := rad_to_deg(2.0 * atan(tan(deg_to_rad(30.0)) * 900.0 / 1600.0))
+	check(absf(f.x - want) < 0.001 and absf(f.y - 20.0 * 900.0 / 1600.0) < 0.001,
+		"one keeping its width: the window's vertical field of view and height (%s)" % f)
+	cam.free()
+
+
+## The screenshot's settle (full_detail.gd pending): chunks count only in the camera's view, and one
+## that hasn't arrived stops counting once the bridge has sent nothing new for a while.
+func _shot_settle(w) -> void:
+	w.set_focus(Vector2(16, 16))
+	w._update_subscription(1.0)
+	var all := func(_c: Vector2i) -> bool: return true
+	var one := func(c: Vector2i) -> bool: return c == Vector2i(0, 0)
+	var wanted: int = w._wanted.size()
+	check(wanted == 9 and w.unsettled_in(all, false) == 9 and w.unsettled_in(all, true) == 0,
+		"unsettled_in: 9 wanted chunks on their way count, none once the bridge has given up (%d, %d)" % [wanted, w.unsettled_in(all, false)])
+	check(w.unsettled_in(one, false) == 1, "only those in the view count")
+	var before: int = w.last_arrival_msec
+	w.handle({"t": "chunk", "cx": 0, "cy": 0, "none": true})
+	check(w.unsettled_in(one, false) == 1 and w.last_arrival_msec >= before and w.last_arrival_msec > 0,
+		"a chunk that came is noted as an arrival, and counts until it is drawn")
+	check(not FullDetail.given_up(w), "the bridge has just sent one: not given up")
+	w.last_arrival_msec = Time.get_ticks_msec() - FullDetail.QUIET_MSEC - 1
+	FullDetail._since = w.last_arrival_msec  # full detail came on before that too
+	check(FullDetail.given_up(w), "nothing new for %d ms: given up" % FullDetail.QUIET_MSEC)
+	var report_before: Dictionary = Bridge.work_budget
+	var report_at: int = Bridge.work_budget_msec
+	Bridge.work_budget = {"q": {"chunks": 5}}
+	Bridge.work_budget_msec = Time.get_ticks_msec()
+	check(not FullDetail.given_up(w), "but not while the bridge's last report has chunks queued (it reads one a tick)")
+	Bridge.work_budget_msec = Time.get_ticks_msec() - FullDetail.REPORT_MSEC - 1
+	check(FullDetail.given_up(w), "a report that old isn't read")
+	Bridge.work_budget = report_before
+	Bridge.work_budget_msec = report_at
+	# A screenshot's cover: the chunks its camera sees asked for besides the view's own square, in
+	# one square fitted round both.
+	var subs_before: int = Bridge.square_subs
+	Bridge.square_subs = WorldMirror.MAX_VIEW_RADIUS
+	w._update_subscription(1.0)
+	var own_wanted: int = w._wanted.size()
+	var east := func(c: Vector2i) -> bool: return c.x >= 5
+	w.set_cover(Rect2i(Vector2i(5, -2), Vector2i(3, 5)), Vector2i(0, 0), east)
+	w._update_subscription(1.0)
+	var seen_in := 0
+	for c: Vector2i in w._wanted:
+		if c.x >= 5:
+			seen_in += 1
+	check(own_wanted == 9 and w._sq_center == Vector2i(3, 0) and w._sq_radius == 4 and w._wanted.size() == 9 + 27 and seen_in == 27,
+		"cover: the square fitted round the view's and the camera's (%s r %d), its seen chunks asked for besides the view's 9 (%d)" % [w._sq_center, w._sq_radius, w._wanted.size()])
+	w.clear_cover()
+	w._update_subscription(1.0)
+	check(w._wanted.size() == 9 and w._sq_center == Vector2i(0, 0) and w._sq_radius == 1, "and after it the view's own square again")
+	Bridge.square_subs = subs_before
+	var fit: Array = WorldMirror.fit_square(Rect2i(0, 0, 300, 5), Vector2i(290, 2), 50)
+	check(fit[0] == Vector2i(249, 2) and fit[1] == 50, "a view wider than the bridge's square: its part nearest the camera (%s)" % [fit])
+	var down := Camera3D.new()
+	add_child(down)
+	down.fov = 90.0
+	down.position = Vector3(0, 100, 0)
+	down.rotation_degrees = Vector3(-90, 0, 0)
+	var foot := FullDetail.ground_footprint(down, Vector2(900, 900), 1.0, 3000.0)
+	check(foot.position.distance_to(Vector2(-100, -100)) < 0.5 and foot.size.distance_to(Vector2(200, 200)) < 1.0,
+		"ground_footprint: straight down, the square under the camera (%s)" % foot)
+	down.rotation_degrees = Vector3(0, 0, 0)
+	foot = FullDetail.ground_footprint(down, Vector2(900, 900), 1.0, 3000.0)
+	check(foot.position.y < -2100.0 and foot.end.y <= 0.5 and absf(foot.position.x + 2121.3) < 1.0, "looking at the horizon: out to the reach along the top corners (%s)" % foot)
+	down.free()
+	# A screenshot's moment: the drawn clock stands still however much comes, and runs on after it.
+	var clock = preload("res://scripts/world/game_clock.gd").new()
+	clock.heard(100.0)
+	clock.advance(0.1)
+	MomentHold.begin()
+	var at_hold: float = clock.advance(0.0)
+	clock.advance(0.5)
+	clock.heard(400.0)
+	var held_at: float = clock.advance(0.5)
+	var kinds_held: bool = Bridge._holding and Bridge._hold_kinds.has("mv")
+	MomentHold.end()
+	var after: float = clock.advance(0.1)
+	check(at_hold == held_at and kinds_held and after > held_at and not Bridge._holding,
+		"the moment: the clock held at %.1f through a jump to tick 400, movers' updates waiting; after it on to %.1f" % [held_at, after])
+	var shots := AddonHost.default_screenshot_folder()
+	check(shots == "user://screenshots" if OS.get_system_dir(OS.SYSTEM_DIR_PICTURES) == "" else (shots.get_file() == "Zenith" and not shots.begins_with("user://")),
+		"screenshots go to the Pictures folder's Zenith (%s)" % shots)
+	# The view: a camera at the origin looking north (-Z).
+	var cam := Camera3D.new()
+	add_child(cam)
+	cam.fov = 70.0
+	cam.far = 500.0
+	var planes := FullDetail.view_planes(cam, Vector2(1600, 900), 16.0 / 9.0, 0.0)
+	check(FullDetail.box_in_view(planes, Vector3(-5, -5, -105), Vector3(5, 5, -95))
+		and not FullDetail.box_in_view(planes, Vector3(-5, -5, 95), Vector3(5, 5, 105))
+		and not FullDetail.box_in_view(planes, Vector3(300, -5, -105), Vector3(310, 5, -95))
+		and not FullDetail.box_in_view(planes, Vector3(-5, -5, -700), Vector3(5, 5, -690)),
+		"view_planes: a box ahead is in view; behind, far to the side or past the far plane isn't")
+	cam.projection = Camera3D.PROJECTION_ORTHOGONAL
+	cam.size = 20.0
+	planes = FullDetail.view_planes(cam, Vector2(1600, 900), 16.0 / 9.0, 0.0)
+	check(FullDetail.box_in_view(planes, Vector3(14, -1, -50), Vector3(16, 1, -48))
+		and not FullDetail.box_in_view(planes, Vector3(20, -1, -50), Vector3(22, 1, -48))
+		and FullDetail.box_in_view(FullDetail.view_planes(cam, Vector2(1600, 900), 16.0 / 9.0, 8.0), Vector3(20, -1, -50), Vector3(22, 1, -48)),
+		"orthographic: within half its width (17.8 tiles) in view, past it not, but within the margin")
+	planes = FullDetail.view_planes(cam, Vector2(1600, 900), 1.0, 0.0)
+	check(not FullDetail.box_in_view(planes, Vector3(14, -1, -50), Vector3(16, 1, -48)), "a square shot is narrower")
+	# Held chunks: never more than 1,600, nor past 3,281 loaded with the view's own.
+	var wanted_before: Array = w._wanted
+	w._wanted = []
+	w._wanted.resize(441)
+	var at_10: int = w._hold_limit()
+	w._wanted.resize(3000)
+	var at_27: int = w._hold_limit()
+	w._wanted.resize(3721)
+	var at_30: int = w._hold_limit()
+	w._wanted = wanted_before
+	check(at_10 == 1600 and at_27 == 281 and at_30 == 0,
+		"hold_chunks' cap: 1,600 at view 10, fewer as the view grows, none at 30 (%d, %d, %d)" % [at_10, at_27, at_30])
+	remove_child(cam)
+	cam.free()
+
+
+## The Cinematic shaders add-on (addons-src/): the add-on is the look, on while it is on, with TAA
+## while its look is in use; switched off, the Factorio look and the player's own TAA come back.
+func _cinematic_shaders(fake) -> void:
+	var src := ProjectSettings.globalize_path("res://").path_join("../addons-src/cinematic-shaders").simplify_path()
+	if not DirAccess.dir_exists_absolute(src):
+		check(false, "cinematic shaders: the add-on's folder is at " + src)
+		return
+	var look_before = Settings.get_value("graphics", "look")
+	var vp := get_viewport()
+	vp.use_taa = false
+	Settings.set_value("graphics", "look", "classic")
+	var look_env := Environment.new()
+	var look_sun := DirectionalLight3D.new()
+	var game_looks := Looks.new()
+	add_child(look_sun)
+	add_child(game_looks)
+	game_looks.attach(look_env, look_sun)
+	var host := AddonHost.new()
+	host.autoload = false
+	host.main = fake
+	add_child(host)
+	host.load_all([[src.get_base_dir(), "test"]])
+	await get_tree().process_frame
+	var m := host.find("cinematic-shaders")
+	var node: Node = m.get("node")
+	check(node != null, "cinematic shaders: the add-on starts: " + str(m.get("problem", "")))
+	if node == null:
+		host.queue_free()
+		game_looks.queue_free()
+		look_sun.queue_free()
+		return
+	var ids: Array = node.api.settings.list().map(func(d: Dictionary) -> String: return str(d.get("id", "")))
+	check(str(Settings.get_value("graphics", "look")) == node.LOOK and not ids.has("use"),
+		"cinematic shaders: its look is put on when it starts, with no switch of its own: %s" % [ids])
+	check(game_looks.current == node.LOOK and not vp.use_taa, "cinematic shaders: TAA off by default (moving parts flicker under it)")
+	check(not game_looks.own_clouds(), "cinematic shaders: Zenith's own clouds are off under its look")
+	check(is_equal_approx(game_looks.twilight(), 1.0) and Looks.looks[node.LOOK].has("at_twilight") and Looks.looks[node.LOOK].has("at_dawn"), "cinematic shaders: it has a sunrise and sunset")
+	node.api.settings.set_value("sunset", 0.5, false)
+	check(is_equal_approx(game_looks.twilight(), 0.5), "cinematic shaders: its slider scales the sunset")
+	node.api.settings.set_value("sunset", 1.0, false)
+	check(not node.has_method("_process"), "cinematic shaders: it no longer reaches into Zenith for the sun")
+	node.api.settings.set_value("taa", true, false)
+	check(vp.use_taa, "cinematic shaders: TAA on while its look is in use, when asked for")
+	game_looks.lift()
+	game_looks.settle(str(Settings.get_value("graphics", "look")))
+	check(vp.use_taa and not game_looks.own_clouds(), "cinematic shaders: changing a Graphics setting leaves the look's TAA and clouds as they are")
+	check(Looks.looks.has(node.LOOK) and float(Looks.looks[node.LOOK].get("roughness_min", 0.0)) > 0.3,
+		"cinematic shaders: its look asks for a roughness floor")
+	host.set_enabled("cinematic-shaders", false)
+	await get_tree().process_frame
+	check(str(Settings.get_value("graphics", "look")) == "classic" and game_looks.current == "classic" and not vp.use_taa and game_looks.own_clouds(),
+		"cinematic shaders: switched off, the look it replaced, the player's own TAA (off) and Zenith's clouds come back")
+	Settings.set_value("graphics", "look", look_before)
+	Settings.reset_value("graphics", "look_before")
+	Settings.reset_value("addons", "cinematic-shaders")
+	host.queue_free()
+	game_looks.queue_free()
+	look_sun.queue_free()
+
+
+## sky.gd's sun as pure functions (add-on API 1.5): the path, the colour through the air, the swap to
+## the moon with no light on, each planet's day.
+func _sun_model() -> void:
+	check(PlanetSky.darkness_at(0.2) == 0.0 and PlanetSky.darkness_at(0.25) == 0.0 and is_equal_approx(PlanetSky.darkness_at(0.35), 0.425)
+		and is_equal_approx(PlanetSky.darkness_at(0.45), 0.85) and is_equal_approx(PlanetSky.darkness_at(0.5), 0.85)
+		and is_equal_approx(PlanetSky.darkness_at(0.65), 0.425) and PlanetSky.darkness_at(0.75) == 0.0,
+		"sun: --sky=@daytime's darkness is Factorio's ramp")
+	check(is_equal_approx(PlanetSky.sun_elevation(0.0, 0.0), PlanetSky.E_NOON) and is_equal_approx(PlanetSky.sun_elevation(0.25, 0.0), PlanetSky.E_DUSK)
+		and is_equal_approx(PlanetSky.sun_elevation(0.5, 1.0), PlanetSky.E_SET), "sun: high at noon, low at dusk, under the horizon at night")
+	check(PlanetSky.sun_elevation(0.38, 0.65) > 0.0 and PlanetSky.sun_elevation(0.4, 0.75) < 0.0, "sun: it crosses the horizon about 0.7 of the way into the night")
+	var west := PlanetSky._towards(0.0, PlanetSky.sun_yaw(0.0, false))
+	var east := PlanetSky._towards(0.0, PlanetSky.sun_yaw(0.0, true))
+	check(west.x < -0.9 and west.z < 0.0 and east.x > 0.9, "sun: sets west with a little north, rises east: %s %s" % [west, east])
+	check(is_equal_approx(PlanetSky.sun_yaw(PlanetSky.E_NOON, false), PlanetSky.sun_yaw(PlanetSky.E_NOON, true)), "sun: the same place at noon coming and going")
+	var scatter: Color = PlanetSky.PLANETS["nauvis"]["twilight"]["scatter"]
+	var noon := PlanetSky.sun_tint(scatter, PlanetSky.E_NOON)
+	var gold := PlanetSky.sun_tint(scatter, 12.0)
+	var red := PlanetSky.sun_tint(scatter, 0.0)
+	check(noon.is_equal_approx(Color.WHITE), "sun: white at noon")
+	check(gold.r > gold.g and gold.g > gold.b and gold.g > 0.55, "sun: gold 12 degrees up: %s" % gold)
+	check(red.g < 0.2 and red.b < 0.05, "sun: deep red at the horizon: %s" % red)
+	check(PlanetSky.twilight_at(PlanetSky.E_NOON) == 0.0 and PlanetSky.twilight_at(PlanetSky.E_SET) == 0.0 and PlanetSky.twilight_at(3.0) > 0.9, "sun: twilight peaks with the sun at the horizon")
+	for planet: String in PlanetSky.PLANETS:
+		var p: Dictionary = PlanetSky.PLANETS[planet]
+		var at_noon := PlanetSky.sun_model(p, 0.0, 0.0)
+		check((at_noon["light_color"] as Color).is_equal_approx(p["sun"][0]) and (at_noon["ambient"] as Color).is_equal_approx(p["ambient"][0])
+			and is_equal_approx(float(at_noon["light_energy"]), float(p["sun_energy"][0])), "sun: %s at noon is the planet's day" % planet)
+		var prev := {}
+		var pops := 0
+		var floors := 0
+		for i in 2000:
+			var d := float(i) / 2000.0
+			var m := PlanetSky.sun_model(p, d, PlanetSky.darkness_at(d) / PlanetSky.FULL_DARKNESS)
+			if float(m["elevation"]) >= -1.0 and float(m["light_pitch"]) < PlanetSky.LIGHT_FLOOR:
+				floors += 1
+			if not prev.is_empty():
+				var moved := absf(wrapf(float(m["light_yaw"]) - float(prev["light_yaw"]), -180.0, 180.0))
+				if moved > 15.0 and maxf(float(m["light_energy"]), float(prev["light_energy"])) > 0.001:
+					pops += 1
+				if absf(float(m["ambient_energy"]) - float(prev["ambient_energy"])) > 0.08:
+					pops += 1
+			prev = m
+		check(pops == 0, "sun: %s through a whole day: no jump in the light while it shines (%d)" % [planet, pops])
+		check(floors == 0, "sun: %s: the light never lower than its floor" % planet)
+	var at := PlanetSky.sun_model(PlanetSky.PLANETS["gleba"], 0.34, 0.45)
+	var dawn := PlanetSky.sun_model(PlanetSky.PLANETS["gleba"], 0.66, 0.45)
+	check((at["sun_color"] as Color).r > (at["sun_color"] as Color).g and (dawn["sun_color"] as Color).g > (dawn["sun_color"] as Color).r,
+		"sun: Gleba's dusk is rose and its dawn green: %s %s" % [at["sun_color"], dawn["sun_color"]])
+	check(PlanetSky.water_tint(Color(0.7, 0.8, 0.88), Color(0.7, 0.8, 0.88)).is_equal_approx(PlanetSky.WATER_SKY), "water: by day its tint is as it was")
+	var cold := PlanetSky.water_tint(Color(0.05, 0.07, 0.12), Color(0.7, 0.8, 0.88))
+	check(cold.b > PlanetSky.WATER_SKY.b and absf(cold.get_luminance() - PlanetSky.WATER_SKY.get_luminance()) < 0.08, "water: at night it follows the sky's colour, not its darkness: %s" % cold)
+	var points: Array = []
+	for u in 500:
+		points.append(LampLights.on_at(u + 1000))
+	check(points.min() >= LampLights.ON_DARKNESS and points.max() <= LampLights.ALL_ON_DARKNESS and points.max() - points.min() > 0.18
+		and LampLights.on_at(1234) == LampLights.on_at(1234), "lamps: each comes on at its own point between 0.3 and 0.5")
+
+
+## A look's sunrise and sunset (1.5): twilight for sky.gd, at_twilight and at_dawn blended by the sun,
+## the pass's sun uniforms, api.shaders.sun(), and the light left as it was without one.
+func _sunset_look(api) -> void:
+	var sh = api.shaders
+	var env := Environment.new()
+	var sun := DirectionalLight3D.new()
+	var looks := Looks.new()
+	var sky := PlanetSky.new()
+	add_child(sun)
+	add_child(looks)
+	add_child(sky)
+	looks.attach(env, sun)
+	sky.set_planet("nauvis")
+	check(looks.twilight() == 0.0 and looks.sky_twilight() > 0.0 and looks.sky_twilight() < 1.0, "sunset: the Factorio look has none on the ground and a restrained one in its sky")
+	sky.twilight = 0.0
+	sky.sky_twilight = 0.0
+	sky.apply(env, sun, 0.35, 0.5, 0.016, false)
+	var high := clampf(cos(TAU * 0.35) * 0.5 + 0.5, 0.0, 1.0)
+	check(is_equal_approx(sun.rotation_degrees.x, -lerpf(20.0, 60.0, high)) and is_equal_approx(sun.light_energy, lerpf(1.1, 0.12, 0.5))
+		and sun.light_color.is_equal_approx(Color(1.0, 0.97, 0.92).lerp(Color(0.6, 0.68, 0.95), 0.5)), "sunset: at twilight 0 the sun is the old one")
+	var ok: bool = sh.add_look("test-addon/dusk", {"name": "Dusk", "twilight": 0.8, "exposure": 1.0,
+		"environment": {"fog_density": 0.01},
+		"sun": {"shadow_opacity": 1.0},
+		"at_twilight": {"environment": {"tonemap_exposure": 2.0, "fog_density": 0.02}, "sun": {"shadow_opacity": 0.5}, "params": {"strength": 1.0}},
+		"at_dawn": {"environment": {"fog_height": 3.0, "fog_density": 0.04}},
+		"fog_from_sky": 1.0,
+		"passes": [{"shader": "grey.gdshader", "params": {"strength": 0.2}}]})
+	check(ok, "sunset: an add-on's look with a sunset")
+	looks.use("test-addon/dusk")
+	var pass_node: MeshInstance3D = looks.get_children().filter(func(n: Node) -> bool: return n is MeshInstance3D)[0]
+	var m := pass_node.material_override as ShaderMaterial
+	check(is_equal_approx(looks.twilight(), 0.8) and is_equal_approx(looks.sky_twilight(), 0.8), "sunset: sky_twilight follows twilight when not given")
+	var fog_before := env.fog_light_color
+	looks.apply(0.0, 0.0, "nauvis", false, {"elevation": 60.0, "height": 0.87, "twilight": 0.0, "morning": false, "direction": Vector3.UP, "color": Color.WHITE, "ambient": Color.GRAY, "fog": Color.RED})
+	check(is_equal_approx(env.tonemap_exposure, 1.0) and is_equal_approx(env.fog_density, 0.01) and is_equal_approx(sun.shadow_opacity, 1.0)
+		and is_equal_approx(float(m.get_shader_parameter("strength")), 0.2) and env.fog_light_color.is_equal_approx(fog_before), "sunset: at noon the look's own values")
+	looks.apply(0.35, 0.5, "nauvis", false, {"elevation": 3.0, "height": 0.05, "twilight": 0.5, "morning": false, "direction": Vector3.LEFT, "color": Color.ORANGE, "ambient": Color.BLUE, "fog": Color.RED})
+	check(is_equal_approx(env.tonemap_exposure, 1.5) and is_equal_approx(env.fog_density, 0.015) and is_equal_approx(sun.shadow_opacity, 0.75)
+		and is_equal_approx(float(m.get_shader_parameter("strength")), 0.6), "sunset: at_twilight is blended by how low the sun is")
+	check(env.fog_light_color.is_equal_approx(fog_before.lerp(Color.RED, 0.5)), "sunset: the fog takes the sky's colour")
+	check(is_equal_approx(float(m.get_shader_parameter("look_twilight")), 0.5) and is_equal_approx(float(m.get_shader_parameter("look_sun_height")), 0.05)
+		and (m.get_shader_parameter("look_sun_dir") as Vector3).is_equal_approx(Vector3.LEFT) and (m.get_shader_parameter("look_sun_color") as Color).is_equal_approx(Color.ORANGE)
+		and float(m.get_shader_parameter("look_morning")) == 0.0, "sunset: passes are given the sun")
+	looks.apply(0.35, 0.5, "", true, {"elevation": 3.0, "height": 0.05, "twilight": 0.5, "morning": false, "direction": Vector3.LEFT, "color": Color.ORANGE, "ambient": Color.BLUE, "fog": Color.RED})
+	var in_space := float(m.get_shader_parameter("look_space"))
+	looks.apply(0.35, 0.5, "nauvis", false, {"elevation": 3.0, "height": 0.05, "twilight": 0.5, "morning": false, "direction": Vector3.LEFT, "color": Color.ORANGE, "ambient": Color.BLUE, "fog": Color.RED})
+	check(in_space == 1.0 and float(m.get_shader_parameter("look_space")) == 0.0,
+		"passes are told when the view is on a space platform (look_space: the Cinematic clouds stay off there)")
+	looks.apply(0.65, 0.5, "nauvis", false, {"elevation": 3.0, "height": 0.05, "twilight": 1.0, "morning": true, "direction": Vector3.RIGHT, "color": Color.ORANGE, "ambient": Color.BLUE, "fog": Color.RED})
+	check(is_equal_approx(env.fog_density, 0.04) and is_equal_approx(env.fog_height, 3.0) and is_equal_approx(env.tonemap_exposure, 2.0) and float(m.get_shader_parameter("look_morning")) == 1.0,
+		"sunset: at_dawn in the morning, over at_twilight's")
+	looks.apply(0.45, 0.5, "nauvis", false, {"elevation": 3.0, "height": 0.05, "twilight": 1.0, "morning": false, "direction": Vector3.RIGHT, "color": Color.ORANGE, "ambient": Color.BLUE, "fog": Color.RED})
+	check(is_equal_approx(env.fog_height, 0.0), "sunset: a dawn-only value has nothing to go to at dusk")
+	var from_api: Dictionary = sh.sun()
+	check(is_equal_approx(float(from_api.get("twilight", -1.0)), 1.0) and from_api.get("morning") == false, "sunset: api.shaders.sun() says where the sun is")
+	sky.twilight = 1.0
+	sky.sky_twilight = 1.0
+	sky.apply(env, sun, 0.34, 0.45, 0.016, true)
+	check(sky.state["twilight"] == 0.0, "sunset: no dusk on a space platform")
+	sky.apply(env, sun, 0.34, 0.45, 0.016, false)
+	check(sky.state["twilight"] > 0.5 and sun.light_color.r > sun.light_color.b * 1.5 and is_equal_approx(sun.rotation_degrees.x, -PlanetSky.LIGHT_FLOOR),
+		"sunset: at dusk the light is warm and held at its floor: %s %s" % [sun.light_color, sun.rotation_degrees])
+	looks.use("classic")
+	check(is_equal_approx(env.fog_density, Environment.new().fog_density) and is_equal_approx(env.tonemap_exposure, 1.0) and is_equal_approx(env.fog_height, 0.0),
+		"sunset: another look puts everything the sunset moved back")
+	sh.remove_look("test-addon/dusk")
+	sky.queue_free()
+	looks.queue_free()
+	sun.queue_free()
+	await get_tree().process_frame
+
+
+## api.shaders (1.3): an add-on's look in the Look setting's list, put on a scene's environment and
+## sun (tonemapping, the light's multipliers, the held sun, environment and sun properties, its pass
+## from the add-on's folder), a pass over every look, and all of it gone again with the add-on.
+func _shaders(api) -> void:
+	var sh = api.shaders
+	var ids: Array = sh.looks().map(func(c: Array) -> String: return str(c[1]))
+	check(ids.has("factorio") and ids.has("classic"), "shaders: Zenith's Factorio and Classic looks are listed: %s" % [ids])
+	var env := Environment.new()
+	var sun := DirectionalLight3D.new()
+	var looks := Looks.new()
+	add_child(sun)
+	add_child(looks)
+	looks.attach(env, sun)
+	check(looks.current == "factorio" and env.tonemap_mode == Environment.TONE_MAPPER_LINEAR, "shaders: the Factorio look is on by default, linear tonemapping")
+	looks.apply(0.0, 0.0, "nauvis", false)
+	var held := sun.rotation_degrees
+	check(is_equal_approx(held.x, Looks.FACTORIO["sun_angle"].x) and is_equal_approx(held.y, Looks.FACTORIO["sun_angle"].y), "shaders: Factorio's look holds the sun where Factorio's shadows fall: %s" % [held])
+	var ok: bool = sh.add_look("test-addon/grey", {"name": "Grey", "tonemap": Environment.TONE_MAPPER_AGX, "exposure": 1.3,
+		"sun_energy": 2.0, "environment": {"glow_enabled": true, "ssao_enabled": true}, "sun": {"light_angular_distance": 1.5, "light_energy": 9.0},
+		"passes": [{"shader": "grey.gdshader", "params": {"strength": 0.25}}]})
+	check(ok and sh.looks().any(func(c: Array) -> bool: return c[1] == "test-addon/grey"), "shaders: an add-on's look joins the list")
+	check(not Looks.register("test-addon/grey", {}, "someone-else") and not sh.add_look("classic", {}), "shaders: nobody else's look can be replaced, nor Zenith's")
+	looks.use("test-addon/grey")
+	sun.light_energy = 1.0
+	looks.apply(0.0, 0.0, "nauvis", false)
+	var passes := looks.get_children().filter(func(n: Node) -> bool: return n is MeshInstance3D)
+	check(env.tonemap_mode == Environment.TONE_MAPPER_AGX and is_equal_approx(env.tonemap_exposure, 1.3) and env.glow_enabled and env.ssao_enabled,
+		"shaders: the look's tonemapping and environment are on")
+	check(is_equal_approx(sun.light_energy, 2.0) and is_equal_approx(sun.light_angular_distance, 1.5), "shaders: its sun: the light doubled, soft shadows: %s %s" % [sun.light_energy, sun.light_angular_distance])
+	check(passes.size() == 1 and is_equal_approx(float((passes[0].material_override as ShaderMaterial).get_shader_parameter("strength")), 0.25),
+		"shaders: its pass from the add-on's folder, with its uniform: %d" % passes.size())
+	sh.set_parameter(0, "strength", 0.75)
+	check(passes.size() == 1 and is_equal_approx(float((passes[0].material_override as ShaderMaterial).get_shader_parameter("strength")), 0.75), "shaders: set_parameter(0) reaches the look's pass")
+	var pid: int = sh.add_pass("grey.gdshader", {"strength": 0.5})
+	check(pid > 0 and looks.get_children().filter(func(n: Node) -> bool: return n is MeshInstance3D).size() == 2, "shaders: a pass over every look is drawn too")
+	check(sh.add_pass("res://shaders/no-such.gdshader") == 0, "shaders: a missing shader isn't a pass")
+	looks.use("classic")
+	await get_tree().process_frame
+	check(not env.glow_enabled and not env.ssao_enabled and env.tonemap_mode == Environment.TONE_MAPPER_FILMIC and is_equal_approx(sun.light_angular_distance, 0.0),
+		"shaders: another look puts the environment and sun back")
+	check(looks.get_children().filter(func(n: Node) -> bool: return n is MeshInstance3D and not n.is_queued_for_deletion()).size() == 1, "shaders: only the pass over every look is left")
+	# A setting changed while the look is on is what comes back when the look goes.
+	looks.use("test-addon/grey")
+	looks.lift()
+	check(not env.ssao_enabled, "shaders: lifted, the look's own values are off while Settings writes")
+	env.ssao_enabled = true
+	looks.settle("test-addon/grey")
+	looks.use("classic")
+	check(env.ssao_enabled, "shaders: a setting changed under a look comes back when the look goes")
+	env.ssao_enabled = false
+	looks.use("test-addon/grey")
+	sh.clear()
+	await get_tree().process_frame
+	check(not Looks.looks.has("test-addon/grey") and looks.current == "factorio" and Looks.extras.is_empty()
+		and looks.get_children().filter(func(n: Node) -> bool: return n is MeshInstance3D and not n.is_queued_for_deletion()).is_empty(),
+		"shaders: switched off, the add-on's look and passes go and the Factorio look comes back")
+	looks.queue_free()
+	sun.queue_free()
 
 
 ## api.terrain (1.2): the height field (set, read between texels, its square, cleared, and only by
@@ -573,12 +1172,24 @@ func _terrain(api, host) -> void:
 	(host.main as FakeMain).world = world
 	var t = api.terrain
 	check(not t.is_on() and t.area() == Rect2() and t.height_at(5, 5) == 0.0, "terrain: flat until a field is set")
+	var GroundHeight = load("res://scripts/world/ground_height.gd")
+	var early := MeshInstance3D.new()
+	var quad := MeshInstance3D.new()
+	quad.extra_cull_margin = 16384.0
+	add_child(early)
+	add_child(quad)
 	var img := Image.create(4, 4, false, Image.FORMAT_RF)
 	for y in 4:
 		for x in 4:
 			img.set_pixel(x, y, Color(float(x), 0, 0))
 	t.set_heights(img, Vector2(-8, -8), 4.0)
 	check(t.is_on() and t.area() == Rect2(-8, -8, 16, 16), "terrain: a 4 x 4 field of 4-tile texels covers 16 x 16 tiles: %s" % [t.area()])
+	var late := MeshInstance3D.new()
+	add_child(late)
+	# The field rises to 3 tiles: that much room in culling (ground_height.gd), not more.
+	check(GroundHeight.lift_range() == Vector2(0.0, 3.0) and early.extra_cull_margin == 3.0 and late.extra_cull_margin == 3.0
+		and quad.extra_cull_margin == 16384.0,
+		"terrain: with hills, nodes made before and after have room for their height, a bigger margin stays: %.1f %.1f" % [early.extra_cull_margin, late.extra_cull_margin])
 	check(is_equal_approx(t.height_at(-6, -6), 0.0) and is_equal_approx(t.height_at(-2, 0), 1.0) and is_equal_approx(t.height_at(0, 0), 1.5),
 		"terrain: heights at texel centres and between them: %s %s %s" % [t.height_at(-6, -6), t.height_at(-2, 0), t.height_at(0, 0)])
 	check(t.height_at(100, 100) == 0.0, "terrain: 0 outside the field")
@@ -587,6 +1198,10 @@ func _terrain(api, host) -> void:
 	check(t.is_on(), "terrain: another add-on's clear leaves this one's field")
 	t.clear()
 	check(not t.is_on() and t.height_at(0, 0) == 0.0, "terrain: cleared")
+	check(early.extra_cull_margin == 0.0 and late.extra_cull_margin == 0.0 and quad.extra_cull_margin == 16384.0, "terrain: flat again, the margins go")
+	early.queue_free()
+	late.queue_free()
+	quad.queue_free()
 	t.set_heights(img, Vector2(-8, -8), 4.0)
 	host.game_ended()
 	check(not t.is_on(), "terrain: the game's end clears the field")

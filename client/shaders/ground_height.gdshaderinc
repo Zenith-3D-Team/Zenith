@@ -44,6 +44,22 @@ vec3 ground_n(vec2 xz) {
 	return normalize(vec3(-dx, 2.0 * e, -dz));
 }
 
+// A world "up" of h in a model's own space: inverse(mat3(model)) * (0, h, 0), the one column of the
+// inverse that needs, from cross products. Not from the columns' lengths: legs stretched between two
+// joints (vehicle_anim.gd) and flattened drop shadows (movers.gd) are sheared. An instance hidden by
+// scaling it to nothing has no inverse and stays put.
+vec3 ground_up_in(mat4 model, float h) {
+	vec3 a = model[0].xyz;
+	vec3 b = model[1].xyz;
+	vec3 c = model[2].xyz;
+	vec3 bc = cross(b, c);
+	float det = dot(a, bc);
+	if (det == 0.0) {
+		return vec3(0.0);
+	}
+	return vec3(bc.y, c.z * a.x - c.x * a.z, a.z * b.x - a.x * b.z) * (h / det);
+}
+
 // A vertex in model space lifted by the ground under its world position: the lift is a world
 // "up", turned back into the model's own space (a MultiMesh instance's turn and scale included).
 // `low`: by the ground without its cliffs' terraces (cliff models: the rock on the low ground).
@@ -56,7 +72,7 @@ vec3 ground_lift_of(vec3 v, mat4 model, bool low) {
 	if (h == 0.0) {
 		return v;
 	}
-	return v + inverse(mat3(model)) * vec3(0.0, h, 0.0);
+	return v + ground_up_in(model, h);
 }
 
 vec3 ground_lift(vec3 v, mat4 model) {
@@ -73,5 +89,5 @@ vec3 ground_lift_origin(vec3 v, mat4 model) {
 	if (h == 0.0) {
 		return v;
 	}
-	return v + inverse(mat3(model)) * vec3(0.0, h, 0.0);
+	return v + ground_up_in(model, h);
 }

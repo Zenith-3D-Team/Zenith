@@ -7,6 +7,9 @@ extends Node
 const CHUNK := 32
 const INTERVAL := 5.0
 
+## Each line as printed (the debug menu shows the last).
+signal reported(text: String)
+
 var world  # world.gd
 
 var _timer := 0.0
@@ -75,11 +78,13 @@ func _report() -> void:
 	_all_total.append_array(_total)
 	_all_hole_view += _hole_view
 	_all_hitches += hitches
-	print("TERRAIN %d chunks | sub->tiles %s | tiles->ground %s | sub->ground %s | holes near %.1f view %.1f chunk-s | %d builds, %.2f ms each on workers, main thread %.0f ms | %d entity builds %.0f ms | frames p50 %.1f p99 %.1f max %.1f ms, %d over 33 ms (slow: %s) | queued %d, gaps %d, loaded %d/%d | all: sub->ground %s, holes %.1f, hitches %d" % [
+	var line := "TERRAIN %d chunks | sub->tiles %s | tiles->ground %s | sub->ground %s | holes near %.1f view %.1f chunk-s | %d builds, %.2f ms each on workers, main thread %.0f ms | %d entity builds %.0f ms | frames p50 %.1f p99 %.1f max %.1f ms, %d over 33 ms (slow: %s) | queued %d, gaps %d, loaded %d/%d | all: sub->ground %s, holes %.1f, hitches %d" % [
 		_total.size(), _stats(_arrive), _stats(_draw), _stats(_total), _hole_near, _hole_view,
 		builds, worker / 1000.0 / maxf(builds, 1), usec / 1000.0, ents, ent_usec / 1000.0,
 		_pct(_frames, 0.5), _pct(_frames, 0.99), _pct(_frames, 1.0), hitches, ",".join(_slow_frames), world.terrain_queue_size(), int(Bridge.stats.get("gaps", 0)), world.loaded_chunk_count(), world.chunks.size(),
-		_stats(_all_total), _all_hole_view, _all_hitches])
+		_stats(_all_total), _all_hole_view, _all_hitches]
+	print(line)
+	reported.emit(line)
 	_arrive.clear()
 	_draw.clear()
 	_total.clear()

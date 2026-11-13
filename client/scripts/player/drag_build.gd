@@ -6,7 +6,12 @@ extends RefCounted
 ##       cursor is past it and within the underground's reach. "Lock belt building to straight
 ##       line" keeps belts on the first line instead.
 ##   pipes drag in a straight line and jump obstacles with a pair of pipes-to-ground;
-##   electric poles go along the line at their wire reach from the last one;
+##   electric poles go along the line at their wire reach from the last one (an existing pole on
+##       the line counts as the last one);
+##   underground belts and pipes-to-ground go in pairs at their maximum reach: an entrance, its exit
+##       as the cursor gets there (or the furthest free tile short of it), the next entrance on the
+##       first free tile past it, and so on. The first piece waits for the line's direction, or for
+##       the button to come up on a plain click, since it can't be turned reliably once built;
 ##   anything else is placed along the line, one footprint after another;
 ## and a faster belt (or anything of the same fast-replace kind) dragged over a line replaces it,
 ## which the mod's `build` does. Shift (or none left, or remote view) makes it all ghosts.
@@ -16,6 +21,7 @@ const WorldMirror := preload("res://scripts/world/world.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 
 const DIRS := {Vector2i(0, -1): 0, Vector2i(1, 0): 4, Vector2i(0, 1): 8, Vector2i(-1, 0): 12}
+const UNDERGROUND_TYPES := ["underground-belt", "pipe-to-ground"]
 
 ## player_input (world, hud, build_dir, _blocked, _remember); untyped to keep the scripts apart.
 var pi: Node
@@ -41,6 +47,12 @@ var _line_last := Vector2i.ZERO
 ## Footprint lines: where the first one went (the cursor) and how many followed.
 var _line_pos0 := Vector2.ZERO
 var _line_k := 0
+## Undergrounds: the first piece not sent yet, an entrance waiting for its exit and where it is, and
+## how far along the line the drag has been (the cursor going back builds nothing).
+var _first_waits := false
+var _under_open := false
+var _under_from := Vector2i.ZERO
+var _under_along := 0
 ## Commands sent during this drag, for tests: [cmd, ...].
 var sent: Array = []
 
@@ -56,8 +68,18 @@ func begin(item: String, proto: ProtoDB.EntityProto, ground: Vector2, ghost: boo
 	_has_last = false
 	_gap_dir = -1
 	sent = []
+	_under_open = false
+	_under_along = 0
+	_first_waits = _under_reach() > 0
+	if _proto.type == "electric-pole":
+		# A pole two tiles wide is centred on a grid corner, up to a tile from the cursor's tile:
+		# the line and its wire reach are measured from where it really stands.
+		var size := _size_for(int(pi.build_dir))
+		_start = Vector2i(floori(pi._snap(ground.x, size.x)), floori(pi._snap(ground.y, size.y)))
+		_cur = _start
 	# The first one goes exactly where a click puts it (the mod snaps it to the grid).
-	_send_at(_item, ground, int(pi.build_dir))
+	if not _first_waits:
+		_send_at(_item, ground, int(pi.build_dir))
 	_last_built = _start
 	_last_dir = int(pi.build_dir)
 	_has_last = true
@@ -67,6 +89,9 @@ func begin(item: String, proto: ProtoDB.EntityProto, ground: Vector2, ghost: boo
 
 
 func end() -> void:
+	if _active and _first_waits:
+		_first_waits = false
+		_send_at(_item, _line_pos0, int(pi.build_dir))  # a plain click: as held
 	_active = false
 
 
@@ -117,6 +142,8 @@ func _along_line(tile: Vector2i) -> void:
 				_step_pipe(next, dir)
 			"electric-pole":
 				_step_pole(next)
+			"underground-belt", "pipe-to-ground":
+				_step_under(next, dir)
 			_:
 				_step_footprint(next, dir)
 		_cur = next
@@ -186,20 +213,107 @@ func _step_pole(next: Vector2i) -> void:
 	if wire <= 0.0:
 		_step_footprint(next, int(pi.build_dir))
 		return
+	var dir := int(pi.build_dir)
+	var size := _size_for(dir)
+	if _is_pole(_aim(next, size)):
+		_line_last = next  # the wire goes on from a pole already standing on the line
+		return
 	if Vector2(next - _line_last).length() > floorf(wire):
-		# Past the reach: the pole goes on the furthest free tile back towards the last one.
+		# Past the reach: the pole goes on the furthest free tile back towards the last one, not
+		# overlapping it.
+		var span := absi(_axis.x) * size.x + absi(_axis.y) * size.y
 		var back := next - _axis
-		while back != _line_last and _obstacle(back, int(pi.build_dir)):
+		while _along(back - _line_last) >= span and pi._blocked(_proto, _aim(back, size), size):
 			back -= _axis
-		if back != _line_last:
-			_place(back, int(pi.build_dir))
+		if _along(back - _line_last) >= span:
+			_place(back, dir)
 			_line_last = back
 
 
-func _step_footprint(next: Vector2i, dir: int) -> void:
+## Undergrounds, one tile of the drag at a time (see the top of this file).
+func _step_under(next: Vector2i, dir: int) -> void:
+	var reach := _under_reach()
+	if reach <= 0:
+		_step_footprint(next, dir)
+		return
+	if _first_waits:
+		_first_waits = false
+		_entrance(_start, dir)
+	var along := _along(next - _start)
+	if along <= _under_along:
+		return
+	_under_along = along
+	if not _under_open:
+		if not _under_in_way(next):
+			_entrance(next, dir)
+		return
+	if _along(next - _under_from) < reach:
+		return
+	var exit := next
+	while exit != _under_from and _under_in_way(exit):
+		exit -= _axis
+	_under_open = false  # nowhere for an exit: the entrance stays alone and the line starts again
+	if exit != _under_from:
+		# The mod makes the second of a pair the exit; a pipe-to-ground's direction is its
+		# above-ground connection, forward at the exit (see _continue_gap).
+		_send(_item, exit, dir)
+		_last_built = exit
+		_last_dir = dir
+
+
+func _entrance(tile: Vector2i, dir: int) -> void:
+	if _proto.type == "underground-belt":
+		pi.build_dir = dir
+		_send(_item, tile, dir)
+	else:
+		_send(_item, tile, posmod(dir + 8, 16))  # connected back along the line
+	_under_open = true
+	_under_from = tile
+	_last_built = tile
+	_last_dir = dir
+
+
+func _under_reach() -> int:
+	if not UNDERGROUND_TYPES.has(_proto.type):
+		return 0
+	return int(pi.hud.ui.model.eprops.get(_proto.id, {}).get("under", 0.0))
+
+
+## In the way of an underground piece: what player_input's build check calls blocked, but for the
+## belt or pipe it would fast-replace.
+func _under_in_way(tile: Vector2i) -> bool:
+	var at := _aim(tile, Vector2i.ONE)
+	if not pi._blocked(_proto, at, Vector2i.ONE):
+		return false
+	var r: WorldMirror.Rec = pi.world.pick(at)
+	if r == null:
+		return true
+	var p: ProtoDB.EntityProto = pi.world.protos.entity(r.proto_id)
+	return p == null or p.type != ("transport-belt" if _proto.type == "underground-belt" else "pipe")
+
+
+func _is_pole(at: Vector2) -> bool:
+	var r: WorldMirror.Rec = pi.world.pick(at)
+	if r == null or r.extra.has("gh"):
+		return false
+	var p: ProtoDB.EntityProto = pi.world.protos.entity(r.proto_id)
+	return p != null and p.type == "electric-pole"
+
+
+## How many tiles along the line's axis `v` reaches.
+func _along(v: Vector2i) -> int:
+	return v.x * _axis.x + v.y * _axis.y
+
+
+func _size_for(dir: int) -> Vector2i:
 	var size: Vector2i = _proto.tile_size
 	if dir == 4 or dir == 12:
 		size = Vector2i(size.y, size.x)
+	return size
+
+
+func _step_footprint(next: Vector2i, dir: int) -> void:
+	var size := _size_for(dir)
 	var span := absi(_axis.x) * size.x + absi(_axis.y) * size.y
 	var along := (next - _start).x * _axis.x + (next - _start).y * _axis.y
 	while (_line_k + 1) * span <= along:
@@ -239,23 +353,24 @@ func _obstacle(tile: Vector2i, dir: int) -> bool:
 
 
 func _place(tile: Vector2i, dir: int) -> void:
-	var size: Vector2i = _proto.tile_size
-	if dir == 4 or dir == 12:
-		size = Vector2i(size.y, size.x)
-	_send(_item, tile, dir, size)
+	_send(_item, tile, dir, _size_for(dir))
 	_last_built = tile
 	_last_dir = dir
 	_has_last = true
 
 
 func _send(item: String, tile: Vector2i, dir: int, size := Vector2i.ONE) -> void:
-	# The mod snaps to the grid: aim at the footprint's centre.
+	_send_at(item, _aim(tile, size), dir)
+
+
+## The mod snaps to the grid: aim at the footprint's centre.
+static func _aim(tile: Vector2i, size: Vector2i) -> Vector2:
 	var at := Vector2(tile) + Vector2(0.5, 0.5)
 	if size.x % 2 == 0:
 		at.x = float(tile.x)
 	if size.y % 2 == 0:
 		at.y = float(tile.y)
-	_send_at(item, at, dir)
+	return at
 
 
 func _send_at(item: String, at: Vector2, dir: int) -> void:

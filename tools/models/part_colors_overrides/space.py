@@ -83,10 +83,11 @@ OVERRIDES = {
     },
     # Fulgora's blue paint over dark steel and copper-brown pipework.
     "electromagnetic-plant": {
-        "colors": {"paint_fulgora_blue": "#44557a", "copper_coil": "#885639", "paint_fulgora_cream": "#cfc6c0",
-                   "rust_brown": "#6a3d2c", "brass": "#7a6846", "wire_yellow": "#c8a032"},
+        "colors": {"paint_fulgora_blue": "#3b4a68", "copper_coil": "#885639", "paint_fulgora_cream": "#b7aea8",
+                   "paint_fulgora_olive": "#555640", "paint_fulgora_screen": "#5f8092",
+                   "rust_brown": "#5f3626", "brass": "#5c4b33", "wire_yellow": "#c8a032"},
         # The detailed housings show more lit faces than the sprite's shaded ones: a little darker.
-        "exposure": 0.85,
+        "exposure": 0.8,
     },
     # A steel-blue ring and column (the sampler took the ring's grey shadows), olive domed tanks,
     # bone-white tanks.

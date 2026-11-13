@@ -24,19 +24,25 @@ void vertex() {
 	VERTEX = ground_lift(VERTEX, MODEL_MATRIX);
 }
 
+global uniform float f3d_look_model_fill;  // looks.gd "model_fill", as factorio_material's
+
 void fragment() {
-	vec3 col = COLOR.rgb * COLOR.rgb;
-	float packed = floor(COLOR.a * 255.0 + 0.5);
+	vec3 col = clamp(COLOR.rgb, 0.0, 1.0);
+	col *= col;
+	float packed = floor(clamp(COLOR.a, 0.0, 1.0) * 255.0 + 0.5);
 	float pc = mod(packed, 16.0) / 15.0;
 	float metal = floor(packed / 16.0) / 15.0;
 	float ground = 1.0 - smoothstep(0.0, ground_grime_height, world_y);
 	col = mix(col, grime_color, ground_grime * ground);
 	// Flat shading from the faces themselves: the merged meshes carry no normals (clustered
 	// vertices are shared by faces turned every way), and Factorio's buildings are boxy.
-	vec3 n = normalize(cross(dFdx(VERTEX), dFdy(VERTEX)));
+	// At an MSAA edge, or on a face clustering collapsed, the slopes can be parallel or zero: no normal from them.
+	vec3 face = cross(dFdx(VERTEX), dFdy(VERTEX));
+	vec3 n = dot(face, face) > 1e-20 ? normalize(face) : vec3(0.0, 0.0, 1.0);
 	NORMAL = dot(n, VERTEX) > 0.0 ? -n : n;
 	float up = clamp((INV_VIEW_MATRIX * vec4(NORMAL, 0.0)).y, 0.0, 1.0);
 	ALBEDO = col * mix(1.0, mix(part_light.x, part_light.y, up), pc);
+	EMISSION = ALBEDO * f3d_look_model_fill * (0.35 + 0.65 * max(dot(NORMAL, VIEW), 0.0));
 	ROUGHNESS = mix(0.65, 0.85, pc);
 	METALLIC = metal;
 	SPECULAR = mix(0.5, 0.2, pc);

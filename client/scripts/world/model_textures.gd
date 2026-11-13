@@ -1,5 +1,5 @@
 extends RefCounted
-## Textures a model brings in its .glb (base colour, and metallic-roughness), made ready for the
+## Textures a model brings in its .glb (base colour, metallic-roughness, occlusion), made ready for the
 ## model shader on the worker thread that reads the model (model_library.gd Load): Godot's glTF
 ## reader makes them without mipmaps, which shimmer on a model a few tiles away, so each picture is
 ## decoded again from the file's own bytes, mipmapped and put back on its material. A small copy
@@ -28,7 +28,8 @@ static func prepare(path: String, state: GLTFState) -> void:
 	var wanted := false
 	for m in materials:
 		var base := m as BaseMaterial3D
-		if base != null and (base.albedo_texture != null or base.roughness_texture != null):
+		if base != null and (base.albedo_texture != null or base.roughness_texture != null
+				or base.emission_texture != null or base.normal_texture != null or base.ao_texture != null):
 			wanted = true
 	if not wanted:
 		return
@@ -39,7 +40,8 @@ static func prepare(path: String, state: GLTFState) -> void:
 		var base := m as BaseMaterial3D
 		if base == null:
 			continue
-		for param in [BaseMaterial3D.TEXTURE_ALBEDO, BaseMaterial3D.TEXTURE_ROUGHNESS, BaseMaterial3D.TEXTURE_METALLIC]:
+		for param in [BaseMaterial3D.TEXTURE_ALBEDO, BaseMaterial3D.TEXTURE_ROUGHNESS, BaseMaterial3D.TEXTURE_METALLIC,
+				BaseMaterial3D.TEXTURE_EMISSION, BaseMaterial3D.TEXTURE_NORMAL, BaseMaterial3D.TEXTURE_AMBIENT_OCCLUSION]:
 			var tex := base.get_texture(param)
 			if tex == null:
 				continue
