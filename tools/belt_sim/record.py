@@ -40,8 +40,11 @@ REMOTE = r"""
 if remote.interfaces["f3d_rec"] then remote.remove_interface("f3d_rec") end
 remote.add_interface("f3d_rec", {bi_last = function()
   local s = storage.f3d
-  local j = s and s.rate_jobs and s.rate_jobs.bi
-  return j and j.last or -1
+  local jobs = s and s.rate_jobs
+  if not jobs then return -1 end
+  -- (own_rate, on by default: the `bs` stream runs as its own job, "bs", not "bi")
+  local a, b = jobs.bi, jobs.bs
+  return math.max(a and a.last or -1, b and b.last or -1)
 end})
 rcon.print("f3d_rec added")
 """

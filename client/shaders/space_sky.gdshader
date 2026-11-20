@@ -21,7 +21,7 @@ uniform float planet_radius = 0.2;
 // Fades it out at the far end of its way, instead of it popping out of the sky.
 uniform float planet_alpha = 1.0;
 // Factorio's own picture of the planet (its star map sprite, from the player's install), drawn
-// over the disc; without one, the procedural sphere below.
+// over the disc; without one, the procedural sphere below (owner's #15).
 uniform sampler2D planet_tex : source_color, filter_linear_mipmap;
 uniform float planet_tex_on = 0.0;
 // Factorio's own maps of the planet's whole surface (space-age/graphics/space/<planet>*.png, 2048 x

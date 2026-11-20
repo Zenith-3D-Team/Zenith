@@ -12,9 +12,13 @@ extends RefCounted
 ##
 ## In a game whose bridge sent its graphics list (mod_graphics.gd) the list comes first: it has every
 ## prototype's icon, a mod's too, read from the mod's own files (mod_files.gd).
+##
+## Above both, model packs' icons (model_packs.gd icon_file(): a pack's icons/<name>.png), by the
+## packs' order and choices; the caches are dropped when those change (ModelPacks.icons_version).
 
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
 
 const MODS := ["base", "space-age", "quality", "elevated-rails", "recycler"]
 const INDEX := "res://data/icons.json"
@@ -42,7 +46,9 @@ static var _textures := {}  # name -> Texture2D, or null when there is no icon
 static var _kinds := {}  # "kind:name" -> Texture2D or null, for fluids, signals and recipes
 static var _index := {}  # kind -> name -> layers (icons.json)
 static var _generation := -1  # ModGraphics.generation the caches were made with
+static var _packs_version := -1  # ModelPacks.icons_version the caches were made with
 static var _retired: Array = []  # the caches before the last list, still referenced by drawings
+static var _any := {}  # name -> true: load_any_uncached()'s icons for it are in the caches (store_any)
 
 
 static func configure_from_command_line() -> void:
@@ -77,6 +83,15 @@ static func is_cached(item: String) -> bool:
 ## prepare_for_threads() has run on the main thread (a tinted icon is composed pixel by pixel,
 ## which takes up to tens of milliseconds). store() then puts it in the cache.
 static func load_uncached(item: String) -> Texture2D:
+	var texture := pack_texture("item", item)
+	if texture != null:
+		return texture
+	return install_texture(item)
+
+
+## An item's icon as Factorio has it (the graphics list, icons.json, the install's files), past the
+## packs' icons and the cache (the Model packs window's comparison).
+static func install_texture(item: String) -> Texture2D:
 	var texture: Texture2D = null
 	var layers = layers_of("item", item)
 	if layers is Array:
@@ -100,13 +115,51 @@ static func layers_of(kind: String, name: String):
 
 ## A new graphics list arrived: icons made before may be wrong or missing, so they are made again.
 static func _follow_list() -> void:
-	if _generation != ModGraphics.generation:
+	if _generation != ModGraphics.generation or _packs_version != ModelPacks.icons_version:
 		_generation = ModGraphics.generation
+		_packs_version = ModelPacks.icons_version
 		# Kept alive: a control that drew one holds only its RID, and a freed texture draws white
 		# until the control redraws (factorio_ui.gd redraws every control on a new list).
 		_retired = [_textures, _kinds]
 		_textures = {}
 		_kinds = {}
+		_any = {}
+
+
+## Kit.item_icon()'s files for `name` read past the caches, for a worker thread once
+## prepare_for_threads() has run: the item's icon, else a fluid's, signal's or recipe's of that name
+## (GuiAssets.other_icon's order), else the entity's (a tree, a rock). [item icon, {"kind:name": icon}];
+## store_any() puts them in the caches, after which Kit.item_icon(name) answers without reading or
+## composing a file (a tinted icon composed pixel by pixel took the hover panel 13-15 ms).
+static func load_any_uncached(name: String) -> Array:
+	var item := load_uncached(name)
+	var kinds := {}
+	if item == null:
+		for kind in ["fluid", "virtual-signal", "recipe", "entity"]:
+			var t := pack_texture(kind, name)
+			if t == null:
+				t = install_kind_texture(kind, name)
+			kinds[kind + ":" + name] = t
+			if t != null:
+				break
+	return [item, kinds]
+
+
+## Puts what load_any_uncached(name) read in the caches, keeping any icon already there.
+static func store_any(name: String, loaded: Array) -> void:
+	_follow_list()
+	store(name, loaded[0])
+	var kinds: Dictionary = loaded[1]
+	for k: String in kinds:
+		if not _kinds.has(k):
+			_kinds[k] = kinds[k]
+	_any[name] = true
+
+
+## Whether Kit.item_icon(name) answers from the caches (no file read or composed).
+static func any_ready(name: String) -> bool:
+	_follow_list()
+	return name == "" or _any.has(name) or _textures.get(name) != null
 
 
 ## Finds the install and reads the index, so load_uncached() on a worker only reads them.
@@ -114,6 +167,7 @@ static func prepare_for_threads() -> void:
 	factorio_data_dir()
 	index()
 	ModFiles.prepare()
+	ModelPacks.active()  # configured on the main thread before workers ask for packs' icons
 	_follow_list()
 
 
@@ -143,13 +197,33 @@ static func texture_for_kind(kind: String, name: String) -> Texture2D:
 	var key := kind + ":" + name
 	if _kinds.has(key):
 		return _kinds[key]
-	var texture: Texture2D = null
+	var texture := pack_texture(kind, name)
+	if texture == null:
+		texture = install_kind_texture(kind, name)
+	_kinds[key] = texture
+	return texture
+
+
+## A kind's icon as Factorio has it, past the packs' icons and the cache.
+static func install_kind_texture(kind: String, name: String) -> Texture2D:
 	var layers = layers_of(kind, name)
 	factorio_data_dir()
 	if layers is Array:
-		texture = _compose(layers, COMPOSED_TECH if kind == "technology" else COMPOSED)
-	_kinds[key] = texture
-	return texture
+		return _compose(layers, COMPOSED_TECH if kind == "technology" else COMPOSED)
+	return null
+
+
+## A model pack's icon for `name` of `kind` (model_packs.gd icon_file()), mipmapped, uncached; null
+## when no pack in use has one. Safe on a worker.
+static func pack_texture(kind: String, name: String) -> Texture2D:
+	var path := ModelPacks.icon_file(kind, name)
+	if path == "":
+		return null
+	var image := ModelPacks.icon_image(path)
+	if image == null:
+		return null
+	image.generate_mipmaps()
+	return ImageTexture.create_from_image(image)
 
 
 ## The prototypes' icons (tools/icon_index.py): {kind: {name: [[file, icon_size, tint, scale,

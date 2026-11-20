@@ -121,6 +121,17 @@ check(msgs and msgs[0]["t"] == "welcome", "welcome first")
 protos = {rec[1]: rec[0] for m in of_type(msgs, "protos") for rec in m["l"]}
 check("transport-belt" in protos and "tree-01" in protos, "prototype dictionary sent")
 check(of_type(msgs, "ready") and of_type(msgs, "recipes"), "ready and recipes sent")
+# Step 5 task 3a: the mock sends vanilla's steps' sounds after eprops, as the bridge does (validated with the rest).
+steps_m = of_type(msgs, "steps")
+kinds_m = [m["t"] for m in msgs]
+tids = {rec[1]: rec[0] for m in of_type(msgs, "tprotos") for rec in m["l"]}
+st_tiles = {r[0]: r[1] for m in steps_m for r in m.get("tl", [])}
+st_s = [e for m in steps_m for e in m.get("s", [])]
+check(len(steps_m) == 1 and kinds_m.index("steps") > kinds_m.index("eprops")
+      and st_s[st_tiles[tids["dirt-1"]] - 1] == ["base/sound/walking/sand", 80, 9] and st_tiles[tids["lava"]] == 0
+      and st_s[steps_m[0]["u"][0] - 1][0] == "core/sound/walking/transport-belt"
+      and any(st_s[i - 1][0] == "base/sound/walking/plant/plant" for _, i in (r for r in steps_m[0]["dl"])),
+      "the mock sends vanilla's steps' sounds after eprops: dirt-1 is sand, lava silent, the belts' metal, plants' rustle")
 items = {rec[0]: rec[1] for m in of_type(msgs, "iprotos") for rec in m["l"]}
 check("iron-plate" in items.values(), "item dictionary sent")
 check(any(rec[1:] == ["rail", "straight-rail"] for m in of_type(msgs, "iprotos") for rec in m["l"]),
@@ -350,6 +361,12 @@ check(ground(msgs) == [], f"pickup takes every item in reach: {len(ground(msgs))
 check(of_type(msgs, "inv") and dict(map(tuple, of_type(msgs, "inv")[-1]["l"])).get("coal") == coal + 3,
       "picked-up items are in the inventory")
 check(game.player["pickup"] is None, "pickup stops when the client stops repeating it")
+send({"t": "pickup"})
+step(1)
+check(game.player["pickup"] is not None, "pickup held")
+send({"t": "pickup_stop"})
+step(1)
+check(game.player["pickup"] is None, "pickup_stop ends the pickup at once")
 game.player["x"], game.player["y"] = -3.0, 0.5
 msgs = []
 
@@ -365,7 +382,7 @@ check(end["x"] - start["x"] > 256 * 5 and abs(end["y"] - start["y"]) < 10, "walk
 send({"t": "walk", "d": -1})
 step(2)
 take()
-# Walking at 20 degrees (0.055 turns) follows that line, and me says the angle
+# B7: walking at 20 degrees (0.055 turns) follows that line, and me says the angle
 x0, y0 = game.player["x"], game.player["y"]
 for _ in range(10):
     send({"t": "walk", "d": 2, "a": 55})
@@ -531,7 +548,7 @@ send({"t": "take", "u": lab[0], "item": "automation-science-pack", "n": 1})
 step(31)
 msgs = take()
 check(screens(msgs, lab) and any(m["text"] == "Out of reach" for m in of_type(msgs, "msg")),
-      "from the remote view (rv) the lab opens out of reach, for settings only")
+      "from the remote view (rv) the lab opens out of reach, for settings only (D10)")
 send({"t": "close"})
 game.player["x"], game.player["y"] = 14.0, 4.0
 send(open_cmd(lab))
@@ -653,8 +670,13 @@ car = next(m for m in game.movers if m["kind"] == "parked")
 game.player["x"], game.player["y"] = car["x"], car["y"] - 2.0
 send({"t": "enter"})
 step(4)
-me = of_type(take(), "me")[-1]
+entered = take()
+me = of_type(entered, "me")[-1]
 check(me.get("v") == car["unit"] and me.get("vs") == 0, f"enter gets into the parked car: {me}")
+step(11)
+vg = of_type(entered + take(), "guns")
+check(vg and vg[-1].get("v") == car["unit"] and vg[-1]["l"][0][0] == "vehicle-machine-gun",
+      f"guns in the car are the car's machine gun (N3): {vg[-1:]}")
 start_x = me["x"]
 for _ in range(8):
     send({"t": "drive", "a": 1, "s": 0})
@@ -678,8 +700,12 @@ check(me["vs"] == 0, f"braking stops the car: vs {me['vs']}")
 send({"t": "drive", "a": 0, "s": 0})
 send({"t": "enter"})
 step(4)
-me = of_type(take(), "me")[-1]
+left = take()
+me = of_type(left, "me")[-1]
 check("v" not in me and abs(me["x"] / 256 - (car["x"] + 2.0)) < 0.01, f"enter again gets out, next to the car: {me}")
+step(11)
+vg = of_type(left + take(), "guns")
+check(vg and "v" not in vg[-1] and vg[-1]["l"][0][0] == "pistol", f"out of the car the character's guns come back: {vg[-1:]}")
 game.player["x"], game.player["y"] = -3.0, 0.5
 send({"t": "enter"})
 step(2)
@@ -754,6 +780,15 @@ techs = {r[0]: r[6] for m in of_type(msgs, "techs") for r in m["l"]}
 check(techs.get("logistics") == 2 and techs.get("logistics-2") == 0 and of_type(msgs, "rs")[-1]["cur"] == "",
       f"finished research resends the tree: {techs}")
 check([m["l"] for m in of_type(msgs, "rdone")] == [[["logistics", 0]]], f"and says so once (rdone), naming the technology: {of_type(msgs, 'rdone')}")
+# L12: a technology whose prerequisites aren't researched or queued gets them queued first, in order (as
+# research.lua): Fluid handling needs Automation 2 and Engine, and through them Electronics and Logistic science.
+game.researched.add("steel-processing")
+send({"t": "research", "name": "fluid-handling"})
+step(2)
+rs = of_type(take(), "rs")
+check(rs and rs[-1]["cur"] == "electronics" and rs[-1]["q"] == ["logistic-science-pack", "automation-2", "engine", "fluid-handling"],
+      f"research of a locked technology queues its missing prerequisites first: {rs[-1:]}")
+game.research, game.research_queue, game.research_progress = None, [], 0
 # An infinite technology names the level it finished and goes on to the next (K23).
 send({"t": "research", "name": "mining-productivity-3"})
 step(605)
@@ -949,7 +984,7 @@ check(any(r[0] == "e" and r[3] == 2.5 for r in ov), f"charts carry the map view'
 send({"t": "unghost", "q": 3, "x": 300 * 256, "y": 300 * 256})
 step(1)
 check([(m["q"], m["n"]) for m in of_type(take(), "unghost")] == [(3, 0)], "unghost with no ghost there answers n = 0")
-# The hover panel's beacon effects (`hinfo`), with --beacon's beacon by the starter assemblers.
+# G12: the hover panel's beacon effects (`hinfo`), with --beacon's beacon by the starter assemblers.
 hb = game.add(mock_server.Entity(game._unit(), "beacon", 8.5, -6.5))
 send({"t": "hinfo", "q": 6, "u": hb.unit, "p": 0, "x": 0, "y": 0})
 send({"t": "hinfo", "q": 7, "u": find_ent("assembling-machine-1", 8.5, -2.5)[0], "p": 0, "x": 0, "y": 0})
@@ -1076,6 +1111,12 @@ for m in mv2:
         seen2.add(r[0])
 seen1 = {r[0] for m in of_type(msgs1, "mv") for r in m["l"]}  # take() already decoded the first client's
 check(game.player["unit"] in seen2 and w2[0]["u"] in seen1, f"each sees the other's character as a mover")
+# The add-on link (`ext`, mock_link.py): `who` from the second client answers it alone, with its character.
+client2.sendto(json.dumps({"t": "ext", "ch": "zenith-link-test", "d": {"who": 1}}).encode(), server)
+step(2)
+who2, who1 = of_type(take2(), "ext"), of_type(take(), "ext")
+check(who2 and who2[-1]["d"]["unit"] == w2[0]["u"] and who2[-1]["d"]["client"] == client2.getsockname()[1] and not who1,
+      f"link: the second client's `who` names its own client and character, answered to it alone: {who2} {who1}")
 client2.sendto(json.dumps({"t": "bye"}).encode(), server)
 step(2)
 check(not game.extras, "bye drops the second client only")
@@ -1093,7 +1134,7 @@ tr = of_type(msgs, "tr")
 check(tr and tr[-1]["l"] and tr[-1]["l"][0][6] == [700, 701, 702] and tr[-1]["l"][0][5] in ("East", "West"),
       f"tr: the train near the focus, its carriages and where it is heading: {tr[-1:]}")
 # The 3D remote view far from the character: the train runs through the starter roboport's
-# construction area, which counts as seen; with the roboport away no radar sees it.
+# construction area, which counts as seen (H13); with the roboport away no radar sees it.
 game.player["x"] -= 300
 send({"t": "focus", "x": int(loco.x * 256), "y": int(loco.y * 256), "r": 48, "rv": 1})
 step(62)
@@ -1227,7 +1268,7 @@ fl = of_type(msgs, "fl")[-1]["l"] if of_type(msgs, "fl") else []
 boxes = [fl[i:i + 6] for i in range(0, len(fl), 6)]
 check(any(b[2] == fids["steam"] and b[5] == 165 for b in boxes) and any(b[2] == fids["water"] for b in boxes),
       f"fl: water in the pipes and boiler, steam at 165 degrees: {boxes[:3]}")
-pipes = [r for r in ents if r[1] == protos["pipe"]]
+pipes = [r for r in ents if r[1] == protos["pipe"] and r[2] == int(-10.5 * 256)]  # the boiler's (not N9's overextended line)
 check(sorted(r[5].get("pc") for r in pipes) == [4, 5, 5, 5], f"pipes say which sides connect (north and south, the open end only south): {[r[5] for r in pipes]}")
 ht = of_type(msgs, "ht")[-1]["l"] if of_type(msgs, "ht") else []
 check(len(ht) == 8 and ht[1] == 600, f"ht: heat pipe temperatures: {ht}")
@@ -1306,7 +1347,7 @@ send({"t": "plat_board", "i": 0})
 step(2)
 surf = of_type(take(), "surface")
 check(surf and surf[0].get("planet") == "nauvis" and game.surface == "nauvis", f"plat_board 0 drops back to the planet: {surf}")
-# Riding up and life in the hub, then down by cargo pod, on the mock's short timeline.
+# Riding up (#10) and life in the hub (#17), then down by cargo pod, on the mock's short timeline.
 send({"t": "ride", "u": 0, "to": 1})
 step(4)
 msgs = take()
@@ -1729,7 +1770,7 @@ check(not of_type(take(), "ac"), "altc off: no more `ac`")
 game.build_alt_icons()
 send({"t": "sub", "c": [[0, -1], [0, 0]]})
 send({"t": "focus", "x": int(14.5 * 256), "y": int(-12.5 * 256), "r": 32})
-send({"t": "altc", "on": 1, "g": 3})
+send({"t": "altc", "on": 1, "g": 3, "lf": 1})  # lf: the locomotives too (--loco-fuel-icons=on)
 step(61)
 am_rows = {r[0]: r for m in of_type(take(), "am") if m["g"] == 3 for r in m["l"]}
 am_by_name = {game.entities[u].name: r[1:] for u, r in am_rows.items() if u in game.entities and game.entities[u].y == -12.5}
@@ -1737,10 +1778,38 @@ check(am_by_name.get("assembling-machine-3") == [["speed-module", "speed-module"
       and am_by_name.get("lab") == [["speed-module", "productivity-module"], mock_machines.LAB_INPUTS]
       and am_by_name.get("electric-mining-drill") == [["speed-module"] * 3] and am_by_name.get("beacon") == [["speed-module"] * 2],
       f"altc: --alt-icons' modules and the lab's packs in `am` (K1, K2): {am_by_name}")
+# K1's leftover: its gun turrets' ammo (none for the empty one), and the train's locomotive's fuel once the focus
+# is on it.
+am_turrets = sorted(r[1:] for u, r in am_rows.items() if u in game.entities and game.entities[u].name == "gun-turret" and game.entities[u].y == -12.0)
+check(am_turrets == [[0, ["firearm-magazine"]], [0, ["piercing-rounds-magazine"]]],
+      f"altc: --alt-icons' gun turrets' ammo in `am`, not the empty one (K1): {am_turrets}")
+wet_drills = [e for e in game.entities.values() if e.name == "electric-mining-drill" and e.extra.get("fa") == 1]
+check(len(wet_drills) == 1 and wet_drills[0].y == -16.5,
+      f"--alt-icons: a drill taking fluid in (fa 1, the client's -wet model), as the bridge sends one over uranium ore: {len(wet_drills)}")
+loco = game.mover_entity(mock_server.TRAIN_UNITS[0])
+send({"t": "sub", "c": [[math.floor(loco.x / 32) + dx, math.floor(loco.y / 32) + dy] for dx in (-1, 0, 1) for dy in (-1, 0, 1)]})
+send({"t": "focus", "x": int(loco.x * 256), "y": int(loco.y * 256), "r": 32})
+step(61)
+am_loco = [r for m in of_type(take(), "am") if m["g"] == 3 for r in m["l"] if r[0] == loco.unit]
+check(am_loco == [[loco.unit, 0, ["coal"]]], f"altc: the locomotive's fuel in `am` (K1): {am_loco}")
+wagon = game.mover_entity(mock_server.TRAIN_UNITS[1])
+take()
+send({"t": "altc", "on": 1, "g": 4})  # without lf: the cargo wagons' items still, no locomotive fuel
+step(61)
+am_now = [r for m in of_type(take(), "am") if m["g"] == 4 for r in m["l"]]
+check(wagon.name == "cargo-wagon" and [wagon.unit, 0, ["iron-plate"]] in am_now and not any(r[0] == loco.unit for r in am_now),
+      f"altc: a cargo wagon's items in `am` without `lf`, the locomotive's fuel only with it: {am_now}")
+send({"t": "sub", "c": [[0, -1], [0, 0]]})
+send({"t": "focus", "x": int(14.5 * 256), "y": int(-12.5 * 256), "r": 32})
 eprops_x = {r[0]: r[4] for r in mock_server.EPROPS if len(r) > 4}
 check(eprops_x.get(mock_server.EID["lab"], {}).get("isq", [[None]])[1][0] == "l"
-      and eprops_x.get(mock_server.EID["assembling-machine-3"], {}).get("ids") == [0, -0.3, 1],
-      "the mock's eprops say where Alt-mode puts them (isq, ids)")
+      and eprops_x.get(mock_server.EID["assembling-machine-3"], {}).get("ids") == [0, -0.3, 1]
+      and eprops_x.get(mock_server.EID["gun-turret"], {}).get("isq") == [["a", 0, -0.25, 0.5, 2, 1, 1.1, -0.1]]
+      and eprops_x.get(mock_server.EID["locomotive"], {}).get("isq") == [["f", 0, 0.3, 0.5, 3, 4, 1.1, -0.1]],
+      "the mock's eprops say where Alt-mode puts them (isq, ids), a gun turret's ammo and a locomotive's fuel too")
+tank_x = eprops_x.get(mock_server.EID["storage-tank"], {})
+check(len(tank_x.get("fj", [])) == 4 and "fb" not in tank_x,
+      f"N9: the mock's storage tank joins its pipeline (fj, four connections), no arrows (fb): {tank_x}")
 send({"t": "altc", "on": 0})
 step(61)
 check(not of_type(take(), "am"), "altc off: no more `am`")
@@ -1846,6 +1915,113 @@ slot_msgs = of_type(rmsgs + take(), "slots")
 worn = [s for s in (slot_msgs[-1]["l"]["main"] if slot_msgs else []) if s and s[0] == "repair-pack"]
 check(worn and len(worn[0]) == 5 and worn[0][2:4] == ["normal", -1] and 900 <= worn[0][4] < 1000,
       f"K13: the worn pack's slot carries its durability: {worn}")
+
+# The add-on link (`ext`, mock_link.py, as link.lua): the welcome says so, an echo comes back, a burst
+# stops at the cap, and what the bridge would drop is dropped. Every message through protocol.py.
+step(61)
+take()
+send({"t": "hello", "v": 1, "sid": "link", "w": 0, "z": 1, "b": 1})
+step(3)
+welcome = of_type(take(), "welcome")
+check(welcome and welcome[-1].get("ext") == 1 and "zenith-link-test" in welcome[-1].get("mods", {}),
+      f"link: the welcome says ext 1 and lists the fixture mod: {welcome[-1:] and (welcome[-1].get('ext'), welcome[-1].get('mods'))}")
+for problem in protocol.ext_problems({"t": "ext", "ch": "zenith-link-test/x", "d": {"echo": "hi"}}, "client"):
+    check(False, f"link: a good client ext refused: {problem}")
+for bad in ({"t": "ext", "ch": "bad channel", "d": 1}, {"t": "ext", "ch": "zenith-link-test"}, {"t": "ext", "ch": 5, "d": 1},
+            {"t": "ext", "ch": "zenith-link-test", "d": "x" * 4100}, {"t": "ext", "ch": "zenith-link-test", "d": 1, "k": 3}):
+    check(protocol.ext_problems(bad, "client"), f"link: protocol.py refuses a bad client ext: {str(bad)[:80]}")
+step(61)
+take()
+send({"t": "ext", "ch": "zenith-link-test", "d": {"echo": [1, "two"]}})
+step(2)
+echo = of_type(take(), "ext")
+check(echo and echo[-1]["ch"] == "zenith-link-test" and echo[-1]["d"] == {"echo": [1, "two"]}, f"link: an echo comes back: {echo}")
+for bad in ({"ch": "zenith-link-test"}, {"ch": "not-loaded", "d": {"echo": 1}}, {"ch": "bad channel", "d": {"echo": 1}},
+            {"ch": "zenith-link-test", "d": {"echo": "x" * 4100}}):
+    send({"t": "ext", **bad})
+step(2)
+check(not of_type(take(), "ext"), "link: no data, a mod not in the game, a bad channel and over 4 KB are dropped")
+step(61)
+take()
+send({"t": "ext", "ch": "zenith-link-test/b", "d": {"burst": 100}})
+step(2)
+burst = of_type(take(), "ext")
+check(len(burst) == 60 and burst[-1]["d"] == {"i": 60}, f"link: a burst of 100 stops at the cap of 60 per 60 ticks ({len(burst)})")
+step(61)
+take()
+for i in range(70):
+    send({"t": "ext", "ch": "zenith-link-test", "d": {"echo": i}})
+step(2)
+echoes = of_type(take(), "ext")
+check(len(echoes) == 60, f"link: 70 messages in, 60 answered (the cap in) ({len(echoes)})")
+# A companion's error (`err`, link.lua failed): sent back on its channel, the channel closed after 10 within a minute.
+check(not protocol.ext_problems({"t": "ext", "k": 1, "ch": "zenith-link-test", "err": "boom"}, "mod")
+      and protocol.ext_problems({"t": "ext", "k": 1, "ch": "zenith-link-test", "err": ""}, "mod")
+      and protocol.ext_problems({"t": "ext", "k": 1, "ch": "zenith-link-test", "err": "x", "d": 1}, "mod")
+      and protocol.ext_problems({"t": "ext", "ch": "zenith-link-test", "err": "x"}, "client")
+      and protocol.ext_problems({"t": "ext", "ch": "factorio-3d-bridge", "d": 1}, "client"),
+      "link: protocol.py takes the bridge's err and refuses an empty one, one with d, a client's, and the bridge's own channel")
+step(61)
+take()
+for i in range(10):
+    send({"t": "ext", "ch": "zenith-link-test/boom", "d": {"boom": 1}})
+    step(1)
+step(1)
+errs = [m for m in of_type(take(), "ext") if "err" in m]
+check(len(errs) == 11 and "boom" in errs[0]["err"] and "closed after repeated errors" in errs[-1]["err"],
+      f"link: a companion's errors come back as err, the 10th closes the channel ({len(errs)})")
+send({"t": "ext", "ch": "zenith-link-test/boom", "d": {"echo": 1}})
+send({"t": "ext", "ch": "zenith-link-test", "d": {"echo": 2}})
+step(2)
+after = of_type(take(), "ext")
+check([m.get("d") for m in after] == [{"echo": 2}], f"link: a closed channel is dropped, the others still answer: {after}")
+
+# Binary frames (docs/PROTOCOL.md, "Binary frames"): a client whose hello says bin gets every datagram as
+# frames, mv in binary, the rest as JSON text inside them, and a welcome that says bin.
+HELLO.update({"sid": "binary", "w": 0, "bin": protocol.WIRE_VERSION})
+send(HELLO)
+HELLO["w"] = 1
+send({"t": "sub", "c": [list(c) for c in wanted]})
+raw = []
+for _ in range(60):
+    step(1)
+    while True:
+        try:
+            raw.append(client.recvfrom(65536)[0])
+        except BlockingIOError:
+            break
+binary = [d for d in raw if d[:1] == bytes((protocol.WIRE_MAGIC,))]
+msgs = [m for d in raw for m in protocol.split_datagram(d)]
+for m in msgs:
+    for problem in protocol.problems(m):
+        check(False, f"binary: protocol: {problem}")
+check(raw and len(binary) == len(raw), f"bin: every datagram is binary frames ({len(binary)} of {len(raw)})")
+check([m.get("bin") for m in of_type(msgs, "welcome")] == [protocol.WIRE_VERSION], f"bin: the welcome says bin {protocol.WIRE_VERSION}")
+check(not HELLO.get("bs") or any(bytes((protocol.KIND_BS, 0)) in d for d in binary), "bin: bs arrives as kind-17 frames (wire version 2)")
+check(of_type(msgs, "mv") and all("z" not in m for m in of_type(msgs, "mv")),
+      "bin: mv arrives in binary, its records whole (no z)")
+check(any(bytes((protocol.KIND_MV, 0)) in d for d in binary), "bin: ... as kind-16 frames")
+# Wire version 3: chunk snapshots and their ents as reliable kind 19 and 20 frames, ih as kind 22.
+check(any(bytes((protocol.KIND_CHUNK, protocol.FLAG_RELIABLE)) in d for d in binary)
+      and any(bytes((protocol.KIND_ENTS, protocol.FLAG_RELIABLE)) in d for d in binary),
+      "bin: chunk and ents arrive as reliable kind-19 and kind-20 frames (wire version 3)")
+check(of_type(msgs, "chunk") and all("r" in m for m in of_type(msgs, "chunk") + of_type(msgs, "ents")),
+      "bin: ... and keep their r")
+check(any(len(e) > 5 for m in of_type(msgs, "ents") for e in m.get("e", [])), "bin: ents records keep their extras (the JSON tail)")
+check(not of_type(msgs, "ih") or any(bytes((protocol.KIND_IH, 0)) in d for d in binary), "bin: ih arrives as kind-22 frames")
+HELLO.pop("bin")
+send(HELLO)
+step(2)
+take()
+raw = []
+for _ in range(20):
+    step(1)
+    while True:
+        try:
+            raw.append(client.recvfrom(65536)[0])
+        except BlockingIOError:
+            break
+check(raw and not any(d[:1] == bytes((protocol.WIRE_MAGIC,)) for d in raw), "without bin again: JSON text")
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

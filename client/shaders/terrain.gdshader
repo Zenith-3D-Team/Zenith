@@ -29,6 +29,8 @@ uniform float ssao_on_sunlight = 0.85;
 // The look's share of the ground's specular (looks.gd "ground_specular"): the sky's reflection on
 // the ground is what washed its colours out, so the Factorio look leaves it out.
 global uniform float f3d_look_ground_specular;
+// The look's share of SSAO and the ground's crevices on its sunlight (looks.gd "ao_direct"; 1: ssao_on_sunlight).
+global uniform float f3d_look_ao_direct;
 uniform bool textured = false;
 uniform sampler2DArray tiles : source_color, filter_linear_mipmap_anisotropic, repeat_disable;
 // Per layer: first slot row, variant width and height in tiles, variant count.
@@ -51,6 +53,11 @@ uniform float ground_roughness = 1.0;
 uniform float floor_roughness = 0.8;
 uniform float ground_specular = 0.15;
 uniform float floor_specular = 0.3;
+// Each tile's own roughness and specular by family (terrain_textures.gd SURFACES, CUSTOM1.w); off
+// (--ground-rough=off) the two values above. surface_roughness_add shifts every tile's roughness (the
+// debug menu's Lighting slider "Ground roughness").
+uniform bool per_tile_surface = true;
+uniform float surface_roughness_add = 0.0;
 // The tile picture's brightness as height (tiles per unit of linear luminance): its stones and
 // clods tilt the normal. Floors get floor_relief of it (concrete's joints and pits, not rubble).
 uniform float relief_height = 0.03;
@@ -292,17 +299,25 @@ void fragment() {
 	} else if (top > 0.5) {
 		roughness = mix(ground_roughness, floor_roughness, is_floor);
 	}
+	float specular = mix(ground_specular, floor_specular, is_floor);
+	// The tile family's own (the wet shore keeps its own roughness above).
+	bool shore = textured && top > 0.5 && kind > 0;
+	if (per_tile_surface && masks.w > 0.5 && !shore) {
+		roughness = clamp(floor(masks.w) * 0.01 + surface_roughness_add, 0.0, 1.0);
+		specular = fract(masks.w);
+	}
 
 	ALBEDO = albedo;
 	ROUGHNESS = roughness;
-	SPECULAR = mix(ground_specular, floor_specular, is_floor) * f3d_look_ground_specular;
+	METALLIC = 0.0;
+	SPECULAR = specular * f3d_look_ground_specular;
 	// SSAO darkens the ground's sunlight too, not only the sky's light: Factorio paints the shade
 	// round a building's foot whatever the light. Without it Godot took a quarter of SSAO to direct
 	// light here (the environment's light affect times its AO channel affect, 0.5 x 0.5), and the
 	// ground round the buildings, nearly all lit by the sun, showed almost none. The picture's own
 	// crevices are the ground's occlusion (Godot takes the darker of it and SSAO).
 	AO = 1.0 - crevice * mix(1.0, 0.5, is_floor) * cavity;
-	AO_LIGHT_AFFECT = ssao_on_sunlight;
+	AO_LIGHT_AFFECT = ssao_on_sunlight * f3d_look_ao_direct;
 
 	if (top > 0.5) {
 		// Height = 0.06 * mid + 0.015 * fine; the gradient tilts the normal. Chain rule: the

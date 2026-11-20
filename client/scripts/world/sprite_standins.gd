@@ -7,6 +7,20 @@ extends RefCounted
 ## reads as Factorio's sprite over the building's footprint; the card casts the shadow. Each direction
 ## the list has gets its own card.
 ##
+## These cards are the Factorio pack's models (model_packs.gd FACTORIO_ID): drawn only while that pack
+## is in use, for entities no pack above it has a model of (ModelLibrary.draws_sprite) or none has at
+## all; with it off such an entity is Zenith's box. Without a game's list (the main menu, an old
+## bridge) Factorio's own and Space Age's entities take their layers from res://data/entity_pictures.json
+## (tools/entity_pictures_index.py: the bridge's own data-stage code run on Factorio's prototype data, file
+## names and numbers only), read from the install the same way; sprite_projection.json's one cut-out frame
+## (made to fit models to a sprite, not to draw it) only for an entity that list lacks.
+##
+## Every layer Factorio draws at rest is composed in its order (an integration patch under it, the picture's
+## layers, glow layers, what it always draws, a turret's folded head), each at its own shift and scale, at the
+## finest density any of them has (64 pixels a tile for the usual 0.5 pictures, 128 for 0.25), so no layer is
+## scaled down. Shadow layers aren't drawn: the card casts the world's shadow instead. The picture keeps its
+## own alpha, sRGB (sprite_card.gdshaderinc), mipmapped.
+##
 ## Animated buildings (Settings > Graphics > Animate modded buildings): the part of the picture that
 ## moves (the animated layers and what a machine adds while working) is drawn at MAX_FRAMES evenly
 ## spaced moments of Factorio's loop into an atlas, at half size when it would be big, and the card's
@@ -16,6 +30,7 @@ extends RefCounted
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
 
 const PX := 64.0  # pixels a tile in the composed picture (Factorio's high-resolution 0.5 scale)
 const FACTORIO_PITCH := 48.0  # camera_rig.gd's
@@ -23,6 +38,12 @@ const FACTORIO_PITCH := 48.0  # camera_rig.gd's
 const MAX_PX := 2048
 const DIR_KEYS := ["n", "e", "s", "w"]
 const CARD_SHADER := preload("res://shaders/sprite_card.gdshader")
+## The preview's: unshaded, blended by the picture's alpha (unlit_material).
+const CARD_UNLIT_SHADER := preload("res://shaders/sprite_card_unlit.gdshader")
+## Factorio's entities' layers offline (tools/entity_pictures_index.py).
+const PICTURES_DATA := "res://data/entity_pictures.json"
+## The finest density composed (pixels a tile): a scale 0.25 layer's.
+const MAX_DENSITY := 128.0
 const GHOST_SHADER := preload("res://shaders/ghost_card.gdshader")
 ## Frames kept of an animation (evenly spaced over Factorio's loop, which keeps its speed).
 const MAX_FRAMES := 16
@@ -49,19 +70,23 @@ static var _mutex := Mutex.new()
 static var _list_generation := -1
 
 
-## Whether a graphics list is in use: chunk_view.gd then draws no boxes or cones, only pictures.
+## Whether a graphics list is in use with the Factorio pack on: chunk_view.gd then draws no boxes or
+## cones, only pictures.
 static func in_use() -> bool:
-	return ModGraphics.fingerprint != ""
+	return ModGraphics.fingerprint != "" and ModelPacks.factorio_on()
 
 
-## The card for an entity facing a 16-way direction, or null: no picture, still being made
-## (coming() says which), or its picture couldn't be read. An entity the list has no picture for
-## shows its icon instead, standing on its footprint (`size`, in tiles).
-static func card(name: String, direction: int, size := Vector2.ONE, type := "") -> Mesh:
+## The card for an entity facing a 16-way direction, or null: the Factorio pack off (not with
+## `force`, the Model packs window's preview), no picture, still being made (coming() says which), or
+## its picture couldn't be read. An entity the list has no picture for shows its icon instead,
+## standing on its footprint (`size`, in tiles).
+static func card(name: String, direction: int, size := Vector2.ONE, type := "", force := false) -> Mesh:
 	_follow_list()
-	var rec = ModGraphics.ents.get(name)
+	if not force and not ModelPacks.factorio_on():
+		return null
+	var rec = _rec(name)
 	if not rec is Dictionary:
-		return _icon_card(name, size) if in_use() else null
+		return _icon_card(name, size) if in_use() or (force and ModGraphics.fingerprint != "") else null
 	var dir_key := _dir_key(rec, direction)
 	var key := name + "|" + dir_key
 	if _cards.has(key):
@@ -81,8 +106,187 @@ static func card(name: String, direction: int, size := Vector2.ONE, type := "") 
 
 ## Whether a card for it is being made (the chunk waits for it rather than drawing a box first).
 static func coming(name: String, direction: int) -> bool:
-	var rec = ModGraphics.ents.get(name)
+	var rec = _rec(name)
 	return rec is Dictionary and _jobs.has(name + "|" + _dir_key(rec, direction))
+
+
+## The picture's record for an entity: the graphics list's, else entity_pictures.json's, else one made
+## from sprite_projection.json's frames (each with an install), else null.
+static func _rec(name: String):
+	var rec = ModGraphics.ents.get(name)
+	if rec is Dictionary:
+		return rec
+	rec = _index_rec(name)
+	if rec is Dictionary:
+		return rec
+	return _projection_rec(name)
+
+
+static var _index = null
+
+
+## entity_pictures.json's record for an entity (the list's form), or null: none, or no install.
+static func _index_rec(name: String):
+	if ItemIcons.factorio_data_dir() == "":
+		return null
+	if _index == null:
+		_index = {}
+		if FileAccess.file_exists(PICTURES_DATA):
+			var parsed = JSON.parse_string(FileAccess.get_file_as_string(PICTURES_DATA))
+			if parsed is Dictionary:
+				_index = parsed
+	return (_index as Dictionary).get(name)
+
+
+## The density a picture's layers are composed at (pixels a tile): the finest any of them has (32 / its
+## scale), at least PX, at most MAX_DENSITY.
+static func density(layers: Array) -> float:
+	var px := PX
+	for layer in layers:
+		if layer is Array and (layer as Array).size() > 5 and float(layer[5]) > 0.0:
+			px = maxf(px, 32.0 / float(layer[5]))
+	return minf(px, MAX_DENSITY)
+
+
+## (The preview) The unshaded, blended twin of a card's material (its picture and frames), made once per
+## material; null for a material that isn't a card's.
+static var _unlit := {}
+static func unlit_material(material: Material) -> ShaderMaterial:
+	var mat := material as ShaderMaterial
+	if mat == null or mat.shader != CARD_SHADER:
+		return null
+	if _unlit.has(mat):
+		return _unlit[mat]
+	var out := ShaderMaterial.new()
+	out.shader = CARD_UNLIT_SHADER
+	for p: String in ["picture", "animated", "frames", "frames_rect", "frames_grid", "frames_loop"]:
+		var v: Variant = mat.get_shader_parameter(p)
+		if v != null:
+			out.set_shader_parameter(p, v)
+	_unlit[mat] = out
+	return out
+
+
+static var _projection := {}  # name -> the list's form of its sprite_projection.json frames, or null
+static var _projection_data = null
+
+
+## sprite_projection.json's frames for an entity in the graphics list's form ({n, e, s, w: layers
+## [file, x, y, w, h, scale, shift x, shift y (tiles), tint]}), or null: none, a picture round the
+## turn (vehicles, units), or no install.
+static func _projection_rec(name: String):
+	if _projection.has(name):
+		return _projection[name]
+	if _projection_data == null:
+		_projection_data = {}
+		if FileAccess.file_exists(ModelPacks.PROJECTION_DATA):
+			var parsed = JSON.parse_string(FileAccess.get_file_as_string(ModelPacks.PROJECTION_DATA))
+			if parsed is Dictionary:
+				_projection_data = parsed
+	var out = null
+	var entry = (_projection_data as Dictionary).get(name)
+	if entry is Dictionary and str(entry.get("mode", "")) != "rotation" and ItemIcons.factorio_data_dir() != "":
+		var cells: Array = entry.get("cells", [])
+		var mode := str(entry.get("mode", ""))
+		var rec := {}
+		for i in (mini(4, cells.size()) if mode == "direction" else mini(1, cells.size())):
+			var layers: Array = []
+			for layer in cells[i]:
+				if layer is Dictionary:
+					layers.append(_projection_layer(layer))
+			if not layers.is_empty():
+				rec[DIR_KEYS[i]] = layers
+		out = rec if rec.has("n") else null
+	_projection[name] = out
+	return out
+
+
+## One sprite_projection.json layer as the list's: its frame's place on the sheet (`xy`, else `index`
+## in rows of `line`), its scale, its shift from 1/32 tile to tiles, its tint.
+static func _projection_layer(layer: Dictionary) -> Array:
+	var size: Array = layer.get("frame", [0, 0])
+	var w := int(size[0])
+	var h := int(size[1])
+	var x := 0
+	var y := 0
+	if layer.has("xy"):
+		x = int(layer["xy"][0])
+		y = int(layer["xy"][1])
+	else:
+		var line := maxi(1, int(layer.get("line", 0)))
+		var index := int(layer.get("index", 0))
+		x = (index % line) * w
+		y = (index / line) * h
+	var shift: Array = layer.get("shift", [0, 0])
+	var tint = layer.get("tint")
+	return [str(layer.get("file", "")), x, y, w, h, float(layer.get("scale", 0.5)), float(shift[0]) / 32.0, float(shift[1]) / 32.0,
+		tint if tint is Array else null]
+
+
+## (The Model packs window's preview, model_preview.gd) An entity's Factorio picture as the world's
+## card draws it: {"card": the Mesh (a QuadMesh facing Factorio's camera from the entity's centre:
+## draw it with transform(Vector2.ZERO)), "texture": the picture, "centre": the entity's centre in it
+## (pixels), "px_per_tile", "size": the picture in tiles}; {} while it is composed (poll() makes it:
+## ask again) or when there is none (has_picture()). Shown whether the Factorio pack is on or not.
+static func picture(name: String, direction := 0, size := Vector2.ONE, type := "") -> Dictionary:
+	var mesh := card(name, direction, size, type, true)
+	if not mesh is QuadMesh:
+		return {}
+	var quad := mesh as QuadMesh
+	var mat := quad.material as ShaderMaterial
+	var tex: Texture2D = mat.get_shader_parameter("picture") if mat != null else null
+	if tex == null:
+		return {}
+	var px := float(tex.get_width()) / maxf(quad.size.x, 0.001)
+	var c: Vector3 = quad.center_offset
+	var squash := sin(deg_to_rad(FACTORIO_PITCH))
+	var centre := Vector2(tex.get_width() * 0.5 - c.x * px, tex.get_height() * 0.5 + c.y / squash * px)
+	return {"card": mesh, "texture": tex, "centre": centre, "px_per_tile": px,
+		"size": Vector2(tex.get_width(), tex.get_height()) / px}
+
+
+## Whether an entity has a Factorio picture to show (the list's, or sprite_projection.json's with an
+## install): picture() gives it once composed.
+static func has_picture(name: String) -> bool:
+	_follow_list()
+	return _rec(name) is Dictionary
+
+
+## (The Model packs window) The 16-way directions an entity's picture differs in: [0, 4, 8, 12] when
+## its record has east, south or west pictures of their own (an inserter in a game's list, a drill,
+## a combinator), else [0]; [] without a picture.
+static func directions(name: String) -> Array:
+	_follow_list()
+	var rec = _rec(name)
+	if not rec is Dictionary:
+		return []
+	for k: String in ["e", "s", "w"]:
+		if (rec as Dictionary).has(k) or (rec as Dictionary).has("k" + k):
+			return [0, 4, 8, 12]
+	return [0]
+
+
+## (The preview) An item's icon card, as items without a model are drawn on belts, the ground and in
+## hands (item_cards.gd): a flat square CARD_SIZE across lying face up, its icon in Factorio's
+## colours; null without an icon. `texture` alone: item_picture().
+static func item_card(item: String) -> Mesh:
+	var tex := item_picture(item)
+	if tex == null:
+		return null
+	var plane := PlaneMesh.new()
+	plane.size = Vector2(0.32, 0.32)
+	var mat := StandardMaterial3D.new()
+	mat.albedo_texture = tex
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
+	mat.alpha_scissor_threshold = 0.5
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	plane.material = mat
+	return plane
+
+
+## An item's icon: the install's (or a pack's, by the order), null for none.
+static func item_picture(item: String) -> Texture2D:
+	return ItemIcons.texture_for(item)
 
 
 ## Once a frame: turns finished pictures into cards. True when any were made.
@@ -134,7 +338,8 @@ static func _compose(key: String, layers: Array, work: Array, with_anim: bool) -
 	var placed: Array = []  # [layer, top-left (px, from the entity's centre), size px, while working]
 	var lo := Vector2(INF, INF)
 	var hi := -Vector2(INF, INF)
-	var px := PX  # pixels a tile here: less for a picture bigger than MAX_PX, which is scaled to fit
+	var fine := density(layers + (work if with_anim else []))
+	var px := fine  # pixels a tile here: less for a picture bigger than MAX_PX, which is scaled to fit
 	for attempt in 2:
 		placed.clear()
 		lo = Vector2(INF, INF)
@@ -152,7 +357,7 @@ static func _compose(key: String, layers: Array, work: Array, with_anim: bool) -
 		var extent := maxf(hi.x - lo.x, hi.y - lo.y)
 		if placed.is_empty() or extent <= MAX_PX:
 			break
-		px = PX * MAX_PX / extent
+		px = fine * MAX_PX / extent
 	var got = null
 	if not placed.is_empty():
 		var w := mini(ceili(hi.x - lo.x), MAX_PX)
@@ -394,6 +599,7 @@ static func instance_color(running: bool, pos: Vector2) -> Color:
 
 ## Forgets every card (tests, and when Animate modded buildings is switched).
 static func clear() -> void:
+	_unlit.clear()
 	for job in _jobs.values():
 		WorkerThreadPool.wait_for_task_completion(job[0])
 	_jobs.clear()

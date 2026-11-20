@@ -50,6 +50,7 @@ void fragment() {
 		discard;
 	}
 	ALBEDO = c.rgb * (1.0 - raised_shade * grown);
-	SPECULAR = 0.5 * f3d_look_ground_specular;
+	SPECULAR = plant_specular() * f3d_look_ground_specular;
+	ROUGHNESS = plant_roughness(1.0);
 	ALPHA = c.a * smoothstep(0.75, 0.9, level);
 }

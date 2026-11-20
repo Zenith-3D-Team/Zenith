@@ -19,6 +19,8 @@ signal updated
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const RichText := preload("res://scripts/ui/factorio/rich_text.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const Alerts := preload("res://scripts/ui/factorio/alerts.gd")
+const AlertIcons := preload("res://scripts/ui/factorio/alert_icons.gd")
 
 ## Factorio's default player colour (the character's map marker).
 const PLAYER_COLOR := Color(0.869, 0.5, 0.130)
@@ -396,6 +398,50 @@ static func draw_pings(canvas: CanvasItem, pings: Array, to_screen: Callable, si
 			var f := fposmod(t * 3.0 + ring * 0.5, 1.0)
 			canvas.draw_arc(at, size * (0.3 + f), 0.0, TAU, 32, Color(1.0, 0.85, 0.2, (1.0 - f) * (1.0 - t)), maxf(1.0, size * 0.08))
 		canvas.draw_circle(at, size * 0.18, Color(1.0, 0.85, 0.2, 1.0 - t))
+
+
+## A fixed clock for the alerts' blink in draw_alerts (tests), or -1: the real one.
+static var alerts_clock_msec := -1
+
+
+## The alert bar's alerts (alerts.gd map_marks, least important first) on the shown surface `shown_si`:
+## Factorio's own alert picture as a `size` square centred on to_screen(position), each mark inside
+## `area` grown by `size`. They blink as over the entities (alert_icons.gd: a 1 s period, on 55% of it,
+## the kinds steady there steady here), on the clock, so the maps and the world blink together;
+## Zenith has no "Enable warning icons blinking" option, so they always blink. Returns what it
+## placed, [[kind, screen point], ...] (tests).
+static func draw_alerts(canvas: CanvasItem, marks: Array, to_screen: Callable, size: float, area: Rect2, shown_si: int) -> Array:
+	var placed: Array = []
+	var blink_on := alerts_blink_on(alerts_clock_msec if alerts_clock_msec >= 0 else Time.get_ticks_msec())
+	var grown := area.grow(size)
+	var half := Vector2(size, size) / 2.0
+	for mark in marks:
+		var si := int(mark["si"])
+		if shown_si != 0 and si != 0 and si != shown_si:
+			continue
+		var kind := str(mark["kind"])
+		if not blink_on and alert_blinks(kind):
+			continue
+		var at: Vector2 = to_screen.call(mark["position"])
+		if not grown.has_point(at):
+			continue
+		var t := Alerts.texture(kind)
+		if t != null:
+			canvas.draw_texture_rect(t, Rect2(at - half, half * 2.0), false)
+		else:
+			canvas.draw_circle(at, size * 0.35, Color(0.9, 0.25, 0.15))
+		placed.append([kind, at])
+	return placed
+
+
+## Whether a kind blinks (alert_icons.gd's DRAWN; the kinds it doesn't draw blink).
+static func alert_blinks(kind: String) -> bool:
+	return bool(AlertIcons.DRAWN[kind][1]) if AlertIcons.DRAWN.has(kind) else true
+
+
+## The blink's phase at `msec`, as billboard_icon_cut.gdshader's (off the first 45% of each period).
+static func alerts_blink_on(msec: int) -> bool:
+	return fposmod(msec / 1000.0 / AlertIcons.BLINK, 1.0) >= 0.45
 
 
 ## core/graphics/custom-tag-in-map-view.png from the install (null without one).

@@ -77,7 +77,7 @@ Factorio's keys work as in Factorio: WASD walks, the right mouse button mines, E
 inventory (or closes the window that is open), the left mouse builds what you hold or, with
 nothing held, opens the building under the mouse, R rotates, Q
 picks up the item under the mouse (pipette), F picks up the items in reach, on the ground and on
-belts, T is the technology screen, M the map, 1–0 the quickbar, Enter gets in and out of
+belts, T is the technology screen, Tab or M the map, 1–0 the quickbar, Enter gets in and out of
 vehicles, Esc closes windows or opens the game menu. The game starts in the angled view, and the
 camera is yours to move:
 
@@ -113,12 +113,19 @@ roboport draws lines to the roboports it is linked to. On a space platform (and 
 one) Factorio's platform panel under the minimap says where it is stopped or what it is travelling
 between, its speed and mass, and on board has **Drop to a planet**.
 
+When it finds Factorio's config.ini, Zenith follows Factorio 2.1's own keys, so the arrow keys don't walk, `/` doesn't open the console and Keypad
+Enter doesn't get in, as in Factorio (the console is on `` ` ``, getting in on Enter or G). To have Zenith 0.2.2's keys
+back, tick Settings → Controls → **Zenith 0.2.2's keys**.
+
 Settings → Controls lists and rebinds everything. F1 shows the help: every control under the key
 you have it on now, grouped, with each add-on's keys under the add-on while it is on (the mouse wheel
-over it scrolls it when the window is too short). F4 shows a status line (the
-game's UPS beside the frame rate, and what Hold the game at 60 UPS holds back). Ctrl+F9
+over it scrolls it when the window is too short). The debug line shows a status line (the
+game's UPS beside the frame rate, and what Hold the game at 60 UPS holds back); it has no key at first:
+bind one in Settings → Controls (Miscellaneous, Debug line), or tick Settings → Interface → Debug line. Ctrl+F9
 opens the same game in Factorio itself, and Ctrl+F9 there comes back, minimising Factorio to save
-its drawing. Started through `server/factorio-with-zenith.ps1` (RUNNING.md says how to set it as
+its drawing. On a world you made in Zenith, Factorio joins as the character you were playing in Zenith,
+with everything it carries, and Factorio's crashed-ship intro doesn't happen there: anyone else who
+joins gets a character of their own. Started through `server/factorio-with-zenith.ps1` (RUNNING.md says how to set it as
 Steam's launch options), Factorio's Ctrl+F9 (or the Zenith gear among its top-left mod buttons) also starts Zenith when it isn't running (Settings → Other → Copy launch options gives the line for Steam; open Zenith once before setting it). When it can't start Zenith, Factorio shows a window saying what is missing: Zenith itself (with its download page), the launch options (with the line to copy), or both. Windows move by dragging their title bars.
 
 Playing through Factorio (hybrid single-player, or joined to the server as yourself), mods'
@@ -136,12 +143,18 @@ the mod can see of you.
   in the background with no window, and Zenith's bridge plays a character of its own. Add mods
   in the main menu's **Mods** window, which lists the server's mods folder: put the mods' zips in
   `%APPDATA%\Godot\app_userdata\Zenith\server-data\mods` (the download) or `server/data/mods`
-  (from the repository), tick them, and start the game. **Load game** on a save made with mods
-  starts it with exactly those mods: Zenith links the mods from your own Factorio mods folder
-  (`%APPDATA%\Factorio\mods`) into the server's, and Factorio turns on the save's mods at the save's
-  versions. If one is missing there, or there at another version, Zenith names it: start the save in
-  Factorio once (it downloads them), or put that mod in your mods folder. This is the cheapest way
-  to play, and the one most tested.
+  (from the repository), tick them, and start the game. Every load also links the mods from your
+  own Factorio mods folder (`%APPDATA%\Factorio\mods`) into the server's, so after the first load
+  you can tick those too (a mod there isn't on until you tick it). **New game** uses the mods
+  ticked there. **Load game** starts a save with its own mods at the save's versions (and its mod
+  settings), with the mods ticked in the Mods window added, as Factorio adds the mods you have on
+  to a save you load: so you can add a mod to a world. Tick **Sync mods with save** beside the save
+  to load it with exactly its own mods instead. Space Age and its DLC always follow the save (a
+  Space Exploration world stays without Space Age); a ticked mod that can't run with the save's
+  mods, or needs one you don't have, is left out, and Zenith says which when the game starts. If
+  one of the save's own mods is missing, or there at another version, Zenith names it: start the
+  save in Factorio once (it downloads them), or put that mod in your mods folder. This is the
+  cheapest way to play, and the one most tested.
 - **Hybrid** (Single player → Single-player (hybrid)): you start your own Factorio with your own
   mods and save, with the Zenith Bridge mod and `--enable-lua-udp 34200` in its launch options,
   and Zenith connects to it and plays *your* character. Both windows show the same game; Ctrl+F9
@@ -237,6 +250,15 @@ to 8.
   real sunrise and sunset, which Factorio's own look doesn't have: Factorio has none to match). The
   downloads come with it switched on, and while it is on its look is used: switch it off in the
   Add-ons menu for the Factorio look.
+- **Graphics → Metal on textured models** (As paint): a model pack's own metal pictures are drawn
+  mostly as paint, as every other model's metal is, so they take the sun and the shadows. Full, as
+  before draws them in full, reflecting only the sky: darker and bluer. Built-in models look the same
+  either way.
+- **Graphics → Packs' own shading** (As each pack says): a model pack that asks for it in its pack.json
+  (Vasillo's do) has its textured models, and its items, drawn as their files say, lit as Blender and Godot
+  light them. Factorio's everywhere draws every pack with the balance made for Factorio's pictures (tops
+  darker than sides), as before. The Model packs window's card says each pack's. Built-in models look the
+  same either way.
 - **Graphics → Anti-aliasing** (SMAA): how edges are smoothed. SMAA keeps fine detail sharp, FXAA is
   softer, TAA is the steadiest far away but softens moving belts, MSAA costs the most. While a look that
   draws its own full-screen passes is on, such as the Cinematic shaders, MSAA is greyed out and a saved
@@ -277,10 +299,17 @@ to 8.
   CPU and graphics card), with Hold the game at 60 UPS on, and Merged
   materials as above. Pressed in a game,
   it measures for six seconds first and goes a preset lower if the game or the frames fall short.
+- **Graphics → Step onto belts** (on): walking over a belt, underground belt, splitter, loader, heat pipe
+  or anything else Factorio's character walks over, your character is drawn standing on its top
+  (eased up and down, no pop) instead of wading through it. It is only drawn: the camera stays where it
+  is in every view, first person too, and the character's place in the game, its reach and what it
+  collides with don't change. Off: it walks through them, as before.
 - **Graphics → Hold the game at 60 UPS** (on): when the game runs slow on a big base, the client
   asks the bridge for less for a while (shorter distances, fewer minimap refreshes, then a lower
-  frame rate) and gives it back when the game recovers. Your settings stay as they are; F4 shows
-  what is held back.
+  frame rate) and gives it back when the game recovers. Your settings stay as they are; the debug line (Settings → Controls) shows
+  what is held back, and so does a yellow warning icon at the top left, with how many settings are held back:
+  hover it for the list, click it for the log of what was held back, when and why (**Interface → Performance
+  warnings** hides the icon).
 - **Graphics → items on belts**, three settings: **Belt item distance**, how far items on belts are
   drawn; **Moving belt items**, how many of them move (Automatic raises and lowers it with the room
   the frames, the game and the server's tick have; counted from the character outwards: past those, out
@@ -297,10 +326,14 @@ to 8.
   240 by default). The camera keeps the character in the middle of the screen in every view, on the
   hills of an add-on such as Terrain Elevation too, rising and falling with them; where a hill would
   come between the camera and the character, it tilts up over it instead of going into the ground.
+  **Add-ons' camera motion** (100% by default) scales the bob, sway and shake add-ons put on the view; turn it
+  down, or to 0% for none, if that motion makes you feel ill.
 - **Interface → UI scale**, and Ctrl+= / Ctrl+- / Ctrl+0 while playing.
 - **The bridge's own settings** are in Factorio's Mod settings (Map tab), or Settings → Mod
   settings in a game the menu started: how much it sends per tick, how far moving things are
   streamed, which player the client plays as on a server.
+- **Footsteps** sound as each ground, rail and ore's own Factorio sound, mods' too, with plants rustling
+  underfoot; start the client with `-- --steps=table` for Zenith's older guess from the tile's name.
 
 <!-- dev -->
 ## The debug menu
@@ -322,7 +355,8 @@ while it's open. It's for testing and for reports when something runs slowly:
   your settings) compared with your last run of it. Copy it or save it to a file to send with a
   bug report. Keep your hands off the keys while one runs; Esc stops it.
 - **Tests**: checks and overlays for finding problems (a frame-time graph, counters, chunk borders,
-  the bridge's self-test) and spots to move your character to (the same rule as Time).
+  the bridge's self-test, which model pack each model comes from) and spots to move your character
+  to (the same rule as Time).
 - **Updates**: see where and when the game sends Zenith its updates. Tick a kind (chunks arriving,
   buildings built, removed or changed, machines starting and stopping, belt lanes read or checked,
   inserters' takes, movers, power, alerts...) and each update outlines what it touched on the ground,
@@ -331,13 +365,106 @@ while it's open. It's for testing and for reports when something runs slowly:
   their items move.
 
 <!-- /dev -->
+## Model packs
+
+Every model Zenith draws comes from a model pack, like a texture pack. Four come with Zenith, in
+this order from the top:
+
+- **FUE5 (Adapted)**: textured models from FUE5, a fan remake of Factorio, of 39 machines, chests, poles,
+  trains and the rocket silo;
+- **Wube3DP (Adapted)**: Wube's official 3D-printable Factorio models (belts, chests, inserters, furnaces,
+  the electric mining drill, biters and more), scaled and coloured to Factorio's sprites. Where FUE5
+  has a model of the same thing (the chests, furnaces, electric mining drill and small pole), FUE5's
+  is drawn unless you move Wube3DP up;
+- **Placeholders**: Zenith's own model of every Nauvis and Space Age entity, built from Factorio's
+  sprites;
+- **Factorio**: Factorio's own pictures, read from your Factorio install (nothing of Wube's comes with
+  Zenith): buildings, belts and trees as their sprites standing on cards, like cardboard cutouts, and
+  items as their icons. At the bottom it only fills in what no other pack has; move it up and the game
+  shows Factorio's 2D pictures instead of the packs below it. Without a Factorio install it is greyed
+  out and says why.
+
+Every pack can be moved and switched off, Placeholders and Factorio too. A building no pack in use has a
+model for is drawn as its Factorio picture, or, with Factorio off, as a plain box in its map colour.
+
+"Adapted" marks the two packs of other people's models, converted and fitted for Zenith.
+
+Some downloads come with a fourth, **Zenith**: Vasillo's textured belts, undergrounds, splitters,
+inserters and burner mining drill, made for Zenith (`models/Zenith.zip` beside Zenith), on top of
+the others.
+
+Packs made by other people go in the `models` folder beside Zenith (beside `Zenith.exe`; **Open
+folder** in the Model packs window opens it). A pack can be:
+
+- **a .zip**, as you downloaded it: no need to unpack it. Zenith unpacks a copy into its own user
+  folder (`model-packs`) the first time, and again only when the zip changes;
+- **a folder**, its models anywhere inside it;
+- **loose .glb files** at the top of the models folder, which count as one pack, "Loose models".
+
+Have as many as you like. Each model is a file named after the Factorio building it draws
+(`transport-belt.glb`). A pack may also carry its author's own sounds in a `sounds/` folder, played in
+place of Factorio's (Settings → Sound → **Sounds from model packs** turns them off). A pack that
+carries copies of Factorio's own files isn't loaded: its card in the Model packs window turns red and
+says which files (Zenith reads Factorio's files from your own install; ask the pack's author for a
+version without them).
+
+**Model packs**, in the main menu and the Esc menu, opens the Model packs window. On the
+left, **Available**: the packs not in use. On the right, **Selected**: the packs in use, the top one
+winning when two have a model of the same thing. ▶ on a pack adds it on top of Selected, ◀ takes it
+out, ▲ and ▼ move it up and down. A new pack in the models folder goes on top, in use (one added while
+Zenith runs is marked new, and is drawn from the next start or as soon as you change anything in the
+window). Each pack shows its picture, name, how many models it has and, from its `pack.json`, its
+version, author and licence; one that can't be read is left out and says why.
+
+Click a pack to see its models, with a search box. Click a model to see it turning, which pack's
+version is drawn now, and a button for each pack that has one, to look at theirs. **Use <pack>'s**
+takes that model, with its curves, directions and other pieces, from the pack shown whatever the
+order; **By the order** gives it back, and **Reset choices** gives them all back.
+
+Changes show at once, in a game too: buildings change straight away; trains, robots, creatures and
+inserter arms the next time Zenith starts.
+
+**One building's model:** in a game, a building's window has a **Model** button in its title bar,
+beside the circuit network buttons. It shows the building turning in each pack in use that has a model
+of it. **This one** draws only that building with that model, kept for this save until the building
+is mined or destroyed; **Every one** draws every building of its kind with it, as Use in the Model
+packs window does. **Usual model** and **Every one by the order** undo them. Only Zenith's picture
+changes: nothing goes to the game. An inserter's arm keeps its usual model.
+
+To play with the built-in packs alone without moving yours, start Zenith with
+`-- --no-custom-models`.
+
+## The main menu's backdrop
+
+Zenith's own, not Factorio's (Factorio's menu always shows its own scenes): the main menu can show
+a spot in one of your games instead of Zenith's default (a corner of a Space Age factory, recorded the
+same way). In a game, go to the spot, turn and
+zoom the camera as you like it, then **Esc > Use this view as the menu backdrop**. Zenith records
+the view and a few seconds of what moves there (about 10 s, with the controls held meanwhile), and the
+main menu shows it from then on, with the camera turning a little either way, in the menu's own
+afternoon light. Belts, inserters, trains, robots and biters move as they did; your character is
+left out.
+
+Each recording is kept: the main menu's **Menu backdrop** lists them under **Default** (Zenith's
+factory), newest first, each named after its save with the date and time, the one shown marked "In
+use". Click a name to change it; **Use** shows that one, **Delete** deletes it (after asking).
+**Open folder** opens the folder they are kept in (`backdrops` in Zenith's user folder; a backdrop a
+friend sends you can be dropped there), and **Choose from a world…** opens Load game, to go and record
+one. A backdrop from before 0.2.2 is moved into the list the first time. To keep only one, replaced by
+each new recording as before, start Zenith with `-- --menu-backdrop-save=overwrite`. Backdrops stay on
+your PC and are drawn with the model packs in use, so a
+modeller can drop new models in, open Model packs or restart Zenith, and see them in their own
+factory without loading a game. The menu shows no grass or small rocks, and no add-ons such as
+Terrain Elevation; a building from a mod may be drawn as a box. To start with Zenith's own backdrop
+once, start Zenith with `-- --menu-backdrop=default`.
+
 ## Add-ons
 
 Add-ons add to what Zenith does, for example the [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) for filming your
 base (its keys and modes are in its own guide there). One is a
 folder or a .zip of it (no need to unpack it): put it in Zenith's add-ons folder, `%APPDATA%\Godot\app_userdata\Zenith\addons\` on
 Windows (or an `addons` folder beside `Zenith.exe`), and start Zenith. The **Add-ons** menu (on
-the main menu, in the game menu that Esc opens, and at the bottom of Settings) lists every add-on
+the main menu and in the game menu that Esc opens) lists every add-on
 found with its version, whether it's on, and why it couldn't load (for example one that needs a
 newer Zenith). Click one for its page: its switch, its settings (changed there at once, in a game
 too, and kept for next time) and its keys, rebound as in Settings → Controls (click, press the
@@ -345,9 +472,15 @@ key; right click clears). With two copies of one add-on (a folder and a zip, say
 version is used and its page says so. The Mods window lists them as well. Add-ons can move the camera and
 change what is shown, never the game itself. Writing one: [ADDONS.md](ADDONS.md).
 
-The download already has two in its `addons` folder: the Cinematic camera, switched on, and
+An add-on is a program: it runs inside Zenith with your rights and can read and change your files.
+So one you add is off until you switch it on in the Add-ons menu: switch on only add-ons from people
+you trust. Zenith's own come with it, and model and icon packs are only data, not programs.
+
+The download already has Zenith's own in its `addons` folder, each starting as its
+`addons/bundled.json` says: the Cinematic camera, switched on;
 [Terrain Elevation](https://github.com/unjustodin/Terrain-Elevation) (hills under the world),
-switched off: turn it on in the Add-ons menu. Newer versions are on each add-on's releases page.
+switched off (turn it on in the Add-ons menu); and the Cinematic shaders, switched on, in a release
+built with them. Newer versions are on each add-on's releases page.
 
 An add-on that records in the background (the Cinematic camera's recorder) keeps Zenith drawing
 while its window is behind Factorio's: Zenith isn't minimised when it loses focus while it

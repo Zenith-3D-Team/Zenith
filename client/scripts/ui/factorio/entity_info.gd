@@ -6,13 +6,24 @@ extends PanelContainer
 ## speed, energy, pollution, health, resistances, module slots...), as Factorio's tooltips list them,
 ## the craft's progress and the burning fuel (drawn on between the mod's answers, I26), a crafting
 ## machine's ingredients and products a second (J15) and what is
-## inside: a machine's input, output and fuel, a chest's or wagon's contents (I2). factorio_ui.gd places it
-## under the minimap and calls show_entity() every frame with the hovered entity (or null).
+## inside: a machine's input, output and fuel, a chest's or wagon's contents (I2); a resource's amount (an
+## infinite one's yield), the fluid it needs and the drills that mine it (L6); a pipe's pipeline extent and
+## Factorio's "Pipeline overextended" (L11). factorio_ui.gd places it under the minimap and calls show_entity()
+## every frame with the hovered entity (or null). With nothing hovered and the map view's resource patch under
+## the mouse (ui_model.map_patch, `rpatch`), that patch: its name and amount summed, or its combined yield (L6).
 ##
 ## Laid out as Factorio 2.1's (measured on tools/ui_reference/hover.py's pictures): as wide as the
 ## side menu (256) and flush with it, a picture of the entity on a dark strip (its icon here, where
 ## Factorio films it), the name on the tooltip's cream title bar, a status dot and word, then the
 ## lines; no key hints.
+##
+## Zenith's own (N8): the model pack that draws the entity, its picture as the Model packs window's
+## rows show it, a small frame action button at the right of the title bar; its tooltip names the
+## pack and its credit, a click opens the Model packs window on that pack with the entity's family
+## shown. Factorio's panel takes no mouse, and the mouse can't reach this one by itself (it shows
+## what is under the mouse), so it holds its entity while the mouse is on it, or heading straight for
+## it (HOLD_MSEC at most from leaving the entity), as a menu holds a submenu the mouse crosses to.
+## `--entity-info-pack=off`: no symbol, the panel as before.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
@@ -22,10 +33,20 @@ const RichText := preload("res://scripts/ui/factorio/rich_text.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.gd")
 const SmoothBar := preload("res://scripts/ui/factorio/smooth_bar.gd")
+const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
+const ModelPacksWindow := preload("res://scripts/menu/model_packs_window.gd")
+const ModelPreview := preload("res://scripts/ui/factorio/model_preview.gd")
+
+## The pack symbol (N8); --entity-info-pack=off leaves it out.
+static var show_pack := not OS.get_cmdline_user_args().has("--entity-info-pack=off")
+const PACK_SIZE := 24
+## How long the panel holds its entity while the mouse heads for it across the world (ms).
+const HOLD_MSEC := 600
 
 const WIDTH := 256  # the side menu's width: Factorio's panel sits flush under it
 const PICTURE := 96
-## Entities whose modules and beacons the mod is asked about (`hinfo`).
+## Entities whose modules and beacons the mod is asked about (`hinfo`, G12).
 const EFFECT_TYPES := ["beacon", "assembling-machine", "furnace", "mining-drill", "lab", "rocket-silo"]
 ## Entities whose contents the mod is asked about (`hinfo` `inv`, I2), besides those above, the
 ## electric ones and those burning fuel.
@@ -39,6 +60,8 @@ const ROLE_NAMES := {"chest": "Contents", "trash": "Trash", "cargo": "Cargo", "t
 ## Slots a row in the contents' grids, and their size (the panel is 256 wide).
 const CONTENT_COLUMNS := 6
 const CONTENT_SLOT := 36
+## Entities whose pipeline Factorio's entity info measures (L11: `hinfo` pl, ox).
+const PIPE_TYPES := ["pipe", "pipe-to-ground", "storage-tank", "infinity-pipe"]
 const EFFECT_NAMES := [["sp", "Speed"], ["pr", "Productivity"], ["co", "Consumption"], ["po", "Pollution"], ["q", "Quality"]]
 ## The "Consumes electricity" heading and the Electricity bar, sampled from Factorio's panel.
 const HEADING := Color(1.0, 211 / 255.0, 73 / 255.0)
@@ -48,6 +71,8 @@ const POWER_STATUS := {0: ["No power", "red"], 1: ["Low power", "yellow"], 2: ["
 
 var model
 var player: Node = null
+## Opens the Model packs window on (pack id, family): factorio_ui.gd open_model_packs.
+var open_pack := Callable()
 
 var _title: Label
 var _icon: TextureRect
@@ -75,6 +100,24 @@ var _bars_at := -1
 var _craft_bar: ProgressBar = null
 var _fuel_bar: ProgressBar = null
 var _frame_msec := 0
+## The pack symbol: the button, the pack and family it opens, what they were worked out from, the
+## pictures read (ModelPacksWindow.pack_picture's cache).
+var _pack_button: Button
+var pack_id := ""
+var pack_family := ""
+var _pack_seen := ""
+var _pack_pictures := {}
+var _pack_holder: Control
+var _pack_image: TextureRect
+var _pack_preview: ModelPreview = null
+var _pack_preview_want := ""
+var _pack_models := {}
+var _pack_models_version := -1
+## Holding the entity while the mouse goes to the panel: where the mouse was last frame, when it
+## left the entity (-1 on it), whether it was heading for the panel.
+var _last_mouse := Vector2.INF
+var _left_msec := -1
+var _heading := false
 
 
 func _ready() -> void:
@@ -102,10 +145,44 @@ func _ready() -> void:
 	picture.add_child(_icon)
 	var head := Kit.panel("FTooltipTitle")
 	box.add_child(head)
+	var head_row := HBoxContainer.new()
+	head_row.add_theme_constant_override("separation", Kit.px(4))
+	head_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	head.add_child(head_row)
 	_title = Kit.label("", "FTooltipTitleLabel")
 	_title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_title.custom_minimum_size.x = Kit.px(WIDTH - 28)
-	head.add_child(_title)
+	_title.custom_minimum_size.x = Kit.px(WIDTH - 28 - (PACK_SIZE + 4 if show_pack else 0))
+	_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	head_row.add_child(_title)
+	_pack_button = Button.new()
+	_pack_button.name = "PackSymbol"
+	_pack_button.theme_type_variation = "FFrameAction"
+	_pack_button.focus_mode = Control.FOCUS_NONE
+	_pack_button.custom_minimum_size = Kit.pxv(PACK_SIZE, PACK_SIZE)
+	_pack_button.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_pack_button.mouse_filter = Control.MOUSE_FILTER_STOP
+	_pack_button.visible = false
+	_pack_button.pressed.connect(open_pack_window)
+	head_row.add_child(_pack_button)
+	_pack_holder = Control.new()
+	_pack_holder.name = "Picture"
+	_pack_holder.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_pack_holder.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_pack_holder.offset_left = Kit.px(3)
+	_pack_holder.offset_top = Kit.px(3)
+	_pack_holder.offset_right = -Kit.px(3)
+	_pack_holder.offset_bottom = -Kit.px(3)
+	_pack_button.add_child(_pack_holder)
+	_pack_image = TextureRect.new()
+	_pack_image.name = "image"
+	_pack_image.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_pack_image.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_pack_image.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_pack_image.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_pack_image.visible = false
+	_pack_holder.add_child(_pack_image)
+	if show_pack:
+		_ensure_pack_preview()
 	var body := MarginContainer.new()
 	for side in ["left", "right"]:
 		body.add_theme_constant_override("margin_" + side, Kit.px(6))
@@ -131,12 +208,21 @@ func _ready() -> void:
 	column.add_child(_lines)
 
 
-## The hovered entity (a world record) or null.
-func show_entity(r) -> void:
+## The hovered entity (a world record) or null; `mouse` where the mouse is (INF: unknown, the
+## mouse captured), for holding the entity while it goes to the pack symbol; `fast`: camera/mouse
+## whipping past entities, skipping transient hover rebuilds and `hinfo` sends until it slows.
+func show_entity(r, mouse := Vector2.INF, fast := false) -> void:
+	Kit.poll_icons()  # icons read on a worker since (Kit.icon_into)
+	r = _held(r, mouse)
+	if r == null and player != null and model != null and not (model.map_patch as Dictionary).is_empty():
+		_show_patch(model.map_patch)
+		return
 	if r == null or player == null:
 		visible = false
 		_key = ""
 		_seen_rec = null
+		return
+	if fast and not is_same(r, _seen_rec):
 		return
 	var world = player.get("world")
 	var proto = world.protos.entity(r.proto_id) if world != null else null
@@ -150,12 +236,22 @@ func show_entity(r) -> void:
 	if proto.type == "entity-ghost" and r.extra.has("gh") and world.protos.entity(int(r.extra["gh"])) != null:
 		inner_name = world.protos.entity(int(r.extra["gh"])).name
 	var stats: Dictionary = model.pedia_data("entity", inner_name) if model != null else {}
+	_update_pack(r, world, proto, inner_name)
 	var electric: bool = str(stats.get("etype", "")) == "electric" and proto.type != "entity-ghost"
 	var effects: Dictionary = _no_info
 	var burner: bool = str(stats.get("etype", "")) == "burner" and proto.type != "entity-ghost"
-	if model != null and r.unit > 0 and (proto.type in EFFECT_TYPES or electric or burner or proto.type in CONTENT_TYPES):
-		model.ask_hover_info(r.unit, r.proto_id, r.fixed)
+	if model != null and r.unit > 0 and (proto.type in EFFECT_TYPES or electric or burner or proto.type in CONTENT_TYPES
+			or proto.type in PIPE_TYPES):
+		if not fast:
+			model.ask_hover_info(r.unit, r.proto_id, r.fixed)
 		if int(model.hover_info.get("u", 0)) == r.unit:
+			effects = model.hover_info
+	elif model != null and proto.type == "resource":
+		# A resource has no unit number: asked for by a key of its place, so another tile's answer isn't taken.
+		var place := resource_key(r.fixed)
+		if not fast:
+			model.ask_hover_info(place, r.proto_id, r.fixed)
+		if int(model.hover_info.get("u", 0)) == place:
 			effects = model.hover_info
 	_report_bars(r.unit, effects, working)
 	var power := _power_state(r)
@@ -199,12 +295,15 @@ func show_entity(r) -> void:
 			var have: int = model.count_of(item) if model != null else 0
 			_line("Needs: %s (you have %d)" % [Kit.pretty(item), have], Kit.GREEN_TEXT if have > 0 else Kit.RED_TEXT, item)
 	_title.text = Kit.entity_name(shown_name)
-	_icon.texture = Kit.item_icon(shown_name)
+	Kit.icon_into(_icon, shown_name)
 	if r.extra.has("q"):
 		_line("Quality: %s" % str(r.extra["q"]).capitalize(), Kit.YELLOW_TEXT)
 	# Factorio's status: a coloured dot and the word; short of power says so, as Factorio's does
-	_status.get_parent().visible = working >= 0 or power >= 0
-	if power >= 0:
+	_status.get_parent().visible = working >= 0 or power >= 0 or effects.has("ox")
+	if effects.has("ox"):
+		_status.text = "Pipeline overextended"
+		_dot.texture = GuiAssets.status_dot("red")
+	elif power >= 0:
 		_status.text = POWER_STATUS[power][0]
 		_dot.texture = GuiAssets.status_dot(POWER_STATUS[power][1])
 	elif working >= 0:
@@ -214,8 +313,13 @@ func show_entity(r) -> void:
 		_line(("Recipe: " if icon[0] == "recipe" else "Filter: ") + (Kit.recipe_name(str(icon[1])) if icon[0] == "recipe" else Kit.pretty(str(icon[1]))))
 	if effects.get("io") is Dictionary:
 		_rates(effects["io"])
-	if r.extra.has("a"):
+	if proto.type == "resource":
+		_resource_lines(r, stats, effects)
+	elif r.extra.has("a"):
 		_line("Remaining: %s" % Kit.count_text(int(r.extra["a"])))
+	if effects.get("pl") is Array and (effects["pl"] as Array).size() >= 2:
+		var pl: Array = effects["pl"]
+		_line("Pipeline extent: %d/%d" % [int(pl[0]), int(pl[1])], Kit.RED_TEXT if effects.has("ox") else Kit.WHITE)
 	if r.extra.has("n"):
 		var station := RichText.label("Station: " + str(r.extra["n"]), Kit.WHITE)
 		station.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -245,6 +349,229 @@ func show_entity(r) -> void:
 		_electricity(stats, effects.get("el", {}))
 	_contents(effects.get("inv", []))
 	_draw_bars()
+	reset_size()
+
+
+func _ensure_pack_preview() -> ModelPreview:
+	if _pack_preview == null:
+		_pack_preview = ModelPreview.new()
+		_pack_preview.name = "picture"
+		_pack_preview.turning = false
+		_pack_preview.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_pack_preview.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		_pack_preview.visible = false
+		_pack_preview.viewport.render_target_update_mode = SubViewport.UPDATE_DISABLED
+		_pack_preview.set_process(false)
+		_pack_holder.add_child(_pack_preview)
+	return _pack_preview
+
+
+func _hide_pack_visuals() -> void:
+	_pack_preview_want = ""
+	if _pack_image != null:
+		_pack_image.visible = false
+	if _pack_preview != null:
+		_pack_preview.visible = false
+		_pack_preview.viewport.render_target_update_mode = SubViewport.UPDATE_DISABLED
+		_pack_preview.set_process(false)
+
+
+func _apply_pack_preview(want: String) -> void:
+	if _pack_preview == null or _pack_preview_want != want or not _pack_preview.visible:
+		return
+	_pack_preview.show_model(want)
+
+
+## The pack symbol for this entity (N8): the pack that draws it (its ghost's entity for a ghost), worked
+## out again when the record, its extra or the packs (their order, switches, choices) change.
+func _update_pack(r, world, proto, inner_name: String) -> void:
+	# The key is a unit number or, for what has none (resources, trees, rocks, some ghosts), a "proto:x:y"
+	# String (world.gd Rec): "%s" for it, as "%d" stopped this function every frame for those.
+	var seen := "%s|%d|%d|%d|%s|%d" % [str(r.key), r.proto_id, r.dir, r.extra.hash(), inner_name, ModelPacks.version]
+	if seen == _pack_seen:
+		return
+	_pack_seen = seen
+	var version_changed := _pack_models_version != ModelPacks.version
+	if version_changed:
+		_pack_models.clear()
+		_pack_models_version = ModelPacks.version
+	var p: Dictionary = {}
+	if show_pack:
+		var inner_type: String = proto.type
+		if inner_name != proto.name and world.protos.entity(int(r.extra.get("gh", 0))) != null:
+			inner_type = world.protos.entity(int(r.extra["gh"])).type
+		p = ModelLibrary.drawing_pack(inner_name, inner_type, r.extra, r.dir)
+	var id := str(p.get("id", ""))
+	pack_family = ModelPacks.family(inner_name) if id != "" else ""
+	_pack_button.visible = id != ""
+	if id == pack_id and not version_changed:
+		return
+	pack_id = id
+	if id == "":
+		_hide_pack_visuals()
+		_pack_button.tooltip_text = ""
+		return
+	var texture := ModelPacksWindow.pack_texture(p, _pack_pictures)
+	if texture != null:
+		_hide_pack_visuals()
+		_pack_image.texture = texture
+		_pack_image.visible = true
+	else:
+		_pack_image.visible = false
+		var preview := _ensure_pack_preview()
+		preview.visible = true
+		var want := ModelPacksWindow.pack_icon_model(p, _pack_models)
+		_pack_preview_want = want
+		if want == "":
+			preview.show_model("")
+		elif preview.model != want:
+			_apply_pack_preview.call_deferred(want)
+		elif not preview.settled() or preview._still_renders > 0 or preview._rendered_size != preview.viewport.size:
+			preview._wake_render(1 if preview.settled() and preview._rendered_size == preview.viewport.size else 2)
+	var lines := PackedStringArray(["Model: %s" % str(p["title"])])
+	var credit := ModelPacksWindow.credit_line(p)
+	if credit != "":
+		lines.append(credit)
+	lines.append("Click to open it in Model packs")
+	_pack_button.tooltip_text = "\n".join(lines)
+
+
+## The pack symbol's click: the Model packs window on its pack, the entity's family shown.
+func open_pack_window() -> void:
+	if pack_id != "" and open_pack.is_valid():
+		open_pack.call(pack_id, pack_family)
+
+
+## The record to show: `r`, or the one shown while the mouse is on the panel or heading straight for
+## it from the entity (HOLD_MSEC at most), so the pack symbol can be reached and clicked.
+func _held(r, mouse: Vector2):
+	if not show_pack or not mouse.is_finite() or _seen_rec == null or not visible or _pack_button == null or not _pack_button.visible \
+			or is_same(r, _seen_rec):
+		_left_msec = -1
+		_heading = false
+		_last_mouse = mouse
+		return r
+	var now := Time.get_ticks_msec()
+	var rect := get_global_rect()
+	var hold := false
+	if rect.grow(Kit.px(6)).has_point(mouse):
+		hold = true
+		_heading = true
+		_left_msec = now  # on the panel it holds; off it again, the time runs from there
+	else:
+		if _left_msec < 0:
+			_left_msec = now
+		var step := mouse - _last_mouse if _last_mouse.is_finite() else Vector2.ZERO
+		if step.length() >= 0.5:
+			_heading = heads_for(rect, _last_mouse, step)
+		hold = _heading and now - _left_msec <= HOLD_MSEC
+	_last_mouse = mouse
+	# The held building as the world has it now: gone (mined, destroyed) lets go; its chunk sent again
+	# gives a new record (perhaps another pack), shown in the old one's place.
+	var now_rec = _current(_seen_rec) if hold else null
+	if now_rec == null:
+		_left_msec = -1
+		_heading = false
+		return r
+	return now_rec
+
+
+## A record as the world holds it now, by its key (a new record when its chunk came again), or null
+## when the world no longer has it.
+func _current(rec):
+	var world = player.get("world") if player != null else null
+	if world == null:
+		return rec
+	var entities = world.get("entities")
+	if not (entities is Dictionary):
+		return rec
+	return (entities as Dictionary).get(rec.key)
+
+
+## Whether a mouse at `from` moving by `step` heads for `rect`: the point as far along its way as
+## the rect's middle is from it lies within the rect, widened by half its height.
+static func heads_for(rect: Rect2, from: Vector2, step: Vector2) -> bool:
+	if step.length() <= 0.0:
+		return false
+	var middle := rect.get_center()
+	var ahead := from + step.normalized() * from.distance_to(middle)
+	return step.dot(middle - from) > 0.0 and rect.grow(rect.size.y * 0.5).has_point(ahead)
+
+
+## A resource has no unit number: `hinfo` asks for it by this key of its place (negative, so no unit has it).
+static func resource_key(fixed: Vector2i) -> int:
+	return -1 - (absi(fixed.x * 73856093 ^ fixed.y * 19349663) % 1000000000)
+
+
+## Factorio's lines for a resource (L6): its amount now (`hinfo` ra, else the record's), an infinite one's yield
+## (the amount over its normal amount: crude oil's 100% at 300,000), the fluid mining it needs ("Requires") and
+## the drills that mine it ("Mined by"), from its Factoriopedia page.
+func _resource_lines(r, stats: Dictionary, info: Dictionary) -> void:
+	var amount := int(info.get("ra", r.extra.get("a", -1)))
+	if amount >= 0:
+		if stats.has("rinf") and float(stats.get("rnormal", 0.0)) > 0.0:
+			_line("Yield: %d%%" % roundi(amount * 100.0 / float(stats["rnormal"])))
+		else:
+			_line("Amount: %s" % thousands(amount))
+	if str(stats.get("fluid_req", "")) != "":
+		_line("Requires: %s" % Kit.pretty(str(stats["fluid_req"])), Kit.WHITE, str(stats["fluid_req"]))
+	var by: Array = stats.get("mined_by") if stats.get("mined_by") is Array else []
+	if by.is_empty():
+		return
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", Kit.px(4))
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var head := Kit.label("Mined by:")
+	head.add_theme_font_override("font", Kit.font("bold"))
+	row.add_child(head)
+	for drill in by:
+		var t := TextureRect.new()
+		Kit.icon_into(t, str(drill))
+		t.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		t.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		t.custom_minimum_size = Kit.pxv(20, 20)
+		t.texture_filter = Kit.ICON_FILTER
+		t.tooltip_text = Kit.entity_name(str(drill))
+		row.add_child(t)
+	_lines.add_child(row)
+
+
+## A whole number with Factorio's thousands commas: 1,234,567.
+static func thousands(n: int) -> String:
+	var digits := str(absi(n))
+	var out := ""
+	while digits.length() > 3:
+		out = "," + digits.substr(digits.length() - 3) + out
+		digits = digits.substr(0, digits.length() - 3)
+	return ("-" if n < 0 else "") + digits + out
+
+
+## The map view's resource patch under the mouse (L6): its picture and name, then the amounts summed (an
+## infinite resource's yields: Factorio's "Crude oil combined yield 345%").
+func _show_patch(patch: Dictionary) -> void:
+	var name := str(patch.get("n", ""))
+	var key := "patch|%s|%s|%s|%s" % [name, patch.get("a", 0), patch.get("y", -1), patch.get("q", 0)]
+	visible = true
+	_seen_rec = null
+	if key == _key:
+		return
+	_key = key
+	_craft_bar = null
+	_fuel_bar = null
+	for c in _lines.get_children():
+		_lines.remove_child(c)
+		c.queue_free()
+	_title.text = Kit.entity_name(name)
+	Kit.icon_into(_icon, name)
+	_status.get_parent().visible = false
+	_pack_button.visible = false
+	_hide_pack_visuals()
+	_pack_seen = ""
+	pack_id = ""
+	if patch.has("y"):
+		_line("%s combined yield %d%%" % [Kit.entity_name(name), int(patch["y"])])
+	else:
+		_line("Amount: %s%s" % ["at least " if patch.has("more") else "", thousands(int(patch.get("a", 0)))])
 	reset_size()
 
 
@@ -322,7 +649,7 @@ func _rates(io: Dictionary) -> void:
 			row.add_theme_constant_override("separation", Kit.px(4))
 			row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 			var t := TextureRect.new()
-			t.texture = Kit.item_icon(str(rec[1]))
+			Kit.icon_into(t, str(rec[1]))
 			t.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 			t.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 			t.custom_minimum_size = Kit.pxv(20, 20)
@@ -465,7 +792,7 @@ func _power_state(r) -> int:
 	return int(power.power_state(r.unit)) if power != null and power.has_method("power_state") else -1
 
 
-## What Factorio's entity info adds for modules and beacons: the modules in it, a beacon's
+## What Factorio's entity info adds for modules and beacons (G12): the modules in it, a beacon's
 ## distribution effectivity and the machines it reaches, a machine's beacons, then the effects (a
 ## machine's total; a beacon's its modules' sum, which 2.1.23 reports before the distribution
 ## effectivity), green where they help, red where they cost.
@@ -482,7 +809,7 @@ func _effect_lines(info: Dictionary, beacon: bool) -> void:
 		row.add_child(head)
 		for m in mods:
 			var t := TextureRect.new()
-			t.texture = Kit.item_icon(str(m[0]))
+			Kit.icon_into(t, str(m[0]))
 			t.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 			t.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 			t.custom_minimum_size = Kit.pxv(20, 20)
@@ -530,7 +857,7 @@ func _line(text: String, color := Kit.WHITE, item := "") -> void:
 	row = HBoxContainer.new()
 	row.add_theme_constant_override("separation", Kit.px(4))
 	var t := TextureRect.new()
-	t.texture = Kit.item_icon(item)
+	Kit.icon_into(t, item)
 	t.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	t.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	t.custom_minimum_size = Kit.pxv(20, 20)

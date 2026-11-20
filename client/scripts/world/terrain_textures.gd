@@ -49,6 +49,35 @@ const WATER_MASKS := ["tile_collision_masks.water(", "tile_collision_masks.shall
 ## The same without an install (the mock's tiles), besides any name with "water" in it.
 const WATER_NAMES := ["ammoniacal-ocean", "ammoniacal-ocean-2", "gleba-deep-lake"]
 
+## The ground's surface by tile family (owner: paving and ground glared pale with the sun low behind the
+## scene): [name part, roughness, specular], the first part found in the tile's name wins; anything else
+## is NATURAL_SURFACE. Ground is never metal. Specular stays low because Godot's Fresnel brings back most of
+## the sun's highlight at grazing angles unless F0 (0.16 x specular^2) is tiny; roughness alone doesn't
+## stop it. Water has its own shader. terrain_mesher.gd puts each tile's into CUSTOM1.w (surface_code),
+## terrain.gdshader reads it; --ground-rough=off draws 0.2.2's (one value for natural ground, one for floors).
+const SURFACES := [
+	["refined-hazard-concrete", 0.88, 0.12], ["refined-concrete", 0.88, 0.12],
+	["hazard-concrete", 0.9, 0.1], ["concrete", 0.9, 0.1],
+	["stone-path", 0.92, 0.08], ["landfill", 0.95, 0.05],
+	["space-platform-foundation", 0.85, 0.15], ["foundation", 0.9, 0.08], ["ice-platform", 0.85, 0.12],
+	["ice-smooth", 0.8, 0.15], ["ice", 0.88, 0.1], ["artificial", 0.93, 0.06],
+]
+const NATURAL_SURFACE := Vector2(0.95, 0.05)  # grass, dirt, sand, desert, volcanic rock...
+const NATURAL_CODE := 95.05  # surface_code(NATURAL_SURFACE)
+
+
+## A tile's [roughness, specular] (SURFACES).
+static func surface_of(tile_name: String) -> Vector2:
+	for row in SURFACES:
+		if tile_name.contains(row[0]):
+			return Vector2(row[1], row[2])
+	return NATURAL_SURFACE
+
+
+## The surface as one float for a vertex: roughness in hundredths plus the specular (under 1); 0: none.
+static func surface_code(surface: Vector2) -> float:
+	return roundf(clampf(surface.x, 0.01, 1.0) * 100.0) + clampf(surface.y, 0.0, 0.99)
+
 
 ## How one tile type is drawn.
 class TileGfx:
@@ -69,6 +98,8 @@ class TileGfx:
 	var tint := Color.WHITE
 	## How much sky the water shader shows in it (1: water; murky swamps less).
 	var reflect := 1.0
+	## [roughness, specular] (SURFACES), as surface_code for the mesh.
+	var surface: float = NATURAL_CODE
 
 	## The slot (in tiles) of the variant tile (x, y) of the world shows, decided per aligned block
 	## so the result is the same in every chunk rebuild and session. (lx, ly) is the tile in its
@@ -207,6 +238,7 @@ static func lookup(tile_name: String) -> TileGfx:
 	g.name = tile_name
 	g.name_hash = tile_name.hash()
 	g.water = is_water_tile(tile_name)
+	g.surface = surface_code(surface_of(tile_name))
 	var block := ""
 	if not disabled and ItemIcons.factorio_data_dir() != "":
 		_read_defs()

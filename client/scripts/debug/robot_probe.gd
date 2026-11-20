@@ -1,6 +1,6 @@
 extends Node
 ## --robot-probe=<out.json>[@seconds]: stands still and records what each frame costs with the
-## movers in view (the frame rate drops with many robots): frame time, the movers' and their
+## movers in view (G3: the frame rate drops with many robots): frame time, the movers' and their
 ## animations' script time (movers.gd, vehicle_anim.gd), message handling, the renderer's draw calls,
 ## objects and primitives, its CPU and GPU time. Waits until the mover count has held (within a
 ## few: trains come and go) for 3 s with every model made, or 60 s at most, then records, writes a

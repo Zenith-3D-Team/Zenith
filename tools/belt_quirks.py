@@ -58,6 +58,10 @@ try:
     kinds = bwc.kinds_from_stream(d / "stream.jsonl", truth)
 except Exception:  # noqa: BLE001
     kinds = {}
+if not kinds:
+    # Without the stream no drawn item has a kind, so every game item reads missing and every drawn one a phantom.
+    print("warning: no item kinds from %s (copy the scene's stream.jsonl beside draw.bin): missing and phantom "
+          "will read about 100%%" % (d / "stream.jsonl"), file=sys.stderr)
 # Lane centre lines, sampled every 1/16 tile, in 0.25-tile cells (off belt, wrong lane).
 CELL = 0.25
 line_pts = collections.defaultdict(list)
@@ -149,9 +153,11 @@ for h, ids, recs, gone, paths in bvc.dump_frames(d / "draw.bin"):
     n = int(h["n"])
     if apply_at.get(n) is not None and T0 <= apply_at[n] <= T1:
         lk = {int(vv[0][3]) for vv in state.items.values() if vv[1][14] > 0.5 and vv[1][13] < 0.5}
+        lmv = {int(vv[0][3]) for vv in state.items.values() if vv[1][14] > 0.5 and vv[1][13] < 0.5 and vv[0][6] > 0}
+        lop = {int(vv[0][3]): int(vv[0][7]) for vv in state.items.values() if vv[1][14] > 0.5 and vv[1][13] < 0.5}
         masked = set()
         for k in lk:
-            masked |= cells(k)
+            masked |= cells(k, k in lmv, lop.get(k, 0))  # (belt_view_check.lane_cells; its open ends, mask_open)
     v = h.get("view")
     if v:
         cur_view = (float(v[0]), float(v[1]), float(v[0]) + float(v[2]), float(v[1]) + float(v[3]))
@@ -281,12 +287,16 @@ except OSError:
     pass
 gx_all = 0.0
 views_scored = {}
+# (The recorded lanes' box grown by the frozen and sliding checks' edge margin, half a tile: the lanes' own box,
+# their centre lines', is no wider than a line, so on a scene of one straight run, as tools/belt_line_end.py's,
+# nothing was ever inside it by half a tile and those checks counted nothing.)
+box_m = (lanes_box[0] - 0.5, lanes_box[1] - 0.5, lanes_box[2] + 0.5, lanes_box[3] + 0.5)
 for t in ticks:
     b = views[t]
     if b is not None:
-        b = (max(b[0], lanes_box[0]), max(b[1], lanes_box[1]), min(b[2], lanes_box[2]), min(b[3], lanes_box[3]))
+        b = (max(b[0], box_m[0]), max(b[1], box_m[1]), min(b[2], box_m[2]), min(b[3], box_m[3]))
     else:
-        b = lanes_box  # (no camera: a replay's job sees everything)
+        b = box_m  # (no camera: a replay's job sees everything)
     if area:
         b = (max(b[0], area[0]), max(b[1], area[1]), min(b[2], area[2]), min(b[3], area[3]))
     if t in sq_at:

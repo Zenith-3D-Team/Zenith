@@ -173,6 +173,8 @@ var _muzzles := {}  # model -> muzzle point in model space
 var _beam_materials := {}  # kind -> ShaderMaterial (null when the sheet is missing)
 ## True once a `pj` message has come: the game's beam and stream entities are drawn from it.
 var game_beams := false
+## How far the railgun's beam runs (the Model packs window's preview keeps it in its picture).
+var railgun_length := RAILGUN_LENGTH
 
 
 ## A new game, or (`keep_beams`) another surface of the same one, whose bridge still sends `pj`.
@@ -313,7 +315,7 @@ func _advance(st: TurretState, delta: float) -> void:
 ## Which way a head's barrels point in its own model. Ours face north; FUE5's gun turret was
 ## modelled with its barrels to the west.
 static func head_front(part: ModelLibrary.AnimPart) -> Vector3:
-	if part.model == "gun-turret" and ModelLibrary._source(part.model).contains("/assets/models/fue5/"):
+	if part.model == "gun-turret" and part.source.contains("/assets/models/packs/fue5/"):
 		return Vector3.LEFT
 	return Vector3.FORWARD
 
@@ -511,8 +513,8 @@ func _beam_start(st: TurretState, kind: String) -> void:
 	st.beam_left = float(spec[9])
 	st.beam_age = 0.0
 	if kind == "railgun":
-		st.target = st.muzzle + (st.target - st.muzzle).normalized() * RAILGUN_LENGTH if st.target.distance_to(st.muzzle) > 0.1 \
-			else st.muzzle + st.forward * RAILGUN_LENGTH
+		st.target = st.muzzle + (st.target - st.muzzle).normalized() * railgun_length if st.target.distance_to(st.muzzle) > 0.1 \
+			else st.muzzle + st.forward * railgun_length
 		st.target_seen = _clock
 
 

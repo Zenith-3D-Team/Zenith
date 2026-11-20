@@ -10,7 +10,8 @@ extends Node
 ## - spinning parts (drill heads, assembler arms, steam engine flywheels) turn while the mod
 ##   reports the machine working (`st`, world.working), spinning up and coasting to a stop;
 ## - glowing surfaces (furnace fire, `anim_glow_*` parts) fade in and out with the working
-##   state (activity_glow);
+##   state (activity_glow); an inserter's (a modeller's burner inserter's lit burner) with its hand's
+##   motion instead (ARM_STATE_TYPES, arm_moving);
 ## - cycling parts (ModelLibrary.CYCLES: pistons, crusher jaws) slide or swing once per loop of
 ##   Factorio's animation while the machine works;
 ## - rocking parts (the pumpjack's beam) see-saw with their model's crank;
@@ -61,6 +62,22 @@ const STATE_TYPES := {
 	"thruster": true, "rail-signal": true, "rail-chain-signal": true, "accumulator": true,
 	"power-switch": true, "splitter": true, "lane-splitter": true,
 }
+## Entity types whose glow follows their hand rather than `st` (the bridge sends none for inserters): lit
+## while inserter_arms.gd draws the hand moving (arm_moving), dark while it waits and where no live arm is
+## drawn (past the bridge's hands radius the arm rests). A burner inserter burns fuel only as its hand moves
+## (Factorio's energy_per_movement and energy_per_rotation, no drain; its burner's light_flicker is black and
+## its sprite has no fire), so a modeller's lit burner (Vasillo's burner-inserter.glb) burns only then (L4).
+## --inserter-glow=always: lit all the time, as before.
+const ARM_STATE_TYPES := {"inserter": true}
+static var arm_glow := true
+## Entity types whose glow follows their temperature (the bridge's `ht`, fluids_power.gd heat): lit from
+## Factorio's minimum_glow_temperature (the heat pipe's 350 °C; its heated pictures show from there),
+## dark below it and where no temperature is heard (past the bridge's fluids radius). FUE5's heat pipes
+## glow by their copper's emission. --heat-glow=always: lit all the time, as any glowing model without a
+## state.
+const HEAT_STATE_TYPES := {"heat-pipe": true}
+const HEAT_GLOW_MIN := 350
+static var heat_glow := true
 ## `st`'s state for a belt or loader switched off by the circuit network (the mod's belt_switch.lua).
 ## What can be switched off, and an instance's custom data while its surface stands still (the model
 ## shader's BELT_OFF; a glowing model's instances say so with flag 8 of their timed data).
@@ -96,6 +113,8 @@ const MODEL_SPEEDS := {"burner-mining-drill": 0.9, "burner-mining-drill-east": 0
 ## and rack move while items pass through it, from the mod's `st`.)
 const ALWAYS_ON := {"tail_fish": true}
 const DEFAULT_SPIN := 0.5
+## Tiles a second a wheel rolls at in the Model packs preview (a train pulling away).
+const PREVIEW_ROLL_SPEED := 3.0
 ## Seconds to get about two thirds of the way to full speed, or to a stop (the shader's ANIM_*).
 const SPIN_UP := 0.35
 const SPIN_DOWN := 0.9
@@ -197,7 +216,7 @@ class Group:
 	var keys: Array = []
 	var units := PackedInt64Array()
 	var bases: Array[Transform3D] = []
-	var stateful := PackedByteArray()  # 1 where the entity reports a working state
+	var stateful := PackedByteArray()  # state_source per instance: 1 the entity reports a working state, 2 its hand says
 	## Each instance's custom data as last set, so nothing reads it back from the RenderingServer
 	## (a wait for the render thread when it runs on its own).
 	var customs := PackedColorArray()
@@ -295,17 +314,83 @@ var _migrate: Array = []  # chunk coords whose groups still need moving onto the
 var _cleanup_timer := 0.0
 ## --worm-state=<0|1|2>: every worm folded, prepared or attacking (for looking at them).
 var _worm_override := -1.0
+## (ARM_STATE_TYPES) The inserters whose hand inserter_arms.gd draws moving now (unit -> 1), and those
+## a glowing group holds (unit -> true): only theirs are written again when a hand starts or stops.
+var arm_working := {}
+var _arm_units := {}
+## (HEAT_STATE_TYPES) The heat pipes hot enough to glow (unit -> 1), and those a glowing group holds.
+var heat_working := {}
+var _heat_units := {}
+
+## Group.stateful: the entity's glow and parts follow `st` (world.working), or its hand (arm_working).
+const STATE_REPORTED := 1
+const STATE_ARM := 2
+const STATE_HEAT := 3
 
 
 func _ready() -> void:
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--worm-state="):
 			_worm_override = float(arg.get_slice("=", 1))
+		elif arg.begins_with("--inserter-glow="):
+			arm_glow = arg.get_slice("=", 1) != "always"
+		elif arg.begins_with("--heat-glow="):
+			heat_glow = arg.get_slice("=", 1) != "always"
 	_update_clock()
 
 
 static func has_state(proto_type: String) -> bool:
 	return STATE_TYPES.has(proto_type)
+
+
+## Where an entity type's glow and moving parts take their state from (Group.stateful): 0 none (always
+## working), STATE_REPORTED the bridge's `st`, STATE_ARM its hand (ARM_STATE_TYPES).
+static func state_source(proto_type: String) -> int:
+	if STATE_TYPES.has(proto_type):
+		return STATE_REPORTED
+	if arm_glow and ARM_STATE_TYPES.has(proto_type):
+		return STATE_ARM
+	if heat_glow and HEAT_STATE_TYPES.has(proto_type):
+		return STATE_HEAT
+	return 0
+
+
+## inserter_arms.gd: an inserter's drawn hand started or stopped moving (L4). Its glow eases on or off
+## from now; one whose model doesn't glow is only noted (a group made later reads it).
+func arm_moving(rec, moving: bool) -> void:
+	if rec == null:
+		return
+	var unit := int(rec.unit)
+	if moving == arm_working.has(unit):
+		return
+	if moving:
+		arm_working[unit] = 1
+	else:
+		arm_working.erase(unit)
+	if _arm_units.has(unit):
+		state_changed(rec)
+
+
+## fluids_power.gd: a complete `ht` came (unit -> °C). Heat pipes crossing HEAT_GLOW_MIN, or no longer
+## heard, ease on or off from now; only those a glowing group holds are written again.
+func heat_changed(temperatures: Dictionary) -> void:
+	var now := {}
+	for unit in temperatures:
+		if int(temperatures[unit]) >= HEAT_GLOW_MIN:
+			now[int(unit)] = 1
+	var changed: Array = []
+	for unit in heat_working:
+		if not now.has(unit):
+			changed.append(unit)
+	for unit in now:
+		if not heat_working.has(unit):
+			changed.append(unit)
+	heat_working = now
+	if world == null:
+		return
+	for unit in changed:
+		if _heat_units.has(unit):
+			state_changed(world.entities.get(unit))
 
 
 ## A moving part's or glowing model's custom data as the parts this node turns read it: the
@@ -317,6 +402,10 @@ static func custom_for(rec, level: float) -> Color:
 func reset() -> void:
 	_states.clear()
 	_migrate.clear()
+	arm_working.clear()
+	_arm_units.clear()
+	heat_working.clear()
+	_heat_units.clear()
 
 
 ## The clock time now (seconds since this node started).
@@ -392,6 +481,12 @@ static func setup_part(part: ModelLibrary.AnimPart) -> void:
 				amount = ROCK_AMPLITUDE
 				range_lo = -amount
 				range_hi = amount
+			elif kind.begins_with("wheel"):
+				# Only the Model packs preview times a wheel (movers.gd rolls them by the distance
+				# driven): rolling forward at PREVIEW_ROLL_SPEED, its top towards the front (-Z).
+				motion = MOTION_SPIN
+				part.rate = -PREVIEW_ROLL_SPEED / (TAU * part.wheel_radius())
+				range_hi = TAU
 			elif BOB_PHASE.has(kind):
 				motion = MOTION_BOB
 				part.rate = float(BOB_SPEEDS.get(part.model, 1.0))
@@ -437,6 +532,7 @@ static func setup_part(part: ModelLibrary.AnimPart) -> void:
 		if motion == MOTION_BAKED:
 			m.set_shader_parameter("bake_tex", part.bake["tex"])
 			m.set_shader_parameter("bake_frames", int(part.bake["frames"]))
+			m.set_shader_parameter("bake_snap", float(part.bake.get("snap", -2.0)))
 		m.set_shader_parameter("anim_amount", amount)
 		m.set_shader_parameter("anim_slide", part.slide)
 		m.set_shader_parameter("anim_axis", axis)
@@ -498,6 +594,14 @@ static func place(group: Group, anim: Node, working: Dictionary) -> void:
 func _place(group: Group, working: Dictionary) -> void:
 	var t0 := Time.get_ticks_usec()
 	group.epoch = _epoch
+	if group.stateful.has(STATE_ARM):
+		for i in group.units.size():
+			if group.stateful[i] == STATE_ARM:
+				_arm_units[group.units[i]] = true
+	if group.stateful.has(STATE_HEAT):
+		for i in group.units.size():
+			if group.stateful[i] == STATE_HEAT:
+				_heat_units[group.units[i]] = true
 	match group.kind:
 		KIND_WORM, KIND_TURRET, KIND_COLLECTOR, KIND_STILL:
 			for i in group.keys.size():
@@ -525,10 +629,14 @@ func _write(group: Group, i: int, working: Dictionary) -> void:
 	var start := _epoch * EPOCH
 	var parity := 2 if _epoch % 2 == 1 else 0
 	var custom: Color
+	if group.stateful[i] == STATE_ARM:
+		working = arm_working  # (an inserter: its hand says, L4)
+	elif group.stateful[i] == STATE_HEAT:
+		working = heat_working  # (a heat pipe: its temperature says)
 	match group.kind:
 		KIND_GLOW, KIND_TIMED:
 			var always := part != null and (ALWAYS_ON.has(part.kind) or ALWAYS_MOVING.has(part.model) or _always_baked(part))
-			var st := _motion(key, unit, always, group.stateful[i] == 1, working, part != null and _splitter_roller(part))
+			var st := _motion(key, unit, always, group.stateful[i] != 0, working, part != null and _splitter_roller(part))
 			if st.at < start:
 				st.change(start, st.on, st.glowing)  # the same motion, on the current clock
 			var loops := 0.0
@@ -668,6 +776,19 @@ func strike(at: Vector2, caught := true) -> void:
 func clock() -> Vector2:
 	var cur := _time - _epoch * EPOCH
 	return Vector2(cur, cur + EPOCH) if _epoch % 2 == 0 else Vector2(cur + EPOCH, cur)
+
+
+## An animator out of the world (the Model packs window's preview, preview_anim.gd) on a clock it is
+## given: time `t`, on the same epochs; the shader's clock written only with `drive` (when no world's
+## animator writes it). Whether that changed the epoch (its instances are then written again).
+func set_time(t: float, drive := true) -> bool:
+	var was := _epoch
+	_time = t
+	if drive:
+		_update_clock()
+	else:
+		_epoch = int(floor(_time / EPOCH))
+	return _epoch != was
 
 
 func _update_clock() -> void:

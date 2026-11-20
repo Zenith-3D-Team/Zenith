@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The worm (big-worm-turret.glb), built to Factorio's own pictures of it.
+"""The worm (big-worm-turret.glb, in the placeholders pack), built to Factorio's own pictures of it.
 
     python tools/models/worm.py            # needs the venv and a Factorio install
 
@@ -36,6 +36,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import creature_score as cs  # noqa: E402
+import packs  # noqa: E402
 import turntable as tt  # noqa: E402
 
 NAME = "big-worm-turret"
@@ -159,7 +160,7 @@ def disc(centre, normal, radius, sides=16):
     return np.array(verts), np.array(faces)
 
 
-def build(raw, out_dir=tt.MODELS):
+def build(raw, out_dir=None):  # None: its pack
     import trimesh
     import wube
     import wube_recipes
@@ -198,7 +199,7 @@ def build(raw, out_dir=tt.MODELS):
     for m, mesh in parts:
         by.setdefault(m, []).append(mesh)
     groups = [(m, wube.shaded(trimesh.util.concatenate(ms))) for m, ms in by.items()]
-    path = os.path.join(out_dir, NAME + ".glb")
+    path = os.path.join(out_dir, NAME + ".glb") if out_dir else packs.out_path(NAME)
     wube.write_glb(path, groups, palette, alpha, "Zenith; shape measured from Factorio's worm sprites")
     print("wrote %s: %d triangles, body to %.2f tiles (radius %.2f at the base, %.2f at the head)" % (
         os.path.relpath(path, tt.REPO), sum(len(m.faces) for _, m in groups), h, prof[0][1], r_top))

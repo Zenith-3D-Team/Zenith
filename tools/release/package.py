@@ -4,6 +4,7 @@ server scripts beside it, zipped as dist/Zenith-<version>-<platform>.zip. Upload
     python3 tools/release/package.py [--godot <godot exe>] [--channel public|dev]
         [--platform windows|linux|linux-arm64|windows-arm64|macos|supported|unsupported|all]
         [--no-addons] [--addon <add-on folder>[:off]]... [--models <folder>]
+    python3 tools/release/package.py --models <folder> --zenith-zip <out.zip>   # the zip alone
 
 Two channels (owner: public downloads carry no testing tools; development builds do). `public`, the
 default, is the release on the public repo. `dev` is a development build for testers:
@@ -21,12 +22,15 @@ release (or its default branch when it has none) into addons/<id>_<version>.zip,
 addons/bundled.json giving each one's first state (addon_loader.gd). --addon <folder>[:off] bundles a
 local folder instead of (or besides) them; --no-addons leaves them all out.
 
---models <folder> puts a modeller's models (the .glb and .gltf files at the folder's top, with any
-files a .gltf points at) into the download's models/ folder beside the program. Zenith reads that
-folder at start-up and a model there replaces its own of the same name (model_library.gd
-custom_models_dir), so the download shows them out of the box; `-- --no-custom-models` leaves them
-out. Only for builds whose modeller agreed (releases with Vasillo's models): the
-models aren't Zenith's, and the README.txt there says so.
+--models <folder> zips a modeller's models (the .glb and .gltf files at the folder's top and in its
+items/ folder, with any files a .gltf points at) into the download's models/Zenith.zip beside the program, with a pack.json
+(name "Zenith", author Vasillo, his permission) and a README.txt. Zenith reads that folder at
+start-up and the zip is a model pack (model_packs.gd), on top of the built-in ones (FUE5, Wube3DP,
+Placeholders) the first time, so the download shows them out of the box; the Model packs window
+moves it or turns it off, and `-- --no-custom-models` leaves it out. Only for builds whose modeller
+agreed (development builds with Vasillo's models): the models aren't Zenith's, and the zip and
+the models folder's README.txt say so. --zenith-zip <out.zip> (or its old name
+--default-zip) writes that zip alone (a source build's models/Zenith.zip) and builds nothing else.
 
 windows and linux are the downloads Zenith supports. linux-arm64 (issue #8), windows-arm64 and
 macos (a universal app: Apple Silicon and Intel) are UNSUPPORTED (owner's label): built the same way, never run by
@@ -38,9 +42,11 @@ Templates, or the .tpz from Godot's releases page unpacked into its templates fo
 exported client finds `mod/` and `server/` next to its own executable (client/scripts/menu/paths.gd),
 so the zip unpacks into one folder that runs as it is.
 
-The native belt simulation (client/native/belt_sim.gdextension, docs/RUNNING.md) is exported by Godot
-itself: the Windows download gets client/native/bin's DLL beside Zenith.exe when it is there (it is
-committed; nothing here builds it). The other platforms have no library and run belt_sim.gd.
+The native belt simulation (client/native/belt_sim.gdextension, docs/RUNNING.md) is copied here, not
+exported by Godot: client/native/ is hidden from Godot's editor (client/scripts/native_library.gd loads
+it, so platforms without it log no errors). The Windows download gets the .gdextension and
+client/native/bin's DLL beside Zenith.exe when the DLL is there (it is committed; nothing here builds
+it). The other platforms have no library and run belt_sim.gd.
 """
 
 import argparse
@@ -57,7 +63,8 @@ import sys
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-# BeltSimNative's library (client/native/belt_sim.gdextension), which Godot exports beside the program.
+# BeltSimNative's library and its .gdextension, put beside the program for native_library.gd to load.
+NATIVE_CONFIG = ROOT / "client" / "native" / "belt_sim.gdextension"
 NATIVE_DLL = "belt_sim.windows.template_release.x86_64.dll"
 MOD = ROOT / "mod" / "factorio-3d-bridge"
 # platform -> (export preset, the program's name in the folder). macOS's export is a .zip holding
@@ -109,8 +116,8 @@ SERVER_FILES = ["server-settings.json", "run-server.ps1", "run-headless.sh", "do
 # their per-model lists and licence terms go beside it, as the licences ask.
 DOCS = [("LICENSE", "LICENSE.txt"), ("LICENSING.md", "LICENSING.md"), ("CREDITS.md", "CREDITS.md"), ("docs/USER-GUIDE.md", "USER-GUIDE.md"),
         ("docs/ADDONS.md", "ADDONS.md"), ("docs/MODELLERS.md", "MODELLERS.md"),
-        ("client/assets/models/CREDITS.md", "MODEL-CREDITS.md"),
-        ("client/assets/models/fue5/README.md", "FUE5-MODELS.md"),
+        ("client/assets/models/packs/wube3dp/CREDITS.md", "MODEL-CREDITS.md"),
+        ("client/assets/models/packs/fue5/README.md", "FUE5-MODELS.md"),
         ("client/assets/branding/README.md", "LOGO-LICENCE.md")]
 # The testing tools' own docs, only in a dev build.
 DEV_DOCS = [("docs/PERFORMANCE-TEST.md", "PERFORMANCE-TEST.md")]
@@ -125,8 +132,14 @@ MODELS_README = """Your own 3D models for Zenith.
 
 Put a .glb file here named after the Factorio entity it draws, and Zenith uses it in place of its
 own model of that name the next time it starts. Everything not here keeps Zenith's own model; with
-nothing here, Zenith looks as it always does. Settings > Graphics > Your models says how many are
-in use and opens this folder.
+nothing here, Zenith looks as it always does.
+
+Model packs go here too, like texture packs: a .zip as you downloaded it (no need to unpack it) or a
+folder, its models anywhere inside. The loose .glb files here count as one pack. The Model packs
+window (the main menu, the Esc menu, Settings) lists them beside Zenith's own (FUE5, Wube3DP and
+Placeholders, built in), with how many models each has: move them between Available and Selected,
+order them (when two packs have a model of the same name, the higher one wins), and pick a pack for
+any one model with its preview. It also opens this folder.
 
 Names are Factorio's internal names, for example:
   transport-belt.glb, transport-belt-curve-left.glb, transport-belt-curve-right.glb
@@ -137,7 +150,8 @@ Names are Factorio's internal names, for example:
 1 unit = 1 tile, the origin at the footprint's centre on the ground, facing north (Blender +Y).
 MODELLERS.md, beside Zenith, has every name, the moving parts and the materials belts need.
 
-To start Zenith with its own models only, without removing these: start it with
+To start Zenith with its own models only, without removing these: move the packs to Available in
+the Model packs window, or start it with
   -- --no-custom-models
 after the program's name (a shortcut's Target), or empty this folder.
 """
@@ -145,16 +159,48 @@ after the program's name (a shortcut's Target), or empty this folder.
 
 # Added to the models folder's README.txt when the download comes with models in it (--models).
 MODELS_BUNDLED = """
-This download comes with {count} models already here, made by a modeller for Zenith and used with
-their permission (CREDITS.md beside Zenith says whose). They aren't Zenith's own and aren't under
-its GPL licence. Remove them, or start Zenith with -- --no-custom-models, to see Zenith's own.
+This download comes with Zenith.zip here: {count} models made by Vasillo for Zenith and used with
+his permission (CREDITS.md beside Zenith). They aren't Zenith's own and aren't under its GPL
+licence. Move Zenith to Available in the Model packs window, remove the zip, or start Zenith with
+-- --no-custom-models, to see Zenith's own.
+"""
+# The bundled models' pack (--models): models/Zenith.zip's pack.json and README.txt (it was Default.zip, "Default":
+# Zenith reads an old one as this pack).
+BUNDLED_ZIP = "Zenith.zip"
+DEFAULT_PACK = {
+    "name": "Zenith",
+    "author": "Vasillo",
+    "licence": "\u00a9 David (Vasillo), used in Zenith with his permission; not under Zenith's GPL licence",
+    # The Model packs window's line over the preview (pack.json "credit", used as it is).
+    "credit": "© Vasillo · used with permission",
+    "description": "Vasillo's textured models made for Zenith: transport belts of every tier with curves, start and end pieces, underground belts, splitters, inserters, mining drills, pipes, ores and item models.",
+    "icon": "transport-belt-curve-left",
+    # Zenith's gear (Vasillo's too, client/assets/branding/README.md), put in the zip by default_zip.
+    "icon_image": "zenith.png",
+    # His textures drawn as their files say (pack.json "shading", model_packs.gd shading()).
+    "shading": "pbr",
+    # Item lane offset from each belt's centre line tuned for Vasillo's belt rails and PBR geometry
+    # (pack.json "belt_lane_offset", belt_lane_inset.gd).
+    "belt_lane_offset": 0.16,
+    # His belt surface (the Belt_Surface mesh of transport-belt, curves, undergrounds, ends and splitter alike)
+    # tops out at 0.25: the items' lowest points rest on it, not 0.02 above it (belt_lane_inset.gd item_height).
+    "belt_item_height": 0.25,
+}
+DEFAULT_ICON = ROOT / "client" / "icon.png"
+DEFAULT_README = """Zenith: Vasillo's models for Zenith.
+
+These models were made by David (Vasillo) for Zenith and are used in it with his permission. They
+aren't Zenith's own and aren't under its GPL licence: don't pass them on apart from Zenith.
+Zenith reads this zip as it is (no need to unpack it); the Model packs window orders it among the
+other packs or turns it off.
 """
 
 
 ADDONS_README = """Zenith add-ons go here: each a .zip as you downloaded it (no need to unpack it), or a folder
 with its addon.json (or put them in Zenith's user data folder, which keeps them across updates).
 The Add-ons menu (main menu, Esc menu, Settings) lists them, with a switch, settings and keys for
-each. ADDONS.md says how to write one.
+each. An add-on is a program running with your rights, so one you add is off until you switch it on
+there: switch on only add-ons from people you trust. ADDONS.md says how to write one.
 """
 
 START_HERE = """Zenith {version}: Factorio in 3D
@@ -211,7 +257,7 @@ def export_with_etc2(godot, preset, out_exe):
                        encoding="utf-8", newline="")
     try:
         # An import pass first: the export alone stops at the setting it hasn't imported for yet.
-        subprocess.run([godot, "--headless", "--path", str(client), "--import"], capture_output=True, text=True)
+        subprocess.run([godot, "--headless", "--path", str(client), *godot_log("import " + preset), "--import"], capture_output=True, text=True)
         export(godot, preset, out_exe)
     finally:
         project.write_bytes(before)
@@ -249,9 +295,17 @@ def channel_doc(text, channel):
     return DEV_INLINE.sub("", DEV_BLOCK.sub("", text))
 
 
+def godot_log(name):
+    """`--log-file` for a build's Godot run: its log in art-src/release-logs/ (git-ignored), not the
+    project's user://logs/, where it would rotate the player's own logs away."""
+    folder = ROOT.resolve() / "art-src" / "release-logs"  # absolute: a relative one is user://'s
+    folder.mkdir(parents=True, exist_ok=True)
+    return ["--log-file", str(folder / (re.sub(r"[^\w.-]+", "_", name) + ".godot.log"))]
+
+
 def export(godot, preset, out_exe):
     out_exe.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [godot, "--headless", "--path", str(ROOT / "client"), "--export-release", preset, str(out_exe)]
+    cmd = [godot, "--headless", "--path", str(ROOT / "client"), *godot_log("export " + preset), "--export-release", preset, str(out_exe)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 or not out_exe.exists():
         log = (result.stdout + result.stderr)[-2000:]
@@ -337,15 +391,37 @@ MODEL_FILES = (".glb", ".gltf", ".bin", ".png", ".jpg", ".jpeg", ".webp", ".ktx2
 
 
 def bundled_models(folder):
-    """The model files in a --models folder (its top level only, as Zenith reads it), sorted."""
+    """The model files in a --models folder, sorted, as (file, its name in the zip): the folder's top
+    level, then its items/ folder (a pack's item models, which Zenith finds only there) as items/<name>."""
     folder = pathlib.Path(folder)
     if not folder.is_dir():
         sys.exit(f"--models {folder}: no such folder")
-    files = sorted(p for p in folder.iterdir()
-                   if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in MODEL_FILES)
+
+    def model_files(where):
+        return sorted(p for p in where.iterdir()
+                      if p.is_file() and not p.name.startswith(".") and p.suffix.lower() in MODEL_FILES)
+
+    files = model_files(folder)
+    if (folder / "items").is_dir():
+        files += model_files(folder / "items")
     if not any(p.suffix.lower() in (".glb", ".gltf") for p in files):
         sys.exit(f"--models {folder}: no .glb or .gltf files in it")
-    return files
+    return [(p, p.relative_to(folder).as_posix()) for p in files]
+
+
+def default_zip(models, out):
+    """models/Zenith.zip from a modeller's model files (bundled_models): them at its top (items/ for a pack's items), with
+    DEFAULT_PACK as its pack.json, DEFAULT_README and Zenith's gear as the pack's picture. The models
+    are stored, not deflated: .glb files hardly shrink, and Zenith unpacks the zip once (model_packs.gd) faster so."""
+    out = pathlib.Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("pack.json", json.dumps(DEFAULT_PACK, indent=1, ensure_ascii=False) + "\n")
+        z.writestr("README.txt", DEFAULT_README)
+        z.write(DEFAULT_ICON, DEFAULT_PACK["icon_image"])
+        for p, name in models:
+            z.write(p, name)
+    return sum(1 for p, _ in models if p.suffix.lower() in (".glb", ".gltf"))
 
 
 def package(godot, platform, version, addons=(), channel="public", models=()):
@@ -361,7 +437,10 @@ def package(godot, platform, version, addons=(), channel="public", models=()):
         export_fn(godot, preset, folder / exe)
     if platform == "windows":
         dll = ROOT / "client" / "native" / "bin" / NATIVE_DLL
-        print(f"  native belt simulation: {'in the download' if (folder / NATIVE_DLL).exists() else 'not exported'}"
+        if dll.exists():
+            shutil.copy2(NATIVE_CONFIG, folder / NATIVE_CONFIG.name)
+            shutil.copy2(dll, folder / NATIVE_DLL)
+        print(f"  native belt simulation: {'in the download' if dll.exists() else 'not in it'}"
               f"{'' if dll.exists() else ' (no ' + NATIVE_DLL + ' in client/native/bin: belt_sim.gd only)'}")
     shutil.copytree(MOD, folder / "mod" / "factorio-3d-bridge",
                     ignore=shutil.ignore_patterns("__pycache__", ".DS_Store", "Thumbs.db"))
@@ -381,11 +460,9 @@ def package(godot, platform, version, addons=(), channel="public", models=()):
         what, body = UNSUPPORTED[platform]
         (folder / "UNSUPPORTED.txt").write_text(UNSUPPORTED_HEAD.format(version=version, what=what) + body, encoding="utf-8")
     (folder / "models").mkdir()
-    for p in models:
-        shutil.copy2(p, folder / "models" / p.name)
-    count = sum(1 for p in models if p.suffix.lower() in (".glb", ".gltf"))
+    count = default_zip(models, folder / "models" / BUNDLED_ZIP) if models else 0
     if count:
-        print(f"  {count} model(s) in models/")
+        print(f"  {count} model(s) in models/{BUNDLED_ZIP}")
     (folder / "models" / "README.txt").write_text(MODELS_README + (MODELS_BUNDLED.format(count=count) if count else ""),
                                                   encoding="utf-8")
     (folder / "addons").mkdir()
@@ -425,8 +502,16 @@ def main():
                         help="public (the release; no testing tools) or dev (development builds: the performance test and debug menu)")
     parser.add_argument("--addon", action="append", default=[], help="a local add-on folder to bundle, :off for off (repeatable)")
     parser.add_argument("--no-addons", action="store_true", help="bundle no add-ons")
-    parser.add_argument("--models", help="a folder of a modeller's models to put in the download's models/ folder")
+    parser.add_argument("--models", help="a folder of a modeller's models to put in the download's models/" + BUNDLED_ZIP)
+    parser.add_argument("--zenith-zip", "--default-zip", dest="zenith_zip", metavar="OUT",
+                        help="with --models: write that " + BUNDLED_ZIP + " to OUT and nothing else (--default-zip: its old name)")
     args = parser.parse_args()
+    if args.zenith_zip:
+        if not args.models:
+            sys.exit("--zenith-zip needs --models <folder>")
+        count = default_zip(bundled_models(args.models), args.zenith_zip)
+        print(f"wrote {args.zenith_zip}: {count} model(s), pack.json, README.txt and zenith.png")
+        return
     version = json.loads((MOD / "info.json").read_text())["version"]
     # The game shows its version from project.godot: a download must say the same as its mod.
     shown = re.search(r'^config/version="([^"]*)"', (ROOT / "client" / "project.godot").read_text(), re.M)

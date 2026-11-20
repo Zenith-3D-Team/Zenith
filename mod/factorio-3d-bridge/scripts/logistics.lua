@@ -26,7 +26,7 @@ local ROBOT_TYPES = { "logistic-robot", "construction-robot" }
 -- Requests as plain data: [[item, min, max (-1 for none), quality?], ...]
 
 -- `owner` has sections (LuaLogisticSections or LuaLogisticPoint). A save's requests are often in
--- several sections, and in groups shared between characters and chests ("Main" in one tested
+-- several sections, and in groups shared between characters and chests ("Main" in the owner's
 -- save), so every active section counts, not only section 1.
 local function active_sections(owner)
   local ok, sections = pcall(function() return owner.sections end)

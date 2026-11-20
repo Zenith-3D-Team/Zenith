@@ -10,7 +10,7 @@ no admin rights.
 1. **Open Zenith** and, in the main menu, click **Performance test**.
 2. **Pick a mode**: Quick, Default or Extensive (below). Default is the green one.
 3. **Send the results file.** When it's done Zenith shows the results; click **Open folder** to
-   see the file, `Zenith-perf-<version>-<mode>.txt` (for example `Zenith-perf-0.2.1-default.txt`),
+   see the file, `Zenith-perf-<version>-<mode>.txt` (for example `Zenith-perf-0.2.2-default.txt`),
    and send it.
 
 ## How long it takes

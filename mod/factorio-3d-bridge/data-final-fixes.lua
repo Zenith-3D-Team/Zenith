@@ -46,3 +46,16 @@ if ok_mining then
 else
   log("[factorio-3d-bridge] mining sound list not made: " .. tostring(mining))
 end
+
+-- The character's steps from the prototypes (step 5 task 3a): each tile's, rail's, resource's and
+-- decorative's walking_sound, the belts' and heat pipes' utility sounds and armours' step sounds, which
+-- the runtime API doesn't give. session.lua sends them as `steps` (scripts/step_sounds.lua). Its own
+-- pcall: a fault here leaves the client's own table, and the other lists as they are.
+local ok_steps, steps = pcall(function()
+  return require("scripts.step_sounds").prototype(data.raw)
+end)
+if ok_steps then
+  data:extend({ steps })
+else
+  log("[factorio-3d-bridge] step sound list not made: " .. tostring(steps))
+end

@@ -18,14 +18,12 @@ import bpy
 from mathutils import Vector
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import kit  # noqa: E402
+import packs  # noqa: E402
 import specs  # noqa: E402
 from compare import FACTORIO_PITCH  # noqa: E402
-
-MODELS_DIR = os.path.join(REPO, "client", "assets", "models")
 
 
 def flat_material(name, rgb):
@@ -65,7 +63,7 @@ def main():
         print("preview: give an output .png path")
         return 1
     if not names:
-        names = sorted(f[:-4] for f in os.listdir(MODELS_DIR) if f.endswith(".glb"))
+        names = packs.names()
 
     kit.clear_scene()
     scene = bpy.context.scene
@@ -103,7 +101,7 @@ def main():
         cx, cy = pos.x, pos.y
         w, d = specs.SPECS.get(name, {"size": (1, 1)})["size"]
         before = set(bpy.data.objects)
-        bpy.ops.import_scene.gltf(filepath=os.path.join(MODELS_DIR, name + ".glb"))
+        bpy.ops.import_scene.gltf(filepath=packs.model_path(name))
         for obj in set(bpy.data.objects) - before:
             if obj.parent is None:
                 obj.location += Vector((cx, cy, 0))

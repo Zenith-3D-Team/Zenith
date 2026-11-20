@@ -6,6 +6,7 @@ extends SceneTree
 ##   godot --headless --path client -s res://tests/belt_sim_walls_test.gd     (exit 1 on failure)
 
 const BeltSim := preload("res://scripts/world/belt_sim.gd")
+const NativeLibrary := preload("res://scripts/native_library.gd")
 
 var fails := 0
 
@@ -50,7 +51,7 @@ func _at(sim: Object) -> Dictionary:
 
 func _initialize() -> void:
 	_run()
-	if ClassDB.class_exists("BeltSimNative"):
+	if NativeLibrary.ensure():
 		print("and BeltSimNative:")
 		native = true
 		_run()

@@ -182,7 +182,23 @@ end
 local CRAFTERS = { ["assembling-machine"] = true, furnace = true }
 M.CRAFTERS = CRAFTERS
 
+-- A mining drill takes fluid in while it has a fluid box (uranium ore's sulfuric acid; Factorio draws the electric
+-- drill's three fluid connectors with its `wet_mining_graphics_set`): `fa` 1, as a crafter whose recipe takes fluid,
+-- so the client draws its `-wet` model (model_library.gd wet_model). Read from the drill's own box, as the game keeps
+-- it (2.1.24: `fluids_count` 1 over uranium, kept when the ore runs out and with one uranium tile in an iron drill's
+-- area; 0 over iron alone), not guessed from what it mines.
+local function drill_arrows(e)
+  local ok, count = pcall(function() return e.fluids_count end)
+  if ok and type(count) == "number" and count > 0 then
+    return 1
+  end
+  return nil
+end
+
 function M.arrows(e)
+  if e.type == "mining-drill" then
+    return drill_arrows(e)
+  end
   if not CRAFTERS[e.type] then
     return nil
   end
@@ -206,6 +222,55 @@ function M.arrows(e)
   return mask > 0 and mask or nil
 end
 
+-- Which fluid goes in or out at each of a crafting machine's connections (L10: the owner couldn't tell
+-- an oil refinery's). Factorio draws each connection's arrow and its fluid's icon while the machine is
+-- selected or in Alt-mode (PipeConnectionDefinition::hide_connection_info). 2.1 makes a crafting
+-- machine's fluid storages from its recipe (an oil refinery on basic oil processing has two, read in
+-- 2.1.24), each filtered to its fluid, so they are read from the entity, turned and mirrored as it
+-- stands: [[dx, dy, way, flow, fluid], ...] for its ordinary connections, (dx, dy) the connection's
+-- tile from the entity's centre (tiles), way the direction its pipe leaves by (0, 4, 8, 12), flow "i",
+-- "o" or "b", fluid its name ("" when nothing says). nil when it has none or `fluid_icons` is off.
+local FLOW_LETTER = { input = "i", output = "o", ["input-output"] = "b" }
+
+local function hundredths(v)
+  return math.floor(v * 100 + 0.5) / 100
+end
+
+function M.connections(e)
+  if not perf.on("fluid_icons") then
+    return nil
+  end
+  local ok, n = pcall(function() return e.fluids_count end)
+  if not (ok and type(n) == "number") then
+    return nil
+  end
+  local p = e.position
+  local out = {}
+  for i = 1, n do
+    local okf, filter = pcall(function() return e.get_fluid_filter(i) end)
+    local name = okf and filter and filter.name or nil
+    if not name then
+      local okg, fluid = pcall(function() return e.get_fluid(i) end)
+      name = okg and fluid and fluid.name or nil
+    end
+    local okc, conns = pcall(function() return e.get_fluid_box_pipe_connections(i) end)
+    for _, c in pairs(okc and conns or {}) do
+      local at, to = c.position, c.target_position
+      if c.connection_type == "normal" and at and to then
+        local dx, dy = to.x - at.x, to.y - at.y
+        local way
+        if math.abs(dx) > math.abs(dy) then
+          way = dx > 0 and 4 or 12
+        else
+          way = dy > 0 and 8 or 0
+        end
+        out[#out + 1] = { hundredths(at.x - p.x), hundredths(at.y - p.y), way, FLOW_LETTER[c.flow_direction] or "b", name or "" }
+      end
+    end
+  end
+  return #out > 0 and out or nil
+end
+
 -- The icon as one string, to see whether it changed ("" for none).
 function M.signature(icon, arrows)
   local s = ""
@@ -224,7 +289,7 @@ end
 -- What Alt-mode shows over the entity: its icon and its arrows (either may be nil), and their signature.
 function M.state(e)
   local icon = TYPES[e.type] and M.icon(e) or nil
-  local arrows = CRAFTERS[e.type] and M.arrows(e) or nil
+  local arrows = (CRAFTERS[e.type] or e.type == "mining-drill") and M.arrows(e) or nil
   return icon, arrows, M.signature(icon, arrows)
 end
 
@@ -247,6 +312,15 @@ function M.recorded(e, icon, extra, arrows)
   elseif s.altw and s.altw[unit] then
     s.altw[unit] = nil -- its wires went: an event or the chunk's next sending tells the rest
   end
+end
+
+-- An `aiu` fa row: [unit, fluid mask, connections?] (M.connections, only with a mask).
+function M.fa_row(e, arrows)
+  local conns = arrows and M.connections(e) or nil
+  if conns then
+    return { e.unit_number, arrows, conns }
+  end
+  return { e.unit_number, arrows or 0 }
 end
 
 local function row(unit, icon)
@@ -274,7 +348,7 @@ function M.check(e, known)
     w.v = v
   end
   if v ~= known then
-    transport.send_reliable({ t = "aiu", l = { row(e.unit_number, icon) }, fa = { { e.unit_number, arrows or 0 } } })
+    transport.send_reliable({ t = "aiu", l = { row(e.unit_number, icon) }, fa = { M.fa_row(e, arrows) } })
   end
   return v
 end
@@ -287,11 +361,21 @@ end
 -- the science packs in a lab. A machine with module slots and no icons_positioning gets Factorio's
 -- documented defaults for its modules (shift {0, 0.7}, scale 0.5, separation 1.1, first row of
 -- several -0.1, up to its selection box's width / 0.75 icons a row and width / 1.5 rows).
+-- An ammo turret's ammo and a locomotive's fuel are drawn the same way (K1's leftover): 2.1's gun
+-- turret lists its turret_ammo inventory ({0, -0.25}) and its locomotive its fuel ({0, 0.3}, three a
+-- row), the only two in 2.1's data; one without an entry gets the defaults, as a machine's modules do
+-- (the old AmmoTurretPrototype::entity_info_icon_shift drew every ammo turret's ammo).
 -- Prototypes only, so the module-level caches are the same on every peer.
 
 local SEQUENCE_TYPES = { ["assembling-machine"] = true, furnace = true, ["rocket-silo"] = true,
   ["mining-drill"] = true, lab = true, beacon = true }
 M.SEQUENCE_TYPES = SEQUENCE_TYPES
+-- The types whose other inventory Alt-mode shows (`/f3d-perf alt_ammo_fuel`): the kind its row has in
+-- `isq` and the inventory's defines.inventory name.
+-- A cargo wagon's load (kind "c", `/f3d-perf alt_ammo_fuel` too) shows its most-stacked kinds in one row.
+local STOCK_TYPES = { ["ammo-turret"] = { "a", "turret_ammo" }, locomotive = { "f", "fuel" },
+  ["cargo-wagon"] = { "c", "cargo_wagon" } }
+local WAGON_SHOWN = 4
 -- The module inventory's defines.inventory name by type: crafter_modules is 2.1's, the rest 2.0's.
 local MODULE_INVENTORIES = {
   ["assembling-machine"] = { "crafter_modules", "assembling_machine_modules" },
@@ -365,10 +449,45 @@ end
 
 local sequences_cache = {}
 
+-- One `isq` row from an IconSequencePositioning (`p`; {} for Factorio's defaults).
+local function sequence_entry(kind, p, width)
+  local sx, sy = 0, 0.7
+  if p.shift ~= nil then
+    sx, sy = vec_xy(p.shift)
+  end
+  return { kind, thousandths(sx), thousandths(sy), thousandths(num(p.scale, 0.5)),
+    math.max(1, math.floor(num(p.max_icons_per_row, width / 0.75) + 1e-6)),
+    math.max(1, math.floor(num(p.max_icon_rows, width / 1.5) + 1e-6)),
+    thousandths(num(p.separation_multiplier, 1.1)), thousandths(num(p.multi_row_initial_height_modifier, -0.1)) }
+end
+
+-- An ammo turret's or a locomotive's one row: its icons_positioning entry for that inventory, else
+-- the defaults.
+local function stock_sequences(proto, stock)
+  if stock[1] == "c" then -- no icons_positioning of its own: a row along the wagon, over its middle
+    return { sequence_entry("c", { shift = { 0, 0 }, scale = 0.5, max_icons_per_row = WAGON_SHOWN, max_icon_rows = 1 },
+      box_width(proto)) }
+  end
+  local index = define_of(stock[2])
+  local ok, list = pcall(function() return proto.icons_positioning end)
+  if index and ok and type(list) == "table" then
+    for _, p in ipairs(list) do
+      if type(p) == "table" and p.inventory_index == index then
+        return { sequence_entry(stock[1], p, box_width(proto)) }
+      end
+    end
+  end
+  return { sequence_entry(stock[1], {}, box_width(proto)) }
+end
+
 -- [[kind, shift x, shift y, scale, icons a row, rows, separation, first row's lift], ...]: kind "m"
--- the modules, "l" a lab's science packs; nil when Alt-mode shows neither.
+-- the modules, "l" a lab's science packs, "a" a turret's ammo, "f" a locomotive's fuel; nil when
+-- Alt-mode shows none of them.
 local function sequences(proto)
   local t = proto.type
+  if STOCK_TYPES[t] then
+    return stock_sequences(proto, STOCK_TYPES[t])
+  end
   if not SEQUENCE_TYPES[t] then
     return nil
   end
@@ -387,14 +506,7 @@ local function sequences(proto)
   local lab_input = t == "lab" and define_of("lab_input") or nil
   local width = box_width(proto)
   local function entry(kind, p)
-    local sx, sy = 0, 0.7
-    if p.shift ~= nil then
-      sx, sy = vec_xy(p.shift)
-    end
-    return { kind, thousandths(sx), thousandths(sy), thousandths(num(p.scale, 0.5)),
-      math.max(1, math.floor(num(p.max_icons_per_row, width / 0.75) + 1e-6)),
-      math.max(1, math.floor(num(p.max_icon_rows, width / 1.5) + 1e-6)),
-      thousandths(num(p.separation_multiplier, 1.1)), thousandths(num(p.multi_row_initial_height_modifier, -0.1)) }
+    return sequence_entry(kind, p, width)
   end
   local out = {}
   local ok, list = pcall(function() return proto.icons_positioning end)
@@ -447,12 +559,24 @@ local function shown_items(inv, each)
   return out
 end
 
--- What Alt-mode shows in a machine (K1, K2): its modules and a lab's science packs, each a list as
--- shown_items makes it (empty for none), or nil, nil for an entity without such icons.
+-- What Alt-mode shows in a machine (K1, K2): its modules and its other inventory (a lab's science
+-- packs, a turret's ammo, a locomotive's fuel: one icon a filled slot), each a list as shown_items
+-- makes it (empty for none), or nil, nil for an entity without such icons.
 function M.machine_icons(e)
   local seq = M.sequences(e.prototype)
   if not seq then
     return nil, nil
+  end
+  local stock = STOCK_TYPES[e.type]
+  if stock then
+    local ok, held = pcall(function()
+      local inv = e.get_inventory(defines.inventory[stock[2]])
+      if stock[1] == "c" then
+        return M.top_names(inv, WAGON_SHOWN) or {}
+      end
+      return shown_items(inv, false)
+    end)
+    return {}, ok and held or {}
   end
   local want_m, want_l
   for _, s in ipairs(seq) do
@@ -495,7 +619,10 @@ end
 -- The machines (K1, K2; `/f3d-perf alt_machines`): those in the focus square whose prototype has
 -- module slots, and labs, are read in the same rounds, `am` {g, l} carrying those whose icons
 -- changed: [unit, modules, packs?] (each a list of items, a name or [name, quality]; modules 0
--- when there are none but packs), or [unit] when it shows none now.
+-- when there are none but packs), or [unit] when it shows none now. Ammo turrets and locomotives
+-- too (`/f3d-perf alt_ammo_fuel`): their ammo or fuel where a lab's packs go, a locomotive read
+-- where it is now (only when the client asks with `lf`: locomotive fuel icons are off by default); cargo wagons
+-- likewise, their four most-stacked kinds.
 
 local CONTAINER_TYPES = { "container", "logistic-container", "infinity-container", "linked-container" }
 local CONTAINER_SET = {}
@@ -530,25 +657,42 @@ local function present_container_types()
   return container_types
 end
 
--- The names of the prototypes whose Alt-mode shows modules or science packs.
-local function present_machine_names()
+-- The names of the prototypes whose Alt-mode shows modules or science packs, and (`stock`, with
+-- /f3d-perf alt_ammo_fuel) the ammo turrets and locomotives after them.
+local function present_machine_names(stock, loco)
   if not machine_names then
-    machine_names = {}
+    -- [1] machines and labs, [2] and the ammo turrets and cargo wagons, [3] and the locomotives too (the client's
+    -- `lf`: locomotives' fuel icons are off unless it asks).
+    machine_names = { {}, {}, {} }
     for name, proto in pairs(prototypes.entity) do
       if SEQUENCE_TYPES[proto.type] and M.sequences(proto) then
-        machine_names[#machine_names + 1] = name
+        for i = 1, 3 do
+          machine_names[i][#machine_names[i] + 1] = name
+        end
+      elseif STOCK_TYPES[proto.type] then
+        machine_names[3][#machine_names[3] + 1] = name
+        if proto.type ~= "locomotive" then
+          machine_names[2][#machine_names[2] + 1] = name
+        end
       end
     end
-    table.sort(machine_names)
+    for i = 1, 3 do
+      table.sort(machine_names[i])
+    end
   end
-  return machine_names
+  return machine_names[stock and (loco and 3 or 2) or 1]
 end
 
 -- The names of the kinds the chest holds most of (qualities together), most first, ties by name;
 -- nil when it is empty.
 function M.contents(e)
   local ok, inv = pcall(function() return e.get_inventory(defines.inventory.chest) end)
-  if not (ok and inv) then
+  return ok and M.top_names(inv, CONTENTS_SHOWN) or nil
+end
+
+-- The `n` kinds an inventory holds most of, most first (the chests' and the cargo wagons' icons).
+function M.top_names(inv, n)
+  if not inv then
     return nil
   end
   local ok_c, list = pcall(function() return inv.get_contents() end)
@@ -579,7 +723,7 @@ function M.contents(e)
     end
     return a < b
   end)
-  for i = #names, CONTENTS_SHOWN + 1, -1 do
+  for i = #names, n + 1, -1 do
     names[i] = nil
   end
   return names
@@ -590,7 +734,7 @@ end
 function M.contents_cmd(cmd)
   local s = storage.f3d
   if tonumber(cmd.on) == 1 then
-    s.altc = { g = math.floor(tonumber(cmd.g) or 0), sent = {}, msent = {}, due = game.tick }
+    s.altc = { g = math.floor(tonumber(cmd.g) or 0), sent = {}, msent = {}, due = game.tick, lf = tonumber(cmd.lf) == 1 }
   else
     s.altc = nil
   end
@@ -646,7 +790,7 @@ local function contents_tick()
     if not (surface and surface.valid and #types > 0 and s.focus) then
       return
     end
-    local machines = perf.on("alt_machines") and present_machine_names() or {}
+    local machines = perf.on("alt_machines") and present_machine_names(perf.on("alt_ammo_fuel"), c.lf) or {}
     local price = CONTENTS_FIND_PRICE * (#machines > 0 and 2 or 1)
     if not budget.can(price, "altc", 0.1) then
       return
@@ -771,7 +915,7 @@ function M.tick()
         out = out or {}
         out[#out + 1] = row(unit, icon)
         fa = fa or {}
-        fa[#fa + 1] = { unit, arrows or 0 }
+        fa[#fa + 1] = M.fa_row(e, arrows)
       end
     end
   end

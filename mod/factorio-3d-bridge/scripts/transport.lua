@@ -38,8 +38,9 @@ local function type_of(data)
   return data:match('^{"t":"([%w_]+)"') or data:match('"t":"([%w_]+)"') or "?"
 end
 
-local function count_type(types, data)
-  local t = type_of(data)
+-- (`t`, optional: the type of a binary message, whose bytes don't say it.)
+local function count_type(types, data, t)
+  t = t or type_of(data)
   types[t] = (types[t] or 0) + 1
 end
 
@@ -61,6 +62,43 @@ local function instance()
   return nil
 end
 
+-- Binary frames (docs/PROTOCOL.md, "Binary frames"), for a client whose hello says `bin` (session.lua):
+-- each datagram is 0xF3, the wire version, then frames of kind u8, flags u8, length u32 and the body.
+-- Kind 0 carries a JSON message's text as it is, so every message not yet written in binary rides
+-- along unchanged; kind 1 is the datagram's `dg` line; 16 and up are messages written in binary
+-- (string.pack writes a number in 36-43 ns in Factorio 2.1, against 290-670 as text: R&D
+-- binary-protocol-rd). Whether a datagram is binary depends only on the client's hello.
+-- The version is what the client's hello and this bridge both read (session.lua): 1 has `mv`, 2 adds
+-- `bs` and `bfar` (kinds 17, 18), 3 `chunk`, `ents`, `st` and `ih` (19-22; the first three reliable: kept in
+-- the outbox as their bytes, send_reliable_frame). A datagram's second byte is the version the client was
+-- answered.
+M.WIRE_VERSION = 3
+M.KIND_JSON, M.KIND_DG, M.KIND_MV, M.KIND_BS, M.KIND_BFAR = 0, 1, 16, 17, 18
+M.KIND_CHUNK, M.KIND_ENTS, M.KIND_ST, M.KIND_IH = 19, 20, 21, 22
+M.FLAG_RELIABLE = 1
+local WIRE_HEADS = {}
+local function wire_head(version)
+  local h = WIRE_HEADS[version]
+  if not h then
+    h = string.char(0xF3, version)
+    WIRE_HEADS[version] = h
+  end
+  return h
+end
+
+-- This client's wire version when it gets binary frames, else nil.
+local function binary_to(port)
+  local client = storage.f3d and storage.f3d.client
+  return client and client.port == port and client.bin or nil
+end
+
+-- Whether the client gets binary frames (of wire version `version` or later, default 1): a module
+-- writes its message in binary only then.
+function M.binary(version)
+  local client = storage.f3d and storage.f3d.client
+  return client ~= nil and client.bin ~= nil and client.bin >= (version or 1)
+end
+
 local function encode(msg)
   msg.k = game.tick
   return helpers.table_to_json(msg)
@@ -68,11 +106,15 @@ end
 
 -- Optional arguments are left out rather than passed as nil. `types` (tracing only): the datagram's
 -- message types and counts, for its log line.
-local function send_datagram(port, data, types)
+local function send_datagram(port, data, types, bin)
   local client = storage.f3d and storage.f3d.client
   if client and client.dq and client.port == port and #data + DG_BYTES <= MAX_DATAGRAM then
     dg_n = dg_n + 1
-    data = data .. '\n{"t":"dg","n":' .. dg_n .. ',"k":' .. game.tick .. ',"b":' .. #data .. "}"
+    if bin then
+      data = data .. string.pack("<BBI4I4I4I4", M.KIND_DG, 0, 12, dg_n, game.tick, #data)
+    else
+      data = data .. '\n{"t":"dg","n":' .. dg_n .. ',"k":' .. game.tick .. ',"b":' .. #data .. "}"
+    end
     if profile.tracing() then
       log("f3ddg " .. game.tick .. " " .. dg_n .. " " .. #data .. " " .. (types and types_text(types) or ""))
     end
@@ -97,7 +139,7 @@ end
 -- the messages joined by newlines into datagrams of up to BATCH_BYTES, sent when one fills and at
 -- the end of each tick (end_tick). Only what is sent depends on this buffer, never storage.
 local BATCH_BYTES = 60000
-local batches = {}  -- port -> {parts, bytes}
+local batches = {}  -- port -> {parts, bytes, binary}: a binary batch's parts are frames (binary: its version)
 
 local function send_batch(port)
   local b = batches[port]
@@ -105,43 +147,118 @@ local function send_batch(port)
     batches[port] = nil
     local types = batch_types[port]
     batch_types[port] = nil
-    send_datagram(port, table.concat(b[1], "\n"), types)
+    if b[3] then
+      send_datagram(port, wire_head(b[3]) .. table.concat(b[1]), types, true)
+    else
+      send_datagram(port, table.concat(b[1], "\n"), types)
+    end
   end
 end
 
-local function send_raw(port, data)
+-- One message to `port`: JSON text, or with `kind` (a binary client only) a binary body of that frame
+-- kind, `t` its type for the trace, `flags` the frame's (M.FLAG_RELIABLE: the body has `r` after `k`).
+local function send_raw(port, data, kind, t, flags)
   local client = storage.f3d and storage.f3d.client
   local tracing = profile.tracing()
+  local bin = binary_to(port)
+  local types
+  if tracing then
+    types = {}
+    count_type(types, data, t)
+  end
+  if bin then
+    data = string.pack("<BBI4", kind or M.KIND_JSON, flags or 0, #data) .. data
+  end
   if not (client and client.b and client.port == port) or #data >= BATCH_BYTES then
     send_batch(port)  -- what was queued goes first
-    local types
-    if tracing then
-      types = {}
-      count_type(types, data)
-    end
-    send_datagram(port, data, types)
+    send_datagram(port, bin and wire_head(bin) .. data or data, types, bin)
     return
   end
   local b = batches[port]
-  -- (A `dq` client's datagram ends with its `dg` line: room is kept for it.)
-  if b and b[2] + #data + 1 > BATCH_BYTES - (numbering() and DG_BYTES or 0) then
+  -- (A `dq` client's datagram ends with its `dg` line: room is kept for it. A batch is all text or
+  -- all frames: a hello that changes `bin` starts a new one.)
+  if b and (b[3] ~= bin or b[2] + #data + 1 > BATCH_BYTES - (numbering() and DG_BYTES or 0)) then
     send_batch(port)
     b = nil
   end
   if tracing then
-    local types = batch_types[port]
-    if not types then
-      types = {}
+    local all = batch_types[port]
+    if not all then
       batch_types[port] = types
+    else
+      for k, v in pairs(types) do
+        all[k] = (all[k] or 0) + v
+      end
     end
-    count_type(types, data)
   end
   if not b then
-    b = { {}, 0 }
+    b = { {}, bin and 2 or 0, bin }
     batches[port] = b
   end
   b[1][#b[1] + 1] = data
-  b[2] = b[2] + #data + 1
+  b[2] = b[2] + #data + (bin and 0 or 1)
+end
+
+-- A message written in binary by its module (only for a client that gets them: M.binary()): `kind`
+-- its frame kind (M.KIND_*), `t` its type (for the trace), `body` its bytes from k on.
+function M.send_frame(kind, t, body)
+  local client = storage.f3d.client
+  if client and client.bin then
+    send_raw(client.port, body, kind, t)
+  end
+end
+
+-- A binary message's body: `scalars` (k first, then the kind's fields) as u32, then one block of
+-- numbers first..last of `flat`, `width` 4 or 8 bytes each (signed, little-endian). string.pack is
+-- fed up to PACK_RUN numbers a call by table.unpack, with no Lua loop over them (that is where its
+-- speed comes from). Throws when a number doesn't fit (callers pcall it and send text instead).
+local PACK_RUN = 200
+M.PACK_RUN = PACK_RUN
+local run_formats = { [4] = {}, [8] = {} }
+-- string.pack's format for `count` signed numbers of `width` bytes (made once).
+local function run_format(width, count)
+  local f = run_formats[width][count]
+  if not f then
+    f = "<" .. string.rep(width == 4 and "i4" or "i8", count)
+    run_formats[width][count] = f
+  end
+  return f
+end
+M.run_format = run_format
+
+-- Appends numbers first..last of `flat` to `out` as packed pieces, PACK_RUN numbers a call (none when
+-- last < first). Numbers may be numeric strings (belt_sim's lists): string.pack reads them as numbers.
+function M.pack_runs(out, flat, first, last, width)
+  for i = first, last, PACK_RUN do
+    local j = math.min(i + PACK_RUN - 1, last)
+    out[#out + 1] = string.pack(run_format(width, j - i + 1), table.unpack(flat, i, j))
+  end
+end
+
+local function pack_block_as(out, flat, first, last, width)
+  out[#out + 1] = string.pack("<BI4", width, math.max(0, last - first + 1))
+  M.pack_runs(out, flat, first, last, width)
+end
+
+-- One block (width u8, count u32, the numbers) of numbers first..last of `flat` (default all) appended to
+-- `out`: 4 bytes each, or 8 when one doesn't fit 32 bits. Throws when neither takes them (a number not
+-- whole or not finite): callers pcall and send text instead.
+function M.pack_block(out, flat, first, last)
+  first, last = first or 1, last or #flat
+  local n = #out
+  if not pcall(pack_block_as, out, flat, first, last, 4) then
+    for i = #out, n + 1, -1 do
+      out[i] = nil
+    end
+    pack_block_as(out, flat, first, last, 8)
+  end
+end
+
+function M.pack_message(scalars, flat, first, last, width)
+  local count = math.max(0, last - first + 1)
+  local out = { string.pack("<" .. string.rep("I4", #scalars), table.unpack(scalars)), string.pack("<BI4", width, count) }
+  M.pack_runs(out, flat, first, last, width)
+  return table.concat(out)
 end
 
 -- Sends what is waiting for every client; once a tick, after the modules ran.
@@ -219,6 +336,56 @@ function M.send_reliable_text(t, fields)
   s.rseq = s.rseq + 1
   s.outbox_tail = s.outbox_tail + 1
   s.outbox[s.outbox_tail] = { r = s.rseq, t = t, __text = fields }
+end
+
+-- A reliable message written in binary by its module (chunk snapshots, `st`), for a client of wire version
+-- `version` or later (M.binary): `kind` its frame kind, `t` its type, `body` its bytes after `k` and `r` (the
+-- flush puts those in front). Kept in the outbox as {r, t, __bin, __kind, __v}: the same bytes on every peer,
+-- made from game reads. A hello that leaves the client below `version` with such messages waiting starts
+-- the stream over (session.lua), so the flush never meets one it can't send.
+function M.send_reliable_frame(kind, t, body, version)
+  local s = storage.f3d
+  if not s.client then
+    return
+  end
+  s.rseq = s.rseq + 1
+  s.outbox_tail = s.outbox_tail + 1
+  s.outbox[s.outbox_tail] = { r = s.rseq, t = t, __bin = body, __kind = kind, __v = version }
+end
+
+local function states_body(l, lc, ao)
+  local out = {}
+  M.pack_block(out, l)
+  M.pack_block(out, lc or {})
+  M.pack_block(out, ao or {})
+  return table.concat(out)
+end
+
+-- `st`, reliable (movers.lua, belt_switch.lua): `l` [unit, state, ...], optional `lc` and `ao` (left out when
+-- empty), as kind 21 for a wire version 3 client (three blocks; one string.pack refuses: as JSON), else JSON.
+function M.send_states(l, lc, ao)
+  lc = lc and #lc > 0 and lc or nil
+  ao = ao and #ao > 0 and ao or nil
+  if M.binary(3) then
+    local ok, body = pcall(states_body, l, lc, ao)
+    if ok then
+      M.send_reliable_frame(M.KIND_ST, "st", body, 3)
+      return
+    end
+  end
+  M.send_reliable({ t = "st", l = l, lc = lc, ao = ao })
+end
+
+-- Whether the outbox holds a binary message (session.lua: a hello that drops the client's version below it).
+function M.binary_waiting(version)
+  local s = storage.f3d
+  for i = s.outbox_head, s.outbox_tail do
+    local msg = s.outbox[i]
+    if msg and msg.__bin and msg.__v > (version or 0) then
+      return true
+    end
+  end
+  return false
 end
 
 -- The JSON text of a value for such messages: integers and short strings by hand, anything else (a
@@ -421,14 +588,22 @@ function M.flush()
     s.outbox_head = s.outbox_head + 1
     -- (A message its module wrote as text, send_reliable_text: no table_to_json here.)
     local data
-    if msg.__text then
-      data = '{"t":"' .. msg.t .. '","k":' .. game.tick .. ',"r":' .. msg.r .. msg.__text .. "}"
+    if msg.__bin then
+      data = string.pack("<I4I4", game.tick, msg.r) .. msg.__bin
+      sent = sent + #data
+      if client and (client.bin or 0) >= msg.__v then
+        send_raw(client.port, data, msg.__kind, msg.t, M.FLAG_RELIABLE)
+      end
     else
-      data = encode(msg)
-    end
-    sent = sent + #data
-    if client then
-      send_raw(client.port, data)
+      if msg.__text then
+        data = '{"t":"' .. msg.t .. '","k":' .. game.tick .. ',"r":' .. msg.r .. msg.__text .. "}"
+      else
+        data = encode(msg)
+      end
+      sent = sent + #data
+      if client then
+        send_raw(client.port, data)
+      end
     end
   end
   if s.outbox_head > s.outbox_tail then

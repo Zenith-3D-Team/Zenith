@@ -119,11 +119,15 @@ func paint(item: String, ground: Vector2, ghost_mode: bool, delta: float) -> voi
 		return
 	_last_paint = tile
 	_timer = REPEAT * 3.0
-	var cmd := {"t": "tile", "item": item, "x": int(ground.x * 256.0), "y": int(ground.y * 256.0), "n": size}
+	var cmd := {"t": "tile", "item": item, "x": pi.wire(ground.x), "y": pi.wire(ground.y), "n": size}  # (J9: as the brush is drawn)
 	if ghost_mode:
 		cmd["ghost"] = 1
 	if alt:
 		cmd["r"] = 1
+	if not ghost_mode and item == str(pi.cursor_item):
+		var hs: int = pi.hud.ui.build_slot()  # the held stack pays, as Factorio's cursor does (L7)
+		if hs > 0:
+			cmd["hs"] = hs
 	Bridge.send(cmd)
 
 
@@ -133,7 +137,7 @@ func mine(ground: Vector2, delta: float) -> void:
 	if _timer > 0.0:
 		return
 	_timer = REPEAT
-	Bridge.send({"t": "tile_mine", "x": int(ground.x * 256.0), "y": int(ground.y * 256.0), "n": size})
+	Bridge.send({"t": "tile_mine", "x": pi.wire(ground.x), "y": pi.wire(ground.y), "n": size})
 
 
 func reset_drag() -> void:

@@ -12,7 +12,20 @@ const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 ## Zenith took the camera back (not after release()).
 signal lost
+## (1.7) Read through `mode_changed` below: the camera's mode changed (mode() before and now).
+signal _mode_changed(mode: String, previous: String)
 
+## (1.7) Signal: the camera's mode changed, within a frame of it, for every add-on (not only one
+## holding the camera). A property, so the first read tells Zenith to start watching the mode
+## (addon_watch.gd): until an add-on reads it, nothing is compared. Connect it as any signal.
+var mode_changed: Signal:
+	get:
+		if not _mode_wanted:
+			_mode_wanted = true
+			_host.watch.want_mode(_api)
+		return _mode_changed
+
+var _mode_wanted := false
 var _host
 var _api
 var _focus = null  # Vector2 tiles, or null: as take()'s "focus" says
@@ -28,13 +41,17 @@ func _init(host, api) -> void:
 
 ## Takes the camera. Options: "input" (bool, default true: the player's controls are off and the
 ## add-on's camera keys on), "focus" ("camera", the default: the world loads round where the camera
-## looks; "character": round the character). False when it can't now (no game, another add-on has
-## it, a ride to a platform, VR).
+## looks; "character": round the character), (1.7) "aim" ("center": with "input" false, building,
+## mining, the hover and shots aim at the middle of the screen through the add-on's camera, as first
+## person does) and "crosshair" (bool, default true: Zenith's dot shown while aiming at the centre).
+## False when it can't now (no game, another add-on has it, a ride to a platform, VR).
 func take(options := {}) -> bool:
 	_input = bool(options.get("input", true))
 	_focus_mode = str(options.get("focus", "camera"))
 	_focus = null
-	return _host.take_camera(_api, _input)
+	# With "input" (the default) the player's controls are off, so nothing aims: "aim" waits for false.
+	var aim_center := str(options.get("aim", "")) == "center" and not _input
+	return _host.take_camera(_api, _input, aim_center, bool(options.get("crosshair", true)))
 
 
 ## Hands the camera back to the player's view.
@@ -76,6 +93,27 @@ func player_view() -> Transform3D:
 	return rig.own_view() if rig != null else Transform3D.IDENTITY
 
 
+## (1.7) This add-on's camera modifier until changed: `offset` in tiles in the camera's own frame (x
+## right, y up, -z forward), `turn` in radians in the camera's frame (x pitch up, y yaw left, z roll),
+## turned after the offset, `fov` degrees added to the view's own. Drawn on the player's own views
+## (angled, Factorio's, first person) only; all add-ons' summed and capped (1.5 tiles; 20 degrees of
+## pitch and yaw, 45 of roll; the FOV by 30 and between 10 and 120). No easing: set it each frame.
+## Drawn only: walking, reach and what the game does never follow it. Gone when the add-on stops or
+## the game ends.
+func set_modifier(offset := Vector3.ZERO, turn := Vector3.ZERO, fov := 0.0) -> void:
+	_host.camera_modifier(self, offset, turn, fov)
+
+
+## (1.7) The same as set_modifier().
+func clear_modifier() -> void:
+	set_modifier()
+
+
+## (1.7) This add-on's own modifier as set: {"offset", "turn", "fov"}.
+func modifier() -> Dictionary:
+	return _host.camera_modifier_of(self)
+
+
 func player_fov() -> float:
 	var rig = _host.rig()
 	if rig == null:
@@ -88,6 +126,23 @@ func player_fov() -> float:
 func player_orthographic() -> bool:
 	var rig = _host.rig()
 	return rig != null and rig.view_orthographic()
+
+
+## (1.7) What the camera is doing now: "angled" (the normal view), "factorio" (Factorio's view as
+## F6 snapped it), "first_person", "remote" (the map's remote view, a train's camera, the view round
+## a hub), "ride" (Zenith's film of a rocket or pod ride), "addon" (an add-on has it: has() says
+## whether it is this one) or "vr". More may come within version 1: treat one you don't know as
+## not first person. "" outside a game.
+func mode() -> String:
+	var rig = _host.rig()
+	return str(rig.view_mode()) if rig != null else ""
+
+
+## (1.7) The player's own view under an add-on's take-over, the one release() goes back to: mode()
+## without "addon".
+func player_mode() -> String:
+	var rig = _host.rig()
+	return str(rig.view_mode(true)) if rig != null else ""
 
 
 func set_transform(t: Transform3D) -> void:
@@ -168,3 +223,10 @@ func _focus_point() -> Vector2:
 func _lost() -> void:
 	_mouse = false
 	lost.emit()
+
+
+## Every handler on `mode_changed` goes (the add-on was switched off).
+func _clear_mode() -> void:
+	for c: Dictionary in _mode_changed.get_connections():
+		_mode_changed.disconnect(c["callable"])
+	_mode_wanted = false

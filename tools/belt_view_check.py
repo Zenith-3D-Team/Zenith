@@ -83,6 +83,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import rcon  # noqa: E402
+import safe_delete  # noqa: E402
 
 NEAR = 38  # 0.15 tile in 1/256
 RINGS = [(0, 8, "0-8"), (8, 16, "8-16"), (16, 32, "16-32"), (32, 1e9, "32+")]
@@ -773,22 +774,40 @@ def dump_frames(path):
 MASK_CELLS = 4  # belt_lattice.gd CELLS: the lattice mask's cells a tile
 
 
-def lane_cells(placer, lengths):
-    """{lane key: set of (cx, cz)}: the cells of the lattice mask a lane's centre line marks, as
-    belt_lattice.gd's _mark (sampled every 8/256 of its length)."""
+def lane_cells(placer, lengths, inner=None):
+    """f(lane key, moving) -> set of (cx, cz): the cells of the lattice mask a lane's centre line marks, as
+    belt_lattice.gd's _mark (sampled every 8/256 of its length, end to end): as --belt-draw-lattice-mask's
+    default (own), every lane with both ends' points 4/256 inside (its own cells only). inner True or False: every
+    lane's entry inside, or every lane end to end; None: as the environment's BVC_MASK says: standing (a run made
+    with --belt-draw-lattice-mask=entry: a standing lane's entry inside, a moving one end to end), ends (made with
+    =ends: every lane end to end), all (every lane's entry inside), else the default's. f(key, moving, open): with
+    the default's, a moving lane's open ends (belt_lattice.gd mask_open, the dump's ids column 7: 1 its exit, 2 its
+    entry) leave that end's cell, a gap from it, out."""
+    mode = os.environ.get("BVC_MASK", "own") if inner is None else ("all" if inner else "ends")
     out = {}
 
-    def cells(key):
-        c = out.get(key)
+    def cells(key, moving=False, open_=0):
+        use_inner = mode in ("all", "own") or (mode != "ends" and not moving)
+        open_ = int(open_) if mode == "own" else 0
+        c = out.get((key, use_inner, open_))
         if c is None:
             c = set()
             length = lengths.get(key, 0)
             if key in placer and length > 0:
                 steps = max(1, length // 8)
+                lo = 64 + 4.0 if open_ & 1 else 4.0
+                hi = length - (64 + 4.0 if open_ & 2 else 4.0)
+                if open_ and lo > hi:
+                    lo = hi = length * 0.5
                 for j in range(steps + 1):
-                    x, z = placer[key](length * j / steps)
+                    at = length * j / steps
+                    if use_inner:
+                        at = min(at, length - 4.0)
+                    if mode == "own":
+                        at = min(max(at, lo), max(hi, lo))
+                    x, z = placer[key](at)
                     c.add((math.floor(x * MASK_CELLS), math.floor(z * MASK_CELLS)))
-            out[key] = c
+            out[(key, use_inner, open_)] = c
         return c
     return cells
 
@@ -827,19 +846,29 @@ class DrawState:
         lattice = (r[:, 13] < 0.5) & (r[:, 14] > 0.5)
         period = r[:, 15]
         wrap = lattice & (period > 0.0)
+        # (A held clock, belt_lattice.gd close and start: from texel 1 w, texel 1 y periods on, 0 on and on.)
+        held = wrap & (t1 > t0)
+        hi = np.where(r[:, 5] > 0.0, t1 + r[:, 5] * period, np.inf)
+        tq = np.where(held, np.clip(t, t1, hi), t)
+        hq = np.where(held, np.clip(r[:, 12], t1, hi), r[:, 12])
         if wrap.any():
-            q = (t - t0[wrap]) / period[wrap]
+            q = (tq[wrap] - t0[wrap]) / period[wrap]
             g[wrap] = q - np.floor(q)
         holed = lattice & (r[:, 12] > 0.0) & (t >= r[:, 12])
         if holed.any():
             per = np.where(period > 0.0, period, 1.0)
-            same = (period <= 0.0) | (np.floor((t - t0) / per) == np.floor((r[:, 12] - t0) / per))
+            same = (period <= 0.0) | (np.floor((tq - t0) / per) == np.floor((hq - t0) / per))
             holed &= same
         shown = code > -0.5
         # (--inserter-handoff) An item a hand took isn't drawn from the take's tick (texel 3 w), as the shader.
         shown &= ~(~lattice & (r[:, 13] < 0.5) & (r[:, 15] > 0.0) & (t >= r[:, 15]))
         shown &= ~(~lattice & (r[:, 13] < 0.5) & (r[:, 15] < 0.0) & (t < -r[:, 15]))
         shown &= ~holed
+        # (belt_lattice.gd handover: a slot at an open end hides where its item is the simulation's to draw; its texel 3
+        # y -(1 + h) hidden from g h on, -(3 + h) before g h.)
+        hy = -r[:, 13]
+        handed = wrap & (hy > 0.5) & np.where(hy < 2.5, g >= hy - 1.0, g < hy - 3.0)
+        shown &= ~handed
         straight = code < 0.5
         x = r[:, 0] + r[:, 4] * g
         z = r[:, 2] + r[:, 6] * g
@@ -869,8 +898,12 @@ class DrawState:
             shown[idx] = ok & (pw >= 0.5)
         if self.cells is not None and lattice.any():
             masked = set()
+            # (A lane's slots say its speed when written, ids column 6: a moving lane's cells run end to end.)
+            moving = set(ids[lattice & (ids[:, 6] > 0), 3].tolist())
+            # (belt_lattice.gd mask_open: a lane's open ends, ids column 7, from its slots' rows.)
+            opens = {int(k): int(o) for k, o in zip(ids[lattice, 3].tolist(), ids[lattice, 7].tolist())}
             for key in set(ids[lattice, 3].tolist()):
-                masked |= self.cells(int(key))
+                masked |= self.cells(int(key), int(key) in moving, opens.get(int(key), 0))
             if masked:
                 cx = np.floor(x * MASK_CELLS).astype(np.int64)
                 cz = np.floor(z * MASK_CELLS).astype(np.int64)
@@ -1244,7 +1277,8 @@ def replay(godot, wt, stream, truth, out, log, every_tick=True, extra=()):
         shutil.copyfile(own, tmp)
     try:
         with open(log, "w", encoding="utf-8", errors="replace") as lf:
-            r = subprocess.run([godot, "--headless", "--path", str(pathlib.Path(wt) / "client"), "-s", "res://tests/" + name, "--",
+            r = subprocess.run([godot, "--headless", "--audio-driver", "Dummy", "--path", str(pathlib.Path(wt) / "client"),
+                                "--log-file", str(pathlib.Path(log).resolve().with_suffix(".godot.log")), "-s", "res://tests/" + name, "--",
                                 "--stream=%s" % stream, "--truth=%s" % truth, "--drawn-check", "--view-dump=%s" % out]
                                + (["--every-tick"] if every_tick else []) + list(extra),
                                stdout=lf, stderr=subprocess.STDOUT, timeout=3600)
@@ -1299,26 +1333,33 @@ def kill_tree(pid):
 
 
 def server_pids(wt):
-    """Every factorio.exe started from this worktree (its command line names the worktree's folders)."""
-    import psutil
+    """The pids of every factorio.exe started from this worktree (its command line names the worktree's folders).
+    psutil when it is installed; else Windows' own process list (the venv doesn't carry psutil)."""
     w = str(pathlib.Path(wt).resolve()).lower()
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is None:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "Get-CimInstance Win32_Process -Filter \"Name='factorio.exe'\" | "
+                            "ForEach-Object { [string]$_.ProcessId + ' ' + $_.CommandLine }"],
+                           capture_output=True, text=True)
+        return [int(line.split(" ", 1)[0]) for line in r.stdout.splitlines()
+                if line.strip() and w in line.lower()]
     out = []
     for p in psutil.process_iter(["name", "cmdline"]):
         try:
             if (p.info["name"] or "").lower() == "factorio.exe" and w in " ".join(p.info["cmdline"] or []).lower():
-                out.append(p)
+                out.append(p.pid)
         except psutil.Error:
             pass
     return out
 
 
 def stop_server(wt):
-    import psutil
-    for p in server_pids(wt):
-        try:
-            p.kill()
-        except psutil.Error:
-            pass
+    for pid in server_pids(wt):
+        kill_tree(pid)
 
 
 def mod_hash(wt):
@@ -1335,11 +1376,12 @@ def mod_hash(wt):
 def sync_mod(wt):
     src = pathlib.Path(wt) / "mod" / "factorio-3d-bridge"
     dst = pathlib.Path(wt) / "server" / "data" / "mods" / "factorio-3d-bridge"
-    if dst.is_symlink() or not dst.exists() or any(
+    # A junction is a link too (is_symlink() is False for one): only the link goes, never what it points to.
+    linked = safe_delete.is_link(dst)
+    if linked or not dst.exists() or any(
             not (dst / f.relative_to(src)).exists() or (dst / f.relative_to(src)).read_bytes() != f.read_bytes()
             for f in src.rglob("*") if f.is_file()):
-        if dst.exists() and not dst.is_symlink():
-            shutil.rmtree(dst)
+        safe_delete.remove_tree(dst)
         shutil.copytree(src, dst)
         print("copied the worktree's mod into server/data/mods", flush=True)
 
@@ -1576,10 +1618,10 @@ def live(a, wt, ports, out, shots, prefix, capture, lock):
         if stand_in:
             args = [sys.executable, str(ROOT / "tools" / "belt_bench.py"), "--udp-port", str(ports[0]), "--rcon-port", str(ports[2]),
                     "--password-file", str(wt / "server" / "data" / "rcon-password.txt"), "--bs", "--capture", str(stream),
-                    "--teleport", "%f,%f" % a.at if a.at else "", "--warmup", "100000", "--seconds", "1",
+                    "--teleport=" + ("%f,%f" % a.at if a.at else ""), "--warmup", "100000", "--seconds", "1",
                     "--cap", str(a.stand_in_cap), "--near", str(a.stand_in_near)]
         else:
-            args = [godot] + a.godot_arg + ["--path", str(wt / "client"), "--", "--factorio-port=%d" % ports[0], "--port=%d" % a.client_port,
+            args = [godot] + a.godot_arg + ["--path", str(wt / "client"), "--log-file", str((out / ("%sgodot.log" % prefix)).resolve()), "--", "--factorio-port=%d" % ports[0], "--port=%d" % a.client_port,
                     "--settings-file=%s" % cfg]
             if cam:
                 args.append("--camera=%s" % cam)

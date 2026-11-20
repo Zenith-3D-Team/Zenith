@@ -10,12 +10,15 @@ dropping files in the right place. Anything else means changing the project itse
 open source (GPL-3.0): fork it and build on it (the project doesn't take pull requests; see
 [CONTRIBUTING.md](CONTRIBUTING.md)).
 
+To change the game, pair your add-on with a small Factorio mod and talk to it through `api.game`
+([ADDONS.md](docs/ADDONS.md), "Messages to your Factorio mod"); `addons-src/sprint/` is a worked pair.
+
 ## What works today
 
 | You want to... | How | Status |
 |---|---|---|
 | Give an entity a 3D model, or replace one | A `.glb` named after the entity's prototype | Works |
-| Keep your models outside the project | Start the client with `--models=<folder>` | Works |
+| Keep your models outside the project | A model pack in the `models` folder beside Zenith, or start the client with `--models=<folder>` | Works |
 | Make parts of a model move | Name the nodes `anim_*` | Works, for the kinds listed below |
 | Play with other Factorio mods | Turn them on in the menu's Mods window | Works; their entities are boxes until modelled |
 | Add your own camera, windows, overlays or behaviour | An add-on: a folder with an `addon.json` and a script ([docs/ADDONS.md](docs/ADDONS.md)) | Works (add-on API 1.1; drop the zip in `addons`) |
@@ -30,21 +33,29 @@ Every entity is looked up by its **prototype name**, the internal name Factorio 
 with that name exists, every entity of that prototype uses it. If not, the entity is drawn as a
 box sized from its selection box and tinted with its map colour.
 
-Put the model in either place:
+Every model comes from a model pack, and the higher pack in one order wins where two have a model of
+the same name. Put the model in one of these:
 
-- `client/assets/models/<prototype-name>.glb`: part of the project; Godot imports it. Models
-  under a licence of their own sit in a subfolder the client looks in first (`fue5/`, FUE5's
-  models: [its README](client/assets/models/fue5/README.md)).
+- One of the project's built-in packs, `client/assets/models/packs/<pack>/<prototype-name>.glb`:
+  part of the project; Godot imports it. `placeholders/` is Zenith's own (a new model of ours goes
+  there), `wube3dp/` Wube's printable models converted, `fue5/` FUE5's models under their own
+  licence ([its README](client/assets/models/packs/fue5/README.md)). By default the order is FUE5
+  (Adapted), Wube3DP (Adapted), Placeholders, and Placeholders is always last.
+- A model pack in the `models` folder beside Zenith (the checkout's root, or beside `Zenith.exe`):
+  the loose `.glb` files there, a folder, or a `.zip` as it is (Zenith unpacks a copy itself). A new
+  pack goes on top of the others. The Model packs window (the main menu, the Esc menu)
+  orders the packs, turns them off and takes any one model family from a pack of your choice, and a
+  building window's Model button does it for one building ([the models
+  README](client/assets/models/README.md), "Model packs").
 - Any folder of your own, loaded at runtime with `--models=<folder>`:
 
   ```bash
   godot --path client -- --models=C:/my-models
   ```
 
-  The folder only fills in prototypes the project has no model for: a model in
-  `client/assets/models/` with the same name wins. To try a replacement for a built-in model,
-  add `--models-first`: then the folder's model wins (this also works with the downloaded
-  game: `Zenith.exe -- --models=C:/my-models --models-first`).
+  The folder only fills in prototypes no pack has a model for. To try a replacement for a model a
+  pack has, add `--models-first`: then the folder's model wins over every pack's (this also works
+  with the downloaded game: `Zenith.exe -- --models=C:/my-models --models-first`).
 
 ### The rules a model has to follow
 
@@ -145,9 +156,9 @@ world read-only, events, frames, lighter updates and data); more hooks come as a
 
 Planned, roughly in order:
 
-1. **Model packs.** A folder (or zip) of models, loaded alongside the built-in ones, with a small
-   manifest saying which mod they're for and which version. A Factorio mod could carry its own
-   pack.
+1. **Model packs for mods.** Packs work today (a folder or zip of models beside the built-in ones,
+   with a `pack.json`); next, a manifest line saying which mod a pack is for and which version, so a
+   Factorio mod could carry its own pack.
 2. **Icons from any mod.** Reading every mod's icons from the game's prototype data, so modded
    items show their real icons.
 3. **Animations.** More `anim_*` kinds, and parts driven by what the machine is doing (its

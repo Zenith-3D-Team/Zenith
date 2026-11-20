@@ -13,6 +13,7 @@ const FactorioUi := preload("res://scripts/ui/factorio/factorio_ui.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const DamageOverlay := preload("res://scripts/ui/damage_overlay.gd")
+const NightVisionOverlay := preload("res://scripts/ui/night_vision_overlay.gd")
 const Controls := preload("res://scripts/player/controls.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
 
@@ -36,6 +37,8 @@ var health_bar := ProgressBar.new()
 var shield_bar := ProgressBar.new()
 var energy_bar := ProgressBar.new()
 var damage := DamageOverlay.new()
+## The green edge of night vision (main.gd sets its level with set_night_vision).
+var night_edge := NightVisionOverlay.new()
 ## [[gun, ammo, magazines], ...] per gun slot ("" when empty), and the selected slot (1-based).
 var guns: Array = []
 var selected_gun := 1
@@ -55,6 +58,7 @@ func _ready() -> void:
 	root.texture_filter = Kit.FILTER
 	add_child(root)
 	# Under everything else: the red of damage and low health over the world.
+	root.add_child(night_edge)
 	root.add_child(damage)
 
 	status.position = Kit.pxv(12, 8)
@@ -137,8 +141,8 @@ func _exit_tree() -> void:
 
 func _on_setting(section: String, key: String) -> void:
 	# Rebound in Settings → Controls, an add-on's controls added or taken away, or Factorio's own
-	# keys switched on or off (read after this). An add-on adds its controls one by one: once for all.
-	if section == "controls" or (section == "factorio" and key == "use_factorio_keys"):
+	# keys or Zenith 0.2.2's switched on or off (read after this). An add-on adds its controls one by one: once for all.
+	if section == "controls" or (section == "factorio" and key in ["use_factorio_keys", Controls.OLD_KEYS_SETTING]):
 		if not _help_queued:
 			_help_queued = true
 			refresh_help.call_deferred()
@@ -397,6 +401,12 @@ static func _range(first: String, last: String) -> String:
 	return a + "-" + b
 
 
+## night vision's 0..1 (main.gd): the screen's edge and the icon over the shortcut bar follow it.
+func set_night_vision(level: float) -> void:
+	night_edge.level = level
+	ui.night_icon.level = level
+
+
 func reset() -> void:
 	set_inventory([])
 	set_recipes([])
@@ -483,11 +493,11 @@ func _show_energy() -> void:
 	energy_bar.tooltip_text = "Energy: %d%%" % roundi(now * 100.0 / maxf(1.0, full))
 
 
-## {t: "guns", sel, l}: the weapon slots beside the quickbar show them.
-func set_guns(sel: int, list: Array) -> void:
+## {t: "guns", sel, l, v}: the weapon slots beside the quickbar show them (`v`: a vehicle's, N3).
+func set_guns(sel: int, list: Array, vehicle := 0) -> void:
 	guns = list
 	selected_gun = sel
-	ui.model.set_guns(sel, list)
+	ui.model.set_guns(sel, list, vehicle)
 
 
 func set_mining(progress: int) -> void:

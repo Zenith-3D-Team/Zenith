@@ -438,7 +438,7 @@ static func silo(screen, rk: Dictionary) -> Control:
 		b.disabled = not ready
 		b.tooltip_text = "Launch the rocket to %s" % str(t[1]) if ready else "The rocket isn't ready"
 		r.add_child(b)
-		# Riding up: the character gets into the rocket and goes to the platform's hub.
+		# Riding up: the character gets into the rocket and goes to the platform's hub (#10).
 		var go_up := func() -> void:
 			Bridge.send({"t": "ride", "u": unit, "to": index})
 			screen.close()

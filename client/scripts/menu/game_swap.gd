@@ -1,5 +1,5 @@
 extends RefCounted
-## Swapping between the 3D client and the normal game, on the same running world: one key
+## Swapping between the 3D client and the normal game, on the same running world (C7): one key
 ## here ("Show in Factorio", Ctrl+F9) brings Factorio's window to the front, or starts Factorio
 ## joined to the server this client started; the mod's own key in Factorio (the same Ctrl+F9,
 ## "Show in Zenith") sends `raise` back, and the client comes to the front. Nothing reloads: the
@@ -112,6 +112,9 @@ static func _after_focus(code: int, started: bool, game_port: int, remote_host :
 	if _game_pid <= 0:
 		_game_pid = -1
 		return "Couldn't start Factorio"
+	if Paths.factorio_player_name() == "":
+		# (The bridge knows Zenith's player by the name its Factorio joins with: the hello's `pn`, L13.)
+		return "Starting Factorio, joining this game as a player of its own (its player name wasn't found): Ctrl+F9 there comes back to 3D"
 	return "Starting Factorio, joining this game: Ctrl+F9 there comes back to 3D"
 
 

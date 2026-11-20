@@ -1,5 +1,5 @@
 """Builds art-src/ui_reference/index.html: Factorio's window and ours side by side, with the
-differences listed in docs/UI-DIFFERENCES.md (if you keep one) under each pair. Self-contained (the pictures are
+differences listed in docs/UI-DIFFERENCES.md under each pair. Self-contained (the pictures are
 embedded as JPEG), so it opens anywhere; it shows Factorio's art, so it stays out of git.
 
     python tools/ui_reference/compare.py

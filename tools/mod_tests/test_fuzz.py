@@ -141,14 +141,19 @@ def tick(n, what):
     return True
 
 
+BINARY = {"datagrams": 0, "mv": 0, "v3": 0}  # binary datagrams seen, and with an mv frame (roughly)
+
+
 def take():
     out = []
     for item in F.take_sent().values():
-        # A fuzzed hello can ask for joined datagrams (`b`): several messages, a line each.
-        for line in str(item[2]).split("\n"):
-            if not line:
-                continue
-            msg = json.loads(line)
+        # A fuzzed hello can ask for joined datagrams (`b`): several messages, a line each; or for
+        # binary frames (`bin`), which fake_factorio hands over as hex.
+        data = bytes.fromhex(item[2]) if item[3] else str(item[2])
+        BINARY["datagrams"] += 1 if item[3] else 0
+        BINARY["mv"] += 1 if item[3] and bytes((protocol.KIND_MV, 0)) in data else 0
+        BINARY["v3"] += 1 if item[3] and bytes((protocol.KIND_ENTS, protocol.FLAG_RELIABLE)) in data else 0
+        for msg in protocol.split_datagram(data):
             for problem in protocol.problems(msg):
                 check(False, f"protocol after fuzzing: {problem}")
             out.append(msg)
@@ -161,12 +166,56 @@ def note_errors(msgs, cmd):
             bridge_errors.setdefault(cmd, set()).add(m["text"].split("\n")[0][:160])
 
 
-# The second half of the rounds the client simulates belts (`bs`: belt_sim.lua instead of bi).
+# The second half of the rounds the client simulates belts (`bs`: belt_sim.lua instead of bi) and gets
+# joined, numbered datagrams of binary frames (`b`, `dq`, `bin`: transport.lua).
 BS = {"on": False}
 
 
 def hello(sid="fuzz", w=1):
-    send({"t": "hello", "v": 1, "sid": sid, "w": w, "bl": 1, "bs": 1 if BS["on"] else 0})
+    msg = {"t": "hello", "v": 1, "sid": sid, "w": w, "bl": 1, "bs": 1 if BS["on"] else 0}
+    if BS["on"]:
+        msg.update({"b": 1, "dq": 1, "bin": protocol.WIRE_VERSION})
+    send(msg)
+
+
+def fuzz_ext(rng, rounds=600):
+    """`ext` (link.lua) with garbage channels and data: nothing escapes, and only a good channel for a
+    mod in the game, with data, raises the event other mods hear."""
+    g.script.active_mods["zenith-link-test"] = "0.1.0"
+    lua.execute("""
+    FUZZ_EXT = {}
+    F.companion_on(remote.call("zenith", "on_message"), function(e) table.insert(FUZZ_EXT, e) end)
+    """)
+    good_channels = ["zenith-link-test", "zenith-link-test/a", "zenith-link-test/" + "é" * 20]
+    deep = "[" * 3000 + "]" * 3000
+    sent_good = 0
+    for i in range(rounds):
+        if i % 50 == 0:
+            hello()
+            tick(1, "an ext round's hello")
+            take()
+        good = rng.random() < 0.4
+        ch = rng.choice(good_channels) if good else rng.choice([
+            junk(rng), "", "x" * 200, "zenith-link-test/" + "y" * 120, "zenith link test", "/zenith-link-test",
+            "not-loaded", "zenith-link-test/\n", 7, None, ["zenith-link-test"], {"ch": "zenith-link-test"}])
+        d = rng.choice([junk(rng), junk(rng), None, "z" * rng.choice([10, 3000, 5000, 70000]), {"a": [1, 2, {"b": None}]}])
+        if rng.random() < 0.05:
+            payload = '{"t":"ext","ch":' + json.dumps(ch) + ',"d":' + deep + "}"
+        else:
+            payload = json.dumps({"t": "ext", "ch": ch, "d": d} if d is not None or rng.random() < 0.5 else {"t": "ext", "ch": ch})
+        send(payload)
+        if good and d is not None and len(payload.encode("utf-8")) <= 4096:
+            sent_good += 1
+        if not tick(rng.choice([0, 0, 1, 7]) or 0, "an ext"):
+            return
+        note_errors(take(), "ext")
+    tick(1, "the last ext")
+    raised = [to_py(e) for e in g.FUZZ_EXT.values()]
+    bad = [e for e in raised if not protocol.ext_channel_ok(e.get("channel")) or e.get("data") is None
+           or not str(e["channel"]).startswith("zenith-link-test")]
+    check(not bad, f"ext fuzz: only good channels with data raise the event: {bad[:3]}")
+    check(0 < len(raised) <= sent_good, f"ext fuzz: {len(raised)} raised of {sent_good} good ones sent (the caps drop some)")
+    print(f"ext fuzz: {rounds} messages, {sent_good} good, {len(raised)} raised")
 
 
 def main():
@@ -202,7 +251,7 @@ def main():
             # Out of order and duplicated: hellos with other sessions or ports, resyncs, subs.
             pick = rng.choice(["hello", "resync", "sub", "dup"])
             if pick == "hello":
-                send({"t": "hello", "v": junk(rng), "sid": rng.choice(["fuzz", "other", junk(rng)]), "w": junk(rng)},
+                send({"t": "hello", "v": junk(rng), "sid": rng.choice(["fuzz", "other", junk(rng)]), "w": junk(rng), "bin": junk(rng)},
                      rng.choice([CLIENT_PORT, CLIENT_PORT, 40000]))
                 tick(1, "a stranger's hello")
                 hello()  # the real client takes the session back, so the next commands count
@@ -232,6 +281,8 @@ def main():
             hello()  # after a bye or a stranger's hello: reconnect, so the next commands count
             tick(1, "a reconnect")
             take()
+
+    fuzz_ext(rng)
 
     # The session recovers: a fresh client connects, gets the world and can walk. It says hello every
     # second until welcomed, as Zenith does: on a server a hello from a new port waits while the client
@@ -265,6 +316,8 @@ def main():
     walking = c and c.valid and c.walking_state
     check(bool(walking) and walking.walking and walking.direction == 4, "and walks east (walking_state)")
 
+    check(BINARY["datagrams"] > 0 and BINARY["mv"] > 0 and BINARY["v3"] > 0,
+          f"the second half's datagrams are binary frames, mv and ents (wire version 3) among them: {BINARY}")
     print(f"{args.rounds} rounds over {len(COMMANDS)} commands and {len(FIELDS)} fields (seed {args.seed})")
     for cmd, texts in sorted(bridge_errors.items()):
         print(f"  caught by on_packet in {cmd}: {sorted(texts)[0]}" + (f" (+{len(texts) - 1} more)" if len(texts) > 1 else ""))

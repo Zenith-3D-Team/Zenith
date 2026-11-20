@@ -62,6 +62,8 @@ static var _saved_msec := 0
 ## queue behind a whole base's list.
 static var listed := 0
 static var _preload: Array[String] = []
+static var _preload_warm: Array[String] = []
+static var _preload_warm_i := 0
 
 
 static func _read_args() -> void:
@@ -111,8 +113,9 @@ static func model_ready(mesh: Mesh, proto_name: String, proto_type: String, extr
 		_seen_mesh[mesh] = true
 		return true
 	if not _ready.has(mesh):
+		var parts := ModelLibrary.parts_for_entity(proto_name, proto_type, extra, dir)
 		var warm := _mesh_ready(mesh, null)
-		for part in ModelLibrary.parts_for_entity(proto_name, proto_type, extra, dir):
+		for part in parts:
 			if part.mesh != null and not _mesh_ready(part.mesh, null):
 				warm = false
 		if not warm:
@@ -120,6 +123,9 @@ static func model_ready(mesh: Mesh, proto_name: String, proto_type: String, extr
 			return false
 		_ready[mesh] = true
 		_models[mesh] = true
+		for part in parts:
+			if part.mesh != null:
+				_models[part.mesh] = true
 	_seen_mesh[mesh] = true
 	return true
 
@@ -225,8 +231,12 @@ static func poll() -> bool:
 		_warm_extras()
 	var asked := 0
 	while not _preload.is_empty() and asked < 32 and ModelLibrary.pending_count() < ModelLibrary.load_jobs + 2:
-		ModelLibrary.ready(_preload.pop_back())  # read on a worker from now (a name without a model: nothing)
+		var pre_name: String = _preload.pop_back()
+		ModelLibrary.ready(pre_name)  # read on a worker from now (a name without a model: nothing)
+		_preload_warm.append(pre_name)
 		asked += 1
+	if enabled and _root != null and is_instance_valid(_root) and not _preload_warm.is_empty():
+		_warm_preloaded()
 	if Time.get_ticks_msec() - _saved_msec > SAVE_EVERY_MSEC:
 		flush()
 	if changed:
@@ -252,6 +262,28 @@ static func _warm_extras() -> void:
 				_mesh_ready(proxy, null)
 				done[1] = true
 		_extras[mesh] = done
+
+
+## Warms pipelines of save-preloaded models once their workers finish, before the player reaches them.
+static func _warm_preloaded() -> void:
+	var checked := 0
+	var limit := mini(_preload_warm.size(), 8)
+	while checked < limit and not _preload_warm.is_empty():
+		_preload_warm_i = _preload_warm_i % _preload_warm.size()
+		var n := _preload_warm[_preload_warm_i]
+		checked += 1
+		if ModelLibrary.ready(n):
+			_preload_warm.remove_at(_preload_warm_i)
+			var mesh := ModelLibrary.mesh_for(n)
+			if mesh != null:
+				_mesh_ready(mesh, null)
+				_models[mesh] = true
+				for part in ModelLibrary.parts_for(n):
+					if part.mesh != null:
+						_mesh_ready(part.mesh, null)
+						_models[part.mesh] = true
+		else:
+			_preload_warm_i += 1
 
 
 ## Pipelines still being given their time.
@@ -285,6 +317,8 @@ static func on_welcome(save_id: String) -> void:
 	_seen_dirty = false
 	listed = 0
 	_preload.clear()
+	_preload_warm.clear()
+	_preload_warm_i = 0
 	if save_id == "" or not FileAccess.file_exists(_path(save_id)):
 		return
 	var names = JSON.parse_string(FileAccess.get_file_as_string(_path(save_id)))

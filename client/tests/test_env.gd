@@ -36,6 +36,19 @@ static func isolate(test_name: String) -> void:
 	FileAccess.open("user://logs/godot.log", FileAccess.WRITE).store_string("a test run\n")
 
 
+## A modeller's models folder for the checks that read one (Vasillo's files are never in the repo):
+## `-- --models-dir=<folder>`, else one of the test's own older flags (`old_flags`, as "--vasillo="),
+## else the ZENITH_TEST_MODELS environment variable. "" when none is given: those checks are skipped.
+static func models_dir(old_flags: Array = []) -> String:
+	var flags: Array = ["--models-dir="]
+	flags.append_array(old_flags)
+	for flag: String in flags:
+		for a in OS.get_cmdline_user_args():
+			if a.begins_with(flag):
+				return a.substr(flag.length())
+	return OS.get_environment("ZENITH_TEST_MODELS")
+
+
 ## Removes the run's folder when the test ends.
 static func clean() -> void:
 	if _root != "":

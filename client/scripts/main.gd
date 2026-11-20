@@ -33,6 +33,7 @@ const Visuals := preload("res://scripts/world/visuals.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
 const MomentHold := preload("res://scripts/world/moment_hold.gd")
 const UpsGovernor := preload("res://scripts/world/ups_governor.gd")
+const PerfLog := preload("res://scripts/world/perf_log.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const ShaderWarmup := preload("res://scripts/world/shader_warmup.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
@@ -65,9 +66,11 @@ const AnimShots := preload("res://scripts/debug/anim_shots.gd")
 const WorkingGlow := preload("res://scripts/world/working_glow.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
+const Paths := preload("res://scripts/menu/paths.gd")
 const ContactShade := preload("res://scripts/world/contact_shade.gd")
 const AoZoom := preload("res://scripts/world/ao_zoom.gd")
 const FrontEnd := preload("res://scripts/menu/front_end.gd")
+const BackdropRecorder := preload("res://scripts/menu/backdrop_recorder.gd")
 const RocketLayer := preload("res://scripts/world/rockets.gd")
 const CollectorLayer := preload("res://scripts/world/collectors.gd")
 const Ride := preload("res://scripts/world/ride.gd")
@@ -76,11 +79,13 @@ const TerritoryLayer := preload("res://scripts/world/territories.gd")
 const DemolisherLayer := preload("res://scripts/world/demolishers.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const QualityMarks := preload("res://scripts/world/quality_marks.gd")
+const NightVisionOverlay := preload("res://scripts/ui/night_vision_overlay.gd")
 const AltArrows := preload("res://scripts/world/alt_arrows.gd")
 const SunShadows := preload("res://scripts/world/sun_shadows.gd")
 const AddonHost := preload("res://scripts/addons/addon_host.gd")
 const InterfaceState := preload("res://scripts/ui/interface_state.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const EscTooltip := preload("res://scripts/ui/esc_tooltip.gd")
 
 ## Options that start a game at once, without the menu.
 const DIRECT_OPTIONS := ["--factorio-port=", "--factorio-host=", "--port=", "--open=", "--ui=", "--ui-sample", "--ui-hold=",
@@ -123,6 +128,9 @@ var input: PlayerInput
 var fx: Fx
 var turrets: TurretLayer
 var front_end: FrontEnd
+## The Esc menu's "Use this view as the menu backdrop" (backdrop_recorder.gd): listens from the start,
+## the prototypes coming only at the handshake.
+var backdrop_recorder: BackdropRecorder
 ## Everything of a game, freed as one on the way back to the menu.
 var _game: Node3D = null
 ## `bs` parts that came before the world was ready (`--belt-early-bs=off`: dropped, as before). The bridge
@@ -187,6 +195,19 @@ var planet_spin := PlanetSpin.new()
 var _asked_space_map := false
 
 
+## Back from another window (Factorio's own, say): keys changed in Factorio's controls meanwhile
+## are followed now (issue #26), not only at the next start. --factorio-keys-refresh=off: start only.
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_FOCUS_IN and Settings.arg_value("--factorio-keys-refresh=") != "off":
+		Settings.refresh_factorio_keys()
+
+
+## Quitting while a model pack's zip is still being unpacked (model_packs.gd) waits for it: Godot
+## crashes on its way out with a task still on a worker.
+func _exit_tree() -> void:
+	ModelLibrary.ModelPacks.wait()
+
+
 func _ready() -> void:
 	# Factorio's own settings are the defaults (factorio_settings.gd), so they are read before any
 	# is applied; the install is found the same way the graphics are (--factorio-data first).
@@ -195,6 +216,9 @@ func _ready() -> void:
 	Settings.apply_startup(DisplayServer.window_get_size().y)
 	Settings.apply_window(get_tree().root)
 	FxSettings.load_settings()
+	# Packs' own shading (Settings, --pack-shading) in the shader's global now: the menu's model preview
+	# draws with it before any game makes the Looks node (project.godot's 1.0 till then).
+	Looks.apply_pack_shading()
 	ModelLibrary.configure_from_command_line()
 	ModFiles.configure_from_command_line()
 	# Names in the language set in Factorio, unless --factorio-locale says otherwise.
@@ -231,9 +255,18 @@ func _ready() -> void:
 		vr.main = self
 		add_child(vr)
 
+	backdrop_recorder = BackdropRecorder.new()
+	backdrop_recorder.name = "BackdropRecorder"
+	add_child(backdrop_recorder)
 	front_end = FrontEnd.new()
 	front_end.main = self
 	add_child(front_end)
+	# Esc with one of Godot's tooltips showing closes the window as without it (esc_tooltip.gd). First of
+	# the children: its _input is asked after every other node's.
+	var esc_tooltip := EscTooltip.new()
+	esc_tooltip.name = "EscTooltip"
+	add_child(esc_tooltip)
+	move_child(esc_tooltip, 0)
 	# Add-ons (scripts/addons/, docs/ADDONS.md), after the menu: they get input before it does.
 	addons = AddonHost.new()
 	addons.main = self
@@ -349,6 +382,7 @@ func start_game() -> void:
 	world.name = "World"
 	world.sun = _sun
 	_game.add_child(world)
+	backdrop_recorder.world = world
 
 	movers = MoverLayer.new()
 	movers.name = "Movers"
@@ -356,6 +390,7 @@ func start_game() -> void:
 	movers.world = world
 	_game.add_child(movers)
 
+	PerfLog.clear()  # the performance warning's log (perf_log.gd) starts afresh with each game
 	ups_governor = UpsGovernor.new()
 	ups_governor.name = "UpsGovernor"
 	ups_governor.changed.connect(_on_governor_changed)
@@ -498,6 +533,7 @@ func start_game() -> void:
 
 	avatar = Avatar.new()
 	avatar.name = "Avatar"
+	avatar.world = world  # the belt step-up's stand height (stand_height.gd)
 	_game.add_child(avatar)
 
 	combat = CombatLayer.new()
@@ -613,14 +649,19 @@ func start_game() -> void:
 	input.avatar = avatar
 	input.movers = movers
 	input.ground_items = ground_items
+	input.belt_items = belt_items
 	input.wires = wires
 	input.predicted = predicted
+	hud.ui.model.inventory_changed.connect(predicted.inventory_heard)  # L2: builds sent, paid for
 	_game.add_child(input)
 	fluids_power.input = input
+	input.pipeline_vis.fluids_power = fluids_power
+	hud.ui.model.alerts_changed.connect(input.pipeline_vis.alerts_heard)
 
 	fx = Fx.new()
 	fx.name = "Fx"
 	fx.world = world
+	fx.decoratives = decoratives
 	fx.movers = movers
 	fx.combat = combat
 	fx.avatar = avatar
@@ -656,6 +697,8 @@ func end_game() -> void:
 	if _game == null:
 		return
 	addons.game_ended()  # while the game's nodes are still there
+	backdrop_recorder.cancel()
+	backdrop_recorder.world = null
 	if rig != null and rig.first_person:
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	_game.queue_free()
@@ -742,7 +785,18 @@ func _unhandled_key_input(event: InputEvent) -> void:
 		hud.show_message("UI scale %d%%" % roundi(Settings.chosen_ui_scale() * 100.0))
 
 
-func _on_setting_changed(section: String, _key: String) -> void:
+## Interface settings only the main menu reads: a change in a game applies nothing (the Esc menu's
+## "Use this view as the menu backdrop" set interface/backdrop, which applied every setting again over
+## every chunk, the look and the models' quality included, while the join still streamed).
+const MENU_ONLY_SETTINGS := ["backdrop"]
+
+
+func _on_setting_changed(section: String, key: String) -> void:
+	# Game or not: the menu's model preview follows Packs' own shading too (a game's Looks settles it again).
+	if section == "graphics" and key == "pack_shading":
+		Looks.apply_pack_shading()
+	if section == "interface" and key in MENU_ONLY_SETTINGS:
+		return
 	if section in ["graphics", "interface", "camera"]:
 		_apply_game_settings()
 
@@ -810,6 +864,7 @@ func _apply_game_settings() -> void:
 	Bridge.decoratives = decoratives.enabled
 	Bridge.decorative_distance = int(decoratives.distance)
 	Bridge.mod_windows = bool(Settings.get_value("interface", "mod_windows"))
+	Bridge.factorio_player = Paths.factorio_player_name()  # L13: who plays this character from Factorio
 	InserterArmLayer.read_flags(OS.get_cmdline_user_args())
 	Bridge.inserter_events = InserterArmLayer.hello_ie()
 	Bridge.inserter_handoff = InserterArmLayer.wants_handoff()
@@ -1063,6 +1118,7 @@ func _on_welcome(msg: Dictionary) -> void:
 	quality_marks.reset()
 	hud.reset()
 	avatar.unit = int(msg.get("u", 0))
+	avatar.heard_me = false  # the character's state is known again from its first `me` (api.character)
 	movers.puppet_unit = avatar.unit
 	avatar.snap_to(Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0)
 	rig.global_position = avatar.global_position
@@ -1136,6 +1192,7 @@ func _on_message(msg: Dictionary) -> void:
 		"me":
 			avatar.update_from(ride.handle_me(msg))
 			movers.puppet_unit = avatar.unit
+			movers.driven = avatar.vehicle
 			hud.set_mining(avatar.mining)
 			hud.set_health(avatar.health, avatar.max_health)
 			hud.set_shield(int(msg.get("sd", 0)), int(msg.get("msd", 0)))
@@ -1204,7 +1261,7 @@ func _on_message(msg: Dictionary) -> void:
 			fx.weapons.prewarm_fights()
 			movers.creatures.prewarm()
 		"guns":
-			hud.set_guns(int(msg.get("sel", 1)), _array(msg.get("l")))
+			hud.set_guns(int(msg.get("sel", 1)), _array(msg.get("l")), int(msg.get("v", 0)))
 		"fl", "pw", "ht":
 			if Bridge.world_ready:
 				fluids_power.handle(msg)
@@ -1256,11 +1313,18 @@ func _on_message(msg: Dictionary) -> void:
 				hud.ui.model.handle({"t": "rdone", "l": [[str(msg["tech"]), 0]], "k": msg.get("k", 0)})
 			else:
 				hud.show_message(str(msg.get("text", "")))
+				if input != null:
+					input.heard_message(str(msg.get("text", "")))  # issue #24: "Out of reach" stops the swing
 		_:
-			if not hud.ui.model.handle(msg):  # UI data (scripts/ui/factorio/ui_model.gd)
+			if str(msg.get("t", "")) == "eprops":
+				hud.ui.model.handle(msg)
+				world.fluid_ports_from(hud.ui.model.eprops)  # machines' connections, for pipe covers (pipe_covers.gd)
+			elif not hud.ui.model.handle(msg):  # UI data (scripts/ui/factorio/ui_model.gd)
 				var t := str(msg.get("t", ""))
 				if t == "del" or t == "add":
 					_belt_change(msg, t)
+				if t == "add" and predicted != null:
+					predicted.heard_add(msg.get("e"))  # L2: the build it answers is made
 				world.handle(msg)
 
 
@@ -1459,6 +1523,7 @@ func _build_environment() -> void:
 	sun_shadows.sun = sun
 	_game.add_child(sun_shadows)
 	looks = Looks.new()
+	looks.shadows = sun_shadows
 	_game.add_child(looks)
 	looks.look_changed.connect(_apply_clouds)
 	looks.look_changed.connect(_note_look_antialiasing)
@@ -1498,8 +1563,8 @@ func _set_space(on: bool) -> void:
 
 
 ## The planet in the platform's sky: the one it is stopped at; while travelling, the one it left
-## falling away over the first part of the route and the next one growing over the last,
-## nothing in between. `plat` comes once a second: the planet drawn glides between them.
+## falling away over the first part of the route and the next one growing over the last (#15),
+## nothing in between. `plat` comes once a second: the planet drawn glides between them (H9).
 func _show_planet_for(rec: Dictionary) -> void:
 	var shown := planet_offset(rec)
 	var location: String = shown[0]
@@ -1583,7 +1648,7 @@ static func planet_in_sky(rec: Dictionary) -> Array:
 func _show_planet(location: String) -> void:
 	if _space_material == null:
 		return
-	# The real planet: Factorio's star map picture of it, where the install has one.
+	# The real planet: Factorio's star map picture of it, where the install has one (owner's #15).
 	var tex := planet_picture(location)
 	# Another mod's planet has no colour here: it shows as its picture, if it is a planet at all
 	# (platforms also stop at places that aren't, such as the solar system's edge).
@@ -1698,19 +1763,35 @@ func _update_sky(delta: float) -> void:
 	var night := clampf(_darkness / 0.85, 0.0, 1.0)
 	_planet_sky.twilight = looks.twilight()
 	_planet_sky.sky_twilight = looks.sky_twilight()
+	_planet_sky.noon_yaw = looks.noon_yaw(PlanetSky.YAW_NOON)
 	_planet_sky.apply(_env, _sun, _daytime, night, delta, _space)
-	looks.apply(_daytime, night, _planet_sky.planet, _space, _planet_sky.state)
 	# Night vision equipment: Factorio's turns on past half darkness while it has power and lifts
-	# the night with its colour lookup (a brighter, greener picture).
+	# the night with its colour lookup (a brighter, greener picture). The look adds it before the debug
+	# menu's sliders, so Ambient energy 0 holds with it on.
 	var nv_on := bool(hud.ui.model.grid("char").get("night_vision", false)) and _darkness >= 0.5
 	_night_vision = move_toward(_night_vision, 1.0 if nv_on else 0.0, delta * 2.0)
-	if _night_vision > 0.0:
-		_env.ambient_light_energy += 1.4 * _night_vision
-		_env.ambient_light_color = _env.ambient_light_color.lerp(Color(0.62, 0.86, 0.62), 0.6 * _night_vision)
+	looks.night_vision = _night_vision
+	looks.apply(_daytime, night, _planet_sky.planet, _space, _planet_sky.state)
+	_night_vision_feedback(nv_on)
 	avatar.set_night(night)
 	movers.set_night(night)
 	lamps.darkness = _darkness
 	lamps.focus = rig.focus_point()
+
+
+## Night vision's feedback: the equipment's own activate / deactivate sound when it switches (from the
+## prototype's data, played at the character on the Effects bus, so the sound settings apply), and the edge
+## and icon following `_night_vision`. `_nv_was` starts unknown, so a join with it already on is silent.
+var _nv_was := -1
+
+
+func _night_vision_feedback(nv_on: bool) -> void:
+	hud.set_night_vision(_night_vision)
+	if _nv_was >= 0 and (_nv_was == 1) != nv_on and NightVisionOverlay.sound_enabled():
+		var def: Variant = fx.steps.night_vision_sound(nv_on)
+		if def != null:
+			fx.sfx.play_def(def, avatar.global_position, "Effects")
+	_nv_was = 1 if nv_on else 0
 
 
 ## A screenshot drawn off screen at a size of its own (addon_host.gd): its camera and size for the
@@ -1721,7 +1802,7 @@ var shot_size := Vector2.ZERO
 
 ## The camera, for the sky shaders (sky_view.gdshaderinc): under an orthographic camera Godot's sky
 ## rays come out nearly 180° wide, so the shaders are given the real orientation and field of view
-##. The planet below a platform stays put (space_sky.gdshader's planet_dir, F4).
+## (owner's C13). The planet below a platform stays put (space_sky.gdshader's planet_dir, F4).
 func _sync_sky_view() -> void:
 	var cam := get_viewport().get_camera_3d()
 	var size := get_viewport().get_visible_rect().size

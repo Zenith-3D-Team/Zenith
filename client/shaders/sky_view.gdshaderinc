@@ -1,6 +1,6 @@
 // The direction a sky pixel looks in. Godot builds a sky's view rays from the camera's projection as
 // if it were a perspective one, so under an orthographic camera (Factorio's view, F6) the field of
-// view grows to nearly 180 degrees and the sky smears towards the edges. There
+// view grows to nearly 180 degrees and the sky smears towards the edges (owner's C13). There
 // main.gd sets these, and the sky is drawn as a perspective camera turned the same way would see it.
 // The cubemap pass that lights reflections has its own rays, which are right either way.
 uniform float view_ortho = 0.0;

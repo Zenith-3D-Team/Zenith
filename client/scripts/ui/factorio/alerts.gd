@@ -12,6 +12,7 @@ extends HBoxContainer
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const AlertIcons := preload("res://scripts/ui/factorio/alert_icons.gd")
+const Sfx := preload("res://scripts/fx/sfx.gd")
 
 ## Look at a position (tiles) in remote view.
 signal show_at(at: Vector2)
@@ -19,6 +20,8 @@ signal show_at(at: Vector2)
 signal say(text: String)
 ## An alert on another surface: look at it on that surface's map (the 3D world is the character's).
 signal show_on_surface(at: Vector2, si: int)
+## What the bar shows changed (the minimap and the map view draw its alerts again).
+signal shown_changed
 
 const REFRESH := 0.5
 ## Kinds the bar leaves out unless `hidden_kinds` is changed. Factorio has no "output full" alert,
@@ -49,6 +52,8 @@ const KINDS := {
 	"collector": ["asteroid-collector-path-blocked-icon.png", "Asteroid collector blocked",
 		["%d asteroid collector can't collect.", "%d asteroid collectors can't collect."]],
 	"launch": ["destination-full-icon.png", "Rocket can't launch", ["%d rocket silo can't launch.", "%d rocket silos can't launch."]],
+	# L11: Factorio's pipeline_disabled_icon and its alert's words ("Pipeline has been overextended.").
+	"pipeline": ["fluid-icon-red.png", "Pipeline overextended", ["Pipeline has been overextended.", "%d pipelines have been overextended."]],
 	"no_power": ["electricity-icon-red.png", "No power", ["%d entity has no power.", "%d entities have no power."]],
 	"unplugged": ["electricity-icon-unplugged.png", "Not connected to power", ["%d entity isn't connected to an electric network.",
 		"%d entities aren't connected to an electric network."]],
@@ -100,8 +105,34 @@ var hidden_kinds: Array = HIDDEN_BY_DEFAULT.duplicate()
 ## kind -> Time.get_ticks_msec() when it was last there (the Alerts configuration's "Latest").
 var last_seen := {}
 
+## Factorio's alert sound (its utility sound alert_destroyed, core/sound/alert-destroyed.ogg at half
+## volume): the beep when something of the force is destroyed (its changelog: "Alert beep sound is
+## activated only when something is destroyed, not by something damaged"). Factorio also beeps once
+## when a turret runs out of ammunition (2.0: "It only sounds once right when the ammo is used up");
+## the owner chose to remove that one, so it sounds only with `--alert-sounds=ammo`. Here: when the
+## mod's alerts gain an entry of one of these kinds, once however many, not for the alerts already
+## there when the client joins, not for a kind muted or disabled in the Alerts configuration.
+## `--alert-sounds=off`: silent, as before.
+const SOUND_KINDS := ["destroyed"]
+const SOUND_KINDS_AMMO := ["destroyed", "no_ammo"]
+const SOUND_GAP_MSEC := 1000
+static var sounds_on := not ("--alert-sounds=off" in OS.get_cmdline_user_args())
+## The bar's alerts on the minimap and the map view (Factorio's changelog 0.7.1: "Alert notifications
+## are visible on the minimap as well"). `--minimap-alerts=off`: neither draws them, as before.
+static var map_marks_on := not ("--minimap-alerts=off" in OS.get_cmdline_user_args())
+## `--alert-sounds=ammo`: the out-of-ammunition beep as before.
+static var sound_kinds: Array = SOUND_KINDS_AMMO if "--alert-sounds=ammo" in OS.get_cmdline_user_args() else SOUND_KINDS
+## Kinds muted in the Alerts configuration (alerts_config.gd apply).
+var muted_kinds: Array = []
+## Plays it (the UI test counts it instead).
+var alert_beep := func() -> void: Sfx.play_ui("alert-destroyed", 0.5)
+var _sounded := {}  # kind -> {entry key: true}: the entries the last update had
+var _sound_primed := false
+var _sound_msec := -SOUND_GAP_MSEC
+
 var _buttons := {}  # kind -> Button
 var _lists := {}  # kind -> [{"position", "si", "name", "unit", "subject"}]
+var _marks_sig := hash([])  # map_marks()'s hash when shown_changed last fired: the maps redraw only on a change
 var _counts := {}  # kind -> how many
 var _next := {}  # kind -> which entity a click looks at next
 var _timer := 0.0
@@ -149,6 +180,24 @@ func look(kind: String) -> void:
 		show_on_surface.emit(e["position"], int(e["si"]))
 		return
 	show_at.emit(e["position"])
+
+
+## The bar's alerts with a position, for the maps: [{"position" (tiles), "si", "kind"}], the kinds the
+## bar leaves out (hidden, status-only) left out here too, least important first so the important ones
+## are drawn on top (Factorio's 0.9.7: destroyed over damaged over turrets firing over the rest; KINDS'
+## order reversed). An entry without a surface (the client's own guesses) is the character's.
+func map_marks() -> Array:
+	var out: Array = []
+	if not map_marks_on:
+		return out
+	var here := int(model.character_si) if model != null and model.get("character_si") != null else 0
+	var kinds: Array = KINDS.keys()
+	kinds.reverse()
+	for kind in kinds:
+		for e in _lists.get(kind, []):
+			var si := int(e.get("si", 0))
+			out.append({"position": e["position"], "si": si if si != 0 else here, "kind": kind})
+	return out
 
 
 ## What the button's tooltip says: the sentence, then the entities by kind with how many.
@@ -205,7 +254,30 @@ func _refresh() -> void:
 	for a in model.alerts:
 		lists[a["kind"]] = a["entities"]
 		counts[a["kind"]] = a["count"]
+	_sound_new(lists)
 	_show(lists, counts)
+
+
+## The alert sound for what is new among the kinds that sound (see SOUND_KINDS, sound_kinds).
+func _sound_new(lists: Dictionary) -> void:
+	var fresh := false
+	for kind in sound_kinds:
+		var keys := {}
+		for e in lists.get(kind, []):
+			keys["%d:%s:%s:%d" % [int(e["unit"]), e["name"], e["position"], int(e["si"])]] = true
+		var before: Dictionary = _sounded.get(kind, {})
+		if not hidden_kinds.has(kind) and not muted_kinds.has(kind):
+			for key in keys:
+				if not before.has(key):
+					fresh = true
+					break
+		_sounded[kind] = keys
+	var primed := _sound_primed
+	_sound_primed = true
+	var now := Time.get_ticks_msec()
+	if fresh and primed and sounds_on and now - _sound_msec >= SOUND_GAP_MSEC:
+		_sound_msec = now
+		alert_beep.call()
 
 
 ## With an older mod: what the client knows (no power from `pw`, damage from `hp`).
@@ -279,3 +351,9 @@ func _show(lists: Dictionary, counts: Dictionary) -> void:
 		b.tooltip_text = str(KINDS[kind][1])
 	if _icons != null:
 		_icons.show_alerts(icon_lists, int(model.character_si) if model != null and model.get("character_si") != null else 0)
+	# Only when what the maps draw changed (an `al` comes about once a second, mostly the same); with
+	# --minimap-alerts=off map_marks() is empty, so this never fires and the maps keep their old cadence.
+	var sig := hash(map_marks())
+	if sig != _marks_sig:
+		_marks_sig = sig
+		shown_changed.emit()

@@ -132,6 +132,7 @@ end
 -- {item, x, y (fixed: the brush's centre), n (brush size), ghost? (1: tile ghosts), r? (1: hazard
 -- concrete's other direction)}: lays the item's tile under the brush where it may go, one item
 -- each, handing back what the old tile is mined into. Ghosts need no items or reach.
+-- hs?: the main inventory slot the client's hand holds the item from: that stack pays first (L7).
 function M.place(cmd)
   local c = puppet.get()
   if not c then
@@ -154,7 +155,10 @@ function M.place(cmd)
     return
   end
   local inventory = c.get_main_inventory()
-  local have = (not ghost and inventory) and inventory.get_item_count(item_name) or 0
+  -- Laid from the held stack's quality (`tile` carries none: the hand's stack, L7), normal without one;
+  -- the count is of that quality, as take_held spends only it.
+  local quality = inventory and puppet.held_quality(inventory, cmd.hs, item_name) or "normal"
+  local have = (not ghost and inventory) and inventory.get_item_count({ name = item_name, quality = quality }) or 0
   local tiles, ghosts, refunds = {}, {}, {}
   local skipped_reach = false
   for _, p in pairs(M.brush(x / 256, y / 256, n)) do
@@ -187,7 +191,7 @@ function M.place(cmd)
   end
   if #tiles > 0 then
     surface.set_tiles(tiles, true, false, true, true)
-    inventory.remove({ name = item_name, count = #tiles })
+    puppet.take_held(inventory, cmd.hs, item_name, #tiles, quality)  -- the held stack first (L7)
     for name, count in pairs(refunds) do
       give(c, { name = name, count = count })
     end

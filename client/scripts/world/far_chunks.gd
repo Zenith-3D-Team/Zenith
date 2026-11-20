@@ -7,9 +7,11 @@ extends Node
 ## vertex baked in (Bake), and drawn with one shared material (far_merged.gdshader). Where the chunk's
 ## shadows can reach the view (world.gd's shadow tiers) the same mesh casts them.
 ##
-## Trees and plants (cut-out leaf cards in their own shader), ore, fish, and nests and worms (moved
-## in the shader) keep their MultiMeshes (KEEP_TYPES). Picking, ghosts, wires, alerts and the fog
-## read world.gd's records or hide whole chunks, so they don't change.
+## Building-like entities merge into one shared mesh (`far_merged`); trees and plants merge into
+## their trunks plus an opaque puff/clustered crown surface (`far_tree_crown`, unless
+## `--far-trees=off`). Ore, fish, train stops, nests and worms (moved in the shader or keeping
+## their own colours/thinning) keep their MultiMeshes (KEEP_TYPES). Picking, ghosts, wires, alerts
+## and the fog read world.gd's records or hide whole chunks, so they don't change.
 ##
 ## A chunk going far keeps its MultiMeshes until its merged mesh is made, then hides them (nothing is
 ## built); coming near again it shows them, unless something in it changed meanwhile (a build lets
@@ -21,14 +23,17 @@ const Probing := preload("res://scripts/debug/probing.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
 const ModelTextures := preload("res://scripts/world/model_textures.gd")
+const Looks := preload("res://scripts/world/looks.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const BeltLods := preload("res://scripts/world/belt_lods.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const MergedShader := preload("res://shaders/far_merged.gdshader")
+const CrownShader := preload("res://shaders/far_tree_crown.gdshader")
 const FactorioAlphaShader := preload("res://shaders/factorio_material_alpha.gdshader")
 const FactorioLeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
+const LEAF_MEAN := 0.85
 
 const CHUNK := 32
 ## A chunk is merged once its nearest point is this far from the camera (tiles), or the sun's shadow
@@ -44,9 +49,10 @@ const SLACK := 24.0
 ## Chunks within this distance of the focus (tiles) are always drawn in full: the character's
 ## surroundings animate and are what the player works on, however far the camera is pulled back.
 const NEAR_FOCUS := 40.0
-## Entity types left to their own MultiMeshes in far chunks.
-const KEEP_TYPES := {"train-stop": true, "tree": true, "plant": true, "resource": true, "fish": true, "unit-spawner": true,
+## Entity types left to their own MultiMeshes in far chunks (trees and plants also kept when --far-trees=off).
+const KEEP_TYPES := {"train-stop": true, "resource": true, "fish": true, "unit-spawner": true,
 	"turret": true, "spider-leg": true}
+static var far_trees := not ("--far-trees=off" in OS.get_cmdline_user_args())
 ## How simple each model is merged (tiles): the simplifier's coarsest level within SIMPLIFY_ERROR, then
 ## its vertices clustered in CELL-sized cubes (Bake): about two pixels at MERGE_FROM in a 900-pixel
 ## window. Times the square root of the Level of detail setting's pixels of error (model_lods.gd
@@ -71,10 +77,12 @@ var merge_from := 0.0
 var merge_cap := MERGE_CAP
 var world  # world.gd
 
-## Per mesh: its Bake (done or not), and whether it can be merged at all.
+## Per mesh: its Bake (done or not), and whether it can be merged at all (0 no, 1 solid, 2 has leaf surface).
 static var _bakes := {}
 static var _bakeable := {}
 static var _material: ShaderMaterial
+static var _crown_material: ShaderMaterial
+static var _nature_material: ShaderMaterial
 ## Chunks whose builds asked for a merge (built()), taken in by _collect.
 static var _asked: Array = []
 
@@ -119,6 +127,8 @@ class State:
 	## Gathered: Mesh -> Array of Transform3D, and placeholders [Mesh, Transform3D, Color].
 	var groups := {}
 	var tinted: Array = []
+	## Meshes of trees and plants (their solid parts merge into a surface of their own, matte: far_merged_nature).
+	var nature := {}
 	## In the merged mesh: Mesh -> instances, and whether it has placeholders.
 	var counts := {}
 	var placeholders := false
@@ -139,32 +149,51 @@ class Bake:
 	## Per surface: [vertices, normals, COLOR, CUSTOM1, indices, params per row ({} leaves the row
 	## out), each vertex's row (CUSTOM2) or null with one row, UV (textured models)]
 	var surfaces: Array = []
+	## Crown surfaces (`factorio_material_leaf`): same layout plus [8] leaf_core flag.
+	var crown_surfaces: Array = []
+	var leaf_tints := PackedVector3Array()
 	var simplify_error := SIMPLIFY_ERROR
 	var cell := CELL
+	var crown_cell := 1.5
 	var verts := PackedVector3Array()
 	var colors := PackedColorArray()
 	var indices := PackedInt32Array()
+	var crown_verts := PackedVector3Array()
+	var crown_colors := PackedColorArray()
+	var crown_indices := PackedInt32Array()
 	var done := false
 	var usec := 0
+	## Packs' own shading as it was when this was baked (Looks.packs_shade): a "pbr" pack's colours differ.
+	var shading := true
 
 	func run() -> void:
 		var t0 := Time.get_ticks_usec()
-		var all_verts := PackedVector3Array()
-		var all_normals := PackedVector3Array()
-		var all_colors := PackedColorArray()
-		var all_idx := PackedInt32Array()
-		for s: Array in surfaces:
-			_surface(s, all_verts, all_normals, all_colors, all_idx)
-		surfaces = []
-		var idx := all_idx
-		for level: Array in _levels(all_verts, all_normals, all_idx):
-			if float(level[0]) <= simplify_error:
-				idx = level[1]
-		_cluster(all_verts, all_colors, idx)
+		if not surfaces.is_empty():
+			var all_verts := PackedVector3Array()
+			var all_normals := PackedVector3Array()
+			var all_colors := PackedColorArray()
+			var all_idx := PackedInt32Array()
+			for s: Array in surfaces:
+				_surface(s, all_verts, all_normals, all_colors, all_idx)
+			surfaces = []
+			var idx := all_idx
+			for level: Array in _levels(all_verts, all_normals, all_idx):
+				if float(level[0]) <= simplify_error:
+					idx = level[1]
+			var clustered := _cluster_into(all_verts, all_colors, idx, cell)
+			verts = clustered[0]
+			colors = clustered[1]
+			indices = clustered[2]
+		if not crown_surfaces.is_empty():
+			_bake_crown()
+			crown_surfaces = []
 		usec = Time.get_ticks_usec() - t0
 
-	## The model's triangles `idx` with vertices clustered by `cell` (none: just the ones used).
-	func _cluster(src: PackedVector3Array, cols: PackedColorArray, idx: PackedInt32Array) -> void:
+	## Clusters `src` vertices by `cluster_cell` and drops degenerate/duplicate triangles -> [verts, colors, indices].
+	static func _cluster_into(src: PackedVector3Array, cols: PackedColorArray, idx: PackedInt32Array, cluster_cell: float) -> Array:
+		var out_verts := PackedVector3Array()
+		var out_colors := PackedColorArray()
+		var out_indices := PackedInt32Array()
 		var map := PackedInt32Array()
 		map.resize(src.size())
 		map.fill(-1)
@@ -176,7 +205,7 @@ class Bake:
 		for k in idx:
 			if map[k] >= 0:
 				continue
-			var key = Vector3i((src[k] / cell).floor()) if cell > 0.0 else k
+			var key = Vector3i((src[k] / cluster_cell).floor()) if cluster_cell > 0.0 else k
 			var at: int = of_cell.get(key, -1)
 			if at < 0:
 				at = counts.size()
@@ -206,12 +235,169 @@ class Bake:
 			seen[key] = true
 			for v in [a, b, c]:
 				if used[v] < 0:
-					used[v] = verts.size()
+					used[v] = out_verts.size()
 					var n := float(counts[v])
-					verts.append(sums[v] / n)
+					out_verts.append(sums[v] / n)
 					var rgb := tints[v] / n
-					colors.append(Color(rgb.x, rgb.y, rgb.z, alphas[v]))
-				indices.append(used[v])
+					out_colors.append(Color(rgb.x, rgb.y, rgb.z, alphas[v]))
+				out_indices.append(used[v])
+		return [out_verts, out_colors, out_indices]
+
+	## Bakes tree crowns into closed opaque low-poly octahedron puffs (for leaf cards) or clustered
+	## simplified geometry (for solid-leaf crowns like tree-06), storing pc in COLOR.a directly.
+	func _bake_crown() -> void:
+		var cards_by_key := {}
+		var solid_verts := PackedVector3Array()
+		var solid_normals := PackedVector3Array()
+		var solid_colors := PackedColorArray()
+		var solid_idx := PackedInt32Array()
+		for s: Array in crown_surfaces:
+			var sv := PackedVector3Array()
+			var sn := PackedVector3Array()
+			var sc := PackedColorArray()
+			var si := PackedInt32Array()
+			_surface(s, sv, sn, sc, si)
+			var uvs := PackedVector2Array()
+			if s.size() > 7 and s[7] is PackedVector2Array and (s[7] as PackedVector2Array).size() == sv.size():
+				uvs = s[7]
+			var all_core := bool(s[8]) if s.size() > 8 else false
+			var solid_base := solid_verts.size()
+			var used_solid := false
+			for t in range(0, si.size() - 2, 3):
+				var i0 := si[t]
+				var i1 := si[t + 1]
+				var i2 := si[t + 2]
+				if not all_core and uvs.size() == sv.size() and uvs[i0].x >= -0.5:
+					var p0 := sv[i0]
+					var p1 := sv[i1]
+					var p2 := sv[i2]
+					var mid := (p0 + p1 + p2) / 3.0
+					var half := (p1 - p0).length() * 0.35
+					var d1 := uvs[i1] - uvs[i0]
+					var d2 := uvs[i2] - uvs[i0]
+					var det := d1.x * d2.y - d1.y * d2.x
+					if absf(det) > 1e-8:
+						var ax := ((p1 - p0) * d2.y - (p2 - p0) * d1.y) / det
+						var ay := ((p2 - p0) * d1.x - (p1 - p0) * d2.x) / det
+						mid = p0 - ax * (uvs[i0].x - 0.5) - ay * (uvs[i0].y - 0.5)
+						half = 0.5 * ax.length()
+					var rgb := Vector3.ZERO
+					var pc_sum := 0.0
+					for vi in [i0, i1, i2]:
+						var c := sc[vi]
+						rgb += Vector3(c.r * c.r, c.g * c.g, c.b * c.b)
+						pc_sum += float(roundi(c.a * 255.0) & 15) / 15.0
+					var key := Vector3i((mid * 200.0).round())
+					if not cards_by_key.has(key):
+						cards_by_key[key] = [mid, rgb / 3.0, pc_sum / 3.0, half, 1]
+					else:
+						var entry: Array = cards_by_key[key]
+						entry[0] = (entry[0] as Vector3) + mid
+						entry[1] = (entry[1] as Vector3) + rgb / 3.0
+						entry[2] = float(entry[2]) + pc_sum / 3.0
+						entry[3] = float(entry[3]) + half
+						entry[4] = int(entry[4]) + 1
+				else:
+					if not used_solid:
+						solid_verts.append_array(sv)
+						solid_normals.append_array(sn)
+						solid_colors.append_array(sc)
+						used_solid = true
+					solid_idx.append_array([i0 + solid_base, i1 + solid_base, i2 + solid_base])
+		if not cards_by_key.is_empty():
+			var lo := Vector3(INF, INF, INF)
+			var hi := -lo
+			var cards: Array = []
+			for key in cards_by_key:
+				var e: Array = cards_by_key[key]
+				var n := float(e[4])
+				var center := (e[0] as Vector3) / n
+				var col_lin := ((e[1] as Vector3) / n) * LEAF_MEAN
+				cards.append([center, col_lin, float(e[2]) / n, float(e[3]) / n])
+				lo = lo.min(center)
+				hi = hi.max(center)
+			var span := hi - lo
+			var step := maxf(maxf(span.x, maxf(span.y, span.z)) * 0.30, crown_cell)
+			var buckets := {}
+			for card: Array in cards:
+				var ck := Vector3i(((card[0] as Vector3) / step).floor())
+				if not buckets.has(ck):
+					buckets[ck] = []
+				(buckets[ck] as Array).append(card)
+			var kept_keys: Array = []
+			if buckets.size() <= 6:
+				kept_keys = buckets.keys()
+			else:
+				for ck: Vector3i in buckets:
+					if (buckets[ck] as Array).size() >= 4:
+						kept_keys.append(ck)
+				if kept_keys.is_empty():
+					kept_keys = buckets.keys()
+			for ck: Vector3i in kept_keys:
+				var list: Array = buckets[ck]
+				var blo := Vector3(INF, INF, INF)
+				var bhi := -blo
+				var col_sum := Vector3.ZERO
+				var pc_total := 0.0
+				var half_total := 0.0
+				for card: Array in list:
+					var cp: Vector3 = card[0]
+					blo = blo.min(cp)
+					bhi = bhi.max(cp)
+					col_sum += card[1] as Vector3
+					pc_total += float(card[2])
+					half_total += float(card[3])
+				var cnt := float(list.size())
+				var mid := (blo + bhi) * 0.5
+				var pad := maxf((half_total / cnt) * 0.75, 0.35)
+				var rx := (bhi.x - blo.x) * 0.5 + pad
+				var ry := (bhi.y - blo.y) * 0.5 + pad
+				var rz := (bhi.z - blo.z) * 0.5 + pad
+				var yaw := float(((ck.x * 73856093) ^ (ck.y * 19349663) ^ (ck.z * 83492791)) & 255) / 256.0 * 0.7854
+				_emit_puff(mid, rx, ry, rz, yaw, col_sum / cnt, pc_total / cnt)
+		elif not solid_idx.is_empty():
+			var idx := solid_idx
+			for level: Array in _levels(solid_verts, solid_normals, solid_idx):
+				if float(level[0]) <= simplify_error:
+					idx = level[1]
+			var clustered := _cluster_into(solid_verts, solid_colors, idx, maxf(cell, 0.35))
+			crown_verts = clustered[0]
+			var cc: PackedColorArray = clustered[1]
+			for k in cc.size():
+				cc[k].a = float(roundi(cc[k].a * 255.0) & 15) / 15.0
+			crown_colors = cc
+			crown_indices = clustered[2]
+
+	static func _sqrt_color(rgb: Vector3, factor: float, alpha: float) -> Color:
+		return Color(sqrt(clampf(rgb.x * factor, 0.0, 1.0)), sqrt(clampf(rgb.y * factor, 0.0, 1.0)),
+			sqrt(clampf(rgb.z * factor, 0.0, 1.0)), clampf(alpha, 0.0, 1.0))
+
+	func _emit_puff(mid: Vector3, rx: float, ry: float, rz: float, yaw: float, rgb: Vector3, pc: float) -> void:
+		var base := crown_verts.size()
+		var c := cos(yaw)
+		var s := sin(yaw)
+		crown_verts.append_array([
+			mid + Vector3(0.0, ry, 0.0),
+			mid + Vector3(0.0, -ry, 0.0),
+			mid + Vector3(rx * c, 0.0, rx * s),
+			mid + Vector3(-rz * s, 0.0, rz * c),
+			mid + Vector3(-rx * c, 0.0, -rx * s),
+			mid + Vector3(rz * s, 0.0, -rz * c),
+		])
+		var top_col := _sqrt_color(rgb, 1.08, pc)
+		var mid_col := _sqrt_color(rgb, 1.0, pc)
+		var bot_col := _sqrt_color(rgb, 0.78, pc)
+		crown_colors.append_array([top_col, bot_col, mid_col, mid_col, mid_col, mid_col])
+		crown_indices.append_array([
+			base, base + 2, base + 3,
+			base, base + 3, base + 4,
+			base, base + 4, base + 5,
+			base, base + 5, base + 2,
+			base + 1, base + 3, base + 2,
+			base + 1, base + 4, base + 3,
+			base + 1, base + 5, base + 4,
+			base + 1, base + 2, base + 5,
+		])
 
 	## [[error, indices into the model's own vertices], ...], finest first, from Godot's simplifier
 	## over the welded positions; [] for a model too small to bother.
@@ -308,6 +494,11 @@ class Bake:
 		var ao_strength := 1.0
 		var light := 1.0
 		var metallic := 0.0
+		var pbr := false
+		var pbr_light := Looks.TEXTURE_LIGHT
+		var normals := PackedVector3Array()
+		if s[1] is PackedVector3Array and (s[1] as PackedVector3Array).size() == n:
+			normals = s[1]
 		# A textured model (never merged, so one row): each vertex takes its texture's colour round it
 		# (a small copy of it, _texture_colours).
 		var tex: Image = (params[0] as Dictionary).get("tex")
@@ -330,10 +521,15 @@ class Bake:
 				ao_strength = p["ao_strength"]
 				light = p["light"]
 				metallic = p["metallic"]
+				pbr = bool(p.get("pbr", false))
+				pbr_light = p.get("pbr_light", Looks.TEXTURE_LIGHT)
 			var rgb := Vector3(albedo.r, albedo.g, albedo.b)
 			var pc := 0.0
 			if not tex_rgb.is_empty():
 				rgb *= tex_rgb[v]
+				pc = 1.0
+			elif pbr:
+				# A "pbr" pack's material without a picture: its factor as the file says, no part colours.
 				pc = 1.0
 			elif part_share > 0.0 and not c1.is_empty():
 				# Part colours are kept with headroom (rgb / 4, share * 0.25) unless the share is above 0.25.
@@ -353,6 +549,12 @@ class Bake:
 			var shade := pow(ao, ao_strength) if ao_strength > 1.0 else lerpf(1.0, ao, ao_strength)
 			rgb *= lerpf(1.0, shade, 0.65) * light
 			var metal := clampf(metallic * lerpf(1.0, 0.1, pc), 0.0, 1.0)
+			if pbr and pc > 0.0:
+				# A "pbr" pack's picture (the near shader's modeller_tex): no part colour balance in the far
+				# shader (pc 0), the look's texture_light baked in by the way the vertex faces instead.
+				var up := clampf(normals[v].y, 0.0, 1.0) if not normals.is_empty() else 1.0
+				rgb *= lerpf(pbr_light.x, pbr_light.y, up)
+				pc = 0.0
 			var packed := float(roundi(pc * 15.0) + 16 * roundi(metal * 15.0)) / 255.0
 			all_colors.append(Color(sqrt(clampf(rgb.x, 0.0, 1.0)), sqrt(clampf(rgb.y, 0.0, 1.0)), sqrt(clampf(rgb.z, 0.0, 1.0)), packed))
 
@@ -393,22 +595,44 @@ class Bake:
 ## its next sync), so the main thread only hands it to the chunk's MeshInstance3D.
 class Merge:
 	var serial := 0
-	var groups: Array = []  # [Bake, Array of Transform3D, Mesh]
+	var groups: Array = []  # [Bake, Array of Transform3D, Mesh, trees' or plants' (bool)]
 	var tinted: Array = []  # [Bake, Transform3D, Color]
 	var material: Material
+	var nature_material: Material
+	var crown_material: Material
 	var mesh: ArrayMesh
 	var triangles := 0
 	var usec := 0
+
+	static func _hash12(p: Vector2) -> float:
+		var px := fposmod(p.x, 4096.0)
+		var py := fposmod(p.y, 4096.0)
+		var x := fposmod(px * 0.1031, 1.0)
+		var y := fposmod(py * 0.1031, 1.0)
+		var z := x
+		var d := x * (y + 33.33) + y * (z + 33.33) + z * (x + 33.33)
+		x += d
+		y += d
+		z += d
+		return fposmod((x + y) * z, 1.0)
 
 	func run() -> void:
 		var t0 := Time.get_ticks_usec()
 		var all: Array = []
 		var nf := 0
+		var n_nf := 0
+		var c_nf := 0
 		for g: Array in groups:
 			var bake: Bake = g[0]
-			for xform: Transform3D in g[1]:
-				all.append([bake, xform, null])
-			nf += bake.indices.size() * (g[1] as Array).size()
+			var xforms: Array = g[1]
+			var is_nature: bool = g.size() > 3 and g[3]
+			for xform: Transform3D in xforms:
+				all.append([bake, xform, null, is_nature])
+			if is_nature:
+				n_nf += bake.indices.size() * xforms.size()
+			else:
+				nf += bake.indices.size() * xforms.size()
+			c_nf += bake.crown_indices.size() * xforms.size()
 		for t: Array in tinted:
 			all.append(t)
 			nf += (t[0] as Bake).indices.size()
@@ -417,31 +641,104 @@ class Merge:
 		var indices := PackedInt32Array()
 		indices.resize(nf)
 		var wf := 0
+		# Trees' and plants' trunks and the like: the same arrays, in a surface of their own.
+		var n_verts := PackedVector3Array()
+		var n_colors := PackedColorArray()
+		var n_indices := PackedInt32Array()
+		n_indices.resize(n_nf)
+		var n_wf := 0
+		var c_verts := PackedVector3Array()
+		var c_colors := PackedColorArray()
+		var c_uvs := PackedVector2Array()
+		var c_indices := PackedInt32Array()
+		c_indices.resize(c_nf)
+		var c_wf := 0
 		for entry: Array in all:
 			var bake: Bake = entry[0]
 			var xform: Transform3D = entry[1]
-			var base := verts.size()
-			verts.append_array(xform * bake.verts)
-			if entry[2] == null:
-				colors.append_array(bake.colors)
-			else:
-				# Placeholders: the prototype's colour, as a square root as the bake's are.
-				var tint: Color = entry[2]
-				for c in bake.colors:
-					colors.append(Color(c.r * sqrt(tint.r), c.g * sqrt(tint.g), c.b * sqrt(tint.b), c.a))
-			for k in bake.indices:
-				indices[wf] = k + base
-				wf += 1
-		triangles = nf / 3
-		if nf >= 3:
-			var arrays := []
-			arrays.resize(Mesh.ARRAY_MAX)
-			arrays[Mesh.ARRAY_VERTEX] = verts
-			arrays[Mesh.ARRAY_COLOR] = colors
-			arrays[Mesh.ARRAY_INDEX] = indices
+			if not bake.indices.is_empty():
+				var nat: bool = entry.size() > 3 and entry[3]
+				var tv: PackedVector3Array = n_verts if nat else verts
+				var tc: PackedColorArray = n_colors if nat else colors
+				var ti_: PackedInt32Array = n_indices if nat else indices
+				var base := tv.size()
+				tv.append_array(xform * bake.verts)
+				if entry[2] == null:
+					tc.append_array(bake.colors)
+				else:
+					# Placeholders: the prototype's colour, as a square root as the bake's are.
+					var tint: Color = entry[2]
+					for c in bake.colors:
+						tc.append(Color(c.r * sqrt(tint.r), c.g * sqrt(tint.g), c.b * sqrt(tint.b), c.a))
+				var w := n_wf if nat else wf
+				for k in bake.indices:
+					ti_[w] = k + base
+					w += 1
+				# (assigned back: no matter whether packed arrays copy on assignment)
+				if nat:
+					n_wf = w
+					n_verts = tv
+					n_colors = tc
+					n_indices = ti_
+				else:
+					wf = w
+					verts = tv
+					colors = tc
+					indices = ti_
+			if not bake.crown_indices.is_empty():
+				var c_base := c_verts.size()
+				c_verts.append_array(xform * bake.crown_verts)
+				var ox := xform.origin.x
+				var oz := xform.origin.z
+				var tree_uv := Vector2(ox, oz)
+				if bake.leaf_tints.is_empty():
+					c_colors.append_array(bake.crown_colors)
+				else:
+					var seed := _hash12(tree_uv * 3.17 + Vector2(0.5, 0.5))
+					var ti := clampi(int(fposmod(seed * 13.37 + 0.21, 1.0) * bake.leaf_tints.size()),
+						0, bake.leaf_tints.size() - 1)
+					var lt := bake.leaf_tints[ti]
+					var sr := sqrt(maxf(lt.x, 0.0))
+					var sg := sqrt(maxf(lt.y, 0.0))
+					var sb := sqrt(maxf(lt.z, 0.0))
+					for c in bake.crown_colors:
+						c_colors.append(Color(c.r * sr, c.g * sg, c.b * sb, c.a))
+				var u0 := c_uvs.size()
+				c_uvs.resize(u0 + bake.crown_verts.size())
+				for ui in range(u0, c_uvs.size()):
+					c_uvs[ui] = tree_uv
+				for k in bake.crown_indices:
+					c_indices[c_wf] = k + c_base
+					c_wf += 1
+		triangles = (nf + n_nf + c_nf) / 3
+		if nf >= 3 or n_nf >= 3 or c_nf >= 3:
 			mesh = ArrayMesh.new()
-			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], {}, Mesh.ARRAY_FLAG_COMPRESS_ATTRIBUTES)
-			mesh.surface_set_material(0, material)
+			if nf >= 3:
+				var arrays := []
+				arrays.resize(Mesh.ARRAY_MAX)
+				arrays[Mesh.ARRAY_VERTEX] = verts
+				arrays[Mesh.ARRAY_COLOR] = colors
+				arrays[Mesh.ARRAY_INDEX] = indices
+				mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], {}, Mesh.ARRAY_FLAG_COMPRESS_ATTRIBUTES)
+				mesh.surface_set_material(mesh.get_surface_count() - 1, material)
+			if n_nf >= 3:
+				var n_arrays := []
+				n_arrays.resize(Mesh.ARRAY_MAX)
+				n_arrays[Mesh.ARRAY_VERTEX] = n_verts
+				n_arrays[Mesh.ARRAY_COLOR] = n_colors
+				n_arrays[Mesh.ARRAY_INDEX] = n_indices
+				mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, n_arrays, [], {}, Mesh.ARRAY_FLAG_COMPRESS_ATTRIBUTES)
+				mesh.surface_set_material(mesh.get_surface_count() - 1, nature_material)
+			if c_nf >= 3:
+				var c_arrays := []
+				c_arrays.resize(Mesh.ARRAY_MAX)
+				c_arrays[Mesh.ARRAY_VERTEX] = c_verts
+				c_arrays[Mesh.ARRAY_COLOR] = c_colors
+				c_arrays[Mesh.ARRAY_TEX_UV] = c_uvs
+				c_arrays[Mesh.ARRAY_INDEX] = c_indices
+				# Uncompressed: UVs hold full float world (x, z) coordinates for far pollution sampling.
+				mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, c_arrays, [], {}, 0)
+				mesh.surface_set_material(mesh.get_surface_count() - 1, crown_material)
 		groups = []
 		tinted = []
 		usec = Time.get_ticks_usec() - t0
@@ -454,8 +751,26 @@ static func material() -> ShaderMaterial:
 	return _material
 
 
+## The merged material for trees' and plants' solid parts: far_merged with its `nature` switch on (matte, as near).
+static func nature_material() -> ShaderMaterial:
+	if _nature_material == null:
+		_nature_material = ShaderMaterial.new()
+		_nature_material.shader = MergedShader
+		_nature_material.set_shader_parameter("nature", true)
+	return _nature_material
+
+
+static func crown_material() -> ShaderMaterial:
+	if _crown_material == null:
+		_crown_material = ShaderMaterial.new()
+		_crown_material.shader = CrownShader
+	return _crown_material
+
+
 func _ready() -> void:
+	nature_material()
 	material()  # Godot sets a shader up with its first material: here rather than at the first merge
+	crown_material()
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--far-merge-from="):
 			merge_from = float(arg.get_slice("=", 1))
@@ -478,13 +793,17 @@ static func skips(cv) -> bool:
 	return s.far and (s.covers or not s.full)
 
 
+static func _kept_type(proto_type: String) -> bool:
+	return KEEP_TYPES.has(proto_type) or (not far_trees and (proto_type == "tree" or proto_type == "plant"))
+
+
 ## Whether an entity of this type drawn with `mesh` (null: a placeholder) goes in a merged mesh. With
 ## a graphics list a building without a model is its own picture on a card (chunk_view.gd), never a
 ## box, and the card stays as it is far away too.
 static func merges(proto_type: String, mesh: Mesh) -> bool:
 	if mesh == null:
-		return not KEEP_TYPES.has(proto_type) and not SpriteStandins.in_use()
-	return not KEEP_TYPES.has(proto_type) and bakeable(mesh)
+		return not _kept_type(proto_type) and not SpriteStandins.in_use()
+	return not _kept_type(proto_type) and bakeable(mesh)
 
 
 ## After a chunk's build (`skipped`: whether it left the merged entities out), or after it added
@@ -554,24 +873,26 @@ static func ask(cv) -> void:
 # --- Which meshes merge, and how ---------------------------------------------------------------
 
 ## A mesh merges when its arrays are on the CPU (model_library.gd keeps them; primitive meshes make
-## them there) and none of its surfaces moves in the shader (creatures' rigs) or is cut out (leaves).
+## them there) and none of its surfaces moves in the shader (creatures' rigs) or is cut out with an
+## external texture (`ALPHA_CLIP`). Leaf surfaces merge when `far_trees` is on.
 static func bakeable(mesh: Mesh) -> bool:
-	if _bakeable.has(mesh):
-		return _bakeable[mesh]
-	var ok := mesh is PrimitiveMesh or (mesh is ArrayMesh and mesh.has_meta(ModelLods.ARRAYS_META))
-	if ok:
-		for i in mesh.get_surface_count():
-			if mesh.surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
-				ok = false
-				break
-			var sm := mesh.surface_get_material(i) as ShaderMaterial
-			# Leaf cards and cut-out materials keep their own mesh: the merged shader has no alpha.
-			if sm != null and (sm.shader == FactorioLeafShader or sm.shader == ModelLibrary.FactorioClipShader
-					or int(_param(sm, "rig_mode", 0)) != 0):
-				ok = false
-				break
-	_bakeable[mesh] = ok
-	return ok
+	if not _bakeable.has(mesh):
+		var kind := 1 if (mesh is PrimitiveMesh or (mesh is ArrayMesh and mesh.has_meta(ModelLods.ARRAYS_META))) else 0
+		if kind != 0:
+			for i in mesh.get_surface_count():
+				if mesh.surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
+					kind = 0
+					break
+				var sm := mesh.surface_get_material(i) as ShaderMaterial
+				if sm != null:
+					if sm.shader == ModelLibrary.FactorioClipShader or int(_param(sm, "rig_mode", 0)) != 0:
+						kind = 0
+						break
+					if sm.shader == FactorioLeafShader:
+						kind = 2
+		_bakeable[mesh] = kind
+	var k: int = _bakeable[mesh]
+	return k == 1 or (k == 2 and far_trees)
 
 
 static func _param(sm: ShaderMaterial, name: String, default: Variant) -> Variant:
@@ -597,6 +918,9 @@ static func _surface_params(material: Material) -> Dictionary:
 		p["value"] = float(_param(sm, "value", 0.9))
 		p["ao_strength"] = float(_param(sm, "ao_strength", 1.0))
 		p["metallic"] = float(_param(sm, "metallic", 0.0))
+		# A "pbr" pack's material (model_library.gd PACK_PBR_META), while packs' own shading is on.
+		p["pbr"] = Looks.packs_shade and bool(_param(sm, "modeller_tex", false))
+		p["pbr_light"] = Looks.light_now
 		var albedo_tex: Texture2D = _param(sm, "albedo_tex", null) if bool(_param(sm, "use_albedo_tex", false)) else null
 		if albedo_tex != null and albedo_tex.has_meta(ModelTextures.SMALL_META):
 			p["tex"] = albedo_tex.get_meta(ModelTextures.SMALL_META)
@@ -615,23 +939,49 @@ static func _surface_params(material: Material) -> Dictionary:
 ## The model's Bake when it is done; else starts it and returns null.
 func _bake_for(mesh: Mesh) -> Bake:
 	var bake: Bake = _bakes.get(mesh)
-	if bake != null:
+	if bake != null and (bake.shading == Looks.packs_shade or not bake.done):
 		return bake if bake.done else null
 	bake = Bake.new()
+	bake.shading = Looks.packs_shade
 	var coarser := sqrt(ModelLods.lod_threshold)
 	bake.simplify_error = SIMPLIFY_ERROR * coarser
 	bake.cell = CELL * coarser
+	bake.crown_cell = 1.5 * clampf(sqrt(coarser), 1.0, 1.3)
 	var kept: Array = mesh.get_meta(ModelLods.ARRAYS_META) if mesh.has_meta(ModelLods.ARRAYS_META) else []
 	for i in mesh.get_surface_count():
 		# A merged surface (material_rows.gd): each row's material, CUSTOM2 each vertex's row.
 		var material := mesh.surface_get_material(i)
 		var rows := MaterialRows.rows(material)
+		var mats: Array = rows if not rows.is_empty() else [material]
 		var params: Array = []
-		for m in (rows if not rows.is_empty() else [material]):
+		for m in mats:
 			params.append(_surface_params(m))
 		if params.all(func(p: Dictionary) -> bool: return p.is_empty()):
 			continue
 		var a: Array = kept[i] if i < kept.size() else (mesh as PrimitiveMesh).get_mesh_arrays()
+		var sm := material as ShaderMaterial
+		if sm != null and sm.shader == FactorioLeafShader:
+			if bake.leaf_tints.is_empty():
+				for r in mats:
+					var rsm := r as ShaderMaterial
+					if rsm == null:
+						continue
+					var n_tints := clampi(int(_param(rsm, "leaf_tint_count", 0)), 0, 16)
+					if n_tints <= 0:
+						continue
+					var raw: Variant = rsm.get_shader_parameter("leaf_tints")
+					if raw is PackedVector3Array:
+						bake.leaf_tints = (raw as PackedVector3Array).slice(0, n_tints)
+						break
+					if raw is Array:
+						for k in mini(n_tints, (raw as Array).size()):
+							if (raw as Array)[k] is Vector3:
+								bake.leaf_tints.append((raw as Array)[k])
+						break
+			bake.crown_surfaces.append([a[Mesh.ARRAY_VERTEX], a[Mesh.ARRAY_NORMAL], a[Mesh.ARRAY_COLOR], a[Mesh.ARRAY_CUSTOM1],
+				a[Mesh.ARRAY_INDEX], params, a[Mesh.ARRAY_CUSTOM2] if not rows.is_empty() else null, a[Mesh.ARRAY_TEX_UV],
+				bool(_param(sm, "leaf_core", false))])
+			continue
 		bake.surfaces.append([a[Mesh.ARRAY_VERTEX], a[Mesh.ARRAY_NORMAL], a[Mesh.ARRAY_COLOR], a[Mesh.ARRAY_CUSTOM1],
 			a[Mesh.ARRAY_INDEX], params, a[Mesh.ARRAY_CUSTOM2] if not rows.is_empty() else null, a[Mesh.ARRAY_TEX_UV]])
 	_bakes[mesh] = bake
@@ -728,6 +1078,7 @@ func _decide_slice() -> void:
 		if far == s.far:
 			continue
 		s.far = far
+		cv.thin_ore()  # scattered ore: one rock a tile far away, all of them near (no build)
 		if far:
 			if cv.loaded:
 				ask(cv)
@@ -813,8 +1164,10 @@ func _current(entry: Array, phase: int) -> bool:
 func _gather(cv, s: State, rec) -> void:
 	var protos = world.protos
 	var proto = protos.entity(rec.proto_id)
-	if proto == null or rec.extra.has("gh") or rec.extra.has("tg") or ModelLibrary.hidden(proto.name) or KEEP_TYPES.has(proto.type):
+	if proto == null or rec.extra.has("gh") or rec.extra.has("tg") or ModelLibrary.hidden(proto.name) or _kept_type(proto.type):
 		return
+	if rec.extra.has("hid"):
+		return  # (predicted.gd clear_run, as chunk_view.gd)
 	if ModelLibrary.REMNANT_TYPES.has(proto.type):
 		var remnant: Array = cv._remnant(protos, proto, rec)
 		if not remnant.is_empty() and bakeable(remnant[0]):
@@ -834,6 +1187,8 @@ func _gather(cv, s: State, rec) -> void:
 		return
 	var xform: Transform3D = cv._model_transform(proto, rec)
 	_add(s, mesh, xform)
+	if proto.type == "tree" or proto.type == "plant":
+		s.nature[mesh] = true
 	var parts := ModelLibrary.parts_for_entity(proto.name, proto.type, rec.extra, rec.dir)
 	for part: ModelLibrary.AnimPart in parts:
 		# Parts at rest; lit parts (signal lenses) show only by state.
@@ -909,7 +1264,7 @@ func _start_merges() -> void:
 			if bake == null:
 				ready = false
 			elif ready:
-				groups.append([bake, s.groups[mesh], mesh])
+				groups.append([bake, s.groups[mesh], mesh, s.nature.has(mesh)])
 		var tinted: Array = []
 		for t: Array in s.tinted:
 			var bake := _bake_for(t[0])
@@ -928,6 +1283,8 @@ func _start_merges() -> void:
 		merge.groups = groups
 		merge.tinted = tinted
 		merge.material = material()
+		merge.nature_material = nature_material()
+		merge.crown_material = crown_material()
 		s.counts = {}
 		for g: Array in groups:
 			s.counts[g[2]] = (g[1] as Array).size()
@@ -1011,7 +1368,8 @@ func models() -> Array:
 	var rows: Array = []
 	for mesh in by:
 		var bake: Bake = _bakes.get(mesh)
-		rows.append([str(names.get(mesh, mesh.resource_name)), by[mesh], bake.indices.size() / 3 if bake != null else 0])
+		rows.append([str(names.get(mesh, mesh.resource_name)), by[mesh],
+			(bake.indices.size() + bake.crown_indices.size()) / 3 if bake != null else 0])
 	rows.sort_custom(func(a: Array, b: Array) -> bool: return int(a[1]) * int(a[2]) > int(b[1]) * int(b[2]))
 	return rows
 

@@ -9,7 +9,7 @@ Source files: download each model set from https://www.printables.com/@WubeSoftw
 `art-src/wube/` (git-ignored). Files are found by name, inside zips too; where a set has "High
 Precision" and "High Clearance" copies of a file, High Precision is used. Printables lists the
 models as CC BY-NC: check the licence on each model page. Attribution for every converted model
-is written to client/assets/models/CREDITS.md.
+is written to client/assets/models/packs/wube3dp/CREDITS.md.
 
 What a conversion does (recipes in wube_recipes.py):
 - millimetres to tiles (25 mm = 1 tile, the print grid's pitch) and STL's z-up to glTF's y-up;
@@ -20,7 +20,9 @@ What a conversion does (recipes in wube_recipes.py):
   (and `tier_paint` gets recoloured for faster belt tiers by the client);
 - scales each model to Factorio's size and shape, from its sprite (the prints are stylised);
 - decimates to the triangle budget in specs.py, puts the origin at the footprint centre on the
-  ground, and writes client/assets/models/<name>.glb.
+  ground, and writes client/assets/models/packs/wube3dp/<name>.glb (Wube's pack, packs.py). A pose
+  (`"posed"`, creature_pose.py) goes beside its source, a model built from the sprites instead
+  (`"built_by"`, the worm) into its own pack (placeholders), unless --out names a folder for all.
 
 Plain Python (pip install numpy scipy trimesh fast-simplification), plus Blender for the
 decimation if it's installed (BLENDER, on PATH, or the default Windows path): the plain-Python
@@ -48,11 +50,12 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import bake  # noqa: E402
+import packs  # noqa: E402
 import specs  # noqa: E402
 import wube_recipes  # noqa: E402
 
 SOURCE_DIR = os.path.join(REPO, "art-src", "wube")
-MODELS_DIR = os.path.join(REPO, "client", "assets", "models")
+MODELS_DIR = packs.WUBE_DIR  # the converted prints and their CREDITS.md
 MM_PER_TILE = 25.0
 CREASE_DEGREES = 35.0
 # Written into every converted model, so write_credits can tell them from procedural ones.
@@ -640,6 +643,7 @@ def assemble(name, recipe, sources):
 
 
 def build(name, recipe, sources, palette, alpha, out_dir):
+    """out_dir None: the packs (see the docstring at the top)."""
     if "posed" in recipe:
         # Another pose of a rigged creature, from its built model (creature_pose.py).
         import creature_pose
@@ -651,6 +655,7 @@ def build(name, recipe, sources, palette, alpha, out_dir):
         import creature_score
         path = module.build(creature_score.data_raw(), out_dir)
         return path, 0
+    out_dir = out_dir or MODELS_DIR
     parts = assemble(name, recipe, sources)
 
     # One primitive per material and node; the triangle budget is shared by surface area.
@@ -731,7 +736,8 @@ def write_credits(models_dir):
         "|---|---|",
     ] + rows + [
         "",
-        "Every other model in this folder is made procedurally by the scripts in `tools/models/`.",
+        "Zenith's own models, made by the scripts in `tools/models/`, are in the placeholders pack",
+        "beside this one.",
         "",
     ]
     with open(os.path.join(models_dir, "CREDITS.md"), "w", encoding="utf-8") as f:
@@ -745,7 +751,8 @@ def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("names", nargs="*", help="models to build (default: all with sources present)")
     parser.add_argument("--source", default=SOURCE_DIR, help="where the downloaded zips or STLs are")
-    parser.add_argument("--out", default=MODELS_DIR, help="where to write .glb files")
+    parser.add_argument("--out", help="where to write .glb files (default: the packs, Wube's prints in "
+                                      "client/assets/models/packs/wube3dp/)")
     parser.add_argument("--list", action="store_true", help="list recipes and the source files found")
     parser.add_argument("--raw", metavar="DIR", help="convert every source STL on its own into DIR")
     args = parser.parse_args(argv)
@@ -791,9 +798,10 @@ def main(argv):
     for name, missing in skipped:
         print("skip  %-30s missing %s" % (name, ", ".join(missing)))
     if built:
-        print("credits: %d converted models listed in %s" % (write_credits(args.out), os.path.join(args.out, "CREDITS.md")))
+        credits_dir = args.out or MODELS_DIR
+        print("credits: %d converted models listed in %s" % (write_credits(credits_dir), os.path.join(credits_dir, "CREDITS.md")))
         # Each part's colour from Factorio's sprite (the client's default look); needs the install.
-        if os.path.abspath(args.out) == os.path.abspath(MODELS_DIR):
+        if not args.out:
             try:
                 import part_colors
                 part_colors.main(list(built))

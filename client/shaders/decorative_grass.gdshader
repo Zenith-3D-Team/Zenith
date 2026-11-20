@@ -81,7 +81,8 @@ void fragment() {
 	}
 	// Darker at the root, a little lighter at the tips: the height reads from any angle.
 	ALBEDO = c.rgb * mix(1.0, mix(0.7, 1.12, clamp(rise, 0.0, 1.0)), grow);
-	SPECULAR = 0.5 * f3d_look_ground_specular;
+	SPECULAR = plant_specular() * f3d_look_ground_specular;
+	ROUGHNESS = plant_roughness(1.0);
 	// Lit as the flat picture, from straight up, on whichever side the view sees.
 	NORMAL = normalize((VIEW_MATRIX * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
 	ALPHA = blade * smoothstep(0.0, 0.4, grow) * smoothstep(0.75, 0.9, level);

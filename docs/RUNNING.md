@@ -13,8 +13,16 @@ mock server and the tests.
 ## Start here: the client's menu
 
 Start the client (`godot --path client`, or F5 in the editor). Like Factorio, it opens on a main
-menu over a live 3D scene (a recorded corner of the mock's factory, `client/data/menu_world.json`,
-made by `tools/record_menu_world.py`):
+menu over a live 3D scene (`client/data/menu_world.json`: since 0.2.2 a snapshot recorded for Zenith
+in a vanilla Space Age game with the Esc menu's **Use this view as the menu backdrop**, shown from its
+saved camera view; made from the snapshot by `tools/make_menu_backdrop.py`, which checks every
+prototype name against vanilla Factorio's `--dump-data`, drops any other mod's, leaves out the save's
+name and the time, and names train stops "Train stop"; it also checks the recipes, items and fluids entities
+name (Alt-mode's `ai`, `fc`), leaves out the chunks' decoded `_tiles` and delta-codes `ih` (`z` 1), which
+change nothing drawn. The 0.2.2 default is the owner's Space Age factory, 4,775 entities, 1.55 MB of
+JSON (370 KB gzipped in the downloads' zips). `-- --menu-backdrop-camera=drift` gives it the
+slow drifting camera of before. The mock's factory it showed before, recorded by
+`tools/record_menu_world.py`, is now the backdrop tests' messages, `client/tests/data/mock_menu_world.json`):
 
 - **Continue** loads the server save played last.
 - **Single player**:
@@ -84,7 +92,7 @@ made by `tools/record_menu_world.py`):
     tiles still, 40 or 50 tiles with wind; default 40; see Decoratives). Models always wear each
     part's colour from Factorio's sprites (the projected-sprite model look is gone). Smooth belt items (belt items
     read in one tick every update, so they follow curves) and item icons are no longer shown and
-    stay on; Hold the game at 60 UPS still eases smooth belt items off under load. **Advanced:**
+    stay on (Hold the game at 60 UPS has no step for smooth belt items; only an add-on's lighter updates ease it). **Advanced:**
     anti-aliasing (Off, FXAA, SMAA, TAA, MSAA 2x/4x/8x; default SMAA, the sharp one; TAA softens moving
     belts; under a look that draws full-screen passes, such as the Cinematic shaders, the MSAA choices are
     greyed out and a saved MSAA is switched to SMAA in the settings (at the start, or when such a look
@@ -92,8 +100,10 @@ made by `tools/record_menu_world.py`):
     runs in SMAA's place while it is on, FXAA with it), shadows (off,
     low, medium, high, ultra: the sun's shadow map is fitted to the ground in view, one map from
     the angled view and Godot's splits when the view reaches the horizon; Low one 2048 map out to
-    80 tiles, Medium 4096 to 110, High 4096 to 150, Ultra 8192 to 200,
-    `scripts/world/sun_shadows.gd`), shadow distance (Automatic, the Shadows quality's 80 to 200
+    80 tiles, Medium 4096 to 110, High 4096 to 150, Ultra 8192 to 200; the soft filter Godot's Soft
+    Very Low on Low, Soft Low on Medium, Soft High (16 taps) on High and Ultra, its blur fitted to the
+    map so a shadow's edge is about 0.02 tiles wide on the ground at every zoom, as Factorio's sprites
+    draw it, never under a texel; `scripts/world/sun_shadows.gd`), shadow distance (Automatic, the Shadows quality's 80 to 200
     tiles, or 60 to 400 tiles from the camera), level of detail (low, medium, high: how soon far models and
     their shadows are drawn simpler: 4, 4 and 1 pixels of error), merge far buildings (on: past
     128 tiles from the camera, or the shadow distance if further, and 40 tiles from the character,
@@ -106,10 +116,10 @@ made by `tools/record_menu_world.py`):
     `--no-merged-materials` override it; Recommended turns it on for a big desktop GPU whose frames
     the CPU holds up, the presets leave it), Ambient occlusion (SSAO, tuned to Factorio's tight corner shading: radius 0.7 tiles, no detail pass, half
     size, half its effect on direct light, faded out 60-140 tiles away; on by default and in High and Ultra, off in Low and Medium, about 0.7 ms of
-    GPU at a busy base on a desktop card; turned off once in settings saved before it was retuned), Contact shading
+    GPU at a busy base on a desktop card; `--ssao=off` (or `=on`) for one run, the command line wins; turned off once in settings saved before it was retuned), Contact shading
     (on: the dark rim on the ground round each building's foot that Factorio's sprites have, faint under chests,
-    none under belts, rails, walls, pipes and trees, a broad patch under drills, labs, radars and centrifuges;
-    contact_shade.gd, one draw per chunk), render on a separate thread (off: Godot's experimental mode, after a
+    none under belts, rails, walls, pipes and trees, a faint patch under drills, labs, radars and centrifuges,
+    kept to their footprint; contact_shade.gd, one draw per chunk), render on a separate thread (off: Godot's experimental mode, after a
     restart).
     **Accessibility:** brightness, contrast, saturation and Factorio's colour filters
     (protanopia, deuteranopia, tritanopia and their corrections, over the whole window).
@@ -125,7 +135,7 @@ made by `tools/record_menu_world.py`):
     buttons don't match Factorio's yet; use them in Factorio with Ctrl+F9), click mods' buttons in
     Factorio (with mods' windows shown: on, pressing a mod's button in Zenith clicks it in your own
     Factorio window, hybrid on Windows; off, it says to use Factorio), chat message delay; then the
-    client's own: shortcut bar, research, alerts, debug line (F4), the minimap's size, zoom and
+    client's own: shortcut bar, research, alerts, debug line (its key named when bound: F4 in dev builds), the minimap's size, zoom and
     tags, and the map view's switches.
   - **Other**: the server's autosave interval and slots and verbose logging (written into the
     `server-settings.json` the menu puts in the server's data folder; from the next start), and
@@ -143,6 +153,46 @@ made by `tools/record_menu_world.py`):
 - **Mods**: base, the DLC and the mods in the server's mods folder, with versions and on/off boxes,
   written to the server's `mods/mod-list.json` (Space Age brings Quality and Elevated rails along;
   the bridge is always on). The map generator leaves Space Age's planets out while it is off.
+- **Menu backdrop** (after Model packs): what the menu shows behind it, Zenith's own factory or one of
+  the snapshots recorded in games (the Esc menu's **Use this view as the menu backdrop**:
+  `client/scripts/menu/backdrop_recorder.gd` sends `resync` `full: 0`, keeps the 5 x 5 chunks round
+  the camera's spot and 8 s of `mv`/`bs`/`ih`/`gi` with the handshake's prototypes, the player's own
+  character left out, and writes a new file in `user://backdrops/` each time (since 0.2.2;
+  `client/scripts/menu/backdrop_list.gd`), named by the time it was taken (`backdrop-YYYYMMDD-HHMMSS.json.gz`,
+  nothing typed in a file name): Godot's compressed file, gzip,
+  `{"v": 1, "center", "camera", "puppet", "save", "name", "taken", "messages"}`, 3 x 3 chunks past 8 MB of
+  JSON, and a still picture (no live updates, a log line) if 3 x 3 is still over; the resync sent once
+  more if no chunk of the square comes in 2.5 s, as the bridge ignores one within 2 s of the last;
+  nothing written if the chunks don't come in 30 s. The live kinds are cut to the square as they come
+  (`cut_live`: movers, hands and ground items by position, `st` by its entity's chunk, belt lanes by
+  their `lm` middle point, a lane's lists together, a kept lane going on into one outside marked as
+  leading out, `lm` next -1 or minus the key, as the bridge marks its own edge); the file is made and
+  written on a WorkerThreadPool task, `done`/`failed` given by the next `advance()` after it ends).
+  `menu_background.gd` draws it with the
+  same replay loop as `menu_world.json` (the default, the same kind of file), the camera at the saved
+  view turning 3 degrees either way.
+  The window lists Default and the saved ones, newest first, the one shown marked ("In use", greyed):
+  each saved one's name (the save it came from and the date and time; edited in place, Enter or leaving
+  the box keeps it, kept in `user://backdrops/backdrops.cfg` and, as recorded, in the file), **Use** and
+  **Delete** (asks first, Factorio's red confirm; deletes the file for good; the one in use goes back to
+  Default). **Open folder** opens `user://backdrops/` in the file manager (`OS.shell_open`); a snapshot
+  dropped there is listed by the `name` (else `save`) inside it. **Choose from a world…** opens Load game.
+  `[interface] backdrop` holds `default` or the id (the file's name without `.json.gz`) in use; `snapshot`,
+  the setting before 0.2.2, still names `user://menu-backdrop.json.gz`, which is moved into the folder
+  once, at the menu or the window (named from its `save`, "Saved backdrop" without one; in use if it was;
+  a copy that couldn't remove the old file notes its time and size and isn't made again). The background
+  is made again on a change, and when the Model packs window closes with the packs changed.
+  `-- --menu-backdrop=default` shows the built-in world whatever the setting; a missing, unreadable,
+  other-version or chunk-less file does too (one log line; the window marks Default then and says the
+  file can't be read). `-- --menu-backdrop-save=overwrite` brings back one file, overwritten: a new
+  recording replaces the one in use (with Default in use it still adds one).
+  The Esc menu's button is greyed (and a press refused, "the game is still loading") until the 5 x 5
+  chunks round the view are drawn after the join, or 20 s into the game (a view at the map's edge),
+  checked again 4 times a second while the Esc menu stays open;
+  `-- --backdrop-wait=off` lets it record at once, as before. The progress box's Cancel goes grey once
+  the file is being written (the bar at its end): the write can't be stopped then. Saving it logs each step of its end
+  (`backdrop: done 1/3`..`3/3`); setting `[interface] backdrop` in a game applies nothing there
+  (`main.gd` MENU_ONLY_SETTINGS: it used to apply every game setting again).
 - **About**: versions, licences and Factorio's own credits from your install.
 - **Exit**.
 
@@ -172,6 +222,12 @@ client's own port), so servers started by hand keep theirs. A progress window sh
 Starting server → Loading map → Connecting → Loading world; Cancel stops it. Errors (Factorio not
 found, map creation failed, the server stopping, no free ports, another Factorio using
 `server/data`) come up as a message with the relevant lines of `server/data/factorio-current.log`.
+
+`server/data/mods/factorio-3d-bridge` is a junction to the repo's `mod/factorio-3d-bridge`: a delete or move
+that follows it empties the repo's mod. Remove the link alone first (`cmd /c rmdir <link>` without /s, or
+`[System.IO.Directory]::Delete(<link>)`); never PowerShell 5.1's `Remove-Item -Recurse` on a folder holding
+it, and robocopy `/MOVE` or `/MIR` only with `/XJ`. Python tools delete such folders with
+`tools/safe_delete.py`'s `remove_tree` (tested by `tools/test_safe_delete.py`).
 
 In the game, **Esc** (with no window open) opens Factorio's "Game menu": Resume, **Load game** (asks to save, then the saves), **Save game** (RCON
 `/server-save`), **Save as** (a name or an existing save to overwrite: `/server-save <name>` writes
@@ -250,7 +306,7 @@ Factorio's own macOS build is found in Steam or /Applications.
 
 **Build channels (owner: public downloads carry no testing tools; development builds do).**
 `--channel public` (the default) is the release on the public repo; `--channel dev` builds
-`dist/Zenith-<version>-dev-<platform>.zip` a development build for testers. A dev export
+`dist/Zenith-<version>-dev-<platform>.zip`, a development build for testers. A dev export
 carries Godot's custom feature tag `zenith_dev`: package.py adds it to that platform's export preset
 for the export alone and puts `client/export_presets.cfg` back after, so the presets stay one list.
 `Settings.dev_tools()` (client/scripts/menu/settings.gd) is the one switch everything asks: true in
@@ -264,13 +320,22 @@ mark them `<!-- dev -->` ... `<!-- /dev -->`, cut from a public zip's copies) an
 A feature tag rather than a marker file beside the program: the build itself says what it is, so
 there is no file to lose when unpacking, to copy into a public download, or to read at start.
 
-**A modeller's models in the download:** `--models <folder>` copies the `.glb` and `.gltf` files at
-that folder's top (and any `.bin` or textures a `.gltf` points at) into the download's `models/`
-folder beside the program, and adds a note to its README.txt that they are a modeller's, used with
-permission. Zenith reads that folder at start-up, as in a checkout, and a model there replaces its
-own of the same name, so the download shows them with no option set (`-- --no-custom-models` leaves
-them out). The 0.2.0 downloads carry Vasillo's models this way (his permission; CREDITS.md):
-`--models <his models>`.
+**A modeller's models in the download:** `--models <folder>` zips the `.glb` and `.gltf` files at
+that folder's top and in its `items/` folder (as `items/<name>`, where Zenith finds a pack's items; and any
+`.bin` or textures a `.gltf` points at), stored as they are, into the
+download's `models/Zenith.zip` beside the program, with a `pack.json` (name "Zenith", author
+Vasillo, the licence line saying his permission and that they aren't under Zenith's GPL, the model
+drawn as its picture) and a README.txt saying the same; the models folder's README.txt gets a note too.
+Zenith reads that folder at start-up, as in a checkout, and the zip is a model pack that goes on top of
+the built-in ones the first time, so the download shows Vasillo's models with no option set; the Model
+packs window moves it or turns it off, and `-- --no-custom-models` leaves it out. Development
+builds carry Vasillo's models this way (his permission; CREDITS.md): `--channel dev --models <his
+models>`. Public builds leave it out unless the owner says otherwise. `--models <folder>
+--zenith-zip <out.zip>` (or its old name `--default-zip`) writes that zip alone and builds nothing
+else: how a source build gets its `models/Zenith.zip`. The pack was called Default (`Default.zip`)
+before: Zenith reads an old `Default.zip` as the Zenith pack (left out when a `Zenith.zip` is beside
+it), and settings.cfg's `order`, `off` and `choices` and user://building_models.cfg's choices saved
+with `zip:Default.zip` as Zenith's (model_packs.gd `canonical_id`).
 
 `python3 tools/release/build_mod_zip.py` builds just the mod
 (`dist/factorio-3d-bridge_<version>.zip`) for Factorio's own mods folder.
@@ -321,6 +386,32 @@ several players, pick one with `/f3d-player <name>` (on the server console or RC
 `/f3d-player` lists them) or the map setting "Player to play as" (`f3d-player`); `/f3d-player none`
 gives everything back and plays the bridge's own character. A new map nobody has joined gets the
 bridge's own character with freeplay's starter kit, as before.
+
+**A world made in Zenith, joined from Factorio** (L13). A map Zenith's menu made has no player of its
+own, so the bridge plays its own character there. When you then join that server from Factorio (Ctrl+F9
+starts Factorio with `--mp-connect` to it, or Multiplayer → Connect to address), you take that
+character over: where it is, its inventory, armour, guns, logistic requests, crafting queue and the
+vehicle it sits in, the same character the client goes on playing, and Zenith's quickbar becomes
+yours; the character the game gave you on joining is emptied into it (without freeplay's starting kit,
+which you had already) and removed. From then on you are that world's player here, as a save's player
+is: when you leave, the bridge stands in for you where you left, and when you come back your character
+takes it all back. The bridge knows it is you by name: Zenith's hello says the account your PC's Factorio
+plays under (`pn`, from `player-data.json`'s `service-username` in Factorio's write-data folder,
+`%APPDATA%\Factorio` or beside a zip install; `--factorio-player=<name>` overrides it, empty for none).
+Anyone else who joins gets a character of their own, as before; a save's player (or a `/f3d-player`
+choice) keeps the character, only the first client's character is handed over, and a player of that
+name already in the game when Zenith connects is claimed then. When Zenith can't find the name it
+says so as Ctrl+F9 starts Factorio, which then joins as a player of its own.
+
+Freeplay makes its crash site (the crashed ship, its fires and the intro's cutscene, with the time set
+to dusk) when its first player is created: on a world made in Zenith that was the first time anyone
+joined from Factorio, and the ship came down in the base round the spawn and set it burning. So when
+the bridge plays its own character on a server whose freeplay hasn't started yet (no player was ever
+created), it tells freeplay not to, through freeplay's own remote interface (`set_disable_crashsite`,
+as mods do from on_init; logged as "freeplay's crash site is off"). Nothing on the map changes; a map
+whose intro already ran is left alone, and single-player, which creates its player before any client
+connects, keeps its intro. `/f3d-perf zenith_join off` and `/f3d-perf no_crash_site off` put each back
+as before (`tools/live_check.py --only join` checks the crash site and `pn` against a fresh server).
 
 **Linux** (the headless build is a free download):
 
@@ -623,14 +714,15 @@ of the square or fed from outside it. What it adds to the check's blind spots: a
 with the count and the front the same, seen up to three checks late. Measured on the owner's base: 0.35 ms of bridge a
 tick less settled, and as many of the game's items drawn at -62,-26 (97.8% visible, 1.2% phantoms). `/f3d-bs far_tier`
 (off by default: no gain at 352 tiles on the owner's base, 40% more asks, a worse p99; it changes
-when far belts are read), with `far_ring <tiles>` (96) and `far_units <belt units>` (4000, about 1 ms a tick at 6-tick
+when far belts are read), with `far_ring <tiles>` (96) and `far_units <belt units>` (1200; under 1 ms a tick at 6-tick
 updates): the watched belts and the inserters and drills using belts within `far_ring` of the focus are checked every
 update as before; those further out are checked in turn by a cursor that carries on where the last update stopped,
 `far_units` an update (each at most once an update), an actor just before its belt so one that acted gets its belt read
-in the same pass. The whole square stays loaded and simulated; every read still names its own tick, so a far input spot
+in the same pass. Far watches skip downstream tail catch-up and `read_runs`, and `bre` asked groups run nearest-first
+by scan index so `extra_units` stay near the character. The whole square stays loaded and simulated; every read still names its own tick, so a far input spot
 read every second to fifth update reaches the client that much later (an inserter's drop 200 tiles away up to half a
-second instead of 0.1 s). The far list is made again when the watched list, the actors' list or the scan changed, at
-most every 4 updates for one scan. The plan's estimate: 0.9-1.4 ms a tick at the owner's settings; not measured.
+second instead of 0.1 s). The far list is made again when the scan changes, else at most every 16 updates for one scan.
+The plan's estimate: 0.9-1.4 ms a tick at the owner's settings; not measured.
 `/f3d-bs target_spots` (on; off: as before): an inserter's or drill's belt is its pickup or drop target when the game
 has one set and alive, else the belt on the tile of its pickup or drop spot. In 2.1 a drill has no `drop_target` until it
 first puts something out (a replaced target stays a dead entity until then), and the bridge reads a chunk's targets
@@ -656,6 +748,9 @@ catch-up and the packed checks). `/f3d-perf mined_tell` (on; off: as before, K22
 player, so the belt simulation drops a mined belt's lanes the next tick and reads the belts round it; before, they
 stayed until a check of that belt came round (seconds for a belt nothing watched) and its neighbours were never read
 again for it.
+`/f3d-perf zenith_join` and `/f3d-perf no_crash_site` (on; off: as before, L13): the player who joins with this
+Zenith's Factorio takes over its character, and freeplay's crash site stays away from a world the bridge played before
+anyone joined it (see "A world made in Zenith, joined from Factorio" above).
 `/f3d-bs lane_next` (on; off: as before, E31): each lane's `lm` next says whether that lane leads out of what is sent,
 from the belt its own items go on into (a splitter's output lanes each by their half's belt, found by where they end;
 an underground entrance's hidden lines by its exit), and is sent again, with the lane's items read on that tick, when
@@ -692,6 +787,19 @@ second; the client's simulation by id 99.86-100% (99.99-100% off), the game's it
 from the read just after a take (the hole still open): 0.5-0.7 points fewer items seen. On the owner's base the share
 of the belt watch on inserters' belts is unknown: measure there before turning it on (`tools/belt_truth.py`,
 `tools/live_check.py`'s belt sections, `/f3d-profile`'s `bs.watch` and `bs.actor` at -62,-26).
+`/f3d-bs quiet_pc` (on; off: as before, every unwatched lane drift-checked each turn, about every 32 updates near, 64
+and 128 further out): an unwatched belt whose drift checks keep agreeing, nothing touching it, has each next check twice
+as far off, up to `/f3d-bs quiet_pc_max` ticks (3600, a minute, near and far: the owner's safety limit; 0: every turn).
+Any touch puts it back to every turn: a full read of one of its lanes (a `bre`, a packed run's read, a tail, a settle
+read, a reload after building, mining or rotating near it), a watched belt behind it that changed or was put on (as
+far as its tails reach, read or not), a wired belt behind it switched on or off, a splitter behind it set again (pasted,
+its window closed, Zenith's own screen). Kept in each belt's record in storage, by game.tick: the same on every peer.
+Offline (two 10-minute quiet 70-belt turbo lines, flowing and stop-and-go, no rereads answered): drift checks' numbers
+125,360 -> 8,100 (94% fewer), the bridge's belt work 1.05 M -> 0.70 M and 0.60 M units (33% and 43% less), the client
+exactly the game's (100.00% in place, 0 items off) both ways. `/f3d-bs reads` says why lanes were read in full since
+loading, by cause, watched belts' and the rest's (`load`, `reload`, `next`, `exits`, `catch`, `run`, `tail`, `settle`,
+`settled`, `watched`, `asked`, `ins`, `edge`), with the drift checks made (`pc`), passed over (`pc_quiet`) and the
+belts woken; the same counts are in `/f3d-bs counts` as `rw_<cause>` and `ru_<cause>`.
 `dec_distance` (on): Zenith's hello says how far it draws decoratives (`dd`, Settings > Graphics > Decorative distance,
 320 under a screenshot's full detail), and a chunk's decoratives are sent only while the chunk is within that and 64
 tiles of the square's middle; the rest are held and sent once the middle brings them inside or the distance grows. At
@@ -713,6 +821,17 @@ sent then too; Zenith takes the entity away and flies the items to the character
 character puts items on or takes them off (Z, Ctrl+click) has its lanes read in the next belt update, as Zenith's own
 `bre` asks, instead of waiting for the lane's drift check (every 32 updates, several seconds).
 
+`/f3d-perf drop_put` (on; the owner: "holding Z on a belt to place items takes a while to show up"): an item Zenith's
+Z puts on a belt is told at once as an inserter's put is (`ie` kind 6 with no inserter, unit 0: its lane, place and
+unique id; for a client whose hello says `ho`), and the belt's drift checks come every turn again (`quiet_pc`'s
+wake), on top of `put_lanes`' read, which can wait behind other asked lanes. Factorio's own Z onto a belt in the game
+window (hybrid) wakes the belt and reads its lanes, if Factorio raises `on_player_dropped_item_into_entity` for a
+belt (not checked). Off: the lanes' read alone, as before. Zenith's side, `--belt-drop-show-now` (on; off: as
+before): the dropped item shows at once, standing where it lands on the nearest lane drawn, until the drawn clock
+(about half a second behind the game) reaches the bridge's put; the simulated item shows there from then. One the
+bridge doesn't confirm (out of reach, the belt full there, an older bridge, `--inserter-handoff=off`) goes after
+1.5 s.
+
 `/f3d-perf belt_pickup` (on; issue #18): F takes the items on belts too, as Factorio's "Pick up items" does: every item
 within the character's item pickup distance (plus half a tile, measured from the character's middle to each item), on
 the ground or on a belt's visible lanes, the nearest first, up to 16 a tick (all in range in practice). An item on a belt
@@ -723,17 +842,151 @@ game's tick through the same take as an inserter's pick (belt_items.gd `ie`, wit
 `--inserter-handoff=off` it leaves only with the lane's next read), and flies each kind to the character with the item's
 own pick sound. The lanes are read again in the next belt update (`put_lanes`) and the inventory is sent at once, at most
 every 6 ticks while F keeps taking. Off: the ground only, two a tick, as before.
+`/f3d-perf pickup_stop` (on; the owner: F "seems to pickup for almost a second after you let go"): Zenith sends
+`pickup_stop` as F is let go (also over a window, and when a text box takes the keyboard) and the bridge ends the
+pickup then; off, the stop is ignored and a pickup runs on 30 ticks after the last `pickup` (sent every 0.15 s while F
+is held), as before and as for clients that never send it. Zenith's side: `--pickup-stop=off` sends no stop. And
+`--pickup-hide-now=off`: a belt item F took left the drawn belt only when the drawn clock, about half a second behind
+the game, reached the take (its icon already flying); on (the default) the items a `pku` names, by the game's ids, hide
+in the belt layer's next job, and a packed lane the lattice draws gets the take's hole from the drawn tick (where the
+item was then) instead of the take's own tick.
 One for the tenth list, on (off: the chests alone). `alt_machines`: while the client has Alt-mode on, the machines
 whose prototype has module slots (assemblers, furnaces, silos, drills, labs, beacons) and the labs in the focus square
 are read in the chests' rounds (J6) for the modules and science packs Alt-mode draws over them (`am`, K1, K2): 3 work
 units a machine under the work budget, after the chests, each round sending only those that changed. Nothing is read
 while Alt-mode is off.
+`alt_ammo_fuel` (K1's leftover), on: with `alt_machines`, the ammo turrets and locomotives in the focus square are read
+in the same rounds for the ammo and fuel Alt-mode draws over them, one icon a filled slot, where Factorio's prototypes
+put them (2.1's gun turret lists its ammo a quarter tile up, its locomotive its fuel three a row; a turret without an
+entry, as Space Age's rocket and railgun turrets, gets Factorio's defaults). Off: machines and labs alone, as before.
+Cargo wagons (owner: "i do want to see items in cargo wagons"): the same rounds read each wagon's four most-stacked kinds
+(most first, no counts, as a chest's) and the client draws them in one row over it, following it as it moves; a
+locomotive's fuel is off by default (the client's `--loco-fuel-icons=on` sends `lf` 1 with `altc` and draws it again).
+The client's `--alt-ammo-fuel=off` draws none of the three whatever the bridge sends. Fluid wagons show nothing.
+One for the eleventh list, on (off: as before). `research_chain` (L12): Zenith's `research` of a technology whose prerequisites aren't all researched or queued queues the missing ones first, all the way down, each after its own (by order), then the technology, as Factorio's technology screen does: 2.1.24's LuaForce.add_research alone refuses it, and refuses a trigger technology and an eighth in the queue (measured in real headless 2.1.24). When one of the missing is a trigger technology nothing is queued and the bridge says which; when the queue can't hold them all, what it queued comes off again ("Research queue full"). Off: add_research alone, as before.
+
+Two more for the eleventh list, on. `fluid_icons` (L10): a crafting machine with a fluid recipe carries its connections and
+the fluid each takes or gives (2.1 makes its fluid storages from the recipe, each filtered to its fluid: an oil refinery
+on basic oil processing has two) in its record and in `aiu` (`fc`), for the arrows and fluid icons Factorio draws on a
+machine hovered or in Alt-mode; off: none sent, the client draws the prototype's arrows without icons. `pipe_alerts`
+(L11): a pipeline over Factorio's extent limit (UtilityConstants' default_pipeline_extent, 320 tiles; status
+pipeline_overextended on every pipe of it) is an alert, `al` `pipeline`, one entity a fluid segment (the one nearest the
+line 320 tiles in from the segment's far edge, where a pump would split it, as the icon stood in the owner's video): the
+alerts' pass reads pipes, pipes to ground and storage tanks too (a quarter of a machine's cost each), and a pipe-type
+entity or pump built, removed or turned on the focus surface has the pipelines round it read the tick after (`al` at
+once when that changes). Off: no such alert, the pass as before.
+
+One for the twelfth list, on. `under_clear` (M2): an underground belt or pipe-to-ground the character builds that
+completes a pair mines what lies between its ends into the character, as Factorio's player build does (its tips and
+tricks, "Fast replace belt & underground belt": "Any belts in between the entrance and exit of the underground belt
+will be mined automatically. This fast replace feature also applies to pipe and pipe-to-ground"): only a plain run,
+every tile between a belt going the pair's way, straight and fed by nothing from the side (a pipe connected to nothing
+off the line), all of them or none (a gap, a curve, a belt the other way, a side-load, a splitter or a ghost keeps them;
+building over another underground, an upgrade, never clears). A script's create_entity doesn't do it, with or without
+`character` (measured in 2.1.24), so the bridge mines them itself (building.lua clear_between): each with what it
+holds into the character, forced (what doesn't fit spilled, as Factorio spills it), said at once (`mnd`, then the
+reliable `del`), the inventory sent once after them. And an underground fast-replacing a belt (a pipe-to-ground a
+pipe) is built with `character`, so the belt and the items on it go to the character, where `spill = false` deleted the
+items. Off: both as before (the belts between stay, a replaced end's items gone). Hybrid single-player with a free
+cursor builds as the player, where Factorio does it itself. Ghosts and blueprints are the game's (unchanged).
+`python tools/live_check.py --only underclear` checks it against the real game. The client marks the belts that will go
+and hides them as the build is sent (`--underground-clear=off`, below in the controls). A drag that places both ends
+hides them with the exit's build too, though the entrance's `add` hasn't come yet: the pieces just sent count as
+standing until the world has them or the game has moved on without them, for the build and for the cursor's marks and
+its entrance or exit model (`--underground-clear-sent=off`: only what the world has, so such a run goes when the
+game's `mnd` comes, a tick later, as before).
+
+Two for the thirteenth list's vehicles, on. `fast_take` (N2): an empty hand's Ctrl+click never takes an entity's fuel.
+In 2.1 defines.inventory.fuel and chest are both 1, and a locomotive's and a burner drill's get_output_inventory is
+their fuel slot (read in 2.1.24), so the bridge checks each inventory against the entity's own fuel inventory and falls
+back by type (a chest's, a car's or spidertron's trunk, a wagon's cargo); off: as before, when a locomotive, boiler,
+burner inserter or burner drill gave up its fuel. `vehicle_ammo` (N3): in an armed vehicle `me` `sh` and "Out of ammo"
+follow the vehicle's selected gun's ammo (the game fires it for the driver); off: the character's, as before. A
+vehicle's shots come in `ts` as before (turrets.gd draws them), not as `shot`. `--only vehitems` checks both.
+
+A pipe's end after one beside it is mined, on. `mined_neighbours`: what the bridge's player-less character mines (a
+headless server's; Factorio raises no event for it) has the pipes and belts beside it read again the tick after and
+sent (`upd`), as a player's mining has them (tracker.lua neighbours_change): the pipe left at a run's end becomes its
+ending piece, a belt beside a mined one its new shape. Off: as before, their records kept the side to what was mined
+(the run's last pipe drawn as a straight, open at its end in FUE5's kit, until something else changed it). The client
+also takes the side towards a mined pipe off its neighbours the moment the `mnd` or `del` comes, for any bridge
+(world.gd `_unlink_pipes`); `--pipe-end=old`: its neighbours wait for the bridge, as before.
+
+Enemies seeing the character, on. `enemy_sight`: a headless server's character has no player, and in 2.1.24 a nest's
+own idle biters ignored it from 50 tiles to 1 until it shot (loose biters and worms saw it), where a real player's
+woke them. Every half second the bridge does what the engine was measured doing for a real player's character
+(enemy_sight.lua): a sleeping enemy unit (no distraction, no attack of its own, in no unit group) within its own
+prototype's vision distance of such a character gets the distraction a sighting gives (attack the character,
+`by_enemy`), and so does every sleeping unit of its nest (the units whose own spawner is in the cluster, its spawner and
+the spawners within 15 tiles of it; a neighbouring nest's units stay asleep, and a new unit of a nest woken lately is
+given alone); while the character stands they are kept on it, each for its own hold (spread by unit number: about half
+gone by 8-10 s, the bridge's re-giving over by 15 s, then the engine's own tail keeps a few on it, as measured for a real
+player's), and while it moves every one of them within its vision of it is kept on it, with no
+give-up distance. Out of vision nothing wakes; worms need nothing (they shoot it on their own). Nothing is done for a
+character with a player (hybrid single-player, a claimed L13 player: the engine sees those), in a vehicle, on a
+peaceful or no-enemies surface. Cost: one `find_units` over the largest unit vision's square every 30 ticks, and one spawner
+search plus one more `find_units` per nest woken (at most 4 a pass). Off: nothing done, as before.
+`python tools/live_check.py --only enemysightfix` checks it against the real game (fresh map only: it clears the enemies
+round its spot and runs the game fast for up to 5 minutes).
+
+### Oil, resources and pipelines (the eleventh list)
+
+- Hovering a resource (L6) shows its amount now (`hinfo` `ra`; the record's until the bridge answers), an infinite
+  one's yield (its amount over its normal amount: crude oil's 100% at 300,000), the fluid mining it needs and the drills
+  that mine it (Factoriopedia's page). On the map (zoomed out) a resource patch under the mouse is outlined in white and
+  the entity info shows its total, an oil field's combined yield ("Crude oil combined yield 292%"), as Factorio's map
+  view: the bridge sums the patch the tick it is asked (`rpatch`; resources within the prototype's
+  resource_patch_search_radius of each other, 3 tiles, crude oil 12; at most 10,000 of them, about 5 microseconds each in
+  2.1.24, then "at least"), once the mouse has rested 0.12 s on a tile outside the patch shown. `--map-resource-info=off`:
+  none on the map.
+- A held drill (L8) is red where its mining area holds no resource it mines ("Pumpjack can only be built on resources",
+  "... cannot mine this resource" over ore), the well it would pump is outlined green and the wells round the cursor
+  white (Factorio's highlight for crude oil and Space Age's fluid resources); its output arrow shows (an old bridge's `fo`
+  hid every drill's), and no arrow in a pumpjack's middle. `--resource-hints=off`: as before. Over uranium ore (any
+  resource needing fluid to be mined: the bridge's `rf`) it follows Factorio 2.1.24's rule: an electric drill (a fluid
+  input) is red with "Uranium mining not researched." until the force can mine with fluid (`cinfo` mwf; even with other
+  ore beside it), and the bridge refuses it in the same words; a burner drill can't mine it ("... cannot mine this
+  resource" over uranium alone). `--fluid-mining-hints=off`: uranium counts as any ore in the preview, as before (the
+  game still refuses it). A held pipe's preview
+  joins the pipes beside it, a pipe to ground facing it and a machine's connection pointing at its tile (it was always the
+  lone pipe); `--held-pipe-joins=off`: the lone pipe. FUE5's pumpjack is mirrored across its diagonal
+  (`tools/models/fue5_pumpjack.py`), its outlet at Factorio's output (FUE5's was the mirror image); no switch (the old
+  file is in git's history).
+- A crafting machine's connections (L10) show the fluid each takes or gives, an icon on the connection's tile beside its
+  arrow, hovered and in Alt-mode (with "Show machine arrows"); from the record's `fc`. `--fluid-icons=off`: the
+  prototype's arrows without icons.
+- A pipeline over the extent limit (L11): Factorio's red fluid icon blinks over one of its entities and the alert bar
+  says "Pipeline has been overextended."; hovering a pipe, pipe to ground or storage tank shows "Pipeline overextended"
+  (its status, red) and "Pipeline extent: 333/320" (`hinfo` `pl`, `ox`). `/f3d-perf pipe_alerts off`: no alert.
+- Factorio 2.1's fluid pipeline visualization (N9, `scripts/player/pipeline_marks.gd`): hovering a pipe, pipe to ground
+  or storage tank marks each joint of its pipeline with Factorio's both-ways chevron (and an underground pair's run with
+  its dashes; the pictures from the install's core/graphics/fluid-visualization/, plain drawn ones without it), tinted
+  to the fluid in it, white when empty, red when the pipeline is overextended (the hovered pipe's `hinfo` `ox`, or an
+  `al` `pipeline` alert on one of its entities); hovering a pump, boiler or machine, the pipelines on its connections;
+  with a fluid entity held, in Alt-mode, every pipeline within two chunks of the cursor (a frame where nothing changed
+  costs only a look at the chunks it read). The pipeline is found in the client from the records (`pc`, underground pairs, a tank's `eprops`
+  fluid boxes), stopping at pumps and machines, at most 4,000 entities, a slice a frame. Settings > Interface >
+  Visualization: "Show fluid pipeline visualization" and "Show fluid pipeline visualization when selected" (Factorio's
+  names, on by default, read from its config.ini as the other interface settings). `--pipeline-vis=off`: nothing drawn,
+  as before. The mock's line at -24..-13, -17.5 stands for an overextended one (`pl` [340, 320], `ox`, its alert).
+- The alert sound: Factorio's beep (its utility sound alert_destroyed, from the install, at half volume) when the
+  bridge's alerts gain something destroyed (Factorio's changelog: the beep "only when something is destroyed, not by
+  something damaged"). A turret running out of ammunition makes no sound (the owner's choice; Factorio's own beeps once,
+  "only sounds once right when the ammo is used up"): `--alert-sounds=ammo` brings that beep back as before. One beep
+  however many at once, none for the alerts already there when Zenith joins, none for a kind ticked Muted or Disabled
+  in the Alerts configuration (Muted did nothing before). `--alert-sounds=off`: silent, as before. Factorio's own repeat while buildings keep falling isn't measured: here every update with a new one beeps,
+  a second apart at most.
+- Alerts on the minimap and the map view: the alert bar's alerts (the kinds the bar shows, its 40 nearest of each
+  kind, the ones on the surface shown) drawn as Factorio's own alert icons at the minimap's and the map view's tag size,
+  destroyed over attack over turret fire over the rest, blinking as the icons over the entities do (a 1 s period, on
+  55%; the steady kinds steady). Client only, from the bridge's `al`: nothing more is asked of the bridge.
+  `--minimap-alerts=off`: neither view draws them, as before.
 
 ### The client's UDP socket (lost datagrams)
 
 Every datagram the bridge sends a client whose hello says `dq` (Zenith does) ends with a `dg` line numbering
 it (docs/PROTOCOL.md, Transport), so the client counts the datagrams the OS dropped: `Bridge.loss`
-(`datagrams`, `lost`, `unnumbered`), the F4 line's "datagrams lost", and `--udp-trace=<file>` (a JSON line
+(`datagrams`, `lost`, `unnumbered`), the debug line's "datagrams lost", and `--udp-trace=<file>` (a JSON line
 per datagram read: when, its number, bytes, tick, message types). With `/f3d-profile trace` on, the bridge
 logs every datagram too (`f3ddg <tick> <n> <bytes> <types>`), and `tools/udp_loss_check.py --bridge-log
 factorio-current.log --client udp.jsonl [--stream stream.jsonl]` reports the loss by message type, size and
@@ -836,7 +1089,7 @@ phantoms -> 97.11% / 99.08% / 0.99% (world all alone 96.78 / 1.22, standing obs 
 -62,-26 96.3% / 1.7% (the rate round's two 6-tick runs) -> 96.9% / 1.5%, 97.0% / 1.3%, 96.9% / 1.3% (three runs; inside
 the bounds 98.2% -> 98.8-98.9%; the game at 46-49 UPS while scored, rate level 2-3; still FAIL on visible as gated: the gap left is the
 2.0% past the bounds); -272,-14 97.6% / 0.8% -> 97.7% / 0.4% (inside 99.2% -> 99.7%), PASS. Run folders under
-E:\Zenith-scratchcc.
+E:\Zenith-scratch\acc.
 
 Found on the way: since de96093f every headless test preloading belt_items.gd (tests/belt_bs_replay.gd, so
 belt_view_check's own replay, section 0) ran with belt_items.gd's statics unset (moment_hold.gd named the Bridge
@@ -853,17 +1106,32 @@ you host on). You get your own character next to the 3D client's, with all the n
 
 **Ctrl+F9** (Show in Factorio) in the client brings Factorio's window to the front, or starts
 Factorio joined to the server the client started. While you play there, the bridge drives your
-player's character, so both windows show the same one. The mod adds the same key in Factorio
+player's character, so both windows show the same one. On a world made in Zenith you join as the
+character Zenith was playing (L13, "A world made in Zenith, joined from Factorio" above). The mod adds the same key in Factorio
 ("Show in Zenith"), which brings the client back and minimises Factorio (Settings → Other →
 Minimise Factorio in Zenith turns that off). Checked with a real Factorio 2.1.24 window in
 single-player: a minimised Factorio keeps running the game at 60 UPS.
 
 **Modded saves from the menu.** Opening a save from Zenith's menu starts its server with the save's
-mods: every mod in your Factorio mods folder (beside Factorio's saves) is linked into the server's mods
-folder (hard links for zips, junctions for folders), the mod list starts from everything off, and
-`factorio --sync-mods <save>` turns on the save's mods at its versions; the bridge is then turned on
-again. A mod the save needs that isn't in your folder stops the start with Factorio's list of what is
-missing.
+mods and those turned on in Zenith's Mods window, as Factorio adds the mods turned on to a save it
+loads: every mod in your Factorio mods folder (beside Factorio's saves) is linked into the server's mods
+folder (hard links for zips, junctions for folders), the mod list starts from everything off,
+`factorio --sync-mods <save>` turns on the save's mods at its versions (and its startup settings into
+mod-settings.dat: checked in 2.1.24), then the Mods window's mods the save hasn't are turned on at the
+folder's highest version, with the mods they need and recommend (2.1's `+`), and the bridge is turned
+on again. Load game's **Sync mods with save** (Factorio's words) leaves the Mods window's out: exactly
+the save's mods. A Mods-window mod that would stop the server is left out and named in the game (one
+that clashes with a mod running, `!` either way, as Space Exploration with Space Age; one needing a mod
+the folder hasn't); Space Age and its DLC follow the save, the Mods window's choice of them is for new
+games. A mod the save needs that isn't in your folder stops the start with Factorio's list of what is
+missing. The Mods window's choices are kept in `<server data>/zenith-mods.json`, apart from
+`mods/mod-list.json`, which the launcher writes before each start (a new game: the choices with what
+they need, every other mod in the folder off). Before, each load rewrote mod-list.json to the save's
+mods, so mods turned on in the Mods window were dropped at the next load (a save made without them
+never got them); `--load-mods=save` brings that back for loads (exactly the save's mods every time; new
+games still take the Mods window's). A server folder from before takes as the player's only the mods
+turned on in mod-list.json without a version (ticked since the last load: `--sync-mods` gives every mod
+it turns on its version).
 
 **Starting Zenith from Factorio.** Start Factorio through `server/factorio-with-zenith.ps1` and
 Ctrl+F9 in the game starts Zenith when none is connected: Zenith joins that game, comes to the
@@ -1028,34 +1296,64 @@ puts back what it borrowed. On a server the same command answers over RCON
 
 ## Client controls
 
-These are the defaults. The keys you changed in Factorio's own Settings → Controls (its `config.ini`)
-replace them, so both answer the same keys (Settings → Controls → "Use the keys set in Factorio";
-a binding changed in Zenith's Settings still wins). Mouse bindings set in Factorio aren't used.
+These are Zenith's built-in defaults: Factorio 2.0's, with Map on Tab (or M), Next weapon on C and Shoot
+selected on Shift+Space as Wube's changelog has them since 2.0. With Factorio's `config.ini` found, Factorio's own keys replace them: the
+ones you changed in Factorio's Settings → Controls, and Factorio's defaults for the rest (the `; ` lines
+Factorio writes there, right for your Factorio version and keyboard layout), so both answer the same
+keys (Settings → Controls → "Use the keys set in Factorio"; a binding changed in Zenith's Settings still
+wins). Mouse bindings set in Factorio aren't used. Keys are matched with exactly their modifiers, so
+Shift+Space doesn't also shoot at enemies, Ctrl+Keypad + doesn't grow the tile area, Ctrl+Shift+Z
+doesn't undo and Ctrl+F (search) and Alt+F (the personal roboport) don't pick up (`--pickup-exact=off`: F
+picks up with any modifier held too, as before; F pressed under Ctrl or Alt starts picking only when pressed
+again after they are let go); G, Factorio 2.1's key for both the rail layer and getting in (its alternative), changes the
+rail layer with rails in hand and gets in otherwise.
+Following Factorio 2.1 takes away keys Zenith 0.2.2 had beyond Factorio's: 2.1's default lines leave the
+arrow keys, the console's alternative and Keypad Enter unbound (and give getting in G as its alternative), so
+the arrows don't walk or pan the map and `/` doesn't open the console. Settings → Controls → "Zenith 0.2.2's
+keys" (saved; `--keys-defaults=old` turns it on for one run) brings back exactly 0.2.2's keys: the built-in
+defaults Map on M, Next weapon on Tab and Shoot selected on C (1.1's), and of `config.ini` only the controls
+you changed in Factorio, not its `; ` default lines, so the arrows walk and pan the map, `/` opens the console
+and Keypad Enter gets in again. "Copy keys from Factorio" follows it, and its message says which it used.
+Zenith finds `config.ini` where the install's `config-path.cfg` says (`%APPDATA%\Factorio\config` for
+Steam and the installer, the install's own `config` folder for the zip, or a folder of your own), and
+reads it at start, when its window comes back from another (a key changed in Factorio meanwhile is
+followed; `--factorio-keys-refresh=off`: at start only) and when the switch is turned. Coming back
+looks only at the file's modified time (in the few seconds after config.ini was written it also compares
+the text's length and hash, as a write in the same second leaves the time as it was); Zenith looks for the install again when Settings → Factorio
+install or `--factorio=` changed, or (with none found) at most once a minute. Rebinding one
+slot in Zenith leaves the other following Factorio's (saved as `default`). **Copy keys from Factorio**
+(Settings → Controls, issue #26) looks for the install afresh, drops the bindings changed in Zenith for
+every control Factorio has (each then follows Factorio's changed key, else Factorio's default),
+switches "Use the keys set in Factorio" on and shows what was copied, what wasn't and why (mouse
+buttons and the wheel, controller bindings, controls Zenith has no key for) and the file it read,
+keys named as Factorio names them ("`", "Page Up", "Numpad +"). Zenith's own controls (camera, views)
+keep theirs; the message lists any copied key one of them also has (camera tilt's Page Up and Page
+Down, and in dev builds the debug line's F4 and the debug menu's Control + F12), as both then act.
 
 | Input | Action |
 |---|---|
-| WASD / arrows (or a gamepad's left stick) | Walk, relative to the camera, at any angle (the bridge steers Factorio's 8-way character to follow it). The stick walks only on a gamepad Godot recognises, once it has been seen centred: pedals, wheels and throttles are left alone |
-| Right mouse (hold) | Mine what's under the cursor; a train, wagon, car, tank or spidertron under it first (issue #10: not the rail beneath), with what is inside it; an item lying on the ground (over ore, under belts and buildings) is picked up at once. While it mines the character stands, as in Factorio: walking goes on once mining stops. What is mined follows the cursor as Factorio's selection does (J26): a new target starts again from nothing, the cursor off it keeps its progress, and with the button held a walk goes on over nothing and stops on the next thing under the cursor, so walking along a line of belts with the cursor on it mines every belt in turn |
-| Enter | Get into the nearest vehicle (car, tank, train, spidertron) or out of it |
+| WASD (or a gamepad's left stick; the arrows too with "Zenith 0.2.2's keys" on or Factorio's keys off) | Walk, relative to the camera, at any angle (the bridge steers Factorio's 8-way character to follow it). The stick walks only on a gamepad Godot recognises, once it has been seen centred: pedals, wheels and throttles are left alone |
+| Right mouse (hold) | Mine what's under the cursor; a train, wagon, car, tank or spidertron under it first (issue #10: not the rail beneath), with what is inside it; an item lying on the ground (over ore, under belts and buildings) is picked up at once. While it mines the character stands, as in Factorio: walking goes on once mining stops. What is mined follows the cursor as Factorio's selection does (J26): a new target starts again from nothing, the cursor off it keeps its progress, and with the button held a walk goes on over nothing and stops on the next thing under the cursor, so walking along a line of belts with the cursor on it mines every belt in turn. Out of reach it says "Out of reach" and doesn't swing, no sound or sparks, as Factorio (issue #24; `--mine-reach-check=off`: the swing played anyway, as before) |
+| Enter (or G; Keypad Enter instead of G with "Zenith 0.2.2's keys" on or Factorio's keys off) | Get into the nearest vehicle (car, tank, train, spidertron) or out of it |
 | Spidertron remote (shortcut bar) | Drag: select spidertrons · Shift+drag: add · right-drag: remove · click: send them there · Shift+click: queue a waypoint |
 | WASD in a vehicle | W accelerate, S reverse, A/D steer (relative to the vehicle) |
-| F (hold) | Pick up items next to the character, lying on the ground or on belts (as Factorio's "Pick up items": everything within the character's item pickup distance, the nearest first), each flying to the character with its sound |
+| F (hold) | Pick up items next to the character, lying on the ground or on belts (as Factorio's "Pick up items": everything within the character's item pickup distance, the nearest first), each flying to the character with its sound; not with Ctrl or Alt held, Ctrl+F and Alt+F being search and the personal roboport, as in Factorio |
 | Space (hold) | Shoot at enemies near the character (the game picks the target) |
-| C (hold) | Shoot at the cursor |
-| Tab | Switch to the next gun (or click a gun in the weapon slots left of the quickbar) |
+| Shift+Space (hold) | Shoot at the cursor (C with "Zenith 0.2.2's keys") |
+| C | Switch to the next gun (or click a gun in the weapon slots left of the quickbar; Tab with "Zenith 0.2.2's keys") |
 | E | Open the character window (the inventory on the left; on the right Factorio's Crafting and Logistics tabs, Logistics once the character's logistics are researched), whatever is under the mouse. With any window open, E closes it. The main inventory sorts itself as Factorio's does: whenever it changes while no window shows it, and when the window closes (not while the hand holds one of its stacks) |
-| Esc | Close the open window, machine screen, map view, chooser or remote view; with none open, the Game menu (Resume, Load game, Save game, Save as, Settings, Exit; Players when others play too) |
-| T | The technology screen: the research in progress and queue, the selected technology (cost, time, prerequisites) with Start research / Add to queue / Cancel, and the tree on the right. It opens on the research in progress (with none, the technology looked at last), the tree scrolled to it; a Factoriopedia link opens it on its technology. T, E, Esc or × closes it |
-| M | The map view: the charted map over the whole window (north up) with your character's arrow, the map tags and trains. Drag (left or middle mouse) or the movement keys (WASD/arrows, or as rebound) move it (Shift: faster), the wheel zooms about the mouse. Right click: on a tag, edit or delete it; on a ghost, remove it; elsewhere, create a tag there (icon, name, Confirm). Double click also creates or edits a tag. M or Esc closes it (Esc closes the tag dialog first). The game keeps running underneath, and the character doesn't walk while it is open |
+| Esc | Close the open window, machine screen, map view, chooser or remote view; with none open, the Game menu (Resume, Load game, Save game, Save as, Settings, Exit; Players when others play too). With the mouse resting on something whose tooltip shows (a button, an item's slot), Esc still does this at once: Godot spends an Esc on hiding its tooltip, so Zenith sends the key again (`--esc-tooltip=old`: the first Esc only hides the tooltip, as before) |
+| T | The technology screen: the research in progress and queue, the selected technology (cost, time, prerequisites) with Start research / Add to queue / Cancel, and the tree on the right. It opens on the research in progress; with none, on the technology looked at last while it is still to be researched, else the first available one, the list of technologies at its top (L9; `--research-open=last` opens on the one looked at last even when researched, as before); the tree scrolled to it. A Factoriopedia link opens it on its technology. Start research / Add to queue on a technology whose prerequisites aren't researched queues the missing ones first, in order, then it, as Factorio's screen does (L12, its tooltip names them); it is greyed when one of them is unlocked by doing its task (Factorio queues no trigger technology) or the queue's seven can't hold them all (`--research-chain=off` greys it whenever a prerequisite isn't researched, as before). Such a technology, one Start research can queue, is orange in the list, the tree, the details and the queue (Factorio's conditionally available slot; red stays for one a trigger technology is on the way to, and with `--research-chain=off` nothing is orange); `--research-orange=factorio` draws only Factorio's own orange ones, whose prerequisites are all researched or queued. A recipe among the Effects has Factorio's recipe tooltip (its ingredients, crafting time, products and Total raw, then the item's lines; nothing red), as do the Unlocks recipes on a technology's Factoriopedia page (M3; `--research-effect-tips=old`: the name and "Unlocked by this technology", as before). The screen covers the HUD, Zenith's Show in Factorio button with it, as Factorio's covers its mod buttons (M4: the gear sat on "Research queue"; every window now draws over the button, `--mod-button=over` keeps it on top as before). T, E, Esc or × closes it. A lab's window follows the research too: its box names the research in progress with its share, and after one finished with none started since says Factorio's "<name> finished. Press T." with that technology's icon and a full bar (`--lab-finished=old`: "No research in progress. Press T." as before) |
+| Tab or M (M only with "Zenith 0.2.2's keys") | The map view: the charted map over the whole window (north up) with your character's arrow, the map tags and trains. Drag (left or middle mouse) or the movement keys (WASD, the arrows with "Zenith 0.2.2's keys" on or Factorio's keys off, or as rebound) move it (Shift: faster), the wheel zooms about the mouse. Right click: on a tag, edit or delete it; on a ghost, remove it; elsewhere, create a tag there (icon, name, Confirm). Double click also creates or edits a tag. Tab, M or Esc closes it (Esc closes the tag dialog first). The game keeps running underneath, and the character doesn't walk while it is open |
 | Minimap (top right) | The charted map around the character (in the map view or remote view, around what that looks at), north up, with tags and trains. Click it to open the map; the wheel or its + / − buttons zoom it |
-| Click a stack (inventory or machine) | Pick it up into the cursor, as in Factorio (right click: half). The cursor shows its icon and count; its slot shows Factorio's hand |
+| Click a stack (inventory or machine) | Pick it up into the cursor, as in Factorio (right click: half). The cursor shows its icon and count; its slot shows Factorio's hand. Over the world, where the held building's ghost shows, the count alone is drawn by the pointer, as Factorio does (L7; `--cursor-count=old`: none there), counting down at once as you build (the builds sent and not yet gone from the inventory shown are taken off). The quickbar's count and the inventory's slots count those builds out at once too, and get them back if the game refuses one (L2; `--slot-counts=report`: they wait for the bridge's inventory report, up to half a second, as before) |
 | With a stack in the cursor, click a slot | Put it there (a different item swaps, so the other stack is now in the cursor); right click drops one; click its own slot, or Q, to put it back. Left mouse in the world builds it (only stacks from the inventory) |
 | Shift+click a stack | Move it between the inventory and the open machine (Ctrl+click: all of that item) |
 | Click a recipe | Hand-craft one (right click: five, Shift: as many as possible). Hover for ingredients (red, as have/need, only where neither held nor hand-craftable from what is held), time, products and Total raw (red where fewer are held). An assembler's recipe chooser has the same tooltip, nothing red |
 | Crafting queue (bottom left) | Each queued craft with its count; the first fills with Factorio's orange pie. Click cancels one, right click five, Shift+click the whole entry. Longer than its row, it ends in "+N": hover it for the rest (opening upwards), click it to keep them open and cancel crafts there |
-| 1 – 0 | Hold the item pinned to that quickbar slot (again: put it away). With the character window open: pin the hovered item, or the held one, to that slot |
+| 1 – 0 | Hold the item pinned to that quickbar slot (again: put it away): one stack of it from the inventory, the biggest, its slot marked with Factorio's hand and the cursor counting that stack, as Factorio's cursor holds one stack; building, Z, tiles and capsules use that stack up (the client names its slot, `hs`), then the next stack of the item comes into the hand (of the same quality first), Q puts it back, a click on a slot puts it down (L7; `--hand-stack=all`: the item with no stack in particular and all of it counted at the cursor, as before). With none in the inventory, a ghost cursor of what it builds. With the character window open: pin the hovered item, or the held one, to that slot |
 | Click a quickbar slot | Hold its item; with an item held, pin that item there. Right click clears the slot. Inventory items can also be dragged onto it |
-| Left mouse (hold and drag) | Build the held item along the way, as Factorio drags: belts go along the held belt's line, each facing the held way, forward with it and backwards against it (J25: a line can be built from its end), nothing off the line or going back over it; R while dragging turns the line at its last belt towards the cursor and builds out to it (with Smart belt building, Settings → Interface, an obstacle or a crossing belt is jumped with undergrounds, the entrance upstream either way; with Lock belt building to straight line off, belts follow the cursor round corners instead); pipes go in a line (pipes-to-ground over obstacles), poles at their wire reach, anything else one footprint after another; a faster belt dragged over a line replaces it. Its ghost is green where it can go (a splitter or underground over belts, a pipe-to-ground over pipes replaces them), red where it can't (none left, beyond the 10-tile build reach, something in the way). Holding an electric pole tints the supply areas of the poles round the cursor and its own in Factorio's blue; hovering a pole shows its own. Holding an underground belt or pipe-to-ground shows Factorio's underground connection to the piece it would join (yellow on the tiles between) and, green, the furthest its exit may go; past that the connection turns red, too far to connect; with nothing to join, the furthest tile its exit could go (J24). Over a window the mouse only works the window: nothing behind it is hovered, built or mined |
+| Left mouse (hold and drag) | Build the held item along the way, as Factorio drags: belts go along the held belt's line, each facing the held way, forward with it and backwards against it (J25: a line can be built from its end), nothing off the line or going back over it; R while dragging turns the line at its last belt towards the cursor and builds out to it (with Smart belt building, Settings → Interface, an obstacle or a crossing belt is jumped with undergrounds, the entrance upstream either way; with Lock belt building to straight line off, belts follow the cursor round corners instead); pipes go in a line (pipes-to-ground over obstacles), walls follow the cursor's path round corners and in any shape, a diagonal filled as a joined staircase (N5; the line lock is the belts' alone, as in Factorio; `--wall-drag=line`: along one line, as before), poles at their wire reach, anything else one footprint after another; a faster belt dragged over a line replaces it. Its ghost is green where it can go (a splitter or underground over belts, a pipe-to-ground over pipes replaces them), red where it can't (none left, beyond the 10-tile build reach, something in the way). None left counts the builds just sent that haven't left the inventory shown yet (the bridge reports the inventory up to half a second after a build), so a drag stops, and shows nothing, past what the hand holds, as Factorio places nothing then (L2; `--build-spend=off`: the inventory shown alone, as before, when a fast drag went on past it and the game took the extra buildings away again). What a build spends is judged by the bridge's own reach (the build distance plus 1.5 tiles, to the building's middle): a small building up to a tile past the cursor's reach has a red ghost and is still built, and counts (`--build-spend-reach=cursor`: by the cursor's reach, as before, when a drag begun there sent one or two too many). Holding an electric pole tints the supply areas of the poles round the cursor and its own in Factorio's blue; hovering a pole shows its own. Holding an underground belt or pipe-to-ground shows Factorio's underground connection to the piece it would join (yellow on the tiles between) and, green, the furthest its exit may go; past that the connection turns red, too far to connect; with nothing to join, the furthest tile its exit could go (J24). Over a plain run of belts (pipes) the tiles between show Factorio's underground_remove_belts instead, red-orange corner brackets and the yellow arrow (pipes without it): building it mines them (the bridge's `under_clear`), and Zenith hides them as the build is sent, back if the game keeps them (M2; `--underground-clear=off`: neither, as before; `--underground-clear-sent=off`: a drag's pair hides its run only when the game answers). Over a window the mouse only works the window: nothing behind it is hovered, built or mined. Where a click lands (J9): the cursor's point is sent rounded down to 1/256 tile, so the bridge snaps it to the grid exactly where the preview stood (Factorio's rule: an odd size on the tile's middle, an even one, a splitter across, on the nearest tile edge; real 2.1.24's own create_entity snaps the same in every direction). Cut towards zero, as before (`--build-wire=truncate`), a point less than 1/256 tile under a tile's edge or middle at negative coordinates was built one tile over; the tile brush's point too |
 | Holding a blueprint, left click | Place its ghosts there (shown under the mouse first; robots build them; building the item over its ghost fills it in yourself). Ctrl+Shift+click: super-forced (trees and rocks in the way are marked). A book places its active page; Shift+mouse wheel picks the page |
 | Holding a deconstruction or upgrade planner, left drag | Mark the area (Shift: cancel the marks). What it will take is highlighted in its colour while dragging |
 | B | Blueprint library: My blueprints (kept by the client in `user://blueprint-library.json`), the save's Game blueprints and, when the bridge plays the save's own player, that player's library. Click takes one into the cursor, right click opens it (books open in place), drag moves it or drops it into a book, Del deletes; Import string takes a string copied from Factorio or a website; New book / planner buttons |
@@ -1073,7 +1371,7 @@ a binding changed in Zenith's Settings still wins). Mouse bindings set in Factor
 | Shift+left click | Holding an item: build a ghost of it for robots. Holding nothing: paste the settings copied with Shift+right click (recipe, filters, requests, combinator settings) |
 | Ctrl+left / Ctrl+right click an entity | Fast transfer: the held stack (half) into it, or with nothing held its output (half) into your inventory. When the held stack empties, the next stack of the item comes into the hand |
 | H / V | Flip the item being built, or the entity under the mouse (machines with fluid boxes) |
-| Alt | Alt-mode: recipe and filter icons over every machine in view (they come with the buildings, issue #9; an idle furnace keeps its last recipe's, J2), over each chest the kinds it holds most of, up to four (the bridge reads the chests round the focus about once a second while Alt-mode is on, J6), over machines the modules in them and over labs their science packs, in rows where Factorio puts them (its prototypes' icons_positioning; a beacon's only with the mouse on it; read in the same rounds, K1, K2), each machine's own icon shifted and scaled by its icon_draw_specification (`--alt-icon-spec=off`: centred at one size, as before), Factorio's fluid arrows on machines and pumps and a recycler's output arrow, inserters' arrows when chosen in Settings → Interface (kept between games); it toggles when Alt is let go, unless Alt was held for an Alt+click |
+| Alt | Alt-mode: recipe and filter icons over every machine in view (they come with the buildings, issue #9; an idle furnace keeps its last recipe's, J2), over each chest the kinds it holds most of, up to four (the bridge reads the chests round the focus about once a second while Alt-mode is on, J6), over machines the modules in them, over labs their science packs, over ammo turrets their ammo and over locomotives their fuel, in rows where Factorio puts them (its prototypes' icons_positioning; a beacon's only with the mouse on it; read in the same rounds, K1, K2; `--alt-ammo-fuel=off`: no ammo or fuel, as before), each machine's own icon shifted and scaled by its icon_draw_specification (`--alt-icon-spec=off`: centred at one size, as before), where icons overlap the one nearest the camera drawn in front (a north-south line of assemblers' recipes in the angled view, a lab's lower row of packs over its upper, a turret's ammo over the lab behind it; in the angled view, F6 and first person; `--alt-icon-order=old`: in the order found, a farther icon over a nearer one as before), Factorio's fluid arrows on machines and pumps and a recycler's output arrow, inserters' arrows when chosen in Settings → Interface (kept between games); it toggles when Alt is let go, unless Alt was held for an Alt+click |
 | Alt+click | Factoriopedia's page of the thing under the mouse (in the world, or a slot or technology in a window) |
 | F2 | Factoriopedia |
 | L | Logistic networks: every network of the force, its robots and items |
@@ -1084,7 +1382,7 @@ a binding changed in Zenith's Settings still wins). Mouse bindings set in Factor
 | Shift+click a pole | Remove its copper cables |
 | Open anything on a circuit network | Its circuit connection (enable/disable condition, read modes, set recipe / filters / stack size...) and logistic connection settings; combinators in full (decider conditions with and/or and red/green inputs, outputs; every selector mode; constant combinator sections); lamp and train stop colour, speaker, pump filter, turret priority targets, display panel messages |
 | P / K | Production statistics (items, fluids, pollution, building counts; this surface or all; Factorio's graphs: click a row's box to draw it) / kill statistics, over Factorio's 8 time scales |
-| ` or / | Chat (a line starting with / is a console command, run over RCON when this client started the server) |
+| ` (or / with "Zenith 0.2.2's keys" on or Factorio's keys off) | Chat (a line starting with / is a console command, run over RCON when this client started the server) |
 | Ctrl+F | Search the crafting recipes |
 | Shift+1 – 0, X | Show quickbar page 1–10, swap the two quickbar rows |
 | Middle click an inventory slot | Filter it to its item (or the held one); again clears it |
@@ -1095,11 +1393,11 @@ a binding changed in Zenith's Settings still wins). Mouse bindings set in Factor
 | Middle-mouse drag | Turn the camera freely (left/right) and tilt it (up/down) |
 | Page Up / Page Down | Tilt the camera |
 | Mouse wheel | Zoom |
-| F6 | Jump to Factorio's own view (north up, from above at Factorio's angle and default zoom); again to go back |
+| F6 | Jump to Factorio's own view (north up, from above at Factorio's angle and default zoom); again to go back. Zooming, turning or tilting out of it gives the normal view its own projection back (Settings > Camera), and F6 snaps to Factorio's view again (L1; `--f6-leave=old`: it stayed orthographic) |
 | F5 | First person: see through the character's eyes, mouse looks, aim with the crosshair; F5 again to go back. The mouse is freed while a window is open. The crosshair acts on what it is on (K7): the nearest entity its line of sight meets (each Factorio selection box raised to its model's height, standing on the hills), within 64 tiles, before the ground; only with nothing in the way does the ground under it decide. Hovering, mining, opening, rotating, Ctrl+click, Z and the wire tools take that entity; a held building goes just out from the side looked at (on a top, where the crosshair is). The bridge still refuses what is out of reach. `--fp-pick=ground` picks from the ground point as before |
-| F7 | Perspective or orthographic for the view in use: in first person first person's, in the map's remote view the map's projection, elsewhere the normal view's (in Factorio's view, F6, used on leaving it); kept in Settings > Camera |
+| F7 | Perspective or orthographic for the view in use, switching what is on screen: in first person first person's, in the map's remote view the map's projection, elsewhere the normal view's (in Factorio's view, F6, the view goes perspective where it stands, out of Factorio's view, and F6 snaps back to it; L1); kept in Settings > Camera. `--f6-leave=old`: in Factorio's view it changed only the normal view's setting, used on leaving it |
 | F1 | Show or hide the help panel (off by default): every control under the key bound to it now (rebound in Settings → Controls, or Factorio's own keys), grouped (moving and camera, fighting, building, blueprints and wires, inventory, windows, the map, Zenith's own), then each add-on's while it is on; the debug menu only in dev builds. When the window is too short for it, the mouse wheel over it scrolls it |
-| F4 | Show or hide the debug line (tick, chunks, entities, packets, the game's UPS, FPS) |
+| F4 (dev builds) | Show or hide the debug line (tick, chunks, entities, packets, the game's UPS, FPS). Public builds give it no key by default (issue #26: many players have F4 on a Factorio control, Factoriopedia's alternative or their own); it stays in Settings → Controls (Miscellaneous, Debug line) to bind, and a key bound there is kept in either build |
 | Alt+L / Alt+F / Alt+E | Personal logistic requests, the personal roboport, exoskeletons on or off (also on the shortcut bar) |
 | Ctrl+= / Ctrl+- / Ctrl+0 | UI scale up, down, back to automatic |
 | Ctrl+F12 | The debug menu (dev builds only, see "The debug menu" below) |
@@ -1107,17 +1405,86 @@ a binding changed in Zenith's Settings still wins). Mouse bindings set in Factor
 
 Client command-line options go after `--` (Godot: Project → Project Settings → Run, or the
 command line): `--factorio-port=34200 --port=34201 --models=/path/to/glb/folder
---factorio-data=/path/to/Factorio/data`. `--models=` only fills in entities without a model of
-their own; add `--models-first` to let the folder's models replace the built-in ones. Without `--models=`, the
-`models` folder beside Zenith (the checkout's root, or beside Zenith.exe) is used that way when it
-holds any; `--no-custom-models` leaves it out.
+--factorio-data=/path/to/Factorio/data`.
+
+**Model packs** (client/scripts/world/model_packs.gd): every model comes from a pack, each a set of
+models found by file name (`<prototype-name>.glb` or `.gltf`). Three are built in
+(`client/assets/models/packs/`: FUE5, Wube3DP and Placeholders, 481 models in all); the
+`models` folder beside Zenith (the checkout's root, or beside Zenith.exe) holds any number more: the
+files at its top ("Loose models"), each folder in it (models anywhere inside) and each `.zip` in it,
+read as it is (a download's `models/Zenith.zip`, Vasillo's models, is one). A zip is unpacked once
+into `user://model-packs/<zip name>-<size>-<modified>/` on a worker thread at start-up
+(ModelLibrary's `ready()` says no until it is in, the join's loading screen counts it), again only
+when the zip changes; copies of zips changed or gone are removed at the next start. **Copies of
+Factorio's files** (`client/scripts/world/pack_check.gd`, the owner's rule): a pack holding any file
+over 1 KB that is a byte-for-byte copy of one in the install's `data/` folder isn't loaded at all, its
+card red in the Model packs window ("Show the files" lists them), one warning line in the log. Every
+pack is checked but the Factorio pack and Wube3DP; there is no switch to turn it off. A pack's file is
+compared first with the install's file at the same Factorio path (`sounds/<mod>/...`, `icons/...`, a
+`<mod>/` or `__mod__/` folder in its path), then with the install's files of the same size, by SHA-256.
+The install's sizes are listed once, on the model packs' worker, into `user://pack-check/install.json`
+(again when base's version, `base/info.json`'s modified time or the data folder's changes; it keeps the
+hashes it took). Each pack's answer is kept in `user://pack-check/packs.json` by its id, its stamp (a
+zip's size and modified time; a folder's file paths and modified times; a built-in pack's file paths and
+Zenith's version) and the install's, so an unchanged pack takes its answer at start-up (about 3 ms for
+the built-in packs) and a new or changed one waits, not in use and its card saying "Checking for copies
+of Factorio's files…", until the worker has checked it (a first run against a full Space Age install:
+about 1.3 s on the worker, FUE5 and Placeholders included). Without an install nothing is compared: the
+packs load at once, the window's details saying so. Delete `user://pack-check/` to check every pack
+again (a built-in pack's model edited in place in a checkout keeps its answer until then). One order decides,
+the higher pack winning where two have a model of one name (settings.cfg `[model_packs]` `order` and
+`off`, by id: `builtin:<folder>`, `loose`, `dir:<folder>`, `zip:<file>`): a new pack of the models
+folder goes on top, on; a built-in one not saved yet goes under the folder's, so by default, from the
+top (the owner's order), Default (when there is one), FUE5, Wube3DP, Placeholders. Placeholders is
+always last and always on. With that order the seven models FUE5 and Wube3DP both have
+(electric-mining-drill, iron-chest, small-electric-pole, steel-chest, steel-furnace, stone-furnace,
+wooden-chest) are FUE5's, as all 39 were before the packs; Wube3DP's stay in their pack.
+`choices` (family -> pack id) takes a model family (a prototype's model with its direction, curve, piece, shape, richness and pose variants; ModelPacks.family)
+from that pack whatever the order: each variant it has, a tier it has only the base of as the base
+recoloured, the variants it lacks from the order. The Model packs window
+(client/scripts/menu/model_packs_window.gd: the main menu and the Esc menu; not in Settings) sets all three and applies them at
+once (ModelLibrary `apply_packs`, `apply_choices`; world.gd `models_changed` builds the chunks drawing
+those models again); trains, robots, creatures and inserter arms keep theirs until a restart. A
+building window's Model button (model_chooser.gd) draws that one building from a pack of its own,
+kept per save and unit number in `user://building_models.cfg` (building_models.gd, forgotten on the
+building's `del`), or sets its family's choice; client only, no protocol change. The hover panel (entity
+info) shows the pack drawing the building as a small picture at the right of its title bar (N8: the
+pack's own picture as its row in the window has it; nothing for an entity no pack nor Factorio's card
+draws), its tooltip "Model: <pack>" and its credit; a click opens the Model packs window on that pack
+with the building's family shown. The panel holds its building while the mouse is on it, or for up to
+0.6 s while the mouse heads straight for it from the building, so the picture can be reached.
+`--entity-info-pack=off`: no picture, the panel follows the mouse as before. A zip that isn't one,
+or one whose entries can't be read (a damaged file, or another compression than deflate), is left out
+with a warning in the log. The start-up log says
+`[models] N model(s) from M packs, the higher winning: <pack> (<where>, <count>), ...`, then the packs
+off or being unpacked and the models a higher pack covers; the dev build's debug menu (Tests > Model
+packs) lists each model's pack. `--models=<dir>` adds one more pack (a folder, searched the same way)
+on top for that run, which only fills in entities no other pack has a model for; `--models-first`
+lets it win over every pack. `--no-custom-models` leaves the models folder's packs out; the built-in
+ones stay (`--models=` still applies).
 A modeller's textured belts, curves, splitters and undergrounds show their return run: the belt
 coming back under the rollers, its texture running the other way at the belt's speed, seen through
 the frame between the rollers and where it rolls over a line's end pieces (client/scripts/world/belt_return.gd:
 the inner side of the return the model carries, or its top run mirrored under it). Only at full
 detail; not in the shadows, the levels of detail or far chunks. `--belt-return=off` draws none, as before.
+The space under the top run (the return strip, the rollers) is shaded as a covered space: darker ambient, direct light and fill (the shader's belt_cover, belt_return.gd `cover`; the rails and the top run are not). `--belt-cover=off` is the look before.
+The same belts' side plates are closed at their ends: Vasillo's build each plate as a box open at both
+ends, and where a line ends or starts, or at a splitter's or underground's open side, the ground showed
+through the hole (L3). Each small upright hole in a belt-family model (a closed loop of edges only one
+triangle uses, at most 0.25 tiles, flat) gets a cap facing out, wearing the plate's material and UVs,
+added to the model's arrays once as it is read (client/scripts/world/belt_caps.gd), so the levels of
+detail and shadows have it too. Zenith's own, Wube's and FUE5's belts are closed: nothing is added to
+them. `--belt-caps=off` leaves the holes, as before.
 `--addons=<folder>[,<folder>...]` loads add-ons from those folders (an add-on's own folder or a
-folder of add-ons), always on, ahead of installed ones with the same id ([ADDONS.md](ADDONS.md)). `--camera=factorio`, `--camera=first-person` or
+folder of add-ons), always on, ahead of installed ones with the same id ([ADDONS.md](ADDONS.md)); while one is
+given, Ctrl+Shift+F5 (Settings → Controls, "Reload the add-ons given with --addons") reloads them from disk, as does
+the Reload button on an add-on's page. `--addons-dev` puts Reload on every switched-on add-on's page.
+`--addon-reload=off` brings back the old behaviour: no Reload or key, and switching an add-on off and on keeps
+the code first loaded (a restart reads changes). Script errors in an add-on's files are listed on its page in
+the Add-ons window (and a refused entry script says its line); `--addon-errors=off` leaves them in the log only.
+An add-on's `dependencies` (other add-ons, and Factorio mods per game; [ADDONS.md](ADDONS.md#dependencies-17)) are
+checked when it starts and set the order add-ons start in; `--addon-requires=off` loads them without checking, in the
+order found, as before. `--camera=factorio`, `--camera=first-person` or
 `--camera=<yaw>,<pitch>,<distance>[,ortho]` start in that view instead of the Camera setting's
 (`--camera=0,48,14,ortho` is close to Factorio's own; a distance past Furthest zoom is kept for that run). The character's body
 is the middle of the screen in every view (the angled view at any zoom and tilt, orthographic, Factorio's view), where it is
@@ -1125,7 +1492,7 @@ drawn: on an add-on's hills, flying in mech armour. Across the ground the camera
 (about 0.1 s at the default zoom, quicker zoomed in) so the hills' small kinks don't jolt it; a jump (another target, the
 remote view left) glides over. Where a hill would come between the camera and the character it tilts up over it and eases
 back after (an orthographic view stands back along its axis instead, so Factorio's view keeps its 48 degrees; issue #17).
-`--camera-focus=off` puts the camera as it was before, to compare: at the feet, level over the hills, trailing a little. `--fp-pick=ground` makes first person pick what is under the point its crosshair's ray meets the ground, as before K7, instead of the entity the ray meets first. `--screenshot=<file.png>[@seconds]` saves
+`--camera-focus=off` puts the camera as it was before, to compare: at the feet, level over the hills, trailing a little. `--fp-pick=ground` makes first person pick what is under the point its crosshair's ray meets the ground, as before K7, instead of the entity the ray meets first. `--shot-note=old` leaves a screenshot's "Screenshot saved" note unshown when the shot was taken with the interface hidden (F11), as before L15; by default it waits and shows, with Open folder, when the interface comes back. `--screenshot=<file.png>[@seconds]` saves
 the window once (default after 10 s; needs a window, which keeps the project's size and mode;
 `--scale-like-full-screen` does full screen's Resolution sums with that window as the monitor). `--full-shot=<file.png or folder>[@seconds][,<width>x<height>]`
 takes one the way the Cinematic camera's F12 does (`api.view.screenshot`: the moment held, full detail, the view's chunks, the game held for the picture), default after 10 s. `--open=<unit>` opens that entity's machine screen once
@@ -1180,7 +1547,7 @@ has no graphics, so it can't supply icons.
 ### Modded games
 
 A modded game shows each mod's own icons, ground, decoratives, names and, for buildings Zenith
-has no model of, the mod's own picture on a card facing Factorio's camera.
+has no model of, the mod's own picture on a card facing Factorio's camera (docs/MOD-GRAPHICS-PLAN.md).
 The bridge lists every prototype's graphics at the data stage and sends the list once per set of
 mods (`gfx`, docs/PROTOCOL.md); the client keeps it in `user://mod-graphics/` and reads the pictures
 from the mods themselves, never copying them: the server's mods folder (`server/data/mods`, which
@@ -1188,9 +1555,10 @@ the menu's servers use), then your own (`%APPDATA%\Factorio\mods`, `~/.factorio/
 portable install's, or `--factorio-mods=<folder>[;<folder>...]` first. Mods may be folders or zips;
 the version the game runs is picked when a folder holds several. Load game on a modded save links
 your own mods folder's mods into the server's and runs Factorio's `--sync-mods` on the save, so the
-server runs exactly the save's mods at its versions, then turns the bridge on; a mod missing there
-(or there at another version) is named with its version, since Factorio, with no mod portal login on
-the server, says only "unknown error". Their machines' pictures move while
+server runs the save's mods at its versions, adds the mods turned on in the Mods window (unless Sync
+mods with save is ticked; "Modded saves from the menu" above), then turns the bridge on; a mod missing
+there (or there at another version) is named with its version, since Factorio, with no mod portal login
+on the server, says only "unknown error". Their machines' pictures move while
 they work (16 frames of each loop, when Settings > Graphics > Animate modded buildings is on; off by default). What
 isn't drawn yet: those cards' working lights at night, and a mod that changes graphics in its own `data-final-fixes`
 after the bridge's (its list is made before) shows the earlier pictures.
@@ -1287,7 +1655,13 @@ steam engines, labs, pumps, radars...; at most 12 at once, nearest and loudest f
 of the same sound), and cars and trains have engine sounds while they move. The character has
 footsteps by ground (grass, sand, dirt, concrete, belts, rails, ore), mining hits (each thing's own
 mining sound from its prototype: rocks' and the stone patch's stone, Space Age's plants and ice; trees
-wood and everything else Factorio's ore sound), building,
+and plants wood, ore, rocks and fish Factorio's ore sound; a building has no mining sound of its own or
+mining particles in Factorio, so its swing is silent and sparkless until it comes off with its mined sound,
+M1; `--building-swing=ore` gives buildings the ore sound and sparks, as before; nothing swings at
+something out of reach, issue #24: ore past the character's resource reach, anything else past its
+reach, each plus the bridge's 1.5 tiles to the target's middle, from `cinfo`, else Factorio's 2.7 and
+10; the bridge's refusal stops a swing: "Out of reach" on the held target until the character moves, "Can't mine that" on that target, "This needs a mining drill" or "a pump or drill" on every entity of that kind until the button is let go;
+`--mine-reach-check=off` swings at whatever is clicked, as before), building,
 rotating and mined-out sounds, gunshots, and biters call and die. Burner furnaces, boilers and
 burner drills smoke while they work, steam engines steam, shots flash at the muzzle and where they
 land, and things that die explode and leave a scorch mark and a burnt remnant for a while. Biters
@@ -1309,14 +1683,22 @@ ui=1.0          ; window clicks
 walking_on=true ; <name>_on=false mutes that slider
 max_voices=12   ; machine and vehicle loops playing at once
 output_device="Default"
+pack_sounds=true ; sounds from model packs (their sounds/ folders)
 [graphics]
 effects=true    ; smoke, dust, flashes, explosions
 ```
 
 Command-line options (after `--`) override the file for that run: `--volume=0.5` (master),
 `--sfx-volume=`, `--music-volume=0.3` (turns the soundtrack on), `--ui-volume=`, `--mute`,
-`--max-voices=8`, `--no-fx` (no smoke or explosions). For debugging, `--sfx-log` prints every
-sound started and, every 5 s, how many voices are busy, and `--fx-demo` plays the character
+`--max-voices=8`, `--no-fx` (no smoke or explosions), `--pack-sounds=off` (no sounds from model
+packs, as Settings → Sound's "Sounds from model packs" off, `[sound] pack_sounds`), `--mod-sounds=off`
+(a mod's own sound files, its mining and repair sounds, aren't read from its folder or zip: the
+defaults play, as before), `--steps=table` (the character's steps from Zenith's name table, as before 0.2.3,
+instead of each tile's, rail's, resource's and plant's own `walking_sound` that the bridge sends in `steps`; no
+silent tiles and no rustling plants), `--addon-sounds=off` (add-ons' `api.sound.replace` and `mute` are ignored:
+Zenith's own sounds play; an add-on's own `play` still works). For debugging, `--sfx-log` prints every
+sound started (and `step/grass replaced by <add-on>` or `muted by` when an add-on decided it) and, every
+5 s, how many voices are busy, and `--fx-demo` plays the character
 through a short script (walk, mine, build, rotate, shoot, then a staged explosion; `--fx-demo=space`
 shoots at enemies instead) so sounds and effects can be checked without input. The UI plays
 Factorio's GUI sounds through `Sfx.play_ui("gui-click")` (`client/scripts/fx/sfx.gd`).
@@ -1352,12 +1734,20 @@ poison capsule, printing what it drew; against the mock use
 Add-ons ([ADDONS.md](ADDONS.md)) are folders with an `addon.json`, found at start-up in
 `user://addons` (on Windows `%APPDATA%\Godot\app_userdata\Zenith\addons`), in `addons/` beside
 the executable (in a checkout, the repo's root), and in any `--addons=<folder>`. The main menu's
-Mods window lists them with a switch each (saved in the settings file's `[addons]` section, on
-when absent) and why one wasn't loaded (a newer add-on API than this Zenith's, a broken
-`addon.json`, an entry script with an error). The log says which started. Their keys show in
+Mods window lists them with a switch each (saved in the settings file's `[addons]` section) and
+why one wasn't loaded (a newer add-on API than this Zenith's, a broken `addon.json`, an entry
+script with an error). The log says which started. Their keys show in
 Settings → Controls under each add-on's name; their data is kept in `user://addons-data/<id>/`.
 An add-on with the camera turns the player's controls off until it hands it back; Zenith takes it
 back itself for a ride to a space platform.
+
+An add-on is a program running with the player's rights, so one nobody switched yet is off until it is
+switched on (the switch is the consent). A download's own add-ons start as its `addons/bundled.json`
+says (the Cinematic camera and shaders on, Terrain Elevation off); `--addons` ones are always on. On
+the first start with this rule, a settings file an earlier Zenith wrote keeps every add-on found then
+on, as it was (saved as on, once; `[meta] addons_off_by_default` marks it done, and a fresh settings
+file starts with it, so nothing found later is turned on that way). `--addons-default=on` brings back
+the old rule: an add-on nobody switched is on.
 
 ## VR (experimental)
 
@@ -1432,7 +1822,13 @@ coloured (`client/scripts/world/looks.gd`):
 - **Classic Zenith**: the look before 0.1.3 (filmic tonemapping, the sun crossing the sky).
 - Add-ons' looks (`api.shaders`, docs/ADDONS.md), such as the Cinematic shaders add-on
   (`addons-src/cinematic-shaders`), whose sun really sets: it sinks in the west with long shadows, a
+  colour from the air it crosses and a blue hour after it, each planet in its own colours
+  (docs/SUNRISE-SUNSET-PLAN.md). Its clouds (0.4.5) read their pattern from a texture the add-on
   colour from the air it crosses and a blue hour after it, each planet in its own colours.
+  From 0.5.1 its noon sun stands in the north-west, the side Factorio's sprites are lit from, rising in the
+  east and setting in the west across the north (the look's `sun_noon_yaw`), so models show the camera a lit
+  side and a shaded one; Zenith's own noon sun, high behind the default view, lit every side the camera sees
+  and drew the modeller's rocks flat. Its setting "Noon sun from the north-west" off gives the old sun back.
   Its clouds (0.4.5) read their pattern from a texture the add-on
   draws once when it starts (`shaders/cloud_field.gdshader`, a 1024 x 1024 viewport of 16-bit floats,
   the pattern repeating every 1,800 tiles or so) instead of working the noise out on every pixel and
@@ -1451,6 +1847,159 @@ going down, restrained, while the light stays where Factorio's shadows fall.
 `--look=<id>` uses a look for one run (`factorio`, `classic`, `cinematic-shaders/cinematic`);
 `--look-file=<file.json>` adds looks from a JSON file, for trying values without an add-on.
 
+A modeller's metallic-roughness picture's metal is drawn as paint: at 0.1 of it, the share part colours
+and textures without such a picture get (`factorio_material.gdshaderinc`, the global
+`f3d_look_texture_metal`), as far merged chunks already drew it. In full, metal shows only the sky's
+reflection, which Zenith keeps dim and blue, so those models read dark and blue. The old drawing is kept:
+Settings > Graphics > Metal on textured models, Full, as before (`[graphics] texture_metal="full"`), or
+`--texture-metal=full` for one run (`=paint`, or a share 0-1). The command line wins over the setting, and
+the setting over the look's `texture_metal` key (looks.gd, default 0.1). The menu and the model preview
+draw 0.1 (project.godot). No built-in pack has such a picture (model_textures_test.gd checks it), so the
+built-in models look the same either way.
+
+Per-model shading: pack.json's `"shading_models": {"transport-belt": "factorio", "iron-ore-*": "pbr"}` (prototype
+names, `*` wildcards; `"pbr"` or `"factorio"`) sets single models over the pack's `"shading"` (model_packs.gd
+`model_shading()`, read by `pbr(path)`, so the world, belt items, far chunks, inserter hands, item models, the Model
+packs preview and the menu backdrop all follow). An exact name beats a pattern (the first that fits, in file order);
+`<name>-<n>` variants follow their base unless named; an `items/` copy follows the same name. Built-in packs ignore
+it; `--pack-shading=factorio` still draws every model Factorio's.
+
+Packs' own shading (0.2.2): a pack whose pack.json says `"shading": "pbr"` (model_packs.gd `shading()`;
+Vasillo's, written by `tools/models/fix_pack.py` from `fixes/vasillo.json`'s `pack_json`) has its materials
+drawn as their files say (`factorio_material.gdshaderinc` `modeller_tex`, set by model_library.gd
+`_factorio` on the materials Load marks `PACK_PBR_META`): no `part_light` balance on its pictures but the
+look's `texture_light` ((1, 1) by default, Cinematic too), Godot's SPECULAR 0.5, its own roughness and metal
+(metal at the look's `texture_metal` share), its occlusion picture as ambient occlusion only
+(the baked vertex occlusion keeping its 0.3 share of direct light), and a normal-map frame right whichever way `dFdy` runs. Its pictured items take the
+same lit path (`item_pbr.gdshaderinc`, in item.gdshader and belt_lane_model.gdshader; the Model packs preview
+draws the file's own material), and far chunks bake it the same way (far_chunks.gd: no part colour share,
+`texture_light` baked in by the vertex's facing; a bake made under the other setting is redone when next
+merged). Since pbr-standard step 2 that is every material of such a pack, not only those with a base colour
+picture: one without draws its factors as the file says (pc 1, no part colours, no weathering, metal at the same
+share), and is never merged into another's row (model_library.gd `Load.textured`); far chunks bake its factor the
+same way. This is decided when the model loads (with packs' own shading on then; a change in Settings reaches
+these when they next load). `--pbr-untextured=off` keeps 0.2.2's: only pictured materials, the rest by Zenith's
+material classes. Since pbr-standard step 3 such a pack's metal is drawn in full (the look's `pbr_metal`, 1 by
+default; the global `f3d_look_pbr_metal`, used in place of `texture_metal` on its materials and items) and
+reflects a neutral surrounding instead of the planet's blue sky: `shaders/pbr_env.gdshaderinc` writes Godot's
+`RADIANCE` (which replaces the sky's sample before its BRDF, energy compensation and specular occlusion), an
+upper half of the ambient plus the look's `pbr_env` (0.45 by default) of the sun, as sky.gd and the look light
+the moment, a lower half at 0.45 of it, blended over a width growing with roughness (looks.gd `pbr_env_now`, the
+global `f3d_pbr_env`, linear; its alpha is the switch). The menu and the model preview reflect the Factorio
+look's noon value (`Looks.PBR_ENV_REST`, project.godot). The preview's pictured items, a StandardMaterial3D,
+draw their metal at the same share and reflect the preview's own sky. `--pbr-env=off` reflects the sky as before,
+`--pbr-env=<0-2>` sets the sun's share for one run, `--pbr-metal=0.1` (or `=paint`) draws metal as 0.2.2 did with Settings' "As paint" (the default; 0.2.2 drew it at 1 on "Full, as before", so `=full` for those players);
+`--pbr-env=off --pbr-metal=0.1 --pbr-untextured=off` together are 0.2.2's drawing of a pbr pack. Built-in packs
+never write `RADIANCE`. Far chunks still draw a pbr pack's metal as paint.
+Since pbr-light-balance such a pack is lit by direction, so the sun decides its light and shaded sides: its share of
+the look's fill light from the camera is the look's `pbr_fill` (0.3 by default) and of the ambient `pbr_ambient` (1),
+the ambient comes through Godot's `IRRADIANCE` from the sky above to 0.35 of it below, and the neutral reflection's
+sun share comes from a broad lobe towards the sun (none from straight opposite) over the same sky-to-ground ambient
+(`shaders/pbr_env.gdshaderinc`; the globals `f3d_pbr_light` (on, fill share, ambient share), `f3d_pbr_sky` (the
+ambient, linear) and `f3d_pbr_sun` (towards the sun), looks.gd `pbr_light_now`, set each frame). On buildings,
+items and belt items; far chunks keep the flat balance. Measured lit-to-shaded in the Factorio look at noon
+(ui_test.gd `_pbr_light`, a window, `--pbr-light-models=<pack folder> --pbr-light-shots=<dir>`): a matte sphere
+2.16 -> 4.54, the modeller's drill 1.63 -> 4.69, his rock 1.08 -> 2.90. `--pbr-light=flat` gives the flat balance
+back for one run (the fill and ambient in full, the reflection the same all round); the menu and the model preview
+are always flat (no sun there). In a dev build the debug menu's Lighting tab has sliders for these numbers (fill, ambient,
+the reflection's k, the sun lobe 2.8, the downward ambient 0.35, the metal share, flat/directional), live, nothing saved, with Reset and
+"Copy values" (prints them to the log; global `f3d_pbr_tune`, looks.gd `pbr_tune`). Below them the same tab moves, live and unsaved, SSAO and SSIL (on/off, radius, intensity, power, detail, light affect, horizon, sharpness), the contact shading's strength and rim and patch widths, the sun's energy, shadow softness and biases, and the ambient energy: each shows what the game has now (a look or a quality change still moves it) until dragged, then is kept over the look each frame (looks.gd `light_tune`) until its Reset. A pbr pack's extra light follows the sun and ambient these sliders set (looks.gd reads its globals after them): the neutral reflection's sun lobe and sky parts and the ambient by direction from the sun's and the ambient's energy and colour now, the fill (`model_fill` x `pbr_fill`) by the ambient's energy over the game's (`f3d_pbr_light.w`), so at sun 0 and ambient 0 a pbr model is black but for its emission and lamps; untouched, nothing changes. `--pbr-light-scene=off` reads them before the sliders as before (the sliders then don't reach a pbr model's extra light). Built-in packs are always `factorio`,
+No model gets a camera fill any more (owner: every model, tree, item, belt item and far chunk lit by the scene's sun and ambient alone, so at sun 0 and ambient 0 everything is black but emission, lamps and the UI): the look's `model_fill` (the Factorio look's 1.1) is off by default. `--model-fill=on` brings the look's own back for one run (0.2.2's, faded by night), `--model-fill=<number>` puts that fill on every look, `=off` none; the Lighting tab's Camera fill slider (from 0) sets it live. Whatever fill there is follows the ambient slider (now over the game's), and the sky's own colour, haze and clouds follow the ambient slider and its sun the sun slider (planet_sky.gdshader `scene_light`; `--pbr-light-scene=off` leaves both as before).
+as is a pack without the key. The old drawing everywhere:
+Settings > Graphics > Advanced > Packs' own shading, Factorio's everywhere (`[graphics] pack_shading="factorio"`),
+or `--pack-shading=factorio` for one run (`=pack` the other way); the command line wins over the setting.
+They set the global `f3d_pack_shading` (looks.gd `apply_pack_shading`: at the app's start and whenever the
+setting changes, from main.gd, game or not, so the menu's model preview follows; in a game also in `settle()`
+and when the game's look goes; project.godot's default is 1).
+
+Since lighting-fixes step 1 the scene's light is the only light: the sun, and one lighting environment that every
+material takes its ambient light and reflections from (buildings of every pack, items, belts, ground, trees, water,
+far chunks). It lives in the sky's cubemap: in a game `planet_sky.gdshader` draws, in its `AT_CUBEMAP_PASS` only, an
+upper half of the ambient (sky.gd's colour times the energy the look and time of day give, linear), a lower half of the
+ground's albedo (look key `env_ground`, `Looks.LIGHT_ENV_GROUND` 0.25/0.23/0.19) times the sun on flat ground plus that
+ambient, and a soft horizon; optionally a wide glow towards the sun (`env_glow`, none by default). The camera still sees
+the planet's sky as before. Godot's ambient is held on that sky (`ambient_light_source` SKY, contribution 1,
+`reflected_light_source` SKY) each frame while a look is on, the look's own values coming back when it goes; a look that
+asks for sky ambient (Cinematic at twilight, 0.5) gets that share of the drawn sky in the upper half. The cubemap is 64
+(32 before) and still updated a little each frame (incremental). In space the lower half is half the ambient. Night
+vision's lifted ambient reaches it (main.gd puts it again after). "pbr" packs' own `RADIANCE`/`IRRADIANCE` terms
+(`pbr_env.gdshaderinc`, below) step back (global `f3d_light_env` 1); the menu and the Model packs preview keep them.
+`--light-env=shader` gives 0.2.2's light for one run: a constant ambient colour, the planet's sky in reflections,
+"pbr" packs' own terms, the looks' 0.2.2 ambient (`looks.gd put_light_env`, `light_env_switch`). Measured in a
+window with ui_test.gd `_light_env_window` (`--light-env-models=<pack folder> --light-env-shots=<dir>`).
+
+Since lighting-fixes step 2 the shade is lit by the scene's ambient, not per pack: a look's `ambient_energy_lit` is its
+ambient multiplier by day under the lighting environment, moving to its `ambient_energy` by night (nights as before):
+the Factorio look 0.7 (0.36), so flat ground is about 4-5:1 between sun and shadow as Factorio's own ground is
+(measured at noon, ui_test `_light_env_window`: 6.0:1 on screen before, 3.87 with 0.8, so 0.7); Cinematic 0.9 (0.42):
+5.85:1 sun to ambient in scene light (11.4 before), 8.7:1 on screen (15.6 before).
+`--light-env=shader` keeps 0.2.2's ambient with 0.2.2's light.
+
+Since lighting-fixes step 4 a look's `roughness_min` (Cinematic's 0.55) holds only built-in packs and icon-coloured
+items: a "pbr" pack's surfaces and a modeller's item models keep the roughness their files give (the globals
+`f3d_look_roughness_min` and `f3d_look_roughness_min_pbr`, 0; Godot's roughness limiter and Cinematic's bloom
+luminance cap still damp the sparkle). `--pbr-rough=floor` puts the look's floor on them too (0.2.2's on buildings).
+The sun's highlight (`light_specular`) is 0.5 in the Factorio look (0.25 before) and 1.0 in Cinematic (0.6 before);
+`--sun-specular=<0-2>` sets it under every look for one run (`=0.25` with the Factorio look is 0.2.2's).
+
+Since lighting-fixes step 5 (Cinematic shaders 0.5.2, defaults updated in 0.5.3) the Cinematic look's ambient occlusion
+acts on indirect light: `ssao_light_affect` 0.15 (Zenith's own looks 0.85) and the look key `ao_direct` 0, which
+scales the models' and the ground's own occlusion share on direct light (global `f3d_look_ao_direct`:
+factorio_material's `AO_LIGHT_AFFECT`, terrain's `ssao_on_sunlight`; 1, as before, in every other look); radius 1.7,
+intensity 2.45 and power 2.0 (1.75, 1.75 and 1.6 in 0.5.2; 1.4, 1.5 and 1.6 before), SSIL off by default as before.
+The add-on's setting "Occlusion in sunlight too" (off by default) also enables occlusion in direct sunlight.
+
+Since lighting-fixes step 6 the Model packs preview (and the in-game model chooser's) and the main menu's backdrop are
+lit as a game is: the Factorio look at noon on Nauvis (`looks.gd noon_rig`: sky.gd's noon sun and ambient times the
+look's, its held sun, ambient_energy_lit and tint, the lighting environment drawn into the sky's cubemap for ambient and
+reflections, linear tonemapping at 0.9, the sun highlight 0.5; `put_noon_rig`), and with no game on the globals
+`f3d_light_env` 1 and `f3d_look_ground_specular` the look's (`put_idle_globals`), and the look's fill light (step 3,
+`put_noon_fill`) from the camera's side. The preview's corner's lamp button gives the studio light before (a key from the upper left, a fill, a grey sky in
+reflections, filmic) while the window is open; `--preview-light=studio` makes that the default for the preview and gives
+the menu's backdrop its late-afternoon light (filmic, colour ambient) as before.
+
+Since lighting-fixes step 3 the Factorio look has a fill light (look key `fill_light`, 0.35): a second DirectionalLight3D
+(`looks.gd fill_light`, made in `attach`) with no shadow, the sun's colour, a low highlight (0.25), from behind the
+camera 35 degrees up and 20 to its right (it follows the camera's turn), faded out by night, none in space, on
+everything but the ground: terrain and water, flat decoratives and their grass are on `Visuals.GROUND_LAYER`
+(render layer 17), which its cull mask leaves out, so the ground's light and shadows stay the sun's and the ambient's
+while what stands on it has its shaded fronts lifted, as Factorio's sprites are rendered with a fill. Other looks have
+none. `--fill-light=off` gives the look without it (the light before), `--fill-light=<0-4>` that energy under every
+look. The camera fill on model materials (`model_fill`, `--model-fill`) is unchanged and still off by default.
+Measured in a window (ui_test `_light_env_window`, Nauvis noon): flat ground 4.43:1 lit to shadow with or without it
+(the ground's light unchanged to 4 digits); the built-in assembler 7.59:1 without, 4.10 with 0.35 (3.51 with 0.5);
+Vasillo's drill 3.32, 2.69; iron ore 4.61, 2.65.
+
+The standard PBR reference set: `tools/models/make_pbr_reference.py` writes `client/tests/fixtures/pbr_ref/`
+(39 one-tile spheres, plates and a tube, one glTF material input each: metal and roughness as factors and as
+pictures, a tinted base colour, normal maps, occlusion at two strengths, emission, alpha, samplers, a texture
+transform, a second UV set, vertex colours; a `.gdignore` keeps them out of Godot's import). model_textures_test.gd
+`_pbr_reference` loads each as a "pbr" pack's model and checks the shader parameters it sets, and pins what Godot's
+glTF reader does (no occlusion strength; a texture transform read for the base colour only). In a window,
+two ui_test.gd sections (`-- --pbr-ref-shots=<dir>` saves the pictures): `--only=_pbr_look`, metal against paint
+spheres in the Factorio look, which prints the parity k ("parity k"), and `--only=_pbr_reference`, the strict
+pass, which draws each file by Zenith and by Godot's own StandardMaterial3D at the same place (fill 0, metal in
+full, the neutral reflection off; mean within 2%, no block over 5% apart, the known differences listed in
+`PBR_REF_DIFFERS`); `-- --pbr-ref-rows=alpha_mask,normal_east` draws only those rows. Godot's side is given the
+MikkTSpace tangents glTF asks for (Godot's runtime glTF reader leaves a file without tangents with one fallback
+tangent, so its normal maps leant the same way whichever way the UVs ran; headless, `_pbr_reference` checks that).
+Each section takes about 6 frames a picture after 30 to settle, and prints its time and frame rate.
+
+A "pbr" pack's cut-out material (glTF MASK, Blender's Alpha Clip) that its file marks single-sided (doubleSided
+false, Backface Culling on in Blender) drops its back faces and their shadows, as Godot's own material does
+(`clip_one_side` in `factorio_material.gdshaderinc`); a double-sided one, and every other pack's cut-outs, draw
+both sides as before. `--pack-shading=factorio` turns it off with the rest of packs' own shading.
+
+A pack whose belt is narrower than Factorio's can say how far in its items ride: pack.json `"belt_lane_offset"`
+(tiles from the belt's centre line; absent: Factorio's 0.234; never wider than that). Items on belts that pack's
+belt model draws are drawn on lanes moved in to it, each lane towards the centre line (straights, curves,
+undergrounds, splitters, the packed lanes, the far lanes' icons);
+the belt simulation's positions are untouched. Vasillo's belts say 0.21 (rails 0.375 out, a plate turned 0.35 rad
+reaches 0.16 sideways). `--belt-lane-offset=<tiles>` overrides the pack for one run.
+`"belt_item_height"` is the height of the belt surface the items rest on (absent: the belt model's top plus 0.02, 0.03
+for the far lanes); an item model's lowest point sits on it. Vasillo's belt surface tops out at 0.25 on every
+belt, curve, underground and splitter. `--belt-item-height=<tiles>` overrides the pack for one run.
+
 The character's flashlight at night (avatar.gd) is Factorio's cone: its own picture
 (`core/graphics/light-cone.png` from the install, or one drawn to its measure without one), 25 tiles
 long from a tile ahead of the character, fading out, landed on the ground through a spot light 10
@@ -1460,6 +2009,40 @@ stops Factorio's light, and its shadow pass draws nothing. In first person it tu
 crosshair looks, whichever way the body faces. `--flashlight=old` brings back 0.2.1's: a spot 3
 tiles up whose shadows the buildings cast, so its beam ended at the next building. The Compatibility
 renderer, which draws no projected pictures, always has the old one.
+
+The belt step-up (avatar.gd, owner: "doesn't move camera or actual player position, just a visual
+thing"): standing on a belt, underground belt, splitter, loader or linked belt (the belt family of
+Factorio's walk-over types, stand_height.gd's BELTS), the character's body is drawn on its top (the
+model's, else its placeholder's: 0.15 tiles for a belt), at most 0.3 tiles up (avatar.gd STAND_MAX: a
+splitter's or a tall loader frame's top isn't stood on); pipes-to-ground, heat pipes and rails are walked
+past at ground level. Eased up in about 0.1 s and down a touch
+slower. Drawn only: `position`, reach and every command stay the game's, and the camera never follows
+it (the first-person eye and the angled view's centre follow only add-on lifts set with `camera`).
+The body, shadow, lantern, health bar, muzzle, flames and step sound follow it. The stand height is
+looked up only when the drawn position moves (at most once a frame), never standing still.
+**Graphics → Step onto belts** (on) turns it off; `--belt-step=off` turns it off for a run whatever the
+setting says.
+
+Add-ons' camera modifiers (add-on API 1.7, `api.camera.set_modifier`: a bob, sway, shake or FOV kick,
+summed and capped, drawn on the angled view, Factorio's view and first person only; walking, reach and
+picks' range never follow them) are off for a run with `--camera-modifiers=off`: the camera as without
+any. An add-on's `take({"input": false, "aim": "center"})` aims building, mining and the hover at the
+middle of the screen, as first person does.
+
+A lit lamp's light (lamp_lights.gd) reaches 14 tiles with a soft fall-off (Godot's omni attenuation
+0.5): the ground is lit to about 11 tiles at a tenth of the lamp's foot, twice the old light's 5
+(range 7, attenuation 1); a coloured lamp's reaches 8 (4 of 7 as before). Factorio's lamp light is
+40 tiles across, a tenth of its middle at about 16 tiles. `--lamp-radius=old` brings back the old reach.
+
+Cars, tanks and spidertrons have their own headlights (vehicle_lights.gd), Factorio's oriented
+`light`s from base's prototypes: the car two cones 0.6 tiles either side and 14 ahead in a warm
+yellow, the tank two 0.1 either side, a little splayed and brighter, the spidertron four of different
+sizes and splays and a round light. Each is the flashlight's cone, scaled to its size and placed
+where Factorio shifts it, so a car's two overlap into a beam about twice as bright and a little wider
+than the character's. They shine at night (above darkness 0.3) on the vehicle the character drives
+or rides in (the bridge doesn't say who drives the others), and meanwhile the character's lantern
+and flashlight are out, as Factorio draws nothing of a character in a vehicle. `--vehicle-lights=off`
+puts back the old way: no vehicle lights, the character's flashlight shining out of the vehicle.
 
 `python tools/look/factorio_reference.py [--looks factorio,classic]` makes a map, has a Factorio
 window save its picture of a small scene at noon, takes Zenith's of the same place in Factorio's
@@ -1526,6 +2109,19 @@ grain or atlas, as before), `--leaf-atlas=off` (the shader's own leaves), `--nat
 sprite from Factorio's camera in plain Python (no Blender, no window; `NAME@k` places a variation
 as the client does), for looking at shape and colour; the client's own look needs a screenshot.
 
+## Creatures' skins
+
+Enemies wear Factorio's colours from their sprites (`tools/models/creature_skin.py`,
+`tools/models/space_skin.py`, `client/scripts/world/creature_models.gd`). Worms, Nauvis's spawners and
+Gleba's wriggler keep Factorio's one mask layer per vertex, which each tier's tint colours; where the
+mask doesn't reach (a worm's head and mouth, a spawner's egg sacs, much of a dead worm) the skin tool
+writes white, which the shader reads as no mask, so those parts keep the sprite's own colour. Factorio
+draws no glow on its enemies: a demolisher's lava is painted bright in its sprite, so its model's lava
+shines by its own colour, 0.4 of it (`PAINT_GLOW`): about the sprite's brightness by day, not dark on
+its shaded side; the crust over it doesn't glow. `--creature-glow=old` (client, after `--`) brings back
+0.2.1's look: the unmasked parts in the tier's colour four times over (lime, cyan, red on worms, red and
+orange spots on spawners) and the lava at its model's 2.5 times red.
+
 ## Chunk streaming: the view's direction, the area cache
 
 (I18, owner: "direction based chunk culling and faster stream in time; maybe we cache everything in an
@@ -1543,7 +2139,8 @@ area".) Not run in a window or measured yet: only the mod, mock and protocol tes
   kept as they are: turning back shows them again the same frame, nothing rebuilt. Off in the remote
   view, while chunks are held, while a screenshot loads, under full detail, in VR, and while another
   camera draws the world (a train's view, the train overview, an add-on's screenshot view).
-  `-- --no-behind-cull` turns it off.
+  `-- --no-behind-cull` turns it off; `-- --behind-cull-hide=all` hides every off-view chunk in the same
+  frame instead of slicing off-view hides across frames (`HIDE_PER_FRAME`).
 - **Faster.** The bridge starts up to 4 chunk snapshots a tick (the Chunk snapshots per tick setting
   is the least) while the work budget has room; each further one only while its slices fit the
   chunks' share of the tick, so the UPS governor's budget still bounds it. Moving, the client asks
@@ -1559,6 +2156,26 @@ area".) Not run in a window or measured yet: only the mod, mock and protocol tes
   recently used first) answers as before; a chunk that got changes (`add`, `del`, `upd`, `tiles`)
   while it was in view is no longer offered from its old messages (the bridge would refuse them), but
   is confirmed by `kept` when nothing changed.
+- **Letting go after a screenshot** (L14). A shot zoomed far out (F12, `api.view.screenshot`,
+  `--full-shot`) loads every chunk its camera sees, thousands; when it ends the view's own subscription
+  goes out at the next step and the rest are let go. An unloaded chunk is now hidden first, farthest from
+  the focus first, as many a frame as the unload slice (frame_budget.gd `unload`, 1.5 ms) holds, and its
+  records and nodes go after it as before; before, each stayed drawn until its records had gone, 2-3
+  chunks a frame, so the renderer kept drawing thousands of chunks at full detail for half a minute.
+  Their clutter (decoratives.gd's sweep every 2 s) is dropped and freed 1 ms a frame each, hidden as it is
+  dropped; the sweep's one frame had dropped 4,000 chunks' (30 ms) and queued their 32,000 nodes to be
+  freed together (95-100 ms). `-- --unload-hide=off` keeps the chunks drawn until their records have gone
+  and drops the clutter in the sweep's frame, as before. And Hold the game at
+  60 UPS takes no step while full detail is on (the shot's slow ticks, the bridge in photo mode and the
+  game held for the picture, had taken its whole ladder, FPS limit 45 and view distance 5 included, which
+  came into force the moment the shot ended and came back a step every 5 s); it judges afresh 10 s after.
+  `-- --governor-full-detail=judge` judges the shot's ticks as before. The bridge side was already spread:
+  the chunks dropped are noted and told as `kept` 16 a tick (world.lua `kept_step`; the mock does the
+  same now, where it counted all 4,000 at once and stalled past the client's timeout).
+  `--stutter-probe=<out.json>@shot` measures it (below): headless against the mock's `--busy` base, a
+  4,708-chunk shot letting go of about 4,300, the 10 s after it went from 447 frames (45 FPS under the
+  governor's limit for 16 s; 40 over 33 ms, 1 over 50 ms, the worst 117 ms) to 601 (6 over 33 ms, 1 over 50,
+  the worst 53 ms), and the chunks let go were all hidden 0.3 s after it instead of 28 s.
 
 ## Mod settings
 
@@ -1602,7 +2219,7 @@ the server console or RCON, for example `/c settings.global["f3d-chunks-per-tick
   (`rate` 1 to 3: the world may glide further, the game keeps its speed), then the entity, belt
   and view distances go below your settings (floors 64 tiles, 8, 32, 5 chunks), then a 45 FPS cap; it gives a step back after 30 s at 60. It also keeps
   the bridge's work budget to the room the game has, so a big request doesn't make a slow tick.
-  Your settings stay as they are; the F4 line says what it holds back. Otherwise `/f3d-profile`, then `/f3d-status`, shows which module costs most: lower "Belt
+  Your settings stay as they are; the debug line says what it holds back. Otherwise `/f3d-profile`, then `/f3d-status`, shows which module costs most: lower "Belt
   item, ground item and inserter radius", or the client's "Moving belt items", "Belt item distance"
   and "Entity distance". `python tools/ups_probe.py --port <rcon> --seconds 30 --profile`
   measures the server's UPS and the bridge's cost; `-- --ups-probe=out.json[@walk]` lowers each
@@ -1623,6 +2240,25 @@ the server console or RCON, for example `/c settings.global["f3d-chunks-per-tick
   (Godot's own, experimental, off by default) measured no faster here and can hang on quitting.
   Untick Settings → Graphics → Render on a separate thread and restart (it is written to
   `user://engine.cfg`), or start once with `--render-thread safe` before the `--`.
+
+### Test runs' Godot logs (not the player's)
+
+Zenith's own Godot log is `user://logs/godot.log` (`%APPDATA%\Godot\app_userdata\Zenith\logs\`), with the
+last 5 kept: each start renames the last log aside, so test runs there would push a player's log (a freeze's,
+say) out. Godot opens that file before any script runs, so every test and tool that starts Godot passes
+`--log-file <absolute path>` instead (a relative path is read from the user folder):
+
+- `tools/check.py`: `art-src/check-logs/<check>.godot.log` in the main checkout (`--all --logs <folder>`: there);
+  its import pass `import.godot.log`. CI's ui job: `ci-logs/`.
+- belt_view_check, belt_walk_check, bench/compare_builds, bench/hybrid_cost, models/review, ui_reference/ours,
+  look/factorio_reference: `godot.log` (or `<name>.godot.log`) in the run's own output folder;
+  live_check's pipeline predictor a temp folder; quit_soak `%TEMP%\zenith-quit-soak\godot.log`;
+  release/package.py's import and export `art-src/release-logs/`.
+- `python tools/test_godot_logs.py` (in `check.py --all godot`) runs one test as check.py does and checks the
+  player's logs folder is unchanged and the run's log written. Another Godot started beside it (a game, a
+  tool without `--log-file`) can rotate the folder too and fail it: run it again.
+
+Starting Godot by hand for a test or probe: add `--log-file <your run folder>/godot.log` before the `--`.
 
 ### The debug menu (Ctrl+F12)
 
@@ -1687,6 +2323,17 @@ doesn't fly the camera; their other keys (F8, F11) still work.
   no handler and no per-frame work; on, one MultiMesh per kind, an instance written only when its flash
   is drawn (at most 512 a kind a frame), the states worked out a few times a second within 64 tiles of
   the focus (belt_items.gd's `debug_tap`, after each belt job, when no job runs).
+- **Simulation**: the belt items' fixes (belt_items.gd `LIVE`) off and on while playing, to compare: Early stop
+  (`--belt-draw-early-stop`), Longer lead (`--belt-sim-ahead=auto` with `--belt-draw-lead-lag`; off: a fixed lead,
+  24 ticks or the command line's N), Rescue seen (`--belt-sim-rescue-seen`), Early changes (`--belt-draw-early`),
+  Take past the edge (`--belt-sim-take-edge`), Open lattice ends (`--belt-draw-lattice-open`), Clean handover
+  (`--belt-draw-handover`), Shut edge ends (`--belt-draw-edge-shut`) and Items keep their turn (`--belt-draw-turn-id`;
+  items already drawn take theirs at their next change). Each box starts as the command line set it ("started on/off", and
+  "changed" once flipped); a change waits for the next belt job's start (the main thread, no job running: a running
+  job never sees a switch change under it), into the job's statics and the simulation's own switches, belt_sim.gd
+  and BeltSimNative alike. Nothing is saved. Left out, as they need a restart: `--belt-sim-take-first` and
+  `--belt-sim-take-line` (the simulation queues takes and reads for them, left waiting if flipped), the lattice and
+  its creep (a lane sliding at its share isn't unwound), and the C++ twins themselves.
 
 ### The performance test (main menu)
 
@@ -1743,6 +2390,36 @@ sun has an angular size (a look's soft shadows, the Cinematic look's): Ultra's 8
 a still the same; nothing at Low and High, whose maps are 4096 or smaller). It is off by default (the
 quality's own map, `0` or `off`): close up on the character the soft shadows' edges came out stair-stepped. The variant `soft shadow atlas <size>` sets it for one step (`soft
 shadow atlas 0` against `base` under the Cinematic look at Ultra; without soft shadows it changes nothing).
+`--shadow-fit=old` fits the sun's shadow map as before the shadows' stability work: whether the view
+"reaches far" (Godot's cascades) was judged by the ladder's distance, never under 32 tiles, so zoomed in
+the ordinary angled view got cascades (two splits on Low and Medium, half the texels on one axis; four on
+High, a hard seam by the character); the ground was measured at y = 0 under a camera riding Terrain
+Elevation's hills, so walking over hills flipped the mode or the distance step and every shadow moved;
+and the split fractions were set in one-map mode too. Now the far test uses what the view needs (its
+furthest ground over the fade, at most the cap) or the horizon in view, the ground is measured from the
+height where the screen's centre meets the hills (the furthest 1.5 tiles under it, so valleys keep their
+shadows), the shortest distance is 12 tiles and the fractions are set only when there are splits. At a
+1920 x 1080 picture, pitch 50, High's 4096 map: zoom 6 one map over 13.8 tiles (about 185 texels a tile;
+the old fit four splits to 32 tiles), zoom 15 27.8 tiles (91, was 32 tiles and 79), zoom 30 unchanged
+(55.8, 45). Factorio's orthographic view keeps its fixed cascades either way.
+`--shadow-filter=old` puts back the soft filters from before the shadows' steps 2-3: Soft Low (4 taps)
+on Medium, High and Ultra with fixed blurs (High 0.6 texels), and a look's sun size (the Cinematic look's
+1.4 degrees, Godot's PCSS) passed straight to the sun with a 20-tile pancake. Under the Cinematic look
+the old picture also needs the add-on's "Shadows soften with distance" on and its "Sun size" at 1.4: the
+add-on (0.5.0) hands a sun size of 0 otherwise, so the switch alone gives the old filter without PCSS. Now the blur follows the
+map's texels a tile: the edge's radius on the ground (0.02 tiles, a look's `shadow_edge`; 0.04 under
+the Cinematic look's Soft shadows) times the nearest split's texels a tile, clamped between one texel and
+the filter's own radius (1.5 to 4 texels); Low keeps blur 1.0. A look's sun size (PCSS) is only used when
+it asks for one (the Cinematic look's Shadows soften with distance, at its Sun size of 0.5): then blur
+1.0, Soft High's 24 + 24 taps on High and Ultra, and a pancake of 8 tiles, which keeps the blocker search
+small and dense (`--shadow-pancake=<tiles>` sets it). Anti-aliasing is unchanged: no screen-space AA
+(FXAA, SMAA) cleans shadow noise; only TAA and FSR2 average it, and both ghost on belts and inserter
+arms, so the filter is made to leave none. `--sun-step=<degrees>` (measuring only; 0, the default, is
+smooth) holds the sun's light until it has moved more than that many degrees, then jumps: the shadow map
+rests in between; the sky's sun and the passes stay smooth. The stutter probe's variants `sun size
+<degrees>` (0.5: PCSS on), `pancake <tiles>` (PCSS's), `blur <x>` (a fixed blur, 0 fitted) and `edge
+<tiles>` set these for one step, beside `soft <quality>` (`hard`, `very_low` ... `ultra`; the fitted blur
+is worked out for that filter's radius, so the edge on the ground keeps its width).
 `@join` measures the join itself: it stands 90 s from the world being ready (pass `--probe-warmup=0`
 so the first load's frames are in), notes when the view was fully drawn (the `JOIN` line: chunks,
 terrain and models settled, the belts' first load done) and with `--probe-stay` keeps the client
@@ -1752,6 +2429,20 @@ tools/join_hitches.py out.json [--windows] [--md]` then gives frame-time percent
 and 50 ms and what each hitch was spent on (the biggest script subtree, world.gd's part of it, the
 renderer's draw with the pipelines it compiled, or the wait for the GPU). belt_view_check's
 `--godot-arg=--gpu-profile` passes Godot its own flag so the probe also gets the render steps' times.
+`@shot` (L14) takes the camera up (`--probe-shot-camera=<height>,<pitch>[,hand]`, default 250 tiles at 22
+degrees: past the horizon, about 4,700 of the mock's chunks; `hand` gives the camera back to the player's
+view when the shot ends) and a screenshot as the Cinematic camera's F12 does, framed as 1920 x 1080 and
+written to the run's own user folder, then stands 10 s (`--probe-shot-after=<s>`): the shot's frames are
+the `shot` phase, the `walk` phase is the frames after it, and an `AFTER SHOT second N` line for each second
+gives the worst frame, those over 50 ms, the chunks still to free and how many of them are still drawn
+(`q_free_drawn`), and the parts that took most (`pre_process` and `after_process`: the frame's time before
+the first and after the last `_process`, coroutines, deferred calls, freed nodes, physics and the draw).
+`@pan` moves the camera fast while the character stands (the owner's stutter when the camera moves
+quickly): 3 s still, the view spun round at 240 degrees a second for 6 s, 2 s still, zoomed all the way out
+and back in over 6 s, 2 s still, then the camera taken over as a free camera and flown 360 tiles east at 60
+tiles a second and back (12 s), given back, 5 s still. Split the frames by leg with their cumulative times
+(3, 9, 11, 17, 19, 31, 36 s). Headless it shows the main thread only; the decorative sheets' bakes
+(`decor_sheet_baker.gd`) run only with a GPU, and pipeline compiles only show in a window.
 With the separate render thread the renderer's own times are only read with
 `--probe-render-times` (each read waits for that thread). `--belt-items-sync` handles belt items on
 the main thread instead of a worker, for comparing. `--no-belt-stand-ins` draws every belt whole
@@ -1771,6 +2462,15 @@ pick index, clutter, far belt icons, wires, far merging) shares one allowance a 
 (frame_budget.gd): what is left under 16.7 ms (or the FPS cap) after the frame's other work, 3-6 ms,
 handed out by priority, with a floor for the near work. `-- --frame-budget=separate` gives every
 system its own slice as before, for comparing.
+`-- --st-slice=on|off` (on): a machine states message (`st`) of more than 64 states waits in world.gd and is applied
+over the next frames within the frame budget's `states` slice (2 ms, 0.3 ms floor; the whole slice when more than
+one waits), in the order the messages came, so a unit ends with the latest state sent; the lamps' colours and Always
+on in it apply at once. A small one with nothing waiting applies at once. Off: every `st` applied whole as it is
+handled, as before (a busy base's 1,600 states took 10-25 ms, a dropped frame each time).
+`-- --ih-apply=quick|old` (quick): an inserter hand update (`ih`) binds an arm to its record again only when the
+record, its direction, position or pack, or the models in use changed; a new arm looks for a belt at its pickup
+only among what stands within a tile (a busy chunk's every record was looked up, 0.3 ms an arm); its place in the
+preplan queue is a flag. Old: as before. What is drawn is the same either way.
 Belts are the last thing culled (the owner: "id like the belt logic to be high priority on what gets culled for
 performance it is integral to the games feel"); each of these has its switch, the old way back when off:
 - `--belt-messages-first=on|off` (on): the belt simulation's updates (`bs`) are handed to the belt layer as they are
@@ -1787,6 +2487,19 @@ performance it is integral to the games feel"); each of these has its switch, th
 - `--governor-belts-last=on|off` (on): Hold the game at 60 UPS cuts the belt item distance (`far` 96, 64, 32) only
   after every other step, the view distance and the FPS cap included; off: STEPS' order, `far` 96 at the seventh
   step, as before.
+- `--night-vision-fx=off`: no night vision feedback: no sound as it turns on or off (the equipment's own
+  activate / deactivate sound, read from the prototype in the player's Factorio install), no icon over the
+  shortcut bar and no green edge on the screen. Without it Settings > Interface > Night vision indicator and
+  Night vision screen edge (`interface/night_vision_indicator`, `interface/night_vision_edge`, both on) turn the
+  two visuals off one by one; the sound follows the Game effects volume.
+- `--perf-warning=off`: starts with the performance warning hidden (until Settings > Interface > Performance
+  warnings, saved as `interface/perf_warning`, on by default, or the debug menu's row of the same name is changed).
+  Both switches show it off meanwhile, without saving that, so one click turns it on.
+  It is Factorio's warning triangle at the top left, right of the Show in Factorio button (in its place while that is
+  hidden): shown while Hold the game at 60 UPS holds settings back, with how many, and 10 s after the last comes back;
+  hover lists them, a click opens the log (perf_log.gd: 200 entries, cleared with each game, the PC's time of day,
+  from -> to and why, Copy). The work budget's cut under 300, Automatic moving belt items under half its start (6,000)
+  and the bridge's own belt square cut are logged too, without lighting the icon. Off, the log still fills.
 - `/f3d-perf belts_last` (on): the far belt lanes' rounds slow only at rate level 3, as the belt simulation's
   updates (which `period_max` 6 never stretches); off: 2, 4 and 8 times apart at levels 1-3, as before.
 - `--message-catchup=on|off` (on): while the oldest message waiting in the bridge's queue (bridge.gd
@@ -1865,6 +2578,9 @@ Hitches while joining (the first 90 s), each behind a switch defaulting to what 
     115-140 ms clutter frame was the kinds' materials' first use of the decorative shaders (the
     warm-up). The texture travels on the KindData with the atlas, so main's race fix (each drawing made
     once per KindData and kept on it, decor_test) holds with it on or off.
+  - `--decor-parallel-load=off`: holds `_kind_mutex` across decorative picture loading (one worker at a
+    time, blocking main-thread `index()` swaps) instead of per-decorative locks and lock-free `index()`
+    preparation.
   - `--terrain-upload-thread=on` (the default; off as before): the terrain Texture2DArray (every layer
     again whenever new ground arrives, 20-40 layers of 1.4 MB) is made on a worker thread; a tile stays
     unknown until the array with its layer is in use. The 90-100 ms `terrain polled` frame is gone; the
@@ -1923,9 +2639,13 @@ fixture must have none); `tools/belt_sim/sim.py rec.json --mode free` is the ref
 How the simulation's items are drawn has toggles, all on by default, so the drawing as it was can be
 compared (the client reads them at start-up, `-- --belt-sim-ahead=0` and so on; `tests/belt_bs_replay.gd`
 takes the same):
-- `--belt-sim-ahead=N` (24; was 1 before `--belt-draw-early`): the simulation runs N ticks past the drawn tick, what it says happens after
-  that tick waiting for the next job. 0: stepped to the drawn tick, so items a read moved or put on a lane
-  on that tick are drawn from their old records until the next job.
+- `--belt-sim-ahead=N` (`auto`; was 24, and 1 before `--belt-draw-early`): the simulation runs N ticks past the drawn
+  tick, what it says happens after that tick waiting for the next job. 0: stepped to the drawn tick, so items a
+  read moved or put on a lane on that tick are drawn from their old records until the next job. `auto` (the
+  default): at least 24, and at least the last job gap and 6 ticks (E46: a 24-tick lead under a 30-tick job gap
+  left the stops and starts of the gap's last ticks to a job late, drawn a job's travel off); never past the
+  newest update, as before, so it needs the drawn clock far enough behind the game (`--belt-draw-lead-lag`).
+  `--belt-sim-ahead=24` is the lead as before.
 - `--belt-draw-gone-order=off`: a job applies every change, then removes every item gone in its ticks (an
   item dropped and put back in one job stays undrawn till its next change); on, both in the
   simulation's order (`take_changes()`'s `gone_tick`, `gone_at`).
@@ -2003,7 +2723,10 @@ takes the same):
   it with the hands' events reaching the job as on the wire (the capture's own order hands them over an
   update early, which hid the fault), and `tools/belt_jumps.py` counts what jumps: the simulation's items
   against the game's, and what is drawn tick by tick (things appearing or vanishing off their motion, game
-  items unseen, phantoms).
+  items unseen, phantoms). Its `--hands-radius R` sets the bridge's f3d-detail-radius so only the inserters within
+  R tiles of the focus send `ie` (live: those past the hands radius send none), the rest seen only in the bridge's
+  lane reads: `--belts 40 --queue 36 --take 25 --feed 6 --ticks 2400 --hands-radius 4`, replayed with
+  `--view=-4,4,52,13` and scored by `tools/belt_quirks.py --every 30`, draws stop-and-go lanes standing (E46).
 - `--belt-sim-take-edge=off`: a take looks for its item on its belt's own lanes only, as before. A take made
   late (the hand's `ie` pick comes a few ticks after the hand closed) at a belt's front edge found nothing:
   the simulation had run the item on over the edge onto the next belt. The read of that belt's lane, without
@@ -2017,6 +2740,21 @@ takes the same):
   (`tools/belt_jumps.py`; things appearing or vanishing off their motion 282 -> 266), `tools/belt_quirks.py`
   phantoms 10 -> 3 item-s and jumps 3 -> 0. `take_edge`; belt_sim_native_test.gd's `take at a belt's front
   edge` pass.
+- `--belt-sim-rescue-seen=off`: a read put every simulated item it hasn't, behind its own items (or all of them
+  when it has none), back out of its lane behind it as one the game's has yet to reach, as before. Past the
+  bridge's hands radius no `ie` comes, so an item an inserter took was put back by each read without it and lived
+  on as a phantom (the line-end scene with `--hands-radius 4`: item 305, taken over b36, pushed back by four empty
+  reads of b36 and b35, joined the queue's tail for good). On (the default): an item isn't put back into a lane read
+  as of that read's tick or later without it (the whole update's reads count, a pickup belt's and its feeder's
+  either way round), nor further back than a gap behind where the bridge last read it, nor a third time with no
+  read listing it in between (RESCUE_STRIKES); it goes. A take that comes late still finds it (`_take_rescued`).
+  On that scene, off / on (and `--belt-sim-read-conserve=off` for comparison): `tools/belt_quirks.py --every 30`
+  phantoms 7.93 / 1.86% (1.77%), missing 0.69 / 0.75% (0.77%), jumps 403 / 57 (36); simulated items the game
+  hasn't 1206 / 166 item-updates (158). The control without `--hands-radius` is unchanged (0.72%, 0.50%, 36).
+  `rescue_seen`; belt_sim_native_test.gd's `rescue seen` pass and a synthetic world with it off. Not behind the
+  switch (a fix either way, both twins): a read listing one unique id twice keeps the first only, and a late take
+  takes a rescued item only if it is still on a line (`_take_rescued`'s `_uid_line` guard); before, such an item
+  could be taken and handed out twice. So `=off` is the old rescue, not the old code exactly.
 - `--belt-sim-ug-guard=off`: an underground's hidden tunnel lane the bridge sends no next for (`lm` next 0: an
   entrance with no exit) links by geometry like a belt, as before: with no entrance at its end it side-loaded onto
   the straight belt beside its exit. On s272_out an express underground's tunnel (lane 35360348) fed a turbo belt
@@ -2257,6 +2995,37 @@ takes the same):
   appearing or vanishing off their motion by default, 593 with flow; the extra 311 are lattice slots at lane
   ends (a creeping lane's slot leaving its end with the next lane standing), 0.1-0.3 tile from the nearest of
   their kind the tick before (the default's 282 have a median of 0.25 tile, 96 over 0.4).
+- `--belt-draw-lattice-creep=step` (off by default; `off` and `flow` unchanged; E46): a standing lane steps
+  instead of creeping. It stays at the game's rest phase (settle, standing_obs) and stays a standing lane for the
+  mask (flow masked a creeping lane end to end, hiding the simulation's standing items past its ends). Each new
+  front item on it (`lane_fronts(keys, 2)`, the history flow keeps) queues a one-gap slide at the belt's speed
+  through close's slide (`slide_at`, `slide_v`, `slide_more`, at most 4 queued), timed to the tick the items moved:
+  from the new front's place while it moves, else half way between the last update and a slide's time before this
+  one. Several takes since the last update: while the new front still moves from more than a gap behind its rest
+  phase, a slide for each gap behind (at most 5, back to back); once the closing is over by the update, one, as the
+  front's place no longer tells and its id doesn't say how many items left between (the simulation's lane fronts
+  give only the front item; a count of items leaving each lane would need both simulations to keep one). Picture
+  and phase are the same either way (a lattice repeats every gap); a missed gap is a slide not drawn and the items'
+  turns a step behind until the lane is written again. On the scenes below no front was ever seen more than a gap
+  behind (232 moving fronts on the taker-every-12 one), so the numbers are as before the count. A front a read put
+  back drops the slides not yet written. A net rate (flow's) of half the belt's speed or
+  more leaves the lane to the usual rules, which take the simulation's speed; a curve whose length isn't a whole
+  number of gaps stands, as close has it. A take close slid the lanes behind for (an `ie` hand) isn't slid again
+  when their fronts change, nor the other way round (a balance per lane, matched within 90 ticks). Offline on
+  K19's line-end scene (`tools/belt_line_end.py --belts 40 --queue 36 --take 25 --feed 6 --ticks 2400`, the replay
+  at `--every-tick=60 --job-every=30 --ie-wire=0 --view=-4,4,52,13`, `tools/belt_quirks.py --every 30`), off /
+  flow / step: with `--hands-radius 4` frozen 4.66 / 0.39 / 0.27%, frozen spans of 2 s or more 9 / 0 / 0, missing
+  0.69 / 1.63 / 0.70%, phantoms 7.95 / 8.20 / 7.96%, hops 139 / 22 / 47; with `--taker-every 12 --hands-radius 4`
+  frozen 11.98 / 0.16 / 0.53%, missing 0.31 / 0.92 / 0.36%, phantoms 2.01 / 2.19 / 2.05%, hops 487 / 14 / 146; every
+  take sending `ie` (no `--hands-radius`) frozen 0.16 / 2.89 / 0.09%, spans 0 / 2 / 0, missing 0.50 / 1.25 / 0.47%,
+  phantoms 0.72 / 0.88 / 0.71%. The cost: lattice lanes drawn sliding while the game's items stood, 0 / 0 / 1.50%
+  and 0 / 0 / 4.82% on the hands-radius scenes (0.75 / 0.05 / 0.58% with every `ie`): the simulation learns of a
+  take past the hands radius from the bridge's reads, so its fronts change late (slides a median 7 ticks after
+  the game's items moved, a tenth over 23), and it runs on lanes the game holds. Owing a gap for each front a
+  read put back, so the simulation running on again slides nothing, was measured and left out: on the
+  taker-every-12 scene sliding 4.82 -> 3.47% but frozen 0.53 -> 1.43% (the game's own moves owed too). Both
+  lattices alike (`creep_step`, `set_creep_step`; `tools/belt_draw_diff.py` 0 differences on all three scenes in
+  every mode). Not run live yet (-62,-26, -272,-14). The UI test's `_belt_step_creep`.
 - `--belt-draw-early=off`: as before, every change the simulation emits for a tick after the drawn tick
   waits for the next job (its record would show the item at its new place before its time). On (the
   default): a change the records can take without showing anything early is taken now: a start of an item
@@ -2273,6 +3042,33 @@ takes the same):
   2.4-2.5%); lattice lanes of a run drawn sliding against a standing neighbour 1.0% of adjacent pairs a job
   (11.8-12.2% before). A job cost 505 ms with ahead 64 (the simulation stepping ahead and 122k held changes
   re-scanned a job) and 426 ms with 24, against about 300 before.
+- `--belt-draw-early-stop=off`: as before. A moving item's record runs on to its line's end (the simulation's
+  reach), and a stop after the drawn tick it runs into (it catches up with the item in front) waited for the
+  next job: the item was drawn running past the stop and pulled back a job's travel then (E46: batches of 20
+  and more items on long straight runs whose front flows in bursts, up to 500 a second zoomed out). On (the
+  default): `_apply_early` cuts the record to end where the stop is (the stop itself still waits for its tick;
+  both records paths, the same arithmetic). The UI test's `_belt_early_stop`.
+- `--belt-draw-lead-lag=N` (60): with `--belt-sim-ahead=auto`, the drawn clock is held up to N ticks further
+  behind the game than before so the lead fits under the newest update: its margin is at least two job gaps and
+  7 ticks where it was 1.5 job gaps and 1. That is half a job gap and 6 ticks more lag: a job gap of 10 ticks
+  +11 ticks (0.18 s), 20 +16 (0.27 s), 30 +21 (0.35 s), so the owner's ~35 ticks live becomes about 51. Items
+  on belts are drawn that much later than the game has them (the rest of the world isn't). `0`: the lag as
+  before (the lead then reaches only about half a job gap past the drawn tick, so early stop alone does the
+  work); a smaller N caps the extra lag. Measured on `tools/belt_bursts.py`'s scenes (turbo, 70 belts, the
+  lattice off, a job every 30 ticks), jumps a second (tools/belt_quirks.py --every 30): `--mode out` 305.8 as
+  before, 174.8 with early stop, 84.1 with the lead and its lag; `--mode take` 131.1, 98.9, 69.7 (the replay's
+  `--every-tick` lag 19 for the old margin, 40 for the new one; at the replays' usual lag 60, out 286.6 -> 92.3 ->
+  0 and take 129.3 -> 101.0 -> 101.0, take's rest a read shifting a standing run). The replay's lag swept with
+  both on: out 84.1 at 40, 39.8 at 46, 0 at 52 and 60; take 69.7, 102.4, 100.2, 101.0. Out's rest at 40 is what
+  the bridge's reads tell the simulation late (the front starting off the square), not the lead: a lag of about
+  a job gap and 22 ticks clears it, which this margin (a job gap and 13) doesn't reach. Game items seen and
+  phantoms (tools/belt_jumps.py) as before on both scenes (out 98.18% / 0.03% before, 98.23% / 0.01% both; take
+  98.49% / 0.24%, 98.48% / 0.09%); the line-end scenes (belt_line_end.py, and `--hands-radius 4` with
+  `--every-tick=60 --job-every=30`) jumps 0 -> 0 and 10.2 -> 9.6 a second, seen and phantoms unchanged.
+  `python tools/belt_ring.py --out <dir> [--puts 10,17] [--watch 5,12]` makes a moving ring the same way (replayed with
+  `--replay-bre` so the client's re-reads are answered, as the bridge answers them live).
+  `python tools/belt_bursts.py --out <dir> --mode out|take [--tier turbo]` makes the scenes (its header says how
+  to replay and score them).
 - `--belt-draw-lattice-world=straight`: as before, only straight lanes and undergrounds' visible halves take the
   map's phase while moving; curves and splitters slide at the simulation's front item's phase. `all` (the
   default): every lattice lane does. Any phase draws a full lane within 0.125 tile of the game's items, but
@@ -2314,6 +3110,144 @@ takes the same):
   work; both twins alike (the UI test's `_belt_lattice_turns` compares them). An item still takes a new turn
   where it passes between a lattice lane and one drawn from the simulation (whose items turn by their unique
   ids), and once round a closed loop where the run's identity meets itself.
+- `--belt-draw-lattice-mask=ends`: as before, a lattice lane marks the mask's cells along its centre line from end
+  to end, so where its entry's point lies on a cell's edge (a lane going west or north) the cell it marks is the
+  lane behind's first one: that lane's front item, standing at its exit (line position 0), was hidden while that
+  lane was drawn from the simulation (the owner's playtest, K19: an inserter's take from a backed-up line gives its
+  lane up for the simulation's items, and that lane's front item was gone from view until it was a lattice again;
+  in `tools/belt_build_mine.py`'s mine scene the items standing at the front of each belt of the queue behind the
+  gap). On (the default): a standing lane's entry point is taken a 64th of a tile inside it. Its exit's point
+  still marks the cell past it (a lane going east or south: the lane ahead's last one), and a moving lane marks end
+  to end: with every cell past either end left unmarked, the restart capture at -62,-26 (below) had 2.15% phantoms
+  against 1.73% (the simulation's items just past a lattice's exit, where its slots draw the game's). A lane that
+  starts or stops moving is marked again. Both twins (`_mark`), and tools/belt_view_check.py's `lane_cells`
+  (`BVC_MASK=ends` scores a run made the old way).
+- `--belt-draw-lattice-mask=entry`: as before (the default above), a lane's exit point marks the cell past it on a
+  lane going east or south (the lane ahead's last cell) and a moving lane's entry point the cell past it on a lane
+  going west or north (the lane behind's first). Where that lane is drawn from the simulation (a take's lane given
+  up, a lane short of full) its items vanished in that cell as they went through it: a one-item gap fixed at the
+  belts' join while the line moved, gone once it stood and was a lattice again (the owner: "after pulling items off
+  a full backed up belt these gaps appear and items move past but the gap remains in the spot until it stops
+  again"). On (the default, `own`): every lane's ends are taken a 64th of a tile inside it, moving or standing, so a
+  lane marks its own cells only. Offline (`tools/belt_bursts.py --mode take --tier yellow --belts 40 --ticks 1300
+  --f --takers 2 --takers-from 10 --period 15 --take-window 100,900 --release 300,700`, replayed as below at
+  `--job-every=30`): going east (`--east`) 1.16% of the game's item-ticks undrawn against 0.76% (the join's cell
+  had 27 items in turn go through it undrawn), phantoms the same but for the run's own exit (items on the
+  unrecorded gate belt now shown); going west 0.57% against 0.42%, phantoms the same. Both twins (`_mark`),
+  `BVC_MASK=standing` scores a run made with `entry`.
+- `--belt-draw-lattice-open=off`: as before, a moving lattice lane marks all its own cells whatever draws the lanes
+  beside it. A moving lattice has the map's phase and a line's items whatever phase their history gave them (up to
+  0.125 tile apart); where the lane ahead is drawn from the simulation (read short of full: a gap of 67 or more, a
+  line fed by inserters or a merge) the game's item at the lattice's exit, its slot already wrapped to the entry (the
+  lattice ahead), was hidden by the mask until it crossed: every item vanished for a few ticks at the join, a gap
+  standing in the moving line (the owner: "they don't just move in unison"). Likewise at the entry of a lattice
+  behind the items, where no lattice feeds it. On (the default, with `--belt-draw-lattice-mask=own`): a moving lane
+  more than 4/256 ahead of the simulation's front item leaves its exit's cell unmarked when the lane ahead isn't a
+  lattice at its speed, one behind it its entry's cell when none feeds it; the simulation's item shows there beside
+  the slots (at most the phases' difference apart, an overlap rather than a gap). A lane in step keeps its cells.
+  Offline (`tools/belt_bursts.py --mode out --open 99999,99999 --shut 1,1 --feed --feed-loose 0.1 --tier yellow
+  --belts 40 --ticks 2400`, replayed as below): the game's item-ticks undrawn mid-run (belts 2-38) 0.40% against
+  0.03% (going east, `--east`: 0.38% against 0.02%); belt_quirks' phantoms 1.36% against 4.01% (the overlaps: a slot
+  and the item it stands for both drawn in the open cell), and on a tightly packed line (no `--feed-loose`) 0.19%
+  against 1.77% at the run's two ends. Both twins (`_open_ends`, `_mark`; the dump's ids column 7 says a lattice
+  lane's open ends, which tools/belt_view_check.py's `lane_cells` follows). In the debug menu's Simulation tab.
+- `--belt-draw-handover=old`: as before, with the lattice's open ends (above), the open cell's slot and the
+  simulation's item there were both drawn, up to 0.125 tile apart (phantoms 1.36% -> 4.01%). On (the default): the
+  slot whose gap reaches into an open end's cell hides while its item is the simulation's to draw there: at an exit
+  from where its item comes into the cell, at an entry until its item has left it (the phases' difference at the
+  simulation's front item, 3/256 more for a line's items a little off one another; the slot record's texel 3 y,
+  read by belt_path.gdshaderinc, belt_view_check and `drawn_lattice`). Offline, the open-ends scene above: belt_quirks'
+  phantoms 4.01% -> 2.36% (east 4.11% -> 2.54%; tightly packed 1.77% -> 1.32%), missing 0.39% -> 0.40%, undrawn
+  mid-run 0.03% either way; the take scenes unchanged. Both twins, in the debug menu's Simulation tab ("Clean
+  handover").
+- `--belt-draw-turn-id=old`: as before, a lattice lane's items were who its neighbour's or the map's formula said and
+  a simulated item turned by its unique id, so an item changed its turn where a lattice lane met one drawn from the
+  simulation. On (the default): the simulation numbers each item along its run when it first comes into a line (one
+  behind the item ahead; belt_sim.gd `_num`, BeltSimNative alike, take_changes()' `num`, lane_fronts speed_of 3), a
+  simulated item turns by its number (belt_items.gd and BeltDrawNative), and a lattice lane is seeded from the
+  simulation's front item on it when written, and again once moving in step for 2 s when its items' numbers have run
+  ahead of its slots (not a standing lane, which settle stands behind its run on purpose, nor a ring). Offline, turn
+  changes (a game item's drawn turn differing from the tick before): belt_bursts --feed --feed-loose 0.1 5098 -> 2150
+  (at a lattice/simulation join 4342 -> 233), east 4551 -> 1790 (4120 -> 157), the take scenes' joins 317-1300 -> 8-22;
+  phantoms, missing and undrawn unchanged by it. Both twins, in the Simulation tab ("Items keep their turn").
+- `--belt-draw-edge-shut=off`: as before, a moving lattice lane leading nowhere loaded (the square's edge) opened its
+  exit like one beside a lane drawn from the simulation, so the simulation's items stopped at its end as a guess
+  (EDGE_STOP) showed there, stacked, while the game's ran on. On (the default): an exit opens only where its items go
+  on (BeltSim.leads_on: into a lane, a side-load, a splitter). Offline: loose-fed phantoms 2.36% -> 1.56% (most were at
+  the run's exit), tight 1.32% -> 0.19%, east 2.54% -> 2.42%; missing 0.40% -> 0.51% and 0.03% -> 0.19% (the game's
+  item at the very edge, its slot wrapped a few 256ths early), undrawn unchanged. In the Simulation tab ("Shut edge
+  ends").
+- `--belt-draw-lattice-close=off`: as before, the lanes behind a take's hole in a standing lane stood while the
+  game's line closed it up (with settle, a gap on is the same picture), and the take's lane, given up for the
+  simulation's items at the bridge's read, slid alone (the owner, K19: "the items dont slide forward as a group to
+  fill the space instead the back item moves into the next one and the front item moves out of the static to
+  fill"). On (the default, with settle): a take on a standing lane (or one not drawn) has every drawn standing lane
+  behind it (`feeds`, its straight run back) slide one gap from the take's tick at its belt's speed and stand
+  again, each slot the item that was behind it (who + 1), as the game's packed line closes up; the take's lane is
+  given up for the simulation's items at once. A slide is each slot's record as a moving lattice's with its clock
+  held within [the take's tick, a period after] (texel 1 w the start, texel 1 y the periods: 1;
+  belt_path.gdshaderinc, belt_items.gd and BeltLatticeNative `drawn_lattice`, tools/belt_view_check.py), so it
+  stands before and after wherever the drawn clock is when it is written. While a lane slides its phase isn't
+  checked (a read of it mid-way through the closing, the UI test's, put it standing at the read's place and the
+  slide was lost). A lane whose standing slots aren't a moving lane's (a curve whose length isn't a whole number of
+  gaps) stands as before; a second take while a lane slides closes after the first (`CLOSE_MORE` more at most); a
+  take on a lane while it slides hides the slot that holds the hole as the slots wrap. The UI test's
+  `_belt_line_end` checks it (the lanes behind drawn 0.117 tile off their places mid-way, back on them after).
+- `--belt-draw-lattice-sim-full=off`: as before, a moving lane stays a lattice while the bridge's last read or
+  check found it full: a belt mined out of a packed moving line left the belts in front drawn full and moving until
+  the bridge's next drift check (the owner, K22: "the belt in front stays full as it moves forward instead of
+  emptying immediately few seconds later it shows the empty spaces"). On (the default): for `FED_GONE_TICKS` (30 s)
+  after a belt behind a lane was removed (belt_items.gd `_feed_gone`: a lane dropped two tiles or more inside the
+  bridge's square, or a belt Zenith removes; the lanes it led into, on along their run to a splitter), a moving
+  lane the simulation has items on but fewer than a full lane's is given up (its full forgotten until the bridge's
+  next read or check says so again). Only there: the simulation is often short of the game on packed lanes (what
+  the lattice draws them for), and a lane fed from outside what is sent empties in it between the bridge's reads;
+  with every lane the simulation had short given up, the restart capture had 6.1% of the game's items in view
+  missing (0.8%), and the far end of `tools/belt_build_mine.py --source` flapped every 24 ticks.
+- `--belt-draw-lattice-tail=off`: as before, a moving lane a packed block had filled stayed a lattice after the
+  block's tail had passed it, till the bridge's next read or check (on a ring with a packed block going round,
+  `tools/belt_ring.py`, the lanes it left were drawn full about 100 ticks more). On (the default): a moving lane the
+  simulation has short of full, or any lane it has no items on, is given up when the simulation's line behind its
+  entry holds nothing for two gaps on lanes it knows all that feeds (`BeltSim.lane_tails`: not a lane fed from outside
+  what is sent, the square's edge, a side-load or a splitter, where the simulation empties between reads).
+- `--belt-draw-lead-max=N` (32): the most ticks a job's lead is (how far ahead a record that ends is made again, and
+  how far a path across its end reaches); 8 as before. A busy client's jobs (every 30 ticks) had their lead held at
+  8, so an item whose record ended at a curve stood there up to 22 ticks and jumped on (the ring: 20 jumps a second).
+  `tests/belt_bs_replay.gd` sets each job's lead as the client does from `--job-every` (`--job-lead=N` to fix it;
+  before, it was always 2).
+- `--belt-draw-lattice-start=off`: as before, with settle a standing lane takes a new speed only once the
+  simulation has had it moving for two gaps' time, then from the map's phase: a belt built at a backed-up line's
+  end had the line's packed belts stand for 16 ticks (yellow) while their items ran on onto it (drawn from the
+  simulation there), each belt's front slot left standing at its exit and a gap opening behind the new belt's items
+  (the owner, K16: "there is a bit of a gap between the new belt items and the previous also leaves some ghosts at
+  the end where it is pulling forward from for a few seconds"). On (the default, with settle): a drawn lane whose
+  next lane is new (the simulation's `links_ver` changed and its `next_of` with it: a belt built in front of it)
+  lets its straight run back go for `RELEASE_TICKS`: each standing lane of it the simulation then has moving starts
+  at once, from where it stands, on the tick its items started (its record's clock held there before, texel 1 w).
+  Other starts wait as settle has them, from the map's phase (every start from where it stands cost the restart
+  capture 0.4% more missing and as many phantoms: its neighbours keep the map's phase).
+  `--belt-draw-lattice-start=stops` (off by default): a moving lane the simulation has standing also goes on to the
+  tick its lattice comes to the standing front's phase and stands there (its clock held after: texel 1 y the
+  periods from its start), standing in the lane's state once the drawn clock is there; moving again before that, on
+  from the tick its items went on. On the restart capture lanes drawn standing while the game's moved 19.0 ->
+  13.4% of the item-seconds in view, frozen spans of 2 s or more 1546 -> 927, lattice hops 554 -> 264 a second,
+  but sliding while the game's stood 4.9 -> 7.2%, phantoms 2.15 -> 2.34% and missing 0.83 -> 1.04% (the
+  simulation runs on lanes the game holds, which the stop at once, ahead of the drawn clock, hid).
+  Measured offline, the four switches together against all four off (each scored with its own mask; both twins
+  alike, `tools/belt_draw_diff.py` 0 differences on each scene and on the restart capture):
+  `tools/belt_line_end.py` (K19, seed 1, 3,600 ticks, 63 takes): game items seen 99.35% -> 99.99%, things
+  appearing or vanishing off their motion 266 -> 164 (`tools/belt_jumps.py`), missing 0.65 -> 0.01% of the
+  item-seconds (`tools/belt_quirks.py`; on the take's lane 13.6 -> 0.3%); `tools/belt_build_mine.py --scene
+  extend` (K16, a belt built at the end of a line backed up 16 belts, another 120 ticks on): seen 98.97 -> 99.98%,
+  appearing or vanishing 91 -> 82; `--scene mine` (a belt mined out of a moving line, not packed): seen 95.54 ->
+  99.91%; `--scene mine --source --spacing 64` (K22, a packed moving line): phantoms 2.06 -> 0.16% of what is drawn
+  (44 a tick at the worst, the belts in front drawn full -> 25 at the mine), seen 99.84 -> 99.67% (the belts given
+  up beside moving lattices, whose cell past the exit hides the item just past it). The restart capture at -62,-26
+  (`tests/belt_bs_replay.gd --every-tick=60 --job-every=30`, `tools/belt_quirks.py`): all four on as the old way within noise: lanes
+  drawn standing while the game's moved 19.2 -> 19.0% of the item-seconds in view, sliding 4.7 -> 4.9% (the
+  closings' slides), phantoms 1.72 -> 1.73%, missing 0.84 -> 0.84%, holes 0.29 -> 0.28%. Live (Hold 60 UPS,
+  tools/belt_view_check.py, tools/belt_walk_check.py): -62,-26 97.2% visible / 0.9% phantoms, -272,-14 98.1% /
+  0.3%, walking at -62,-26 99.4% / 0.8% (before: 97.1 / 0.9, 97.7-98.0 / 0.3, 99.3-99.4 / 0.8-0.9).
 
 The 0.2.1 performance hotfix's switches (art-src/perf-plans/belt-sim.md section 6; all client-only, both records
 paths alike). Its counters go into belt_items.gd's `stats`, so the stutter probe's `join.belt_stats` shows them:
@@ -2486,6 +3420,27 @@ item every 6 ticks, `ih`):
   arm); worked out per chunk when its entities change (at most 0.3 ms a frame) or one of its inserters' live
   arms comes or goes (at once, so no arm is drawn twice or missing), put together at most every 0.25 s, never
   per frame. `off`: none, as before. Not measured on a big base; checked by inserter_events_test.gd.
+- `--heat-glow=heat|always` (heat): a heat pipe model's glow (FUE5's heat pipes' copper) follows its temperature,
+  the bridge's `ht` (fluids_power.gd): lit from 350 °C (Factorio's heat pipe minimum_glow_temperature, where its
+  heated pictures start), easing on and off, dark below it and where no temperature is heard (past the bridge's
+  fluids radius). On or off, not brighter with more heat. `always`: lit all the time, as any glowing model without a
+  state. Headless only (anim.gd STATE_HEAT), not seen in a window.
+- `--inserter-glow=hand|always` (hand): an inserter model's glow (a modeller's lit burner, Vasillo's
+  burner-inserter.glb) follows its hand: lit while the arm is drawn turning or reaching and for 30 game ticks
+  after (the short waits at its ends), dark while it waits for items or room and wherever no live arm is drawn
+  (past the bridge's hands radius the arm rests). Factorio's burner inserter burns fuel only as its hand moves
+  (energy_per_movement and energy_per_rotation, no drain); its own burner has no light (light_flicker black)
+  and its picture no fire. The bridge sends no `st` for inserters, so their glow counted as always working
+  (owner, L4: "the burner stays lit while it's idle"). `always`: lit all the time, as before. Checked by
+  inserter_events_test.gd; not seen in a window.
+- `--burner-fx=on|off` (on): while a burner inserter whose model has a glowing burner (Vasillo's; the built-in
+  packs' have none) is lit by that rule, its glow breathes like coals (0.75 to 1.15 of its level, three slow
+  sines in the model shader, `glow_heat`, each inserter out of phase by where it stands), a thin wisp of
+  Factorio's light smoke (the smoke sheet, light-smoke's colour) leaves its grille about every 2.5 s within 30
+  tiles of the listener, and Factorio's burning-fire loop (base/sound/fire-1.ogg, fire-flame-on-tree's working
+  sound) crackles quietly, the nearest 3 at once (scripts/fx/burner_fx.gd). The same in the Model packs window's
+  preview: Play animation breathes and smokes, the speaker plays the crackle. The owner's addition: Factorio's
+  own burner inserter has none of it. `off`: a steady glow, no smoke or sound, as before.
 - `--inserter-arms-trace=<file>`: a JSON line per frame with every drawn hand (unit, x, y, held item),
   the game tick the arms stand for, the belts' drawn tick and the frame's arm cost; with the bridge's
   `/f3d-ih trace [ticks] [radius]` (every hand near the focus each tick into
@@ -2504,7 +3459,8 @@ item every 6 ticks, `ih`):
 
 `godot --headless --path client -s res://tests/belt_bs_replay.gd -- --stream=bs.jsonl --truth=rec.json
 --drawn-check --every-tick [toggles]` replays a capture (`--belt-capture=bs.jsonl`) with a job a tick as
-the client runs them and says, every recorded tick, how far each simulated item is drawn from where the
+the client runs them (`--binary`: each part written as a binary frame and read back first, as from a bridge
+sending binary; the replay must come out the same) and says, every recorded tick, how far each simulated item is drawn from where the
 simulation has it, by cause (`--drawn-explain=N` examples, `--trace=UID` one item). Without a camera every
 item is in view; `--view=x,z,w,h` gives the ground view the records are planned for, moved `--view-drift=dx`
 tiles east a job, so items park and are planned again as it goes. (A capture made offline with
@@ -2738,6 +3694,21 @@ behind a switch that puts back what was there before, for comparing:
   round the camera every frame, each band of rings further out only once the camera moved 3% of the
   band's distance (or the zoom, the window or the levels changed), within the frame budget's `lods`
   slice; standing still, nothing. Chunks shown again behind the camera switch without a cross-fade.
+- `--lod-slice=off`: disables per-chunk ring slicing and the per-frame MultiMesh switch cap
+  (`LOD_SWITCH_CAP`) in the banded LOD pass, switching a whole ring in one frame as before.
+- `--lod-cpu-copy=off`: reads `MultiMesh.buffer` back from the RenderingServer on LOD cross-fades
+  instead of building the fade copy from CPU-cached instance data.
+- `--textured-lod=legacy`: restores the fixed `[64, 32]` px switch sizes and `[0.3, 0.15]`
+  triangle floors for textured models instead of the triangle-density ladder and 7% third tier on
+  dense models.
+- `--tree-lod=off`: disables card-level view LODs on trees, keeping full leaf cards at every distance as before.
+- `--far-trees=off`: keeps trees and plants as MultiMeshes in far chunks instead of merging their trunks and crowns.
+- `--icons-later=off`: the entity info panel (the hover panel) reads an icon that isn't cached yet at once,
+  on the main thread, as before. On (`Kit.icon_into`): read on a worker thread and filled in a frame or
+  a few later, so the camera sweeping new kinds under a still cursor never waits for a file (13-15 ms
+  frames on a cold disk).
+- `--decor-sheet=off`: keeps flat decoratives as separate per-kind MultiMeshInstance3Ds per chunk instead of baking them into one chunk sheet (`decor_sheet_baker.gd`).
+- `--decor-sheet-compress=on`: S3TC block-compresses baked decorative chunk sheets in editor builds (off by default to avoid `Image.compress` stalling `WorkerThreadPool`; export builds always skip compression).
 - `--build-parts=each`: a chunk is built again on each `ents` part of its snapshot, as before. On:
   once its last part is in (or 0.5 s after the snapshot started, a part lost meanwhile).
 - `--build-apply-deadline=off`: a chunk's build fills all its MultiMeshes in one go once its records
@@ -2769,6 +3740,18 @@ behind a switch that puts back what was there before, for comparing:
 - `--decode-thread=off`: map charts' pictures (`chart`) and chunks' tiles (`chunk`) are decoded on the
   main thread when handled, as before. On: on the bridge's parsing thread as each message is read
   (client/scripts/net/message_decode.gd); a message with fields of the wrong kind is left as it came.
+- `--binary-messages=off`: the hello leaves `bin` out and the bridge sends everything as JSON text, as before.
+  On (the default): the bridge sends binary frames (docs/PROTOCOL.md, "Binary frames"; wire_decode.gd reads
+  them), the movers (`mv`) written with `string.pack` instead of as text (about 40 ns a number in the game
+  against 290-670), and from wire version 2 the belts (`bs`, each lane key as unit number and line) and far lanes
+  (`bfar`) too, their lists kept as numbers rather than text; everything else as its JSON text inside a frame.
+  From wire version 3 the chunk snapshots (`chunk` tiles, `ents` records with their extras as a JSON tail), the
+  machine states (`st`) and the inserter hands (`ih`) too; the snapshot jobs then keep numbers, not text. A
+  client of an older version gets the newer kinds as text, and a hello that lowers it while binary chunk
+  snapshots wait starts the stream over. `--belt-capture` writes a binary `bs` part as its JSON,
+  so captures and the tools reading them are the same either way. The map setting **Binary messages to
+  Zenith** (`f3d-binary-messages`, on) turns it off from the bridge's side, from the client's next hello (a
+  second). `/f3d-selftest` says which a client gets; `tools/live_check.py --binary` checks a live server with it.
 
 Not behind a switch: the graphics list's last part is merged and written to the cache on a worker
 thread, and a new list's clutter is built again a slice a frame nearest the focus first (with the
@@ -2799,6 +3782,150 @@ in one running client.
   and that doesn't glow, loads as a solid material. Vasillo's belt surface is one: the top of every
   belt, splitter and underground leaves the transparent pass and gets the depth pre-pass, SSAO and
   contact shading. `--opaque-blend=off` keeps every BLEND material see-through.
+- **Belt surfaces with see-through pictures are cut out, not blended** (model_textures.gd `clip_belt`):
+  a BLEND belt surface (belt_return.gd `is_surface`) whose picture has transparent pixels (Vasillo's new
+  belts: notched plate corners) loads as Alpha Clip at 0.5 and is drawn with factorio_material_clip.
+  Blended, it wrote no depth and the return run, drawn in the same draw, painted its backward chevrons
+  over the top ("chevrons pointing both ways"). `--belt-surface-blend=on` keeps it blended, as before
+  0.2.2. Also, the return's triangles now come first in that draw (belt_return.gd `joined`), so even a
+  blended surface draws its top run last; `--belt-return-first=off` puts them after, as before.
+- **Emission as the glTF file says** (model_textures.gd `emission_strict`): a material glows only by its
+  `emissiveFactor` (absent means none, glTF's default) and only when its emission picture isn't black on
+  every pixel. Godot's reader turned emission on, white, for any emission picture, and Zenith drew such a
+  material as lighting up at work, a see-through one as a plume that is gone at rest: Vasillo's export
+  wires a black emission picture with no factor into 30 see-through materials, so his new pipes, ores,
+  plates and drill bodies were invisible unless working ("none of the new models show up in the
+  viewer"). The glow that is drawn is the picture x the factor x the strength
+  (KHR_materials_emissive_strength). `--emission-strict=off` reads them as before 0.2.2.
+- **A modeller's glow dims only itself at rest** (model_library.gd `glow_keeps_albedo`): a glowing
+  material from a modeller's pack without an emission picture (Vasillo's drill's `Light`: a factor, no
+  picture) goes dark at rest by its glow alone; its base colour is the same idle and working (Zenith's
+  own fire boxes and lamps still dim theirs to 30%, as Factorio's do; a material with its own emission
+  picture already didn't). `--idle-dims-glow-paint=on` dims it as before 0.2.2.
+- **Nearly opaque Alpha Blend is cut out** (model_textures.gd `clip_blend`, the general case of
+  `clip_belt`): a modeller's BLEND material whose base colour alpha is 1 and whose picture is opaque on
+  95% or more of its pixels (Vasillo's drill: 0.1-0.3% of pixels a little see-through) loads as Alpha
+  Clip at 0.5, so its parts sort and get the depth pre-pass; real glass (pipe-alt's `Glass`, 0.6 alpha
+  everywhere) stays blended, and built-in packs are unchanged. `--blend-clip=off` keeps it blended.
+- **Ore as scattered rocks** (model_library.gd `ore_rocks`, chunk_view.gd `_scatter_ore`): a pack with numbered
+  ore models (`iron-ore-1.glb`, `-2`, ..., `copper-ore-N`, `coal-N`, `stone-N`, `uranium-ore-N`) or a plain
+  `<ore>.glb` under 0.6 tiles on its larger side draws each ore tile as rocks by Factorio's eight richness stages
+  (`ORE_STAGES`: from 150, 400, 1300, 2900, 5500, 9500 and 15000 ore; uranium's own 100, 270, 870, 1930, 3670, 6330,
+  10000): 3, 5, 6, 7, 8, 10, 12 or 14 rocks, sized 1.1, 1.2, 1.35, 1.5, 1.6, 1.7, 1.8 or 1.9 times their 0.8-1.2
+  jitter, poorest to richest, so they hide about as much ground as Factorio's ore pictures (22% to 96%). From a hash
+  of the tile, in the chunk's MultiMesh per rock model, filled rank by rank: a far
+  chunk (far_chunks.gd) shows every tile's first rock by the MultiMeshes' visible count, without a build.
+  `--ore-scatter=auto` (default) as said; `--ore-scatter=on` scatters any plain ore model too, and a pack whose
+  pack.json says `"ore_scatter": false`; `--ore-scatter=off`: one model a tile, as before 0.2.2.
+  `--ore-look=old`: a "pbr" pack's ore rocks drawn as any model (Burley diffuse, the file's occlusion picture on ambient)
+  instead of as belt ore is (Lambert, no occlusion: factorio_material_ore.gdshader).
+  `--ore-density=classic`: 0.2.2's first scattering, 2, 4 or 6 rocks (under 400, from 400, from 2900; uranium 270
+  and 1930) at their 0.8-1.2 size. A 60 x 60 patch draws 24,212 rocks near (classic 15,416; far 3,600 either way).
+- **Window pipes** (model_library.gd `pipe_window`, world.gd `extra.pw`): a straight pipe where its floored x
+  plus floored y is even is drawn with `pipe-straight-vertical-window` / `-horizontal-window` when the pack
+  drawing its straight has that model (Factorio's window on every second pipe). `--pipe-windows=off`: none.
+- **A mining drill's fluid part** (model_library.gd `wet_model`, chunk_view.gd `_add_wet`): `<drill>-wet.glb`
+  drawn over a drill whose record's `fa` has bit 1 (the bridge sends it for a drill over a resource that needs
+  fluid), if the drill's pack has it; a chunk is drawn again when that bit changes. `--drill-wet=off`: never.
+- **Pipe covers** (pipe_covers.gd, world.gd `_cover`, chunk_view.gd `_add_covers`): Factorio's `pipe_covers`. Each
+  fluid connection of a machine (the prototype's `eprops` fb) with nothing connected to it (no pipe whose `pc`
+  reaches back, no pipe to ground facing it, no machine with a connection back) gets a cover from the pack that
+  draws the machine: its `pipe-cover.glb`, else the cap of its pipe kit (`pipe-ending-down` less
+  `pipe-straight-vertical`: Vasillo's pipe-cap, so his wet drill's open pipe ends are closed). A drill's show while
+  it takes fluid (`fa` bit 1), a crafting machine's those its recipe uses, the rest all of theirs. Worked out again
+  when a pipe or machine is built or removed next to it. Packs with neither model (the built-in ones) draw none.
+  `--pipe-covers=off`: none.
+- **Contact shading's patch under big machines** (contact_shade.gd `PATCH_EDGE`, `collect`'s footprint): the
+  faint patch under drills, labs, radars, centrifuges, pumpjacks, refineries and reactors has its feet clamped
+  to the building's tiles and fades out 0.1 tiles past them, its ring as wide as the rim's (0.27). It used to
+  fade over 0.5 tiles past a foot that on a drill reaches the tile edge: a dark band all round every drill
+  (31-35% dark at the tile edge, 14-16% 0.1 tiles out, 7% at 0.2; now 10-28%, 1-5%, 0%), where Factorio's
+  drill has none past its body. `--contact-patch=wide`: as before.
+  The clamp moves the patch alone: the rim stays round the model's real feet, so a machine whose base overhangs
+  its tiles (Wube3DP's electric drill by 0.11 tiles, Vasillo's by 0.08, the placeholder burner drills) keeps its
+  rim on that side instead of having it pushed under the model (such a foot gets a rim ring and a patch ring).
+  `--contact-rim=clamped`: one clamped ring a foot, as the drill-border fix first had it.
+  Under the foot the rim and patch fade out over 0.05 tiles (contact_shade.gd `INNER_FADE`, the shader's
+  `inner_fade`), gone before the ring's hole. They were drawn at full darkness from the foot's box in to the hole
+  and cut off there: hidden under a solid base, but where a body doesn't fill its feet's box (Wube3DP's electric
+  drill between its rear legs, 0.38 tiles deep) a dark band with a sharp inner edge lay on the ground past the body.
+  `--contact-inner=hard`: as before.
+- **Contact shading shaped by each model** (contact_shade.gd `mask_of`, `commit_mask`; the shader's mask mode): the
+  rings follow boxes, and a box was dark where the model has no part (Vasillo's electric drill: dark patches beside
+  its body between the legs; the burner drill: a dark oval off one leg; an underground belt and a curve: dark ground
+  under the hood and outside the curve). Each model's contact map is now made from its own mesh once, on the loader's
+  worker thread: its triangles (moving parts in their rest pose) within 0.25 tiles of its lowest vertex, seen from
+  above, the lower the darker, turned into the distance to that contact over a 64 x 64 mask (its contact plus 0.3
+  tiles). The masks share one R8 atlas (16 a row, grown as needed, 4 KB each; the same mask twice shares a slot) and
+  the rings' shader, profile, strengths, speckle and neighbour halving; one quad per building, turned and mirrored
+  as it is, on a MultiMesh under the chunk's ring node (`ContactMasks`). Belts, pipes and walls (by file name) also
+  get a joined variant, carried straight to the half-tile line their contact reaches and cut there, so a run's
+  tiles meet in one rim with no bead at the joints (a run's open end has no rim round it). Models with no mask keep
+  the rings: a mod's picture card, files named as rails, trees, rocks, ores, vehicles and the like (no shading
+  anyway), and a full atlas (4096 masks). Cost, all 636 built-in and Vasillo's models: 480 masks in 6.5 s of loader
+  time (about 13 ms each, a third of their load), 2.9 MB of atlas. `--contact-shape=box`: the rings for all, as
+  before, and no masks made.
+- **Contact shading under items** (item_cards.gd `contact`, `_with_contact`; shaders/item_contact.gdshader): items
+  on belts and on the ground get the buildings' soft dark rim on what is under them (the belt's surface between
+  its rails, or the ground), round their look's footprint (an icon card's middle 60%), as strong as the rim
+  (`rim_dark` times 0.8) and as wide (`rim_falloff`): the debug menu's Contact strength and rim width move both,
+  Settings > Graphics > Contact shading shows or hides both, and it fades out at far zoom as they do. A kind's
+  mesh is a copy of its look with one more surface, a box round the footprint from 0.2 tiles under the item's base
+  to just over it, drawn by the kind's own MultiMesh in the alpha pass as a decal: it reads the opaque scene's
+  depth (already copied each frame for the cloud shadows) and darkens what lies below the base outside the
+  footprint, so it follows the items on the GPU and costs one instanced draw a kind and the box's pixels, nothing
+  a frame on the CPU; a pile's copies and inserters' hands have none. `--belt-item-contact=off`: no box (as
+  before); `=flip`: on and off every 10 s, for `--item-bench`, which says the share of frames they were on.
+- **Variants of every model, item model and icon** (model_packs.gd `variant_base`, `variants_in`; model_library.gd
+  `pick_variant`): `<name>-1`, `-2`, ... and `<name>` are variants of `<name>` (not a numbered Factorio prototype:
+  `assembling-machine-2`), one entry in the Model packs window; each placed entity and ground item draws one picked
+  by a hash of its position (`extra.zv`, set in world.gd), an icon one picked by its name. A pack.json's
+  `"aliases": {"coal-ore": "coal"}` reads its files under Factorio's names. Ores as before (scattered rocks).
+  Items on belts draw theirs too (`items/stone-1..3`): a simulated item the one who it is picks, its number along
+  its run as for its turn (item_cards.gd `lattice_variant`), kept while it travels and across re-reads; a packed
+  lane's slots the same in the shader (`belt_lattice_variant`: a lattice kind per variant over the same records,
+  each drawing its variant's slots); far lanes' icons by their place; an inserter's hand one per thing it takes.
+  `--model-variants=off`: always the plain model (the window still groups them), items everywhere included.
+- **Which packs have an ore** (model_packs.gd `provides`): a pack with only an ore's numbered rocks
+  (`iron-ore-1`...), or its `-rich`/`-sparse` stages, provides that ore: listed on the ore's card in the
+  Model packs window, drawing it when it is the order's first with it (model_library.gd
+  `ore_scatter_names`) or chosen for it, the card tagged in use then. One rule for all three.
+- **A modeller's item pictures** (item_models.gd `material_for`): an item model whose surfaces share a
+  base-colour picture is drawn with it, by one material per item model kept with its mesh and shared by
+  every instance (item_cards.gd's MultiMeshes on belts, the ground and in hands; belt_lanes.gd's far
+  belts; the Model packs preview), the picture times the vertex colours, without the 0.75 exposure the
+  icon-coloured items get. Built-in items (vertex colours, no picture) keep the one shared material.
+  `--item-pictures=off`: pictures left out, every item model by its colours alone (as before 0.2.2).
+- **A modeller's item drawn with its file's own materials** (item_models.gd `own_look`, `dressed`): an item
+  model whose materials have more than one shared picture draws (pictures that differ between its
+  surfaces or on only some, glow, see-through parts, or roughness, metal or normal pictures in a pack that
+  isn't "pbr") keeps them, one material per surface, as
+  its buildings do: base colour and its picture, roughness and metal with their picture, normal map,
+  emission and alpha (item_own.gdshader for items on the ground, near belts and in hands; far belts'
+  belt_lane_model.gdshader `own`; the Model packs preview with the file's materials), whatever the pack's
+  shading and with or without pack.json, its pictures made ready as a building's (model_textures.gd
+  `prepare`). See-through (glTF Alpha Blend) parts are blended at the file's alpha in the transparent pass, as
+  buildings' glass is (item_own_blend.gdshader, belt_lane_model_blend.gdshader; the item's other parts stay in the
+  opaque MultiMesh pass; with a depth pre-pass, as Godot draws glTF's Alpha Blend in the preview, so a one-surface
+  flask's opaque pixels still write depth and cast shadow and only its glass blends; several see-through parts in one item blend smallest first,
+  so a liquid shows inside its glass); `--item-glass=dither` dithers them in the opaque pass instead (stippled,
+  more see-through), as the first 0.2.2 drawing did. Only one picture shared by
+  every surface was drawn before, so a model of several materials (Vasillo's science pack) came out plain
+  grey. `--item-materials=old`: as before.
+- **Items already drawn follow the packs** (item_models.gd `generation`): when an item's model file changes
+  with the packs' order, switches or choices, the item kinds drawn with the old one (item_cards.gd: on the
+  ground, near belts, in hands; belt_lanes.gd's far belts) are made again with the new file. Checked only
+  when the packs change (an int compare a frame otherwise). `--item-kinds-follow=off`: they keep the model
+  they were first drawn with until a restart or a surface change (as before 0.2.2).
+- **Baked animation played as the file says** (model_skin.gd, factorio_material.gdshaderinc `anim_baked`): a
+  modeller's action is sampled at its own key rate (the closest two keys of any channel), 30 to 60 frames a second,
+  up to 4096 frames (Vasillo's 35 s electric drill: 2101 frames at 60 a second, its bones' texture 2.7 MB against
+  0.66 MB, the same again kept on the CPU for its bounds; it bakes in about 1.9 s on a worker instead of 0.4).
+  Between two frames a bone whose axes turn more than about 30 degrees is shown at the nearer frame instead of
+  mixing the two matrices, which shrank it (his fans to 57% of their width, the bit to 22%); slower bones are
+  mixed as before. Not behind the switch, a plain error: a bone with uneven scale is posed rotate x scale as glTF
+  says (the burner drill's counterweight arm sat 7 cm off). `--baked-anim=old`: 30 frames a second, at most 512,
+  always mixed, as before 0.2.2.
 - **Pictures shared between models** (model_textures.gd): a picture is made into a texture once, found
   by an MD5 of its bytes in the .glb (and failing that a hash of its decoded pixels), whatever model
   brings it; Vasillo's 39 models carry 188 textures of 48 pictures. A picture drawn crisp (NEAREST) is
@@ -2814,6 +3941,15 @@ in one running client.
   and crevices fade out from 1.5 to 3 texels a pixel, where the mipmaps have already flattened them,
   and aren't made past that; off altogether at Level of detail Low. `--relief-fade=off` keeps them at
   every distance, `--ground-relief=on|off` forces them whatever the setting; the probe's `relief off`.
+- **Matte ground and plants** (terrain_textures.gd `SURFACES`, terrain.gdshader, decorative_grass.gdshaderinc): each
+  ground tile family has its own roughness and specular (concrete 0.9 / 0.1, refined 0.88 / 0.12, stone path 0.92 /
+  0.08, landfill and natural ground 0.95 / 0.05, platform foundations and ice a little smoother), carried per tile in
+  the mesh's CUSTOM1.w; never metal. Grass, carpet clumps and flat decoratives: specular 0.05, roughness 1. Godot's
+  Fresnel brings most of a low sun's highlight back at grazing angles unless the specular is tiny, so with the sun low
+  behind the scene paving glared pale and back-lit grass turned white. `--ground-rough=off` gives the ground 0.2.2's
+  values (natural 1.0 / 0.15, floors 0.8 / 0.3), `--grass-backlight=old` the plants' (specular 0.5, carpet roughness
+Trees (and rocks with grain): `--tree-sheen=old` (also `--grass-backlight=old`) keeps the 0.2.2 specular 0.5-0.2; default is matte (0.05, roughness 1). `--night-vision-fx=old` keeps night vision's first look (ambient lift 1.4, edge 0.42).
+  0.9). The debug menu's Lighting tab: "Ground roughness" adds to every tile's.
 - **Far merging no further than 192 tiles** (far_chunks.gd `MERGE_CAP`): a long Shadow distance no
   longer pushes the merge out past 192 tiles (at 400 nothing in view was merged zoomed out).
   `--far-merge-cap=<tiles>` sets the cap, 0 none (as 0.2.0).
@@ -2827,18 +3963,25 @@ The same library holds `BeltDrawNative` (`belt_draw_native.cpp`): belt_items.gd'
 simulation's changes to the GPU records (`--belt-draw-native`, above), the same records as the GDScript
 path (`tools/belt_draw_diff.py`).
 The Windows library, `client/native/bin/belt_sim.windows.template_release.x86_64.dll`, is committed, so
-nothing needs building to use it. Without it (other platforms, or the file deleted) Godot prints three
-`ERROR` lines at start-up ("GDExtension dynamic library not found: 'res://native/belt_sim.gdextension'"),
-and everything runs on belt_sim.gd; the tests pass either way.
+nothing needs building to use it. Without it (other platforms, or the file deleted) everything runs on
+belt_sim.gd and Godot's own UDP socket; the tests pass either way. The library holds `UdpSocketNative` too
+(bridge.gd's socket, `--udp-socket`).
 
 `--belt-sim-native=off` runs belt_sim.gd with the library loaded (its drawing and lattice in GDScript
 too). If Zenith ever dies inside the library (an access violation, exit code 3221225477, with no
 backtrace: a loop side-loading onto itself on Aquilo did that), the same spot under belt_sim.gd stops with
 a script error and a GDScript backtrace naming the line, which points at the C++ function of the same name.
 
-Godot loads an extension only once it is listed in `client/.godot/extension_list.cfg`, which an import
-writes: on a fresh checkout run `godot --headless --path client --import` once, or the client and the tests
-run on belt_sim.gd (`belt_sim_native_test.gd` then says "BeltSimNative isn't loaded" and skips).
+Godot doesn't load it at start-up: `client/scripts/native_library.gd` does, the first time Bridge or
+belt_items.gd asks, and only where the `.gdextension` names a library for this platform and the file is
+there. Godot itself loads every `.gdextension` its editor finds, and a `.gdextension` can't make a
+platform's library optional: on Linux, macOS and ARM64 every run printed three `ERROR` lines ("No
+GDExtension library found for current OS and architecture"). So `client/native/.gdignore` hides the folder
+from the editor, the start-up line says `Native library: loaded`, or `none for linux.x86_64, belt_sim.gd
+instead`, and nothing needs importing first. An exported game has the `.gdextension` and the DLL beside
+its program (`tools/release/package.py` copies them; Godot's export no longer sees them). A checkout whose
+`client/.godot/extension_list.cfg` still names it, from before, has Godot load it as before until its next
+import, which removes the list.
 
 To build it again after changing `belt_sim_native.cpp` (Windows, MSVC Build Tools 2022 or newer, Python):
 
@@ -2853,6 +3996,13 @@ The first build takes ~15 minutes (godot-cpp, with link-time code generation); a
 source about 2. Symbols and a link map (`.pdb`, `.map`, git-ignored) are written beside the DLL: Godot's
 crash backtraces give `belt_sim...dll+<offset>`, which the map turns into a function.
 
+The DLL goes out in the downloads, so it carries no path of the PC it was built on: SConstruct links with
+`/PDBALTPATH:%_PDB%` (the `.pdb`'s file name alone, not its full path) and compiles godot-cpp and our own
+source with `/d1trimfile:<client\native>\` (and the folder holding `godot_cpp=`), which cuts that folder off
+the `__FILE__` names godot-cpp's error macros keep (`godot-cpp\src\core\memory.cpp` is left). A godot-cpp
+built before that flag is built again once. Before committing a new DLL, scan it for drive paths, ASCII and
+UTF-16 (none may be left).
+
 A change to belt_sim.gd's rules must be made in `belt_sim_native.cpp` too (it follows the GDScript
 function by function, down to belt_sim.gd's own slips: see the test's header). Check them:
 
@@ -2866,6 +4016,47 @@ On the desktop (i5-6600K), replaying `main_belts.json` (Zenith Test's main belts
 game's oracle at the square's edges): belt_sim.gd 4.4 ms a tick, BeltSimNative 0.17; six copies side by
 side (77,000 items) 23.4 against 0.86 ms; the synthetic bench's 80,000 items (loops and backed-up runs) 17.9 against 0.16 ms. In
 belt_items.gd's job (`tests/belt_bs_perf.gd`, `--gd` for belt_sim.gd) on a captured stream: 3.0 against 0.08 ms a tick.
+
+## Commands for models, releases and the UI reference
+
+Moved here from AGENTS.md's command list, which keeps the tests and the everyday commands.
+
+```bash
+# 3D models (client/assets/models/README.md): rebuild, check, re-import, optional preview
+blender --background --factory-startup --python tools/models/build.py -- [names...]
+python3 tools/models/wube.py [names...]  # convert Wube's printable models from art-src/wube/
+python3 tools/models/fue5.py [names...]  # convert FUE5's models from art-src/fue5/raw/ (--score: overlap, ours and theirs;
+                                         # --fix-imports after `godot --import` keeps their textures embedded)
+python3 tools/models/check.py [names...]  # <name> or <pack>/<name> (fue5/stone-furnace); none: all 481
+python3 tools/models/fix_pack.py <export> <copy> [--fixes tools/models/fixes/vasillo.json]  # a modeller's export fixed into a copy (names, items/, origin, pipe shapes and endings, emission and blend modes by the picture's alpha); the list is data
+python3 tools/models/sprite_projection.py  # after adding a model with a Factorio sprite
+python3 tools/models/part_colors.py [names...]  # and each part's colour from the sprite, into the .glb (after any rebuild)
+python3 tools/models/review.py [names...]    # owner review shots in the client (art-src/shots/<name>/, needs a window)
+godot --headless --path client --import     # commit the new .glb.import files too
+blender --background --factory-startup --python tools/models/preview.py -- out.png [names...]
+
+# releases, benches and the network's cost
+python3 tools/net_cost.py [--port 34200] # bytes and messages per type the client gets (mock busy base, or a server)
+python3 tools/release/build_mod_zip.py  # dist/factorio-3d-bridge_<version>.zip for the mod portal (uploads nothing)
+python3 tools/bench/compare_builds.py --before v0.1.2 --after v0.1.3   # every update: the same laps and standing test
+                                        # on both builds, a copy of Zenith Test, runs taking turns -> art-src/bench/*/table.md
+python3 tools/bench/hybrid_cost.py      # what hybrid costs against a server, the same test (adds and removes steam_appid.txt)
+python3 tools/release/package.py        # dist/Zenith-<version>-windows.zip: the exported client, mod and server scripts (needs Godot's export templates)
+                                        # --platform linux, or linux-arm64 / windows-arm64 / macos (unsupported), all;
+                                        # --channel dev for a development build (Zenith-<version>-dev-*.zip, with the testing tools)
+python3 tools/release/thumbnail.py      # redraws the mod's thumbnail.png
+
+# Factorio's own UI as the reference (windowed Factorio on a copy of the owner's save; pictures in the
+# main checkout's git-ignored art-src/ui_reference/), ours the same way against the mock
+# (mock_server.py --port 35310 --reach 200 --machine-gallery), then the side-by-side page; differences: docs/UI-DIFFERENCES.md
+python3 tools/ui_reference/capture.py [--only names] [--fresh]
+python3 tools/ui_reference/ours.py --factorio-port 35310 --port 35311 [names...]
+python3 tools/ui_reference/compare.py
+
+# compare every model with Factorio's sprite (needs Blender and a Factorio install); writes the
+# git-ignored art-src/compare/index.html, tagged Wube 3D release / sprite reference / old placeholder
+python3 tools/models/gallery.py [names...]
+```
 
 ## Tests
 
@@ -2889,11 +4080,12 @@ python3 -m venv .venv && .venv/bin/pip install "lupa==2.*" "gdtoolkit==4.*"   # 
 .venv/bin/python tools/mod_tests/test_bridge.py   # the mod, against a fake Factorio API
 .venv/bin/python tools/mod_tests/test_data_stage.py   # the mod's data stage (the graphics list)
 .venv/bin/python tools/mod_tests/test_fuzz.py     # the mod against malformed, truncated, out-of-order packets
+.venv/bin/python tools/mod_tests/test_binary.py   # binary frames (`bin`) decode as their JSON does
 python3 tools/test_mock_server.py                 # the mock server, over real UDP
 python3 tools/test_mock_fuzz.py                   # the mock, fuzzed the same way
 python3 tools/test_relay.py                       # the relay for a server on another PC, and the mock behind it
 .venv/bin/gdparse $(find client -name '*.gd') >/dev/null || echo "FAIL"
-python3 tools/models/check.py                     # after model changes: name, footprint, origin, triangle budget
+python3 tools/models/check.py                     # after model changes: name, footprint, origin, triangle budget (all 481)
 godot --headless --path client res://tests/ui_test.tscn   # the UI's input paths; exits 1 on failure
 godot --headless --path client res://tests/addon_test.tscn   # add-ons: loading, keys, the camera, data
 godot --headless --path client res://tests/bridge_fuzz_test.tscn   # the client's packet parsing, fuzzed
@@ -2901,7 +4093,11 @@ godot --headless --path client res://tests/decor_test.tscn   # decoratives
 godot --headless --path client res://tests/vr_test.tscn      # VR panel and session without a headset
 godot --headless --path client -s res://tests/model_load_test.gd   # after model changes: every model loads the same both ways
 godot --headless --path client -s res://tests/mod_files_test.gd    # mods' files and the graphics list
+godot --headless --path client -s res://tests/model_packs_test.gd  # model packs: built in, loose, folders, zips, order, off, choices
 godot --headless --path client -s res://tests/nature_looks_test.gd # trees' variations, colours, leaf atlas, rock and bark grain
+godot --headless --path client -s res://tests/sound_decode_test.gd # sound decodes on workers never wait for a lock the main thread holds (packs', add-ons', mods' and steps' sounds too); at most 2 at once; clear_cache() waits for them
+godot --headless --path client -s res://tests/sound_cache_test.gd  # one decode per sound and loop flag, clear_cache() mid-flight, quitting with decodes in flight
+godot --headless --path client -s res://tests/safe_delete_test.gd  # add-ons' and model packs' folder deletes never go through a junction or symlink
 ```
 
 CI (`.github/workflows/tests.yml`) runs all of these on every push, and `tools/live_check.py`

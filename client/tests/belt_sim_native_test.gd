@@ -15,9 +15,10 @@ extends SceneTree
 ## crashed the C++ twin on Aquilo) runs sparse and packed.
 
 const BeltSim := preload("res://scripts/world/belt_sim.gd")
+const NativeLibrary := preload("res://scripts/native_library.gd")
 const Replay := preload("res://tests/belt_sim_replay.gd")
 const DEFAULT := "res://tests/data/belt_sim_small.json"
-const STATE_KEYS := ["uid", "item", "stack", "key", "pos", "tick", "speed", "reach", "run", "gone", "gone_tick", "gone_at", "mismatch",
+const STATE_KEYS := ["uid", "item", "stack", "key", "pos", "tick", "speed", "reach", "run", "num", "gone", "gone_tick", "gone_at", "mismatch",
 	"mismatch_n", "hand_uid", "hand_tick", "hand_ins", "hand_key", "hand_pos", "hand_why"]
 
 var gd: RefCounted
@@ -42,11 +43,15 @@ func compare(where: String) -> bool:
 	for i in gd.l_key.size():
 		if gd.l_alive[i] == 1:
 			keys.append(gd.l_key[i])
-	for speed_of in 3:
+	for speed_of in 4:
 		var fa: PackedInt32Array = gd.lane_fronts(keys, speed_of)
 		var fb: PackedInt32Array = nat.lane_fronts(keys, speed_of)
 		if fa != fb:
 			return _fail(where, "lane_fronts differ (%d lanes, speed_of %d)" % [keys.size(), speed_of])
+	# (belt_lattice.gd tail) Whether nothing comes close behind each lane's entry.
+	for need in [64, 128, 600]:
+		if gd.lane_tails(keys, need) != nat.lane_tails(keys, need):
+			return _fail(where, "lane_tails differ (need %d)" % need)
 	var a: Array = gd.items_state()
 	var b: Array = nat.items_state()
 	if a != b:
@@ -72,6 +77,8 @@ func compare(where: String) -> bool:
 		return _fail(where, "given differs")
 	if gd.n_hand != nat.n_hand:
 		return _fail(where, "hand counters %s against %s" % [gd.n_hand, nat.n_hand])
+	if gd.n_rescue_denied != nat.n_rescue_denied:
+		return _fail(where, "rescues denied %d/%d" % [gd.n_rescue_denied, nat.n_rescue_denied])
 	if gd.n_take_read != nat.n_take_read or gd.n_take_rescued != nat.n_take_rescued:
 		return _fail(where, "takes made at a read %d/%d, from a push-back %d/%d" % [gd.n_take_read, nat.n_take_read,
 			gd.n_take_rescued, nat.n_take_rescued])
@@ -106,6 +113,8 @@ var take_line := true
 var take_edge := true
 ## A tunnel with no next links like a belt, as before --belt-sim-ug-guard: a pass.
 var ug_guard := true
+## Reads put back every item they haven't behind or ahead of their own, as before --belt-sim-rescue-seen: a pass.
+var rescue_seen := true
 
 
 func _fresh(edge: int) -> void:
@@ -137,10 +146,12 @@ func _fresh(edge: int) -> void:
 	nat.take_edge = take_edge
 	gd.ug_guard = ug_guard
 	nat.ug_guard = ug_guard
+	gd.rescue_seen = rescue_seen
+	nat.rescue_seen = rescue_seen
 
 
 func _initialize() -> void:
-	if not ClassDB.class_exists("BeltSimNative"):
+	if not NativeLibrary.ensure():
 		print("BeltSimNative isn't loaded: nothing to compare (skipped)")
 		quit(0)
 		return
@@ -170,7 +181,11 @@ func _initialize() -> void:
 	if fails == 0:
 		_take_at_line_end()
 	if fails == 0:
+		_tails_case()
+	if fails == 0:
 		_take_at_front_edge()
+	if fails == 0:
+		_rescue_seen_case()
 	if fails == 0:
 		_ug_guard_case()
 	if fails == 0:
@@ -236,6 +251,11 @@ func _initialize() -> void:
 		_synthetic(1, 1500)
 		print("synthetic world 1, take_edge off: %d checks, %d differences" % [checked, fails])
 		take_edge = true
+	if fails == 0:
+		rescue_seen = false
+		_synthetic(3, 1500)
+		print("synthetic world 3, rescue_seen off: %d checks, %d differences" % [checked, fails])
+		rescue_seen = true
 	print("%s in %d ms: %d checks, %d differences" % ["PASS" if fails == 0 else "FAIL", Time.get_ticks_msec() - t0,
 		checked, fails])
 	quit(1 if fails > 0 else 0)
@@ -637,6 +657,9 @@ func _take_before_read() -> void:
 			# (The old way is both off: take_line puts a tick's takes before its reads whatever came first.)
 			gd.take_line = take_first
 			nat.take_line = take_first
+			# (And rescue_seen, which lets the read's taken item go: the old way pushed it back.)
+			gd.rescue_seen = take_first
+			nat.rescue_seen = take_first
 			both("step_to", [0])
 			for u in [1, 2, 3]:
 				var ex := Vector2i((u + 1) * 256, 2560)
@@ -716,6 +739,34 @@ func _take_before_read() -> void:
 ##  - "known": the same hand, the pickup lane's read queued when the take is made: the take takes the item the
 ##    read hasn't, whatever the hand is nearest.
 ## With take_line off (the old way) "front" keeps the taken item.
+## (belt_lattice.gd tail) lane_tails on a line of six belts going west (belt 1 its front, belt 6 its back, fed by no
+## lane: the square's edge): belt 1 full, belt 2 one item at its exit. Nothing behind belt 2 or 5 for 128 (1); an item
+## right behind belt 1 (0); belt 6, where what feeds it isn't known (0).
+func _tails_case() -> void:
+	_fresh(BeltSim.EDGE_STOP)
+	both("step_to", [0])
+	for u in range(1, 7):
+		var ex := Vector2i((u - 1) * 256, 2560)
+		var en := Vector2i(u * 256, 2560)
+		both("set_lane", [u * 8 + 1, BeltSim.STRAIGHT, 256, 8, ex, (ex + en) / 2, en, 0, 0])
+	var its := PackedInt64Array()
+	for k in 4:
+		its.append_array([100 + k, 7, 64 * k, 1])
+	both("load_lane", [9, 0, its])
+	both("load_lane", [17, 0, PackedInt64Array([110, 7, 0, 1])])
+	both("step_to", [1])
+	if not compare("lane tails"):
+		return
+	var keys := PackedInt64Array([9, 17, 41, 49])
+	var want := PackedInt32Array([0, 1, 1, 0])
+	for sim in [gd, nat]:
+		var got: PackedInt32Array = sim.lane_tails(keys, 128)
+		if got != want:
+			_fail("lane tails", "%s: %s, not %s" % ["belt_sim.gd" if sim == gd else "BeltSimNative", str(got), str(want)])
+			return
+	print("lane tails: as wanted")
+
+
 func _take_at_line_end() -> void:
 	var known_n := 0
 	for on in [true, false]:
@@ -844,8 +895,10 @@ func _take_at_front_edge() -> void:
 		var on := variant < 2
 		var case := "together" if variant % 2 == 0 else "reads first"
 		take_edge = on
+		rescue_seen = on  # (the old way: rescue_seen, which lets the item go too, off with it)
 		_fresh(BeltSim.EDGE_STOP)
 		take_edge = true
+		rescue_seen = true
 		both("step_to", [0])
 		for u in range(1, 7):
 			var ex := Vector2i((u - 1) * 256, 2560)
@@ -914,6 +967,70 @@ func _take_at_front_edge() -> void:
 			_fail(where, "with take_edge off the taken item 208 should stay as before")
 			return
 	print("take at a belt's front edge: %d checks, %d differences" % [checked, fails])
+
+
+## --belt-sim-rescue-seen: an inserter past the bridge's hands radius takes an item with no `ie`, so the client
+## learns of it only from reads. Six yellow belts that end (units 1-6, west), two items a few tiles apart; the
+## game's hand takes the front one (50) over belt 4 on tick 10, and the bridge reads the pickup belt and its
+## feeder (belt 5, item 51 on it) as the game has them, both without 50, in one update. The old way the read of
+## belt 4 put 50 back onto belt 5 as one the game's had yet to reach, belt 5's read then pushed it ahead onto
+## belt 4 again, and it ran on to the line's end for good. Cases: "pickup first", "feeder first" (the update's two
+## reads either way round), "pickup only" (belt 4 alone read without it, every 8 ticks: rescued twice, then gone
+## at the third). With rescue_seen the line ends as the game's (51 alone at the end); off, 50 stays. Both twins
+## alike every tick.
+func _rescue_seen_case() -> void:
+	for variant in 6:
+		var on := variant < 3
+		var case: String = ["pickup first", "feeder first", "pickup only"][variant % 3]
+		rescue_seen = on
+		_fresh(BeltSim.EDGE_STOP)
+		rescue_seen = true
+		both("step_to", [0])
+		for u in range(1, 7):
+			var ex := Vector2i((u - 1) * 256, 2560)
+			var en := Vector2i(u * 256, 2560)
+			both("set_lane", [u * 8 + 1, BeltSim.STRAIGHT, 256, 8, ex, (ex + en) / 2, en, 0, 0])
+		var game := {50: 1100, 51: 1300}  # uid -> place along the line (0 its end)
+		for u in range(1, 7):
+			both("load_lane", [u * 8 + 1, 0, _game_lane(game, u)])
+		var where := "rescue seen (%s, rescue_seen %s)" % [case, on]
+		for t in range(1, 260):
+			var order: Array = game.keys()
+			order.sort_custom(func(a: int, b: int) -> bool: return int(game[a]) < int(game[b]))
+			var prev := -64
+			for u2: int in order:
+				game[u2] = mini(int(game[u2]), maxi(int(game[u2]) - 8, prev + 64))
+				prev = int(game[u2])
+			if t == 10:
+				if int(game[50]) < 768 or int(game[50]) >= 1024:
+					_fail(where, "the set-up's item 50 is at %d on tick 10, not on belt 4" % int(game[50]))
+					return
+				game.erase(50)
+			if t == 13:
+				# (The update as of tick 12: no `ie`, the hand past the bridge's radius.)
+				var keys: Array = [33, 41] if case == "pickup first" else ([41, 33] if case == "feeder first" else [33])
+				for key: int in keys:
+					both("load_lane", [key, 12, _game_lane(game, (key - 1) / 8)])
+			elif case == "pickup only" and t > 13 and t < 60 and (t - 13) % 8 == 0:
+				both("load_lane", [33, t - 1, _game_lane(game, 4)])
+			both("step_to", [t])
+			var ch: Dictionary = gd.take_changes()
+			var chn: Dictionary = nat.take_changes()
+			for k in STATE_KEYS:
+				if ch[k] != chn[k]:
+					_fail("%s tick %d" % [where, t], "take_changes %s: %s against %s" % [k, str(ch[k]).left(200), str(chn[k]).left(200)])
+					return
+			if not compare("%s tick %d" % [where, t]):
+				return
+		var left: PackedInt64Array = gd.items_state()[0]
+		if on:
+			if left.has(50) or not left.has(51) or gd.n_rescue_denied < 1:
+				_fail(where, "items left %s (the game: 51 alone), %d rescues denied" % [str(left), gd.n_rescue_denied])
+				return
+		elif not left.has(50):
+			_fail(where, "with rescue_seen off the taken item 50 should stay as before")
+			return
+	print("rescue seen: %d checks, %d differences" % [checked, fails])
 
 
 ## An underground's tunnel the bridge sends no next for (`lm` next 0, s272_out's lane 35360348): its exit beside

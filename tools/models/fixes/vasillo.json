@@ -1,0 +1,583 @@
+{
+	"about": "Fixes for Vasillo's export (models/Vasillo new/), run by tools/models/fix_pack.py. Measured on his export of the 0.2.2 cycle; see each entry's note. Openings: N/E/S/W = the sides a pipe piece reaches the tile's edge (+-0.5 from its tile centre; the closed sides stop at 0.45). Turns are clockwise seen from above (north -> east). Models not listed are copied unchanged, apart from the \"materials\" rules, which cover every model.",
+	"alpha_cutoff": 0.5,
+	"pack_json": {
+		"shading": "pbr",
+		"belt_lane_offset": 0.21,
+		"shading_models": {"transport-belt": "factorio", "transport-belt-*": "factorio", "splitter": "factorio"},
+		"belt_item_height": 0.25,
+		"note": "The owner's decision (0.2.2): his textured models are drawn as his files say, glTF PBR as Godot's own material draws it, without Factorio's top and side balance (pbr-rd: it held his drill at 0.73 of its base colour). docs/MODELLERS.md, pack.json's shading. belt_lane_offset 0.21 and belt_item_height 0.25: his belt's usable width and surface (belt-lane-inset, belt-item-height; once dropped by a re-run, dev-022-update7)."
+	},
+	"materials": {
+		"note": "Every model, listed or not. His export preset wires a blank emission picture with no emissiveFactor (glTF: no emission) on every material, and sets Alpha Blend with an alpha picture that is full almost everywhere. Unwired; BLEND made OPAQUE where the picture's alpha is full on every pixel, Alpha Clip where under 5% of pixels are below full; real glass (alpha below full everywhere) stays BLEND.",
+		"unwire_emission": true,
+		"alpha_by_picture": true,
+		"mask_share": 0.05,
+		"keep_blend": [
+			"Glass"
+		]
+	},
+	"recolour": {
+		"note": "None: his pictures as he made them. The rule (fix_pack.py recolour_materials) stays for a later pack. Ores: the owner leaves his ores' colours and metal as he made them, for him to adjust (vas-ore-undo). Pipes: his corner picture (mean linear brightness 0.209) is brighter than his straight (0.072), window straight (0.044), T (0.033) and cross (0.037); that is his paint, and Zenith draws a picture's metal as paint (metal-look), so they are left as he made them (vas-pipe-undo)."
+	},
+	"files": {
+		"long-handed-inserter": {
+			"note": "Factorio's name is long-handed-inserter (his first export: long-inserter; his re-export uses Factorio's).",
+			"out": [
+				{
+					"name": "long-handed-inserter"
+				}
+			]
+		},
+		"pipe": {
+			"note": "Straight. At the origin (his first export: tile centre at (3, 0), root at x 3, moved back by an offset). His re-export of 18 Nov (dev-022-update7) has every pipe piece at the origin: the old offsets, kept, put them 2-6 tiles off (pipes-lanes-fix). Openings N, S (34 vertices at each edge). Serves the lone pipe, both straights and (with pipe-cap) the endings and the single. Its mesh floats 0.05 above the ground as every pipe piece of his does (pipe-to-ground's included), kept so they line up.",
+			"out": [
+				{
+					"name": "pipe"
+				},
+				{
+					"name": "pipe-straight-vertical"
+				},
+				{
+					"name": "pipe-straight-horizontal",
+					"turn": 90
+				},
+				{
+					"name": "pipe-straight-vertical-single",
+					"add": [
+						{
+							"model": "pipe-cap",
+							"turn": 180,
+							"inside": true
+						},
+						{
+							"model": "pipe-cap",
+							"inside": true
+						}
+					]
+				},
+				{
+					"name": "pipe-ending-up",
+					"add": [
+						{
+							"model": "pipe-cap",
+							"inside": true
+						}
+					]
+				},
+				{
+					"name": "pipe-ending-right",
+					"turn": 90,
+					"add": [
+						{
+							"model": "pipe-cap",
+							"turn": 90,
+							"inside": true
+						}
+					]
+				},
+				{
+					"name": "pipe-ending-down",
+					"add": [
+						{
+							"model": "pipe-cap",
+							"turn": 180,
+							"inside": true
+						}
+					]
+				},
+				{
+					"name": "pipe-ending-left",
+					"turn": 90,
+					"add": [
+						{
+							"model": "pipe-cap",
+							"turn": 270,
+							"inside": true
+						}
+					]
+				}
+			]
+		},
+		"pipe-cap": {
+			"note": "Not a pipe shape: a cap 0.11 deep at the south edge (z 0.386 .. 0.5), the same 0.9 across as the tube, at the origin (his first export: the north edge, tile centre at (1, 0); each cap's turn below is half a turn on from then). His re-export of 18 Nov (dev-022-update7) has every pipe piece at the origin: the old offsets, kept, put them 2-6 tiles off (pipes-lanes-fix). Used only as a part: each ending is the full straight plus a cap at its far (closed) edge, the single a cap at both (R&D vas-rd section 5). Ending-up joins from the north, so its cap is at the south. Inside added wherever it is a part (vas-round3-code): its flat faces, the plate (62 of its 238 triangles), all face into the tube (+z) and none out, so from outside a lone pipe end Zenith (front faces only) culled the plate and only the bolts showed, floating in a ring. With the inside every cap triangle is also drawn from behind (238 back faces per cap). Measured with rays and back faces culled: the other pipe pieces are seen into only through their connected sides, which a neighbour closes, so only the cap gets one; the straights at an ending are closed by the cap.",
+			"out": []
+		},
+		"pipe-curve": {
+			"note": "Corner. At the origin (his first export: tile centre at (2, 0)). Openings N, E (35 vertices each), as exported = corner-up-right. His re-export of 18 Nov (dev-022-update7) has every pipe piece at the origin: the old offsets, kept, put them 2-6 tiles off (pipes-lanes-fix).",
+			"out": [
+				{
+					"name": "pipe-corner-up-right"
+				},
+				{
+					"name": "pipe-corner-down-right",
+					"turn": 90
+				},
+				{
+					"name": "pipe-corner-down-left",
+					"turn": 180
+				},
+				{
+					"name": "pipe-corner-up-left",
+					"turn": 270
+				}
+			]
+		},
+		"pipe-t": {
+			"note": "T. At the origin (his first export: tile centre at (5, 0)). Openings N, E, W, closed S (34 vertices at each open edge), as exported = t-up. His re-export of 18 Nov (dev-022-update7) has every pipe piece at the origin: the old offsets, kept, put them 2-6 tiles off (pipes-lanes-fix).",
+			"out": [
+				{
+					"name": "pipe-t-up"
+				},
+				{
+					"name": "pipe-t-right",
+					"turn": 90
+				},
+				{
+					"name": "pipe-t-down",
+					"turn": 180
+				},
+				{
+					"name": "pipe-t-left",
+					"turn": 270
+				}
+			]
+		},
+		"pipe-cross": {
+			"note": "Cross (his first export: ppe-cross, a typo). Already at the origin. Openings N, E, S, W (34 vertices each).",
+			"out": [
+				{
+					"name": "pipe-cross"
+				}
+			]
+		},
+		"pipe-alt": {
+			"note": "The straight with a window (glass in the middle): Factorio's straight_vertical_window and straight_horizontal_window pictures (R&D vas-rd section 4). At the origin (his first export: tile centre at (4, 0)), openings N, S like pipe. Its Glass (alpha 0.596 on every pixel) stays Alpha Blend. His re-export of 18 Nov (dev-022-update7) has every pipe piece at the origin: the old offsets, kept, put them 2-6 tiles off (pipes-lanes-fix).",
+			"out": [
+				{
+					"name": "pipe-straight-vertical-window"
+				},
+				{
+					"name": "pipe-straight-horizontal-window",
+					"turn": 90
+				}
+			]
+		},
+		"pipe-to-ground": {
+			"note": "At the origin, its root turned half a turn in the file (his first export: tile centre at (6, 0), root at x 6); the bounds' centre reads (0.00, -0.03) because the closed south end stops at 0.446. His re-export of 18 Nov (dev-022-update7) has every pipe piece at the origin: the old offsets, kept, put them 2-6 tiles off (pipes-lanes-fix). Opening N (35 vertices), Factorio's above-ground side for a north-facing pipe-to-ground. Lowest point already 0. Inside added (vas-preview-fix): its tube (160 of the 636 triangles) is one single-sided shell, every face outward and none inside, which Blender draws from both sides (Backface Culling off; glTF doubleSided) and Zenith from the front only, so its open north end, the one end no neighbour or cap closes in the preview and on an unconnected pipe-to-ground, was see-through: the far flange's bolts floating round a hole, half a wall. Every triangle is also drawn from behind (636 back faces, 1272 in all). The other pieces' open ends meet a neighbour or one of the preview's endings.",
+			"inside": true
+		},
+		"electric-mining-drill": {
+			"note": "Footprint already centred: the body spans x -1.5 .. 1.5 and z -1.5 .. 1.5 with its base at y 0; the 0.26 past the north edge (z to -1.757) is a full-width part at the front (y 0 .. 0.77), and the -0.227 below ground is the drill bit's tip (Drillbit bone), so no move. See-through materials become Alpha Clip.",
+			"offset": [
+				0,
+				0,
+				0
+			],
+			"mask": [
+				"Electric_Drill_Static",
+				"Electric_Drill_Moving"
+			]
+		},
+		"electric-mining-drill-liquid": {
+			"note": "The drill's fluid part, shown while it mines with a fluid (R&D vas-rd section 3): renamed, no move (x -1.5 .. 1.5, south at 1.5). Not used by Zenith yet. Its alpha material clipped like the drill's.",
+			"mask": [
+				"Electric_Drill_Liquid_Attachment"
+			],
+			"out": [
+				{
+					"name": "electric-mining-drill-wet"
+				}
+			]
+		},
+		"transport-belt": {
+			"mask": [
+				"Belt_Surface"
+			]
+		},
+		"transport-belt-start": {
+			"mask": [
+				"Belt_Surface"
+			]
+		},
+		"transport-belt-end": {
+			"mask": [
+				"Belt_Surface"
+			]
+		},
+		"transport-belt-curve-left": {
+			"mask": [
+				"Belt_Surface"
+			]
+		},
+		"transport-belt-curve-right": {
+			"mask": [
+				"Belt_Surface"
+			]
+		},
+		"underground-belt-input": {
+			"mask": [
+				"Belt_Surface"
+			]
+		},
+		"underground-belt-output": {
+			"mask": [
+				"Belt_Surface"
+			]
+		},
+		"splitter": {
+			"note": "His four rollers (Belt_Splitter_*_Roller*) stand turned -90 degrees about y, across the belt halves (x 0.08-0.92), but their actions key only a spin about z, which in glTF replaces that turn: from the first key they lay along the belt, two of them out of the body's front to z -0.92 (vas-splitter-fix). Each key put after the rest turn.",
+			"mask": [
+				"Belt_Surface"
+			],
+			"keep_rest_turn": [
+				"Belt_Splitter_Left_Roller1",
+				"Belt_Splitter_Left_Roller2",
+				"Belt_Splitter_Right_Roller1",
+				"Belt_Splitter_Right_Roller2"
+			]
+		},
+		"iron-plate": {
+			"note": "An item: into items/. Exported at (0, -0.9): moved to the origin, as items are drawn centred on their spot.",
+			"offset": [
+				0,
+				0,
+				0.9
+			],
+			"out": [
+				{
+					"name": "items/iron-plate"
+				}
+			]
+		},
+		"copper-plate": {
+			"note": "An item, exported at (-0.4, -0.9).",
+			"offset": [
+				0.4,
+				0,
+				0.9
+			],
+			"out": [
+				{
+					"name": "items/copper-plate"
+				}
+			]
+		},
+		"steel-plate": {
+			"note": "An item, exported at (0, -1.2).",
+			"offset": [
+				0,
+				0,
+				1.2
+			],
+			"out": [
+				{
+					"name": "items/steel-plate"
+				}
+			]
+		},
+		"stone-brick": {
+			"note": "An item, exported at (-0.8, -0.9).",
+			"offset": [
+				0.8,
+				0,
+				0.9
+			],
+			"out": [
+				{
+					"name": "items/stone-brick"
+				}
+			]
+		},
+		"iron-ore-1": {
+			"note": "Ores: numbered variants, one rock each, scattered per tile (R&D vas-rd section 2). Each exported somewhere else (up to 1.36 tiles off): centred on its own box in X and Z, Y kept (they sit on 0). coal and stone are Factorio's prototype names.",
+			"centre": true,
+			"out": [
+				{
+					"name": "iron-ore-1"
+				},
+				{
+					"name": "items/iron-ore-1"
+				}
+			],
+			"metal": 0
+		},
+		"iron-ore-2": {
+			"centre": true,
+			"out": [
+				{
+					"name": "iron-ore-2"
+				},
+				{
+					"name": "items/iron-ore-2"
+				}
+			],
+			"metal": 0
+		},
+		"iron-ore-3": {
+			"centre": true,
+			"out": [
+				{
+					"name": "iron-ore-3"
+				},
+				{
+					"name": "items/iron-ore-3"
+				}
+			],
+			"metal": 0
+		},
+		"copper-ore-1": {
+			"centre": true,
+			"out": [
+				{
+					"name": "copper-ore-1"
+				},
+				{
+					"name": "items/copper-ore-1"
+				}
+			],
+			"metal": 0
+		},
+		"copper-ore-2": {
+			"centre": true,
+			"out": [
+				{
+					"name": "copper-ore-2"
+				},
+				{
+					"name": "items/copper-ore-2"
+				}
+			],
+			"metal": 0
+		},
+		"copper-ore-3": {
+			"centre": true,
+			"out": [
+				{
+					"name": "copper-ore-3"
+				},
+				{
+					"name": "items/copper-ore-3"
+				}
+			],
+			"metal": 0
+		},
+		"advanced-circuit": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/advanced-circuit"
+				}
+			],
+			"note": "Items from his 'Items Added' push (dev c1270abc): each exported somewhere else (up to 1.9 tiles off), centred on its own box in X and Z, Y kept, into items/."
+		},
+		"automation-science-pack": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/automation-science-pack"
+				}
+			]
+		},
+		"chemical-science-pack": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/chemical-science-pack"
+				}
+			]
+		},
+		"copper-cable": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/copper-cable"
+				}
+			]
+		},
+		"electronic-circuit": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/electronic-circuit"
+				}
+			]
+		},
+		"iron-gear-wheel": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/iron-gear-wheel"
+				}
+			]
+		},
+		"logistic-science-pack": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/logistic-science-pack"
+				}
+			]
+		},
+		"military-science-pack": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/military-science-pack"
+				}
+			]
+		},
+		"plastic-bar": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/plastic-bar"
+				}
+			]
+		},
+		"processing-unit": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/processing-unit"
+				}
+			]
+		},
+		"sulfur-1": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/sulfur-1"
+				}
+			],
+			"metal": 0
+		},
+		"sulfur-2": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/sulfur-2"
+				}
+			],
+			"metal": 0
+		},
+		"sulfur-3": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/sulfur-3"
+				}
+			],
+			"metal": 0
+		},
+		"uranium-ore-1": {
+			"note": "Uranium ore rocks (his 'Items Added' push), scattered like the other ores by uranium's own stages: centred on their own box in X and Z.",
+			"centre": true,
+			"out": [
+				{
+					"name": "uranium-ore-1"
+				},
+				{
+					"name": "items/uranium-ore-1"
+				}
+			],
+			"metal": 0
+		},
+		"uranium-ore-2": {
+			"centre": true,
+			"out": [
+				{
+					"name": "uranium-ore-2"
+				},
+				{
+					"name": "items/uranium-ore-2"
+				}
+			],
+			"metal": 0
+		},
+		"uranium-ore-3": {
+			"centre": true,
+			"out": [
+				{
+					"name": "uranium-ore-3"
+				},
+				{
+					"name": "items/uranium-ore-3"
+				}
+			],
+			"metal": 0
+		},
+		"coal-1": {
+			"centre": true,
+			"out": [
+				{
+					"name": "coal-1"
+				},
+				{
+					"name": "items/coal-1"
+				}
+			],
+			"metal": 0
+		},
+		"coal-2": {
+			"centre": true,
+			"out": [
+				{
+					"name": "coal-2"
+				},
+				{
+					"name": "items/coal-2"
+				}
+			],
+			"metal": 0
+		},
+		"coal-3": {
+			"centre": true,
+			"out": [
+				{
+					"name": "coal-3"
+				},
+				{
+					"name": "items/coal-3"
+				}
+			],
+			"metal": 0
+		},
+		"stone-1": {
+			"centre": true,
+			"out": [
+				{
+					"name": "stone-1"
+				},
+				{
+					"name": "items/stone-1"
+				}
+			],
+			"metal": 0
+		},
+		"stone-2": {
+			"centre": true,
+			"out": [
+				{
+					"name": "stone-2"
+				},
+				{
+					"name": "items/stone-2"
+				}
+			],
+			"metal": 0
+		},
+		"stone-3": {
+			"centre": true,
+			"out": [
+				{
+					"name": "stone-3"
+				},
+				{
+					"name": "items/stone-3"
+				}
+			],
+			"metal": 0
+		}
+	}
+}

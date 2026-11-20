@@ -326,6 +326,7 @@ func _ready() -> void:
 	model.character_info_changed.connect(_refresh_info)
 
 	model.inventory_changed.connect(_refresh)
+	model.shown_changed.connect(_refresh)  # L2: builds sent count out at once
 	model.guns_changed.connect(_refresh)
 	visibility_changed.connect(func() -> void:
 		if _stale and is_visible_in_tree():
@@ -867,7 +868,7 @@ func _refresh() -> void:
 		_stale = true
 		return
 	_stale = false
-	var slots := model.main_slots
+	var slots := model.shown_main_slots()  # less the builds sent the bridge hasn't reported yet (L2)
 	while _grid.get_child_count() < slots.size():
 		_grid.add_child(_new_slot("main", _grid.get_child_count() + 1))
 	while _grid.get_child_count() > slots.size():
@@ -913,7 +914,7 @@ func _show(s: Slot, role: String, index: int, stack: Dictionary) -> void:
 	s.drag_item = item if role == "main" else ""
 	var lines: Array = []
 	if role == "main":
-		lines.append(["%d in this slot, %d in the inventory" % [n, model.count_of(item)]])
+		lines.append(["%d in this slot, %d in the inventory" % [n, model.shown_count_of(item)]])
 		lines.append(["Click: pick up · Right click: pick up half", "", Kit.DISABLED_TEXT])
 		lines.append(["1-0 or drag to the quickbar: pin it", "", Kit.DISABLED_TEXT])
 	elif role == "guns":

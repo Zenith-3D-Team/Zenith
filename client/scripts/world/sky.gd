@@ -161,6 +161,12 @@ const WATER_SKY := Color(0.5, 0.62, 0.72)
 ## Lightning on Fulgora: seconds between strikes at night.
 const LIGHTNING_GAP := Vector2(3.0, 12.0)
 
+## --sun-step=<degrees>, for measuring only (0, the default: smooth): the sun's light holds its pitch
+## and yaw until the sun has moved more than this from where it was last put, then jumps there. The
+## shadow map is only rasterised anew when the light turns; this measures whether resting it helps
+## the shadows' crawl (shadows-bp.md: a step that doesn't pop is as frequent as smooth). The sky's
+## sun, `state` and the passes stay smooth.
+static var sun_step := _sun_step_arg()
 static var _shape_tex: Texture2D
 static var _detail_tex: Texture2D
 static var _loading := false
@@ -184,11 +190,50 @@ var _clouds_forced_off := false
 ## sets them each frame). A look can have a setting sun in the sky over a light held still.
 var twilight := 0.0
 var sky_twilight := 0.0
+## Where the look in use wants the noon sun (its sun_noon_yaw; main.gd sets it each frame): YAW_NOON unless it says.
+var noon_yaw := YAW_NOON
 ## This frame's sun for looks and add-ons (looks.gd, api.shaders.sun()): elevation (degrees), height
 ## (its sine), twilight (0-1, as the look asked), morning, direction (towards the sun), color,
 ## ambient, fog (the sky's colour on the sun's side).
 var state := {}
 var _water_tint := Color(-1.0, 0.0, 0.0)  # none yet: the shared material may hold the last game's
+## The light's rotation last put, with --sun-step (null: none yet).
+var _held_sun: Variant = null
+var _sky_cache := {}
+
+
+func _set_sky_param(key: String, val: Variant) -> void:
+	if _sky_cache.has(key):
+		var prev: Variant = _sky_cache[key]
+		if val is float and prev is float and absf(float(val) - float(prev)) <= 1e-4:
+			return
+		if val is Vector3 and prev is Vector3 and (val as Vector3).distance_squared_to(prev as Vector3) <= 1e-8:
+			return
+		if val is Color and prev is Color:
+			var c: Color = val
+			var p: Color = prev
+			if absf(c.r - p.r) <= 1e-4 and absf(c.g - p.g) <= 1e-4 and absf(c.b - p.b) <= 1e-4 and absf(c.a - p.a) <= 1e-4:
+				return
+	_sky_cache[key] = val
+	sky_material.set_shader_parameter(key, val)
+
+
+static func _sun_step_arg() -> float:
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with("--sun-step="):
+			return maxf(float(arg.get_slice("=", 1)), 0.0)
+	return 0.0
+
+
+## The light's rotation (degrees) with a step: `held` (null: none yet) until `want` points more than
+## `step` degrees away from it, then `want`. Step 0 is `want` always.
+static func stepped_sun(held: Variant, want: Vector3, step: float) -> Vector3:
+	if step <= 0.0 or held == null:
+		return want
+	var was: Vector3 = held
+	var a := Basis.from_euler(was * (PI / 180.0)).z
+	var b := Basis.from_euler(want * (PI / 180.0)).z
+	return want if rad_to_deg(a.angle_to(b)) > step else was
 
 
 func _ready() -> void:
@@ -224,6 +269,7 @@ func _exit_tree() -> void:
 	_shape_tex = null
 	_detail_tex = null
 	_loading = false
+	_sky_cache.clear()
 	sky_material.set_shader_parameter("cloud_shape", null)
 	sky_material.set_shader_parameter("cloud_detail", null)
 	_shadow_material.set_shader_parameter("cloud_shape", null)
@@ -251,10 +297,13 @@ static func sun_elevation(daytime: float, night: float) -> float:
 
 
 ## Which way the sun is (light yaw, degrees): swinging out to the side it rises or sets on as it
-## gets lower. The same at noon either way, and at night nobody sees it.
-static func sun_yaw(elevation: float, morning: bool) -> float:
+## gets lower. The same at noon either way, and at night nobody sees it. `noon`: where it stands at
+## noon (a look's sun_noon_yaw); it still rises in the east and sets in the west, each the short way
+## round from there (a noon in the north crosses the north).
+static func sun_yaw(elevation: float, morning: bool, noon := YAW_NOON) -> float:
 	var t := clampf((E_NOON - elevation) / E_NOON, 0.0, 1.0)
-	return lerpf(YAW_NOON, YAW_RISE if morning else YAW_SET, t)
+	var end := YAW_RISE if morning else YAW_SET
+	return lerpf(noon, noon + wrapf(end - noon, -180.0, 180.0), t)
 
 
 ## How much air the sun's light crosses against straight up (Kasten and Young's formula).
@@ -290,11 +339,11 @@ static func _through(day: Color, pair: Array, night: Color, w: Vector3) -> Color
 ## a look has a `twilight`. Pure, so it can be checked. The light leaves as the sun reaches the
 ## horizon and comes back as the moon from the other side of the sky: the swap happens with no light
 ## at all, so nothing pops.
-static func sun_model(p: Dictionary, daytime: float, night: float) -> Dictionary:
+static func sun_model(p: Dictionary, daytime: float, night: float, noon := YAW_NOON) -> Dictionary:
 	var day := fposmod(daytime, 1.0)
 	var morning := day > 0.5
 	var e := sun_elevation(day, night)
-	var yaw := sun_yaw(e, morning)
+	var yaw := sun_yaw(e, morning, noon)
 	var w := _phases(e)
 	var tw: Dictionary = p["twilight"]
 	if morning and p.has("dawn"):
@@ -361,12 +410,12 @@ func set_planet(name: String) -> void:
 		name = _forced_planet
 	planet = name if PLANETS.has(name) else "nauvis"
 	_p = PLANETS[planet]
-	sky_material.set_shader_parameter("cloud_cover", float(_p["cover"]))
+	_set_sky_param("cloud_cover", float(_p["cover"]))
 	_shadow_material.set_shader_parameter("cloud_cover", float(_p["cover"]))
 	var hz: Array = _p.get("haze_colors", [Color.WHITE, Color.WHITE])
 	_shadow_material.set_shader_parameter("haze_color", hz[0])
 	_shadow_material.set_shader_parameter("haze_color2", hz[1])
-	sky_material.set_shader_parameter("haze_color", hz[0].lerp(_pair("horizon", 0.0), 0.5))
+	_set_sky_param("haze_color", hz[0].lerp(_pair("horizon", 0.0), 0.5))
 
 
 func set_clouds(on: bool) -> void:
@@ -379,9 +428,10 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 	# No dusk on a platform, whatever the planet below is doing.
 	var warm := 0.0 if space else clampf(twilight, 0.0, 1.0)
 	var sky_warm := 0.0 if space else clampf(sky_twilight, 0.0, 1.0)
-	var m := sun_model(_p, daytime, night)
+	var m := sun_model(_p, daytime, night, noon_yaw)
 	var high := clampf(cos(TAU * daytime) * 0.5 + 0.5, 0.0, 1.0)  # 1 at noon, 0 at midnight
-	sun.rotation_degrees = Vector3(-lerpf(20.0, 60.0, high), -30.0 + 60.0 * sin(TAU * daytime), 0.0)
+	# The look's noon side here too (a look with no sunset, or its slider at 0); YAW_NOON (-30) without one, as before.
+	sun.rotation_degrees = Vector3(-lerpf(20.0, 60.0, high), noon_yaw + 60.0 * sin(TAU * daytime), 0.0)
 	sun.light_energy = lerpf(_p["sun_energy"][0], _p["sun_energy"][1], night)
 	sun.light_color = _pair("sun", night)
 	env.ambient_light_energy = lerpf(_p["ambient_energy"][0], _p["ambient_energy"][1], night)
@@ -410,6 +460,10 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 	if not _loaded.is_empty():
 		_take_loaded()
 	var to_sun := sun.global_transform.basis.z.normalized()
+	if sun_step > 0.0:
+		# The light alone steps; to_sun above (the sky, state, the passes) stays smooth.
+		_held_sun = stepped_sun(_held_sun, sun.rotation_degrees, sun_step)
+		sun.rotation_degrees = _held_sun
 	var sky_sun := to_sun
 	var sun_color := sun.light_color
 	if sky_warm > 0.0:
@@ -431,28 +485,28 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 	_shadow_quad.visible = not space and clouds_on and (shadow_strength > 0.0 or haze_strength > 0.0)
 	if space:
 		return
-	sky_material.set_shader_parameter("zenith_color", zenith)
-	sky_material.set_shader_parameter("horizon_color", horizon)
-	sky_material.set_shader_parameter("horizon_sun_color", sun_side)
-	sky_material.set_shader_parameter("ground_color", horizon * 0.45)
-	sky_material.set_shader_parameter("sun_dir", sky_sun)
-	sky_material.set_shader_parameter("sun_color", sun_color)
+	_set_sky_param("zenith_color", zenith)
+	_set_sky_param("horizon_color", horizon)
+	_set_sky_param("horizon_sun_color", sun_side)
+	_set_sky_param("ground_color", horizon * 0.45)
+	_set_sky_param("sun_dir", sky_sun)
+	_set_sky_param("sun_color", sun_color)
 	var old_strength := clampf(to_sun.y * 4.0, 0.0, 1.0) * (1.0 - night)
-	sky_material.set_shader_parameter("sun_strength", float(m["sun_strength"]) if sky_warm > 0.0 else old_strength)
-	sky_material.set_shader_parameter("twilight", float(m["twilight"]) * sky_warm)
-	sky_material.set_shader_parameter("belt_color", m["belt"])
-	sky_material.set_shader_parameter("belt", float(m["belt_strength"]) * sky_warm)
+	_set_sky_param("sun_strength", float(m["sun_strength"]) if sky_warm > 0.0 else old_strength)
+	_set_sky_param("twilight", float(m["twilight"]) * sky_warm)
+	_set_sky_param("belt_color", m["belt"])
+	_set_sky_param("belt", float(m["belt_strength"]) * sky_warm)
 	var old_stars := smoothstep(0.4, 0.9, night)
-	sky_material.set_shader_parameter("stars", float(_p["stars"]) * (float(m["stars"]) if sky_warm > 0.0 else old_stars))
-	sky_material.set_shader_parameter("haze", float(_p["haze"]) * 6.0)
+	_set_sky_param("stars", float(_p["stars"]) * (float(m["stars"]) if sky_warm > 0.0 else old_stars))
+	_set_sky_param("haze", float(_p["haze"]) * 6.0)
 	# Water follows the sky: its colour only in a look with no sunset, the warm horizon in one with.
 	var water_sky := horizon.lerp(sun_side, 0.7 * float(m["twilight"]) * warm)
 	var tint := water_tint(water_sky, _p["horizon"][0])
 	if not tint.is_equal_approx(_water_tint):
 		_water_tint = tint
 		Visuals.water_material().set_shader_parameter("sky_tint", tint)
-	sky_material.set_shader_parameter("flash", _flash)
-	sky_material.set_shader_parameter("cloud_alpha", (0.85 - 0.25 * night) if cloudy else 0.0)
+	_set_sky_param("flash", _flash)
+	_set_sky_param("cloud_alpha", (0.85 - 0.25 * night) if cloudy else 0.0)
 	# Lit by the sun by day, grey-blue shapes against the night sky.
 	var cc: Array = _p["clouds"]
 	var lit := lerpf(1.0, 0.12, night)
@@ -464,8 +518,8 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 		var lit_sun := Color(cc[0].r * sun_color.r, cc[0].g * sun_color.g, cc[0].b * sun_color.b) * low_lit
 		cloud_color = cloud_color.lerp(lit_sun, sky_warm)
 		cloud_shade = cloud_shade.lerp(zenith.lerp(horizon, 0.5) * lerpf(0.5, 1.0, low_lit), sky_warm)
-	sky_material.set_shader_parameter("cloud_color", cloud_color)
-	sky_material.set_shader_parameter("cloud_shade", cloud_shade)
+	_set_sky_param("cloud_color", cloud_color)
+	_set_sky_param("cloud_shade", cloud_shade)
 	if _shadow_quad.visible:
 		_shadow_material.set_shader_parameter("sun_dir", to_sun)
 		_shadow_material.set_shader_parameter("shadow_strength", shadow_strength)

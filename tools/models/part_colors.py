@@ -70,10 +70,10 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-MODELS = os.path.join(REPO, "client", "assets", "models")
 ENTRIES = os.path.join(REPO, "client", "data", "sprite_projection.json")
 sys.path.append(os.path.dirname(HERE))
 import factorio_install  # noqa: E402
+import packs  # noqa: E402  (ours: placeholders and wube3dp; FUE5's wear their own textures)
 FACTORIO = factorio_install.install()
 
 SIN, COS = math.sin(math.radians(48.0)), math.cos(math.radians(48.0))
@@ -896,7 +896,7 @@ def colours_for(name, entries, sprites, opts=None):
     corner colours or None), or None when no picture could be sampled. opts: the model's tuning
     (overrides_for)."""
     opts = overrides_for(name) if opts is None else opts
-    glb = Glb(os.path.join(MODELS, name + ".glb"))
+    glb = Glb(packs.model_path(name))
     model = Model(glb, float(opts.get("crease", CREASE)), opts.get("merge_materials", ()))
     entry = entries.get(opts.get("entry", name))
     if entry is None:
@@ -984,7 +984,7 @@ def apply_forced(model, colour, owed, opts, grade=(1.0, 1.0)):
 
 def forced_only(name, opts):
     """A model without a sprite to sample: its palette, with the override's forced colours."""
-    model = Model(Glb(os.path.join(MODELS, name + ".glb")), float(opts.get("crease", CREASE)),
+    model = Model(Glb(packs.model_path(name)), float(opts.get("crease", CREASE)),
                   opts.get("merge_materials", ()))
     model.free = False
     colour = np.array([model.palette[m] for m in model.patch_material])
@@ -1147,7 +1147,7 @@ def from_lab(lab):
 
 def donor_colours(name, donor_model, donor_colour):
     """Per-material average colours from a donor model, for a model without a sprite entry."""
-    glb = Glb(os.path.join(MODELS, name + ".glb"))
+    glb = Glb(packs.model_path(name))
     model = Model(glb)
     names = donor_model.material_names
     by_name = {}
@@ -1360,10 +1360,9 @@ def main(argv):
         print("no Factorio install at %s (--factorio)" % args.factorio)
         return 1
     sprites = Sprites(args.factorio)
-    names = args.names or sorted(n for n in entries if "." not in n and os.path.exists(os.path.join(MODELS, n + ".glb")))
+    names = args.names or sorted(n for n in entries if "." not in n and os.path.exists(packs.model_path(n)))
     if not args.names:  # and the models without an entry that an override colours
-        names += sorted(n[:-4] for n in os.listdir(MODELS) if n.endswith(".glb") and n[:-4] not in entries
-                        and n[:-4] not in DONORS and overrides_for(n[:-4]))
+        names += sorted(n for n in packs.names() if n not in entries and n not in DONORS and overrides_for(n))
     names += [] if args.names else sorted(DONORS)
     done = {}
     fits = []
@@ -1372,7 +1371,7 @@ def main(argv):
     skins_path = os.path.join(REPO, "client", "data", "creature_skins.json")
     skinned = list(json.load(open(skins_path, encoding="utf-8"))) if os.path.exists(skins_path) else []
     for name in names:
-        path = os.path.join(MODELS, name + ".glb")
+        path = packs.model_path(name)
         if not os.path.exists(path):
             continue
         if any(name == f or name.startswith(f + "-") for f in skinned) and not args.check:

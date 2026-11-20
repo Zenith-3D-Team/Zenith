@@ -57,6 +57,7 @@ sys.path.insert(0, HERE)
 import creature_gait as cg  # noqa: E402
 import creature_score as cs  # noqa: E402
 import creature_skin as sk  # noqa: E402
+import packs  # noqa: E402
 import part_colors as pc  # noqa: E402
 import turntable as tt  # noqa: E402
 import turntable_anim as ta  # noqa: E402
@@ -212,7 +213,7 @@ class Skin(sk.Skin):
 
     def __init__(self, name, path=None):
         self.name = name
-        self.glb = pc.Glb(path or os.path.join(tt.MODELS, name + ".glb"))
+        self.glb = pc.Glb(path or packs.model_path(name))
         self.model = pc.Model(self.glb)
         self.rest = self.model.tris.copy()
         self.T = len(self.model.tris)
@@ -557,7 +558,7 @@ def write_skin(skin, spec, legs=None, check=False):
 def copy_skin(corners, extra, source, name):
     """A pose model of a walking one (creature_pose.py: the same triangles in the same order) takes
     its skin."""
-    path = os.path.join(tt.MODELS, name + ".glb")
+    path = packs.model_path(name)
     if not os.path.exists(path):
         return
     glb = pc.Glb(path)
@@ -596,7 +597,8 @@ def stored_corners(glb, m=None):
 
 
 def mask_corners(glb, m):
-    """(T, 3, 2) COLOR_0's (shade, cover) per corner (skin_mode 2's mask)."""
+    """(T, 3, 2) COLOR_0's (shade, cover) per corner (skin_mode 2's mask): (1, 1, 1), where the mask
+    doesn't reach, as none (the client takes the blue off red and green)."""
     out = np.zeros((len(m.tris), 3, 2))
     for k, (_mi, _pi, prim) in enumerate(m.prims):
         sel = np.nonzero(m.prim_of == k)[0]
@@ -604,7 +606,9 @@ def mask_corners(glb, m):
         if "COLOR_0" not in a:
             continue
         col = glb.accessor(a["COLOR_0"])
-        v = np.stack([4.0 * col[:, 0] ** 2, col[:, 1]], axis=1)
+        blue = col[:, 2] if col.shape[1] > 2 else 0.0
+        r, g = np.maximum(col[:, 0] - blue, 0.0), np.maximum(col[:, 1] - blue, 0.0)
+        v = np.stack([4.0 * r ** 2, g], axis=1)
         out[sel] = v[m.corner_vert[sel]]
     return out
 
@@ -721,7 +725,7 @@ def shots(name, spec, out_dir, before_dir, tint=None):
     paths = []
     if before_dir and os.path.exists(os.path.join(before_dir, name + ".glb")):
         paths.append(("before", os.path.join(before_dir, name + ".glb"), True))
-    paths.append(("after", os.path.join(tt.MODELS, name + ".glb"), False))
+    paths.append(("after", packs.model_path(name), False))
     views = {}
     for label, path, old in paths:
         keep = []
@@ -779,7 +783,7 @@ def main(argv):
     for name in names:
         spec = table[name]
         # Scores of older copies read those; pictures and the rest the models in the repo.
-        path = os.path.join(before if before and score_only and not shot_dir else tt.MODELS, name + ".glb")
+        path = os.path.join(before, name + ".glb") if before and score_only and not shot_dir else packs.model_path(name)
         if not os.path.exists(path):
             print("%s: no model" % name)
             continue

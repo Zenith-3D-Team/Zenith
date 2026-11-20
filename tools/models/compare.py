@@ -49,13 +49,12 @@ import numpy as np
 from mathutils import Matrix, Vector
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import kit  # noqa: E402
+import packs  # noqa: E402
 import specs  # noqa: E402
 
-MODELS_DIR = os.path.join(REPO, "client", "assets", "models")
 FACTORIO_PITCH = 48.0   # degrees below the horizon
 FACTORIO_ANCHOR_Z = 0.3  # tiles above the ground that the entity's position marks
 BACKGROUND = (0.16, 0.22, 0.12)
@@ -399,7 +398,7 @@ def main():
 
     kit.clear_scene()
     scene = bpy.context.scene
-    load_model(opts.get("glb") or os.path.join(MODELS_DIR, name + ".glb"), float(opts["rot"]),
+    load_model(opts.get("glb") or packs.model_path(name), float(opts["rot"]),
                float(opts["head"]), float(opts["stretch"]), float(opts["model-scale"]),
                opts.get("keep-upright") == "1", "palette" not in opts,
                tuple(float(v) for v in opts.get("offset", "0,0").split(",")))

@@ -402,6 +402,8 @@ record_of = function(entity, t, id)
     if arrows then
       x = x or {}
       x.fa = arrows
+      -- Which fluid each connection takes or gives (L10).
+      x.fc = alt_mode.connections(entity)
     end
     alt_mode.recorded(entity, icon, x, arrows)
   end
@@ -1356,9 +1358,64 @@ local function snap_price(job)
   return DECORATIVE_PRICE
 end
 
+-- A snapshot's frames for a wire version 3 client (docs/PROTOCOL.md, "Binary frames"): `chunk` (kind 19) with
+-- its tiles' runs as a block, then each `ents` part (kind 20): the records' five numbers as one block, the
+-- indexes of those with extras as another, and their extras as JSON text after them (transport.json_object,
+-- as chunk_text writes them). Made whole before any is sent; throws when string.pack refuses a number.
+local function snapshot_frames(job, parts)
+  local records = job.records
+  local out = { string.pack("<i4i4I4I4I4I4", job.cx, job.cy, parts, job.si, job.rev, job.count) }
+  transport.pack_block(out, job.tiles)
+  local frames = { concat(out) }
+  local head = string.pack("<i4i4", job.cx, job.cy)
+  for part = 1, parts do
+    local flat, xi, extras = {}, {}, {}
+    local first = (part - 1) * ENTITIES_PER_MESSAGE + 1
+    local n = 0
+    for i = first, math.min(part * ENTITIES_PER_MESSAGE, #records) do
+      local rec = records[i]
+      flat[n + 1], flat[n + 2], flat[n + 3], flat[n + 4], flat[n + 5] = rec[1], rec[2], rec[3], rec[4], rec[5]
+      n = n + 5
+      local x = rec[6]
+      if x then
+        xi[#xi + 1] = i - first
+        extras[#extras + 1] = transport.json_object(x)
+      end
+    end
+    local tail = #extras > 0 and "[" .. concat(extras, ",") .. "]" or ""
+    out = { head, string.pack("<I4I4", part, parts) }
+    transport.pack_block(out, flat)
+    transport.pack_block(out, xi)
+    out[#out + 1] = string.pack("<I4", #tail)
+    out[#out + 1] = tail
+    frames[part + 1] = concat(out)
+  end
+  return frames
+end
+
 local function send_snapshot(job)
   local records = job.records
   local parts = math.max(1, math.ceil(#records / ENTITIES_PER_MESSAGE))
+  if job.bin then
+    if transport.binary(3) then
+      local ok, frames = pcall(snapshot_frames, job, parts)
+      if ok then
+        transport.send_reliable_frame(transport.KIND_CHUNK, "chunk", frames[1], 3)
+        for part = 1, parts do
+          transport.send_reliable_frame(transport.KIND_ENTS, "ents", frames[part + 1], 3)
+        end
+        return
+      end
+    end
+    -- (string.pack refused a number, or the client reads no binary now: the same as text, below.)
+    job.bin = nil
+    if job.text then
+      job.tiles = concat(job.tiles, ",")
+      for i = 1, #records do
+        records[i] = M.record_text(records[i])
+      end
+    end
+  end
   if job.text then
     -- (chunk_text: the tiles and records are text already, made in the job's slices.)
     local at = ',"cx":' .. job.cx .. ',"cy":' .. job.cy
@@ -1434,7 +1491,7 @@ local function snapshot_step(surface, s)
   end
   if job.step == 0 then
     job.tiles = read_tiles(surface, x0, y0)
-    if job.text then
+    if job.text and not job.bin then
       job.tiles = concat(job.tiles, ",")
     end
     job.step = 1
@@ -1454,7 +1511,7 @@ local function snapshot_step(surface, s)
       end
     end
     -- An entity overlapping several chunks (or strips) belongs to the one containing its centre.
-    local records, text = job.records, job.text
+    local records, text = job.records, job.text and not job.bin
     for _, e in pairs(found) do
       local p = e.position
       if p.x >= x0 and p.x < x0 + CHUNK and p.y >= ya and p.y < yb then
@@ -1644,8 +1701,10 @@ function M.tick()
       local k = M.take_next()
       local c = s.subs[k]
       if c then
-        -- (text: written as JSON text in its slices, perf.lua chunk_text; a job keeps the way it began.)
-        s.snap = { k = k, cx = c[1], cy = c[2], step = -1, text = perf.on("chunk_text") or nil }
+        -- (text: written as JSON text in its slices, perf.lua chunk_text; bin: kept as numbers for a client of
+        -- wire version 3, its snapshot sent as binary frames, send_snapshot. A job keeps the way it began.)
+        s.snap = { k = k, cx = c[1], cy = c[2], step = -1, text = perf.on("chunk_text") or nil,
+          bin = transport.binary(3) or nil }
       end
     end
     if s.snap then

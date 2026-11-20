@@ -83,14 +83,23 @@ inline double yaw_for(i64 seed) {
 
 // item_cards.gd lattice_turn (belt_path.gdshaderinc belt_lattice_turn): a packed lane's item's turn from who
 // it is along its run (its low 20 bits) and the run's seed, without a pile's copies.
-inline double lattice_turn(i64 who, i64 run) {
+inline uint32_t lattice_hash(i64 who, i64 run) {
 	uint32_t x = (uint32_t)(who & 0xFFFFF) + (uint32_t)run * 2654435769u;
 	x = x ^ (x >> 16);
 	x = x * 2146121005u;
 	x = x ^ (x >> 15);
 	x = x * 2221713035u;
 	x = x ^ (x >> 16);
-	return ((double)(x % 2001u) / 1000.0 - 1.0) * MAX_YAW;
+	return x;
+}
+
+inline double lattice_turn(i64 who, i64 run) {
+	return ((double)(lattice_hash(who, run) % 2001u) / 1000.0 - 1.0) * MAX_YAW;
+}
+
+// item_cards.gd lattice_variant (belt_path.gdshaderinc belt_lattice_variant): which of `count` model variants.
+inline i64 lattice_variant(i64 who, i64 run, i64 count) {
+	return count < 2 ? 0 : (i64)((lattice_hash(who, run) >> 8) % (uint32_t)count);
 }
 
 template <class P, class T>

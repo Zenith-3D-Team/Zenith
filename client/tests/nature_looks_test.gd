@@ -10,11 +10,14 @@ extends SceneTree
 
 const NatureLooks := preload("res://scripts/world/nature_looks.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const ModelLods := preload("res://scripts/world/model_lods.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const LeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
 const SolidShader := preload("res://shaders/factorio_material.gdshader")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
 const TestEnv := preload("res://tests/test_env.gd")
+const Looks := preload("res://scripts/world/looks.gd")
+const FarChunks := preload("res://scripts/world/far_chunks.gd")
 
 var fails := 0
 
@@ -37,10 +40,35 @@ func _init() -> void:
 	_placed()
 	_synthetic_atlas()
 	_shader()
+	_matte()
 	_synthetic_grain()
 	_dressed(dump)
+	# Loading the trees starts their leaf atlases and grain on workers, which _dressed waits for only
+	# with an install. Without one Godot quit with them still running and crashed on its way out, after
+	# PASS (CI's exit code; 0xC0000005 on Windows): waited for here, as world.gd does when the game quits.
+	NatureLooks.finish_all()
+	ModelLods.finish_all()
 	print("nature_looks_test: %s" % ("PASS" if fails == 0 else "FAILS %d" % fails))
 	quit(1 if fails else 0)
+
+
+## The trees' matte switch (--tree-sheen=old) reaches the shaders' global while running, and the far merged
+## mesh's trees and plants get a material of their own with the matte on, buildings' staying as they were.
+func _matte() -> void:
+	var was := Looks.tree_sheen_old
+	Looks.tree_sheen_old = false
+	check(is_equal_approx(Looks.tree_matte_value(), 1.0), "tree matte 1 by default")
+	Looks.tree_sheen_old = true
+	check(is_equal_approx(Looks.tree_matte_value(), 0.0), "--tree-sheen=old: the value is 0")
+	Looks.put_tree_matte()  # the call the running paths make (_ready, _put_on, put_idle_globals): no error
+	Looks.put_idle_globals({})
+	Looks.tree_sheen_old = was
+	Looks.put_tree_matte()
+	var nat := FarChunks.nature_material()
+	var bld := FarChunks.material()
+	check(nat != bld and nat.shader == bld.shader, "far trees' material is its own, on the merged shader")
+	check(bool(nat.get_shader_parameter("nature")), "far trees' material has nature on")
+	check(not bool(bld.get_shader_parameter("nature") if bld.get_shader_parameter("nature") != null else false), "far buildings' material has nature off")
 
 
 func _data() -> void:

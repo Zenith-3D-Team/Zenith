@@ -564,7 +564,7 @@ func _on_chunks() -> void:
 				phase = d[1]
 				offset = gap
 				match_d = d
-		# The sent movement assumes 60 UPS and leaves out a travelling platform's own drift, so
+		# G2: the sent movement assumes 60 UPS and leaves out a travelling platform's own drift, so
 		# moving a chunk on by it left a gap at every update, closed six times a second (a stutter).
 		# A chunk seen before moves on by how far it really went between updates, smoothed.
 		if not match_d.is_empty() and since > 0.05:

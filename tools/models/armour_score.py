@@ -30,6 +30,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import packs  # noqa: E402
 import turntable as tt  # noqa: E402
 import turntable_anim as ta  # noqa: E402
 
@@ -71,7 +72,7 @@ def plates(name, fitter):
     level = LEVEL[name]
     addon = [[tt.frame_canvas([ta.sp_layer("character/%s.png" % n, w, h, sh, FRAMES, d * FRAMES)
                                for n, w, h, sh in LAYERS[("idle", level)]])[..., 3] > 0.5 for d in range(8)]]
-    scene = trimesh.load(os.path.join(tt.MODELS, name + ".glb"), force="scene")
+    scene = trimesh.load(packs.model_path(name), force="scene")
     tris, flag = [], []
     for node in scene.graph.nodes_geometry:
         transform, geom = scene.graph[node]
@@ -92,7 +93,7 @@ def score(name, pictures=False):
     level = LEVEL[name]
     idle = masks_for(layers("idle", level), 8, 1)
     run = masks_for(layers("run", level), 8, FRAMES)
-    pts, uv, _col, tris, tcol, tuv = ta.load_points(os.path.join(tt.MODELS, name + ".glb"))
+    pts, uv, _col, tris, tcol, tuv = ta.load_points(packs.model_path(name))
     rig = ta.CharacterRig()
     fitter = ta.Fitter(rig, pts, uv, idle, 8, 0.0)
     rest = np.zeros(rig.n)

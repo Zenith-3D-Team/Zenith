@@ -18,6 +18,7 @@ extends RefCounted
 ## the old code did at least one message, one build, one chunk freed a frame)].
 const SYSTEMS := {
 	&"messages": [0, 4000, 1000],  # bridge.gd: messages handled (they feed everything else)
+	&"states": [1, 2000, 300],  # world.gd: machines' states (`st`) applied, a busy base's 1,600 in 10-25 ms
 	&"terrain": [1, 3000, 500],  # world.gd: finished terrain meshes put in (holes in the ground)
 	&"blueprint": [1, 3000, 1000],  # blueprint_preview.gd: a held blueprint laid out and checked at the cursor
 	&"build": [2, 6000, 1500],  # world.gd: chunks' buildings built, nearest first
@@ -29,6 +30,7 @@ const SYSTEMS := {
 	&"decoratives": [6, 3000, 0],  # decoratives.gd: clutter built on workers put in
 	&"lanes": [6, 2000, 0],  # belt_lanes.gd: far belt icons put in
 	&"wires": [7, 1500, 0],  # wires.gd: chunks' wires drawn again
+	&"pipelines": [6, 2000, 300],  # pipeline_marks.gd: fluid pipelines found for their visualization (N9)
 	&"far_collect": [8, 1000, 0],  # far_chunks.gd: far chunks' entities gathered for merging
 	&"far_install": [8, 1500, 0],  # far_chunks.gd: finished merges put in
 	&"anim_migrate": [9, 300, 0],  # anim.gd: groups moved onto the newer clock

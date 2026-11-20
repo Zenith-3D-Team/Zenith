@@ -40,6 +40,8 @@ uniform vec3 look_sun_dir = vec3(0.25, 0.87, 0.43);
 uniform vec3 look_sun_color : source_color = vec3(1.0, 0.95, 0.88);
 uniform vec3 look_ambient_color : source_color = vec3(0.7, 0.76, 0.85);
 uniform float look_space = 0.0;
+// The scene's light against what the game set (the debug menu's sliders): x the ambient's share, y the sun's.
+uniform vec2 look_scene_light = vec2(1.0);
 
 void vertex() {
 	POSITION = vec4(VERTEX.xy, 1.0, 1.0);

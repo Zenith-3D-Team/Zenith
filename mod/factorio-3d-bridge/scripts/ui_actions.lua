@@ -20,6 +20,7 @@ local alt_mode = require("scripts.alt_mode")
 local inventory = require("scripts.inventory")
 local mining_sounds = require("scripts.mining_sounds")
 local belt_sim = require("scripts.belt_sim")
+local inserters = require("scripts.inserters")
 local perf = require("scripts.perf")
 
 local M = {}
@@ -100,8 +101,24 @@ puppet.belt_listeners[#puppet.belt_listeners + 1] = belt_lanes_changed
 ---------------------------------------------------------------------------------------------
 -- Drop (Z)
 
--- {item, x, y}: one of the item from the main inventory into the entity at that spot if it takes
--- it (Factorio's Z over a machine or chest), else onto a belt or the ground there.
+-- (`/f3d-perf drop_put`; off: the lanes' read alone, J21) An item Zenith's Z put on `belt` at `at`: the belt's drift
+-- checks every turn again (quiet_pc's wake), and the item told at once as an inserter's put is (`ie` kind 6, unit
+-- 0: its lane, place and id), so the client has it before the lanes' read, which can wait behind other asked lanes.
+local function dropped_on_belt(belt, at)
+  if not perf.on("drop_put") then
+    return
+  end
+  belt_sim.wake_unit(belt.unit_number)
+  inserters.put_by_hand(belt, at.x, at.y)
+end
+
+-- Takes `count` of the item out of the main inventory, from slot `hs` (the client's held stack)
+-- first: Factorio's Ctrl+click empties the cursor's stack, not another stack of the item (I1).
+local remove_held = puppet.take_held
+
+-- {item, x, y, hs?}: one of the item from the main inventory into the entity at that spot if it takes
+-- it (Factorio's Z over a machine or chest), else onto a belt or the ground there. `hs`: the main
+-- inventory slot the client's hand holds it from, the stack it comes off (and whose quality goes), L7.
 function M.drop(cmd)
   local c = puppet.get()
   local at = c and position_of(cmd)
@@ -116,7 +133,12 @@ function M.drop(cmd)
   if distance(c.position, at) > c.drop_item_distance + 0.5 then
     return puppet.message("Out of reach")
   end
+  local hs = math.floor(tonumber(cmd.hs) or 0)
+  local quality = puppet.held_quality(main, hs, item) or "normal"
   local stack = { name = item, count = 1 }
+  if quality ~= "normal" then
+    stack.quality = quality
+  end
   for _, e in pairs(c.surface.find_entities_filtered({ position = at })) do
     if e.valid and e.unit_number and e.force == c.force and e ~= c then
       local ok, inserted = pcall(function()
@@ -126,21 +148,37 @@ function M.drop(cmd)
         return 0
       end)
       if ok and inserted > 0 then
-        main.remove(stack)
+        remove_held(main, hs, item, 1, quality)
         puppet.send_inventory_now()
         if registry.BELT_SET[e.type] then
+          dropped_on_belt(e, at)
           belt_lanes_changed({ e })
         end
         return
       end
     end
   end
-  main.remove(stack)
+  remove_held(main, hs, item, 1, quality)
   c.surface.spill_item_stack({ position = at, stack = stack, allow_belts = true, max_radius = 0, use_start_position_on_failure = true })
   puppet.send_inventory_now()
   local types = registry.belt_types()
   if #types > 0 then
-    belt_lanes_changed(c.surface.find_entities_filtered({ position = at, type = types }))
+    local belts = c.surface.find_entities_filtered({ position = at, type = types })
+    if belts[1] then
+      dropped_on_belt(belts[1], at)
+    end
+    belt_lanes_changed(belts)
+  end
+end
+
+-- (`/f3d-perf drop_put`, Factorio's own Z in the game window, hybrid) A player's drop into an entity: on a belt,
+-- its drift checks every turn again and its lanes read in the next update, as Zenith's Z (no id to tell: the game
+-- doesn't say where on the belt it went). Whether Factorio raises this for a belt isn't known; harmless if not.
+function M.on_dropped_into(event)
+  local e = event.entity
+  if e and e.valid and registry.BELT_SET[e.type] and perf.on("drop_put") then
+    belt_sim.wake_unit(e.unit_number)
+    belt_lanes_changed({ e })
   end
 end
 
@@ -152,7 +190,47 @@ end
 -- science packs).
 local HOLDERS = { "chest", "car_trunk", "cargo_wagon", "spider_trunk", "lab_input" }
 
+-- (`/f3d-perf fast_take`) What an empty hand's Ctrl+click takes, by what the entity is: never its
+-- fuel. In 2.1 defines.inventory.fuel, chest and cargo_wagon are all 1, and a locomotive's and a
+-- burner drill's get_output_inventory is their fuel slot (read in 2.1.24), so neither the index
+-- nor get_output_inventory alone says what an inventory is: each is checked against the entity's
+-- own fuel inventory, and the fallback is the holding inventory of its type.
+local HOLDER_OF_TYPE = { container = "chest", ["logistic-container"] = "chest", ["infinity-container"] = "chest",
+  ["linked-container"] = "chest", ["temporary-container"] = "chest", car = "car_trunk",
+  ["spider-vehicle"] = "spider_trunk", ["cargo-wagon"] = "cargo_wagon",
+  -- What the old index loop reached and Factorio's own rule doesn't settle (its wiki: "takes anything the entity
+  -- has"): a lab's packs, a turret's ammo, the hub's and the landing pad's main inventory, as before.
+  lab = "lab_input", ["ammo-turret"] = "turret_ammo", ["artillery-turret"] = "artillery_turret_ammo",
+  ["artillery-wagon"] = "artillery_wagon_ammo", ["space-platform-hub"] = "hub_main",
+  ["cargo-landing-pad"] = "cargo_landing_pad_main" }
+
+local function take_inventories_by_kind(e)
+  local okf, fuel = pcall(function() return e.get_fuel_inventory() end)
+  local fuel_index = okf and fuel and fuel.index or nil
+  local function holds(inv)
+    return inv and #inv > 0 and inv.index ~= fuel_index
+  end
+  local out = {}
+  for _, getter in ipairs({ "get_output_inventory", "get_burnt_result_inventory" }) do
+    local ok, inv = pcall(function() return e[getter]() end)
+    if ok and holds(inv) then
+      out[#out + 1] = inv
+    end
+  end
+  local name = #out == 0 and HOLDER_OF_TYPE[e.type]
+  if name then
+    local ok, inv = pcall(function() return e.get_inventory(defines.inventory[name]) end)
+    if ok and holds(inv) then
+      out[#out + 1] = inv
+    end
+  end
+  return out
+end
+
 local function take_inventories(e)
+  if perf.on("fast_take") then
+    return take_inventories_by_kind(e)
+  end
   local out = {}
   for _, getter in ipairs({ "get_output_inventory", "get_burnt_result_inventory" }) do
     local ok, inv = pcall(function() return e[getter]() end)
@@ -173,32 +251,6 @@ local function take_inventories(e)
 end
 
 local BELTS = { ["transport-belt"] = true, ["underground-belt"] = true, splitter = true }
-
-local function quality_of(stack)
-  local ok, q = pcall(function() return stack.quality.name end)
-  return ok and q or "normal"
-end
-
--- Takes `count` of the item out of the main inventory, from slot `hs` (the client's held stack)
--- first: Factorio's Ctrl+click empties the cursor's stack, not another stack of the item (I1).
-local function remove_held(main, hs, item, count, quality)
-  local left = count
-  if hs and hs >= 1 and hs <= #main then
-    local st = main[hs]
-    if st.valid_for_read and st.name == item and quality_of(st) == quality then
-      local k = math.min(left, st.count)
-      if k >= st.count then
-        st.clear()
-      else
-        st.count = st.count - k
-      end
-      left = left - k
-    end
-  end
-  if left > 0 then
-    main.remove({ name = item, count = left, quality = quality })
-  end
-end
 
 -- Ctrl+click on a belt: its items into the character (half of each with `half`), or the held
 -- stack onto it, as many as its lanes take.
@@ -785,15 +837,11 @@ local function vec(p)
   return { math.floor((p.x or p[1]) * 100 + 0.5) / 100, math.floor((p.y or p[2]) * 100 + 0.5) / 100 }
 end
 
--- Fluid connections drawn as arrows on hover: [x, y (from the centre, facing north), direction the
--- pipe leaves by, "i" | "o" | "b" (input, output, both)] for ordinary connections, or nil.
+-- A prototype's ordinary pipe connections: [x, y (from the centre, facing north), direction the pipe leaves
+-- by, "i" | "o" | "b" (input, output, both)], or nil. `shown_only`: those the game shows (no
+-- hide_connection_info).
 local FLOWS = { input = "i", output = "o", ["input-output"] = "b" }
-local NO_FLUID_ARROWS = { pipe = true, ["pipe-to-ground"] = true, ["infinity-pipe"] = true, ["storage-tank"] = true,
-  valve = true, ["fluid-wagon"] = true }
-local function fluid_connections(proto)
-  if NO_FLUID_ARROWS[proto.type] then
-    return nil
-  end
+local function pipe_connections(proto, shown_only)
   local ok, boxes = pcall(function() return proto.fluidbox_prototypes end)
   if not ok or not boxes then
     return nil
@@ -801,13 +849,36 @@ local function fluid_connections(proto)
   local out = {}
   for _, box in pairs(boxes) do
     for _, conn in pairs(box.pipe_connections or {}) do
-      if conn.connection_type == "normal" and conn.positions and conn.positions[1] and not conn.hide_connection_info then
+      if conn.connection_type == "normal" and conn.positions and conn.positions[1]
+          and not (shown_only and conn.hide_connection_info) then
         local p = vec(conn.positions[1])
         out[#out + 1] = { p[1], p[2], conn.direction, FLOWS[conn.flow_direction] or "b" }
       end
     end
   end
   return #out > 0 and out or nil
+end
+
+-- Fluid connections drawn as arrows on hover (`fb`), or nil. Pipes, tanks, valves and fluid wagons show none.
+local NO_FLUID_ARROWS = { pipe = true, ["pipe-to-ground"] = true, ["infinity-pipe"] = true, ["storage-tank"] = true,
+  valve = true, ["fluid-wagon"] = true }
+local function fluid_connections(proto)
+  if NO_FLUID_ARROWS[proto.type] then
+    return nil
+  end
+  return pipe_connections(proto, true)
+end
+
+-- Where it joins a pipeline (`fj`, the same shape as `fb`, never drawn as arrows): for the types with no
+-- arrows whose records carry no `pc` (pipes, pipes to ground and infinity pipes do, world.lua), so the
+-- client's pipeline marks (N9) run through a storage tank as the game's fluid segment does. Every connection,
+-- hidden or not: a hidden one still joins. Fluid wagons join no pipeline of their own.
+local FLUID_JOINS = { ["storage-tank"] = true, valve = true }
+local function fluid_joins(proto)
+  if not FLUID_JOINS[proto.type] then
+    return nil
+  end
+  return pipe_connections(proto, false)
 end
 
 -- A collision mask's tile kind as the client tells tiles apart: "w" water tiles, "g" ground
@@ -876,14 +947,41 @@ local function overlay(proto)
       x.mr = math.floor(r * 100 + 0.5) / 100
       x.vp = v and vec(v) or nil
     end
+    -- What it mines and whether it needs a resource under it to be built (L8: the build cursor red off
+    -- them, "Pumpjack can only be built on resources", and the resources it can mine marked).
+    local okc, cats = pcall(function() return proto.resource_categories end)
+    if okc and type(cats) == "table" then
+      local l = {}
+      for c in pairs(cats) do
+        l[#l + 1] = c
+      end
+      table.sort(l)
+      x.rk = #l > 0 and l or nil
+    end
+    local okr, rr = pcall(function() return proto.require_resources_to_place end)
+    x.rr = okr and rr and 1 or nil
+  elseif t == "resource" then
+    -- Its category (L8, against a held drill's `rk`); `hl` for those Factorio marks while a drill that mines
+    -- them is held (the prototype's `highlight`, which the runtime can't read: crude oil and Space Age's
+    -- geysers, vents and brine, the infinite resources that give fluid, are the ones that set it).
+    local okc, cat = pcall(function() return proto.resource_category end)
+    x.rk = okc and type(cat) == "string" and cat or nil
+    local okh, inf, mp = pcall(function() return proto.infinite_resource, proto.mineable_properties end)
+    local product = okh and inf and mp and mp.products and mp.products[1]
+    x.hl = product and product.type == "fluid" and 1 or nil
+    -- `rf`: it needs a fluid to be mined (uranium ore's sulfuric acid). Factorio refuses a drill with a fluid input over
+    -- it until the force can mine with fluid ("Uranium mining not researched."), and a drill without one can't mine it.
+    local okf, rf = pcall(function() return proto.mineable_properties.required_fluid end)
+    x.rf = okf and rf and 1 or nil
   elseif t == "assembling-machine" or t == "furnace" then
-    -- Where a recycler (or any machine putting its results out) drops them: Alt-mode's arrow.
+    -- Where a recycler (or any machine putting its results out) drops them: Alt-mode's arrow (#9).
     local ok, v = pcall(function() return proto.vector_to_place_result end)
     if ok and v and ((v.x or v[1] or 0) ~= 0 or (v.y or v[2] or 0) ~= 0) then
       x.vp = vec(v)
     end
   end
   x.fb = fluid_connections(proto)
+  x.fj = fluid_joins(proto)
   -- Wire tools: how far a circuit wire reaches from it (and a power switch's copper wire).
   local okc, cw = pcall(function() return proto.get_max_circuit_wire_distance() end)
   if okc and type(cw) == "number" and cw > 0 then
@@ -903,9 +1001,16 @@ local function overlay(proto)
   x.isq = alt_mode.sequences(proto)
   -- And its repair sound, the one a repair pack mending it plays (K13).
   x.rsd = mining_sounds.repair_of(proto.name)
-  -- Assemblers' and drills' pipe connections show only while their recipe (resource) needs fluid.
+  -- Assemblers' and drills' pipe connections show only while their recipe (resource) needs fluid. Not a
+  -- pumpjack's: its output is always there (L8: its arrow didn't show while placing it).
   local ok, off = pcall(function() return proto.fluid_boxes_off_when_no_fluid_recipe end)
-  if x.fb and ((ok and off) or t == "mining-drill") then
+  local drill_input = false
+  if t == "mining-drill" then
+    for _, c in ipairs(x.fb or {}) do
+      drill_input = drill_input or c[4] ~= "o"
+    end
+  end
+  if x.fb and ((ok and off) or drill_input) then
     x.fo = 1
   end
   return next(x) and x or nil

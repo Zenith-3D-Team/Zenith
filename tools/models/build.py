@@ -1,4 +1,5 @@
-"""Builds the procedural models and exports them to client/assets/models/<name>.glb.
+"""Builds the procedural models and exports them to their pack (packs.py: over the model of that
+name where it is, a new one into client/assets/models/packs/placeholders/<name>.glb).
 
     blender --background --factory-startup --python tools/models/build.py -- [names...] [--out=DIR]
 
@@ -20,6 +21,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import kit  # noqa: E402
+import packs  # noqa: E402
 import specs  # noqa: E402
 
 # One module per family; each registers its models with @kit.model.
@@ -46,9 +48,14 @@ def converted_from_wube(path):
     return doc.get("asset", {}).get("generator") == WUBE_GENERATOR
 
 
+def out_path(out_dir, name):
+    """--out's folder, or the model's own pack."""
+    return os.path.join(out_dir, name + ".glb") if out_dir else packs.out_path(name)
+
+
 def main():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-    out_dir = os.path.join(REPO, "client", "assets", "models")
+    out_dir = None  # the packs
     names = []
     for arg in argv:
         if arg.startswith("--out="):
@@ -61,7 +68,7 @@ def main():
     if not names:
         names = []
         for name in sorted(kit.REGISTRY):
-            if converted_from_wube(os.path.join(out_dir, name + ".glb")):
+            if converted_from_wube(out_path(out_dir, name)):
                 print("build: keep %-28s converted from Wube's model; name it to rebuild" % name)
             else:
                 names.append(name)
@@ -71,14 +78,15 @@ def main():
         print("build: known: %s" % ", ".join(sorted(kit.REGISTRY)))
         return 1
 
-    os.makedirs(out_dir, exist_ok=True)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     failed = 0
     for name in names:
         start = time.time()
         try:
             parts = kit.as_parts(kit.REGISTRY[name]())
             tris = sum(p.triangles() for p in parts)
-            path = os.path.join(out_dir, name + ".glb")
+            path = out_path(out_dir, name)
             kit.export(parts, path)
         except Exception:
             traceback.print_exc()
@@ -88,7 +96,7 @@ def main():
         budget = specs.SPECS.get(name, {}).get("budget", 0)
         flag = "" if not budget or tris <= budget else "  OVER BUDGET (%d)" % budget
         print("build: %-28s %6d tris  %.1fs%s" % (name, tris, time.time() - start, flag))
-    print("build: %d built, %d failed -> %s" % (len(names) - failed, failed, out_dir))
+    print("build: %d built, %d failed -> %s" % (len(names) - failed, failed, out_dir or packs.PACKS_DIR))
     if len(names) > failed:
         # Blender's Python has no scipy: the part colours (the client's default look) are a step after.
         print("build: next, part colours from the sprites: python tools/models/part_colors.py %s" % " ".join(names))

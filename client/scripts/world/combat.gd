@@ -137,7 +137,7 @@ func _update_bars() -> void:
 
 func _bar_position(unit: int) -> Variant:
 	if avatar != null and unit == avatar.unit:
-		return avatar.position + Vector3(0, AVATAR_BAR_HEIGHT, 0)
+		return avatar.position + Vector3(0, AVATAR_BAR_HEIGHT, 0) + avatar.lifted()  # over the drawn head (1.7)
 	var mover = movers.position_of(unit)
 	if mover != null:
 		var at: Vector3 = mover

@@ -11,6 +11,8 @@ const Rockets := preload("res://scripts/world/rockets.gd")
 const ItemCards := preload("res://scripts/world/item_cards.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const Settings := preload("res://scripts/menu/settings.gd")
+const CharacterPoints := preload("res://scripts/player/character_points.gd")
 
 const FOLLOW_RATE := 18.0
 
@@ -36,11 +38,18 @@ var mine_hint_msec := -1
 ## The vehicle the character sits in (its unit number), or 0, and its speed in km/h.
 var vehicle := 0
 var vehicle_speed := 0.0
+## The shield in the armour and its most (`me` `sd`, `msd`; 0 without shields), for add-ons
+## (api.character); the HUD takes them from the message itself.
+var shield := 0
+var max_shield := 0
+## A `me` was heard since the last handshake (main.gd's _on_welcome clears it): the character's
+## state is known.
+var heard_me := false
 
 var _target := Vector3.ZERO
 ## The last few positions the mod sent and their ticks (`me`'s k): the avatar is drawn between them
 ## GameClock.DELAY_SENDS behind the game's clock, so it moves at an even speed and the run cycle
-## steps evenly (chasing each position made it surge and sag, worst at exoskeleton
+## steps evenly (owner's #19: chasing each position made it surge and sag, worst at exoskeleton
 ## speed). The clock runs at the game's measured tick rate, so a slow server doesn't make it lurch.
 var _ticks: Array[float] = []
 var _spots: Array[Vector3] = []
@@ -53,7 +62,7 @@ var _drawn_angle := -1.0
 var _offset := Vector3.ZERO
 var _last_goal := Vector3.ZERO
 var _smooth_set := false
-## Walking at an angle, Factorio's character zig-zags between two of its 8 directions about the
+## B7: walking at an angle, Factorio's character zig-zags between two of its 8 directions about the
 ## line (puppet.lua). The avatar is drawn along the line: movement along it is followed exactly,
 ## sideways movement only through a slow filter, and never more than MAX_OFF from the real position,
 ## so sliding along a wall still shows. Without an angle it catches up at once.
@@ -117,7 +126,42 @@ static var _beam_gain := 1.0
 ## are lifted by this (at the flat height the lantern sat inside ground more than 2.5 tiles up and
 ## lit nothing, J19). 0 on flat ground.
 var lift := 0.0
+## (Add-on API 1.7) The add-ons' lift (api.character.set_lift, summed by addon_host.gd): the body is
+## drawn this far up (y) and across (x, z) from the game's place, through the pose's root, and its
+## lantern, bar and flames follow it (the eye only for the camera part, _view_lifted). `position` never moves with it: reach, picking and every
+## command stay on the game's position. Capped by cap_lift.
+var _lifted := Vector3.ZERO
+## The most an add-on lift draws the body up, and across (tiles): above every tree and model with room
+## for a flight, but never further across than beside where the game has the character.
+const LIFT_MAX := 16.0
+const OFFSET_MAX := 1.0
+## The camera's part of the add-ons' lift: only lifts set with `camera` true (set_lift's third
+## argument) move the first-person eye and the angled view's centre. Capped as the body's is.
+var _view_lifted := Vector3.ZERO
+## The belt step-up (owner: "on by default but doesn't move camera or actual player position, just a
+## visual thing"): on a belt, underground, splitter, loader or linked belt (stand_height.gd BELTS) the
+## body is drawn on its top, at most STAND_MAX, eased, beside the add-ons' lift. Never the camera, never `position`. Looked up only
+## when the drawn position moves (at most once a frame), nothing while standing still.
+var world  # WorldMirror (main.gd sets it); none: no step-up
+var _stand := 0.0  # the step-up as drawn, eased
+var _stand_goal := 0.0
+var _stand_at := Vector2.INF  # the drawn place _stand_goal was looked up at
+var _box_for := Vector3.INF  # the lift _rig's culling box was last grown for (_fit_box)
+## stand_height.gd, loaded on first use: a preload would pull in aim_pick.gd and world.gd, which names the
+## Bridge autoload, and `-s` scripts that load avatar.gd (no autoloads) would fail to compile.
+static var _stand_height: GDScript
+var stand_lookups := 0  # counted for the tests' cost check
+## The most the belt step-up draws the body up (tiles): a belt's height, so a splitter's or a model
+## pack's tall loader frame doesn't stand the character on its hood (api.world.stand_height_at keeps
+## the model's whole top for add-ons).
+const STAND_MAX := 0.3
+const STEP_UP_RATE := 30.0  # most of the way up in about 0.1 s,
+const STEP_DOWN_RATE := 20.0  # down a touch slower
+## `--belt-step=off`: walking through belts, as before, whatever the setting says (docs/RUNNING.md).
+static var belt_step_switch := not ("--belt-step=off" in OS.get_cmdline_user_args())
+static var _belt_step := -1  # Settings > Graphics > Step onto belts: -1 unread, then 0 or 1
 var _body: Array = []  # the nodes hidden while in a vehicle or seen from inside (first person)
+var _body_at: Array = []  # their own positions, for the capsule stand-in's lift
 var _first_person := false
 ## The character model (Wube's, skinned: character_pose.gd), drawn as a one-instance MultiMesh
 ## with its own copy of the materials, which carry the pose.
@@ -246,6 +290,8 @@ func _ready() -> void:
 		_body.append(nose)
 	add_child(body)
 	_body.append(body)
+	for node in _body:
+		_body_at.append((node as Node3D).position)
 	_own_layer(self)
 
 
@@ -277,8 +323,9 @@ func _make_rig(model_name: String) -> MultiMeshInstance3D:
 	mm.set_instance_custom_data(0, Color(0, 0, 0, 1))
 	_rig.multimesh = mm
 	# The pose moves vertices outside the mesh's own box (a raised pickaxe, lying dead).
-	# Flying lifts it a few tiles more.
-	_rig.custom_aabb = AABB(Vector3(-2, -1, -2), Vector3(4, 8.0, 4))
+	# Flying lifts it a few tiles more; an add-on's lift and the belt step-up grow it (_fit_box).
+	_box_for = Vector3.INF
+	_fit_box()
 	return _rig
 
 
@@ -302,6 +349,9 @@ func set_armor(item: String) -> void:
 	_own_layer(fresh)
 	_body.append(fresh)
 	_update_body()
+	if not _attached.is_empty() or not _layer_src.is_empty():
+		_refit_attached()  # (1.7) the new look's rest places
+		set_pose_layer(_layer_src)
 
 
 ## The model Factorio's look for armour `item` is drawn with.
@@ -413,6 +463,9 @@ func update_from(msg: Dictionary) -> void:
 	_yaw_goal = _facing_yaw(msg)
 	health = int(msg.get("hp", 0))
 	_has_state = msg.has("hp")
+	heard_me = true
+	shield = int(msg.get("sd", 0))
+	max_shield = int(msg.get("msd", 0))
 	max_health = maxi(1, int(msg.get("mhp", max_health)))
 	firing = int(msg.get("sh", 0)) == 1
 	craft_queue = int(msg.get("q", 0))
@@ -425,6 +478,7 @@ func update_from(msg: Dictionary) -> void:
 	# Thousandths of a tile per tick; a tile is a metre.
 	vehicle_speed = int(msg.get("vs", 0)) / 1000.0 * 60.0 * 3.6
 	_update_body()
+	_apply_night()
 	if msg.has("m"):
 		mining = int(msg["m"])
 		mining_at = Vector2(int(msg.get("mx", 0)), int(msg.get("my", 0))) / 256.0
@@ -462,10 +516,54 @@ func footfalls() -> int:
 	return _anim.footfalls
 
 
+# Read-only views of the drawn character for add-ons (api.character): nothing here changes what is
+# drawn, and nothing is worked out until asked.
+
+## The foot of the last footfall was the right one.
+func foot_right() -> bool:
+	return _anim.right_foot
+
+
+## Where the run loop is, 0 to 1: 0 as the right foot comes down, 0.5 the left (0 without the rig).
+func stride() -> float:
+	return _anim._run_phase / TAU if _rig != null else 0.0
+
+
+## The drawn body is off the ground, from the start of the take-off to the end of the landing (the
+## game's flag without the rig, which draws no flight).
+func in_air() -> bool:
+	if _rig == null:
+		return flying and vehicle == 0
+	return _anim.air_state != CharacterAnim.Air.GROUND
+
+
+## The body is drawn now: not in a vehicle, first person or on another surface's view.
+func body_shown() -> bool:
+	return visible and vehicle == 0 and not _first_person
+
+
+## How fast the drawn character moves over the ground, in tiles a tick (Factorio's unit: plain running
+## is 0.15), negative moving against its facing: the two `me`s it is drawn between, unsmoothed. 0
+## standing, in a vehicle, or with fewer than two of them.
+func drawn_speed() -> float:
+	var n := _ticks.size()
+	if vehicle != 0 or n < 2 or _clock.tick < 0.0:
+		return 0.0
+	var drawn := _clock.tick - _clock.gap * GameClock.DELAY_SENDS
+	for i in range(1, n):
+		if drawn <= _ticks[i]:
+			if drawn < _ticks[i - 1]:
+				return 0.0
+			var step := _spots[i] - _spots[i - 1]
+			var facing := -global_transform.basis.z
+			return step.length() / (_ticks[i] - _ticks[i - 1]) * (-1.0 if step.dot(facing) < 0.0 else 1.0)
+	return 0.0
+
+
 ## Which way the body faces for a `me`: an angled walk's line (`a`); else the 8-way direction,
 ## except that the line is kept while that direction is one of the two the zig-zag steps between
 ## (a message without `a` mid-walk, or stopping after one): otherwise the body, and the
-## flashlight with it, would swing 22 degrees back and forth. A walk without an angle
+## flashlight with it, would swing 22 degrees back and forth (owner's F7). A walk without an angle
 ## for ANGLE_HOLD ticks, or a direction off the line, ends it.
 func _facing_yaw(msg: Dictionary) -> float:
 	var k := float(msg.get("k", -1))
@@ -492,10 +590,30 @@ func set_first_person(on: bool) -> void:
 func _update_body() -> void:
 	for node in _body:
 		(node as Node3D).visible = vehicle == 0 and not _first_person
+	if _holder != null:
+		_holder.visible = vehicle == 0 and not _first_person
+
+
+## N1: in a vehicle the character's lights go out, as Factorio draws nothing of a character in a
+## vehicle, its lights neither; the vehicle's own lights shine instead (vehicle_lights.gd).
+## --vehicle-lights=off keeps them on, as before.
+static var vehicle_lights := not ("--vehicle-lights=off" in OS.get_cmdline_user_args())
+var _night := 0.0
 
 
 ## `night`: 0 in daylight, 1 at full darkness.
 func set_night(night: float) -> void:
+	_night = night
+	_apply_night()
+
+
+## True while the character's own lights are out (in a vehicle, N1).
+func lights_out() -> bool:
+	return vehicle_lights and vehicle != 0
+
+
+func _apply_night() -> void:
+	var night := 0.0 if lights_out() else _night
 	_lantern.light_energy = 1.8 * night
 	_lantern.visible = night > 0.01
 	var cone := beam(night)
@@ -507,6 +625,12 @@ func set_night(night: float) -> void:
 ## on above darkness 0.3 (`minimum_darkness`), faded in here instead of popping.
 static func beam(night: float) -> float:
 	return smoothstep(0.3, 0.5, night)
+
+
+## The spot's energy for BEAM_PEAK on the ground (beam_texture() makes it): vehicle_lights.gd's cones.
+static func beam_gain() -> float:
+	beam_texture()
+	return _beam_gain
 
 
 ## The flashlight's height over the ground under the character.
@@ -689,10 +813,123 @@ func ground_position() -> Vector2:
 	return Vector2(position.x, position.z)
 
 
-## How far the body is drawn over the ground under it, flying in mech armour (tiles; 0 otherwise): the
-## camera's centre rises with it (camera_rig.gd).
+## How far the body is drawn over the ground under it, flying in mech armour (tiles; 0 otherwise).
+## (1.7) Plus the add-ons' lift and the belt step-up (lifted().y). The camera follows view_lift().
 func drawn_lift() -> float:
+	return _flight_lift() + lifted().y
+
+
+## How far the camera's centre rises over the ground (camera_rig.gd): flight, and only the add-ons'
+## lifts set with `camera` (camera_lift()); the belt step-up never moves it.
+func view_lift() -> float:
+	return _flight_lift() + camera_lift().y
+
+
+func _flight_lift() -> float:
 	return _anim.drawn_lift() if _rig != null and vehicle == 0 else 0.0
+
+
+## (1.7) The add-ons' lift (addon_host.gd), capped, and its camera part. Drawn only: nothing reads
+## them to act.
+func set_lifted(v: Vector3, view := Vector3.ZERO) -> void:
+	_lifted = cap_lift(v)
+	_view_lifted = cap_lift(view)
+	_fit_box()
+
+
+## The body's lift as drawn now: the add-ons' and the belt step-up together, capped; zero in a
+## vehicle or dead (the add-ons' kept, and drawn again after).
+func lifted() -> Vector3:
+	if vehicle != 0 or (_has_state and health <= 0):
+		return Vector3.ZERO
+	return lift_total()
+
+
+## The add-ons' lift and the belt step-up together, capped, as lifted() draws them on foot (kept in a
+## vehicle or dead): api.character.state()'s `lift`.
+func lift_total() -> Vector3:
+	return cap_lift(_lifted + Vector3(0.0, _stand, 0.0)) if _stand > 0.0 else _lifted
+
+
+## The camera's part of lifted(): the add-ons' lifts set with `camera`, never the belt step-up.
+func camera_lift() -> Vector3:
+	if vehicle != 0 or (_has_state and health <= 0):
+		return Vector3.ZERO
+	return _view_lifted
+
+
+## The belt step-up as drawn now (tiles), 0 off a belt.
+func stand_lift() -> float:
+	return _stand
+
+
+## Settings > Graphics > Step onto belts, unless `--belt-step=off`. Read once and again when a graphics
+## setting changes, not each frame.
+static func belt_step() -> bool:
+	if not belt_step_switch:
+		return false
+	if _belt_step < 0:
+		_read_belt_step("graphics", "belt_step")
+		Settings.listen(_read_belt_step)
+	return _belt_step == 1
+
+
+static func _read_belt_step(section: String, _key: String) -> void:
+	if section == "graphics":
+		_belt_step = 1 if bool(Settings.get_value("graphics", "belt_step")) else 0
+
+
+## The belt step-up eased towards the top of what the drawn body stands on: looked up only when the
+## drawn place moved since the last look. None flying (mech armour), in a vehicle or dead.
+func _step_onto(delta: float) -> void:
+	var goal := 0.0
+	if belt_step() and world != null and vehicle == 0 and not flying and not (_has_state and health <= 0):
+		var at := Vector2(position.x, position.z)
+		if at != _stand_at:
+			_stand_at = at
+			if _stand_height == null:
+				_stand_height = load("res://scripts/world/stand_height.gd")
+			_stand_goal = minf(_stand_height.at(world, at, _stand_height.BELTS), STAND_MAX)
+			stand_lookups += 1
+		goal = _stand_goal
+	else:
+		_stand_at = Vector2.INF  # looked up again when it is back on
+	if _stand == goal:
+		return
+	var was_up := _stand > 0.0
+	_stand = lerpf(_stand, goal, 1.0 - exp(-delta * (STEP_UP_RATE if goal > _stand else STEP_DOWN_RATE)))
+	if absf(_stand - goal) < 0.002:
+		_stand = goal
+	if (_stand > 0.0) != was_up:
+		_fit_box()
+
+
+## The body's culling box: the pose's room (a raised pickaxe, lying dead, flying), grown by the lift
+## only while one is set (the add-ons' and the step-up's most), written only when that changes.
+func _fit_box() -> void:
+	if _rig == null:
+		return
+	# The offset turns with the body (_own_frame), so the box grows by its length every way across.
+	var across := Vector2(_lifted.x, _lifted.z).length()
+	var up := Vector3(across, _lifted.y + (STAND_MAX if _stand > 0.0 else 0.0), across)
+	if up == _box_for:
+		return
+	_box_for = up
+	_rig.custom_aabb = AABB(Vector3(-2 - across, -1, -2 - across), Vector3(4 + 2 * across, 8.0 + up.y, 4 + 2 * across))
+
+
+## A lift within the caps: height 0 to LIFT_MAX, across at most OFFSET_MAX; not-a-number counts as 0.
+static func cap_lift(v: Vector3) -> Vector3:
+	var up := 0.0 if is_nan(v.y) else clampf(v.y, 0.0, LIFT_MAX)
+	var across := Vector2(0.0 if is_nan(v.x) else v.x, 0.0 if is_nan(v.z) else v.z)
+	# Clamped first: an infinite offset would make limit_length's answer not-a-number.
+	across = across.clamp(-Vector2.ONE * OFFSET_MAX, Vector2.ONE * OFFSET_MAX).limit_length(OFFSET_MAX)
+	return Vector3(across.x, up, across.y)
+
+
+## A world-space lift in the avatar's own (turned) frame, where its lights and pose are placed.
+func _own_frame(v: Vector3) -> Vector3:
+	return v.rotated(Vector3.UP, -rotation.y)
 
 
 ## Remembers a sent position at game tick `k` (none when the message has no tick: then the avatar
@@ -773,9 +1010,12 @@ func _process(delta: float) -> void:
 	position = goal if _ticks.size() >= 2 and position.distance_to(goal) < 2.0 else position.lerp(goal, t)
 	rotation.y = lerp_angle(rotation.y, _body_yaw(), t)
 	_aim_flashlight()
+	_step_onto(delta)
 	_lift_lights()
 	if _rig != null:
 		_animate(delta)
+	if not _attached.is_empty():
+		_place_attached()
 
 
 ## K3 (owner: "flashlight should follow the mouse in first person"): in first person the flashlight
@@ -793,11 +1033,20 @@ func _aim_flashlight() -> void:
 	_flashlight.rotation.y = yaw
 
 
-## The lantern and flashlight over the hills under the character (one height read a frame).
+## The lantern and flashlight over the hills under the character (one height read a frame), and with
+## an add-on's lift (1.7): the lantern and the old flashlight rise with the body; the new flashlight is
+## Factorio's picture cast from BEAM_HEIGHT, so it only moves across (raised, it would stretch).
 func _lift_lights() -> void:
-	lift = GroundHeight.at(position.x, position.z)
-	_lantern.position.y = LANTERN_HEIGHT + lift
-	_flashlight.position.y = flashlight_height() + lift
+	var up := lifted()
+	lift = GroundHeight.at(position.x + up.x, position.z + up.z)
+	var across := _own_frame(Vector3(up.x, 0.0, up.z))
+	_lantern.position = Vector3(across.x, LANTERN_HEIGHT + lift + up.y, across.z)
+	var beam_up := up.y if flashlight_mode == "old" else 0.0
+	_flashlight.position = Vector3(across.x, flashlight_height() + lift + beam_up, across.z)
+	if _rig == null:
+		var own := _own_frame(up)
+		for i in _body.size():
+			(_body[i] as Node3D).position = _body_at[i] + own
 
 
 ## Which way the legs face: where the character walks, except while shooting, when it faces
@@ -840,14 +1089,15 @@ func _animate(delta: float) -> void:
 	_anim.flying = flying and vehicle == 0
 	_anim.flight_height = _fly_h
 	_anim.descending = _fly_down
+	_anim.extra_offset = _own_frame(lifted())
 	_anim.step(_pose, delta, distance)
 	_update_jets()
 	var rows := _pose.rows()
 	for m in _materials:
 		m.set_shader_parameter("rig_bone", rows)
 	var shown := vehicle == 0 and not _first_person
-	_pickaxe.visible = _anim.pickaxe_shown and shown
-	_gun.visible = _anim.gun_shown and shown
+	_pickaxe.visible = _anim.pickaxe_shown and shown and not tools_hidden
+	_gun.visible = _anim.gun_shown and shown and not tools_hidden
 	var grip := Transform3D(Basis.IDENTITY, GRIP)
 	if _pickaxe.visible:
 		# The handle carries on from the forearm, angled forwards: down past the knee at rest,
@@ -865,12 +1115,146 @@ func kick(strength := 1.0) -> void:
 
 ## Where shots leave the gun (world): muzzle flashes, beams, projectiles' first height.
 func muzzle_position() -> Vector3:
+	if not _addon_muzzle.is_empty():
+		var n = _addon_muzzle[0]
+		if is_instance_valid(n) and (n as Node3D).is_inside_tree():
+			return (n as Node3D).global_transform * (_addon_muzzle[1] as Vector3)
+	return _own_muzzle()
+
+
+## Zenith's own muzzle, without an add-on's (set_addon_muzzle).
+func _own_muzzle() -> Vector3:
 	if _mech and _pose != null:
 		# The mech's right forearm is its gun: its bone ends at the muzzle.
 		return global_transform * _pose.point("forearm_r", _pose.tail_of("forearm_r"))
 	if _gun != null and _gun.visible:
 		return _gun.global_transform * MUZZLE
-	return position + Vector3(0, 1.1, 0)
+	return position + Vector3(0, 1.1, 0) + lifted()
+
+
+# --- (Add-on API 1.7) attachments, frames, the pose layer, the muzzle and tools (api.character) ---
+
+## Zenith's own pickaxe and gun not drawn (api.character.hide_tools: the add-on draws its own).
+var tools_hidden := false
+## An add-on's muzzle (api.character.set_muzzle): [node, point in the node's frame]; [] for Zenith's.
+var _addon_muzzle: Array = []
+## Add-ons' nodes kept at a bone or point (attach_node): [node, name, offset, rig bone ("" for none),
+## rest frame]. Drawn from a holder made on the first attach, hidden with the body.
+var _attached: Array = []
+var _holder: Node3D
+## The add-ons' pose layer as the host gave it (API bone names), kept to map it again on a new rig.
+var _layer_src: Array = []
+## The plain look's rig at rest, for the capsule stand-in (no character model in this build).
+static var _plain_rest: CharacterPose = null
+
+
+## Keeps `node` at the bone or point `name` (CharacterPoints), `offset` in its frame, drawn from this
+## frame on. False for an unknown name (`view` is the camera's: addon_host.gd).
+func attach_node(node: Node3D, name: String, offset := Transform3D.IDENTITY) -> bool:
+	if not CharacterPoints.is_name(name) or name == "view" or node == null:
+		return false
+	detach_node(node)
+	if _holder == null:
+		_holder = Node3D.new()
+		_holder.name = "AddonAttached"
+		add_child(_holder)
+		_update_body()
+	if node.get_parent() != null:
+		node.get_parent().remove_child(node)
+	_holder.add_child(node)
+	_own_layer(node)  # (F7) the lantern's shadows don't see it, as they don't see the body
+	_attached.append([node, name, offset, "", Transform3D.IDENTITY])
+	_refit_attached()
+	_place_attached()
+	return true
+
+
+## Hands `node` back out of the tree, not freed.
+func detach_node(node: Node3D) -> void:
+	for i in range(_attached.size() - 1, -1, -1):
+		if _attached[i][0] == node:
+			_attached.remove_at(i)
+	if node != null and is_instance_valid(node) and _holder != null and node.get_parent() == _holder:
+		_holder.remove_child(node)
+
+
+## The rig bone and rest frame of every attached name, for the look drawn now (on attach and when
+## set_armor swaps the rig).
+func _refit_attached() -> void:
+	var pose := _rest_pose()
+	for e: Array in _attached:
+		var r := CharacterPoints.rest(pose, look, str(e[1])) if pose != null else []
+		e[3] = str(r[0]) if r.size() == 2 else ""
+		e[4] = (r[1] as Transform3D) if r.size() == 2 else Transform3D.IDENTITY
+
+
+## The pose the rest places come from: the drawn rig's, or the plain look's for the capsule.
+func _rest_pose() -> CharacterPose:
+	if _pose != null:
+		return _pose
+	if _plain_rest == null:
+		var p := CharacterPose.new()
+		if p.load_rig(BODY_MODEL):
+			p.compute()
+			_plain_rest = p
+	return _plain_rest
+
+
+## A name's frame in the avatar's own frame as drawn now: the pose (the lift is in its root), and
+## the hills under the character, which the body gets in its shader and an add-on's node doesn't.
+func _local_frame(name: String, rig_bone: String, rest: Transform3D) -> Transform3D:
+	var hill := Transform3D(Basis.IDENTITY, Vector3(0.0, lift, 0.0))
+	if name == "muzzle":
+		return hill * Transform3D(Basis.IDENTITY, global_transform.affine_inverse() * _own_muzzle())
+	if rig_bone == "":
+		return hill * Transform3D(Basis.IDENTITY, _own_frame(lifted()))
+	if _pose != null and _rig != null:
+		return hill * _pose.frame(rig_bone, rest)
+	return hill * Transform3D(Basis.IDENTITY, _own_frame(lifted())) * rest
+
+
+func _place_attached() -> void:
+	for e: Array in _attached:
+		var n = e[0]
+		if is_instance_valid(n):
+			(n as Node3D).transform = _local_frame(str(e[1]), str(e[3]), e[4]) * (e[2] as Transform3D)
+
+
+## A bone's or point's frame in the world as drawn now; null for an unknown name (and `view`, the
+## camera's).
+func frame_of(name: String):
+	if not CharacterPoints.is_name(name) or name == "view":
+		return null
+	var pose := _rest_pose()
+	var r := CharacterPoints.rest(pose, look, name) if pose != null else []
+	var bone := str(r[0]) if r.size() == 2 else ""
+	var rest: Transform3D = r[1] if r.size() == 2 else Transform3D.IDENTITY
+	return global_transform * _local_frame(name, bone, rest)
+
+
+## What the rig is: mech or not, head_top's height at rest (for scaling), the names.
+func rig_info() -> Dictionary:
+	var pose := _rest_pose()
+	var r := CharacterPoints.rest(pose, look, "head_top") if pose != null else []
+	return {"mech": _mech, "height": (r[1] as Transform3D).origin.y if r.size() == 2 else 0.0,
+		"bones": CharacterPoints.BONES.keys(), "points": CharacterPoints.POINTS.duplicate()}
+
+
+## The add-ons' pose layer (addon_host.gd, start order): [API bone name, turn, weight, replace], mapped
+## to the rig's bone indices here, when set and when the rig is swapped, never per frame.
+func set_pose_layer(entries: Array) -> void:
+	_layer_src = entries
+	var out: Array = []
+	for e: Array in entries:
+		var bone: String = CharacterPoints.BONES.get(str(e[0]), "")
+		if _pose != null and _pose.index.has(bone):
+			out.append([int(_pose.index[bone]), e[1], e[2], e[3]])
+	_anim.layer = out
+
+
+## An add-on's muzzle: shots start at `at` in `node`'s frame while it is in the tree; null: Zenith's.
+func set_addon_muzzle(node: Node3D, at := Vector3.ZERO) -> void:
+	_addon_muzzle = [node, at] if node != null else []
 
 
 ## Thruster smoke and a small flame under each foot while the thrusters burn (CharacterAnim.thrust).

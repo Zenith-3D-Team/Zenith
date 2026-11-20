@@ -137,6 +137,10 @@ static func chart_image(n: int, pal: Array, px: Array) -> Image:
 
 static func _chunk(msg: Dictionary) -> void:
 	var rle_v: Variant = msg.get("tiles")
+	# (A binary frame's runs come packed, wire_decode.gd: whole numbers already.)
+	if rle_v is PackedInt32Array or rle_v is PackedInt64Array:
+		msg["_tiles"] = tiles_from_runs(rle_v)
+		return
 	if not (rle_v is Array):
 		return
 	var rle: Array = rle_v
@@ -146,9 +150,9 @@ static func _chunk(msg: Dictionary) -> void:
 	msg["_tiles"] = tiles_from_runs(rle)
 
 
-## A chunk's tiles from their runs ([id, count, id, count...]), as chunk_view.gd set_tiles_rle reads
-## them: CHUNK x CHUNK ids, those the runs don't reach 0.
-static func tiles_from_runs(rle: Array) -> PackedInt32Array:
+## A chunk's tiles from their runs ([id, count, id, count...], an Array or a packed list), as chunk_view.gd
+## set_tiles_rle reads them: CHUNK x CHUNK ids, those the runs don't reach 0.
+static func tiles_from_runs(rle: Variant) -> PackedInt32Array:
 	var ids := PackedInt32Array()
 	ids.resize(CHUNK * CHUNK)
 	var i := 0

@@ -164,6 +164,23 @@ local raw = {
   ["ammo-turret"] = {
     ["my-turret"] = { type = "ammo-turret", name = "my-turret", collision_box = { { -1, -1 }, { 1, 1 } },
       folded_animation = { filename = "__my-mod__/graphics/entity/turret.png", width = 100, height = 80, direction_count = 8, line_length = 4 } },
+    ["my-gun"] = { type = "ammo-turret", name = "my-gun", collision_box = { { -1, -1 }, { 1, 1 } },
+      graphics_set = { base_visualisation = { animation = { filename = "__my-mod__/gun-base.png", width = 150, height = 118, scale = 0.5 } } },
+      folded_animation = { filename = "__my-mod__/gun-head.png", width = 130, height = 130, direction_count = 8, line_length = 4, scale = 0.5 } },
+  },
+  ["lab"] = {
+    ["my-miner"] = { type = "lab", name = "my-miner", collision_box = { { -1, -1 }, { 1, 1 } },
+      integration_patch = { north = { filename = "__my-mod__/patch.png", width = 200, height = 200, scale = 0.5 } },
+      graphics_set = {
+        animation = { layers = {
+          { filename = "__my-mod__/miner.png", width = 190, height = 208, frame_count = 4, line_length = 4, scale = 0.5 },
+          { filename = "__my-mod__/miner-shadow.png", width = 220, height = 150, draw_as_shadow = true, scale = 0.5 },
+          { filename = "__my-mod__/miner-glow.png", width = 40, height = 40, draw_as_glow = true, scale = 0.5 },
+          { filename = "__my-mod__/miner-light.png", width = 100, height = 100, blend_mode = "additive", scale = 0.5 } } },
+        working_visualisations = {
+          { always_draw = true, north_animation = { filename = "__my-mod__/miner-front.png", width = 136, height = 148, scale = 0.5 } },
+          { always_draw = true, apply_tint = "status", north_animation = { filename = "__my-mod__/lamp.png", width = 32, height = 32, scale = 0.5 } },
+          { animation = { filename = "__my-mod__/miner-fire.png", width = 40, height = 100, frame_count = 8, scale = 0.5 } } } } },
   },
   tree = {
     ["my-tree"] = { type = "tree", name = "my-tree", collision_box = { { -0.4, -0.4 }, { 0.4, 0.4 } },
@@ -315,6 +332,12 @@ check(se.get("n", [[""]])[0][0].endswith("sender.png"), "a blank 1x1 base is pas
 tr = ents.get("my-tree", {})
 check(len(tr.get("n", [])) == 2 and tr["n"][1][0].endswith("leaves.png"), "a tree's trunk and leaves: %r" % tr)
 check("my-boom" not in ents, "effects aren't listed")
+mi = ents.get("my-miner", {})
+check([l[0].rsplit("/", 1)[-1] for l in mi.get("n", [])] == ["patch.png", "miner.png", "miner-glow.png", "miner-front.png"]
+      and [l[0].rsplit("/", 1)[-1] for l in mi.get("kn", [])] == ["miner-fire.png"],
+      "every layer Factorio draws at rest in its order (patch, picture, glow, always-drawn front), no shadow, additive or status lamp: %r" % mi)
+gu = ents.get("my-gun", {})
+check([l[0].rsplit("/", 1)[-1] for l in gu.get("n", [])] == ["gun-base.png", "gun-head.png"], "a turret's folded head over its base: %r" % gu)
 
 # The client's validator accepts the parts as `gfx` messages.
 for i, p in enumerate(parts):
@@ -347,8 +370,8 @@ check(str(g2.data.raw["mod-data"]["zenith-graphics"].data.fp) != str(data.fp), "
 # The format is in the fingerprint (no separate version field the client would have to read):
 # FORMAT 1's fingerprints stay as they were, a later format makes clients fetch the list again.
 texts = lua.table_from(["{}", "{\"a\": 1}"])
-check(data.v is None and ex.FORMAT == 2 and ex.fingerprint(texts, 1) == ex.fingerprint(texts)
-      and ex.fingerprint(texts, 2) != ex.fingerprint(texts), "the format goes into the fingerprint, not a field")
+check(data.v is None and ex.FORMAT == 3 and ex.fingerprint(texts, 1) == ex.fingerprint(texts)
+      and ex.fingerprint(texts, 2) != ex.fingerprint(texts) and ex.fingerprint(texts, 3) != ex.fingerprint(texts, 2), "the format goes into the fingerprint, not a field")
 
 # A data.raw the extractor can't read only costs the list.
 _, g4 = run("return { item = setmetatable({}, { __pairs = function() error('boom') end }) }")
@@ -401,6 +424,169 @@ check(ms == {"huge-rock": "base/sound/axe-mining-stone", "stone": "core/sound/ax
 rs = {k: v for k, v in md.data.rs.items()} if md is not None and md.data.rs is not None else None
 check(rs == {"stone-wall": "base/sound/manual-repair-simple"},
       "K13: zenith-mining-sounds has each entity's own repair sound: %r" % rs)
+
+# Step 5 task 3a: the steps' sounds (zenith-step-sounds): tiles, rails, resources, decoratives, armours and
+# the two utility sounds, each sound once, a mod's oddly named files as a list, and a broken walking_sound
+# (a string, or a file outside any mod) costing only its own entry: left out, so the client plays its
+# table there, not silence (silent, 0, only for no walking_sound at all).
+STEP_RAW = """
+local function vars(prefix, n, volume)
+  local out = {}
+  for i = 1, n do out[i] = { filename = prefix .. "-" .. i .. ".ogg", volume = volume } end
+  return out
+end
+return {
+  tile = {
+    ["grass-1"] = { type = "tile", name = "grass-1", walking_sound = { variations = vars("__base__/sound/walking/grass", 10, 0.8) } },
+    ["grass-2"] = { type = "tile", name = "grass-2", walking_sound = { variations = vars("__base__/sound/walking/grass", 10, 0.8) } },
+    ["dirt-1"] = { type = "tile", name = "dirt-1", walking_sound = vars("__base__/sound/walking/sand", 9, 0.8) },
+    ["lab-white"] = { type = "tile", name = "lab-white", walking_sound = { filename = "__base__/sound/walking/concrete-1.ogg", volume = 0.5 } },
+    ["one-file"] = { type = "tile", name = "one-file", walking_sound = { filename = "__my-mod__/sound/thud.ogg" } },
+    ["odd-floor"] = { type = "tile", name = "odd-floor", walking_sound = { variations = {
+      { filename = "__my-mod__/sound/floor/clank_a.ogg", min_volume = 0.4, max_volume = 0.6 },
+      { filename = "__my-mod__/sound/floor/clank_b.ogg", min_volume = 0.4, max_volume = 0.6 } } } },
+    ["deepwater"] = { type = "tile", name = "deepwater" },
+    ["broken-tile"] = { type = "tile", name = "broken-tile", walking_sound = "__base__/sound/walking/grass-1.ogg" },
+    ["no-mod-tile"] = { type = "tile", name = "no-mod-tile", walking_sound = { filename = "sound/walking/odd.ogg" } },
+  },
+  ["straight-rail"] = { ["straight-rail"] = { type = "straight-rail", name = "straight-rail",
+    walking_sound = { variations = vars("__base__/sound/walking/rails/rails", 12, 0.6) } } },
+  ["curved-rail-a"] = { ["curved-rail-a"] = { type = "curved-rail-a", name = "curved-rail-a",
+    walking_sound = { variations = vars("__base__/sound/walking/rails/rails", 12, 0.6) } } },
+  resource = {
+    ["crude-oil"] = { type = "resource", name = "crude-oil", walking_sound = { variations = vars("__base__/sound/walking/resources/oil", 7, 0.7) } },
+    ["iron-ore"] = { type = "resource", name = "iron-ore" },
+    ["odd-ore"] = { type = "resource", name = "odd-ore", walking_sound = { filename = 7 } },
+  },
+  ["optimized-decorative"] = {
+    ["brown-asterisk"] = { type = "optimized-decorative", name = "brown-asterisk",
+      walking_sound = { variations = vars("__base__/sound/walking/plant/plant", 5, 0.4) } },
+    ["small-rock"] = { type = "optimized-decorative", name = "small-rock" },
+  },
+  armor = {
+    ["mech-armor"] = { type = "armor", name = "mech-armor",
+      steps_sound = { variations = vars("__space-age__/sound/entity/mech-armor/mech-armor-steps-metallic", 5, 0.2) },
+      moving_sound = { variations = vars("__space-age__/sound/entity/mech-armor/mech-armor-moves", 10, 0.4) } },
+    ["power-armor"] = { type = "armor", name = "power-armor" },
+  },
+  unit = { ["small-biter"] = { type = "unit", name = "small-biter", walking_sound = { filename = "__base__/sound/x.ogg" } } },
+  ["night-vision-equipment"] = { ["night-vision-equipment"] = { type = "night-vision-equipment", name = "night-vision-equipment",
+    activate_sound = { filename = "__base__/sound/nightvision-on.ogg", volume = 0.5 },
+    deactivate_sound = { filename = "__base__/sound/nightvision-off.ogg", volume = 0.5 } } },
+  ["utility-sounds"] = { default = { type = "utility-sounds", name = "default",
+    metal_walking_sound = vars("__core__/sound/walking/transport-belt", 9, 0.6),
+    heat_pipe_walking_sound = vars("__core__/sound/walking/heat-pipe", 5, 0.7) } },
+}
+"""
+_, g8 = run(STEP_RAW)
+sd = g8.data.raw["mod-data"] and g8.data.raw["mod-data"]["zenith-step-sounds"]
+
+
+def py(v):
+    if lupa_type(v) == "table":
+        items = list(v.items())
+        if items and all(isinstance(k, int) for k, _ in items) and sorted(k for k, _ in items) == list(range(1, len(items) + 1)):
+            return [py(v[i]) for i in range(1, len(items) + 1)]
+        return {k: py(x) for k, x in items}
+    return v
+
+
+lupa_type = lua52.lua_type
+step = py(sd.data) if sd is not None else {}
+snd = step.get("s", [])
+
+
+def sound(i):
+    return snd[i - 1] if i else None
+
+
+tile = step.get("tile", {})
+check(sd is not None and sd.data_type == "zenith-step-sounds", "zenith-step-sounds is a mod-data prototype")
+check(sound(tile.get("grass-1")) == ["base/sound/walking/grass", 80, 10] and tile.get("grass-1") == tile.get("grass-2"),
+      f"steps: a tile's variations as their prefix, volume and count, the same sound listed once: {sound(tile.get('grass-1'))}")
+check(sound(tile.get("dirt-1")) == ["base/sound/walking/sand", 80, 9],
+      f"steps: a bare list of variations (sound_variations), dirt-1's sand as Factorio has it: {sound(tile.get('dirt-1'))}")
+check(sound(tile.get("lab-white")) == ["base/sound/walking/concrete", 50, 1] and sound(tile.get("one-file")) == ["my-mod/sound/thud", 100, 1],
+      f"steps: a bare filename, numbered or not, volume 1 when none is given: {sound(tile.get('lab-white'))} {sound(tile.get('one-file'))}")
+check(sound(tile.get("odd-floor")) == [["my-mod/sound/floor/clank_a.ogg", "my-mod/sound/floor/clank_b.ogg"], 50, 2],
+      f"steps: a mod's oddly named files as their list, min and max volume's middle: {sound(tile.get('odd-floor'))}")
+check(tile.get("deepwater") == 0 and len(tile) == 7,
+      f"steps: a tile without a sound listed silent (0), the others still there: {tile}")
+check("broken-tile" not in tile and "no-mod-tile" not in tile,
+      f"steps: a tile whose sound can't be read left out (the client's table), not silent: {tile}")
+ent = step.get("entity", {})
+check(sound(ent.get("straight-rail")) == ["base/sound/walking/rails/rails", 60, 12] and ent.get("curved-rail-a") == ent.get("straight-rail")
+      and sound(ent.get("crude-oil")) == ["base/sound/walking/resources/oil", 70, 7] and set(ent) == {"straight-rail", "curved-rail-a", "crude-oil"},
+      f"steps: rails and resources with a walking sound; not a biter's, nor ore without one or with one that can't be read: {ent}")
+dec = step.get("decorative", {})
+check(sound(dec.get("brown-asterisk")) == ["base/sound/walking/plant/plant", 40, 5] and set(dec) == {"brown-asterisk"},
+      f"steps: a decorative's rustle: {dec}")
+arm = step.get("armor", {})
+check([sound(i) for i in arm.get("mech-armor", [])] == [["space-age/sound/entity/mech-armor/mech-armor-steps-metallic", 20, 5],
+      ["space-age/sound/entity/mech-armor/mech-armor-moves", 40, 10]] and "power-armor" not in arm,
+      f"steps: an armour's steps and moving sounds: {arm}")
+check([sound(i) for i in step.get("u", [])] == [["core/sound/walking/transport-belt", 60, 9], ["core/sound/walking/heat-pipe", 70, 5]],
+      f"steps: the utility sounds, metal (belts) and heat pipes: {step.get('u')}")
+check([sound(i) for i in step.get("nv", [])] == [["base/sound/nightvision-on", 50, 1], ["base/sound/nightvision-off", 50, 1]],
+      f"steps: the night vision equipment's activate and deactivate sounds: {step.get('nv')}")
+check(len({json.dumps(x) for x in snd}) == len(snd), "steps: each sound once")
+
+# One sound listing more files than a part holds keeps those that fit, with a log line.
+fit_mod = lua52.LuaRuntime(unpack_returned_tuples=True)
+fit_mod.globals().package.path = str(MOD / "?.lua") + ";" + fit_mod.globals().package.path
+fit_mod.execute("fit_log = {}; function log(s) fit_log[#fit_log + 1] = s end")
+fitter = fit_mod.execute('return require("scripts.step_sounds")')
+big = fit_mod.execute("""
+local files = {}
+for i = 1, 200 do files[i] = "a-mod/sound/walking/a-rather-long-and-unnumbered-step-file-name_" .. i .. ".ogg" end
+return { files, 70, 200 }""")
+fitted = py(fitter.fit(big, 3))
+fitted_size = len(json.dumps({"t": "steps", "part": 1, "parts": 1, "s": [fitted]}, separators=(",", ":")))
+check(0 < fitted[2] == len(fitted[0]) < 200 and fitted[0] == py(big)[0][:fitted[2]] and fitted_size < 4096
+      and len(list(fit_mod.globals().fit_log.values())) == 1,
+      f"steps: a sound with too many files for a part cut to fit ({fitted[2]} of 200, {fitted_size} bytes), logged once")
+small = fit_mod.execute('return { "base/sound/walking/grass", 80, 10 }')
+check(fit_mod.eval("function(m, s) return m.fit(s, 1) == s end")(fitter, small), "steps: a sound that fits is left as it is")
+
+# Without the utility sounds or any tile, and with nothing at all, a list is still made.
+_, g9 = run("return {}")
+sd9 = g9.data.raw["mod-data"] and g9.data.raw["mod-data"]["zenith-step-sounds"]
+check(sd9 is not None and py(sd9.data.u) == [0, 0], "steps: an empty list without prototypes")
+
+# The runtime side: the messages from the list, in parts under PART_BYTES, the sounds first; none without a list.
+rt = lua52.LuaRuntime(unpack_returned_tuples=True)
+rt.globals().package.path = str(MOD / "?.lua") + ";" + rt.globals().package.path
+steps_mod = rt.execute('return require("scripts.step_sounds")')
+rt.execute("prototypes = { mod_data = {} }")
+reg = rt.eval("{ tile_id = function(n) return 1 end, entity_id = function(n) return 1 end, decorative_id = function(n) return 1 end, item_id = function(n) return 1 end }")
+check(len(list(steps_mod.messages(reg).values())) == 0, "steps: no message when the data stage made no list (the client keeps its table)")
+rt2 = lua52.LuaRuntime(unpack_returned_tuples=True)
+rt2.globals().package.path = str(MOD / "?.lua") + ";" + rt2.globals().package.path
+steps_mod2 = rt2.execute('return require("scripts.step_sounds")')
+rt2.execute("""
+local s, tile = {}, {}
+for i = 1, 300 do s[i] = { "a-mod/sound/walking/ground-number-" .. i, 70, 6 }; tile["t" .. i] = i end
+tile.missing = 5
+prototypes = { mod_data = { ["zenith-step-sounds"] = { get = function(k)
+  return ({ s = s, tile = tile, entity = {}, decorative = {}, armor = {}, u = { 1, 0 } })[k] end } } }
+ids = {}
+for i = 1, 300 do ids["t" .. i] = i end
+""")
+reg2 = rt2.eval("{ tile_id = function(n) return ids[n] or 0 end, entity_id = function() return 0 end, decorative_id = function() return 0 end, item_id = function() return 0 end }")
+msgs2 = [py(m) for m in steps_mod2.messages(reg2).values()]
+sizes = [len(json.dumps(m, separators=(",", ":"))) for m in msgs2]
+all_s = [e for m in msgs2 for e in m.get("s", [])]
+all_tl = [e for m in msgs2 for e in m.get("tl", [])]
+check(len(msgs2) >= 4 and all(sz < 4096 for sz in sizes) and [m["part"] for m in msgs2] == list(range(1, len(msgs2) + 1))
+      and all(m["parts"] == len(msgs2) for m in msgs2) and len(all_s) == 300 and len(all_tl) == 300
+      and msgs2[0]["u"] == [1, 0] and all("u" not in m for m in msgs2[1:]),
+      f"steps: a long list in parts each under the smallest byte budget, every entry once, an unknown name left out: {sizes}")
+first_tl = next(i for i, m in enumerate(msgs2) if "tl" in m)
+check(all("s" not in m for m in msgs2[first_tl + 1:]), "steps: the sounds come before the names that point at them")
+for m in msgs2:
+    m.update({"k": 1, "r": 1, "t": "steps"})
+    for problem in protocol.problems(m):
+        check(False, f"steps: protocol: {problem}")
 
 print("DATA STAGE FAILS: %d" % len(failures))
 sys.exit(1 if failures else 0)

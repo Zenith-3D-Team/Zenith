@@ -10,6 +10,8 @@
 
 #include "belt_native_common.h"
 
+#include <algorithm>
+
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/variant/array.hpp>
@@ -51,6 +53,9 @@ public:
 	static constexpr i64 MAX_STACK = 4;
 	static constexpr double PILE_TURN = 0.45;
 	static constexpr i64 IDS = (i64)1 << 20;
+	static constexpr i64 TURN_RUN = 40503;  // (turn_id) belt_lattice.gd TURN_RUN
+	static constexpr i64 SEED_AFTER = 120;  // (turn_id) belt_lattice.gd SEED_AFTER
+	static constexpr i64 SEED_WL = 28;  // (turn_id) belt_lattice.gd SEED_WL
 	// belt_sim.gd's lane kinds
 	enum Kinds { STRAIGHT = 1, CURVE = 2, UG_VISIBLE = 3, UG_HIDDEN = 4, SPLIT_IN = 5, SPLIT_OUT = 6, LOADER = 7, OTHER = 8 };
 
@@ -79,6 +84,18 @@ private:
 		std::vector<int32_t> fu;  // (creep_flow) its recent front items' ids (low 31 bits), oldest first
 		i64 none_t = -1;  // (creep_flow) the tick the simulation was first seen with none on it, -1 while it has
 		bool gated = false;  // (creep_flow) stood for want of net flow: takes the simulation's speed again only with it
+		i64 slide_at = -1;  // (close) the tick a one-gap slide starts (-1: none)
+		i64 slide_v = 0;  // (close) its speed (1/256 a tick; 0: set and written with the next update)
+		i64 slide_more = 0;  // (close) slides queued after it (takes ahead while it slides)
+		i64 step_bal = 0;  // (creep_step) slides its fronts queued (+) less those close queued (-), not yet matched
+		i64 bal_t = -1;  // (creep_step) the tick step_bal last changed
+		i64 go_lo = -1;  // (start) the tick its motion started from, its record's clock held there before (-1: none)
+		i64 go_hi = -1;  // (start) the tick its motion stops, its record's clock held there after (-1: none)
+		i64 release_t = -1;  // (start) the tick its run in front was extended (-1: none): its next start is at once
+		bool mark_moving = false;  // (mask_inner) whether its mask cells are a moving lane's (end to end)
+		i64 open = 0;  // (mask_open) its end cells left unmarked: OPEN_EXIT, OPEN_ENTRY
+		i64 open_d = 0;  // (handover) how far its slots are off its items at its open end (0: none)
+		i64 go_next = -1;  // (start) stopping on go_hi: the tick it goes on again from there (-1: none)
 	};
 	struct LKind {
 		int base = -1;
@@ -141,6 +158,8 @@ private:
 	int planned_cap = -2;
 	std::unordered_map<i64, i64> feeds;  // lane key -> the drawn lane whose items go on into it
 	bool item_turns = true;  // belt_lattice.gd item_turns (set_item_turns)
+	bool turn_id = true;  // belt_lattice.gd turn_id (set_turn_id)
+	bool edge_shut = true;  // belt_lattice.gd edge_shut (set_edge_shut)
 	double shown = -1.0;  // belt_lattice.gd shown (set_shown): the drawn clock when the update is first drawn
 
 	// --- this update
@@ -172,8 +191,73 @@ private:
 	static constexpr i64 FLOW_GATE = 1000;
 	static constexpr i64 FLOW_GATE_TICKS = 120;
 	i64 _t_draw(i64 tick) const;
-	static i64 _phase_at(const Lane *ln, i64 t) { return beltn::posmod(ln->r0 - ln->v * (t - ln->t0), GAP); }
+	static i64 _phase_at(const Lane *ln, i64 t) {
+		return beltn::posmod(ln->r0 - ln->v * (_held_t(ln, t) - ln->t0) - _slide_moved(ln, t), GAP);
+	}
+	// (start) belt_lattice.gd's.
+	bool start = true;
+	static constexpr i64 RELEASE_TICKS = 120;
+	i64 links_seen = -1;
+	void set_start(bool v) { start = v; }
+	bool start_stops = false;  // (start) belt_lattice.gd start_stops
+	void set_start_stops(bool v) { start_stops = v; }
+	static i64 _held_t(const Lane *ln, i64 t) {
+		i64 c = t;
+		if (ln->go_hi >= 0) {
+			c = std::min(c, ln->go_hi);
+		}
+		if (ln->go_lo >= 0) {
+			c = std::max(c, ln->go_lo);
+		}
+		return c;
+	}
+	void _release_behind(i64 key, i64 tick);
+	// (close, mask_inner, sim_full) belt_lattice.gd's.
+	bool close = true;
+	bool mask_inner = true;
+	bool mask_own = true;  // (mask_own) belt_lattice.gd's
+	bool mask_open = true;  // (mask_open) belt_lattice.gd's
+	static constexpr i64 OPEN_EXIT = 1;
+	static constexpr i64 OPEN_ENTRY = 2;
+	static constexpr i64 OPEN_TOL = 4;
+	void _open_ends(const std::unordered_map<i64, i64> &front_at, i64 tick);
+	bool sim_full = true;
+	static constexpr i64 CLOSE_MORE = 4;
+	void set_close(bool v) { close = v; }
+	void set_mask_inner(bool v) { mask_inner = v; }
+	void set_mask_own(bool v) { mask_own = v; }
+	void set_mask_open(bool v) { mask_open = v; }
+	bool handover = true;  // (handover) belt_lattice.gd's
+	static constexpr i64 HAND_SLACK = 3;
+	void set_handover(bool v) { handover = v; }
+	static double _hand_code(const Lane *ln, i64 k, i64 length);
+	void set_sim_full(bool v) { sim_full = v; }
+	bool tail = true;  // (tail) belt_lattice.gd's
+	static constexpr i64 TAIL_NEED = 2 * GAP;
+	void set_tail(bool v) { tail = v; }
+	std::unordered_map<i64, i64> fed_gone;  // (sim_full) belt_lattice.gd fed_gone
+	static constexpr i64 FED_GONE_TICKS = 1800;
+	void feed_gone(i64 key, i64 tick) { fed_gone[key] = tick; }
+	static i64 _slide_moved(const Lane *ln, i64 t) {
+		if (ln->slide_at < 0 || ln->slide_v <= 0) {
+			return 0;
+		}
+		return std::clamp<i64>(ln->slide_v * (t - ln->slide_at), 0, GAP);
+	}
+	static i64 _slide_ticks(const Lane *ln) { return (i64)std::ceil((double)GAP / (double)std::max<i64>(1, ln->slide_v)); }
+	void _slide_done(Lane *ln);
+	static void _slide_clear(Lane *ln) {
+		ln->slide_at = -1;
+		ln->slide_v = 0;
+		ln->slide_more = 0;
+	}
+	void _close_behind(i64 key, i64 at);
 	void set_creep_flow(bool v) { creep_flow = v; }
+	bool creep_step = false;  // belt_lattice.gd creep_step
+	static constexpr i64 STEP_BAL_TICKS = 90;
+	void set_creep_step(bool v) { creep_step = v; }
+	i64 _front_flow(Lane *ln, i64 u, i64 tick);
+	void _creep_step(Lane *ln, i64 u, i64 step, i64 f, i64 fv, bool has, i64 tick);
 	bool _creep_flow(Lane *ln, i64 lv, i64 u, i64 step, i64 tick, i64 pred, i64 f);
 	void _creep_stop(Lane *ln, i64 r0, i64 tick);
 	void set_drawn_tick(i64 t) { drawn_tick = t; }
@@ -198,6 +282,9 @@ private:
 	void _set_motion(Lane *ln, i64 r0, i64 v, i64 tick);
 	i64 _lag(i64 dv, i64 tick) const { return shown >= 0.0 && dv != 0 ? beltn::roundi((double)dv * (shown - (double)tick)) : 0; }
 	void _identify(i64 key, Lane *ln, const int32_t *m, i64 tick);
+	bool _seed(Lane *ln, i64 at, i64 num, i64 tick);
+	static i64 _seed_who(const Lane *ln, i64 at, i64 num, i64 tick);
+	bool _ring(i64 key);
 	Vector4 _point(i64 key, double pos) const;
 	Ends _ends(i64 key, i64 length) const;
 	Vector4 _along(i64 key, double pos, i64 length, const Ends &ends) const;
@@ -217,6 +304,8 @@ public:
 	void set_sim(Object *p_sim);
 	void set_small_pages(bool on) { records.set_small(on); }
 	void set_item_turns(bool on) { item_turns = on; }
+	void set_turn_id(bool on) { turn_id = on; }
+	void set_edge_shut(bool on) { edge_shut = on; }
 	void set_shown(double t) { shown = t; }
 	void set_lane(i64 key, const PackedInt32Array &meta, const PackedFloat64Array &arc);
 	void note_read(i64 key, i64 length, const PackedInt64Array &items);

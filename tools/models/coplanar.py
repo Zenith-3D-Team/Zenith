@@ -3,7 +3,8 @@ the depth test picks a different one from frame to frame and the surface flicker
 covers more. Materials are double-sided in Zenith's models, so faces facing either way count.
 
 python tools/models/coplanar.py [names...] [--all] [--eps 0.003] [--top 30]
-prints each model's overlapping area (square tiles) and the material pairs it is between
+prints each model's overlapping area (square tiles) and the material pairs it is between; --all is every model of ours, a
+name ours or fue5/<name> (tools/models/packs.py)
 """
 import argparse
 import collections
@@ -12,7 +13,7 @@ import pathlib
 import numpy as np
 import trimesh
 
-MODELS = pathlib.Path(__file__).resolve().parents[2] / "client" / "assets" / "models"
+import packs
 
 
 def triangles(path):
@@ -108,7 +109,8 @@ def main():
     ap.add_argument("--eps", type=float, default=0.003)
     ap.add_argument("--top", type=int, default=30)
     a = ap.parse_args()
-    files = sorted(MODELS.glob("*.glb")) if a.all else [MODELS / (n if n.endswith(".glb") else n + ".glb") for n in a.names]
+    files = [pathlib.Path(p) for p in (packs.glbs() if a.all else
+                                       (packs.resolve(n[:-4] if n.endswith(".glb") else n) for n in a.names))]
     rows = []
     for f in files:
         try:

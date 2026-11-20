@@ -46,9 +46,9 @@ sys.path.insert(0, HERE)
 
 import fit  # noqa: E402
 import fit_cells  # noqa: E402
+import packs  # noqa: E402
 import score_proto  # noqa: E402
 
-MODELS = os.path.join(REPO, "client", "assets", "models")
 ENTRIES = os.path.join(REPO, "client", "data", "sprite_projection.json")
 SUFFIX = re.compile(r"-(east|south|west|ne|nw|se|sw|corner-\w+|inner-\w+|wall-\w+|flaming|hot|gun|armor-\d|mech-armor)$")
 
@@ -185,7 +185,7 @@ def main():
             continue
         meshes = {}
         for model in {j[6] for j in js}:
-            glb = os.path.join(MODELS, model + ".glb")
+            glb = packs.model_path(model)
             if os.path.exists(glb):
                 meshes[model] = fit.load_mesh(glb, a.faces)
         if not meshes:

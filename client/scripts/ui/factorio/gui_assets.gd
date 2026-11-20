@@ -175,14 +175,14 @@ static func side_menu_icon(row: int) -> Texture2D:
 ## others technology.lua names most of them, and levelled technologies ("logistics-2") without
 ## their own entry use their base's.
 static func tech_icon(tech: String) -> Texture2D:
-	var dir := ItemIcons.find_data_dir()
-	if dir == "":
-		return null
-	# The prototypes' own icons (icons.json), with the bonus badges; the guesses below are for
-	# technologies the index doesn't know (a mod's).
+	# A model pack's icon, else the prototypes' own (icons.json), with the bonus badges; the guesses
+	# below are for technologies the index doesn't know (a mod's).
 	var indexed := ItemIcons.texture_for_kind("technology", tech)
 	if indexed != null:
 		return indexed
+	var dir := ItemIcons.find_data_dir()
+	if dir == "":
+		return null
 	_load_tech_paths(dir)
 	var names := [tech]
 	var base := tech

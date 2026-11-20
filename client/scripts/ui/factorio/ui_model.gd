@@ -38,6 +38,8 @@ signal roboports_changed
 signal landing_pad_found(si: int, q: int, at: Vector2, found: bool)
 ## The mod answered about the hovered machine or beacon (`hinfo`): hover_info changed.
 signal hover_info_changed
+## The map view's resource patch under the mouse changed (L6: map_patch).
+signal map_patch_changed
 ## The mod's answer to command(): its lines; `known` false when the bridge doesn't run that command.
 signal command_answered(id: int, lines: Array, known: bool)
 ## The same answer whole (`cmdr`), for what reads more than its lines: `na` (not allowed to run
@@ -96,6 +98,24 @@ var main_filters := {}
 ## item -> total count in the main inventory.
 var counts := {}
 
+## L2 (the owner's playtest, its leftover): a build spends its item in the game on the bridge's next
+## tick, but the inventory comes with its report, up to 30 ticks later; only the count at the cursor
+## counted the builds sent meanwhile (predicted.gd spend). Now the quickbar and the inventory's slots
+## show them gone at once too: `_spent` (item -> builds sent that the inventory heard still holds,
+## factorio_ui.gd set_spent each frame) is taken off the stacks as the bridge takes them, the hand's
+## slot first and then the stacks the hand refills from (L7), and given back when the game refuses a
+## build (predicted.gd drops the spend). `--slot-counts=report`: the slots wait for the report, as
+## before.
+signal shown_changed
+static var shown_fix := not ("--slot-counts=report" in OS.get_cmdline_user_args())
+var _spent := {}
+## The main inventory slot (1-based) the hand holds its stack from, its item and quality (0, "": none).
+var _spent_hand := 0
+var _spent_held := ""
+var _spent_quality := "normal"
+## _spend_from_slots()'s answer for the slots and spends as they are ([] to work it out again).
+var _shown: Array = []
+
 ## Hand-craftable recipes in Factorio's order, each a dictionary:
 ##   name, group, subgroup, order (strings, "" unknown), energy (seconds, -1 unknown),
 ##   ingredients and products ([[item, amount], ...], empty when unknown),
@@ -140,6 +160,11 @@ var _server_quickbar: Array = []
 var techs := {}
 var research := ""
 var research_progress := 0.0
+## The technology that finished last, while nothing is being researched since (`rdone`), and the level
+## it finished for a levelled one (else 0): a lab's window says "<name> finished. Press T." as
+## Factorio's does (production_panels.gd lab). "" once a research is in progress.
+var research_finished := ""
+var research_finished_level := 0
 var research_queue: Array = []
 
 ## The map, chunk by chunk as requested with request_map(): Vector2i -> Image (n x n pixels, one per
@@ -203,19 +228,22 @@ var train_of_unit := {}
 ## slot (1-based).
 var guns: Array = []
 var selected_gun := 1
+## N3: the unit number of the car, tank or spidertron whose guns `guns` holds (0: the character's).
+## While it is set the tool bar shows the vehicle's guns and ammo, as Factorio's does.
+var guns_vehicle := 0
 
 var _unghost_q := 0
 ## Demolisher territories (`terr`): their borders as tile segments, [a0, b0, a1, b1, ...] where a
 ## chunk of a territory meets ground that isn't that territory's.
 var territory_edges := PackedVector2Array()
-## The same territories' chunks (Vector2i -> true), which the map view stripes, and the surface
+## The same territories' chunks (Vector2i -> true), which the map view stripes (G20), and the surface
 ## they are on (`si`; 0 when the mod didn't say: then the character's).
 var territory_chunks := {}
 var territory_si := 0
 ## Pollution by chunk on the map's surface (charts' `pol`).
 var map_pollution := {}
 var _territory_parts: Array = []
-## What the mod says about the machine or beacon under the mouse (`hinfo`): {"u" (its unit),
+## What the mod says about the machine or beacon under the mouse (`hinfo`, G12): {"u" (its unit),
 ## "eff" ({sp, pr, co, po, q} in thousandths), "m" ([[module, count, quality], ...]), "b" (beacons
 ## reaching it), "n" (machines a beacon reaches), "de" (a beacon's distribution effectivity), "el"
 ## (its electricity, H20: {"e" joules in its buffer, "b" the buffer's size, "mx" / "mn" its max. and
@@ -224,8 +252,19 @@ var _territory_parts: Array = []
 ## craft's progress, its rate a second and the fuel left, I26, thousandths), "at" (msec read)}.
 var hover_info := {}
 var _hinfo_q := 0
+## L6: the resource patch under the mouse on the map (`rpatch`): {"n" name, "a" amount summed, "c" how many, "y"?
+## (an infinite one's yields summed, percent), "more"? (cut short), "o" (its tiles as rows [y, x, length, ...]),
+## "q"}, or {} for none.
+var map_patch := {}
+var _patch_q := 0
+var _patch_tile := Vector2i(1 << 30, 1 << 30)
+## Wait at most this long for an in-flight `hinfo` answer before allowing a switch to another
+## entity (prevents flooding the server when sweeping across machines while staying instant when
+## the previous answer has arrived).
+const HINFO_PENDING_MSEC := 120
 var _hinfo_unit := 0
 var _hinfo_msec := -100000
+var _hinfo_pending := false
 ## The clipboard while pasting (`clip`): [{"p" (proto id), "at" (Vector2 tiles from its centre), "d"}].
 var clipboard: Array = []
 ## Blueprints and planners: exchange strings, the libraries, undo entries, qualities (planner_model.gd).
@@ -361,6 +400,20 @@ var _parts := {}  # message type -> the multi-part list being received
 ## included); Factorio's base 10 until the first `cinfo` arrives.
 func build_reach() -> float:
 	return float(character_info.get("build", 100)) / 10.0
+
+
+## Issue #24: the character's reach for mining by hand in tiles, from `cinfo` (`rreach` for a resource,
+## else `reach`; bonuses included); Factorio 2.1's base 2.7 and 10 until the first `cinfo` arrives.
+func mine_reach(resource: bool) -> float:
+	if resource:
+		return float(character_info.get("rreach", 27)) / 10.0
+	return float(character_info.get("reach", 100)) / 10.0
+
+## Whether the force may mine with fluid (the "Uranium mining" research's effect), from `cinfo` mwf; true from a bridge
+## that doesn't send it, or before the first `cinfo` (the drill's preview then refuses nothing more than before).
+func mines_with_fluid() -> bool:
+	return int(character_info.get("mwf", 1)) != 0
+
 
 func _init() -> void:
 	quickbar.resize(QUICKBAR_SLOTS)
@@ -672,9 +725,29 @@ func handle(msg: Dictionary) -> bool:
 		"lpad":
 			landing_pad_found.emit(int(msg.get("si", 0)), int(msg.get("q", 0)),
 				Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0, msg.has("x") and msg.has("y"))
+		"rpatch":
+			if int(msg.get("q", 0)) == _patch_q:
+				var patch := {}
+				if msg.has("n"):
+					patch = {"n": str(msg["n"]), "a": int(msg.get("a", 0)), "c": int(msg.get("c", 0)), "q": _patch_q,
+						"o": _array(msg.get("o"))}
+					if msg.has("y"):
+						patch["y"] = int(msg["y"])
+					if msg.has("more"):
+						patch["more"] = 1
+				map_patch = patch
+				map_patch_changed.emit()
 		"hinfo":
 			if int(msg.get("q", 0)) == _hinfo_q:
+				_hinfo_pending = false
 				var info := {"u": int(msg.get("u", 0)), "m": []}
+				# L11: a pipe's pipeline extent and limit, and whether it is overextended; L6: a resource's amount.
+				if msg.get("pl") is Array and (msg["pl"] as Array).size() >= 2:
+					info["pl"] = [int(msg["pl"][0]), int(msg["pl"][1])]
+				if msg.has("ox"):
+					info["ox"] = 1
+				if msg.has("ra"):
+					info["ra"] = int(msg["ra"])
 				if msg.get("eff") is Dictionary:
 					var eff := {}
 					for k in msg["eff"]:
@@ -911,6 +984,9 @@ func handle(msg: Dictionary) -> bool:
 			research = str(msg.get("cur", ""))
 			research_progress = int(msg.get("pr", 0)) / 1000.0
 			research_queue = _array(msg.get("q"))
+			if research != "":
+				research_finished = ""
+				research_finished_level = 0
 			research_changed.emit()
 		"rdone":
 			var done: Array = []
@@ -928,6 +1004,8 @@ func handle(msg: Dictionary) -> bool:
 				if research == d["name"]:
 					research = ""
 					research_progress = 0.0
+			research_finished = str((done[-1] as Dictionary)["name"])
+			research_finished_level = int((done[-1] as Dictionary)["level"])
 			var more = msg.get("n", 0)
 			var tick = msg.get("tick", msg.get("k", 0))
 			research_done.emit(done, maxi(0, int(more)) if (more is float or more is int) else 0,
@@ -1023,6 +1101,7 @@ func sort_inventory(role := "main", unit := 0) -> void:
 
 func _set_slots(slots: Array) -> void:
 	main_slots = slots
+	_shown = []
 	counts.clear()
 	for s in slots:
 		if not s.is_empty():
@@ -1042,6 +1121,113 @@ func icons_of(item: String) -> Array:
 
 func count_of(item: String) -> int:
 	return int(counts.get(item, 0))
+
+
+## L2: the builds sent that the inventory heard hasn't lost yet (`spent`: item -> how many), and the
+## hand they are built from: its main inventory slot (0: none in particular), item and quality.
+func set_spent(spent: Dictionary, hand_slot := 0, held := "", quality := "normal") -> void:
+	if not shown_fix:
+		spent = {}
+	var hand_same := hand_slot == _spent_hand and held == _spent_held and quality == _spent_quality
+	_spent_hand = hand_slot
+	_spent_held = held
+	_spent_quality = quality
+	if spent == _spent and (spent.is_empty() or hand_same):
+		return  # nothing shown changes: with nothing spent the hand alone moves no count
+	_spent = spent.duplicate()
+	_shown = []
+	shown_changed.emit()
+
+
+## How many of the item the quickbar shows: the inventory's less the builds sent it still holds (L2).
+func shown_count_of(item: String) -> int:
+	return maxi(0, count_of(item) - int(_spent.get(item, 0)))
+
+
+## The main inventory as the window shows it: main_slots with the builds sent taken off (L2). The
+## same array while nothing is spent; else a copy, the changed stacks copies too.
+func shown_main_slots() -> Array:
+	return main_slots if _spent.is_empty() else _spend_from_slots()[0]
+
+
+## The main inventory slot (1-based) the hand's stack is in once the builds sent are counted: the
+## hand's own while it lasts, then the stack the cursor refills from (L7); 0 with none left (or no
+## hand slot given).
+func shown_hand() -> int:
+	return _spent_hand if _spent.is_empty() else int(_spend_from_slots()[1])
+
+
+## The shown stack in a main inventory slot (1-based), or {}.
+func shown_stack_at(index: int) -> Dictionary:
+	var list := shown_main_slots()
+	return list[index - 1] if index >= 1 and index <= list.size() and list[index - 1] is Dictionary else {}
+
+
+## The stack Factorio's cursor refills from when the held stack runs out (J3, L7): the first of the
+## item in the held quality, else the first of it, in `slots`; 1-based, 0 for none.
+static func refill_slot(slots: Array, item: String, quality := "normal") -> int:
+	var other := 0
+	for i in slots.size():
+		var s = slots[i]
+		if not (s is Dictionary) or str(s.get("item", "")) != item or int(s.get("count", 0)) <= 0:
+			continue
+		if str(s.get("quality", "normal")) == quality:
+			return i + 1
+		if other == 0:
+			other = i + 1
+	return other
+
+
+## The quality the bridge builds when `wanted` is asked for (building.lua pick_quality): that one
+## while the slots hold the item in it, else normal, else the first by name.
+static func built_quality(slots: Array, item: String, wanted: String) -> String:
+	var have := {}
+	for s in slots:
+		if s is Dictionary and str(s.get("item", "")) == item and int(s.get("count", 0)) > 0:
+			have[str(s.get("quality", "normal"))] = true
+	if have.has(wanted) or have.is_empty():
+		return wanted
+	if have.has("normal"):
+		return "normal"
+	var names := have.keys()
+	names.sort()
+	return str(names[0])
+
+
+## [main_slots with `_spent` taken off, the hand's slot after it, ...]: each build comes off the
+## stack the bridge takes it from (building.lua): the hand's while it holds the item in the quality
+## built, else the first stack of that quality; an emptied hand moves on to the stack the cursor
+## refills from, as Factorio's does.
+func _spend_from_slots() -> Array:
+	if not _shown.is_empty() and int(_shown[2]) == _spent_hand and str(_shown[3]) == _spent_held and str(_shown[4]) == _spent_quality:
+		return _shown
+	var out := main_slots.duplicate()
+	var hand := _spent_hand
+	if hand > out.size() or (hand > 0 and str((out[hand - 1] as Dictionary).get("item", "")) != _spent_held):
+		# The inventory heard has that stack gone already: the hand is on the next one (_check_hand).
+		hand = refill_slot(out, _spent_held, _spent_quality) if _spent_hand > 0 else 0
+	for item in _spent:
+		var name := str(item)
+		var mine := name == _spent_held and _spent_hand > 0
+		var left := int(_spent[item])
+		while left > 0:
+			var q := built_quality(out, name, _spent_quality if mine else "normal")
+			var at := refill_slot(out, name, q)
+			if mine and hand > 0 and str((out[hand - 1] as Dictionary).get("quality", "normal")) == q:
+				at = hand
+			if at == 0:
+				break
+			var st: Dictionary = (out[at - 1] as Dictionary).duplicate()
+			var k := mini(left, int(st.get("count", 0)))
+			if k <= 0:
+				break
+			st["count"] = int(st["count"]) - k
+			left -= k
+			out[at - 1] = st if int(st["count"]) > 0 else {}
+			if mine and at == hand and int(st["count"]) <= 0:
+				hand = refill_slot(out, name, _spent_quality)
+	_shown = [out, hand, _spent_hand, _spent_held, _spent_quality]
+	return _shown
 
 
 ## A module (`iuse` "m"): clicked on a building or ghost, it goes in or is asked for (F6).
@@ -1078,13 +1264,10 @@ func slots_of(role: String) -> Array:
 		return main_slots
 	if other_slots.has(role):
 		return other_slots[role]
+	if role == "vammo":
+		return gun_slots("ammo") if guns_vehicle != 0 else []
 	if role == "guns" or role == "ammo":
-		var out: Array = []
-		for g in guns:
-			var item := str(g[0] if role == "guns" else g[1]) if g is Array and g.size() >= 3 else ""
-			var n := 1 if role == "guns" else int(g[2]) if g is Array and g.size() >= 3 else 0
-			out.append({"item": item, "count": n} if item != "" and n > 0 else {})
-		return out
+		return gun_slots(role)
 	return []
 
 
@@ -1102,10 +1285,22 @@ func knows_slots(role: String) -> bool:
 # --- guns ------------------------------------------------------------------------------------
 
 ## The `guns` message.
-func set_guns(sel: int, list: Array) -> void:
+func set_guns(sel: int, list: Array, vehicle := 0) -> void:
 	selected_gun = maxi(1, sel)
 	guns = list
+	guns_vehicle = vehicle
 	guns_changed.emit()
+
+
+## The `guns` message's list as slots ("guns" or "ammo", like main_slots): the vehicle's while
+## driving (N3), else the character's when the mod sends no `slots` for them.
+func gun_slots(role: String) -> Array:
+	var out: Array = []
+	for g in guns:
+		var item := str(g[0] if role == "guns" else g[1]) if g is Array and g.size() >= 3 else ""
+		var n := 1 if role == "guns" else int(g[2]) if g is Array and g.size() >= 3 else 0
+		out.append({"item": item, "count": n} if item != "" and n > 0 else {})
+	return out
 
 
 ## Uses gun slot `index` (1-based), like Factorio's Tab or clicking the gun.
@@ -1181,7 +1376,9 @@ func total_raw(name: String, given: Dictionary = {}) -> Dictionary:
 	var r := recipe(name)
 	if r.is_empty() or (r["ingredients"] as Array).is_empty():
 		r = given
-	if not r.is_empty():
+	# Only once its ingredients are known: a tooltip opened before the recipe's Factoriopedia page came
+	# (recipe_info's {"name"} alone) kept an empty answer, and no Total raw, until the recipes changed.
+	if not r.is_empty() and not (r.get("ingredients", []) as Array).is_empty():
 		_add_raw(r, 1.0, out, [name])
 		_raw_cache[name] = out
 	return out
@@ -2057,7 +2254,7 @@ func has_roboport_at(si: int, fixed_at: Vector2i) -> bool:
 	return _roboports.has(si) and _roboports[si]["at"].has(fixed_at)
 
 
-## Whether a roboport's construction area on surface `si` holds this chunk's centre.
+## Whether a roboport's construction area on surface `si` holds this chunk's centre (H13).
 func roboport_covers(si: int, chunk: Vector2i) -> bool:
 	# Asked for every chunk round the view several times a second: no dictionary made on the way.
 	return _roboports.has(si) and _roboports[si]["chunks"].has(chunk)
@@ -2084,7 +2281,7 @@ func ask_map_trains() -> void:
 	Bridge.send(cmd)
 
 
-## Whether radars, roboports' construction areas or the character (at `character_at` on the
+## Whether radars, roboports' construction areas (H13) or the character (at `character_at` on the
 ## character's surface) see this chunk. Until the mod has said where its radars are, everything
 ## counts as seen.
 func chunk_covered(chunk: Vector2i, character_at: Vector2) -> bool:
@@ -2147,16 +2344,21 @@ static func territory_borders(territories: Array) -> PackedVector2Array:
 	return out
 
 
-## Asks the mod about the machine or beacon under the mouse: at once when it is a new one,
-## then about once a second while it stays, as beacons and modules come and go.
+## Asks the mod about the machine or beacon under the mouse (G12): at once when it is a new one
+## (capped at one in-flight request until answered or HINFO_PENDING_MSEC elapses), then about once
+## a second while it stays, as beacons and modules come and go.
 func ask_hover_info(unit: int, proto_id: int, fixed: Vector2i) -> void:
 	var now := Time.get_ticks_msec()
 	if unit == _hinfo_unit and now - _hinfo_msec < 1000:
 		return
 	if unit != _hinfo_unit:
-		hover_info = {}
+		if int(hover_info.get("u", 0)) != unit:
+			hover_info = {}
+		if _hinfo_pending and now - _hinfo_msec < HINFO_PENDING_MSEC:
+			return
 	_hinfo_unit = unit
 	_hinfo_msec = now
+	_hinfo_pending = true
 	_hinfo_q += 1
 	Bridge.send({"t": "hinfo", "q": _hinfo_q, "u": unit, "p": proto_id, "x": fixed.x, "y": fixed.y})
 
@@ -2183,6 +2385,39 @@ func command(text: String) -> int:
 
 ## Right-click on the map: asks the mod to remove the ghost under `position` (tiles) on the map's
 ## surface; unghost_answered says whether there was one. Returns the request's id.
+## L6: asks for the resource patch at a tile of the map's surface (once a tile: the map view asks when the mouse
+## rests on one outside the patch shown). The answer comes as `rpatch` (map_patch).
+func ask_patch(tile: Vector2i) -> void:
+	if tile == _patch_tile:
+		return
+	_patch_tile = tile
+	_patch_q += 1
+	var cmd := {"t": "rpatch", "q": _patch_q, "x": tile.x * 256 + 128, "y": tile.y * 256 + 128}
+	if map_si > 0:
+		cmd["si"] = map_si
+	Bridge.send(cmd)
+
+
+## No patch under the mouse any more (it left the map, or the map closed).
+func clear_patch() -> void:
+	_patch_tile = Vector2i(1 << 30, 1 << 30)
+	_patch_q += 1
+	if not map_patch.is_empty():
+		map_patch = {}
+		map_patch_changed.emit()
+
+
+## Whether a tile is one of the shown patch's (its outline rows).
+static func patch_has(patch: Dictionary, tile: Vector2i) -> bool:
+	for row in patch.get("o", []):
+		if not (row is Array) or row.size() < 3 or int(row[0]) != tile.y:
+			continue
+		for i in range(1, row.size() - 1, 2):
+			if tile.x >= int(row[i]) and tile.x < int(row[i]) + int(row[i + 1]):
+				return true
+	return false
+
+
 func unghost(position: Vector2) -> int:
 	_unghost_q += 1
 	var cmd := {"t": "unghost", "q": _unghost_q, "x": roundi(position.x * 256), "y": roundi(position.y * 256)}

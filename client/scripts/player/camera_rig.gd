@@ -5,7 +5,7 @@ extends Node3D
 ## whether it is inverted; --camera=... wins over the setting.
 
 const MIN_DISTANCE := 6.0
-## The furthest zoom by default; Settings > Camera > Furthest zoom changes it.
+## The furthest zoom by default; Settings > Camera > Furthest zoom changes it (owner's H19).
 const MAX_DISTANCE := 140.0
 const MAX_ZOOM_RANGE := Vector2(60.0, 400.0)
 # Below 20° the far edge of the loaded chunks comes into view; above 85° yaw stops making sense.
@@ -34,6 +34,13 @@ const GroundHeight := preload("res://scripts/world/ground_height.gd")
 ## ground that would come between, and it is on the character as it moves. `--camera-focus=off`: the
 ## camera as before.
 static var focus_fix := not ("--camera-focus=off" in OS.get_cmdline_user_args())
+## L1 (the owner's playtest): zoomed, turned or tilted out of Factorio's view (F6), the view stayed
+## orthographic, Factorio's, while F7 flipped the normal view's setting (still perspective), so its
+## first press said "Normal view: orthographic" and changed nothing; it took two. Now leaving Factorio's
+## view that way puts the normal view's own projection back (Settings > Camera, as I19 has it), and F7
+## always switches what is on screen and says so: in Factorio's view itself it leaves it where it is,
+## in the other projection. `--f6-leave=old`: the view stays orthographic and F7 there as before.
+static var f6_leave_fix := not ("--f6-leave=old" in OS.get_cmdline_user_args())
 ## The 1.7-tile character's middle over its feet: the view's centre.
 const BODY_MID := 0.85
 ## The default zoom: the up and down glide below is as tight on screen at every zoom as there.
@@ -79,7 +86,7 @@ var max_distance := MAX_DISTANCE
 ## the view starts and stays where it was asked for.
 var _arg_distance := 0.0
 ## In the remote view (factorio_ui.gd sets it), the map's own projection applies instead of
-## `orthographic` (Settings > Camera, one for the map and one for the normal view).
+## `orthographic` (owner's H17: Settings > Camera, one for the map and one for the normal view).
 var in_remote := false
 var remote_orthographic := true
 ## First person's own projection (owner's I19: each view keeps the one set in Settings, and only F7
@@ -132,6 +139,26 @@ var _ground_back := 0.0
 var _last_goal := Vector3.INF
 var _goal_y := 0.0
 var _glide := Vector3.ZERO
+## (Add-on API 1.7) Add-ons' camera modifiers (api.camera.set_modifier): a bob, a sway, a shake, a
+## kick of the FOV, summed and capped by addon_host.gd and drawn on top of the player's own view in the
+## angled view, Factorio's view and first person, never in a ride's film, the remote view, VR or an
+## add-on's take-over. Drawn only: walking reads the view from before them (ground_forward), and the
+## first-person pick reaches no further from a moved eye (modifier_reach). `--camera-modifiers=off`:
+## the rig ignores them.
+static var modifiers_on := not ("--camera-modifiers=off" in OS.get_cmdline_user_args())
+var _mod_offset := Vector3.ZERO
+var _mod_turn := Vector3.ZERO
+var _mod_fov := 0.0
+var _mod_on := false
+## Whether this frame's camera has the modifier on it, its own transform from before it, and that
+## transform's basis in the world as the engine works it out (walking reads it: the very value it reads
+## without a modifier, to the bit).
+var _mod_shown := false
+var _base := Transform3D.IDENTITY
+var _base_world := Basis.IDENTITY
+## (1.7) An add-on's take({"aim": "center"}): building, mining and the hover aim at the middle of the
+## screen, as in first person (aims_center).
+var _taken_aim_center := false
 
 
 func _ready() -> void:
@@ -178,6 +205,9 @@ func apply_settings() -> void:
 
 
 func _process(delta: float) -> void:
+	if _view_anchor != null:
+		_view_anchor.visible = view_mode() == "first_person"
+	_left_factorio_view()
 	if not _taken.is_empty():
 		if taken_focus != Vector2.INF:
 			global_position = _follow(Vector3(taken_focus.x, 0.0, taken_focus.y))
@@ -185,7 +215,7 @@ func _process(delta: float) -> void:
 	if first_person:
 		# Locked to the character: any lag would feel like a lurching head.
 		if target != null:
-			global_position = GroundHeight.lift(target.global_position)
+			global_position = GroundHeight.lift(target.global_position + _lifted(target))
 		var look := Basis(Vector3.UP, deg_to_rad(_look_yaw)) * Basis(Vector3.RIGHT, -deg_to_rad(_look_pitch))
 		camera.transform = Transform3D(look, Vector3(0.0, EYE_HEIGHT, 0.0))
 		# Set only when it differs: Camera3D's setters don't check, and each one updates the
@@ -197,6 +227,7 @@ func _process(delta: float) -> void:
 				camera.size = FIRST_PERSON_ORTHO_SIZE
 		elif camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
 			camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+		_modify()
 		return
 	if target != null:
 		# A ride's camera goes up with the rocket; only the view on foot stays level.
@@ -226,6 +257,47 @@ func _process(delta: float) -> void:
 		camera.size = distance * ORTHO_SCALE
 	elif camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
 		camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+	_modify()
+
+
+## (1.7) The add-ons' modifier, already summed and capped (addon_host.gd), drawn from the next _process.
+func set_modifier(offset: Vector3, turn: Vector3, fov: float) -> void:
+	_mod_offset = offset
+	_mod_turn = turn
+	_mod_fov = fov
+	_mod_on = modifiers_on and (offset != Vector3.ZERO or turn != Vector3.ZERO or fov != 0.0)
+
+
+## The view's own field of view, without a modifier: first person's or the angled view's.
+func _own_fov() -> float:
+	return FIRST_PERSON_FOV if first_person else 35.0
+
+
+## The modifier on top of the transform _process has just built from nothing (so it never adds up over
+## frames), in the player's three views only; elsewhere the add-on's number is kept for afterwards. The
+## field of view goes back to the view's own when the last modifier goes. Orthographic views keep theirs.
+func _modify() -> void:
+	if not _mod_on and not _mod_shown:
+		return
+	_mod_shown = _mod_on and not in_cinematic() and not in_remote and vr_view == null
+	var fov := _own_fov()
+	if _mod_shown:
+		_base = camera.transform
+		_base_world = camera.global_transform.basis
+		var t := _base
+		t.origin += t.basis * _mod_offset
+		t.basis = t.basis * Basis.from_euler(_mod_turn)
+		camera.transform = t
+		if not view_orthographic():
+			fov = clampf(fov + _mod_fov, 10.0, 120.0)
+	if not is_equal_approx(camera.fov, fov):  # Camera3D's setter doesn't check (see first person's)
+		camera.fov = fov
+
+
+## (1.7) How far the modifier moves the eye from where the player's view has it (tiles): the
+## first-person pick's reach is cut by it, so a moved eye never picks further than an unmoved one.
+func modifier_reach() -> float:
+	return _mod_offset.length() if _mod_shown else 0.0
 
 
 ## Whether the view in use is drawn orthographic: first person's, the map's remote view's or the
@@ -242,8 +314,18 @@ func in_factorio_view() -> bool:
 	return not _saved_view.is_empty() and not first_person and orthographic and _factorio_snap == [_yaw_goal, pitch_degrees, _distance_goal]
 
 
+## L1: turned, tilted or zoomed out of Factorio's view, the normal view's own projection is back (the
+## view before is still kept, so F6 snaps to Factorio's again and once more goes back to it, G5).
+## Called wherever the view is moved, and each frame for whatever else moves it.
+func _left_factorio_view() -> void:
+	if not f6_leave_fix or _saved_view.is_empty() or first_person or not orthographic or in_cinematic():
+		return
+	if _factorio_snap != [_yaw_goal, pitch_degrees, _distance_goal]:
+		orthographic = bool(_saved_view["ortho"])
+
+
 ## Jumps straight to Factorio's view centred on the character, or back to the view before it.
-## F6 sometimes took several presses. Turning, tilting or zooming in Factorio's view
+## Owner's G5: F6 sometimes took several presses. Turning, tilting or zooming in Factorio's view
 ## (a nudge of the middle mouse, the wheel) left it marked as on, so the next press went back to
 ## the view before instead of snapping, and in first person the snap didn't show at all. Now a
 ## press snaps whenever the view isn't exactly Factorio's, and goes back only from it.
@@ -290,12 +372,15 @@ func _snap(yaw: float, pitch: float, dist: float, ortho: bool) -> void:
 
 
 ## F7 (owner's H17): flips the projection of the view in use, first person, the map's remote view
-## or the normal view, and keeps it as that view's setting, so Settings shows it (I19). Factorio's
-## view (F6) stays orthographic: there F7 changes the normal view's, used on leaving it. Returns a
-## line saying what it is now.
+## or the normal view, and keeps it as that view's setting, so Settings shows it (I19). It flips what
+## is on screen (L1): in Factorio's view (F6), orthographic, the normal view goes perspective where it
+## stands, out of Factorio's view (F6 snaps back to it). Returns a line saying what it is now.
+## `--f6-leave=old`: Factorio's view stays orthographic and F7 there changes only the normal view's.
 func toggle_projection() -> String:
+	_left_factorio_view()
 	var key := "first_person_orthographic" if first_person else ("map_orthographic" if in_remote else "orthographic")
-	var ortho := not bool(Settings.get_value("camera", key))
+	var ortho := not view_orthographic() if f6_leave_fix else not bool(Settings.get_value("camera", key))
+	var factorio_view := in_factorio_view()
 	# The setting's listeners (apply_settings) read it back into the view, Factorio's view kept.
 	Settings.set_value("camera", key, ortho)
 	var kind := "orthographic" if ortho else "perspective"
@@ -305,8 +390,9 @@ func toggle_projection() -> String:
 	if in_remote:
 		remote_orthographic = ortho
 		return "Map view: " + kind
-	if in_factorio_view():
+	if not _saved_view.is_empty():
 		_saved_view["ortho"] = ortho
+	if factorio_view and not f6_leave_fix:
 		return "Normal view: %s (Factorio's view stays orthographic)" % kind
 	orthographic = ortho
 	return "Normal view: " + kind
@@ -364,16 +450,30 @@ func in_cinematic() -> bool:
 
 ## An add-on takes the camera: from now on it moves it (`camera`, in world space) until
 ## hand_back(). The player's own view (first person, Factorio's view, zoom) is kept as it was.
-func take_over() -> void:
+## (1.7) `aim_center`: the player's controls aim at the middle of the screen meanwhile (aims_center),
+## with Zenith's dot when `crosshair`.
+func take_over(aim_center := false, crosshair := true) -> void:
 	if not _taken.is_empty():
+		_set_taken_aim(aim_center, crosshair)
 		return
-	_taken = {"fov": camera.fov, "near": camera.near, "far": camera.far, "projection": camera.projection,
+	# The view's own FOV, not a modifier's: hand_back puts the player's view back as it was.
+	_taken = {"fov": _own_fov() if _mod_shown else camera.fov, "near": camera.near, "far": camera.far, "projection": camera.projection,
 		"size": camera.size, "attributes": camera.attributes, "keep_aspect": camera.keep_aspect,
 		"crosshair": _crosshair != null and _crosshair.visible}
 	var at := camera.global_transform
 	camera.top_level = true
 	camera.global_transform = at
 	if _crosshair != null:
+		_crosshair.visible = false
+	_mod_shown = false  # the add-on's camera now: the modifier waits for the hand-back
+	_set_taken_aim(aim_center, crosshair)
+
+
+func _set_taken_aim(aim_center: bool, crosshair: bool) -> void:
+	_taken_aim_center = aim_center
+	if aim_center and crosshair:
+		_show_crosshair(true)
+	elif _crosshair != null:
 		_crosshair.visible = false
 
 
@@ -383,6 +483,7 @@ func hand_back() -> void:
 		return
 	var t := _taken
 	_taken = {}
+	_taken_aim_center = false
 	taken_focus = Vector2.INF
 	camera.top_level = false
 	camera.fov = float(t["fov"])
@@ -392,8 +493,8 @@ func hand_back() -> void:
 	camera.size = float(t["size"])
 	camera.attributes = t["attributes"]
 	camera.keep_aspect = t["keep_aspect"]
-	if bool(t["crosshair"]):
-		_crosshair.visible = true
+	if _crosshair != null:
+		_crosshair.visible = bool(t["crosshair"])  # an add-on's dot (aim_center) goes with it
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if first_person else Input.MOUSE_MODE_VISIBLE
 	_centre_now()
 	_process(0.0)  # the camera in its place now, not a frame late
@@ -403,13 +504,47 @@ func taken() -> bool:
 	return not _taken.is_empty()
 
 
+## (Add-on API 1.7) api.character's `view` point: a child of the camera (no frame of lag), made on first
+## use, shown only in the player's own first person (not while an add-on, a ride, VR or the remote view
+## has the camera). A viewmodel's anchor: it clips into walls and takes the FOV kick with the world.
+var _view_anchor: Node3D
+
+
+func view_anchor() -> Node3D:
+	if _view_anchor == null:
+		_view_anchor = Node3D.new()
+		_view_anchor.name = "AddonView"
+		camera.add_child(_view_anchor)
+		_view_anchor.visible = view_mode() == "first_person"
+	return _view_anchor
+
+
+## What the camera is doing now, for add-ons (api.camera.mode): "addon", "vr", "ride", "remote",
+## "first_person", "factorio" or "angled", the first that holds. `own`: the player's own view under
+## an add-on's take-over (api.camera.player_mode). Remote is above first person, which stays on while
+## a remote view is open with the rig at the remote point. Reads only: nothing here moves the view.
+func view_mode(own := false) -> String:
+	if not own and taken():
+		return "addon"
+	if vr_view != null:
+		return "vr"
+	if in_cinematic():
+		return "ride"
+	if in_remote:
+		return "remote"
+	if first_person:
+		return "first_person"
+	return "factorio" if in_factorio_view() else "angled"
+
+
 ## Where the player's own view would put the camera now, round the character (an add-on glides
 ## there before handing the camera back).
 func own_view() -> Transform3D:
 	var at := target.global_position if target != null else global_position
 	if first_person:
 		var look := Basis(Vector3.UP, deg_to_rad(_look_yaw)) * Basis(Vector3.RIGHT, -deg_to_rad(_look_pitch))
-		# On the hills, where _process puts first person's eyes.
+		# On the hills, where _process puts first person's eyes (and an add-on's lift, 1.7).
+		at += _lifted(target)
 		return Transform3D(look, (GroundHeight.lift(at) if focus_fix else at) + Vector3(0.0, EYE_HEIGHT, 0.0))
 	if not focus_fix:
 		var flat := Basis(Vector3.UP, deg_to_rad(_yaw_goal)) * Basis(Vector3.RIGHT, -deg_to_rad(pitch_degrees))
@@ -449,9 +584,16 @@ func look(relative: Vector2) -> void:
 	_look_pitch = clampf(_look_pitch + relative.y * LOOK_DEGREES_PER_PIXEL * look_speed * look_sign, -85.0, 85.0)
 
 
-## Where the player aims on screen: the cursor, or the crosshair in first person.
+## (1.7) Whether the player aims at the middle of the screen: in first person, or while an add-on has
+## the camera with take({"aim": "center"}). The one place player_input.gd asks.
+func aims_center() -> bool:
+	return first_person or (taken() and _taken_aim_center)
+
+
+## Where the player aims on screen: the cursor, or the crosshair in first person (or an add-on's
+## camera aiming at the centre).
 func aim_position() -> Vector2:
-	if first_person:
+	if aims_center():
 		return get_viewport().get_visible_rect().size * 0.5
 	return get_viewport().get_mouse_position()
 
@@ -529,12 +671,26 @@ func _centre_now() -> void:
 ## (mech armour's flight), at every zoom, tilt and projection; in the map's remote view the ground there.
 func _focus_goal() -> Vector3:
 	var p := target.global_position
+	if not in_remote:
+		var up := _lifted(target)
+		p += Vector3(up.x, 0.0, up.z)  # its height comes in view_lift()
 	var y := p.y + GroundHeight.at(p.x, p.z)
 	if not in_remote:
 		y += BODY_MID
-		if target.has_method("drawn_lift"):
+		if target.has_method("view_lift"):
+			y += float(target.view_lift())  # the avatar: flight and camera lifts, not the belt step-up
+		elif target.has_method("drawn_lift"):
 			y += float(target.drawn_lift())
 	return Vector3(p.x, y, p.z)
+
+
+## (Add-on API 1.7) The camera's part of the character's lift (avatar.gd camera_lift()): only add-ons'
+## lifts set with `camera` move the eye and the centre; the body's other lifts (the belt step-up, an
+## add-on's without `camera`) leave the view still. Zero for any other target.
+static func _lifted(t: Node) -> Vector3:
+	if t != null and t.has_method("camera_lift"):
+		return t.camera_lift()
+	return Vector3.ZERO
 
 
 ## The view's centre on the character (focus_fix). Across the ground it stays on it: the drawn walk is
@@ -676,9 +832,10 @@ func focus_point() -> Vector2:
 	return Vector2(global_position.x, global_position.z)
 
 
-## Camera forward and right flattened onto the ground, for camera-relative movement.
+## Camera forward and right flattened onto the ground, for camera-relative movement. An add-on's
+## modifier is left out (_view_basis): a sway or a shake must never bend the `walk` sent to the game.
 func ground_forward() -> Vector3:
-	var basis := (vr_view if vr_view != null else camera).global_transform.basis
+	var basis := _view_basis()
 	var f := -basis.z
 	f.y = 0.0
 	if f.length() < 0.01:  # looking straight down (an add-on's overhead shot): screen up is forward
@@ -688,9 +845,17 @@ func ground_forward() -> Vector3:
 
 
 func ground_right() -> Vector3:
-	var r := (vr_view if vr_view != null else camera).global_transform.basis.x
+	var r := _view_basis().x
 	r.y = 0.0
 	return r.normalized()
+
+
+func _view_basis() -> Basis:
+	if vr_view != null:
+		return vr_view.global_transform.basis
+	if _mod_shown:
+		return _base_world
+	return camera.global_transform.basis
 
 
 ## The point on the ground under a screen position, or null.

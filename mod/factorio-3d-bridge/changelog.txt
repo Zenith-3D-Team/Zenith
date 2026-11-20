@@ -1,4 +1,17 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.2.2
+Date: 2026-11-16
+  Features:
+    - Starting or queueing a technology whose prerequisites are missing queues them first, in order; a trigger technology on the way or a full queue refuses it and says why.
+    - A pipeline over the extent limit raises Factorio's pipeline overextended alert on the pipe where a pump would split it, and a hovered pipe sends its extent.
+    - Resource patches on request: the force's charted resource under the map's mouse, summed, with its tiles for an outline; a hovered resource sends its amount or yield.
+    - Each prototype sends which resources it mines and which fluid resources to highlight, for a held drill's placement hints; only drills with a fluid input mark their fluid connections.
+    - A machine's fluid connections are sent with their fluid, for each connection's icon.
+    - An underground belt or pipe-to-ground pair built over a plain straight run mines the run between into the character, as a player's build does.
+    - In an armed vehicle the guns sent are the vehicle's, with its selected gun; the client can pick the vehicle's gun and put ammo into it.
+    - A player joining under the name of the account Zenith plays takes over the character the bridge played; on a server the bridge made, freeplay's crash site is turned off before anyone joins.
+    - The graphics list carries every layer an entity's picture draws at rest, for the client's picture cards.
+---------------------------------------------------------------------------------------------------
 Version: 0.2.1
 Date: 2026-11-14
   Features:

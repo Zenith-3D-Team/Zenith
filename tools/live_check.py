@@ -17,6 +17,7 @@ the mod's own state (`/c __factorio-3d-bridge__ ...`), which disables achievemen
 
 A second server instance on other ports (run-server.ps1 -UdpPort/-RconPort):
     python3 tools/live_check.py --factorio-port 34210 --client-port 34211 --rcon-port 34298
+`--binary`: every hello asks for binary frames (`bin`), read as the client reads them (docs/PROTOCOL.md);
 `--only platforms` runs just the handshake and the space platform checks (needs Space Age);
 `--only pickup` F taking items off belts and the ground (`pku`), after an INFO line on Factorio's own picking_state;
 `--only ride` riding a rocket up to a platform's hub and a cargo pod down (`ride`, `land`);
@@ -45,13 +46,45 @@ chooser's groups, productivity, burners, drills, temperature, labs, a requester'
 linked belts' ends; `--only barrier` the error barrier (barrier.lua): a tick step and an event handler
 made to fail, the game and the other steps going on (`--server-log` points at the server's
 factorio-current.log when it isn't server/data's); `--only research` research finishing (`rdone`: a
-technology researched by script named once, an infinite one by the level it finished).
+technology researched by script named once, an infinite one by the level it finished); `--only join` a world
+Zenith made (L13; run it on a fresh map nobody joined): freeplay's crash site turned off through its 2.1 interface,
+and a hello's `pn` kept, claiming nobody when no player has that name (a player joining can't be played headless:
+test_bridge.py does that against the fake API); `--only underclear` an underground pair built over belts mining the belts
+between (M2: a plain run, a side-loaded one kept, pipes-to-ground over pipes, the switch off), after an INFO line on what
+a script's own create_entity{fast_replace, character} does to the run; `--only vehitems` vehicles (N2: Ctrl+click into a
+car, tank, spidertron, locomotive and cargo wagon and out of them; N3: the vehicle's `guns`, `gun` and `vammo` while
+driving, and a printed line on whether `shoot` fires the vehicle's gun; N4: `repair` on a car and a cargo wagon);
+`--only pipeend` the pipes and belts beside what the bridge's character mines (no event raised) sent again with
+their new shapes: a run's ends, a corner, a T losing its branch, a cross an arm, pipes-to-ground, a pump and a tank
+going, belts straightened and curved, a pipe `die`d and one a robot takes, `/f3d-perf mined_neighbours off`; walls and
+heat pipes only their `del` (the client joins them).
+`--only steps` the character's steps from the prototypes (`steps`:
+every part, every tile, silent only where the player can't walk, the files in the install, again on a resync and a
+reconnect).
+`--only enemysight` a diagnostic, not in the full run: do idle biters notice the bridge's player-less character walking up
+(three small biters left idle 60 tiles off, approached to 20 and 8 tiles), one shot at one of them, a small worm approached
+inside its range, and the two candidate fixes tried by hand (a wander command with distraction by_enemy; a distraction
+command to attack the character), then the nearest nest the map made, with the bridge's fix (/f3d-perf enemy_sight)
+off and on: its biters attack the approaching character only with it on, the whole nest at once, held about 40 s while
+it stands and dropping off gradually, and chasing it 150 tiles away (a real player's measured behaviour); prints raw
+numbers (commands, distances, ticks, damage) per step. Steps 2-5 run with the fix off.
+`--only enemysightfix` steps 1 and 6 alone. Run them on a fresh map: they destroy the enemies within 200 tiles of the spot,
+and step 6 runs the game fast (speed 10) for up to 5 minutes until the nest owns 8 idle biters.
+`--only link` the add-on link (`ext`, link.lua) with the fixture mod tools/mod_tests/fixtures/zenith-link-test in the
+server's mods: an echo there and back, `who` naming this client's character, the caps on a flood both ways and on a
+message over 4 KB, a bad channel dropped, a second client answered alone and its coming and going raised. Run it
+twice, the server restarted on the saved game in between (`/server-save`, then run-server.ps1 -Save), so the second
+run checks the mod's on_load path: the bridge's event ids made again on loading.
+`--only sprint` the Sprint add-on's Factorio mod (addons-src/sprint/mod/zenith-sprint, with the fixture mod above, both in
+the server's mods) played as the add-on would: on, held, off, the 90-tick time-out, a client dropping mid-sprint, another
+mod's change to the running speed surviving; then garbage `ext`, a stranger's port and an `ext` before the welcome.
 """
 
 import argparse
 import base64
 import json
 import math
+import os
 import re
 import pathlib
 import socket
@@ -110,6 +143,22 @@ def destroy_units(units):
                 "if e.valid and e.unit_number and want[e.unit_number] then e.destroy() end end")
 
 
+def clear_enemies(radius=96, x=None, y=None, units=0):
+    """Destroys the enemies within `radius` of (x, y), the character by default, and heals it. The
+    turrets' nest spawns defenders under the artillery's shells and the shooting checks leave
+    biters: one that finds the character later kills it, and its respawn starts the session over
+    (a new character is a new handshake), which ends a remote view and the checks waiting on it.
+    `units`: a wider radius in which the biters and spitters alone go (nests and worms stay): the
+    groups already on their way from further off."""
+    at = "c.position" if x is None else f"{{ {x}, {y} }}"
+    wide = (f"for _, e in pairs(c.surface.find_entities_filtered({{ force = 'enemy', type = 'unit', position = {at}, radius = {units} }})) "
+            "do e.destroy() end ") if units else ""
+    mod_lua("local c = storage.f3d.puppet if c and c.valid then "
+            f"for _, e in pairs(c.surface.find_entities_filtered({{ force = 'enemy', position = {at}, radius = {radius} }})) do e.destroy() end "
+            + wide +
+            "pcall(function() c.health = c.max_health end) pcall(function() c.health = c.prototype.get_max_health() end) end")
+
+
 class Client:
     def __init__(self, factorio_port=34200, port=34201):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -122,6 +171,7 @@ class Client:
         self.me = None
         self.inv = {}
         self.protos = {}
+        self.proto_recs = {}  # id -> the whole `protos` record (pipevis hands them to the client's own rule)
         self.items = {}
         self.tiles = {}
         self.eprops = None
@@ -129,8 +179,11 @@ class Client:
         self.iuse = {}  # (item, kind) -> `iuse` record
         self.invalid = []
         self.last = {}  # message type (eq: "eq char" / "eq veh") -> the latest one
+        self.datagrams = self.binary_datagrams = 0  # received, and of them binary frames (--binary)
 
     def send(self, msg):
+        if BINARY and msg.get("t") == "hello":
+            msg = dict(msg, bin=protocol.WIRE_VERSION)  # --binary: binary frames (docs/PROTOCOL.md)
         self.sock.sendto(json.dumps(msg).encode(), self.dest)
 
     def pump(self, seconds, until=None, every=None):
@@ -144,35 +197,45 @@ class Client:
                 data, _ = self.sock.recvfrom(65536)
             except (socket.timeout, ConnectionResetError):
                 continue
-            msg = json.loads(data)
-            t = msg.get("t")
-            self.max_size[t] = max(self.max_size.get(t, 0), len(data))
-            problems = protocol.problems(msg)
-            if problems:
-                self.invalid.append((t, problems))
-            self.last[f"eq {msg.get('kind')}" if t == "eq" else t] = msg
-            if t == "me":
-                self.me = msg
-            elif t == "inv":
-                self.inv = {name: count for name, count in msg["l"]}
-            elif t == "protos":
-                for rec in msg["l"]:
-                    self.protos[rec[0]] = (rec[1], rec[2])
-            elif t == "iprotos":
-                for rec in msg["l"]:
-                    self.items[rec[0]] = rec[1]
-            elif t == "tprotos":
-                for rec in msg["l"]:
-                    self.tiles[rec[1]] = rec[0]
-            elif t == "quals":
-                self.quals = msg["l"]
-            elif t == "eprops":
-                self.eprops = {rec[0]: rec[1:] for rec in msg["l"]}
-            elif t == "iuse":
-                for rec in msg["l"]:
-                    self.iuse[(rec[0], rec[1])] = rec
-            out.append(msg)
-            if until and until(msg):
+            self.datagrams += 1
+            self.binary_datagrams += data[:1] == bytes((protocol.WIRE_MAGIC,))
+            # (One message, or for a `bin` hello binary frames: several, the `dg` one counted, not kept.)
+            stop = False
+            for msg in protocol.split_datagram(data):
+                if msg.get("t") == "dg":
+                    continue
+                t = msg.get("t")
+                self.max_size[t] = max(self.max_size.get(t, 0), len(data))
+                problems = protocol.problems(msg)
+                if problems:
+                    self.invalid.append((t, problems))
+                self.last[f"eq {msg.get('kind')}" if t == "eq" else t] = msg
+                if t == "me":
+                    self.me = msg
+                elif t == "inv":
+                    self.inv = {name: count for name, count in msg["l"]}
+                elif t == "protos":
+                    for rec in msg["l"]:
+                        self.protos[rec[0]] = (rec[1], rec[2])
+                        self.proto_recs[rec[0]] = rec
+                elif t == "iprotos":
+                    for rec in msg["l"]:
+                        self.items[rec[0]] = rec[1]
+                elif t == "tprotos":
+                    for rec in msg["l"]:
+                        self.tiles[rec[1]] = rec[0]
+                elif t == "quals":
+                    self.quals = msg["l"]
+                elif t == "eprops":
+                    self.eprops = {rec[0]: rec[1:] for rec in msg["l"]}
+                elif t == "iuse":
+                    for rec in msg["l"]:
+                        self.iuse[(rec[0], rec[1])] = rec
+                out.append(msg)
+                if until and until(msg):
+                    stop = True
+                    break
+            if stop:
                 break
         return out
 
@@ -184,6 +247,7 @@ def of_type(msgs, t):
     return [m for m in msgs if m.get("t") == t]
 
 
+BINARY = False  # --binary: every hello asks for binary frames (`bin`)
 SPOT_WHY = ""
 WATCH_PENDING = []
 
@@ -191,7 +255,7 @@ WATCH_PENDING = []
 def clean_spot(c, hello, half=14):
     """Moves the character to the nearest dry, empty square (2 * half tiles) and watches the chunks
     around it. Building checks need room: earlier checks leave the character wherever the car
-    or train stopped (often by water, or among the cliffs), and a reused save has someone's base and
+    or train stopped (often by water, or among the cliffs), and a reused save has the owner's base and
     trees about. A character in a vehicle gets out first (it can't be teleported in one), and one
     still coming down in a cargo pod (after the planets check) is waited for. Nothing
     near the character: the nearest such square to the force's spawn. The 3x3
@@ -439,6 +503,261 @@ def check_multi(c, hello):
     c.pump(0.5, every=hello)
 
 
+LINK_CH = "zenith-link-test"
+
+
+def link_get():
+    try:
+        return json.loads(rcon.run('/c rcon.print(remote.call("linktest", "get"))').strip())
+    except ValueError:
+        return {}
+
+
+def check_link(c, hello, welcome):
+    """The add-on link (link.lua, PROTOCOL.md "Messages for add-ons and their mods") against the fixture mod
+    tools/mod_tests/fixtures/zenith-link-test, which answers on its channel through remote.call("zenith", ...)."""
+    report(welcome.get("ext") == 1, "link: the welcome says ext 1", str(welcome.get("ext")))
+    if LINK_CH not in welcome.get("mods", {}):
+        print(f"  (the fixture mod {LINK_CH} isn't on this server: copy tools/mod_tests/fixtures/{LINK_CH} into its mods)")
+        report(False, "link: the fixture mod is in the game", str(sorted(welcome.get("mods", {}))))
+        return
+    rcon.run('/c remote.call("linktest", "reset")')
+    state = link_get()
+    print(f"  the fixture mod came by {state.get('came_by')}; the bridge's link() says {state.get('link')}")
+    report(state.get("came_by") in ("on_init", "on_load") and state.get("link") == 1,
+           "link: the fixture mod found the bridge's interface and registered for its events", str(state))
+
+    def replies(seconds, until=None):
+        return [m for m in of_type(c.pump(seconds, every=hello, until=until), "ext") if m.get("ch", "").startswith(LINK_CH)]
+
+    token = f"t{int(time.time())}"
+    t0 = time.time()
+    c.send({"t": "ext", "ch": LINK_CH, "d": {"echo": token}})
+    got = replies(3.0, until=lambda m: m.get("t") == "ext" and m.get("d") == {"echo": token})
+    took = time.time() - t0
+    report(any(m.get("d") == {"echo": token} for m in got), "link: an echo there and back", f"{took * 1000:.0f} ms")
+    c.send({"t": "ext", "ch": LINK_CH + "/who", "d": {"who": 1}})
+    who = [m["d"] for m in replies(3.0, until=lambda m: m.get("ch") == LINK_CH + "/who")]
+    me_unit = c.me.get("u") if c.me else None
+    report(who and who[-1].get("client") == CLIENT_PORT and who[-1].get("unit") == me_unit,
+           "link: who names this client and its character (character(client))", f"{who[-1:]} me {me_unit}")
+    before = link_get().get("n", 0)
+    c.send({"t": "ext", "ch": "bad channel", "d": {"echo": 1}})
+    c.send({"t": "ext", "ch": LINK_CH})
+    c.send({"t": "ext", "ch": "zenith-not-a-mod-here", "d": {"echo": 1}})
+    c.send({"t": "ext", "ch": LINK_CH, "d": {"echo": "x" * 4100}})
+    bad = replies(1.5)
+    report(not bad and link_get().get("n", 0) == before, "link: a bad channel, no data, a mod not in the game and over 4 KB dropped",
+           f"{len(bad)} answers, {link_get().get('n', 0) - before} raised")
+    c.pump(1.2, every=hello)  # a fresh window of 60 ticks
+    c.send({"t": "ext", "ch": LINK_CH + "/flood", "d": {"flood": 100}})
+    flood = replies(3.0)
+    state = link_get()
+    report(state.get("flood") == 60 and len(flood) == 60, "link: a mod's flood of 100 stops at the cap (60 per 60 ticks)",
+           f"send took {state.get('flood')}, {len(flood)} arrived")
+    c.pump(1.2, every=hello)
+    c.send({"t": "ext", "ch": LINK_CH, "d": {"big": 1}})
+    c.pump(1.0, every=hello)
+    report(link_get().get("big") == "too big", "link: a message over 4 KB is refused (too big)", str(link_get().get("big")))
+    c.pump(1.2, every=hello)
+    before = link_get().get("n", 0)
+    for i in range(80):
+        c.send({"t": "ext", "ch": LINK_CH, "d": {"n": i}})
+    c.pump(1.0, every=hello)
+    took_in = link_get().get("n", 0) - before
+    report(took_in == 60, "link: a client's flood of 80 in a moment: 60 raised (the cap in)", str(took_in))
+    # A second client: its own messages, its own character, answered alone; its coming and going raised.
+    port2 = SECOND_CLIENT_PORT or CLIENT_PORT + 1
+    c2 = Client(FACTORIO_PORT, port2)
+    c2.sid += "-link"
+    c.send(hello[1])
+    msgs = c2.pump(6, until=lambda m: m.get("t") == "ready", every=(1.0, {"t": "hello", "v": 1, "sid": c2.sid, "w": 0}))
+    w2 = of_type(msgs, "welcome")
+    if w2:
+        hello2 = (1.0, {"t": "hello", "v": 1, "sid": c2.sid, "w": 1})
+        c2.send({"t": "ext", "ch": LINK_CH + "/who", "d": {"who": 1}})
+        who2 = [m["d"] for m in of_type(c2.pump(3.0, every=hello2, until=lambda m: m.get("t") == "ext"), "ext")]
+        first = replies(1.0)
+        report(who2 and who2[-1].get("client") == port2 and who2[-1].get("unit") == w2[0]["u"] and not first,
+               "link: a second client's who names it and its character, answered to it alone", f"{who2[-1:]}, first got {len(first)}")
+        c2.send({"t": "bye"})
+        c2.pump(0.5)
+        joined = [(e.get("client"), e.get("joined")) for e in link_get().get("clients", [])]
+        report((port2, True) in joined and (port2, False) in joined, "link: the second client's coming and going raised on_client", str(joined))
+        mod_lua("for sid, ch in pairs(storage.f3d_parked or {}) do if ch.valid then ch.destroy() end end storage.f3d_parked = {} rcon.print('ok')")
+    else:
+        report(False, "link: a second client connects")
+    c2.sock.close()
+    if state.get("came_by") != "on_load":
+        print("  (this run's game started the fixture mod with on_init: /server-save, restart the server on that save and run"
+              " --only link again to check the on_load path)")
+    c.pump(0.5, every=hello)
+
+
+SPRINT_CH = "zenith-sprint"
+
+
+def check_sprint(c, hello):
+    """The sprint pair's Factorio side (addons-src/sprint/mod/zenith-sprint, which must be in the server's mods),
+    played as its add-on would: {on: true} on "zenith-sprint" adds the map setting's bonus (0.5) to this client's
+    character's running speed once, however often it is said; {on: false} takes it off; 90 ticks without a word
+    take it off too (a client dropping mid-sprint); what another mod adds to the modifier meanwhile survives;
+    messages the mod doesn't expect change nothing. Then the link's own robustness: garbage `ext`, a stranger's
+    port, an `ext` sent right after a new client's hello."""
+    unit = c.me.get("u") if c.me else None
+    has = rcon.run('/c rcon.print(script.active_mods["zenith-sprint"] and "yes" or "no")').strip()
+    if has != "yes" or not unit:
+        report(False, "sprint: the zenith-sprint mod is in the game and this client has a character", f"{has}, unit {unit}")
+        return
+    char = f"game.get_entity_by_unit_number({unit})"
+
+    def mod():
+        out = rcon.run(f"/c local e = {char} rcon.print(e and e.valid and e.character_running_speed_modifier or 'gone')").strip()
+        try:
+            return round(float(out), 4)
+        except ValueError:
+            return out
+
+    def say(d, seconds=0.3):
+        c.send({"t": "ext", "ch": SPRINT_CH, "d": d})
+        c.pump(seconds, every=hello)
+
+    rcon.run(f"/c {char}.character_running_speed_modifier = 0.25")  # another mod's change, made before
+    base = mod()
+    say({"on": True})
+    on = mod()
+    for _ in range(6):  # the add-on says it again every half second while the key is held
+        say({"on": True}, 0.5)
+    held = mod()
+    report(base == 0.25 and on == 0.75 and held == 0.75, "sprint: on adds the bonus once, held for 3 s it stays",
+           f"before {base}, on {on}, held {held}")
+    rcon.run(f"/c local e = {char} e.character_running_speed_modifier = e.character_running_speed_modifier + 0.1")
+    say({"on": False})
+    off = mod()
+    report(off == 0.35, "sprint: off takes only its own bonus back (another mod's +0.25 and +0.1 made meanwhile survive)", str(off))
+    for bad in ({"on": "yes"}, {"on": 1}, [True], "on", {"off": True}, {"on": None}):
+        say(bad, 0.1)
+    c.send({"t": "ext", "ch": SPRINT_CH + "/x", "d": {"on": True}})
+    c.pump(0.4, every=hello)
+    report(mod() == 0.35, "sprint: messages it doesn't expect (and another topic) change nothing", str(mod()))
+    say({"on": True})
+    started = time.time()
+    c.pump(0.9, every=hello)
+    mid = mod()
+    c.pump(1.2, every=hello)  # 90 ticks and the 15-tick check after the last word
+    after = mod()
+    report(mid == 0.85 and after == 0.35, "sprint: 90 ticks without a word end the sprint by itself",
+           f"{mid} after 0.9 s, {after} after {time.time() - started:.1f} s")
+    # A client dropping mid-sprint: a goodbye, then nothing more from it.
+    say({"on": True})
+    dropped_on = mod()
+    c.send({"t": "bye"})
+    c.pump(2.2)
+    gone = mod()
+    report(dropped_on == 0.85 and gone == 0.35, "sprint: a client dropping mid-sprint: the bonus off within 90 ticks",
+           f"{dropped_on} then {gone}")
+    rcon.run(f"/c local e = {char} if e then e.character_running_speed_modifier = 0 end")
+    # Back again, for the link's robustness.
+    msgs = c.pump(6, until=lambda m: m.get("t") == "ready", every=(1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 0}))
+    report(of_type(msgs, "welcome"), "sprint: the client comes back after its goodbye")
+    c.pump(0.5, every=hello)
+    rcon.run('/c remote.call("linktest", "reset")')
+    garbage = [
+        {"t": "ext"}, {"t": "ext", "ch": None, "d": 1}, {"t": "ext", "ch": [], "d": 1}, {"t": "ext", "ch": {"a": 1}, "d": 1},
+        {"t": "ext", "ch": LINK_CH, "d": {}}, {"t": "ext", "ch": LINK_CH, "d": 1e308}, {"t": "ext", "ch": LINK_CH, "d": -0.0},
+        {"t": "ext", "ch": LINK_CH + "/é", "d": "ü"}, {"t": "ext", "ch": LINK_CH + "/", "d": 1},
+        {"t": "ext", "ch": LINK_CH, "d": {"a": {"b": {"c": {"d": [[[[[[[[1]]]]]]]]}}}}},
+        {"t": "ext", "ch": LINK_CH, "d": 1, "extra": "field", "r": 5}, {"t": "ext", "ch": "/", "d": 1},
+        {"t": "ext", "ch": "../" + LINK_CH, "d": 1}, {"t": "ext", "ch": "level", "d": 1}, {"t": "ext", "ch": "base", "d": 1},
+        {"t": "ext", "ch": "factorio-3d-bridge", "d": {"echo": "to the bridge"}},
+    ]
+    for m in garbage:
+        c.send(m)
+    deep = "[" * 3000 + "]" * 3000
+    c.sock.sendto(('{"t":"ext","ch":"' + LINK_CH + '","d":' + deep + "}").encode(), c.dest)
+    c.sock.sendto(b'{"t":"ext","ch":"zenith-link-test","d":', c.dest)
+    c.sock.sendto(b"\xff\xfe\x00garbage", c.dest)
+    c.pump(1.0, every=hello)
+    got = link_get()
+    print(f"  INFO: of the garbage, {got.get('n')} reached the fixture mod (the ones with its channel and data)")
+    report(isinstance(got.get("n"), int) and got.get("n") <= 9, "link: garbage `ext` neither errors nor reaches a mod it isn't for",
+           str(got.get("n")))
+    status = rcon.run("/f3d-status")
+    report("ERROR" not in status, "link: and no step failed", status.replace("\n", " | ")[:300])
+    # A stranger's port (no hello) is dropped; an `ext` right after a new client's hello, before its welcome.
+    rcon.run('/c remote.call("linktest", "reset")')
+    stranger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    stranger.bind(("127.0.0.1", 0))
+    for _ in range(5):
+        stranger.sendto(json.dumps({"t": "ext", "ch": LINK_CH, "d": {"echo": "stranger"}}).encode(), c.dest)
+    c.pump(0.6, every=hello)
+    report(link_get().get("n") == 0, "link: an `ext` from a port that never said hello is dropped", str(link_get().get("n")))
+    port3 = (SECOND_CLIENT_PORT or CLIENT_PORT + 1) + 1
+    c3 = Client(FACTORIO_PORT, port3)
+    c3.sid += "-early"
+    c3.send({"t": "hello", "v": 1, "sid": c3.sid, "w": 0})
+    c3.send({"t": "ext", "ch": LINK_CH, "d": {"echo": "early"}})
+    msgs = c3.pump(6, until=lambda m: m.get("t") == "ready", every=(1.0, {"t": "hello", "v": 1, "sid": c3.sid, "w": 0}))
+    early = [m for m in of_type(msgs, "ext") if m.get("d") == {"echo": "early"}]
+    w3 = of_type(msgs, "welcome")
+    order = [m.get("t") for m in msgs if m.get("t") in ("welcome", "ext")]
+    print(f"  INFO: an `ext` sent with a new client's first hello: {len(early)} echo back, order {order[:4]}")
+    report(w3 and link_get().get("n", 0) == 0 and not early, "link: an `ext` before the client's handshake is done is dropped",
+           f"raised {link_get().get('n')}, welcome {bool(w3)}")
+    c3.send({"t": "bye"})
+    c3.pump(0.5)
+    c3.sock.close()
+    stranger.close()
+    # A companion's own bug: its handler fails. The bridge catches it (a client's packet never stops the
+    # game), sends the error back on the channel (`ext` with `err`) and logs it naming the mod; it isn't
+    # the bridge's error. (A separate topic, so the channel's 10-errors close can't touch the others.)
+    rcon.run('/c remote.call("linktest", "reset")')
+    c.send({"t": "ext", "ch": LINK_CH + "/boom", "d": {"boom": 1}})
+    errs = [m for m in of_type(c.pump(1.0, every=hello), "ext") if "err" in m]
+    c.send({"t": "ext", "ch": LINK_CH, "d": {"echo": "after boom"}})
+    after = [m for m in of_type(c.pump(2.0, every=hello), "ext") if m.get("d") == {"echo": "after boom"}]
+    status = rcon.run("/f3d-status")
+    tick = rcon.run("/c rcon.print(game.tick)").strip()
+    print(f"  INFO: after a companion's handler failed: the game at tick {tick}, err {[m.get('err', '')[:160] for m in errs]},"
+          f" an echo after it {'came' if after else 'did not come'};"
+          f" /f3d-status: {' | '.join(l for l in status.splitlines() if 'ERROR' in l)[:300] or 'no error'}")
+    report(len(errs) == 1 and errs[0].get("ch") == LINK_CH + "/boom" and "boom" in errs[0].get("err", "") and "d" not in errs[0],
+           "link: a companion's failing handler: its error comes back to the add-on on its channel", str(errs)[:300])
+    report(tick.isdigit() and after and "step 'link'" not in status,
+           "link: and the game and the link go on (the next message answered, no bridge error)", f"tick {tick}, echo {bool(after)}")
+    # Ten errors on one channel within a minute close it for this client's session: the first boom above
+    # and nine more. The tenth's own error comes back, then one saying it closed; after that the channel's
+    # messages (a boom, an echo) are dropped quietly, while the mod's other topics still answer.
+    boom_ch = LINK_CH + "/boom"
+    msgs = []
+    for _ in range(9):
+        c.send({"t": "ext", "ch": boom_ch, "d": {"boom": 1}})
+        msgs += c.pump(0.1, every=hello)
+    msgs += c.pump(1.0, every=hello)
+    errs = [m for m in of_type(msgs, "ext") if "err" in m and m.get("ch") == boom_ch]
+    closed = [m for m in errs if "closed" in m.get("err", "")]
+    booms = [m for m in errs if "boom" in m.get("err", "")]
+    print(f"  INFO: nine more booms: {len(booms)} boom errors, closing err {[m.get('err') for m in closed]}")
+    report(len(booms) == 9 and len(closed) == 1 and errs[-1] is closed[0] and "10 within 60 s" in closed[0].get("err", ""),
+           "link: the tenth error within a minute closes the channel and says so once, last", str([m.get("err", "")[:60] for m in errs])[:300])
+    n_before = link_get().get("n", 0)
+    c.send({"t": "ext", "ch": boom_ch, "d": {"boom": 1}})
+    c.send({"t": "ext", "ch": boom_ch, "d": {"echo": "closed?"}})
+    c.send({"t": "ext", "ch": LINK_CH, "d": {"echo": "still open"}})
+    msgs = of_type(c.pump(2.0, every=hello), "ext")
+    on_closed = [m for m in msgs if m.get("ch") == boom_ch]
+    still = [m for m in msgs if m.get("d") == {"echo": "still open"}]
+    raised_n = link_get().get("n", 0) - n_before
+    status = rcon.run("/f3d-status")
+    report(not on_closed and still and raised_n == 1 and "step 'link'" not in status,
+           "link: then the closed channel drops quietly (nothing raised or sent), the mod's other topic still answers",
+           f"on the closed channel {on_closed}, other topic {bool(still)}, raised {raised_n}")
+    barrier_forget = mod_lua("local b = package.loaded['__factorio-3d-bridge__/scripts/barrier.lua'] "
+                             "if b and b.forget then b.forget('link') b.forget('packet') end rcon.print('ok')")
+    mod_lua("for sid, ch in pairs(storage.f3d_parked or {}) do if ch.valid then ch.destroy() end end storage.f3d_parked = {} rcon.print('ok')")
+    c.pump(0.5, every=hello)
+
+
 def check_remnants(c, hello):
     """Remnants (extra.rm): a destroyed assembler's and rail's remnants come as an `add` naming
     what left them, a chunk snapshot carries them too, building over them removes them in the
@@ -619,6 +938,10 @@ rcon.print(helpers.table_to_json(made))""".replace("\n", " "))
     c.pump(0.3, every=hello)
     mod_lua("local c = storage.f3d.puppet if c.vehicle then c.driving = false end "
             "for _, b in pairs(storage.f3d_tur_biters or {}) do if b.valid then b.destroy() end end")
+    # The row to the nest 45 tiles south and the defenders it spawned; and every biter within 400 tiles: a group
+    # from further off than the 96 (the artillery reaches 224) arrives checks later (once 12 small biters killed
+    # the character in the middle of the underground check, and the platform and planet checks after it lost theirs).
+    clear_enemies(96, x - 10.5, y + 20, units=400)
     destroy_units(list(made.values()))
     report(True, f"turrets: cleaned up ({len(unknown)} other turrets reported nearby)", str(made))
 
@@ -628,6 +951,9 @@ def check_platforms(c, hello):
     if "space-platform-foundation" not in c.tiles:
         report(False, "space platforms: Space Age isn't enabled on this server")
         return
+    # The remote view, the modules and the map below are asked for by one session all through: once
+    # (CI) a leftover biter killed the character half way, and the respawn's new session lost them.
+    clear_enemies()
     out = rcon.run("/f3d-platform new").strip()
     report("built in orbit of" in out, "/f3d-platform new: force.create_space_platform + apply_starter_pack", out)
     try:
@@ -640,14 +966,14 @@ def check_platforms(c, hello):
     report(rec.get("hub", 0) > 0 and rec.get("loc") == "nauvis" and plats[-1].get("on") == 0 and plats[-1].get("here") == "nauvis",
            "plat: the new platform, its hub and where it is", f"{rec} here={plats[-1].get('here') if plats else None}")
 
-    # The remote view looks at the platform from Nauvis: its world streams while the character
+    # #5: the remote view looks at the platform from Nauvis: its world streams while the character
     # stays put; building waits; si 0 brings Nauvis back.
     psi = int(mod_lua(f'rcon.print(game.forces.player.platforms[{index}].surface.index)') or 0)
     c.send({"t": "view", "si": psi, "x": 0, "y": 0})
     msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     vs = of_type(msgs, "surface")
     c.send({"t": "sub", "c": [[0, 0], [-1, -1], [-1, 0], [0, -1]]})
-    # Building from the remote view puts a ghost on that surface. A new platform's foundation
+    # #12: building from the remote view puts a ghost on that surface. A new platform's foundation
     # lies under its hub, so a patch of foundation east of it first. F6: what is chosen must be
     # buildable on a platform: a chest needs gravity (2.1.23), so an assembler.
     spot = mod_lua(f'local s = game.get_surface({psi}) local t = {{}} for x = 6, 11 do for y = -6, 2 do '
@@ -660,10 +986,10 @@ def check_platforms(c, hello):
     vtiles = {tid for m in of_type(msgs, "chunk") if m.get("tiles") for tid in m["tiles"][0::2]}
     report(bool(vs) and vs[0].get("view") == 1 and vs[0].get("pf") == index and c.tiles["space-platform-foundation"] in vtiles
            and mod_lua("rcon.print(storage.f3d.puppet.surface.name)") == "nauvis",
-           "view: the platform's chunks stream for the remote view while the character stays on Nauvis", f"{vs[:1]} tiles {sorted(vtiles)}")
+           "view: the platform's chunks stream for the remote view while the character stays on Nauvis (#5)", f"{vs[:1]} tiles {sorted(vtiles)}")
     ghost = json.loads(mod_lua(f'local s = game.get_surface({psi}) local g = s.find_entities_filtered{{ghost_name = "assembling-machine-2", '
                                f'position = {{{gx} + 0.5, {gy} + 0.5}}}}[1] rcon.print(helpers.table_to_json(g and {{ g.unit_number }} or {{}}))') or "[]")
-    report(len(ghost) == 1, "view: building from the remote view places a ghost on the platform", f"{spot!r} {ghost!r}")
+    report(len(ghost) == 1, "view: building from the remote view places a ghost on the platform (#12)", f"{spot!r} {ghost!r}")
     report(any("another surface" in m.get("text", "") for m in of_type(msgs, "msg")),
            "view: mining by hand waits while another surface is shown")
     # F6: the platform is uncharted on a headless server, so the mod's fallback check must still
@@ -773,16 +1099,16 @@ def check_platforms(c, hello):
             'p.space_connection = prototypes.space_connection["nauvis-vulcanus"] p.distance = 0.25 p.speed = 1')
     msgs = c.pump(2.5, every=hello)
     rec = next((p for m in of_type(msgs, "plat") for p in m["l"] if p["i"] == index), {})
-    # Its schedule (plat_sched above) goes to nauvis, the connection's from end: it heads back.
+    # Its schedule (plat_sched above) goes to nauvis, the connection's from end: it heads back (G9).
     report(rec.get("from") == "vulcanus" and rec.get("to") == "nauvis" and 700 < rec.get("d", 0) < 800 and rec.get("len") == 15000
            and "loc" not in rec, "plat while travelling: from, to, how far, the connection's length, speed", str(rec))
-    # Sent to the connection's from end, 2.1.23 counts distance down; plat turns it round.
+    # Owner's G9: sent to the connection's from end, 2.1.23 counts distance down; plat turns it round.
     mod_lua(f'local p = game.forces.player.platforms[{index}] p.distance = 0.4 p.speed = 1 p.paused = false '
             'p.schedule = {current = 1, records = {{station = "nauvis", wait_conditions = {}, temporary = true}}}')
     msgs = c.pump(2.5, every=hello)
     recs = [p for m in of_type(msgs, "plat") for p in m["l"] if p["i"] == index and "to" in p]
     report(len(recs) >= 2 and recs[-1].get("from") == "vulcanus" and recs[-1].get("to") == "nauvis" and recs[-1]["d"] > recs[0]["d"] >= 600,
-           "plat heading back along its connection: from where it left, d counting up", str(recs[:1] + recs[-1:]))
+           "plat heading back along its connection: from where it left, d counting up (G9)", str(recs[:1] + recs[-1:]))
     c.send({"t": "plat_board", "i": 0})
     msgs = c.pump(1.0, every=hello)
     report(any("stopped at a planet" in m["text"] for m in of_type(msgs, "msg")) and not of_type(msgs, "surface"),
@@ -799,7 +1125,7 @@ def check_platforms(c, hello):
 
 
 def check_ride(c, hello):
-    """Riding to a platform as a player does: into a silo's rocket with `ride`
+    """Riding to a platform as a player does (#10, #17): into a silo's rocket with `ride`
     (launch_rocket with the character), up to the platform's hub, life in the hub (no walking,
     ghosts, the hub's screen), and down again by cargo pod with `land`. Prints the pod's states
     and when each began."""
@@ -808,9 +1134,7 @@ def check_ride(c, hello):
         return
     # Earlier sections leave biters about (the shooting and enemies checks); one that keeps
     # biting the character kills it during the ride and every section after fails.
-    mod_lua("local c = storage.f3d.puppet if c and c.valid then "
-            "for _, e in pairs(c.surface.find_entities_filtered({ force = 'enemy', position = c.position, radius = 96 })) do e.destroy() end "
-            "pcall(function() c.health = c.max_health end) pcall(function() c.health = c.prototype.get_max_health() end) end")
+    clear_enemies()
     out = rcon.run("/f3d-platform new").strip()
     try:
         index = int(out.split("platform ")[1].split(" ")[0])
@@ -905,7 +1229,7 @@ rcon.print(silo.unit_number .. " " .. silo.position.x .. " " .. silo.position.y 
                     "rcon.print(g and 'ghost' or 'none') if g then g.destroy() end")
     report(c.me and (c.me["x"], c.me["y"]) == (hx, hy) and "hub" in c.me and ghost == "ghost"
            and any(m.get("text") == "Not from inside the hub" for m in of_type(msgs, "msg")),
-           "in the hub: no walking or mining, building places a ghost", f"{ghost} {[m.get('text') for m in of_type(msgs, 'msg')]}")
+           "in the hub: no walking or mining, building places a ghost (#17)", f"{ghost} {[m.get('text') for m in of_type(msgs, 'msg')]}")
     c.send({"t": "open", "u": hub_u, "p": c.proto_id("space-platform-hub"), "x": hx, "y": hy})
     msgs = c.pump(2, every=hello, until=lambda m: m.get("t") == "gui" and m.get("u") == hub_u)
     g = [m for m in of_type(msgs, "gui") if m.get("u") == hub_u]
@@ -1230,7 +1554,7 @@ rcon.print((pad and (pad.unit_number .. " " .. pad.position.x .. " " .. pad.posi
 def check_collectors(c, hello):
     """Asteroid collectors' arms (`acol`, F3): a collector on a new platform's edge, powered, its
     filter set to promethium so the orbit's own chunks don't count; a still promethium chunk 6
-    tiles in front is caught (`g`) where it was and lands in the output; without power the arms fold home."""
+    tiles in front is caught (`g`) where it was and lands in the output; without power the arms fold home (G10)."""
     out = rcon.run("/f3d-platform new").strip()
     try:
         index = int(out.split("platform ")[1].split(" ")[0])
@@ -1273,7 +1597,7 @@ def check_collectors(c, hello):
     mod_lua(f"for _, e in pairs(game.forces.player.platforms[{index}].surface.find_entities_filtered({{ name = 'electric-energy-interface' }})) do e.destroy() end")
     msgs = c.pump(2.5, every=hello)
     rows = [r for m in of_type(msgs, "acol") for r in m.get("l", []) if r[0] == col_u]
-    report(bool(rows) and rows[-1][3] == 2, "acol: without power the arms fold home (2)", str(rows[-1:]))
+    report(bool(rows) and rows[-1][3] == 2, "acol: without power the arms fold home (2, G10)", str(rows[-1:]))
     c.send({"t": "plat_board", "i": 0})
     msgs = c.pump(SURFACE_WAIT, every=hello, until=lambda m: m.get("t") == "surface")
     msgs += c.pump(1.0, every=hello)  # the clear comes on the next 10-tick look, after `surface`
@@ -2098,6 +2422,54 @@ rcon.print(table.concat(out, " "))
     report(inv_count("automation-science-pack") == 10, "fast with an empty hand on a lab takes its science packs (lab_input)",
            str(inv_count("automation-science-pack")))
     destroy_units(units)
+    check_hand_stack(c, hello, x, y)
+
+
+def check_hand_stack(c, hello, x, y):
+    """L7: Factorio builds out of the cursor's stack. A `build` naming the main inventory slot the client's hand
+    holds (`hs`) is paid from that stack, in its quality; an `hs` on a slot that holds another item is passed over
+    (a normal one pays, as without it); Z (`drop`) naming the slot takes the item from that stack."""
+    def stacks():
+        out = mod_lua("""local inv = storage.f3d.puppet.get_main_inventory() local at = {} for i = 1, #inv do local st = inv[i]
+ if st.valid_for_read and (st.name == 'wooden-chest' or st.name == 'iron-plate') then at[#at + 1] = i .. ':' .. st.name .. ':' .. st.quality.name .. ':' .. st.count end end
+ rcon.print(table.concat(at, ' '))""".replace("\n", " "))
+        rows = [r.split(":") for r in out.split()]
+        return {int(r[0]): (r[1], r[2], int(r[3])) for r in rows if len(r) == 4}
+
+    made = mod_lua("""local inv = storage.f3d.puppet.get_main_inventory() inv.clear()
+ inv.insert({ name = 'wooden-chest', count = 5 }) inv.insert({ name = 'iron-plate', count = 7 })
+ local ok = pcall(function() inv.insert({ name = 'wooden-chest', count = 3, quality = 'rare' }) end)
+ rcon.print(ok and 'rare' or 'plain')""".replace("\n", " "))
+    before = stacks()
+    normal = next((i for i, s in before.items() if s[0] == "wooden-chest" and s[1] == "normal"), 0)
+    rare = next((i for i, s in before.items() if s[0] == "wooden-chest" and s[1] == "rare"), 0)
+    plates = next((i for i, s in before.items() if s[0] == "iron-plate"), 0)
+    if not normal or not plates:
+        report(False, "L7: chests and plates in the character's inventory", f"{made} {before}")
+        return
+    fx = lambda v: math.floor(v * 256)
+
+    def build(dy, hs):
+        c.send({"t": "build", "item": "wooden-chest", "x": fx(x + 6.5), "y": fx(y + dy + 0.5), "d": 0, "hs": hs})
+        c.pump(0.5, every=hello)
+        return stacks()
+
+    if rare:
+        after = build(0, rare)
+        report(after.get(rare, ("", "", 0))[2] == 2 and after.get(normal, ("", "", 0))[2] == 5,
+               "L7: a build naming the held stack's slot (hs) is paid from that stack, in its quality (a rare stack held)",
+               f"{before} -> {after}")
+    after = build(2, normal)
+    report(after.get(normal, ("", "", 0))[2] == 4, "L7: hs on the normal stack: that stack pays", str(after))
+    after = build(4, plates)
+    report(after.get(normal, ("", "", 0))[2] == 3 and after.get(plates, ("", "", 0))[2] == 7,
+           "L7: an hs naming a slot that holds another item is passed over: a normal chest pays, the plates stay", str(after))
+    c.send({"t": "drop", "item": "iron-plate", "x": fx(x + 5.5), "y": fx(y - 3.5), "hs": plates})
+    c.pump(0.5, every=hello)
+    after = stacks()
+    report(after.get(plates, ("", "", 0))[2] == 6, "L7: Z naming the held stack's slot takes the plate from that stack", str(after))
+    mod_lua(f"""local c = storage.f3d.puppet for _, e in pairs(c.surface.find_entities_filtered({{ area = {{ {{ {x} + 4, {y} - 5 }}, {{ {x} + 8, {y} + 6 }} }},
+ name = {{ 'wooden-chest', 'item-on-ground' }} }})) do e.destroy({{ raise_destroy = true }}) end rcon.print('ok')""".replace("\n", " "))
 
 
 def check_circuits(c, hello):
@@ -2437,14 +2809,14 @@ def check_logic(c, hello):
     open_gui("locomotive", {"t": "set_color", "c": [0, 100, 200]})
     out2 = lua_on("locomotive", 'rcon.print(math.floor(e.color.b * 255 + 0.5))')
     report(out2 == "200", "set_color on a locomotive", out2)
-    # From the remote view (rv) a building far away opens where a working radar covers it
+    # D10: from the remote view (rv) a building far away opens where a working radar covers it
     # (the mod works the coverage out: a headless server reveals nothing), for settings only.
     rx, ry = x + 320, y
     made = mod_lua(f'local c = storage.f3d.puppet local s = c.surface local f = c.force '
                    f's.request_to_generate_chunks({{ {rx}, {ry} }}, 4) s.force_generate_chunk_requests() '
                    f'for _, e in pairs(s.find_entities_filtered({{ area = {{ {{ {rx - 12}, {ry - 12} }}, {{ {rx + 12}, {ry + 12} }} }} }})) do if e.type ~= "character" then e.destroy() end end '
                    f'for _, e in pairs(s.find_entities_filtered({{ area = {{ {{ {rx + 280}, {ry - 8} }}, {{ {rx + 300}, {ry + 8} }} }} }})) do if e.type ~= "character" then e.destroy() end end '
-                   f'local r = s.create_entity({{ name = "radar", position = {{ {rx}, {ry} }}, force = f }}) '
+                   f'local r = s.create_entity({{ name = "radar", position = {{ {rx}, {ry} }}, force = f, raise_built = true }}) '
                    f's.create_entity({{ name = "electric-energy-interface", position = {{ {rx + 4}, {ry} }}, force = f }}) '
                    f's.create_entity({{ name = "small-electric-pole", position = {{ {rx + 2.5}, {ry + 2.5} }}, force = f }}) '
                    f'local a = s.create_entity({{ name = "assembling-machine-2", position = {{ {rx + 1.5}, {ry + 7.5} }}, force = f }}) '
@@ -2469,12 +2841,12 @@ def check_logic(c, hello):
         cov = mt[0].get("cov") if mt else None
         rc = [int(rx // 32), int(ry // 32)]
         report(isinstance(cov, list) and any(cov[i:i + 2] == rc and cov[i + 2] >= 2 for i in range(0, len(cov), 3)),
-               "mtr cov: the working radar's chunk and its nearby reveal distance", f"{cov} radar chunk {rc}")
+               "mtr cov: the working radar's chunk and its nearby reveal distance (D12)", f"{cov} radar chunk {rc}")
         c.send({"t": "close"})
-        mod_lua(f'for _, u in pairs({{ {ua}, {ub}, {ur} }}) do local e = game.get_entity_by_unit_number(u) if e then e.destroy() end end')
+        destroy_units([ua, ub, ur])
     else:
         report(False, "rv: test buildings made", str(made))
-    # The map's trains (mtr): every carriage with its place, turn, size and map colour.
+    # D11: the map's trains (mtr): every carriage with its place, turn, size and map colour.
     c.pump(0.5, every=hello)
     c.send({"t": "mtr"})
     mtr = [m for m in c.pump(1.0, every=hello) if m.get("t") == "mtr"]
@@ -2849,7 +3221,7 @@ rcon.print(f.unit_number)""".replace("\n", " "))
     if not keep:
         mod_lua(f'for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ area = {{ {{ {x0 - 30}, {y0 - 30} }}, '
                 f'{{ {x0 + 30}, {y0 + 30} }} }}, name = {{ "steel-furnace", "chemical-plant", "oil-refinery", "assembling-machine-2", "recycler", '
-                f'"assembling-machine-3", "lab", "beacon" }} }})) do e.destroy() end rcon.print("ok")')
+                f'"assembling-machine-3", "lab", "beacon", "gun-turret", "rocket-turret", "locomotive", "straight-rail" }} }})) do e.destroy() end rcon.print("ok")')
 
 
 def check_alt_machines(c, hello_now, x0, y0):
@@ -2899,6 +3271,57 @@ rcon.print(a.unit_number .. " " .. l.unit_number .. " " .. b.unit_number)""".rep
     report(rows.get(l) == [l, ["speed-module", "speed-module"], packs],
            "K2: `am`: the lab's seven packs a slot each and its two modules", str(rows.get(l)))
     report(rows.get(b) == [b, ["speed-module-2", "speed-module-2"]], "K1: `am`: the beacon's modules", str(rows.get(b)))
+    check_alt_stock(c, hello_now, x0, y0)
+
+
+def check_alt_stock(c, hello_now, x0, y0):
+    """K1's leftover: an ammo turret's ammo and a locomotive's fuel in Alt-mode. What 2.1 says of their
+    icons_positioning (the gun turret's and the locomotive's are the only two in its data; Space Age's rocket
+    turret has none), eprops' isq for them, and `am`: a gun turret's magazines, a rocket turret's rockets (when
+    Space Age is on), a locomotive's fuel a slot each."""
+    facts = mod_lua("""local out = {} for _, n in pairs({ 'gun-turret', 'rocket-turret', 'railgun-turret', 'locomotive', 'car' }) do
+ local p = prototypes.entity[n] if p then local ok, ip = pcall(function() return p.icons_positioning end)
+ out[#out + 1] = n .. ' ip=' .. (ok and serpent.line(ip) or 'error') end end
+ rcon.print(table.concat(out, ' | '))""".replace("\n", " "))
+    print("  icons_positioning:", facts)
+    names = ("gun-turret", "locomotive", "rocket-turret")
+    ep = {name: (((c.eprops or {}).get(c.proto_id(name)) or [None] * 4)[3:] or [{}])[0] or {} for name in names if c.proto_id(name)}
+    report(ep.get("gun-turret", {}).get("isq") == [["a", 0, -0.25, 0.5, 2, 1, 1.1, -0.1]]
+           and ep.get("locomotive", {}).get("isq") == [["f", 0, 0.3, 0.5, 3, 4, 1.1, -0.1]],
+           "K1: eprops: the gun turret's ammo row and the locomotive's fuel row, as 2.1's icons_positioning",
+           f"{ep.get('gun-turret')} {ep.get('locomotive')}")
+    if "rocket-turret" in ep:
+        report(ep["rocket-turret"].get("isq") == [["a", 0, 0.7, 0.5, 4, 2, 1.1, -0.1]],
+               "K1: eprops: the rocket turret (no icons_positioning) gets Factorio's defaults", str(ep["rocket-turret"]))
+    # South and east of the smelting array (x0 - 24..x0 + 24, y0 - 28..y0 + 20) and the arrows' machines (y0 + 24),
+    # inside the cleared square: a locomotive isn't made where its box meets a building.
+    out = mod_lua(f"""
+local c = storage.f3d.puppet local s = c.surface
+local t = s.create_entity({{ name = "gun-turret", position = {{ {x0} - 12, {y0} + 28 }}, force = c.force, raise_built = true }})
+t.insert({{ name = "firearm-magazine", count = 10 }})
+local bare = s.create_entity({{ name = "gun-turret", position = {{ {x0} - 8, {y0} + 28 }}, force = c.force, raise_built = true }})
+local r = prototypes.entity["rocket-turret"] and s.create_entity({{ name = "rocket-turret", position = {{ {x0} - 3.5, {y0} + 28.5 }}, force = c.force, raise_built = true }})
+if r then r.insert({{ name = "rocket", count = 5 }}) end
+local rx, ry = math.floor(({x0} + 27) / 2) * 2 + 1, math.floor(({y0} - 6) / 2) * 2 + 1
+for i = 0, 4 do s.create_entity({{ name = "straight-rail", position = {{ rx, ry + 2 * i }}, direction = defines.direction.north, force = c.force, raise_built = true }}) end
+local l = s.create_entity({{ name = "locomotive", position = {{ rx, ry + 4 }}, direction = defines.direction.north, force = c.force, raise_built = true }})
+if l then l.insert({{ name = "coal", count = 5 }}) l.insert({{ name = "wood", count = 3 }}) end
+rcon.print(t.unit_number .. " " .. bare.unit_number .. " " .. (r and r.unit_number or 0) .. " " .. (l and l.unit_number or 0))""".replace("\n", " "))
+    units = [int(v) for v in out.split()] if all(v.isdigit() for v in out.split()) and len(out.split()) == 4 else []
+    if not units or not units[3]:
+        report(False, "K1: gun turrets and a locomotive on rails built", out)
+        return
+    c.send({"t": "altc", "on": 1, "g": 42})
+    msgs = c.pump(5.0, every=(1.0, hello_now))
+    c.send({"t": "altc", "on": 0})
+    rows = {r[0]: r for m in msgs if m.get("t") == "am" and m.get("g") == 42 for r in m["l"]}
+    t, bare, r, l = units
+    report(rows.get(t) == [t, 0, ["firearm-magazine"]] and bare not in rows,
+           "K1: `am`: a gun turret's ammo, one icon a filled slot; none for an empty turret", f"{rows.get(t)} {rows.get(bare)}")
+    if r:
+        report(rows.get(r) == [r, 0, ["rocket"]], "K1: `am`: a rocket turret's rockets", str(rows.get(r)))
+    fuel = (rows.get(l) or [0, 0, []])[2] if len(rows.get(l) or []) == 3 else []
+    report(sorted(fuel) == ["coal", "wood"], "K1: `am`: a locomotive's fuel, a slot each", str(rows.get(l)))
 
 
 def check_belt_switch(c, hello):
@@ -3189,7 +3612,7 @@ def check_gear(c, hello):
     moving and taking equipment, the roboport and exoskeleton switches, `me`'s shields, the
     character tab (`cinfo`), the players list (`pl`), a vehicle's grid, and dying: the countdown
     (`dead`) and the respawn at the spawn. Use a copy of a save: the armour is taken from any
-    other character that wears one (a real save may have one), else power armour is made."""
+    other character that wears one (the owner's save has one), else power armour is made."""
     out = mod_lua("""
 local c = storage.f3d.puppet
 local mine = c.get_inventory(defines.inventory.character_armor)
@@ -3694,7 +4117,7 @@ rcon.print(out[1] .. " " .. out[2] .. " " .. a.unit_number .. " " .. b.unit_numb
         c.send({"t": "redo", "h": hist[-1]["h"]})
         c.pump(0.5, every=hello)
         report(marked(chest_a) == "true", "redo: marked again (order_deconstruction)")
-    # Alt+D's shortcut and Ctrl+X's cut over ghosts. Factorio deletes them with no event.
+    # Owner's #20: Alt+D's shortcut and Ctrl+X's cut over ghosts. Factorio deletes them with no event.
     out = mod_lua(f"""
 local c = storage.f3d.puppet local s = c.surface local out = {{}}
 for _, p in pairs({{ {{ {x - 4.5}, {y + 8.5} }}, {{ {x + 4.5}, {y + 8.5} }} }}) do
@@ -3714,7 +4137,7 @@ rcon.print(out[1] .. " " .. out[2])
         c.send({"t": "copy", "cut": 1, "bp": 0, "x1": fx(x + 3.5), "y1": fx(y + 7.5), "x2": fx(x + 5.5), "y2": fx(y + 9.5)})
         dels = {d["u"] for d in of_type(c.pump(1.0, every=hello), "del")}
         report(ghost_b in dels, "cut (Ctrl+X) over a ghost deletes it and sends its del", f"{dels}")
-    # A book's icons (LuaItemStack.preview_icons) reach the inventory's slots as `ic`.
+    # Owner's #13: a book's icons (LuaItemStack.preview_icons) reach the inventory's slots as `ic`.
     out = mod_lua("""
 local inv = storage.f3d.puppet.get_main_inventory() local st, i = inv.find_empty_stack()
 st.set_stack({ name = "blueprint-book", count = 1 })
@@ -3727,7 +4150,7 @@ rcon.print(i)
            "a book's icons go with the inventory's slots (preview_icons -> ic)", f"slot {out}: {ic[-1:]}")
     if book_at:
         mod_lua(f"storage.f3d.puppet.get_main_inventory()[{book_at}].clear()")
-    # Right-click on the map removes the ghost under the point (unghost).
+    # Owner's #22: right-click on the map removes the ghost under the point (unghost).
     out = mod_lua(f"""
 local c = storage.f3d.puppet
 local g = c.surface.create_entity({{ name = "entity-ghost", inner_name = "assembling-machine-1", position = {{ {x + 6.5}, {y + 14.5} }}, force = c.force }})
@@ -3742,7 +4165,7 @@ rcon.print(g.unit_number)
     c.send({"t": "unghost", "q": 42, "x": fx(x + 30.5), "y": fx(y + 30.5)})
     answers = [(m["q"], m["n"]) for m in of_type(c.pump(1.0, every=hello), "unghost")]
     report(answers == [(42, 0)], "unghost where there is no ghost answers n = 0", f"{answers}")
-    # The map's copper wires between poles (chart ov "w").
+    # Owner's C10: the map's copper wires between poles (chart ov "w").
     out = mod_lua(f"""
 local c = storage.f3d.puppet local s = c.surface
 local a = s.create_entity({{ name = "small-electric-pole", position = {{ {x - 14.5}, {y + 18.5} }}, force = c.force }})
@@ -3761,14 +4184,14 @@ rcon.print(a.unit_number .. " " .. b.unit_number)
            f"{out}: {wires[:4]}")
     if poles:
         destroy_units(poles)
-    # A chart carries its chunk's pollution (pol).
+    # Owner's C12: a chart carries its chunk's pollution (pol).
     px_, py_ = x + 40, y + 40
     mod_lua(f"local c = storage.f3d.puppet c.surface.pollute({{ {px_}, {py_} }}, 777)")
     pcx, pcy = int(px_ // 32), int(py_ // 32)
     c.send({"t": "map", "cx1": pcx, "cy1": pcy, "cx2": pcx, "cy2": pcy, "res": 32})
     pols = [m.get("pol") for m in of_type(c.pump(1.5, every=hello), "chart") if (m["cx"], m["cy"]) == (pcx, pcy)]
     report(pols and pols[-1] is not None and pols[-1] >= 700, "a chart carries its chunk's pollution (LuaSurface.get_pollution)", f"{pols}")
-    # A filter inserter's Alt-mode icon carries every filter.
+    # Owner's #23: a filter inserter's Alt-mode icon carries every filter.
     out = mod_lua(f"""
 local c = storage.f3d.puppet
 local e = c.surface.create_entity({{ name = "fast-inserter", position = {{ {x + 0.5}, {y + 11.5} }}, force = c.force }})
@@ -4190,6 +4613,7 @@ def check_info(c, hello):
     msgs = c.pump(2, every=hello)
     nets = of_type(msgs, "lnets")
     l = nets[-1]["l"] if nets else []
+    l = l if isinstance(l, list) else []  # none: table_to_json writes {}
     report(nets, "lnets: every logistic network of the force", f"{len(l)} networks: {l[:3]}")
     if l:
         busiest = max(l, key=lambda r: r[3][1] + r[4][1])
@@ -4197,7 +4621,7 @@ def check_info(c, hello):
         msgs = c.pump(2, every=hello)
         one = of_type(msgs, "lnet")
         report(one and one[-1]["found"] == 1 and one[-1]["log"][1] == busiest[3][1], "lnet: one network's robots and items",
-               f"network {busiest[0]}: {len(one[-1].get('items', [])) if one else 0} items, first {one[-1].get('items', [])[:3] if one else ''}")
+               f"network {busiest[0]}: {len(one[-1].get('items', [])) if one else 0} items, first {list(one[-1].get('items', []))[:3] if one else ''}")
 
     # Alerts: whatever the save has, then ones made here.
     msgs = c.pump(4, every=hello)
@@ -4246,9 +4670,11 @@ rcon.print(t.unit_number .. " " .. a.unit_number .. " " .. hurt.unit_number .. "
     report(any(e[3] == "iron-chest" for e in kinds.get("destroyed", [0, 0, []])[2]), "al: destroyed (on_entity_died)",
            str(kinds.get("destroyed", "")[:2]))
     # The entity scans make a pass over every chunk at most every 10 s, spread over several seconds.
+    # The turret is seen round the focus within a second (J22, status_near), the ghost only by a pass: wait for both.
     has_turret = lambda m: m.get("t") == "al" and any(a[0] == "no_ammo" and any(e[4] == turret for e in a[2]) for a in m["l"])
+    has_ghost = lambda m: m.get("t") == "al" and any(a[0] in ("no_material", "no_robots") and any(e[4] == ghost for e in a[2]) for a in m["l"])
     started = time.time()
-    msgs = c.pump(30, every=hello, until=has_turret)
+    msgs = c.pump(30, every=hello, until=lambda m: has_turret(m) and has_ghost(m))
     msgs += c.pump(1.2, every=hello)
     al = of_type(msgs, "al")
     kinds = {a[0]: a for a in al[-1]["l"]} if al else {}
@@ -4599,7 +5025,7 @@ for _, at in pairs({{ rx, rx + 300 }}) do
   made[#made + 1] = car.unit_number
   made[#made + 1] = belt.unit_number
 end
-local r = s.create_entity({{ name = "radar", position = {{ rx, ry }}, force = f }})
+local r = s.create_entity({{ name = "radar", position = {{ rx, ry }}, force = f, raise_built = true }})
 s.create_entity({{ name = "electric-energy-interface", position = {{ rx + 4, ry }}, force = f }})
 s.create_entity({{ name = "small-electric-pole", position = {{ rx + 2.5, ry + 2.5 }}, force = f }})
 made[#made + 1] = r.unit_number
@@ -4647,11 +5073,11 @@ end
 local p = s.create_entity({{ name = "roboport", position = {{ px, py }}, force = f, raise_built = true }})
 local eei = s.create_entity({{ name = "electric-energy-interface", position = {{ px + 4, py }}, force = f }})
 local pole = s.create_entity({{ name = "small-electric-pole", position = {{ px + 2.5, py - 2.5 }}, force = f }})
-rcon.print(p.unit_number .. " " .. eei.unit_number .. " " .. pole.unit_number .. " " .. s.index)
+rcon.print(p.unit_number .. " " .. eei.unit_number .. " " .. pole.unit_number .. " " .. s.index .. " " .. p.position.x .. " " .. p.position.y)
 """.replace("\n", " ")).split()
     port_units = []
     fx = lambda v: int(round(v * 256))  # noqa: E731
-    if len(port) == 4:
+    if len(port) == 6:
         port_units = list(map(int, port[:3]))
         c.pump(1.0, every=hello)
         cars, on_belt, cov = look(rx + 310, True, 3.0)
@@ -4660,19 +5086,19 @@ rcon.print(p.unit_number .. " " .. eei.unit_number .. " " .. pole.unit_number ..
         c.send({"t": "open", "u": belt_b, "p": c.proto_id("transport-belt"), "x": fx(rx + 314.5), "y": fx(ry + 0.5), "rv": 1})
         msgs = c.pump(1.0, every=hello)
         report(any(m.get("t") == "gui" and m.get("u") == belt_b for m in msgs),
-               "rv: a building in a roboport's construction area opens from the remote view (H13)",
+               "rv: a building in a roboport's construction area opens from the remote view (H13, D10)",
                str([m.get("text") for m in msgs if m.get("t") == "msg"]))
         c.send({"t": "close"})
         c.send({"t": "mrp", "si": int(port[3]), "q": 7})
         msgs = c.pump(2.0, every=hello)
         ports = [v for m in msgs if m.get("t") == "mrp" and m.get("q") == 7 for v in m["l"]]
         last = [m for m in msgs if m.get("t") == "mrp" and m.get("q") == 7 and m.get("last") == 1]
-        at = [fx(rx + 310), fx(ry + 20)]
+        at = [fx(float(port[4])), fx(float(port[5]))]  # where the 4x4 roboport snapped to
         report(bool(last) and any(ports[i:i + 2] == at and ports[i + 3] > ports[i + 2] > 0 for i in range(0, len(ports), 4)),
                "mrp: the roboport with its logistic and construction radius (H13)", f"{len(ports) // 4} roboports, last {bool(last)}")
     else:
         report(False, "remote view: a roboport made", str(port))
-    mod_lua(f'for _, u in pairs({{ {", ".join(str(u) for u in [car_a, belt_a, car_b, belt_b, radar] + port_units)} }}) do local e = game.get_entity_by_unit_number(u) if e then e.destroy() end end')
+    destroy_units([car_a, belt_a, car_b, belt_b, radar] + port_units)
     c.send({"t": "focus", "x": c.me["x"], "y": c.me["y"], "r": 48})
     c.pump(0.5, every=hello)
 
@@ -4686,6 +5112,7 @@ def check_states(c, hello):
     an accumulator charges from a solar panel at noon and discharges into a radar once that is gone
     (an electric energy interface won't do: it gives power at tertiary priority, as accumulators
     do, so it never charges them)."""
+    clear_enemies()  # a biter left from the shooting checks kills the character in the middle (see clear_enemies)
     if not clean_spot(c, hello):
         report(False, "states: an empty spot", SPOT_WHY)
         return
@@ -4839,6 +5266,7 @@ def check_repair(c, hello):
     bridge's player-less character (printed: the bridge doesn't use it), then the bridge's `repair`: a wall and a
     chest damaged by script, a repair pack in the inventory, the client's command repeated as the button is held;
     health per tick, durability used, `me` `rp`, the bar in `hp`, and nothing for another force's building."""
+    clear_enemies()  # a biter left from the shooting checks kills the character in the middle (see clear_enemies)
     if not clean_spot(c, hello):
         report(False, "repair: an empty spot", SPOT_WHY)
         return
@@ -4920,8 +5348,674 @@ t.w.health = 100""".replace("\n", " "))
             "storage.f3d.puppet.get_main_inventory().remove({ name = 'repair-pack', count = 3 }) storage.f3d_repair = nil rcon.print('ok')")
 
 
+def check_vehicle_items(c, hello):
+    """N2, N3, N4: the bridge's commands on vehicles in the real game. N2: Ctrl+click (`fast`) on a car, a tank, a
+    spidertron, a locomotive and a cargo wagon (LuaEntity.insert: fuel to the fuel slot, ammo to the ammo slots, the
+    rest to the trunk or cargo; a locomotive takes fuel only; an empty hand takes the trunk or cargo, a locomotive's
+    nothing). N3: in an armed vehicle `guns` is the vehicle's (`v`, its guns over its ammo, `sel`), `gun` picks the
+    vehicle's gun, `move` to role `vammo` loads it, out of it the character's guns come back; and printed: whether
+    `shoot` fires the vehicle's gun for the player-less character. N4: `repair` mends a car and a cargo wagon, not
+    another force's car."""
+    clear_enemies()
+    back = mod_lua("local p = storage.f3d.puppet.position rcon.print(p.x .. ' ' .. p.y)")
+    if not clean_spot(c, hello):
+        report(False, "vehicle items: an empty spot", SPOT_WHY)
+        return
+    x, y = c.me["x"] / 256, c.me["y"] / 256
+    fx = lambda v: math.floor(v * 256 + 0.5)  # world.fixed
+    pid = {v[0]: k for k, v in c.protos.items()}
+    rails = " ".join(f's.create_entity({{ name = "straight-rail", position = {{ {x - 11 + 2 * i}, {y + 5} }}, direction = 4, force = c.force }})'
+                     for i in range(12))
+    specs = [("car", x + 4, y - 3, "player"), ("tank", x - 4, y - 3, "player"), ("spidertron", x, y - 8, "player"),
+             ("locomotive", x - 4, y + 5, "player"), ("cargo-wagon", x + 4, y + 5, "player"), ("car", x + 8, y + 1, "enemy"),
+             ("wooden-chest", x + 4.5, y - 12.5, "enemy")]
+    lua = f"local c = storage.f3d.puppet local s = c.surface {rails} local out = {{}} "
+    for name, ex, ey, force in specs:
+        lua += (f'local e = s.create_entity({{ name = "{name}", position = {{ {ex}, {ey} }}, direction = 4, force = "{force}", raise_built = true }}) '
+                'out[#out + 1] = e and (e.unit_number .. " " .. e.position.x .. " " .. e.position.y) or "0 0 0" ')
+    # The spidertron's auto targeting (on without a gunner by default) fires its rockets at the enemy car and chest.
+    lua += ("local sp = out[3] and game.get_entity_by_unit_number(tonumber(out[3]:match('^%d+'))) "
+            "if sp then sp.vehicle_automatic_targeting_parameters = { auto_target_without_gunner = false, auto_target_with_gunner = false } end "
+            "local m = c.get_main_inventory() m.insert({ name = 'wood', count = 40 }) m.insert({ name = 'firearm-magazine', count = 40 }) "
+            "m.insert({ name = 'rocket', count = 20 }) m.insert({ name = 'iron-plate', count = 200 }) m.insert({ name = 'repair-pack', count = 5 }) "
+            'rcon.print(table.concat(out, " "))')
+    vals = mod_lua(lua).split()
+    keys = ["car", "tank", "spidertron", "locomotive", "cargo-wagon", "enemy-car", "enemy-chest"]
+    ents = {}
+    for i, k in enumerate(keys):
+        if 3 * i + 2 < len(vals) and int(float(vals[3 * i])):
+            ents[k] = (int(float(vals[3 * i])), float(vals[3 * i + 1]), float(vals[3 * i + 2]))
+    report(len(ents) == len(keys), "vehicle items: a car, a tank, a spidertron, a locomotive and a cargo wagon built, "
+           "another force's car and chest", str(ents)[:300])
+    if len(ents) < len(keys):
+        destroy_units([v[0] for v in ents.values()])
+        return
+    c.pump(1.0, every=hello)
+    name_of = {"enemy-car": "car", "enemy-chest": "wooden-chest"}
+
+    def target(k):
+        u, ex, ey = ents[k]
+        return {"u": u, "p": pid.get(name_of.get(k, k), 0), "x": fx(ex), "y": fx(ey)}
+
+    def count(k, inv, item):
+        out = mod_lua(f"local e = game.get_entity_by_unit_number({ents[k][0]}) "
+                      f"local ok, i = pcall(function() return e.get_inventory(defines.inventory.{inv}) end) "
+                      f"rcon.print(ok and i and i.get_item_count('{item}') or -1)")
+        return int(out) if out.lstrip("-").isdigit() else -2
+
+    def main(item):
+        out = mod_lua(f"rcon.print(storage.f3d.puppet.get_main_inventory().get_item_count('{item}'))")
+        return int(out) if out.isdigit() else -1
+
+    def fast(k, item=None, n=None):
+        cmd = dict(target(k), t="fast")
+        if item:
+            cmd.update(item=item, n=n)
+        else:
+            cmd["half"] = 0
+        c.send(cmd)
+        return c.pump(0.8, every=hello)
+
+    # --- N2: Ctrl+click on vehicles ---
+    cases = [("car", "wood", 10, "fuel"), ("car", "firearm-magazine", 10, "car_ammo"), ("car", "iron-plate", 50, "car_trunk"),
+             ("tank", "wood", 10, "fuel"), ("tank", "firearm-magazine", 10, "car_ammo"), ("tank", "iron-plate", 20, "car_trunk"),
+             ("spidertron", "rocket", 10, "spider_ammo"), ("spidertron", "iron-plate", 20, "spider_trunk"),
+             ("locomotive", "wood", 5, "fuel"), ("cargo-wagon", "iron-plate", 50, "cargo_wagon")]
+    for k, item, n, inv in cases:
+        m0, v0 = main(item), count(k, inv, item)
+        msgs = fast(k, item, n)
+        m1, v1 = main(item), count(k, inv, item)
+        texts = [m["text"] for m in of_type(msgs, "msg")]
+        report(v1 - v0 == n and m0 - m1 == n, f"N2: Ctrl+click on the {k} puts {n} {item} into its {inv}",
+               f"{inv} {v0} -> {v1}, main {m0} -> {m1}, {texts}, slots sent {len(of_type(msgs, 'slots'))}")
+    m0 = main("iron-plate")
+    msgs = fast("locomotive", "iron-plate", 10)
+    texts = [m["text"] for m in of_type(msgs, "msg")]
+    report(main("iron-plate") == m0 and any("Can't put" in t for t in texts),
+           "N2: a locomotive refuses plates (fuel only) and nothing leaves the inventory", f"main {m0} -> {main('iron-plate')}, {texts}")
+    for k, inv, n in (("car", "car_trunk", 50), ("cargo-wagon", "cargo_wagon", 50), ("spidertron", "spider_trunk", 20)):
+        m0 = main("iron-plate")
+        fast(k)
+        report(count(k, inv, "iron-plate") == 0 and main("iron-plate") - m0 == n,
+               f"N2: Ctrl+click on the {k} with an empty hand takes its {inv} out",
+               f"main {m0} -> {main('iron-plate')}, left {count(k, inv, 'iron-plate')}")
+    report(count("car", "fuel", "wood") == 10 and count("car", "car_ammo", "firearm-magazine") == 10,
+           "N2: and leaves the car's fuel and ammo where they are",
+           f"fuel {count('car', 'fuel', 'wood')} wood, ammo {count('car', 'car_ammo', 'firearm-magazine')} magazines")
+    w0 = main("wood")
+    msgs = fast("locomotive")
+    texts = [m["text"] for m in of_type(msgs, "msg")]
+    report(count("locomotive", "fuel", "wood") == 5 and main("wood") == w0,
+           "N2: Ctrl+click on a locomotive with an empty hand takes nothing (no trunk; its fuel stays)",
+           f"fuel 5 -> {count('locomotive', 'fuel', 'wood')}, main wood {w0} -> {main('wood')}, {texts}")
+    # Burners whose fuel 2.1 hands out as inventory 1 (defines.inventory.chest is fuel too) or as their output
+    # inventory (a burner drill's): an empty hand takes nothing from them either (/f3d-perf fast_take).
+    burners = [("boiler", x - 8.5, y + 10), ("burner-mining-drill", x - 3, y + 10), ("burner-inserter", x + 0.5, y + 10.5)]
+    mod_lua(f"storage.f3d.puppet.teleport({{ {x - 3}, {y + 7} }})")
+    lua = "local c = storage.f3d.puppet local out = {} "
+    for name, bx, by in burners:
+        lua += (f'local e = c.surface.create_entity({{ name = "{name}", position = {{ {bx}, {by} }}, force = c.force, raise_built = true }}) '
+                "if e then e.get_fuel_inventory().insert({ name = 'wood', count = 5 }) end "
+                'out[#out + 1] = e and (e.unit_number .. " " .. e.position.x .. " " .. e.position.y) or "0 0 0" ')
+    vals = mod_lua(lua + 'rcon.print(table.concat(out, " "))').split()
+    c.pump(0.6, every=hello)
+    for i, (name, _bx, _by) in enumerate(burners):
+        if 3 * i + 2 >= len(vals) or not int(float(vals[3 * i])):
+            report(False, f"N2: a {name} built for the empty-hand Ctrl+click", str(vals))
+            continue
+        u = int(float(vals[3 * i]))
+        ents[name] = (u, float(vals[3 * i + 1]), float(vals[3 * i + 2]))
+        w0 = main("wood")
+        msgs = fast(name)
+        texts = [m["text"] for m in of_type(msgs, "msg")]
+        # (get_entity_by_unit_number finds vehicles and units, not buildings.)
+        left = mod_lua(f"local n = -1 for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ name = '{name}', "
+                       f"position = {{ {ents[name][1]}, {ents[name][2]} }}, radius = 0.5 }})) do "
+                       "if e.unit_number == " + str(u) + " then n = e.get_fuel_inventory().get_item_count('wood') end end rcon.print(n)")
+        # (A burner may have taken one into its fire meanwhile: the drill burns with nothing to mine.)
+        report(left in ("4", "5") and main("wood") == w0, f"N2: Ctrl+click on a {name} with an empty hand leaves its fuel",
+               f"fuel 5 -> {left}, main wood {w0} -> {main('wood')}, {texts}")
+    # A lab's packs and a gun turret's ammo are taken, as before the fuel fix (Factorio's wiki only says "takes
+    # anything the entity has"; whether Factorio does for these is the owner's to try).
+    holders = [("lab", x + 5, y + 10.5, "lab_input", "automation-science-pack"),
+               ("gun-turret", x + 9, y + 10, "turret_ammo", "firearm-magazine")]
+    lua = "local c = storage.f3d.puppet local out = {} "
+    for name, hx, hy, inv, item in holders:
+        lua += (f'local e = c.surface.create_entity({{ name = "{name}", position = {{ {hx}, {hy} }}, force = c.force, raise_built = true }}) '
+                f"if e then e.get_inventory(defines.inventory.{inv}).insert({{ name = '{item}', count = 3 }}) end "
+                'out[#out + 1] = e and (e.unit_number .. " " .. e.position.x .. " " .. e.position.y) or "0 0 0" ')
+    vals = mod_lua(lua + 'rcon.print(table.concat(out, " "))').split()
+    mod_lua(f"storage.f3d.puppet.teleport({{ {x + 6}, {y + 7} }})")
+    c.pump(0.6, every=hello)
+    for i, (name, _hx, _hy, inv, item) in enumerate(holders):
+        if 3 * i + 2 >= len(vals) or not int(float(vals[3 * i])):
+            report(False, f"N2: a {name} built for the empty-hand Ctrl+click", str(vals))
+            continue
+        u = int(float(vals[3 * i]))
+        ents[name] = (u, float(vals[3 * i + 1]), float(vals[3 * i + 2]))
+        total = lambda: mod_lua(f"rcon.print(storage.f3d.puppet.get_item_count('{item}'))")
+        t0 = total()
+        msgs = fast(name)
+        left = mod_lua(f"local n = -1 for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ name = '{name}', "
+                       f"position = {{ {ents[name][1]}, {ents[name][2]} }}, radius = 0.5 }})) do "
+                       f"if e.unit_number == {u} then n = e.get_inventory(defines.inventory.{inv}).get_item_count('{item}') end end rcon.print(n)")
+        t1 = total()
+        report(left == "0" and t0.isdigit() and t1.isdigit() and int(t1) - int(t0) >= 2,  # (2.1.24 counted 30 -> 32 once: into the ammo slots)
+               f"N2: Ctrl+click on a {name} with an empty hand takes its {item}, as before",
+               f"left {left}, the character's {t0} -> {t1}, {[m['text'] for m in of_type(msgs, 'msg')]}")
+
+    # --- N3: the vehicle's guns while the character sits in it ---
+    def enter(k, dx=0.0, dy=2.5):
+        u, ex, ey = ents[k]
+        mod_lua(f"storage.f3d.puppet.teleport({{ {ex + dx}, {ey + dy} }})")
+        c.pump(0.3, every=hello)
+        c.last.pop("guns", None)
+        c.send({"t": "enter"})
+        msgs = c.pump(1.5, every=hello)
+        inside = mod_lua("local v = storage.f3d.puppet.vehicle rcon.print(v and v.unit_number or 0)")
+        return inside == str(u), msgs
+
+    def last_guns(msgs):
+        g = of_type(msgs, "guns")
+        return g[-1] if g else c.last.get("guns") or {}
+
+    ok, msgs = enter("car")
+    g = last_guns(msgs)
+    l = g.get("l") or []
+    report(ok and g.get("v") == ents["car"][0] and g.get("sel") == 1 and len(l) == 1
+           and l[0][:3] == ["vehicle-machine-gun", "firearm-magazine", 10] and l[0][4] == 10 and l[0][3] > 0,
+           "N3: in the car `guns` is the car's: its machine gun over its 10 magazines, rounds and magazine size, sel 1, v the car",
+           f"in {ok}, {g}")
+    report(c.me and c.me.get("v") == ents["car"][0], "N3: and me says the character sits in it (v)", str(c.me and c.me.get("v")))
+    # move with role vammo: a stack from the main inventory into the car's ammo.
+    slot = mod_lua("local m = storage.f3d.puppet.get_main_inventory() for i = 1, #m do "
+                   "if m[i].valid_for_read and m[i].name == 'firearm-magazine' then rcon.print(i) return end end rcon.print(0)")
+    a0 = count("car", "car_ammo", "firearm-magazine")
+    c.send({"t": "move", "from": "main", "fi": int(slot) if slot.isdigit() else 0, "to": "vammo", "ti": 1, "n": 5})
+    msgs = c.pump(1.0, every=hello)
+    g = last_guns(msgs)
+    a1 = count("car", "car_ammo", "firearm-magazine")
+    report(a1 - a0 == 5 and (g.get("l") or [[0, 0, 0]])[0][2] == a1,
+           "N3: move to role vammo puts 5 magazines into the car's ammo, and guns follows", f"car ammo {a0} -> {a1}, {g.get('l')}")
+    # shoot: does the character's shooting_state fire the car's gun? An enemy chest under the aim point.
+    rounds = lambda: mod_lua(f"local e = game.get_entity_by_unit_number({ents['car'][0]}) local s = e.get_inventory(defines.inventory.car_ammo)[1] "
+                             "local ch = storage.f3d.puppet.get_inventory(defines.inventory.character_ammo)[1] "
+                             "rcon.print((s.valid_for_read and (s.count * 10 + s.ammo - 10) or 0) .. ' ' .. "
+                             "(ch.valid_for_read and (ch.count * 10 + ch.ammo - 10) or 0))")
+    chest = lambda: mod_lua(f"local t for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ name = 'wooden-chest', force = 'enemy', "
+                            f"position = {{ {ents['enemy-chest'][1]}, {ents['enemy-chest'][2]} }}, radius = 0.6 }})) do t = e end "
+                            "rcon.print(t and t.health or 'gone')")
+    r0, h0 = rounds(), chest()
+    _u, cx_, cy_ = ents["enemy-chest"]
+    shoot = {"t": "shoot", "m": 1, "x": fx(cx_), "y": fx(cy_)}
+    msgs = c.pump(2.0, every=(0.2, shoot))
+    c.send({"t": "shoot", "m": -1})
+    msgs += c.pump(0.5, every=hello)
+    r1, h1 = rounds(), chest()
+    shots = of_type(msgs, "shot")
+    texts = [m["text"] for m in of_type(msgs, "msg")]
+    fired = r0.split()[:1] != r1.split()[:1]
+    print(f"  N3: shoot (m 1, at an enemy chest 9 tiles off) from inside the car for 2 s: car, character rounds {r0} -> {r1}, "
+          f"chest {h0} -> {h1}, `shot` {len(shots)} {[s.get('g') for s in shots[:2]]}, "
+          f"me.sh {[m.get('sh') for m in of_type(msgs, 'me')][-3:]}, msgs {texts}")
+    report(fired, "N3: `shoot` fires the car's gun for the player-less character (its rounds go down)", f"{r0} -> {r1}")
+    # The bridge's side (/f3d-perf vehicle_ammo): me.sh follows the car's ammo, the car's shots come in `ts` (the client's
+    # turrets.gd draws them from the car's gun) and no `shot` from the character's own guns; no "Out of ammo" while the
+    # car has some.
+    car_u, me_u = ents["car"][0], (c.me or {}).get("u")
+    ts_shots = sum(r[2] for m in of_type(msgs, "ts") for r in (m.get("l") or []) if r and r[0] == car_u)
+    report(fired and any(m.get("sh") == 1 for m in of_type(msgs, "me")), "N3: me.sh is 1 while the car's gun fires",
+           f"me with sh 1: {sum(m.get('sh') == 1 for m in of_type(msgs, 'me'))} of {len(of_type(msgs, 'me'))}")
+    report(fired and ts_shots > 0 and not [s for s in shots if s.get("u") == me_u],
+           "N3: the car's shots come in ts (its unit, shots counted), no `shot` from the character's guns",
+           f"ts shots {ts_shots}, shot {[(s.get('u'), s.get('g')) for s in shots[:3]]}")
+    report("Out of ammo" not in texts, "N3: no Out of ammo while the car has ammo", str(texts))
+    # m 0 (Factorio's Space: the nearest enemies) from the car: the enemy car 6 tiles off.
+    r0 = rounds()
+    near = {"t": "shoot", "m": 0, "x": fx(ents["car"][1]), "y": fx(ents["car"][2])}
+    msgs = c.pump(2.0, every=(0.2, near))
+    c.send({"t": "shoot", "m": -1})
+    msgs += c.pump(0.5, every=hello)
+    r1 = rounds()
+    fired0 = r0.split()[:1] != r1.split()[:1]
+    ts0 = sum(r[2] for m in of_type(msgs, "ts") for r in (m.get("l") or []) if r and r[0] == car_u)
+    print(f"  N3: shoot m 0 from inside the car for 2 s: car, character rounds {r0} -> {r1}, ts shots {ts0}, "
+          f"me with sh 1: {sum(m.get('sh') == 1 for m in of_type(msgs, 'me'))} of {len(of_type(msgs, 'me'))}")
+    report(not fired0 or any(m.get("sh") == 1 for m in of_type(msgs, "me")),
+           "N3: shoot m 0 from the car: when the game fires the car's gun at the nearest enemy, me.sh says so",
+           "fires" if fired0 else "the game didn't fire (m 0 printed)")
+    # Out of the car the character's own guns come back.
+    c.last.pop("guns", None)
+    c.send({"t": "enter"})
+    msgs = c.pump(1.5, every=hello)
+    g = last_guns(msgs)
+    out = mod_lua("rcon.print(storage.f3d.puppet.vehicle and 'in' or 'out')")
+    report(out == "out" and g and "v" not in g and (g.get("l") or [[""]])[0][0] == "pistol",
+           "N3: out of the car the character's guns come back (no v, the pistol)", f"{out}, {g}")
+    # A tank: three guns, gun 2 its cannon.
+    ok, msgs = enter("tank", 0, 3.0)
+    c.send({"t": "gun", "i": 2})
+    msgs += c.pump(1.0, every=hello)
+    g = last_guns(msgs)
+    sel = mod_lua(f"rcon.print(game.get_entity_by_unit_number({ents['tank'][0]}).selected_gun_index)")
+    order = mod_lua("local o = {} for _, gp in ipairs(prototypes.entity['tank'].indexed_guns) do o[#o + 1] = gp.name end "
+                    "rcon.print(table.concat(o, ' '))").split()
+    names = [r[0] for r in g.get("l") or []]
+    # 2.1's tank: cannon, machine gun, flamethrower (indexed_guns); the magazines put in went to the machine gun's slot.
+    mg = order.index("tank-machine-gun") if "tank-machine-gun" in order else 0
+    report(ok and sel == "2" and g.get("sel") == 2 and g.get("v") == ents["tank"][0] and names == order
+           and sorted(names) == ["tank-cannon", "tank-flamethrower", "tank-machine-gun"]
+           and (g.get("l") or [])[mg:mg + 1] and g["l"][mg][1] == "firearm-magazine",
+           "N3: a tank's three guns in indexed_guns' order, its magazines under the machine gun, gun i=2 selects the second "
+           "(the vehicle's selected_gun_index)", f"in {ok}, sel {sel}, indexed_guns {order}, {g}")
+    c.send({"t": "enter"})
+    c.pump(1.0, every=hello)
+    ok, msgs = enter("spidertron", 0, 2.5)
+    g = last_guns(msgs)
+    l = g.get("l") or []
+    report(ok and g.get("v") == ents["spidertron"][0] and len(l) == 4 and l[0][1] == "rocket" and l[0][2] == 10,
+           "N3: a spidertron's four rocket launchers over its spider_ammo (the 10 rockets)", f"in {ok}, {g}")
+    c.send({"t": "enter"})
+    c.pump(1.0, every=hello)
+
+    # --- N4: repair packs on vehicles ---
+    mod_lua(f"storage.f3d.puppet.teleport({{ {x}, {y} }}) for _, u in pairs({{ {ents['car'][0]}, {ents['cargo-wagon'][0]}, {ents['enemy-car'][0]} }}) do "
+            "local e = game.get_entity_by_unit_number(u) e.health = e.max_health - 150 end")
+    c.pump(0.5, every=hello)
+
+    def health(k):
+        out = mod_lua(f"local e = game.get_entity_by_unit_number({ents[k][0]}) rcon.print(e.health .. ' ' .. e.max_health)")
+        try:
+            h, mx = (float(v) for v in out.split())
+            return h, mx
+        except ValueError:
+            return -1.0, -1.0
+
+    for k in ("car", "cargo-wagon"):
+        h0, mx = health(k)
+        cmd = dict(target(k), t="repair", item="repair-pack")
+        msgs = []
+        end = time.time() + 2.0
+        while time.time() < end:
+            c.send(cmd)
+            msgs += c.pump(0.15, every=hello)
+        c.send({"t": "repair"})
+        msgs += c.pump(0.3, every=hello)
+        h1, _ = health(k)
+        rp = [m for m in of_type(msgs, "me") if m.get("rp") == 1]
+        hp_lists = [m["l"] if isinstance(m["l"], list) else [] for m in of_type(msgs, "hp")]
+        bars = [dict(zip(l[::2], l[1::2])).get(ents[k][0]) for l in hp_lists]
+        texts = [m["text"] for m in of_type(msgs, "msg")]
+        print(f"  N4: {k}: {len(hp_lists)} hp messages, the last {hp_lists[-2:]}, rp from tick "
+              f"{[m.get('k') for m in rp][:1]} to {[m.get('k') for m in rp][-1:]}")
+        report(h1 == mx and h0 < mx, f"N4: `repair` mends the damaged {k} to full", f"{h0} -> {h1} of {mx}, {texts}")
+        report(rp and rp[-1].get("rx") == target(k)["x"], f"N4: me says the character repairs the {k} (rp, rx)", str(rp[-1:]))
+        report(any(b is not None for b in bars), f"N4: the {k}'s bar is in hp while it mends", str(bars[-3:]))
+    e0, _ = health("enemy-car")
+    c.send(dict(target("enemy-car"), t="repair", item="repair-pack"))
+    c.pump(1.0, every=hello)
+    c.send({"t": "repair"})
+    report(health("enemy-car")[0] == e0, "N4: another force's car isn't mended", f"{e0} -> {health('enemy-car')[0]}")
+
+    # Clean up: everything built, the rails, what was put in the inventory.
+    mod_lua("local c = storage.f3d.puppet if c.vehicle then c.driving = false end")
+    destroy_units([v[0] for k, v in ents.items() if not k.startswith("enemy")])
+    mod_lua(f"local c = storage.f3d.puppet local e = game.get_entity_by_unit_number({ents['enemy-car'][0]}) if e then e.destroy() end "
+            f"for _, r in pairs(c.surface.find_entities_filtered({{ area = {{ {{ {x - 14}, {y - 14} }}, {{ {x + 14}, {y + 7} }} }}, "
+            "name = { 'straight-rail', 'car', 'tank', 'spidertron', 'locomotive', 'cargo-wagon', 'wooden-chest' } })) do r.destroy() end "
+            "local m = c.get_main_inventory() for _, it in pairs({ { 'wood', 40 }, { 'firearm-magazine', 40 }, { 'rocket', 20 }, "
+            "{ 'iron-plate', 200 }, { 'repair-pack', 5 } }) do m.remove({ name = it[1], count = it[2] }) end rcon.print('ok')")
+    if len(back.split()) == 2:
+        bx, by = (float(v) for v in back.split())
+        mod_lua(f"storage.f3d.puppet.teleport({{ {bx}, {by} }})")
+        watch_around(c, hello, bx, by)
+
+
+def check_under_clear(c, hello):
+    """M2: an underground pair the client builds over a run of belts mines the belts between into the character, their
+    items too, as Factorio's player build does (its tips and tricks: "Any belts in between the entrance and exit of the
+    underground belt will be mined automatically"), each said at once (`mnd`); pipes-to-ground over pipes the same.
+    A run with a belt side-loading into it keeps its belts (only "simple" ones go), and so does one with the switch
+    off. First whether a script's create_entity{fast_replace, character} does it by itself (printed: in 2.1.24 it
+    doesn't, so the bridge mines them)."""
+    clear_enemies()  # a biter left from the shooting checks kills the character in the middle (see clear_enemies)
+    if not clean_spot(c, hello):
+        report(False, "under_clear: an empty spot", SPOT_WHY)
+        return
+    x, y = math.floor(c.me["x"] / 256), math.floor(c.me["y"] / 256)
+    fx = lambda v: math.floor(v * 256 + 0.5)  # world.fixed
+    # Rows (y + dy), every lane full so nothing moves (a line backed up to its end): 2 a plain east run, 8 plates a
+    # belt, 4 the same with a belt side-loading into its third,
+    # 6 pipes, 8 a plain run built with the switch off, 10 the script's own create_entity (character, fast_replace),
+    # -2 a plain run whose two ends are sent together (a drag's pair; within the character's reach, as the rest).
+    out = mod_lua(f"""local c = storage.f3d.puppet local s = c.surface
+local t = {{ rows = {{}} }}
+for _, dy in pairs({{ 2, 4, 6, 8, 10, -2 }}) do
+  local row = {{}}
+  for i = 0, 6 do
+    local e = s.create_entity({{ name = dy == 6 and 'pipe' or 'transport-belt', position = {{ {x} + i + 0.5, {y} + dy + 0.5 }},
+      direction = defines.direction.east, force = c.force, raise_built = true }})
+    if dy ~= 6 then
+      for l = 1, 2 do for k = 0, 3 do e.get_transport_line(l).insert_at(0.125 + 0.25 * k, {{ name = 'iron-plate', count = 1 }}) end end
+    end
+    row[#row + 1] = e
+  end
+  t.rows[dy] = row
+end
+t.side = s.create_entity({{ name = 'transport-belt', position = {{ {x} + 2.5, {y} + 3.5 }}, direction = defines.direction.south,
+  force = c.force, raise_built = true }})
+c.get_main_inventory().insert({{ name = 'underground-belt', count = 10 }})
+c.get_main_inventory().insert({{ name = 'pipe-to-ground', count = 2 }})
+storage.f3d_m2 = t
+local u = {{}} for i = 2, 5 do u[#u + 1] = t.rows[2][i].unit_number end
+rcon.print(table.concat(u, ' '))""".replace("\n", " "))
+    try:
+        middle = {int(v) for v in out.split()}
+    except ValueError:
+        report(False, "under_clear: belt runs and pipes laid, undergrounds in the inventory", out)
+        return
+    # The script's own create_entity with the character: does the game mine the run between? (Printed.)
+    own = mod_lua(f"""local c = storage.f3d.puppet local s = c.surface local t = storage.f3d_m2
+local a = s.create_entity({{ name = 'underground-belt', position = {{ {x} + 0.5, {y} + 10.5 }}, direction = defines.direction.east,
+  type = 'input', force = c.force, fast_replace = true, character = c }})
+local b = s.create_entity({{ name = 'underground-belt', position = {{ {x} + 5.5, {y} + 10.5 }}, direction = defines.direction.east,
+  type = 'output', force = c.force, fast_replace = true, character = c }})
+local n = 0 for i = 2, 5 do if t.rows[10][i].valid then n = n + 1 end end
+local paired = a and b and a.underground_belt_neighbour == b
+for _, e in pairs({{ a, b }}) do if e and e.valid then e.destroy() end end
+rcon.print('paired ' .. tostring(paired) .. ', ' .. n .. ' of 4 between still there')""".replace("\n", " "))
+    print(f"  M2: a script's create_entity{{fast_replace, character}} pair over a run: {own}")
+    report(True, "under_clear: what a script's own fast-replace pair does to the run printed (the bridge mines it)", own)
+
+    def count(item):
+        try:
+            return int(mod_lua(f"rcon.print(storage.f3d.puppet.get_main_inventory().get_item_count('{item}'))"))
+        except ValueError:
+            return -1
+
+    def build(item, dy, x0, d0, x1, d1):
+        msgs = []
+        for bx, d in ((x0, d0), (x1, d1)):
+            c.send({"t": "build", "item": item, "x": fx(x + bx + 0.5), "y": fx(y + dy + 0.5), "d": d})
+            msgs += c.pump(0.4, every=hello)
+        return msgs + c.pump(1.0, every=hello)
+
+    def alive(dy):
+        return mod_lua(f"local r = {{}} for _, e in ipairs(storage.f3d_m2.rows[{dy}]) do r[#r + 1] = e.valid and '1' or '0' end "
+                       "rcon.print(table.concat(r))")
+
+    belts0, plates0 = count("transport-belt"), count("iron-plate")
+    msgs = build("underground-belt", 2, 0, 4, 5, 4)
+    row2 = alive(2)
+    mnd = {m["u"]: m for m in of_type(msgs, "mnd") if m["u"] in middle}
+    dels = {d["u"] for d in of_type(msgs, "del")}
+    belts1, plates1 = count("transport-belt"), count("iron-plate")
+    print(f"  M2: row {row2} (ends and the four between gone, the last kept), mnd {sorted(mnd)}, belts {belts0} -> {belts1}, "
+          f"plates {plates0} -> {plates1}")
+    report(row2 == "0000001", "under_clear: an underground pair over a plain run mines the four belts between", row2)
+    report(set(mnd) == middle and all(m["g"] == 1 and ["transport-belt", 1] in m["l"] and ["iron-plate", 8] in m["l"]
+                                      for m in mnd.values()),
+           "under_clear: each is said at once (`mnd`: gone, the belt and its 8 plates to the character)", str(list(mnd.values())[:2]))
+    report(middle <= dels, "under_clear: and their `del`s come", f"{sorted(middle - dels)} missing")
+    report(belts1 - belts0 == 6 and plates1 - plates0 == 48,
+           "under_clear: six belts (four between, the two the ends replaced) and their 48 plates in the inventory",
+           f"belts +{belts1 - belts0}, plates +{plates1 - plates0}")
+    build("underground-belt", 4, 0, 4, 5, 4)
+    report(alive(4)[1:5] == "1111", "under_clear: a run with a belt side-loading into it keeps its belts", alive(4))
+    pipes0 = count("pipe")
+    build("pipe-to-ground", 6, 0, 12, 5, 4)
+    row6 = alive(6)
+    report(row6 == "0000001" and count("pipe") - pipes0 == 6, "under_clear: a pipe-to-ground pair over pipes mines the four between",
+           f"{row6}, pipes +{count('pipe') - pipes0}")
+    # M2's leftover: a drag sends both ends back to back (one datagram each, the same tick or the next): the run
+    # between is mined just the same, said in the answer to the exit (what the client hides ahead of).
+    for bx in (0, 5):
+        c.send({"t": "build", "item": "underground-belt", "x": fx(x + bx + 0.5), "y": fx(y - 2 + 0.5), "d": 4})
+    msgs = c.pump(1.5, every=hello)
+    row12 = alive(-2)
+    said = len([m for m in of_type(msgs, "mnd") if m.get("g") == 1 and ["transport-belt", 1] in m.get("l", [])])
+    report(row12 == "0000001" and said == 4, "under_clear: both ends sent together (a drag's pair): the four between mined, an `mnd` each",
+           f"{row12}, {said} mnd")
+    rcon.run("/f3d-perf under_clear off")
+    build("underground-belt", 8, 0, 4, 5, 4)
+    rcon.run("/f3d-perf under_clear default")
+    report(alive(8)[1:5] == "1111", "under_clear: /f3d-perf under_clear off keeps the run, as before", alive(8))
+    check_splitter_snap(c, hello, x, y)
+    mod_lua(f"""local c = storage.f3d.puppet local s = c.surface
+for _, e in pairs(s.find_entities_filtered({{ area = {{ {{ {x} - 1, {y} - 5 }}, {{ {x} + 8, {y} + 12 }} }},
+  type = {{ 'transport-belt', 'underground-belt', 'pipe', 'pipe-to-ground', 'splitter' }} }})) do e.destroy({{ raise_destroy = true }}) end
+storage.f3d_m2 = nil rcon.print('ok')""".replace("\n", " "))
+
+
+def check_splitter_snap(c, hello, x, y):
+    """J9 (the owner: placing a splitter over a belt sometimes shifts it over one tile): a splitter built over a row of
+    belts stands where the cursor's point snaps, as Factorio's prototype docs say for an even tile_width ("the center is
+    on the tile transition") and an odd one (the tile's middle): on the tile edge nearest the cursor across, so over the
+    belt under the cursor and the one on the side the cursor leans to, both replaced and given back. First what the
+    game's own create_entity makes of unsnapped points (printed): the same rule in every direction."""
+    own = mod_lua(f"""local c = storage.f3d.puppet local s = c.surface local n, bad = 0, 0
+local function snap(v, size) if size % 2 == 1 then return math.floor(v) + 0.5 end return math.floor(v + 0.5) end
+for _, d in pairs({{ defines.direction.north, defines.direction.east, defines.direction.south, defines.direction.west }}) do
+  local w, h = 2, 1 if d == defines.direction.east or d == defines.direction.west then w, h = 1, 2 end
+  for _, f in pairs({{ 0.004, 0.25, 0.496, 0.5, 0.504, 0.75, 0.996 }}) do for _, g in pairs({{ 0.3, 0.7 }}) do for swap = 0, 1 do
+    local cx, cy = {x} + 20 + f, {y} - 4 + g if swap == 1 then cx, cy = {x} + 20 + g, {y} - 4 + f end
+    local e = s.create_entity({{ name = 'splitter', position = {{ cx, cy }}, direction = d, force = c.force }}) n = n + 1
+    if not e or e.position.x ~= snap(cx, w) or e.position.y ~= snap(cy, h) then bad = bad + 1 end
+    if e then e.destroy() end
+  end end end
+end
+rcon.print(n .. ' placements, ' .. bad .. ' off the rule')""".replace("\n", " "))
+    print(f"  J9: the game's own create_entity snaps a splitter's point (every direction): {own}")
+    report(own.endswith(" 0 off the rule"), "J9: Factorio snaps a splitter as the bridge and the client do (odd: the tile's middle, even: the nearest tile edge)", own)
+    out = mod_lua(f"""local c = storage.f3d.puppet local s = c.surface local u = {{}}
+for i = 0, 6 do local e = s.create_entity({{ name = 'transport-belt', position = {{ {x} + i + 0.5, {y} - 4 + 0.5 }},
+  direction = defines.direction.north, force = c.force, raise_built = true }}) u[#u + 1] = e.unit_number end
+c.get_main_inventory().insert({{ name = 'splitter', count = 2 }}) rcon.print(table.concat(u, ' '))""".replace("\n", " "))
+    try:
+        row = [int(v) for v in out.split()]
+    except ValueError:
+        row = []
+    if len(row) != 7:
+        report(False, "J9: a row of belts for the splitters", out)
+        return
+    c.pump(0.5, every=hello)
+    fx = lambda v: math.floor(v * 256 + 0.5)
+    got = []
+    # The cursor in the left half of the second belt's tile, then in the right half of the fifth's: sent as the
+    # client sends it (rounded down to 1/256 tile).
+    for cx, want_x, under in ((x + 1.3, x + 1, row[0:2]), (x + 4.7, x + 5, row[4:6])):
+        c.send({"t": "build", "item": "splitter", "x": math.floor(cx * 256), "y": math.floor((y - 4 + 0.4) * 256), "d": 0})
+        msgs = c.pump(1.0, every=hello)
+        adds = [a["e"][2:5] for a in of_type(msgs, "add") if a["e"][1] == c.proto_id("splitter")]
+        dels = {d["u"] for d in of_type(msgs, "del")}
+        got.append((adds[:1] == [[fx(want_x), fx(y - 4 + 0.5), 0]], set(under) <= dels, adds[:1], sorted(dels & set(row))))
+    report(all(g[0] for g in got), "J9: a splitter over belts stands on the tile edge on the cursor's side of the belt under it",
+           str([g[2] for g in got]))
+    report(all(g[1] for g in got), "J9: and replaces both belts under it (their `del`s)", str([g[3] for g in got]))
+
+
+def check_pipe_end(c, hello):
+    """The owner's FUE5 pipe left open where its run now ends (and a T left a T): the bridge's player-less character
+    mines with LuaControl.mine_entity, which raises no event, so the pipes and belts beside what it mined never had
+    their shapes sent again (`pc`, a belt's `s`); `/f3d-perf mined_neighbours` queues them for the next tick. Each case
+    is built, its piece removed (the bridge's `mine`, damage, a construction robot) and the neighbours' `upd` waited
+    for: a run of five losing its middle (endings), a corner, a T losing its branch (a straight), a cross losing an arm
+    (a T), a pipe-to-ground and a pipe beside each other, a pump and a storage tank under pipes, a belt curve
+    straightened, a side-loaded belt curving once the belt behind it goes, a pipe `die`d, one a robot deconstructs, and
+    the switch off (no `upd`). Walls and heat pipes are joined by the client itself (no shape from the bridge: checked),
+    so only their `del` is looked for."""
+    clear_enemies()
+    if not clean_spot(c, hello):
+        report(False, "pipe end: an empty spot", SPOT_WHY)
+        return
+    x, y = math.floor(c.me["x"] / 256), math.floor(c.me["y"] / 256)
+    home = (x + 0.5, y + 0.5)
+    area = f"{{ {{ {x} - 9, {y} + 1 }}, {{ {x} + 9, {y} + 12 }} }}"
+    types = ("{ 'pipe', 'pipe-to-ground', 'pump', 'transport-belt', 'wall', 'heat-pipe', 'storage-tank', 'roboport', "
+             "'electric-energy-interface', 'electric-pole', 'logistic-container', 'construction-robot', 'item-entity' }")
+    N, E, S, W = 0, 4, 8, 12
+
+    def clear():
+        mod_lua(f"local c = storage.f3d.puppet for _, e in pairs(c.surface.find_entities_filtered({{ area = {area}, "
+                f"type = {types} }})) do e.destroy({{ raise_destroy = true }}) end rcon.print('ok')")
+        c.pump(0.6, every=hello)
+
+    def lay(parts):
+        """parts: (name, dx, dy, direction) from (x, y + 2); their unit numbers and their latest records sent."""
+        lines = []
+        for name, dx, dy, d in parts:
+            lines.append(f"u[#u + 1] = s.create_entity({{ name = '{name}', position = {{ {x} + {dx}, {y} + 2 + {dy} }}, "
+                         f"direction = {d}, force = c.force, raise_built = true }}).unit_number")
+        out = mod_lua("local c = storage.f3d.puppet local s = c.surface local u = {} " + " ".join(lines)
+                      + " rcon.print(table.concat(u, ' '))")
+        try:
+            units = [int(v) for v in out.split()]
+        except ValueError:
+            return None, {}, out
+        recs = {}
+        for m in c.pump(1.0, every=hello):
+            if m.get("t") in ("add", "upd") and m["e"][0] in units:
+                recs[m["e"][0]] = m["e"]
+        return units, recs, out
+
+    def remove_and_watch(unit, rec, watch, how="mine"):
+        """Removes `unit` (the bridge's `mine`; `die`; "robot": already ordered), then waits for every unit in `watch`
+        to be sent again: ({unit: (record, seconds after the del)}, whether its del came)."""
+        if how == "die":
+            mod_lua(f"local c = storage.f3d.puppet for _, e in pairs(c.surface.find_entities_filtered({{ area = {area} }})) do "
+                    f"if e.unit_number == {unit} then e.die() end end rcon.print('ok')")
+        cmd = {"t": "mine", "u": unit, "p": rec[1], "x": rec[2], "y": rec[3]} if rec else None
+        t_del, got = None, {}
+        end = time.time() + (30 if how == "robot" else 6)
+        while time.time() < end:
+            if how == "mine" and t_del is None and cmd:
+                c.send(cmd)
+            for m in c.pump(0.15, every=hello):
+                if m.get("t") == "del" and m.get("u") == unit and t_del is None:
+                    t_del = time.time()
+                if m.get("t") == "upd" and m["e"][0] in watch and t_del is not None:
+                    got.setdefault(m["e"][0], (m["e"], round(time.time() - t_del, 2)))
+            if t_del is not None and (len(got) == len(watch) or time.time() - t_del > 1.5):
+                break
+        if how == "mine":
+            c.send({"t": "mine_stop"})
+        return got, t_del is not None
+
+    def extra(rec, key):
+        return rec[5].get(key) if rec and len(rec) > 5 and isinstance(rec[5], dict) else None
+
+    mod_lua(f"storage.f3d.puppet.teleport({{ {home[0]}, {home[1]} }})")
+    print("  pipe end: act-as-player " + mod_lua("rcon.print(tostring(settings.global['f3d-act-as-player'].value))")
+          + ", players connected " + mod_lua("rcon.print(#game.connected_players)") + " (none: the bridge mines with mine_entity)")
+
+    def pipe_case(label, parts, target, expect, how="mine"):
+        """expect: {index in parts: the pc wanted after} (1 north, 2 east, 4 south, 8 west)."""
+        units, recs, out = lay(parts)
+        if units is None:
+            report(False, f"pipe end: {label}: laid", out)
+            clear()
+            return
+        before = {i: extra(recs.get(units[i]), "pc") for i in expect}
+        got, gone = remove_and_watch(units[target], recs.get(units[target]), {units[i] for i in expect}, how)
+        after = {i: (extra(got[units[i]][0], "pc") if units[i] in got else None) for i in expect}
+        secs = {i: got[units[i]][1] for i in expect if units[i] in got}
+        report(gone and after == expect and all(v <= 0.6 for v in secs.values()),
+               f"pipe end: {label}: the neighbours sent again at once with their new shape",
+               f"removed {gone}, pc before {before}, after {after} (wanted {expect}), seconds after the del {secs}")
+        clear()
+
+    pipe_case("a run of five, its middle mined", [("pipe", dx + 0.5, 0.5, N) for dx in range(-2, 3)], 2, {1: 8, 3: 2})
+    pipe_case("a corner losing its south side", [("pipe", -0.5, 0.5, N), ("pipe", 0.5, 0.5, N), ("pipe", 0.5, 1.5, N)],
+              2, {1: 8})
+    pipe_case("a T losing its branch (the owner's T): a straight",
+              [("pipe", -0.5, 0.5, N), ("pipe", 0.5, 0.5, N), ("pipe", 1.5, 0.5, N), ("pipe", 0.5, 1.5, N)], 3, {1: 10})
+    pipe_case("a cross losing its north arm: a T",
+              [("pipe", -0.5, 1.5, N), ("pipe", 0.5, 1.5, N), ("pipe", 1.5, 1.5, N), ("pipe", 0.5, 2.5, N),
+               ("pipe", 0.5, 0.5, N)], 4, {1: 14, 0: 2, 2: 8})  # (the south arm, two tiles off, keeps its side: not sent)
+    pipe_case("a pipe-to-ground mined beside a pipe",
+              [("pipe", -0.5, 0.5, N), ("pipe", 0.5, 0.5, N), ("pipe-to-ground", 1.5, 0.5, W)], 2, {1: 8})
+    pipe_case("a pipe mined beside a pipe-to-ground",
+              [("pipe-to-ground", -0.5, 0.5, E), ("pipe", 0.5, 0.5, N), ("pipe", 1.5, 0.5, N)], 1, {0: 0, 2: 0})
+    pipe_case("a pump mined under the pipes on its output",
+              [("pipe", 0.5, 0.5, N), ("pipe", 0.5, 1.5, N), ("pump", 0.5, 3.0, N)], 2, {1: 1})
+    pipe_case("a storage tank mined beside the pipes on its connection",
+              [("storage-tank", 1.5, 2.5, N), ("pipe", -0.5, 1.5, N), ("pipe", -1.5, 1.5, N)], 0, {1: 8})
+    pipe_case("a pipe destroyed by damage (die)", [("pipe", dx + 0.5, 0.5, N) for dx in range(-1, 2)], 1, {0: 0, 2: 0},
+              how="die")
+
+    # The switch off: nothing sent for the neighbours (the bug as it was).
+    rcon.run("/f3d-perf mined_neighbours off")
+    units, recs, out = lay([("pipe", dx + 0.5, 0.5, N) for dx in range(-2, 3)])
+    if units:
+        got, gone = remove_and_watch(units[2], recs.get(units[2]), {units[1], units[3]})
+        report(gone and not got, "pipe end: /f3d-perf mined_neighbours off sends nothing for the neighbours, as before",
+               f"removed {gone}, sent {sorted(got)}")
+    else:
+        report(False, "pipe end: the switch's run laid", out)
+    rcon.run("/f3d-perf mined_neighbours default")
+    clear()
+
+    # Belts: a curve straightened when the belt feeding its side goes; a side-loaded belt curving once the belt behind goes.
+    for label, parts, target, watch, want in (
+            ("a belt curve whose feeding belt is mined is sent straight",
+             [("transport-belt", -0.5, 0.5, E), ("transport-belt", 0.5, 0.5, S)], 0, 1, "straight"),
+            ("a side-loaded belt whose belt behind is mined is sent as the curve it becomes",
+             [("transport-belt", dx + 0.5, 0.5, E) for dx in range(-1, 2)] + [("transport-belt", 0.5, -0.5, S)], 0, 1,
+             "curve")):
+        units, recs, out = lay(parts)
+        if units is None:
+            report(False, f"pipe end: {label}: laid", out)
+            clear()
+            continue
+        before = extra(recs.get(units[watch]), "s")
+        got, gone = remove_and_watch(units[target], recs.get(units[target]), {units[watch]})
+        after = extra(got[units[watch]][0], "s") if units[watch] in got else None
+        ok = (before in ("l", "r") and after == "s") if want == "straight" else (before == "s" and after in ("l", "r"))
+        report(gone and ok and got[units[watch]][1] <= 0.6, f"pipe end: {label}",
+               f"removed {gone}, s {before} -> {after}, {got.get(units[watch], (0, None))[1]} s after the del")
+        clear()
+
+    # Walls and heat pipes: the client joins them itself; the bridge sends no shape, and the `del` is what it needs.
+    for name in ("stone-wall", "heat-pipe"):
+        units, recs, out = lay([(name, dx + 0.5, 0.5, N) for dx in range(-1, 2)])
+        if units is None:
+            report(False, f"pipe end: {name}s laid", out)
+            clear()
+            continue
+        extras = [(recs[u][5] if len(recs[u]) > 5 else {}) if u in recs else None for u in units]
+        _, gone = remove_and_watch(units[1], recs.get(units[1]), set())
+        report(gone and None not in extras and all(not ("pc" in e or "wc" in e) for e in extras),
+               f"pipe end: a {name} mined from a row of three: its `del` comes, and the bridge sends no shape for them "
+               "(the client joins them)", f"removed {gone}, extras {extras}")
+        clear()
+
+    # A construction robot deconstructing a pipe (on_robot_mined_entity) still has its neighbours sent.
+    out = mod_lua(f"""local c = storage.f3d.puppet local s = c.surface
+local e = s.create_entity({{ name = 'electric-energy-interface', position = {{ {x} - 6, {y} + 9 }}, force = c.force }})
+e.power_production = 1e9 e.electric_buffer_size = 1e10
+s.create_entity({{ name = 'medium-electric-pole', position = {{ {x} - 4.5, {y} + 9.5 }}, force = c.force }})
+local r = s.create_entity({{ name = 'roboport', position = {{ {x} - 2, {y} + 9 }}, force = c.force }})
+r.get_inventory(defines.inventory.roboport_robot).insert({{ name = 'construction-robot', count = 5 }})
+s.create_entity({{ name = 'storage-chest', position = {{ {x} + 1.5, {y} + 9.5 }}, force = c.force }})
+rcon.print('ok')""".replace("\n", " "))
+    units, recs, _ = lay([("pipe", dx + 0.5, 0.5, N) for dx in range(-1, 2)])
+    if units and out == "ok":
+        c.pump(2.0, every=hello)  # the roboport charges its robots
+        mod_lua(f"local c = storage.f3d.puppet for _, e in pairs(c.surface.find_entities_filtered({{ area = {area}, name = 'pipe' }})) do "
+                f"if e.unit_number == {units[1]} then e.order_deconstruction(c.force) end end rcon.print('ok')")
+        got, gone = remove_and_watch(units[1], recs.get(units[1]), {units[0], units[2]}, how="robot")
+        after = {u: extra(got[u][0], "pc") for u in got}
+        report(gone and after == {units[0]: 0, units[2]: 0},
+               "pipe end: a pipe a construction robot deconstructs: its neighbours sent again as lone pipes",
+               f"removed {gone}, after {after}")
+    else:
+        report(False, "pipe end: a roboport, robots and pipes laid", out)
+    clear()
+    mod_lua(f"storage.f3d.puppet.teleport({{ {home[0]}, {home[1]} }})")
+
+
 def check_map_info(c, hello):
-    """The map and hover information: `hinfo` for a powered beacon with two speed modules
+    """The map and hover information (G12, G20): `hinfo` for a powered beacon with two speed modules
     and the assembler it reaches (LuaEntity.effects, get_module_inventory, get_beacons,
     get_beacon_effect_receivers, the beacon's distribution_effectivity), and `terr` naming its surface."""
     if not clean_spot(c, hello):
@@ -4953,15 +6047,15 @@ rcon.print(asm.unit_number .. " " .. asm.position.x .. " " .. asm.position.y .. 
     hi = {m["q"]: m for m in of_type(msgs, "hinfo")}
     ma, mb = hi.get(11, {}), hi.get(12, {})
     report(ma.get("b") == 1 and ma.get("eff", {}).get("sp", 0) > 0 and ma.get("eff", {}).get("co", 0) > 0,
-           "hinfo: an assembler reached by a beacon: the beacon count and its effects", str(ma))
+           "hinfo: an assembler reached by a beacon: the beacon count and its effects (G12)", str(ma))
     report(mb.get("m") == [["speed-module", 2]] and mb.get("n") == 1 and mb.get("de") == 1500 and mb.get("eff", {}).get("sp", 0) > 0,
-           "hinfo: the beacon's modules, the machines it reaches, its effectivity and what it hands on", str(mb))
+           "hinfo: the beacon's modules, the machines it reaches, its effectivity and what it hands on (G12)", str(mb))
     destroy_units([int(au), int(bu), int(pu)])
     mod_lua('package.loaded["__factorio-3d-bridge__/scripts/planets.lua"].territories_soon()')
     msgs = c.pump(1.5, every=hello)
     terr = of_type(msgs, "terr")
     si = mod_lua("rcon.print(storage.f3d.puppet.surface.index)")
-    report(bool(terr) and str(terr[-1].get("si")) == si, "terr names the surface its territories are on",
+    report(bool(terr) and str(terr[-1].get("si")) == si, "terr names the surface its territories are on (G20)",
            f"{terr[-1:] if terr else 'no terr'} on surface {si}")
 
 
@@ -5027,6 +6121,514 @@ rcon.print(table.concat(made, " ") .. " " .. decals)
     destroy_units(made[:1])
     c.send(hello[1])
     c.pump(0.5, every=hello)
+
+
+ES_LUA = """
+local CN = {} for k, v in pairs(defines.command) do CN[v] = k end
+local DN = {} for k, v in pairs(defines.distraction) do DN[v] = k end
+local c = storage.f3d.puppet local s = c.surface
+local function find(units)
+  local want, out = {}, {}
+  for _, u in pairs(units) do want[u] = true end
+  for _, e in pairs(s.find_entities_filtered({ force = 'enemy', position = c.position, radius = 200 })) do
+    if e.unit_number and want[e.unit_number] then out[#out + 1] = e end
+  end
+  return out
+end
+local function cmd(t)
+  if not t then return 'nil' end
+  local x = CN[t.type] or tostring(t.type)
+  if t.target then x = x .. (t.target == c and '>char' or ('>' .. (t.target.valid and t.target.name or '?'))) end
+  if t.distraction then x = x .. '/' .. (DN[t.distraction] or tostring(t.distraction)) end
+  return x
+end
+local function row(e)
+  local r = { u = e.unit_number, n = e.name, x = math.floor(e.position.x * 10) / 10, y = math.floor(e.position.y * 10) / 10,
+    d = math.floor(math.sqrt((e.position.x - c.position.x) ^ 2 + (e.position.y - c.position.y) ^ 2) * 10) / 10, hp = e.health }
+  if e.commandable then
+    local cm = e.commandable
+    r.cmd = cmd(cm.command) r.dis = cmd(cm.distraction_command)
+    r.grp = cm.parent_group and 1 or 0
+    local ok, sp = pcall(function() return cm.spawner end) r.sp = ok and sp and 1 or 0
+  end
+  local ok, a = pcall(function() return e.active end) if ok then r.act = a end
+  local ok2, f = pcall(function() return e.frozen end) if ok2 then r.frz = f end
+  if e.type == 'turret' then
+    local t = e.shooting_target r.shoot = t and (t == c and 'char' or t.name) or 'nil'
+  end
+  return r
+end
+"""
+
+
+def fix_compare(c, hello, lua, sample, show, rows_of, attacking, nest_units, nx, ny):
+    """The bridge's fix (/f3d-perf enemy_sight, enemy_sight.lua) at a nest the map made, its biters asleep: the character
+    walks up from 90 tiles west with the switch off, then back out and up again with it on. Off, none of the nest's
+    biters may attack it; on, they must once it is within their vision (30), the whole nest together. Then, on, it
+    stands among them for 45 s (the health bonus kept, healed four times a second) and the attackers are counted each
+    second: held and dropping off gradually, as a real player's were; then it walks 150 tiles away and they must still
+    be on it (no leash). Returns the numbers for the summary."""
+    set_sight = lambda on: mod_lua("storage.f3d_perf = storage.f3d_perf or {} storage.f3d_perf.enemy_sight = "
+                                   + ("nil" if on else "false"))
+
+    def biters():
+        return [r for r in rows_of(sample(nest_units)) if "cmd" in r]
+
+    def walk_to(dist):
+        stop = nx - dist
+        if c.me["x"] / 256 < stop:
+            c.pump(10.0, until=lambda m: m.get("t") == "me" and m["x"] / 256 >= stop, every=(0.15, {"t": "walk", "d": 4}))
+        c.send({"t": "walk", "d": -1})
+        c.pump(0.3, every=hello)
+
+    def heal_watch(seconds, tag):
+        """Samples every second, healing the character every quarter second in between (the caller's health bonus
+        left as it is, on for the standing hold): attackers per second, the hp it lost, and whether it died."""
+        counts, lost, died = [], 0.0, False
+        for i in range(int(seconds)):
+            for _ in range(4):
+                c.pump(0.25, every=hello)
+                out = mod_lua("local c = storage.f3d.puppet if not (c and c.valid) then rcon.print('dead') return end "
+                              "local l = c.max_health - c.health c.health = c.max_health rcon.print(l)")
+                if out.strip() == "dead":
+                    died = True
+                else:
+                    try:
+                        lost += float(out)
+                    except ValueError:
+                        pass
+            smp = sample(nest_units)
+            show(f"{tag} +{i + 1}s", smp)
+            counts.append(len(set(attacking(smp, True))))
+        print(f"  {tag}: attackers each second {counts}, hp lost {lost:.0f} (healed), died {died}")
+        return counts, round(lost), died
+
+    def approach(tag):
+        """Walks up in steps; at each, 5 s of samples. Returns (distance, nearest biter, attackers) at the first stop
+        any biter attacked, or None."""
+        for dist in (50, 40, 32, 26, 20, 14):
+            walk_to(dist)
+            for i in range(5):
+                c.pump(1.0, every=hello)
+                mod_lua("local c = storage.f3d.puppet if c and c.valid then c.health = c.max_health end")
+                smp = sample(nest_units)
+                show(f"{tag} at {dist} +{i + 1}s", smp)
+                att = set(attacking(smp, True))
+                if att:
+                    units = [r for r in rows_of(smp) if "cmd" in r]
+                    near = min((r["d"] for r in units), default=None)
+                    return dist, near, len(att), len(units), i + 1
+        return None
+
+    # The nest's worms shoot the character (they need no fix) and would kill it between the samples: gone. During the
+    # approaches a health bonus keeps it alive (it changes no targeting, the diagnostic found); none for the fades.
+    mod_lua(f"for _, e in pairs(storage.f3d.puppet.surface.find_entities_filtered({{ type = 'turret', force = 'enemy', "
+            f"position = {{ {nx}, {ny} }}, radius = 40 }})) do e.destroy() end")
+    bonus = lambda n: mod_lua(f"storage.f3d.puppet.character_health_bonus = {n} local c = storage.f3d.puppet c.health = c.max_health")
+    alive = lambda: mod_lua("local c = storage.f3d.puppet rcon.print(tostring(c and c.valid and c.health > 0) .. ' ' .. "
+                            "(c and c.valid and math.floor(c.position.x) or 0))")
+    groups = biters()
+    print(f"INFO enemysight fix: {len(groups)} nest biters, in a unit group (parent_group) {sum(r.get('grp', 0) for r in groups)}, "
+          f"spawner set {sum(r.get('sp', 0) for r in groups)}")
+    set_sight(False)
+    mod_lua(f"storage.f3d.puppet.teleport({{ {nx - 90}, {ny} }})")
+    bonus(100000)
+    c.pump(1.0, every=hello)
+    off = approach("fix off")
+    print(f"  after the approach, alive and x: {alive()}")
+    print(f"INFO enemysight fix off: first attack (distance, nearest biter, attackers, biters, s) {off}")
+    report(off is None and alive().startswith("true"), "enemysight: with /f3d-perf enemy_sight off the nest's biters don't attack the character "
+           "walking up to 14 tiles (as before the fix)", str(off))
+    # Out again, and a while for anything stirred up to settle.
+    mod_lua(f"storage.f3d.puppet.teleport({{ {nx - 90}, {ny} }}) local c = storage.f3d.puppet c.health = c.max_health")
+    c.pump(20.0, every=hello)
+    set_sight(True)
+    on = approach("fix on")
+    print(f"  after the approach, alive and x: {alive()}")
+    print(f"INFO enemysight fix on: first attack (distance, nearest biter, attackers, biters, s) {on}")
+    report(on is not None and on[1] is not None and on[1] <= 31,
+           "enemysight: with the fix on the nest's biters attack the approaching character once within their vision (30)",
+           str(on))
+    # The whole nest wakes together (a real player's: 14 of 14 within 0.6 s), not only those in vision.
+    woke = None
+    if on:
+        c.pump(0.6, every=hello)
+        smp = sample(nest_units)
+        units = [r for r in rows_of(smp) if "cmd" in r]
+        woke = (len(set(attacking(smp, True))), len(units))
+        print(f"INFO enemysight fix on: attacking 0.6 s after the first attack {woke[0]} of {woke[1]} nest biters")
+        report(woke[1] > 0 and woke[0] >= 0.8 * woke[1],
+               "enemysight: the whole nest wakes together, as for a real player (at least 80% of its biters)", str(woke))
+    # Standing still 45 s (the health bonus kept, as in the real player's measurement): held and dropping off
+    # gradually, about half by 8-10 s, a few left at 40 s; not the 3-6 s fade without the fix.
+    hold = heal_watch(45, "fix on, standing") if on else None
+    if hold:
+        n = hold[0]
+        print(f"INFO enemysight fix on, standing: attackers at 2, 5, 10, 20, 30, 40 s: {[n[i - 1] for i in (2, 5, 10, 20, 30, 40)]} "
+              "(real player: 14, 11-13, 6-7, 4-5, 3-4, 1-2)")
+        report(n[1] >= 1 and n[9] < n[1] and n[19] >= 1 and n[44] <= n[9],
+               "enemysight: standing, the attack is held and drops off gradually (on at 20 s, fewer at 10 s than at 2 s)", str(n))
+    # Walking away west 150 tiles in one-tile steps (as the measurement moved both characters): no leash, the
+    # attackers keep chasing while they keep up.
+    chase = []
+    if on:
+        start = float(alive().split()[1])
+        for i in range(150):
+            mod_lua("local c = storage.f3d.puppet if c and c.valid then c.teleport({ c.position.x - 1, c.position.y }) "
+                    "c.health = c.max_health end")
+            c.pump(0.13, every=hello)
+            if i % 10 == 9:
+                smp = sample(nest_units)
+                chase.append((round(nx - (start - i - 1)), len(set(attacking(smp, True)))))
+        print(f"INFO enemysight fix on, walking away: (tiles from the nest, attackers) {chase} (real player: 8-13 to 400 tiles)")
+        report(bool(chase) and chase[-1][1] >= 1,
+               f"enemysight: chasing with no leash, still attacked {chase[-1][0] if chase else '?'} tiles from the nest", str(chase))
+    bonus(0)
+    mod_lua(f"storage.f3d.puppet.teleport({{ {nx - 90}, {ny} }}) local c = storage.f3d.puppet c.health = c.max_health")
+    c.pump(1.0, every=hello)
+    return {"off": off, "on": on, "woke": woke, "hold": hold, "chase": chase,
+            "grouped": sum(r.get("grp", 0) for r in groups), "biters": len(groups)}
+
+
+def check_enemy_sight(c, hello, nest_only=False, old_nest=False):
+    """A diagnostic, not a pass/fail check (stability, `alerts` group, step 0 of the R&D's Question 3): do idle
+    biters notice the bridge's player-less character walking up to them, as they would a real player? Prints raw
+    numbers per step: the character's flags; three small biters made 60 tiles off and left to go idle; the character
+    walking (the client's `walk`) to 20 tiles of them and then 8; one pistol shot at one of them; a small worm
+    approached to inside its range; and by hand the two candidate fixes, B (an idle biter's command re-issued as a
+    wander with distraction by_enemy) and A (set_distraction_command attack on the character for each biter within
+    vision); last, the nearest nest the map made itself, walked up to from 90 tiles in steps. The character is healed
+    after every sample, so an attack can't kill it. Use a fresh map: enemies within 200 tiles of the spot are destroyed,
+    and step 6 runs the game fast (speed 10) for up to 5 minutes.
+    Steps 1-5 run with /f3d-perf enemy_sight off (the bridge's fix, enemy_sight.lua), as the diagnostic first ran them. At
+    the nest, the fix is compared off and on (fix_compare): its biters must not attack the approaching character with
+    it off and must with it on; then how long their attack lasts, without the health bonus (the character healed four
+    times a second instead). old_nest: the diagnostic's own nest step (options A and B by hand, a shot) after it.
+    nest_only (`--only enemysightfix`): steps 1 and 6 alone."""
+    if not clean_spot(c, hello):
+        report(False, "enemysight: a clean spot", SPOT_WHY)
+        return
+    clear_enemies(radius=200)
+    # The approach runs 60 tiles east: trees, rocks, cliffs and water there would stop the walk.
+    spot = mod_lua("local c = storage.f3d.puppet local s = c.surface local p = c.position "
+                   "local area = { { p.x - 20, p.y - 24 }, { p.x + 100, p.y + 24 } } "
+                   "for _, e in pairs(s.find_entities_filtered({ area = area, type = { 'tree', 'simple-entity', 'cliff', 'fish' } })) do e.destroy() end "
+                   "local tiles = {} for _, t in pairs(s.find_tiles_filtered({ area = area, collision_mask = 'water_tile' })) do "
+                   "tiles[#tiles + 1] = { name = 'landfill', position = t.position } end "
+                   "if #tiles > 0 then s.set_tiles(tiles) end rcon.print(p.x .. ' ' .. p.y)")
+    sx, sy = (float(v) for v in spot.split())
+    c.pump(0.5, every=hello)
+    set_sight = lambda on: mod_lua("storage.f3d_perf = storage.f3d_perf or {} storage.f3d_perf.enemy_sight = "
+                                   + ("nil" if on else "false"))
+    set_sight(False)
+
+    def lua(code):
+        return mod_lua((ES_LUA + code).replace("\n", " "))
+
+    print("INFO enemysight step 1: " + lua(
+        "local ok, mil = pcall(function() return c.is_military_target end) "
+        "local ok2, act = pcall(function() return c.active end) "
+        "local ok3, dis = pcall(function() return c.disabled_by_script end) "
+        "local ok4, pmil = pcall(function() return c.prototype.is_military_target end) "
+        "rcon.print('force ' .. c.force.name .. ', is_military_target ' .. tostring(mil) .. ', destructible ' .. tostring(c.destructible) "
+        ".. ', active ' .. tostring(act) .. ', disabled_by_script ' .. tostring(dis) .. ', c.player ' .. tostring(c.player and c.player.name) "
+        ".. ', #game.players ' .. #game.players .. ', #game.connected_players ' .. #game.connected_players "
+        ".. ', peaceful_mode ' .. tostring(s.peaceful_mode) .. ', no_enemies_mode ' .. tostring(s.no_enemies_mode) "
+        ".. ', enemy at war with it ' .. tostring(game.forces.enemy.is_enemy(c.force)) .. ', cease_fire ' .. tostring(game.forces.enemy.get_cease_fire(c.force)) "
+        ".. ', prototype is_military_target ' .. tostring(pmil) .. ', tick ' .. game.tick)"))
+
+    def sample(units):
+        """The units' rows, the character's damage since the last sample (then it is healed)."""
+        out = lua(f"local rows = {{}} for _, e in pairs(find({{ {', '.join(str(u) for u in units)} }})) do rows[#rows + 1] = row(e) end "
+                  "local lost = c.max_health - c.health c.health = c.max_health "
+                  "rcon.print(helpers.table_to_json({ tick = game.tick, cx = math.floor(c.position.x * 10) / 10, lost = lost, rows = rows }))")
+        try:
+            return json.loads(out)
+        except ValueError:
+            return {"error": out}
+
+    seen = {}
+
+    def rows_of(smp):
+        return smp["rows"] if isinstance(smp.get("rows"), list) else []
+
+    def show(tag, smp):
+        if "error" in smp:
+            print(f"  {tag}: error {smp['error'][:300]}")
+            return
+        rows = rows_of(smp)
+        units = [r for r in rows if "cmd" in r]
+        crowd = len(units) > 6
+        line = lambda r: (f"{r['u']} {r['n']} d {r['d']} ({r['x']},{r['y']}) hp {r['hp']:.0f}"
+                          + (f" cmd {r.get('cmd')} dis {r.get('dis')} spawner {r.get('sp')}" if "cmd" in r else "")
+                          + (f" active {r['act']}" if "act" in r else "") + (f" frozen {r['frz']}" if "frz" in r else "")
+                          + (f" shoot {r['shoot']}" if "shoot" in r else ""))
+        text = " | ".join(line(r) for r in rows if not crowd or "cmd" not in r)
+        if crowd:
+            ds = sorted(r["d"] for r in units)
+            moved = sum(1 for r in units if seen.get(r["u"]) not in (None, (r["x"], r["y"])))
+            for r in units:
+                seen[r["u"]] = (r["x"], r["y"])
+            text += (f" | {len(units)} biters: d {ds[0]}-{ds[-1]}, moved since the last sample {moved}, "
+                     f"cmd {sorted({str(r.get('cmd')) for r in units})}, dis {sorted({str(r.get('dis')) for r in units})} "
+                     f"({sum(1 for r in units if r.get('dis') != 'nil')} with one), spawner set {sum(r.get('sp', 0) for r in units)}, "
+                     f"in a unit group {sum(r.get('grp', 0) for r in units)}, "
+                     f"active {sorted({str(r.get('act')) for r in units})}, nearest: {line(min(units, key=lambda r: r['d']))}")
+        print(f"  {tag}: tick {smp['tick']} char x {smp['cx']} lost {smp['lost']:.0f} hp | " + text)
+
+    def attacking(smp, biters_only=False):
+        return [r["u"] for r in rows_of(smp) if ">char" in str(r.get("cmd")) or ">char" in str(r.get("dis"))
+                or (r.get("shoot") == "char" and not biters_only)]
+
+    def setup(name="small-biter", n=3, idle=20):
+        """Back to the spot, the enemies cleared, `n` of `name` made 60 tiles east, then waited on until idle."""
+        clear_enemies(radius=200)
+        mod_lua(f"storage.f3d.puppet.teleport({{ {sx}, {sy} }})")
+        c.pump(0.5, every=hello)
+        out = lua(f"local u = {{}} for i = 1, {n} do local p = s.find_non_colliding_position('{name}', {{ c.position.x + 60, c.position.y + (i - ({n} + 1) / 2) * 3 }}, 4, 0.5) "
+                  f"local e = p and s.create_entity({{ name = '{name}', position = p, force = 'enemy' }}) u[#u + 1] = e and e.unit_number or 0 end "
+                  "rcon.print(table.concat(u, ' '))")
+        units = [int(v) for v in out.split()]
+        smp = sample(units)
+        show("made", smp)
+        if name != "small-biter":
+            return units
+        end, last, start = time.time() + idle + 15, None, time.time()
+        while time.time() < end:
+            c.pump(2.0, every=hello)
+            smp = sample(units)
+            pos = [(r["x"], r["y"], r.get("dis")) for r in rows_of(smp)]
+            if time.time() - start >= idle and pos == last and all(p[2] == "nil" for p in pos):
+                show(f"idle after {time.time() - start:.0f} s", smp)
+                return units
+            last = pos
+        show("not idle in time", smp)
+        return units
+
+    def approach(units, dist):
+        """Walks east (the client's walk) until the character is `dist` tiles west of the units' middle x."""
+        rows = rows_of(sample(units))
+        if not rows:
+            return None
+        stop = sum(r["x"] for r in rows) / len(rows) - dist
+        t0 = time.time()
+        if c.me["x"] / 256 < stop:
+            c.pump(10.0, until=lambda m: m.get("t") == "me" and m["x"] / 256 >= stop, every=(0.15, {"t": "walk", "d": 4}))
+        c.send({"t": "walk", "d": -1})
+        c.pump(0.3, every=hello)
+        smp = sample(units)
+        show(f"walked to {dist} ({time.time() - t0:.1f} s)", smp)
+        return smp
+
+    def watch(units, seconds, tag, biters_only=False):
+        first, t0 = None, time.time()
+        for i in range(int(seconds)):
+            c.pump(1.0, every=hello)
+            smp = sample(units)
+            show(f"{tag} +{i + 1}s", smp)
+            if first is None and (attacking(smp, biters_only) or (smp.get("lost", 0) > 0 and not biters_only)):
+                first = (round(time.time() - t0, 1), smp.get("tick"), attacking(smp, biters_only), smp.get("lost"))
+        print(f"  {tag}: first attack (s, tick, attackers, hp lost) {first}")
+        return first
+
+    near20 = near8 = shot = opt_b = opt_a = worm_hit = None
+    if not nest_only:
+        print("INFO enemysight step 2-3: three idle small biters, the character walks up to 20 tiles, then 8")
+        units = setup()
+        approach(units, 20)
+        near20 = watch(units, 10, "at 20")
+        approach(units, 8)
+        near8 = watch(units, 5, "at 8")
+
+        print("INFO enemysight step 4: one pistol shot at one idle biter at 20 tiles")
+        units = setup()
+        approach(units, 20)
+        watch(units, 3, "before shot")
+        mod_lua('local c = storage.f3d.puppet '
+                'c.get_inventory(defines.inventory.character_guns).clear() c.get_inventory(defines.inventory.character_ammo).clear() '
+                'c.get_inventory(defines.inventory.character_guns).insert({name = "pistol"}) '
+                'c.get_inventory(defines.inventory.character_ammo).insert({name = "firearm-magazine", count = 10}) '
+                'c.selected_gun_index = 1 storage.f3d.guns_sig = nil')
+        rows = rows_of(sample(units))
+        shot = None
+        if rows:
+            target = rows[0]
+            ammo = ("local i = storage.f3d.puppet.get_inventory(defines.inventory.character_ammo) "
+                    "rcon.print(i.get_item_count('firearm-magazine') .. ' mags, ' .. (i[1].valid_for_read and i[1].ammo or 0) .. ' rounds in the first')")
+            before = mod_lua(ammo)
+            c.send({"t": "shoot", "m": 1, "x": int(target["x"] * 256), "y": int(target["y"] * 256)})
+            c.pump(0.1)
+            c.send({"t": "shoot", "m": -1})
+            c.pump(0.5, every=hello)
+            print(f"  shot at {target['u']}: {before} -> {mod_lua(ammo)}")
+            shot = watch(units, 10, "after shot")
+
+        print("INFO enemysight option B by hand: each idle biter's command re-issued as wander, distraction by_enemy, then the walk")
+        units = setup()
+        print("  set_command: " + lua(f"local r = {{}} for _, e in pairs(find({{ {', '.join(map(str, units))} }})) do "
+                                     "local ok, err = pcall(function() e.commandable.set_command({ type = defines.command.wander, distraction = defines.distraction.by_enemy, radius = 3 }) end) "
+                                     "r[#r + 1] = tostring(ok) .. (ok and '' or (' ' .. tostring(err))) end rcon.print(table.concat(r, ', '))"))
+        c.pump(2.0, every=hello)
+        show("after set_command", sample(units))
+        approach(units, 20)
+        opt_b = watch(units, 10, "B at 20")
+
+        print("INFO enemysight option A by hand: set_distraction_command attack on the character for each biter within 30 tiles")
+        units = setup()
+        approach(units, 20)
+        watch(units, 2, "A before")
+        print("  set_distraction_command: " + lua(
+            f"local r = {{ 'tick ' .. game.tick }} for _, e in pairs(find({{ {', '.join(map(str, units))} }})) do "
+            "local d = math.sqrt((e.position.x - c.position.x) ^ 2 + (e.position.y - c.position.y) ^ 2) "
+            "if d <= 30 then local ok, err = pcall(function() e.commandable.set_distraction_command({ type = defines.command.attack, target = c, distraction = defines.distraction.by_enemy }) end) "
+            "r[#r + 1] = e.unit_number .. ' ' .. tostring(ok) .. (ok and '' or (' ' .. tostring(err))) end end rcon.print(table.concat(r, ', '))"))
+        opt_a = watch(units, 10, "A after")
+
+        print("INFO enemysight step 5: a small worm, approached to 3 tiles inside its range")
+        worm_range = float(mod_lua("rcon.print(prototypes.entity['small-worm-turret'].attack_parameters.range)"))
+        print(f"  small-worm-turret attack range {worm_range}")
+        worm = setup("small-worm-turret", n=1)
+        c.pump(5.0, every=hello)
+        show("worm after 5 s", sample(worm))
+        approach(worm, worm_range + 8)
+        watch(worm, 3, "worm outside range")
+        approach(worm, worm_range - 3)
+        worm_hit = watch(worm, 8, "worm in range")
+
+        clear_enemies(radius=200)
+        mod_lua(f"storage.f3d.puppet.teleport({{ {sx}, {sy} }}) local c = storage.f3d.puppet "
+                "c.get_inventory(defines.inventory.character_guns).clear() c.get_inventory(defines.inventory.character_ammo).clear() storage.f3d.guns_sig = nil")
+
+    # Script-made biters keep the wander command create_entity gives them and never settle, so they may not be
+    # what the owner meets: the map's own nests' biters, left alone since the map was made, are.
+    print("INFO enemysight step 6: the nearest nest the map made, approached from 90 tiles west in steps")
+    nest = lua("local n = s.find_entities_filtered({ type = 'unit-spawner', force = 'enemy', position = c.position, radius = 900 }) "
+               "if #n == 0 then s.request_to_generate_chunks(c.position, 20) s.force_generate_chunk_requests() "
+               "n = s.find_entities_filtered({ type = 'unit-spawner', force = 'enemy', position = c.position, radius = 900 }) end "
+               "local best = s.get_closest(c.position, n) if not best then rcon.print('none') return end "
+               "local p = best.position local u = {} "
+               "for _, e in pairs(s.find_entities_filtered({ force = 'enemy', type = { 'unit', 'turret', 'unit-spawner' }, position = p, radius = 32 })) do "
+               "u[#u + 1] = e.unit_number end "
+               "local area = { { p.x - 100, p.y - 6 }, { p.x - 8, p.y + 6 } } "
+               "for _, e in pairs(s.find_entities_filtered({ area = area, type = { 'tree', 'simple-entity', 'cliff', 'fish' } })) do e.destroy() end "
+               "local tiles = {} for _, t in pairs(s.find_tiles_filtered({ area = area, collision_mask = 'water_tile' })) do "
+               "tiles[#tiles + 1] = { name = 'landfill', position = t.position } end if #tiles > 0 then s.set_tiles(tiles) end "
+               "c.teleport({ p.x - 90, p.y }) "
+               "rcon.print(p.x .. ' ' .. p.y .. ' ' .. table.concat(u, ' '))")
+    nest_first = None
+    if nest == "none" or not nest:
+        print("  no nest within 900 tiles")
+    else:
+        nx, ny, *nest_units = nest.split()
+        nx, ny, nest_units = float(nx), float(ny), [int(u) for u in nest_units]
+        print(f"  nest at ({nx}, {ny}), {len(nest_units)} enemies within 32 tiles of it; the character at {nx - 90}")
+        watch_around(c, hello, nx - 90, ny)
+        # A fresh map's nests own one biter each and spawn more on their own over the first minutes (seen live: about
+        # 7 a spawner after 10 game minutes). Pollution would spawn them faster but sends them off as an attack group
+        # (parent_group set, spawner lost), which enemy_sight leaves to the engine on purpose: not the sleeping nest a
+        # player walks up to. So the game runs fast until the nest owns enough idle biters of its own, no pollution.
+        own = f"{{ {nx}, {ny} }}"
+        t0 = time.time()
+        count = ("local sp = {} for _, e in pairs(s.find_entities_filtered({ type = 'unit-spawner', force = 'enemy', position = " + own
+                 + ", radius = 20 })) do sp[e.unit_number] = true end local u = {} for _, e in pairs(s.find_entities_filtered({ force = 'enemy', "
+                 "type = 'unit', position = " + own + ", radius = 32 })) do local cm = e.commandable local k = cm and cm.spawner "
+                 "if k and k.valid and sp[k.unit_number] and not cm.parent_group then u[#u + 1] = e.unit_number end end "
+                 "rcon.print(table.concat(u, ' '))")
+        got = lua(count).split()
+        if len(got) < 8:
+            # Speed 1 again on any way out (an RCON or socket error, Ctrl+C), or the map runs ten times fast after.
+            try:
+                lua("game.speed = 10")
+                while time.time() - t0 < 300:
+                    c.pump(5.0, every=hello)
+                    got = lua(count).split()
+                    if len(got) >= 8:
+                        break
+            finally:
+                try:
+                    lua("game.speed = 1")
+                except Exception as e:  # (a dead link mustn't hide the first error)
+                    print(f"WARN enemysight step 6: game.speed not set back to 1 ({e}); set it by hand")
+            c.pump(10.0, every=hello)  # settled at normal speed
+            got = lua(count).split()
+        nest_units += [int(u) for u in got if int(u) not in nest_units]
+        print(f"  {len(got)} idle biters of the nest's own (spawner set, no group) after {time.time() - t0:.0f} s (game speed 10 meanwhile)")
+        show("nest, the character 90 tiles off", sample(nest_units))
+        c.pump(20.0, every=hello)
+        show("nest, 20 s later", sample(nest_units))
+        fix = fix_compare(c, hello, lua, sample, show, rows_of, attacking, nest_units, nx, ny)
+        nest_first = ("fix", fix)
+        if old_nest:
+            # The diagnostic's own approach (the switch off), from 90 tiles again.
+            set_sight(False)
+            mod_lua(f"storage.f3d.puppet.teleport({{ {nx - 90}, {ny} }})")
+            c.pump(20.0, every=hello)
+            # 26 biters on the character: a big health bonus keeps it alive between the heals (it changes no targeting).
+            mod_lua("storage.f3d.puppet.character_health_bonus = 100000")
+            for dist in (50, 40, 32, 26, 20, 14, 8):
+                stop = nx - dist
+                t0 = time.time()
+                if c.me["x"] / 256 < stop:
+                    c.pump(10.0, until=lambda m: m.get("t") == "me" and m["x"] / 256 >= stop, every=(0.15, {"t": "walk", "d": 4}))
+                c.send({"t": "walk", "d": -1})
+                c.pump(0.3, every=hello)
+                show(f"walked to {dist} of the nest ({time.time() - t0:.1f} s)", sample(nest_units))
+                first = watch(nest_units, 5, f"nest at {dist}", biters_only=True)
+                if first:
+                    nest_first = (dist,) + first
+                    break
+            if not nest_first:
+                # Still asleep at 8 tiles: option B on half of the nest's biters, option A on the other half, at once.
+                biters = sorted(r["u"] for r in rows_of(sample(nest_units)) if "cmd" in r)
+                half_b, half_a = biters[0::2], biters[1::2]
+                print("  option B (wander, by_enemy) on " + str(half_b) + ": " + lua(
+                    f"local r = {{}} for _, e in pairs(find({{ {', '.join(map(str, half_b))} }})) do "
+                    "r[#r + 1] = tostring(pcall(function() e.commandable.set_command({ type = defines.command.wander, distraction = defines.distraction.by_enemy, radius = 3 }) end)) end "
+                    "rcon.print(table.concat(r, ' '))"))
+                print("  option A (distraction attack on the character, within 30) on " + str(half_a) + ": " + lua(
+                    f"local r = {{}} for _, e in pairs(find({{ {', '.join(map(str, half_a))} }})) do "
+                    "local d = math.sqrt((e.position.x - c.position.x) ^ 2 + (e.position.y - c.position.y) ^ 2) "
+                    "if d <= 30 then r[#r + 1] = tostring(pcall(function() e.commandable.set_distraction_command({ type = defines.command.attack, target = c, distraction = defines.distraction.by_enemy }) end)) end end "
+                    "rcon.print(table.concat(r, ' '))"))
+                for i in range(6):
+                    c.pump(1.0, every=hello)
+                    smp = sample(nest_units)
+                    show(f"nest after options +{i + 1}s", smp)
+                    att = set(attacking(smp, True))
+                    print(f"    attacking: of B's {len(half_b)} {len(att & set(half_b))}, of A's {len(half_a)} {len(att & set(half_a))}")
+                nest_first = ("options", sorted(att & set(half_b)), sorted(att & set(half_a)))
+                # The owner's "until you shoot": one pistol round at one of B's biters, still asleep.
+                asleep = [r for r in rows_of(sample(half_b)) if r.get("dis") == "nil"]
+                if asleep:
+                    t = min(asleep, key=lambda r: r["d"])
+                    mod_lua('local c = storage.f3d.puppet '
+                            'c.get_inventory(defines.inventory.character_guns).clear() c.get_inventory(defines.inventory.character_ammo).clear() '
+                            'c.get_inventory(defines.inventory.character_guns).insert({name = "pistol"}) '
+                            'c.get_inventory(defines.inventory.character_ammo).insert({name = "firearm-magazine", count = 2}) '
+                            'c.selected_gun_index = 1 storage.f3d.guns_sig = nil')
+                    c.send({"t": "shoot", "m": 1, "x": int(t["x"] * 256), "y": int(t["y"] * 256)})
+                    c.pump(0.1)
+                    c.send({"t": "shoot", "m": -1})
+                    print(f"  one shot at sleeping {t['u']} (d {t['d']}); B's {len(asleep)} still asleep before it")
+                    woke = []
+                    for i in range(5):
+                        c.pump(1.0, every=hello)
+                        smp = sample(half_b)
+                        show(f"nest after the shot +{i + 1}s", smp)
+                        woke = [r["u"] for r in rows_of(smp) if r.get("dis") != "nil"]
+                        print(f"    of B's {len(half_b)}: {len(woke)} with a distraction, "
+                              f"{len(set(attacking(smp, True)))} attacking the character, {t['u']} hp {next((r['hp'] for r in rows_of(smp) if r['u'] == t['u']), 'dead')}")
+                    nest_first += (("shot", t["u"], len(woke)),)
+                    mod_lua("local c = storage.f3d.puppet c.get_inventory(defines.inventory.character_guns).clear() "
+                            "c.get_inventory(defines.inventory.character_ammo).clear() storage.f3d.guns_sig = nil")
+            mod_lua("storage.f3d.puppet.character_health_bonus = 0")
+            mod_lua(f"storage.f3d.puppet.teleport({{ {sx}, {sy} }}) local c = storage.f3d.puppet c.health = c.max_health")
+        c.pump(1.0, every=hello)
+    print(f"INFO enemysight summary (first attack: seconds into the watch, tick, attackers, hp lost): walk to 20 -> {near20}; "
+          f"walk to 8 -> {near8}; one shot -> {shot}; option B -> {opt_b}; option A -> {opt_a}; worm in range -> {worm_hit}; "
+          f"the map's nest (distance, ...) -> {nest_first}")
+    set_sight(True)
+    report(True, "enemysight: the diagnostic ran (its numbers are in the INFO lines)")
 
 
 def lua_command(text):
@@ -5235,6 +6837,378 @@ rcon.print(tostring(ok) .. ' ' .. tostring(done) .. ' ' .. t.name .. ' ' .. tost
     report(left.keys() == before.keys(), "barrier: the check's failures are forgotten, the rest kept", str(list(left))[:200])
 
 
+PIPE_STEPS = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+GODOT = None  # --godot
+
+
+def client_pipelines(records, eprops, types):
+    """N9: client/scripts/player/pipeline_marks.gd's rule in Python, on the bridge's own records: a pipe joins across its
+    `pc` sides (a pipe whose `pc` has the side back, a pipe to ground facing it, a tank whose connection leads onto it);
+    a pipe to ground also its open side and its underground partner (the first piece of its kind along its back within
+    `under` tiles facing either way, a partner when it faces back); a tank its `eprops` fluid boxes. Anything else ends a
+    pipeline. Returns {unit: pipeline number}."""
+    by_unit = {r[0]: r for r in records if r[0]}
+    pipes, tanks = {}, {}
+    for r in by_unit.values():
+        t = types.get(r[1], "")
+        tx, ty = math.floor(r[2] / 256), math.floor(r[3] / 256)
+        if t in ("pipe", "infinity-pipe", "pipe-to-ground"):
+            pipes[(tx, ty)] = r
+        elif t == "storage-tank":
+            cx, cy = r[2] / 256, r[3] / 256
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    tanks[(math.floor(cx + dx), math.floor(cy + dy))] = r
+
+    def extra(r):
+        return r[5] if len(r) > 5 and isinstance(r[5], dict) else {}
+
+    def turn(v, d):
+        # 16-way direction d clockwise, as CursorOverlay.turn (quarter turns only here)
+        x, y = v
+        for _ in range((d // 4) % 4):
+            x, y = -y, x
+        return x, y
+
+    def ports(t):
+        x = ((eprops.get(t[1]) or [None] * 4)[3:] or [{}])[0] or {}
+        out = []
+        for c in x.get("fb") or x.get("fj") or []:
+            ox, oy = turn((c[0], c[1]), t[4])
+            wx, wy = turn(PIPE_STEPS[(c[2] // 4) % 4], t[4])
+            own = (math.floor(t[2] / 256 + ox), math.floor(t[3] / 256 + oy))
+            out.append((own, (own[0] + wx, own[1] + wy)))
+        return out
+
+    def at(tile):
+        return pipes.get(tile) or tanks.get(tile)
+
+    def side(r, tile, i, out):
+        nx, ny = tile[0] + PIPE_STEPS[i][0], tile[1] + PIPE_STEPS[i][1]
+        back = (i + 2) % 4
+        o = at((nx, ny))
+        if o is None:
+            return
+        t = types.get(o[1], "")
+        if t in ("pipe", "infinity-pipe") and int(extra(o).get("pc", 0)) & (1 << back):
+            out.append(o)
+        elif t == "pipe-to-ground" and o[4] == back * 4:
+            out.append(o)
+        elif t == "storage-tank" and any(port[1] == tile for port in ports(o)):
+            out.append(o)
+
+    def partner(r):
+        reach = int((eprops.get(r[1]) or [10])[0] or 10)
+        tx, ty = math.floor(r[2] / 256), math.floor(r[3] / 256)
+        sx, sy = PIPE_STEPS[(r[4] // 4) % 4]
+        back = (r[4] + 8) % 16
+        for k in range(1, reach + 1):
+            o = pipes.get((tx - sx * k, ty - sy * k))
+            if o is not None and o[1] == r[1] and o[4] in (r[4], back):
+                return o if o[4] == back else None
+        return None
+
+    def neighbours(r):
+        t = types.get(r[1], "")
+        tile = (math.floor(r[2] / 256), math.floor(r[3] / 256))
+        out = []
+        if t in ("pipe", "infinity-pipe"):
+            for i in range(4):
+                if int(extra(r).get("pc", 0)) & (1 << i):
+                    side(r, tile, i, out)
+        elif t == "pipe-to-ground":
+            opened = (r[4] // 4) % 4
+            if "pc" not in extra(r) or int(extra(r)["pc"]) & (1 << opened):
+                side(r, tile, opened, out)
+            o = partner(r)
+            if o is not None:
+                out.append(o)
+        elif t == "storage-tank":
+            for own, nxt in ports(r):
+                o = at(nxt)
+                if o is None or o is r:
+                    continue
+                ot = types.get(o[1], "")
+                step = (nxt[0] - own[0], nxt[1] - own[1])
+                back = PIPE_STEPS.index((-step[0], -step[1]))
+                if ot in ("pipe", "infinity-pipe") and int(extra(o).get("pc", 0)) & (1 << back):
+                    out.append(o)
+                elif ot == "pipe-to-ground" and o[4] == back * 4:
+                    out.append(o)
+                elif ot == "storage-tank" and any(b == (nxt, own) for b in ports(o)):
+                    out.append(o)
+        return out
+
+    group, n = {}, 0
+    for u, r in by_unit.items():
+        if u in group or types.get(r[1], "") not in ("pipe", "infinity-pipe", "pipe-to-ground", "storage-tank"):
+            continue
+        n += 1
+        todo = [r]
+        group[u] = n
+        while todo:
+            for o in neighbours(todo.pop()):
+                if o[0] not in group:
+                    group[o[0]] = n
+                    todo.append(o)
+    return group
+
+
+def client_own_pipelines(records, c):
+    """N9: client/tests/pipeline_predict.tscn (the client's pipeline_marks.gd, headless, muted) on these records:
+    {unit: pipeline number}, or None without Godot."""
+    import shutil
+    import subprocess
+    import tempfile
+    godot = GODOT or os.environ.get("GODOT") or shutil.which("godot") or shutil.which("godot4")
+    if not godot:
+        return None
+    client = pathlib.Path(__file__).resolve().parent.parent / "client"
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = pathlib.Path(tmp) / "in.json", pathlib.Path(tmp) / "out.json"
+        eprops = [[k] + list(v) for k, v in (c.eprops or {}).items()]
+        src.write_text(json.dumps({"protos": list(c.proto_recs.values()), "eprops": eprops, "records": records}), encoding="utf-8")
+        subprocess.run([godot, "--headless", "--audio-driver", "Dummy", "--path", str(client),
+                        "--log-file", str(pathlib.Path(tmp) / "godot.log"), "res://tests/pipeline_predict.tscn",
+                        "--", f"--in={src}", f"--out={dst}"], capture_output=True, timeout=300)
+        if not dst.exists():
+            return {}
+        return {int(u): n for u, n in json.loads(dst.read_text(encoding="utf-8"))["groups"].items()}
+
+
+def check_pipe_vis(c, hello):
+    """N9: the client's pipeline visualization (pipeline_marks.gd) finds a fluid pipeline from the bridge's records alone.
+    A lab layout (pipes, an underground pair, a storage tank, a pump, a boiler with pipes at both its water connections,
+    and a pipe beside the line, which the game joins to it: pipes connect on every side) is built, its chunks' records
+    read, and the client's rule is compared with the game's own LuaFluidBox.get_fluid_segment_id for every pipe, pipe to
+    ground and tank: the rule in Python (client_pipelines), and the client's own pipeline_marks.gd run on the same
+    records (tests/pipeline_predict.tscn, when Godot is found: --godot, $GODOT or godot on PATH). A pipe without a
+    segment id (nil, or an error reading it) fails. Printed: whether the boiler's pass-through joins its two pipes into
+    one segment (the client stops at machines)."""
+    clear_enemies()
+    if not clean_spot(c, hello):
+        report(False, "pipevis: an empty spot", SPOT_WHY)
+        return
+    x, y = math.floor(c.me["x"] / 256), math.floor(c.me["y"] / 256)
+    # Row y+2: pipes x..x+2, a pipe to ground (open west) x+3, its partner (open east) x+8, a pipe x+9, a storage tank
+    # x+10..x+12 by y+2..y+4 (its west connection at x+10, y+2), a pump x+13..x+14 on row y+4 off its east connection and
+    # a pipe x+15 past the pump; a pipe at x+1, y+1 above the line (joined by the game: pipes join every side).
+    # Row y+9: a boiler x+2..x+4 by y+8..y+9 facing north, a pipe at each end of its water box (x+1 and x+5, y+9).
+    # (A segment id the game doesn't give is written "nil", an error reading it "x": both fail below.)
+    out = mod_lua(f"""local c = storage.f3d.puppet local s = c.surface local d = defines.direction
+local made = {{}}
+local function put(name, px, py, dir, extra)
+  local spec = {{ name = name, position = {{ {x} + px, {y} + py }}, direction = dir or d.north, force = c.force, raise_built = true }}
+  if extra then for k, v in pairs(extra) do spec[k] = v end end
+  local e = s.create_entity(spec)
+  if e then made[#made + 1] = e end
+  return e
+end
+for i = 0, 2 do put('pipe', i + 0.5, 2.5) end
+put('pipe-to-ground', 3.5, 2.5, d.west)
+put('pipe-to-ground', 8.5, 2.5, d.east)
+put('pipe', 9.5, 2.5)
+put('storage-tank', 11.5, 3.5)
+put('pump', 14, 4.5, d.east)
+put('pipe', 15.5, 4.5)
+put('pipe', 1.5, 1.5)
+put('boiler', 3.5, 9, d.north)
+put('pipe', 1.5, 9.5)
+put('pipe', 5.5, 9.5)
+storage.f3d_n9 = made
+local r = {{}}
+for _, e in ipairs(made) do
+  local ok, id = pcall(function() return e.get_fluid_segment_id(1) end)
+  r[#r + 1] = e.unit_number .. ':' .. e.name .. ':' .. tostring(ok and id or 'x')
+end
+rcon.print(table.concat(r, ' '))""".replace("\n", " "))
+    game = {}
+    names = {}
+    try:
+        for part in out.split():
+            u, name, seg = part.split(":")
+            game[int(u)] = seg
+            names[int(u)] = name
+    except ValueError:
+        report(False, "pipevis: the layout built, the game's segment ids read", out)
+        return
+    report(len(game) == 13, "pipevis: the layout built (13 entities) and the game's segment ids read", out)
+    # The chunks round the spot again, each a snapshot with the records' `pc`.
+    cx, cy = x // 32, y // 32
+    wanted = [[cx + dx, cy + dy] for dy in range(-1, 2) for dx in range(-1, 2)]
+    c.send({"t": "sub", "c": []})
+    c.send({"t": "sub", "c": wanted})
+    pending = {tuple(w) for w in wanted}
+    records = {}
+    end = time.time() + 20
+    while pending and time.time() < end:
+        for m in c.pump(0.5, every=hello):
+            if m.get("t") == "ents":
+                for e in m["e"]:
+                    if e[0]:
+                        records[e[0]] = e
+                if m["part"] == m["parts"]:
+                    pending.discard((m["cx"], m["cy"]))
+            elif m.get("t") in ("add", "upd") and m["e"][0]:
+                records[m["e"][0]] = m["e"]
+    types = {i: t for i, (_, t) in c.protos.items()}
+    group = client_pipelines(list(records.values()), c.eprops or {}, types)
+    fluid = [u for u in game if types.get(records.get(u, [0, 0])[1], "") in ("pipe", "pipe-to-ground", "storage-tank")]
+    report(not pending and all(u in records for u in game), "pipevis: every entity's record came with its chunk",
+           f"pending {sorted(pending)}, missing {[names[u] for u in game if u not in records]}")
+    no_id = [f"{names[u]} {u}: {game[u]}" for u in fluid if game[u] in ("nil", "x")]
+    report(not no_id, "pipevis: the game gives every pipe, pipe to ground and tank a fluid segment id", "; ".join(no_id))
+
+    def same_game(a, b):
+        return game[a] == game[b] and game[a] not in ("nil", "x")
+
+    def compare(groups, what):
+        wrong = []
+        for a in fluid:
+            for b in fluid:
+                if a < b and same_game(a, b) != (groups.get(a) is not None and groups.get(a) == groups.get(b)):
+                    wrong.append(f"{names[a]} {a} / {names[b]} {b}: game {'same' if same_game(a, b) else 'apart'}")
+        report(not wrong, f"pipevis: {what} groups every pipe, pipe to ground and tank as the game's fluid segments",
+               "; ".join(wrong[:6]))
+    compare(group, "the client's rule (in Python)")
+    own = client_own_pipelines(list(records.values()), c)
+    if own is None:
+        print("  INFO N9: Godot not found (--godot, $GODOT, godot on PATH): the client's own pipeline_marks.gd not run")
+    else:
+        compare(own, "the client's own pipeline_marks.gd")
+    boiler_pipes = [u for u in game if names[u] == "pipe"][-2:]
+    if len(boiler_pipes) == 2:
+        a, b = boiler_pipes
+        print(f"  INFO N9: the boiler's two pipes {'share' if game[a] == game[b] else 'are apart in'} a fluid segment "
+              f"(game ids {game[a]} and {game[b]}); the client {'joins' if group.get(a) == group.get(b) else 'stops at'} the boiler")
+    print("  INFO N9: game segment ids:", ", ".join(f"{names[u]} {u}={game[u]}" for u in game))
+    mod_lua("for _, e in ipairs(storage.f3d_n9 or {}) do if e.valid then e.destroy() end end storage.f3d_n9 = nil")
+
+
+def check_join(c, hello):
+    """L13: a world Zenith made (a fresh map, nobody created in it yet) played by the bridge's own character.
+    Freeplay is told not to make its crash site (takeover.lua no_crash_site) through the remote interface 2.1's
+    freeplay.lua has; the hello's `pn` (the client PC's Factorio account) is kept with the client and claims nobody
+    while no player has that name. The join itself (a player of that name taking the character over, handing it
+    back on leaving) needs a real Factorio joined as a player, which a headless run can't make."""
+    facts = json.loads(mod_lua(
+        "local fp = remote.interfaces.freeplay local fns = {} if fp then for k in pairs(fp) do fns[#fns + 1] = k end end "
+        "table.sort(fns) local n = 0 for _ in pairs(game.players) do n = n + 1 end local s = storage.f3d "
+        "rcon.print(helpers.table_to_json({ fns = fns, players = n, mp = game.is_multiplayer(), "
+        "own = s.own_character ~= nil and s.own_character.valid and s.own_character == s.puppet }))"))
+    print("  INFO freeplay's remote interface:", ", ".join(facts["fns"]) or "none", f"| players {facts['players']}")
+    need = {"get_init_ran", "get_disable_crashsite", "set_disable_crashsite", "get_created_items"}
+    report(need <= set(facts["fns"]), "join: freeplay's remote interface has what the bridge calls", sorted(need - set(facts["fns"])))
+    if not need <= set(facts["fns"]):
+        return
+    state = json.loads(mod_lua(
+        "rcon.print(helpers.table_to_json({ ran = remote.call('freeplay', 'get_init_ran') == true, "
+        "off = remote.call('freeplay', 'get_disable_crashsite') == true, kit = remote.call('freeplay', 'get_created_items') }))"))
+    print("  INFO freeplay: init_ran", state["ran"], "| crash site disabled", state["off"], "| created items", state["kit"])
+    if facts["players"] == 0:
+        report(facts["mp"] and facts["own"] and not state["ran"] and state["off"],
+               "join: on a server map nobody joined yet, the bridge plays its own character and freeplay's crash site is off",
+               f"{facts}, {state}")
+    else:
+        report(True, "join: this map has players (freeplay's intro ran already): nothing to turn off", f"{facts['players']} players")
+    report(isinstance(state["kit"], dict) and state["kit"].get("iron-plate") == 8,
+           "join: freeplay's created items are names to counts (what a claimed new player's character is emptied of)", state["kit"])
+    named = dict(hello[1], pn="zenith-live-nobody")
+    c.pump(2.0, every=(1.0, named))
+    st = json.loads(mod_lua("local s = storage.f3d rcon.print(helpers.table_to_json({ pn = s.client and s.client.pn or '', "
+                            "owner = s.owner_index or 0, z = s.zenith_owner or 0, "
+                            "own = s.own_character ~= nil and s.own_character.valid and s.own_character == s.puppet }))"))
+    report(st["pn"] == "zenith-live-nobody" and st["owner"] == 0 and st["z"] == 0 and st["own"] == facts["own"],
+           "join: a hello's pn is kept with the client; with no player of that name nobody is claimed", st)
+    c.pump(1.5, every=hello)
+    st = json.loads(mod_lua("local s = storage.f3d rcon.print(helpers.table_to_json({ pn = s.client and s.client.pn or '' }))"))
+    report(st["pn"] == "", "join: a hello without pn forgets it", st)
+    switches = rcon.run("/f3d-perf")
+    report("zenith_join on" in switches and "no_crash_site on" in switches, "join: /f3d-perf lists the two switches, on",
+           switches.strip()[-200:])
+
+
+def steps_parts(msgs):
+    """The `steps` parts of one handshake, by part number, and their count as the parts say it."""
+    parts = {m["part"]: m for m in of_type(msgs, "steps")}
+    total = {m["parts"] for m in parts.values()}
+    return parts, (total.pop() if len(total) == 1 else None)
+
+
+def handshake_msgs(c):
+    """A handshake's messages: hellos until `ready`, then the rest of the stages (eprops, steps...) with the
+    client's world on, as the client does."""
+    msgs = c.pump(8, until=lambda m: m.get("t") == "ready", every=(1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 0}))
+    c.send({"t": "hello", "v": 1, "sid": c.sid, "w": 1})
+    return msgs + c.pump(4.0)
+
+
+def check_steps(c, hello):
+    """Step 5 task 3a: the character's steps from Factorio's own prototypes. The handshake's `steps` parts whole,
+    numbered and under the outbox's budget; every tile listed, and silent only where the player can't walk (its
+    collision mask has `player`); the files each listed sound names are in the install; the same list as the
+    data stage's zenith-step-sounds; sent again whole on a full resync and on a reconnect (a new sid)."""
+    import factorio_install
+    msgs = handshake_msgs(c)
+    kinds = [m.get("t") for m in msgs]
+    parts, total = steps_parts(msgs)
+    report(total is not None and sorted(parts) == list(range(1, total + 1)),
+           "steps: every part of the list in the handshake", f"{sorted(parts)} of {total}")
+    if not parts or total is None:
+        return
+    report("eprops" in kinds and kinds.index("steps") > kinds.index("eprops"), "steps: after eprops")
+    report(c.max_size.get("steps", 0) <= 4096, "steps: each datagram within f3d-bytes-per-tick's floor (4096)",
+           f"largest {c.max_size.get('steps')} bytes, {total} parts")
+    sounds, lists, u = [], {"tl": [], "el": [], "dl": [], "al": []}, None
+    for n in range(1, total + 1):
+        sounds += parts[n].get("s", [])
+        for k in lists:
+            lists[k] += parts[n].get(k, [])
+        u = parts[n].get("u", u)
+    report(all(0 <= rec[1] <= len(sounds) for k in ("tl", "el", "dl") for rec in lists[k]) and u is not None
+           and all(0 <= v <= len(sounds) for v in u), "steps: every name points at a listed sound (0: none)", f"{len(sounds)} sounds, u {u}")
+    # The data stage's list, read back over RCON: the same tiles, rails and resources, decoratives.
+    facts = json.loads(mod_lua(
+        "local d = prototypes.mod_data['zenith-step-sounds'] local out = { has = d ~= nil } "
+        "if d then local function n(t) local c = 0 for _ in pairs(t or {}) do c = c + 1 end return c end "
+        "out.s = #d.get('s') out.tile = n(d.get('tile')) out.entity = n(d.get('entity')) out.decorative = n(d.get('decorative')) end "
+        "local blocked = {} for name, p in pairs(prototypes.tile) do "
+        "if p.collision_mask.layers.player then blocked[#blocked + 1] = name end end out.blocked = blocked "
+        "out.tiles = 0 for _ in pairs(prototypes.tile) do out.tiles = out.tiles + 1 end "
+        "rcon.print(helpers.table_to_json(out))"))
+    report(facts["has"] and facts["s"] == len(sounds) and facts["tile"] == len(lists["tl"]) == facts["tiles"]
+           and facts["entity"] == len(lists["el"]) and facts["decorative"] == len(lists["dl"]),
+           "steps: the message carries the data stage's whole list (every tile, rails and resources, decoratives)",
+           f"sounds {len(sounds)}/{facts.get('s')}, tiles {len(lists['tl'])}/{facts.get('tile')}/{facts['tiles']}, "
+           f"entities {len(lists['el'])}/{facts.get('entity')}, decoratives {len(lists['dl'])}/{facts.get('decorative')}")
+    names = {i: n for n, i in c.tiles.items()}
+    silent = sorted(names.get(rec[0], f"#{rec[0]}") for rec in lists["tl"] if rec[1] == 0)
+    walk_silent = [n for n in silent if n not in set(facts["blocked"]) and n != "tile-unknown"]
+    print(f"  INFO steps: {len(sounds)} sounds in {total} parts; silent tiles: {', '.join(silent)}")
+    report(not walk_silent, "steps: no tile the player can walk on is silent", walk_silent)
+    data = factorio_install.find()
+    data = os.path.join(data, "data") if data and os.path.isdir(os.path.join(data, "data")) else None
+    if data:
+        missing = []
+        for key, _vol, count in sounds:
+            files = key if isinstance(key, list) else (
+                [f"{key}-{i}.ogg" for i in range(1, count + 1)] if not (count == 1 and os.path.exists(os.path.join(data, key + ".ogg")))
+                else [key + ".ogg"])
+            missing += [f for f in files if not os.path.exists(os.path.join(data, f))]
+        report(not missing, "steps: every listed sound's files are in the install (read there, never copied)", missing[:5])
+    # A full resync and a reconnect: the list again, whole.
+    c.send({"t": "resync", "full": 1})
+    again = c.pump(4.0)
+    p2, t2 = steps_parts(again)
+    report(t2 == total and sorted(p2) == list(range(1, total + 1)), "steps: sent again whole on a full resync", f"{sorted(p2)} of {t2}")
+    c.sid = c.sid + "-again"
+    again = handshake_msgs(c)
+    p3, t3 = steps_parts(again)
+    report(t3 == total and sorted(p3) == list(range(1, total + 1)) and p3[1].get("s") == parts[1].get("s"),
+           "steps: sent again whole on a reconnect (a new sid), the same list", f"{sorted(p3)} of {t3}")
+    c.pump(1.0, every=(1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1}))
+
+
 def handshake(c):
     msgs = c.pump(6, until=lambda m: m.get("t") == "ready", every=(1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 0}))
     welcome = of_type(msgs, "welcome")
@@ -5337,19 +7311,24 @@ def check_as_player(c, hello):
 
 
 def parse_args():
-    global FACTORIO_PORT, CLIENT_PORT, SECOND_CLIENT_PORT, SERVER_LOG
+    global FACTORIO_PORT, CLIENT_PORT, SECOND_CLIENT_PORT, SERVER_LOG, GODOT, BINARY
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--factorio-port", type=int, default=FACTORIO_PORT, help="the server's --enable-lua-udp port")
     parser.add_argument("--client-port", type=int, default=CLIENT_PORT, help="the port this binds, as the client would")
     parser.add_argument("--rcon-port", type=int, default=rcon.PORT)
+    parser.add_argument("--godot", help="the Godot binary for pipevis's run of the client's own rule (default: $GODOT, godot on PATH)")
     parser.add_argument("--rcon-password", help="default: server/data/rcon-password.txt")
     parser.add_argument("--second-client-port", type=int, default=0, help="the two-client check's second client (default: the client port + 1)")
     parser.add_argument("--server-log", help="the server's factorio-current.log, for the barrier check (default: server/data's, "
                                              "when it is this server's)")
     parser.add_argument("--only", choices=["platforms", "planets", "space", "ride", "collectors", "ui", "input", "cliffs", "save", "gear", "planners", "circuits", "build", "info",
-                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "pickup", "states", "repair", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx", "beltswitch", "barrier", "research"], help="run just these checks after the handshake")
+                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "pickup", "states", "repair", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx", "beltswitch", "barrier", "research", "join", "underclear", "vehitems", "pipeend", "pipevis", "link", "sprint", "steps", "enemysight", "enemysightfix"], help="run just these checks after the handshake")
+    parser.add_argument("--binary", action="store_true", help="every hello asks for binary frames (bin): the checks read "
+                        "them as the client does (protocol.py), and the end says how many datagrams came binary")
     args = parser.parse_args()
+    BINARY = args.binary
     FACTORIO_PORT, CLIENT_PORT, rcon.PORT = args.factorio_port, args.client_port, args.rcon_port
+    GODOT = args.godot
     rcon.PASSWORD = args.rcon_password
     SECOND_CLIENT_PORT = args.second_client_port
     SERVER_LOG = args.server_log
@@ -5373,12 +7352,33 @@ def main():
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
+    if args.only == "steps":
+        check_steps(c, None)
+        report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+        report_step_errors()
+        print(f"\n{results.count(True)} passed, {results.count(False)} failed")
+        sys.exit(0 if all(results) else 1)
+
     if args.only == "modgfx":
         welcome = handshake(c)
         if welcome:
             hello = (1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1})
             c.pump(1.0, every=hello)
             check_mod_graphics(c, hello, welcome[0])
+            report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+        report_step_errors()
+        print(f"\n{results.count(True)} passed, {results.count(False)} failed")
+        sys.exit(0 if all(results) else 1)
+
+    if args.only in ("link", "sprint"):
+        welcome = handshake(c)
+        if welcome:
+            hello = (1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1})
+            c.pump(1.0, every=hello)
+            if args.only == "link":
+                check_link(c, hello, welcome[0])
+            else:
+                check_sprint(c, hello)
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
         report_step_errors()
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
@@ -5394,7 +7394,7 @@ def main():
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
         sys.exit(0 if all(results) else 1)
 
-    if args.only in ("cliffs", "save", "gear", "build", "alerts", "multi", "remnants", "turrets", "weapons", "enemies", "remote", "walk", "pickup", "states", "repair", "mapinfo", "triggers", "minevehicles", "alt", "beltswitch", "asplayer", "barrier", "research"):
+    if args.only in ("cliffs", "save", "gear", "build", "alerts", "multi", "remnants", "turrets", "weapons", "enemies", "remote", "walk", "pickup", "states", "repair", "mapinfo", "triggers", "minevehicles", "alt", "beltswitch", "asplayer", "barrier", "research", "join", "underclear", "vehitems", "pipeend", "pipevis", "enemysight", "enemysightfix"):
         if handshake(c):
             hello = (1.0, {"t": "hello", "v": 1, "sid": c.sid, "w": 1})
             c.pump(1.0, every=hello)
@@ -5402,7 +7402,9 @@ def main():
              "alerts": check_alerts, "multi": check_multi, "remnants": check_remnants, "turrets": check_turrets, "weapons": check_weapons,
              "enemies": check_enemies, "remote": check_remote_view, "walk": check_walk, "pickup": check_pickup, "states": check_states,
              "repair": check_repair, "mapinfo": check_map_info, "triggers": check_triggers, "minevehicles": check_mine_vehicles, "alt": check_alt, "beltswitch": check_belt_switch, "asplayer": check_as_player,
-             "barrier": check_barrier, "research": check_research}[args.only](c, hello)
+             "barrier": check_barrier, "research": check_research, "join": check_join, "underclear": check_under_clear, "pipeend": check_pipe_end,
+             "vehitems": check_vehicle_items, "pipevis": check_pipe_vis, "enemysight": check_enemy_sight,
+             "enemysightfix": lambda c, h: check_enemy_sight(c, h, nest_only=True)}[args.only](c, hello)
             report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
         report_step_errors()
         print(f"\n{results.count(True)} passed, {results.count(False)} failed")
@@ -5444,6 +7446,14 @@ def main():
     report(bool(quals) and quals[-1]["l"][0][:3] == ["normal", 0, 1],
            "quals: the qualities by level, normal unlocked (prototypes.quality, is_quality_unlocked)", str(quals[-1:])[:300])
     report(not c.invalid, "every message passes tools/protocol.py", str(c.invalid[:3]))
+    welcome_bin = c.last.get("welcome", {}).get("bin")
+    if BINARY:
+        report(welcome_bin == protocol.WIRE_VERSION and c.binary_datagrams > 0 and "mv" in c.last,
+               "--binary: the welcome says bin, datagrams come as binary frames, movers among them",
+               f"bin {welcome_bin}, {c.binary_datagrams} of {c.datagrams} datagrams binary")
+    else:
+        report(welcome_bin is None and c.binary_datagrams == 0, "without bin in the hello: JSON text only",
+               f"bin {welcome_bin}, {c.binary_datagrams} binary datagrams")
 
     # --- decoratives --------------------------------------------------------------------------------
     check_decoratives(c, hello, x, y, wanted)
@@ -5547,7 +7557,7 @@ rcon.print(n .. " items placed")
            f"{out}; {len(ticks)} updates, {len(last)} items, {len(on_row)} on the row")
     squared = [m for m in of_type(msgs, "bi") if "fr" in m]
     report(squared and len(squared) == len(of_type(msgs, "bi")) and all(m["fr"] > 0 for m in squared),
-           "bi: every part says the square it covers (fx, fy, fr), where the client hands over to lane icons",
+           "bi: every part says the square it covers (fx, fy, fr), where the client hands over to lane icons (G16)",
            f"{[(m['fx'] / 256, m['fy'] / 256, m['fr']) for m in squared[:2]]}")
     lanes = sorted({v[2] - (row * 256 + 128) for v in on_row})
     report(lanes and min(lanes) < 0 < max(lanes), "the two lanes sit either side of the belt centre", f"y offsets {lanes} / 256")
@@ -5575,7 +7585,7 @@ rcon.print(n .. " items placed")
     our_counts = [m["c"][i // 5 * 2:i // 5 * 2 + 2] for m in far_msgs if m in counted for i in range(0, len(m["l"]), 5)
                   if m["l"][i + 1] == row * 256 + 128 and x0 * 256 <= m["l"][i] <= (x0 + 8) * 256]
     report(far_msgs and len(counted) == len(far_msgs) and our_counts and all(0 <= n <= 4 for p in our_counts for n in p) and any(sum(p) > 0 for p in our_counts),
-           "bfar c: how many items each lane of each belt holds (0-4), so far belts are drawn as full as they are", f"ours {our_counts[:4]}")
+           "bfar c: how many items each lane of each belt holds (0-4), so far belts are drawn as full as they are (G17)", f"ours {our_counts[:4]}")
     c.send({"t": "bfar", "r": 0})
     kept = [u for u in first if u in last]
     crossed = [u for u in kept if int(first[u][1] / 256) != int(last[u][1] / 256)]
@@ -5823,7 +7833,7 @@ rcon.print((loco and loco.unit_number or "none") .. " " .. rails)
             report("v" not in c.me, "and gets out of the locomotive", str(c.me))
     else:
         report(False, "place a locomotive on a straight track for the train checks", out)
-    # Only what this check made: it may be run on a real save.
+    # Only what this check made: the owner may run it on a real save.
     made = [str(u) for u in (car if isinstance(car, int) else 0, loco if isinstance(loco, int) else 0) if u]
     vehicle_lua(f"""
 for _, u in pairs({{ {", ".join(made)} }}) do
@@ -5967,12 +7977,16 @@ table.sort(done) rcon.print(table.concat(done, " "))
         first, second = lab[0], lab[1]
         c.send({"t": "research", "name": first})
         c.send({"t": "research", "name": second})
-        msgs = c.pump(0.5, every=hello)
+        # Waits for the `rs` that says so (up to 5 s): right after a resend of every technology the outbox may hold
+        # the answer back past half a second (a full run's one failure).
+        msgs = c.pump(5.0, until=lambda m: m.get("t") == "rs" and m.get("cur") == first and second in (m.get("q") or []),
+                      every=hello)
         rs = latest(msgs, "rs")
         report(bool(rs) and rs["cur"] == first and second in rs["q"], "research: add_research starts one and queues the next", str(rs))
         c.send({"t": "research_cancel", "name": second})
         c.send({"t": "research_cancel", "name": first})
-        msgs = c.pump(0.5, every=hello)
+        msgs = c.pump(5.0, until=lambda m: m.get("t") == "rs" and second not in (m.get("q") or []) and m.get("cur") != first,
+                      every=hello)
         rs = latest(msgs, "rs")
         report(bool(rs) and second not in rs["q"] and rs["cur"] != first,
                "research_cancel: research_queue and cancel_current_research", str(rs))
@@ -6629,6 +8643,15 @@ rcon.print({"", "25 chunks, ", tostring(n), " entities: ", profiler})
 
     # --- repair packs (K13) ---------------------------------------------------------------------
     check_repair(c, hello)
+
+    # --- vehicles: Ctrl+click into them, their guns while driving, repair packs (N2, N3, N4) -----
+    check_vehicle_items(c, hello)
+
+    # --- an underground pair over belts mines the belts between (M2) -----------------------------
+    check_under_clear(c, hello)
+
+    # --- the pipes and belts beside what the character mines get their new shapes (the owner's FUE5 pipe end) -----
+    check_pipe_end(c, hello)
 
     # --- space platforms (Space Age) -----------------------------------------------------------
     check_platforms(c, hello)

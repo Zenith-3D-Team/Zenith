@@ -1,6 +1,6 @@
 extends Node
 ## --stutter-probe=<out.json>[@route]: walks the character along a fixed route and records every
-## frame's length and what ran in it on the main thread (stutters while moving on big worlds):
+## frame's length and what ran in it on the main thread (D6: stutters while moving on big worlds):
 ## models made for their first appearance (model_library.gd), level-of-detail work (model_lods.gd),
 ## chunk entity rebuilds, terrain applied, messages handled, the renderer's own CPU and GPU time,
 ## all scripts' _process together, and which of the game's nodes took it (markers between them).
@@ -56,8 +56,33 @@ const ROUTES := {
 	"stand120": [[-1, 120.0]],  # (tools/belt_view_check.py --client-arg: the frames of a whole scored run, --probe-stay)
 	"fight": [[-1, 150.0]],  # stands while tools/attack_wave.py sends enemies at a defended wall
 	"variants": [[-1, 7200.0]],  # stands until --probe-variants has gone through its list
+	# L14: a screenshot zoomed far out (SHOT_LEG: the camera taken up as the Cinematic camera's free
+	# camera flies, api.view.screenshot as its F12 takes one), then 10 s standing from when it ended:
+	# the frames while the shot's far chunks are let go. The shot's own frames are kept apart ("shot").
+	"shot": [[-2, 0.0], [-1, 10.0]],
+	# The owner's stutter when the camera moves fast (the character stands): the view spun round
+	# (SPIN_LEG), zoomed all the way out and back in (ZOOM_LEG), then the camera taken off the character
+	# and flown fast across the base and back as a free camera does (PAN_LEG), and given back.
+	"pan": [[-1, 3.0], [-3, 6.0], [-1, 2.0], [-4, 6.0], [-1, 2.0], [-5, 12.0], [-1, 5.0]],
 }
+## Route "pan"'s legs: degrees a second the view turns, the zoom out-and-back, and the free camera's
+## speed (tiles a second, about the Cinematic camera's fast fly) out from where it was taken and back.
+const SPIN_LEG := -3
+const ZOOM_LEG := -4
+const PAN_LEG := -5
+const SPIN_RATE := 240.0
+const PAN_SPEED := 60.0
+var _cam_t := 0.0
+var _cam_from := Vector2.ZERO
+var _zoom_from := 0.0
 const WALK_REPEAT := 0.15
+## A leg that takes a screenshot (route "shot"): --probe-shot-camera=<height>,<pitch>[,hand] puts the
+## camera that many tiles over the character looking that many degrees down (default 250, 22: past
+## the horizon, so the shot asks for thousands of chunks); `hand` gives the camera back to the
+## player's view the moment the shot ends (an F12 from the normal view), else it stays up there.
+const SHOT_LEG := -2
+var _shot_frames: Array = []
+var _shot_state := 0  # 0 not begun, 1 being taken, 2 done
 
 var world  # world.gd
 var out_path := ""
@@ -140,6 +165,9 @@ var _marks: Array = []
 ## _process to the draw is deferred calls and freed nodes, the draw is the renderer's whole frame
 ## on the main thread (not only the viewport's measured time), the rest is presenting and input.
 var _end_usec := 0
+var _pf_usec := 0
+var _phys_usec := 0
+var _deferred_usec := 0
 var _pre_usec := 0
 var _post_usec := 0
 var _world_prof := {}
@@ -181,6 +209,10 @@ func _ready() -> void:
 		_variant_list = list
 	add_child(_start)
 	RenderingServer.frame_pre_draw.connect(func() -> void: _pre_usec = Time.get_ticks_usec())
+	get_tree().process_frame.connect(func() -> void: _pf_usec = Time.get_ticks_usec())
+	get_tree().physics_frame.connect(func() -> void:
+		if _phys_usec <= _end_usec:
+			_phys_usec = Time.get_ticks_usec())
 	RenderingServer.frame_post_draw.connect(func() -> void: _post_usec = Time.get_ticks_usec())
 	_add_marks.call_deferred()
 
@@ -221,6 +253,9 @@ func _add_marks() -> void:
 	var spec := out_path.split("@")
 	out_path = spec[0]
 	_route = ROUTES.get(spec[1] if spec.size() > 1 else "busy", ROUTES["busy"])
+	if Settings.has_arg("--probe-shot-after="):  # route "shot": seconds after it ended (10)
+		_route = _route.duplicate(true)
+		_route[-1][1] = float(Settings.arg_value("--probe-shot-after="))
 	RenderingServer.viewport_set_measure_render_time(get_viewport().get_viewport_rid(), _times)
 
 
@@ -259,15 +294,25 @@ func _process(delta: float) -> void:
 		# lines in Factorio's log), asked through the console, so single-player needs no RCON.
 		if Settings.has_arg("--probe-trace="):
 			Bridge.send({"t": "cmd", "id": 9999, "text": "/f3d-profile trace %d" % int(Settings.arg_value("--probe-trace="))})
+	var shooting := false
 	if not walking:
 		_warm += delta
 	elif _leg >= _route.size():
 		_finish()
 		return
+	elif int(_route[_leg][0]) == SHOT_LEG:
+		shooting = true
+		if _shot_leg():
+			_leg += 1
 	else:
+		var code := int(_route[_leg][0])
 		if _leg_left <= 0.0:
 			_leg_left = float(_route[_leg][1])
 			_walk_timer = 0.0
+			_cam_t = 0.0
+		if code <= SPIN_LEG:
+			_camera_leg(code, delta, float(_route[_leg][1]))
+			_walk_timer = INF  # the character stands
 		_walk_timer -= delta
 		if _walk_timer <= 0.0:
 			Bridge.send({"t": "walk", "d": int(_route[_leg][0])})
@@ -288,7 +333,7 @@ func _process(delta: float) -> void:
 	for k in ["tex_mem", "buf_mem"]:
 		if absi(c[k] - _before[k]) >= 1 << 20:  # 1 MB
 			phases[k] = snappedf((c[k] - _before[k]) / 1048576.0, 0.1)
-	(_frames if walking else _load_frames).append([(now - _last_usec) / 1000.0, (c["model"] - _before["model"]) / 1000.0,
+	(_shot_frames if shooting else _frames if walking else _load_frames).append([(now - _last_usec) / 1000.0, (c["model"] - _before["model"]) / 1000.0,
 		(c["lods"] - _before["lods"]) / 1000.0, (c["rebuild"] - _before["rebuild"]) / 1000.0,
 		(c["terrain"] - _before["terrain"]) / 1000.0, (c["handle"] - _before["handle"]) / 1000.0,
 		_render_cpu(vp), _render_gpu(vp),
@@ -299,6 +344,7 @@ func _process(delta: float) -> void:
 	_last_usec = now
 	_before = c
 	_end_usec = Time.get_ticks_usec()
+	(func() -> void: _deferred_usec = Time.get_ticks_usec()).call_deferred()
 	_elapsed += delta
 	if _settled_at < 0.0 and _settled() and world.undrawn() == 0:
 		_settled_at = _elapsed
@@ -312,6 +358,82 @@ func _process(delta: float) -> void:
 			_drawn_at = -1.0
 	if _drawn_at < 0.0 and _settled_at >= 0.0 and _belt_done_at >= 0.0:
 		_drawn_at = _elapsed
+
+
+## Route "shot": the camera up (--probe-shot-camera), the screenshot asked for as the Cinematic
+## camera's F12 does (no file written: a picture of 16 pixels stands in for the window's), and true
+## once it has ended. The camera stays up after, as the free camera does, unless `hand`.
+func _shot_leg() -> bool:
+	var main: Node = world.get_parent().get_parent()
+	var addons = main.get("addons")
+	var rig = main.get("rig")
+	if addons == null or rig == null:
+		return true
+	var spec := (Settings.arg_value("--probe-shot-camera=") if Settings.has_arg("--probe-shot-camera=") else "250,22").split(",")
+	if _shot_state == 0:
+		var height := float(spec[0])
+		var pitch := deg_to_rad(float(spec[1]) if spec.size() > 1 else 22.0)
+		rig.take_over()
+		var f: Vector2 = world.focus()
+		var cam: Camera3D = rig.camera
+		var at := Vector3(f.x, height, f.y + height / tan(pitch))
+		cam.global_transform = Transform3D(Basis(), at).looking_at(Vector3(f.x, 0.0, f.y))
+		addons.test_capture = func(_size: Vector2i) -> Image: return Image.create(16, 16, false, Image.FORMAT_RGB8)
+		# Framed as a 1920 x 1080 picture whatever the window (headless it is 64 x 64).
+		var target: String = addons.screenshot("user://probe-shots/shot.png", {"size": Vector2i(1920, 1080)})
+		print("STUTTER shot: camera %.0f tiles up at %.0f degrees, %s" % [height, rad_to_deg(pitch), target])
+		_shot_state = 1
+		_shot_t0 = Time.get_ticks_msec()
+		return false
+	if addons.screenshot_busy():
+		var sp: Dictionary = world.shot_progress()
+		if not sp.is_empty() and int(sp.get("total", 0)) > _shot_total:
+			_shot_total = int(sp["total"])
+			print("STUTTER shot: %d chunks in its view (cover %s, window %s, fov %.0f)" % [_shot_total, str(world._cover_rect),
+				str(get_viewport().get_visible_rect().size), (rig.camera as Camera3D).fov])
+		return false
+	_shot_state = 2
+	print("STUTTER shot ended after %.1f s; chunks loaded %d, being let go %d" % [
+		(Time.get_ticks_msec() - _shot_t0) / 1000.0, world.chunks.size(), world._unloaded.size()])
+	if spec.size() > 2 and spec[2] == "hand":
+		rig.hand_back()
+	return true
+
+
+## Route "pan": moves the view as the leg says, `length` seconds long; the free camera is given back
+## when its leg ends.
+func _camera_leg(code: int, delta: float, length: float) -> void:
+	var rig = world.get_parent().get_parent().get("rig")
+	if rig == null:
+		return
+	var first := _cam_t == 0.0
+	_cam_t += delta
+	var f := clampf(_cam_t / length, 0.0, 1.0)
+	match code:
+		SPIN_LEG:
+			rig.rotate_free(SPIN_RATE * delta)
+		ZOOM_LEG:
+			if first:
+				_zoom_from = rig._distance_goal
+			var out := 1.0 - absf(f * 2.0 - 1.0)  # 0 -> 1 -> 0
+			rig._distance_goal = lerpf(_zoom_from, rig.max_distance, out)
+		PAN_LEG:
+			if first:
+				rig.take_over()
+				_cam_from = world.focus()
+			# East for half the leg, back west for the other half, at PAN_SPEED.
+			var x := PAN_SPEED * length * 0.5 * (1.0 - absf(f * 2.0 - 1.0))
+			var ground := _cam_from + Vector2(x, 0.0)
+			rig.taken_focus = ground
+			var eye := Vector3(ground.x, 25.0, ground.y + 22.0)
+			rig.camera.global_transform = Transform3D(Basis.IDENTITY, eye).looking_at(Vector3(ground.x, 0.0, ground.y), Vector3.UP)
+			if _leg_left - delta <= 0.0:
+				rig.hand_back()
+
+
+var _shot_t0 := 0
+var _free_drawn := [0, 0]
+var _shot_total := 0
 
 
 ## Draw calls and primitives of the view and of the shadow passes: [view draws, view prims,
@@ -367,6 +489,18 @@ func _phases() -> Dictionary:
 		out["flush"] = snappedf((_pre_usec - _end_usec) / 1000.0, 0.01)
 		out["draw"] = snappedf((_post_usec - _pre_usec) / 1000.0, 0.01)
 		out["present"] = snappedf((_start.at - _post_usec) / 1000.0, 0.01)
+	# The frame's start to the first _process: SceneTree's process_frame handlers (coroutines awaiting
+	# it, ground_height.gd's walk) and the message queue's flush; from the last _process to that start:
+	# freed nodes, physics, the draw.
+	if _end_usec > 0 and _pf_usec > _end_usec and _start.at >= _pf_usec:
+		out["pre_process"] = snappedf((_start.at - _pf_usec) / 1000.0, 0.01)
+		out["after_process"] = snappedf((_pf_usec - _end_usec) / 1000.0, 0.01)
+		if _deferred_usec > _end_usec and _deferred_usec <= _pf_usec:
+			out["ap_deferred"] = snappedf((_deferred_usec - _end_usec) / 1000.0, 0.01)
+			var to := _phys_usec if _phys_usec > _deferred_usec and _phys_usec <= _pf_usec else _pf_usec
+			out["ap_delete_timers_draw"] = snappedf((to - _deferred_usec) / 1000.0, 0.01)
+			if to != _pf_usec:
+				out["ap_physics"] = snappedf((_pf_usec - to) / 1000.0, 0.01)
 	for k in world.prof:
 		var ms := (int(world.prof[k]) - int(_world_prof.get(k, 0))) / 1000.0
 		if ms > 0.05:
@@ -408,6 +542,16 @@ func _phases() -> Dictionary:
 	# waiting to be freed, and (when world.gd has them) the queues of its spread-out work.
 	out["q_unasked"] = maxi(world._wanted.size() - world._subscribed.size(), 0)
 	out["q_free"] = world._unloaded.size()
+	# Of them, those still drawn and their nodes (what the renderer still draws of chunks let go: L14),
+	# looked at every 15th frame (its own cost would show in the frames).
+	if Engine.get_process_frames() % 15 == 0:
+		_free_drawn = [0, 0]
+		for cv in world._unloaded:
+			if is_instance_valid(cv) and (cv as Node3D).visible:
+				_free_drawn[0] += 1
+				_free_drawn[1] += (cv as Node).get_child_count()
+	out["q_free_drawn"] = _free_drawn[0]
+	out["q_free_drawn_nodes"] = _free_drawn[1]
 	if world.has_method("stream_queues"):
 		var queues: Dictionary = world.stream_queues()
 		for k in queues:
@@ -588,7 +732,56 @@ func _soft_now() -> int:
 	var fitter: Node = world.get_parent().get_node_or_null("SunShadows")
 	if fitter == null or fitter.legacy:
 		return RenderingServer.SHADOW_QUALITY_SOFT_LOW
-	return int(fitter.spec["filter"])
+	return int(fitter.filter_now())
+
+
+## "soft hard / very_low / low / medium / high / ultra": Godot's soft filter for this step, put back
+## after. Through sun_shadows.gd when it fits the shadows, so the fitted blur is worked out for this
+## filter's radius, not the preset's (else a radius-2 filter kept a blur meant for radius 3: another
+## edge). Whether it took.
+func _filter_variant(fitter: Node, name: String, on: bool) -> bool:
+	if not name.begins_with("soft "):
+		return false
+	var q := ["hard", "very_low", "low", "medium", "high", "ultra"].find(name.get_slice(" ", 1))
+	if fitter != null and not fitter.legacy:
+		fitter.set_filter_override(q if on else -1)
+		var sun: DirectionalLight3D = fitter.sun
+		if sun != null:
+			print("VARIANT %s %s: filter %d, blur %.3f, texels a tile %.1f" % [name, "on" if on else "off",
+				int(fitter.filter_now()), sun.shadow_blur, float(fitter.texels)])
+	else:
+		RenderingServer.directional_soft_shadow_filter_set_quality(q if on else int(_base.get("soft", RenderingServer.SHADOW_QUALITY_SOFT_LOW)))
+	return true
+
+
+## "sun size <degrees>", "pancake <tiles>", "blur <x>", "edge <tiles>": sun_shadows.gd's soft shadows
+## for this step (the sun's size, PCSS when above 0; the PCSS pancake; a fixed blur in place of the
+## fitted one, 0 fitted; the edge's radius on the ground), each put back after. Whether it took.
+func _soft_variant(fitter: Node, name: String, on: bool) -> bool:
+	const SunShadows := preload("res://scripts/world/sun_shadows.gd")
+	var keys := {"sun size ": "sun_size", "pancake ": "pancake", "blur ": "blur_override", "edge ": "edge"}
+	for prefix: String in keys:
+		if not name.begins_with(prefix):
+			continue
+		if fitter == null:
+			return true
+		var key: String = keys[prefix]
+		var value := float(name.substr(prefix.length()))
+		if not _base.has(key):
+			_base[key] = SunShadows.pcss_pancake if key == "pancake" else float(fitter.get(key))
+		var v: float = value if on else float(_base[key])
+		if key == "pancake":
+			SunShadows.pcss_pancake = maxf(v, 0.1)
+		else:
+			fitter.set(key, v)
+		fitter.apply_atlas(false)
+		fitter._fit(true)
+		fitter.apply_soft(true)
+		var sun: DirectionalLight3D = world.sun
+		print("VARIANT %s %s: sun size %.2f, blur %.3f, pancake %.1f, texels a tile %.1f" % [name, "on" if on else "off",
+			sun.light_angular_distance, sun.shadow_blur, sun.directional_shadow_pancake_size, float(fitter.texels)])
+		return true
+	return false
 
 
 func _set_variant(name: String, on: bool) -> void:
@@ -621,7 +814,7 @@ func _set_variant(name: String, on: bool) -> void:
 		if on:
 			var words := Array(name.split(" ", false)).slice(1)
 			var q: String = words.pop_front() if not words.is_empty() and fitter.QUALITY.has(words[0]) else "high"
-			var s: Dictionary = (fitter.QUALITY[q] as Dictionary).duplicate()
+			var s: Dictionary = (fitter.spec_for(q) as Dictionary).duplicate()
 			for kv: String in words:
 				s[kv.get_slice("=", 0)] = float(kv.get_slice("=", 1))
 			fitter.apply_spec(s)
@@ -688,9 +881,9 @@ func _set_variant(name: String, on: bool) -> void:
 		sun.directional_shadow_split_2 = float(f[1]) if on and f.size() > 1 else float(_base["split2"])
 		sun.directional_shadow_split_3 = float(f[2]) if on and f.size() > 2 else float(_base["split3"])
 		return
-	if name.begins_with("soft "):  # soft hard / very_low / low / medium / high / ultra
-		var q := ["hard", "very_low", "low", "medium", "high", "ultra"].find(name.get_slice(" ", 1))
-		RenderingServer.directional_soft_shadow_filter_set_quality(q if on else int(_base["soft"]))
+	if _soft_variant(fitter, name, on):
+		return
+	if _filter_variant(fitter, name, on):
 		return
 	if name.ends_with(" no shadow"):
 		if not on:
@@ -955,6 +1148,42 @@ static func _print_windows(frames: Array) -> void:
 		t = 0.0
 
 
+## Route "shot": each second after the shot ended, its frames, the worst, those over 50 ms, the chunks
+## still being let go at its end and the world's parts that took most of it (w_ keys, ms).
+static func _print_seconds(frames: Array) -> void:
+	var t := 0.0
+	var second: Array = []
+	var n := 0
+	for r: Array in frames:
+		second.append(r)
+		t += float(r[0]) / 1000.0
+		if t < 1.0 and r != frames.back():
+			continue
+		n += 1
+		var parts := {}
+		var worst := 0.0
+		var over50 := 0
+		for w: Array in second:
+			worst = maxf(worst, float(w[0]))
+			if float(w[0]) > 50.0:
+				over50 += 1
+			if w.size() > 19 and w[19] is Dictionary:
+				for k: String in (w[19] as Dictionary):
+					if k.begins_with("w_") or k in ["flush", "draw", "pre_process", "after_process", "ap_deferred", "ap_delete_timers_draw", "ap_physics"]:
+						parts[k] = snappedf(float(parts.get(k, 0.0)) + float(w[19][k]), 0.01)
+		var top: Array = parts.keys()
+		top.sort_custom(func(a: String, b: String) -> bool: return float(parts[a]) > float(parts[b]))
+		var shown := {}
+		for k: String in top.slice(0, 6):
+			shown[k] = parts[k]
+		var last: Dictionary = second.back()[19] if second.back().size() > 19 and second.back()[19] is Dictionary else {}
+		print("AFTER SHOT second %2d: frames %3d | worst %6.1f ms | over 50 ms %d | still to free %s chunks (%s drawn, %s nodes), %s records | most %s" % [
+			n, second.size(), worst, over50, str(last.get("q_free", "?")), str(last.get("q_free_drawn", "?")), str(last.get("q_free_drawn_nodes", "?")),
+			str(last.get("q_free_records", "?")), JSON.stringify(shown)])
+		second = []
+		t = 0.0
+
+
 func _finish() -> void:
 	_done = true
 	var merged: Array = world.far_chunks.census()
@@ -965,6 +1194,9 @@ func _finish() -> void:
 	for row: Array in world.far_chunks.models().slice(0, 25):
 		print("FAR model %-36s instances %6d x %5d triangles = %8d" % [row[0], row[1], row[2], int(row[1]) * int(row[2])])
 	var phases := {"load": summarize(_load_frames), "walk": summarize(_frames)}
+	if not _shot_frames.is_empty():
+		phases["shot"] = summarize(_shot_frames)
+		_print_seconds(_frames)
 	var lat: Array = world.drawn_latency
 	var lat_ms: Array = lat.map(func(r: Array) -> float: return float(r[0]))
 	var near_ms: Array = lat.filter(func(r: Array) -> bool: return r.size() > 2 and float(r[2]) >= 0.0).map(func(r: Array) -> float: return float(r[2]))
@@ -1017,6 +1249,7 @@ func _finish() -> void:
 	var slow_msgs: Array = Bridge.slow_messages.duplicate()
 	slow_msgs.sort_custom(func(a: Array, b: Array) -> bool: return a[0] > b[0])
 	print("STUTTER messages over 8 ms to handle (ms, type, bytes), %d: %s" % [slow_msgs.size(), JSON.stringify(slow_msgs.slice(0, 15))])
+	print("STUTTER messages over 8 ms by type: %s" % JSON.stringify(Bridge.slow_counts))
 	print("STUTTER memory: static %.0f MB, video %.0f MB" % [Performance.get_monitor(Performance.MEMORY_STATIC) / 1048576.0,
 		Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0])
 	print("SLOWEST models made on the main thread (ms, name), %d over 2 ms:" % slow.size())

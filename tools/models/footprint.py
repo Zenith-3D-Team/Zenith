@@ -2,7 +2,7 @@
 
     python tools/models/footprint.py [names...] [--dump data-raw-dump.json] [--all] [--json out.json]
 
-A model's east-west and north-south extent (its .glb's bounds, client/assets/models) is compared
+A model's east-west and north-south extent (its .glb's bounds, ours: tools/models/packs.py) is compared
 with the north-facing entity's collision box and selection box from `factorio --dump-data` (read
 from --dump, or made with icon_index.dump from the install when that file is missing). A model is
 listed when an axis is more than 10% smaller than the smaller box or 10% bigger than the larger:
@@ -28,12 +28,12 @@ import trimesh
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-MODELS = os.path.join(REPO, "client", "assets", "models")
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "tools"))
 
 from specs import SPECS  # noqa: E402
 import factorio_install  # noqa: E402
+import packs  # noqa: E402
 
 TOLERANCE = 0.10
 # Suffixes of variant models, longest first; "-east"/"-west" models face that way unturned.
@@ -139,7 +139,7 @@ def main(argv=None):
             json.dump(raw, f)
     known = boxes(raw)
     space = space_age_names()
-    names = a.names or sorted(os.path.basename(p)[:-4] for p in glob.glob(os.path.join(MODELS, "*.glb")))
+    names = a.names or packs.names()
     rows = []
     for model in names:
         proto, turned = prototype_of(model, known)
@@ -150,7 +150,7 @@ def main(argv=None):
         if turned:
             coll = coll and (coll[1], coll[0])
             sel = sel and (sel[1], sel[0])
-        w, d, h = extent(os.path.join(MODELS, model + ".glb"))
+        w, d, h = extent(packs.model_path(model))
         v = verdict((w, d), coll, sel)
         rows.append({"model": model, "prototype": proto, "type": ptype, "space_age": proto in space,
                      "size": [round(w, 2), round(d, 2)], "height": round(h, 2),

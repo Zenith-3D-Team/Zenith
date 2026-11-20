@@ -74,7 +74,7 @@ function M.recorded(e, extra)
   elseif s.beltw and s.beltw[unit] then
     -- Its wires went: nothing can switch it off now, and nothing would say it runs again.
     if s.beltw[unit].off then
-      transport.send_reliable({ t = "st", l = { unit, 0 } })
+      transport.send_states({ unit, 0 })
     end
     s.beltw[unit] = nil
   end
@@ -161,7 +161,7 @@ function M.tick()
     end
   end
   if out then
-    transport.send_reliable({ t = "st", l = out })
+    transport.send_states(out)
   end
 end
 

@@ -14,6 +14,7 @@ extends Node3D
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const WireDecode := preload("res://scripts/net/wire_decode.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Creatures := preload("res://scripts/world/creatures.gd")
 const CreatureModels := preload("res://scripts/world/creature_models.gd")
@@ -26,6 +27,7 @@ const MoverRecords := preload("res://scripts/world/mover_records.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const VehicleLights := preload("res://scripts/world/vehicle_lights.gd")
 
 const MISSING_FRAMES := 3
 const FOLLOW_RATE := 15.0
@@ -68,6 +70,7 @@ class Mover:
 	var target := Vector3.ZERO
 	var yaw_goal := 0.0
 	var oriented := false
+	var last_orient := WireDecode.NO_ORIENTATION
 	var missing := 0
 	var enemy := false
 	var robot := false
@@ -78,13 +81,14 @@ class Mover:
 	var height := 0.0  # Visuals.flying_height of its type
 	var on_rails := false  # rolling stock: drawn at the rails' height under it (elevated, ramps)
 	var rail_h := 0.0
-	## Wheels (a car's, a train's axles): [MeshInstance3D, AnimPart, radius, steers].
+	## Wheels (a car's, a train's axles): [MeshInstance3D, AnimPart, radius, steers, turn].
 	var wheels: Array = []
-	var roll := 0.0
 	var steer := 0.0
 
 	## A locomotive's headlights (Factorio's `front_light`: two cones 0.6 tiles either side).
 	var headlights: Array[SpotLight3D] = []
+	## A car's, tank's or spidertron's own lights (vehicle_lights.gd), or null.
+	var lights: Node3D
 
 	var proto_id := 0
 	var fixed := Vector2i.ZERO  # the latest position as sent, for commands that name the mover
@@ -124,6 +128,10 @@ const ROLLING_STOCK := {"locomotive": true, "cargo-wagon": true, "fluid-wagon": 
 var world
 ## The character the client controls is drawn by the avatar instead.
 var puppet_unit := 0
+## The vehicle that character sits in (Avatar.vehicle), or 0: its lights shine at night (N1).
+var driven := 0
+## Movers carrying vehicle lights: unit -> Mover.
+var _lit := {}
 ## The remote view's coverage (remote_fog.gd), or null: movers where it doesn't see are hidden.
 var fog: Node3D = null
 
@@ -172,6 +180,8 @@ static var dress_usec := 1500
 static var _dress_arg_read := false
 var _to_dress := {}  # unit -> true: waiting movers whose model is ready, dressed within dress_usec a frame
 var _refresh_due := false  # robots' batches still to be made again on a new mesh (robots.refresh)
+var _frame_f := -1.0
+var _stale_gap := 60.0
 
 
 func _ready() -> void:
@@ -197,9 +207,12 @@ func reset() -> void:
 	_fog_list.clear()
 	_seen.clear()
 	_waiting.clear()
+	_lit.clear()
 	_to_dress.clear()
 	_refresh_due = false
 	_frame_tick = -1
+	_frame_f = -1.0
+	_stale_gap = 60.0
 	clock = GameClock.new()
 	creatures.clear()
 	vehicles.reset()
@@ -224,7 +237,8 @@ func waiting() -> int:
 	return _waiting.size()
 
 
-## One part of a frame: {t: "mv", k: tick, part, parts, l: [[unit, proto, x, y, orientation?], ...]}
+## One part of a frame: {t: "mv", k: tick, part, parts, l: [[unit, proto, x, y, orientation?], ...]}, or
+## from a binary frame (wire_decode.gd) `l` packed, WireDecode.MV_STRIDE numbers a record (orientation -1: none).
 func handle(msg: Dictionary) -> void:
 	var k := int(msg.get("k", 0))
 	if k != _frame_tick:
@@ -232,7 +246,12 @@ func handle(msg: Dictionary) -> void:
 		_frame_tick = k
 	# p: the ticks until the next update, longer while the mod is slowed down (`rate`).
 	clock.heard(k, float(msg.get("p", 0)))
+	_frame_f = float(_frame_tick)
+	_stale_gap = maxf(60.0, clock.gap * 4.0)
 	var list = msg.get("l")
+	if WireDecode.packed(list):
+		_handle_packed(list)
+		return
 	if not (list is Array):
 		return
 	# z = 1: a record's first four numbers are the differences from the record before it.
@@ -254,7 +273,17 @@ func handle(msg: Dictionary) -> void:
 				proto = int(r[1])
 				x = int(r[2])
 				y = int(r[3])
-			_update(unit, proto, x, y, r)
+			_update(unit, proto, x, y, int(r[4]) if r.size() >= 5 else WireDecode.NO_ORIENTATION)
+
+
+## A binary frame's movers: whole records of WireDecode.MV_STRIDE numbers, read straight from the packed list.
+func _handle_packed(list: Variant) -> void:
+	var stride := WireDecode.MV_STRIDE
+	var n: int = list.size() - stride + 1
+	var i := 0
+	while i < n:
+		_update(list[i], list[i + 1], list[i + 2], list[i + 3], list[i + 4])
+		i += stride
 
 
 func _end_frame() -> void:
@@ -272,18 +301,28 @@ func _end_frame() -> void:
 				_count_type(m.type, -1)
 				_movers.erase(unit)
 				_node_movers.erase(unit)
+				_lit.erase(unit)
 				_waiting.erase(unit)
 				vehicles.detach(unit)
 	_seen.clear()
 
 
-## One mover's record: its unit, prototype and place (fixed), and `rec` for its orientation.
-## The prototype is looked up only for a new mover (or one whose prototype changed).
-func _update(unit: int, proto_id: int, x: int, y: int, rec: Array) -> void:
+## One mover's record: its unit, prototype and place (fixed), and its orientation x 1000
+## (WireDecode.NO_ORIENTATION for a mover that has none). The prototype is looked up only for a new mover
+## (or one whose prototype changed).
+func _update(unit: int, proto_id: int, x: int, y: int, orient: int) -> void:
 	if unit == puppet_unit:
 		return
 	_seen[unit] = true
 	var m: Mover = _movers.get(unit)
+	var tick := _frame_f if _frame_f >= 0.0 else float(_frame_tick)
+	var stale_gap := _stale_gap if _frame_f >= 0.0 else maxf(60.0, clock.gap * 4.0)
+	if m != null and m.proto_id == proto_id and m.to_tick >= 0.0 and x == m.fixed.x and y == m.fixed.y \
+			and orient == m.last_orient and tick - m.to_tick <= stale_gap:
+		if tick > m.to_tick:
+			m.from = m.target
+		m.to_tick = tick
+		return
 	if m == null or m.proto_id != proto_id:
 		var proto: ProtoDB.EntityProto = protos.entity(proto_id)
 		if proto == null:
@@ -295,6 +334,10 @@ func _update(unit: int, proto_id: int, x: int, y: int, rec: Array) -> void:
 			m.node.position = Vector3(x / 256.0, Visuals.flying_height(proto.type), y / 256.0)
 			if proto.type == "locomotive":
 				_add_headlights(m)
+			elif VehicleLights.has(proto.type):
+				m.lights = VehicleLights.build(proto.type)
+				m.node.add_child(m.lights)
+				_lit[unit] = m
 			m.enemy = ENEMY_TYPES.has(proto.type)
 			m.robot = ROBOT_TYPES.has(proto.type)
 			add_child(m.node)
@@ -312,11 +355,10 @@ func _update(unit: int, proto_id: int, x: int, y: int, rec: Array) -> void:
 		m.height = Visuals.flying_height(proto.type)
 		m.on_rails = ROLLING_STOCK.has(proto.type)
 	var pos := Vector3(x / 256.0, m.height, y / 256.0)
-	var tick := float(_frame_tick)
 	# A train at full speed covers 1.4 tiles a tick: further than TELEPORT between the updates of a
 	# slowed-down mod (`rate`), so the limit grows with the time since the last one.
 	var teleport := maxf(TELEPORT, (tick - m.to_tick) * TRAIN_SPEED)
-	var fresh := m.to_tick < 0.0 or pos.distance_to(m.target) > teleport or tick - m.to_tick > maxf(60.0, clock.gap * 4.0)
+	var fresh := m.to_tick < 0.0 or pos.distance_squared_to(m.target) > teleport * teleport or tick - m.to_tick > stale_gap
 	var changed := fresh
 	if fresh:
 		# New, teleported, or not seen for a second: no gliding from where it was.
@@ -337,7 +379,10 @@ func _update(unit: int, proto_id: int, x: int, y: int, rec: Array) -> void:
 			m.spots.append(m.spots[-1])
 		else:
 			m.key_gap = lerpf(m.key_gap, clampf(since, 1.0, STILL_TICKS), 0.5)
-		m.walked += Vector2(pos.x - m.spots[-1].x, pos.z - m.spots[-1].z).length()
+		var last_spot: Vector3 = m.spots[-1]
+		var wdx := pos.x - last_spot.x
+		var wdz := pos.z - last_spot.z
+		m.walked += sqrt(wdx * wdx + wdz * wdz)
 		m.ticks.append(tick)
 		m.spots.append(pos)
 		changed = true
@@ -353,17 +398,20 @@ func _update(unit: int, proto_id: int, x: int, y: int, rec: Array) -> void:
 	m.to_tick = tick
 	m.target = pos
 	m.proto_id = proto_id
-	m.fixed = Vector2i(x, y)
-	m.oriented = rec.size() >= 5
+	if x != m.fixed.x or y != m.fixed.y:
+		m.fixed = Vector2i(x, y)
+	m.last_orient = orient
+	m.oriented = orient != WireDecode.NO_ORIENTATION
 	var goal_was := m.yaw_goal
 	if m.oriented:
-		m.yaw_goal = Visuals.orientation_yaw(float(rec[4]) / 1000.0)
+		m.yaw_goal = Visuals.orientation_yaw(float(orient) / 1000.0)
 		if fresh:
-			m.node.rotation.y = m.yaw_goal  # appear facing its way, not turning into it
+			m.node.rotation.y = m.yaw_goal  # appear facing its way, not turning into it (C1)
 	else:
-		var step: Vector3 = m.target - m.from
-		if Vector2(step.x, step.z).length() > 0.02:
-			m.yaw_goal = atan2(-step.x, -step.z)
+		var sx := m.target.x - m.from.x
+		var sz := m.target.z - m.from.z
+		if sx * sx + sz * sz > 0.0004:
+			m.yaw_goal = atan2(-sx, -sz)
 	if m.slot >= 0 and (changed or absf(m.yaw_goal - goal_was) > 0.0001):
 		_write(m, fresh)
 
@@ -386,9 +434,9 @@ func _write(m: Mover, fresh: bool) -> void:
 		l0 = records.lag_at(m.slot, now)
 		if m.bot != null:
 			# Robots come every 20 ticks or so: their animation's state is worked out in full.
-			var anim := MoverRecords.robot_anim(records.state(m.slot))
-			c0 = anim.x
-			c1 = anim.w
+			var carry := records.robot_carry(m.slot)
+			c0 = carry.x
+			c1 = carry.y
 	if fresh and m.oriented:
 		yaw0 = m.yaw_goal
 	m.recorded = true
@@ -525,6 +573,20 @@ func _lift_headlights(m: Mover) -> void:
 		h.position.y = y
 
 
+## N1: the vehicle the character is in lights its cones at night, the others stay dark (the bridge
+## doesn't say who drives them); over the hills under it (one height read a frame while lit).
+func _light_vehicles() -> void:
+	for unit in _lit:
+		var m: Mover = _lit[unit]
+		if not is_instance_valid(m.node):
+			continue
+		var beam := _beam if unit == driven else 0.0
+		var ground := 0.0
+		if beam > 0.01:
+			ground = GroundHeight.at(m.node.position.x, m.node.position.z) - m.node.position.y
+		VehicleLights.apply(m.lights, beam, ground)
+
+
 ## Drops a mover at once (it died) instead of waiting for it to stop showing up.
 func remove(unit: int) -> void:
 	var m: Mover = _movers.get(unit)
@@ -535,6 +597,7 @@ func remove(unit: int) -> void:
 		_movers.erase(unit)
 		_node_movers.erase(unit)
 		_waiting.erase(unit)
+		_lit.erase(unit)
 		vehicles.detach(unit)
 
 
@@ -544,6 +607,22 @@ func position_of(unit: int) -> Variant:
 	if m == null:
 		return null
 	return _drawn_now(m)
+
+
+## The prototype id of the mover of one of `types` whose latest sent position is nearest `at` (in
+## 1/256 tile) within half a tile, or 0: what the bridge's `me` `rx`/`ry` name when it is a vehicle.
+func proto_near(at: Vector2i, types: Array) -> int:
+	var best := 0
+	var best_d := 128 * 128 + 1
+	for unit in _movers:
+		var m: Mover = _movers[unit]
+		if not types.has(m.type):
+			continue
+		var d := (m.fixed - at).length_squared()
+		if d < best_d:
+			best_d = d
+			best = m.proto_id
+	return best
 
 
 ## Which way a mover faces as drawn now (radians about up), or 0 for none.
@@ -562,6 +641,12 @@ func yaw_of(unit: int) -> float:
 func node_of(unit: int) -> Node3D:
 	var m: Mover = _movers.get(unit)
 	return m.node if m != null else null
+
+
+## Its prototype's id, or 0 (alt_overlay.gd: a locomotive's fuel icons, K1).
+func proto_id_of(unit: int) -> int:
+	var m: Mover = _movers.get(unit)
+	return m.proto_id if m != null else 0
 
 
 func proto_name_of(unit: int) -> String:
@@ -817,6 +902,7 @@ func _process_movers(delta: float) -> void:
 		if m.shadow != null:
 			m.shadow.position = Vector3(m.node.position.x, 0.03, m.node.position.z) + SHADOW_OFFSET
 			m.shadow.rotation.y = m.node.rotation.y
+	_light_vehicles()
 	Probing.add("mv_move", t0_move)
 	var t0_draw := Time.get_ticks_usec()
 	robots.draw(delta)
@@ -858,7 +944,7 @@ func _to_record(m: Mover, kind: Vector4, flags: int) -> void:
 	_write(m, false)
 
 
-## Rolling stock wears the colour its player gave it, from its record's extra.col.
+## Rolling stock wears the colour its player gave it (H21), from its record's extra.col.
 func _paint(unit: int, m: Mover) -> void:
 	if not m.on_rails or world == null or m.card != null:
 		return
@@ -999,8 +1085,7 @@ func _wheels_of(root: Node3D) -> Array:
 	for child in root.get_children():
 		if child.has_meta("wheel"):
 			var part: ModelLibrary.AnimPart = child.get_meta("wheel")
-			var radius := maxf(part.mesh.get_aabb().size.y * 0.5, 0.05)
-			out.append([child, part, radius, part.kind == "wheel_front"])
+			out.append([child, part, part.wheel_radius(), part.kind == "wheel_front", 0.0])
 	return out
 
 
@@ -1011,7 +1096,6 @@ func _roll_wheels(m: Mover, moved: Vector3, turned: float, delta: float) -> void
 	var distance := moved.dot(forward)
 	if absf(distance) > 2.0:
 		distance = 0.0  # a jump (teleport, new surface)
-	m.roll = fposmod(m.roll - distance / 0.36, TAU)
 	# Steering from how fast it turns for the distance covered (a 1.66-tile wheelbase).
 	var goal := 0.0
 	if absf(distance) > 0.0005:
@@ -1020,8 +1104,11 @@ func _roll_wheels(m: Mover, moved: Vector3, turned: float, delta: float) -> void
 	for w in m.wheels:
 		var mi: MeshInstance3D = w[0]
 		var part: ModelLibrary.AnimPart = w[1]
-		var roll := m.roll * 0.36 / float(w[2])
-		var turn := Basis(Vector3.RIGHT, roll)
+		# Each wheel's own turn, the distance over its radius, wrapped at a whole turn of that wheel
+		# (one turn for them all, wrapped at TAU, made a wheel of another size jump at each wrap).
+		var roll := fposmod(float(w[4]) - distance / float(w[2]), TAU)
+		w[4] = roll
+		var turn := Basis(part.axis, roll)  # about its axle (X): the top turns forward going forward
 		if w[3]:
 			turn = Basis(Vector3.UP, m.steer) * turn
 		mi.transform = part.pivot * Transform3D(turn, Vector3.ZERO) * part.pivot.affine_inverse()

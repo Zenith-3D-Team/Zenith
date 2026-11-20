@@ -112,6 +112,22 @@ function M.run()
       check(true, "send_udp without for_player (single-player)", "a connected client shows \"Self-test from the game\"")
     end
   end
+  -- Binary frames (transport.lua): string.pack and unpack as the mover lists use them, every byte value
+  -- kept (send_udp carries them unchanged: measured in 2.1.24, not documented), and what this client gets.
+  local okp, packed = pcall(function()
+    local bytes = {}
+    for v = 0, 255 do
+      bytes[#bytes + 1] = string.char(v)
+    end
+    local all = table.concat(bytes)
+    local s = string.pack("<i4i8", -2, 2 ^ 40 + 5) .. all
+    local a, b, at = string.unpack("<i4i8", s)
+    return a == -2 and b == 2 ^ 40 + 5 and s:sub(at) == all
+  end)
+  check(okp and packed == true, "string.pack and string.unpack (binary frames)", not okp and packed or nil)
+  local c2 = s.client
+  lines[#lines + 1] = "[Zenith] INFO binary frames: " .. (c2 and c2.bin and ("on, wire version " .. c2.bin)
+    or (settings.global["f3d-binary-messages"].value and "off for this client (its hello doesn't ask)" or "off (map setting)"))
   return lines
 end
 

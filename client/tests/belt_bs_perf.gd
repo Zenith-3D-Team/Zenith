@@ -4,12 +4,13 @@ extends SceneTree
 ## stepping, making records, writing them), line steps a tick and why lines are stepped every tick.
 ##
 ##   godot --headless --path client -s res://tests/belt_bs_perf.gd -- --stream=bs.jsonl [--bundle=N]
-##       [--from=<update>] [--updates=N] [--gd]
+##       [--from=<update>] [--updates=N] [--gd] [--variants=N]
 ##
 ## --bundle: updates a job takes at once (live, a slow job's next one holds every update that came
 ## meanwhile); the simulation is stepped to the last one's tick, as belt_items.gd does. --gd: belt_sim.gd
 ## even when the C++ twin (BeltSimNative) is loaded; the last line's hash of every item's place is the
-## same for both.
+## same for both. --variants=N: every item's model has N variants (items on belts drawn as N kinds each, item_cards.gd
+## lattice_variant), for what that costs the job.
 
 const BeltItems := preload("res://scripts/world/belt_items.gd")
 
@@ -20,6 +21,7 @@ func _initialize() -> void:
 	var from := 0
 	var count := 1 << 30
 	var use_gd := false
+	var variants := 0
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--stream="):
 			stream = a.substr(9)
@@ -31,6 +33,8 @@ func _initialize() -> void:
 			count = int(a.substr(10))
 		elif a == "--gd":
 			use_gd = true
+		elif a.begins_with("--variants="):
+			variants = int(a.substr(11))
 	BeltItems.read_flags(OS.get_cmdline_user_args())  # (the drawing's toggles, --belt-draw-lattice-native=off and the rest)
 	var updates: Array = []
 	var looks := {}  # item id -> a stand-in look (lift, turns, pile), so records are written as live
@@ -52,7 +56,10 @@ func _initialize() -> void:
 			while q + 2 < a2.size():
 				var n := int(a2[q + 2])
 				for e in n:
-					looks[int(a2[q + 3 + e * 4 + 1])] = [Vector3(0.0, 0.1, 0.0), true, 0.07]
+					var item := int(a2[q + 3 + e * 4 + 1])
+					looks[item] = [Vector3(0.0, 0.1, 0.0), true, 0.07, variants]
+					for v in range(1, variants):
+						looks[item + v * BeltItems.ItemCards.VARIANT_STEP] = [Vector3(0.0, 0.1, 0.0), true, 0.07]
 				q += 3 + n * 4
 		if k != cur_k and not cur.is_empty():
 			updates.append(cur)

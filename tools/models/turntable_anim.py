@@ -39,6 +39,7 @@ from scipy import ndimage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import packs  # noqa: E402
 import turntable as tt  # noqa: E402
 
 REPO = tt.REPO
@@ -383,7 +384,7 @@ def run(name):
     e = ENTITIES[name]
     print("%s: cutting %d x %d frames" % (name, e["dirs"], e["frames"]))
     masks = masks_for(e["layers"], e["dirs"], e["frames"])
-    path = os.path.join(tt.MODELS, name + ".glb")
+    path = packs.model_path(name)
     prefix = "anim_turret" if name == "gun-turret" else None
     pts, uv, col, tris, tcol, tuv = load_points(path, prefix=prefix)
     rig = {"big-biter": lambda: BiterRig("big-biter"), "character": CharacterRig, "gun-turret": TurretRig}[name]()
@@ -535,7 +536,7 @@ def fit_gait(fitter, model, nframes, frame_step=2, dir_step=1):
 def run_gait(name):
     e = ENTITIES[name]
     masks = masks_for(e["layers"], e["dirs"], e["frames"])
-    pts, uv, col, tris, tcol, tuv = load_points(os.path.join(tt.MODELS, name + ".glb"))
+    pts, uv, col, tris, tcol, tuv = load_points(packs.model_path(name))
     rig = BiterRig("big-biter") if name == "big-biter" else CharacterRig()
     fitter = Fitter(rig, pts, uv, masks, e["dirs"], e["anchor"])
     free = os.path.join(OUT, name + ".json")

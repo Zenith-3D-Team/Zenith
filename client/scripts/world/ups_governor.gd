@@ -31,6 +31,7 @@ extends Node
 const BeltCaps := preload("res://scripts/world/belt_lanes.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const AddonRequests := preload("res://scripts/addons/addon_requests.gd")
+const PerfLog := preload("res://scripts/world/perf_log.gd")
 
 signal changed
 
@@ -199,9 +200,12 @@ func reset() -> void:
 	ups = 0.0
 	budget = BUDGET_DEFAULT
 	_budget_sent = -1
+	PerfLog.restore("budget", "budget", "Hold 60 UPS off")
 	if level != 0:
+		var before := _held_values()
 		level = 0
 		_caps = {}
+		_log_held(before, "Hold 60 UPS off")
 		changed.emit()
 
 
@@ -209,6 +213,14 @@ func reset() -> void:
 ## Full detail (full_detail.gd, a screenshot): nothing is held back, by the governor or an add-on's
 ## lighter updates, while it lasts.
 static var lifted := false
+## L14: while full detail is on the game's UPS is not judged and no step is taken, and once it ends
+## the readings start afresh (START_DELAY before anything is judged). A screenshot zoomed far out
+## loads for a minute or more with the bridge in photo mode and the game held for the picture, so the
+## UPS sat under LOW and, unseen while `lifted` held everything back, the governor took its whole
+## ladder (the mock: rate level 3, minimap 4x apart, entity distance 64, view distance 5, FPS limit 45),
+## which came into force the moment the shot ended and came back a step at a time over a minute.
+## `--governor-full-detail=judge` judges it as before.
+static var rest_lifted := Settings.arg_value("--governor-full-detail=") != "judge"
 ## A screenshot is loading its chunks (full_detail.gd cover): BUDGET_PHOTO_MAX.
 static var photo := false
 
@@ -276,6 +288,15 @@ func feed(tick: int, delta: float) -> void:
 		budget = BUDGET_DEFAULT  # (sent by _keep_budget now: it differs from what was sent)
 		_budget_for = BUDGET_EVERY
 	_keep_budget(delta)
+	if lifted and rest_lifted:
+		# Full detail (a screenshot loading its view): see rest_lifted. Judged afresh START_DELAY after.
+		_samples.clear()
+		_ready_for = 0.0
+		_low_for = 0.0
+		_high_for = 0.0
+		ups = 0.0
+		ups_long = 0.0
+		return
 	if not enabled or _ready_for < START_DELAY or ups <= 0.0 or loading or _since_load < AFTER_LOAD:
 		_low_for = 0.0
 		_high_for = 0.0
@@ -286,7 +307,7 @@ func feed(tick: int, delta: float) -> void:
 		# The steps bought nothing: the game is slow for its own reasons. Back to the player's
 		# settings, a step at a time, and nothing held back for a while.
 		if level > 0 and _since_step >= PAUSE_DOWN:
-			_step(-1)
+			_step(-1, "the steps bought nothing")
 		return
 	var hold := HOLD_DOWN_AFTER_UP if _clock - _last_up < AFTER_UP else HOLD_DOWN
 	if _low_for >= hold and _since_step >= (PAUSE_DOWN_FAR if ups < FAR_BELOW else PAUSE_DOWN):
@@ -295,13 +316,13 @@ func feed(tick: int, delta: float) -> void:
 				_ups_before = ups
 			if _clock - _last_up < UNDONE:
 				_hold_up = minf(_hold_up * 2.0, HOLD_UP_MAX)
-			_step(1)
+			_step(1, "game at %.1f UPS for %d s" % [ups, roundi(_low_for)])
 		elif _since_step >= NO_GAIN_WAIT and ups < _ups_before + NO_GAIN:
 			_no_gain_until = _clock + NO_GAIN_RETRY
-			_step(-1)
+			_step(-1, "the steps bought nothing")
 	elif _high_for >= _hold_up and _since_step >= _hold_up and level > 0:
 		_last_up = _clock
-		_step(-1)
+		_step(-1, "back at 60 for %d s" % roundi(_high_for))
 
 
 ## Keeps the work budget to the game's room now, so the next request is already paced to it.
@@ -331,6 +352,7 @@ func _keep_budget(delta: float) -> void:
 		elif budget > top:
 			want = maxi(top, int(budget / BUDGET_GROW))
 	budget = want
+	_log_budget()
 	if _budget_sent < 0 or absi(budget - _budget_sent) >= maxi(10, _budget_sent / 10):
 		_budget_sent = budget
 		budget_changed.emit(budget)
@@ -398,7 +420,8 @@ static func _player(knob: String) -> float:
 	return 1.0
 
 
-func _step(dir: int) -> void:
+func _step(dir: int, why := "") -> void:
+	var before := _held_values()
 	if dir > 0:
 		level = _next_down() + 1
 	else:
@@ -410,6 +433,7 @@ func _step(dir: int) -> void:
 	_caps = {}
 	for i in level:
 		_caps[steps[i][0]] = steps[i][1]  # each knob's steps go one way, so the last one taken holds
+	_log_held(before, why)
 	_since_step = 0.0
 	_low_for = 0.0
 	_high_for = 0.0
@@ -426,3 +450,52 @@ func _changes_at(i: int) -> bool:
 		if steps[j][0] == knob:
 			now = limit_with(knob, now, float(steps[j][1]))
 	return absf(limit_with(knob, now, float(steps[i][1])) - now) > 0.001
+
+
+## Each knob's value under the steps taken now, for the player's settings (the performance log's from and to:
+## an add-on's lighter updates and full detail are not the governor's holds).
+func _held_values() -> Dictionary:
+	var out := {}
+	for st: Array in STEPS:
+		var knob: String = st[0]
+		if out.has(knob) or (knob == "updates" and not updates_steps):
+			continue
+		var mine := _player(knob)
+		out[knob] = limit_with(knob, mine, float(_caps[knob])) if _caps.has(knob) else mine
+	return out
+
+
+## The performance log (perf_log.gd, the HUD's warning icon): one entry per knob whose value changed, a
+## knob back at the player's own value restored.
+func _log_held(before: Dictionary, why: String) -> void:
+	var after := _held_values()
+	for knob: String in after:
+		var was := float(before.get(knob, after[knob]))
+		var now := float(after[knob])
+		if absf(now - was) < 0.001:
+			continue
+		if absf(now - _player(knob)) < 0.001:
+			PerfLog.restore("ups", knob, why)
+		else:
+			PerfLog.note("ups", knob, LABELS[knob], _knob_text(knob, was), _knob_text(knob, now), why)
+
+
+static func _knob_text(knob: String, v: float) -> String:
+	if knob == "fps" and v <= 0.0:
+		return "unlimited"
+	return str(int(v)) if v == floorf(v) else str(v)
+
+
+## The work budget in the performance log, without the icon: one entry when it first goes under the default,
+## the lowest kept, restored once back at the default (not for a budget pinned with --bridge-budget=).
+func _log_budget() -> void:
+	if budget < BUDGET_DEFAULT and not Settings.has_arg("--bridge-budget="):
+		if PerfLog.is_open("budget", "budget"):
+			var open := PerfLog.find_open("budget", "budget")
+			if budget < int(open["to"]):
+				PerfLog.lower("budget", "budget", str(budget))
+		else:
+			var why := "game at %.1f UPS" % ups if ups > 0.0 else "a first load"
+			PerfLog.note("budget", "budget", "bridge's work budget %s units a tick", str(BUDGET_DEFAULT), str(budget), why, false)
+	elif budget >= BUDGET_DEFAULT and PerfLog.is_open("budget", "budget"):
+		PerfLog.restore("budget", "budget", "back at %d" % BUDGET_DEFAULT)

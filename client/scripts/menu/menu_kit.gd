@@ -311,6 +311,34 @@ static func textbox(text: String, placeholder := "") -> LineEdit:
 	return e
 
 
+## Factorio's message box: a window with the text in a shallow frame and an OK button, on a dimmed
+## overlay(). `scroll` puts the text in a scroll box (a long report). Returns [overlay, OK button];
+## the caller adds the overlay where it shows and says what OK does.
+static func message(title: String, text: String, scroll := false) -> Array:
+	var o := overlay(0.35)
+	o.name = "Message"
+	var parts := window(title)
+	overlay_center(o).add_child(parts[0])
+	var box: VBoxContainer = parts[1]
+	var inner := Kit.panel("FShallowFrame")
+	var pad := MarginContainer.new()
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, Kit.px(12))
+	if scroll:
+		var sc := ScrollContainer.new()
+		sc.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		sc.custom_minimum_size = Kit.pxv(540, mini(420, 22 * (text.count("\n") + 2)))
+		sc.add_child(paragraph(text, 520))
+		pad.add_child(sc)
+	else:
+		pad.add_child(paragraph(text, 520))
+	inner.add_child(pad)
+	box.add_child(inner)
+	var row: Array = dialog_buttons("", "OK")
+	box.add_child(row[0])
+	return [o, row[2]]
+
+
 ## A label that wraps, for explanations in dialogs.
 static func paragraph(text: String, width := 460) -> Label:
 	var l := Label.new()

@@ -32,6 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "tools"))
+import packs  # noqa: E402
 import turntable as tt  # noqa: E402
 
 OUT = os.path.join(tt.OUT, "creatures")
@@ -189,7 +190,7 @@ def _centred(render, mask):
 
 def score(model, anim, frame, cam, per_frame=False, path=None, opts=None):
     opts = opts or {}
-    path = path or os.path.join(tt.MODELS, model + ".glb")
+    path = path or packs.model_path(model)
     tris, cols = tt.load_glb(path, exclude=opts.get("exclude"))
     dirs = direction_count(anim)
     used = opts.get("dirs") or list(range(0, dirs, opts.get("step", 1)))
@@ -260,7 +261,7 @@ def main(argv):
     cam = tt.Camera(anchor=0.0, size=tt.CANVAS)
     report = {}
     for model in names or [k for k in refs if k not in space]:
-        if model not in refs or not os.path.exists(os.path.join(tt.MODELS, model + ".glb")):
+        if model not in refs or not os.path.exists(packs.model_path(model)):
             print("%s: no model or no reference" % model)
             continue
         anim, frame, note, opts = refs[model]

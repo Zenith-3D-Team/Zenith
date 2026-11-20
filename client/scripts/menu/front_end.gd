@@ -1,10 +1,10 @@
 extends CanvasLayer
 ## The game's front end, like Factorio's: the main menu over a live 3D scene (Continue, Single
 ## player → New game / Load game, Multiplayer → Host new game / Host saved game / Connect to
-## address, Settings, Mods, Add-ons, About, Exit), the saves (date, preview; Load, Delete), the map
+## address, Settings, Mods, Add-ons, Model packs, About, Exit), the saves (date, preview; Load, Delete), the map
 ## generator (map_generator_window.gd), starting the headless server (server_launcher.gd) with
 ## Factorio-style progress, connecting the bridge, the in-game Esc menu (Resume, Save game, Save
-## as, Load game, Settings, Add-ons, Exit to menu, Quit game), the settings window, the mods list
+## as, Load game, Settings, Add-ons, Model packs, Exit to menu, Quit game), the settings window, the mods list
 ## (mods_window.gd), the add-ons (addons_window.gd) and the credits.
 ##
 ## main.gd creates it. With --factorio-port / --port (or other options that only make sense in a
@@ -46,7 +46,15 @@ const ColorFilter := preload("res://scripts/menu/color_filter.gd")
 const MapGen := preload("res://scripts/menu/map_gen.gd")
 const MapGeneratorWindow := preload("res://scripts/menu/map_generator_window.gd")
 const ModsWindow := preload("res://scripts/menu/mods_window.gd")
+const ModChoices := preload("res://scripts/menu/mod_choices.gd")
 const AddonsWindow := preload("res://scripts/menu/addons_window.gd")
+const ModelPacksWindow := preload("res://scripts/menu/model_packs_window.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
+const BackdropRecorder := preload("res://scripts/menu/backdrop_recorder.gd")
+const BackdropList := preload("res://scripts/menu/backdrop_list.gd")
+const BACKDROP_TIP := "What the main menu shows behind it: Zenith's own factory, or one of the views you recorded in your games"
+const BACKDROP_RECORD_TIP := "Record this spot as it is now (the camera's view and a few seconds of what moves) and show it behind the main menu"
+const MODEL_PACKS_TIP := "Which 3D models Zenith draws: the packs in use and their order, and a pack for any one model"
 const AddonRequests := preload("res://scripts/addons/addon_requests.gd")
 const GameSwap := preload("res://scripts/menu/game_swap.gd")
 const Rcon := preload("res://scripts/menu/rcon.gd")
@@ -87,8 +95,14 @@ var _page: Control = null
 var _overlays: Array[Control] = []
 var _background: Node3D = null
 var _sfx: Node = null
-var _progress: Dictionary = {}  # "root", "label", "bar" while a progress window shows
+var _progress: Dictionary = {}  # "root", "label", "bar", "cancel" while a progress window shows
 var _esc_menu: Control = null
+## A backdrop recording from the Esc menu is under way (backdrop_recorder.gd).
+var _recording_backdrop := false
+## The recording's entry in the list once it is done: {"id", "name", "taken"} (backdrop_list.gd).
+var _backdrop_entry := {}
+## Seconds till the open Esc menu's backdrop button is checked again (greyed while the join loads).
+var _backdrop_button_check := 0.0
 var _settings: Control = null
 var _connect_started := 0
 var _ready_since := 0
@@ -103,6 +117,9 @@ var _quit_after_exit := false
 var _played_seconds := 0.0
 ## The saves page's purpose: "load" (play it here) or "host" (open it to the network).
 var _worlds_mode := "load"
+## Load game's "Sync mods with save" (Factorio's words): the save with exactly its own mods, without
+## those turned on in the Mods window. Off each time the page opens.
+var _sync_with_save := false
 ## The performance test while it runs (perf_test.gd), and what this program's own frames were
 ## before it (kept low meanwhile, so the window behind the test's Zenith costs next to nothing).
 var _perf: Node = null
@@ -230,8 +247,12 @@ func _process(delta: float) -> void:
 				_server_died()
 				return
 			_played_seconds += delta
+			_check_backdrop_recording()
+			_refresh_backdrop_button(delta)
 			if main != null and main.hud != null and not main.hud.ui.show_factorio.is_valid():
 				main.hud.ui.show_factorio = _show_factorio
+			if main != null and main.hud != null and not main.hud.ui.show_model_packs.is_valid():
+				main.hud.ui.show_model_packs = open_model_packs
 			if _esc_after >= 0.0 and _played_seconds >= _esc_after:
 				_esc_after = -1.0
 				_toggle_esc_menu()
@@ -336,6 +357,16 @@ func _show_background(on: bool) -> void:
 		_sfx = null
 
 
+## The menu's background made again: the backdrop chosen, or the models changed (a swapped model
+## pack shows at once, for a modeller trying their models).
+func _rebuild_background() -> void:
+	if _background == null:
+		return
+	_background.get_parent().remove_child(_background)  # (its name free for the new one at once)
+	_show_background(false)
+	_show_background(true)
+
+
 ## Factorio's main menu, or one of its submenus ("single", "multi") in the same window.
 func _show_main_menu(sub := "") -> void:
 	var page := Control.new()
@@ -411,6 +442,8 @@ func _show_main_menu(sub := "") -> void:
 			add.call("Settings", func() -> void: _show_settings(""))
 			add.call("Mods", _show_mods, "The mods the server plays with")
 			add.call("Add-ons", func() -> void: _show_addons(""), "Zenith's add-ons: switch them on and off, their settings and keys")
+			add.call("Model packs", _show_model_packs, MODEL_PACKS_TIP)
+			add.call("Menu backdrop", _show_backdrop_window, BACKDROP_TIP)
 			if Settings.dev_tools():
 				add.call("Performance test", _show_perf_test, PERF_TIP)
 			add.call("Report a bug", _report_bug, BUG_TIP)
@@ -455,6 +488,7 @@ func _show_main_menu(sub := "") -> void:
 func _show_worlds(mode := "load") -> void:
 	_worlds_mode = mode
 	_worlds_dir = {}
+	_sync_with_save = false
 	_list_worlds()
 	var page := MenuKit.overlay(0.0)
 	page.name = "Worlds"
@@ -649,6 +683,7 @@ static func _source_heading(source: String) -> String:
 func _fill_details() -> void:
 	var dbox: VBoxContainer = _page.find_child("Details", true, false)
 	for c in dbox.get_children():
+		dbox.remove_child(c)  # at once, so the new SyncMods and ModsNote keep their names
 		c.queue_free()
 	var load: Button = _page.find_child("Load", true, false)
 	var delete: Button = _page.find_child("Delete", true, false)
@@ -688,6 +723,27 @@ func _fill_details() -> void:
 	var note := MenuKit.paragraph(where, 344)
 	note.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
 	dbox.add_child(note)
+	# The save's mods, with the Mods window's added, as Factorio adds the mods turned on to a save it
+	# loads; Sync mods with save loads exactly the save's (server_launcher.gd).
+	var sync := MenuKit.checkbox("Sync mods with save", _sync_with_save)
+	sync.name = "SyncMods"
+	sync.tooltip_text = "Load with exactly the mods the save was made with, at its versions"
+	sync.toggled.connect(func(on: bool) -> void:
+		Sfx.play_ui("gui-checkbox-click")
+		_sync_with_save = on
+		_fill_details.call_deferred())  # not inside the box's own signal: it is taken out
+	dbox.add_child(sync)
+	var chosen := ModChoices.added(ModChoices.states())
+	var mods_text := "Loads with the save's own mods."
+	if _sync_with_save:
+		mods_text = "Loads with exactly the save's mods, at its versions."
+	elif not chosen.is_empty():
+		var names := ", ".join(chosen.slice(0, 6)) + (" and %d more" % (chosen.size() - 6) if chosen.size() > 6 else "")
+		mods_text = "Loads with the save's own mods and those turned on in the Mods window: %s." % names
+	var mods_note := MenuKit.paragraph(mods_text, 344)
+	mods_note.name = "ModsNote"
+	mods_note.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+	dbox.add_child(mods_note)
 
 
 func _latest_server_save() -> String:
@@ -711,9 +767,9 @@ func _load_selected() -> void:
 			_show_message("Error", "Couldn't copy %s into %s." % [s["path"], Paths.saves_dir()])
 			return
 	if _worlds_mode == "host":
-		_show_host({"save": path})
+		_show_host({"save": path, "sync": _sync_with_save})
 	else:
-		_launch(path)
+		_launch(path, {}, _sync_with_save)
 
 
 func _confirm_delete() -> void:
@@ -810,7 +866,7 @@ func _show_host(host: Dictionary) -> void:
 		spec["password"] = password.text
 		if host.has("save"):
 			_clear_overlays()
-			_launch(str(host["save"]), spec)
+			_launch(str(host["save"]), spec, bool(host.get("sync", false)))
 		else:
 			_pop_overlay()
 			_show_new_game(spec), "gui-green-confirm")
@@ -818,7 +874,7 @@ func _show_host(host: Dictionary) -> void:
 
 
 ## The Add-ons menu (addons_window.gd): every add-on, its settings and keys; `select` opens one's
-## page. From the main menu, the Esc menu and the Settings list.
+## page. From the main menu and the Esc menu (N7: not in Settings).
 func _show_addons(select := "") -> void:
 	var o := MenuKit.overlay(0.35)
 	o.name = "Addons"
@@ -830,6 +886,300 @@ func _show_addons(select := "") -> void:
 		_overlays.erase(o)
 		o.queue_free())
 	_push_overlay(o)
+
+
+## The Model packs window (model_packs_window.gd, M7): the packs, their order, a pack for any one
+## model. From the main menu and the Esc menu (N7: not in Settings); in a game its changes are drawn at once.
+func _show_model_packs() -> void:
+	open_model_packs("", "")
+
+
+## The Model packs window on `pack`'s models with family `fam` shown ("" both: as it opens from the
+## menus): the entity info's pack symbol (N8, factorio_ui.gd show_model_packs).
+func open_model_packs(pack: String, fam: String) -> void:
+	var o := MenuKit.overlay(0.35)
+	o.name = "ModelPacks"
+	var window := ModelPacksWindow.new()
+	window.world = main.get("world") if main != null and state == State.PLAYING else null
+	if pack != "":
+		window.start_on(pack, fam)
+	MenuKit.overlay_center(o).add_child(window)
+	var packs_were := ModelPacks.version
+	window.closed.connect(func() -> void:
+		_overlays.erase(o)
+		o.queue_free()
+		# The menu's world isn't drawn again when the packs change (world.gd's chunks keep their models).
+		if ModelPacks.version != packs_were and state == State.MENU:
+			_rebuild_background())
+	_push_overlay(o)
+
+
+## The main menu's Menu backdrop: what the menu shows behind it; the saved backdrops (backdrop_list.gd),
+## newest first under Default (Zenith's own), each with its name (edited in place), Use and Delete, the
+## one in use marked; Open folder; and how to record another.
+func _show_backdrop_window() -> void:
+	var o := MenuKit.overlay(0.35)
+	o.name = "MenuBackdrop"
+	var parts := MenuKit.window("Menu backdrop")
+	MenuKit.overlay_center(o).add_child(parts[0])
+	var box: VBoxContainer = parts[1]
+	var entries := BackdropList.entries()
+	var using := BackdropList.in_use()
+	var chosen := MenuBackground.chosen_path()
+	var shown := "Zenith's own factory (the default)."
+	# (A missing or broken file: Default is what shows, so Default is marked.)
+	var readable := false
+	if chosen != "":
+		var snap := BackdropRecorder.read(chosen)
+		readable = not snap.is_empty()
+		var called := _backdrop_name(entries, using, snap)
+		shown = ("\"%s\"." % called) if not snap.is_empty() else "Zenith's own factory: \"%s\" can't be read." % called
+	if MenuBackground.force_default:
+		shown += " (--menu-backdrop=default: the default this time.)"
+	var text := "Shown now: " + shown
+	text += "\n\nIn a game: Esc > Use this view as the menu backdrop adds the view to this list. The camera stays where you left it, and what moves there moves behind the menu too."
+	var label := MenuKit.paragraph(text, 560)
+	label.name = "Shown"
+	box.add_child(label)
+	var head := HBoxContainer.new()
+	head.add_theme_constant_override("separation", Kit.px(8))
+	box.add_child(head)
+	var title := Kit.label("Backdrops", "FHeading")
+	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	head.add_child(title)
+	var open := MenuKit.button("Open folder")
+	open.name = "OpenFolder"
+	open.tooltip_text = "The folder your backdrops are saved in"
+	_on(open, func() -> void: BackdropList.open_folder())
+	head.add_child(open)
+	var deep: Array = Kit.deep_scroll(Kit.pxv(560, 300))
+	box.add_child(deep[0])
+	var list := VBoxContainer.new()
+	list.name = "Buttons"
+	list.add_theme_constant_override("separation", Kit.px(4))
+	list.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	deep[1].add_child(list)
+	_backdrop_row(list, BackdropList.DEFAULT, "Default: Zenith's own factory", not readable)
+	for e: Dictionary in entries:
+		_backdrop_row(list, str(e["id"]), str(e["name"]), readable and str(e["id"]) == using)
+	var from_world := MenuKit.menu_button("Choose from a world…")
+	from_world.name = "ChooseFromAWorld"
+	from_world.tooltip_text = "Load a save, go to the spot you want, then Esc > Use this view as the menu backdrop (your own Factorio saves are copied first, never changed)"
+	_on(from_world, func() -> void:
+		_clear_overlays()
+		_show_worlds("load"))
+	box.add_child(from_world)
+	var row: Array = MenuKit.dialog_buttons("Back", "")
+	box.add_child(row[0])
+	_on(row[1], _pop_overlay, "gui-back")
+	_push_overlay(o)
+
+
+## One backdrop in the window's list: its name (a text box for a saved one: Enter or leaving it renames
+## it), Use (greyed "In use" for the one shown) and Delete (asks first).
+func _backdrop_row(list: Container, id: String, called: String, in_use: bool) -> void:
+	var row := HBoxContainer.new()
+	row.name = "Default" if id == BackdropList.DEFAULT else id
+	row.add_theme_constant_override("separation", Kit.px(8))
+	row.set_meta("in_use", in_use)
+	list.add_child(row)
+	if id == BackdropList.DEFAULT:
+		var label := Kit.label(called)
+		label.name = "Name"
+		label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		row.add_child(label)
+	else:
+		var edit := MenuKit.textbox(called)
+		edit.name = "Name"
+		edit.max_length = BackdropList.NAME_MAX
+		edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		edit.tooltip_text = "Its name: click to change it"
+		var renamed := func() -> void:
+			if is_instance_valid(edit) and edit.text.strip_edges() != called:
+				BackdropList.rename(id, edit.text)
+		var submitted := func(_t: String) -> void:
+			renamed.call()
+			edit.release_focus()
+		edit.text_submitted.connect(submitted)
+		edit.focus_exited.connect(renamed)
+		row.add_child(edit)
+	var use := MenuKit.button("In use" if in_use else "Use", "FGreenButton" if not in_use else "")
+	use.name = "Use"
+	use.disabled = in_use
+	use.tooltip_text = "Shown behind the main menu now" if in_use else "Show this behind the main menu"
+	_on(use, _choose_backdrop.bind(id))
+	row.add_child(use)
+	if id != BackdropList.DEFAULT:
+		var delete := MenuKit.button("Delete", "FRedButton")
+		delete.name = "Delete"
+		delete.tooltip_text = "Delete this backdrop's file"
+		_on(delete, func() -> void:
+			var shown := BackdropList.name_of(id)
+			_show_confirm("Delete backdrop", "Delete \"%s\"? Its file is deleted for good." % (shown if shown != "" else called), "Delete", func() -> void:
+				var was_shown := MenuBackground.chosen_path() == BackdropList.path_of(id)
+				if not BackdropList.delete(id):
+					_show_message("Error", "Couldn't delete %s." % BackdropList.path_of(id).get_file())
+				if was_shown:
+					_rebuild_background()
+				_pop_overlay()
+				_show_backdrop_window(), true))
+		row.add_child(delete)
+	else:
+		# (Default can't be deleted: a gap the width of Delete keeps the Use buttons in one column.)
+		var gap := Control.new()
+		gap.custom_minimum_size = Kit.pxv(108, 28)
+		row.add_child(gap)
+
+
+func _choose_backdrop(id: String) -> void:
+	BackdropList.use(id)
+	_rebuild_background()
+	_pop_overlay()
+	_show_backdrop_window()
+
+
+## The name the window gives the one in use: from the list, or for the old setting's file its save.
+static func _backdrop_name(entries: Array, id: String, snap: Dictionary) -> String:
+	for e: Dictionary in entries:
+		if str(e["id"]) == id:
+			return str(e["name"])
+	return BackdropList.default_name(str(snap.get("save", "")), int(snap.get("taken", 0)))
+
+
+## The Esc menu's "Use this view as the menu backdrop": records the spot the camera shows
+## (backdrop_recorder.gd) behind a short progress box; the game's input is off meanwhile.
+func _record_backdrop() -> void:
+	var rec = main.get("backdrop_recorder") if main != null else null
+	var rig = main.get("rig") if main != null else null
+	if rec == null or rig == null or _recording_backdrop or rec.recording():
+		return  # (one at a time: a second press while one records does nothing)
+	var save := launcher.save_path.get_file().get_basename() if session == "launched" and launcher.save_path != "" else session_address
+	var avatar = main.get("avatar")
+	var now := int(Time.get_unix_time_from_system())
+	# A new file each time (--menu-backdrop-save=overwrite: the one in use replaced, as before 0.2.2).
+	var using := BackdropList.in_use()
+	var id := using if BackdropList.overwrite and BackdropList.valid_id(using) else BackdropList.new_id(now)
+	var called := BackdropList.default_name(save, now)
+	var info := {"save": save, "name": called, "puppet": int(avatar.unit) if avatar != null else 0}
+	if not rec.done.is_connected(_on_backdrop_done):
+		rec.done.connect(_on_backdrop_done)
+		rec.failed.connect(_on_backdrop_failed)
+		rec.progress.connect(_on_backdrop_progress)
+	_close_esc_menu()
+	if _join_loading():
+		_show_message("Menu backdrop", "The view can't be recorded yet: the game is still loading.")
+		return
+	DirAccess.make_dir_recursive_absolute(BackdropList.dir)
+	rec.path = BackdropList.path_of(id)
+	if not rec.record(rig.focus_point(), BackdropRecorder.camera_dict(rig.camera), info):
+		_show_message("Menu backdrop", "The view can't be recorded yet: the game is still loading.")
+		return
+	_backdrop_entry = {"id": id, "name": called, "taken": now}
+	_recording_backdrop = true
+	main.set_game_input(false)
+	var cancel := func() -> void:
+		rec.cancel()
+		_end_backdrop_recording()
+	_show_progress("Menu backdrop", "Recording the view…", 0.0, false, cancel)
+
+
+## A recording that stopped without saying so (a script error in its end, or record() called from
+## elsewhere): the progress box goes and the game's input comes back, never left waiting.
+func _check_backdrop_recording() -> void:
+	if not _recording_backdrop:
+		return
+	var rec = main.get("backdrop_recorder") if main != null else null
+	if rec == null or not rec.recording():
+		print("backdrop: the recording stopped without a word: the game's input is back")
+		_end_backdrop_recording()
+
+
+func _on_backdrop_progress(fraction: float) -> void:
+	if _recording_backdrop:
+		_set_progress("Recording the view…", fraction)
+		# 1.0: the file is being written on the worker, and a cancel now would only drop the signal
+		# while the file is still replaced, so Cancel goes grey rather than seem to work.
+		if fraction >= 1.0 and _progress.get("cancel") is Button:
+			(_progress["cancel"] as Button).disabled = true
+			(_progress["cancel"] as Button).tooltip_text = "The recording is being saved: a moment"
+
+
+func _end_backdrop_recording() -> void:
+	_recording_backdrop = false
+	_hide_progress()
+	if state == State.PLAYING and main != null and _esc_menu == null:
+		main.set_game_input(true)
+
+
+## (The recorder's advance(), on the main thread, once a recording: a log line after each step, so a
+## hang here shows where it stopped. The owner's second recording in one session froze after "recorded".)
+func _on_backdrop_done(_path: String) -> void:
+	if not _recording_backdrop:
+		print("backdrop: done heard with no recording under way: ignored")
+		return
+	if OS.get_thread_caller_id() != OS.get_main_thread_id():
+		push_error("backdrop: done heard off the main thread")
+		_on_backdrop_done.call_deferred(_path)
+		return
+	_end_backdrop_recording()
+	print("backdrop: done 1/3: the progress box gone, the game's input back")
+	# (Only the menu reads it: main.gd's listener leaves interface/backdrop alone, where it used to
+	# apply every game setting again over every chunk while the world still streamed in.)
+	var entry := _backdrop_entry
+	_backdrop_entry = {}
+	var id := str(entry.get("id", _path.get_file().trim_suffix(BackdropList.EXT)))
+	BackdropList.add(id, str(entry.get("name", BackdropList.OLD_NAME)), int(entry.get("taken", Time.get_unix_time_from_system())))
+	BackdropList.use(id)
+	print("backdrop: done 2/3: listed and the setting saved (interface/backdrop = %s)" % id)
+	_show_message("Menu backdrop", "Saved. It shows at the main menu.")
+	print("backdrop: done 3/3")
+
+
+const JOIN_STREAM_SECONDS := 20.0
+
+
+## The join still loading: the loading screen up, or the chunks round the view not all drawn yet
+## (the first stream after it, world.gd square_drawn). A recording waits till it is over.
+func _join_loading() -> bool:
+	if state != State.PLAYING or main == null:
+		return true
+	if _played_seconds >= JOIN_STREAM_SECONDS or Settings.arg_value("--backdrop-wait=") == "off":
+		return false  # (a view at the map's edge, whose square never fills, can still be recorded)
+	var world = main.get("world")
+	return world != null and world.has_method("square_drawn") and not world.square_drawn(BackdropRecorder.RADIUS)
+
+
+## The Esc menu's backdrop button: greyed (with why) while it can't record, else its normal tooltip.
+func _set_backdrop_button(button: Button) -> void:
+	button.tooltip_text = BACKDROP_RECORD_TIP
+	button.disabled = main.get("backdrop_recorder") == null or main.get("rig") == null or _recording_backdrop \
+		or main.backdrop_recorder.recording()
+	if _recording_backdrop:
+		button.tooltip_text = "Recording the view: a moment"
+	elif _join_loading():
+		button.disabled = true
+		button.tooltip_text = "The game is still loading: a moment"
+
+
+## While the Esc menu stays open with the backdrop button greyed, it is checked again about 4 times
+## a second (the join's square drawn, or its 20 s over): enabled without closing and reopening.
+func _refresh_backdrop_button(delta: float) -> void:
+	_backdrop_button_check -= delta
+	if _esc_menu == null or _backdrop_button_check > 0.0 or main == null:
+		return
+	_backdrop_button_check = 0.25
+	var button := _esc_menu.find_child("UseAsBackdrop", true, false) as Button
+	if button != null and button.disabled:
+		_set_backdrop_button(button)
+
+
+func _on_backdrop_failed(reason: String) -> void:
+	if not _recording_backdrop:
+		return
+	_end_backdrop_recording()
+	_show_message("Menu backdrop", "The view wasn't recorded: %s. Try again in a moment." % reason)
 
 
 func _show_mods() -> void:
@@ -970,8 +1320,7 @@ func _show_hybrid() -> void:
 ## settings; then the client's own Camera and Factorio) with Back; each page opens alone ("Graphics
 ## settings") with Back to the list and Confirm. `tab` opens that page straight away.
 const SETTINGS_PAGES := [["Graphics", "Graphics"], ["Controls", "Controls"], ["Sounds", "Sound"], ["Interface", "Interface"],
-	["Other", "Other"], ["Mod settings", "Mod settings"], ["Camera", "Camera"], ["Factorio install", "Factorio"],
-	["Add-ons", "Add-ons"]]
+	["Other", "Other"], ["Mod settings", "Mod settings"], ["Camera", "Camera"], ["Factorio install", "Factorio"]]
 
 
 func _show_settings(tab: String) -> void:
@@ -998,10 +1347,7 @@ func _show_settings(tab: String) -> void:
 		var b := MenuKit.menu_button(str(page[0]))
 		b.name = "Page" + str(page[1]).replace(" ", "")
 		var which := str(page[1])
-		if which == "Add-ons":  # its own window (addons_window.gd), over the list
-			_on(b, func() -> void: _show_addons(""))
-		else:
-			_on(b, func() -> void: _show_settings_page(which, o, close_all))
+		_on(b, func() -> void: _show_settings_page(which, o, close_all))
 		buttons.add_child(b)
 	var row: Array = MenuKit.dialog_buttons("Back", "")
 	box.add_child(row[0])
@@ -1035,21 +1381,9 @@ func _show_settings_page(tab: String, list: Control, close_all: Callable) -> voi
 
 
 func _show_message(title: String, text: String) -> void:
-	var o := MenuKit.overlay(0.35)
-	var parts := MenuKit.window(title)
-	MenuKit.overlay_center(o).add_child(parts[0])
-	var box: VBoxContainer = parts[1]
-	var inner := Kit.panel("FShallowFrame")
-	var pad := MarginContainer.new()
-	for side in ["left", "top", "right", "bottom"]:
-		pad.add_theme_constant_override("margin_" + side, Kit.px(12))
-	pad.add_child(MenuKit.paragraph(text, 520))
-	inner.add_child(pad)
-	box.add_child(inner)
-	var row: Array = MenuKit.dialog_buttons("", "OK")
-	box.add_child(row[0])
-	_on(row[2], _pop_overlay)
-	_push_overlay(o)
+	var parts: Array = MenuKit.message(title, text)
+	_on(parts[1], _pop_overlay)
+	_push_overlay(parts[0])
 	print("menu: %s: %s" % [title, text.replace("\n", " | ")])
 
 
@@ -1261,7 +1595,7 @@ func _show_progress(title: String, text: String, fraction: float, opaque: bool, 
 	box.add_child(row[0])
 	_on(row[1], on_cancel if on_cancel.is_valid() else _cancel_launch, "gui-back")
 	_root.add_child(o)
-	_progress = {"root": o, "label": label, "bar": bar}
+	_progress = {"root": o, "label": label, "bar": bar, "cancel": row[1]}
 	if _page != null:
 		_page.visible = false
 
@@ -1307,7 +1641,8 @@ func _create_and_launch(save_name: String, map_settings: Variant, seed_text: Str
 	_launch(path, host)
 
 
-func _launch(path: String, host := {}) -> void:
+## `exact_mods`: Load game's Sync mods with save (the save's mods only, none of the Mods window's).
+func _launch(path: String, host := {}, exact_mods := false) -> void:
 	if state != State.MENU:
 		return
 	state = State.BUSY
@@ -1316,7 +1651,7 @@ func _launch(path: String, host := {}) -> void:
 		_show_progress(("Hosting " if not host.is_empty() else "Loading ") + path.get_file().get_basename(), "Starting server…", 0.05, false)
 	else:
 		_set_progress("Starting server…", 0.3)
-	var ok: bool = await launcher.start(path, host)
+	var ok: bool = await launcher.start(path, host, exact_mods)
 	if state != State.BUSY:
 		return  # cancelled meanwhile
 	if not ok:
@@ -1428,6 +1763,11 @@ func _update_connecting() -> void:
 	main.set_game_input(true)
 	print("menu: in the game (%s, %d chunks, %d s after ready%s)" % [session_address, chunks, waited / 1000,
 		", %d still preparing" % left if left > 0 else ""])
+	if session == "launched" and main.get("hud") != null:
+		if not launcher.added_mods.is_empty():
+			main.hud.show_message("Mods from the Mods window added to this game: " + ", ".join(launcher.added_mods))
+		if not launcher.left_out_mods.is_empty():
+			main.hud.show_message("Left out from the Mods window: " + "; ".join(launcher.left_out_mods))
 	if Settings.arg_value("--menu=").get_slice(":", 0) in ["esc", "save-as", "settings"]:
 		_toggle_esc_menu()
 		if Settings.arg_value("--menu=") == "save-as":
@@ -1465,6 +1805,7 @@ func _leave_game(save: bool) -> void:
 	state = State.BUSY
 	_close_esc_menu()
 	_clear_overlays()
+	_recording_backdrop = false  # (main.gd end_game stops the recording)
 	if main != null:
 		main.end_game()
 	if remote_rcon != null:
@@ -1563,6 +1904,16 @@ func _toggle_esc_menu() -> void:
 	addon_button.tooltip_text = "Zenith's add-ons: their settings and keys"
 	_on(addon_button, func() -> void: _show_addons(""))
 	buttons.add_child(addon_button)
+	var packs_button := MenuKit.menu_button("Model packs")
+	packs_button.name = "ModelPacks"
+	packs_button.tooltip_text = MODEL_PACKS_TIP
+	_on(packs_button, _show_model_packs)
+	buttons.add_child(packs_button)
+	var backdrop_button := MenuKit.menu_button("Use this view as the menu backdrop")
+	backdrop_button.name = "UseAsBackdrop"
+	_set_backdrop_button(backdrop_button)
+	_on(backdrop_button, _record_backdrop)
+	buttons.add_child(backdrop_button)
 	var bug := MenuKit.menu_button("Report a bug")
 	bug.name = "ReportABug"
 	bug.tooltip_text = BUG_TIP

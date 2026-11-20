@@ -19,6 +19,7 @@ extends SceneTree
 ## straight lanes had no simulated item near them (holes).
 
 const BeltSim := preload("res://scripts/world/belt_sim.gd")
+const NativeLibrary := preload("res://scripts/native_library.gd")
 const DEFAULT := "res://tests/data/belt_sim_small.json"
 const KEY_OFF := 8 * 100000000
 const UID_OFF := 1 << 34
@@ -56,7 +57,7 @@ static func prio(v: Variant) -> int:
 ## belt_sim.gd ("gd"), its C++ twin ("native", null when its extension isn't loaded), or the one
 ## belt_items.gd would use ("").
 static func make_sim(which: String) -> RefCounted:
-	var has_native := ClassDB.class_exists("BeltSimNative")
+	var has_native := NativeLibrary.ensure()
 	if which == "native" and not has_native:
 		printerr("BeltSimNative isn't loaded (client/native/bin: docs/RUNNING.md)")
 		return null

@@ -2,6 +2,60 @@
 
 Newest first. Versions before 0.4.5 are summarised from Zenith's history.
 
+## 0.5.3 (with Zenith 0.2.3)
+
+Tuned default ambient occlusion.
+
+- SSAO defaults updated to radius 1.7, intensity 2.45, and power 2.0 (was 1.75 / 1.75 / 1.6 in 0.5.2 and
+  1.4 / 1.5 / 1.6 before), used both by default on indirect light and with "Occlusion in sunlight too" on.
+- "Occlusion in sunlight too" stays off by default.
+
+## 0.5.2 (with Zenith 0.2.3)
+
+Ambient occlusion where light says it goes: on the shade.
+
+- Ambient occlusion darkens indirect light (the sky's, the shade) and only a little of the sun's (`ssao_light_affect`
+  0.15; Zenith's own looks 0.85), and models' and the ground's own occlusion no longer darkens their sunlit sides
+  (look key `ao_direct` 0). Sunlit walls no longer go grey in corners; the shade at a machine's foot stays.
+- The clouds drawn in the sky follow the debug menu's Sun and Ambient energy (Zenith's `look_scene_light`): at 0 and 0 they
+  are dark like the rest of the sky.
+- Radius 1.75 and strength 1.75 (were 1.4 and 1.5), a little wider and stronger, since it now acts on the shade alone.
+- Bounce light (SSIL) stays off by default, on its own switch.
+- New setting, off: "Occlusion in sunlight too" gives 0.5.1's occlusion back. On a Zenith without `ao_direct` the key is
+  ignored: models' own occlusion still darkens their sunlit sides there.
+
+## 0.5.1 (with Zenith 0.2.3)
+
+Models show a lit side and a shaded one again.
+
+- The sun that crosses the sky now stands in the north-west at noon (`sun_noon_yaw` -135), the side Factorio's
+  sprites are lit from, and rises in the east and sets in the west across the north. Zenith's own noon sun stood
+  high behind the default view, so every side of a model the camera sees was lit: the modeller's stone and ore
+  rocks (full metal, so mostly the reflection of a light that also follows the sun) drew flat and bright, where
+  the Factorio look, its sun held in the west, shows them a lit side and a shaded one. Shadows now fall towards
+  the bottom right of the screen at noon, as Factorio's do.
+- The same with "Sunrise and sunset" at 0 (the sun that fades without setting).
+- New setting, on: "Noon sun from the north-west". Off gives the sun before 0.5.1. "The sun crosses the sky"
+  off holds the sun where the Factorio look has it, as before.
+- On a Zenith without `sun_noon_yaw` the key is ignored: the old noon sun.
+
+## 0.5.0 (with Zenith 0.2.3)
+
+Steadier, sharper shadows by default.
+
+- "Soft shadows" (on by default) now gives wider, even shadow edges (`shadow_edge` 0.04 tiles, twice
+  Zenith's Factorio edge) instead of a sun 1.4 degrees wide. That sun turned on Godot's contact-hardening
+  shadows (PCSS), whose blocker search with few taps left holes in thin shadows (wires, a pole's
+  lattice), a grain that slid over the ground as the camera moved, and stair-steps where things touch
+  the ground.
+- New, off by default: "Shadows soften with distance" brings those shadows back, at a "Sun size" of 0.5
+  degrees (the real sun's; 0.1-1.4, 1.4 being the old look). Zenith gives them a shorter, denser search
+  (24 + 24 taps on Shadows: High and Ultra, a pancake of 8 tiles); still grainy below High, smoothest
+  with temporal anti-aliasing.
+- Needs add-on API 1.7 (Zenith 0.2.3 or later), which added `shadow_edge`.
+
+Not yet seen in a window.
+
 ## 0.4.5 (with Zenith 0.2.1)
 
 The same picture for less GPU time.

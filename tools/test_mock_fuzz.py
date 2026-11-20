@@ -15,6 +15,7 @@ import traceback
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import mock_server  # noqa: E402
+import protocol  # noqa: E402
 
 # A FAIL line can hold any character: on Windows, output to a file or pipe is in the system's code page,
 # and one character it lacks stopped the run with UnicodeEncodeError.
@@ -37,9 +38,19 @@ def junk(rng, depth=0):
 
 
 class Silent(mock_server.MockGame):
-    def send_raw(self, msg):  # no socket: just check the message can be encoded
-        json.dumps(msg)
+    def send_raw(self, msg):  # no socket: just check the message can be encoded (and decoded, as frames)
+        if self.client and self.client.get("bin"):
+            msg["k"] = self.tick
+            data = protocol.encode_datagram([protocol.encode_message(msg)])
+            BINARY["frames"] += 1
+            if protocol.split_datagram(data) != [json.loads(json.dumps(msg))] and msg.get("t") != "mv":
+                raise AssertionError(f"a {msg.get('t')} frame doesn't decode as its JSON")
+        else:
+            json.dumps(msg)
         return 0
+
+
+BINARY = {"frames": 0}  # messages encoded as binary frames (the hellos every other 300 rounds ask)
 
 
 def main():
@@ -72,8 +83,10 @@ def main():
             game.build_starter_base()
             game.on_message({"t": "hello", "v": 1, "sid": "fuzz", "w": 0}, ADDR)
         if i % 300 == 0:
-            game.on_message({"t": "hello", "v": 1, "sid": "fuzz", "w": 1}, ADDR)
+            game.on_message({"t": "hello", "v": 1, "sid": "fuzz", "w": 1, "bin": 1 if i % 600 else 0}, ADDR)
     print(f"{args.rounds} rounds over {len(COMMANDS)} commands (seed {args.seed})")
+    if not BINARY["frames"]:
+        errors["binary frames"] = "none were encoded"
     for t, e in sorted(errors.items()):
         print(f"FAIL: {t}: {e}")
     if errors:

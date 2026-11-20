@@ -34,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import creature_pose as cp  # noqa: E402
 import creature_score as cs  # noqa: E402
+import packs  # noqa: E402
 import turntable as tt  # noqa: E402
 import turntable_anim as ta  # noqa: E402
 
@@ -54,7 +55,7 @@ def smoothstep(e0, e1, x):
 def knees(model, rig):
     """[(knee point, reach)] per limb, from the model's vertices as creature_pose.write_posed reads
     them, so the shader's knee folds the leg where the attack and corpse models were folded."""
-    src = cp._read_glb(os.path.join(tt.MODELS, model + ".glb"))
+    src = cp._read_glb(packs.model_path(model))
     v = np.concatenate([s[1] for s in src])
     uv = np.concatenate([s[3] for s in src])
     limb = np.round(uv[:, 0]).astype(int) - 1
@@ -161,7 +162,7 @@ class Fit:
         self.ndirs = cs.direction_count(anim)
         self.anim = anim
         self._masks = {}
-        pts, uv, _c, _t, _tc, _tu = ta.load_points(os.path.join(tt.MODELS, model + ".glb"))
+        pts, uv, _c, _t, _tc, _tu = ta.load_points(packs.model_path(model))
         self.pts, self.uv = pts, uv
         self.rig = WalkRig(model, groups_of(ta.RIGS[model]))
         self.fitter = ta.Fitter(self.rig, pts, uv, [], self.ndirs, 0.0)

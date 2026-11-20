@@ -43,7 +43,7 @@ var _meshes := {}  # Vector2i chunk -> MeshInstance3D
 var _dirty := {}  # Vector2i -> true
 var _material: ShaderMaterial
 var _spans := 0
-## The remote view's fog (remote_fog.gd): wires starting in chunks no radar sees are hidden.
+## The remote view's fog (remote_fog.gd): wires starting in chunks no radar sees are hidden (G18).
 var fog: Node
 var _fogged := false
 

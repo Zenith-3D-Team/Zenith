@@ -11,6 +11,7 @@ local crafting = require("scripts.crafting")
 local pedia = require("scripts.pedia")
 local planners = require("scripts.planners")
 local budget = require("scripts.budget")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -190,7 +191,50 @@ end
 ---------------------------------------------------------------------------------------------
 -- Commands
 
--- Starts researching a technology, or adds it to the end of the queue.
+-- What 2.1.24's add_research takes at most (measured in real headless 2.1.24: the eighth is refused); only
+-- for the message saying why one was refused.
+local QUEUE_MAX = 7
+
+-- The technologies a technology waits for that are neither researched nor queued, all the way down, each
+-- after its own (prerequisites by their order, then name): what has to be queued before it (L12).
+local function missing_prerequisites(f, tech)
+  local have = {}
+  for _, n in ipairs(queue_names(f)) do
+    have[n] = true
+  end
+  local current = f.current_research
+  if current then
+    have[current.name] = true
+  end
+  local out = {}
+  local function visit(t)
+    local pres = {}
+    for _, pre in pairs(t.prerequisites) do
+      pres[#pres + 1] = pre
+    end
+    table.sort(pres, function(a, b)
+      if a.order ~= b.order then
+        return a.order < b.order
+      end
+      return a.name < b.name
+    end)
+    for _, pre in ipairs(pres) do
+      if not (pre.researched or have[pre.name]) then
+        have[pre.name] = true
+        visit(pre)
+        out[#out + 1] = pre
+      end
+    end
+  end
+  visit(tech)
+  return out
+end
+
+-- Starts researching a technology, or adds it to the end of the queue. Factorio's add_research takes one
+-- only once its prerequisites are researched or queued before it, and never a trigger technology (one
+-- unlocked by doing its task); its technology screen queues what is missing first. So does this (L12,
+-- `/f3d-perf research_chain`): the missing prerequisites in order, then the technology, or nothing at all
+-- if one of them can't be queued.
 function M.research(cmd)
   local f = force()
   local name = type(cmd.name) == "string" and cmd.name or ""
@@ -198,8 +242,31 @@ function M.research(cmd)
   if not (tech and shown(tech) and tech.enabled and not tech.researched) then
     return puppet.message("Can't research " .. name)
   end
-  if not f.add_research(name) then
-    puppet.message("Can't research " .. name .. " yet")
+  local need = perf.on("research_chain") and missing_prerequisites(f, tech) or {}
+  for _, pre in ipairs(need) do
+    if trigger(pre) ~= "" or not pre.enabled then
+      puppet.message("Can't research " .. name .. " yet: " .. pre.name
+        .. (pre.enabled and " is unlocked by doing its task" or " isn't available"))
+      return send_status()
+    end
+  end
+  local before = queue_names(f)
+  need[#need + 1] = tech
+  for i, t in ipairs(need) do
+    if not f.add_research(t) then
+      local full = #queue_names(f) >= QUEUE_MAX
+      if i > 1 then
+        -- What this command queued comes off again (the first in the queue is the current research).
+        f.research_queue = before
+      end
+      if full then
+        puppet.message(#need > 1 and ("Research queue full: " .. name .. " needs " .. (#need - 1) .. " more queued first")
+          or "Research queue full")
+      else
+        puppet.message("Can't research " .. name .. " yet")
+      end
+      break
+    end
   end
   send_status()
 end

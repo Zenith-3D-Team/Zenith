@@ -33,6 +33,7 @@ local map = require("scripts.map")
 local rate = require("scripts.rate")
 local belt_sim = require("scripts.belt_sim")
 local perf = require("scripts.perf")
+local tracker = require("scripts.tracker")
 
 local M = {}
 
@@ -885,7 +886,7 @@ local function emit(round, now, period, lanes_left)
   end
   -- Like `mv`, every update is the full list, split into parts that share the tick `k`. Each part
   -- says which square it covers, so the client hands over to the far lane icons exactly where
-  -- these items stop rather than round its own focus, which runs ahead while panning, and
+  -- these items stop rather than round its own focus, which runs ahead while panning (G16), and
   -- `p`, the ticks between updates, so the client draws items far enough behind to glide evenly,
   -- and `w`, the work units the update took (w / p a tick; with what a round cut short for time
   -- would have needed), which Moving belt items' Automatic keeps within its share of the tick.
@@ -1113,7 +1114,7 @@ end
 -- (fewer at a slower `rate`), round and round, and a chunk is sent only when what its lanes carry changed:
 -- {t = "bfar", cx, cy, l = [x, y (1/256 tile), direction, lane 1 item id, lane 2 item id, ...],
 -- c = [lane 1 count, lane 2 count, ...]}, 0 for an empty lane; an empty l clears the chunk. The
--- counts (items on that lane of that belt, at most 4) let the client draw a full belt full,
+-- counts (items on that lane of that belt, at most 4) let the client draw a full belt full (G17),
 -- and h how high to pile them when there are more items than that (stack inserters' stacks). By
 -- items, not stacks: counted by stacks, a lane of a few stacks of 4 drew a few icons with holes
 -- between them, which from afar read as gaps on a full belt (owner: "we didn't have gaps in 0.1.1").
@@ -1129,7 +1130,7 @@ local FAR_MIN_BELTS = 10
 -- Finding a chunk's belts costs about a twentieth of reading them.
 local FAR_FIND_PER_BELT = 20
 -- Chunks this far past r are read too (a chunk's half diagonal is 23): the round is fixed round the
--- focus where it began, and while the camera pans chunks coming into r must already be there.
+-- focus where it began, and while the camera pans chunks coming into r must already be there (G17).
 local FAR_MARGIN = 48
 
 -- The round in progress (queue, next; cur, the chunk being read: {key, c, belts, i, l, counts, piles,
@@ -1137,8 +1138,31 @@ local FAR_MARGIN = 48
 -- changed only from on_tick and commands.
 local function far_state()
   local s = storage.f3d
-  s.far = s.far or { queue = {}, next = 1, sent = {} }
+  s.far = s.far or { queue = {}, next = 1, sent = {}, empty = {} }
+  s.far.empty = s.far.empty or {}
   return s.far
+end
+
+-- Re-check chunks cached as having no belts every this many rounds (catches script-spawned belts;
+-- normal builds/mines clear the chunk at once through tracker.listeners).
+local FAR_EMPTY_EVERY = 10
+
+tracker.listeners[#tracker.listeners + 1] = function(entity)
+  if not (entity and entity.valid and registry.BELT_SET[entity.type]) then
+    return
+  end
+  local p = entity.position
+  local key = floor(p.x / 32) .. "," .. floor(p.y / 32)
+  if storage.f3d and storage.f3d.far and storage.f3d.far.empty then
+    storage.f3d.far.empty[key] = nil
+  end
+  if storage.f3d_clients then
+    for _, cs in pairs(storage.f3d_clients) do
+      if cs.far and cs.far.empty then
+        cs.far.empty[key] = nil
+      end
+    end
+  end
 end
 
 -- A full lane holds 4 items (or stacks) a belt.
@@ -1147,6 +1171,9 @@ local FAR_MAX_COUNT = 4
 -- The item a lane carries most of, by id (0: empty), how many icons it gets (its items, at most
 -- FAR_MAX_COUNT) and how high they are piled (the items over those icons, rounded up: 1 to MAX_STACK).
 local function lane_item(line)
+  if #line == 0 then
+    return 0, 0, 1
+  end
   local best, most, all = nil, 0, 0
   for _, it in pairs(line.get_contents()) do
     all = all + it.count
@@ -1170,19 +1197,30 @@ local function far_find(surface, types, key, c)
       belts[#belts + 1] = belt
     end
   end
-  return { key = key, c = c, belts = belts, i = 1, l = {}, counts = {}, piles = {} }, #found
+  return { key = key, c = c, belts = belts, i = 1, l = {}, counts = {}, piles = {}, bin = transport.binary(2) or nil }, #found
 end
 
 -- Reads up to `budget` of the chunk's belts; returns how many it read. Each belt's numbers are
 -- written as text as it is read: turning a busy chunk's 5,000 numbers into text at its end cost
--- 7 ms in one tick (2.1.23, the owner's save).
-local function far_read(cur, budget)
+-- 7 ms in one tick (2.1.23, the owner's save). For a client that gets binary frames (cur.bin) they
+-- stay numbers, packed at the end (string.pack: about 31 ns a number). `sq` (optional, for a belt-simulating
+-- client): belts strictly inside the simulation's square are already drawn moving, so skip reading them.
+local function far_read(cur, budget, sq)
   -- A chunk half read in a save from before piles (0.1.1) has none: the save keeps its client, and
   -- this runs for it until that client times out or says hello again (far_reset).
   cur.piles = cur.piles or {}
+  local bin = transport.binary(2)
+  if (cur.bin or false) ~= bin then
+    -- (The client's hello changed the format while the chunk was half read: read again from its start.)
+    cur.i, cur.l, cur.counts, cur.piles, cur.stacked, cur.bin = 1, {}, {}, {}, nil, bin or nil
+  end
   local belts, l, counts, piles = cur.belts, cur.l, cur.counts, cur.piles
   local small = transport.small
   local read = 0
+  local sx, sy, sr
+  if sq then
+    sx, sy, sr = sq[1], sq[2], sq[3] - 1
+  end
   while read < budget and cur.i <= #belts do
     local belt = belts[cur.i]
     cur.i = cur.i + 1
@@ -1190,22 +1228,54 @@ local function far_read(cur, budget)
     -- (A belt belt_sim loads outside its square (area trace) has no icons: its items are drawn moving.)
     if belt.valid and not belt_sim.hidden(belt.unit_number) then
       local p = belt.position
+      if not (sx and math.abs(p.x - sx) < sr and math.abs(p.y - sy) < sr) then
       local a, na, ha = lane_item(belt.get_transport_line(1))
       local b, nb, hb = lane_item(belt.get_transport_line(2))
       if a ~= 0 or b ~= 0 then
-        l[#l + 1] = world.fixed(p.x) .. "," .. world.fixed(p.y) .. "," .. small[belt.direction] .. ","
-          .. (small[a] or a) .. "," .. (small[b] or b)
-        counts[#counts + 1] = small[na] .. "," .. small[nb]
-        piles[#piles + 1] = small[ha] .. "," .. small[hb]
+        if bin then
+          local m = #l
+          l[m + 1], l[m + 2], l[m + 3], l[m + 4], l[m + 5] = world.fixed(p.x), world.fixed(p.y), belt.direction, a, b
+          m = #counts
+          counts[m + 1], counts[m + 2] = na, nb
+          piles[m + 1], piles[m + 2] = ha, hb
+        else
+          l[#l + 1] = world.fixed(p.x) .. "," .. world.fixed(p.y) .. "," .. small[belt.direction] .. ","
+            .. (small[a] or a) .. "," .. (small[b] or b)
+          counts[#counts + 1] = small[na] .. "," .. small[nb]
+          piles[#piles + 1] = small[ha] .. "," .. small[hb]
+        end
         cur.stacked = cur.stacked or ha > 1 or hb > 1
+      end
       end
     end
   end
   return read
 end
 
+-- A binary chunk's blocks (docs/PROTOCOL.md, kind 18): l, c, then h (empty when no lane is piled).
+local function far_blocks(cur)
+  local out = {}
+  for _, list in ipairs({ cur.l, cur.counts, cur.stacked and #cur.piles == #cur.counts and cur.piles or {} }) do
+    out[#out + 1] = string.pack("<BI4", 4, #list)
+    transport.pack_runs(out, list, 1, #list, 4)
+  end
+  return table.concat(out)
+end
+
 -- A chunk read whole: sent if what its lanes carry changed.
 local function far_finish(cur, far_sent)
+  if cur.bin and transport.binary(2) then
+    -- (Packed in pcall: a number string.pack refuses sends the chunk as text, below, its lists joined.)
+    local ok, sig = pcall(far_blocks, cur)
+    if ok then
+      -- (An empty chunk never sent is not sent: as the text's ";".)
+      if sig ~= (far_sent[cur.key] or (#cur.l == 0 and sig)) then
+        far_sent[cur.key] = sig
+        transport.send_frame(transport.KIND_BFAR, "bfar", string.pack("<I4i4i4", game.tick, cur.c[1], cur.c[2]) .. sig)
+      end
+      return
+    end
+  end
   local l, counts = table.concat(cur.l, ","), table.concat(cur.counts, ",")
   -- How high each lane's stacks are piled, only where some are (a stack inserter's).
   local h = cur.stacked and #cur.piles == #cur.counts and (',"h":[' .. table.concat(cur.piles, ",") .. "]") or ""
@@ -1260,7 +1330,8 @@ function M.far_tick()
   -- and the far distance, round the square's middle: once the square reaches that far there is nothing
   -- to read (with the belt item distance equal to the far one, the client's own, every chunk once
   -- loaded). Joining, after a jump or with the square cut the icons fill in as before.
-  local bs_lanes = s.client and s.client.bs and perf.on("far_lanes")
+  local far_opt = perf.on("far_lanes")
+  local bs_lanes = s.client and s.client.bs and far_opt
   local cover = bs_lanes and belt_sim.covered()
   if cover and cover[3] >= r then
     if far.cur or far.next <= #far.queue then
@@ -1273,6 +1344,8 @@ function M.far_tick()
       return
     end
     far.started = game.tick
+    far.rounds = (far.rounds or 0) + 1
+    local recheck = far.rounds % FAR_EMPTY_EVERY == 0
     -- The next round: subscribed chunks within r, nearest first; forget chunks no longer subscribed
     -- (the client dropped them, so they are sent again when they come back).
     local f = s.focus
@@ -1297,6 +1370,8 @@ function M.far_tick()
         and y0 + 0.5 > sq[2] - sq[3] + 1 and y0 + 31.5 < sq[2] + sq[3] - 1 then
         far.sent[key] = nil
         M.counts.far_skipped = M.counts.far_skipped + 1
+      elseif far_opt and not recheck and far.empty[key] and not far.sent[key] then
+        M.counts.far_skipped = M.counts.far_skipped + 1
       elseif not outside and dx * dx + dy * dy <= (r + FAR_MARGIN) * (r + FAR_MARGIN) then
         far.queue[#far.queue + 1] = { key, c, dx * dx + dy * dy }
       end
@@ -1308,15 +1383,21 @@ function M.far_tick()
         far.sent[key] = nil
       end
     end
+    for key in pairs(far.empty) do
+      if not s.subs[key] then
+        far.empty[key] = nil
+      end
+    end
   end
   local surface = world.surface()
+  local read_sq = bs_lanes and (cover or belt_sim.square()) or nil
   -- Slowed down (rate.lua): rounds start less often and read fewer belts a tick.
   local per = M.far_belts_per_tick
   local budget = math.max(math.min(FAR_MIN_BELTS, per), math.floor(per / rate.factor("lanes")))
   while budget > 0 do
     local cur = far.cur
     if cur then
-      budget = budget - far_read(cur, budget)
+      budget = budget - far_read(cur, budget, read_sq)
       if cur.i > #cur.belts then
         far.cur = nil
         -- A chunk the client dropped meanwhile is left for when it comes back.
@@ -1330,6 +1411,9 @@ function M.far_tick()
       if s.subs[entry[1]] then
         local found
         far.cur, found = far_find(surface, types, entry[1], entry[2])
+        if far_opt then
+          far.empty[entry[1]] = #far.cur.belts == 0 or nil
+        end
         budget = budget - math.max(1, ceil(found / FAR_FIND_PER_BELT))
       end
     else

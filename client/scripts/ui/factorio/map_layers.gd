@@ -23,12 +23,12 @@ const TURRET := Color(0.95, 0.15, 0.1)
 const ROBOT := Color(1.0, 0.9, 0.55)
 ## Copper wires between poles, with the electric layer (Factorio draws them over the supply areas).
 const WIRE := Color(0.95, 0.72, 0.35, 0.9)
-## Pollution: each chunk tinted by how much it holds, stronger on a log scale.
+## Pollution: each chunk tinted by how much it holds, stronger on a log scale (owner's C12).
 const POLLUTION := Color(0.85, 0.12, 0.05)
 const POLLUTION_FULL := 10000.0  # this much (and more) is the strongest tint
-## Vulcanus' demolisher territories' borders.
+## Vulcanus' demolisher territories' borders (owner's #4).
 const TERRITORY := Color(0.9, 0.12, 0.08, 0.85)
-## Their ground, striped across as Factorio's map marks a hazard: a light red wash with
+## Their ground, striped across as Factorio's map marks a hazard (G20): a light red wash with
 ## stronger diagonal bands, a stripe and a gap at least this many screen pixels.
 const TERRITORY_WASH := Color(0.9, 0.12, 0.08, 0.1)
 const TERRITORY_STRIPE := Color(0.9, 0.12, 0.08, 0.26)
@@ -68,7 +68,7 @@ const UNSEEN := Color(0, 0, 0, 0.4)
 ## drew every layer up to four times a second, 15-20 ms each time on a big base: the stutter
 ## standing still), in drawing order: the four coverage areas (each in its CanvasGroup), then
 ## `shade` (unseen chunks dimmed, pollution, territories), `wires`, `trains` and `marks` (robots,
-## signals, stops and recipe icons, last: over the coverage areas).
+## signals, stops and recipe icons, last: over the coverage areas, C11).
 const LAYERS := ["construction", "logistic", "electric", "turret", "shade", "wires", "trains", "marks"]
 var _groups := {}  # kind -> [CanvasGroup, Control]
 var _canvas := {}  # layer -> its Control
@@ -498,7 +498,7 @@ static func stripe_period(scale: float) -> float:
 	return period
 
 
-## Demolisher territories' ground: each chunk washed red with diagonal bands (x + y in a
+## Demolisher territories' ground (G20): each chunk washed red with diagonal bands (x + y in a
 ## stripe's half of the period) that run on unbroken from chunk to chunk; the borders go over them.
 func _draw_territories(c: Control) -> void:
 	var half := size / 2.0 / scale_px + _slack()
@@ -666,5 +666,5 @@ func _draw_marks() -> void:
 					marks.draw_rect(Rect2(p - Vector2(3, 3), Vector2(6, 6)), Color(0.95, 0.3, 0.25))
 					if show_text and font != null and str(r[3]) != "":
 						var at := p + Vector2(6, font_size * 0.35)
-						# Names with icons ([item=...]) draw them, as Factorio's map does.
+						# Names with icons ([item=...]) draw them, as Factorio's map does (G8).
 						RichText.draw(marks, font, at, str(r[3]), font_size, Color.WHITE, maxi(2, font_size / 5))

@@ -11,6 +11,7 @@ import json
 import math
 import pathlib
 import re
+import struct
 import sys
 
 from lupa import lua52
@@ -85,12 +86,25 @@ def tick(n=1):
         F.tick()
 
 
+# --binary: every hello asks for binary frames (`bin`, docs/PROTOCOL.md "Binary frames"), so every check
+# below reads the bridge's binary messages (mv, bs, bfar) through protocol.py's decoder instead of JSON.
+BINARY = "--binary" in sys.argv
+binary_kinds = set()
+
+
 def send(msg, port=CLIENT_PORT):
+    if BINARY and msg.get("t") == "hello" and "bin" not in msg:
+        msg = {**msg, "bin": protocol.WIRE_VERSION}
     F.packet(json.dumps(msg), port)
 
 
 expected_r = 1
 most_batched = 0  # the most messages seen in one datagram (a client whose hello says b)
+
+
+def sent_data(item):
+    """A sent datagram's bytes or text: fake_factorio hands a binary one (transport.lua's frames) over as hex."""
+    return bytes.fromhex(item[2]) if item[3] else item[2]
 
 
 def take():
@@ -99,11 +113,17 @@ def take():
     global expected_r
     out = []
     for item in F.take_sent().values():
-        port, data = item[1], item[2]
+        port, data = item[1], sent_data(item)
         check(port == CLIENT_PORT, f"sent to wrong port {port}")
         check(len(data) <= MAX_DATAGRAM, f"datagram too large: {len(data)} bytes")
         global most_batched
         lines = protocol.split_datagram(data)
+        if isinstance(data, bytes):
+            at = 2
+            while at + 6 <= len(data):
+                kind, _, length = struct.unpack_from("<BBI", data, at)
+                binary_kinds.add(kind)
+                at += 6 + length
         most_batched = max(most_batched, len(lines))
         for msg in lines:
             for problem in protocol.problems(msg):
@@ -203,9 +223,70 @@ over = {name: (ep.get(pid[name]) or [0] * 5)[4:] for name in ("inserter", "robop
 check(over["inserter"] == [{"ip": [0, -1], "id": [0, 1.2], "rs": 0.014, "es": 0.035}] and over["roboport"] == [{"lr": 25, "cr": 55}]
       and over["offshore-pump"] == [{"fb": [[0, -0.5, 0, "o"]]}],
       f"eprops' overlay: inserter pickup and drop and hand speeds, roboport areas, fluid connections: {over}")
+# N9: a storage tank's pipeline joins (`fj`, its four connections from its fluid box prototype), never `fb` (no arrows on
+# tanks); a pipe and a pipe to ground carry `pc` on their records instead, and get neither.
+tank_ep = ((ep.get(pid["storage-tank"]) or [0] * 5)[4:] or [{}])[0]
+pipe_eps = [next((x for x in (ep.get(pid[n]) or [])[4:5] if isinstance(x, dict)), {}) for n in ("pipe", "pipe-to-ground")]
+check(tank_ep.get("fj") == [[-1, -1, 0, "b"], [1, 1, 4, "b"], [1, 1, 8, "b"], [-1, -1, 12, "b"]] and "fb" not in tank_ep
+      and all("fj" not in x and "fb" not in x for x in pipe_eps),
+      f"N9: eprops' fj: a storage tank's four pipeline joins, no fb; none on a pipe or pipe to ground: {tank_ep} {pipe_eps}")
 ore_ep = (ep.get(pid["iron-ore"]) or [0] * 5)[4:]
-check(ore_ep == [{"ms": "base/sound/axe-mining-test"}] and pid["tree-01"] not in ep,
+check(ore_ep == [{"ms": "base/sound/axe-mining-test", "rk": "basic-solid"}] and pid["tree-01"] not in ep,
       f"J11: eprops carries an entity's own mining sound (zenith-mining-sounds), none for those without: {ore_ep}")
+# Step 5 task 3a: the steps' sounds (zenith-step-sounds) go after eprops, in parts each well under the
+# smallest byte budget a tick (4096), the sounds first; names become ids, and a name the game hasn't is left out.
+STEP_BUDGET = 4096
+
+
+def steps_of(msgs):
+    """The whole `steps` list from its parts: (parts, sounds, {key: [records]}, u)."""
+    parts = of_type(msgs, "steps")
+    sounds, lists, u, nv = [], {k: [] for k in ("tl", "el", "dl", "al")}, None, None
+    for m in parts:
+        sounds += m.get("s", [])
+        for k in lists:
+            lists[k] += m.get(k, [])
+        u = m.get("u", u)
+        nv = m.get("nv", nv)
+    return parts, sounds, lists, u, nv
+
+
+kinds = [m["t"] for m in msgs]
+st_parts, st_sounds, st_lists, st_u, st_nv = steps_of(msgs)
+check(len(st_parts) >= 2 and [m["part"] for m in st_parts] == list(range(1, len(st_parts) + 1))
+      and all(m["parts"] == len(st_parts) for m in st_parts)
+      and all(len(json.dumps(m, separators=(",", ":"))) < STEP_BUDGET for m in st_parts),
+      f"steps: in numbered parts, each under {STEP_BUDGET} bytes: {[len(json.dumps(m)) for m in st_parts]}")
+check("eprops" in kinds and kinds.index("steps") > kinds.index("eprops") and kinds.index("steps") < kinds.index("iuse") if "iuse" in kinds
+      else "eprops" in kinds and "steps" in kinds and kinds.index("steps") > kinds.index("eprops"),
+      "steps: sent after eprops, in the same handshake stage")
+tid = {rec[1]: rec[0] for m in of_type(msgs, "tprotos") for rec in m["l"]}
+did = {n: lua.eval(f'function() return package.loaded["scripts.registry"].decorative_id("{n}") end')() for n in ("brown-asterisk",)}
+iid = lua.eval('function() return package.loaded["scripts.registry"].item_id("power-armor") end')()
+step_sound = {k: dict((r[0], r[1:] if k == "al" else r[1]) for r in v) for k, v in st_lists.items()}
+check(len(st_sounds) == 86 and st_sounds[0] == ["base/sound/walking/grass", 80, 10]
+      and st_sounds[3] == [["my-mod/sound/clank.ogg", "my-mod/sound/clonk.ogg"], 50, 2] and st_u == [4, 0],
+      f"steps: every sound once in order, a mod's files as a list; u the utility sounds: {st_sounds[:4]} {st_u}")
+check(st_nv == [5, 1], f"steps: nv the night vision equipment's two sounds: {st_nv}")
+check(step_sound["tl"] == {tid["grass-1"]: 1, tid["water"]: 0, tid["concrete"]: 2}
+      and step_sound["el"] == {pid["straight-rail"]: 3, pid["iron-ore"]: 4}
+      and step_sound["dl"] == {did["brown-asterisk"]: 5} and step_sound["al"] == {iid: [6, 0]},
+      f"steps: tiles (water silent, an unknown name left out), rails and resources, decoratives, armours by id: {step_sound}")
+# L8: a drill's resource categories and that it needs a resource under it; a pumpjack's output arrow shows (no
+# fo: its output is always there, a burner drill's has no fluid box); crude oil marked while a pumpjack is held.
+pj_ep = (ep.get(pid["pumpjack"]) or [0] * 5)[4:]
+oil_ep = (ep.get(pid["crude-oil"]) or [0] * 5)[4:]
+burner_ep = (ep.get(pid["burner-mining-drill"]) or [0] * 5)[4:]
+check(pj_ep and pj_ep[0].get("rk") == ["basic-fluid"] and pj_ep[0].get("rr") == 1 and "fo" not in pj_ep[0]
+      and pj_ep[0].get("fb") == [[1, -1, 0, "o"]] and pj_ep[0].get("mr") == 0.49,
+      f"L8: the pumpjack's eprops: what it mines, needs a resource, its output shown (no fo): {pj_ep}")
+check(oil_ep and oil_ep[0].get("rk") == "basic-fluid" and oil_ep[0].get("hl") == 1
+      and burner_ep and burner_ep[0].get("rk") == ["basic-solid"] and "hl" not in ore_ep[0],
+      f"L8: crude oil is marked for a held pumpjack (hl), ore isn't; a burner drill mines basic-solid: {oil_ep} {burner_ep}")
+# A resource that needs fluid to be mined carries rf (uranium ore's sulfuric acid); ore that doesn't, none.
+uran_ep = (ep.get(pid["uranium-ore"]) or [0] * 5)[4:]
+check(uran_ep and uran_ep[0].get("rf") == 1 and uran_ep[0].get("rk") == "basic-solid" and "rf" not in ore_ep[0],
+      f"eprops: uranium ore needs fluid to be mined (rf 1), iron ore doesn't: {uran_ep} {ore_ep}")
 # K1, K2: where Alt-mode draws an entity's icon (icon_draw_specification, when not the default) and
 # the rows of its modules and a lab's packs (icons_positioning; Factorio's defaults without one).
 alt_ep = {name: ((ep.get(pid[name]) or [0] * 5)[4:] or [{}])[0] for name in ("assembling-machine-1", "lab", "beacon", "wooden-chest", "inserter")}
@@ -215,6 +296,16 @@ check(alt_ep["assembling-machine-1"].get("ids") == [0, -0.3, 1]
       and alt_ep["beacon"].get("isq") == [["m", 0, 0, 0.5, 2, 2, 1.1, -0.3]] and "ids" not in alt_ep["lab"]
       and alt_ep["wooden-chest"].get("ids") == [0, 0, 0.7] and "isq" not in alt_ep["wooden-chest"] and "ids" not in alt_ep["inserter"],
       f"K1, K2: eprops' ids and isq: a machine's icon shift, its modules' row (defaults), a lab's packs and modules, a beacon's: {alt_ep}")
+# K1's leftover: an ammo turret's ammo and a locomotive's fuel, by their icons_positioning as 2.1.24 gives them
+# (the gun turret's {0, -0.25}, the locomotive's {0, 0.3} three a row); an ammo turret without one, the defaults.
+stock_ep = {name: next((x for x in (ep.get(pid[name]) or [])[4:5] if isinstance(x, dict)), {}) for name in ("gun-turret", "locomotive", "car")}
+alt_mode_mod0 = lua.eval('package.loaded["scripts.alt_mode"]')
+plain_turret = to_py(alt_mode_mod0.sequences(lua.table_from({"name": "k1-plain-turret", "type": "ammo-turret",
+                                                             "selection_box": lua.table_from([lua.table_from([-1.5, -1.5]), lua.table_from([1.5, 1.5])])})))
+check(stock_ep["gun-turret"].get("isq") == [["a", 0, -0.25, 0.5, 2, 1, 1.1, -0.1]]
+      and stock_ep["locomotive"].get("isq") == [["f", 0, 0.3, 0.5, 3, 4, 1.1, -0.1]] and "isq" not in stock_ep["car"]
+      and plain_turret == [["a", 0, 0.7, 0.5, 4, 2, 1.1, -0.1]],
+      f"K1: eprops' isq has a gun turret's ammo row and a locomotive's fuel row, an ammo turret without one the defaults, a car none: {stock_ep} {plain_turret}")
 wall_ep = (ep.get(pid["stone-wall"]) or [0] * 5)[4:]
 check(wall_ep and wall_ep[0].get("rsd") == "base/sound/manual-repair-simple" and "rsd" not in ((ep.get(pid["iron-ore"]) or [0] * 5)[4:] or [{}])[0],
       f"K13: eprops carries an entity's own repair sound (rsd), none for those without: {wall_ep}")
@@ -894,6 +985,17 @@ far00 = [m for m in sent if (m["cx"], m["cy"]) == (0, 0)]
 check(far00 and len(far00[0]["l"]) == 10 and steps and max(steps) <= 1,
       f"bfar: a chunk is read a slice of belts a tick and sent whole: steps {steps}, {far00[:1]}")
 belt_mod.far_belts_per_tick = 100
+# Belt-free chunks are cached in far.empty and cleared immediately when a belt is built there.
+send({"t": "sub", "c": [[0, 0], [1, 0], [2, 0], [9, 9]]})
+tick(200)
+take()
+far_empty_cached = bool(g.storage.f3d.far.empty["2,0"])
+e_far_new = g.game.surfaces[1].create_entity(lua.table(name="transport-belt", position=lua.table(x=70.5, y=4.5), force="player"))
+g.package.loaded["scripts.tracker"].added(e_far_new)
+far_empty_cleared = g.storage.f3d.far.empty["2,0"] is None
+e_far_new.destroy()
+check(far_empty_cached and far_empty_cleared,
+      f"bfar: belt-free chunk cached empty ({far_empty_cached}) and cleared when a belt is built ({far_empty_cleared})")
 send({"t": "bfar", "r": 0})
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1})
 tick(3)
@@ -1282,10 +1384,12 @@ def decode_records(parts):
 
 
 hands_plain, hands_coded = last_frame(plain, "ih"), last_frame(coded_msgs, "ih")
-check(hands_coded and all(m.get("z") == 1 for m in hands_coded) and decode_groups(hands_coded) == decode_groups(hands_plain),
-      f"and the inserter hands: {decode_groups(hands_coded)[:3]}")
+# (--binary: binary ih, wire version 3, is never delta-coded either.)
+check(hands_coded and (BINARY or all(m.get("z") == 1 for m in hands_coded)) and decode_groups(hands_coded) == decode_groups(hands_plain),
+      f"and the inserter hands: {decode_groups(hands_coded)[:3]} vs {decode_groups(hands_plain)[:3]} ({len(hands_coded)} parts)")
 movers_plain, movers_coded = last_frame(plain, "mv"), last_frame(coded_msgs, "mv")
-check(len(decode_records(movers_plain)) >= 2 and all(m.get("z") == 1 for m in movers_coded)
+# (--binary: binary mv is never delta-coded.)
+check(len(decode_records(movers_plain)) >= 2 and (BINARY or all(m.get("z") == 1 for m in movers_coded))
       and decode_records(movers_coded) == decode_records(movers_plain), f"and the movers: {decode_records(movers_coded)} vs {decode_records(movers_plain)}")
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
 g.settings["global"]["f3d-detail-radius"].value = 0
@@ -1778,6 +1882,359 @@ st = puppet.shooting_state
 check(st.state == shooting.shooting_selected and st.position.y == 1.0, "shoot m=1 shoots at the aim point (shooting_selected)")
 tick(40)
 check(puppet.shooting_state.state == shooting.not_shooting, "shooting stops when the client stops repeating it")
+
+# --- enemies notice the player-less character (enemy_sight.lua, /f3d-perf enemy_sight) ----------------------
+# A nest's idle biters ignored a character with no player in 2.1.24 until it shot; a real player's woke them.
+# Every 30 ticks (phase 17), as measured for a real player's: a sleeping unit within its own prototype's vision
+# of it wakes (attack it, by_enemy) with every sleeping unit of its nest; held while it stands, dropping off over
+# about 40 s by unit number; kept on it while it moves and they're within their vision, with no leash; nothing out
+# of vision, with a player, peaceful, not destructible, or the switch off. Not those already distracted, attacking
+# something of their own, in a unit group, or whose command takes no distraction.
+es_mod = g.package.loaded["scripts.enemy_sight"]
+
+
+def es_new():
+    return list(F.distractions.values()) if F.distractions else []
+
+
+def es_for(unit):
+    return [d for d in es_new() if d.unit.unit_number == unit.unit_number]
+
+
+def es_given():
+    return sorted({d.unit.unit_number for d in es_new()})
+
+
+def es_phase(fade=False, units=()):
+    g.storage.f3d.client.last_seen = g.game.tick  # (the client's hellos, so the long waits don't drop it)
+    if fade:  # the engine's distraction ends on its own (3-6 s live): taken off before each pass
+        for u in units:
+            u.commandable.distraction_command = None
+    tick(30)  # every 30 ticks on its own phase: one pass within any 30
+
+
+def es_reset(units):
+    for u in units:
+        u.commandable.distraction_command = None
+    g.storage.f3d.sight = None
+    F.distractions = None
+
+
+es_c = g.storage.f3d.puppet
+es_home = es_c.position
+cx, cy = es_home.x, es_home.y
+es_attack, es_by_enemy = g.defines.command.attack, g.defines.distraction.by_enemy
+# Units the earlier checks left near the character are out of the way of these counts.
+# (given a distraction for the while, put back at the end)
+es_old = [(e, e.commandable.distraction_command) for e in F.surface.entities.values() if e.valid and e.type == "unit"]
+for e, _ in es_old:
+    e.commandable.distraction_command = lua.table_from({"type": g.defines.command.attack, "target": e})
+lua.execute("""
+function F_deepcopy(v)
+  if type(v) ~= "table" then return v end
+  local o = {}
+  for k, x in pairs(v) do o[k] = F_deepcopy(x) end
+  return o
+end
+function F_serialize(v)
+  if type(v) ~= "table" then return tostring(v) end
+  local keys = {}
+  for k in pairs(v) do keys[#keys + 1] = k end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local out = {}
+  for _, k in ipairs(keys) do out[#out + 1] = tostring(k) .. "=" .. F_serialize(v[k]) end
+  return "{" .. table.concat(out, ",") .. "}"
+end
+""")
+
+# A nest 40 tiles west: its spawner, one unit in vision (25 from the character), one beside the spawner out of
+# vision (45), one of its units already attacking something else; and round the character the units to leave.
+es_sp = spawn("biter-spawner", cx - 40.0, cy, force="enemy")
+es_in = spawn("small-biter", cx - 25.0, cy, force="enemy")
+es_far = spawn("small-biter", cx - 45.0, cy + 3.0, force="enemy")
+es_nbusy = spawn("small-biter", cx - 42.0, cy - 3.0, force="enemy")
+es_out = spawn("small-biter", cx + 25.0, cy + 25.0, force="enemy")   # loose, in the search square, 35 away
+es_busy = spawn("small-biter", cx, cy + 10.0, force="enemy")         # already distracted
+es_own = spawn("small-biter", cx + 5.0, cy + 10.0, force="enemy")    # an attack command of its own
+es_grouped = spawn("small-biter", cx, cy - 10.0, force="enemy")      # in a unit group
+es_none = spawn("small-biter", cx + 10.0, cy, force="enemy")         # its command takes no distraction
+es_mine = spawn("small-biter", cx - 10.0, cy - 10.0, force="player")  # the character's own force
+for u in (es_in, es_far, es_nbusy):
+    u.commandable.spawner = es_sp
+    u.commandable.command = lua.table_from({"type": g.defines.command.wander, "distraction": es_by_enemy})
+es_nbusy.commandable.distraction_command = lua.table_from({"type": es_attack, "target": es_out})
+es_busy.commandable.distraction_command = lua.table_from({"type": es_attack, "target": es_out})
+es_own.commandable.command = lua.table_from({"type": es_attack, "target": es_out})
+es_grouped.commandable.parent_group = lua.table_from({"valid": True})
+es_none.commandable.command = lua.table_from({"type": g.defines.command.wander, "distraction": g.defines.distraction.none})
+es_all = [es_in, es_far, es_nbusy, es_out, es_busy, es_own, es_grouped, es_none, es_mine]
+F.distractions = None
+es_phase()
+dis = es_in.commandable.distraction_command
+check(dis is not None and dis.type == es_attack and dis.distraction == es_by_enemy
+      and dis.target.unit_number == es_c.unit_number,
+      "enemy_sight: a unit within its vision of the player-less character is given attack it, by_enemy")
+check(es_far.commandable.distraction_command is not None and es_far.commandable.distraction_command.target.unit_number == es_c.unit_number,
+      "enemy_sight: its nest's sleeping unit out of vision wakes with it (the whole nest, as for a real player)")
+check(es_given() == sorted([es_in.unit_number, es_far.unit_number]),
+      f"enemy_sight: none for one outside its vision, already distracted, attacking of its own, in a group, with "
+      f"distraction none, or the character's own force: {len(es_new())} given")
+check(es_busy.commandable.distraction_command.target.unit_number == es_out.unit_number
+      and es_nbusy.commandable.distraction_command.target.unit_number == es_out.unit_number,
+      "enemy_sight: a unit's own distraction left alone (in the nest too)")
+woke = es_for(es_in)[0].tick
+check(g.storage.f3d.sight.units[es_in.unit_number].first == woke, "enemy_sight: what it woke is kept in storage by unit number")
+
+# The vision distance is the unit's own prototype's: a harness unit that sees 12 tiles wakes at 11, not at 14.
+es_short = spawn("f3d-test-short-sighted", cx + 14.0, cy, force="enemy")
+F.distractions = None
+es_phase()
+check(not es_for(es_short), "enemy_sight: a unit seeing 12 tiles (its prototype) doesn't wake 14 tiles off")
+es_short.teleport(lua.table_from({"x": cx + 11.0, "y": cy}))
+es_phase()
+check(len(es_for(es_short)) == 1, "enemy_sight: it wakes 11 tiles off, within its prototype's vision_distance")
+es_short.destroy()
+
+# The holds: spread over unit numbers as the real player's two runs dropped off (half by 8-10 s); re-giving ends
+# by 15 s, the engine's own tail (live: 3 of 12 still on it at 40 s with nothing re-given) doing the rest.
+hold = [es_mod.hold_ticks(n) + es_mod.FADE_TICKS for n in range(1, 1001)]
+by9 = sum(h <= 9 * 60 for h in hold) / 1000
+past12 = sum(h > 12 * 60 for h in hold) / 1000
+check(0.45 <= by9 <= 0.6 and 0.1 <= past12 <= 0.3 and max(hold) <= 15 * 60 and min(hold) >= 150,
+      f"enemy_sight: holds spread as measured: {by9:.2f} gone by 9 s, {past12:.2f} past 12 s, {min(hold)}-{max(hold)} ticks")
+
+# A standing character, a nest of 14 (consecutive unit numbers, as a nest's are): each pass the engine's
+# distraction has ended; the bridge gives it again only within each unit's hold, so they drop off gradually.
+for e in es_all:
+    e.destroy()
+es_nest = [spawn("small-biter", cx - 20.0 - (i % 4), cy - 6.0 + i, force="enemy") for i in range(14)]
+for u in es_nest:
+    u.commandable.spawner = es_sp
+es_reset(es_nest)
+start = g.game.tick
+on = []
+for p in range(100):  # 50 s
+    F.distractions = None
+    es_phase(fade=p > 0, units=es_nest)
+    on.append((g.game.tick - start, len(es_given())))
+at = lambda secs: max([n for t, n in on if t <= secs * 60 + 30 and t > secs * 60 - 30] or [0])
+# (Given again at t: still attacking until at least t + FADE_TICKS, the engine's own fade; live, some far longer.)
+es_curve = [at(s) for s in (2, 5, 10, 12, 15, 20, 47)]
+check(on[0][1] == 14 and es_curve == sorted(es_curve, reverse=True) and at(2) >= 10 and 2 <= at(10) <= 6
+      and at(12) >= 1 and at(15) == 0 and at(47) == 0,
+      f"enemy_sight: standing, held and dropping off gradually, re-giving over by 15 s: given again {es_curve} at 2-47 s")
+
+# The chase: the character runs off (a tile and a half a pass) with the nest behind it, to 450 tiles from the
+# nest. Those within their vision are kept on it every pass, the ones that had dropped off rejoin; no leash.
+es_back = es_nest[:3]  # three fall behind
+chased = []
+for p in range(300):
+    x = cx + 1.5 * (p + 1)
+    es_c.teleport(lua.table_from({"x": x, "y": cy}))
+    for i, u in enumerate(es_nest):
+        if u not in es_back:
+            u.teleport(lua.table_from({"x": x - 10.0 - (i % 4), "y": cy - 6.0 + i}))
+    F.distractions = None
+    es_phase(fade=True, units=es_nest)
+    chased.append(len(es_given()))
+check(min(chased) == 11 and chased[-1] == 11 and abs(es_c.position.x - es_sp.position.x) > 400,
+      f"enemy_sight: chasing, kept on it within vision with no leash, 450 tiles out: {min(chased)}-{max(chased)} a pass")
+check(not any(es_for(u) for u in es_back), "enemy_sight: the ones fallen behind (out of vision) are left")
+
+# Out of vision: units 37 tiles off for 20 s, nothing (the real player's run woke nothing at 37).
+for e in es_nest:
+    e.destroy()
+es_c.teleport(es_home)
+es_far37 = [spawn("small-biter", cx - 37.0, cy + i, force="enemy") for i in range(3)]
+for u in es_far37:
+    u.commandable.spawner = es_sp
+es_reset(es_far37)
+for _ in range(40):
+    es_phase()
+check(not es_new(), "enemy_sight: nothing wakes with the character 37 tiles off for 20 s")
+for e in es_far37:
+    e.destroy()
+
+# Determinism: two runs of a pass from the same storage (one with the module's prototype caches forgotten, as a
+# peer that loaded the save would have them) give the same commands.
+es_det = [spawn("small-biter", cx - 20.0 - i, cy + (i % 5), force="enemy") for i in range(8)]
+for u in es_det:
+    u.commandable.spawner = es_sp
+es_reset(es_det)
+for _ in range(6):
+    es_phase(fade=True, units=es_det)
+es_c.teleport(lua.table_from({"x": cx + 2.0, "y": cy}))
+for _ in range(8):
+    es_phase(fade=True, units=es_det)
+es_c.teleport(es_home)
+for _ in range(10):
+    es_phase(fade=True, units=es_det)
+lua.execute("F_es_saved = F_deepcopy(storage.f3d.sight)")
+run_at = g.game.tick
+while (run_at + 17) % 30:
+    run_at += 1
+
+
+def es_run(forget_caches):
+    lua.execute("storage.f3d.sight = F_deepcopy(F_es_saved)")
+    for u in es_det:
+        u.commandable.distraction_command = None
+    if forget_caches:
+        check(forget(es_mod.tick, "vision_of_name") and forget(es_mod.tick, "search_radius") is not None,
+              "enemy_sight: its prototype caches can be forgotten")
+    F.distractions = None
+    g.game.tick = run_at
+    es_mod.tick()
+    return [(d.unit.unit_number, d.tick) for d in es_new()], lua.eval("F_serialize(storage.f3d.sight)")
+
+
+first = es_run(False)
+second = es_run(True)
+check(first == second and first[0], f"enemy_sight: two runs from the same storage give the same commands: {first[0]} / {second[0]}")
+g.game.tick = run_at
+
+# Nothing when the character can't be sighted as a player's could, or with the switch off (and the records go).
+es_in = es_det[0]
+
+
+def es_none_given(what):
+    es_reset(es_det)
+    for _ in range(4):
+        es_phase()
+    check(not es_new(), f"enemy_sight: nothing given {what}")
+
+
+es_c.destructible = False
+es_none_given("to a character that isn't destructible")
+check(g.storage.f3d.sight is None, "enemy_sight: the records go when there's nothing to do")
+es_c.destructible = True
+F.surface.peaceful_mode = True
+es_none_given("in peaceful mode")
+F.surface.peaceful_mode = False
+F.surface.no_enemies_mode = True
+es_none_given("in no-enemies mode")
+F.surface.no_enemies_mode = False
+# (puppet.player_of answers for the character: hybrid single-player's, or an L13 claimed player's.)
+lua.execute('F_es_po = package.loaded["scripts.puppet"].player_of; package.loaded["scripts.puppet"].player_of = function() return {} end')
+es_none_given("to a character with a real player (the engine sees those)")
+lua.execute('package.loaded["scripts.puppet"].player_of = F_es_po')
+# In a car (puppet.vehicle; a tank or spidertron the same), and on a platform's hub (puppet.hub, stubbed).
+es_car = spawn("car", cx, cy, force="player")
+es_car.set_driver(es_c)
+es_none_given("to a character in a vehicle (car, tank, spidertron)")
+es_car.set_driver(None)
+es_car.destroy()
+es_c.teleport(es_home)
+lua.execute('F_es_hub = package.loaded["scripts.puppet"].hub; package.loaded["scripts.puppet"].hub = function(c) return c end')
+es_none_given("to a character on a platform's hub")
+lua.execute('package.loaded["scripts.puppet"].hub = F_es_hub')
+F.commands["f3d-perf"](lua.table_from({"name": "f3d-perf", "parameter": "enemy_sight off"}))
+es_none_given("with /f3d-perf enemy_sight off, as before")
+F.commands["f3d-perf"](lua.table_from({"name": "f3d-perf", "parameter": "enemy_sight default"}))
+es_reset(es_det)
+es_phase()
+check(len(es_for(es_in)) == 1, "enemy_sight: given again with the switch back on")
+for e in es_det:
+    e.destroy()
+es_sp.destroy()
+
+# MAX_NESTS (4) a pass: five nests in vision at once. Four wake in the first pass, each unit in vision with its
+# spawner's unit out of vision; the fifth's unit waits with no record and wakes its nest in the next pass.
+es_five = []
+for i in range(5):
+    a = i * math.tau / 5
+    ux, uy = math.cos(a), math.sin(a)
+    sp = spawn("biter-spawner", cx + 40.0 * ux, cy + 40.0 * uy, force="enemy")
+    near = spawn("small-biter", cx + 25.0 * ux, cy + 25.0 * uy, force="enemy")
+    back = spawn("small-biter", cx + 45.0 * ux, cy + 45.0 * uy, force="enemy")
+    for u in (near, back):
+        u.commandable.spawner = sp
+    es_five.append((sp, near, back))
+es_five_units = [u for _, n, b in es_five for u in (n, b)]
+es_reset(es_five_units)
+es_phase()
+first_pass = es_given()
+F.distractions = None
+es_phase()
+second_pass = es_given()
+woke_nests_of = lambda nests, given: sorted(i for i, (_, n, b, *_) in enumerate(nests) if n.unit_number in given and b.unit_number in given)
+woke_nests = lambda given: sorted(i for i, (_, n, b) in enumerate(es_five) if n.unit_number in given and b.unit_number in given)
+check(len(woke_nests(first_pass)) == 4 and len(first_pass) == 8,
+      f"enemy_sight: four nests (MAX_NESTS) wake in one pass, whole: {woke_nests(first_pass)}, {len(first_pass)} given")
+check(len(woke_nests(second_pass)) == 1 and len(second_pass) == 2
+      and sorted(woke_nests(first_pass) + woke_nests(second_pass)) == [0, 1, 2, 3, 4],
+      f"enemy_sight: the fifth nest wakes in the next pass, whole (not lost to the cap): {woke_nests(second_pass)}")
+for sp, n, b in es_five:
+    for e in (sp, n, b):
+        e.destroy()
+
+# A spawning nest is no new nest: its spawners are kept after the wake, so a fresh unit of it (a new spawn, held
+# busy until now) is given alone, with no spawner search and no place under MAX_NESTS. Four nests woken, each with
+# a new unit every pass ahead of the fifth's unit in find_units' order: the fifth still wakes, whole.
+es_sn = []
+for i in range(5):
+    a = i * math.tau / 5
+    ux, uy = math.cos(a), math.sin(a)
+    sp = spawn("biter-spawner", cx + 40.0 * ux, cy + 40.0 * uy, force="enemy")
+    near = spawn("small-biter", cx + 25.0 * ux, cy + 25.0 * uy, force="enemy")
+    back = spawn("small-biter", cx + 45.0 * ux, cy + 45.0 * uy, force="enemy")
+    new = [spawn("small-biter", cx + (20.0 + j) * ux, cy + (20.0 + j) * uy, force="enemy") for j in range(2)] if i < 4 else []
+    for u in [near, back] + new:
+        u.commandable.spawner = sp
+    es_sn.append((sp, near, back, new))
+es_sn_units = [u for _, n, b, new in es_sn for u in [n, b] + new]
+es_reset(es_sn_units)
+for _, _, _, new in es_sn:
+    for u in new:
+        u.commandable.distraction_command = lua.table_from({"type": es_attack, "target": u})
+es_phase()
+check(sorted(woke_nests_of(es_sn, es_given())) == [0, 1, 2, 3], "enemy_sight: (four spawning nests woken first)")
+es_sn_finds = []
+for j in range(2):
+    for _, _, _, new in es_sn[:4]:
+        new[j].commandable.distraction_command = None
+    F.distractions = None
+    F.finds = lua.table_from({})
+    es_phase()
+    es_sn_finds.append((F.finds.find_units or 0, es_given()))
+    F.finds = None
+es_sn_new = sorted(new[0].unit_number for _, _, _, new in es_sn[:4])
+check(woke_nests_of(es_sn, es_sn_finds[0][1]) == [4]
+      and sorted(set(es_sn_finds[0][1]) - {es_sn[4][1].unit_number, es_sn[4][2].unit_number}) == es_sn_new,
+      f"enemy_sight: four nests each with a new unit a pass, the fifth still wakes, whole: {es_sn_finds[0][1]}")
+# (one find_units a pass for the character, one more per nest woken: a nest's search is its spawner search and
+# its find_units together; the spawner searches can't be counted alone, planets.lua lists spawners too)
+check(es_sn_finds[0][0] == 2 and es_sn_finds[1][0] == 1
+      and sorted(es_sn_finds[1][1]) == sorted(new[1].unit_number for _, _, _, new in es_sn[:4]),
+      f"enemy_sight: a spawning nest's new unit is given alone, its nest not searched again: "
+      f"find_units {es_sn_finds[0][0]} a pass, then {es_sn_finds[1][0]}")
+for sp, n, b, new in es_sn:
+    for e in [sp, n, b] + new:
+        e.destroy()
+
+# The nest is its spawners' cluster: a nest of two spawners 10 tiles apart wakes together; a second nest's idle
+# unit inside the 45-tile circle round the first spawner, its own spawner 36 tiles off (more than NEST_EXTRA),
+# stays asleep while its own units can't see the character (58 tiles off).
+es_a1 = spawn("biter-spawner", cx - 40.0, cy, force="enemy")
+es_a2 = spawn("biter-spawner", cx - 40.0, cy + 10.0, force="enemy")
+es_b = spawn("biter-spawner", cx - 60.0, cy - 30.0, force="enemy")
+es_ua1 = spawn("small-biter", cx - 25.0, cy, force="enemy")         # in vision, of a1
+es_ua2 = spawn("small-biter", cx - 45.0, cy + 12.0, force="enemy")  # out of vision, of a2
+es_ub = spawn("small-biter", cx - 55.0, cy - 20.0, force="enemy")   # 25 from a1, of b
+es_ua1.commandable.spawner = es_a1
+es_ua2.commandable.spawner = es_a2
+es_ub.commandable.spawner = es_b
+es_cl = [es_ua1, es_ua2, es_ub]
+es_reset(es_cl)
+for _ in range(3):
+    es_phase()
+check(es_for(es_ua1) and es_for(es_ua2), "enemy_sight: both spawners of one nest (10 tiles apart) wake their units together")
+check(not es_for(es_ub), "enemy_sight: a neighbouring nest's unit inside the circle, its spawner past NEST_EXTRA, stays asleep")
+for e in es_cl + [es_a1, es_a2, es_b]:
+    e.destroy()
+for e, d in es_old:
+    e.commandable.distraction_command = d
+F.distractions = None
 check(of_type(take(), "me")[-1].get("sh") == 0, "and me.sh goes back to 0")
 send({"t": "shoot", "m": 0, "x": 0, "y": 0})
 tick(2)
@@ -1898,6 +2355,31 @@ send({"t": "repair", "u": chest_r.unit_number, "p": eid["wooden-chest"], "x": fi
 chest_r.health = 50
 tick(5)
 check(chest_r.health == 50, f"K13: only a repair tool mends: {chest_r.health}")
+# N4: vehicles are mended as buildings are (Factorio repairs any entity with health of the force that
+# isn't not-repairable): a car, a train's wagon; another force's car is left alone.
+car_r = spawn("car", 2.5, -2.5, force="player")
+wagon_r = spawn("cargo-wagon", -3.0, 2.0, force="player")
+enemy_car = spawn("car", -2.5, -2.5, force="enemy")
+car_r.health, wagon_r.health, enemy_car.health = car_r.max_health - 20, wagon_r.max_health - 6, 50
+send(repair_cmd(car_r))
+tick(15)
+msgs = take()
+me = of_type(msgs, "me")
+check(car_r.health == car_r.max_health, f"N4: a damaged car is mended to full: {car_r.health}/{car_r.max_health}")
+check(any(m.get("rp") == 1 and m.get("rx") == fixed(car_r.position.x) for m in me),
+      f"N4: me says the character repairs the car, and where: {me[-2:]}")
+hp_seen = [dict(zip(m["l"][::2], m["l"][1::2])).get(car_r.unit_number) for m in of_type(msgs, "hp")]
+check(any(v is not None and v < 1000 for v in hp_seen), f"N4: the car's health bar rises: {hp_seen}")
+send(repair_cmd(wagon_r))
+tick(5)
+check(wagon_r.health == wagon_r.max_health, f"N4: a train's wagon is mended: {wagon_r.health}/{wagon_r.max_health}")
+send(repair_cmd(enemy_car))
+tick(5)
+check(enemy_car.health == 50, f"N4: another force's car isn't mended: {enemy_car.health}")
+send({"t": "repair"})
+for e in (car_r, wagon_r, enemy_car):
+    e.destroy()
+take()
 main.remove(lua.table_from({"name": "repair-pack", "count": 1}))
 for e in (chest_r, wall_r, far_chest, enemy_r):
     e.destroy()
@@ -2003,10 +2485,86 @@ send({"t": "drive", "a": 0, "s": 0})
 tick(2)
 check(puppet.riding_state.acceleration == riding.acceleration.nothing, "drive 0, 0 stops at once")
 check(not [m for m in of_type(take(), "msg") if m["text"] == "No fuel"], "no fuel message once there is fuel")
+# N3: while driving, the tool bar's `guns` are the vehicle's: its guns over its ammo, its selected gun.
+car_ammo = car.get_inventory(g.defines.inventory.car_ammo)
+car_ammo[1].set_stack(lua.table_from({"name": "firearm-magazine", "count": 7}))
+tick(11)
+vg = of_type(take(), "guns")
+check(vg and vg[-1].get("v") == car.unit_number and vg[-1]["sel"] == 1
+      and [r[:3] for r in vg[-1]["l"]] == [["vehicle-machine-gun", "firearm-magazine", 7]],
+      f"guns while driving: the car's machine gun and its ammo, with v the car: {vg[-1:]}")
+send({"t": "gun", "i": 1})
+tick(11)
+check(car.selected_gun_index == 1, "gun while driving picks the vehicle's gun")
+send({"t": "move", "from": "vammo", "fi": 1, "to": "main", "ti": 30, "n": 2})
+tick(11)
+vg = of_type(take(), "guns")
+check(car_ammo[1].count == 5 and vg and vg[-1]["l"][0][2] == 5, f"move from vammo takes the vehicle's ammo: {vg[-1:]}")
+# N3: shooting from the car: the game fires the car's gun (its rounds go down, read in 2.1.24), so me.sh and
+# "Out of ammo" follow the car's ammo (/f3d-perf vehicle_ammo); its shots are turrets.lua's (`ts`, drawn by
+# the client's turrets.gd), so no `shot` comes from the character's guns.
+veh_biter = spawn("small-biter", car.position.x + 4, car.position.y, force="enemy")
+take()
+for m in (1, 0):
+    send({"t": "shoot", "m": m, "x": fixed(car.position.x + 4), "y": fixed(car.position.y)})
+    tick(2)
+    car_ammo[1].count = car_ammo[1].count - 1  # the game fired the car's gun (a magazine: the fake has no rounds)
+    tick(4)
+    msgs = take()
+    check(of_type(msgs, "me")[-1].get("sh") == 1, f"N3: shoot m={m} from the car: me.sh is 1 once the car's ammo goes down")
+    check(not of_type(msgs, "shot"), f"N3: and no `shot` (the car's shots come in ts): {of_type(msgs, 'shot')}")
+    send({"t": "shoot", "m": -1})
+    send({"t": "hello", "v": 1, "sid": "s1", "w": 1})  # keep-alive: these ticks add up towards the timeout
+    tick(2)
+    take()
+send({"t": "shoot", "m": 1, "x": fixed(car.position.x + 4), "y": fixed(car.position.y)})
+tick(25)
+check(of_type(take(), "me")[-1].get("sh") == 0, "N3: me.sh back to 0 once the car's ammo stops going down")
+send({"t": "shoot", "m": -1})
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
+tick(2)
+car_mags = car_ammo[1].count
+car_ammo[1].clear()
+send({"t": "shoot", "m": 1, "x": fixed(car.position.x + 4), "y": fixed(car.position.y)})
+tick(4)
+check(sum(m["text"] == "Out of ammo" for m in of_type(take(), "msg")) == 1,
+      "N3: shooting from a car without ammo says Out of ammo, whatever the character holds")
+send({"t": "shoot", "m": -1})
+tick(2)
+car_ammo[1].set_stack(lua.table_from({"name": "firearm-magazine", "count": car_mags}))
+g.storage.f3d_perf = lua.table_from({"vehicle_ammo": False})
+take()
+send({"t": "shoot", "m": 1, "x": fixed(car.position.x + 4), "y": fixed(car.position.y)})
+tick(2)
+car_ammo[1].count = car_ammo[1].count - 1
+tick(4)
+check(of_type(take(), "me")[-1].get("sh") == 0, "N3: /f3d-perf vehicle_ammo off: me.sh follows the character's ammo, as before")
+send({"t": "shoot", "m": -1})
+tick(2)
+g.storage.f3d_perf = None
+veh_biter.destroy()
+take()
 send({"t": "enter"})
 tick(4)
-me = of_type(take(), "me")[-1]
+msgs = take()
+me = of_type(msgs, "me")[-1]
 check(car.get_driver() is None and puppet.vehicle is None and "v" not in me, f"enter again gets out: {me}")
+tick(11)
+back = of_type(msgs + take(), "guns")
+check(back and "v" not in back[-1] and back[-1]["l"][0][0] == "pistol", f"out of the car the character's guns come back: {back[-1:]}")
+tank = spawn("tank", puppet.position.x + 0.5, puppet.position.y, force="player")  # nearer than the car
+send({"t": "enter"})
+tick(4)
+send({"t": "gun", "i": 2})
+tick(11)
+tg = of_type(take(), "guns")
+check(same(puppet.vehicle, tank) and tank.selected_gun_index == 2 and tg and tg[-1]["sel"] == 2 and tg[-1].get("v") == tank.unit_number
+      and [r[0] for r in tg[-1]["l"]] == ["tank-cannon", "tank-machine-gun", "tank-flamethrower"],
+      f"a tank's three guns in 2.1's order, and gun i=2 selects its machine gun: {tg[-1:]}")
+send({"t": "enter"})
+tick(4)
+tank.destroy()
+take()
 check(me["x"] == 5 * 256, "the character stands next to the vehicle")
 
 other = spawn("character", 3.0, 3.0, force="player")
@@ -2330,7 +2888,7 @@ tick(2)
 msgs = take()
 proxy = asm.item_request_proxy
 plan = [(p.id.name, at.inventory, at.stack) for p in proxy.insert_plan.values() for at in p["items"].in_inventory.values()] if proxy else []
-check(plan == [("speed-module", 25, 1)] and "That slot has a module in it" in texts(msgs),
+check(plan == [("speed-module", g.defines.inventory.crafter_modules, 1)] and "That slot has a module in it" in texts(msgs),
       f"modreq on a slot: the free one gets a request proxy, the filled one is refused: {plan} {texts(msgs)}")
 g8 = guis(msgs, asm)
 check(g8 and g8[-1].get("mrq") == ["", "speed-module"], f"gui mrq: each module slot's requested module: {g8[-1:]}")
@@ -2720,13 +3278,14 @@ send({"t": "research", "name": "secret"})
 tick(2)
 msgs = take()
 rs = of_type(msgs, "rs")
-check(rs and rs[-1]["cur"] == "automation" and rs[-1]["q"] == ["logistics"], f"research starts one and queues the next: {rs[-1:]}")
+check(rs and rs[-1]["cur"] == "automation" and rs[-1]["q"] == ["automation", "logistics"],
+      f"research starts one and queues the next (the queue's first is the current research, as Factorio's): {rs[-1:]}")
 check(any(m["text"] == "Can't research secret" for m in of_type(msgs, "msg")), "hidden technologies can't be researched")
 g.game.forces.player.research_progress = 0.4
 send({"t": "research_cancel", "name": "logistics"})
 tick(2)
 rs = of_type(take(), "rs")
-check(rs and rs[-1]["q"] == [] and rs[-1]["pr"] == 400, f"research_cancel takes it off the queue: {rs[-1:]}")
+check(rs and rs[-1]["q"] == ["automation"] and rs[-1]["pr"] == 400, f"research_cancel takes it off the queue: {rs[-1:]}")
 send({"t": "research_cancel", "name": "automation"})
 tick(4)
 msgs = take()
@@ -2780,6 +3339,74 @@ tick(1)
 done = of_type(take(), "rdone")
 check(len(done) == 1 and len(done[0]["l"]) == 100 and done[0].get("n") == 5, f"rdone: 100 named, n the rest: {[(len(m['l']), m.get('n')) for m in done]}")
 g.storage.k23 = None
+tick(4)
+take()
+# L12: a technology whose prerequisites aren't all researched is queued after the missing ones, in order, as
+# Factorio's technology screen does: 2.1.24's add_research alone refuses it, and refuses trigger technologies and an
+# eighth in the queue (measured in real headless 2.1.24; the fake does the same). The owner's case: Plastics being
+# researched, Advanced circuits queued behind it.
+lua.execute("""
+local f = game.forces.player
+local T = f.technologies
+local function proto(trigger)
+  return { hidden = false, essential = false, effects = {}, level = 1, max_level = 1, research_trigger = trigger }
+end
+local function add(name, pres, trigger)
+  local p = {}
+  for _, n in ipairs(pres) do p[n] = T[n] end
+  T[name] = F.make_tech(name, p, { prototype = proto(trigger), force = f })
+  prototypes.technology[name] = T[name].prototype
+end
+f.research_queue = {}
+add("l12-plastics", { "logistics" })
+add("l12-circuits", { "l12-plastics", "automation" })
+add("l12-oil", {}, { type = "mine-entity", entity = "crude-oil" })
+add("l12-gas", { "l12-oil" })
+add("l12-d1", {}) add("l12-d2", { "l12-d1" }) add("l12-d3", { "l12-d2" }) add("l12-d4", { "l12-d3" })
+""")
+take()
+send({"t": "research", "name": "l12-plastics"})
+tick(2)
+rs = of_type(take(), "rs")
+check(rs and rs[-1]["cur"] == "automation" and rs[-1]["q"] == ["automation", "logistics", "l12-plastics"],
+      f"research of a locked technology: its missing prerequisites queued first, in order, then it: {rs[-1:]}")
+send({"t": "research", "name": "l12-circuits"})
+tick(2)
+rs = of_type(take(), "rs")
+check(rs and rs[-1]["q"] == ["automation", "logistics", "l12-plastics", "l12-circuits"],
+      f"one whose prerequisites are queued goes behind them (Advanced circuits behind Plastics): {rs[-1:]}")
+send({"t": "research", "name": "l12-gas"})
+tick(2)
+msgs = take()
+rs = of_type(msgs, "rs")
+check(rs and rs[-1]["q"] == ["automation", "logistics", "l12-plastics", "l12-circuits"]
+      and any(m["text"] == "Can't research l12-gas yet: l12-oil is unlocked by doing its task" for m in of_type(msgs, "msg")),
+      f"a trigger technology on the way: nothing queued, and why: {rs[-1:]}, {[m['text'] for m in of_type(msgs, 'msg')]}")
+send({"t": "research", "name": "l12-d4"})
+tick(2)
+msgs = take()
+rs = of_type(msgs, "rs")
+check(rs and rs[-1]["q"] == ["automation", "logistics", "l12-plastics", "l12-circuits"]
+      and any(m["text"] == "Research queue full: l12-d4 needs 3 more queued first" for m in of_type(msgs, "msg")),
+      f"a chain past the queue's 7: what was queued for it comes off again: {rs[-1:]}, {[m['text'] for m in of_type(msgs, 'msg')]}")
+g.storage.f3d_perf = lua.table_from({"research_chain": False})
+lua.execute("game.forces.player.research_queue = {}")
+send({"t": "research", "name": "l12-plastics"})
+tick(2)
+msgs = take()
+rs = of_type(msgs, "rs")
+check(rs and rs[-1]["q"] == [] and any(m["text"] == "Can't research l12-plastics yet" for m in of_type(msgs, "msg")),
+      f"/f3d-perf research_chain off: add_research alone, refused as before: {rs[-1:]}")
+g.storage.f3d_perf = None
+lua.execute("""
+local f = game.forces.player
+f.research_queue = {}
+for _, n in ipairs({ "l12-plastics", "l12-circuits", "l12-oil", "l12-gas", "l12-d1", "l12-d2", "l12-d3", "l12-d4" }) do
+  f.technologies[n] = nil
+  prototypes.technology[n] = nil
+end
+storage.f3d.techs_dirty = true
+""")
 tick(4)
 take()
 # A technology unlocking thousands of recipes (Space Exploration's recycling, 3,253) made one record
@@ -2851,10 +3478,154 @@ adds = [a["e"] for a in of_type(msgs, "add") if a["e"][1] == eid["splitter"]]
 check(sorted(d["u"] for d in of_type(msgs, "del")) == j9_units and adds and adds[0][2:5] == [fixed(2), fixed(7.5), 0]
       and inv.get_item_count("transport-belt") == belts + 2,
       f"J9: a splitter over two belts replaces both where it was aimed: {adds[:1]}, dels {[d['u'] for d in of_type(msgs, 'del')]}")
+# J9: at negative coordinates the same rule (floor): a point a hair left of the tile middle at -3.5 (the client
+# sends it rounded down, -897) is the tile edge at -4; the middle itself (-896, what a client cutting towards zero
+# sent for that point) is the edge at -3, one tile over.
+puppet.insert(lua.table_from({"name": "splitter", "count": 2}))
+j9_home = {"x": puppet.position.x, "y": puppet.position.y}
+puppet.teleport(lua.table_from({"x": -3.5, "y": -20.5}))
+for j9_x, j9_y in ((-897, fixed(-22.3)), (-896, fixed(-24.3))):
+    send({"t": "build", "item": "splitter", "x": j9_x, "y": j9_y, "d": 0})
+    tick(2)
+take()
+puppet.teleport(lua.table_from(j9_home))
+# (Read from the game: the client doesn't watch that chunk, so no `add` comes.)
+j9_at = sorted(([e.position.x, e.position.y] for e in F.surface.entities.values() if e.name == "splitter" and e.position.y < -20),
+               key=lambda p: -p[1])
+check(j9_at == [[-4, -22.5], [-3, -24.5]],
+      f"J9: left of zero a splitter sent a hair under a tile's middle stands on the edge below it, the middle itself on the edge above: {j9_at}")
 for e in list(F.surface.entities.values()):
     if e.name == "splitter":
         e.destroy()
 take()
+
+# M2: an underground pair the character builds over a run of belts mines the belts between (and their items)
+# into the character, as Factorio's player build does ("Any belts in between the entrance and exit of the
+# underground belt will be mined automatically"); pipes-to-ground over pipes the same. Only a plain run: every
+# tile between a belt the pair's way, straight, fed by nothing from the side (a pipe with no connection off the
+# line); anything else and none go. The ends' own belts and their items come back too.
+m2_x0 = math.floor(puppet.position.x)
+m2_y0 = math.floor(puppet.position.y) + 8
+
+
+M2_TYPES = ("transport-belt", "underground-belt", "pipe", "pipe-to-ground")
+
+
+def m2_clear():
+    for e in list(F.surface.entities.values()):
+        p = e.position
+        if e.valid and e.type in M2_TYPES and m2_x0 - 1 <= p.x <= m2_x0 + 8 and m2_y0 - 2 <= p.y <= m2_y0 + 2:
+            e.destroy()
+    take()
+
+
+def m2_row(dy, name="transport-belt", n=7, d=4, items=False):
+    row = [spawn(name, m2_x0 + i + 0.5, m2_y0 + dy + 0.5, force="player", direction=d) for i in range(n)]
+    if items:
+        for i, b in enumerate(row):
+            F.put_on_belt(b, 1, "iron-plate", 0.5, 9000 + 10 * dy + i)
+    return row
+
+
+def m2_pair(dy, item="underground-belt", d_in=4, d_out=4, at=(0, 5)):
+    puppet.insert(lua.table_from({"name": item, "count": 2}))
+    for x, d in zip(at, (d_in, d_out)):
+        send({"t": "build", "item": item, "x": fixed(m2_x0 + x + 0.5), "y": fixed(m2_y0 + dy + 0.5), "d": d})
+    tick(2)
+    return take()
+
+
+m2_clear()
+row = m2_row(0, items=True)
+beside = m2_row(1)  # the next line over, the same way: not the pair's
+middle = {b.unit_number for b in row[1:5]}
+ends = {row[0].unit_number, row[5].unit_number}
+belts0, plates0 = inv.get_item_count("transport-belt"), inv.get_item_count("iron-plate")
+msgs = m2_pair(0)
+pair = [e for e in F.surface.entities.values() if e.valid and e.name == "underground-belt" and e.position.y == m2_y0 + 0.5]
+mnd = {m["u"]: m for m in of_type(msgs, "mnd")}
+check(len(pair) == 2 and all(not b.valid for b in row[1:6]) and row[6].valid and all(b.valid for b in beside),
+      f"M2: an underground pair over a run mines the belts between, the line beside and the belt after it stay: "
+      f"{[b.valid for b in row]} {[b.valid for b in beside]}")
+check(set(mnd) == middle and all(m["g"] == 1 and ["transport-belt", 1] in m["l"] and ["iron-plate", 1] in m["l"]
+                                 for m in mnd.values()),
+      f"M2: each belt between is said at once (`mnd`), gone, its belt and its item to the character: {sorted(mnd)}")
+check({d["u"] for d in of_type(msgs, "del")} >= middle | ends,
+      f"M2: their `del`s, and the ends' replaced belts': {[d['u'] for d in of_type(msgs, 'del')]}")
+check(inv.get_item_count("transport-belt") == belts0 + 6 and inv.get_item_count("iron-plate") == plates0 + 6
+      and inv.get_item_count("underground-belt") == 0,
+      f"M2: the four between and the two the ends replaced come back with their six plates: "
+      f"belts +{inv.get_item_count('transport-belt') - belts0}, plates +{inv.get_item_count('iron-plate') - plates0}")
+inv_k = [m["k"] for m in of_type(msgs, "inv")]
+check(bool(inv_k), f"M2: the inventory is sent at once with them: {inv_k}")
+
+# Not a plain run: nothing between goes (the ends are still built over their belts).
+m2_cases = {}
+m2_clear()
+side = m2_row(0)
+feeder = spawn("transport-belt", m2_x0 + 2.5, m2_y0 - 0.5, force="player", direction=8)
+F.link_belts(feeder, side[2])
+m2_pair(0)
+m2_cases["a belt fed from the side"] = [b.valid for b in side[1:5]]
+m2_clear()
+back = m2_row(0)
+back[3].direction = 12
+m2_pair(0)
+m2_cases["a belt the other way"] = [b.valid for i, b in enumerate(back[1:5]) if i != 2]
+m2_clear()
+gap = m2_row(0)
+gap[2].destroy()
+m2_pair(0)
+m2_cases["a gap"] = [b.valid for b in (gap[1], gap[3], gap[4])]
+m2_clear()
+bent = m2_row(0)
+F.entity_data(bent[2]).belt_shape = "left"
+m2_pair(0)
+m2_cases["a curve"] = [b.valid for b in bent[1:5]]
+m2_clear()
+west = m2_row(0, d=12)
+m2_pair(0)  # the pair goes east under belts going west
+m2_cases["belts going the other way"] = [b.valid for b in west[1:5]]
+for name, kept in m2_cases.items():
+    check(all(kept), f"M2: {name} between keeps the run: {kept}")
+
+# Pipes-to-ground over pipes: the same, and a branch keeps them.
+m2_clear()
+pipes = m2_row(0, name="pipe")
+pipes0 = inv.get_item_count("pipe")
+msgs = m2_pair(0, item="pipe-to-ground", d_in=12, d_out=4)
+ptg = [e for e in F.surface.entities.values() if e.valid and e.name == "pipe-to-ground"]
+check(len(ptg) == 2 and all(not p.valid for p in pipes[:6]) and pipes[6].valid
+      and inv.get_item_count("pipe") == pipes0 + 6 and inv.get_item_count("pipe-to-ground") == 0
+      and {m["u"] for m in of_type(msgs, "mnd")} == {p.unit_number for p in pipes[1:5]},
+      f"M2: a pipe-to-ground pair over pipes mines the pipes between: {[p.valid for p in pipes]}, "
+      f"pipes +{inv.get_item_count('pipe') - pipes0}")
+m2_clear()
+pipes = m2_row(0, name="pipe")
+spawn("pipe", m2_x0 + 3.5, m2_y0 - 0.5, force="player")
+m2_pair(0, item="pipe-to-ground", d_in=12, d_out=4)
+check(all(p.valid for p in pipes[1:5]), f"M2: a pipe with a branch between keeps the pipes: {[p.valid for p in pipes]}")
+
+# A full inventory: mined anyway, the rest spilled at the character's feet, as Factorio's build spills it.
+m2_clear()
+row = m2_row(0, items=True)
+spilled0 = len(F.spilled)
+F.inventory_space = 3
+m2_pair(0)
+F.inventory_space = float("inf")
+check(all(not b.valid for b in row[1:5]) and len(F.spilled) > spilled0,
+      f"M2: a full inventory still mines the run, the rest spilled: {len(F.spilled) - spilled0} stacks")
+
+# /f3d-perf under_clear off: as before (the run stays, an end's items deleted with its belt).
+m2_clear()
+row = m2_row(0, items=True)
+g.storage.f3d_perf = lua.table_from({"under_clear": False})  # (set_perf, below)
+plates0 = inv.get_item_count("iron-plate")
+msgs = m2_pair(0)
+g.storage.f3d_perf = None
+check(all(b.valid for b in row[1:5]) and not of_type(msgs, "mnd") and inv.get_item_count("iron-plate") == plates0,
+      f"M2: under_clear off: the belts between stay and no `mnd`, as before: {[b.valid for b in row]}")
+m2_clear()
 
 puppet.insert(lua.table_from({"name": "rail", "count": 3}))
 send({"t": "build", "item": "rail", "x": int(4.2 * 256), "y": int(3.7 * 256), "d": 0})
@@ -4003,7 +4774,7 @@ send({"t": "mrp", "q": 6})
 tick(2)
 check(not of_type(take(), "mrp"), "mrp: asks within a second for the same surface are ignored")
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1})  # keep-alive: the waits here add up past the timeout
-# Ground in a roboport's construction area counts as seen, like a radar's: the map's trains
+# Ground in a roboport's construction area counts as seen, like a radar's (H13): the map's trains
 # there, the remote view's movers and buildings to open; a mobile cell (a personal roboport) doesn't.
 # Chunks are seen by their centres: these are chunk centres inside (in_x, in_x2) and past (out_x) the
 # far roboport's construction square (55 tiles round px + 900, py - 700).
@@ -4320,10 +5091,11 @@ puppet.position = lua.table_from({"x": 0, "y": 0})
 inv = puppet.get_main_inventory()
 
 # Drop (Z): one item into the chest under the mouse, else onto the ground.
-box_chest = spawn("wooden-chest", 2.5, 2.5, force="player")
+# (Clear of the car at 3, 3, which a drop over it would fill.)
+box_chest = spawn("wooden-chest", 0.5, 6.5, force="player")
 puppet.insert(lua.table_from({"name": "iron-plate", "count": 10}))
 plates = inv.get_item_count("iron-plate")
-send({"t": "drop", "item": "iron-plate", "x": fixed(2.5), "y": fixed(2.5)})
+send({"t": "drop", "item": "iron-plate", "x": fixed(0.5), "y": fixed(6.5)})
 tick(2)
 check(F.inventories[box_chest]["chest"].get_item_count("iron-plate") == 1 and inv.get_item_count("iron-plate") == plates - 1,
       "Z over a chest puts one item in it")
@@ -4357,6 +5129,183 @@ check(F.inventories[box_chest]["chest"].get_item_count("iron-plate") == 5 and in
 check(len(of_type(take(), "slots")) >= 1, "a Ctrl+click sends the slots at once (the client's hand follows them)")
 send({"t": "fast", **target_of(box_chest), "half": 0})
 tick(2)
+
+# L7: Factorio builds out of the cursor's stack. The client names the main inventory slot its hand holds the
+# item from (`hs`), and that stack pays for a build or a Z, in its own quality; without `hs`, as before (any
+# stack of the item: the fake's remove takes the last).
+set_slot = lua.eval("function(inv, i, name, count, quality) inv[i].set_stack(name and { name = name, count = count, quality = quality } or nil) end")
+slot_now = lua.eval("function(inv, i) local s = inv[i]; if s.valid_for_read then return s.count end return 0 end")
+inv_size = lua.eval("function(inv) return #inv end")(inv)
+hs_a, hs_b, hs_c = inv_size - 2, inv_size - 1, inv_size
+set_slot(inv, hs_a, "wooden-chest", 3, None)
+set_slot(inv, hs_b, "wooden-chest", 5, None)
+set_slot(inv, hs_c, "wooden-chest", 4, "rare")
+def chest_stacks():
+    return [slot_now(inv, hs_a), slot_now(inv, hs_b), slot_now(inv, hs_c)]
+def chest_at(x, y):
+    found = list(puppet.surface.find_entities_filtered(lua.table_from({"name": "wooden-chest", "position": lua.table_from({"x": x, "y": y})})).values())
+    return found[0] if found else None
+take()
+for k in range(3):
+    send({"t": "build", "item": "wooden-chest", "x": fixed(-3.5 - k), "y": fixed(3.5), "d": 0, "hs": hs_a})
+tick(2)
+built_hs = [chest_at(-3.5 - k, 3.5) for k in range(3)]
+check(all(built_hs) and chest_stacks() == [0, 5, 4],
+      f"L7: builds naming the held stack's slot (hs) take all three from that stack: built {[bool(b) for b in built_hs]}, stacks {chest_stacks()}")
+send({"t": "build", "item": "wooden-chest", "x": fixed(-3.5), "y": fixed(4.5), "d": 0, "hs": hs_a})
+tick(2)
+check(chest_stacks() == [0, 4, 4] and chest_at(-3.5, 4.5),
+      f"L7: an hs whose stack is used up still builds, from another normal stack: {chest_stacks()}")
+send({"t": "build", "item": "wooden-chest", "x": fixed(-4.5), "y": fixed(4.5), "d": 0, "hs": hs_c})
+tick(2)
+rare_built = chest_at(-4.5, 4.5)
+check(chest_stacks() == [0, 4, 3] and rare_built and rare_built.quality.name == "rare",
+      f"L7: the held stack's own quality is what is built (a rare stack held, no q sent): {chest_stacks()}")
+send({"t": "build", "item": "wooden-chest", "x": fixed(-5.5), "y": fixed(4.5), "d": 0})
+tick(2)
+check(sum(chest_stacks()[:2]) == 3 and chest_stacks()[2] == 3 and chest_at(-5.5, 4.5) and chest_at(-5.5, 4.5).quality.name == "normal",
+      f"L7: without hs a normal one pays, as before: {chest_stacks()}")
+send({"t": "build", "item": "wooden-chest", "x": fixed(-6.5), "y": fixed(4.5), "d": 0, "hs": 1})
+tick(2)
+check(sum(chest_stacks()[:2]) == 2 and chest_at(-6.5, 4.5),
+      f"L7: an hs naming a slot that holds another item is passed over: {chest_stacks()}")
+for spot in [(-3.5, 3.5), (-4.5, 3.5), (-5.5, 3.5), (-3.5, 4.5), (-4.5, 4.5), (-5.5, 4.5), (-6.5, 4.5)]:
+    if chest_at(*spot):
+        chest_at(*spot).destroy()
+set_slot(inv, hs_a, "iron-plate", 7, None)
+plates_all = inv.get_item_count("iron-plate")
+send({"t": "drop", "item": "iron-plate", "x": fixed(2.5), "y": fixed(2.5), "hs": hs_a})
+tick(2)
+check(slot_now(inv, hs_a) == 6 and inv.get_item_count("iron-plate") == plates_all - 1,
+      f"L7: Z naming the held stack's slot takes the plate from that stack: {slot_now(inv, hs_a)}")
+send({"t": "fast", **target_of(box_chest), "half": 0})
+tick(2)
+# Tiles and capsules leave the held stack too (tiles took any stack, a capsule the first found).
+set_slot(inv, hs_a, "concrete", 4, None)
+set_slot(inv, hs_b, "concrete", 6, None)
+concrete_all = inv.get_item_count("concrete")
+tile_was = F.surface.get_tile(-4, 5).name
+send({"t": "tile", "item": "concrete", "x": fixed(-3.5), "y": fixed(5.5), "n": 1, "hs": hs_a})
+tick(2)
+check(slot_now(inv, hs_a) == 3 and slot_now(inv, hs_b) == 6 and inv.get_item_count("concrete") == concrete_all - 1,
+      f"L7: a tile naming the held stack's slot is paid from that stack: {slot_now(inv, hs_a)}, {slot_now(inv, hs_b)} (was {tile_was})")
+F.surface.set_tile(-4, 5, tile_was)
+set_slot(inv, hs_a, None, 0, None)
+set_slot(inv, hs_b, "grenade", 4, None)
+grenades_all = inv.get_item_count("grenade")
+thrown = len(F.capsules)
+send({"t": "throw", "item": "grenade", "x": fixed(puppet.position.x + 5), "y": fixed(puppet.position.y), "hs": hs_b})
+tick(2)
+check(slot_now(inv, hs_b) == 3 and inv.get_item_count("grenade") == grenades_all - 1 and len(F.capsules) == thrown + 1,
+      f"L7: a capsule naming the held stack's slot is thrown out of that stack: {slot_now(inv, hs_b)} of {grenades_all}")
+# One rule for every command spending from the hand (puppet.held_stack / take_held): the held stack pays only
+# when it is the item in the quality asked for, normal when none is given; else a stack of that quality.
+puppet_mod = lua.eval('package.loaded["scripts.puppet"]')
+set_slot(inv, hs_a, "wooden-chest", 3, "rare")
+set_slot(inv, hs_b, "wooden-chest", 5, None)
+set_slot(inv, hs_c, None, 0, None)
+rule =[puppet_mod.held_stack(inv, hs_a, "wooden-chest") is None,
+        puppet_mod.held_stack(inv, hs_a, "wooden-chest", "rare") is not None,
+        puppet_mod.held_quality(inv, hs_a, "wooden-chest") == "rare"]
+puppet_mod.take_held(inv, hs_a, "wooden-chest", 1)
+rule.append(chest_stacks()[:2] == [3, 4])
+puppet_mod.take_held(inv, hs_a, "wooden-chest", 1, "rare")
+rule.append(chest_stacks()[:2] == [2, 4])
+send({"t": "fast", **target_of(box_chest), "item": "wooden-chest", "n": 1, "q": "rare", "hs": hs_b, "half": 0})
+tick(2)
+rule.append(chest_stacks()[:2] == [1, 4])
+check(all(rule), f"L7: the held stack pays only in the quality asked for (normal by default), else a stack of that quality: {rule}, {chest_stacks()}")
+send({"t": "fast", **target_of(box_chest), "half": 0})
+tick(2)
+for k in (hs_a, hs_b, hs_c):
+    set_slot(inv, k, None, 0, None)
+take()
+
+# N2: Ctrl+click on vehicles, as Factorio's fast transfer: a car takes fuel into its fuel slot, ammo
+# into its ammo slots and anything else into its trunk; a locomotive takes fuel; a full trunk refuses;
+# an empty hand takes the trunk out.
+F.trunk_size = 1
+fast_car = spawn("car", -4.0, 4.0, force="player")
+F.trunk_size = None
+fast_loco = spawn("locomotive", -8.0, 2.0, force="player")
+car_invs = F.inventories[fast_car]
+puppet.insert(lua.table_from({"name": "wood", "count": 40}))
+inv.insert(lua.table_from({"name": "firearm-magazine", "count": 20}))  # the main inventory (the character puts ammo in its ammo slots)
+puppet.insert(lua.table_from({"name": "iron-plate", "count": 200}))
+take()
+wood0 = inv.get_item_count("wood")
+send({"t": "fast", **target_of(fast_car), "item": "wood", "n": 10})
+tick(2)
+check(car_invs["fuel"].get_item_count("wood") == 10 and inv.get_item_count("wood") == wood0 - 10,
+      "N2: Ctrl+click on a car puts the held fuel into its fuel slot")
+check(len(of_type(take(), "slots")) >= 1, "N2: and sends the slots at once, as for a building (the hand and sound follow)")
+mags0 = inv.get_item_count("firearm-magazine")
+send({"t": "fast", **target_of(fast_car), "item": "firearm-magazine", "n": 10})
+tick(2)
+check(car_invs["vehicle_ammo"].get_item_count("firearm-magazine") == 10 and inv.get_item_count("firearm-magazine") == mags0 - 10,
+      "N2: ammo goes into the car's ammo slots")
+plates0 = inv.get_item_count("iron-plate")
+send({"t": "fast", **target_of(fast_car), "item": "iron-plate", "n": 100})
+tick(2)
+check(car_invs["trunk"].get_item_count("iron-plate") == 100 and inv.get_item_count("iron-plate") == plates0 - 100,
+      "N2: anything else goes into the car's trunk")
+take()
+send({"t": "fast", **target_of(fast_car), "item": "iron-plate", "n": 100})
+tick(2)
+check(inv.get_item_count("iron-plate") == plates0 - 100 and car_invs["trunk"].get_item_count("iron-plate") == 100
+      and any("Can't put" in m["text"] for m in of_type(take(), "msg")),
+      "N2: a full trunk refuses, and nothing leaves the inventory")
+wood1 = inv.get_item_count("wood")
+send({"t": "fast", **target_of(fast_loco), "item": "wood", "n": 5})
+tick(2)
+check(F.inventories[fast_loco]["fuel"].get_item_count("wood") == 5 and inv.get_item_count("wood") == wood1 - 5,
+      "N2: a locomotive takes the held fuel")
+send({"t": "fast", **target_of(fast_loco), "item": "iron-plate", "n": 5})
+tick(2)
+check(inv.get_item_count("iron-plate") == plates0 - 100, "N2: a locomotive takes no plates (fuel only)")
+send({"t": "fast", **target_of(fast_car), "half": 0})
+tick(2)
+check(car_invs["trunk"].get_item_count("iron-plate") == 0 and inv.get_item_count("iron-plate") == plates0,
+      "N2: Ctrl+click with an empty hand takes the car's trunk out")
+check(car_invs["fuel"].get_item_count("wood") == 10, "N2: and leaves the car's fuel in its fuel slot")
+# An empty hand never takes fuel (/f3d-perf fast_take): in 2.1 a locomotive's get_output_inventory is its
+# fuel slot, and a boiler's (an empty burnt result inventory) leaves the old fallback at inventory 1,
+# defines.inventory.chest, which is also its fuel (read in 2.1.24).
+fast_boiler = spawn("boiler", -7.5, 6.0, force="player")
+F.inventories[fast_boiler]["fuel"].insert(lua.table_from({"name": "wood", "count": 5}))
+take()
+for who, ent in (("locomotive", fast_loco), ("boiler", fast_boiler)):
+    wood2 = inv.get_item_count("wood")
+    send({"t": "fast", **target_of(ent), "half": 0})
+    tick(2)
+    check(F.inventories[ent]["fuel"].get_item_count("wood") == 5 and inv.get_item_count("wood") == wood2,
+          f"N2: Ctrl+click with an empty hand on a {who} leaves its fuel")
+    check(any(m["text"] == "Nothing to take" for m in of_type(take(), "msg")), f"N2: and the {who} says there is nothing to take")
+# A lab's packs and a turret's ammo are still taken, as before (Factorio's wiki: "takes anything the entity has";
+# whether it does for these wasn't seen in Factorio).
+fast_lab = spawn("lab", -5.5, 9.5, force="player")
+fast_turret = spawn("gun-turret", -2.0, 8.0, force="player")
+F.inventories[fast_lab]["input"].insert(lua.table_from({"name": "automation-science-pack", "count": 3}))
+F.inventories[fast_turret]["turret_ammo"].insert(lua.table_from({"name": "firearm-magazine", "count": 4}))
+for who, ent, role, item, n in (("lab", fast_lab, "input", "automation-science-pack", 3),
+                                ("gun turret", fast_turret, "turret_ammo", "firearm-magazine", 4)):
+    have = inv.get_item_count(item)
+    send({"t": "fast", **target_of(ent), "half": 0})
+    tick(2)
+    check(F.inventories[ent][role].get_item_count(item) == 0 and (role == "turret_ammo" or inv.get_item_count(item) == have + n),  # (ammo goes to the ammo slots)
+          f"N2: Ctrl+click with an empty hand still takes a {who}'s {item}: left {F.inventories[ent][role].get_item_count(item)}, main {have} -> {inv.get_item_count(item)}")
+take()
+fast_lab.destroy()
+fast_turret.destroy()
+g.storage.f3d_perf = lua.table_from({"fast_take": False})
+send({"t": "fast", **target_of(fast_boiler), "half": 0})
+tick(2)
+check(F.inventories[fast_boiler]["fuel"].get_item_count("wood") == 0, "N2: /f3d-perf fast_take off: the boiler's fuel taken, as before")
+g.storage.f3d_perf = None
+take()
+fast_boiler.destroy()
+fast_car.destroy()
+fast_loco.destroy()
 
 # Copy and paste settings (Shift+right / left click): an assembler's recipe.
 asm_a = spawn("assembling-machine-1", 6.5, 6.5, force="player")
@@ -4418,7 +5367,7 @@ send({"t": "copy", "x1": fixed(-30), "y1": fixed(-30), "x2": fixed(-29), "y2": f
 tick(2)
 check(any(m["text"] == "Nothing to copy there" for m in of_type(take(), "msg")), "copying an empty area says so")
 
-# Alt-mode: recipe icons near the focus, and every filter of a filter inserter.
+# Alt-mode: recipe icons near the focus, and every filter of a filter inserter (owner's #23).
 fins = spawn("fast-inserter", 3.5, 3.5, force="player")
 fins.set_filter(2, "iron-plate")
 fins.set_filter(4, "copper-plate")
@@ -4484,11 +5433,31 @@ F["raise"]("on_gui_closed", lua.table_from({"entity": asm_r, "player_index": 1})
 tick(1)
 aiu = [row for m in of_type(take(), "aiu") for row in m["l"]]
 check([asm_r.unit_number, "recipe", "transport-belt"] in aiu, f"#9: a window closed in the real game sends the machine's icon: {aiu}")
+# L10: 2.1 makes the machine's fluid storages from its recipe, each filtered to its fluid: which fluid goes in or out
+# where rides with the mask (the fake's two storages and their connections, as 2.1.24's refinery reports them).
+F.set_fluid(asm_r, 2, None)
+asm_x, asm_y = asm_r.position.x, asm_r.position.y
+F.fluid_conns[asm_r] = lua.table_from({
+    1: {"filter": "crude-oil", "conns": [{"connection_type": "normal", "flow_direction": "input",
+                                         "position": {"x": asm_x + 1, "y": asm_y + 1}, "target_position": {"x": asm_x + 1, "y": asm_y + 2}}]},
+    2: {"filter": "petroleum-gas", "conns": [{"connection_type": "normal", "flow_direction": "output",
+                                             "position": {"x": asm_x - 1, "y": asm_y - 1}, "target_position": {"x": asm_x - 1, "y": asm_y - 2}},
+                                            {"connection_type": "underground", "flow_direction": "output",
+                                             "position": {"x": asm_x, "y": asm_y}, "target_position": {"x": asm_x, "y": asm_y}}]},
+}, recursive=True)
 asm_r.set_recipe("oil-processing")
 F["raise"]("on_gui_closed", lua.table_from({"entity": asm_r, "player_index": 1}))
 tick(1)
 fa = [row for m in of_type(take(), "aiu") for row in m.get("fa", [])]
-check([asm_r.unit_number, 3] in fa, f"#9 part 2: a recipe taking and making fluid sends its arrows' mask (fa 3): {fa}")
+l10_conns = [[1, 1, 8, "i", "crude-oil"], [-1, -1, 0, "o", "petroleum-gas"]]
+check([asm_r.unit_number, 3, l10_conns] in fa,
+      f"#9 part 2, L10: a recipe taking and making fluid sends its arrows' mask (fa 3) and each connection's fluid: {fa}")
+l10_rec = to_py(g.package.loaded["scripts.world"].record(asm_r))
+check(isinstance(l10_rec, list) and len(l10_rec) > 5 and l10_rec[5].get("fc") == l10_conns,
+      f"L10: and its record carries them (fc): {l10_rec}")
+g.storage.f3d_perf = lua.table_from({"fluid_icons": False})
+check(g.package.loaded["scripts.alt_mode"].connections(asm_r) is None, "fluid_icons off: no connections read")
+g.storage.f3d_perf = None
 asm_r.set_recipe("iron-gear-wheel")
 F["raise"]("on_gui_closed", lua.table_from({"entity": asm_r, "player_index": 1}))
 tick(1)
@@ -4499,6 +5468,74 @@ asm_r.destroy()
 alt_furnace.destroy()
 tick(250)
 check(not g.storage.f3d.altw[alt_furnace.unit_number] if g.storage.f3d.altw else True, "#9: a watched machine gone is forgotten after a round")
+take()
+
+# The drill's fluid part: a mining drill with a fluid box (2.1.24 gives one over uranium ore, for its sulfuric acid)
+# takes fluid in, its record's `fa` 1 (the client draws its `-wet` model); without one none. Its own box says
+# (`fluids_count`), not what it mines: the box stays when the ore runs out, and an iron drill with one uranium tile in
+# its area has one too.
+wet_ore = spawn("uranium-ore", 60.5, 60.5, amount=500)
+dry_ore = spawn("iron-ore", 70.5, 60.5, amount=500)
+wet_drill = spawn("electric-mining-drill", 60.5, 60.5, force="player")
+dry_drill = spawn("electric-mining-drill", 70.5, 60.5, force="player")
+wet_drill.mining_target = wet_ore
+dry_drill.mining_target = dry_ore
+F.set_fluids_count(wet_drill, 1)
+check(alt_mode_mod.arrows(wet_drill) == 1 and alt_mode_mod.arrows(dry_drill) is None,
+      "a drill with a fluid box (fluids_count 1): fa 1; with none (0): nil")
+F.set_fluids_count(wet_drill, 0)
+check(alt_mode_mod.arrows(wet_drill) is None,
+      "a drill mining uranium ore whose box is gone (fluids_count 0): nil, the box decides, not the target")
+F.set_fluids_count(wet_drill, 1)
+mixed_drill = spawn("electric-mining-drill", 80.5, 60.5, force="player")
+mixed_ore = spawn("iron-ore", 80.5, 60.5, amount=500)
+mixed_wet = spawn("uranium-ore", 81.5, 61.5, amount=500)
+mixed_drill.mining_target = mixed_ore
+F.set_fluids_count(mixed_drill, 1)
+check(alt_mode_mod.arrows(mixed_drill) == 1,
+      "the mixed area: a drill mining iron ore (no fluid needed) with one uranium tile in its area has its box: fa 1")
+check(alt_mode_mod.arrows(g.F.spawn("burner-mining-drill", 90.5, 90.5, lua.table_from({"force": "player"}))) is None,
+      "a burner drill, no fluid box: nil")
+for e in (mixed_drill, mixed_ore, mixed_wet):
+    e.destroy()
+wet_rec = to_py(g.package.loaded["scripts.world"].record(wet_drill))
+dry_rec = to_py(g.package.loaded["scripts.world"].record(dry_drill))
+check(isinstance(wet_rec, list) and len(wet_rec) > 5 and wet_rec[5].get("fa") == 1,
+      f"the wet drill's record carries fa 1: {wet_rec}")
+check(isinstance(dry_rec, list) and (len(dry_rec) == 5 or "fa" not in dry_rec[5]), f"the dry drill's none: {dry_rec}")
+for e in (wet_drill, dry_drill, wet_ore, dry_ore):
+    e.destroy()
+take()
+
+# Placing an electric drill over uranium ore, as Factorio 2.1.24 does (measured with can_place_entity): refused with
+# Factorio's own reason until the force can mine with fluid (the "Uranium mining" research), even with iron ore beside
+# it; built once it can. The fake's can_place_entity holds that rule.
+# (A free square within reach: earlier checks left a car, a biter and machines round the character.)
+ux, uy = next((math.floor(puppet.position.x) + dx, math.floor(puppet.position.y) + dy)
+              for dx in range(-7, 8) for dy in range(-7, 8)
+              if not any(e.type != "resource" and abs(e.position.x - (math.floor(puppet.position.x) + dx + 0.5)) < 4
+                         and abs(e.position.y - (math.floor(puppet.position.y) + dy + 0.5)) < 4 for e in F.surface.entities.values()))
+u_ores = [spawn("uranium-ore", ux + dx + 0.5, uy + dy + 0.5, amount=500) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+u_iron = spawn("iron-ore", ux + 2.5, uy + 2.5, amount=500)
+g.game.forces.player.mining_with_fluid = False
+puppet.insert(lua.table_from({"name": "electric-mining-drill", "count": 2}))
+take()
+send({"t": "build", "item": "electric-mining-drill", "x": ux * 256 + 128, "y": uy * 256 + 128, "d": 0})
+tick(1)
+said = texts(take())
+drills_at = lambda: [e for e in F.surface.entities.values() if e.name == "electric-mining-drill"
+                     and abs(e.position.x - (ux + 0.5)) < 0.1 and abs(e.position.y - (uy + 0.5)) < 0.1]
+check(not drills_at() and "Uranium mining not researched." in said,
+      f"an electric drill over uranium ore (iron beside it) before Uranium mining: refused in Factorio's words: {said}")
+g.game.forces.player.mining_with_fluid = True
+send({"t": "build", "item": "electric-mining-drill", "x": ux * 256 + 128, "y": uy * 256 + 128, "d": 0})
+tick(1)
+said = texts(take())
+check(len(drills_at()) == 1 and not any("place" in t or "Uranium" in t for t in said),
+      f"and once the force can mine with fluid it is built, waiting for its sulfuric acid as in Factorio: {said}")
+g.game.forces.player.mining_with_fluid = False
+for e in drills_at() + u_ores + [u_iron]:
+    e.destroy()
 take()
 
 # J6: Factorio's Alt-mode shows what is in a chest. While the client says Alt-mode is on (`altc`), the
@@ -4593,7 +5630,48 @@ g.storage.f3d_perf = None
 send({"t": "altc", "on": 0})
 tick(70)
 check(not of_type(take(), "am") and not g.storage.f3d.altc, "K1: Alt-mode off: no more `am`")
-for e in (am_asm, am_lab, am_beacon, am_idle):
+# K1's leftover: ammo turrets' ammo and locomotives' fuel in the same rounds, one icon a filled slot, where a
+# lab's packs go in the row; an empty turret none; the locomotive read where it stands now; nothing read with
+# /f3d-perf alt_ammo_fuel off.
+am_turret = spawn("gun-turret", 20.0, 4.0, force="player")
+F.inventories[am_turret]["turret_ammo"].insert(lua.table_from({"name": "firearm-magazine", "count": 10}))
+am_bare = spawn("gun-turret", 20.0, 8.0, force="player")
+am_loco = spawn("locomotive", 21.0, 20.0, force="player")
+F.inventories[am_loco]["fuel"].insert(lua.table_from({"name": "wood", "count": 5}))
+am_wagon = spawn("cargo-wagon", 21.0, 26.0, force="player")
+for item, n in (("copper-plate", 50), ("iron-plate", 200), ("coal", 80), ("stone", 10), ("wood", 5), ("iron-ore", 80)):
+    F.inventories[am_wagon]["cargo"].insert(lua.table_from({"name": item, "count": n}))
+# Locomotives' fuel is read only when the client asks (`lf`, --loco-fuel-icons=on); wagons' cargo always.
+send({"t": "altc", "on": 1, "g": 4})
+tick(5)
+am_rows = {r[0]: r for m in of_type(take(), "am") if m["g"] == 4 for r in m["l"]}
+check(am_rows.get(am_wagon.unit_number) == [am_wagon.unit_number, 0, ["iron-plate", "coal", "iron-ore", "copper-plate"]]
+      and am_loco.unit_number not in am_rows and am_turret.unit_number in am_rows,
+      f"wagon items: `am` lists a cargo wagon's four most-stacked kinds, most first; no locomotive fuel without `lf`: {am_rows}")
+send({"t": "altc", "on": 1, "g": 5, "lf": 1})
+tick(5)
+am_rows = {r[0]: r for m in of_type(take(), "am") if m["g"] == 5 for r in m["l"]}
+check(am_rows.get(am_turret.unit_number) == [am_turret.unit_number, 0, ["firearm-magazine"]]
+      and am_rows.get(am_loco.unit_number) == [am_loco.unit_number, 0, ["wood"]] and am_bare.unit_number not in am_rows
+      and am_rows.get(am_wagon.unit_number) == [am_wagon.unit_number, 0, ["iron-plate", "coal", "iron-ore", "copper-plate"]]
+      and am_rows.get(am_asm.unit_number) == [am_asm.unit_number, ["speed-module", ["speed-module", "rare"]]],
+      f"K1: Alt-mode on: `am` lists a gun turret's ammo and a locomotive's fuel beside the machines, not an empty turret: {am_rows}")
+F.inventories[am_turret]["turret_ammo"].remove(lua.table_from({"name": "firearm-magazine", "count": 10}))
+F.inventories[am_bare]["turret_ammo"].insert(lua.table_from({"name": "firearm-magazine", "count": 3, "quality": "rare"}))
+tick(70)
+am_rows = [r for m in of_type(take(), "am") for r in m["l"]]
+check(sorted(am_rows, key=str) == sorted([[am_turret.unit_number], [am_bare.unit_number, 0, [["firearm-magazine", "rare"]]]], key=str),
+      f"K1: the next round sends only what changed: a turret out of ammo as [unit], another's ammo with its quality: {am_rows}")
+g.storage.f3d_perf = lua.table_from({"alt_ammo_fuel": False})
+tick(70)
+am_rows = [r for m in of_type(take(), "am") for r in m["l"]]
+check(sorted(am_rows, key=str) == sorted([[am_bare.unit_number], [am_loco.unit_number], [am_wagon.unit_number]], key=str),
+      f"K1: /f3d-perf alt_ammo_fuel off: turrets and locomotives aren't read, their icons go, the machines' stay: {am_rows}")
+g.storage.f3d_perf = None
+send({"t": "altc", "on": 0})
+tick(70)
+take()
+for e in (am_asm, am_lab, am_beacon, am_idle, am_turret, am_bare, am_loco, am_wagon):
     e.destroy()
 send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
 send({"t": "focus", "x": fixed(focus_before["x"]), "y": fixed(focus_before["y"]), "r": int(focus_before["r"])})
@@ -5057,7 +6135,7 @@ def take_by_port():
     """Everything sent, by port; reliable numbering checked per client."""
     by, seq = {}, {}
     for item in F.take_sent().values():
-        port, data = item[1], item[2]
+        port, data = item[1], sent_data(item)
         for msg in protocol.split_datagram(data):
             for problem in protocol.problems(msg):
                 check(False, f"protocol: {problem}")
@@ -5436,7 +6514,7 @@ for _ in range(3):
 tick(1)
 said = texts(take())
 plan = [(p.id.name, at.inventory, at.stack) for p in am_ghost.insert_plan.values() for at in p["items"].in_inventory.values()] if am_ghost else []
-check(sorted(plan) == [("speed-module", 25, 0), ("speed-module", 25, 1)] and "Module requested: 2 of 2 slots" in said
+check(sorted(plan) == [("speed-module", g.defines.inventory.crafter_modules, 0), ("speed-module", g.defines.inventory.crafter_modules, 1)] and "Module requested: 2 of 2 slots" in said
       and "The module slots are full" in said, f"modreq: a ghost's insert plan gets a module per slot, no more (F6): {plan} {said}")
 send({"t": "modreq", "item": "wooden-chest", **mod_at})
 send({"t": "modreq", "clr": 1, "s": 1, **mod_at})
@@ -5670,7 +6748,7 @@ take()
 check(F.launched.type == g.defines.cargo_destination.station and same(F.launched.station, plat2.hub),
       "silo_launch to a built platform lands at its hub")
 
-# Riding the rocket up: into its pod, up to the platform's hub, and inside the hub.
+# Riding the rocket up (#10): into its pod, up to the platform's hub, and inside the hub (#17).
 send({"t": "ride", "u": silo_e.unit_number, "to": 2})
 tick(1)
 check("The rocket isn't ready" in texts(take()) and puppet.cargo_pod is None, "ride: no rocket ready, no ride")
@@ -6004,6 +7082,9 @@ chest = spawn("wooden-chest", puppet.position.x + 2, puppet.position.y + 1, forc
 lines = selftest()
 check(any("PASS the bridge's character has no player" in l for l in lines) and any("PASS character.selected can be set" in l for l in lines)
       and not any("FAIL" in l for l in lines), f"/f3d-selftest on a server: {lines}")
+check(any("PASS string.pack and string.unpack (binary frames)" in l for l in lines)
+      and any(("INFO binary frames: on" if BINARY else "INFO binary frames: off for this client") in l for l in lines),
+      f"/f3d-selftest: string.pack round trip, and this client gets no binary frames (its hello doesn't ask): {lines[-2:]}")
 chest.destroy()
 old_unit = puppet.unit_number
 puppet.destroy()
@@ -6035,6 +7116,13 @@ check(veh and veh[-1]["w"] == 0 and veh[-1]["u"] == 0, f"eq: no vehicle grid: {v
 cinfo = of_type(msgs, "cinfo")
 check(cinfo and cinfo[-1]["reach"] == 100 and cinfo[-1]["craft"] == 1000 and cinfo[-1]["slots"] == 80 and cinfo[-1]["hp"] == 250,
       f"cinfo: reach, crafting speed, slots and health: {cinfo[-1:]}")
+check(cinfo and cinfo[-1].get("mwf") == 0, f"cinfo: the force can't mine with fluid yet on a new map (mwf 0): {cinfo[-1:]}")
+g.game.forces.player.mining_with_fluid = True
+g.storage.f3d.info_sig = None  # (sent on the next tick, not waiting for its once-a-second round)
+tick(1)
+cinfo2 = of_type(take(), "cinfo")
+check(cinfo2 and cinfo2[-1].get("mwf") == 1, f"cinfo: once it can (Uranium mining researched), mwf 1: {cinfo2[-1:]}")
+g.game.forces.player.mining_with_fluid = False
 pl = of_type(msgs, "pl")
 check(pl and pl[-1]["me"] == 0 and pl[-1]["u"] == puppet.unit_number, f"pl: the bridge's own character plays no player: {pl[-1:]}")
 send({"t": "eq_put", "kind": "char", "fi": gear_slots["energy-shield-equipment"], "x": 2, "y": 0})
@@ -6201,7 +7289,7 @@ launch = [json.loads(item[2]) for item in F.take_sent().values() if item[1] == 3
 g.storage.f3d.client = kept_client
 check(len(launch) == 1 and launch[0]["t"] == "launch",
       f"Ctrl+F9 with no client connected asks Zenith's launcher on 34209 to start Zenith ({launch})")
-# With no launcher running nothing answered and nothing showed. Two seconds
+# The owner's bug: with no launcher running nothing answered and nothing showed. Two seconds
 # without its `launching` opens the bridge's window saying what to set up.
 screen = g.game.get_player(1).gui.screen
 check(screen["f3d-launch-help"] is None, "no help window while the launcher still has time to answer")
@@ -7339,8 +8427,10 @@ bs_mod.extra_units = saved_extra
 bs_mod.pc_every = 1000
 check(drift_on["pu"].get(u3 * 8 + 2) == [8104, 8104] and u3 * 8 + 2 in drift_off["pc"],
       f"bs pc_ids: a packed lane's drift check carries its ids with no extra share left: {drift_on['pu']} {drift_off['pc'].get(u3 * 8 + 2)}")
-# drift_watched: a watched belt's lanes get drift checks too (off: none, as before).
+# drift_watched: a watched belt's lanes get drift checks too (off: none, as before). (quiet_pc off: its checks every
+# turn, as these look for one in a window; quiet_pc's own checks follow.)
 bs_mod.pc_every = 1
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "quiet_pc off"}))
 F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "drift_watched on"}))
 tick(12)
 take()  # (an update's work list is made on the tick after the one before is sent)
@@ -7356,6 +8446,79 @@ bs_mod.pc_every = 1000
 check(uw * 8 + 1 in dw_on["pc"] and uw * 8 + 1 not in dw_off["pc"] and u3 * 8 + 2 in dw_off["pc"],
       f"bs drift_watched: a watched lane's drift check is sent with it on, not off; an unwatched one's either way: "
       f"{dw_on['pc'].get(uw * 8 + 1)} {dw_off['pc'].get(uw * 8 + 1)}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "quiet_pc default"}))
+
+
+# quiet_pc (on by default): an unwatched belt whose drift checks keep agreeing has each next one twice as far off, up
+# to quiet_pc_max ticks; any touch (a full read of its lanes, a `bre`, a watched belt behind it changing) puts it back
+# to every turn. (sb3: unwatched, fed by sb2, a pickup and drop belt; tails are off here, so only the wake reaches it.)
+def pc_ticks(ticks, key):
+    """The ticks of `key`'s drift checks over `ticks` ticks."""
+    got = []
+    for j in range(ticks // 6):
+        if j % 10 == 0:
+            # (The same hello again: the session drops a client it hasn't heard a hello from in 600 ticks.)
+            send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "z": 1, "bl": 1, "bs": 1})
+        tick(6)
+        for m in of_type(take(), "bs"):
+            pc = m.get("pc", [])
+            got += [pc[i + 1] for i in range(0, len(pc), 5) if pc[i] == key]
+    return got
+
+
+def gaps(ts):
+    return [b - a for a, b in zip(ts, ts[1:])]
+
+
+q_key = u3 * 8 + 2
+bs_mod.pc_every = 1
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "quiet_pc_max 200"}))
+take()
+q_on = gaps(pc_ticks(600, q_key))
+q_rec = lambda f: lua.eval(f"storage.f3d.bs.belts[{u3}].{f}")
+check(len(q_on) >= 4 and all(b >= a for a, b in zip(q_on, q_on[1:])) and q_on[-1] > 2 * q_on[0]
+      and max(q_on) <= 200 + 6 and q_rec("qw") == 200,
+      f"bs quiet_pc: an untouched lane's drift checks come further apart each time, up to quiet_pc_max (200): gaps {q_on}, qw {q_rec('qw')}")
+# A `bre` for it: read in full, back to every turn.
+send({"t": "bre", "l": [q_key]})
+tick(12)
+take()
+check(q_rec("qw") is None, f"bs quiet_pc: a lane read again for the client (bre) is woken: qw {q_rec('qw')}")
+q_after = gaps(pc_ticks(60, q_key))
+check(q_after and q_after[0] <= q_on[0] + 6, f"bs quiet_pc: and checked every turn again: gaps {q_after} (first quiet {q_on})")
+# A watched belt behind it that changed wakes it (its tails' reach), read or not.
+pc_ticks(300, q_key)
+qw_before, woken0 = q_rec("qw"), int(bs_mod.counts["woken"] or 0)
+F.put_on_belt(sb2, 1, "iron-plate", 0.9, 8199)
+tick(66)  # (sb2, quiet, is checked again within spot_quiet_ticks)
+take()
+qw_now = q_rec("qw")
+check(qw_before and qw_before > 48 and int(bs_mod.counts["woken"]) > woken0 and (qw_now is None or qw_now <= 48),
+      f"bs quiet_pc: a watched belt behind it (sb2) that changed wakes it (its checks starting over): qw {qw_before} -> {qw_now}")
+F.move_on_belt(sb2, 1, 8199, None)
+tick(12)
+take()
+# The cap: never more than quiet_pc_max apart (0: every turn).
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "quiet_pc_max 0"}))
+q_zero = gaps(pc_ticks(300, q_key))[-4:]
+check(q_zero and max(q_zero) <= 12, f"bs quiet_pc_max 0: every turn: gaps {q_zero}")
+# Off: every turn, as before.
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "quiet_pc_max default"}))
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "quiet_pc off"}))
+q_off = gaps(pc_ticks(300, q_key))
+check(q_off and max(q_off) <= 12, f"bs quiet_pc off: every turn, as before: gaps {q_off}")
+F.commands["f3d-bs"](lua.table_from({"name": "f3d-bs", "parameter": "quiet_pc default"}))
+said_q = str(bs_mod.option_command("")[1])
+check("quiet_pc on" in said_q and "quiet_pc_max 3600" in said_q, "/f3d-bs lists quiet_pc (on) and quiet_pc_max (3600: a minute)")
+# A splitter set again wakes the belts after it (tracker.configured, from a paste, its window or Zenith's screen).
+lua.eval('package.loaded["scripts.tracker"].configured')(s_lane)
+# Step 1: full reads counted by cause, watched or not (/f3d-bs reads).
+said_reads = str(bs_mod.option_command("reads")[1])
+check("bs reads" in said_reads and "asked=" in said_reads and "load=" in said_reads and "pc_quiet=" in said_reads
+      and int(bs_mod.counts["ru_asked"] or 0) >= 1,
+      f"/f3d-bs reads: full reads by cause (watched/unwatched) and the drift checks skipped: {said_reads}")
+bs_mod.pc_every = 1000
+take()
 # bre: lanes the client has otherwise are read in full (with their meta) in the next update made.
 # (Each update's work list is made on the tick after the one before is sent: a change shows the
 # update after.)
@@ -7913,8 +9076,9 @@ world_mod.count_interval = saved_count_interval
 
 # D6 (last: its ticks would shift the periodic jobs' phase for the checks above): a client that says dq
 # gets every datagram numbered: its last line is {"t":"dg","n":N,"k":tick,"b":bytes before it}, N counting
-# up without gaps, so the client can count the datagrams the OS dropped.
-send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "b": 1, "dq": 1})
+# up without gaps, so the client can count the datagrams the OS dropped. (JSON lines even with --binary: bin 0;
+# binary datagrams' dg frame is test_binary.py's.)
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1, "b": 1, "dq": 1, "bin": 0})
 tick(1)
 take()
 raw = []
@@ -8405,6 +9569,15 @@ dark2.electric_network_id = None
 check(unplugged_at(alerts_now(True), 100.5, -80.5), "alerts_quiet off: every chunk every pass, as before")
 dark2.destroy()
 set_perf()
+# alerts_quiet waits PASS_INTERVAL (600 ticks) after a pass finishes before starting the next.
+alerts_mod.current()
+p_after = int(alerts_mod.pass_count())
+alive(300)
+p_mid = int(alerts_mod.pass_count())
+alive(320)
+p_next = int(alerts_mod.pass_count())
+check(p_mid == p_after and p_next > p_after,
+      f"alerts_quiet: waits PASS_INTERVAL after a pass finishes ({p_after} -> {p_mid} -> {p_next})")
 
 # J5: round the focus the unplugged icon comes from fluids_power's read and the build events, not the pass
 # over every surface (10-40 s late on a big base): a machine built out of every pole's reach is listed the
@@ -8530,6 +9703,83 @@ for e in (j9_tur, j9_fur, j9_drill):
 alive(2)
 take()
 
+# L11: a pipeline over Factorio's extent limit (pipeline_overextended): one entity of its segment in `al` `pipeline`
+# the tick after a pipe is built round the focus (not at the pass), the segment's entity nearest the line 320 tiles
+# in from its far edge (where a pump would split it); its pipes' hinfo says the extent and the status; gone once
+# mended; the pass finds it too; pipe_alerts off: none.
+l11 = [spawn("pipe", 36.5 + i, 48.5, force="player") for i in range(4)]
+l11_box = {"left_top": {"x": 30.2, "y": 48.2}, "right_bottom": {"x": 358.8, "y": 48.8}}
+for p_ in l11:
+    F.segments[p_] = lua.table_from({"id": 77, "box": l11_box}, recursive=True)
+    p_.status = g.defines.entity_status.pipeline_overextended
+until_read()
+alive(8)
+take()
+F["raise"]("script_raised_built", lua.table_from({"entity": l11[3]}))
+alive(8)
+k = kinds_in(take())
+check(k is not None and k.get("pipeline") == [l11[2].unit_number],
+      f"L11: an overextended pipeline is one `pipeline` alert the ticks after a pipe is built, on its pipe nearest the cut "
+      f"(358.8 - 320 = 38.8: the third): {k}")
+send({"t": "hinfo", "q": 61, "u": l11[0].unit_number, "p": 0, "x": fixed(l11[0].position.x), "y": fixed(l11[0].position.y)})
+tick(2)
+hp_ = {m["q"]: m for m in of_type(take(), "hinfo")}.get(61, {})
+check(hp_.get("pl") == [329, 320] and hp_.get("ox") == 1 and "el" not in hp_,
+      f"L11: a pipe's hinfo: its pipeline's extent over the limit and overextended: {hp_}")
+check(any(kind == "pipeline" and shown for kind, _, shown in to_py(alerts_mod.current())["l"]),
+      "L11: the alerts' pass lists it too")
+for p_ in l11:
+    p_.status = g.defines.entity_status.working
+F["raise"]("script_raised_built", lua.table_from({"entity": l11[0]}))
+alive(8)
+k = kinds_in(take())
+check(k is not None and "pipeline" not in k, f"L11: mended (a pump split it), it goes at once: {k}")
+for p_ in l11:
+    p_.status = g.defines.entity_status.pipeline_overextended
+set_perf(pipe_alerts=False)
+F["raise"]("script_raised_built", lua.table_from({"entity": l11[1]}))
+alive(70)
+k = kinds_in(take())
+check(k is not None and "pipeline" not in k and not any(kind == "pipeline" for kind, _, _ in to_py(alerts_mod.current())["l"]),
+      f"pipe_alerts off: no pipeline alert, from the spots or the pass: {k}")
+set_perf()
+for p_ in l11:
+    p_.destroy()
+alive(2)
+take()
+
+# L6: a resource's hinfo has its amount now; the map's `rpatch` sums the patch under the point (ore within its search
+# radius of each other, 3 tiles: a gap of 2 joins, one 5 away doesn't), its tiles as runs a row; an infinite one's
+# yields in percent of its normal amount; nothing where there is no charted resource.
+l6_ore = [spawn("iron-ore", 60.5 + i, 60.5, amount=100 + i) for i in range(3)]
+l6_ore.append(spawn("iron-ore", 65.5, 60.5, amount=1000))  # 3 tiles from the last: joins
+l6_far = spawn("iron-ore", 72.5, 60.5, amount=5000)  # 7 tiles on: another patch
+l6_oil = [spawn("crude-oil", 60.5, 70.5, amount=150000), spawn("crude-oil", 70.5, 70.5, amount=300000)]
+F.charted["1,1"] = True
+F.charted["1,2"] = True
+F.charted["2,1"] = True
+F.charted["2,2"] = True
+send({"t": "hinfo", "q": 62, "u": 0, "p": eid["iron-ore"], "x": fixed(60.5), "y": fixed(60.5)})
+send({"t": "rpatch", "q": 63, "x": fixed(61.2), "y": fixed(60.7)})
+send({"t": "rpatch", "q": 64, "x": fixed(70.0), "y": fixed(71.0)})
+send({"t": "rpatch", "q": 65, "x": fixed(10.5), "y": fixed(90.5)})
+tick(4)
+msgs = take()
+hr6 = {m["q"]: m for m in of_type(msgs, "hinfo")}.get(62, {})
+rp = {m["q"]: m for m in of_type(msgs, "rpatch")}
+check(hr6.get("ra") == 100, f"L6: a resource's hinfo says its amount now: {hr6}")
+ore_patch = rp.get(63, {})
+check(ore_patch.get("n") == "iron-ore" and ore_patch.get("a") == 100 + 101 + 102 + 1000 and ore_patch.get("c") == 4
+      and ore_patch.get("o") == [[60, 60, 3, 65, 1]] and "y" not in ore_patch,
+      f"L6: rpatch sums the ore patch under the point, within its search radius, and outlines its tiles: {ore_patch}")
+oil_patch = rp.get(64, {})
+check(oil_patch.get("n") == "crude-oil" and oil_patch.get("c") == 2 and oil_patch.get("y") == 150
+      and oil_patch.get("o") == [[69, 59, 3, 69, 3], [70, 59, 3, 69, 3], [71, 59, 3, 69, 3]],
+      f"L6: crude oil wells 10 apart are one field (radius 12), its yields summed (50% + 100%), each well's 3x3 outlined: {oil_patch}")
+check(rp.get(65) is not None and set(rp[65]) <= {"t", "q", "k"}, f"L6: no resource there: only q: {rp.get(65)}")
+for e in l6_ore + [l6_far] + l6_oil:
+    e.destroy()
+
 # J20: mining sends `mnd` the tick it finishes, before the `del` (which waits in the reliable outbox), with what the
 # character got, and the inventory at once.
 j9_belt = spawn("transport-belt", 41.5, 40.5, force="player", direction=4)
@@ -8592,6 +9842,74 @@ send(dict(target_of(j9_put), t="fast", item="iron-plate", n=1))
 alive(1)
 check(len(list(g.F_resent.values())) == 0, "put_lanes off: nothing asked, as before")
 set_perf()
+
+# drop_put: Z onto a belt tells the item at once as a put with no inserter (`ie` kind 6, unit 0: lane, place, id) for a
+# client whose hello says `ho`, and wakes the belt's drift checks (quiet_pc); off: the lanes' read alone, as before.
+def z_put_records(msgs):
+    out = []
+    for m in of_type(msgs, "ie"):
+        l = list(m["l"])
+        if m.get("z") == 1:
+            for i in range(9, len(l)):
+                l[i] += l[i - 9]
+        for i in range(0, len(l), 9):
+            if l[i] == 6 and l[i + 1] == 0:
+                out.append(l[i:i + 9])
+    return out
+
+
+# (The client's `ie` and `ho` set as its hello would, without a new hello: one resends what a later check counts.)
+dz_t0 = int(g.game.tick)
+g.storage.f3d.client.ie, g.storage.f3d.client.ho = True, True
+dz_belt = spawn("transport-belt", 43.5, 41.5, force="player", direction=4)
+dz_unit = int(dz_belt.unit_number)
+g.F_dz_belt = dz_belt
+lua.execute("""
+local surface = game.surfaces[1]
+F_spill_real = surface.spill_item_stack
+surface.spill_item_stack = function(p)
+  -- (the game's spill with allow_belts: onto the belt under it, with the newest unique id)
+  F.next_item_id = (F.next_item_id or 9000) + 1
+  F.put_on_belt(F_dz_belt, 1, p.stack.name, 0.4, F.next_item_id)
+  return {}
+end
+""")
+alive(70)
+take()
+# (A quiet belt's record, as belt_sim.lua keeps it, its next drift check 1800 ticks off: there only while the drop is
+# handled, the packet being handled at once.)
+def quiet_drop():
+    g.storage.f3d.bs.belts[dz_unit] = lua.table_from({"qw": 1800, "ql": g.game.tick})
+    send({"t": "drop", "item": "iron-plate", "x": fixed(43.5), "y": fixed(41.5)})
+    rec = g.storage.f3d.bs.belts[dz_unit]
+    g.storage.f3d.bs.belts[dz_unit] = None
+    return rec.qw, rec.ql
+
+
+qd = quiet_drop()
+alive(3)
+zp = z_put_records(take())
+check(len(zp) >= 1 and zp[0][3] // 8 == dz_unit and zp[0][3] % 8 == 1 and zp[0][5] == int(g.F.next_item_id)
+      and zp[0][6] == iid["iron-plate"] and zp[0][7] == 1 and zp[0][8] == dz_unit,
+      f"drop_put: Z onto a belt is told at once as a put with no inserter (lane, place, id): {zp[:1]} (unit {dz_unit})")
+check(qd == (None, None), f"drop_put: and its quiet belt's drift checks come every turn again: {qd}")
+alive(10)
+take()  # (each record goes again in the next messages)
+set_perf(drop_put=False)
+qd = quiet_drop()
+alive(3)
+check(not z_put_records(take()) and qd[0] == 1800, f"drop_put off: no put told, the belt left quiet, as before: {qd}")
+set_perf()
+g.storage.f3d.client.ho = None
+alive(10)
+take()
+send({"t": "drop", "item": "iron-plate", "x": fixed(43.5), "y": fixed(41.5)})
+alive(3)
+check(not z_put_records(take()), "drop_put: none for a hello without `ho`")
+lua.execute("game.surfaces[1].spill_item_stack = F_spill_real")
+g.storage.f3d.client.ie = None
+alive((30 - (int(g.game.tick) - dz_t0) % 30) % 30)  # (the checks below keep the inventory's 30-tick phase)
+take()
 
 # Issue #18: F takes the items on belts within the character's item pickup distance too, as Factorio's "Pick up
 # items": all in range a tick, nearest first, each said at once (`pku`: where it was, its lane and unique id), the
@@ -8700,6 +10018,173 @@ send({"t": "pickup"})
 alive(1)
 pk_l = [r for m in of_type(take(), "pku") for r in m["l"]]
 check(pk_l and pk_l[0][5] == 18030 and pk_uids(pk_belt, 2) == [], f"belt_pickup back on: the belt's item comes off: {pk_l}")
+alive(40)
+take()
+# pickup_stop (the owner: F picked on for almost a second after it was let go): F let go ends the pickup at once;
+# an old client that never sends it keeps picking until HOLD_TICKS (30) after its last `pickup`; switched off, ignored.
+send({"t": "pickup"})
+alive(1)
+take()
+send({"t": "pickup_stop"})
+alive(1)
+F.put_on_belt(pk_belt, 2, "copper-plate", 0.75, 18040)
+ps_ground = spawn("item-on-ground", 60.3, 49.8, stack={"name": "wood", "count": 1})
+alive(40)
+ps_msgs = take()
+check(pk_uids(pk_belt, 2) == [18040] and ps_ground.valid and not of_type(ps_msgs, "pku"),
+      "pickup_stop: after F is let go nothing more is picked, off a belt or the ground")
+send({"t": "pickup"})
+alive(10)
+ps_l = [r for m in of_type(take(), "pku") for r in m["l"]]
+check(ps_l and pk_uids(pk_belt, 2) == [] and not ps_ground.valid,
+      f"pickup_stop: held again, both picked: {ps_l}")
+F.put_on_belt(pk_belt, 2, "copper-plate", 0.75, 18041)
+alive(10)
+check(pk_uids(pk_belt, 2) == [], "pickup_stop: an old client (no stop) still picks 20 ticks after its last pickup")
+alive(20)
+F.put_on_belt(pk_belt, 2, "copper-plate", 0.75, 18042)
+alive(5)
+check(pk_uids(pk_belt, 2) == [18042], "pickup_stop: and stops once HOLD_TICKS have passed, as before")
+send({"t": "pickup"})
+alive(1)
+take()
+set_perf(pickup_stop=False)
+send({"t": "pickup"})
+alive(1)
+send({"t": "pickup_stop"})
+alive(1)
+F.put_on_belt(pk_belt, 2, "copper-plate", 0.75, 18043)
+alive(5)
+check(pk_uids(pk_belt, 2) == [], "pickup_stop off: the stop ignored, picking on until HOLD_TICKS, as before")
+set_perf()
+alive(40)
+take()
+# pickup_stop, the owner's case measured (belts-pickup-test): the client's own cadence (a `pickup` every 9 ticks
+# while F is held, `pickup_stop` on release), the packets a tick or two late, a belt fed an item every tick under the
+# character; what the game picks after F is let go, an old client (no stop) against a new one.
+PS_UID = [18100]
+
+
+def ps_run(stop, delay, release, ticks=60):
+    """Holds F from client tick 0 to `release`; returns [(ticks after release, items)] for each pku after it."""
+    due = {}
+    for t in range(0, release, 9):
+        due.setdefault(t + delay, []).append({"t": "pickup"})
+    if stop:
+        due.setdefault(release + delay, []).append({"t": "pickup_stop"})
+    after = []
+    for t in range(ticks):
+        for m in due.get(t, []):
+            send(m)
+        PS_UID[0] += 1
+        F.put_on_belt(pk_belt, 2, "copper-plate", 0.75, PS_UID[0])
+        alive(1)
+        for m in of_type(take(), "pku"):
+            if t >= release:
+                after.append((t - release, len(m["l"])))
+    return after
+
+
+ps_res = {}
+for ps_delay in (1, 2):
+    for ps_rel in (27, 31, 35):  # let go right after a repeat, between two, just before the next
+        for ps_stop in (False, True):
+            ps_res[(ps_delay, ps_rel, ps_stop)] = ps_run(ps_stop, ps_delay, ps_rel)
+            alive(40)
+            take()
+for k, v in sorted(ps_res.items()):
+    print(f"  pickup_stop measured: delay {k[0]}, let go at {k[1]}, stop {k[2]}: last pick "
+          f"+{max([a for a, _ in v], default=-1)} ticks, {sum(n for _, n in v)} items after F was let go")
+check(all(max([a for a, _ in v], default=-1) <= k[0] for k, v in ps_res.items() if k[2]),
+      "pickup_stop measured: with the stop, nothing is picked later than the packet's own delay after F is let go")
+check(all(sum(n for _, n in v) <= k[0] for k, v in ps_res.items() if k[2]),
+      "pickup_stop measured: with the stop, at most an item a tick of the packet's delay after F is let go")
+check(all(max([a for a, _ in v], default=-1) >= 20 for k, v in ps_res.items() if not k[2]),
+      "pickup_stop measured: an old client (no stop) picks on 20 ticks and more (as before, for old clients)")
+# The inventory of a pick just before the stop still reaches the client (a pick's report waits PICK_REPORT_TICKS).
+send({"t": "pickup"})
+alive(1)
+take()
+F.put_on_belt(pk_belt, 2, "copper-plate", 0.75, 18190)
+alive(1)
+take()
+F.put_on_belt(pk_belt, 2, "copper-plate", 0.75, 18191)
+alive(1)
+ps_m = take()
+send({"t": "pickup_stop"})
+alive(8)
+ps_m += take()
+check(of_type(ps_m, "pku") and pk_uids(pk_belt, 2) == [], "pickup_stop: the item picked the tick before the stop is said")
+check([m for m in ps_m if m.get("t") in ("inv", "slots")],
+      f"pickup_stop: its inventory still sent soon after the stop: {[m.get('t') for m in ps_m]}")
+alive(40)
+take()
+# A stop with no pickup going: quietly nothing.
+send({"t": "pickup_stop"})
+alive(2)
+check(g.storage.f3d.pickup is None and not of_type(take(), "msg"), "pickup_stop with no pickup going: quietly nothing")
+# F held with the inventory full: said once; let go and pressed again, once more.
+F.inventory_space = 0
+for _ in range(3):
+    PS_UID[0] += 1
+    F.put_on_belt(pk_belt, 2, "copper-plate", 0.75, PS_UID[0])
+    send({"t": "pickup"})
+    alive(9)
+ps_full = [m for m in of_type(take(), "msg") if m["text"] == "Inventory full"]
+check(len(ps_full) == 1, f"pickup_stop: F held with the inventory full says so once: {len(ps_full)}")
+send({"t": "pickup_stop"})
+alive(2)
+send({"t": "pickup"})
+alive(9)
+ps_full = [m for m in of_type(take(), "msg") if m["text"] == "Inventory full"]
+check(len(ps_full) == 1, f"pickup_stop: pressed again, said once more: {len(ps_full)}")
+send({"t": "pickup_stop"})
+F.inventory_space = float("inf")
+alive(40)
+take()
+# Mining held at the same time: the stop leaves the mining alone.
+ps_tree = spawn("tree-01", 61.5, 51.5)
+send({"t": "mine", "u": 0, "p": eid["tree-01"], "x": fixed(61.5), "y": fixed(51.5)})
+send({"t": "pickup"})
+alive(1)
+ps_mining = g.storage.f3d.mining
+send({"t": "pickup_stop"})
+send({"t": "mine", "u": 0, "p": eid["tree-01"], "x": fixed(61.5), "y": fixed(51.5)})
+alive(1)
+check(ps_mining is not None and g.storage.f3d.mining is not None and g.storage.f3d.pickup is None,
+      f"pickup_stop: mining held at the same time goes on, the pickup ends ({ps_mining is not None})")
+send({"t": "mine_stop"})
+alive(2)
+if ps_tree.valid:
+    ps_tree.destroy()
+take()
+# Two clients: one's stop leaves the other's pickup going (storage.f3d is swapped per client).
+ps_mp = F.multiplayer
+F.multiplayer = True  # (in single-player a hello from another port takes the one client's place)
+send(hello_now)  # (A heard just now, so B's hello is a second client, not A's restart)
+alive(1)
+send({"t": "hello", "v": 1, "sid": "ps-b", "w": 0}, port=PORT_B)
+alive(3)
+take_by_port()
+send({"t": "pickup"})
+send({"t": "pickup"}, port=PORT_B)
+alive(1)
+ps_b = g.storage.f3d_extra[PORT_B]
+ps_ok = g.storage.f3d.pickup is not None and ps_b.pickup is not None
+send({"t": "pickup_stop"}, port=PORT_B)
+alive(1)
+check(ps_ok and g.storage.f3d.pickup is not None and ps_b.pickup is None,
+      "pickup_stop, two clients: B's stop ends B's pickup, A's goes on")
+send({"t": "pickup"}, port=PORT_B)
+alive(1)
+send({"t": "pickup_stop"})
+alive(1)
+check(g.storage.f3d.pickup is None and ps_b.pickup is not None, "pickup_stop, two clients: A's stop leaves B's going")
+send({"t": "pickup_stop"}, port=PORT_B)
+send({"t": "bye"}, port=PORT_B)
+alive(3)
+take_by_port()
+F.multiplayer = ps_mp
 alive(40)
 take()
 for e in (pk_belt, pk_far, pk_under):
@@ -8811,6 +10296,70 @@ for upd in range(1, 21):
 far_after = int(bs_mod.counts.far_checks or 0)
 check(read_at is not None and read_at > 1 and far_after > far_before,
       f"far_tier: a far inserter's take is read after a few updates, not at once: update {read_at}, {far_after - far_before} far checks")
+# Zero-alloc far_split keeps deterministic ascending unit-number order when two actors share a far belt,
+# skips downstream tail catch-up on far belts while keeping near tails, skips far bre read_runs, and orders
+# asked bre groups nearest-first.
+ft_ins_tie = spawn("inserter", fx0 + 10, fy0 - 1, force="player")
+ft_ins_tie.pickup_target = ft_belts[10]
+F.set_hand(ft_ins[10], fx0 + 10, fy0 + 0.5, None)
+F.set_hand(ft_ins[1], fx0 + 1, fy0 + 0.5, None)
+for b_i, base_id in [(0, 9600), (1, 9610), (2, 9620), (9, 9630), (10, 9640), (11, 9650)]:
+    F.move_on_belt(ft_belts[b_i], 1, 9500 + b_i, None)
+    for s_idx, pos in enumerate((0.1, 0.35, 0.6, 0.85)):
+        F.put_on_belt(ft_belts[b_i], 1, "iron-plate", pos, base_id + s_idx)
+g.storage.f3d_bs = lua.table_from({"far_tier": True, "far_ring": 4, "far_units": 200})
+bs_mod.reset()
+alive(60)
+take()
+ft2 = g.storage.f3d.bs.ft
+ft_u = list(to_py(ft2.units)) if ft2 else []
+ft_k = list(to_py(ft2.kinds)) if ft2 else []
+u10, u_ins10, u_tie = int(ft_belts[10].unit_number), int(ft_ins[10].unit_number), int(ft_ins_tie.unit_number)
+p_lo, p_hi, p_b10 = ft_u.index(min(u_ins10, u_tie)), ft_u.index(max(u_ins10, u_tie)), ft_u.index(u10)
+check(p_lo < p_hi < p_b10 and ft_k[p_lo] == 7 and ft_k[p_hi] == 7 and ft_k[p_b10] == 3,
+      f"far_split tie-break puts both actors ascending before their far belt: {(p_lo, p_hi, p_b10)}")
+tail_0 = int(bs_mod.counts.r_tail or 0)
+F.move_on_belt(ft_belts[10], 1, 9640, None)
+F.set_hand(ft_ins[10], fx0 + 10, fy0 + 0.5, "iron-plate")
+alive(6)
+take()
+tail_far = int(bs_mod.counts.r_tail or 0)
+F.move_on_belt(ft_belts[1], 1, 9610, None)
+F.set_hand(ft_ins[1], fx0 + 1, fy0 + 0.5, "iron-plate")
+alive(6)
+take()
+tail_near = int(bs_mod.counts.r_tail or 0)
+check(tail_far == tail_0 and tail_near > tail_0,
+      f"far_tier skips far tail catch-up ({tail_0} -> {tail_far}) while near belts still catch up (-> {tail_near})")
+key1 = int(ft_belts[1].unit_number) * 8 + 1
+r_run0 = int(bs_mod.counts.r_run or 0)
+send({"t": "bre", "l": [key10]})
+alive(6)
+take()
+r_run_far = int(bs_mod.counts.r_run or 0)
+send({"t": "bre", "l": [key1]})
+alive(6)
+take()
+r_run_near = int(bs_mod.counts.r_run or 0)
+check(r_run_far == r_run0 and r_run_near > r_run0,
+      f"far bre skips read_runs ({r_run0} -> {r_run_far}) while near bre runs read_runs (-> {r_run_near})")
+while g.storage.f3d.bs.round is not None:
+    alive(1)
+take()
+send({"t": "bre", "l": [key10, key1]})
+alive(1)
+q_groups = []
+rnd = g.storage.f3d.bs.round
+if rnd:
+    for seg in to_py(rnd.q):
+        if seg[0] == 2:
+            q_groups = seg[1]
+            break
+check(len(q_groups) >= 2 and key1 in q_groups[0] and key10 in q_groups[1],
+      f"bre groups ordered nearest-first by scan index despite far sent first: {q_groups}")
+alive(6)
+take()
+ft_ins_tie.destroy()
 g.storage.f3d_bs = None
 for e in ft_belts + ft_ins:
     e.destroy()
@@ -8984,7 +10533,7 @@ def drain():
     reliable messages to this port."""
     out = []
     for item in F.take_sent().values():
-        out += protocol.split_datagram(item[2])
+        out += protocol.split_datagram(sent_data(item))
     return out
 
 
@@ -9361,6 +10910,106 @@ check(k22["default"][0] and k22["default"][1] is not None and k22["default"][1] 
       and k22["off"][0] and (k22["off"][1] is None or k22["off"][1] > 7),
       f"K22 mined_tell: a belt the character mines leaves the belt simulation (dl) in the next update (off: later): "
       f"(mined, ticks from its mining to its dl) {k22}")
+# The owner's FUE5 pipe left open at its end: the character mines the middle of a run of five pipes with no player
+# (Factorio raises nothing then): the two pipes beside it are sent again (`upd`) the tick after with their new
+# connections, now the run's endings (pc 8 and 2) (/f3d-perf mined_neighbours; off: never, their records kept the side
+# to the mined pipe and the client drew them as straights, open at the end in FUE5's kit).
+pe = {}
+pe_home = puppet.position
+# (records go only for subscribed chunks: the pipes' chunk added to what this client has, put back after)
+pe_subs = [[int(c) for c in k.split(",")] for k in to_py(lua.eval(
+    "function() local o = {} for k in pairs(storage.f3d.subs) do o[#o + 1] = k end return o end")())]
+pe_chunk = [int((kx + 1.5) // 32), int((ky + 20.5) // 32)]
+send({"t": "sub", "c": pe_subs + [pe_chunk]})
+keep(10)
+drain()
+g.settings["global"]["f3d-act-as-player"]["value"] = False
+for flag, dy_ in (("off", 18), ("default", 20)):
+    F.commands["f3d-perf"](lua.table_from({"name": "f3d-perf", "parameter": "mined_neighbours " + flag}))
+    run_ = []
+    for i_ in range(5):
+        p_ = spawn("pipe", kx + 1.5 + i_, ky + dy_ + 0.5, force="player")
+        F["raise"]("script_raised_built", lua.table_from({"entity": p_}))
+        run_.append(p_)
+    keep(5)
+    drain()
+    mid_ = run_[2]
+    puppet.teleport(lua.table_from({"x": kx + 3.5, "y": ky + dy_ - 1.5}))
+    mine_ = {"t": "mine", "u": int(mid_.unit_number), "p": eid["pipe"], "x": fixed(kx + 3.5), "y": fixed(ky + dy_ + 0.5),
+             "ox": fixed(0.0), "oy": fixed(2.0)}
+    t_mined, got_ = None, {}
+    for t_ in range(300):
+        if t_ % 9 == 0 and mid_.valid:
+            send(mine_)
+        keep(1)
+        if t_mined is None and not mid_.valid:
+            t_mined = g.game.tick
+        for m_ in of_type(drain(), "upd"):
+            if t_mined is not None and m_["e"][0] in (run_[1].unit_number, run_[3].unit_number):
+                got_[m_["e"][0]] = (m_["e"][5].get("pc"), g.game.tick - t_mined)
+        if t_mined is not None and (len(got_) == 2 or g.game.tick - t_mined > 30):
+            break
+    send({"t": "mine_stop"})
+    keep(1)
+    pe[flag] = (t_mined is not None, got_.get(run_[1].unit_number), got_.get(run_[3].unit_number))
+    for p_ in run_:
+        if p_.valid:
+            p_.destroy()
+    keep(2)
+    drain()
+# The owner's second picture: a T whose branch was mined stayed a T, its open mouth showing. A T, a cross and a
+# corner each lose one arm (the north one) to the character's mining: the pipe in the middle is sent again without it.
+pe_shape = {}
+for name_, cx_, arms_, want_ in (("T", kx + 10.5, ((1, 0), (-1, 0)), 10), ("cross", kx + 14.5, ((1, 0), (-1, 0), (0, 1)), 14),
+                                 ("corner", kx + 18.5, ((1, 0),), 2)):
+    cy_ = ky + 20.5
+    mid_ = spawn("pipe", cx_, cy_, force="player")
+    F["raise"]("script_raised_built", lua.table_from({"entity": mid_}))
+    others_ = []
+    for ax_, ay_ in arms_ + ((0, -1),):
+        p_ = spawn("pipe", cx_ + ax_, cy_ + ay_, force="player")
+        F["raise"]("script_raised_built", lua.table_from({"entity": p_}))
+        others_.append(p_)
+    north_ = others_[-1]
+    keep(5)
+    drain()
+    puppet.teleport(lua.table_from({"x": cx_ - 2.0, "y": cy_ - 1.0}))
+    mine_ = {"t": "mine", "u": int(north_.unit_number), "p": eid["pipe"], "x": fixed(cx_), "y": fixed(cy_ - 1.0),
+             "ox": fixed(2.0), "oy": fixed(0.0)}
+    t_mined, got_ = None, None
+    for t_ in range(300):
+        if t_ % 9 == 0 and north_.valid:
+            send(mine_)
+        keep(1)
+        if t_mined is None and not north_.valid:
+            t_mined = g.game.tick
+        for m_ in of_type(drain(), "upd"):
+            if t_mined is not None and m_["e"][0] == mid_.unit_number:
+                got_ = (m_["e"][5].get("pc"), g.game.tick - t_mined)
+        if t_mined is not None and (got_ is not None or g.game.tick - t_mined > 30):
+            break
+    send({"t": "mine_stop"})
+    keep(1)
+    pe_shape[name_] = (t_mined is not None, want_, got_)
+    for p_ in [mid_] + others_:
+        if p_.valid:
+            p_.destroy()
+    keep(2)
+    drain()
+check(all(v[0] and v[2] is not None and v[2][0] == v[1] and v[2][1] <= 3 for v in pe_shape.values()),
+      f"mined_neighbours: a T, a cross and a corner losing their north arm to the character's mining are sent again "
+      f"without it the tick after: (mined, want pc, (pc, ticks)) {pe_shape}")
+F.commands["f3d-perf"](lua.table_from({"name": "f3d-perf", "parameter": "mined_neighbours default"}))
+g.settings["global"]["f3d-act-as-player"]["value"] = True
+puppet.teleport(pe_home)
+send({"t": "sub", "c": pe_subs})
+keep(5)
+drain()
+check(pe["default"][0] and pe["default"][1] is not None and pe["default"][1][0] == 8 and pe["default"][1][1] <= 3
+      and pe["default"][2] is not None and pe["default"][2][0] == 2 and pe["default"][2][1] <= 3
+      and pe["off"][0] and pe["off"][1] is None and pe["off"][2] is None,
+      f"mined_neighbours: the pipes beside one the character mines with no player are sent again as endings "
+      f"(west 8, east 2) the tick after (off: not at all): (mined, (pc, ticks) west, east) {pe}")
 bs_k.option_command("built_now off")
 keep(13)
 check(g.storage.f3d.bs.fresh is None, "K16 built_now off: nothing kept for it")
@@ -9758,7 +11407,656 @@ send(hello_now)
 tick(1)
 drain()
 
+# --- L13: a world Zenith made, joined from Factorio ----------------------------------------------
+# Each scenario on a fresh game (a runtime of its own, nobody in it yet, freeplay as the scenario):
+# the helpers above read the module's `lua`, `g` and `F`, so they follow.
+def fresh_world(freeplay=True, multiplayer=True):
+    global lua, g, F, expected_r
+    lua = lua52.LuaRuntime(unpack_returned_tuples=True)
+    g = lua.globals()
+    g.F_to_json = to_json
+    g.F_from_json = from_json
+    lua.execute(FAKE.read_text())
+    g.package.path = str(MOD / "?.lua") + ";" + g.package.path
+    lua.execute((MOD / "control.lua").read_text())
+    lua.execute('package.loaded["scripts.barrier"].rethrow = true')
+    lua.execute('require = function(name) error("Require can not be used outside of control.lua parsing: " .. tostring(name)) end')
+    F = g.F
+    F.multiplayer = multiplayer
+    if freeplay:
+        F.add_freeplay()
+    F.on_init()
+    expected_r = 1
+
+
+def same(a, b):
+    # (Lua objects through lupa compare as Python objects: entities by their unit numbers.)
+    return a is not None and b is not None and a.valid and b.valid and a.unit_number == b.unit_number
+
+
+def perf_cmd(parameter):
+    F.commands["f3d-perf"](lua.table_from({"name": "f3d-perf", "parameter": parameter}))
+
+
+def item_count(c, name):
+    n = c.get_main_inventory().get_item_count(name)
+    for inv in (g.defines.inventory.character_guns, g.defines.inventory.character_ammo):
+        n += c.get_inventory(inv).get_item_count(name)
+    return n
+
+
+def kit_counts(c):
+    return {n: item_count(c, n) for n in ("iron-plate", "wood", "pistol", "firearm-magazine", "burner-mining-drill", "stone-furnace")}
+
+
+# The owner's video: a new game made in Zenith's menu, Zenith playing it on the headless server.
+fresh_world()
+zen_hello = {"t": "hello", "v": 1, "sid": "z1", "w": 1, "pn": "zen"}
+send(zen_hello)
+tick(4)
+take()
+own = g.storage.f3d.puppet
+check(own and own.valid and same(g.storage.f3d.own_character, own) and not g.storage.f3d.owner_index,
+      "L13: on a new server game the bridge plays its own character")
+check(F.freeplay.disable_crashsite is True and not F.freeplay.init_ran,
+      f"L13: freeplay is told not to make its crash site, before anyone joined ({F.freeplay.disable_crashsite})")
+check(g.storage.f3d.client.pn == "zen", "L13: the hello's pn (this Zenith's Factorio account) is kept with the client")
+own.teleport(lua.table_from({"x": 40.5, "y": 12.5}))
+own.get_main_inventory().insert(lua.table_from({"name": "iron-gear-wheel", "count": 30}))
+own.get_inventory(g.defines.inventory.character_armor).insert(lua.table_from({"name": "light-armor", "count": 1}))
+send({"t": "qb_set", "i": 1, "item": "transport-belt"})
+tick(1)
+before_kit = kit_counts(own)
+own_unit = own.unit_number
+take()
+# A stranger joins first: a character of their own, with freeplay's kit; the bridge keeps its own.
+stranger, stranger_char = F.create_player(2, "stranger", 0.5, 0.5)
+send(zen_hello)
+tick(2)
+check(same(g.storage.f3d.puppet, own) and same(stranger.character, stranger_char) and stranger_char.valid
+      and not g.storage.f3d.owner_index and kit_counts(stranger_char)["iron-plate"] == 8,
+      "L13: a stranger who joins gets a character of their own (and freeplay's kit); the bridge keeps playing its own")
+check(F.freeplay.crash_sites == 0 and F.freeplay.init_ran,
+      f"L13: freeplay's first player made no crash site in the base ({F.freeplay.crash_sites})")
+take()
+# The owner presses Ctrl+F9: their Factorio joins as "zen" (the name the hello said).
+zen, fresh = F.create_player(3, "zen", 0.5, 0.5)
+fresh.insert(lua.table_from({"name": "coal", "count": 5}))  # what another mod gave a new player
+check(g.storage.f3d.owner_index == 3 and g.storage.f3d.zenith_owner == 3, "L13: the player of the hello's name is claimed on joining")
+tick(2)
+msgs = take()
+check(same(zen.character, own) and same(g.storage.f3d.puppet, own) and own.valid and own.unit_number == own_unit
+      and own.position.x == 40.5 and own.position.y == 12.5 and own.player.index == 3,
+      "L13: they take over the character Zenith was playing, where it was (the same entity)")
+check(not fresh.valid, "L13: the character the game gave them on joining is gone")
+check(own.get_main_inventory().get_item_count("iron-gear-wheel") == 30
+      and own.get_inventory(g.defines.inventory.character_armor)[1].valid_for_read,
+      "L13: with Zenith's inventory and armour")
+check(kit_counts(own) == before_kit, f"L13: and no second starting kit ({before_kit} -> {kit_counts(own)})")
+check(own.get_main_inventory().get_item_count("coal") == 5, "L13: what else the new character had comes along")
+qb = zen.get_quick_bar_slot(1, 1)
+check(qb is not None and qb.filter.name == "transport-belt", "L13: Zenith's quickbar becomes the player's")
+check(not of_type(msgs, "welcome") and g.storage.f3d.held_for is None and g.storage.f3d.own_character is None,
+      "L13: the client goes on with the same character (no new handshake)")
+g.storage.f3d.pl_sig = None
+tick(60)
+pl = of_type(take(), "pl")
+check(pl and pl[-1]["me"] == 3 and pl[-1]["u"] == own_unit, f"L13: the players list says the client plays that player: {pl[-1:]}")
+send(zen_hello)
+tick(1)
+take()
+F.handlers["f3d-show-3d"](lua.table_from({"player_index": 3, "input_name": "f3d-show-3d"}))
+check(of_type(take(), "raise"), "L13: Ctrl+F9 in their Factorio brings Zenith to the front again (raise)")
+g.storage.f3d.client.raised = None
+F.handlers["f3d-show-3d"](lua.table_from({"player_index": 2, "input_name": "f3d-show-3d"}))
+sent = [(item[1], json.loads(item[2].split("\n")[0])) for item in F.take_sent().values()]
+check(not any(m.get("t") == "raise" for _, m in sent) and any(port == 34209 for port, _ in sent),
+      f"L13: the stranger's Ctrl+F9 doesn't (their own launcher is asked to start a Zenith): {sent}")
+g.storage.f3d.launch_wait = None
+check(same(stranger.character, stranger_char) and stranger_char.valid, "L13: the stranger keeps their character")
+# They leave: the bridge stands in for them where they were, with their things, as for a save's player.
+own.teleport(lua.table_from({"x": 44.5, "y": 14.5}))
+F.disconnect_player(zen)
+send(zen_hello)
+tick(2)
+msgs = take()
+stand_in = g.storage.f3d.puppet
+check(stand_in and stand_in.valid and stand_in.unit_number != own_unit and g.storage.f3d.held_for == 3
+      and stand_in.position.x == 44.5 and stand_in.position.y == 14.5,
+      "L13: when they leave, the bridge stands in for them where they left")
+check(stand_in and stand_in.get_main_inventory().get_item_count("iron-gear-wheel") == 30
+      and stand_in.get_inventory(g.defines.inventory.character_armor)[1].valid_for_read,
+      "L13: holding their things")
+welcome = of_type(msgs, "welcome")
+check(welcome and welcome[-1]["u"] == stand_in.unit_number, "L13: and the client plays the stand-in")
+# Back from Factorio: their own character returns and takes it all back.
+back = spawn("character", 44.5, 14.5, force="player")
+F.connect_player(zen, back)
+send(zen_hello)
+tick(2)
+check(same(g.storage.f3d.puppet, back) and not stand_in.valid and g.storage.f3d.held_for is None
+      and back.get_main_inventory().get_item_count("iron-gear-wheel") == 30,
+      "L13: when they come back their character takes it all back, and the client plays it")
+take()
+# Should 2.1 keep a logged-off character's LuaEntity valid, the bridge leaves it alone: it isn't the bridge's.
+kept = F.disconnect_player(zen, True)
+send(zen_hello)
+tick(2)
+take()
+check(kept.valid and not same(g.storage.f3d.puppet, kept) and g.storage.f3d.held_for == 3,
+      "L13: a logged-off character that stays valid isn't emptied or removed: the bridge stands in beside it")
+F.connect_player(zen, kept)
+send(zen_hello)
+tick(2)
+take()
+check(same(g.storage.f3d.puppet, kept) and kept.get_main_inventory().get_item_count("iron-gear-wheel") == 30,
+      "L13: and it takes the things back when they return")
+
+# Factorio joined before Zenith connected: the hello's name finds them already in the game.
+fresh_world()
+send({"t": "hello", "v": 1, "sid": "z2", "w": 1})
+tick(4)
+own = g.storage.f3d.puppet
+own.teleport(lua.table_from({"x": 30.5, "y": 8.5}))
+own_unit = own.unit_number
+send({"t": "bye"})
+tick(1)
+take()
+zen, mine = F.create_player(1, "zen", 0.5, 0.5)
+tick(120)
+check(same(zen.character, mine) and not g.storage.f3d.owner_index, "L13: with no Zenith connected a player joining isn't claimed")
+send({"t": "hello", "v": 1, "sid": "z3", "w": 1, "pn": "zen"})
+tick(4)
+take()
+check(g.storage.f3d.owner_index == 1 and same(zen.character, own) and own.valid and own.unit_number == own_unit
+      and own.position.x == 30.5 and not mine.valid,
+      "L13: Zenith's hello naming them claims them then: they take over its character")
+check(own.get_main_inventory().get_item_count("pistol") + own.get_inventory(g.defines.inventory.character_guns).get_item_count("pistol") == 2,
+      "L13: claimed later, what their own character held (freeplay's kit too) all comes along")
+
+# The switches off (`/f3d-perf zenith_join off`, `no_crash_site off`): as before L13.
+fresh_world()
+perf_cmd("zenith_join off")
+perf_cmd("no_crash_site off")
+send(zen_hello)
+tick(4)
+take()
+own = g.storage.f3d.puppet
+check(F.freeplay.disable_crashsite is None, "L13 off: freeplay's crash site left to freeplay")
+zen, mine = F.create_player(1, "zen", 0.5, 0.5)
+send(zen_hello)
+tick(2)
+take()
+check(F.freeplay.crash_sites == 1 and same(zen.character, mine) and same(g.storage.f3d.puppet, own) and not g.storage.f3d.owner_index,
+      "L13 off: the first player gets freeplay's crash site and a character of their own, as before")
+# Should the game refuse to hand the character over, the old way: its things onto theirs, where it was.
+perf_cmd("zenith_join default")
+own.teleport(lua.table_from({"x": 25.5, "y": 6.5}))
+own.get_main_inventory().insert(lua.table_from({"name": "iron-gear-wheel", "count": 7}))
+own_at = (25.5, 6.5)
+F.refuse_set_controller = True
+send(dict(zen_hello, pn="zen2"))
+tick(1)
+zen2, mine2 = F.create_player(2, "zen2", 0.5, 0.5)
+send(dict(zen_hello, pn="zen2"))
+tick(2)
+msgs = take()
+check(same(g.storage.f3d.puppet, mine2) and not own.valid and (mine2.position.x, mine2.position.y) == own_at
+      and mine2.get_main_inventory().get_item_count("iron-gear-wheel") == 7 and of_type(msgs, "welcome"),
+      "L13: set_controller refused: the bridge's character's things move onto theirs, where it stood, and the client plays it")
+F.refuse_set_controller = False
+
+# Single-player with the mod: its player was created before any client, freeplay's intro is its own.
+fresh_world(multiplayer=False)
+sp_char = spawn("character", 0.5, 0.5, force="player")
+F.make_player(sp_char)
+send({"t": "hello", "v": 1, "sid": "s9", "w": 1, "pn": "player"})
+tick(4)
+take()
+check(F.freeplay.disable_crashsite is None and not g.package.loaded["scripts.takeover"].no_crash_site(),
+      "L13: single-player keeps freeplay's intro (the bridge never turns its crash site off there)")
+check(same(g.storage.f3d.puppet, sp_char) and not g.storage.f3d.zenith_owner, "L13: and its player plays as before")
+
+# Step 5 task 3a: the steps' list comes again with a full resync and with a client's new hello (a reconnect).
+lua.eval("function() storage.f3d.resync_tick = -1000000 end")()
+take()
+send({"t": "resync", "full": 1})
+tick(6)
+again = steps_of(take())
+tick(130)  # a welcome goes again at most every 2 s
+send({"t": "hello", "v": 1, "sid": "steps-again", "w": 0})
+tick(6)
+rehello = steps_of(take())
+# (A new world here: ids may differ, so the lists are compared by the sounds they point at.)
+def step_shape(lists):
+    return {k: sorted(r[1:] for r in v) for k, v in lists.items()}
+
+
+check(again[1] == st_sounds and step_shape(again[2]) == step_shape(st_lists) and rehello[1] == st_sounds
+      and step_shape(rehello[2]) == step_shape(st_lists) and len(again[0]) == len(st_parts) == len(rehello[0]),
+      f"steps: sent again whole on a full resync and a reconnect: {len(again[0])} and {len(rehello[0])} parts")
+# --- the link between add-ons and their mods (link.lua, `ext`) ------------------------------------
+# A fake companion mod: it listens to the bridge's events, answers `echo` and `who`, and notes clients.
+fresh_world(multiplayer=True)
+g.script.active_mods["zenith-link-test"] = "0.1.0"
+LINK_CH = "zenith-link-test"
+lua.execute("""
+LINK = {msgs = {}, clients = {}, sends = {}, first = {}}
+F.companion_on(remote.call("zenith", "on_message"), function(e)
+  table.insert(LINK.msgs, e)
+  local d = e.data
+  if type(d) == "table" and d.echo ~= nil then
+    local ok, why = remote.call("zenith", "send", e.client, e.channel, {echo = d.echo})
+    table.insert(LINK.sends, {ok = ok, why = why})
+  elseif type(d) == "table" and d.who then
+    local c = remote.call("zenith", "character", e.client)
+    -- (Called from the handler: the first client's state is storage.f3d, never another's swapped in.)
+    table.insert(LINK.first, storage.f3d.client.port)
+    remote.call("zenith", "send", e.client, e.channel, {unit = c and c.unit_number or 0, p = e.player_index or 0})
+  end
+end)
+F.companion_on(remote.call("zenith", "on_client"), function(e) table.insert(LINK.clients, e) end)
+""")
+LINK = g.LINK
+ev_msg, ev_client = F.remote.zenith.on_message(), F.remote.zenith.on_client()
+check(isinstance(ev_msg, int) and isinstance(ev_client, int) and ev_msg != ev_client and F.remote.zenith.link() == 1,
+      f"link: the interface hands out two generated event ids and its version ({ev_msg}, {ev_client})")
+
+
+def ext(d, ch=LINK_CH, port=CLIENT_PORT, machine=0, **more):
+    F.packet(json.dumps({"t": "ext", "ch": ch, "d": d, **more}), port, machine)
+
+
+def link_count():
+    return len(list(LINK.msgs.values()))
+
+
+send({"t": "hello", "v": 1, "sid": "lk", "w": 0})
+tick(3)
+msgs = take()
+welcome = of_type(msgs, "welcome")
+check(welcome and welcome[0].get("ext") == 1, f"link: the welcome says ext 1: {welcome[:1] and welcome[0].get('ext')}")
+joins = [to_py(e) for e in LINK.clients.values()]
+check(len(joins) == 1 and joins[0]["client"] == CLIENT_PORT and joins[0]["joined"] is True,
+      f"link: a client's first hello raises on_client (joined): {joins}")
+check(same(F.remote.zenith.character(), g.storage.f3d.puppet) and same(F.remote.zenith.character(CLIENT_PORT), g.storage.f3d.puppet)
+      and F.remote.zenith.character(CLIENT_PORT + 99) is None,
+      "link: character() as before, character(client) that client's, nil for no such client")
+ext({"echo": "hi"}, machine=3)
+tick(1)
+got = to_py(LINK.msgs[1])
+check(got and got["client"] == CLIENT_PORT and got["channel"] == LINK_CH and got["data"] == {"echo": "hi"} and got["machine"] == 3
+      and got["name"] == ev_msg,
+      f"link: an `ext` arrives as the event with client, channel, data and the machine it came in on: {got}")
+replies = of_type(take(), "ext")
+check(replies and replies[-1]["ch"] == LINK_CH and replies[-1]["d"] == {"echo": "hi"} and isinstance(replies[-1].get("k"), int),
+      f"link: the mod's send reaches the client as `ext` (stamped with the tick): {replies}")
+ext("a string", ch=LINK_CH + "/state/x")
+ext([1, 2, 3])
+tick(1)
+check(link_count() == 3 and to_py(LINK.msgs[2])["channel"] == LINK_CH + "/state/x" and to_py(LINK.msgs[3])["data"] == [1, 2, 3],
+      f"link: topics after the mod's name, strings and lists as data: {[to_py(m) for m in LINK.msgs.values()][1:]}")
+before = link_count()
+ext({"echo": 1}, ch="not-in-this-game")
+ext({"echo": 1}, ch="bad channel")
+ext({"echo": 1}, ch=5)
+ext({"echo": 1}, ch="")
+ext({"echo": 1}, ch=LINK_CH + "/" + "x" * 130)
+ext({"echo": 1}, ch=LINK_CH + "/a\nb")
+ext({"echo": 1}, ch="/" + LINK_CH)
+F.packet(json.dumps({"t": "ext", "ch": LINK_CH}), CLIENT_PORT)  # no d
+ext("x" * 4100)  # over 4 KB
+ext({"echo": 1}, port=40000)  # not a connected client
+tick(1)
+check(link_count() == before and not of_type(take(), "ext"),
+      f"link: refused, nothing raised: a mod not in the game, bad channels, no data, over 4 KB, another port ({link_count() - before})")
+check(not any("Bridge error" in str(m) for m in g.F.printed.values()), "link: and none of it an error")
+tick(60)
+for i in range(70):
+    ext({"n": i})
+tick(1)
+take()
+check(link_count() - before == 60, f"link: a client's flood is capped at 60 messages per 60 ticks ({link_count() - before})")
+tick(60)
+ext({"n": 70})
+tick(1)
+check(link_count() - before == 61, "link: and the window opens again 60 ticks later")
+before = link_count()
+for i in range(10):
+    ext("y" * 3900)
+tick(1)
+check(link_count() - before == 8, f"link: and at 32 KB per 60 ticks ({link_count() - before} of 10 near-4 KB messages)")
+tick(61)
+take()
+results = lua.eval("""function(port)
+  local out = {}
+  for i = 1, 70 do
+    out[#out + 1] = select(1, remote.call("zenith", "send", port, "zenith-link-test", {i = i})) and 1 or 0
+  end
+  local _, big = remote.call("zenith", "send", port, "zenith-link-test", string.rep("z", 4100))
+  local _, chan = remote.call("zenith", "send", port, "no spaces", 1)
+  local _, who = remote.call("zenith", "send", 1, "zenith-link-test", 1)
+  local _, many = remote.call("zenith", "send", port, "zenith-link-test", 1)
+  local _, nan = remote.call("zenith", "send", port, "zenith-link-test", 0/0)
+  return {sum = out, big = big, chan = chan, who = who, many = many, nan = nan}
+end""")(CLIENT_PORT)
+sent_ok = sum(results.sum.values())
+tick(1)
+outs = of_type(take(), "ext")
+check(sent_ok == 60 and len(outs) == 60 and results.many == "too many",
+      f"link: send is capped at 60 a client per 60 ticks too ({sent_ok} true, {len(outs)} sent, then {results.many})")
+check(results.big == "too big" and results.chan == "bad channel" and results.who == "no such client" and results.nan == "bad data",
+      f"link: send refuses too big, a bad channel, no such client, data that isn't JSON: {results.big}, {results.chan}, {results.who}, {results.nan}")
+# Two clients: each message names its own client, and an answer reaches only it.
+tick(61)
+take()
+send({"t": "hello", "v": 1, "sid": "lk", "w": 1})  # the first client still there
+send({"t": "hello", "v": 1, "sid": "lk2", "w": 0}, port=PORT_B)
+tick(3)
+take_by_port()
+joins = [to_py(e) for e in LINK.clients.values()]
+check(len(joins) == 2 and joins[1]["client"] == PORT_B and joins[1]["joined"] is True, f"link: a second client joins: {joins}")
+b_puppet = g.storage.f3d_extra[PORT_B].puppet
+ext({"who": 1}, port=PORT_B)
+tick(1)
+by = take_by_port()
+got = to_py(LINK.msgs[link_count()])
+b_ext, a_ext = of_type(by.get(PORT_B, []), "ext"), of_type(by.get(CLIENT_PORT, []), "ext")
+check(got["client"] == PORT_B and b_ext and b_ext[-1]["d"]["unit"] == b_puppet.unit_number and not a_ext,
+      f"link: the second client's message names it; character(client) is its character; the answer goes to it alone: {b_ext}, {a_ext}")
+check(list(LINK.first.values()) == [CLIENT_PORT], f"link: a mod's handler runs with the first client's state in place: {list(LINK.first.values())}")
+listed = to_py(F.remote.zenith.clients())
+check([c["client"] for c in listed] == [CLIENT_PORT, PORT_B], f"link: clients() lists both, the first first: {listed}")
+check(F.remote.zenith.send(PORT_B, LINK_CH, lua.table_from({"to": "b"})), "link: send to the second client")
+tick(1)
+by = take_by_port()
+check(of_type(by.get(PORT_B, []), "ext") and not of_type(by.get(CLIENT_PORT, []), "ext"), "link: reaches only it")
+send({"t": "bye"}, port=PORT_B)
+tick(1)
+joins = [to_py(e) for e in LINK.clients.values()]
+check(len(joins) == 3 and joins[2]["client"] == PORT_B and joins[2]["joined"] is False, f"link: a goodbye raises on_client (left): {joins}")
+check(F.remote.zenith.send(PORT_B, LINK_CH, 1) == (False, "no such client"), "link: and send to it is refused")
+# A client that times out leaves too (raised after the tick's clients are served).
+tick(700)
+joins = [to_py(e) for e in LINK.clients.values()]
+check(joins[-1]["client"] == CLIENT_PORT and joins[-1]["joined"] is False, f"link: a client timing out raises on_client (left): {joins[-1]}")
+check(len(list(LINK.sends.values())) >= 1 and all(s.ok for s in LINK.sends.values()), "link: the echoes were sent")
+
+# --- the link's determinism (testing agent): every storage write on the link's path inside an event ---
+# Multiplayer: every peer must end each event with the same storage, and nothing between events may change
+# it (a remote.call outside an event, a list carried over to the next event and lost in a save). Each
+# event handler is wrapped: storage's fingerprint is taken when it returns and compared when the next one
+# starts, and link.lua's list of events to raise must be empty when it returns. A companion mod's handler
+# notes which event it ran in and sends from inside it.
+fresh_world(multiplayer=True)
+g.script.active_mods["zenith-link-test"] = "0.1.0"
+lua.execute(r"""
+DET = {outside = 0, left_pending = 0, events = 0, ran_in = {}, sent = {}}
+local function fp(v, seen, out)
+  local t = type(v)
+  if t ~= "table" then
+    out[#out + 1] = t .. ":" .. tostring(v)
+    return
+  end
+  if getmetatable(v) ~= nil then  -- a LuaObject (the fake's strict tables)
+    local ok, u = pcall(function() return v.unit_number end)
+    out[#out + 1] = "obj:" .. tostring(ok and u or "?")
+    return
+  end
+  if seen[v] then
+    out[#out + 1] = "seen:" .. seen[v]
+    return
+  end
+  seen.n = (seen.n or 0) + 1
+  seen[v] = seen.n
+  local keys = {}
+  for k in pairs(v) do
+    keys[#keys + 1] = k
+  end
+  table.sort(keys, function(a, b) return type(a) .. tostring(a) < type(b) .. tostring(b) end)
+  out[#out + 1] = "{"
+  for _, k in ipairs(keys) do
+    fp(k, seen, out)
+    out[#out + 1] = "="
+    fp(v[k], seen, out)
+  end
+  out[#out + 1] = "}"
+end
+function DET.fingerprint()
+  local out = {}
+  fp(storage, {}, out)
+  return table.concat(out, ",")
+end
+local link = package.loaded["scripts.link"]
+local function pending_count()
+  local i = 1
+  while true do
+    local name, val = debug.getupvalue(link.raise, i)
+    if not name then
+      return -1
+    elseif name == "pending" then
+      return #val
+    end
+    i = i + 1
+  end
+end
+DET.pending_count = pending_count
+local function wrap(fn, name)
+  return function(...)
+    if DET.after and DET.fingerprint() ~= DET.after then
+      DET.outside = DET.outside + 1
+    end
+    DET.in_event = name
+    fn(...)
+    DET.in_event = nil
+    DET.events = DET.events + 1
+    if pending_count() ~= 0 then
+      DET.left_pending = DET.left_pending + 1
+    end
+    DET.after = DET.fingerprint()
+  end
+end
+for _, name in ipairs({"on_tick", "on_udp_packet_received"}) do
+  local id = defines.events[name]
+  F.handlers[id] = wrap(F.handlers[id], name)
+end
+F.on_config = wrap(F.on_config, "on_configuration_changed")
+F.companion_on(remote.call("zenith", "on_message"), function(e)
+  table.insert(DET.ran_in, "msg:" .. tostring(DET.in_event))
+  storage.companion_n = (storage.companion_n or 0) + 1  -- the companion's own write, inside the event
+  local ok, why = remote.call("zenith", "send", e.client, e.channel, {echo = e.data})
+  table.insert(DET.sent, ok and "ok" or why)
+end)
+F.companion_on(remote.call("zenith", "on_client"), function(e)
+  table.insert(DET.ran_in, (e.joined and "join:" or "left:") .. tostring(DET.in_event))
+end)
+""")
+DET = g.DET
+check(DET.pending_count() == 0, f"link determinism: the guard finds link.lua's list of events to raise ({DET.pending_count()})")
+send({"t": "hello", "v": 1, "sid": "det", "w": 0})
+tick(5)
+take()
+check(g.storage.f3d.link is None, "link cost while unused: no link state in storage before a first ext")
+# A read from outside any event (a companion's on_load, RCON) changes nothing.
+DET.after = DET.fingerprint()
+F.remote.zenith.link(), F.remote.zenith.on_message(), F.remote.zenith.on_client(), F.remote.zenith.clients()
+F.remote.zenith.character(CLIENT_PORT), F.remote.zenith.player(CLIENT_PORT), F.remote.zenith.name(CLIENT_PORT)
+F.remote.zenith.character(CLIENT_PORT + 99)
+check(DET.fingerprint() == DET.after, "link determinism: the interface's reads outside an event leave storage alone")
+for i in range(5):
+    F.packet(json.dumps({"t": "ext", "ch": "zenith-link-test", "d": {"i": i}}), CLIENT_PORT)
+F.packet("{not json", CLIENT_PORT)
+F.packet(json.dumps({"t": "ext", "ch": "zenith-link-test/x", "d": None}), CLIENT_PORT)
+tick(2)
+check(g.storage.f3d.link is not None and g.storage.f3d.link.i == 5, f"link determinism: the caps' counters live in storage ({g.storage.f3d.link and g.storage.f3d.link.i})")
+send({"t": "hello", "v": 1, "sid": "det2", "w": 0}, port=PORT_B)
+tick(3)
+F.packet(json.dumps({"t": "ext", "ch": "zenith-link-test", "d": "b"}), PORT_B)
+tick(1)
+check(g.storage.f3d_extra[PORT_B].link is not None and g.storage.f3d_extra[PORT_B].link.i == 1,
+      "link determinism: a second client's counters in its own state in storage")
+send({"t": "bye"}, port=PORT_B)
+tick(700)  # the first client times out
+F.on_config(lua.table_from({"mod_changes": {"factorio-3d-bridge": {"old_version": "0.1.1", "new_version": "0.1.3"}}}, recursive=True))
+ran_in = list(DET.ran_in.values())
+sent = list(DET.sent.values())
+check(DET.outside == 0, f"link determinism: no storage write between events ({DET.outside} events found storage changed since the last)")
+check(DET.left_pending == 0, f"link determinism: the list of events to raise is empty after every event ({DET.left_pending} of {DET.events})")
+check(ran_in.count("msg:on_udp_packet_received") == 6 and all(r.split(":")[1] != "nil" for r in ran_in),
+      f"link determinism: every companion handler ran inside an event: {ran_in}")
+check("join:on_udp_packet_received" in ran_in and ran_in.count("left:on_udp_packet_received") == 1 and "left:on_tick" in ran_in,
+      f"link determinism: joins in the hello's packet, a goodbye in its packet, a time-out in on_tick: {ran_in}")
+check(sent == ["ok"] * 6, f"link determinism: a companion's send from inside its handler: {sent}")
+# The guard itself: a write between events is caught.
+before = DET.outside
+g.storage.f3d.det_probe = 1
+tick(1)
+check(DET.outside == before + 1, "link determinism: (the guard catches a storage write made between events)")
+g.storage.f3d.det_probe = None
+
+# --- the link: a companion mod's error, the handshake, the bridge's own name, on_configuration_changed ---
+# A companion handler that throws is the companion's error, caught per event: the game goes on, the
+# error is logged naming the mod and sent back to the add-on (`ext` with `err`), the other events in
+# the same raise still arrive, and 10 errors within a minute close the channel for that client's session.
+fresh_world(multiplayer=True)
+g.script.active_mods["zenith-link-test"] = "0.1.0"
+lua.execute("""
+ERR = {msgs = {}, clients = {}, boom_client = false}
+F.companion_on(remote.call("zenith", "on_message"), function(e)
+  if type(e.data) == "table" and e.data.boom then
+    error("boom " .. tostring(e.data.boom))
+  end
+  table.insert(ERR.msgs, e.data)
+end)
+F.companion_on(remote.call("zenith", "on_client"), function(e)
+  if ERR.boom_client and e.client == ERR.boom_client then
+    error("on_client boom")
+  end
+  table.insert(ERR.clients, e)
+end)
+""")
+ERR = g.ERR
+LINK_MOD = g.package.loaded["scripts.link"]
+send({"t": "hello", "v": 1, "sid": "er", "w": 0})
+# An `ext` before the client's handshake is done is dropped.
+ext({"early": 1})
+check(len(list(ERR.msgs.values())) == 0 and g.F.printed is not None, "link: an `ext` before the client's handshake is done is dropped")
+tick(5)
+take()
+ext({"ok": 1}, ch="factorio-3d-bridge")
+ext({"ok": 1}, ch="factorio-3d-bridge/x")
+tick(1)
+check(len(list(ERR.msgs.values())) == 0 and LINK_MOD.channel_mod("factorio-3d-bridge") is None,
+      "link: the bridge's own name isn't a channel")
+check(F.remote.zenith.send(CLIENT_PORT, "factorio-3d-bridge", 1) == (False, "bad channel"), "link: nor for a mod's send")
+
+
+def err_lines():
+    return [str(m) for m in g.F.printed.values() if "handler failed" in str(m)]
+
+
+# Three events in one raise, the middle one failing: the first and the third arrive.
+logged_before = len(err_lines())
+lua.eval("""function(port, ch)
+  local link = package.loaded["scripts.link"]
+  link.from_packet({payload = "{}", player_index = 0})
+  link.receive({ch = ch, d = {n = 1}}, port)
+  link.receive({ch = ch, d = {boom = 1}}, port)
+  link.receive({ch = ch, d = {n = 3}}, port)
+  link.raise()
+end""")(CLIENT_PORT, LINK_CH)
+got = [to_py(d) for d in ERR.msgs.values()]
+check(got == [{"n": 1}, {"n": 3}], f"link: a companion's error loses none of the other events in that raise: {got}")
+lines = err_lines()
+check(len(lines) == logged_before + 1 and "zenith-link-test" in lines[-1] and "channel " + LINK_CH in lines[-1] and "boom 1" in lines[-1],
+      f"link: the error is logged naming the mod and the channel: {lines[-1:]}")
+errs = [m for m in of_type(take(), "ext") if "err" in m]
+check(len(errs) == 1 and errs[0]["ch"] == LINK_CH and "boom 1" in errs[0]["err"] and "d" not in errs[0],
+      f"link: and sent back to the add-on on its channel as `ext` with `err`: {errs}")
+check(not any("Bridge error" in str(m) for m in g.F.printed.values()), "link: a companion's error isn't the bridge's")
+# From a packet: the game goes on (the test runs with barrier.rethrow on: nothing reached the barrier).
+for i in range(2, 10):
+    ext({"boom": i})
+    tick(1)
+errs = [m for m in of_type(take(), "ext") if "err" in m]
+check(len(errs) == 8 and not any("closed" in m["err"] for m in errs), f"link: 9 errors, each sent back, the channel still open ({len(errs)})")
+ext({"n": 4})
+tick(1)
+check(to_py(list(ERR.msgs.values())[-1]) == {"n": 4}, "link: and still raised after 9 errors")
+check(len(err_lines()) == 5, f"link: only the first few errors are logged in full ({len(err_lines())})")
+ext({"boom": 10})
+tick(1)
+errs = [m for m in of_type(take(), "ext") if "err" in m]
+check(len(errs) == 2 and "boom 10" in errs[0]["err"] and "closed after repeated errors" in errs[1]["err"] and errs[1]["ch"] == LINK_CH,
+      f"link: the 10th error within a minute closes the channel, and the add-on hears so: {errs}")
+check(any("is closed after repeated errors" in str(m) and LINK_CH in str(m) for m in g.F.printed.values()), "link: said in the log too")
+check(g.storage.f3d.link_closed and g.storage.f3d.link_closed[LINK_CH], "link: the closed channel is in the client's state in storage")
+n_before = len(list(ERR.msgs.values()))
+ext({"n": 5})
+ext({"boom": 11})
+tick(1)
+check(len(list(ERR.msgs.values())) == n_before and not of_type(take(), "ext"), "link: a closed channel's messages are dropped, quietly")
+ext({"n": 6}, ch=LINK_CH + "/other")
+tick(1)
+check(to_py(list(ERR.msgs.values())[-1]) == {"n": 6}, "link: another channel of the same mod still works")
+# A long error's text is trimmed to 1000 bytes at a character's start (é is two bytes in UTF-8).
+lua.execute("""F.companion_on(remote.call("zenith", "on_message"), function(e)
+  if e.data == "long" then error(string.rep("\\195\\169", 900), 0) end
+end)""")
+take()
+ext("long", ch=LINK_CH + "/long")
+tick(1)
+long_err = [m for m in of_type(take(), "ext") if "err" in m]
+check(len(long_err) == 1 and long_err[0]["err"].endswith("...") and set(long_err[0]["err"][:-3]) == {"é"}
+      and len(long_err[0]["err"].encode("utf-8")) <= 1000, f"link: a long error trimmed at a character: {[len(m['err']) for m in long_err]}")
+# Spread out: 9 errors, a minute, then a 10th: the count starts over.
+for i in range(9):
+    ext({"boom": i}, ch=LINK_CH + "/slow")
+    tick(1)
+take()
+for _ in range(12):  # a minute, the client saying hello as it does
+    tick(300)
+    send({"t": "hello", "v": 1, "sid": "er", "w": 1})
+take()
+ext({"boom": 99}, ch=LINK_CH + "/slow")
+tick(1)
+slow = [m for m in of_type(take(), "ext") if "err" in m]
+check(len(slow) == 1 and "boom 99" in slow[0]["err"] and not (g.storage.f3d.link_closed and g.storage.f3d.link_closed[LINK_CH + "/slow"]),
+      f"link: 10 errors spread over more than a minute don't close it: {slow}")
+# The client's next session opens it again.
+send({"t": "bye"})
+tick(1)
+send({"t": "hello", "v": 1, "sid": "er2", "w": 0})
+tick(5)
+take()
+ext({"n": 7})
+tick(1)
+check(to_py(list(ERR.msgs.values())[-1]) == {"n": 7}, "link: the client's next session opens it again")
+
+# on_configuration_changed: the clients a new bridge dropped are raised on the first tick after it,
+# not inside it (a companion's on_configuration_changed runs after the bridge's), from storage, the
+# failing one losing none of the others.
+send({"t": "hello", "v": 1, "sid": "er3", "w": 0}, port=PORT_B)
+tick(5)
+take_by_port()
+left_before = [to_py(e) for e in ERR.clients.values() if not e.joined]
+ERR.boom_client = CLIENT_PORT
+F.on_config(lua.table_from({"mod_changes": {"factorio-3d-bridge": {"old_version": "0.1.1", "new_version": "0.1.3"}}}, recursive=True))
+left_now = [to_py(e) for e in ERR.clients.values() if not e.joined]
+later = g.storage.f3d_link_later
+check(left_now == left_before and later is not None and len(list(later.values())) == 2,
+      f"link: on_configuration_changed raises nothing; its clients' leaving waits in storage ({left_now[len(left_before):]})")
+tick(1)
+left_now = [to_py(e) for e in ERR.clients.values() if not e.joined]
+check(g.storage.f3d_link_later is None and [e["client"] for e in left_now[len(left_before):]] == [PORT_B],
+      f"link: raised on the first tick; the one whose handler failed loses none of the others: {left_now[len(left_before):]}")
+ERR.boom_client = False
+
+if BINARY:
+    check({protocol.KIND_MV, protocol.KIND_BS, protocol.KIND_BFAR} <= binary_kinds,
+          f"--binary: mv, bs and bfar came as binary frames: kinds {sorted(binary_kinds)}")
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)
-print("all bridge checks passed")
+print("all bridge checks passed" + (" (binary frames)" if BINARY else ""))

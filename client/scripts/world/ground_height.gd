@@ -77,7 +77,8 @@ static func set_field(heights: Image, origin: Vector2, tiles_per_texel: float) -
 		heights.convert(Image.FORMAT_RF)
 	var low_ground := heights.get_format() == Image.FORMAT_RGF
 	var size := Vector2i(heights.get_width(), heights.get_height())
-	if _texture != null and size == _size and _image != null and _image.get_format() == heights.get_format():
+	var reused := _texture != null and size == _size and _image != null and _image.get_format() == heights.get_format()
+	if reused:
 		_texture.update(heights)
 	else:
 		_texture = ImageTexture.create_from_image(heights)
@@ -86,7 +87,8 @@ static func set_field(heights: Image, origin: Vector2, tiles_per_texel: float) -
 	_origin = origin
 	_step = maxf(tiles_per_texel, 0.001)
 	_on = true
-	RenderingServer.global_shader_parameter_set(GLOBAL_TEX, _texture)
+	if not reused:
+		RenderingServer.global_shader_parameter_set(GLOBAL_TEX, _texture)
 	RenderingServer.global_shader_parameter_set(GLOBAL_RECT, Vector4(_origin.x, _origin.y, _step, 1.0 if low_ground else 0.0))
 	RenderingServer.global_shader_parameter_set(GLOBAL_ON, 1.0)
 	_measure(heights, given)

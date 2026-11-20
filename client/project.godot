@@ -11,7 +11,7 @@ config_version=5
 [application]
 
 config/name="Zenith"
-config/version="0.2.1"
+config/version="0.2.2"
 config/description="3D client for a running Factorio game, via the factorio-3d-bridge mod."
 run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.4", "Forward Plus")
@@ -45,6 +45,10 @@ limits/global_shader_variables/buffer_size=4194304
 f3d_nature_grain={
 "type": "sampler2DArray",
 "value": ""
+}
+f3d_tree_matte={
+"type": "float",
+"value": 1.0
 }
 f3d_nature_grain_on={
 "type": "float",
@@ -118,6 +122,10 @@ f3d_look_ground_specular={
 "type": "float",
 "value": 1.0
 }
+f3d_look_ao_direct={
+"type": "float",
+"value": 1.0
+}
 f3d_look_model_fill={
 "type": "float",
 "value": 0.0
@@ -125,6 +133,50 @@ f3d_look_model_fill={
 f3d_look_roughness_min={
 "type": "float",
 "value": 0.0
+}
+f3d_look_roughness_min_pbr={
+"type": "float",
+"value": 0.0
+}
+f3d_light_env={
+"type": "float",
+"value": 0.0
+}
+f3d_look_texture_metal={
+"type": "float",
+"value": 0.1
+}
+f3d_look_texture_light={
+"type": "vec2",
+"value": Vector2(1, 1)
+}
+f3d_pack_shading={
+"type": "float",
+"value": 1.0
+}
+f3d_look_pbr_metal={
+"type": "float",
+"value": 1.0
+}
+f3d_pbr_env={
+"type": "vec4",
+"value": Vector4(0.839, 0.797, 0.732, 1)
+}
+f3d_pbr_light={
+"type": "vec4",
+"value": Vector4(0, 1, 1, 1)
+}
+f3d_pbr_tune={
+"type": "vec4",
+"value": Vector4(2.8, 0.35, 0, 0)
+}
+f3d_pbr_sky={
+"type": "vec4",
+"value": Vector4(0, 0, 0, 0)
+}
+f3d_pbr_sun={
+"type": "vec4",
+"value": Vector4(0, 1, 0, 0)
 }
 f3d_pollution={
 "type": "sampler2D",

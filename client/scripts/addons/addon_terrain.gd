@@ -59,6 +59,7 @@ func chunk_kinds(chunk: Vector2i) -> PackedByteArray:
 	var cv = w.chunks.get(chunk)
 	if cv == null:
 		return PackedByteArray()
+	_remember_rev(chunk, cv)
 	var ids: PackedInt32Array = cv.tile_ids
 	if ids.size() != 32 * 32:
 		return PackedByteArray()
@@ -82,6 +83,7 @@ func cliffs_in_chunk(chunk: Vector2i) -> Array:
 	if w == null or not w.chunks.has(chunk):
 		return out
 	var cv = w.chunks[chunk]
+	_remember_rev(chunk, cv)
 	for key in cv.entities:
 		var r = cv.entities[key]
 		var proto = w.protos.entity(r.proto_id)
@@ -97,9 +99,17 @@ const NOT_BUILDINGS := ["cliff", "tree", "simple-entity", "resource", "fish", "c
 	"asteroid", "asteroid-chunk", "plant", "entity-ghost", "tile-ghost", "deconstructible-tile-proxy"]
 
 var _changed := {}  # Vector2i -> true: chunks whose buildings came or changed (take_changed_chunks)
+var _read_revs := {}  # Vector2i -> int: ChunkView.content_rev last read or reported
 ## The world whose entities_changed is watched, by instance id: main.gd makes a new one for every
 ## game, so each game's is watched afresh (an id isn't reused, a freed node's address may be).
 var _watched := 0
+
+
+func _remember_rev(chunk: Vector2i, cv) -> void:
+	if cv is Object:
+		var rev = cv.get("content_rev")
+		if rev is int:
+			_read_revs[chunk] = rev
 
 
 ## The buildings in a loaded chunk, for levelling the ground under them: [[Vector2 centre, Vector2
@@ -111,6 +121,7 @@ func buildings_in_chunk(chunk: Vector2i) -> Array:
 	if w == null or not w.chunks.has(chunk):
 		return out
 	var cv = w.chunks[chunk]
+	_remember_rev(chunk, cv)
 	for key in cv.entities:
 		var r = cv.entities[key]
 		var proto = w.protos.entity(r.proto_id)
@@ -131,11 +142,23 @@ func take_changed_chunks() -> Array:
 	if w != null and w.get_instance_id() != _watched:
 		_watched = w.get_instance_id()
 		_changed = {}  # the last game's chunks
+		_read_revs = {}
 		w.entities_changed.connect(_on_entities_changed)
 	var out := _changed.keys()
 	_changed = {}
+	for c: Vector2i in out:
+		if w != null and w.chunks.has(c):
+			_remember_rev(c, w.chunks[c])
+		else:
+			_read_revs.erase(c)
 	return out
 
 
 func _on_entities_changed(chunk: Vector2i) -> void:
+	var w = _host.game_node("world")
+	var cv = w.chunks.get(chunk) if w != null else null
+	if cv is Object:
+		var rev = cv.get("content_rev")
+		if rev is int and int(_read_revs.get(chunk, -1)) == rev:
+			return
 	_changed[chunk] = true

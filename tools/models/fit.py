@@ -24,9 +24,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
+import packs  # noqa: E402
 import score_proto as score  # noqa: E402
 
 PITCH = math.radians(48.0)
@@ -162,8 +162,10 @@ def prepare(name, raw, glb):
         scale = float(opts["scale"])
         ppt = 32.0 / scale
         mask, centre = sprite_mask(specs, ppt, scale)
-        # A model per direction (score_proto.VARIANTS) brings its own mesh.
-        own = load_mesh(os.path.join(os.path.dirname(glb), score.model_of(name, dn) + ".glb"))             if name in score.VARIANTS else None
+        # A model per direction (score_proto.VARIANTS) brings its own mesh, beside it in its pack (a
+        # pack with the north one only, as FUE5's, turns it: none).
+        own_path = os.path.join(os.path.dirname(glb), score.model_of(name, dn) + ".glb")
+        own = load_mesh(own_path) if name in score.VARIANTS and os.path.exists(own_path) else None
         jobs.append((dn, opts, mask, centre, ppt, own))
     return jobs, load_mesh(glb)
 
@@ -187,7 +189,7 @@ def main():
     ap.add_argument("--png")
     a = ap.parse_args()
     raw = json.load(open(a.dump, encoding="utf-8")) if a.dump else __import__("icon_index").dump(score.FACTORIO)
-    glb = a.glb or os.path.join(REPO, "client", "assets", "models", a.name + ".glb")
+    glb = a.glb or packs.model_path(a.name)
     jobs, mesh = prepare(a.name, raw, glb)
     extra = [float(x) for x in a.extra.split(",")]
     r = ious(jobs, mesh, extra)

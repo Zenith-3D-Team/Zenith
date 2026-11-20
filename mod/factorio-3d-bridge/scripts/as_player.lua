@@ -60,7 +60,9 @@ end
 -- Builds one `item` (of `quality`) at `position` from the player's cursor, as their click would:
 -- true when built, false when Factorio refused, nil when this path doesn't apply (no player, the
 -- cursor busy, another surface, the item not in the main inventory), so the caller builds its way.
-function M.build(c, item, quality, position, direction, mirror, surface)
+-- `held`: the stack the client's hand holds the item from (L7), already found by puppet.held_stack for
+-- this item and quality (puppet requires this file, so it is passed in, not looked up here).
+function M.build(c, item, quality, position, direction, mirror, surface, held)
   local p = M.player(c)
   if not p or (surface and p.surface ~= surface) then
     return nil
@@ -70,7 +72,12 @@ function M.build(c, item, quality, position, direction, mirror, surface)
   if not inventory then
     return nil
   end
-  local ok, stack = pcall(inventory.find_item_stack, { name = item, quality = quality or "normal" })
+  local ok, stack = true, nil
+  if held and held.valid_for_read then
+    stack = held
+  else
+    ok, stack = pcall(inventory.find_item_stack, { name = item, quality = quality or "normal" })
+  end
   if not (ok and stack and stack.valid_for_read) then
     return nil
   end
@@ -96,13 +103,19 @@ function M.build(c, item, quality, position, direction, mirror, surface)
   return built
 end
 
--- Mines `e` as the player: true when mined, nil when this path doesn't apply.
-function M.mine(c, e)
+-- Mines `e` as the player: true when mined, nil when this path doesn't apply. `force`: even when what it
+-- gives doesn't fit (spilled), as a build's own removals are.
+function M.mine(c, e, force)
   local p = M.player(c)
   if not p then
     return nil
   end
-  local ok, mined = pcall(p.mine_entity, e)
+  local ok, mined
+  if force then
+    ok, mined = pcall(p.mine_entity, e, true)
+  else
+    ok, mined = pcall(p.mine_entity, e)
+  end
   return ok and mined or false
 end
 

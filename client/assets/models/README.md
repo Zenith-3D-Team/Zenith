@@ -1,8 +1,24 @@
 # 3D models
 
-Drop a model here named after the Factorio prototype it replaces, for example
-`transport-belt.glb` or `assembling-machine-1.glb`. The client uses it for every entity of
-that prototype and falls back to a coloured placeholder box for anything without a model.
+The models that come with Zenith are three built-in model packs in `packs/`, each with its
+`pack.json`:
+
+- `packs/placeholders/` ("Placeholders", 348 files): Zenith's own, built by the scripts in
+  `tools/models/` from Factorio's sprites, with the belt pieces, curves and underground ends. It is
+  the last resort under every other pack, always on, so every entity keeps a model.
+- `packs/wube3dp/` ("Wube3DP (Adapted)", 94): Wube's printable models as `tools/models/wube.py` converts them,
+  and the poses made from them; its `CREDITS.md` lists them.
+- `packs/fue5/` ("FUE5 (Adapted)", 39): FUE5's textured models, CC BY-NC-SA 3.0; its README says where each
+  came from.
+
+`items/` (models of items on belts, "Items" below) isn't a pack.
+
+A model is named after the Factorio prototype it draws, for example `transport-belt.glb` or
+`assembling-machine-1.glb`. The client uses it for every entity of that prototype and falls back to
+a coloured placeholder box for anything no pack has a model for. Which pack's model is drawn is the
+packs' order ("Model packs" below). The model tools find and write models through
+`tools/models/packs.py`: a model of ours is in placeholders or wube3dp, a rebuild writes over it where
+it is, and a new one goes into placeholders.
 
 Conventions (see `docs/PLAN.md` §4):
 
@@ -25,7 +41,10 @@ metallic-roughness one, glTF's green = roughness, blue = metallic), embedded in 
 JPEG) and read through the material's first UV map. The client mipmaps them when it reads the model
 (`model_textures.gd`) and the model shader draws the base colour texture in place of the part
 colour, times the material's base colour factor (keep it white), with the usual light weathering
-on top; normal maps are ignored (the merged meshes carry no tangents). Far merged chunks
+on top; normal maps are ignored (the merged meshes carry no tangents). The picture's roughness is
+used as it is; its metal is drawn at the look's `texture_metal` share (0.1 by default, as part
+colours' metal is), so it takes the sun, the shadows and the look's fill as paint does; Settings'
+Metal on textured models, Full, as before, or `--texture-metal=full` draws it in full (docs/RUNNING.md). Far merged chunks
 (`far_chunks.gd`) colour each vertex from a small copy of the texture. One material with one atlas
 per model is cheapest (`tools/models/fue5.py` bakes FUE5's textures that way). Models without
 textures are drawn as before.
@@ -55,8 +74,165 @@ Their UV tells them apart where model_library.gd merges them into one surface: c
 (-1, -1), solid leaves (-2, -2). A tree's shadow stand-in casts its crown from a surface of its own
 that drops what pollution took (model_lods.gd `crown_arrays`, shadow_stand_in_leaf.gdshader).
 
-Models under their own licence live in a subfolder looked in first (`model_library.gd`
-`MODEL_SUBDIRS`): `fue5/` (CC BY-NC-SA 3.0, see its README) replaces ours of the same name.
+Models under their own licence are a pack of their own, its licence in its `pack.json` and a README
+beside them, as FUE5's are (`packs/fue5/`, CC BY-NC-SA 3.0).
+
+## Model packs
+
+Every model the client draws comes from a model pack (`client/scripts/world/model_packs.gd`), found
+by file name (`<prototype-name>.glb` or `.gltf`). Besides the three built in, the `models` folder
+beside Zenith (the checkout's root, or beside `Zenith.exe`) holds any number of them, loaded at
+runtime without importing them into the project:
+
+- the `.glb` and `.gltf` files at its top: one pack, "Loose models";
+- each folder in it: a pack, its models anywhere inside, in any layout (in one pack the model nearest
+  its top wins, then `.glb` over `.gltf`);
+- each `.zip` in it: a pack the same way, read without unpacking it by hand. Zenith unpacks it once
+  into `user://model-packs/<zip name>-<size>-<modified>/`, on a worker thread at start-up (models
+  wait for it; play doesn't), again only when the zip changes, and removes the copies of zips changed
+  or gone, so a `.gltf`'s own `.bin` and textures beside it work as from a folder. A download's
+  `models/Zenith.zip` is one: Vasillo's models, "Zenith" (`tools/release/package.py --models`; an old
+  `Default.zip`, its name before, is read as it, and left out when a `Zenith.zip` is beside it).
+
+One order decides which pack's model is drawn: the higher pack wins when two have a model of the
+same name. It is kept in settings.cfg's `[model_packs]` (`order` and `off`, by id: `builtin:<folder>`,
+`loose`, `dir:<folder>`, `zip:<file>`). A new pack of the models folder goes on top, on; a built-in one
+not saved yet goes under the folder's, so by default, from the top (the owner's order): Default (when
+there is one), FUE5 (Adapted), Wube3DP (Adapted), Placeholders, Factorio. Every pack moves and switches
+off, Placeholders too.
+
+**Factorio** (`builtin:factorio`, `ModelPacks.FACTORIO_ID`) is a built-in pack with no files: its content
+is the player's install, read at run time (nothing of Wube's is committed or shipped). Its picture is the
+install's `data/core/graphics/factorio-icon.png`, its credit "© Wube Software · from your install". It
+offers each entity's resting picture on a card facing Factorio's camera, a "cardboard cutout"
+(`client/scripts/world/sprite_standins.gd`: in a game the bridge's graphics list, `mod_graphics.gd`, which
+has every entity's, mods' too; without one `client/data/sprite_projection.json`'s frames of the base and
+Space Age entities, cut from the install's sheets), each item's icon card (`item_cards.gd`) and the
+install's icons. Characters, vehicles and creatures (pictures round the turn) keep their models. Where it
+is above the pack that has a family's model (or is chosen for it, or is a building's own pack in the
+model chooser), the family is drawn as its card (`ModelPacks.sprite_wins`, `ModelLibrary.draws_sprite`);
+an item as its icon card; an icon as the install's. Under every pack in use (the default, and where an
+order saved before it puts it) it keeps its old roles: the icons below every pack, the cards for entities
+no pack has. An entity no pack in use has a model for is its card with Factorio on, else Zenith's box in
+its map colour. Without an install (and no game's list) it is listed greyed with the reason and gives
+nothing. For the Model packs window's preview: `ModelPacks.is_sprite_pack(pack or id)`,
+`ModelPacks.sprite_names()`, `SpriteStandins.picture(name, direction)` (the card's Mesh, texture, centre,
+pixels a tile and size; `{}` while composed, ask again after `SpriteStandins.poll()`),
+`SpriteStandins.has_picture(name)`, `SpriteStandins.item_card(item)` and `item_picture(item)`.
+
+The Model packs window (`client/scripts/menu/model_packs_window.gd`: the main menu, the in-game Esc
+menu) lays the packs out as Minecraft does its resource packs: Available (off) and
+Selected (on, the top one winning) side by side, ▶ on a pack's row adding it on top of Selected, ◀
+taking it out, ▲ ▼ ordering it (Placeholders and Factorio too). A row has the pack's picture, name, model
+count, where it is and its `pack.json` lines. A click on a pack lists its models by family, with a
+search box; a click on one shows it turning (`client/scripts/ui/factorio/model_preview.gd`, a
+SubViewport with the client's own model loading and materials), whose version is in use, and a
+button per pack in use with a version of it to look at. Everything applies at once
+(`ModelLibrary.apply_packs`, `apply_choices`; in a game `world.gd` `models_changed` builds the chunks
+drawing those models again); trains, robots, creatures and inserter arms keep their models until a
+restart, and the window says so.
+
+A model's **family** (`ModelPacks.family`) is a prototype's model with its variants: directions
+(`-east`, `-south`, `-west`), curves, line end pieces, `-input` and `-output`, pipe and wall shapes,
+`-rich` and `-sparse` ores, cliff pieces, the `-attack` and `-corpse` poses; a cargo bay's edge
+pieces are `cargo-bay`'s, an inserter arm's parts `inserter-arm-<kind>`'s. The window's "Use
+<pack>'s" takes a family from that pack whatever the order (settings.cfg `[model_packs]` `choices`,
+family -> pack id): each variant the pack has, a tier it has only the base of (`fast-transport-belt`
+from `transport-belt`) as the base recoloured, and a variant it lacks from the order. "By the order"
+gives one back, "Reset choices" all of them.
+
+**One building:** a building window's Model button, in its title bar beside the circuit buttons,
+opens the model chooser (`client/scripts/ui/factorio/model_chooser.gd`): a card for every pack in use
+with a model of that building (its own variant: a curved belt's curve, the way it faces), each
+turning in its preview. "This one" draws that building alone with the pack's model, kept per save and
+unit number in `user://building_models.cfg` (`client/scripts/world/building_models.gd`) and
+forgotten when the game says it was mined or destroyed; "Every one" sets the family's choice, as the
+window does. "Usual model" and "Every one by the order" undo them. The building moves to that model's
+MultiMesh in its chunk at once. Client only: nothing goes to the game. An inserter's arm
+(`inserter_arms.gd`) and the building window's own picture of the entity keep the usual model.
+
+An optional `pack.json` at a pack's top (or one folder down; a built-in pack's at its top) names it
+in the window:
+
+```json
+{"name": "Vasillo's belts", "version": "1.2", "author": "Vasillo", "licence": "CC BY-NC 4.0",
+ "description": "Textured belts, splitters and undergrounds.", "icon": "transport-belt"}
+```
+
+`shading` (optional): `"pbr"` draws the pack's materials (pictured or plain colours), and its pictured items, as
+their files say (glTF's PBR as Godot's own material draws it, metal in full reflecting a neutral surrounding lit as
+the moment is, with the look's fill on top; model_packs.gd
+`shading()`), `"factorio"` or none with Zenith's Factorio-style balance. Zenith's own packs are always
+`"factorio"`. The Model packs window's card shows it; Settings > Graphics > Advanced > Packs' own shading
+(Factorio's everywhere) and `--pack-shading=factorio` turn it off for every pack (docs/RUNNING.md).
+
+`aliases` (optional): `{"coal-ore": "coal", "stone-ore": "stone"}`, the pack's own names for Factorio's (model_packs.gd
+`alias_name`): its `coal-ore-1.glb` is read as `coal-1`, `coal-ore-rich.glb` as `coal-rich`, `items/` and `icons/`
+(`icons/item/coal-ore.png`) the same way; a file the pack also has under Factorio's own name keeps it.
+
+**Variants**, one rule for every entity model, item model (`items/`) and icon (model_packs.gd `variant_base`,
+`variants_in`): `<name>-1.glb`, `<name>-2.glb`, ... (numbered from 1) and `<name>.glb` are the variants of `<name>`,
+with or without the plain one. The Model packs window lists them as one entry (`Sulfur (3)`), in the Models, Items
+and Icons tabs. Each placed entity, rock or ground item draws one at random, the same on every load and in every
+view: a hash of its position (`variant_seed`; the record's client-only `extra.zv`, world.gd). An icon has no place:
+its name picks one, the same everywhere. A name that is a prototype of its own in Factorio (`assembling-machine-2`,
+`speed-module-3`, `tree-04`, `uranium-235`: data/icons.json) is never a variant. Ores are as before: their numbered
+models are the scattered rocks (`ore_rocks`), their tiles' stage models aren't picked. Items on belts and in hands
+show the first variant. `--model-variants=off`: always the plain model (docs/RUNNING.md).
+
+`short_name` (optional) is the name in lines like "Use FUE5's" and "FUE5's models" where the full one
+reads badly: the two built-in packs of other people's models are "FUE5 (Adapted)" and "Wube3DP
+(Adapted)", short "FUE5" and "Wube3DP". `icon` names the model drawn, still, as the pack's picture; a `pack.png` (or `icon.png`) at the pack's
+top comes before it, and without either the pack's first model is drawn. `icon_image` (optional)
+comes before all of them: a PNG, JPEG or WebP picture in the pack, its path from the pack's top or
+from the folder its `pack.json` is in (`"icon_image": "logo.png"`), or `"factorio:<path>"` for one
+read from the player's Factorio install, its path from the install's folder
+(`"factorio:data/core/graphics/wube-logo.png"`, Wube3DP's: Wube's pictures are never committed or
+shipped, so a pack points at the install's copy). A picture that isn't there, or isn't one, leaves
+the pack its model picture. The download's Default pack carries Zenith's gear (`zenith.png`,
+`client/icon.png`, put in by `tools/release/package.py`); FUE5 keeps its locomotive (FUE5's repo has
+no logo file of its own, `packs/fue5/README.md`).
+
+A pack that isn't built in is a modeller's to Zenith wherever its models lie: their vertex colours
+are Blender's own unless they carry Zenith's baked layout. In any pack, one model of a direction
+entity is turned to every direction unless the same pack has all four. The start-up log says how many
+models come from which packs, which are off or left out and which models a higher pack covers; the
+debug menu's Tests > Model packs lists every model's pack.
+
+A pack may also carry icons that replace Factorio's wherever Zenith's UI draws one (every icon goes
+through `item_icons.gd`, which asks `model_packs.gd` `icon_file()` first): an `icons/` folder at the
+pack's top or one folder down (in a folder, a zip or a built-in pack alike; the models folder's own
+top `icons/` is the loose pack's), `icons/<name>.png` for the prototype of that name whatever its
+kind, `icons/<kind>/<name>.png` for one kind (`item`, `entity`, `fluid`, `recipe`, `technology`,
+`virtual-signal` or `signal`, `space-location`, `item-group`), the kind's file first. Square PNGs of
+any size (one that isn't square is cut to its middle), mipmapped. They go by the packs' order, the
+replacing packs before those that fill in; the Icons tab's choice for one is kept in settings.cfg
+`[model_packs]` `choices` as `"icon:<name>": <pack id>`. Below every pack, the install's icon (or
+nothing without one, as before). The icon caches are dropped when the order, a switch or an icon
+choice changes (`ModelPacks.icons_version`). No built-in pack ships icons (Factorio's are Wube's,
+read from the install). A pack of icons alone is a pack.
+
+A pack may carry sounds too, file for file in place of Factorio's (`sound_bank.gd` `locate()` asks
+`model_packs.gd` `sound_file()` before the install): a `sounds/` folder at the pack's top or one folder
+down (the models folder's own top `sounds/` is the loose pack's), under it the file's Factorio path:
+`sounds/core/sound/gui-click.ogg`, `sounds/base/sound/walking/grass-3.ogg`,
+`sounds/space-age/sound/walking/snow-1.ogg`, `sounds/<mod-name>/...` for a mod's. Ogg Vorbis only (an
+Opus file is skipped, with a warning, for the next place's). The rules (volume, variations, pitch,
+aggregation) stay Factorio's prototypes'. Same order and switches as the icons; a choice kept as
+`"sound:<path>": <pack id>` (no picker yet). A pack below the Factorio pack gives only what Factorio
+(the install and the game's mods) hasn't. The decoded sounds are dropped when the order, a switch, a
+sound choice or Settings > Sound's "Sounds from model packs" changes (`ModelPacks.sounds_version`);
+`--pack-sounds=off` leaves every pack's sounds out. Packs carry their authors' own sounds, never
+Factorio's; no built-in pack ships any. A pack of sounds alone is a pack.
+
+A pack holding a copy of any file of the player's Factorio install (byte for byte, over 1 KB: a sound,
+a picture, anything) is not loaded at all, none of its models, items, icons or sounds, and its card in
+the Model packs window is red with the copies listed (`pack_check.gd`, the owner's rule; every pack is
+checked but the Factorio pack and Wube3DP, and there is no switch: it is a bound, not a look).
+
+`-- --models=/path/to/folder` adds one more pack, on top for that run, which only fills in entities no
+other pack has a model for; add `--models-first` for it to win over every pack (a modeller trying a
+new version). `-- --no-custom-models` leaves the models folder's packs out; the built-in ones stay.
 
 ## Moving parts
 
@@ -117,7 +293,9 @@ Spinning parts ease up to speed in about a third of a second and coast to a stop
 second. Speeds are `SPIN_SPEEDS` / `MODEL_SPEEDS` in `anim.gd` (turns per second, picked to look
 like Factorio's animation loops). Emissive materials (the stone furnace's `fire`) behave like
 `anim_glow_*`: lit while the machine works, dark when it's idle. Entities the mod doesn't report
-states for (turrets, chests) count as always working for glows. Blender names like
+states for (turrets, chests) count as always working for glows, but inserters, whose glow (a burner
+inserter's lit burner) follows their hand: lit while it moves, as Factorio's burner burns fuel only then
+(anim.gd `ARM_STATE_TYPES`, `-- --inserter-glow=always` as before). Blender names like
 `anim_spin_drill.001` and Godot's `anim_spin_drill2` work too (the number is dropped).
 
 Belts move in the shader: the `belt_surface` material's slats scroll the way items travel at the
@@ -243,9 +421,12 @@ python tools/models/check.py
 godot --headless --path client --import
 ```
 
-Converted models replace the procedural ones with the same name. `build.py` without names then
-leaves them alone (it reads the generator tag in the `.glb`); name a model to rebuild it
-procedurally. `CREDITS.md` in this folder lists every converted model and its source files.
+Converted models go into `packs/wube3dp/`, which is above Placeholders in the order, so they replace
+the procedural ones with the same name. `build.py` without names then leaves them alone (it reads the
+generator tag in the `.glb`); name a model to rebuild it procedurally (it is written over the
+conversion, where it is). `packs/wube3dp/CREDITS.md` lists every converted model and its source files.
+A pose (`creature_pose.py`) goes beside its source, the worm, built from its sprites, into
+placeholders.
 
 What the converter does: millimetres to tiles (25 mm, the print grid's pitch); z-up to y-up;
 picks parts off print plates and cuts away grid pegs and joining tabs; stands up parts printed
@@ -287,11 +468,14 @@ Wube models without a recipe yet:
 
 ## Converting FUE5's models
 
-By choice, 39 base-game entities are drawn with the textured models of FUE5
+At the owner's choice, 39 base-game entities are drawn with the textured models of FUE5
 (https://github.com/FUE5BASE/FUE5, a fan remake of Factorio in Unreal Engine 5 by Hurricane and
-Nuke, CC BY-NC-SA 3.0). They live in `fue5/`, which the client looks in before this folder, with
-their own README (licence, credit, and which FBX file each came from); ours stay here and in their
-recipes, and deleting a file in `fue5/` brings ours back.
+Nuke, CC BY-NC-SA 3.0). They are the FUE5 pack, `packs/fue5/`, with their own README (licence,
+credit, and which FBX file each came from); ours stay in their packs and recipes. By default FUE5 is
+above Wube3DP and Placeholders, so all 39 are drawn in place of ours, the 7 Wube3DP has too (electric
+mining drill, small electric pole, stone and steel furnace, wooden, iron and steel chest) included;
+Wube's stay in their pack, drawn when the player puts Wube3DP higher or chooses it for them in the
+Model packs window. Deleting a file in `packs/fue5/` brings ours back.
 
 1. Put FUE5's `Content/MyStuff/ENTITIES/STRUCTURES` and `VEHICLES` folders (each model's FBX files
    and the .jpg textures beside them) under the git-ignored `art-src/fue5/raw/`.
@@ -310,9 +494,10 @@ face north (a recipe's `yaw`, found by scoring each quarter turn), cuts it at th
 ground decals, decimates to the budget in `specs.py` and bakes every texture into one atlas per
 model. Moving parts come from FUE5's animated FBX files: meshes are split by bone into `anim_*`
 nodes (the electric furnace's fans, the radar's dish, the centrifuge's rotors, the wagons' wheels).
-Boiler, chemical plant and pumpjack are FUE5's one model turned for each direction (`-east`,
-`-south`, `-west` files) and the steam engine for its two (`-east`), as the client's
-`FACING_MODELS` expects (`fue5.py` `FACINGS`).
+Boiler, chemical plant, pumpjack and steam engine, which ours draw with a model per direction
+(`FACING_MODELS`), are one model in FUE5: `fue5.py` (`FACINGS`) writes the north one, fitted to all
+our directions, and the client turns it, as the pack has no direction models of its own
+(`model_library.gd` `single_model`).
 
 ## Materials: Factorio's colours, its sprites and the weathered fallback
 
@@ -434,15 +619,17 @@ sprite, and the client's blueprint window draws its previews from it. One entry 
 
 ## Building the procedural models
 
-The models here are generated by Blender Python scripts in `tools/models/`, no `.blend` files:
+Zenith's own models (Placeholders) are generated by Blender Python scripts in `tools/models/`, no
+`.blend` files:
 
 | File | What |
 |---|---|
 | `kit.py` | Shared kit: materials (sRGB palette, roughness, metallic), bevelled boxes, cylinders, prisms, bolts, hazard stripes, the `Part` builder, export |
 | `belts.py`, `chests.py`, `machines.py`, `power.py`, `defence.py`, `fluids.py`, `electric.py`, `oil.py`, `vehicles.py`, `circuits.py`, `logistics.py`, `rails.py`, `railway.py`, `crash_site.py`, `fish.py`, `military.py`, `nuclear.py`, `rocket.py`, `placeholders.py` (and the Space Age modules below; `MODULES` in `build.py` lists them all) | One function per model, registered with `@model("<name>")` (rails.py: the track pieces; railway.py: supports, ramp, signals, train stop, gate) |
 | `specs.py` | Expected footprint and triangle budget per model (plain Python) |
-| `build.py` | Builds and exports models to this folder |
-| `check.py` | Validates the exported `.glb` files (plain Python, no Blender) |
+| `build.py` | Builds and exports models to their pack (over the file where it is, a new one into `packs/placeholders/`) |
+| `check.py` | Validates the exported `.glb` files, every pack's without names (plain Python, no Blender) |
+| `packs.py` | Where the built-in packs are: `model_path`, `out_path`, `resolve` (`<name>` or `<pack>/<name>`) for every tool (plain Python) |
 | `preview.py` | Renders models side by side to a PNG, without the client |
 | `compare.py` | Renders one model from Factorio's camera next to a frame of its sprite, with an outline overlay |
 | `bake.py` | Bakes the per-vertex weathering data (below) for kit, nature and Wube models (plain numpy) |
@@ -452,7 +639,8 @@ The models here are generated by Blender Python scripts in `tools/models/`, no `
 ```bash
 # rebuild everything (or name models after the --)
 blender --background --factory-startup --python tools/models/build.py -- [names...]
-# check names, footprint, origin, rotation and triangle budget
+# check names, footprint, origin, rotation and triangle budget (<name> or <pack>/<name>, as
+# fue5/stone-furnace; none: all 481 of the three packs)
 python tools/models/check.py [names...]
 # each part's colour from the sprite, after any rebuild (wube.py runs it itself; --debug DIR
 # writes sprite / sampled colour pictures to look at, never into the repo)
@@ -489,10 +677,6 @@ north-south and the burner drill's four directions move parts around, so match t
 To add a model: write a function in the right family module (or a new module listed in
 `MODULES` in `build.py`), add its footprint and budget to `specs.py`, build, check, import, and
 look at it in the client.
-
-Models can also be loaded at runtime from any folder, without importing them into the project:
-run the client with `-- --models=/path/to/folder`. Add `--models-first` for the folder's models
-to replace the project's own of the same name (a modeller trying a new version).
 
 ### Space Age: Gleba and Aquilo
 
@@ -577,7 +761,14 @@ the walkers' MultiMeshes.
 
 ## Items (on belts, on the ground, in inserter hands)
 
-`items/<item>.glb` are small models for items, made by `tools/models/items.py` (plain Python:
+Item models are part of the model packs: a folder called `items` in a pack holds `<item>.glb` (or
+`.gltf`), apart from its entity models (model_packs.gd `item_model_path`, `items`); they go by the
+packs' order, switches and per-item choices (settings.cfg `[model_packs]` `choices`, keyed
+`item:<name>`). Zenith's own are the Placeholders pack's, `packs/placeholders/items/<item>.glb`
+(they were `assets/models/items/`), so every item modelled keeps one. A modeller's item is drawn
+the same way, by its vertex colours (a surface without them takes its material's base colour).
+
+`packs/placeholders/items/<item>.glb` are small models for items, made by `tools/models/items.py` (plain Python:
 numpy, pillow, scipy; no Blender) from the low-poly parts in `tools/models/item_kit.py`. Thousands
 can be in view on a busy bus, so each is a few dozen triangles (about 55 on average, at most 220)
 with its colours in the vertices (`COLOR_0`), about a quarter tile across, resting on y = 0 and

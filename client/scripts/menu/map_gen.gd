@@ -7,10 +7,11 @@ extends RefCounted
 ##
 ## The settings are one Dictionary {"gen": {...}, "map": {...}, "preset": name}; get_value() and
 ## set_value() address them by path ("gen/autoplace_controls/iron-ore/richness"). Space Age's
-## controls are left out when its mod is off in the server's mod-list.json (Factorio refuses
+## controls are left out when its mod is off in the Mods window (mod_choices.gd; Factorio refuses
 ## controls it doesn't know).
 
 const Paths := preload("res://scripts/menu/paths.gd")
+const ModChoices := preload("res://scripts/menu/mod_choices.gd")
 
 ## Autoplace controls in Factorio's order: [name, label, category, planet, richness?]. From
 ## base and space-age prototypes/autoplace-controls.lua and the planets' map_gen_settings.
@@ -143,18 +144,16 @@ static func controls_for(mods: Dictionary) -> Array:
 	return CONTROLS.filter(func(c: Array) -> bool: return c[3] == "nauvis" or space_age)
 
 
-## The server's mods/mod-list.json as name -> enabled. Factorio turns on the DLC it finds, so a
-## missing list means base and the DLC are on.
+## A new game's mods as name -> enabled: the Mods window's choices (mod_choices.gd), which the
+## launcher writes into mod-list.json before creating the map. Space Age and its DLC are on unless
+## turned off there.
 static func enabled_mods() -> Dictionary:
-	var out := {"base": true, "space-age": true, "quality": true, "elevated-rails": true}
-	var file := Paths.server_data_dir().path_join("mods/mod-list.json")
-	if not FileAccess.file_exists(file):
-		return out
-	var parsed = JSON.parse_string(FileAccess.get_file_as_string(file))
-	if parsed is Dictionary:
-		for m in parsed.get("mods", []):
-			if m is Dictionary:
-				out[str(m.get("name", ""))] = bool(m.get("enabled", true))
+	var choices := ModChoices.states()
+	var out := {}
+	for name in ModChoices.GAME:
+		out[name] = ModChoices.is_on(name, choices)
+	for name in ModChoices.added(choices):
+		out[name] = true
 	return out
 
 

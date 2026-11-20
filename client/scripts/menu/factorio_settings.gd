@@ -36,6 +36,8 @@ const MAP := {
 	"interface/show-pump-arrows-when-detailed-info-is-on": ["interface", "alt_pump_arrows", "bool"],
 	"interface/show-machine-arrows-when-detailed-info-is-on": ["interface", "alt_machine_arrows", "bool"],
 	"interface/show-minimap": ["map", "minimap", "bool"],
+	"interface/show-fluid-segment-visualization": ["interface", "fluid_vis", "bool"],
+	"interface/show-fluid-segment-visualization-when-selected": ["interface", "fluid_vis_selected", "bool"],
 	"other/autosave-interval": ["factorio", "autosave_interval", "minutes"],
 }
 

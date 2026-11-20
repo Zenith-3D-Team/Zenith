@@ -211,7 +211,7 @@ func _draw() -> void:
 		if _hover.get("planet", "") == loc["name"]:
 			col = ORBIT_HOVERED
 		draw_arc(sun, r, 0.0, TAU, maxi(64, int(r / 3.0)), col, maxf(1.0, Kit.px(1.5)), true)
-	# Routes between places, each with its distance at its middle.
+	# Routes between places, each with its distance at its middle (owner's B6).
 	var small := Kit.font("default")
 	var small_fs := Kit.px(13)
 	for i in model.space_connections.size():

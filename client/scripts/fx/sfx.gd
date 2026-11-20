@@ -26,6 +26,11 @@ extends Node3D
 ##
 ## `--sfx-log` prints every sound started and, every 5 s, how many voices are busy, the loudest
 ## peaks, and sounds started over the same file.
+##
+## Kinds (API 1.7, addon_sound.gd): the character's steps, swings, shots, the windows' clicks, building,
+## rotating, picking up and explosions are played with a kind ("step/grass", "shot/pistol"), which
+## add-ons may replace or mute. Each kind keeps a stack: the last add-on to replace it wins, and when it
+## stops the one before comes back. `--addon-sounds=off` ignores every replace and mute.
 
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
@@ -55,6 +60,20 @@ const REPEAT_MSEC := 40
 const KEEP_BONUS := 1.4
 
 static var instance = null  # the Sfx node, untyped so its own methods can be called
+
+## The kinds an add-on can replace or mute (each also with a detail: "step/grass").
+const KINDS := ["step", "rustle", "mine", "mined", "repair", "shot", "ui", "build", "rotate", "pickup", "explosion"]
+## Add-ons' replaces and mutes: kind ("step" or "step/grass") -> its stack, the top last:
+## {by (add-on id), mute, files (sound paths), volume (-1: the replaced sound's own)}.
+static var kind_stack := {}
+## Every add-on's api.sound (addon_sound.gd), and those whose `played` signal has a connection
+## (refreshed each frame: a signal can't tell when it is connected).
+static var listeners: Array = []
+static var _hearing: Array = []
+## Kinds are looked at at all: the one check a sound with a kind costs while no add-on uses them.
+static var _kinds_on := false
+## --addon-sounds=off: add-ons' replace() and mute() are ignored.
+static var addon_sounds := not OS.get_cmdline_user_args().has("--addon-sounds=off")
 
 
 class LoopVoice:
@@ -108,10 +127,67 @@ var _stat_dropped := 0
 
 
 ## A click or other window sound: "gui-click", "gui-tab", "inventory-move"... (Factorio's
-## core/sound names), or a full path relative to Factorio's data folder.
-static func play_ui(sound: String, volume := 1.0) -> void:
+## core/sound names), or a full path relative to Factorio's data folder. Its kind is "ui/<name>"
+## unless given.
+static func play_ui(sound: String, volume := 1.0, kind := "") -> void:
 	if instance != null and is_instance_valid(instance):
-		instance.play_flat(sound if sound.ends_with(".ogg") else "core/sound/%s.ogg" % sound, volume)
+		var path := sound if sound.ends_with(".ogg") else "core/sound/%s.ogg" % sound
+		instance.play_flat(path, volume, kind if kind != "" else "ui/" + path.get_file().get_basename())
+
+
+## An add-on's replace (`files` non-empty) or mute (`files` empty) of `kind`, on top of its stack.
+## An add-on's earlier one for the same kind is taken out first.
+static func push_kind(kind: String, by: String, files: PackedStringArray, volume := -1.0) -> void:
+	var stack: Array = kind_stack.get(kind, [])
+	stack = stack.filter(func(e: Dictionary) -> bool: return e["by"] != by)
+	stack.append({"by": by, "mute": files.is_empty(), "files": files, "volume": volume})
+	kind_stack[kind] = stack
+	_update_kinds_on()
+
+
+## Takes add-on `by`'s replaces and mutes out: of `kind`, or of every kind ("").
+static func pop_kinds(by: String, kind := "") -> void:
+	for k: String in kind_stack.keys():
+		if kind != "" and k != kind:
+			continue
+		var stack: Array = kind_stack[k].filter(func(e: Dictionary) -> bool: return e["by"] != by)
+		if stack.is_empty():
+			kind_stack.erase(k)
+		else:
+			kind_stack[k] = stack
+	_update_kinds_on()
+
+
+## The entry that decides `kind` now: the top of its own stack, else of its base kind's; {} for none.
+static func kind_entry(kind: String) -> Dictionary:
+	var stack: Array = kind_stack.get(kind, [])
+	if stack.is_empty() and "/" in kind:
+		stack = kind_stack.get(kind.get_slice("/", 0), [])
+	return stack.back() if not stack.is_empty() else {}
+
+
+## The add-on API's key for one of Zenith's buses ("Walking" -> "walking"), as api.sound's `bus` option
+## and volume() take it; "effects" for one not in FxSettings.BUSES.
+static func bus_key(bus: String) -> String:
+	for key: String in FxSettings.BUSES:
+		if FxSettings.BUSES[key][0] == bus:
+			return key
+	return "effects"
+
+
+## Which listeners' `played` has a connection now.
+static func refresh_hearing() -> void:
+	var hearing: Array = []
+	for l in listeners:
+		if l.played.has_connections():
+			hearing.append(l)
+	if hearing != _hearing:
+		_hearing = hearing
+		_update_kinds_on()
+
+
+static func _update_kinds_on() -> void:
+	_kinds_on = not kind_stack.is_empty() or not _hearing.is_empty()
 
 
 func _ready() -> void:
@@ -209,50 +285,125 @@ func distance_gain(pos: Vector3, reach := 1.0, curve := "") -> float:
 ## A positional one-shot of a file. The file's definition in Factorio's prototypes, when found,
 ## decides its volume, variations' pitch, reach, aggregation and priority; `volume`,
 ## `pitch_spread` and `reach` are used for files it doesn't define. `bus` is the sound settings
-## category (fx_settings.gd BUSES). Quietly does nothing for "" or a missing file.
-func play_at(path: String, pos: Vector3, volume := 1.0, pitch_spread := 0.0, reach := 1.0, bus := "Effects") -> void:
+## category (fx_settings.gd BUSES). `kind` ("step/grass") lets add-ons replace or mute it. Quietly
+## does nothing for "" or a missing file.
+func play_at(path: String, pos: Vector3, volume := 1.0, pitch_spread := 0.0, reach := 1.0, bus := "Effects", kind := "") -> void:
 	if path == "" or volume <= 0.0:
 		return
 	var def := SoundBank.sound_for_file(path)
 	if def != null:
 		var i := def.files.find(path)
-		_play(path, def, pos, def.volume_of(i) if i >= 0 else volume, def.speed(), bus)
+		volume = def.volume_of(i) if i >= 0 else volume
 	else:
-		var plain := SoundBank.SoundDef.single(path, volume)
-		plain.reach = reach
-		plain.min_speed = 1.0 - pitch_spread
-		plain.max_speed = 1.0 + pitch_spread
-		_play(path, plain, pos, volume, plain.speed(), bus)
+		def = _plain(path, volume, pitch_spread, reach)
+	if kind != "" and _kinds_on:
+		_play_kind(kind, path, def, pos, volume, bus)
+	else:
+		_play(path, def, pos, volume, def.speed(), bus)
 
 
-## A positional one-shot of a whole definition: a random variation of it.
-func play_def(def: SoundBank.SoundDef, pos: Vector3, bus := "Effects", scale := 1.0) -> void:
+func _plain(path: String, volume: float, pitch_spread: float, reach: float) -> SoundBank.SoundDef:
+	var plain := SoundBank.SoundDef.single(path, volume)
+	plain.reach = reach
+	plain.min_speed = 1.0 - pitch_spread
+	plain.max_speed = 1.0 + pitch_spread
+	return plain
+
+
+## A sound of `kind`: Zenith's own (`path`), or the add-on's that replaced it, or nothing when muted;
+## then the add-ons listening hear of it. `pos` null: not positional (the windows').
+func _play_kind(kind: String, path: String, def: SoundBank.SoundDef, pos: Variant, volume: float, bus: String) -> void:
+	var e := kind_entry(kind)
+	var by := ""
+	if not e.is_empty():
+		by = str(e["by"])
+		if e["mute"]:
+			if FxSettings.log_sounds:
+				print("sfx: %s muted by %s" % [kind, by])
+			return
+		var file := _ready_file(e["files"], pos == null)
+		if file == "":
+			return  # still decoding: it plays next time, as Zenith's own first sounds
+		if FxSettings.log_sounds:
+			print("sfx: %s replaced by %s" % [kind, by])
+		if float(e["volume"]) >= 0.0:
+			volume = float(e["volume"])
+		var own := SoundBank.SoundDef.single(file, volume)
+		if def != null:
+			own.reach = def.reach
+			own.attenuation = def.attenuation
+			own.priority = def.priority
+			own.min_speed = def.min_speed
+			own.max_speed = def.max_speed
+		path = file
+		def = own
+	var ok := _flat(path, volume, bus) if pos == null else _play(path, def, pos, volume, def.speed(), bus)
+	if ok and not _hearing.is_empty():
+		var info := {"at": pos, "path": path, "by": by, "bus": bus_key(bus)}
+		for l in _hearing:
+			l.played.emit(kind, info)
+
+
+## One of `files` that can be played now: decoded (`now`: decoded on the spot, for the windows'), the
+## others started; "" while none is.
+func _ready_file(files: PackedStringArray, now: bool) -> String:
+	if now:
+		return files[randi() % files.size()] if files.size() > 0 else ""
+	var ready := PackedStringArray()
+	for f in files:
+		if SoundBank.stream_soon(f) != null:
+			ready.append(f)
+	return ready[randi() % ready.size()] if ready.size() > 0 else ""
+
+
+## An add-on's own one-shot (api.sound.play): a file's path, or a stream it made. `pos` null: not
+## positional. False when it didn't play: not decoded yet, out of hearing, or no voice free. A bus the
+## player muted still plays it, silently, as Zenith's own.
+func play_addon(sound: Variant, pos: Variant, volume: float, pitch_spread: float, reach: float, bus: String) -> bool:
+	var path := str(sound) if sound is String else "(stream)"
+	var given: AudioStream = sound if sound is AudioStream else null
+	if volume <= 0.0 or (given == null and path == ""):
+		return false
+	if pos == null:
+		return _flat(path, volume, bus, given)
+	var def := SoundBank.sound_for_file(path) if given == null else null
+	if def == null:
+		def = _plain(path, volume, pitch_spread, reach)
+	return _play(path, def, pos, volume, def.speed(), bus, given)
+
+
+## A positional one-shot of a whole definition: a random variation of it. `kind` as play_at's.
+func play_def(def: SoundBank.SoundDef, pos: Vector3, bus := "Effects", scale := 1.0, kind := "") -> void:
 	if def == null or def.files.is_empty():
 		return
 	var i := def.pick()
-	_play(def.files[i], def, pos, def.volume_of(i) * scale, def.speed(), bus)
+	if kind != "" and _kinds_on:
+		_play_kind(kind, def.files[i], def, pos, def.volume_of(i) * scale, bus)
+	else:
+		_play(def.files[i], def, pos, def.volume_of(i) * scale, def.speed(), bus)
 
 
-func _play(path: String, def: SoundBank.SoundDef, pos: Vector3, volume: float, speed: float, bus: String) -> void:
+## True when it started. `given`: a stream to play instead of the file's (an add-on's own).
+func _play(path: String, def: SoundBank.SoundDef, pos: Vector3, volume: float, speed: float, bus: String, given: AudioStream = null) -> bool:
 	var gain := distance_gain(pos, def.reach, def.attenuation)
 	if gain <= 0.0 or volume <= 0.0:
-		return
+		return false
 	var now := Time.get_ticks_msec()
-	if def.max_count <= 0 and now - int(_last_played.get(path, -100000)) < REPEAT_MSEC:
+	if given == null and def.max_count <= 0 and now - int(_last_played.get(path, -100000)) < REPEAT_MSEC:
 		_stat_dropped += 1
-		return
+		return false
 	var factor := _aggregate(def, now)
 	if factor <= 0.0:
 		_stat_dropped += 1
-		return
+		return false
 	volume *= factor
-	var stream := SoundBank.stream_soon(path)
+	var stream := given if given != null else SoundBank.stream_soon(path)
 	if stream == null:
-		return
+		return false
 	var s := _shot_voice(bus, def.priority, volume * gain)
 	if s == null:
 		_stat_dropped += 1
-		return
+		return false
 	_last_played[path] = now
 	if FxSettings.log_sounds and _playing_paths().has(path):
 		_stat_dups += 1
@@ -273,6 +424,7 @@ func _play(path: String, def: SoundBank.SoundDef, pos: Vector3, volume: float, s
 	s.player.bus = bus
 	s.player.play()
 	_note(path, pos)
+	return true
 
 
 ## Factorio's aggregation: the volume factor for one more of `def` now (0: don't play it).
@@ -343,17 +495,26 @@ func _heard(s: Shot) -> float:
 	return s.volume * distance_gain(s.player.global_position, s.reach, s.curve)
 
 
-## Not positional: the windows' sounds.
-func play_flat(path: String, volume := 1.0) -> void:
-	var stream := SoundBank.stream(path)
+## Not positional: the windows' sounds. `kind` ("ui/gui-click") lets add-ons replace or mute it.
+func play_flat(path: String, volume := 1.0, kind := "") -> void:
+	if kind != "" and _kinds_on:
+		_play_kind(kind, path, null, null, volume, "UI")
+	else:
+		_flat(path, volume)
+
+
+func _flat(path: String, volume: float, bus := "UI", given: AudioStream = null) -> bool:
+	var stream := given if given != null else SoundBank.stream(path)
 	if stream == null:
-		return
+		return false
 	var p: AudioStreamPlayer = _ui[_ui_next]
 	_ui_next = (_ui_next + 1) % _ui.size()
 	p.stream = stream
+	p.bus = bus
 	p.volume_db = linear_to_db(volume)
 	p.play()
 	_note(path, null)
+	return true
 
 
 ## The working loops that should be playing now: one Dictionary per source in hearing range:
@@ -463,6 +624,8 @@ func stop_all() -> void:
 
 
 func _process(delta: float) -> void:
+	if not listeners.is_empty():
+		refresh_hearing()
 	for v: LoopVoice in _loops:
 		if v.key == null:
 			continue

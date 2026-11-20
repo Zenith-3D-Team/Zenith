@@ -16,7 +16,7 @@ extends Node
 ## each cropped to the box's outline on screen.
 
 ## yaw, pitch, distance for a 3-tile model (scaled to the box), orthographic; the cameras the
-## review set uses. "factorio" is Factorio's own view and zoom.
+## owner's review set uses (model brief). "factorio" is Factorio's own view and zoom.
 const VIEWS := {
 	"factorio": [0.0, 48.0, 0.0, true],
 	"north": [180.0, 38.0, 7.0, false],

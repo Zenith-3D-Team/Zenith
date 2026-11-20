@@ -33,6 +33,7 @@ import compare_builds as cb  # noqa: E402
 
 sys.path.append(str(ROOT / "tools"))
 import factorio_install  # noqa: E402
+import safe_delete  # noqa: E402
 
 FACTORIO_EXE = pathlib.Path(factorio_install.exe())
 TRACE = {"stand": 1500, "laps": 3600}
@@ -42,9 +43,10 @@ MINIMISE = ("Add-Type -Name W -Namespace Z -MemberDefinition '[DllImport(\"user3
             "ForEach-Object { [Z.W]::ShowWindow($_.MainWindowHandle, 6) | Out-Null }")
 
 
-def client(args, out):
+def client(args, out, log):
     godot = os.environ.get("GODOT", "godot")
-    return subprocess.Popen([godot, "--audio-driver", "Dummy", "--path", str(ROOT / "client"), "--"] + args,
+    # --log-file: the run folder's own log, not the player's user://logs/
+    return subprocess.Popen([godot, "--audio-driver", "Dummy", "--path", str(ROOT / "client"), "--log-file", str(log), "--"] + args,
                             stdout=out, stderr=subprocess.STDOUT)
 
 
@@ -56,8 +58,7 @@ def hybrid_folder(work):
     read_data = FACTORIO_EXE.parent.parent.parent / "data"
     (h / "config.ini").write_text(f"[path]\nread-data={read_data}\nwrite-data={h / 'data'}\n[graphics]\nfull-screen=false\n", encoding="ascii")
     bridge = h / "mods" / "factorio-3d-bridge"
-    if bridge.exists():
-        shutil.rmtree(bridge)
+    safe_delete.remove_tree(bridge)  # a link left there goes as a link, not its target
     shutil.copytree(ROOT / "mod" / "factorio-3d-bridge", bridge)
     for f in ("mod-list.json", "mod-settings.dat"):
         src = ROOT / "server" / "data" / "mods" / f
@@ -93,7 +94,7 @@ def run_hybrid(h, scenario, run_dir, minimise):
     args = ["--factorio-port=36130", "--port=36131", "--gpu-profile", f"--stutter-probe={probe}@{cb.ROUTE[scenario]}",
             f"--probe-trace={TRACE[scenario]}"]
     with open(run_dir / "client.log", "w", encoding="utf-8", errors="ignore") as out:
-        c = client(args, out)
+        c = client(args, out, (run_dir / "godot.log").resolve())
         if minimise:
             time.sleep(20)
             subprocess.run(["powershell", "-NoProfile", "-Command", MINIMISE % game.pid], capture_output=True)

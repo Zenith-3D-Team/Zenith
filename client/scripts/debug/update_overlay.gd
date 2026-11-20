@@ -17,6 +17,7 @@ extends Node3D
 ## Everything is drawn over buildings (no depth test) and lifted onto the hills (ground_height.gdshaderinc).
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const WireDecode := preload("res://scripts/net/wire_decode.gd")
 const FlashShader := preload("res://shaders/update_flash.gdshader")
 
 const FADE := 1.0
@@ -592,7 +593,7 @@ func on_message(msg: Dictionary) -> void:
 					_unit("st", int(l[i]))
 		"bs":
 			if _lane_kinds:
-				_belts(msg)
+				_belts(WireDecode.plain(msg))
 		"pku":
 			if _on.has("hand"):
 				for r in _list(msg.get("l")):
@@ -647,6 +648,8 @@ func on_message(msg: Dictionary) -> void:
 
 
 static func _list(v) -> Array:
+	if WireDecode.packed(v):
+		return Array(v)  # (a binary frame's list: st, ih, chunk tiles)
 	return v if v is Array else []
 
 
@@ -729,7 +732,7 @@ func _movers(msg: Dictionary) -> void:
 	var proto := 0
 	var x := 0
 	var y := 0
-	for rec in _list(msg.get("l")):
+	for rec in _list(WireDecode.mv_records(msg)):  # (a binary frame's packed records, whole)
 		if not (rec is Array) or (rec as Array).size() < 4:
 			continue
 		var r: Array = rec

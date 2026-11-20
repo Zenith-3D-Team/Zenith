@@ -31,6 +31,7 @@ from PIL import Image
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT / "tools"))
 import factorio_install  # noqa: E402
+import safe_delete  # noqa: E402
 
 EXE = pathlib.Path(factorio_install.exe())
 WORK = ROOT / "art-src" / "look"
@@ -52,8 +53,7 @@ def log(*a):
 
 def folder(name, mods, space_age=False):
     h = WORK / name
-    if h.exists():
-        shutil.rmtree(h)
+    safe_delete.remove_tree(h)  # links inside (a mod linked in) go as links
     (h / "mods").mkdir(parents=True)
     if space_age:
         names = ["base", "elevated-rails", "quality", "space-age"] + [src.name for src in mods]
@@ -137,7 +137,8 @@ def zenith_pictures(save, looks, daytimes, extra):
                 dest = WORK / f"zenith-{look}{tag(d)}.png"
                 if dest.exists():
                     dest.unlink()
-                args = [GODOT, "--audio-driver", "Dummy", "--path", str(ROOT / "client"), "--resolution", "%dx%d" % SIZE, "--",
+                args = [GODOT, "--audio-driver", "Dummy", "--path", str(ROOT / "client"), "--resolution", "%dx%d" % SIZE,
+                        "--log-file", str((WORK / f"zenith-{look}{tag(d)}.godot.log").resolve()), "--",
                         f"--factorio-port={PORTS[0]}", f"--port={PORTS[3]}", "--clean-shot", f"--sky=nauvis@{d}",
                         "--camera=factorio", f"--look={look}", f"--screenshot={dest}@45", "--no-custom-models",
                         # Zenith's defaults, not this PC's own settings (brightness, saturation...)

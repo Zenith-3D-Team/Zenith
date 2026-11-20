@@ -23,6 +23,7 @@ local map = require("scripts.map")
 local modules = require("scripts.modules")
 local alt_mode = require("scripts.alt_mode")
 local belt_switch = require("scripts.belt_switch")
+local tracker = require("scripts.tracker")
 
 local M = {}
 
@@ -569,7 +570,10 @@ local function chest_command(fn)
 end
 
 M.set_inserter = kind_command("inserter", entity_ui.set_inserter, "That isn't an inserter")
-M.set_splitter = kind_command("splitter", entity_ui.set_splitter, "That isn't a splitter")
+M.set_splitter = kind_command("splitter", function(e, cmd)
+  entity_ui.set_splitter(e, cmd)
+  tracker.configured(e)
+end, "That isn't a splitter")
 M.set_switch = kind_command("switch", entity_ui.set_switch, "That isn't a power switch")
 M.set_panel = kind_command("panel", entity_ui.set_panel, "That isn't a display panel")
 

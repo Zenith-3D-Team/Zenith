@@ -6,11 +6,11 @@ two can't drift apart. `problems(msg)` returns a list of strings; empty means va
 
 RELIABLE = {"cmdr", "welcome", "protos", "tprotos", "iprotos", "fprotos", "ready", "chunk", "ents", "add", "upd", "del", "aiu", "tiles", "st", "inv", "recipes",
             "guns", "slots", "qb", "rdet", "craftable", "techs", "rdone", "clog", "surface", "eprops", "surfs", "planet",
-            "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol", "kept", "ac", "am"}
+            "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol", "kept", "ac", "am", "steps"}
 IMMEDIATE = {"me", "mv", "bi", "ih", "ie", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "plat",
              "ai", "clip", "chat", "stats", "trl", "seg", "lt", "legs", "cp", "pg", "sp", "fz", "rk", "pst", "bf",
              "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui", "bs", "dg", "pol",
-             "mnd", "pku"}
+             "mnd", "pku", "rpatch", "ext"}
 CHARACTER_ROLES = {"main", "guns", "ammo", "armor", "trash"}
 DICTIONARY_WIDTH = {"protos": 12, "tprotos": 5, "iprotos": 2, "fprotos": 5, "dprotos": 2}
 GUI_KINDS = {"container", "crafter", "furnace", "lab", "combinator", "train", "stop", "roboport", "other",
@@ -23,7 +23,8 @@ PLANNER_ITEMS = {"", "blueprint", "blueprint-book", "deconstruction-planner", "u
 RECORD_TYPES = {"blueprint", "blueprint-book", "deconstruction-planner", "upgrade-planner"}
 STATS_KINDS = {"item", "fluid", "kill", "electric", "build", "pollution"}
 ALERT_KINDS = {"destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "train_fuel", "train_path",
-               "platform_path", "platform_storage", "collector", "launch", "unplugged", "no_fuel", "output_full", "depleted"}
+               "platform_path", "platform_storage", "collector", "launch", "pipeline", "unplugged", "no_fuel", "output_full",
+               "depleted"}
 PEDIA_KINDS = {"item", "fluid", "entity", "recipe", "technology", "tile", "planet", "space-location", "quality"}
 
 
@@ -54,11 +55,390 @@ def doc_problems(path=None):
     return out
 
 
+# Binary frames (docs/PROTOCOL.md, "Binary frames"): for a client whose hello says `bin`, every datagram is
+# WIRE_MAGIC, the wire version, then frames: kind u8, flags u8, length u32, the body (little-endian). Kind 0 is
+# a JSON message as text, kind 1 the datagram's `dg` line, kinds 16 and up messages in binary. A binary body
+# starts with k u32 (and r u32 with flag bit 0), then the kind's scalar fields, then its blocks: width u8 (4 or
+# 8), count u32, `count` signed numbers of `width` bytes.
+WIRE_MAGIC = 0xF3
+WIRE_VERSION = 3  # 1: mv; 2: bs and bfar too; 3: chunk, ents, st and ih too (a datagram's second byte: the version
+# its client was answered)
+KIND_JSON, KIND_DG, KIND_MV, KIND_BS, KIND_BFAR = 0, 1, 16, 17, 18
+KIND_CHUNK, KIND_ENTS, KIND_ST, KIND_IH = 19, 20, 21, 22
+ENT_STRIDE = 5  # an `ents` record's numbers: unit, prototype id, x, y, direction (its extras in the JSON tail)
+IH_STRIDE = 4  # an `ih` hand: unit, hand x, hand y, item id
+ST_LISTS = ("l", "lc", "ao")
+FLAG_RELIABLE = 1
+MV_STRIDE = 5  # unit, prototype id, x, y, orientation (-1: not oriented)
+NO_ORIENTATION = -1
+# bs (kind 17): its lists in this order, each a block; a lane key is two numbers (unit number, line index:
+# signed as the key, so minus a key has the line negative and 0 is 0, 0). Numbers a record in JSON (0: sl,
+# by its count) and the positions in a record that are keys.
+BS_FIELDS = ("lm", "sl", "ew", "sh", "pc", "pu", "dl", "of")
+BS_STRIDE = {"lm": 12, "sl": 0, "ew": 4, "sh": 2, "pc": 5, "pu": 3, "dl": 1, "of": 2}
+BS_KEYS = {"lm": (0, 11), "sl": (0,), "ew": (0,), "sh": (0,), "pc": (0,), "pu": (0,), "dl": (0,), "of": ()}
+LANE_KEYS = 8
+
+
+def lane_pair(key):
+    """A lane key as [unit number, line index] (docs/PROTOCOL.md, kind 17)."""
+    if key == 0:
+        return [0, 0]
+    a = abs(key)
+    unit = (a - 1) // LANE_KEYS
+    line = a - unit * LANE_KEYS
+    return [unit, line if key > 0 else -line]
+
+
+def lane_key(unit, line):
+    if line == 0:
+        return 0
+    key = unit * LANE_KEYS + abs(line)
+    return key if line > 0 else -key
+
+
+def _bs_split(field, flat):
+    """A bs list in JSON's layout with its keys split (the binary layout)."""
+    out = []
+    if field == "sl":
+        i = 0
+        while i + 2 < len(flat):
+            n = flat[i + 2]
+            out += lane_pair(flat[i]) + flat[i + 1:i + 3 + n * 4]
+            i += 3 + n * 4
+        return out
+    stride, keys = BS_STRIDE[field], BS_KEYS[field]
+    for i in range(0, len(flat) - stride + 1, stride):
+        for j in range(stride):
+            out += lane_pair(flat[i + j]) if j in keys else [flat[i + j]]
+    return out
+
+
+def _bs_join(field, flat):
+    """The binary layout back to JSON's (raises ValueError when it doesn't add up)."""
+    out = []
+    if field == "sl":
+        i = 0
+        while i < len(flat):
+            if i + 4 > len(flat):
+                raise ValueError("bs sl lane cut short")
+            n = flat[i + 3]
+            if n < 0 or i + 4 + n * 4 > len(flat):
+                raise ValueError("bs sl lane's items past the block")
+            out += [lane_key(flat[i], flat[i + 1])] + flat[i + 2:i + 4 + n * 4]
+            i += 4 + n * 4
+        return out
+    stride, keys = BS_STRIDE[field], BS_KEYS[field]
+    wide = stride + len(keys)
+    if len(flat) % wide:
+        raise ValueError(f"bs {field}: {len(flat)} numbers, not records of {wide}")
+    for i in range(0, len(flat), wide):
+        at = i
+        for j in range(stride):
+            if j in keys:
+                out.append(lane_key(flat[at], flat[at + 1]))
+                at += 2
+            else:
+                out.append(flat[at])
+                at += 1
+    return out
+
+
+def _bs_body(msg, width=None):
+    import struct
+    blocks = [_bs_split(f, msg.get(f) or []) for f in BS_FIELDS]
+    qu = msg.get("qu") or []
+    uids, names = qu[0::2], qu[1::2]
+    if width is None:
+        width = 4 if all(-2 ** 31 <= v < 2 ** 31 for b in blocks + [uids] for v in b) else 8
+    code = "i" if width == 4 else "q"
+    body = struct.pack("<IIIIIiiII", msg["k"], msg["part"], msg["parts"], msg.get("p", 0), msg.get("w", 0),
+                       msg.get("fx", 0), msg.get("fy", 0), msg.get("fr", 0), msg.get("ld", 0))
+    for b in blocks + [uids]:
+        body += struct.pack(f"<BI{len(b)}{code}", width, len(b), *b)
+    text = ",".join(names).encode()
+    return body + struct.pack("<I", len(text)) + text
+
+
+def encode_frame(kind, body, flags=0):
+    import struct
+    return struct.pack("<BBI", kind, flags, len(body)) + body
+
+
+def _block(numbers):
+    import struct
+    width = 4 if all(-2 ** 31 <= v < 2 ** 31 for v in numbers) else 8
+    return struct.pack(f"<BI{len(numbers)}{'i' if width == 4 else 'q'}", width, len(numbers), *numbers)
+
+
+def _head(msg):
+    """A binary body's start, `k` and (a reliable message) `r`, and the frame's flags."""
+    import struct
+    if "r" in msg:
+        return struct.pack("<II", msg["k"], msg["r"]), FLAG_RELIABLE
+    return struct.pack("<I", msg["k"]), 0
+
+
+def _undelta(flat, stride):
+    out = list(flat)
+    for i in range(stride, len(out)):
+        out[i] += out[i - stride]
+    return out
+
+
+def encode_message(msg, version=WIRE_VERSION):
+    """One message as a frame, as the bridge writes it for a `bin` client of wire `version`: `mv` in binary
+    (its records as they are, not delta-coded; a `z` one is undone first), from version 2 `bs` and `bfar`
+    too, from 3 `chunk` (a snapshot: not `none` or `same`), `ents`, `st` and `ih`, anything else as JSON
+    text (kind 0)."""
+    import json
+    import struct
+    t = msg.get("t")
+    if version >= 3 and t == "chunk" and "tiles" in msg:
+        head, flags = _head(msg)
+        body = head + struct.pack("<iiIIII", msg["cx"], msg["cy"], msg.get("parts", 1), msg.get("rs", 0),
+                                  msg.get("rv", 0), msg.get("n", 0)) + _block(msg.get("tiles") or [])
+        return encode_frame(KIND_CHUNK, body, flags)
+    if version >= 3 and t == "ents":
+        head, flags = _head(msg)
+        flat, xi, extras = [], [], []
+        for j, rec in enumerate(msg.get("e") or []):
+            flat += list(rec[:ENT_STRIDE])
+            if len(rec) > ENT_STRIDE:
+                xi.append(j)
+                extras.append(rec[ENT_STRIDE])
+        tail = json.dumps(extras, separators=(",", ":")).encode() if extras else b""
+        body = head + struct.pack("<iiII", msg["cx"], msg["cy"], msg.get("part", 1), msg.get("parts", 1))             + _block(flat) + _block(xi) + struct.pack("<I", len(tail)) + tail
+        return encode_frame(KIND_ENTS, body, flags)
+    if version >= 3 and t == "st":
+        head, flags = _head(msg)
+        return encode_frame(KIND_ST, head + b"".join(_block(msg.get(f) or []) for f in ST_LISTS), flags)
+    if version >= 3 and t == "ih" and "r" not in msg:
+        flat = msg.get("l") or []
+        if msg.get("z") == 1:
+            flat = _undelta(flat, IH_STRIDE)
+        body = struct.pack("<IIII", msg["k"], msg.get("part", 1), msg.get("parts", 1), msg.get("p", 0)) + _block(flat)
+        return encode_frame(KIND_IH, body)
+    if t == "mv" and "r" not in msg:
+        flat = []
+        prev = None
+        for rec in msg.get("l") or []:
+            rec = list(rec)
+            if msg.get("z") == 1 and prev is not None:
+                rec = [v + prev[j] if j < 4 else v for j, v in enumerate(rec)]
+            prev = rec
+            flat += rec[:4] + [rec[4] if len(rec) > 4 else NO_ORIENTATION]
+        body = struct.pack("<IIII", msg["k"], msg["part"], msg["parts"], msg.get("p", 0)) + _block(flat)
+        return encode_frame(KIND_MV, body)
+    if version >= 2 and msg.get("t") == "bs" and "r" not in msg:
+        return encode_frame(KIND_BS, _bs_body(msg))
+    if version >= 2 and msg.get("t") == "bfar" and "r" not in msg:
+        h = msg.get("h") or []
+        body = struct.pack("<Iii", msg["k"], msg["cx"], msg["cy"])
+        for b in (msg.get("l") or [], msg.get("c") or [], h):
+            body += struct.pack(f"<BI{len(b)}i", 4, len(b), *b)
+        return encode_frame(KIND_BFAR, body)
+    return encode_frame(KIND_JSON, json.dumps(msg, separators=(",", ":")).encode())
+
+
+def encode_datagram(frames, version=WIRE_VERSION):
+    return bytes((WIRE_MAGIC, version)) + b"".join(frames)
+
+
+def _read_block(data, at, end):
+    import struct
+    if at + 5 > end:
+        raise ValueError("block header past the frame")
+    width, count = struct.unpack_from("<BI", data, at)
+    if width not in (4, 8):
+        raise ValueError(f"block width {width}")
+    at += 5
+    if at + width * count > end:
+        raise ValueError("block past the frame")
+    return list(struct.unpack_from(f"<{count}{'i' if width == 4 else 'q'}", data, at)), at + width * count
+
+
+def decode_frames(data):
+    """A binary datagram's messages as the dicts their JSON gives (`mv` without `z`: whole records).
+    Raises ValueError on a bad datagram: a wrong start or version, a length past the end, an unknown kind."""
+    import json
+    import struct
+    if len(data) < 2 or data[0] != WIRE_MAGIC:
+        raise ValueError("not a binary datagram")
+    if not 1 <= data[1] <= WIRE_VERSION:
+        raise ValueError(f"wire version {data[1]}")
+    out = []
+    at = 2
+    while at < len(data):
+        if at + 6 > len(data):
+            raise ValueError("frame header past the datagram")
+        kind, flags, length = struct.unpack_from("<BBI", data, at)
+        at += 6
+        end = at + length
+        if end > len(data):
+            raise ValueError("frame past the datagram")
+        if kind == KIND_JSON:
+            out.append(json.loads(data[at:end].decode("utf-8")))
+        elif kind == KIND_DG:
+            if length != 12:
+                raise ValueError("dg frame of the wrong length")
+            n, k, b = struct.unpack_from("<III", data, at)
+            out.append({"t": "dg", "n": n, "k": k, "b": b})
+        elif kind == KIND_MV:
+            p = at
+            if p + 4 > end:
+                raise ValueError("mv frame too short")
+            msg = {"t": "mv", "k": struct.unpack_from("<I", data, p)[0]}
+            p += 4
+            if flags & FLAG_RELIABLE:
+                if p + 4 > end:
+                    raise ValueError("mv frame too short")
+                msg["r"] = struct.unpack_from("<I", data, p)[0]
+                p += 4
+            if p + 12 > end:
+                raise ValueError("mv frame too short")
+            msg["part"], msg["parts"], period = struct.unpack_from("<III", data, p)
+            if period:
+                msg["p"] = period
+            flat, p = _read_block(data, p + 12, end)
+            if len(flat) % MV_STRIDE or p != end:
+                raise ValueError("mv records of the wrong size")
+            msg["l"] = [flat[i:i + 4] + ([] if flat[i + 4] == NO_ORIENTATION else [flat[i + 4]])
+                        for i in range(0, len(flat), MV_STRIDE)]
+            out.append(msg)
+        elif kind == KIND_BS and data[1] >= 2:
+            out.append(_decode_bs(data, at, end, flags))
+        elif kind in (KIND_CHUNK, KIND_ENTS, KIND_ST, KIND_IH) and data[1] >= 3:
+            out.append(_decode_v3(kind, data, at, end, flags))
+        elif kind == KIND_BFAR and data[1] >= 2:
+            if length < 12:
+                raise ValueError("bfar frame too short")
+            k, cx, cy = struct.unpack_from("<Iii", data, at)
+            msg = {"t": "bfar", "k": k, "cx": cx, "cy": cy}
+            p = at + 12
+            lists = []
+            for _ in range(3):
+                block, p = _read_block(data, p, end)
+                lists.append(block)
+            if p != end or len(lists[0]) % 5 or len(lists[1]) * 5 != len(lists[0]) * 2 or lists[2] and len(lists[2]) != len(lists[1]):
+                raise ValueError("bfar blocks of the wrong size")
+            msg["l"], msg["c"] = lists[0], lists[1]
+            if lists[2]:
+                msg["h"] = lists[2]
+            out.append(msg)
+        else:
+            raise ValueError(f"unknown frame kind {kind}")
+        at = end
+    return out
+
+
+def _decode_bs(data, at, end, flags):
+    """A kind 17 body as the dict its JSON gives (lists absent when empty, as the bridge leaves them)."""
+    import struct
+    p = at
+    if p + 4 > end:
+        raise ValueError("bs frame too short")
+    msg = {"t": "bs", "k": struct.unpack_from("<I", data, p)[0]}
+    p += 4
+    if flags & FLAG_RELIABLE:
+        if p + 4 > end:
+            raise ValueError("bs frame too short")
+        msg["r"] = struct.unpack_from("<I", data, p)[0]
+        p += 4
+    if p + 32 > end:
+        raise ValueError("bs frame too short")
+    msg["part"], msg["parts"], msg["p"], msg["w"], msg["fx"], msg["fy"], msg["fr"], ld = struct.unpack_from("<IIIIiiII", data, p)
+    if ld:
+        msg["ld"] = ld
+    p += 32
+    for field in BS_FIELDS:
+        flat, p = _read_block(data, p, end)
+        if flat:
+            msg[field] = _bs_join(field, flat)
+    uids, p = _read_block(data, p, end)
+    if p + 4 > end:
+        raise ValueError("bs qu names past the frame")
+    n = struct.unpack_from("<I", data, p)[0]
+    p += 4
+    if p + n != end:
+        raise ValueError("bs qu names of the wrong length")
+    names = data[p:end].decode("utf-8").split(",") if n else []
+    if len(names) != len(uids):
+        raise ValueError("bs qu: ids and names differ in number")
+    if uids:
+        msg["qu"] = [v for pair in zip(uids, names) for v in pair]
+    return msg
+
+
+def _decode_v3(kind, data, at, end, flags):
+    """A kind 19-22 body (`chunk`, `ents`, `st`, `ih`) as the dict its JSON gives."""
+    import json
+    import struct
+    name = {KIND_CHUNK: "chunk", KIND_ENTS: "ents", KIND_ST: "st", KIND_IH: "ih"}[kind]
+    p = at
+    if p + 4 > end:
+        raise ValueError(f"{name} frame too short")
+    msg = {"t": name, "k": struct.unpack_from("<I", data, p)[0]}
+    p += 4
+    if flags & FLAG_RELIABLE:
+        if p + 4 > end:
+            raise ValueError(f"{name} frame too short")
+        msg["r"] = struct.unpack_from("<I", data, p)[0]
+        p += 4
+    if kind == KIND_CHUNK:
+        if p + 24 > end:
+            raise ValueError("chunk frame too short")
+        msg["cx"], msg["cy"], msg["parts"], msg["rs"], msg["rv"], msg["n"] = struct.unpack_from("<iiIIII", data, p)
+        msg["tiles"], p = _read_block(data, p + 24, end)
+        if p != end or len(msg["tiles"]) % 2:
+            raise ValueError("chunk tiles of the wrong size")
+    elif kind == KIND_ENTS:
+        if p + 16 > end:
+            raise ValueError("ents frame too short")
+        msg["cx"], msg["cy"], msg["part"], msg["parts"] = struct.unpack_from("<iiII", data, p)
+        flat, p = _read_block(data, p + 16, end)
+        xi, p = _read_block(data, p, end)
+        if len(flat) % ENT_STRIDE or p + 4 > end:
+            raise ValueError("ents records of the wrong size")
+        n = struct.unpack_from("<I", data, p)[0]
+        p += 4
+        if p + n != end:
+            raise ValueError("ents extras of the wrong length")
+        extras = json.loads(data[p:end].decode("utf-8")) if n else []
+        recs = [flat[i:i + ENT_STRIDE] for i in range(0, len(flat), ENT_STRIDE)]
+        if not isinstance(extras, list) or len(extras) != len(xi) or any(not 0 <= j < len(recs) for j in xi):
+            raise ValueError("ents extras and their records differ")
+        for j, x in zip(xi, extras):
+            recs[j].append(x)
+        msg["e"] = recs
+    elif kind == KIND_ST:
+        for f in ST_LISTS:
+            flat, p = _read_block(data, p, end)
+            if len(flat) % 2:
+                raise ValueError(f"st {f} of the wrong size")
+            if flat or f == "l":
+                msg[f] = flat
+        if p != end:
+            raise ValueError("st frame of the wrong length")
+    else:
+        if p + 12 > end:
+            raise ValueError("ih frame too short")
+        msg["part"], msg["parts"], period = struct.unpack_from("<III", data, p)
+        if period:
+            msg["p"] = period
+        msg["l"], p = _read_block(data, p + 12, end)
+        if p != end or len(msg["l"]) % IH_STRIDE:
+            raise ValueError("ih hands of the wrong size")
+    return msg
+
+
 def split_datagram(data):
-    """The messages in one datagram: one JSON object, or for a client whose hello says `b` several
-    joined by newlines (docs/PROTOCOL.md, Transport)."""
+    """The messages in one datagram: one JSON object, several joined by newlines for a client whose hello
+    says `b`, or binary frames for one whose hello says `bin` (docs/PROTOCOL.md, Transport)."""
     import json
     if isinstance(data, (bytes, bytearray)):
+        if data[:1] == bytes((WIRE_MAGIC,)):
+            return decode_frames(bytes(data))
         data = data.decode("utf-8")
     return [json.loads(line) for line in data.split("\n") if line]
 
@@ -78,6 +458,37 @@ def _list(v):
 
 def _items(v):
     return v if isinstance(v, list) else []
+
+
+# `steps` (step_sounds.lua: the character's steps from the prototypes).
+def steps_problems(msg):
+    """steps: part, parts, and optional s [[prefix or [files], volume x 100, count], ...], tl and el and dl
+    [[id, sound], ...], al [[item id, steps sound, moving sound], ...], u [metal, heat pipe], nv [night vision on, off] (docs/PROTOCOL.md).
+    A sound is its place in the whole of s, from 1; 0 is none."""
+    out = []
+    for k in ("part", "parts"):
+        if not (_int(msg.get(k)) and msg[k] >= 1):
+            out.append(f"steps: {k} must be an integer from 1: {msg.get(k)!r}")
+    for e in _items(msg.get("s", [])):
+        key = e[0] if isinstance(e, list) and e else None
+        if not (isinstance(e, list) and len(e) == 3 and (isinstance(key, str) and key != "" or
+                (isinstance(key, list) and key and all(isinstance(f, str) and f != "" for f in key)))
+                and _int(e[1]) and e[1] >= 0 and _int(e[2]) and e[2] >= 1):
+            out.append(f"steps: sound must be [prefix or [files], volume x 100, count]: {e!r}")
+    for k, width in (("tl", 2), ("el", 2), ("dl", 2), ("al", 3)):
+        if k in msg and not _list(msg[k]):
+            out.append(f"steps: {k} must be a list: {msg[k]!r}")
+        for rec in _items(msg.get(k, [])):
+            if not (isinstance(rec, list) and len(rec) == width and _int(rec[0]) and rec[0] > 0
+                    and all(_int(v) and v >= 0 for v in rec[1:])):
+                out.append(f"steps: {k} entry must be [id, sound{', sound' if width == 3 else ''}]: {rec!r}")
+    if "u" in msg and not (isinstance(msg["u"], list) and len(msg["u"]) == 2 and all(_int(v) and v >= 0 for v in msg["u"])):
+        out.append(f"steps: u must be [metal sound, heat pipe sound]: {msg['u']!r}")
+    if "nv" in msg and not (isinstance(msg["nv"], list) and len(msg["nv"]) == 2 and all(_int(v) and v >= 0 for v in msg["nv"])):
+        out.append(f"steps: nv must be [activate sound, deactivate sound]: {msg['nv']!r}")
+    if "s" in msg and not _list(msg["s"]):
+        out.append(f"steps: s must be a list: {msg['s']!r}")
+    return out
 
 
 def bs_problems(msg):
@@ -189,10 +600,19 @@ def entity_record_problems(rec, where):
     elif len(rec) == 6 and "co" in rec[5] and rec[5]["co"] not in CLIFF_ORIENTATIONS:
         out.append(f"{where}: extra.co is a cliff orientation like \"west-to-east\": {rec!r}")
     elif len(rec) == 6 and "fa" in rec[5] and not (_int(rec[5]["fa"]) and 1 <= rec[5]["fa"] <= 3):
-        out.append(f"{where}: extra.fa (a recipe's fluid in 1 / out 2, Alt-mode's arrows) is 1-3: {rec!r}")
+        out.append(f"{where}: extra.fa (a recipe's fluid in 1 / out 2, Alt-mode's arrows; a drill's fluid box 1) is 1-3: {rec!r}")
     elif len(rec) == 6 and "ai" in rec[5] and not _alt_icon(rec[5]["ai"]):
         out.append(f"{where}: extra.ai (Alt-mode icon) is [icon type, name, more filters?]: {rec!r}")
+    elif len(rec) == 6 and "fc" in rec[5] and not _fluid_connections(rec[5]["fc"]):
+        out.append(f"{where}: extra.fc (L10) is [[dx, dy, way 0/4/8/12, \"i\"|\"o\"|\"b\", fluid], ...]: {rec!r}")
     return out
+
+
+def _fluid_connections(v):
+    """A crafting machine's connections with their fluids (L10): [[dx, dy, way, flow, fluid name or ""], ...]."""
+    return isinstance(v, list) and v and all(
+        isinstance(c, list) and len(c) == 5 and _num(c[0]) and _num(c[1]) and c[2] in (0, 4, 8, 12)
+        and c[3] in ("i", "o", "b") and isinstance(c[4], str) for c in v)
 
 
 def _alt_icon(v):
@@ -257,11 +677,15 @@ def recipe_detail_problems(rec):
 
 def eprops_overlay_problems(x):
     """eprops' fifth entry: {ip, id: [x, y], rs, es} inserter vectors and hand speeds, {lr, cr} roboport radii, {mr, vp?}
-    mining radius and drop vector, {fb: [[x, y, direction, "i"|"o"|"b"], ...]} fluid connections, fo: 1
+    mining radius and drop vector, {fb: [[x, y, direction, "i"|"o"|"b"], ...]} fluid connections, fj the same for a tank's or
+    valve's pipeline joins (N9, never drawn as arrows), fo: 1
     when those show only while the recipe needs fluid, cw the circuit wire reach, ww a power switch's copper
     wire reach, tb the tiles it needs and keeps off (tile_buildability_rules), ms its own mining sound, ids where
-    Alt-mode draws its own icon (icon_draw_specification), isq the rows of its modules and a lab's packs (K1, K2),
-    rsd its own repair sound (K13)."""
+    Alt-mode draws its own icon (icon_draw_specification), isq the rows of its modules, a lab's packs, an ammo
+    turret's ammo and a locomotive's fuel (K1, K2),
+    rsd its own repair sound (K13), rk a mining drill's resource categories (a list) or a resource's own (a string),
+    rr 1: a drill needs a resource under it to be built, hl 1: a resource Factorio marks while a drill that mines it
+    is held (L8), rf 1: a resource that needs fluid to be mined (uranium ore)."""
     if not isinstance(x, dict) or not x:
         return [f"must be a non-empty object: {x!r}"]
     out = []
@@ -269,13 +693,16 @@ def eprops_overlay_problems(x):
     for k, v in x.items():
         if k in ("ip", "id", "vp"):
             ok = vec(v)
-        elif k == "fo":
+        elif k in ("fo", "rr", "hl", "rf"):
             ok = v == 1
+        elif k == "rk":
+            ok = (isinstance(v, str) and v != "") or (isinstance(v, list) and v and all(isinstance(c, str) and c for c in v))
         elif k in ("lr", "cr", "mr", "cw", "ww"):
             ok = _num(v) and v >= 0
         elif k in ("rs", "es"):
             ok = _num(v) and v > 0  # an inserter's rotation (turns a tick) and extension (tiles a tick) speed
-        elif k == "fb":
+        elif k in ("fb", "fj"):
+            # fb: the connections drawn as arrows; fj: where a tank or valve joins a pipeline (N9), never drawn.
             ok = isinstance(v, list) and all(isinstance(c, list) and len(c) == 4 and _num(c[0]) and _num(c[1]) and _int(c[2])
                                              and c[3] in ("i", "o", "b") for c in v)
         elif k in ("ms", "rsd"):
@@ -287,9 +714,9 @@ def eprops_overlay_problems(x):
             ok = isinstance(v, list) and len(v) == 3 and all(_num(n) for n in v) and v[2] > 0 and v != [0, 0, 1]
         elif k == "isq":
             # icons_positioning: [[kind, shift x, shift y, scale, icons a row, rows, separation, first row's lift], ...],
-            # kind "m" modules or "l" a lab's science packs.
+            # kind "m" modules, "l" a lab's science packs, "a" an ammo turret's ammo, "f" a locomotive's fuel, "c" a cargo wagon's load.
             ok = isinstance(v, list) and 0 < len(v) <= 4 and all(
-                isinstance(c, list) and len(c) == 8 and c[0] in ("m", "l") and all(_num(n) for n in c[1:4]) and c[3] > 0
+                isinstance(c, list) and len(c) == 8 and c[0] in ("m", "l", "a", "f", "c") and all(_num(n) for n in c[1:4]) and c[3] > 0
                 and _int(c[4]) and c[4] >= 1 and _int(c[5]) and c[5] >= 1 and _num(c[6]) and c[6] > 0 and _num(c[7]) for c in v)
         elif k == "tb":
             # Tile rules: [x1, y1, x2, y2, need, avoid], need / avoid "w" water, "g" ground, "" none.
@@ -1038,6 +1465,53 @@ def gfx_problems(msg):
     return out
 
 
+# The link between add-ons and their mods (`ext`, PROTOCOL.md "Messages for add-ons and their mods").
+EXT_MAX_BYTES = 4096
+EXT_MAX_CHANNEL = 128
+_EXT_MOD_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+# The bridge's own mod is no add-on's channel.
+EXT_BRIDGE_MOD = "factorio-3d-bridge"
+# A companion mod's error sent back (`err`): at most this many bytes of its text.
+EXT_MAX_ERROR = 1000
+
+
+def ext_channel_ok(ch):
+    """A channel: a Factorio mod's name ([A-Za-z0-9_-]), optionally "/" and a topic without control
+    characters, 1-128 bytes in UTF-8; not the bridge's own name."""
+    if not isinstance(ch, str) or not ch or len(ch.encode("utf-8")) > EXT_MAX_CHANNEL:
+        return False
+    mod, slash, topic = ch.partition("/")
+    if not mod or mod == EXT_BRIDGE_MOD or any(c not in _EXT_MOD_CHARS for c in mod):
+        return False
+    return not any(ord(c) < 32 or ord(c) == 127 for c in topic)
+
+
+def ext_bytes(msg):
+    import json
+    return len(json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def ext_problems(msg, sender):
+    """An `ext` either way (sender "mod" or "client"): a channel, data, the line within 4 KB. The
+    bridge's may carry `err` instead of `d`: the channel's mod's handler failed (its error's text)."""
+    out = []
+    if not ext_channel_ok(msg.get("ch")):
+        out.append(f"ext: ch must be <mod>[/<topic>], at most {EXT_MAX_CHANNEL} bytes: {msg.get('ch')!r}")
+    if sender == "mod" and "err" in msg:
+        err = msg.get("err")
+        if not isinstance(err, str) or not err or len(err.encode("utf-8")) > EXT_MAX_ERROR:
+            out.append(f"ext: err is the mod's error text, 1-{EXT_MAX_ERROR} bytes: {str(err)[:80]!r}")
+        if "d" in msg:
+            out.append("ext: err comes without d")
+    elif msg.get("d") is None:
+        out.append("ext: d (the data) is missing")
+    if ext_bytes(msg) > EXT_MAX_BYTES:
+        out.append(f"ext: over {EXT_MAX_BYTES} bytes ({ext_bytes(msg)})")
+    if sender == "client" and set(msg) - {"t", "ch", "d"}:
+        out.append(f"ext: a client's carries only t, ch and d: {sorted(msg)}")
+    return out
+
+
 def problems(msg):
     out = []
     if not isinstance(msg, dict):
@@ -1069,6 +1543,12 @@ def problems(msg):
             out.append(f"welcome: sq is the furthest square subscription, in chunks: {msg['sq']!r}")
         if "sid" in msg and not (isinstance(msg["sid"], str) and msg["sid"]):
             out.append(f"welcome: sid is the save's name for the client, a string: {msg['sid']!r}")
+        if "bin" in msg and not (_int(msg["bin"]) and 1 <= msg["bin"] <= WIRE_VERSION):
+            out.append(f"welcome: bin is the binary wire version the bridge sends, 1..{WIRE_VERSION}: {msg['bin']!r}")
+        if "ext" in msg and not (_int(msg["ext"]) and msg["ext"] >= 1):
+            out.append(f"welcome: ext is the add-on link's version, 1 or more: {msg['ext']!r}")
+    elif t == "ext":
+        out += ext_problems(msg, "mod")
     elif t == "surface":
         need("si", "x", "y")
         out += surface_field_problems(msg, t)
@@ -1290,6 +1770,8 @@ def problems(msg):
     elif t == "cinfo":
         need("craft", "mine", "run", "speed", "eqmv", "reach", "build", "rreach", "pick", "loot", "drop", "invb", "eqinv",
              "trash", "hp", "hpb", "robots", "slots")
+        if "mwf" in msg and msg["mwf"] not in (0, 1):
+            out.append(f"cinfo: mwf must be 0 or 1: {msg['mwf']!r}")
     elif t == "dead":
         need("left")
         if ("x" in msg) != ("y" in msg):
@@ -1359,6 +1841,8 @@ def problems(msg):
             if not (isinstance(rec, list) and len(rec) in (3, 5) and isinstance(rec[0], str) and isinstance(rec[1], str)
                     and all(_int(v) for v in rec[2:])):
                 out.append(f"guns: slot must be [gun, ammo, count, rounds?, magazine size?]: {rec!r}")
+        if "v" in msg and not (_int(msg["v"]) and msg["v"] >= 0):
+            out.append(f"guns: v must be the vehicle's unit number: {msg!r}")
     elif t == "ts":
         need("l", check=_list)
         for rec in _items(msg.get("l")):
@@ -1598,8 +2082,28 @@ def problems(msg):
                            f"(both \"\" for another surface): {rec!r}")
     elif t == "unghost":
         need("q", "n")
+    elif t == "rpatch":
+        need("q")
+        if "n" in msg:
+            need("n", check=lambda v: isinstance(v, str) and v != "")
+            need("a", "c")
+            need("o", check=_list)
+            for row in _items(msg.get("o", [])):
+                if not (_list(row) and len(row) >= 3 and len(row) % 2 == 1 and all(_int(v) for v in row)
+                        and all(row[i] > 0 for i in range(2, len(row), 2))):
+                    out.append(f"rpatch: an outline row is [y, x, length, x, length, ...]: {row!r}")
+            if "y" in msg and not (_int(msg["y"]) and msg["y"] >= 0):
+                out.append(f"rpatch: y is the yields summed in percent: {msg!r}")
+            if "more" in msg and msg["more"] != 1:
+                out.append(f"rpatch: more is 1 when the patch was cut short: {msg!r}")
     elif t == "hinfo":
         need("q", "u")
+        if "pl" in msg and not (_list(msg["pl"]) and len(msg["pl"]) == 2 and all(_int(v) and v > 0 for v in msg["pl"])):
+            out.append(f"hinfo: pl is [extent, limit] in tiles (L11): {msg!r}")
+        if "ox" in msg and msg["ox"] != 1:
+            out.append(f"hinfo: ox is 1 for an overextended pipeline: {msg!r}")
+        if "ra" in msg and not (_int(msg["ra"]) and msg["ra"] >= 0):
+            out.append(f"hinfo: ra is a resource's amount: {msg!r}")
         if "eff" in msg and not (isinstance(msg["eff"], dict) and all(k in ("sp", "pr", "co", "po", "q") and _int(v) for k, v in msg["eff"].items())):
             out.append(f"hinfo: eff is {{sp, pr, co, po, q}} in thousandths: {msg!r}")
         for rec in _items(msg.get("m", [])):
@@ -1832,7 +2336,7 @@ def problems(msg):
                     and (len(rec) == 1 or rec[1] == 0 or (_list(rec[1]) and _items(rec[1]) and all(item(x) for x in _items(rec[1]))))
                     and (len(rec) < 3 or (_list(rec[2]) and _items(rec[2]) and all(item(x) for x in _items(rec[2]))))
                     and not (len(rec) == 2 and rec[1] == 0)):
-                out.append(f"am: entry must be [unit, modules or 0, [science packs]?] or [unit], each item a name or [name, quality]: {rec!r}")
+                out.append(f"am: entry must be [unit, modules or 0, [science packs, ammo or fuel]?] or [unit], each item a name or [name, quality]: {rec!r}")
     elif t == "aiu":
         need("l", check=_list)
         for rec in _items(msg.get("l")):
@@ -1840,8 +2344,9 @@ def problems(msg):
                     and ((len(rec) == 2 and rec[1] == "") or _alt_icon(rec[1:]))):
                 out.append(f"aiu: entry must be [unit, icon type, name, more filters?] or [unit, \"\"]: {rec!r}")
         for rec in _items(msg.get("fa", [])):
-            if not (isinstance(rec, list) and len(rec) == 2 and _int(rec[0]) and _int(rec[1]) and 0 <= rec[1] <= 3):
-                out.append(f"aiu: fa entry must be [unit, fluid mask 0-3]: {rec!r}")
+            if not (isinstance(rec, list) and len(rec) in (2, 3) and _int(rec[0]) and _int(rec[1]) and 0 <= rec[1] <= 3
+                    and (len(rec) == 2 or (rec[1] > 0 and _fluid_connections(rec[2])))):
+                out.append(f"aiu: fa entry must be [unit, fluid mask 0-3, connections?]: {rec!r}")
     elif t == "clip":
         need("l", check=_list)
         for rec in _items(msg.get("l")):
@@ -1930,4 +2435,6 @@ def problems(msg):
         need("pr")
         need("cur", check=lambda v: isinstance(v, str))
         need("q", check=_strs)
+    elif t == "steps":
+        out += steps_problems(msg)
     return out

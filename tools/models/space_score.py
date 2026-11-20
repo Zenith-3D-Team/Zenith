@@ -26,7 +26,7 @@ import space_sprites  # noqa: E402
 DIRS = ("N", "E", "S", "W")
 SA = "data/space-age/graphics/entity/"
 
-# The families this script covers, in a fixed order.
+# The families this script covers (docs/tracker/models.json ids), in the tracker's order.
 FAMILIES = {
     "V01 Vulcanus machines": ["foundry", "big-mining-drill"],
     "V03 Volcanic rocks": ["big-volcanic-rock", "big-volcanic-rock-hot", "huge-volcanic-rock", "huge-volcanic-rock-hot"],

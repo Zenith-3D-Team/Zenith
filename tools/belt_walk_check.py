@@ -687,7 +687,7 @@ def live(a, wt, ports, out, lock):
         info["bs"] = list(a.bs)
         bvc.teleport(wt, ports[2], at)
         t_client = time.time()
-        args = [godot, "--path", str(wt / "client"), "--", "--factorio-port=%d" % ports[0], "--port=%d" % a.client_port,
+        args = [godot, "--path", str(wt / "client"), "--log-file", str((out / "godot.log").resolve()), "--", "--factorio-port=%d" % ports[0], "--port=%d" % a.client_port,
                 "--settings-file=%s" % cfg, "--camera=%s" % cam, "--sky=@0", "--belt-capture=%s" % stream,
                 "--belt-draw-dump=%s" % dump, "--stutter-probe=%s@%s" % (probe, a.route), "--probe-warmup=%d" % warm]
         args.extend(a.client_arg)

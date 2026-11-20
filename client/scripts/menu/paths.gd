@@ -78,7 +78,7 @@ static func default_saves_dir() -> String:
 
 ## Once, while the user folder has no saves and no server mod list yet: copies what earlier
 ## versions kept beside Zenith.exe (server/saves, the server's own mods, their mod-list.json and
-## mod settings) into it, so updating in place keeps them. Saves in folders keep their folders.
+## mod settings, the Mods window's choices) into it, so updating in place keeps them. Saves in folders keep their folders.
 ## The originals stay where they were. The bridge mod's link is made again at each start.
 static func _move_once() -> void:
 	if not _moved:
@@ -113,6 +113,10 @@ static func move_from_install(install: String) -> void:
 			for f in dir.get_files():
 				if f.ends_with(".zip") or f == "mod-list.json" or f == "mod-settings.dat":
 					DirAccess.copy_absolute(old_mods.path_join(f), new_mods.path_join(f))
+		# The Mods window's choices (mod_choices.gd), beside the mods folder.
+		var choices := install.path_join("server/data/zenith-mods.json")
+		if FileAccess.file_exists(choices):
+			DirAccess.copy_absolute(choices, user_data_dir.path_join("server-data/zenith-mods.json"))
 
 
 static func _has_zip(dir_path: String) -> bool:
@@ -150,6 +154,54 @@ static func factorio_mods_dir() -> String:
 	return mods if DirAccess.dir_exists_absolute(mods) else ""
 
 
+## The name this PC's Factorio plays multiplayer games under (player-data.json's service-username in
+## its write-data folder), read once; "" when there is none. The hello says it (`pn`), so the bridge
+## knows that player as this Zenith's when they join the same world, as Ctrl+F9's Factorio does, and
+## hands them the character Zenith plays (L13). --factorio-player=<name> says another (empty: none).
+static var _player_name := ""
+static var _player_name_read := false
+
+
+static func factorio_player_name() -> String:
+	if Settings.has_arg("--factorio-player="):
+		return Settings.arg_value("--factorio-player=").strip_edges()
+	if not _player_name_read:
+		_player_name_read = true
+		_player_name = _read_player_name()
+	return _player_name
+
+
+static func _read_player_name() -> String:
+	for dir in factorio_write_dirs():
+		var path := dir.path_join("player-data.json")
+		if not FileAccess.file_exists(path):
+			continue
+		var data = JSON.parse_string(FileAccess.get_file_as_string(path))
+		if data is Dictionary:
+			var player_name := str(data.get("service-username", "")).strip_edges()
+			if player_name != "":
+				return player_name
+	return ""
+
+
+## Where Factorio keeps its own files (player-data.json, saves, mods): beside the install when its
+## config-path.cfg says not to use the system's folders (the zip package), then the system's.
+static func factorio_write_dirs() -> Array[String]:
+	var dirs: Array[String] = []
+	var exe := factorio_exe()
+	if exe != "":
+		var install := exe.get_base_dir().path_join("../..").simplify_path()
+		var cfg := install.path_join("config-path.cfg")
+		if FileAccess.file_exists(cfg):
+			for line in FileAccess.get_file_as_string(cfg).split("\n"):
+				if line.strip_edges() == "use-system-read-write-data-directories=false":
+					dirs.append(install)
+	var saves := factorio_saves_dir()
+	if saves != "":
+		dirs.append(saves.get_base_dir())
+	return dirs
+
+
 ## Factorio's own saves (%APPDATA%\Factorio\saves, ~/.factorio/saves), or "".
 static func factorio_saves_dir() -> String:
 	var candidates: Array[String] = []
@@ -167,14 +219,15 @@ static func factorio_saves_dir() -> String:
 
 
 ## factorio.exe: the setting or --factorio, else the install the icons come from, else Steam's
-## libraries and the standalone folder. "" when there is none.
-static func factorio_exe() -> String:
+## libraries and the standalone folder (find_factorio_exe; `search_again` past what it remembers).
+## "" when there is none.
+static func factorio_exe(search_again := false) -> String:
 	var configured := Settings.arg_value("--factorio=")
 	if configured == "":
 		configured = str(Settings.get_value("factorio", "executable"))
 	if configured != "":
 		return _exe_in(configured)
-	return find_factorio_exe()
+	return find_factorio_exe(search_again)
 
 
 ## factorio.exe from --factorio or the setting alone, "" when neither is set (no searching, so
@@ -186,8 +239,31 @@ static func configured_exe() -> String:
 	return _exe_in(configured) if configured.strip_edges() != "" else ""
 
 
-## Searching only, without the setting (shown in Settings as what "automatic" finds).
-static func find_factorio_exe() -> String:
+## What find_factorio_exe found and when (msec, -1: not yet), and how many searches it made (tests).
+static var _found_exe := ""
+static var _found_at := -1
+static var exe_searches := 0
+## With nothing found, how long that answer stands before a call searches again.
+const NOT_FOUND_MSEC := 60000
+
+
+## Searching only, without the setting (shown in Settings as what "automatic" finds). The search
+## runs reg.exe and reads Steam's library list, so its answer is remembered: while that file is still
+## there, or for a minute when nothing was found (Factorio installed meanwhile is found after it).
+## `search_again` searches whatever it remembers (Settings → Factorio install, the copy button).
+static func find_factorio_exe(search_again := false) -> String:
+	if not search_again and _found_at >= 0:
+		if _found_exe != "" and FileAccess.file_exists(_found_exe):
+			return _found_exe
+		if _found_exe == "" and Time.get_ticks_msec() - _found_at < NOT_FOUND_MSEC:
+			return ""
+	exe_searches += 1
+	_found_exe = _search_factorio_exe()
+	_found_at = Time.get_ticks_msec()
+	return _found_exe
+
+
+static func _search_factorio_exe() -> String:
 	var candidates: Array[String] = []
 	var data := ItemIcons.factorio_data_dir()
 	if data != "":

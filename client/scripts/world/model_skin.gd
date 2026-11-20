@@ -11,9 +11,18 @@ extends RefCounted
 ## the model's body; the rest become one moving part, "baked" (model_library.gd Load).
 ## Worker-thread safe: plain arrays and an ImageTexture.
 
-## Frames a second the action is sampled at (between frames the shader blends).
+## Frames a second an action is sampled at, at least (between frames the shader blends): an action
+## keyed more often is sampled at its own key rate, up to MAX_FPS, so every key is a frame.
 const FPS := 30.0
-const MAX_FRAMES := 512
+const MAX_FPS := 60.0
+const MAX_FRAMES := 4096
+## Between two frames a bone that turns more than about 30 degrees is shown at the nearer frame, not
+## mixed: a mix of two matrices far apart shrinks the bone (a fan turning 115 degrees a frame drew at
+## 57% of its width). The cosine of that turn, for the shader's bake_snap; -2 always mixes.
+const SNAP := 0.866
+## --baked-anim=old: as before 0.2.2, every action at 30 frames a second, at most 512, always mixed.
+static var old_anim := OS.get_cmdline_user_args().has("--baked-anim=old")
+const OLD_MAX_FRAMES := 512
 ## Bones whose matrix changes less than this over the action count as still.
 const STILL := 0.0005
 
@@ -23,8 +32,9 @@ const STILL := 0.0005
 ##              the mesh object's transform (glTF skins ignore that transform; Zenith then applies it)
 ##   node_joints  glTF node -> joint: objects with a mesh that the actions move (a roller, a lid),
 ##              each played as a bone of its own after the skin's joints
-##   animated   true when something moves; then also frames, duration (s), tex (ImageTexture RGBAF:
-##              3 texels a joint, a row a frame), image, moving (PackedByteArray: 1 a joint that moves)
+##   animated   true when something moves; then also frames, duration (s), fps (frames a second),
+##              tex (ImageTexture RGBAF: 3 texels a joint, a row a frame), image, moving
+##              (PackedByteArray: 1 a joint that moves), snap (the shader's bake_snap)
 ## Every action is played at once (Blender exports one per object), each looping on its own length.
 static func bake(path: String) -> Dictionary:
 	var glb := _read(path)
@@ -41,6 +51,7 @@ static func bake(path: String) -> Dictionary:
 	# Every action's channels by node, each with its action's length.
 	var tracks := {}  # node -> {path -> [times, values, interpolation, length]}
 	var duration := 0.0
+	var spacing := INF  # the closest two keys of any channel (s)
 	for anim: Dictionary in anims:
 		var samplers: Array = anim.get("samplers", [])
 		var length := 0.0
@@ -55,6 +66,9 @@ static func bake(path: String) -> Dictionary:
 			if times.is_empty():
 				continue
 			length = maxf(length, times[times.size() - 1])
+			for k in range(1, times.size()):
+				if times[k] - times[k - 1] > 1e-5:
+					spacing = minf(spacing, times[k] - times[k - 1])
 			chans.append([int(target["node"]), str(target["path"]), times, values, str(smp.get("interpolation", "LINEAR"))])
 		for c: Array in chans:
 			if not tracks.has(c[0]):
@@ -118,7 +132,9 @@ static func bake(path: String) -> Dictionary:
 	var node_rest: Array = []
 	for i: int in node_list:
 		node_rest.append(_global(nodes, parent, {}, i, 0.0, rest_cache).affine_inverse())
-	var frames := clampi(int(ceil(duration * FPS)) + 1, 2, MAX_FRAMES)
+	var fps := frame_rate(spacing)
+	# A whisker under, so 35 s at 60 a second is 2101 frames on the keys, not 2102 between them.
+	var frames := clampi(int(ceil(duration * fps - 0.01)) + 1, 2, OLD_MAX_FRAMES if old_anim else MAX_FRAMES)
 	var image := Image.create_empty(count * 3, frames, false, Image.FORMAT_RGBAF)
 	var first: Array = []
 	var moving := PackedByteArray()
@@ -145,9 +161,41 @@ static func bake(path: String) -> Dictionary:
 		any = any or moving[j] == 1
 	if not any:
 		return out
-	out.merge({"animated": true, "frames": frames, "duration": duration,
+	out.merge({"animated": true, "frames": frames, "duration": duration, "fps": fps,
+		"snap": -2.0 if old_anim else SNAP,
 		"tex": ImageTexture.create_from_image(image), "image": image, "moving": moving}, true)
 	return out
+
+
+## Frames a second for an action whose closest keys are `spacing` seconds apart: its own key rate,
+## between FPS and MAX_FPS (30 with --baked-anim=old).
+static func frame_rate(spacing: float) -> float:
+	if old_anim or spacing <= 0.0 or is_inf(spacing):
+		return FPS
+	# Rounded to a hundredth of a frame: 1/60 s stored in floats reads 59.9999.
+	return clampf(snappedf(1.0 / spacing, 0.01), FPS, MAX_FPS)
+
+
+## A bone's matrix between frames a and b, u of the way (0..1), as the shader's anim_baked draws it:
+## mixed, unless one of its axes turns further than acos(snap) between them; then the nearer frame.
+static func shown(a: Transform3D, b: Transform3D, u: float, snap: float) -> Transform3D:
+	if turned(a, b) < snap:
+		u = 0.0 if u < 0.5 else 1.0
+	return Transform3D(Basis(a.basis.x.lerp(b.basis.x, u), a.basis.y.lerp(b.basis.y, u), a.basis.z.lerp(b.basis.z, u)),
+		a.origin.lerp(b.origin, u))
+
+
+## The cosine of the largest turn of a's axes to b's (the shader's bake_turned); 1 for an axis scaled
+## to nothing at either end (shrinking away is a scale, mixed as before).
+static func turned(a: Transform3D, b: Transform3D) -> float:
+	var c := 1.0
+	for i in 3:
+		var x := a.basis[i]
+		var y := b.basis[i]
+		var l := x.length() * y.length()
+		if l > 1e-8:
+			c = minf(c, x.dot(y) / l)
+	return c
 
 
 ## Drawn positions and normals of a skinned surface put in the skin's rest pose (bones and weights
@@ -276,7 +324,8 @@ static func _local(node: Dictionary, track: Dictionary, t: float) -> Transform3D
 	if track.has("scale"):
 		var s := _sample(track["scale"], t, 3)
 		scl = Vector3(s[0], s[1], s[2])
-	return Transform3D(Basis(rot).scaled(scl), pos)
+	# glTF's T * R * S: the scale first, in the bone's own axes (Basis.scaled scales after turning).
+	return Transform3D(Basis(rot) * Basis.from_scale(scl), pos)
 
 
 ## A channel's value at t: LINEAR (slerp for rotations), STEP, or CUBICSPLINE's values (no tangents).

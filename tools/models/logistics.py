@@ -121,7 +121,7 @@ def roboport():
     # Arms: broad blue channel brackets leaning out from the body's corners, each carrying the
     # sprite's white tube frames: an A-frame over the bracket with a small white ball joint and a
     # thin antenna at its top, a white knob on the bracket's end and a square frame hanging out
-    # and down from it (they were thin lattices with a white block).
+    # and down from it (G13: they were thin lattices with a white block).
     from mathutils import Vector
     charge = Part("anim_charge")
     for sx in (-1, 1):

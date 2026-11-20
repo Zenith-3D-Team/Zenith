@@ -9,6 +9,8 @@ extends SceneTree
 ##
 ## Prints the datagrams got and lost, the first gaps, and how long OS.delay_usec(delay) really takes.
 
+const NativeLibrary := preload("res://scripts/native_library.gd")
+
 var port := 36699
 var socket_kind := "godot"
 var timeout := 30.0
@@ -32,7 +34,7 @@ func _init() -> void:
 	print("OS.delay_usec(%d) x200 took %.2f ms each" % [delay_usec, (Time.get_ticks_usec() - t0) / 200000.0])
 	var udp: Variant = null
 	if socket_kind == "native":
-		if not ClassDB.class_exists("UdpSocketNative"):
+		if not NativeLibrary.ensure() or not ClassDB.class_exists("UdpSocketNative"):
 			print("UdpSocketNative isn't in the extension: skipped")
 			quit(0)
 			return

@@ -1,4 +1,4 @@
--- Modules where the hands can't reach, Factorio 2.x's way: a module held and clicked
+-- Modules where the hands can't reach, Factorio 2.x's way (owner's F6): a module held and clicked
 -- on a building out of reach, on one seen from the remote view (another surface, a platform's hub)
 -- or on a ghost asks for it, and the robots (or a platform's hub) bring it. A ghost keeps the
 -- request in its insert plan; a building gets an item request proxy, as a player's does. All of it
@@ -17,6 +17,7 @@ local puppet = require("scripts.puppet")
 local transport = require("scripts.transport")
 local world = require("scripts.world")
 local alt_mode = require("scripts.alt_mode")
+local pipelines = require("scripts.pipelines")
 
 local M = {}
 
@@ -64,7 +65,7 @@ local function round(v)
   return math.floor(v + 0.5)
 end
 
--- What Factorio's entity info shows under "Consumes electricity" for something that draws
+-- What Factorio's entity info shows under "Consumes electricity" (H20) for something that draws
 -- power: {e (joules in its buffer), b (the buffer's size: the Electricity bar is e / b), mx (Max.
 -- consumption: the most it uses with its modules and beacons, plus its drain, in watts), mn (Min.
 -- consumption: its drain, watts)}; nil for generators, accumulators and what isn't electric.
@@ -273,13 +274,23 @@ end
 -- de? (a beacon's distribution effectivity, thousandths), el? (its electricity, M.electricity),
 -- rn? (a roboport's links to other roboports, M.roboport_links), inv? (what is inside,
 -- M.hover_inventories), pr? ps? (a crafter's progress and its rate), bn? (the burning fuel left,
--- thousandths), io? (a crafter's ingredients and products a second, M.rates)}.
+-- thousandths), io? (a crafter's ingredients and products a second, M.rates), pl? ([extent, limit] of a
+-- pipe's, pipe to ground's or storage tank's pipeline, tiles: Factorio's "Pipeline extent: 333/320", L11),
+-- ox? (1: that pipeline is overextended), ra? (a resource's amount now, L6)}.
 -- Reads only.
 function M.hover(cmd)
   local q = math.floor(tonumber(cmd.q) or 0)
   local e = puppet.find_target(world.surface(), cmd)
   local msg = { t = "hinfo", q = q, u = math.floor(tonumber(cmd.u) or 0) }
-  if e and e.valid and e.type ~= "entity-ghost" then
+  if e and e.valid and e.type == "resource" then
+    msg.ra = try(function() return e.amount end)
+  elseif e and e.valid and pipelines.SET[e.type] then
+    local extent = pipelines.extent(e)
+    if extent then
+      msg.pl = { extent, pipelines.limit() }
+    end
+    msg.ox = pipelines.overextended(e) and 1 or nil
+  elseif e and e.valid and e.type ~= "entity-ghost" then
     msg.el = M.electricity(e)
     msg.eff = M.effects_of(e)
     local inv = try(function() return e.get_module_inventory() end)

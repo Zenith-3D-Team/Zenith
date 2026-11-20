@@ -83,6 +83,13 @@ data:extend({
   },
   {
     type = "bool-setting",
+    name = "f3d-binary-messages",
+    setting_type = "runtime-global",
+    default_value = true,
+    order = "e5",
+  },
+  {
+    type = "bool-setting",
     name = "f3d-starter-kit",
     setting_type = "runtime-global",
     default_value = true,

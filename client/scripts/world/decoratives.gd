@@ -9,7 +9,7 @@ extends Node3D
 ##
 ## The density setting keeps a share of them, the same ones every time (by position).
 ##
-## A chunk is built on a worker thread (10-55 ms each on the main thread while walking, and a
+## A chunk is built on a worker thread (D6: 10-55 ms each on the main thread while walking, and a
 ## decorative's first appearance read its pictures from the install there, up to 300 ms): its
 ## instances' transforms are worked out into a MultiMesh buffer and new pictures loaded into an
 ## atlas image (BuildJob, KindData). The main thread then only makes the MultiMeshes and new
@@ -38,13 +38,20 @@ extends Node3D
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
+const Visuals := preload("res://scripts/world/visuals.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
+const DecorSheetBaker := preload("res://scripts/world/decor_sheet_baker.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const SHADER := preload("res://shaders/decorative.gdshader")
 const SHADER_FLAT := preload("res://shaders/decorative_flat.gdshader")
+const SHADER_SHEET := preload("res://shaders/decorative_sheet.gdshader")
 const SHADER_GRASS := preload("res://shaders/decorative_grass.gdshader")
 const SHADER_CARPET := preload("res://shaders/decorative_carpet.gdshader")
+## --grass-backlight=old: the ground plants' 0.2.2 specular and roughness, which glared white with the sun
+## low behind them (decorative_grass.gdshaderinc plant_specular).
+static var old_sheen_on: bool = "--grass-backlight=old" in OS.get_cmdline_user_args()
 const INDEX := "res://data/decoratives.json"
 
 const CHUNK := 32
@@ -54,7 +61,7 @@ const PX_PER_TILE := 32.0
 ## Measured from the character, not the camera: the camera sits far back and up, so its own
 ## visibility range left the ground near the character bare and drew clutter behind it.
 const DRAW_DISTANCE := 192.0
-## Level of detail: past FULL_DISTANCE a chunk draws half its clutter, past HALF_DISTANCE a
+## Level of detail (B9): past FULL_DISTANCE a chunk draws half its clutter, past HALF_DISTANCE a
 ## quarter. Each chunk's instances are in a fixed random order, so drawing the first part thins
 ## the clutter evenly rather than cutting it off.
 const FULL_DISTANCE := 80.0
@@ -74,6 +81,27 @@ const TILE_STEPS := 4
 ## Render priorities from the lowest: flat decoratives, then raised ones, under 0 (and -1, flat effects).
 const FLAT_PRIORITIES := 96
 const GRASS_PRIORITIES := 31
+## Baked flat decorative chunk sheet (decor_sheet_baker.gd): flattens all flat MultiMeshes per chunk
+## into one lit layer, sized by distance with a hysteresis band to avoid thrashing while walking.
+const SHEET_LIFT := 0.024
+const SHEET_PRIORITY := Material.RENDER_PRIORITY_MIN + FLAT_PRIORITIES - 1
+const SHEET_NEAR_DIST := 24.0
+const SHEET_MID_DIST := 80.0
+const SHEET_HYSTERESIS := 16.0
+const SHEET_SIZE_NEAR := 1024
+const SHEET_SIZE_MID_COMPRESSED := 512
+const SHEET_SIZE_MID_PLAIN := 512
+const SHEET_SIZE_FAR := 256
+## Sparse self-contained chunks with fewer flat instances than this (and no neighbor overhangs) keep
+## their raw flat MultiMeshes instead of paying full-chunk transparent overdraw and a bake/readback.
+const SHEET_MIN_FLAT := 24
+## Tier-resize-only sheet re-bakes pause while focus moves faster than this (tiles/s) and stay paused
+## for SHEET_MOVE_SETTLE_SEC after slowing down, eliminating mid-run SubViewport readbacks.
+const SHEET_MOVE_FREEZE_SPEED := 6.0
+const SHEET_MOVE_SETTLE_SEC := 0.5
+const SHEET_HILLS_CELLS := 31
+const FLAT_SHADE_TUFT := 0.55
+const META_FLAT := &"f3d_flat"
 ## Floats per instance in a MultiMesh buffer: a 3x4 transform, then the custom data.
 const STRIDE := 16
 ## 3D grass: [range in tiles, wind] per Settings > Graphics > 3D grass.
@@ -155,6 +183,7 @@ class KindData:
 	var grass_triangles := 0  # one raised instance's
 	## A carpet's clumps (_carpet_cells): a row per variant, a texel per clump, and the most in a row.
 	var carpet_cells: Image
+	var carpet_texture: ImageTexture
 	var carpet_clumps := 0
 
 
@@ -164,12 +193,21 @@ class KindData:
 ## atlas is up to a few MB with its mipmaps, and the renderer takes the upload on the calling thread).
 ## off: made by _kind on the main thread, as before.
 static var texture_thread := not ("--decor-texture-thread=off" in OS.get_cmdline_user_args())
+## --decor-parallel-load=off: holds _kind_mutex across decorative picture loading (one worker at a
+## time, blocking main-thread index() swaps) as before.
+static var parallel_kind_load := not ("--decor-parallel-load=off" in OS.get_cmdline_user_args())
+## --decor-sheet=off: keeps flat decoratives as overlapping MultiMeshInstance3Ds per chunk.
+static var sheet_enabled := not ("--decor-sheet=off" in OS.get_cmdline_user_args())
+## Block-compress baked decorative sheets only when opted in via --decor-sheet-compress=on in
+## editor builds (Image.compress S3TC fans across all WorkerThreadPool threads).
+static var sheet_compress := OS.has_feature("editor") and ("--decor-sheet-compress=on" in OS.get_cmdline_user_args())
 
 
 ## One decorative's pictures, ready to draw (made on the main thread from its KindData).
 class Kind:
 	var name := ""
 	var material: ShaderMaterial
+	var bake_material: ShaderMaterial
 	var mesh: Mesh
 	var upright := false
 	var grass_mesh: Mesh  # null: stays flat
@@ -178,15 +216,16 @@ class Kind:
 
 
 ## A chunk's clutter worked out on a worker thread: per decorative [name, buffer, instances, KindData,
-## how many of them rise].
+## how many of them rise], plus edge overhangs reaching into adjacent chunks.
 class BuildJob:
 	var chunk := Vector2i.ZERO
 	var version := 0
 	var list: Array = []
 	var density := 1.0
 	var names := {}
-	var data_dir := ""
 	var groups: Array = []
+	var edge_groups: Array = []  # [name, edge_buffer, edge_count, KindData]
+	var edge_dirs := 0  # bitmask for dx, dy in -1..1
 	## The mask's inputs (copies or never changed after): the chunk's tile ids, 1 per floor tile id,
 	## its entity records, proto id -> Vector4(tiles across, down, box centre) for buildings, the
 	## neighbours' footprints reaching in [x0, y0, x1, y1, ...] and their masks (offset -> rows).
@@ -214,9 +253,14 @@ static var _kind_data := {}  # name -> KindData (null: no pictures), each holdin
 static var _flat_order := {}  # flat decorative -> its rank in the drawing order (_flat_priority)
 static var _grass_order := {}  # raised decorative -> its rank in the drawing order (_grass_priority)
 static var _grass_meshes := {}  # grid cells a side -> the grid; minus a carpet's clumps -> its mesh
+static var _sheet_mesh_flat: PlaneMesh
+static var _sheet_mesh_hills: PlaneMesh
 static var _wind: NoiseTexture2D  # the carpets' gusts (_wind_noise)
-## Worker threads read pictures one at a time (and each only once).
+## Worker threads read pictures one at a time (and each only once) under --decor-parallel-load=off.
 static var _kind_mutex := Mutex.new()
+## Per-decorative locks so workers load different decoratives in parallel without duplicating the
+## same name, and without holding _kind_mutex across I/O (lock order: per-name lock -> _kind_mutex).
+static var _kind_locks := {}  # name -> Mutex
 
 var enabled := true
 var density := 1.0
@@ -254,6 +298,11 @@ var _jobs: Array = []  # [task id, BuildJob], oldest first
 ## few a frame. Freeing all of them at once (441 chunks of clutter) made a 35-60 ms frame.
 var _freeing: Array = []
 const FREE_USEC := 1000
+## L14: the chunks the world let go are dropped every 2 s (_process's sweep), and after a screenshot zoomed
+## far out that was the clutter of 4,000 chunks queued to be freed at once: 32,000 nodes, a 95-100 ms frame
+## at the end of the sweep's frame. They go into _freeing too, freed FREE_USEC a frame (_free_some).
+## `--unload-hide=off`: queue_free as before.
+static var drop_sliced := not OS.get_cmdline_user_args().has("--unload-hide=off")
 ## 3D grass (set_grass). Tiles from the character; 0: off.
 var grass_range := 0.0
 var grass_wind := false
@@ -291,6 +340,18 @@ var _mask_image: Image
 var _mask_texture: ImageTexture
 var _mask_dirty := false
 var _connected: Node
+var _baker: Node
+var _flat_groups := {}  # Vector2i -> Array of [Kind, buffer, count]
+var _edge_flat := {}  # Vector2i -> Array of [Kind, edge_buffer, edge_count]
+var _edge_dirs := {}  # Vector2i -> int direction bitmask of overhanging edges
+var _sheet_gen := {}  # Vector2i -> int, bumped on each chunk rebuild or drop
+var _sheet_size := {}  # Vector2i -> int baked texture resolution (0 if unbaked)
+var _sheet_shade := {}  # Vector2i -> float weighted raised_shade for this chunk
+var _bake_dirty := {}  # Vector2i -> true: chunk sheet needs (re)baking or resize
+var _sheet_content_dirty := {}  # Vector2i -> true: chunk sheet content/overhang changed (not resize-only)
+var _sheet_move_pos := Vector2.INF
+var _sheet_move_hold := 0.0
+var _sheet_hills := false
 
 
 func _init() -> void:
@@ -308,6 +369,7 @@ func reset(keep_names := false) -> void:
 		_floor_names.clear()
 	_parts.clear()
 	_lists.clear()
+	_drops.clear()
 	_versions.clear()
 	_masks.clear()
 	_spills.clear()
@@ -320,6 +382,18 @@ func reset(keep_names := false) -> void:
 	_mask_owner.clear()
 	_mask_bytes.fill(0)
 	_mask_dirty = true
+	_flat_groups.clear()
+	_edge_flat.clear()
+	_edge_dirs.clear()
+	_sheet_gen.clear()
+	_sheet_size.clear()
+	_sheet_shade.clear()
+	_bake_dirty.clear()
+	_sheet_content_dirty.clear()
+	_sheet_move_pos = Vector2.INF
+	_sheet_move_hold = 0.0
+	if _baker != null:
+		_baker.reset()
 	for node: Node3D in _chunks.values():
 		node.visible = false
 		_freeing.append(node)
@@ -424,6 +498,9 @@ func _process(delta: float) -> void:
 	_cull()
 	Probing.add("dc_cull", tp)
 	tp = Time.get_ticks_usec()
+	_step_sheets(delta)
+	Probing.add("dc_sheet", tp)
+	tp = Time.get_ticks_usec()
 	_upload_mask()
 	Probing.add("dc_mask", tp)
 	tp = Time.get_ticks_usec()
@@ -431,12 +508,33 @@ func _process(delta: float) -> void:
 	Probing.add("dc_grass", tp)
 	_print_grass_stats(delta)
 	_sweep += delta
-	if _sweep < 2.0 or world == null:
-		return
-	_sweep = 0.0
-	for c in _lists.keys():
-		if not world.chunks.has(c):
+	if _sweep >= 2.0 and world != null and _drops.is_empty():
+		_sweep = 0.0
+		for c in _lists.keys():
+			if not world.chunks.has(c):
+				if drop_sliced:
+					_drops.append(c)
+				else:
+					_drop(c)
+	if not _drops.is_empty():
+		tp = Time.get_ticks_usec()
+		_drop_some()
+		Probing.add("dc_drop", tp)
+
+
+## The chunks the sweep found gone, dropped FREE_USEC a frame (drop_sliced): after a screenshot zoomed far
+## out dropping all 4,000 in the sweep's frame was 30 ms. One that came back meanwhile stays.
+var _drops: Array = []
+
+
+func _drop_some() -> void:
+	var t0 := Time.get_ticks_usec()
+	while not _drops.is_empty():
+		var c: Vector2i = _drops.pop_back()
+		if world == null or not is_instance_valid(world) or not world.chunks.has(c):
 			_drop(c)
+		if Time.get_ticks_usec() - t0 > FREE_USEC:
+			break
 
 
 ## Chunks to build again, a slice a frame (at least BUILDS_MIN, else half the decoratives' slice):
@@ -605,6 +703,20 @@ func _upload_mask() -> void:
 	_mask_texture.update(_mask_image)
 
 
+## The decoratives on a map tile (their ids, as `dec` lists them, whatever share is drawn): what the
+## character's steps rustle through (fx.gd, the steps' sounds). Empty where no list came.
+func ids_at(x: int, y: int) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	var c := Vector2i(floori(x / float(CHUNK)), floori(y / float(CHUNK)))
+	var list: Array = _lists.get(c, [])
+	var lx := x - c.x * CHUNK
+	var ly := y - c.y * CHUNK
+	for i in range(0, list.size() - 3, 4):
+		if _int(list[i + 1]) == lx and _int(list[i + 2]) == ly:
+			out.append(_int(list[i]))
+	return out
+
+
 ## Whether a map tile is blocked by the masks built so far (tests, tools).
 func blocked_at(x: int, y: int) -> bool:
 	var c := Vector2i(floori(x / float(CHUNK)), floori(y / float(CHUNK)))
@@ -626,7 +738,8 @@ func _free_some() -> void:
 ## How many of a left world's nodes are still to be freed (tests).
 ## Nothing being built: no chunk's clutter on a worker, no raised grass still to make or fading in.
 func settled() -> bool:
-	return _jobs.is_empty() and _grass_queue.is_empty() and _grass_fade >= 1.0 and _restale.is_empty() and _relist_at >= _relist.size()
+	return _jobs.is_empty() and _grass_queue.is_empty() and _grass_fade >= 1.0 and _restale.is_empty() and _relist_at >= _relist.size() \
+		and not (_baker != null and (_baker.busy() or _has_eligible_bake()))
 
 
 ## settled() for a screenshot of what `in_view` sees (a Callable(Vector2i) -> bool; full_detail.gd):
@@ -649,6 +762,14 @@ func pending_in(in_view: Callable) -> int:
 	for c: Vector2i in _parts:
 		if in_view.call(c):
 			n += 1
+	if _baker != null:
+		for c: Vector2i in _bake_dirty:
+			if _lists.has(c) and in_view.call(c):
+				n += 1
+		if _baker.busy():
+			for c: Vector2i in _chunks:
+				if in_view.call(c) and _baker.has_pending(c):
+					n += 1
 	return n
 
 
@@ -683,8 +804,13 @@ func _cull_one(c: Vector2i, node: Node3D, at: Vector2) -> void:
 	if share > 0.0 and _shares.get(c, -1.0) != share:
 		_shares[c] = share
 		for inst in node.get_children():
-			var mm := (inst as MultiMeshInstance3D).multimesh
-			mm.visible_instance_count = ceili(mm.instance_count * share)
+			if inst is MultiMeshInstance3D:
+				var mm := (inst as MultiMeshInstance3D).multimesh
+				mm.visible_instance_count = ceili(mm.instance_count * share)
+	if sheet_enabled and share > 0.0 and _sheet_size.has(c):
+		var want := sheet_size_for(c, at, int(_sheet_size[c]))
+		if want != int(_sheet_size[c]):
+			_bake_dirty[c] = true
 
 
 ## 3D grass's centre this frame: the character (`at`) in the normal view; in front of the camera
@@ -799,6 +925,7 @@ func _make_grass(c: Vector2i) -> void:
 		inst.multimesh = mm
 		inst.material_override = kind.grass_material
 		inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		inst.layers = Visuals.GROUND_LAYER  # ground cover: the fill light leaves it (looks.gd fill_light)
 		inst.custom_aabb = bounds
 		node.add_child(inst)
 	node.visible = _chunk_distance(c, _grass_at) <= grass_range
@@ -876,13 +1003,19 @@ func _drop(c: Vector2i) -> void:
 	_edges.erase(c)
 	_read_revs.erase(c)
 	_full_pending.erase(c)
+	_clear_flat_sheet_state(c)
+	_sheet_gen.erase(c)
 	if _mask_owner.get(_mask_slot(c)) == c:
 		_write_mask(c, PackedInt32Array())
 		_mask_owner.erase(_mask_slot(c))
 	var node: Node3D = _chunks.get(c)
 	if node != null:
-		node.queue_free()
 		_chunks.erase(c)
+		if drop_sliced:
+			node.visible = false
+			_freeing.append(node)  # freed FREE_USEC a frame, the last dropped first (_free_some)
+		else:
+			node.queue_free()
 
 
 ## Rebuilds a chunk's MultiMeshes from its list: [id, x, y, amount, ...], x and y the tile in the
@@ -918,7 +1051,6 @@ func _build(c: Vector2i, mask_only := false) -> void:
 	job.list = l
 	job.density = density
 	job.names = _names.duplicate()
-	job.data_dir = data_dir
 	job.mask_only = mask_only
 	_mask_inputs(c, job)
 	_jobs.append([WorkerThreadPool.add_task(_run_job.bind(job), false, "decoratives"), job])
@@ -1041,6 +1173,8 @@ func finish_jobs() -> void:
 func _exit_tree() -> void:
 	_wait_all()
 	_jobs.clear()
+	if _baker != null:
+		_baker.shutdown()
 
 
 ## Waits for the jobs on worker threads (each only once: their task ids become -1).
@@ -1053,10 +1187,17 @@ func _wait_all() -> void:
 
 func _replace(c: Vector2i, node: Node3D) -> void:
 	var old: Node3D = _chunks.get(c)
+	if old != null and node != null and sheet_enabled and _flat_groups.has(c) and not _chunk_fully_blocked(c):
+		var kept_sheet: MeshInstance3D = old.get_node_or_null("FlatSheet") as MeshInstance3D
+		if kept_sheet != null:
+			old.remove_child(kept_sheet)
+			node.add_child(kept_sheet)
 	if old != null:
 		old.queue_free()
 		_chunks.erase(c)
-	if node != null:
+	if node == null:
+		_clear_flat_sheet_state(c)
+	else:
 		_shares.erase(c)  # set again for the new MultiMeshes
 		add_child(node)
 		_chunks[c] = node
@@ -1072,36 +1213,61 @@ func _replace(c: Vector2i, node: Node3D) -> void:
 
 ## The chunk's node with a MultiMesh per decorative from a finished job, or null if it has none.
 func _node_for(job: BuildJob) -> Node3D:
-	_grass_lists.erase(job.chunk)
+	var c := job.chunk
+	_grass_lists.erase(c)
 	if job.groups.is_empty():
 		return null
 	var raised: Array = []
+	var flat_list: Array = []
+	var shade_sum := 0.0
+	var rising_total := 0
+	var old_chunk: Node3D = _chunks.get(c)
+	var has_existing_sheet := sheet_enabled and not _chunk_fully_blocked(c) and old_chunk != null and not old_chunk.is_queued_for_deletion() and old_chunk.get_node_or_null("FlatSheet") != null
 	var node := Node3D.new()
-	node.name = "Decor %d,%d" % [job.chunk.x, job.chunk.y]
+	node.name = "Decor %d,%d" % [c.x, c.y]
 	for g: Array in job.groups:
 		var tk := Time.get_ticks_usec()
 		var kind := _kind(str(g[0]), g[3])
 		Probing.add("dc_kinds", tk)
 		if kind == null:
 			continue
-		tk = Time.get_ticks_usec()
-		var mm := MultiMesh.new()
-		mm.transform_format = MultiMesh.TRANSFORM_3D
-		mm.use_custom_data = true
-		mm.mesh = kind.mesh
-		mm.instance_count = int(g[2])
-		mm.buffer = g[1]
-		var inst := MultiMeshInstance3D.new()
-		inst.multimesh = mm
-		inst.material_override = kind.material
-		inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		node.add_child(inst)
-		Probing.add("dc_multimeshes", tk)
+		var is_flat := not kind.upright
+		if is_flat:
+			flat_list.append([kind, g[1], int(g[2])])
+		if is_flat and has_existing_sheet:
+			pass  # keep the chunk's existing FlatSheet drawn until its updated sheet finishes baking
+		else:
+			tk = Time.get_ticks_usec()
+			var mm := MultiMesh.new()
+			mm.transform_format = MultiMesh.TRANSFORM_3D
+			mm.use_custom_data = true
+			mm.mesh = kind.mesh
+			mm.instance_count = int(g[2])
+			mm.buffer = g[1]
+			var inst := MultiMeshInstance3D.new()
+			inst.multimesh = mm
+			inst.material_override = kind.material
+			inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			if is_flat:
+				inst.layers = Visuals.GROUND_LAYER  # lying flat: ground, which the fill light leaves (looks.gd fill_light)
+				inst.set_meta(META_FLAT, true)
+			node.add_child(inst)
+			Probing.add("dc_multimeshes", tk)
 		var rising := int(g[4])
 		if rising > 0 and kind.grass_mesh != null:
 			raised.append([kind, (g[1] as PackedFloat32Array).slice(0, rising * STRIDE), rising])
+			var data: KindData = g[3]
+			shade_sum += float(rising) * (CARPET_SHADE if data.grass_carpet else FLAT_SHADE_TUFT)
+			rising_total += rising
 	if not raised.is_empty():
-		_grass_lists[job.chunk] = raised
+		_grass_lists[c] = raised
+	var edge_list: Array = []
+	for eg: Array in job.edge_groups:
+		var ekind := _kind(str(eg[0]), eg[3])
+		if ekind != null and not ekind.upright:
+			edge_list.append([ekind, eg[1], int(eg[2])])
+	var shade := shade_sum / rising_total if rising_total > 0 else 0.0
+	_record_flat_sheet_state(c, flat_list, edge_list, job.edge_dirs if not edge_list.is_empty() else 0, shade, has_existing_sheet and not flat_list.is_empty())
 	return node
 
 
@@ -1133,7 +1299,7 @@ static func _run_job(job: BuildJob) -> void:
 	var stand_triangles := 0
 	var carpet_triangles := 0
 	for id in groups:
-		var grass_data := _kind_data_for(str(job.names.get(id, "")), job.data_dir)
+		var grass_data := _kind_data_for(str(job.names.get(id, "")))
 		if grass_data != null and grass_data.grass_height > 0.0:
 			var t: int = (groups[id].size() >> 1) * grass_data.grass_triangles
 			if grass_data.grass_carpet:
@@ -1144,7 +1310,7 @@ static func _run_job(job: BuildJob) -> void:
 	var carpet_share := clampf(float(GRASS_CHUNK_TRIANGLES - stand_triangles) / maxf(carpet_triangles, 1.0), 0.0, 1.0)
 	for id in groups:
 		var name := str(job.names.get(id, ""))
-		var data := _kind_data_for(name, job.data_dir)
+		var data := _kind_data_for(name)
 		if data == null:
 			continue
 		var tiles: Array = groups[id]
@@ -1170,6 +1336,12 @@ static func _run_job(job: BuildJob) -> void:
 					rising = mini(rising, clear.size())
 		var buffer := PackedFloat32Array()
 		buffer.resize(count * STRIDE)
+		var edge_floats: Array = []
+		var edge_mask := 0
+		var x0_c := float(c.x * CHUNK)
+		var z0_c := float(c.y * CHUNK)
+		var x1_c := x0_c + CHUNK
+		var z1_c := z0_c + CHUNK
 		for j in count:
 			var k: int = order[j]
 			var x: int = tiles[k * 2]
@@ -1197,7 +1369,29 @@ static func _run_job(job: BuildJob) -> void:
 			buffer[o + 14] = data.uvs[v].z
 			# Over 0.5: has a raised copy (decorative_flat.gdshader); the fraction is the plant's root.
 			buffer[o + 15] = 1.0 + data.uvs[v].w if j < rising else 0.0
+			if not data.upright:
+				var min_x := origin.x - scale.x * 0.5
+				var max_x := origin.x + scale.x * 0.5
+				var min_z := origin.z - scale.z * 0.5
+				var max_z := origin.z + scale.z * 0.5
+				var ddx0 := -1 if min_x < x0_c else 0
+				var ddx1 := 1 if max_x > x1_c else 0
+				var ddy0 := -1 if min_z < z0_c else 0
+				var ddy1 := 1 if max_z > z1_c else 0
+				if ddx0 != 0 or ddx1 != 0 or ddy0 != 0 or ddy1 != 0:
+					for dy in range(ddy0, ddy1 + 1):
+						for dx in range(ddx0, ddx1 + 1):
+							if dx != 0 or dy != 0:
+								edge_mask |= _dir_bit(dx, dy)
+					edge_floats.append_array([
+						scale.x, 0.0, 0.0, origin.x,
+						0.0, scale.y, 0.0, origin.y,
+						0.0, 0.0, scale.z, origin.z,
+						buffer[o + 12], buffer[o + 13], buffer[o + 14], buffer[o + 15]])
 		job.groups.append([name, buffer, count, data, rising])
+		if not edge_floats.is_empty():
+			job.edge_groups.append([name, PackedFloat32Array(edge_floats), edge_floats.size() / STRIDE, data])
+			job.edge_dirs |= edge_mask
 
 
 ## The job's mask (the header): floor tiles, then its buildings' footprints and those of its
@@ -1314,6 +1508,8 @@ static func _kind(name: String, data: KindData) -> Kind:
 		var t0 := Time.get_ticks_usec()
 		kind.material = ShaderMaterial.new()
 		kind.material.shader = SHADER if kind.upright else SHADER_FLAT
+		if old_sheen_on:
+			kind.material.set_shader_parameter(&"old_sheen", true)
 		Probing.add("dc_k_material", t0)
 		t0 = Time.get_ticks_usec()
 		var texture: ImageTexture = data.texture if data.texture != null else ImageTexture.create_from_image(data.atlas)
@@ -1328,10 +1524,14 @@ static func _kind(name: String, data: KindData) -> Kind:
 			kind.grass_triangles = data.grass_triangles
 			kind.grass_material = ShaderMaterial.new()
 			kind.grass_material.set_shader_parameter("atlas", texture)
+			if old_sheen_on:
+				kind.grass_material.set_shader_parameter(&"old_sheen", true)
 			if data.grass_carpet:
 				kind.grass_mesh = _carpet_mesh(data.carpet_clumps)
 				kind.grass_material.shader = SHADER_CARPET
-				kind.grass_material.set_shader_parameter("cells", ImageTexture.create_from_image(data.carpet_cells))
+				var cells_tex: ImageTexture = data.carpet_texture if data.carpet_texture != null else ImageTexture.create_from_image(data.carpet_cells)
+				kind.grass_material.set_shader_parameter("cells", cells_tex)
+				data.carpet_texture = null
 				kind.grass_material.set_shader_parameter("variants", float(data.uvs.size()))
 				kind.grass_material.set_shader_parameter("stretch", CARPET_STRETCH)
 				kind.grass_material.set_shader_parameter("wind_noise", _wind_noise())
@@ -1348,7 +1548,12 @@ static func _kind(name: String, data: KindData) -> Kind:
 		if kind.upright:
 			kind.material.set_shader_parameter("upright", true)
 		else:
-			kind.material.render_priority = _flat_priority(name)
+			var prio := _flat_priority(name)
+			kind.material.render_priority = prio
+			kind.bake_material = ShaderMaterial.new()
+			kind.bake_material.shader = DecorSheetBaker.SHADER_BAKE
+			kind.bake_material.set_shader_parameter("atlas", texture)
+			kind.bake_material.render_priority = prio
 		Probing.add("dc_k_priority", t0)
 		t0 = Time.get_ticks_usec()
 		if kind.upright:
@@ -1366,29 +1571,63 @@ static func _kind(name: String, data: KindData) -> Kind:
 
 
 ## The decorative's pictures as one atlas (variants side by side), or null without any. Read once,
-## on whichever thread asks first (worker threads, from _run_job).
-static func _kind_data_for(name: String, data_dir: String) -> KindData:
+## on whichever thread asks first (worker threads, from _run_job). Each picture is read through
+## mod_files.gd, a mod's from its own folder or zip: none needs the Factorio install here.
+static func _kind_data_for(name: String) -> KindData:
 	if name == "":
 		return null
+	index()
+	if not parallel_kind_load:
+		_kind_mutex.lock()
+		if not _kind_data.has(name):
+			_kind_data[name] = _load_kind_data(name, _index.get(name))
+		var legacy_out: KindData = _kind_data[name]
+		_kind_mutex.unlock()
+		return legacy_out
 	_kind_mutex.lock()
-	if not _kind_data.has(name):
-		var data: KindData = null
-		var entry = index().get(name)
-		if entry is Dictionary and data_dir != "":
-			var images: Array[Image] = []
-			var pics: Array = []
-			var files := {}  # path -> Image, as a sheet holds several variants
-			for pic in entry.get("pics", []):
-				var image := _region(pic, files)
-				if image != null:
-					images.append(image)
-					pics.append(pic)
-			if not images.is_empty():
-				data = _make_kind_data(name, entry, images, pics)
-		_kind_data[name] = data
-	var out: KindData = _kind_data[name]
+	if _kind_data.has(name):
+		var cached: KindData = _kind_data[name]
+		_kind_mutex.unlock()
+		return cached
+	var k_lock: Mutex = _kind_locks.get(name)
+	if k_lock == null:
+		k_lock = Mutex.new()
+		_kind_locks[name] = k_lock
 	_kind_mutex.unlock()
-	return out
+	k_lock.lock()
+	_kind_mutex.lock()
+	if _kind_data.has(name):
+		var found: KindData = _kind_data[name]
+		_kind_mutex.unlock()
+		k_lock.unlock()
+		return found
+	var entry: Variant = _index.get(name)
+	var gen := _index_generation
+	_kind_mutex.unlock()
+	var data := _load_kind_data(name, entry)
+	_kind_mutex.lock()
+	if _index_generation == gen:
+		if not _kind_data.has(name):
+			_kind_data[name] = data
+		else:
+			data = _kind_data[name]
+	_kind_mutex.unlock()
+	k_lock.unlock()
+	return data
+
+
+static func _load_kind_data(name: String, entry: Variant) -> KindData:
+	if not (entry is Dictionary):
+		return null
+	var images: Array[Image] = []
+	var pics: Array = []
+	var files := {}  # path -> Image, as a sheet holds several variants
+	for pic in entry.get("pics", []):
+		var image := _region(pic, files)
+		if image != null:
+			images.append(image)
+			pics.append(pic)
+	return _make_kind_data(name, entry, images, pics) if not images.is_empty() else null
 
 
 static func _make_kind_data(name: String, entry: Dictionary, images: Array[Image], pics: Array) -> KindData:
@@ -1417,6 +1656,8 @@ static func _make_kind_data(name: String, entry: Dictionary, images: Array[Image
 	kind.atlas = atlas
 	if texture_thread:
 		kind.texture = ImageTexture.create_from_image(atlas)
+		if kind.carpet_cells != null:
+			kind.carpet_texture = ImageTexture.create_from_image(kind.carpet_cells)
 	return kind
 
 
@@ -1651,14 +1892,15 @@ static func _region(pic: Array, files: Dictionary) -> Image:
 ## main thread's _kind and _flat_priority read their KindData's Kind and _flat_order without it.
 static func index() -> Dictionary:
 	if _index_generation != ModGraphics.generation and OS.get_thread_caller_id() == OS.get_main_thread_id():
-		_kind_mutex.lock()  # recursive: _kind_data_for asks while holding it
-		_index_generation = ModGraphics.generation
+		var target_gen := ModGraphics.generation
 		var merged := {}
 		if FileAccess.file_exists(INDEX):
 			var parsed = JSON.parse_string(FileAccess.get_file_as_string(INDEX))
 			if parsed is Dictionary:
 				merged = parsed
 		merged.merge(ModGraphics.decor, true)
+		_kind_mutex.lock()
+		_index_generation = target_gen
 		# The pictures read before (each KindData with its Kind) stay alive (_retired) until the chunks
 		# drawn with them are built again: a freed texture would draw white meanwhile.
 		_retired = [_kind_data.duplicate()]
@@ -1679,3 +1921,331 @@ static func _array(v) -> Array:
 ## A number from the wire, 0 for anything else (null, a list, a string).
 static func _int(v) -> int:
 	return int(v) if v is int or v is float else 0
+
+
+static func _dir_bit(dx: int, dy: int) -> int:
+	return 1 << ((dy + 1) * 3 + (dx + 1))
+
+
+## Sheet resolution for a chunk from its edge distance to the focus, with a hysteresis band around
+## thresholds so walking near a boundary does not repeatedly re-bake at alternating sizes.
+static func sheet_size_for(c: Vector2i, at: Vector2, current_size: int = 0, compressed: bool = sheet_compress) -> int:
+	if not at.is_finite():
+		return SHEET_SIZE_MID_PLAIN
+	var d := _chunk_distance(c, at)
+	var mid := SHEET_SIZE_MID_COMPRESSED if compressed else SHEET_SIZE_MID_PLAIN
+	if current_size <= 0:
+		if d <= SHEET_NEAR_DIST:
+			return SHEET_SIZE_NEAR
+		return mid if d <= SHEET_MID_DIST else SHEET_SIZE_FAR
+	if current_size >= SHEET_SIZE_NEAR:
+		if d <= SHEET_NEAR_DIST + SHEET_HYSTERESIS:
+			return SHEET_SIZE_NEAR
+		return mid if d <= SHEET_MID_DIST else SHEET_SIZE_FAR
+	if current_size > SHEET_SIZE_FAR:
+		if d <= SHEET_NEAR_DIST:
+			return SHEET_SIZE_NEAR
+		if d > SHEET_MID_DIST + SHEET_HYSTERESIS:
+			return SHEET_SIZE_FAR
+		return mid
+	if d <= SHEET_NEAR_DIST:
+		return SHEET_SIZE_NEAR
+	return mid if d <= SHEET_MID_DIST else SHEET_SIZE_FAR
+
+
+static func _edges_equal(a: Array, b: Array) -> bool:
+	if a.size() != b.size():
+		return false
+	for i in a.size():
+		var ea: Array = a[i]
+		var eb: Array = b[i]
+		if (ea[0] as Kind).name != (eb[0] as Kind).name or int(ea[2]) != int(eb[2]):
+			return false
+		if (ea[1] as PackedFloat32Array) != (eb[1] as PackedFloat32Array):
+			return false
+	return true
+
+
+static func _sheet_mesh(hills: bool) -> PlaneMesh:
+	if hills:
+		if _sheet_mesh_hills == null:
+			_sheet_mesh_hills = PlaneMesh.new()
+			_sheet_mesh_hills.size = Vector2(CHUNK, CHUNK)
+			_sheet_mesh_hills.subdivide_width = SHEET_HILLS_CELLS
+			_sheet_mesh_hills.subdivide_depth = SHEET_HILLS_CELLS
+		return _sheet_mesh_hills
+	if _sheet_mesh_flat == null:
+		_sheet_mesh_flat = PlaneMesh.new()
+		_sheet_mesh_flat.size = Vector2(CHUNK, CHUNK)
+	return _sheet_mesh_flat
+
+
+func _chunk_fully_blocked(c: Vector2i) -> bool:
+	var mask: PackedInt32Array = _masks.get(c, PackedInt32Array())
+	if mask.size() != CHUNK:
+		return false
+	for row: int in mask:
+		if (row & 0xFFFFFFFF) != 0xFFFFFFFF:
+			return false
+	return true
+
+
+static func _flat_instance_count(flat_list: Array) -> int:
+	var n := 0
+	for entry: Array in flat_list:
+		n += int(entry[2])
+	return n
+
+
+func _mark_overhang_neighbors(c: Vector2i, mask: int) -> void:
+	if mask == 0 or not sheet_enabled:
+		return
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			if dx == 0 and dy == 0:
+				continue
+			if (mask & _dir_bit(dx, dy)) == 0:
+				continue
+			var n := c + Vector2i(dx, dy)
+			if _lists.has(n) and not _chunk_fully_blocked(n):
+				_bake_dirty[n] = true
+				_sheet_content_dirty[n] = true
+
+
+func _has_neighbor_overhang(c: Vector2i) -> bool:
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			if dx == 0 and dy == 0:
+				continue
+			var n := c + Vector2i(dx, dy)
+			if (int(_edge_dirs.get(n, 0)) & _dir_bit(-dx, -dy)) != 0:
+				return true
+	return false
+
+
+func _record_flat_sheet_state(c: Vector2i, flat_list: Array, edge_list: Array, new_dirs: int, shade: float, keep_sheet := false) -> void:
+	var old_edges: Array = _edge_flat.get(c, [])
+	var old_dirs := int(_edge_dirs.get(c, 0))
+	if flat_list.is_empty():
+		_flat_groups.erase(c)
+	else:
+		_flat_groups[c] = flat_list
+	if edge_list.is_empty() or new_dirs == 0:
+		_edge_flat.erase(c)
+		_edge_dirs.erase(c)
+		new_dirs = 0
+	else:
+		_edge_flat[c] = edge_list
+		_edge_dirs[c] = new_dirs
+	_sheet_shade[c] = shade
+	_sheet_gen[c] = int(_sheet_gen.get(c, 0)) + 1
+	if not keep_sheet:
+		_sheet_size.erase(c)
+	if sheet_enabled and (old_dirs != new_dirs or not _edges_equal(old_edges, edge_list)):
+		_mark_overhang_neighbors(c, old_dirs | new_dirs)
+	if _chunk_fully_blocked(c):
+		_sheet_size.erase(c)
+		_bake_dirty.erase(c)
+		_sheet_content_dirty.erase(c)
+		return
+	var neighbor_in := _has_neighbor_overhang(c)
+	var want_sheet := neighbor_in or (not flat_list.is_empty() and (keep_sheet or new_dirs != 0 or _flat_instance_count(flat_list) >= SHEET_MIN_FLAT))
+	if sheet_enabled and want_sheet:
+		_bake_dirty[c] = true
+		_sheet_content_dirty[c] = true
+	else:
+		_bake_dirty.erase(c)
+		_sheet_content_dirty.erase(c)
+
+
+func _clear_flat_sheet_state(c: Vector2i) -> void:
+	var old_dirs := int(_edge_dirs.get(c, 0))
+	_flat_groups.erase(c)
+	_edge_flat.erase(c)
+	_edge_dirs.erase(c)
+	_sheet_shade.erase(c)
+	_sheet_size.erase(c)
+	_sheet_gen[c] = int(_sheet_gen.get(c, 0)) + 1
+	if sheet_enabled and old_dirs != 0:
+		_mark_overhang_neighbors(c, old_dirs)
+	if sheet_enabled and _lists.has(c) and not _chunk_fully_blocked(c) and _has_neighbor_overhang(c):
+		_bake_dirty[c] = true
+		_sheet_content_dirty[c] = true
+	else:
+		_bake_dirty.erase(c)
+		_sheet_content_dirty.erase(c)
+
+
+func _collect_sheet_sources(c: Vector2i) -> Array:
+	var out: Array = []
+	for entry: Array in _flat_groups.get(c, []):
+		var kind: Kind = entry[0]
+		if kind != null and kind.bake_material != null:
+			out.append([kind.mesh, kind.bake_material, entry[1], entry[2]])
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			if dx == 0 and dy == 0:
+				continue
+			var n := c + Vector2i(dx, dy)
+			if (int(_edge_dirs.get(n, 0)) & _dir_bit(-dx, -dy)) == 0:
+				continue
+			for e: Array in _edge_flat.get(n, []):
+				var ekind: Kind = e[0]
+				if ekind != null and ekind.bake_material != null:
+					out.append([ekind.mesh, ekind.bake_material, e[1], e[2]])
+	return out
+
+
+func _sync_sheet_hills() -> void:
+	if _sheet_hills == GroundHeight._on:
+		return
+	_sheet_hills = GroundHeight._on
+	var m := _sheet_mesh(_sheet_hills)
+	for node: Node3D in _chunks.values():
+		for ch: Node in node.get_children():
+			if ch is MeshInstance3D and ch.get_meta(META_FLAT, false):
+				(ch as MeshInstance3D).mesh = m
+
+
+func _update_sheet_move(delta: float) -> void:
+	var focus: Node3D = rig.get("target") if rig != null and is_instance_valid(rig) else null
+	if focus == null or not is_instance_valid(focus) or delta <= 0.0:
+		_sheet_move_hold = maxf(_sheet_move_hold - maxf(delta, 0.0), 0.0)
+		return
+	var at := Vector2(focus.global_position.x, focus.global_position.z)
+	if _sheet_move_pos.is_finite():
+		var speed := at.distance_to(_sheet_move_pos) / delta
+		if speed >= SHEET_MOVE_FREEZE_SPEED:
+			_sheet_move_hold = SHEET_MOVE_SETTLE_SEC
+		else:
+			_sheet_move_hold = maxf(_sheet_move_hold - delta, 0.0)
+	_sheet_move_pos = at
+
+
+func _has_eligible_bake() -> bool:
+	for c: Vector2i in _bake_dirty:
+		if not _lists.has(c) or _chunk_fully_blocked(c):
+			continue
+		if _sheet_size.has(c) and not _sheet_content_dirty.has(c) and _sheet_move_hold > 0.0:
+			continue
+		if not _culled_at.is_finite() or _chunk_distance(c, _culled_at) <= distance:
+			return true
+	return false
+
+
+func _step_sheets(delta: float) -> void:
+	_sync_sheet_hills()
+	_update_sheet_move(delta)
+	if not sheet_enabled or not enabled or not DecorSheetBaker.gpu_available():
+		return
+	if _baker == null and is_inside_tree():
+		_baker = DecorSheetBaker.new()
+		_baker.name = "DecorSheetBaker"
+		add_child(_baker)
+	if _baker == null:
+		return
+	_baker.step(delta, _apply_sheet)
+	if not _baker.is_idle() or _bake_dirty.is_empty():
+		return
+	var best_c := Vector2i.ZERO
+	var best_score := 1e18
+	var found := false
+	var cur_vp := int(_baker.current_size())
+	for c: Vector2i in _bake_dirty.keys():
+		if not _lists.has(c):
+			_bake_dirty.erase(c)
+			_sheet_content_dirty.erase(c)
+			continue
+		if _chunk_fully_blocked(c):
+			_bake_dirty.erase(c)
+			_sheet_content_dirty.erase(c)
+			if _sheet_size.has(c):
+				_apply_sheet(c, int(_sheet_gen.get(c, 0)), 0, null, true)
+			continue
+		var d := _chunk_distance(c, _culled_at) if _culled_at.is_finite() else 0.0
+		if _culled_at.is_finite() and d > distance + CHUNK:
+			continue
+		var has_sheet := _sheet_size.has(c)
+		var content_dirty := _sheet_content_dirty.has(c)
+		var c_want := sheet_size_for(c, _culled_at, int(_sheet_size.get(c, 0)))
+		if has_sheet and not content_dirty:
+			if c_want == int(_sheet_size[c]):
+				_bake_dirty.erase(c)
+				continue
+			if _sheet_move_hold > 0.0:
+				continue
+		var score := d + (10000.0 if has_sheet else 0.0) - (8.0 if c_want == cur_vp else 0.0)
+		if score < best_score:
+			best_score = score
+			best_c = c
+			found = true
+	if not found:
+		return
+	_bake_dirty.erase(best_c)
+	_sheet_content_dirty.erase(best_c)
+	var gen := int(_sheet_gen.get(best_c, 0))
+	var sources := _collect_sheet_sources(best_c)
+	if sources.is_empty():
+		_apply_sheet(best_c, gen, 0, null, true)
+		return
+	var want := sheet_size_for(best_c, _culled_at, int(_sheet_size.get(best_c, 0)))
+	_baker.start_bake(best_c, gen, want, sources, sheet_compress, texture_thread)
+
+
+func _apply_sheet(c: Vector2i, gen: int, size: int, texture: ImageTexture, empty: bool) -> void:
+	if int(_sheet_gen.get(c, -1)) != gen or not _lists.has(c):
+		return
+	var node: Node3D = _chunks.get(c)
+	var existing_sheet: MeshInstance3D = null
+	if node != null:
+		for ch: Node in node.get_children():
+			if ch.get_meta(META_FLAT, false):
+				if not empty and texture != null and existing_sheet == null and ch is MeshInstance3D and not (ch is MultiMeshInstance3D):
+					existing_sheet = ch as MeshInstance3D
+				else:
+					node.remove_child(ch)
+					ch.queue_free()
+	if empty or texture == null:
+		_sheet_size.erase(c)
+		if node != null and node.get_child_count() == 0:
+			_chunks.erase(c)
+			node.queue_free()
+		return
+	if node == null:
+		node = Node3D.new()
+		node.name = "Decor %d,%d" % [c.x, c.y]
+		add_child(node)
+		_chunks[c] = node
+	if existing_sheet != null:
+		var mat := existing_sheet.material_override as ShaderMaterial
+		if mat == null:
+			mat = ShaderMaterial.new()
+			mat.shader = SHADER_SHEET
+			if old_sheen_on:
+				mat.set_shader_parameter(&"old_sheen", true)
+			mat.render_priority = SHEET_PRIORITY
+			existing_sheet.material_override = mat
+		mat.set_shader_parameter(&"sheet", texture)
+		mat.set_shader_parameter(&"raised_shade", float(_sheet_shade.get(c, 0.0)))
+		existing_sheet.mesh = _sheet_mesh(_sheet_hills)
+	else:
+		var mat := ShaderMaterial.new()
+		mat.shader = SHADER_SHEET
+		if old_sheen_on:
+			mat.set_shader_parameter(&"old_sheen", true)
+		mat.set_shader_parameter(&"sheet", texture)
+		mat.set_shader_parameter(&"raised_shade", float(_sheet_shade.get(c, 0.0)))
+		mat.render_priority = SHEET_PRIORITY
+		var inst := MeshInstance3D.new()
+		inst.name = "FlatSheet"
+		inst.set_meta(META_FLAT, true)
+		inst.mesh = _sheet_mesh(_sheet_hills)
+		inst.material_override = mat
+		inst.position = Vector3(c.x * CHUNK + CHUNK * 0.5, SHEET_LIFT, c.y * CHUNK + CHUNK * 0.5)
+		inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		inst.layers = Visuals.GROUND_LAYER
+		inst.custom_aabb = AABB(Vector3(-CHUNK * 0.5, -64.0, -CHUNK * 0.5), Vector3(CHUNK, 128.0, CHUNK))
+		node.add_child(inst)
+	_sheet_size[c] = size
+	if _culled_at.is_finite():
+		_cull_one(c, node, _culled_at)

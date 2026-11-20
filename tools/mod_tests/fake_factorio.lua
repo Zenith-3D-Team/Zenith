@@ -4,8 +4,89 @@
 --
 -- The harness (test_bridge.py) drives it through the global table F.
 
+-- Factorio 2.1's string.pack, string.unpack and string.packsize (backported from Lua 5.4; lupa's Lua
+-- 5.2 has none): only the options the bridge uses, little-endian, anything else throws, so a new
+-- format shows up here first. Numbers are doubles, whole and in range, as in the game; a numeric string
+-- is read as its number, as the game's does (belt_sim's lists hold text; the game truncates "1.5" to 1,
+-- this throws, so a list that isn't whole numbers fails here first).
+local PACK_OPTIONS = { B = { 1, false }, I4 = { 4, false }, i4 = { 4, true }, i8 = { 8, true } }
+local function pack_items(fmt)
+  local items, at = {}, 1
+  if fmt:sub(1, 1) == "<" then
+    at = 2
+  end
+  while at <= #fmt do
+    local opt = fmt:match("^[Ii]%d", at) or fmt:sub(at, at)
+    local spec = PACK_OPTIONS[opt]
+    if not spec then
+      error("fake string.pack: format option '" .. opt .. "' is not one the bridge uses (" .. fmt .. ")", 3)
+    end
+    items[#items + 1] = spec
+    at = at + #opt
+  end
+  return items
+end
+
+function string.packsize(fmt)
+  local n = 0
+  for _, spec in ipairs(pack_items(fmt)) do
+    n = n + spec[1]
+  end
+  return n
+end
+
+function string.pack(fmt, ...)
+  local args = { ... }
+  local out = {}
+  for i, spec in ipairs(pack_items(fmt)) do
+    local v, size, signed = args[i], spec[1], spec[2]
+    if type(v) == "string" then
+      v = tonumber(v) or v
+    end
+    if type(v) ~= "number" then
+      error("bad argument #" .. (i + 1) .. " to 'pack' (number expected, got " .. type(v) .. ")", 2)
+    end
+    if v ~= math.floor(v) then
+      error("bad argument #" .. (i + 1) .. " to 'pack' (number has no integer representation)", 2)
+    end
+    local lim = 2 ^ (size * 8)
+    if (signed and (v < -lim / 2 or v >= lim / 2)) or (not signed and (v < 0 or v >= lim)) then
+      error("bad argument #" .. (i + 1) .. " to 'pack' (integer overflow)", 2)
+    end
+    local bytes = {}
+    for b = 1, size do
+      bytes[b] = v % 256
+      v = math.floor(v / 256)
+    end
+    out[#out + 1] = string.char(table.unpack(bytes))
+  end
+  return table.concat(out)
+end
+
+function string.unpack(fmt, s, pos)
+  pos = pos or 1
+  local out = {}
+  for _, spec in ipairs(pack_items(fmt)) do
+    local size, signed = spec[1], spec[2]
+    if pos + size - 1 > #s then
+      error("bad argument #2 to 'unpack' (data string too short)", 2)
+    end
+    local v = 0
+    for b = size, 1, -1 do
+      v = v * 256 + s:byte(pos + b - 1)
+    end
+    if signed and v >= 2 ^ (size * 8 - 1) then
+      v = v - 2 ^ (size * 8)
+    end
+    out[#out + 1] = v
+    pos = pos + size
+  end
+  out[#out + 1] = pos
+  return table.unpack(out)
+end
+
 F = {
-  sent = {},          -- {port, data} for every send_udp call
+  sent = {},          -- {port, data} for every send_udp call ({port, hex, true} for a binary one)
   registered = setmetatable({}, { __mode = "k" }), -- entity -> register_on_object_destroyed number
   next_registration = 0,
   destroyed_queue = {}, -- registration numbers of destroyed entities, raised at the next tick
@@ -24,6 +105,7 @@ F = {
   game_blueprints = {}, -- game.blueprints: LuaRecords (F.make_record)
   player_blueprints = {}, -- an offline player's library (make_offline_player)
   fluid_setters = setmetatable({}, { __mode = "k" }), -- entity -> function(box, fluid, capacity)
+  fluid_counters = setmetatable({}, { __mode = "k" }), -- entity -> function(count): F.set_fluids_count
   connectors = setmetatable({}, { __mode = "k" }), -- entity -> function(wire type) -> its connector
   printed = {},
   multiplayer = true,
@@ -45,7 +127,10 @@ F = {
   players_by = {}, -- index and name -> LuaPlayer
   game_surfaces = {}, -- game.surfaces: index -> LuaSurface
   trains = {}, -- id -> LuaTrain, for game.train_manager
-  segments = setmetatable({}, { __mode = "k" }), -- entity -> {fluid, capacity}: its pipeline (fluid segment)
+  segments = setmetatable({}, { __mode = "k" }), -- entity -> {fluid, capacity, id?, box?}: its pipeline (fluid segment)
+  -- entity -> {[storage] = {filter = fluid name, conns = {PipeConnection, ...}}}: a crafting machine's fluid storages'
+  -- filters and connections (get_fluid_filter, get_fluid_box_pipe_connections), set by the harness (L10).
+  fluid_conns = setmetatable({}, { __mode = "k" }),
   by_unit = setmetatable({}, { __mode = "v" }), -- unit number -> vehicle, for game.get_entity_by_unit_number
   capsules = {}, -- capsules used: {name, x, y}
 }
@@ -67,7 +152,7 @@ local event_names = {
   "on_space_platform_built_entity", "script_raised_built", "script_raised_revive",
   "on_entity_cloned", "on_player_mined_entity", "on_robot_mined_entity",
   "on_space_platform_mined_entity", "on_entity_died", "on_post_entity_died", "script_raised_destroy",
-  "on_resource_depleted", "on_player_rotated_entity", "on_player_flipped_entity", "on_entity_settings_pasted", "on_entity_color_changed", "on_gui_closed", "on_gui_click", "on_player_created",
+  "on_resource_depleted", "on_player_rotated_entity", "on_player_flipped_entity", "on_entity_settings_pasted", "on_entity_color_changed", "on_gui_closed", "on_gui_click", "on_player_dropped_item_into_entity", "on_player_created",
   "on_player_built_tile", "on_robot_built_tile", "on_space_platform_built_tile",
   "on_player_mined_tile", "on_robot_mined_tile", "on_space_platform_mined_tile",
   "script_raised_set_tiles", "on_chunk_generated", "on_entity_damaged", "on_research_finished",
@@ -92,10 +177,11 @@ defines = strict("defines", {
     westsouthwest = 11, west = 12, westnorthwest = 13, northwest = 14, northnorthwest = 15,
   }),
   -- Only the ones the mod reads; 2.1.23's attack is 1 (seen on units' distraction_command).
-  command = strict("defines.command", { attack = 1, go_to_location = 2, wander = 6, stop = 8 }),
+  command = strict("defines.command", { attack = 1, go_to_location = 2, attack_area = 5, wander = 6, stop = 8 }),
+  distraction = strict("defines.distraction", { none = 0, by_enemy = 1, by_anything = 2, by_damage = 3 }),
   entity_status = strict("defines.entity_status", { working = 1, no_power = 2, no_ingredients = 3, low_power = 4, no_research_in_progress = 5, missing_science_packs = 6, not_plugged_in_electric_network = 7,
     no_fuel = 8, full_output = 9, no_ammo = 10, charging = 11, discharging = 12, fully_charged = 13,
-    disabled_by_control_behavior = 14, no_minable_resources = 15, turned_off_during_daytime = 16 }),
+    disabled_by_control_behavior = 14, no_minable_resources = 15, turned_off_during_daytime = 16, pipeline_overextended = 17 }),
   signal_state = strict("defines.signal_state", { open = 0, closed = 1, reserved = 2, reserved_by_circuit_network = 3 }),
   chain_signal_state = strict("defines.chain_signal_state", { none = 0, all_open = 1, partially_open = 2, none_open = 3 }),
   wire_type = strict("defines.wire_type", { red = 1, green = 2, copper = 3 }),
@@ -129,17 +215,21 @@ defines = strict("defines", {
   }),
   controllers = strict("defines.controllers", { ghost = 0, character = 1, god = 2, editor = 4, spectator = 5, cutscene = 6, remote = 7 }),
   -- 2.0 names. The harness swaps assembling_machine_input for crafter_input to check the fallback.
+  -- 2.1.24's numbers (read live): each entity type reads them its own way (INVENTORY_ROLES), so many share one.
+  -- furnace_source and assembling_machine_input are 2.0's names (2.1 has crafter_input), kept for the fallback.
   inventory = strict("defines.inventory", {
     chest = 1, furnace_source = 2, assembling_machine_input = 2, lab_input = 2, character_guns = 3, character_ammo = 4,
-    cargo_wagon = 5, logistic_container_trash = 6, roboport_robot = 7, roboport_material = 8, robot_cargo = 9, turret_ammo = 10,
-    character_main = 11, character_armor = 12, character_trash = 13, item_main = 20,
+    cargo_wagon = 1, logistic_container_trash = 2, roboport_robot = 1, roboport_material = 2, robot_cargo = 1, turret_ammo = 1,
+    character_main = 1, character_armor = 5, character_trash = 8, item_main = 1,
     -- Space Age (space.lua): the hub's, the landing pad's and the silo's.
-    hub_main = 14, hub_trash = 15, cargo_landing_pad_main = 16, cargo_landing_pad_trash = 17,
-    rocket_silo_rocket = 18, rocket_silo_trash = 19,
+    hub_main = 1, hub_trash = 2, cargo_landing_pad_main = 1, cargo_landing_pad_trash = 2,
+    rocket_silo_rocket = 9, rocket_silo_trash = 11,
     -- Turrets' and vehicles' ammo (turrets.lua).
-    car_ammo = 21, spider_ammo = 22, artillery_turret_ammo = 23, artillery_wagon_ammo = 24,
-    -- Module slots (modules.lua): 2.1's crafter_modules is 4 in the game.
-    crafter_modules = 25, lab_modules = 26, mining_drill_modules = 27, beacon_modules = 28,
+    car_ammo = 3, spider_ammo = 3, artillery_turret_ammo = 1, artillery_wagon_ammo = 1,
+    -- Module slots (modules.lua).
+    crafter_modules = 4, lab_modules = 3, mining_drill_modules = 2, beacon_modules = 1,
+    -- Vehicles' trunks and fuel (ui_actions.lua's fast transfer, N2).
+    car_trunk = 2, spider_trunk = 2, fuel = 1, burnt_result = 6,
   }),
   rocket_silo_status = strict("defines.rocket_silo_status", {
     building_rocket = 0, create_rocket = 1, lights_blinking_open = 2, doors_opening = 3, doors_opened = 4,
@@ -183,6 +273,42 @@ script = strict("LuaBootstrap", {
     assert(type(id) == "number", "get_event_handler(event id)")
     return F.handlers[id]
   end,
+  -- Custom events (link.lua): ids past every defines.events one, made anew on each load.
+  generate_event_name = function()
+    F.next_event_id = F.next_event_id + 1
+    F.generated_events[F.next_event_id] = true
+    return F.next_event_id
+  end,
+  -- Only generated events here (the real one allows a short list of game events too, which the bridge
+  -- doesn't raise). Like Factorio, the data must hold no LuaObjects (an invalid one silently stops
+  -- the event): plain values and tables only. Every handler a companion mod set (F.companion_on) runs
+  -- at once, with name and tick added, before this returns.
+  raise_event = function(id, data)
+    assert(F.generated_events[id], "raise_event: " .. tostring(id) .. " isn't a generated event")
+    assert(type(data) == "table", "raise_event(event, data table)")
+    local function plain(v, depth)
+      assert(depth < 64, "raise_event: data nested too deep")
+      if type(v) == "table" then
+        assert(getmetatable(v) == nil, "raise_event: data holds a LuaObject")
+        for k, x in pairs(v) do
+          plain(k, depth + 1)
+          plain(x, depth + 1)
+        end
+      else
+        assert(type(v) ~= "function" and type(v) ~= "userdata", "raise_event: data holds a " .. type(v))
+      end
+    end
+    plain(data, 0)
+    F.raised_events[#F.raised_events + 1] = { id = id, data = data }
+    for _, fn in ipairs(F.companions[id] or {}) do
+      local e = {}
+      for k, v in pairs(data) do
+        e[k] = v
+      end
+      e.name, e.tick = id, game.tick
+      fn(e)
+    end
+  end,
   -- The same number each time the same entity is registered (as in 2.1.23); on_object_destroyed
   -- names it when the entity goes.
   register_on_object_destroyed = function(e)
@@ -218,6 +344,7 @@ settings = strict("LuaSettings", {
     ["f3d-detail-radius"] = { value = 24 },
     ["f3d-detail-interval"] = { value = 6 },
     ["f3d-spread-jobs"] = { value = true },
+    ["f3d-binary-messages"] = { value = true },
     ["f3d-starter-kit"] = { value = true },
     ["f3d-player"] = { value = "" },
     ["f3d-act-as-player"] = { value = true },
@@ -241,6 +368,16 @@ package.preload["mod-gui"] = function()
     return outer.mod_gui_inner_frame or outer.add({ type = "frame", name = "mod_gui_inner_frame", direction = "horizontal" })
   end
   return M
+end
+
+-- A fake companion mod's handler for a generated event (link.lua), and what was raised.
+F.next_event_id = 100000
+F.generated_events = {}
+F.companions = {}
+F.raised_events = {}
+function F.companion_on(id, fn)
+  F.companions[id] = F.companions[id] or {}
+  table.insert(F.companions[id], fn)
 end
 
 -- remote.add_interface: the `zenith` interface (console.lua); F.remote[name][fn] calls it.
@@ -292,7 +429,9 @@ local entity_protos = {
   ["transport-belt"] = entity_proto("transport-belt", "transport-belt", 1, 1, { rotatable = true, fast_replaceable_group = "transport-belt" }),
   ["fast-transport-belt"] = entity_proto("fast-transport-belt", "transport-belt", 1, 1, { rotatable = true, fast_replaceable_group = "transport-belt" }),
   ["straight-rail"] = entity_proto("straight-rail", "straight-rail", 2, 2, { rotatable = true, build_grid_size = 2 }),
-  ["underground-belt"] = entity_proto("underground-belt", "underground-belt", 1, 1, { rotatable = true, max_underground_distance = 5 }),
+  -- (Belts, undergrounds and splitters fast-replace each other: one group, as in the game's data.)
+  ["underground-belt"] = entity_proto("underground-belt", "underground-belt", 1, 1, { rotatable = true, max_underground_distance = 5,
+    fast_replaceable_group = "transport-belt" }),
   ["assembling-machine-1"] = entity_proto("assembling-machine-1", "assembling-machine", 3, 3, {
     crafting_categories = { crafting = true, ["basic-crafting"] = true, ["advanced-crafting"] = true },
   }),
@@ -300,7 +439,8 @@ local entity_protos = {
   ["wooden-chest"] = entity_proto("wooden-chest", "container", 1, 1),
   lab = entity_proto("lab", "lab", 3, 3, { lab_inputs = { "automation-science-pack", "logistic-science-pack" } }),
   -- (A drill: belt_sim.lua's actors; its drop spot and mining progress set by the harness.)
-  ["burner-mining-drill"] = entity_proto("burner-mining-drill", "mining-drill", 2, 2, { rotatable = true, mining_speed = 0.25 }),
+  ["burner-mining-drill"] = entity_proto("burner-mining-drill", "mining-drill", 2, 2, { rotatable = true, mining_speed = 0.25,
+    resource_categories = { ["basic-solid"] = true }, require_resources_to_place = true }),
   inserter = entity_proto("inserter", "inserter", 1, 1, { rotatable = true,
     inserter_pickup_position = { x = 0, y = -1 }, inserter_drop_position = { x = 0, y = 1.2 },
     get_inserter_rotation_speed = function() return 0.014 end, get_inserter_extension_speed = function() return 0.035 end }),
@@ -314,11 +454,18 @@ local entity_protos = {
   -- A boiler with fluid boxes and no fuel inventory (heat source): it opens with no inventory.
   ["heat-exchanger"] = entity_proto("heat-exchanger", "boiler", 3, 2, { rotatable = true,
     fluidbox_prototypes = { { pipe_connections = {} }, { pipe_connections = {} } } }),
+  -- A burner boiler (ui_actions.lua's fast transfer): a fuel slot and a burnt result inventory of no slots.
+  boiler = entity_proto("boiler", "boiler", 3, 2, { rotatable = true,
+    fluidbox_prototypes = { { pipe_connections = {} }, { pipe_connections = {} } } }),
   splitter = entity_proto("splitter", "splitter", 2, 1, { rotatable = true, fast_replaceable_group = "transport-belt" }),
   ["power-switch"] = entity_proto("power-switch", "power-switch", 2, 2),
   ["gun-turret"] = entity_proto("gun-turret", "ammo-turret", 2, 2),
   ["small-lamp"] = entity_proto("small-lamp", "lamp", 1, 1),
-  pipe = entity_proto("pipe", "pipe", 1, 1),
+  pipe = entity_proto("pipe", "pipe", 1, 1, { fast_replaceable_group = "pipe" }),
+  -- (M2) Its direction is its pipe connection; the underground one is behind it, up to 10 tiles, to one facing back.
+  ["pipe-to-ground"] = entity_proto("pipe-to-ground", "pipe-to-ground", 1, 1, { rotatable = true, fast_replaceable_group = "pipe",
+    fluidbox_prototypes = { { pipe_connections = { { connection_type = "normal", flow_direction = "input-output", direction = 0 },
+      { connection_type = "underground", flow_direction = "input-output", direction = 8, max_underground_distance = 10 } } } } }),
   ["arithmetic-combinator"] = entity_proto("arithmetic-combinator", "arithmetic-combinator", 1, 2, { rotatable = true }),
   ["constant-combinator"] = entity_proto("constant-combinator", "constant-combinator", 1, 1, { rotatable = true }),
   ["entity-ghost"] = entity_proto("entity-ghost", "entity-ghost", 1, 1),
@@ -345,8 +492,37 @@ local entity_protos = {
   ["iron-ore"] = entity_proto("iron-ore", "resource", 1, 1, {
     unit_numbered = false,
     mineable_properties = { minable = true, mining_time = 1, products = { { type = "item", name = "iron-ore", amount = 1 } } },
+    resource_category = "basic-solid", resource_patch_search_radius = 3, normal_resource_amount = 1, minimum_resource_amount = 0,
   }),
-  ["small-biter"] = entity_proto("small-biter", "unit", 0.5, 0.5, { attack_parameters = { range = 0.5 } }),
+  -- A resource that needs fluid to be mined (2.1's uranium ore: sulfuric acid), so a drill over it takes fluid in.
+  ["uranium-ore"] = entity_proto("uranium-ore", "resource", 1, 1, {
+    unit_numbered = false,
+    mineable_properties = { minable = true, mining_time = 2, required_fluid = "sulfuric-acid", fluid_amount = 10,
+      products = { { type = "item", name = "uranium-ore", amount = 1 } } },
+    resource_category = "basic-solid", resource_patch_search_radius = 3, normal_resource_amount = 1, minimum_resource_amount = 0,
+  }),
+  -- 2.1's electric drill: its mining area 2.49 tiles about its centre (the wet drill over uranium ore).
+  ["electric-mining-drill"] = entity_proto("electric-mining-drill", "mining-drill", 3, 3, { rotatable = true, mining_speed = 0.5,
+    mining_drill_radius = 2.49, resource_categories = { ["basic-solid"] = true }, require_resources_to_place = true,
+    -- Its fluid input (2.1.24 reads its production_type "none"; no pipe connections here, so no `fb` is sent).
+    fluidbox_prototypes = { { production_type = "none", pipe_connections = {} } } }),
+  -- An infinite resource giving fluid (L6, L8): 2.1's crude oil, its well three by three.
+  ["crude-oil"] = entity_proto("crude-oil", "resource", 3, 3, {
+    unit_numbered = false, infinite_resource = true,
+    mineable_properties = { minable = true, mining_time = 1, products = { { type = "fluid", name = "crude-oil", amount = 10 } } },
+    resource_category = "basic-fluid", resource_patch_search_radius = 12, normal_resource_amount = 300000, minimum_resource_amount = 60000,
+  }),
+  -- 2.1.24's pumpjack: an output only, at the north-east tile northwards facing north (L8).
+  pumpjack = entity_proto("pumpjack", "mining-drill", 3, 3, { rotatable = true, mining_speed = 1,
+    mining_drill_radius = 0.49, vector_to_place_result = { x = 0, y = 0 }, resource_categories = { ["basic-fluid"] = true },
+    require_resources_to_place = true,
+    fluidbox_prototypes = { { pipe_connections = { { connection_type = "normal", flow_direction = "output", direction = 0,
+      positions = { { x = 1, y = -1 }, { x = 1, y = 1 }, { x = -1, y = 1 }, { x = -1, y = -1 } } } } } } }),
+  ["small-biter"] = entity_proto("small-biter", "unit", 0.5, 0.5, { attack_parameters = { range = 0.5 },
+    vision_distance = 30 }),
+  -- Harness only (no such unit in the game): a unit that sees 12 tiles, for enemy_sight's per-prototype vision.
+  ["f3d-test-short-sighted"] = entity_proto("f3d-test-short-sighted", "unit", 0.5, 0.5, { attack_parameters = { range = 0.5 },
+    vision_distance = 12 }),
   -- What weapons fire: none of these has a unit_number.
   ["shotgun-pellet"] = entity_proto("shotgun-pellet", "projectile", 0.2, 0.5, { unit_numbered = false }),
   ["rocket"] = entity_proto("rocket", "projectile", 0.2, 0.5, { unit_numbered = false }),
@@ -369,7 +545,13 @@ local entity_protos = {
   ["laser-turret"] = entity_proto("laser-turret", "electric-turret", 2, 2),
   ["flamethrower-turret"] = entity_proto("flamethrower-turret", "fluid-turret", 2, 3),
   tank = entity_proto("tank", "car", 3, 4),
-  ["storage-tank"] = entity_proto("storage-tank", "storage-tank", 3, 3),
+  -- 2.1's storage tank: four connections at two corners (base data: north and west at {-1, -1}, east and south at {1, 1}).
+  ["storage-tank"] = entity_proto("storage-tank", "storage-tank", 3, 3, { rotatable = true,
+    fluidbox_prototypes = { { pipe_connections = {
+      { connection_type = "normal", flow_direction = "input-output", direction = 0, positions = { { x = -1, y = -1 }, { x = 1, y = -1 }, { x = 1, y = 1 }, { x = -1, y = 1 } } },
+      { connection_type = "normal", flow_direction = "input-output", direction = 4, positions = { { x = 1, y = 1 }, { x = -1, y = 1 }, { x = -1, y = -1 }, { x = 1, y = -1 } } },
+      { connection_type = "normal", flow_direction = "input-output", direction = 8, positions = { { x = 1, y = 1 }, { x = -1, y = 1 }, { x = -1, y = -1 }, { x = 1, y = -1 } } },
+      { connection_type = "normal", flow_direction = "input-output", direction = 12, positions = { { x = -1, y = -1 }, { x = 1, y = -1 }, { x = 1, y = 1 }, { x = -1, y = 1 } } } } } } }),
   ["heat-pipe"] = entity_proto("heat-pipe", "heat-pipe", 1, 1),
   ["requester-chest"] = entity_proto("requester-chest", "logistic-container", 1, 1, { logistic_mode = "requester" }),
   ["storage-chest"] = entity_proto("storage-chest", "logistic-container", 1, 1, { logistic_mode = "storage" }),
@@ -392,6 +574,7 @@ local entity_protos = {
     { leg = "small-stomper-pentapod-leg", ground_position = { 3.7, -5.1 } },
   } } }),
   ["small-stomper-pentapod-leg"] = entity_proto("small-stomper-pentapod-leg", "spider-leg", 0.5, 0.5),
+  ["biter-spawner"] = entity_proto("biter-spawner", "unit-spawner", 5, 5),
   ["gleba-spawner"] = entity_proto("gleba-spawner", "unit-spawner", 5, 5),
   ["heating-tower"] = entity_proto("heating-tower", "reactor", 3, 3, { heating_radius = 12 }),
   ["cargo-pod"] = entity_proto("cargo-pod", "cargo-pod", 2, 2),
@@ -415,7 +598,7 @@ local entity_protos = {
   -- What a building waits for (modules.lua): no unit number, made with a target and `modules`.
   ["item-request-proxy"] = entity_proto("item-request-proxy", "item-request-proxy", 1, 1, { unit_numbered = false }),
 }
--- A beacon: its two module slots and how much of their effect it hands on.
+-- A beacon (G12): its two module slots and how much of their effect it hands on.
 entity_protos.beacon = entity_proto("beacon", "beacon", 3, 3, { distribution_effectivity = 1.5, supply_area_distance = 3 })
 -- Module slots (LuaEntityPrototype.module_inventory_size, allowed_effects; nil = every category).
 for _, n in pairs({ "assembling-machine-1", "lab", "beacon" }) do
@@ -440,6 +623,15 @@ entity_protos.lab.icons_positioning = {
 entity_protos.beacon.icons_positioning = {
   { inventory_index = defines.inventory.beacon_modules, shift = { x = 0, y = 0 }, scale = 0.5, max_icons_per_row = 2,
     max_icon_rows = 2, separation_multiplier = 1.1, multi_row_initial_height_modifier = -0.3 },
+}
+-- 2.1's gun turret lists its ammo and its locomotive its fuel (read in real 2.1.24, K1's leftover).
+entity_protos["gun-turret"].icons_positioning = {
+  { inventory_index = defines.inventory.turret_ammo, shift = { 0, -0.25 }, scale = 0.5, max_icons_per_row = 2,
+    max_icon_rows = 1, separation_multiplier = 1.1, multi_row_initial_height_modifier = -0.1 },
+}
+entity_protos.locomotive.icons_positioning = {
+  { inventory_index = defines.inventory.fuel, shift = { 0, 0.3 }, scale = 0.5, max_icons_per_row = 3,
+    max_icon_rows = 4, separation_multiplier = 1.1, multi_row_initial_height_modifier = -0.1 },
 }
 -- What an assembler draws (H20's entity info): 75 kW at most (joules a tick, by quality) and a
 -- 2.5 kW drain; consumers' electric sources have an input priority.
@@ -486,7 +678,8 @@ for name, t in pairs(tile_protos) do
 end
 
 local item_protos = {}
-for _, n in pairs({ "transport-belt", "fast-transport-belt", "underground-belt", "assembling-machine-1", "stone-furnace", "locomotive", "splitter" }) do
+for _, n in pairs({ "transport-belt", "fast-transport-belt", "underground-belt", "assembling-machine-1", "stone-furnace", "locomotive", "splitter",
+    "pipe", "pipe-to-ground" }) do
   item_protos[n] = { name = n, place_result = entity_protos[n] }
 end
 -- 2.x: the rail item is a rail planner; its place_result is empty and `rails` lists what it builds.
@@ -525,6 +718,8 @@ item_protos["burner-inserter"] = { name = "burner-inserter", place_result = enti
 -- Ammo named like the projectile it fires, which it doesn't build (issue #2).
 item_protos.rocket = { name = "rocket", type = "ammo", place_result = nil }
 entity_protos["burner-inserter"].items_to_place_this = { { name = "burner-inserter", count = 1 } }
+-- The electric drill's item builds it (placing one over uranium ore: the "Uranium mining" research's rule).
+item_protos["electric-mining-drill"] = { name = "electric-mining-drill", place_result = entity_protos["electric-mining-drill"] }
 for _, n in pairs({ "iron-plate", "copper-plate", "wood", "pistol", "firearm-magazine", "burner-mining-drill", "iron-ore", "iron-gear-wheel",
   "space-platform-starter-pack" }) do
   item_protos[n] = { name = n, place_result = nil }
@@ -535,6 +730,16 @@ item_protos["pistol"].attack_parameters = { type = "projectile", range = 15, coo
 item_protos["firearm-magazine"].type = "ammo"
 item_protos["firearm-magazine"].ammo_category = { name = "bullet" }
 item_protos["firearm-magazine"].magazine_size = 10
+-- N3: vehicles' guns (LuaEntityPrototype.indexed_guns, in slot order), as in the game's data.
+for _, n in pairs({ "vehicle-machine-gun", "tank-machine-gun", "tank-cannon", "tank-flamethrower", "spidertron-rocket-launcher-1",
+  "spidertron-rocket-launcher-2", "spidertron-rocket-launcher-3", "spidertron-rocket-launcher-4" }) do
+  item_protos[n] = { name = n, type = "gun", place_result = nil }
+end
+entity_protos.car.indexed_guns = { item_protos["vehicle-machine-gun"] }
+-- 2.1.24 (read live): the cannon first, then the machine gun and the flamethrower.
+entity_protos.tank.indexed_guns = { item_protos["tank-cannon"], item_protos["tank-machine-gun"], item_protos["tank-flamethrower"] }
+entity_protos.spidertron.indexed_guns = { item_protos["spidertron-rocket-launcher-1"], item_protos["spidertron-rocket-launcher-2"],
+  item_protos["spidertron-rocket-launcher-3"], item_protos["spidertron-rocket-launcher-4"] }
 
 -- Equipment (LuaEquipmentPrototype) and the items that place it.
 local equipment_protos = {
@@ -655,7 +860,27 @@ F.mod_data = {
 F.planet_data = { lightning = { "fulgora" } }
 -- Entities' own mining sounds (data-final-fixes.lua's zenith-mining-sounds, J11): F.mining_data.
 F.mining_data = { ms = { ["iron-ore"] = "base/sound/axe-mining-test" }, rs = { ["stone-wall"] = "base/sound/manual-repair-simple" } }
+-- The steps' sounds (data-final-fixes.lua's zenith-step-sounds, step_sounds.lua): F.step_data. Its
+-- sounds' list is long enough for several `steps` parts (a mod set with many grounds).
+F.step_data = {
+  s = { { "base/sound/walking/grass", 80, 10 }, { "base/sound/walking/concrete", 80, 11 },
+        { "base/sound/walking/rails/rails", 60, 12 }, { { "my-mod/sound/clank.ogg", "my-mod/sound/clonk.ogg" }, 50, 2 },
+        { "base/sound/walking/plant/plant", 40, 5 }, { "space-age/sound/entity/mech-armor/mech-armor-steps-metallic", 20, 5 } },
+  tile = { ["grass-1"] = 1, water = 0, concrete = 2, ["not-a-tile"] = 1 },
+  entity = { ["straight-rail"] = 3, ["iron-ore"] = 4 },
+  decorative = { ["brown-asterisk"] = 5 },
+  armor = { ["power-armor"] = { 6, 0 } },
+  u = { 4, 0 },
+  nv = { 5, 1 },
+}
+for i = 1, 80 do
+  table.insert(F.step_data.s, { "some-terrain-mod/sound/walking/a-rather-long-ground-name-" .. i, 70, 6 })
+end
 local mod_data = {
+  ["zenith-step-sounds"] = strict("LuaModData", {
+    name = "zenith-step-sounds", data_type = "zenith-step-sounds",
+    get = function(key) return F.step_data and F.step_data[key] end,
+  }),
   ["zenith-graphics"] = strict("LuaModData", {
     name = "zenith-graphics", data_type = "zenith-graphics",
     get = function(key) return F.mod_data[key] end,
@@ -672,9 +897,21 @@ local mod_data = {
 
 prototypes = strict("LuaPrototypes", {
   mod_data = mod_data,
+  utility_constants = strict("UtilityConstants", { default_pipeline_extent = 320 }),
   entity = entity_protos, tile = tile_protos, item = item_protos, fluid = fluid_protos,
   space_location = space_locations, space_connection = space_connections, surface_property = surface_properties,
   asteroid_chunk = asteroid_chunks, quality = qualities, recipe = recipe_protos, decorative = decorative_protos, technology = {},
+  -- Only the "type" filter (enemy_sight.lua's units).
+  get_entity_filtered = function(filters)
+    assert(#filters == 1 and filters[1].filter == "type", "get_entity_filtered: only {filter = \"type\"} is faked")
+    local out = {}
+    for name, p in pairs(entity_protos) do
+      if p.type == filters[1].type then
+        out[name] = p
+      end
+    end
+    return out
+  end,
   -- Only the "type" filter (repair tools for the alerts).
   get_item_filtered = function(filters)
     assert(#filters == 1 and filters[1].filter == "type", "get_item_filtered: only {filter = \"type\"} is faked")
@@ -751,22 +988,63 @@ techs.logistics = make_tech("logistics", { automation = techs.automation })
 techs["steel-processing"] = make_tech("steel-processing", {}, { researched = true })
 techs["secret"] = make_tech("secret", {}, { prototype = strict("LuaTechnologyPrototype", { hidden = true, effects = {}, level = 1, max_level = 1 }) })
 
+F.make_tech = make_tech -- for test technologies (a trigger one, a deeper chain); put in game.forces.player.technologies
+F.research_rest = {} -- the queue after the current research (research_queue reads them with it first)
+
+-- 2.1.24's add_research and research_queue, as measured in real headless 2.1.24 (L12): add_research takes a name
+-- or a LuaTechnology and refuses (false) a researched or already queued one, a trigger technology (its
+-- prototype has a research_trigger), one whose prerequisites aren't researched or queued before it, and an
+-- eighth in the queue (the current research counts); it never queues prerequisites itself.
+local QUEUE_MAX = 7
+local function queue_list()
+  local f = forces.player
+  local q = {}
+  if rawget(f, "current_research") then
+    q[1] = rawget(f, "current_research")
+  end
+  for _, t in ipairs(F.research_rest) do
+    q[#q + 1] = t
+  end
+  return q
+end
+local function can_queue(tech, q)
+  local ok, trig = pcall(function() return tech.prototype.research_trigger end)
+  if tech.researched or (ok and trig) or not tech.enabled or #q >= QUEUE_MAX then
+    return false
+  end
+  local queued = {}
+  for _, t in ipairs(q) do
+    queued[t.name] = true
+  end
+  if queued[tech.name] then
+    return false
+  end
+  for _, pre in pairs(tech.prerequisites) do
+    if not (pre.researched or queued[pre.name]) then
+      return false
+    end
+  end
+  return true
+end
+
 -- current_research is nil when nothing is being researched; anything else unknown is an error.
 forces.player = setmetatable({
   name = "player",
   rail_planner_allow_elevated_rails = false,
   technologies = techs,
   research_progress = 0,
-  research_queue = {},
   -- Starts the research if none is running, otherwise queues it (2.x).
-  add_research = function(name)
+  add_research = function(t)
     local f = forces.player
-    local tech = techs[name]
-    assert(tech, "add_research: unknown technology " .. tostring(name))
-    if f.current_research == nil then
+    local tech = type(t) == "string" and techs[t] or t
+    assert(type(tech) == "table" and tech.name, "add_research: unknown technology " .. tostring(t))
+    if not can_queue(tech, queue_list()) then
+      return false
+    end
+    if rawget(f, "current_research") == nil then
       rawset(f, "current_research", tech)
     else
-      table.insert(f.research_queue, tech)
+      table.insert(F.research_rest, tech)
     end
     return true
   end,
@@ -777,8 +1055,21 @@ forces.player = setmetatable({
       rawset(rawget(f, "current_research"), "saved_progress", f.research_progress)
     end
     rawset(f, "current_research", nil)
+    -- What depended on it leaves the queue; the next one left starts.
+    local rest = F.research_rest
+    F.research_rest = {}
+    for _, t in ipairs(rest) do
+      if can_queue(t, queue_list()) then
+        if rawget(f, "current_research") == nil then
+          rawset(f, "current_research", t)
+        else
+          table.insert(F.research_rest, t)
+        end
+      end
+    end
   end,
   manual_mining_speed_modifier = 0,
+  mining_with_fluid = false, -- the "Uranium mining" research's effect (false on a new map)
   character_logistic_requests = false,
   recipes = {
     ["iron-gear-wheel"] = make_recipe("iron-gear-wheel", true, "crafting", {
@@ -875,8 +1166,32 @@ forces.player = setmetatable({
   __index = function(_, k)
     if k == "current_research" then
       return nil
+    elseif k == "research_queue" then
+      return queue_list() -- the current research first, as Factorio's
     end
     error("LuaForce doesn't contain key " .. tostring(k), 2)
+  end,
+  -- Written whole: names or technologies, the first the current research; one that can't be queued where it
+  -- stands (researched, a trigger technology, its prerequisites not before it, the queue full) is dropped
+  -- silently, as Factorio's (a dependent written before its prerequisite is dropped).
+  __newindex = function(f, k, v)
+    if k ~= "research_queue" then
+      rawset(f, k, v)
+      return
+    end
+    rawset(f, "current_research", nil)
+    F.research_rest = {}
+    for _, t in ipairs(v or {}) do
+      local tech = type(t) == "string" and techs[t] or t
+      assert(type(tech) == "table" and tech.name, "research_queue: unknown technology " .. tostring(t))
+      if can_queue(tech, queue_list()) then
+        if rawget(f, "current_research") == nil then
+          rawset(f, "current_research", tech)
+        else
+          table.insert(F.research_rest, tech)
+        end
+      end
+    end
   end,
 })
 for name, r in pairs(forces.player.recipes) do
@@ -1149,6 +1464,29 @@ end
 -- (F.make_inventory, below, for books' pages.)
 -- An inventory of `size` slots, like LuaInventory: inv[i] and #inv give its stacks; insert fills
 -- stacks of the same item first, then empty slots.
+-- What LuaEntity.get_inventory(i) returns per entity type, by 2.1.24's numbers (read live), as roles of the
+-- fake's inventories (a list: the first it has). Inventory 1 is a chest's, a burner's fuel, a wagon's cargo,
+-- a turret's ammo, the hub's main...; 2 a crafter's or lab's input, a chest's trash, a trunk; 3 an output.
+local INVENTORY_ROLES = {
+  default = { { "chest", "fuel" }, "input", "output" },
+  container = { "chest" },
+  ["logistic-container"] = { "chest", "trash" },
+  ["space-platform-hub"] = { "chest", "trash" },
+  ["cargo-landing-pad"] = { "chest", "trash" },
+  ["rocket-silo"] = { nil, "input", "output", nil, nil, nil, nil, nil, "rocket", nil, "trash" },
+  roboport = { "robots", "repair" },
+  ["logistic-robot"] = { "robot_cargo" },
+  ["construction-robot"] = { "robot_cargo" },
+  ["cargo-wagon"] = { "cargo" },
+  car = { "fuel", "trunk", "vehicle_ammo" },
+  ["spider-vehicle"] = { nil, "trunk", "vehicle_ammo" },
+  locomotive = { "fuel" },
+  ["ammo-turret"] = { "turret_ammo" },
+  ["artillery-turret"] = { "vehicle_ammo" },
+  ["artillery-wagon"] = { "vehicle_ammo" },
+  boiler = { "fuel", nil, nil, nil, nil, "burnt" },
+}
+
 local function make_inventory(size)
   size = size or 16
   local slots = {} -- index -> {name, count, quality} or nil
@@ -1835,7 +2173,7 @@ local function make_entity(surface, params)
     position = { x = pos.x or pos[1], y = pos.y or pos[2] },
     direction = params.direction or 0, surface = surface,
     force = params.force and (type(params.force) == "string" and forces[params.force] or params.force) or forces.neutral,
-    prototype = proto, health = 100, max_health = 100, minable = true, rotatable = proto.rotatable,
+    prototype = proto, health = 100, max_health = 100, minable = true, rotatable = proto.rotatable, destructible = true,
     quality = qualities[params.quality or "normal"] or strict("LuaQualityPrototype", { name = params.quality }),
   }
   data.get_health_ratio = function() return data.health / data.max_health end
@@ -1929,17 +2267,28 @@ local function make_entity(surface, params)
   end
   -- Units are commandable; the harness sets the command and distraction (LuaCommandable's
   -- command / distraction_command, nil when it has none).
+  -- set_distraction_command records what it was given (F.distractions, in order) and sets distraction_command;
+  -- parent_group and spawner nil unless the harness sets them.
   if proto.type == "unit" then
     local cmds = {}
+    local readable = { command = true, distraction_command = true, parent_group = true, spawner = true }
+    local set_distraction = function(c)
+      assert(type(c) == "table" and c.type, "set_distraction_command: a Command")
+      cmds.distraction_command = c
+      F.distractions = F.distractions or {}
+      F.distractions[#F.distractions + 1] = { unit = data.self, command = c, tick = game.tick }
+    end
     data.commandable = setmetatable({}, {
       __index = function(_, k)
-        if k == "command" or k == "distraction_command" then
+        if readable[k] then
           return cmds[k]
+        elseif k == "set_distraction_command" then
+          return set_distraction
         end
         error("LuaCommandable doesn't contain key " .. tostring(k), 2)
       end,
       __newindex = function(_, k, v)
-        assert(k == "command" or k == "distraction_command", "LuaCommandable: can't write " .. tostring(k))
+        assert(readable[k], "LuaCommandable: can't write " .. tostring(k))
         cmds[k] = v  -- harness only (the real ones take set_command / set_distraction_command)
       end,
     })
@@ -1985,7 +2334,7 @@ local function make_entity(surface, params)
     request_from_buffers = true,
     splitter_input_priority = true, splitter_output_priority = true, splitter_filter = true, power_switch_state = true,
     rocket_silo_status = "harness", send_to_orbit_automatically = true, providing_to_other_platforms = true,
-    ignore_unprioritised_targets = true, belt_shape = "harness",
+    ignore_unprioritised_targets = true, belt_shape = "harness", destructible = "harness",
   }
   -- What an inserter takes from and puts on, and where a drill drops its ore (nil: nothing there);
   -- set by the harness (`e.pickup_target = belt`), only on the kinds that have them.
@@ -1993,8 +2342,9 @@ local function make_entity(surface, params)
     optional.pickup_target, optional.drop_target = true, true
     writable.pickup_target, writable.drop_target = "harness", "harness"
   elseif proto.type == "mining-drill" then
-    optional.drop_target = true
-    writable.drop_target = "harness"
+    -- What it mines now (LuaEntity.mining_target), nil until the harness sets it.
+    optional.drop_target, optional.mining_target = true, true
+    writable.drop_target, writable.mining_target = "harness", "harness"
   end
   -- Where an inserter takes from and puts, and where a drill drops (pickup_position, drop_position): nil until
   -- the harness sets them (the real ones always have one; a test world's default spot would land on belts the
@@ -2011,7 +2361,7 @@ local function make_entity(surface, params)
   -- harness fills them (F.set_fluid, F.connect). 2.1 has no LuaEntity.fluidbox: storages are read
   -- by index with get_fluid / get_fluid_capacity up to fluids_count, and written with set_fluid.
   local boxes, capacities = {}, {}
-  local box_count = (proto.type == "pipe" or proto.type == "storage-tank") and 1 or 0
+  local box_count = (proto.type == "pipe" or proto.type == "pipe-to-ground" or proto.type == "storage-tank") and 1 or 0
   local function storage_index(i)
     assert(type(i) == "number" and i >= 1 and i <= box_count, "fluid storage index out of range: " .. tostring(i))
   end
@@ -2041,6 +2391,22 @@ local function make_entity(surface, params)
       local seg = F.segments[data.self]
       return seg and seg.capacity or capacities[i] or 100
     end
+    -- (L11) The segment's id and extent box: the harness's, or the entity alone.
+    data.get_fluid_segment_id = function(i)
+      storage_index(i)
+      local seg = F.segments[data.self]
+      return seg and seg.id or data.unit_number
+    end
+    data.get_fluid_segment_extent_bounding_box = function(i)
+      storage_index(i)
+      local seg = F.segments[data.self]
+      if seg and seg.box then
+        return seg.box
+      end
+      local b, p = data.prototype.collision_box, data.position
+      return { left_top = { x = p.x + b.left_top.x, y = p.y + b.left_top.y },
+        right_bottom = { x = p.x + b.right_bottom.x, y = p.y + b.right_bottom.y } }
+    end
     data.clear_fluid_segment_fluid = function(i)
       storage_index(i)
       local old = boxes[i]
@@ -2059,11 +2425,34 @@ local function make_entity(surface, params)
       end
     end
   end
+  -- (L10) A crafting machine's storages' filters and connections, from the harness (F.fluid_conns).
+  if proto.type == "assembling-machine" or proto.type == "furnace" then
+    data.get_fluid_filter = function(i)
+      local c = (F.fluid_conns[data.self] or {})[i]
+      return c and c.filter and strict("LuaFluidPrototype", { name = c.filter }) or nil
+    end
+    data.get_fluid_box_pipe_connections = function(i)
+      local c = (F.fluid_conns[data.self] or {})[i]
+      return c and c.conns or {}
+    end
+  end
   local function set_fluid(i, fluid, capacity)
     box_count = math.max(box_count, i)
     data.fluids_count = box_count
     boxes[i] = fluid and strict("Fluid", { name = fluid.name, amount = fluid.amount, temperature = fluid.temperature or 15 }) or nil
     capacities[i] = capacity or capacities[i]
+  end
+  -- How many fluid storages the entity has now (F.set_fluids_count): a mining drill's box comes and goes with what
+  -- it mines (2.1.24: 1 over uranium ore, kept when the ore runs out or with one uranium tile in an iron drill's
+  -- area; 0 over iron ore alone), so the harness sets it. Storages past the count are emptied.
+  local function set_count(n)
+    box_count = n
+    data.fluids_count = n
+    for k in pairs(boxes) do
+      if k > n then
+        boxes[k] = nil
+      end
+    end
   end
   local connectors = {} -- wire type -> {wire_type, connections, owner}
   data.get_wire_connectors = function(create)
@@ -2274,7 +2663,8 @@ local function make_entity(surface, params)
         local tx, ty = data.position.x + d[1], data.position.y + d[2]
         local target = nil
         for _, other in ipairs(surface.entities) do
-          if other.valid and other.type == "pipe" and other.position.x == tx and other.position.y == ty then
+          if other.valid and other.position.x == tx and other.position.y == ty and (other.type == "pipe"
+              or (other.type == "pipe-to-ground" and F.faces(other, data.position))) then
             target = other
           end
         end
@@ -2287,10 +2677,47 @@ local function make_entity(surface, params)
       end
       return out
     end
+  elseif t == "pipe-to-ground" then
+    -- (M2) 2.1.24's two: the ordinary one its direction faces (to a pipe there, or a pipe-to-ground facing back),
+    -- and the underground one behind it to the first of its kind on that line within its reach, when that one faces
+    -- back (measured: an "underground" connection whose target is the other end).
+    data.get_fluid_box_pipe_connections = function(i)
+      assert(i == 1, "get_fluid_box_pipe_connections: a pipe-to-ground has one fluid box")
+      local v = F.dir_vector(data.direction)
+      local p = data.position
+      local tx, ty = p.x + v[1], p.y + v[2]
+      local near = nil
+      for _, other in ipairs(surface.entities) do
+        if other.valid and other.position.x == tx and other.position.y == ty and (other.type == "pipe"
+            or (other.type == "pipe-to-ground" and F.faces(other, p))) then
+          near = other
+        end
+      end
+      local far = nil
+      for k = 1, 10 do
+        local ux, uy = p.x - v[1] * k, p.y - v[2] * k
+        local hit = nil
+        for _, other in ipairs(surface.entities) do
+          if other.valid and other.name == data.name and other.position.x == ux and other.position.y == uy then
+            hit = other
+          end
+        end
+        if hit then
+          far = hit.direction == (data.direction + 8) % 16 and hit or nil
+          break
+        end
+      end
+      return {
+        { connection_type = "normal", flow_direction = "input-output", position = { x = p.x + v[1] * 0.5, y = p.y + v[2] * 0.5 },
+          target_position = { x = tx, y = ty }, target = near },
+        { connection_type = "underground", flow_direction = "input-output", position = { x = p.x, y = p.y },
+          target_position = { x = p.x - v[1], y = p.y - v[2] }, target = far },
+      }
+    end
   elseif t == "logistic-container" or t == "roboport" then
     data.logistic_network = F.network
     if t == "roboport" then
-      -- Its logistic cell: neighbours are the roboports whose logistic squares meet its own.
+      -- Its logistic cell (H14): neighbours are the roboports whose logistic squares meet its own.
       local r = proto.logistic_radius or 25
       data.logistic_cell = setmetatable({ valid = true, object_name = "LuaLogisticCell", logistic_radius = r,
         construction_radius = proto.construction_radius or 55, logistics_connection_distance = r }, {
@@ -2675,7 +3102,26 @@ local function make_entity(surface, params)
   if t == "ammo-turret" then
     invs.turret_ammo = make_inventory(1)
   elseif t == "car" or t == "spider-vehicle" or t == "artillery-turret" or t == "artillery-wagon" then
-    invs.vehicle_ammo = make_inventory(t == "artillery-turret" and 1 or 3)
+    invs.vehicle_ammo = make_inventory((t == "artillery-turret" and 1) or (t == "spider-vehicle" and 4) or 3)
+  end
+  -- A car's trunk and a spidertron's (F.trunk_size slots, the harness fills them), and a burner
+  -- vehicle's fuel slot: its burner's inventory.
+  if t == "car" or t == "spider-vehicle" then
+    invs.trunk = make_inventory(F.trunk_size or 20)
+  end
+  if (t == "car" or t == "locomotive") and data.burner then
+    invs.fuel = data.burner.inventory
+  end
+  if proto.name == "boiler" then
+    invs.fuel, invs.burnt = make_inventory(1), make_inventory(0)
+  end
+  -- Each inventory's index, as get_inventory finds it (2.1.24's numbers): get_inventory(i).index == i.
+  for i, role in pairs(INVENTORY_ROLES[t] or INVENTORY_ROLES.default) do
+    for _, r in ipairs(type(role) == "table" and role or { role }) do
+      if invs[r] and rawget(invs[r], "index") == nil then
+        rawset(invs[r], "index", i)
+      end
+    end
   end
   -- Where turrets point (the weapon's orientation; a vehicle's turret relative to its body), as
   -- turrets.lua reads them; the harness turns them.
@@ -2753,6 +3199,7 @@ local function make_entity(surface, params)
     data.get_control_behavior = function() return behavior end
   end
   F.fluid_setters[e] = set_fluid
+  F.fluid_counters[e] = set_count
   -- By connector id: the fake keeps one connector per wire type (no combinator output side).
   data.get_wire_connector = function(id, create)
     assert(type(id) == "number" and type(create) == "boolean", "get_wire_connector(id, or_create)")
@@ -2772,39 +3219,33 @@ local function make_entity(surface, params)
     rawset(c, "owner", e)
     return c
   end
+  -- By 2.1.24's numbers (read live), which each entity type reads its own way: inventory 1 is a chest's, a
+  -- burner's fuel, a wagon's cargo, a turret's ammo, the hub's main...
+  local roles = INVENTORY_ROLES[t] or INVENTORY_ROLES.default
   data.get_inventory = function(i)
-    local by_define = { [14] = "chest", [15] = "trash", [16] = "chest", [17] = "trash", [18] = "rocket", [19] = "trash" }
-    if by_define[i] then
-      local here = (t == "space-platform-hub" and i <= 15) or (t == "cargo-landing-pad" and (i == 16 or i == 17))
-        or (t == "rocket-silo" and i >= 18)
-      return here and invs[by_define[i]] or nil
+    local role = roles[i]
+    if type(role) == "table" then
+      for _, r in ipairs(role) do
+        if invs[r] then
+          return invs[r]
+        end
+      end
+      return nil
     end
-    if i == defines.inventory.turret_ammo then
-      return invs.turret_ammo
-    elseif (i == defines.inventory.car_ammo and t == "car") or (i == defines.inventory.spider_ammo and t == "spider-vehicle")
-      or (i == defines.inventory.artillery_turret_ammo and t == "artillery-turret")
-      or (i == defines.inventory.artillery_wagon_ammo and t == "artillery-wagon") then
-      return invs.vehicle_ammo
-    elseif i == 1 then
-      return invs.chest
-    elseif i == 2 then
-      return invs.input
-    elseif i == 5 then
-      return invs.cargo
-    elseif i == 6 then
-      return invs.trash
-    elseif i == 7 then
-      return invs.robots
-    elseif i == 8 then
-      return invs.repair
-    elseif i == 9 then
-      return invs.robot_cargo
-    end
-    return nil
+    return role and invs[role] or nil
   end
-  data.get_output_inventory = function() return invs.output end
+  -- As 2.1.24 answers (read live): a locomotive's output inventory is its fuel slot, a boiler's its burnt
+  -- result inventory of no slots, a car's its trunk.
+  data.get_output_inventory = function()
+    if t == "locomotive" then
+      return invs.fuel
+    elseif t == "car" then
+      return invs.trunk
+    end
+    return invs.output or invs.burnt
+  end
   data.get_fuel_inventory = function() return invs.fuel end
-  data.get_burnt_result_inventory = function() return nil end
+  data.get_burnt_result_inventory = function() return invs.burnt end
   data.get_module_inventory = function() return invs.modules end
 
   local recipe = nil
@@ -2819,6 +3260,30 @@ local function make_entity(surface, params)
         return 0
       end
       return target.insert(stack)
+    end
+    data.can_insert = function(stack) return true end
+  elseif t == "car" or t == "spider-vehicle" or t == "locomotive" or t == "cargo-wagon" then
+    -- As the game's LuaEntity.insert on a vehicle: fuel into the fuel slot, ammo into the ammo
+    -- slots, what doesn't fit there (and anything else) into the trunk; a locomotive takes only
+    -- fuel, a wagon everything into its cargo.
+    local FUEL = { coal = true, wood = true }
+    data.insert = function(stack)
+      local count = stack.count or 1
+      local done = 0
+      local function into(inv)
+        if inv and done < count then
+          done = done + inv.insert({ name = stack.name, count = count - done, quality = stack.quality })
+        end
+      end
+      if FUEL[stack.name] then
+        into(invs.fuel)
+      elseif stack.name == "firearm-magazine" then
+        into(invs.vehicle_ammo)
+      end
+      if t ~= "locomotive" then
+        into(invs.trunk or invs.cargo)
+      end
+      return done
     end
     data.can_insert = function(stack) return true end
   end
@@ -2842,7 +3307,7 @@ local function make_entity(surface, params)
     -- Module and beacon effects (2.x: plain numbers); the harness sets F.effects.
     data.effects = F.effects or {}
   end
-  -- Beacons and what they reach: within 5 tiles here; the game uses the beacon's supply area.
+  -- Beacons and what they reach (G12): within 5 tiles here; the game uses the beacon's supply area.
   local function near(types)
     local p = data.position
     return data.surface.find_entities_filtered({ area = { { p.x - 5, p.y - 5 }, { p.x + 5, p.y + 5 } }, type = types })
@@ -3024,8 +3489,21 @@ local function make_entity(surface, params)
     data.can_insert = function(stack) return F.inventory_space > 0 end
     -- (F's pick-up hands back what a lane wouldn't give up.)
     data.remove_item = function(stack)
-      local n = inventory.remove({ name = stack.name, count = stack.count or 1, quality = stack.quality })
+      local want = stack.count or 1
+      local n = inventory.remove({ name = stack.name, count = want, quality = stack.quality })
       F.inventory_space = F.inventory_space + n
+      -- As LuaControl.remove_item: from all the character's inventories (freeplay's kit's pistol, L13).
+      for _, slots in ipairs({ gun_slots, ammo_slots }) do
+        for _, slot in ipairs(slots) do
+          if n < want and slot.name == stack.name then
+            local take = math.min(want - n, slot.count or 0)
+            slot.count, n = (slot.count or 0) - take, n + take
+            if slot.count <= 0 then
+              slot.name, slot.count, slot.ammo = nil, nil, nil
+            end
+          end
+        end
+      end
       return n
     end
     -- Reach is measured to the target's selection box, like the game.
@@ -3048,9 +3526,10 @@ local function make_entity(surface, params)
       data.surface.tiles[tile.position.x .. "," .. tile.position.y] = nil
       return true
     end
-    -- Without `force` it fails when the products don't fit.
+    -- Without `force` it fails when the products don't fit; with it (true: leave it out otherwise) what doesn't
+    -- fit is spilled (M2, as 2.1.24 spills it). A belt's items come with it (measured in 2.1.24).
     data.mine_entity = function(target, force)
-      assert(force == nil, "mine_entity: leave out force")
+      assert(force == nil or force == true, "mine_entity: leave out force, or pass true")
       local products = {}
       if target.type == "item-entity" then
         products[1] = { name = target.stack.name, amount = target.stack.count }
@@ -3058,13 +3537,24 @@ local function make_entity(surface, params)
         for _, product in pairs(target.prototype.mineable_properties.products) do
           products[#products + 1] = { name = product.name, amount = product.amount }
         end
+        for _, it in ipairs(F.belt_items_of(target)) do
+          products[#products + 1] = { name = it.name, amount = it.count }
+        end
       end
+      local spill = {}
       for _, product in pairs(products) do
         if F.inventory_space < product.amount then
-          return false
+          if not force then
+            return false
+          end
+          spill[#spill + 1] = { name = product.name, count = product.amount }
+        else
+          F.inventory_space = F.inventory_space - product.amount
+          inventory.insert({ name = product.name, count = product.amount })
         end
-        F.inventory_space = F.inventory_space - product.amount
-        inventory.insert({ name = product.name, count = product.amount })
+      end
+      for _, stack in ipairs(spill) do
+        F.spilled[#F.spilled + 1] = stack
       end
       target.destroy()
       return true
@@ -3193,6 +3683,7 @@ local function make_surface(index, name, default_tile)
     ticks_per_day = 25000, always_day = false, freeze_daytime = false, min_brightness = 0.15, solar_power_multiplier = 1,
     dusk = 0.25, evening = 0.45, morning = 0.55, dawn = 0.75,
     map_gen_settings = { seed = 123456789 }, -- /seed (console.lua)
+    peaceful_mode = false, no_enemies_mode = false,
   }
   -- Surface properties (F.surface_props on the harness side); Nauvis's by default.
   surface.props = { gravity = 10, pressure = 1000, ["magnetic-field"] = 90, ["solar-power"] = 100, ["day-night-cycle"] = 25000 }
@@ -3423,6 +3914,29 @@ local function make_surface(index, name, default_tile)
     end
     return out
   end
+  -- LuaSurface.find_units: units in an area of a force, or of the forces in `condition` to it (only "enemy",
+  -- here any other force but neutral). F.finds.find_units counts the calls.
+  surface.find_units = function(f)
+    assert(f.area and f.force and f.condition, "find_units takes {area, force, condition}")
+    assert(f.condition == "enemy" or f.condition == "same", "find_units: only the enemy and same conditions are faked")
+    if F.finds then
+      F.finds.find_units = (F.finds.find_units or 0) + 1
+    end
+    local want = type(f.force) == "string" and f.force or f.force.name
+    local a1, a2 = f.area[1] or f.area.left_top, f.area[2] or f.area.right_bottom
+    local out = {}
+    for _, e in ipairs(surface.entities) do
+      local p = e.position
+      local name = e.force.name
+      local match = e.type == "unit" and p.x >= (a1.x or a1[1]) and p.x <= (a2.x or a2[1])
+        and p.y >= (a1.y or a1[2]) and p.y <= (a2.y or a2[2])
+        and (f.condition == "same" and name == want or f.condition == "enemy" and name ~= want and name ~= "neutral")
+      if match then
+        out[#out + 1] = e
+      end
+    end
+    return out
+  end
   surface.can_place_entity = function(p)
     assert(p.build_check_type ~= nil, "expected a build_check_type")
     local x, y = p.position.x or p.position[1], p.position.y or p.position[2]
@@ -3443,6 +3957,27 @@ local function make_surface(index, name, default_tile)
       if surface.count_tiles_filtered({ area = { { x - w / 2 + 0.1, y - h / 2 + 0.1 }, { x + w / 2 - 0.1, y + h / 2 - 0.1 } },
           collision_mask = mask.layers, limit = 1 }) > 0 then
         return false
+      end
+    end
+    -- 2.1.24, measured: a drill with a fluid input (a box that isn't an output) whose mining area holds a resource it mines
+    -- that needs fluid is refused by the manual check until the force can mine with fluid, even with other ore beside it.
+    local proto = entity_protos[p.name]
+    if manual and proto.type == "mining-drill" and proto.mining_drill_radius then
+      local wet = false
+      for _, b in ipairs(proto.fluidbox_prototypes or {}) do
+        wet = wet or b.production_type ~= "output"
+      end
+      local force = type(p.force) == "string" and forces[p.force] or p.force
+      if wet and force and not force.mining_with_fluid then
+        local r = proto.mining_drill_radius
+        for _, e in ipairs(surface.entities) do
+          local rp = entity_protos[e.name]
+          if e.type == "resource" and rp and rp.mineable_properties.required_fluid
+              and (proto.resource_categories or {})[rp.resource_category]
+              and math.abs(e.position.x - x) <= r and math.abs(e.position.y - y) <= r then
+            return false
+          end
+        end
       end
     end
     -- 2.1 answers true where the entity could fast-replace what stands there.
@@ -3489,10 +4024,22 @@ local function make_surface(index, name, default_tile)
   end
   surface.create_entity = function(p)
     if p.fast_replace then
-      assert(p.spill == false, "fast_replace without a player: pass spill = false")
+      -- Without a player or character: spill = false deletes what the old entity held. With `character`
+      -- (M2), its products and the items on it go to that character, as 2.1.24's (measured).
+      assert(p.spill == false or (p.character and p.spill == nil),
+        "fast_replace without a player: pass spill = false, or the character to give the items to")
       local olds = replaceable(p)
       assert(olds, "create_entity: nothing to fast-replace")
       for _, old in ipairs(olds) do
+        if p.character then
+          local inv = p.character.get_main_inventory()
+          for _, product in pairs(old.prototype.mineable_properties.products or {}) do
+            inv.insert({ name = product.name, count = product.amount })
+          end
+          for _, it in ipairs(F.belt_items_of(old)) do
+            inv.insert({ name = it.name, count = it.count })
+          end
+        end
         old.destroy()
       end
     elseif p.name ~= "entity-ghost" and replaceable(p) then
@@ -3500,6 +4047,9 @@ local function make_surface(index, name, default_tile)
       return nil
     end
     local e = make_entity(surface, p)
+    if e.type == "underground-belt" then
+      F.pair_as_built(surface, e)
+    end
     if p.raise_built then
       raise("script_raised_built", { entity = e })
     end
@@ -4084,7 +4634,12 @@ helpers = strict("LuaHelpers", {
     else
       assert(who == nil, "send_udp: single-player must not pass for_player")
     end
-    F.sent[#F.sent + 1] = { port, data }
+    -- A binary datagram (transport.lua's frames) can't be handed to Python as text: as hex, flagged.
+    if data:byte(1) == 0xF3 then
+      F.sent[#F.sent + 1] = { port, (data:gsub(".", function(c) return string.format("%02x", c:byte()) end)), true }
+    else
+      F.sent[#F.sent + 1] = { port, data }
+    end
   end,
   recv_udp = function(who) end,
 })
@@ -4174,6 +4729,52 @@ function F.pair_undergrounds(a, b)
   b.underground_belt_neighbour = a
 end
 
+-- The unit step of a 4-way direction (north is y - 1).
+function F.dir_vector(d)
+  return ({ [0] = { 0, -1 }, [4] = { 1, 0 }, [8] = { 0, 1 }, [12] = { -1, 0 } })[d % 16] or { 0, 0 }
+end
+
+-- Whether `e` (a pipe-to-ground) has its pipe connection on the tile at `p`.
+function F.faces(e, p)
+  local v = F.dir_vector(e.direction)
+  return e.position.x + v[1] == p.x and e.position.y + v[2] == p.y
+end
+
+-- The items on a belt's lines as {name, count} (what mining or a character's fast-replace hands over).
+function F.belt_items_of(e)
+  local out = {}
+  for _, items in pairs(belt_lines[e] or {}) do
+    for _, it in ipairs(items) do
+      out[#out + 1] = { name = it.name, count = it.count or 1 }
+    end
+  end
+  return out
+end
+
+-- (M2) An underground belt a script builds pairs as the game pairs it: an exit with the nearest of its kind
+-- behind it facing its way, an entrance with the nearest ahead, when that one is the other type (another of the
+-- same type there cuts it off). Spawned ones are paired by the harness (F.pair_undergrounds).
+function F.pair_as_built(surface, e)
+  local v = F.dir_vector(e.direction)
+  local sign = e.belt_to_ground_type == "output" and -1 or 1
+  for k = 1, e.prototype.max_underground_distance or 5 do
+    local x, y = e.position.x + v[1] * k * sign, e.position.y + v[2] * k * sign
+    for _, other in ipairs(surface.entities) do
+      if other.valid and other ~= e and other.name == e.name and other.direction == e.direction
+          and other.position.x == x and other.position.y == y then
+        if other.belt_to_ground_type ~= e.belt_to_ground_type then
+          local old = other.underground_belt_neighbour
+          if old and old.valid then
+            old.underground_belt_neighbour = nil
+          end
+          F.pair_undergrounds(e, other)
+        end
+        return
+      end
+    end
+  end
+end
+
 -- Belt a feeds belt b (their belt_neighbours, as the harness sets them).
 F.belt_links = setmetatable({}, { __mode = "k" })
 function F.link_belts(a, b)
@@ -4201,6 +4802,11 @@ end
 -- Puts fluid in an entity's box i ({name, amount, temperature}, or nil to empty it).
 function F.set_fluid(entity, i, fluid, capacity)
   F.fluid_setters[entity](i, fluid, capacity)
+end
+
+-- Sets how many fluid storages an entity has now (a mining drill's box, which the game adds and takes away).
+function F.set_fluids_count(entity, n)
+  F.fluid_counters[entity](n)
 end
 
 -- Connects two entities with a wire (defines.wire_type), both ways, as 2.x connectors do.
@@ -4316,13 +4922,16 @@ function F.make_player(character)
       return true
     end,
     mine_entity = function(target, force)
-      assert(force == nil, "mine_entity: leave out force")
+      assert(force == nil or force == true, "mine_entity: leave out force, or pass true")
       if not (target and target.valid) then
         return false
       end
       F.player_events[#F.player_events + 1] = "on_player_mined_entity"
       raise("on_pre_player_mined_item", { entity = target, player_index = 1 })
       raise("on_player_mined_entity", { entity = target, player_index = 1, buffer = nil })
+      if force then
+        return character.mine_entity(target, true)
+      end
       return character.mine_entity(target)
     end,
   }
@@ -4448,8 +5057,26 @@ function F.make_offline_player(index, name, x, y)
   end
   d.get_active_quick_bar_page = function(i) return active[i] end
   d.set_active_quick_bar_page = function(i, page) active[i] = page end
+  local player
+  -- LuaPlayer::set_controller: only the character controller (L13: a player takes the bridge's character);
+  -- the character they had stays in the world, controlled by nobody.
+  d.set_controller = function(p)
+    assert(type(p) == "table" and p.type == defines.controllers.character, "set_controller{type = character, character = ...}")
+    assert(d.connected, "set_controller: the fake only hands characters to connected players")
+    local c = p.character
+    assert(c and c.valid and c.type == "character", "set_controller: character must be a valid character")
+    if F.refuse_set_controller then
+      error("set_controller refused (the harness)")
+    end
+    if d.character and d.character.valid then
+      d.character.player = nil
+    end
+    d.character = c
+    c.player = player
+    d.controller_type = defines.controllers.character
+  end
   local optional = { character = true, crafting_queue = true }
-  local player = setmetatable({}, {
+  player = setmetatable({}, {
     __index = function(_, k)
       local v = d[k]
       if v == nil and not optional[k] then
@@ -4477,6 +5104,96 @@ function F.connect_player(player, character)
   d.character = character
   character.player = player
   raise("on_player_joined_game", { player_index = d.index })
+end
+
+-- Base's freeplay scenario (2.1.24's base/script/freeplay/freeplay.lua): its remote interface and
+-- storage. F.create_player plays its on_player_created: the starting kit, and for the first player
+-- the starting area charted and, unless disabled, the crash site (F.freeplay.crash_sites counts them).
+function F.add_freeplay()
+  local fp = {
+    created_items = { ["iron-plate"] = 8, wood = 1, pistol = 1, ["firearm-magazine"] = 10,
+      ["burner-mining-drill"] = 1, ["stone-furnace"] = 1 },
+    init_ran = nil, disable_crashsite = nil, skip_intro = nil, crash_sites = 0, intros = 0,
+  }
+  F.freeplay = fp
+  remote.add_interface("freeplay", {
+    get_created_items = function() return fp.created_items end,
+    set_created_items = function(map) fp.created_items = map or error("can't be nil") end,
+    get_init_ran = function() return fp.init_ran end,
+    get_disable_crashsite = function() return fp.disable_crashsite end,
+    set_disable_crashsite = function(b) fp.disable_crashsite = b end,
+    get_skip_intro = function() return fp.skip_intro end,
+    set_skip_intro = function(b) fp.skip_intro = b end,
+  })
+end
+
+-- A new player joins the server from Factorio (a peer's first join): created with a character at
+-- (x, y), freeplay's on_player_created first (when F.add_freeplay was called; the scenario's
+-- handler and the mod's run in an order the bridge mustn't depend on), then on_player_created and
+-- on_player_joined_game for the mod.
+function F.create_player(index, name, x, y)
+  local player = F.make_offline_player(index, name, x, y)
+  local d = F.player_data[player]
+  local c = F.spawn("character", x, y, { force = "player" })
+  d.connected = true
+  d.character = c
+  c.player = player
+  local fp = F.freeplay
+  if fp then
+    for item, count in pairs(fp.created_items) do
+      c.insert({ name = item, count = count })
+    end
+    if not fp.init_ran then
+      fp.init_ran = true
+      if not fp.disable_crashsite then
+        fp.crash_sites = fp.crash_sites + 1 -- the ship, its fires, the cutscene
+      end
+    end
+    if not fp.skip_intro then
+      fp.intros = fp.intros + 1
+    end
+  end
+  raise("on_player_created", { player_index = index })
+  raise("on_player_joined_game", { player_index = index })
+  return player, c
+end
+
+-- The player leaves: their character is logged off (2.x), out of the world, and its things stay with
+-- the LuaPlayer (moved into the offline player's own inventories here). keep_entity: the logged-off
+-- character's LuaEntity stays valid (what 2.1 does with it isn't documented), else it is gone.
+function F.disconnect_player(player, keep_entity)
+  local d = F.player_data[player]
+  local c = d.character
+  if c and c.valid then
+    d.physical_position = { x = c.position.x, y = c.position.y }
+    d.physical_surface = c.surface
+    for _, id in ipairs({ defines.inventory.character_main, defines.inventory.character_guns,
+        defines.inventory.character_ammo, defines.inventory.character_armor, defines.inventory.character_trash }) do
+      local from, to = c.get_inventory(id), d.get_inventory(id)
+      for i = 1, #from do
+        local stack = from[i]
+        if stack.valid_for_read then
+          to.insert({ name = stack.name, count = stack.count })
+          pcall(function() stack.clear() end)
+        end
+      end
+    end
+    if F.slots[c] then
+      for _, slots in pairs(F.slots[c]) do
+        for _, slot in ipairs(slots) do
+          slot.name, slot.count, slot.ammo = nil, nil, nil
+        end
+      end
+    end
+    c.player = nil
+    if not keep_entity then
+      c.destroy()
+    end
+  end
+  d.connected = false
+  d.character = nil
+  raise("on_player_left_game", { player_index = d.index })
+  return c
 end
 
 -- A LuaEquipmentGrid of w x h cells (the harness gives it to a character or car as `grid`).

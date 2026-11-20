@@ -73,6 +73,22 @@ SPECS["small-electric-pole"]["centre"] = 0.3
 # Wube's assembler is a dense model: its gears and pipes need more than the usual machine budget.
 SPECS["assembling-machine-1"]["budget"] = 16000
 
+# Belts of every tier (FUE5's, fue5.py): the faster tiers' curves, and every tier's line-end
+# pieces, which lie just past the tile's west (-start) or east (-end) edge, the belt running east
+# (model_library.gd BELT_END_FACING): a sliver of the tile's length, its middle off the centre.
+for _tier in ("", "fast-", "express-", "turbo-"):
+    _belt = _tier + "transport-belt"
+    SPECS.setdefault(_belt, {"size": (1, 1), "budget": LOGISTICS})
+    for _sfx in ("-curve-left", "-curve-right"):
+        SPECS.setdefault(_belt + _sfx, {"size": (1, 1), "budget": LOGISTICS, "base": _belt})
+    for _sfx in ("-start", "-end"):
+        SPECS[_belt + _sfx] = {"size": (1, 1), "budget": LOGISTICS, "base": _belt, "fill": (0.02, 0.6),
+                               "overhang": 0.3, "centre": 0.65}
+    # Undergrounds of every tier (FUE5's): the entrance and exit, as the yellow tier's.
+    for _sfx in ("-input", "-output"):
+        SPECS.setdefault(_tier + "underground-belt" + _sfx, {"size": (1, 1), "budget": LOGISTICS,
+                                                             "base": _tier + "underground-belt"})
+
 # Default fill and how far a model may stray from its footprint (tiles).
 DEFAULT_FILL = (0.6, 0.6)
 OVERHANG = 0.03
@@ -87,7 +103,8 @@ SPECS["pipe"] = {"size": (1, 1), "budget": LOGISTICS, "fill": (0.4, 0.9), "overh
 # The pipe kit: one model per Factorio pipe picture, picked from the pipe's neighbours (fluids.py).
 for _shape in ("straight-vertical-single", "straight-vertical", "straight-horizontal", "corner-up-right",
                "corner-up-left", "corner-down-right", "corner-down-left", "t-up", "t-down", "t-left", "t-right",
-               "cross", "ending-up", "ending-down", "ending-left", "ending-right"):
+               "cross", "ending-up", "ending-down", "ending-left", "ending-right",
+               "straight-vertical-window", "straight-horizontal-window"):  # Factorio's window pictures
     # North flanges straddle the tile edge, as Factorio draws them (fluids.py).
     SPECS["pipe-" + _shape] = {"size": (1, 1), "budget": LOGISTICS, "fill": (0.4, 0.4), "base": "pipe", "overhang": 0.15}
 # Its ground flange sits north of the middle in the north picture (fluids.py PTG_FACINGS).
@@ -112,6 +129,11 @@ for _name in ("locomotive", "cargo-wagon", "fluid-wagon", "infinity-cargo-wagon"
 # Wube's printable drill is an open frame of many small parts (rails, racks, arms, hoses): at
 # 10k triangles the decimation melts them, so it gets twice the machine budget.
 SPECS["electric-mining-drill"]["budget"] = 20000
+# Its output chute reaches past the north edge, over the belt it drops onto, as Factorio's sprite's
+# does (0.26 in Vasillo's), and its drill bit goes into the ground (0.23).
+SPECS["electric-mining-drill"].update(overhang=0.3, sink=0.25)
+# The fluid part drawn over it while it mines with a fluid (Factorio's wet mining graphics).
+SPECS["electric-mining-drill-wet"] = dict(SPECS["electric-mining-drill"], base="electric-mining-drill")
 # The burner drill's legs reach past the corners of its 2x2 box, as its sprite's do.
 SPECS["burner-mining-drill"]["overhang"] = 0.5
 for _sfx in ("-east", "-south", "-west"):  # its other directions (machines.py DRILL_FACINGS)
@@ -158,7 +180,8 @@ SPECS["pump"] = {"size": (1, 2), "budget": MACHINE}
 # 4x4 box, as in the sprite; robots fly, so their "footprint" is just their size.
 SPECS["roboport"] = {"size": (4, 4), "budget": MACHINE, "overhang": 0.3}
 SPECS["logistic-robot"] = {"size": (0.8, 0.8), "budget": LOGISTICS * 2, "overhang": 0.2, "centre": 0.3}
-SPECS["construction-robot"] = {"size": (0.6, 0.6), "budget": LOGISTICS * 2, "overhang": 0.2, "centre": 0.3}
+# Its claws reach past its body: FUE5's, at the sprite's size, is 0.85 tiles across.
+SPECS["construction-robot"] = {"size": (0.6, 0.6), "budget": LOGISTICS * 2, "overhang": 0.3, "centre": 0.3}
 SPECS["electric-furnace"] = {"size": (3, 3), "budget": MACHINE}
 SPECS["beacon"] = {"size": (3, 3), "budget": MACHINE}
 SPECS["assembling-machine-2"] = {"size": (3, 3), "budget": MACHINE}
@@ -245,8 +268,10 @@ for _shape in ("es", "nes", "esw", "nesw"):
     SPECS["stone-wall-%s-fill" % _shape] = {"size": (1, 1), "budget": LOGISTICS, "base": "stone-wall", "fill": (0.3, 0.3),
                                             "overhang": 0.4, "centre": 0.3}
 
-# The splitter is two belt tiles under a gearbox.
+# The splitter is two belt tiles under a gearbox; FUE5's has a model per tier (fue5.py).
 SPECS["splitter"]["budget"] = LOGISTICS * 2
+for _tier in ("fast-", "express-", "turbo-"):
+    SPECS.setdefault(_tier + "splitter", dict(SPECS["splitter"], base="splitter"))
 
 
 # Creatures, converted from Wube's printable models and rigged (wube_recipes.py, wube_rig.py), posed
@@ -315,7 +340,8 @@ SPECS["centrifuge"] = {"size": (3, 3), "budget": MACHINE, "overhang": 0.15}
 SPECS["heat-pipe"] = {"size": (1, 1), "budget": LOGISTICS, "fill": (0.3, 0.9)}
 for _shape in ("straight-vertical-single", "straight-vertical", "straight-horizontal", "corner-up-right",
                "corner-up-left", "corner-down-right", "corner-down-left", "t-up", "t-down", "t-left", "t-right",
-               "cross", "ending-up", "ending-down", "ending-left", "ending-right"):
+               "cross", "ending-up", "ending-down", "ending-left", "ending-right",
+               "straight-vertical-window", "straight-horizontal-window"):  # Factorio's window pictures
     SPECS["heat-pipe-" + _shape] = {"size": (1, 1), "budget": LOGISTICS, "fill": (0.25, 0.25), "base": "heat-pipe",
                                     "centre": 0.3}
 # The drum in its south-east hole (anim_lift_silo) reaches down into the deck, out of sight.
@@ -413,3 +439,11 @@ for _proto, _size in (("legacy-straight-rail", (2.4, 2.1)), ("legacy-curved-rail
 for _name in ("foundry", "biochamber", "agricultural-tower", "heating-tower", "biolab", "captive-biter-spawner",
               "cryogenic-plant", "fusion-reactor", "fusion-generator"):
     SPECS[_name]["budget"] = 14000
+
+# Ores drawn as numbered rocks scattered over the tile (`iron-ore-1` ...): any number per resource.
+ORE_VARIANTS = ("iron-ore", "copper-ore", "coal", "stone", "uranium-ore")
+
+# Items (a pack's items/ folder): small, centred, on the ground. Thousands are in view on a bus.
+ITEM_SIZE = 1.0
+ITEM_CENTRE = 0.05
+ITEM_BUDGET = 500

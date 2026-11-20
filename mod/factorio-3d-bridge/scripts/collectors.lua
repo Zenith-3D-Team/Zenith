@@ -49,7 +49,7 @@ end
 
 -- Statuses whose arms move: working, or slowed by low power. A full output holds them where
 -- they are; switched off (no power, the circuit network, a script, marked for deconstruction) they
--- fold back home.
+-- fold back home (owner's G10).
 local MOVING = { working = 1, normal = 1, low_power = 1 }
 local FOLDED = { no_power = 1, disabled_by_control_behavior = 1, disabled_by_script = 1, disabled = 1,
   marked_for_deconstruction = 1, frozen = 1 }

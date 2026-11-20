@@ -5,8 +5,8 @@ Factorio's own sprite, to judge shape, size and colour.
     python tools/models/nature/raster.py OUT.png NAME[@REF][:LEAVES] [...] [--zoom 1] [--scale 1]
         [--tilt DEG] [--tint K] [--shadows off] [--grain off]
 
-NAME is a model in client/assets/models (or a path to a .glb). REF picks the sprite: a variation
-letter for tree-01..09 (default a), a picture number for rocks (default 1). LEAVES is how leaf
+NAME is one of our models (tools/models/packs.py), or a path to a .glb. REF picks the sprite: a
+variation letter for tree-01..09 (default a), a picture number for rocks (default 1). LEAVES is how leaf
 cards are cut: `proc` (the shader's procedural leaves, the default) or `atlas` (patches of the
 tree's own leaves sprite, as nature_looks.gd builds them in the client). Each NAME gets a row:
 the sprite, then the model, at 64 px a tile times --zoom. --scale and --tilt draw the model as a
@@ -40,9 +40,10 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, HERE)
+sys.path.append(os.path.dirname(HERE))  # tools/models, after nature/ (both have a score.py)
+import packs  # noqa: E402
 import tree_sprites  # noqa: E402
 
-MODELS = os.path.join(REPO, "client", "assets", "models")
 SIN, COS = math.sin(math.radians(48.0)), math.cos(math.radians(48.0))
 LIGHT = np.array([-0.604, 0.766, 0.22])
 LIGHT = LIGHT / np.linalg.norm(LIGHT)
@@ -400,7 +401,7 @@ def main(argv):
         if re.search(r":(proc|atlas)$", spec):
             spec, leaves = spec.rsplit(":", 1)
         name, _, ref = spec.partition("@")
-        path = name if name.endswith(".glb") else os.path.join(MODELS, name + ".glb")
+        path = name if name.endswith(".glb") else packs.model_path(name)
         model_name = os.path.basename(path)[:-4]
         model = Model(path)
         atlas = Atlas(model_name) if leaves == "atlas" and tree_sprites.tree_type(model_name) else None

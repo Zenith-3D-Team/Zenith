@@ -1,0 +1,8 @@
+{
+	"name": "Placeholders",
+	"author": "Zenith contributors",
+	"licence": "GPL-3.0",
+	"credit": "Zenith · GPL-3.0",
+	"description": "Zenith's own models: every Nauvis and Space Age entity, built by Zenith's model tools from Factorio's own sprites (their shapes, proportions and part colours). The last resort under every other pack: always on, so every entity keeps a model.",
+	"icon": "assembling-machine-2"
+}

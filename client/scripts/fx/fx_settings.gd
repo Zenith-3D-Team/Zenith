@@ -6,10 +6,12 @@ extends RefCounted
 ##
 ##   --volume=0.8 --sfx-volume=1 --music-volume=0.3 --ui-volume=1 --mute
 ##   --max-voices=12 --sfx-log --no-fx (no smoke, dust, flashes or explosions)
+##   --pack-sounds=off (no sounds from model packs: model_packs.gd sounds_on)
 ##
 ## Volumes are linear, 0 to 1. Music is off (0) unless asked for.
 
 const Settings := preload("res://scripts/menu/settings.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
 
 ## Volume key -> [bus, the bus it feeds]. Factorio's categories: walking, environment (machines and
 ## vehicles), weapons, explosions and enemies are parts of the game effects.
@@ -80,6 +82,7 @@ static func _read() -> void:
 		max_voices = clampi(int(Settings.get_value("sound", "max_voices")), 0, 64)
 	if not _overridden.has("fx"):
 		effects_enabled = bool(Settings.get_value("graphics", "effects"))
+	ModelPacks.set_sounds_on(ModelPacks.arg_on("--pack-sounds") and bool(Settings.get_value("sound", "pack_sounds")))
 
 
 static func _on_setting(section: String, key: String) -> void:

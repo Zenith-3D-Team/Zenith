@@ -66,10 +66,11 @@ class Build:
         self.server_dir = folder / "server"
         self.data = self.server_dir / "data"
 
-    def client_cmd(self, args):
+    def client_cmd(self, args, log):
+        # --log-file: the run folder's own log, not the player's user://logs/ (a release's Zenith.exe too)
         if self.exe:
-            return [str(self.exe), "--audio-driver", "Dummy", "--"] + args
-        return [GODOT, "--audio-driver", "Dummy", "--path", str(self.folder / "client"), "--"] + args
+            return [str(self.exe), "--audio-driver", "Dummy", "--log-file", str(log), "--"] + args
+        return [GODOT, "--audio-driver", "Dummy", "--path", str(self.folder / "client"), "--log-file", str(log), "--"] + args
 
 
 def resolve(spec, work, repo):
@@ -148,7 +149,7 @@ def run_once(build, scenario, run_dir, ports):
     args = [f"--factorio-port={ports[0]}", f"--port={ports[3]}", "--gpu-profile", f"--stutter-probe={probe}@{ROUTE[scenario]}"]
     started = time.time()
     with open(run_dir / "client.log", "w", encoding="utf-8", errors="ignore") as out:
-        client = subprocess.Popen(build.client_cmd(args), stdout=out, stderr=subprocess.STDOUT)
+        client = subprocess.Popen(build.client_cmd(args, (run_dir / "godot.log").resolve()), stdout=out, stderr=subprocess.STDOUT)
         time.sleep(TRACE_AT)
         try:
             log("   trace:", rcon.run(TRACE % TRACE_TICKS[scenario], port=ports[2],

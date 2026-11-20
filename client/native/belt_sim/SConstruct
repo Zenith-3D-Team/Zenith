@@ -10,11 +10,21 @@ env = SConscript(os.path.join(godot_cpp, "SConstruct"))
 env.Append(CPPPATH=["src/"])
 if env["platform"] == "windows" and not env.get("use_mingw"):
 	env.Append(CCFLAGS=["/O2", "/Oi", "/GL"], LINKFLAGS=["/LTCG"])
+	# The DLL ships in public downloads, so it must not carry where it was built: godot-cpp's error
+	# macros put __FILE__ into the binary (I:\...\worktrees\...\godot-cpp\src\core\memory.cpp).
+	# /d1trimfile cuts these folders off __FILE__ ("godot-cpp\src\core\memory.cpp" is left). On env
+	# so godot-cpp's own sources get it too (its library is built again once with the flag).
+	native_root = os.path.abspath(os.path.join(Dir("#").abspath, ".."))
+	trim_roots = {native_root, os.path.dirname(os.path.abspath(godot_cpp))}
+	# A folder with a space is quoted on the command line, and a quote after one backslash would be
+	# read as a literal quote: two there, which cl reads as one.
+	env.Append(CCFLAGS=["/d1trimfile:" + r + ("\\\\" if " " in r else "\\") for r in sorted(trim_roots)])
 # (A clone for our own flags: changing env itself would rebuild all of godot-cpp.) Symbols in a .pdb
-# beside the DLL (git-ignored), for crash backtraces.
+# beside the DLL (git-ignored), for crash backtraces. /PDBALTPATH:%_PDB% records the .pdb's file name
+# alone in the DLL, not the full path it was linked at (debuggers look beside the DLL first).
 lib_env = env.Clone()
 if env["platform"] == "windows" and not env.get("use_mingw"):
-	lib_env.Append(CCFLAGS=["/Zi", "/FS"], LINKFLAGS=["/DEBUG", "/OPT:REF", "/OPT:ICF", "/MAP"])
+	lib_env.Append(CCFLAGS=["/Zi", "/FS"], LINKFLAGS=["/DEBUG", "/PDBALTPATH:%_PDB%", "/OPT:REF", "/OPT:ICF", "/MAP"])
 if env["platform"] == "windows":
 	lib_env.Append(LIBS=["ws2_32"])  # UdpSocketNative (udp_socket_native.cpp)
 sources = Glob("src/*.cpp")

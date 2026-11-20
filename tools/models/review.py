@@ -28,11 +28,12 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 
 import specs  # noqa: E402
 import factorio_install  # noqa: E402
+import packs  # noqa: E402
 
 GODOT = os.environ.get("GODOT", os.path.expandvars(
     r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\GodotEngine.GodotEngine_Microsoft.Winget.Source_8wekyb3d8bbwe"
     r"\Godot_v4.7.2-stable_win64.exe"))
-# The review folder is in the main checkout (shared by every worktree).
+# The owner's review folder is in the main checkout (shared by every worktree).
 # A worktree under <main>/.claude/worktrees/<name> finds it three levels up.
 _MAIN = REPO.split(os.sep + ".claude" + os.sep + "worktrees" + os.sep)[0]
 OUT = os.environ.get("F3D_SHOTS", os.path.join(_MAIN, "art-src", "shots"))
@@ -113,7 +114,7 @@ def entity_for(name):
 def aim_for(name):
     """Height (tiles) the side views look at: the area-weighted mean height of the model's surface,
     so an elevated rail's views aim at its deck, not the ground under it; None without a model."""
-    path = os.path.join(REPO, "client", "assets", "models", name + ".glb")
+    path = packs.model_path(name)
     if not os.path.exists(path):
         return None
     import numpy as np
@@ -130,7 +131,7 @@ def aim_for(name):
 
 def box_for(name):
     """What to frame: the model's own extent (from its .glb), centred on its position."""
-    path = os.path.join(REPO, "client", "assets", "models", name + ".glb")
+    path = packs.model_path(name)
     if os.path.exists(path):
         import trimesh
         lo, hi = trimesh.load(path, force="scene").bounds
@@ -234,7 +235,8 @@ def shoot(name, args):
         aim = aim_for(name)
         if fly:
             aim = fly + (aim if aim is not None else 0.3)
-        cmd = [GODOT, "--audio-driver", "Dummy", "--path", os.path.join(REPO, "client"), "--resolution", args.size, "--",
+        cmd = [GODOT, "--audio-driver", "Dummy", "--path", os.path.join(REPO, "client"), "--resolution", args.size,
+               "--log-file", os.path.abspath(os.path.join(out, "godot.log")), "--",
                "--factorio-port=%d" % args.port, "--port=%d" % (args.port + 1), "--borderless", "--clean-shot",
                "--review-shots=%s@%g" % (out, args.wait), "--review-box=%g,%g,%g" % (w, d, h),
                "--review-views=" + ",".join(views)] + (["--review-aim=%g" % aim] if aim is not None else []) + args.client_arg

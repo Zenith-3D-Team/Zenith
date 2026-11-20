@@ -9,7 +9,8 @@ local M = {}
 
 local RANGE_SLACK = 0.5
 
--- {item, x, y (fixed target)}: throws one of the item at the target if it is in range.
+-- {item, x, y (fixed target), hs? (the main inventory slot the client's hand holds it from, L7)}: throws one
+-- of the item at the target if it is in range.
 function M.throw(cmd)
   local c = puppet.get()
   if not c then
@@ -36,7 +37,10 @@ function M.throw(cmd)
     end
   end
   local inventory = c.get_main_inventory()
-  local stack = inventory and inventory.find_item_stack(item_name)
+  -- The stack the client's hand holds, in its own quality (`throw` carries none), as Factorio throws
+  -- from the cursor (L7); else the first of the item.
+  local stack = puppet.held_stack(inventory, cmd.hs, item_name, puppet.held_quality(inventory, cmd.hs, item_name))
+  stack = stack or (inventory and inventory.find_item_stack(item_name))
   if not stack then
     return puppet.message("You have no " .. item_name)
   end

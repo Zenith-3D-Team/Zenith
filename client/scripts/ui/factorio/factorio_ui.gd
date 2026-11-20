@@ -75,9 +75,12 @@ const ChatWindow := preload("res://scripts/ui/factorio/chat_window.gd")
 const StatsWindow := preload("res://scripts/ui/factorio/stats_window.gd")
 const ShortcutBar := preload("res://scripts/ui/factorio/shortcut_bar.gd")
 const Alerts := preload("res://scripts/ui/factorio/alerts.gd")
+const NightVisionIcon := preload("res://scripts/ui/factorio/night_vision_icon.gd")
+const PerfWarning := preload("res://scripts/ui/factorio/perf_warning.gd")
 const TrainsWindow := preload("res://scripts/ui/factorio/trains_window.gd")
 const DeathScreen := preload("res://scripts/ui/factorio/death_screen.gd")
 const PlayersWindow := preload("res://scripts/ui/factorio/players_window.gd")
+const ModelChooser := preload("res://scripts/ui/factorio/model_chooser.gd")
 const ModGui := preload("res://scripts/ui/factorio/mod_gui.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
@@ -156,10 +159,18 @@ var alerts: Alerts
 ## Factorio's respawn screen while the character is dead, and the players list.
 var death_screen: DeathScreen
 var players_window: PlayersWindow
+var model_chooser: ModelChooser
 var mod_gui: ModGui
 ## The top-left Factorio button (Ctrl+F9) and what it does (front_end.gd sets it in a game).
 var factorio_button: Button
+## The performance warning right of it (perf_warning.gd), in its place while it is hidden.
+var perf_warning: PerfWarning
+## The night vision equipment's icon over the shortcut bar, while night vision is on (night_vision_icon.gd).
+var night_icon: NightVisionIcon
 var show_factorio := Callable()
+## The Model packs window on a pack with a family shown (pack id, family): front_end.gd's
+## open_model_packs, set once the game runs; the entity info's pack symbol asks it (N8).
+var show_model_packs := Callable()
 var pedia: Factoriopedia
 var networks: NetworksWindow
 ## The remote view was started by the logistic networks window (it ends when that closes).
@@ -193,7 +204,7 @@ var _remote_anchor: Node3D = null
 var _map_factorio_view := false  # the remote view switched to Factorio's angle when the map zoomed in
 ## The mover remote view follows (remote_follow), 0 none.
 var _remote_follow := 0
-## Inside a space platform's hub: the character sits in it and the platform is seen and
+## Inside a space platform's hub (#17): the character sits in it and the platform is seen and
 ## worked from the remote view round it, as Factorio does; leaving the remote view comes back to
 ## the hub, not the character. INF when not in a hub.
 var hub_at := Vector2.INF
@@ -220,6 +231,16 @@ var platform_panel: Control = null
 ## free slot of the inventory at once and held from there (I7), as Factorio's cursor owns what it
 ## holds: until the inventory shows it there the hand has "await" (when) and "count".
 var hand := {}
+
+## L7's leftover: an item picked from the quickbar was held with no stack in particular, and the
+## count at the cursor was all of it in the inventory. Factorio's cursor holds one stack, at most a
+## stack size (its changelog: the hand icon on the slot it was taken from; "the cursor was
+## auto-refilled when entity building"): the quickbar now takes a stack as the pipette does (the
+## biggest, the first of those; Factorio's own choice of stack isn't written down anywhere), its
+## slot marked with the hand; building, Z and Ctrl+click take from that stack (`hs`), the next stack
+## comes into the hand when it runs out, Q puts it back, a click on a slot puts it down.
+## `--hand-stack=all`: the quickbar's item with every one of it counted, as before.
+static var stack_hand := not ("--hand-stack=all" in OS.get_cmdline_user_args())
 
 ## Ctrl+clicks on entities sent and not answered yet, oldest first (player_input.gd's
 ## _fast_transfer): {"item" (held, "": taking), "counts" (the inventory before), "at" (msec),
@@ -362,7 +383,11 @@ func _ready() -> void:
 		open_map(true)
 		map_view.look_at_on(si, at))
 	alerts.say.connect(hud_message)
+	minimap.alerts = alerts
+	map_view.alerts = alerts
 	add_child(alerts)
+	night_icon = NightVisionIcon.new()
+	add_child(night_icon)
 
 	research_hud = ResearchProgress.new()
 	research_hud.model = model
@@ -376,6 +401,7 @@ func _ready() -> void:
 
 	entity_info = EntityInfo.new()
 	entity_info.model = model
+	entity_info.open_pack = open_model_packs
 	add_child(entity_info)
 
 	chat = ChatWindow.new()
@@ -414,6 +440,11 @@ func _ready() -> void:
 	players_window = PlayersWindow.new()
 	players_window.model = model
 	add_child(players_window)
+	# M8: the open building's model from another pack (the Model button in its window's title bar).
+	model_chooser = ModelChooser.new()
+	add_child(model_chooser)
+	screen.open_model = func(u: int, proto_name: String, proto_type: String) -> void:
+		model_chooser.open(u, proto_name, proto_type, player.get("world") if player != null else null)
 	# Mods' windows from the real player's GUI (mod_gui.lua), beside Zenith's own windows.
 	mod_gui = ModGui.new()
 	mod_gui.anchors = {"controller_gui": window, "entity": screen}
@@ -446,6 +477,15 @@ func _ready() -> void:
 			show_factorio.call()
 	factorio_button.pressed.connect(on_factorio)
 	add_child(factorio_button)
+	# M4: it is part of the HUD, as Factorio's mod button flow (gui.top) is, so Zenith's windows draw over it
+	# and take the mouse there: the full-screen technology screen covers and blurs it with the rest of the
+	# HUD instead of the gear sitting on "Research queue" ("earch queue"). Still over the map view and the
+	# Remote view frame, which come before. --mod-button=over keeps it over every window, as before.
+	if not OS.get_cmdline_user_args().has("--mod-button=over"):
+		move_child(factorio_button, window.get_index())
+	perf_warning = PerfWarning.new()
+	add_child(perf_warning)
+	move_child(perf_warning, factorio_button.get_index() + 1)
 	death_screen = DeathScreen.new()
 	death_screen.model = model
 	add_child(death_screen)
@@ -663,17 +703,22 @@ func _process(_delta: float) -> void:
 	held = held_item()
 	_check_hand(held)
 	held = held_item()
+	_push_spent(held)
 	_auto_sort()
 	quickbar.set_held(held)
 	# Factorio marks only a stack picked up whole (not a split, nor a one-item stack's right click).
 	var hand_slot := [hand["role"], hand["index"], int(hand["n"])] if not hand.is_empty() and hand["role"] != "grid" and not hand.get("nohand", false) else []
+	if not hand_slot.is_empty() and _whole_stack_hand() and UiModel.shown_fix:
+		# The builds sent used the hand's stack up: its mark is on the stack the cursor refills from.
+		var at: int = model.shown_hand()
+		hand_slot = ["main", at, 0] if at > 0 else []
 	window.set_hand_slot(hand_slot if not hand_slot.is_empty() and not MACHINE_ROLES.has(hand["role"]) else [])
 	screen.set_hand_slot(hand_slot if not hand_slot.is_empty() and MACHINE_ROLES.has(hand["role"]) else [])
 	Slot.spreading = not _spread.is_empty()
 	cursor.item = held
 	_grey_undo()
 	var tool = player.get("cursor_tool") if player != null else null
-	cursor.count = hand_count() if tool == null or str(tool) == "" else -1
+	cursor.count = cursor_count() if tool == null or str(tool) == "" else -1
 	cursor.over_gui = mouse_over_gui()
 	alt_overlay.player = player
 	entity_info.player = player
@@ -743,10 +788,15 @@ func layout() -> void:
 	# goes down under the frame's title bar as the top right corner does (at the top it covered the
 	# title's first letters), and the frame's panels on that side (Surfaces, the logistic networks)
 	# start under it.
+	# The performance warning (perf_warning.gd) right of it, or in its place while it is hidden.
 	if factorio_button != null:
 		var in_frame := corner_top > 0.0
 		factorio_button.position = Vector2(Kit.px(RemoteFrame.BORDER + 4), remote_frame.title_bottom() + Kit.px(4)) if in_frame else Kit.pxv(8, 8)
-		var under := factorio_button.position.y + factorio_button.get_combined_minimum_size().y + Kit.px(4) if in_frame and factorio_button.visible else 0.0
+		var row_shown := factorio_button.visible
+		if perf_warning != null:
+			perf_warning.position = factorio_button.position + (Vector2(Kit.px(Kit.SLOT + 4), 0.0) if factorio_button.visible else Vector2.ZERO)
+			row_shown = row_shown or perf_warning.visible
+		var under := factorio_button.position.y + factorio_button.get_combined_minimum_size().y + Kit.px(4) if in_frame and row_shown else 0.0
 		remote_frame.left_top = under
 		networks.set_top(under)
 	if minimap.visible:  # a short window: the minimap shrinks to stay above the quickbar
@@ -792,6 +842,13 @@ func layout() -> void:
 	alerts.reset_size()
 	var alerts_w := alerts.size.x * sf
 	alerts.global_position = Vector2(clampf(keys.end.x - alerts_w, m, view.x - m - alerts_w), keys.position.y - Kit.px(4) * sf - alerts.size.y * sf)
+	# Night vision's icon on the same row as the alerts, left of them (or at the bar's left edge without any).
+	night_icon.scale = shortcuts.scale
+	var nw := night_icon.size.x * sf
+	var nx := keys.position.x
+	if alerts.visible and alerts.size.x > 0.0:
+		nx = minf(nx, alerts.global_position.x - nw - Kit.px(4) * sf)
+	night_icon.global_position = Vector2(clampf(nx, m, view.x - m - nw), keys.position.y - Kit.px(4) * sf - night_icon.size.y * sf)
 	var info_top := under  # flush under the side menu (and the platform panel), as Factorio
 	if map_open() and map_view.panel.is_visible_in_tree():
 		info_top = map_view.panel.get_global_rect().end.y + m  # under the map view's settings, not over them
@@ -954,6 +1011,70 @@ func hand_count() -> int:
 	return model.count_of(held)
 
 
+## The count drawn at the cursor: the hand's, less what was just built from it and hasn't left the
+## inventory shown yet (L2, predicted.gd: the bridge reports the inventory up to half a second after
+## a build), so it counts down as a drag builds, as Factorio's does. A whole stack held from the
+## inventory (L7) counts down to nothing and then shows the stack the cursor refills from.
+func cursor_count() -> int:
+	var n := hand_count()
+	if n <= 0 or player == null or not can_build_from_hand():
+		return n
+	var pred = player.get("predicted")
+	if pred == null:
+		return n
+	if UiModel.shown_fix and _whole_stack_hand():
+		_push_spent(held_item())
+		var at: int = model.shown_hand()
+		return int(model.shown_stack_at(at).get("count", 0)) if at > 0 else 0
+	return maxi(0, n - int(pred.unpaid(held_item())))
+
+
+## The hand holds a whole stack of the main inventory (not a split-off part, not one still on its
+## way in from a machine).
+func _whole_stack_hand() -> bool:
+	return not hand.is_empty() and hand["role"] == "main" and int(hand["n"]) == 0 and not hand.has("await")
+
+
+## L2: tells the model what was built and isn't paid for yet, and which stack the hand builds from,
+## so the slots and the quickbar count it out as the cursor does (ui_model.gd set_spent).
+func _push_spent(held: String) -> void:
+	var pred = player.get("predicted") if player != null else null
+	var spent: Dictionary = pred.unpaid_all() if pred != null and pred.has_method("unpaid_all") else {}
+	var quality = player.get("cursor_quality") if player != null else null
+	model.set_spent(spent, int(hand["index"]) if _whole_stack_hand() else 0, held,
+		str(quality) if quality is String and quality != "" else "normal")
+
+
+## The main inventory slot (1-based) a build, a drop or a Ctrl+click of the held item takes from
+## (`hs`): the hand's stack, or once the builds sent have used it up the stack the cursor refills
+## from (L7), so the bridge empties the stacks in the order the hand shows; 0 for none in particular.
+func build_slot() -> int:
+	if not _whole_stack_hand():
+		return held_slot()
+	if not UiModel.shown_fix:
+		return int(hand["index"])
+	_push_spent(held_item())
+	return model.shown_hand()
+
+
+## Ctrl+wheel changed the held item's quality (player_input.gd cycle_quality): a whole stack held
+## gives way to the biggest stack of the item in that quality, as Factorio's cursor swaps stacks; with
+## none of it the hand keeps its stack (the bridge builds what there is).
+func hand_quality_changed(quality: String) -> void:
+	if not _whole_stack_hand():
+		return
+	var held := held_item()
+	var slot := 0
+	var most := 0
+	for i in model.main_slots.size():
+		var st: Dictionary = model.main_slots[i]
+		if st.get("item", "") == held and str(st.get("quality", "normal")) == quality and int(st.get("count", 0)) > most:
+			slot = i + 1
+			most = int(st["count"])
+	if slot > 0:
+		hand = {"role": "main", "index": slot, "n": 0, "unit": 0}
+
+
 ## Building from the cursor uses the character's main inventory, so a stack picked up from a
 ## machine is only moved, not built.
 func can_build_from_hand() -> bool:
@@ -1020,10 +1141,12 @@ func _check_hand(held: String) -> void:
 		return
 	if hand["role"] == "main" and model.stack_at("main", int(hand["index"])).get("item", "") != held:
 		hand = {}
-		for i in model.main_slots.size():
-			if model.main_slots[i].get("item", "") == held:
-				hand = {"role": "main", "index": i + 1, "n": 0, "unit": 0}
-				break
+		# The stack the cursor refills from: of the held quality first (J3, L7), as the shown slots
+		# and the builds' `hs` counted on while this one emptied.
+		var quality = player.get("cursor_quality") if player != null else null
+		var next := UiModel.refill_slot(model.main_slots, held, str(quality) if quality is String and quality != "" else "normal")
+		if next > 0:
+			hand = {"role": "main", "index": next, "n": 0, "unit": 0}
 		if hand.is_empty() and model.knows_slots("main") and player != null and str(player.get("cursor_tool")) == "":
 			_drop_hand()
 
@@ -1174,7 +1297,7 @@ func picked(msg: Dictionary) -> void:
 		var general := SoundBank.pick("core/sound/picked-up-item")
 		if general != "":
 			sound = [general, 1.0]
-	Sfx.play_ui(str(sound[0]), float(sound[1]))
+	Sfx.play_ui(str(sound[0]), float(sound[1]), "pickup/" + order[0])
 
 
 func _stack(role: String, index: int) -> Dictionary:
@@ -1219,7 +1342,7 @@ func _on_research_done(done: Array, more: int, tick: int) -> void:
 
 
 func is_open() -> bool:
-	return window.is_open() or research.is_open() or stats.is_open() or trains_window.is_open() or players_window.visible or planners.is_open() or space_map.is_open() or pedia.is_open() or networks.is_open() 		or bonuses.is_open() or alerts_config.is_open() or achievements.is_open() or permissions.is_open() or tips.is_open()
+	return window.is_open() or research.is_open() or stats.is_open() or trains_window.is_open() or players_window.visible or model_chooser.visible or planners.is_open() or space_map.is_open() or pedia.is_open() or networks.is_open() 		or bonuses.is_open() or alerts_config.is_open() or achievements.is_open() or permissions.is_open() or tips.is_open()
 
 
 ## Opens (or closes) one of Factorio's game-wide windows by name: "bonuses", "alerts" (the alerts
@@ -1284,9 +1407,20 @@ func toggle_personal_logistics() -> void:
 	Bridge.send({"t": "set_char_requests", "on": 0 if on else 1})
 
 
-## The hovered entity for the info panel (player_input.gd, every frame), or null.
-func set_selected(r) -> void:
-	entity_info.show_entity(r if entity_info.get_meta("enabled", true) else null)
+## The hovered entity for the info panel (player_input.gd, every frame), or null. Where the mouse
+## is goes with it, so the panel holds its entity while the mouse goes to its pack symbol (N8).
+func set_selected(r, fast := false) -> void:
+	var mouse := Vector2.INF if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED else mouse_position()
+	entity_info.show_entity(r if entity_info.get_meta("enabled", true) else null, mouse, fast)
+
+
+## The Model packs window on `pack` with family `fam` shown (the entity info's pack symbol, N8): the
+## menus' window (front_end.gd), over the game as from the Esc menu.
+func open_model_packs(pack: String, fam: String) -> void:
+	if not show_model_packs.is_valid():
+		return
+	Sfx.play_ui("gui-click")
+	show_model_packs.call(pack, fam)
 
 
 func entity_name(name: String) -> String:
@@ -1439,7 +1573,7 @@ func _frame_drop(planet: String) -> void:
 		pp.drop_to(planet)
 
 
-## The platform whose panel goes under the minimap: the one the remote view shows from elsewhere,
+## The platform whose panel goes under the minimap (H3): the one the remote view shows from elsewhere,
 ## else the character's (-1); none (0) while the map or the space map, with panels of their own, is open.
 func _watched_platform() -> int:
 	if map_view.is_open() or space_map.is_open():
@@ -1475,7 +1609,7 @@ func open_map(on: bool) -> void:
 	minimap.set_map_open(space_map.is_open())  # the map view keeps the minimap, following it (H22)
 
 
-## Where the minimap looks, as Factorio's does: the map view's middle while it is open, the 3D
+## Where the minimap looks (H22), as Factorio's does: the map view's middle while it is open, the 3D
 ## remote view's point on the character's surface (another surface's world isn't the map's), else
 ## the character (Vector2.INF).
 func minimap_look() -> Vector2:
@@ -1522,7 +1656,7 @@ func _follow_remote() -> void:
 
 
 ## Zoomed in past the map's closest level: the world there, seen from Factorio's own angle (F6),
-## as the map hands over to the game's view in Factorio. Leaving the remote view
+## as the map hands over to the game's view in Factorio (owner's #6). Leaving the remote view
 ## puts the camera back as it was.
 func _zoom_into_world(at: Vector2) -> void:
 	# Another surface's map: the mod streams that surface's world while the remote view is on it.
@@ -1629,6 +1763,7 @@ func close_all() -> void:
 	stats.visible = false
 	trains_window.open(false)
 	players_window.visible = false
+	model_chooser.close()
 	planners.close_all()
 	open_space_map(false)
 	pedia.open(false)
@@ -1644,12 +1779,16 @@ func close_all() -> void:
 func escape() -> bool:
 	if picker.is_open():
 		picker.close()
+	elif model_chooser.is_open():
+		model_chooser.close()
 	elif shortcuts.chooser_open():
 		shortcuts.open_chooser(false)
 	elif quickbar.chooser_open():
 		quickbar.open_chooser(0, false)
 	elif chat.is_open():
 		chat.close()
+	elif perf_warning != null and perf_warning.is_open():  # an open GUI closes first, as in Factorio
+		perf_warning.set_open(false)
 	elif debug_menu.escape():
 		pass
 	elif planners.escape():
@@ -1860,14 +1999,24 @@ func _select(index: int) -> void:
 	_select_item(str(model.quickbar[index]))
 
 
-func _select_item(item: String) -> void:
+## `quality` is the pin's: Factorio 2.x's quickbar slots carry one, Zenith's pins don't yet, so a pin
+## means normal.
+func _select_item(item: String, quality := "normal") -> void:
 	if item == "" or player == null:
 		return
 	if held_item() == item:
 		clear_cursor()
 		return
 	hand = {}
+	# L7: one stack of it comes into the hand, as Factorio's quickbar takes one from the inventory
+	# (the hand on its slot), of the pin's quality only (a bigger stack of another quality made the
+	# next builds that quality). With none of that quality, the item alone at that quality, as
+	# before L7 (a ghost cursor for what builds; Ctrl+wheel picks another quality's stack).
+	if stack_hand and model.knows_slots("main") and pick_from_inventory(item, quality, true):
+		return
 	player.hold(item)
+	if stack_hand and player.get("cursor_quality") != null:
+		player.cursor_quality = quality
 
 
 ## Factorio 2.1's clicks on a quickbar slot, with its "Set quickbar filter by clicking with item" off
@@ -1906,6 +2055,15 @@ func _on_page_slot_clicked(page: int, index: int, button_index: int) -> void:
 ## A slot of the character's inventories. Shift (Ctrl: every one of the item) moves the stack into
 ## the open machine.
 func _on_character_slot(role: String, index: int, button_index: int, shift: bool, ctrl: bool) -> void:
+	if role == "vammo":
+		# N3: the driven vehicle's ammo slot in the tool bar: a stack held from the inventory goes in
+		# (the right button: one), as Factorio's tool bar takes ammo while driving.
+		if not hand.is_empty() and str(hand.get("role", "")) == "main" and held_item() != "" \
+				and (button_index == MOUSE_BUTTON_LEFT or button_index == MOUSE_BUTTON_RIGHT):
+			model.move("main", int(hand["index"]), "vammo", index, 1 if button_index == MOUSE_BUTTON_RIGHT else int(hand.get("n", 0)))
+			if button_index == MOUSE_BUTTON_LEFT:
+				_drop_hand()
+		return
 	if role == "armor" and button_index == MOUSE_BUTTON_RIGHT and hand.is_empty() and held_item() == "" 			and int(model.grid("char").get("w", 0)) > 0:
 		# Right click on armour with a grid opens the grid, as in Factorio.
 		if not window.is_open():
@@ -2293,15 +2451,23 @@ func clear_cursor() -> void:
 
 
 ## The pipette's stack: the first stack of the item in the main inventory goes in the cursor, its
-## slot marked with the hand. False when there is none.
-func pick_from_inventory(item: String) -> bool:
+## slot marked with the hand. False when there is none (with `exact`, none of that quality).
+func pick_from_inventory(item: String, quality := "", exact := false) -> bool:
 	var slot := 0
 	var most := 0
+	var of_quality := false
 	for i in model.main_slots.size():
 		var st: Dictionary = model.main_slots[i]
-		if st.get("item", "") == item and int(st.get("count", 0)) > most:
+		if st.get("item", "") != item:
+			continue
+		# A stack of the quality asked for (the pipette's entity's) before any other, L7.
+		var wanted := quality != "" and str(st.get("quality", "normal")) == quality
+		if exact and not wanted:
+			continue
+		if (wanted and not of_quality) or (wanted == of_quality and int(st.get("count", 0)) > most):
 			slot = i + 1  # 2.1.23's pipette takes a full stack: the biggest
 			most = int(st["count"])
+			of_quality = wanted
 	if slot == 0 or player == null:
 		return false
 	_pick_up("main", slot, 0, item, 0)
@@ -2349,6 +2515,10 @@ func _pick_up(role: String, index: int, unit: int, item: String, n: int, count :
 		return
 	hand = {"role": role, "index": index, "n": n, "unit": unit}
 	player.hold(item)
+	if stack_hand and role == "main" and player.get("cursor_quality") != null:
+		# The cursor's quality is its stack's (L7): what a build from it places, and the quality of
+		# the stack it refills from first.
+		player.cursor_quality = str(model.stack_at("main", index).get("quality", "normal"))
 	if MACHINE_ROLES.has(role) and model.knows_slots("main") and screen.knows_slots(role):
 		# I7: Factorio's cursor owns the stack it took from a chest or machine: it stays held when the
 		# window closes or the character walks away, and goes back into the inventory, not the

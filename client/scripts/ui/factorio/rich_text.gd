@@ -278,7 +278,7 @@ static func plain_token(tok: Dictionary) -> String:
 	return "[%s %d]" % [str(tok["t"]), int(tok["id"])]
 
 
-## Gives the entries of a drop-down or menu with rich text names their icon and plain text;
+## Gives the entries of a drop-down or menu with rich text names (G8) their icon and plain text;
 ## `names[i]` is entry i's name.
 static func decorate_items(menu: Object, names: Array) -> void:
 	var popup: PopupMenu = menu if menu is PopupMenu else (menu as OptionButton).get_popup()
@@ -292,7 +292,7 @@ static func decorate_items(menu: Object, names: Array) -> void:
 			popup.set_item_icon_max_width(i, Kit.px(20))
 
 
-## A Button showing a rich text name: its first icon and the rest as text.
+## A Button showing a rich text name (G8): its first icon and the rest as text.
 static func decorate_button(b: Button, text: String) -> void:
 	var it := icon_and_text(text)
 	b.text = str(it[1])

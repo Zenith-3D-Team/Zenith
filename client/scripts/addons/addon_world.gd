@@ -12,6 +12,7 @@ extends RefCounted
 
 const TRAIN_TYPES := ["locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon", "infinity-cargo-wagon"]
 const ROBOT_TYPES := ["logistic-robot", "construction-robot", "combat-robot", "capture-robot"]
+const StandHeight := preload("res://scripts/world/stand_height.gd")
 
 var _host
 ## The add-on this copy belongs to (each add-on has its own, for hold_chunks); null for the host's.
@@ -155,6 +156,14 @@ func entities_near(point: Vector2, radius: float, types: Array = []) -> Array:
 				if (e["position"] as Vector2).distance_to(point) <= radius:
 					out.append(e)
 	return out
+
+
+## (API 1.7) How high the character would stand at a ground point (tiles over the ground there): the
+## drawn top of a belt, underground belt, splitter, loader, pipe-to-ground, heat pipe or ground rail
+## there, the highest where several meet; 0 for bare ground and anything else (stand_height.gd). The
+## whole answer: Zenith's own belt step-up takes the belt family alone, capped (avatar.gd STAND_MAX).
+func stand_height_at(point: Vector2) -> float:
+	return StandHeight.at(_host.game_node("world"), point)
 
 
 ## (API 1.6) Holds the chunks already drawn (on), or lets them go again (off): while on, chunks the

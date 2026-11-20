@@ -495,7 +495,7 @@ func _station_card(name: String, n: int) -> Control:
 	b.add_theme_stylebox_override("pressed", _card_style(Color8(52, 52, 52)))
 	b.add_theme_color_override("font_color", Kit.WHITE)
 	b.add_theme_color_override("font_hover_color", Kit.WHITE)
-	# A name with icons shows its first icon in the stop's place and the rest as text.
+	# A name with icons (G8) shows its first icon in the stop's place and the rest as text.
 	var named := RichText.icon_and_text(name)
 	b.icon = named[0] if named[0] != null else Kit.item_icon("train-stop")
 	b.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER

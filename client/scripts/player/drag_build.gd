@@ -17,6 +17,9 @@ extends RefCounted
 ##       stays ahead within 45 degrees of it (I12); begun against the held way they go backwards
 ##       there too, the new belts flowing into the last at a corner.
 ##   pipes drag in a straight line and jump obstacles with a pair of pipes-to-ground;
+##   walls follow the cursor's path tile by tile, round corners and in any shape (N5): no line lock,
+##       which in Factorio is the belts' alone; a diagonal move fills its path as a staircase of
+##       side-by-side tiles, so the wall stays joined (`--wall-drag=line`: along one line, as before);
 ##   electric poles follow the cursor's path at any angle (I13): when the cursor gets further than
 ##       the wire reaches from the last pole, the next goes on the furthest free spot of its path
 ##       still in reach of it (an existing pole the cursor crosses counts as the last one);
@@ -34,6 +37,8 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const VisualTurns := preload("res://scripts/world/visual_turns.gd")
+const Predicted := preload("res://scripts/world/predicted.gd")
+const UndergroundPairs := preload("res://scripts/world/underground_pairs.gd")
 
 const DIRS := {Vector2i(0, -1): 0, Vector2i(1, 0): 4, Vector2i(0, 1): 8, Vector2i(-1, 0): 12}
 const UNDERGROUND_TYPES := ["underground-belt", "pipe-to-ground"]
@@ -41,6 +46,8 @@ const UNDERGROUND_TYPES := ["underground-belt", "pipe-to-ground"]
 ## its line (and not further ahead along it than it is off): a hand drifting a tile while dragging
 ## keeps the line straight.
 const TURN_SLACK := 2
+## N5: walls follow the cursor's path; `--wall-drag=line` holds them to one line as before.
+static var walls_follow := not ("--wall-drag=line" in OS.get_cmdline_user_args())
 
 ## player_input (world, hud, build_dir, _blocked, _remember); untyped to keep the scripts apart.
 var pi: Node
@@ -87,6 +94,8 @@ var _ahead := 0
 var _behind := 0
 ## Poles: the tiles the cursor crossed since the last pole, in order (where the next may go).
 var _path: Array[Vector2i] = []
+## Walls following the cursor: the tiles this drag already built on (going back sends nothing).
+var _walled := {}
 ## Out of items during a real drag: said once.
 var _ran_out := false
 ## Commands sent during this drag, for tests: [cmd, ...].
@@ -113,6 +122,7 @@ func begin(item: String, proto: ProtoDB.EntityProto, ground: Vector2, ghost: boo
 	_ahead = 0
 	_behind = 0
 	_path.clear()
+	_walled = {_start: true}
 	_ran_out = false
 	_first_waits = _under_reach() > 0
 	if _proto.type == "electric-pole":
@@ -156,6 +166,9 @@ func update(ground: Vector2) -> void:
 	if _axis == Vector2i.ZERO:
 		var d := tile - _start
 		_axis = Vector2i(signi(d.x), 0) if absi(d.x) >= absi(d.y) else Vector2i(0, signi(d.y))
+	if _proto.type == "wall" and walls_follow:
+		_follow_walls(tile)
+		return
 	if _proto.type == "transport-belt":
 		if locked():
 			_belt_line(tile)
@@ -323,6 +336,27 @@ func _follow_poles(ground: Vector2) -> void:
 		_place(at, int(pi.build_dir))
 		_line_last = at
 		_path = _path.slice(placed + 1)
+
+
+## Walls: one tile at a time from the last tile to the cursor's, along whichever axis has further to
+## go (a diagonal makes a staircase of tiles sharing sides, as Factorio fills a dragged wall), a wall
+## on each tile not built on yet in this drag.
+func _follow_walls(target: Vector2i) -> void:
+	var guard := 0
+	while _cur != target and guard < 256:
+		guard += 1
+		_cur += wall_step(target - _cur)
+		if _walled.has(_cur):
+			continue
+		_walled[_cur] = true
+		_place(_cur, int(pi.build_dir))
+
+
+## A wall drag's next step towards a cursor `d` tiles away: along the longer way, x on a tie.
+static func wall_step(d: Vector2i) -> Vector2i:
+	if absi(d.x) >= absi(d.y):
+		return Vector2i(signi(d.x), 0)
+	return Vector2i(0, signi(d.y))
 
 
 static func _overlaps(a: Vector2i, b: Vector2i, size: Vector2i) -> bool:
@@ -544,7 +578,7 @@ static func _vec(dir: int) -> Vector2i:
 func _under_item(kind: String) -> String:
 	var u: Dictionary = pi.hud.ui.model.item_uses.get(_item, {})
 	var under := str(u.get(kind, ""))
-	if under == "" or (not _ghost and pi.hud.count_of(under) == 0):
+	if under == "" or (not _ghost and pi.items_left(under) <= 0):
 		return ""
 	return under
 
@@ -586,13 +620,16 @@ static func _aim(tile: Vector2i, size: Vector2i) -> Vector2:
 
 
 func _send_at(item: String, at: Vector2, dir: int) -> void:
-	var cmd := {"t": "build", "item": item, "x": int(at.x * 256.0), "y": int(at.y * 256.0), "d": dir}
+	# J9: rounded down, so the mod snaps it where the preview stood (player_input.gd wire).
+	var cmd := {"t": "build", "item": item, "x": pi.wire(at.x), "y": pi.wire(at.y), "d": dir}
 	if _ghost:
 		cmd["ghost"] = 1
-	elif pi.hud.count_of(item) == 0 and item == _item:
+	elif (pi.items_left(item) <= 0) if Predicted.spend_fix else (pi.hud.count_of(item) == 0 and item == _item):
 		# A real drag that ran out (I5): it stops, as Factorio's does, instead of going on in ghosts.
-		# (An underground pair's other item, `item` != `_item`, was checked by _under_item.)
-		if not _ran_out:
+		# L2: out means none left once the builds sent and not yet gone from the inventory shown are
+		# counted (predicted.gd spend), so nothing past what the hand holds is sent or drawn. (An
+		# underground pair's other item, `item` != `_item`, was checked by _under_item.)
+		if not _ran_out and item == _item:
 			_ran_out = true
 			pi.hud.show_message("You have no %s" % item)
 		return
@@ -602,11 +639,19 @@ func _send_at(item: String, at: Vector2, dir: int) -> void:
 		cmd["m"] = 1
 	if pi.cursor_quality != "normal":
 		cmd["q"] = pi.cursor_quality
+	if not _ghost and item == str(pi.cursor_item):
+		# L7: built out of the held stack's own slot, as Factorio builds from the cursor; once the
+		# builds sent have used it up, out of the stack the cursor refills from (factorio_ui.gd).
+		var hs: int = pi.hud.ui.build_slot()
+		if hs > 0:
+			cmd["hs"] = hs
 	Bridge.send(cmd)
 	sent.append(cmd)
 	if not cmd.has("ghost"):
 		pi._remember({"do": "build", "item": item, "x": at.x, "y": at.y, "d": dir})
+		_spend(item, at, dir)
 		var look := _look_turned(item, dir)
+		_predict_clear(item, at, dir)
 		_predict(item, at, dir, look != null)
 		if look != null:
 			# K21: the game puts it down unturned; it keeps the cursor's turn once its `add` comes.
@@ -626,6 +671,56 @@ func _look_turned(item: String, dir: int) -> ProtoDB.EntityProto:
 	return proto if VisualTurns.eligible(proto, x) else null
 
 
+## L2: a real build sent spends one of the item until the inventory shown has lost it
+## (predicted.gd), where the client's own check says the game will take it: within the bridge's
+## reach, not in the way (a build the game refuses spends nothing, and isn't counted against what
+## is left).
+func _spend(item: String, at: Vector2, dir: int) -> void:
+	if pi.predicted == null or not Predicted.spend_fix:
+		return
+	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
+	if proto == null:
+		return
+	var size := _snapped_size(proto, dir)
+	at = Vector2(pi._snap(at.x, size.x), pi._snap(at.y, size.y))
+	var reach: bool = pi._bridge_reach(at) if Predicted.spend_bridge_reach else pi._in_reach(at, size)
+	if not reach or pi._blocked(proto, at, size) or pi._on_void(at, size):
+		return
+	pi.predicted.spend(item, proto, at)
+
+
+static func _snapped_size(proto: ProtoDB.EntityProto, dir: int) -> Vector2i:
+	var size: Vector2i = proto.tile_size
+	if dir == 4 or dir == 12:
+		size = Vector2i(size.y, size.x)
+	return size
+
+
+## M2: an underground (pipe-to-ground) completing a pair over a plain run of belts (pipes): the game mines the run with
+## the build, so it is hidden at once (predicted.gd clear_run), as the cursor marked it (underground_pairs.gd
+## cleared); shown again if the game keeps it. Only where the client's own check says the build goes (in reach); the
+## run is looked for before this build's own entity is in the world, as the cursor saw it. A drag's exit whose
+## entrance went in the same drag pairs with that entrance though its `add` hasn't come: each piece sent is kept
+## until the world has it (predicted.gd sent_underground), with the end the bridge will make it.
+func _predict_clear(item: String, at: Vector2, dir: int) -> void:
+	if pi.predicted == null or pi.hud.ui.remote or not UndergroundPairs.clear_on:
+		return
+	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
+	if proto == null or not UndergroundPairs.is_underground(proto.type):
+		return
+	var size := _snapped_size(proto, dir)
+	at = Vector2(pi._snap(at.x, size.x), pi._snap(at.y, size.y))
+	if not pi._in_reach(at, size) or pi._blocked(proto, at, size, true):
+		return
+	var reach: int = pi._under_reach(proto)
+	var sent: Array = pi.predicted.sent_undergrounds()
+	var run := UndergroundPairs.cleared(pi.world, proto, at, dir, reach, sent)
+	if not run.is_empty():
+		pi.predicted.clear_run(run)
+	var join := UndergroundPairs.held_join(pi.world, proto, at, dir, reach, sent)
+	pi.predicted.sent_underground(proto, at, dir, join.is_empty() or bool(join["far"]))
+
+
 ## Shows what was just built at once (the latency layer, FFF #83), where the client's own check
 ## says it can go: within reach and not in the way. The mod's answer replaces or drops it.
 func _predict(item: String, at: Vector2, dir: int, look_turned := false) -> void:
@@ -634,15 +729,14 @@ func _predict(item: String, at: Vector2, dir: int, look_turned := false) -> void
 	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
 	if proto == null:
 		return
-	var size: Vector2i = proto.tile_size
-	if dir == 4 or dir == 12:
-		size = Vector2i(size.y, size.x)
+	var size := _snapped_size(proto, dir)
 	# A click (and a line's later footprints) sends the exact cursor point, which the mod snaps to
 	# the grid: drawn unsnapped, the prediction stood up to half a tile off the game's building and
 	# never matched it, so both showed until it timed out.
 	at = Vector2(pi._snap(at.x, size.x), pi._snap(at.y, size.y))
 	if not pi._in_reach(at, size) or pi._blocked(proto, at, size) or pi._on_void(at, size):
 		return
-	if pi.hud.count_of(item) <= pi.predicted.pending_of(proto):
+	# L2: with the spends counted, only what the hand could pay for was sent (see _send_at).
+	if not Predicted.spend_fix and pi.hud.count_of(item) <= pi.predicted.pending_of(proto):
 		return  # the inventory hasn't caught up: the last ones may be refused for want of items
 	pi.predicted.build(proto, at, dir, look_turned)

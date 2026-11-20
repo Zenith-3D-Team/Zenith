@@ -55,10 +55,20 @@ const DAY_LIGHT := 0.15
 const REFRESH := 0.5
 ## A white lamp's light, warm as Factorio's lit lamps look at night.
 const LIGHT_COLOR := Color(1.0, 0.86, 0.6)
-const LIGHT_RANGE := 7.0
+## N6 (owner: "a larger radius of light, maybe double"): range 14 with a gentler fall-off
+## (attenuation 0.5) lights the ground to about 11 tiles at a tenth of the lamp's foot, twice the old
+## 7 at Godot's inverse-distance fall-off (about 5 tiles). Factorio's small lamp (light size 40,
+## light-medium.png) is near full to 8 tiles, half at 11, a tenth at 16: ours keeps nearer the lamp
+## brighter than the far edge, as a 3D light seen up close should. `--lamp-radius=old`: 7 and 1.0.
+const LIGHT_RANGE := 14.0
+const LIGHT_ATTENUATION := 0.5
+const OLD_LIGHT_RANGE := 7.0
+const OLD_ATTENUATION := 1.0
 ## A coloured lamp's light reaches less far: Factorio draws it with light_when_colored (no light in the
-## small lamp's prototype) and a coloured glow 6 tiles across, where the white light is 40.
-const COLORED_RANGE := 4.0
+## small lamp's prototype) and a coloured glow 6 tiles across, where the white light is 40. The same
+## share of the white light's range as before (4 of 7).
+const COLORED_RANGE := LIGHT_RANGE * 4.0 / 7.0
+const OLD_COLORED_RANGE := 4.0
 
 var protos: ProtoDB
 ## The world mirror: entities and machine working states.
@@ -68,10 +78,14 @@ var darkness := 0.0
 var focus := Vector2.ZERO
 ## fluids_power.gd, for machines short of power (optional).
 var power: Node
-## The remote view's fog (remote_fog.gd): lamps no radar sees stay dark under it.
+## The remote view's fog (remote_fog.gd): lamps no radar sees stay dark under it (G18).
 var fog: Node
 
 var _lights: Array[OmniLight3D] = []
+## The lights' reach (N6, or the old one with `--lamp-radius=old`).
+var light_range := LIGHT_RANGE
+var colored_range := COLORED_RANGE
+var attenuation := LIGHT_ATTENUATION
 ## Lamps given real lights, and glows ("bulbs") drawn (full_detail.gd raises both, then puts them back).
 var max_lights := MAX_LIGHTS
 var max_bulbs := MAX_BULBS
@@ -92,6 +106,10 @@ var _is_lamp := {}  # proto id -> bool
 
 
 func _ready() -> void:
+	if old_radius():
+		light_range = OLD_LIGHT_RANGE
+		colored_range = OLD_COLORED_RANGE
+		attenuation = OLD_ATTENUATION
 	var quad := QuadMesh.new()
 	quad.size = GLOW_SIZE
 	quad.center_offset = Vector3(0.0, GLOW_RAISE, 0.0)
@@ -122,6 +140,14 @@ func _ready() -> void:
 	_add_lights(MAX_LIGHTS)
 	if world != null and world.has_signal("entities_changed"):
 		world.entities_changed.connect(_on_entities_changed)
+
+
+## `--lamp-radius=old`: the lights' reach before N6.
+static func old_radius() -> bool:
+	for arg in OS.get_cmdline_user_args():
+		if arg == "--lamp-radius=old":
+			return true
+	return false
 
 
 ## Factorio's lit lamp's picture (its light in alpha), or without an install a soft round glow of
@@ -163,7 +189,8 @@ func _add_lights(n: int) -> void:
 		var light := OmniLight3D.new()
 		light.light_color = LIGHT_COLOR
 		light.light_energy = 1.6
-		light.omni_range = LIGHT_RANGE
+		light.omni_range = light_range
+		light.omni_attenuation = attenuation
 		light.visible = false
 		add_child(light)
 		_lights.append(light)
@@ -287,4 +314,4 @@ func _process(delta: float) -> void:
 			light.light_energy = (0.7 if dim.has(lit[i]) else 1.6) * light_share
 			var own: bool = colored.has(lit[i])
 			light.light_color = colored[lit[i]] if own else LIGHT_COLOR
-			light.omni_range = COLORED_RANGE if own else LIGHT_RANGE
+			light.omni_range = colored_range if own else light_range

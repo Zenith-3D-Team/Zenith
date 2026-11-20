@@ -4,6 +4,8 @@ draws them; no Blender, no window).
 
     python tools/models/nature/score.py [NAME[@REF] ...] [--models DIR] [--yaws N]
 
+NAME is one of our models (tools/models/packs.py), or the one in --models' folder, or a .glb's path.
+
 For each model (default: the Nauvis trees and rocks), against its sprite (variation a, or the rock's
 picture its model was fitted to; @REF picks another), as Factorio's camera sees both:
 
@@ -28,6 +30,8 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.append(os.path.dirname(HERE))  # tools/models, after nature/ (both have a score.py)
+import packs  # noqa: E402
 import raster  # noqa: E402
 import tree_sprites as ts  # noqa: E402
 
@@ -130,7 +134,7 @@ def score(path, name, ref, yaws):
 
 
 def main(argv):
-    models_dir, yaws, names = raster.MODELS, 8, []
+    models_dir, yaws, names = None, 8, []  # models_dir None: our packs
     it = iter(argv)
     for a in it:
         if a == "--models":
@@ -143,7 +147,10 @@ def main(argv):
     for spec in names or TREES + ROCKS:
         name, _, ref = spec.partition("@")
         ref = ref or FITTED.get(name) or None
-        path = name if name.endswith(".glb") else os.path.join(models_dir, name + ".glb")
+        if name.endswith(".glb"):
+            path = name
+        else:
+            path = os.path.join(models_dir, name + ".glb") if models_dir else packs.model_path(name)
         r = score(path, os.path.basename(path)[:-4], ref, yaws)
         rows.append(r)
         clump = " clumps %.2f" % r["clumps"] if "clumps" in r else ""

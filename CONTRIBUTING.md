@@ -54,9 +54,10 @@ Zenith draws whatever the real game runs, so Factorio mods work alongside it:
 - **How they look:** a modded entity is a box sized from its selection box until it has a model,
   and its icons are plain squares for now. Its screens are picked by its Factorio type (a modded
   furnace gets the furnace screen); a mod's own GUI doesn't show in Zenith.
-- **Models for a mod's entities:** name a `.glb` after the entity's prototype and load the folder
-  with `--models=<folder>` ([docs/MODELLERS.md](docs/MODELLERS.md) has the rules). Packs a mod can
-  ship itself are planned ([MODDING.md](MODDING.md) says what's next).
+- **Models for a mod's entities:** name a `.glb` after the entity's prototype and put it in a model
+  pack in the `models` folder beside Zenith, or load the folder with `--models=<folder>`
+  ([docs/MODELLERS.md](docs/MODELLERS.md) has the rules). Packs a mod can ship itself are planned
+  ([MODDING.md](MODDING.md) says what's next).
 - **Testing with mods is the most useful thing to report:** what breaks, and with which mods.
 
 ## Art

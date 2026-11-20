@@ -17,6 +17,7 @@ const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const ContactShade := preload("res://scripts/world/contact_shade.gd")
 const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
 const NatureLooks := preload("res://scripts/world/nature_looks.gd")
+const PipeCovers := preload("res://scripts/world/pipe_covers.gd")
 
 const SIZE := 32
 ## Entity types whose models get a per-entity random turn and size (see _model_transform).
@@ -73,6 +74,9 @@ var _flat_mmis := {}
 ## Belts and loaders a network can switch off (a wire, or off now), so drawn with custom data:
 ## unit -> [[MultiMesh, instance, stopped], ...] (the model, its stand-in, a line's end pieces), for set_belt_off.
 var _switches := {}
+## Scattered ore's rock models drawn here (ModelLibrary.ore_rocks) -> how many of their instances are
+## every tile's first rock (they come first: rank by rank), what a far chunk shows (thin_ore).
+var _ore_near := {}
 
 var _terrain: MeshInstance3D
 ## The rings of contact shading round the buildings' feet (contact_shade.gd), or null.
@@ -103,9 +107,15 @@ var _lod_fading := 0
 ## Set by world.gd while it looks at a chunk just shown again (behind_cull.gd): a switch then needs
 ## no cross-fade, as nothing of the chunk was on screen to fade from.
 var lod_snap := false
+## Set when update_lods stopped early on its per-frame switch cap, so world.gd resumes this chunk
+## next frame; lod_last_switches counts the level switches made in that call.
+var lod_partial := false
+var lod_last_switches := 0
 const LOD_LOOK_AGAIN := 0.03
 ## How high a chunk's buildings reach, for its nearest point to the camera (tiles).
 const LOD_HEIGHT := 12.0
+## --lod-cpu-copy=off: read `mm.buffer` back from RenderingServer on LOD cross-fades as before.
+static var lod_cpu_copy := not OS.get_cmdline_user_args().has("--lod-cpu-copy=off")
 
 
 class LodState:
@@ -115,6 +125,12 @@ class LodState:
 	## seconds left.
 	var fade: MultiMeshInstance3D
 	var fade_left := 0.0
+	var from_apply := false
+	var xforms: Array = []
+	var colors: Array = []
+	var custom := false
+	var group: Anim.Group
+	var switches: Array = []
 ## Each tile's texture slot (x + 64 * y), kept between rebuilds: it depends only on this chunk's
 ## tiles and their pictures, and neighbours arriving rebuild the terrain several times. Empty:
 ## work them out again (terrain_mesher.gd).
@@ -237,6 +253,7 @@ func apply_terrain(job: TerrainMesher) -> void:
 		_terrain = MeshInstance3D.new()
 		# Flat ground shades nothing worth a shadow pass (0.14-0.5 ms of GPU on the owner's save).
 		_terrain.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_terrain.layers = Visuals.GROUND_LAYER
 		add_child(_terrain)
 	_terrain.mesh = mesh
 	if Probing.on:
@@ -257,6 +274,7 @@ func apply_kept_terrain(mesh: ArrayMesh, kept_slots: PackedInt32Array, coarse :=
 	if _terrain == null:
 		_terrain = MeshInstance3D.new()
 		_terrain.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		_terrain.layers = Visuals.GROUND_LAYER
 		add_child(_terrain)
 	_terrain.mesh = mesh
 	GroundHeight.hold_mesh(_terrain)  # on hills, room for their lift
@@ -459,6 +477,7 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 	var belt_lo := Vector2.INF
 	var belt_hi := -Vector2.INF
 	var rings: Array = []  # contact_shade.gd collect()
+	var scattered := {}  # ore rock Mesh -> per rank, Array of [Transform3D, rec]
 
 	var done := 0
 	var t_recs := Time.get_ticks_usec()  # (--stutter-probe: the records' pass and the MultiMeshes' as c_us_*)
@@ -471,6 +490,8 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 		var proto: ProtoDB.EntityProto = protos.entity(rec.proto_id)
 		if proto == null or rec.extra.has("gh") or rec.extra.has("tg") or ModelLibrary.hidden(proto.name):
 			continue  # ghosts (and tile ghosts) are drawn by ghosts.gd
+		if rec.extra.has("hid"):
+			continue  # a belt the build of an underground pair mines, until the game says so (predicted.gd clear_run)
 		if ModelLibrary.REMNANT_TYPES.has(proto.type):
 			var remnant := _remnant(protos, proto, rec)
 			if remnant.is_empty():
@@ -489,6 +510,15 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 			by_model[rmesh].append(remnant[1])
 			recs_by_model[rmesh].append([rec, proto.type])
 			continue
+		if proto.type == "resource" and ModelLibrary.ORE_STAGES.has(proto.name):
+			var rocks: Variant = ModelLibrary.ore_rocks(proto.name)
+			if rocks == null:
+				waiting_models = true
+				continue
+			if not (rocks as Array).is_empty():
+				if not _scatter_ore(rec, proto.name, rocks, scattered):
+					waiting_models = true
+				continue
 		var t_ready := Time.get_ticks_usec() if Probing.on else 0
 		var ready := ModelLibrary.entity_ready(proto.name, proto.type, rec.extra, rec.dir)
 		if Probing.on:
@@ -517,7 +547,7 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 				parts_by_model[mesh] = ModelLibrary.parts_for_entity(proto.name, proto.type, rec.extra, rec.dir)
 			by_model[mesh].append(_model_transform(proto, rec))
 			recs_by_model[mesh].append([rec, proto.type])
-			ContactShade.collect(rings, proto.name, proto.type, mesh, by_model[mesh][-1], proto.box_min, proto.box_max)
+			ContactShade.collect(rings, proto.name, proto.type, mesh, by_model[mesh][-1], proto.box_min, proto.box_max, Vector2(proto.tile_size))
 			if Anim.SWITCHABLE_TYPES.has(proto.type) and (rec.extra.has("r") or rec.extra.has("g") or int(working.get(rec.unit, 0)) == Anim.SWITCHED_OFF):
 				switchable[rec.key] = true
 			if BeltLods.TYPES.has(proto.type):
@@ -526,6 +556,12 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 				belt_hi = belt_hi.max(rec.pos)
 			if rec.extra.has("cb"):
 				if _add_cargo_pieces(rec, by_model[mesh][-1], by_model, recs_by_model, parts_by_model):
+					waiting_models = true
+			if rec.extra.has("fa") and proto.type == "mining-drill":
+				if _add_wet(rec, proto, by_model[mesh][-1], by_model, recs_by_model, parts_by_model):
+					waiting_models = true
+			if rec.covers != 0:
+				if _add_covers(rec, proto, by_model[mesh][-1], by_model, recs_by_model, parts_by_model):
 					waiting_models = true
 			if rec.belt_ends != 0:
 				if _add_belt_ends(rec, proto, by_model[mesh][-1], by_model, recs_by_model, parts_by_model, cap_parts):
@@ -569,6 +605,19 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 			box_colors.append(color)
 
 	count("us_build_recs", Time.get_ticks_usec() - t_recs)
+	_ore_near.clear()
+	for rock: Mesh in scattered:
+		if not by_model.has(rock):
+			by_model[rock] = []
+			recs_by_model[rock] = []
+			parts_by_model[rock] = []
+		var ranks: Array = scattered[rock]
+		for rank in ranks.size():
+			for entry: Array in ranks[rank]:
+				by_model[rock].append(entry[0])
+				recs_by_model[rock].append([entry[1], "resource"])
+			if rank == 0:
+				_ore_near[rock] = (by_model[rock] as Array).size()
 	if _until > 0 and done > 16 and Time.get_ticks_usec() > _until:
 		await _wait_for_more()  # the records are read: the MultiMeshes next time
 	var t_wants := Time.get_ticks_usec()
@@ -732,6 +781,7 @@ func _apply(w: Want, working: Dictionary, anim: Anim, budget: Budget) -> void:
 		count("surfaces", w.mesh.get_surface_count())
 	Anim.setup_part(w.part)  # its bounds over its whole motion, before the MultiMesh takes them
 	_fill(mmi.multimesh, _lod_mesh(mmi, w), w.xforms, w.colors, w.custom)
+	_thin(mmi.multimesh, w.key if w.part == null else null)
 	# On hills the bounds grow in height only by what they lift (ground_height.gd), not every way.
 	# Parts anim.gd moves on the CPU (turret heads turning) keep the MultiMesh's own bounds, which
 	# follow them, and the margin.
@@ -745,8 +795,17 @@ func _apply(w: Want, working: Dictionary, anim: Anim, budget: Budget) -> void:
 	if not w.switches.is_empty() and not w.group:
 		_draw_switches(w, mmi.multimesh, working)
 	count("instances", w.xforms.size())
+	var group: Anim.Group = null
 	if w.group:
-		_add_group(mmi.multimesh, w.part, w.xforms, w.recs, working, anim)
+		group = _add_group(mmi.multimesh, w.part, w.xforms, w.recs, working, anim)
+	var st: LodState = _lods.get(mmi)
+	if st != null:
+		st.from_apply = true
+		st.xforms = w.xforms
+		st.colors = w.colors
+		st.custom = w.custom
+		st.group = group
+		st.switches = w.switches if not w.group else []
 	if w.part == null and w.key is Mesh:
 		_shadow_proxy(w.key, w.xforms, budget)
 	elif ModelLods.part_has_levels(w.part):
@@ -856,9 +915,13 @@ func _lod_mesh(mmi: MultiMeshInstance3D, w: Want) -> Mesh:
 ## is the tiles of error the view allows per tile of distance from the camera (Level of detail's
 ## pixels times a pixel's size there), or `allowed_flat` the tiles allowed wherever (an
 ## orthographic view; < 0 in perspective). Measured to the chunk's nearest point, so no model in it
-## is nearer than its level was made for. Also moves cross-fades on by `delta`.
-func update_lods(camera: Vector3, allowed_per_tile: float, allowed_flat: float, delta: float) -> void:
+## is nearer than its level was made for. Also moves cross-fades on by `delta`. When
+## `switch_budget >= 0`, stops after that many level switches and sets `lod_partial` without
+## updating `_lod_allowed` so the caller finishes this chunk on the next frame.
+func update_lods(camera: Vector3, allowed_per_tile: float, allowed_flat: float, delta: float, switch_budget := -1) -> void:
+	lod_last_switches = 0
 	if _lods.is_empty():
+		lod_partial = false
 		return
 	if _lod_fading > 0:
 		_advance_fades(delta)
@@ -870,17 +933,28 @@ func update_lods(camera: Vector3, allowed_per_tile: float, allowed_flat: float, 
 		var dz := maxf(maxf(z0 - camera.z, camera.z - (z0 + SIZE)), 0.0)
 		var dy := maxf(camera.y - LOD_HEIGHT, 0.0) if camera.y > 0.0 else -camera.y
 		allowed = sqrt(dx * dx + dy * dy + dz * dz) * allowed_per_tile
-	if _lod_generation == ModelLods.level_generation and _lod_allowed > 0.0 \
+	if not lod_partial and _lod_generation == ModelLods.level_generation and _lod_allowed > 0.0 \
 			and absf(allowed - _lod_allowed) <= _lod_allowed * LOD_LOOK_AGAIN:
 		return
-	_lod_allowed = maxf(allowed, 1e-6)
-	_lod_generation = ModelLods.level_generation
+	lod_partial = false
 	for mmi: MultiMeshInstance3D in _lods:
 		var st: LodState = _lods[mmi]
 		var levels := ModelLods.levels(st.model)
 		var level := ModelLods.level_for(levels, st.level, allowed)
 		if level != st.level:
+			if switch_budget >= 0 and lod_last_switches >= switch_budget:
+				lod_partial = true
+				return
 			_switch_level(mmi, st, level, levels)
+			lod_last_switches += 1
+	_lod_allowed = maxf(allowed, 1e-6)
+	_lod_generation = ModelLods.level_generation
+
+
+## Moves active cross-fades on by `delta` without switching any model's level (world.gd _lod_fades).
+func advance_lod_fades(delta: float) -> void:
+	if _lod_fading > 0:
+		_advance_fades(delta)
 
 
 ## Draws the model at `level`, the level before fading out over ModelLods.FADE_SECONDS through a
@@ -897,13 +971,31 @@ func _switch_level(mmi: MultiMeshInstance3D, st: LodState, level: int, levels: A
 		return
 	var copy := MultiMesh.new()
 	copy.transform_format = mm.transform_format
-	copy.use_colors = mm.use_colors
-	copy.use_custom_data = mm.use_custom_data
-	copy.mesh = before
-	copy.instance_count = mm.instance_count
-	var data := mm.buffer
-	if not data.is_empty():
-		copy.buffer = data
+	if lod_cpu_copy and st.from_apply:
+		var xforms: Array = st.group.drawn if (st.group != null and not st.group.drawn.is_empty()) else (st.group.bases if st.group != null else st.xforms)
+		_fill(copy, before, xforms, st.colors, st.custom)
+		if st.custom:
+			if st.group != null:
+				for i in mini(copy.instance_count, st.group.customs.size()):
+					copy.set_instance_custom_data(i, st.group.customs[i])
+			else:
+				for i in copy.instance_count:
+					copy.set_instance_custom_data(i, Color(0.0, 0.0, 0.0, 0.0))
+				for s: Array in st.switches:
+					for entry: Array in _switches.get(s[1], []):
+						if entry[0] == mm and int(entry[1]) == int(s[0]) and bool(entry[2]):
+							copy.set_instance_custom_data(int(s[0]), Anim.BELT_STOPPED)
+							break
+		count("lod_cpu_copies")
+	else:
+		copy.use_colors = mm.use_colors
+		copy.use_custom_data = mm.use_custom_data
+		copy.mesh = before
+		copy.instance_count = mm.instance_count
+		var data := mm.buffer
+		if not data.is_empty():
+			copy.buffer = data
+		count("lod_buffer_readbacks")
 	copy.visible_instance_count = mm.visible_instance_count
 	var node := MultiMeshInstance3D.new()
 	node.multimesh = copy
@@ -1015,6 +1107,93 @@ func _add_cargo_pieces(rec, base: Transform3D, by_model: Dictionary, recs_by_mod
 	return waiting
 
 
+## A drill's fluid part (ModelLibrary.wet_model: `<drill>-wet`, while the resource under it needs fluid) over the
+## drill at its own place. True while its model is being made.
+func _add_wet(rec, proto: ProtoDB.EntityProto, base: Transform3D, by_model: Dictionary, recs_by_model: Dictionary, parts_by_model: Dictionary) -> bool:
+	var name := ModelLibrary.wet_model(proto.name, proto.type, rec.extra, rec.dir)
+	if name == "":
+		return false
+	if not ModelLibrary.ready(name):
+		return true
+	var mesh := ModelLibrary.mesh_for(name)
+	if mesh == null:
+		return false
+	if not PipelineWarm.mesh_ready(mesh):
+		return true
+	if not by_model.has(mesh):
+		by_model[mesh] = []
+		recs_by_model[mesh] = []
+		parts_by_model[mesh] = ModelLibrary.parts_for(name)
+	by_model[mesh].append(base)
+	recs_by_model[mesh].append([rec, proto.type])
+	return false
+
+
+## Pipe covers (pipe_covers.gd) on a machine's connections with nothing connected (its record's `covers`,
+## world.gd _cover), from the pack that draws it. True while the cover is being made.
+func _add_covers(rec, proto: ProtoDB.EntityProto, base: Transform3D, by_model: Dictionary, recs_by_model: Dictionary, parts_by_model: Dictionary) -> bool:
+	var name := PipeCovers.model_for(ModelLibrary.drawing_pack(proto.name, proto.type, rec.extra, rec.dir))
+	if name == "":
+		return false
+	if not ModelLibrary.ready(name):
+		return true
+	if name.begins_with(PipeCovers.ENDING + "@") and not ModelLibrary.ready(PipeCovers.STRAIGHT + name.substr(PipeCovers.ENDING.length())):
+		return true
+	var made := PipeCovers.cover(name, func(n: String) -> Mesh: return ModelLibrary.mesh_for(n))
+	if made.is_empty():
+		return false
+	var mesh: Mesh = made[0]
+	if not PipelineWarm.mesh_ready(mesh):
+		return true
+	if not by_model.has(mesh):
+		by_model[mesh] = []
+		recs_by_model[mesh] = []
+		parts_by_model[mesh] = []
+	# At the entity's position, turned as its model (a model's placement offset isn't its connections').
+	var at := Transform3D(base.basis, Vector3(rec.pos.x, base.origin.y, rec.pos.y))
+	for place: Transform3D in PipeCovers.places(rec.cover_ports, rec.covers, at):
+		by_model[mesh].append(place)
+		recs_by_model[mesh].append([rec, proto.type])
+	return false
+
+
+## An ore tile's rocks (ModelLibrary.ore_rock_places) into `scattered`, per model and rank. False while a
+## rock's pipelines are being compiled (pipeline_warm.gd): drawn in a moment, the tile whole.
+func _scatter_ore(rec, ore: String, rocks: Array, scattered: Dictionary) -> bool:
+	for rock: Mesh in rocks:
+		if not PipelineWarm.mesh_ready(rock):
+			return false
+	var places := ModelLibrary.ore_rock_places(rec.fixed, Vector3(rec.pos.x, 0.0, rec.pos.y), int(rec.extra.get("a", 1000)), rocks.size(), ore)
+	for rank in places.size():
+		var rock: Mesh = rocks[int(places[rank][0])]
+		if not scattered.has(rock):
+			scattered[rock] = []
+		var ranks: Array = scattered[rock]
+		while ranks.size() <= rank:
+			ranks.append([])
+		(ranks[rank] as Array).append([places[rank][1], rec])
+	return true
+
+
+## A far chunk shows one rock an ore tile (its scattered ore's first rank), a near one all: in place, no build
+## (far_chunks.gd, when the chunk goes far or comes near).
+func thin_ore() -> void:
+	for rock: Mesh in _ore_near:
+		for table: Dictionary in [_nodes, _shadows]:
+			var mmi: MultiMeshInstance3D = table.get(rock)
+			if mmi != null:
+				_thin(mmi.multimesh, rock)
+
+
+## Sets a MultiMesh's visible count: a scattered ore model's (`key`) in a far chunk its first rank's.
+func _thin(mm: MultiMesh, key: Variant) -> void:
+	var shown := -1
+	if key is Mesh and _ore_near.has(key) and far.far:
+		shown = mini(int(_ore_near[key]), mm.instance_count)
+	if mm.visible_instance_count != shown:
+		mm.visible_instance_count = shown
+
+
 ## A modeller's pieces where a line of belts begins or ends (belt_ends on its record, from world.gd), on a
 ## belt, each half of a splitter and an underground's open end. True while some piece's model is being made.
 ## A piece's moving parts go in `cap_parts` ([piece mesh, part index] -> [transforms, records]) rather than
@@ -1070,6 +1249,7 @@ func _shadow_proxy(model: Mesh, xforms: Array, budget: Budget, key: Variant = nu
 		if budget != null:
 			budget.left -= 1
 	_fill(mmi.multimesh, proxy, xforms, [], false)
+	_thin(mmi.multimesh, key)
 	# The proxy may still be empty: give it the model's bounds so it isn't culled once filled (and
 	# room for the hills' lift, ground_height.gd).
 	GroundHeight.cull_box(mmi, _bounds(model.get_aabb(), xforms))
@@ -1141,7 +1321,7 @@ func _model_transform(proto: ProtoDB.EntityProto, rec) -> Transform3D:
 
 ## A moving part's or glowing model's instances, handed to anim.gd, which sets them to where their
 ## entities' states have them now (most move in the shader from there).
-func _add_group(mm: MultiMesh, part: ModelLibrary.AnimPart, xforms: Array, recs: Array, working: Dictionary, anim: Anim) -> void:
+func _add_group(mm: MultiMesh, part: ModelLibrary.AnimPart, xforms: Array, recs: Array, working: Dictionary, anim: Anim) -> Anim.Group:
 	var group := Anim.Group.new()
 	group.mm = mm
 	group.part = part
@@ -1153,10 +1333,11 @@ func _add_group(mm: MultiMesh, part: ModelLibrary.AnimPart, xforms: Array, recs:
 		group.keys.append(rec.key)
 		group.units.append(rec.unit)
 		group.bases.append(base)
-		group.stateful.append(1 if Anim.has_state(str(recs[i][1])) else 0)
+		group.stateful.append(Anim.state_source(str(recs[i][1])))
 		var custom := Anim.custom_for(rec, 1.0)
 		if part != null and part.upright:
 			custom.b = 0.0  # its sprite is drawn facing north
 		group.customs.append(custom)
 	Anim.place(group, anim, working)
 	anim_groups.append(group)
+	return group

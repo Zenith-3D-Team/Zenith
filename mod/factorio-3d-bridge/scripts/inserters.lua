@@ -346,14 +346,13 @@ end
 -- counting stacks), found on the belt now: those nearest the hand at (px, py) with the newest ids (an
 -- item gets its unique_id when it comes onto a belt: the one just dropped is the newest there), within
 -- PLACE_NEAR. A few reads of the drop belt's lines a drop: only for a client that asked (`ho`).
-local function placed(st, now, px, py, n)
-  local belt = st.e.drop_target
+local function placed_on(belt, st, now, px, py, n)
   if not (belt and belt.valid and BELTISH[belt.type]) then
-    return
+    return 0
   end
   local unit = belt.unit_number
   if not unit then
-    return
+    return 0
   end
   local found = {}
   for i = 1, belt.get_max_transport_line_index() do
@@ -378,6 +377,11 @@ local function placed(st, now, px, py, n)
       cnt, unit)
     got = got + math.max(cnt, 1)
   end
+  return got
+end
+
+local function placed(st, now, px, py, n)
+  placed_on(st.e.drop_target, st, now, px, py, n)
 end
 
 -- The hand set off for an end: checked when it should arrive (the drop end, holding; the pickup,
@@ -657,6 +661,34 @@ end
 
 -- `ie`: the events of the last O.every * O.repeat ticks (each goes O.repeat times, in as many
 -- messages, so a lost datagram loses none), by tick.
+-- `ih` for a wire version 3 client: each part a kind 22 frame (k, part, parts, p, then the hands as one block,
+-- whole: not delta-coded). Every part is made before any is sent; nil when string.pack refuses a number (the
+-- caller sends JSON), else the bytes.
+local function hands_frames(flat, period)
+  local n = HANDS_PER_MESSAGE * 4
+  local parts = math.max(1, math.ceil(#flat / n))
+  local frames = {}
+  for part = 1, parts do
+    local out = { string.pack("<I4I4I4I4", game.tick, part, parts, period) }
+    transport.pack_block(out, flat, (part - 1) * n + 1, math.min(part * n, #flat))
+    frames[part] = table.concat(out)
+  end
+  return frames
+end
+
+local function send_hands_bin(flat, period)
+  local ok, frames = pcall(hands_frames, flat, period)
+  if not ok then
+    return nil
+  end
+  local bytes = 0
+  for _, body in ipairs(frames) do
+    transport.send_frame(transport.KIND_IH, "ih", body)
+    bytes = bytes + #body
+  end
+  return bytes
+end
+
 local function send_events(now, window)
   local keep = {}
   local flat = {}
@@ -689,6 +721,20 @@ local function wants()
   return ev, sm
 end
 M.wants = wants
+
+-- (PLACED with no inserter, `/f3d-perf drop_put`) The item the character just dropped on `belt` with Zenith's Z at
+-- (x, y) (tiles; ui_actions.lua), told at once as a hand's put is, with unit 0: its lane, place and id, so the
+-- client's belt simulation has it now instead of at the lane's next read. For a client whose hello says `ho` and
+-- that gets the events. Returns how many were told (0 or 1).
+local DROP_HAND = { u = 0 }
+function M.put_by_hand(belt, x, y)
+  local client = storage.f3d.client
+  if not (client and client.ho and wants()) then
+    return 0
+  end
+  local ok, got = pcall(placed_on, belt, DROP_HAND, game.tick, x, y, 1)
+  return ok and got or 0
+end
 
 -- --- the debug trace (tools/inserter_check.py) ---------------------------------------------------
 --
@@ -956,7 +1002,9 @@ function M.tick()
     -- Like `mv`, every update is the full list, split into parts that share the tick `k`; `p`, the
     -- ticks between updates.
     local flat = collect()
-    local bytes = transport.send_groups("ih", flat, 4, HANDS_PER_MESSAGE, ',"p":' .. rate.period("ih", interval))
+    local period = rate.period("ih", interval)
+    local bytes = transport.binary(3) and send_hands_bin(flat, period)
+      or transport.send_groups("ih", flat, 4, HANDS_PER_MESSAGE, ',"p":' .. period)
     if tr and s.ih_trace then
       tr.sends = tr.sends + 1
       tr.hands = tr.hands + #flat / 4

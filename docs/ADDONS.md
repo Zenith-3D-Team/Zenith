@@ -5,9 +5,18 @@ the client does: a camera for filming, an overlay, a window of your own. It is w
 GDScript, Godot's scripting language, and gets one object from Zenith, the add-on API, through
 which it reads what the client knows of the game and changes what the client shows.
 
-**Nothing an add-on does changes the game.** The API only reads the client's own copy of the
-world and moves the camera, the interface and what is drawn. Everyone else in the game sees
-nothing of it, and Factorio's simulation is untouched.
+**Add-ons are programs.** An add-on runs inside Zenith with the player's own rights: like any
+program on the PC it can read and change files, start other programs and use the network, and Godot
+has no way to wall it off. So Zenith leaves a new add-on off until the player switches it on in the
+Add-ons menu, and says there that only add-ons from people you trust should be switched on. Model
+and icon packs are data, not programs: they are the safe way to share models and icons.
+
+**An add-on changes the game only through a Factorio mod of its own that everyone in that game has.** The rest of
+the API only reads the client's own copy of the world and moves the camera, the interface and what is drawn:
+everyone else sees nothing of it and Factorio's simulation is untouched. An add-on that wants to change the game
+(a sprint, a new tool) comes with a Factorio mod; `api.game` carries messages between the two, and the mod, which
+Factorio gives to every player in that game, makes the change. Zenith only carries the messages and never looks
+inside them.
 
 The [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) add-on (free
 camera, timelapses, tracking shots, paths, idle mode, a recorder camera filming in the background,
@@ -39,8 +48,15 @@ without an `addon.json`, is listed with the reason. When an add-on with the same
 twice (a folder and a zip, two zips), the newer version is used (a folder on a tie, and one given
 with `--addons` always), and its page in the Add-ons menu names the copy left out.
 
-Zenith looks for add-ons when it starts. The **Add-ons** menu (the main menu, the game menu Esc
-opens, and Settings) lists them, each with its version, whether it's on and the reason when one
+A newly found add-on is **off until you switch it on** in the Add-ons menu (its page says so, and
+where it was found): it is a program, and switching it on is your say-so. The add-ons that come with
+a download start as its `addons/bundled.json` says (the Cinematic camera and shaders on, Terrain
+Elevation off), and one given with `--addons` is always on. Add-ons that were already on before
+Zenith turned new ones off stay on. `-- --addons-default=on` starts every add-on not yet switched as
+on, as before.
+
+Zenith looks for add-ons when it starts. The **Add-ons** menu (the main menu and the game menu Esc
+opens) lists them, each with its version, whether it's on and the reason when one
 couldn't load; clicking one opens its page: its switch (it applies at once, in a game too), its
 settings (`api.settings`, API 1.1), the options it builds itself (`api.ui.set_options`) and its
 keys. The main menu's **Mods** window lists them too, under *Zenith add-ons*. An add-on given with
@@ -86,17 +102,70 @@ my-addon/
 |---|---|
 | `id` | Lower case letters, digits, `-` and `_`. Names the add-on's keys, data folder and node |
 | `name`, `version`, `description`, `author` | Shown in the Add-ons menu, the Mods window and Settings → Controls |
-| `api` | The add-on API it was written for: `1` (any 1.x), or `1.1` to `1.6` (needs the additions marked with that level below). Zenith refuses an add-on that needs a newer API than it has, and says so in the Add-ons menu: update Zenith |
+| `api` | The add-on API it was written for: `1` (any 1.x), or `1.1` to `1.7` (needs the additions marked with that level below). Zenith refuses an add-on that needs a newer API than it has, and says so in the Add-ons menu: update Zenith |
 | `entry` | The entry script, a `.gd` file in the folder |
+| `dependencies` | *(1.7)* Other add-ons and Factorio mods it needs, works with or can't run with, in Factorio's form (below). Optional |
 
-This page describes add-on API **1.6**: version 1 with additions that keep every 1.0 add-on
-working. The additions are marked *(1.1)* to *(1.6)*. An add-on that wants to run on a Zenith with 1.0 too
+This page describes add-on API **1.7**: version 1 with additions that keep every 1.0 add-on
+working. The additions are marked *(1.1)* to *(1.7)*. An add-on that wants to run on a Zenith with 1.0 too
 asks for `"api": 1` and checks before using them:
 
 ```gdscript
 if api.get("level") != null and api.level >= 1.1:
 	api.settings.add("distance", "number", 60.0, "Distance", {"min": 10, "max": 300, "unit": "tiles"})
 ```
+
+### Dependencies *(1.7)*
+
+An add-on that needs another add-on, or a Factorio mod in the game, says so in `addon.json` the way
+Factorio's `info.json` does:
+
+```json
+"dependencies": ["cinematic-camera >= 0.3.0", "? terrain-elevation", "mod:space-age >= 2.1.0", "! old-camera"]
+```
+
+Each entry is `"<prefix> <name> <op> <version>"`; the prefix and the version are optional, the ops are
+`<`, `<=`, `=`, `>=` and `>`. A bare name is another add-on's id; `mod:<name>` is a Factorio mod (ids
+can't hold `:`). A Factorio mod whose name has a space (Factorio allows it) can't be named after `mod:`
+yet. The Zenith API it needs stays in `api`. The prefixes, as Factorio's:
+
+| Prefix | |
+|---|---|
+| none | Required: the add-on doesn't start without it, at a fitting version |
+| `?` | Optional: absent or switched off, nothing happens; there and on, its version must fit, and it starts first |
+| `(?)` | Optional, as `?`, and not named on the add-on's page |
+| `!` | Incompatible: the two don't run together. Whichever is already running wins: if one stops for a game's Factorio mods, the other may start in its place and keeps it when the game ends |
+| `~` | Required, but doesn't change the order the add-ons start in, so two add-ons may need each other this way: it only has to be installed, switched on and at a fitting version |
+| `+` | Recommended: treated as optional (Zenith has no launcher to suggest it) |
+
+**Other add-ons** are checked when the add-on starts. If one isn't met the add-on doesn't start, and
+its page in the Add-ons window says why in red: the other isn't installed, is switched off, is too old
+(the version found is named), or couldn't load; or one running can't run with it. Add-ons that need
+each other in a circle (A needs B, B needs A) are all refused. Zenith never switches another add-on on
+for yours: switching an add-on on is the player's consent, so the page says what to switch on instead.
+Switching off an add-on that others need stops them first, with the reason on their pages; their own
+switches stay on, so switching it back on starts them again. Reloading an add-on (Testing, below)
+reloads the add-ons that need it too.
+
+**Factorio mods** can only be checked in a game: Zenith learns the game's mods when it joins. An add-on
+whose required mod the game doesn't have, at a fitting version, stops for that game (its page says
+which mod) and starts again when the game ends; in the menu it runs, so its keys and settings are there.
+An optional mod only stops it when the game has it at a version that doesn't fit; `!` stops it when the
+game has the mod.
+
+**Order.** Add-ons start by the depth of their dependency chains, as Factorio loads its mods: one that
+needs nothing first, then one that needs only those, and so on. Two at the same depth start in the order
+they were found (the command line's, your user folder's, Zenith's own; by folder name in each), where
+Factorio sorts by name; so add-ons without dependencies start exactly as before. A stop for a dependency
+goes the other way: the add-ons that need it stop first.
+
+Ask `api.addons.version(id)` *(1.7)* whether an optional add-on is running: its version, or `""`.
+An add-on with an optional Factorio mod (`"? mod:<name>"`) asks `api.game.mod(name)` whether this game has it.
+Reaching into another add-on's node or scripts works today but isn't promised: its insides may change in
+any version. Calls between add-ons may come later, as part of the API.
+
+An older Zenith (before 1.7) ignores `dependencies`. If your add-on relies on them being checked, ask for
+`"api": 1.7`. `--addon-requires=off` loads add-ons without checking them, in the order found.
 
 ## The entry script
 
@@ -151,6 +220,7 @@ A few GDScript notes:
 | `api.game_started`, `api.game_ended` | Signals |
 | `api.note(text)` | A line in Zenith's log, marked with the add-on's id |
 | `api.load_script(path)` | One of the add-on's own scripts, by its path in its folder |
+| `api.addons.version(id)` | *(1.7)* The version of the add-on with that id while it runs, `""` when it isn't (not installed, off, refused): for optional dependencies |
 
 ### Camera: `api.camera`
 
@@ -159,7 +229,7 @@ Factorio's view, first person, the zoom) is kept as it was, and comes back exact
 
 | | |
 |---|---|
-| `take(options = {})` | Takes the camera; false when it can't now (no game, another add-on has it, a ride to a space platform, VR). Options: `"input"` (default `true`: the player's controls are off and the character stops; your `"camera"` keys work), `"focus"` (`"camera"`, the default: the world loads round the ground in the middle of the picture; `"character"`: round the character) |
+| `take(options = {})` | Takes the camera; false when it can't now (no game, another add-on has it, a ride to a space platform, VR). Options: `"input"` (default `true`: the player's controls are off and the character stops; your `"camera"` keys work), `"focus"` (`"camera"`, the default: the world loads round the ground in the middle of the picture; `"character"`: round the character), `"aim"` *(1.7)* (`"center"`: building, mining, the hover, Ctrl+clicks and shots aim at the middle of the screen through your camera, as first person does; only with `"input": false`, since with the player's controls off nothing aims; `"input"`'s default stays `true`) and `"crosshair"` *(1.7)* (default `true`: Zenith's dot in the middle while aiming at the centre). The mouse never turns the hidden first-person view while you have the camera |
 | `release()` | Back to the player's view |
 | `has()`, `has_input()` | Whether this add-on has it, and the player's controls are off |
 | `node()` | The `Camera3D` itself while you have it (else null): set its `global_transform`, `fov`, `projection`, `size`, `near`, `far`, `attributes` (depth of field). All of it is put back on release |
@@ -171,6 +241,40 @@ Factorio's view, first person, the zoom) is kept as it was, and comes back exact
 | `capture_mouse(on)`, `mouse_captured()` | The mouse hidden and captured (its motion arrives as `InputEventMouseMotion.relative`, for mouse look) while you have the camera; Zenith gives it back while a window or menu is open |
 | `ground_point(screen_pos)`, `center_ground()` | The ground under a point of the screen, or its middle (`null` above the horizon) |
 | `lost` | Signal: Zenith took the camera back (a ride to a platform started, the game ended) |
+| `set_modifier(offset = Vector3.ZERO, turn = Vector3.ZERO, fov = 0.0)` *(1.7)* | A bob, a sway, a shake or a kick on top of the player's own view (the angled view, Factorio's view, first person), from the next frame until changed: `offset` in tiles in the camera's frame (`x` right, `y` up, `-z` forward), `turn` in radians (`x` pitch, `y` yaw, `z` roll) about the moved eye, `fov` degrees added to the view's own (ignored by orthographic views). Every add-on's modifier is added up, then capped: the offset at 1.5 tiles, pitch and yaw at 20 degrees, roll at 45, the FOV change at 30 either way and the result between 10 and 120; not-a-number counts as 0. No easing: set it each frame. Not drawn in a ride's film, the remote view, VR or while an add-on has the camera (kept, and drawn again after); `take()` keeps the player's view without it. Gone when your add-on stops or the game ends. `--camera-modifiers=off` turns them off for a run |
+| `clear_modifier()` *(1.7)* | The same as `set_modifier()` |
+| `modifier()` *(1.7)* | Your add-on's own modifier as set: `{offset, turn, fov}` (what you set, not what is drawn) |
+| `mode()` *(1.7)* | What the camera is doing now, one of the modes below (`""` outside a game) |
+| `player_mode()` *(1.7)* | The player's own view under an add-on's take-over, the one `release()` goes back to: `mode()` without `"addon"` |
+| `mode_changed(mode, previous)` *(1.7)* | Signal: the mode changed, within a frame of it, to every add-on listening (not only the one holding the camera); once per change. A change that passes through a mode within one frame (F6 in first person leaves it, then snaps) is reported once, from the old to the new. Your own `take()` and `release()` fire it too |
+
+A modifier is drawn only, like the character's lift: walking keeps the directions of the view from
+before it (a sway never bends where the character walks), the first-person pick reaches no further
+from a moved eye (its 64 tiles less the offset's length), and the character, its reach and every
+command stay the game's. Picks follow the picture as drawn: a turned or moved view moves the ground
+point of a click or a shot as moving the mouse would. So keep the motion gentle, and the player in
+mind: that is yours to do. Don't shake the view while the player builds (a cursor in hand, a drag),
+and ease a modifier in and out yourself rather than jump it. The player can scale your camera motion down
+in Settings > Camera (Add-ons' camera motion, 0 to 100%; 0 draws none), applied to every add-on's sum
+before the caps, and `modifier()` gives what you set, not what is drawn. A camera of your own from
+`take()` and its `aim` aren't scaled.
+
+The modes *(1.7)*, the first that holds:
+
+| Mode | |
+|---|---|
+| `"addon"` | An add-on has the camera; `has()` says whether it is yours |
+| `"vr"` | The headset is the camera (`take()` refuses there) |
+| `"ride"` | Zenith's own film of a rocket or cargo pod ride |
+| `"remote"` | The remote view: from the map, a train's camera, the view round a platform's hub. The camera is not at the character (also when first person is on under it) |
+| `"first_person"` | In the character's eyes; the crosshair aims |
+| `"factorio"` | Factorio's view (F6) exactly as snapped; zoomed, turned or tilted since, it is `"angled"` again |
+| `"angled"` | The normal angled view |
+
+More modes may come within version 1: treat one you don't know as not first person. The
+projection (F7) is not a mode: each view keeps its own, and `player_orthographic()` says it. The
+map (M) is a window over the world, not a mode. Nothing is compared until an add-on reads
+`mode_changed`; `mode()` itself reads when called.
 
 The world is only loaded and sent round one point. A camera far from the character makes Zenith
 load the world there (the bridge sends what is near the focus), so flying far is fine; but
@@ -212,7 +316,7 @@ returns copies.
 
 | | |
 |---|---|
-| `character()` | The client's own character: `{unit, position, forward, vehicle, visible}` (`{}` outside a game) |
+| `character()` | The client's own character: `{unit, position, forward, vehicle, visible}` (`{}` outside a game). For more, `api.character` *(1.7)* |
 | `movers(types = [])` | Moving things of these prototype types (all when empty): `[{unit, type, name, position, forward}]`. Types: `locomotive`, `cargo-wagon`, `fluid-wagon`, `artillery-wagon`, `car`, `spider-vehicle`, `character` (other players), `logistic-robot`, `construction-robot`, `combat-robot`, `unit` (biters, spitters), `spider-unit`, `rocket-silo-rocket`, `cargo-pod` |
 | `mover(unit)` | One of them, or `{}` when it's gone or too far |
 | `trains()` | `[{id, state, manual, speed (tiles a tick, negative backwards), station (the stop's unit, 0 none), destination, carriages (units, front first)}]` |
@@ -223,6 +327,7 @@ returns copies.
 | `entities_in_chunk(chunk, types = [])` | Its buildings, trees, rocks...: `[{unit, name, type, position (Vector2), direction (0-15), working (true, false, or null)}]` |
 | `entities_near(point, radius, types = [])` | The same round a ground point |
 | `focus()` | The point the world is loaded round |
+| `stand_height_at(point)` *(1.7)* | How high the character would stand at a ground point (a `Vector2`), in tiles over the ground there: the drawn top of a belt, underground belt, splitter, loader, pipe-to-ground, heat pipe or ground rail (Factorio's character walks over these), the highest where several meet; 0 for bare ground and everything else. The model's top once it is in, else its placeholder's. This is the whole answer, uncapped: Zenith's own belt step-up uses only the belt family (belts, undergrounds, splitters, loaders, linked belts) and stands the body at most 0.3 tiles up. Cheap enough to ask each frame (a few box tests). From the prototype types only: a mod that changes what the character collides with isn't seen |
 | `hold_chunks(on)` *(1.6)* | While on, chunks the camera leaves aren't unloaded: the world keeps everything already drawn, as the bridge last sent it (it no longer updates chunks out of the view), and the chunks round the new focus still come. For a screenshot or a film of a long flight. Capped by memory: at most 1,600 chunks held past the view (a 40 x 40 square, about 1,300 tiles across), and fewer once the computer has under 1 GB of memory free; past either the held chunks farthest from the focus go first, and Zenith's log says so once. Held while any add-on asks; switching the add-on off lets them go |
 | `holding_chunks()`, `held_chunks()` *(1.6)* | Chunks are held now (by any add-on); how many are held past the view |
 | `daytime()`, `darkness()` | The time of day as drawn (0 noon, 0.5 midnight) and how dark it is (0 to 0.85) |
@@ -245,6 +350,147 @@ Worked out by the client from what the bridge already sends; nothing extra is as
 `recent(seconds = 60)` lists the last events, newest first, each `{kind, time, age, position, ...}`
 with the signal's values by name; `fights()` the fights going on, `[{position, since, size}]`.
 
+### The character: `api.character` *(1.7)*
+
+The client's own character: its state, its gear and its moments, from what the client already
+has (nothing is asked of the game, nothing about other players). Read-only, but for the drawn lift,
+attachments and pose below. Each add-on has its own `api.character`; reading one of its signals (to connect a handler)
+starts Zenith watching for them at once, also through a copy of `api.character` kept for later, so an
+add-on that only reads its state or lifts the body costs nothing each frame, and switching your add-on
+off removes every handler you connected to it, its lift and pose, and frees the nodes it attached.
+
+| | |
+|---|---|
+| `exists()` | A living character whose state is known: in a game, heard from since the last connection, not dead. Also true in a vehicle, a platform's hub, a rocket or pod, and with the remote view open |
+| `state()` | The table below as one Dictionary (a copy). `{}` outside a game and before the character's first update. While dead: the same keys, `dead` true, `health` 0, `walking`, `mining`, `firing` false, `position` where it died |
+| `weapons()` | `{selected, vehicle, slots}`: the gun slots as the tool bar shows them. `selected` is 1-based; `vehicle` the unit whose guns these are (0: the character's own; in an armed car, tank or spidertron the list is the vehicle's); `slots`: `[{gun, ammo, magazines, rounds, magazine_size}]`, item names `""` for an empty slot, `rounds` what is left in the magazine in use, -1 where the bridge doesn't say. `{}` before the first report |
+| `armor()` | The item in the armour slot, `""` for none or not known yet |
+| `held()` | `{item, quality}` for what is in the hand (the cursor), `{}` for an empty hand. No count: Zenith's hand isn't Factorio's cursor stack |
+| `set_lift(height, offset = Vector3.ZERO, camera = false)` *(1.7)* | Draws the character `height` tiles up and `offset` across the ground (`x` east, `z` south; its `y` is ignored) from where the game has it, from the next frame until changed: a jump, a lean, a ride on something. The body, its shadow, the lantern, the health bar, shots' muzzle, flames on it and its steps' sound and dust follow; the flashlight's picture on the ground only moves across. The camera stays still unless you pass `camera` true: then the first-person eye and the angled view's centre follow this lift too (the sum of the lifts set with `camera`, capped as the body's is). Zenith's own belt step-up never moves the camera. No easing: set it each frame for an arc, and ease your own number (with `camera`, first person feels every step of it). Several add-ons' lifts add up, capped at 16 tiles up and 1 tile across; not-a-number and a negative height count as 0. Not drawn in a vehicle or dead (kept, and drawn again after). Gone when your add-on stops or the game ends |
+| `clear_lift()` *(1.7)* | The same as `set_lift(0.0)` |
+| `lift()` *(1.7)* | Your add-on's own lift as a `Vector3` (`y` the height), `Vector3.ZERO` for none |
+
+Zenith itself draws the character on top of belts it walks over (Settings > Graphics > Step onto belts,
+on by default): belts, underground belts, splitters, loaders and linked belts only, at most 0.3 tiles up
+(pipes-to-ground, heat pipes and rails are walked past at ground level, as Factorio draws them). It adds
+to your lift, is in `state()`'s `height` and `lift`, and never moves the camera.
+An add-on that draws its own step onto belts can ask the player to switch it off.
+
+The lift is drawn only. The game's character stays where it is: reach, mining, building, picking up,
+what shots hit and what hits you are all measured from the game's position on the ground, and a lifted
+character collides exactly as an unlifted one. The crosshair in first person still picks at most 64
+tiles from the eye, so a raised eye reaches less far across the ground, never further. Nothing is sent
+to the game.
+
+#### Attachments and a pose *(1.7)*
+
+Things of your own on the character (a hat, a backpack, a held gun, a viewmodel) and turns of its
+bones over Zenith's own animations. Drawn only, like the lift: nothing is sent to the game, and the
+character's place, reach and what it hits are unchanged.
+
+| | |
+|---|---|
+| `attach(node, to, offset = Transform3D.IDENTITY)` *(1.7)* | Keeps your `Node3D` at the bone or point `to` (the tables below), `offset` in its frame, drawn from this frame on: it follows the pose, the lift and the hills, hides with the body (a vehicle, a hub or pod, first person), falls with it when it dies, and is moved to the new look's bones when the armour changes. `view` is the other way round: on the camera, shown only in first person. The node and its children are put on the character's own render layer, so the lantern's shadows don't flicker on a hat. False for an unknown name or outside a game. Kept across games (put on the next game's character) and freed when your add-on stops |
+| `detach(node)` *(1.7)* | Hands the node back out of the tree, not freed |
+| `frame(name)` *(1.7)* | The bone's or point's `Transform3D` in the world as drawn now (pose, lift, hills); `null` for an unknown name or outside a game. Also while the body is hidden |
+| `rig()` *(1.7)* | `{mech, height, bones, points}`: mech armour or not, `height` the `head_top` point at rest over the feet (1.72 tiles plain, 2.76 in mech armour), for scaling what you attach; the names |
+| `set_muzzle(node, at = Vector3.ZERO)`, `clear_muzzle()` *(1.7)* | Zenith's muzzle flashes, beams and streams start at `at` in your node's frame while the node is in the tree (your own gun's barrel). The newest set wins |
+| `hide_tools(on)` *(1.7)* | Zenith's own pickaxe and gun aren't drawn while on (you draw your own) |
+| `set_pose(turns, options = {})` *(1.7)* | Your add-on's pose layer, until changed. `turns`: bone name to a `Vector3` of radians. Options: `"weight"` 0 to 1 (1), `"replace"` an Array of bones or `true` for all |
+| `clear_pose()`, `pose()` *(1.7)* | Takes your layer away; your layer's turns (`{}` for none) |
+
+**Bones**, frozen for version 1: `hips`, `spine`, `head`, `right_upper_arm`, `left_upper_arm`,
+`right_lower_arm`, `left_lower_arm`, `right_upper_leg`, `left_upper_leg`, `right_lower_leg`,
+`left_lower_leg`. A bone's frame is its joint (where it turns).
+
+**Points**, frozen for version 1 (attach and `frame` only, not posed):
+
+| Point | Carried by | Where | For |
+|---|---|---|---|
+| `head_top` | `head` | the top of the head | a hat |
+| `eyes` | `head` | in front of the face at eye height | glasses; where an eye is |
+| `back`, `chest` | `spine` | the middle of the back, behind and in front | a backpack, a cape; a badge, a strap |
+| `right_hip`, `left_hip` | `hips` | beside the thighs' tops | a holster, a pouch |
+| `right_hand`, `left_hand` | the lower arms | the forearm's end | a gun, a tool |
+| `right_foot`, `left_foot` | the lower legs | the shin's end, at the sole | footprints, jets |
+| `muzzle` | none | where Zenith's shots start (`set_muzzle` doesn't move it) | a flash of your own |
+| `view` | the camera | the first-person eye | a viewmodel: arms and a gun |
+
+**Axes**, frozen for version 1: a bone's and a point's frame at rest is the model's: `-z` forward, `y`
+up, `x` the character's right. The hands differ: `-z` runs along the forearm past the hand and `y`
+faces forward at rest, the frame Zenith's own gun is held in, so a gun modelled with its barrel along
+`-z` sits right. How deep `back`, `chest`, `eyes` and the hips sit is measured from each look's model
+(`client/data/character_points.json`), just outside its surface. In mech armour the right hand is the
+end of its arm gun and the left its claw: a hand gun looks wrong there (`rig().mech` says so).
+
+**A turn** means what it does in Zenith's own animations: about the bone's joint, in the model's axes
+at rest; `x` swings a hanging limb forward (and tips the spine and head back), `z` swings a right limb
+out to the side (a left one in), `y` twists. Children turn with their parents. By default your turns
+are added to Zenith's (times the weight): a lean, a nod. With `replace`, Zenith's own turn for those
+bones fades out by the weight and yours stands alone: arms held on a gun while the legs run. Several
+add-ons' layers apply in the order the add-ons were started, each adding to or blended over what is
+there. Each bone a layer touches is then held to its joint's range (an elbow bends one way; Zenith's own
+animations all stay inside the ranges); not-a-number counts as 0, other keys are ignored. The layer
+fades as the body falls dead, and the turns only turn: the body's place is the lift's.
+
+The `view` point is a viewmodel's anchor with no frame of lag, but version 1 has no separate pass for
+it: a viewmodel clips into walls and buildings close in front and takes the camera's FOV changes with
+the world. `set_pose` reads last frame's run cycle, so pose a viewmodel at `view`, not the body's arm.
+The body in first person is not shown yet (planned, not promised).
+
+`state()`'s keys. "Drawn" values are as drawn this frame, a couple of ticks behind the game;
+the others are the game's last report (one a tick).
+
+| Key | |
+|---|---|
+| `unit` | The character's unit number; a new one after a respawn |
+| `position`, `forward` | Where it is drawn and where its body faces (drawn; the same as `api.world.character()`'s). `y` is 0: the ground's height is `api.terrain.height_at(x, z)`. In a vehicle the vehicle's position; `forward` stays the character's own |
+| `height` | How far the body is drawn above the ground under it, in tiles (drawn): mech armour's flight, add-ons' lifts and Zenith's belt step-up *(1.7)*, 0 otherwise. Draw over the character at `position + Vector3(0, ground + height, 0)` (plus `lift`'s `x` and `z`) |
+| `lift` *(1.7)* | Every add-on's `set_lift` together and Zenith's belt step-up (Settings > Graphics > Step onto belts: the character drawn on the top of a belt it stands on, eased, as `api.world.stand_height_at` gives it), after the caps: a `Vector3`, `y` the height, `x` and `z` across (the add-ons' part kept in a vehicle or dead, where it isn't drawn) |
+| `speed` | How fast it moves over the ground along its facing, in tiles a tick (Factorio's unit: plain running is 0.15), negative running backwards (it does while shooting). 0 standing and in a vehicle (drawn) |
+| `stride` | Where the run cycle is, 0 to 1: 0 as the right foot comes down, 0.5 the left; one loop is two steps. Holds still when not running (drawn) |
+| `walking`, `flying` | The game says it walks; the drawn body is off the ground (from the start of the take-off to the end of the landing: `took_off` and `landed` fire as it flips) |
+| `mining`, `mining_progress`, `mining_at` | Hand-mining now, 0 to 1, what (a `Vector3`, `null` when not mining) |
+| `repairing`, `repairing_at` | Mending with a repair pack, and what |
+| `firing` | Shots are going off (it lingers about a third of a second after the last round; `shot_fired` is the exact one) |
+| `health`, `max_health`, `shield`, `max_shield` | Whole points; shields 0 and 0 without any in the armour |
+| `vehicle`, `vehicle_speed` | The unit it sits in (0 none), and the vehicle's speed in tiles a tick, negative in reverse |
+| `in_hub`, `riding` | Sitting in a space platform's hub (no body in the world); in a rocket or cargo pod between surfaces (`position` where it boarded or will land) |
+| `dead` | Dead, until the respawned character's first update |
+| `body_visible` | The body is drawn now: false in a vehicle, in first person, in a hub or pod, while another surface is shown |
+| `on_shown_surface` | False while the remote view shows another planet or platform: `position` is then on a surface that isn't drawn |
+
+`api.world.character().visible` is the character's node's own flag (still true in a vehicle or
+first person, where no body is drawn); `state().body_visible` says whether a body is on screen.
+
+Signals. Their arguments are fixed for all of version 1 (Godot won't call a handler with fewer
+parameters than a signal sends, so none can be added); read anything more from `state()`. Nothing
+fires for what was already so when a game starts or the client reconnects (no `armor_changed` for
+the armour worn at the start, no `damaged` on the first report). "Drawn" ones follow the legs on
+screen; the rest come in the frame the bridge's message is handled, with Zenith's own flash and
+sound for it.
+
+| Signal | |
+|---|---|
+| `footfall(foot, position)` | A foot came down in the drawn run cycle, `"right"` or `"left"`; `position` is the drawn place on the ground (`y` 0): the feet are `state()`'s `height` and `lift` above it. The beat Zenith's own steps play on. Not in a vehicle, in the air or dead. Running backwards the beat comes as that foot lifts, a moment after it landed (drawn) |
+| `took_off()`, `landed()` | The drawn body left the ground (mech armour), and came back down. A landing cut short by a new take-off fires neither (drawn) |
+| `shot_fired(gun, ammo, target)` | One round from the character's own gun: item names, and the game's target on the ground. Not for streams (the flamethrower) or a vehicle's guns |
+| `mined(name, position, gone)` | Hand-mining finished: the prototype (`"item-on-ground"` for an item picked up with the mouse), `gone` false for a unit of ore from a patch still there. It also fires for each belt or pipe a build of the character's replaces |
+| `damaged(health_lost, shield_lost)` | Health or shield went down, at most once a frame, the frame's reports added up. Coarse: whole points, regeneration between two reports can hide a small hit, and the last hit before a death may not show. For a flash or a grunt, not for accounts |
+| `died(position)` | Once per death, where it died |
+| `respawned()` | The new character's first report after `died` (`state().unit` is new) |
+| `vehicle_entered(unit)`, `vehicle_left(unit)` | Got into a vehicle and out of it; from one straight into another, `left` then `entered` |
+| `armor_changed(item)` | The armour slot's item changed (`""` taken off) |
+| `gun_selected(slot, gun)` | The selected gun slot or the gun in it changed (Tab, a click, the gun swapped, the list becoming a vehicle's); not on ammo counts |
+
+```gdscript
+func addon_start(a) -> void:
+	api = a
+	if api.get("level") != null and api.level >= 1.7:
+		api.character.footfall.connect(func(foot: String, at: Vector3) -> void: _dust(at))
+		api.camera.mode_changed.connect(func(mode: String, _before: String) -> void: _hands.visible = mode == "first_person")
+```
+
 ### What is shown: `api.view`
 
 | | |
@@ -259,7 +505,7 @@ with the signal's values by name; `fights()` the fights going on, `[{position, s
 | `screen_size()` | |
 | `full_detail(on)` *(1.6)* | Everything drawn at its most until turned off (below). Nothing is saved: the player's settings come back as they were. It costs frames and the game's time while it lasts: for a shot, not to play with |
 | `full_detail_on()`, `full_detail_settled()` *(1.6)* | It is on (for any add-on); everything it asked for is drawn in the camera's view, for an add-on that takes its own pictures with `save_frame`. Chunks count only in the view (grown by 8 tiles), and one that hasn't arrived stops counting once the bridge has sent no new chunk for 3 s (it sends them as its work budget allows; one it never sends would hold the shot to its timeout); chunks off the view keep arriving after |
-| `screenshot(path = null, options = {})` *(1.6)* | A screenshot: hides the interface (as `hide_interface`, and add-ons' own layers and Zenith's debug menu too), turns full detail on and waits until everything is drawn, takes the picture, puts the interface back and writes a PNG on a worker thread. Returns the file's path at once (`""` while another is being taken, or without a game). `path`: a `.png` file, a folder, or `null`: `zenith-<n>.png` in the player's Pictures folder, in `Zenith` (`%USERPROFILE%\Pictures\Zenith\` on Windows; `user://screenshots/` where the system has no Pictures folder), the next free number. Zenith shows *Screenshot saved* with an *Open folder* button. The picture is of the moment it was asked for: until it is taken Zenith's own view of time stands still (moving things, robots, trains, vehicles, creatures, the character, belt items, inserter hands, machines' moving parts, shots and effects, the time of day; the bridge's updates of them wait and are caught up after, in order), while the game runs on so the bridge can send the view's chunks, which are drawn as they come. Not held: animations the shaders run on their own clock (water, clouds and their shadows, grass in the wind, belts' surfaces, robots' and creatures' idle motion, smoke and lights pulsing); in a still picture they only make it a few seconds later there. Options: `folder` (where, when `path` is null), `size` (a `Vector2i`, or `[width, height]`: the picture's size in pixels, up to 16384 each way, e.g. `Vector2i(7680, 4320)` for 8K; a size other than the window's is drawn again off screen from a copy of the camera with the window's anti-aliasing, TAA (given 16 frames to settle), level of detail, shadows and filtering, the world's environment, sky and look passes, at that size whatever the window's render scale. The window's height is framed: a picture of another shape than the window shows more or less at the sides, as games do at a fixed resolution. MSAA is stepped down where its samples would take over 1.5 GB of video memory (4x at 8K), and if the picture can't be drawn it is tried without MSAA, then the window is taken), `scale` (1 to 4: that many times the window's size, when there's no `size`; 1), `full_detail` (true), `hide_interface` (true), `overlays` (false: your own layers are hidden too), `timeout` (seconds to wait for full detail at most; past it the picture is taken as it is and the log says what was still drawing in the view. Without it Zenith waits while things still come: the picture is taken as it is once nothing new has come for 20 s (no chunk arrived, nothing fewer left to draw), or after 5 minutes. What it waits for is fixed when it starts: the chunks in the camera's view, out to the bridge's largest square, nearest the camera first; the chunks already loaded there stay, and the camera or the character moving meanwhile changes nothing. The progress says how many of them are still to come (a count that only goes down), with a bar that only moves forward and, once it can tell, about how long is left. Chunks are asked for 256 at a time and the bridge is put in photo mode meanwhile (more chunks read a tick, within a work budget kept to what holds the game near 60 UPS); a view zoomed far out can still take a minute or more. A chunk the bridge never sends stops counting once every chunk has been asked for, none has arrived for 5 s and its work report has no chunks queued (15 s without a report); while it waits, Zenith's main thread may take frames of up to 50 ms so the wider view fills faster), `pause` (true: the Factorio game is held while the picture is taken and let go after it, unless the player had paused it already. It is held through the bridge (`/f3d-debug hold`): Factorio's slowest game speed, 0.01, rather than a tick pause, so the bridge still ticks (about once every 1.7 s), reads the client and puts the speed back; this works in single-player (hybrid) as well as on servers. It is held once the bridge has sent the chunks in view, since a held game sends hardly any, and moving things hold still at the game's last positions. Where the console's rule refuses (multiplayer, not an admin) the picture is taken with the game running and the log says why. The game is let go after the picture, when it is cancelled or fails, when the game ends, at the latest `timeout` (5 minutes without one) + 15 s after holding, and by the bridge itself 30 game ticks (about 50 s) after the hold if the client never says) |
+| `screenshot(path = null, options = {})` *(1.6)* | A screenshot: hides the interface (as `hide_interface`, and add-ons' own layers and Zenith's debug menu too), turns full detail on and waits until everything is drawn, takes the picture, puts the interface back and writes a PNG on a worker thread. Returns the file's path at once (`""` while another is being taken, or without a game). `path`: a `.png` file, a folder, or `null`: `zenith-<n>.png` in the player's Pictures folder, in `Zenith` (`%USERPROFILE%\Pictures\Zenith\` on Windows; `user://screenshots/` where the system has no Pictures folder), the next free number. Zenith shows *Screenshot saved* with an *Open folder* button for a few seconds; taken with the interface hidden (`hide_interface`, the Cinematic camera's F11), the note waits and shows when the interface comes back, the newest shot's (`--shot-note=old`: not at all, as before). The picture is of the moment it was asked for: until it is taken Zenith's own view of time stands still (moving things, robots, trains, vehicles, creatures, the character, belt items, inserter hands, machines' moving parts, shots and effects, the time of day; the bridge's updates of them wait and are caught up after, in order), while the game runs on so the bridge can send the view's chunks, which are drawn as they come. Not held: animations the shaders run on their own clock (water, clouds and their shadows, grass in the wind, belts' surfaces, robots' and creatures' idle motion, smoke and lights pulsing); in a still picture they only make it a few seconds later there. Options: `folder` (where, when `path` is null), `size` (a `Vector2i`, or `[width, height]`: the picture's size in pixels, up to 16384 each way, e.g. `Vector2i(7680, 4320)` for 8K; a size other than the window's is drawn again off screen from a copy of the camera with the window's anti-aliasing, TAA (given 16 frames to settle), level of detail, shadows and filtering, the world's environment, sky and look passes, at that size whatever the window's render scale. The window's height is framed: a picture of another shape than the window shows more or less at the sides, as games do at a fixed resolution. MSAA is stepped down where its samples would take over 1.5 GB of video memory (4x at 8K), and if the picture can't be drawn it is tried without MSAA, then the window is taken), `scale` (1 to 4: that many times the window's size, when there's no `size`; 1), `full_detail` (true), `hide_interface` (true), `overlays` (false: your own layers are hidden too), `timeout` (seconds to wait for full detail at most; past it the picture is taken as it is and the log says what was still drawing in the view. Without it Zenith waits while things still come: the picture is taken as it is once nothing new has come for 20 s (no chunk arrived, nothing fewer left to draw), or after 5 minutes. What it waits for is fixed when it starts: the chunks in the camera's view, out to the bridge's largest square, nearest the camera first; the chunks already loaded there stay, and the camera or the character moving meanwhile changes nothing. The progress says how many of them are still to come (a count that only goes down), with a bar that only moves forward and, once it can tell, about how long is left. Chunks are asked for 256 at a time and the bridge is put in photo mode meanwhile (more chunks read a tick, within a work budget kept to what holds the game near 60 UPS); a view zoomed far out can still take a minute or more. A chunk the bridge never sends stops counting once every chunk has been asked for, none has arrived for 5 s and its work report has no chunks queued (15 s without a report); while it waits, Zenith's main thread may take frames of up to 50 ms so the wider view fills faster), `pause` (true: the Factorio game is held while the picture is taken and let go after it, unless the player had paused it already. It is held through the bridge (`/f3d-debug hold`): Factorio's slowest game speed, 0.01, rather than a tick pause, so the bridge still ticks (about once every 1.7 s), reads the client and puts the speed back; this works in single-player (hybrid) as well as on servers. It is held once the bridge has sent the chunks in view, since a held game sends hardly any, and moving things hold still at the game's last positions. Where the console's rule refuses (multiplayer, not an admin) the picture is taken with the game running and the log says why. The game is let go after the picture, when it is cancelled or fails, when the game ends, at the latest `timeout` (5 minutes without one) + 15 s after holding, and by the bridge itself 30 game ticks (about 50 s) after the hold if the client never says) |
 | `screenshot_busy()` *(1.6)* | One is being taken. Meanwhile Zenith shows its progress at the bottom of the screen (never in the picture), holds the camera where it was when the shot began (whoever moves it; an add-on with its own camera should leave it alone too while this is true), keeps the mouse from Zenith's camera and menus and the player's controls off, and Esc cancels it |
 | `screenshot_cancel()` *(1.6)* | Stops the one being taken: the game let go, full detail and the interface back, nothing written. False when none is being taken |
 | `screenshot_cancelled(path)` *(1.6)* | Signal: a screenshot was cancelled (`screenshot_cancel` or Esc) |
@@ -379,8 +625,14 @@ Everything goes when the add-on is switched off. A look is a Dictionary; every k
 | `sun_energy`, `ambient_energy` | Multipliers on the planet's sun and ambient light for the time of day |
 | `ambient_tint`, `ambient_tint_amount` | A `Color` the ambient light moves towards, and how far (0-1) |
 | `sun_angle` | `Vector2(pitch, yaw)` in degrees: the sun held there, as Factorio's shadows never move (`Vector2(-42, -112)`: shadows to the east, as Factorio's). Leave it out for a sun that crosses the sky |
+| `sun_noon_yaw` *(cinematic-pbr-flat)* | Degrees, a `DirectionalLight3D`'s yaw (0 south, 90 east): where the sun that crosses the sky stands at noon. It still rises in the east and sets in the west, each the short way round from there (a noon in the north crosses the north). Absent: -30, high behind the default view (every side a model shows the camera lit); the Cinematic shaders use -135, the north-west Factorio's sprites are lit from |
 | `factorio_lut` | `true`: Factorio's own colour lookup for the planet and time of day, from the player's install |
 | `roughness_min` | 0-1: no model's surface shinier than this |
+| `texture_light` *(0.2.2)* | Vector2(sides, tops): the light balance on the textured models of a pack whose pack.json says `"shading": "pbr"` (absent: (1, 1), as Godot's own material lights them; Factorio's part colours keep their own (0.95, 0.6)). Lower the tops (0.8) if a look washes those packs out. The player's Packs' own shading setting (Factorio's everywhere) and `--pack-shading=factorio` turn the path off |
+| `texture_metal` *(0.2.2)* | 0-1: the share of a modeller's metallic-roughness picture's metal drawn (absent: 0.1, as paint, the share of every other surface's metal; 1: in full). The player's Metal on textured models setting (Full) and `--texture-metal` win over it |
+| `pbr_env` *(pbr-standard)* | 0-2: the neutral reflection a pack whose pack.json says `"shading": "pbr"` reflects (`shaders/pbr_env.gdshaderinc`): its upper half is the ambient plus this much of the sun, its lower half 0.45 of that (absent: 0.45, a rough metal about as bright as paint of its colour). `--pbr-env=off` (the sky's reflection, as in 0.2.2) or a number wins |
+| `pbr_metal` *(pbr-standard)* | 0-1: the share of such a pack's metal drawn (absent: 1, in full). `--pbr-metal=0.1` (0.2.2's) or another number wins |
+| `pbr_fill`, `pbr_ambient` *(pbr-light-balance)* | 0-2: such a pack's share of the look's `model_fill` (absent: 0.3) and of the ambient (absent: 1), its ambient and reflection then lit by direction (the sky above, darker below, the sun's side brighter) so the sun decides its light and shaded sides. `--pbr-light=flat` gives the flat balance back (both in full, the reflection the same all round) |
 | `roughness_limiter` *(1.4)* | `Vector2(amount, limit)`: Godot's screen-space roughness limiter while the look is on |
 | `taa` *(1.4)* | `true`: temporal anti-aliasing while the look is on, whatever the player's setting; theirs comes back after |
 | `own_clouds` *(1.4)* | `false`: Zenith's own clouds are off while the look is on (for a look that draws its own) |
@@ -389,7 +641,8 @@ Everything goes when the add-on is switched off. A look is a Dictionary; every k
 | `at_twilight`, `at_dawn` *(1.5)* | `{environment: {}, sun: {}, params: {}}`: values of those properties, sun properties and pass uniforms the look moves towards as the sun nears the horizon, by how near it is (`at_dawn` in the morning, over `at_twilight`'s). Numbers and colours only; `environment` may name any `Environment` property, `tonemap_exposure` too |
 | `fog_from_sky` *(1.5)* | 0-1: how far the fog's colour takes the sky's on the sun's side at twilight |
 | `environment` | `{Environment property: value}` while the look is on: `glow_*`, `ssao_*`, `ssil_*`, `fog_*`, `adjustment_*`, `reflected_light_source`... Put back when the look goes |
-| `sun` | Sun properties: `light_angular_distance` (soft shadows), `shadow_opacity`, `light_specular`, `light_indirect_energy`, `shadow_bias`, `shadow_normal_bias` |
+| `sun` | Sun properties: `light_angular_distance` (soft shadows), `shadow_opacity`, `light_specular`, `light_indirect_energy`, `shadow_bias`, `shadow_normal_bias`. Zenith's shadows (`sun_shadows.gd`) own the sun's angular size, blur and pancake: a look's `light_angular_distance` is handed to them, which give the sun that size and Godot's contact-hardening soft shadows (PCSS) with a shorter pancake and a blur of 1; 0 or absent, the fitted even edge of `shadow_edge`. It can't be moved by `at_twilight` or `at_dawn` |
+| `shadow_edge` *(1.7)* | Tiles: the radius of the shadows' edge on the ground when the look has no sun size; Zenith fits the blur to the shadow map so the edge keeps this width at every zoom (at least a texel, at most the filter's reach). Absent: 0.02, the edge of Factorio's own shadow sprites. The Cinematic look's Soft shadows: 0.04. An older Zenith ignores it |
 | `passes` | `[{shader, params, order}]`, drawn in order. While a look with passes is on (or any `add_pass` pass), the player's MSAA runs as SMAA and Settings greys MSAA out: Godot resolves the depth a pass reads by averaging each pixel's samples, so with MSAA every silhouette reads a depth between the two sides. Decided when Zenith starts; a look switched on in a running game changes it at the next start |
 
 A pass includes `res://shaders/look_pass.gdshaderinc` and writes only `fragment()`:
@@ -419,6 +672,61 @@ picture, and smoke, ghosts and icons drawn after it aren't graded. Put several e
 pass. Colours are linear HDR; tonemapping and Factorio's colour lookup come after. Each pass costs
 a full-screen read and write; `scene_color_blurred` reads mipmaps Godot makes anyway.
 
+### Sounds: `api.sound` *(1.7)*
+
+Your own sounds, and Zenith's replaced or muted by kind. Everything plays through Zenith's own players
+and buses: an add-on never gets a bus or a player of its own, so the player's volume sliders and tick
+boxes (Settings, Sound), `--mute` and the limiter on the master output always apply.
+
+**Your own sounds only.** Ship sounds you made or may share under your add-on's licence, never Factorio's
+files (they are Wube's, and the player has them already: name them by their Factorio path, as below,
+and they are read from the player's install).
+
+| | |
+|---|---|
+| `play(sound, options = {})` | A one-shot. `sound`: a file in your add-on's folder (`"sounds/boing.ogg"`), a Factorio path (`"__base__/sound/car-door-open.ogg"`, read from the player's install, or a mod's folder or zip for `"__mod-name__/..."`), either without `.ogg` for its numbered variations (`"sounds/boing"` finds `boing-1.ogg`, `boing-2.ogg`..., a random one each time), or an `AudioStream` you made. Options: `at` (a `Vector3`: positional, fading over distance as Zenith's sounds do; absent: not positional, as the windows' clicks), `bus` (below; `"effects"`), `volume` (0 to 1), `pitch_spread` (0.05: up to 5% higher or lower), `reach` (times the audible distance, 40 tiles). Returns false when it didn't play: no game's sound running, the file not found, still being decoded (a file's first play, positional or not: decoding runs on a worker so a long file doesn't stall a frame; call `preload_sounds` first), out of hearing, or every voice busy with something louder |
+| `preload_sounds(sounds)` | Starts decoding these (one, or an Array, as `play` takes them) so their first `play` isn't lost. (`preload` is a word GDScript keeps for itself) |
+| `replace(kind, sounds, options = {})` | Zenith plays these files (one or an Array, as `play` takes them; a random one each time) wherever it would play `kind`, at the same place, bus and reach. Options: `volume` (0 to 1; absent: the volume of the sound replaced). False when refused: an unknown kind, no file found, or the player's `--addon-sounds=off` |
+| `mute(kind)` | Nothing plays for `kind`. False when refused |
+| `restore(kind = "")` | Undoes your `replace` and `mute` of `kind`, or of every kind |
+| `kinds()` | The kinds (below) |
+| `volume(bus)` | The player's volume for a bus, 0 to 1 (0 while its tick box is off). Read-only |
+| `played(kind, info)` | Signal: Zenith played a sound of a kind (`"step/grass"`). `info`: `at` (a `Vector3`, or `null` for the windows'), `path` (the file), `by` (the add-on whose replacement it was, `""` for Zenith's own), `bus` (the key, as `play`'s `bus` option and `volume()` take it: `"walking"`, `"ui"`...). Sent only while something is connected (from the next frame after you connect), and not for a muted kind |
+
+**Buses:** `effects` (the default), `walking`, `environment` (machines and vehicles), `weapons`,
+`explosions`, `enemies`, `ambient`, `ui`, `music`. Not `master`: a sound asked for there plays on
+`effects`.
+
+**Kinds.** A kind is a base name, or a base name and a detail after a `/`. Zenith looks for a replace or
+mute of the exact kind first, then of its base: `replace("step", ...)` changes every step,
+`replace("step/grass", ...)` only those on grass, and the second wins on grass whoever came first.
+
+| Kind | When | Details |
+|---|---|---|
+| `step` | Each footfall of the character | The sound's name, as the prototype walked on gives it (its `walking_sound`'s file without the variation's number): `grass`, `sand`, `concrete`, `refined-concrete`, `transport-belt`, `heat-pipe`, `rails`, `ore`, `oil`, Space Age's (`semi-wet-rock`, `icy-snow`...), a mod's own; with `--steps=table` or a bridge without the list, the name table's (`dirt-1`, `shallow-water`...) |
+| `rustle` | A plant or other decorative under the foot, played on top of the step (its own kind, so replacing `step` doesn't replace it too) | Its walking sound's name: `plant`, `decorative-grass`, `stones`, a mod's own |
+| `mine` | Each swing while the character mines by hand | `wood` (trees and plants), `ore` (ore, rocks, fish), or the thing's own mining sound's name |
+| `mined` | The thing comes off | The thing's name (`mined/iron-chest`) |
+| `repair` | Each repair pack's work | |
+| `shot` | The character's or a vehicle's gun fires | The gun: `pistol`, `submachine-gun`, `shotgun`, `flamethrower`... |
+| `ui` | The windows' sounds | The sound's name: `gui-click`, `gui-tab`, `inventory-move`... |
+| `build` | A building or a ghost placed near the character | The building's name, or `ghost` |
+| `rotate` | A building turned near the character | Its name |
+| `pickup` | Items picked up (F, or ore as it is mined) | The item's name, for F |
+| `explosion` | A building or vehicle destroyed, a weapon's explosion | The thing's or the explosion's name |
+
+**Stacking.** Each kind keeps a stack: the last add-on to replace or mute it wins; when it calls `restore`
+or stops (switched off, or Zenith closes), the one before comes back. `--sfx-log` prints
+`step/grass replaced by <your id>` (or `muted by`) each time an add-on decided a sound.
+
+**Undone on stop.** Switching your add-on off takes your replaces and mutes away and forgets your files.
+
+**The player's switch:** `--addon-sounds=off` ignores every `replace` and `mute` (they return false);
+your own `play` still works. Files are Ogg Vorbis (`.ogg`); Ogg Opus and `.wav` don't play yet.
+
+Looping sounds (`loop(sound, options)` and `stop(handle)`, mixed with the machines' loops) come in a
+later level.
+
 ### Lighter updates: `api.updates`
 
 While something long runs (a timelapse left for hours), an add-on can ask the bridge to send less,
@@ -446,6 +754,106 @@ JSON files in Zenith's user data: one set per save, and one for every save.
 Values are plain JSON: numbers (they come back as floats), strings, booleans, arrays and
 dictionaries. Store a `Vector3` as `[x, y, z]`.
 
+## Messages to your Factorio mod
+
+The one way an add-on changes the game: pair it with a small Factorio mod and talk to it through
+`api.game`. The mod, which Factorio gives to every player in the game, makes the change, so everyone
+has the same rule and the game stays in step. Zenith only carries the messages and never looks inside
+them. [`addons-src/sprint/`](../addons-src/sprint) is a worked pair: hold Shift and the mod
+`zenith-sprint` makes the character run faster.
+
+A **channel** is your Factorio mod's name, optionally followed by `/` and a topic: `zenith-sprint`,
+`zenith-sprint/state`. The mod part is a Factorio mod name (letters, digits, `-` and `_`); the whole
+at most 128 bytes, and not the bridge's own `factorio-3d-bridge`. Name your channels after your own
+mod: Zenith can't check who answers on one.
+
+**Messages are best-effort.** They go as single datagrams, at once and unacknowledged, so one can be
+lost. Send the state you want ("sprint on"), repeat it while it holds, and let the mod time it out;
+don't send changes that only make sense in order. Each message is at most 4 KB (its whole JSON line).
+
+### `api.game` *(1.7)*
+
+| | |
+|---|---|
+| `available()` | A game is on and its bridge carries messages |
+| `mod(name)` | The version of Factorio mod `name` in this game, `""` when the game doesn't have it (or no game is on): check your mod is there |
+| `open(channel)` | This add-on's channel: its messages come as `message`, and `send` may use it. False if the name isn't a channel or another add-on has it (the log says which) |
+| `close(channel)`, `channels()` | |
+| `send(channel, data)` | Sends `data` (anything JSON holds but null) to the mod. False when not sent: the channel isn't open, no game, the bridge carries no messages, the mod isn't in the game, over 4 KB, or the channel sent 20 already this second. Nothing is queued |
+| `message(channel, data)` | Signal: a message from the mod on one of this add-on's channels (JSON: numbers come as floats) |
+| `link_changed(on)` | Signal: the link came (a game whose bridge carries messages) or went (the game ended or was lost) |
+| `mod_error(channel, text)` | Signal: the mod's handler failed on a message from this add-on, with its error's whole text: Factorio's own report, which says "non-recoverable" and names the bridge's event "Custom event (ID n)", yet the game went on (the bridge caught it). Zenith's log and the add-on's page show a short line naming the mod and the error's own line; the page's Copy gives the whole report. After 10 within a minute the bridge closes the channel until Zenith connects again, and `text` says "closed after repeated errors" |
+
+Zenith closes an add-on's channels when it is switched off. One add-on holds a channel at a time and
+only it hears that channel; this stops accidents, not a hostile add-on (see "Add-ons are programs").
+
+```gdscript
+func addon_start(api) -> void:
+	api.game.open("my-mod")
+	api.game.message.connect(func(channel: String, data: Variant) -> void: api.note(str(data)))
+	if api.game.mod("my-mod") != "":
+		api.game.send("my-mod", {"hello": true})
+```
+
+### The Factorio side
+
+The bridge mod (Zenith's `factorio-3d-bridge`) raises a custom event for each message and offers
+calls in its `zenith` remote interface. Depend on it optionally (`"? factorio-3d-bridge"` in your
+`info.json`), so your mod runs without Zenith too.
+
+| `remote.call("zenith", ...)` | |
+|---|---|
+| `on_message()` | The event a message arrives as: `{client, channel, data, player_index, machine}` (and Factorio's `name`, `tick`). `client` names one connected Zenith (a number, the same while it stays connected: key your own state by the character or the player, not by it); `player_index` the player whose character that Zenith plays (nil for the bridge's own character); `machine` the player whose machine the datagram came in on (0 on a server) |
+| `on_client()` | The event a Zenith connecting or leaving raises: `{client, joined, player_index}` |
+| `send(client, channel, data)` | To that Zenith's add-on: `true`, or `false` and why ("no such client", "bad channel", "bad data", "too big", "too many") |
+| `clients()` | `{ {client, player_index}, ... }`, the first one first |
+| `character(client)`, `player(client)`, `name(client)` | That Zenith's character (LuaEntity), its player (LuaPlayer, nil for the bridge's own), the player's name. Without an argument, as before |
+| `link()` | 1: this bridge has the link |
+
+```lua
+local function on_message(e)
+  if e.channel ~= "my-mod" or type(e.data) ~= "table" then return end
+  local c = remote.call("zenith", "character", e.client)
+  -- ... check every field, then change the game ...
+  remote.call("zenith", "send", e.client, e.channel, { ok = true })
+end
+
+local function register()
+  local z = remote.interfaces["zenith"]
+  if z and z.on_message then
+    script.on_event(remote.call("zenith", "on_message"), on_message)
+  end
+end
+script.on_init(register)
+script.on_load(register)
+```
+
+**Keep it deterministic.** Every player's game runs your mod, and each message reaches all of them
+as the same input. Ask for the event ids in `on_init` and `on_load` (they aren't saved; never keep
+them in `storage`), register the handlers whenever the bridge is there, and change the game only from
+the event and from `on_tick` or `on_nth_tick`, with your state in `storage`. `send`'s answer is the
+same on every peer, so acting on it is safe. The bridge caps each Zenith at 60 messages and 32 KB per
+60 ticks each way, past which messages in are dropped and `send` answers false.
+
+**Trust a message as you would the player's own input, no more.** Any program on the server's PC
+can connect as a Zenith and send the same, and so can one on the PC of any player in the game whose
+Factorio listens for UDP (`machine` is that player):
+
+- Check every field's type and range; ignore what you don't know.
+- Never run text from a message (`load`, `loadstring`), and never use it as a prototype name or an
+  index without checking it.
+- For anything an admin should decide, check `game.get_player(e.player_index).admin`, and when
+  `machine` isn't 0 that player's too (`game.get_player(e.machine).admin`): a message that came in on
+  a player's PC is that player's doing, whatever character it names. A nil `player_index` is the
+  server's own character.
+- Cap your own work per message: the bridge caps how many and how big, not what you do with them.
+- An error in your handler doesn't stop the game: a message is a player's input, and the bridge
+  catches the error, writes it in Factorio's log naming your mod, and hands it to your add-on
+  (`api.game.mod_error`, with Factorio's whole report; the player sees a short line saying the game
+  went on, in the log and on the add-on's page in the Add-ons window). Your `storage` stays as far as your handler got, so check before you
+  write. After 10 errors on a channel within a minute the bridge closes that channel for that Zenith
+  until it connects again. Test it: an error you never see still loses what the player asked for.
+
 ## Good manners
 
 - Leave the camera, the keys and the mouse alone unless the player asked (a key, a button).
@@ -469,6 +877,34 @@ godot --path client -- --addons=C:/my-addon
 ```
 
 Zenith's log (the console it was started from) says which add-ons started, which were refused
-and why, and the add-on's own `api.note` lines. Script errors show there too, with the line. The
-project's own add-on test (`client/tests/addon_test.tscn`) loads a small add-on from
+and why, and the add-on's own `api.note` lines. Script errors show there too, with the line.
+
+**Edit, then reload.** No restart is needed after a change: press **Ctrl+Shift+F5** (Zenith's
+"Reload the add-ons given with --addons", rebindable in Settings → Controls while `--addons` is given)
+or the **Reload** button on the add-on's page in the Add-ons window. Zenith stops the add-on
+(`addon_stop`), reads its `addon.json`, its scripts and shaders from disk again (a changed zip is
+unpacked again) and starts it (`addon_start`), so its keys and settings are declared afresh, once.
+Reload is on the page of every add-on given with `--addons`; with `-- --addons-dev` it is on every
+add-on's page that is switched on. Switching an add-on off and on in the Add-ons window reads it
+again too. A reload reads every `.gd` file in the add-on's folder, so a broken file anywhere in it is
+reported (in the log and on the page) even when nothing uses it, such as a work in progress. What the
+add-on keeps outside the API survives a reload: a `static var`, a node it added
+somewhere else than under its own, an autoload-like object of its own. Clear them in `addon_stop`.
+
+**Script errors in the game.** A downloaded Zenith has no console, so an error in an add-on's files
+also goes to its page in the Add-ons window, under "Script errors (n)": the file (its path in the
+add-on's folder), the line and the message, how many times it happened, and Copy for a bug report.
+Paths in a message are shown in the add-on's folder too, and any other in the player's own folders as
+`<user folder>`, so a copied report names no folder of the PC.
+A Factorio mod's error on one of the add-on's channels is listed there too, as a short line naming the
+mod (the game went on; Copy gives Factorio's whole report), and the row says "Factorio mod error" when
+it has only those; these aren't announced in the game.
+The add-on's row says "script error", and the first error of each add-on in a run is announced once in
+the game. An entry script that doesn't parse is refused with the first error since it started or was reloaded
+(the cause, such as a preloaded file's parse error, not the errors that follow from it). The add-on
+keeps running: Godot ends the call that failed and goes on. Factorio stops the game on a mod's error;
+Zenith is only the view, so it shows the error and carries on. A reload clears the list. (This needs
+Godot 4.5 or newer, which Zenith's downloads use; on an older Godot errors stay in the log.)
+
+The project's own add-on test (`client/tests/addon_test.tscn`) loads a small add-on from
 `client/tests/addon_fixtures/` and is a compact example of each part of the API.

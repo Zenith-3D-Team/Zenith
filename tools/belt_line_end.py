@@ -28,6 +28,15 @@ closer than 64 to the one in front, the first stands at position 0 of the last b
     late is where the game's hand would be. --pick any: a hand takes any item on its belt, not the one
     nearest the middle; --copper N: every N'th take is off the north lane, which is then fed from its
     far end too.
+--hands-radius R: the bridge's f3d-detail-radius (24 by default, the fake's) set to R tiles. The bridge
+plays only the inserters within R of the focus (the run's middle) as events: those further out send no
+`ie` and their puts aren't handed over (`ho`), as live for inserters past the hands radius, so only the
+bridge's own reads of their belts (`bs` `sl`/`pc`, its actors' checks) show their takes and puts. The
+recording is the same; left out, the stream is as before. E46's stop-and-go lanes drawn standing:
+--belts 40 --queue 36 --take 25 --feed 6 --ticks 2400 --hands-radius 4 (the middle two takers send `ie`),
+replayed with --view=-4,4,52,13 (else the replay's view is the lanes' own box) and scored by
+tools/belt_quirks.py --every 30 (a sample a tick moves no item the 0.25 tile its frozen check wants).
+--taker-every N: a taking inserter at every N'th belt (3); 12 leaves long runs read by no inserter's checks.
 The bridge is the worktree's own mod (control.lua under lupa against tools/mod_tests' fake Factorio and
 bs_world.lua, as tools/bs_offline.py), its inserters' hands set each tick as the scene has them.
 """
@@ -99,7 +108,7 @@ class Hand:
         self.at = (round(cx + r * math.cos(ang)), round(cy + r * math.sin(ang)))
 
 
-def make_scene(n_belts, ticks, seed, queue, t0, feed_gap, take_period, copper_every=0, pick="near"):
+def make_scene(n_belts, ticks, seed, queue, t0, feed_gap, take_period, copper_every=0, pick="near", taker_every=3):
     """The recording, the world, each tick's hands ([actor, held, kind, place]) and what happened.
     copper_every N > 0: the north lane's plates are taken too (every N'th take of an inserter) and come
     again from an inserter south of the last belt but one, so that lane closes up from its far end; 0:
@@ -121,7 +130,7 @@ def make_scene(n_belts, ticks, seed, queue, t0, feed_gap, take_period, copper_ev
     hands = []
     actors, targets = [], []
     j = 0
-    for b in range(2, n_belts - 3, 3):
+    for b in range(2, n_belts - 3, taker_every):
         j += 1
         over_queue = b < queue
         hands.append(Hand(j, b, True, take_period + rng.randrange(-40, 41) + (0 if over_queue else 120), t0 + 30 + rng.randrange(0, take_period)))
@@ -215,7 +224,7 @@ def make_scene(n_belts, ticks, seed, queue, t0, feed_gap, take_period, copper_ev
     return truth, world, acts, events
 
 
-def play(mod, truth, world, acts, out, toggles="", radius=160, quiet=False, bre=True):
+def play(mod, truth, world, acts, out, toggles="", radius=160, quiet=False, bre=True, hands_radius=None):
     """The bridge's `bs` and `ie` for the scene, written a message a line."""
     h = bs_offline.Harness(mod)
     h.protos(world)
@@ -238,6 +247,8 @@ def play(mod, truth, world, acts, out, toggles="", radius=160, quiet=False, bre=
             d.pickup_position, d.drop_position = { x = other_x / 256, y = other_y / 256 }, { x = belt_x / 256, y = belt_y / 256 }
         end
     end""")
+    if hands_radius is not None:
+        g.settings["global"]["f3d-detail-radius"].value = hands_radius
     for kv in [p for p in toggles.split(",") if p.strip()]:
         k, v = (s.strip() for s in kv.split("=", 1))
         opts = bs["OPTIONS"]
@@ -334,11 +345,14 @@ def main(argv=None):
     ap.add_argument("--pick", default="near", choices=["near", "any"],
                     help="which item a hand takes: the one nearest its belt's middle, or any on its belt")
     ap.add_argument("--toggles", default="", help="the bridge's /f3d-bs switches, name=value,...")
+    ap.add_argument("--taker-every", type=int, default=3, help="an inserter taking north of every N'th belt")
+    ap.add_argument("--hands-radius", type=int, default=None,
+                    help="the bridge's f3d-detail-radius in tiles: inserters further from the focus send no ie (default: the fake's 24)")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    truth, world, acts, events = make_scene(a.belts, a.ticks, a.seed, a.queue, a.first, a.feed, a.take, a.copper, a.pick)
+    truth, world, acts, events = make_scene(a.belts, a.ticks, a.seed, a.queue, a.first, a.feed, a.take, a.copper, a.pick, a.taker_every)
     (out / "rec.json").write_text(json.dumps(truth, separators=(",", ":")))
     (out / "events.json").write_text(json.dumps(events))
     if not a.quiet:
@@ -346,7 +360,7 @@ def main(argv=None):
         put = sum(1 for e in events if e[1] == "put")
         print("scene: %d belts, %d ticks, %d items put on, %d taken off, %d on the south lane at the end"
               % (a.belts, a.ticks, put, took, sum(1 for i in range(1, len(truth["ticks"][-1]), 5) if truth["ticks"][-1][i + 4] == 2)))
-    play(a.mod, truth, world, acts, str(out / "stream.jsonl"), a.toggles, quiet=a.quiet)
+    play(a.mod, truth, world, acts, str(out / "stream.jsonl"), a.toggles, quiet=a.quiet, hands_radius=a.hands_radius)
 
 
 if __name__ == "__main__":

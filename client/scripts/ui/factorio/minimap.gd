@@ -7,7 +7,7 @@ extends Control
 ## and whether it shows at all are options (ui_settings.gd, [map]).
 ##
 ## It asks for the charts around it every few seconds while shown (map_cache.gd). As in Factorio it
-## shows what the view looks at: while the map view is open, the map's middle (on the map's
+## shows what the view looks at (H22): while the map view is open, the map's middle (on the map's
 ## surface; the map view does the asking), and in the 3D remote view the remote view's point. The
 ## space map hides it.
 
@@ -23,7 +23,7 @@ const Controls := preload("res://scripts/player/controls.gd")
 const REFRESH := 4.0
 const ZOOM_STEP := 2.0
 const MARGIN := 12  # GUI pixels from the window's corner
-## So the map opens already drawn, the minimap asks this often (when it has nothing
+## Owner's C15: so the map opens already drawn, the minimap asks this often (when it has nothing
 ## else to ask) for what the map view shows on opening, at the map's first zoom (map_view.gd
 ## DEFAULT_ZOOM). One pass, then back to its own corner.
 const PRELOAD_EVERY := 30.0
@@ -51,6 +51,15 @@ var map_asks := false
 var _preloading := false
 var _spot := Rect2i()  # a spot from cache.spots being asked for
 var _preloaded_at := -1e9
+## The alert bar (alerts.gd), set by factorio_ui.gd: its alerts are drawn on the minimap.
+var alerts = null:
+	set(a):
+		alerts = a
+		if a != null and not a.shown_changed.is_connected(_queue):
+			a.shown_changed.connect(_queue)
+## The alerts drawn last, [[kind, screen point], ...] (tests).
+var alerts_placed: Array = []
+var _blink_was := false
 
 
 func _ready() -> void:
@@ -160,6 +169,8 @@ func _process(_delta: float) -> void:
 	_area.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST if scale >= 0.5 else CanvasItem.TEXTURE_FILTER_LINEAR
 	if not model.live_pings().is_empty():
 		_redraw = true
+	if _alerts_blinked():
+		_redraw = true
 	var player: Vector2 = me[0]
 	if _redraw or at.distance_squared_to(_drawn_at) * scale * scale > 0.04 or absf(float(me[1]) - _drawn_heading) > 0.02 \
 			or player.distance_squared_to(_drawn_player) * scale * scale > 0.04:
@@ -197,6 +208,22 @@ func _ask(own: Rect2i, res: int, at: Vector2) -> void:
 	cache.want(own, res, REFRESH)
 
 
+## The alerts blink: true when the blink's phase flipped since the last call and there are alerts to
+## draw (drawn again then, not every frame).
+func _alerts_blinked() -> bool:
+	var blink := MapCache.alerts_blink_on(Time.get_ticks_msec())
+	if blink == _blink_was:
+		return false
+	_blink_was = blink
+	if alerts == null:
+		return false
+	# Steady kinds (no_material, ...) look the same on both halves: no redraw for them alone.
+	for mk in alerts.map_marks():
+		if MapCache.alert_blinks(str(mk["kind"])):
+			return true
+	return false
+
+
 func _draw_area() -> void:
 	var area := Rect2(Vector2.ZERO, _area.size)
 	var scale := scale_now()
@@ -209,7 +236,9 @@ func _draw_area() -> void:
 			var p: Vector2 = middle + ((tag["position"] as Vector2) - _drawn_at) * scale
 			if area.grow(icon).has_point(p):
 				MapCache.draw_tag(_area, p, tag, icon, false, null, 0)
-	MapCache.draw_pings(_area, model.live_pings(), func(t: Vector2) -> Vector2: return middle + (t - _drawn_at) * scale, float(Kit.px(14)))
+	var to_screen := func(t: Vector2) -> Vector2: return middle + (t - _drawn_at) * scale
+	alerts_placed = MapCache.draw_alerts(_area, alerts.map_marks(), to_screen, icon, area, model.shown_surface()) if alerts != null else []
+	MapCache.draw_pings(_area, model.live_pings(), to_screen, float(Kit.px(14)))
 	# The character's arrow where it is (the middle unless the minimap follows a view), on its surface.
 	if model.map_si == 0:
 		var me := middle + (_drawn_player - _drawn_at) * scale

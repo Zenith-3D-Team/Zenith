@@ -150,6 +150,8 @@ func handle(msg: Dictionary) -> void:
 		fluids = into
 	elif t == "ht":
 		heat = into
+		if world != null and world.animator != null:
+			world.animator.heat_changed(heat)
 	else:
 		unpowered = into
 	_incoming[t] = {}

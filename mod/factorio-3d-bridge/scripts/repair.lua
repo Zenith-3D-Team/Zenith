@@ -89,8 +89,9 @@ local function tool_stack(c, r)
     local ok, q = pcall(function() return stack.quality.name end)
     return (ok and q or "normal") == r.quality
   end
-  if r.slot and r.slot >= 1 and r.slot <= #main and fits(main[r.slot]) then
-    return main[r.slot]
+  local held = puppet.held_stack(main, r.slot, r.item, r.quality)
+  if held then
+    return held
   end
   local ok, stack, index = pcall(main.find_item_stack, { name = r.item, quality = r.quality })
   if ok and stack and fits(stack) then

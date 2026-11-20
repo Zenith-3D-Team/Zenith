@@ -1,6 +1,6 @@
 """Small 3D models for items on belts, on the ground and in inserter hands.
 
-    python tools/models/items.py [names...]              # write client/assets/models/items/<item>.glb
+    python tools/models/items.py [names...]              # write client/assets/models/packs/placeholders/items/<item>.glb
     python tools/models/items.py --list                  # the items with a recipe here
     python tools/models/items.py [names...] --preview out.png   # icon | model sheet (not for the repo)
     godot --headless --path client --import              # then import, as after any .glb change
@@ -29,7 +29,7 @@ sys.path.insert(0, HERE)
 from item_kit import (Icon, bevel_box, box, circle, cylinder_x, cylinder_z, extrude, find_factorio,  # noqa: E402
                       hexcol, merge, mix, prism, ring, rock, scale, shade_by_height, write_glb)
 
-OUT_DIR = os.path.join(REPO, "client", "assets", "models", "items")
+OUT_DIR = os.path.join(REPO, "client", "assets", "models", "packs", "placeholders", "items")  # the Placeholders pack's items
 MAX_TRIS = 220
 
 _factorio = None

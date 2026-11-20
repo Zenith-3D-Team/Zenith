@@ -38,13 +38,13 @@ from scipy import ndimage
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
+import packs  # noqa: E402
 import sprite_projection as sp  # noqa: E402  (frame numbers only)
 
 sys.path.append(os.path.dirname(HERE))
 import factorio_install  # noqa: E402
 FACTORIO = factorio_install.install()
 OUT = os.path.join(REPO, "art-src", "turntable")
-MODELS = os.path.join(REPO, "client", "assets", "models")
 PPT = 64.0                      # pixels per tile of an HR frame at scale 0.5
 ELEV = math.radians(48.0)
 A_UP = math.cos(ELEV)           # height -> up the screen (gauge, the client's)
@@ -490,7 +490,7 @@ def crop_box(images, pad=8, bg=(48, 52, 56)):
 def cmd_compare(entity, dirs=(0, 8, 16, 24, 40, 56)):
     camj = json.load(open(cam_file(entity)))
     hull_path = os.path.join(OUT, "out", entity + ".glb")
-    cur_path = os.path.join(MODELS, entity + ".glb")
+    cur_path = packs.model_path(entity)
     report = {}
     rows = []
     for part, (fn, prefix) in ENTITIES[entity].items():

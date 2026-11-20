@@ -4,7 +4,7 @@ extends Control
 ## to the character), back / forward and close, a thin frame round the screen, the "Surfaces" panel
 ## at the top left (map_view.gd's, moved in here: Space map, Planets, Platforms, + Add space
 ## platform), and at the right, where the minimap sits, the map view settings. Factorio's "Add tag" /
-## "Add ping" panel is left out on purpose: tags are added by right-clicking the map.
+## "Add ping" panel is left out on purpose (the owner's call): tags are added by right-clicking the map.
 ##
 ## Around the space map ("space", space_map.gd) it is the same frame. In the right column, under
 ## the map view settings as in Factorio, a platform's panel (platform_info.gd): shown while a

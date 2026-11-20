@@ -341,11 +341,26 @@ static func _zip_index(path: String) -> Dictionary:
 	return out
 
 
+## A zip's entries as _zip_index reads them ({} when it isn't a zip it can read), for others that
+## read zips (model_packs.gd).
+static func zip_entries(path: String) -> Dictionary:
+	return _zip_index(path)
+
+
 ## One entry's bytes: stored, or deflated (inflated through Godot's gzip reader, the zip's raw
 ## deflate data wrapped in a gzip header and its CRC and size from the directory).
 static func _zip_read(path: String, entry: PackedInt64Array) -> PackedByteArray:
 	var f := _file(path)
 	if f == null:
+		return PackedByteArray()
+	return zip_entry(f, entry)
+
+
+## _zip_read through a file the caller opened on the zip, and closes: model_packs.gd unpacks a zip
+## once and lets it go, so the player can replace it while Zenith runs (the per-thread handles of
+## _file stay open). Empty when the entry can't be read; zlib checks a deflated entry's CRC.
+static func zip_entry(f: FileAccess, entry: PackedInt64Array) -> PackedByteArray:
+	if entry[3] == 0:
 		return PackedByteArray()
 	f.seek(entry[4])
 	var head := f.get_buffer(30)

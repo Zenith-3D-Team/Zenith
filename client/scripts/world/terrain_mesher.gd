@@ -148,7 +148,7 @@ func _mesh() -> void:
 			var spread := _spreading(spreads, prio, pi, g.layer)
 			var wet := _mask(kinds, pi, WATER) if textured else 0
 			land.quad(Vector3(x, 0.0, z), Vector3(x + 1.0, 0.0, z), Vector3(x + 1.0, 0.0, z + 1.0), Vector3(x, 0.0, z + 1.0), Vector3.UP,
-				color, color, color, color, uv, spread, Color(wet, 0.0, _floor(g), 0.0))
+				color, color, color, color, uv, spread, Color(wet, 0.0, _floor(g), g.surface))
 			var plain := Color(g.layer, -1.0, -1.0, 0.0)
 			if wet != 0:
 				# The ground's edge is cut back raggedly along the water (terrain.gdshader); this
@@ -217,7 +217,7 @@ func _mesh_coarse(kinds: PackedByteArray, slot: Vector2) -> void:
 				continue
 			var color := Color.WHITE if g.layer >= 0 else _color(id)
 			land.quad(Vector3(x, 0.0, z), Vector3(x + w, 0.0, z), Vector3(x + w, 0.0, z + w), Vector3(x, 0.0, z + w), Vector3.UP,
-				color, color, color, color, uv, Color(g.layer, -1.0, -1.0, 0.0), Color(0.0, 0.0, _floor(g), 0.0))
+				color, color, color, color, uv, Color(g.layer, -1.0, -1.0, 0.0), Color(0.0, 0.0, _floor(g), g.surface))
 
 
 ## The graphics of tile `id`, or a plain stand-in (map colour, no transitions) while its picture
@@ -239,6 +239,7 @@ func _gfx(id: int) -> TerrainTextures.TileGfx:
 ## CUSTOM1.z for a land tile: 1 on a player's floor (Factorio's "ground-artificial" tiles: concrete,
 ## paths, foundations, which don't spread over their neighbours), which terrain.gdshader keeps
 ## smoother than natural ground; 0 for natural ground and tiles drawn without their picture.
+## CUSTOM1.w is the tile's surface (TerrainTextures.surface_code: roughness and specular by family).
 static func _floor(g: TerrainTextures.TileGfx) -> float:
 	return 1.0 if g.layer >= 0 and not g.spills and not g.water else 0.0
 

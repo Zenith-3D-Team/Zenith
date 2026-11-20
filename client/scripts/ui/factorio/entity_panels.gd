@@ -6,7 +6,7 @@ extends RefCounted
 ## Each builder takes the screen (its `unit`, `model`, `picker`, `held_item`, `_last`...).
 ##
 ## Changes are sent at once (the mod's next `gui` shows them), as Factorio applies GUI edits
-## immediately. Logistics (`gui.lg`) are described in docs/PROTOCOL.md.
+## immediately. Logistics (`gui.lg`) follow the cloud session's shapes (COORDINATION.md task 14).
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")

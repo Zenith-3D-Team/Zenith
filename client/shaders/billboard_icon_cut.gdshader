@@ -2,7 +2,7 @@ shader_type spatial;
 // Icons over entities that buildings in front hide (quality marks, alert and power icons): a quad
 // that faces the camera, depth tested. Its solid middle goes into the depth pre-pass, so where two
 // icons overlap the nearer one wins whatever order they are drawn in (blended without it, overlapping
-// icons swapped order and flickered as the camera moved). Its rim is blended rather than cut
+// icons swapped order and flickered as the camera moved: D3, D9). Its rim is blended rather than cut
 // at a threshold, which left Factorio's 64-pixel pictures stair-stepped and ragged.
 render_mode unshaded, blend_mix, depth_prepass_alpha, cull_disabled, shadows_disabled;
 

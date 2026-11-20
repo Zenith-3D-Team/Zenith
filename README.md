@@ -130,9 +130,12 @@ welcome. [CONTRIBUTING.md](CONTRIBUTING.md) has notes for working on a fork; you
 Factorio for most client work, since a mock server plays a fake game.
 
 **Your own models, add-ons and mods.** Today:
-- Any `.glb` named after a prototype replaces that entity's model, from the project or from
-  your own folder (`--models=/path/to/folder`, and `--models-first` to replace built-in ones).
-  Models may bring their own textures.
+- Every model comes from a model pack, like a texture pack: Zenith's own three (FUE5, Wube3DP and
+  Placeholders), folders or `.zip`s in the `models` folder beside Zenith, or your own folder
+  (`--models=/path/to/folder`, and `--models-first` to win over every pack). Any `.glb` named after
+  a prototype in a higher pack replaces that entity's model. The Model packs window orders and
+  switches them, shows each model turning and takes any one from a pack of your choice; a building's
+  window does it for that building alone. Models may bring their own textures.
 - Add-ons: small GDScript programs in a folder of their own that add to the client without
   forking it, through one versioned API (the camera, keys, windows, the world read-only, events).
   The first is the [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) for filming (free camera, timelapses, tracking

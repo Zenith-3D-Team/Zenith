@@ -4,8 +4,9 @@ extends PanelContainer
 ## why it couldn't load; clicking one opens its page on the right: what it is, its switch, its
 ## settings (declared with api.settings, add-on API 1.1, addon_settings.gd), the options it builds
 ## itself (api.ui.set_options) and its keys, rebound as in Settings → Controls (click, press the
-## key; right click clears; Esc cancels). Controls are named for tests: "addon-item-<id>",
-## "addon-switch-<id>", "addon-setting-<id>-<setting>", "addon-key-<action>-<slot>".
+## key; right click clears; Esc cancels), Reload for an add-on in development and its script errors
+## (docs/ADDONS.md, "Testing"). Controls are named for tests: "addon-item-<id>", "addon-switch-<id>",
+## "addon-setting-<id>-<setting>", "addon-key-<action>-<slot>", "addon-reload-<id>", "addon-errors-<id>".
 
 signal closed
 
@@ -14,6 +15,11 @@ const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
+const AddonLoader := preload("res://scripts/addons/addon_loader.gd")
+
+## Said on every page: an add-on is a program (GDScript can't be sandboxed), so the switch is the
+## player's consent; packs are the data-only way to share.
+const TRUST_NOTE := "An add-on is a program that runs inside Zenith with your rights: it can read and change your files. Switch on only add-ons from people you trust. Zenith's own come with it. Model and icon packs are only data, not programs."
 
 ## addon_host.gd (main.addons).
 var addons = null
@@ -144,6 +150,9 @@ func _fill_list() -> void:
 		b.alignment = HORIZONTAL_ALIGNMENT_LEFT
 		b.custom_minimum_size = Kit.pxv(230, 30)
 		var state := "on" if m.has("object") else ("can't load" if _problem(m) != "" else "off")
+		var errs := _errors(id)
+		if not errs.is_empty():
+			state += ", script error" if errs.any(func(e: Dictionary) -> bool: return not e.has("mod")) else ", Factorio mod error"
 		b.text = "%s  %s  (%s)" % [str(m["name"]), str(m["version"]), state]
 		b.tooltip_text = str(m["description"]) + ("\nFrom a zip: " + str(m["zip"]) if m.has("zip") else "")
 		if not (m.get("also", []) as Array).is_empty():
@@ -165,6 +174,9 @@ func _show_page() -> void:
 		_page.remove_child(c)
 		c.queue_free()
 	var m: Dictionary = addons.find(selected) if addons != null and selected != "" else {}
+	var trust := _note(TRUST_NOTE)
+	trust.name = "addon-trust-note"
+	_page.add_child(trust)
 	if m.is_empty():
 		_page.add_child(_note("An add-on is a folder put in %s (or beside Zenith.exe in addons\\). docs/ADDONS.md says how to write one." % ProjectSettings.globalize_path("user://addons")))
 		return
@@ -176,6 +188,15 @@ func _show_page() -> void:
 	_page.add_child(Kit.label(who))
 	if str(m["description"]) != "":
 		_page.add_child(MenuKit.paragraph(str(m["description"]), 600))
+	var needs := AddonLoader.needs_text(m, addons.name_of) if addons.has_method("name_of") else ""
+	if needs != "":
+		var n := MenuKit.paragraph(needs, 600)
+		n.name = "addon-needs-" + id
+		_page.add_child(n)
+	if AddonLoader.is_new(m) and bool(m["ok"]) and not m.has("object"):
+		var fresh := _note("New: off until you switch it on. %s." % AddonLoader.origin_text(m))
+		fresh.name = "addon-new-" + id
+		_page.add_child(fresh)
 	if m.has("zip"):
 		_page.add_child(_note("From %s (Zenith unpacks it into %s)" % [str(m["zip"]), ProjectSettings.globalize_path(str(m["dir"]))]))
 	else:
@@ -188,17 +209,27 @@ func _show_page() -> void:
 	on.name = "addon-switch-" + id
 	on.disabled = not bool(m["ok"]) or str(m["source"]) == "command line"
 	if str(m["source"]) == "command line":
-		on.tooltip_text = "Given with --addons: always on."
+		on.tooltip_text = "Given with --addons: always on (Reload restarts it)." if addons.has_method("can_reload") and addons.can_reload(m) else "Given with --addons: always on."
 	on.toggled.connect(func(v: bool) -> void:
 		Sfx.play_ui("gui-checkbox-click")
 		addons.set_enabled(id, v))  # addons_changed redraws the page
 	_page.add_child(on)
+	if addons.has_method("can_reload") and addons.can_reload(m):
+		var reload := MenuKit.button("Reload")
+		reload.name = "addon-reload-" + id
+		reload.custom_minimum_size.x = Kit.px(120)
+		reload.tooltip_text = "Reads its addon.json, scripts and shaders from disk again and restarts it."
+		reload.pressed.connect(func() -> void:
+			Sfx.play_ui("gui-click")
+			addons.reload(m))  # addons_changed redraws the page
+		_page.add_child(reload)
 	var why := _problem(m)
 	if why != "":
 		var n := MenuKit.paragraph("Not loaded: " + why, 600)
 		n.name = "addon-problem-" + id
 		n.add_theme_color_override("font_color", Kit.RED_TEXT)
 		_page.add_child(n)
+	_error_rows(id)
 	if not m.has("object"):
 		_page.add_child(_note("Switch it on to see its settings and keys."))
 		return
@@ -213,6 +244,38 @@ func _show_page() -> void:
 		_page.add_child(holder)
 		builder.call(holder)
 	_key_rows(api)
+
+
+# --- script errors (addon_host.gd, addon_errors.gd) ---------------------------------------------
+
+func _errors(id: String) -> Array:
+	return addons.script_errors(id) if addons != null and addons.has_method("script_errors") else []
+
+
+## "Script errors (n)": each as its file in the add-on's folder, the line and the message, repeats
+## counted, with Copy for a bug report. A Factorio mod's error on its channels shows its short line;
+## Copy gives Factorio's whole report.
+func _error_rows(id: String) -> void:
+	var list := _errors(id)
+	if list.is_empty():
+		return
+	var head := HBoxContainer.new()
+	head.add_theme_constant_override("separation", Kit.px(10))
+	var title := Kit.label("Script errors (%d)" % list.size(), "FHeading")
+	title.add_theme_color_override("font_color", Kit.RED_TEXT)
+	head.add_child(title)
+	var copy := MenuKit.button("Copy")
+	copy.name = "addon-errors-copy-" + id
+	copy.tooltip_text = "Copies these lines (paths are in the add-on's folder)."
+	copy.pressed.connect(func() -> void:
+		Sfx.play_ui("gui-click")
+		DisplayServer.clipboard_set(addons.script_errors_text(id, true)))
+	head.add_child(copy)
+	_page.add_child(head)
+	var text := MenuKit.paragraph(addons.script_errors_text(id), 600)
+	text.name = "addon-errors-" + id
+	_page.add_child(text)
+	_page.add_child(_note("The add-on keeps running: the call that failed ended there. Reload it once fixed."))
 
 
 # --- settings ---------------------------------------------------------------------------------

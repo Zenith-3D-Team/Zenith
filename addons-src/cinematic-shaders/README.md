@@ -5,12 +5,16 @@ more depth and detail. Needs Zenith's add-on API 1.5 (`api.shaders`, docs/ADDONS
 
 - AgX tonemapping and a film contrast curve: highlights roll off instead of clipping
 - bloom: lamps, fire, lasers and molten metal glow
-- soft shadows (the sun's angular size), from a sun that crosses the sky
+- soft shadows from a sun that crosses the sky, standing in the north-west at noon (the side Factorio's sprites are
+  lit from, so models show a lit side and a shaded one; Noon sun from the north-west off: high behind the view, as
+  before 0.5.1): wider, even edges by default (Soft shadows), and
+  as an option shadows that soften with distance from what casts them (Shadows soften with distance,
+  at a Sun size you pick; Godot's PCSS, which costs more and looks grainy below Shadows: High)
 - a real sunrise and sunset: the sun reddens as it sinks and sets in the west, shadows grow long, a
   blue hour follows, and the exposure, haze, shadows and grade all follow the sun's height; dawn has
   its own mist. Each planet has its own colours. One slider, Sunrise and sunset, sets how much
-- ambient occlusion (SSAO) in corners and under machines; bounce light (SSIL) as its own option,
-  off by default
+- ambient occlusion (SSAO) in corners and under machines, on the shade's light (the sun's nearly untouched; Occlusion
+  in sunlight too gives the darker one before 0.5.2); bounce light (SSIL) as its own option, off by default
 - the sky's reflection on metal
 - depth haze that grows with distance
 - clouds: soft, shaded clouds in the sky and their shadows drifting over the factory, from one
@@ -34,8 +38,8 @@ Put this folder (or a zip of it) in Zenith's `addons` folder and switch it on in
 the add-on is the look, so the world is drawn with it while it is on, and switching it off brings
 back Zenith's Factorio look (which has no settings of its own). Its page in the Add-ons menu has its
 sliders: grade strength, bloom, depth haze, softening the far distance, vignette, film grain,
-temporal anti-aliasing, ambient occlusion, bounce light, soft shadows, whether the sun moves, and how
-strong sunrise and sunset are.
+temporal anti-aliasing, ambient occlusion, bounce light, soft shadows, shadows that soften with
+distance and the sun's size, whether the sun moves, and how strong sunrise and sunset are.
 
 It costs GPU time: ambient occlusion most (about 1-1.5 ms a frame on a desktop graphics card at a
 busy base: Godot's depth pre-pass then writes every pixel's normal), bounce light about as much again

@@ -22,15 +22,15 @@ const LIST := [
 	["move_right", [KEY_D, KEY_RIGHT]],
 	["open_screen", [KEY_E]],
 	["open_technology", [KEY_T]],
-	["toggle_map", [KEY_M]],
+	["toggle_map", [KEY_TAB, KEY_M]],
 	["production_statistics", [KEY_P]],
 	["kill_statistics", [KEY_K]],
 	["logistic_networks", [KEY_L]],
 	["toggle_factoriopedia", [KEY_F2]],
 	["toggle_console", [KEY_QUOTELEFT, KEY_SLASH]],
 	["shoot_enemies", [KEY_SPACE]],
-	["shoot_cursor", [KEY_C]],
-	["next_gun", [KEY_TAB]],
+	["shoot_cursor", [KEY_SPACE | KEY_MASK_SHIFT]],
+	["next_gun", [KEY_C]],
 	["enter_vehicle", [KEY_ENTER, KEY_KP_ENTER]],
 	["pick_up", [KEY_F]],
 	["rotate", [KEY_R]],
@@ -100,7 +100,44 @@ const LIST := [
 	["toggle_projection", [KEY_F7]],
 	["show_factorio", [KEY_F9 | KEY_MASK_CTRL]],
 	["debug_menu", [KEY_F12 | KEY_MASK_CTRL]],
+	["addons_reload", [KEY_F5 | KEY_MASK_CTRL | KEY_MASK_SHIFT]],
 ]
+
+## Factorio 1.1's defaults where 2.0 changed them (Wube's data/changelog.txt, 2.0.7: "Default control key
+## for Map changed from M to Tab or M", "Next weapon changed from Tab to C", "Shoot selected changed from
+## C to Shift+Space"), as Zenith 0.2.2 had them. LIST has 2.0's; Settings → Controls → "Zenith 0.2.2's keys"
+## (or --keys-defaults=old for one run) puts these back (issue #26).
+const OLD_DEFAULTS := {"toggle_map": [KEY_M], "next_gun": [KEY_TAB], "shoot_cursor": [KEY_C]}
+## The saved setting behind old_defaults() (Settings' factorio section).
+const OLD_KEYS_SETTING := "keys_0_2_2"
+## Tests force old_defaults() one way (1) or the other (0); -1 reads the command line, then the setting.
+static var old_defaults_override := -1
+
+
+## Zenith 0.2.2's keys (issue #26's switch): OLD_DEFAULTS as the built-in defaults, and of Factorio's
+## config.ini only the controls the player set (factorio_keys.gd's report(text, true)), so the arrows walk,
+## / opens the console and Keypad Enter gets in as before. On with --keys-defaults=old (that run only)
+## or the saved setting.
+static func old_defaults() -> bool:
+	if old_defaults_override != -1:
+		return old_defaults_override == 1
+	if old_defaults_forced():
+		return true
+	# settings.gd preloads this script, so it is loaded here when used.
+	return bool(load("res://scripts/menu/settings.gd").get_value("factorio", OLD_KEYS_SETTING))
+
+
+## --keys-defaults=old: the switch on for this run, whatever is saved.
+static func old_defaults_forced() -> bool:
+	return OS.get_cmdline_user_args().has("--keys-defaults=old")
+
+
+## An action's default keys (LIST's, or OLD_DEFAULTS' with old_defaults()).
+static func defaults_of(entry: Array) -> Array:
+	var action: String = entry[0]
+	if old_defaults() and OLD_DEFAULTS.has(action):
+		return OLD_DEFAULTS[action]
+	return entry[1]
 
 const MODIFIERS := [KEY_SHIFT, KEY_CTRL, KEY_ALT, KEY_META]
 
@@ -108,10 +145,46 @@ const MODIFIERS := [KEY_SHIFT, KEY_CTRL, KEY_ALT, KEY_META]
 ## public one.
 const DEV_ONLY := ["debug_menu"]
 
+## Actions with their default key only in dev builds (Settings.dev_tools()): a public build lists them in
+## Settings → Controls unbound, for the player to bind (nothing locked out). Issue #26: the debug line's F4 is
+## a key many players gave a Factorio control (Factoriopedia), so both acted. A binding saved keeps its key.
+const DEV_KEYS := ["debug_line"]
+
+
+## An action's default keys in LIST as [primary, alternative] codes (0: none).
+static func default_pair(action: String) -> Array:
+	for entry in LIST:
+		if entry[0] == action:
+			var keys: Array = defaults_of(entry).duplicate()
+			while keys.size() < 2:
+				keys.append(0)
+			return keys
+	return [0, 0]
+
+## Actions only an add-on author has: reloading the add-ons given with --addons (addon_host.gd), while
+## one is given (and --addon-reload=off isn't). Settings.apply_bindings takes them away otherwise.
+const ADDON_AUTHOR_ONLY := ["addons_reload"]
+## Tests force addon_author() one way (1) or the other (0); -1 reads the command line.
+static var addon_author_override := -1
+
+
+static func addon_author() -> bool:
+	if addon_author_override != -1:
+		return addon_author_override == 1
+	var args := OS.get_cmdline_user_args()
+	if args.has("--addon-reload=off"):
+		return false
+	for arg in args:
+		if arg.begins_with("--addons="):
+			return true
+	return false
+
 ## Pairs that share a key on purpose, as in Factorio: one press does whichever fits
-## (player_input.gd). Q clears the cursor, or pipettes with nothing in it; Alt+R changes the rail
-## layer with rails in hand, otherwise it gives a red wire. Settings doesn't call them a clash.
-const SHARED := [["clear_cursor", "pipette"], ["give_red_wire", "toggle_rail_layer"]]
+## (player_input.gd). Q clears the cursor, or pipettes with nothing in it; the rail layer's key
+## changes the layer with rails in hand, otherwise it does the other's: Factorio 2.1 binds G to both
+## the rail layer and getting in a vehicle (its alternative), and Zenith's old Alt+R gave a red wire.
+## Settings doesn't call them a clash.
+const SHARED := [["clear_cursor", "pipette"], ["give_red_wire", "toggle_rail_layer"], ["enter_vehicle", "toggle_rail_layer"]]
 
 
 ## Adds the actions that aren't defined yet, with their default keys. Call once before the scene
@@ -122,7 +195,7 @@ static func define() -> void:
 		if InputMap.has_action(action):
 			continue
 		InputMap.add_action(action)
-		for code in entry[1]:
+		for code in defaults_of(entry):
 			InputMap.action_add_event(action, key_event(int(code)))
 
 

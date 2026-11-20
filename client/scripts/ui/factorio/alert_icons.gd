@@ -22,6 +22,8 @@ const DRAWN := {
 	"platform_storage": ["no-platform-storage-space-icon.png", true],
 	# J27: a mining drill whose status is no_minable_resources, Factorio's utility sprite resources_depleted_icon.
 	"depleted": ["resources-depleted-icon.png", true],
+	# L11: a pipeline over the extent limit, Factorio's pipeline_disabled_icon over one entity of it.
+	"pipeline": ["fluid-icon-red.png", true],
 }
 const SIZE := 1.0
 const BLINK := 1.0
@@ -65,7 +67,7 @@ func _process(_delta: float) -> void:
 
 
 ## lists: kind -> [{"position", "si", "unit", ...}]; si: the character's surface (0: unknown, draw all).
-## An icon is drawn only over an entity the 3D world has: the mod's lists come from a
+## An icon is drawn only over an entity the 3D world has (owner's G19): the mod's lists come from a
 ## pass over every surface that is seconds old, so a building mined, destroyed or on another surface
 ## (the remote view of another planet) would otherwise leave its icon over empty ground.
 func show_alerts(lists: Dictionary, si: int) -> void:

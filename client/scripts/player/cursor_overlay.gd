@@ -7,12 +7,15 @@ extends MeshInstance3D
 ## roboports (logistic orange, construction green) and mining drills; the lines between linked
 ## roboports (H14, roboport_links.gd); electric poles' supply areas in Factorio's blue, one tint
 ## where several meet (J4, pole_coverage.gd); and a held underground's connection and reach (J24,
-## underground_pairs.gd).
+## underground_pairs.gd). A crafting machine's connections with its record's `fc` (L10: which fluid goes in or
+## out where, read by the bridge) get the fluid's icon at each, as Factorio draws it on a machine selected
+## (PipeConnectionDefinition::hide_connection_info); --fluid-icons=off draws the prototype's arrows alone, as before.
 ##
 ## marks_for() works the marks out as plain data from the mod's `eprops` overlay (ui_model.eprops
 ## "x"), so the UI test can check them; show_marks() draws a list of marks.
 
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const Kit := preload("res://scripts/ui/factorio/kit.gd")
 
 const YELLOW := Color(1.0, 0.8, 0.1, 0.95)
 const SELECTION := Color(1.0, 0.86, 0.3, 0.95)
@@ -32,8 +35,15 @@ const SUPPLY := Color(55.0 / 255.0, 85.0 / 255.0, 217.0 / 255.0, 0.28)
 const ARROW := Vector2(0.5, 0.42)
 const LIFT := 0.06
 const BELT_TYPES := ["transport-belt", "underground-belt", "splitter", "lane-splitter", "loader", "loader-1x1", "linked-belt"]
+## A fluid's icon at a connection (tiles across), on the connection's own tile just inside the machine's edge.
+const FLUID_ICON := 0.55
+## L10: on unless --fluid-icons=off (docs/RUNNING.md).
+static var fluid_icons := not ("--fluid-icons=off" in OS.get_cmdline_user_args())
 
 var _mesh := ImmediateMesh.new()
+## Pictures drawn flat (fluid icons): a pool of quads, one material a picture.
+var _icon_quads: Array[MeshInstance3D] = []
+var _icon_materials := {}
 
 
 func _ready() -> void:
@@ -55,6 +65,11 @@ static func dir_vector(dir: int) -> Vector2:
 
 static func arrow(at: Vector2, towards: Vector2, both := false, color := YELLOW) -> Dictionary:
 	return {"k": "arrow", "at": at, "dir": towards.normalized(), "both": both, "c": color}
+
+
+## A picture lying flat at `at` (tiles), `size` across: an item's or fluid's icon by name.
+static func icon(at: Vector2, name: String, size := FLUID_ICON) -> Dictionary:
+	return {"k": "icon", "at": at, "name": name, "size": size}
 
 
 static func area(rect: Rect2, fill: Color, edge: Color) -> Dictionary:
@@ -169,8 +184,9 @@ static func brackets(centre: Vector2, half: Vector2, yaw := 0.0, color := SELECT
 
 
 ## The marks for an entity of `type` at `pos` facing `dir`, from its `eprops` overlay `x`; with
-## `placing`, also what only shows while it is being placed (a belt's way).
-static func marks_for(type: String, x: Dictionary, pos: Vector2, dir: int, placing: bool) -> Array:
+## `placing`, also what only shows while it is being placed (a belt's way). `fc`: the record's live fluid
+## connections with their fluids (L10, world frame), drawn in place of the prototype's.
+static func marks_for(type: String, x: Dictionary, pos: Vector2, dir: int, placing: bool, fc: Array = []) -> Array:
 	var out: Array = []
 	if placing and BELT_TYPES.has(type):
 		out.append(arrow(pos, dir_vector(dir)))
@@ -189,9 +205,12 @@ static func marks_for(type: String, x: Dictionary, pos: Vector2, dir: int, placi
 	if x.has("mr"):
 		var r := float(x["mr"])
 		out.append(area(Rect2(pos - Vector2(r, r), Vector2(r, r) * 2.0), MINING_FILL, MINING_EDGE))
-		if x.has("vp"):
+		# A pumpjack's {0, 0} isn't a drop: its oil leaves by its fluid connection (L8).
+		if x.has("vp") and _vec(x["vp"]) != Vector2.ZERO:
 			out.append(arrow(pos + turn(_vec(x["vp"]), dir), dir_vector(dir)))
-	if x.has("fb") and not x.has("fo"):
+	if fluid_icons and not fc.is_empty():
+		out.append_array(connection_marks(pos, fc))
+	elif x.has("fb") and (not x.has("fo") or outputs_only(x["fb"])):
 		for c in x["fb"]:
 			if not (c is Array) or c.size() < 4:
 				continue
@@ -202,6 +221,33 @@ static func marks_for(type: String, x: Dictionary, pos: Vector2, dir: int, placi
 	return out
 
 
+## A record's live connections (`fc`: [dx, dy, way, flow, fluid]) as Factorio marks a selected machine's: the
+## arrow past the edge, in or out, and the fluid's icon on the connection's tile.
+static func connection_marks(pos: Vector2, fc: Array) -> Array:
+	var out: Array = []
+	for c in fc:
+		if not (c is Array) or c.size() < 5:
+			continue
+		var way := dir_vector(int(c[2]))
+		var tile := pos + Vector2(float(c[0]), float(c[1]))
+		var flow := str(c[3])
+		out.append(arrow(tile + way * 0.62, -way if flow == "i" else way, flow == "b"))
+		if str(c[4]) != "":
+			out.append(icon(tile - way * 0.05, str(c[4])))
+	return out
+
+
+## True when every connection only lets fluid out (a pumpjack's): `fo` (shown only while a recipe or resource
+## needs fluid) doesn't hide those (L8; a bridge from before marked every drill so).
+static func outputs_only(fb) -> bool:
+	if not (fb is Array) or (fb as Array).is_empty():
+		return false
+	for c in fb:
+		if not (c is Array) or c.size() < 4 or str(c[3]) != "o":
+			return false
+	return true
+
+
 static func _vec(v) -> Vector2:
 	return Vector2(float(v[0]), float(v[1])) if v is Array and v.size() >= 2 else Vector2.ZERO
 
@@ -210,10 +256,14 @@ static func _vec(v) -> Vector2:
 func show_marks(marks: Array) -> void:
 	_mesh.clear_surfaces()
 	visible = not marks.is_empty()
+	_show_icons(marks)
 	if marks.is_empty():
 		return
+	var drawn := 0
 	_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
 	for m: Dictionary in marks:
+		if str(m["k"]) != "icon":
+			drawn += 1
 		match str(m["k"]):
 			"area":
 				var r: Rect2 = m["rect"]
@@ -234,7 +284,46 @@ func show_marks(marks: Array) -> void:
 				_quad(a + side, b + side, b - side, a - side, m["c"])
 			"tunnel":
 				_tunnel(m["at"], m["dir"], m["c"], bool(m.get("arrow", true)))
+			"unbuilt":
+				_unbuilt(m["at"], m["dir"], m["c"], m["ca"], bool(m.get("arrow", true)))
+	if drawn == 0:  # (only pictures: a surface can't be empty)
+		_tri(Vector2.ZERO, Vector2.ZERO, Vector2.ZERO, Color(0, 0, 0, 0))
 	_mesh.surface_end()
+
+
+## The marks' pictures on quads of their own (the mesh above has colours, no textures).
+func _show_icons(marks: Array) -> void:
+	var i := 0
+	for m: Dictionary in marks:
+		if str(m["k"]) != "icon":
+			continue
+		var name := str(m["name"])
+		if not _icon_materials.has(name):
+			var texture := Kit.item_icon(name)
+			_icon_materials[name] = GroundHeight.overlay_material(10, texture) if texture != null else null
+		var material: Material = _icon_materials[name]
+		if material == null:
+			continue
+		if i == _icon_quads.size():
+			var mi := MeshInstance3D.new()
+			var quad := QuadMesh.new()
+			quad.orientation = PlaneMesh.FACE_Y
+			mi.mesh = quad
+			mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			add_child(mi)
+			_icon_quads.append(mi)
+		var q := _icon_quads[i]
+		var side := Vector2.ONE * float(m["size"])
+		if (q.mesh as QuadMesh).size != side:
+			(q.mesh as QuadMesh).size = side
+		q.material_override = material
+		var at: Vector2 = m["at"]
+		# The parent sits at the origin: the quad is placed in the world's frame, a little over the arrows.
+		q.transform = Transform3D(Basis.IDENTITY, Vector3(at.x, LIFT * 1.5, at.y))
+		q.visible = true
+		i += 1
+	for j in range(i, _icon_quads.size()):
+		_icon_quads[j].visible = false
 
 
 func _frame(r: Rect2, w: float, c: Color) -> void:
@@ -306,6 +395,34 @@ func _tunnel(at: Vector2, flow: Vector2, c: Color, arrow: bool) -> void:
 		var q: Vector2 = edge[1]
 		var n := (q - p).normalized().orthogonal() * 0.025
 		_quad(p - n, q - n, q + n, p + n, c)
+
+
+## M2: one tile an underground's build would mine (underground_pairs.gd removed), as Factorio's
+## underground-lines-remove.png draws it on a 64-pixel tile pointing up: an L in each corner 20 pixels along
+## each edge and 9 thick (red-orange; Factorio's round their outer corners), and for belts the hollow arrow of its other
+## frame (apex at row 23, base at row 42, 36 pixels wide, 4 thick) in `arrow_c`.
+func _unbuilt(at: Vector2, flow: Vector2, c: Color, arrow_c: Color, arrow: bool) -> void:
+	var f := flow.normalized()
+	var side := Vector2(-f.y, f.x)
+	var arm := 20.0 / 64.0
+	var w := 9.0 / 64.0
+	for sf: float in [-1.0, 1.0]:
+		for ss: float in [-1.0, 1.0]:
+			var corner := at + f * (0.5 * sf) + side * (0.5 * ss)
+			var back_f := -f * sf
+			var back_s := -side * ss
+			_quad(corner, corner + back_f * arm, corner + back_f * arm + back_s * w, corner + back_s * w, c)
+			_quad(corner, corner + back_s * arm, corner + back_s * arm + back_f * w, corner + back_f * w, c)
+	if not arrow:
+		return
+	var apex := at + f * (9.0 / 64.0)
+	var left := at - f * (10.0 / 64.0) - side * (18.0 / 64.0)
+	var right := at - f * (10.0 / 64.0) + side * (18.0 / 64.0)
+	for edge: Array in [[apex, left], [left, right], [right, apex]]:
+		var p: Vector2 = edge[0]
+		var q: Vector2 = edge[1]
+		var n := (q - p).normalized().orthogonal() * (2.0 / 64.0)
+		_quad(p - n, q - n, q + n, p + n, arrow_c)
 
 
 func _tri(a: Vector2, b: Vector2, c: Vector2, color: Color, lift := LIFT) -> void:

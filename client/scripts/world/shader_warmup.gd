@@ -15,6 +15,7 @@ extends Node3D
 
 const Visuals := preload("res://scripts/world/visuals.gd")
 const TerrainMesher := preload("res://scripts/world/terrain_mesher.gd")
+const FarChunks := preload("res://scripts/world/far_chunks.gd")
 
 const WARM_FRAMES := 4
 const DIR := "res://shaders"
@@ -84,10 +85,28 @@ func _ready() -> void:
 		mmi.multimesh = mm
 		mmi.material_override = m
 		add_child(mmi)
+		# Also warm MULTIMESH_HAS_COLOR (tints, custom-painted/placeholder variants).
+		var mm_c := MultiMesh.new()
+		mm_c.transform_format = MultiMesh.TRANSFORM_3D
+		mm_c.use_colors = true
+		mm_c.use_custom_data = true
+		mm_c.mesh = box
+		mm_c.instance_count = 1
+		var mmi_c := MultiMeshInstance3D.new()
+		mmi_c.multimesh = mm_c
+		mmi_c.material_override = m
+		add_child(mmi_c)
 	# The ground: its vertex layout (terrain_mesher.gd TerrainSurface) with the terrain and water materials.
 	var ground := MeshInstance3D.new()
 	ground.mesh = _ground_mesh()
 	add_child(ground)
+	# Far merged chunks: compressed vertex + color layout, and crown puffs with uncompressed world UV (far_chunks.gd).
+	var far := MeshInstance3D.new()
+	far.mesh = _far_chunk_mesh()
+	add_child(far)
+	var far_crown := MeshInstance3D.new()
+	far_crown.mesh = _far_crown_mesh()
+	add_child(far_crown)
 	warmed_msec = Time.get_ticks_msec() - t0
 	print("Shader warm-up (%s): %d shaders, %d materials set up in %d ms" % [mode, shaders.size(), materials.size(), warmed_msec])
 
@@ -110,6 +129,33 @@ static func _ground_mesh() -> ArrayMesh:
 	for m in [Visuals.terrain_material(), Visuals.water_material()]:
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, a, [], {}, TerrainMesher.TerrainSurface.FORMAT)
 		mesh.surface_set_material(mesh.get_surface_count() - 1, m)
+	return mesh
+
+
+## One triangle in far_chunks.gd's compressed vertex-color layout.
+static func _far_chunk_mesh() -> ArrayMesh:
+	var a := []
+	a.resize(Mesh.ARRAY_MAX)
+	a[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(0, 0, 0), Vector3(0.01, 0, 0), Vector3(0, 0, 0.01)])
+	a[Mesh.ARRAY_COLOR] = PackedColorArray([Color.WHITE, Color.WHITE, Color.WHITE])
+	a[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2])
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, a, [], {}, Mesh.ARRAY_FLAG_COMPRESS_ATTRIBUTES)
+	mesh.surface_set_material(0, FarChunks.material())
+	return mesh
+
+
+## One triangle in far_chunks.gd's tree-crown layout (uncompressed float world UV).
+static func _far_crown_mesh() -> ArrayMesh:
+	var a := []
+	a.resize(Mesh.ARRAY_MAX)
+	a[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(0, 0, 0), Vector3(0.01, 0, 0), Vector3(0, 0, 0.01)])
+	a[Mesh.ARRAY_COLOR] = PackedColorArray([Color.WHITE, Color.WHITE, Color.WHITE])
+	a[Mesh.ARRAY_TEX_UV] = PackedVector2Array([Vector2.ZERO, Vector2.ZERO, Vector2.ZERO])
+	a[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2])
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, a, [], {}, 0)
+	mesh.surface_set_material(0, FarChunks.crown_material())
 	return mesh
 
 

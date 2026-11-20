@@ -1,7 +1,6 @@
 extends Control
 ## Zenith's debug menu, opened only by its key (Settings > Controls > Miscellaneous > Debug menu,
-## Ctrl+F12): out of players' way, and only in dev builds (Settings.dev_tools(): development
-## downloads and a checkout); a public download has no key for it and it never opens, so its
+## Ctrl+F12): out of players' way, and only in dev builds (Settings.dev_tools(): development downloads and a checkout); a public download has no key for it and it never opens, so its
 ## overlays and probes can't be switched on there either. Three tabs in Factorio's style:
 ## - Time: the time of day (a slider and Dawn / Noon / Sunset / Night), freezing the day/night
 ##   cycle, the game's speed and pausing. They change the game, through the bridge's /f3d-debug
@@ -23,6 +22,14 @@ extends Control
 ##   alerts...) outlined on the ground as it arrives, fading over a second, each its own switch and
 ##   colour, a legend with its updates a second; and three states (the subscription, how each lane is
 ##   drawn, the lattice against the simulation). The overlay node exists only while a kind is on.
+## - Simulation: the belt fixes (belt_items.gd's LIVE: early stop, the longer lead, rescue seen...) off and
+##   on while playing, each from the command line's value, taken at the next belt job; nothing saved.
+## - Lighting: the pbr light numbers (looks.gd), each a slider with its value and default, applied live and
+##   not saved: the fill and ambient shares, the neutral reflection's k, the sun lobe, the downward-face ambient,
+##   the metal share, a flat / directional toggle, a reset each and "Copy values" (prints them to the log). Under
+##   them SSAO and SSIL on/off and their numbers, the contact shading's strength and widths, the sun's energy,
+##   shadow softness and biases, and the ambient energy: each shows what the game has now and, once moved, is kept
+##   over the look each frame (looks.gd light_tune) until its Reset.
 ## Esc cancels a running benchmark, then closes the report, then the menu.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
@@ -40,8 +47,15 @@ const TerrainProbe := preload("res://scripts/debug/terrain_probe.gd")
 const FxDemo := preload("res://scripts/fx/fx_demo.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
+const PerfWarning := preload("res://scripts/ui/factorio/perf_warning.gd")
+const BeltItems := preload("res://scripts/world/belt_items.gd")
+const Looks := preload("res://scripts/world/looks.gd")
+const ContactShade := preload("res://scripts/world/contact_shade.gd")
+const ItemCards := preload("res://scripts/world/item_cards.gd")
+const Visuals := preload("res://scripts/world/visuals.gd")
 
-const TABS := ["Time", "Benchmarks", "Tests", "Updates"]
+const TABS := ["Time", "Benchmarks", "Tests", "Updates", "Simulation", "Lighting"]
 ## Factorio's day: 0 is noon, dusk 0.25, evening (darkest from) 0.45, morning 0.55, dawn 0.75.
 const DAY_PRESETS := [["Dawn", 0.65], ["Noon", 0.0], ["Sunset", 0.35], ["Night", 0.5]]
 const SPEEDS := [0.25, 0.5, 1.0, 2.0, 4.0]
@@ -69,6 +83,8 @@ const TESTS := [
 	["flicker", "Flicker frames", "Turns the camera 0.1 degrees a frame and saves 40 frames for tools/flicker_count.py (--flicker-probe)", false],
 	["fx", "Effects demo", "The character walks, mines, builds a furnace and an inserter, shoots and mines them back, as a player would (--fx-demo). Hands off the keys", false],
 	["redraw", "Redraw chunks", "Every loaded chunk's buildings built again from what the client has (models changed on disk need a restart)", false],
+	["perfwarn", "Performance warnings", "The warning icon at the top left while settings are held back for UPS; its log fills either way. The same as Settings > Interface > Performance warnings, saved", true],
+	["packs", "Model packs", "Which model pack each model in use comes from, and the packs off or left out (the Model packs window)", false],
 ]
 
 ## ui_model.gd: command() and its answers.
@@ -130,6 +146,20 @@ var _fx_demo: Node
 var _updates: UpdateOverlay = null
 var _update_boxes := {}  # kind id -> CheckBox
 var _updates_note: Label
+## The Lighting tab's sliders: key -> [HSlider, value Label].
+var _light_sliders := {}
+var _light_flat: CheckBox
+## The live-light sliders (LIVE): key -> [HSlider, value Label]; the toggles: key -> CheckBox.
+var _live_sliders := {}
+var _live_boxes := {}
+## What each overridden number was before the first move (reset puts it back).
+var _live_was := {}
+## The environment, sun and sun shadows the live sliders move: the game's (main.gd), or a test's own.
+var light_env: Environment
+var light_sun: DirectionalLight3D
+var light_shadows
+var _sim_boxes := {}  # belt switch id -> CheckBox
+var _sim_note: Label
 
 
 func _ready() -> void:
@@ -177,7 +207,7 @@ func _ready() -> void:
 	scroll.add_child(pad)
 	var pages := VBoxContainer.new()
 	pad.add_child(pages)
-	for page in [_time_page(), _bench_page(), _tests_page(), _updates_page()]:
+	for page in [_time_page(), _bench_page(), _tests_page(), _updates_page(), _sim_page(), _light_page()]:
 		page.visible = false
 		pages.add_child(page)
 		_pages.append(page)
@@ -215,6 +245,10 @@ func open(on: bool) -> void:
 		_ask("/f3d-debug", "state")
 		_show_bench_lasts()
 		_sync_updates()
+		if _toggles.has("perfwarn"):  # the setting may have changed in Settings since
+			var pw: Button = _toggles["perfwarn"]
+			pw.set_pressed_no_signal(PerfWarning.enabled())
+			pw.text = "Hide" if pw.button_pressed else "Show"
 
 
 ## Esc: a running benchmark stops, then the report closes, then the menu. False when none was open.
@@ -236,6 +270,10 @@ func current_tab() -> String:
 
 func _open_tab(index: int) -> void:
 	_tab = index
+	if TABS[index] == "Lighting":
+		_sync_light()
+	if TABS[index] == "Simulation":
+		_sync_sim()
 	for i in _pages.size():
 		_pages[i].visible = i == index
 		_tab_buttons[i].button_pressed = i == index
@@ -250,6 +288,8 @@ func _process(delta: float) -> void:
 		_apply()
 	if not _frame.visible:
 		return
+	if TABS[_tab] == "Lighting":
+		_sync_live()  # the numbers the game moves itself (the time of day, a look) follow
 	var now := Time.get_ticks_msec()
 	for id in _asked.keys():
 		if now - int(_asked[id][0]) > ANSWER_MSEC:
@@ -865,6 +905,9 @@ func _tests_page() -> Control:
 				b.text = "Hide" if on else "Show"
 				set_toggle(id, on))
 			_toggles[id] = b
+			if id == "perfwarn":  # a saved setting, not an overlay: the button shows it as it is (off under --perf-warning=off)
+				b.set_pressed_no_signal(PerfWarning.enabled())
+				b.text = "Hide" if b.button_pressed else "Show"
 		else:
 			b.pressed.connect(func() -> void: run_test(id))
 		row.add_child(b)
@@ -933,6 +976,9 @@ func run_test(id: String) -> void:
 			_show_result("Asking the bridge...")
 			_ask("/f3d-status", "status")
 			return
+		"packs":
+			_show_result(ModelPacks.report())
+			return
 	if main == null or not Bridge.world_ready:
 		_show_result("This one needs a game: connect first")
 		return
@@ -987,6 +1033,8 @@ func _start_probe(p: Node, what: String) -> void:
 ## An overlay or probe of TESTS that stays on until switched off.
 func set_toggle(id: String, on: bool) -> void:
 	match id:
+		"perfwarn":
+			Settings.set_value("interface", "perf_warning", on)
 		"ups":
 			if main != null:
 				main.ups_overlay_on = on
@@ -1150,3 +1198,396 @@ func _sync_updates() -> void:
 	for id: String in _update_boxes:
 		if (_update_boxes[id] as CheckBox).button_pressed:
 			set_update_kind(id, true)
+
+
+## The Simulation tab: the belt fixes (belt_items.gd's LIVE), each ticked as the jobs use it, with the
+## command line's value beside it. A change waits for the next belt job (a running one never sees a switch
+## change under it) and isn't saved.
+func _sim_page() -> Control:
+	var page := VBoxContainer.new()
+	page.name = "SimulationPage"
+	page.add_theme_constant_override("separation", Kit.px(6))
+	var about := MenuKit.paragraph("The belt items' fixes, to switch off and compare while playing. A change takes effect at the next belt job (a fraction of a second) and isn't saved: the next start takes the command line's again. Not here, as they need a restart: take before read and take on the read's tick (the simulation queues takes and reads for them), the lattice and its creep (lanes keep their motion), the C++ twins (--belt-sim-native, --belt-draw-native).", 660)
+	about.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+	page.add_child(about)
+	_sim_note = Kit.label("")
+	_sim_note.name = "SimulationNote"
+	_sim_note.add_theme_color_override("font_color", Kit.RED_TEXT)
+	_sim_note.visible = false
+	page.add_child(_sim_note)
+	page.add_child(Kit.label("Belts", "FHeading"))
+	for l: Array in BeltItems.LIVE:
+		var id: String = l[0]
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", Kit.px(10))
+		var box := MenuKit.checkbox(str(l[1]), BeltItems.live_on(id))
+		box.name = "Sim_" + id
+		box.tooltip_text = str(l[2])
+		box.custom_minimum_size.x = Kit.px(220)
+		box.toggled.connect(func(on: bool) -> void: set_sim_switch(id, on))
+		row.add_child(box)
+		var start := Kit.label("")
+		start.name = "SimStart_" + id
+		start.custom_minimum_size.x = Kit.px(130)
+		start.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+		row.add_child(start)
+		var what := MenuKit.paragraph(str(l[2]), 290)
+		what.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+		row.add_child(what)
+		page.add_child(row)
+		_sim_boxes[id] = box
+	_sync_sim()
+	return page
+
+
+## A belt switch on or off for the next belt job (belt_items.gd set_live). False in a public build (no dev
+## tools): the box goes back.
+func set_sim_switch(id: String, on: bool) -> bool:
+	if not Settings.dev_tools():
+		if _sim_note != null:
+			_sim_note.text = "Dev builds only"
+			_sim_note.visible = true
+		_sync_sim()
+		return false
+	if _sim_note != null:
+		_sim_note.visible = false
+	BeltItems.set_live(id, on)
+	_sync_sim()
+	return true
+
+
+## The boxes as the switches are (a test or the command line may have set them), each with its start value.
+func _sync_sim() -> void:
+	for id: String in _sim_boxes:
+		var box: CheckBox = _sim_boxes[id]
+		if box.button_pressed != BeltItems.live_on(id):
+			box.set_pressed_no_signal(BeltItems.live_on(id))
+		var start: Label = box.get_parent().find_child("SimStart_" + id, false, false)
+		if start != null:
+			var was := BeltItems.live_started(id)
+			start.text = "started " + ("on" if was else "off") + ("" if was == BeltItems.live_on(id) else ", changed")
+
+
+## The pbr light numbers the Lighting tab moves: [key, label, min, max, step, default, what it does].
+const LIGHT := [
+	["model_fill", "Camera fill", 0.0, 2.0, 0.01, 0.0, "Light from the camera's side on every model (off by default; --model-fill=on: the look's 1.1). Follows the ambient."],
+	["pbr_fill", "Fill share", 0.0, 1.5, 0.01, Looks.PBR_FILL, "How much of the look's camera fill a pbr surface gets."],
+	["pbr_ambient", "Ambient share", 0.0, 2.0, 0.01, Looks.PBR_AMBIENT, "How much of the scene's ambient a pbr surface gets."],
+	["pbr_env", "Reflection k", 0.0, 1.0, 0.01, Looks.PBR_ENV, "The sun's share in the neutral reflection (metal)."],
+	["pbr_sun_lobe", "Sun lobe", 0.0, 5.0, 0.05, Looks.PBR_SUN_LOBE, "The height of the sun's reflection lobe (directional only)."],
+	["pbr_ground", "Down ambient", 0.0, 1.0, 0.01, Looks.PBR_GROUND, "The ambient on faces pointing down, as a share of the sky's (directional only)."],
+	["pbr_metal", "Metal share", 0.0, 1.0, 0.01, Looks.PBR_METAL, "The share of a pbr pack's metal drawn."],
+]
+
+
+## The Lighting tab: sliders for the pbr light numbers, live, nothing saved.
+func _light_page() -> Control:
+	var page := VBoxContainer.new()
+	page.name = "LightingPage"
+	page.add_theme_constant_override("separation", Kit.px(6))
+	var about := MenuKit.paragraph("The camera fill and the pbr packs' light numbers, applied live and not saved (the next start takes the look's and the command line's). Dragging a slider overrides that number; Reset puts the default back. Copy values prints them to the log.", 660)
+	about.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+	page.add_child(about)
+	_light_flat = MenuKit.checkbox("Lit by direction", true)
+	_light_flat.name = "Light_directional"
+	_light_flat.tooltip_text = "Off: the old flat balance (--pbr-light=flat)."
+	_light_flat.toggled.connect(func(on: bool) -> void: set_light("pbr_directional", 1.0 if on else 0.0))
+	page.add_child(_light_flat)
+	for l: Array in LIGHT:
+		var key: String = l[0]
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", Kit.px(10))
+		var name_label := Kit.label(str(l[1]))
+		name_label.custom_minimum_size.x = Kit.px(120)
+		name_label.tooltip_text = str(l[6])
+		row.add_child(name_label)
+		var sl := MenuKit.slider(float(l[2]), float(l[3]), float(l[4]), float(l[5]))
+		sl.name = "Light_" + key
+		sl.custom_minimum_size.x = Kit.px(300)
+		sl.tooltip_text = str(l[6])
+		sl.value_changed.connect(func(v: float) -> void: set_light(key, v))
+		row.add_child(sl)
+		var val := Kit.label("")
+		val.name = "LightValue_" + key
+		val.custom_minimum_size.x = Kit.px(110)
+		row.add_child(val)
+		var reset := Button.new()
+		reset.text = "Reset"
+		reset.name = "LightReset_" + key
+		reset.focus_mode = Control.FOCUS_NONE
+		reset.pressed.connect(func() -> void: reset_light(key))
+		row.add_child(reset)
+		page.add_child(row)
+		_light_sliders[key] = [sl, val]
+	var live_about := MenuKit.paragraph("Ambient occlusion, indirect light, contact shading, the sun and the ambient: the numbers the game sets now (a look or a quality change moves them), until a slider is dragged; Reset gives that number back.", 660)
+	live_about.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+	page.add_child(live_about)
+	for t: Array in LIVE_TOGGLES:
+		var key: String = t[0]
+		var box := MenuKit.checkbox(str(t[1]), false)
+		box.name = "Live_" + key
+		box.tooltip_text = str(t[2])
+		box.toggled.connect(func(on: bool) -> void: set_live(key, 1.0 if on else 0.0))
+		var trow := HBoxContainer.new()
+		trow.add_theme_constant_override("separation", Kit.px(10))
+		trow.add_child(box)
+		var treset := Button.new()
+		treset.text = "Reset"
+		treset.name = "LiveReset_" + key
+		treset.tooltip_text = "Gives the switch back to the game (Settings > Graphics)."
+		treset.focus_mode = Control.FOCUS_NONE
+		treset.pressed.connect(func() -> void: reset_live(key))
+		trow.add_child(treset)
+		page.add_child(trow)
+		_live_boxes[key] = box
+	for l: Array in LIVE:
+		var key: String = l[0]
+		var row := HBoxContainer.new()
+		row.add_theme_constant_override("separation", Kit.px(10))
+		var name_label := Kit.label(str(l[1]))
+		name_label.custom_minimum_size.x = Kit.px(120)
+		name_label.tooltip_text = str(l[5])
+		row.add_child(name_label)
+		var sl := MenuKit.slider(float(l[2]), float(l[3]), float(l[4]), float(l[2]))
+		sl.name = "Live_" + key
+		sl.custom_minimum_size.x = Kit.px(300)
+		sl.tooltip_text = str(l[5])
+		sl.value_changed.connect(func(v: float) -> void: set_live(key, v))
+		row.add_child(sl)
+		var val := Kit.label("")
+		val.name = "LiveValue_" + key
+		val.custom_minimum_size.x = Kit.px(130)
+		row.add_child(val)
+		var reset := Button.new()
+		reset.text = "Reset"
+		reset.name = "LiveReset_" + key
+		reset.focus_mode = Control.FOCUS_NONE
+		reset.pressed.connect(func() -> void: reset_live(key))
+		row.add_child(reset)
+		page.add_child(row)
+		_live_sliders[key] = [sl, val]
+	var copy := Button.new()
+	copy.text = "Copy values"
+	copy.name = "LightCopy"
+	copy.focus_mode = Control.FOCUS_NONE
+	copy.pressed.connect(copy_light)
+	page.add_child(copy)
+	_sync_light()
+	return page
+
+
+## One pbr light number set live (Looks.pbr_tune). False in a public build.
+func set_light(key: String, v: float) -> bool:
+	if not Settings.dev_tools():
+		_sync_light()
+		return false
+	Looks.pbr_tune[key] = v
+	_sync_light()
+	return true
+
+
+func reset_light(key: String) -> void:
+	Looks.pbr_tune.erase(key)
+	_sync_light()
+
+
+## The tab's text: every number now (an override or its default), for the log.
+func light_text() -> String:
+	var parts: PackedStringArray = []
+	for l: Array in LIGHT:
+		parts.append("%s=%.3f" % [l[0], float(Looks.pbr_tune.get(l[0], l[5]))])
+	parts.append("pbr_directional=%d" % (1 if float(Looks.pbr_tune.get("pbr_directional", 1.0)) > 0.5 else 0))
+	for t: Array in LIVE_TOGGLES:
+		parts.append("%s=%d" % [t[0], 1 if live_value(t[0]) > 0.5 else 0])
+	for l: Array in LIVE:
+		parts.append("%s=%.3f" % [l[0], live_value(l[0])])
+	return "light: " + " ".join(parts)
+
+
+func copy_light() -> String:
+	var t := light_text()
+	print(t)
+	DisplayServer.clipboard_set(t)
+	return t
+
+
+func _sync_light() -> void:
+	_sync_live()
+	for l: Array in LIGHT:
+		var key: String = l[0]
+		var pair: Array = _light_sliders[key] if _light_sliders.has(key) else []
+		if pair.is_empty():
+			continue
+		var v := float(Looks.pbr_tune.get(key, l[5]))
+		(pair[0] as HSlider).set_value_no_signal(v)
+		(pair[1] as Label).text = "%.2f (%s%.2f)" % [v, "default " if not Looks.pbr_tune.has(key) else "was ", float(l[5])]
+	if _light_flat != null:
+		_light_flat.set_pressed_no_signal(float(Looks.pbr_tune.get("pbr_directional", 1.0)) > 0.5)
+
+
+## The live-light numbers: [key, label, min, max, step, what it does]. Their defaults are read from the game as it is.
+const LIVE := [
+	["ssao_radius", "AO radius", 0.0, 4.0, 0.05, "Ambient occlusion: how far (tiles) a surface looks for what shades it."],
+	["ssao_intensity", "AO intensity", 0.0, 8.0, 0.05, "Ambient occlusion: how dark the occluded places get."],
+	["ssao_power", "AO power", 0.1, 8.0, 0.05, "Ambient occlusion: the curve (higher: darker creases, lighter open faces)."],
+	["ssao_detail", "AO detail", 0.0, 1.0, 0.01, "Ambient occlusion: the small-scale detail."],
+	["ssao_light_affect", "AO light affect", 0.0, 1.0, 0.01, "Ambient occlusion: how far it darkens direct light too, not only the ambient."],
+	["ssao_horizon", "AO horizon", 0.0, 1.0, 0.01, "Ambient occlusion: the angle below which a flat surface's own plane isn't counted."],
+	["ssao_sharpness", "AO sharpness", 0.0, 1.0, 0.01, "Ambient occlusion: how much it keeps its edges against the depth."],
+	["ssil_radius", "SSIL radius", 0.0, 16.0, 0.1, "Screen-space indirect light: how far (tiles) light bounces from."],
+	["ssil_intensity", "SSIL intensity", 0.0, 4.0, 0.05, "Screen-space indirect light: how much bounced light is added."],
+	["contact_strength", "Contact strength", 0.0, 1.0, 0.01, "Contact shading: the rim's darkness at the building's edge."],
+	["contact_rim", "Contact rim width", 0.01, 0.2, 0.005, "Contact shading: how fast the rim fades out (tiles)."],
+	["contact_patch", "Contact patch width", 0.0, 0.6, 0.01, "Contact shading: how far the big machines' patch reaches past their foot (tiles)."],
+	["sun_energy", "Sun energy", 0.0, 6.0, 0.05, "The sun's brightness (the time of day sets it each frame until you move this)."],
+	["shadow_blur", "Shadow softness", 0.0, 8.0, 0.05, "The sun's shadow blur (the soft-shadow fit sets it until you move this)."],
+	["shadow_bias", "Shadow bias", 0.0, 1.0, 0.005, "The sun shadow's depth bias (low: thin shadows kept, high: no acne)."],
+	["shadow_normal_bias", "Shadow normal bias", 0.0, 8.0, 0.05, "The sun shadow's normal bias."],
+	["ambient_energy", "Ambient energy", 0.0, 4.0, 0.02, "The ambient light's strength (the time of day sets it each frame until you move this)."],
+	["ground_rough", "Ground roughness", -0.5, 0.5, 0.01, "Added to every ground tile's own roughness (terrain_textures.gd SURFACES; 0: as drawn)."],
+]
+const LIVE_TOGGLES := [
+	["ssao_enabled", "Ambient occlusion (SSAO)", "Screen-space ambient occlusion on or off."],
+	["ssil_enabled", "Indirect light (SSIL)", "Screen-space indirect lighting on or off."],
+]
+## The contact shading's shader uniforms the sliders move (the rest it sets itself: the rim's end and reach follow the width).
+const CONTACT_UNIFORMS := {"contact_strength": "rim_dark", "contact_rim": "rim_falloff", "contact_patch": "patch_reach"}
+## The shader's own defaults (contact_shade.gdshader's; the engine gives none back while a uniform is unset).
+const CONTACT_FALLBACK := {"rim_dark": 0.47, "rim_falloff": 0.06, "patch_reach": 0.1}
+## Those the items' rims share (item_cards.gd contact_param).
+const ITEM_CONTACT_UNIFORMS := {"rim_dark": true, "rim_falloff": true}
+
+
+func _live_env() -> Environment:
+	if light_env != null:
+		return light_env
+	return main._env if main != null and main.get("_env") != null else null
+
+
+func _live_sun() -> DirectionalLight3D:
+	if light_sun != null:
+		return light_sun
+	return main._sun if main != null and main.get("_sun") != null else null
+
+
+func _live_shadows():
+	if light_shadows != null:
+		return light_shadows
+	return main.get("sun_shadows") if main != null else null
+
+
+## What the game has now for one live number (the override, or the game's own value; 0 without a target).
+func live_value(key: String) -> float:
+	if Looks.light_tune.has(key):
+		return float(Looks.light_tune[key])
+	return _live_read(key)
+
+
+func _live_read(key: String) -> float:
+	var e := _live_env()
+	var s := _live_sun()
+	if CONTACT_UNIFORMS.has(key):
+		var u: String = CONTACT_UNIFORMS[key]
+		var m := ContactShade.material()
+		var v = m.get_shader_parameter(u)
+		return float(v) if v != null else float(CONTACT_FALLBACK[u])
+	if key == "ground_rough":
+		var g = Visuals.terrain_material().get_shader_parameter("surface_roughness_add")
+		return float(g) if g != null else 0.0
+	if key == "ambient_energy":
+		return e.ambient_light_energy if e != null else 0.0
+	if key == "sun_energy":
+		return s.light_energy if s != null else 0.0
+	if key == "shadow_blur" or key == "shadow_bias" or key == "shadow_normal_bias":
+		return float(s.get(key)) if s != null else 0.0
+	if e != null:
+		var v2 = e.get(key)
+		if v2 is bool:
+			return 1.0 if v2 else 0.0
+		if v2 != null:
+			return float(v2)
+	return 0.0
+
+
+## Puts one live number on its target now (and Looks.light_tune keeps it there each frame, where the game would set it).
+func _live_put(key: String, v: float) -> void:
+	var e := _live_env()
+	var s := _live_sun()
+	if CONTACT_UNIFORMS.has(key):
+		_contact_put(key, v)
+	elif key == "ground_rough":
+		Visuals.terrain_material().set_shader_parameter("surface_roughness_add", v)
+	elif key == "shadow_blur":
+		var sh = _live_shadows()
+		if sh != null:
+			sh.blur_override = v
+		if s != null:
+			s.shadow_blur = v
+	else:
+		var one := Looks.light_tune
+		Looks.light_tune = {key: v}
+		Looks.apply_light_tune(e, s)
+		Looks.light_tune = one
+
+
+func _contact_put(key: String, v: float) -> void:
+	var m := ContactShade.material()
+	m.set_shader_parameter(CONTACT_UNIFORMS[key], v)
+	if ITEM_CONTACT_UNIFORMS.has(CONTACT_UNIFORMS[key]):
+		ItemCards.contact_param(CONTACT_UNIFORMS[key], v)  # the items' rims (item_contact.gdshader) follow
+	if key == "contact_rim":
+		var end := maxf(0.25, v * 4.2)
+		m.set_shader_parameter("rim_end", end)
+		m.set_shader_parameter("ring_reach", maxf(ContactShade.REACH, end + 0.02))
+	elif key == "contact_patch":
+		m.set_shader_parameter("ring_patch_reach", maxf(ContactShade.patch_ring_reach(), v + 0.05))
+
+
+## One live number set (dev builds only; False in a public build).
+func set_live(key: String, v: float) -> bool:
+	if not Settings.dev_tools():
+		_sync_live()
+		return false
+	if not _live_was.has(key):
+		_live_was[key] = _live_read(key)
+	Looks.light_tune[key] = v
+	_live_put(key, v)
+	_sync_live()
+	return true
+
+
+func reset_live(key: String) -> void:
+	if Looks.light_tune.has(key) and _live_was.has(key):
+		Looks.light_tune.erase(key)
+		var was: float = _live_was[key]
+		_live_was.erase(key)
+		if CONTACT_UNIFORMS.has(key):
+			var m := ContactShade.material()
+			m.set_shader_parameter(CONTACT_UNIFORMS[key], null)
+			if ITEM_CONTACT_UNIFORMS.has(CONTACT_UNIFORMS[key]):
+				ItemCards.contact_param(CONTACT_UNIFORMS[key], null)
+			if key == "contact_rim":
+				m.set_shader_parameter("rim_end", null)
+				m.set_shader_parameter("ring_reach", ContactShade.REACH)
+			elif key == "contact_patch":
+				m.set_shader_parameter("patch_reach", ContactShade.PATCH_REACH - 0.05 if ContactShade.wide_patch else ContactShade.PATCH_EDGE)
+				m.set_shader_parameter("ring_patch_reach", ContactShade.patch_ring_reach())
+		else:
+			_live_put(key, was)
+			if key == "shadow_blur" and _live_shadows() != null:
+				_live_shadows().blur_override = 0.0
+	Looks.light_tune.erase(key)
+	_sync_live()
+
+
+func _sync_live() -> void:
+	for l: Array in LIVE:
+		var key: String = l[0]
+		if not _live_sliders.has(key):
+			continue
+		var pair: Array = _live_sliders[key]
+		var v := live_value(key)
+		(pair[0] as HSlider).set_value_no_signal(v)
+		(pair[1] as Label).text = "%.2f (%s%.2f)" % [v, "was " if Looks.light_tune.has(key) else "now ", float(_live_was.get(key, v))]
+	for key in _live_boxes:
+		(_live_boxes[key] as CheckBox).set_pressed_no_signal(live_value(key) > 0.5)

@@ -38,8 +38,22 @@ local function character_inventory(c, role)
   return nil
 end
 
--- A character inventory, or the open machine screen's inventory with that role (chest, input...).
+-- N3: "vammo", the ammo of the car or spidertron the character sits in (the tool bar's ammo slots
+-- while driving).
+local VEHICLE_AMMO = { car = "car_ammo", ["spider-vehicle"] = "spider_ammo" }
+local function vehicle_ammo(c)
+  local v = puppet.vehicle(c)
+  local name = v and v.valid and VEHICLE_AMMO[v.type]
+  local ok, inv = pcall(function() return name and v.get_inventory(defines.inventory[name]) end)
+  return ok and inv or nil
+end
+
+-- A character inventory, the vehicle's ammo, or the open machine screen's inventory with that
+-- role (chest, input...).
 local function inventory_for(c, role, cmd)
+  if role == "vammo" then
+    return vehicle_ammo(c)
+  end
   return character_inventory(c, role) or screens.inventory(role, cmd)
 end
 
@@ -264,8 +278,8 @@ end
 -- Moves the stack in slot `fi` of inventory `from` to slot `ti` of inventory `to`, like clicking
 -- in Factorio: into an empty slot or onto the same item (as much as fits), or swapping with a
 -- different item. `n` moves only that many (0 or absent: the whole stack). Roles are the
--- character's (main, guns, ammo, armor, trash) or the open screen's (chest, input, output, fuel,
--- burnt, modules), which also need `u`.
+-- character's (main, guns, ammo, armor, trash), the ridden vehicle's ammo (vammo) or the open
+-- screen's (chest, input, output, fuel, burnt, modules), which also need `u`.
 function M.move(cmd)
   local c = puppet.get()
   if not c then

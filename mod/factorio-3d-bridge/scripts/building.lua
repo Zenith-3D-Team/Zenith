@@ -9,6 +9,7 @@ local as_player = require("scripts.as_player")
 local puppet = require("scripts.puppet")
 local map = require("scripts.map")
 local space = require("scripts.space")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -89,6 +90,10 @@ local function quality_name(e)
   local ok, q = pcall(function() return e.quality.name end)
   return ok and q or "normal"
 end
+
+-- L7: Factorio builds out of the cursor's stack, so the stack the client's hand holds the item from (`hs`,
+-- a main inventory slot) is the one that empties (and its quality the one built), and the client's hand
+-- moves on to the next stack when it has; without it any stack of the item pays (puppet.take_held).
 
 -- Rolling stock goes on the nearest straight rail, facing along it (the client's direction picks
 -- which way along).
@@ -176,6 +181,139 @@ end
 
 ---------------------------------------------------------------------------------------------
 
+-- M2 (the owner: placing undergrounds over belts should remove the belts between them). Factorio's own rule, its
+-- tips and tricks ("Fast replace belt & underground belt", base.cfg): "Any belts in between the entrance and exit of
+-- the underground belt will be mined automatically. This fast replace feature also applies to pipe and
+-- pipe-to-ground." What its developers have said of when (forum answers): only "simple" belts, the underground's
+-- way and straight, with "no incoming side connections"; every tile between holding a pipe and none of them with a
+-- perpendicular connection. So all or none: a gap, a curve, a belt the other way, a splitter, a ghost or a side-load
+-- anywhere between and nothing goes. A player's build does it; a script's create_entity doesn't, with or without
+-- `character` (measured in 2.1.24: the run stayed both ways), so for its player-less character the bridge mines them
+-- into the character itself, items and all, as LuaControl.mine_entity does (measured: a belt's items come too; full,
+-- forced, they spill), and says each at once.
+local UNDERGROUND = { ["underground-belt"] = true, ["pipe-to-ground"] = true }
+
+local function on(e)
+  return e and e.valid and e or nil
+end
+
+-- The other end of an underground belt or pipe-to-ground as the game connected it, or nil. (2.1's
+-- underground_belt_neighbour, 2.0's neighbours; a pipe-to-ground's underground pipe connection's target.)
+local function partner_of(e)
+  if e.type == "underground-belt" then
+    local ok, other = pcall(function() return e.underground_belt_neighbour end)
+    if not ok then
+      ok, other = pcall(function() return e.neighbours end)
+    end
+    return ok and on(other) or nil
+  end
+  local ok, conns = pcall(function() return e.get_fluid_box_pipe_connections(1) end)
+  for _, conn in pairs(ok and conns or {}) do
+    if conn.connection_type == "underground" and on(conn.target) then
+      return conn.target
+    end
+  end
+  return nil
+end
+
+-- What stands on the tile at `at` of `type` (one, or nil when none or several).
+local function only_one(surface, at, type)
+  local found = surface.find_entities_filtered({ position = at, type = type })
+  if #found ~= 1 then
+    return nil
+  end
+  return found[1]
+end
+
+-- A plain belt of the run: the run's way, straight, fed by nothing but `behind` (the belt before it in the run, or
+-- the entrance, which feeds nothing on the surface).
+local function plain_belt(b, way, behind)
+  if b.direction ~= way or b.belt_shape ~= "straight" then
+    return false
+  end
+  for _, input in pairs(b.belt_neighbours.inputs) do
+    if not (input.valid and input.unit_number == behind.unit_number) then
+      return false
+    end
+  end
+  return true
+end
+
+-- A plain pipe of the run: whatever it connects to lies on the run's line (`horizontal`: its row).
+local function plain_pipe(p, at, horizontal)
+  local ok, conns = pcall(function() return p.get_fluid_box_pipe_connections(1) end)
+  if not ok then
+    return false
+  end
+  for _, conn in pairs(conns or {}) do
+    if conn.target then
+      local t = conn.target_position
+      if (horizontal and t.y ~= at.y) or (not horizontal and t.x ~= at.x) then
+        return false
+      end
+    end
+  end
+  return true
+end
+
+-- The belts (pipes) between `e`, just built, and its other end when every tile between holds a plain one of the
+-- character's force; nil when there is none between or anything breaks the run.
+local function run_between(c, e)
+  local other = partner_of(e)
+  if not other then
+    return nil
+  end
+  local belt = e.type == "underground-belt"
+  -- Walked from the entrance (a belt's input end) to the exit; a pipe's either way.
+  local from, to = e, other
+  if belt and e.belt_to_ground_type ~= "input" then
+    from, to = other, e
+  end
+  local a, b = from.position, to.position
+  local dx, dy = b.x - a.x, b.y - a.y
+  if (dx ~= 0) == (dy ~= 0) then
+    return nil
+  end
+  local n = math.floor(math.abs(dx + dy) + 0.5)
+  local sx, sy = dx > 0 and 1 or dx < 0 and -1 or 0, dy > 0 and 1 or dy < 0 and -1 or 0
+  local list, behind = {}, from
+  for i = 1, n - 1 do
+    local at = { x = a.x + sx * i, y = a.y + sy * i }
+    local x = only_one(e.surface, at, belt and "transport-belt" or "pipe")
+    if not (x and x.force == c.force) then
+      return nil
+    end
+    if belt then
+      if not plain_belt(x, from.direction, behind) then
+        return nil
+      end
+    elseif not plain_pipe(x, at, sy == 0) then
+      return nil
+    end
+    list[i] = x
+    behind = x
+  end
+  return #list > 0 and list or nil
+end
+
+-- After the character built `e` (not over another underground, `upgrade`: that completes no new pair): the plain run
+-- between its ends mined into the character, as Factorio's player build does.
+local function clear_between(c, e, upgrade)
+  if upgrade or not (perf.on("under_clear") and e and e.valid and UNDERGROUND[e.type]) then
+    return
+  end
+  local ok, list = pcall(run_between, c, e)
+  if not ok then
+    log("[factorio-3d-bridge] under_clear: " .. tostring(list))
+    return
+  end
+  if list then
+    puppet.mine_for_build(c, list)
+  end
+end
+
+---------------------------------------------------------------------------------------------
+
 -- Whether a tile under the footprint is one the entity can't stand on (empty space round a
 -- platform, water): the script check below doesn't look at tiles (2.1.23 answers true over space).
 local function on_bad_tiles(surface, proto, position, direction)
@@ -216,6 +354,38 @@ local function can_place(surface, proto, position, direction, force, check)
   return surface.can_place_entity(spec)
 end
 
+-- Why Factorio refused to build `proto` at `position`, in its words where the bridge can tell: the planet's conditions
+-- (Space Age), or a drill with a fluid input whose mining area holds a resource that needs fluid (uranium ore) while the
+-- force can't mine with fluid yet ("Uranium mining not researched.", 2.1.24's cant-build-reason: refused even with other
+-- ore beside it, allowed once researched). Otherwise "Can't place that there".
+local function refusal(surface, proto, position, force)
+  local planet = space.cant_build(surface, proto)
+  if planet then
+    return planet
+  end
+  if proto.type == "mining-drill" and not force.mining_with_fluid then
+    local okr, r = pcall(function() return proto.mining_drill_radius end)
+    local okc, cats = pcall(function() return proto.resource_categories end)
+    local okf, boxes = pcall(function() return proto.fluidbox_prototypes end)
+    local wet = false
+    for _, box in ipairs(okf and boxes or {}) do
+      local okd, flow = pcall(function() return box.production_type end)
+      wet = wet or not (okd and flow == "output")
+    end
+    if okr and r and okc and type(cats) == "table" and wet then
+      local area = { { position.x - r, position.y - r }, { position.x + r, position.y + r } }
+      for _, res in pairs(surface.find_entities_filtered({ area = area, type = "resource" })) do
+        local rp = res.prototype
+        local okm, fluid = pcall(function() return rp.mineable_properties.required_fluid end)
+        if okm and fluid and cats[rp.resource_category] then
+          return "Uranium mining not researched."
+        end
+      end
+    end
+  end
+  return "Can't place that there"
+end
+
 -- A ghost of the entity for robots to build (Shift+click, or a pipette with none in the
 -- inventory), like a player's; no reach limit and no item needed. Super-forced (Ctrl+Shift+click)
 -- marks what stands in the way for deconstruction and puts the ghost there anyway, as 2.x does.
@@ -248,12 +418,13 @@ local function build_ghost(c, proto, position, direction, mirror, super)
   end
   if not can_place(surface, proto, position, direction, c.force, defines.build_check_type.manual)
       or not surface.create_entity(spec) then
-    puppet.message(space.cant_build(surface, proto) or "Can't place that there")
+    puppet.message(refusal(surface, proto, position, c.force))
   end
 end
 
 -- {item, x, y (fixed cursor position), d, q? (quality), ghost? (1: a ghost), sf? (1: super-forced
--- ghost), m? (1: flipped)}: places one of the item's entity.
+-- ghost), m? (1: flipped), hs? (the main inventory slot the client's hand holds it from: that stack
+-- pays, L7)}: places one of the item's entity.
 function M.build(cmd)
   local c = puppet.get()
   if not c then
@@ -266,7 +437,9 @@ function M.build(cmd)
     return puppet.message("Can't build " .. item_name)
   end
   local inventory = c.get_main_inventory()
-  local quality = inventory and pick_quality(inventory, item_name, cmd.q and tostring(cmd.q))
+  local quality = inventory and pick_quality(inventory, item_name,
+    (cmd.q and tostring(cmd.q)) or puppet.held_quality(inventory, cmd.hs, item_name) or nil)
+  local held = quality and puppet.held_stack(inventory, cmd.hs, item_name, quality) or nil
   if not quality and cmd.ghost ~= 1 then
     return puppet.message("You have no " .. item_name)
   end
@@ -299,10 +472,10 @@ function M.build(cmd)
   -- mods and applies its own rules (fast-replace, ghosts, undergrounds); see as_player.lua.
   local same_first = same_entity(surface, proto, position)
   if not (same_first and quality_name(same_first) == quality) and not ROLLING_STOCK[proto.type] then
-    local built = as_player.build(c, item_name, quality, position, direction, cmd.m == 1, surface)
+    local built = as_player.build(c, item_name, quality, position, direction, cmd.m == 1, surface, held)
     if built ~= nil then
       if not built then
-        puppet.message(space.cant_build(surface, proto) or "Can't place that there")
+        puppet.message(refusal(surface, proto, position, c.force))
       end
       return
     end
@@ -321,11 +494,8 @@ function M.build(cmd)
       for _, it in pairs(collided or {}) do
         give(c, { name = it.name, count = it.count, quality = it.quality })
       end
-      local stack = { name = item_name, count = 1 }
-      if quality ~= "normal" then
-        stack.quality = quality
-      end
-      inventory.remove(stack)
+      puppet.take_held(inventory, cmd.hs, item_name, 1, quality)
+      clear_between(c, revived, false)
       return
     end
   end
@@ -354,6 +524,7 @@ function M.build(cmd)
   -- stands there (2.1), but create_entity without fast_replace then builds nothing.
   local olds = replaced_entities(surface, proto, position, w, h)
   local entity
+  local upgrade = false
   if #olds > 0 and surface.can_fast_replace({ name = proto.name, position = position, direction = direction, force = c.force }) then
     -- Fast-replace without a player: the old entities' items are ours to hand back, and their
     -- removal ours to report (the game raises no destroy event for them).
@@ -361,9 +532,17 @@ function M.build(cmd)
     for i, old in ipairs(olds) do
       gone[i] = { old = old, removal = tracker.removal_message(old), quality = quality_name(old),
         products = old.prototype.mineable_properties.products or {} }
+      upgrade = upgrade or UNDERGROUND[old.type] == true
     end
     spec.fast_replace = true
-    spec.spill = false
+    -- M2: an underground over a belt (a pipe-to-ground over a pipe) as the character's own fast-replace: the game
+    -- hands the belt and the items on it to the character (2.1.24, measured), where spill = false deleted the items.
+    local as_character = perf.on("under_clear") and UNDERGROUND[proto.type] and not upgrade
+    if as_character then
+      spec.character = c
+    else
+      spec.spill = false
+    end
     entity = surface.create_entity(spec)
     if entity then
       for _, g in ipairs(gone) do
@@ -371,7 +550,7 @@ function M.build(cmd)
           if g.removal then
             transport.send_reliable(g.removal)
           end
-          for _, product in pairs(g.products) do
+          for _, product in pairs(as_character and {} or g.products) do
             if product.type == "item" then
               local stack = { name = product.name, count = product.amount or product.amount_min or 1 }
               if g.quality ~= "normal" then
@@ -390,16 +569,13 @@ function M.build(cmd)
     entity = surface.create_entity(spec)
   else
     -- Space Age: the planet's pressure, gravity or magnetic field may be what forbids it.
-    return puppet.message(space.cant_build(surface, proto) or "Can't place that there")
+    return puppet.message(refusal(surface, proto, position, c.force))
   end
   if not entity then
     return puppet.message("Can't place that there")
   end
-  local stack = { name = item_name, count = 1 }
-  if quality ~= "normal" then
-    stack.quality = quality
-  end
-  inventory.remove(stack)
+  puppet.take_held(inventory, cmd.hs, item_name, 1, quality)
+  clear_between(c, entity, upgrade)
 end
 
 return M

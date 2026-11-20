@@ -31,13 +31,15 @@ These keep their own terms. They are separate works shipped alongside Zenith:
 
 - **`client/assets/branding/`** (Zenith's logo and icon, `client/icon.png`, `client/icon.ico`):
   © David (Vasillo). Used in Zenith with his permission; see the folder's README.
-- **Models in a download's `models/` folder** (the development builds carry David's (Vasillo's)
-  textured belts, splitters, undergrounds, inserters and burner drill there): © David (Vasillo).
-  Used in Zenith with his permission.
-- **`client/assets/models/fue5/`**: models by Hurricane and Nuke (FUE5), CC BY-NC-SA 3.0; see
-  its README.
-- **Models converted from Wube's printable release** (listed in
-  [client/assets/models/CREDITS.md](client/assets/models/CREDITS.md)): Wube's CC BY-NC licence.
+- **A download's `models/Zenith.zip`**, the Zenith model pack (the development builds carry
+  David's (Vasillo's) textured belts, splitters, undergrounds, inserters and burner drill in it):
+  © David (Vasillo). Used in Zenith with his permission; its `pack.json` and README.txt say so.
+- **`client/assets/models/packs/fue5/`**, the FUE5 model pack: models by Hurricane and Nuke
+  (FUE5), CC BY-NC-SA 3.0; see its README.
+- **`client/assets/models/packs/wube3dp/`**, the Wube3DP model pack: models converted from Wube's
+  printable release (listed in
+  [client/assets/models/packs/wube3dp/CREDITS.md](client/assets/models/packs/wube3dp/CREDITS.md)),
+  under Wube's CC BY-NC licence.
 - **Factorio** itself and its graphics, sounds and fonts are © Wube Software and aren't part of
   Zenith: the client reads them from your own Factorio install.
 

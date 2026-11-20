@@ -42,7 +42,7 @@ jobs:
           path: ci-logs/
           if-no-files-found: ignore
 
-  # The client's headless Godot tests (UI test, packet fuzzing, decoratives, mods' files, add-ons, VR,
+  # The client's headless Godot tests (UI test, packet fuzzing, decoratives, mods' files, model packs, add-ons, VR,
   # model loading), through check.py as locally: each fails on its exit code or on any SCRIPT ERROR
   # (a GDScript runtime error only stops that call), and all run even when one fails. Without a
   # Factorio install the UI falls back to flat panels, which is what this checks: input paths and
@@ -71,7 +71,7 @@ jobs:
           mv ~/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot/godot
       - name: Import the project
         timeout-minutes: 10
-        run: ~/godot/godot --headless --path client --import
+        run: ~/godot/godot --headless --path client --log-file "$PWD/ci-logs/import.godot.log" --import
       # Each test stops itself on a parse error or past its time limit (client/tests/test_watchdog.gd),
       # and check.py stops one that still runs a minute later.
       - name: The Godot tests (tools/check.py --all godot)

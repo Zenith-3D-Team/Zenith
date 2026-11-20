@@ -509,6 +509,8 @@ def ashland_lichen_tree_flaming():
 # the seams and under the plates, the bone of the head's mandibles), so the materials sit where
 # Factorio paints them.
 
+# The lava's emission is what the model had before space_skin.py gave it the sprite's colours: the
+# client now has it shine by those (creature_models.gd PAINT_GLOW; --creature-glow=old for this).
 kit.MATERIALS.update({
     "rock_demolisher": ("2c2826", 0.85, 0.05, None, 0),
     "rock_demolisher_light": ("4a433e", 0.85, 0.05, None, 0),

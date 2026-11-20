@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Builds a local comparison page: every model in client/assets/models next to Factorio's own
-sprite, rendered from Factorio's camera, and tagged with where the model came from.
+"""Builds a local comparison page: every model of ours (tools/models/packs.py: placeholders and
+wube3dp) next to Factorio's own sprite, rendered from Factorio's camera, and tagged with where the model came from.
 
     python tools/models/gallery.py [names...]      -> art-src/compare/index.html
 
@@ -8,7 +8,7 @@ Each card also shows the model's screenshots from the client, if art-src/shots/<
 (factorio.png, north/east/south/west.png, low.png, close.png, night.png; see shot_strip).
 
 Tags: "Wube 3D release" (converted by tools/models/wube.py from Wube's printable models),
-"Built from sprite reference" (rebuilt against the sprites, see tools/models/model_sources.json),
+"Built from sprite reference" (rebuilt against the sprites, see docs/tracker/model_sources.json),
 "Old generated placeholder" (made before the art rule, still to redo).
 
 The sprites are read from the player's Factorio install by tools/models/compare.py and
@@ -30,12 +30,12 @@ from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-MODELS = os.path.join(REPO, "client", "assets", "models")
 OUT = os.path.join(REPO, "art-src", "compare")
-SOURCES = os.path.join(HERE, "model_sources.json")
+SOURCES = os.path.join(REPO, "docs", "tracker", "model_sources.json")
 BLENDER = os.environ.get("BLENDER", r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe")
 sys.path.append(os.path.dirname(HERE))
 import factorio_install  # noqa: E402
+import packs  # noqa: E402
 FACTORIO = factorio_install.install()
 WUBE_GENERATOR = "factorio-3d tools/models/wube.py"
 
@@ -219,7 +219,7 @@ for _mask, _shape in enumerate(_WALL_SHAPES):
     _wall = ["--frame=64x%d" % _picture[1], "--line=%d" % _picture[2], "--shift=0,%d" % _picture[3]]
     BUILDINGS["stone-wall-" + _shape] = [_sprite, *_wall]
     _fill_name = "stone-wall-%s-fill" % _shape
-    if _mask & 6 == 6 and os.path.exists(os.path.join(MODELS, _fill_name + ".glb")):
+    if _mask & 6 == 6 and os.path.exists(packs.model_path(_fill_name)):
         BUILDINGS[_fill_name] = [_sprite, *_wall,
                                  "--layer=" + os.path.join(FACTORIO, G, "wall/wall-filling.png") + "|48x56|0|8|16,15"]
 
@@ -461,7 +461,7 @@ def generator(path):
 
 
 def tag_for(name, sources):
-    if generator(os.path.join(MODELS, name + ".glb")) == WUBE_GENERATOR:
+    if generator(packs.model_path(name)) == WUBE_GENERATOR:
         return "wube"
     return "sprite" if sources.get(name, sources.get("*", "")).startswith("Matched") else "old"
 
@@ -489,7 +489,7 @@ def render(name, out_png):
 def main(argv):
     os.makedirs(OUT, exist_ok=True)
     sources = json.load(open(SOURCES, encoding="utf-8")) if os.path.exists(SOURCES) else {}
-    names = argv[1:] or sorted(f[:-4] for f in os.listdir(MODELS) if f.endswith(".glb"))
+    names = argv[1:] or packs.names()
     results = {}
     for name in names:
         png = os.path.join(OUT, name + ".png")
@@ -525,7 +525,7 @@ def shot_strip(name):
 
 
 def write_page(sources):
-    names = sorted(f[:-4] for f in os.listdir(MODELS) if f.endswith(".glb"))
+    names = packs.names()
     order = {"old": 0, "sprite": 1, "wube": 2}
     rows = sorted(((tag_for(n, sources), n) for n in names), key=lambda t: (order[t[0]], t[1]))
     counts = {k: sum(1 for t, _ in rows if t == k) for k in TAGS}

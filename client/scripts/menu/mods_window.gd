@@ -1,9 +1,11 @@
 extends PanelContainer
 ## Factorio's Mods window for the server the menu starts: the game's own mods (base and the DLC
 ## from the install's data folder) and the mods in the server's mods folder (zips and folders),
-## each with its version and an on/off box. Changes go into the server's mods/mod-list.json, so
-## they apply the next time a server starts. The bridge mod is always on. Space Age needs Quality
-## and Elevated rails, as in Factorio; turning one on or off carries the others along.
+## each with its version (the highest, when the folder has several) and an on/off box. Changes are
+## kept as the player's choices (mod_choices.gd), which apply the next time a server starts: a new
+## game gets them, a loaded save gets them added to its own. The bridge mod is always on. Space Age
+## needs Quality and Elevated rails, as in Factorio; turning one on or off carries the others along.
+## In a game it shows what the server runs, read-only.
 
 signal closed
 
@@ -11,6 +13,7 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
+const ModChoices := preload("res://scripts/menu/mod_choices.gd")
 
 const BRIDGE := "factorio-3d-bridge"
 const DLC := ["base", "elevated-rails", "quality", "space-age"]
@@ -36,7 +39,8 @@ func _ready() -> void:
 	var bar := Kit.title_bar("Mods", true)
 	box.add_child(bar)
 	(bar.get_child(bar.get_child_count() - 1) as Button).pressed.connect(func() -> void: closed.emit())
-	var where := MenuKit.paragraph("The server's mods (%s). Changes apply the next time a server starts." % Paths.server_data_dir().path_join("mods"), 560)
+	var where := MenuKit.paragraph(("The mods this game runs (%s)." if read_only else
+		"The server's mods (%s). The mods turned on here are in every new game and are added to a game you load (Load game's Sync mods with save leaves them out); a loaded game keeps its own Space Age and DLC.") % Paths.server_data_dir().path_join("mods"), 560)
 	where.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
 	box.add_child(where)
 	var deep: Array = Kit.deep_scroll(Kit.pxv(560, 360))
@@ -51,7 +55,7 @@ func _ready() -> void:
 	(row[1] as Button).pressed.connect(func() -> void:
 		Sfx.play_ui("gui-back")
 		closed.emit())
-	_mods = scan()
+	_mods = scan(read_only)
 	_fill()
 
 
@@ -62,58 +66,41 @@ func _unhandled_input(event: InputEvent) -> void:
 		closed.emit()
 
 
-## Every mod the server could load, with its state in mod-list.json (on when not listed, as
-## Factorio does).
-static func scan() -> Array:
-	var states := _list_states()
+## Every mod the server could load, once each (a folder holding several versions shows the highest,
+## which Factorio runs unless a save asks for another), on or off as the player chose
+## (mod_choices.gd); `running`: as the server's mod-list.json has them, the mods a game runs (on
+## when not listed, as Factorio does).
+static func scan(running := false) -> Array:
+	var choices := _list_states() if running else ModChoices.states()
 	var out: Array = []
 	var data := Paths.read_data_dir(Paths.factorio_exe())
 	for name in DLC:
-		var info := _info_at(data.path_join(name))
+		var info := ModChoices.info_at(data.path_join(name))
 		if not info.is_empty():
-			out.append(_entry(name, info, "game", states))
+			out.append(_entry(name, info, "game", choices, running))
 	var mods_dir := Paths.server_data_dir().path_join("mods")
-	if DirAccess.dir_exists_absolute(mods_dir):
-		for dir in DirAccess.get_directories_at(mods_dir):
-			var info := _info_at(mods_dir.path_join(dir))
-			if not info.is_empty():
-				out.append(_entry(str(info.get("name", dir)), info, "folder", states))
-		for file in DirAccess.get_files_at(mods_dir):
-			if file.to_lower().ends_with(".zip"):
-				var info := _info_in_zip(mods_dir.path_join(file))
-				if not info.is_empty():
-					out.append(_entry(str(info.get("name", file.get_basename())), info, "zip", states))
+	var found := ModChoices.folder(mods_dir)
+	var names := found.keys()
+	names.sort_custom(func(a: String, b: String) -> bool: return a.naturalnocasecmp_to(b) < 0)
+	var bridge := ModChoices.info_at(mods_dir.path_join(BRIDGE))
+	if not bridge.is_empty():
+		out.append(_entry(BRIDGE, bridge, "folder", choices, running))
+	for name in names:
+		var versions: Dictionary = found[name]
+		var at := str(versions[ModChoices.highest(versions.keys())])
+		var info := ModChoices.info_of(at)
+		if not info.is_empty():
+			out.append(_entry(name, info, "zip" if at.to_lower().ends_with(".zip") else "folder", choices, running))
 	return out
 
 
-static func _entry(name: String, info: Dictionary, source: String, states: Dictionary) -> Dictionary:
+static func _entry(name: String, info: Dictionary, source: String, choices: Dictionary, running: bool) -> Dictionary:
+	var on := bool(choices.get(name, true)) if running else ModChoices.is_on(name, choices)
 	return {"name": name, "title": str(info.get("title", name)), "version": str(info.get("version", "")),
-		"source": source, "enabled": name == BRIDGE or bool(states.get(name, true))}
+		"source": source, "enabled": name == BRIDGE or on}
 
 
-static func _info_at(dir: String) -> Dictionary:
-	var file := dir.path_join("info.json")
-	if not FileAccess.file_exists(file):
-		return {}
-	var parsed = JSON.parse_string(FileAccess.get_file_as_string(file))
-	return parsed if parsed is Dictionary else {}
-
-
-static func _info_in_zip(path: String) -> Dictionary:
-	var zip := ZIPReader.new()
-	if zip.open(path) != OK:
-		return {}
-	var info := {}
-	for f in zip.get_files():
-		if f.get_file() == "info.json" and f.count("/") <= 1:
-			var parsed = JSON.parse_string(zip.read_file(f).get_string_from_utf8())
-			if parsed is Dictionary:
-				info = parsed
-			break
-	zip.close()
-	return info
-
-
+## The server's mod-list.json as name -> enabled: what the server last ran.
 static func _list_states() -> Dictionary:
 	var out := {}
 	var file := Paths.server_data_dir().path_join("mods/mod-list.json")
@@ -127,20 +114,12 @@ static func _list_states() -> Dictionary:
 	return out
 
 
-## Writes mod-list.json, keeping entries of mods not found here.
+## Keeps the window's states as the player's choices, with those of mods not found here.
 static func write_states(mods: Array) -> void:
-	var file := Paths.server_data_dir().path_join("mods/mod-list.json")
-	var states := _list_states()
+	var choices := ModChoices.states()
 	for m in mods:
-		states[m["name"]] = bool(m["enabled"])
-	var list: Array = []
-	for name in states:
-		list.append({"name": name, "enabled": states[name]})
-	DirAccess.make_dir_recursive_absolute(file.get_base_dir())
-	var f := FileAccess.open(file, FileAccess.WRITE)
-	if f != null:
-		f.store_string(JSON.stringify({"mods": list}, "  "))
-		f.close()
+		choices[m["name"]] = bool(m["enabled"])
+	ModChoices.write(choices)
 
 
 ## Turns a mod on or off, with the DLC that go with it.

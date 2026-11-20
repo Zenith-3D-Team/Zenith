@@ -1,0 +1,9 @@
+{
+  "id": "sprint",
+  "name": "Sprint",
+  "version": "0.1.0",
+  "api": 1.7,
+  "entry": "main.gd",
+  "author": "Zenith",
+  "description": "Hold Shift to run faster. Needs its Factorio mod, zenith-sprint, in the game: the mod makes the change, so everyone in that game has the same rule. A worked example of an add-on and its own Factorio mod (api.game)."
+}

@@ -3,14 +3,20 @@
 -- When a player disconnects, Factorio "logs off" their character: it leaves the world
 -- (LuaPlayer::character is nil, get_associated_characters is empty), so nothing can walk or mine
 -- with it. Its inventories, logistic requests, crafting queue and quickbar stay with the
--- LuaPlayer, which is a LuaControl and can still be read and written (checked in 2.1.23 on a
--- real save). So the bridge stands in for that player: its own character appears where the
+-- LuaPlayer, which is a LuaControl and can still be read and written (checked in 2.1.23 on the
+-- owner's save). So the bridge stands in for that player: its own character appears where the
 -- player's was and the player's things move onto it. When the player connects again (with the
 -- real game) everything moves back onto their character, and the bridge controls that one, as in
 -- single-player.
 --
 -- Everything here runs from on_tick or from commands and events, and only touches storage, so
 -- it stays deterministic in multiplayer.
+--
+-- A world Zenith made has no player of its own: the bridge plays its own character there. The player
+-- who later joins with the client's own Factorio (Ctrl+F9) takes that character over (puppet.lua claim,
+-- L13), and from then on is that world's player here, handed back and forth as a save's player is.
+
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -247,6 +253,13 @@ function M.choose(s)
       return p
     end
   end
+  -- The player who joined with the client's own Factorio and took its character over (L13).
+  if s.zenith_owner then
+    local p = game.get_player(s.zenith_owner)
+    if p then
+      return p
+    end
+  end
   local best, best_seen
   for _, p in pairs(game.players) do
     local controller = get(p, "controller_type")
@@ -263,6 +276,9 @@ function M.describe(s)
   local lines = {}
   for _, p in pairs(game.players) do
     local mark = (s.owner_index == p.index) and " (playing as)" or ""
+    if s.zenith_owner == p.index then
+      mark = mark .. " (joined with Zenith's Factorio)"
+    end
     lines[#lines + 1] = string.format("[Zenith] %d %s, %s%s", p.index, p.name,
       p.connected and "connected" or "not connected", mark)
   end
@@ -270,6 +286,86 @@ function M.describe(s)
     lines[1] = "[Zenith] no players in this game: the bridge plays its own character"
   end
   return lines
+end
+
+---------------------------------------------------------------------------------------------
+-- Joining a world Zenith made (L13)
+
+-- Freeplay (base/script/freeplay/freeplay.lua) makes its crash site, the crashed ship with its fires
+-- and the intro's cutscene, when its first player is created. On a map a headless server made for
+-- Zenith that is the first time anyone joins from Factorio, long after the base round the spawn was
+-- built: the ship landed in it and set it burning. So on a server where the bridge plays its own
+-- character before any player was created, freeplay is told not to, through its own remote interface
+-- (as mods do from on_init): nothing on the map changes, only what would have happened. A map whose
+-- intro already ran (a player was created) is left alone, and single-player creates its player before
+-- a client can connect, so it keeps its intro. True when freeplay was told.
+function M.no_crash_site()
+  if not (game.is_multiplayer() and perf.on("no_crash_site")) then
+    return false
+  end
+  local fp = remote.interfaces["freeplay"]
+  if not (fp and fp.set_disable_crashsite) then
+    return false -- not freeplay (another scenario), or one without the switch
+  end
+  if fp.get_init_ran then
+    local ok, ran = pcall(remote.call, "freeplay", "get_init_ran")
+    if not ok or ran then
+      return false
+    end
+  else
+    for _ in pairs(game.players) do
+      return false
+    end
+  end
+  if fp.get_disable_crashsite then
+    local ok, off = pcall(remote.call, "freeplay", "get_disable_crashsite")
+    if ok and off then
+      return false
+    end
+  end
+  local ok = pcall(remote.call, "freeplay", "set_disable_crashsite", true)
+  if ok then
+    log("[Zenith] the bridge plays this server's world before anyone joined: freeplay's crash site is off")
+  end
+  return ok
+end
+
+-- What freeplay gave a new player (its created items), taken off the character it gave them to: a
+-- player taking over the client's character isn't new to the world, and it had its kit already.
+function M.drop_created_items(c)
+  local fp = remote.interfaces["freeplay"]
+  if not (fp and fp.get_created_items) then
+    return
+  end
+  local ok, items = pcall(remote.call, "freeplay", "get_created_items")
+  if not (ok and type(items) == "table") then
+    return
+  end
+  for name, count in pairs(items) do
+    if type(name) == "string" and tonumber(count) then
+      pcall(c.remove_item, { name = name, count = tonumber(count) })
+    end
+  end
+end
+
+-- The quickbar the bridge kept for its own character (inventory.lua, storage) onto the player taking
+-- that character over: its items into the player's slots where those are empty.
+function M.copy_quickbar(qb, player)
+  if not (qb and qb.items) then
+    return
+  end
+  for i, name in pairs(qb.items) do
+    if type(i) == "number" and type(name) == "string" and name ~= "" and prototypes.item[name] then
+      local page, slot = math.ceil(i / 10), (i - 1) % 10 + 1
+      local ok, now = pcall(player.get_quick_bar_slot, page, slot)
+      if ok and not now then
+        pcall(player.set_quick_bar_slot, page, slot, name)
+      end
+    end
+  end
+  if qb.page then
+    pcall(player.set_active_quick_bar_page, 1, qb.page)
+  end
 end
 
 return M

@@ -1,9 +1,10 @@
 extends RefCounted
 ## Finds the 3D model for a prototype and flattens it into one Mesh, so it can be drawn with
-## MultiMesh instancing. Looked up by prototype name:
-##
-##   res://assets/models/<name>.glb or .gltf   (imported by the Godot editor)
-##   <dir>/<name>.glb or .gltf                 (loaded at runtime, with --models=<dir>; first with --models-first)
+## MultiMesh instancing. Looked up by prototype name in the model packs (model_packs.gd), in their
+## order: the built-in ones (res://assets/models/packs/<pack>/<name>.glb: FUE5, Wube3DP,
+## Placeholders) and the models folder beside Zenith's (its loose models, folders and zips, Vasillo's
+## Zenith.zip in a download), and --models=<dir>. A family can be taken from a chosen pack, and a
+## building from a pack of its own (`<name>@<pack id>`: entity_models, PACK_KEY).
 ##
 ## Models follow docs/PLAN.md §4: 1 unit = 1 tile, origin at the footprint centre on the
 ## ground, facing north (-Z). Anything without a model is drawn as a placeholder.
@@ -88,8 +89,10 @@ const BELT_CHEVRON_PERIOD := 0.5
 ## Models whose tier_paint is bare steel on every tier (Factorio's belts have no painted frame:
 ## their tier shows in the chevrons alone).
 const STEEL_FRAMES := ["transport-belt"]
-## Moving part kinds that turn about the node's X axis (east-west); the rest turn about Y.
-const X_AXIS_KINDS := {"spin_flywheel": true}
+## Moving part kinds that turn about the node's X axis (east-west); the rest turn about Y. Wheels
+## (`anim_wheel_*`: rolling stock's axles, a car's, a tank's road wheels) roll about their axle,
+## across the vehicle (movers.gd rolls them in the world, anim.gd in the Model packs preview).
+const X_AXIS_KINDS := {"spin_flywheel": true, "wheel_rail": true, "wheel_front": true, "wheel_rear": true, "wheel_track": true}
 ## ... and these about the node's Z axis (north-south): the pumpjack's crank and walking beam,
 ## the flywheel of a steam engine lying east-west.
 const Z_AXIS_KINDS := {"spin_crank": true, "rock_beam": true, "spin_flywheel_ns": true}
@@ -223,7 +226,8 @@ class AnimPart:
 	var roller := false  # a "baked" object named as a roller: on a splitter it runs all the time
 	## A "baked" part's animation (model_skin.gd bake()): frames, duration, the bones' texture.
 	var bake := {}
-	var model := ""  # the model it belongs to
+	var model := ""  # the model it belongs to (its name, without a pack: model_packs.gd)
+	var source := ""  # that model's file (whose pack's version it is: turrets.gd)
 	var mesh: Mesh
 	var pivot := Transform3D.IDENTITY
 	var axis := Vector3.UP  # in the pivot's frame
@@ -235,6 +239,24 @@ class AnimPart:
 	var motion := -1
 	var rate := 0.0
 	var phase := 0.0
+	var _radius := -1.0
+
+	## A wheel's radius: half its mesh's height at rest, from its vertices (its bounds may have been
+	## grown since for the whole turn: anim.gd setup_part).
+	func wheel_radius() -> float:
+		if _radius < 0.0:
+			var lo := INF
+			var hi := -INF
+			if mesh is ArrayMesh:
+				for i in mesh.get_surface_count():
+					for v: Vector3 in mesh.surface_get_arrays(i)[Mesh.ARRAY_VERTEX]:
+						lo = minf(lo, v.y)
+						hi = maxf(hi, v.y)
+			if lo > hi and mesh != null:
+				lo = mesh.get_aabb().position.y
+				hi = mesh.get_aabb().end.y
+			_radius = maxf((hi - lo) * 0.5, 0.05) if lo <= hi else 0.36
+		return _radius
 
 	## The part's transform in the model, turned by `angle` radians (slid by `angle` of the way,
 	## 0 to 1, for sliding parts; shown when not 0 for lit parts).
@@ -249,20 +271,21 @@ class AnimPart:
 
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
+const Looks := preload("res://scripts/world/looks.gd")
 const ModelTextures := preload("res://scripts/world/model_textures.gd")
 const ModelSkin := preload("res://scripts/world/model_skin.gd")
 const ModelRig := preload("res://scripts/world/model_rig.gd")
 const ContactShade := preload("res://scripts/world/contact_shade.gd")
 const BeltReturn := preload("res://scripts/world/belt_return.gd")
-## Folders under res://assets/models/ looked in first, in order: models brought in from elsewhere
-## under their own licence (fue5/: the FUE5 fan project's, CC BY-NC-SA 3.0) replace ours there.
-const MODEL_SUBDIRS := ["fue5/"]
+const BeltCaps := preload("res://scripts/world/belt_caps.gd")
 const CreatureModels := preload("res://scripts/world/creature_models.gd")
 const NatureLooks := preload("res://scripts/world/nature_looks.gd")
+const BurnerFx := preload("res://scripts/fx/burner_fx.gd")
 const FactorioShader := preload("res://shaders/factorio_material.gdshader")
 const FactorioAlphaShader := preload("res://shaders/factorio_material_alpha.gdshader")
 ## Cut-out materials (Blender's Alpha Clip, glTF MASK): see factorio_material_clip.gdshader.
 const FactorioClipShader := preload("res://shaders/factorio_material_clip.gdshader")
+const FactorioOreShader := preload("res://shaders/factorio_material_ore.gdshader")
 ## Trees' leaf cards (tools/models/nature/geo.py `card`): leaves cut out, both sides drawn.
 const FactorioLeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
 
@@ -340,24 +363,13 @@ const CLASS_PARAMS := {
 		"ao_strength": 0.3, "desaturate": 0.0, "value": 1.0, "grain": 0.0},
 }
 
-static var external_dir := ""
 ## One material per model (Settings > Graphics > Merged materials, off by default; read when models
 ## load, so a change applies after a restart). --merged-materials / --no-merged-materials override it.
 static var merge_materials := false
-## --models-first: a model in external_dir replaces the project's own model of that name (for a
-## modeller trying a new version), instead of only filling in prototypes without one.
+## --models-first: the --models=<dir> pack's models win over every pack's of that name (for a
+## modeller trying a new version), instead of only filling in prototypes no pack has one for. The
+## models folder's packs go by the order (model_packs.gd).
 static var external_first := false
-
-
-## The model file of `file` in external_dir, or "".
-static func _external_path(file: String) -> String:
-	if external_dir == "":
-		return ""
-	for ext in ["glb", "gltf"]:
-		var path := external_dir.path_join("%s.%s" % [file, ext])
-		if FileAccess.file_exists(path):
-			return path
-	return ""
 ## The models' look: "colours" (part colours, always in a game) or "palette" (the models' own
 ## palette, --model-look=palette for comparing). Set before the first model is built.
 const LOOKS := ["colours", "palette"]
@@ -370,12 +382,13 @@ static var _factorio_cache := {}  # [imported material, has COLOR, UV2, CUSTOM0]
 
 
 ## The modellers' folder: `models/` beside Zenith (beside Zenith.exe in a download, the checkout's
-## root otherwise). A model there replaces Zenith's own of the same name, so a modeller tries one by
-## dropping it in; Zenith's own are used for everything else. --models=<dir> picks another folder,
-## --no-custom-models leaves it out.
+## root otherwise). Its loose models, folders and zips are model packs (model_packs.gd), new ones on
+## top of Zenith's own built-in packs, so a modeller tries one by dropping it in; Zenith's own are
+## used for everything else. --models=<dir> adds another folder as a pack on top, --no-custom-models
+## leaves the folder's packs out.
 const CUSTOM_MODELS_DIR := "models"
-## How many models in external_dir (Settings > Graphics shows it).
-static var external_count := 0
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
+static var _packs_version := -1  # ModelPacks.version when generation last followed it
 
 
 static func custom_models_dir() -> String:
@@ -383,19 +396,12 @@ static func custom_models_dir() -> String:
 	return load("res://scripts/menu/paths.gd").repo_dir().path_join(CUSTOM_MODELS_DIR)
 
 
-static func _count_models(dir: String) -> int:
-	var n := 0
-	for f in DirAccess.get_files_at(dir):
-		if f.get_extension().to_lower() in ["glb", "gltf"]:
-			n += 1
-	return n
-
-
 static func configure_from_command_line() -> void:
 	var custom := true
+	var extra := ""
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--models="):
-			external_dir = arg.get_slice("=", 1)
+			extra = arg.get_slice("=", 1)
 		elif arg == "--models-first":
 			external_first = true
 		elif arg == "--no-custom-models":
@@ -406,16 +412,66 @@ static func configure_from_command_line() -> void:
 			merge_materials = true
 		elif arg.begins_with("--model-look="):
 			set_look(arg.get_slice("=", 1))
-	if external_dir == "" and custom:
-		var dir := custom_models_dir()
-		if _count_models(dir) > 0:
-			external_dir = dir
-			external_first = true
-	if external_dir != "":
-		external_count = _count_models(external_dir)
-		print("[models] %d model(s) from %s %s" % [external_count, external_dir,
-			"replace Zenith's own of the same name" if external_first else "fill in entities without a model"])
+	# Loaded, not preloaded: settings.gd preloads this script.
+	_extra_pack = extra
+	_use_folder = custom
+	_configure_packs()
+	if ModelPacks.is_ready():
+		_packs_version = ModelPacks.version  # nothing to unpack: nothing to ask for again
+	for line in ModelPacks.summary():
+		print(line)
 	warm_up()
+
+
+static var _extra_pack := ""  # --models=, as Zenith started
+static var _use_folder := true  # false with --no-custom-models
+
+
+## The packs found again and put in settings.cfg's order (as at start-up), with its choices.
+static func _configure_packs() -> void:
+	# Loaded, not preloaded: settings.gd preloads this script.
+	var settings = load("res://scripts/menu/settings.gd")
+	var order := _pack_ids(settings, "order")
+	var off := _pack_ids(settings, "off")
+	var chosen: Variant = settings.get_value("model_packs", "choices")
+	ModelPacks.set_choices(chosen if chosen is Dictionary else {})
+	# Again: the folder found at start-up (tests give another), its packs used as they were.
+	var again := ModelPacks.folder != ""
+	var dir := ModelPacks.folder if again else custom_models_dir()
+	var use := ModelPacks.models_dir != "" if again else _use_folder
+	ModelPacks.configure(dir, order, off, _extra_pack, external_first, use)
+	# New packs went on top and packs gone left the list: kept so, so the next new one goes above them.
+	if _use_folder and (ModelPacks.saved_order() != order or ModelPacks.saved_off() != off):
+		settings.set_value("model_packs", "order", ModelPacks.saved_order())
+		settings.set_value("model_packs", "off", ModelPacks.saved_off())
+
+
+## The Model packs window changed the order or a pack's switch (settings.cfg saved): the packs are
+## put in it now and every model is found and made again (a zip turned on is unpacked first, on a
+## worker); whatever draws models (world.gd models_changed) draws them again.
+static func apply_packs() -> void:
+	_configure_packs()
+	choices_changed([])
+	print("[models] packs applied: ", ", ".join(ModelPacks.active().map(func(p: Dictionary) -> String: return str(p["title"]))))
+
+
+## The Model packs window changed the packs chosen for families (settings.cfg saved): applied now,
+## those families' models made again. True when some were made already.
+static func apply_choices(families: Array) -> bool:
+	var settings = load("res://scripts/menu/settings.gd")
+	var chosen: Variant = settings.get_value("model_packs", "choices")
+	ModelPacks.set_choices(chosen if chosen is Dictionary else {})
+	return choices_changed(families)
+
+
+## settings.cfg's [model_packs] `order` or `off`: pack ids.
+static func _pack_ids(settings: Variant, key: String) -> Array:
+	var value: Variant = settings.get_value("model_packs", key)
+	var out: Array = []
+	if value is Array:
+		for id in value:
+			out.append(str(id))
+	return out
 
 
 ## The first material made with each Factorio shader costs about 50 ms on the main thread (Godot
@@ -508,13 +564,18 @@ static func has_belt_ends() -> bool:
 
 
 ## The models of one belt's ends (`belt` the belt's name, as fast-transport-belt): 1 in `mask` where
-## the line begins, 2 where it ends.
-static func belt_ends(belt: String, mask: int) -> Array:
+## the line begins, 2 where it ends. `pack`: only that pack's pieces (`<piece>@pack`), as the model
+## preview shows a pack's; "" the ones in use.
+static func belt_ends(belt: String, mask: int, pack := "") -> Array:
 	var out: Array = []
-	if mask & 1 and _source("transport-belt-start") != "":
-		out.append(belt + "-start")
-	if mask & 2 and _source("transport-belt-end") != "":
-		out.append(belt + "-end")
+	for end: Array in [[1, "-start"], [2, "-end"]]:
+		if mask & int(end[0]) == 0:
+			continue
+		var base := "transport-belt" + str(end[1])
+		if pack == "" and _source(base) != "":
+			out.append(belt + str(end[1]))
+		elif pack != "" and ModelPacks.find_in(pack, base) != "":
+			out.append(belt + str(end[1]) + "@" + pack)
 	return out
 
 
@@ -544,7 +605,7 @@ static func belt_tiles(pos: Vector2) -> Array:
 ## also for an underground exit, whose model is turned round (turn_dir) but whose open end is ahead.
 ## The pieces need no shift on splitters and undergrounds: their belt surfaces end on the tile's edge
 ## as a belt's does (measured on Vasillo's and Zenith's models: +-0.5 along every one).
-static func belt_end_places(proto_name: String, proto_type: String, dir: int, pos: Vector2, mask: int, height := 0.0) -> Array:
+static func belt_end_places(proto_name: String, proto_type: String, dir: int, pos: Vector2, mask: int, height := 0.0, pack := "") -> Array:
 	var out: Array = []
 	var family := belt_end_family(proto_name, proto_type)
 	var basis := Basis(Vector3.UP, -float(dir) / 16.0 * TAU)
@@ -552,7 +613,7 @@ static func belt_end_places(proto_name: String, proto_type: String, dir: int, po
 	for i in tiles.size():
 		var tile: Vector2i = tiles[i]
 		var at := Transform3D(basis, Vector3(tile.x + 0.5, height, tile.y + 0.5)) * BELT_END_FACING
-		for piece: String in belt_ends(family, (mask >> (2 * i)) & 3):
+		for piece: String in belt_ends(family, (mask >> (2 * i)) & 3, pack):
 			out.append([piece, at])
 	return out
 
@@ -573,6 +634,125 @@ static func part_doubled(part: AnimPart, rel: Transform3D, host_parts: Array) ->
 	return false
 
 
+## The entity a belt-like model stands for, as a lone one (the model preview): [prototype name, type,
+## the record's extra, centre, belt_ends] facing north, or [] for any other model. Its pieces are those
+## world.gd gives a lone one: a straight belt both ends, an underground's entrance its back and an exit
+## its front, a splitter's halves both ends. A curve none: Factorio has no lone curve (a belt is a curve
+## only because another feeds it from the side, so its entry is always joined), and the world's end
+## piece at a curve's free exit (belt_end_places, the same place: it wraps the curve's exit roller) next
+## to the open entry the preview has to give it drew a line's end on half a line. The curve alone is
+## how the world draws one inside a line.
+static func _lone_belt(file: String) -> Array:
+	var tile := Vector2(0.5, 0.5)
+	for curve in ["-curve-left", "-curve-right"]:
+		if file.ends_with(curve) and file.trim_suffix(curve).ends_with("transport-belt"):
+			return [file.trim_suffix(curve), "transport-belt", {"s": curve.substr(7, 1)}, tile, 0]
+	for end in ["-input", "-output"]:
+		var proto := file.trim_suffix(end)
+		if file.ends_with(end) and (proto.ends_with("underground-belt") or proto.ends_with("linked-belt")):
+			var type := "underground-belt" if proto.ends_with("underground-belt") else "linked-belt"
+			return [proto, type, {"u": end.substr(1, 1)}, tile, 1 if end == "-input" else 2]
+	if file.ends_with("lane-splitter"):
+		return [file, "lane-splitter", {}, tile, 3]
+	if file.ends_with("splitter"):
+		return [file, "splitter", {}, Vector2(0.0, 0.5), 15]  # two tiles across, centred on their edge
+	if file.ends_with("transport-belt"):
+		return [file, "transport-belt", {"s": "s"}, tile, 3]
+	return []
+
+
+## A lone belt, underground or splitter's end pieces (belt_end_places) in model `name`'s own space, as
+## the world draws them on a lone one (the model preview, model_preview.gd): [mesh, transform] for each
+## piece's body and [mesh, transform, part] for each moving part the model hasn't already (part_doubled). `name@pack` takes only
+## that pack's pieces, none when it has none; a plain name the ones the world uses. [] for other models,
+## null while a piece is still being read.
+static func lone_belt_pieces(name: String) -> Variant:
+	var lone := _lone_belt(file_of(name))
+	if lone.is_empty():
+		return []
+	var at := name.find("@")
+	var pack := "" if at < 0 else name.substr(at + 1)
+	var extra: Dictionary = lone[2]
+	var dir := 0
+	var pos: Vector2 = lone[3]
+	var host := Transform3D(Basis(Vector3.UP, -float(turn_dir(lone[1], dir, extra, lone[0])) / 16.0 * TAU),
+		Vector3(pos.x, 0.0, pos.y))
+	var inverse := host.affine_inverse()
+	var host_parts := parts_for(name)
+	var out: Array = []
+	for place: Array in belt_end_places(lone[0], lone[1], dir, pos, lone[4], 0.0, pack):
+		var piece: String = place[0]
+		if not ready(piece):
+			return null
+		var mesh := mesh_for(piece)
+		if mesh == null:
+			continue
+		var rel: Transform3D = inverse * place[1]
+		out.append([mesh, rel])
+		for part: AnimPart in parts_for(piece):
+			if part.mesh != null and not part.lit and not part_doubled(part, rel, host_parts):
+				out.append([part.mesh, rel, part])
+	return out
+
+
+## A pipe piece's neighbours for the preview (model_preview.gd), as a short line in the world draws
+## them: shown alone, a straight, corner, T or cross has its connected ends open (a hollow tube end-on,
+## FUE5's), where in the world the next pipe closes each. So each connected side gets the kit's ending
+## piece that joins back to it, one tile over: [mesh, transform] in the piece's own space. The side's
+## bit (PIPE_SHAPES' index) -> the tile it leads to and the ending that faces back.
+const PIPE_STUBS := {1: [Vector3(0, 0, -1), "ending-down"], 2: [Vector3(1, 0, 0), "ending-left"],
+	4: [Vector3(0, 0, 1), "ending-up"], 8: [Vector3(-1, 0, 0), "ending-right"]}
+
+## The pipe kit's family and connection mask of model `name` ([] for anything else): a shape's from its
+## name, the family's own model (no shape in its name) from the sides its mesh reaches (FUE5's pipe is
+## a straight east-west one). `name@pack` takes only that pack's endings.
+static func _pipe_kit(name: String) -> Array:
+	var file := file_of(name)
+	var at := name.find("@")
+	var pack := "" if at < 0 else name.substr(at + 1)
+	var proto := file
+	var mask := -1
+	for i in PIPE_SHAPES.size():
+		var s: String = "-" + PIPE_SHAPES[i]
+		if file.ends_with(s):
+			proto = file.trim_suffix(s)
+			mask = i
+			break
+	var probe := proto + "-ending-up"
+	if pack != "" and ModelPacks.find_in(pack, probe) == "":
+		return []
+	if pack == "" and _source(probe) == "":
+		return []
+	return [proto, mask, pack]
+
+
+static func lone_pipe_pieces(name: String) -> Variant:
+	var kit := _pipe_kit(name)
+	if kit.is_empty():
+		return []
+	var mask: int = kit[1]
+	if mask < 0:
+		var mesh := mesh_for(name)
+		if mesh == null:
+			return []
+		var box := mesh.get_aabb()
+		mask = (1 if box.position.z <= -0.45 else 0) | (2 if box.end.x >= 0.45 else 0) \
+			| (4 if box.end.z >= 0.45 else 0) | (8 if box.position.x <= -0.45 else 0)
+	var out: Array = []
+	for bit: int in PIPE_STUBS:
+		if mask & bit == 0:
+			continue
+		var piece: String = str(kit[0]) + "-" + str(PIPE_STUBS[bit][1])
+		if str(kit[2]) != "":
+			piece += "@" + str(kit[2])
+		if not ready(piece):
+			return null
+		var mesh := mesh_for(piece)
+		if mesh != null:
+			out.append([mesh, Transform3D(Basis.IDENTITY, PIPE_STUBS[bit][0])])
+	return out
+
+
 ## The model an entity record is drawn with. Belts carry their shape in extra.s ("s", "l",
 ## "r": straight, left or right curve) and undergrounds their end in extra.u ("i" entrance,
 ## "o" exit). Curves are modelled facing their output direction, like straight belts. Pipes
@@ -580,7 +760,7 @@ static func part_doubled(part: AnimPart, rel: Transform3D, host_parts: Array) ->
 static func model_name(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> String:
 	if RAIL_TYPES.has(proto_type) and dir % 4 == 2:
 		return proto_name + "-ne"
-	if FACING_MODELS.has(proto_name) and dir % 4 == 0 and not single_model(proto_name):
+	if FACING_MODELS.has(proto_name) and dir % 4 == 0 and not single_model(proto_name, entity_pack(extra)):
 		return proto_name + str(FACING_MODELS[proto_name][(dir >> 2) % 4])
 	match proto_type:
 		"transport-belt":
@@ -593,7 +773,10 @@ static func model_name(proto_name: String, proto_type: String, extra: Dictionary
 			return proto_name + ("-output" if str(extra.get("u", "i")) == "o" else "-input")
 		"pipe", "heat-pipe", "infinity-pipe":
 			if extra.has("pc"):
-				return proto_name + "-" + PIPE_SHAPES[int(extra["pc"]) & 15]
+				var shape := proto_name + "-" + str(PIPE_SHAPES[int(extra["pc"]) & 15])
+				if extra.has("pw") and proto_type == "pipe" and (int(extra["pc"]) & 15) in [5, 10]:
+					return pipe_window(shape, entity_pack(extra))
+				return shape
 		"wall":
 			if extra.has("wc"):
 				var wc := int(extra["wc"])
@@ -604,20 +787,251 @@ static func model_name(proto_name: String, proto_type: String, extra: Dictionary
 		"resource":
 			if ORE_STAGES.has(proto_name) and extra.has("a"):
 				var amount := int(extra["a"])
-				if amount >= ORE_RICH:
+				var edges: Array = ORE_STAGES[proto_name]
+				if amount >= int(edges[ORE_RICH_AT]):
 					return proto_name + "-rich"
-				if amount < ORE_SPARSE:
+				if amount < int(edges[ORE_SPARSE_AT]):
 					return proto_name + "-sparse"
 	return proto_name
 
 
-## Nauvis ores modelled at three of Factorio's eight richness stages (tools/models/nature/rocks.py
-## STAGES): "-rich" from the fourth stage up (Factorio's stage_counts for them: 15000, 9500, 5500,
-## 2900, 1300, 400, 150, 80 per tile; uranium's about a third lower), "-sparse" under the sixth,
+## Factorio's eight richness stages of each Nauvis ore, richest first: its stage_counts (15000, 9500,
+## 5500, 2900, 1300, 400, 150, 80 per tile; uranium's about a third lower: 10000, 6330, 3670, 1930, 870,
+## 270, 100, 50). A tile is in the first stage whose count it reaches, the last one (the eighth) below
+## the seventh's count. Scattered rocks follow all eight (ore_stage); the three modelled stages
+## (tools/models/nature/rocks.py STAGES) "-rich" from the fourth stage up, "-sparse" under the sixth,
 ## the plain model in between.
-const ORE_STAGES := {"iron-ore": true, "copper-ore": true, "coal": true, "stone": true, "uranium-ore": true}
-const ORE_RICH := 2900
-const ORE_SPARSE := 400
+const ORE_COUNTS := [15000, 9500, 5500, 2900, 1300, 400, 150, 80]
+const ORE_STAGES := {
+	"iron-ore": ORE_COUNTS, "copper-ore": ORE_COUNTS, "coal": ORE_COUNTS, "stone": ORE_COUNTS,
+	"uranium-ore": [10000, 6330, 3670, 1930, 870, 270, 100, 50],
+}
+const ORE_RICH_AT := 3  # "-rich" from this stage's count (2900; uranium 1930)
+const ORE_SPARSE_AT := 5  # "-sparse" under this one's (400; uranium 270)
+
+
+## Factorio draws a window in every second straight pipe (where the floored x plus the floored y of
+## its position is even: world.gd sets extra.pw there), its pictures `straight_vertical_window` and
+## `straight_horizontal_window`. A pack draws them with `pipe-straight-vertical-window.glb` and
+## `pipe-straight-horizontal-window.glb`; a pack without them, its plain straight. `--pipe-windows=off`:
+## no windows.
+static var pipe_windows := not OS.get_cmdline_user_args().has("--pipe-windows=off")
+static var _windows := {}  # straight's name@pack -> its window's, or the straight's own when the pack has none
+static var _windows_version := -1
+
+
+## The window piece of straight pipe `shape` when the pack that draws the straight has it, else `shape`.
+static func pipe_window(shape: String, pack := "") -> String:
+	if not pipe_windows or not ModelPacks.is_ready():
+		return shape
+	if _windows_version != ModelPacks.version:
+		_windows.clear()
+		_windows_version = ModelPacks.version
+	var key := shape + ("@" + pack if pack != "" else "")
+	if _windows.has(key):
+		return _windows[key]
+	var out := shape
+	var from := _drawing_pack_of(key)
+	if not from.is_empty() and ModelPacks.find_in(str(from["id"]), shape + "-window") != "":
+		out = shape + "-window"
+	_windows[key] = out
+	return out
+
+
+## The pack in use whose file draws model `name` (`name@pack` too; a family's chosen pack), {} for none.
+static func _drawing_pack_of(name: String) -> Dictionary:
+	if draws_sprite(name):
+		return {}
+	var alias := _alias_of(name)
+	return ModelPacks.pack_of(_source(alias if alias != "" else name))
+
+
+## Ore scattered as rocks (Vasillo's single ore rocks): a pack with numbered models of an ore
+## (`iron-ore-1.glb`, `-2`, ...: Factorio's variations) or a plain `<ore>.glb` under ORE_SMALL tiles on its
+## larger side has each ore tile drawn as 3 to 14 of them, bigger on richer tiles (ORE_ROCKS and
+## ORE_SIZES, by the ore's own eight stages in ORE_STAGES: they hide about as much of the ground as
+## Factorio's ore pictures, 22% to 96%), each its variant, place, turn and size from a hash of the tile
+## and the rock (the same on every build and session), in the chunk's MultiMesh per model (chunk_view.gd).
+## `--ore-density=classic` draws 0.2.2's 2, 4 or 6 at one size (ORE_ROCKS_CLASSIC: under the sixth stage,
+## from it, from the fourth).
+## `--ore-scatter=auto` (the default) does so; `on` also scatters a plain ore model of any size and a
+## pack that asks not to; `off` draws one model per tile, as before. A pack's pack.json
+## `"ore_scatter": false` keeps its numbered files out of it. A far chunk (far_chunks.gd) shows one rock
+## a tile: the MultiMeshes are filled rank by rank, and ChunkView.thin_ore() cuts their visible count.
+static var ore_scatter := _arg_value("--ore-scatter=", "auto")
+const ORE_SMALL := 0.6
+## Rocks a tile and their size factor (times the 0.8-1.2 jitter) per stage, poorest first.
+const ORE_ROCKS := [3, 5, 6, 7, 8, 10, 12, 14]
+const ORE_SIZES := [1.1, 1.2, 1.35, 1.5, 1.6, 1.7, 1.8, 1.9]
+const ORE_ROCKS_CLASSIC := [2, 4, 6]
+static var ore_density := _arg_value("--ore-density=", "factorio")
+## `--ore-look=old`: a "pbr" pack's ore rocks drawn as any model (Burley diffuse, its occlusion picture on the ambient
+## light) instead of as belt ore is (Lambert, no occlusion picture: factorio_material_ore.gdshader).
+static var ore_look := _arg_value("--ore-look=", "item")
+## How far a rock may sit from the tile's middle (tiles): a little over the edge, as Factorio's ore pictures reach.
+const ORE_SPREAD := 0.55
+static var _ore := {}  # ore -> Array of Mesh (none: drawn as one model a tile)
+static var _ore_names := {}  # ore -> [pack, names]
+static var _ore_packs := -1  # what the cached choices were made for (_ore_follow)
+static var _ore_generation := -1
+static var _ore_scatter := ""
+
+
+static func _arg_value(prefix: String, fallback: String) -> String:
+	for arg in OS.get_cmdline_user_args():
+		if arg.begins_with(prefix):
+			return arg.substr(prefix.length())
+	return fallback
+
+
+## The stage of a tile of ore `proto_name` with `amount` left, 0 (poorest) to 7 (richest), by that ore's
+## own counts (iron's for an ore not in ORE_STAGES).
+static func ore_stage(amount: int, proto_name := "") -> int:
+	var counts: Array = ORE_STAGES.get(proto_name, ORE_COUNTS)
+	for i in counts.size() - 1:
+		if amount >= int(counts[i]):
+			return counts.size() - 1 - i
+	return 0
+
+
+## How many rocks a tile of ore `proto_name` with `amount` left is drawn with (ORE_ROCKS; classic's
+## 2/4/6 under `--ore-density=classic`).
+static func ore_rock_count(amount: int, proto_name := "") -> int:
+	if ore_density == "classic":
+		var counts: Array = ORE_STAGES.get(proto_name, ORE_COUNTS)
+		if amount >= int(counts[ORE_RICH_AT]):
+			return ORE_ROCKS_CLASSIC[2]
+		return ORE_ROCKS_CLASSIC[1] if amount >= int(counts[ORE_SPARSE_AT]) else ORE_ROCKS_CLASSIC[0]
+	return ORE_ROCKS[ore_stage(amount, proto_name)]
+
+
+## The size factor of a tile's rocks (ORE_SIZES; 1 under `--ore-density=classic`).
+static func ore_rock_size(amount: int, proto_name := "") -> float:
+	return 1.0 if ore_density == "classic" else float(ORE_SIZES[ore_stage(amount, proto_name)])
+
+
+## The pack that draws ore `proto_name` (its family's chosen one, else the first in the order with any
+## of its models, numbered ones too) and the rock models scattered from it: [pack, names], names empty
+## when it isn't scattered by its numbered models (a plain model may still be: ore_rocks).
+static func ore_scatter_names(proto_name: String) -> Array:
+	_ore_follow()
+	if _ore_names.has(proto_name):
+		return _ore_names[proto_name]
+	var from := variant_pack(proto_name)
+	var names: Array = []
+	if not from.is_empty() and not ModelPacks.is_sprite_pack(from) and _pack_scatters(from):
+		for v: String in ModelPacks.variants_in(from["models"], proto_name, true):
+			if v != proto_name:
+				names.append("%s@%s" % [v, from["id"]])
+	var out := [from, names]
+	_ore_names[proto_name] = out
+	return out
+
+
+## The pack that draws model `name`'s variants (ModelPacks.variants_in): its family's chosen one, else
+## the first in the order that provides it (ModelPacks.provides: it or its numbered variants), {} for
+## none. An ore's (ore_scatter_names) and every placed entity's (pick_variant).
+static func variant_pack(name: String) -> Dictionary:
+	var chosen := ModelPacks.choice(name)
+	if chosen != "":
+		return ModelPacks.pack(chosen)
+	for replacing in [true, false]:
+		for p: Dictionary in ModelPacks.active():
+			if bool(p["replaces"]) == replacing and ModelPacks.provides(p, name):
+				return p
+	return {}
+
+
+## False for a pack whose pack.json says `"ore_scatter": false` (unless --ore-scatter=on).
+static func _pack_scatters(p: Dictionary) -> bool:
+	if ore_scatter == "on":
+		return true
+	var info: Variant = p.get("info", {})
+	var said: Variant = (info as Dictionary).get("ore_scatter", true) if info is Dictionary else true
+	return not (said is bool and not said)
+
+
+## The cached choices follow the packs (their order, switches and choices) and the models made again.
+static func _ore_follow() -> void:
+	if ModelPacks.version == _ore_packs and generation == _ore_generation and ore_scatter == _ore_scatter:
+		return
+	_ore.clear()
+	_ore_names.clear()
+	_ore_packs = ModelPacks.version
+	_ore_generation = generation
+	_ore_scatter = ore_scatter
+
+
+## The rock meshes ore `proto_name`'s tiles are scattered with: [] when each tile is one model
+## (model_name's), null while they are being made.
+static func ore_rocks(proto_name: String) -> Variant:
+	if ore_scatter == "off" or not ORE_STAGES.has(proto_name):
+		return []
+	if not ModelPacks.is_ready():
+		return null
+	_ore_follow()
+	if _ore.has(proto_name):
+		return _ore[proto_name]
+	var found := ore_scatter_names(proto_name)
+	var from: Dictionary = found[0]
+	var names: Array = found[1]
+	var plain := false
+	if names.is_empty():
+		# A plain model of the ore that is one small rock (not a whole tile's ore) is scattered too.
+		if from.is_empty() or ModelPacks.is_sprite_pack(from) or not _pack_scatters(from) \
+				or not (from["models"] as Dictionary).has(proto_name):
+			_ore[proto_name] = []
+			return []
+		names = [proto_name + "@" + str(from["id"])]
+		plain = true
+	var meshes: Array = []
+	for name: String in names:
+		if not ready(name):
+			return null
+		var mesh := mesh_for(name)
+		if mesh != null:
+			meshes.append(mesh)
+	if plain and ore_scatter != "on" and not meshes.is_empty():
+		var box: AABB = (meshes[0] as Mesh).get_aabb()
+		if maxf(box.size.x, box.size.z) >= ORE_SMALL:
+			meshes = []
+	_ore[proto_name] = meshes
+	return meshes
+
+
+## Where an ore tile's rocks go: [[rock index into `count` meshes, Transform3D], ...], rank by rank (the
+## first rock, the second...), each from hash([fixed, k]).
+static func ore_rock_places(fixed: Vector2i, at: Vector3, amount: int, count: int, proto_name := "") -> Array:
+	var out: Array = []
+	var grow := ore_rock_size(amount, proto_name)
+	for k in ore_rock_count(amount, proto_name):
+		var h := hash([fixed, k])
+		var variant := (h & 0xff) % count
+		var dx := (float((h >> 8) & 0x3ff) / 1023.0 * 2.0 - 1.0) * ORE_SPREAD
+		var dz := (float((h >> 18) & 0x3ff) / 1023.0 * 2.0 - 1.0) * ORE_SPREAD
+		var h2 := hash([fixed, k, 1])
+		var yaw := float(h2 & 0xffff) / 65536.0 * TAU
+		var size := (0.8 + 0.4 * float((h2 >> 16) & 0xff) / 255.0) * grow
+		out.append([variant, Transform3D(Basis(Vector3.UP, yaw) * Basis.from_scale(Vector3.ONE * size), at + Vector3(dx, 0.0, dz))])
+	return out
+
+
+## Factorio's wet drill (`wet_mining_graphics_set`: the fluid input a drill shows over a resource
+## that needs fluid to mine, uranium ore's sulfuric acid): `<drill>-wet.glb`, drawn over the drill
+## at its own place while its record's extra.fa has bit 1 (the bridge's alt_mode.lua), if the pack
+## that draws the drill has it. `--drill-wet=off`: never.
+static var drill_wet := not OS.get_cmdline_user_args().has("--drill-wet=off")
+
+
+## The `-wet` model drawn over a mining drill's record (name@pack), "" for none.
+static func wet_model(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> String:
+	if not drill_wet or proto_type != "mining-drill" or int(extra.get("fa", 0)) & 1 == 0:
+		return ""
+	var from := drawing_pack(proto_name, proto_type, extra, dir)
+	var name := proto_name + "-wet"
+	if from.is_empty() or ModelPacks.is_sprite_pack(from) or ModelPacks.find_in(str(from["id"]), name) == "":
+		return ""
+	return name + "@" + str(from["id"])
 
 
 ## A cliff's orientation (extra.co: it runs from the middle of one edge of its 4x4 cell to
@@ -685,22 +1099,31 @@ static func clipped(material: Material) -> bool:
 
 
 ## True when a FACING_MODELS entity is drawn with one model turned to each direction, as any other:
-## its north model comes from a folder that has no direction models beside it, a modeller's
-## (models/, --models=) or FUE5's (fue5/, one model turned, so no copies are kept). A modeller
-## makes one model; one who makes all four (`<name>-east`, `-south`, `-west`) gets those drawn unturned.
-static func single_model(proto_name: String) -> bool:
+## its north model comes from a pack that has no direction models of it (a modeller's, FUE5's: one
+## model turned, so no copies are kept). A modeller makes one model; one who makes all four
+## (`<name>-east`, `-south`, `-west`) gets those drawn unturned, as Placeholders' are. `pack`: the
+## building's own (entity_pack), whose model it is if that pack has one.
+static func single_model(proto_name: String, pack := "") -> bool:
 	if not FACING_MODELS.has(proto_name):
 		return false
 	var name: String = MODEL_ALIASES.get(proto_name, proto_name)
-	var base := _source(name)
-	if base == "" or not (base.contains("/fue5/") or (external_dir != "" and base.contains(external_dir))):
+	var suffix := "@" + pack if pack != "" else ""
+	var base := _source(name + suffix)
+	if base == "" and suffix != "":
+		suffix = ""  # that pack hasn't it: the usual model, with the usual rule
+		base = _source(name)
+	var from := ModelPacks.pack_of(base)
+	if base == "" or from.is_empty():
 		return false
 	var east := ""
 	for sfx: String in FACING_MODELS[proto_name]:
 		if sfx != "":
-			east = _source(name + sfx)
+			east = _source(name + sfx + suffix)
 			break
-	return east == "" or east.get_base_dir() != base.get_base_dir()
+	if east == "":
+		return true
+	# A pack's direction models may lie anywhere in it, but not in another pack.
+	return str(ModelPacks.pack_of(east).get("id", "")) != str(from["id"])
 
 
 ## Factorio draws each of a rail signal's 16 pictures about its own point (2.0 sets a signal
@@ -732,7 +1155,7 @@ static func placed(proto_name: String, proto_type: String, dir: int, extra: Dict
 
 
 static func turn_dir(proto_type: String, dir: int, extra := {}, proto_name := "") -> int:
-	if PICTURES.has(proto_name) and not single_model(proto_name):
+	if PICTURES.has(proto_name) and not single_model(proto_name, entity_pack(extra)):
 		return dir % (4 * int(PICTURES[proto_name]))
 	if RAIL_TYPES.has(proto_type):
 		return dir - dir % 4
@@ -786,22 +1209,22 @@ static func _commit_rig(rig: Dictionary, name: String) -> Dictionary:
 	return out
 
 
-## Mesh for an entity record: its variant model if there is one, else the prototype's.
+## Mesh for an entity record: its variant model if there is one, else the prototype's (entity_models).
 static func mesh_for_entity(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> Mesh:
-	var variant := model_name(proto_name, proto_type, extra, dir)
-	if variant != proto_name:
-		var mesh := mesh_for(variant)
+	for name: String in entity_models(proto_name, proto_type, extra, dir):
+		var mesh := mesh_for(name)
 		if mesh != null:
 			return mesh
-	return mesh_for(proto_name)
+	return null
 
 
 ## The moving parts drawn with an entity record's mesh (mesh_for_entity).
 static func parts_for_entity(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> Array:
-	var variant := model_name(proto_name, proto_type, extra, dir)
-	if variant != proto_name and mesh_for(variant) != null:
-		return parts_for(variant)
-	return parts_for(proto_name)
+	var names := entity_models(proto_name, proto_type, extra, dir)
+	for name: String in names:
+		if mesh_for(name) != null:
+			return parts_for(name)
+	return parts_for(names[-1])
 
 
 ## The moving parts of a model (AnimPart), empty when it has none or there is no model.
@@ -850,17 +1273,32 @@ static func mesh_for(name: String) -> Mesh:
 
 
 static func _make(name: String) -> Mesh:
+	if draws_sprite(name):
+		_cache[name] = null  # the Factorio pack comes first: its picture's card (chunk_view.gd), no model
+		_parts[name] = []
+		return null
+	var alias := _alias_of(name)
+	if alias != "":
+		# A family taken from a chosen pack, or a building's pack without this model: drawn as that.
+		var drawn := mesh_for(alias)
+		_cache[name] = drawn
+		_parts[name] = _parts.get(alias, [])
+		if _rigs.has(alias):
+			_rigs[name] = _rigs[alias]
+		return drawn
 	var mesh: Mesh = null
 	var parts: Array = []
+	var file := file_of(name)  # what every rule by model name reads ("@pack" off)
 	var source := _source(name)
 	var built: Load = _built(name) if source.begins_with(GLTF_SOURCE) else null
 	if built != null and not built.ok:
 		built = null
-	var root: Node = _load_scene(name) if source.begins_with(SCENE_SOURCE) else null
-	if root == null and built == null and MODEL_ALIASES.has(name):
-		mesh = mesh_for(MODEL_ALIASES[name])
+	var root: Node = _load_scene(source.substr(SCENE_SOURCE.length())) if source.begins_with(SCENE_SOURCE) else null
+	if root == null and built == null and MODEL_ALIASES.has(file):
+		var other := str(MODEL_ALIASES[file]) + name.substr(file.length())
+		mesh = mesh_for(other)
 		_cache[name] = mesh
-		_parts[name] = _parts.get(MODEL_ALIASES[name], [])
+		_parts[name] = _parts.get(other, [])
 		return mesh
 	if root != null or built != null:
 		if built != null:
@@ -871,18 +1309,20 @@ static func _make(name: String) -> Mesh:
 			mesh = _flatten(root, parts)
 			root.free()
 		# Creatures: a tier is its family's model scaled and tinted; limbs move in the shader.
-		mesh = CreatureModels.prepare(mesh as ArrayMesh, name)
+		mesh = CreatureModels.prepare(mesh as ArrayMesh, file)
 		if mesh != null:
 			for part: AnimPart in parts:
-				part.model = name
-				part.slide = MODEL_SLIDES.get(name, {}).get(part.kind, part.slide)
+				part.model = file
+				part.source = source.substr(source.find(":") + 1)
+				part.slide = MODEL_SLIDES.get(file, {}).get(part.kind, part.slide)
 				_mark_animated(part.mesh as ArrayMesh)
 	if mesh == null:
 		mesh = _tier_variant(name)
 		parts = _parts.get(_tier_base(name), [])
 	if mesh != null:
-		_setup_belt(mesh as ArrayMesh, name)
-		NatureLooks.prepare(mesh, name)
+		_setup_belt(mesh as ArrayMesh, file)
+		NatureLooks.prepare(mesh, file)
+		BurnerFx.prepare(mesh, file)  # a modeller's glowing burner inserter: its coals' heat
 		for i in mesh.get_surface_count():
 			var material := mesh.surface_get_material(i) as ShaderMaterial
 			if material != null and material.get_shader_parameter("activity_glow"):
@@ -936,6 +1376,23 @@ static func _setup_belt(mesh: ArrayMesh, name: String) -> void:
 		m.set_shader_parameter("belt_chevron_period", chevron_period)
 		m.set_shader_parameter("belt_uv_scroll", scroll)
 	edit_materials(mesh, pick, change)
+	# The space under the top run (the return strip, the rollers) is a covered space: shaded in every
+	# material of the model (belt_return.gd cover). A line's end pieces wrap the belt round the roller: none.
+	if name.ends_with("-start") or name.ends_with("-end"):
+		return
+	var all: Array = mesh.get_meta(ModelLods.ARRAYS_META, [])
+	for i in mesh.get_surface_count():
+		var m := mesh.surface_get_material(i) as ShaderMaterial
+		if m == null or i >= all.size() or not m.resource_name.to_lower().contains(BELT_MATERIAL) \
+				or m.get_shader_parameter("use_albedo_tex") != true:
+			continue
+		var cover := BeltReturn.cover(all[i], shape)
+		if cover.w > 0.0:
+			var set_cover := func(mm: ShaderMaterial) -> void:
+				mm.set_shader_parameter("belt_cover", cover)
+				mm.set_shader_parameter("belt_shape", shape)
+			edit_materials(mesh, func(_mm: ShaderMaterial) -> bool: return true, set_cover)
+		break
 
 
 ## How a textured belt surface's UVs change per tile along the belt (a least-squares fit of U and V
@@ -1045,11 +1502,13 @@ static func _copy(base: ArrayMesh) -> ArrayMesh:
 		out.set_meta(BeltReturn.META, returns)
 	if base.has_meta(ContactShade.META):
 		out.set_meta(ContactShade.META, base.get_meta(ContactShade.META))
+	if base.has_meta(ContactShade.MASK_META):
+		out.set_meta(ContactShade.MASK_META, base.get_meta(ContactShade.MASK_META))
 	return out
 
 
 # --- Loading on worker threads ------------------------------------------------------------------
-## A model's first appearance cost 20-250 ms on the main thread: loading the imported scene, then
+## A model's first appearance cost 20-250 ms on the main thread (D6): loading the imported scene, then
 ## SurfaceTool reading every mesh back from the GPU to merge it. Now its .glb is parsed and merged on
 ## a worker thread (Load: CPU arrays only, nothing touches the GPU), and the main thread only makes
 ## the ArrayMesh and its materials (poll(), within its slice of the frame: frame_budget.gd, `models`). Chunks, ghosts and movers ask
@@ -1068,6 +1527,8 @@ static var _jobs := {}  # name -> [task id (-1 while queued), Load]
 static var _job_order: Array[String] = []
 ## Goes up whenever models become ready, so whatever skipped them can be drawn again.
 static var generation := 0
+## The process frame poll() last ran in (model_preview.gd polls when no world does: the main menu).
+static var polled_frame := -1
 
 
 ## A model's .glb read and merged on a worker thread: per surface [keys, arrays, custom formats],
@@ -1085,6 +1546,14 @@ class Load:
 	## From a modeller's folder (models/, --models=): its vertex colours are Blender's own unless it
 	## has Zenith's baked layout (a second UV map beside them), so they aren't read as weathering.
 	var modeller := false
+	## From a pack whose pack.json says "shading": "pbr" (model_packs.gd shading()): its textured materials
+	## are drawn as their files say (PACK_PBR_META).
+	var pbr := false
+	## A "pbr" pack's materials without a base colour picture take its path too: their factors as the file says, no
+	## weathering, no part colours, never merged (pbr-standard step 2), while packs' own shading is on when the model
+	## loads (Looks.packs_shade: a change in Settings reaches them when they next load). --pbr-untextured=off: only
+	## pictured ones, as in 0.2.2 (Zenith's material classes by name for the rest).
+	static var pbr_all := not ("--pbr-untextured=off" in OS.get_cmdline_user_args())
 	## The format bits of CUSTOM0 and CUSTOM1 (the baked views and part colours).
 	const CUSTOM_KEEP := (Mesh.ARRAY_FORMAT_CUSTOM_MASK << Mesh.ARRAY_FORMAT_CUSTOM_BASE) \
 		| (Mesh.ARRAY_FORMAT_CUSTOM_MASK << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + Mesh.ARRAY_FORMAT_CUSTOM_BITS)) \
@@ -1101,16 +1570,26 @@ class Load:
 	var _rig_cut := []  # [split(), the skinned node's transform, its key]
 	## Its feet on the ground (contact_shade.gd feet_of(), for the rim round them).
 	var contact: Array = []
+	## Its contact map (contact_shade.gd mask_of(): its own parts near the ground; [] floating or --contact-shape=box),
+	## and the microseconds it took (the cost probe).
+	var contact_mask: Array = []
+	var mask_usec := 0
+	## Whether it gets one (ContactShade.mask_wanted: not rails, trees...), and its joined variant (join_wanted).
+	var contact_wanted := true
+	var contact_joins := true
 	## A belt model's shape for its return run (BeltReturn.shape_for; -1: none wanted), and per group the
 	## return drawn after it (null: none; empty when no group has one).
 	var belt_shape := -1
 	var returns: Array = []
+	## A belt-family model: its side plates' open ends are capped (BeltCaps), `caps` of them.
+	var belt_caps := false
+	var caps := 0
 
 	func run() -> void:
 		var doc := GLTFDocument.new()
 		var state := GLTFState.new()
 		if doc.append_from_file(path, state) == OK:
-			ModelTextures.prepare(path, state)
+			ModelTextures.prepare(path, state, modeller)
 			if not state.get_skins().is_empty() or not state.get_animations().is_empty():
 				bake = ModelSkin.bake(path)
 			var nodes := state.get_nodes()
@@ -1132,8 +1611,18 @@ class Load:
 					p[1] = yaw * (p[1] as Transform3D)
 					for g: Array in p[2]:
 						_turn_arrays(g[1], yaw.basis)
+			if belt_caps:
+				for g: Array in groups:
+					caps += BeltCaps.cap(g[1])
+				for p: Array in parts:
+					for g: Array in p[2]:
+						caps += BeltCaps.cap(g[1])
 			returns = BeltReturn.for_groups(groups, belt_shape)
 			contact = ContactShade.feet_of(groups)
+			if contact_wanted and not ContactShade.box_shape:
+				var t_mask := Time.get_ticks_usec()
+				contact_mask = ContactShade.mask_of(groups, parts, contact_joins)
+				mask_usec = Time.get_ticks_usec() - t_mask
 			ok = true
 
 	## The rig's parts and numbers from the cut skinned surface (model_rig.gd), into `rig`; returns the
@@ -1252,6 +1741,13 @@ class Load:
 				var material: Material = mesh.get_surface_material(k)
 				if k < overrides.size() and overrides[k] != null:
 					material = overrides[k]
+				# A modeller's own textured material keeps its own look (no weathering), marked before the roller, rig
+				# and baked-split paths below can move every triangle of it into a part and skip the rest. A "pbr"
+				# pack's every material, a picture or not: its file is the whole look (pbr-standard step 2).
+				if modeller and material is BaseMaterial3D and ((material as BaseMaterial3D).albedo_texture != null or (pbr and pbr_all and Looks.packs_shade)):
+					material.set_meta(OWN_LOOK_META, true)
+					if pbr:
+						material.set_meta(PACK_PBR_META, true)
 				if bake.get("animated", false) and bake["node_joints"].has(i):
 					# An object the actions move (a roller): all of it a bone of its own.
 					var joint: int = bake["node_joints"][i]
@@ -1280,8 +1776,6 @@ class Load:
 						for a in cut["parts"]:
 							if a != null and strip:
 								a[Mesh.ARRAY_COLOR] = null
-						if modeller and material is BaseMaterial3D and (material as BaseMaterial3D).albedo_texture != null:
-							material.set_meta(OWN_LOOK_META, true)
 						var rkey := [material, arrays[Mesh.ARRAY_COLOR] != null and not strip, arrays[Mesh.ARRAY_TEX_UV2] != null,
 							arrays[Mesh.ARRAY_CUSTOM0] != null, glow, arrays[Mesh.ARRAY_CUSTOM1] != null]
 						_rig_cut = [cut, xform, rkey + [mesh.get_surface_format(k) & (0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE)], roles]
@@ -1308,8 +1802,6 @@ class Load:
 					arrays = split[0]
 				if modeller and arrays[Mesh.ARRAY_COLOR] != null and arrays[Mesh.ARRAY_TEX_UV2] == null:
 					arrays[Mesh.ARRAY_COLOR] = null
-				if modeller and material is BaseMaterial3D and (material as BaseMaterial3D).albedo_texture != null:
-					material.set_meta(OWN_LOOK_META, true)
 				var key := [material, arrays[Mesh.ARRAY_COLOR] != null, arrays[Mesh.ARRAY_TEX_UV2] != null,
 					arrays[Mesh.ARRAY_CUSTOM0] != null, glow, arrays[Mesh.ARRAY_CUSTOM1] != null]
 				var flags := mesh.get_surface_format(k) & (0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE)
@@ -1427,11 +1919,15 @@ class Load:
 			return 3
 		return 1 if base.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED else 0
 
-	## True for a material with a base colour or roughness texture.
+	## True for a material with any texture (its own uniforms, which a merged row doesn't carry), or a
+	## "pbr" pack's ore rock (which uses FactorioOreShader's Lambert diffuse instead of FactorioShader).
+	## Other untextured "pbr" pack materials merge into MaterialRows via FLAG_MODELLER_TEX.
 	static func textured(material: Material) -> bool:
 		var base := material as BaseMaterial3D
 		return base != null and (base.albedo_texture != null or base.roughness_texture != null
-			or base.emission_texture != null or base.normal_texture != null)
+			or base.emission_texture != null or base.normal_texture != null
+			or (base.ao_enabled and base.ao_texture != null)
+			or (base.has_meta(PACK_PBR_META) and base.resource_name.to_lower().ends_with("_ore")))
 
 	static func _custom_format(flags: int, c: int) -> int:
 		return (flags >> (Mesh.ARRAY_FORMAT_CUSTOM_BASE + c * Mesh.ARRAY_FORMAT_CUSTOM_BITS)) & Mesh.ARRAY_FORMAT_CUSTOM_MASK
@@ -1506,38 +2002,219 @@ class Load:
 		return k.trim_suffix("_")
 
 
-## Where a model comes from: GLTF_SOURCE + its .glb or .gltf (readable as a file: the project's own
-## models, also in an exported game, and --models=<dir>), SCENE_SOURCE + an imported scene without
-## its file, or "" (no model of that name).
+## Where a model comes from: GLTF_SOURCE + its .glb or .gltf (readable as a file: every pack's, the
+## built-in ones too, also in an exported game), SCENE_SOURCE + an imported scene without its file,
+## or "" (no model of that name). The packs in their order (model_packs.gd), one that only fills in
+## (--models without --models-first) last. `name@pack` is that pack's model alone ("" if it has
+## none: a tier drawn from its base, model_name's PACK_KEY); a family chosen from a pack (the Model
+## packs window) is that pack's (_alias_of).
+## The file a model is drawn from, "" for none (its pack: ModelPacks.pack_of).
+static func source_of(name: String) -> String:
+	return _source(name)
+
+
 static func _source(name: String) -> String:
 	if _sources.has(name):
 		return _sources[name]
-	var file := name
-	var family := CreatureModels.base_model(name)
+	ModelPacks.wait()  # asked for before the packs' zips are unpacked (ready() waits for them)
+	var alias := _alias_of(name)
+	if alias != "":
+		var drawn := _source(alias)
+		_sources[name] = drawn
+		return drawn
+	var file := file_of(name)
+	var family := CreatureModels.base_model(file)
 	if family != "":
 		file = family
+	var path := ""
+	if name.contains("@"):
+		path = ModelPacks.find_in(name.get_slice("@", 1), file)
+	else:
+		path = ModelPacks.find(file, true)
+		if path == "":
+			path = ModelPacks.find(file, false)
 	var found := ""
-	var external := _external_path(file)
-	if external_first and external != "":
-		found = GLTF_SOURCE + external
-	for sub in MODEL_SUBDIRS:
-		if found == "" and FileAccess.file_exists("res://assets/models/%s%s.glb" % [sub, file]):
-			found = GLTF_SOURCE + "res://assets/models/%s%s.glb" % [sub, file]
-	for ext in ["glb", "gltf"]:
-		if found != "":
-			break
-		var res_path := "res://assets/models/%s.%s" % [file, ext]
-		# An exported game has the .glb itself (addons/zenith_export) and no imported scene.
-		if FileAccess.file_exists(res_path):
-			found = GLTF_SOURCE + res_path
-			break
-		if ResourceLoader.exists(res_path):
-			found = SCENE_SOURCE + res_path
-			break
-	if found == "" and external != "":
-		found = GLTF_SOURCE + external
+	# An exported game has the .glb itself (addons/zenith_export); without it, only its imported scene.
+	if path != "":
+		found = (SCENE_SOURCE if path.begins_with("res://") and not FileAccess.file_exists(path) else GLTF_SOURCE) + path
 	_sources[name] = found
 	return found
+
+
+## A model's name without the pack it is asked of ("transport-belt" for "transport-belt@builtin:fue5").
+static func file_of(name: String) -> String:
+	var at := name.find("@")
+	return name if at < 0 else name.substr(0, at)
+
+
+## The name a model is drawn as when it isn't its own, "" when it is: a family chosen from a pack
+## (ModelPacks.choice) as `name@pack`, if the pack has the model or its tier's base; `name@pack`
+## whose pack has neither as the plain name (the usual model, a chosen family's too).
+static func _alias_of(name: String) -> String:
+	var at := name.find("@")
+	if at < 0:
+		var chosen := ModelPacks.choice(name)
+		return name + "@" + chosen if chosen != "" and _pack_draws(chosen, name) else ""
+	return "" if _pack_draws(name.substr(at + 1), name.substr(0, at)) else name.substr(0, at)
+
+
+## Whether model `name` (`name@pack` too) is drawn as the Factorio pack's picture, not a model
+## (ModelPacks.sprite_wins: the Factorio pack in use comes first for its family, is chosen for it, or
+## is its building's pack): mesh_for gives null, so whatever draws it puts the entity's own picture
+## on a card (sprite_standins.gd), as for a building no pack has a model of.
+static func draws_sprite(name: String) -> bool:
+	var file := file_of(name)
+	var at := name.find("@")
+	return ModelPacks.sprite_wins(file, name.substr(at + 1) if at >= 0 else "", CreatureModels.base_model(file), _tier_base(file))
+
+
+## Whether a pack in use has model `file` (a creature tier's family model) or its tier's base.
+static func _pack_draws(pack: String, file: String) -> bool:
+	var family := CreatureModels.base_model(file)
+	if ModelPacks.find_in(pack, family if family != "" else file) != "":
+		return true
+	var base := _tier_base(file)
+	return base != "" and ModelPacks.find_in(pack, base) != ""
+
+
+## The extra key a record carries when its building is drawn with a pack's model of its own (the
+## in-game model chooser, building_models.gd), whatever the order: that pack's id. Client only.
+const PACK_KEY := "zmp"
+
+
+## The pack a record's building is drawn from ("" for the usual).
+static func entity_pack(extra: Dictionary) -> String:
+	return str(extra[PACK_KEY]) if extra.has(PACK_KEY) else ""
+
+
+## The pack in use that draws an entity record ({} for none), as mesh_for_entity picks its model: its
+## building's own pack (PACK_KEY), the family's chosen one or the order's; a tier drawn from its base
+## recoloured, the base's pack; Factorio's picture, the Factorio pack. With no model at all, the
+## Factorio pack when it can give the entity's card (sprite_standins.gd), else {} (the box). {} too
+## while the packs' zips are still unpacked and the model wasn't asked for yet (nothing waits on them).
+## The entity info's pack symbol (N8).
+static func drawing_pack(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> Dictionary:
+	if proto_type == "resource" and ORE_STAGES.has(proto_name):
+		var rocks: Variant = ore_rocks(proto_name)
+		if rocks is Array and not (rocks as Array).is_empty():
+			return ore_scatter_names(proto_name)[0]  # scattered rocks (ore_rocks)
+	for name: String in entity_models(proto_name, proto_type, extra, dir):
+		if draws_sprite(name):
+			return ModelPacks.pack(ModelPacks.FACTORIO_ID)
+		var alias := _alias_of(name)
+		var drawn := alias if alias != "" else name
+		if not ModelPacks.is_ready() and not _sources.has(drawn):
+			return {}
+		var src := _source(drawn)
+		var base := _tier_base(drawn)
+		if src == "" and base != "":
+			src = _source(base)
+		if src != "":
+			return ModelPacks.pack_of(src)
+	return ModelPacks.pack(ModelPacks.FACTORIO_ID) if ModelPacks.factorio_usable() else {}
+
+
+## The models an entity record may be drawn with, first found first: the variant its seed picks of its
+## model (pick_variant), its model (model_name), then the prototype's; each asked of its building's pack
+## (PACK_KEY) when it has one.
+static func entity_models(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> Array:
+	var variant := model_name(proto_name, proto_type, extra, dir)
+	var pack := entity_pack(extra)
+	var suffix := "@" + pack if pack != "" else ""
+	var out: Array = []
+	if not (proto_type == "resource" and ORE_STAGES.has(proto_name)):  # ores: scattered rocks, stage models
+		var picked := pick_variant(variant + suffix, extra)
+		if picked != variant + suffix:
+			out.append(picked)
+	out.append(variant + suffix)
+	if variant != proto_name:
+		out.append(proto_name + suffix)
+	return out
+
+
+## Every model's variants (ModelPacks.variants_in: `<name>-1.glb`, `-2`... beside `<name>.glb`) are
+## drawn at random, the same for a placed entity every time: its record's VARIANT_KEY (world.gd, a hash
+## of its position: ModelPacks.variant_seed) picks one of those the pack that draws it has (variant_pack;
+## its building's own pack for `name@pack`). `--model-variants=off`: always the plain model, as before.
+static var model_variants := not OS.get_cmdline_user_args().has("--model-variants=off")
+## The extra key of a record's variant seed. Client only (world.gd, predicted.gd set it).
+const VARIANT_KEY := "zv"
+static var _variants := {}  # name (name@pack) -> its variants as name@pack, [] for none or the plain alone
+static var _variants_version := -1
+
+
+## The variant model `name` (`name@pack`) is drawn as for a record's `extra`: `<variant>@<pack>`, or
+## `name` itself when there is no seed, no variant or the pack draws Factorio's picture.
+static func pick_variant(name: String, extra: Dictionary) -> String:
+	if not model_variants or not extra.has(VARIANT_KEY) or not ModelPacks.is_ready():
+		return name
+	var list := variants_of(name)
+	return name if list.is_empty() else str(list[ModelPacks.variant_pick(list.size(), int(extra[VARIANT_KEY]))])
+
+
+## Model `name`'s variants as `<variant>@<pack>` in the pack that draws them, [] when it has none but
+## the plain model (that is drawn as before).
+static func variants_of(name: String) -> Array:
+	if _variants_version != ModelPacks.version:
+		_variants.clear()
+		_variants_version = ModelPacks.version
+	if _variants.has(name):
+		return _variants[name]
+	var file := file_of(name)
+	var from := ModelPacks.pack(name.get_slice("@", 1)) if name.contains("@") else variant_pack(file)
+	var out: Array = []
+	if not from.is_empty() and not ModelPacks.is_sprite_pack(from) and not draws_sprite(name):
+		var found := ModelPacks.variants_in(from["models"], file)
+		if not (found.size() == 1 and found[0] == file):
+			for v: String in found:
+				out.append("%s@%s" % [v, from["id"]])
+	_variants[name] = out
+	return out
+
+
+## The packs' choices changed (ModelPacks.set_choices): the models of the families in `families`
+## (all with an empty list) are found and made again; true when any was made already, so whatever
+## drew them must be drawn again. Jobs reading them are waited for first (it is the player's click).
+static func choices_changed(families: Array) -> bool:
+	var all := families.is_empty()
+	var wanted := {}
+	for f in families:
+		wanted[str(f)] = true
+	var touched := func(name: String) -> bool:
+		if all:
+			return true
+		var file := file_of(name)
+		for drawn in [file, _tier_base(file), str(MODEL_ALIASES.get(file, ""))]:
+			if drawn != "" and wanted.has(ModelPacks.family(drawn)):
+				return true
+		return false
+	var names := {}
+	for table in [_sources, _cache, _jobs]:
+		for name: String in (table as Dictionary):
+			names[name] = true
+	var hit := false
+	for name: String in names:
+		if not touched.call(name):
+			continue
+		if name.contains("@") and _pack_draws(name.get_slice("@", 1), file_of(name)):
+			continue  # a pack's own model, asked of it by name: no choice changes it
+		if _jobs.has(name):
+			var entry: Array = _jobs[name]
+			if int(entry[0]) >= 0:
+				WorkerThreadPool.wait_for_task_completion(entry[0])
+			_jobs.erase(name)
+			_job_order.erase(name)
+		if _cache.has(name):
+			hit = true
+		_sources.erase(name)
+		_cache.erase(name)
+		_parts.erase(name)
+		_rigs.erase(name)
+		if not _remnant_jobs.has(name):
+			_remnant_cache.erase(name)  # its wreck, broken from the model it was (one being broken finishes as it is)
+	if hit:
+		generation += 1
+	return hit
 
 
 ## True when the model of `name` (or the knowledge that there is none) is ready: mesh_for() then
@@ -1546,20 +2223,36 @@ static func _source(name: String) -> String:
 static func ready(name: String) -> bool:
 	if _cache.has(name):
 		return true
+	if not ModelPacks.is_ready():
+		return false  # zips still being unpacked: their models may be this one's
+	if draws_sprite(name):
+		mesh_for(name)  # none: Factorio's picture
+		return true
+	var alias := _alias_of(name)
+	if alias != "":
+		if not ready(alias):
+			return false
+		mesh_for(name)
+		return true
 	var source := _source(name)
+	var file := file_of(name)
 	if source.begins_with(GLTF_SOURCE):
 		if not _jobs.has(name):
 			var load := Load.new()
 			load.path = source.substr(GLTF_SOURCE.length())
 			load.combine = merge_materials
-			load.modeller = external_dir != "" and load.path.begins_with(external_dir)
-			load.rig_wanted = rig_name(name)
-			load.belt_shape = BeltReturn.shape_for(name)
+			load.modeller = ModelPacks.owns(load.path)
+			load.pbr = load.modeller and ModelPacks.pbr(load.path)
+			load.rig_wanted = rig_name(file)
+			load.belt_shape = BeltReturn.shape_for(file)
+			load.belt_caps = BeltCaps.wanted(file)
+			load.contact_wanted = ContactShade.mask_wanted(file)
+			load.contact_joins = ContactShade.join_wanted(file)
 			_jobs[name] = [-1, load]
 			_job_order.append(name)
 		return false
 	if source == "":
-		if MODEL_ALIASES.has(name) and not ready(MODEL_ALIASES[name]):
+		if MODEL_ALIASES.has(file) and not ready(str(MODEL_ALIASES[file]) + name.substr(file.length())):
 			return false
 		var base := _tier_base(name)
 		if base != "" and not ready(base):
@@ -1570,29 +2263,36 @@ static func ready(name: String) -> bool:
 
 ## ready() for an entity record's model (mesh_for_entity: its variant, else the prototype's).
 static func entity_ready(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> bool:
-	var variant := model_name(proto_name, proto_type, extra, dir)
-	if variant != proto_name:
-		if not ready(variant):
+	for name: String in entity_models(proto_name, proto_type, extra, dir):
+		if not ready(name):
 			return false
-		if _cache[variant] != null:
+		if _cache[name] != null:
 			return true
-	return ready(proto_name)
+	return true
 
 
-## How many models are being read or wait to be (the join's loading screen counts them).
+## How many models are being read or wait to be (the join's loading screen counts them); model
+## packs' zips being unpacked count one.
 static func pending_count() -> int:
-	return _jobs.size()
+	return _jobs.size() + (0 if ModelPacks.is_ready() else 1)
 
 
 ## Models still being read on worker threads or waiting to be made (full_detail.gd's settle check).
 static func busy() -> bool:
-	return not _jobs.is_empty() or not _remnant_jobs.is_empty()
+	return not _jobs.is_empty() or not _remnant_jobs.is_empty() or not ModelPacks.is_ready()
 
 
 ## Starts waiting jobs and makes the models whose jobs are done, within its slice. True when
 ## some became ready (`generation` went up).
 static func poll() -> bool:
+	polled_frame = Engine.get_process_frames()
 	NatureLooks.poll()
+	# Model packs' zips unpacked: what ready() turned down is asked for again.
+	var packs_in := false
+	if ModelPacks.is_ready() and _packs_version != ModelPacks.version:
+		_packs_version = ModelPacks.version
+		generation += 1
+		packs_in = true
 	var running := 0
 	for name in _job_order:
 		var entry: Array = _jobs[name]
@@ -1614,7 +2314,7 @@ static func poll() -> bool:
 			done += 1
 	if done == 0 and _remnant_jobs.is_empty():
 		FrameBudget.waiting(&"models", 0)
-		return false
+		return packs_in
 	var allow := FrameBudget.grant(&"models")
 	for name in _job_order.duplicate():
 		if allow <= 0 or (made > 0 and Time.get_ticks_usec() - start > allow):
@@ -1632,7 +2332,7 @@ static func poll() -> bool:
 	FrameBudget.spent(&"models", Time.get_ticks_usec() - start, maxi(done, 0))
 	if made > 0:
 		generation += 1
-	return made > 0
+	return made > 0 or packs_in
 
 
 ## True while models are being made on worker threads.
@@ -1654,9 +2354,13 @@ static func _built(name: String) -> Load:
 		load = Load.new()
 		load.path = _source(name).substr(GLTF_SOURCE.length())
 		load.combine = merge_materials
-		load.modeller = external_dir != "" and load.path.begins_with(external_dir)
-		load.rig_wanted = rig_name(name)
-		load.belt_shape = BeltReturn.shape_for(name)
+		load.modeller = ModelPacks.owns(load.path)
+		load.pbr = load.modeller and ModelPacks.pbr(load.path)
+		load.rig_wanted = rig_name(file_of(name))
+		load.belt_shape = BeltReturn.shape_for(file_of(name))
+		load.belt_caps = BeltCaps.wanted(file_of(name))
+		load.contact_wanted = ContactShade.mask_wanted(file_of(name))
+		load.contact_joins = ContactShade.join_wanted(file_of(name))
 		_parsed_here = true
 		load.run()
 	return load
@@ -1667,6 +2371,10 @@ static func _commit_load(load: Load, parts: Array) -> Mesh:
 	var mesh := _commit_groups(load.groups, load.returns)
 	if mesh != null:
 		mesh.set_meta(ContactShade.META, load.contact)
+		if not load.contact_mask.is_empty():
+			mesh.set_meta(ContactShade.MASK_META, ContactShade.commit_mask(load.contact_mask))
+		if load.caps > 0:
+			mesh.set_meta(BeltCaps.META, load.caps)
 	for p: Array in load.parts:
 		var part := _new_part(str(p[0]), p[1])
 		part.mesh = _commit_groups(p[2])
@@ -1724,29 +2432,12 @@ static func set_named(mesh: ArrayMesh, material_name: String, param: String, val
 	edit_materials(mesh, pick, change)
 
 
-static func _load_scene(name: String) -> Node:
-	var family := CreatureModels.base_model(name)
-	if family != "":
-		name = family
-	var external := _external_path(name)
-	if not (external_first and external != ""):
-		for sub in MODEL_SUBDIRS:
-			if ResourceLoader.exists("res://assets/models/%s%s.glb" % [sub, name]):
-				var sub_packed := load("res://assets/models/%s%s.glb" % [sub, name]) as PackedScene
-				if sub_packed != null:
-					return sub_packed.instantiate()
-		for ext in ["glb", "gltf"]:
-			var res_path := "res://assets/models/%s.%s" % [name, ext]
-			if ResourceLoader.exists(res_path):
-				var packed := load(res_path) as PackedScene
-				if packed != null:
-					return packed.instantiate()
-	if external != "":
-		var doc := GLTFDocument.new()
-		var state := GLTFState.new()
-		if doc.append_from_file(external, state) == OK:
-			return doc.generate_scene(state)
-	return null
+## A built-in model's imported scene, in an exported game without its .glb (SCENE_SOURCE).
+static func _load_scene(res_path: String) -> Node:
+	if not ResourceLoader.exists(res_path):
+		return null
+	var packed: PackedScene = load(res_path) as PackedScene
+	return packed.instantiate() if packed != null else null
 
 
 ## Merges every MeshInstance3D under `root` into one ArrayMesh, one surface per material.
@@ -1815,8 +2506,14 @@ const OCCLUSION_CHANNELS := [Vector4(1, 0, 0, 0), Vector4(0, 1, 0, 0), Vector4(0
 	Vector4(0.299, 0.587, 0.114, 0)]
 
 
+## --idle-dims-glow-paint=on: a modeller's glowing material's base colour dims to 30% at rest too, as
+## before 0.2.2 (only one without an emission picture did).
+static var glow_keeps_albedo := not ("--idle-dims-glow-paint=on" in OS.get_cmdline_user_args())
 ## Marks a modeller's textured material (Load, from the models folder): drawn with its textures only.
 const OWN_LOOK_META := "f3d_own_look"
+## And one whose pack says "shading": "pbr": drawn as its file says (the shader's modeller_tex, while
+## f3d_pack_shading is on), not with Factorio's top and side balance.
+const PACK_PBR_META := "f3d_pack_pbr"
 ## A textured model's baked occlusion strength (the shader's ao_strength; above 1 a power): its
 ## per-vertex bake shows mostly as 0.6-0.9 near corners and feet, which at 1 left Vasillo's belts and
 ## inserters and FUE5's buildings looking unshaded beside Factorio's sprites.
@@ -1875,9 +2572,16 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 	# Alpha Clip (glTF MASK, imported as alpha scissor) cuts pixels out; Alpha Blend (BLEND) is see-through.
 	var clip := clipped(base)
 	var see_through := base != null and not clip and base.transparency != BaseMaterial3D.TRANSPARENCY_DISABLED
-	out.shader = FactorioClipShader if clip else (FactorioAlphaShader if see_through else FactorioShader)
+	# A "pbr" pack's ore rocks: drawn as the same ore is on a belt (item.gdshader: Lambert diffuse, no occlusion picture).
+	var ore_rock := ore_look != "old" and not clip and not see_through and base != null and base.has_meta(PACK_PBR_META) \
+		and name.to_lower().ends_with("_ore")
+	var shader: Shader = FactorioOreShader if ore_rock else (FactorioClipShader if clip else (FactorioAlphaShader if see_through else FactorioShader))
+	out.shader = Looks.shader_for(shader)
 	if clip:
 		out.set_shader_parameter("alpha_clip", base.alpha_scissor_threshold)
+		# A "pbr" pack's single-sided cut-out (glTF doubleSided false): back faces dropped, as Godot draws it.
+		if base.has_meta(PACK_PBR_META) and base.cull_mode == BaseMaterial3D.CULL_BACK:
+			out.set_shader_parameter("clip_one_side", true)
 	if name.begins_with("leafcard"):
 		out.shader = FactorioLeafShader
 	elif name.begins_with("leaf-shadow"):
@@ -1913,7 +2617,7 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 				out.set_shader_parameter("orm_tex_nearest", base.roughness_texture)
 				out.set_shader_parameter("orm_nearest", true)
 		# glTF's occlusionTexture: most files pack it as the red of the metallic-roughness picture.
-		if base.ao_enabled and base.ao_texture != null:
+		if base.ao_enabled and base.ao_texture != null and not ore_rock:
 			var same := base.ao_texture == base.roughness_texture
 			if not same:
 				out.set_shader_parameter("occlusion_tex", base.ao_texture)
@@ -1934,6 +2638,10 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 				out.set_shader_parameter("use_emission_tex", true)
 			out.set_shader_parameter("activity_glow", true)
 			out.set_shader_parameter("glow_fades", see_through)
+			# A modeller's glow (a lamp's colour with no picture, Vasillo's drill's Light) goes out at rest,
+			# its paint stays: Zenith's idle dim of the base colour is for its own fire boxes and lamps.
+			if glow_keeps_albedo and base.has_meta(ModelTextures.MODELLER_META):
+				out.set_shader_parameter("glow_keeps_albedo", true)
 		elif glow != "":
 			out.set_shader_parameter("emission", base.albedo_color)
 			out.set_shader_parameter("emission_energy", 1.5)
@@ -1959,6 +2667,8 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 		# top would sit still in model space while a belt's texture runs under it, and muddy the paint.
 		for param in OWN_LOOK:
 			out.set_shader_parameter(param, OWN_LOOK[param])
+		if base.has_meta(PACK_PBR_META):
+			out.set_shader_parameter("modeller_tex", true)
 	if base != null and base.albedo_texture != null and has_color:
 		# A textured model's baked occlusion (bake_glb.py), whatever its material's class: an inserter's
 		# emissive material had 0.3 of it, which no one could see.

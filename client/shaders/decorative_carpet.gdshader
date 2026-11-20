@@ -129,8 +129,8 @@ void fragment() {
 	float blade = c.a * smoothstep(0.002, 0.016, max(c.r, max(c.g, c.b)));
 	// Darker at the root, a little lighter at the tips: the height reads from any angle.
 	ALBEDO = c.rgb * mix(0.65, 1.12, clamp(rise, 0.0, 1.0));
-	SPECULAR = 0.5 * f3d_look_ground_specular;
-	ROUGHNESS = 0.9;
+	SPECULAR = plant_specular() * f3d_look_ground_specular;
+	ROUGHNESS = plant_roughness(0.9);
 	// Bent up: lit nearly as the ground is, with a little of the card's own facing, on either side.
 	vec3 n = face * (FRONT_FACING ? 1.0 : -1.0);
 	NORMAL = normalize((VIEW_MATRIX * vec4(normalize(mix(n, vec3(0.0, 1.0, 0.0), 0.8)), 0.0)).xyz);

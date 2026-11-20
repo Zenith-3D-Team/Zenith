@@ -13,10 +13,12 @@ run to --out (JSON).
 
 import argparse
 import json
+import os
 import random
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -28,7 +30,8 @@ def run_once(args, seconds):
     cmd = [args.godot]
     if args.safe:
         cmd += ["--render-thread", "safe"]
-    cmd += ["--path", "client", "--", f"--factorio-port={args.factorio_port}", f"--port={args.port}",
+    # its own log (the temp folder), not the player's user://logs/, which these quick runs would rotate away
+    cmd += ["--path", "client", "--log-file", os.path.join(tempfile.gettempdir(), "zenith-quit-soak", "godot.log"), "--", f"--factorio-port={args.factorio_port}", f"--port={args.port}",
             f"--settings-file={args.settings_file}", f"--quit-probe={seconds:.1f}"]
     start = time.monotonic()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")

@@ -243,6 +243,22 @@ end
 -- with each mover's prototype id and whether it is oriented read once per search (sc.info), not
 -- per send: a send of ~150 movers cost 6.6 ms at -62,-26, most of what movers cost there.
 local mv_recs = {}
+-- (Binary frames, transport.lua: five numbers a record, -1 for no orientation; parts with a mover
+-- past 32 bits, one without a unit number (NO_UNIT_BASE), go as 64-bit numbers.)
+local MV_STRIDE = 5
+local INT32_MAX = 2147483647
+local mv_flat, mv_wide = {}, {}
+
+-- One part's records as JSON text (a binary part that could not be packed).
+local function flat_text(flat, first, last)
+  local out = {}
+  for i = first, last, MV_STRIDE do
+    local o = flat[i + 4]
+    out[#out + 1] = "[" .. flat[i] .. "," .. flat[i + 1] .. "," .. flat[i + 2] .. "," .. flat[i + 3] .. (o >= 0 and "," .. o or "") .. "]"
+  end
+  return table.concat(out, ",")
+end
+
 local function send_movers(surface, s, every)
   local found = map.view_only(movers_in_focus(surface, s))
   local tp = profile.start()
@@ -255,10 +271,11 @@ local function send_movers(surface, s, every)
       sc.info = info
     end
   end
-  local z = transport.compact()
+  local bin = transport.binary()
+  local z = not bin and transport.compact()
   local small = transport.small
   local fixed, floor, oriented = world.fixed, math.floor, registry.ORIENTED
-  local recs = mv_recs
+  local recs, flat, wide = mv_recs, mv_flat, mv_wide
   local n = 0
   local pu, pe, px, py = 0, 0, 0, 0
   for _, e in pairs(found) do
@@ -271,18 +288,28 @@ local function send_movers(surface, s, every)
       end
       local p = e.position
       local x, y = fixed(p.x), fixed(p.y)
-      local tail = ""
-      if eid[2] then
-        tail = "," .. floor(e.orientation * 1000 + 0.5)
+      if bin then
+        local at = n * MV_STRIDE
+        flat[at + 1], flat[at + 2], flat[at + 3], flat[at + 4] = unit, eid[1], x, y
+        flat[at + 5] = eid[2] and floor(e.orientation * 1000 + 0.5) or -1
+        n = n + 1
+        if unit > INT32_MAX then
+          wide[math.ceil(n / MOVERS_PER_MESSAGE)] = true
+        end
+      else
+        local tail = ""
+        if eid[2] then
+          tail = "," .. floor(e.orientation * 1000 + 0.5)
+        end
+        local a, b, c, d = unit, eid[1], x, y
+        -- (A part's first record is written whole, the rest as differences from the one before.)
+        if z and n % MOVERS_PER_MESSAGE ~= 0 then
+          a, b, c, d = a - pu, b - pe, c - px, d - py
+        end
+        pu, pe, px, py = unit, eid[1], x, y
+        n = n + 1
+        recs[n] = "[" .. (small[a] or a) .. "," .. (small[b] or b) .. "," .. (small[c] or c) .. "," .. (small[d] or d) .. tail .. "]"
       end
-      local a, b, c, d = unit, eid[1], x, y
-      -- (A part's first record is written whole, the rest as differences from the one before.)
-      if z and n % MOVERS_PER_MESSAGE ~= 0 then
-        a, b, c, d = a - pu, b - pe, c - px, d - py
-      end
-      pu, pe, px, py = unit, eid[1], x, y
-      n = n + 1
-      recs[n] = "[" .. (small[a] or a) .. "," .. (small[b] or b) .. "," .. (small[c] or c) .. "," .. (small[d] or d) .. tail .. "]"
     end
   end
   -- What reading them cost (budget.commit): the periodic jobs that may wait (budget.admit) see it
@@ -296,12 +323,29 @@ local function send_movers(surface, s, every)
   -- (An empty list is still sent, as one empty part.)
   local parts = math.max(1, math.ceil(n / MOVERS_PER_MESSAGE))
   for part = 1, parts do
-    local first = (part - 1) * MOVERS_PER_MESSAGE + 1
-    local body = n > 0 and table.concat(recs, ",", first, math.min(n, part * MOVERS_PER_MESSAGE)) or ""
-    transport.send_text("mv", ',"part":' .. part .. ',"parts":' .. parts .. (z and ',"z":1' or "") .. ',"p":' .. every .. ',"l":[' .. body .. "]")
+    if bin then
+      local first = (part - 1) * MOVERS_PER_MESSAGE * MV_STRIDE + 1
+      local last = math.min(n, part * MOVERS_PER_MESSAGE) * MV_STRIDE
+      -- (Packed inside pcall: a number string.pack refuses sends that part as JSON text instead.)
+      local ok, body = pcall(transport.pack_message, { game.tick, part, parts, every }, flat, first, last, wide[part] and 8 or 4)
+      if ok then
+        transport.send_frame(transport.KIND_MV, "mv", body)
+      else
+        transport.send_text("mv", ',"part":' .. part .. ',"parts":' .. parts .. ',"p":' .. every .. ',"l":[' .. flat_text(flat, first, last) .. "]")
+      end
+      wide[part] = nil
+    else
+      local first = (part - 1) * MOVERS_PER_MESSAGE + 1
+      local body = n > 0 and table.concat(recs, ",", first, math.min(n, part * MOVERS_PER_MESSAGE)) or ""
+      transport.send_text("mv", ',"part":' .. part .. ',"parts":' .. parts .. (z and ',"z":1' or "") .. ',"p":' .. every .. ',"l":[' .. body .. "]")
+    end
   end
-  for k = n + 1, #recs do
-    recs[k] = nil
+  local used, list = n, recs
+  if bin then
+    used, list = n * MV_STRIDE, flat
+  end
+  for k = used + 1, #list do
+    list[k] = nil
   end
   profile.stop("mv.send", tp)
 end
@@ -512,7 +556,7 @@ end
 
 local function send_state_changes(changes, lc, ao)
   if #changes > 0 or #lc > 0 or #ao > 0 then
-    transport.send_reliable({ t = "st", l = changes, lc = #lc > 0 and lc or nil, ao = #ao > 0 and ao or nil })
+    transport.send_states(changes, lc, ao)
   end
 end
 

@@ -200,6 +200,10 @@ class InfoMixin:
         depleted = [e for e in self.entities.values() if e.type == "mining-drill" and not self.ore_under(e)]
         if depleted:
             l.append(["depleted", len(depleted), [rec(e, "no_minable_resources") for e in depleted[:40]]])
+        # N9: the mock's overextended pipeline (L11's alert, on the pipe nearest where a pump would cut it).
+        cut = getattr(self, "overextended_cut", None)
+        if cut is not None and cut.unit in self.entities:
+            l.append(["pipeline", 1, [rec(cut)]])
         return {"t": "al", "l": l}
 
     def ore_under(self, drill):

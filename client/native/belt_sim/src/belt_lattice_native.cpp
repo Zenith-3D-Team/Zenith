@@ -120,6 +120,7 @@ i64 BeltLatticeNative::_obs_front(i64 key) {
 }
 
 void BeltLatticeNative::drop(i64 key) {
+	fed_gone.erase(key);
 	info.erase(key);
 	mids.erase(key);
 	moving_since.erase(key);
@@ -236,10 +237,52 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 	if (keys.size() > 0 && sim != nullptr) {
 		fronts = sim->lane_fronts(keys);
 	}
+	// (turn_id) Each lane's front item's number.
+	PackedInt32Array nums;
+	if (turn_id && item_turns && keys.size() > 0 && sim != nullptr) {
+		nums = sim->lane_fronts(keys, 3);
+	}
+	// (tail) Whether a packed block's tail has gone onto each lane, nothing close behind it.
+	PackedInt32Array tails;
+	if (tail && keys.size() > 0 && sim != nullptr) {
+		tails = sim->lane_tails(keys, (int)TAIL_NEED);
+	}
 	// (creep) The speed most of each lane's items move at.
 	PackedInt32Array lane_v;
-	if (creep && keys.size() > 0 && sim != nullptr) {
-		lane_v = sim->lane_fronts(keys, creep_flow ? 2 : 1);
+	if ((creep || creep_step) && keys.size() > 0 && sim != nullptr) {
+		lane_v = sim->lane_fronts(keys, creep_flow || creep_step ? 2 : 1);
+	}
+	// (mask_open) The simulation's front item on each lane it has one on: where its items are.
+	std::unordered_map<i64, i64> front_at;
+	if (mask_open && mask_own) {
+		for (i64 q = 0; q < keys.size() && q * 3 + 2 < fronts.size(); q++) {
+			if (fronts[q * 3 + 2] > 0) {
+				front_at[keys[q]] = fronts[q * 3];
+			}
+		}
+	}
+	// (start) The simulation's links changed (lane_fronts linked them): a drawn lane whose next lane is new lets its
+	// run back go (belt_lattice.gd).
+	if (start && settle && sim != nullptr && sim->get_links_ver() != links_seen) {
+		links_seen = sim->get_links_ver();
+		for (i64 key2 : drawn.key_list()) {
+			Lane *l2 = *drawn.get(key2);
+			i64 nx = sim->next_of(key2);
+			if (nx == l2->next) {
+				continue;
+			}
+			if (l2->next != 0) {
+				auto ff = feeds.find(l2->next);
+				if (ff != feeds.end() && ff->second == key2) {
+					feeds.erase(ff);
+				}
+			}
+			l2->next = nx;
+			if (nx != 0) {
+				feeds[nx] = key2;
+				_release_behind(key2, tick);
+			}
+		}
 	}
 	const int32_t *fr = fronts.ptr();
 	int nk = (int)keys.size();
@@ -269,6 +312,83 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 		// (standing_obs: the game's front on the lane at its last read or check, -1 none.)
 		i64 obs = standing_obs ? _obs_front(key) : -1;
 		int st = (ln == nullptr || replan || heard.count(key)) ? _stack_of(key) : ln->stack;
+		bool short_ = (i64)fr[q * 3 + 2] < std::max<i64>(1, (i64)m[1] / GAP);
+		if ((sim_full && ln != nullptr && ln->v > 0 && has && short_ && fed_gone.count(key) && tick - fed_gone[key] <= FED_GONE_TICKS)
+				|| (tail && q < (i64)tails.size() && tails[q] == 1 && (!has || (short_ && (ln == nullptr || ln->v > 0))))) {
+			// (sim_full) Moving, and the simulation has it short of full; (tail) or a packed block's tail went onto it
+			// (or past it) with nothing close behind (belt_lattice.gd).
+			Info *e = info.get(key);
+			if (e != nullptr) {
+				e->full = false;
+			}
+			want.erase(key);
+			if (ln != nullptr) {
+				_remove(key);
+			}
+			continue;
+		}
+		// (creep_step sees the lanes in this update's check: all of them with unison on, the default.)
+		if (creep_step && close && settle && ln != nullptr && q * 3 + 2 < (int)lane_v.size()) {
+			_creep_step(ln, lane_v[q * 3 + 2], m[2], f, v, has, tick);
+		}
+		if (close && settle && ln != nullptr && ln->slide_at >= 0) {
+			// (close) A slide a take ahead asked for: written at its belt's speed; once over, standing a gap on.
+			if (ln->v > 0) {
+				_slide_clear(ln);
+			} else if (ln->slide_v == 0) {
+				i64 n_stand = 0;
+				for (i64 qs = ln->r0; qs < (i64)m[1]; qs += GAP) {
+					n_stand += 1;
+				}
+				if (m[2] <= 0 || n_stand != std::max<i64>(1, (i64)std::ceil((double)m[1] / (double)GAP))) {
+					_slide_clear(ln);
+				} else {
+					ln->slide_v = m[2];
+					_write_lane(key, ln, m, lk->second, ln->stack);
+				}
+			} else if (drawn_tick >= ln->slide_at + _slide_ticks(ln)) {
+				_slide_done(ln);
+				_write_lane(key, ln, m, lk->second, ln->stack);
+			}
+		}
+		if (start && settle && ln != nullptr) {
+			if (ln->release_t >= 0 && tick - ln->release_t > RELEASE_TICKS) {
+				ln->release_t = -1;
+			}
+			if (ln->go_hi >= 0) {
+				// (start) Stopping on go_hi: standing on its phase then, once the drawn clock is there; moving again
+				// before, on from go_next (belt_lattice.gd).
+				if (has && v > 0 && ln->go_next < 0) {
+					i64 t_next = tick - roundi((double)posmod(_phase_at(ln, ln->go_hi) - f, GAP) / (double)v);
+					if (t_next <= ln->go_hi + 1 && v == ln->v) {
+						ln->go_hi = -1;
+						_write_lane(key, ln, m, lk->second, ln->stack);
+					} else {
+						ln->go_next = std::max(t_next, ln->go_hi + 1);
+					}
+				}
+				if (ln->go_hi >= 0) {
+					if (drawn_tick >= ln->go_hi) {
+						i64 hi = ln->go_hi;
+						i64 nxt = ln->go_next;
+						_set_motion(ln, _phase_at(ln, hi), 0, hi);
+						ln->go_next = -1;
+						if (nxt >= 0 && has && v > 0) {
+							_set_motion(ln, ln->r0, v, nxt);
+							ln->go_lo = nxt;
+							ln->pend_n = 0;
+							ln->pend_v = -1;
+						}
+						_write_lane(key, ln, m, lk->second, ln->stack);
+						if (nxt >= 0 && has && v > 0) {
+							continue;
+						}
+					} else {
+						continue;
+					}
+				}
+			}
+		}
 		if (settle && ln != nullptr && ln->hole_at >= 0) {
 			// (The hole a take left: closed once the drawn clock is a gap's time past it.)
 			if (has && v > 0) {
@@ -280,6 +400,9 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 				ln->hole_at = -1;
 				_write_lane(key, ln, m, lk->second, ln->stack);
 			}
+		}
+		if (close && settle && ln != nullptr && ln->v == 0 && ln->slide_at >= 0) {
+			continue;  // (close) Sliding: the simulation's front (or a read) mid-way through the closing says nothing new.
 		}
 		// (A lane whose stacks changed is made again with its new piles, its phase as a new lane's.)
 		if (ln != nullptr && ln->stack == st) {
@@ -340,14 +463,41 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 					if (ln->pend_n < (unison ? 1 : SPEED_CHECKS)) {
 						continue;
 					}
-					if (settle && ln->v == 0 && (tick - ln->pend_t) * v <= SETTLE_GAPS * GAP) {
+					bool released = start && settle && ln->v == 0 && v > 0 && ln->release_t >= 0 && ln->slide_at < 0;
+					if (settle && ln->v == 0 && !released && (tick - ln->pend_t) * v <= SETTLE_GAPS * GAP) {
 						continue;  // (a line closing a hole: a gap on it stands again, the same picture)
+					}
+					if (start && start_stops && settle && ln->v > 0 && v == 0 && !ln->creeping) {
+						// (start) Stopping: on to the tick its lattice comes to the simulation's standing front's phase.
+						i64 over = posmod(ln->v * (tick - ln->t0) - (ln->r0 - f), GAP);
+						i64 t_stop = tick - roundi((double)over / (double)ln->v);
+						if (t_stop > drawn_tick && t_stop > std::max(ln->t0, ln->go_lo)) {
+							ln->pend_n = 0;
+							ln->pend_v = -1;
+							if (ln->go_lo < 0) {
+								ln->go_lo = ln->t0;
+							}
+							ln->go_hi = t_stop;
+							_write_lane(key, ln, m, lk->second, st);
+							continue;
+						}
 					}
 					if (ln->gated && ln->flow_q >= FLOW_GATE) {
 						ln->gated = false;
 					}
 					if (ln->v == 0 && ln->gated) {
 						continue;  // (creep_flow: stood for want of net flow; moves again with it)
+					}
+					if (released) {
+						// (start) Its run in front extended: on from where it stands, from the tick its items started.
+						i64 t_go = tick - roundi((double)posmod(ln->r0 - f, GAP) / (double)v);
+						ln->pend_n = 0;
+						ln->pend_v = -1;
+						ln->release_t = -1;
+						_set_motion(ln, ln->r0, v, t_go);
+						ln->go_lo = t_go;
+						_write_lane(key, ln, m, lk->second, st);
+						continue;
 					}
 					// (Its new speed from where it is drawn now; the map's phase at it, world. Stopping, it
 					// keeps where it is drawn: the game's standing phase comes with the lane's next read or
@@ -368,11 +518,17 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 					if (posmod(obs, GAP) == ln->r0) {
 						continue;  // (standing at the game's phase)
 					}
-				} else if (wl) {
-					continue;  // (the map's phase: nothing drifts)
 				} else {
 					i64 off = std::abs(pred - posmod(f, GAP));
-					if (std::min(off, GAP - off) <= DRIFT) {
+					bool in_step = std::min(off, GAP - off) <= DRIFT;
+					if (wl || in_step) {  // (wl: the map's phase, nothing drifts)
+						in_step = std::min(off, GAP - off) <= (wl ? SEED_WL : DRIFT);  // (belt_lattice.gd)
+						// (turn_id) Moving in step, who its items are off the simulation's: seeded again (belt_lattice.gd).
+						if (in_step && ln->v > 0 && tick - ln->t0 >= SEED_AFTER && q * 3 + 2 < (int)nums.size() && has && nums[q * 3 + 2] >= 0
+								&& _seed_who(ln, f, nums[q * 3 + 2], tick) != ln->who && !_ring(key)
+								&& _seed(ln, f, nums[q * 3 + 2], tick)) {
+							_write_lane(key, ln, m, lk->second, st);
+						}
 						continue;
 					}
 				}
@@ -427,8 +583,13 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 		} else {
 			_set_motion(ln, nr0, nv, tick);
 		}
+		// (turn_id: from the simulation's front item, but on a ring as before, carried from lane to lane.)
+		if (q * 3 + 2 < (int)nums.size() && has && nums[q * 3 + 2] >= 0 && !_ring(key)) {
+			_seed(ln, f, nums[q * 3 + 2], tick);
+		}
 		_write_lane(key, ln, m, lk->second, st);
 	}
+	_open_ends(front_at, tick);
 	for (i64 kk : kinds.key_list()) {
 		LKind *kd = *kinds.get(kk);
 		Vector3i told(kd->base, kd->top, kd->cap);
@@ -481,6 +642,68 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 	res["removed"] = del;
 	res["added"] = add;
 	return res;
+}
+
+// (mask_open) Each drawn lane's ends left unmarked for the lanes beside it now (belt_lattice.gd _open_ends).
+void BeltLatticeNative::_open_ends(const std::unordered_map<i64, i64> &front_at, i64 tick) {
+	for (i64 key : drawn.key_list()) {
+		Lane *ln = *drawn.get(key);
+		i64 o = 0;
+		auto fa = front_at.find(key);
+		if (mask_open && mask_own && ln->v > 0 && fa != front_at.end()) {
+			// (Its slots less the simulation's items, -32..31: below 0 its slots are ahead, nearer the exit.)
+			i64 off = posmod(_phase_at(ln, tick) - fa->second + GAP / 2, GAP) - GAP / 2;
+			if (off < -OPEN_TOL) {
+				Lane **pd = ln->next != 0 && ln->next != key ? drawn.get(ln->next) : nullptr;
+				if ((pd == nullptr || (*pd)->v != ln->v) && (!edge_shut || sim == nullptr || sim->leads_on(key))) {
+					o = OPEN_EXIT;
+				}
+			} else if (off > OPEN_TOL) {
+				auto ff = feeds.find(key);
+				i64 up_key = ff != feeds.end() ? ff->second : 0;
+				Lane **pu = up_key != 0 && up_key != key ? drawn.get(up_key) : nullptr;
+				if (pu == nullptr || (*pu)->v != ln->v) {
+					o = OPEN_ENTRY;
+				}
+			}
+		}
+		// (handover) The phases' difference the open end's slot hides by.
+		i64 od = 0;
+		if (handover && o != 0) {
+			od = posmod(_phase_at(ln, tick) - fa->second + GAP / 2, GAP) - GAP / 2;
+			od = o == OPEN_EXIT ? -od : od;
+		}
+		auto lf = lanes.find(key);
+		if ((o == ln->open && od == ln->open_d) || lf == lanes.end()) {
+			continue;
+		}
+		ln->open_d = od;
+		if (o != ln->open) {
+			_unmark(ln);
+			ln->open = o;
+			_mark(key, ln);
+		}
+		auto lk = known.find(ln->kind_key);
+		if (lk != known.end()) {
+			_write_lane(key, ln, lf->second.m, lk->second, ln->stack);
+		}
+	}
+}
+
+// (handover) A moving lane's slot k's texel 3 y: where in its period it hides at its lane's open end
+// (belt_lattice.gd _hand_code).
+double BeltLatticeNative::_hand_code(const Lane *ln, i64 k, i64 length) {
+	if (ln->open_d <= 0 || ln->v <= 0) {
+		return 0.0;
+	}
+	if (ln->open & OPEN_EXIT) {
+		return k == 0 ? -(1.0 + std::min(1.0, (double)(ln->open_d + HAND_SLACK) / GAP)) : 0.0;
+	}
+	if (ln->open & OPEN_ENTRY) {
+		double h = (double)(GAP * (k + 2) - length - ln->open_d - HAND_SLACK) / GAP;
+		return h > 0.0 ? -(3.0 + std::min(h, 1.0)) : 0.0;
+	}
+	return 0.0;
 }
 
 // How high a lane's piles are drawn: its last read's most common stack (1 with --belt-draw-lattice-pile=off).
@@ -599,8 +822,8 @@ bool BeltLatticeNative::_creep(Lane *ln, i64 lv, i64 step, i64 tick, i64 pred, i
 	return false;
 }
 
-// belt_lattice.gd _creep_flow.
-bool BeltLatticeNative::_creep_flow(Lane *ln, i64 lv, i64 u, i64 step, i64 tick, i64 pred, i64 f) {
+// belt_lattice.gd _front_flow.
+i64 BeltLatticeNative::_front_flow(Lane *ln, i64 u, i64 tick) {
 	i64 dd = 0;
 	int n = (int)ln->fu.size();
 	if (n == 0 || ln->fu[n - 1] != (int32_t)u) {
@@ -631,6 +854,78 @@ bool BeltLatticeNative::_creep_flow(Lane *ln, i64 lv, i64 u, i64 step, i64 tick,
 		ln->flow_q = std::max<i64>(0, ln->flow_q + _fdiv(dd * FLOW_ONE, CREEP_TAU));
 	}
 	ln->flow_t = tick;
+	return dd;
+}
+
+// belt_lattice.gd _creep_step.
+void BeltLatticeNative::_creep_step(Lane *ln, i64 u, i64 step, i64 f, i64 fv, bool has, i64 tick) {
+	if (!has) {
+		return;
+	}
+	i64 prev_t = ln->flow_t;
+	i64 dd = _front_flow(ln, u, tick);
+	if (dd < 0) {
+		// (A read put the simulation's items back: slides not written yet dropped; belt_lattice.gd.)
+		i64 nb = _fdiv(-dd, GAP);
+		while (nb > 0 && ln->slide_more > 0) {
+			ln->slide_more -= 1;
+			ln->step_bal = std::max<i64>(ln->step_bal - 1, 0);
+			nb -= 1;
+		}
+		if (nb > 0 && ln->slide_at >= 0 && ln->slide_v == 0) {
+			_slide_clear(ln);
+			ln->step_bal = std::max<i64>(ln->step_bal - 1, 0);
+			nb -= 1;
+		}
+		return;
+	}
+	if (dd == 0 || ln->v != 0 || ln->creeping || step <= 0) {
+		return;
+	}
+	if (ln->flow_q * 2 >= step * FLOW_ONE) {
+		return;  // (at half the belt's speed or more: the usual rules)
+	}
+	if (ln->bal_t >= 0 && std::llabs(tick - ln->bal_t) > STEP_BAL_TICKS) {
+		ln->step_bal = 0;
+	}
+	ln->bal_t = tick;
+	// Gaps the line went on since the last update (belt_lattice.gd).
+	i64 k = 1;
+	i64 moved = beltn::posmod(ln->r0 - f, GAP);
+	if (fv > 0 && f > ln->r0) {
+		k = std::clamp<i64>(_fdiv(f - ln->r0 - 1, GAP) + 1, 1, CLOSE_MORE + 1);
+		moved = ln->r0 + k * GAP - f;
+	}
+	while (k > 0 && ln->step_bal < 0) {
+		ln->step_bal += 1;  // (close slid it for this take)
+		k -= 1;
+		moved = std::max<i64>(0, moved - GAP);
+	}
+	if (k <= 0) {
+		return;
+	}
+	ln->step_bal = std::min<i64>(ln->step_bal + k, CLOSE_MORE);
+	i64 t_s = 0;
+	if (fv > 0) {
+		t_s = tick - _fdiv(2 * moved + fv, 2 * fv);
+	} else {
+		t_s = tick - _fdiv(GAP + step - 1, step);
+		if (prev_t >= 0 && prev_t < t_s) {
+			t_s = _fdiv(prev_t + t_s, 2);
+		}
+	}
+	if (ln->slide_at < 0) {
+		ln->slide_at = t_s;
+		ln->slide_v = 0;
+		ln->slide_more = std::min<i64>(k - 1, CLOSE_MORE);
+	} else {
+		ln->slide_more = std::min<i64>(ln->slide_more + k, CLOSE_MORE);
+	}
+}
+
+// belt_lattice.gd _creep_flow.
+bool BeltLatticeNative::_creep_flow(Lane *ln, i64 lv, i64 u, i64 step, i64 tick, i64 pred, i64 f) {
+	_front_flow(ln, u, tick);
 	if (lv <= 0) {
 		ln->run_t = -1;
 	} else if (ln->run_t < 0) {
@@ -692,10 +987,92 @@ void BeltLatticeNative::_creep_stop(Lane *ln, i64 r0, i64 tick) {
 }
 
 void BeltLatticeNative::_set_motion(Lane *ln, i64 r0, i64 v, i64 tick) {
-	ln->who = posmod(ln->who + _fdiv(r0 + ln->v * (tick - ln->t0) - ln->r0 + _lag(ln->v - v, tick) + GAP / 2, GAP), IDS);
+	// (close: a slide's way so far counts as moved; the new motion replaces what is left of it.)
+	ln->who = posmod(ln->who + _fdiv(r0 + ln->v * (_held_t(ln, tick) - ln->t0) + _slide_moved(ln, tick) - ln->r0 + _lag(ln->v - v, tick)
+			+ GAP / 2, GAP), IDS);
+	_slide_clear(ln);
+	ln->go_lo = -1;
+	ln->go_hi = -1;
+	ln->go_next = -1;
 	ln->r0 = r0;
 	ln->v = v;
 	ln->t0 = tick;
+}
+
+// (close) A slide over: standing a gap on, each slot the item that was behind it; the next queued, if any.
+void BeltLatticeNative::_slide_done(Lane *ln) {
+	ln->who = posmod(ln->who + 1, IDS);
+	if (ln->slide_more > 0) {
+		ln->slide_more -= 1;
+		ln->slide_at += _slide_ticks(ln);
+	} else {
+		_slide_clear(ln);
+	}
+}
+
+// (start) Lane `key`'s next lane is new: it and its straight run back (feeds), each released (belt_lattice.gd).
+void BeltLatticeNative::_release_behind(i64 key, i64 tick) {
+	i64 k = key;
+	for (int i = 0; i < 4096; i++) {
+		Lane **pl = drawn.get(k);
+		if (pl == nullptr) {
+			return;
+		}
+		(*pl)->release_t = tick;
+		auto ff = feeds.find(k);
+		i64 up = ff == feeds.end() ? 0 : ff->second;
+		if (up == 0 || up == key) {
+			return;
+		}
+		Lane **pu = drawn.get(up);
+		if (pu == nullptr || (*pu)->next != k) {
+			return;
+		}
+		k = up;
+	}
+}
+
+// (close) A take on tick `at` from lane `key` (standing, or not drawn): the drawn standing lanes behind it
+// (feeds), each a slide of a gap from then, or one more after the slide it has (belt_lattice.gd).
+void BeltLatticeNative::_close_behind(i64 key, i64 at) {
+	i64 down = key;
+	for (int i = 0; i < 4096; i++) {
+		auto ff = feeds.find(down);
+		i64 up_key = ff == feeds.end() ? 0 : ff->second;
+		if (up_key == 0 || up_key == key) {
+			return;
+		}
+		Lane **pu = drawn.get(up_key);
+		Lane *up = pu == nullptr ? nullptr : *pu;
+		if (up == nullptr || up->next != down || up->v != 0 || up->creeping) {
+			return;
+		}
+		if (creep_step) {
+			// (creep_step) Its front's change already slid it for this take: not again.
+			if (up->bal_t >= 0 && std::llabs(at - up->bal_t) > STEP_BAL_TICKS) {
+				up->step_bal = 0;
+			}
+			up->bal_t = at;
+			if (up->step_bal > 0) {
+				up->step_bal -= 1;
+				down = up_key;
+				continue;
+			}
+			up->step_bal = std::max<i64>(up->step_bal - 1, -CLOSE_MORE);
+		}
+		if (up->slide_at >= 0 && up->slide_v > 0 && up->slide_more == 0 && at >= up->slide_at + _slide_ticks(up)) {
+			_slide_done(up);  // (its slide over by the take: standing a gap on)
+		}
+		if (up->slide_at < 0) {
+			up->slide_at = at;
+			up->slide_v = 0;
+			up->slide_more = 0;
+		} else {
+			up->slide_more = std::min<i64>(up->slide_more + 1, CLOSE_MORE);
+		}
+		dirty.set(up_key, true);
+		down = up_key;
+	}
 }
 
 // Who a new lane's items are: its next drawn lane's, the drawn lane feeding it, else the map's
@@ -719,11 +1096,12 @@ void BeltLatticeNative::_identify(i64 key, Lane *ln, const int32_t *m, i64 tick)
 		up = pu == nullptr ? nullptr : *pu;
 	}
 	if (down != nullptr) {
-		ln->who = posmod(down->who + _fdiv((i64)dm[1] + ln->r0 + down->v * (tick - down->t0) - down->r0 + _lag(down->v - ln->v, tick)
-				+ GAP / 2, GAP), IDS);
+		ln->who = posmod(down->who + _fdiv((i64)dm[1] + ln->r0 + down->v * (tick - down->t0) + _slide_moved(down, tick) - down->r0
+				+ _lag(down->v - ln->v, tick) + GAP / 2, GAP), IDS);
 		ln->run = down->run;
 	} else if (up != nullptr) {
-		ln->who = posmod(up->who + _fdiv(up->v * (tick - up->t0) - up->r0 - (i64)m[1] + ln->r0 + _lag(up->v - ln->v, tick) + GAP / 2, GAP), IDS);
+		ln->who = posmod(up->who + _fdiv(up->v * (tick - up->t0) + _slide_moved(up, tick) - up->r0 - (i64)m[1] + ln->r0
+				+ _lag(up->v - ln->v, tick) + GAP / 2, GAP), IDS);
 		ln->run = up->run;
 	} else {
 		ln->who = posmod(_fdiv(ln->r0 - _world_tau(m) + ln->v * tick + GAP / 2, GAP), IDS);
@@ -732,6 +1110,39 @@ void BeltLatticeNative::_identify(i64 key, Lane *ln, const int32_t *m, i64 tick)
 	if (ln->next != 0) {
 		feeds[ln->next] = key;
 	}
+}
+
+// (turn_id) belt_lattice.gd _seed: who a lane's items are from the simulation's front item on it.
+i64 BeltLatticeNative::_seed_who(const Lane *ln, i64 at, i64 num, i64 tick) {
+	return posmod(num - _fdiv(at + ln->v * (_held_t(ln, tick) - ln->t0) + _slide_moved(ln, tick) - ln->r0 + GAP / 2, GAP), IDS);
+}
+
+// (turn_id) belt_lattice.gd _ring: whether lane `key` is on a ring of lanes (the simulation's links).
+bool BeltLatticeNative::_ring(i64 key) {
+	if (sim == nullptr) {
+		return false;
+	}
+	i64 k = sim->next_of(key);
+	for (int i = 0; i < 256; i++) {
+		if (k == key) {
+			return true;
+		}
+		if (k == 0) {
+			return false;
+		}
+		k = sim->next_of(k);
+	}
+	return false;
+}
+
+bool BeltLatticeNative::_seed(Lane *ln, i64 at, i64 num, i64 tick) {
+	i64 w = _seed_who(ln, at, num, tick);
+	if (w == ln->who && ln->run == TURN_RUN) {
+		return false;
+	}
+	ln->who = w;
+	ln->run = TURN_RUN;
+	return true;
 }
 
 void BeltLatticeNative::_remove(i64 key) {
@@ -768,6 +1179,12 @@ void BeltLatticeNative::_write_lane(i64 key, Lane *ln, const int32_t *m, const L
 		return;
 	}
 	bool moving = ln->v > 0;
+	if (mask_inner && !mask_own && moving != ln->mark_moving && !ln->cells.empty()) {
+		// (mask_inner) Started or stopped moving: its mask cells a moving or a standing lane's (belt_lattice.gd).
+		_unmark(ln);
+		ln->mark_moving = moving;
+		_mark(key, ln);
+	}
 	i64 n = 0;
 	if (moving) {
 		n = std::max<i64>(1, (i64)std::ceil((double)length / (double)GAP));
@@ -778,6 +1195,9 @@ void BeltLatticeNative::_write_lane(i64 key, Lane *ln, const int32_t *m, const L
 			q += GAP;
 		}
 	}
+	// (close) Sliding a gap: a moving lane's slots on a clock held to the slide (belt_lattice.gd).
+	bool sliding = !moving && close && ln->slide_at >= 0 && ln->slide_v > 0
+			&& n == std::max<i64>(1, (i64)std::ceil((double)length / (double)GAP));
 	LKind **pkd = kinds.get(ln->kind_key);
 	LKind *kd;
 	if (pkd == nullptr) {
@@ -827,18 +1247,35 @@ void BeltLatticeNative::_write_lane(i64 key, Lane *ln, const int32_t *m, const L
 	}
 	Vector3 lift = look.lift;
 	double pile_step = look.pile;
-	double period = moving ? (double)GAP / (double)ln->v : 0.0;
+	double period = moving ? (double)GAP / (double)ln->v : (sliding ? (double)GAP / (double)ln->slide_v : 0.0);
 	Ends ends = _ends(key, length);
 	// (Its clock from where slot k is at 64k + r0 on tick t0: the shader's fract() starts at (64 - r0) / 64.)
 	double t_start = (double)ln->t0 - base;
+	double t_hold = 0.0;
+	double periods = 0.0;  // (close, start) how long the held clock runs from t_hold (texel 1 y), 0: on and on
+	// (start) A motion that started at once or stops: its clock held (belt_lattice.gd).
+	bool held = moving && start && (ln->go_lo >= 0 || ln->go_hi >= 0);
 	if (moving) {
 		t_start -= (double)(GAP - ln->r0) / (double)GAP * period;
+		if (held) {
+			i64 lo = ln->go_lo >= 0 ? ln->go_lo : ln->t0;
+			t_start += period / 256.0;
+			t_hold = (double)lo - base;
+			if (ln->go_hi >= 0) {
+				periods = (double)(ln->go_hi - lo) / period;
+			}
+		}
+	} else if (sliding) {
+		// (close) From the slide's start, a 256th of a period on; held from then to a period after (texel 1 w, y).
+		t_hold = (double)ln->slide_at - base;
+		t_start = t_hold - (double)(GAP - ln->r0) / (double)GAP * period + period / 256.0;
+		periods = 1.0;
 	}
 	float *d = records.data.data();
 	for (i64 k = 0; k < n; k++) {
-		double top = moving ? (double)(GAP * (k + 1)) : (double)(ln->r0 + GAP * k);
+		double top = (moving || sliding) ? (double)(GAP * (k + 1)) : (double)(ln->r0 + GAP * k);
 		Vector4 p = _along(key, top, length, ends);
-		Vector4 to = moving ? _along(key, (double)(GAP * k), length, ends) : p;
+		Vector4 to = (moving || sliding) ? _along(key, (double)(GAP * k), length, ends) : p;
 		i64 uid = _uid(key, k);
 		// Turned as every item is, icon cards too: by who its item is (the shader adds the periods slid,
 		// item_cards.gd lattice_turn), or (slot turns) by the slot (turn_for).
@@ -852,20 +1289,20 @@ void BeltLatticeNative::_write_lane(i64 key, Lane *ln, const int32_t *m, const L
 		d[o + 3] = (float)t_start;
 		if (period > 0.0) {
 			d[o + 4] = (float)((double)to.x - (double)p.x);
-			d[o + 5] = 0.0f;
+			d[o + 5] = (float)periods;  // (a slot slides on the ground: texel 1 y is its held clock's run)
 			d[o + 6] = (float)((double)to.z - (double)p.z);
 		} else {
 			d[o + 4] = 0.0f;
 			d[o + 5] = 0.0f;
 			d[o + 6] = 0.0f;
 		}
-		d[o + 7] = (float)t_start;
+		d[o + 7] = (float)((sliding || held) ? t_hold : t_start);
 		d[o + 8] = (float)c;
 		d[o + 9] = (float)s;
 		d[o + 10] = (float)((double)lift.y + LAYER_STEP * (double)posmod(uid, LAYERS));
 		d[o + 11] = p.w >= 0.5f ? 0.0f : HIDDEN;
 		d[o + 12] = 0.0f;
-		d[o + 13] = 0.0f;
+		d[o + 13] = moving ? (float)_hand_code(ln, k, length) : 0.0f;  // (handover) where it hides at an open end
 		d[o + 14] = item_turns ? 2.0f : 1.0f;  // a lattice slot (not masked); 2: texel 2 says who its item is
 		d[o + 15] = (float)period;
 		records.mark(r / records.per_page);
@@ -892,7 +1329,7 @@ void BeltLatticeNative::_write_lane(i64 key, Lane *ln, const int32_t *m, const L
 			records.mark(rc / records.per_page);
 		}
 		if (dump_on) {
-			i64 row[8] = { uid, ln->item, (i64)st, key, ln->r0 + GAP * k, ln->t0, ln->v, 0 };
+			i64 row[8] = { uid, ln->item, (i64)st, key, ln->r0 + GAP * k, ln->t0, ln->v, ln->open };
 			dump_ids.insert(dump_ids.end(), row, row + 8);
 			dump_recs.insert(dump_recs.end(), d + o, d + o + FLOATS);
 		}
@@ -980,8 +1417,24 @@ void BeltLatticeNative::_mark(i64 key, Lane *ln) {
 	i64 length = std::clamp<i64>(m[1], 0, MAX_LENGTH);
 	std::unordered_set<i64> seen;
 	i64 steps = std::max<i64>(1, length / 8);
+	bool inner = mask_own || (mask_inner && !ln->mark_moving);
+	// (mask_open) Its open ends' cells left out; a lane too short for both keeps its middle's.
+	double lo = (ln->open & OPEN_EXIT) ? (double)GAP + 4.0 : 4.0;
+	double hi = (double)length - ((ln->open & OPEN_ENTRY) ? (double)GAP + 4.0 : 4.0);
+	if (ln->open != 0 && lo > hi) {
+		lo = (double)length * 0.5;
+		hi = lo;
+	}
 	for (i64 j = 0; j <= steps; j++) {
-		Vector4 p = _point(key, (double)length * (double)j / (double)steps);
+		// (mask_inner, standing: its entry end's point a 64th of a tile inside; mask_own: its exit's too, belt_lattice.gd)
+		double at = (double)length * (double)j / (double)steps;
+		if (inner) {
+			at = std::min(at, (double)length - 4.0);
+		}
+		if (mask_own) {
+			at = std::clamp(at, lo, std::max(hi, lo));
+		}
+		Vector4 p = _point(key, at);
 		i64 cx = posmod((i64)std::floor((double)p.x * (double)CELLS), MASK);
 		i64 cz = posmod((i64)std::floor((double)p.z * (double)CELLS), MASK);
 		i64 c = cz * MASK + cx;
@@ -1032,6 +1485,19 @@ Dictionary BeltLatticeNative::hole(i64 key, i64 at, i64 pos, bool dump) {
 	PackedInt64Array ids;
 	PackedFloat32Array recs;
 	Lane **pln = drawn.get(key);
+	if (close && settle && (pln == nullptr || (*pln)->v <= 0)) {
+		// (close) The standing line behind closes the hole up; the take's lane, short of full now, is drawn from
+		// the simulation until a read finds it full again (belt_lattice.gd).
+		_close_behind(key, at);
+		if (pln != nullptr) {
+			Info *e = info.get(key);
+			if (e != nullptr) {
+				e->full = false;
+			}
+			dirty.set(key, true);
+		}
+		pln = drawn.get(key);
+	}
 	if (pln != nullptr && base >= 0.0) {
 		Lane *ln = *pln;
 		LKind **pkd = kinds.get(ln->kind_key);
@@ -1044,7 +1510,7 @@ Dictionary BeltLatticeNative::hole(i64 key, i64 at, i64 pos, bool dump) {
 				records.data[o + 12] = (float)h;
 				records.mark(r / records.per_page);
 				if (dump) {
-					i64 row[8] = { _uid(key, k), ln->item, ln->stack, key, ln->r0 + GAP * k, ln->t0, ln->v, 0 };
+					i64 row[8] = { _uid(key, k), ln->item, ln->stack, key, ln->r0 + GAP * k, ln->t0, ln->v, ln->open };
 					for (int q = 0; q < 8; q++) {
 						ids.append(row[q]);
 					}
@@ -1053,13 +1519,30 @@ Dictionary BeltLatticeNative::hole(i64 key, i64 at, i64 pos, bool dump) {
 					}
 				}
 			};
-			if (ln->v <= 0) {
+			double sp = 0.0;  // (close) the period of the slide it is in at the take, 0: none
+			if (close && ln->v <= 0 && ln->slide_at >= 0 && ln->slide_v > 0 && at >= ln->slide_at
+					&& (double)at < (double)ln->slide_at + (double)GAP / (double)ln->slide_v) {
+				sp = (double)GAP / (double)ln->slide_v;
+			}
+			if (ln->v <= 0 && sp <= 0.0) {
 				i64 k = (i64)std::llround((double)(pos - ln->r0) / (double)GAP);
 				if (k >= 0 && k < n) {
 					slot(k, (double)at - base);
 					ln->hole_at = std::max(ln->hole_at, at);
 					ln->hole_v = 0;
 				}
+			} else if (ln->v <= 0) {
+				// (close) Taken while it slides: slot k until the slots wrap, then the one ahead (belt_lattice.gd).
+				double ts = (double)ln->slide_at - (double)(GAP - ln->r0) / (double)GAP * sp + sp / 256.0;
+				double q = ((double)at - ts) / sp;
+				double idx = std::floor(q);
+				i64 k = (i64)std::llround(((double)pos - (double)GAP * (1.0 - (q - idx))) / (double)GAP);
+				for (i64 j = std::min(k, n - 1); j > std::max<i64>(-1, k - 2 + (i64)idx); j--) {
+					double h = j == k ? (double)at : ts + (idx + (double)(k - j)) * sp + 0.01;
+					slot(j, h - base);
+				}
+				ln->hole_at = std::max(ln->hole_at, at);
+				ln->hole_v = 0;
 			} else {
 				double period = (double)GAP / (double)ln->v;
 				double ts = (double)ln->t0 - (double)(GAP - ln->r0) / (double)GAP * period;
@@ -1103,19 +1586,35 @@ Array BeltLatticeNative::drawn_lattice(i64 kind_key, double t) {
 		double g = d[o + 7] > d[o + 3] ? clampd((t - d[o + 3]) / ((double)d[o + 7] - d[o + 3]), 0.0, 1.0) : 1.0;
 		i64 slid = 0;
 		if (d[o + 13] < 0.5f && d[o + 14] > 0.5f && d[o + 15] > 0.0f) {
-			double q = (t - d[o + 3]) / d[o + 15];
+			// (A held clock, belt_lattice.gd close and start: from texel 1 w, texel 1 y periods on, 0 on and on.)
+			double hi = d[o + 5] > 0.0f ? (double)d[o + 7] + (double)d[o + 5] * (double)d[o + 15] : INFINITY;
+			double tq = d[o + 7] > d[o + 3] ? clampd(t, (double)d[o + 7], hi) : t;
+			double q = (tq - d[o + 3]) / d[o + 15];
 			g = q - std::floor(q);
 			slid = (i64)std::floor(q);
+			// (handover) Hidden where its item is the simulation's to draw (texel 3 y: _hand_code).
+			double hy = -(double)d[o + 13];
+			if (hy > 0.5 && (hy < 2.5 ? g >= hy - 1.0 : g < hy - 3.0)) {
+				out.push_back(Variant());
+				continue;
+			}
 		}
-		Vector3 at = Vector3(d[o], d[o + 1], d[o + 2]) + Vector3(d[o + 4], d[o + 5], d[o + 6]) * (real_t)g;
+		bool on_ground = d[o + 13] < 0.5f && d[o + 14] > 0.5f;  // (a lattice slot slides on the ground: texel 1 y its held clock's run)
+		Vector3 at = Vector3(d[o], d[o + 1], d[o + 2]) + Vector3(d[o + 4], on_ground ? 0.0f : d[o + 5], d[o + 6]) * (real_t)g;
 		double c = k > 0.5 ? own_c : (double)d[o + 8];
+		i64 who = -1;
+		i64 run = 0;
 		if (d[o + 13] < 0.5f && d[o + 14] > 1.5f) {
 			// (Who the slot's item is now: belt_path.gdshaderinc's belt_lattice_turn.)
-			c = std::cos(lattice_turn(roundi(d[o + 8]) + slid, roundi(d[o + 9])) + (k > 0.5 ? PILE_TURN * (double)roundi(k) : 0.0));
+			who = roundi(d[o + 8]) + slid;
+			run = roundi(d[o + 9]);
+			c = std::cos(lattice_turn(who, run) + (k > 0.5 ? PILE_TURN * (double)roundi(k) : 0.0));
 		}
 		Array e;
 		e.push_back(at + Vector3(0.0f, (real_t)((double)d[o + 10] + lift_k), 0.0f));
 		e.push_back(c);
+		e.push_back(who);
+		e.push_back(run);
 		out.push_back(e);
 	}
 	return out;
@@ -1141,8 +1640,21 @@ void BeltLatticeNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_settle", "on"), &BeltLatticeNative::set_settle);
 	ClassDB::bind_method(D_METHOD("set_creep", "on"), &BeltLatticeNative::set_creep);
 	ClassDB::bind_method(D_METHOD("set_creep_flow", "on"), &BeltLatticeNative::set_creep_flow);
+	ClassDB::bind_method(D_METHOD("set_creep_step", "on"), &BeltLatticeNative::set_creep_step);
+	ClassDB::bind_method(D_METHOD("set_close", "on"), &BeltLatticeNative::set_close);
+	ClassDB::bind_method(D_METHOD("set_mask_inner", "on"), &BeltLatticeNative::set_mask_inner);
+	ClassDB::bind_method(D_METHOD("set_mask_own", "on"), &BeltLatticeNative::set_mask_own);
+	ClassDB::bind_method(D_METHOD("set_mask_open", "on"), &BeltLatticeNative::set_mask_open);
+	ClassDB::bind_method(D_METHOD("set_handover", "on"), &BeltLatticeNative::set_handover);
+	ClassDB::bind_method(D_METHOD("set_sim_full", "on"), &BeltLatticeNative::set_sim_full);
+	ClassDB::bind_method(D_METHOD("set_tail", "on"), &BeltLatticeNative::set_tail);
+	ClassDB::bind_method(D_METHOD("set_start", "on"), &BeltLatticeNative::set_start);
+	ClassDB::bind_method(D_METHOD("set_start_stops", "on"), &BeltLatticeNative::set_start_stops);
+	ClassDB::bind_method(D_METHOD("feed_gone", "key", "tick"), &BeltLatticeNative::feed_gone);
 	ClassDB::bind_method(D_METHOD("set_drawn_tick", "t"), &BeltLatticeNative::set_drawn_tick);
 	ClassDB::bind_method(D_METHOD("set_item_turns", "on"), &BeltLatticeNative::set_item_turns);
+	ClassDB::bind_method(D_METHOD("set_turn_id", "on"), &BeltLatticeNative::set_turn_id);
+	ClassDB::bind_method(D_METHOD("set_edge_shut", "on"), &BeltLatticeNative::set_edge_shut);
 	ClassDB::bind_method(D_METHOD("set_shown", "t"), &BeltLatticeNative::set_shown);
 	ClassDB::bind_method(D_METHOD("set_lane", "key", "meta", "arc"), &BeltLatticeNative::set_lane);
 	ClassDB::bind_method(D_METHOD("note_read", "key", "length", "items"), &BeltLatticeNative::note_read);

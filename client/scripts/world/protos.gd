@@ -29,6 +29,7 @@ var tile_names := PackedStringArray()
 var tile_is_water := PackedByteArray()
 var _water_list := -1  # the graphics list (ModGraphics.generation) tile_is_water was worked out with
 var item_names := {}  # id -> name
+var item_ids := {}  # name -> id
 var fluid_names := {}  # id -> name
 var fluid_colors := {}  # name -> Color
 var item_places := {}  # item name -> the entity it builds, when that has another name (rail); "" none
@@ -44,6 +45,7 @@ func clear() -> void:
 	entities.clear()
 	entities_by_name.clear()
 	item_names.clear()
+	item_ids.clear()
 	fluid_names.clear()
 	fluid_colors.clear()
 	item_places.clear()
@@ -123,6 +125,7 @@ func add_items(list: Array) -> void:
 	for rec in list:
 		if rec is Array and rec.size() >= 2:
 			item_names[int(rec[0])] = str(rec[1])
+			item_ids[str(rec[1])] = int(rec[0])
 			if rec.size() >= 3:
 				item_places[str(rec[1])] = str(rec[2])
 
@@ -149,6 +152,11 @@ func fluid_name(id: int) -> String:
 
 func item_name(id: int) -> String:
 	return item_names.get(id, "")
+
+
+## The id the bridge gives item `name` (`iprotos`), 0 when unknown.
+func item_id(name: String) -> int:
+	return int(item_ids.get(name, 0))
 
 
 func entity(id: int) -> EntityProto:

@@ -25,6 +25,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 import fit  # noqa: E402
+import packs  # noqa: E402
 import placement  # noqa: E402
 
 FACTORIO = fit.score.FACTORIO
@@ -134,7 +135,7 @@ def main():
     a = ap.parse_args()
     for name in a.names:
         extra = [float(x) for x in a.extra.split(",")]
-        glb = a.glb or os.path.join(REPO, "client", "assets", "models", name + ".glb")
+        glb = a.glb or packs.model_path(name)
         v0, faces = fit.load_mesh(glb, a.faces)
         js = jobs(name, a.step, a.stretch)
         if a.fit:

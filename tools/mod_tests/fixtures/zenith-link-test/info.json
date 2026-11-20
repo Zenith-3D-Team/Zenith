@@ -1,0 +1,1 @@
+{"name": "zenith-link-test", "version": "0.1.0", "title": "Zenith link test", "author": "test", "factorio_version": "2.1", "dependencies": ["base", "? factorio-3d-bridge"]}

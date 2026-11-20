@@ -67,6 +67,27 @@ const TEXTURED_FLOORS := [0.3, 0.15]
 ## Textured models: each level is drawn only once the model's longest side is at most this many
 ## pixels on screen (counted against Level of detail's pixels of error: lod_threshold 1 is High).
 const TEXTURED_PIXELS := [64.0, 32.0]
+## High-triangle textured models (FUE5's ~10k-tri buildings): allow a third level down to 7%
+## and pick switch size from triangle density (~4 sq px per triangle, capped at TEXTURED_MAX_PIXELS
+## so close-up models stay whole). --textured-lod=legacy restores fixed [64, 32] px and [0.3, 0.15].
+const TEXTURED_DENSE_TRIS := 5000
+const TEXTURED_DENSE_FLOORS := [0.3, 0.15, 0.07]
+const TEXTURED_DENSE_PIXELS := [64.0, 32.0, 16.0]
+const TEXTURED_PX_PER_TRI := 4.0
+const TEXTURED_MAX_PIXELS := 256.0
+static var textured_density_lod := not ("--textured-lod=legacy" in OS.get_cmdline_user_args())
+## Card-level view LODs for trees: drop whole leaf cards evenly across the crown and scale the
+## surviving ones about their own centres so normals and lighting stay steady without flicker.
+## Each entry is [keep every Nth card, scale factor, High pixel switch height, Med/Low pixel floor,
+## bark/core max error share of longest side].
+## --tree-lod=off keeps tree crowns whole in view as before.
+const TREE_LOD_TIERS := [
+	[2, 1.25, 190.0, 260.0, 0.08],
+	[4, 1.45, 100.0, 150.0, 0.15],
+	[8, 1.65, 55.0, 85.0, 0.25],
+]
+const TREE_MIN_CARDS := 8
+static var tree_lods := not ("--tree-lod=off" in OS.get_cmdline_user_args())
 ## The custom channel formats in a surface's format, which add_surface_from_arrays needs again.
 const CUSTOM_FORMATS := 0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE
 ## Meta on an ArrayMesh holding its surfaces' arrays on the CPU (model_library.gd keeps them):
@@ -146,6 +167,7 @@ class Job:
 	var levels_done := false
 	## A model with its own textures: its surfaces simplified with their UVs (see the header).
 	var textured := false
+	var density_lod := true
 	## A tree's crown (its surfaces in the leaf cards' shader, by index in `surfaces`; their own
 	## leaf_core flag): cast by the stand-in's second surface, which drops what pollution took
 	## (crown_arrays, shadow_stand_in_leaf.gdshader). Welded in with the wood, a bare tree cast its
@@ -153,6 +175,10 @@ class Job:
 	var crown: Dictionary = {}
 	var crown_vertices := PackedVector3Array()
 	var crown_uvs := PackedVector2Array()
+	## A tree with leaf cards: its view levels drop whole cards instead of welding them (tree_levels).
+	var tree_cards := false
+	## True once run() finished (poll uses this to dispatch run_levels even when surface_lods are all empty).
+	var proxy_done := false
 
 	func run() -> void:
 		if not proxy:
@@ -166,6 +192,7 @@ class Job:
 			else:
 				wood.append(surfaces[i])
 		if wood.is_empty():
+			proxy_done = true
 			return
 		var welded := ModelLodsMath.weld(wood)
 		vertices = welded[0]
@@ -179,15 +206,28 @@ class Job:
 		indices = simplified[0]
 		lods = simplified[1] if proxy_lods else {}
 		if not view_lods:
+			proxy_done = true
 			return
+		var total_tris := 0
 		for s in surfaces:
+			total_tris += (s[2] as PackedInt32Array).size() / 3 if s[2] != null else (s[0] as PackedVector3Array).size() / 3
+		var min_floor := float(TEXTURED_DENSE_FLOORS[-1]) if (textured and density_lod and total_tris >= TEXTURED_DENSE_TRIS) else float(TEXTURED_FLOORS[-1])
+		for i in surfaces.size():
+			var s: Array = surfaces[i]
+			if tree_cards and crown.has(i) and not bool(crown[i]):
+				surface_lods.append({})
+				continue
 			var uv: Variant = (s[4] as Array)[Mesh.ARRAY_TEX_UV] if textured and s.size() > 4 else null
-			surface_lods.append(ModelLodsMath.surface_lods(s[0], s[1], s[2], s[3], uv))
+			surface_lods.append(ModelLodsMath.surface_lods(s[0], s[1], s[2], s[3], uv, min_floor))
+		proxy_done = true
 
 	## The second step (poll queues it once the stand-in is shown, so shadows don't wait for it):
 	## the model's levels, which take longer than the rest (the coplanar checks).
 	func run_levels() -> void:
-		levels = ModelLodsMath.levels(surfaces, surface_lods, textured)
+		if tree_cards:
+			levels = ModelLodsMath.tree_levels(surfaces, surface_lods, crown)
+		else:
+			levels = ModelLodsMath.levels(surfaces, surface_lods, textured, density_lod)
 		levels_done = true
 
 	## How much of a leaf card's square its shadow covers: the round spray leaf_cut casts
@@ -329,12 +369,12 @@ class ModelLodsMath:
 	## Only those that keep the surface's shape (Parts.kept_by) are kept. `rows`: a merged surface's
 	## material row per vertex (weld). `uv`: a textured surface's UVs, simplified with them
 	## (textured_lods).
-	static func surface_lods(src: PackedVector3Array, src_normals, src_idx, rows: Variant = null, uv: Variant = null) -> Dictionary:
+	static func surface_lods(src: PackedVector3Array, src_normals, src_idx, rows: Variant = null, uv: Variant = null, min_floor := -1.0) -> Dictionary:
 		var triangles := (src_idx as PackedInt32Array).size() / 3 if src_idx != null else src.size() / 3
 		if triangles < MIN_TRIANGLES:
 			return {}
 		if uv is PackedVector2Array and (uv as PackedVector2Array).size() == src.size():
-			return textured_lods(src, src_normals, src_idx, uv, rows)
+			return textured_lods(src, src_normals, src_idx, uv, rows, min_floor)
 		var welded := weld([[src, src_normals, src_idx]], rows)
 		var verts: PackedVector3Array = welded[0]
 		var remap: PackedInt32Array = welded[2]
@@ -378,7 +418,7 @@ class ModelLodsMath:
 	## simplified corner is one of the surface's vertices, its UV with it. Material rows are kept
 	## apart the same way: each row's UVs are moved apart for the merging only. LODs under the last of
 	## TEXTURED_FLOORS, or that lose a part or the silhouette (Parts), are left out.
-	static func textured_lods(src: PackedVector3Array, src_normals, src_idx, uv: PackedVector2Array, rows: Variant = null) -> Dictionary:
+	static func textured_lods(src: PackedVector3Array, src_normals, src_idx, uv: PackedVector2Array, rows: Variant = null, min_floor := -1.0) -> Dictionary:
 		var idx: PackedInt32Array = src_idx if src_idx != null else PackedInt32Array(range(src.size()))
 		var normals: PackedVector3Array
 		if src_normals is PackedVector3Array and (src_normals as PackedVector3Array).size() == src.size():
@@ -402,7 +442,8 @@ class ModelLodsMath:
 		var welded := weld([[src, src_normals, idx]])
 		var remap: PackedInt32Array = welded[2]
 		var parts := Parts.new(welded[0], welded[1])
-		var least := int(idx.size() * float(TEXTURED_FLOORS[-1]))
+		var floor_share := min_floor if min_floor > 0.0 else float(TEXTURED_FLOORS[-1])
+		var least := int(idx.size() * floor_share)
 		var out := {}
 		for l in im.get_surface_lod_count(0):
 			if out.size() >= MAX_LODS:
@@ -425,7 +466,7 @@ class ModelLodsMath:
 	## before, and is dropped if that doesn't clear them or leaves too little saved. A textured
 	## model's levels keep TEXTURED_FLOORS of its triangles.
 	## [[error, [arrays per surface, compacted], tiles a pixel may be at most (0: any)], ...], finest first.
-	static func levels(surfaces: Array, per_surface: Array, textured := false) -> Array:
+	static func levels(surfaces: Array, per_surface: Array, textured := false, density_lod := true) -> Array:
 		var sizes: Array = []
 		for lods: Dictionary in per_surface:
 			for size in lods:
@@ -449,12 +490,15 @@ class ModelLodsMath:
 		# with it, a little more or less: what counts is overlap the level adds beyond that.
 		var base_fight := base * (1.0 + COPLANAR_SHARE)
 		var own_fights := {}  # surface -> the overlap of its own faces in the model (textured only)
+		var dense_tex := textured and density_lod and (full_count / 3) >= TEXTURED_DENSE_TRIS
+		var tex_floors: Array = TEXTURED_DENSE_FLOORS if dense_tex else TEXTURED_FLOORS
+		var tex_pixels: Array = TEXTURED_DENSE_PIXELS if dense_tex else TEXTURED_PIXELS
 		var out: Array = []
 		var previous: Array = full.duplicate()
 		var previous_count := full_count
 		var last_error := 0.0
 		for error: float in sizes:
-			if out.size() >= (TEXTURED_FLOORS.size() if textured else MAX_LEVELS):
+			if out.size() >= (tex_floors.size() if textured else MAX_LEVELS):
 				break
 			if last_error > 0.0 and error < last_error * LEVEL_STEP:
 				continue
@@ -480,9 +524,14 @@ class ModelLodsMath:
 			var pixel := 0.0
 			if textured:
 				# Coarser errors only take more away: the first under its floor ends the levels.
-				if _count(chosen) < full_count * float(TEXTURED_FLOORS[out.size()]):
+				if _count(chosen) < full_count * float(tex_floors[out.size()]):
 					break
-				pixel = longest / float(TEXTURED_PIXELS[out.size()])
+				var base_px := float(tex_pixels[out.size()])
+				var target_px := base_px
+				if dense_tex:
+					var density_px := sqrt((float(previous_count) / 3.0) * TEXTURED_PX_PER_TRI)
+					target_px = clampf(maxf(base_px, density_px), base_px, TEXTURED_MAX_PIXELS)
+				pixel = longest / target_px
 			var arrays: Array = []
 			for i in surfaces.size():
 				arrays.append(compact(surfaces[i][4], chosen[i]))
@@ -673,9 +722,14 @@ class ModelLodsMath:
 			out_idx[k] = new_of[v]
 		var out := []
 		out.resize(Mesh.ARRAY_MAX)
+		_copy_attributes(arrays, count, used, out)
+		out[Mesh.ARRAY_INDEX] = out_idx
+		return out
+
+	static func _copy_attributes(arrays: Array, count: int, used: PackedInt32Array, out: Array) -> void:
 		for a in Mesh.ARRAY_MAX:
 			var src: Variant = arrays[a]
-			if a == Mesh.ARRAY_INDEX or src == null:
+			if a == Mesh.ARRAY_INDEX or out[a] != null or src == null:
 				continue
 			var n: int = src.size()
 			if count == 0 or n == 0 or n % count != 0:
@@ -689,6 +743,189 @@ class ModelLodsMath:
 				for s in stride:
 					dst[j * stride + s] = src[from + s]
 			out[a] = dst
+
+	## Card-level view LODs for trees (ModelLods.TREE_LOD_TIERS): keep every Nth whole card
+	## sorted round horizontal layers of the crown and scale surviving cards about their own
+	## centres so lighting stays steady while triangle count drops across distance bands.
+	static func tree_levels(surfaces: Array, per_surface: Array, crown: Dictionary) -> Array:
+		var lo := Vector3(INF, INF, INF)
+		var hi := -lo
+		for s: Array in surfaces:
+			for p: Vector3 in (s[0] as PackedVector3Array):
+				lo = lo.min(p)
+				hi = hi.max(p)
+		if lo.x > hi.x:
+			return []
+		var longest := maxf((hi - lo)[(hi - lo).max_axis_index()], 0.0)
+		if longest <= 0.0:
+			return []
+		var parsed := {}
+		var base_cards := 0
+		for i in surfaces.size():
+			if crown.has(i) and not bool(crown[i]):
+				var p := _parse_cards(surfaces[i])
+				parsed[i] = p
+				base_cards += (p[0] as Array).size()
+		if base_cards < TREE_MIN_CARDS * 2:
+			return []
+		var prev_cards := base_cards
+		var out: Array = []
+		for tier: Array in TREE_LOD_TIERS:
+			var step := int(tier[0])
+			var scale := float(tier[1])
+			var error := longest / float(tier[2])
+			var pixel := longest / float(tier[3])
+			var part_err := longest * float(tier[4])
+			var picks := {}
+			var kept_total := 0
+			for i in parsed:
+				var cards: Array = (parsed[i] as Array)[0]
+				var kept := _pick_cards(cards, step)
+				picks[i] = kept
+				kept_total += kept.size()
+			if kept_total >= prev_cards:
+				continue
+			var arrays: Array = []
+			for i in surfaces.size():
+				var s: Array = surfaces[i]
+				if parsed.has(i):
+					var p: Array = parsed[i]
+					var non_card: PackedInt32Array = p[1]
+					var core_lods: Dictionary = p[2]
+					var core_idx := non_card if core_lods.is_empty() else _coarsest_within(core_lods, non_card, part_err)
+					arrays.append(_build_card_surface(s[4] as Array, picks[i] as Array, scale, core_idx))
+				else:
+					var full := _indices_of(s)
+					var slods: Dictionary = per_surface[i] if i < per_surface.size() else {}
+					var chosen := full if slods.is_empty() else _coarsest_within(slods, full, part_err)
+					arrays.append(compact(s[4] as Array, chosen))
+			out.append([error, arrays, pixel])
+			prev_cards = kept_total
+		return out
+
+	static func _coarsest_within(lods: Dictionary, fallback: PackedInt32Array, max_err: float) -> PackedInt32Array:
+		var chosen := fallback
+		var best := -1.0
+		for size in lods:
+			var sz := float(size)
+			if sz <= max_err and sz > best:
+				best = sz
+				chosen = lods[size]
+		return chosen
+
+	static func _parse_cards(s: Array) -> Array:
+		var arrays: Array = s[4]
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var n := verts.size()
+		var uvs := PackedVector2Array()
+		var uv_src: Variant = arrays[Mesh.ARRAY_TEX_UV]
+		if uv_src is PackedVector2Array:
+			uvs = uv_src
+		var index := _indices_of(s)
+		var groups := {}
+		var non_card := PackedInt32Array()
+		for t in range(0, index.size() - 2, 3):
+			var i0 := index[t]
+			var i1 := index[t + 1]
+			var i2 := index[t + 2]
+			if uvs.size() == n and uvs[i0].x < -0.5:
+				non_card.append_array([i0, i1, i2])
+				continue
+			var p0 := verts[i0]
+			var p1 := verts[i1]
+			var p2 := verts[i2]
+			var mid := (p0 + p1 + p2) / 3.0
+			if uvs.size() == n:
+				var uv0 := uvs[i0]
+				var d1 := uvs[i1] - uv0
+				var d2 := uvs[i2] - uv0
+				var det := d1.x * d2.y - d1.y * d2.x
+				if absf(det) > 1e-8:
+					var ax := ((p1 - p0) * d2.y - (p2 - p0) * d1.y) / det
+					var ay := ((p2 - p0) * d1.x - (p1 - p0) * d2.x) / det
+					mid = p0 - ax * (uv0.x - 0.5) - ay * (uv0.y - 0.5)
+			var key := Vector3i((mid * 200.0).round())
+			if not groups.has(key):
+				groups[key] = [mid, 1, [i0, i1, i2]]
+			else:
+				var g: Array = groups[key]
+				g[0] = (g[0] as Vector3) + mid
+				g[1] = int(g[1]) + 1
+				(g[2] as Array).append_array([i0, i1, i2])
+		var ymin := INF
+		for key in groups:
+			var g: Array = groups[key]
+			var c := (g[0] as Vector3) / float(g[1])
+			g[0] = c
+			ymin = minf(ymin, c.y)
+		var cards: Array = []
+		for key in groups:
+			var g: Array = groups[key]
+			var c: Vector3 = g[0]
+			cards.append([c, PackedInt32Array(g[2] as Array), int(floor((c.y - ymin) / 0.6)), atan2(c.z, c.x)])
+		cards.sort_custom(_card_less)
+		var core_lods := surface_lods(verts, s[1], non_card, s[3]) if non_card.size() / 3 >= MIN_TRIANGLES else {}
+		return [cards, non_card, core_lods]
+
+	static func _card_less(a: Array, b: Array) -> bool:
+		var la := int(a[2])
+		var lb := int(b[2])
+		if la != lb:
+			return la < lb
+		var aa := float(a[3])
+		var ab := float(b[3])
+		if aa != ab:
+			return aa < ab
+		var ca: Vector3 = a[0]
+		var cb: Vector3 = b[0]
+		if ca.y != cb.y:
+			return ca.y < cb.y
+		if ca.x != cb.x:
+			return ca.x < cb.x
+		return ca.z < cb.z
+
+	static func _pick_cards(cards: Array, step: int) -> Array:
+		if cards.size() <= TREE_MIN_CARDS or step <= 1:
+			return cards
+		var kept: Array = []
+		for k in cards.size():
+			if k % step == 0:
+				kept.append(cards[k])
+		if kept.size() >= TREE_MIN_CARDS:
+			return kept
+		kept = []
+		for j in TREE_MIN_CARDS:
+			kept.append(cards[int(j * cards.size() / TREE_MIN_CARDS)])
+		return kept
+
+	static func _build_card_surface(arrays: Array, kept: Array, scale: float, core_idx: PackedInt32Array) -> Array:
+		var src_verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var count := src_verts.size()
+		var used := PackedInt32Array()
+		var out_pos := PackedVector3Array()
+		var out_idx := PackedInt32Array()
+		for card: Array in kept:
+			var center: Vector3 = card[0]
+			var tri_idx: PackedInt32Array = card[1]
+			var local_map := {}
+			for orig in tri_idx:
+				if not local_map.has(orig):
+					local_map[orig] = used.size()
+					used.append(orig)
+					out_pos.append(center + (src_verts[orig] - center) * scale)
+				out_idx.append(int(local_map[orig]))
+		if not core_idx.is_empty():
+			var core_map := {}
+			for orig in core_idx:
+				if not core_map.has(orig):
+					core_map[orig] = used.size()
+					used.append(orig)
+					out_pos.append(src_verts[orig])
+				out_idx.append(int(core_map[orig]))
+		var out := []
+		out.resize(Mesh.ARRAY_MAX)
+		out[Mesh.ARRAY_VERTEX] = out_pos
+		_copy_attributes(arrays, count, used, out)
 		out[Mesh.ARRAY_INDEX] = out_idx
 		return out
 
@@ -983,18 +1220,21 @@ static func _job_for(mesh: ArrayMesh) -> Job:
 	var job := Job.new()
 	job.view_lods = view_lods
 	job.textured = textured(mesh)
+	job.density_lod = textured_density_lod
 	var triangles := 0
 	for i in mesh.get_surface_count():
 		var sm := mesh.surface_get_material(i) as ShaderMaterial
 		var rig = sm.get_shader_parameter("rig_mode") if sm != null else null
 		if rig != null and int(rig) != 0:
 			return null
-		# A tree's crown is many separate leaf cards, which simplifying merges into other shapes, so
-		# each LOD switch as the camera moved relit whole crowns (flicker). Trees keep their own
-		# mesh in view; their shadow stand-in still simplifies.
+		# A tree's crown is many separate leaf cards: keep whole cards in view LODs (decimating
+		# cards instead of welding them, which relit crowns as shapes merged) while simplifying
+		# bark and cores cleanly; --tree-lod=off keeps crowns whole at every distance.
 		if sm != null and _has_cards(sm):
-			job.view_lods = false
+			job.tree_cards = true
 			job.proxy_lods = false
+			if not tree_lods:
+				job.view_lods = false
 		if sm != null and sm.shader == LeafShader:
 			job.crown[job.surfaces.size()] = sm.get_shader_parameter("leaf_core") == true
 		if mesh.surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
@@ -1069,7 +1309,7 @@ static func poll() -> bool:
 		elif job.levels_done:
 			_make_levels(entry[3] as ArrayMesh, job.levels)
 			kind += "+levels"
-		elif job.surface_lods.any(func(l: Dictionary) -> bool: return not l.is_empty()):
+		elif (job.tree_cards and job.view_lods) or job.surface_lods.any(func(l: Dictionary) -> bool: return not l.is_empty()):
 			_queue.append([job, null, entry[3]])
 			kind += "+queued"
 		var ms := (Time.get_ticks_usec() - tf) / 1000.0
@@ -1079,7 +1319,7 @@ static func poll() -> bool:
 	while _running.size() < JOBS and not _queue.is_empty():
 		var next: Array = _queue.pop_front()
 		var queued: Job = next[0]
-		var step := queued.run if queued.surface_lods.is_empty() or not queued.proxy else queued.run_levels
+		var step := queued.run_levels if queued.proxy_done and queued.proxy else queued.run
 		_running.append([WorkerThreadPool.add_task(step, false, "model lods"), next[0], next[1], next[2]])
 	if done:
 		generation += 1

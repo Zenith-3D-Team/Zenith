@@ -15,6 +15,7 @@ const Paths := preload("res://scripts/menu/paths.gd")
 const Rcon := preload("res://scripts/menu/rcon.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const MapGen := preload("res://scripts/menu/map_gen.gd")
+const ModChoices := preload("res://scripts/menu/mod_choices.gd")
 
 ## Above the ports the docs use (34197/34198/34200 for run-server.ps1, 34400s for a second game);
 ## Settings → Factorio → First port for servers changes it.
@@ -51,6 +52,9 @@ var data_dir := ""
 var player_mods := true
 var port_base := 0
 var server_settings_extra := {}
+## The last start's mods from the Mods window added to the save's, and those left out with why.
+var added_mods: Array = []
+var left_out_mods: Array = []
 
 
 func is_running() -> bool:
@@ -73,6 +77,8 @@ func _data_dir() -> String:
 func create_map(path: String, settings: Variant, seed_text: String, exchange := "") -> bool:
 	if not _prepare():
 		return false
+	if player_mods:
+		write_new_game_mods()
 	progress.emit("Creating map…", 0.05)
 	DirAccess.make_dir_recursive_absolute(path.get_base_dir())
 	var args := _common() + ["--create", _native(path)] + _map_args(settings, seed_text, exchange, "create")
@@ -103,6 +109,8 @@ func create_map(path: String, settings: Variant, seed_text: String, exchange := 
 func generate_preview(settings: Variant, seed_text: String, exchange := "", planet := "nauvis", size := 512) -> Image:
 	if not _prepare():
 		return null
+	if player_mods:
+		write_new_game_mods()
 	var out := _data.path_join("map-presets/preview.png")
 	DirAccess.make_dir_recursive_absolute(out.get_base_dir())
 	if FileAccess.file_exists(out):
@@ -155,8 +163,9 @@ func _map_args(settings: Variant, seed_text: String, exchange: String, tag: Stri
 ## Starts the server on a save. Returns once it is hosting (or false with `error`); the bridge
 ## then connects to `udp_port`. `host` ({name, description, port, password, max_players, lan})
 ## opens the game to normal Factorio players on the network (Multiplayer → Host); without it the
-## server only listens on this computer.
-func start(path: String, host := {}) -> bool:
+## server only listens on this computer. The save runs with its own mods and those turned on in the
+## Mods window; `exact_mods` (Load game's Sync mods with save) with exactly the save's.
+func start(path: String, host := {}, exact_mods := false) -> bool:
 	if is_running():
 		await stop(true)
 	if not _prepare():
@@ -165,9 +174,11 @@ func start(path: String, host := {}) -> bool:
 		error = "The save %s doesn't exist." % path
 		return false
 	save_path = path
+	added_mods = []
+	left_out_mods = []
 	if player_mods:
 		progress.emit("Matching the save's mods…", 0.2)
-		if not await _sync_mods(path):
+		if not await _sync_mods(path, exact_mods):
 			return false
 	var base := int(Settings.get_value("factorio", "port_base"))
 	if base < 1024:
@@ -216,6 +227,8 @@ func start(path: String, host := {}) -> bool:
 		if not is_running():
 			pid = -1
 			error = "The server stopped while starting.\n" + _log_errors(started)
+			if not added_mods.is_empty():
+				error += "\nIt was loading %s from the Mods window too: load the save with Sync mods with save ticked to leave them out." % ", ".join(added_mods)
 			return false
 		if Time.get_ticks_msec() - started_msec > START_TIMEOUT_MSEC:
 			error = "The server didn't start within %d s.\n%s" % [START_TIMEOUT_MSEC / 1000, _log_errors(started)]
@@ -427,28 +440,22 @@ func _prepare() -> bool:
 	return true
 
 
-## A save made with mods loads with them: the player's own mods (their Factorio's mods folder) are
-## linked into the server's mods folder (hard links and junctions, so nothing is copied), the mod
-## list starts from everything off, and Factorio's `--sync-mods` turns on exactly the save's mods at
-## the save's versions; then the bridge is turned on again. False with `error` when the save needs a
-## mod that isn't there (Factorio's own list of what is missing).
-func _sync_mods(save: String) -> bool:
+## A save loads with its mods, as Factorio's Sync mods with save makes them: the player's own mods
+## (their Factorio's mods folder) are linked into the server's mods folder (hard links and junctions,
+## so nothing is copied), the mod list starts from everything off, and Factorio's `--sync-mods` turns
+## on exactly the save's mods at the save's versions; then the mods turned on in the Mods window are
+## added (add_chosen_mods), unless `exact` (Load game's Sync mods with save, or --load-mods=save), and
+## the bridge is turned on again. False with `error` when the save needs a mod that isn't there
+## (Factorio's own list of what is missing).
+func _sync_mods(save: String, exact := false) -> bool:
 	var mods := _data.path_join("mods")
 	var own := Paths.factorio_mods_dir()
 	if own != "":
 		_link_mods(own, mods)
-	var names := {}
-	for f in DirAccess.get_files_at(mods) + DirAccess.get_directories_at(mods):
-		if f == "mod-list.json" or f == "mod-settings.dat":
-			continue
-		names[_mod_name(f)] = true
-	var listed: Array = [{"name": "base", "enabled": true}]
-	for n in ["space-age", "quality", "elevated-rails"]:
-		listed.append({"name": n, "enabled": false})
-	for n in names:
-		if n != "base":
-			listed.append({"name": n, "enabled": false})
-	_write(mods.path_join("mod-list.json"), JSON.stringify({"mods": listed}, " "))
+	var off := {}
+	for n in ["space-age", "quality", "elevated-rails"] + _folder_mods(mods):
+		off[n] = false
+	_write_mod_list(mods.path_join("mod-list.json"), off)
 	var args := _common() + ["--sync-mods", _native(save)]
 	var out: Array = []
 	var task := WorkerThreadPool.add_task(func() -> void: OS.execute(_exe, args, out, true), false, "sync mods")
@@ -466,8 +473,86 @@ func _sync_mods(save: String) -> bool:
 		error = "The save's mods couldn't be set up for the server.%s\nPut the mods it needs in your Factorio mods folder (%s), or start it in Factorio once to download them." % [
 			listed_why, own if own != "" else "none found"]
 		return false
+	if not exact and Settings.arg_value("--load-mods=") != "save":
+		add_chosen_mods(mods.path_join("mod-list.json"))
+	print("menu: %s runs with its own mods%s%s" % [save.get_file(),
+		(", and from the Mods window " + ", ".join(added_mods)) if not added_mods.is_empty() else (" only" if exact else ""),
+		("; left out: " + "; ".join(left_out_mods)) if not left_out_mods.is_empty() else ""])
 	_enable_bridge(mods.path_join("mod-list.json"))
 	return true
+
+
+## After `--sync-mods`: the mods turned on in the Mods window (mod_choices.gd) that the save hasn't,
+## turned on in the list at the folder's highest version, with what they need; one that would stop
+## the server (a clash, a missing dependency, Wube's DLC, which follow the save) is left out and
+## named (`added_mods`, `left_out_mods`).
+func add_chosen_mods(list_path: String) -> void:
+	var data = JSON.parse_string(FileAccess.get_file_as_string(list_path))
+	if not (data is Dictionary and data.get("mods") is Array):
+		return
+	var running := {}
+	for m in data["mods"]:
+		if m is Dictionary and bool(m.get("enabled", true)):
+			running[str(m.get("name", ""))] = str(m.get("version", ""))
+	var wanted := ModChoices.added(ModChoices.states(_data))
+	if wanted.all(func(n: String) -> bool: return running.has(n)):
+		return
+	var result := ModChoices.add_to(running, wanted, list_path.get_base_dir())
+	added_mods = result["added"]
+	left_out_mods = result["left_out"]
+	for n in added_mods:
+		var found := false
+		for m in data["mods"]:
+			if m is Dictionary and str(m.get("name", "")) == n:
+				m["enabled"] = true
+				m.erase("version")
+				found = true
+		if not found:
+			(data["mods"] as Array).append({"name": n, "enabled": true})
+	_write(list_path, JSON.stringify(data, " "))
+
+
+## A new game's mods (create_map, the map preview): Wube's and the others as the Mods window has
+## them (mod_choices.gd), with what the chosen ones need; every mod in the folder listed, so a mod
+## not chosen stays off (Factorio turns on a mod a list leaves out).
+func write_new_game_mods() -> void:
+	var mods := _data.path_join("mods")
+	var choices := ModChoices.states(_data)
+	var running := {"base": ""}
+	var states := {}
+	for n in ModChoices.GAME:
+		states[n] = ModChoices.is_on(n, choices)
+		if states[n]:
+			running[n] = ""
+	for n in _folder_mods(mods):
+		states[n] = false
+	var result := ModChoices.add_to(running, ModChoices.added(choices), mods)
+	for n in result["added"]:
+		states[n] = true
+	if not (result["left_out"] as Array).is_empty():
+		print("menu: a new game leaves out " + "; ".join(result["left_out"]))
+	_write_mod_list(mods.path_join("mod-list.json"), states)
+	_enable_bridge(mods.path_join("mod-list.json"))
+
+
+## The names of the mods in a mods folder (zips and folders, not the lists).
+static func _folder_mods(mods: String) -> Array:
+	var names := {}
+	for f in DirAccess.get_files_at(mods) + DirAccess.get_directories_at(mods):
+		if f == "mod-list.json" or f == "mod-settings.dat":
+			continue
+		names[_mod_name(f)] = true
+	names.erase("base")
+	return names.keys()
+
+
+## mod-list.json with base on and `states` (name -> on).
+static func _write_mod_list(list_path: String, states: Dictionary) -> void:
+	var listed: Array = [{"name": "base", "enabled": true}]
+	for n in states:
+		if n != "base":
+			listed.append({"name": n, "enabled": bool(states[n])})
+	_write(list_path, JSON.stringify({"mods": listed}, " "))
 
 
 ## The mods `--sync-mods` went to download: a save's mod missing from the mods folder, or there at

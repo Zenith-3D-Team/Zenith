@@ -24,6 +24,13 @@
 -- of a building by the character (session.lua: take, put, move, xfer, fast, drop) have the buildings in
 -- its reach read again 2 and 20 ticks after (a burner takes its fuel on its next update). `status_near`
 -- (perf.lua) off: those kinds from the pass alone, as before.
+--
+-- Pipelines over Factorio's extent limit (L11, `pipeline`, pipelines.lua): one entity a fluid segment whose
+-- status is pipeline_overextended. The pass reads pipes, pipes to ground and storage tanks too (a quarter of
+-- a machine's cost each); a pipe-type entity or pump built, removed or turned on the focus surface has the
+-- pipelines round it read the tick after (storage.f3d.al_pspots), what they find kept in storage.f3d.al_pipe,
+-- and `al` goes at once when that changes. Every listed entity is read again as `al` is made, so a pipeline a
+-- pump has split goes then. `pipe_alerts` (perf.lua) off: none.
 
 local transport = require("scripts.transport")
 local world = require("scripts.world")
@@ -33,6 +40,7 @@ local perf = require("scripts.perf")
 local rate = require("scripts.rate")
 local registry = require("scripts.registry")
 local fluids_power = require("scripts.fluids_power")
+local pipelines = require("scripts.pipelines")
 
 local M = {}
 
@@ -60,7 +68,7 @@ local NOT_DESTROYED_ALERT = { ["entity-ghost"] = true, ["tile-ghost"] = true, ["
 
 local scans = {}       -- kind -> {entries}, refreshed by the scans
 -- entry -> the entity it is about, for the scans' entries: a pass is seconds old by the time it is
--- sent, and an entity mined or destroyed since is left out (icons over empty ground).
+-- sent, and an entity mined or destroyed since is left out (owner's G19: icons over empty ground).
 -- Weak keys: entries go with the scan results that hold them.
 local subjects = setmetatable({}, { __mode = "k" })
 local status_names
@@ -140,7 +148,7 @@ end
 ---------------------------------------------------------------------------------------------
 -- Events (called from combat.lua, which owns on_entity_damaged and on_entity_died)
 
--- A big attack on a big base remembers at most this many of each (a fixed cap, so
+-- A big attack on a big base remembers at most this many of each (the cloud session's cap, so
 -- storage can't grow without bound between expiries).
 local MAX_REMEMBERED = 500
 
@@ -201,7 +209,9 @@ end
 local STATUS_KINDS = { no_power = "no_power", not_plugged_in_electric_network = "unplugged", no_fuel = "no_fuel",
   full_output = "output_full", full_burnt_result_output = "output_full", no_minable_resources = "depleted" }
 local PASS_KINDS = { "no_ammo", "unplugged", "no_fuel", "output_full", "launch", "collector",
-  "no_material", "no_robots", "depleted" }
+  "no_material", "no_robots", "depleted", "pipeline" }
+-- A pipe-type entity's share of the pass's per-tick budget (a base has many, and most need one status read).
+local PIPE_COST = 0.25
 
 local function networks_at(e)
   local ok, nets = pcall(function() return e.surface.find_logistic_networks_by_construction_area(e.position, e.force) end)
@@ -261,7 +271,7 @@ local function check_entity(e, found)
 end
 
 -- The entity scans go through every surface chunk by chunk, a few each tick (a busy base has
--- tens of thousands of entities: one scan of them all took 145 ms in a large real save, 10456
+-- tens of thousands of entities: one scan of them all took 145 ms in the owner's save, 10456
 -- chunks), and replace the last results when a pass is complete.
 local pass
 
@@ -271,15 +281,16 @@ local next_pass = 0
 -- the owner's ticks went on them). A chunk the pass found none in is looked in again only every
 -- EMPTY_EVERY'th pass, or once something is built, mined or changed there (tracker.listeners); a pass
 -- passing over one counts it as EMPTY_COST of a chunk. And the pass steps once a tick, not once per
--- client (its results only feed `al`, so module-local is fine). empty: "si,cx,cy" -> true.
+-- client (its results only feed `al`, so module-local is fine), waiting PASS_INTERVAL after a pass
+-- finishes so a big base doesn't run passes back-to-back. empty: si -> { cx * 65536 + cy -> true }.
 local EMPTY_EVERY = 10
 local EMPTY_COST = 0.25
 local empty = {}
 local passes = 0
 local stepped_at = -1
 
-local function chunk_of(si, x, y)
-  return si .. "," .. math.floor(x / 32) .. "," .. math.floor(y / 32)
+local function chunk_key(cx, cy)
+  return cx * 65536 + cy
 end
 
 ---------------------------------------------------------------------------------------------
@@ -422,10 +433,19 @@ tracker.listeners[#tracker.listeners + 1] = function(entity)
     return
   end
   local p = entity.position
-  if next(empty) then
-    empty[chunk_of(entity.surface.index, p.x, p.y)] = nil
+  local es = empty[entity.surface.index]
+  if es then
+    es[chunk_key(math.floor(p.x / 32), math.floor(p.y / 32))] = nil
   end
   local near = storage.f3d.al_near
+  if near and near.si == entity.surface.index and perf.on("pipe_alerts")
+      and (pipelines.SET[entity.type] or entity.type == "pump" or entity.type == "offshore-pump") then
+    local s = storage.f3d
+    s.al_pspots = s.al_pspots or {}
+    if #s.al_pspots < SPOTS_MAX then
+      s.al_pspots[#s.al_pspots + 1] = { x = p.x, y = p.y, t = game.tick }
+    end
+  end
   local kind = near and near.si == entity.surface.index and is_spot_type(entity.type)
   if kind == "status" then
     if perf.on("status_near") then
@@ -540,6 +560,92 @@ local function look_at_spots()
   end
 end
 
+-- Pipe spots (L11): the pipelines round a pipe-type entity or pump built, removed or turned are read the tick
+-- after (2.1 joins or splits the segments then), at most SPOTS_PER_TICK spots a tick; an overextended
+-- segment's entity (pipelines.spot) goes into storage.f3d.al_pipe, unit -> entity, and those listed that a
+-- change has mended come out.
+local PIPE_SPOT_REACH = 1.5
+
+local function look_at_pipe_spots()
+  local s = storage.f3d
+  local spots, near = s.al_pspots, s.al_near
+  if not spots then
+    return
+  end
+  local surface = near and game.get_surface(near.si)
+  if not (surface and surface.valid and perf.on("pipe_alerts")) then
+    s.al_pspots = nil
+    return
+  end
+  local types = pipelines.types()
+  local f = force()
+  local done, changed = 0, false
+  local rest = {}
+  s.al_pipe = s.al_pipe or {}
+  local segs = {}
+  for _, spot in ipairs(spots) do
+    if done < SPOTS_PER_TICK and spot.t < game.tick then
+      done = done + 1
+      local d = PIPE_SPOT_REACH
+      local found = #types > 0 and surface.find_entities_filtered({ area = { { spot.x - d, spot.y - d }, { spot.x + d, spot.y + d } },
+        type = types, force = f }) or {}
+      for _, e in pairs(found) do
+        if pipelines.overextended(e) then
+          local seg = pipelines.segment(e)
+          if seg and not segs[seg] then
+            segs[seg] = true
+            local w = pipelines.spot(e)
+            if w.unit_number and s.al_pipe[w.unit_number] == nil then
+              s.al_pipe[w.unit_number] = w
+              changed = true
+            end
+          end
+        end
+      end
+    else
+      rest[#rest + 1] = spot
+    end
+  end
+  if done == 0 then
+    return
+  end
+  for unit, e in pairs(s.al_pipe) do
+    if not (e.valid and pipelines.overextended(e)) then
+      s.al_pipe[unit] = nil
+      changed = true
+    end
+  end
+  s.al_pspots = #rest > 0 and rest or nil
+  if changed then
+    s.al_dirty = true
+  end
+end
+
+-- The overextended pipelines: the pass's and the spots' entities still overextended, one a segment.
+local function pipeline_list()
+  if not perf.on("pipe_alerts") then
+    return {}
+  end
+  local out, segs = {}, {}
+  local function add(e, rec)
+    if e and e.valid and pipelines.overextended(e) then
+      local seg = pipelines.segment(e)
+      if seg and not segs[seg] then
+        segs[seg] = true
+        out[#out + 1] = rec or entry(e, "pipeline_overextended")
+      end
+    end
+  end
+  local s = storage.f3d
+  for _, e in pairs(s.al_pipe or {}) do
+    add(e)
+  end
+  for _, rec in ipairs(scans.pipeline or {}) do
+    add(subjects[rec], rec)
+  end
+  return out
+end
+
 local function start_pass()
   passes = passes + 1
   next_pass = game.tick + PASS_INTERVAL * rate.factor("al")
@@ -551,7 +657,13 @@ local function start_pass()
   for _, k in ipairs(PASS_KINDS) do
     found[k] = {}
   end
-  pass = { surfaces = list, i = 1, iter = nil, found = found, seen = {}, types = types(PASS_TYPES), ghosts = 0 }
+  local pass_types = types(PASS_TYPES)
+  if perf.on("pipe_alerts") then
+    for _, t in ipairs(pipelines.types()) do
+      pass_types[#pass_types + 1] = t
+    end
+  end
+  pass = { surfaces = list, i = 1, iter = nil, found = found, seen = {}, types = pass_types, ghosts = 0, segs = {} }
 end
 
 local function step_pass(now)
@@ -572,6 +684,9 @@ local function step_pass(now)
         scans[k] = v
       end
       pass = nil
+      if quiet then
+        next_pass = game.tick + PASS_INTERVAL * rate.factor("al")
+      end
       return
     end
     local surface = game.get_surface(si)
@@ -580,22 +695,40 @@ local function step_pass(now)
       pass.iter = pass.iter or surface.get_chunks()
       chunk = pass.iter()
     end
-    local ckey = quiet and chunk and (si .. "," .. chunk.x .. "," .. chunk.y)
+    local es = quiet and empty[si]
+    local ckey = quiet and chunk and chunk_key(chunk.x, chunk.y)
     if not chunk then
       pass.i, pass.iter = pass.i + 1, nil
-    elseif ckey and empty[ckey] and not recheck then
+    elseif ckey and es and es[ckey] and not recheck then
       chunks = chunks + EMPTY_COST
     else
       chunks = chunks + 1
       local found = surface.find_entities_filtered({ area = chunk.area, force = f, type = pass.types })
       if ckey then
-        empty[ckey] = #found == 0 or nil
+        if #found == 0 then
+          if not es then
+            es = {}
+            empty[si] = es
+          end
+          es[ckey] = true
+        elseif es then
+          es[ckey] = nil
+        end
       end
       for _, e in pairs(found) do
         local key = e.unit_number or key_of(e)
         if not pass.seen[key] then
           pass.seen[key] = true
-          if e.type == "entity-ghost" then
+          if pipelines.SET[e.type] then
+            cost = cost + PIPE_COST
+            if pipelines.overextended(e) then
+              local seg = pipelines.segment(e)
+              if seg and not pass.segs[seg] then
+                pass.segs[seg] = true
+                table.insert(pass.found.pipeline, entry(pipelines.spot(e), "pipeline_overextended"))
+              end
+            end
+          elseif e.type == "entity-ghost" then
             pass.ghosts = pass.ghosts + 1
             if pass.ghosts <= GHOSTS_MAX then
               cost = cost + check_entity(e, pass.found)
@@ -707,7 +840,7 @@ local SCANS = { scan_repair, scan_trains, scan_platforms }
 
 -- The order of Factorio's alert bar, then the machine warnings.
 local ORDER = { "destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "train_fuel", "train_path",
-  "platform_path", "platform_storage", "collector", "launch", "unplugged", "no_fuel", "output_full", "depleted" }
+  "platform_path", "platform_storage", "collector", "launch", "pipeline", "unplugged", "no_fuel", "output_full", "depleted" }
 
 local function from_events(al, kind)
   local list = {}
@@ -755,6 +888,8 @@ local function message()
     local list
     if LIFETIME[kind] then
       list = from_events(al, kind)
+    elseif kind == "pipeline" then
+      list = pipeline_list()
     elseif NEAR[kind] then
       list = near_list(kind)
     else
@@ -812,6 +947,11 @@ function M.tick()
     storage.f3d.al_spots = nil
     log("[factorio-3d-bridge] alert spots: " .. tostring(err))
   end
+  ok, err = pcall(look_at_pipe_spots)
+  if not ok then
+    storage.f3d.al_pspots = nil
+    log("[factorio-3d-bridge] alert pipe spots: " .. tostring(err))
+  end
   -- Its own phase: the bridge's periodic jobs all fell on the same tick once a second (budget.lua);
   -- sooner when the warned machines round the focus changed.
   local s = storage.f3d
@@ -842,6 +982,7 @@ function M.reset()
   local s = storage.f3d
   if s then
     s.al_near, s.al_spots, s.al_dirty, s.al_sent_at = nil, nil, nil, nil
+    s.al_pipe, s.al_pspots = nil, nil
   end
 end
 
@@ -853,8 +994,10 @@ end
 -- How many chunks the pass takes as empty (tests).
 function M.empty_chunks()
   local n = 0
-  for _ in pairs(empty) do
-    n = n + 1
+  for _, es in pairs(empty) do
+    for _ in pairs(es) do
+      n = n + 1
+    end
   end
   return n
 end

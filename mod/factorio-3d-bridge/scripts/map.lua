@@ -177,7 +177,7 @@ end
 -- kept current by tracker.listeners (built and removed radars; M.tick drops removed ones every
 -- RADAR_PRUNE_TICKS, never the reads, which a module-local cache times). The scan starts again now and then (RADAR_RESCAN_TICKS) for radars made
 -- without an event. The same scan finds the cargo landing pads (reg.pads), which the map view
--- centres on when it switches to a planet.
+-- centres on when it switches to a planet (H23).
 local SCANNED = { "radar", "cargo-landing-pad" }
 local RADAR_REGION = 4 * CHUNK
 local RADAR_REGION_PRICE = 32       -- units for one square (16 chunks; ~0.4 ms on a busy base)
@@ -325,7 +325,7 @@ function M.radar_queue()
 end
 budget.register_queue("radars", M.radar_queue)
 
--- Roboports reveal too (; Factorio's own don't): a chunk counts as seen when its centre
+-- Roboports reveal too (owner's H13; Factorio's own don't): a chunk counts as seen when its centre
 -- lies in a roboport's construction area, the larger of its two and where its robots reach, so a
 -- network shows whole. Mobile cells (a character's or a spidertron's personal roboport) don't count.
 -- Read from the game (a few API calls), so it is the same on every peer.
@@ -1303,7 +1303,7 @@ function M.trains(cmd)
   end
 end
 
--- The map's logistic networks layer: Factorio's map draws every roboport's logistic and
+-- The map's logistic networks layer (H13): Factorio's map draws every roboport's logistic and
 -- construction area on the surface, not only the ones in the charts the client happened to load,
 -- and the client counts the ground in their construction areas as seen (roboport_sees).
 -- {si?, q}: the client asks every few seconds while a map or the remote view needs them, and gets
@@ -1422,7 +1422,7 @@ function M.roboport_queue()
 end
 budget.register_queue("roboports", M.roboport_queue)
 
--- {si, q}: where the map view centres on switching to a planet, the force's cargo landing pad
+-- {si, q}: where the map view centres on switching to a planet (H23), the force's cargo landing pad
 -- there (the lowest unit number if there are several): `lpad` {si, q, x?, y?} (1/256 tile), without
 -- x, y when the surface has none. The pads come from the radars' scan of that surface (started now
 -- if it hasn't been), so the answer waits until a pad is found or the scan is done (at most

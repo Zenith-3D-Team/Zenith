@@ -121,6 +121,10 @@ const FLAT := {
 	"tech_band_available": [Color8(77, 71, 48), Color8(40, 35, 20), 0, 2],
 	"tech_band_researched": [Color8(40, 80, 40), Color8(20, 45, 20), 0, 2],
 	"tech_band_unavailable": [Color8(80, 40, 40), Color8(45, 20, 20), 0, 2],
+	"tech_conditional": [Color8(165, 105, 30), Color8(45, 30, 15), 2, 3],
+	"tech_conditional_hover": [Color8(215, 150, 70), Color8(45, 30, 15), 2, 3],
+	"tech_conditional_selected": [Color8(255, 190, 110), Color8(45, 30, 15), 2, 3],
+	"tech_band_conditional": [Color8(95, 60, 20), Color8(45, 30, 15), 0, 2],
 	"confirm": [Color8(94, 182, 99), Color8(30, 60, 30), 1, 3],
 	"confirm_hover": [Color8(135, 216, 139), Color8(30, 60, 30), 1, 3],
 	"confirm_pressed": [Color8(70, 150, 75), Color8(30, 60, 30), 1, 3],
@@ -201,6 +205,14 @@ static var _styles := {}  # name -> StyleBox
 static var _theme: Theme = null
 static var _fallback_fonts := {}
 static var _swatches := {}  # item -> ImageTexture, for items without an icon
+## icon_into()'s reads on worker threads: name -> [task id, [its load_any_uncached() answer]].
+static var _icon_jobs := {}
+## TextureRects waiting for icon_into()'s icon: [weakref, name].
+static var _icon_waiting: Array = []
+## `--icons-later=off`: icon_into() reads an icon that isn't cached yet at once, on the main thread, as
+## the hover panel always did (13-15 ms frames as the camera swept new kinds under a still cursor).
+static var icons_later := not OS.get_cmdline_user_args().has("--icons-later=off")
+const ICON_META := &"kit_icon"
 
 
 static func configure(window_height: float) -> void:
@@ -291,8 +303,9 @@ static func _tab_base(x: int) -> Dictionary:
 		"l": [x, 25, 8, 1], "c": [x + 8, 25, 1, 1], "r": [x + 9, 25, 8, 1]}}
 
 
-## Atlas rows of the technology slot images (style.lua: available_, researched_, unavailable_technology_slot).
-const TECH_ROWS := {"tech_available": 136, "tech_researched": 187, "tech_unavailable": 170}
+## Atlas rows of the technology slot images (style.lua: available_, researched_, unavailable_ and
+## conditionally_available_technology_slot).
+const TECH_ROWS := {"tech_available": 136, "tech_researched": 187, "tech_unavailable": 170, "tech_conditional": 153}
 
 
 ## arrow_idle_index, arrow_disabled_index, arrow_hovered_index, arrow_clicked_index.
@@ -490,15 +503,17 @@ static func _layers(name: String) -> Array:
 			return [_base(64, 584)]
 		"queue_slot_pressed":
 			return [_base(80, 584)]
-		# technology_slot styles: available (yellow), researched (green), unavailable (red); hovered
-		# is the next image right, highlighted (selected) the one after.
-		"tech_available", "tech_researched", "tech_unavailable":
+		# technology_slot styles: available (yellow), researched (green), unavailable (red),
+		# conditionally available (orange); hovered is the next image right, highlighted (selected) the
+		# one after. (Factorio's orange hovered band is the yellow one's, x 364 on row 136; only the
+		# default bands are drawn here.)
+		"tech_available", "tech_researched", "tech_unavailable", "tech_conditional":
 			return [_glow(SHADOW_COLOR), _base(296, TECH_ROWS[name])]
-		"tech_available_hover", "tech_researched_hover", "tech_unavailable_hover":
+		"tech_available_hover", "tech_researched_hover", "tech_unavailable_hover", "tech_conditional_hover":
 			return [_glow(SHADOW_COLOR), _base(312, TECH_ROWS[name.trim_suffix("_hover")])]
-		"tech_available_selected", "tech_researched_selected", "tech_unavailable_selected":
+		"tech_available_selected", "tech_researched_selected", "tech_unavailable_selected", "tech_conditional_selected":
 			return [_glow(SHADOW_COLOR), _base(330, TECH_ROWS[name.trim_suffix("_selected")])]
-		"tech_band_available", "tech_band_researched", "tech_band_unavailable":  # *_ingredients_background
+		"tech_band_available", "tech_band_researched", "tech_band_unavailable", "tech_band_conditional":  # *_ingredients_background
 			return [_base(347, TECH_ROWS["tech_" + name.trim_prefix("tech_band_")])]
 		# confirm_button (green, arrow right), back_button (grey, arrow left), red_back_button.
 		"confirm", "confirm_disabled", "confirm_hover", "confirm_pressed":
@@ -772,7 +787,7 @@ static func theme() -> Theme:
 	t.set_stylebox("hover_pressed", "FQueueSlot", style("queue_slot_pressed"))
 	t.set_stylebox("focus", "FQueueSlot", StyleBoxEmpty.new())
 	# Technology slots: toggled is Factorio's highlighted (selected) look.
-	for state in ["available", "researched", "unavailable"]:
+	for state in ["available", "researched", "unavailable", "conditional"]:
 		var type_name: String = "FTech" + str(state).capitalize()
 		_variation(t, type_name, "Button")
 		t.set_stylebox("normal", type_name, style("tech_" + state))
@@ -1108,6 +1123,48 @@ static func item_icon(item: String) -> Texture2D:
 		image.fill(ItemIcons.color_for(item))
 		_swatches[item] = ImageTexture.create_from_image(image)
 	return _swatches[item]
+
+
+## item_icon(name) on `rect`: at once when it is in the caches, else no icon until a worker thread has
+## read it and poll_icons() puts it there (a frame or a few later), so a panel built in a hurry (the
+## hover panel as the camera moves) never waits for a file to be read or an icon to be composed.
+static func icon_into(rect: TextureRect, name: String) -> void:
+	rect.set_meta(ICON_META, name)
+	if not icons_later or ItemIcons.any_ready(name):
+		rect.texture = item_icon(name)
+		return
+	rect.texture = null
+	_icon_waiting.append([weakref(rect), name])
+	if not _icon_jobs.has(name):
+		ItemIcons.prepare_for_threads()
+		var holder := [null]
+		var read := func() -> void: holder[0] = ItemIcons.load_any_uncached(name)
+		_icon_jobs[name] = [WorkerThreadPool.add_task(read, false, "ui icon"), holder]
+
+
+## Gives icon_into()'s waiting icons the ones read since; called every frame by whoever uses it (cheap
+## when nothing waits). A rect given another icon since keeps that one.
+static func poll_icons() -> void:
+	if _icon_waiting.is_empty() and _icon_jobs.is_empty():
+		return
+	for name: String in _icon_jobs.keys():
+		var job: Array = _icon_jobs[name]
+		if not WorkerThreadPool.is_task_completed(job[0]):
+			continue
+		WorkerThreadPool.wait_for_task_completion(job[0])
+		_icon_jobs.erase(name)
+		if job[1][0] is Array:
+			ItemIcons.store_any(name, job[1][0])
+	var still: Array = []
+	for w: Array in _icon_waiting:
+		var rect = w[0].get_ref()
+		if rect == null or str(rect.get_meta(ICON_META, "")) != str(w[1]):
+			continue
+		if _icon_jobs.has(w[1]):
+			still.append(w)
+			continue
+		rect.texture = item_icon(str(w[1]))
+	_icon_waiting = still
 
 
 ## Display names from the player's Factorio locale files (locale_names.gd), "iron-gear-wheel" ->

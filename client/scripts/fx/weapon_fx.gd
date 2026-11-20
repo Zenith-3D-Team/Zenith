@@ -22,8 +22,10 @@ const SpriteFx := preload("res://scripts/fx/sprite_fx.gd")
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const Avatar := preload("res://scripts/player/avatar.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
-const WorldMirror := preload("res://scripts/world/world.gd")
-const CapsuleAim := preload("res://scripts/player/capsule_aim.gd")
+## world.gd and capsule_aim.gd are read when used, not preloaded: they name the Bridge autoload, which
+## a script run on its own (the Model packs window's preview's test, model_preview_test.gd) lacks.
+const WORLD_SCRIPT := "res://scripts/world/world.gd"
+const CAPSULE_AIM_SCRIPT := "res://scripts/player/capsule_aim.gd"
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const DATA_PATH := "res://data/weapon_fx.json"
@@ -115,13 +117,13 @@ var sprites: SpriteFx
 var sfx: Node  # sfx.gd
 var avatar: Avatar
 var movers: MoverLayer
-var world: WorldMirror
+var world: Node  # world.gd
 ## Where the character aims (tiles) while it shoots at a point, so its stream lands there, and
 ## whether it is firing a stream gun (the flamethrower); set by fx.gd.
 var aim = null
 var hand_stream := false
 ## On a space platform: no scorch marks or burnt patches (Factorio only makes them where they can
-## be placed).
+## be placed, and the owner saw them drawn on empty space, #16).
 var in_space := false
 
 var data := {}
@@ -343,7 +345,7 @@ func explode(name: String, at: Vector3, dir := Vector3.ZERO) -> void:
 		var now := Time.get_ticks_msec()
 		if now - int(_sounds.get(file, -1000)) > 60:
 			_sounds[file] = now
-			sfx.play_at(file, at, float(pick[1]), 0.05, 1.0, "Explosions")
+			sfx.play_at(file, at, float(pick[1]), 0.05, 1.0, "Explosions", "explosion/" + name)
 
 
 ## An explosion Factorio stretches along a line (railgun-beam): its sprite laid end to end.
@@ -525,8 +527,10 @@ func _new_flyer(name: String, at: Vector2) -> Flyer:
 		return null
 	if avatar != null:
 		f.near_shooter = Vector2(avatar.position.x, avatar.position.z).distance_to(at) < NEAR_SHOOTER
-	if f.near_shooter and f.kind == 3 and Time.get_ticks_msec() - CapsuleAim.last_msec < 2000:
-		f.landing = at.distance_to(CapsuleAim.last_target)
+	if f.near_shooter and f.kind == 3:
+		var capsule_aim: GDScript = load(CAPSULE_AIM_SCRIPT)
+		if Time.get_ticks_msec() - int(capsule_aim.get("last_msec")) < 2000:
+			f.landing = at.distance_to(capsule_aim.get("last_target"))
 	for layer: Array in layers:
 		var pool := _pool(layer, true, false, 256, 0.0, 0.0)
 		if pool == "":
@@ -656,15 +660,16 @@ func _stream_shooter(at: Vector2) -> Variant:
 	# Only the chunks the 4-tile search reaches: this went through every entity in the world,
 	# for each stream four times a second, and a spitter's acid (no building shoots it) never
 	# stopped looking: 15-50 ms a frame in a 300-enemy attack on a 16,000-entity map.
-	var lo := WorldMirror.chunk_of(at - Vector2(best_d, best_d))
-	var hi := WorldMirror.chunk_of(at + Vector2(best_d, best_d))
+	var world_script: GDScript = load(WORLD_SCRIPT)
+	var lo: Vector2i = world_script.chunk_of(at - Vector2(best_d, best_d))
+	var hi: Vector2i = world_script.chunk_of(at + Vector2(best_d, best_d))
 	for cy in range(lo.y, hi.y + 1):
 		for cx in range(lo.x, hi.x + 1):
 			var cv = world.chunks.get(Vector2i(cx, cy))
 			if cv == null:
 				continue
-			for r: WorldMirror.Rec in cv.entities.values():
-				var d := r.pos.distance_to(at)
+			for r in cv.entities.values():
+				var d: float = r.pos.distance_to(at)
 				if d < best_d:
 					var proto = world.protos.entity(r.proto_id)
 					if proto != null and proto.type in STREAM_SHOOTERS:

@@ -89,8 +89,9 @@ vec4 sky_clouds(vec3 from, vec3 dir, float night, float jitter) {
 	// At dusk the sky is lit from one side: away from the sun clouds stay dim.
 	float toward = clamp(0.5 + 0.5 * dot(normalize(dir.xz + vec2(1e-5)), normalize(look_sun_dir.xz + vec2(1e-5))), 0.0, 1.0);
 	vec3 lit = lit_color * mix(0.06, 1.35 - 0.9 * look_twilight, mix(1.0 - night, sun_on, step(0.001, look_twilight)))
-		* mix(1.0, mix(0.3, 1.0, toward * toward), look_twilight);
-	vec3 shade = mix(mix(vec3(0.46, 0.53, 0.64), look_ambient_color * 0.3, look_twilight), vec3(0.03, 0.04, 0.07), night);
+		* mix(1.0, mix(0.3, 1.0, toward * toward), look_twilight) * look_scene_light.y;
+	vec3 shade = mix(mix(vec3(0.46, 0.53, 0.64), look_ambient_color * 0.3, look_twilight), vec3(0.03, 0.04, 0.07), night)
+		* look_scene_light.x;
 	// Looking towards a low sun, its light rims them.
 	float rim = pow(max(dot(dir, normalize(look_sun_dir)), 0.0), 6.0) * look_twilight;
 	vec3 col = vec3(0.0);

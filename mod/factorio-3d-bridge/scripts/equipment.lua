@@ -156,12 +156,15 @@ local function send_info(c, s)
     hp = round(mhp),
     hpb = round(number(get(c, "character_health_bonus")) + number(get(f, "character_health_bonus"))),
     robots = round(number(get(c, "character_maximum_following_robot_count_bonus")) + number(get(f, "maximum_following_robot_count"))),
+    -- Whether the force may mine with fluid (the "Uranium mining" research's effect): a drill with a fluid input over
+    -- uranium ore is refused until then, as the build cursor shows it.
+    mwf = get(f, "mining_with_fluid") and 1 or 0,
   }
   local main = c.get_main_inventory()
   info.slots = main and #main or 0
   local parts = {}
   for _, k in ipairs({ "craft", "mine", "run", "speed", "eqmv", "reach", "build", "rreach", "pick", "loot", "drop",
-      "invb", "eqinv", "trash", "hp", "hpb", "robots", "slots" }) do
+      "invb", "eqinv", "trash", "hp", "hpb", "robots", "slots", "mwf" }) do
     parts[#parts + 1] = info[k]
   end
   local sig = table.concat(parts, ",")

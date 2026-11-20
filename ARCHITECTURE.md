@@ -119,16 +119,20 @@ sequenceDiagram
   `MultiMeshInstance3D` per mesh per chunk (never a node per belt); movers, belt items, inserter
   arms, ground items, fluids and power, wires, ghosts each have their own layer. Chunks are asked
   for a few at a time, nearest first, and built within a per-frame allowance.
-- **Models**: `client/assets/models/<prototype>.glb`, made by the Blender scripts in
-  `tools/models/` (or converted from Wube's printable models). Each part carries a colour sampled
-  from Factorio's sprite when the model is built (`tools/models/part_colors.py`; only the numbers
-  are stored), and one shader adds weathering (`shaders/factorio_material`); projecting the
-  sprite itself from the player's install is a setting. A model may also bring its own textures
-  (`model_textures.gd`): 39 entities are drawn with FUE5's textured models
-  (`client/assets/models/fue5/`, looked in before ours; CC BY-NC-SA, see CREDITS.md). Models are
-  read and merged on worker threads (`model_library.gd`), so a model's first appearance doesn't
-  stall a frame. Each model is flattened into one mesh for instanced drawing. Nothing of Wube's art
-  is in the repository; graphics, sounds and fonts are read from the player's Factorio.
+- **Models**: every model comes from a model pack (`model_packs.gd`), the higher pack in one order
+  winning where two have a model of one name. Three are built in,
+  `client/assets/models/packs/<pack>/<prototype>.glb`: Placeholders, made by the Blender scripts in
+  `tools/models/` (always last, so every entity keeps a model), Wube3DP, converted from Wube's
+  printable models, and FUE5's textured models (CC BY-NC-SA, see CREDITS.md). The `models` folder
+  beside Zenith adds more (loose files, folders, zips), on top; the Model packs window orders them and
+  takes any model family from a pack of the player's choice, and a building window's Model button one
+  building. Each of our parts carries a colour sampled from Factorio's sprite when the model is built
+  (`tools/models/part_colors.py`; only the numbers are stored), and one shader adds weathering
+  (`shaders/factorio_material`). A model may also bring its own textures (`model_textures.gd`), as
+  FUE5's do. Models are read and merged on worker threads (`model_library.gd`), so a model's first
+  appearance doesn't stall a frame. Each model is flattened into one mesh for instanced drawing.
+  Nothing of Wube's art is in the repository; graphics, sounds and fonts are read from the player's
+  Factorio.
 - **Motion on the GPU.** Machines' moving parts (`anim_*` nodes: spinning, sliding, rocking, lit,
   glowing) are moved by the model shader from each instance's state, which `anim.gd` writes only
   when a machine starts or stops, so every loaded chunk animates at no script cost; turret heads,
@@ -186,6 +190,7 @@ flowchart LR
 |---|---|---|
 | `tools/mod_tests/test_bridge.py` | the real mod in Lua 5.2 (lupa) against `fake_factorio.lua`, a strict fake API where unknown keys throw | Python, lupa |
 | `tools/mod_tests/test_fuzz.py` | the mod under malformed, huge and out-of-order packets | Python, lupa |
+| `tools/mod_tests/test_binary.py` | binary frames (`bin`): the movers as JSON and as binary decode the same; `bs` parts and their text twins from the same ranges; chunk snapshots, `st` and `ih` (wire version 3) and their JSON twins; wire versions 1 to 3 (`test_bridge.py --binary` runs every bridge check over binary frames) | Python, lupa |
 | `tools/test_mock_server.py`, `test_mock_fuzz.py` | the mock over real UDP, and fuzzed | Python |
 | gdparse over `client/` | every GDScript file parses | gdtoolkit |
 | `client/tests/ui_test.tscn`, `bridge_fuzz_test.tscn` | the UI's input paths with synthetic input; the client's packet parsing fuzzed | Godot |

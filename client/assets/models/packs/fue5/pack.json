@@ -1,0 +1,10 @@
+{
+	"name": "FUE5 (Adapted)",
+	"short_name": "FUE5",
+	"author": "Hurricane and Nuke (FUE5), converted by Zenith's tools/models/fue5.py",
+	"licence": "CC BY-NC-SA 3.0",
+	"credit": "FUE5 (Hurricane and Nuke) · CC BY-NC-SA 3.0 · adapted",
+	"description": "Textured models from FUE5, a fan remake of Factorio in Unreal Engine 5: machines, chests, poles, combinators, trains, the rocket silo and more. Not for commercial use, and shared only under the same licence; README.md says what was changed.",
+	"icon": "locomotive",
+	"icon_image": "logo.png"
+}

@@ -5,7 +5,9 @@ extends PanelContainer
 ## its ammo drawn green. Clicking a gun with nothing held uses it (Tab cycles); other clicks go to
 ## factorio_ui.gd like the inventory's slots (`slot_clicked`: put the held gun, ammo or armour in,
 ## take it out). From the mod's `guns` (or the `slots` of the guns and ammo inventories when it
-## sends them).
+## sends them). In a car, tank or spidertron (`guns` with `v`, N3) it shows the vehicle's guns over
+## their ammo instead, one column a gun (a spidertron's four), as Factorio's tool bar does; a click
+## on a gun uses it, one on an ammo slot with a stack held puts it in the vehicle (`vammo`).
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
@@ -14,7 +16,7 @@ const UiModel := preload("res://scripts/ui/factorio/ui_model.gd")
 const TipButton := preload("res://scripts/ui/factorio/tip_button.gd")
 const Controls := preload("res://scripts/player/controls.gd")
 
-## A slot was clicked: role "guns", "ammo" or "armor", 1-based index.
+## A slot was clicked: role "guns", "ammo", "armor" or "vammo" (the vehicle's ammo), 1-based index.
 signal slot_clicked(role: String, index: int, button_index: int, shift: bool, ctrl: bool)
 ## The character button was clicked.
 signal open_requested
@@ -30,6 +32,9 @@ var _guns: Array[Slot] = []
 var _ammo: Array[Slot] = []
 var _armor: Slot
 var _health := ProgressBar.new()
+var _grid: GridContainer
+## The vehicle whose guns the slots show (0: the character's).
+var shown_vehicle := 0
 
 
 func _ready() -> void:
@@ -85,36 +90,51 @@ func _ready() -> void:
 	_armor.clicked.connect(on_armour)
 	armour_row.add_child(_armor)
 
-	var grid := Kit.slot_grid(GUN_SLOTS)
-	row.add_child(grid)
-	for i in GUN_SLOTS:
+	_grid = Kit.slot_grid(GUN_SLOTS)
+	row.add_child(_grid)
+	_build_slots(GUN_SLOTS)
+	model.guns_changed.connect(refresh)
+	model.inventory_changed.connect(refresh)
+	refresh()
+
+
+## `n` gun slots over their ammo slots (3 for the character, a vehicle's gun count while driving).
+func _build_slots(n: int) -> void:
+	for c in _grid.get_children():
+		_grid.remove_child(c)
+		c.queue_free()
+	_guns.clear()
+	_ammo.clear()
+	_grid.columns = n
+	for i in n:
 		var s := Slot.new()
 		s.theme_type_variation = "FToolSlot"
 		s.toggle_mode = true
 		s.empty_icon = GuiAssets.core_sprite("icons/mip/empty-gun-slot.png")
 		var pick := func(button_index: int, shift: bool) -> void:
-			if button_index == MOUSE_BUTTON_LEFT and s.item != "" and not holding.call():
+			if model.guns_vehicle != 0:
+				# A vehicle's guns stay in it: a click only uses one.
+				if button_index == MOUSE_BUTTON_LEFT and s.item != "":
+					model.select_gun(i + 1)
+			elif button_index == MOUSE_BUTTON_LEFT and s.item != "" and not holding.call():
 				model.select_gun(i + 1)
 			else:
 				slot_clicked.emit("guns", i + 1, button_index, shift, Input.is_key_pressed(KEY_CTRL))
 			refresh.call_deferred()  # the mod's `guns` decides what is selected
 		s.clicked.connect(pick)
-		grid.add_child(s)
+		_grid.add_child(s)
 		_guns.append(s)
-	for i in GUN_SLOTS:
+	for i in n:
 		var s := Slot.new()
 		s.theme_type_variation = "FToolSlot"
 		s.toggle_mode = true
 		s.empty_icon = GuiAssets.core_sprite("icons/mip/empty-ammo-slot.png")
 		var put := func(button_index: int, shift: bool) -> void:
-			slot_clicked.emit("ammo", i + 1, button_index, shift, Input.is_key_pressed(KEY_CTRL))
+			slot_clicked.emit("vammo" if model.guns_vehicle != 0 else "ammo", i + 1, button_index, shift, Input.is_key_pressed(KEY_CTRL))
 			refresh.call_deferred()
 		s.clicked.connect(put)
-		grid.add_child(s)
+		_grid.add_child(s)
 		_ammo.append(s)
-	model.guns_changed.connect(refresh)
-	model.inventory_changed.connect(refresh)
-	refresh()
 
 
 ## The character's health, shown as the bar beside the armour slot.
@@ -124,14 +144,19 @@ func set_health(hp: float, max_hp: float) -> void:
 
 
 func refresh() -> void:
-	var guns := model.slots_of("guns")
-	var ammo := model.slots_of("ammo")
+	var vehicle := model.guns_vehicle
+	var guns := model.gun_slots("guns") if vehicle != 0 else model.slots_of("guns")
+	var ammo := model.gun_slots("ammo") if vehicle != 0 else model.slots_of("ammo")
+	var n := maxi(1, model.guns.size()) if vehicle != 0 else GUN_SLOTS
+	if n != _guns.size():
+		_build_slots(n)
+	shown_vehicle = vehicle
 	var armour := model.slots_of("armor")
 	var a0: Dictionary = armour[0] if armour.size() > 0 else {}
 	_armor.set_stack(str(a0.get("item", "")), -1)
 	_armor.set_tip(Kit.pretty(str(a0["item"])) if not a0.is_empty() else "Armour slot",
 		[] if not a0.is_empty() else [["Empty", "", Kit.DISABLED_TEXT]])
-	for i in GUN_SLOTS:
+	for i in n:
 		var g: Dictionary = guns[i] if i < guns.size() else {}
 		var a: Dictionary = ammo[i] if i < ammo.size() else {}
 		var selected := i + 1 == model.selected_gun and not g.is_empty()

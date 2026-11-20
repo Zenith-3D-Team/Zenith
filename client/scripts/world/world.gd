@@ -5,9 +5,12 @@ extends Node3D
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const ChunkView := preload("res://scripts/world/chunk_view.gd")
 const Anim := preload("res://scripts/world/anim.gd")
+const WireDecode := preload("res://scripts/net/wire_decode.gd")
+const MessageDecode := preload("res://scripts/net/message_decode.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const VisualTurns := preload("res://scripts/world/visual_turns.gd")
+const BuildingModels := preload("res://scripts/world/building_models.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const TerrainMesher := preload("res://scripts/world/terrain_mesher.gd")
 const TerrainTextures := preload("res://scripts/world/terrain_textures.gd")
@@ -17,6 +20,7 @@ const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const BeltBlur := preload("res://scripts/world/belt_blur.gd")
 const BehindCull := preload("res://scripts/world/behind_cull.gd")
 const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
+const PipeCovers := preload("res://scripts/world/pipe_covers.gd")
 
 const CHUNK := 32
 const SUBSCRIBE_REFRESH := 5.0  # resend the subscription now and then in case it was lost
@@ -123,6 +127,11 @@ class Rec:
 	## Where a line of belts begins and ends (_connect_belt). Not in `extra`: belt_paths.gd reads belts'
 	## `extra` on belt_items.gd's worker, and a Dictionary mustn't be written while it is read.
 	var belt_ends := 0
+	## Its fluid connections with nothing connected (_cover, pipe_covers.gd): a bit per connection, by its
+	## index in the prototype's `eprops` fb. Not in `extra`, as belt_ends.
+	var covers := 0
+	## The connections it draws (PipeCovers.ports), which `covers` picks from.
+	var cover_ports: Array = []
 
 
 var protos := ProtoDB.new()
@@ -146,6 +155,11 @@ var _pipes := {}  # Vector2i tile -> key of the pipe or pipe-to-ground on it
 var _belts := {}  # Vector2i tile -> key of what carries items on it, while a modeller's belt ends are in use
 var _belt_ends_on := -1  # whether there are models of belt ends (-1: not looked yet)
 var _walls := {}  # Vector2i tile -> key of the wall or gate on it
+## Pipe covers (_cover): proto id -> its fluid connections (`eprops` fb, fluid_ports_from); the tile each
+## connection of a record (not a pipe) is on -> its key, and the tile it leads onto -> [keys].
+var _fluid_ports := {}
+var _port_tiles := {}
+var _port_targets := {}
 var _cargo := {}  # key of a hub, cargo bay or landing pad -> Rect2i of its tiles
 var _cargo_tiles := {}  # Vector2i tile -> how many of them cover it
 var _cargo_ghosts := {}  # the same for ghosts of them: ghost bays join each other, built ones don't
@@ -171,7 +185,8 @@ var lamp_always := {}
 var alt_contents := {}
 var _alt_contents_g := 0
 ## Alt-mode's machine icons (`am`, K1, K2): unit -> [modules, packs], each [[item, quality], ...]
-## (quality "" for normal): the modules in a machine and the science packs in a lab, in slot order.
+## (quality "" for normal): the modules in a machine and the science packs in a lab, in slot order;
+## where the packs go, an ammo turret's ammo and a locomotive's fuel (a mover's unit, no record here).
 ## Kept as alt_contents is, for the current turning on of Alt-mode only; alt_overlay.gd lays them out
 ## by the prototype's `eprops` isq.
 var alt_machines := {}
@@ -322,6 +337,9 @@ func reset(keep_protos := false, next_surface := -1) -> void:
 	_cargo_left.clear()
 	_remnants.clear()
 	working.clear()
+	_st_lists.clear()  # the old world's states that waited
+	_st_at = 0
+	_st_i = 0
 	lamp_colors.clear()
 	lamp_always.clear()
 	alt_contents.clear()  # the bridge sends every chest again with the new world
@@ -396,8 +414,11 @@ func handle(msg: Dictionary) -> void:
 			var cv: ChunkView = chunks.get(Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0))))
 			if cv != null:
 				cv.got_part(int(msg.get("part", 1)))
-			for rec in _array(msg.get("e")):
-				_add(rec)
+			if WireDecode.packed(msg.get("e")):
+				_add_packed(msg)
+			else:
+				for rec in _array(msg.get("e")):
+					_add(rec)
 		"add", "upd":
 			var e = msg.get("e")
 			if e is Array and e.size() >= 4:
@@ -412,6 +433,7 @@ func handle(msg: Dictionary) -> void:
 			var key = unit
 			if unit > 0:
 				VisualTurns.forget(Bridge.save_id, unit)  # mined or destroyed: a look-only turn goes too (I9)
+				BuildingModels.forget(Bridge.save_id, unit)  # and a model of its own (M8)
 			else:
 				key = static_key(int(msg.get("p", 0)), int(msg.get("x", 0)), int(msg.get("y", 0)))
 			var gone: Rec = entities.get(key)
@@ -420,13 +442,14 @@ func handle(msg: Dictionary) -> void:
 			elif unit <= 0:
 				_touch(chunk_of(Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0))
 			_remove(key)
+			_unlink_pipes(gone)
 			_mined_early.erase(key)
 		"tiles":
 			_on_tiles(_array(msg.get("l")))
 		"kept":
 			_on_kept(msg)
 		"st":
-			_on_states(_array(msg.get("l")), _array(msg.get("lc")), _array(msg.get("ao")))
+			_on_states(_list(msg.get("l")), _list(msg.get("lc")), _list(msg.get("ao")))
 		"aiu":
 			_on_alt_icons(_array(msg.get("l")))
 			_on_alt_fluids(_array(msg.get("fa")))
@@ -449,6 +472,7 @@ func mined(msg: Dictionary) -> void:
 		return
 	_touch(gone.chunk)
 	_remove(key)
+	_unlink_pipes(gone)
 	_mined_early[key] = Time.get_ticks_msec()
 
 
@@ -459,7 +483,7 @@ func _keep_chunk(msg: Dictionary) -> void:
 	var c := Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0)))
 	var k := Vector3i(int(msg["rs"]), c.x, c.y)
 	_cache_drop(k)
-	var bytes := 256 + _array(msg.get("tiles")).size() * 16
+	var bytes: int = 256 + int(_list(msg.get("tiles")).size()) * 16
 	_cache[k] = {"rv": int(msg["rv"]), "n": int(msg.get("n", 0)), "msgs": [msg], "dec": [], "msec": Time.get_ticks_msec(),
 		"b": bytes, "db": 0}
 	_cache_bytes += bytes
@@ -533,7 +557,7 @@ func _keep_part(msg: Dictionary, list: String) -> void:
 		entry["db"] = 0
 	(entry[list] as Array).append(msg)
 	var field := "b" if list == "msgs" else "db"
-	var bytes := 128 + (_array(msg.get("e")).size() * 120 if list == "msgs" else _array(msg.get("l")).size() * 16)
+	var bytes := 128 + (WireDecode.ents_count(msg) * 120 if list == "msgs" else _array(msg.get("l")).size() * 16)
 	entry[field] = int(entry[field]) + bytes
 	_cache_bytes += bytes
 	_trim_cache()
@@ -651,8 +675,10 @@ func _on_chunk(msg: Dictionary) -> void:
 	else:
 		if msg.has("rv") and msg.has("rs"):
 			_live[c] = [int(msg["rs"]), int(msg["rv"]), int(msg.get("n", 0))]
-		var rle := _array(msg.get("tiles"))
+		var rle: Variant = _list(msg.get("tiles"))
 		var ids: Variant = msg.get("_tiles")  # decoded on the bridge's parsing thread (message_decode.gd)
+		if not (ids is PackedInt32Array) and WireDecode.packed(rle):
+			ids = MessageDecode.tiles_from_runs(rle)  # (--decode-thread=off: a binary frame's runs here)
 		if ids is PackedInt32Array and (ids as PackedInt32Array).size() == CHUNK * CHUNK:
 			cv.set_tiles(ids)
 		else:
@@ -691,14 +717,38 @@ func _claim_turn(a) -> void:
 func _add(a) -> void:
 	if not (a is Array) or a.size() < 5:
 		return
+	_add_fields(int(a[0]), int(a[1]), int(a[2]), int(a[3]), int(a[4]), a[5] if a.size() > 5 else null)
+
+
+## A binary `ents` part (wire_decode.gd): its records read straight from the packed block, WireDecode.ENT_STRIDE
+## numbers each, the extras of those listed in `xi` (ascending) from `xe`.
+func _add_packed(msg: Dictionary) -> void:
+	var list: Variant = msg["e"]
+	var xi: Variant = msg.get("xi", PackedInt32Array())
+	var xe: Variant = msg.get("xe", [])
+	if not (xe is Array) or not WireDecode.packed(xi):
+		xi = PackedInt32Array()
+	var nx: int = mini(xi.size(), (xe as Array).size()) if xe is Array else 0
+	var stride := WireDecode.ENT_STRIDE
+	var x := 0
+	for i in range(0, list.size() / stride):
+		var a := i * stride
+		var extra: Variant = null
+		if x < nx and int(xi[x]) == i:
+			extra = xe[x]
+			x += 1
+		_add_fields(int(list[a]), int(list[a + 1]), int(list[a + 2]), int(list[a + 3]), int(list[a + 4]), extra)
+
+
+func _add_fields(unit: int, proto_id: int, fx: int, fy: int, dir: int, extra: Variant) -> void:
 	var r := Rec.new()
-	r.unit = int(a[0])
-	r.proto_id = int(a[1])
-	r.fixed = Vector2i(int(a[2]), int(a[3]))
+	r.unit = unit
+	r.proto_id = proto_id
+	r.fixed = Vector2i(fx, fy)
 	r.pos = Vector2(r.fixed) / 256.0
-	r.dir = int(a[4])
-	if a.size() > 5 and a[5] is Dictionary:
-		r.extra = a[5]
+	r.dir = dir
+	if extra is Dictionary:
+		r.extra = extra
 		if r.extra.has("pc"):
 			r.extra["pc_mod"] = true
 		# A cliff has no direction of its own: its piece is turned to its orientation.
@@ -708,6 +758,14 @@ func _add(a) -> void:
 	# A building turned in Zenith alone (I9, visual_turns.gd) stands turned whatever the game says.
 	if r.unit > 0 and VisualTurns.any(Bridge.save_id):
 		r.dir = posmod(r.dir + 4 * VisualTurns.quarters(Bridge.save_id, r.unit), 16)
+	# A building drawn with a pack's model of its own (M8, building_models.gd), whatever the order.
+	if r.unit > 0 and BuildingModels.any(Bridge.save_id):
+		var own := BuildingModels.pack_for(Bridge.save_id, r.unit)
+		if own != "":
+			r.extra[ModelLibrary.PACK_KEY] = own
+	# Which of its model's variants it is drawn with (ModelLibrary.pick_variant): from its position, the
+	# same on every load. Set here, before any worker can read the record's `extra`.
+	r.extra[ModelLibrary.VARIANT_KEY] = ModelLibrary.ModelPacks.variant_seed(r.fixed)
 	r.key = r.unit if r.unit > 0 else static_key(r.proto_id, r.fixed.x, r.fixed.y)
 	if not _mined_early.is_empty() and _mined_early.has(r.key):
 		if Time.get_ticks_msec() - int(_mined_early[r.key]) < MINED_EARLY_MSEC:
@@ -743,6 +801,9 @@ func _add(a) -> void:
 	if _is_pipe(r):
 		_pipes[_tile_of(r)] = r.key
 		_connect_pipes_around(_tile_of(r))
+		_cover_towards(_tile_of(r))
+	elif _has_ports(r):
+		_add_ports(r)
 	if _is_belt(r):
 		for t in _belt_tiles(r):
 			_belts[t] = r.key
@@ -806,7 +867,8 @@ func alt_contents_now() -> Dictionary:
 
 
 ## Machines whose modules or science packs changed (`am`, K1, K2): [unit, modules or 0, [packs]?],
-## or [unit] for none; each item a name or [name, quality]. Kept by `g` as `ac` is.
+## or [unit] for none; each item a name or [name, quality]; a turret's ammo and a locomotive's fuel
+## come where the packs do. Kept by `g` as `ac` is.
 func _on_alt_machines(msg: Dictionary) -> void:
 	var g := int(msg.get("g", -1))
 	if g <= 0 or g != Bridge.alt_contents:
@@ -853,10 +915,23 @@ func _on_alt_fluids(list: Array) -> void:
 		var r: Rec = entities.get(int(row[0]))
 		if r == null:
 			continue
+		# A mining drill's fluid input (bit 1: the resource under it needs fluid) draws its `-wet` part
+		# (model_library.gd wet_model): its chunk is drawn again when that changes.
+		if (int(r.extra.get("fa", 0)) & 1) != (int(row[1]) & 1) and ModelLibrary.drill_wet:
+			var rp := protos.entity(r.proto_id)
+			if rp != null and rp.type == "mining-drill":
+				_dirty[r.chunk] = true
 		if int(row[1]) > 0:
 			r.extra["fa"] = int(row[1])
 		else:
 			r.extra.erase("fa")
+		_cover(r)  # a drill's connections show while it takes fluid, a machine's those its recipe uses
+		_cover_facing(r)  # and the machines they meet
+		# L10: which fluid goes in or out where, with the mask (a bridge from before sends none).
+		if row.size() >= 3 and row[2] is Array and int(row[1]) > 0:
+			r.extra["fc"] = row[2]
+		else:
+			r.extra.erase("fc")
 		alt_changed.emit(r.chunk)
 
 
@@ -917,6 +992,8 @@ func _remove(key) -> void:
 	if _same_key(_pipes.get(_tile_of(r)), key):
 		_pipes.erase(_tile_of(r))
 		_connect_pipes_around(_tile_of(r))
+		_cover_towards(_tile_of(r))
+	_remove_ports(r, true)
 	for t in _belt_tiles(r):
 		if _same_key(_belts.get(t), key):
 			_belts.erase(t)
@@ -949,6 +1026,7 @@ func _forget(key, r: Rec) -> void:
 		_pipes.erase(tile)
 	if _same_key(_walls.get(tile), key):
 		_walls.erase(tile)
+	_remove_ports(r, false)
 	for t in _belt_tiles(r):
 		if _same_key(_belts.get(t), key):
 			_belts.erase(t)
@@ -1081,6 +1159,144 @@ static func _tile_of(r: Rec) -> Vector2i:
 	return Vector2i(floori(r.pos.x), floori(r.pos.y))
 
 
+## The pipe, pipe to ground or heat pipe on `tile`, or null.
+func pipe_at(tile: Vector2i) -> Rec:
+	return entities.get(_pipes.get(tile, -1))
+
+
+## Pipe covers (pipe_covers.gd): the prototypes' fluid connections from the UI's `eprops` (main.gd, as they
+## arrive); every record's covers worked out again.
+func fluid_ports_from(eprops: Dictionary) -> void:
+	_fluid_ports.clear()
+	for id in eprops:
+		var fb = (eprops[id] as Dictionary).get("x", {}).get("fb") if eprops[id] is Dictionary else null
+		if fb is Array and not (fb as Array).is_empty():
+			_fluid_ports[int(id)] = fb
+	_port_tiles.clear()
+	_port_targets.clear()
+	var with_ports: Array = []
+	for r: Rec in entities.values():
+		if r.covers != 0:
+			r.covers = 0
+			_dirty[r.chunk] = true
+		if not _is_pipe(r) and _has_ports(r):
+			_note_ports(r)
+			with_ports.append(r)
+	for r: Rec in with_ports:
+		_cover(r)
+
+
+func _has_ports(r: Rec) -> bool:
+	return PipeCovers.enabled and _fluid_ports.has(r.proto_id) and not r.extra.has("gh")
+
+
+## A record's connections as tiles: [[its own tile, the tile it leads onto, index in fb], ...], all of them.
+func _port_tiles_of(r: Rec) -> Array:
+	var out: Array = []
+	var fb: Array = _fluid_ports.get(r.proto_id, [])
+	var turn := float(r.dir) / 16.0 * TAU
+	for i in fb.size():
+		var c = fb[i]
+		if not (c is Array) or c.size() < 3:
+			continue
+		var at := r.pos + Vector2(float(c[0]), float(c[1])).rotated(turn)
+		var own := Vector2i(floori(at.x), floori(at.y))
+		var way := Vector2(0, -1).rotated(float(int(c[2]) + r.dir) / 16.0 * TAU).round()
+		out.append([own, own + Vector2i(way), i])
+	return out
+
+
+func _note_ports(r: Rec) -> void:
+	for port: Array in _port_tiles_of(r):
+		_port_tiles[port[0]] = r.key
+		var keys: Array = _port_targets.get(port[1], [])
+		if not keys.has(r.key):
+			keys.append(r.key)
+		_port_targets[port[1]] = keys
+
+
+func _add_ports(r: Rec) -> void:
+	_note_ports(r)
+	_cover(r)
+	_cover_facing(r)
+
+
+## A record leaving takes its connections away; `redraw`: the machines whose connections met them show
+## their covers (not when it leaves with its chunk).
+func _remove_ports(r: Rec, redraw: bool) -> void:
+	if _fluid_ports.is_empty() or not _fluid_ports.has(r.proto_id):
+		return
+	for port: Array in _port_tiles_of(r):
+		if _same_key(_port_tiles.get(port[0]), r.key):
+			_port_tiles.erase(port[0])
+		var keys: Array = _port_targets.get(port[1], [])
+		keys.erase(r.key)
+		if keys.is_empty():
+			_port_targets.erase(port[1])
+	if redraw:
+		_cover_facing(r)
+
+
+## The machines with a connection on the tiles `r`'s connections lead onto.
+func _cover_facing(r: Rec) -> void:
+	for port: Array in _port_tiles_of(r):
+		var other: Rec = entities.get(_port_tiles.get(port[1], -1))
+		if other != null and other != r:
+			_cover(other)
+
+
+## The machines whose connections lead onto `tile` (a pipe built or taken away there).
+func _cover_towards(tile: Vector2i) -> void:
+	for key in _port_targets.get(tile, []):
+		var r: Rec = entities.get(key)
+		if r != null:
+			_cover(r)
+
+
+## A record's `covers`: its connections drawn (PipeCovers.ports) that nothing is connected to.
+func _cover(r: Rec) -> void:
+	var mask := 0
+	var drawn: Array = []
+	if _has_ports(r) and entities.has(r.key):
+		var proto: ProtoDB.EntityProto = protos.entity(r.proto_id)
+		drawn = PipeCovers.ports(_fluid_ports[r.proto_id], proto.type if proto != null else "", int(r.extra.get("fa", 0)))
+		if not drawn.is_empty():
+			var tiles := _port_tiles_of(r)
+			for port: Array in drawn:
+				for t: Array in tiles:
+					if int(t[2]) == int(port[2]) and not _port_connected(r, t[0], t[1]):
+						mask |= 1 << int(port[2])
+	r.cover_ports = drawn
+	if r.covers != mask:
+		r.covers = mask
+		_dirty[r.chunk] = true
+
+
+## Whether a connection of `r` on tile `own` leading onto `next` meets something: a pipe there whose `pc`
+## reaches back (the bridge's; one worked out here joins pipes alone, so any pipe), a pipe to ground facing
+## it, or another machine with a connection on `next` leading back onto `own`.
+func _port_connected(r: Rec, own: Vector2i, next: Vector2i) -> bool:
+	var back := PIPE_STEPS.find(own - next)
+	var pipe := pipe_at(next)
+	if pipe != null:
+		var type := protos.entity(pipe.proto_id).type
+		if type == "pipe" or type == "infinity-pipe":
+			return not pipe.extra.has("pc_mod") or (back >= 0 and int(pipe.extra.get("pc", 0)) & (1 << back) != 0)
+		if type == "pipe-to-ground":
+			return back >= 0 and pipe.dir == back * 4
+		return false  # a heat pipe
+	var other: Rec = entities.get(_port_tiles.get(next, -1))
+	if other == null or other == r or other.extra.has("gh"):
+		return false
+	# Only a connection it has now (a dry drill's are none, PipeCovers.ports).
+	var proto: ProtoDB.EntityProto = protos.entity(other.proto_id)
+	var live := PipeCovers.ports(_fluid_ports.get(other.proto_id), proto.type if proto != null else "", int(other.extra.get("fa", 0)))
+	for port: Array in _port_tiles_of(other):
+		if port[0] == next and port[1] == own and live.any(func(p: Array) -> bool: return int(p[2]) == int(port[2])):
+			return true
+	return false
+
+
 func _connect_pipes_around(tile: Vector2i) -> void:
 	_connect_pipe(tile)
 	for step in PIPE_STEPS:
@@ -1089,12 +1305,21 @@ func _connect_pipes_around(tile: Vector2i) -> void:
 
 func _connect_pipe(tile: Vector2i) -> void:
 	var r: Rec = entities.get(_pipes.get(tile, -1))
-	if r == null or r.extra.has("pc_mod"):
+	if r == null:
+		return
+	var rp := protos.entity(r.proto_id)
+	if rp == null:
+		return
+	# Factorio's window on every second straight pipe (model_library.gd pipe_window): where the floored
+	# x plus the floored y is even. Set whoever works out the connections (the bridge's `pc` too).
+	if posmod(tile.x + tile.y, 2) == 0 and rp.type == "pipe":
+		r.extra["pw"] = 1
+	if r.extra.has("pc_mod"):
 		return
 	# Heat pipes join only heat pipes (a reactor's or heat exchanger's connections aren't known
 	# here, so a heat pipe ending at one shows its end cap), fluid pipes only fluid pipes.
-	var heat := protos.entity(r.proto_id).type == "heat-pipe"
-	if not heat and not protos.entity(r.proto_id).type in ["pipe", "infinity-pipe"]:
+	var heat := rp.type == "heat-pipe"
+	if not heat and not rp.type in ["pipe", "infinity-pipe"]:
 		return
 	var mask := 0
 	for i in 4:
@@ -1111,6 +1336,32 @@ func _connect_pipe(tile: Vector2i) -> void:
 	if int(r.extra.get("pc", -1)) != mask:
 		r.extra["pc"] = mask
 		_dirty[r.chunk] = true
+
+
+## A pipe the game took away (`del`, `mnd`): the pipes beside it whose connections the bridge sent (`pc_mod`, which
+## _connect_pipe leaves alone) lose their side towards it now, so the run's last pipe is its ending piece at once,
+## not a straight open at its end (FUE5's kit) until the bridge sends it again (a player-less character's mining
+## raised nothing, so a bridge before /f3d-perf mined_neighbours never did). A connection always runs through the
+## neighbouring tile, so the side to an emptied tile is gone whatever stood there. Not for an `upd`, which replaces a
+## record in place. `--pipe-end=old`: the neighbours wait for the bridge, as before.
+static var pipe_end_now := not OS.get_cmdline_user_args().has("--pipe-end=old")
+
+
+func _unlink_pipes(gone: Rec) -> void:
+	if gone == null or not pipe_end_now or not _is_pipe(gone):
+		return
+	var tile := _tile_of(gone)
+	if _pipes.has(tile):
+		return  # something stands there again
+	for i in 4:
+		var other: Rec = entities.get(_pipes.get(tile + PIPE_STEPS[i], -1))
+		if other == null or not other.extra.has("pc_mod"):
+			continue
+		var pc := int(other.extra.get("pc", 0))
+		var back := 1 << ((i + 2) % 4)
+		if pc & back:
+			other.extra["pc"] = pc & ~back
+			_dirty[other.chunk] = true
 
 
 ## Walls are drawn with the piece that joins their neighbours (model_library.gd, WALL_SHAPES):
@@ -1304,35 +1555,30 @@ func _dirty_terrain_around(c: Vector2i) -> void:
 
 ## Flat [unit, 0/1, ...], lit lamps' colours `lc` [unit, 0xRRGGBB or -1, ...] (K10) and which of them
 ## are set to Always on, `ao` [unit, 0/1, ...] (K20).
-func _on_states(list: Array, lc: Array = [], ao: Array = []) -> void:
+## (Each list an Array, or packed from a binary frame: wire_decode.gd.)
+func _on_states(list: Variant, lc: Variant = [], ao: Variant = []) -> void:
 	var colored := not lamp_colors.is_empty()
 	var always := not lamp_always.is_empty()
 	var i := 0
-	while i + 1 < list.size():
-		var unit := int(list[i])
-		var state := int(list[i + 1])
-		var was: int = working.get(unit, -1)
-		working[unit] = state
-		if colored:
-			lamp_colors.erase(unit)
-		if always:
-			lamp_always.erase(unit)
-		# Models show the state through anim.gd; placeholders change colour, so rebuild.
-		var r: Rec = entities.get(unit)
-		if r != null:
-			if was < 0:
-				_stated_in(r.chunk)[unit] = true
-			var cv: ChunkView = chunks.get(r.chunk)
-			if cv != null and cv.placeholder_keys.has(r.key):
-				_dirty[r.chunk] = true
-			if state != was:
-				animator.state_changed(r)
-				# Only one with a wire is drawn ready to stop: one set by the logistic network needs drawing again.
-				if cv != null and (state == Anim.SWITCHED_OFF or was == Anim.SWITCHED_OFF) \
-						and not cv.set_belt_off(unit, state == Anim.SWITCHED_OFF) and state == Anim.SWITCHED_OFF \
-						and not r.extra.has("r") and not r.extra.has("g"):
-					_dirty[r.chunk] = true
-		i += 2
+	if colored or always:
+		# The lamps' colours and Always on are forgotten with each state here, in the message's order
+		# (the same message sends them again), even when the states themselves wait (states_sliced).
+		while i + 1 < list.size():
+			var unit := int(list[i])
+			if colored:
+				lamp_colors.erase(unit)
+			if always:
+				lamp_always.erase(unit)
+			i += 2
+	if states_sliced and (_st_at < _st_lists.size() or list.size() > ST_INLINE * 2):
+		# Behind the ones waiting, in order: the latest a unit was sent is the one it ends with.
+		if list.size() >= 2:
+			_st_lists.append(list)
+	else:
+		i = 0
+		while i + 1 < list.size():
+			_apply_state(int(list[i]), int(list[i + 1]))
+			i += 2
 	i = 0
 	while i + 1 < lc.size():
 		var col := int(lc[i + 1])
@@ -1348,6 +1594,92 @@ func _on_states(list: Array, lc: Array = [], ao: Array = []) -> void:
 		else:
 			lamp_always.erase(int(ao[i]))
 		i += 2
+
+
+## One machine's state: `working`, its chunk's set of stated units, its placeholder's colour, its
+## models' animation (anim.gd) and a switched-off belt's look.
+func _apply_state(unit: int, state: int) -> void:
+	var was: int = working.get(unit, -1)
+	working[unit] = state
+	# Models show the state through anim.gd; placeholders change colour, so rebuild.
+	var r: Rec = entities.get(unit)
+	if r == null:
+		return
+	if was < 0:
+		_stated_in(r.chunk)[unit] = true
+	var cv: ChunkView = chunks.get(r.chunk)
+	if cv != null and cv.placeholder_keys.has(r.key):
+		_dirty[r.chunk] = true
+	if state != was:
+		animator.state_changed(r)
+		# Only one with a wire is drawn ready to stop: one set by the logistic network needs drawing again.
+		if cv != null and (state == Anim.SWITCHED_OFF or was == Anim.SWITCHED_OFF) \
+				and not cv.set_belt_off(unit, state == Anim.SWITCHED_OFF) and state == Anim.SWITCHED_OFF \
+				and not r.extra.has("r") and not r.extra.has("g"):
+			_dirty[r.chunk] = true
+
+
+## --st-slice=off: each `st` message's states applied whole as it is handled, as before (a busy base's
+## 1,600 states took 10-25 ms, a dropped frame each time). On: a message of more than ST_INLINE states
+## waits here and is applied over the next frames within the frame budget's `states` slice, in the
+## order the messages came (a unit's latest state wins), the lamps' colours at once.
+static var states_sliced := not OS.get_cmdline_user_args().has("--st-slice=off")
+const ST_INLINE := 64
+var _st_lists: Array = []  # the `l` lists waiting, oldest first
+var _st_at := 0  # the list being applied
+var _st_i := 0  # its next pair
+
+
+## States waiting to be applied (units).
+func states_waiting() -> int:
+	var n := 0
+	for j in range(_st_at, _st_lists.size()):
+		n += int(_st_lists[j].size()) / 2
+	return n - _st_i / 2
+
+
+## Applies the states waiting within the frame budget's `states` slice (at least its floor); `most`
+## states at most when above 0 (the UI test).
+func _apply_states_waiting(most := 0) -> void:
+	if _st_at >= _st_lists.size():
+		FrameBudget.waiting(&"states", 0)
+		return
+	var t0 := Time.get_ticks_usec()
+	# More than one message behind: the whole slice, so a stream of them can't pile up.
+	var allow := FrameBudget.grant(&"states", 1, _st_lists.size() - _st_at > 1)
+	var n := 0
+	while _st_at < _st_lists.size():
+		var list: Variant = _st_lists[_st_at]
+		while _st_i + 1 < list.size():
+			_apply_state(int(list[_st_i]), int(list[_st_i + 1]))
+			_st_i += 2
+			n += 1
+			if n == most or ((n & 7) == 0 and Time.get_ticks_usec() - t0 > allow):
+				break
+		if _st_i + 1 < list.size():
+			break
+		_st_at += 1
+		_st_i = 0
+		if n == most:
+			break
+	if _st_at >= _st_lists.size():
+		_st_lists.clear()
+		_st_at = 0
+	FrameBudget.spent(&"states", Time.get_ticks_usec() - t0, _st_lists.size() - _st_at)
+	_prof("states", t0)
+
+
+## Applies every state waiting at once (tests; what reads `working` right after a big message).
+func flush_states() -> void:
+	while _st_at < _st_lists.size():
+		var list: Variant = _st_lists[_st_at]
+		while _st_i + 1 < list.size():
+			_apply_state(int(list[_st_i]), int(list[_st_i + 1]))
+			_st_i += 2
+		_st_at += 1
+		_st_i = 0
+	_st_lists.clear()
+	_st_at = 0
 
 
 ## The units with a state (`working`) by their record's chunk, for what looks at machines near a
@@ -1418,9 +1750,12 @@ func _process(delta: float) -> void:
 	var t0 := Time.get_ticks_usec()
 	_update_subscription(delta)
 	_prof("subscribe", t0)
+	_apply_states_waiting()
 	_free_unloaded()
 	_update_focus(delta)
 	t0 = Time.get_ticks_usec()
+	if ModelLibrary.ModelPacks.follow_sprites():
+		models_changed([])  # a graphics list came, the Factorio pack over another: its pictures may be new ones
 	var models_made := ModelLibrary.poll()
 	var cards_made := SpriteStandins.poll()
 	if models_made or cards_made:
@@ -2344,6 +2679,59 @@ func redraw(c: Vector2i) -> void:
 		_dirty[c] = true
 
 
+## M8: a building drawn with `pack`'s model ("" the usual; building_models.gd keeps it for this save),
+## at once: its record takes the pack (a new `extra`, as belt_paths.gd may be reading the old one on a
+## worker) and its chunk is built again, which puts it in that model's MultiMesh.
+func set_building_pack(unit: int, pack: String) -> void:
+	BuildingModels.choose(Bridge.save_id, unit, pack)
+	var r: Rec = entities.get(unit)
+	if r == null:
+		return
+	var x: Dictionary = r.extra.duplicate()
+	if pack == "":
+		x.erase(ModelLibrary.PACK_KEY)
+	else:
+		x[ModelLibrary.PACK_KEY] = pack
+	r.extra = x
+	var cv: ChunkView = chunks.get(r.chunk)
+	if cv != null:
+		cv.content_rev += 1
+		cv.pick_grid = []
+	_dirty[r.chunk] = true
+
+
+## M7: the packs' choices for model families changed (the Model packs window, the model chooser's
+## "every one"; ModelPacks.set_choices done): those families' models are made again
+## (ModelLibrary.choices_changed) and the chunks drawing any of them built again; `families` empty:
+## every chunk.
+func models_changed(families: Array) -> void:
+	ModelLibrary.choices_changed(families)
+	var wanted := {}
+	for f in families:
+		wanted[str(f)] = true
+	for c in chunks:
+		if families.is_empty() or _draws_family(chunks[c], wanted):
+			_dirty[c] = true
+
+
+## Whether a chunk draws a model of one of these families: its buildings' own, their tier's base, an
+## alias's, a belt's end pieces, a cargo bay's edges.
+func _draws_family(cv: ChunkView, wanted: Dictionary) -> bool:
+	for r: Rec in cv.entities.values():
+		var proto: ProtoDB.EntityProto = protos.entity(r.proto_id)
+		if proto == null:
+			continue
+		var names: Array = [proto.name, ModelLibrary._tier_base(proto.name), str(ModelLibrary.MODEL_ALIASES.get(proto.name, ""))]
+		if r.belt_ends != 0:
+			names.append(ModelLibrary.belt_end_family(proto.name, proto.type))
+		if ModelLibrary.CARGO_TYPES.has(proto.type):
+			names.append("cargo-bay")
+		for n: String in names:
+			if n != "" and wanted.has(ModelLibrary.ModelPacks.family(n)):
+				return true
+	return false
+
+
 ## Whether a chunk asked for has arrived and is drawn (its ground, and its buildings built). Tiles
 ## that aren't a whole chunk get no ground (_start_terrain_jobs): such a chunk is drawn without it,
 ## or it would hold its place on the way (_coming) and a screenshot's count for good.
@@ -2367,15 +2755,72 @@ func _unload(c: Vector2i) -> void:
 	_waiting_gfx.erase(c)
 	# Its records leave `entities`, entities_changed goes out and it is freed within a time budget
 	# (_free_unloaded): walking over a chunk's edge lets a whole row of 29 go at once, and a busy
-	# chunk's thousands of records and 60-150 nodes took 1.5-5 ms each. Until then it stays drawn
-	# past the view's edge.
+	# chunk's thousands of records and 60-150 nodes took 1.5-5 ms each. It is hidden first, before
+	# any of that (unload_hide).
 	_unload_keys[cv] = [cv.entities.keys(), 0]
 	cv.retire()
 	_unloaded.append(cv)
+	if unload_hide and cv.visible:
+		_hide_queue.append(cv)
+		_hide_sorted = false
 
 
 ## Unloaded chunks waiting for their records to leave `entities`: ChunkView -> [keys, next].
 var _unload_keys := {}
+## L14: a screenshot zoomed far out lets go of thousands of chunks at once (4,353 of the mock's 4,708
+## in a 250-tile-high shot), and each stayed drawn until its records had left `entities`, at the
+## unload slice's 2-3 chunks a frame: 30-40 s of the renderer drawing thousands of chunks at full
+## detail (far merging is off for a shot) behind a view that no longer wants them ("easier to just
+## reload the save"). Now an unloaded chunk is hidden first, farthest from the focus first, as many a
+## frame as the unload slice holds (a hidden chunk costs the renderer nothing), and its records and
+## nodes go after, as before. `--unload-hide=off`: drawn until its records have gone, as before.
+static var unload_hide := not OS.get_cmdline_user_args().has("--unload-hide=off")
+var _hide_queue: Array = []  # unloaded ChunkViews still drawn, hidden from _hide_at on
+var _hide_at := 0
+var _hide_sorted := true  # _hide_queue from _hide_at is farthest from the focus first
+
+
+## Hides unloaded chunks still drawn, from _hide_at, for `allow` µs from `t0` (at least one): farthest
+## from the focus first (sorted once a batch has come: natively, by squared distance). How many it hid.
+func _hide_unloaded(t0: int, allow: int) -> int:
+	if not _hide_sorted:
+		_hide_sorted = true
+		var rest := _hide_queue.slice(_hide_at)
+		var center := chunk_of(_focus)
+		var keys := PackedInt64Array()
+		keys.resize(rest.size())
+		for i in rest.size():
+			var d := 0
+			if is_instance_valid(rest[i]):
+				d = ((rest[i] as ChunkView).coord - center).length_squared()
+			keys[i] = (d << 20) + i
+		keys.sort()
+		_hide_queue = []
+		for j in range(keys.size() - 1, -1, -1):
+			_hide_queue.append(rest[keys[j] & 0xfffff])
+		_hide_at = 0
+	var hidden := 0
+	while _hide_at < _hide_queue.size():
+		if hidden > 0 and Time.get_ticks_usec() - t0 > allow:
+			break
+		var cv = _hide_queue[_hide_at]
+		_hide_at += 1
+		if is_instance_valid(cv) and (cv as ChunkView).visible:
+			(cv as ChunkView).visible = false
+			hidden += 1
+	if _hide_at >= _hide_queue.size():
+		_hide_queue = []
+		_hide_at = 0
+	return hidden
+
+
+## Unloaded chunks still drawn (for --stutter-probe and the UI test).
+func unloaded_drawn() -> int:
+	var n := 0
+	for cv in _unloaded:
+		if is_instance_valid(cv) and (cv as ChunkView).visible:
+			n += 1
+	return n
 
 
 ## Takes unloaded chunks apart within their slice of the frame (frame_budget.gd `unload`, at least
@@ -2384,11 +2829,17 @@ var _unload_keys := {}
 ## then their nodes one by one (a busy chunk's took up to 5 ms freed at once), then the chunk.
 func _free_unloaded() -> void:
 	if _unloaded.is_empty():
+		if not _hide_queue.is_empty():
+			_hide_queue = []
+			_hide_at = 0
 		FrameBudget.waiting(&"unload", 0)
 		return
 	var t0 := Time.get_ticks_usec()
 	var steps := 0
 	var allow := FrameBudget.grant(&"unload")
+	if allow > 0 and _hide_at < _hide_queue.size():
+		# Hidden first, all of them before any record goes (unload_hide).
+		steps += _hide_unloaded(t0, allow)
 	while allow > 0 and not _unloaded.is_empty():
 		if steps > 0 and Time.get_ticks_usec() - t0 > allow:
 			break
@@ -2727,7 +3178,13 @@ const LOD_BANDS := [2, 3, 4, 6, 9, 13, 19, 28, 40, 58, 84]  # band k: rings [LOD
 ## A model's levels being made changes ModelLods.level_generation (every chunk looks again): a band
 ## starts again for it at most this often (dozens a second while joining).
 const LOD_GEN_MSEC := 250
+## Most MultiMesh level switches in one frame: each switch copies the MultiMesh buffer and adds a
+## cross-fade node, so a whole ring crossing a boundary in one frame spiked both this pass (22-25 ms)
+## and the next frame's renderer CPU (60-88 ms; art-src/perf-plans/after.md). Bypassed under
+## ModelLods.full_detail; --lod-slice=off restores unbudgeted whole-ring switches.
+const LOD_SWITCH_CAP := 16
 static var lod_bands_on := not OS.get_cmdline_user_args().has("--lod-pass=every-frame")
+static var lod_slice_on := not OS.get_cmdline_user_args().has("--lod-slice=off")
 
 
 class LodBand:
@@ -2739,6 +3196,7 @@ class LodBand:
 	var gen := -1  # ModelLods.level_generation then
 	var msec := -1000000
 	var ring := -1  # the ring to look at next (-1: nothing to do); the far band: its index in _lod_far
+	var ring_pos := 0  # next chunk index around `ring` (0 .. 8 * ring - 1)
 	var center := Vector2i.ZERO  # the camera's chunk when it started
 	var again := false  # due again before it finished
 
@@ -2747,8 +3205,9 @@ var _lod_bands: Array = []
 var _lod_fades := {}  # ChunkView -> true: cross-fading
 var _lod_now := {}  # Vector2i -> whether without a fade (shown again): looked at this frame
 var _lod_far: Array = []  # the far band's chunks (past the last band's rings), when it runs
-## Chunks looked at and microseconds spent this frame (for the UI test and probes).
+## Chunks looked at, level switches made, and microseconds spent this frame (for the UI test and probes).
 var lod_looked := 0
+var lod_switches := 0
 var lod_usec := 0
 
 
@@ -2766,6 +3225,8 @@ func _lod_soon(c: Vector2i) -> void:
 func _update_lod_bands(at: Vector3, per_tile: float, flat: float, delta: float) -> void:
 	var t0 := Time.get_ticks_usec()
 	lod_looked = 0
+	lod_switches = 0
+	var cap_switches := lod_slice_on and not ModelLods.full_detail
 	if _lod_bands.is_empty():
 		for k in LOD_BANDS.size():
 			var band := LodBand.new()
@@ -2776,13 +3237,16 @@ func _update_lod_bands(at: Vector3, per_tile: float, flat: float, delta: float) 
 		if not is_instance_valid(cv) or chunks.get(cv.coord) != cv:
 			_lod_fades.erase(cv)
 			continue
-		cv.update_lods(at, per_tile, flat, delta)
+		if lod_slice_on:
+			cv.advance_lod_fades(delta)
+		else:
+			cv.update_lods(at, per_tile, flat, delta)
 		if not cv.lod_fading():
 			_lod_fades.erase(cv)
 	var cam_chunk := chunk_of(Vector2(at.x, at.z))
 	for dy in range(-1, 2):
 		for dx in range(-1, 2):
-			_lod_cell(cam_chunk + Vector2i(dx, dy), at, per_tile, flat, false)
+			_lod_cell(cam_chunk + Vector2i(dx, dy), at, per_tile, flat, false, cap_switches)
 	var ortho := flat >= 0.0
 	var p := flat if ortho else per_tile
 	var gen := ModelLods.level_generation
@@ -2805,36 +3269,55 @@ func _update_lod_bands(at: Vector3, per_tile: float, flat: float, delta: float) 
 			busy += 1
 	if _lod_now.is_empty() and busy == 0:
 		lod_usec = Time.get_ticks_usec() - t0
-		FrameBudget.waiting(&"lods", 0)
+		if lod_switches > 0:
+			FrameBudget.spent(&"lods", lod_usec, 0)
+		else:
+			FrameBudget.waiting(&"lods", 0)
 		return
 	# Under full detail (a screenshot) everything at once, as the pass before.
 	var allow := 0x3fffffff if ModelLods.full_detail else FrameBudget.grant(&"lods")
 	var t1 := Time.get_ticks_usec()
 	for c: Vector2i in _lod_now.keys():
-		if lod_looked > 0 and Time.get_ticks_usec() - t1 > allow:
+		if not _lod_budget_left(t1, allow, cap_switches):
 			break
 		var snap: bool = _lod_now[c]
 		_lod_now.erase(c)
-		_lod_cell(c, at, per_tile, flat, snap)
+		_lod_cell(c, at, per_tile, flat, snap, cap_switches)
 	for band: LodBand in _lod_bands:
+		var out_of_budget := false
 		while band.ring >= 0:
-			if lod_looked > 0 and Time.get_ticks_usec() - t1 > allow:
+			if not _lod_budget_left(t1, allow, cap_switches):
+				out_of_budget = true
 				break
 			if band.hi == 0x3fffffff:
-				_lod_far_step(band, at, per_tile, flat)
+				_lod_far_step(band, at, per_tile, flat, t1, allow, cap_switches)
 			elif band.ring >= band.hi or band.ring > reach:
 				band.ring = -1
+				band.ring_pos = 0
 			else:
-				_lod_ring(band.center, band.ring, at, per_tile, flat)
-				band.ring += 1
+				if not _lod_ring_step(band, at, per_tile, flat, t1, allow, cap_switches):
+					out_of_budget = true
+					break
 			if band.ring < 0 and band.again:
 				_lod_start(band, at, p, ortho, gen, now, cam_chunk)
+		if out_of_budget:
+			break
 	busy = 0
 	for band: LodBand in _lod_bands:
 		if band.ring >= 0:
 			busy += 1
 	lod_usec = Time.get_ticks_usec() - t0
-	FrameBudget.spent(&"lods", Time.get_ticks_usec() - t1, busy + _lod_now.size())
+	FrameBudget.spent(&"lods", lod_usec if lod_switches > 0 else Time.get_ticks_usec() - t1, busy + _lod_now.size())
+
+
+func _lod_budget_left(t1: int, allow: int, cap_switches: bool) -> bool:
+	if ModelLods.full_detail:
+		return true
+	if cap_switches and lod_switches >= LOD_SWITCH_CAP:
+		return false
+	if lod_looked > 0 and Time.get_ticks_usec() - t1 > allow:
+		return false
+	return true
 
 
 ## Whether a band's chunks may need other levels than when it was last started.
@@ -2863,6 +3346,7 @@ func _lod_start(band: LodBand, at: Vector3, p: float, ortho: bool, gen: int, now
 	band.msec = now
 	band.center = cam_chunk
 	band.again = false
+	band.ring_pos = 0
 	if band.hi == 0x3fffffff:
 		_lod_far = chunks.values()
 		band.ring = 0
@@ -2870,44 +3354,72 @@ func _lod_start(band: LodBand, at: Vector3, p: float, ortho: bool, gen: int, now
 		band.ring = band.lo
 
 
-## The chunks at ring `r` round `center` (the square's edge r chunks out).
-func _lod_ring(center: Vector2i, r: int, at: Vector3, per_tile: float, flat: float) -> void:
-	for dx in range(-r, r + 1):
-		_lod_cell(center + Vector2i(dx, -r), at, per_tile, flat, false)
-		_lod_cell(center + Vector2i(dx, r), at, per_tile, flat, false)
-	for dy in range(-r + 1, r):
-		_lod_cell(center + Vector2i(-r, dy), at, per_tile, flat, false)
-		_lod_cell(center + Vector2i(r, dy), at, per_tile, flat, false)
+## The `pos`-th chunk offset around ring `r` (0 .. 8 * r - 1), walking top, bottom, left, right edges.
+static func _lod_ring_offset(r: int, pos: int) -> Vector2i:
+	var horiz := 2 * r + 1
+	if pos < horiz:
+		return Vector2i(pos - r, -r)
+	pos -= horiz
+	if pos < horiz:
+		return Vector2i(pos - r, r)
+	pos -= horiz
+	var vert := 2 * r - 1
+	if pos < vert:
+		return Vector2i(-r, pos - r + 1)
+	pos -= vert
+	return Vector2i(r, pos - r + 1)
+
+
+## Steps through chunks at ring `band.ring` round `band.center`, yielding when the frame's time or
+## switch budget runs out. Returns true when the ring finished.
+func _lod_ring_step(band: LodBand, at: Vector3, per_tile: float, flat: float, t1: int, allow: int, cap_switches: bool) -> bool:
+	var r := band.ring
+	var total := 8 * r
+	while band.ring_pos < total:
+		if cap_switches and not _lod_budget_left(t1, allow, cap_switches):
+			return false
+		var offset := _lod_ring_offset(r, band.ring_pos)
+		band.ring_pos += 1
+		_lod_cell(band.center + offset, at, per_tile, flat, false, cap_switches)
+	band.ring_pos = 0
+	band.ring += 1
+	return true
 
 
 ## The far band: loaded chunks past the last band's rings (held ones), a slice of _lod_far at a time.
-func _lod_far_step(band: LodBand, at: Vector3, per_tile: float, flat: float) -> void:
+func _lod_far_step(band: LodBand, at: Vector3, per_tile: float, flat: float, t1: int, allow: int, cap_switches: bool) -> void:
 	var stop := mini(band.ring + 256, _lod_far.size())
 	while band.ring < stop:
+		if cap_switches and not _lod_budget_left(t1, allow, cap_switches):
+			return
 		var cv = _lod_far[band.ring]
 		band.ring += 1
 		if not is_instance_valid(cv) or chunks.get(cv.coord) != cv:
 			continue
 		var c: Vector2i = cv.coord
 		if maxi(absi(c.x - band.center.x), absi(c.y - band.center.y)) >= band.lo:
-			_lod_cell(c, at, per_tile, flat, false)
+			_lod_cell(c, at, per_tile, flat, false, cap_switches)
 	if band.ring >= _lod_far.size():
 		band.ring = -1
 		_lod_far = []
 
 
-func _lod_cell(c: Vector2i, at: Vector3, per_tile: float, flat: float, snap: bool) -> void:
+func _lod_cell(c: Vector2i, at: Vector3, per_tile: float, flat: float, snap: bool, cap_switches := true) -> void:
 	var cv: ChunkView = chunks.get(c)
 	# Hidden behind the camera (I18): kept at their levels until shown (chunk_shown).
 	if cv == null or not cv.visible:
 		return
 	lod_looked += 1
+	var budget := maxi(LOD_SWITCH_CAP - lod_switches, 0) if cap_switches else -1
 	if snap:
 		cv.lod_snap = true
-		cv.update_lods(at, per_tile, flat, 0.0)
+		cv.update_lods(at, per_tile, flat, 0.0, budget)
 		cv.lod_snap = false
 	else:
-		cv.update_lods(at, per_tile, flat, 0.0)
+		cv.update_lods(at, per_tile, flat, 0.0, budget)
+	lod_switches += cv.lod_last_switches
+	if cv.lod_partial:
+		_lod_now[c] = snap or bool(_lod_now.get(c, false))
 	if cv.lod_fading():
 		_lod_fades[cv] = true
 
@@ -3286,6 +3798,19 @@ func _on_welcome(msg: Dictionary) -> void:
 const JOIN_RINGS := 2
 
 
+## Every chunk within `rings` of the focus has come and is drawn (the menu backdrop's recording waits
+## for it: the first stream after the join's loading screen).
+func square_drawn(rings: int) -> bool:
+	var center := chunk_of(_focus)
+	for dy in range(-rings, rings + 1):
+		for dx in range(-rings, rings + 1):
+			var c := center + Vector2i(dx, dy)
+			var cv: ChunkView = chunks.get(c)
+			if cv == null or not cv.loaded or not _drawn(c):
+				return false
+	return true
+
+
 ## What the join's loading screen still waits for (front_end.gd): chunks within JOIN_RINGS of the
 ## focus not drawn yet or drawn with models left out, and pipelines still compiling. Models being
 ## read count too while any near chunk waits for one. 0: ready to play.
@@ -3382,6 +3907,26 @@ func rail_height(point: Vector2, was: float) -> float:
 	if elevated and (not ground or was > ELEVATED_HEIGHT * 0.5):
 		return ELEVATED_HEIGHT
 	return 0.0
+
+
+## (stand_height.gd: the belt step-up and api.world.stand_height_at) Every drawn entity whose selection box holds `point`,
+## from the pick index (not ones hidden by a prediction).
+func recs_at(point: Vector2) -> Array:
+	var out: Array = []
+	var center := chunk_of(point)
+	var cell := Vector2i(floori(point.x / PICK_CELL), floori(point.y / PICK_CELL))
+	var reach := _pick_reach()
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			var cv: ChunkView = chunks.get(center + Vector2i(dx, dy))
+			if cv == null:
+				continue
+			if (dx != 0 or dy != 0) and not Rect2(Vector2(cv.coord * CHUNK), Vector2(CHUNK, CHUNK)).grow(reach).has_point(point):
+				continue
+			for entry: Array in _pick_grid(cv).get(cell, []):
+				if (entry[1] as Rect2).has_point(point) and not (entry[0] as Rec).extra.has("hid"):
+					out.append(entry[0])
+	return out
 
 
 var _reach := [-1, 0.0]  # [entity prototypes counted, the reach]
@@ -3492,3 +4037,8 @@ static func selection_rect(proto: ProtoDB.EntityProto, pos: Vector2, dir: int) -
 
 static func _array(v) -> Array:
 	return v if v is Array else []
+
+
+## A list as JSON or a binary frame gives it (an Array, or packed: wire_decode.gd), else [].
+static func _list(v: Variant) -> Variant:
+	return v if v is Array or WireDecode.packed(v) else []

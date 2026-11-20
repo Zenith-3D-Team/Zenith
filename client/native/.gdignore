@@ -1,0 +1,3 @@
+Keeps Godot's editor out of this folder (godot-cpp, the sources, the build): it would load belt_sim.gdextension
+at every start and, on a platform without its library, print three ERROR lines. scripts/native_library.gd
+loads it where there is one (docs/RUNNING.md, "The native belt simulation").

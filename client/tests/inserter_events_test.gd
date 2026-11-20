@@ -11,8 +11,11 @@ extends SceneTree
 
 const Swing := preload("res://scripts/world/inserter_swing.gd")
 const Arms := preload("res://scripts/world/inserter_arms.gd")
+const Anim := preload("res://scripts/world/anim.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const BurnerFx := preload("res://scripts/fx/burner_fx.gd")
+const FactorioShader := preload("res://shaders/factorio_material.gdshader")
 
 var failures := 0
 var verbose := false
@@ -24,6 +27,7 @@ class Rec:
 	var dir := 0
 	var extra := {}
 	var unit := 0
+	var key: Variant = 0  # (world.gd Rec: the entity's key, its unit for those with one)
 	var chunk := Vector2i.ZERO
 
 
@@ -279,6 +283,8 @@ func _init() -> void:
 
 	_arms_layer()
 	_held_at_grip()
+	_burner_fx()
+	_sprite_arms()
 	print("inserter_events_test: %s (%d failure(s))" % ["PASS" if failures == 0 else "FAIL", failures])
 	quit(1 if failures > 0 else 0)
 
@@ -483,6 +489,7 @@ func _held_at_grip() -> void:
 		belts.free()
 	world.free()
 	_rest_arms(rig)
+	_burner_glow(rig)
 
 
 ## K12 (owner: "inserters are hiding their arms completely at distance"): the bridge sends hands only within
@@ -554,3 +561,430 @@ func _rest_arms(rig: Dictionary) -> void:
 	arms.free()
 	belts.free()
 	world.free()
+
+
+## L4 (owner: "the burner inserter's burner stays lit while it's idle"): a modeller's burner inserter glows
+## by its model's emissive material, which anim.gd lit while the entity worked, and inserters (the bridge sends
+## them no `st`) counted as always working. Now an inserter's glow follows its drawn hand: lit while it turns
+## or reaches and for MOVING_HOLD ticks after (the short waits at its ends), dark once it waits longer, and dark
+## at once when its live arm goes (it rests). --inserter-glow=always: lit all along, as before.
+class GlowWorld extends StubWorld:
+	var animator: Node
+	var working := {}  # the bridge's `st` (none for inserters)
+
+
+class GlowChunk:
+	var entities := {}
+	var anim_groups: Array = []
+
+
+func _burner_glow(rig: Dictionary) -> void:
+	var protos := ProtoDB.new()
+	var p := ProtoDB.EntityProto.new()
+	p.id = 1
+	p.name = "test-inserter"
+	p.type = "inserter"
+	protos.entities[1] = p
+	var world := GlowWorld.new()
+	var cv := GlowChunk.new()
+	world.chunks[Vector2i(0, 0)] = cv
+	var rec := Rec.new()
+	rec.unit = 77
+	rec.key = 77
+	rec.pos = Vector2(10.5, 20.5)
+	world.entities[77] = rec
+	cv.entities[77] = rec
+	var anim := Anim.new()
+	anim.world = world
+	world.animator = anim
+	# Its base model's glowing instance, as chunk_view.gd hands it over (a glowing model: no part).
+	var group := Anim.Group.new()
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_custom_data = true
+	mm.instance_count = 1
+	group.mm = mm
+	group.keys.append(77)
+	group.units.append(77)
+	group.bases.append(Transform3D())
+	group.stateful.append(Anim.state_source("inserter"))
+	group.customs.append(Anim.custom_for(rec, 1.0))
+	Anim.place(group, anim, {})
+	cv.anim_groups.append(group)
+	var glowing := func() -> bool:
+		var flags := floori(-group.customs[0].b - 1.0)
+		return flags & 4 != 0
+	Arms.belt_clock = true
+	Arms.events = true
+	Arms.events_items = false
+	var arms := Arms.new()
+	arms.protos = protos
+	arms.world = world
+	arms.eprops = {1: {"x": {"ip": [0, -1], "id": [0, 1.2], "rs": 0.014, "es": 0.035}}}
+	var belts := StubBelts.new()
+	arms.belts = belts
+	arms._rigs["test-inserter"] = rig
+	var at_pick: Vector2 = (rec.pos + Swing.hand_pos(-PI / 2.0, 1.0)) * 256.0
+	var at_drop: Vector2 = (rec.pos + Swing.hand_pos(PI / 2.0, 1.2)) * 256.0
+	arms.handle_events({"t": "ie", "k": 100, "n": 6, "p": 2, "part": 1, "parts": 1,
+		"l": [Swing.Ev.SYNC, 77, 100, 0, 0, 0, roundi(at_pick.x), roundi(at_pick.y), 0]})
+	arms.handle_events({"t": "ie", "k": 140, "n": 6, "p": 2, "part": 1, "parts": 1,
+		"l": [Swing.Ev.PICKED, 77, 140, 1, 5, 0, roundi(at_pick.x), roundi(at_pick.y), 0]})
+	arms.handle_events({"t": "ie", "k": 180, "n": 6, "p": 2, "part": 1, "parts": 1,
+		"l": [Swing.Ev.DROPPED, 77, 180, 0, 5, 0, roundi(at_drop.x), roundi(at_drop.y), 0]})
+	var start_glow: bool = glowing.call()
+	var lit_waiting := 0  # frames lit while the hand waits for its first item
+	var dark_swinging := 0  # frames dark while it swings out and back
+	var lit_after := 0  # frames lit once it has stood at the pickup past the hold
+	var back_at := -1.0
+	for t in range(100, 330):
+		belts.t = float(t)
+		arms._process(1.0 / 60.0)
+		var lit: bool = anim.arm_working.has(77)
+		var arm = arms._arms[77]
+		var home := Swing.hand_pos(arm.angle, arm.reach).distance_to(Swing.hand_pos(-PI / 2.0, 1.0)) < 0.01
+		if t >= 185 and back_at < 0.0 and home:
+			back_at = t
+		if t < 140:
+			lit_waiting += 1 if lit else 0
+		elif t > 142 and (back_at < 0.0 or t < back_at):
+			dark_swinging += 0 if lit and glowing.call() else 1
+		elif back_at >= 0.0 and t > back_at + Arms.MOVING_HOLD + 2:
+			lit_after += 1 if lit or glowing.call() else 0
+	check(not start_glow and lit_waiting == 0 and dark_swinging == 0 and back_at > 0.0 and lit_after == 0,
+		"L4: a burner inserter's burner is dark while its hand waits for an item (%d frames lit), lit while it swings out and back (%d dark), dark again %d ticks after it stands at the pickup (back at %d, %d lit after)" % [
+		lit_waiting, dark_swinging, int(Arms.MOVING_HOLD), int(back_at), lit_after])
+	# Swinging again, then gone (out of the radius): dark at once, its arm resting.
+	arms.handle_events({"t": "ie", "k": 340, "n": 6, "p": 2, "part": 1, "parts": 1,
+		"l": [Swing.Ev.PICKED, 77, 340, 1, 5, 0, roundi(at_pick.x), roundi(at_pick.y), 0]})
+	for t in range(330, 352):
+		belts.t = float(t)
+		arms._process(1.0 / 60.0)
+	var lit_again: bool = anim.arm_working.has(77) and glowing.call()
+	arms.handle_events({"t": "ie", "k": 352, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [Swing.Ev.GONE, 77, 352, 0, 0, 0, 0, 0, 0]})
+	belts.t = 352.0
+	arms._process(1.0 / 60.0)
+	check(lit_again and not anim.arm_working.has(77) and not glowing.call(),
+		"L4: lit again when it swings, dark the frame its live arm goes")
+	# --inserter-glow=always: inserters' glows follow nothing, lit all along (as before).
+	Anim.arm_glow = false
+	check(Anim.state_source("inserter") == 0 and Anim.state_source("furnace") == Anim.STATE_REPORTED,
+		"L4: --inserter-glow=always leaves inserters always lit (state source %d), machines as they were" % Anim.state_source("inserter"))
+	Anim.arm_glow = true
+	for c in arms._cards.get_children():
+		c.free()
+	arms._cards.free()
+	arms.free()
+	belts.free()
+	anim.free()
+	world.free()
+
+
+## The owner's burner effects (burner_fx.gd): while a modeller's burner inserter's burner is lit (its hand
+## moving, L4's rule: anim.gd arm_working) it breathes like coals (the shader's glow_heat), a thin wisp of
+## light smoke leaves its grille now and then near the listener, and a quiet fire crackle plays, at most
+## MAX_SOUNDS at once. --burner-fx=off: none of it.
+class StubSprites:
+	var cards: Array = []
+
+	func emit(sheet: String, pos: Vector3, width: float, life: float, color := Color.WHITE):
+		var c := preload("res://scripts/fx/sprite_fx.gd").Card.new()
+		c.pos = pos
+		c.size0 = width
+		c.life = life
+		c.color = color
+		cards.append([sheet, c])
+		return c
+
+
+static func _no_heat(mesh: Mesh) -> bool:
+	var h: Variant = (mesh.surface_get_material(0) as ShaderMaterial).get_shader_parameter("glow_heat")
+	return h == null or float(h) == 0.0
+
+
+static func _glow_mesh(glows: bool) -> ArrayMesh:
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3.ZERO, Vector3.RIGHT, Vector3.UP])
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	var m := ShaderMaterial.new()
+	m.shader = FactorioShader
+	m.set_shader_parameter("activity_glow", glows)
+	m.set_shader_parameter("emission", Color(1.0, 0.6, 0.2))
+	m.set_shader_parameter("emission_energy", 5.0)
+	mesh.surface_set_material(0, m)
+	return mesh
+
+
+func _burner_fx() -> void:
+	BurnerFx.enabled()  # (the command line read once, before the tests set `on`)
+	var burner := _glow_mesh(true)
+	BurnerFx.prepare(burner, "burner-inserter@arg")
+	var plain := _glow_mesh(false)
+	BurnerFx.prepare(plain, "burner-inserter")
+	var electric := _glow_mesh(true)
+	BurnerFx.prepare(electric, "inserter")
+	var heat: Variant = (burner.surface_get_material(0) as ShaderMaterial).get_shader_parameter("glow_heat")
+	check(BurnerFx.burns(burner) and heat != null and float(heat) == BurnerFx.HEAT and not BurnerFx.burns(plain)
+		and not BurnerFx.burns(electric) and _no_heat(electric),
+		"burner fx: a glowing burner inserter's burner gets the coals' heat (%s), one without a glow and an electric inserter don't" % heat)
+	# The pulse: 0.75 to 1.15 of the glow, a few changes a second, each instance out of phase.
+	var lo := 9.0
+	var hi := 0.0
+	var turns := 0
+	var last := 0.0
+	var rising := true
+	var apart := 0.0
+	for i in 600:
+		var t := i * 0.01
+		var w := BurnerFx.heat_wave(t, 0.3)
+		lo = minf(lo, w)
+		hi = maxf(hi, w)
+		if i > 0 and (w > last) != rising:
+			rising = w > last
+			turns += 1
+		last = w
+		apart = maxf(apart, absf(w - BurnerFx.heat_wave(t, 0.71)))
+	check(lo >= 0.749 and hi <= 1.151 and hi - lo > 0.2 and turns >= 6 and turns <= 60 and apart > 0.05,
+		"burner fx: the heat varies %.2f to %.2f of the glow, %d turns in 6 s, two burners apart by up to %.2f" % [lo, hi, turns, apart])
+	# The shader with glow_heat compiles (its uniforms listed); a copy with an error in that sum doesn't.
+	var inc := FileAccess.get_file_as_string("res://shaders/factorio_material.gdshaderinc")
+	var top := FileAccess.get_file_as_string("res://shaders/factorio_material.gdshader")
+	var good := Shader.new()
+	good.code = top.replace('#include "res://shaders/factorio_material.gdshaderinc"', inc)
+	var bad := Shader.new()
+	bad.code = good.code.replace("wave *= 1.0 + glow_heat * (-0.05 + 0.2 * n);", "wave *= 1.0 + glow_heat * (-0.05 + 0.2 * n) +;")
+	var good_u: Array = good.get_shader_uniform_list().map(func(u: Dictionary) -> String: return str(u["name"]))
+	check(good_u.has("glow_heat") and bad.code != good.code and bad.get_shader_uniform_list().is_empty(),
+		"burner fx: the model shader with the heat compiles (%d uniforms); a broken copy doesn't" % good_u.size())
+	# The world: burners whose hand moves, near the listener, smoke and crackle; far ones and idle ones don't.
+	var entities := {}
+	for u in [77, 78, 79]:
+		var r := Rec.new()
+		r.unit = u
+		r.key = u
+		r.pos = Vector2(10.5, 10.5) if u != 78 else Vector2(10.5 + BurnerFx.SMOKE_RANGE + 20.0, 10.5)
+		entities[u] = r
+	var mesh_of := func(_r) -> Mesh: return burner
+	var vent_of := func(r) -> Vector3: return BurnerFx.vent_at(r.pos, 0.0)
+	var fx := BurnerFx.new()
+	var sprites := StubSprites.new()
+	var sources: Array = []
+	var focus := Vector2(12.0, 10.0)
+	fx.scan(entities, {77: 1, 78: 1}, focus, 40.0, sources, mesh_of, vent_of)
+	for i in 600:
+		fx.step(sprites, 1.0 / 60.0)
+	var at: Vector3 = sprites.cards[0][1].pos if not sprites.cards.is_empty() else Vector3.ZERO
+	var expected := 10.0 * BurnerFx.SMOKE_RATE
+	check(fx.burning.keys() == [77] and sprites.cards.size() >= expected * 0.5 and sprites.cards.size() <= expected * 1.6 + 1
+		and sprites.cards.all(func(c: Array) -> bool: return c[0] == "smoke")
+		and at.distance_to(Vector3(10.5, 0.0, 10.5) + BurnerFx.VENT) < 0.01,
+		"burner fx: a burner working near the listener smokes %d wisps in 10 s (about %.0f), from its vent, one far off none (burning %s)" % [sprites.cards.size(), expected, fx.burning.keys()])
+	check(sources.size() == 1 and sources[0]["path"] == BurnerFx.SOUND and int(sources[0]["per_group"]) == BurnerFx.MAX_SOUNDS
+		and sources[0]["pos"] == vent_of.call(entities[77]),
+		"burner fx: its crackle plays (%s), capped per group at %d" % [sources, BurnerFx.MAX_SOUNDS])
+	# Dark (its hand waits): no smoke, no crackle.
+	sources.clear()
+	var before := sprites.cards.size()
+	fx.scan(entities, {}, focus, 40.0, sources, mesh_of, vent_of)
+	for i in 600:
+		fx.step(sprites, 1.0 / 60.0)
+	check(fx.burning.is_empty() and sprites.cards.size() == before and sources.is_empty(),
+		"burner fx: dark, it neither smokes nor crackles")
+	# Many burning at once: the nearest MAX_SOUNDS crackle, all smoke.
+	var many := {}
+	var working := {}
+	for u in range(200, 208):
+		var r := Rec.new()
+		r.unit = u
+		r.pos = focus + Vector2(u - 200, 0.0)
+		many[u] = r
+		working[u] = 1
+	fx.scan(many, working, focus, 40.0, sources, mesh_of, vent_of)
+	var keys: Array = sources.map(func(s: Dictionary) -> String: return str(s["key"]))
+	check(sources.size() == BurnerFx.MAX_SOUNDS and keys == ["burner200", "burner201", "burner202"] and fx.burning.size() == 8,
+		"burner fx: 8 burning, the nearest %d crackle (%s)" % [BurnerFx.MAX_SOUNDS, keys])
+	# --burner-fx=off: no heat on a model, no smoke or crackle (as before).
+	BurnerFx.on = false
+	var off := _glow_mesh(true)
+	BurnerFx.prepare(off, "burner-inserter")
+	sources.clear()
+	fx.scan(entities, {77: 1}, focus, 40.0, sources, mesh_of, vent_of)
+	check(not BurnerFx.burns(off) and _no_heat(off)
+		and fx.burning.is_empty() and sources.is_empty(),
+		"burner fx: --burner-fx=off leaves the burner's glow steady, no smoke, no crackle")
+	BurnerFx.on = true
+
+
+## The Factorio pack's inserters (owner: "the cardboard-cutout look should hold"): with the Factorio pack winning
+## for the inserter, its arm is Factorio's own pictures on cards (the hand base, the hand open while empty and
+## closed while holding) in one MultiMesh per prototype and picture, no 3D arm; the hand card's grip is where the
+## 3D arm's grip is for the same events (the hand's pose is the same whichever way it is drawn), seen along
+## Factorio's camera; a long-handed inserter uses its own pictures and rests as pictures; with Placeholders
+## (or Wube3DP, which has the inserters) winning the 3D arm is drawn as before. Needs the install (its pictures); skipped with a note without.
+func _sprite_arms() -> void:
+	const ModelPacks := preload("res://scripts/world/model_packs.gd")
+	const ItemIcons := preload("res://scripts/world/item_icons.gd")
+	const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
+	if ItemIcons.factorio_data_dir() == "":
+		print("NOTE no Factorio install here: the Factorio pack's inserter arms aren't checked")
+		return
+	var built := ModelPacks.builtin_packs()
+	var off_others := ["builtin:fue5", "builtin:wube3dp"]
+	ModelPacks.set_choices({})
+	ModelPacks.use(ModelPacks.ordered(built, [ModelPacks.FACTORIO_ID, "builtin:placeholders"] + off_others, off_others))
+	ModelLibrary.choices_changed([])
+	var protos := ProtoDB.new()
+	for id in [1, 2]:
+		var p := ProtoDB.EntityProto.new()
+		p.id = id
+		p.name = "inserter" if id == 1 else "long-handed-inserter"
+		p.type = "inserter"
+		protos.entities[id] = p
+	var world := StubWorld.new()
+	var cv := StubChunk.new()
+	world.chunks[Vector2i(0, 0)] = cv
+	for u: int in [77, 78]:
+		var rec := Rec.new()
+		rec.unit = u
+		rec.proto_id = 1 if u == 77 else 2
+		rec.pos = Vector2(10.5, 20.5) if u == 77 else Vector2(14.5, 20.5)
+		world.entities[u] = rec
+		cv.entities[u] = rec
+	var base: Vector2 = world.entities[77].pos
+	var at_pick: Vector2 = (base + Swing.hand_pos(-PI / 2.0, 1.0)) * 256.0
+	var at_drop: Vector2 = (base + Swing.hand_pos(PI / 2.0, 1.2)) * 256.0
+	var pitch := deg_to_rad(SpriteStandins.FACTORIO_PITCH)
+	var facing := Vector3(0.0, sin(pitch), cos(pitch))
+	var poses := {}  # sprite arms on/off -> [[angle, reach, item], ...] per frame
+	for sprites in [true, false]:
+		Arms.belt_clock = true
+		Arms.handoff = true
+		Arms.events = true
+		Arms.events_items = false
+		Arms.rest_arms = true
+		Arms.sprite_arms = sprites
+		var arms := Arms.new()
+		arms.protos = protos
+		arms.world = world
+		var ends := {"x": {"ip": [0, -1], "id": [0, 1.2], "rs": 0.014, "es": 0.035}}
+		arms.eprops = {1: ends, 2: {"x": {"ip": [0, -2], "id": [0, 2.2], "rs": 0.02, "es": 0.05}}}
+		var belts := StubBelts.new()
+		arms.belts = belts
+		arms._ready()  # (not in the tree yet under _init: its parts made here)
+		arms.handle_events({"t": "ie", "k": 100, "n": 6, "p": 2, "part": 1, "parts": 1,
+			"l": [Swing.Ev.SYNC, 77, 100, 0, 0, 0, roundi(at_pick.x), roundi(at_pick.y), 0]})
+		arms.handle_events({"t": "ie", "k": 110, "n": 6, "p": 2, "part": 1, "parts": 1,
+			"l": [Swing.Ev.PICKED, 77, 110, 1, 5, 0, roundi(at_pick.x), roundi(at_pick.y), 3]})
+		arms.handle_events({"t": "ie", "k": 150, "n": 6, "p": 2, "part": 1, "parts": 1,
+			"l": [Swing.Ev.DROPPED, 77, 150, 0, 5, 0, roundi(at_drop.x), roundi(at_drop.y), 0]})
+		var seen: Array = []
+		var wrong_hand := 0
+		var grip_off := 0.0
+		var boxes := 0
+		for t in range(100, 170):
+			belts.t = float(t)
+			arms._process(1.0 / 60.0)
+			var arm = arms._arms[77]
+			seen.append([arm.angle, arm.reach, arm.item_id])
+			for mmi: MultiMeshInstance3D in arms._parts:
+				boxes += mmi.multimesh.visible_instance_count
+			for pieces in arms._model_parts.values():
+				if pieces != null:
+					for mmi: MultiMeshInstance3D in pieces:
+						boxes += mmi.multimesh.visible_instance_count
+			if not sprites:
+				continue
+			if arm.sprite_xf.size() != 3:
+				wrong_hand += 1
+				continue
+			var hand_xf: Transform3D = arm.sprite_xf[1]
+			var piece: int = arm.sprite_xf[2]
+			if piece != (Arms.SpritePiece.CLOSED if arm.item_id > 0 else Arms.SpritePiece.OPEN) or (t < 110 and piece != Arms.SpritePiece.OPEN) \
+					or (t >= 112 and t < 150 and piece != Arms.SpritePiece.CLOSED) or (t >= 152 and piece != Arms.SpritePiece.OPEN):
+				wrong_hand += 1
+			# The card's grip: HAND_TIP short of its top. The 3D arm's: the grip height over the hand's place.
+			var along := hand_xf.basis.y
+			var card_grip := hand_xf.origin + along * 0.5 - along * Arms.HAND_TIP
+			var out := Basis(Vector3.UP, -arm.angle) * Vector3.RIGHT
+			var grip: Vector3 = Vector3(base.x, arms._grip_height(), base.y) + out * arm.reach
+			grip_off = maxf(grip_off, (card_grip - grip).cross(facing).length())
+		poses[sprites] = seen
+		if sprites:
+			var mmis: Array = arms._sprite_mmis.get("inserter", [])
+			var drawn := 0
+			for mmi: MultiMeshInstance3D in mmis:
+				drawn += mmi.multimesh.visible_instance_count
+			check(mmis.size() == 3 and drawn == 2 and boxes == 0,
+				"Factorio pack: the inserter's arm is its pictures, the hand base and one hand card (%d cards, %d MultiMeshes), no 3D arm (%d box or piece instances)" % [drawn, mmis.size(), boxes])
+			check(wrong_hand == 0, "Factorio pack: the hand open while empty, closed from the pick to the drop (%d frames wrong)" % wrong_hand)
+			check(grip_off < 1e-3, "Factorio pack: the hand card's grip is the 3D arm's grip seen along Factorio's camera (%.5f off at most)" % grip_off)
+			var files: Array = (Arms._sprite_pictures.get("inserter", {}) as Dictionary).get("files", [])
+			var long_files: Array = (Arms._sprite_pictures.get("long-handed-inserter", {}) as Dictionary).get("files", [])
+			check(files.size() == 3 and str(files[1]).ends_with("inserter/inserter-hand-open.png") and long_files.size() == 3
+				and str(long_files[0]).ends_with("long-handed-inserter/long-handed-inserter-hand-base.png")
+				and str(long_files[2]).ends_with("long-handed-inserter-hand-closed.png") and arms.sprite_rest_count == 1
+				and arms._sprite_rest_mmis.has("long-handed-inserter"),
+				"Factorio pack: the long-handed inserter (no live arm) rests as its own pictures (%s; %d resting as pictures)" % [long_files, arms.sprite_rest_count])
+			var pose := Arms.sprite_arm_pose("inserter", Vector2(0.0, -1.0), true)
+			check(pose.get("cards", false) and (pose["pieces"] as Array).size() == 2 and pose["pieces"][1][0] == Arms._sprite_pictures["inserter"]["meshes"][Arms.SpritePiece.CLOSED],
+				"the Model packs viewer's pose: the base and the closed hand's cards")
+		else:
+			check(arms._sprite_mmis.is_empty() and boxes > 0, "--inserter-sprite-arms=off: the 3D arm as before (%d instances)" % boxes)
+		for c in arms._cards.get_children():
+			c.free()
+		arms._cards.free()
+		arms.free()
+		belts.free()
+	var most := 0.0
+	for i in mini((poses[true] as Array).size(), (poses[false] as Array).size()):
+		var a: Array = poses[true][i]
+		var b: Array = poses[false][i]
+		most = maxf(most, maxf(absf(angle_difference(a[0], b[0])), absf(a[1] - b[1])))
+		if a[2] != b[2]:
+			most = INF
+	check(most < 1e-6, "the same events give the same hand drawn as pictures or as the 3D arm (%.7f off at most)" % most)
+	# Wube3DP above Factorio (Placeholders has no inserter): its inserter model and the 3D arm, no pictures.
+	Arms.sprite_arms = true
+	ModelPacks.use(ModelPacks.ordered(built, ["builtin:wube3dp", ModelPacks.FACTORIO_ID, "builtin:placeholders", "builtin:fue5"], ["builtin:fue5"]))
+	ModelLibrary.choices_changed([])
+	var arms := Arms.new()
+	arms.protos = protos
+	arms.world = world
+	arms.eprops = {1: {"x": {"ip": [0, -1], "id": [0, 1.2], "rs": 0.014, "es": 0.035}}}
+	var belts := StubBelts.new()
+	belts.t = 105.0
+	arms.belts = belts
+	arms._ready()
+	arms.handle_events({"t": "ie", "k": 100, "n": 6, "p": 2, "part": 1, "parts": 1,
+		"l": [Swing.Ev.SYNC, 77, 100, 0, 0, 0, roundi(at_pick.x), roundi(at_pick.y), 0]})
+	var drawn := 0
+	for i in 600:
+		ModelLibrary.poll()
+		arms._process(1.0 / 60.0)
+		drawn = 0
+		for mmi: MultiMeshInstance3D in arms._parts:
+			drawn += mmi.multimesh.visible_instance_count
+		for pieces in arms._model_parts.values():
+			if pieces != null:
+				for mmi: MultiMeshInstance3D in pieces:
+					drawn += mmi.multimesh.visible_instance_count
+		for rig: Dictionary in arms._rigs.values():
+			for mmi in rig.get("mmis", []):
+				if mmi != null:
+					drawn += (mmi as MultiMeshInstance3D).multimesh.visible_instance_count
+		if drawn > 0 and ModelLibrary.ready("inserter"):
+			break
+		OS.delay_msec(5)
+	check(not ModelLibrary.draws_sprite("inserter") and arms._sprite_mmis.is_empty() and drawn > 0,
+		"Wube3DP above Factorio: the inserter's 3D arm as before (%d instances), no pictures" % drawn)
+	for c in arms._cards.get_children():
+		c.free()
+	arms._cards.free()
+	arms.free()
+	belts.free()
+	world.free()
+	ModelPacks.set_choices({})
+	ModelPacks.use(ModelPacks.ordered(built, [], []))
+	ModelLibrary.choices_changed([])

@@ -23,6 +23,9 @@ art-src/check-log.jsonl in the main checkout (git-ignored, one log for every wor
 Actions the table also goes to the job's summary ($GITHUB_STEP_SUMMARY), and each failure is an
 error annotation naming the check.
 
+Each Godot run writes its own log, art-src/check-logs/<check>.godot.log (`--log-file`), never the
+Zenith project's user://logs/ (%APPDATA%/Godot/app_userdata/Zenith/logs), which keeps the player's own logs.
+
 Godot: $GODOT, else `godot` on PATH, else the console build under ~/Tools/Godot, else winget's.
 Python: this checkout's .venv, else the main checkout's, else the one running this.
 """
@@ -78,6 +81,15 @@ def godot_path() -> str | None:
     return winget[-1] if winget else None
 
 
+def godot_log(name: str, logs: pathlib.Path | None = None) -> list[str]:
+    """`--log-file` for one Godot run: Godot opens its log before any script runs, so only the command line
+    keeps a test's log out of the project's user://logs/, where it would rotate the player's own logs away.
+    Absolute: Godot reads a relative --log-file from the user folder."""
+    folder = (logs or main_checkout() / "art-src" / "check-logs").resolve()  # a relative path is user://'s
+    folder.mkdir(parents=True, exist_ok=True)
+    return ["--log-file", str(folder / (name.replace(" ", "_") + ".godot.log"))]
+
+
 def changed_files(base: str) -> list[str]:
     """Committed since `base`, changed in the working tree and new, as paths from the repo's root."""
     files = set(git("diff", "--name-only", base).splitlines())
@@ -113,6 +125,11 @@ def godot_script(name: str, script: str) -> Check:
     return Check(name, ["-s", "res://tests/" + script], godot=True)
 
 
+# Issue #26's switch for one run: factorio_keys_test checks --keys-defaults=old on its own command line.
+FACTORIO_KEYS_OLD = Check("factorio_keys_test --keys-defaults=old",
+                          ["-s", "res://tests/factorio_keys_test.gd", "--", "--keys-defaults=old"], godot=True)
+
+
 def plan(files: list[str], ui: str | None, done: bool) -> tuple[list[Check], list[str]]:
     """The checks for these files, and notes on what isn't checked here."""
     py = python_path()
@@ -134,7 +151,10 @@ def plan(files: list[str], ui: str | None, done: bool) -> tuple[list[Check], lis
     protocol = any_match(files, "tools/protocol.py", "docs/PROTOCOL.md")
     if any_match(files, "mod/*.lua", "tools/mod_tests/*") or protocol:
         add(tool("tools/mod_tests/test_bridge.py"))
+        # (Every check again with every hello asking for binary frames: mv, bs and bfar through protocol.py.)
+        add(Check("test_bridge --binary", [py, "tools/mod_tests/test_bridge.py", "--binary"]))
         add(tool("tools/mod_tests/test_fuzz.py"))
+        add(tool("tools/mod_tests/test_binary.py"))
     if any_match(files, "mod/*/data*.lua", "mod/*/scripts/gfx_extract.lua", "tools/mod_tests/test_data_stage.py"):
         add(tool("tools/mod_tests/test_data_stage.py"))
     if any_match(files, "tools/mock*.py", "tools/test_mock*.py") or protocol:
@@ -142,8 +162,29 @@ def plan(files: list[str], ui: str | None, done: bool) -> tuple[list[Check], lis
         add(tool("tools/test_mock_fuzz.py"))
     if any_match(files, "server/relay.py", "tools/relay_check.py", "tools/test_relay.py"):
         add(tool("tools/test_relay.py"))
+    if any_match(files, "tools/models/fix_pack.py", "tools/models/fixes/*", "tools/models/test_fix_pack.py",
+               "tools/models/check.py", "tools/models/specs.py"):
+        add(tool("tools/models/test_fix_pack.py"))
+    if any_match(files, "tools/release/package.py", "tools/release/test_package.py"):
+        add(tool("tools/release/test_package.py"))
+    if any_match(files, "tools/safe_delete.py", "tools/test_safe_delete.py", "tools/belt_view_check.py",
+                 "tools/bench/hybrid_cost.py", "tools/look/factorio_reference.py"):
+        add(tool("tools/test_safe_delete.py"))  # a delete never goes through a junction
+    if any_match(files, "tools/check.py", "tools/test_godot_logs.py"):
+        add(tool("tools/test_godot_logs.py"))  # starts Godot: the player's logs stay theirs
+    if any_match(files, "tools/tracker/agents_merge.py", "tools/tracker/test_agents_merge.py"):
+        add(tool("tools/tracker/test_agents_merge.py"))
+    if any_match(files, "tools/tracker/releases.py", "tools/tracker/test_releases.py"):
+        add(tool("tools/tracker/test_releases.py"))
+    if any_match(files, "tools/tracker/usage.py", "tools/tracker/test_usage.py"):
+        add(tool("tools/tracker/test_usage.py"))
+    if any_match(files, "tools/tracker/refresh_dashboard.py", "tools/tracker/test_refresh_dashboard.py"):
+        add(tool("tools/tracker/test_refresh_dashboard.py"))
 
-    models = sorted({pathlib.Path(f).name[:-4] for f in files if fnmatch.fnmatch(f, "client/assets/models/*.glb")})
+    # The packs' models (tools/models/packs.py) as check.py names them: FUE5's share names with ours.
+    # Not their items/ (item models, which items.py checks; fnmatch's * crosses folders).
+    models = sorted({("fue5/" if f.startswith("client/assets/models/packs/fue5/") else "") + pathlib.Path(f).name[:-4]
+                     for f in files if fnmatch.fnmatch(f, "client/assets/models/packs/*/*.glb") and "/items/" not in f})
     if models:
         add(Check("models check.py", [py, "tools/models/check.py", *models]))
     elif any_match(files, "tools/models/*.py"):
@@ -160,11 +201,55 @@ def plan(files: list[str], ui: str | None, done: bool) -> tuple[list[Check], lis
     if any_match(files, "client/scripts/world/mod_files.gd", "client/scripts/world/mod_graphics.gd",
                  "client/scripts/world/sprite_standins.gd", "client/tests/mod_files*"):
         add(godot_script("mod_files_test", "mod_files_test.gd"))
+    if any_match(files, "client/scripts/world/model_packs.gd", "client/scripts/world/model_library.gd",
+                 "client/scripts/world/mod_files.gd", "client/scripts/world/pack_check.gd", "client/tests/model_packs*"):
+        add(godot_script("model_packs_test", "model_packs_test.gd"))
+    if any_match(files, "client/scripts/fx/sound_bank.gd", "client/scripts/world/model_packs.gd",
+                 "client/scripts/world/mod_files.gd", "client/tests/sound_f*"):
+        add(godot_script("sound_files_test", "sound_files_test.gd"))
+    if any_match(files, "client/scripts/player/factorio_keys.gd", "client/scripts/menu/settings.gd", "client/tests/factorio_keys*",
+                 "client/scripts/player/controls.gd", "client/scripts/player/player_input.gd",
+                 "client/scripts/menu/settings_window.gd", "client/scripts/menu/paths.gd", "client/scripts/main.gd"):
+        add(godot_script("factorio_keys_test", "factorio_keys_test.gd"))
+        add(FACTORIO_KEYS_OLD)
+    if any_match(files, "client/scripts/world/item_icons.gd", "client/scripts/ui/factorio/kit.gd",
+                 "client/scripts/ui/factorio/entity_info.gd", "client/tests/icons_later*"):
+        add(godot_script("icons_later_test", "icons_later_test.gd"))
+    if any_match(files, "client/scripts/world/belt_return.gd", "client/shaders/factorio_material.gdshaderinc", "client/tests/belt_cover*"):
+        add(godot_script("belt_cover_test", "belt_cover_test.gd"))
+    if any_match(files, "client/scripts/world/belt_caps.gd", "client/scripts/world/model_library.gd", "client/tests/belt_caps*"):
+        add(godot_script("belt_caps_test", "belt_caps_test.gd"))
+    if any_match(files, "client/scripts/ui/night_vision_overlay.gd", "client/scripts/ui/factorio/night_vision_icon.gd",
+                 "client/scripts/fx/step_sounds.gd", "client/tests/night_vision*"):
+        add(godot_script("night_vision_test", "night_vision_test.gd"))
+    if any_match(files, "client/scripts/world/belt_lane_inset.gd", "client/scripts/world/belt_items.gd", "client/tests/belt_lane_inset*",
+                 "client/scripts/world/model_packs.gd"):
+        add(godot_script("belt_lane_inset_test", "belt_lane_inset_test.gd"))
+    if any_match(files, "client/scripts/world/contact_shade.gd", "client/scripts/world/belt_return.gd", "client/tests/contact_belt_under*"):
+        add(godot_script("contact_belt_under_test", "contact_belt_under_test.gd"))
+    if any_match(files, "client/scripts/ui/factorio/model_preview.gd", "client/scripts/world/model_library.gd",
+                 "client/scripts/world/ground_height.gd", "client/tests/model_preview*"):
+        add(godot_script("model_preview_test", "model_preview_test.gd"))
     if any_match(files, "client/scripts/world/nature_looks.gd", "client/data/nature_looks.json", "client/tests/nature_looks*",
                  "client/shaders/factorio_material*", "client/scripts/world/material_rows.gd"):
         add(godot_script("nature_looks_test", "nature_looks_test.gd"))
+    if any_match(files, "client/scripts/safe_delete.gd", "client/scripts/addons/addon_loader.gd",
+                 "client/scripts/world/model_packs.gd", "client/tests/safe_delete*"):
+        add(godot_script("safe_delete_test", "safe_delete_test.gd"))  # a delete never goes through a link
+    if any_match(files, "client/scripts/world/item_models.gd", "client/scripts/world/model_textures.gd",
+                 "client/shaders/item*", "client/tests/item_materials*"):
+        add(godot_script("item_materials_test", "item_materials_test.gd"))  # an item keeps its file's materials
+    if any_match(files, "client/scripts/world/item_cards.gd", "client/shaders/item_contact*", "client/tests/item_contact*"):
+        add(godot_script("item_contact_test", "item_contact_test.gd"))  # items' contact rims: the box surface, switches
+    if any_match(files, "client/scripts/fx/sound_bank.gd", "client/tests/sound_decode*", "client/tests/sound_cache*"):
+        add(godot_script("sound_decode_test", "sound_decode_test.gd"))
+        add(godot_script("sound_cache_test", "sound_cache_test.gd"))
 
     client_code = any_match(files, "client/scripts/*", "client/tests/ui_test*", "client/tests/test_*")
+    if not ui and not done and any_match(files, "client/scripts/world/contact_shade.gd", "client/shaders/contact_shade.gdshader",
+                                         "client/scripts/world/chunk_view.gd", "client/scripts/world/model_library.gd"):
+        # Contact shading: the rings' rules, the drills' patch and rim, a built chunk's rings.
+        add(godot_scene("ui_test contact", "ui_test.tscn", "--", "--only=_contact_shade,_contact_drills,_contact_chunk"))
     if ui:
         add(godot_scene("ui_test " + ui, "ui_test.tscn", "--", "--only=" + ui))
     elif done and client_code:
@@ -193,37 +278,76 @@ def all_checks(which: str) -> list[Check]:
     if which in ("fast", "both"):
         checks += [
             Check("test_bridge", [py, "tools/mod_tests/test_bridge.py"]),
+            Check("test_bridge --binary", [py, "tools/mod_tests/test_bridge.py", "--binary"]),
             Check("test_data_stage", [py, "tools/mod_tests/test_data_stage.py"]),
             Check("test_mock_server", [py, "tools/test_mock_server.py"]),
             # One Python start for them all: gdparse takes many files (~270 paths, ~10 KB of command line).
             Check("gdparse", [py, "-m", "gdtoolkit.parser", *all_scripts()]),
             Check("models check.py", [py, "tools/models/check.py"]),
+            Check("test_fix_pack", [py, "tools/models/test_fix_pack.py"]),
             Check("test_fuzz", [py, "tools/mod_tests/test_fuzz.py"]),
+            # Binary frames (transport.lua) decode as their JSON does.
+            Check("test_binary", [py, "tools/mod_tests/test_binary.py"]),
             Check("test_mock_fuzz", [py, "tools/test_mock_fuzz.py"]),
             # The relay for a server on another PC, and the mock behind it losing packets.
             Check("test_relay", [py, "tools/test_relay.py"]),
+            # package.py's Zenith.zip: a pack's items/ folder goes in.
+            Check("test_package", [py, "tools/release/test_package.py"]),
+            # Deleting a folder that holds a junction (a linked mod) never empties the junction's target.
+            Check("test_safe_delete", [py, "tools/test_safe_delete.py"]),
         ]
+        # The dashboard's Agents table merged from every session's rows file: a private tool, left out of the
+        # release tree, so only where it is.
+        if (REPO / "tools/tracker/test_agents_merge.py").exists():
+            checks.append(Check("test_agents_merge", [py, "tools/tracker/test_agents_merge.py"]))
+        # The Releases page's data (tools/tracker/releases.py): private too.
+        if (REPO / "tools/tracker/test_releases.py").exists():
+            checks.append(Check("test_releases", [py, "tools/tracker/test_releases.py"]))
+        # The Usage panel's data (tools/tracker/usage.py), offline: private too.
+        if (REPO / "tools/tracker/test_usage.py").exists():
+            checks.append(Check("test_usage", [py, "tools/tracker/test_usage.py"]))
+        if (REPO / "tools/tracker/test_refresh_dashboard.py").exists():
+            checks.append(Check("test_refresh_dashboard", [py, "tools/tracker/test_refresh_dashboard.py"]))
     if which in ("godot", "both"):
         checks += [
             godot_scene("ui_test", "ui_test.tscn"),
             godot_scene("bridge_fuzz_test", "bridge_fuzz_test.tscn"),
             godot_scene("decor_test", "decor_test.tscn"),
             godot_script("mod_files_test", "mod_files_test.gd"),
+            godot_script("model_packs_test", "model_packs_test.gd"),
+            godot_script("sound_files_test", "sound_files_test.gd"),
+            godot_script("model_preview_test", "model_preview_test.gd"),
+            godot_script("belt_caps_test", "belt_caps_test.gd"),
+            godot_script("belt_cover_test", "belt_cover_test.gd"),
+            godot_script("night_vision_test", "night_vision_test.gd"),
+            godot_script("belt_lane_inset_test", "belt_lane_inset_test.gd"),
+            godot_script("contact_belt_under_test", "contact_belt_under_test.gd"),
             godot_script("nature_looks_test", "nature_looks_test.gd"),
+            godot_script("factorio_keys_test", "factorio_keys_test.gd"),
+            FACTORIO_KEYS_OLD,
+            godot_script("icons_later_test", "icons_later_test.gd"),
+            godot_script("sound_decode_test", "sound_decode_test.gd"),
+            godot_script("sound_cache_test", "sound_cache_test.gd"),
+            godot_script("safe_delete_test", "safe_delete_test.gd"),
+            godot_script("item_materials_test", "item_materials_test.gd"),
+            godot_script("item_contact_test", "item_contact_test.gd"),
             godot_scene("addon_test", "addon_test.tscn"),
             godot_scene("vr_test", "vr_test.tscn"),
             godot_script("model_load_test", "model_load_test.gd"),
+            # Starts one Godot test itself, as above: the player's own Godot logs left alone.
+            Check("test_godot_logs", [py, "tools/test_godot_logs.py"]),
         ]
     return checks
 
 
-def run_once(check: Check, godot: str | None) -> tuple[bool, str, str]:
+def run_once(check: Check, godot: str | None, logs: pathlib.Path | None = None) -> tuple[bool, str, str]:
     """(passed, why not, the whole output)."""
     command = check.command
     if check.godot:
         if godot is None:
             return False, "no Godot found: set $GODOT", ""
-        command = [godot, "--headless", "--audio-driver", "Dummy", "--path", str(REPO / "client"), *command]
+        command = [godot, "--headless", "--audio-driver", "Dummy", "--path", str(REPO / "client"),
+                   *godot_log(check.name, logs), *command]
     limit = GODOT_LIMIT if check.godot else 600
     try:
         done = subprocess.run(command, cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -282,15 +406,15 @@ def run_all(which: str, logs: pathlib.Path) -> int:
     godot = godot_path()
     if any(c.godot for c in checks) and godot and not (REPO / "client" / ".godot").exists():
         print("first Godot run in this checkout: importing")
-        subprocess.run([godot, "--headless", "--audio-driver", "Dummy", "--path", str(REPO / "client"), "--import"],
-                       capture_output=True, timeout=900)
+        subprocess.run([godot, "--headless", "--audio-driver", "Dummy", "--path", str(REPO / "client"),
+                        *godot_log("import", logs), "--import"], capture_output=True, timeout=900)
     logs.mkdir(parents=True, exist_ok=True)
     print(f"{len(checks)} checks; each one's whole output in {logs}", flush=True)
     results = []
     total = time.monotonic()
     for check in checks:
         start = time.monotonic()
-        passed, why, output = run_once(check, godot)
+        passed, why, output = run_once(check, godot, logs)
         secs = time.monotonic() - start
         result = "passed" if passed else "failed"
         (logs / (check.name.replace(" ", "_") + ".log")).write_text(output, encoding="utf-8")
@@ -336,7 +460,8 @@ def main() -> int:
     godot = godot_path()
     if any(c.godot for c in checks) and godot and not (REPO / "client" / ".godot").exists():
         print("first Godot run in this checkout: importing")
-        subprocess.run([godot, "--headless", "--audio-driver", "Dummy", "--path", str(REPO / "client"), "--import"], capture_output=True, timeout=600)
+        subprocess.run([godot, "--headless", "--audio-driver", "Dummy", "--path", str(REPO / "client"), *godot_log("import"),
+                        "--import"], capture_output=True, timeout=600)
 
     failed = 0
     total = time.monotonic()

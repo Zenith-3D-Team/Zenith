@@ -22,7 +22,7 @@ const IDLE_LOOP := 22.0 / (0.15 * 60.0)
 ## Tiles walked per run loop: Factorio advances a running animation animation_speed frames per
 ## distance_per_frame walked (UnitPrototype's frames = distance / distance_per_frame x
 ## animation_speed), so 22 frames x 0.13 / 0.6 for the character and / 0.37 for the mech's run
-## (leaving animation_speed out ran the cycle 1.7 times too fast, flailing).
+## (owner's F8: leaving animation_speed out ran the cycle 1.7 times too fast, flailing).
 const RUN_LOOP := 22.0 * 0.13 / 0.6
 const MECH_RUN_LOOP := 22.0 * 0.13 / 0.37
 const MINE_LOOP := 26.0 / (0.9 * 60.0)
@@ -44,6 +44,12 @@ var dead := false
 ## In mech armour (Space Age's mech-armor animations): the right forearm is a gun and the left a
 ## claw, so no pickaxe or hand gun; a long, crouching stride; mining swings the claw.
 var mech := false
+## (Add-on API 1.7) An add-on's lift in the body's own frame (avatar.gd lifted()): the whole pose drawn
+## that far up and across. Not part of drawn_lift(), which stays flight's.
+var extra_offset := Vector3.ZERO
+## (Add-on API 1.7) The add-ons' pose layer (api.character.set_pose; avatar.gd set_pose_layer), in their
+## start order: [rig bone index, turn (Vector3, radians), weight 0 to 1, replace (bool)]. Empty: nothing.
+var layer: Array = []
 
 ## Outputs.
 var pickaxe_shown := false
@@ -54,6 +60,12 @@ var _run_phase := 0.0
 ## I21: each foot coming down in the run loop (the phase passing 0 and half way), counted for
 ## fx.gd's footsteps, so they keep the cycle's beat at every speed.
 var footfalls := 0
+## Which foot the last footfall was (add-ons' api.character footfall): the boundary the phase
+## crossed names it, 0 the right foot's and half way the left's, whichever way the loop runs. Running
+## backwards (shooting while retreating) the half entered is the other foot's, so it can't name it;
+## there the beat comes as that foot lifts, the stance played backwards (_leg), a moment after it
+## came down, and still names the foot that last landed.
+var right_foot := true
 var _mine_clock := 0.0
 var _combat := 0.0
 var _fall := 0.0
@@ -90,8 +102,10 @@ func step(pose: CharacterPose, delta: float, distance: float) -> void:
 		var turn := distance / _loop_length() * TAU
 		var half := floori(_run_phase / PI)
 		_run_phase = fposmod(_run_phase + turn, TAU)
-		if floori(_run_phase / PI) != half:
+		var now_half := floori(_run_phase / PI)
+		if now_half != half:
 			footfalls += 1
+			right_foot = (now_half if turn > 0.0 else half) == 0
 		if absf(turn) > 0.00001:
 			_phase_rate = turn / dt
 	elif _w["run"] > 0.01:
@@ -147,9 +161,54 @@ func step(pose: CharacterPose, delta: float, distance: float) -> void:
 		_crouch(pose, 0.35 * sin(PI * (1.0 - _settle)) * (1.0 - air_weight()), 1.0)
 	_fly(pose)
 	pose.root_offset.y += flight_height * _lift
+	pose.root_offset += extra_offset
+	if not layer.is_empty():
+		_apply_layer(pose, 1.0 - _fall)
 	if _fall > 0.0:
 		_die(pose, _fall)
 	pose.compute()
+
+
+## (Add-on API 1.7) The joints' ranges an add-on's pose layer is held to, per rig bone and axis (radians,
+## the turns of character_pose.gd): every pose Zenith's own animations make (each --anim-pose state, plain
+## and mech, swept: tests/addon_test.gd _pose_limits holds them inside it) and a margin.
+## Swept (both looks, 8 s a state): spine x -0.41 to 0.12, y -0.25 to 0.51 (aim_twist's full MAX_TWIST
+## gives 0.94); head x -0.12 to 0.29; upper arms x -0.9 to 2.9, z -0.33 to 0.4; forearms x -0.3 to 1.7;
+## thighs x -0.32 to 1.02; shins x -2.1 to 0.22. [min, max]; the rest a human joint's room.
+const JOINTS := {
+	"root": [Vector3(-0.6, -1.0, -0.5), Vector3(0.6, 1.0, 0.5)],
+	"spine": [Vector3(-0.9, -1.3, -0.5), Vector3(0.7, 1.3, 0.5)],
+	"head": [Vector3(-0.7, -1.4, -0.5), Vector3(0.8, 1.4, 0.5)],
+	"upper_arm_r": [Vector3(-1.6, -0.8, -0.6), Vector3(3.2, 0.8, 1.6)],
+	"upper_arm_l": [Vector3(-1.6, -0.8, -1.6), Vector3(3.2, 0.8, 0.6)],
+	"forearm_r": [Vector3(-0.5, -0.5, -0.2), Vector3(2.6, 0.5, 0.2)],
+	"forearm_l": [Vector3(-0.5, -0.5, -0.2), Vector3(2.6, 0.5, 0.2)],
+	"thigh_r": [Vector3(-1.2, -0.5, -0.3), Vector3(2.0, 0.5, 0.9)],
+	"thigh_l": [Vector3(-1.2, -0.5, -0.9), Vector3(2.0, 0.5, 0.3)],
+	"shin_r": [Vector3(-2.7, -0.2, -0.2), Vector3(0.5, 0.2, 0.2)],
+	"shin_l": [Vector3(-2.7, -0.2, -0.2), Vector3(0.5, 0.2, 0.2)],
+}
+
+
+## The add-ons' layer over Zenith's pose (`k`: one less the fall, so a dead body lies as Zenith lays it):
+## each entry added, or blended over what is there (`replace`), then each bone it touched held to JOINTS.
+func _apply_layer(pose: CharacterPose, k: float) -> void:
+	if k <= 0.0:
+		return
+	var touched := {}
+	for e: Array in layer:
+		var i: int = e[0]
+		if i < 0 or i >= pose.turns.size():
+			continue
+		var w: float = float(e[2]) * k
+		if w <= 0.0:
+			continue  # weight 0 leaves the bone as it is (and untouched: no JOINTS clamp from it)
+		pose.turns[i] = pose.turns[i].lerp(e[1], w) if bool(e[3]) else pose.turns[i] + (e[1] as Vector3) * w
+		touched[i] = true
+	for i: int in touched:
+		var r: Array = JOINTS.get(pose.names[i], [])
+		if r.size() == 2:
+			pose.turns[i] = pose.turns[i].clamp(r[0], r[1])
 
 
 func _blend(layer: String, goal: float, k: float) -> void:

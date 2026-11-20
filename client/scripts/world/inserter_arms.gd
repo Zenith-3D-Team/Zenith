@@ -47,6 +47,17 @@ extends Node3D
 ## lower and upper arm come from the same two-bone IK with the rig's own joints and lengths, and its
 ## pincers turn about their joints to close while the hand holds an item. Its own materials, no tint.
 ##
+## Drawn by the Factorio pack (model_packs.gd FACTORIO_ID winning for the inserter: ModelLibrary.draws_sprite),
+## whose platform is its own picture on a card (sprite_standins.gd), the arm is Factorio's too: the prototype's
+## hand_base_picture from the shoulder to the elbow and hand_open_picture (empty) or hand_closed_picture (holding)
+## from the elbow to the grip, read from the install (`__base__` / `__space-age__`
+## graphics/entity/<name>/<name>-hand-*.png), each a strip stretched along its piece and laid in Factorio's camera
+## plane as the platform's card is (FACTORIO_PITCH), just in front of it. The joints are the 3D arm's (the same
+## shoulder, IK elbow and grip, projected along the camera onto that plane), so the hand is where the 3D arm's
+## would be, and the held item is drawn in its grip as before; one MultiMesh per prototype and picture, the
+## resting arms' too. An inserter whose pictures aren't found (no install, a mod's) keeps the 3D arm.
+## --inserter-sprite-arms=off: the 3D arm as before. The shadows' pictures aren't drawn (the cards cast their own).
+##
 ## --inserter-arms-trace=<file>: a line per frame with each drawn hand (unit, x, y in tiles, held
 ## item), the game tick the arms stand for, the belts' drawn tick and the frame's arm cost, for
 ## tools/inserter_check.py against the bridge's /f3d-ih trace.
@@ -59,6 +70,8 @@ const GameClock := preload("res://scripts/world/game_clock.gd")
 const BeltSimConst := preload("res://scripts/world/belt_sim.gd")
 ## (rest arms) Plain vertex-coloured boxes on the hills: the loose items' shader (no record: belt_base -1).
 const RestShader := preload("res://shaders/item.gdshader")
+const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
+const ModFiles := preload("res://scripts/world/mod_files.gd")
 
 ## An arm missing from this many updates in a row (the inserter left the radius, or was mined) is
 ## dropped. Every update is the full list, so this counts updates (`k` changes), not ticks.
@@ -154,6 +167,14 @@ static var held_grip := true
 ## (at once), put together at most every REST_REFRESH seconds (at once for a live arm), never per frame. Off:
 ## as before.
 static var rest_arms := true
+## --inserter-sprite-arms=on (the default) | off: see the top (an inserter drawn by the Factorio pack).
+static var sprite_arms := true
+## --ih-apply=quick (the default) | old: a hand update (`ih`) binds an arm to its record again only when the
+## record, its direction, position or pack, or the models in use changed (_bind looked its model's placement
+## up for every hand of every update, most of the handling's time), and an arm's place in the preplan queue
+## is a flag, not a search of the queue; a new arm's belt at its pickup (_belt_at) is looked for only among what
+## stands within a tile. Old: as before. What is drawn is the same either way.
+static var quick_apply := true
 const REST_USEC := 300
 const REST_REFRESH := 0.25
 const REST_UPPER := 0.07  # the boxes' thickness: upper arm, forearm
@@ -179,6 +200,22 @@ const PREPLAN_MIN := 4
 ## (events) An arm keeps at least this many cycles of events, however old (the mod probes the
 ## sweep's side once in 8 legs: 4 cycles).
 const KEEP_CYCLES := 6
+## (L4) A hand counts as moving (anim.gd arm_moving: a modeller's burner inserter's burner lit) from a frame it
+## is drawn turning or reaching until it has stood still this many game ticks: a hand working a steady line
+## waits only a few ticks at each end, so its burner stays lit through them; one waiting for items goes dark.
+const MOVING_HOLD := 30.0
+const STILL := 1e-4  # radians and tiles a frame under which a hand stands still
+## (sprite arms) The pictures, in SpritePiece order, as `<name>-hand-<piece>.png`; the mods looked in; the
+## pictures' scale (Factorio's high-resolution 0.25: 128 px a tile); how far the claw's picture runs past the
+## grip (a share of the hand's length: the item sits between its fingers); how far in front of the platform's
+## card the base piece and the hand are laid (tiles, along the card's facing).
+enum SpritePiece { BASE, OPEN, CLOSED }
+const SPRITE_FILES := ["base", "open", "closed"]
+const SPRITE_MODS := ["base", "space-age"]
+const SPRITE_SCALE := 0.25
+const HAND_TIP := 0.2
+const SPRITE_DEPTH := 0.03
+const SPRITE_HAND_DEPTH := 0.05
 
 
 class Arm:
@@ -186,9 +223,21 @@ class Arm:
 	var proto_name := ""
 	var color := Color.WHITE
 	var item_id := 0  # what the hand is drawn holding
+	## The kind it is drawn as (ItemCards.variant_key: its model's variant), picked each time the hand takes
+	## something new (grabs counts them, with what it held) and kept while it holds it.
+	var held_key := 0
+	var held_was := 0
+	var grabs := 0
 	var angle := 0.0  # where it is drawn
 	var reach := 0.0
+	var seen_angle := NAN  # (L4) where it was drawn the frame before, and the tick it last moved then
+	var seen_reach := NAN
+	var moved_at := -INF
 	var placed := Transform3D.IDENTITY  # the base model's transform (ModelLibrary.placed)
+	var dir := 0
+	var model_name := ""  # its prototype's model name, `name@pack` for a building's own pack (sprite arms)
+	var card_lift := NAN  # (sprite arms) its platform card's lift towards the camera, NAN until known
+	var sprite_xf: Array = []  # (sprite arms, tests) the base's and hand's transforms drawn last, and the hand's SpritePiece
 	var close := 0.0  # a rig's pincers: 0 open, 1 closed on an item
 	# (wall clock) The update interpolation: from the pose the path had when the update came to the
 	# new sample, and where the path is now.
@@ -223,6 +272,14 @@ class Arm:
 	var plan_still_until := -1.0  # the plan's end when it stands still (most arms, most of the time)
 	var plans := {}  # plans made ahead (preplan), by their first sample's tick
 	var bound := false  # its record (base, prototype) known
+	# (quick_apply) What _bind last read: the record, its direction, prototype and pack, and the models' versions.
+	var bound_rec: Object = null
+	var bound_dir := 0
+	var bound_proto := -1
+	var bound_pack := ""
+	var bound_gen := -1
+	var bound_ver := -1
+	var preplanned := false  # (quick_apply) in _preplan
 	var last_heard := -1.0  # the newest event's or sample's tick
 	# (events) By tick, oldest first: kind (Swing.Ev), count, item, c (PICKED/DROPPED: how many
 	# ticks before it may have happened; STATUS/SYNC: the status code), the hand's position (tiles,
@@ -349,6 +406,7 @@ var _drawn := -1.0  # (belt clock) the game tick the arms are drawn at
 var _parts: Array[MultiMeshInstance3D] = []
 ## Prototype name -> [MultiMeshInstance3D per ArmPiece], or null when its models are missing.
 var _model_parts := {}
+var _parts_packs := -1  # ModelPacks.version the pieces were made under
 ## Prototype name -> its model's arm rig (ModelLibrary.rig_for) with "mmis" (a MultiMeshInstance3D per
 ## ModelRig.Part, null for a part it lacks), or {} without one.
 var _rigs := {}
@@ -380,6 +438,10 @@ static func read_flags(args: PackedStringArray) -> void:
 			held_grip = a.substr(16) != "off"
 		elif a.begins_with("--inserter-rest-arms="):
 			rest_arms = a.substr(21) != "off"
+		elif a.begins_with("--inserter-sprite-arms="):
+			sprite_arms = a.substr(23) != "off"
+		elif a.begins_with("--ih-apply="):
+			quick_apply = a.substr(11) != "old"
 	if handoff and not events:
 		# (The hand-off needs the events: the pose stays the samples', the held item follows the events.)
 		events = true
@@ -454,6 +516,7 @@ func reset() -> void:
 	_swept = -1.0
 	_events_heard = false
 	_rest.clear()
+	_rest_sprites.clear()
 	_rest_now.clear()
 	_rest_live.clear()
 	_rest_put = true
@@ -490,16 +553,29 @@ func handle(msg: Dictionary) -> void:
 		_frame_msec = Time.get_ticks_msec()
 		_clock.heard(float(k), p)
 	var list = msg.get("l")
-	if not (list is Array):
+	# (A binary frame's hands come packed, whole: wire_decode.gd, never delta-coded.)
+	if not (list is Array or list is PackedInt32Array or list is PackedInt64Array):
 		return
 	# z = 1: every number is the difference from the hand before it (see belt_items.gd).
 	var deltas := int(msg.get("z", 0)) == 1
-	var v := [0, 0, 0, 0]
+	var unit := 0
+	var x := 0
+	var y := 0
+	var item := 0
 	var i := 0
-	while i + 3 < list.size():
-		for j in 4:
-			v[j] = v[j] + int(list[i + j]) if deltas else int(list[i + j])
-		_update(v[0], Vector2(v[1], v[2]) / 256.0, v[3], k)
+	var n: int = list.size()
+	while i + 3 < n:
+		if deltas:
+			unit += int(list[i])
+			x += int(list[i + 1])
+			y += int(list[i + 2])
+			item += int(list[i + 3])
+		else:
+			unit = int(list[i])
+			x = int(list[i + 1])
+			y = int(list[i + 2])
+			item = int(list[i + 3])
+		_update(unit, Vector2(x, y) / 256.0, item, k)
 		i += 4
 
 
@@ -519,7 +595,9 @@ func _update(unit: int, hand: Vector2, item_id: int, k: int) -> void:
 		_arms[unit] = arm
 	_bind(arm, rec)
 	if belt_clock:
-		if _add_sample(arm, float(k), rel, item_id) and arm.ticks.size() >= 2 and not _preplan.has(arm):
+		if _add_sample(arm, float(k), rel, item_id) and arm.ticks.size() >= 2 \
+				and not (arm.preplanned if quick_apply else _preplan.has(arm)):
+			arm.preplanned = true
 			_preplan.append(arm)
 		return
 	arm.item_id = item_id
@@ -532,13 +610,32 @@ func _update(unit: int, hand: Vector2, item_id: int, k: int) -> void:
 ## The arm's record: its base, prototype (colour, model, family), end poses and speeds. Each update
 ## (the record can change: rotated, upgraded), or when its record first comes (events).
 func _bind(arm: Arm, rec) -> void:
+	var pack := ModelLibrary.entity_pack(rec.extra)
+	if quick_apply and arm.bound_rec == rec and arm.bound_dir == rec.dir and arm.bound_proto == rec.proto_id \
+			and arm.base == rec.pos and arm.bound_pack == pack and arm.bound_gen == ModelLibrary.generation \
+			and arm.bound_ver == ModelLibrary.ModelPacks.version:
+		if belt_clock and not arm.ends_tried:
+			_learn_ends(arm, rec, protos.entity(rec.proto_id) if protos != null else null)
+		return
 	var proto: ProtoDB.EntityProto = protos.entity(rec.proto_id) if protos != null else null
 	arm.color = proto.color if proto != null else Color.GOLDENROD
 	arm.proto_name = proto.name if proto != null else ""
 	arm.base = rec.pos
+	arm.dir = rec.dir
+	var model := arm.proto_name + ("@" + pack if pack != "" else "")
+	if model != arm.model_name:
+		arm.model_name = model
+		arm.card_lift = NAN
 	if proto != null:
 		arm.placed = ModelLibrary.placed(proto.name, proto.type, rec.dir, rec.extra, Vector3(rec.pos.x, 0.0, rec.pos.y))
 	arm.bound = true
+	# (A record whose prototype isn't known yet is looked at again next time.)
+	arm.bound_rec = rec if proto != null else null
+	arm.bound_dir = rec.dir
+	arm.bound_proto = rec.proto_id
+	arm.bound_pack = pack
+	arm.bound_gen = ModelLibrary.generation
+	arm.bound_ver = ModelLibrary.ModelPacks.version
 	if belt_clock and not arm.ends_tried:
 		_learn_ends(arm, rec, proto)
 
@@ -669,8 +766,11 @@ func _belt_at(pos: Vector2) -> bool:
 	var cv = world.chunks.get(Vector2i(floori(pos.x / 32.0), floori(pos.y / 32.0)))  # (world.gd chunk_of)
 	if cv == null:
 		return false
-	for key in cv.entities:
-		var r = cv.entities[key]
+	for r in cv.entities.values():
+		# (quick_apply) Only what stands within a tile is looked up: a busy chunk's thousands of records each
+		# looked up and their type searched for took 0.3 ms an inserter, most of a hand update's time.
+		if quick_apply and r.pos.distance_squared_to(pos) >= 1.0:
+			continue
 		var p: ProtoDB.EntityProto = protos.entity(r.proto_id)
 		if p == null or not BELT_TYPES.has(p.type):
 			continue
@@ -925,6 +1025,7 @@ func _preplan_some() -> void:
 	var n := mini(_preplan.size(), maxi(PREPLAN_MIN, _preplan.size() / 4))
 	for _i in n:
 		var arm: Arm = _preplan.pop_front()
+		arm.preplanned = false
 		var m := arm.ticks.size()
 		if m < 2 or not arm.ends_tried:
 			continue
@@ -965,7 +1066,12 @@ func _process(delta: float) -> void:
 	var held_yaws := {}  # item id -> Array of turns
 	var model_lists := {}  # proto name -> [Array of Transform3D per ArmPiece]
 	var rig_lists := {}  # proto name -> [Array of Transform3D per ModelRig.Part]
+	var sprite_lists := {}  # model name -> [Array of Transform3D per SpritePiece]
 	var live := {}  # unit -> its chunk: the arms drawn live this frame (rest arms leave them out)
+	# (L4) The game tick the hands are drawn at, for how long one has stood still; the world's animator lights
+	# a modeller's burner while its hand moves.
+	var now: float = _drawn if belt_clock and _drawn >= 0.0 else Time.get_ticks_msec() * 0.06
+	var animator = world.get("animator") if world != null else null
 	for unit in _arms:
 		if world != null and not world.entities.has(unit):
 			continue  # mined since the last update, or its chunk not here yet (events)
@@ -986,13 +1092,18 @@ func _process(delta: float) -> void:
 			arm.reach = lerpf(arm.reach, arm.path_reach, follow)
 		var wrist: Vector3
 		_gripped = false
-		var rig = _rig_for(arm.proto_name)
+		var cards := _sprite_set_for(arm.model_name)
+		var rig = {} if not cards.is_empty() else _rig_for(arm.proto_name)
 		if rig == null:
 			continue  # its model is still being read: neither base nor arm is drawn yet
-		if not (rig as Dictionary).is_empty():
+		if not cards.is_empty():
+			if not sprite_lists.has(arm.model_name):
+				sprite_lists[arm.model_name] = [[], [], []]
+			wrist = _draw_sprite_arm(arm, cards, sprite_lists[arm.model_name])
+		elif not (rig as Dictionary).is_empty():
 			if not rig_lists.has(arm.proto_name):
 				rig_lists[arm.proto_name] = [[], [], [], [], []]
-			arm.close = move_toward(arm.close, 1.0 if arm.item_id > 0 else 0.0, delta / CLOSE_TIME)
+			arm.close = ease_close(arm.close, arm.item_id > 0, delta)
 			wrist = _draw_rig_arm(arm, rig, rig_lists[arm.proto_name])
 		elif _pieces_for(arm.proto_name) != null:
 			if not model_lists.has(arm.proto_name):
@@ -1003,14 +1114,24 @@ func _process(delta: float) -> void:
 			colors.append(arm.color)
 		if world != null:
 			live[unit] = world.entities[unit].chunk
+			if animator != null:
+				animator.arm_moving(world.entities[unit], _moving(arm, now))
+		if arm.item_id != arm.held_was:
+			arm.held_was = arm.item_id
+			if arm.item_id > 0:
+				arm.grabs += 1
+				arm.held_key = 0
 		if arm.item_id > 0:
-			if not held.has(arm.item_id):
-				held[arm.item_id] = []
-				held_yaws[arm.item_id] = []
-			held[arm.item_id].append(held_at(arm, wrist))
+			if arm.held_key == 0 or ItemCards.item_of(arm.held_key) != arm.item_id:
+				arm.held_key = _cards.variant_key(arm.item_id, hash([unit, arm.grabs]))
+			var key := arm.held_key
+			if not held.has(key):
+				held[key] = []
+				held_yaws[key] = []
+			held[key].append(held_at(arm, wrist))
 			# (--inserter-grip) A model sits square in the grip, turned with the hand; an icon card keeps its
 			# slight turn (an icon turned with the hand would stand on its head on the way back).
-			held_yaws[arm.item_id].append(-arm.angle if _gripped and _cards.turns(arm.item_id) else ItemCards.turn_for(unit))
+			held_yaws[key].append(-arm.angle if _gripped and _cards.turns(key) else ItemCards.turn_for(unit))
 	for p in _parts.size():
 		var mm := _parts[p].multimesh
 		var xforms: Array = lists[p]
@@ -1047,11 +1168,45 @@ func _process(delta: float) -> void:
 			mm.visible_instance_count = xforms.size()
 			for i in xforms.size():
 				mm.set_instance_transform(i, xforms[i])
+	for model in _sprite_mmis:
+		var mmis: Array = _sprite_mmis[model]
+		var per_piece: Array = sprite_lists.get(model, [[], [], []])
+		for p in mmis.size():
+			_fill(mmis[p].multimesh, per_piece[p])
 	_cards.draw(held, held_yaws)
 	_update_rest(live, delta)
+	if animator != null and not animator.arm_working.is_empty():
+		_stop_unseen(animator, live)
 	_frames += 1
 	if _trace != null and not _arms.is_empty():
 		_write_trace(Time.get_ticks_usec() - usec, t)
+
+
+## A rig's pincers `delta` seconds on: closing onto a held item, opening once it is let go, over CLOSE_TIME.
+static func ease_close(close: float, holding: bool, delta: float) -> float:
+	return move_toward(close, 1.0 if holding else 0.0, delta / CLOSE_TIME)
+
+
+## (L4) Whether an arm's hand is moving: drawn turning or reaching this frame, or within MOVING_HOLD ticks of
+## it (`now`, the tick the hands are drawn at).
+static func _moving(arm: Arm, now: float) -> bool:
+	if absf(angle_difference(arm.seen_angle, arm.angle)) > STILL or absf(arm.reach - arm.seen_reach) > STILL:
+		arm.moved_at = now  # (NAN the first frame: not moving)
+	arm.seen_angle = arm.angle
+	arm.seen_reach = arm.reach
+	return now - arm.moved_at < MOVING_HOLD and now >= arm.moved_at
+
+
+## (L4) Hands no longer drawn live (left the bridge's radius, gone, mined) stop: their arms rest.
+func _stop_unseen(animator, live: Dictionary) -> void:
+	for unit: int in animator.arm_working.keys():
+		if live.has(unit):
+			continue
+		var rec = world.entities.get(unit)
+		if rec == null:
+			animator.arm_working.erase(unit)
+		else:
+			animator.arm_moving(rec, false)
 
 
 ## (rest arms) Every resting arm's box in one MultiMesh (16 floats an instance: the transform's rows, the
@@ -1060,6 +1215,8 @@ func _process(delta: float) -> void:
 ## A chunk whose inserter waits for its model is tried again on the next frames.
 var _rest_mmi: MultiMeshInstance3D = null
 var _rest := {}  # chunk -> PackedFloat32Array
+var _rest_sprites := {}  # (sprite arms) chunk -> {model name -> [PackedFloat32Array per SpritePiece]}
+var sprite_rest_count := 0  # (tests) resting arms drawn as pictures
 var _rest_dirty := {}  # chunk -> true
 var _rest_now := {}  # chunk -> true
 var _rest_live := {}  # unit -> chunk
@@ -1078,6 +1235,9 @@ func _update_rest(live: Dictionary, delta: float) -> void:
 	if not rest_arms or world == null:
 		if _rest_mmi != null and _rest_mmi.visible:
 			_rest_mmi.visible = false
+		for mmis: Array in _sprite_rest_mmis.values():
+			for mmi in mmis:
+				(mmi as MultiMeshInstance3D).visible = false
 		return
 	if not _rest_hooked and world.has_signal("entities_changed"):
 		_rest_hooked = true
@@ -1101,6 +1261,9 @@ func _update_rest(live: Dictionary, delta: float) -> void:
 		_rest_mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		add_child(_rest_mmi)
 	_rest_mmi.visible = true
+	for mmis: Array in _sprite_rest_mmis.values():
+		for mmi in mmis:
+			(mmi as MultiMeshInstance3D).visible = true
 	for u in live:
 		if not _rest_live.has(u):
 			_rest_now[live[u]] = true
@@ -1140,6 +1303,41 @@ func _update_rest(live: Dictionary, delta: float) -> void:
 		mm.buffer = all
 		mm.visible_instance_count = count
 		rest_count = count / 3
+		_put_rest_sprites()
+
+
+## (sprite arms) The resting arms drawn as pictures put together, one MultiMesh per model and picture.
+func _put_rest_sprites() -> void:
+	var all := {}  # model -> [PackedFloat32Array per SpritePiece]
+	for c in _rest_sprites:
+		for model: String in _rest_sprites[c]:
+			if not all.has(model):
+				all[model] = [PackedFloat32Array(), PackedFloat32Array(), PackedFloat32Array()]
+			for p in SpritePiece.size():
+				var into: PackedFloat32Array = all[model][p]
+				into.append_array(_rest_sprites[c][model][p])
+				all[model][p] = into
+	sprite_rest_count = 0
+	for model: String in all:
+		if not _sprite_rest_mmis.has(model):
+			var pictures := _sprite_set_for(model)
+			if pictures.is_empty():
+				continue
+			_sprite_rest_mmis[model] = _sprite_instances(model, pictures, "_rest")
+	for model: String in _sprite_rest_mmis:
+		var per: Array = all.get(model, [PackedFloat32Array(), PackedFloat32Array(), PackedFloat32Array()])
+		for p in SpritePiece.size():
+			var buf: PackedFloat32Array = per[p]
+			var count := buf.size() / 12
+			var mm: MultiMesh = (_sprite_rest_mmis[model][p] as MultiMeshInstance3D).multimesh
+			if mm.instance_count < count or mm.instance_count > maxi(16, count * 4):
+				mm.visible_instance_count = 0
+				mm.instance_count = maxi(16, count + count / 2)
+			buf.resize(mm.instance_count * 12)
+			mm.buffer = buf
+			mm.visible_instance_count = count
+			if p == SpritePiece.BASE:
+				sprite_rest_count += count
 
 
 ## (rest arms) Chunk c's resting arms worked out again: every inserter in it not drawn live. False when one
@@ -1151,6 +1349,7 @@ func _rest_chunk(c: Vector2i) -> bool:
 		_rest.erase(c)
 		return true
 	var buf := PackedFloat32Array()
+	var sprites := {}  # model name -> [PackedFloat32Array per SpritePiece]
 	var done := true
 	for rec in cv.entities.values():
 		var ins = _is_inserter.get(rec.proto_id)
@@ -1159,6 +1358,21 @@ func _rest_chunk(c: Vector2i) -> bool:
 			ins = proto != null and proto.type == "inserter"
 			_is_inserter[rec.proto_id] = ins
 		if not ins or _rest_live.has(rec.unit):
+			continue
+		var pack := ModelLibrary.entity_pack(rec.extra)
+		var model := proto.name + ("@" + pack if pack != "" else "")
+		var pictures := _sprite_set_for(model)
+		if not pictures.is_empty():
+			if not sprites.has(model):
+				sprites[model] = [PackedFloat32Array(), PackedFloat32Array(), PackedFloat32Array()]
+			var x: Dictionary = (eprops.get(rec.proto_id, {}) as Dictionary).get("x", {})
+			var pick := _vec(x["ip"]) if x.has("ip") else Vector2(0.0, -2.0 if ARM_FAMILIES.get(proto.name, "") == "long" else -1.0)
+			pick = _turn(pick, rec.dir)
+			var lift := _platform_lift(proto.name, rec.dir)
+			var xf := sprite_cards(proto.name, pictures, rec.pos, Vector3(rec.pos.x + pick.x, _grip_height(), rec.pos.y + pick.y),
+				0.0 if is_nan(lift) else lift)
+			_rest_xf(sprites[model][SpritePiece.BASE], xf[0])
+			_rest_xf(sprites[model][SpritePiece.OPEN], xf[1])
 			continue
 		var rig = _rig_for(proto.name)
 		if rig == null:
@@ -1169,7 +1383,16 @@ func _rest_chunk(c: Vector2i) -> bool:
 		_rest.erase(c)
 	else:
 		_rest[c] = buf
+	if sprites.is_empty():
+		_rest_sprites.erase(c)
+	else:
+		_rest_sprites[c] = sprites
 	return done
+
+
+static func _rest_xf(buf: PackedFloat32Array, t: Transform3D) -> void:
+	var b := t.basis
+	buf.append_array([b.x.x, b.y.x, b.z.x, t.origin.x, b.x.y, b.y.y, b.z.y, t.origin.y, b.x.z, b.y.z, b.z.z, t.origin.z])
 
 
 ## (rest arms) One inserter's arm at rest into `buf`: from its shoulder (a rig's, or the base's top) through the
@@ -1337,8 +1560,9 @@ func _grip_height() -> float:
 ## drawn (--inserter-grip), else ITEM_DROP below its wrist, as before.
 func held_at(arm: Arm, wrist: Vector3) -> Vector3:
 	if _gripped:
-		_cards.prepare(arm.item_id)  # (its look known, its height with it, from its first frame)
-		return _grip_at - Vector3(0.0, _cards.pile_step(arm.item_id) * 0.5, 0.0)
+		var key := arm.held_key if ItemCards.item_of(arm.held_key) == arm.item_id else arm.item_id
+		_cards.prepare(key)  # (its look known, its height with it, from its first frame)
+		return _grip_at - Vector3(0.0, _cards.pile_step(key) * 0.5, 0.0)
 	return wrist - Vector3(0.0, ITEM_DROP, 0.0)
 
 
@@ -1415,26 +1639,249 @@ static func along(dir: Vector3, s: float) -> Basis:
 	return Basis(Vector3.RIGHT + d * (d.x * k), Vector3.UP + d * (d.y * k), Vector3.BACK + d * (d.z * k))
 
 
+## (sprite arms) Each prototype's pictures, read once: proto name -> {"meshes": [a unit QuadMesh per SpritePiece
+## wearing its picture], "widths": [tiles], "files": [the files]}, or {} when one isn't found (the 3D arm then).
+static var _sprite_pictures := {}
+## (sprite arms) Whether model name draws its arm as pictures, under ModelPacks.version _sprite_version; and the
+## MultiMeshes per model name (live arms, resting arms), [MultiMeshInstance3D per SpritePiece].
+var _sprite_known := {}
+var _sprite_version := -1
+var _sprite_mmis := {}
+var _sprite_rest_mmis := {}
+
+
+## (sprite arms) The pictures an inserter model (`name`, `name@pack`) draws its arm with: those of its prototype
+## when the Factorio pack draws it (ModelLibrary.draws_sprite) and they are found, else {} (the 3D arm).
+func _sprite_set_for(name: String) -> Dictionary:
+	if _sprite_version != ModelLibrary.ModelPacks.version:
+		_sprite_version = ModelLibrary.ModelPacks.version
+		_sprite_known.clear()
+		for list: Dictionary in [_sprite_mmis, _sprite_rest_mmis]:
+			for mmis: Array in list.values():
+				for mmi in mmis:
+					(mmi as Node).queue_free()
+			list.clear()
+		if world != null:
+			for c in world.chunks:
+				_rest_dirty[c] = true
+	var got = _sprite_known.get(name)
+	if got == null:
+		got = sprite_set(name)
+		_sprite_known[name] = got
+		if not (got as Dictionary).is_empty():
+			_sprite_mmis[name] = _sprite_instances(name, got, "")
+	return got
+
+
+## (sprite arms, the model preview too) An inserter model's arm pictures (see _sprite_set_for), {} when it isn't
+## drawn by the Factorio pack or they can't be read.
+## `force` (the preview's, for a name of the Factorio pack's own): whether or not that pack is in use.
+static func sprite_set(name: String, force := false) -> Dictionary:
+	if not sprite_arms or name == "" or not (ModelLibrary.draws_sprite(name) or force):
+		return {}
+	var proto := ModelLibrary.file_of(name)
+	if not _sprite_pictures.has(proto):
+		_sprite_pictures[proto] = _read_sprite_pictures(proto)
+	return _sprite_pictures[proto]
+
+
+static func _read_sprite_pictures(proto: String) -> Dictionary:
+	var meshes: Array = []
+	var widths: Array = []
+	var files: Array = []
+	for piece: String in SPRITE_FILES:
+		var image: Image = null
+		var file := ""
+		for mod: String in SPRITE_MODS:
+			file = "__%s__/graphics/entity/%s/%s-hand-%s.png" % [mod, proto, proto, piece]
+			image = ModFiles.load_image(file)
+			if image != null:
+				break
+		if image == null:
+			return {}
+		image.convert(Image.FORMAT_RGBA8)
+		image.fix_alpha_edges()
+		image.generate_mipmaps()
+		var quad := QuadMesh.new()
+		quad.size = Vector2.ONE
+		var mat := ShaderMaterial.new()
+		mat.shader = SpriteStandins.CARD_SHADER  # cut out, both sides, on the hills: the platform's
+		mat.set_shader_parameter("picture", ImageTexture.create_from_image(image))
+		quad.material = mat
+		meshes.append(quad)
+		widths.append(image.get_width() * SPRITE_SCALE / 32.0)
+		files.append(file)
+	return {"meshes": meshes, "widths": widths, "files": files}
+
+
+func _sprite_instances(name: String, pictures: Dictionary, tag: String) -> Array:
+	var out: Array = []
+	for p in SpritePiece.size():
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = pictures["meshes"][p]
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.name = "%s_sprite%s_%s" % [name.replace("@", "_").replace(":", "_"), tag, SPRITE_FILES[p]]
+		add_child(mmi)
+		out.append(mmi)
+	return out
+
+
+## (sprite arms) The platform card's lift towards the camera (sprite_standins.gd _card_mesh), NAN until made.
+static func _platform_lift(proto: String, dir: int, force := false) -> float:
+	var card := SpriteStandins.card(proto, dir, Vector2.ONE, "inserter", force)
+	return (card as QuadMesh).center_offset.z if card is QuadMesh else NAN
+
+
+## (sprite arms) Adds one arm's cards to `lists` (by SpritePiece); returns where the held item hangs from (its
+## grip is set, as Wube's arm's: the item's middle there).
+func _draw_sprite_arm(arm: Arm, pictures: Dictionary, lists: Array) -> Vector3:
+	if is_nan(arm.card_lift):
+		arm.card_lift = _platform_lift(arm.proto_name, arm.dir)
+	var out := Basis(Vector3.UP, -arm.angle) * Vector3.RIGHT
+	var grip := Vector3(arm.base.x, _grip_height(), arm.base.y) + out * arm.reach
+	var hand: int = SpritePiece.CLOSED if arm.item_id > 0 else SpritePiece.OPEN
+	var xf := sprite_cards(arm.proto_name, pictures, arm.base, grip, 0.0 if is_nan(arm.card_lift) else arm.card_lift, hand)
+	lists[SpritePiece.BASE].append(xf[0])
+	lists[hand].append(xf[1])
+	arm.sprite_xf = [xf[0], xf[1], hand]
+	_gripped = true
+	_grip_at = grip
+	return grip + Vector3(0.0, ITEM_DROP, 0.0)
+
+
+## (sprite arms) Factorio's two pictures for an arm on the inserter at `base` (tiles) with its grip at `grip`:
+## [the base piece's Transform3D, the hand's] for unit quads, from the 3D arm's shoulder through its IK elbow to
+## the grip (the claw's picture HAND_TIP on past it), projected along Factorio's camera onto the platform card's
+## plane, each piece the picture's width across and in front of the card by `lift` and SPRITE_DEPTH /
+## SPRITE_HAND_DEPTH (more where a piece would reach under the ground). Its picture's top at the far end.
+static func sprite_cards(proto: String, pictures: Dictionary, base: Vector2, grip: Vector3, lift: float, hand: int = SpritePiece.OPEN) -> Array:
+	var lengths: Array = ARM_LENGTHS[ARM_FAMILIES.get(proto, "basic")]
+	var shoulder := Vector3(base.x, MODEL_SHOULDER, base.y)
+	var flat := grip - shoulder
+	var out := Vector3(flat.x, 0.0, flat.z).normalized() if Vector2(flat.x, flat.z).length() > 0.001 else Vector3.RIGHT
+	var elbow := _elbow(shoulder, grip, out, float(lengths[0]) * float(lengths[2]), float(lengths[1]) * float(lengths[2]) * CLAW_DEFAULT)
+	var pitch := deg_to_rad(SpriteStandins.FACTORIO_PITCH)
+	var up := Vector3(0.0, cos(pitch), -sin(pitch))
+	var facing := Vector3(0.0, sin(pitch), cos(pitch))
+	var centre := Vector3(base.x, 0.0, base.y)
+	var s := _on_card(shoulder, centre, up)
+	var e := _on_card(elbow, centre, up)
+	var g := _on_card(grip, centre, up)
+	var tip := g + (g - e) * (HAND_TIP / (1.0 - HAND_TIP))
+	var widths: Array = pictures["widths"]
+	# (Both pieces kept above the ground: the lowest corner, along the facing, which lifts as it comes forward.)
+	var low := INF
+	for piece: Array in [[s, e, float(widths[SpritePiece.BASE])], [e, tip, float(widths[hand])]]:
+		var across: Vector3 = _across(piece[1] - piece[0], facing) * (float(piece[2]) * 0.5)
+		for end: Vector3 in [piece[0], piece[1]]:
+			low = minf(low, minf((end + across).y, (end - across).y))
+	var d := maxf(lift, (0.02 - low) / sin(pitch))
+	return [_card_xf(s, e, float(widths[SpritePiece.BASE]), facing, d + SPRITE_DEPTH),
+		_card_xf(e, tip, float(widths[hand]), facing, d + SPRITE_HAND_DEPTH)]
+
+
+## A point moved along Factorio's camera onto the card plane through `centre` (the entity's middle on the ground).
+static func _on_card(p: Vector3, centre: Vector3, up: Vector3) -> Vector3:
+	var d := p - centre
+	return centre + Vector3(d.x, 0.0, 0.0) + up * d.dot(up)
+
+
+static func _across(along: Vector3, facing: Vector3) -> Vector3:
+	var a := along.cross(facing)
+	return a.normalized() if a.length() > 1e-5 else Vector3.RIGHT
+
+
+## A unit quad from `a` (its picture's bottom) to `b` (its top), `width` across, facing the camera, `depth` in
+## front of the plane.
+static func _card_xf(a: Vector3, b: Vector3, width: float, facing: Vector3, depth: float) -> Transform3D:
+	var along := b - a
+	if along.length() < 0.01:
+		along = Vector3(0.0, 0.01, 0.0)
+	return Transform3D(Basis(_across(along, facing) * width, along, facing), (a + b) * 0.5 + facing * depth)
+
+
+## (The model preview, M7) Inserter model `name` (`name@builtin:factorio`, or one the Factorio pack wins for)'s
+## arm as Factorio's pictures with its hand at `hand` (tiles from its middle, facing north: x east, y south),
+## `holding` an item: posed_pieces' form ({"pieces": [[QuadMesh, Transform3D], ...], "grip", "gripped", "wrist",
+## "turn"}, "cards": true), in the entity's space (its middle on the ground at the origin, as
+## SpriteStandins.picture's card drawn with transform(Vector2.ZERO)); {} when it isn't drawn that way. `dir`
+## (16-way) is the platform's picture it stands in front of (the hand is where it is, already turned).
+static func sprite_arm_pose(name: String, hand: Vector2, holding: bool, dir := 0) -> Dictionary:
+	# (Shown from the Factorio pack in the preview whether or not that pack is in use.)
+	var pictures := sprite_set(name, name.ends_with("@" + ModelLibrary.ModelPacks.FACTORIO_ID))
+	if pictures.is_empty():
+		return {}
+	var proto := ModelLibrary.file_of(name)
+	var lift := _platform_lift(proto, dir, true)
+	var grip := Vector3(hand.x, GRIP_HEIGHT, hand.y)
+	var piece: int = SpritePiece.CLOSED if holding else SpritePiece.OPEN
+	var xf := sprite_cards(proto, pictures, Vector2.ZERO, grip, 0.0 if is_nan(lift) else lift, piece)
+	return {"pieces": [[pictures["meshes"][SpritePiece.BASE], xf[0]], [pictures["meshes"][piece], xf[1]]], "grip": grip,
+		"gripped": true, "wrist": grip + Vector3(0.0, ITEM_DROP, 0.0), "turn": Basis(Vector3.UP, -hand.angle()), "cards": true}
+
+
+## Fills a MultiMesh with `xforms`, growing it as needed.
+static func _fill(mm: MultiMesh, xforms: Array) -> void:
+	if mm.instance_count < xforms.size():
+		mm.instance_count = maxi(xforms.size(), mm.instance_count * 2)
+	mm.visible_instance_count = xforms.size()
+	for i in xforms.size():
+		mm.set_instance_transform(i, xforms[i])
+
+
 ## The arm pieces of an inserter prototype, made on first use; null without the models.
 func _pieces_for(proto_name: String):
+	# A pack chosen for an inserter's family (the Model packs window, the building's Model button)
+	# takes its arm too (ModelPacks.PREFIX_FAMILIES): the pieces are made again from the new models.
+	if _parts_packs != ModelLibrary.ModelPacks.version:
+		_parts_packs = ModelLibrary.ModelPacks.version
+		for pieces in _model_parts.values():
+			if pieces != null:
+				for mmi in pieces:
+					(mmi as Node).queue_free()
+		_model_parts.clear()
 	if _model_parts.has(proto_name):
 		return _model_parts[proto_name]
+	var meshes = _arm_meshes(proto_name)
+	if meshes == null:
+		return null
+	var out := []
+	for i in (meshes as Array).size():
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.mesh = meshes[i]
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.name = "%s_%s" % [proto_name, ARM_PIECE_NAMES[i]]
+		add_child(mmi)
+		out.append(mmi)
+	_model_parts[proto_name] = out if not out.is_empty() else null
+	return _model_parts[proto_name]
+
+
+const ARM_PIECE_NAMES := ["upper", "hand-open", "hand-closed"]
+
+
+## Wube's arm pieces for an inserter prototype, [upper, hand open, hand closed] (ArmPiece) in its paint, the
+## models named with `pack` ("@pack", the model preview's; "" the world's, the packs' order); sets its claw's
+## length. Null while one is still being read (on a worker), [] without them.
+func _arm_meshes(proto_name: String, pack := ""):
 	var family: String = ARM_FAMILIES.get(proto_name, "basic")
 	# Made on worker threads (reading one here cost 2-4 ms a piece): the plain arm stands in until then.
+	# Every piece is asked for before waiting, so the three are read side by side, not one after another.
 	var waiting := false
-	for piece in ["upper", "hand-open", "hand-closed"]:
-		if not ModelLibrary.ready("inserter-arm-%s-%s" % [family, piece]):
+	for piece: String in ARM_PIECE_NAMES:
+		if not ModelLibrary.ready("inserter-arm-%s-%s%s" % [family, piece, pack]):
 			waiting = true
 	if waiting:
 		return null
 	var out := []
-	for piece in ["upper", "hand-open", "hand-closed"]:
-		var mesh := ModelLibrary.mesh_for("inserter-arm-%s-%s" % [family, piece])
+	for piece: String in ARM_PIECE_NAMES:
+		var mesh := ModelLibrary.mesh_for("inserter-arm-%s-%s%s" % [family, piece, pack])
 		if not (mesh is ArrayMesh):
-			for mmi in out:
-				mmi.queue_free()
-			out.clear()
-			break
+			return []
 		if piece == "hand-closed":
 			# (The piece points north from the elbow, the wrist at its modelled length; the claw beyond.)
 			var hand_length: float = (ARM_LENGTHS[family] as Array)[1]
@@ -1444,16 +1891,124 @@ func _pieces_for(proto_name: String):
 			# The arm pieces are thin: nearly every face is a bevel or rim to the weathering, which
 			# chipped them all to bare steel. The sprites' arms are painted with a little wear.
 			ModelLibrary.set_named(mesh as ArrayMesh, ModelLibrary.TIER_MATERIAL, "edge_wear", ARM_EDGE_WEAR)
-		var mm := MultiMesh.new()
-		mm.transform_format = MultiMesh.TRANSFORM_3D
-		mm.mesh = mesh
-		var mmi := MultiMeshInstance3D.new()
-		mmi.multimesh = mm
-		mmi.name = "%s_%s" % [proto_name, piece]
-		add_child(mmi)
-		out.append(mmi)
-	_model_parts[proto_name] = out if not out.is_empty() else null
-	return _model_parts[proto_name]
+		out.append(mesh)
+	return out
+
+
+## (The model preview, M7 and M8) An inserter's pickup and drop points (facing north, tiles from its middle)
+## and hand speeds: from its prototype's eprops overlay `x` when a game has sent them, else Factorio 2.1's base
+## values (pickup_position {0, -1}, insert_position {0, 1.2}; long-handed {0, -2}, {0, 2.2}; Swing.SPEEDS).
+## {"pick", "drop": Vector2, "omega": turns a tick, "v": tiles a tick}.
+static func cycle_of(proto_name: String, x := {}) -> Dictionary:
+	var long: bool = ARM_FAMILIES.get(proto_name, "") == "long"
+	var pick := _vec(x["ip"]) if x.has("ip") else Vector2(0.0, -2.0 if long else -1.0)
+	var drop := _vec(x["id"]) if x.has("id") else Vector2(0.0, 2.2 if long else 1.2)
+	var speeds := Swing.speeds(x, proto_name, "normal")
+	return {"pick": pick, "drop": drop, "omega": speeds[0], "v": speeds[1]}
+
+
+## (The model preview) Inserter model `name` (`name@pack`)'s arm as the world draws an idle one: the resting
+## arm's pose (_rest_arm: the hand open over the pickup, at the grip's height). [[mesh, Transform3D in the base
+## model's space], ...]; [] for a model that isn't an inserter, null while its models are read.
+static func resting_pieces(name: String):
+	var arms = new_posing()
+	var posed = arms.posed_pieces(name, cycle_of(ModelLibrary.file_of(name))["pick"], 0.0, false)
+	_free_scratch(arms)
+	return posed if posed == null else (posed as Dictionary).get("pieces", [])
+
+
+## A scratch instance for posed_pieces (never in the tree), kept while a preview plays; _free_scratch frees it.
+static func new_posing():
+	return (load("res://scripts/world/inserter_arms.gd") as GDScript).new()
+
+
+## (The model preview) Inserter model `name`'s arm drawn as the world draws a live one (the same _draw_* calls),
+## its hand at `hand` (tiles from its middle, facing north: x east, y south), its pincers `close` (0 open, 1
+## closed: ease_close) and `holding` an item (Wube's pieces: the closed hand). {"pieces": [[mesh, Transform3D in
+## the base model's space], ...], "grip": where a held item's middle goes, "gripped": whether it has a grip
+## (else the item hangs ITEM_DROP under "wrist"), both in model space, "turn": a held item's turn there}; {} for a
+## model that isn't an inserter,
+## null while its models are read. `dir`: a picture arm's platform's direction (sprite_arm_pose).
+func posed_pieces(name: String, hand: Vector2, close: float, holding: bool, dir := 0):
+	var proto_name := ModelLibrary.file_of(name)
+	if not ModelLibrary.rig_name(proto_name) or proto_name.begins_with("inserter-arm-"):
+		return {}
+	var cards := sprite_arm_pose(name, hand, holding, dir)
+	if not cards.is_empty():
+		return cards  # (the Factorio pack's: its pictures, in the entity's space)
+	if not ModelLibrary.ready(name):
+		return null
+	ModelLibrary.mesh_for(name)  # (its rig made with it)
+	var arm := Arm.new()
+	arm.proto_name = proto_name
+	arm.angle = hand.angle()
+	arm.reach = hand.length()
+	arm.close = close
+	arm.item_id = 1 if holding else 0
+	arm.placed = ModelLibrary.placed(proto_name, "inserter", 0, {}, Vector3.ZERO)
+	var to_model := arm.placed.affine_inverse()
+	var out := []
+	var wrist: Vector3
+	_gripped = false
+	var rig := ModelLibrary.rig_for(name)
+	if not rig.is_empty():
+		var lists := [[], [], [], [], []]
+		wrist = _draw_rig_arm(arm, rig, lists)
+		for p in lists.size():
+			for t: Transform3D in lists[p]:
+				out.append([rig["meshes"][p], to_model * t])
+		return {"pieces": out, "grip": to_model * _grip_at, "gripped": _gripped, "wrist": to_model * wrist,
+			"turn": to_model.basis * Basis(Vector3.UP, -arm.angle)}
+	var at := name.find("@")
+	var meshes = _posed_meshes.get(name)  # (made once: _arm_meshes tints a new copy each time)
+	if meshes == null:
+		meshes = _arm_meshes(proto_name, "" if at < 0 else name.substr(at))
+	if meshes == null:
+		return null
+	_posed_meshes[name] = meshes
+	if not (meshes as Array).is_empty():
+		var lists := [[], [], []]
+		wrist = _draw_model_arm(arm, lists)
+		for p in lists.size():
+			for t: Transform3D in lists[p]:
+				out.append([meshes[p], to_model * t])
+	else:
+		var proto_color: Color = (ARM_TINTS[proto_name][1] as Color) if ARM_TINTS.has(proto_name) else Color.GOLDENROD
+		arm.color = proto_color
+		var lists := []
+		for p in Part.size():
+			lists.append([])
+		wrist = _draw_arm(arm, lists)
+		for p in lists.size():
+			var mesh: PrimitiveMesh = _box_meshes.get(p)
+			if mesh == null:
+				mesh = CylinderMesh.new() if p == Part.TURNTABLE or p == Part.SHOULDER else BoxMesh.new()
+				if mesh is CylinderMesh:
+					(mesh as CylinderMesh).top_radius = 0.5
+					(mesh as CylinderMesh).bottom_radius = 0.5
+					(mesh as CylinderMesh).height = 1.0
+				else:
+					(mesh as BoxMesh).size = Vector3.ONE
+				var material := StandardMaterial3D.new()
+				material.albedo_color = _part_color(p, proto_color)
+				mesh.material = material
+				_box_meshes[p] = mesh
+			for t: Transform3D in lists[p]:
+				out.append([mesh, to_model * t])
+	return {"pieces": out, "grip": to_model * _grip_at, "gripped": _gripped, "wrist": to_model * wrist,
+			"turn": to_model.basis * Basis(Vector3.UP, -arm.angle)}
+
+
+var _box_meshes := {}  # (posed_pieces) the plain arm's part meshes, made once per scratch instance
+var _posed_meshes := {}  # (posed_pieces) model name -> its Wube pieces, made once per scratch instance
+
+
+## Frees an instance made only to work out a pose (resting_pieces, the tests): never in the tree, so its
+## held items' node was never its child.
+static func _free_scratch(arms) -> void:
+	if arms._cards.get_parent() == null:
+		arms._cards.free()
+	arms.free()
 
 
 ## Adds one arm's piece transforms (Wube's models) to `lists` (indexed by ArmPiece); returns
@@ -1530,7 +2085,7 @@ func _draw_arm(arm: Arm, lists: Array) -> Vector3:
 
 
 ## Where the elbow goes: two-bone IK in the arm's vertical plane, bending upwards.
-func _elbow(shoulder: Vector3, wrist: Vector3, out: Vector3, upper: float, fore: float) -> Vector3:
+static func _elbow(shoulder: Vector3, wrist: Vector3, out: Vector3, upper: float, fore: float) -> Vector3:
 	var to_wrist := wrist - shoulder
 	var d := clampf(to_wrist.length(), 0.05, upper + fore - 0.001)
 	var horizontal := Vector2(to_wrist.x, to_wrist.z).dot(Vector2(out.x, out.z))

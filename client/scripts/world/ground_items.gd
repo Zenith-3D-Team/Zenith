@@ -6,6 +6,7 @@ extends Node3D
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const ItemCards := preload("res://scripts/world/item_cards.gd")
+const ItemModels := preload("res://scripts/world/item_models.gd")
 
 ## Just above the terrain, so the cards don't flicker into it.
 const HEIGHT := 0.03
@@ -28,6 +29,7 @@ var _count := 0
 
 func _ready() -> void:
 	_cards.name = "Cards"
+	_cards.contact = true  # a soft rim on the ground under each item (item_contact.gdshader)
 	add_child(_cards)
 
 
@@ -57,18 +59,20 @@ func handle(msg: Dictionary) -> void:
 	if list is Array:
 		var i := 0
 		while i + 2 < list.size():
-			var id := int(list[i])
+			var item := int(list[i])
+			var x := int(list[i + 1])
+			var y := int(list[i + 2])
+			# Its kind: the item with the variant of its model its place picks (ItemCards.variant_key).
+			var id := _cards.variant_key(item, ItemModels.ModelPacks.variant_seed(Vector2i(x, y)))
 			if not _groups.has(id):
 				_groups[id] = []
 				_yaws[id] = []
-			var x := int(list[i + 1])
-			var y := int(list[i + 2])
 			_groups[id].append(Vector3(x / 256.0, HEIGHT, y / 256.0))
 			_yaws[id].append(ItemCards.turn_for(x * 92821 + y))
 			var tile := Vector2i(floori(x / 256.0), floori(y / 256.0))
 			if not _tiles.has(tile):
 				_tiles[tile] = []
-			_tiles[tile].append([Vector2i(x, y), id])
+			_tiles[tile].append([Vector2i(x, y), item])
 			i += 3
 	if int(msg.get("part", 1)) < int(msg.get("parts", 1)):
 		return

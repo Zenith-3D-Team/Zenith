@@ -24,6 +24,8 @@ const RichText := preload("res://scripts/ui/factorio/rich_text.gd")
 const Info := preload("res://scripts/ui/factorio/info_text.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const TechSlot := preload("res://scripts/ui/factorio/tech_slot.gd")
+const CraftingPanel := preload("res://scripts/ui/factorio/crafting_panel.gd")
+const ResearchWindow := preload("res://scripts/ui/factorio/research_window.gd")
 
 signal close_requested
 ## The page's "Open in the technology screen" (and a click on an Unlocked by card).
@@ -55,10 +57,15 @@ class LinkSlot extends Button:
 	const K := preload("res://scripts/ui/factorio/kit.gd")
 	const R := preload("res://scripts/ui/factorio/rich_text.gd")
 	const I := preload("res://scripts/ui/factorio/info_text.gd")
+	const S := preload("res://scripts/ui/factorio/slot.gd")
 	var kind := ""
 	var thing := ""
 	var amount := ""
 	var tip_lines: Array = []
+	## M3: a recipe a technology unlocks: Factorio's recipe tooltip, "<name> (Recipe)" with lines worked out as
+	## it opens (the recipe's page may have come since), the item's own lines under them (Slot.info).
+	var tip_title := ""
+	var tip_fn := Callable()
 
 	func _init() -> void:
 		focus_mode = Control.FOCUS_NONE
@@ -88,7 +95,12 @@ class LinkSlot extends Button:
 			draw_string(f, at, amount, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, K.WHITE)
 
 	func _make_custom_tooltip(_for_text: String) -> Object:
-		return K.tooltip(I.display_name(kind, thing), tip_lines)
+		if not tip_fn.is_valid():
+			return K.tooltip(I.display_name(kind, thing), tip_lines)
+		var lines: Array = tip_fn.call()
+		if S.info.is_valid():
+			lines.append_array(S.info.call(thing))
+		return K.tooltip(tip_title, lines)
 
 
 var model: UiModel
@@ -681,7 +693,7 @@ func _technology_page(d: Dictionary) -> void:
 				unlocks.append(str(e[1]))
 			else:
 				other.append(Info.effect_line(e))
-	_slot_grid("Unlocks recipes", "recipe", unlocks)
+	_slot_grid("Unlocks recipes", "recipe", unlocks, true)
 	if not other.is_empty():
 		var sec := _section("Effects")
 		for line in other:
@@ -1038,7 +1050,7 @@ static func _list(v) -> Array:
 
 
 ## A section of slots ten wide, the last row filled with empty slots.
-func _slot_grid(title: String, link_kind: String, list) -> void:
+func _slot_grid(title: String, link_kind: String, list, recipe_tips := false) -> void:
 	var names := _list(list)
 	if names.is_empty():
 		return
@@ -1049,6 +1061,12 @@ func _slot_grid(title: String, link_kind: String, list) -> void:
 		var b := LinkSlot.new()
 		b.setup(str(target[0]), str(n))
 		b.pressed.connect(show_page.bind(str(target[0]), str(n)))
+		if recipe_tips and ResearchWindow.effect_recipe_tips and model != null:
+			var m := model
+			var recipe := str(n)
+			b.tip_title = "%s (Recipe)" % Kit.recipe_name(recipe)
+			b.tip_fn = func() -> Array: return CraftingPanel.recipe_tip_lines(m, m.recipe_info(recipe), false)
+			b.mouse_entered.connect(func() -> void: m.recipe_info(recipe))
 		grid.add_child(b)
 	for i in (COLUMNS - names.size() % COLUMNS) % COLUMNS:
 		grid.add_child(Kit.empty_cell())

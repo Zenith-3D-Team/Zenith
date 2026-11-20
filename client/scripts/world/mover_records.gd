@@ -142,7 +142,9 @@ func write(slot: int, spots: Array[Vector3], ticks: Array[float], flags: int, he
 		d[o + 8 + i] = ticks[j] - base
 		_ticks[to + i] = ticks[j]
 		if i > 0:
-			length += Vector2(p.x - last.x, p.z - last.z).length()
+			var dx := p.x - last.x
+			var dz := p.z - last.z
+			length += sqrt(dx * dx + dz * dz)
 		last = p
 	walked -= length
 	if loop > 0.0:
@@ -364,9 +366,12 @@ func position(slot: int) -> Vector3:
 	return Vector3(lerpf(d[o + 4], d[o + 6], f), d[o + 13], lerpf(d[o + 5], d[o + 7], f))
 
 
+static var _f32_buf := PackedFloat32Array([0.0])
+
+
 static func _f32(x: float) -> float:
-	var a := PackedFloat32Array([x])
-	return a[0]
+	_f32_buf[0] = x
+	return _f32_buf[0]
 
 
 ## A robot's animation now from its state, as the robot shader works it out: Vector4(how much it
@@ -386,6 +391,60 @@ static func robot_anim(st: Dictionary) -> Vector4:
 	else:
 		reach = move_toward(carried.w, 0.0, 3.0 * since)
 	return Vector4(amount, (st["kind"] as Vector4).x, (1.0 if flags & CARGO else 0.0) + (2.0 if working else 0.0), reach)
+
+
+## Fast path for movers.gd _write: computes Vector2(amount, reach) matching robot_anim(state(slot))
+## without allocating a Dictionary or evaluating yaw/position/walked.
+func robot_carry(slot: int) -> Vector2:
+	var o := slot * FLOATS
+	var d := data
+	var flags := int(d[o + 12])
+	if not (flags & ANIMATED):
+		return Vector2.ZERO
+	var c := clocks()
+	var now := _f32(c.y if flags & ODD else c.x)
+	var r := maxf(rate, 1.0)
+	var after := maxf(now - d[o + 15], 0.0)
+	var lag := _lag_after(o, after)
+	var drawn := now - lag
+	var pace := 1.0 - (lag - _lag_after(o, maxf(after - 1.0, 0.0)))
+	var speed := 0.0
+	var still := 0.0
+	if drawn > d[o + 8]:
+		var found := false
+		for i in 3:
+			if drawn <= d[o + 9 + i]:
+				var span: float = d[o + 9 + i] - d[o + 8 + i]
+				if span > 1e-4:
+					var dx: float = d[o + i * 2 + 2] - d[o + i * 2]
+					var dz: float = d[o + i * 2 + 3] - d[o + i * 2 + 1]
+					speed = sqrt(dx * dx + dz * dz) / span
+				found = true
+				break
+		if not found:
+			var span: float = d[o + 11] - d[o + 10]
+			var ext: float = d[o + 23]
+			if span > 1e-4:
+				var f: float = (drawn - d[o + 10]) / span
+				if f < ext:
+					var dx: float = d[o + 6] - d[o + 4]
+					var dz: float = d[o + 7] - d[o + 5]
+					speed = sqrt(dx * dx + dz * dz) / span
+				else:
+					still = drawn - (d[o + 10] + ext * span)
+			else:
+				still = drawn - d[o + 11]
+	var since := after / r
+	var amount := move_toward(d[o + 18], clampf(speed * pace * r / ROBOT_FULL_SPEED, 0.0, 1.0), 3.0 * since)
+	var stl := still / r
+	var working := (flags & BUILDER) != 0 and stl > ROBOT_WORK_STILL
+	var reach := 0.0
+	if working:
+		var began := maxf(since - (stl - ROBOT_WORK_STILL), 0.0)
+		reach = move_toward(move_toward(d[o + 19], 0.0, 3.0 * began), ROBOT_ARMS_REACH, 3.0 * (since - began))
+	else:
+		reach = move_toward(d[o + 19], 0.0, 3.0 * since)
+	return Vector2(amount, reach)
 
 
 ## A walking creature's gait phase and strength now, as the shader works them out: the strength from

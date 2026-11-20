@@ -56,6 +56,7 @@ const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const CursorOverlay := preload("res://scripts/player/cursor_overlay.gd")
 const GroundItems := preload("res://scripts/world/ground_items.gd")
 const PoleCoverage := preload("res://scripts/player/pole_coverage.gd")
+const PipelineMarks := preload("res://scripts/player/pipeline_marks.gd")
 const UndergroundPairs := preload("res://scripts/world/underground_pairs.gd")
 const BlueprintPreview := preload("res://scripts/player/blueprint_preview.gd")
 ## The previews' plain marks (an item's box without a model, the drag box, pole lines) ride the hills.
@@ -71,6 +72,7 @@ const DragBuild := preload("res://scripts/player/drag_build.gd")
 const SpiderRemote := preload("res://scripts/player/spider_remote.gd")
 const VisualTurns := preload("res://scripts/world/visual_turns.gd")
 const AimPick := preload("res://scripts/world/aim_pick.gd")
+const ResourceHints := preload("res://scripts/player/resource_hints.gd")
 
 const REPEAT := 0.15
 ## First person (K7): how far the crosshair's ray looks for an entity before the ground's point
@@ -149,7 +151,11 @@ var movers: MoverLayer = null
 var ground_items = null
 ## Electric poles' supply areas while a pole is held or hovered (J4).
 var pole_cover := PoleCoverage.new()
+## Factorio 2.1's fluid pipeline visualization, hovered or held in Alt-mode (N9).
+var pipeline_vis := PipelineMarks.new()
 var wires = null  # wires.gd, for where a dragged wire hangs from
+## The belt items' layer (belt_items.gd), which shows an item Z drops on a belt at once (drop_show_now). Untyped.
+var belt_items = null
 var wire_tool := WireTool.new()
 ## The spidertron remote's selection and waypoints (cursor_tool "spidertron").
 var spider_remote := SpiderRemote.new()
@@ -216,9 +222,42 @@ var _mine_key: Variant = null
 ## Tests set it: where the character stands, for the cursor's offset from it in `mine`, when there
 ## is no avatar.
 var character_at_for_test := Vector2.INF
+## Issue #24: no swing (sound, sparks, dust) at something out of the character's reach, as in
+## Factorio: the swing starts on the click (avatar.mine_hint, I20) only when the target is within the
+## bridge's own reach (puppet.lua can_hand_mine), and stops on the bridge's "Out of reach" while the
+## button stays on that target. `--mine-reach-check=off`: the hint on every click, as before.
+static var mine_reach_check := not OS.get_cmdline_user_args().has("--mine-reach-check=off")
+## The target the bridge last refused as out of reach while it was held, and where the character
+## stood then: no swing at it again until another target, the character moving or the button let go.
+var _reach_refused_key: Variant = null
+var _reach_refused_at := Vector2.INF
+## Whether that refusal was for reach (moving tries again) or for the target itself (it stays).
+var _refused_for_reach := true
+## Prototypes the bridge refused as kinds that can't be mined by hand ("This needs a mining drill"):
+## every entity of them is silent until the button is let go, so a sweep over a uranium patch doesn't
+## swing on each new tile before its refusal comes back.
+var _refused_protos := {}
+## The prototype of the target the last `mine` was for (an entity's or a mover's), for _refused_protos.
+var _mine_proto := 0
+## Every reason puppet.lua's can_hand_mine refuses a hand mine with, and what it refuses: "reach" the
+## target from where the character stands, "target" that entity, "kind" its whole prototype. Keep in
+## step with can_hand_mine's `return false, "<reason>"` lines (issue #24).
+const MINE_REFUSALS := {
+	"Out of reach": "reach",
+	"Can't mine that": "target",
+	"This needs a mining drill": "kind",
+	"This needs a pump or drill": "kind",
+}
 ## The mover last marked for deconstruction from the remote view while the button is held.
 var _remote_marked_mover := 0
 var _pickup_timer := 0.0
+## F held (a `pickup` sent since it was last let go): its release sends `pickup_stop`, so the bridge picks no more
+## (it kept a pickup 30 ticks after the last one, picking on for up to half a second); `--pickup-stop=off` as before.
+var _pickup_held := false
+var pickup_stop := not OS.get_cmdline_user_args().has("--pickup-stop=off")
+## F read with exactly its modifiers, as shooting and dropping are: Ctrl+F (search) and Alt+F (the personal
+## roboport) held don't pick up, as in Factorio. `--pickup-exact=off`: any modifier held too, as before.
+var pickup_exact := not OS.get_cmdline_user_args().has("--pickup-exact=off")
 var _drop_timer := 0.0
 var _shoot_mode := -1
 var _shoot_timer := 0.0
@@ -236,9 +275,16 @@ var _bp_mode := 0
 ## Ctrl+click held down (MOUSE_BUTTON_LEFT / RIGHT, or NONE) and the entity it last went to; a
 ## Shift+left paste held down and the entity it last pasted to.
 var _fast_button := MOUSE_BUTTON_NONE
-var _fast_target: WorldMirror.Rec = null
+var _fast_target: Variant = null  # the key of what this Ctrl+click drag last did (_fast_pick)
 var _fast_putting := false  # this Ctrl+click drag began with a stack held (puts), else it takes
 var _paste_dragging := false
+## Camera turn rate (rad/s) or mouse cursor speed (px/s) above which hover-panel rebuilds and
+## `hinfo` requests pause until motion slows, so spinning the camera doesn't churn UI/UDP.
+const HOVER_FAST_TURN := PI * 0.5  # 90 deg/s
+const HOVER_FAST_MOUSE := 1200.0   # px/s
+var _last_cam_dir := Vector3.ZERO
+var _last_hover_screen := Vector2.INF
+var _last_hover_usec := 0
 var _paste_target: WorldMirror.Rec = null
 ## The blueprint window's "Select new contents": the blueprint tool's area goes into this
 ## blueprint (a main slot, -1 the library one) instead of a new one; 0 none.
@@ -267,7 +313,7 @@ var _ghost_model_materials := {}
 var _ghost_pieces: Array[MeshInstance3D] = []
 ## Selection brackets, arrows and areas (cursor_overlay.gd).
 var _overlay := CursorOverlay.new()
-## Which roboports are linked, for the lines between them.
+## Which roboports are linked, for the lines between them (H14).
 var roboport_links: RoboportLinks = null
 ## A held blueprint's and the clipboard's entities at the cursor, as their models (K11).
 var bp_preview := BlueprintPreview.new()
@@ -314,6 +360,8 @@ func _ready() -> void:
 	_ghost_model.visible = false
 	world.add_child(_ghost_model)
 	world.add_child(_overlay)
+	pipeline_vis.world = world
+	world.add_child(pipeline_vis)
 	bp_preview.world = world
 	bp_preview.replace_groups = REPLACE_GROUPS
 	bp_preview.refused = func(proto_id: int) -> bool: return hud.ui.model.cant_build_reason(proto_id) != ""
@@ -347,7 +395,8 @@ func _unhandled_input(event: InputEvent) -> void:
 		_mouse_button(event as InputEventMouseButton)
 	elif event is InputEventMouseMotion:
 		var mm := event as InputEventMouseMotion
-		if rig.first_person and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		# Not while an add-on has the camera (1.7): the hidden first-person view drifted, seen on release.
+		if rig.first_person and not rig.taken() and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 			rig.look(mm.relative)
 		elif mm.button_mask & MOUSE_BUTTON_MASK_MIDDLE:
 			rig.rotate_free(-mm.relative.x * 0.3)
@@ -387,8 +436,8 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif Controls.pressed(event, "give_deconstruction_planner"):
 		hold_tool("decon")
 	elif Controls.pressed(event, "toggle_rail_layer") and cursor_tool == "" and not rail_planner.use_of(cursor_item).is_empty():
-		# Alt+R is both the rail layer (this client's default) and Factorio's red wire: rails in
-		# hand take it, anything else gives the wire.
+		# The rail layer's key is shared (Controls.SHARED): Factorio 2.1's G also gets in a vehicle, Zenith's
+		# Alt+R also gives a red wire. Rails in hand take it, anything else falls through to the other.
 		rail_planner.toggle_layer()
 	elif Controls.pressed(event, "give_red_wire"):
 		hold_tool("red-wire")
@@ -659,8 +708,8 @@ func _process(delta: float) -> void:
 
 
 func _update_ground() -> void:
-	over_gui = hud.ui.mouse_over_gui() and not rig.first_person
-	var screen: Vector2 = rig.aim_position() if rig.first_person else hud.ui.mouse_position()
+	over_gui = hud.ui.mouse_over_gui() and not rig.aims_center()
+	var screen := _aim_screen()
 	var p = rig.ground_point(screen)
 	has_ground = p != null and not over_gui
 	if has_ground:
@@ -679,13 +728,27 @@ func _update_ground() -> void:
 		hovered_mover = _nearer_than_aim(_mover_under_mouse())
 		if not hovered_mover.is_empty():
 			hovered = null
-			if rig.first_person and fp_pick_models:
+			if rig.aims_center() and fp_pick_models:
 				# The cursor on the vehicle looked at, even looking level (no ground under the aim).
 				ground = hovered_mover[3]
 				has_ground = true
 	world._prof("in_mover", t0)
 	t0 = Time.get_ticks_usec()
-	hud.ui.set_selected(hovered)
+	var now_usec := t0
+	var dt_s := float(now_usec - _last_hover_usec) / 1e6 if _last_hover_usec > 0 else 0.0
+	_last_hover_usec = now_usec
+	var cam_dir := rig.camera.global_basis.z if rig != null and rig.camera != null else Vector3.ZERO
+	var hover_fast := false
+	if dt_s > 0.0005 and dt_s < 0.25:
+		if _last_cam_dir != Vector3.ZERO and cam_dir != Vector3.ZERO:
+			if cam_dir.angle_to(_last_cam_dir) / dt_s > HOVER_FAST_TURN:
+				hover_fast = true
+		if not hover_fast and rig != null and not rig.aims_center() and _last_hover_screen.is_finite():
+			if screen.distance_to(_last_hover_screen) / dt_s > HOVER_FAST_MOUSE:
+				hover_fast = true
+	_last_cam_dir = cam_dir
+	_last_hover_screen = screen if rig != null and not rig.aims_center() else Vector2.INF
+	hud.ui.set_selected(hovered, hover_fast)
 	world._prof("in_panel", t0)
 
 
@@ -697,11 +760,12 @@ func _update_ground() -> void:
 func _aim_from(screen: Vector2, p) -> void:
 	_aim = []
 	_aim_ground = Vector2.INF
-	if rig == null or not rig.first_person or not fp_pick_models or over_gui or _clean_shot:
+	if rig == null or not rig.aims_center() or not fp_pick_models or over_gui or _clean_shot:
 		return
 	var r := rig.ray(screen)
 	var from: Vector3 = r[0]
-	var limit := AIM_RANGE
+	# An add-on's camera modifier (1.7) moves the eye: the reach is cut by as much, never grown.
+	var limit := AIM_RANGE - rig.modifier_reach()
 	if p != null:
 		limit = minf(limit, from.distance_to(Vector3(p.x, GroundHeight.at(p.x, p.z), p.z)))
 	_aim = AimPick.pick(world, from, r[1], limit)
@@ -713,6 +777,12 @@ func _aim_from(screen: Vector2, p) -> void:
 	ground = Vector2(clampf(at.x, rect.position.x + inset, rect.end.x - inset), clampf(at.z, rect.position.y + inset, rect.end.y - inset))
 	has_ground = true
 	_aim_ground = ground
+
+
+## Where the player aims on screen: the middle in first person or under an add-on's camera aiming at
+## the centre (rig.aims_center, 1.7), else the mouse (as the UI sees it).
+func _aim_screen() -> Vector2:
+	return rig.aim_position() if rig.aims_center() else hud.ui.mouse_position()
 
 
 ## The entity the cursor is on: in first person the one the crosshair's ray met (K7), else the one
@@ -771,7 +841,7 @@ func _update_walk(delta: float) -> void:
 		var world_dir := rig.ground_right() * input.x + rig.ground_forward() * input.y
 		var angle := atan2(world_dir.x, -world_dir.z)  # clockwise from north
 		dir = posmod(int(round(angle / (TAU / 8.0))), 8) * 2
-		# Any angle, in thousandths of a turn; the mod steps between Factorio's 8 ways to follow it.
+		# B7: any angle, in thousandths of a turn; the mod steps between Factorio's 8 ways to follow it.
 		turn = posmod(int(round(angle / TAU * 1000.0)), 1000)
 	_walk_timer -= delta
 	var turned := turn >= 0 and _walk_turn >= 0 and absi(posmod(turn - _walk_turn + 500, 1000) - 500) >= TURN_STEP
@@ -859,6 +929,8 @@ func _update_mining(delta: float) -> void:
 			_mine_target = null
 		if avatar != null:
 			avatar.mine_hint_clear()
+		_reach_refused_key = null
+		_refused_protos.clear()
 		return
 	if not tile_brush.use_of(cursor_item).is_empty() and cursor_tool == "":
 		# A tile in hand: the right button mines the placed tiles under the brush, as in Factorio.
@@ -919,15 +991,13 @@ func _update_mining(delta: float) -> void:
 		Bridge.send(_with_offset({"t": "mine", "u": int(mover[0]), "p": int(mover[1]), "x": at.x, "y": at.y}))
 		_mining = true
 		_mine_target = null
-		if avatar != null:
-			avatar.mine_hint(mover[3])
+		_hint_swing(key, mover[3], false, int(mover[1]))
 		return
 	if target != null:
 		Bridge.send(_with_offset({"t": "mine", "u": target.unit, "p": target.proto_id, "x": target.fixed.x, "y": target.fixed.y}))
 		_mining = true
 		_mine_target = target
-		if avatar != null:
-			avatar.mine_hint(target.pos)
+		_hint_swing(key, target.pos, _is_resource(target), target.proto_id)
 		return
 	# Nothing under the mouse: where it is, so the bridge mines what the walking character brings under
 	# it (J26: the cursor stays put on the screen while the view follows the character).
@@ -936,6 +1006,70 @@ func _update_mining(delta: float) -> void:
 		Bridge.send(none)
 		_mining = true
 		_mine_target = null
+
+
+## Issue #24: the swing's hint for a `mine` just sent at `at` (prototype `proto`): given only within the
+## bridge's reach and not at a target or kind it refused (MINE_REFUSALS); otherwise any hint goes, so
+## nothing swings (the `mine` is still sent, and the bridge says why as Factorio does).
+func _hint_swing(key: Variant, at: Vector2, resource: bool, proto: int) -> void:
+	_mine_proto = proto
+	if avatar == null:
+		return
+	if not mine_reach_check:
+		avatar.mine_hint(at)
+		return
+	var me := _character_at()
+	if _reach_refused_key != null and (typeof(key) != typeof(_reach_refused_key) or key != _reach_refused_key
+			or (_refused_for_reach and (me == Vector2.INF or me.distance_to(_reach_refused_at) > REFUSED_MOVE))):
+		_reach_refused_key = null
+	if _reach_refused_key == null and not _refused_protos.has(proto) and mine_in_reach(at, resource):
+		avatar.mine_hint(at)
+	else:
+		avatar.mine_hint_clear()
+
+
+## How far the character may move before a target refused as out of reach is tried again (tiles).
+const REFUSED_MOVE := 0.25
+## Factorio 2.1's character without bonuses (base's character prototype): reach_distance 10 and
+## resource_reach_distance 2.7, until the bridge's `cinfo` gives the character's own.
+const MINE_REACH := 10.0
+const MINE_RESOURCE_REACH := 2.7
+
+
+## Within the bridge's reach for mining by hand (puppet.lua can_hand_mine): the character's
+## resource_reach_distance for a resource, else its reach_distance, plus the bridge's slack, from
+## the character to the target's middle. No character known: in reach (the bridge decides).
+func mine_in_reach(at: Vector2, resource: bool) -> bool:
+	var me := _character_at()
+	if me == Vector2.INF:
+		return true
+	var reach := MINE_RESOURCE_REACH if resource else MINE_REACH
+	if hud != null and hud.ui != null and hud.ui.model != null:
+		reach = hud.ui.model.mine_reach(resource)
+	return me.distance_to(at) <= reach + BRIDGE_REACH_SLACK
+
+
+func _character_at() -> Vector2:
+	if avatar != null:
+		return avatar.ground_position()
+	return character_at_for_test
+
+
+## A message from the bridge (`msg`, main.gd). Issue #24: a refusal of the hand mine held
+## (MINE_REFUSALS) stops the swing at once and keeps it stopped: out of reach while the button stays on
+## that target and the character stands; "Can't mine that" while it stays on that target; a kind that
+## needs a drill or pump for every entity of it until the button is let go.
+func heard_message(text: String) -> void:
+	if not mine_reach_check or not MINE_REFUSALS.has(text) or not _rmb_down or not _mining or _mine_key == null:
+		return
+	var what: String = MINE_REFUSALS[text]
+	if what == "kind" and _mine_proto > 0:
+		_refused_protos[_mine_proto] = true
+	_reach_refused_key = _mine_key
+	_reach_refused_at = _character_at()
+	_refused_for_reach = what == "reach"
+	if avatar != null:
+		avatar.mine_hint_clear()
 
 
 ## A `mine` with the cursor's place from the character as drawn (`ox`, `oy`, 1/256 tiles), which
@@ -983,11 +1117,21 @@ func _mark_for_deconstruction(target: WorldMirror.Rec) -> void:
 
 
 ## Holding F picks up items on the ground around the character, like in Factorio.
+## Polled, so a release over the HUD (or the key going to a text box) still stops it. Exact (pickup_exact):
+## Godot keeps whether the last F event matched exactly, so F pressed under Ctrl stays not picking when Ctrl
+## is let go, until F is pressed again; Ctrl pressed while F is held doesn't stop it either.
 func _update_pickup(delta: float) -> void:
 	_pickup_timer -= delta
-	if Input.is_action_pressed("pick_up") and not hud.ui.typing() and _pickup_timer <= 0.0:
+	var held := Input.is_action_pressed("pick_up", pickup_exact) and not hud.ui.typing()
+	if held and _pickup_timer <= 0.0:
 		Bridge.send({"t": "pickup"})
 		_pickup_timer = REPEAT
+		_pickup_held = true
+	elif not held and _pickup_held:
+		_pickup_held = false
+		if pickup_stop:
+			Bridge.send({"t": "pickup_stop"})
+			_pickup_timer = 0.0  # pressed again, it picks at once
 
 
 ## Z drops one of the held item where the mouse is; held down it keeps dropping, like Factorio.
@@ -1001,17 +1145,25 @@ func _update_drop(delta: float) -> void:
 	_drop_timer = REPEAT
 	if cursor_item == "" or cursor_tool != "" or not has_ground:
 		return
-	Bridge.send({"t": "drop", "item": cursor_item, "x": int(ground.x * 256.0), "y": int(ground.y * 256.0)})
+	var cmd := {"t": "drop", "item": cursor_item, "x": int(ground.x * 256.0), "y": int(ground.y * 256.0)}
+	# L7: out of the held stack's own slot, as Factorio drops from the cursor (not another stack of it).
+	var hs: int = hud.ui.build_slot()
+	if hs > 0:
+		cmd["hs"] = hs
+	Bridge.send(cmd)
+	if belt_items != null and world != null:
+		belt_items.predict_drop(world.protos.item_id(cursor_item), ground.x, ground.y)
 
 
-## Like Factorio: Space shoots at enemies near the character (the game picks the target), C at
-## whatever is under the cursor.
+## Like Factorio: Space shoots at enemies near the character (the game picks the target), Shift+Space
+## (1.1's C) at whatever is under the cursor. Both with exactly their modifiers: Shift+Space never
+## shoots at enemies, even where it can't shoot at the cursor (a screen open, no ground).
 func _update_shooting(delta: float) -> void:
 	var mode := -1
 	if not hud.ui.typing():
 		if Input.is_action_pressed("shoot_cursor", true) and has_ground and not hud.ui.is_open():
 			mode = 1
-		elif Input.is_action_pressed("shoot_enemies"):
+		elif Input.is_action_pressed("shoot_enemies", true):
 			mode = 0
 	if combat != null:
 		combat.aim_mode = mode
@@ -1028,26 +1180,39 @@ func _update_shooting(delta: float) -> void:
 ## 30 ticks) and at once when the mouse comes onto another; `repair` without a target as the button lets
 ## go or the mouse leaves it. The bridge decides what may be mended (damaged, the character's force, in
 ## reach) and mends it at the pack's speed; the health bar rises from its `hp`.
+## N4: vehicles and wagons too, as Factorio mends them: they are movers, not the world's records, so
+## they are picked by their own box (MoverLayer.pick_ray, which hovered_mover skips with an item held)
+## and win over the rail or ground under them.
 func _update_repair(delta: float) -> void:
-	var target: WorldMirror.Rec = null
+	var unit := 0
+	var proto_id := 0
+	var at := Vector2i.ZERO
 	if _lmb_down and cursor_tool == "" and has_ground and not hud.ui.remote and hud.ui.model.is_repair_tool(cursor_item):
-		target = _cursor_pick()
-		if target != null and target.unit <= 0:
-			target = null
-	if target == null:
+		var m := _repairable_mover_under_mouse()
+		if not m.is_empty():
+			unit = int(m[0])
+			proto_id = int(m[1])
+			at = m[2]
+		else:
+			var target: WorldMirror.Rec = _cursor_pick()
+			if target != null and target.unit > 0:
+				unit = target.unit
+				proto_id = target.proto_id
+				at = target.fixed
+	if unit <= 0:
 		if repair_unit != 0:
 			repair_unit = 0
 			Bridge.send({"t": "repair"})
 		return
 	_repair_timer -= delta
-	if target.unit == repair_unit and _repair_timer > 0.0:
+	if unit == repair_unit and _repair_timer > 0.0:
 		return
-	repair_unit = target.unit
+	repair_unit = unit
 	_repair_timer = REPEAT
-	var cmd := {"t": "repair", "u": target.unit, "p": target.proto_id, "x": target.fixed.x, "y": target.fixed.y, "item": cursor_item}
+	var cmd := {"t": "repair", "u": unit, "p": proto_id, "x": at.x, "y": at.y, "item": cursor_item}
 	if cursor_quality != "normal":
 		cmd["q"] = cursor_quality
-	var hs: int = hud.ui.held_slot()
+	var hs: int = hud.ui.build_slot()
 	if hs > 0:
 		cmd["hs"] = hs  # the held stack's own slot: its packs are used first, as the hand's
 	Bridge.send(cmd)
@@ -1181,7 +1346,9 @@ func _use_tool(cancel: bool) -> void:
 func _paste() -> void:
 	if not has_ground or hud.ui.model.clipboard.is_empty():
 		return
-	Bridge.send({"t": "paste", "x": int(ground.x * 256.0), "y": int(ground.y * 256.0), "d": build_dir})
+	# Rounded down as every build point (J9): the mod snaps it, so cut towards zero a point just
+	# under a tile's edge at negative coordinates pasted a tile over.
+	Bridge.send({"t": "paste", "x": wire(ground.x), "y": wire(ground.y), "d": build_dir})
 
 
 ## The stack of the held blueprint or planner: the library's (-1), the one picked up from the
@@ -1298,7 +1465,7 @@ func _pipette_or_clear() -> void:
 		hold("")
 	if cursor_item == "" and item != "":
 		var quality := str(hovered.extra.get("q", "normal")) if hovered != null else "normal"
-		hud.ui.pick_from_inventory(item)
+		hud.ui.pick_from_inventory(item, quality if quality != "" else "normal")
 		if cursor_item != item:
 			hold(item)
 		# Factorio's smart pipette picks the entity's own quality (a ghost's too).
@@ -1336,21 +1503,48 @@ func item_for_proto(proto: ProtoDB.EntityProto) -> String:
 	return ""
 
 
-## Ctrl+click on an entity: the held stack in (right: half), or its output out (right: half), like
-## Factorio's fast transfer. The mod checks reach and what fits.
+## Movers a Ctrl+click puts into or takes from (N2): Factorio's fast transfer works on every vehicle
+## and wagon with an inventory (a car's fuel, ammo and trunk, a locomotive's fuel, a wagon's cargo).
+const FAST_MOVERS := ["car", "spider-vehicle", "locomotive", "cargo-wagon", "artillery-wagon", "infinity-cargo-wagon"]
+
+
+## What a Ctrl+click is on: the vehicle or wagon under the mouse first (N2: they are movers, not in
+## the world's records, so the world's pick found the ground or rail under them and nothing was
+## sent), else the entity. {key, u, p, x, y, at} or {}.
+func _fast_pick() -> Dictionary:
+	var m: Array = []
+	if movers != null and not over_gui and not _clean_shot:
+		if not hovered_mover.is_empty():
+			m = hovered_mover
+		elif rig != null:
+			# hovered_mover stays empty while a stack is held (_mover_under_mouse), so look again.
+			var screen := _aim_screen()
+			var r := rig.ray(screen)
+			m = _nearer_than_aim(movers.pick_ray(r[0], r[1], FAST_MOVERS))
+	if not m.is_empty() and FAST_MOVERS.has(_mover_type(m)):
+		var fixed: Vector2i = m[2]
+		return {"key": "m%d" % int(m[0]), "u": int(m[0]), "p": int(m[1]), "x": fixed.x, "y": fixed.y, "at": m[3]}
+	var target: WorldMirror.Rec = _cursor_pick()
+	if target == null or target.unit == 0:
+		return {}
+	return {"key": "e%s" % str(target.key), "u": target.unit, "p": target.proto_id, "x": target.fixed.x, "y": target.fixed.y, "at": target.pos}
+
+
+## Ctrl+click on an entity or vehicle: the held stack in (right: half), or its output out (right:
+## half), like Factorio's fast transfer. The mod checks reach and what fits.
 func _fast_transfer(half: bool) -> void:
 	if not has_ground:
 		return
-	var target: WorldMirror.Rec = _cursor_pick()
-	if target == null or target.unit == 0:
+	var target := _fast_pick()
+	if target.is_empty():
 		return
 	var putting := cursor_item != "" and cursor_tool == ""
 	if _fast_target == null:
 		_fast_putting = putting  # the drag goes on as it began (see _update_drag_clicks)
 	elif _fast_putting != putting:
 		return  # the held stack ran out on the way: Factorio's drag doesn't start taking then
-	_fast_target = target
-	var cmd := {"t": "fast", "u": target.unit, "p": target.proto_id, "x": target.fixed.x, "y": target.fixed.y, "half": 1 if half else 0}
+	_fast_target = target["key"]
+	var cmd := {"t": "fast", "u": target["u"], "p": target["p"], "x": target["x"], "y": target["y"], "half": 1 if half else 0}
 	if putting:
 		cmd["item"] = cursor_item
 		var n: int = hud.ui.hand_count()
@@ -1360,13 +1554,14 @@ func _fast_transfer(half: bool) -> void:
 			cmd["q"] = cursor_quality
 		# The held stack's own slot: the mod takes the items from it first, so the hand is what
 		# empties (I1) and not another stack of the item.
-		var hs: int = hud.ui.held_slot()
+		var hs: int = hud.ui.build_slot()
 		if hs > 0:
 			cmd["hs"] = hs
 	Bridge.send(cmd)
 	# The answer (the inventory changing) plays Factorio's sound and flies the items (I3, I4), and
 	# an emptied hand drops the selection (I1): factorio_ui.gd.
-	hud.ui.fast_transfer_sent(cursor_item if putting else "", Vector3(target.pos.x, 0.6, target.pos.y))
+	var at: Vector2 = target["at"]
+	hud.ui.fast_transfer_sent(cursor_item if putting else "", Vector3(at.x, 0.6, at.y))
 
 
 ## Factorio lets Ctrl+click and Shift+click (paste settings) be dragged: holding the button with the
@@ -1377,8 +1572,8 @@ func _update_drag_clicks() -> void:
 			if not Input.is_mouse_button_pressed(_fast_button):
 				_fast_button = MOUSE_BUTTON_NONE
 			return
-		var target: WorldMirror.Rec = _cursor_pick()
-		if target != null and target.unit != 0 and target != _fast_target:
+		var target := _fast_pick()
+		if not target.is_empty() and target["key"] != _fast_target:
 			_fast_transfer(_fast_button == MOUSE_BUTTON_RIGHT)
 	if _paste_dragging:
 		if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or not Input.is_key_pressed(KEY_SHIFT):
@@ -1463,6 +1658,7 @@ func cycle_quality(step: int) -> void:
 	var next: String = list[clampi(at + step, 0, list.size() - 1)]
 	if next != cursor_quality:
 		cursor_quality = next
+		hud.ui.hand_quality_changed(next)  # a held stack gives way to one of that quality (L7)
 		hud.show_message("Quality: %s" % next.capitalize())
 
 
@@ -1505,7 +1701,7 @@ func _wire_click(shift: bool) -> void:
 func _mover_under_mouse() -> Array:
 	if movers == null or over_gui or cursor_item != "" or _clean_shot:
 		return []
-	var screen: Vector2 = rig.aim_position() if rig.first_person else hud.ui.mouse_position()
+	var screen := _aim_screen()
 	var r := rig.ray(screen)
 	return movers.pick_ray(r[0], r[1], OPENABLE_MOVERS)
 
@@ -1518,7 +1714,16 @@ func _mineable_mover_under_mouse() -> Array:
 		return hovered_mover
 	if rig == null:
 		return []
-	var screen: Vector2 = rig.aim_position() if rig.first_person else hud.ui.mouse_position()
+	var screen := _aim_screen()
+	var r := rig.ray(screen)
+	return _nearer_than_aim(movers.pick_ray(r[0], r[1], MINEABLE_MOVERS))
+
+
+## The vehicle or wagon under the mouse a held repair pack mends (every one the right button mines), or [].
+func _repairable_mover_under_mouse() -> Array:
+	if movers == null or rig == null or over_gui or _clean_shot:
+		return []
+	var screen := _aim_screen()
 	var r := rig.ray(screen)
 	return _nearer_than_aim(movers.pick_ray(r[0], r[1], MINEABLE_MOVERS))
 
@@ -1579,7 +1784,8 @@ func _update_highlights() -> void:
 	if hovered != null:
 		var proto: ProtoDB.EntityProto = world.protos.entity(hovered.proto_id)
 		if proto != null:
-			marks = hover_marks(proto, hovered.pos, hovered.dir)
+			var fc = hovered.extra.get("fc")
+			marks = hover_marks(proto, hovered.pos, hovered.dir, fc if fc is Array else [])
 			# J4: a pole hovered shows the area it supplies (one held shows every pole's, below).
 			pole_cover.world = world
 			var supplied := pole_cover.area_of(hovered, hud.ui.model.eprops)
@@ -1645,14 +1851,21 @@ func _update_highlights() -> void:
 		marks.append_array(rules[1])
 		if _build_refusal == "" and not bool(rules[0]):
 			_build_refusal = "Needs water in front and land under it" if proto.type == "offshore-pump" else "Can't be built on these tiles"
-		var ok := (ghost_mode or (hud.ui.can_build_from_hand() and _in_reach(pos, size))) and (on_rails or not _blocked(proto, pos, size, true)) \
-			and _build_refusal == ""
+		# L8: a drill needs a resource it mines under it (a pumpjack the oil well), as Factorio refuses it; the
+		# resources it would mine are marked, and the wells Factorio highlights round the cursor.
+		if _build_refusal == "":
+			_build_refusal = ResourceHints.mining_refusal(world, hud.ui.model.eprops, proto, pos, hud.ui.model.mines_with_fluid())
+		marks.append_array(ResourceHints.drill_marks(world, hud.ui.model.eprops, proto, pos))
+		# L2: red, none left, once the builds sent have used up what the inventory shown still holds.
+		var ok := (ghost_mode or (hud.ui.can_build_from_hand() and _in_reach(pos, size) and items_left(cursor_item) > 0)) \
+			and (on_rails or not _blocked(proto, pos, size, true)) and _build_refusal == ""
 		show_build_ghost(proto, pos, ok, ghost_mode, dir)
 		var x: Dictionary = hud.ui.model.eprops.get(proto.id, {}).get("x", {})
 		marks.append_array(CursorOverlay.marks_for(proto.type, x, pos, dir, true))
 		if UndergroundPairs.is_underground(proto.type):
 			# J24: the connection to the piece it would join and the furthest it may go; red past that.
-			marks.append_array(UndergroundPairs.held_marks(world, proto, pos, dir, _under_reach(proto)))
+			# M2: a real build over a plain run of belts marks those it mines.
+			marks.append_array(UndergroundPairs.held_marks(world, proto, pos, dir, _under_reach(proto), not ghost_mode, _sent_unders()))
 		if proto.type == "roboport" and roboport_links != null:
 			for l in roboport_links.held_lines(pos, _logistic_radius(proto.id)):
 				marks.append(CursorOverlay.line(l[0], l[1]))
@@ -1662,6 +1875,9 @@ func _update_highlights() -> void:
 			marks.append_array(pole_cover.held_marks(proto.id, cursor_quality, pos, hud.ui.model.eprops))
 		_update_reach(proto, pos)
 	_overlay.show_marks(marks)
+	# N9: the hovered pipeline, and with a fluid entity held in Alt-mode every one round the cursor.
+	pipeline_vis.update(hovered, placed, hud.ui.alt_mode, ground if has_ground else null, hud.ui.model.eprops,
+		hud.ui.model.hover_info, hud.ui.model.alerts)
 
 
 ## A roboport prototype's logistic radius (tiles) from its `eprops` overlay.
@@ -1728,31 +1944,38 @@ func _show_cargo_pieces(proto: ProtoDB.EntityProto, pos: Vector2, material: Mate
 ## What hovering over an entity shows, like Factorio: its selection box's corners, and from its
 ## `eprops` overlay an inserter's pickup and drop arrows, a roboport's logistic and construction
 ## areas, a mining drill's area and output, fluid connections.
-func hover_marks(proto: ProtoDB.EntityProto, pos: Vector2, dir: int) -> Array:
+func hover_marks(proto: ProtoDB.EntityProto, pos: Vector2, dir: int, fc: Array = []) -> Array:
 	var rect := WorldMirror.selection_rect(proto, pos, dir)
 	var marks: Array = [CursorOverlay.brackets(rect.get_center(), rect.size * 0.5)]
 	if proto.type != "entity-ghost":
 		var x: Dictionary = hud.ui.model.eprops.get(proto.id, {}).get("x", {})
-		marks.append_array(CursorOverlay.marks_for(proto.type, x, pos, dir, false))
+		marks.append_array(CursorOverlay.marks_for(proto.type, x, pos, dir, false, fc))
 	return marks
 
 
 ## The extra data the held item's model is picked by (ModelLibrary.model_name), as the entity would
 ## have it there: a straight belt, an underground's end (an exit when the nearest underground of its
-## kind behind it facing the same way, or its ghost, is an entrance: the mod builds it so), a lone
-## pipe or wall piece.
+## kind behind it facing the same way, or its ghost, is an entrance: the mod builds it so), a pipe joined
+## to what it would join there (L8, resource_hints.gd), a lone wall piece.
 func build_extra(proto: ProtoDB.EntityProto, pos: Vector2, dir: int) -> Dictionary:
 	match proto.type:
 		"transport-belt":
 			return {"s": "s"}
 		"pipe", "heat-pipe":
-			return {"pc": 0}
+			var tile := Vector2i(floori(pos.x), floori(pos.y))
+			return {"pc": ResourceHints.held_pipe_mask(world, hud.ui.model.eprops if hud != null else {}, tile, proto.type == "heat-pipe")}
 		"wall":
 			return {"wc": 0}
 		"underground-belt":
-			var join := UndergroundPairs.held_join(world, proto, pos, dir, _under_reach(proto))
+			var join := UndergroundPairs.held_join(world, proto, pos, dir, _under_reach(proto), _sent_unders())
 			return {"u": "o" if not join.is_empty() and not bool(join["far"]) else "i"}
 	return {}
+
+
+## The undergrounds just sent to be built that the world doesn't have yet (predicted.gd, M2): the
+## cursor pairs with them as the build will.
+func _sent_unders() -> Array:
+	return predicted.sent_undergrounds() if predicted != null else []
 
 
 ## An underground belt's or pipe-to-ground's reach from the mod's `eprops` (its max_distance), or 0.
@@ -1972,6 +2195,13 @@ func _paste_centre_at(at: Vector2, first: Dictionary, turn: int) -> Vector2:
 	return Vector2(_snap(on.x, size.x), _snap(on.y, size.y)) - offset  # exact: half tiles less half tiles
 
 
+## L2: how many of `item` the hand can still build with: the inventory shown less the builds sent
+## that it hasn't lost yet (predicted.gd spend; the inventory alone with `--build-spend=off`).
+func items_left(item: String) -> int:
+	var unpaid := predicted.unpaid(item) if predicted != null else 0
+	return maxi(0, hud.count_of(item) - unpaid)
+
+
 ## Within the character's build distance (to the footprint's nearest edge, as Factorio measures).
 func _in_reach(pos: Vector2, size: Vector2i) -> bool:
 	if avatar == null:
@@ -1980,6 +2210,19 @@ func _in_reach(pos: Vector2, size: Vector2i) -> bool:
 	var half := Vector2(size) * 0.5
 	var d := Vector2(maxf(0.0, absf(c.x - pos.x) - half.x), maxf(0.0, absf(c.y - pos.y) - half.y))
 	return d.length() <= build_reach()
+
+
+## What the bridge adds to the build distance, measuring to a building's middle (building.lua REACH_SLACK).
+const BRIDGE_REACH_SLACK := 1.5
+
+
+## Within the bridge's own reach for a build: the character's build distance plus its slack, to the
+## building's middle. A little past _in_reach for a small building (the preview is red there and the
+## bridge still builds), short of it for a big one; what the game will take is counted by this (L2).
+func _bridge_reach(pos: Vector2) -> bool:
+	if avatar == null:
+		return true
+	return avatar.ground_position().distance_to(pos) <= build_reach() + BRIDGE_REACH_SLACK
 
 
 ## The character's build distance now (other mods and research may add to it), from `cinfo`.
@@ -2102,11 +2345,27 @@ func _tile_is(id: int, kind: String) -> bool:
 
 
 ## Same grid snapping as the mod: odd sizes centre on a tile, even sizes on a tile corner (rails:
-## a two-tile grid, see _update_highlights).
+## a two-tile grid, see _update_highlights). Factorio's own rule (its prototype docs' tile_width: odd,
+## the centre in the middle of a tile; even, on the tile transition; create_entity in real 2.1.24
+## snaps a splitter the same in every direction, J9).
 static func _snap(v: float, size: int) -> float:
 	if size % 2 == 1:
 		return floorf(v) + 0.5
 	return floorf(v + 0.5)
+
+
+## J9 (the owner: placing a splitter over a belt sometimes shifts it over one tile): a cursor point
+## on the wire, in 1/256 tile, for what the mod snaps to the grid (`build`, `tile`, `tile_mine`).
+## Rounded down, so the mod's snap of it is the preview's snap of the point itself for every point
+## (floor(floor(256 v) / 256 + c) == floor(v + c) for c 0 or 0.5). int() cut towards zero, which at
+## negative coordinates is up: a point less than 1/256 tile under a tile's edge (an odd size) or its
+## middle (an even one, a splitter aimed at a belt's middle) was sent as the edge itself, and the
+## mod built one tile over from the preview. `--build-wire=truncate`: as before.
+static var wire_floor := not ("--build-wire=truncate" in OS.get_cmdline_user_args())
+
+
+static func wire(v: float) -> int:
+	return floori(v * 256.0) if wire_floor else int(v * 256.0)
 
 
 ## Puts an item in the cursor (the quickbar, a picked-up stack), or empties it with "". Anything

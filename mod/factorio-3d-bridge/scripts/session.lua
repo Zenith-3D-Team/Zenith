@@ -28,6 +28,7 @@ local planets = require("scripts.planets")
 local platforms = require("scripts.platforms")
 local selftest = require("scripts.selftest")
 local ui_actions = require("scripts.ui_actions")
+local step_sounds = require("scripts.step_sounds")
 local equipment = require("scripts.equipment")
 local wiring = require("scripts.wiring")
 local players = require("scripts.players")
@@ -38,6 +39,7 @@ local space = require("scripts.space")
 local alerts = require("scripts.alerts")
 local pedia = require("scripts.pedia")
 local force_info = require("scripts.force_info")
+local resource_patch = require("scripts.resource_patch")
 local spiders = require("scripts.spiders")
 local belt_items = require("scripts.belt_items")
 local movers = require("scripts.movers")
@@ -54,6 +56,7 @@ local belt_sim = require("scripts.belt_sim")
 local perf = require("scripts.perf")
 local barrier = require("scripts.barrier")
 local alt_mode = require("scripts.alt_mode")
+local link = require("scripts.link")
 
 local M = {}
 
@@ -154,6 +157,10 @@ function M.handshake(keep_view)
     -- Square subscriptions (`sub` o, r, w) out to world.MAX_RADIUS: a client asks older bridges for a list.
     sq = world.MAX_RADIUS,
     sid = s.save_id,
+    -- The link between add-ons and their mods (link.lua), its version.
+    ext = link.VERSION,
+    -- The binary wire version it sends this client (transport.lua), absent for JSON text.
+    bin = s.client and s.client.bin or nil,
   })))
   -- The rest a stage a tick (handshake_tick): together they took 35 ms in one tick on the owner's
   -- save. Meanwhile only the transport and the stages run (control.lua), as before for one tick.
@@ -177,6 +184,10 @@ local HANDSHAKE_STAGES = {
   { 100, function()
     transport.send_reliable({ t = "ready" })
     ui_actions.send_eprops()
+    -- The steps' sounds from the prototypes (step_sounds.lua), in parts; none without the list.
+    for _, msg in ipairs(step_sounds.messages(registry)) do
+      transport.send_reliable(msg)
+    end
   end },
   { 100, function() tiles.item_uses() end },
   { 400, function(s)
@@ -286,14 +297,27 @@ local function extras()
 end
 
 -- Runs fn(...) with `state` as storage.f3d.
+local first = nil  -- the first client's state while another is served (M.first_state)
 function M.serve(state, fn, ...)
   local primary = storage.f3d
+  local outer = first == nil
+  if outer then
+    first = primary
+  end
   storage.f3d = state
   local ok, err = pcall(fn, ...)
   storage.f3d = primary
+  if outer then
+    first = nil
+  end
   if not ok then
     error(err, 0)
   end
+end
+
+-- The first client's state, whichever is served now (link.lua finds clients from it).
+function M.first_state()
+  return first or storage.f3d
 end
 
 -- Runs fn(...) for the first client's state (connected or not, as before), then for each other
@@ -483,6 +507,7 @@ end
 local function drop_client()
   local s = storage.f3d
   local port = s.client and s.client.port
+  link.client_changed(port, false)
   if s.extra and port then
     -- Its character waits for the same client (session id) to come back.
     storage.f3d_parked = storage.f3d_parked or {}
@@ -522,6 +547,7 @@ end
 local KEPT_ACROSS_VERSIONS = {
   extra = true, puppet = true, own_character = true, held_for = true, owner_index = true, owner_checked = true,
   owner_pick = true, recheck = true, was_mp = true, death = true, respawn = true, trip = true,
+  zenith_owner = true, played_for = true,
   quickbar = true, hist = true, explored = true, hist_scratch = true, clipboard = true, lib_cursor = true,
 }
 
@@ -561,10 +587,28 @@ end
 local handlers = {}
 
 -- A hello's `dd` (tiles out to which the client draws decoratives), or nil: a whole number 0-4096.
+-- The binary wire version this bridge sends a client whose hello says `bin` (the highest it reads),
+-- nil for JSON text: an older client, the map setting off, or a Factorio without string.pack.
+local function binary_version(v)
+  v = tonumber(v)
+  if v and v >= 1 and string.pack and settings.global["f3d-binary-messages"].value then
+    return math.min(math.floor(v), transport.WIRE_VERSION)
+  end
+  return nil
+end
+
 local function decorative_distance(v)
   v = tonumber(v)
   if v and v == v and v >= 0 then
     return math.min(4096, math.floor(v))
+  end
+  return nil
+end
+
+-- A hello's `pn` (the Factorio account the client's PC plays under, L13), or nil.
+local function player_name(v)
+  if type(v) == "string" and v ~= "" and #v <= 100 then
+    return v
   end
   return nil
 end
@@ -574,15 +618,22 @@ function handlers.hello(msg, port)
   local sid = tostring(msg.sid or "")
   if not s.client or s.client.sid ~= sid or s.client.port ~= port then
     heard_since_load = true
+    if s.client then
+      link.client_changed(s.client.port, false)  -- another Zenith takes its place
+    end
     s.client = { sid = sid, port = port, last_seen = game.tick, z = msg.z == 1, dc = msg.dc == 1, b = msg.b == 1,
       bl = msg.bl == 1, bs = msg.bs == 1, bg = msg.bl == 1 and msg.bg == 1, br = msg.bl == 1 and msg.br == 1,
       ie = msg.ie == 1 or msg.ie == 2, ih_too = msg.ie == 2, ho = msg.ho == 1, v = tonumber(msg.v) or 0, mg = msg.mg ~= 0,
-      dq = msg.dq == 1, lv = msg.lv == 1, dd = decorative_distance(msg.dd) }
+      dq = msg.dq == 1, lv = msg.lv == 1, dd = decorative_distance(msg.dd), pn = player_name(msg.pn),
+      bin = binary_version(msg.bin) }
     if not rate.held() then
       s.rate = nil -- a new client starts at full rate; it sends `rate` if it wants another
     end
     s.bud = nil -- and with the default work budget, not one the last client set
+    -- Its Factorio's player, already in the game, takes over the client's character (L13).
+    puppet.claim_named()
     M.handshake()
+    link.client_changed(port, true)
     return
   end
   s.client.last_seen = game.tick
@@ -610,6 +661,20 @@ function handlers.hello(msg, port)
   s.client.dq = msg.dq == 1
   -- Chunks it keeps after they leave its square (world.lua `kept`): told the counts its copy matches.
   s.client.lv = msg.lv == 1
+  -- Binary frames (transport.lua): every hello says it again, so the map setting turned off takes
+  -- effect at the next one (the client reads both kinds of datagram whatever the welcome said).
+  local bin = binary_version(msg.bin)
+  -- (Lower now, with reliable messages waiting in binary it no longer reads, chunk snapshots and `st`: the
+  -- stream starts over, below, rather than leave a gap in `r`.)
+  local restart = (bin or 0) < (s.client.bin or 0) and transport.binary_waiting(bin)
+  s.client.bin = bin
+  -- The account its PC's Factorio plays under (puppet.lua claim, L13): one said for the first time
+  -- (its first hellos may come before the client read it), or another, is looked for in the game.
+  local pn = player_name(msg.pn)
+  if pn ~= s.client.pn then
+    s.client.pn = pn
+    puppet.claim_named()
+  end
   -- How far it draws decoratives (world.lua dec_distance): further now, the chunks held come.
   local dd = decorative_distance(msg.dd)
   local grew = dd ~= s.client.dd and (dd == nil or (s.client.dd ~= nil and dd > s.client.dd))
@@ -626,7 +691,7 @@ function handlers.hello(msg, port)
     s.client.dc = false
   end
   -- The client never got the welcome (lost packet): start over, at most every 2 seconds.
-  if msg.w == 0 and game.tick - s.handshake_tick > 120 then
+  if restart or (msg.w == 0 and game.tick - s.handshake_tick > 120) then
     M.handshake()
   end
 end
@@ -683,6 +748,7 @@ handlers.walk = puppet.walk
 handlers.mine = puppet.mine
 handlers.mine_stop = puppet.mine_stop
 handlers.pickup = puppet.pickup
+handlers.pickup_stop = puppet.pickup_stop
 handlers.repair = repair.cmd
 handlers.build = function(cmd)
   if cmd.sf == 1 then
@@ -846,6 +912,9 @@ handlers.set_section = function(cmd)
 end
 handlers.set_char_color = logistics.set_char_color
 handlers.gfx = gfx.ask
+-- An add-on's message for its own Factorio mod (link.lua): raised as an event after the packet.
+handlers.ext = link.receive
+link.attach(M)
 requests.add("pedia_index", pedia.index, 300)
 handlers.pedia_index = requests.handler("pedia_index")
 requests.add("pedia", pedia.page, 150)
@@ -863,6 +932,9 @@ handlers.mpress = mod_gui.press
 handlers.modreq = modules.request
 requests.add("hinfo", modules.hover, 50)
 handlers.hinfo = requests.handler("hinfo")
+-- L6: the resource patch under the mouse on the map (a patch's tiles are read at once: priced as a big job).
+requests.add("rpatch", resource_patch.answer, 400)
+handlers.rpatch = requests.handler("rpatch")
 
 -- J22, J28: items the character put into or took out of a building (a screen's slots, Ctrl+click, Z): the
 -- turrets' ammo and burners' fuel in its reach are looked at again in a tick or two (alerts.lua), so their
@@ -1020,6 +1092,7 @@ function M.on_packet(event)
   end
   local port = event.source_port
   console.from_player = tonumber(event.player_index) or 0
+  link.from_packet(event)
   local extra = extras()[port]
   if extra then
     return M.serve(extra, dispatch, handler, msg, port)

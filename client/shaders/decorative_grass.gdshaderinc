@@ -14,3 +14,19 @@ float grass_grow(vec2 xz) {
 	}
 	return f3d_grass.w * (1.0 - smoothstep(f3d_grass.z - GRASS_EASE, f3d_grass.z, distance(xz, f3d_grass.xy)));
 }
+
+// The ground plants' surface (owner: grass turned white with the sun low behind it). Godot's Fresnel
+// brings most of the sun's highlight back at grazing angles unless F0 (0.16 x specular^2) is tiny, and
+// a back-lit plant's half vector points straight up its bent-up normal, so specular 0.5 lit the blades
+// with a white sheen brighter than their own colour. Kept low and fully rough, as the ground under them
+// (terrain_textures.gd SURFACES). --grass-backlight=old (decoratives.gd): 0.2.2's.
+uniform bool old_sheen = false;
+const float PLANT_SPECULAR = 0.05;
+
+float plant_specular() {
+	return old_sheen ? 0.5 : PLANT_SPECULAR;
+}
+
+float plant_roughness(float old_roughness) {
+	return old_sheen ? old_roughness : 1.0;
+}

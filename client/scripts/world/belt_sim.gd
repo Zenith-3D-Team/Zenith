@@ -182,6 +182,27 @@ var _takes := {}  # (take_first) unit -> takes queued, not made yet: [seq, tick,
 ## (take_first) lane index -> what its last read's _rescue moved: [read tick, uids, items, stacks, positions
 ## in the lane before].
 var _rescued := {}
+## A read's _rescue puts an item it hasn't back out of its lane, behind or ahead, as one the game's has yet to
+## reach or has passed. Past the bridge's hands radius no take event (`ie`) comes, so an item an inserter took
+## was "rescued" by every read without it: item 305 on the line-end scene (--hands-radius 4), read at b36 and
+## taken there, then b36 and b35 read empty four times, was pushed back into b36 each time, ran on and joined
+## the queue's tail for good (phantoms 0.72% -> 7.93%). On (the default): an item is not rescued, it goes, when
+## the lane it would be pushed into was read as of this read's tick or later without it (the bridge reads a
+## pickup belt and its feeder in one update: the whole update's reads count, whatever order they are applied
+## in), or when that place is behind (upstream of) where the bridge last read the item, by more than a gap; and
+## an item rescued RESCUE_STRIKES - 1 times with no read listing it in between goes at the next. Off
+## (--belt-sim-rescue-seen=off): as before.
+var rescue_seen := true
+const RESCUE_STRIKES := 3
+var n_rescue_denied := 0  # (probes) items a read let go instead of rescuing (rescue_seen)
+## (rescue_seen) uid -> [lane key, tick, place in the lane] of the newest read that listed it.
+var _seen := {}
+## (rescue_seen) uid -> times rescued since a read last listed it.
+var _strikes := {}
+## (rescue_seen) lane -> the tick of its newest read, applied or queued in the batch being applied (-1 none).
+var l_seen := PackedInt64Array()
+## (rescue_seen) The tick of the read being applied (_apply_queue's; the sim's tick for a direct apply).
+var _read_t := -1
 var n_take_read := 0  # (probes) items a read that came first took for a queued take (take_first)
 var n_take_rescued := 0  # (probes) items a take took back from a read's _rescue (take_first)
 const TURN_FOLLOW := 8  # (_turns_from_read) lanes followed on from a splitter's other output
@@ -300,6 +321,12 @@ var _splitters := {}  # unit -> Splitter
 var _lines: Array = []  # Line or null
 var _free_lines := PackedInt32Array()
 var _uid_line := {}  # uid -> line id
+## (turn_id) Each item's number along its run, set when it first comes into a line (_number) and kept while the
+## simulation has it: one behind the item ahead of it, so a packed line's items count up from its front, as a
+## lattice's slots do (belt_lattice.gd: slot k is item front + k). Its drawn turn comes from it (take_changes() `num`).
+var _num := {}  # uid -> number
+var _num_next := 0
+const NUMS := 1 << 20
 var _bucket := {}  # tick -> Array of line ids due
 var _heap := PackedInt64Array()
 var _cur_t := -1
@@ -377,6 +404,7 @@ var out_tick := PackedInt64Array()
 var out_speed := PackedInt32Array()
 var out_reach := PackedInt32Array()
 var out_run := PackedInt32Array()
+var out_num := PackedInt64Array()  # (turn_id) the item's number (_num; -1 none)
 var out_gone := PackedInt64Array()
 var out_gone_tick := PackedInt64Array()  # the tick it went on
 var out_gone_at := PackedInt32Array()  # the changes before it (in out_uid): the order of the two
@@ -433,6 +461,7 @@ func set_lane(key: int, kind: int, length: int, step: int, p0: Vector2i, pm: Vec
 		l_sp0[i] = -1
 		l_sp1[i] = -1
 		l_read[i] = -1
+		l_seen[i] = -1
 		l_feeders[i] = PackedInt32Array()
 		l_sideins[i] = PackedInt32Array()
 		var w: Variant = _xnext_wait.get(key)
@@ -729,7 +758,7 @@ func put_at(at_tick: int, key: int, uid: int, item: int, stack: int, pos: int, i
 ## a lane that linked up too) or only where its items are (0).
 func take_changes() -> Dictionary:
 	var d := {"uid": out_uid, "item": out_item, "stack": out_stack, "key": out_key, "pos": out_pos,
-		"tick": out_tick, "speed": out_speed, "reach": out_reach, "run": out_run, "gone": out_gone,
+		"tick": out_tick, "speed": out_speed, "reach": out_reach, "run": out_run, "num": out_num, "gone": out_gone,
 		"gone_tick": out_gone_tick, "gone_at": out_gone_at, "mismatch": out_mismatch, "mismatch_n": out_mismatch_n,
 		"hand_uid": out_hand_uid, "hand_tick": out_hand_tick, "hand_ins": out_hand_ins, "hand_key": out_hand_key,
 		"hand_pos": out_hand_pos, "hand_why": out_hand_why}
@@ -748,6 +777,7 @@ func take_changes() -> Dictionary:
 	out_speed = PackedInt32Array()
 	out_reach = PackedInt32Array()
 	out_run = PackedInt32Array()
+	out_num = PackedInt64Array()
 	out_gone = PackedInt64Array()
 	out_gone_tick = PackedInt64Array()
 	out_gone_at = PackedInt32Array()
@@ -773,6 +803,17 @@ func next_of(key: int) -> int:
 	return l_key[l_next[i]]
 
 
+## Whether items leaving lane `key` at its exit go on somewhere the simulation knows: into a lane, onto one's side
+## (a side-load), or into a splitter (an input). False for a lane leading nowhere loaded (the square's edge), whose
+## items stop at its end as a guess (EDGE_STOP), and a lane it doesn't know. For the drawing (belt_lattice.gd open ends).
+func leads_on(key: int) -> bool:
+	_relink()
+	var i: int = _key_idx.get(key, -1)
+	if i < 0:
+		return false
+	return l_next[i] >= 0 or l_side[i] >= 0 or l_kind[i] == SPLIT_IN
+
+
 ## How far the straight run of one speed and direction goes on past lane `key`'s exit (1/256; 0 for a
 ## lane that isn't a straight belt): for the drawing, as take_changes()'s `run` less the position.
 func run_of(key: int) -> int:
@@ -791,6 +832,7 @@ func run_of(key: int) -> int:
 ## speed most of its items move at (more than half of them moving: the fastest of those), else 0. A lane
 ## whose front waits at its exit while the items behind it close up (a stop-and-go or creeping lane) moves.
 ## 2 (belt_lattice.gd creep_flow): as 1, with the front item's unique id (its low 31 bits) for the count.
+## 3 (belt_lattice.gd turn_id): as 1, with the front item's number (_num; -1 none) for the count.
 func lane_fronts(keys: PackedInt64Array, speed_of := 0) -> PackedInt32Array:
 	_relink()
 	var out := PackedInt32Array()
@@ -820,11 +862,11 @@ func lane_fronts(keys: PackedInt64Array, speed_of := 0) -> PackedInt32Array:
 		cnt.resize(nl)
 		var mv := PackedInt32Array()  # (speed_of 1, 2) items moving, and the fastest, a lane
 		var mvv := PackedInt32Array()
-		var fu := PackedInt32Array()  # (speed_of 2) the front item's id
+		var fu := PackedInt32Array()  # (speed_of 2) the front item's id; (3) its number (_num), -1 none
 		if speed_of >= 1:
 			mv.resize(nl)
 			mvv.resize(nl)
-		if speed_of == 2:
+		if speed_of >= 2:
 			fu.resize(nl)
 		var d := maxi(tick - L.ft, 0)
 		var pos := L.f - (L.s * d if L.mode == 1 else 0)
@@ -853,6 +895,8 @@ func lane_fronts(keys: PackedInt64Array, speed_of := 0) -> PackedInt32Array:
 					fv[li] = v
 					if speed_of == 2:
 						fu[li] = L.uid[j] & 0x7fffffff
+					elif speed_of == 3:
+						fu[li] = int(_num.get(L.uid[j], -1))
 				if speed_of >= 1 and v > 0:
 					mv[li] += 1
 					mvv[li] = maxi(mvv[li], v)
@@ -864,8 +908,61 @@ func lane_fronts(keys: PackedInt64Array, speed_of := 0) -> PackedInt32Array:
 				continue
 			out[q * 3] = first[li2]
 			out[q * 3 + 1] = fv[li2] if speed_of == 0 else (mvv[li2] if 2 * mv[li2] > cnt[li2] else 0)
-			out[q * 3 + 2] = fu[li2] if speed_of == 2 else cnt[li2]
+			out[q * 3 + 2] = fu[li2] if speed_of >= 2 else cnt[li2]
 	return out
+
+
+## For the drawing's packed lanes (belt_lattice.gd tail): each lane 1 when the simulation's line behind its entry is
+## known for `need` (1/256) and holds no item there now (a packed block's tail has gone onto it, nothing following
+## close behind), else 0: an item there, or the line behind ends sooner at a lane the simulation doesn't know all
+## that feeds (no lane behind it loaded: the square's edge; more than one; a side-load; a splitter). Reads only.
+func lane_tails(keys: PackedInt64Array, need: int) -> PackedInt32Array:
+	_relink()
+	var out := PackedInt32Array()
+	out.resize(keys.size())
+	for q in keys.size():
+		var i: int = _key_idx.get(keys[q], -1)
+		if i < 0 or l_line[i] < 0:
+			continue
+		var L: Line = _lines[l_line[i]]
+		var at := l_base[i] + l_len[i]  # its entry, in L's positions
+		var left := need
+		var hops := 0
+		while L != null and hops < 8:
+			var hi := mini(at + left, L.total)
+			if _line_has_in(L, at, hi):
+				break
+			left -= maxi(hi - at, 0)
+			if left <= 0:
+				out[q] = 1
+				break
+			# On into the line behind its back lane: fed by one lane only, joined or not, nothing side-loading.
+			var b: int = L.lanes[L.lanes.size() - 1]
+			var fs: PackedInt32Array = l_feeders[b]
+			if fs.size() != 1 or not (l_sideins[b] as PackedInt32Array).is_empty() or l_line[fs[0]] < 0:
+				break
+			L = _lines[l_line[fs[0]]]
+			at = l_base[fs[0]]
+			hops += 1
+	return out
+
+
+## (lane_tails) Whether line L has an item now at a line position in [lo, hi).
+func _line_has_in(L: Line, lo: int, hi: int) -> bool:
+	if L.uid.is_empty() or hi <= lo:
+		return false
+	var d := maxi(tick - L.ft, 0)
+	var pos := L.f - (L.s * d if L.mode == 1 else 0)
+	for j in L.uid.size():
+		if j > 0:
+			pos += L.gap[j]
+			if L.mode == 2 and j == L.ck:
+				pos -= L.s * d
+		if pos >= hi:
+			return false
+		if pos >= lo:
+			return true
+	return false
 
 
 ## Every item now: [uids (PackedInt64Array), lane keys (PackedInt64Array), positions on them].
@@ -942,8 +1039,16 @@ func _apply_queue(now: int) -> void:
 			return a[1] < b[1])
 	else:
 		due.sort_custom(func(a: Array, b: Array) -> bool: return a[1] < b[1])
+	if rescue_seen and read_conserve:
+		# (The whole batch's reads count as seen before any is applied: a pickup belt's read and its
+		# feeder's come in one update, either first.)
+		for q in due:
+			if int(q[2]) == 0:
+				var data: Array = q[3]
+				_note_seen(int(data[0]), int(q[0]), data[1])
 	for q in due:
 		var data: Array = q[3]
+		_read_t = int(q[0])
 		match int(q[2]):
 			0:
 				if not _qload.is_empty():
@@ -971,6 +1076,51 @@ func _apply_queue(now: int) -> void:
 					_apply_take(int(q[0]), int(data[0]), int(data[1]), nt, int(data[3]), int(data[4]), int(data[5]))
 			6:
 				_apply_put(int(q[0]), int(data[0]), int(data[1]), int(data[2]), int(data[3]), int(data[4]), int(data[5]))
+	_read_t = -1
+
+
+## (rescue_seen) Item uid left the belts.
+func _forget_seen(uid: int) -> void:
+	if not _seen.is_empty():
+		_seen.erase(uid)
+	if not _strikes.is_empty():
+		_strikes.erase(uid)
+
+
+## (rescue_seen) A read of lane `key` as of tick t listed these items ([uid, item, pos, stack, ...]).
+func _note_seen(key: int, t: int, items: PackedInt64Array) -> void:
+	var i: int = _key_idx.get(key, -1)
+	if i < 0:
+		return
+	if t > l_seen[i]:
+		l_seen[i] = t
+	for k in items.size() / 4:
+		var u: int = items[k * 4]
+		var e: Variant = _seen.get(u)
+		if e == null or t >= int((e as PackedInt64Array)[1]):
+			_seen[u] = PackedInt64Array([key, t, items[k * 4 + 2]])
+
+
+## (rescue_seen) Whether item `uid`, which a read of the lane at line L's [lo, hi) hasn't, may be put back
+## out of it into lane `to` (-1: not known) at line position `at` (-1: not judged by place).
+func _may_rescue(uid: int, L: Line, to: int, at: int) -> bool:
+	if int(_strikes.get(uid, 0)) >= RESCUE_STRIKES - 1:
+		return false
+	var rt := _read_t if _read_t >= 0 else tick
+	var e: Variant = _seen.get(uid)
+	if to >= 0 and l_seen[to] >= rt:
+		# (Read as of this read's tick or later: did that read list it?)
+		if e == null:
+			return false
+		var s: PackedInt64Array = e
+		if s[0] != l_key[to] or s[1] < l_seen[to]:
+			return false
+	if at >= 0 and e != null:
+		var s2: PackedInt64Array = e
+		var li: int = _key_idx.get(s2[0], -1)
+		if li >= 0 and l_line[li] == L.id and at > l_base[li] + int(s2[2]) + GAP:
+			return false
+	return true
 
 
 ## (take_at) The take, on the tick it is applied at (its own, or later when it came late: an item that moved
@@ -1189,6 +1339,7 @@ func _take_one(uid: int, at: int) -> void:
 		_remove_at(L, j)
 	_uid_line.erase(uid)
 	L.holds.erase(uid)
+	_forget_seen(uid)
 	if emit_changes:
 		out_gone.append(uid)
 		out_gone_tick.append(at)
@@ -1241,22 +1392,28 @@ func _takes_first(i: int, items: PackedInt64Array) -> void:
 
 
 ## (take_first) Lane i's read just moved these items out of it (_rescue: P against `before`): kept for a take of
-## its belt that comes after it (_take_rescued).
-func _note_rescued(i: int, L: Line, P: PackedInt32Array, before: PackedInt32Array, lo: int) -> void:
+## its belt that comes after it (_take_rescued). (rescue_seen) And those it let go instead (`denied`, indices in
+## the line): a take that comes late still takes them, its hand the item's (flag 1; 2 once taken).
+func _note_rescued(i: int, L: Line, P: PackedInt32Array, before: PackedInt32Array, lo: int, denied := PackedInt32Array()) -> void:
 	var u := PackedInt64Array()
 	var it := PackedInt32Array()
 	var st := PackedInt32Array()
 	var p := PackedInt32Array()
+	var fl := PackedByteArray()
+	var dn := {}
+	for j in denied:
+		dn[j] = true
 	for j in P.size():
-		if P[j] != before[j]:
+		if P[j] != before[j] or dn.has(j):
 			u.append(L.uid[j])
 			it.append(L.itm[j])
 			st.append(L.stk[j])
 			p.append(before[j] - lo)
+			fl.append(1 if dn.has(j) else 0)
 	if u.is_empty():
 		_rescued.erase(i)
 	else:
-		_rescued[i] = [tick, u, it, st, p]
+		_rescued[i] = [tick, u, it, st, p, fl]
 
 
 ## (take_first) A take whose belt was read as of its tick or later before it came (or a tick or two before it,
@@ -1272,6 +1429,7 @@ func _take_rescued(at: int, unit: int, item: int, n: int, hx: int, hy: int, ins:
 	var cs := PackedInt32Array()
 	var cl := PackedInt32Array()
 	var cp := PackedInt32Array()
+	var cr := PackedInt32Array()  # (the record's lane)
 	for ln in range(1, 9):
 		var i: int = _key_idx.get(unit * 8 + ln, -1)
 		if i < 0:
@@ -1301,9 +1459,12 @@ func _take_rescued(at: int, unit: int, item: int, n: int, hx: int, hy: int, ins:
 			var ri: PackedInt32Array = r[2]
 			var rs: PackedInt32Array = r[3]
 			var rp: PackedInt32Array = r[4]
+			var rf: PackedByteArray = r[5]
 			for k in ru.size():
-				if item > 0 and ri[k] != item or not _uid_line.has(ru[k]):
+				if item > 0 and ri[k] != item or not (_uid_line.has(ru[k]) or rf[k] == 1):
 					continue
+				if cu.has(ru[k]):
+					continue  # (a denied item in two lanes' records)
 				var q := rp[k] + off
 				if src != i and q < -back:
 					continue
@@ -1322,11 +1483,21 @@ func _take_rescued(at: int, unit: int, item: int, n: int, hx: int, hy: int, ins:
 				cs.insert(x, rs[k])
 				cl.insert(x, i)
 				cp.insert(x, rp[k] if src == i else maxi(q, 0))
+				cr.insert(x, src)
 	var got := 0
 	for k in cd.size():
 		if got >= maxi(n, 1):
 			break
-		_take_one(cu[k], at)
+		if _uid_line.has(cu[k]):
+			_take_one(cu[k], at)
+		# (rescue_seen: a denied item, gone at its read: the hand's now, once.)
+		var r2: Array = _rescued.get(cr[k], [])
+		if r2.size() > 5:
+			var f2: PackedByteArray = r2[5]
+			var at2 := (r2[1] as PackedInt64Array).find(cu[k])
+			if at2 >= 0 and f2[at2] == 1:
+				f2[at2] = 2
+				r2[5] = f2
 		_hand_out(cu[k], at, ins, l_key[cl[k]], cp[k], HAND_TAKEN)
 		n_take_rescued += 1
 		got += maxi(cs[k], 1)
@@ -1400,6 +1571,11 @@ func _apply_load(key: int, items: PackedInt64Array) -> void:
 		_fresh_tick = tick
 	if take_first and not _takes.is_empty():
 		_takes_first(i, items)
+	if rescue_seen and read_conserve:
+		_note_seen(key, _read_t if _read_t >= 0 else tick, items)
+		if not _strikes.is_empty():
+			for k in items.size() / 4:
+				_strikes.erase(items[k * 4])
 	if read_skip_same and _lane_is(i, items):
 		n_same += 1
 		for k in items.size() / 4:
@@ -1479,9 +1655,9 @@ func _apply_load(key: int, items: PackedInt64Array) -> void:
 		gone_between[j] = true
 	if read_conserve and n > 0:
 		var before := P.duplicate() if take_first else PackedInt32Array()
-		_rescue(L, P, RV, idx, items, lo, hi, gone_between)
+		var denied := _rescue(i, L, P, RV, idx, items, lo, hi, gone_between)
 		if take_first:
-			_note_rescued(i, L, P, before, lo)
+			_note_rescued(i, L, P, before, lo, denied)
 	elif take_first:
 		_rescued.erase(i)
 	var past: Array = []  # (read_bound) [uid, item, stack, how far past the back end]: carried back
@@ -1687,8 +1863,10 @@ func _forward_split(sp: Splitter, l0: int, uid: int, item: int, stk: int, over: 
 ## are in the line) go back out of the lane behind it, those ahead of them out of it in front, keeping
 ## their order; _space_out and _carry_back then place them (P, RV changed). Only items between the read's
 ## own are left to go (taken).
-func _rescue(L: Line, P: PackedInt32Array, RV: PackedInt32Array, idx: Dictionary, items: PackedInt64Array,
-		lo: int, hi: int, skip: Dictionary) -> void:
+## (rescue_seen) Items it may not put back (_may_rescue) go: added to `skip` (the read's gone between its own).
+func _rescue(i: int, L: Line, P: PackedInt32Array, RV: PackedInt32Array, idx: Dictionary, items: PackedInt64Array,
+		lo: int, hi: int, skip: Dictionary) -> PackedInt32Array:
+	var denied := PackedInt32Array()
 	var nl := items.size() / 4
 	var n := L.uid.size()
 	var rmin := n
@@ -1702,18 +1880,47 @@ func _rescue(L: Line, P: PackedInt32Array, RV: PackedInt32Array, idx: Dictionary
 			rmax = maxi(rmax, j)
 	var ahead := PackedInt32Array()
 	var r := 0
+	# (rescue_seen) The lanes they would go into: behind, the lane after this one in the line or the last's
+	# one feeder; ahead, the lane before it or the first's next.
+	var to_back := -1
+	var to_front := -1
+	if rescue_seen:
+		var last: int = L.lanes[L.lanes.size() - 1]
+		if hi < L.base[L.base.size() - 1] + l_len[last]:
+			to_back = L.lanes[_lane_at(L, hi)]
+		elif l_feeders[last].size() == 1:
+			to_back = l_feeders[last][0]
+		if lo > 0:
+			to_front = L.lanes[_lane_at(L, lo - 1)]
+		elif l_kind[i] != SPLIT_IN and l_side[i] < 0:
+			to_front = l_next[i]
 	for j in n:
 		var q := P[j]
 		if skip.has(j) or loaded.has(L.uid[j]) or not (q < hi and (q >= lo or lo == 0 and q < 0)):
 			continue
 		if rmax < 0 or j > rmax:
-			P[j] = maxi(q, hi + r)
+			var at := maxi(q, hi + r)
+			if rescue_seen and not _may_rescue(L.uid[j], L, to_back, at):
+				skip[j] = true
+				denied.append(j)
+				n_rescue_denied += 1
+				continue
+			P[j] = at
 			RV[j] = -1
 			r += 1
+			if rescue_seen:
+				_strikes[L.uid[j]] = int(_strikes.get(L.uid[j], 0)) + 1
 		elif j < rmin and nl > 0:
+			if rescue_seen:
+				if not _may_rescue(L.uid[j], L, to_front, -1):
+					skip[j] = true
+					denied.append(j)
+					n_rescue_denied += 1
+					continue
+				_strikes[L.uid[j]] = int(_strikes.get(L.uid[j], 0)) + 1
 			ahead.append(j)
 	if ahead.is_empty():
-		return
+		return denied
 	var front := lo + int(items[2])
 	var m := ahead.size()
 	for x in m:
@@ -1722,6 +1929,7 @@ func _rescue(L: Line, P: PackedInt32Array, RV: PackedInt32Array, idx: Dictionary
 		if t < P[j]:
 			P[j] = t
 			RV[j] = -1
+	return denied
 
 
 ## (_apply_load) A read of a splitter's output with an item the simulation still had on one of that
@@ -2222,6 +2430,7 @@ func _rebuild(L: Line, U: PackedInt64Array, I: PackedInt32Array, S: PackedInt32A
 		if L.rv.is_empty() or L.rv[L.rv.size() - 1] != V[o]:
 			L.rs.append(k)
 			L.rv.append(V[o])
+	_number_all(L)
 
 
 func _apply_check(key: int, count: int, front: int, back: int, front_uid := 0, back_uid := 0) -> void:
@@ -2307,6 +2516,7 @@ func _new_lane() -> int:
 	l_xm.resize(i + 1)
 	l_ym.resize(i + 1)
 	l_read.resize(i + 1)
+	l_seen.resize(i + 1)
 	l_next.resize(i + 1)
 	l_side.resize(i + 1)
 	l_side_at.resize(i + 1)
@@ -2880,6 +3090,7 @@ func _append_sorted_build(L: Line, pos: int, uid: int, item: int, stack: int) ->
 	L.stk.append(stack)
 	_rec_append(L, -1)
 	_uid_line[uid] = L.id
+	_number(L, L.uid.size() - 1)
 	L.lp = 1
 
 
@@ -3254,6 +3465,7 @@ func _trim_out(n: int, ng: int) -> void:
 	out_speed.resize(mini(out_speed.size(), n))
 	out_reach.resize(mini(out_reach.size(), n))
 	out_run.resize(mini(out_run.size(), n))
+	out_num.resize(mini(out_num.size(), n))
 	out_gone.resize(mini(out_gone.size(), ng))
 	out_gone_tick.resize(mini(out_gone_tick.size(), ng))
 	out_gone_at.resize(mini(out_gone_at.size(), ng))
@@ -4045,6 +4257,7 @@ func _insert(X: Line, pos: int, uid: int, item: int, stack: int, rv: int) -> int
 		X.lp = 1
 		X.rs = PackedInt32Array([0])
 		X.rv = PackedInt32Array([rv])
+		_number(X, 0)
 		return 0
 	var back := X.f + X.span
 	if pos > back or pos == back and uid > X.uid[n - 1]:
@@ -4056,6 +4269,7 @@ func _insert(X: Line, pos: int, uid: int, item: int, stack: int, rv: int) -> int
 		_rec_append(X, rv)
 		if pos - back > GAP and n < X.lp:
 			X.lp = n
+		_number(X, n)
 		return n
 	# In the middle (or in front): find its place.
 	var q := X.f
@@ -4087,6 +4301,7 @@ func _insert(X: Line, pos: int, uid: int, item: int, stack: int, rv: int) -> int
 	X.lp2_from = 1 << 30
 	if X.mode == 2:
 		X.mode = 0  # (its shrinking gap moved: the line is stepped next, see the callers)
+	_number(X, j)
 	return j
 
 
@@ -4346,6 +4561,8 @@ func _wake_one(id: int, worse: bool, depth: int) -> void:
 # ---------------------------------------------------------------- records (output)
 
 func _gone(uid: int) -> void:
+	_forget_seen(uid)
+	_num.erase(uid)
 	if emit_changes:
 		out_gone.append(uid)
 		out_gone_tick.append(_cur_t if _in_step else tick)
@@ -4364,6 +4581,41 @@ func _emit_one(uid: int, item: int, stack: int, lane: int, pos: int, t: int, v: 
 	out_speed.append(v)
 	out_reach.append(line_pos if v > 0 else 0)
 	out_run.append(pos + (l_run[lane] if l_kind[lane] == STRAIGHT and l_run[lane] >= 0 else 0) if v > 0 else 0)
+	out_num.append(int(_num.get(uid, -1)))
+
+
+## (turn_id) Item j of line L numbered if it has no number yet: one behind the item ahead of it, else one ahead of
+## the item behind, else the next number not given yet.
+func _number(L: Line, j: int) -> void:
+	var u := L.uid[j]
+	if _num.has(u):
+		return
+	var n := _num_next
+	if j > 0 and _num.has(L.uid[j - 1]):
+		n = int(_num[L.uid[j - 1]]) + 1
+	elif j + 1 < L.uid.size() and _num.has(L.uid[j + 1]):
+		n = int(_num[L.uid[j + 1]]) - 1
+	_set_num(u, n)
+
+
+## (turn_id) A line's items without a number numbered from the numbered ones beside them: on behind one ahead, then
+## back ahead of one behind, then (none numbered) from the next number not given yet.
+func _number_all(L: Line) -> void:
+	var n := L.uid.size()
+	for k in range(1, n):
+		if not _num.has(L.uid[k]) and _num.has(L.uid[k - 1]):
+			_set_num(L.uid[k], int(_num[L.uid[k - 1]]) + 1)
+	for k in range(n - 2, -1, -1):
+		if not _num.has(L.uid[k]) and _num.has(L.uid[k + 1]):
+			_set_num(L.uid[k], int(_num[L.uid[k + 1]]) - 1)
+	for k in n:
+		_number(L, k)
+
+
+## (Kept below NUMS, never negative, -1 meaning none: a turn counts only a number's low 20 bits, belt_lattice.gd IDS.)
+func _set_num(u: int, n: int) -> void:
+	_num[u] = posmod(n, NUMS)
+	_num_next = maxi(_num_next, posmod(n, NUMS) + 1)
 
 
 ## The lane of a line position.

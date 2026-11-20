@@ -1,0 +1,7 @@
+{
+ "_about": "Add-on API 1.7: how deep the character's named points sit (scripts/player/character_points.gd), per look, in tiles. back and chest: out from the spine's middle, behind and in front; eyes: forward from the head bone at eye_height (0 the neck, 1 the top); hip: out from each thigh's head. Measured from the models' vertices (the outermost within 0.1 of the centre line), just outside the surface. A look not listed gets defaults worked out from its bones.",
+ "character": {"back": 0.33, "chest": 0.2, "eyes": 0.09, "eye_height": 0.5, "hip": 0.1},
+ "character-armor-2": {"back": 0.33, "chest": 0.21, "eyes": 0.14, "eye_height": 0.5, "hip": 0.1},
+ "character-armor-3": {"back": 0.46, "chest": 0.2, "eyes": 0.17, "eye_height": 0.5, "hip": 0.1},
+ "character-mech-armor": {"back": 0.36, "chest": 0.36, "eyes": 0.32, "eye_height": 0.5, "hip": 0.15}
+}

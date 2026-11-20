@@ -21,15 +21,22 @@ const FLAG_GLOW := 1
 const FLAG_FADES := 2
 const FLAG_BELT := 4
 const FLAG_NO_SPRITE := 8
-## A creature's tinted skin (creature_models.gd): Factorio's two mask layers, or one over the part colour.
+## A creature's tinted skin (creature_models.gd): Factorio's two mask layers, or one over the part colour
+## (both flags: skin_mode 3, the one mask as 0.2.1 read it).
 const FLAG_SKIN_MASKS := 16
 const FLAG_SKIN_MASK := 32
+## emission_from_paint: the emission multiplies the surface's own colour.
+const FLAG_PAINT_GLOW := 64
+## glow_keeps_albedo: its idle dims only the glow, never the base colour (a modeller's).
+const FLAG_KEEP_ALBEDO := 128
+## modeller_tex: a "pbr" pack's untextured surface merged into rows uses its own glTF shading.
+const FLAG_MODELLER_TEX := 256
 ## The uniforms each row has its own value of, in the table.
 const ROW_PARAMS := ["albedo", "roughness", "metallic", "emission", "emission_energy", "activity_glow", "glow_fades",
 	"glow_flicker", "glow_pulse", "glow_rate", "vertex_data", "edge_data", "view_data", "part_data", "part_colors",
 	"part_weathering", "part_light", "ao_strength", "grime", "grime_color", "ground_grime_height", "edge_wear", "edge_color",
 	"edge_metallic", "rust", "rust_color", "streaks", "dust", "dust_color", "desaturate", "value", "grain",
-	"skin_mode", "skin_tint2", "nature_grain"]
+	"skin_mode", "skin_tint2", "nature_grain", "emission_from_paint", "glow_keeps_albedo", "modeller_tex"]
 ## The vec4s a row takes in material_table.
 const ROW_SIZE := 11
 ## Meta on a row changed by edit(): only those are looked at for the model's own uniforms.
@@ -100,11 +107,14 @@ static func compile(material: ShaderMaterial) -> void:
 	var list := rows(material)
 	var table: Array[Vector4] = []
 	var any_glow := false
+	var any_modeller_tex := false
 	var lifted := {}
 	for row: ShaderMaterial in list:
 		table.append_array(row_vectors(row))
 		if bool(_value(row, "activity_glow")):
 			any_glow = true
+		if bool(_value(row, "modeller_tex")):
+			any_modeller_tex = true
 		if row.has_meta(EDITED_META):
 			for u in _uniform_names(row.shader):
 				if not _not_lifted.has(u) and not lifted.has(u):
@@ -115,6 +125,8 @@ static func compile(material: ShaderMaterial) -> void:
 	material.set_shader_parameter("material_rows", list.size())
 	# What GDScript asks of a material (ModelLibrary.glows, the far merge) answers for the model.
 	material.set_shader_parameter("activity_glow", any_glow)
+	if any_modeller_tex or material.get_shader_parameter("modeller_tex") == true:
+		material.set_shader_parameter("modeller_tex", any_modeller_tex)
 	for u in lifted:
 		material.set_shader_parameter(u, lifted[u])
 
@@ -133,6 +145,12 @@ static func row_vectors(row: ShaderMaterial) -> Array[Vector4]:
 	var cells: Variant = row.get_shader_parameter("sprite_cells")
 	if cells != null and int(cells) == 0:
 		flags |= FLAG_NO_SPRITE
+	if bool(v["emission_from_paint"]):
+		flags |= FLAG_PAINT_GLOW
+	if bool(v["glow_keeps_albedo"]):
+		flags |= FLAG_KEEP_ALBEDO
+	if bool(v["modeller_tex"]):
+		flags |= FLAG_MODELLER_TEX
 	var albedo: Color = v["albedo"]
 	var emission: Color = v["emission"]
 	var energy := float(v["emission_energy"])
@@ -147,8 +165,8 @@ static func row_vectors(row: ShaderMaterial) -> Array[Vector4]:
 		emission = tint2
 		energy = 1.0
 		spare = tint2.a
-	elif skin == 2:
-		flags |= FLAG_SKIN_MASK
+	elif skin == 2 or skin == 3:
+		flags |= FLAG_SKIN_MASK | (FLAG_SKIN_MASKS if skin == 3 else 0)
 		emission = Color.BLACK
 		spare = tint2.a
 	var out: Array[Vector4] = [

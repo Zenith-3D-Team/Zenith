@@ -1,7 +1,8 @@
 # Zenith: Roadmap
 
-Where Zenith is going, may not happen in this exact order but a general idea of my plans for the project.
-[Releases](https://github.com/unjustodin/Zenith/releases),
+Where Zenith is going. It's a plan, not a promise: priorities can change as I play it and as
+players report bugs. What's in each release is on the
+[Releases](https://github.com/unjustodin/Zenith/releases) page, and known bugs are in
 [Issues](https://github.com/unjustodin/Zenith/issues).
 
 ## Goals, not one milestone at a time

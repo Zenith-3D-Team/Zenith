@@ -1,9 +1,10 @@
 extends "res://scripts/ui/factorio/global_window.gd"
 ## Factorio's "Alerts configuration": a table of every kind of alert (Icon, Name, Muted, Disabled,
 ## Latest), sorted by clicking a column's header (again: the other way). Disabled kinds leave the
-## alert bar and the icons over entities (alerts.gd's hidden_kinds); muted ones are kept for when
-## alerts make sounds (the client's alerts are silent). Latest is how long since the client last
-## saw that alert. Both choices are kept in settings.cfg [alerts].
+## alert bar and the icons over entities (alerts.gd's hidden_kinds); muted ones make no alert sound
+## (alerts.gd's muted_kinds: Factorio's beep for something destroyed and for a turret out of
+## ammunition). Latest is how long since the client last saw that alert. Both choices are kept in
+## settings.cfg [alerts].
 ##
 ## The bridge's character has no player, so these are the client's own settings, not
 ## LuaPlayer.mute_alert / disable_alert.
@@ -29,7 +30,7 @@ const TYPES := [
 	["Asteroid collector blocked", "asteroid-collector-path-blocked-icon.png", "collector"],
 	["Unclaimed items waiting", "unclaimed-cargo-icon.png", ""],
 	["Not enough empty roboport robot slots", "no-roboport-storage-space-icon.png", ""],
-	["Pipeline overextended", "fluid-icon-red.png", ""],
+	["Pipeline overextended", "fluid-icon-red.png", "pipeline"],
 	["Fluids mixed", "fluid-icon-red.png", ""],
 	["Enemy expansion base detected", "biter-base-icon.png", ""],
 ]
@@ -71,10 +72,14 @@ func apply() -> void:
 	if alerts == null:
 		return
 	var hidden: Array = Alerts.HIDDEN_BY_DEFAULT.duplicate()
+	var silent: Array = []
 	for t in TYPES:
 		if disabled().has(t[0]) and str(t[2]) != "":
 			hidden.append(str(t[2]))
+		if muted().has(t[0]) and str(t[2]) != "":
+			silent.append(str(t[2]))
 	alerts.hidden_kinds = hidden
+	alerts.muted_kinds = silent
 
 
 func set_flag(name: String, which: String, on: bool) -> void:

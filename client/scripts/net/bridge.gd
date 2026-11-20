@@ -22,6 +22,9 @@ signal connection_lost
 ## rate a busy base's messages queue up for seconds, and the debug menu and a screenshot's pause
 ## gave up on answers that had come). It is handled in its turn too: ui_model.gd answers each id once.
 signal answer_read(msg: Dictionary)
+## A Factorio mod's message for its add-on (`ext`, addon_game.gd): handed only to the add-ons, never
+## to message_received.
+signal ext_received(msg: Dictionary)
 
 const PROTOCOL := 1
 const HELLO_INTERVAL := 1.0
@@ -47,10 +50,16 @@ var decoratives := true
 var decorative_distance := 0
 ## Ask for mods' windows in the hello (main.gd, from the Interface settings).
 var mod_windows := false
+## The account this PC's Factorio plays under (main.gd, Paths.factorio_player_name), "" unknown: the
+## hello's `pn`, so the player who joins with it takes over this client's character (L13).
+var factorio_player := ""
 ## Ask for inserter events (`ie`) in the hello (main.gd, from inserter_arms.gd's flags): 0 no, 1
 ## instead of the samples, 2 as well as them.
 var inserter_events := 0
 var inserter_handoff := false  # (hello ho: the items inserters put on belts, inserter_arms.gd handoff)
+## Binary frames (hello `bin`, wire_decode.gd): the busiest updates as numbers instead of JSON text, which
+## the mod writes far faster. `--binary-messages=off`: the hello leaves `bin` out and everything comes as JSON.
+var binary_messages := true
 var bind_error := OK
 ## True between a welcome and a timeout.
 var connected := false
@@ -64,13 +73,15 @@ var save_id := ""
 ## The furthest square subscription the bridge takes (welcome `sq`, chunks; world.gd's `sub`); 0: a
 ## bridge from before them, which takes a list of at most 625 chunks.
 var square_subs := 0
+## The add-on link's version from the last welcome (`ext`; 0: the bridge carries no add-on messages).
+var link_version := 0
 ## The tick of the message handled last: what the world mirror has reached.
 var server_tick := 0
 ## The newest tick read off the socket: where the game is now. server_tick runs behind it while
 ## messages wait their turn (_drain) and catches up in bursts, so the game's UPS is measured on this
 ## (a busy base at 6 fps read 161 UPS at game speed 1 on server_tick).
 var newest_tick := 0
-var stats := {"packets": 0, "bytes": 0, "gaps": 0, "handle_usec": 0, "resyncs": 0, "full_resyncs": 0, "bad_json": 0}
+var stats := {"packets": 0, "bytes": 0, "gaps": 0, "handle_usec": 0, "resyncs": 0, "full_resyncs": 0, "bad_json": 0, "bad_frames": 0}
 ## Datagram loss, from the bridge's numbering (its `dg` line at the end of each datagram, asked for
 ## with `dq` in the hello): "datagrams" numbered ones read, "lost" the numbers skipped (datagrams the
 ## OS dropped: Windows keeps 64 KB of unread datagrams per socket), "unnumbered" datagrams without
@@ -100,6 +111,9 @@ var _rate_sent := -1
 ## `ac` carries back (world.gd keeps only the current turning's), or 0 while off. Set with
 ## set_alt_contents; said again after every handshake, which turns it off in the bridge.
 var alt_contents := 0
+## --loco-fuel-icons=on: Alt-mode shows locomotives' fuel again (off by default; the cargo wagons' items show instead).
+## Sent with `altc` as `lf`, so the bridge reads locomotives only then.
+var loco_fuel_icons := OS.get_cmdline_user_args().has("--loco-fuel-icons=on")
 var _alt_turns := 0
 var _alt_sent := 0
 
@@ -116,6 +130,7 @@ var _udp := PacketPeerUDP.new()
 ## 0.3-0.6% of them, and `ih` updates; tools/udp_loss_check.py), and OS.delay_usec(1000) sleeps
 ## 2 ms on Windows, so the drain between the burst's datagrams often came too late.
 const NATIVE_SOCKET := "UdpSocketNative"
+const NativeLibrary := preload("res://scripts/native_library.gd")
 var udp_native := true
 var udp_rcvbuf := 8 * 1024 * 1024
 ## --udp-io-priority=high|normal: the I/O thread's priority. Measured at -62,-26 (before the native
@@ -172,7 +187,8 @@ var _outbox: Array[PackedByteArray] = []
 ## The datagrams' JSON is read on a thread of its own too (walking a big base, decoding was about
 ## half of the 2-7 ms a frame spent on messages): the I/O thread hands it what it read (_inbox),
 ## it hands the main thread the messages read (_parsed: [datagram bytes, messages, their lengths,
-## how many had numbers that aren't finite, the newest tick, the console answers (`cmdr`)]), and
+## how many had numbers that aren't finite, the newest tick, the console answers (`cmdr`), the `dg`
+## number, when it was read, the types traced, 1 for a bad binary frame]), and
 ## the main thread only handles them. A thread of
 ## its own, not the I/O thread's: reading a burst's JSON there would leave the socket unread for
 ## tens of milliseconds. Its own JSON and RegEx: neither is shared between threads.
@@ -229,6 +245,7 @@ var _relay_state := ""
 
 
 func _ready() -> void:
+	NativeLibrary.ensure()  # early, on the main thread, for whatever looks for its classes later
 	for arg in OS.get_cmdline_user_args():
 		if arg.begins_with("--factorio-port="):
 			factorio_port = int(arg.get_slice("=", 1))
@@ -256,6 +273,8 @@ func _ready() -> void:
 			catchup_usec = maxi(0, int(arg.get_slice("=", 1))) * 1000
 		elif arg.begins_with("--belt-messages-first="):
 			belt_messages_first = arg.get_slice("=", 1) != "off"
+		elif arg.begins_with("--binary-messages="):
+			binary_messages = arg.get_slice("=", 1) != "off"
 	randomize()
 
 
@@ -263,7 +282,7 @@ func _ready() -> void:
 ## else PacketPeerUDP. Returns the bind's error.
 func _sock_bind(port: int) -> Error:
 	_nudp = null
-	if udp_native and ClassDB.class_exists(NATIVE_SOCKET):
+	if udp_native and NativeLibrary.ensure() and ClassDB.class_exists(NATIVE_SOCKET):
 		var sock: RefCounted = ClassDB.instantiate(NATIVE_SOCKET)
 		var err := sock.bind(port, "127.0.0.1", udp_rcvbuf) as Error
 		if err == OK:
@@ -415,10 +434,11 @@ func disconnect_from() -> void:
 	_relay_state = ""
 	connected = false
 	world_ready = false
+	link_version = 0
 	bind_error = OK
 	server_tick = 0
 	newest_tick = 0
-	stats = {"packets": 0, "bytes": 0, "gaps": 0, "handle_usec": 0, "resyncs": 0, "full_resyncs": 0, "bad_json": 0}
+	stats = {"packets": 0, "bytes": 0, "gaps": 0, "handle_usec": 0, "resyncs": 0, "full_resyncs": 0, "bad_json": 0, "bad_frames": 0}
 	loss = {"datagrams": 0, "lost": 0, "unnumbered": 0}
 	_dg_expected = -1
 	_waiting.clear()
@@ -633,33 +653,18 @@ func _parse_loop() -> void:
 			var packet: PackedByteArray = raw[i]
 			var newest := -1
 			var answers: Array = []
-			var text := MessageDecode.packet_text(packet)
-			var lines := text.split("\n", false) if text.contains("\n") else PackedStringArray([text])
-			var msgs: Array = []
-			var lengths := PackedInt32Array()
-			var bad := 0
-			var dg := -1
+			var read := _read_datagram(json, not_finite, packet)
+			var msgs: Array = read[0]
 			var types := {}
-			for line in lines:
-				var got: Array = _parse_with(json, not_finite, line)
-				if got[0] is Dictionary:
-					var msg: Dictionary = got[0]
-					var t: Variant = msg.get("t")
-					if t == "dg":
-						# The datagram's number (the bridge's last line): counted, not handled.
-						dg = _int_or(msg.get("n"), -1)
-						continue
-					MessageDecode.prepare(msg, t)  # its pure decoding here, off the main thread
-					msgs.append(msg)
-					lengths.append(line.length())
-					newest = maxi(newest, _int_or(msg.get("k"), -1))
-					if t == "cmdr":
-						answers.append(msg)
-					if tracing:
-						types[t] = int(types.get(t, 0)) + 1
-				if got[1]:
-					bad += 1
-			out.append([packet.size(), msgs, lengths, bad, newest, answers, dg, when[i] if i < when.size() else 0, types])
+			for msg: Dictionary in msgs:
+				var t: Variant = msg.get("t")
+				MessageDecode.prepare(msg, t)  # its pure decoding here, off the main thread
+				newest = maxi(newest, _int_or(msg.get("k"), -1))
+				if t == "cmdr":
+					answers.append(msg)
+				if tracing:
+					types[t] = int(types.get(t, 0)) + 1
+			out.append([packet.size(), msgs, read[1], read[2], newest, answers, read[3], when[i] if i < when.size() else 0, types, read[4]])
 		_io_mutex.lock()
 		_parsed.append_array(out)
 		_io_mutex.unlock()
@@ -712,6 +717,8 @@ func _process(delta: float) -> void:
 					_waiting_usec.append(read_at)
 			if int(entry[3]) > 0:
 				stats["bad_json"] = int(stats.get("bad_json", 0)) + int(entry[3])
+			if int(entry[9]) > 0:
+				stats["bad_frames"] = int(stats.get("bad_frames", 0)) + int(entry[9])
 			var k := int(entry[4])
 			# A tick far behind the newest is a save loaded (or a new session): start from it.
 			if k > newest_tick or (k >= 0 and k < newest_tick - 3600):
@@ -733,7 +740,10 @@ func _process(delta: float) -> void:
 		_alt_sent = 0
 	elif _alt_sent != alt_contents:
 		_alt_sent = alt_contents
-		send({"t": "altc", "on": 1 if alt_contents > 0 else 0, "g": alt_contents})
+		var altc := {"t": "altc", "on": 1 if alt_contents > 0 else 0, "g": alt_contents}
+		if loco_fuel_icons:
+			altc["lf"] = 1
+		send(altc)
 	if connected and not world_ready and Time.get_ticks_msec() - last_reliable_msec > HANDSHAKE_STALL_MSEC:
 		request_resync(true)
 	if _pending_resync > 0 and connected:
@@ -775,6 +785,7 @@ const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const MessageDecode := preload("res://scripts/net/message_decode.gd")
+const WireDecode := preload("res://scripts/net/wire_decode.gd")
 const BACKLOG_MESSAGES := 300
 ## This frame's message handling, in µs, for world.gd's share of the frame.
 var frame_handle_usec := 0
@@ -782,19 +793,77 @@ var frame_handle_usec := 0
 ## only while it runs).
 const SLOW_MESSAGE_USEC := 8000
 var slow_messages: Array = []
+## (--stutter-probe) Every message over SLOW_MESSAGE_USEC by type (slow_messages keeps only the first 200).
+var slow_counts := {}
 
 
 ## For the UI test: a datagram's messages queued for _drain, as the parsing thread queues them.
 func _queue(packet: PackedByteArray) -> void:
 	stats["packets"] += 1
 	stats["bytes"] += packet.size()
-	var text := MessageDecode.packet_text(packet)
-	for line in (text.split("\n", false) if text.contains("\n") else PackedStringArray([text])):
-		var msg = parse(line)
-		if msg is Dictionary:
-			_waiting.append(msg)
-			_waiting_len.append(line.length())
-			_waiting_usec.append(Time.get_ticks_usec())
+	var read := _read_datagram(_json, _not_finite, packet)
+	_count_bad(read)
+	var lengths: PackedInt32Array = read[1]
+	for i in (read[0] as Array).size():
+		_waiting.append(read[0][i])
+		_waiting_len.append(lengths[i])
+		_waiting_usec.append(Time.get_ticks_usec())
+
+
+## A datagram's messages, with the JSON and RegEx of the thread it runs on: [messages (Dictionaries), their
+## lengths, how many had numbers that aren't finite, the datagram's number (-1 without), 1 when a binary
+## frame was bad]. Text is one JSON message or several joined by newlines (`b` in the hello); a datagram
+## starting WireDecode.WIRE_MAGIC is binary frames (`bin`), JSON ones among them read as lines are. The
+## `dg` line or frame is counted here, not handed on. Anything that isn't a JSON object is dropped.
+func _read_datagram(json: JSON, not_finite: RegEx, packet: PackedByteArray) -> Array:
+	var entries: Variant
+	var sizes := PackedInt32Array()
+	var dg := -1
+	var bad_frames := 0
+	if WireDecode.is_binary(packet):
+		var got := WireDecode.read(packet)
+		entries = got[0]
+		sizes = got[1]
+		dg = int(got[2])
+		bad_frames = int(got[3])
+	else:
+		var text := MessageDecode.packet_text(packet)
+		entries = text.split("\n", false) if text.contains("\n") else PackedStringArray([text])
+	var msgs: Array = []
+	var lengths := PackedInt32Array()
+	var bad := 0
+	var i := -1
+	for entry: Variant in entries:
+		i += 1
+		if entry is Dictionary:
+			# (A binary `ents` part's extras come as JSON text: parsed here as a line is.)
+			if (entry as Dictionary).has("xi") and not WireDecode.ents_extras(entry, func(text: String) -> Variant: return _parse_with(json, not_finite, text)[0]):
+				bad_frames += 1
+				continue
+			msgs.append(entry)
+			lengths.append(sizes[i])
+			continue
+		var line: String = entry
+		var got: Array = _parse_with(json, not_finite, line)
+		if got[1]:
+			bad += 1
+		if got[0] is Dictionary:
+			var msg: Dictionary = got[0]
+			var t: Variant = msg.get("t")
+			if t is String and t == "dg":
+				# The datagram's number (the bridge's last line): counted, not handled.
+				dg = _int_or(msg.get("n"), -1)
+				continue
+			msgs.append(msg)
+			lengths.append(line.length())
+	return [msgs, lengths, bad, dg, bad_frames]
+
+
+func _count_bad(read: Array) -> void:
+	if int(read[2]) > 0:
+		stats["bad_json"] = int(stats.get("bad_json", 0)) + int(read[2])
+	if int(read[4]) > 0:
+		stats["bad_frames"] = int(stats.get("bad_frames", 0)) + int(read[4])
 
 
 var _json := JSON.new()
@@ -906,8 +975,11 @@ func _drain() -> void:
 				_routed_out(msg)
 			_handle(msg)
 			var spent := Time.get_ticks_usec() - t0
-			if Probing.on and spent > SLOW_MESSAGE_USEC and slow_messages.size() < 200:
-				slow_messages.append([spent / 1000.0, str(msg.get("t", "")), length])
+			if Probing.on and spent > SLOW_MESSAGE_USEC:
+				var st := str(msg.get("t", ""))
+				slow_counts[st] = int(slow_counts.get(st, 0)) + 1
+				if slow_messages.size() < 200:
+					slow_messages.append([spent / 1000.0, st, length])
 		elif msg is Replay:
 			(msg as Replay).run()
 		if Time.get_ticks_usec() - start > limit:
@@ -1002,16 +1074,10 @@ func waiting_count() -> int:
 func receive(packet: PackedByteArray) -> void:
 	stats["packets"] += 1
 	stats["bytes"] += packet.size()
-	var text := MessageDecode.packet_text(packet)
-	if not text.contains("\n"):
-		var msg = parse(text)
-		if msg is Dictionary:
-			_handle(msg)
-		return
-	for line in text.split("\n", false):
-		var msg = parse(line)
-		if msg is Dictionary:
-			_handle(msg)
+	var read := _read_datagram(_json, _not_finite, packet)
+	_count_bad(read)
+	for msg: Dictionary in read[0]:
+		_handle(msg)
 
 
 ## A JSON number as an int, or `default` for anything else. Packets come from a local port any
@@ -1112,6 +1178,12 @@ func _send_hello() -> void:
 		hello["ie"] = inserter_events
 	if inserter_handoff:
 		hello["ho"] = 1
+	# pn: the player this PC's Factorio joins as (Ctrl+F9's), who plays this client's character there.
+	if factorio_player != "":
+		hello["pn"] = factorio_player
+	# bin: binary frames up to this wire version (wire_decode.gd); a bridge before them sends JSON as ever.
+	if binary_messages:
+		hello["bin"] = WireDecode.WIRE_VERSION
 	send(hello)
 
 
@@ -1133,6 +1205,7 @@ func _handle(msg: Dictionary) -> void:
 			mod_version = str(msg.get("mod", ""))
 			save_id = str(msg.get("sid", ""))
 			square_subs = _int_or(msg.get("sq"), 0)
+			link_version = _int_or(msg.get("ext"), 0)
 			if _int_or(msg.get("v"), 0) != PROTOCOL:
 				push_warning("Bridge mod %s speaks protocol %s, this client %d" % [mod_version, str(msg.get("v")), PROTOCOL])
 			_expected_r = r + 1
@@ -1160,6 +1233,9 @@ func _handle(msg: Dictionary) -> void:
 		return
 	if t == "gfx":
 		ModGraphics.on_part(msg)
+		return
+	if t == "ext":
+		ext_received.emit(msg)
 		return
 	if t == "wb":
 		# The bridge's work per tick (once a second): kept here for whatever reads it.

@@ -9,6 +9,7 @@ local tracker = require("scripts.tracker")
 local puppet = require("scripts.puppet")
 local alerts = require("scripts.alerts")
 local turrets = require("scripts.turrets")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -38,16 +39,72 @@ local function selected_gun(c)
   return ok and i or nil
 end
 
+-- N3: the armed vehicle the character sits in (a car, tank or spidertron with guns), its guns
+-- (LuaEntityPrototype.indexed_guns, in slot order) and its ammo inventory, or nil. Factorio's
+-- tool bar shows these instead of the character's while it drives or rides.
+local VEHICLE_AMMO = { car = "car_ammo", ["spider-vehicle"] = "spider_ammo" }
+local function armed_vehicle(c)
+  local v = puppet.vehicle(c)
+  local inv_name = v and v.valid and VEHICLE_AMMO[v.type]
+  if not inv_name then
+    return nil
+  end
+  local ok, guns = pcall(function()
+    local out = {}
+    for i, g in ipairs(v.prototype.indexed_guns or {}) do
+      out[i] = g.name
+    end
+    return out
+  end)
+  if not (ok and guns and #guns > 0) then
+    return nil
+  end
+  local oka, ammo = pcall(function() return v.get_inventory(defines.inventory[inv_name]) end)
+  return v, guns, oka and ammo or nil
+end
+M.armed_vehicle = armed_vehicle
+
+-- (`/f3d-perf vehicle_ammo`) What the character shoots with: in an armed vehicle the vehicle's
+-- selected gun (the game fires it for the driver's shooting_state: the car's rounds go down, checked
+-- in 2.1.24), else its own. Returns the ammo inventory, the selected slot, the gun's name and the
+-- vehicle (nil on foot).
+local weapon_tick, weapon_of, weapon_was = -1, nil, nil
+local function read_weapon(c)
+  if perf.on("vehicle_ammo") then
+    local v, vguns, vammo = armed_vehicle(c)
+    if v then
+      local ok, i = pcall(function() return v.selected_gun_index end)
+      i = ok and i or 1
+      return vammo, i, vguns[i], v
+    end
+  end
+  local guns, ammo = inventories(c)
+  local i = selected_gun(c)
+  local g = guns and i and i >= 1 and i <= #guns and guns[i]
+  return ammo, i, g and g.valid_for_read and g.name or nil, nil
+end
+
+-- read_weapon once a tick (tick_shooting asks three or four times); a cache of this tick's game state only,
+-- never in storage, so every peer reads the same.
+local function weapon(c)
+  if weapon_tick ~= game.tick or weapon_of ~= c then
+    weapon_tick, weapon_of, weapon_was = game.tick, c, { read_weapon(c) }
+  end
+  return weapon_was[1], weapon_was[2], weapon_was[3], weapon_was[4]
+end
+
+-- The ammo stack of the gun in use, or nil.
+local function ammo_stack(c)
+  local ammo, i = weapon(c)
+  local stack = ammo and i and i >= 1 and i <= #ammo and ammo[i]
+  return stack and stack.valid_for_read and stack or nil
+end
+
 -- Bullets left with the selected gun: magazines and the rounds in the one in use. It only
 -- matters that it goes down when the character fires.
 local function ammo_left(c)
-  local _, ammo = inventories(c)
-  local i = selected_gun(c)
-  if not (ammo and i and i >= 1 and i <= #ammo) then
-    return 0
-  end
-  local stack = ammo[i]
-  if not stack.valid_for_read then
+  local stack = ammo_stack(c)
+  if not stack then
     return 0
   end
   local ok, rounds = pcall(function() return stack.ammo end)
@@ -78,6 +135,18 @@ end
 function M.gun(cmd)
   local c = puppet.get()
   local i = math.floor(tonumber(cmd.i) or 0)
+  local v, vguns
+  if c then
+    v, vguns = armed_vehicle(c)
+  end
+  if v then
+    -- Driving: Tab and the tool bar pick the vehicle's gun, as in Factorio.
+    if i >= 1 and i <= #vguns then
+      pcall(function() v.selected_gun_index = i end)
+      storage.f3d.guns_sig = nil
+    end
+    return
+  end
   local guns = c and inventories(c)
   if guns and i >= 1 and i <= #guns and guns[i].valid_for_read then
     pcall(function() c.selected_gun_index = i end)
@@ -165,25 +234,20 @@ end
 -- The selected gun's name and attack parameters (cached per gun: they come from prototypes).
 local gun_params = {}
 local function selected_gun_params(c)
-  local guns = inventories(c)
-  local i = selected_gun(c)
-  local g = guns and i and i >= 1 and i <= #guns and guns[i]
-  if not (g and g.valid_for_read) then
+  local _, _, name = weapon(c)
+  if not name then
     return nil
   end
-  local name = g.name
   if gun_params[name] == nil then
-    local ok, ap = pcall(function() return g.prototype.attack_parameters end)
+    local ok, ap = pcall(function() return prototypes.item[name].attack_parameters end)
     gun_params[name] = ok and ap and { type = ap.type, range = ap.range or 15 } or false
   end
   return name, gun_params[name]
 end
 
 local function ammo_name(c)
-  local _, ammo = inventories(c)
-  local i = selected_gun(c)
-  local stack = ammo and i and i >= 1 and i <= #ammo and ammo[i]
-  return stack and stack.valid_for_read and stack.name or nil
+  local stack = ammo_stack(c)
+  return stack and stack.name or nil
 end
 
 -- Each shot the character fires (its ammo went down this tick), so the client can draw the
@@ -194,6 +258,12 @@ end
 local function send_shot(c, sh, state)
   local gun, params = selected_gun_params(c)
   if not gun or (params and params.type == "stream") then
+    return
+  end
+  -- A vehicle's shots are turrets.lua's: `ts` counts its rounds and the client's turrets.gd draws
+  -- each from the vehicle's gun (flash, hit, recoil, sound); a `shot` too would draw them twice.
+  local _, _, _, vehicle = weapon(c)
+  if vehicle then
     return
   end
   local target
@@ -259,9 +329,36 @@ local function rounds_of(stack)
   return ok and math.floor(rounds or 0) or 0, ok2 and math.floor(size or 0) or 0
 end
 
+-- The vehicle's guns, as send_guns' list: each of its guns over its ammo slot.
+local function vehicle_guns(v, guns, ammo)
+  local list, parts = {}, {}
+  for i, name in ipairs(guns) do
+    local a = ammo and i <= #ammo and ammo[i] or nil
+    local rec = { name, "", 0, 0, 0 }
+    if a and a.valid_for_read then
+      rec[2], rec[3] = a.name, a.count
+      rec[4], rec[5] = rounds_of(a)
+    end
+    list[i] = rec
+    parts[i] = table.concat(rec, "/")
+  end
+  local ok, sel = pcall(function() return v.selected_gun_index end)
+  return list, parts, ok and sel or 1
+end
+
 -- [[gun, ammo, magazines, rounds, magazine size], ...] per gun slot ("" for empty), and the
--- selected slot.
+-- selected slot; in an armed vehicle its guns, with `v` its unit number (N3).
 local function send_guns(c, s)
+  local v, vguns, vammo = armed_vehicle(c)
+  if v then
+    local list, parts, sel = vehicle_guns(v, vguns, vammo)
+    local sig = "v" .. tostring(v.unit_number) .. ":" .. sel .. ":" .. table.concat(parts, ",")
+    if sig ~= s.guns_sig then
+      s.guns_sig = sig
+      transport.send_reliable({ t = "guns", sel = sel, l = list, v = v.unit_number or 0 })
+    end
+    return
+  end
   local guns, ammo = inventories(c)
   if not (guns and ammo) then
     return

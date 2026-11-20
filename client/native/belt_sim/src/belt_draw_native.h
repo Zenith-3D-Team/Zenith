@@ -53,6 +53,8 @@ public:
 	static constexpr int KEEP_UPDATES = 40;
 	static constexpr int CAP_EVERY = 30;
 	static constexpr int MAX_STACK = 4;
+	static constexpr i64 TURN_RUN = 40503;  // (turn_id) belt_lattice.gd TURN_RUN
+	static constexpr i64 VARIANT_STEP = 1 << 20;  // item_cards.gd VARIANT_STEP
 	static constexpr double PILE_TURN = 0.45;  // item_cards.gd PILE_TURN (turn_for)
 	static constexpr double CAP_SLACK = 1.5;
 	// belt_items.gd VIEW_STEP, VIEW_TURN; view_priority.gd MARGIN
@@ -95,6 +97,7 @@ private:
 		i64 item_id = 0;
 		i64 key = 0;
 		double c = 1.0, s = 0.0;
+		i64 num = -1;  // (turn_id) the number its turn is from (-1: its uid's)
 		Vector3 from, step;
 		double t_from = 0.0, t_to = 0.0;
 		std::vector<float> path;
@@ -144,6 +147,7 @@ private:
 		Vector3 lift;
 		bool turns = false;
 		double pile = 0.07;
+		i64 variants = 0;  // how many variants its model has (belt_items.gd _look's 4th)
 	};
 	// What happened after the drawn tick, for the next job (belt_items.gd State.later).
 	struct Later {
@@ -240,6 +244,7 @@ private:
 	bool full = false;
 	std::unordered_map<i64, Look> known;
 	int model_cap = -1;
+	bool known_given = false;  // this job's params gave the looks (they changed)
 	// The camera drawing, when it leads Items in 3D's cap (belt_items.gd Job.cam_led, view_priority.gd).
 	bool cam_led = false;
 	Vector3 cam_pos;
@@ -251,6 +256,7 @@ private:
 	bool view_all = true;
 	bool coalesce = true;
 	bool early = true;  // --belt-draw-early: changes after the drawn tick taken now when nothing shows early
+	bool early_stop = true;  // --belt-draw-early-stop: a record cut to end at a stop waiting that it runs into
 	bool view_cull = true;
 	bool lead_on = true;
 	bool gone_order = true;
@@ -258,6 +264,8 @@ private:
 	bool dump_parks = true;  // --belt-draw-dump-parks: a park dumped as the record's going (belt_items.gd)
 	bool later_tick = true;  // --belt-draw-later-tick
 	bool park_lat = false;  // --belt-draw-park-lattice
+	bool turn_id = false;  // (turn_id) belt_lattice.gd turn_id (with item_turns): an item turned by its number
+	std::unordered_map<i64, i64> nums_of;  // (turn_id) uid -> the simulation's number for it (belt_items.gd nums)
 	int ask_mode = 0;  // --belt-sim-ask: 0 all (every failing lane every 3 s, as before), 1 view
 	bool ask_near = true;  // --belt-sim-ask-near: a job's asks nearest the view first
 	bool dumping = false;
@@ -266,7 +274,7 @@ private:
 	// Results
 	Array written;
 	Array unknown;
-	i64 records_written = 0, changes = 0, coalesced = 0, early_n = 0, renewed = 0, gone_n = 0, parked = 0, unparked = 0;
+	i64 records_written = 0, changes = 0, coalesced = 0, early_n = 0, early_stop_n = 0, renewed = 0, gone_n = 0, parked = 0, unparked = 0;
 	i64 early_tries = 0, ask_view = 0, ask_lat = 0, ask_out = 0, ask_held = 0, lat_parks = 0, lat_unparks = 0, drained = 0;
 	std::vector<i64> resend;
 	Ref<Image> paths;
@@ -306,6 +314,7 @@ private:
 	void _go_or_hold(i64 uid, i64 t, i64 now, std::unordered_set<i64> &held);
 	void _go(i64 uid);
 	void _apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run);
+	void _cut_at_stop(Item *it, i64 key, i64 pos, i64 t0, i64 now);
 	bool _apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run, i64 now,
 			i64 *retry_at = nullptr);
 	void _plan(Item *it);
@@ -320,6 +329,7 @@ private:
 	void _cap_models();
 	bool _cam_moved() const;
 	void _rekey(Item *it, i64 key);
+	i64 _model_key(const Item *it) const;
 	int _put(Kind *kind, SlotRef e);
 	void _unplace(Item *it);
 	void _write();
@@ -338,6 +348,16 @@ public:
 	Dictionary run_job(const Dictionary &changes, const Dictionary &params);
 	Array drawn(i64 key, double t);
 	bool has_item(i64 uid) const { return items.has(uid); }
+	// (tests) The kind item `uid` is drawn as (belt_items.gd Item.key), 0 for none.
+	i64 key_of(i64 uid) {
+		Item **p = items.get(uid);
+		return p == nullptr ? 0 : (*p)->key;
+	}
+	// An item's hide_at (the tick its record hides from on the drawn clock), -1 none or no such item (tests).
+	double hide_of(i64 uid) {
+		Item **it = items.get(uid);
+		return it == nullptr ? -1.0 : (*it)->hide_at;
+	}
 	Dictionary stats() const;
 
 	BeltDrawNative();

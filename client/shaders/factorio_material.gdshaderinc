@@ -63,11 +63,16 @@ uniform bool part_colors = true;
 // A creature's tinted skin (tools/models/creature_skin.py, creature_models.gd): its part colours are
 // Factorio's mask layers per vertex, coloured by the tier's tints as Factorio draws them. skin_mode
 // 1: (mask 1, mask 2, mask 2's cover) under albedo (tint 1) and skin_tint2; 2: one mask (its shade
-// and cover in COLOR) over the part colour, tinted by albedo, skin_tint2.a its alpha. 0: the part
-// colour as it is. In a merged table: row flags 16 and 32, tint 2 in the emission slot and its
-// alpha in row 5's w.
+// and cover in COLOR) over the part colour, tinted by albedo, skin_tint2.a its alpha; 3: mode 2 as
+// 0.2.1 read it, where the mask doesn't reach glowing in the tier's colour (--creature-glow=old). 0:
+// the part colour as it is. In a merged table: row flags 16, 32 and both (3), tint 2 in the emission
+// slot and its alpha in row 5's w.
 uniform int skin_mode = 0;
 uniform vec4 skin_tint2 : source_color = vec4(1.0);
+// A glowing material that shines by its own paint: the emission (colour times strength) multiplies
+// what the surface shows instead of glowing in its own colour (creature_models.gd: the demolishers'
+// lava, whose part colours are the sprite's lava). Row flag 64 in a merged table.
+uniform bool emission_from_paint = false;
 // Cliffs: lifted by the low ground (ground_height.gdshaderinc), so the rock sits at the foot of
 // the terrace its cliff makes instead of riding up it.
 uniform bool ground_low = false;
@@ -80,6 +85,10 @@ uniform bool use_albedo_tex = false;
 #ifdef ALPHA_CLIP
 // glTF's alphaCutoff (Blender's Alpha Clip threshold): pixels under it are dropped.
 uniform float alpha_clip = 0.5;
+// A "pbr" pack's cut-out material whose file says single-sided (glTF doubleSided false, Godot's
+// CULL_BACK): its back faces are dropped, shadows too, as Godot's own material culls them, while packs'
+// own shading is on. Everyone else's cut-outs draw both sides (fences, grilles, leaves).
+uniform bool clip_one_side = false;
 #endif
 uniform sampler2D albedo_tex : source_color, filter_linear_mipmap_anisotropic, repeat_enable;
 uniform bool use_orm_tex = false;
@@ -115,6 +124,12 @@ uniform vec4 part_weathering = vec4(0.4, 0.2, 0.6, 0.1);
 // view shows them, are balanced back by the way the surface faces (x sides, y tops), so a forced
 // colour shows about as given on a top and the sides keep their share.
 uniform vec2 part_light = vec2(0.95, 0.6);
+// A textured material from a pack whose pack.json says "shading": "pbr" (model_library.gd PACK_PBR_META):
+// drawn as its file says, as Godot's own material draws it, while f3d_pack_shading is on. Its base colour
+// picture is a colour with no light in it, so it gets the look's texture_light balance instead of
+// part_light, Godot's SPECULAR 0.5, its own roughness and metal (at the look's pbr_metal share), its
+// occlusion picture as ambient occlusion only, and a normal-map frame right whichever way dFdy runs.
+uniform bool modeller_tex = false;
 const float PART_RANGE = 4.0;
 const float PART_SHARE = 0.25;
 
@@ -195,10 +210,23 @@ instance uniform float f3d_paint_from = -1000.0;
 // isn't under the value less 2. The two levels of a switch take the same value, so together they
 // cover every pixel once, and neither shows through the other.
 instance uniform float f3d_lod_fade = 1.0;
+// Where the instance's seed (its weathering, dirt, a 2-tile belt's parity) is read when .y is 1
+// (.xz the place), instead of its own position: the model preview (model_preview.gd) turns a model
+// about its middle, so its origin circles and the seed, a hash of it, changed every frame (the
+// model's dirt and wear flickered as it turned).
+instance uniform vec3 f3d_seed_at = vec3(0.0, -1.0, 0.0);
 uniform float glow_flicker = 0.0;
 uniform float glow_pulse = 0.0;
 uniform float glow_rate = 1.0;
+// Coals' heat (scripts/fx/burner_fx.gd, a modeller's burner inserter's lit burner): the glow
+// breathes brighter and dimmer by slow noise, each instance out of phase by where it stands; 0 off.
+// Unmerged materials only (a modeller's textured ones never are). burner_fx.gd heat_wave() is the
+// same sum in GDScript: change both together.
+uniform float glow_heat = 0.0;
 uniform bool glow_fades = false;
+// A modeller's glowing material (model_library.gd _factorio): at rest only its glow goes out; its base
+// colour isn't dimmed as Zenith's own fire boxes and lamps are.
+uniform bool glow_keeps_albedo = false;
 // Creatures (creature_models.gd, tools/models/wube_rig.py): limbs turn about their joints here.
 // UV.x is the vertex's limb (1-12, 0 for the body), UV.y how much it follows it (0 at the joint).
 // rig_mode 1: the gait comes from INSTANCE_CUSTOM (r phase in radians, g strength 0-1), set by
@@ -240,6 +268,10 @@ uniform float belt_speed = 0.0;
 // A textured belt surface: UV change per tile along the belt (model_library.gd _belt_uv_scroll).
 uniform vec2 belt_uv_scroll = vec2(0.0);
 uniform int belt_shape = 0;
+// The space under a belt's top run (belt_return.gd cover): (lowest y of the top run, lateral range of its
+// width lo, hi, on). Everything of the model below that height and inside that range (the return strip,
+// the rollers) is a covered space: darker ambient, direct light and fill (model_library.gd _setup_belt).
+uniform vec4 belt_cover = vec4(0.0);
 // The tier's chevron painted on every other slat, pointing the way items go (Factorio's belt sheets:
 // yellow, red, blue, green); alpha 0 leaves the slats bare.
 uniform vec4 belt_chevron : source_color = vec4(0.0);
@@ -275,7 +307,9 @@ const float BELT_SMEAR_TO = 0.2;
 // 1), so vertex_data, edge_data and view_data aren't needed there. A row, MATERIAL_ROW vec4s:
 //   0  albedo (linear rgb, alpha)
 //   1  emission * emission_energy (linear), flags: 1 activity_glow, 2 glow_fades,
-//      4 a belt surface (belt_speed applies), 8 no sprite (a tier's own paint)
+//      4 a belt surface (belt_speed applies), 8 no sprite (a tier's own paint), 16 and 32 a
+//      creature's skin (skin_mode 1, 2, both 3), 64 emission_from_paint, 128 glow_keeps_albedo,
+//      256 modeller_tex
 //   2  roughness, metallic, edge_metallic, ground_grime_height
 //   3  part_data (0 without part_colors), glow_flicker, glow_pulse, glow_rate
 //   4  ao_strength, streaks, desaturate, value
@@ -389,23 +423,29 @@ float chips_mean(float edge) {
 // the crown thins evenly, the far disk shrinks with it, and a dead tree (1) has none left.
 const float LEAF_CELLS = 5.0;
 
-float leaf_cut(vec2 uv, float seed, bool in_shadow, float dying) {
+float leaf_cut(vec2 uv, float seed, bool in_shadow, float dying, float fw) {
 	if (dying >= 0.98) {
 		discard;
 	}
 	float fallen = dying * 0.95;
 	vec2 g = uv * LEAF_CELLS;
-	vec2 cell = floor(g);
 	vec2 off = vec2(seed * 61.0, seed * 37.0);
-	vec2 q = uv * 2.0 - 1.0;
-	float disk = 0.78 + 0.18 * hash12(floor(g * 2.0) + off) - length(q) - 0.6 * fallen;
-	// A crown's shadow doesn't show its leaves' small holes: the solid disk, without the 3x3 search.
-	if (in_shadow) {
-		if (disk <= 0.0) {
-			discard;
+	// Leaves only a pixel or two long shimmer as the camera moves: the disk takes over while a leaf is
+	// still about four pixels long (a cell 0.25 pixels per unit of g, wholly by 0.55).
+	float far_away = clamp((fw - 0.25) * 3.3, 0.0, 1.0);
+	float disk = 0.0;
+	// A crown's shadow doesn't show its leaves' small holes, nor a card small enough that only the disk remains.
+	if (in_shadow || far_away > 0.0) {
+		vec2 q = uv * 2.0 - 1.0;
+		disk = 0.78 + 0.18 * hash12(floor(g * 2.0) + off) - length(q) - 0.6 * fallen;
+		if (in_shadow || far_away >= 1.0) {
+			if (disk <= 0.0) {
+				discard;
+			}
+			return 0.95;
 		}
-		return 0.95;
 	}
+	vec2 cell = floor(g);
 	float cover = 0.0;
 	float shade = 1.0;
 	for (int j = -1; j <= 1; j++) {
@@ -433,10 +473,7 @@ float leaf_cut(vec2 uv, float seed, bool in_shadow, float dying) {
 			}
 		}
 	}
-	// Leaves only a pixel or two long shimmer as the camera moves: the disk takes over while a leaf is
-	// still about four pixels long (a cell 0.25 pixels per unit of g, wholly by 0.55).
-	float far_away = clamp((max(fwidth(g.x), fwidth(g.y)) - 0.25) * 3.3, 0.0, 1.0);
-	if (mix(cover, disk, far_away) <= 0.0) {
+	if ((far_away > 0.0 ? mix(cover, disk, far_away) : cover) <= 0.0) {
 		discard;
 	}
 	return mix(shade * (0.7 + 0.3 * sqrt(clamp(cover, 0.0, 1.0))), 0.95, far_away);
@@ -457,12 +494,19 @@ vec3 leaf_atlas_cut(vec2 uv, float seed, bool in_shadow, float dying, float lod)
 	}
 	float fallen = dying * 0.95;
 	vec2 off = vec2(seed * 61.0, seed * 37.0);
-	float disk = 0.78 + 0.18 * hash12(floor(uv * 10.0) + off) - length(uv * 2.0 - 1.0) - 0.6 * fallen;
-	if (in_shadow) {
-		if (disk <= 0.0) {
-			discard;
+	float far_away = clamp((lod - 1.0) * 0.8, 0.0, 1.0);
+	float disk = 0.0;
+	if (in_shadow || far_away > 0.0) {
+		disk = 0.78 + 0.18 * hash12(floor(uv * 10.0) + off) - length(uv * 2.0 - 1.0) - 0.6 * fallen;
+		if (in_shadow || far_away >= 1.0) {
+			if (disk <= 0.0) {
+				discard;
+			}
+			if (!in_shadow && fallen > 0.0 && hash12(floor(uv * 12.0) + off + 7.1) < fallen) {
+				discard;
+			}
+			return in_shadow ? vec3(1.0) : vec3(LEAF_MEAN);
 		}
-		return vec3(1.0);
 	}
 	float n = leaf_atlas_cells;
 	float k = floor(fract(seed * 7.137) * n * n);
@@ -478,8 +522,7 @@ vec3 leaf_atlas_cut(vec2 uv, float seed, bool in_shadow, float dying, float lod)
 	if (fallen > 0.0 && hash12(floor(auv * n * leaf_atlas_texels / 3.0) + 7.1) < fallen) {
 		discard;
 	}
-	float far_away = clamp((lod - 1.0) * 0.8, 0.0, 1.0);
-	if (mix(s.a - 0.5, disk, far_away) <= 0.0) {
+	if ((far_away > 0.0 ? mix(s.a - 0.5, disk, far_away) : s.a - 0.5) <= 0.0) {
 		discard;
 	}
 	return LEAF_MEAN * mix(vec3(1.0), mix(vec3(1.0), s.rgb * 2.0, leaf_detail), 1.0 - far_away);
@@ -555,18 +598,40 @@ float robot_glow(vec4 c, float time) {
 // Turning is about anim_axis in the pivot's frame (anim_pivot, the part node's transform);
 // sliding (anim_slide not zero) moves by anim_slide per unit.
 global uniform vec2 f3d_anim_time;
-// The look's fill light on models (looks.gd "model_fill", 0 by night): Factorio's sprites were
+// The look's fill light on models (looks.gd "model_fill", 0 by night; off unless --model-fill=on or the debug
+// menu's Camera fill, owner: models lit by the scene's sun and ambient alone): Factorio's sprites were
 // rendered with light from the camera's side as well as their shadows' sun, so their fronts and
 // tops read bright; one sun leaves a model's south faces in shade. Added as light on the model
 // alone, so the ground and its shadows keep the sun's and the sky's.
 global uniform float f3d_look_model_fill;
+// looks.gd "ao_direct": the share of a model's occlusion (its own and SSAO's) that darkens its direct light (1: as Zenith
+// draws it; the Cinematic look's 0: occlusion on indirect light only).
+global uniform float f3d_look_ao_direct;
 global uniform float f3d_look_roughness_min;  // looks.gd "roughness_min": no surface shinier (a look's choice)
+// The same on a "pbr" pack's surfaces: 0 (they keep the roughness their files give), the look's with --pbr-rough=floor.
+global uniform float f3d_look_roughness_min_pbr;
+// The share of a modeller's metallic-roughness picture's metal drawn (looks.gd "texture_metal", 0.1 by
+// default: as paint, the share part colours and textures without such a picture get; 1: in full, as before).
+// Zenith's only thing for metal to reflect is the dim blue sky, so a picture's full metal read dark and blue.
+global uniform float f3d_look_texture_metal;
+// Packs' own shading (looks.gd pack_shading): 1 as each pack's pack.json says, 0 Factorio's everywhere
+// (--pack-shading=factorio, Settings > Graphics > Advanced). And the look's balance on a "pbr" pack's
+// pictures (looks.gd "texture_light": sides, tops; (1, 1) as Godot's material draws them).
+global uniform float f3d_pack_shading;
+global uniform vec2 f3d_look_texture_light;
+// The share of a "pbr" pack's metal drawn (looks.gd "pbr_metal", 1 by default since pbr-standard step 3, with the
+// neutral reflection, pbr_env.gdshaderinc, to reflect; --pbr-metal=0.1 is 0.2.2's).
+global uniform float f3d_look_pbr_metal;
+#include "res://shaders/pbr_env.gdshaderinc"
 // Seconds the last frame took (belt_blur.gd): how far a belt's surface moves between two frames.
 global uniform float f3d_frame_dt;
 // The grain layers (nature_looks.gd): each a tile of a bark's or rock's picture at Factorio's own 64
 // texels a tile, its colour over its own light a few texels round, halved; on once they are made.
 global uniform sampler2DArray f3d_nature_grain;
 global uniform float f3d_nature_grain_on;
+// 1: trees' trunks and leaf cards (and rocks) matte, specular 0.05 and fully rough, so the sun low behind them
+// leaves no white Fresnel sheen (as the ground plants, decorative_grass.gdshaderinc); 0: --tree-sheen=old.
+global uniform float f3d_tree_matte;
 
 // A layer's grain read from the three sides the surface faces most (model space, mirrored every
 // tile so it never shows a seam), as a colour factor round 1.
@@ -608,6 +673,9 @@ uniform bool anim_strike = false;
 // frame, 3 texels a bone and a row a frame; each vertex's four bones and weights in CUSTOM3.
 uniform sampler2D bake_tex : filter_nearest;
 uniform int bake_frames = 0;
+// A bone whose axes turn further than acos(bake_snap) between two frames is shown at the nearer one, not
+// mixed (model_skin.gd SNAP, shown()); -2 always mixes (--baked-anim=old).
+uniform float bake_snap = 0.866;
 // anim.gd's SPIN_UP, SPIN_DOWN, GLOW_UP, GLOW_DOWN, STRIKE_RISE, STRIKE_FADE (seconds).
 const float ANIM_SPIN_UP = 0.35;
 const float ANIM_SPIN_DOWN = 0.9;
@@ -739,9 +807,22 @@ mat4 bake_bone(int bone, int f) {
 		vec4(r0.w, r1.w, r2.w, 1.0));
 }
 
+// The cosine of the largest turn of a's axes to b's; 1 for an axis scaled to nothing at either end
+// (model_skin.gd turned()).
+float bake_turned(mat4 a, mat4 b) {
+	float c = 1.0;
+	for (int i = 0; i < 3; i++) {
+		float l = length(a[i].xyz) * length(b[i].xyz);
+		if (l > 1e-8) {
+			c = min(c, dot(a[i].xyz, b[i].xyz) / l);
+		}
+	}
+	return c;
+}
+
 // The baked animation: the machine's clock (as a spinning part's: easing up while it works, coasting
 // to a stop) says how many loops of the action have gone; the vertex is skinned by its bones there,
-// blended between the two frames around it.
+// blended between the two frames around it (a bone turning fast between them: the nearer frame).
 void anim_baked(inout vec3 v, inout vec3 n, vec4 c, vec4 skin) {
 	float s0;
 	float flags = anim_flags(c, s0);
@@ -764,7 +845,10 @@ void anim_baked(inout vec3 v, inout vec3 n, vec4 c, vec4 skin) {
 			continue;
 		}
 		int bone = int(floor(code));
-		m += w * ((1.0 - u) * bake_bone(bone, f0) + u * bake_bone(bone, f1));
+		mat4 a = bake_bone(bone, f0);
+		mat4 b = bake_bone(bone, f1);
+		float ub = bake_turned(a, b) < bake_snap ? step(0.5, u) : u;
+		m += w * ((1.0 - ub) * a + ub * b);
 		total += w;
 	}
 	if (total <= 0.0) {
@@ -897,6 +981,9 @@ void vertex() {
 	float off_speed;
 	belt_off = (timed ? anim_bit(anim_flags(INSTANCE_CUSTOM, off_speed), 8.0) : abs(INSTANCE_CUSTOM.b - BELT_OFF) < 0.5) ? 1.0 : 0.0;
 	vec2 origin = from_custom ? INSTANCE_CUSTOM.rg : MODEL_MATRIX[3].xz;
+	if (f3d_seed_at.y > 0.5) {
+		origin = f3d_seed_at.xz;
+	}
 	belt_parity = mod(floor(origin.x) + floor(origin.y), 2.0);
 	inst_seed = hash12(origin * 3.17 + 0.5);
 #ifdef MOVER
@@ -1122,7 +1209,15 @@ void vertex() {
 #endif
 	// The ground's height under every vertex (ground_height.gdshaderinc), last, so moving parts, rigs and
 	// movers all ride on it. world_y stays the height over the ground (weathering reads it).
+#ifdef LEAF_CUT
+	if (leaf_dying >= 0.98) {
+		VERTEX = vec3(0.0);
+	} else {
+		VERTEX = ground_lift_of(VERTEX, MODEL_MATRIX, ground_low);
+	}
+#else
 	VERTEX = ground_lift_of(VERTEX, MODEL_MATRIX, ground_low);
+#endif
 }
 
 // With MSAA a pixel only partly covered by a triangle is shaded once, at a point that can lie outside the
@@ -1138,6 +1233,12 @@ float f3d_finite1(float v, float fallback) {
 }
 
 void fragment() {
+#ifdef LEAF_CUT
+	vec2 uv_dx = dFdx(UV);
+	vec2 uv_dy = dFdy(UV);
+	float leaf_lod = log2(max(max(length(uv_dx), length(uv_dy)) * leaf_atlas_texels, 1e-4));
+	float leaf_fw = max(abs(uv_dx.x) + abs(uv_dy.x), abs(uv_dx.y) + abs(uv_dy.y)) * LEAF_CELLS;
+#else
 	// How far the model's surface moves in a pixel, for the noise (first: a discard below would
 	// leave neighbouring pixels' derivatives undefined).
 	vec3 obj_step = fwidth(obj_pos);
@@ -1145,9 +1246,6 @@ void fragment() {
 	// The bark's and rock's grain is read along the three axes (nature_grain): their derivatives too.
 	vec3 obj_dx = dFdx(obj_pos);
 	vec3 obj_dy = dFdy(obj_pos);
-#ifdef LEAF_CUT
-	vec2 leaf_tx = UV * leaf_atlas_texels;
-	float leaf_lod = log2(max(max(length(dFdx(leaf_tx)), length(dFdy(leaf_tx))), 1e-4));
 #endif
 	// A level of detail cross-fading (f3d_lod_fade): a 4x4 Bayer screen door. Shadows stay whole
 	// (the level fading out casts none).
@@ -1189,12 +1287,17 @@ void fragment() {
 	} else if (leaf_atlas_cells > 0.0) {
 		leaf_rgb = leaf_atlas_cut(UV, UV2.y, IN_SHADOW_PASS, leaf_dying, leaf_lod);
 	} else {
-		leaf_shade = leaf_cut(UV, UV2.y, IN_SHADOW_PASS, leaf_dying);
+		leaf_shade = leaf_cut(UV, UV2.y, IN_SHADOW_PASS, leaf_dying, leaf_fw);
 	}
 	// Both sides are drawn and lit by the crown's normal the card carries (Godot flips it on the
 	// back side: flipped back).
 	if (!FRONT_FACING) {
 		NORMAL = -NORMAL;
+	}
+#endif
+#ifdef ALPHA_CLIP
+	if (clip_one_side && modeller_tex && f3d_pack_shading > 0.5 && !FRONT_FACING) {
+		discard;
 	}
 #endif
 	// A merged surface has every vertex array (material_rows): its data flags are all on.
@@ -1208,15 +1311,19 @@ void fragment() {
 	float part = mix(0.5, UV2.y, edge_on);
 	// How dirty this instance and this part are.
 	float dirt = 0.75 + 0.5 * inst_seed;
+#ifdef LEAF_CUT
+	// Foliage cards skip the 3D weathering noise: they wear ground grime only and draw up to a dozen
+	// layers deep per crown.
+	float patches = 0.5;
+	float fine = 0.5;
+	float mid = 0.5;
+#else
 	vec3 p = obj_pos + vec3(inst_seed * 37.0, 0.0, inst_seed * 53.0) + part * 11.0;
 
 	float patches = fbm3d(p * 2.3, pixel * 2.3);
 	float fine = vnoise3_fading(p * 23.0, pixel * 23.0);
 	float mid = vnoise3(p * 7.0 + 5.0);
-	// A textured model's own pictures carry its wear and dirt: its baked occlusion only shades it
-	// (below), adding no crevice grime or rust of Zenith's.
-	float occluded = use_albedo_tex && !merged ? 0.0 : 1.0 - ao;
-
+#endif
 	// This fragment's material: the uniforms, or its row of the model's table (material_rows).
 	vec4 m_albedo = albedo;
 	vec3 m_emission = emission * emission_energy;
@@ -1246,12 +1353,18 @@ void fragment() {
 	vec4 m_dust = vec4(dust_color, dust);
 	int m_skin = skin_mode;
 	vec4 m_tint2 = skin_tint2;
+	bool m_paint_glow = emission_from_paint;
+	bool m_keep_albedo = glow_keeps_albedo;
+	bool m_modeller_tex = modeller_tex;
 	if (merged) {
 		int r = mat_row * MATERIAL_ROW;
 		m_albedo = material_table[r];
 		vec4 e = material_table[r + 1];
 		m_emission = e.rgb;
-		m_skin = row_flag(e.w, 16.0) ? 1 : (row_flag(e.w, 32.0) ? 2 : 0);
+		m_skin = (row_flag(e.w, 16.0) ? 1 : 0) + (row_flag(e.w, 32.0) ? 2 : 0);
+		m_paint_glow = row_flag(e.w, 64.0);
+		m_keep_albedo = row_flag(e.w, 128.0);
+		m_modeller_tex = row_flag(e.w, 256.0);
 		if (m_skin > 0) {
 			m_tint2 = vec4(m_skin == 1 ? e.rgb : vec3(0.0), material_table[r + 5].w);
 			m_emission = vec3(0.0);
@@ -1294,11 +1407,18 @@ void fragment() {
 	// with shares above PART_SHARE (part_colors.py).
 	bool headroom = part_col.a <= PART_SHARE + 0.0001;
 	float pc = clamp(headroom ? part_col.a / PART_SHARE : part_col.a, 0.0, 1.0) * m_part;
+	// A "pbr" pack's material (m_modeller_tex): its colour is its picture times its factor, or the
+	// factor alone without a picture (pc 1 either way, no part colours), its surface plain glTF (paint 0).
+	// A textured model's own pictures carry its wear and dirt (as an untextured "pbr" row while packs' own shading is on).
+	bool mp = m_modeller_tex && f3d_pack_shading > 0.5;
+	float occluded = ((use_albedo_tex && !merged) || mp) ? 0.0 : 1.0 - ao;
 	vec3 part_rgb = max(part_col.rgb, vec3(0.0)) * (headroom ? PART_RANGE : 1.0);
 	// Textured surfaces are never merged (model_library.gd Load.combined): their textures are the
 	// material's own uniforms.
 	// The texture's alpha (1 without one): cuts a clipped material, fades a blended one.
 	float tex_a = 1.0;
+	// A "pbr" pack's occlusion picture (mp): ambient only, as glTF's occlusion is.
+	float pic_ao = 1.0;
 	// A modeller's textured belt surface: its own texture runs along the belt at the tier's speed
 	// (the drawn slats and chevrons are left out). belt_uv_scroll is how far its UVs go per tile along
 	// the belt, measured from the mesh (model_library.gd _belt_uv_scroll); the offset wraps on whole
@@ -1315,21 +1435,50 @@ void fragment() {
 	if (use_albedo_tex && !merged) {
 		pc = 1.0;
 		vec4 tex = albedo_nearest ? texture(albedo_tex_nearest, tuv) : texture(albedo_tex, tuv);
-		vec2 tdx = dFdx(tuv);
-		vec2 tdy = dFdy(tuv);
-		if (smear > 0.0 && m_belt) {
-			// A modeller's texture smeared the same way: eight taps back along its scroll over the
-			// smear (where it was this frame and the last), the first the one above. Four left its
-			// arrows (three a tile) merged into a stripe with ghost copies.
-			vec2 back = belt_uv_scroll * (smear * sign(belt_speed));
-			for (int i = 1; i < 8; i++) {
-				vec2 at = tuv + back * (float(i) / 7.0);
-				tex += albedo_nearest ? textureGrad(albedo_tex_nearest, at, tdx, tdy) : textureGrad(albedo_tex, at, tdx, tdy);
+		if (m_belt) {
+			vec2 tdx = dFdx(tuv);
+			vec2 tdy = dFdy(tuv);
+			if (smear > 0.0) {
+				// Smear along scroll only when motion exceeds a pixel; anisotropic taps cover linear textures cheaply.
+				vec2 back = belt_uv_scroll * (smear * sign(belt_speed));
+				float uv_px = max(length(tdx), length(tdy));
+				float smear_px = length(back) / max(uv_px, 1e-6);
+				if (smear_px >= 1.25) {
+					if (albedo_nearest) {
+						int taps = smear_px < 6.0 ? 4 : 8;
+						float denom = float(taps - 1);
+						for (int i = 1; i < taps; i++) {
+							vec2 at = tuv + back * (float(i) / denom);
+							tex += textureGrad(albedo_tex_nearest, at, tdx, tdy);
+						}
+						tex /= float(taps);
+					} else if (smear_px < 4.0) {
+						tex += textureGrad(albedo_tex, tuv + back * 0.5, tdx, tdy);
+						tex += textureGrad(albedo_tex, tuv + back, tdx, tdy);
+						tex *= (1.0 / 3.0);
+					} else {
+						vec2 step_uv = back * 0.25;
+						vec2 sdx = tdx;
+						vec2 sdy = tdy;
+						if (abs(dot(tdx, back)) >= abs(dot(tdy, back))) {
+							sdx += step_uv * (dot(tdx, step_uv) < 0.0 ? -1.0 : 1.0);
+						} else {
+							sdy += step_uv * (dot(tdy, step_uv) < 0.0 ? -1.0 : 1.0);
+						}
+						tex = textureGrad(albedo_tex, tuv + back * 0.125, sdx, sdy)
+							+ textureGrad(albedo_tex, tuv + back * 0.375, sdx, sdy)
+							+ textureGrad(albedo_tex, tuv + back * 0.625, sdx, sdy)
+							+ textureGrad(albedo_tex, tuv + back * 0.875, sdx, sdy);
+						tex *= 0.25;
+					}
+				}
 			}
-			tex *= 0.125;
 		}
 		part_rgb = tex.rgb * albedo.rgb;
 		tex_a = tex.a;
+	} else if (mp) {
+		pc = 1.0;
+		part_rgb = m_albedo.rgb;
 	}
 #ifdef ALPHA_CLIP
 	if (m_albedo.a * tex_a < alpha_clip) {
@@ -1340,33 +1489,49 @@ void fragment() {
 		// Factorio's two mask layers: the first (all of the carapace) tinted by tint 1, the second
 		// over it where it covers (times tint 2's alpha) tinted by tint 2.
 		part_rgb = mix(part_rgb.r * m_albedo.rgb, part_rgb.g * m_tint2.rgb, clamp(part_rgb.b * m_tint2.a, 0.0, 1.0));
-	} else if (m_skin == 2) {
+	} else if (m_skin >= 2) {
 		// One mask over the part's own colour: its shade (COLOR.r = sqrt(shade / 4)) tinted by tint 1,
 		// covering COLOR.g of it (times the tint's alpha, in skin_tint2's). COLOR is the mask's data
-		// here, not a shading.
-		float shade = 4.0 * COLOR.r * COLOR.r;
-		part_rgb = mix(part_rgb, shade * m_albedo.rgb, clamp(COLOR.g * m_tint2.a, 0.0, 1.0));
+		// here, not a shading. A vertex the mask doesn't reach is (1, 1, 1) (creature_skin.py), the
+		// masked ones' blue 0: taking the blue off red and green reads it as no mask, as if it held
+		// (0, 0, 0), smoothly across its triangles. Read as it is, it was shade 4 under full cover,
+		// the tier's tint four times over (a worm's mouth, a spawner's sacs): mode 3 keeps that.
+		float unmasked = m_skin == 3 ? 0.0 : COLOR.b;
+		float mask_r = max(COLOR.r - unmasked, 0.0);
+		float shade = 4.0 * mask_r * mask_r;
+		part_rgb = mix(part_rgb, shade * m_albedo.rgb, clamp(max(COLOR.g - unmasked, 0.0) * m_tint2.a, 0.0, 1.0));
 		tint = vec3(1.0);
 	}
 	vec3 col = mix(m_albedo.rgb, part_rgb, pc) * tint * model_tint;
+#ifndef LEAF_CUT
 	if (m_nature > 0.5 && f3d_nature_grain_on > 0.5) {
 		col *= nature_grain_at(m_nature, obj_pos, n, obj_dx, obj_dy);
 	}
+#endif
 	vec4 wear = mix(vec4(1.0), m_wear, pc);
 	// Part colours are the sprite's paint as it looks, metal and all: drawn mostly as diffuse paint
 	// (as the projected sprite is), or the sky's reflection would grey them.
 	// Little specular either: the sun's highlight on tops and domes read as a lighter colour.
-	float rough = mix(m_rough, 0.85, pc);
-	float metal = m_metal * mix(1.0, 0.1, pc);
+	float paint = mp ? 0.0 : pc;
+	float rough = mix(m_rough, 0.85, paint);
+	float metal = m_metal * mix(1.0, 0.1, paint);
+	if (mp) {
+		metal = m_metal * f3d_look_pbr_metal;
+	}
 	if (use_orm_tex && !merged) {
 		vec3 orm = orm_nearest ? texture(orm_tex_nearest, tuv).rgb : texture(orm_tex, tuv).rgb;
 		rough = roughness * orm.g;
-		metal = metallic * orm.b;
+		metal = metallic * orm.b * (mp ? f3d_look_pbr_metal : f3d_look_texture_metal);
 	}
 	if (occlusion_mode > 0 && !merged) {
 		vec4 occ = occlusion_mode == 2 ? texture(occlusion_tex, tuv)
 			: (orm_nearest ? texture(orm_tex_nearest, tuv) : texture(orm_tex, tuv));
-		ao *= clamp(dot(occ, occlusion_channel), 0.0, 1.0);
+		float occ_v = clamp(dot(occ, occlusion_channel), 0.0, 1.0);
+		if (mp) {
+			pic_ao = occ_v;
+		} else {
+			ao *= occ_v;
+		}
 	}
 	if (use_normal_tex && !merged) {
 		vec3 nm = texture(normal_tex, tuv).rgb * 2.0 - 1.0;
@@ -1382,6 +1547,13 @@ void fragment() {
 		vec3 dp1perp = cross(n0, dp1);
 		vec3 t = dp2perp * duv1.x + dp1perp * duv2.x;
 		vec3 b = dp2perp * duv1.y + dp1perp * duv2.y;
+		if (mp) {
+			// The full formula: the frame's handedness from the screen slopes themselves, so it is right
+			// whichever way dFdy runs (pbr-rd).
+			float hand = dot(dp1, dp2perp) < 0.0 ? -1.0 : 1.0;
+			t *= hand;
+			b *= hand;
+		}
 		float inv = inversesqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
 		NORMAL = normalize(mat3(t * inv, -b * inv, n0) * nm);
 	}
@@ -1389,6 +1561,9 @@ void fragment() {
 	// The belt's moving slats: light ridges and dark seams over the weathered surface.
 	float belt_shade = 1.0;
 	float chevron = 0.0;
+	vec4 sprite = vec4(0.0);
+	float sprite_w = 0.0;
+#ifndef LEAF_CUT
 	if (m_belt && !(use_albedo_tex && !merged)) {
 		// Distance along the belt (tiles, -0.5 at the input edge to 0.5 at the output edge),
 		// so the slats line up from tile to tile. Curves spread a tile's worth over the arc.
@@ -1443,8 +1618,6 @@ void fragment() {
 		belt_shade = 1.0 + blur * ridge;
 	}
 
-	vec4 sprite = vec4(0.0);
-	float sprite_w = 0.0;
 	if (m_sprite && all(greaterThan(sprite_uv, vec2(0.0))) && all(lessThan(sprite_uv, vec2(1.0)))) {
 		sprite = texture(sprite_tex, sprite_uv);
 		// The sprite has Factorio's light and shadows painted in: divide out the broad light
@@ -1465,6 +1638,7 @@ void fragment() {
 		// Part colours already match the sprite: lean less.
 		col = mix(col, lean, sprite_fallback_tint * near.a * (1.0 - 0.7 * pc));
 	}
+#endif
 
 	// Slightly greyed and darker, like Factorio's palette next to a clean render.
 	float lum = dot(col, vec3(0.299, 0.587, 0.114));
@@ -1472,6 +1646,7 @@ void fragment() {
 	// Mottling: no flat surface in Factorio's art is one colour.
 	col *= 1.0 + m_grain * ((fine - 0.5) * 1.4 + (mid - 0.5) * 1.2);
 
+#ifndef LEAF_CUT
 	// Rust: patches where water sits (crevices, low down, the top of a part) and streaks
 	// running down the sides.
 	float side = 1.0 - abs(n.y);
@@ -1504,6 +1679,7 @@ void fragment() {
 	float e = edge_amount * chips * (1.0 - 0.6 * r);
 	col = mix(col, m_edge.rgb * (0.85 + 0.3 * fine), e);
 	metal = mix(metal, m_edge_metal, e);
+#endif
 
 	// Grime: settles in occluded corners and climbs up from the ground.
 	float ground = 1.0 - smoothstep(0.0, m_ground_height, world_y);
@@ -1512,6 +1688,7 @@ void fragment() {
 	col = mix(col, m_grime.rgb, clamp(g, 0.0, 0.85));
 	metal = mix(metal, 0.1, g);
 
+#ifndef LEAF_CUT
 	// Dust on surfaces facing up.
 	float dust_amount = m_dust.a * wear.w * smoothstep(0.35, 0.95, n.y);
 	float d = dust_amount * smoothstep(0.3, 0.7, patches + 0.2 * fine);
@@ -1529,6 +1706,7 @@ void fragment() {
 
 	col *= belt_shade;
 	col = mix(col, belt_chevron.rgb * (0.9 + 0.2 * fine), chevron);
+#endif
 
 	// Baked occlusion darkens direct light too: Factorio's sprites have it painted in. Above 1 the
 	// strength is a power (textured models, model_library.gd TEXTURED_AO): their bake is per vertex
@@ -1554,18 +1732,34 @@ void fragment() {
 	}
 #endif
 	float up = clamp((INV_VIEW_MATRIX * vec4(NORMAL, 0.0)).y, 0.0, 1.0);
-	ALBEDO *= mix(1.0, mix(m_light.x, m_light.y, up), pc * (1.0 - sprite_w));
-	AO = shade;
-	AO_LIGHT_AFFECT = 0.3;
-	ROUGHNESS = max(rough, f3d_look_roughness_min);
+	// A "pbr" pack's picture: the look's balance, darkened as part_light is (a burnt remnant's 0.42).
+	vec2 balance = mp ? f3d_look_texture_light * (m_light.x / 0.95) : m_light;
+	ALBEDO *= mix(1.0, mix(balance.x, balance.y, up), pc * (1.0 - sprite_w));
+	float covered = 0.0;
+	if (belt_cover.w > 0.0) {
+		float lat = belt_shape > 0 ? belt_coords(obj_pos).y + 0.5 : abs(obj_pos.x);
+		covered = (1.0 - smoothstep(belt_cover.x - 0.04, belt_cover.x, obj_pos.y))
+				* step(belt_cover.y - 0.01, lat) * step(lat, belt_cover.z + 0.01);
+		ALBEDO *= mix(1.0, 0.6, covered);
+		shade = mix(shade, min(shade, 0.3), covered);
+	}
+	AO = shade * pic_ao;
+	// A "pbr" pack: its picture's occlusion only on ambient light, the baked vertex occlusion (shade) still
+	// darkening direct light by its 0.3 share (Godot: direct * mix(1, AO, affect) = 1 - 0.3 * (1 - shade)).
+	AO_LIGHT_AFFECT = mix((mp ? 0.3 * (1.0 - shade) / max(1.0 - shade * pic_ao, 1e-4) : 0.3) * f3d_look_ao_direct, 1.0, covered);
+	ROUGHNESS = max(rough, mp ? f3d_look_roughness_min_pbr : f3d_look_roughness_min);
 #ifdef LEAF_CUT
 	// Leaves keep their base roughness: with SSAO on, Godot's depth prepass writes normals and
 	// roughness, so every one of a crown's dozen cut-out card layers ran the weathering noise and
 	// sprite sampling feeding `rough` there, which nothing else in that pass needs.
 	ROUGHNESS = mix(m_rough, 0.85, pc);
+	float tree_matte = f3d_tree_matte;
+#else
+	float tree_matte = (m_nature > 0.5) ? f3d_tree_matte : 0.0;
 #endif
 	METALLIC = metal;
-	SPECULAR = mix(0.5, 0.2, pc);
+	SPECULAR = mix(mix(0.5, 0.2, paint), 0.05, tree_matte);
+	ROUGHNESS = mix(ROUGHNESS, 1.0, tree_matte);
 	float wave = 1.0;
 	if (m_flicker > 0.0) {
 		float t = TIME * 8.0 + inst_seed * 40.0 - obj_pos.y * 6.0 + obj_pos.x * 2.0;
@@ -1574,15 +1768,27 @@ void fragment() {
 	if (m_pulse > 0.0) {
 		wave -= m_pulse * (0.5 + 0.5 * sin((TIME * m_rate + inst_seed) * 6.2831853));
 	}
+	if (glow_heat > 0.0 && !merged) {
+		// Three slow sines at unrelated rates (0.9, 1.7, 2.9 a second) summed to -1..1: 0.75 to 1.15 of
+		// the glow at full heat.
+		float ht = (TIME + inst_seed * 37.0) * 6.2831853;
+		float n = 0.5 * sin(ht * 0.9) + 0.3 * sin(ht * 1.7 + 1.3) + 0.2 * sin(ht * 2.9 + 2.9);
+		wave *= 1.0 + glow_heat * (-0.05 + 0.2 * n);
+	}
 	if (use_emission_tex && !merged) {
 		m_emission *= texture(emission_tex, UV).rgb;
 	}
+	if (m_paint_glow) {
+		m_emission *= ALBEDO;
+	}
 	EMISSION = m_emission * act * act * wave;
-	EMISSION += ALBEDO * f3d_look_model_fill * (0.35 + 0.65 * max(dot(NORMAL, VIEW), 0.0));
-	if (m_glow && !(use_emission_tex && !merged)) {
+	// A "pbr" pack: its pbr_fill share of it (pbr_env.gdshaderinc), so the sun decides its lit and shaded sides.
+	EMISSION += ALBEDO * f3d_look_model_fill * (mp ? pbr_fill_share() : 1.0) * (0.35 + 0.65 * max(dot(NORMAL, VIEW), 0.0)) * mix(1.0, 0.25, covered);
+	if (m_glow && !(use_emission_tex && !merged) && !m_keep_albedo) {
 		// Idle fire boxes and lamps go dark, as Factorio's do. A material with its own emission
 		// texture is the model's whole surface (a modeller's): only its painted glow fades, or the
-		// whole model would darken when idle and look washed white when it works.
+		// whole model would darken when idle and look washed white when it works. Nor does a
+		// modeller's glow without a picture (glow_keeps_albedo): only its emission goes out.
 		ALBEDO *= mix(0.3, 1.0, act);
 	}
 	ALBEDO = max(f3d_finite(ALBEDO, m_albedo.rgb), vec3(0.0));
@@ -1593,6 +1799,14 @@ void fragment() {
 	if (any(isnan(NORMAL)) || any(isinf(NORMAL)) || dot(NORMAL, NORMAL) < 0.25) {
 		NORMAL = vec3(0.0, 0.0, 1.0);
 	}
+#if defined(SHADER_LIGHT_ENV) && !defined(LEAF_CUT)
+	if (mp && f3d_light_env < 0.5) {
+		// A "pbr" pack under --light-env=shader: the neutral reflection and directional ambient
+		// (pbr_env.gdshaderinc). Compiled out by default so Godot skips custom IBL registers.
+		RADIANCE = pbr_env_radiance(VIEW, normalize(NORMAL), ROUGHNESS, INV_VIEW_MATRIX);
+		IRRADIANCE = pbr_irradiance(normalize(NORMAL), INV_VIEW_MATRIX);
+	}
+#endif
 #ifdef BLEND_ALPHA
 	// See-through light (a thruster's plume) fades away with its glow when idle; glass stays.
 	ALPHA = m_albedo.a * tex_a * (m_fades ? act : 1.0);

@@ -18,6 +18,11 @@ extends Control
 ## the character's surface, as Factorio does.
 ##
 ## Charts for what is visible are asked for through map_cache.gd, which spaces the requests out.
+##
+## A resource patch under the mouse is outlined in white and the entity info panel shows its total, an
+## infinite resource's combined yield (L6, as Factorio's map view: ResourceEntityPrototype's
+## resource_patch_search_radius groups the patch): asked of the bridge (`rpatch`) once the mouse rests on a
+## tile outside the patch shown. --map-resource-info=off: none.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const MapCache := preload("res://scripts/ui/factorio/map_cache.gd")
@@ -39,6 +44,10 @@ const DEFAULT_ZOOM := 2.0
 const ZOOM_STEP := 1.4142135
 ## Seconds between asking again for the same area.
 const REFRESH := 6.0
+## L6: how long the mouse rests on a tile before its resource patch is asked for, and the outline's colour and width.
+const PATCH_REST := 0.12
+const PATCH_OUTLINE := Color(1, 1, 1, 0.95)
+static var patch_info := not ("--map-resource-info=off" in OS.get_cmdline_user_args())
 ## The most chunks asked for at once around the middle of the view (the mod sends 240 a second).
 const MAX_CHUNKS := 96
 ## Screen pixels a second WASD moves the map.
@@ -87,6 +96,19 @@ var _redraw := true
 var _layers_now := true  # opened: the layers drawn at once, around the view
 ## The landing pad asked for on switching to a planet (its ask's id; -1 none, or the view was moved).
 var _pad_q := -1
+## L6: the tile under the mouse and since when (msec), and the shown patch's outline as segment pairs (tiles).
+var _hover_tile := Vector2i(1 << 30, 1 << 30)
+var _hover_since := 0
+var _patch_edges := PackedVector2Array()
+## The alert bar (alerts.gd), set by factorio_ui.gd: its alerts are drawn on the map.
+var alerts = null:
+	set(a):
+		alerts = a
+		if a != null and not a.shown_changed.is_connected(_queue_alerts):
+			a.shown_changed.connect(_queue_alerts)
+## The alerts drawn last, [[kind, screen point], ...] (tests).
+var alerts_placed: Array = []
+var _blink_was := false
 
 
 func _ready() -> void:
@@ -126,6 +148,15 @@ func _ready() -> void:
 	model.territories_changed.connect(func() -> void: _redraw = true)
 	model.roboports_changed.connect(func() -> void: _redraw = true)
 	model.landing_pad_found.connect(_on_landing_pad)
+	model.map_patch_changed.connect(func() -> void:
+		_patch_edges = outline_edges(model.map_patch.get("o", []))
+		_redraw = true)
+	mouse_exited.connect(func() -> void: model.clear_patch())
+
+
+## The alert bar changed: draw its alerts again.
+func _queue_alerts() -> void:
+	_redraw = true
 
 
 func is_open() -> bool:
@@ -146,6 +177,8 @@ func open(on: bool) -> void:
 		_layers_now = true
 	elif model.map_si != 0:
 		model.set_map_surface(0)  # back to the character's surface, as in Factorio
+	if not on:
+		model.clear_patch()
 
 
 ## Screen pixels per tile.
@@ -208,7 +241,10 @@ func _process(delta: float) -> void:
 		model.ask_map_trains()
 		model.ask_roboports(model.shown_surface())
 	cache.flush()
+	_hover_patch()
 	texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST if scale >= 0.5 else CanvasItem.TEXTURE_FILTER_LINEAR
+	if _alerts_blinked():
+		_redraw = true
 	if _redraw or not model.live_pings().is_empty():
 		_redraw = false
 		queue_redraw()
@@ -221,6 +257,63 @@ func _process(delta: float) -> void:
 		layers.follow(centre, scale, false)
 
 
+## L6: the resource patch under the mouse, asked for once it rests on a tile outside the one shown.
+func _hover_patch() -> void:
+	if not patch_info or not Bridge.world_ready:
+		return
+	var mouse := get_local_mouse_position()
+	if _dragging or dialog.is_open() or not Rect2(Vector2.ZERO, size).has_point(mouse):
+		return
+	var t := screen_to_tiles(mouse)
+	var tile := Vector2i(floori(t.x), floori(t.y))
+	var now := Time.get_ticks_msec()
+	if tile != _hover_tile:
+		_hover_tile = tile
+		_hover_since = now
+		return
+	if now - _hover_since < int(PATCH_REST * 1000.0) or model.patch_has(model.map_patch, tile):
+		return
+	model.ask_patch(tile)
+
+
+## A patch's tiles (rows [y, x, length, ...]) as the segments round them, in pairs (tiles): each run's ends,
+## and its top and bottom where the row above or below doesn't cover it.
+static func outline_edges(rows: Array) -> PackedVector2Array:
+	var spans := {}
+	for row in rows:
+		if not (row is Array) or row.size() < 3:
+			continue
+		var list: Array = []
+		for i in range(1, row.size() - 1, 2):
+			list.append(Vector2i(int(row[i]), int(row[i]) + int(row[i + 1])))
+		spans[int(row[0])] = list
+	var out := PackedVector2Array()
+	for y in spans:
+		for run: Vector2i in spans[y]:
+			out.append_array([Vector2(run.x, y), Vector2(run.x, y + 1), Vector2(run.y, y), Vector2(run.y, y + 1)])
+			for side in [[y, spans.get(y - 1, [])], [y + 1, spans.get(y + 1, [])]]:
+				for piece: Vector2i in _uncovered(run, side[1]):
+					out.append_array([Vector2(piece.x, side[0]), Vector2(piece.y, side[0])])
+	return out
+
+
+## The parts of `run` (x from, x to) that none of `others` covers.
+static func _uncovered(run: Vector2i, others: Array) -> Array:
+	var pieces: Array = [run]
+	for o: Vector2i in others:
+		var next: Array = []
+		for p: Vector2i in pieces:
+			if o.y <= p.x or o.x >= p.y:
+				next.append(p)
+				continue
+			if o.x > p.x:
+				next.append(Vector2i(p.x, o.x))
+			if o.y < p.y:
+				next.append(Vector2i(o.y, p.y))
+		pieces = next
+	return pieces
+
+
 ## The movement keys (WASD and the arrows unless rebound, as the help says), unless the tag dialog
 ## is being typed in.
 func _pan_input() -> Vector2:
@@ -231,6 +324,22 @@ func _pan_input() -> Vector2:
 		if InputMap.has_action(a[0]) and Input.is_action_pressed(a[0]):  # Shift (faster) held too
 			v += a[1]
 	return v.normalized()
+
+
+## The alerts blink: true when the blink's phase flipped since the last call and there are alerts to
+## draw (drawn again then, not every frame).
+func _alerts_blinked() -> bool:
+	var blink := MapCache.alerts_blink_on(Time.get_ticks_msec())
+	if blink == _blink_was:
+		return false
+	_blink_was = blink
+	if alerts == null:
+		return false
+	# Steady kinds (no_material, ...) look the same on both halves: no redraw for them alone.
+	for mk in alerts.map_marks():
+		if MapCache.alert_blinks(str(mk["kind"])):
+			return true
+	return false
 
 
 func _draw() -> void:
@@ -246,7 +355,14 @@ func _draw() -> void:
 			var p := tiles_to_screen(tag["position"])
 			if area.grow(icon + Kit.px(200)).has_point(p):
 				MapCache.draw_tag(self, p, tag, icon, true, font, font_size)
+	alerts_placed = MapCache.draw_alerts(self, alerts.map_marks(), tiles_to_screen, icon, area, model.shown_surface()) if alerts != null else []
 	MapCache.draw_pings(self, model.live_pings(), tiles_to_screen, float(Kit.px(24)))
+	if not _patch_edges.is_empty():
+		var pts := PackedVector2Array()
+		pts.resize(_patch_edges.size())
+		for i in _patch_edges.size():
+			pts[i] = tiles_to_screen(_patch_edges[i])
+		draw_multiline(pts, PATCH_OUTLINE, maxf(1.0, Kit.px(2)))
 	if model.map_si == 0:
 		MapCache.draw_player(self, tiles_to_screen(_me[0]), float(_me[1]), float(Kit.px(20)))
 

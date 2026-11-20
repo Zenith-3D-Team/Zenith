@@ -258,7 +258,8 @@ func _tiles_and_decoratives() -> void:
 	if card != null:
 		_check(is_zero_approx(card.center_offset.x) and is_equal_approx(card.center_offset.y, 0.25 * squash) and card.center_offset.z > 0.0, "the card's centre and lift: %s" % [card.center_offset])
 		var mat := card.material as ShaderMaterial
-		_check(mat != null and mat.shader.code.contains("ground_h("), "the card's shader lifts it onto an add-on's hills")
+		_check(mat != null and mat.shader.code.contains("sprite_card.gdshaderinc")
+			and FileAccess.get_file_as_string("res://shaders/sprite_card.gdshaderinc").contains("ground_h("), "the card's shader lifts it onto an add-on's hills")
 		var img := (mat.get_shader_parameter("picture") as Texture2D).get_image()
 		img.decompress()
 		var red := img.get_pixel(64 + 16, 96 + 48)  # the entity's centre is at (64, 96) in the picture
@@ -281,7 +282,7 @@ func _tiles_and_decoratives() -> void:
 	_check(SpriteStandins.in_use(), "with a list in use chunks draw no boxes or cones")
 	_mover_cards()
 	_card_cases()
-	var data = Decoratives._kind_data_for("zenith-test-pebbles", ItemIcons.factorio_data_dir())
+	var data = Decoratives._kind_data_for("zenith-test-pebbles")
 	_check(data != null and data.uvs.size() == 2, "the mod's decorative, its two pictures")
 
 

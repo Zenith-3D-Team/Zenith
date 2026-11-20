@@ -7,7 +7,7 @@ extends Control
 ##
 ## Many cards can be open at once, so each view renders only while it is on screen, at REFRESH
 ## seconds apart (UPDATE_ONCE), and at most BUDGET views render in the same frame. A card makes its
-## 3D view only once the train is in the client's world (making one per card made the
+## 3D view only once the train is in the client's world (owner's C8: making one per card made the
 ## overview slow to open); for a train far away it asks the map cache for the chart around it.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")

@@ -28,12 +28,16 @@ const MARGIN := 64.0
 const KEEP_RINGS := 2
 const MOVE := 8.0
 const TURN_DEGREES := 3.0
+const HIDE_PER_FRAME := 8
 
 ## Off with `--no-behind-cull` (read once, here).
 static var enabled := not OS.get_cmdline_user_args().has("--no-behind-cull") and not OS.get_cmdline_args().has("--no-behind-cull")
+## --behind-cull-hide=all: hide every off-view chunk in one frame as before.
+static var slice_hide := not OS.get_cmdline_user_args().has("--behind-cull-hide=all")
 
 var world: Node3D
 var _hidden := {}  # Vector2i -> ChunkView hidden here
+var _to_hide := {}  # Vector2i -> ChunkView queued to hide a slice a frame
 var _by_row := {}  # chunk row -> {chunk x: ChunkView}: the chunks world.gd made (added, removed)
 var _runs := {}  # chunk row -> Vector2i(first, last) chunk x drawn under _hull (first > last: none)
 var _hull := PackedVector2Array()
@@ -53,7 +57,7 @@ func _init() -> void:
 
 ## Whether world.gd's chunk `c` is hidden here (behind the camera, off its sides).
 func hidden(c: Vector2i) -> bool:
-	return _hidden.has(c)
+	return _hidden.has(c) or _to_hide.has(c)
 
 
 func hidden_count() -> int:
@@ -75,6 +79,7 @@ func added(c: Vector2i, cv: Node3D) -> void:
 ## world.gd let a chunk go (it hides and frees it itself).
 func removed(c: Vector2i) -> void:
 	_hidden.erase(c)
+	_to_hide.erase(c)
 	var row: Dictionary = _by_row.get(c.y, {})
 	row.erase(c.x)
 	if row.is_empty():
@@ -85,6 +90,7 @@ func removed(c: Vector2i) -> void:
 ## world.gd forgot its chunks (another surface, a new game).
 func reset() -> void:
 	_hidden.clear()
+	_to_hide.clear()
 	_by_row.clear()
 	_runs.clear()
 	_full = true
@@ -138,6 +144,7 @@ func _process(_delta: float) -> void:
 	var key := [cam.projection, cam.fov, cam.size, cam.near, cam.far, world.get_viewport().get_visible_rect().size,
 		world.chunk_of(world.focus()), world.view_radius]
 	if not _full and key == _cam_key and at.distance_to(_cam_at) < MOVE and back.dot(_cam_back) > cos(deg_to_rad(TURN_DEGREES)):
+		_drain_hide()
 		return
 	_cam_key = key
 	_cam_at = at
@@ -156,6 +163,7 @@ func _process(_delta: float) -> void:
 				_settle(y, row, was, run)
 		_runs[y] = run
 	_full = false
+	_drain_hide()
 
 
 ## The view's outline on the ground (x, z in tiles; a closed convex polygon, Geometry2D's).
@@ -238,12 +246,30 @@ func _set_drawn(c: Vector2i, cv: Node3D, drawn: bool) -> void:
 	if not is_instance_valid(cv):
 		return
 	if drawn:
+		_to_hide.erase(c)
 		if _hidden.has(c):
 			_hidden.erase(c)
 			cv.visible = true
 			_shown(c)
 	elif not _hidden.has(c) and cv.visible:
-		_hide(c, cv)
+		if slice_hide:
+			_to_hide[c] = cv
+		else:
+			_hide(c, cv)
+
+
+func _drain_hide() -> void:
+	if _to_hide.is_empty():
+		return
+	var n := 0
+	for c: Vector2i in _to_hide.keys():
+		var cv: Node3D = _to_hide[c]
+		_to_hide.erase(c)
+		if is_instance_valid(cv):
+			_hide(c, cv)
+			n += 1
+			if slice_hide and n >= HIDE_PER_FRAME:
+				break
 
 
 func _hide(c: Vector2i, cv: Node3D) -> void:
@@ -254,6 +280,7 @@ func _hide(c: Vector2i, cv: Node3D) -> void:
 
 
 func _show_all() -> void:
+	_to_hide.clear()
 	for c: Vector2i in _hidden:
 		var cv = _hidden[c]
 		if is_instance_valid(cv):

@@ -1,5 +1,5 @@
 extends Node3D
-## Riding to a space platform and back, as Factorio 2.x does it, from the
+## Riding to a space platform and back, as Factorio 2.x does it (owner's #10 and #17), from the
 ## mod's `me` (docs/PROTOCOL.md, "Riding to a platform"):
 ##   up      `ride` from a silo: the character walks into the rocket, the camera pulls back, the
 ##           engine lights, the rocket rises out of the silo and climbs at the game's own pace (its

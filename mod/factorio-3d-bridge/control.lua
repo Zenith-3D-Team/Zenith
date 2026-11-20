@@ -33,6 +33,7 @@ local equipment = require("scripts.equipment")
 local players = require("scripts.players")
 local alerts = require("scripts.alerts")
 local enemies = require("scripts.enemies")
+local enemy_sight = require("scripts.enemy_sight")
 local session = require("scripts.session")
 local barrier = require("scripts.barrier")
 local console = require("scripts.console")
@@ -43,6 +44,8 @@ local alt_mode = require("scripts.alt_mode")
 local belt_switch = require("scripts.belt_switch")
 local gfx = require("scripts.gfx")
 local mod_gui = require("scripts.mod_gui")
+-- (Its event ids are made as it loads: unconditionally, the same on every peer. link.lua)
+local link = require("scripts.link")
 
 local zenith_button = require("scripts.zenith_button")
 script.on_init(function()
@@ -53,9 +56,18 @@ script.on_load(session.on_load)
 script.on_configuration_changed(function(data)
   session.on_configuration_changed(data)
   zenith_button.update_all()
+  -- Clients a new bridge version dropped: raised on the first tick, after the companion mods'
+  -- own on_configuration_changed (link.later).
+  barrier.call("link", link.later)
 end)
 
-script.on_event(defines.events.on_udp_packet_received, function(event) barrier.call("packet", session.on_packet, event) end)
+-- An add-on's message for its mod is raised after the packet's handler returns (link.lua). A
+-- companion mod's error is caught there, per event, and reported to the add-on; the barrier is
+-- for the bridge's own.
+script.on_event(defines.events.on_udp_packet_received, function(event)
+  barrier.call("packet", session.on_packet, event)
+  barrier.call("link", link.raise)
+end)
 
 -- In this order: queued world data goes first, so a fresh client gets its welcome before any
 -- live state.
@@ -70,7 +82,7 @@ local STEPS = {
   { "ground_items", ground_items.tick }, { "fluids_power", fluids_power.tick },
   { "inserters", inserters.tick }, { "sky", sky.tick }, { "pollution", pollution.tick }, { "ui_actions", ui_actions.tick }, { "alt_mode", alt_mode.tick }, { "belt_switch", belt_switch.tick },
   { "alerts", alerts.tick }, { "equipment", equipment.tick }, { "players", players.tick },
-  { "enemies", enemies.tick }, { "requests", requests.tick }, { "gfx", gfx.tick }, { "mod_gui", mod_gui.tick },
+  { "enemies", enemies.tick }, { "enemy_sight", enemy_sight.tick }, { "requests", requests.tick }, { "gfx", gfx.tick }, { "mod_gui", mod_gui.tick },
 }
 
 local function serve()
@@ -116,6 +128,7 @@ script.on_event(defines.events.on_tick, function()
   end
   profile.run("poll", barrier.call, "poll", transport.poll)
   profile.run("bridge", session.each_client, barrier.call, "serve", serve)
+  barrier.call("link", link.raise)  -- clients that timed out
   profile.run("transport", barrier.call, "transport", transport.end_tick)
   barrier.call("launch", session.launch_tick)
   barrier.call("shot_hold", console.hold_tick)
@@ -173,7 +186,7 @@ for name, id in pairs(defines.events) do
 end
 
 -- The real game's "Show in Zenith" key (data.lua): the client playing that player's character
--- comes to the front.
+-- comes to the front (C7).
 local function show_in_zenith(event)
   log("[Zenith] Show in Zenith pressed by player " .. tostring(event.player_index) .. " at tick " .. game.tick)
   local raised = false
@@ -192,6 +205,8 @@ local function on_gui_click(event)
   session.on_gui_click(event)
 end
 script.on_event(defines.events.on_gui_click, function(event) barrier.call("on_gui_click", on_gui_click, event) end)
+-- Factorio's own Z onto a belt (hybrid, ui_actions.lua drop_put): the belt woken and read.
+script.on_event(defines.events.on_player_dropped_item_into_entity, function(event) barrier.call("dropped_into", ui_actions.on_dropped_into, event) end)
 -- The Zenith button for each player, on top of what these events already do (puppet.lua).
 local function also(id, fn)
   local before = script.get_event_handler(id)

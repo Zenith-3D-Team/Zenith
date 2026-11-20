@@ -16,8 +16,17 @@ extends RefCounted
 ##
 ## The scan runs once, in the background (prepare(), started by sfx.gd); until it is done lookups
 ## answer with what they can (files are still found, rules are defaults).
+##
+## A sound's file is looked for by locate(), in this order: a file an add-on registered for it
+## (register_file()), a model pack's (model_packs.gd sound_file(): its sounds/ folder), the install's
+## data folder, then a mod's folder or zip (mod_files.gd: a mod's own mining or repair sound;
+## --mod-sounds=off leaves mods' files out). The rules stay those of Factorio's prototypes whichever
+## place gives the file. The decoded sounds and found files are dropped when the packs' sounds
+## (ModelPacks.sounds_version), the mods found (ModFiles.generation) or the add-ons' files change.
 
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
+const ModFiles := preload("res://scripts/world/mod_files.gd")
 
 const PROTOTYPE_MODS := ["core", "base", "space-age", "quality", "elevated-rails"]
 
@@ -200,9 +209,24 @@ class LuaText:
 	static var _KEY := RegEx.create_from_string("([A-Za-z_][A-Za-z_0-9]*)\\s*=\\s*$")
 
 
+## The decoded streams, on the main thread only (stream(), stream_soon()), like every cache here. A
+## decode on a worker is handed where to read (_places(), found on the main thread) and puts its
+## stream in a holder of its own that only the main thread reads, once the task is done
+## (_take_decoded): no lock is shared with the workers. Under the lock there was before, the owner's
+## game froze joining a big base: a dump showed the lock owned by the main thread (its state one that
+## matched lock and unlock calls can't leave), every low-priority worker (4 of 16) blocked on it in a
+## decode, and the main thread waiting for the engine's own low-priority task (a render pipeline's
+## compile) queued behind them.
 static var _streams := {}  # "path|loop" -> AudioStream, or null when the file isn't there
-static var _decoding := {}  # "path|loop" -> true while a worker decodes it
-static var _stream_lock := Mutex.new()
+## "path|loop" -> [task id, holder Array, _cache_gen at its start] while a worker decodes it; [] while queued
+static var _decoding := {}
+## Asks waiting for a worker, [key, path, loop], first in first out. At most DECODES_AT_ONCE decode
+## at a time: the pool's low-priority queue runs in order, and the ~40 decodes asked for at a join
+## (fx.gd _warm_sounds) all queued at once held up the engine's own low-priority tasks (a render
+## pipeline's compile, which the main thread waits for) for 2-3 s.
+static var _queued: Array = []
+static var _running: Array[String] = []  # the keys decoding on a worker now
+const DECODES_AT_ONCE := 2
 static var _variants := {}  # prefix -> PackedStringArray
 static var _working := {}  # entity name -> Loop or null
 static var _by_file := {}  # path -> SoundDef: the definition each file was found in
@@ -211,8 +235,20 @@ static var _sound_refs := {}  # name of sounds.name -> [[LuaText, text position 
 static var _ambience := {}  # planet -> Dictionary (planet_ambience)
 static var _tracks: Array = []  # [path, volume, planets (Array, empty: space), track type, weight]
 static var _ready := false
-static var _lock := Mutex.new()
+static var _lock := Mutex.new()  # _scan's (a worker's) _ready; the main thread never waits holding it
 static var _started := false
+## Files add-ons give (task 2's api.sound): a sound's path ("addon:<id>/<path>", or a Factorio path it
+## replaces) -> a file on disk. Changed only through register_file() and forget_files().
+static var _addon_files := {}
+## Whether a mod's own files are read (--mod-sounds=off: only the packs' and the install's).
+static var mod_sounds := ModelPacks.arg_on("--mod-sounds")
+static var _where := {}  # path -> locate()'s answer, {} for nowhere
+## [ModelPacks.sounds_version, ModFiles.generation] the caches were made with. (Add-ons' files drop
+## only their own entries: _drop_addon_entries.)
+static var _versions := Vector2i(-1, -1)
+## Goes up each time the caches are dropped: a decode started before isn't kept. Main thread.
+static var _cache_gen := 0
+static var _warned := {}  # files said not to be Ogg Vorbis
 
 
 static func data_dir() -> String:
@@ -224,8 +260,154 @@ static func available() -> bool:
 
 
 static func exists(path: String) -> bool:
+	return not locate(path).is_empty()
+
+
+## Where sound `path` ("base/sound/boiler.ogg", or "__mod__/sound/x.ogg") is: {"from": "addon",
+## "pack", "install" or "mod", "file": a file on disk, or for a mod's the path mod_files.gd reads,
+## "step": _find_file()'s}; {} when it is nowhere. Cached per path until a place changes.
+static func locate(path: String) -> Dictionary:
+	_check_versions()
+	return _located(path)
+
+
+## A number that changes whenever the places files come from change (packs' sounds, mods found, add-ons'
+## files): what was found before may be elsewhere now. Main thread.
+static func generation() -> int:
+	_check_versions()
+	return _cache_gen
+
+
+## A file an add-on gives for sound `path` (`file` on disk); "" forgets it. Main thread.
+static func register_file(path: String, file: String) -> void:
+	if file == "":
+		_addon_files.erase(path)
+	else:
+		_addon_files[path] = file
+	_drop_addon_entries([path])
+
+
+## Forgets every add-on file whose path starts with `prefix` ("addon:<id>/" when an add-on stops).
+static func forget_files(prefix: String) -> void:
+	var files := {}
+	var gone := []
+	for k: String in _addon_files:
+		if not k.begins_with(prefix):
+			files[k] = _addon_files[k]
+		else:
+			gone.append(k)
+	if not gone.is_empty():
+		_addon_files = files
+		_drop_addon_entries(gone)
+
+
+## An add-on's files came or went: drops what was found and decoded for those paths (its "addon:..." keys,
+## or a Factorio path it gave a file for) and the variation lists they could be in, not every sound
+## Zenith decoded (all decoded again: a few frames of lost one-shots). Nothing else depends on them:
+## _find_file reads _addon_files only for the path asked. A decode under way is not kept (_cache_gen),
+## whichever file it is.
+static func _drop_addon_entries(changed: Array) -> void:
+	for path: String in changed:
+		_where.erase(path)
+		_streams.erase(path + "|0")
+		_streams.erase(path + "|1")
+	for prefix: String in _variants.keys():
+		if changed.any(func(c: String) -> bool: return c.begins_with(prefix)):
+			_variants.erase(prefix)
+	_cache_gen += 1
+
+
+## Drops the decoded sounds and found files when a place they came from changed. Main thread.
+static func _check_versions() -> void:
+	var now := Vector2i(ModelPacks.sounds_version, ModFiles.generation)
+	if now == _versions:
+		return
+	_versions = now
+	_streams.clear()
+	_variants.clear()
+	_where.clear()
+	_cache_gen += 1
+
+
+## locate()'s cache. Main thread (a worker's decode is handed its places: _places()).
+static func _located(path: String) -> Dictionary:
+	if _where.has(path):
+		return _where[path]
+	var at := _find_file(path)
+	_where[path] = at
+	return at
+
+
+## The places in order, from step `first` on (a file that can't be played gives way to the next):
+## 0 an add-on's, 1 a pack's above the Factorio pack, 2 the install's, 3 a mod's, 4 a pack's below
+## the Factorio pack (Factorio's own files come first there, but a file Factorio hasn't is the pack's).
+static func _find_file(path: String, first := 0) -> Dictionary:
+	var file := str(_addon_files.get(path, "")) if first <= 0 else ""
+	if file != "" and FileAccess.file_exists(file):
+		return {"from": "addon", "file": file, "step": 0}
+	if first <= 1:
+		file = ModelPacks.sound_file(path)
+		if file != "":
+			return {"from": "pack", "file": file, "step": 1}
 	var dir := data_dir()
-	return dir != "" and FileAccess.file_exists(dir.path_join(path))
+	if first <= 2 and dir != "" and not path.begins_with("__") and FileAccess.file_exists(dir.path_join(path)):
+		return {"from": "install", "file": dir.path_join(path), "step": 2}
+	if first <= 3 and mod_sounds:
+		# The install's own mods were looked for above: only another mod's folder or zip.
+		var mod := ModFiles.split(path)[0]
+		if mod != "" and not mod in ModFiles.BUILT_IN and ModFiles.exists(path):
+			return {"from": "mod", "file": path, "step": 3}
+	if first <= 4:
+		file = ModelPacks.sound_file(path, true)
+		if file != "":
+			return {"from": "pack", "file": file, "step": 4}
+	return {}
+
+
+## Where a decode reads sound `path`, found on the main thread: each place that has it, in order (a
+## file that can't be played gives way to the next), as {"name": locate()'s file, then "file": a file
+## on disk, or "zip" and "entry" for a mod's zip}. A worker reads them with _read() and nothing else.
+static func _places(path: String) -> Array:
+	var out := []
+	if not path.ends_with(".ogg"):
+		return out
+	var at := _located(path)
+	while not at.is_empty():
+		var p := {"name": str(at["file"])}
+		if at["from"] == "mod":
+			var parts := ModFiles.split(str(at["file"]))
+			var mod := ModFiles.locate(parts[0])
+			var inner := str(mod.get("root", "")) + parts[1]
+			if mod.has("dir"):
+				p["file"] = str(mod["dir"]).path_join(parts[1])
+			elif mod.has("zip") and (mod["files"] as Dictionary).has(inner):
+				p["zip"] = str(mod["zip"])
+				p["entry"] = (mod["files"] as Dictionary)[inner]
+		else:
+			p["file"] = str(at["file"])
+		out.append(p)
+		at = _find_file(path, int(at["step"]) + 1)
+	return out
+
+
+## A place's bytes, on any thread: no lock and no shared state (a mod's zip through a file of its own,
+## not mod_files.gd's per-thread handles, which take its lock).
+static func _read(p: Dictionary) -> PackedByteArray:
+	if p.has("zip"):
+		var f := FileAccess.open(str(p["zip"]), FileAccess.READ)
+		if f == null:
+			return PackedByteArray()
+		var data := ModFiles.zip_entry(f, p["entry"])
+		f.close()
+		return data
+	var file := str(p.get("file", ""))
+	return FileAccess.get_file_as_bytes(file) if file != "" and FileAccess.file_exists(file) else PackedByteArray()
+
+
+## Whether bytes are an Ogg Vorbis file (Factorio also reads Opus .ogg, which Godot can't decode).
+static func _is_vorbis(data: PackedByteArray) -> bool:
+	return data.size() > 64 and data.slice(0, 4).get_string_from_ascii() == "OggS" \
+		and _find(data.slice(0, 80), PackedByteArray([1, 0x76, 0x6F, 0x72, 0x62, 0x69, 0x73])) >= 0  # "\x01vorbis"
 
 
 ## Starts reading the prototypes in the background (once).
@@ -247,17 +429,21 @@ static func ready() -> bool:
 ## can be both (car engine). Decodes on the spot when it isn't cached yet: for the windows' sounds,
 ## which are small; the world's use stream_soon().
 static func stream(path: String, loop := false) -> AudioStream:
+	_check_versions()
+	_take_decoded()
 	var key := "%s|%d" % [path, int(loop)]
-	_stream_lock.lock()
-	var cached := _streams.has(key)
-	var s: AudioStream = _streams.get(key)
-	_stream_lock.unlock()
-	if cached:
-		return s
-	s = _decode(path, loop)
-	_stream_lock.lock()
+	if _streams.has(key):
+		return _streams[key]
+	var job: Array = _decoding.get(key, [0])
+	if job.is_empty():  # queued, not started: decoded here instead
+		_decoding.erase(key)
+		for i in _queued.size():
+			var ask: Array = _queued[i]
+			if str(ask[0]) == key:
+				_queued.remove_at(i)
+				break
+	var s := _decode(path, loop)
 	_streams[key] = s
-	_stream_lock.unlock()
 	return s
 
 
@@ -265,36 +451,99 @@ static func stream(path: String, loop := false) -> AudioStream:
 ## worker thread for next time. A sound's first decode took 110-340 ms on the main thread, a
 ## hitch while walking into new machines' sounds; skipping its very first play costs nothing.
 static func stream_soon(path: String, loop := false) -> AudioStream:
+	_check_versions()
+	_take_decoded()
 	var key := "%s|%d" % [path, int(loop)]
-	_stream_lock.lock()
-	var s: AudioStream = _streams.get(key)
-	if s == null and not _streams.has(key) and not _decoding.has(key):
+	if _streams.has(key):
+		return _streams[key]
+	if not _decoding.has(key):
 		_make_crc_table()
-		_decoding[key] = true
-		WorkerThreadPool.add_task(_decode_later.bind(key, path, loop), false, "Factorio sound")
-	_stream_lock.unlock()
-	return s
+		if _running.size() < DECODES_AT_ONCE:
+			_start_decode(key, path, loop)
+		else:
+			_decoding[key] = []
+			_queued.append([key, path, loop])
+	return null
 
 
-static func _decode_later(key: String, path: String, loop: bool) -> void:
-	var s := _decode(path, loop)
-	_stream_lock.lock()
-	_streams[key] = s
-	_decoding.erase(key)
-	_stream_lock.unlock()
+## Where to read is found here, on the main thread (a pack's file, an add-on's, the install's, a mod's
+## folder or zip): the worker only reads and decodes.
+static func _start_decode(key: String, path: String, loop: bool) -> void:
+	var holder := []
+	var task := WorkerThreadPool.add_task(_decode_into.bind(holder, _places(path), loop), false, "Factorio sound")
+	_decoding[key] = [task, holder, _cache_gen]
+	_running.append(key)
 
 
+## On a worker: the holder is this task's alone until the main thread has seen the task finish.
+## [the stream or null, the files that weren't Vorbis (warned about on the main thread)].
+static func _decode_into(holder: Array, places: Array, loop: bool) -> void:
+	var skipped := PackedStringArray()
+	holder.append(_decode_places(places, loop, skipped))
+	holder.append(skipped)
+
+
+## The finished decodes taken into the cache, then queued ones started up to DECODES_AT_ONCE. Only
+## the running ones are looked at (at most DECODES_AT_ONCE), and a task is waited for only once it is
+## done, so the main thread never waits on the pool here. A decode started before the caches were
+## dropped (_cache_gen) isn't kept: decoded again when asked.
+static func _take_decoded() -> void:
+	if _running.is_empty():
+		return
+	for i in range(_running.size() - 1, -1, -1):
+		var key := _running[i]
+		var job: Array = _decoding.get(key, [])
+		if job.is_empty():
+			_running.remove_at(i)
+			continue
+		if not WorkerThreadPool.is_task_completed(int(job[0])):
+			continue
+		WorkerThreadPool.wait_for_task_completion(int(job[0]))
+		_running.remove_at(i)
+		_decoding.erase(key)
+		var holder: Array = job[1]
+		if holder.size() > 1:
+			for file: String in holder[1]:
+				_warn_not_vorbis(file)
+		if int(job[2]) == _cache_gen:
+			_streams[key] = holder[0] if not holder.is_empty() else null
+	while _running.size() < DECODES_AT_ONCE and not _queued.is_empty():
+		var ask: Array = _queued.pop_front()
+		_start_decode(str(ask[0]), str(ask[1]), bool(ask[2]))
+
+
+## On the main thread (stream()).
 static func _decode(path: String, loop: bool) -> AudioStreamOggVorbis:
-	var dir := data_dir()
-	if dir == "" or not path.ends_with(".ogg"):
-		return null
-	var full := dir.path_join(path)
-	if not FileAccess.file_exists(full):
-		return null
-	var s := AudioStreamOggVorbis.load_from_buffer(_fix_comment(FileAccess.get_file_as_bytes(full)))
-	if s != null:
-		s.loop = loop
+	var skipped := PackedStringArray()
+	var s := _decode_places(_places(path), loop, skipped)
+	for file in skipped:
+		_warn_not_vorbis(file)
 	return s
+
+
+## Safe on a worker: reads only the places it is given (_read()), and lists the files that aren't
+## Vorbis (an Opus .ogg) in `skipped` as each gives way to the next place's.
+static func _decode_places(places: Array, loop: bool, skipped: PackedStringArray) -> AudioStreamOggVorbis:
+	for p: Dictionary in places:
+		var data := _read(p)
+		if data.is_empty():
+			return null
+		if not _is_vorbis(data):
+			skipped.append(str(p["name"]))
+			continue
+		var s := AudioStreamOggVorbis.load_from_buffer(_fix_comment(data))
+		if s != null:
+			s.loop = loop
+		return s
+	return null
+
+
+## Main thread.
+static func _warn_not_vorbis(file: String) -> void:
+	if _warned.has(file):
+		return
+	_warned[file] = true
+	push_warning("[sound] %s isn't Ogg Vorbis (Zenith plays only Vorbis .ogg files): skipped" % file)
 
 
 static var _crc_table := PackedInt64Array()
@@ -360,6 +609,7 @@ static func _crc(data: PackedByteArray, from: int, length: int) -> int:
 ## The numbered variations of a sound: "core/sound/walking/grass" ->
 ## ["base/.../grass-1.ogg", ...]. A prefix that is itself a file comes back alone.
 static func variants(prefix: String) -> PackedStringArray:
+	_check_versions()
 	if _variants.has(prefix):
 		return _variants[prefix]
 	var out := PackedStringArray()
@@ -856,7 +1106,16 @@ static func _index_music(lt: LuaText) -> void:
 		_tracks.append([path, volume, planets, kind.get_string(1) if kind != null else "main-track", _num(own, "weight", 1.0)])
 
 
-## Drops the cached streams (at exit, so Godot doesn't report them as leaked).
+## Drops the cached streams (at exit, so Godot doesn't report them as leaked), after waiting for
+## the decodes running (at most DECODES_AT_ONCE; the workers take no lock, so the main thread can
+## wait) and dropping the queued ones.
 static func clear_cache() -> void:
+	for job: Array in _decoding.values():
+		if not job.is_empty():
+			WorkerThreadPool.wait_for_task_completion(int(job[0]))
+	_decoding.clear()
+	_queued.clear()
+	_running.clear()
 	_streams.clear()
 	_variants.clear()
+	_where.clear()

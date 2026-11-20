@@ -6,7 +6,7 @@ alpha, the layout Zenith's own models carry (client/assets/models/README.md).
     python tools/models/bake_glb.py FILE.glb [FILE.glb...] --out DIR    # baked copies in DIR
     python tools/models/bake_glb.py FILE.glb [FILE.glb...] --in-place   # the files themselves
 
-Textured models (FUE5's, client/assets/models/fue5/; a modeller's in models/) have their own wear
+Textured models (FUE5's, client/assets/models/packs/fue5/; a modeller's in models/) have their own wear
 in their pictures but no occlusion: corners, the undersides of pipes and the gaps between parts
 were lit as brightly as the tops. The client's model shader (factorio_material.gdshaderinc) darkens
 a textured model's colour and direct light by this, and adds none of its own grime with it.

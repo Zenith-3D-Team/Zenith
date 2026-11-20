@@ -1,5 +1,5 @@
 extends Node3D
-## Flying robots drawn together (the frame rate dropped with many robots in view). Each robot
+## Flying robots drawn together (G3: the frame rate dropped with many robots in view). Each robot
 ## used to be a node with a MeshInstance3D per part and a flattened copy of each for its drop
 ## shadow, moved and animated one by one by vehicle_anim.gd: about 13 draw calls and objects a
 ## robot, and 9 ms of script a frame for 1,000 robots. Each robot kind is one MultiMesh per part

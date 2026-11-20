@@ -1,9 +1,15 @@
 extends Control
 ## The stack in the cursor, drawn at the mouse like Factorio: the item's icon with its count in the
-## count font, over windows and wherever the world shows no build ghost (an item that can't be
-## built, or one held over nothing). factorio_ui.gd sets `item`, `count` and `over_world_too`.
+## count font (Factorio's count-font: default-bold 13, bordered), over windows and wherever the world
+## shows no build ghost (an item that can't be built, or one held over nothing). Where the world shows
+## the held building's ghost, the ghost shows what it is and only the count is drawn by the pointer,
+## as Factorio does (L7). factorio_ui.gd sets `item`, `count` and `over_world_too`.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+
+## L7 (the owner's playtest: "I can't see how many big electric poles I have through my hand"):
+## holding a building over the world showed its ghost and no count at all. `--cursor-count=old`: none.
+static var count_fix := not ("--cursor-count=old" in OS.get_cmdline_user_args())
 
 var item := ""
 ## -1 hides the count.
@@ -28,23 +34,34 @@ var _drawn := false
 
 
 func _process(_delta: float) -> void:
-	if _drawn or shown():
+	if _drawn or shown() or count_shown():
 		queue_redraw()
 
 
+## The icon and its count: over a window, or over the world where no build ghost shows.
 func shown() -> bool:
 	return item != "" and Input.mouse_mode == Input.MOUSE_MODE_VISIBLE and (over_gui or over_world_too)
 
 
+## The count alone, by the pointer: over the world where the held building's ghost shows (L7). None
+## for an empty hand (a ghost cursor: Factorio's has no count either).
+func count_shown() -> bool:
+	return count_fix and item != "" and count > 0 and Input.mouse_mode == Input.MOUSE_MODE_VISIBLE \
+		and not over_gui and not over_world_too
+
+
 func _draw() -> void:
-	_drawn = shown()
+	var icon := shown()
+	_drawn = icon or count_shown()
 	if not _drawn:
 		return
 	var at := get_local_mouse_position() if debug_at.x < 0 else debug_at
 	var side := float(Kit.px(32))
-	# Down and right of the pointer's tip, so the pointer still shows where a click lands.
+	# Down and right of the pointer's tip, so the pointer still shows where a click lands. The count
+	# alone stays where it is with the icon, so it doesn't jump as the mouse leaves a window.
 	var rect := Rect2(at + Vector2(Kit.px(6), Kit.px(6)), Vector2(side, side))
-	draw_texture_rect(Kit.item_icon(item), rect, false)
+	if icon:
+		draw_texture_rect(Kit.item_icon(item), rect, false)
 	if count >= 0:
 		var f := Kit.font("bold")
 		var fs := Kit.px(13)

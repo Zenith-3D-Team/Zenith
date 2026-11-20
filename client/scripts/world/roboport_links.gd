@@ -1,5 +1,5 @@
 extends RefCounted
-## Which roboports are linked into one logistic network, for the lines Factorio draws between
+## Which roboports are linked into one logistic network (H14), for the lines Factorio draws between
 ## them while a roboport is hovered or held. A hovered roboport's links come from the game itself
 ## (`hinfo` `rn`, LuaLogisticCell.neighbours); for the rest (the held one's preview and the others
 ## round it) Factorio's rule stands in: two roboports join when their logistic squares meet, each

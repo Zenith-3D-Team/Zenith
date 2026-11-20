@@ -29,7 +29,6 @@ import types
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 GENERATOR = "Zenith tools/models/noblender.py"
 
@@ -762,7 +761,7 @@ def main():
     kit.export = export
     args = sys.argv[1:]
     compare = "--compare" in args
-    out_dir = os.path.join(REPO, "client", "assets", "models")
+    out_dir = None  # each model's pack (build.out_path)
     names = []
     for arg in args:
         if arg.startswith("--out="):
@@ -778,7 +777,7 @@ def main():
         begun = time.time()
         try:
             parts = kit.as_parts(kit.REGISTRY[name]())
-            path = os.path.join(target, name + ".glb")
+            path = build.out_path(target, name)
             export(parts, path)
         except Exception:  # noqa: BLE001  (one model failing doesn't stop the rest)
             traceback.print_exc()
@@ -790,7 +789,7 @@ def main():
         flag = "" if not budget or tris <= budget else "  OVER BUDGET (%d)" % budget
         print("noblender: %-28s %6d tris  %.1fs%s" % (name, tris, time.time() - begun, flag))
         if compare:
-            _report(name, path, os.path.join(out_dir, name + ".glb"))
+            _report(name, path, build.out_path(out_dir, name))
     return 1 if failed else 0
 
 

@@ -18,10 +18,17 @@ extends RefCounted
 ## stand-in's shadow of the top run falls on it. Only textured belt surfaces (a modeller's): Zenith's
 ## own belts are slabs lying in a closed frame with no end pieces, where nothing under them shows.
 ## The end pieces (`-start`, `-end`) get none: their surface is the wrap round the roller itself.
-## --belt-return=off draws none (docs/RUNNING.md).
+## --belt-return=off draws none (docs/RUNNING.md). The return's triangles come first in the draw
+## (joined), the top run's after: a surface drawn blended (no depth written, the last triangle drawn
+## wins) shows its top run over the return, not the return's backward chevrons over it;
+## --belt-return-first=off puts them after, as before 0.2.2.
 
 ## On unless --belt-return=off.
 static var enabled := not ("--belt-return=off" in OS.get_cmdline_user_args())
+## The space under the top run (return strip, rollers) shaded as a covered space, unless --belt-cover=off.
+static var cover_on := not ("--belt-cover=off" in OS.get_cmdline_user_args())
+## The return's triangles drawn before the top run's, unless --belt-return-first=off.
+static var first := not ("--belt-return-first=off" in OS.get_cmdline_user_args())
 ## Meta on a model's ArrayMesh: per surface the return drawn after its arrays (null: none), so a copy
 ## of the model (model_library.gd _copy: a tier wearing another's model) draws it too.
 const META := &"f3d_belt_return"
@@ -198,7 +205,8 @@ static func _subset(arrays: Array, idx: PackedInt32Array, tris: PackedInt32Array
 	return out
 
 
-## A surface's arrays with its return after them, for drawing (new arrays; neither is changed).
+## A surface's arrays with its return, for drawing (new arrays; neither is changed): the vertices the
+## surface's then the return's, the return's triangles drawn first (`first`; after with it off).
 static func joined(arrays: Array, ret: Array) -> Array:
 	var out := []
 	out.resize(Mesh.ARRAY_MAX)
@@ -214,10 +222,48 @@ static func joined(arrays: Array, ret: Array) -> Array:
 		idx = (arrays[Mesh.ARRAY_INDEX] as PackedInt32Array).duplicate()
 	else:
 		idx = PackedInt32Array(range(base))
+	var back := PackedInt32Array()
 	for k in (ret[Mesh.ARRAY_INDEX] as PackedInt32Array):
-		idx.append(base + k)
+		back.append(base + k)
+	if first:
+		back.append_array(idx)
+		idx = back
+	else:
+		idx.append_array(back)
 	out[Mesh.ARRAY_INDEX] = idx
 	return out
+
+
+## The covered space under a belt's top run, for the shader's belt_cover: (lowest y of the top run, the
+## lateral range of its width [|x| on a straight, the distance from a curve's centre on a curve], 1), or
+## Vector4.ZERO when switched off (--belt-cover=off) or there is no top run. The rollers and the return
+## strip lie below that height and inside that range; the frame's rails lie outside it.
+static func cover(arrays: Array, shape: int) -> Vector4:
+	if not cover_on:
+		return Vector4.ZERO
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	var normals: Variant = arrays[Mesh.ARRAY_NORMAL]
+	if verts.is_empty() or not normals is PackedVector3Array or (normals as PackedVector3Array).size() != verts.size():
+		return Vector4.ZERO
+	var low := INF
+	var lo := INF
+	var hi := -INF
+	var side := 1.0 if shape == 1 else -1.0
+	for v in verts.size():
+		if (normals as PackedVector3Array)[v].y <= UP:
+			continue
+		var p := verts[v]
+		low = minf(low, p.y)
+		var lat := absf(p.x)
+		if shape > 0:
+			lat = (Vector2(p.x, p.z) - Vector2(-0.5 * side, -0.5)).length()
+		lo = minf(lo, lat)
+		hi = maxf(hi, lat)
+	if low == INF:
+		return Vector4.ZERO
+	if shape == 0:
+		lo = 0.0 # the strip is symmetric about the belt's axis; its vertices sit at the edges, not the middle
+	return Vector4(low, lo, hi, 1.0)
 
 
 ## How far the return lies under its belt and how its texture runs, for tests: [lowest, highest y of the

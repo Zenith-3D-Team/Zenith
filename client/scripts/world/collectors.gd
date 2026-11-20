@@ -59,7 +59,7 @@ class Collector:
 	var arms := 1
 	var speed := DEFAULT_SPEED * 60.0  # tiles a second
 	var moving := true
-	var folded := false            # switched off: the arms go home and stay there
+	var folded := false            # switched off: the arms go home and stay there (G10)
 	var filters: Array = []
 	var known := false             # an `acol` row arrived for it
 	var base := Transform3D.IDENTITY

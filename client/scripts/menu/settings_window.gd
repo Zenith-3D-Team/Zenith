@@ -15,12 +15,15 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
-const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const GameSwap := preload("res://scripts/menu/game_swap.gd")
 const UiSettings := preload("res://scripts/ui/ui_settings.gd")
 const ColorFilter := preload("res://scripts/menu/color_filter.gd")
 const Looks := preload("res://scripts/world/looks.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
+const Controls := preload("res://scripts/player/controls.gd")
+const FactorioKeys := preload("res://scripts/player/factorio_keys.gd")
+const NightVisionOverlay := preload("res://scripts/ui/night_vision_overlay.gd")
+const PerfWarning := preload("res://scripts/ui/factorio/perf_warning.gd")
 
 const TABS := ["Graphics", "Sound", "Controls", "Interface", "Other", "Mod settings", "Camera", "Factorio"]
 ## Factorio's sound sliders ([gui-sound-settings]) the client has a bus for, in its order (Master,
@@ -348,12 +351,14 @@ func _graphics() -> void:
 		["24,000 items", 24000], ["Unlimited", 0]],
 		"how many belt items move|The most items on belts the server sends moving each update, counted from the character outwards (empty belts count a little too); further out they stand still on their lanes. Automatic raises and lowers it by itself as there is room: frames ending in time and the game at 60 UPS let more items move. Unlimited moves every item within the Belt item distance, which costs the server most on a busy base.")
 	# Smooth belt items (belt_smooth) and item icons (item_icons) are no longer shown (owner: too
-	# many belt settings): both stay on; Hold 60 UPS still eases belt_smooth off under load.
+	# many belt settings): both stay on (Hold 60 UPS has no step for belt_smooth; only an add-on's lighter updates ease it).
 	_check(grid, "Hold the game at 60 UPS", "graphics", "hold_ups",
-		"eases off when the game slows|While the game runs under 60 UPS, the bridge's updates, the distances above, the minimap's refreshes and then the frame rate go lower for a while (the F4 line says what). Your settings stay as they are.")
+		"eases off when the game slows|While the game runs under 60 UPS, the bridge's updates, the distances above, the minimap's refreshes and then the frame rate go lower for a while (the debug line says what). Your settings stay as they are.")
 	_check(grid, "Give the server the CPU first", "graphics", "server_first",
 		"with the server on this PC|When the server runs on this PC, the client runs at a lower process priority, so the game's tick gets a core first whenever every core is busy (joining, loading chunks). The client's frame rate stays the same when there is room. A server on another PC (through its relay) needs nothing here.")
 	_check(grid, "Show all smoke and particles", "graphics", "effects", "smoke, dust, flashes, explosions")
+	_check(grid, "Step onto belts", "graphics", "belt_step",
+		"the character drawn on belts|Walking over a belt, underground belt, splitter, loader or another thing Factorio's character walks over, the character is drawn standing on its top instead of through it. Only drawn: the camera and the character's place in the game don't move. Off: it walks through them, as before.")
 	_slider(grid, "Items in 3D", "graphics", "item_models_max", 0, Settings.ITEM_MODELS_ALL, 500, func(v: float) -> String:
 		if int(v) <= 0:
 			return "Icons only"
@@ -371,17 +376,6 @@ func _graphics() -> void:
 		"haze over polluted ground|A brownish haze lies over the ground where pollution is heavy, thicker the more polluted the chunk; trees there grey and lose their leaves and lakes turn green whatever this says. 0% switches the haze off (one full-screen pass, cheap, and none where there is no pollution).")
 	_dropdown(grid, "Look", "graphics", "look", Looks.choices(),
 		"light and colour|How the world is lit and coloured. Factorio: matched to Factorio's own pictures (its shadows' angle, its colours, its colour grading for each planet and time of day). Classic Zenith: the look before 0.1.4. Add-ons can add their own looks here.").item_selected.connect(reopen)  # rows a look sets itself grey out
-	var open_models := MenuKit.button("Open folder")
-	open_models.name = "graphics-open-models"
-	var on_open := func() -> void:
-		Sfx.play_ui("gui-click")
-		var dir := ModelLibrary.custom_models_dir()
-		DirAccess.make_dir_recursive_absolute(dir)
-		OS.shell_open(dir)
-	open_models.pressed.connect(on_open)
-	var in_use := ("%d in use" % ModelLibrary.external_count) if ModelLibrary.external_count > 0 else "none"
-	_row(grid, "Your models", open_models,
-		"%s|A .glb in Zenith's models folder replaces Zenith's own model of the same name (transport-belt.glb, inserter-east.glb...), at the next start. Empty, Zenith uses its own. The guide for modellers (MODELLERS.md) has every name." % in_use)
 
 	_heading("Advanced")
 	grid = _grid()
@@ -412,6 +406,10 @@ func _graphics() -> void:
 	_check(grid, "Ambient occlusion", "graphics", "ssao",
 		"shading in corners|SSAO: tight shading in corners and between machines, as Factorio's sprites have it. On in High and Ultra. Drawn only zoomed in: it fades out as you zoom out and is off further out, costing nothing there. Up close it makes the depth pre-pass write every pixel's normal, about 0.7 ms of GPU a frame at a busy base on a desktop graphics card, more on a laptop.")
 	_grey_for_look("graphics-ssao", "ssao", "its own Ambient occlusion setting (Add-ons menu) applies")
+	_dropdown(grid, "Metal on textured models", "graphics", "texture_metal", [["As paint", "paint"], ["Full, as before", "full"]],
+		"a modeller's metal pictures|Models with their own metal picture (some model packs). As paint: their metal is drawn as every other model's, mostly as paint, so it takes the sun, the shadows and the look's light as Factorio's pictures do. Full, as before: in full, reflecting only the sky, which reads dark and blue. Built-in models have no such picture and look the same either way. A pack that asks for its own shading (Packs' own shading below) always has its metal drawn in full, reflecting a neutral light rather than the sky (--pbr-metal for one run).")
+	_dropdown(grid, "Packs' own shading", "graphics", "pack_shading", [["As each pack says", "pack"], ["Factorio's everywhere", "factorio"]],
+		"how model packs are lit|As each pack says: a model pack that asks for it (\"shading\": \"pbr\" in its pack.json, Vasillo's for one) has its models, pictured or not, drawn as their files say, as Blender and Godot draw them. Factorio's everywhere: every pack drawn with the balance made for Factorio's pictures, as before 0.2.2 (tops held darker than sides). Zenith's own packs look the same either way.")
 	_check(grid, "Contact shading", "graphics", "contact_shading",
 		"dark rim round buildings' feet|The dark rim on the ground round each building's foot that Factorio's sprites have, so buildings stand in the ground rather than on it. One draw per chunk, a fraction of a millisecond.")
 	_check(grid, "Render on a separate thread", "graphics", "render_thread",
@@ -434,6 +432,7 @@ func _sound() -> void:
 		devices.append(["Default device" if d == "Default" else d, d])
 	_dropdown(grid, "Preferred output", "sound", "output_device", devices)
 	_slider(grid, "Machine sounds at once", "sound", "max_voices", 4, 32, 1, func(v: float) -> String: return "%d" % int(v), false, false, "from the next game")
+	_check(grid, "Sounds from model packs", "sound", "pack_sounds", "Zenith's own|Sounds a model pack carries play in place of Factorio's, by the packs' order in Model packs. Off: Factorio's own sounds only.")
 	_heading("Volume")
 	grid = _grid()
 	for entry in SOUND:
@@ -476,9 +475,26 @@ func _controls() -> void:
 		Settings.reload_factorio_keys()
 		_open_tab.call_deferred(_tab))
 	var found: String = load("res://scripts/player/factorio_keys.gd").config_path()
-	var changed := Settings.factorio_keys.size()
+	var changed := Settings.factorio_keys_changed
 	var where := ("%d changed there, from %s" % [changed, found]) if found != "" else "Factorio's config.ini wasn't found"
-	_row(top, "Use the keys set in Factorio", use, "Factorio's Settings > Controls; %s|The keys you changed in Factorio's own controls are the defaults here, so Factorio and Zenith answer the same keys. A binding changed on this page still wins; Default puts Factorio's back. Read when Zenith starts and when this is switched: %s" % [where, where])
+	_row(top, "Use the keys set in Factorio", use, "Factorio's Settings > Controls; %s|Factorio's keys are the defaults here: the ones you changed in Factorio's own controls, and Factorio's own defaults for the rest (both from its config.ini; with Zenith 0.2.2's keys on, only the ones you changed), so Factorio and Zenith answer the same keys. A binding changed on this page still wins; Default puts Factorio's back. Off, or without a config.ini: Zenith's built-in keys. Read when Zenith starts, when its window comes back from another, and when this is switched: %s" % [where, where])
+	# Issue #26: the switch back to Zenith 0.2.2's keys, from before Zenith followed Factorio 2.1's defaults.
+	var old := MenuKit.checkbox("", Controls.old_defaults())
+	old.name = "factorio-" + Controls.OLD_KEYS_SETTING
+	old.disabled = Controls.old_defaults_forced()
+	old.toggled.connect(func(on: bool) -> void:
+		Sfx.play_ui("gui-checkbox-click")
+		Settings.set_value("factorio", Controls.OLD_KEYS_SETTING, on)
+		_open_tab.call_deferred(_tab))
+	_row(top, "Zenith 0.2.2's keys", old, ("On for this run (--keys-defaults=old)|" if Controls.old_defaults_forced() else "|") + "The keys Zenith had before it followed Factorio 2.1's defaults: the arrow keys walk and pan the map, / opens the console, Keypad Enter gets in and out of vehicles, M opens the map (not Tab), Tab is Next weapon and C is Shoot selected. Of Factorio's controls only the keys you changed there are used, not its defaults. A binding changed on this page still wins.")
+	# Issue #26: Factorio's keys over the ones saved here, with what was copied and what wasn't.
+	var copy := MenuKit.button("Copy keys from Factorio")
+	copy.name = "CopyFactorioKeys"
+	copy.tooltip_text = "Reads Factorio's config.ini again and drops the bindings changed on this page for every control Factorio has, so each follows Factorio's key: the one changed there, else Factorio's default. Zenith's own controls (camera, views) keep theirs."
+	copy.pressed.connect(func() -> void:
+		Sfx.play_ui("gui-click")
+		copy_factorio_keys())
+	_row(top, "Factorio's keys over these", copy)
 	var by_group := {}
 	for action in Settings.bindable_actions():
 		var group := ControlsInfo.group_of(action)
@@ -519,6 +535,82 @@ func _controls() -> void:
 			Settings.bind(action, [])
 		_open_tab(_tab))
 	_pane.add_child(reset_all)
+
+
+## Settings.copy_factorio_keys, then Factorio's style of message: what was copied, what wasn't and
+## why, and the config.ini read. Returns the message's text (tests).
+func copy_factorio_keys() -> String:
+	var r: Dictionary = Settings.copy_factorio_keys()
+	_open_tab(_tab)
+	var text := copy_report_text(r)
+	_show_message("Copy keys from Factorio", text)
+	return text
+
+
+## "Copy keys from Factorio"'s message: the keys as Factorio shows them (factorio_keys.gd's key_label),
+## controls by Zenith's names where it has them, Factorio's own otherwise.
+static func copy_report_text(r: Dictionary, os_name := OS.get_name()) -> String:
+	var file := str(r.get("file", ""))
+	if file == "":
+		return "Factorio's config.ini wasn't found, so nothing was copied. Zenith looks where the Factorio install in Settings > Factorio install keeps it (its config-path.cfg), then in %s. Start Factorio once and change a key there, or choose the install." % FactorioKeys.system_config_text(os_name)
+	var lines: Array = []
+	if bool(r.get("old_keys", false)):
+		lines.append("With Zenith 0.2.2's keys on: only the keys changed in Factorio are copied, Zenith 0.2.2's keys for the rest.")
+	else:
+		lines.append("With Factorio's keys: the keys changed in Factorio, and Factorio's defaults for the rest.")
+	var copied: Array = r.get("copied", [])
+	var defaults: Array = r.get("defaults", [])
+	if copied.is_empty():
+		lines.append("None of Factorio's controls were changed there." + (" Its defaults are used here." if not defaults.is_empty() else ""))
+	else:
+		lines.append("Copied (%d):" % copied.size())
+		for c in copied:
+			var key := FactorioKeys.key_label(int(c[3]))
+			lines.append("  %s: %s" % [_slot_name(str(c[1]), int(c[2])), key if key != "" else "unbound, as in Factorio"])
+	var skipped: Array = r.get("skipped", [])
+	if not skipped.is_empty():
+		lines.append("Not copied (%d):" % skipped.size())
+		for c in skipped:
+			var control := str(c[0])
+			var base := control.trim_suffix("-alternative").trim_suffix("-controller")
+			var label := control
+			if FactorioKeys.ACTIONS.has(base):
+				label = ControlsInfo.name_of(FactorioKeys.ACTIONS[base])
+				if control.contains("-controller"):
+					label += " (controller)"
+				elif control.ends_with("-alternative"):
+					label += " (alternative)"
+			lines.append("  %s: %s (%s)" % [label, FactorioKeys.value_label(str(c[1])), c[2]])
+	var clashes: Array = r.get("clashes", [])
+	if not clashes.is_empty():
+		lines.append("Also on one of Zenith's own controls (both act; change either in this tab):")
+		for c in clashes:
+			var own: Array = (c[2] as Array).map(func(a: String) -> String: return ControlsInfo.name_of(a))
+			lines.append("  %s: %s, also %s" % [FactorioKeys.key_label(int(c[1])), ControlsInfo.name_of(str(c[0])), ", ".join(own)])
+	if not defaults.is_empty():
+		lines.append("Factorio's defaults taken for the rest: %d." % defaults.size())
+	var reset: Array = r.get("reset", [])
+	if not reset.is_empty():
+		# Without Factorio's default lines (an old or hand-written config.ini) the rest are Zenith's own.
+		lines.append(("Bindings changed here put back to Factorio's: %d." if not defaults.is_empty()
+			else "Bindings changed here put back to the defaults (Factorio's changed keys, Zenith's own otherwise): %d.") % reset.size())
+	lines.append("Read from: " + file)
+	return "\n".join(lines)
+
+
+static func _slot_name(action: String, slot: int) -> String:
+	return ControlsInfo.name_of(action) + (" (alternative)" if slot == 1 else "")
+
+
+## A message over the settings with Factorio's OK button (MenuKit.message, scrolling).
+func _show_message(title: String, text: String) -> void:
+	var parts: Array = MenuKit.message(title, text, true)
+	var o: Control = parts[0]
+	(parts[1] as Button).pressed.connect(func() -> void:
+		Sfx.play_ui("gui-click")
+		o.queue_free())
+	add_child(o)
+	print("settings: %s: %s" % [title, text.replace("\n", " | ")])
 
 
 func _binding_row(grid: GridContainer, action: String) -> void:
@@ -568,6 +660,8 @@ func _interface() -> void:
 	var grid := _grid()
 	_ui_check(grid, "Show minimap", "map/minimap", "M opens the map")
 	_check(grid, "Show mouse and keyboard control hints", "interface", "show_help", "F1; the client's help panel, hidden while a window is open")
+	_check(grid, "Show fluid pipeline visualization", "interface", "fluid_vis", "When holding a fluid-related entity, show all fluid pipelines in view (in Alt-mode).")
+	_check(grid, "Show fluid pipeline visualization when selected", "interface", "fluid_vis_selected", "When hovering over an entity, show that entity's fluid pipelines.")
 
 	_heading("Alt-mode")
 	grid = _grid()
@@ -584,7 +678,7 @@ func _interface() -> void:
 
 	_heading("UI scale")
 	grid = _grid()
-	_dropdown(grid, "UI scale", "interface", "ui_scale", [["Automatic", "auto"], ["75%", "0.75"], ["100%", "1.0"], ["125%", "1.25"], ["150%", "1.5"], ["175%", "1.75"], ["200%", "2.0"]], "Ctrl+= / Ctrl+- / Ctrl+0")
+	_dropdown(grid, "UI scale", "interface", "ui_scale", [["Automatic", "auto"], ["75%", "0.75"], ["100%", "1.0"], ["125%", "1.25"], ["150%", "1.5"], ["175%", "1.75"], ["200%", "2.0"]], " / ".join(["increase_ui_scale", "decrease_ui_scale", "reset_ui_scale"].map(func(a: String) -> String: return Settings.key_names(a))))
 
 	_heading("Tooltips")
 	grid = _grid()
@@ -602,7 +696,16 @@ func _interface() -> void:
 	_check(grid, "Shortcut bar", "interface", "shortcut_bar", "right of the quickbar")
 	_check(grid, "Research progress", "interface", "research_progress", "top right")
 	_check(grid, "Alerts", "interface", "alerts", "over the shortcut bar")
-	_check(grid, "Debug line (F4)", "interface", "debug_overlay", "tick, chunks, packets, FPS")
+	_check(grid, "Night vision indicator", "interface", "night_vision_indicator", "the equipment's icon over the shortcut bar while it is on")
+	_check(grid, "Night vision screen edge", "interface", "night_vision_edge", "a soft green vignette at the screen's edges while it is on")
+	for key in ["night_vision_indicator", "night_vision_edge"]:  # --night-vision-fx=off holds both (and the sound) off, unsaved
+		(grid.find_child("interface-" + key, true, false) as CheckBox).set_pressed_no_signal(not NightVisionOverlay.forced_off and bool(Settings.get_value("interface", key)))
+	_check(grid, "Performance warnings", "interface", "perf_warning", "an icon top left while settings are held back for UPS|A yellow warning icon at the top left while Hold the game at 60 UPS holds settings back, with how many; click it for the log of what was held back, when and why. The log fills with this off too.")
+	# --perf-warning=off holds it off until changed, unsaved: the box shows that, so one click turns it on.
+	(grid.find_child("interface-perf_warning", true, false) as CheckBox).set_pressed_no_signal(PerfWarning.enabled())
+	# Its key as bound now: F4 in dev builds, none by default in a public one (issue #26).
+	var debug_key := Settings.key_names("debug_line")
+	_check(grid, "Debug line" if debug_key == "(none)" else "Debug line (%s)" % debug_key, "interface", "debug_overlay", "tick, chunks, packets, FPS")
 	_ui_slider(grid, "Minimap size", "map/minimap_size", 120.0, 480.0, 20.0, func(v: float) -> String: return "%d px" % roundi(v))
 	_ui_slider(grid, "Minimap zoom", "map/minimap_zoom", 0.25, 4.0, 0.25, func(v: float) -> String: return "%.2f px per tile" % v)
 	_ui_check(grid, "Show tags on the minimap", "map/minimap_tags")
@@ -698,11 +801,12 @@ func _camera() -> void:
 	_slider(grid, "Zoom out to the map at", "camera", "map_zoom_out", 80.0, 480.0, 10.0, func(v: float) -> String: return "%d tiles" % int(v), false, false, "the view zoomed in from the map goes back to the map when zoomed out this far; the default is 240")
 	_slider(grid, "Mouse sensitivity", "camera", "look_sensitivity", 0.25, 3.0, 0.05, func(v: float) -> String: return "%.2f×" % v)
 	_check(grid, "Invert mouse look", "camera", "invert_y", "first person and middle-drag tilt")
+	_slider(grid, "Add-ons' camera motion", "camera", "addon_motion", 0.0, 100.0, 5.0, func(v: float) -> String: return "%d%%" % int(v), false, true, "scales the bob, sway and shake add-ons put on the camera; 0% for none")
 
 
 func _factorio() -> void:
 	var grid := _grid()
-	var found := Paths.find_factorio_exe()
+	var found := Paths.find_factorio_exe(true)  # the player may have just installed it
 	var exe := MenuKit.textbox(str(Settings.get_value("factorio", "executable")), "Automatic: " + (found if found != "" else "not found"))
 	exe.custom_minimum_size.x = Kit.px(420)
 	_on_text(exe, "factorio", "executable")

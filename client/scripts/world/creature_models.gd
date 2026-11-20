@@ -37,6 +37,18 @@ const POSE_SLOTS := ["-attack", "-corpse", "-corpse-1", "-corpse-2", "-corpse-3"
 const POSE_SCALE := 0.999
 ## Material name fragments that take the tier's colour.
 const TINTED := ["chitin", "flesh_worm", "flesh_spawner_dome"]
+## Demolishers' lava (tools/models/vulcanus.py): its .glb glows 2.5 times a bright red (the crust 0.6
+## times a dark one), over part colours that already are the sprite's lava (space_skin.py): 4 to 7
+## times the sprite's brightness, a red glare. Factorio paints its lava in (the demolisher has no glow
+## layer), so here it shines by its own paint, this share of it: about the sprite's brightness in
+## daylight, still lava on its shaded side. The crust doesn't glow (the sprite's is dark).
+const PAINT_GLOW := {"lava_demolisher": 0.4, "lava_demolisher_dim": 0.0}
+
+## The creatures' look before their glow was taken off (--creature-glow=old): worms' and spawners'
+## unmasked parts in the tier's colour four times over (skin_mode 3), demolishers' lava at its .glb's
+## emission.
+static var old_glow := false
+static var _args_read := false
 
 ## Prototype name -> [model it is drawn with, scale, carapace colour or null].
 ## Scales from Factorio's enemy-constants.lua. Biters' and spitters' colours were sampled from
@@ -137,6 +149,9 @@ static func prepare(mesh: ArrayMesh, name: String) -> ArrayMesh:
 	var model := name if alias.is_empty() else str(alias[0])
 	var limbs := rig(model)
 	var scale := 1.0 if alias.is_empty() else float(alias[1])
+	_read_args()
+	if not old_glow:
+		_paint_glow(mesh)
 	# A skin without tiers (Space Age's pentapods, shells, spawners, demolishers: `colour`) is all in
 	# the model's own part colours: nothing to do here.
 	if alias.is_empty() and limbs.is_empty() and (skin_of(_unposed(model)).get("tiers", {}) as Dictionary).is_empty():
@@ -164,7 +179,7 @@ static func prepare(mesh: ArrayMesh, name: String) -> ArrayMesh:
 		m.set_shader_parameter("albedo", Color(_linear_colour(t[0]).linear_to_srgb(), albedo.a))
 		var second := _linear_colour(t[1])
 		m.set_shader_parameter("skin_tint2", Color(second.linear_to_srgb(), float((t[1] as Array)[3])))
-		m.set_shader_parameter("skin_mode", 1 if masks else 2)
+		m.set_shader_parameter("skin_mode", 1 if masks else (3 if old_glow else 2))
 		m.set_shader_parameter("part_colors", true)
 	var glowing := func(m: ShaderMaterial) -> void: m.set_shader_parameter("activity_glow", true)
 	for i in out.get_surface_count():
@@ -183,6 +198,29 @@ static func prepare(mesh: ArrayMesh, name: String) -> ArrayMesh:
 				copy.set_shader_parameter("worm_height", out.get_aabb().end.y)
 		out.surface_set_material(i, copy)
 	return out
+
+
+static func _read_args() -> void:
+	if _args_read:
+		return
+	_args_read = true
+	for a in OS.get_cmdline_user_args():
+		if a == "--creature-glow=old":
+			old_glow = true
+
+
+## The lava's materials (PAINT_GLOW) shine by their own paint instead of their .glb's emission.
+static func _paint_glow(mesh: ArrayMesh) -> void:
+	var lava := func(m: ShaderMaterial) -> bool: return PAINT_GLOW.has(m.resource_name)
+	var by_paint := func(m: ShaderMaterial) -> void:
+		m.set_shader_parameter("emission", Color.WHITE)
+		m.set_shader_parameter("emission_energy", float(PAINT_GLOW[m.resource_name]))
+		m.set_shader_parameter("emission_from_paint", true)
+	for i in mesh.get_surface_count():
+		var material := mesh.surface_get_material(i)
+		var changed := MaterialRows.edit(material, lava, by_paint)
+		if changed != material:
+			mesh.surface_set_material(i, changed)
 
 
 ## A family's skin (creature_skins.json): {mode, materials, tiers: {tier: tints}}, or {}.

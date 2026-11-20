@@ -198,10 +198,35 @@ private:
 		i64 tick = 0;
 		std::vector<i64> uid, pos;
 		std::vector<int32_t> itm, stk;
+		std::vector<uint8_t> fl;  // (rescue_seen) 1: denied (gone at the read), a late take's still; 2: taken
 	};
 	std::unordered_map<int, Rescued> _rescued;
 	i64 n_take_read = 0;
 	i64 n_take_rescued = 0;
+	// belt_sim.gd's rescue_seen: a read's _rescue doesn't put an item back into a lane read as of its tick or
+	// later without it, nor behind where it was last read (by more than a gap), nor after RESCUE_STRIKES - 1
+	// rescues with no read listing it; it goes. _seen: uid -> lane key, tick, place of the newest read listing
+	// it; _strikes: uid -> rescues since; l_seen: lane -> its newest read's tick (the batch's too); _read_t: the
+	// tick of the read being applied (-1: the sim's).
+	bool rescue_seen = true;
+	static constexpr i64 RESCUE_STRIKES = 3;
+	i64 n_rescue_denied = 0;
+	struct Seen {
+		i64 key, tick, place;
+	};
+	std::unordered_map<i64, Seen> _seen;
+	std::unordered_map<i64, i64> _strikes;
+	i64 _read_t = -1;
+	void _note_seen(i64 key, i64 t, const std::vector<i64> &items);
+	bool _may_rescue(i64 uid, Line *L, int to, i64 at);
+	void _forget_seen(i64 uid) {
+		if (!_seen.empty()) {
+			_seen.erase(uid);
+		}
+		if (!_strikes.empty()) {
+			_strikes.erase(uid);
+		}
+	}
 	// belt_sim.gd's take_line (K19): what is queued applied by tick, a tick's takes first; a take of the item
 	// its belt's queued read hasn't (_take_known; _qload: lane key -> reads queued, not applied: tick, items).
 	bool take_line = true;
@@ -220,7 +245,8 @@ private:
 	i64 _take_known(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins);
 	i64 _take_left(i64 unit, i64 seq, i64 n);
 	void _takes_first(int i, const std::vector<i64> &items);
-	void _note_rescued(int i, Line *L, const std::vector<i64> &P, const std::vector<i64> &before, i64 lo);
+	void _note_rescued(int i, Line *L, const std::vector<i64> &P, const std::vector<i64> &before, i64 lo,
+			const std::vector<int> &denied);
 	i64 _take_rescued(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins);
 	// Splitter inputs the bridge saw stand as their last read left them (`sh`): lane index -> the tick
 	// from which their items don't cross into the outputs, until the lane's next read (belt_sim.gd's
@@ -259,6 +285,7 @@ private:
 	std::vector<int32_t> l_kind, l_len, l_step, l_extra, l_x0, l_y0, l_x1, l_y1;
 	std::vector<int32_t> l_xm, l_ym;  // (handoff) its middle (line position length / 2)
 	std::vector<i64> l_read;  // (handoff) the tick of its newest read applied (-1 none)
+	std::vector<i64> l_seen;  // (rescue_seen) the tick of its newest read, applied or in the batch (-1 none)
 	std::vector<int32_t> l_next, l_side, l_side_at, l_sp0, l_sp1, l_line, l_base, l_run;
 	std::vector<uint8_t> l_off, l_alive;
 	std::vector<std::vector<int>> l_feeders, l_sideins;
@@ -291,6 +318,10 @@ private:
 	std::vector<std::unique_ptr<Line>> _lines;
 	std::vector<int> _free_lines;
 	std::unordered_map<i64, int> _uid_line;
+	// (turn_id) belt_sim.gd's _num: each item's number along its run, set when it first comes into a line (_number).
+	std::unordered_map<i64, i64> _num;
+	i64 _num_next = 0;
+	static constexpr i64 NUMS = (i64)1 << 20;
 	std::unordered_map<i64, std::vector<int>> _bucket;
 	std::vector<i64> _heap;
 	i64 _cur_t = -1;
@@ -318,6 +349,7 @@ private:
 	std::vector<i64> out_gone_tick;  // the tick each item went on
 	std::vector<int32_t> out_gone_at;  // the changes before it (in out_uid)
 	std::vector<int32_t> out_item, out_stack, out_pos, out_speed, out_reach, out_run;
+	std::vector<i64> out_num;  // (turn_id) the item's number (_num; -1 none)
 	// (handoff: take_at, put_at) What each inserter's take or put did (belt_sim.gd's out_hand_*).
 	std::vector<i64> out_hand_uid, out_hand_tick, out_hand_ins, out_hand_key;
 	std::vector<int32_t> out_hand_pos, out_hand_why;
@@ -331,6 +363,7 @@ private:
 		int32_t stk;
 		int lane;
 		i64 pos;
+		int src = -1;  // (_take_rescued) the record's lane
 	};
 	std::vector<TakeCand> _tc;  // belt_sim.gd's _tc_u, _tc_s, _tc_l, _tc_p
 	int _tc_lane = -1;
@@ -373,8 +406,8 @@ private:
 	int _carry_input(int o);
 	void _carry_forward(int l0, std::vector<Carried> ex);
 	bool _forward_split(Splitter *sp, int l0, i64 uid, i64 item, i64 stk, i64 over);
-	void _rescue(Line *L, std::vector<i64> &P, std::vector<int32_t> &RV, const std::unordered_map<i64, int> &idx,
-			const std::vector<i64> &items, i64 lo, i64 hi, const std::vector<uint8_t> &skip);
+	std::vector<int> _rescue(int i, Line *L, std::vector<i64> &P, std::vector<int32_t> &RV, const std::unordered_map<i64, int> &idx,
+			const std::vector<i64> &items, i64 lo, i64 hi, std::vector<uint8_t> &skip);
 	std::vector<int> _push_back(Line *L, std::vector<i64> &P, std::vector<int32_t> &RV,
 			const std::unordered_map<i64, int> &idx, const std::vector<i64> &items, i64 lo, i64 hi);
 	i64 _stays_at(const std::vector<i64> &P, const std::unordered_map<int, i64> &gp, int j, i64 lo, i64 hi) const;
@@ -388,6 +421,7 @@ private:
 	static i64 _floordiv(i64 a, i64 b);
 	static i64 _cell(i64 x, i64 y) { return (i64)(((uint64_t)x << 32) ^ (uint64_t)(uint32_t)y); }
 	int _lane_index(i64 key) const;
+	bool _line_has_in(const Line *L, i64 lo, i64 hi) const;
 	int _new_lane();
 	void _grid_add(int i);
 	void _grid_remove(int i);
@@ -459,6 +493,9 @@ private:
 
 	// --- records (output)
 	void _gone(i64 uid);
+	void _number(Line *L, int j);
+	void _number_all(Line *L);
+	void _set_num(i64 u, i64 n);
 	void _emit_one(i64 uid, i64 item, i64 stack, int lane, i64 pos, i64 t, i64 v, i64 line_pos);
 	int _lane_at(Line *L, i64 pos);
 	void _rec_append(Line *X, int v);
@@ -503,8 +540,10 @@ public:
 	void set_n_hand(const PackedInt64Array &a);
 	Dictionary take_changes();
 	i64 next_of(i64 key);
+	bool leads_on(i64 key);
 	Array items_state();
 	PackedInt32Array lane_fronts(const PackedInt64Array &keys, int speed_of = 0);
+	PackedInt32Array lane_tails(const PackedInt64Array &keys, int need);
 	Dictionary stats();
 	void mark_split_holds();
 	Dictionary debug_links();
@@ -550,6 +589,10 @@ public:
 	i64 get_n_take_rescued() const { return n_take_rescued; }
 	void set_take_line(bool v) { take_line = v; }
 	bool get_take_line() const { return take_line; }
+	void set_rescue_seen(bool v) { rescue_seen = v; }
+	bool get_rescue_seen() const { return rescue_seen; }
+	void set_n_rescue_denied(i64 v) { n_rescue_denied = v; }
+	i64 get_n_rescue_denied() const { return n_rescue_denied; }
 	void set_take_edge(bool v) { take_edge = v; }
 	bool get_take_edge() const { return take_edge; }
 	void set_ug_guard(bool v) { ug_guard = v; }

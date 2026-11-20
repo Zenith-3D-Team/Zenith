@@ -13,6 +13,7 @@ extends SceneTree
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
+const TestEnv := preload("res://tests/test_env.gd")
 
 ## How far a corner's value may drift between the two ways, on average, by array.
 const PER_CORNER := {Mesh.ARRAY_NORMAL: 0.03}
@@ -23,16 +24,27 @@ var _surfaces_after := 0
 
 
 func _initialize() -> void:
+	TestEnv.isolate("model-load-test")  # configure() keeps its packs' copies check in user://
 	var names: Array = OS.get_cmdline_user_args()
+	if names == ["walls"]:  # the stone walls' layout alone
+		_wall_layout_check()
+		print("MODEL LOAD FAILS: %d" % _fails)
+		TestEnv.clean()
+		quit(1 if _fails > 0 else 0)
+		return
 	if names.is_empty():
-		for f in DirAccess.get_files_at("res://assets/models"):
-			if f.ends_with(".glb"):
-				names.append(f.get_basename())
-		# Models under their own licence, in subfolders (fue5/locomotive...).
-		for sub in ModelLibrary.MODEL_SUBDIRS:
-			for f in DirAccess.get_files_at("res://assets/models/" + sub):
+		# Every built-in pack's models (model_packs.gd BUILTIN), as <pack>/<name>.
+		for pack: String in ModelLibrary.ModelPacks.BUILTIN:
+			for f in DirAccess.get_files_at(ModelLibrary.ModelPacks.BUILTIN_DIR + pack):
 				if f.ends_with(".glb"):
-					names.append(sub + f.get_basename())
+					names.append(pack + "/" + f.get_basename())
+		print("MODEL LOAD: %d models in %d built-in packs" % [names.size(), ModelLibrary.ModelPacks.BUILTIN.size()])
+	else:
+		# A bare name is our own model (Wube3DP's, else Placeholders'), "<pack>/<name>" a pack's.
+		for i in names.size():
+			if not str(names[i]).contains("/"):
+				var wube := "wube3dp/" + str(names[i])
+				names[i] = wube if FileAccess.file_exists(ModelLibrary.ModelPacks.BUILTIN_DIR + wube + ".glb") else "placeholders/" + str(names[i])
 	# Both settings: merged materials (one surface per shader) and a surface per material.
 	for name in names:
 		_compare(str(name), true)
@@ -40,6 +52,7 @@ func _initialize() -> void:
 	ModelLibrary.merge_materials = true
 	if OS.get_cmdline_user_args().is_empty():
 		_edits_check()
+		_wall_layout_check()
 	_async_check()
 
 
@@ -50,7 +63,7 @@ func _fail(what: String) -> void:
 
 
 func _compare(name: String, combine: bool) -> void:
-	var res_path := "res://assets/models/%s.glb" % name
+	var res_path := ModelLibrary.ModelPacks.BUILTIN_DIR + name + ".glb"
 	var old_parts: Array = []
 	var root := (load(res_path) as PackedScene).instantiate()
 	var old := ModelLibrary._flatten(root, old_parts)
@@ -276,7 +289,8 @@ func _edits_check() -> void:
 	var kinds := {"albedo": TYPE_COLOR, "emission": TYPE_COLOR, "grime_color": TYPE_COLOR, "edge_color": TYPE_COLOR,
 		"rust_color": TYPE_COLOR, "dust_color": TYPE_COLOR, "part_weathering": TYPE_VECTOR4,
 		"part_light": TYPE_VECTOR2, "activity_glow": TYPE_BOOL, "part_colors": TYPE_BOOL, "glow_fades": TYPE_BOOL,
-		"skin_mode": TYPE_INT, "skin_tint2": TYPE_COLOR}
+		"skin_mode": TYPE_INT, "skin_tint2": TYPE_COLOR, "emission_from_paint": TYPE_BOOL,
+		"glow_keeps_albedo": TYPE_BOOL, "modeller_tex": TYPE_BOOL}
 	for u: String in MaterialRows.ROW_PARAMS:
 		var d: Variant = MaterialRows._defaults.get(u)
 		if typeof(d) != int(kinds.get(u, TYPE_FLOAT)):
@@ -284,29 +298,31 @@ func _edits_check() -> void:
 	if MaterialRows._defaults.get("grime_color") != Color(0.13, 0.11, 0.09) or not is_equal_approx(float(MaterialRows._defaults.get("grain", 0.0)), 0.08) \
 			or MaterialRows._defaults.get("part_weathering") != Vector4(0.4, 0.2, 0.6, 0.1) or MaterialRows._defaults.get("albedo") != Color(1, 1, 1, 1):
 		_fail("the row uniforms' defaults misread: %s" % MaterialRows._defaults)
-	# A tier's paint (express underground belt): the row recoloured, no sprite or part colours there.
-	var base := ModelLibrary.mesh_for("underground-belt-input")
-	var tier := ModelLibrary.mesh_for("express-underground-belt-input")
+	# A tier's paint: the row recoloured, no sprite or part colours there. Placeholders' express splitter is its
+	# splitter repainted (FUE5's, above it, has a model per tier), so both come from that pack.
+	var base := ModelLibrary.mesh_for("splitter@builtin:placeholders")
+	var tier := ModelLibrary.mesh_for("express-splitter@builtin:placeholders")
 	var bm := base.surface_get_material(0) as ShaderMaterial
 	var tm := tier.surface_get_material(0) as ShaderMaterial
 	var paint := _row_named(tm, ModelLibrary.TIER_MATERIAL)
 	if paint < 0 or MaterialRows.rows(bm).size() != MaterialRows.rows(tm).size():
-		_fail("the express underground's paint isn't a row of its one material (%d rows)" % MaterialRows.rows(tm).size())
+		_fail("the express splitter's paint isn't a row of its one material (%d rows)" % MaterialRows.rows(tm).size())
 	else:
-		var colour: Color = ModelLibrary.TIER_TINTS["express-underground-belt"][1]
+		var colour: Color = ModelLibrary.TIER_TINTS["express-splitter"][1]
 		var lin := colour.srgb_to_linear()
 		var a: Vector4 = _row(tm, paint)[0]
 		var flags := int((_row(tm, paint)[1] as Vector4).w)
 		var d: Vector4 = _row(tm, paint)[3]
 		if not Vector3(a.x, a.y, a.z).is_equal_approx(Vector3(lin.r, lin.g, lin.b)) or (flags & MaterialRows.FLAG_NO_SPRITE) == 0 or d.x != 0.0:
-			_fail("the express underground's paint row: albedo %s, flags %d, part colours %s" % [a, flags, d.x])
+			_fail("the express splitter's paint row: albedo %s, flags %d, part colours %s" % [a, flags, d.x])
 		for r in MaterialRows.rows(tm).size():
 			if r != paint and _row(tm, r) != _row(bm, r):
-				_fail("the express underground's row %d changed with the paint" % r)
+				_fail("the express splitter's row %d changed with the paint" % r)
 		if MaterialRows.rows(bm)[paint] == MaterialRows.rows(tm)[paint]:
 			_fail("the tier's paint row is the base's own material, not a copy")
-	# A belt's moving surface: its row flagged, the speed and chevron the model's.
-	var belt := ModelLibrary.mesh_for("fast-transport-belt").surface_get_material(0) as ShaderMaterial
+	# A belt's moving surface: its row flagged, the speed and chevron the model's (Wube3DP's, drawn slats:
+	# FUE5's, above it, is textured and never merged).
+	var belt := ModelLibrary.mesh_for("fast-transport-belt@builtin:wube3dp").surface_get_material(0) as ShaderMaterial
 	var moving := _row_named(belt, ModelLibrary.BELT_MATERIAL)
 	if moving < 0:
 		_fail("the fast belt's moving surface isn't a row")
@@ -334,6 +350,128 @@ func _edits_check() -> void:
 		_fail("the heating tower's remnant isn't burnt in every row (%d rows)" % MaterialRows.rows(burnt).size())
 	if not ModelLibrary.glows(ModelLibrary.mesh_for("heating-tower")):
 		_fail("the heating tower's fire doesn't count as glowing")
+
+
+## FUE5's stone walls laid out as the world draws them (world.gd _connect_wall's mask, model_name):
+## a ring, an L, a T, a cross, a lone wall and a 2x2 block. Every tile asks for the shape its
+## neighbours make and gets FUE5's file of that name (no other pack's piece mixed in); each piece
+## reaches the tile edges it joins and stops short of the others; its ends are closed (FUE5's cuts
+## were open underneath, so a lone pillar's, an end's and a corner's showed the inside); and an arm
+## across the hub (a corner's, a T's) runs over the hub's narrow top (it began past it: a gap).
+func _wall_layout_check() -> void:
+	var tiles := {}
+	for x in 5:
+		for y in 5:
+			if x == 0 or x == 4 or y == 0 or y == 4:
+				tiles[Vector2i(x, y)] = true
+	for i in 4:
+		tiles[Vector2i(8, i)] = true
+		tiles[Vector2i(8 + i, 3)] = true
+	for i in 5:
+		tiles[Vector2i(14 + i, 0)] = true
+		tiles[Vector2i(22, i)] = true
+		tiles[Vector2i(20 + i, 2)] = true
+	for i in range(1, 4):
+		tiles[Vector2i(16, i)] = true
+	tiles[Vector2i(27, 2)] = true
+	for d in [Vector2i(0, 0), Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 1)]:
+		tiles[Vector2i(30, 1) + d] = true
+	var steps := [Vector2i(0, -1), Vector2i(1, 0), Vector2i(0, 1), Vector2i(-1, 0)]
+	ModelLibrary.ModelPacks.configure("", [], [])
+	ModelLibrary.ModelPacks.wait()  # the built-in packs checked for copies of Factorio's files first
+	var shapes := {}
+	for t: Vector2i in tiles:
+		var mask := 0
+		for i in 4:
+			if tiles.has(t + steps[i]):
+				mask |= 1 << i
+		if mask & 6 == 6 and tiles.has(t + Vector2i(1, 1)):
+			mask |= 16
+		var name := ModelLibrary.model_name("stone-wall", "wall", {"wc": mask})
+		var path := ModelLibrary.ModelPacks.find(name, true)
+		if path != ModelLibrary.ModelPacks.BUILTIN_DIR + "fue5/" + name + ".glb":
+			_fail("wall at %s (mask %d): %s drawn from %s, not FUE5's" % [t, mask, name, path])
+		shapes[name] = mask
+	for name: String in shapes:
+		var load := ModelLibrary.Load.new()
+		load.path = ModelLibrary.ModelPacks.BUILTIN_DIR + "fue5/" + name + ".glb"
+		load.run()
+		if not load.ok:
+			_fail("%s: didn't parse" % name)
+			continue
+		var mesh := ModelLibrary._commit_load(load, [])
+		var mask: int = shapes[name]
+		var box := mesh.get_aabb()
+		# Sides north, east, south, west: glTF -z, +x, +z, -x. A fill block reaches past east and south.
+		var reach := [-box.position.z, box.end.x, box.end.z, -box.position.x]
+		for i in 4:
+			var joined := mask & (1 << i) != 0
+			if mask & 16 and (i == 1 or i == 2):
+				continue
+			if joined and absf(float(reach[i]) - 0.5) > 0.01:
+				_fail("%s: reaches %.3f towards side %d it joins, not the tile edge" % [name, float(reach[i]), i])
+			if not joined and float(reach[i]) > 0.45:
+				_fail("%s: reaches %.3f towards side %d it doesn't join" % [name, float(reach[i]), i])
+		var tris := PackedVector3Array()
+		var edges := {}
+		for j in mesh.get_surface_count():
+			var a := mesh.surface_get_arrays(j)
+			var v: PackedVector3Array = a[Mesh.ARRAY_VERTEX]
+			var ix := PackedInt32Array(a[Mesh.ARRAY_INDEX]) if a[Mesh.ARRAY_INDEX] != null else PackedInt32Array(range(v.size()))
+			for k in ix:
+				tris.append(v[k])
+			for k in range(0, ix.size(), 3):
+				for e in 3:
+					var p := Vector3i((v[ix[k + e]] * 1000.0).round())
+					var q := Vector3i((v[ix[k + (e + 1) % 3]] * 1000.0).round())
+					var key := "%s%s" % [p, q] if str(p) < str(q) else "%s%s" % [q, p]
+					if not edges.has(key):
+						edges[key] = [p, q, 0]
+					edges[key][2] += 1
+		# Open edges above the plate off the tile's edges (where the neighbour's piece meets this one):
+		# an end left open. A few hairline ones where the budget's decimation met a seam are let be.
+		var open := 0
+		for key: String in edges:
+			var entry: Array = edges[key]
+			if int(entry[2]) != 1:
+				continue
+			var p: Vector3i = entry[0]
+			var q: Vector3i = entry[1]
+			var on_edge := false
+			for c in [0, 2]:
+				if absi(absi(p[c]) - 500) <= 2 and absi(absi(q[c]) - 500) <= 2:
+					on_edge = true
+			if p.y > 150 and q.y > 150 and not on_edge:
+				open += 1
+		if open > 24:
+			_fail("%s: %d open edges on its ends (the inside shows)" % [name, open])
+		# A hub runs east-west when the piece joins east or west; an arm north or south then crosses it
+		# and must cover the hub's narrow top between its middle (0.1 out) and its end (0.272 out).
+		if mask & 10 != 0:
+			for i in [0, 2]:
+				if mask & (1 << i) == 0:
+					continue
+				# Straight down at the middle of that stretch: the wall's top, not the ground.
+				var at := Vector3(0.0, 0.0, -0.19 if i == 0 else 0.19)
+				var top := -1.0
+				for k in range(0, tris.size(), 3):
+					var y := _height_at(tris[k], tris[k + 1], tris[k + 2], at)
+					top = maxf(top, y)
+				if top < 1.0:
+					_fail("%s: nothing over the hub's top towards side %d: a gap at the joint" % [name, i])
+	print("WALL LAYOUT: %d wall shapes checked" % shapes.size())
+
+
+## The height where a vertical line through `at` (x, z) crosses triangle a b c, -1 when it misses.
+static func _height_at(a: Vector3, b: Vector3, c: Vector3, at: Vector3) -> float:
+	var d := (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z)
+	if absf(d) < 1e-9:
+		return -1.0
+	var u := ((b.z - c.z) * (at.x - c.x) + (c.x - b.x) * (at.z - c.z)) / d
+	var v := ((c.z - a.z) * (at.x - c.x) + (a.x - c.x) * (at.z - c.z)) / d
+	if u < 0.0 or v < 0.0 or u + v > 1.0:
+		return -1.0
+	return u * a.y + v * b.y + (1.0 - u - v) * c.y
 
 
 ## ready() starts a job and returns at once; poll() finishes it; the mesh is the one mesh_for gives.
@@ -383,4 +521,5 @@ func _async_check() -> void:
 	print("MODEL LOAD checked %d models | surfaces %d -> %d | ready() %d us | job done after %d polls | FAILS: %d"
 		% [_checked, _surfaces_before, _surfaces_after, asked_usec, frames, _fails])
 	print("MODEL LOAD FAILS: %d" % _fails)
+	TestEnv.clean()
 	quit(1 if _fails > 0 else 0)

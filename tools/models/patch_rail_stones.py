@@ -11,7 +11,7 @@ import pathlib
 import struct
 import sys
 
-MODELS = pathlib.Path(__file__).resolve().parents[2] / "client" / "assets" / "models"
+import packs
 LIFT = 0.012  # tiles the light stones go up
 COLOR = {"stone_ballast_light": [0.230, 0.195, 0.147, 1.0]}  # linear (rails.py #847a6b); the bed is 0.156, 0.117, 0.074
 ROUGH = {"steel_light": 0.7, "steel_rail": 0.55}
@@ -69,5 +69,5 @@ def patch(path, dry):
 
 if __name__ == "__main__":
     dry = "--dry-run" in sys.argv
-    n = sum(patch(p, dry) for p in sorted(MODELS.glob("*rail*.glb")))
+    n = sum(patch(pathlib.Path(p), dry) for p in packs.glbs() if "rail" in pathlib.Path(p).name)
     print(n, "models", "(dry run)" if dry else "patched")

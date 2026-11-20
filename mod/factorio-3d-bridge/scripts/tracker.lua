@@ -99,6 +99,17 @@ end
 
 -- Functions called with each entity built, changed or removed (map.lua forgets its charts there).
 M.listeners = {}
+-- Functions called with an entity whose settings were set again (pasted, its window closed, Zenith's own screen):
+-- belt_sim.lua wakes the belts after a splitter (quiet_pc).
+M.configure_listeners = {}
+
+function M.configured(entity)
+  if entity and entity.valid then
+    for _, f in ipairs(M.configure_listeners) do
+      f(entity)
+    end
+  end
+end
 
 local function tell(entity)
   world.touched(entity)
@@ -179,6 +190,21 @@ end
 function M.removing(entity)
   if entity and entity.valid then
     tell(entity)
+  end
+end
+
+-- (/f3d-perf mined_neighbours) An entity the bridge itself is about to remove where Factorio raises nothing (a
+-- player-less character's mining): the pipes and belts beside it change shape once it is gone, so they are looked
+-- at next tick, as M.removed has them. Should the mining fail, they are only sent again as they are.
+function M.neighbours_change(entity)
+  if not (entity and entity.valid) then
+    return
+  end
+  fluid_neighbours_changed(entity, true)
+  if BELT_TYPES[entity.type] and watched(entity) then
+    local s = storage.f3d
+    local p = entity.position
+    s.belt_refresh[#s.belt_refresh + 1] = { surface = entity.surface.index, x = p.x, y = p.y }
   end
 end
 
@@ -403,6 +429,7 @@ function M.register()
     alt_mode.check(event.destination)
     if event.destination then
       belt_switch.configured(event.destination)
+      M.configured(event.destination)
     end
     if event.destination and event.destination.valid then
       world.bump(event.destination.surface.index, event.destination.position)
@@ -418,6 +445,7 @@ function M.register()
     if event.entity then
       alt_mode.check(event.entity)
       belt_switch.configured(event.entity)
+      M.configured(event.entity)
       if event.entity.valid then
         world.bump(event.entity.surface.index, event.entity.position)
       end

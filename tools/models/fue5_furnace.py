@@ -13,7 +13,7 @@ It bakes the model's occlusion again at the end (bake_glb.py), for the new shape
 - The atlas graded towards Factorio's colours: the loud blue to the sprite's dull steel and the
   front's dark teal, the rust cone to weathered steel, bright orange trim to rust.
 
-The result stays under FUE5's licence (CC BY-NC-SA 3.0, fue5/README.md).
+The result stays under FUE5's licence (CC BY-NC-SA 3.0, packs/fue5/README.md).
 """
 
 import colorsys
@@ -25,8 +25,10 @@ import struct
 import numpy as np
 from PIL import Image, ImageDraw
 
+import packs
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-PATH = os.path.join(os.path.dirname(os.path.dirname(HERE)), "client", "assets", "models", "fue5", "electric-furnace.glb")
+PATH = packs.fue5_path("electric-furnace")
 SQUASH_FROM, SQUASH = 0.9, 0.68      # above this height the back west part keeps this share of its height
 WINDOW = ((-0.55, 0.05, 0.75), (0.9, 0.95, 1.3))
 # The grille box (x, height, south), and where its faces come from in the atlas (u0, v0, u1, v1).

@@ -3,10 +3,10 @@
     blender --background --factory-startup --python tools/models/nature/build_nature.py -- [names...]
         [--out DIR] [--preview FILE.png]
 
-With no names it builds all of them. Output goes to client/assets/models/<name>.glb unless
---out says otherwise. --preview also renders the models lined up on a tile grid, for a quick
-look without starting the client. Each model is seeded from its name, so rebuilding gives
-identical files.
+With no names it builds all of them. Output goes to the model's pack (tools/models/packs.py:
+client/assets/models/packs/placeholders/<name>.glb) unless --out says otherwise. --preview also
+renders the models lined up on a tile grid, for a quick look without starting the client. Each
+model is seeded from its name, so rebuilding gives identical files.
 
 After adding new .glb files, import them: `godot --headless --path client --import`.
 
@@ -30,7 +30,8 @@ sys.path.insert(0, os.path.dirname(HERE))  # tools/models, for bake.py
 import bpy  # noqa: E402
 from mathutils import Vector  # noqa: E402
 
-REPO = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
+import packs  # noqa: E402
+
 TRI_BUDGET = 3000
 
 
@@ -43,7 +44,7 @@ def clear_scene():
 
 def parse_args(argv):
     argv = argv[argv.index("--") + 1:] if "--" in argv else []
-    names, out, preview = [], os.path.join(REPO, "client", "assets", "models"), None
+    names, out, preview = [], None, None  # out None: each model's pack
     it = iter(argv)
     for a in it:
         if a == "--out":
@@ -130,13 +131,14 @@ def main():
     if unknown:
         raise SystemExit("unknown model(s): %s (known: %s)" % (", ".join(unknown), ", ".join(registry_)))
     names = names or list(registry_)
-    os.makedirs(out, exist_ok=True)
+    if out:
+        os.makedirs(out, exist_ok=True)
     clear_scene()
     built = []
     over = []
     for name in names:
         obj, tris = build(name, registry_)
-        export(obj, os.path.join(out, name + ".glb"))
+        export(obj, os.path.join(out, name + ".glb") if out else packs.out_path(name))
         lo = Vector([min(v.co[i] for v in obj.data.vertices) for i in range(3)])
         hi = Vector([max(v.co[i] for v in obj.data.vertices) for i in range(3)])
         print("%-22s %5d tris  x %5.2f..%5.2f  y %5.2f..%5.2f  z %5.2f..%5.2f"
@@ -144,7 +146,7 @@ def main():
         if tris > TRI_BUDGET:
             over.append(name)
         built.append(obj)
-    print("built %d model(s) into %s" % (len(built), out))
+    print("built %d model(s) into %s" % (len(built), out or packs.PACKS_DIR))
     print("next, part colours from the sprites: python tools/models/part_colors.py %s" % " ".join(names))
     if over:
         print("OVER BUDGET (%d tris): %s" % (TRI_BUDGET, ", ".join(over)))

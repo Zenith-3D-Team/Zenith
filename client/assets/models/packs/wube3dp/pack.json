@@ -1,0 +1,10 @@
+{
+	"name": "Wube3DP (Adapted)",
+	"short_name": "Wube3DP",
+	"author": "Wube Software, converted by Zenith's tools/models/wube.py",
+	"licence": "CC BY-NC",
+	"credit": "© Wube Software · CC BY-NC · adapted",
+	"description": "Wube's official 3D-printable Factorio models (Friday Facts #447): belts, undergrounds, chests, inserters, furnaces, the assembling machine 1, the electric mining drill, the small pole, walls, the character, biters, spitters and the spawner, scaled and coloured to Factorio's sprites. Not for commercial use; CREDITS.md lists every model and its source files.",
+	"icon": "assembling-machine-1",
+	"icon_image": "factorio:data/core/graphics/wube-logo.png"
+}

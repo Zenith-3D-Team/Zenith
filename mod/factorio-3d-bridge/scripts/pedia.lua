@@ -510,6 +510,24 @@ function M.entity_page(name, e, d)
     table.sort(can)
     d.can_mine = capped(can)
   end
+  -- A resource (L6): the mining drills that mine it (Factorio's "Mined by") and, for an infinite one,
+  -- its normal amount (its yield is the amount over that: crude oil's 100% at 300,000).
+  local own_cat = d.type == "resource" and get(e, "resource_category")
+  if own_cat then
+    local by = {}
+    for dname, dr in pairs(table_of("entity")) do
+      local cats = get(dr, "type") == "mining-drill" and get(dr, "resource_categories")
+      if cats and cats[own_cat] and not hidden(dr) then
+        by[#by + 1] = dname
+      end
+    end
+    table.sort(by)
+    d.mined_by = capped(by)
+    if get(e, "infinite_resource") then
+      d.rinf = 1
+      d.rnormal = get(e, "normal_resource_amount")
+    end
+  end
   local lab_inputs = get(e, "lab_inputs")
   d.packs = lab_inputs and names_of(lab_inputs) or nil
   local burner = get(e, "burner_prototype")

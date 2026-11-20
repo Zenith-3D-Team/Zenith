@@ -6,6 +6,10 @@ extends RefCounted
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const TerrainShader := preload("res://shaders/terrain.gdshader")
 const WaterShader := preload("res://shaders/water.gdshader")
+## The ground's render layer: terrain and water, flat decoratives and their grass. Every
+## light reaches it but a look's fill light (looks.gd fill_light), which lights what stands on the ground, as Factorio
+## lights its sprites, and leaves the ground's light and shadows the sun's and the ambient's.
+const GROUND_LAYER := 1 << 16
 
 ## Placeholder height in tiles, by entity type.
 const HEIGHTS := {
@@ -113,6 +117,10 @@ static func terrain_material() -> ShaderMaterial:
 		_terrain_material.shader = TerrainShader
 		if "--relief-fade=off" in OS.get_cmdline_user_args():
 			_terrain_material.set_shader_parameter("relief_fades", false)
+		# --ground-rough=off: 0.2.2's one roughness and specular for natural ground and one for floors,
+		# not each tile family's own (terrain_textures.gd SURFACES).
+		if "--ground-rough=off" in OS.get_cmdline_user_args():
+			_terrain_material.set_shader_parameter("per_tile_surface", false)
 	return _terrain_material
 
 

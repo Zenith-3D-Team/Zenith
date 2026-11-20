@@ -32,6 +32,8 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, HERE)
+sys.path.append(os.path.dirname(HERE))  # tools/models, after nature/ (both have a score.py)
+import packs  # noqa: E402
 import raster  # noqa: E402
 import tree_sprites as ts  # noqa: E402
 
@@ -48,7 +50,7 @@ def _r(x, k=3):
 
 
 def model_points(name):
-    m = raster.Model(os.path.join(raster.MODELS, name + ".glb"))
+    m = raster.Model(packs.model_path(name))
     return m.p.reshape(-1, 3)
 
 
@@ -101,7 +103,7 @@ def tree_entry(name, proto):
     for v in vars_:
         if v["fallen"]:
             if points is None:
-                points = model_points(name if os.path.exists(os.path.join(raster.MODELS, name + ".glb")) else "tree-" + t)
+                points = model_points(name if os.path.exists(packs.model_path(name)) else "tree-" + t)
             shapes.append(fallen_shape(points, t, v["letter"]))
             continue
         up = v["leaves"][3] / ah

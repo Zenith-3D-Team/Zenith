@@ -43,11 +43,22 @@ import mock_enemy_showcase
 import mock_logistics
 import mock_shots
 import mock_mod_gfx
+import mock_link
 
 import mock_info
+import protocol
 
 PROTOCOL = 1
 TICKS_PER_SECOND = 60
+
+
+def binary_version(v):
+    """The binary wire version sent a client whose hello says `bin` (session.lua's binary_version), or None."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 1:
+        return int(min(v, protocol.WIRE_VERSION))  # (min first: a hello's Infinity)
+    return None
+
+
 CHUNK = 32
 BYTES_PER_TICK = 32768
 CHUNKS_PER_TICK = 2
@@ -57,6 +68,9 @@ MAX_BACKLOG = 64
 PHOTO_FACTOR = 4
 PHOTO_BACKLOG = 256
 PHOTO_LAPSE = 900
+# Chunks the client keeps (`kept`, world.lua MAX_KEPT, KEPT_PER_TICK): noted at most, counted a tick.
+MAX_KEPT = 2048
+KEPT_PER_TICK = 16
 ENTITIES_PER_MESSAGE = 120
 DECORATIVES_PER_MESSAGE = 1000  # 4 numbers each, as the mod
 RECORDS_PER_MESSAGE = 80
@@ -600,6 +614,9 @@ EPROPS = [
     [EID["assembling-machine-2"], 0, 0, 0, {"fb": [[0, -1, 0, "i"], [0, 1, 8, "o"]], "fo": 1}],
     [EID["boiler"], 0, 0, 0, {"fb": [[-1, 0.5, 12, "b"], [1, 0.5, 4, "b"], [0, -0.5, 0, "o"]]}],
     [EID["steam-engine"], 0, 0, 0, {"fb": [[0, 2, 8, "b"], [0, -2, 0, "b"]]}],
+    # A storage tank's pipeline joins (`fj`, N9's marks; no arrows), as 2.1's four connections.
+    *([[EID["storage-tank"], 0, 0, 0, {"fj": [[-1, -1, 0, "b"], [1, 1, 4, "b"], [1, 1, 8, "b"], [-1, -1, 12, "b"]]}]]
+      if "storage-tank" in EID else []),
     # Circuit wire reach (get_max_circuit_wire_distance) of what can take a circuit wire.
     *[[EID[n], 0, 0, 0, {"cw": 9}] for n in ("constant-combinator", "arithmetic-combinator", "decider-combinator",
                                              "selector-combinator", "small-lamp", "programmable-speaker", "display-panel",
@@ -612,6 +629,23 @@ EPROPS = [
     *([[EID["offshore-pump"], 0, 0, 0, {"tb": [[-0.4, -0.4, 0.4, 0.4, "g", "w"], [-1, -2, 1, -1, "w", ""]]}]]
       if "offshore-pump" in EID else []),
 ]
+
+
+def _overlay(name):
+    """The overlay dict of an EPROPS entry, made if it has none."""
+    for rec in EPROPS:
+        if rec[0] == EID[name] and len(rec) == 5:
+            return rec[4]
+    rec = [EID[name], 0, 0, 0, {}]
+    EPROPS.append(rec)
+    return rec[4]
+
+
+# L8: what each drill mines and that it needs a resource under it, each ore's category (`rk`, `rr`), as 2.1 sends them.
+for _n in ("electric-mining-drill", "burner-mining-drill"):
+    _overlay(_n).update(rk=["basic-solid"], rr=1)
+for _n in ("iron-ore", "copper-ore", "coal", "stone"):
+    _overlay(_n)["rk"] = "basic-solid"
 
 
 def alt_sequence(kind, width, shift=(0, 0.7), scale=0.5, per_row=None, rows=None, sep=1.1, lift=-0.1):
@@ -634,6 +668,11 @@ ALT_LAYOUT = {
     "oil-refinery": ([0, -0.3, 2], [alt_sequence("m", 5, (0, 1.25))]),
     "lab": (None, [alt_sequence("m", 3, (0, 0.9)), alt_sequence("l", 3, (0, 0), per_row=6, sep=0.909)]),
     "beacon": (None, [alt_sequence("m", 3, (0, 0), per_row=2, lift=-0.3)]),
+    # K1's leftover: an ammo turret's ammo and a locomotive's fuel (2.1's gun turret and locomotive list them).
+    "gun-turret": (None, [alt_sequence("a", 2, (0, -0.25))]),
+    "locomotive": (None, [alt_sequence("f", 2, (0, 0.3), per_row=3, rows=4)]),
+    # A cargo wagon's most-stacked kinds in one row along it (alt_mode.lua's stock_sequences "c").
+    "cargo-wagon": (None, [alt_sequence("c", 2, (0, 0), per_row=4, rows=1)]),
     "stone-furnace": ([0, -0.1, 0.66], None),
     "steel-furnace": ([0, -0.1, 0.66], None),
     "inserter": ([0, 0, 0.5], None),
@@ -667,6 +706,34 @@ DECORATIVE_PROTOS = ["green-carpet-grass", "green-hairy-grass", "green-small-gra
 DID = {name: i + 1 for i, name in enumerate(DECORATIVE_PROTOS)}
 FID = {p[0]: i + 1 for i, p in enumerate(FLUID_PROTOS)}
 IID = {name: i + 1 for i, name in enumerate(ITEM_PROTOS)}
+# `steps` (step 5 task 3a): the steps' sounds as the bridge's data stage lists them from Factorio 2.1's own
+# prototypes (vanilla with Space Age), for the mock's tiles, rails, ores and decoratives: [prefix, volume x 100,
+# variations]. Water, deep water, lava and the ammoniacal ocean have no walking sound (0: silent).
+STEP_SOUND_LIST = [
+    ["base/sound/walking/grass", 80, 10], ["base/sound/walking/sand", 80, 9], ["base/sound/walking/concrete", 50, 11],
+    ["space-age/sound/walking/soft-sand", 100, 10], ["space-age/sound/walking/rocky-stone", 80, 10],
+    ["base/sound/walking/resources/oil", 100, 7], ["base/sound/walking/shallow-water", 100, 7],
+    ["space-age/sound/walking/semi-wet-rock", 70, 10], ["space-age/sound/walking/icy-snow", 80, 10],
+    ["space-age/sound/walking/smooth-ice", 80, 9], ["base/sound/walking/dirt-1", 80, 10],
+    ["base/sound/walking/resources/ore", 70, 10], ["base/sound/walking/rails/rails", 60, 12],
+    ["base/sound/walking/decorative-grass", 20, 10],
+    ["base/sound/walking/decorative-grass", 30, 10], ["base/sound/walking/plant/plant", 40, 5],
+    ["base/sound/walking/pebble/stones", 60, 9], ["core/sound/walking/transport-belt", 60, 9],
+    ["core/sound/walking/heat-pipe", 70, 5],
+    ["base/sound/nightvision-on", 50, 1], ["base/sound/nightvision-off", 50, 1],
+]
+STEP_TILES = {"grass-1": 1, "grass-2": 1, "dirt-1": 2, "sand-1": 2, "water": 0, "deepwater": 0, "stone-path": 3, "concrete": 3,
+              "space-platform-foundation": 3, "empty-space": 0, "volcanic-ash-flats": 4, "lava": 0, "lava-hot": 0,
+              "fulgoran-rock": 5, "oil-ocean-shallow": 6, "wetland-yumako": 7, "lowland-olive-blubber": 8, "snow-flat": 9,
+              "ice-smooth": 10, "ammoniacal-ocean": 0, "hazard-concrete-left": 3, "hazard-concrete-right": 3, "landfill": 11}
+STEP_ENTITIES = {"iron-ore": 12, "copper-ore": 12, "coal": 12, "stone": 12, "straight-rail": 13, "curved-rail-a": 13,
+                 "curved-rail-b": 13}
+STEP_DECORATIVES = {"green-carpet-grass": 14, "green-hairy-grass": 15, "green-small-grass": 14, "brown-asterisk": 16,
+                    "red-asterisk": 1, "green-bush-mini": 16, "small-rock": 17, "tiny-rock": 17}
+STEPS = {"part": 1, "parts": 1, "s": STEP_SOUND_LIST, "u": [18, 19], "nv": [20, 21],
+         "tl": [[TID[n], i] for n, i in STEP_TILES.items()],
+         "el": [[EID[n], i] for n, i in STEP_ENTITIES.items() if n in EID],
+         "dl": [[DID[n], i] for n, i in STEP_DECORATIVES.items()]}
 
 
 
@@ -773,7 +840,7 @@ class MockGame(mock_info.InfoMixin):
         self.rseq = 0
         self.outbox = []
         self.batches = {}  # client address -> [datagrams waiting to be joined, bytes] (send_raw)
-        self.subs, self.queue = {}, []
+        self.subs, self.queue, self.kept_queue = {}, [], []
         self.focus = (0.0, 0.0, 48.0)
         self.remote_view = False  # focus rv = 1: movers only where radars or the character see
         self.generated = set()
@@ -797,6 +864,7 @@ class MockGame(mock_info.InfoMixin):
         self.guns_sig = None
         self.inv_sig = None
         self.layout = [None] * MAIN_SLOTS  # the main inventory's slots as the client arranged them
+        self.pay_slot = 0  # L7: the slot (1-based) the client's hand held the last item spent from (`hs`)
         self.slots_sig = self.craftable_sig = None
         self.quickbar = {"page": 1, "sel": 0, "items": [""] * QUICKBAR_SIZE}
         self.researched, self.research, self.research_queue, self.research_progress = {"automation"}, None, [], 0
@@ -1017,7 +1085,8 @@ class MockGame(mock_info.InfoMixin):
             self.add(Entity(0, "cliff", 4 * i + 2, 4 * 11 + 2.5, 0, {"co": co}))
 
     def build_alt_icons(self):
-        """--alt-icons: machines with modules and a lab with packs north of the start (K1, K2)."""
+        """--alt-icons: machines with modules and a lab with packs north of the start (K1, K2), then two gun
+        turrets with ammo and one without (the train's locomotive carries its fuel)."""
         row = [
             ("assembling-machine-3", 8.5, {"recipe": "iron-gear-wheel", "inv": {"input": {"iron-plate": 20}, "output": {},
                                                                            "modules": {"speed-module": 2, "productivity-module": 2}}, "mods": 4}),
@@ -1032,6 +1101,15 @@ class MockGame(mock_info.InfoMixin):
             m = {"recipe": None, "progress": 0}
             m.update(copy.deepcopy(insides))
             self.machines[e.unit] = m
+        # A drill with a fluid box (the bridge's alt_mode.lua: its fluids_count, as over uranium ore's sulfuric acid):
+        # `fa` 1, so the client draws a pack's `-wet` model over it.
+        wet = Entity(self._unit(), "electric-mining-drill", 16.5, -16.5, 0, {"fa": 1})
+        self.add(wet)
+        self.machines[wet.unit] = {"recipe": None, "progress": 0}
+        for x, ammo in ((24.0, {"firearm-magazine": 10}), (27.0, {"piercing-rounds-magazine": 6}), (30.0, {})):
+            e = Entity(self._unit(), "gun-turret", x, -12.0, 0)
+            self.add(e)
+            self.machines[e.unit] = {"recipe": None, "progress": 0, "inv": {"turret_ammo": dict(ammo)}}
 
     def build_starter_base(self):
         add = lambda name, x, y, d=0, extra=None: self.add(Entity(self._unit(), name, x, y, d, extra))
@@ -1086,6 +1164,11 @@ class MockGame(mock_info.InfoMixin):
         for i in range(4):
             pipe = add("pipe", -10.5, -11.5 - i)
             self.fluids[pipe.unit] = [("water", 100 - 5 * i, 100, 15)]
+        # N9: a pipeline over Factorio's extent (L11), standing in for a 340-tile one: its pipes answer hinfo
+        # with pl [340, 320] and ox, and the alert's pipeline icon is on the one nearest the cut, so the
+        # client's pipeline visualization draws it red without Factorio.
+        self.overextended = [add("pipe", -24.5 + i, -17.5) for i in range(12)]
+        self.overextended_cut = self.overextended[8]
         # Heat pipes cooling off away from a (missing) reactor, and a lamp nobody wired up.
         self.heat = {add("heat-pipe", -16.5 - i, -12.5).unit: 600 - 40 * i for i in range(4)}
         self.unplugged = add("small-lamp", -6.5, -14.5)
@@ -1144,7 +1227,7 @@ class MockGame(mock_info.InfoMixin):
                     self.platform["hub"] = e.unit
         p = self.player
         p.update(x=float(x), y=float(y), walk=None, mining=None, mine_at=None, pickup=None, shoot=None)
-        self.subs, self.queue = {}, []
+        self.subs, self.queue, self.kept_queue = {}, [], []
         self.screen = None
         if self.altc is not None:
             self.altc["sent"], self.altc["msent"] = {}, {}  # Alt-mode's icons are sent again on the new surface
@@ -1674,7 +1757,7 @@ class MockGame(mock_info.InfoMixin):
                                 "bx": ax + 20 - (i % 40), "by": ay - 30 + (i % 7) * 9, "phase": i * 13})
 
     def build_robot_swarm(self, count, cx=-3.0, cy=0.5):
-        """--robots N: N robots flying round the start (the frame rate with many robots in view):
+        """--robots N: N robots flying round the start (G3: the frame rate with many robots in view):
         logistic robots shuttling (carrying plates on the way out, `rc`), construction robots
         shuttling and one in twenty hovering in place, working."""
         for i in range(count):
@@ -1702,7 +1785,7 @@ class MockGame(mock_info.InfoMixin):
 
     def lay_item_showcase(self, x0, y0, names, per_row=16, gap=0.6):
         """--item-showcase: one of every item in a grid on the ground, for looking at the item
-        models (client/assets/models/items/) side by side."""
+        models (client/assets/models/packs/placeholders/items/) side by side."""
         for i, name in enumerate(names):
             self.ground.append([name, x0 + (i % per_row) * gap, y0 + (i // per_row) * gap])
 
@@ -1839,29 +1922,33 @@ class MockGame(mock_info.InfoMixin):
         if self.client is None:
             return 0
         msg["k"] = self.tick
-        data = json.dumps(msg, separators=(",", ":")).encode()
         addr = self.client["addr"]
+        # A client whose hello says bin gets binary frames, as from transport.lua: mv in binary (bs and bfar
+        # too from wire version 2; chunk, ents, st and ih from 3), anything else as its JSON text in a frame
+        # (protocol.encode_message).
+        binary = self.client.get("bin") or 0
+        data = protocol.encode_message(msg, binary) if binary else json.dumps(msg, separators=(",", ":")).encode()
         if self.client.get("b") and len(data) < BATCH_BYTES:
             # A client whose hello says b gets the tick's messages joined by newlines, like the mod's
             # transport.lua (sending a datagram costs Factorio about a millisecond).
             batch = self.batches.get(addr)
-            if batch and batch[1] + len(data) + 1 > BATCH_BYTES:
+            if batch and (batch[2] != binary or batch[1] + len(data) + 1 > BATCH_BYTES):
                 self.send_batch(addr)
                 batch = None
             if batch is None:
-                batch = self.batches[addr] = [[], 0]
+                batch = self.batches[addr] = [[], 2 if binary else 0, binary]
             batch[0].append(data)
-            batch[1] += len(data) + 1
+            batch[1] += len(data) + (0 if binary else 1)
             return len(data)
         self.send_batch(addr)
         if self.rng.random() >= self.drop:
-            self.sock.sendto(data, addr)
+            self.sock.sendto(protocol.encode_datagram([data], binary) if binary else data, addr)
         return len(data)
 
     def send_batch(self, addr):
         batch = self.batches.pop(addr, None)
         if batch and self.rng.random() >= self.drop:
-            self.sock.sendto(b"\n".join(batch[0]), addr)
+            self.sock.sendto(protocol.encode_datagram(batch[0], batch[2]) if batch[2] else b"\n".join(batch[0]), addr)
 
     def send_now(self, msg):
         self.send_raw(msg)
@@ -1915,7 +2002,7 @@ class MockGame(mock_info.InfoMixin):
 
     def handshake(self):
         self.rseq, self.outbox = 0, []
-        self.subs, self.queue = {}, []
+        self.subs, self.queue, self.kept_queue = {}, [], []
         self.altc = None  # a client in Alt-mode says `altc` again after the welcome
         p = self.player
         welcome = self.surface_fields({"t": "welcome", "v": PROTOCOL, "mod": "mock", "u": p["unit"],
@@ -1923,6 +2010,9 @@ class MockGame(mock_info.InfoMixin):
                                        "mods": {"base": "2.1.24", "factorio-3d-bridge": "mock"}})
         if getattr(self, "mod_gfx", None):
             self.mod_gfx.welcome_fields(welcome)
+        mock_link.welcome_fields(welcome)
+        if self.client and self.client.get("bin"):
+            welcome["bin"] = self.client["bin"]
         self.send_reliable(welcome)
         recs = []
         for name, etype, w, h, color in ENTITY_PROTOS:
@@ -1936,6 +2026,7 @@ class MockGame(mock_info.InfoMixin):
                                     for name in ITEM_PROTOS])
         self.send_reliable({"t": "ready"})
         self.send_reliable({"t": "eprops", "l": EPROPS})
+        self.send_reliable({"t": "steps", **STEPS})
         self.send_reliable({"t": "quals", "l": [["normal", 0, 1, "cccccc"], ["uncommon", 1, 1, "33e633"], ["rare", 2, 0, "1a66ff"],
                                                 ["epic", 3, 0, "b23aff"], ["legendary", 5, 0, "ff7f00"]]})
         self.send_item_uses()
@@ -2063,6 +2154,9 @@ class MockGame(mock_info.InfoMixin):
 
     def handle_message(self, msg, addr):
         t = msg.get("t")
+        if t in ("build", "drop", "tile", "throw", "fast", "repair"):
+            hs = msg.get("hs", 0)  # the held stack's slot: what this spends leaves it first (main_slots)
+            self.pay_slot = hs if isinstance(hs, int) and not isinstance(hs, bool) else 0
         if t == "gfx":
             if getattr(self, "mod_gfx", None):
                 self.mod_gfx.ask(msg)
@@ -2075,7 +2169,7 @@ class MockGame(mock_info.InfoMixin):
                                "chat_at": self.tick + 240,
                                "z": msg.get("z") == 1, "dc": msg.get("dc") == 1, "b": msg.get("b") == 1,
                                "bl": msg.get("bl") == 1, "bs": msg.get("bs") == 1, "mg": msg.get("mg") != 0,
-                               "lv": msg.get("lv") == 1, "dd": msg.get("dd")}
+                               "lv": msg.get("lv") == 1, "dd": msg.get("dd"), "bin": binary_version(msg.get("bin"))}
                 self.lanes, self.bs_lanes, self.bs_next = {}, {}, {}
                 self.rate, self.rate_from, self.rate_at = 0, 0, -10 ** 9
                 self.photo_until = None
@@ -2090,6 +2184,7 @@ class MockGame(mock_info.InfoMixin):
                 self.client["bl"] = msg.get("bl") == 1
                 self.client["bs"] = bs
                 self.client["lv"] = msg.get("lv") == 1  # told the counts of chunks it keeps (`kept`)
+                self.client["bin"] = binary_version(msg.get("bin"))  # binary frames (send_raw)
                 # How far it draws decoratives (`dd`): the bridge leaves out the chunks past it (dec_distance);
                 # the mock, whose world is small, sends every chunk's as a bridge before it did.
                 self.client["dd"] = msg.get("dd")
@@ -2113,6 +2208,8 @@ class MockGame(mock_info.InfoMixin):
         if t == "set_section" and int(msg.get("u", 0) or 0) == 0:
             self.char_section(msg)
             return
+        if mock_link.command(self, t, msg):
+            return
         if mock_machines.command(self, t, msg):
             return
         if mock_vehicles.command(self, t, msg):
@@ -2131,20 +2228,21 @@ class MockGame(mock_info.InfoMixin):
                 wanted = [(int(c[0]), int(c[1])) for c in msg.get("c", []) if isinstance(c, list) and len(c) >= 2]
             old = self.subs
             self.subs = {c: True for c in wanted}
-            # As world.lua's `kept` (I18): chunks that left, sent and not queued, with the counts the
-            # client's copy matches (here at once: the mock's counts are its content's checksum).
+            # As world.lua's `kept` (I18): chunks that left, sent and not queued, noted now (at most
+            # MAX_KEPT waiting) and counted KEPT_PER_TICK a tick (tick_kept), as the bridge spreads them:
+            # counting a screenshot's 4,000 at once held the mock for seconds, past the client's timeout (L14).
             if self.client and self.client.get("lv"):
-                kept = []
+                queued = set(self.queue)
                 for c in old:
-                    if c not in self.subs and c not in self.queue and c in self.generated:
-                        _, records, si, rv = self.chunk_content(*c)
-                        kept += [c[0], c[1], rv, len(records)]
-                if kept:
-                    self.send_reliable({"t": "kept", "rs": self.surface_index(), "l": kept})
+                    if c not in self.subs and c not in queued and c in self.generated \
+                            and len(self.kept_queue) < MAX_KEPT:
+                        self.kept_queue.append((c, self.surface_index()))
             self.queue = [c for c in self.queue if c in self.subs]
+            queued = set(self.queue)  # (a list looked through for each of a 101 x 101 square's chunks took seconds)
             for c in wanted:
-                if c not in old and c not in self.queue:
+                if c not in old and c not in queued:
                     self.queue.append(c)
+                    queued.add(c)
             # The client's kept chunks it subscribes to again: [si, cx, cy, rv, n].
             self.have = {}
             for h in msg.get("h", []) if isinstance(msg.get("h"), list) else []:
@@ -2184,7 +2282,7 @@ class MockGame(mock_info.InfoMixin):
         elif t == "walk":
             d, a = msg.get("d", -1), msg.get("a")
             if isinstance(a, (int, float)) and 0 <= a < 1000 and not (isinstance(d, (int, float)) and d < 0):
-                # Any angle, stepped between its two 8-way neighbours as the mod does
+                # B7: any angle, stepped between its two 8-way neighbours as the mod does
                 w = p["walk"]
                 err = w[3] if w and len(w) > 2 and self.tick <= w[1] else 0.0
                 p["walk"] = [w[0] if w else 0, self.tick + HOLD_TICKS, int(a), err]
@@ -2201,6 +2299,8 @@ class MockGame(mock_info.InfoMixin):
             self.repair_cmd(msg)
         elif t == "pickup":
             p["pickup"] = self.tick + HOLD_TICKS
+        elif t == "pickup_stop":
+            p["pickup"] = None  # F let go: picks nothing more (puppet.lua M.pickup_stop)
         elif t == "enter":
             self.enter()
         elif t == "drive":
@@ -2274,6 +2374,8 @@ class MockGame(mock_info.InfoMixin):
             self.send_now({"t": "unghost", "q": int(msg.get("q", 0)), "n": 1 if hit is not None else 0})
         elif t == "hinfo":
             self.send_now(self.hover_info(msg))
+        elif t == "rpatch":
+            self.send_now(self.resource_patch(msg))
         elif t == "view":
             # session.lua's view: the remote view looks at another surface. The mock moves its one
             # world there (and the character with it, unlike the mod) and back on si 0.
@@ -2328,7 +2430,7 @@ class MockGame(mock_info.InfoMixin):
                 reply["all"] = 1
             self.send_now(reply)
         elif t == "mrp":
-            # map.lua's roboport listing: every roboport on the surface, in one part here.
+            # map.lua's roboport listing (H13): every roboport on the surface, in one part here.
             si = msg.get("si") if isinstance(msg.get("si"), int) else self.surface_index()
             ports = []
             if si == self.surface_index():
@@ -2336,7 +2438,7 @@ class MockGame(mock_info.InfoMixin):
                     ports += [fixed(x), fixed(y), fixed(lr), fixed(cr)]
             self.send_now({"t": "mrp", "si": si, "q": (int(msg["q"]) if isinstance(msg.get("q"), int) else 0), "part": 1, "last": 1, "l": ports})
         elif t == "lpad":
-            # Where the map centres on switching to a planet: its landing pad.
+            # Where the map centres on switching to a planet (H23): its landing pad.
             si = msg.get("si") if isinstance(msg.get("si"), int) else 0
             out = {"t": "lpad", "si": si, "q": (int(msg["q"]) if isinstance(msg.get("q"), int) else 0)}
             if si == self.surface_index():
@@ -2473,10 +2575,8 @@ class MockGame(mock_info.InfoMixin):
             name = str(msg.get("name", ""))
             if name not in TECHS or name in self.researched:
                 self.message(f"Can't research {name}")
-            elif self.research is None:
-                self.research, self.research_progress = name, 0
-            elif name != self.research and name not in self.research_queue:
-                self.research_queue.append(name)
+            else:
+                self.queue_research(name)
             self.send_research_status()
         elif t == "research_cancel":
             name = str(msg.get("name", ""))
@@ -3730,7 +3830,8 @@ class MockGame(mock_info.InfoMixin):
             self.alt = msg.get("on") == 1
         elif t == "altc":
             # J6: the chests' contents while Alt-mode is on (alt_mode.lua's contents rounds).
-            self.altc = {"g": int(msg.get("g", 0)), "sent": {}, "msent": {}} if msg.get("on") == 1 else None
+            self.altc = ({"g": int(msg.get("g", 0)), "sent": {}, "msent": {}, "lf": msg.get("lf") == 1}
+                         if msg.get("on") == 1 else None)
         elif t == "chat":
             text = str(msg.get("text", ""))[:500]
             if text:
@@ -3938,12 +4039,19 @@ class MockGame(mock_info.InfoMixin):
     @staticmethod
     def machine_alt_icons(entity, m):
         """K1, K2: the modules in a machine (one icon each) and a lab's science packs (one a slot, in the lab's
-        slot order), as alt_mode.lua's machine_icons; ([], []) for none."""
+        slot order), as alt_mode.lua's machine_icons; ([], []) for none. Where the packs go, a gun turret's
+        ammo and a locomotive's fuel, a kind a slot."""
         seq = ALT_LAYOUT.get(entity.name, (None, None))[1]
         inv = (m or {}).get("inv", {})
         if not seq:
             return [], []
         kinds = {r[0] for r in seq}
+        if "c" in kinds:  # a wagon: the four kinds it holds most of, most first
+            held = inv.get("cargo", {})
+            return [], sorted((k for k, v in held.items() if v > 0), key=lambda k: (-held[k], k))[:4]
+        if kinds & {"a", "f"}:
+            held = inv.get("turret_ammo" if "a" in kinds else "fuel", {})
+            return [], sorted(k for k, v in held.items() if v > 0)
         modules = [k for k, v in inv.get("modules", {}).items() for _ in range(v)] if "m" in kinds else []
         packs = []
         if "l" in kinds:
@@ -3953,12 +4061,14 @@ class MockGame(mock_info.InfoMixin):
         return modules, packs
 
     def tick_alt_machines(self):
-        """K1, K2: in the same rounds, `am` with the machines in the focus square whose modules or packs changed."""
+        """K1, K2: in the same rounds, `am` with the machines in the focus square whose modules or packs changed;
+        the locomotives too, where they are now."""
         c = self.altc
         fx, fy, fr = self.focus
         seen, rows = set(), []
         sent = c.setdefault("msent", {})
-        for e in self.entities.values():
+        locomotives = [e for e in (self.mover_entity(m["unit"]) for m in self.movers if m["name"] == "cargo-wagon" or (m["name"] == "locomotive" and c.get("lf"))) if e]
+        for e in list(self.entities.values()) + locomotives:
             if (not e.unit or not ALT_LAYOUT.get(e.name, (None, None))[1] or not self.watched(e)
                     or abs(e.x - fx) > fr or abs(e.y - fy) > fr):
                 continue
@@ -4013,6 +4123,15 @@ class MockGame(mock_info.InfoMixin):
         """The main inventory slot by slot. The rest of the mock adds and removes totals in
         player["inventory"]; this keeps the layout the client arranged and fits changes into it."""
         inv, layout = self.player["inventory"], self.layout
+        # L7: what a build, drop, tile or capsule spent leaves the stack the client's hand holds (`hs`) first.
+        held = layout[self.pay_slot - 1] if 1 <= self.pay_slot <= len(layout) else None
+        if held:
+            extra = sum(s[1] for s in layout if s and s[0] == held[0]) - inv.get(held[0], 0)
+            if extra > 0:
+                held[1] -= min(extra, held[1])
+                if held[1] == 0:
+                    layout[self.pay_slot - 1] = None
+        self.pay_slot = 0
         for i in range(len(layout) - 1, -1, -1):  # too much of something: take from the last stacks
             slot = layout[i]
             if slot:
@@ -4231,6 +4350,37 @@ class MockGame(mock_info.InfoMixin):
             recs.append([name, "a-" + name, pre, ings, count, seconds, state, extra[3][0] if extra[3] else ""] + extra
                         + [1 if name in ESSENTIAL else 0])
         self.send_parts("techs", recs)
+
+    def queue_research(self, name):
+        """As research.lua (L12): the prerequisites neither researched nor queued go first, in order, then the
+        technology; nothing when one of them is a trigger technology or the queue (7, the current one counted)
+        can't hold them all."""
+        have = set(self.research_queue) | ({self.research} if self.research else set())
+        if name in have:
+            return
+        missing = []
+
+        def visit(tech):
+            for pre in sorted(TECHS[tech][0], key=lambda p: ("a-" + p, p)):
+                if pre in TECHS and pre not in self.researched and pre not in have:
+                    have.add(pre)
+                    visit(pre)
+                    missing.append(pre)
+
+        visit(name)
+        for pre in missing:
+            if TECH_EXTRAS.get(pre, [[], 1, 1, []])[3]:
+                self.message(f"Can't research {name} yet: {pre} is unlocked by doing its task")
+                return
+        queued = len(self.research_queue) + (1 if self.research else 0)
+        if queued + len(missing) + 1 > 7:
+            self.message("Research queue full")
+            return
+        for tech in missing + [name]:
+            if self.research is None:
+                self.research, self.research_progress = tech, 0
+            else:
+                self.research_queue.append(tech)
 
     def send_research_status(self):
         self.send_now({"t": "rs", "cur": self.research or "", "pr": int(self.research_progress * 1000 / RESEARCH_TICKS),
@@ -4475,7 +4625,7 @@ class MockGame(mock_info.InfoMixin):
         mv = sum(EQUIPMENT[e[0]][4] for e in g["eq"]) if g["mvon"] else 0.0
         return {"t": "cinfo", "craft": 1000, "mine": 1500, "run": 1000, "speed": int(round(WALK_SPEED * (1 + mv) * 1000)),
                 "eqmv": int(round(mv * 1000)), "reach": int(REACH * 10), "build": 100, "rreach": 27, "pick": 11, "loot": 20, "drop": 100,
-                "invb": 10, "eqinv": 0, "trash": 10, "hp": CHARACTER_HEALTH, "hpb": 0, "robots": 0, "slots": MAIN_SLOTS}
+                "invb": 10, "eqinv": 0, "trash": 10, "hp": CHARACTER_HEALTH, "hpb": 0, "robots": 0, "slots": MAIN_SLOTS, "mwf": 1}
 
     def gear_command(self, t, msg):
         kind = str(msg.get("kind", "char"))
@@ -4644,10 +4794,19 @@ class MockGame(mock_info.InfoMixin):
             else:
                 self.fire(sh, gun)
         if self.tick % GUNS_INTERVAL == 0:
-            sig = json.dumps([p["sel"], p["guns"], p["rounds"]])
-            if sig != self.guns_sig:
-                self.guns_sig = sig
-                self.send_reliable({"t": "guns", "sel": p["sel"] + 1, "l": [self.gun_record(i, g) for i, g in enumerate(p["guns"])]})
+            car = p.get("vehicle")
+            if car is not None:
+                # N3: in the car the tool bar shows its machine gun and ammo (a full magazine stock).
+                rec = ["vehicle-machine-gun", "firearm-magazine", car.setdefault("ammo", 20), ROUNDS_PER_MAGAZINE, ROUNDS_PER_MAGAZINE]
+                sig = json.dumps(["v", car["unit"], rec])
+                if sig != self.guns_sig:
+                    self.guns_sig = sig
+                    self.send_reliable({"t": "guns", "sel": 1, "l": [rec], "v": car["unit"]})
+            else:
+                sig = json.dumps([p["sel"], p["guns"], p["rounds"]])
+                if sig != self.guns_sig:
+                    self.guns_sig = sig
+                    self.send_reliable({"t": "guns", "sel": p["sel"] + 1, "l": [self.gun_record(i, g) for i, g in enumerate(p["guns"])]})
         if self.tick % HEALTH_INTERVAL == 0:
             fx, fy, fr = self.focus
             flat = []
@@ -4797,6 +4956,7 @@ class MockGame(mock_info.InfoMixin):
         if self.surface == "nauvis":
             self.tick_trains()
             self.tick_logistics()
+        self.tick_kept()
         photo = self.photo_on()
         budget = CHUNKS_PER_TICK * (PHOTO_FACTOR if photo else 1)
         backlog = PHOTO_BACKLOG if photo else MAX_BACKLOG
@@ -5002,11 +5162,59 @@ class MockGame(mock_info.InfoMixin):
                       "fast-inserter": 46000, "radar": 300000, "beacon": 480000, "small-lamp": 5000, "roboport": 50000,
                       "laser-turret": 2400000, "pump": 30000}
 
+    def resource_patch(self, msg):
+        """resource_patch.lua's `rpatch` (L6): the resource under the point and the rest of its patch, ores within 3
+        tiles of each other, summed, its tiles as runs a row."""
+        out = {"t": "rpatch", "q": int(msg.get("q", 0))}
+        x, y = msg.get("x", 0) / 256, msg.get("y", 0) / 256
+        start = next((e for e in self.entities.values() if e.type == "resource" and e.box()[0] <= x <= e.box()[2]
+                      and e.box()[1] <= y <= e.box()[3]), None)
+        if start is None:
+            return out
+        tiles = {(math.floor(e.x), math.floor(e.y)): e for e in self.entities.values() if e.name == start.name}
+        seen, queue = {(math.floor(start.x), math.floor(start.y))}, [(math.floor(start.x), math.floor(start.y))]
+        total = 0
+        while queue:
+            tx, ty = queue.pop()
+            total += int(tiles[(tx, ty)].extra.get("a", 0))
+            for dy in range(-3, 4):
+                for dx in range(-3, 4):
+                    k = (tx + dx, ty + dy)
+                    if k in tiles and k not in seen:
+                        seen.add(k)
+                        queue.append(k)
+        rows = []
+        for ty in sorted({k[1] for k in seen}):
+            xs = sorted(k[0] for k in seen if k[1] == ty)
+            row, i = [ty], 0
+            while i < len(xs):
+                j = i
+                while j + 1 < len(xs) and xs[j + 1] == xs[j] + 1:
+                    j += 1
+                row += [xs[i], j - i + 1]
+                i = j + 1
+            rows.append(row)
+        out.update(n=start.name, a=total, c=len(seen), o=rows)
+        return out
+
     def hover_info(self, msg):
         """modules.lua's hover: a beacon's or a machine's effects, modules and the beacons between them."""
         out = {"t": "hinfo", "q": int(msg.get("q", 0)), "u": int(msg.get("u", 0))}
         e = self.entities.get(out["u"])
         if e is None:
+            # L6: a resource (no unit number) by its place: its amount now.
+            x, y = msg.get("x", 0), msg.get("y", 0)
+            ore = next((o for o in self.entities.values() if o.type == "resource" and fixed(o.x) == x and fixed(o.y) == y), None)
+            if ore is not None:
+                out["ra"] = int(ore.extra.get("a", 0))
+            return out
+        if e.type in ("pipe", "pipe-to-ground", "storage-tank"):
+            # L11: its pipeline's extent and Factorio's limit (the mock's are short, but for N9's line).
+            if e in getattr(self, "overextended", ()):
+                out["pl"] = [340, 320]
+                out["ox"] = 1
+            else:
+                out["pl"] = [3, 320]
             return out
         # H20: what draws electricity, as modules.lua's electricity(): the buffer (two ticks' worth here),
         # Max. consumption with the drain (a thirtieth of the use, Factorio's usual) and Min. consumption.
@@ -5054,6 +5262,20 @@ class MockGame(mock_info.InfoMixin):
                 out["b"] = len(beacons)
                 out["eff"] = {k: v * 3 // 2 * len(beacons) for k, v in self.BEACON_EFFECT.items()}
         return out
+
+    def tick_kept(self):
+        """world.lua kept_step: KEPT_PER_TICK of the chunks the client dropped counted, those not asked
+        for again and still on this surface told in one `kept`."""
+        out = []
+        taken = 0
+        while self.kept_queue and taken < KEPT_PER_TICK:
+            c, si = self.kept_queue.pop(0)
+            taken += 1
+            if c not in self.subs and si == self.surface_index():
+                _, records, si, rv = self.chunk_content(*c)
+                out += [c[0], c[1], rv, len(records)]
+        if out:
+            self.send_reliable({"t": "kept", "rs": self.surface_index(), "l": out})
 
     def surface_index(self):
         """The same index surface_fields gives the client (on another planet its own, not the platform's)."""
@@ -5518,7 +5740,7 @@ def main():
     if args.travel:
         game.platform["sched"], game.platform["pa"] = {"c": 1, "l": [args.travel]}, 0
     if args.wait or args.depart:
-        # Waiting at its stop: the schedule's current record is where it is and the next one
+        # Waiting at its stop (H7): the schedule's current record is where it is and the next one
         # elsewhere; or done there, the current record the next stop, held for cargo on its way.
         game.platform["sched"] = {"c": 2 if args.depart else 1, "l": [game.platform["loc"], args.depart or args.wait]}
         game.platform["pa"], game.platform["hold"] = 0, True

@@ -1,8 +1,8 @@
 {
   "id": "cinematic-shaders",
   "name": "Cinematic shaders",
-  "version": "0.4.5",
-  "api": 1.5,
+  "version": "0.5.3",
+  "api": 1.7,
   "entry": "main.gd",
   "author": "Zenith",
   "description": "A cinematic look for Zenith: filmic colour, bloom on lights and fire, soft shadows, ambient occlusion and bounce light, depth haze, local contrast, a gentle vignette and film grain, with temporal anti-aliasing so far detail holds still. Switched on, it is the look; switched off, Zenith's Factorio look comes back."

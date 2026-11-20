@@ -8,6 +8,7 @@
 local transport = require("scripts.transport")
 local puppet = require("scripts.puppet")
 local platforms = require("scripts.platforms")
+local link = require("scripts.link")
 
 local M = {}
 
@@ -400,16 +401,44 @@ function M.run(cmd)
 end
 
 ---------------------------------------------------------------------------------------------
--- remote.call("zenith", ...): for the client's Lua commands over RCON.
+-- remote.call("zenith", ...): for the client's Lua commands over RCON, and for the Factorio mods
+-- that talk to their Zenith add-ons (link.lua; docs/ADDONS.md "Messages to your Factorio mod").
+-- Without an argument player, character and name are the client being served, as they always
+-- were; with a client's id (link.lua: its port, as the events and clients() give it), that client's.
 
 function M.register_remote()
   remote.add_interface("zenith", {
     -- The LuaPlayer playing the client's character, or nil.
-    player = function() return M.player() end,
+    player = function(client)
+      if client == nil then
+        return M.player()
+      end
+      return link.with_client(client, M.player)
+    end,
     -- The client's character (LuaEntity), or nil.
-    character = function() return puppet.get() end,
+    character = function(client)
+      if client == nil then
+        return puppet.get()
+      end
+      return link.with_client(client, puppet.get)
+    end,
     -- The name of the player the character is, or stands in for (nil: the bridge's own).
-    name = function() return name_of(puppet.get()) end,
+    name = function(client)
+      if client == nil then
+        return name_of(puppet.get())
+      end
+      return link.with_client(client, function() return name_of(puppet.get()) end)
+    end,
+    -- The link's version (1), so a mod can tell a bridge that has it.
+    link = function() return link.VERSION end,
+    -- The event an add-on's message arrives as: {client, channel, data, player_index, machine}.
+    on_message = link.on_message,
+    -- The event a client coming or going raises: {client, joined, player_index}.
+    on_client = link.on_client,
+    -- send(client, channel, data): true, or false and why.
+    send = link.send,
+    -- {{client, player_index}, ...}, the first client first.
+    clients = link.clients,
   })
 end
 

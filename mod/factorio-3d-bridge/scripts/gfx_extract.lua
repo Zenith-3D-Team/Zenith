@@ -27,7 +27,7 @@
 
 local M = {}
 
-M.FORMAT = 2  -- 2: sprites
+M.FORMAT = 3  -- 2: sprites; 3: entities' integration patches, always-drawn visualisations, folded turrets, glow layers
 M.NAME = "zenith-graphics"
 local PART_BYTES = 30000
 local MAX_PICS = 8
@@ -462,7 +462,10 @@ end
 -- Entities' pictures, for buildings Zenith has no model of: per direction (n, e, s, w) the first
 -- frame of what Factorio draws at rest, as layers [file, x, y, w, h, scale, shift x, shift y,
 -- tint or null, anim?] (anim: how the layer's frames run, M.anim_of), and what a machine adds while
--- working (kn, ke, ks, kw); shadows and lights left out. e, s and w only when they differ from n.
+-- working (kn, ke, ks, kw); shadows, lights and additive layers left out (glow layers are drawn as
+-- pictures too, so they stay). At rest, in Factorio's order: the integration patch under it, the
+-- picture, the working visualisations it draws always (`always_draw`: the electric drill's frame and
+-- front), and a turret's folded head over its base. e, s and w only when they differ from n.
 
 -- Types never drawn as a building (effects, flying things, things carried by others).
 local SKIP_TYPES = {
@@ -503,7 +506,7 @@ end
 
 -- One sprite's layer for direction index d (0-3) of a rotated sprite or animation.
 local function one_layer(spec, d)
-  if spec.draw_as_shadow or spec.draw_as_light or spec.draw_as_glow then
+  if spec.draw_as_shadow or spec.draw_as_light or (spec.blend_mode ~= nil and spec.blend_mode ~= "normal") then
     return nil
   end
   local file = spec.filename
@@ -533,7 +536,9 @@ local function one_layer(spec, d)
     y = y + math.floor(index / line) * h
   end
   local shift = vec(spec.shift) or { 0, 0 }
-  local layer = { file, x, y, w, h, spec.scale or 1, shift[1], shift[2], spec.tint and tint_of(spec.tint) or NULL }
+  -- (A mask Factorio tints with the force's colour at runtime: tinted with the default player colour.)
+  local tint = spec.tint and tint_of(spec.tint) or (spec.apply_runtime_tint and { 0.869, 0.5, 0.13, 1 }) or NULL
+  local layer = { file, x, y, w, h, spec.scale or 1, shift[1], shift[2], tint }
   local anim = M.anim_of(spec, d)
   if anim then
     layer[10] = anim
@@ -680,10 +685,40 @@ function M.entity_pictures(proto)
       end
     end
   end
+  local wv = type(proto.graphics_set) == "table" and proto.graphics_set.working_visualisations
+  local function vis_layers(vis, d)
+    if type(vis) ~= "table" or vis.draw_as_light or vis.light then
+      return {}
+    end
+    return layers_of(vis[DIR_NAMES[d + 1] .. "_animation"] or vis.animation, d) or {}
+  end
   local out, first = {}, nil
   for d = 0, 3 do
     local layers = layers_of(spec, d)
     if layers then
+      local patch = type(proto.integration_patch) == "table" and layers_of(proto.integration_patch, d) or nil
+      if patch then
+        for _, l in ipairs(layers) do
+          patch[#patch + 1] = l
+        end
+        layers = patch
+      end
+      if type(wv) == "table" then
+        for _, vis in ipairs(wv) do
+          -- (A status lamp's colour is the machine's state: not drawn at rest.)
+          if type(vis) == "table" and vis.always_draw and vis.apply_tint ~= "status" then
+            for _, l in ipairs(vis_layers(vis, d)) do
+              layers[#layers + 1] = l
+            end
+          end
+        end
+      end
+      if spec ~= proto.folded_animation and type(proto.folded_animation) == "table" then
+        for _, l in ipairs(layers_of(proto.folded_animation, d) or {}) do
+          layers[#layers + 1] = l
+        end
+      end
+
       local text = encode(layers)
       if d == 0 then
         out.n, first = layers, text
@@ -696,15 +731,13 @@ function M.entity_pictures(proto)
     return nil
   end
   -- What a machine adds while it works (graphics_set.working_visualisations): kn, ke, ks, kw.
-  local wv = type(proto.graphics_set) == "table" and proto.graphics_set.working_visualisations
   if type(wv) == "table" then
     local firstk
     for d = 0, 3 do
       local layers = {}
       for _, vis in ipairs(wv) do
-        if type(vis) == "table" and not vis.draw_as_light and not vis.light then
-          local anim = vis[DIR_NAMES[d + 1] .. "_animation"] or vis.animation
-          for _, l in ipairs(layers_of(anim, d) or {}) do
+        if type(vis) == "table" and not vis.always_draw then
+          for _, l in ipairs(vis_layers(vis, d)) do
             layers[#layers + 1] = l
           end
         end

@@ -24,6 +24,12 @@ const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const CraftingPanel := preload("res://scripts/ui/factorio/crafting_panel.gd")
+const Controls := preload("res://scripts/player/controls.gd")
+
+## A lab's research box after a research finished with none started since: Factorio's "<name> finished.
+## Press T." (core.cfg's research-finished) with that technology's icon and a full bar, where ours said
+## "No research in progress. Press T." (docs/UI-DIFFERENCES.md, Biolab). `--lab-finished=old`: as before.
+static var lab_finished := not ("--lab-finished=old" in OS.get_cmdline_user_args())
 
 ## Factorio's colours: production_progressbar (green), heat_progressbar (red), burning_progressbar,
 ## bonus_progressbar (purple).
@@ -586,6 +592,13 @@ static func _resource_icon(name: String) -> Texture2D:
 static func lab(screen, body: Control) -> void:
 	var tech := str(screen.model.research) if screen.model != null else ""
 	var progress := float(screen.model.research_progress) if screen.model != null else 0.0
+	var title := Kit.tech_name(tech) if tech != "" else "No research in progress. Press T."
+	var done := str(screen.model.research_finished) if screen.model != null and lab_finished and tech == "" else ""
+	if done != "":
+		var keys := Controls.keys_text("open_technology")
+		title = "%s finished. Press %s." % [Kit.tech_level_name(done, int(screen.model.research_finished_level)), keys if keys != "" else "T"]
+		tech = done
+		progress = 1.0
 	# Factorio's research box: a slightly darker inset than the panel, not the deep frame.
 	var box := PanelContainer.new()
 	var inset := StyleBoxFlat.new()
@@ -604,7 +617,7 @@ static func lab(screen, body: Control) -> void:
 	var col := VBoxContainer.new()
 	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	col.add_theme_constant_override("separation", Kit.px(2))
-	col.add_child(bold(Kit.tech_name(tech) if tech != "" else "No research in progress. Press T."))
+	col.add_child(bold(title))
 	var bar_row := _row(8)
 	var bar := thin_bar(Kit.BAR_GREEN, progress)
 	bar_row.add_child(bar)

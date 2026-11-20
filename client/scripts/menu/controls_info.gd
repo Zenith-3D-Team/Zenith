@@ -100,6 +100,7 @@ const ACTIONS := {
 	"toggle_projection": ["Camera", "Perspective or orthographic, for the view in use (first person, the map's or the normal one)"],
 	"show_factorio": ["Miscellaneous", "Show in Factorio (the same game, Ctrl+F9 there comes back)"],
 	"debug_menu": ["Miscellaneous", "Debug menu: the game's time, benchmarks and tests (Zenith's own)"],
+	"addons_reload": ["Miscellaneous", "Reload the add-ons given with --addons (Zenith's own, while one is given)"],
 }
 
 ## [group, name, binding] for controls handled directly, not through InputMap (not rebindable).

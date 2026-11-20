@@ -44,6 +44,7 @@ sys.path.insert(0, HERE)
 import creature_gait as cg  # noqa: E402
 import creature_pose as cp  # noqa: E402
 import creature_score as cs  # noqa: E402
+import packs  # noqa: E402
 import part_colors as pc  # noqa: E402
 import turntable as tt  # noqa: E402
 import turntable_anim as ta  # noqa: E402
@@ -139,7 +140,7 @@ class Skin:
 
     def __init__(self, name):
         self.name = name
-        self.glb = pc.Glb(os.path.join(tt.MODELS, name + ".glb"))
+        self.glb = pc.Glb(packs.model_path(name))
         self.model = pc.Model(self.glb)
         m = self.model
         self.rest = m.tris.copy()
@@ -354,7 +355,7 @@ def run_family(family, raw, check=False, debug=None):
     spec = FAMILIES[family]
     skins = {}
     for model, anim, f, d, pose in views(family, raw):
-        if not os.path.exists(os.path.join(tt.MODELS, model + ".glb")):
+        if not os.path.exists(packs.model_path(model)):
             continue
         sk = skins.get(model) or Skin(model)
         skins[model] = sk
@@ -412,7 +413,7 @@ def run_family(family, raw, check=False, debug=None):
             write_mask_colour(sk.glb.path, extra_corners)
     # The attack models are the walking model posed: the same triangles in the same order.
     for pose_model in (family.replace("big-", "big-") + "-attack",):
-        path = os.path.join(tt.MODELS, pose_model + ".glb")
+        path = packs.model_path(pose_model)
         if family not in ("big-biter", "big-spitter") or not os.path.exists(path):
             continue
         sk = Skin(pose_model)
@@ -433,7 +434,9 @@ def run_family(family, raw, check=False, debug=None):
 def write_mask_colour(path, corners):
     """COLOR_0's rgb: (sqrt(shade / 4), cover, 0) of the mask per vertex where `corners` has it
     (factorio_material.gdshaderinc skin_mode 2), 1 elsewhere (and everywhere without them); the
-    occlusion in its alpha kept."""
+    occlusion in its alpha kept. The client reads a masked material's (1, 1, 1) as no mask: it takes
+    the blue off red and green (read as it was, shade 4 under full cover, it glowed in the tier's
+    colour: --creature-glow=old)."""
     g = pc.Glb(path)
     m = pc.Model(g)
     for k, (_mi, _pi, prim) in enumerate(m.prims):

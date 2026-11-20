@@ -874,7 +874,7 @@ def thruster():
     p.add_part(bell)
     # Combustion chambers round the mouth, leaning down and out: purple-grey, scorched blue at
     # their ends. The three over the mouth stop at its upper rim, as the sprite draws them, clear
-    # of the plume streaming out below them (they used to reach into the middle of the mouth).
+    # of the plume streaming out below them (G7: they used to reach into the middle of the mouth).
     d = Vector((0.0, -0.6, -0.8))
     chambers = []
     for x, start, length_ in ((-0.95, (-3.9, 1.3), 0.72), (-0.05, (-3.9, 1.35), 0.72), (0.9, (-3.9, 1.3), 0.72),

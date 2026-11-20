@@ -32,6 +32,7 @@ const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const LogicWindows := preload("res://scripts/ui/factorio/logic_windows.gd")
 const CircuitWindow := preload("res://scripts/ui/factorio/circuit_window.gd")
 const SmoothBar := preload("res://scripts/ui/factorio/smooth_bar.gd")
+const LogicKit := preload("res://scripts/ui/factorio/logic_kit.gd")
 
 ## Shown or hidden (the window lays itself out around it).
 signal opened_changed(open: bool)
@@ -77,6 +78,10 @@ var stop_names := Callable()
 var open_stats := Callable()
 ## (unit, map position): remote view following a mover (a train window's camera click).
 var remote_follow := Callable()
+## (unit, prototype name, type): the model chooser for the open building (M8, model_chooser.gd),
+## from the title bar's Model button.
+var open_model := Callable()
+var model_button: Button
 ## Unit number of the entity being shown or asked for; 0 when closed.
 var unit := 0
 ## The open entity's identity as `open` named it ({u, p, x, y}) and its prototype name.
@@ -132,6 +137,18 @@ func _ready() -> void:
 	(bar.get_child(bar.get_child_count() - 1) as Button).pressed.connect(close)
 	circuit_dock.screen = self
 	circuit_dock.add_buttons(bar)
+	# M8: Zenith's own, beside Factorio's circuit buttons: this building's model from another pack.
+	model_button = LogicKit.frame_button("icons/mip/grid-view.png", "Model: draw this building with another model pack's model", false)
+	model_button.name = "ModelButton"
+	model_button.toggle_mode = false
+	if model_button.icon == null:
+		model_button.text = "3D"
+	model_button.pressed.connect(func() -> void:
+		var proto: ProtoDB.EntityProto = protos.entities_by_name.get(proto_name) if protos != null else null
+		if open_model.is_valid() and unit > 0 and proto != null:
+			open_model.call(unit, proto_name, proto.type))
+	bar.add_child(model_button)
+	bar.move_child(model_button, bar.get_child_count() - 2)
 	_dock.call_deferred()
 	box.add_child(bar)
 	# Factorio's bigger windows (silo, landing pad, hub) add columns of their own beside the first.
@@ -451,9 +468,15 @@ func _panel_sig(msg: Dictionary) -> String:
 
 ## machine_info.lua's fields that change the layout (the progress bar updates in place).
 func _production_sig(msg: Dictionary) -> String:
+	# A lab's research box follows the research (its name, each whole percent, the one that just finished):
+	# with the labs standing still nothing else in its message changes.
+	var research: Array = []
+	if str(msg.get("kind", "")) == "lab" and model != null:
+		research = [model.research, floori(float(model.research_progress) * 100.0), model.research_finished, model.research_finished_level,
+			ProductionPanels.lab_finished]
 	return JSON.stringify([msg.get("rd"), msg.get("rp"), msg.get("fixed"), msg.get("mt"), msg.get("lc"), msg.get("li"), msg.get("ld"),
 		int(msg.get("pb", 0)) > 0, msg.has("bn"), roundi(int(msg.get("bp", 0)) / 50.0),
-		roundi(int(msg.get("tc", 0)) / 100.0), _pick_group, _pick_quality, _recipe_groups.size()])
+		roundi(int(msg.get("tc", 0)) / 100.0), _pick_group, _pick_quality, _recipe_groups.size(), research])
 
 
 func _editing() -> bool:
@@ -477,7 +500,7 @@ func _set_open(open: bool) -> void:
 
 ## The screen is rebuilt whenever what it shows changes (a hub's inventory every second on a busy
 ## platform), and its scroll boxes came back at the top: the hub's schedule jumped up while being
-## scrolled. Their places are kept across rebuilds of the same entity's screen.
+## scrolled (owner's G6). Their places are kept across rebuilds of the same entity's screen.
 func _build(kind: String, recipe: String, inv: Dictionary) -> void:
 	var kept: Array = []
 	var same := _scroll_key == "%d|%s" % [unit, kind]

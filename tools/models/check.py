@@ -2,8 +2,9 @@
 
     python tools/models/check.py [names or .glb paths...]
 
-With no arguments it checks every .glb in client/assets/models. Plain Python (reads the glTF
-binary directly), no Blender needed. For each model:
+With no arguments it checks every .glb in the three packs (packs.py: ours, then FUE5's). A name
+is ours, or FUE5's when only FUE5 has it; fue5/<name> (or placeholders/, wube3dp/) names that
+pack's. Plain Python (reads the glTF binary directly), no Blender needed. For each model:
 
 - the name is a known prototype (docs/ASSET-INVENTORY.md) or a variant listed in specs.py;
 - the footprint (x by z extents) fits the selection box and fills enough of it. For entities
@@ -12,6 +13,10 @@ binary directly), no Blender needed. For each model:
 - no root node is rotated, so "facing north" lives in the geometry, not in a node transform
   (a square model built facing the wrong way can't be caught here: look at a preview);
 - the triangle count is within budget.
+
+A model in a folder called `items` is an item (items on belts, MODELLERS.md): its name must be an
+item the Placeholders pack has a model for, and it must fit in a tile, sit on the ground, be centred
+and stay within specs.ITEM_BUDGET. Numbered ore rocks (`iron-ore-1`, specs.ORE_VARIANTS) are known.
 
 Exits 1 if any model fails.
 """
@@ -27,10 +32,24 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
+import packs  # noqa: E402
 import specs  # noqa: E402
 
-MODELS_DIR = os.path.join(REPO, "client", "assets", "models")
 INVENTORY = os.path.join(REPO, "docs", "ASSET-INVENTORY.md")
+ITEMS = os.path.join(REPO, "client", "assets", "models", "packs", "placeholders", "items")
+
+
+def known_items():
+    return {os.path.splitext(f)[0] for f in os.listdir(ITEMS) if f.endswith(".glb")} if os.path.isdir(ITEMS) else set()
+
+
+def is_item(path):
+    return os.path.basename(os.path.dirname(os.path.abspath(path))).lower() == "items"
+
+
+def is_ore_variant(name):
+    m = re.fullmatch(r"(.+)-(\d+)", name)
+    return bool(m) and m.group(1) in specs.ORE_VARIANTS
 
 
 def known_prototypes():
@@ -129,11 +148,40 @@ def measure(doc):
     return lo, hi, tris, rotated
 
 
-def check(path, known):
+def check_item(name, lo, hi, tris, rotated, items):
+    problems = []
+    if name not in items:
+        problems.append("unknown item (no Placeholders item model of that name)")
+    w, d = hi[0] - lo[0], hi[2] - lo[2]
+    cx, cz = (hi[0] + lo[0]) / 2, (hi[2] + lo[2]) / 2
+    if abs(lo[1]) > specs.GROUND_TOLERANCE:
+        problems.append("lowest point at y=%.3f, not on the ground" % lo[1])
+    if rotated:
+        problems.append("rotated root node(s) %s: model the rotation into the mesh" % ", ".join(rotated))
+    if w > specs.ITEM_SIZE or d > specs.ITEM_SIZE:
+        problems.append("item %.2f x %.2f larger than a tile" % (w, d))
+    if abs(cx) > specs.ITEM_CENTRE or abs(cz) > specs.ITEM_CENTRE:
+        problems.append("item centred at (%.2f, %.2f), not the origin" % (cx, cz))
+    if tris > specs.ITEM_BUDGET:
+        problems.append("%d triangles, item budget %d" % (tris, specs.ITEM_BUDGET))
+    return problems
+
+
+def check(path, known, items=None):
     name = os.path.splitext(os.path.basename(path))[0]
     problems, notes = [], []
+    if is_item(path):
+        try:
+            lo, hi, tris, rotated = measure(read_glb(path))
+        except Exception as e:
+            return name, ["unreadable: %s" % e], [], None
+        if lo[0] == math.inf:
+            return name, ["no meshes"], [], None
+        problems = check_item(name, lo, hi, tris, rotated, known_items() if items is None else items)
+        return "items/" + name, problems, [], "%5.2f x %5.2f x %4.2f  %6d tris" % (
+            hi[0] - lo[0], hi[2] - lo[2], hi[1] - lo[1], tris)
     spec = specs.SPECS.get(name)
-    if spec is None and name not in known:
+    if spec is None and name not in known and not is_ore_variant(name):
         problems.append("unknown name (not a prototype in ASSET-INVENTORY.md or a variant in specs.py)")
     try:
         doc = read_glb(path)
@@ -172,21 +220,24 @@ def check(path, known):
 
 def main(argv):
     known = known_prototypes()
+    items = known_items()
     paths = []
     for arg in argv:
         if arg.endswith((".glb", ".gltf")):
             paths.append(arg)
         else:
-            paths.append(os.path.join(MODELS_DIR, arg + ".glb"))
+            paths.append(packs.resolve(arg))
     if not paths:
-        paths = sorted(os.path.join(MODELS_DIR, f) for f in os.listdir(MODELS_DIR) if f.endswith(".glb"))
+        paths = packs.glbs(fue5=True)
     failed = 0
     for path in paths:
         if not os.path.exists(path):
             print("FAIL %-28s missing: %s" % (os.path.basename(path), path))
             failed += 1
             continue
-        name, problems, notes, summary = check(path, known)
+        name, problems, notes, summary = check(path, known, items)
+        if packs.pack_of(path) == "fue5":
+            name = "fue5/" + name  # most share a name with one of ours
         print("%s %-28s %s" % ("FAIL" if problems else "ok  ", name, summary or ""))
         for p in problems:
             print("       - " + p)

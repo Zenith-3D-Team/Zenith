@@ -40,6 +40,67 @@ local function message(text)
 end
 M.message = message
 
+-- A stack's quality's name ("normal" when it can't say).
+local function stack_quality(st)
+  local ok, q = pcall(function() return st.quality.name end)
+  return ok and q or "normal"
+end
+M.stack_quality = stack_quality
+
+-- L7: the stack in slot `hs` of the inventory (the main inventory slot the client's hand holds it from), or
+-- nil: only while that slot holds the item in `quality` (normal when none is given). The one rule for every
+-- command that spends from the hand (building, Z, Ctrl+click, tiles, capsules, as_player).
+function M.held_stack(inventory, hs, item, quality)
+  hs = math.floor(tonumber(hs) or 0)
+  if not inventory or hs < 1 or hs > #inventory then
+    return nil
+  end
+  local st = inventory[hs]
+  if st and st.valid_for_read and st.name == item and stack_quality(st) == (quality or "normal") then
+    return st
+  end
+  return nil
+end
+
+-- The quality of the stack in slot `hs` when it holds the item, else nil: what the hand holds, for
+-- commands that carry no quality of their own (Z, tiles, capsules) or as a build's default.
+function M.held_quality(inventory, hs, item)
+  hs = math.floor(tonumber(hs) or 0)
+  if not inventory or hs < 1 or hs > #inventory then
+    return nil
+  end
+  local st = inventory[hs]
+  if st and st.valid_for_read and st.name == item then
+    return stack_quality(st)
+  end
+  return nil
+end
+
+-- L7: takes `count` of the item in `quality` (normal when none is given) out of an inventory as Factorio
+-- spends the cursor's stack: off the held stack (M.held_stack) first, the rest off any stack of the item
+-- in that quality. `hs` nil or 0, or something else there: any stack of it, as before.
+function M.take_held(inventory, hs, item, count, quality)
+  quality = quality or "normal"
+  local left = count
+  local st = M.held_stack(inventory, hs, item, quality)
+  if st then
+    local k = math.min(left, st.count)
+    if k >= st.count then
+      st.clear()
+    else
+      st.count = st.count - k
+    end
+    left = left - k
+  end
+  if left > 0 then
+    local stack = { name = item, count = left }
+    if quality ~= "normal" then
+      stack.quality = quality
+    end
+    inventory.remove(stack)
+  end
+end
+
 -- The player playing this character in single-player (hybrid mode), or nil for the bridge's own
 -- player-less character on a server.
 function M.player_of(c)
@@ -88,10 +149,82 @@ function M.recheck(choose_again)
   end
 end
 
+-- L13: the player who joins with this Zenith's own Factorio takes over the character the client
+-- plays. The client's hello names the account its PC's Factorio plays under (`pn`, from
+-- player-data.json; Ctrl+F9 starts that Factorio joined to the same server), so a player of that
+-- name joining while the bridge plays its own character (a world Zenith made has no player of its
+-- own) becomes the one it plays, as a save's player is: M.get hands them the character, and when
+-- they leave the bridge stands in for them until they come back. Only the first client's character
+-- (another client plays one of its own), never over a save's player or a /f3d-player choice, and
+-- only that name: anyone else who joins gets a character of their own, as before. Everything comes
+-- from events and the client's packets, so every peer decides the same. True when claimed.
+function M.claim(index)
+  local s = storage.f3d
+  if s.extra or not game.is_multiplayer() or not perf.on("zenith_join") then
+    return false
+  end
+  local name = s.client and s.client.pn
+  if type(name) ~= "string" or name == "" then
+    return false
+  end
+  local p = game.get_player(index)
+  if not (p and p.valid and p.connected and p.name == name) then
+    return false
+  end
+  if s.owner_pick == 0 or M.owner() then
+    return false -- the bridge plays a save's player (or this one already), or was told to play none
+  end
+  local made = s.made_player
+  s.zenith_owner = p.index
+  s.owner_index = p.index
+  s.owner_checked = true
+  -- `new`: freeplay has just made them a character with its starting kit, which they had already.
+  s.claimed = { index = p.index, new = made ~= nil and made.index == p.index and game.tick - made.tick <= 60 }
+  s.recheck = true
+  log("[Zenith] player " .. p.index .. " joined with this Zenith's Factorio: they take over its character")
+  return true
+end
+
+-- The client's hello named its Factorio's account (a new session, or another name): a player of
+-- that name already in the game (they joined before this Zenith connected) is claimed now.
+function M.claim_named()
+  local s = storage.f3d
+  local name = s.client and s.client.pn
+  if type(name) ~= "string" or name == "" then
+    return false
+  end
+  local p = game.get_player(name)
+  return p ~= nil and M.claim(p.index)
+end
+
 -- The player whose things the bridge's own character holds while they are away, or nil.
 function M.held_for()
   local s = storage.f3d
   return s.held_for and game.get_player(s.held_for) or nil
+end
+
+-- A player claimed as this Zenith's (M.claim) gets the bridge's own character itself: its place,
+-- health, inventories, armour, requests, crafting queue, the vehicle it sits in, and the client goes
+-- on with the same entity. The character the game gave them on joining is emptied into it (without
+-- freeplay's starting kit when they are new) and removed. "wait" while they can't take it yet (in a
+-- cutscene or the remote view); false when the game refused, and the old way is used instead.
+local function hand_over(player, own, fresh, new)
+  local ok, kind = pcall(function() return player.controller_type end)
+  if not ok or kind ~= defines.controllers.character then
+    return "wait"
+  end
+  local done = pcall(player.set_controller, { type = defines.controllers.character, character = own })
+  if not (done and player.character == own) then
+    return false
+  end
+  if fresh and fresh.valid and fresh ~= own then
+    if new then
+      takeover.drop_created_items(fresh)
+    end
+    takeover.absorb(fresh, own)
+  end
+  takeover.copy_quickbar(storage.f3d.quickbar, player)
+  return true
 end
 
 -- The character the client controls:
@@ -111,6 +244,11 @@ function M.get()
   local owner = M.owner()
   local old = s.puppet and s.puppet.valid and s.puppet or nil
   s.puppet = nil
+  if owner and not owner.connected and s.claimed and s.claimed.index == owner.index then
+    -- Claimed (L13) but gone again before taking the character: the bridge goes on with its own.
+    s.claimed, s.zenith_owner, s.owner_index = nil, nil, nil
+    owner = nil
+  end
 
   if owner and owner.connected then
     local c = owner.character
@@ -118,9 +256,25 @@ function M.get()
       s.puppet = old -- they have no character yet (dead, or still in the menu): keep standing in
       return old
     end
+    -- The player who joined with this Zenith's Factorio (L13) takes over the client's character.
+    local claimed = s.claimed and s.claimed.index == owner.index and s.claimed or nil
+    local handed = nil
+    if claimed and old and old ~= c and not s.held_for and s.own_character == old then
+      handed = hand_over(owner, old, c, claimed.new)
+      if handed == "wait" then
+        s.recheck = true -- looked at again on the next call
+        s.puppet = old
+        return old
+      end
+      if handed then
+        c = old
+      end
+    end
+    s.claimed = nil
     -- A player joining a new map takes over the bridge's own character's things and place too,
-    -- so swapping between the real game and the client carries on where the client was.
-    if old and c and old ~= c and (s.held_for == owner.index or (not s.held_for and s.own_character == old)) then
+    -- so swapping between the real game and the client (C7) carries on where the client was.
+    if not handed and old and c and old ~= c
+        and (s.held_for == owner.index or (not s.held_for and s.own_character == old)) then
       takeover.move_all(old, c, c)
       pcall(c.teleport, old.position, old.surface)
       pcall(old.destroy)
@@ -128,6 +282,7 @@ function M.get()
     if c then
       s.held_for = nil
       s.own_character = nil
+      s.played_for = owner.index
     end
     s.puppet = c -- nil while dead: wait for the respawn
     return s.puppet
@@ -137,6 +292,11 @@ function M.get()
     if old and s.held_for == owner.index then
       s.puppet = old
       return old
+    end
+    -- Their own character, which the bridge played while they were here, left the world with them
+    -- (logged off): it isn't the bridge's to empty or remove, and comes back when they do.
+    if old and s.played_for == owner.index then
+      old = nil
     end
     if M.waiting_to_respawn() then
       return nil
@@ -152,6 +312,7 @@ function M.get()
     end
     takeover.move_all(owner, c, c)
     pcall(function() c.color = owner.color end)
+    s.played_for = nil
     if old then
       local before = s.held_for and game.get_player(s.held_for)
       if before and not before.connected then
@@ -165,6 +326,7 @@ function M.get()
   end
 
   -- No owner: the bridge's own character. Hand anything held for someone back first.
+  s.played_for = nil
   if old and s.held_for then
     local before = game.get_player(s.held_for)
     if before and not before.connected then
@@ -371,7 +533,7 @@ end
 ---------------------------------------------------------------------------------------------
 -- Commands
 
--- `walk` with `a` (thousandths of a turn clockwise from north) walks at any angle.
+-- `walk` with `a` (thousandths of a turn clockwise from north) walks at any angle (owner's B7).
 -- Factorio's character walks only 8 ways, so each tick steps one of the two 8-way directions either
 -- side of the angle, whichever brings the sideways drift accumulated so far (`err`, in steps) back
 -- towards the line: the path zig-zags a few hundredths of a tile about the line while the game's own
@@ -625,6 +787,13 @@ function M.pickup()
   end
 end
 
+-- F let go: the pickup ends now, not HOLD_TICKS after the last `pickup` (clients from before never send it).
+function M.pickup_stop()
+  if perf.on("pickup_stop") then
+    storage.f3d.pickup = nil
+  end
+end
+
 -- Hand-mining one unit of ore: products go to the inventory, the patch shrinks by one.
 local function mine_resource(c, e)
   local products = e.prototype.mineable_properties.products or {}
@@ -673,7 +842,7 @@ M.mined_listeners = {}
 -- (what the character holds now less what it held before; its own products first), for the client to
 -- take it away and fly the items to the character in the frame it hears. The inventory is sent at once
 -- too, not at its next 30-tick report.
-local function say_mined(c, info, before)
+local function mined_message(c, info, before)
   local after = held(c)
   local gained = {}
   for name, n in pairs(after) do
@@ -700,11 +869,19 @@ local function say_mined(c, info, before)
   if info.gi then
     msg.gi = 1
   end
-  transport.send_now(msg)
+  return msg
+end
+
+local function mined_after(c)
   M.send_inventory_now()
   for _, fn in ipairs(M.mined_listeners) do
     fn(c)
   end
+end
+
+local function say_mined(c, info, before)
+  transport.send_now(mined_message(c, info, before))
+  mined_after(c)
 end
 
 -- What `mnd` says of the entity, read before it is mined; nil when the switch is off.
@@ -729,13 +906,15 @@ local function mined_info(e)
     y = world.fixed(p.y), gi = item, products = products }
 end
 
-local function finish_mining_now(c, e)
+-- `force`: mined even when what it gives doesn't fit, the rest spilled at the character's feet (a build's own
+-- removals, M2).
+local function finish_mining_now(c, e, force)
   if e.type == "resource" then
     return mine_resource(c, e)
   end
   -- As the player when there is one (as_player.lua): Factorio raises on_player_mined_entity, whose
   -- handler (tracker.lua) sends the removal.
-  local mined = as_player.mine(c, e)
+  local mined = as_player.mine(c, e, force)
   if mined ~= nil then
     return mined, (not mined) and "Inventory full" or nil
   end
@@ -743,7 +922,16 @@ local function finish_mining_now(c, e)
   if perf.on("mined_tell") then
     tracker.removing(e)
   end
-  if not c.mine_entity(e) then
+  if perf.on("mined_neighbours") then
+    tracker.neighbours_change(e)
+  end
+  local done
+  if force then
+    done = c.mine_entity(e, true)
+  else
+    done = c.mine_entity(e)
+  end
+  if not done then
     return false, "Inventory full"
   end
   if removal and not e.valid then
@@ -763,6 +951,38 @@ function finish_mining(c, e)
     end
   end
   return done, reason
+end
+
+-- M2: entities a build of the character's takes away as Factorio's player build does (the belts or pipes between a
+-- new underground pair, building.lua): each mined into the character with what it holds (a belt's items too),
+-- forced, so what doesn't fit is spilled as Factorio spills it; each said at once as hand mining is (`mnd` then the
+-- reliable `del`), the inventory once after them. How many went.
+function M.mine_for_build(c, list)
+  local n = 0
+  for _, e in ipairs(list) do
+    if e.valid then
+      local info = mined_info(e)
+      local before = info and held(c)
+      if finish_mining_now(c, e, true) then
+        n = n + 1
+        if info then
+          local ok, msg = pcall(mined_message, c, info, before)
+          if ok then
+            transport.send_now(msg)
+          else
+            log("[factorio-3d-bridge] mnd: " .. tostring(msg))
+          end
+        end
+      end
+    end
+  end
+  if n > 0 then
+    local ok, err = pcall(mined_after, c)
+    if not ok then
+      log("[factorio-3d-bridge] mnd: " .. tostring(err))
+    end
+  end
+  return n
 end
 
 function M.rotate(cmd)
@@ -1481,7 +1701,14 @@ function M.register()
   local function again()
     M.recheck(false)
   end
-  script.on_event(defines.events.on_player_joined_game, again)
+  -- Who was just created (freeplay gave them its starting kit), for M.claim.
+  script.on_event(defines.events.on_player_created, function(event)
+    storage.f3d.made_player = { index = event.player_index, tick = game.tick }
+  end)
+  script.on_event(defines.events.on_player_joined_game, function(event)
+    M.recheck(false)
+    M.claim(event.player_index)
+  end)
   script.on_event(defines.events.on_player_left_game, again)
   script.on_event(defines.events.on_player_respawned, again)
   script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
@@ -1517,6 +1744,9 @@ function M.send_initial()
   local c = M.get()
   if c then
     local s = storage.f3d
+    if s.own_character == c then
+      takeover.no_crash_site() -- the bridge plays this world before anyone joined it (L13)
+    end
     M.invalidate()
     send_inventory(c, s)
     send_recipes(c, s)

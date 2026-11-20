@@ -6,7 +6,7 @@ touched. The f3d-ui-capture mod opens every window it can and screenshots it at 
 the GUI at 100% (game.take_screenshot{show_gui = true}); this script then kills that game and
 copies the pictures to art-src/ui_reference/ in the main checkout.
 
-    python tools/ui_reference/capture.py                    # a copy of a big save
+    python tools/ui_reference/capture.py                    # a copy of the owner's big save
     python tools/ui_reference/capture.py --fresh            # a new map (prefix fresh_)
     python tools/ui_reference/capture.py --only character,entity_lab
 

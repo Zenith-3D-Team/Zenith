@@ -137,7 +137,8 @@ def main() -> int:
         png = out / f"{name}.png"
         if png.exists():
             png.unlink()
-        cmd = [str(args.godot), "--path", str(REPO / "client"), "--resolution", args.size, "--",
+        cmd = [str(args.godot), "--path", str(REPO / "client"), "--resolution", args.size,
+            "--log-file", (out / f"{name}.godot.log").resolve().as_posix(), "--",
             f"--factorio-port={args.factorio_port}", f"--port={args.port}", "--borderless", f"--ui-scale={args.ui_scale}",
             f"--settings-file={settings.as_posix()}", f"--screenshot={png.as_posix()}@{args.delay}", *SHOTS[name]]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

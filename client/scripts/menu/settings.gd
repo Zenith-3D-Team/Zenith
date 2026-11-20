@@ -23,6 +23,8 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Controls := preload("res://scripts/player/controls.gd")
 
 const PATH := "user://settings.cfg"
+## [meta]: set once add-ons found under an earlier Zenith were kept on (addon_loader.gd _migrate_once).
+const ADDONS_OFF_BY_DEFAULT := "addons_off_by_default"
 
 const DEFAULTS := {
 	"graphics": {
@@ -42,6 +44,13 @@ const DEFAULTS := {
 		# "classic" (Zenith's look before 0.1.4), or an add-on's look
 		"look": "factorio",
 		"look_before": "factorio",  # what an add-on's look replaced, back when the add-on goes
+		# A modeller's metallic-roughness picture's metal (looks.gd texture_metal): "paint" (drawn at the
+		# share every other surface's metal is, the look's own) or "full" (in full, as before 0.2.2)
+		"texture_metal": "paint",
+		# Packs' own shading (looks.gd pack_shading, model_packs.gd shading()): "pack" (each pack as its pack.json
+		# says: a "pbr" pack's textured models drawn as their files say) or "factorio" (Factorio's everywhere, as
+		# before 0.2.2; --pack-shading=factorio)
+		"pack_shading": "pack",
 		"shadows": "high",  # off, low, medium, high, ultra (sun_shadows.gd)
 		"shadow_distance": 0,  # tiles the shadows may reach from the camera; 0: the quality's (sun_shadows.gd)
 		# high, medium, low: how soon far-away models and their shadows simplify (model_lods.gd); the
@@ -86,6 +95,7 @@ const DEFAULTS := {
 		"item_icons": true,  # Factorio's icons on items on belts and on the ground
 		"item_models_max": 20500,  # Items in 3D: the most belt items drawn as models, nearest first; 0 icons only; ITEM_MODELS_ALL every one
 		"effects": true,  # Factorio's "Show all smoke" and "Show particles": smoke, dust, flashes, explosions
+		"belt_step": true,  # the character drawn on top of belts it walks over (avatar.gd; drawn only, owner)
 		"clouds": true,  # clouds in the sky and their shadows on the ground, planets' haze (scripts/world/sky.gd)
 		"decoratives": true,  # grass, flowers and small rocks from Factorio (scripts/world/decoratives.gd)
 		"decorative_density": 1.0,  # the share of them drawn, 0.1 to 1
@@ -103,6 +113,7 @@ const DEFAULTS := {
 		"ambient": 1.0,  # wind and each planet's background sounds (fx/ambience.gd)
 		"max_voices": 12,  # machine and vehicle loops playing at once
 		"output_device": "Default",
+		"pack_sounds": true,  # sounds from model packs (model_packs.gd sounds_on; --pack-sounds=off)
 	},
 	"interface": {
 		"ui_scale": "auto",  # auto, 0.75 ... 2.0
@@ -123,10 +134,21 @@ const DEFAULTS := {
 		"shortcut_bar": true,  # the shortcut bar right of the quickbar
 		"research_progress": true,  # the research in progress, top right
 		"alerts": true,  # alert icons over the shortcut bar
+		"night_vision_indicator": true,  # the equipment's icon over the shortcut bar while night vision is on (night_vision_icon.gd; --night-vision-fx=off)
+		"night_vision_edge": true,  # a green vignette at the screen's edges while it is on (night_vision_overlay.gd)
+		"perf_warning": true,  # the warning icon top left while settings are held back for UPS (perf_warning.gd; --perf-warning=off)
 		"smart_belt_building": true,  # Factorio's: dragged belts jump obstacles with undergrounds
 		# Factorio's "Lock belt building to straight line": on, belts drag along the held belt's line as
 		# Factorio 2.x always does (it dropped the setting); off, Zenith's own drag round corners
 		"lock_belt_straight": true,
+		# Factorio 2.1's fluid pipeline visualization (N9, pipeline_marks.gd): with a fluid entity held, in
+		# Alt-mode, every pipeline in view; and the hovered entity's pipelines
+		"fluid_vis": true,
+		"fluid_vis_selected": true,
+		# The main menu's backdrop (menu_background.gd): "default", Zenith's built-in factory, or the id of a
+		# view recorded in a game (backdrop_recorder.gd, the Esc menu; listed in user://backdrops/,
+		# backdrop_list.gd; "snapshot": the one file before 0.2.2); --menu-backdrop=default overrules it
+		"backdrop": "default",
 	},
 	"camera": {
 		"default_view": "angled",  # angled, factorio, first_person
@@ -140,6 +162,8 @@ const DEFAULTS := {
 		"first_person_orthographic": false,  # first person's (owner's I19: each view keeps its own; F7 switches)
 		"max_zoom": 140,  # how far the wheel zooms out, in tiles from the focus
 		"map_zoom_out": 240,  # the map's remote view: how far out before the map comes back (tiles)
+		# add-ons' camera modifiers (bob, sway, shake) scaled to this percentage, 0: none drawn
+		"addon_motion": 100,
 	},
 	"factorio": {
 		"executable": "",  # factorio.exe or the install folder; "" finds it
@@ -151,6 +175,9 @@ const DEFAULTS := {
 		"verbose_logging": false,
 		# the keys set in Factorio's own controls (its config.ini) are Zenith's defaults (issue #14)
 		"use_factorio_keys": true,
+		# Zenith 0.2.2's keys (issue #26): its old built-in defaults, and only the keys changed in Factorio
+		# (Controls.old_defaults; --keys-defaults=old for one run)
+		"keys_0_2_2": false,
 		# so are the sound, graphics and interface settings set there (factorio_settings.gd)
 		"use_factorio_settings": true,
 		# Ctrl+F9 swapping: Factorio's window minimised while Zenith is in front (game_swap.gd)
@@ -165,6 +192,15 @@ const DEFAULTS := {
 	"alerts": {
 		"disabled": [],
 		"muted": [],
+	},
+	# The Model packs window (model_packs.gd, model_packs_window.gd): the packs by id
+	# ("builtin:<folder>", "loose", "dir:<folder>", "zip:<file>"), top first, and those turned off.
+	# A pack of the models folder not listed goes on top, a built-in one in its place under them.
+	# `choices`: a model family -> the pack it is taken from whatever the order.
+	"model_packs": {
+		"order": [],
+		"off": [],
+		"choices": {},
 	},
 }
 
@@ -309,6 +345,29 @@ static var _default_keys := {}
 static var _own_keys := {}
 ## The keys read from Factorio's config.ini (factorio_keys.gd), action -> [primary, alternative].
 static var factorio_keys := {}
+## How many of factorio_keys' controls were changed in Factorio (its config.ini's set lines); the rest
+## are Factorio's defaults (its "; " lines).
+static var factorio_keys_changed := 0
+## The config.ini factorio_keys came from and its modified time, so a change made in Factorio while
+## Zenith runs is read again when Zenith's window comes back (refresh_factorio_keys).
+static var _factorio_keys_file := ""
+static var _factorio_keys_time := 0
+## Modified times are whole seconds (two on FAT): a write in the second it was read leaves the time as
+## it was. So until a focus-in comes FACTORIO_KEYS_SAME_SEC past the file's time, refresh_factorio_keys
+## also compares the text's length and hash (String.hash, 32 bits) with these; after one that matches
+## that late, the time alone tells (`_factorio_keys_settled`).
+static var _factorio_keys_length := 0
+static var _factorio_keys_hash := 0
+static var _factorio_keys_settled := false
+## How many times refresh_factorio_keys read the text to compare it (tests: a settled file is never read).
+static var factorio_keys_text_checks := 0
+## What the file was looked for with (--factorio=, the executable setting, a test's config.ini) and
+## when (msec): refresh_factorio_keys looks again only when one of those changed, or, with none
+## found, a minute after the last look.
+static var _factorio_keys_source := ""
+static var _factorio_keys_looked := 0
+## How many times config.ini was looked for (the full search: tests check a focus-in does none).
+static var factorio_keys_lookups := 0
 ## The settings read from Factorio's config.ini (factorio_settings.gd), {section: {key: value}}:
 ## the defaults for those keys, in place of DEFAULTS'. {} when off.
 static var factorio_values := {}
@@ -344,6 +403,9 @@ static func load_settings() -> void:
 	if path == PATH:
 		copy_old_user_folder()
 	_cfg = ConfigFile.new()
+	# A file there that can't be read (cut short, damaged) still came from an earlier Zenith: only a
+	# missing one is fresh, so its add-ons go through the migration instead of all turning off.
+	var fresh := not FileAccess.file_exists(path)
 	var existed := _cfg.load(path) == OK
 	if not existed:
 		_cfg = ConfigFile.new()
@@ -353,6 +415,9 @@ static func load_settings() -> void:
 	var still_cards := _mod_anim_off_once()
 	var full_res := _full_screen_resolution_once()
 	var grass := _grass_preset_once()
+	if fresh:
+		# Add-ons are off until switched on; a new file has none to keep on (addon_loader.gd _migrate_once).
+		_cfg.set_value("meta", ADDONS_OFF_BY_DEFAULT, true)
 	if _migrate() or renamed or reset or belt_auto or still_cards or full_res or grass or not existed:
 		_cfg.save(path)
 
@@ -567,6 +632,9 @@ static func set_value(section: String, key: String, value: Variant, persist := t
 		apply_item_look()
 	if section == "graphics" and key == "render_thread" and persist:
 		write_engine_overrides()
+	if section == "factorio" and key == Controls.OLD_KEYS_SETTING and not _default_keys.is_empty():
+		apply_old_defaults()
+		reload_factorio_keys()
 	if section == "interface" and key == "ui_scale":
 		var tree := Engine.get_main_loop() as SceneTree
 		if tree != null:
@@ -1072,10 +1140,27 @@ const SSAO_FACTORIO := {"ssao_radius": 0.7, "ssao_intensity": 1.6, "ssao_power":
 const SSAO_FADE := Vector2(60.0, 140.0)
 
 
+## `--ssao=off` / `--ssao=on` among `args` (the command line wins over the setting for one run): "off",
+## "on", or "" without one.
+static func ssao_arg(args: PackedStringArray) -> String:
+	var out := ""
+	for arg in args:
+		if arg.begins_with("--ssao="):
+			var v := arg.get_slice("=", 1).to_lower()
+			if v == "off" or v == "false" or v == "0" or v == "no":
+				out = "off"
+			elif v == "on" or v == "true" or v == "1" or v == "yes":
+				out = "on"
+	return out
+
+
 static func apply_ssao(env: Environment, on: Variant = null) -> void:
 	if env == null:
 		return
-	env.ssao_enabled = bool(get_value("graphics", "ssao")) if on == null else bool(on)
+	if on == null:
+		var arg := ssao_arg(OS.get_cmdline_user_args())
+		on = (arg == "on") if arg != "" else bool(get_value("graphics", "ssao"))
+	env.ssao_enabled = bool(on)
 	for key in SSAO_FACTORIO:
 		env.set(key, SSAO_FACTORIO[key])
 	RenderingServer.environment_set_ssao_quality(RenderingServer.ENV_SSAO_QUALITY_MEDIUM, true, 0.5, 2, SSAO_FADE.x, SSAO_FADE.y)
@@ -1088,8 +1173,10 @@ static func shadow_size() -> int:
 
 # --- key bindings ----------------------------------------------------------------------------
 # Like Factorio, each control has a primary and an alternative binding, each a key with any
-# modifiers (Shift, Ctrl, Alt). A binding with modifiers only fires with them held; one without
-# fires whatever is held (so R also answers Shift+R, which rotate reads as reverse rotate).
+# modifiers (Shift, Ctrl, Alt). Controls are matched with exactly their modifiers (Controls.pressed,
+# and Input.is_action_pressed(action, true) for shooting, dropping and picking up), so R and Shift+R, Space
+# and Shift+Space, F and Ctrl+F, Keypad + and Ctrl+Keypad + are different controls, as in Factorio. Walking
+# answers whatever else is held (Shift, Ctrl and Alt keep the character walking in Factorio too).
 
 ## Remembers player_input.gd's default keys (its first key is the primary binding, the second the
 ## alternative), then applies the saved bindings over them. Call after PlayerInput.define_actions()
@@ -1107,6 +1194,14 @@ static func apply_bindings() -> void:
 			keys.append(0)
 		_default_keys[name] = keys
 		_own_keys[name] = keys.duplicate()
+	# The debug line: its F4 in dev builds, no key by default in a public one (issue #26). Set on every
+	# call, as the input map may already hold a binding applied over the default.
+	for name in Controls.DEV_KEYS:
+		if _default_keys.has(name):
+			var keys: Array = Controls.default_pair(name) if dev_tools() else [0, 0]
+			_default_keys[name] = keys
+			_own_keys[name] = keys.duplicate()
+	apply_old_defaults()
 	if not dev_tools():
 		# A public build has no key for the testing tools, in Settings → Controls or anywhere.
 		for name in Controls.DEV_ONLY:
@@ -1114,7 +1209,24 @@ static func apply_bindings() -> void:
 			_own_keys.erase(name)
 			if InputMap.has_action(name):
 				InputMap.erase_action(name)
+	if not Controls.addon_author():
+		# Reloading add-ons is for the add-ons given with --addons: no key, and no row in Controls, without.
+		for name in Controls.ADDON_AUTHOR_ONLY:
+			_default_keys.erase(name)
+			_own_keys.erase(name)
+			if InputMap.has_action(name):
+				InputMap.erase_action(name)
 	reload_factorio_keys()
+
+
+## Zenith's own defaults of the controls 2.0 changed (Controls.OLD_DEFAULTS): 0.2.2's with
+## Controls.old_defaults(), Factorio 2.1's without. Set on every call, as the switch can change while Zenith runs.
+static func apply_old_defaults() -> void:
+	for name in Controls.OLD_DEFAULTS:
+		if _own_keys.has(name):
+			var keys: Array = Controls.default_pair(name)
+			_default_keys[name] = keys
+			_own_keys[name] = keys.duplicate()
 
 
 ## factorio_keys.gd, loaded when used: it preloads this script (and paths.gd, which does too).
@@ -1138,9 +1250,129 @@ static func apply_factorio_keys(keys: Dictionary) -> void:
 		_set_keys(action, keys_for(action))
 
 
-## Reads Factorio's controls again (the setting was switched, or Factorio's changed).
-static func reload_factorio_keys() -> void:
-	apply_factorio_keys(_factorio_keys_script().read() if bool(get_value("factorio", "use_factorio_keys")) else {})
+## Reads Factorio's controls again (the setting was switched, or Factorio's changed), looking for
+## config.ini afresh (`search_again`: past paths.gd's remembered install too, as the copy button does).
+static func reload_factorio_keys(search_again := false) -> void:
+	var on := bool(get_value("factorio", "use_factorio_keys"))
+	_factorio_keys_source = _factorio_keys_lookup_source()
+	_factorio_keys_looked = Time.get_ticks_msec()
+	factorio_keys_lookups += 1
+	_read_factorio_keys(_factorio_keys_script().config_path(search_again) if on else "")
+
+
+## Factorio's controls from this config.ini ("": none, Zenith's own defaults).
+static func _read_factorio_keys(file: String) -> void:
+	_factorio_keys_file = file
+	_factorio_keys_time = FileAccess.get_modified_time(file) if file != "" else 0
+	var text := FileAccess.get_file_as_string(file) if file != "" else ""
+	_factorio_keys_length = text.length()
+	_factorio_keys_hash = text.hash()
+	_factorio_keys_settled = _factorio_keys_time_settled()
+	var r: Dictionary = _factorio_keys_script().report(text, Controls.old_defaults()) if file != "" else {"keys": {}, "copied": []}
+	factorio_keys_changed = (r["copied"] as Array).size()
+	apply_factorio_keys(r["keys"])
+
+
+## What config.ini is looked for with: a change here means looking again.
+static func _factorio_keys_lookup_source() -> String:
+	return "%s|%s|%s|%s" % [arg_value("--factorio="), get_value("factorio", "executable"), arg_value("--factorio-config="),
+		_factorio_keys_script().test_config]
+
+
+## Issue #26: reads Factorio's controls again when its config.ini changed (or appeared) since they
+## were read: main.gd asks when Zenith's window gets the focus back, so a key changed in Factorio
+## meanwhile is followed without a restart. True when they were read again. Costs a file's modified
+## time when nothing changed (plus reading and hashing its text in the few seconds after a write, as a
+## write in the same second leaves the time as it was): config.ini is looked for again (paths.gd's search, Steam's libraries)
+## only when where to look changed (Settings → Factorio install, --factorio=), when the file went, or
+## with none found, at most once a minute.
+static func refresh_factorio_keys() -> bool:
+	if _default_keys.is_empty() or not bool(get_value("factorio", "use_factorio_keys")):
+		return false
+	var same_source := _factorio_keys_lookup_source() == _factorio_keys_source
+	if same_source and _factorio_keys_file != "":
+		var time := FileAccess.get_modified_time(_factorio_keys_file) if FileAccess.file_exists(_factorio_keys_file) else 0
+		if time == _factorio_keys_time and (_factorio_keys_settled or not _factorio_keys_text_changed()):
+			return false
+		if time != 0:
+			_read_factorio_keys(_factorio_keys_file)
+			_notify("controls", "")
+			return true
+	elif same_source and Time.get_ticks_msec() - _factorio_keys_looked < FACTORIO_KEYS_LOOK_MSEC:
+		return false
+	var before := _factorio_keys_file
+	reload_factorio_keys()
+	if _factorio_keys_file == "" and before == "":
+		return false
+	_notify("controls", "")
+	return true
+
+
+## With no config.ini found, how often a focus-in looks for one again.
+const FACTORIO_KEYS_LOOK_MSEC := 60000
+## Seconds past config.ini's modified time after which a write would have moved it (FAT's two-second
+## times, and a second either way between the file system's clock and the system's).
+const FACTORIO_KEYS_SAME_SEC := 3
+
+
+static func _factorio_keys_time_settled() -> bool:
+	return Time.get_unix_time_from_system() >= _factorio_keys_time + FACTORIO_KEYS_SAME_SEC
+
+
+## The modified time is the one read: was config.ini written again within that second? Reads its text
+## (about 30 KB) only in the seconds after a write; settles once a check that late finds it the same.
+static func _factorio_keys_text_changed() -> bool:
+	var settled := _factorio_keys_time_settled()
+	factorio_keys_text_checks += 1
+	var text := FileAccess.get_file_as_string(_factorio_keys_file)
+	if text.length() != _factorio_keys_length or text.hash() != _factorio_keys_hash:
+		return true
+	_factorio_keys_settled = settled
+	return false
+
+
+## Issue #26, Settings → Controls → "Copy keys from Factorio": looks for config.ini afresh and reads
+## it, switches "Use the keys set in Factorio" on, and drops Zenith's saved binding of every action
+## Factorio has, so each follows Factorio's: the key changed there, else Factorio's default from
+## config.ini's "; " lines (Zenith's own default only where config.ini has neither). Zenith's own
+## controls (the camera, the views) keep theirs. Returns factorio_keys.gd's report plus `file` (the
+## config.ini read, "" when none was found), `reset` (the actions whose saved binding went) and
+## `clashes`: [[action, code, [Zenith-only actions]]] for each copied key that one of Zenith's own
+## controls (Factorio has none of them: camera tilt's Page Up, the debug line's F4 and the debug menu's
+## Control + F12 in dev builds, an add-on's) also has, so the message can say so.
+static func copy_factorio_keys() -> Dictionary:
+	var fk := _factorio_keys_script()
+	var file: String = fk.config_path(true)
+	var out: Dictionary = fk.report(FileAccess.get_file_as_string(file) if file != "" else "", Controls.old_defaults())
+	out["file"] = file
+	out["old_keys"] = Controls.old_defaults()
+	var reset: Array = []
+	if file == "":
+		out["reset"] = reset
+		return out
+	set_value("factorio", "use_factorio_keys", true, false)
+	reload_factorio_keys()  # the search above was afresh: this finds the same file
+	var theirs := {}
+	for control in fk.ACTIONS:
+		theirs[fk.ACTIONS[control]] = true
+	for action in _default_keys.keys():
+		if theirs.has(action) and _cfg.has_section_key("controls", action):
+			_cfg.erase_section_key("controls", action)
+			reset.append(action)
+		_set_keys(action, keys_for(action))
+	_cfg.save(path)
+	_notify("controls", "")
+	out["reset"] = reset
+	var clashes: Array = []
+	for c in out["copied"]:
+		var code := int(c[3])
+		if code <= 0 or keys_for(str(c[1]))[int(c[2])] != code:
+			continue
+		var own: Array = conflicts(str(c[1]), code).filter(func(a: String) -> bool: return not theirs.has(a))
+		if not own.is_empty():
+			clashes.append([str(c[1]), code, own])
+	out["clashes"] = clashes
+	return out
 
 
 ## A key event's code with its modifiers (KEY_MASK_SHIFT...), as OS.get_keycode_string names it.
@@ -1172,10 +1404,20 @@ static func keys_for(action: String) -> Array:
 		return default_keys(action)
 	var names := saved.split(",")
 	var keys: Array = []
+	var defaults := default_keys(action)
 	for i in 2:
 		var name := names[i].strip_edges() if i < names.size() else ""
-		keys.append(OS.find_keycode_from_string(name) if name != "" else 0)
+		if name == DEFAULT_SLOT:
+			keys.append(defaults[i])
+		else:
+			keys.append(OS.find_keycode_from_string(name) if name != "" else 0)
 	return keys
+
+
+## A saved binding's slot left at the default ("Shift+H,default"): it follows the default (Factorio's
+## key when that changes), like the slot Factorio leaves alone; issue #26. Before, rebinding one slot
+## saved the other as it was then, so a change in Factorio never reached it again.
+const DEFAULT_SLOT := "default"
 
 
 static func default_keys(action: String) -> Array:
@@ -1204,8 +1446,13 @@ static func bind(action: String, keys: Array) -> void:
 		_notify("controls", action)
 	else:
 		var names: Array = []
-		for code in codes:
-			names.append(OS.get_keycode_string(code) if code != 0 else "")
+		var defaults := default_keys(action)
+		for i in 2:
+			var code: int = codes[i]
+			if code == int(defaults[i]):
+				names.append(DEFAULT_SLOT)
+			else:
+				names.append(OS.get_keycode_string(code) if code != 0 else "")
 		set_value("controls", action, ",".join(names))
 	_set_keys(action, keys_for(action))
 

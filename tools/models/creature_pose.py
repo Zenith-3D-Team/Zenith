@@ -19,9 +19,9 @@ splats at half resolution), starting from a coarse grid of body rolls and pitche
 creature_poses.py (numbers only). The client blends the walking model's legs into each pose (a bite,
 a spit, a fall into the corpse) in the shader, from the legs' angles in creature_poses.json, and
 turns its body there the way the pose's body moved (see write_fall). wube.py builds these models through `write_posed` after their
-source (recipes with `"posed"` in wube_recipes.py). The worm's corpse is the worm (worm.py) fallen
-over the same way, without legs. Each corpse's body move also goes to client/data/creature_poses.json
-for the client's dying animation.
+source (recipes with `"posed"` in wube_recipes.py), each into its source's pack (tools/models/packs.py). The worm's corpse
+is the worm (worm.py) fallen over the same way, without legs. Each corpse's body move also goes to
+client/data/creature_poses.json for the client's dying animation.
 
 The silhouettes come from Factorio's install and stay in the git-ignored art-src/turntable/.
 """
@@ -35,6 +35,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import creature_score as cs  # noqa: E402
+import packs  # noqa: E402
 import turntable as tt  # noqa: E402
 import turntable_anim as ta  # noqa: E402
 
@@ -232,7 +233,7 @@ class Fitter(ta.Fitter):
 
 def fit(name, raw):
     source, anim, frame, opts = targets(raw)[name]
-    pts, uv, _col, tris, _tc, _tu = ta.load_points(os.path.join(tt.MODELS, source + ".glb"))
+    pts, uv, _col, tris, _tc, _tu = ta.load_points(packs.model_path(source))
     rig = PoseRig(source, tris.reshape(-1, 3), opts["limit"])
     if "roll" in opts:  # e.g. a corpse that lies on its belly, not on its side
         rig.lo[-3], rig.hi[-3] = opts["roll"]
@@ -301,11 +302,13 @@ def _read_glb(path):
     return out
 
 
-def write_posed(name, entry, palette, alpha, copyright_text, out_dir=tt.MODELS):
-    """The source model in the stored pose, written as a still model (no rig)."""
+def write_posed(name, entry, palette, alpha, copyright_text, out_dir=None):
+    """The source model in the stored pose, written as a still model (no rig): from `out_dir` into
+    it, or (None) from the packs into the source's pack."""
     import trimesh
     import wube
-    src = _read_glb(os.path.join(out_dir, entry["source"] + ".glb"))
+    source = os.path.join(out_dir, entry["source"] + ".glb") if out_dir else packs.model_path(entry["source"])
+    src = _read_glb(source)
     allv = np.concatenate([v for _, v, _, _ in src])
     rig = PoseRig(entry["source"], allv, math.pi)
     x = np.zeros(rig.n)
@@ -320,12 +323,11 @@ def write_posed(name, entry, palette, alpha, copyright_text, out_dir=tt.MODELS):
         mesh = trimesh.Trimesh(posed[at:at + len(v)], f, process=False)
         at += len(v)
         groups.append((material, wube.shaded(mesh)))
-    path = os.path.join(out_dir, name + ".glb")
+    path = os.path.join(out_dir, name + ".glb") if out_dir else packs.out_path(name, beside=entry["source"])
     # Materials the kit's palette doesn't have (Gleba's, gleba.py's own) come from the source model.
-    palette = dict(palette, **{k: v for k, v in _materials_of(os.path.join(out_dir, entry["source"] + ".glb")).items()
-                              if k not in palette})
+    palette = dict(palette, **{k: v for k, v in _materials_of(source).items() if k not in palette})
     wube.write_glb(path, groups, palette, alpha, copyright_text)
-    if os.path.abspath(out_dir) == os.path.abspath(tt.MODELS):
+    if not out_dir:
         write_fall(name, rig, x, allv, alluv, posed, entry)
     return path, sum(len(m.faces) for _, m in groups)
 
@@ -358,7 +360,7 @@ def _materials_of(path):
 
 def write_table(name, entry):
     """Only the client's table (write_fall) for a stored pose, the model left as it is."""
-    src = _read_glb(os.path.join(tt.MODELS, entry["source"] + ".glb"))
+    src = _read_glb(packs.model_path(entry["source"]))
     allv = np.concatenate([v for _, v, _, _ in src])
     alluv = np.concatenate([u for _, _, _, u in src])
     rig = PoseRig(entry["source"], allv, math.pi)

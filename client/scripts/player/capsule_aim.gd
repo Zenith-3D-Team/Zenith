@@ -78,7 +78,11 @@ func hold(item: String, ground: Vector2, delta: float) -> void:
 	if not in_range(item, ground):
 		pi.hud.show_message("Out of range")
 		return
-	Bridge.send({"t": "throw", "item": item, "x": int(ground.x * 256.0), "y": int(ground.y * 256.0)})
+	var cmd := {"t": "throw", "item": item, "x": int(ground.x * 256.0), "y": int(ground.y * 256.0)}
+	var hs: int = pi.hud.ui.build_slot() if item == str(pi.cursor_item) else 0
+	if hs > 0:
+		cmd["hs"] = hs  # thrown out of the held stack, as Factorio's cursor (L7)
+	Bridge.send(cmd)
 	last_target = ground
 	last_msec = Time.get_ticks_msec()
 

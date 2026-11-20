@@ -55,9 +55,17 @@ local NUM = {}
 for v = -1, 8192 do
   NUM[v] = tostring(v)
 end
+-- For a client that gets binary frames (transport.binary(2), docs/PROTOCOL.md "Binary frames") the numbers
+-- stay numbers (`raw`, set each tick by M.tick): string.pack takes them at about 31 ns each, against 59
+-- for their text and 34 for table.concat of it (2.1, live), and no text is made. Either encoder takes
+-- either kind, so a list written before the client's hello changed it is still sent whole.
 local STR, str_n = {}, 0
 local STR_MAX = 60000
+local raw = false
 local function S(v)
+  if raw then
+    return v
+  end
   local s = NUM[v]
   if s then
     return s
@@ -232,8 +240,9 @@ M.counts = { checked = 0, changed = 0, quiet = 0, flow = 0, scan_moved = 0, scan
 -- check only when either changed (two_call_line). A save that set it keeps its own value (storage.f3d_bs
 -- holds only what /f3d-bs set). far_tier (bridge.md change 8; off: it changes when far belts are read): the watched
 -- belts and the inserters and drills using belts at far_ring tiles or more from the focus are checked in turn,
--- far_units belt units an update, a cursor carrying on where the last update stopped (far_split), instead of
--- every one every update; within far_ring as before. The whole square stays loaded and simulated; a far input
+-- far_units belt units an update (1200), a cursor carrying on where the last update stopped (far_split), instead of
+-- every one every update; within far_ring as before. Far watches skip downstream tail catch-up and `read_runs`,
+-- and `bre` asked groups run nearest-first by scan index. The whole square stays loaded and simulated; a far input
 -- spot is read every few updates, an actor just before its belt, so one that acted wakes its belt in the same
 -- pass.
 -- target_spots (on; off: as before): an inserter's or drill's belt is its pickup or drop target when the game
@@ -292,19 +301,29 @@ M.counts = { checked = 0, changed = 0, quiet = 0, flow = 0, scan_moved = 0, scan
 -- checks pickup lanes every update). ins_ho (on; only under ins_driven): a put by an inserter inside inserters.lua's
 -- square (the detail radius round the focus, no remote view) for a client taking `ie` and `ho` isn't read: the client
 -- got the item itself (PLACED, its lane, place and id).
+-- quiet_pc (on; off: as before, every unwatched lane's drift check each pc_every updates): an unwatched belt whose
+-- drift check found nothing to change since its last (no full read of its lanes, no `bre` for them, nothing built,
+-- changed or acting next to it) has its next drift check twice as far off, up to quiet_pc_max ticks (3600, a minute:
+-- the owner's safety limit; near or far). Any touch puts it back to every turn (wake): a full read of one of its lanes
+-- (asked, run, tail, settle, reload), a watched belt behind it that changed or was put on (its tails' belts), a wired
+-- belt behind it switched on or off, a splitter behind it set again (tracker.configure_listeners). Offline a lane
+-- nothing touches stays the game's for 30 minutes with no reads at all (belts-quiet-reads-rd); its drift checks were
+-- 35-46% of a quiet line's belt work and 77% of its bytes. Kept in the belt's record (storage, game.tick), the same
+-- on every peer.
 M.OPTIONS = { feed_edges = true, full_area = true, inputs_first = true, line_rereads = true, bound = 0.6,
   actor_backoff = true, drift_far = true, bre_cap = 192, quiet_backoff = true, pc_ids = false, hold_inputs = true,
   area = "square", trace_near = 48, trace_hops = 200, trace_down = 8, checkpoints = false, crossings = "sim",
   own_rate = true, period_max = 6, drift_watched = false, walk_load = 1200, walk_near = 96, send_cap = 30000,
   extra_spread = true, quiet_first = true, watch_nosort = true, scan_step = true, far_load_cap = true, two_call = true,
-  far_tier = false, far_ring = 96, far_units = 4000, target_spots = true, drill_tails = true, built_now = true,
+  far_tier = false, far_ring = 96, far_units = 1200, target_spots = true, drill_tails = true, built_now = true,
   lane_next = true,
-  ins_driven = false, ins_ho = true, ins_window = 20 }
+  ins_driven = false, ins_ho = true, ins_window = 20, quiet_pc = true, quiet_pc_max = 3600 }
 M.OPTION_ORDER = { "feed_edges", "full_area", "inputs_first", "line_rereads", "bound", "actor_backoff", "drift_far",
   "bre_cap", "quiet_backoff", "pc_ids", "hold_inputs", "area", "trace_near", "trace_hops", "trace_down",
   "checkpoints", "crossings", "own_rate", "period_max", "drift_watched", "walk_load", "walk_near", "send_cap",
   "extra_spread", "quiet_first", "watch_nosort", "scan_step", "far_load_cap", "two_call", "far_tier", "far_ring",
-  "far_units", "target_spots", "drill_tails", "built_now", "lane_next", "ins_driven", "ins_ho", "ins_window" }
+  "far_units", "target_spots", "drill_tails", "built_now", "lane_next", "ins_driven", "ins_ho", "ins_window",
+  "quiet_pc", "quiet_pc_max" }
 -- The values a word switch takes.
 M.OPTION_VALUES = { area = { square = true, trace = true }, crossings = { sim = true, game = true } }
 local O = {}
@@ -348,6 +367,18 @@ function M.option_command(param)
       parts[#parts + 1] = k .. "=" .. tostring(M.counts[k])
     end
     return { "[Zenith] bs counts " .. game.tick .. ": " .. table.concat(parts, " ") }
+  end
+  -- (`/f3d-bs reads`: the full lane reads by cause since loading, watched belts' and the rest's, and drift checks.)
+  if tostring(param or ""):match("^%s*reads%s*$") then
+    local parts = {}
+    for _, c in ipairs(M.READ_CAUSES) do
+      local w, u = M.counts["rw_" .. c] or 0, M.counts["ru_" .. c] or 0
+      if w + u > 0 then
+        parts[#parts + 1] = c .. "=" .. w .. "/" .. u
+      end
+    end
+    return { "[Zenith] bs reads " .. game.tick .. " (watched/unwatched): " .. table.concat(parts, " ")
+      .. "; pc=" .. M.counts.pc .. " pc_quiet=" .. (M.counts.pc_quiet or 0) .. " woken=" .. (M.counts.woken or 0) }
   end
   local name, value = tostring(param or ""):match("^%s*([%w_]+)%s+(%S+)")
   local out = {}
@@ -959,7 +990,7 @@ local function write_meta(out, belt, unit, i, line, step, edge)
     local pm = line.get_line_item_position(len / 2)
     local p1 = line.get_line_item_position(len)
     m = { S(key), S(kind), S(fixed(len)), S(step), S(fixed(p0.x)), S(fixed(p0.y)), S(fixed(pm.x)), S(fixed(pm.y)),
-      S(fixed(p1.x)), S(fixed(p1.y)), "0", next_of(belt, unit, i, kind), exit_line(belt, i) }
+      S(fixed(p1.x)), S(fixed(p1.y)), S(0), next_of(belt, unit, i, kind), exit_line(belt, i) }
     m[0] = kind
     meta_cache[key] = m
   end
@@ -968,7 +999,7 @@ local function write_meta(out, belt, unit, i, line, step, edge)
     out[n + j] = m[j]
   end
   -- (A splitter's priorities and filter are read each time: set from its GUI, no event.)
-  out[n + 11] = (kind == 5 or kind == 6) and S(splitter_extra(belt)) or "0"
+  out[n + 11] = S((kind == 5 or kind == 6) and splitter_extra(belt) or 0)
   local nk = m[12]
   if edge and m[13] then
     -- (Leading out of what is sent: minus the lane it goes on into when the game says, else -1.)
@@ -1083,9 +1114,71 @@ local function new_payload(id)
   return { id = id, lm = {}, sl = {}, qu = {}, pc = {}, dl = {}, of = {}, ew = {}, sh = {}, sent = {}, msent = {} }
 end
 
+-- Why lanes are read in full (step 1 of belts-quiet-reads): a group of reads sets read_cause round them, or
+-- read_lane is given one; each read counted as M.counts.rw_<cause> (a watched belt's lane) or ru_<cause> (the rest).
+-- Module-local: counting only. load: a belt's first load; reload: loaded again; next: its next told again (lane_next);
+-- exits: a lane leading out; catch: round a belt built; run: a packed run round an asked lane; tail: the belts after
+-- a changed watched belt or a hand's take or put; settle: round one that settled; settled: a watched lane read once it
+-- stood; watched: a watched lane that changed; asked: `bre`; ins: a hand's take or put (ins_driven); edge: the edge
+-- checks.
+M.READ_CAUSES = { "load", "reload", "next", "exits", "catch", "run", "tail", "settle", "settled", "watched", "asked",
+  "ins", "edge", "other" }
+local read_cause = "other"
+local function set_cause(c)
+  local c0 = read_cause
+  read_cause = c
+  return c0
+end
+
+-- (quiet_pc) A belt touched: its drift checks every turn again. rec.qw: the ticks its next drift check may wait
+-- (nil: every turn); rec.ql: the tick of its last drift check (nil since the touch); rec.qt: its last turn's tick.
+local function wake(rec)
+  if rec and (rec.qw or rec.ql) then
+    rec.qw, rec.ql = nil, nil
+    M.counts.woken = (M.counts.woken or 0) + 1
+  end
+end
+
+-- The belts a belt feeds, `depth` on (a watched belt's tails' reach): woken.
+local function wake_after(b, unit, depth)
+  local rec = b.belts[unit]
+  if not rec or depth <= 0 then
+    return
+  end
+  for _, u in ipairs(rec[7] or {}) do
+    local r = b.belts[u]
+    if r and not b.wset[u] then
+      wake(r)
+    end
+    wake_after(b, u, depth - 1)
+  end
+end
+
+-- (quiet_pc, drop_put) A belt an item was put on that no event of the belt simulation's sees (Z, from Zenith or a
+-- player in the game window: ui_actions.lua): its drift checks every turn again at once, not after the wait it had
+-- grown (up to quiet_pc_max ticks). From a command or an event: storage only.
+function M.wake_unit(unit)
+  local b = storage.f3d and storage.f3d.bs
+  if b and b.belts and unit then
+    wake(b.belts[unit])
+  end
+end
+
+
+-- (quiet_pc) A splitter set again (its filter, its priorities): the belts after it woken, as a watched belt's tails.
+-- (Its lanes change at once in the game; a put or take's tails reach as far.)
+tracker.configure_listeners[#tracker.configure_listeners + 1] = function(entity)
+  local s = storage.f3d
+  local b = s and s.bs
+  local u = entity.unit_number
+  if b and b.belts and u and b.belts[u] and (entity.type == "splitter" or entity.type == "lane-splitter") then
+    wake_after(b, u, 2)
+  end
+end
+
 -- Reads lane i of a belt in full (and its meta with `meta`): its record in storage, what is sent
 -- into `p`. Returns the units it cost.
-local function read_lane(b, belt, unit, i, lines, meta, p, n, p1, pn, total)
+local function read_lane(b, belt, unit, i, lines, meta, p, n, p1, pn, total, why)
   local line = lines[i]
   local key = unit * LANE_KEYS + i
   local now = game.tick
@@ -1106,7 +1199,11 @@ local function read_lane(b, belt, unit, i, lines, meta, p, n, p1, pn, total)
   local br = b.belts[unit]
   if br then
     br[13] = nil
+    -- (quiet_pc: read in full, touched.)
+    wake(br)
   end
+  local ck = (b.wset[unit] and "rw_" or "ru_") .. (why or read_cause)
+  M.counts[ck] = (M.counts[ck] or 0) + 1
   if not rec[9] then
     rec[9] = fixed(line_len(lines, i))
   end
@@ -1151,15 +1248,16 @@ local function read_lane(b, belt, unit, i, lines, meta, p, n, p1, pn, total)
     local one = n >= 1 and total == n and one_kind(line)
     if one then
       one = S(one)
+      local single = S(1)
       for _, item in pairs(contents) do
-        sl[m + 1], sl[m + 2], sl[m + 3], sl[m + 4] = S(item.unique_id), one, S(fixed(item.position)), "1"
+        sl[m + 1], sl[m + 2], sl[m + 3], sl[m + 4] = S(item.unique_id), one, S(fixed(item.position)), single
         m = m + 4
       end
     else
       for _, item in pairs(contents) do
         local st = item.stack
         local c = st.count
-        sl[m + 1], sl[m + 2], sl[m + 3], sl[m + 4] = S(item.unique_id), S(registry.item_id(st.name)), S(fixed(item.position)), NUM[c > 4 and 4 or c]
+        sl[m + 1], sl[m + 2], sl[m + 3], sl[m + 4] = S(item.unique_id), S(registry.item_id(st.name)), S(fixed(item.position)), S(c > 4 and 4 or c)
         m = m + 4
         local q = st.quality.name
         if q ~= "normal" then
@@ -1329,7 +1427,7 @@ local function read_exits(b, belt, unit, p)
   local units = 0
   for i = 1, #lines do
     if exit_line(belt, i) and b.lanes[unit * LANE_KEYS + i] then
-      units = units + read_lane(b, belt, unit, i, lines, false, p)
+      units = units + read_lane(b, belt, unit, i, lines, false, p, nil, nil, nil, nil, "exits")
     end
   end
   return units
@@ -1362,7 +1460,7 @@ local function next_check(b, unit, p, count)
       if lr and lr[16] ~= (u ~= 0 and b.belts[u] == nil) then
         lines = lines or lines_of(belt, unit)
         if lines[i] then
-          units = units + read_lane(b, belt, unit, i, lines, true, p)
+          units = units + read_lane(b, belt, unit, i, lines, true, p, nil, nil, nil, nil, "next")
           M.counts[count] = (M.counts[count] or 0) + 1
         end
       end
@@ -1467,7 +1565,7 @@ local function load_belt(b, belt, unit, x, y, p)
     end
   end
   for i = 1, #lines do
-    units = units + read_lane(b, belt, unit, i, lines, true, p)
+    units = units + read_lane(b, belt, unit, i, lines, true, p, nil, nil, nil, nil, old and "reload" or "load")
   end
   -- Loaded belts that led into this one led out of what was sent: the client held their fronts
   -- where they were last read. Read again now (where the game has them as this one comes), and from
@@ -1493,8 +1591,9 @@ local function load_belt(b, belt, unit, x, y, p)
           end
         end
         if since < now then
-          local r0 = M.counts.read
+          local r0, c0 = M.counts.read, set_cause("catch")
           units = units + catch_up_fn(b, u, now - since, p, 0)
+          set_cause(c0)
           M.counts.r_catch = (M.counts.r_catch or 0) + M.counts.read - r0
         end
       end
@@ -1527,7 +1626,7 @@ local function load_belt(b, belt, unit, x, y, p)
     local off = is_off(belt)
     if off ~= (rec[6] or false) and p then
       p.of[#p.of + 1] = S(unit)
-      p.of[#p.of + 1] = off and "1" or "0"
+      p.of[#p.of + 1] = S(off and 1 or 0)
     end
     rec[6] = off
   end
@@ -1756,7 +1855,7 @@ local function watch_lane(b, belt, unit, i, lines, p)
     -- would send (it no longer changes).
     if c == M.quiet_after and rec[8] then
       M.counts.settled = (M.counts.settled or 0) + 1
-      local u = read_lane(b, belt, unit, i, lines, false, p, n, p1, pn, total)
+      local u = read_lane(b, belt, unit, i, lines, false, p, n, p1, pn, total, read_cause == "edge" and "edge" or "settled")
       rec[7], rec[8] = c, nil
       return CHECK_UNITS + extra + u, 2
     end
@@ -1797,7 +1896,7 @@ local function watch_lane(b, belt, unit, i, lines, p)
   M.counts.changed = M.counts.changed + 1
   -- (1: items came or went, 3: they only moved otherwise.)
   local came = n ~= rec[1] or total ~= rec[4]
-  local u = read_lane(b, belt, unit, i, lines, false, p, n, p1, pn, total)
+  local u = read_lane(b, belt, unit, i, lines, false, p, n, p1, pn, total, read_cause == "edge" and "edge" or "watched")
   rec[8] = true
   return CHECK_UNITS + extra + u, came and 1 or 3
 end
@@ -1850,10 +1949,13 @@ end
 local function settle_around(b, unit, p)
   local rec = b.belts[unit]
   local units = 0
+  local c0 = set_cause("settle")
   for _, u in ipairs(rec[7] or {}) do
     units = units + catch_up(b, u, 0, p, 0)
   end
-  return units + read_run(b, unit, p)
+  units = units + read_run(b, unit, p)
+  set_cause(c0)
+  return units
 end
 
 -- A packed run goes on across a belt's front (a lane's front item within a gap of its exit, its
@@ -1883,7 +1985,7 @@ local function read_runs(b, unit, ahead, behind, p)
     return 0
   end
   local units = 0
-  local r0 = M.counts.read
+  local r0, c0 = M.counts.read, set_cause("run")
   local function walk(field, front)
     local seen = { [unit] = true }
     local layer = { unit }
@@ -1914,6 +2016,7 @@ local function read_runs(b, unit, ahead, behind, p)
     walk(8, false)
   end
   M.counts.r_run = (M.counts.r_run or 0) + M.counts.read - r0
+  set_cause(c0)
   return units
 end
 
@@ -1925,6 +2028,14 @@ local function drift_check(b, belt, unit, p)
   local units = next_check(b, unit, p, "next_fix")
   local now = game.tick
   local unwatched = not b.wset[unit] or (ins_driven() and (b.belts[unit] or {})[16])
+  -- (quiet_pc: nothing touched it since its last check: twice as long to the next, up to quiet_pc_max ticks.)
+  local br = b.belts[unit]
+  if br and not b.wset[unit] then
+    if O.quiet_pc and br.ql and now > br.ql then
+      br.qw = math.min(tonumber(O.quiet_pc_max) or 0, 2 * (now - br.ql))
+    end
+    br.ql = now
+  end
   for i = 1, #lines do
     local key = unit * LANE_KEYS + i
     local rec = b.lanes[key]
@@ -2559,6 +2670,21 @@ end
 -- bs.round = {start, steps: the steady work's queue (reloads, `bre` lanes, watched belts, drift
 -- checks), i, units, scan (one being made)}.
 
+-- (quiet_pc) Whether a belt's drift check is due on this turn: none made since its touch, or the next turn would
+-- come past its wait (rec.qw ticks from its last). The turn's tick kept (rec.qt) for the gap between turns.
+local function quiet_due(rec, now)
+  local gap = now - (rec.qt or now)
+  rec.qt = now
+  if not (rec.qw and rec.ql) then
+    return true
+  end
+  if now - rec.ql + gap > rec.qw then
+    return true
+  end
+  M.counts.pc_quiet = (M.counts.pc_quiet or 0) + 1
+  return false
+end
+
 -- Drift checks' bands of rings {from, to, how many times pc_every apart} (drift_far), and without it.
 local DRIFT_NEAR = 48
 local DRIFT_BANDS = { { 0, DRIFT_NEAR, 1 }, { DRIFT_NEAR, 2 * DRIFT_NEAR, 2 }, { 2 * DRIFT_NEAR, math.huge, 4 } }
@@ -2678,7 +2804,7 @@ end
 -- made again when the watched list, the actors' list or the scan changed, at most every FAR_REBUILD updates
 -- for the same scan (an actor or watched belt new meanwhile waits that long for its first check). In
 -- storage (bs.ft), from the scan and the lists.
-local FAR_REBUILD = 4
+local FAR_REBUILD = 16
 local function far_split(b, w)
   local ft = b.ft
   local sc = b.scan
@@ -2688,11 +2814,22 @@ local function far_split(b, w)
     return ft
   end
   local idx, rings = sc.idx, sc.rings
-  local near_w, near_a, far = {}, {}, {}
+  local near_w, near_a = {}, {}
+  local far_b, far_a = {}, {}
+  local jmin, jmax = math.huge, 0
   for _, u in ipairs(w) do
     local j = idx[u]
     if j and rings[j] >= edge then
-      far[#far + 1] = { j * 2 + 1, 3, u }
+      local slot = far_b[j]
+      if slot == nil then
+        far_b[j] = u
+      elseif type(slot) == "number" then
+        far_b[j] = { slot, u }
+      else
+        slot[#slot + 1] = u
+      end
+      if j < jmin then jmin = j end
+      if j > jmax then jmax = j end
     else
       near_w[#near_w + 1] = u
     end
@@ -2704,22 +2841,50 @@ local function far_split(b, w)
         local j1, j2 = a[2] and idx[a[2]], a[3] and idx[a[3]]
         local j = j1 and j2 and math.min(j1, j2) or j1 or j2
         if j and rings[j] >= edge then
-          far[#far + 1] = { j * 2, 7, u }
+          local slot = far_a[j]
+          if slot == nil then
+            far_a[j] = u
+          elseif type(slot) == "number" then
+            far_a[j] = { slot, u }
+          else
+            slot[#slot + 1] = u
+          end
+          if j < jmin then jmin = j end
+          if j > jmax then jmax = j end
         else
           near_a[#near_a + 1] = u
         end
       end
     end
   end
-  table.sort(far, function(x, y)
-    if x[1] ~= y[1] then
-      return x[1] < y[1]
-    end
-    return x[3] < y[3]
-  end)
   local kinds, units = {}, {}
-  for k, f in ipairs(far) do
-    kinds[k], units[k] = f[2], f[3]
+  for j = jmin, jmax do
+    local sa = far_a[j]
+    if sa then
+      if type(sa) == "number" then
+        kinds[#kinds + 1] = 7
+        units[#units + 1] = sa
+      else
+        table.sort(sa)
+        for _, u in ipairs(sa) do
+          kinds[#kinds + 1] = 7
+          units[#units + 1] = u
+        end
+      end
+    end
+    local sb = far_b[j]
+    if sb then
+      if type(sb) == "number" then
+        kinds[#kinds + 1] = 3
+        units[#units + 1] = sb
+      else
+        table.sort(sb)
+        for _, u in ipairs(sb) do
+          kinds[#kinds + 1] = 3
+          units[#units + 1] = u
+        end
+      end
+    end
   end
   local i = ft and ft.i or 1
   b.ft = { key = key, scan = sc.tick, built = b.count, near_w = near_w, near_a = near_a, kinds = kinds, units = units,
@@ -2803,6 +2968,27 @@ local function make_queue(b, fr)
     g[#g + 1] = key
   end
   if #groups > 0 then
+    if b.scan and #groups > 1 then
+      local idx = b.scan.idx
+      local gidx = {}
+      for _, g in ipairs(groups) do
+        local best = math.huge
+        for x = 2, #g do
+          local j = idx[floor((g[x] - 1) / LANE_KEYS)]
+          if j and j < best then
+            best = j
+          end
+        end
+        gidx[g] = best
+      end
+      table.sort(groups, function(a, c)
+        local ia, ic = gidx[a], gidx[c]
+        if ia ~= ic then
+          return ia < ic
+        end
+        return a[2] < c[2]
+      end)
+    end
     q[#q + 1] = { 2, groups }
   end
   M.counts.bre_lanes = (M.counts.bre_lanes or 0) + #asked
@@ -2903,6 +3089,9 @@ local function make_queue(b, fr)
     local bands = O.drift_far and DRIFT_BANDS or DRIFT_ONE
     -- (ins_driven: a belt watched for its inserters alone gets drift checks, as unwatched ones: the safety net.)
     local driven = ins_driven()
+    -- (quiet_pc: an unwatched belt whose checks keep agreeing waits out its rec.qw; due on the last turn before
+    -- that would be passed, so a check is never more than qw apart: quiet_due.)
+    local quiet, now = O.quiet_pc, game.tick
     for _, band in ipairs(bands) do
       local r0, r1 = band[1], math.min(band[2], sc.top + 1)
       if r0 <= sc.top then
@@ -2913,7 +3102,9 @@ local function make_queue(b, fr)
           local unit = sc.units[j]
           local r = b.belts[unit]
           if r and (O.drift_watched or not b.wset[unit] or (driven and r[16])) and not b.oset[unit] and not b.iset[unit] then
-            list[#list + 1] = unit
+            if not (quiet and not b.wset[unit] and not quiet_due(r, now)) then
+              list[#list + 1] = unit
+            end
           end
         end
       end
@@ -2964,7 +3155,7 @@ local function event_lane(b, belt, unit, i, lines, p)
     return units, false
   end
   M.counts.ins_reads = (M.counts.ins_reads or 0) + 1
-  return units + read_lane(b, belt, unit, i, lines, false, p, n, p1, pn, total), true
+  return units + read_lane(b, belt, unit, i, lines, false, p, n, p1, pn, total, "ins"), true
 end
 
 -- (ins_driven) A belt watched for its inserters alone, after a hand took or put there: its lanes (event_lane), and the
@@ -2994,11 +3185,15 @@ local function event_belt(b, u, p, dt)
     b.iwin[u] = b.count + win
   end
   local extra = 0
+  if O.quiet_pc then
+    wake_after(b, u, TAIL_DEPTH)
+  end
   if M.tails and extra_left(b) then
-    local r0 = M.counts.read
+    local r0, c0 = M.counts.read, set_cause("tail")
     for _, w in ipairs(rec[7] or {}) do
       extra = extra + catch_up(b, w, math.max(1, dt), p, CATCH_DEPTH - TAIL_DEPTH + 1)
     end
+    set_cause(c0)
     M.counts.r_tail = (M.counts.r_tail or 0) + M.counts.read - r0
     extra_spend(b, extra)
   end
@@ -3137,7 +3332,7 @@ local function actor_check(b, unit, period, p)
 end
 
 local STEP_NAMES = { "bs.reload", "bs.bre", "bs.watch", "bs.drift", nil, nil, "bs.actor", nil, "bs.far" }
-local function do_step(b, kind, v, p, period)
+local function do_step(b, kind, v, p, period, far)
   if kind == 7 then
     return actor_check(b, v, period, p)
   elseif kind == 2 then
@@ -3151,7 +3346,7 @@ local function do_step(b, kind, v, p, period)
       if rec and rec[1].valid then
         local lines = lines_of(rec[1], unit)
         if lines[i] then
-          units = units + read_lane(b, rec[1], unit, i, lines, true, p)
+          units = units + read_lane(b, rec[1], unit, i, lines, true, p, nil, nil, nil, nil, "asked")
           if not units_of[unit] then
             units_of[unit] = true
             units_of[#units_of + 1] = unit
@@ -3161,8 +3356,12 @@ local function do_step(b, kind, v, p, period)
         units = units + 1
       end
     end
+    local far_edge = O.far_tier and b.scan and (tonumber(O.far_ring) or 96) or nil
+    local sc_idx = far_edge and b.scan.idx
+    local sc_rings = far_edge and b.scan.rings
     for _, unit in ipairs(units_of) do
-      if O.line_rereads and extra_left(b) then
+      local j = sc_idx and sc_idx[unit]
+      if O.line_rereads and extra_left(b) and not (j and sc_rings[j] >= far_edge) then
         local x = read_runs(b, unit, true, true, p)
         extra_spend(b, x)
         extra = extra + x
@@ -3264,17 +3463,22 @@ local function do_step(b, kind, v, p, period)
     -- (On this tick, as the lane's own read: a read a tick later would move this one's items. Apart
     -- from the units the steady limit counts, so every input spot is checked first.)
     local extra = 0
-    if (changed or dsince) and M.tails and (rec[11] or t == "splitter" or t == "lane-splitter") and extra_left(b) then
-      local r0 = M.counts.read
+    if (changed or dsince) and O.quiet_pc and (rec[11] or t == "splitter" or t == "lane-splitter") then
+      -- (quiet_pc: the belts its tails reach woken, read or not: a put or take there runs on into them.)
+      wake_after(b, v, TAIL_DEPTH)
+    end
+    if not far and (changed or dsince) and M.tails and (rec[11] or t == "splitter" or t == "lane-splitter") and extra_left(b) then
+      local r0, c0 = M.counts.read, set_cause("tail")
       for _, u in ipairs(rec[7] or {}) do
         extra = extra + catch_up(b, u, math.max(1, now - since), p, CATCH_DEPTH - TAIL_DEPTH + 1)
       end
+      set_cause(c0)
       M.counts.r_tail = (M.counts.r_tail or 0) + M.counts.read - r0
       if dsince and not changed then
         M.counts.r_drill = (M.counts.r_drill or 0) + M.counts.read - r0
       end
     end
-    if settled and M.settle_around and (rec[11] or t == "splitter" or t == "lane-splitter") and extra_left(b) then
+    if not far and settled and M.settle_around and (rec[11] or t == "splitter" or t == "lane-splitter") and extra_left(b) then
       local r0 = M.counts.read
       extra = extra + settle_around(b, v, p)
       M.counts.r_settle = (M.counts.r_settle or 0) + M.counts.read - r0
@@ -3285,9 +3489,11 @@ local function do_step(b, kind, v, p, period)
       units = units + 1
       if off ~= (rec[6] or false) then
         M.counts.of = M.counts.of + 1
+        -- (quiet_pc: the belts after it start or stop: woken.)
+        wake_after(b, v, TAIL_DEPTH)
         if p then
           p.of[#p.of + 1] = S(v)
-          p.of[#p.of + 1] = off and "1" or "0"
+          p.of[#p.of + 1] = S(off and 1 or 0)
         end
       end
       rec[6] = off
@@ -3311,6 +3517,7 @@ local function check_edges(b, p)
   end
   table.sort(list)
   local units = 0
+  local c0 = set_cause("edge")
   local fed = {}
   for unit in pairs(O.feed_edges and b.iset or {}) do
     fed[#fed + 1] = unit
@@ -3346,6 +3553,7 @@ local function check_edges(b, p)
     end
   end
   profile.stop("bs.edge", t)
+  set_cause(c0)
   return units
 end
 
@@ -3382,8 +3590,108 @@ local function part_text(head, k, part)
   return table.concat(text)
 end
 
+-- The binary twin of part_text, for a client that gets binary frames (docs/PROTOCOL.md, "Binary frames",
+-- kind 17): the same ranges packed with string.pack, never turned into text. The head's numbers as u32
+-- (fx, fy signed), then one block a field in BIN_FIELDS' order, then qu. Every lane key (a record's
+-- first number, and lm's next) is written as two numbers, the belt's unit number and the line index
+-- (signed as the key: lm's next -1 is 0, -1), so a part stays 32-bit whatever the unit numbers reach.
+-- `width` 4 or 8; throws when a number doesn't fit (spool_step tries 8, then the text).
+local BIN_FIELDS = { "lm", "sl", "ew", "sh", "pc", "pu", "dl", "of" }
+-- Numbers a record (0: sl, by its count) and whether it starts with a lane key.
+local BIN_STRIDE = { lm = 12, sl = 0, ew = 4, sh = 2, pc = 5, pu = 3, dl = 1, of = 2 }
+local BIN_KEYED = { lm = true, sl = true, ew = true, sh = true, pc = true, pu = true, dl = true }
+
+-- A lane key (a number or its text) as the belt's unit number and line index: 0 is 0, 0; minus a
+-- key (lm's next leading out) has the line negative.
+local function lane_pair(key)
+  local v = tonumber(key)
+  if v == 0 then
+    return 0, 0
+  end
+  local a = v < 0 and -v or v
+  local unit = floor((a - 1) / LANE_KEYS)
+  local line = a - unit * LANE_KEYS
+  return unit, v < 0 and -line or line
+end
+
+local bin_tmp = {}
+local function part_bin(scalars, k, number, part, width)
+  local pack, run_format = string.pack, transport.run_format
+  local out = { pack("<I4I4I4I4I4i4i4I4I4", k, number, scalars[1], scalars[2], scalars[3], scalars[4], scalars[5],
+    scalars[6], scalars[7]) }
+  local tmp = bin_tmp
+  for _, field in ipairs(BIN_FIELDS) do
+    local ranges = part[field]
+    local head = #out + 1
+    out[head] = ""
+    local count = 0
+    if field == "sl" then
+      -- (A range is one lane: its key split, the rest packed straight from the list.)
+      for r = 1, #ranges, 3 do
+        local list, a, b = ranges[r], ranges[r + 1], ranges[r + 2]
+        local u, l = lane_pair(list[a])
+        if b - a <= transport.PACK_RUN then
+          out[#out + 1] = pack(run_format(width, b - a + 2), u, l, table.unpack(list, a + 1, b))
+        else
+          out[#out + 1] = pack(run_format(width, 2), u, l)
+          transport.pack_runs(out, list, a + 1, b, width)
+        end
+        count = count + b - a + 2
+      end
+    elseif #ranges > 0 then
+      -- (Short records, or few: copied with their keys split, then packed.)
+      local stride, keyed = BIN_STRIDE[field], BIN_KEYED[field]
+      local n = 0
+      for r = 1, #ranges, 3 do
+        local list, a, b = ranges[r], ranges[r + 1], ranges[r + 2]
+        for x = a, b, stride do
+          local y = 0
+          if keyed then
+            tmp[n + 1], tmp[n + 2] = lane_pair(list[x])
+            n, y = n + 2, 1
+          end
+          for j = x + y, x + stride - 1 do
+            n = n + 1
+            tmp[n] = list[j]
+          end
+          if field == "lm" then
+            -- (Its last number, next, is a key too.)
+            tmp[n], tmp[n + 1] = lane_pair(list[x + 11])
+            n = n + 1
+          end
+        end
+      end
+      transport.pack_runs(out, tmp, 1, n, width)
+      count = n
+      for j = n, 1, -1 do
+        tmp[j] = nil
+      end
+    end
+    out[head] = pack("<BI4", width, count)
+  end
+  -- qu: the items' unique ids as a block, then their quality names joined by commas (u32 bytes, the text).
+  local ranges = part.qu
+  local names, n = {}, 0
+  for r = 1, #ranges, 3 do
+    local list = ranges[r]
+    for y = ranges[r + 1], ranges[r + 2], 2 do
+      n = n + 1
+      tmp[n] = list[y]
+      names[n] = list[y + 1]
+    end
+  end
+  out[#out + 1] = pack("<BI4", width, n)
+  transport.pack_runs(out, tmp, 1, n, width)
+  for j = n, 1, -1 do
+    tmp[j] = nil
+  end
+  local text = table.concat(names, ",")
+  out[#out + 1] = pack("<I4", #text) .. text
+  return table.concat(out)
+end
+
 -- The spool (send_cap): parts waiting to be sent, oldest first, each {head, part number, the part's
--- ranges, the update's tick}. Module-local: only what is sent depends on it, never storage, and a
+-- ranges, the update's tick, the head's numbers for part_bin}. Module-local: only what is sent depends on it, never storage, and a
 -- peer that loaded the save mid-update sends less.
 local spool = {}
 local SPOOL_LONG = 12
@@ -3401,17 +3709,42 @@ local function spool_step(cap)
     return
   end
   local bytes, sent = 0, 0
+  local bin = transport.binary(2)
   while #spool > 0 do
     local item = spool[1]
-    -- (bse.text: the part's text; bse.send: handing it to transport, a datagram when the batch fills.)
+    -- (bse.text: the part's text, or its bytes (bse.bin); bse.send: handing it to transport, a datagram
+    -- when the batch fills. The part's `k` is its update's tick, not this one's.)
     local te = profile.start()
-    local text = part_text(item[1], item[2], item[3])
-    profile.stop("bse.text", te)
-    te = profile.start()
-    -- (The part's `k` is its update's tick, not this one's.)
-    transport.send_text_at("bs", item[4], text)
+    local body
+    if bin then
+      -- (32-bit, else 64-bit when some number doesn't fit, else the text as before.)
+      local ok
+      ok, body = pcall(part_bin, item[5], item[4], item[2], item[3], 4)
+      if not ok then
+        ok, body = pcall(part_bin, item[5], item[4], item[2], item[3], 8)
+        M.counts.bin_wide = (M.counts.bin_wide or 0) + 1
+      end
+      if not ok then
+        body = nil
+        M.counts.bin_text = (M.counts.bin_text or 0) + 1
+      end
+      profile.stop("bse.bin", te)
+    end
+    local size
+    if body then
+      te = profile.start()
+      transport.send_frame(transport.KIND_BS, "bs", body)
+      size = #body
+    else
+      te = profile.start()
+      local text = part_text(item[1], item[2], item[3])
+      profile.stop("bse.text", te)
+      te = profile.start()
+      transport.send_text_at("bs", item[4], text)
+      size = #text
+    end
     profile.stop("bse.send", te)
-    bytes, sent = bytes + #text, sent + 1
+    bytes, sent = bytes + size, sent + 1
     table.remove(spool, 1)
     if bytes >= cap and not (#spool > SPOOL_LONG and sent < 2) then
       break
@@ -3497,10 +3830,12 @@ local function emit(b, p, period, fr, work, loading)
   local head = ',"parts":' .. #parts .. ',"p":' .. period .. ',"w":' .. floor(work)
     .. ',"fx":' .. world.fixed(sc and sc.fx or 0) .. ',"fy":' .. world.fixed(sc and sc.fy or 0) .. ',"fr":' .. fr
     .. (loading and ',"ld":1' or "")
+  local scalars = { #parts, period, floor(work), world.fixed(sc and sc.fx or 0), world.fixed(sc and sc.fy or 0), fr,
+    loading and 1 or 0 }
   -- (send_cap: the parts join the spool, sent over the ticks from this one; off, all now.)
   local n = #spool
   for k = 1, #parts do
-    spool[n + k] = { head, k, parts[k], game.tick }
+    spool[n + k] = { head, k, parts[k], game.tick, scalars }
   end
   spool_step(send_cap())
 end
@@ -3696,6 +4031,7 @@ end
 
 function M.tick()
   read_options()
+  raw = transport.binary(2)
   local s = storage.f3d
   local r = radius()
   if r <= 0 then
@@ -3805,7 +4141,7 @@ function M.tick()
       -- once at most an update.
       local ft = b.ft
       local n = ft and ft.units == list and #list or 0
-      local cap = tonumber(O.far_units) or 4000
+      local cap = tonumber(O.far_units) or 1200
       local tk = profile.start()
       while n > 0 and (round.fdone or 0) < n and (round.fspent or 0) < cap and spent < limit and xtick < xcap do
         local k = ft.i
@@ -3813,7 +4149,7 @@ function M.tick()
           k = 1
         end
         ft.i = k + 1
-        local u, x = do_step(b, ft.kinds[k], list[k], p, period)
+        local u, x = do_step(b, ft.kinds[k], list[k], p, period, true)
         spent = spent + u
         round.fspent = (round.fspent or 0) + u
         round.fdone = (round.fdone or 0) + 1

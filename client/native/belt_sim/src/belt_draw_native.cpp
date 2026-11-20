@@ -593,6 +593,15 @@ void BeltDrawNative::_apply_changes(const Dictionary &ch) {
 	PackedInt64Array gone_ticks = ch.has("gone_tick") ? (PackedInt64Array)ch["gone_tick"] : PackedInt64Array();
 	PackedInt32Array gone_at = ch.has("gone_at") ? (PackedInt32Array)ch["gone_at"] : PackedInt32Array();
 	gone_n = gone.size();
+	if (turn_id && ch.has("num")) {
+		// (turn_id) The simulation's number for each item changed (belt_items.gd).
+		PackedInt64Array nums = ch["num"];
+		for (int64_t i = 0; i < nums.size() && i < uids.size(); i++) {
+			if (nums[i] >= 0) {
+				nums_of[uids[i]] = nums[i];
+			}
+		}
+	}
 	// (take_changes() fills the lists in lockstep; a shorter one, from any other caller of run_job,
 	// is never read past its end.)
 	i64 n_ch = uids.size();
@@ -1014,6 +1023,9 @@ bool BeltDrawNative::_apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos
 		return false;
 	}
 	if (v != it->v) {
+		if (v == 0 && early_stop) {
+			_cut_at_stop(it, key, pos, t0, now);
+		}
 		return false;
 	}
 	i64 d = it->v * (t0 - it->t0);
@@ -1044,6 +1056,52 @@ bool BeltDrawNative::_apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos
 	return true;
 }
 
+// belt_items.gd's _cut_at_stop: a stop after the drawn tick that a moving item's record runs into; the record
+// made again from where the item is now, ending at the stop (the stop stays waiting). Made once.
+void BeltDrawNative::_cut_at_stop(Item *it, i64 key, i64 pos, i64 t0, i64 now) {
+	i64 ds = it->v * (t0 - it->t0);
+	if (ds <= 0) {
+		return;
+	}
+	Vector2i at = _advance(it->lane, it->pos, ds);
+	i64 k = -1;
+	if (at.y > 0 && (i64)at.x == key && pos >= (i64)at.y && pos - (i64)at.y < it->v) {
+		k = pos - (i64)at.y;
+	} else {
+		for (i64 j = 0; j < it->v; j++) {
+			Vector2i a2 = _advance(it->lane, it->pos, ds - j);
+			if ((i64)a2.x == key && (i64)a2.y == pos) {
+				k = j;
+				break;
+			}
+		}
+	}
+	if (k < 0) {
+		return;
+	}
+	ds -= k;
+	if (ds >= it->reach) {
+		return;
+	}
+	i64 d0 = std::max<i64>(0, std::min<i64>(it->v * (now - it->t0), ds));
+	Vector2i from = _advance(it->lane, it->pos, d0);
+	it->lane = from.x;
+	it->pos = from.y;
+	it->t0 = d0 > 0 ? std::max<i64>(it->t0, now) : it->t0;
+	it->reach = ds - d0;
+	auto f = lanes.find(it->lane);
+	it->run = (f != lanes.end() && f->second.m[0] == STRAIGHT) ? it->pos + sim->run_of(it->lane) : 0;
+	early_stop_n++;
+	int why = _hide_why(it->lane, it->pos, it->reach, it->v);
+	if (why != 0) {
+		_park(it);
+		_set_lat(it, why == 2);
+		parked++;
+		return;
+	}
+	_plan(it);
+}
+
 void BeltDrawNative::_apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run) {
 	Item **pit = items.get(uid);
 	Item *it;
@@ -1066,6 +1124,22 @@ void BeltDrawNative::_apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, 
 		}
 	}
 	kept.erase(it);
+	if (turn_id) {
+		// (turn_id) Turned by its number along its run, as the lattice's slot that has it (belt_items.gd).
+		auto nm = nums_of.find(uid);
+		if (nm != nums_of.end() && nm->second != it->num) {
+			it->num = nm->second;
+			double na = beltn::lattice_turn(it->num, TURN_RUN);
+			it->c = std::cos(na);
+			it->s = std::sin(na);
+		}
+	}
+	if (it->key >= 0) {
+		i64 mk = _model_key(it);
+		if (mk != it->key) {
+			_rekey(it, mk);
+		}
+	}
 	_set_count(it, stack);
 	it->lane = key;
 	it->pos = pos;
@@ -1288,6 +1362,7 @@ void BeltDrawNative::_keep_or_drop() {
 }
 
 void BeltDrawNative::_remove(i64 uid) {
+	nums_of.erase(uid);
 	Item **pit = items.get(uid);
 	if (pit == nullptr) {
 		return;
@@ -1367,8 +1442,9 @@ void BeltDrawNative::_place(Item *it) {
 void BeltDrawNative::_cap_models() {
 	if (model_cap < 0) {
 		for (Item *it : items.val_list()) {
-			if (it->key != it->item_id) {
-				_rekey(it, it->item_id);
+			i64 mk = _model_key(it);
+			if (it->key != mk) {
+				_rekey(it, mk);
 			}
 		}
 		return;
@@ -1379,13 +1455,17 @@ void BeltDrawNative::_cap_models() {
 	std::vector<char> models;
 	for (Item *it : items.val_list()) {
 		auto lk = known.find(it->item_id);
+		i64 mk = _model_key(it);
 		if (lk != known.end() && !lk->second.turns) {
-			if (it->key != it->item_id) {
-				_rekey(it, it->item_id);
+			if (it->key != mk) {
+				_rekey(it, mk);
 			}
 			continue;
 		}
-		bool model = it->key == it->item_id;
+		bool model = it->key >= 0;
+		if (model && it->key != mk) {
+			_rekey(it, mk);
+		}
 		sel.push_back(it);
 		models.push_back(model ? 1 : 0);
 		if (cam_led) {
@@ -1427,7 +1507,7 @@ void BeltDrawNative::_cap_models() {
 		double d = (double)dists[i];
 		bool want = d < INFINITY && d <= (model ? keep : limit);
 		if (want != model) {
-			_rekey(it, want ? it->item_id : -it->item_id - 1);
+			_rekey(it, want ? _model_key(it) : -it->item_id - 1);
 		}
 	}
 }
@@ -1438,6 +1518,17 @@ bool BeltDrawNative::_cam_moved() const {
 		return true;
 	}
 	return cam_led && ((double)cam_pos.distance_squared_to(capped_cam_pos) > CAM_STEP * CAM_STEP || (double)cam_dir.dot(capped_cam_dir) < CAM_TURN);
+}
+
+// belt_items.gd Job._model_key: the item with the variant of its model who it is picks, as its turn.
+i64 BeltDrawNative::_model_key(const Item *it) const {
+	auto lk = known.find(it->item_id);
+	i64 n = lk != known.end() ? lk->second.variants : 0;
+	if (n < 2) {
+		return it->item_id;
+	}
+	i64 v = it->num >= 0 ? beltn::lattice_variant(it->num, TURN_RUN, n) : beltn::lattice_variant(it->uid, 0, n);
+	return it->item_id + v * VARIANT_STEP;
 }
 
 void BeltDrawNative::_rekey(Item *it, i64 key) {
@@ -1772,6 +1863,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	dumping = (bool)params.get("dump", false);
 	coalesce = (bool)params.get("coalesce", true);
 	early = (bool)params.get("early", true);
+	early_stop = (bool)params.get("early_stop", true);
 	view_cull = (bool)params.get("view_cull", true);
 	lead_on = (bool)params.get("lead_on", true);
 	gone_order = (bool)params.get("gone_order", true);
@@ -1789,10 +1881,12 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	}
 	later_tick = (bool)params.get("later_tick", true);
 	park_lat = (bool)params.get("park_lat", false);
+	turn_id = (bool)params.get("turn_id", false);
 	ask_mode = (int)params.get("ask", 0);
 	ask_near = (bool)params.get("ask_near", true);
 	// The kinds' looks and the far icons' chunks are given only when they changed (belt_items.gd, A4):
 	// otherwise those of the last job stand.
+	known_given = params.has("known");
 	if (params.has("known")) {
 		known.clear();
 		Dictionary kn = params["known"];
@@ -1804,6 +1898,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 				l.lift = (Vector3)look[0];
 				l.turns = (bool)look[1];
 				l.pile = look.size() > 2 ? (double)look[2] : 0.07;
+				l.variants = look.size() > 3 ? (i64)look[3] : 0;
 				known[(i64)kk[i]] = l;
 			}
 		}
@@ -1823,7 +1918,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	}
 	written = Array();
 	unknown = Array();
-	records_written = changes = coalesced = early_n = renewed = gone_n = parked = unparked = 0;
+	records_written = changes = coalesced = early_n = early_stop_n = renewed = gone_n = parked = unparked = 0;
 	early_tries = ask_view = ask_lat = ask_out = ask_held = lat_parks = lat_unparks = drained = 0;
 	resend.clear();
 	paths = Ref<Image>();
@@ -1845,6 +1940,18 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	// and a taken item's record hide on the take's tick; a guess the take didn't make is shown again.
 	// (Only a take after the drawn tick hides a record: belt_items.gd Job._hands.)
 	i64 h_now = (i64)std::floor(fold_tick);
+	// (--pickup-hide-now) F's takes (`pku`, the game's unique ids) hide from now, before the peeks: belt_items.gd
+	// Job._hands.
+	if (ch.has("now_uid")) {
+		PackedInt64Array nu = ch["now_uid"];
+		for (int64_t j = 0; j < nu.size(); j++) {
+			Item **nit = items.get(nu[j]);
+			if (nit != nullptr && (double)h_now > base && ((*nit)->hide_at < 0.0 || (*nit)->hide_at > (double)h_now)) {
+				(*nit)->hide_at = (double)h_now;
+				_mark(*nit);
+			}
+		}
+	}
 	if (ch.has("peek_uid")) {
 		PackedInt64Array pu = ch["peek_uid"];
 		PackedInt64Array pt = ch["peek_tick"];
@@ -1922,7 +2029,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	i64 tk = now_us();
 	_keep_or_drop();
 	i64 cap_us = 0;
-	if (model_cap != capped_at || (model_cap >= 0 && (square != capped_square || cap_jobs >= CAP_EVERY || _cam_moved()))) {
+	if (known_given || model_cap != capped_at || (model_cap >= 0 && (square != capped_square || cap_jobs >= CAP_EVERY || _cam_moved()))) {
 		capped_square = square;
 		capped_at = model_cap;
 		capped_cam = cam_led;
@@ -2009,6 +2116,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	res["changes"] = changes;
 	res["coalesced"] = coalesced;
 	res["early"] = early_n;
+	res["early_stop"] = early_stop_n;
 	res["renewed"] = renewed;
 	res["gone_n"] = gone_n;
 	res["parked"] = parked;
@@ -2162,5 +2270,7 @@ void BeltDrawNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("run_job", "changes", "params"), &BeltDrawNative::run_job);
 	ClassDB::bind_method(D_METHOD("drawn", "key", "t"), &BeltDrawNative::drawn);
 	ClassDB::bind_method(D_METHOD("has_item", "uid"), &BeltDrawNative::has_item);
+	ClassDB::bind_method(D_METHOD("key_of", "uid"), &BeltDrawNative::key_of);
+	ClassDB::bind_method(D_METHOD("hide_of", "uid"), &BeltDrawNative::hide_of);
 	ClassDB::bind_method(D_METHOD("stats"), &BeltDrawNative::stats);
 }

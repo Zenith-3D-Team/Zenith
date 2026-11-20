@@ -1,6 +1,7 @@
 extends Button
 ## One of Factorio's technology slots (72x100 at 100%): the technology_slot image for its state
-## (yellow available, green researched, red not yet available; toggled is the highlighted look),
+## (yellow available, green researched, red not yet available, orange conditionally available;
+## toggled is the highlighted look),
 ## its icon, the science packs it costs on the band at the bottom, the research progress bar when
 ## it is being researched and its place in the queue. `compact` draws a 40x40 slot-sized version
 ## for the queue.
@@ -8,7 +9,10 @@ extends Button
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 
-const STATES := ["unavailable", "available", "researched"]  # by the mod's state 0/1/2
+## By the mod's state 0/1/2, then the client's own 3: not yet available, but Start research queues it
+## with what it needs (research_window.gd slot_state), Factorio's conditionally_available_technology_slot.
+const STATES := ["unavailable", "available", "researched", "conditional"]
+const CONDITIONAL := 3
 
 var tech := ""
 var state := 1
@@ -32,9 +36,10 @@ var level_range := ""
 var big := false
 
 ## The strip between the icon and the packs, and the level badge on it, by state (measured on
-## Factorio's tree at 100%).
-const STRIP := [Color8(141, 42, 41), Color8(117, 97, 24), Color8(0, 114, 25)]
-const BADGE := [Color8(255, 215, 214), Color8(255, 238, 178), Color8(166, 255, 172)]
+## Factorio's tree at 100%). The orange ones are the middles of style.lua's level_range_band and
+## level_band on its row of the GUI atlas (x 397 and 381, y 153), which the others match within 6.
+const STRIP := [Color8(141, 42, 41), Color8(117, 97, 24), Color8(0, 114, 25), Color8(147, 86, 2)]
+const BADGE := [Color8(255, 215, 214), Color8(255, 238, 178), Color8(166, 255, 172), Color8(255, 235, 207)]
 const STRIP_HEIGHT := 12
 
 
@@ -46,7 +51,7 @@ func _init() -> void:
 
 func setup(name: String, new_state: int, new_packs: Array, small := false) -> void:
 	tech = name
-	state = clampi(new_state, 0, 2)
+	state = clampi(new_state, 0, STATES.size() - 1)
 	packs = new_packs
 	compact = small
 	theme_type_variation = "FTech" + str(STATES[state]).capitalize()

@@ -7,7 +7,9 @@ extends SceneTree
 ##
 ##   godot --headless --path client -s res://tests/belt_bs_replay.gd -- --stream=bs.jsonl --truth=rec.json
 ##       [--explain=N] [--dump=out.json --dump-at=TICK] [--gd]
-## --gd runs belt_sim.gd even when BeltSimNative is loaded. --replay-bre answers the job's own `bre`
+## --gd runs belt_sim.gd even when BeltSimNative is loaded. --binary: each `bs` part goes through binary frames
+## first (tests/wire_encode.gd writes it as the bridge does for a wire version 2 client, wire_decode.gd reads
+## it), as the client gets them from a bridge sending binary: the replay must come out the same. --replay-bre answers the job's own `bre`
 ## from the recording two updates on (off by default: a live capture holds the bridge's answers already). The drawing's toggles (--belt-sim-ahead=N,
 ## --belt-draw-gone-order=off, --belt-draw-lead=off, --belt-draw-head-move=off) as the client reads them. --drawn-check: by place, the simulation and
 ## what its items' records draw against the game.
@@ -29,6 +31,7 @@ const BeltItems := preload("res://scripts/world/belt_items.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
 const BeltRecords := preload("res://scripts/world/belt_records.gd")
 const BeltSim := preload("res://scripts/world/belt_sim.gd")
+const WireEncode := preload("res://tests/wire_encode.gd")
 
 
 ## (--drawn-check) The job, keeping each item's last change as the simulation gave it (uid -> [lane,
@@ -103,6 +106,8 @@ const DX_TOL := 0.02
 
 func _initialize() -> void:
 	var stream := ""
+	var binary := false  # --binary
+	var binary_bad := 0
 	var truth := ""
 	var explain := 0
 	var explain_from := 0
@@ -124,6 +129,7 @@ func _initialize() -> void:
 	var every_tick := false
 	var lag := -1
 	var job_every := 1  # --job-every=N (with --every-tick): a job every N ticks instead
+	var job_lead := -1.0  # --job-lead=N: each job's lead (belt_items.gd Job.lead), -1: as the client sets it from the job's ticks
 	# --oracle-at=TICK: at the first recorded tick at or after it, every recorded lane is read (its items as
 	# the recording has them, as `sl`), so the simulation starts from the game's state there. --reads-after=
 	# none: after that tick no lane reads (`sl`, nor answers to `bre`) are applied: the simulation alone.
@@ -166,6 +172,8 @@ func _initialize() -> void:
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--stream="):
 			stream = a.substr(9)
+		elif a == "--binary":
+			binary = true
 		elif a.begins_with("--truth="):
 			truth = a.substr(8)
 		elif a.begins_with("--explain="):
@@ -241,6 +249,8 @@ func _initialize() -> void:
 			cam.global_transform = Transform3D(Basis(Vector3.RIGHT, -deg_to_rad(50.0)), Vector3(float(ca[0]), 12.0, float(ca[1]) + 10.0))
 		elif a.begins_with("--job-every="):
 			job_every = maxi(1, int(a.substr(12)))
+		elif a.begins_with("--job-lead="):
+			job_lead = float(a.substr(11))
 		elif a == "--every-tick" or a.begins_with("--every-tick="):
 			every_tick = true
 			if a.length() > 13:
@@ -314,6 +324,12 @@ func _initialize() -> void:
 			continue
 		if not (msg is Dictionary) or msg.get("t") != "bs":
 			continue
+		if binary:
+			var got := WireEncode.round_trip(msg)
+			if got.is_empty():
+				binary_bad += 1
+				continue
+			msg = got
 		var k := int(msg.get("k", 0))
 		if k != cur_k and not cur.is_empty():
 			updates.append(cur)
@@ -332,7 +348,7 @@ func _initialize() -> void:
 			wi += 1
 		if wi < updates.size():
 			(updates[wi] as Array).append(e[1])
-	print("stream: %d updates" % updates.size())
+	print("stream: %d updates" % updates.size() + (" (through binary frames, %d unreadable)" % binary_bad if binary else ""))
 	var vf: FileAccess = null
 	var view_last := ""  # the last compared update's line, written at the end unless written already
 	var view_written := false
@@ -541,6 +557,8 @@ func _initialize() -> void:
 			job.view = view_rect
 			job.view_all = false
 		job.fold_tick = float(k)
+		# (Ticks till the next job's result is drawn, and a tick, as the client's _start_job sets it.)
+		job.lead = job_lead if job_lead >= 0.0 else clampf(float(job_every) + 1.0, 2.0, BeltItems.lead_max)
 		job.now_msec = k * 16
 		job.run()
 		# (The kinds' looks, as the main thread gives them a job later.)
@@ -594,7 +612,7 @@ func _initialize() -> void:
 			else:
 				st = []
 		last_ct = ct
-		if drawn_check and now_t > k and now_t <= k + BeltItems.Job.ahead and game.has(k) and k <= cmp_until:
+		if drawn_check and now_t > k and now_t <= k + job.ahead_used and game.has(k) and k <= cmp_until:
 			_drawn_precise(job as DiagJob, state, now_st[0], now_st[1], now_st[2], now_t, "(end) ")
 		prev_st = now_st
 		prev_t = now_t

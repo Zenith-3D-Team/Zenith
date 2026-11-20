@@ -28,6 +28,7 @@ const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const Info := preload("res://scripts/ui/factorio/info_text.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const CraftingPanel := preload("res://scripts/ui/factorio/crafting_panel.gd")
 
 signal close_requested
 
@@ -94,6 +95,28 @@ var _center_frames := 0
 ## The technology the tree was last built round.
 var _tree_for := ""
 const CENTER_FRAMES := 10
+## L9: with nothing researched, T opens on the technology looked at last only while it is still to be
+## researched; one researched (most often the research that just finished) sat with the researched ones at
+## the bottom of the list, which opened scrolled down there. The first available one, at the top, instead.
+## --research-open=last opens on the one looked at last whatever it is, as J17 had it.
+var open_on_researched := OS.get_cmdline_user_args().has("--research-open=last")
+## L12: Start research / Add to queue on a technology whose prerequisites aren't researched: the bridge queues
+## the missing ones first, as Factorio's technology screen does. --research-chain=off greys it as before.
+var research_chain := not OS.get_cmdline_user_args().has("--research-chain=off")
+## The orange slot (Factorio's conditionally_available_technology_slot) for a technology not yet available
+## that Start research can queue with what it needs: none of its missing prerequisites a trigger technology
+## (slot_state). Factorio's own queue takes only a technology whose prerequisites are all researched or
+## queued, and the wiki's orange is those; --research-orange=factorio draws only them orange.
+var orange_factorio := OS.get_cmdline_user_args().has("--research-orange=factorio")
+## M3: a recipe the technology unlocks, among its Effects, has Factorio's recipe tooltip: "<name> (Recipe)",
+## its ingredients, crafting time, products and Total raw, then the item's own lines (Slot.info), from the hand
+## recipe's details or the recipe's Factoriopedia page asked for as the mouse comes on it (J14's way; nothing
+## red: it isn't measured against the inventory). --research-effect-tips=old: the name and "Unlocked by this
+## technology" (Zenith's words, not Factorio's) over the item's lines, as before.
+static var effect_recipe_tips := not OS.get_cmdline_user_args().has("--research-effect-tips=old")
+## tech -> whether a prerequisite still to be researched, all the way down, is a trigger technology
+## (_chain_blocked); emptied on each refresh, as the technologies or the queue may have changed.
+var _blocked := {}
 
 
 func _ready() -> void:
@@ -248,11 +271,15 @@ func open(on: bool) -> void:
 	visible = on
 	if on:
 		# Factorio's technology screen opens on what is being researched; with nothing researched, on
-		# the technology looked at last.
+		# the technology looked at last while it is still to be researched (L9), else the first available.
 		if not was and model.research != "" and model.techs.has(model.research):
 			selected = model.research
 		elif selected == "" or not model.techs.has(selected):
 			selected = _default_selection()
+		elif not was and not open_on_researched and int(model.techs[selected]["state"]) == 2:
+			selected = _default_selection()
+		if not was and not open_on_researched and _list_scroll != null:
+			_list_scroll.scroll_vertical = 0  # the list opens at its top (available first), brought to the selection from there
 		refresh()
 		_center_on(selected)
 
@@ -338,8 +365,9 @@ func _apply_center() -> bool:
 
 
 func refresh() -> void:
+	_blocked.clear()
 	# Closed, it waits for open(), which refreshes: research progress (`rs`) comes about once a second
-	# and rebuilding the tree each time cost ~9 ms on the main thread.
+	# and rebuilding the tree each time cost ~9 ms on the main thread (D6).
 	if not is_inside_tree() or not visible:
 		return
 	if selected == "" or not model.techs.has(selected):
@@ -357,7 +385,7 @@ func _default_selection() -> String:
 	if model.research != "" and model.techs.has(model.research):
 		return model.research
 	for t in _sorted_techs():
-		if int(model.techs[t]["state"]) == 1:
+		if int(model.techs[t]["state"]) == 1 and _shown(t):
 			return t
 	var all := _sorted_techs()
 	return all[0] if not all.is_empty() else ""
@@ -377,19 +405,120 @@ func _shown(t: String) -> bool:
 	return not essential_only or bool(model.techs[t].get("essential", true)) or t == selected
 
 
-## Queue position (1 = being researched), or 0.
+## Queue position (1 = being researched), or 0. Factorio's research_queue starts with the research in
+## progress (the second in the queue was numbered 3); the mock's leaves it out.
 func _place(tech: String) -> int:
 	if tech == model.research and tech != "":
 		return 1
 	var i := model.research_queue.find(tech)
 	if i < 0:
 		return 0
-	return i + (2 if model.research != "" else 1)
+	var current_first := model.research != "" and str(model.research_queue[0]) == model.research
+	return i + (2 if model.research != "" and not current_first else 1)
+
+
+## What the queue holds, the research in progress first.
+func _queued() -> Array:
+	var queued: Array = []
+	if model.research != "":
+		queued.append(model.research)
+	for q in model.research_queue:
+		if not queued.has(str(q)):
+			queued.append(str(q))
+	return queued
+
+
+## The technologies `tech` waits for that are neither researched nor queued, all the way down, each after
+## its own (prerequisites by order, then name): what the bridge queues before it (L12, research.lua).
+## Prerequisites the window doesn't have (hidden ones) are left to the bridge.
+func missing_prerequisites(tech: String) -> Array:
+	var have := {}
+	for q in _queued():
+		have[q] = true
+	var out: Array = []
+	_add_missing(tech, have, out)
+	return out
+
+
+func _add_missing(tech: String, have: Dictionary, out: Array) -> void:
+	var info: Dictionary = model.techs.get(tech, {})
+	var pres: Array = []
+	for p in info.get("prerequisites", []):
+		if model.techs.has(str(p)):
+			pres.append(str(p))
+	var before := func(a, b) -> bool:
+		var oa := str(model.techs[a]["order"])
+		var ob := str(model.techs[b]["order"])
+		return oa < ob if oa != ob else str(a) < str(b)
+	pres.sort_custom(before)
+	for p: String in pres:
+		if have.has(p) or int(model.techs[p]["state"]) == 2:
+			continue
+		have[p] = true
+		_add_missing(p, have, out)
+		out.append(p)
+
+
+## Why Start research / Add to queue can't take `tech` ("" when it can), as Factorio's technology screen
+## says it: a prerequisite unlocked by doing its task can't be queued, nor more than the queue's seven.
+func queue_refusal(tech: String) -> String:
+	if not research_chain:
+		return "Research the required technologies first" if int(model.techs[tech]["state"]) == 0 else ""
+	var missing := missing_prerequisites(tech)
+	for p: String in missing:
+		if str(model.techs[p].get("trigger", "")) != "":
+			return "Research %s first: it is unlocked by doing its task" % title_of(p)
+	if _queued().size() + missing.size() + 1 > QUEUE_SLOTS:
+		return "Research queue full"
+	return ""
+
+
+## The slot `tech` is drawn with: the bridge's state (0 red, 1 yellow, 2 green), or orange
+## (TechSlot.CONDITIONAL) for one not yet available that Start research / Add to queue can queue with
+## what it needs: queue_refusal's test without the queue's length (a full queue doesn't turn the tree
+## red). A trigger technology itself is never queued, so it stays red; with --research-chain=off nothing
+## not yet available can be queued, so nothing is orange.
+func slot_state(tech: String) -> int:
+	var info: Dictionary = model.techs.get(tech, {})
+	var state := int(info.get("state", 1))
+	if state != 0 or not research_chain or str(info.get("trigger", "")) != "":
+		return state
+	if orange_factorio:
+		var queued := _queued()
+		for p in info.get("prerequisites", []):
+			if model.techs.has(str(p)) and int(model.techs[str(p)]["state"]) != 2 and not queued.has(str(p)):
+				return 0
+		return TechSlot.CONDITIONAL
+	return 0 if _chain_blocked(tech) else TechSlot.CONDITIONAL
+
+
+## Whether a prerequisite of `tech` still to be researched, or one of theirs, is a trigger technology: what
+## queue_refusal finds among missing_prerequisites. Queued ones are walked through too (Factorio's queue
+## holds only technologies whose own prerequisites are researched or queued, never a trigger one, so it
+## comes out the same) and the answer depends on the technologies alone, as the list's key does.
+## Prerequisites the window doesn't have are left to the bridge, as there.
+func _chain_blocked(tech: String) -> bool:
+	if _blocked.has(tech):
+		return _blocked[tech]
+	_blocked[tech] = false  # a loop, which Factorio refuses to load, ends here
+	var out := false
+	for p in model.techs.get(tech, {}).get("prerequisites", []):
+		var pre: Dictionary = model.techs.get(str(p), {})
+		if pre.is_empty() or int(pre["state"]) == 2:
+			continue
+		if str(pre.get("trigger", "")) != "" or _chain_blocked(str(p)):
+			out = true
+			break
+	_blocked[tech] = out
+	return out
 
 
 func _refresh_tree() -> void:
 	# Under "essential only" the selected technology is listed too (_shown): it is part of the key.
-	var sig := JSON.stringify(model.techs) + str(essential_only) + (selected if essential_only else "")
+	# The orange slots follow the switches, and Factorio's own orange (--research-orange=factorio) the
+	# queue: then it is part of the key too.
+	var sig := JSON.stringify(model.techs) + str(essential_only) + (selected if essential_only else "") \
+		+ str(research_chain) + str(orange_factorio) + (JSON.stringify(_queued()) if orange_factorio else "")
 	if sig != _list_sig:
 		_list_sig = sig
 		_build_list()
@@ -647,7 +776,7 @@ func _tech_slot(t: String) -> TechSlot:
 	for ing in info["ingredients"]:
 		if ing is Array and ing.size() >= 1:
 			packs.append(str(ing[0]))
-	s.setup(t, int(info["state"]), packs, false)
+	s.setup(t, slot_state(t), packs, false)
 	s.title = title_of(t)
 	var max_level := int(info.get("max_level", 1))
 	s.level_text = "∞" if max_level == -1 else ""
@@ -688,6 +817,19 @@ func _cost_lines(info: Dictionary) -> Array:
 			if e is Array and e.size() >= 2:
 				lines.append(Info.effect_line(e))
 	return lines
+
+
+## A recipe a technology unlocks, as a slot among its Effects, with its recipe tooltip (M3).
+static func unlock_slot(recipe: String, m: UiModel) -> Slot:
+	var s := Slot.new()
+	s.set_stack(recipe, -1)
+	if not effect_recipe_tips or m == null:
+		s.set_tip(Kit.recipe_name(recipe), [["Unlocked by this technology", "", Kit.DISABLED_TEXT]])
+		return s
+	s.set_tip("%s (Recipe)" % Kit.recipe_name(recipe))
+	s.tip_fn = func() -> Array: return CraftingPanel.recipe_tip_lines(m, m.recipe_info(recipe), false)
+	s.mouse_entered.connect(func() -> void: m.recipe_info(recipe))
+	return s
 
 
 ## The details' title and big card as the research moves on, without rebuilding them.
@@ -754,7 +896,9 @@ func _refresh_queue() -> void:
 
 
 func _refresh_details() -> void:
-	var sig := "%s|%d|%s|%s" % [selected, _place(selected), model.research, JSON.stringify(model.techs.get(selected, {}))]
+	# The queue too: what Start research would add before it, and whether that fits (L12).
+	var sig := "%s|%d|%s|%s|%s" % [selected, _place(selected), model.research, JSON.stringify(model.techs.get(selected, {})),
+		JSON.stringify(model.research_queue)]
 	if sig == _details_sig and is_instance_valid(_big):
 		_details_progress()
 		return
@@ -847,10 +991,7 @@ func _refresh_details() -> void:
 	for e in info.get("effects", []):
 		if e is Array and e.size() >= 2:
 			if str(e[0]) == "unlock-recipe":
-				var s := Slot.new()
-				s.set_stack(str(e[1]), -1)
-				s.set_tip(Kit.recipe_name(str(e[1])), [["Unlocked by this technology", "", Kit.DISABLED_TEXT]])
-				unlocks.add_child(s)
+				unlocks.add_child(unlock_slot(str(e[1]), model))
 			else:
 				bonuses.append(Info.effect_line(e))
 	if int(info.get("effects_more", 0)) > 0:
@@ -878,11 +1019,18 @@ func _refresh_details() -> void:
 		buttons.add_child(cancel)
 	# A trigger technology unlocks by doing its task, never in labs: Factorio shows no button for it
 	# (the bridge refused one with "Can't research ... yet", issue #7).
+	# One whose prerequisites aren't researched takes the missing ones into the queue first (L12).
 	if state != 2 and place == 0 and str(info.get("trigger", "")) == "":
 		var start := _dialog_button("Start research" if model.research == "" else "Add to queue", "")
-		start.disabled = state == 0
-		if state == 0:
-			start.tooltip_text = "Research the required technologies first"
+		var why := queue_refusal(selected)
+		start.disabled = why != ""
+		start.tooltip_text = why
+		if why == "" and state == 0:
+			var names := PackedStringArray()
+			for p in missing_prerequisites(selected):
+				names.append(title_of(str(p)))
+			if not names.is_empty():
+				start.tooltip_text = "Queues first: %s" % ", ".join(names)
 		start.pressed.connect(func() -> void: model.start_research(selected))
 		buttons.add_child(start)
 

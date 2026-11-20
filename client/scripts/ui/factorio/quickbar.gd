@@ -109,6 +109,7 @@ func _ready() -> void:
 	_build_chooser()
 	model.quickbar_changed.connect(refresh)
 	model.inventory_changed.connect(refresh)
+	model.shown_changed.connect(refresh)  # L2: builds sent count out at once
 	refresh()
 
 
@@ -218,7 +219,7 @@ func _refresh_chooser() -> void:
 			if item == "":
 				s.set_stack("", -1)
 			else:
-				var n := model.count_of(item)
+				var n := model.shown_count_of(item)  # less the builds sent (L2)
 				s.set_stack(item, n, n == 0)
 			s.set_tip(Kit.pretty(item) if item != "" else "Quickbar page %d, slot %d" % [page, i + 1], [])
 		var b: Button = _chooser_pages[page]
@@ -271,7 +272,7 @@ func _show(s: Slot, item: String, key: String) -> void:
 		s.set_stack("", -1)
 		s.set_tip("", [])
 	else:
-		var n := model.count_of(item)
+		var n := model.shown_count_of(item)  # less the builds sent (L2)
 		s.set_stack(item, n, n == 0)
 		s.set_extra({"icons": model.icons_of(item)})
 		s.set_tip(Kit.pretty(item), [["Middle-click| to clear shortcut.", "", null, "keys"]])
