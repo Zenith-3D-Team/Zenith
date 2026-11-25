@@ -21,9 +21,11 @@ uniform float frames_loop = 1.0;
 instance uniform vec2 f3d_card_run = vec2(-1.0);
 
 varying vec2 run;
+varying vec2 card_xz;
 
 void vertex() {
-	float h = ground_h(MODEL_MATRIX[3].xz);
+	card_xz = MODEL_MATRIX[3].xz;
+	float h = ground_h(card_xz);
 	if (h != 0.0) {
 		VERTEX += inverse(mat3(MODEL_MATRIX)) * vec3(0.0, h, 0.0);
 	}

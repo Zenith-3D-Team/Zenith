@@ -13,9 +13,35 @@ extends RefCounted
 ## the car's). Shown on the vehicle the character drives or rides in (the bridge doesn't say who
 ## drives the others). --vehicle-lights=off: none, the character's flashlight as before (avatar.gd).
 
-const Avatar := preload("res://scripts/player/avatar.gd")
+## Headlights seen from the front (trailer: a tank driving at the camera was a black silhouette).
+## Factorio lights a vehicle that someone drives, but the bridge doesn't say who drives which; a car,
+## tank or spidertron moving under its own power has a driver, so one that has moved in the last
+## HOLD_S seconds lights too (at most MAX_OTHERS besides ours, none casting shadows: the cones'
+## projector spots as ours). And each lamp gets a glare: an unshaded additive card at the lens, soft,
+## bright looking into the lamp and faint from the side, no light. --headlight-glare=off: only the
+## vehicle the character is in lights, no glare (as before).
 
-static var enabled := not ("--vehicle-lights=off" in OS.get_cmdline_user_args())
+const Avatar := preload("res://scripts/player/avatar.gd")
+const Switches := preload("res://scripts/switches.gd")
+
+static var enabled := Switches.on("--vehicle-lights")
+static var glare_enabled := Switches.on("--headlight-glare")
+## --headlight-storm=off: the lamps follow the game's darkness alone (a thunderstorm's dimmed sun at dusk
+## left them dark on a screen that looks like night).
+static var storm_enabled := Switches.on("--headlight-storm")
+
+const HOLD_S := 30.0
+const MAX_OTHERS := 6
+## Glare card's width in tiles, by type; lamps where the model has no `anim_headlight` part:
+## [across, height, ahead] (the car's cones 0.6 either side, the tank's 0.1: one lamp mid-front).
+const GLARE := {
+	"car": {"size": 1.1, "lamps": [[-0.45, 0.55, 1.0], [0.45, 0.55, 1.0]]},
+	"tank": {"size": 1.3, "lamps": [[0.0, 0.8, 1.35]]},
+	"spider-vehicle": {"size": 0.9, "lamps": []},
+}
+
+static var _glare_shader: Shader
+static var _glare_mats := {}
 
 ## Per type: cones of [across, ahead, size, intensity, colour, source_orientation_offset] (Factorio's
 ## shift {across, -ahead}, its size 2 being the character's 25-tile cone), and the round light's
@@ -30,6 +56,15 @@ const TYPES := {
 	"spider-vehicle": {"cones": [[0.0, 15.0, 2.0, 0.6, CAR_YELLOW, 0.0], [0.0, 11.5, 1.4, 0.42, CAR_YELLOW, -0.05],
 		[0.0, 8.5, 0.9, 0.3, CAR_YELLOW, 0.04], [0.0, 7.5, 0.7, 0.36, CAR_YELLOW, 0.06]], "round": [25.0, 0.4]},
 }
+
+
+## The night the lamps go by: the game's, or what the weather's dimmed sun makes of the screen (sun
+## energy scale 0.4 reads as 0.48 night), whichever is darker. `wx` is WeatherState.state when active.
+static func screen_night(night: float, wx: Dictionary) -> float:
+	if not storm_enabled or wx.is_empty():
+		return night
+	var dim := clampf(1.0 - float(wx.get("sun_energy_scale", 1.0)), 0.0, 1.0)
+	return maxf(night, dim * 0.8)
 
 
 static func has(type: String) -> bool:
@@ -88,7 +123,128 @@ static func build(type: String) -> Node3D:
 		omni.light_energy = 0.0
 		rig.add_child(omni)
 	rig.visible = false
+	rig.set_meta("kind", type)
+	if glare_enabled and spec["cones"].size() > 0:
+		rig.set_meta("tint", (spec["cones"][0] as Array)[4])
 	return rig
+
+
+## The glare cards at the lamps: the `anim_headlight` meshes' ends (the node's space, as the rig's),
+## else the type's GLARE lamps. Again after the model is dressed anew. Not with --headlight-glare=off.
+static func place_glare(rig: Node3D, meshes: Array[MeshInstance3D]) -> void:
+	if not glare_enabled or rig == null:
+		return
+	for child in rig.get_children():
+		if child.has_meta("glare"):
+			rig.remove_child(child)
+			child.queue_free()
+	var kind := str(rig.get_meta("kind", ""))
+	if not GLARE.has(kind):
+		return
+	var spec: Dictionary = GLARE[kind]
+	var points := lamp_points(meshes)
+	if points.is_empty():
+		for l: Array in spec["lamps"]:
+			points.append(Vector3(float(l[0]), float(l[1]), -float(l[2])))
+	var tint: Color = rig.get_meta("tint", Color(1.0, 0.95, 0.8))
+	var quad := QuadMesh.new()
+	quad.size = Vector2(1.0, 1.0)
+	var size := float(spec["size"])
+	for i in points.size():
+		var card := MeshInstance3D.new()
+		card.name = "Glare%d" % i
+		card.mesh = quad
+		card.material_override = glare_material(tint)
+		card.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		card.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+		card.position = points[i]
+		card.scale = Vector3(size, size, size)
+		card.set_meta("glare", true)
+		card.set_meta("height", points[i].y)
+		card.set_instance_shader_parameter("glow", 0.0)
+		rig.add_child(card)
+
+
+## Where the lenses are: each headlight mesh's front face, at its two ends when it is wide (one mesh
+## for both lamps), else its middle.
+static func lamp_points(meshes: Array[MeshInstance3D]) -> Array[Vector3]:
+	var out: Array[Vector3] = []
+	for mi in meshes:
+		if not is_instance_valid(mi) or mi.mesh == null:
+			continue
+		var box: AABB = mi.transform * mi.mesh.get_aabb()
+		var front := box.position.z  # forward is -Z
+		var mid := box.get_center()
+		var r := minf(box.size.y, box.size.x * 0.25) * 0.5
+		if box.size.x > 0.5:
+			out.append(Vector3(box.position.x + r, mid.y, front))
+			out.append(Vector3(box.end.x - r, mid.y, front))
+		else:
+			out.append(Vector3(mid.x, mid.y, front))
+	return out
+
+
+static func glare_material(tint: Color) -> ShaderMaterial:
+	var key := tint.to_html(false)
+	if _glare_mats.has(key):
+		return _glare_mats[key]
+	if _glare_shader == null:
+		_glare_shader = Shader.new()
+		_glare_shader.code = GLARE_SHADER
+	var mat := ShaderMaterial.new()
+	mat.shader = _glare_shader
+	mat.set_shader_parameter("tint", Vector3(tint.r, tint.g, tint.b).lerp(Vector3.ONE, 0.35))
+	_glare_mats[key] = mat
+	return mat
+
+
+static func glares_of(rig: Node3D) -> Array[MeshInstance3D]:
+	var out: Array[MeshInstance3D] = []
+	if rig == null:
+		return out
+	for child in rig.get_children():
+		if child.has_meta("glare"):
+			out.append(child as MeshInstance3D)
+	return out
+
+
+## A card facing the camera, pulled towards it only when viewed from the front so the body doesn't
+## cut it, its node's -Z the lamp's forward: fades smoothly to zero when viewed from the side or
+## behind so glare never bleeds through the hull, with soft halo and horizontal streak looking into
+## the lamp. Additive, no fog (fog would add its colour), no depth write.
+const GLARE_SHADER := """
+shader_type spatial;
+render_mode unshaded, blend_add, depth_draw_never, cull_disabled, skip_vertex_transform, fog_disabled, shadows_disabled;
+
+instance uniform float glow = 0.0;
+uniform vec3 tint = vec3(1.0, 0.95, 0.8);
+uniform float pull = 0.7;
+
+varying float facing;
+
+void vertex() {
+	vec3 centre = (MODELVIEW_MATRIX * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+	vec3 fwd = normalize((MODELVIEW_MATRIX * vec4(0.0, 0.0, -1.0, 0.0)).xyz);
+	vec3 to_cam = normalize(-centre);
+	facing = clamp(dot(fwd, to_cam), 0.0, 1.0);
+	float front_pull = pull * smoothstep(0.0, 0.35, facing);
+	float size = length(MODEL_MATRIX[0].xyz);
+	VERTEX = centre + to_cam * front_pull + vec3(VERTEX.xy * size * (0.5 + 0.5 * facing), 0.0);
+	NORMAL = vec3(0.0, 0.0, 1.0);
+}
+
+void fragment() {
+	vec2 p = UV * 2.0 - 1.0;
+	float r = length(p);
+	float fall = max(0.0, 1.0 - r);
+	float f = facing * facing;
+	float front = smoothstep(0.0, 0.25, facing);
+	float core = pow(fall, 6.0) * front * (0.35 + 0.65 * f);
+	float halo = pow(fall, 2.5) * 0.22 * f;
+	float streak = pow(max(0.0, 1.0 - abs(p.y) * 10.0), 2.0) * pow(max(0.0, 1.0 - abs(p.x)), 2.0) * 0.18 * f;
+	ALBEDO = tint * glow * (core * 1.6 + halo + streak);
+}
+"""
 
 
 ## `beam`: how much they show (Avatar.beam of the night, 0 when nobody of ours is in it). `ground`:
@@ -100,6 +256,9 @@ static func apply(rig: Node3D, beam: float, ground: float) -> void:
 	for light in lights_of(rig):
 		light.light_energy = float(light.get_meta("energy")) * beam
 		light.position.y = float(light.get_meta("height")) + ground
+	for card in glares_of(rig):
+		card.set_instance_shader_parameter("glow", clampf(beam, 0.0, 1.0))
+		card.position.y = float(card.get_meta("height")) + ground
 
 
 static func lights_of(rig: Node3D) -> Array[Light3D]:

@@ -14,6 +14,8 @@ extends RefCounted
 ## Quality and book cycling are on the mouse wheel by default (Ctrl+wheel and Shift+wheel,
 ## player_input.gd); their actions here start without keys, so a key can be bound to them.
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## [action, its default keys: the first is the primary binding, the second the alternative].
 const LIST := [
 	["move_up", [KEY_W, KEY_UP]],
@@ -129,7 +131,7 @@ static func old_defaults() -> bool:
 
 ## --keys-defaults=old: the switch on for this run, whatever is saved.
 static func old_defaults_forced() -> bool:
-	return OS.get_cmdline_user_args().has("--keys-defaults=old")
+	return Switches.has("--keys-defaults=old")
 
 
 ## An action's default keys (LIST's, or OLD_DEFAULTS' with old_defaults()).
@@ -171,7 +173,7 @@ static var addon_author_override := -1
 static func addon_author() -> bool:
 	if addon_author_override != -1:
 		return addon_author_override == 1
-	var args := OS.get_cmdline_user_args()
+	var args := Switches.args()
 	if args.has("--addon-reload=off"):
 		return false
 	for arg in args:

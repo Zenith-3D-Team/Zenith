@@ -8,6 +8,8 @@ extends "res://scripts/ui/factorio/platform_info.gd"
 ## scripts/world/ride.gd shows it). Going up is a ride in a rocket from a silo's screen; where a
 ## platform goes and its pause are set in its hub's screen, as in Factorio.
 
+const Wire := preload("res://scripts/util/wire.gd")
+
 ## Space locations that aren't planets: nothing to drop to.
 const NOT_PLANETS := ["solar-system-edge", "shattered-planet"]
 
@@ -81,9 +83,9 @@ func reset() -> void:
 func handle(msg: Dictionary) -> void:
 	on = int(msg.get("on", 0))
 	here = str(msg.get("here", ""))
-	destinations = _array(msg.get("dest"))
+	destinations = Wire.array(msg.get("dest"))
 	platforms.clear()
-	for rec in _array(msg.get("l")):
+	for rec in Wire.array(msg.get("l")):
 		if rec is Dictionary:
 			platforms[int(rec.get("i", 0))] = rec
 	if on == 0:
@@ -121,7 +123,3 @@ func refresh() -> void:
 	visible = not p.is_empty()
 	if visible:
 		show_platform(p, on != 0 and int(p.get("i", 0)) == on)
-
-
-static func _array(v) -> Array:
-	return v if v is Array else []

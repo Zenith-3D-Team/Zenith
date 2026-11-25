@@ -78,7 +78,14 @@ func _compare(name: String, combine: bool) -> void:
 	var new_parts: Array = []
 	var new := ModelLibrary._commit_load(load, new_parts)
 	_checked += 1 if combine else 0
+	if load.bake.get("animated", false):
+		_compare_baked(name, old, old_parts, new, new_parts, combine)
+		return
 	_same_mesh(name, old, new, combine)
+	_same_parts(name, old_parts, new_parts, combine)
+
+
+func _same_parts(name: String, old_parts: Array, new_parts: Array, combine: bool) -> void:
 	if old_parts.size() != new_parts.size():
 		_fail("%s: %d moving parts, was %d" % [name, new_parts.size(), old_parts.size()])
 		return
@@ -88,6 +95,126 @@ func _compare(name: String, combine: bool) -> void:
 		if a.kind != b.kind or not a.pivot.is_equal_approx(b.pivot) or a.axis != b.axis or a.slide != b.slide or a.upright != b.upright or a.lit != b.lit:
 			_fail("%s: part %d is %s at %s, was %s at %s" % [name, i, b.kind, b.pivot, a.kind, a.pivot])
 		_same_mesh("%s part %s" % [name, a.kind], a.mesh, b.mesh, combine)
+
+
+func _compare_baked(name: String, old: Mesh, old_parts: Array, new: Mesh, new_parts: Array, combine: bool) -> void:
+	var baked_parts: Array = []
+	var other_parts: Array = []
+	for p: ModelLibrary.AnimPart in new_parts:
+		if p.kind == "baked":
+			baked_parts.append(p)
+		else:
+			other_parts.append(p)
+	if baked_parts.is_empty():
+		_fail("%s: animated model produced no baked part" % name)
+		return
+	_same_parts(name, old_parts, other_parts, combine)
+
+	if combine:
+		_surfaces_before += old.get_surface_count() if old != null else 0
+		_surfaces_after += new.get_surface_count() if new != null else 0
+		for bp: ModelLibrary.AnimPart in baked_parts:
+			_surfaces_after += bp.mesh.get_surface_count() if bp.mesh != null else 0
+
+	var old_tris := _mesh_tris(old)
+	var new_tris := _mesh_tris(new)
+	var box := new.get_aabb() if new != null else AABB()
+	var has_box := new != null
+	for bp: ModelLibrary.AnimPart in baked_parts:
+		if bp.bake.is_empty() or bp.mesh == null:
+			_fail("%s: baked part missing bake or mesh" % name)
+			return
+		new_tris += _mesh_tris(bp.mesh)
+		var pbox := _baked_rest_aabb(bp.mesh, bp.bake)
+		box = box.merge(pbox) if has_box else pbox
+		has_box = true
+		for s in bp.mesh.get_surface_count():
+			var arrays := bp.mesh.surface_get_arrays(s)
+			if arrays[Mesh.ARRAY_CUSTOM3] == null:
+				_fail("%s: baked part surface %d missing ARRAY_CUSTOM3" % [name, s])
+	if new_tris != old_tris:
+		_fail("%s: baked split has %d triangles, was %d" % [name, new_tris, old_tris])
+	if old != null and has_box:
+		var old_box := old.get_aabb()
+		var tol := maxf(old_box.size.length() * 0.002, 0.002)
+		if not _close(old_box.position, box.position, tol) or not _close(old_box.size, box.size, tol):
+			_fail("%s: baked rest bounds %s, was %s" % [name, box, old_box])
+
+	# Shader / textured parity between old surfaces and split (body + baked_parts) surfaces.
+	var old_kinds := {}
+	if old != null:
+		for i in old.get_surface_count():
+			var m := old.surface_get_material(i) as ShaderMaterial
+			old_kinds[[m.shader, _textured(m)]] = true
+	var split_meshes: Array = []
+	if new != null:
+		split_meshes.append(new)
+	for bp: ModelLibrary.AnimPart in baked_parts:
+		if bp.mesh != null:
+			split_meshes.append(bp.mesh)
+	var seen_kinds := {}
+	for sm: Mesh in split_meshes:
+		for r: Array in _rows_of(sm):
+			var rm := r[2] as ShaderMaterial
+			var key := [rm.shader, _textured(rm)]
+			if not old_kinds.has(key):
+				_fail("%s: split surface %s has unexpected shader/texture kind" % [name, rm.resource_name])
+			seen_kinds[key] = true
+	if seen_kinds.size() != old_kinds.size():
+		_fail("%s: split meshes cover %d material kinds, expected %d" % [name, seen_kinds.size(), old_kinds.size()])
+
+
+static func _mesh_tris(mesh: Mesh) -> int:
+	if mesh == null:
+		return 0
+	var total := 0
+	for i in mesh.get_surface_count():
+		total += _triangles(mesh.surface_get_arrays(i))
+	return total
+
+
+static func _baked_rest_aabb(mesh: Mesh, bake: Dictionary) -> AABB:
+	var image: Image = bake.get("image")
+	if image == null:
+		return mesh.get_aabb()
+	var box := AABB()
+	var first := true
+	for s in mesh.get_surface_count():
+		var arrays := mesh.surface_get_arrays(s)
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var skin: Variant = arrays[Mesh.ARRAY_CUSTOM3]
+		if not (skin is PackedFloat32Array):
+			var sb := mesh.get_aabb()
+			box = sb if first else box.merge(sb)
+			first = false
+			continue
+		var c3 := skin as PackedFloat32Array
+		for v in verts.size():
+			var m := Transform3D(Basis(Vector3.ZERO, Vector3.ZERO, Vector3.ZERO), Vector3.ZERO)
+			var total := 0.0
+			for k in 4:
+				if v * 4 + k >= c3.size():
+					break
+				var code := c3[v * 4 + k]
+				var w := fposmod(code, 1.0) / 0.999
+				if w <= 0.0:
+					continue
+				var j := int(floor(code))
+				var r0 := image.get_pixel(j * 3, 0)
+				var r1 := image.get_pixel(j * 3 + 1, 0)
+				var r2 := image.get_pixel(j * 3 + 2, 0)
+				m.basis.x += w * Vector3(r0.r, r1.r, r2.r)
+				m.basis.y += w * Vector3(r0.g, r1.g, r2.g)
+				m.basis.z += w * Vector3(r0.b, r1.b, r2.b)
+				m.origin += w * Vector3(r0.a, r1.a, r2.a)
+				total += w
+			var p := verts[v] if total <= 0.0 else (m * verts[v]) / total
+			if first:
+				box = AABB(p, Vector3.ZERO)
+				first = false
+			else:
+				box = box.expand(p)
+	return box
 
 
 static func _textured(m: ShaderMaterial) -> bool:
@@ -290,7 +417,8 @@ func _edits_check() -> void:
 		"rust_color": TYPE_COLOR, "dust_color": TYPE_COLOR, "part_weathering": TYPE_VECTOR4,
 		"part_light": TYPE_VECTOR2, "activity_glow": TYPE_BOOL, "part_colors": TYPE_BOOL, "glow_fades": TYPE_BOOL,
 		"skin_mode": TYPE_INT, "skin_tint2": TYPE_COLOR, "emission_from_paint": TYPE_BOOL,
-		"glow_keeps_albedo": TYPE_BOOL, "modeller_tex": TYPE_BOOL}
+		"glow_keeps_albedo": TYPE_BOOL, "modeller_tex": TYPE_BOOL, "wet_rock": TYPE_BOOL,
+		"organic_surface": TYPE_INT}
 	for u: String in MaterialRows.ROW_PARAMS:
 		var d: Variant = MaterialRows._defaults.get(u)
 		if typeof(d) != int(kinds.get(u, TYPE_FLOAT)):
@@ -311,10 +439,9 @@ func _edits_check() -> void:
 		var colour: Color = ModelLibrary.TIER_TINTS["express-splitter"][1]
 		var lin := colour.srgb_to_linear()
 		var a: Vector4 = _row(tm, paint)[0]
-		var flags := int((_row(tm, paint)[1] as Vector4).w)
 		var d: Vector4 = _row(tm, paint)[3]
-		if not Vector3(a.x, a.y, a.z).is_equal_approx(Vector3(lin.r, lin.g, lin.b)) or (flags & MaterialRows.FLAG_NO_SPRITE) == 0 or d.x != 0.0:
-			_fail("the express splitter's paint row: albedo %s, flags %d, part colours %s" % [a, flags, d.x])
+		if not Vector3(a.x, a.y, a.z).is_equal_approx(Vector3(lin.r, lin.g, lin.b)) or d.x != 0.0:
+			_fail("the express splitter's paint row: albedo %s, part colours %s" % [a, d.x])
 		for r in MaterialRows.rows(tm).size():
 			if r != paint and _row(tm, r) != _row(bm, r):
 				_fail("the express splitter's row %d changed with the paint" % r)
@@ -340,16 +467,53 @@ func _edits_check() -> void:
 	if pipe.get_shader_parameter("model_tint") != ModelLibrary.WHOLE_TINTS["infinity-pipe"][1]:
 		_fail("the infinity pipe's tint is %s" % pipe.get_shader_parameter("model_tint"))
 	# A remnant: every row burnt (no sprite, no glow, darker), the model's sprite and motion off.
-	var burnt := ModelLibrary._burnt(ModelLibrary.mesh_for("heating-tower").surface_get_material(0)) as ShaderMaterial
+	var burnt := ModelLibrary._burnt(ModelLibrary.mesh_for("burner-mining-drill@builtin:placeholders").surface_get_material(0)) as ShaderMaterial
 	var all_burnt := MaterialRows.rows(burnt).size() > 1
 	for r in MaterialRows.rows(burnt).size():
 		var flags := int((_row(burnt, r)[1] as Vector4).w)
 		var tone: Vector4 = _row(burnt, r)[4]
-		all_burnt = all_burnt and (flags & MaterialRows.FLAG_NO_SPRITE) != 0 and (flags & MaterialRows.FLAG_GLOW) == 0 and is_equal_approx(tone.w, 0.45)
+		all_burnt = all_burnt and (flags & MaterialRows.FLAG_GLOW) == 0 and is_equal_approx(tone.w, 0.45)
 	if not all_burnt or burnt.get_shader_parameter("activity_glow") != false or burnt.get_shader_parameter("animated") != false:
-		_fail("the heating tower's remnant isn't burnt in every row (%d rows)" % MaterialRows.rows(burnt).size())
-	if not ModelLibrary.glows(ModelLibrary.mesh_for("heating-tower")):
+		_fail("the burner drill's remnant isn't burnt in every row (%d rows)" % MaterialRows.rows(burnt).size())
+	var tower := ModelLibrary.mesh_for("heating-tower")
+	var tower_burnt := ModelLibrary._burnt(tower.surface_get_material(0)) as ShaderMaterial
+	if not is_equal_approx(float(tower_burnt.get_shader_parameter("value")), 0.45) \
+			or float(tower_burnt.get_shader_parameter("emission_energy")) != 0.0 \
+			or tower_burnt.get_shader_parameter("activity_glow") != false \
+			or tower_burnt.get_shader_parameter("animated") != false:
+		_fail("the heating tower's remnant isn't darkened with glow and motion off")
+	if not ModelLibrary.glows(tower):
 		_fail("the heating tower's fire doesn't count as glowing")
+	if ModelLibrary.organic_surface_kind("chitin_big") != 2 or ModelLibrary.organic_surface_kind("flesh_biter") != 1 \
+			or ModelLibrary.organic_surface_kind("steel_dark") != 0 or ModelLibrary.organic_surface_kind("flesh_biter", true) != 0 \
+			or ModelLibrary.organic_surface_kind("flesh_eye") != 0 or ModelLibrary.organic_surface_kind("cliff-gleba-flesh-root") != 0:
+		_fail("organic_surface_kind classification mismatch")
+	for biter_id in ["big-biter@builtin:placeholders", "big-biter@builtin:wube3dp"]:
+		var biter_mesh := ModelLibrary.mesh_for(biter_id)
+		var biter_mat := biter_mesh.surface_get_material(0) as ShaderMaterial
+		var chitin_row := _row_named(biter_mat, "chitin_big")
+		var flesh_row := _row_named(biter_mat, "flesh_biter")
+		var leg_row := _row_named(biter_mat, "flesh_leg")
+		if chitin_row < 0 or flesh_row < 0 or leg_row < 0:
+			_fail("%s missing expected organic material rows" % biter_id)
+		else:
+			var cf := int((_row(biter_mat, chitin_row)[1] as Vector4).w)
+			var ff := int((_row(biter_mat, flesh_row)[1] as Vector4).w)
+			var lf := int((_row(biter_mat, leg_row)[1] as Vector4).w)
+			if (cf & MaterialRows.FLAG_ORGANIC_CHITIN) == 0 or (ff & MaterialRows.FLAG_ORGANIC_FLESH) == 0 \
+					or (lf & MaterialRows.FLAG_ORGANIC_FLESH) == 0:
+				_fail("%s organic row flags wrong: chitin=%d flesh=%d leg=%d" % [biter_id, cf, ff, lf])
+	for r in MaterialRows.rows(bm).size():
+		var bf := int((_row(bm, r)[1] as Vector4).w)
+		if (bf & (MaterialRows.FLAG_ORGANIC_FLESH | MaterialRows.FLAG_ORGANIC_CHITIN)) != 0:
+			_fail("splitter row %d unexpectedly flagged organic (%d)" % [r, bf])
+	# S10: dead sprite-projection uniforms and varyings removed from factorio_material.gdshaderinc.
+	var shader_names := {}
+	for u: Dictionary in (belt.shader as Shader).get_shader_uniform_list():
+		shader_names[str(u["name"])] = true
+	for dead in ["sprite_cells", "sprite_tex", "depth_on", "depth_tex"]:
+		if shader_names.has(dead):
+			_fail("dead sprite-projection uniform %s still present in factorio_material shader" % dead)
 
 
 ## FUE5's stone walls laid out as the world draws them (world.gd _connect_wall's mask, model_name):

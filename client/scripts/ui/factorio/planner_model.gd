@@ -11,6 +11,7 @@ extends RefCounted
 ## cursor isn't in the inventory).
 
 const BpString := preload("res://scripts/ui/factorio/bp_string.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## A string goes to the mod in parts of this many characters (a datagram holds 64 KB).
 const PART := 8000
@@ -55,9 +56,9 @@ func handle(msg: Dictionary) -> bool:
 			stack_written.emit(q, int(msg.get("i", 0)), str(msg.get("item", "")), int(msg.get("new", 0)) == 1)
 		"bpl":
 			var list: Array = []
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 4:
-					list.append([int(r[0]), str(r[1]), str(r[2]), _array(r[3])])
+					list.append([int(r[0]), str(r[1]), str(r[2]), Wire.array(r[3])])
 			if str(msg.get("src", "")) == "player":
 				player_library = list
 				player_name = str(msg.get("who", ""))
@@ -68,7 +69,7 @@ func handle(msg: Dictionary) -> bool:
 			history_added.emit(int(msg.get("h", 0)), str(msg.get("what", "")))
 		"quals":
 			qualities = []
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 3:
 					qualities.append([str(r[0]), int(r[1]), int(r[2]) == 1])
 			qualities_changed.emit()
@@ -194,7 +195,3 @@ func unlocked_qualities() -> Array:
 ## A new empty record of a kind, stamped with the game's version when one is known.
 func empty(kind: String) -> Dictionary:
 	return BpString.empty(kind, version)
-
-
-static func _array(v) -> Array:
-	return v if v is Array else []

@@ -24,10 +24,11 @@ extends RefCounted
 const WorldMirror := preload("res://scripts/world/world.gd")
 const CursorOverlay := preload("res://scripts/player/cursor_overlay.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const Switches := preload("res://scripts/switches.gd")
 
-static var drill_hints := not ("--resource-hints=off" in OS.get_cmdline_user_args())
-static var pipe_joins := not ("--held-pipe-joins=off" in OS.get_cmdline_user_args())
-static var fluid_mining_hints := not ("--fluid-mining-hints=off" in OS.get_cmdline_user_args())
+static var drill_hints := Switches.on("--resource-hints")
+static var pipe_joins := Switches.on("--held-pipe-joins")
+static var fluid_mining_hints := Switches.on("--fluid-mining-hints")
 
 ## How far round the cursor highlighted resources are outlined (tiles).
 const HIGHLIGHT_REACH := 48.0

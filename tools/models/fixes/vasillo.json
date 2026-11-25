@@ -152,7 +152,8 @@
 			]
 		},
 		"pipe-alt": {
-			"note": "The straight with a window (glass in the middle): Factorio's straight_vertical_window and straight_horizontal_window pictures (R&D vas-rd section 4). At the origin (his first export: tile centre at (4, 0)), openings N, S like pipe. Its Glass (alpha 0.596 on every pixel) stays Alpha Blend. His re-export of 18 Nov (dev-022-update7) has every pipe piece at the origin: the old offsets, kept, put them 2-6 tiles off (pipes-lanes-fix).",
+			"note": "The straight with a window (glass in the middle): Factorio's straight_vertical_window and straight_horizontal_window pictures (R&D vas-rd section 4). At the origin (his first export: tile centre at (4, 0)), openings N, S like pipe. Its Glass (alpha 0.596 on every pixel) stays Alpha Blend. His re-export of 18 Nov (dev-022-update7) has every pipe piece at the origin: the old offsets, kept, put them 2-6 tiles off (pipes-lanes-fix). Inside added: the single-sided pipe barrel is seen into through the glass window and add_inside skips the BLEND Glass surface while giving Pipe_Straight_Alt inward faces.",
+			"inside": true,
 			"out": [
 				{
 					"name": "pipe-straight-vertical-window"
@@ -369,7 +370,7 @@
 					"name": "items/advanced-circuit"
 				}
 			],
-			"note": "Items from his 'Items Added' push (dev c1270abc): each exported somewhere else (up to 1.9 tiles off), centred on its own box in X and Z, Y kept, into items/."
+			"note": "Items from his 'Items Added' push (c1270abc): each exported somewhere else (up to 1.9 tiles off), centred on its own box in X and Z, Y kept, into items/."
 		},
 		"automation-science-pack": {
 			"centre": true,
@@ -578,6 +579,354 @@
 				}
 			],
 			"metal": 0
+		},
+		"atomic-bomb": {
+			"note": "Items from his 'New items + Walls' push (e86f60c2): in MODEL_TRANSFER/Items/, centred in X and Z, into items/.",
+			"centre": true,
+			"out": [
+				{
+					"name": "items/atomic-bomb"
+				}
+			]
+		},
+		"engine-unit": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/engine-unit"
+				}
+			]
+		},
+		"explosive-rocket": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/explosive-rocket"
+				}
+			]
+		},
+		"firearm-magazine": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/firearm-magazine"
+				}
+			]
+		},
+		"flamethrower-ammo": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/flamethrower-ammo"
+				}
+			]
+		},
+		"grenade": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/grenade"
+				}
+			]
+		},
+		"piercing-rounds-magazine": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/piercing-rounds-magazine"
+				}
+			]
+		},
+		"piercing-shotgun-shell": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/piercing-shotgun-shell"
+				}
+			]
+		},
+		"rocket": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/rocket"
+				}
+			]
+		},
+		"shotgun-shell": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/shotgun-shell"
+				}
+			]
+		},
+		"uranium-rounds-magazine": {
+			"centre": true,
+			"out": [
+				{
+					"name": "items/uranium-rounds-magazine"
+				}
+			]
+		},
+		"wall-single": {
+			"note": "Walls from his 'New items + Walls' push (e86f60c2): 1x1 footprint, height 2.042; single pillar serves stone-wall and stone-wall-pylon, plus gate-connected single walls (buttress shells dropped and gate socket/light from wall-gate-side diff wall-end added).",
+			"out": [
+				{
+					"name": "stone-wall"
+				},
+				{
+					"name": "stone-wall-pylon"
+				},
+				{
+					"name": "stone-wall-gate-single-s",
+					"drop_shells": [
+						[
+							[-1, -1, 0.46],
+							[1, 3, 1]
+						]
+					],
+					"add": [
+						{
+							"model": "wall-gate-side",
+							"diff": "wall-end"
+						}
+					]
+				},
+				{
+					"name": "stone-wall-gate-single-w",
+					"turn": 90,
+					"drop_shells": [
+						[
+							[-1, -1, 0.46],
+							[1, 3, 1]
+						]
+					],
+					"add": [
+						{
+							"model": "wall-gate-side",
+							"diff": "wall-end",
+							"turn": 90
+						}
+					]
+				},
+				{
+					"name": "stone-wall-gate-single-n",
+					"turn": 180,
+					"drop_shells": [
+						[
+							[-1, -1, 0.46],
+							[1, 3, 1]
+						]
+					],
+					"add": [
+						{
+							"model": "wall-gate-side",
+							"diff": "wall-end",
+							"turn": 180
+						}
+					]
+				},
+				{
+					"name": "stone-wall-gate-single-e",
+					"turn": 270,
+					"drop_shells": [
+						[
+							[-1, -1, 0.46],
+							[1, 3, 1]
+						]
+					],
+					"add": [
+						{
+							"model": "wall-gate-side",
+							"diff": "wall-end",
+							"turn": 270
+						}
+					]
+				},
+				{
+					"name": "stone-wall-gate-ns",
+					"drop_shells": [
+						[
+							[-1, -1, 0.46],
+							[1, 3, 1]
+						],
+						[
+							[-1, -1, -1],
+							[1, 3, -0.46]
+						]
+					],
+					"add": [
+						{
+							"model": "wall-gate-side",
+							"diff": "wall-end"
+						},
+						{
+							"model": "wall-gate-side",
+							"diff": "wall-end",
+							"turn": 180
+						}
+					]
+				},
+				{
+					"name": "stone-wall-gate-ew",
+					"turn": 90,
+					"drop_shells": [
+						[
+							[-1, -1, 0.46],
+							[1, 3, 1]
+						],
+						[
+							[-1, -1, -1],
+							[1, 3, -0.46]
+						]
+					],
+					"add": [
+						{
+							"model": "wall-gate-side",
+							"diff": "wall-end",
+							"turn": 90
+						},
+						{
+							"model": "wall-gate-side",
+							"diff": "wall-end",
+							"turn": 270
+						}
+					]
+				}
+			]
+		},
+		"wall-end": {
+			"note": "Exported connecting north (-z); turned clockwise for E/S/W.",
+			"out": [
+				{
+					"name": "stone-wall-n"
+				},
+				{
+					"name": "stone-wall-e",
+					"turn": 90
+				},
+				{
+					"name": "stone-wall-s",
+					"turn": 180
+				},
+				{
+					"name": "stone-wall-w",
+					"turn": 270
+				}
+			]
+		},
+		"wall-straight": {
+			"note": "Exported running north-south (-z..+z); turned 90 for east-west.",
+			"out": [
+				{
+					"name": "stone-wall-ns"
+				},
+				{
+					"name": "stone-wall-ew",
+					"turn": 90
+				}
+			]
+		},
+		"wall-corner": {
+			"note": "Exported connecting north (-z) and west (-x); -es-fill reuses -es until a dedicated fill piece is made so 2x2 wall blocks stay Vasillo's height and look.",
+			"out": [
+				{
+					"name": "stone-wall-nw"
+				},
+				{
+					"name": "stone-wall-ne",
+					"turn": 90
+				},
+				{
+					"name": "stone-wall-es",
+					"turn": 180
+				},
+				{
+					"name": "stone-wall-es-fill",
+					"turn": 180
+				},
+				{
+					"name": "stone-wall-sw",
+					"turn": 270
+				}
+			]
+		},
+		"wall-t": {
+			"note": "Exported connecting north, east and west (-z, +x, -x); -fill pieces reuse the matching T until a dedicated fill piece is made.",
+			"out": [
+				{
+					"name": "stone-wall-new"
+				},
+				{
+					"name": "stone-wall-nes",
+					"turn": 90
+				},
+				{
+					"name": "stone-wall-nes-fill",
+					"turn": 90
+				},
+				{
+					"name": "stone-wall-esw",
+					"turn": 180
+				},
+				{
+					"name": "stone-wall-esw-fill",
+					"turn": 180
+				},
+				{
+					"name": "stone-wall-nsw",
+					"turn": 270
+				}
+			]
+		},
+		"wall-cross": {
+			"note": "Exported connecting N/E/S/W; -nesw-fill reuses -nesw until a dedicated fill piece is made.",
+			"out": [
+				{
+					"name": "stone-wall-nesw"
+				},
+				{
+					"name": "stone-wall-nesw-fill"
+				}
+			]
+		},
+		"wall-gate": {
+			"note": "Runs north-south (-z..+z) with 2-bone skeletal animation (wall-gate-arm); merged with wall-gate-gap ground rail into gate. Note: anim.gd needs linear-baked gate support before this skeletal gate opens on proximity.",
+			"out": [
+				{
+					"name": "gate",
+					"add": [
+						{
+							"model": "wall-gate-gap"
+						}
+					]
+				}
+			]
+		},
+		"wall-gate-gap": {
+			"note": "Ground rail beneath wall-gate; merged into gate.",
+			"out": []
+		},
+		"wall-gate-side": {
+			"note": "Exported open north (-z) to join a straight wall and capped with the status light on south (+z) facing the gate; turned clockwise for W, N, E gate sides.",
+			"out": [
+				{
+					"name": "stone-wall-gate-s"
+				},
+				{
+					"name": "stone-wall-gate-w",
+					"turn": 90
+				},
+				{
+					"name": "stone-wall-gate-n",
+					"turn": 180
+				},
+				{
+					"name": "stone-wall-gate-e",
+					"turn": 270
+				}
+			]
 		}
 	}
 }

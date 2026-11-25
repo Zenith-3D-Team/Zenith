@@ -21,6 +21,7 @@ extends RefCounted
 const Paths := preload("res://scripts/menu/paths.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const SafeDelete := preload("res://scripts/safe_delete.gd")  # never through a link
+const Switches := preload("res://scripts/switches.gd")
 
 ## The add-on API this Zenith offers (addon_api.gd). An add-on names the one it needs in its
 ## addon.json as "api"; one that needs a newer API than this is refused with a message.
@@ -28,8 +29,11 @@ const API_VERSION := 1
 ## The exact API level, with what was added within version 1 (1.1: api.settings, the Add-ons
 ## menu's pages, api.view.keep_drawing; 1.2: api.terrain; 1.3: api.shaders; 1.4: looks' own_clouds, taa, roughness_limiter; 1.5: a look's sunrise and sunset, its passes' sun uniforms, api.shaders.sun(); 1.6: api.world.hold_chunks,
 ## api.view.full_detail and api.view.screenshot; 1.7: api.character, api.camera.mode, the lift, api.game, addon.json's
-## dependencies, api.addons, api.sound, reload and script errors, a look's shadow_edge). An addon.json may ask for 1.1 to 1.7; 1 means any 1.x. (0.2.3 ships one level, 1.7.)
-const API_LEVEL := 1.7
+## dependencies, api.addons, api.sound, reload and script errors, a look's shadow_edge; 1.8: api.weather,
+## api.sound.loop / update_loop / stop_loop; 1.9: api.creatures; 1.91: api.world.tick, smooth_tick and cue_tick,
+## the game's tick for timed scenes; levels are numbers, so the one after 1.9 is 1.91, not 1.10; 1.92: api.cue_changed
+## and a cue the game sets while running; 1.93: api.native_class). An addon.json may ask for 1.1 to 1.93; 1 means any 1.x.
+const API_LEVEL := 1.93
 const MANIFEST := "addon.json"
 ## Ids are folder-like names: lower case letters, digits, - and _.
 const ID_CHARS := "abcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -405,7 +409,7 @@ static func set_enabled(id: String, on: bool) -> void:
 
 ## Dependencies are checked and order the start (addon_host.gd). `--addon-requires=off`: add-ons load
 ## without checking, in the order they are found, as before (tests set it).
-static var requires_on := not OS.get_cmdline_user_args().has("--addon-requires=off")
+static var requires_on := Switches.on("--addon-requires")
 ## Factorio's prefixes: none required, ? optional, (?) optional and hidden, ! incompatible, ~ required
 ## without affecting the order, + recommended (Factorio's launcher only suggests it: optional here).
 const PREFIXES := ["(?)", "!", "?", "~", "+"]

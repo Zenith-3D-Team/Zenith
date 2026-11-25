@@ -21,4 +21,5 @@ static func arm() -> void:
 
 static func _watch(msec: int) -> void:
 	OS.delay_msec(msec)
+	printerr("[quit] shutdown still running after %d ms: ended by exit_guard.gd" % msec)
 	OS.kill(OS.get_process_id())

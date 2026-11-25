@@ -1,7 +1,19 @@
+#include "acid_goo_native.h"
 #include "belt_draw_native.h"
+#include "belt_items_native.h"
 #include "belt_lattice_native.h"
+#include "belt_mv_native.h"
 #include "belt_sim_native.h"
+#include "biter_gore_native.h"
+#include "biter_ragdoll_native.h"
+#include "movers_native.h"
+#include "decor_native.h"
+#include "chunk_build_native.h"
+#include "inserter_arms_native.h"
+#include "lod_mesher_native.h"
+#include "terrain_field_native.h"
 #include "udp_socket_native.h"
+#include "wire_decode_native.h"
 
 #include <gdextension_interface.h>
 #include <godot_cpp/core/class_db.hpp>
@@ -14,10 +26,22 @@ static void initialize_belt_sim(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
+	GDREGISTER_CLASS(AcidGooNative);
 	GDREGISTER_CLASS(BeltSimNative);
 	GDREGISTER_CLASS(BeltDrawNative);
+	GDREGISTER_CLASS(BeltItemsNative);
 	GDREGISTER_CLASS(BeltLatticeNative);
+	GDREGISTER_CLASS(BeltMvNative);
+	GDREGISTER_CLASS(BiterGoreNative);
+	GDREGISTER_CLASS(BiterRagdollNative);
+	GDREGISTER_CLASS(MoversNative);
 	GDREGISTER_CLASS(UdpSocketNative);
+	GDREGISTER_CLASS(DecorNative);
+	GDREGISTER_CLASS(WireDecodeNative);
+	GDREGISTER_CLASS(ChunkBuildNative);
+	GDREGISTER_CLASS(InserterArmsNative);
+	GDREGISTER_CLASS(LodMesherNative);
+	GDREGISTER_CLASS(TerrainFieldNative);
 }
 
 static void uninitialize_belt_sim(ModuleInitializationLevel p_level) {

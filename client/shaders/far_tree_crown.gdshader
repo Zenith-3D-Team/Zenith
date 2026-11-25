@@ -11,17 +11,20 @@ global uniform float f3d_tree_matte;  // looks.gd: 0 = --tree-sheen=old
 #include "res://shaders/noise.gdshaderinc"
 #include "res://shaders/ground_height.gdshaderinc"
 #include "res://shaders/pollution.gdshaderinc"
+#include "res://shaders/lamp_light.gdshaderinc"
 
 uniform vec2 part_light = vec2(0.95, 0.6);
 
 global uniform float f3d_look_model_fill;
 
 varying flat float leaf_dying;
+varying vec3 world_pos;
 
 void vertex() {
 	vec2 origin = UV;
 	float seed = hash12(origin * 3.17 + 0.5);
 	leaf_dying = clamp(pollution_at(origin).x * 1.3 - 0.3 * seed, 0.0, 1.0);
+	world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 	VERTEX = leaf_dying >= 0.85 ? vec3(0.0) : ground_lift(VERTEX, MODEL_MATRIX);
 }
 
@@ -40,6 +43,7 @@ void fragment() {
 	float pc = clamp(COLOR.a, 0.0, 1.0);
 	ALBEDO = col * mix(1.0, mix(part_light.x, part_light.y, up), pc);
 	EMISSION = ALBEDO * f3d_look_model_fill * (0.35 + 0.65 * max(dot(NORMAL, VIEW), 0.0));
+	EMISSION += lamp_light_emission(ALBEDO, world_pos.xz, world_pos.y, up);
 	ROUGHNESS = mix(0.85, 1.0, f3d_tree_matte);
 	METALLIC = 0.0;
 	SPECULAR = mix(0.2, 0.05, f3d_tree_matte);

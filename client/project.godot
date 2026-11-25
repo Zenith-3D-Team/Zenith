@@ -11,10 +11,10 @@ config_version=5
 [application]
 
 config/name="Zenith"
-config/version="0.2.2"
+config/version="0.3.0"
 config/description="3D client for a running Factorio game, via the factorio-3d-bridge mod."
-run/main_scene="res://scenes/main.tscn"
-config/features=PackedStringArray("4.4", "Forward Plus")
+run/main_scene="res://scenes/boot.tscn"
+config/features=PackedStringArray("4.7", "Forward Plus")
 config/icon="res://icon.png"
 config/windows_native_icon="res://icon.ico"
 config/project_settings_override="user://engine.cfg"
@@ -39,12 +39,17 @@ driver/threads/thread_model=1
 textures/default_filters/anisotropic_filtering_level=4
 textures/vram_compression/compress_with_gpu=false
 limits/global_shader_variables/buffer_size=4194304
+limits/cluster_builder/max_clustered_elements=1024
 
 [shader_globals]
 
 f3d_nature_grain={
 "type": "sampler2DArray",
 "value": ""
+}
+f3d_time={
+"type": "float",
+"value": 0.0
 }
 f3d_tree_matte={
 "type": "float",
@@ -62,9 +67,49 @@ f3d_ground_on={
 "type": "float",
 "value": 0.0
 }
+f3d_cliff_fit={
+"type": "float",
+"value": 1.0
+}
+f3d_mover_rigid={
+"type": "float",
+"value": 1.0
+}
+f3d_wet_rock={
+"type": "float",
+"value": 1.0
+}
+f3d_organic_surface={
+"type": "float",
+"value": 1.0
+}
+f3d_wet_metal={
+"type": "float",
+"value": 1.0
+}
+f3d_cliff_tint={
+"type": "float",
+"value": 0.55
+}
+f3d_cliff_normal={
+"type": "float",
+"value": 1.0
+}
 f3d_ground_rect={
 "type": "vec4",
 "value": Vector4(0, 0, 1, 0)
+}
+f3d_ground_prev={
+"type": "sampler2D",
+"value": ""
+}
+f3d_ground_prev_rect={
+"type": "vec4",
+"value": Vector4(0, 0, 0, 0)
+}
+f3d_ground_mix={
+"type": "float",
+"value": 1.0
 }
 f3d_anim_time={
 "type": "vec2",
@@ -91,12 +136,20 @@ f3d_belt_lattice={
 "value": ""
 }
 f3d_belt_mask={
-"type": "sampler2D",
+"type": "sampler2DArray",
 "value": ""
 }
 f3d_belt_lattice_on={
 "type": "float",
 "value": 0.0
+}
+f3d_item_view_rect={
+"type": "vec4",
+"value": Vector4(-1000000, -1000000, 1000000, 1000000)
+}
+f3d_item_lod_cam={
+"type": "vec3",
+"value": Vector3(0, 0, 0)
 }
 f3d_frame_dt={
 "type": "float",
@@ -109,6 +162,10 @@ f3d_grass={
 f3d_grass_wind={
 "type": "float",
 "value": 0.0
+}
+f3d_decor_composite_on={
+"type": "float",
+"value": 1.0
 }
 f3d_decor_mask={
 "type": "sampler2D",
@@ -185,6 +242,46 @@ f3d_pollution={
 f3d_pollution_rect={
 "type": "vec4",
 "value": Vector4(0, 0, 32, 0)
+}
+f3d_lamp_light={
+"type": "sampler2D",
+"value": ""
+}
+f3d_lamp_light_rect={
+"type": "vec4",
+"value": Vector4(0, 0, 2, 0)
+}
+f3d_weather_wet={
+"type": "vec4",
+"value": Vector4(0, 0, 0, 0)
+}
+f3d_weather_puddle={
+"type": "vec4",
+"value": Vector4(0.12, 0.75, 0.45, 0)
+}
+f3d_weather_clouds={
+"type": "vec4",
+"value": Vector4(0, 0, 0, 0)
+}
+f3d_weather_wind={
+"type": "vec4",
+"value": Vector4(0, 0, 1, 0)
+}
+f3d_weather_impulses={
+"type": "sampler2D",
+"value": ""
+}
+f3d_weather_impulse_info={
+"type": "vec4",
+"value": Vector4(0, 0, 1, 0)
+}
+f3d_weather_impulse_bounds={
+"type": "vec4",
+"value": Vector4(0, 0, 0, 0)
+}
+f3d_belt_reactive={
+"type": "float",
+"value": 0.0
 }
 
 [xr]

@@ -23,12 +23,14 @@ extends RefCounted
 ## wins) shows its top run over the return, not the return's backward chevrons over it;
 ## --belt-return-first=off puts them after, as before 0.2.2.
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## On unless --belt-return=off.
-static var enabled := not ("--belt-return=off" in OS.get_cmdline_user_args())
+static var enabled := Switches.on("--belt-return")
 ## The space under the top run (return strip, rollers) shaded as a covered space, unless --belt-cover=off.
-static var cover_on := not ("--belt-cover=off" in OS.get_cmdline_user_args())
+static var cover_on := Switches.on("--belt-cover")
 ## The return's triangles drawn before the top run's, unless --belt-return-first=off.
-static var first := not ("--belt-return-first=off" in OS.get_cmdline_user_args())
+static var first := Switches.on("--belt-return-first")
 ## Meta on a model's ArrayMesh: per surface the return drawn after its arrays (null: none), so a copy
 ## of the model (model_library.gd _copy: a tier wearing another's model) draws it too.
 const META := &"f3d_belt_return"

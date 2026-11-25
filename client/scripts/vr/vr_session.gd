@@ -34,6 +34,7 @@ extends Node3D
 ## The desktop keyboard keeps working.
 
 const VrPanel := preload("res://scripts/vr/vr_panel.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 enum Mode { TABLETOP, FIRST_PERSON }
 
@@ -86,7 +87,7 @@ var _panel_pose := Transform3D.IDENTITY  # metres, play space
 
 
 static func requested() -> bool:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg == "--vr" or arg.begins_with("--vr="):
 			return true
 	return false
@@ -94,7 +95,7 @@ static func requested() -> bool:
 
 func _ready() -> void:
 	var left_handed := false
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg == "--vr=first-person":
 			mode = Mode.FIRST_PERSON
 		elif arg == "--vr-hand=left":

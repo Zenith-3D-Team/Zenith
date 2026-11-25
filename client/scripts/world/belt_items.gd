@@ -48,16 +48,21 @@ const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const GameClock := preload("res://scripts/world/game_clock.gd")
 const InserterArms := preload("res://scripts/world/inserter_arms.gd")
 const MomentHold := preload("res://scripts/world/moment_hold.gd")
+const BeltMv := preload("res://scripts/world/belt_mv.gd")
+const Settings := preload("res://scripts/menu/settings.gd")
 const BeltPaths := preload("res://scripts/world/belt_paths.gd")
 const BeltRecords := preload("res://scripts/world/belt_records.gd")
 const BeltSim := preload("res://scripts/world/belt_sim.gd")
 const WireDecode := preload("res://scripts/net/wire_decode.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const ModelLods := preload("res://scripts/world/model_lods.gd")
 const BeltLattice := preload("res://scripts/world/belt_lattice.gd")
 const LaneInset := preload("res://scripts/world/belt_lane_inset.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const NativeLibrary := preload("res://scripts/native_library.gd")
 const PickUp := preload("res://scripts/world/pick_up.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## The C++ simulation's class (the same API as belt_sim.gd), used when its extension is loaded.
 const NATIVE_SIM := "BeltSimNative"
@@ -106,6 +111,9 @@ static var lead_lag := 60.0
 ## chunks; queued behind them (main's heavier levels of detail and decoratives), a job's result came
 ## about twice its own time late, the next stepped more ticks, and the drawn clock sat 120 ticks behind.
 static var job_high := true
+## --belt-job=pool: run belt jobs on Godot's WorkerThreadPool (as before). On (the default): a dedicated
+## worker thread with a semaphore so terrain/LOD/model pool tasks never stall belt jobs on laps.
+static var job_thread := true
 ## Tiles from the camera to the items' square within which item models cast shadows, by Settings >
 ## Graphics > Shadows (sun_shadows.gd QUALITY "items": Low 0, Medium 30, High 45, Ultra 60). It was a
 ## fixed 16, so items lost their shadows a step out from the closest zoom; now they keep them at the
@@ -135,9 +143,9 @@ const PILE_TURN := ItemCards.PILE_TURN
 ## Tiles past the Items in 3D cap's edge a model stays a model (no flipping at the edge).
 const CAP_SLACK := 1.5
 ## With the camera leading (view_led): Items in 3D's cap is worked out again once the camera has
-## moved this far (tiles) or turned this much (the cosine of about 5 degrees) since.
-const VIEW_STEP := 2.0
-const VIEW_TURN := 0.996
+## moved this far (tiles) or turned this much (the cosine of about 10 degrees) since.
+const VIEW_STEP := 6.0
+const VIEW_TURN := 0.985
 ## A finished job's result waits for the drawn clock to reach its fold tick (within FOLD_SLACK
 ## ticks), at most HOLD_USEC: drawn sooner, its records would start ahead of the clock.
 const FOLD_SLACK := 0.25
@@ -172,7 +180,7 @@ const AHEAD_MARGIN := 6
 ## wider, so a camera panning a little doesn't plan every parked item again each job; and the ground
 ## the camera sees is taken to end this far from it (a low camera sees to the horizon).
 const VIEW_MARGIN := 4.0
-const VIEW_KEEP := 10.0
+const VIEW_KEEP := 18.0
 const VIEW_FAR := 160.0
 ## --belt-draw-view-ground=off: the view is cut VIEW_FAR along each corner ray, as before. On (the
 ## default): each ray is followed to the ground however far it goes (up to VIEW_GROUND_FAR) and the view
@@ -296,6 +304,9 @@ class State:
 	var square := Vector3(0.0, 0.0, -1.0)
 	var period := 0
 	var data_tick := -1  # the newest update's tick
+	var _square_tick: int = -1
+	var _lane_tick: Dictionary = {}  # lane key -> newest bs tick applied
+	var _off_tick: Dictionary = {}  # unit id -> newest bs `of` tick applied
 	var last_fold := -1.0  # (ahead_auto) the last job's drawn tick: the gap to this one's is the lead's floor
 	## Lane key -> its meta [kind, length, step, x0, y0, xm, ym, x1, y1] and, for curves, its arc
 	## [centre x, centre y, radius, angle at 0, angle turned to its length].
@@ -367,6 +378,13 @@ class State:
 	var capped_cam := false  # and whether the camera led it, from where, facing which way
 	var capped_cam_pos := Vector3.INF
 	var capped_cam_dir := Vector3.ZERO
+	var capped_lod_split := false
+	var capped_d1 := INF
+	var capped_d2 := INF
+	var capped_lod_anchor := Vector3.INF
+	var capped_sim_cap := -2
+	var sim_cap_d2 := PackedFloat32Array()
+	var cap_exhausted := false
 	## (view) The ground rectangle (x, z tiles) the parked items were last judged against: the camera's
 	## view grown by VIEW_KEEP; when the view leaves it, the parked items in the new one are planned.
 	var planned_view := Rect2()
@@ -427,6 +445,9 @@ class State:
 		sim.set("ug_guard", Job.ug_guard)
 		sim.hold_inputs = Job.hold
 		sim.split_wake = Job.split_wake
+		sim.set("split_wake_r4", Job.split_wake_r4)
+		sim.set("split_hints", Job.split_hints)
+		sim.set("split_reconcile", Job.split_reconcile)
 		sim.set("dead_walls", Job.dead_walls)
 
 	## The waiting changes, each item's in its order (tests: the list, or later_tick's by item; an item's
@@ -455,6 +476,18 @@ class Job:
 	var full := false
 	var known := {}
 	var model_cap := -1
+	var lod_split := false
+	var lod_anchor := Vector3.ZERO
+	var lod_d1 := INF
+	var lod_d2 := INF
+	var lod_jit := Vector2.ZERO
+	var lat_3d_slots := 0
+	var lat_eligible_slots := 0
+	var lat_limit_d2 := INF
+	var sim_cap := -1
+	var sim_3d := 0
+	var sim_eligible := 0
+	var cap_exhausted := false
 	## The camera drawing, when it leads Items in 3D's cap (view_led, view_priority.gd): its place, facing,
 	## and frustum without the far plane. Off: nearest the square's centre, as before. (Not `view`, the
 	## camera's ground rectangle the records are planned for.)
@@ -584,7 +617,17 @@ class Job:
 	## (the default): its front runs to its end, as before.
 	static var dead_walls := false
 	## --belt-sim-split-wake=off: splitters let items through whenever the belt rules say (BeltSim.split_wake).
+	## =old: the earlier wait rule (a crossing 1-2 ticks ago, 3 with the other output moving); the default is
+	## the R4 rule (BeltSim.split_wake_r4).
 	static var split_wake := true
+	static var split_wake_r4 := true
+	## --belt-sim-split-hints=off: the bridge's splitter crossing hints (`bs.sx`, /f3d-bs crossings hints) aren't
+	## followed (as before: the rules and split_wake only; BeltSim.split_hints). The old way whole pairs it with
+	## /f3d-bs crossings sim on the server.
+	static var split_hints := true
+	## --belt-sim-split-reconcile=off: a read of a splitter's lane that differs from the simulation only by when
+	## items crossed is applied as any other (as before; BeltSim.split_reconcile).
+	static var split_reconcile := true
 	## --belt-sim-ask-unknown=off: a lane read (`sl`) or checked (`pc`) whose meta (`lm`) never came is left
 	## out (as before). On: it is asked for again (`bre`, at most every ASK_AGAIN_MSEC), which the bridge
 	## answers with its meta. The bridge sends a lane's meta once, when it loads it: an update lost (UDP, or
@@ -638,8 +681,17 @@ class Job:
 	## --belt-sim-ask-near=off: a job's asks in the simulation's order. On (the default): nearest the view's
 	## middle first (the bridge reads them in the order asked, bre_cap an update).
 	static var ask_near := true
+	## --belt-sim-lattice-no-bre=off: a lane the lattice draws (full of one kind) whose drift check (`pc`) fails
+	## is asked for again (`bre`) as the ask rules say. On (the default): it is not asked while the lattice
+	## draws it (a packed balancer row's items drift at the splitters, ~900 asks a second, and the lattice's
+	## own checks drop the lane from it when it really stops being full of its kind); it is asked the moment it
+	## leaves the lattice, as a count-only mismatch is.
+	static var lat_no_bre := true
+	## --belt-native-decode=off: decode bs message bodies (sl, sh, ew, pc, pu, of) in GDScript instead of C++.
+	static var native_decode := true
 	var view := Rect2()  # the camera's ground view (x, z tiles), from the main thread
 	var view_all := true  # no camera (tests, replays): everything is in view
+	var tight_cull := true
 	var parked := 0  # items parked after this job
 	var unparked := 0  # items planned again as the view moved
 	var first_tick := -1  # the earliest read tick in the job's lanes (for starting the simulation)
@@ -668,7 +720,8 @@ class Job:
 	## (--belt-draw-lattice, belt_lattice.gd) its kinds' runs, record pages and mask, for the main thread.
 	var lat_written: Array = []
 	var lat_pages := {}
-	var lat_mask: Image = null
+	var lat_mask_tiles: Array = []
+	var lat_mask_all := false
 	var lat_lanes := 0
 	var lat_usec := 0
 	## (--inserter-handoff) What the inserters' takes and puts did in this job's ticks, for the arms:
@@ -806,6 +859,11 @@ class Job:
 		# (The lattice first: the records' side parks and counts the items on the lanes it draws.)
 		if BeltLattice.on or state.lattice.has_drawn():
 			_lattice()
+		else:
+			lat_3d_slots = 0
+			lat_eligible_slots = 0
+			lat_limit_d2 = INF
+		sim_cap = -1 if model_cap < 0 else maxi(0, model_cap - lat_3d_slots)
 		if state.draw != null:
 			_run_native(ch)
 			_hands(ch, false)
@@ -824,12 +882,22 @@ class Job:
 			_renew()
 			renew_usec = Time.get_ticks_usec() - tr
 			_keep_or_drop()
-			if known_new or model_cap != state.capped_at or (model_cap >= 0 and (state.square != state.capped_square or state.cap_jobs >= CAP_EVERY or _cam_moved())):
+			var lod_moved := lod_split != state.capped_lod_split or not is_equal_approx(lod_d1, state.capped_d1) \
+				or not is_equal_approx(lod_d2, state.capped_d2) \
+				or (lod_split and (state.capped_lod_anchor == Vector3.INF or lod_anchor.distance_squared_to(state.capped_lod_anchor) > 16.0))
+			if known_new or model_cap != state.capped_at or sim_cap != state.capped_sim_cap or lod_moved \
+					or (model_cap >= 0 and (state.square != state.capped_square or state.cap_jobs >= CAP_EVERY or _cam_moved())):
 				state.capped_square = state.square
 				state.capped_at = model_cap
+				state.capped_sim_cap = sim_cap
 				state.capped_cam = cam_led
 				state.capped_cam_pos = cam_pos
 				state.capped_cam_dir = cam_dir
+				state.capped_lod_split = lod_split
+				state.capped_d1 = lod_d1
+				state.capped_d2 = lod_d2
+				if lod_moved:
+					state.capped_lod_anchor = lod_anchor
 				state.cap_jobs = 0
 				var tc := Time.get_ticks_usec()
 				_cap_models()
@@ -874,6 +942,16 @@ class Job:
 			lanes_n = state.lanes.size()
 			if dump != null and paths != null:
 				dump_paths = state.path_tex
+		var eligible := lat_eligible_slots + sim_eligible
+		if model_cap < 0:
+			cap_exhausted = false
+		elif model_cap == 0:
+			cap_exhausted = true
+		elif state.cap_exhausted:
+			cap_exhausted = eligible > maxi(0, model_cap - maxi(model_cap / 20, 64))
+		else:
+			cap_exhausted = eligible >= model_cap
+		state.cap_exhausted = cap_exhausted
 		_lattice_merge()
 		if not rm_keys.is_empty():
 			_forget_lanes(rm_keys)
@@ -938,10 +1016,18 @@ class Job:
 		elif state.lattice.has_method("set_shown"):
 			state.lattice.set_shown(fold_tick)
 		if state.lattice is BeltLattice:
+			state.lattice.set_tight_cull(tight_cull)
 			state.lattice.drawn_tick = floori(fold_tick)
+			state.lattice.set_cap_anchor(Vector2(state.square.x, state.square.y), cam_led, cam_pos, cam_dir, cam_planes, state.sim_cap_d2)
+			state.lattice.set_lod_bands(lod_split, lod_anchor, lod_d1, lod_d2, lod_jit)
 			lr = state.lattice.update(state, state.sim, int(state.sim.tick), view, view_all, known, model_cap, full, dump != null)
+			lat_3d_slots = state.lattice.cap_3d_slots
+			lat_eligible_slots = state.lattice.cap_eligible_slots
+			lat_limit_d2 = state.lattice.cap_limit_d2
 		else:
 			# (A library built before the switch has no such method and runs as before.)
+			if state.lattice.has_method("set_tight_cull"):
+				state.lattice.set_tight_cull(tight_cull)
 			if state.lattice.has_method("set_settle"):
 				state.lattice.set_settle(BeltLattice.settle)
 				state.lattice.set_drawn_tick(floori(fold_tick))
@@ -951,12 +1037,25 @@ class Job:
 				state.lattice.set_creep_flow(BeltLattice.creep_flow)
 			if state.lattice.has_method("set_creep_step"):
 				state.lattice.set_creep_step(BeltLattice.creep_step)
+			if state.lattice.has_method("set_mask_tiled"):
+				state.lattice.set_mask_tiled(BeltLattice.mask_tiled)
+			if state.lattice.has_method("set_model_cap_near"):
+				state.lattice.set_model_cap_near(BeltLattice.model_cap_near)
+			if state.lattice.has_method("set_cap_anchor"):
+				state.lattice.set_cap_anchor(Vector2(state.square.x, state.square.y), cam_led, cam_pos, cam_dir, cam_planes, state.sim_cap_d2)
+			if state.lattice.has_method("set_lod_bands"):
+				state.lattice.set_lod_bands(lod_split, lod_anchor, lod_d1, lod_d2, lod_jit)
 			lr = state.lattice.update(int(state.sim.tick), view, view_all, known, model_cap, full, dump != null, state.records.base,
 				state.height, BeltLattice.on, BeltLattice.world, BeltLattice.piles, BeltLattice.unison, BeltLattice.world_all,
 				BeltLattice.standing_obs)
+			if state.lattice.has_method("get_cap_3d_slots"):
+				lat_3d_slots = int(state.lattice.get_cap_3d_slots())
+				lat_eligible_slots = int(state.lattice.get_cap_eligible_slots())
+				lat_limit_d2 = float(state.lattice.get_cap_limit_d2())
 		lat_written = lr["written"]
 		lat_pages = lr["pages"]
-		lat_mask = lr["mask"]
+		lat_mask_tiles = lr.get("mask_tiles", [])
+		lat_mask_all = bool(lr.get("mask_all", false))
 		lat_lanes = state.lattice.lanes_n
 		lat_add = lr.get("added", PackedInt64Array())
 		lat_del = lr.get("removed", PackedInt64Array())
@@ -993,8 +1092,10 @@ class Job:
 	## as _set_view .. _write below, item for item); its results into this job's fields.
 	func _run_native(ch: Dictionary) -> void:
 		var params := {"fold": fold_tick, "lead": lead, "now_msec": now_msec, "full": full, "model_cap": model_cap,
+			"sim_cap": sim_cap, "lat_cap_near": BeltLattice.on and BeltLattice.model_cap_near, "lat_limit_d2": lat_limit_d2,
+			"lod_split": lod_split, "lod_anchor": lod_anchor, "lod_d1": lod_d1, "lod_d2": lod_d2, "lod_jit": lod_jit,
 			"square": state.square, "base": state.records.base, "height": state.height, "dump": dump != null,
-			"coalesce": coalesce, "view_cull": view_cull, "lead_on": lead_on, "gone_order": gone_order, "early": early, "early_stop": early_stop,
+			"coalesce": coalesce, "view_cull": view_cull, "tight_cull": tight_cull, "lead_on": lead_on, "gone_order": gone_order, "early": early, "early_stop": early_stop,
 			"view_all": view_all, "view": view, "watch": watch, "watch_all": watch_all,
 			"pile_one": pile_one, "dump_parks": dump_parks, "cam_led": cam_led, "cam_pos": cam_pos, "cam_dir": cam_dir, "cam_planes": cam_planes,
 			"later_tick": later_tick, "park_lat": park_lat, "ask": 1 if ask_view else 0, "ask_near": ask_near,
@@ -1005,6 +1106,12 @@ class Job:
 		if far_new:
 			params["far_built"] = far_built
 		var res: Dictionary = state.draw.run_job(ch, params)
+		sim_3d = int(res.get("sim_3d", 0))
+		sim_eligible = int(res.get("sim_eligible", 0))
+		if res.has("sim_d2"):
+			state.sim_cap_d2 = res["sim_d2"]
+		if res.has("capped_lod_anchor"):
+			state.capped_lod_anchor = res["capped_lod_anchor"]
 		apply_usec = int(res.get("apply_usec", 0))
 		renew_usec = int(res.get("renew_usec", 0))
 		cap_usec = int(res.get("cap_usec", 0))
@@ -1052,9 +1159,14 @@ class Job:
 	func _set_view() -> bool:
 		if not view_cull or view_all:
 			return false
+		var keep: float = clampf(maxf(view.size.x, view.size.y) * 0.15, 2.0, 8.0) if tight_cull else VIEW_KEEP
 		if state.planned_any and state.planned_view.encloses(view):
-			return false
-		state.planned_view = view.grow(VIEW_KEEP)
+			if not tight_cull:
+				return false
+			if state.planned_view.size.x <= view.size.x + 2.0 * keep + 6.0 \
+					and state.planned_view.size.y <= view.size.y + 2.0 * keep + 6.0:
+				return false
+		state.planned_view = view.grow(keep)
 		state.planned_any = true
 		return true
 
@@ -1125,6 +1237,14 @@ class Job:
 		var now := floori(fold_tick)
 		for it: Item in state.items.values():
 			if not it.parked:
+				if tight_cull and it.slot >= 0 and not state.kept.has(it) and it.hide_at < 0.0 and it.show_at < 0.0:
+					var ad := mini(it.v * (now - it.t0), it.reach) if it.v > 0 and now > it.t0 else 0
+					var aat := _advance(it.lane, it.pos, ad) if ad > 0 else Vector2i(it.lane, it.pos)
+					var awhy := _hide_why(aat.x, aat.y, it.reach - ad, it.v)
+					if awhy != 0:
+						_park(it)
+						_set_lat(it, awhy == 2)
+						parked += 1
 				continue
 			var d := mini(it.v * (now - it.t0), it.reach) if it.v > 0 and now > it.t0 else 0
 			var at := _advance(it.lane, it.pos, d) if d > 0 else Vector2i(it.lane, it.pos)
@@ -1139,6 +1259,11 @@ class Job:
 				var m: PackedInt32Array = state.lanes.get(it.lane, PackedInt32Array())
 				it.run = it.pos + int(state.sim.run_of(it.lane)) if not m.is_empty() and m[0] == BeltSim.STRAIGHT else 0
 				it.t0 = now
+			if model_cap < 0 and it.key < 0:
+				it.key = it.item_id
+			if lod_split and it.key >= 0:
+				var p_up := _point(it.lane, float(it.pos))
+				it.key = _desired_3d_key(it, Vector3(p_up.x, p_up.y, p_up.z), -1)
 			_unpark(it)
 			_plan(it)
 			unparked += 1
@@ -1281,6 +1406,10 @@ class Job:
 		var q := _point_m(m, arc, float(0 if stuck else p - left))
 		if view_cull and not view_all and not state.planned_view.grow(VIEW_MARGIN).has_point(Vector2(q.x, q.z)):
 			return false
+		if model_cap < 0 and it.key < 0:
+			it.key = it.item_id
+		if lod_split and it.key >= 0:
+			it.key = _desired_3d_key(it, Vector3(q.x, q.y, q.z), -1)
 		_unpark(it)
 		it.v = 0
 		it.from = Vector3(q.x, q.y, q.z)
@@ -1374,11 +1503,16 @@ class Job:
 			for msg: Dictionary in msgs:
 				drops = drops or msg.get("dl") is Array or msg.get("dl") is PackedInt64Array
 		for msg: Dictionary in msgs:
+			if msg.get("t") != "bs":
+				continue
+			var k := int(msg.get("k", 0))
 			var lm = msg.get("lm")
 			if drops and (lm is Array or lm is PackedInt64Array):
 				var a = lm
 				for i in range(0, a.size() - 11, 12):
-					new_geo[Vector4i(int(a[i + 4]), int(a[i + 5]), int(a[i + 8]), int(a[i + 9]))] = int(a[i])
+					var lkey := int(a[i])
+					if k >= int(state._lane_tick.get(lkey, -1)):
+						new_geo[Vector4i(int(a[i + 4]), int(a[i + 5]), int(a[i + 8]), int(a[i + 9]))] = lkey
 			var sl = msg.get("sl")
 			if not (sl is Array or sl is PackedInt64Array):
 				continue
@@ -1387,7 +1521,7 @@ class Job:
 			while i + 2 < a2.size():
 				var key := int(a2[i])
 				var at := int(a2[i + 1])
-				if not read_at.has(key) or at < int(read_at[key]):
+				if k >= int(state._lane_tick.get(key, -1)) and (not read_at.has(key) or at < int(read_at[key])):
 					read_at[key] = at
 				i += 3 + clampi(int(a2[i + 2]), 0, (a2.size() - i - 3) / 4) * 4
 
@@ -1584,6 +1718,88 @@ class Job:
 					if pk.y < now - 600:
 						state.peeks.erase(pk)
 
+	func _filter_sl(sl_v: Variant, k: int) -> Variant:
+		if not (sl_v is Array or sl_v is PackedInt64Array):
+			return sl_v
+		var sz: int = sl_v.size()
+		var stale := false
+		var i := 0
+		while i + 2 < sz:
+			var key := int(sl_v[i])
+			var n := clampi(int(sl_v[i + 2]), 0, (sz - i - 3) / 4)
+			if k < int(state._lane_tick.get(key, -1)):
+				stale = true
+				break
+			i += 3 + n * 4
+		if not stale:
+			i = 0
+			while i + 2 < sz:
+				var key := int(sl_v[i])
+				var n := clampi(int(sl_v[i + 2]), 0, (sz - i - 3) / 4)
+				if state.removed_keys.is_empty() or not state.removed_keys.has(key):
+					state._lane_tick[key] = k
+				i += 3 + n * 4
+			return sl_v
+		var out := PackedInt64Array()
+		i = 0
+		while i + 2 < sz:
+			var key := int(sl_v[i])
+			var at := int(sl_v[i + 1])
+			var n := clampi(int(sl_v[i + 2]), 0, (sz - i - 3) / 4)
+			var step := 3 + n * 4
+			if k >= int(state._lane_tick.get(key, -1)):
+				if state.removed_keys.is_empty() or not state.removed_keys.has(key):
+					state._lane_tick[key] = k
+				var base := out.size()
+				out.resize(base + step)
+				out[base] = key
+				out[base + 1] = at
+				out[base + 2] = n
+				for j in n * 4:
+					out[base + 3 + j] = int(sl_v[i + 3 + j])
+			i += step
+		return out
+
+	func _filter_of(of_v: Variant, k: int) -> Variant:
+		if not (of_v is Array or of_v is PackedInt64Array):
+			return of_v
+		var sz: int = of_v.size()
+		var stale := false
+		for i in range(0, sz - 1, 2):
+			if k < int(state._off_tick.get(int(of_v[i]), -1)):
+				stale = true
+				break
+		if not stale:
+			for i in range(0, sz - 1, 2):
+				state._off_tick[int(of_v[i])] = k
+			return of_v
+		var out := PackedInt64Array()
+		for i in range(0, sz - 1, 2):
+			var unit := int(of_v[i])
+			if k >= int(state._off_tick.get(unit, -1)):
+				state._off_tick[unit] = k
+				out.append(unit)
+				out.append(int(of_v[i + 1]))
+		return out
+
+	func _filter_lane_stride(raw_v: Variant, k: int, stride: int) -> Variant:
+		if not (raw_v is Array or raw_v is PackedInt64Array):
+			return raw_v
+		var sz: int = raw_v.size()
+		var stale := false
+		for i in range(0, sz - (stride - 1), stride):
+			if k < int(state._lane_tick.get(int(raw_v[i]), -1)):
+				stale = true
+				break
+		if not stale:
+			return raw_v
+		var out := PackedInt64Array()
+		for i in range(0, sz - (stride - 1), stride):
+			if k >= int(state._lane_tick.get(int(raw_v[i]), -1)):
+				for j in stride:
+					out.append(int(raw_v[i + j]))
+		return out
+
 	## One part of an update (`bs`): lanes' meta first, then their items, checks, drops, switches.
 	func _handle(msg: Dictionary) -> void:
 		if msg.get("t") == "zp":
@@ -1604,18 +1820,23 @@ class Job:
 		state.data_tick = maxi(state.data_tick, k)
 		if state.records.base < 0.0:
 			state.records.base = float(k) - 600.0
-		if msg.has("p"):
-			state.period = int(msg["p"])
-		if msg.has("fr"):
-			state.square = Vector3(int(msg.get("fx", 0)) / 256.0, int(msg.get("fy", 0)) / 256.0, int(msg.get("fr", 0)))
+		if k >= state._square_tick:
+			state._square_tick = k
+			if msg.has("p"):
+				state.period = int(msg["p"])
+			if msg.has("fr"):
+				state.square = Vector3(int(msg.get("fx", 0)) / 256.0, int(msg.get("fy", 0)) / 256.0, int(msg.get("fr", 0)))
 		# (A binary part's lists are PackedInt64Array in the same layout: wire_decode.gd.)
 		var lm = msg.get("lm")
 		if (lm is Array or lm is PackedInt64Array):
 			var a = lm
 			for i in range(0, a.size() - 11, 12):
 				var key := int(a[i])
+				if k < int(state._lane_tick.get(key, -1)):
+					continue
 				if not state.removed_keys.is_empty() and state.removed_keys.has(key):
 					continue  # (removed_now: a belt Zenith took away, read before it went)
+				state._lane_tick[key] = k
 				var raw := PackedInt32Array([int(a[i + 1]), int(a[i + 2]), int(a[i + 3]), int(a[i + 4]), int(a[i + 5]),
 					int(a[i + 6]), int(a[i + 7]), int(a[i + 8]), int(a[i + 9])])
 				state.lanes_raw[key] = raw
@@ -1647,13 +1868,40 @@ class Job:
 		var dl = msg.get("dl")
 		if (dl is Array or dl is PackedInt64Array):
 			for key in dl:
-				if not state.removed_keys.is_empty() and state.removed_keys.erase(int(key)):
-					_drop_now(int(key))  # (removed_now: gone already; nothing of it left to stand)
+				var ki := int(key)
+				if k < int(state._lane_tick.get(ki, -1)):
 					continue
-				if not new_geo.is_empty() and _drop_later(int(key)):
+				state._lane_tick[ki] = k
+				if not state.removed_keys.is_empty() and state.removed_keys.erase(ki):
+					_drop_now(ki)  # (removed_now: gone already; nothing of it left to stand)
 					continue
-				_drop_now(int(key))
-		var sl = msg.get("sl")
+				if not new_geo.is_empty() and _drop_later(ki):
+					continue
+				_drop_now(ki)
+		# sx: splitter crossing hints, [unit, side, tick, out0, out1, in0, in1, ...] (split_hints; before the reads:
+		# both decoders' reads land in the queue, the hints beside it).
+		var sx = msg.get("sx")
+		if (sx is Array or sx is PackedInt64Array) and Job.split_hints and sim.has_method("add_split_hint"):
+			var a8 = sx
+			for i in range(0, a8.size() - 6, 7):
+				sim.add_split_hint(int(a8[i]), int(a8[i + 1]), int(a8[i + 2]), int(a8[i + 3]), int(a8[i + 4]), int(a8[i + 5]),
+					int(a8[i + 6]))
+		var sl: Variant = _filter_sl(msg.get("sl"), k)
+		var sh: Variant = _filter_lane_stride(msg.get("sh"), k, 2)
+		var ew: Variant = _filter_lane_stride(msg.get("ew"), k, 4)
+		var pc: Variant = _filter_lane_stride(msg.get("pc"), k, 5)
+		var of: Variant = _filter_of(msg.get("of"), k)
+		if native_decode and sim.has_method("apply_bs_body") and not (state.lattice is BeltLattice):
+			var r: Dictionary = sim.apply_bs_body(sl, sh, ew, pc, msg.get("pu"),
+				of, k, state.lattice, state.removed_keys, ask_unknown, hold, ORACLE_MAX)
+			var ft := int(r.get("first_tick", -1))
+			if ft >= 0:
+				first_tick = ft if first_tick < 0 else mini(first_tick, ft)
+			stale_reads += int(r.get("stale_reads", 0))
+			stale_most = maxi(stale_most, int(r.get("stale_most", 0)))
+			for ak: int in (r.get("ask", PackedInt64Array()) as PackedInt64Array):
+				_ask(ak)
+			return
 		if (sl is Array or sl is PackedInt64Array):
 			var a2 = sl
 			var i := 0
@@ -1693,7 +1941,6 @@ class Job:
 					state.last_read[key] = items
 				i += 3 + n * 4
 		# sh: splitter inputs found as their last read left them, [key, tick, ...]: put back so, and held.
-		var sh = msg.get("sh")
 		if (sh is Array or sh is PackedInt64Array) and hold:
 			var a7 = sh
 			for i in range(0, a7.size() - 1, 2):
@@ -1701,12 +1948,10 @@ class Job:
 				if state.last_read.has(key):
 					sim.hold_input(key, int(a7[i + 1]), state.last_read[key])
 		# ew: a lane leading out that only moved on: its new wall, [key, tick, front uid, its position, ...].
-		var ew = msg.get("ew")
 		if (ew is Array or ew is PackedInt64Array):
 			var a6 = ew
 			for i in range(0, a6.size() - 3, 4):
 				sim.set_wall(int(a6[i]), int(a6[i + 1]), int(a6[i + 2]), int(a6[i + 3]))
-		var pc = msg.get("pc")
 		if (pc is Array or pc is PackedInt64Array):
 			var a3 = pc
 			# (pu: packed lanes' front and back items' ids, [key, front uid, back uid, ...].)
@@ -1726,7 +1971,6 @@ class Job:
 				if state.lanes.has(int(a3[i])):
 					state.lattice.note_check(int(a3[i]), (state.lanes[int(a3[i])] as PackedInt32Array)[1], int(a3[i + 2]),
 						int(a3[i + 3]), int(a3[i + 4]))
-		var of = msg.get("of")
 		if (of is Array or of is PackedInt64Array):
 			var a4 = of
 			for i in range(0, a4.size() - 1, 2):
@@ -2184,6 +2428,10 @@ class Job:
 			elif not m.is_empty() and not _in_view(key, m[1] / 2, 0):
 				cls = 2
 			var every := ASK_AGAIN_MSEC
+			if lat_no_bre and cls == 1:
+				state.lat_pend[key] = true
+				ask_held_n += 1
+				continue
 			if ask_view:
 				if cls == 1:
 					if not count:
@@ -2379,7 +2627,8 @@ class Job:
 	## One change: the item's new motion, and its record.
 	func _apply_one(uid: int, item: int, stack: int, key: int, pos: int, t0: int, v: int, reach: int, run: int) -> void:
 		var it: Item = state.items.get(uid)
-		if it == null:
+		var fresh_item := it == null
+		if fresh_item:
 			it = Item.new()
 			it.uid = uid
 			it.item_id = item
@@ -2402,10 +2651,22 @@ class Job:
 				var na := ItemCards.lattice_turn(nm, BeltLattice.TURN_RUN)
 				it.c = cos(na)
 				it.s = sin(na)
+		var pos3 := it.from
+		if lod_split or fresh_item or it.parked:
+			var p_est := _point(key, float(pos))
+			pos3 = Vector3(p_est.x, p_est.y, p_est.z)
 		if it.key >= 0:
-			var mk := _model_key(it)
-			if mk != it.key:
-				_rekey(it, mk)
+			var cur_b := -1 if fresh_item or it.parked else ItemCards.band_of(it.key)
+			var dk := _desired_3d_key(it, pos3, cur_b)
+			if fresh_item and model_cap == 0:
+				var lk_f: Array = known.get(item, [])
+				if lk_f.is_empty() or bool(lk_f[1]):
+					dk = ItemCards.icon_key(item)
+			if dk != it.key:
+				if it.parked:
+					it.key = dk
+				else:
+					_rekey(it, dk)
 		_set_count(it, stack)
 		it.lane = key
 		it.pos = pos
@@ -2697,43 +2958,107 @@ class Job:
 	## its view count, nearest the camera first, so an add-on's camera away from the character, first
 	## person or the remote view spend the models on what is on screen; items behind it or off to the
 	## side are icons.
+	func _desired_3d_key(it: Item, pos: Vector3, cur_band: int) -> int:
+		var mk := _model_key(it)
+		if not lod_split:
+			return mk
+		var look: Array = known.get(it.item_id, [])
+		if not look.is_empty() and not bool(look[1]):
+			return mk
+		return ItemCards.band_key(mk, BeltLattice.band_for_dist(it.uid, pos.distance_to(lod_anchor), lod_d1, lod_d2, lod_jit, cur_band))
+
+
 	func _cap_models() -> void:
-		if model_cap < 0:
+		sim_3d = 0
+		sim_eligible = 0
+		var lat_cap_coord := BeltLattice.on and BeltLattice.model_cap_near
+		if model_cap == 0:
+			state.sim_cap_d2 = PackedFloat32Array()
 			for uid in state.items:
 				var it: Item = state.items[uid]
-				var mk := _model_key(it)
-				if it.key != mk:
-					_rekey(it, mk)
+				var look: Array = known.get(it.item_id, [])
+				var icon_only := not look.is_empty() and not bool(look[1])
+				var target := _model_key(it) if icon_only else ItemCards.icon_key(it.item_id)
+				if it.key != target:
+					_rekey(it, target)
+				if not icon_only and not it.parked and (not lat_cap_coord or not state.lat.has(it.lane)):
+					sim_eligible += 1
+			return
+		if model_cap < 0:
+			state.sim_cap_d2 = PackedFloat32Array()
+			for uid in state.items:
+				var it: Item = state.items[uid]
+				var look: Array = known.get(it.item_id, [])
+				var icon_only := not look.is_empty() and not bool(look[1])
+				if icon_only:
+					var mk := _model_key(it)
+					if it.key != mk:
+						_rekey(it, mk)
+					continue
+				if it.parked:
+					if it.key < 0:
+						it.key = it.item_id
+					continue
+				var dk := _desired_3d_key(it, it.from, ItemCards.band_of(it.key) if it.key >= 0 else -1)
+				if it.key != dk:
+					_rekey(it, dk)
+				if not state.lat.has(it.lane):
+					sim_eligible += 1
+					sim_3d += 1
 			return
 		var c := Vector2(state.square.x, state.square.y)
-		var uids: Array = []
+		var sel: Array = []
 		var dists := PackedFloat32Array()
+		var order := PackedFloat32Array()
 		var models := PackedByteArray()
+		var lat_keep := lat_limit_d2 if (lat_limit_d2 == INF or lat_limit_d2 < 0.0) else pow(sqrt(lat_limit_d2) + CAP_SLACK, 2.0)
 		for uid in state.items:
 			var it: Item = state.items[uid]
 			var look: Array = known.get(it.item_id, [])
-			var mk := _model_key(it)
 			if not look.is_empty() and not bool(look[1]):
+				var mk := _model_key(it)
 				if it.key != mk:
 					_rekey(it, mk)
 				continue
-			var model := it.key >= 0
-			if model and it.key != mk:
-				_rekey(it, mk)
-			uids.append(uid)
-			models.append(1 if model else 0)
+			if it.parked:
+				continue
+			var was_3d := it.key >= 0
+			var d2: float
 			if cam_led:
 				# A model already keeps its look a little further outside the view too.
-				dists.append(ViewPriority.view_distance_sq(it.from, cam_pos, cam_planes, ViewPriority.MARGIN + (CAP_SLACK if model else 0.0)))
+				d2 = ViewPriority.view_distance_sq(it.from, cam_pos, cam_planes, ViewPriority.MARGIN + (CAP_SLACK if was_3d else 0.0))
 			else:
-				dists.append(c.distance_squared_to(Vector2(it.from.x, it.from.z)))
-		if uids.is_empty():
+				d2 = c.distance_squared_to(Vector2(it.from.x, it.from.z))
+			if lat_cap_coord and state.lat.has(it.lane):
+				var want_lat := d2 < INF and d2 <= (lat_keep if was_3d else lat_limit_d2)
+				var target_lat := _desired_3d_key(it, it.from, ItemCards.band_of(it.key) if was_3d else -1) if want_lat else ItemCards.icon_key(it.item_id)
+				if it.key != target_lat:
+					_rekey(it, target_lat)
+				continue
+			sim_eligible += 1
+			sel.append(it)
+			models.append(1 if was_3d else 0)
+			dists.append(d2)
+			if d2 < INF:
+				order.append(d2)
+		order.sort()
+		state.sim_cap_d2 = order
+		if sel.is_empty():
 			return
-		var want := ViewPriority.choose(dists, models, model_cap, CAP_SLACK)
-		for i in uids.size():
-			if want[i] != models[i]:
-				var it: Item = state.items[uids[i]]
-				_rekey(it, _model_key(it) if want[i] == 1 else ItemCards.icon_key(it.item_id))
+		var limit := INF
+		if sim_cap < order.size():
+			limit = order[maxi(sim_cap - 1, 0)] if sim_cap > 0 else -1.0
+		var keep := limit if (limit == INF or limit < 0.0) else pow(sqrt(limit) + CAP_SLACK, 2.0)
+		for i in sel.size():
+			var it: Item = sel[i]
+			var was_3d := models[i] == 1
+			var d2 := dists[i]
+			var want := d2 < INF and d2 <= (keep if was_3d else limit)
+			if want:
+				sim_3d += 1
+			var target := _desired_3d_key(it, it.from, ItemCards.band_of(it.key) if was_3d else -1) if want else ItemCards.icon_key(it.item_id)
+			if it.key != target:
+				_rekey(it, target)
 
 	## The kind an item is drawn as a model by: its item with the variant of its model (the main thread's look
 	## of it, known's 4th: how many) that who it is picks, as its turn is (its number along its run, else its
@@ -2822,7 +3147,8 @@ class Job:
 			it.code_at = writing
 		for item_id in state.kinds:
 			var kind: Kind = state.kinds[item_id]
-			var look: Array = known.get(item_id, [])
+			var lk := BeltLattice._look_key(int(item_id))
+			var look: Array = known.get(lk, [])
 			if full:
 				kind.known = false
 			if not kind.known and not look.is_empty():
@@ -2845,7 +3171,8 @@ class Job:
 				kind.base = base
 				kind.cap = cap
 			if not kind.known:
-				unknown.append(item_id)
+				if not unknown.has(lk):
+					unknown.append(lk)
 				continue
 			for i in kind.emptied:
 				if i < kind.cap:
@@ -2953,7 +3280,14 @@ class Job:
 		while not kind.slots.is_empty() and kind.slots.back() == null:
 			kind.slots.pop_back()
 		var n := kind.slots.size()
-		if kind.free.size() > 64 and kind.free.size() * 2 > n:
+		if n == 0:
+			kind.slots.clear()
+			kind.fresh.clear()
+			kind.free.clear()
+			kind.emptied.clear()
+			return
+		var fn := kind.free.size()
+		if fn > 16 and fn * 2 > n:
 			var packed := []
 			for e in kind.slots:
 				if e != null:
@@ -2994,10 +3328,23 @@ var old_bridge_seen := false
 
 var _cards := ItemCards.new()
 var _lat_cards := ItemCards.new()  # (--belt-draw-lattice) the lattice's kinds, records from f3d_belt_lattice
+var _mv := BeltMv.new()
+var _last_aabb := AABB(Vector3(-1.0e5, -16.0, -1.0e5), Vector3(2.0e5, 96.0, 2.0e5))
 var _lat_records: Texture2DArray = null
-var _lat_mask: ImageTexture = null
-## The lattice's mask image as its last job left it (tests: a texture made headless keeps its first image).
-var _lat_mask_img: Image = null
+var _lat_mask: Texture2DArray = null
+var _lat_mask_tiles: Array[Image] = []
+
+
+func lat_mask_has() -> bool:
+	return _lat_mask_tiles.size() == BeltLattice.MASK_TILES
+
+
+func lat_mask_pixel(cx: int, cz: int) -> bool:
+	if _lat_mask_tiles.size() != BeltLattice.MASK_TILES:
+		return false
+	var x := posmod(cx, BeltLattice.MASK)
+	var z := posmod(cz, BeltLattice.MASK)
+	return _lat_mask_tiles[(z >> 9) * 4 + (x >> 9)].get_pixel(x & 511, z & 511).r > 0.5
 
 
 ## Item kinds whose model or icon is still being read (full_detail.gd waits for them).
@@ -3043,6 +3390,14 @@ var _removed := {}
 var _built_tiles := {}
 var _job: Job = null
 var _task := -1
+var _worker_thread: Thread = null
+var _worker_sem := Semaphore.new()
+var _worker_done_sem := Semaphore.new()
+var _worker_mutex := Mutex.new()
+var _worker_pending: Job = null
+var _worker_done := false
+var _worker_stop := false
+var _worker_busy := false
 var _known := {}  # item id -> [lift, turns, pile step], kinds item_cards.gd has dressed
 var _dressing := {}  # item id -> true: kinds made, their looks still being read
 ## (A4) _known's changes counted; the copy the jobs read and the count it was made at; the far icons' chunks
@@ -3058,6 +3413,7 @@ var _far_ver := -3
 static var skip_same := true
 var _ho_last: Array = []  # what lanes.hand_over was last given
 var _lat_on_set := -1.0
+var _sent_view_rect := Vector4(-1.0e6, -1.0e6, 1.0e6, 1.0e6)
 var _rewrite := false
 ## Items are drawn on the game's clock (the messages' ticks, run on at its measured rate), one gap
 ## between updates and a margin for the jobs behind it.
@@ -3073,6 +3429,24 @@ var _hands: Array = []  # (--inserter-handoff) Job.hands not yet taken by the ar
 var watch_all := false
 var _epoch := -1
 var _height_known := false
+const LOD_COUNT_1_ENTER := 3500
+const LOD_COUNT_1_EXIT := 2800
+const LOD_COUNT_1_MAX_PX := 95.0
+var _lod_timer := 0.0
+var _lod_cam_pos := Vector3.ZERO
+var _lod_cam_proj := -1
+var _lod_cam_fov := -1.0
+var _lod_cam_size := -1.0
+var _lod_square := Vector3(0.0, 0.0, -1.0)
+var _lod_vp_h := -1.0
+var _lod_quality_seen := ""
+var _forced_lod_seen := -1
+var _lod_anchor_pos := Vector3(INF, INF, INF)
+var _lod_anchor_mode := false
+var _lod_count_tier := 0
+var _lod_active_count := -1
+var _lat_slots := 0
+var _has_applied := false
 ## --belt-items-sync: jobs run on the main thread at once (tests).
 var _sync := false
 var _held_job: Job = null
@@ -3104,6 +3478,31 @@ var stats := {"frames": 0, "main_usec": 0, "jobs": 0, "worker_usec": 0, "worst_j
 ## ticks msec; 0 while it hasn't (--stutter-probe's JOIN line).
 var load_done_msec := 0
 var _load_seen := false
+
+
+var _prof_detail := false
+var _prof_ema := {}
+
+
+func set_prof_detail(on: bool) -> void:
+	_prof_detail = on
+	if not on:
+		_prof_ema.clear()
+
+
+func prof_breakdown() -> String:
+	if not _prof_detail or _prof_ema.is_empty():
+		return ""
+	return "mv %.1f | apply %.1f | lods %.1f | start %.1f" % [
+		float(_prof_ema.get("mv", 0.0)),
+		float(_prof_ema.get("apply", 0.0)),
+		float(_prof_ema.get("lods", 0.0)),
+		float(_prof_ema.get("start", 0.0)),
+	]
+
+
+func _prof_ema_add(k: String, ms: float) -> void:
+	_prof_ema[k] = lerpf(float(_prof_ema.get(k, ms)), ms, 0.15)
 
 
 ## Main-thread time by part of _apply into world.prof (--stutter-probe shows them as w_bi_<key>; kept
@@ -3154,6 +3553,11 @@ static func read_flags(args: PackedStringArray) -> void:
 			Job.dead_walls = a.substr(22) == "on"
 		elif a.begins_with("--belt-sim-split-wake="):
 			Job.split_wake = a.substr(22) != "off"
+			Job.split_wake_r4 = a.substr(22) != "off" and a.substr(22) != "old"
+		elif a.begins_with("--belt-sim-split-hints="):
+			Job.split_hints = a.substr(23) != "off"
+		elif a.begins_with("--belt-sim-split-reconcile="):
+			Job.split_reconcile = a.substr(27) != "off"
 		elif a.begins_with("--belt-sim-ask-unknown="):
 			Job.ask_unknown = a.substr(23) != "off"
 		elif a.begins_with("--belt-sim-replace-at="):
@@ -3188,8 +3592,14 @@ static func read_flags(args: PackedStringArray) -> void:
 			Job.dump_parks = a.substr(23) != "off"
 		elif a.begins_with("--belt-job-high="):
 			job_high = a.substr(16) != "off"
+		elif a.begins_with("--belt-job="):
+			job_thread = a.substr(11) != "pool"
 		elif a.begins_with("--belt-draw-lattice-pile="):
 			BeltLattice.piles = a.substr(25) != "off"
+		elif a.begins_with("--lattice-model-cap="):
+			BeltLattice.model_cap_near = a.substr(20) != "off"
+		elif a.begins_with("--item-lod-split="):
+			ItemCards.lod_split = a.substr(17) != "off"
 		elif a.begins_with("--belt-draw-lattice-native="):
 			State.lattice_native = a.substr(27) != "off"
 		elif a.begins_with("--belt-draw-lattice="):
@@ -3229,6 +3639,10 @@ static func read_flags(args: PackedStringArray) -> void:
 		elif a.begins_with("--belt-draw-lattice-start="):
 			BeltLattice.start = a.substr(26) != "off"
 			BeltLattice.start_stops = a.substr(26) == "stops"
+		elif a.begins_with("--belt-mask-tiled="):
+			BeltLattice.mask_tiled = a.substr(18) != "off"
+		elif a.begins_with("--belt-native-decode="):
+			Job.native_decode = a.substr(21) != "off"
 		elif a.begins_with("--belt-capture-thread="):
 			capture_thread = a.substr(22) == "on"
 		elif a.begins_with("--belt-draw-later-tick="):
@@ -3237,6 +3651,8 @@ static func read_flags(args: PackedStringArray) -> void:
 			Job.park_lat = a.substr(25) == "on"
 		elif a.begins_with("--belt-sim-ask="):
 			Job.ask_view = a.substr(15) != "all"
+		elif a.begins_with("--belt-sim-lattice-no-bre="):
+			Job.lat_no_bre = a.substr(26) != "off"
 		elif a.begins_with("--belt-sim-ask-near="):
 			Job.ask_near = a.substr(20) != "off"
 		elif a.begins_with("--belt-draw-skip-same="):
@@ -3342,11 +3758,12 @@ func _take_live() -> void:
 
 
 static func flags_text() -> String:
-	return ("ahead auto (at least %d, lag +%.0f at most), " % [Job.ahead, lead_lag] if Job.ahead_auto else "ahead %d, " % Job.ahead) + "early stop %s, " % ("on" if Job.early_stop else "off") + "gone order %s, lead %s, head move %s, read apply %s, read conserve %s, read forward %s, shift keep %s, read skip same %s, take first %s, take line %s, take edge %s, rescue seen %s, ug guard %s, hold %s, dead walls %s, split wake %s, coalesce %s, view %s, margin %.0f, native draw %s, pile %s, lattice %s%s, lattice unison %s, lattice settle %s, early %s, job %s" % [
+	return ("ahead auto (at least %d, lag +%.0f at most), " % [Job.ahead, lead_lag] if Job.ahead_auto else "ahead %d, " % Job.ahead) + "early stop %s, " % ("on" if Job.early_stop else "off") + "gone order %s, lead %s, head move %s, read apply %s, read conserve %s, read forward %s, shift keep %s, read skip same %s, take first %s, take line %s, take edge %s, rescue seen %s, ug guard %s, hold %s, dead walls %s, split wake %s, split hints %s, split reconcile %s, coalesce %s, view %s, margin %.0f, native draw %s, pile %s, lattice %s%s, lattice unison %s, lattice settle %s, early %s, job %s" % [
 		"on" if Job.gone_order else "off", "on" if Job.lead_on else "off", "on" if State.head_move else "off",
 		"on" if Job.read_apply else "off", "on" if Job.read_conserve else "off", "on" if Job.read_forward else "off", "on" if Job.shift_keep else "off",
 		"on" if Job.read_skip_same else "off", "on" if Job.take_first else "off", "on" if Job.take_line else "off", "on" if Job.take_edge else "off", "on" if Job.rescue_seen else "off", "on" if Job.ug_guard else "off", "on" if Job.hold else "off",
-		"on" if Job.dead_walls else "off", "on" if Job.split_wake else "off", "on" if Job.coalesce else "off", "on" if Job.view_cull else "off", margin_max,
+		"on" if Job.dead_walls else "off", "on" if Job.split_wake else "off", "on" if Job.split_hints else "off",
+		"on" if Job.split_reconcile else "off", "on" if Job.coalesce else "off", "on" if Job.view_cull else "off", margin_max,
 		"on" if State.draw_native and ClassDB.class_exists(NATIVE_DRAW) else "off", "one" if Job.pile_one else "each",
 		(("world " + ("all" if BeltLattice.world_all else "straight")) if BeltLattice.world else "sim") if BeltLattice.on else "off",
 		(", lattice standing " + ("obs" if BeltLattice.standing_obs else "world") + ", lattice piles " + ("on" if BeltLattice.piles else "off")
@@ -3355,7 +3772,7 @@ static func flags_text() -> String:
 			+ ", lattice sim full " + ("on" if BeltLattice.sim_full else "off") + ", lattice tail " + ("on" if BeltLattice.tail else "off") + ", lattice start " + (("stops" if BeltLattice.start_stops else "on") if BeltLattice.start else "off") + ", lattice creep " + (("flow" if BeltLattice.creep_flow else "on") if BeltLattice.creep else ("step" if BeltLattice.creep_step else "off"))
 			+ ", lattice native " + ("on" if State.lattice_native and ClassDB.class_exists(NATIVE_LATTICE) else "off")) if BeltLattice.on else "",
 		"on" if BeltLattice.unison else "off", "on" if BeltLattice.settle else "off", "on" if Job.early else "off",
-		"high" if job_high else "low"] + ", later %s, park lattice %s, ask %s%s, skip same %s, pages %s, replace at %s, removed now %s" % [
+		"thread" if job_thread else ("pool/high" if job_high else "pool/low")] + ", later %s, park lattice %s, ask %s%s, skip same %s, pages %s, replace at %s, removed now %s" % [
 		"tick" if Job.later_tick else "list", "on" if Job.park_lat else "off", "view" if Job.ask_view else "all",
 		" near" if Job.ask_near else "", "on" if skip_same else "off", "64 KB" if BeltRecords.small else "256 KB",
 		"on" if Job.replace_at else "off", "on" if removed_now else "off"] 		+ ", " + InserterArms.flags_text() + (" (slack %d, margin %.1f jobs)" % [Job.handoff_slack,
@@ -3368,26 +3785,32 @@ func _ready() -> void:
 	_cards.contact = true  # a soft rim on the belt under each item (item_contact.gdshader)
 	_cards.casts_shadow = false
 	_cards.render_layers = ItemCards.BELT_LAYER
+	_cards.allow_lod = true
+	_cards.split_bands = true
+	_cards.use_shadow_proxy = true
 	add_child(_cards)
 	_lat_cards.name = "LatticeCards"
 	_lat_cards.contact = true
 	_lat_cards.casts_shadow = false
 	_lat_cards.render_layers = ItemCards.BELT_LAYER
 	_lat_cards.record_tex = 1
+	_lat_cards.allow_lod = true
+	_lat_cards.split_bands = true
+	_lat_cards.use_shadow_proxy = true
 	add_child(_lat_cards)
 	_drop_cards.name = "DropCards"
 	_drop_cards.contact = true
 	_drop_cards.casts_shadow = false
 	_drop_cards.render_layers = ItemCards.BELT_LAYER
 	add_child(_drop_cards)
-	_bench = "--item-bench" in OS.get_cmdline_user_args()
+	_bench = Switches.has("--item-bench")
 	# A movie's frame stands for 1/60 s while workers take real time: jobs would land late on its clock.
-	_sync = _sync or "--belt-items-sync" in OS.get_cmdline_user_args() or Engine.get_write_movie_path() != ""
-	Job.debug = "--belt-sim-debug" in OS.get_cmdline_user_args()
-	read_flags(OS.get_cmdline_user_args())
+	_sync = _sync or Switches.has("--belt-items-sync") or Engine.get_write_movie_path() != ""
+	Job.debug = Switches.has("--belt-sim-debug")
+	read_flags(Switches.args())
 	if State.force_gd and not (_state.sim is BeltSim) or _state.records.rows != BeltRecords.new().rows:
 		_state = State.new()  # (--belt-sim-native=off, --belt-draw-small-pages: the first was made before the flags were read)
-	for a in OS.get_cmdline_user_args():
+	for a in Switches.args():
 		if a.begins_with("--belt-capture="):
 			_capture = FileAccess.open(a.substr(15), FileAccess.WRITE)
 		elif a.begins_with("--belt-draw-dump="):
@@ -3399,7 +3822,53 @@ func _ready() -> void:
 
 func _exit_tree() -> void:
 	_wait(false)
+	_worker_close()
 	_capture_close()
+
+
+func _job_active() -> bool:
+	return _task >= 0 or _worker_busy
+
+
+func _job_completed() -> bool:
+	if _task >= 0:
+		return WorkerThreadPool.is_task_completed(_task)
+	if _worker_busy:
+		_worker_mutex.lock()
+		var d := _worker_done
+		_worker_mutex.unlock()
+		return d
+	return false
+
+
+func _worker_run() -> void:
+	while true:
+		_worker_sem.wait()
+		_worker_mutex.lock()
+		var stop := _worker_stop
+		var j := _worker_pending
+		_worker_pending = null
+		_worker_mutex.unlock()
+		if stop:
+			break
+		if j != null:
+			j.run()
+			_worker_mutex.lock()
+			_worker_done = true
+			_worker_mutex.unlock()
+			_worker_done_sem.post()
+
+
+func _worker_close() -> void:
+	if _worker_thread == null:
+		return
+	_worker_mutex.lock()
+	_worker_stop = true
+	_worker_mutex.unlock()
+	_worker_sem.post()
+	_worker_thread.wait_to_finish()
+	_worker_thread = null
+	_worker_stop = false
 
 
 ## Queues a message for the capture file (written on _capture_thread), or writes it now.
@@ -3461,8 +3930,12 @@ func reset() -> void:
 	_cards.reset()
 	_lat_cards.reset()
 	_drop_cards.reset()
+	_mv.reset()
+	_last_aabb = AABB(Vector3(-1.0e5, -16.0, -1.0e5), Vector3(2.0e5, 96.0, 2.0e5))
 	_drops.clear()
 	_lat_records = null
+	_lat_mask = null
+	_lat_mask_tiles.clear()
 	RenderingServer.global_shader_parameter_set("f3d_belt_lattice_on", 0.0)
 	_lat_on_set = 0.0
 	_known.clear()
@@ -3477,12 +3950,23 @@ func reset() -> void:
 	_positions.clear()
 	_count = 0
 	_square = Vector3(0.0, 0.0, -1.0)
+	_lod_timer = 0.0
+	_lod_cam_pos = Vector3.ZERO
+	_lod_square = Vector3(0.0, 0.0, -1.0)
+	_lod_quality_seen = ""
+	_forced_lod_seen = ItemCards.forced_lod_tier
+	_lod_count_tier = 0
+	_lod_active_count = -1
+	_lat_slots = 0
+	_has_applied = false
 	_clock = GameClock.new()
 	_clock.ease = 0.5
 	_drawn = -1.0
 	_records = null
 	_record_pages = 0
 	_clock_base = -1.0
+	if lanes != null and is_instance_valid(lanes) and lanes.has_method("set_near_3d_exhausted"):
+		lanes.set_near_3d_exhausted(false)
 
 
 ## (drop_show_now) Zenith's Z with `item_id` held, over (x, y) (tiles; player_input.gd): shown at once where it lands
@@ -3629,6 +4113,14 @@ func _wait(apply := true) -> void:
 		if apply:
 			_apply(_held_job)
 		_held_job = null
+	if _worker_busy:
+		_worker_done_sem.wait()
+		_worker_busy = false
+		_worker_done = false
+		if apply and _job != null:
+			_apply(_job)
+		_job = null
+		return
 	if _task < 0:
 		return
 	WorkerThreadPool.wait_for_task_completion(_task)
@@ -3638,17 +4130,127 @@ func _wait(apply := true) -> void:
 	_job = null
 
 
-## Item models cast shadows only with the camera nearer than shadows_within to the items' square.
+func _lod_use_char() -> bool:
+	return ViewPriority.char_lod_anchor and not view_led and world != null
+
+
+func _char_anchor() -> Vector3:
+	var f: Vector2 = world.focus()
+	return Vector3(f.x, _state.height, f.y)
+
+
+## Item models cast shadows only nearer than shadows_within to the belt square's bounds (character
+## in normal play, camera in detached views); individual shadow proxies cull in item_shadow.gdshader.
 func _update_shadows() -> void:
-	var cam := get_viewport().get_camera_3d()
-	if cam != null and _square.z >= 0.0:
-		_cards.casts_shadow = cam.global_position.distance_to(Vector3(_square.x, 0.0, _square.y)) < shadows_within
+	var vp: Viewport = get_viewport() if is_inside_tree() else null
+	var cam: Camera3D = vp.get_camera_3d() if vp != null else null
+	var use_char := _lod_use_char()
+	if _square.z >= 0.0 and (use_char or cam != null):
+		var ref := _char_anchor() if use_char else cam.global_position
+		var half := _square.z + INDEX_MARGIN
+		var flat := AABB(Vector3(_square.x - half, _state.height - 1.0, _square.y - half), Vector3(2.0 * half, 3.0, 2.0 * half))
+		var tight: AABB = GroundHeight.grow(flat) if ViewPriority.tight_cull else flat
+		var min_d := ref.distance_to(ref.clamp(tight.position, tight.end))
+		_cards.casts_shadow = min_d < shadows_within + 1.5
 		_lat_cards.casts_shadow = _cards.casts_shadow
+		_cards.update_shadow_cam(ref, shadows_within)
+		_lat_cards.update_shadow_cam(ref, shadows_within)
+
+
+func _active_item_count() -> int:
+	var lat_count := _lat_slots if _has_applied else _lat_cards.visible_item_count()
+	return maxi(_count, _cards.visible_item_count() + lat_count)
+
+
+## Applies live debug-menu changes to item rendering / LOD settings.
+func apply_debug_item_settings(rebuild_kinds := false) -> void:
+	if rebuild_kinds:
+		_cards.reset()
+		_lat_cards.reset()
+	_lod_timer = 999.0
+	_update_shadows()
+	_update_item_lods()
+	if _square.z < 0.0 and ItemCards.lod_mode != "distance" and ItemCards.forced_lod_tier >= 0:
+		var ft := clampi(ItemCards.forced_lod_tier, 0, 2)
+		_cards.set_lod_tier(ft)
+		_lat_cards.set_lod_tier(ft)
+
+
+## Updates per-instance distance-banded LODs ("distance", default) or legacy screen-size global LODs ("global").
+func _update_item_lods() -> void:
+	_lod_timer = 0.0
+	var vp: Viewport = get_viewport() if is_inside_tree() else null
+	var cam: Camera3D = vp.get_camera_3d() if vp != null else null
+	var use_char := _lod_use_char()
+	if (not use_char and cam == null) or _square.z < 0.0:
+		return
+	var vp_h := vp.get_visible_rect().size.y if vp != null else 1080.0
+	var anchor := _char_anchor() if use_char else cam.global_position
+	_lod_square = _square
+	_lod_anchor_pos = anchor
+	_lod_anchor_mode = use_char
+	_lod_quality_seen = ItemCards.lod_quality
+	_forced_lod_seen = ItemCards.forced_lod_tier
+	if cam != null:
+		_lod_cam_pos = cam.global_position
+		_lod_cam_proj = int(cam.projection)
+		_lod_cam_fov = cam.fov
+		_lod_cam_size = cam.size
+	_lod_vp_h = vp_h
+	if ItemCards.lod_mode == "distance":
+		var half := _square.z + INDEX_MARGIN
+		var flat := AABB(Vector3(_square.x - half, _state.height - 1.0, _square.y - half), Vector3(2.0 * half, 3.0, 2.0 * half))
+		var tight: AABB = GroundHeight.grow(flat) if ViewPriority.tight_cull else flat
+		_cards.update_distance_lod(cam, vp_h, tight, anchor, use_char)
+		_lat_cards.update_distance_lod(cam, vp_h, tight, anchor, use_char)
+		_lat_cards.set_lattice_variants_active(ItemCards.lattice_variants_mode != "off")
+		return
+	var ref_pos := Vector3(_square.x, 0.0, _square.y)
+	if ItemCards.forced_lod_tier >= 0:
+		var ft := clampi(ItemCards.forced_lod_tier, 0, 2)
+		_cards.set_lod_tier(ft)
+		_lat_cards.set_lod_tier(ft)
+	else:
+		var px := ItemCards.tile_pixels(cam, ref_pos, vp_h) if cam != null else 999.0
+		var tier := _cards.lod_tier
+		if px < ItemCards.LOD2_BELOW_PX:
+			tier = 2
+		elif px < ItemCards.LOD1_BELOW_PX:
+			if tier == 2 and px > ItemCards.LOD1_ABOVE_PX:
+				tier = 1
+			elif tier == 0:
+				tier = 1
+		elif px <= ItemCards.LOD0_ABOVE_PX:
+			if tier == 2:
+				tier = 1
+		else:
+			tier = 0
+		var active_count := _active_item_count()
+		_lod_active_count = active_count
+		if active_count > LOD_COUNT_1_ENTER or (_lod_count_tier >= 1 and active_count > LOD_COUNT_1_EXIT):
+			_lod_count_tier = 1
+		else:
+			_lod_count_tier = 0
+		if _lod_count_tier >= 1 and px <= LOD_COUNT_1_MAX_PX:
+			tier = maxi(tier, 1)
+		_cards.set_lod_tier(tier)
+		_lat_cards.set_lod_tier(tier)
+	var cam_dist := anchor.distance_to(ref_pos)
+	var want_lat_var := true
+	if ItemCards.lattice_variants_mode == "off":
+		want_lat_var = false
+	elif ItemCards.lattice_variants_mode == "close":
+		if _lat_cards.lod_tier >= 1:
+			want_lat_var = false
+		elif _lat_cards.lattice_variants_active:
+			want_lat_var = cam_dist <= ItemCards.LATTICE_VARIANTS_CLOSE + ItemCards.LATTICE_VARIANTS_HYST
+		else:
+			want_lat_var = cam_dist <= ItemCards.LATTICE_VARIANTS_CLOSE
+	_lat_cards.set_lattice_variants_active(want_lat_var)
 
 
 func _process(delta: float) -> void:
 	var start := Time.get_ticks_usec()
-	_update_shadows()
 	_clock.advance(delta)
 	var step := 0.0 if MomentHold.on else delta * _clock.rate  # a screenshot's moment: items stand still
 	if not _sync:
@@ -3667,18 +4269,29 @@ func _process(delta: float) -> void:
 			drawn = least
 			_margin = _clock.tick - _clock.gap - drawn
 		_drawn = drawn
+	var prof_on := _prof_detail
+	var apply_usec := 0
 	if not _drops.is_empty():
+		var t_p := Time.get_ticks_usec() if prof_on else 0
 		_drops_due()  # (with this frame's drawn tick, the one the records show at)
+		if prof_on:
+			apply_usec += Time.get_ticks_usec() - t_p
 	_cards.begin()
 	_lat_cards.begin()
+	var t_apply := Time.get_ticks_usec() if prof_on else 0
 	if _epoch != _cards.epoch:
 		_epoch = _cards.epoch
 		_wait()
 		_known.clear()
 		_known_ver += 1
 		_dressing.clear()
+		_lod_square = Vector3(0.0, 0.0, -1.0)
+		_lod_quality_seen = ""
+		_lod_count_tier = 0
+		_lod_active_count = -1
+		_mv.invalidate_all()
 		_rewrite = true
-	if _task >= 0 and WorkerThreadPool.is_task_completed(_task):
+	if _job_active() and _job_completed():
 		var now := Time.get_ticks_usec()
 		if _job.done_usec == 0:
 			_job.done_usec = now
@@ -3688,15 +4301,65 @@ func _process(delta: float) -> void:
 		var held := _held_job
 		_held_job = null
 		_apply(held)
-	if _task < 0 and not _height_known:
+	if prof_on:
+		apply_usec += Time.get_ticks_usec() - t_apply
+		_prof_ema_add("apply", float(apply_usec) / 1000.0)
+	if not _job_active() and not _height_known:
 		_find_height()
 	if not _dressing.is_empty():
 		_dressed()
 	# A job when messages wait, a look was made, or the clock moved on (the simulation steps along).
-	if _task < 0 and _held_job == null and (not _inbox.is_empty() or _rewrite or (_state.data_tick >= 0 and _drawn >= 0.0)):
+	var t_start := Time.get_ticks_usec() if prof_on else 0
+	if not _job_active() and _held_job == null and (not _inbox.is_empty() or _rewrite or (_state.data_tick >= 0 and _drawn >= 0.0)):
 		_start(delta)
+	if prof_on:
+		_prof_ema_add("start", float(Time.get_ticks_usec() - t_start) / 1000.0)
+	var vp: Viewport = get_viewport() if is_inside_tree() else null
+	var cam: Camera3D = vp.get_camera_3d() if vp != null else null
+	var t_lods := Time.get_ticks_usec() if prof_on else 0
+	_update_shadows()
+	_lod_timer += delta
+	if _square.z >= 0.0:
+		if _lod_use_char():
+			if _square != _lod_square or _lod_timer >= 0.2 \
+					or ItemCards.lod_quality != _lod_quality_seen \
+					or ItemCards.forced_lod_tier != _forced_lod_seen \
+					or not _lod_anchor_mode \
+					or _char_anchor().distance_squared_to(_lod_anchor_pos) > 0.25:
+				_update_item_lods()
+		elif cam != null:
+			var vp_h := vp.get_visible_rect().size.y
+			if _square != _lod_square or _lod_timer >= 0.15 \
+					or ItemCards.lod_quality != _lod_quality_seen \
+					or ItemCards.forced_lod_tier != _forced_lod_seen \
+					or _lod_anchor_mode \
+					or cam.global_position.distance_squared_to(_lod_cam_pos) > 0.25 \
+					or int(cam.projection) != _lod_cam_proj or not is_equal_approx(cam.fov, _lod_cam_fov) \
+					or not is_equal_approx(cam.size, _lod_cam_size) or not is_equal_approx(vp_h, _lod_vp_h):
+				_update_item_lods()
+	if prof_on:
+		_prof_ema_add("lods", float(Time.get_ticks_usec() - t_lods) / 1000.0)
 	if _clock_base >= 0.0:
 		RenderingServer.global_shader_parameter_set("f3d_belt_clock", _drawn - _clock_base)
+	var vrect := Vector4(-1.0e6, -1.0e6, 1.0e6, 1.0e6)
+	if _can_tight_cull() and cam != null:
+		var far_v := VIEW_GROUND_FAR if view_ground else VIEW_FAR
+		var vr: Rect2 = ViewPriority.ground_view_rect(cam, far_v, 4.0, -4.0, 16.0)
+		if vr.size.x > 0.0:
+			vrect = Vector4(vr.position.x, vr.position.y, vr.end.x, vr.end.y)
+	if not vrect.is_equal_approx(_sent_view_rect):
+		_sent_view_rect = vrect
+		RenderingServer.global_shader_parameter_set("f3d_item_view_rect", vrect)
+	var mv_on := _clock_base >= 0.0 and Settings.temporal_aa_active(vp)
+	_cards.mv_mode = mv_on
+	_lat_cards.mv_mode = mv_on
+	_cards.mv_max_band = BeltMv.max_band
+	_lat_cards.mv_max_band = BeltMv.max_band
+	var t_mv := Time.get_ticks_usec() if prof_on else 0
+	if _clock_base >= 0.0 or _mv._was_active:
+		_mv.step(_drawn - _clock_base, _sent_view_rect, _cards, _lat_cards, _last_aabb, mv_on)
+	if prof_on:
+		_prof_ema_add("mv", float(Time.get_ticks_usec() - t_mv) / 1000.0)
 	var spent := Time.get_ticks_usec() - start
 	stats["frames"] += 1
 	stats["main_usec"] += spent
@@ -3768,10 +4431,27 @@ func _dressed() -> void:
 			_rewrite = true
 
 
+func _can_tight_cull() -> bool:
+	if not ViewPriority.tight_cull or ModelLods.full_detail:
+		return false
+	var vp := get_viewport() if is_inside_tree() else null
+	if vp != null and vp.use_xr:
+		return false
+	if world != null:
+		if world.remote_view or world.hold:
+			return false
+		if world.has_method("has_cover") and world.has_cover():
+			return false
+		if world.behind_cull != null and world.behind_cull.other_view_open():
+			return false
+	return true
+
+
 func _start(delta: float) -> void:
 	_take_live()
 	var job := Job.new()
 	job.state = _state
+	job.tight_cull = _can_tight_cull()
 	# (removed_now) Belts taken away since the last job, but those with a belt built on their tile since.
 	if not _removed.is_empty():
 		var gone := PackedInt64Array()
@@ -3823,6 +4503,36 @@ func _start(delta: float) -> void:
 	if vr.size.x > 0.0:
 		job.view = vr
 		job.view_all = false
+	var want_split := ItemCards.use_models and ItemCards.ItemModels.item_geom_lod and ItemCards.lod_mode == "distance" \
+		and ItemCards.lod_split and _cards.split_bands and _lat_cards.split_bands
+	job.lod_split = want_split
+	if want_split:
+		var use_char := _lod_use_char()
+		var vcam := get_viewport().get_camera_3d() if is_inside_tree() else null
+		if use_char:
+			job.lod_anchor = _char_anchor()
+		elif vcam != null:
+			job.lod_anchor = vcam.global_position
+		elif _lod_square.z >= 0.0 and _lod_anchor_pos != Vector3.INF:
+			job.lod_anchor = _lod_anchor_pos
+		elif _state.square.z >= 0.0:
+			job.lod_anchor = Vector3(_state.square.x, _state.height, _state.square.y)
+		else:
+			job.lod_split = false
+		if job.lod_split:
+			if _lod_square.z >= 0.0:
+				job.lod_d1 = _cards._lod_d1
+				job.lod_d2 = _cards._lod_d2
+			elif use_char or vcam == null:
+				var th := ItemCards.zoom_character_thresholds(vcam, get_viewport().get_visible_rect().size.y, job.lod_anchor) if use_char and vcam != null else ItemCards.character_thresholds()
+				job.lod_d1 = th.x
+				job.lod_d2 = th.y
+			else:
+				var th := ItemCards.distance_thresholds(vcam, get_viewport().get_visible_rect().size.y)
+				job.lod_d1 = th.x
+				job.lod_d2 = th.y
+			job.lod_jit = ItemCards._lod_jitters(job.lod_d1, job.lod_d2)
+			ItemCards._set_global_lod_cam(job.lod_anchor)
 	# Where the drawn clock will be when this job's result is drawn.
 	job.fold_tick = _drawn + (0.0 if _sync else maxf(delta * _clock.rate, _job_ticks))
 	job.lead = clampf(job.fold_tick - _drawn + 1.0, 2.0, lead_max)
@@ -3834,6 +4544,17 @@ func _start(delta: float) -> void:
 		job.run()
 		_job = null
 		_apply(job)
+	elif job_thread:
+		if _worker_thread == null:
+			_worker_stop = false
+			_worker_thread = Thread.new()
+			_worker_thread.start(_worker_run)
+		_worker_busy = true
+		_worker_mutex.lock()
+		_worker_pending = job
+		_worker_done = false
+		_worker_mutex.unlock()
+		_worker_sem.post()
 	else:
 		_task = WorkerThreadPool.add_task(job.run, job_high, "belt items")
 
@@ -3842,25 +4563,30 @@ func _start(delta: float) -> void:
 ## height, each cut VIEW_FAR tiles out when it reaches no further (or looks up); with view_ground,
 ## VIEW_GROUND_FAR, and the rectangle cut to the simulated square. Empty with no camera.
 func _view_rect() -> Rect2:
-	var cam := get_viewport().get_camera_3d()
+	var vp_node := get_viewport()
+	var cam := vp_node.get_camera_3d() if vp_node != null else null
 	if cam == null:
 		return Rect2()
-	var vp := get_viewport().get_visible_rect().size
-	var y := _state.height
 	var o := cam.global_position
 	var far := VIEW_GROUND_FAR if view_ground else VIEW_FAR
-	var r := Rect2(Vector2(o.x, o.z), Vector2.ZERO)
-	for c in [Vector2.ZERO, Vector2(vp.x, 0.0), Vector2(0.0, vp.y), vp]:
-		var ro := cam.project_ray_origin(c)
-		var n := cam.project_ray_normal(c)
-		var hit: Vector3
-		if n.y < -1e-4 and (y - ro.y) / n.y <= far:
-			hit = ro + n * ((y - ro.y) / n.y)
-		else:
-			var h := Vector2(n.x, n.z)
-			h = h.normalized() if h.length() > 1e-6 else Vector2(1.0, 0.0)
-			hit = Vector3(ro.x + h.x * far, y, ro.z + h.y * far)
-		r = r.expand(Vector2(hit.x, hit.z))
+	var r: Rect2
+	if _can_tight_cull():
+		r = ViewPriority.ground_view_rect(cam, far, 2.0, -4.0, 16.0)
+	else:
+		var vp := get_viewport().get_visible_rect().size
+		var y := _state.height
+		r = Rect2(Vector2(o.x, o.z), Vector2.ZERO)
+		for c in [Vector2.ZERO, Vector2(vp.x, 0.0), Vector2(0.0, vp.y), vp]:
+			var ro := cam.project_ray_origin(c)
+			var n := cam.project_ray_normal(c)
+			var hit: Vector3
+			if n.y < -1e-4 and (y - ro.y) / n.y <= far:
+				hit = ro + n * ((y - ro.y) / n.y)
+			else:
+				var h := Vector2(n.x, n.z)
+				h = h.normalized() if h.length() > 1e-6 else Vector2(1.0, 0.0)
+				hit = Vector3(ro.x + h.x * far, y, ro.z + h.y * far)
+			r = r.expand(Vector2(hit.x, hit.z))
 	if view_lead:
 		# (view_lead) The camera's ground speed, smoothed over the jobs; the view joined with itself that far on.
 		var now := Time.get_ticks_usec()
@@ -3903,11 +4629,18 @@ func _apply(job: Job) -> void:
 		Job.dump_apply.flush()
 	_prof("upload", t_apply)
 	var sq := job.square
-	var aabb := AABB(Vector3(sq.x - sq.z - INDEX_MARGIN, -16.0, sq.y - sq.z - INDEX_MARGIN), Vector3(2.0 * (sq.z + INDEX_MARGIN), 96.0, 2.0 * (sq.z + INDEX_MARGIN))) \
-		if sq.z >= 0.0 else AABB(Vector3(-1.0e5, -16.0, -1.0e5), Vector3(2.0e5, 96.0, 2.0e5))
+	var aabb: AABB
+	if sq.z >= 0.0:
+		var flat_box := AABB(Vector3(sq.x - sq.z - INDEX_MARGIN, (_state.height - 1.0) if ViewPriority.tight_cull else -16.0, sq.y - sq.z - INDEX_MARGIN),
+			Vector3(2.0 * (sq.z + INDEX_MARGIN), 4.0 if ViewPriority.tight_cull else 96.0, 2.0 * (sq.z + INDEX_MARGIN)))
+		aabb = GroundHeight.grow(flat_box) if ViewPriority.tight_cull else flat_box
+	else:
+		aabb = AABB(Vector3(-1.0e5, -16.0, -1.0e5), Vector3(2.0e5, 96.0, 2.0e5))
+	_last_aabb = aabb
 	var t1 := Time.get_ticks_usec()
 	for w: Array in job.written:
 		_cards.put_records(int(w[0]), int(w[1]), int(w[2]), int(w[3]), aabb)
+		_mv.set_rec_kind(int(w[0]), int(w[1]), int(w[2]), int(w[3]))
 	if sq != _square:
 		_cards.set_bounds(aabb)
 		_lat_cards.set_bounds(aabb)
@@ -3938,6 +4671,8 @@ func _apply(job: Job) -> void:
 		if not skip_same or ho != _ho_last:
 			_ho_last = ho
 			lanes.hand_over(job.square, job.held_chunks, ho[2])
+		if lanes.has_method("set_near_3d_exhausted"):
+			lanes.set_near_3d_exhausted(job.cap_exhausted)
 	_prof("handover", t1)
 	_positions = job.positions
 	if not (job.drops.is_empty() and job.drop_puts.is_empty()):
@@ -3955,6 +4690,7 @@ func _apply(job: Job) -> void:
 			_cards.set_paths(_paths)
 		else:
 			_paths.update(job.paths)
+		_mv.update_paths(job.paths)
 	_prof("paths", t1)
 	if not job.resend.is_empty():
 		stats["asked"] += job.resend.size()
@@ -4003,6 +4739,10 @@ func _apply(job: Job) -> void:
 	stats["lat_lanes"] = job.lat_lanes_n
 	stats["lat_slots"] = _state.lattice.slots_n
 	stats["items"] = job.count
+	_lat_slots = _state.lattice.slots_n
+	_has_applied = true
+	if _active_item_count() != _lod_active_count:
+		_lod_timer = 0.1
 	_bench_worker_usec += job.usec
 	_bench_jobs += 1
 	if not _sync:
@@ -4026,25 +4766,38 @@ func _apply_lattice(job: Job, aabb: AABB) -> void:
 		else:
 			for e: Array in list:
 				_lat_records.update_layer(e[1], int(e[0]))
+		_mv.update_lat_pages(job.lat_pages)
 	for w: Array in job.lat_written:
 		_lat_cards.put_records(int(w[0]), int(w[1]), int(w[2]), int(w[3]), aabb)
-	if job.lat_mask != null:
-		_lat_mask_img = job.lat_mask
-		if _lat_mask == null:
-			_lat_mask = ImageTexture.create_from_image(job.lat_mask)
+		_mv.set_lat_kind(int(w[0]), int(w[1]), int(w[2]), int(w[3]))
+	var mtiles: Array = job.lat_mask_tiles
+	if not mtiles.is_empty():
+		if _lat_mask_tiles.size() != BeltLattice.MASK_TILES:
+			_lat_mask_tiles.resize(BeltLattice.MASK_TILES)
+		for e: Array in mtiles:
+			_lat_mask_tiles[int(e[0])] = e[1]
+		if job.lat_mask_all or _lat_mask == null:
+			_lat_mask = Texture2DArray.new()
+			_lat_mask.create_from_images(_lat_mask_tiles)
 			RenderingServer.global_shader_parameter_set("f3d_belt_mask", _lat_mask)
 		else:
-			_lat_mask.update(job.lat_mask)
+			for e: Array in mtiles:
+				_lat_mask.update_layer(e[1], int(e[0]))
+		stats["mask_tiles"] = int(stats.get("mask_tiles", 0)) + mtiles.size()
 	var on := 1.0 if job.lat_lanes > 0 and _lat_mask != null else 0.0
+	if not mtiles.is_empty():
+		_mv.update_mask(mtiles, on > 0.5)
 	if not skip_same or on != _lat_on_set:
 		_lat_on_set = on
 		RenderingServer.global_shader_parameter_set("f3d_belt_lattice_on", on)
+		_mv.set_mask_on(on > 0.5)
 
 
 func _upload(p: Dictionary) -> void:
 	var list: Array = p.get("pages", [])
 	if list.is_empty():
 		return
+	_mv.update_rec_pages(p)
 	var t0 := Time.get_ticks_usec()
 	if bool(p.get("all", false)) or _records == null:
 		var images: Array[Image] = []
@@ -4084,7 +4837,7 @@ func position_of(uid: int) -> Variant:
 ## per slot [where (with its lift), cosine of its turn], or null where nothing is drawn (tests).
 func drawn(key: int) -> Array:
 	var out: Array = []
-	if _task >= 0:
+	if _job_active():
 		return out
 	if _state.draw != null:
 		return _state.draw.drawn(key, _drawn - _clock_base)
@@ -4136,7 +4889,7 @@ func drawn(key: int) -> Array:
 ## drawn (tests).
 func drawn_lattice(key: int) -> Array:
 	var out: Array = []
-	if _task >= 0:
+	if _job_active():
 		return out
 	var lat: RefCounted = _state.lattice
 	if not (lat is BeltLattice):

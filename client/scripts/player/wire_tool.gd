@@ -12,6 +12,7 @@ extends Node3D
 const WorldMirror := preload("res://scripts/world/world.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## Tool name (player_input.gd's cursor_tool) -> the wire kind on the wire ("r", "g", "w").
 const KINDS := {"red-wire": "r", "green-wire": "g", "copper-wire": "w"}
@@ -31,13 +32,21 @@ var _mesh := ImmediateMesh.new()
 var _mi := MeshInstance3D.new()
 ## The vertex colour, riding on an add-on's hills (ground_height.gd) as the poles and their wires do.
 var _material := GroundHeight.mark_material(Color.WHITE)
+## The ground reach ring draws at GroundHeight.AREA_PRIORITY (under models), separate from the aerial wire.
+var _ring_mesh := ImmediateMesh.new()
+var _ring_mi := MeshInstance3D.new()
+var _ring_material := GroundHeight.mark_material(Color.WHITE, true, GroundHeight.AREA_PRIORITY)
 
 
-func _ready() -> void:
+func _init() -> void:
 	_mi.mesh = _mesh
 	_mi.material_override = _material
 	_mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_mi)
+	_ring_mi.mesh = _ring_mesh
+	_ring_mi.material_override = _ring_material
+	_ring_mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(_ring_mi)
 
 
 static func is_wire(tool: String) -> bool:
@@ -50,6 +59,7 @@ func cancel() -> bool:
 	var had := not from.is_empty()
 	from = {}
 	_mesh.clear_surfaces()
+	_ring_mesh.clear_surfaces()
 	return had
 
 
@@ -124,7 +134,7 @@ func _sides_differ(rec: WorldMirror.Rec, first: Dictionary, at: Vector2) -> bool
 	var proto: ProtoDB.EntityProto = world.protos.entity(rec.proto_id)
 	if proto == null or not proto.type in ["arithmetic-combinator", "decider-combinator", "selector-combinator"]:
 		return false
-	var yaw := float(rec.dir) / 16.0 * TAU
+	var yaw := -Wire.direction_yaw(rec.dir)
 	var forward := Vector2(sin(yaw), -cos(yaw))
 	var a := (Vector2(int(first["mx"]), int(first["my"])) / 256.0 - rec.pos).dot(forward)
 	var b := (at - rec.pos).dot(forward)
@@ -145,6 +155,7 @@ func clear_cables(rec: WorldMirror.Rec) -> bool:
 ## Draws the hanging wire to the mouse (or the hovered entity's connection) and the reach ring.
 func update(tool: String, hovered: WorldMirror.Rec, at: Vector2, has_ground: bool) -> void:
 	_mesh.clear_surfaces()
+	_ring_mesh.clear_surfaces()
 	var kind: String = KINDS.get(tool, "")
 	if kind == "" or from.is_empty() or not has_ground:
 		return
@@ -160,9 +171,12 @@ func update(tool: String, hovered: WorldMirror.Rec, at: Vector2, has_ground: boo
 	var color: Color = COLORS[kind] if limit <= 0.0 or dist <= limit + 0.01 else TOO_FAR
 	_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
 	_span(start, end, color)
-	if limit > 0.0:
-		_ring(Vector3(a.pos.x, 0.06, a.pos.y), limit, Color(color.r, color.g, color.b, 0.55))
 	_mesh.surface_end()
+	if limit > 0.0:
+		var ring_y := 0.05 if GroundHeight.is_on() else 0.02
+		_ring_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+		_ring(Vector3(a.pos.x, ring_y, a.pos.y), limit, Color(color.r, color.g, color.b, 0.55))
+		_ring_mesh.surface_end()
 
 
 ## The wire as a sagging ribbon, crossed so it shows from any side.
@@ -193,10 +207,14 @@ func _ring(c: Vector3, r: float, color: Color) -> void:
 		var a1 := TAU * (i + 1) / RING_SEGMENTS
 		var d0 := Vector3(cos(a0), 0, sin(a0))
 		var d1 := Vector3(cos(a1), 0, sin(a1))
-		_quad(c + d0 * (r - w), c + d0 * (r + w), c + d1 * (r + w), c + d1 * (r - w), color)
+		_quad_on(_ring_mesh, c + d0 * (r - w), c + d0 * (r + w), c + d1 * (r + w), c + d1 * (r - w), color)
 
 
 func _quad(a: Vector3, b: Vector3, c: Vector3, d: Vector3, color: Color) -> void:
+	_quad_on(_mesh, a, b, c, d, color)
+
+
+static func _quad_on(target: ImmediateMesh, a: Vector3, b: Vector3, c: Vector3, d: Vector3, color: Color) -> void:
 	for p in [a, b, c, a, c, d]:
-		_mesh.surface_set_color(color)
-		_mesh.surface_add_vertex(p)
+		target.surface_set_color(color)
+		target.surface_add_vertex(p)

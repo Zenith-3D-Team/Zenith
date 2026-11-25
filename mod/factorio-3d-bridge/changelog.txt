@@ -1,4 +1,27 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.0
+Date: 2026-11-21
+  Features:
+    - Binary messages: movers, belts, chunks, machine states and inserter hands sent packed, negotiated at connect (map setting f3d-binary-messages to turn them off).
+    - Belts: machine states sliced across ticks, quiet belts read less, a drop with Z onto a belt sent at once, splitter crossing hints and the wait rule for balancers.
+    - Cargo wagons send their items for alt-mode; locomotives' fuel only when the client asks.
+    - Priority queues for movement and interaction, and the far view's (distant horizon) data.
+    - Characters' corpses are sent, drawn and mineable, with a skull map marker (map setting f3d-character-corpses).
+    - Rolling stock and signals on elevated rails are sent at the rails' height.
+    - Enemies target the character's car, tank or spidertron, not the character inside it.
+    - Damage events and deaths carry the damage, health, damage type and attacker, for enemy worms and nests too.
+    - An option brakes a vehicle to a stop and holds it with the opposite key.
+    - Gates near the client send their real open state, so their doors follow the game.
+    - Enemy melee attacks are sent near the client, for their attack sounds.
+    - /f3d-perf shots_radius (8-256) widens where projectiles and fires are sent.
+    - remote.call("zenith", "set_cue", tick) sends a filmed scene's cue to every client.
+  Changes:
+    - Needs base 2.1.0 or later.
+  Optimisations:
+    - Whole-base jobs (the map's trains, alerts, entity events) sliced across ticks; a paced garbage collector; leaner belt lane checks.
+  Bugfixes:
+    - Retransmitted and priority messages kept in order; the map scan resumes from the save after a load.
+---------------------------------------------------------------------------------------------------
 Version: 0.2.2
 Date: 2026-11-16
   Features:

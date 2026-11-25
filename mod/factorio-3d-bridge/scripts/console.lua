@@ -397,7 +397,7 @@ function M.run(cmd)
     reply.l = {}
     reply.ok = 0
   end
-  transport.send_reliable(reply)
+  transport.send_reliable_priority(reply)
 end
 
 ---------------------------------------------------------------------------------------------
@@ -439,6 +439,9 @@ function M.register_remote()
     send = link.send,
     -- {{client, player_index}, ...}, the first client first.
     clients = link.clients,
+    -- set_cue(tick): a filmed scene's cue at that game tick (nil or -1 clears it); the clients'
+    -- add-ons read it as api.world.cue_tick(). Returns the cue now set, -1 when none.
+    set_cue = link.set_cue,
   })
 end
 

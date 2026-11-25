@@ -25,6 +25,8 @@ extends RefCounted
 ## the same profile, speckle, strengths and side halving, drawn over a quad per building (turns and mirrors are its
 ## transform). Models without one (a mod's picture card) keep the rings. `--contact-shape=box`: the rings for all, as before.
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## Meta on a model's mesh: feet_of()'s feet, [[Rect2 of a foot in model space (x, z), its corners'
 ## radius], ...] in tiles; [] when it floats.
 const META := &"f3d_contact"
@@ -45,20 +47,20 @@ const PATCH_REACH := 0.55
 ## "a dark border around the drills"), where Factorio's drill sprite has none past its body, only its
 ## shadow dropped to one side. `--contact-patch=wide`: as before.
 const PATCH_EDGE := 0.1
-static var wide_patch := OS.get_cmdline_user_args().has("--contact-patch=wide")
+static var wide_patch := Switches.has("--contact-patch=wide")
 ## The clamp moves the patch alone: the rim stays round the model's real feet. Clamping the whole ring put the
 ## rim of a machine whose base overhangs its tiles (Wube3DP's electric drill by 0.11 tiles, Vasillo's by 0.08)
 ## under the model, where none of it shows (owner: "the dark contact shading ... is gone again"). Such a foot
 ## gets two rings, the rim's on the foot and the patch's on its tiles. `--contact-rim=clamped`: one clamped ring,
 ## as the drill-border fix first had it.
-static var rim_clamped := OS.get_cmdline_user_args().has("--contact-rim=clamped")
+static var rim_clamped := Switches.has("--contact-rim=clamped")
 ## Under the foot the rim and patch fade out over this much (tiles; the shader's inner_fade, its `inset`), gone
 ## before the ring's hole. They were drawn at full darkness from the foot's box in to the hole and cut off there:
 ## hidden under a solid base, but where a body doesn't fill its feet's box (Wube3DP's drill between its rear legs,
 ## 0.38 tiles deep, its round foot's corners 1.1 tiles) a dark band with a sharp inner edge lay on the bare ground
 ## (owner: "a dark rectangular band along its right and bottom edges, past the body"). `--contact-inner=hard`: as before.
 const INNER_FADE := 0.05
-static var inner_hard := OS.get_cmdline_user_args().has("--contact-inner=hard")
+static var inner_hard := Switches.has("--contact-inner=hard")
 ## Rims of two buildings closer than this (tiles) halve the sides that face each other.
 const NEIGHBOUR_GAP := 2.0 * REACH
 ## Inner ring ticks along each side: long sides follow the hills in steps of a tile or so.
@@ -132,7 +134,7 @@ const JOIN_MAX := 2.6
 const NO_MASK_NAMES := ["rail", "tree", "-rock", "-ore", "coal", "cliff", "fish", "remnants", "corpse", "locomotive", "wagon",
 	"spidertron", "character", "robot", "-asteroid", "explosion", "decorative"]
 const JOIN_NAMES := ["belt", "splitter", "loader", "pipe", "wall", "gate"]
-static var box_shape := OS.get_cmdline_user_args().has("--contact-shape=box")
+static var box_shape := Switches.has("--contact-shape=box")
 static var _atlas: Image
 static var _atlas_tex: ImageTexture
 static var _atlas_count := 0
@@ -141,6 +143,7 @@ static var _atlas_resized := false
 static var _atlas_slots := {}  # mask bytes -> slot (the same model loaded again shares one)
 static var _quad: ArrayMesh
 
+const FreeLater := preload("res://scripts/world/free_later.gd")
 const SHADER := preload("res://shaders/contact_shade.gdshader")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const AoZoom := preload("res://scripts/world/ao_zoom.gd")
@@ -148,6 +151,8 @@ const AoZoom := preload("res://scripts/world/ao_zoom.gd")
 static var enabled := true
 static var _material: ShaderMaterial
 static var _ring: ArrayMesh
+static var _anchor_on := false
+static var _anchor_pos := Vector2(INF, INF)
 
 
 ## A model's feet from its merged surfaces ([keys, arrays, formats] as Load makes them): the
@@ -263,7 +268,7 @@ static func feet_of(groups: Array) -> Array:
 ## A face counts as facing down for mask_of() when its normal's y is under minus this.
 const UNDER := 0.5
 ## --contact-belt-under=on: a belt surface's underside counts as contact, as before.
-static var belt_under := OS.get_cmdline_user_args().has("--contact-belt-under=on")
+static var belt_under := Switches.has("--contact-belt-under=on")
 const BeltReturn := preload("res://scripts/world/belt_return.gd")
 
 
@@ -683,12 +688,124 @@ static func joined(rings: Array) -> Array:
 	return out
 
 
-## Fills (or makes, or frees) the chunk's ring MultiMesh from what collect() gathered. Returns the
-## node to keep (null when there are none).
-static func apply(parent: Node3D, node: MultiMeshInstance3D, rings: Array) -> MultiMeshInstance3D:
+class Prepared:
+	var empty := true
+	var box_count := 0
+	var box_buf := PackedFloat32Array()
+	var box_aabb := AABB()
+	var mask_count := 0
+	var mask_buf := PackedFloat32Array()
+	var mask_aabb := AABB()
+
+
+static func _pack_instance(buf: PackedFloat32Array, off: int, t: Transform3D, col: Color, cust: Color) -> void:
+	buf[off] = t.basis.x.x
+	buf[off + 1] = t.basis.y.x
+	buf[off + 2] = t.basis.z.x
+	buf[off + 3] = t.origin.x
+	buf[off + 4] = t.basis.x.y
+	buf[off + 5] = t.basis.y.y
+	buf[off + 6] = t.basis.z.y
+	buf[off + 7] = t.origin.y
+	buf[off + 8] = t.basis.x.z
+	buf[off + 9] = t.basis.y.z
+	buf[off + 10] = t.basis.z.z
+	buf[off + 11] = t.origin.z
+	buf[off + 12] = col.r
+	buf[off + 13] = col.g
+	buf[off + 14] = col.b
+	buf[off + 15] = col.a
+	buf[off + 16] = cust.r
+	buf[off + 17] = cust.g
+	buf[off + 18] = cust.b
+	buf[off + 19] = cust.a
+
+
+## Computes joined rings, side halving, MultiMesh buffers, and world AABBs (safe on worker threads).
+static func prepare(rings: Array, patch_reach := -1.0) -> Prepared:
+	var p := Prepared.new()
 	if rings.is_empty():
+		return p
+	p.empty = false
+	if patch_reach < 0.0:
+		patch_reach = patch_ring_reach()
+	rings = joined(rings)
+	var all_sides := _sides(rings)
+	var masks: Array = []
+	var mask_sides: Array[Color] = []
+	var boxes: Array = []
+	var sides: Array[Color] = []
+	for i in rings.size():
+		var g: Array = rings[i]
+		if g.size() > 8:
+			masks.append(g)
+			mask_sides.append(all_sides[i])
+		else:
+			boxes.append(g)
+			sides.append(all_sides[i])
+	p.mask_count = masks.size()
+	if p.mask_count > 0:
+		p.mask_buf.resize(p.mask_count * 20)
+		var mlo := Vector2.INF
+		var mhi := -Vector2.INF
+		for i in p.mask_count:
+			var g: Array = masks[i]
+			var t: Transform3D = g[8]
+			_pack_instance(p.mask_buf, i * 20, t, mask_sides[i], Color(-1.0 - float(g[9]), 0.0, 0.0, float(g[5])))
+			for c: Vector3 in [Vector3(-1, 0, -1), Vector3(1, 0, -1), Vector3(-1, 0, 1), Vector3(1, 0, 1)]:
+				var w := t * c
+				mlo = mlo.min(Vector2(w.x, w.z))
+				mhi = mhi.max(Vector2(w.x, w.z))
+		p.mask_aabb = AABB(Vector3(mlo.x, 0.0, mlo.y), Vector3(mhi.x - mlo.x, 0.05, mhi.y - mlo.y))
+	p.box_count = boxes.size()
+	var lo := Vector2.INF
+	var hi := -Vector2.INF
+	if p.box_count == 0:
+		lo = Vector2.ZERO
+		hi = Vector2.ZERO
+	else:
+		p.box_buf.resize(p.box_count * 20)
+		for i in p.box_count:
+			var g: Array = boxes[i]
+			var gx := float(g[0])
+			var gz := float(g[1])
+			var hx := float(g[2])
+			var hz := float(g[3])
+			var patch := float(g[5])
+			var reach := patch_reach if patch > 0.0 else REACH
+			_pack_instance(p.box_buf, i * 20, Transform3D(Basis.IDENTITY, Vector3(gx, 0.0, gz)),
+				sides[i], Color(hx, hz, g[6], patch))
+			lo = lo.min(Vector2(gx - hx - reach, gz - hz - reach))
+			hi = hi.max(Vector2(gx + hx + reach, gz + hz + reach))
+	p.box_aabb = AABB(Vector3(lo.x, 0.0, lo.y), Vector3(hi.x - lo.x, 0.05, hi.y - lo.y))
+	return p
+
+
+static var use_buffer := Switches.on("--chunk-mm-worker")
+
+
+static func _nonempty_aabb(bounds: AABB) -> AABB:
+	return AABB(bounds.position, bounds.size.max(Vector3(0.01, 0.01, 0.01)))
+
+
+static func _fill_unpacked(mm: MultiMesh, count: int, buf: PackedFloat32Array) -> void:
+	for i in count:
+		var off := i * 20
+		var b := Basis(
+			Vector3(buf[off], buf[off + 4], buf[off + 8]),
+			Vector3(buf[off + 1], buf[off + 5], buf[off + 9]),
+			Vector3(buf[off + 2], buf[off + 6], buf[off + 10])
+		)
+		mm.set_instance_transform(i, Transform3D(b, Vector3(buf[off + 3], buf[off + 7], buf[off + 11])))
+		mm.set_instance_color(i, Color(buf[off + 12], buf[off + 13], buf[off + 14], buf[off + 15]))
+		mm.set_instance_custom_data(i, Color(buf[off + 16], buf[off + 17], buf[off + 18], buf[off + 19]))
+
+
+## Installs pre-packed Prepared buffers onto the chunk's ContactShade and ContactMasks MultiMeshes.
+static func apply_prepared(parent: Node3D, node: MultiMeshInstance3D, p: Prepared) -> MultiMeshInstance3D:
+	if p == null or p.empty:
 		if node != null:
-			node.queue_free()
+			FreeLater.node(node)
 		return null
 	if node == null:
 		var mm := MultiMesh.new()
@@ -704,86 +821,57 @@ static func apply(parent: Node3D, node: MultiMeshInstance3D, rings: Array) -> Mu
 		node.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
 		parent.add_child(node)
 	node.visible = enabled
-	rings = joined(rings)
-	var all_sides := _sides(rings)
-	# The masks (collect(): those with a quad) on a MultiMesh of their own under the rings' node.
-	var masks: Array = []
-	var mask_sides: Array[Color] = []
-	var boxes: Array = []
-	var sides: Array[Color] = []
-	for i in rings.size():
-		var g: Array = rings[i]
-		if g.size() > 8:
-			masks.append(g)
-			mask_sides.append(all_sides[i])
+	var mask_node := node.get_node_or_null("ContactMasks") as MultiMeshInstance3D
+	if p.mask_count == 0:
+		if mask_node != null:
+			mask_node.queue_free()
+	else:
+		_flush_atlas()
+		if mask_node == null:
+			var made := MultiMesh.new()
+			made.transform_format = MultiMesh.TRANSFORM_3D
+			made.use_colors = true
+			made.use_custom_data = true
+			made.mesh = quad_mesh()
+			mask_node = MultiMeshInstance3D.new()
+			mask_node.name = "ContactMasks"
+			mask_node.multimesh = made
+			mask_node.material_override = material()
+			mask_node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			mask_node.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
+			node.add_child(mask_node)
+		var mmm := mask_node.multimesh
+		if mmm.instance_count != p.mask_count:
+			mmm.instance_count = p.mask_count
+		if use_buffer:
+			mmm.custom_aabb = _nonempty_aabb(p.mask_aabb)
+			mmm.buffer = p.mask_buf
 		else:
-			boxes.append(g)
-			sides.append(all_sides[i])
-	_apply_masks(node, masks, mask_sides)
-	rings = boxes
+			if mmm.custom_aabb != AABB():
+				mmm.custom_aabb = AABB()
+			_fill_unpacked(mmm, p.mask_count, p.mask_buf)
+		mask_node.custom_aabb = p.mask_aabb
+		GroundHeight.cull_box(mask_node, p.mask_aabb)
 	var mm := node.multimesh
-	if mm.instance_count != rings.size():
-		mm.instance_count = rings.size()
-	var lo := Vector2.INF
-	var hi := -Vector2.INF
-	if rings.is_empty():
-		lo = Vector2.ZERO
-		hi = Vector2.ZERO
-	for i in rings.size():
-		var g: Array = rings[i]
-		var patch := float(g[5])
-		var reach := patch_ring_reach() if patch > 0.0 else REACH
-		mm.set_instance_transform(i, Transform3D(Basis.IDENTITY, Vector3(g[0], 0.0, g[1])))
-		mm.set_instance_custom_data(i, Color(g[2], g[3], g[6], patch))
-		mm.set_instance_color(i, sides[i])
-		lo = lo.min(Vector2(g[0] - g[2] - reach, g[1] - g[3] - reach))
-		hi = hi.max(Vector2(g[0] + g[2] + reach, g[1] + g[3] + reach))
-	# The vertex shader places the corners: the bounds are the rings' own (grown by the hills).
-	var box := AABB(Vector3(lo.x, 0.0, lo.y), Vector3(hi.x - lo.x, 0.05, hi.y - lo.y))
-	node.custom_aabb = box
-	GroundHeight.cull_box(node, box)
+	if mm.instance_count != p.box_count:
+		mm.instance_count = p.box_count
+	if p.box_count > 0:
+		if use_buffer:
+			mm.custom_aabb = _nonempty_aabb(p.box_aabb)
+			mm.buffer = p.box_buf
+		else:
+			if mm.custom_aabb != AABB():
+				mm.custom_aabb = AABB()
+			_fill_unpacked(mm, p.box_count, p.box_buf)
+	node.custom_aabb = p.box_aabb
+	GroundHeight.cull_box(node, p.box_aabb)
 	return node
 
 
-## The chunk's masks (collect()'s entries with a quad) on the ring node's child MultiMesh, made, filled or freed.
-static func _apply_masks(parent: MultiMeshInstance3D, masks: Array, sides: Array[Color]) -> void:
-	var node := parent.get_node_or_null("ContactMasks") as MultiMeshInstance3D
-	if masks.is_empty():
-		if node != null:
-			node.queue_free()
-		return
-	_flush_atlas()
-	if node == null:
-		var made := MultiMesh.new()
-		made.transform_format = MultiMesh.TRANSFORM_3D
-		made.use_colors = true
-		made.use_custom_data = true
-		made.mesh = quad_mesh()
-		node = MultiMeshInstance3D.new()
-		node.name = "ContactMasks"
-		node.multimesh = made
-		node.material_override = material()
-		node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		node.gi_mode = GeometryInstance3D.GI_MODE_DISABLED
-		parent.add_child(node)
-	var mm := node.multimesh
-	if mm.instance_count != masks.size():
-		mm.instance_count = masks.size()
-	var lo := Vector2.INF
-	var hi := -Vector2.INF
-	for i in masks.size():
-		var g: Array = masks[i]
-		var t: Transform3D = g[8]
-		mm.set_instance_transform(i, t)
-		mm.set_instance_custom_data(i, Color(-1.0 - float(g[9]), 0.0, 0.0, float(g[5])))
-		mm.set_instance_color(i, sides[i])
-		for c: Vector3 in [Vector3(-1, 0, -1), Vector3(1, 0, -1), Vector3(-1, 0, 1), Vector3(1, 0, 1)]:
-			var w := t * c
-			lo = lo.min(Vector2(w.x, w.z))
-			hi = hi.max(Vector2(w.x, w.z))
-	var box := AABB(Vector3(lo.x, 0.0, lo.y), Vector3(hi.x - lo.x, 0.05, hi.y - lo.y))
-	node.custom_aabb = box
-	GroundHeight.cull_box(node, box)
+## Fills (or makes, or frees) the chunk's ring MultiMesh from what collect() gathered. Returns the
+## node to keep (null when there are none).
+static func apply(parent: Node3D, node: MultiMeshInstance3D, rings: Array) -> MultiMeshInstance3D:
+	return apply_prepared(parent, node, prepare(rings, patch_ring_reach()))
 
 
 ## Each ring's rim strength per side (east, west, south, north as r, g, b, a): its style's, halved
@@ -909,6 +997,9 @@ static func material() -> ShaderMaterial:
 		# Faded by how close the view is, by ao_zoom.gd's thresholds (the one place for them).
 		_material.set_shader_parameter("fade_from", AoZoom.RIM_FULL)
 		_material.set_shader_parameter("fade_to", AoZoom.RIM_GONE)
+		_material.set_shader_parameter("use_anchor", _anchor_on)
+		if _anchor_pos.x < INF:
+			_material.set_shader_parameter("anchor_xz", _anchor_pos)
 		_material.set_shader_parameter("ring_reach", REACH)
 		_material.set_shader_parameter("ring_patch_reach", patch_ring_reach())
 		_material.set_shader_parameter("patch_reach", PATCH_REACH - 0.05 if wide_patch else PATCH_EDGE)
@@ -923,6 +1014,18 @@ static func material() -> ShaderMaterial:
 		# smoke and icons.
 		_material.render_priority = -1
 	return _material
+
+
+## Anchors building contact rims around the character (`active = true`) or restores view-pixel fade.
+static func update_anchor(pos: Vector2, active: bool) -> void:
+	if active == _anchor_on and (not active or pos.distance_squared_to(_anchor_pos) <= 0.0625):
+		return
+	_anchor_on = active
+	_anchor_pos = pos
+	if _material != null:
+		_material.set_shader_parameter("use_anchor", active)
+		if active:
+			_material.set_shader_parameter("anchor_xz", pos)
 
 
 ## Settings > Graphics > Contact shading: shows or hides every chunk's rings (chunk views: `chunks`).

@@ -20,8 +20,8 @@ var pi: Node
 var _mesh := ImmediateMesh.new()
 var _mi := MeshInstance3D.new()
 ## The rings ride on an add-on's hills (ground_height.gd), as the ground does.
-var _ok_mat := GroundHeight.mark_material(Color(1.0, 1.0, 1.0, 0.55), false)
-var _bad_mat := GroundHeight.mark_material(Color(1.0, 0.3, 0.25, 0.6), false)
+var _ok_mat := GroundHeight.mark_material(Color(1.0, 1.0, 1.0, 0.55), false, GroundHeight.AREA_PRIORITY)
+var _bad_mat := GroundHeight.mark_material(Color(1.0, 0.3, 0.25, 0.6), false, GroundHeight.AREA_PRIORITY)
 var _timer := 0.0
 
 
@@ -62,11 +62,12 @@ func update_preview(item: String, has_ground: bool, ground: Vector2) -> void:
 
 
 func _ring(c: Vector2, r: float) -> void:
+	var y := 0.05 if GroundHeight.is_on() else 0.02
 	for i in SEGMENTS:
 		var a := TAU * i / SEGMENTS
 		var b := TAU * (i + 1) / SEGMENTS
-		_mesh.surface_add_vertex(Vector3(c.x + cos(a) * r, 0.08, c.y + sin(a) * r))
-		_mesh.surface_add_vertex(Vector3(c.x + cos(b) * r, 0.08, c.y + sin(b) * r))
+		_mesh.surface_add_vertex(Vector3(c.x + cos(a) * r, y, c.y + sin(a) * r))
+		_mesh.surface_add_vertex(Vector3(c.x + cos(b) * r, y, c.y + sin(b) * r))
 
 
 ## While the left button is held: throws now and then every REPEAT.

@@ -488,7 +488,7 @@ function M.build(cmd)
     local ok, collided, revived = pcall(function() return ghost.revive({ raise_revive = true }) end)
     if ok and revived then
       if removal then
-        transport.send_reliable(removal)
+        transport.send_reliable_priority(removal, math.floor(position.x / 32), math.floor(position.y / 32))
       end
       -- What lay in the way (array[ItemWithQualityCount] in 2.1) goes to the character.
       for _, it in pairs(collided or {}) do
@@ -548,7 +548,7 @@ function M.build(cmd)
       for _, g in ipairs(gone) do
         if not g.old.valid then
           if g.removal then
-            transport.send_reliable(g.removal)
+            transport.send_reliable_priority(g.removal, math.floor(g.removal.x / 8192), math.floor(g.removal.y / 8192))
           end
           for _, product in pairs(as_character and {} or g.products) do
             if product.type == "item" then

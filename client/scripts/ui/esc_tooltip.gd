@@ -12,7 +12,9 @@ extends Node
 ## every other node's: an Esc one of them took (a key being rebound, a screenshot being cancelled)
 ## never gets here. `--esc-tooltip=old`: as before, the first Esc only hides the tooltip.
 
-var enabled := not OS.get_cmdline_user_args().has("--esc-tooltip=old")
+const Switches := preload("res://scripts/switches.gd")
+
+var enabled := not Switches.has("--esc-tooltip=old")
 ## How many were sent again (the UI test reads it).
 var resent := 0
 var _resending := false

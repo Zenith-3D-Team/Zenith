@@ -7,6 +7,7 @@
 
 local profile = require("scripts.profile")
 local photo = require("scripts.photo")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -70,11 +71,11 @@ end
 -- binary-protocol-rd). Whether a datagram is binary depends only on the client's hello.
 -- The version is what the client's hello and this bridge both read (session.lua): 1 has `mv`, 2 adds
 -- `bs` and `bfar` (kinds 17, 18), 3 `chunk`, `ents`, `st` and `ih` (19-22; the first three reliable: kept in
--- the outbox as their bytes, send_reliable_frame). A datagram's second byte is the version the client was
--- answered.
-M.WIRE_VERSION = 3
+-- the outbox as their bytes, send_reliable_frame), 4 `rb` (23), 5 `bs`'s crossing hints (`sx`, a block after qu's
+-- text, only in a part that has some). A datagram's second byte is the version the client was answered.
+M.WIRE_VERSION = 5
 M.KIND_JSON, M.KIND_DG, M.KIND_MV, M.KIND_BS, M.KIND_BFAR = 0, 1, 16, 17, 18
-M.KIND_CHUNK, M.KIND_ENTS, M.KIND_ST, M.KIND_IH = 19, 20, 21, 22
+M.KIND_CHUNK, M.KIND_ENTS, M.KIND_ST, M.KIND_IH, M.KIND_RB = 19, 20, 21, 22, 23
 M.FLAG_RELIABLE = 1
 local WIRE_HEADS = {}
 local function wire_head(version)
@@ -139,7 +140,13 @@ end
 -- the messages joined by newlines into datagrams of up to BATCH_BYTES, sent when one fills and at
 -- the end of each tick (end_tick). Only what is sent depends on this buffer, never storage.
 local BATCH_BYTES = 60000
+local PRIO_BYTES = 32768
+local NACK_RING_SIZE = 256
+local NACK_MAX_SCAN = 64
 local batches = {}  -- port -> {parts, bytes, binary}: a binary batch's parts are frames (binary: its version)
+-- Reliable retransmit ring per client port (UDP output cache only, never in storage): port -> { [r % 256] = entry }.
+local nack_rings = {}
+local nack_ports = setmetatable({}, { __mode = "k" })
 
 local function send_batch(port)
   local b = batches[port]
@@ -312,45 +319,120 @@ function M.send_now(msg)
   end
 end
 
-function M.send_reliable(msg)
+local function ensure_prio(s)
+  if not s.outbox_prio then
+    s.outbox_prio = {}
+    s.outbox_prio_head = 1
+    s.outbox_prio_tail = 0
+  end
+  if not s.outbox_chunks then
+    s.outbox_chunks = {}
+  end
+  if not s.outbox_chunk_wait then
+    s.outbox_chunk_wait = {}
+  end
+end
+
+local function track_chunk(s, msg, ckey)
+  if not ckey and (msg.t == "chunk" or msg.t == "ents") and msg.cx ~= nil and msg.cy ~= nil then
+    ckey = msg.cx .. "," .. msg.cy
+  end
+  if ckey then
+    ensure_prio(s)
+    msg.__ckey = ckey
+    s.outbox_chunks[ckey] = (s.outbox_chunks[ckey] or 0) + 1
+  end
+end
+
+local function queue_priority(s, entry, cx, cy)
+  ensure_prio(s)
+  if cx ~= nil and cy ~= nil then
+    local ckey = cx .. "," .. cy
+    if (s.outbox_chunks[ckey] or 0) > 0 then
+      local wait = s.outbox_chunk_wait[ckey]
+      if not wait then
+        wait = {}
+        s.outbox_chunk_wait[ckey] = wait
+      end
+      wait[#wait + 1] = entry
+      return
+    end
+  end
+  s.outbox_prio_tail = s.outbox_prio_tail + 1
+  s.outbox_prio[s.outbox_prio_tail] = entry
+end
+
+function M.send_reliable(msg, ckey)
   local s = storage.f3d
   if not s.client then
     return
   end
-  s.rseq = s.rseq + 1
-  msg.r = s.rseq
+  if msg.t == "welcome" then
+    s.ready_sent = false
+  end
+  track_chunk(s, msg, ckey)
   s.outbox_tail = s.outbox_tail + 1
   s.outbox[s.outbox_tail] = msg
+end
+
+-- Priority reliable message (player actions: inventory, slots, quickbar, blueprint acks, and entity
+-- deltas whose chunk has no snapshot waiting in `outbox`): flushes ahead of bulk chunks/state with `r`
+-- assigned at flush time (unless `ready` hasn't flushed yet). Falls back to `outbox` when `prio_queue` is
+-- off, or waits in `outbox_chunk_wait[ckey]` until chunk `(cx, cy)` finishes flushing its snapshots.
+function M.send_reliable_priority(msg, cx, cy)
+  local s = storage.f3d
+  if not s.client then
+    return
+  end
+  if not perf.on("prio_queue") then
+    return M.send_reliable(msg)
+  end
+  queue_priority(s, msg, cx, cy)
+end
+
+-- Priority binary reliable frame: routes into `outbox_prio` or `outbox_chunk_wait[ckey]`, falling
+-- back to `M.send_reliable_frame` when `prio_queue` is off.
+function M.send_reliable_frame_priority(kind, t, body, version, cx, cy)
+  local s = storage.f3d
+  if not s.client then
+    return
+  end
+  if not perf.on("prio_queue") then
+    return M.send_reliable_frame(kind, t, body, version)
+  end
+  queue_priority(s, { t = t, __bin = body, __kind = kind, __v = version }, cx, cy)
 end
 
 -- A reliable message written as JSON text by its module (chunk snapshots: world.lua): `fields`, the
 -- fields after t, k and r, starting with a comma. helpers.table_to_json in the flush cost 0.3-0.5 ms a
 -- KB there, outside the work budget (1.4-2 ms a tick while chunks streamed on the owner's base, 40-65
 -- ms ticks in photo mode); the text is made in the module's own slices instead. Kept in the outbox as
--- {r, t, __text}: the same text on every peer, made from game reads.
-function M.send_reliable_text(t, fields)
+-- {t, __text, __ckey?}: the same text on every peer, made from game reads, `r` stamped when flushed.
+function M.send_reliable_text(t, fields, ckey)
   local s = storage.f3d
   if not s.client then
     return
   end
-  s.rseq = s.rseq + 1
+  local entry = { t = t, __text = fields }
+  track_chunk(s, entry, ckey)
   s.outbox_tail = s.outbox_tail + 1
-  s.outbox[s.outbox_tail] = { r = s.rseq, t = t, __text = fields }
+  s.outbox[s.outbox_tail] = entry
 end
 
 -- A reliable message written in binary by its module (chunk snapshots, `st`), for a client of wire version
 -- `version` or later (M.binary): `kind` its frame kind, `t` its type, `body` its bytes after `k` and `r` (the
--- flush puts those in front). Kept in the outbox as {r, t, __bin, __kind, __v}: the same bytes on every peer,
--- made from game reads. A hello that leaves the client below `version` with such messages waiting starts
--- the stream over (session.lua), so the flush never meets one it can't send.
-function M.send_reliable_frame(kind, t, body, version)
+-- flush puts those in front). Kept in the outbox as {t, __bin, __kind, __v, __ckey?}: the same bytes on every peer,
+-- made from game reads, `r` stamped when flushed. A hello that leaves the client below `version` with such
+-- messages waiting starts the stream over (session.lua), so the flush never meets one it can't send.
+function M.send_reliable_frame(kind, t, body, version, ckey)
   local s = storage.f3d
   if not s.client then
     return
   end
-  s.rseq = s.rseq + 1
+  local entry = { t = t, __bin = body, __kind = kind, __v = version }
+  track_chunk(s, entry, ckey)
   s.outbox_tail = s.outbox_tail + 1
-  s.outbox[s.outbox_tail] = { r = s.rseq, t = t, __bin = body, __kind = kind, __v = version }
+  s.outbox[s.outbox_tail] = entry
 end
 
 local function states_body(l, lc, ao)
@@ -363,26 +445,55 @@ end
 
 -- `st`, reliable (movers.lua, belt_switch.lua): `l` [unit, state, ...], optional `lc` and `ao` (left out when
 -- empty), as kind 21 for a wire version 3 client (three blocks; one string.pack refuses: as JSON), else JSON.
-function M.send_states(l, lc, ao)
+-- When `priority == true`, routes through the priority reliable lane.
+function M.send_states(l, lc, ao, priority)
   lc = lc and #lc > 0 and lc or nil
   ao = ao and #ao > 0 and ao or nil
   if M.binary(3) then
     local ok, body = pcall(states_body, l, lc, ao)
     if ok then
-      M.send_reliable_frame(M.KIND_ST, "st", body, 3)
+      if priority == true then
+        M.send_reliable_frame_priority(M.KIND_ST, "st", body, 3)
+      else
+        M.send_reliable_frame(M.KIND_ST, "st", body, 3)
+      end
       return
     end
   end
-  M.send_reliable({ t = "st", l = l, lc = lc, ao = ao })
+  local msg = { t = "st", l = l, lc = lc, ao = ao }
+  if priority == true then
+    M.send_reliable_priority(msg)
+  else
+    M.send_reliable(msg)
+  end
 end
 
 -- Whether the outbox holds a binary message (session.lua: a hello that drops the client's version below it).
 function M.binary_waiting(version)
   local s = storage.f3d
+  local min_v = version or 0
   for i = s.outbox_head, s.outbox_tail do
     local msg = s.outbox[i]
-    if msg and msg.__bin and msg.__v > (version or 0) then
+    if msg and msg.__bin and msg.__v > min_v then
       return true
+    end
+  end
+  if s.outbox_prio then
+    for i = s.outbox_prio_head, s.outbox_prio_tail do
+      local msg = s.outbox_prio[i]
+      if msg and msg.__bin and msg.__v > min_v then
+        return true
+      end
+    end
+  end
+  if s.outbox_chunk_wait then
+    for _, list in pairs(s.outbox_chunk_wait) do
+      for i = 1, #list do
+        local msg = list[i]
+        if msg and msg.__bin and msg.__v > min_v then
+          return true
+        end
+      end
     end
   end
   return false
@@ -563,52 +674,230 @@ end
 
 function M.backlog()
   local s = storage.f3d
-  return s.outbox_tail - s.outbox_head + 1
+  local n = s.outbox_tail - s.outbox_head + 1
+  if s.outbox_prio then
+    n = n + (s.outbox_prio_tail - s.outbox_prio_head + 1)
+  end
+  if s.outbox_chunk_wait then
+    for _, list in pairs(s.outbox_chunk_wait) do
+      n = n + #list
+    end
+  end
+  return n
 end
 
 function M.reset()
   local s = storage.f3d
+  local port = s.client and s.client.port or nack_ports[s]
+  if port then
+    nack_rings[port] = nil
+  end
+  if nack_ports[s] then
+    nack_rings[nack_ports[s]] = nil
+    nack_ports[s] = nil
+  end
   s.rseq = 0
   s.outbox = {}
   s.outbox_head = 1
   s.outbox_tail = 0
+  s.outbox_prio = {}
+  s.outbox_prio_head = 1
+  s.outbox_prio_tail = 0
+  s.outbox_chunks = {}
+  s.outbox_chunk_wait = {}
+  s.ready_sent = nil
 end
 
-function M.flush()
+-- Resends up to `NACK_MAX_SCAN` reliable messages matching `r_list` from this client's module-local
+-- ring buffer without mutating `s.rseq` or `storage`. Returns `(hits, misses)` lists of integers.
+function M.retransmit(r_list)
   local s = storage.f3d
-  local client = s.client
+  local client = s and s.client
+  if not client or type(r_list) ~= "table" then
+    return {}, {}
+  end
+  local prev_port = nack_ports[s]
+  if prev_port and prev_port ~= client.port then
+    nack_rings[prev_port] = nil
+    nack_rings[client.port] = nil
+    nack_ports[s] = client.port
+  end
+  local ring = nack_rings[client.port]
+  local hits, misses = {}, {}
+  local count = math.min(#r_list, NACK_MAX_SCAN)
+  local cbin = client.bin or 0
+  for i = 1, count do
+    local r = r_list[i]
+    if type(r) == "number" and r == r and r >= 0 and r < 1e14 and r == math.floor(r) then
+      local entry = ring and ring[r % NACK_RING_SIZE]
+      if entry and entry.r == r and (not entry.bin or cbin >= entry.v) then
+        send_raw(client.port, entry.data, entry.kind, entry.t, entry.flags)
+        hits[#hits + 1] = r
+      else
+        misses[#misses + 1] = r
+      end
+    end
+  end
+  return hits, misses
+end
+
+local function port_ring(s, client)
+  if not client then
+    return nil
+  end
+  local prev_port = nack_ports[s]
+  if prev_port and prev_port ~= client.port then
+    nack_rings[prev_port] = nil
+    nack_rings[client.port] = nil
+  end
+  nack_ports[s] = client.port
+  local ring = nack_rings[client.port]
+  if not ring then
+    ring = {}
+    nack_rings[client.port] = ring
+  end
+  return ring
+end
+
+local function flush_budget()
   local budget = settings.global["f3d-bytes-per-tick"].value
   if photo.on() then
     budget = budget * photo.BYTES -- a screenshot loading its chunks (photo.lua)
   end
-  local sent = 0
-  while s.outbox_head <= s.outbox_tail and sent < budget do
-    local msg = s.outbox[s.outbox_head]
-    s.outbox[s.outbox_head] = nil
-    s.outbox_head = s.outbox_head + 1
-    -- (A message its module wrote as text, send_reliable_text: no table_to_json here.)
-    local data
-    if msg.__bin then
-      data = string.pack("<I4I4", game.tick, msg.r) .. msg.__bin
-      sent = sent + #data
-      if client and (client.bin or 0) >= msg.__v then
-        send_raw(client.port, data, msg.__kind, msg.t, M.FLAG_RELIABLE)
-      end
+  return budget, math.max(budget, PRIO_BYTES)
+end
+
+local function flush_message(s, client, ring, msg)
+  s.rseq = s.rseq + 1
+  msg.r = s.rseq
+  if msg.t == "ready" then
+    s.ready_sent = true
+  end
+  -- (A message its module wrote as text, send_reliable_text: no table_to_json here.)
+  local data, sent_bytes
+  local did_send = false
+  if msg.__bin then
+    data = string.pack("<I4I4", game.tick, msg.r) .. msg.__bin
+    sent_bytes = #data
+    if client and (client.bin or 0) >= msg.__v then
+      send_raw(client.port, data, msg.__kind, msg.t, M.FLAG_RELIABLE)
+      did_send = true
+    end
+  else
+    if msg.__text then
+      data = '{"t":"' .. msg.t .. '","k":' .. game.tick .. ',"r":' .. msg.r .. msg.__text .. "}"
     else
-      if msg.__text then
-        data = '{"t":"' .. msg.t .. '","k":' .. game.tick .. ',"r":' .. msg.r .. msg.__text .. "}"
-      else
-        data = encode(msg)
-      end
-      sent = sent + #data
-      if client then
-        send_raw(client.port, data)
-      end
+      data = encode(msg)
+    end
+    sent_bytes = #data
+    if client then
+      send_raw(client.port, data)
+      did_send = true
     end
   end
+  if did_send and ring then
+    if msg.r == 1 then
+      ring = {}
+      nack_rings[client.port] = ring
+    end
+    ring[msg.r % NACK_RING_SIZE] = {
+      r = msg.r,
+      data = data,
+      kind = msg.__bin and msg.__kind or nil,
+      t = msg.t,
+      flags = msg.__bin and M.FLAG_RELIABLE or nil,
+      bin = msg.__bin ~= nil,
+      v = msg.__v or 0,
+    }
+  end
+  return sent_bytes, ring
+end
+
+-- Flushes only `outbox_prio` (up to `math.max(budget, PRIO_BYTES)`): used at the end of `serve()`
+-- when `flush_end` is on so interactive replies and unblocked deltas leave on the same tick.
+function M.flush_priority()
+  local s = storage.f3d
+  if not s or not s.client or s.ready_sent == false then
+    return
+  end
+  ensure_prio(s)
+  if s.outbox_prio_head > s.outbox_prio_tail then
+    return
+  end
+  local client = s.client
+  local ring = port_ring(s, client)
+  local _, prio_budget = flush_budget()
+  -- prio_cap: counts what M.flush already sent this tick, so the tick's total stays within the
+  -- priority budget (two full budgets in one tick overran the ~64 KB Windows keeps unread).
+  local sent = 0
+  if perf.on("prio_cap") and s.flush_sent_tick == game.tick then
+    sent = s.flush_sent or 0
+  end
+  while s.outbox_prio_head <= s.outbox_prio_tail and sent < prio_budget do
+    local msg = s.outbox_prio[s.outbox_prio_head]
+    s.outbox_prio[s.outbox_prio_head] = nil
+    s.outbox_prio_head = s.outbox_prio_head + 1
+    local bytes
+    bytes, ring = flush_message(s, client, ring, msg)
+    sent = sent + bytes
+  end
+  if s.outbox_prio_head > s.outbox_prio_tail then
+    s.outbox_prio_head = 1
+    s.outbox_prio_tail = 0
+  end
+end
+
+function M.flush()
+  local s = storage.f3d
+  ensure_prio(s)
+  local client = s.client
+  local ring = port_ring(s, client)
+  local budget, prio_budget = flush_budget()
+  local sent = 0
+  while true do
+    local msg
+    if s.ready_sent ~= false and s.outbox_prio_head <= s.outbox_prio_tail and sent < prio_budget then
+      msg = s.outbox_prio[s.outbox_prio_head]
+      s.outbox_prio[s.outbox_prio_head] = nil
+      s.outbox_prio_head = s.outbox_prio_head + 1
+    elseif s.outbox_head <= s.outbox_tail and sent < budget then
+      msg = s.outbox[s.outbox_head]
+      s.outbox[s.outbox_head] = nil
+      s.outbox_head = s.outbox_head + 1
+      if msg.__ckey then
+        local ckey = msg.__ckey
+        msg.__ckey = nil
+        local n = (s.outbox_chunks[ckey] or 0) - 1
+        if n > 0 then
+          s.outbox_chunks[ckey] = n
+        else
+          s.outbox_chunks[ckey] = nil
+          local wait = s.outbox_chunk_wait[ckey]
+          if wait then
+            s.outbox_chunk_wait[ckey] = nil
+            for i = 1, #wait do
+              s.outbox_prio_tail = s.outbox_prio_tail + 1
+              s.outbox_prio[s.outbox_prio_tail] = wait[i]
+            end
+          end
+        end
+      end
+    else
+      break
+    end
+    local bytes
+    bytes, ring = flush_message(s, client, ring, msg)
+    sent = sent + bytes
+  end
+  s.flush_sent_tick = game.tick
+  s.flush_sent = sent
   if s.outbox_head > s.outbox_tail then
     s.outbox_head = 1
     s.outbox_tail = 0
+  end
+  if s.outbox_prio_head > s.outbox_prio_tail then
+    s.outbox_prio_head = 1
+    s.outbox_prio_tail = 0
   end
 end
 

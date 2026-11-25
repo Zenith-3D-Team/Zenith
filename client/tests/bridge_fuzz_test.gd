@@ -58,6 +58,10 @@ func _ready() -> void:
 			check(m.has("dl") and WireDecode.packed(m["dl"]) or m.has("l") and (m["l"] is PackedInt32Array),
 				"binary frames: %s's lists arrive packed" % m["t"])
 			plain = WireDecode.plain(m)
+		elif m.get("t") == "rb":
+			check(WireDecode.packed(m["u"]), "binary frames: rb's u list arrives packed")
+			check(not m.has("g") or WireDecode.packed(m["g"]), "binary frames: rb's g list arrives packed")
+			plain = WireDecode.plain(m)
 		elif m.get("t") in ["chunk", "ents", "st", "ih"]:
 			# (Wire version 3: the lists packed, ents' extras parsed from their JSON text into xe.)
 			var key: String = {"chunk": "tiles", "ents": "e", "st": "l", "ih": "l"}[m["t"]]
@@ -112,8 +116,34 @@ func _ready() -> void:
 	b.receive(_bytes({"t": "add", "r": 3, "e": [1, 2, 0, 0, 0]}))
 	check(seen[0] == before + 2 and b.server_tick == 9, "messages still arrive in order")
 	before = seen[0]
+	b._expected_r = 12  # the fixture's reliable messages start at r 12 (a gap before them is held until filled)
 	b.receive(frames)
 	check(seen[0] == before + (fixture["messages"] as Array).size(), "a whole binary datagram's messages all arrive after the fuzzing")
+	# The review's ordering cases: a lost chunk header retransmitted after its ents is handled first
+	# (reliable_reorder); an add queued in bulk isn't overtaken by its del in the priority lane
+	# (prio_delta_order).
+	var order: Array = []
+	var rec := func(m: Dictionary) -> void:
+		order.append("%s%d" % [str(m.get("t", "")), int(m.get("r", 0))])
+	b.message_received.connect(rec)
+	b.receive(_bytes({"t": "welcome", "r": 1, "v": 1}))
+	b.receive(_bytes({"t": "ready", "r": 2}))
+	order.clear()
+	b.receive(_bytes({"t": "ents", "r": 4, "cx": 1, "cy": 1, "part": 1, "parts": 1, "e": []}))
+	b.receive(_bytes({"t": "chunk", "r": 3, "cx": 1, "cy": 1}))
+	check(order == ["chunk3", "ents4"], "a chunk header retransmitted after its ents is handled first: %s" % [order])
+	b.priority_queue = true
+	b._seq_world_ready = true
+	order.clear()
+	b._route([{"t": "ents", "r": 5, "cx": 0, "cy": 0, "part": 1, "parts": 1, "e": []},
+		{"t": "add", "r": 6, "e": [9, 1, 128, 128, 0]}], PackedInt32Array(), 0)
+	var first: Dictionary = b._waiting[b._waiting_at]
+	b._waiting_at += 1
+	b._routed_out(first)
+	b._route([{"t": "del", "r": 7, "x": 128, "y": 128}], PackedInt32Array(), 0)
+	b._drain()
+	check(order == ["add6", "del7"], "a del doesn't overtake its chunk's queued add: %s" % [order])
+	b.message_received.disconnect(rec)
 	print("bridge fuzz: %d rounds (random bytes %.2f ms a packet), FAILS: %d" % [ROUNDS, noise_ms, fails])
 	get_tree().quit(1 if fails else 0)
 

@@ -1,106 +1,69 @@
 # Zenith: Roadmap
 
-Where Zenith is going. It's a plan, not a promise: priorities can change as I play it and as
-players report bugs. What's in each release is on the
-[Releases](https://github.com/unjustodin/Zenith/releases) page, and known bugs are in
-[Issues](https://github.com/unjustodin/Zenith/issues).
+Where Zenith is going. Priorities adapt as real saves are play-tested and bugs are reported. Published builds are on [Releases](https://github.com/unjustodin/Zenith/releases), and open bugs are in [Issues](https://github.com/unjustodin/Zenith/issues).
 
-## Goals, not one milestone at a time
+## Six parallel goals to 1.0
 
-The road to 1.0 is six goals, each with a priority. Work goes on several of them at once: the
-priority says what wins when two things compete for time, not that a goal waits until the one
-above it is finished. A release ships whatever is ready across all of them.
+Zenith progresses across all six goals in parallel. Priority order decides what wins when work competes for time; **`1.0`** means everything playable in Factorio works smoothly in Zenith.
 
-| Priority | Goal | In short |
+| Priority | Goal | Focus |
 |---|---|---|
-| 1 | [Stability](#1-stability) | Works on real games and big saves, bugs fixed first |
-| 2 | [Performance](#2-performance) | 60 UPS and a smooth frame rate on big bases |
-| 3 | [Interface](#3-interface) | Factorio's interface and controls, 1:1 |
-| 4 | [Models and animation](#4-models-and-animation) | Every model true to its sprite, and moving as in the game |
-| 5 | [Space Age](#5-space-age) | Platforms, rockets, planets and their creatures finished |
-| 6 | [Mods and add-ons](#6-mods-and-add-ons) | Other Factorio mods drawn, and more open to add-ons |
+| 1 | [Stability](#1-stability) | Real saves, multi-client play, Linux parity, zero crashes/freezes |
+| 2 | [Performance](#2-performance) | Steady 60 UPS/FPS on megabases, forests, and long view distances |
+| 3 | [Interface](#3-interface) | Last 1:1 Factorio UI, camera views, and controls parity |
+| 4 | [Models and animation](#4-models-and-animation) | Model accuracy vs sprites, restored FUE5 parts/glows, lighting, 3D foliage |
+| 5 | [Space Age](#5-space-age) | Smooth planet transitions, silo launches, platforms, Space Age enemies |
+| 6 | [Mods and add-ons](#6-mods-and-add-ons) | Mod-bundled model packs, overhaul testing, richer add-on hooks |
 
-**1.0** comes when all six are met and everything you can do in Factorio, you can do in Zenith.
+## Version numbering
 
-## Version numbers
-
-Versions are `state.release.hotfix`:
-
-- **State:** 0 while Zenith is in development, 1 from the full release.
-- **Release:** the second number counts feature releases. Each one carries progress on any of the
-  goals; it isn't tied to one goal.
-- **Hotfix:** the third number is for bug fixes between releases, with no new features. There's
-  no limit: 0.1.100 comes after 0.1.99.
-
-The bridge mod and the client always carry the same version. The add-ons keep their own numbers.
+Versions use `state.release.hotfix` (`0` while pre-1.0, second digit for feature releases, third for hotfixes). Bridge mod and client always share one version; add-ons keep their own versions.
 
 ## The goals
 
 ### 1. Stability
 
-Everything that works against the test server checked on real games and real saves, and the bugs
-that turns up fixed:
-
-- Players' bug reports, always first.
-- Trains on elevated rails, and train stops in the colour you paint them.
-- Several Zenith players on one server, side by side.
-- Switching a running game between Factorio's window and Zenith (Ctrl+F9).
-- Long sessions on big saves; the Linux server script and download.
+- Player bug reports first.
+- Long play-test sessions on large saves, Linux release/CI parity, and elevated rail / train stop polish.
+- Multi-client server sessions, `Ctrl+F9` window switching freeze hardening, and hybrid single-player testing.
 
 ### 2. Performance
 
-- Forests and long view distances, which cost the graphics card the most today.
-- Simpler stand-ins for far trees and far chunks.
-- 60 UPS on very big bases with less held back from what you see.
-- A smooth frame rate while running, at long view distances too.
+- Reducing forest leaf & long-distance GPU cost (`E15`) and eliminating main-thread/camera-pan spikes while running (`E14`).
+- Cheaper far tree/chunk stand-ins while keeping Distant Horizon transitions seamless.
+- Sustaining 60 UPS on very big bases with minimal visual holdbacks.
 
 ### 3. Interface
 
-- Factorio's interface matched 1:1: the last differences in layout and behaviour.
-- Train and platform schedules that look and feel like Factorio's own.
-- The map view, alerts, Factoriopedia and tooltips as Factorio has them; Tips and tricks with
-  their pictures.
-- The camera views (Factorio's angle, first person, the map's remote view) finished.
-- Smaller things: dragging undergrounds, pipes and poles, crafting that shows at once, what's
-  inside a chest when you hover it.
+- Closing remaining UI parity gaps ([UI-DIFFERENCES.md](UI-DIFFERENCES.md)), train/platform schedules, and chest hover contents.
+- Tips & tricks imagery/workarounds and finishing camera polish across angled, F6, first-person, and map remote views.
 
 ### 4. Models and animation
 
-- Models that still differ from their Factorio sprites redone, and more textured models where
-  they're better than ours (with help from modellers: [MODELLERS.md](MODELLERS.md)).
-- 3D foliage, and wind in trees and plants.
-- The buildings, vehicles and creatures still missing animations, the moving parts some
-  textured models lost, the rocket silo's launch.
-- The character's run, and the lights at night.
-- Shader work: better shadows and lighting in general (softer, steadier shadows, light on the
-  models' materials, ambient light and occlusion cheap enough to leave on).
+- Refining models that still trail their sprites ([ASSET-INVENTORY.md](ASSET-INVENTORY.md)) and collaborating with 3D modellers ([MODELLERS.md](MODELLERS.md)).
+- Restoring missing FUE5 animations/glows (e.g., roboport doors, refinery/reactor/beacon glow, pump/pumpjack motion).
+- 3D foliage (`C14`), wind in plants/trees, improved character run cycle, and cheaper indirect lighting/shadows.
 
 ### 5. Space Age
 
-- Flying up to and past planets, rockets and cargo pods.
-- Space platforms and travel as in the game.
-- Each planet's sky, ground and details; Space Age's enemies finished.
+- Smoothing rocket silo launches and orbital planet approach/flyby visuals.
+- Platform schedules/hub UX and polishing Vulcanus, Fulgora, Gleba, and Aquilo creatures & environments.
 
 ### 6. Mods and add-ons
 
-- Other mods' buildings, items and ground drawn from their own graphics, and model packs for them.
-- Big overhaul mods tried and working.
-- More of the client open to add-ons, as add-on authors need it.
+- Mod-declared model packs, animated modded buildings polish, and testing large overhaul mods.
+- Expanding add-on API hooks (`docs/ADDONS.md`, currently `1.91`) as community add-ons need them.
 
 ## Released
 
 ### 0.1: First release
 
-Real Factorio 2.1 (with or without Space Age) played in 3D: a model for every base game and
-Space Age entity, Factorio's own interface and hotkeys, your own saves, space platforms and the
-other planets, add-ons. Hotfixes on 0.1 (0.1.1, 0.1.2) fixed the bugs players reported and made
-big bases faster.
+Real Factorio 2.1 (base + Space Age) playable in 3D: model coverage for base + Space Age entities, Factorio UI & hotkeys, save import, space platforms, and first add-on API (`0.1.1` / `0.1.2` hotfixes improved megabase speed and stability).
 
-### 0.2: Zenith runs the belts
+### 0.2 / 0.2.1: Client belt simulation & visual upgrades
 
-Zenith runs Factorio's belt logic itself, so items on belts move exactly as the game moves them
-and full belts are drawn full. Textured belts, undergrounds, splitters, inserters and the burner
-drill by David (Vasillo), the Cinematic look in the download, shading round every building, 3D
-grass and screenshots up to 8K. 0.2.1 brought big bases back to 60 UPS, with the next round of
-play-test fixes: mining and picking up as in Factorio, belt drags and undergrounds as in Factorio
-2.x, biters, pentapods and trees from Factorio's own pictures, and a server on another PC.
+Client-side Factorio-accurate belt simulation, Vasillo's textured logistics & drill pack (`Zenith.zip`), Cinematic shaders, contact shading, 3D grass, 8K screenshots, creature hull models, LAN TCP relay (`server/relay.py`), and mod graphics (`gfx`).
+
+### 0.3 (pre-release): Horizon, weather, FSR 2.2 & C++ speedup
+
+Bundled **Immersive Weather**, **Distant Horizon** (`512`-chunk 2.5D terrain & factory silhouettes), **AMD FSR 2.2**, redone card-based Graphics settings, per-pack PBR shading (`108`-model Vasillo PBR support + FUE5/Wube3DP PBR), **Binary Wire `v1–5`** with `nack` ring & `rb` robot sim, **13-class C++ GDExtension**, cargo wagon Alt-mode, and Factorio 2.1 default key bindings.

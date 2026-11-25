@@ -261,7 +261,32 @@ private:
 	bool split_wake = true;
 	std::unordered_map<int, i64> _ob1, _ob2;
 	std::unordered_map<i64, i64> _side_x;
+	// split_wake_r4 (belt_sim.gd's): R&D's wait rule; _ib1/_ib2 each splitter input's line's front and back
+	// as one number (-1 none) at the end of the tick before and the one before that, _side_in unit * 2 +
+	// side -> the input half that last crossed there.
+	bool split_wake_r4 = true;
+	std::unordered_map<int, i64> _ib1, _ib2;
+	std::unordered_map<i64, int> _side_in;
+	i64 _lane_sig(int lane, i64 t);
+	i64 _out_back(int o, i64 t);
+	bool _r4_wait(const Splitter *sp, int side, int o, int l0, i64 t);
 	i64 n_woke = 0;
+	// split_hints (belt_sim.gd's): the bridge's crossing hints (`bs.sx`), unit * 2 + side -> [tick, out0, out1, in0,
+	// in1] * n by tick; an item a hint has at an input's front waits, one it has as an output's last item crosses
+	// there. split_reconcile: a splitter lane's read that differs only by the crossings' timing (or a lane's lag)
+	// isn't applied (_split_timing); _sx_batch the batch's splitter reads, uid -> (lane key, tick).
+	bool split_hints = true;
+	bool split_reconcile = true;
+	static constexpr int SX_STRIDE = 5;
+	static constexpr i64 SX_SWEEP = 600;
+	std::unordered_map<i64, std::vector<i64>> _sx;
+	i64 _sx_sweep = -1;
+	std::unordered_map<i64, std::pair<i64, i64>> _sx_batch;
+	i64 n_hint_held = 0;
+	i64 n_hint_steered = 0;
+	i64 n_reconciled = 0;
+	static int _hint_for(const std::vector<i64> &a, i64 t, i64 uid);
+	bool _split_timing(int i, Line *L, const std::vector<i64> &items, i64 lo, i64 hi);
 	void _note_outputs();
 	static constexpr int TURN_FOLLOW = 8;
 	i64 prof[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -286,7 +311,7 @@ private:
 	std::vector<int32_t> l_xm, l_ym;  // (handoff) its middle (line position length / 2)
 	std::vector<i64> l_read;  // (handoff) the tick of its newest read applied (-1 none)
 	std::vector<i64> l_seen;  // (rescue_seen) the tick of its newest read, applied or in the batch (-1 none)
-	std::vector<int32_t> l_next, l_side, l_side_at, l_sp0, l_sp1, l_line, l_base, l_run;
+	std::vector<int32_t> l_next, l_side, l_side_at, l_sp0, l_sp1, l_line, l_base, l_lpos, l_run;
 	std::vector<uint8_t> l_off, l_alive;
 	std::vector<std::vector<int>> l_feeders, l_sideins;
 	std::vector<int> _free_lanes;
@@ -387,6 +412,96 @@ private:
 	std::vector<int32_t> _nrs, _nrv;  // (records being rebuilt: swapped with a line's)
 	std::vector<SelfSide> _self_side;
 
+	// Scratch for lane_fronts / lane_fronts_batch.
+	std::vector<int> _lf_lines;
+	std::vector<std::vector<int>> _lf_buckets;
+	std::vector<i64> _lf_first, _lf_fv, _lf_cnt, _lf_mv, _lf_mvv, _lf_fu, _lf_num;
+
+	// Scratch for _apply_load (A8).
+	struct ReadIdx {
+		std::vector<i64> uids;
+		std::vector<int> pos;
+		std::unordered_map<i64, int> big_map;
+		bool use_map = false;
+
+		void reset(const std::vector<i64> &items) {
+			size_t nl = items.size() / 4;
+			uids.clear();
+			pos.clear();
+			big_map.clear();
+			use_map = nl > 32;
+			if (use_map) {
+				big_map.reserve(nl * 2);
+				for (size_t k = 0; k < nl; k++) {
+					big_map.emplace(items[k * 4], -1);
+				}
+			} else {
+				uids.resize(nl);
+				pos.assign(nl, -1);
+				for (size_t k = 0; k < nl; k++) {
+					uids[k] = items[k * 4];
+				}
+			}
+		}
+
+		bool has_uid(i64 u) const {
+			if (use_map) {
+				return big_map.count(u) != 0;
+			}
+			for (size_t k = 0; k < uids.size(); k++) {
+				if (uids[k] == u) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		void set_pos(i64 u, int j) {
+			if (use_map) {
+				auto it = big_map.find(u);
+				if (it != big_map.end()) {
+					it->second = j;
+				}
+				return;
+			}
+			for (size_t k = 0; k < uids.size(); k++) {
+				if (uids[k] == u) {
+					pos[k] = j;
+				}
+			}
+		}
+
+		int find_pos(i64 u) const {
+			if (use_map) {
+				auto it = big_map.find(u);
+				return it == big_map.end() ? -1 : it->second;
+			}
+			for (size_t k = 0; k < uids.size(); k++) {
+				if (uids[k] == u) {
+					return pos[k];
+				}
+			}
+			return -1;
+		}
+	};
+
+	struct LoadScratch {
+		ReadIdx ridx;
+		std::vector<i64> P, before, U, Q, drop, crowded, so_nf;
+		std::vector<int32_t> RV, I, S, V;
+		std::vector<uint8_t> gone_between, fwd_j, kept_f, sp_has_gp, sp_has_dj, so_gone;
+		std::vector<int> between, denied, ahead, keep, sp_front, sp_back, pb_moved, so_order, rb_order;
+		std::vector<i64> sp_gp, sp_dj;
+		std::vector<std::pair<i64, int>> sp_cnt;
+		std::vector<Carried> past, fwd, carry;
+	};
+	LoadScratch _ls;
+
+	// Native bs body decode scratch + splitter input last reads (A7).
+	std::unordered_map<i64, std::vector<i64>> _last_read;
+	std::vector<i64> _bs_sl_buf, _bs_sh_buf, _bs_ew_buf, _bs_pc_buf, _bs_pu_buf, _bs_of_buf, _bs_item_buf;
+	std::unordered_map<i64, std::pair<i64, i64>> _bs_pu_map;
+
 	// --- queue
 	void _enqueue(i64 at_tick, int kind, i64 a, i64 b, i64 c, i64 d, const std::vector<i64> *items);
 	void _apply_queue(i64 now);
@@ -397,20 +512,22 @@ private:
 	std::unordered_set<i64> _fresh;
 	i64 _fresh_tick = -1;
 	static const i64 PACK_SLACK = 8;
-	std::vector<int> _shift_packed(Line *L, std::vector<i64> &P, std::vector<int32_t> &RV,
-			const std::unordered_map<i64, int> &idx, const std::vector<i64> &items, i64 lo, i64 hi);
+	void _shift_packed(Line *L, std::vector<i64> &P, std::vector<int32_t> &RV,
+			const ReadIdx &idx, const std::vector<i64> &items, i64 lo, i64 hi, std::vector<int> &out_between);
 	void _turns_from_read(int o, const std::vector<i64> &items);
-	std::vector<i64> _space_out(std::vector<i64> &U, std::vector<int32_t> &I, std::vector<int32_t> &S,
-			std::vector<i64> &Q, std::vector<int32_t> &V, i64 bound, std::vector<Carried> &past);
-	void _carry_back(int z, std::vector<Carried> ex, int origin);
+	void _space_out(std::vector<i64> &U, std::vector<int32_t> &I, std::vector<int32_t> &S,
+			std::vector<i64> &Q, std::vector<int32_t> &V, i64 bound, std::vector<Carried> &past,
+			std::vector<i64> &out_crowded);
+	void _carry_back(int z, std::vector<Carried> &ex, int origin);
 	int _carry_input(int o);
-	void _carry_forward(int l0, std::vector<Carried> ex);
+	void _carry_forward(int l0, const std::vector<Carried> &ex);
 	bool _forward_split(Splitter *sp, int l0, i64 uid, i64 item, i64 stk, i64 over);
-	std::vector<int> _rescue(int i, Line *L, std::vector<i64> &P, std::vector<int32_t> &RV, const std::unordered_map<i64, int> &idx,
-			const std::vector<i64> &items, i64 lo, i64 hi, std::vector<uint8_t> &skip);
-	std::vector<int> _push_back(Line *L, std::vector<i64> &P, std::vector<int32_t> &RV,
-			const std::unordered_map<i64, int> &idx, const std::vector<i64> &items, i64 lo, i64 hi);
-	i64 _stays_at(const std::vector<i64> &P, const std::unordered_map<int, i64> &gp, int j, i64 lo, i64 hi) const;
+	void _rescue(int i, Line *L, std::vector<i64> &P, std::vector<int32_t> &RV, const ReadIdx &idx,
+			const std::vector<i64> &items, i64 lo, i64 hi, std::vector<uint8_t> &skip, std::vector<int> &out_denied);
+	void _push_back(Line *L, std::vector<i64> &P, std::vector<int32_t> &RV,
+			const ReadIdx &idx, const std::vector<i64> &items, i64 lo, i64 hi, std::vector<int> &out_between);
+	i64 _stays_at(const std::vector<i64> &P, const std::vector<uint8_t> &has_gp, const std::vector<i64> &gp, int j,
+			i64 lo, i64 hi) const;
 	void _rebuild(Line *L, std::vector<i64> &U, std::vector<int32_t> &I, std::vector<int32_t> &S,
 			std::vector<i64> &Q, std::vector<int32_t> &V);
 	void _apply_check(i64 key, i64 count, i64 front, i64 back, i64 front_uid, i64 back_uid);
@@ -522,11 +639,16 @@ public:
 	void set_lane_at(i64 at_tick, i64 key, i64 kind, i64 length, i64 step, Vector2i p0, Vector2i pm, Vector2i p1, i64 extra,
 			i64 next_key, bool out_edge);
 	void drop_lane(i64 key);
+	void load_lane_raw(i64 key, i64 at_tick, const i64 *ptr, size_t n);
 	void load_lane(i64 key, i64 at_tick, const PackedInt64Array &items);
 	void check_lane(i64 key, i64 at_tick, i64 count, i64 front, i64 back, i64 front_uid, i64 back_uid);
 	void set_out_edge(i64 key, bool on);
 	void set_wall(i64 key, i64 at_tick, i64 uid, i64 pos);
+	void hold_input_raw(i64 key, i64 at_tick, const std::vector<i64> &items);
 	void hold_input(i64 key, i64 at_tick, const PackedInt64Array &items);
+	Dictionary apply_bs_body(const Variant &sl_v, const Variant &sh_v, const Variant &ew_v, const Variant &pc_v,
+			const Variant &pu_v, const Variant &of_v, i64 msg_tick, Object *lattice_obj, const Dictionary &removed_keys,
+			bool ask_unknown, bool hold, i64 oracle_max);
 	void set_off(i64 unit, bool off, i64 at_tick);
 	void step_to(i64 to_tick);
 	void skip_to(i64 to_tick);
@@ -543,6 +665,8 @@ public:
 	bool leads_on(i64 key);
 	Array items_state();
 	PackedInt32Array lane_fronts(const PackedInt64Array &keys, int speed_of = 0);
+	void lane_fronts_batch(const PackedInt64Array &keys, bool want_nums, int creep_mode,
+			PackedInt32Array &out_fronts, PackedInt32Array &out_nums, PackedInt32Array &out_lane_v);
 	PackedInt32Array lane_tails(const PackedInt64Array &keys, int need);
 	Dictionary stats();
 	void mark_split_holds();
@@ -603,8 +727,21 @@ public:
 	i64 get_n_take_known() const { return n_take_known; }
 	void set_split_wake(bool v) { split_wake = v; }
 	bool get_split_wake() const { return split_wake; }
+	void set_split_wake_r4(bool v) { split_wake_r4 = v; }
+	bool get_split_wake_r4() const { return split_wake_r4; }
 	void set_n_woke(i64 v) { n_woke = v; }
 	i64 get_n_woke() const { return n_woke; }
+	void add_split_hint(i64 unit, i64 side, i64 at_tick, i64 out0, i64 out1, i64 in0, i64 in1);
+	void set_split_hints(bool v) { split_hints = v; }
+	bool get_split_hints() const { return split_hints; }
+	void set_split_reconcile(bool v) { split_reconcile = v; }
+	bool get_split_reconcile() const { return split_reconcile; }
+	void set_n_hint_held(i64 v) { n_hint_held = v; }
+	i64 get_n_hint_held() const { return n_hint_held; }
+	void set_n_hint_steered(i64 v) { n_hint_steered = v; }
+	i64 get_n_hint_steered() const { return n_hint_steered; }
+	void set_n_reconciled(i64 v) { n_reconciled = v; }
+	i64 get_n_reconciled() const { return n_reconciled; }
 	void set_hold_inputs(bool v) { hold_inputs = v; }
 	bool get_hold_inputs() const { return hold_inputs; }
 	void set_dead_walls(bool v) { dead_walls = v; }

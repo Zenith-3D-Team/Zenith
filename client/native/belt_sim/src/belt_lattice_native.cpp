@@ -60,7 +60,11 @@ void BeltLatticeNative::set_lane(i64 key, const PackedInt32Array &meta, const Pa
 // ---------------------------------------------------------------- what the bridge said
 
 void BeltLatticeNative::note_read(i64 key, i64 length, const PackedInt64Array &items) {
-	i64 n = items.size() / 4;
+	note_read_raw(key, length, items.ptr(), (i64)items.size());
+}
+
+void BeltLatticeNative::note_read_raw(i64 key, i64 length, const i64 *it, i64 n_ints) {
+	i64 n = n_ints / 4;
 	Info none;
 	if (n == 0) {
 		info.set(key, none);
@@ -68,7 +72,6 @@ void BeltLatticeNative::note_read(i64 key, i64 length, const PackedInt64Array &i
 		return;
 	}
 	dirty.set(key, true);
-	const i64 *it = items.ptr();
 	i64 item = it[1];
 	i64 front = it[2];
 	bool full = n >= std::max<i64>(1, length / GAP);
@@ -124,9 +127,39 @@ void BeltLatticeNative::drop(i64 key) {
 	info.erase(key);
 	mids.erase(key);
 	moving_since.erase(key);
+	lane_keys.erase(key);
 	dirty.set(key, true);
 	lanes.erase(key);
 	arcs.erase(key);
+}
+
+void BeltLatticeNative::set_cap_anchor(const Vector2 &anchor, bool cam_led, const Vector3 &cam_pos, const Vector3 &cam_dir,
+		const Array &cam_planes, const PackedFloat32Array &sim_d2) {
+	cap_anchor = anchor;
+	cap_anchor_set = true;
+	cap_cam_led = cam_led;
+	cap_cam_pos = cam_pos;
+	cap_cam_dir = cam_dir;
+	cap_cam_planes.clear();
+	cap_cam_planes.reserve((size_t)cam_planes.size());
+	for (int i = 0; i < cam_planes.size(); i++) {
+		cap_cam_planes.push_back((Plane)cam_planes[i]);
+	}
+	if ((int)cap_sim_d2.size() != (int)sim_d2.size()) {
+		cap_sim_dirty = true;
+	}
+	cap_sim_d2.resize((size_t)sim_d2.size());
+	if (!cap_sim_d2.empty()) {
+		memcpy(cap_sim_d2.data(), sim_d2.ptr(), cap_sim_d2.size() * sizeof(float));
+	}
+}
+
+void BeltLatticeNative::set_lod_bands(bool split, const Vector3 &anchor, double d1, double d2, const Vector2 &jit) {
+	lod_split = split;
+	lod_anchor = anchor;
+	lod_d1 = d1;
+	lod_d2 = d2;
+	lod_jit = jit;
 }
 
 // ---------------------------------------------------------------- the update
@@ -163,15 +196,21 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 	added_keys.clear();
 	// Which lanes to draw: all again when the planned ground or the look changed, else only those the
 	// bridge said something about.
-	bool replan = full || view_all != planned_all || !planned_any || (!view_all && !planned.encloses(view)) || model_cap != planned_cap;
+	double keep = tight_cull ? std::clamp((double)std::max(view.size.x, view.size.y) * 0.15, 2.0, 8.0) : (double)VIEW_KEEP;
+	bool shrunk = tight_cull && !view_all && planned_any
+			&& ((double)planned.size.x > (double)view.size.x + 2.0 * keep + 6.0
+					|| (double)planned.size.y > (double)view.size.y + 2.0 * keep + 6.0);
+	bool replan = full || view_all != planned_all || !planned_any || (!view_all && (!planned.encloses(view) || shrunk)) || model_cap != planned_cap;
+	int prev_cap = planned_cap;
 	std::vector<i64> look_at;
 	if (replan) {
 		planned_cap = model_cap;
-		planned = view.grow((real_t)VIEW_KEEP);
+		planned = view.grow((real_t)keep);
 		planned_all = view_all;
 		planned_any = true;
 		want.clear();
 		undrawn.clear();
+		lane_keys.clear();
 		look_at = info.key_list();
 		for (i64 key : drawn.key_list()) {
 			if (!info.has(key)) {
@@ -193,6 +232,7 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 		if (item < 0) {
 			want.erase(key);
 			undrawn.erase(key);
+			lane_keys.erase(key);
 		} else {
 			want.set(key, item);
 			check.set(key, true);
@@ -209,10 +249,50 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 		}
 		Lane *ln = *pln;
 		i64 *w = want.get(key);
-		if (w == nullptr || *w != ln->item || ln->kind_key != _kind_key(*w, model_cap)) {
+		if (w == nullptr || *w != ln->item) {
 			_remove(key);
 			if (w != nullptr) {
 				undrawn.set(key, true);
+			}
+		}
+	}
+	cap_round += 1;
+	Vector2 anchor = cap_anchor_set ? cap_anchor : (!view_all ? view.get_center() : Vector2());
+	bool cap_moved = replan || model_cap != prev_cap || cap_sim_dirty || undrawn.size() > 0 || cap_round >= CAP_EVERY
+			|| (model_cap > 0 && model_cap_near && (cap_cam_led != capped_cam
+					|| (cap_cam_led && ((double)cap_cam_pos.distance_squared_to(capped_cam_pos) > CAM_STEP * CAM_STEP
+							|| (double)cap_cam_dir.dot(capped_cam_dir) < CAM_TURN))
+					|| (!cap_cam_led && (!std::isfinite(capped_anchor.x) || (double)anchor.distance_squared_to(capped_anchor) > CAM_STEP * CAM_STEP))));
+	bool d1_changed = !(lod_d1 == lod_d1_seen || (!std::isfinite(lod_d1) && !std::isfinite(lod_d1_seen)));
+	bool d2_changed = !(lod_d2 == lod_d2_seen || (!std::isfinite(lod_d2) && !std::isfinite(lod_d2_seen)));
+	bool band_moved = replan || lod_split != lod_split_seen || d1_changed || d2_changed
+			|| (lod_split && (!std::isfinite(lod_band_at.x) || (double)lod_anchor.distance_squared_to(lod_band_at) > 16.0));
+	if (cap_moved || band_moved) {
+		if (cap_moved) {
+			cap_round = 0;
+			cap_sim_dirty = false;
+			capped_cam = cap_cam_led;
+			capped_cam_pos = cap_cam_pos;
+			capped_cam_dir = cap_cam_dir;
+			capped_anchor = anchor;
+		}
+		if (band_moved) {
+			lod_split_seen = lod_split;
+			lod_d1_seen = lod_d1;
+			lod_d2_seen = lod_d2;
+			lod_band_at = lod_anchor;
+		}
+		_plan_lane_keys(model_cap, anchor, check);
+	} else {
+		for (i64 key_u : undrawn.key_list()) {
+			i64 *w_u = want.get(key_u);
+			if (w_u != nullptr && lane_keys.find(key_u) == lane_keys.end()) {
+				auto lf_u = lanes.find(key_u);
+				if (lf_u != lanes.end()) {
+					Vector2 mid_u = _lane_mid(key_u, lf_u->second.m);
+					lane_keys[key_u] = _compute_lane_key(key_u, *w_u, mid_u, height, model_cap, true);
+					check.set(key_u, true);
+				}
 			}
 		}
 	}
@@ -233,24 +313,15 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 			keys.push_back(key);
 		}
 	}
-	PackedInt32Array fronts;
+	PackedInt32Array fronts, nums, lane_v;
 	if (keys.size() > 0 && sim != nullptr) {
-		fronts = sim->lane_fronts(keys);
-	}
-	// (turn_id) Each lane's front item's number.
-	PackedInt32Array nums;
-	if (turn_id && item_turns && keys.size() > 0 && sim != nullptr) {
-		nums = sim->lane_fronts(keys, 3);
+		sim->lane_fronts_batch(keys, turn_id && item_turns, (creep || creep_step) ? (creep_flow || creep_step ? 2 : 1) : 0,
+				fronts, nums, lane_v);
 	}
 	// (tail) Whether a packed block's tail has gone onto each lane, nothing close behind it.
 	PackedInt32Array tails;
 	if (tail && keys.size() > 0 && sim != nullptr) {
 		tails = sim->lane_tails(keys, (int)TAIL_NEED);
-	}
-	// (creep) The speed most of each lane's items move at.
-	PackedInt32Array lane_v;
-	if ((creep || creep_step) && keys.size() > 0 && sim != nullptr) {
-		lane_v = sim->lane_fronts(keys, creep_flow || creep_step ? 2 : 1);
 	}
 	// (mask_open) The simulation's front item on each lane it has one on: where its items are.
 	std::unordered_map<i64, i64> front_at;
@@ -292,11 +363,24 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 	for (int q = 0; q < nk; q++) {
 		i64 key = keys[q];
 		i64 item = *want.get(key);
-		i64 kk = _kind_key(item, model_cap);
-		auto lk = known.find(kk);
+		Lane **pln_k = drawn.get(key);
+		Lane *ln_k = pln_k == nullptr ? nullptr : *pln_k;
+		i64 kk;
+		if (ln_k != nullptr) {
+			kk = ln_k->kind_key;
+		} else {
+			auto lkf = lane_keys.find(key);
+			kk = lkf != lane_keys.end() ? lkf->second : _kind_key(item, model_cap);
+		}
+		i64 lk_id = look_key(kk);
+		auto lk = known.find(lk_id);
 		if (lk == known.end()) {
-			unknown.set(kk, true);
+			unknown.set(lk_id, true);
 			continue;
+		}
+		if (ln_k == nullptr && kk >= 0 && !lk->second.turns && band_of(kk) > 0) {
+			kk = item;
+			lane_keys[key] = kk;
 		}
 		auto lf = lanes.find(key);
 		if (lf == lanes.end()) {
@@ -306,8 +390,7 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 		i64 f = fr[q * 3];
 		i64 v = fr[q * 3 + 1];
 		bool has = fr[q * 3 + 2] > 0;
-		Lane **pln = drawn.get(key);
-		Lane *ln = pln == nullptr ? nullptr : *pln;
+		Lane *ln = ln_k;
 		bool wl = world && (m[0] == STRAIGHT || m[0] == UG_VISIBLE || (world_all && (m[0] == CURVE || m[0] == SPLIT_IN || m[0] == SPLIT_OUT)));
 		// (standing_obs: the game's front on the lane at its last read or check, -1 none.)
 		i64 obs = standing_obs ? _obs_front(key) : -1;
@@ -589,7 +672,43 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 		}
 		_write_lane(key, ln, m, lk->second, st);
 	}
+	for (i64 key : drawn.key_list()) {
+		Lane **pln_r = drawn.get(key);
+		if (pln_r == nullptr) {
+			continue;
+		}
+		Lane *ln = *pln_r;
+		auto lkf = lane_keys.find(key);
+		i64 target_kk = lkf != lane_keys.end() ? lkf->second : ln->kind_key;
+		if (target_kk == ln->kind_key) {
+			continue;
+		}
+		i64 lk_id = look_key(target_kk);
+		auto lk = known.find(lk_id);
+		if (lk == known.end()) {
+			unknown.set(lk_id, true);
+			continue;
+		}
+		if (target_kk >= 0 && !lk->second.turns && band_of(target_kk) > 0) {
+			target_kk = ln->item;
+			lane_keys[key] = target_kk;
+			if (target_kk == ln->kind_key) {
+				continue;
+			}
+		}
+		auto lf = lanes.find(key);
+		if (lf == lanes.end()) {
+			continue;
+		}
+		_rekey_lane(key, ln, target_kk);
+		_write_lane(key, ln, lf->second.m, lk->second, ln->stack);
+	}
 	_open_ends(front_at, tick);
+	if (tight_cull) {
+		for (i64 kk : kinds.key_list()) {
+			_compact_kind(kk, *kinds.get(kk));
+		}
+	}
 	for (i64 kk : kinds.key_list()) {
 		LKind *kd = *kinds.get(kk);
 		Vector3i told(kd->base, kd->top, kd->cap);
@@ -611,12 +730,24 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 	}
 	res["unknown"] = unk;
 	res["pages"] = records.take_pages();
-	if (mask_dirty) {
-		mask_dirty = false;
-		res["mask"] = mask;
-	} else {
-		res["mask"] = Variant();
+	Array dirty_tiles;
+	bool send_all = false;
+	if (mask_dirty_bits != 0 && mask_init) {
+		send_all = !mask_sent_all || !mask_tiled;
+		mask_sent_all = true;
+		uint32_t bits = send_all ? 0xFFFFu : mask_dirty_bits;
+		mask_dirty_bits = 0;
+		for (i64 ti = 0; ti < MASK_TILES; ti++) {
+			if ((bits & (1u << ti)) != 0) {
+				Array e;
+				e.push_back(ti);
+				e.push_back(mask_tiles[ti]);
+				dirty_tiles.push_back(e);
+			}
+		}
 	}
+	res["mask_tiles"] = dirty_tiles;
+	res["mask_all"] = send_all;
 	lanes_n = (i64)drawn.size();
 	slots_n = 0;
 	for (LKind *kd : kinds.val_list()) {
@@ -683,7 +814,7 @@ void BeltLatticeNative::_open_ends(const std::unordered_map<i64, i64> &front_at,
 			ln->open = o;
 			_mark(key, ln);
 		}
-		auto lk = known.find(ln->kind_key);
+		auto lk = known.find(look_key(ln->kind_key));
 		if (lk != known.end()) {
 			_write_lane(key, ln, lf->second.m, lk->second, ln->stack);
 		}
@@ -729,20 +860,201 @@ i64 BeltLatticeNative::_wanted(i64 key) {
 		return -1;
 	}
 	if (!planned_all) {
-		Vector2 mid;
-		auto mf = mids.find(key);
-		if (mf != mids.end()) {
-			mid = mf->second;
-		} else {
-			Vector4 p = _point(key, (double)lf->second.m[1] * 0.5);
-			mid = Vector2(p.x, p.z);
-			mids[key] = mid;
-		}
+		Vector2 mid = _lane_mid(key, lf->second.m);
 		if (!planned.has_point(mid)) {
 			return -1;
 		}
 	}
 	return e->item;
+}
+
+Vector2 BeltLatticeNative::_lane_mid(i64 key, const int32_t *m) {
+	auto mf = mids.find(key);
+	if (mf != mids.end()) {
+		return mf->second;
+	}
+	Vector4 p = _point(key, (double)m[1] * 0.5);
+	Vector2 mid((real_t)p.x, (real_t)p.z);
+	mids[key] = mid;
+	return mid;
+}
+
+double BeltLatticeNative::_view_dist_sq(const Vector3 &p, const Vector3 &cpos, const std::vector<Plane> &planes, double margin) {
+	for (const Plane &pl : planes) {
+		if ((double)pl.distance_to(p) > margin) {
+			return INFINITY;
+		}
+	}
+	return (double)cpos.distance_squared_to(p);
+}
+
+i64 BeltLatticeNative::_compute_lane_key(i64 key, i64 item, const Vector2 &mid, double h, int /*model_cap*/, bool is_3d) {
+	if (!is_3d) {
+		return -item - 1;
+	}
+	if (!lod_split) {
+		return item;
+	}
+	auto lk = known.find(item);
+	if (lk != known.end() && !lk->second.turns) {
+		return item;
+	}
+	Lane *const *pln = drawn.get(key);
+	int cur_band = (pln != nullptr && (*pln)->kind_key >= 0) ? band_of((*pln)->kind_key) : -1;
+	double d = (double)Vector3((real_t)mid.x, (real_t)h, (real_t)mid.y).distance_to(lod_anchor);
+	return band_key(item, band_for_dist(key, d, lod_d1, lod_d2, lod_jit, cur_band));
+}
+
+void BeltLatticeNative::_plan_lane_keys(int model_cap, const Vector2 &anchor, Ordered<i64, bool> &check) {
+	cap_3d_slots = 0;
+	cap_eligible_slots = 0;
+	cap_limit_d2 = INFINITY;
+	if (model_cap == 0 || (model_cap > 0 && !model_cap_near)) {
+		cap_limit_d2 = -1.0;
+		for (i64 key : want.key_list()) {
+			i64 item = *want.get(key);
+			auto lk = known.find(item);
+			bool icon_only = lk != known.end() && !lk->second.turns;
+			if (!icon_only) {
+				auto lf = lanes.find(key);
+				if (lf != lanes.end()) {
+					cap_eligible_slots += std::max<i64>(1, (i64)std::ceil((double)lf->second.m[1] / (double)GAP)) * _stack_of(key);
+				}
+			}
+			i64 target = icon_only ? item : (-item - 1);
+			lane_keys[key] = target;
+			Lane **pln = drawn.get(key);
+			if (pln != nullptr && (*pln)->kind_key != target) {
+				check.set(key, true);
+			}
+		}
+		return;
+	}
+	if (model_cap < 0) {
+		for (i64 key : want.key_list()) {
+			i64 item = *want.get(key);
+			auto lf = lanes.find(key);
+			if (lf == lanes.end()) {
+				continue;
+			}
+			auto lk = known.find(item);
+			bool icon_only = lk != known.end() && !lk->second.turns;
+			if (!icon_only) {
+				i64 sl = std::max<i64>(1, (i64)std::ceil((double)lf->second.m[1] / (double)GAP)) * _stack_of(key);
+				cap_eligible_slots += sl;
+				cap_3d_slots += sl;
+			}
+			Vector2 mid = _lane_mid(key, lf->second.m);
+			i64 target = _compute_lane_key(key, item, mid, height, model_cap, true);
+			lane_keys[key] = target;
+			Lane **pln = drawn.get(key);
+			if (pln != nullptr && (*pln)->kind_key != target) {
+				check.set(key, true);
+			}
+		}
+		return;
+	}
+	struct LatCand {
+		double d2;
+		i64 key;
+		i64 item;
+		Vector2 mid;
+		int sl;
+		bool was_3d;
+	};
+	std::vector<LatCand> cands;
+	cands.reserve(want.size());
+	for (i64 key : want.key_list()) {
+		auto lf = lanes.find(key);
+		if (lf == lanes.end()) {
+			continue;
+		}
+		i64 item = *want.get(key);
+		Vector2 mid = _lane_mid(key, lf->second.m);
+		auto lk = known.find(item);
+		if (lk != known.end() && !lk->second.turns) {
+			lane_keys[key] = item;
+			continue;
+		}
+		int sl = (int)std::max<i64>(1, (i64)std::ceil((double)lf->second.m[1] / (double)GAP)) * _stack_of(key);
+		cap_eligible_slots += sl;
+		Lane **pln = drawn.get(key);
+		bool was_3d = pln != nullptr && (*pln)->kind_key >= 0;
+		double d2 = cap_cam_led
+				? _view_dist_sq(Vector3((real_t)mid.x, (real_t)height, (real_t)mid.y), cap_cam_pos, cap_cam_planes,
+						CAM_MARGIN + (was_3d ? CAP_SLACK : 0.0))
+				: (double)anchor.distance_squared_to(mid);
+		cands.push_back(LatCand{ d2, key, item, mid, sl, was_3d });
+	}
+	std::sort(cands.begin(), cands.end(), [](const LatCand &a, const LatCand &b) { return a.d2 < b.d2; });
+	size_t li = 0;
+	size_t si = 0;
+	i64 used = 0;
+	double limit_d2 = -1.0;
+	bool all_within = true;
+	while (li < cands.size() || si < cap_sim_d2.size()) {
+		double cand_d2 = li < cands.size() ? cands[li].d2 : INFINITY;
+		if (!std::isfinite(cand_d2) && si >= cap_sim_d2.size()) {
+			break;
+		}
+		bool take_lat = si >= cap_sim_d2.size() || (li < cands.size() && cand_d2 <= (double)cap_sim_d2[si]);
+		if (take_lat) {
+			if (!std::isfinite(cand_d2)) {
+				all_within = false;
+				break;
+			}
+			if (used < (i64)model_cap) {
+				used += cands[li].sl;
+				limit_d2 = cand_d2;
+				li++;
+			} else {
+				all_within = false;
+				break;
+			}
+		} else {
+			if (used < (i64)model_cap) {
+				used += 1;
+				limit_d2 = (double)cap_sim_d2[si];
+				si++;
+			} else {
+				all_within = false;
+				break;
+			}
+		}
+	}
+	if (all_within) {
+		limit_d2 = INFINITY;
+	}
+	cap_limit_d2 = limit_d2;
+	double keep_d2 = (!std::isfinite(limit_d2) || limit_d2 < 0.0) ? limit_d2 : std::pow(std::sqrt(limit_d2) + CAP_SLACK, 2.0);
+	for (const LatCand &e : cands) {
+		bool want_3d = std::isfinite(e.d2) && e.d2 <= (e.was_3d ? keep_d2 : limit_d2);
+		if (want_3d) {
+			cap_3d_slots += e.sl;
+		}
+		i64 target = _compute_lane_key(e.key, e.item, e.mid, height, model_cap, want_3d);
+		lane_keys[e.key] = target;
+		Lane **pln = drawn.get(e.key);
+		if (pln != nullptr && (*pln)->kind_key != target) {
+			check.set(e.key, true);
+		}
+	}
+}
+
+void BeltLatticeNative::_rekey_lane(i64 key, Lane *ln, i64 new_kk) {
+	LKind **pkd = kinds.get(ln->kind_key);
+	LKind *kd = pkd == nullptr ? nullptr : *pkd;
+	for (size_t i = 0; i < ln->slots.size(); i++) {
+		if (kd != nullptr) {
+			records.hide(kd->base + ln->slots[i]);
+			kd->free.push_back(ln->slots[i]);
+		}
+		if ((i64)i % ln->stack == 0) {
+			dump_gone.push_back(_uid(key, (i64)i / ln->stack));
+		}
+	}
+	ln->slots.clear();
+	ln->kind_key = new_kk;
 }
 
 bool BeltLatticeNative::_drawn_kind(int kind) {
@@ -1348,6 +1660,55 @@ void BeltLatticeNative::_drop_slot(i64 key, Lane *ln, LKind *kd) {
 	ln->slots.resize((size_t)i);
 }
 
+void BeltLatticeNative::_compact_kind(i64 kk, LKind *kd) {
+	if (kd == nullptr || kd->base < 0 || kd->top <= 0 || kd->free.empty()) {
+		return;
+	}
+	int live = 0;
+	std::vector<Lane *> owned;
+	for (Lane *ln : drawn.val_list()) {
+		if (ln->kind_key == kk && !ln->slots.empty()) {
+			live += (int)ln->slots.size();
+			owned.push_back(ln);
+		}
+	}
+	if (live > 0 && (kd->free.size() <= 16 || kd->free.size() * 2 <= (size_t)kd->top)) {
+		return;
+	}
+	int old_top = kd->top;
+	if (live == 0) {
+		for (int i = 0; i < old_top; i++) {
+			records.hide(kd->base + i);
+		}
+		kd->top = 0;
+		kd->free.clear();
+		return;
+	}
+	std::vector<float> tmp((size_t)live * FLOATS);
+	const float *src = records.data.data();
+	int next = 0;
+	for (Lane *ln : owned) {
+		int st = std::max(ln->stack, 1);
+		for (size_t i = 0; i < ln->slots.size(); i++) {
+			int s_old = ln->slots[i];
+			std::copy_n(src + (size_t)(kd->base + s_old) * FLOATS, FLOATS, tmp.data() + (size_t)next * FLOATS);
+			int j = (int)(i % (size_t)st);
+			if (j > 0) {
+				tmp[(size_t)next * FLOATS + 12] = (float)(-j);
+			}
+			ln->slots[i] = next;
+			next++;
+		}
+	}
+	std::copy_n(tmp.data(), (size_t)live * FLOATS, records.data.data() + (size_t)kd->base * FLOATS);
+	for (int i = live; i < old_top; i++) {
+		records.hide(kd->base + i);
+	}
+	records.mark_range(kd->base, old_top);
+	kd->top = live;
+	kd->free.clear();
+}
+
 // A lane's exit and entry and the way items go there.
 BeltLatticeNative::Ends BeltLatticeNative::_ends(i64 key, i64 length) const {
 	Ends e;
@@ -1405,8 +1766,11 @@ Vector4 BeltLatticeNative::_point(i64 key, double pos) const {
 
 // The mask's cells along a lane's centre line (sampled every 1/32 tile).
 void BeltLatticeNative::_mark(i64 key, Lane *ln) {
-	if (mask.is_null()) {
-		mask = Image::create(MASK, MASK, false, Image::FORMAT_R8);
+	if (!mask_init) {
+		for (i64 ti = 0; ti < MASK_TILES; ti++) {
+			mask_tiles[ti] = Image::create(MASK_TILE, MASK_TILE, false, Image::FORMAT_R8);
+		}
+		mask_init = true;
 		mask_n.assign((size_t)(MASK * MASK), 0);
 	}
 	auto lf = lanes.find(key);
@@ -1447,8 +1811,9 @@ void BeltLatticeNative::_mark(i64 key, Lane *ln) {
 			mask_n[(size_t)c] += 1;
 		}
 		if (mask_n[(size_t)c] == 1) {
-			mask->set_pixel((int32_t)cx, (int32_t)cz, Color(1.0f, 0.0f, 0.0f));
-			mask_dirty = true;
+			i64 ti = (cz >> 9) * 4 + (cx >> 9);
+			mask_tiles[ti]->set_pixel((int32_t)(cx & 511), (int32_t)(cz & 511), Color(1.0f, 0.0f, 0.0f));
+			mask_dirty_bits |= (1u << ti);
 		}
 	}
 }
@@ -1458,8 +1823,11 @@ void BeltLatticeNative::_unmark(Lane *ln) {
 		if (mask_n[(size_t)c] > 0) {
 			mask_n[(size_t)c] -= 1;
 			if (mask_n[(size_t)c] == 0) {
-				mask->set_pixel(c % MASK, c / MASK, Color(0.0f, 0.0f, 0.0f));
-				mask_dirty = true;
+				int cx = c % MASK;
+				int cz = c / MASK;
+				int ti = (cz >> 9) * 4 + (cx >> 9);
+				mask_tiles[ti]->set_pixel((int32_t)(cx & 511), (int32_t)(cz & 511), Color(0.0f, 0.0f, 0.0f));
+				mask_dirty_bits |= (1u << ti);
 			}
 		}
 	}
@@ -1474,6 +1842,10 @@ PackedInt64Array BeltLatticeNative::clear() {
 		_remove(key);
 	}
 	feeds.clear();
+	lane_keys.clear();
+	cap_3d_slots = 0;
+	cap_eligible_slots = 0;
+	cap_limit_d2 = INFINITY;
 	return to_packed<PackedInt64Array>(dump_gone);
 }
 
@@ -1655,7 +2027,16 @@ void BeltLatticeNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_item_turns", "on"), &BeltLatticeNative::set_item_turns);
 	ClassDB::bind_method(D_METHOD("set_turn_id", "on"), &BeltLatticeNative::set_turn_id);
 	ClassDB::bind_method(D_METHOD("set_edge_shut", "on"), &BeltLatticeNative::set_edge_shut);
+	ClassDB::bind_method(D_METHOD("set_mask_tiled", "on"), &BeltLatticeNative::set_mask_tiled);
+	ClassDB::bind_method(D_METHOD("set_tight_cull", "on"), &BeltLatticeNative::set_tight_cull);
 	ClassDB::bind_method(D_METHOD("set_shown", "t"), &BeltLatticeNative::set_shown);
+	ClassDB::bind_method(D_METHOD("set_model_cap_near", "on"), &BeltLatticeNative::set_model_cap_near);
+	ClassDB::bind_method(D_METHOD("set_cap_anchor", "anchor", "cam_led", "cam_pos", "cam_dir", "cam_planes", "sim_d2"),
+			&BeltLatticeNative::set_cap_anchor);
+	ClassDB::bind_method(D_METHOD("set_lod_bands", "split", "anchor", "d1", "d2", "jit"), &BeltLatticeNative::set_lod_bands);
+	ClassDB::bind_method(D_METHOD("get_cap_3d_slots"), &BeltLatticeNative::get_cap_3d_slots);
+	ClassDB::bind_method(D_METHOD("get_cap_eligible_slots"), &BeltLatticeNative::get_cap_eligible_slots);
+	ClassDB::bind_method(D_METHOD("get_cap_limit_d2"), &BeltLatticeNative::get_cap_limit_d2);
 	ClassDB::bind_method(D_METHOD("set_lane", "key", "meta", "arc"), &BeltLatticeNative::set_lane);
 	ClassDB::bind_method(D_METHOD("note_read", "key", "length", "items"), &BeltLatticeNative::note_read);
 	ClassDB::bind_method(D_METHOD("note_check", "key", "length", "count", "front", "back"), &BeltLatticeNative::note_check);

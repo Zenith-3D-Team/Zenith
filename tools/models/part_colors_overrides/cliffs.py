@@ -11,6 +11,11 @@ but the crest.
 SOFT = {"two_tone": "*", "two_tone_blur": 0.3, "cells": [0]}
 
 OVERRIDES = {"cliff-*": dict(SOFT)}
+# Nauvis's variants (`cliff-sides-1`...) take their colours from their plain piece's picture, and the
+# old pieces (`cliff-sides-old`, for --cliff-pieces=old) from theirs.
+for _kind in ("sides", "outer", "inner", "exit", "entrance"):
+    OVERRIDES["cliff-%s-[0-9]" % _kind] = dict(SOFT, entry="cliff-%s" % _kind)
+    OVERRIDES["cliff-%s-old" % _kind] = dict(SOFT, entry="cliff-%s" % _kind)
 OVERRIDES.update({
     # Gleba's roots are thin tubes the sampler rarely finds: the sprite's orange.
     "cliff-gleba-*": dict(SOFT, sprite_colors={"cliff-gleba-flesh-root": "#9a6224"}),

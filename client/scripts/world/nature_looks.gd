@@ -20,10 +20,14 @@ extends RefCounted
 ## --nature-looks=off draws every tree and rock as before (one shape, +-10%); --leaf-atlas=off keeps
 ## the shader's own leaves.
 
+const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
 const LeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
+const Switches := preload("res://scripts/switches.gd")
 const DATA := "res://data/nature_looks.json"
+const CACHE_DIR := "user://tex-cache"
+const CACHE_VERSION := 1
 ## The atlas: patches a side (tools/models/nature/tree_sprites.py ATLAS_CELLS).
 const ATLAS_CELLS := 4
 ## A pixel of the leaves picture counts as a leaf when it is at least this opaque (the picture also
@@ -42,6 +46,11 @@ const GRAIN_BLUR := 4
 static var enabled := true
 static var atlas_enabled := true
 static var grain_enabled := true
+static var disk_cache := Switches.on("--tex-cache")
+static var cache_hits := 0
+static var _cache_stamp := ""
+static var _cache_mutex := Mutex.new()
+static var _cache_dir_made := false
 static var _read := false
 static var _trees := {}
 static var _rocks := {}
@@ -65,7 +74,7 @@ static func _load() -> void:
 	if _read:
 		return
 	_read = true
-	for a in OS.get_cmdline_user_args():
+	for a in Switches.args():
 		if a == "--nature-looks=off":
 			enabled = false
 		elif a == "--leaf-atlas=off":
@@ -73,6 +82,14 @@ static func _load() -> void:
 		elif a == "--nature-grain=off":
 			grain_enabled = false
 	var text := FileAccess.get_file_as_string(DATA)
+	var data_dir := ItemIcons.factorio_data_dir()
+	if data_dir != "" and text != "":
+		var info := data_dir.path_join("base/info.json")
+		var fi := FileAccess.open(info, FileAccess.READ)
+		var info_sz := fi.get_length() if fi != null else 0
+		if fi != null:
+			fi.close()
+		_cache_stamp = "%s|%s|%d|%d" % [text.sha256_text().substr(0, 16), info, info_sz, FileAccess.get_modified_time(info)]
 	var parsed = JSON.parse_string(text) if text != "" else null
 	if parsed is Dictionary:
 		var trees = parsed.get("trees")
@@ -306,12 +323,93 @@ static func _poll_grain() -> void:
 	RenderingServer.global_shader_parameter_set("f3d_nature_grain_on", 1.0)
 
 
+static func _image_cache_path(kind: String, key_hash: String) -> String:
+	return CACHE_DIR.path_join("%s-%s.bin" % [kind, key_hash.substr(0, 16)])
+
+
+static func _read_image_cache(path: String, key_hash: String) -> Array:
+	if not disk_cache or key_hash == "" or not FileAccess.file_exists(path):
+		return []
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return []
+	var raw: Variant = f.get_var(false)
+	f.close()
+	if not (raw is Dictionary):
+		return []
+	var d := raw as Dictionary
+	if int(d.get("v", 0)) != CACHE_VERSION or str(d.get("k", "")) != key_hash:
+		return []
+	var raw_imgs: Variant = d.get("imgs")
+	if not (raw_imgs is Array) or (raw_imgs as Array).is_empty():
+		return []
+	var out: Array = []
+	for item in raw_imgs as Array:
+		if not (item is Dictionary):
+			return []
+		var idict := item as Dictionary
+		var w := int(idict.get("w", 0))
+		var h := int(idict.get("h", 0))
+		var fmt := int(idict.get("fmt", -1))
+		var raw_data: Variant = idict.get("data")
+		if w <= 0 or h <= 0 or fmt < 0 or not (raw_data is PackedByteArray):
+			return []
+		var bytes: PackedByteArray = raw_data
+		var img := Image.create_from_data(w, h, bool(idict.get("mip", true)), fmt as Image.Format, bytes)
+		if img == null or img.is_empty():
+			return []
+		out.append(img)
+	_cache_mutex.lock()
+	cache_hits += 1
+	_cache_mutex.unlock()
+	return out
+
+
+static func _write_image_cache(path: String, key_hash: String, imgs: Array) -> void:
+	if not disk_cache or key_hash == "" or imgs.is_empty():
+		return
+	var encoded: Array = []
+	for item in imgs:
+		if not (item is Image) or (item as Image).is_empty():
+			return
+		var im := item as Image
+		encoded.append({
+			"w": im.get_width(), "h": im.get_height(), "fmt": int(im.get_format()),
+			"mip": im.has_mipmaps(), "data": im.get_data(),
+		})
+	_cache_mutex.lock()
+	if not _cache_dir_made:
+		DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(CACHE_DIR))
+		_cache_dir_made = true
+	_cache_mutex.unlock()
+	var tmp := path + ".tmp." + str(OS.get_thread_caller_id())
+	var f := FileAccess.open(tmp, FileAccess.WRITE)
+	if f == null:
+		return
+	f.store_var({"v": CACHE_VERSION, "k": key_hash, "imgs": encoded}, false)
+	var ok := f.get_error() == OK
+	f.close()
+	var abs_tmp := ProjectSettings.globalize_path(tmp)
+	var abs_path := ProjectSettings.globalize_path(path)
+	if not ok or DirAccess.rename_absolute(abs_tmp, abs_path) != OK:
+		if FileAccess.file_exists(tmp):
+			DirAccess.remove_absolute(abs_tmp)
+
+
 ## The grain layers, `size` square each (tree_sprites.py detail_layer does the same in numpy): each
 ## layer's region of its picture, its colour over its own light a few texels round (only the grain:
 ## the model is shaded on its own) at CONTRAST, mirrored out to the layer's size, scaled to a mean of
 ## 1 and halved. All of them or none ([] when a picture is missing). Runs on a worker thread.
 ## `pictures`: file -> Image instead of reading the files (the tests).
 static func grain_layers(layers: Array, size: int, pictures := {}) -> Array:
+	var cache_hash := ""
+	var cache_path := ""
+	if pictures.is_empty() and disk_cache and _cache_stamp != "" and not layers.is_empty():
+		cache_hash = ("%d|grain|%d|%s|%s" % [CACHE_VERSION, size, _cache_stamp, JSON.stringify(layers)]).sha256_text()
+		cache_path = _image_cache_path("nature-grain", cache_hash)
+		var cached := _read_image_cache(cache_path, cache_hash)
+		if cached.size() == layers.size() and not cached.is_empty():
+			return cached
 	var out: Array = []
 	for layer: Dictionary in layers:
 		var file := str(layer.get("file", ""))
@@ -379,6 +477,8 @@ static func grain_layers(layers: Array, size: int, pictures := {}) -> Array:
 		var im := Image.create_from_data(size, size, false, Image.FORMAT_RGBA8, bytes)
 		im.generate_mipmaps()
 		out.append(im)
+	if cache_hash != "" and out.size() == layers.size() and not out.is_empty():
+		_write_image_cache(cache_path, cache_hash, out)
 	return out
 
 
@@ -400,6 +500,14 @@ static func show_atlas(on: bool) -> void:
 ## The leaf atlas for an entry's leaves picture (tree_sprites.py leaf_atlas does the same in numpy,
 ## for the model tools' previews), or null without the picture. Runs on a worker thread.
 static func atlas(leaves: Dictionary, picture: Image = null) -> Image:
+	var cache_hash := ""
+	var cache_path := ""
+	if picture == null and disk_cache and _cache_stamp != "":
+		cache_hash = ("%d|atlas|%d|%s|%s" % [CACHE_VERSION, ATLAS_CELLS, _cache_stamp, JSON.stringify(leaves)]).sha256_text()
+		cache_path = _image_cache_path("nature-atlas", cache_hash)
+		var cached := _read_image_cache(cache_path, cache_hash)
+		if cached.size() == 1:
+			return cached[0]
 	var src := picture if picture != null else ModFiles.load_image(str(leaves.get("file", "")))
 	if src == null:
 		return null
@@ -485,6 +593,8 @@ static func atlas(leaves: Dictionary, picture: Image = null) -> Image:
 		bytes[t * 4 + 3] = clampi(roundi(alpha[t] * 255.0), 0, 255)
 	var out := Image.create_from_data(size, size, false, Image.FORMAT_RGBA8, bytes)
 	out.generate_mipmaps()
+	if cache_hash != "" and out != null and not out.is_empty():
+		_write_image_cache(cache_path, cache_hash, [out])
 	return out
 
 

@@ -21,6 +21,8 @@ extends RefCounted
 ##   character (1.7) the client's own character: its state, gear and moments (addon_character.gd)
 ##   sound     (1.7) its own sounds, and Zenith's replaced or muted by kind (addon_sound.gd)
 ##   game      (1.7) messages to and from a Factorio mod of the add-on's own (addon_game.gd)
+##   weather   (1.8) atmosphere, sky, cloud, wind, and wet/puddle surface overrides (addon_weather.gd)
+##   creatures (1.9) enemy damage/death hooks, ragdoll node/limb helpers, blood puddles, live overrides (addon_creatures.gd)
 
 const AddonLoader := preload("res://scripts/addons/addon_loader.gd")
 const AddonCamera := preload("res://scripts/addons/addon_camera.gd")
@@ -36,16 +38,23 @@ const AddonWorld := preload("res://scripts/addons/addon_world.gd")
 const AddonCharacter := preload("res://scripts/addons/addon_character.gd")
 const AddonSound := preload("res://scripts/addons/addon_sound.gd")
 const AddonGame := preload("res://scripts/addons/addon_game.gd")
+const AddonWeather := preload("res://scripts/addons/addon_weather.gd")
+const AddonCreatures := preload("res://scripts/addons/addon_creatures.gd")
+const NativeLibrary := preload("res://scripts/native_library.gd")
+const NATIVE_CLASSES := ["BiterRagdollNative", "BiterGoreNative", "AcidGooNative", "BiterAnimNative"]
 
 ## A game started (the world is being received) or ended (back to the menu).
 signal game_started
 signal game_ended
+## (1.92) The game set a filmed scene's cue (a mod's remote.call("zenith", "set_cue", tick)): the new
+## cue tick, -1 when cleared. api.world.cue_tick() returns it from then on.
+signal cue_changed(tick: int)
 
 ## The add-on API this Zenith offers.
 var version := AddonLoader.API_VERSION
 ## The add-on API with its additions within the version (1.1: settings, view.keep_drawing; 1.2:
 ## terrain; 1.3: shaders; 1.6: world.hold_chunks, view.full_detail, view.screenshot; 1.7: character,
-## camera.mode, game, addons, sound). Check it before using a 1.1 call to keep working on a Zenith with 1.0:
+## camera.mode, game, addons, sound; 1.8: weather; 1.9: creatures; 1.91: world.tick, smooth_tick, cue_tick; 1.92: cue_changed, a cue set by the game). Check it before using a newer call to keep working on a Zenith with 1.0:
 ## `if api.get("level") != null and api.level >= 1.1`.
 var level := AddonLoader.API_LEVEL
 ## Zenith's own version, for messages.
@@ -81,6 +90,8 @@ var _character: AddonCharacter
 
 var addons = preload("res://scripts/addons/addon_addons.gd").new(self)  # (1.7) other add-ons: version(id) (addon_addons.gd)
 var game: AddonGame
+var weather: AddonWeather
+var creatures: AddonCreatures
 
 var _host  # addon_host.gd
 
@@ -104,6 +115,8 @@ func _setup(host, manifest: Dictionary) -> void:
 	shaders = AddonShaders.new(host, self)
 	sound = AddonSound.new(host, self)
 	game = AddonGame.new(host, self)
+	weather = AddonWeather.new(host, self)
+	creatures = AddonCreatures.new(host, self)
 
 
 ## Everything the add-on set up through the API, taken away again (it was switched off).
@@ -120,6 +133,8 @@ func _teardown() -> void:
 	shaders.clear()
 	sound._release()
 	game._close_all()
+	weather.clear()
+	creatures.clear()
 	camera._clear_mode()
 	if _character != null:
 		_character._clear()
@@ -147,7 +162,23 @@ func _let_go() -> void:
 	game = null
 	_character = null
 	sound = null
+	weather = null
+	creatures = null
 	_host = null
+
+
+## (1.93) An instance of one of Zenith's native (C++) classes, for an add-on's hot loops: only
+## `BiterRagdollNative`, `BiterGoreNative`, `AcidGooNative` and `BiterAnimNative` are given out; null for any other
+## name, for a class this Zenith's library lacks, where the library is not there (Linux, macOS, ARM64) or
+## `--enemies-native=off`. Main thread only. The add-on keeps its own GDScript for null.
+func native_class(cls: String) -> Object:
+	if cls not in NATIVE_CLASSES:
+		return null
+	if "--enemies-native=off" in OS.get_cmdline_user_args():
+		return null
+	if not NativeLibrary.ensure() or not ClassDB.class_exists(cls):
+		return null
+	return ClassDB.instantiate(cls)
 
 
 ## A game is on (the world may still be arriving).

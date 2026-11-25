@@ -16,8 +16,10 @@ extends RefCounted
 ## frame costs nothing more. Zenith's own belts, Wube's and FUE5's are closed: nothing is found there.
 ## --belt-caps=off leaves the holes (docs/RUNNING.md).
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## On unless --belt-caps=off.
-static var enabled := not ("--belt-caps=off" in OS.get_cmdline_user_args())
+static var enabled := Switches.on("--belt-caps")
 ## Meta on a model's ArrayMesh: how many caps its load added (for tests and the log).
 const META := &"f3d_belt_caps"
 ## A hole is capped only when no side of its box is longer than this (tiles): Vasillo's are 0.131.

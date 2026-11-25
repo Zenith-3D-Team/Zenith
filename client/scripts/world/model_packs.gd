@@ -40,7 +40,8 @@ extends RefCounted
 ## pack.json's "shading" says how the pack's textured materials are drawn (shading()): "pbr" as their
 ## files say (glTF's PBR, as Godot's own material draws it, with the look's fill and metal share on top:
 ## factorio_material.gdshaderinc modeller_tex), "factorio" (or no key) with Zenith's Factorio-style
-## balance as before. Zenith's built-in packs are always "factorio". --pack-shading=factorio, or Settings >
+## balance as before. FUE5, Wube3DP and Placeholders use "pbr" (--fue5-pbr=off / --wube3dp-pbr=off /
+## --placeholder-pbr=off keep them on "factorio"); Factorio stays "factorio". --pack-shading=factorio, or Settings >
 ## Graphics > Advanced > Packs' own shading, Factorio's everywhere, draws every pack the old way (looks.gd).
 ##
 ## A pack may also carry icons that replace Factorio's in Zenith's UI (item_icons.gd asks icon_file()
@@ -60,6 +61,26 @@ extends RefCounted
 ## Factorio's. A pack of sounds alone is a pack too. --pack-sounds=off, or Settings > Sound's
 ## "Sounds from model packs" off, leaves every pack's sounds out (sounds_on).
 ##
+## A pack may carry ground textures too, in place of Factorio's (terrain_textures.gd asks
+## tile_source() first): a `tiles/` folder at its top or one folder down (the models folder's own
+## top `tiles/` is the loose pack's), `<tile-name>.png` (or .webp, .jpg, .jpeg), in subfolders
+## (`tiles/nauvis/grass-1.png`), or numbered variants in a folder named for the tile
+## (`tiles/grass-1/1.png`, `2.png`). Companion `-normal`, `-height`/`-bump`, and `-roughness` maps
+## (e.g. `dirt-1-normal.png`, `dirt-1-height.png`) layer onto Factorio's or the pack's own albedo.
+## Same order and switches as the icons, a choice kept as "tile:<name>"; a pack below the Factorio
+## pack gives only what Factorio and mods lack. Packs carry their authors' own pictures, never
+## Factorio's. A pack of tiles alone is a pack too. --pack-tiles=off, or Settings > Graphics' "Ground
+## textures from model packs" off, leaves them out (tiles_on); --pack-tile-pbr=off disables only the
+## companion PBR maps.
+##
+## A pack may carry decoratives and grass too, in a `decoratives/` folder at its top or one folder
+## down (loose packs use top `decoratives/`): flat ground clutter, upright plants, and 3D raised
+## grass tufts/bushes/carpets (`decoratives.gd`), with variants (`<name>-1.png` or `<name>/1.png`)
+## and optional `pack.json` `"decoratives"` overrides (`scale`, `size`, `shift`, `layer`, `grass`,
+## `grass_height`, `grass_style`, `hide`). Same order and switches as tiles, a choice kept as
+## "decor:<name>". --pack-decoratives=off, or Settings > Graphics' "Decoratives from model packs" off,
+## leaves them out (decor_on).
+##
 ## A pack that holds a copy of any of the install's own files is refused whole, its card red saying
 ## why (pack_check.gd; the owner's rule). A new or changed pack is checked on the worker first and is
 ## not in use until it is clean, the way a zip being unpacked isn't (`checking`); an unchanged one
@@ -77,6 +98,7 @@ const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const PackCheck := preload("res://scripts/world/pack_check.gd")
 const SafeDelete := preload("res://scripts/safe_delete.gd")  # never through a link
+const Switches := preload("res://scripts/switches.gd")
 
 const MODEL_EXTS := ["glb", "gltf"]
 const INFO_FILE := "pack.json"
@@ -91,6 +113,10 @@ const ARG_ID := "arg"
 const BUILTIN_DIR := "res://assets/models/packs/"
 const BUILTIN := ["fue5", "wube3dp", "placeholders", "factorio"]
 const BUILTIN_PREFIX := "builtin:"
+## FUE5's adapted models (built-in top pack in default order).
+const FUE5_ID := "builtin:fue5"
+## Wube's adapted 3D-printable models.
+const WUBE3DP_ID := "builtin:wube3dp"
 ## Zenith's own models from the sprites (once pinned last; it moves and switches like the rest now).
 const LAST_ID := "builtin:placeholders"
 ## The Factorio pack: virtual, its content read from the player's install at run time (nothing of
@@ -115,10 +141,10 @@ const OLD_BUNDLED_FILES := ["default.zip"]
 ## end pieces, poses). ALWAYS_SUFFIXES are taken off whatever is left: an underground's ends and
 ## a cliff's pieces have no model of the bare name.
 const SUFFIXES := ["-straight-vertical-single", "-straight-horizontal", "-corner-down-right", "-straight-vertical",
-	"-corner-down-left", "-corner-up-right", "-corner-up-left", "-ending-right", "-ending-down", "-ending-left",
-	"-curve-right", "-curve-left", "-ending-up", "-t-right", "-t-down", "-t-left", "-sparse", "-attack", "-corpse",
+	"-corner-down-left", "-corner-up-right", "-corner-up-left", "-gate-single-n", "-gate-single-e", "-gate-single-s", "-gate-single-w", "-ending-right", "-ending-down", "-ending-left",
+	"-curve-right", "-curve-left", "-ending-up", "-t-right", "-t-down", "-t-left", "-gate-ns", "-gate-ew", "-gate-n", "-gate-e", "-gate-s", "-gate-w", "-sparse", "-attack", "-corpse",
 	"-window", "-cross", "-pylon", "-start", "-south", "-t-up", "-east", "-west", "-rich", "-fill", "-wet", "-nesw", "-nes", "-nsw",
-	"-esw", "-new", "-end", "-ne", "-nw", "-ns", "-es", "-ew", "-sw", "-n", "-e", "-s", "-w", "-1", "-2", "-3"]
+	"-esw", "-new", "-old", "-end", "-ne", "-nw", "-ns", "-es", "-ew", "-sw", "-n", "-e", "-s", "-w", "-1", "-2", "-3"]
 const ALWAYS_SUFFIXES := ["-entrance", "-output", "-input", "-sides", "-outer", "-inner", "-exit"]
 ## Parts with names of their own that belong to a building's family (the Model packs window lists
 ## them under it, a choice for it takes them too): name prefix -> family. A cargo bay's edge pieces;
@@ -149,12 +175,19 @@ const NUMBERED_FAMILIES := ["iron-ore", "copper-ore", "coal", "stone", "uranium-
 const ORE_SUFFIXES := ["-rich", "-sparse", "-1"]
 ## The prototype index read for NUMBERED_PROTOS.
 const PROTO_INDEX := "res://data/icons.json"
-const COUNT_KEYS := {"models": "count", "items": "item_count", "icons": "icon_count"}
+const COUNT_KEYS := {"models": "count", "items": "item_count", "icons": "icon_count", "tiles": "tile_count", "decoratives": "decor_count"}
 ## How deep a pack's folders are searched for models.
 const MAX_DEPTH := 12
 ## A half-unpacked copy (".part-<process>") older than this, in seconds, was left by a Zenith that
 ## stopped; a newer one may be another Zenith's at work.
 const PART_AGE := 3600
+## --pack-cache-keep=<days>: an unpacked copy of a zip this folder doesn't have (another launcher's, a
+## pack removed) is kept until unused this many days (its USED_SUFFIX stamp, touched whenever a client
+## finds its zip), so switching between launchers doesn't unpack 2 GB again each time; 0 removes it at
+## once, as before. A copy of a zip of the same name in this folder, changed since, goes at once.
+const PACK_CACHE_KEEP_DAYS := 7
+const USED_SUFFIX := ".used"
+static var pack_cache_keep := _keep_days()
 ## How long a worker thread waits for the main thread to take the unpacked packs in (ms).
 const WORKER_WAIT := 60000
 ## A pack's icons: the folder's name, the files read, the choices' key prefix, and kind folders
@@ -167,7 +200,20 @@ const ICON_KIND_ALIASES := {"signal": "virtual-signal"}
 const SOUNDS_DIR := "sounds"
 const SOUND_EXTS := ["ogg"]
 const SOUND_PREFIX := "sound:"
-const NOTHING_IN_IT := "it has no models, icons or sounds in it"
+## A pack's ground tiles: the folder's name, the picture formats read, the choices' key prefix, and
+## how deep under tiles/ folders are walked.
+const TILES_DIR := "tiles"
+const TILE_EXTS := ["png", "webp", "jpg", "jpeg"]
+const TILE_PREFIX := "tile:"
+const TILE_DEPTH := 4
+## A pack's decoratives and grass: the folder's name, formats, choices' key prefix, and walk depth.
+const DECOR_DIR := "decoratives"
+const DECOR_IMAGE_EXTS := ["png", "webp", "jpg", "jpeg"]
+const DECOR_MODEL_EXTS := ["glb", "gltf"]
+const DECOR_EXTS := ["glb", "gltf", "png", "webp", "jpg", "jpeg"]
+const DECOR_PREFIX := "decor:"
+const DECOR_DEPTH := 4
+const NOTHING_IN_IT := "it has no models, icons, sounds, tiles or decoratives in it"
 ## How deep under sounds/ a file may be (<mod>/sound/<folders>/<name>.ogg).
 const SOUND_DEPTH := 8
 
@@ -195,9 +241,33 @@ static var icons_version := 0
 static var sounds_version := 0
 ## Whether packs' sounds are used at all (--pack-sounds=off; Settings > Sound, fx_settings.gd sets it).
 static var sounds_on := arg_on("--pack-sounds")
+## Goes up whenever the ground tiles in use may have changed (the order, a switch, a "tile:" choice,
+## tiles_on, tile_pbr_on): terrain_textures.gd drops and reloads its layers on it.
+static var tiles_version := 0
+## Whether packs' ground textures are used at all (--pack-tiles=off; Settings > Graphics sets it).
+static var tiles_on := arg_on("--pack-tiles")
+## Whether companion -normal / -height / -roughness maps in tiles/ are used (--pack-tile-pbr=off).
+static var tile_pbr_on := arg_on("--pack-tile-pbr")
+## Goes up whenever the decoratives in use may have changed (the order, a switch, a "decor:" choice,
+## decor_on): decoratives.gd drops and reloads its pictures and 3D grass on it.
+static var decor_version := 0
+## Whether packs' decoratives and grass are used at all (--pack-decoratives=off; Settings > Graphics sets it).
+static var decor_on := arg_on("--pack-decoratives")
+## Whether 3D decorative models (.glb/.gltf in decoratives/) are used (--decor-models=off; Settings > Graphics sets it).
+static var decor_models_on := arg_on("--decor-models")
+## --fue5-pbr=off: draw FUE5 with Factorio shading instead of its pack.json PBR shading.
+static var fue5_pbr := Switches.on("--fue5-pbr")
+## --wube3dp-pbr=off: draw Wube3DP with Factorio shading instead of its pack.json PBR shading.
+static var wube3dp_pbr := Switches.on("--wube3dp-pbr")
+## --placeholder-pbr=off: draw Placeholders with Factorio shading instead of its pack.json PBR shading.
+static var placeholder_pbr := Switches.on("--placeholder-pbr")
 ## The packs chosen for model families whatever the order (the Model packs window): family -> pack
 ## id. Replaced, never changed in place (read on workers); set_choices().
 static var choices := {}
+## Per-pack and per-model PBR shading overrides set in the Model packs window
+## (settings.cfg [model_packs] pbr_packs / pbr_models). Replaced wholesale, never changed in place.
+static var pbr_packs := {}  # canonical pack id -> bool (true: "pbr", false: "factorio")
+static var pbr_models := {}  # "<canonical pack id>|<family or item:<name>>" -> bool
 static var _active: Array = []  # the packs models are taken from, in order: on, read, unpacked
 static var _names := {}  # every model name any pack has (family() reads it on workers): replaced, not changed
 ## Factorio's prototypes whose names end in a number (variant_base leaves them alone): name -> true.
@@ -242,7 +312,10 @@ static func configure(dir: String, order: Array, off: Array, extra := "", extra_
 		if not job.is_empty():
 			jobs.append(job)
 	var keep := {}
+	var here := {}  # the zip names of every zip in the folder, refused or not (_stale_copies)
 	for p: Dictionary in packs:
+		if p["kind"] == "zip" and p.has("cache"):
+			here[_copy_zip_name(str(p["cache"]).get_file())] = true
 		if p["kind"] != "zip" or p["problem"] != "":
 			continue
 		var cache := str(p["cache"])
@@ -253,10 +326,17 @@ static func configure(dir: String, order: Array, off: Array, extra := "", extra_
 		var models: Dictionary = _index(cache, MAX_DEPTH, items) if DirAccess.dir_exists_absolute(cache) else {}
 		var icons: Dictionary = _index_icons(cache, 1) if DirAccess.dir_exists_absolute(cache) else {}
 		var sounds: Dictionary = _index_sounds(cache, 1) if DirAccess.dir_exists_absolute(cache) else {}
-		if not models.is_empty() or not items.is_empty() or not icons.is_empty() or not sounds.is_empty():
+		var tile_maps := {}
+		var tiles: Dictionary = _index_tiles(cache, 1, tile_maps) if DirAccess.dir_exists_absolute(cache) else {}
+		var decor: Dictionary = _index_decoratives(cache, 1) if DirAccess.dir_exists_absolute(cache) else {}
+		if not models.is_empty() or not items.is_empty() or not icons.is_empty() or not sounds.is_empty() \
+				or not tiles.is_empty() or not tile_maps.is_empty() or not decor.is_empty() \
+				or (DirAccess.dir_exists_absolute(cache) and _has_decor_hide(p.get("info", {}))):
 			_take_models(p, models, items)
 			_take_icons(p, icons)
 			_take_sounds(p, sounds)
+			_take_tiles(p, tiles, tile_maps)
+			_take_decoratives(p, decor)
 			if bool(p["checking"]):
 				jobs.append({"id": p["id"], "files": PackCheck.pack_files(cache), "check": p["check_stamp"], "install": install,
 					"install_stamp": install_stamp})
@@ -269,7 +349,9 @@ static func configure(dir: String, order: Array, off: Array, extra := "", extra_
 			push_warning(refusal_line(p))
 		elif p["problem"] != "":
 			push_warning("[models] %s (%s) left out: %s" % [p["title"], where(p), p["problem"]])
-	var stale: Array = _stale_copies(keep) if models_dir != "" else []
+	var stale: Array = _stale_copies(keep, here) if models_dir != "" else []
+	for name: String in keep:
+		_touch_used(name)
 	for job: Dictionary in jobs:
 		if job.has("zip") and DirAccess.dir_exists_absolute(str(job["cache"])):
 			stale.append(job["cache"])  # a copy emptied since: unpacked again
@@ -341,30 +423,44 @@ static func scan(dir: String) -> Array:
 			_walk(dir.path_join(sub), 1, MAX_DEPTH, loose_items, null)
 	var loose_icons := _index_icons(dir, 0)
 	var loose_sounds := _index_sounds(dir, 0)
-	if not loose.is_empty() or not loose_items.is_empty() or not loose_icons.is_empty() or not loose_sounds.is_empty():
+	var loose_tile_maps := {}
+	var loose_tiles := _index_tiles(dir, 0, loose_tile_maps)
+	var loose_decor := _index_decoratives(dir, 0)
+	var loose_info := _read_info(dir, 0)
+	if not loose.is_empty() or not loose_items.is_empty() or not loose_icons.is_empty() or not loose_sounds.is_empty() \
+			or not loose_tiles.is_empty() or not loose_tile_maps.is_empty() or not loose_decor.is_empty() or _has_decor_hide(loose_info):
 		var p := _pack(LOOSE_ID, "loose", "Loose models", dir, dir, loose)
 		_take_models(p, loose, _ranked(loose_items))
 		_take_icons(p, loose_icons)
 		_take_sounds(p, loose_sounds)
-		_take_info(p, _read_info(dir, 0))
+		_take_tiles(p, loose_tiles, loose_tile_maps)
+		_take_decoratives(p, loose_decor)
+		_take_info(p, loose_info)
 		out.append(p)
 	var subs := Array(DirAccess.get_directories_at(dir))
 	subs.sort_custom(func(a: String, b: String) -> bool: return a.naturalnocasecmp_to(b) < 0)
 	for sub: String in subs:
-		if sub.begins_with(".") or sub == "__MACOSX" or sub.to_lower() in [ICONS_DIR, ITEMS_DIR, SOUNDS_DIR]:
-			continue  # the folder's own icons/, items/ and sounds/ are the loose pack's
+		if sub.begins_with(".") or sub == "__MACOSX" or sub.to_lower() in [ICONS_DIR, ITEMS_DIR, SOUNDS_DIR, TILES_DIR, DECOR_DIR]:
+			continue  # the folder's own icons/, items/, sounds/, tiles/ and decoratives/ are the loose pack's
 		var root := dir.path_join(sub)
 		var items := {}
 		var models := _index(root, MAX_DEPTH, items)
 		var icons := _index_icons(root, 1)
 		var sounds := _index_sounds(root, 1)
-		if models.is_empty() and items.is_empty() and icons.is_empty() and sounds.is_empty():
+		var tile_maps := {}
+		var tiles := _index_tiles(root, 1, tile_maps)
+		var decor := _index_decoratives(root, 1)
+		var info := _read_info(root, 1)
+		if models.is_empty() and items.is_empty() and icons.is_empty() and sounds.is_empty() \
+				and tiles.is_empty() and tile_maps.is_empty() and decor.is_empty() and not _has_decor_hide(info):
 			continue  # a .gltf's textures beside the loose models, or an empty folder
 		var p := _pack("dir:" + sub, "folder", sub, root, root, models)
 		_take_models(p, models, items)
 		_take_icons(p, icons)
 		_take_sounds(p, sounds)
-		_take_info(p, _read_info(root, 1))
+		_take_tiles(p, tiles, tile_maps)
+		_take_decoratives(p, decor)
+		_take_info(p, info)
 		out.append(p)
 	var files := Array(DirAccess.get_files_at(dir))
 	files.sort_custom(func(a: String, b: String) -> bool: return a.naturalnocasecmp_to(b) < 0)
@@ -393,6 +489,9 @@ static func builtin_packs() -> Array:
 			_take_models(p, p["models"], items)
 			_take_icons(p, _index_icons(root, 0))  # none ship any (Factorio's are read from the install)
 			_take_sounds(p, _index_sounds(root, 0))  # nor sounds
+			var builtin_tmaps := {}
+			_take_tiles(p, _index_tiles(root, 0, builtin_tmaps), builtin_tmaps)  # nor tiles
+			_take_decoratives(p, _index_decoratives(root, 0))  # Placeholders ships 3D models for raised decoratives
 			_take_info(p, _read_info(root, 0))
 			_builtin.append(p)
 	var out: Array = []
@@ -550,6 +649,10 @@ static func folder_pack(dir: String, replaces: bool) -> Dictionary:
 	p["replaces"] = replaces
 	_take_icons(p, _index_icons(dir, 1) if DirAccess.dir_exists_absolute(dir) else {})
 	_take_sounds(p, _index_sounds(dir, 1) if DirAccess.dir_exists_absolute(dir) else {})
+	var tmaps := {}
+	var t := _index_tiles(dir, 1, tmaps) if DirAccess.dir_exists_absolute(dir) else {}
+	_take_tiles(p, t, tmaps)
+	_take_decoratives(p, _index_decoratives(dir, 1) if DirAccess.dir_exists_absolute(dir) else {})
 	_take_info(p, _read_info(dir, 1))
 	return p
 
@@ -576,6 +679,8 @@ static func zip_pack(path: String) -> Dictionary:
 	var item_names := {}
 	var icons := 0
 	var sounds := 0
+	var tile_names := {}
+	var decor_map_names := {}
 	var info_entry := ""
 	for entry: String in entries:
 		var rel := safe_entry(entry)
@@ -585,6 +690,14 @@ static func zip_pack(path: String) -> Dictionary:
 			icons += 1
 		elif rel.get_extension().to_lower() in SOUND_EXTS and _in_sounds_dir(rel):
 			sounds += 1
+		elif rel.get_extension().to_lower() in TILE_EXTS and _in_tiles_dir(rel):
+			var tname := _zip_tile_name(rel)
+			if tname != "":
+				tile_names[tname] = true
+		elif rel.get_extension().to_lower() in DECOR_EXTS and _in_decor_dir(rel):
+			var dname := _zip_decor_name(rel)
+			if dname != "":
+				decor_map_names[dname] = true
 		elif rel.get_extension().to_lower() in MODEL_EXTS:
 			var dirs := Array(rel.to_lower().split("/")).slice(0, -1)
 			var into: Dictionary = item_names if dirs.has(ITEMS_DIR) else names
@@ -595,12 +708,30 @@ static func zip_pack(path: String) -> Dictionary:
 	p["item_count"] = item_names.size()
 	p["icon_count"] = icons
 	p["sound_count"] = sounds
+	p["tile_count"] = tile_names.size()
+	p["decor_count"] = decor_map_names.size()
 	if info_entry != "":
 		var zf := FileAccess.open(path, FileAccess.READ)
 		if zf != null:
 			_take_info(p, _parse_info(ModFiles.zip_entry(zf, entries[info_entry]).get_string_from_utf8()))
 			zf.close()
-	if names.is_empty() and item_names.is_empty() and icons == 0 and sounds == 0:
+	var aliases: Variant = (p.get("info", {}) as Dictionary).get("aliases")
+	if aliases is Dictionary and not (aliases as Dictionary).is_empty():
+		var alias_map: Dictionary = aliases
+		var mapped_tiles := {}
+		for k: String in tile_names:
+			mapped_tiles[str(alias_map.get(k, k))] = true
+		tile_names = mapped_tiles
+		p["tile_count"] = tile_names.size()
+		var mapped_decor := {}
+		for k: String in decor_map_names:
+			mapped_decor[str(alias_map.get(k, k))] = true
+		decor_map_names = mapped_decor
+	for k: String in _explicit_hidden_decor_names(p):
+		decor_map_names[k] = true
+	p["decor_count"] = decor_map_names.size()
+	if names.is_empty() and item_names.is_empty() and icons == 0 and sounds == 0 and tile_names.is_empty() \
+			and decor_map_names.is_empty() and not _has_decor_hide(p.get("info", {})):
 		p["problem"] = NOTHING_IN_IT
 	if name.to_lower() in OLD_BUNDLED_FILES:
 		p["id"] = BUNDLED_ID  # the bundled pack under its old name (its pack.json may say "Default")
@@ -694,6 +825,13 @@ static func listed(dir: String, order: Array, off: Array) -> Array:
 				p["root"] = now["root"]
 			if not bool(now["unpacking"]) and (p["sounds"] as Dictionary).is_empty() and not (now["sounds"] as Dictionary).is_empty():
 				_take_sounds(p, now["sounds"])
+				p["root"] = now["root"]
+			if not bool(now["unpacking"]) and (p["tiles"] as Dictionary).is_empty() and (p.get("tile_maps", {}) as Dictionary).is_empty() \
+					and not ((now["tiles"] as Dictionary).is_empty() and (now.get("tile_maps", {}) as Dictionary).is_empty()):
+				_take_tiles(p, now["tiles"], now.get("tile_maps", {}))
+				p["root"] = now["root"]
+			if not bool(now["unpacking"]) and (p["decoratives"] as Dictionary).is_empty() and not (now["decoratives"] as Dictionary).is_empty():
+				_take_decoratives(p, now["decoratives"])
 				p["root"] = now["root"]
 		if p["id"] == FACTORIO_ID:
 			p["count"] = _sprites.size()
@@ -871,10 +1009,25 @@ static func _aliased(names: Dictionary, aliases: Dictionary) -> Dictionary:
 ## the files as they were found (kept in `found_*`, so taking the info again changes nothing).
 static func _apply_aliases(p: Dictionary) -> void:
 	var aliases: Dictionary = (p.get("info", {}) as Dictionary).get("aliases", {})
-	for key in ["models", "items", "icons"]:
+	for key in ["models", "items", "icons", "tiles", "tile_maps", "decoratives"]:
 		if p.has("found_" + key):  # (a zip's listing has only its counts until it is unpacked)
 			p[key] = _aliased(p["found_" + key], aliases)
-			p[COUNT_KEYS[key]] = (p[key] as Dictionary).size()
+			if COUNT_KEYS.has(key):
+				p[COUNT_KEYS[key]] = (p[key] as Dictionary).size()
+	if p.has("found_tiles") or p.has("found_tile_maps"):
+		var seen_tiles := {}
+		for k in (p.get("tiles", {}) as Dictionary):
+			seen_tiles[k] = true
+		for k in (p.get("tile_maps", {}) as Dictionary):
+			seen_tiles[k] = true
+		p["tile_count"] = seen_tiles.size()
+	if p.has("found_decoratives"):
+		var seen_decor := {}
+		for k in (p.get("decoratives", {}) as Dictionary):
+			seen_decor[k] = true
+		for k: String in _explicit_hidden_decor_names(p):
+			seen_decor[k] = true
+		p["decor_count"] = seen_decor.size()
 
 
 static func _read_numbered_protos() -> Dictionary:
@@ -932,7 +1085,40 @@ static func set_choices(map: Dictionary) -> void:
 		icons_version += 1
 	if _icon_choices(out, SOUND_PREFIX) != _icon_choices(choices, SOUND_PREFIX):
 		sounds_version += 1
+	if _icon_choices(out, TILE_PREFIX) != _icon_choices(choices, TILE_PREFIX):
+		tiles_version += 1
+	if _icon_choices(out, DECOR_PREFIX) != _icon_choices(choices, DECOR_PREFIX):
+		decor_version += 1
 	choices = out
+	version += 1
+
+
+## Key in `pbr_models` for one entity family or item inside `pack_id`.
+static func pbr_model_key(pack_id: String, name: String, is_item := false) -> String:
+	var pid := canonical_id(pack_id)
+	var mkey := (ITEM_PREFIX + name.to_lower()) if is_item else family(name.to_lower())
+	return pid + "|" + mkey
+
+
+## Applies per-pack and per-model PBR overrides (settings.cfg [model_packs] pbr_packs / pbr_models).
+## Replaces both tables wholesale so worker threads can read them safely without locks.
+static func set_pbr_overrides(packs_map: Dictionary, models_map: Dictionary) -> void:
+	var out_packs := {}
+	for k in packs_map:
+		var pid := canonical_id(str(k))
+		if pid != "":
+			out_packs[pid] = bool(packs_map[k])
+	var out_models := {}
+	for k in models_map:
+		var raw := str(k)
+		var sep := raw.find("|")
+		if sep > 0:
+			var pid := canonical_id(raw.substr(0, sep))
+			var mkey := raw.substr(sep + 1).to_lower()
+			if pid != "" and mkey != "":
+				out_models[pid + "|" + mkey] = bool(models_map[k])
+	pbr_packs = out_packs
+	pbr_models = out_models
 	version += 1
 
 
@@ -1001,39 +1187,159 @@ static func families_of(p: Dictionary) -> Dictionary:
 	return out
 
 
-## How a pack's textured materials are drawn: "pbr" when its pack.json says so (a modeller's), else
-## "factorio" (built-in packs always; no key or any other word).
-static func shading(p: Dictionary) -> String:
-	if p.is_empty() or is_builtin(p):
+static func pbr_override_off(p: Dictionary) -> bool:
+	var id := str(p.get("id", ""))
+	return (id == LAST_ID and not placeholder_pbr) or (id == FUE5_ID and not fue5_pbr) or (id == WUBE3DP_ID and not wube3dp_pbr)
+
+
+## A pack's own default shading from pack.json ("pbr" or "factorio"), ignoring user overrides.
+static func pack_default_shading(p: Dictionary) -> String:
+	if p.is_empty() or is_sprite_pack(p) or pbr_override_off(p):
 		return "factorio"
 	return "pbr" if str((p.get("info", {}) as Dictionary).get("shading", "")) == "pbr" else "factorio"
 
 
-## Whether a model's (or an item model's) file comes from a pack that asks for "pbr" (shading()).
-static func pbr(path: String) -> bool:
-	var p := pack_of(path)
-	if p.is_empty() or is_builtin(p):
-		return false
-	return model_shading(p, path.get_file().get_basename()) == "pbr"
-
-
-## One model's shading in a pack: pack.json's "shading_models" ({"<prototype name or pattern with *>": "pbr" |
-## "factorio"}) over the pack's "shading" (shading()). An exact name beats a pattern (the first pattern that
-## fits, in file order); a numbered variant (`<name>-<n>`) follows its base name unless it is named itself.
-static func model_shading(p: Dictionary, name: String) -> String:
-	var default := shading(p)
-	if p.is_empty() or is_builtin(p):
-		return default
+## One model's default shading from pack.json's "shading_models" over `base` (the pack's own default,
+## pack_default_shading(p), unless the user's pack-level PBR toggle gives another).
+static func pack_default_model_shading(p: Dictionary, name: String, is_item := false, base := "") -> String:
+	var fallback := base if base != "" else pack_default_shading(p)
+	if p.is_empty() or is_sprite_pack(p) or pbr_override_off(p):
+		return fallback
 	var per: Variant = (p.get("info", {}) as Dictionary).get("shading_models", null)
 	if not (per is Dictionary) or (per as Dictionary).is_empty():
-		return default
+		return fallback
+	if is_item:
+		var f_item := name.to_lower()
+		while f_item != "":
+			var hit := _shading_match(per as Dictionary, ITEMS_DIR + "/" + f_item)
+			if hit != "":
+				return hit
+			f_item = variant_base(f_item)
 	var f := name.to_lower()
 	while f != "":
 		var hit := _shading_match(per as Dictionary, f)
 		if hit != "":
 			return hit
 		f = variant_base(f)
-	return default
+	return fallback
+
+
+## How a pack's textured materials are drawn: user pack PBR override over its pack.json ("pbr" vs
+## "factorio"; the Factorio pack always; --fue5-pbr=off / --wube3dp-pbr=off / --placeholder-pbr=off
+## keep them on "factorio").
+static func shading(p: Dictionary) -> String:
+	if p.is_empty() or is_sprite_pack(p) or pbr_override_off(p):
+		return "factorio"
+	var pp := pbr_packs
+	var pid := canonical_id(str(p.get("id", "")))
+	if pid != "" and pp.has(pid):
+		return "pbr" if bool(pp[pid]) else "factorio"
+	return pack_default_shading(p)
+
+
+## Whether a model's (or an item model's) file uses "pbr" shading under user overrides and pack.json.
+static func pbr(path: String) -> bool:
+	var p := _pack_at(path, active())
+	if p.is_empty():
+		p = _pack_at(path, packs)
+	if p.is_empty() or is_sprite_pack(p) or pbr_override_off(p):
+		return false
+	var root := str(p["root"])
+	var rel_dir := path.substr(root.length() + 1).get_base_dir().to_lower() if path.begins_with(root + "/") else ""
+	var is_item := path.get_base_dir().get_file().to_lower() == ITEMS_DIR or ITEMS_DIR in rel_dir.split("/", false)
+	return model_shading(p, path.get_file().get_basename(), is_item) == "pbr"
+
+
+## One model's shading in a pack: user per-model PBR override (`pbr_models`), then pack.json's
+## "shading_models", then the pack's default: the user's pack-level PBR toggle (`pbr_packs`) over pack.json's "shading".
+static func model_shading(p: Dictionary, name: String, is_item := false) -> String:
+	if p.is_empty() or is_sprite_pack(p) or pbr_override_off(p):
+		return "factorio"
+	var pm := pbr_models
+	var pid := canonical_id(str(p.get("id", "")))
+	if pid != "" and not pm.is_empty():
+		if is_item:
+			var f_item := name.to_lower()
+			while f_item != "":
+				var ik := pid + "|" + ITEM_PREFIX + f_item
+				if pm.has(ik):
+					return "pbr" if bool(pm[ik]) else "factorio"
+				f_item = variant_base(f_item)
+		else:
+			var exact_k := pid + "|" + name.to_lower()
+			if pm.has(exact_k):
+				return "pbr" if bool(pm[exact_k]) else "factorio"
+			var fam_k := pid + "|" + family(name.to_lower())
+			if pm.has(fam_k):
+				return "pbr" if bool(pm[fam_k]) else "factorio"
+	# The pack-level toggle only sets the pack's default: pack.json's "shading_models" entries (a fixed pack's
+	# belts and splitters as "factorio", say) still win over it.
+	var pp := pbr_packs
+	if pid != "" and pp.has(pid):
+		return pack_default_model_shading(p, name, is_item, "pbr" if bool(pp[pid]) else "factorio")
+	return pack_default_model_shading(p, name, is_item)
+
+
+## Shading for an entity family inside pack `p`, picking a present family member (e.g. `iron-ore-1`
+## when the pack omits `iron-ore`) so wildcard rules in pack.json match accurately.
+static func family_shading(p: Dictionary, fam: String) -> String:
+	if p.is_empty() or is_sprite_pack(p) or pbr_override_off(p):
+		return "factorio"
+	var rep := fam
+	var models: Variant = p.get("models")
+	if models is Dictionary:
+		var mdict: Dictionary = models
+		if not mdict.has(fam):
+			var names := mdict.keys()
+			names.sort()
+			for n: Variant in names:
+				var ns := str(n)
+				if family(ns) == fam:
+					rep = ns
+					break
+	return model_shading(p, rep, false)
+
+
+## True when `pack_id` has a user pack-level or per-model PBR override.
+static func has_pack_pbr_overrides(pack_id: String) -> bool:
+	var pid := canonical_id(pack_id)
+	if pid == "":
+		return false
+	if pbr_packs.has(pid):
+		return true
+	var prefix := pid + "|"
+	var pm := pbr_models
+	for k: Variant in pm:
+		if str(k).begins_with(prefix):
+			return true
+	return false
+
+
+## True when `(pack_id, name, is_item)` has an explicit user per-model PBR override.
+static func has_model_pbr_override(pack_id: String, name: String, is_item := false) -> bool:
+	var pm := pbr_models
+	return pm.has(pbr_model_key(pack_id, name, is_item))
+
+
+## Pack PBR summary for UI: "on", "off", or "mixed".
+static func pack_pbr_state(p: Dictionary) -> String:
+	if p.is_empty() or is_sprite_pack(p) or pbr_override_off(p):
+		return "off"
+	var pid := canonical_id(str(p.get("id", "")))
+	var pm := pbr_models
+	var base_on := shading(p) == "pbr"
+	var prefix := pid + "|"
+	for k: Variant in pm:
+		if str(k).begins_with(prefix) and bool(pm[k]) != base_on:
+			return "mixed"
+	# pack.json's "shading_models" entries win over the pack toggle, so any that differ from the pack's
+	# base shading make it mixed.
+	var per: Variant = (p.get("info", {}) as Dictionary).get("shading_models", {})
+	if pid != "" and per is Dictionary:
+		for v: Variant in (per as Dictionary).values():
+			if (str(v) == "pbr") != base_on:
+				return "mixed"
+	return "on" if base_on else "off"
 
 
 static func _shading_match(per: Dictionary, f: String) -> String:
@@ -1047,14 +1353,20 @@ static func _shading_match(per: Dictionary, f: String) -> String:
 
 ## The pack in use a model's file comes from, {} for none.
 static func pack_of(path: String) -> Dictionary:
+	return _pack_at(path, active())
+
+
+static func _pack_at(path: String, list: Array) -> Dictionary:
 	if path.begins_with("gltf:"):
 		path = path.substr(5)
 	elif path.begins_with("scene:"):
 		path = path.substr(6)
-	for p: Dictionary in active():
+	for p: Dictionary in list:
 		var root := str(p["root"])
 		if p["kind"] == "loose":
-			if path.get_base_dir() == root:
+			var sub_rel := path.substr(root.length() + 1).to_lower() if path.begins_with(root + "/") else ""
+			if path.get_base_dir() == root or sub_rel.begins_with(ITEMS_DIR + "/") or sub_rel.begins_with(TILES_DIR + "/") \
+					or sub_rel.begins_with(DECOR_DIR + "/") or sub_rel.begins_with(ICONS_DIR + "/") or sub_rel.begins_with(SOUNDS_DIR + "/"):
 				return p
 		elif path.begins_with(root + "/"):
 			return p
@@ -1187,11 +1499,14 @@ static func icon_image(path: String) -> Image:
 	return image
 
 
-## How many of `choices` are models' families (the rest are "icon:", "item:" and "sound:" ones).
+## How many of `choices` are models' families (the rest are "icon:", "item:", "sound:", "tile:"
+## and "decor:" ones).
 static func model_choice_count() -> int:
 	var n := 0
 	for k in choices:
-		if not str(k).begins_with(ICON_PREFIX) and not str(k).begins_with(ITEM_PREFIX) and not str(k).begins_with(SOUND_PREFIX):
+		var ks := str(k)
+		if not ks.begins_with(ICON_PREFIX) and not ks.begins_with(ITEM_PREFIX) and not ks.begins_with(SOUND_PREFIX) \
+				and not ks.begins_with(TILE_PREFIX) and not ks.begins_with(DECOR_PREFIX):
 			n += 1
 	return n
 
@@ -1276,9 +1591,341 @@ static func set_sounds_on(on: bool) -> void:
 		sounds_version += 1
 
 
+## Packs' ground textures on or off (Settings > Graphics' "Ground textures from model packs";
+## --pack-tiles=off wins for the run). terrain_textures.gd reloads its layers when it changes.
+static func set_tiles_on(on: bool) -> void:
+	if on != tiles_on:
+		tiles_on = on
+		tiles_version += 1
+
+
+## Companion tile PBR maps (-normal, -height, -roughness) on or off (--pack-tile-pbr=off).
+static func set_tile_pbr_on(on: bool) -> void:
+	if on != tile_pbr_on:
+		tile_pbr_on = on
+		tiles_version += 1
+
+
+## The tile picture files a pack gives for `tile_name` (one file or a sorted array of variant files),
+## [] when it has none.
+static func tile_in(p: Dictionary, tile_name: String) -> Array:
+	if p.is_empty():
+		return []
+	var tiles: Variant = p.get("tiles")
+	if not tiles is Dictionary:
+		return []
+	var found: Variant = (tiles as Dictionary).get(tile_name.to_lower())
+	return (found as Array).duplicate() if found is Array else []
+
+
+## Companion PBR maps a pack gives for `tile_name` ({"normal": [...], "height": [...], "roughness": [...]}),
+## {} when it has none.
+static func tile_maps_in(p: Dictionary, tile_name: String) -> Dictionary:
+	if p.is_empty():
+		return {}
+	var tmaps: Variant = p.get("tile_maps")
+	if not tmaps is Dictionary:
+		return {}
+	var found: Variant = (tmaps as Dictionary).get(tile_name.to_lower())
+	return (found as Dictionary).duplicate(true) if found is Dictionary else {}
+
+
+static func _match_spec(cfg_root: Variant, item_name: String) -> Dictionary:
+	if not cfg_root is Dictionary or (cfg_root as Dictionary).is_empty():
+		return {}
+	var map := cfg_root as Dictionary
+	var key := item_name.to_lower()
+	var wilds: Array = []
+	for pat: Variant in map:
+		var ps := str(pat)
+		if ps.contains("*") and key.match(ps):
+			wilds.append(ps)
+	var by_specificity := func(a: String, b: String) -> bool:
+		return (a.length() < b.length()) if a.length() != b.length() else (a < b)
+	wilds.sort_custom(by_specificity)
+	var out := {}
+	for pat: String in wilds:
+		if map[pat] is Dictionary:
+			out.merge(map[pat] as Dictionary, true)
+	if map.has(key) and map[key] is Dictionary:
+		out.merge(map[key] as Dictionary, true)
+	return out
+
+
+## Per-tile overrides from pack.json's "tiles" section (`size`, `count`, `roughness`, `specular`,
+## `normal_strength`, `height_strength`, `normal_flip_x`, `normal_flip_y`), matching `*` wildcards
+## (shortest first) then the exact tile name; {} for none.
+static func tile_spec(p: Dictionary, tile_name: String) -> Dictionary:
+	if p.is_empty():
+		return {}
+	return _match_spec((p.get("info", {}) as Dictionary).get("tiles"), tile_name)
+
+
+## The ground texture source a pack gives for `tile_name`: {"files", "maps", "pack", "spec"}, or {}
+## for Factorio's/mod's own. Follows the pack order and "tile:<name>" choices; Factorio's own wins
+## above packs below it unless `past_factorio` is true (Factorio and mods have no picture). Note
+## that a higher pack providing albedo alone returns maps={} (never mixes lower packs' maps onto
+## its albedo), while a PBR-only pack returns files=[] and non-empty maps so TerrainTextures layers
+## them onto Factorio's/mod's albedo. Safe on a worker.
+static func tile_source(tile_name: String, past_factorio := false) -> Dictionary:
+	if not tiles_on:
+		return {}
+	var key := tile_name.to_lower()
+	var c := choices
+	if not c.is_empty():
+		var id := str(c.get(TILE_PREFIX + key, ""))
+		if id != "":
+			if canonical_id(id) == FACTORIO_ID and not pack(id).is_empty():
+				return {}
+			var chosen_p := pack(id)
+			var chosen_files := tile_in(chosen_p, key)
+			var chosen_maps := tile_maps_in(chosen_p, key) if tile_pbr_on else {}
+			if not chosen_files.is_empty() or not chosen_maps.is_empty():
+				return {"files": chosen_files, "maps": chosen_maps, "pack": chosen_p, "spec": tile_spec(chosen_p, key)}
+	var act := active()
+	for replacing in [true, false]:
+		for p: Dictionary in act:
+			if bool(p["replaces"]) == replacing:
+				if p["id"] == FACTORIO_ID:
+					if not past_factorio and factorio_usable():
+						return {}
+					continue
+				var files := tile_in(p, key)
+				var maps := tile_maps_in(p, key) if tile_pbr_on else {}
+				if not files.is_empty() or not maps.is_empty():
+					return {"files": files, "maps": maps, "pack": p, "spec": tile_spec(p, key)}
+	return {}
+
+
+## The files a pack gives for `tile_name`, [] for none.
+static func tile_files(tile_name: String, past_factorio := false) -> Array:
+	var src := tile_source(tile_name, past_factorio)
+	var files: Variant = src.get("files")
+	return files if files is Array else []
+
+
+## The first file a pack gives for `tile_name`, "" for none.
+static func tile_file(tile_name: String, past_factorio := false) -> String:
+	var files := tile_files(tile_name, past_factorio)
+	return str(files[0]) if not files.is_empty() else ""
+
+
+## The pack in use whose tile tile_source() gives, {} for none.
+static func tile_pack(tile_name: String, past_factorio := false) -> Dictionary:
+	var src := tile_source(tile_name, past_factorio)
+	var p: Variant = src.get("pack")
+	return p if p is Dictionary else {}
+
+
+## A pack's tiles, sorted ("grass-1", "concrete"...), including tiles with only PBR maps.
+static func tile_names(p: Dictionary) -> Array:
+	var seen := {}
+	var tiles: Variant = p.get("tiles")
+	if tiles is Dictionary:
+		for k in (tiles as Dictionary):
+			seen[k] = true
+	var tmaps: Variant = p.get("tile_maps")
+	if tmaps is Dictionary:
+		for k in (tmaps as Dictionary):
+			seen[k] = true
+	var names: Array = seen.keys()
+	names.sort()
+	return names
+
+
+## The pack chosen for tile `tile_name`, "" for the order's; only a pack in use counts.
+static func tile_choice(tile_name: String) -> String:
+	var id := str(choices.get(TILE_PREFIX + tile_name.to_lower(), ""))
+	return id if id != "" and not pack(id).is_empty() else ""
+
+
+## Packs' decoratives and 3D grass on or off (Settings > Graphics' "Decoratives from model packs";
+## --pack-decoratives=off wins for the run). decoratives.gd reloads when it changes.
+static func set_decor_on(on: bool) -> void:
+	if on != decor_on:
+		decor_on = on
+		decor_version += 1
+
+
+## 3D decorative models (.glb/.gltf in decoratives/) on or off (Settings > Graphics' "3D decorative models";
+## --decor-models=off falls back to 2D pictures/shaders). decoratives.gd reloads when it changes.
+static func set_decor_models_on(on: bool) -> void:
+	if on != decor_models_on:
+		decor_models_on = on
+		decor_version += 1
+
+
+static func is_decor_model(path: String) -> bool:
+	return path.get_extension().to_lower() in DECOR_MODEL_EXTS
+
+
+## The decorative picture or model files a pack gives for `decor_name`, [] when it has none.
+static func decor_in(p: Dictionary, decor_name: String) -> Array:
+	if p.is_empty():
+		return []
+	var decor: Variant = p.get("decoratives")
+	if not decor is Dictionary:
+		return []
+	var found: Variant = (decor as Dictionary).get(decor_name.to_lower())
+	return (found as Array).duplicate() if found is Array else []
+
+
+static func decor_images_in(p: Dictionary, decor_name: String) -> Array:
+	var out: Array = []
+	for f: Variant in decor_in(p, decor_name):
+		var s := str(f)
+		if not is_decor_model(s):
+			out.append(s)
+	return out
+
+
+static func decor_models_in(p: Dictionary, decor_name: String) -> Array:
+	var out: Array = []
+	for f: Variant in decor_in(p, decor_name):
+		var s := str(f)
+		if is_decor_model(s):
+			out.append(s)
+	return out
+
+
+## Per-decorative overrides from pack.json's "decoratives" section (`scale`, `size`, `shift`,
+## `layer`, `grass`, `grass_height`, `grass_style`, `hide`), matching `*` wildcards then exact name.
+static func decor_spec(p: Dictionary, decor_name: String) -> Dictionary:
+	if p.is_empty():
+		return {}
+	return _match_spec((p.get("info", {}) as Dictionary).get("decoratives"), decor_name)
+
+
+## Whether pack `p` replaces or hides `decor_name`.
+static func decor_has(p: Dictionary, decor_name: String) -> bool:
+	if p.is_empty():
+		return false
+	if not decor_in(p, decor_name).is_empty():
+		return true
+	return bool(decor_spec(p, decor_name).get("hide", false))
+
+
+static func _decor_usable_in(p: Dictionary, decor_name: String) -> bool:
+	if p.is_empty():
+		return false
+	if not decor_images_in(p, decor_name).is_empty():
+		return true
+	if decor_models_on and not decor_models_in(p, decor_name).is_empty():
+		return true
+	return bool(decor_spec(p, decor_name).get("hide", false))
+
+
+## The decorative source a pack gives for `decor_name`: {"files", "models", "pack", "spec"}, or {} for
+## Factorio's/mod's own. Follows the pack order and "decor:<name>" choices. Safe on a worker.
+static func decor_source(decor_name: String, past_factorio := false) -> Dictionary:
+	if not decor_on:
+		return {}
+	var key := decor_name.to_lower()
+	var c := choices
+	if not c.is_empty():
+		var id := str(c.get(DECOR_PREFIX + key, ""))
+		if id != "":
+			if canonical_id(id) == FACTORIO_ID and not pack(id).is_empty():
+				return {}
+			var chosen_p := pack(id)
+			if _decor_usable_in(chosen_p, key):
+				return {"files": decor_images_in(chosen_p, key), "models": decor_models_in(chosen_p, key) if decor_models_on else [],
+					"pack": chosen_p, "spec": decor_spec(chosen_p, key)}
+	var act := active()
+	for replacing in [true, false]:
+		for p: Dictionary in act:
+			if bool(p["replaces"]) == replacing:
+				if p["id"] == FACTORIO_ID:
+					if not past_factorio and factorio_usable():
+						return {}
+					continue
+				if _decor_usable_in(p, key):
+					return {"files": decor_images_in(p, key), "models": decor_models_in(p, key) if decor_models_on else [],
+						"pack": p, "spec": decor_spec(p, key)}
+	return {}
+
+
+## The files a pack gives for `decor_name`, [] for none.
+static func decor_files(decor_name: String, past_factorio := false) -> Array:
+	var src := decor_source(decor_name, past_factorio)
+	var files: Variant = src.get("files")
+	return files if files is Array else []
+
+
+## The pack in use whose decorative decor_source() gives, {} for none.
+static func decor_pack(decor_name: String, past_factorio := false) -> Dictionary:
+	var src := decor_source(decor_name, past_factorio)
+	var p: Variant = src.get("pack")
+	return p if p is Dictionary else {}
+
+
+## A pack's decoratives, sorted ("green-hairy-grass", "small-rock"...), including explicit hidden ones.
+static func decor_names(p: Dictionary) -> Array:
+	var seen := {}
+	var decor: Variant = p.get("decoratives")
+	if decor is Dictionary:
+		for k in (decor as Dictionary):
+			seen[k] = true
+	for k: String in _explicit_hidden_decor_names(p):
+		seen[k] = true
+	var names: Array = seen.keys()
+	names.sort()
+	return names
+
+
+## The pack chosen for decorative `decor_name`, "" for the order's; only a pack in use counts.
+static func decor_choice(decor_name: String) -> String:
+	var id := str(choices.get(DECOR_PREFIX + decor_name.to_lower(), ""))
+	return id if id != "" and not pack(id).is_empty() else ""
+
+
+## Whether any active pack provides usable decoratives or decorative hide overrides when decor_on is true.
+static func has_any_decoratives() -> bool:
+	if not decor_on:
+		return false
+	for p: Dictionary in active():
+		if _has_decor_hide(p.get("info", {})):
+			return true
+		var decor: Variant = p.get("decoratives")
+		if decor is Dictionary:
+			if decor_models_on and not (decor as Dictionary).is_empty():
+				return true
+			for files: Variant in (decor as Dictionary).values():
+				if files is Array:
+					for f: Variant in (files as Array):
+						if not is_decor_model(str(f)):
+							return true
+	return false
+
+
+static func _has_decor_hide(info: Variant) -> bool:
+	if not info is Dictionary:
+		return false
+	var cfg: Variant = (info as Dictionary).get("decoratives")
+	if not cfg is Dictionary:
+		return false
+	for v: Variant in (cfg as Dictionary).values():
+		if v is Dictionary and bool((v as Dictionary).get("hide", false)):
+			return true
+	return false
+
+
+static func _explicit_hidden_decor_names(p: Dictionary) -> Array:
+	var out: Array = []
+	var cfg: Variant = (p.get("info", {}) as Dictionary).get("decoratives")
+	if not cfg is Dictionary:
+		return out
+	for k: Variant in (cfg as Dictionary):
+		var ks := str(k)
+		var entry: Variant = (cfg as Dictionary)[k]
+		if not ks.contains("*") and entry is Dictionary and bool((entry as Dictionary).get("hide", false)):
+			out.append(ks)
+	return out
+
+
 ## False when the command line says `<flag>=off` (read once, at load).
 static func arg_on(flag: String) -> bool:
-	return not OS.get_cmdline_user_args().has(flag + "=off")
+	return not Switches.has(flag + "=off")
 
 
 ## The file of item `name`'s model (items on belts, the ground, inserter hands): the pack chosen for
@@ -1506,8 +2153,9 @@ static func report() -> String:
 
 static func _pack(id: String, kind: String, title: String, source: String, root: String, models: Dictionary) -> Dictionary:
 	return {"id": id, "kind": kind, "title": title, "short": title, "info": {}, "source": source, "root": root, "models": models,
-		"count": models.size(), "items": {}, "item_count": 0, "icons": {}, "icon_count": 0, "sounds": {}, "sound_count": 0, "on": true, "replaces": true, "problem": "",
-		"unpacking": false, "cache": "", "checking": false, "copies": [], "unchecked": false, "check_stamp": ""}
+		"count": models.size(), "items": {}, "item_count": 0, "icons": {}, "icon_count": 0, "sounds": {}, "sound_count": 0,
+		"tiles": {}, "tile_maps": {}, "tile_count": 0, "decoratives": {}, "decor_count": 0,
+		"on": true, "replaces": true, "problem": "", "unpacking": false, "cache": "", "checking": false, "copies": [], "unchecked": false, "check_stamp": ""}
 
 
 static func _take_models(p: Dictionary, models: Dictionary, items: Variant = null) -> void:
@@ -1527,9 +2175,20 @@ static func _take_sounds(p: Dictionary, sounds: Dictionary) -> void:
 	p["sound_count"] = sounds.size()
 
 
+static func _take_tiles(p: Dictionary, tiles: Dictionary, tile_maps: Dictionary = {}) -> void:
+	p["found_tiles"] = tiles
+	p["found_tile_maps"] = tile_maps
+	_apply_aliases(p)
+
+
+static func _take_decoratives(p: Dictionary, decor: Dictionary) -> void:
+	p["found_decoratives"] = decor
+	_apply_aliases(p)
+
+
 static func _take_info(p: Dictionary, info: Dictionary) -> void:
 	p["info"] = info
-	if info.has("aliases"):
+	if info.has("aliases") or info.has("decoratives"):
 		_apply_aliases(p)
 	if str(info.get("name", "")) != "":
 		p["title"] = str(info["name"])
@@ -1553,6 +2212,8 @@ static func _activate() -> void:
 	version += 1
 	icons_version += 1
 	sounds_version += 1
+	tiles_version += 1
+	decor_version += 1
 
 
 ## The worker's results taken in, on the main thread.
@@ -1582,10 +2243,14 @@ static func _apply() -> void:
 				_take_models(p, r["models"], r["items"])
 				_take_icons(p, r["icons"])
 				_take_sounds(p, r["sounds"])
+				_take_tiles(p, r["tiles"], r.get("tile_maps", {}))
+				_take_decoratives(p, r.get("decoratives", {}))
 				var with_items := ", %d item model(s)" % p["item_count"] if int(p["item_count"]) > 0 else ""
 				var with_sounds := ", %d sound(s)" % p["sound_count"] if int(p["sound_count"]) > 0 else ""
-				print("[models] %s (%s) unpacked: %d model(s)%s, %d icon(s)%s in %.1f s" % [p["title"], where(p), p["count"], with_items,
-					p["icon_count"], with_sounds, float(r["msec"]) / 1000.0])
+				var with_tiles := ", %d tile(s)" % p["tile_count"] if int(p["tile_count"]) > 0 else ""
+				var with_decor := ", %d decorative(s)" % p["decor_count"] if int(p["decor_count"]) > 0 else ""
+				print("[models] %s (%s) unpacked: %d model(s)%s, %d icon(s)%s%s%s in %.1f s" % [p["title"], where(p), p["count"], with_items,
+					p["icon_count"], with_sounds, with_tiles, with_decor, float(r["msec"]) / 1000.0])
 			else:
 				push_warning("[models] %s (%s) left out: %s" % [p["title"], where(p), r["problem"]])
 	_activate()
@@ -1595,6 +2260,8 @@ static func _apply() -> void:
 static func _unpack_all(jobs: Array, stale: Array) -> void:
 	for dir: String in stale:
 		SafeDelete.remove_tree(dir)
+		if FileAccess.file_exists(dir + USED_SUFFIX):
+			DirAccess.remove_absolute(dir + USED_SUFFIX)
 	var results: Array = []
 	for job: Dictionary in jobs:
 		if not job.has("zip"):
@@ -1607,14 +2274,22 @@ static func _unpack_all(jobs: Array, stale: Array) -> void:
 		var items := {}
 		var icons := {}
 		var sounds := {}
+		var tiles := {}
+		var tile_maps := {}
+		var decor := {}
 		if why == "":
 			models = _index(str(job["cache"]), MAX_DEPTH, items)
 			icons = _index_icons(str(job["cache"]), 1)
 			sounds = _index_sounds(str(job["cache"]), 1)
-			if models.is_empty() and items.is_empty() and icons.is_empty() and sounds.is_empty():
-				why = NOTHING_IN_IT
+			tiles = _index_tiles(str(job["cache"]), 1, tile_maps)
+			decor = _index_decoratives(str(job["cache"]), 1)
+			if models.is_empty() and items.is_empty() and icons.is_empty() and sounds.is_empty() \
+					and tiles.is_empty() and tile_maps.is_empty() and decor.is_empty():
+				var raw_info := _read_info(str(job["cache"]), 1)
+				if not _has_decor_hide(raw_info):
+					why = NOTHING_IN_IT
 		var r := {"id": job["id"], "problem": why, "models": models, "items": items, "icons": icons, "sounds": sounds,
-			"msec": Time.get_ticks_msec() - t0}
+			"tiles": tiles, "tile_maps": tile_maps, "decoratives": decor, "msec": Time.get_ticks_msec() - t0}
 		if str(job.get("check", "")) != "":
 			r["copies"] = PackCheck.find_copies(PackCheck.pack_files(str(job["cache"])), str(job["install"])) if why == "" else []
 			r["check"] = job["check"]
@@ -1697,20 +2372,68 @@ static func safe_entry(name: String) -> String:
 
 
 ## The unpacked copies to remove: every folder in the cache but those of the zips found
-## (`keep`, by folder name) and another Zenith's unpacking now.
-static func _stale_copies(keep: Dictionary) -> Array:
+## (`keep`, by folder name) and another Zenith's unpacking now; with pack_cache_keep days, a copy
+## of a zip not in this folder only once unused that long (last_used); a copy of a zip of this folder
+## (`here`, by zip name) not kept, changed since or refused (it may hold Factorio's files), at once.
+## Stamps left without their copy go too.
+static func _stale_copies(keep: Dictionary, here := {}) -> Array:
 	var root := ProjectSettings.globalize_path(cache_root)
 	var out: Array = []
 	if not DirAccess.dir_exists_absolute(root):
 		return out
-	var old := int(Time.get_unix_time_from_system()) - PART_AGE
-	for d in DirAccess.get_directories_at(root):
+	var now := int(Time.get_unix_time_from_system())
+	var old := now - PART_AGE
+	var kept_zips := here.duplicate()
+	for d: String in keep:
+		kept_zips[_copy_zip_name(d)] = true
+	var dirs := DirAccess.get_directories_at(root)
+	for d in dirs:
 		if keep.has(d):
 			continue
-		if d.contains(".part-") and FileAccess.get_modified_time(root.path_join(d)) > old:
+		if d.contains(".part-"):
+			if FileAccess.get_modified_time(root.path_join(d)) > old:
+				continue
+		elif pack_cache_keep > 0 and not kept_zips.has(_copy_zip_name(d)) \
+				and last_used(root.path_join(d)) > now - pack_cache_keep * 86400:
 			continue
 		out.append(root.path_join(d))
+	for f in DirAccess.get_files_at(root):
+		if f.ends_with(USED_SUFFIX) and not dirs.has(f.trim_suffix(USED_SUFFIX)):
+			DirAccess.remove_absolute(root.path_join(f))
 	return out
+
+
+## The zip's name part of a copy's folder name ("<zip name>-<size>-<modified>").
+static func _copy_zip_name(d: String) -> String:
+	var parts := d.rsplit("-", true, 2)
+	return parts[0] if parts.size() == 3 and parts[1].is_valid_int() and parts[2].is_valid_int() else d
+
+
+## When an unpacked copy (its folder) was last used: the time in its stamp (Unix seconds), else the
+## folder's own modified time.
+static func last_used(copy: String) -> int:
+	var stamp := FileAccess.get_file_as_string(copy + USED_SUFFIX).strip_edges() if FileAccess.file_exists(copy + USED_SUFFIX) else ""
+	if stamp.is_valid_int():
+		return stamp.to_int()
+	return int(FileAccess.get_modified_time(copy))
+
+
+## Marks the copy `name` (a folder in the cache, perhaps not unpacked yet) used now.
+static func _touch_used(name: String) -> void:
+	var root := ProjectSettings.globalize_path(cache_root)
+	if not DirAccess.dir_exists_absolute(root):
+		DirAccess.make_dir_recursive_absolute(root)
+	var f := FileAccess.open(root.path_join(name + USED_SUFFIX), FileAccess.WRITE)
+	if f != null:
+		f.store_string(str(int(Time.get_unix_time_from_system())))
+		f.close()
+
+
+static func _keep_days() -> int:
+	for a: String in Switches.args():
+		if a.begins_with("--pack-cache-keep="):
+			return maxi(0, a.trim_prefix("--pack-cache-keep=").to_int())
+	return PACK_CACHE_KEEP_DAYS
 
 
 ## A folder's models (`depth` folders down at most): name -> file, the one nearest the top first,
@@ -1750,6 +2473,8 @@ static func _walk(dir: String, d: int, depth: int, found: Dictionary, items: Var
 	for sub in DirAccess.get_directories_at(dir):
 		if sub.begins_with(".") or sub == "__MACOSX":
 			continue
+		if items is Dictionary and d <= 1 and sub.to_lower() == DECOR_DIR:
+			continue  # decoratives/*.glb are indexed separately by _index_decoratives()
 		if items is Dictionary and sub.to_lower() == ITEMS_DIR:
 			_walk(dir.path_join(sub), d + 1, depth, items, null)
 		else:
@@ -1863,6 +2588,341 @@ static func _in_sounds_dir(rel: String) -> bool:
 	return false
 
 
+static func _is_digits(s: String) -> bool:
+	if s.is_empty():
+		return false
+	for i in s.length():
+		var c := s.unicode_at(i)
+		if c < 48 or c > 57:
+			return false
+	return true
+
+
+static func _split_tile_map(stem: String) -> Array:
+	for pair: Array in [
+		["-normal", "normal"], ["_normal", "normal"],
+		["-height", "height"], ["_height", "height"],
+		["-bump", "height"], ["_bump", "height"],
+		["-roughness", "roughness"], ["_roughness", "roughness"],
+	]:
+		var suffix := str(pair[0])
+		if stem.ends_with(suffix) and stem.length() > suffix.length():
+			return [stem.substr(0, stem.length() - suffix.length()), str(pair[1])]
+	return [stem, ""]
+
+
+## A pack's ground tiles, from its `tiles/` folder at `root` or (`depth` 1) one folder down,
+## the top's first: `<tile-name>` -> sorted Array of picture file paths. If `tile_maps` is a
+## Dictionary, companion PBR maps (`-normal`, `-height`/`-bump`, `-roughness`) go there as
+## `<tile-name>` -> {kind -> sorted Array of file paths}.
+static func _index_tiles(root: String, depth: int, tile_maps: Variant = null) -> Dictionary:
+	var dir := _tiles_dir(root)
+	if dir == "" and depth > 0 and DirAccess.dir_exists_absolute(root):
+		var subs := Array(DirAccess.get_directories_at(root))
+		subs.sort()
+		for sub: String in subs:
+			if sub.begins_with(".") or sub == "__MACOSX":
+				continue
+			dir = _tiles_dir(root.path_join(sub))
+			if dir != "":
+				break
+	if dir == "":
+		return {}
+	var singles := {}      # tile_name -> [depth, ext_rank, path]
+	var groups := {}       # tile_name -> [depth, dir_path, {stem -> [ext_rank, path]}]
+	var map_singles := {}  # kind -> {tile_name -> [depth, ext_rank, path]}
+	var map_groups := {}   # kind -> {tile_name -> [depth, dir_path, {stem -> [ext_rank, path]}]}
+	_walk_tiles(dir, "", 0, singles, groups, map_singles, map_groups)
+	var out := {}
+	var sort_variants := func(a: Array, b: Array) -> bool:
+		var sa := str(a[0])
+		var sb := str(b[0])
+		var ia := int(sa)
+		var ib := int(sb)
+		if ia != ib:
+			return ia < ib
+		if sa.length() != sb.length():
+			return sa.length() < sb.length()
+		return sa < sb
+	var collect_kind := func(s_dict: Dictionary, g_dict: Dictionary) -> Dictionary:
+		var res := {}
+		var all_names := {}
+		for k in s_dict:
+			all_names[k] = true
+		for k in g_dict:
+			all_names[k] = true
+		for tname: String in all_names:
+			var has_s := s_dict.has(tname)
+			var has_g := g_dict.has(tname)
+			var use_group := has_g and (not has_s or int((g_dict[tname] as Array)[0]) <= int((s_dict[tname] as Array)[0]))
+			if use_group:
+				var files_map: Dictionary = (g_dict[tname] as Array)[2]
+				var items: Array = []
+				for stem: String in files_map:
+					items.append([stem, str((files_map[stem] as Array)[1])])
+				items.sort_custom(sort_variants)
+				var paths: Array = []
+				for it: Array in items:
+					paths.append(it[1])
+				res[tname] = paths
+			elif has_s:
+				res[tname] = [str((s_dict[tname] as Array)[2])]
+		return res
+	out = collect_kind.call(singles, groups)
+	if tile_maps is Dictionary:
+		var maps_out := tile_maps as Dictionary
+		for kind: String in ["normal", "height", "roughness"]:
+			var ms: Dictionary = map_singles.get(kind, {})
+			var mg: Dictionary = map_groups.get(kind, {})
+			if ms.is_empty() and mg.is_empty():
+				continue
+			var per_kind: Dictionary = collect_kind.call(ms, mg)
+			for tname: String in per_kind:
+				if not maps_out.has(tname):
+					maps_out[tname] = {}
+				(maps_out[tname] as Dictionary)[kind] = per_kind[tname]
+	return out
+
+
+static func _put_tile_group(g_dict: Dictionary, tname: String, d: int, dir: String, vkey: String, rank: int, full: String) -> void:
+	if not g_dict.has(tname):
+		g_dict[tname] = [d, dir, {}]
+	var grp: Array = g_dict[tname]
+	if d < int(grp[0]) or (d == int(grp[0]) and dir.naturalnocasecmp_to(str(grp[1])) < 0):
+		grp[0] = d
+		grp[1] = dir
+		grp[2] = {}
+	if str(grp[1]) == dir:
+		var fmap: Dictionary = grp[2]
+		var cur: Variant = fmap.get(vkey)
+		if cur == null or rank < int((cur as Array)[0]):
+			fmap[vkey] = [rank, full]
+
+
+static func _walk_tiles(dir: String, parent_name: String, d: int, singles: Dictionary, groups: Dictionary,
+		map_singles: Dictionary, map_groups: Dictionary) -> void:
+	var seen := {}
+	for f in DirAccess.get_files_at(dir):
+		if dir.begins_with("res://") and (f.ends_with(".import") or f.ends_with(".remap")):
+			f = f.get_basename()
+		seen[f] = true
+	for f: String in seen:
+		var rank := TILE_EXTS.find(f.get_extension().to_lower())
+		if rank < 0:
+			continue
+		var stem := f.get_basename().to_lower()
+		var full := dir.path_join(f)
+		if d >= 1 and parent_name != "" and stem in ["normal", "height", "bump", "roughness"]:
+			var kind := "height" if stem == "bump" else stem
+			if not map_singles.has(kind):
+				map_singles[kind] = {}
+			var ks: Dictionary = map_singles[kind]
+			var here := [d, rank, full]
+			var have: Array = ks.get(parent_name, [])
+			if have.is_empty() or _nearer(here, have):
+				ks[parent_name] = here
+			continue
+		var sp := _split_tile_map(stem)
+		var base := str(sp[0])
+		var kind := str(sp[1])
+		if kind != "":
+			if d >= 1 and parent_name != "" and _is_digits(base):
+				if not map_groups.has(kind):
+					map_groups[kind] = {}
+				_put_tile_group(map_groups[kind], parent_name, d, dir, base, rank, full)
+			else:
+				if not map_singles.has(kind):
+					map_singles[kind] = {}
+				var ks: Dictionary = map_singles[kind]
+				var here := [d, rank, full]
+				var have: Array = ks.get(base, [])
+				if have.is_empty() or _nearer(here, have):
+					ks[base] = here
+		elif d >= 1 and parent_name != "" and _is_digits(stem):
+			_put_tile_group(groups, parent_name, d, dir, stem, rank, full)
+		else:
+			var here := [d, rank, full]
+			var have: Array = singles.get(stem, [])
+			if have.is_empty() or _nearer(here, have):
+				singles[stem] = here
+	if d >= TILE_DEPTH:
+		return
+	var subs := Array(DirAccess.get_directories_at(dir))
+	subs.sort_custom(func(a: String, b: String) -> bool: return a.naturalnocasecmp_to(b) < 0)
+	for sub: String in subs:
+		if not sub.begins_with(".") and sub != "__MACOSX":
+			_walk_tiles(dir.path_join(sub), sub.to_lower(), d + 1, singles, groups, map_singles, map_groups)
+
+
+## `root`'s tiles/ folder (any case), "" without one.
+static func _tiles_dir(root: String) -> String:
+	if not DirAccess.dir_exists_absolute(root):
+		return ""
+	for sub in DirAccess.get_directories_at(root):
+		if sub.to_lower() == TILES_DIR:
+			return root.path_join(sub)
+	return ""
+
+
+## Whether a zip entry is a ground tile's: under tiles/ at its top or one folder down, up to TILE_DEPTH.
+static func _in_tiles_dir(rel: String) -> bool:
+	return _zip_tile_name(rel) != ""
+
+
+## Logical tile name for a zip entry inside tiles/, "" if outside tiles/ or too deep/hidden.
+static func _zip_tile_name(rel: String) -> String:
+	var parts := rel.split("/")
+	for i in mini(2, parts.size() - 1):
+		if parts[i].to_lower() == TILES_DIR:
+			var d := parts.size() - i - 2
+			if d < 0 or d > TILE_DEPTH:
+				return ""
+			for j in range(i + 1, parts.size() - 1):
+				if parts[j].begins_with(".") or parts[j] == "__MACOSX":
+					return ""
+			var stem := rel.get_file().get_basename().to_lower()
+			if d >= 1 and stem in ["normal", "height", "bump", "roughness"]:
+				return parts[parts.size() - 2].to_lower()
+			var sp := _split_tile_map(stem)
+			var base := str(sp[0])
+			var kind := str(sp[1])
+			if kind != "":
+				if d >= 1 and _is_digits(base):
+					return parts[parts.size() - 2].to_lower()
+				return base
+			if d >= 1 and _is_digits(stem):
+				return parts[parts.size() - 2].to_lower()
+			return stem
+	return ""
+
+
+static func _decor_variant_key(stem: String) -> Array:
+	var at := stem.rfind("-")
+	if at > 0 and _is_digits(stem.substr(at + 1)):
+		return [stem.substr(0, at), stem.substr(at + 1)]
+	return [stem, ""]
+
+
+## A pack's decoratives and grass, from its `decoratives/` folder at `root` or (`depth` 1) one
+## folder down, the top's first: `<decor-name>` -> sorted Array of picture file paths.
+static func _index_decoratives(root: String, depth: int) -> Dictionary:
+	var dir := _decor_dir(root)
+	if dir == "" and depth > 0 and DirAccess.dir_exists_absolute(root):
+		var subs := Array(DirAccess.get_directories_at(root))
+		subs.sort()
+		for sub: String in subs:
+			if sub.begins_with(".") or sub == "__MACOSX":
+				continue
+			dir = _decor_dir(root.path_join(sub))
+			if dir != "":
+				break
+	if dir == "":
+		return {}
+	var groups := {}  # decor_name -> {"0:" + vkey -> image, "1:" + vkey -> model}
+	_walk_decoratives(dir, "", 0, groups)
+	var out := {}
+	var sort_variants := func(a: Array, b: Array) -> bool:
+		var sa := str(a[0])
+		var sb := str(b[0])
+		var ka := sa.substr(2) if sa.length() >= 2 else sa
+		var kb := sb.substr(2) if sb.length() >= 2 else sb
+		var ma := sa.left(2)
+		var mb := sb.left(2)
+		if ma != mb:
+			return ma > mb  # models ("1:") listed first, then images ("0:")
+		if ka == "" or kb == "":
+			return ka < kb
+		var ia := int(ka)
+		var ib := int(kb)
+		if ia != ib:
+			return ia < ib
+		if ka.length() != kb.length():
+			return ka.length() < kb.length()
+		return ka < kb
+	for dname: String in groups:
+		var vmap: Dictionary = groups[dname]
+		var items: Array = []
+		for vkey: String in vmap:
+			items.append([vkey, str((vmap[vkey] as Array)[2])])
+		items.sort_custom(sort_variants)
+		var paths: Array = []
+		for it: Array in items:
+			paths.append(it[1])
+		out[dname] = paths
+	return out
+
+
+static func _walk_decoratives(dir: String, parent_name: String, d: int, groups: Dictionary) -> void:
+	var seen := {}
+	for f in DirAccess.get_files_at(dir):
+		if dir.begins_with("res://") and (f.ends_with(".import") or f.ends_with(".remap")):
+			f = f.get_basename()
+		seen[f] = true
+	for f: String in seen:
+		var rank := DECOR_EXTS.find(f.get_extension().to_lower())
+		if rank < 0:
+			continue
+		var stem := f.get_basename().to_lower()
+		var full := dir.path_join(f)
+		var dname := ""
+		var vkey := ""
+		if d >= 1 and parent_name != "" and _is_digits(stem):
+			dname = parent_name
+			vkey = stem
+		else:
+			var sp := _decor_variant_key(stem)
+			dname = str(sp[0])
+			vkey = str(sp[1])
+		if dname == "":
+			continue
+		var key_prefix := "1:" if is_decor_model(full) else "0:"
+		var vslot := key_prefix + vkey
+		if not groups.has(dname):
+			groups[dname] = {}
+		var vmap: Dictionary = groups[dname]
+		var here := [d, rank, full]
+		var have: Array = vmap.get(vslot, [])
+		if have.is_empty() or _nearer(here, have):
+			vmap[vslot] = here
+	if d >= DECOR_DEPTH:
+		return
+	var subs := Array(DirAccess.get_directories_at(dir))
+	subs.sort_custom(func(a: String, b: String) -> bool: return a.naturalnocasecmp_to(b) < 0)
+	for sub: String in subs:
+		if not sub.begins_with(".") and sub != "__MACOSX":
+			_walk_decoratives(dir.path_join(sub), sub.to_lower(), d + 1, groups)
+
+
+static func _decor_dir(root: String) -> String:
+	if not DirAccess.dir_exists_absolute(root):
+		return ""
+	for sub in DirAccess.get_directories_at(root):
+		if sub.to_lower() == DECOR_DIR:
+			return root.path_join(sub)
+	return ""
+
+
+static func _in_decor_dir(rel: String) -> bool:
+	return _zip_decor_name(rel) != ""
+
+
+static func _zip_decor_name(rel: String) -> String:
+	var parts := rel.split("/")
+	for i in mini(2, parts.size() - 1):
+		if parts[i].to_lower() == DECOR_DIR:
+			var d := parts.size() - i - 2
+			if d < 0 or d > DECOR_DEPTH:
+				return ""
+			for j in range(i + 1, parts.size() - 1):
+				if parts[j].begins_with(".") or parts[j] == "__MACOSX":
+					return ""
+			var stem := rel.get_file().get_basename().to_lower()
+			if d >= 1 and _is_digits(stem):
+				return parts[parts.size() - 2].to_lower()
+			return str(_decor_variant_key(stem)[0])
+	return ""
+
+
 static func _nearer(a: Array, b: Array) -> bool:
 	if int(a[0]) != int(b[0]):
 		return int(a[0]) < int(b[0])
@@ -1927,6 +2987,100 @@ static func _parse_info(text: String) -> Dictionary:
 				aliases[str(from).strip_edges().to_lower()] = str(to).strip_edges().to_lower()
 		if not aliases.is_empty():
 			out["aliases"] = aliases
+	# "tiles": {"<tile pattern, * allowed>": {"size": 2 | [w, h], "count": n, "roughness": r, "specular": s}}
+	if data.get("tiles") is Dictionary:
+		var tiles_cfg := {}
+		for k: Variant in (data["tiles"] as Dictionary):
+			var pat := str(k).strip_edges().to_lower()
+			var raw_val: Variant = (data["tiles"] as Dictionary)[k]
+			if pat == "" or not (raw_val is Dictionary):
+				continue
+			var entry := raw_val as Dictionary
+			var spec := {}
+			var sv: Variant = entry.get("size")
+			if sv is int or sv is float:
+				var s := int(sv)
+				if s >= 1 and s <= 16:
+					spec["size"] = [s, s]
+			elif sv is Array and (sv as Array).size() >= 2:
+				var sa := sv as Array
+				if (sa[0] is int or sa[0] is float) and (sa[1] is int or sa[1] is float):
+					var w := int(sa[0])
+					var h := int(sa[1])
+					if w >= 1 and w <= 32 and h >= 1 and h <= 16:
+						spec["size"] = [w, h]
+			var cv: Variant = entry.get("count")
+			if cv is int or cv is float:
+				var cnt := int(cv)
+				if cnt >= 1 and cnt <= 64:
+					spec["count"] = cnt
+			var rv: Variant = entry.get("roughness")
+			if rv is int or rv is float:
+				spec["roughness"] = clampf(float(rv), 0.01, 1.0)
+			var spv: Variant = entry.get("specular")
+			if spv is int or spv is float:
+				spec["specular"] = clampf(float(spv), 0.0, 0.99)
+			var nsv: Variant = entry.get("normal_strength")
+			if nsv is int or nsv is float:
+				spec["normal_strength"] = clampf(float(nsv), 0.0, 4.0)
+			var hsv: Variant = entry.get("height_strength")
+			if hsv is int or hsv is float:
+				spec["height_strength"] = clampf(float(hsv), 0.0, 4.0)
+			if entry.get("normal_flip_x") is bool:
+				spec["normal_flip_x"] = entry["normal_flip_x"]
+			if entry.get("normal_flip_y") is bool:
+				spec["normal_flip_y"] = entry["normal_flip_y"]
+			if not spec.is_empty():
+				tiles_cfg[pat] = spec
+		if not tiles_cfg.is_empty():
+			out["tiles"] = tiles_cfg
+	# "decoratives": {"<decor pattern, * allowed>": {"scale": f, "size": f | [w, h], "shift": [dx, dy],
+	#   "layer": str, "grass": bool, "grass_height": f, "grass_style": "auto"|"tuft"|"bush"|"carpet", "hide": bool}}
+	if data.get("decoratives") is Dictionary:
+		var decor_cfg := {}
+		for k: Variant in (data["decoratives"] as Dictionary):
+			var pat := str(k).strip_edges().to_lower()
+			var raw_val: Variant = (data["decoratives"] as Dictionary)[k]
+			if pat == "" or not (raw_val is Dictionary):
+				continue
+			var entry := raw_val as Dictionary
+			var spec := {}
+			var scv: Variant = entry.get("scale")
+			if scv is int or scv is float:
+				spec["scale"] = clampf(float(scv), 0.05, 8.0)
+			var dsv: Variant = entry.get("size")
+			if dsv is int or dsv is float:
+				var s := clampf(float(dsv), 0.05, 32.0)
+				spec["size"] = [s, s]
+			elif dsv is Array and (dsv as Array).size() >= 2:
+				var sa := dsv as Array
+				if (sa[0] is int or sa[0] is float) and (sa[1] is int or sa[1] is float):
+					spec["size"] = [clampf(float(sa[0]), 0.05, 32.0), clampf(float(sa[1]), 0.05, 32.0)]
+			var shv: Variant = entry.get("shift")
+			if shv is Array and (shv as Array).size() >= 2:
+				var sha := shv as Array
+				if (sha[0] is int or sha[0] is float) and (sha[1] is int or sha[1] is float):
+					spec["shift"] = [clampf(float(sha[0]), -16.0, 16.0), clampf(float(sha[1]), -16.0, 16.0)]
+			if entry.get("layer") is String:
+				var lyr := str(entry["layer"]).strip_edges().to_lower()
+				if lyr in ["decals", "ground-layer-1", "ground-layer-2", "ground-layer-3",
+						"ground-layer-4", "ground-layer-5", "floor", "decorative", "object"]:
+					spec["layer"] = lyr
+			if entry.get("grass") is bool:
+				spec["grass"] = entry["grass"]
+			var ghv: Variant = entry.get("grass_height")
+			if ghv is int or ghv is float:
+				spec["grass_height"] = clampf(float(ghv), 0.05, 2.0)
+			if entry.get("grass_style") is String:
+				var st := str(entry["grass_style"]).strip_edges().to_lower()
+				if st in ["auto", "tuft", "bush", "carpet"]:
+					spec["grass_style"] = st
+			if entry.get("hide") is bool:
+				spec["hide"] = entry["hide"]
+			if not spec.is_empty():
+				decor_cfg[pat] = spec
+		if not decor_cfg.is_empty():
+			out["decoratives"] = decor_cfg
 	var licence: Variant = data.get("licence", data.get("license"))
 	if licence != null:
 		out["licence"] = str(licence)

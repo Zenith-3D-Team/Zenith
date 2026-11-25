@@ -25,6 +25,7 @@ const FIRST_PERSON_ORTHO_SIZE := 12.0
 const LOOK_DEGREES_PER_PIXEL := 0.15
 const Settings := preload("res://scripts/menu/settings.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Issue #17: on an add-on's hills the view's centre stayed at the flat height under the character, so
 ## the character stood off the screen's centre (zoomed in at a low tilt on a 3-tile hill, off the screen)
@@ -33,14 +34,14 @@ const GroundHeight := preload("res://scripts/world/ground_height.gd")
 ## projection, on the hills too (owner: "should just always be in the middle"), the camera tilts up over
 ## ground that would come between, and it is on the character as it moves. `--camera-focus=off`: the
 ## camera as before.
-static var focus_fix := not ("--camera-focus=off" in OS.get_cmdline_user_args())
+static var focus_fix := Switches.on("--camera-focus")
 ## L1 (the owner's playtest): zoomed, turned or tilted out of Factorio's view (F6), the view stayed
 ## orthographic, Factorio's, while F7 flipped the normal view's setting (still perspective), so its
 ## first press said "Normal view: orthographic" and changed nothing; it took two. Now leaving Factorio's
 ## view that way puts the normal view's own projection back (Settings > Camera, as I19 has it), and F7
 ## always switches what is on screen and says so: in Factorio's view itself it leaves it where it is,
 ## in the other projection. `--f6-leave=old`: the view stays orthographic and F7 there as before.
-static var f6_leave_fix := not ("--f6-leave=old" in OS.get_cmdline_user_args())
+static var f6_leave_fix := not (Switches.has("--f6-leave=old"))
 ## The 1.7-tile character's middle over its feet: the view's centre.
 const BODY_MID := 0.85
 ## The default zoom: the up and down glide below is as tight on screen at every zoom as there.
@@ -98,6 +99,8 @@ var map_handoff_distance := INF
 
 ## The wheel zoomed out past map_handoff_distance.
 signal zoomed_out_to_map
+## Emitted whenever the camera switches between perspective and orthographic projection.
+signal projection_changed(orthographic: bool)
 
 ## VR (scripts/vr/vr_session.gd): the headset's camera, which then decides which way is forward
 ## for walking, and the controller's laser as [origin, direction], which then stands in for the
@@ -129,6 +132,7 @@ var _settle_pitch := NAN
 ## the camera was before, to put back: empty while no add-on has it.
 var _taken := {}
 var taken_focus := Vector2.INF
+var taken_cone := false
 ## The ground's hold on the camera (focus_fix): the lowest pitch that keeps it over the hills in
 ## perspective, and in an orthographic view the tiles it stands back along its axis instead (which
 ## changes nothing seen, so Factorio's view keeps its angle). Both rise at once and ease off.
@@ -145,7 +149,7 @@ var _glide := Vector3.ZERO
 ## add-on's take-over. Drawn only: walking reads the view from before them (ground_forward), and the
 ## first-person pick reaches no further from a moved eye (modifier_reach). `--camera-modifiers=off`:
 ## the rig ignores them.
-static var modifiers_on := not ("--camera-modifiers=off" in OS.get_cmdline_user_args())
+static var modifiers_on := Switches.on("--camera-modifiers")
 var _mod_offset := Vector3.ZERO
 var _mod_turn := Vector3.ZERO
 var _mod_fov := 0.0
@@ -167,13 +171,13 @@ func _ready() -> void:
 	camera.far = 2000.0
 	add_child(camera)
 	camera.make_current()
-	configure_from(OS.get_cmdline_user_args())
+	configure_from(Switches.args())
 	_centre_now()
 	# --camera=factorio starts in Factorio's view (handy for screenshots).
-	if "--camera=factorio" in OS.get_cmdline_user_args():
+	if Switches.has("--camera=factorio"):
 		toggle_factorio_view.call_deferred()
 	# --camera=first-person starts in the character's eyes (for screenshots).
-	if "--camera=first-person" in OS.get_cmdline_user_args():
+	if Switches.has("--camera=first-person"):
 		toggle_first_person.call_deferred()
 	apply_settings()
 	if not Settings.has_arg("--camera="):
@@ -221,12 +225,11 @@ func _process(delta: float) -> void:
 		# Set only when it differs: Camera3D's setters don't check, and each one updates the
 		# rendering server's camera and emits property_list_changed.
 		if first_person_orthographic:
-			if camera.projection != Camera3D.PROJECTION_ORTHOGONAL:
-				camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+			_set_projection(Camera3D.PROJECTION_ORTHOGONAL)
 			if not is_equal_approx(camera.size, FIRST_PERSON_ORTHO_SIZE):
 				camera.size = FIRST_PERSON_ORTHO_SIZE
-		elif camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
-			camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+		else:
+			_set_projection(Camera3D.PROJECTION_PERSPECTIVE)
 		_modify()
 		return
 	if target != null:
@@ -252,12 +255,18 @@ func _process(delta: float) -> void:
 	var turn := Basis(Vector3.UP, deg_to_rad(yaw_degrees)) * Basis(Vector3.RIGHT, -deg_to_rad(shown_pitch()))
 	camera.transform = Transform3D(turn, turn * Vector3(0.0, 0.0, distance + _ground_back))
 	if view_orthographic():
-		if camera.projection != Camera3D.PROJECTION_ORTHOGONAL:
-			camera.projection = Camera3D.PROJECTION_ORTHOGONAL
+		_set_projection(Camera3D.PROJECTION_ORTHOGONAL)
 		camera.size = distance * ORTHO_SCALE
-	elif camera.projection != Camera3D.PROJECTION_PERSPECTIVE:
-		camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+	else:
+		_set_projection(Camera3D.PROJECTION_PERSPECTIVE)
 	_modify()
+
+
+func _set_projection(proj: Camera3D.ProjectionType) -> void:
+	if camera.projection == proj:
+		return
+	camera.projection = proj
+	projection_changed.emit(proj == Camera3D.PROJECTION_ORTHOGONAL)
 
 
 ## (1.7) The add-ons' modifier, already summed and capped (addon_host.gd), drawn from the next _process.
@@ -485,11 +494,12 @@ func hand_back() -> void:
 	_taken = {}
 	_taken_aim_center = false
 	taken_focus = Vector2.INF
+	taken_cone = false
 	camera.top_level = false
 	camera.fov = float(t["fov"])
 	camera.near = float(t["near"])
 	camera.far = float(t["far"])
-	camera.projection = t["projection"]
+	_set_projection(int(t["projection"]) as Camera3D.ProjectionType)
 	camera.size = float(t["size"])
 	camera.attributes = t["attributes"]
 	camera.keep_aspect = t["keep_aspect"]
@@ -502,6 +512,10 @@ func hand_back() -> void:
 
 func taken() -> bool:
 	return not _taken.is_empty()
+
+
+func use_view_cone() -> bool:
+	return taken() and taken_cone
 
 
 ## (Add-on API 1.7) api.character's `view` point: a child of the camera (no frame of lag), made on first

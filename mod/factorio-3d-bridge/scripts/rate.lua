@@ -70,6 +70,7 @@ local JOBS = {
   ih = { tier = 3, max = 24, phase = 3 },     -- inserter hands
   gi = { tier = 3, max = 120, phase = 29, slack = 6, price = 0.1, cost = 10 },   -- items on the ground
   rc = { tier = 3, max = 40, phase = 13, slack = 6, price = 0.1, cost = 10 },    -- robots' cargo
+  rb = { tier = 3, max = 16, phase = 9 },                                        -- robot flight updates (event-driven + heartbeat)
   pol = { tier = 3, max = 1200, phase = 53, slack = 30, price = 0.02, cost = 15 }, -- chunks' pollution (pollution.lua)
 }
 
@@ -166,6 +167,14 @@ function M.period(name, interval, double, cap)
   return period_at(name, interval, M.level(), double, cap)
 end
 
+-- Near-bubble counterpart to `M.period`: stays at level 0 (factor 1) while `near_rate` is on.
+function M.period_near(name, interval, double, cap)
+  if perf.on("near_rate") then
+    return period_at(name, interval, 0, double, cap)
+  end
+  return M.period(name, interval, double, cap)
+end
+
 -- Whether a job with this period runs this tick at `level`.
 local function on_ticks(name, interval, level, double, cap)
   local p = period_at(name, interval, level, double, cap)
@@ -175,20 +184,21 @@ local function on_ticks(name, interval, level, double, cap)
   return game.tick % p == phase % p, p
 end
 
--- Whether job `name` (every `interval` ticks at level 0) runs this tick. For EASE_TICKS after a
--- slow-down an `ease` job also still runs on its old ticks, so no gap is ever longer than its `p`.
-function M.due(name, interval, double, cap)
+local function due_at(name, interval, double, cap, near)
   local s = storage.f3d
-  local now, p = on_ticks(name, interval, s.rate or 0, double, cap)
+  local level = near and 0 or (s.rate or 0)
+  local now, p = on_ticks(name, interval, level, double, cap)
   local t = game.tick
-  if not now and JOBS[name].ease and s.rate_at and (s.rate_from or 0) < (s.rate or 0) and t < s.rate_at + EASE_TICKS then
+  if not near and not now and JOBS[name].ease and s.rate_at and (s.rate_from or 0) < (s.rate or 0)
+      and t < s.rate_at + EASE_TICKS then
     now = on_ticks(name, interval, s.rate_from or 0, double, cap)
   end
   local job = JOBS[name]
+  local key = near and (name .. "_near") or name
   if job.slack then
     -- Due now or waiting since: it runs when the tick has room for it, or its slack ran out.
     s.rate_wait = s.rate_wait or {}
-    local since = s.rate_wait[name]
+    local since = s.rate_wait[key]
     if now and not since then
       since = t
     end
@@ -196,17 +206,32 @@ function M.due(name, interval, double, cap)
       return false
     end
     if not budget.admit(name, job.cost, t - since >= math.min(job.slack, p - 1)) then
-      s.rate_wait[name] = since
+      s.rate_wait[key] = since
       return false
     end
-    s.rate_wait[name] = nil
+    s.rate_wait[key] = nil
   elseif not now then
     return false
   end
   s.rate_jobs = s.rate_jobs or {}
-  local j = s.rate_jobs[name]
-  s.rate_jobs[name] = { prev = j and j.last or t - p, last = t }
+  local j = s.rate_jobs[key]
+  s.rate_jobs[key] = { prev = j and j.last or t - p, last = t }
   return true
+end
+
+-- Whether job `name` (every `interval` ticks at level 0) runs this tick. For EASE_TICKS after a
+-- slow-down an `ease` job also still runs on its old ticks, so no gap is ever longer than its `p`.
+function M.due(name, interval, double, cap)
+  return due_at(name, interval, double, cap, false)
+end
+
+-- Near-bubble counterpart to `M.due`: stays at level 0 cadence (still honoring `job.slack` via
+-- `budget.admit`) while `near_rate` is on; delegates to `M.due` when off.
+function M.due_near(name, interval, double, cap)
+  if perf.on("near_rate") then
+    return due_at(name, interval, double, cap, true)
+  end
+  return M.due(name, interval, double, cap)
 end
 
 -- Job `name` (one with a slack) read `count` entities this run: what it is expected to cost next.
@@ -220,7 +245,11 @@ end
 -- Whether a multiple of `every` passed since the job's run before this one (due just said yes):
 -- for work a job did on `game.tick % every == 0`, which a stretched job's ticks may never land on.
 function M.crossed(name, every)
-  local j = storage.f3d.rate_jobs[name]
+  local jobs = storage.f3d.rate_jobs
+  local j = jobs and jobs[name]
+  if not j then
+    return false
+  end
   return math.floor(j.last / every) ~= math.floor(j.prev / every)
 end
 

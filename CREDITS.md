@@ -49,6 +49,16 @@ models: the textured transport belts (with their curves and start and end pieces
 underground belts, inserters and burner mining drill in the development builds' Zenith model pack
 (`models/Zenith.zip`) are his, used with his permission, and not under the GPL.
 
+## Weather audio (Immersive Weather add-on)
+
+The wind, rain and thunder `.ogg` clips bundled in `addons-src/immersive-weather/sounds/` are from
+**Weather Elements** (https://heltonyan.itch.io/weatherelements) by **Helton Yan**, licensed under
+**CC BY 4.0** (https://creativecommons.org/licenses/by/4.0/). Selected stereo 44.1 kHz WAV files
+were trimmed, crossfaded or faded out, loudness-normalized, and encoded to Ogg Vorbis; each
+file's source clip mapping is listed in
+[addons-src/immersive-weather/CREDITS.md](addons-src/immersive-weather/CREDITS.md). They keep CC BY 4.0,
+not the GPL.
+
 ## Tools and libraries
 
 - [Godot Engine](https://godotengine.org) (MIT), the client.

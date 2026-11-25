@@ -14,7 +14,11 @@ extends Node3D
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
+const LampLights := preload("res://scripts/world/lamp_lights.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
 const ADD_SHADER := preload("res://shaders/fx_sprite_add.gdshader")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 const RADIUS := 40.0
 ## Full detail (full_detail.gd, a screenshot): fires and lab glows this far, with this many lights.
@@ -22,6 +26,12 @@ const FULL_RADIUS := 400.0
 const FULL_LIGHTS := 48
 const REFRESH := 0.25
 const MAX_LIGHTS := 16
+## Scaled from far_chunks.detail_distance() by Settings > Graphics > Level of detail ([min_radius, max_lights, scale]).
+const LOD_TIERS := {"low": [28.0, 16, 0.5], "medium": [88.0, 32, 0.75], "high": [128.0, 48, 1.0], "ultra": [160.0, 64, 1.25]}
+const FAR_RADIUS_MAX := 180.0
+const FAR_SPLAT_RANGE := 4.5
+const FADE_FRAC := 0.25
+static var legacy_lights := Switches.has("--far-lights=old")
 const FADE_IN := 0.4
 const FADE_OUT := 1.2
 
@@ -53,16 +63,29 @@ const LAB_LOOP := 33.0 / 20.0
 ## The world mirror: entities, working states and the focus.
 var world: Node3D
 var protos: ProtoDB
+var far_chunks: Node
 
 var _sheets := {}  # sheet -> [MultiMeshInstance3D, aspect, frames, fps]
 var _lights: Array[OmniLight3D] = []
 var radius := RADIUS
 var max_lights := MAX_LIGHTS
+var _lod_quality := ""
+var _custom_lod_distance := 0.0
+var _base_radius := RADIUS
+var _base_max_lights := MAX_LIGHTS
+var _full_detail := false
+var _far_glows: Array = []  # [[Vector2 xz, Color, energy, range], ...] for lamp_lights' 2D lightmap
 ## entity key -> [rec, MACHINES entry, level 0-1, seed, prototype name, the hills' height under its
 ## light, GroundHeight.version() it was read at]
 var _shown := {}
+var _chunk_machines := {}  # chunk Vector2i -> Array of [unit, rec, MACHINES entry, seed, proto_name]
+var _proto_machine := {}  # proto_id -> [MACHINES entry, proto_name] or []
 var _timer := 0.0
 var _clock := 0.0
+
+
+func _on_entities_changed(c: Vector2i) -> void:
+	_chunk_machines.erase(c)
 
 
 func _ready() -> void:
@@ -92,6 +115,8 @@ func _ready() -> void:
 		add_child(mmi)
 		_sheets[name] = [mmi, float(spec[2]) / float(spec[1]), int(spec[3]), float(spec[5])]
 	_add_lights(MAX_LIGHTS)
+	if world != null and world.has_signal("entities_changed"):
+		world.entities_changed.connect(_on_entities_changed)
 
 
 func _add_lights(n: int) -> void:
@@ -104,10 +129,60 @@ func _add_lights(n: int) -> void:
 		_lights.append(light)
 
 
-## Fires and glows out to FULL_RADIUS with FULL_LIGHTS lights (a screenshot), or back as before.
+func apply_lod_quality(quality: String, custom_distance := 0.0) -> void:
+	var prev := _lod_quality
+	var prev_custom := _custom_lod_distance
+	_lod_quality = quality
+	_custom_lod_distance = maxf(custom_distance, 0.0)
+	if legacy_lights:
+		_base_radius = RADIUS
+		_base_max_lights = MAX_LIGHTS
+	else:
+		var spec: Array = LOD_TIERS.get(quality, LOD_TIERS["medium"])
+		_base_radius = float(spec[0])
+		_base_max_lights = int(spec[1])
+	if not _full_detail:
+		radius = _effective_radius()
+		max_lights = _base_max_lights
+		_add_lights(max_lights)
+		if prev != quality or not is_equal_approx(prev_custom, _custom_lod_distance):
+			_timer = REFRESH
+
+
+func _effective_radius() -> float:
+	if _full_detail:
+		return FULL_RADIUS
+	if legacy_lights or _lod_quality == "":
+		return _base_radius
+	var scale := 0.75
+	var min_r := _base_radius
+	var lod_r := _base_radius
+	if _custom_lod_distance > 0.0:
+		var low_spec: Array = LOD_TIERS["low"]
+		min_r = float(low_spec[0])
+		lod_r = 128.0 * clampf(_custom_lod_distance / 48.0, 0.25, 3.0) * scale
+	else:
+		var spec: Array = LOD_TIERS.get(_lod_quality, LOD_TIERS["medium"])
+		scale = float(spec[2])
+	if far_chunks != null and far_chunks.has_method("detail_distance"):
+		var fd := float(far_chunks.call("detail_distance"))
+		if fd > 0.0:
+			lod_r = fd * scale
+	var cap := FAR_RADIUS_MAX
+	if world != null and world.get("focus_radius") != null:
+		cap = minf(cap, float(world.get("focus_radius")))
+	return clampf(lod_r, min_r, maxf(cap, min_r))
+
+
+func far_glows() -> Array:
+	return _far_glows
+
+
+## Fires and glows out to FULL_RADIUS with FULL_LIGHTS lights (a screenshot), or back to LOD cap.
 func set_full_detail(on: bool) -> void:
-	radius = FULL_RADIUS if on else RADIUS
-	max_lights = FULL_LIGHTS if on else MAX_LIGHTS
+	_full_detail = on
+	radius = FULL_RADIUS if on else _effective_radius()
+	max_lights = FULL_LIGHTS if on else _base_max_lights
 	_add_lights(max_lights)
 	_timer = REFRESH
 
@@ -116,6 +191,9 @@ func set_full_detail(on: bool) -> void:
 ## fires don't fade out over the new one.
 func reset() -> void:
 	_shown.clear()
+	_far_glows.clear()
+	_chunk_machines.clear()
+	_proto_machine.clear()
 
 
 func count() -> int:
@@ -132,10 +210,22 @@ func _process(delta: float) -> void:
 	if _timer >= REFRESH:
 		_timer = 0.0
 		_refresh()
+	if _shown.is_empty():
+		for sheet in _sheets:
+			var mm_empty: MultiMesh = (_sheets[sheet][0] as MultiMeshInstance3D).multimesh
+			if mm_empty.visible_instance_count != 0:
+				mm_empty.visible_instance_count = 0
+		for l: OmniLight3D in _lights:
+			if l.visible:
+				l.visible = false
+		_far_glows.clear()
+		return
 	var focus: Vector2 = world.focus()
 	var buffers := {}
 	var lit: Array = []
 	var hills := GroundHeight.version()
+	var bc: Variant = world.get("behind_cull")
+	var check_behind: bool = ViewPriority.tight_cull and not _full_detail and bc != null and is_instance_valid(bc) and bc.is_active()
 	for key in _shown.keys():
 		var s: Array = _shown[key]
 		var on: bool = int(world.working.get(s[0].unit, 0)) == 1 and world.entities.has(key)
@@ -146,7 +236,9 @@ func _process(delta: float) -> void:
 			continue
 		var entry: Array = s[1]
 		var rec = s[0]
-		var turn := Basis(Vector3.UP, -float(rec.dir) / 16.0 * TAU)
+		if check_behind and bc.hidden(rec.chunk):
+			continue
+		var turn := Basis(Vector3.UP, Wire.direction_yaw(rec.dir))
 		var offset: Vector3 = entry[1]
 		if FACING_SPOTS.has(s[4]):
 			offset = FACING_SPOTS[s[4]][(int(rec.dir) >> 2) % 4]
@@ -177,9 +269,11 @@ func _process(delta: float) -> void:
 		if int(s[6]) != hills:
 			s[5] = GroundHeight.at(at.x, at.z)
 			s[6] = hills
-		lit.append([Vector2(at.x, at.z).distance_squared_to(focus), at + Vector3(0.0, float(s[5]), 0.0), entry[3], energy])
+		var lp := at + Vector3(0.0, float(s[5]), 0.0)
+		lit.append([Vector2(at.x, at.z).distance_squared_to(focus), lp, entry[3], energy, true])
 	for sheet in _sheets:
-		var mm: MultiMesh = (_sheets[sheet][0] as MultiMeshInstance3D).multimesh
+		var mmi := _sheets[sheet][0] as MultiMeshInstance3D
+		var mm := mmi.multimesh
 		var buf: PackedFloat32Array = buffers.get(sheet, PackedFloat32Array())
 		var n := buf.size() / 20
 		if mm.instance_count < n:
@@ -188,31 +282,107 @@ func _process(delta: float) -> void:
 			buf.resize(mm.instance_count * 20)
 			mm.buffer = buf
 		mm.visible_instance_count = n
-	lit.sort_custom(func(x: Array, y: Array) -> bool: return float(x[0]) < float(y[0]))
-	for i in _lights.size():
-		var light := _lights[i]
-		light.visible = i < lit.size() and i < max_lights
-		if light.visible:
-			light.position = (lit[i][1] as Vector3) + Vector3(0.0, 0.3, 0.25)
-			light.light_color = lit[i][2]
-			light.light_energy = lit[i][3]
+		mmi.visible = n > 0
+	var cam := get_viewport().get_camera_3d() if is_inside_tree() and get_viewport() != null else null
+	if not legacy_lights and not _full_detail and cam != null:
+		var fctx := LampLights.frustum_context(cam)
+		var keep_r2 := 36.0 if ViewPriority.tight_cull else 256.0
+		if not fctx.is_empty():
+			for item in lit:
+				var e: Array = item
+				e[4] = float(e[0]) <= keep_r2 or LampLights.in_frustum(fctx, e[1] as Vector3, 6.0)
+	var sort_glows := func(x: Array, y: Array) -> bool:
+		var vx := bool(x[4])
+		var vy := bool(y[4])
+		if vx != vy:
+			return vx
+		return float(x[0]) < float(y[0])
+	lit.sort_custom(sort_glows)
+	var eff_r := _effective_radius()
+	var cut_d := eff_r
+	if not legacy_lights and not _full_detail and lit.size() > max_lights and max_lights > 0:
+		if bool((lit[max_lights - 1] as Array)[4]) and bool((lit[max_lights] as Array)[4]):
+			cut_d = minf(eff_r, maxf(sqrt(float((lit[max_lights - 1] as Array)[0])), 16.0))
+	_far_glows.clear()
+	var real_used := 0
+	for i in lit.size():
+		var item: Array = lit[i]
+		var pos := item[1] as Vector3
+		var col := item[2] as Color
+		var energy := float(item[3])
+		var rw := 0.0
+		if i < max_lights and i < _lights.size() and (not ViewPriority.tight_cull or _full_detail or legacy_lights or bool(item[4])):
+			if _full_detail or legacy_lights:
+				rw = 1.0
+			else:
+				var d := sqrt(float(item[0]))
+				rw = LampLights.smooth_fade(cut_d * (1.0 - FADE_FRAC), cut_d, d)
+			var light := _lights[i]
+			if rw > 0.01:
+				light.visible = true
+				light.position = pos + Vector3(0.0, 0.3, 0.25)
+				light.light_color = col
+				light.light_energy = energy * rw
+				real_used = i + 1
+			else:
+				light.visible = false
+				rw = 0.0
+		var fw := 1.0 - rw
+		if fw > 0.02 and not legacy_lights and not _full_detail:
+			_far_glows.append([Vector2(pos.x, pos.z), col, energy * fw, FAR_SPLAT_RANGE])
+	for i in range(real_used, _lights.size()):
+		_lights[i].visible = false
 
 
 ## Which working machines of these kinds are near the focus.
 func _refresh() -> void:
+	radius = _effective_radius()
 	var focus: Vector2 = world.focus()
-	for unit in world.working_near(focus, radius):
-		if int(world.working.get(unit, 0)) != 1 or _shown.has(unit):
-			continue
-		var rec = world.entities.get(unit)
-		if rec == null or rec.pos.distance_to(focus) > radius:
-			continue
-		var proto: ProtoDB.EntityProto = protos.entity(rec.proto_id)
-		if proto == null or not MACHINES.has(proto.name):
-			continue
-		_shown[unit] = [rec, MACHINES[proto.name], 0.0, fposmod(rec.pos.x * 0.37 + rec.pos.y * 0.71, 1.0), proto.name, 0.0, -1]
+	var r2 := radius * radius
+	var lo: Vector2i = world.chunk_of(focus - Vector2(radius, radius))
+	var hi: Vector2i = world.chunk_of(focus + Vector2(radius, radius))
+	var bc: Variant = world.get("behind_cull")
+	var check_behind: bool = ViewPriority.tight_cull and not _full_detail and bc != null and is_instance_valid(bc) and bc.is_active()
+	for cy in range(lo.y, hi.y + 1):
+		for cx in range(lo.x, hi.x + 1):
+			var c := Vector2i(cx, cy)
+			if check_behind and bc.hidden(c):
+				continue
+			var cv = world.chunks.get(c)
+			if cv == null:
+				_chunk_machines.erase(c)
+				continue
+			var list: Variant = _chunk_machines.get(c)
+			if list == null:
+				var found: Array = []
+				for rec in cv.entities.values():
+					var pid := int(rec.proto_id)
+					var spec: Array = _proto_machine.get(pid, [])
+					if spec.is_empty() and not _proto_machine.has(pid) and protos != null:
+						var proto: ProtoDB.EntityProto = protos.entity(pid)
+						if proto != null and MACHINES.has(proto.name):
+							spec = [MACHINES[proto.name], proto.name]
+						_proto_machine[pid] = spec
+					if not spec.is_empty():
+						found.append([rec.unit, rec, spec[0], fposmod(rec.pos.x * 0.37 + rec.pos.y * 0.71, 1.0), spec[1]])
+				_chunk_machines[c] = found
+				list = found
+			for item_var in list as Array:
+				var item: Array = item_var
+				var unit := int(item[0])
+				if int(world.working.get(unit, 0)) != 1 or _shown.has(unit):
+					continue
+				var rec = item[1]
+				if not world.entities.has(unit) or rec.pos.distance_squared_to(focus) > r2:
+					continue
+				_shown[unit] = [rec, item[2], 0.0, float(item[3]), item[4], 0.0, -1]
+	if _chunk_machines.size() > world.chunks.size() + 64:
+		for c_old in _chunk_machines.keys():
+			if not world.chunks.has(c_old):
+				_chunk_machines.erase(c_old)
+	var drop_r2 := (radius + 8.0) * (radius + 8.0)
 	for key in _shown.keys():
-		if (_shown[key][0].pos as Vector2).distance_to(focus) > radius + 8.0:
+		if (_shown[key][0].pos as Vector2).distance_squared_to(focus) > drop_r2:
 			_shown.erase(key)
 
 

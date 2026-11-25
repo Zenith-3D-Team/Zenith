@@ -73,6 +73,7 @@ const SpiderRemote := preload("res://scripts/player/spider_remote.gd")
 const VisualTurns := preload("res://scripts/world/visual_turns.gd")
 const AimPick := preload("res://scripts/world/aim_pick.gd")
 const ResourceHints := preload("res://scripts/player/resource_hints.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const REPEAT := 0.15
 ## First person (K7): how far the crosshair's ray looks for an entity before the ground's point
@@ -133,7 +134,7 @@ const MINEABLE_MOVERS := ["car", "spider-vehicle", "locomotive", "cargo-wagon", 
 const HISTORY := 50
 
 ## --clean-shot (model screenshots): no hover highlight, whatever the mouse is over.
-var _clean_shot := OS.get_cmdline_user_args().has("--clean-shot")
+var _clean_shot := Switches.has("--clean-shot")
 ## Why the held entity can't be built on this surface ("" when it can), shown under the cursor.
 var _build_refusal := ""
 var world: WorldMirror
@@ -195,7 +196,7 @@ var ground := Vector2.ZERO
 var has_ground := false
 ## First person picks what the crosshair's ray meets first (K7, aim_pick.gd); --fp-pick=ground picks
 ## from where it meets the ground, as before.
-var fp_pick_models := not OS.get_cmdline_user_args().has("--fp-pick=ground")
+var fp_pick_models := not Switches.has("--fp-pick=ground")
 ## What that ray met this frame (AimPick.pick: [Rec, distance, point, outward normal, selection
 ## rect]) or [], and the cursor point it put `ground` at.
 var _aim: Array = []
@@ -226,7 +227,7 @@ var character_at_for_test := Vector2.INF
 ## Factorio: the swing starts on the click (avatar.mine_hint, I20) only when the target is within the
 ## bridge's own reach (puppet.lua can_hand_mine), and stops on the bridge's "Out of reach" while the
 ## button stays on that target. `--mine-reach-check=off`: the hint on every click, as before.
-static var mine_reach_check := not OS.get_cmdline_user_args().has("--mine-reach-check=off")
+static var mine_reach_check := Switches.on("--mine-reach-check")
 ## The target the bridge last refused as out of reach while it was held, and where the character
 ## stood then: no swing at it again until another target, the character moving or the button let go.
 var _reach_refused_key: Variant = null
@@ -254,10 +255,10 @@ var _pickup_timer := 0.0
 ## F held (a `pickup` sent since it was last let go): its release sends `pickup_stop`, so the bridge picks no more
 ## (it kept a pickup 30 ticks after the last one, picking on for up to half a second); `--pickup-stop=off` as before.
 var _pickup_held := false
-var pickup_stop := not OS.get_cmdline_user_args().has("--pickup-stop=off")
+var pickup_stop := Switches.on("--pickup-stop")
 ## F read with exactly its modifiers, as shooting and dropping are: Ctrl+F (search) and Alt+F (the personal
 ## roboport) held don't pick up, as in Factorio. `--pickup-exact=off`: any modifier held too, as before.
-var pickup_exact := not OS.get_cmdline_user_args().has("--pickup-exact=off")
+var pickup_exact := Switches.on("--pickup-exact")
 var _drop_timer := 0.0
 var _shoot_mode := -1
 var _shoot_timer := 0.0
@@ -285,6 +286,10 @@ const HOVER_FAST_MOUSE := 1200.0   # px/s
 var _last_cam_dir := Vector3.ZERO
 var _last_hover_screen := Vector2.INF
 var _last_hover_usec := 0
+## The character (or what it drives) moving faster than this, tiles a second: the hover panel is rebuilt at most
+## about ten times a second (entity_info.gd RUN_REBUILD_MSEC, --hover-rate=off).
+const HOVER_RUN_SPEED := 3.0
+var _last_hover_focus := Vector2.INF
 var _paste_target: WorldMirror.Rec = null
 ## The blueprint window's "Select new contents": the blueprint tool's area goes into this
 ## blueprint (a main slot, -1 the library one) instead of a new one; 0 none.
@@ -378,7 +383,7 @@ func _ready() -> void:
 		world.add_child(tool)
 	drag.pi = self
 	hud.ui.player = self
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--open="):
 			var what := arg.get_slice("=", 1)
 			if what.is_valid_int():
@@ -493,6 +498,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			_open(silo)
 		else:
 			Bridge.send({"t": "enter"})
+	if Bridge.priority_queue and Bridge.connected and rig != null and hud != null and hud.ui != null and not hud.ui.remote:
+		if (event is InputEventKey or event is InputEventJoypadButton or event is InputEventJoypadMotion) and not event.is_echo():
+			if event.is_action("move_up") or event.is_action("move_down") or event.is_action("move_left") or event.is_action("move_right"):
+				_update_walk(0.0)
 
 
 ## A rocket silo the character stands beside (within 6 tiles of its edge), or null.
@@ -748,7 +757,11 @@ func _update_ground() -> void:
 				hover_fast = true
 	_last_cam_dir = cam_dir
 	_last_hover_screen = screen if rig != null and not rig.aims_center() else Vector2.INF
-	hud.ui.set_selected(hovered, hover_fast)
+	var focus_now: Vector2 = world.focus() if world != null else Vector2.INF
+	var running := dt_s > 0.0005 and dt_s < 0.25 and _last_hover_focus.is_finite() and focus_now.is_finite() \
+		and focus_now.distance_to(_last_hover_focus) / dt_s > HOVER_RUN_SPEED
+	_last_hover_focus = focus_now
+	hud.ui.set_selected(hovered, hover_fast, running)
 	world._prof("in_panel", t0)
 
 
@@ -906,7 +919,10 @@ func _update_drive(delta: float) -> void:
 	var code := a * 3 + s
 	_walk_timer -= delta
 	if code != _drive_code or (code != 0 and _walk_timer <= 0.0):
-		Bridge.send({"t": "drive", "a": a, "s": s})
+		var msg := {"t": "drive", "a": a, "s": s}
+		if Settings.vehicle_brake_hold():
+			msg["h"] = 1  # the mod brakes to a stop against the motion and holds there (driving.lua)
+		Bridge.send(msg)
 		_drive_code = code
 		_walk_timer = REPEAT
 
@@ -2361,7 +2377,7 @@ static func _snap(v: float, size: int) -> float:
 ## negative coordinates is up: a point less than 1/256 tile under a tile's edge (an odd size) or its
 ## middle (an even one, a splitter aimed at a belt's middle) was sent as the edge itself, and the
 ## mod built one tile over from the preview. `--build-wire=truncate`: as before.
-static var wire_floor := not ("--build-wire=truncate" in OS.get_cmdline_user_args())
+static var wire_floor := not (Switches.has("--build-wire=truncate"))
 
 
 static func wire(v: float) -> int:

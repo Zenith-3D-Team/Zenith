@@ -30,9 +30,10 @@ void fragment() {
 	}
 	vec4 world = INV_VIEW_MATRIX * INV_PROJECTION_MATRIX * vec4(SCREEN_UV * 2.0 - 1.0, depth, 1.0);
 	vec3 pos = world.xyz / world.w;
+	float dist_fade = 1.0 - smoothstep(1400.0, 4200.0, length(pos.xz - CAMERA_POSITION_WORLD.xz));
 	vec3 sd = normalize(sun_dir);
 	vec2 p = pos.xz + sd.xz / max(sd.y, 0.25) * (cloud_height - pos.y);
-	float shadow = shadow_strength > 0.0 ? cloud_density(p) * shadow_strength : 0.0;
+	float shadow = shadow_strength > 0.0 ? cloud_density(p) * shadow_strength * dist_fade : 0.0;
 	float h = 0.0;
 	vec3 hc = haze_color;
 	if (haze_strength > 0.0) {
@@ -40,7 +41,7 @@ void fragment() {
 		vec2 q = pos.xz * 1.7 + vec2(97.0, 41.0) + cloud_wind * TIME * -1.3;
 		float n = cloud_density(q);
 		hc = mix(haze_color, haze_color2, texture(cloud_detail, pos.xz / 210.0).r);
-		h = haze_strength * (0.25 + n);
+		h = haze_strength * (0.25 + n) * dist_fade;
 	}
 	float a = 1.0 - (1.0 - shadow) * (1.0 - h);
 	if (a < 0.002) {

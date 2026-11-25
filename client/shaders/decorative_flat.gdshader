@@ -7,11 +7,12 @@ shader_type spatial;
 // away they fade evenly instead of darkening at their edges. INSTANCE_CUSTOM is (u start, u width,
 // v height, unused). They take the sun's shadows (trees' and buildings' fall over them, as in Factorio)
 // but cast none (decoratives.gd turns casting off).
-render_mode blend_mix, depth_draw_never, cull_disabled;
+render_mode blend_mix, depth_draw_never, cull_back, specular_disabled;
 
 #include "res://shaders/ground_height.gdshaderinc"
 #include "res://shaders/decorative_grass.gdshaderinc"
 #include "res://shaders/decor_mask.gdshaderinc"
+#include "res://shaders/lamp_light.gdshaderinc"
 
 uniform sampler2D atlas : source_color, filter_linear_mipmap_anisotropic, repeat_disable;
 // How much darker a plant with a raised copy gets near the character: less for carpets, whose clumps
@@ -36,8 +37,6 @@ void vertex() {
 	VERTEX = ground_lift(VERTEX, MODEL_MATRIX);
 }
 
-global uniform float f3d_look_ground_specular;  // looks.gd "ground_specular"
-
 void fragment() {
 	vec4 c = texture(atlas, UV);
 	// A picture's quad is its bounding box, mostly empty round a tuft: an empty pixel stops here, before
@@ -50,7 +49,6 @@ void fragment() {
 		discard;
 	}
 	ALBEDO = c.rgb * (1.0 - raised_shade * grown);
-	SPECULAR = plant_specular() * f3d_look_ground_specular;
-	ROUGHNESS = plant_roughness(1.0);
+	EMISSION = lamp_light_emission(ALBEDO, ground_at, 0.0, 1.0);
 	ALPHA = c.a * smoothstep(0.75, 0.9, level);
 }

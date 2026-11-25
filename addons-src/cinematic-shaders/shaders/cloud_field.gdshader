@@ -65,6 +65,12 @@ void fragment() {
 			four = v;
 		}
 	}
+	// Cloud-type height map in alpha (2 low-frequency wrapped octaves, [0.25, 1.0]) while RGB stays unchanged.
+	float tc1 = max(round(0.35 * period), 1.0);
+	float tc2 = max(round(0.70 * period), 1.0);
+	float ctype = 0.65 * gnoise_wrapped(q0 * (tc1 / period) + vec2(17.3, 4.9), tc1, vec2(91.0, 23.0))
+		+ 0.35 * gnoise_wrapped(q0 * (tc2 / period) + vec2(3.7, 29.1), tc2, vec2(137.0, 59.0));
+	ctype = clamp(smoothstep(0.18, 0.84, ctype) * 0.75 + 0.25, 0.25, 1.0);
 	// Each sum over its octaves' strengths, as the grade's fbm() divided it.
-	COLOR = vec4(three / 0.875, four / 0.9375, v / 0.96875, 1.0);
+	COLOR = vec4(three / 0.875, four / 0.9375, v / 0.96875, ctype);
 }

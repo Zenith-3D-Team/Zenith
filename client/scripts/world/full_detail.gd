@@ -27,6 +27,7 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
 const BeltLods := preload("res://scripts/world/belt_lods.gd")
 const UpsGovernor := preload("res://scripts/world/ups_governor.gd")
+const RenderDistance := preload("res://scripts/world/render_distance.gd")
 
 ## The settings held, at the tops of their sliders (settings_window.gd, main.gd's clamps).
 const HELD := {
@@ -76,6 +77,7 @@ static var _belt_lods_before := true
 static var _far_before := -1.0
 static var _camera: Camera3D
 static var _scale_before := -1.0
+static var _scale_mode_before: Viewport.Scaling3DMode = Viewport.SCALING_3D_MODE_BILINEAR
 ## A screenshot's view as cover() framed it (view_filter), fixed while it waits: its decoratives are
 ## counted in that view, not in whatever the camera does meanwhile.
 static var _shot_view := Callable()
@@ -127,11 +129,14 @@ static func _apply(on: bool, main: Node) -> void:
 			_camera = null
 		if on:
 			_scale_before = vp.scaling_3d_scale
+			_scale_mode_before = vp.scaling_3d_mode
+			vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
 			vp.scaling_3d_scale = maxf(vp.scaling_3d_scale, 1.0)
 		elif _scale_before > 0.0:
+			vp.scaling_3d_mode = _scale_mode_before
 			vp.scaling_3d_scale = _scale_before
 			_scale_before = -1.0
-	for field in ["lamps", "working_glow"]:
+	for field in ["lamps", "signal_lights", "working_glow"]:
 		var n = _node(main, field)
 		if n != null and n.has_method("set_full_detail"):
 			n.set_full_detail(on)
@@ -248,7 +253,12 @@ static func cover(main: Node, on: bool) -> void:
 		return
 	var window := vp.get_visible_rect().size
 	var aspect := shot_aspect if shot_aspect > 0.0 else window.x / maxf(window.y, 1.0)
-	var foot := ground_footprint(cam, window, aspect, COVER_REACH)
+	var reach := COVER_REACH
+	var dh = _node(main, "distant_horizon")
+	if dh != null and bool(dh.get("enabled")) and int(dh.get("radius_chunks")) > 0 and bool(Settings.get_value("graphics", "distant_horizon_shots")):
+		var real_r := int(RenderDistance.from_settings()["real_radius"])
+		reach = float(maxi(VIEW_RADIUS, real_r)) * 32.0
+	var foot := ground_footprint(cam, window, aspect, reach)
 	var lo := Vector2i(floori(foot.position.x / 32.0), floori(foot.position.y / 32.0)) - Vector2i.ONE
 	var hi := Vector2i(floori(foot.end.x / 32.0), floori(foot.end.y / 32.0)) + Vector2i.ONE
 	var g := cam.global_position

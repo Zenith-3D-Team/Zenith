@@ -12,6 +12,7 @@ extends Node
 const Settings := preload("res://scripts/menu/settings.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const NatureLooks := preload("res://scripts/world/nature_looks.gd")
+const Switches := preload("res://scripts/switches.gd")
 const WARMUP := 15.0
 ## --probe-warmup=<s>: a longer warm-up (a big save at long distances takes a while to load); with
 ## --probe-variants the variants also wait until no chunk is left to build (or 3 minutes).
@@ -64,12 +65,21 @@ const ROUTES := {
 	# (SPIN_LEG), zoomed all the way out and back in (ZOOM_LEG), then the camera taken off the character
 	# and flown fast across the base and back as a free camera does (PAN_LEG), and given back.
 	"pan": [[-1, 3.0], [-3, 6.0], [-1, 2.0], [-4, 6.0], [-1, 2.0], [-5, 12.0], [-1, 5.0]],
+	# P4 (owner: "it takes like 5 seconds after looking away from a dense area to gain FPS"): stands
+	# looking at where it joined, turns the view half round in one frame (TURN_LEG) and stands looking
+	# away, turns back and stands again. With the unload census (--probe-unload, on for this route) each
+	# frame says what is still drawn outside the view and past the render distance.
+	"turn": [[-1, 8.0], [-6, 10.0], [-6, 8.0]],
+	# Laps as "fast" does, then standing: what the laps left drawn behind (trailing chunks, warm ones,
+	# their levels of detail) and how soon it goes.
+	"laps": [[4, 5.0], [8, 3.0], [12, 10.0], [0, 6.0], [4, 10.0], [8, 3.0], [12, 5.0], [-1, 10.0]],
 }
 ## Route "pan"'s legs: degrees a second the view turns, the zoom out-and-back, and the free camera's
 ## speed (tiles a second, about the Cinematic camera's fast fly) out from where it was taken and back.
 const SPIN_LEG := -3
 const ZOOM_LEG := -4
 const PAN_LEG := -5
+const TURN_LEG := -6
 const SPIN_RATE := 240.0
 const PAN_SPEED := 60.0
 var _cam_t := 0.0
@@ -82,6 +92,20 @@ const WALK_REPEAT := 0.15
 ## player's view the moment the shot ends (an F12 from the normal view), else it stays up there.
 const SHOT_LEG := -2
 var _shot_frames: Array = []
+var _turned_at := -1.0
+## --probe-unload (on for routes "turn" and "laps"): each frame the chunks loaded, drawn, drawn past the square,
+## kept past the square, hidden behind the camera and waiting to go; with --probe-unload-walk every
+## UNLOAD_CENSUS_FRAMES frames a walk of what is drawn (visible in the tree) counting its instances in the view,
+## outside it, and past the render distance, the triangles in view and casting shadows by owner.
+var _unload_census := Switches.has("--probe-unload")
+const UNLOAD_CENSUS_FRAMES := 6
+## --probe-unload-walk: the walk of what is drawn too (slow on a big view: its frames have "census_ms"; leave it
+## out when timing frames).
+var _census_walk := Switches.has("--probe-unload-walk")
+var _census_last := {}
+## --probe-frame-sleep=<ms>: the main thread waits this long each frame, as a dense base's slow frames would
+## (the frame-counted slices then take as many seconds as they would there).
+var _frame_sleep: int = int(Settings.arg_value("--probe-frame-sleep=")) if Settings.has_arg("--probe-frame-sleep=") else 0
 var _shot_state := 0  # 0 not begun, 1 being taken, 2 done
 
 var world  # world.gd
@@ -106,7 +130,7 @@ var _done := false
 ## --probe-variants (with a standing route): instead of one long stand, steps through VARIANTS of
 ## the render settings, VARIANT_SETTLE + VARIANT_MEASURE seconds each, and prints each one's frame
 ## and GPU time (its price, against "base"). Pass --probe-render-times with the separate thread.
-var _variants := "--probe-variants" in OS.get_cmdline_user_args() or Settings.has_arg("--probe-variants=")
+var _variants := Switches.has("--probe-variants") or Settings.has_arg("--probe-variants=")
 ## --probe-variants=a,b: only these (and "base" first).
 var _variant_list: Array = VARIANTS if not Settings.has_arg("--probe-variants=") else ["base"] + Array(Settings.arg_value("--probe-variants=").split(","))
 var _variant := -1
@@ -131,7 +155,7 @@ var _shot := false  # this variant's screenshot (--probe-shots) is taken
 ## With the render thread on its own (project setting thread_model 2) the renderer's measured times
 ## can only be read by waiting for that thread, which would make every frame wait: they're left
 ## out there (-1), unless --probe-render-times asks for them anyway.
-var _times: bool = ProjectSettings.get_setting("rendering/driver/threads/thread_model", 1) != 2 or "--probe-render-times" in OS.get_cmdline_user_args()
+var _times: bool = ProjectSettings.get_setting("rendering/driver/threads/thread_model", 1) != 2 or Switches.has("--probe-render-times")
 
 
 func _render_cpu(vp: RID) -> float:
@@ -190,7 +214,7 @@ var _elapsed := 0.0
 var _settled_at := -1.0
 var _belt_done_at := -1.0
 var _drawn_at := -1.0
-var _stay := "--probe-stay" in OS.get_cmdline_user_args()
+var _stay := Switches.has("--probe-stay")
 
 
 func _ready() -> void:
@@ -217,10 +241,58 @@ func _ready() -> void:
 	_add_marks.call_deferred()
 
 
+## --probe-deep (R&D, run-spikes): a mark as the first (internal) child of every scripted node with a
+## _process, so each frame's time is split by script, not by main's children; new nodes are found by
+## a rescan every DEEP_RESCAN frames (its own cost is the frame's `probe_scan`).
+var _deep := Switches.has("--probe-deep")
+const DEEP_RESCAN := 240
+var _deep_scan_ms := 0.0
+var _obj_phys := 0
+var _obj_pf := 0
+var _obj_end := 0
+var _obj_phys_delta := 0
+var _obj_tail_delta := 0
+
+
+func _deep_scan() -> void:
+	var t0 := Time.get_ticks_usec()
+	var stack: Array = [get_tree().root]
+	var root_path := str(world.get_parent().get_parent().get_path())
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		if n is FrameStart or n == self:
+			continue
+		for c in n.get_children():
+			stack.append(c)
+		if n.get_script() == null or not n.has_method("_process") or n.has_meta("deep_mark"):
+			continue
+		n.set_meta("deep_mark", true)
+		var mark := FrameStart.new()
+		n.add_child(mark, false, Node.INTERNAL_MODE_FRONT)
+		mark.process_priority = n.process_priority
+		var label := str(n.get_path()).replace(root_path + "/", "")
+		var sp: String = (n.get_script() as Script).resource_path.get_file()
+		# numbered siblings (chunks, cards) fold into one label by their script
+		_marks.append([mark, _digitless(label) + " <" + sp + ">"])
+	_deep_scan_ms = (Time.get_ticks_usec() - t0) / 1000.0
+	if Engine.get_process_frames() % (DEEP_RESCAN * 20) == 0:
+		print("STUTTER deep marks %d, scan %.1f ms" % [_marks.size(), _deep_scan_ms])
+
+
 func _add_marks() -> void:
 	world.track_latency = true
 	var game: Node = world.get_parent()
-	for parent in [game.get_parent(), game]:
+	if _deep:
+		_deep_scan()
+		get_tree().physics_frame.connect(func() -> void:
+			if _obj_phys == 0:
+				_obj_phys = int(Performance.get_monitor(Performance.OBJECT_COUNT)))
+		get_tree().process_frame.connect(func() -> void:
+			var n := int(Performance.get_monitor(Performance.OBJECT_COUNT))
+			_obj_phys_delta = n - _obj_phys if _obj_phys != 0 else 0
+			_obj_tail_delta = (_obj_phys if _obj_phys != 0 else n) - _obj_end
+			_obj_phys = 0)
+	for parent in ([] if _deep else [game.get_parent(), game]):
 		for child in parent.get_children():
 			if child is FrameStart:
 				continue
@@ -230,7 +302,7 @@ func _add_marks() -> void:
 			parent.move_child(mark, child.get_index() + 1)
 			mark.process_priority = 0
 			_marks.append([mark, str(child.name)])
-	for child in world.get_children():
+	for child in ([] if _deep else world.get_children()):
 		if child.name == "Animator":
 			var before := FrameStart.new()
 			world.add_child(before)
@@ -244,7 +316,7 @@ func _add_marks() -> void:
 			_marks.append([mark, "Animator"])  # world.gd's own _process runs before its children
 	# Scripts that run after every priority-0 node (fx.gd at 2; sun_shadows.gd and vehicle_anim.gd
 	# at 10): marks between the priorities split them from the rest.
-	for p in [[1, "rest at priority 0"], [3, "fx.gd (priority 2)"], [999, "sun_shadows.gd, vehicle_anim.gd (priority 10)"]]:
+	for p in ([[1, "rest at priority 0 (unscripted nodes)"]] if _deep else [[1, "rest at priority 0"], [3, "fx.gd (priority 2)"], [999, "sun_shadows.gd, vehicle_anim.gd (priority 10)"]]):
 		var late := FrameStart.new()
 		late.name = "StutterMarkLate"
 		add_child(late)
@@ -253,6 +325,8 @@ func _add_marks() -> void:
 	var spec := out_path.split("@")
 	out_path = spec[0]
 	_route = ROUTES.get(spec[1] if spec.size() > 1 else "busy", ROUTES["busy"])
+	if spec.size() > 1 and spec[1] in ["turn", "laps"]:
+		_unload_census = true
 	if Settings.has_arg("--probe-shot-after="):  # route "shot": seconds after it ended (10)
 		_route = _route.duplicate(true)
 		_route[-1][1] = float(Settings.arg_value("--probe-shot-after="))
@@ -281,6 +355,10 @@ func _counters() -> Dictionary:
 func _process(delta: float) -> void:
 	if _done or world == null or not Bridge.world_ready:
 		return
+	if _frame_sleep > 0:
+		OS.delay_msec(_frame_sleep)
+	if _unload_census and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE  # (a probe in first person leaves the real mouse alone)
 	var now := Time.get_ticks_usec()
 	var c := _counters()
 	if _before.is_empty():
@@ -311,6 +389,9 @@ func _process(delta: float) -> void:
 			_walk_timer = 0.0
 			_cam_t = 0.0
 		if code <= SPIN_LEG:
+			if code == TURN_LEG and _cam_t == 0.0:
+				_turned_at = _elapsed
+				print("STUTTER turn at %.2f s" % _elapsed)
 			_camera_leg(code, delta, float(_route[_leg][1]))
 			_walk_timer = INF  # the character stands
 		_walk_timer -= delta
@@ -343,6 +424,11 @@ func _process(delta: float) -> void:
 		int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME)), _alive(), phases, _passes(vp)] + _pass_times())
 	_last_usec = now
 	_before = c
+	if _deep:
+		if Engine.get_process_frames() % DEEP_RESCAN == 0:
+			_marks = _marks.filter(func(e: Array) -> bool: return is_instance_valid(e[0]))
+			_deep_scan()
+		_obj_end = int(Performance.get_monitor(Performance.OBJECT_COUNT))
 	_end_usec = Time.get_ticks_usec()
 	(func() -> void: _deferred_usec = Time.get_ticks_usec()).call_deferred()
 	_elapsed += delta
@@ -410,6 +496,12 @@ func _camera_leg(code: int, delta: float, length: float) -> void:
 	_cam_t += delta
 	var f := clampf(_cam_t / length, 0.0, 1.0)
 	match code:
+		TURN_LEG:
+			if first:
+				if rig.first_person:  # (--camera=first-person: the eyes turn)
+					rig.set("_look_yaw", float(rig.get("_look_yaw")) + 180.0)
+				else:
+					rig.rotate_free(180.0)  # (goal and shown yaw both: the whole turn this frame)
 		SPIN_LEG:
 			rig.rotate_free(SPIN_RATE * delta)
 		ZOOM_LEG:
@@ -501,6 +593,13 @@ func _phases() -> Dictionary:
 			out["ap_delete_timers_draw"] = snappedf((to - _deferred_usec) / 1000.0, 0.01)
 			if to != _pf_usec:
 				out["ap_physics"] = snappedf((_pf_usec - to) / 1000.0, 0.01)
+	if _deep:
+		out["objs_phys"] = _obj_phys_delta  # objects made (+) or freed (-) in the physics part of the frame's start
+		out["objs_tail"] = _obj_tail_delta  # and between the last _process and it (deferred calls, the delete queue)
+		out["objs"] = int(Performance.get_monitor(Performance.OBJECT_COUNT))
+		if _deep_scan_ms > 0.0:
+			out["probe_scan"] = snappedf(_deep_scan_ms, 0.01)
+			_deep_scan_ms = 0.0
 	for k in world.prof:
 		var ms := (int(world.prof[k]) - int(_world_prof.get(k, 0))) / 1000.0
 		if ms > 0.05:
@@ -620,7 +719,186 @@ func _alive() -> Dictionary:
 			for k in parts:
 				out["ms_cr_" + str(k)] = int(parts[k]) / 1000.0
 		out["cr_layers"] = int(movers.creatures.get("layers_seen") if movers.creatures.get("layers_seen") != null else 0)
+	if _unload_census:
+		_unload_counts(out)
 	return out
+
+
+## The unload census (--probe-unload): cheap counts every frame, the walk of what is drawn every
+## UNLOAD_CENSUS_FRAMES frames (the frame that walked has "census_ms").
+func _unload_counts(out: Dictionary) -> void:
+	out["t_turn"] = snappedf(_elapsed - _turned_at, 0.001) if _turned_at >= 0.0 else -1.0
+	out["u_chunks"] = world.chunks.size()
+	var sun_l = world.get("sun")
+	if sun_l is DirectionalLight3D:
+		var sl := sun_l as DirectionalLight3D
+		out["sun"] = [snappedf(sl.directional_shadow_max_distance, 0.1), int(sl.directional_shadow_mode), snappedf(sl.directional_shadow_split_1, 0.01),
+			snappedf(sl.directional_shadow_split_2, 0.01), snappedf(sl.directional_shadow_split_3, 0.01)]
+	out["u_casters"] = int(world.get("shadow_casters"))
+	var fc = world.far_chunks
+	if fc != null:
+		# Far merging's queues: [decide pass left, asked, gathering, waiting, merging, bakes queued + running]
+		out["u_far_q"] = [(fc.get("_pass_todo") as Array).size() - int(fc.get("_pass_next")), (fc.get("_asked") as Array).size(),
+			(fc.get("_collecting") as Array).size(), (fc.get("_waiting") as Array).size(), (fc.get("_merging") as Array).size(),
+			(fc.get("_bake_queue") as Array).size() + (fc.get("_baking") as Array).size()]
+		var snap := preload("res://scripts/world/frame_budget.gd").snapshot()
+		for k in ["far_decide", "far_collect", "far_install", "lods", "unload"]:
+			if snap.has(k):
+				out["fb_" + k] = snap[k]
+		out["fb_pool"] = snap["pool"]
+	out["u_warm"] = (world.get("_warm") as Dictionary).size()
+	out["u_unloaded"] = (world.get("_unloaded") as Array).size()
+	out["u_unloaded_drawn"] = world.unloaded_drawn()
+	var bc = world.behind_cull
+	out["u_bc_hidden"] = bc.hidden_count()
+	out["u_bc_to_hide"] = (bc.get("_to_hide") as Dictionary).size()
+	out["u_bc_to_show"] = (bc.get("_to_show") as Dictionary).size()
+	for k in ["u_fast_hidden", "u_fast_freeing"]:
+		var v = world.get(k)
+		if v != null:
+			out[k] = int(v)
+	var vis := 0
+	var past := 0
+	var sq: Rect2i = world.square_chunks()
+	for c: Vector2i in world.chunks:
+		if (world.chunks[c] as Node3D).visible:
+			vis += 1
+			if sq.size.x > 0 and not sq.has_point(c):
+				past += 1
+	out["u_chunks_drawn"] = vis
+	out["u_past_drawn"] = past  # drawn past the square (the render distance)
+	if not _census_walk:
+		return
+	if Engine.get_process_frames() % UNLOAD_CENSUS_FRAMES == 0 or _census_last.is_empty():
+		var t0 := Time.get_ticks_usec()
+		_census_last = _drawn_census()
+		_census_last["census_ms"] = (Time.get_ticks_usec() - t0) / 1000.0
+		out["census_ms"] = _census_last["census_ms"]
+	for k in _census_last:
+		if k != "census_ms":
+			out[k] = _census_last[k]
+
+
+## What is drawn now: instances (a MultiMesh's visible ones, 1 a mesh) in the camera's view, outside
+## it, and past the render distance (further from the focus than the square of loaded chunks), with
+## the outside ones by the world's child they hang under.
+func _drawn_census() -> Dictionary:
+	var cam := get_viewport().get_camera_3d()
+	if cam == null:
+		return {}
+	var planes: Array[Plane] = cam.get_frustum()
+	var probe_pt := cam.global_position - cam.global_transform.basis.z * 10.0
+	var flip := 1.0
+	for pl in planes:
+		if pl.is_point_over(probe_pt):
+			flip = -1.0  # (planes facing in)
+			break
+	var f: Vector2 = world.focus()
+	var reach := (float(world.view_radius) + 0.5) * 32.0
+	var in_inst := 0
+	var out_inst := 0
+	var out_nodes := 0
+	var far_inst := 0
+	var by: Dictionary = {}
+	var tri_by: Dictionary = {}
+	var cast_by: Dictionary = {}
+	var dc_by: Dictionary = {}
+	var root: Node = world.get_parent()
+	var stack: Array = [[root, ""]]
+	while not stack.is_empty():
+		var e: Array = stack.pop_back()
+		var n: Node = e[0]
+		var tag: String = e[1]
+		for ch in n.get_children():
+			if ch is Node3D:
+				if not (ch as Node3D).visible:
+					continue
+				var t := tag if tag != "" else str(ch.name)
+				if t.begins_with("@"):
+					t = ch.get_class()
+				if ch is GeometryInstance3D:
+					var gi := ch as GeometryInstance3D
+					var count := 1
+					if gi is MultiMeshInstance3D:
+						var mm := (gi as MultiMeshInstance3D).multimesh
+						if mm == null:
+							count = 0
+						else:
+							count = mm.visible_instance_count if mm.visible_instance_count >= 0 else mm.instance_count
+					if count > 0 and gi.cast_shadow != GeometryInstance3D.SHADOW_CASTING_SETTING_OFF:
+						var smesh: Mesh = (gi as MultiMeshInstance3D).multimesh.mesh if gi is MultiMeshInstance3D else (gi as MeshInstance3D).mesh if gi is MeshInstance3D else null
+						var ssub := t + "/" + str(gi.name).left(14)
+						cast_by[ssub] = int(cast_by.get(ssub, 0)) + _mesh_tris(smesh) * count
+					if count > 0:
+						var box: AABB = gi.global_transform * gi.get_aabb()
+						var outside := false
+						for pl in planes:
+							var nrm := pl.normal * flip
+							var d := pl.d * flip
+							# The box's corner furthest against the plane's normal.
+							var p := box.position + Vector3(box.size.x if nrm.x < 0.0 else 0.0, box.size.y if nrm.y < 0.0 else 0.0, box.size.z if nrm.z < 0.0 else 0.0)
+							if nrm.dot(p) > d:
+								outside = true
+								break
+						if outside:
+							out_inst += count
+							out_nodes += 1
+							by[t] = int(by.get(t, 0)) + count
+						else:
+							in_inst += count
+							var mesh: Mesh = (gi as MultiMeshInstance3D).multimesh.mesh if gi is MultiMeshInstance3D else (gi as MeshInstance3D).mesh if gi is MeshInstance3D else null
+							var tris := _mesh_tris(mesh)
+							var sub := t + "/" + str(gi.get_parent().name if gi.get_parent() != null and t != str(gi.get_parent().name) else gi.name).left(14)
+							tri_by[sub] = int(tri_by.get(sub, 0)) + tris * count
+							var dkey := t + "/" + _digitless(str(gi.name))
+							dc_by[dkey] = int(dc_by.get(dkey, 0)) + (mesh.get_surface_count() if mesh != null else 1)
+						var cen := box.get_center()
+						var gap := maxf(absf(cen.x - f.x) - box.size.x * 0.5, absf(cen.z - f.y) - box.size.z * 0.5)
+						if gap > reach and box.size.x < 2000.0:
+							far_inst += count
+				stack.append([ch, t])
+			elif not (ch is CanvasItem) and not (ch is CanvasLayer):
+				stack.append([ch, tag])
+	var top: Array = by.keys().map(func(k) -> Array: return [int(by[k]), str(k)])
+	top.sort_custom(func(a: Array, b: Array) -> bool: return a[0] > b[0])
+	var tri_top: Array = tri_by.keys().map(func(k) -> Array: return [int(tri_by[k]), str(k)])
+	tri_top.sort_custom(func(a: Array, b: Array) -> bool: return a[0] > b[0])
+	var cast_top: Array = cast_by.keys().map(func(k) -> Array: return [int(cast_by[k]), str(k)])
+	cast_top.sort_custom(func(a: Array, b: Array) -> bool: return a[0] > b[0])
+	var cast_total := 0
+	for k in cast_by:
+		cast_total += int(cast_by[k])
+	var dc_top: Array = dc_by.keys().map(func(k) -> Array: return [int(dc_by[k]), str(k)])
+	dc_top.sort_custom(func(a: Array, b: Array) -> bool: return a[0] > b[0])
+	return {"c_in_dc_by": dc_top.slice(0, 10), "c_cast_tris": cast_total, "c_cast_by": cast_top.slice(0, 8), "c_in": in_inst, "c_out": out_inst, "c_out_nodes": out_nodes, "c_far": far_inst, "c_out_by": top.slice(0, 6), "c_in_tris_by": tri_top.slice(0, 8)}
+
+
+var _tris_cache := {}
+
+
+static func _digitless(n: String) -> String:
+	var out := ""
+	for ch in n:
+		if not (ch >= "0" and ch <= "9") and ch != "-" and ch != "_" and ch != "@":
+			out += ch
+	return out.left(24)
+
+
+## Triangles in `mesh`'s surfaces (its full detail), cached by the mesh.
+func _mesh_tris(mesh: Mesh) -> int:
+	if mesh == null:
+		return 0
+	var id := mesh.get_instance_id()
+	if _tris_cache.has(id):
+		return int(_tris_cache[id])
+	var n := 0
+	if mesh is ArrayMesh or mesh is PrimitiveMesh:
+		for i in mesh.get_surface_count():
+			var arr := mesh.surface_get_arrays(i)
+			var idx = arr[Mesh.ARRAY_INDEX]
+			n += (idx.size() if idx != null else (arr[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()) / 3
+	_tris_cache[id] = n
+	return n
 
 
 func _step_variant(delta: float) -> void:
@@ -924,6 +1202,25 @@ func _set_variant(name: String, on: bool) -> void:
 			NatureLooks.show_atlas(not on)
 		"ssao off":
 			env.ssao_enabled = not on
+		"ssil off":
+			if not _base.has("ssil"):
+				_base["ssil"] = env.ssil_enabled
+			env.ssil_enabled = false if on else bool(_base["ssil"])
+		"ssil on":
+			if not _base.has("ssil"):
+				_base["ssil"] = env.ssil_enabled
+			env.ssil_enabled = true if on else bool(_base["ssil"])
+		"taa on", "taa off":
+			var vp := get_viewport()
+			if not _base.has("taa"):
+				_base["taa"] = vp.use_taa
+			vp.use_taa = (name == "taa on") if on else bool(_base["taa"])
+		"grade off":
+			const Looks := preload("res://scripts/world/looks.gd")
+			if Looks.active != null:
+				for n: MeshInstance3D in Looks.active._pass_nodes:
+					if is_instance_valid(n):
+						n.visible = not on
 		"ssao low":
 			RenderingServer.environment_set_ssao_quality(RenderingServer.ENV_SSAO_QUALITY_LOW if on else RenderingServer.ENV_SSAO_QUALITY_MEDIUM, true, 0.5, 2, 50.0, 300.0)
 		"ssao very low":
@@ -963,8 +1260,46 @@ func _set_variant(name: String, on: bool) -> void:
 		# rendering/driver/depth_prepass/enable in an override.cfg for a whole run instead.
 		"prepass off":
 			ProjectSettings.set_setting("rendering/driver/depth_prepass/enable", not on)
-		"render scale 0.5":  # half the pixels each way: what scales with pixels, not vertices
-			get_viewport().scaling_3d_scale = 0.5 if on else 1.0
+		# AMD FSR 2.2 (Viewport.SCALING_3D_MODE_FSR2) at the scale given, or the current one for plain "fsr2".
+		# It replaces TAA, MSAA and screen-space AA, so those are saved and held off while it is on.
+		"fsr2", "fsr2 0.5", "fsr2 0.67", "fsr2 0.75", "fsr2 1.0":
+			var vp := get_viewport()
+			if not _base.has("scale"):
+				_base["scale"] = vp.scaling_3d_scale
+				_base["scale_mode"] = vp.scaling_3d_mode
+			if not _base.has("fsr2_aa"):
+				_base["fsr2_aa"] = [vp.use_taa, vp.msaa_3d, vp.screen_space_aa, vp.fsr_sharpness]
+			if on:
+				vp.use_taa = false
+				vp.msaa_3d = Viewport.MSAA_DISABLED
+				vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+				vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR2
+				vp.fsr_sharpness = Settings.fsr_sharpness_value()
+				if name != "fsr2":
+					vp.scaling_3d_scale = float(name.get_slice(" ", 1))
+			else:
+				var saved: Array = _base["fsr2_aa"]
+				vp.scaling_3d_mode = int(_base["scale_mode"]) as Viewport.Scaling3DMode
+				vp.scaling_3d_scale = float(_base["scale"])
+				vp.use_taa = bool(saved[0])
+				vp.msaa_3d = int(saved[1]) as Viewport.MSAA
+				vp.screen_space_aa = int(saved[2]) as Viewport.ScreenSpaceAA
+				vp.fsr_sharpness = float(saved[3])
+			var looks_fsr2 = load("res://scripts/world/looks.gd")
+			if looks_fsr2.active != null:
+				looks_fsr2.active.sync_pre_aa(vp)
+		"render scale 0.5", "render scale 0.75", "fsr 0.5", "fsr 0.75":
+			var vp := get_viewport()
+			if not _base.has("scale"):
+				_base["scale"] = vp.scaling_3d_scale
+				_base["scale_mode"] = vp.scaling_3d_mode
+			if on:
+				var s := 0.5 if name.ends_with("0.5") else 0.75
+				vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR if name.begins_with("fsr") else Viewport.SCALING_3D_MODE_BILINEAR
+				vp.scaling_3d_scale = s
+			else:
+				vp.scaling_3d_mode = int(_base["scale_mode"]) as Viewport.Scaling3DMode
+				vp.scaling_3d_scale = float(_base["scale"])
 		"fxaa off":
 			get_viewport().screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED if on else Viewport.SCREEN_SPACE_AA_FXAA
 		"clouds off":
@@ -986,7 +1321,7 @@ func _set_variant(name: String, on: bool) -> void:
 		"relief off":  # the ground's bumps and crevices (terrain.gdshader ground_relief)
 			const Visuals := preload("res://scripts/world/visuals.gd")
 			if on:
-				Visuals.terrain_material().set_shader_parameter("ground_relief", false)
+				Visuals.set_terrain_param(&"ground_relief", false)
 			else:
 				Visuals.set_ground_relief(str(_base["lod"]) != "low")
 		"tree shadows off":
@@ -1045,11 +1380,11 @@ func _set_variant(name: String, on: bool) -> void:
 ## everything up to the first marker (autoloads such as Bridge, and main itself).
 ## --probe-fine: subtrees over 0.005 ms, kept to 0.01 ms (an average frame's breakdown), not only
 ## those over 0.1 ms.
-var SEGMENT_MIN_MS := 0.005 if "--probe-fine" in OS.get_cmdline_user_args() else 0.1
+var SEGMENT_MIN_MS := 0.005 if Switches.has("--probe-fine") else 0.1
 
 
 func _segments() -> Dictionary:
-	var order := _marks.filter(func(e: Array) -> bool: return (e[0] as FrameStart).at >= _start.at)
+	var order := _marks.filter(func(e: Array) -> bool: return is_instance_valid(e[0]) and (e[0] as FrameStart).at >= _start.at)
 	order.sort_custom(func(a: Array, b: Array) -> bool: return (a[0] as FrameStart).at < (b[0] as FrameStart).at)
 	var out := {}
 	var last := _start.at
@@ -1058,7 +1393,7 @@ func _segments() -> Dictionary:
 		var mark: FrameStart = entry[0]
 		var ms := (mark.at - last) / 1000.0
 		if ms > SEGMENT_MIN_MS:
-			var key: String = label if label == "before" else str(entry[1])
+			var key: String = label if label == "before" and not _deep else str(entry[1])
 			out[key] = snappedf(float(out.get(key, 0.0)) + ms, 0.01 if SEGMENT_MIN_MS < 0.1 else 0.1)
 		label = ""
 		last = mark.at

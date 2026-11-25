@@ -3,10 +3,59 @@ extends RefCounted
 ## that world messages use.
 
 
+const PF_REMNANT := 1 << 0
+const PF_PIPE_FLUID := 1 << 1
+const PF_PIPE_PLAIN := 1 << 2
+const PF_PIPE_GROUND := 1 << 3
+const PF_PIPE_HEAT := 1 << 4
+const PF_PIPE_ANY := PF_PIPE_FLUID | PF_PIPE_GROUND | PF_PIPE_HEAT
+const PF_BELT := 1 << 5
+const PF_BELT_CAPPED := 1 << 6
+const PF_BELT_UNDER := 1 << 7
+const PF_WALL := 1 << 8
+const PF_GATE := 1 << 9
+const PF_WALL_ANY := PF_WALL | PF_GATE
+const PF_CARGO := 1 << 10
+const PF_CARGO_BAY := 1 << 11
+const PF_COMPUTED := 1 << 30
+
+
+static func flags_for_type(t: String) -> int:
+	match t:
+		"corpse", "character-corpse", "rail-remnants":
+			return PF_COMPUTED | PF_REMNANT
+		"pipe":
+			return PF_COMPUTED | PF_PIPE_FLUID | PF_PIPE_PLAIN
+		"infinity-pipe":
+			return PF_COMPUTED | PF_PIPE_FLUID
+		"pipe-to-ground":
+			return PF_COMPUTED | PF_PIPE_GROUND
+		"heat-pipe":
+			return PF_COMPUTED | PF_PIPE_HEAT
+		"transport-belt":
+			return PF_COMPUTED | PF_BELT | PF_BELT_CAPPED
+		"underground-belt", "linked-belt":
+			return PF_COMPUTED | PF_BELT | PF_BELT_CAPPED | PF_BELT_UNDER
+		"splitter", "lane-splitter":
+			return PF_COMPUTED | PF_BELT | PF_BELT_CAPPED
+		"loader", "loader-1x1":
+			return PF_COMPUTED | PF_BELT
+		"wall":
+			return PF_COMPUTED | PF_WALL
+		"gate":
+			return PF_COMPUTED | PF_GATE
+		"cargo-bay":
+			return PF_COMPUTED | PF_CARGO | PF_CARGO_BAY
+		"space-platform-hub", "cargo-landing-pad":
+			return PF_COMPUTED | PF_CARGO
+	return PF_COMPUTED
+
+
 class EntityProto:
 	var id := 0
 	var name := ""
 	var type := ""
+	var flags := 0
 	## Selection box in tiles, relative to the entity position, for the north-facing entity.
 	## x is east, y is south (Factorio's axes).
 	var box_min := Vector2.ZERO
@@ -21,6 +70,7 @@ class EntityProto:
 		return (box_min + box_max) * 0.5
 
 
+var version := 0
 var entities := {}  # id -> EntityProto
 var entities_by_name := {}  # name -> EntityProto
 var tile_colors := PackedColorArray()
@@ -42,6 +92,7 @@ const NEVER_PLACED := {"projectile": true, "artillery-projectile": true, "explos
 
 
 func clear() -> void:
+	version += 1
 	entities.clear()
 	entities_by_name.clear()
 	item_names.clear()
@@ -56,6 +107,7 @@ func clear() -> void:
 
 ## [id, name, type, x1, y1, x2, y2, r, g, b, tile_width, tile_height]
 func add_entities(list: Array) -> void:
+	version += 1
 	for rec in list:
 		if not (rec is Array) or rec.size() < 12:
 			continue
@@ -63,6 +115,7 @@ func add_entities(list: Array) -> void:
 		p.id = int(rec[0])
 		p.name = str(rec[1])
 		p.type = str(rec[2])
+		p.flags = flags_for_type(p.type)
 		p.box_min = Vector2(float(rec[3]), float(rec[4]))
 		p.box_max = Vector2(float(rec[5]), float(rec[6]))
 		p.color = Color8(int(rec[7]), int(rec[8]), int(rec[9]))
@@ -73,6 +126,7 @@ func add_entities(list: Array) -> void:
 
 ## [id, name, r, g, b]
 func add_tiles(list: Array) -> void:
+	version += 1
 	for rec in list:
 		if not (rec is Array) or rec.size() < 5:
 			continue

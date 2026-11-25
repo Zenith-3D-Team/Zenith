@@ -6,6 +6,8 @@ extends Node
 ## is ready, records for `seconds` (default 20), writes the file, prints the summary and quits.
 ## With an out path of "-" it records no positions (cost only).
 
+const Switches := preload("res://scripts/switches.gd")
+
 const MAX_ITEMS := 4000
 
 ## The summary line, as printed (the debug menu shows it).
@@ -46,7 +48,7 @@ func _ready() -> void:
 		_seconds = float(spec[1])
 	if spec.size() > 2:
 		_settle = float(spec[2])
-	for a in OS.get_cmdline_user_args():
+	for a in Switches.args():
 		if a.begins_with("--belt-path-area="):
 			for v in a.substr(17).split(","):
 				_area.append(float(v) - 1.0 if _area.size() < 2 else float(v) + 1.0)

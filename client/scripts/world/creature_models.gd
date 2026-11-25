@@ -28,6 +28,8 @@ extends RefCounted
 
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
+const Looks := preload("res://scripts/world/looks.gd")
+const Switches := preload("res://scripts/switches.gd")
 const RIGS_PATH := "res://data/creature_rigs.json"
 const POSES_PATH := "res://data/creature_poses.json"
 const SKINS_PATH := "res://data/creature_skins.json"
@@ -181,6 +183,8 @@ static func prepare(mesh: ArrayMesh, name: String) -> ArrayMesh:
 		m.set_shader_parameter("skin_tint2", Color(second.linear_to_srgb(), float((t[1] as Array)[3])))
 		m.set_shader_parameter("skin_mode", 1 if masks else (3 if old_glow else 2))
 		m.set_shader_parameter("part_colors", true)
+		if m.get_shader_parameter("use_albedo_tex") != true:
+			m.set_shader_parameter("modeller_tex", false)
 	var glowing := func(m: ShaderMaterial) -> void: m.set_shader_parameter("activity_glow", true)
 	for i in out.get_surface_count():
 		var material := out.surface_get_material(i) as ShaderMaterial
@@ -195,6 +199,7 @@ static func prepare(mesh: ArrayMesh, name: String) -> ArrayMesh:
 			_set_rig(copy, limbs, scale, model)
 			if str(limbs.get("mode", "")) == "worm":
 				copy.set_shader_parameter("rig_mode", 4)
+				copy.shader = Looks.timed_shader(copy.shader)  # swaying by TIME: kept in the motion-vector pass (--static-mv)
 				copy.set_shader_parameter("worm_height", out.get_aabb().end.y)
 		out.surface_set_material(i, copy)
 	return out
@@ -204,7 +209,7 @@ static func _read_args() -> void:
 	if _args_read:
 		return
 	_args_read = true
-	for a in OS.get_cmdline_user_args():
+	for a in Switches.args():
 		if a == "--creature-glow=old":
 			old_glow = true
 
@@ -321,6 +326,8 @@ static func _set_rig(material: ShaderMaterial, limbs: Dictionary, scale: float, 
 		lifts.append(Vector3.RIGHT)
 		gaits.append(Vector4.ZERO)
 	material.set_shader_parameter("rig_mode", 2 if str(limbs.get("mode", "walk")) == "idle" else 1)
+	if str(limbs.get("mode", "walk")) == "idle":
+		material.shader = Looks.timed_shader(material.shader)  # its idle loop runs on TIME (--static-mv)
 	material.set_shader_parameter("rig_rate", float(limbs.get("rate", 1.0)))
 	material.set_shader_parameter("rig_joint", joints)
 	material.set_shader_parameter("rig_swing", swings)

@@ -18,6 +18,8 @@ extends RefCounted
 ## once either has finished: each thread opens its own
 ## file handle per zip (one isn't safe to share). Zips are read through their own index (_zip_index).
 
+const Switches := preload("res://scripts/switches.gd")
+
 const BUILT_IN := ["core", "base", "space-age", "quality", "elevated-rails", "recycler"]
 
 static var extra_dirs: Array[String] = []
@@ -37,7 +39,7 @@ static var generation := 0
 
 
 static func configure_from_command_line() -> void:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--factorio-mods="):
 			for dir in arg.get_slice("=", 1).split(";", false):
 				extra_dirs.append(dir.replace("\\", "/"))

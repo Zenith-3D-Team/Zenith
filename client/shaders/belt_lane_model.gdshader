@@ -3,6 +3,7 @@ shader_type spatial;
 // their small models instead of icons, placed as the icons are. Colours in the vertices, as
 // item.gdshader's; left out on the belts belt_items.gd draws and past the distance, as
 // belt_lane_icon.gdshader's (the belt's centre in the instance's custom data).
+// Opaque Early-Z shader (no discard; cut-out/dithered surfaces and vcull=off use belt_lane_model_cut.gdshader).
 render_mode world_vertex_coords, shadows_disabled;
 
 #include "res://shaders/belt_lane_model.gdshaderinc"

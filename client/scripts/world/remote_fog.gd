@@ -18,6 +18,8 @@ const RECENTRE := 64
 ## Seconds between passes over the world's chunks (new ones arrive while the view moves).
 const CHUNK_PASS := 0.25
 
+signal chunk_visibility_changed(c: Vector2i, drawn: bool)
+
 ## The world (world.gd), whose chunk nodes are hidden under the fog; null leaves them alone.
 var world: Node3D = null
 ## The UI model (ui_model.gd), for the roboports' chunks (roboport_covers); null: radars only.
@@ -83,6 +85,18 @@ func handle(msg: Dictionary) -> void:
 		_character_radius = -1.0
 	_known = true
 	_dirty = true
+
+
+## Another surface (main.gd _on_surface): drop the old surface's coverage until a fresh `cov` comes.
+func reset() -> void:
+	_known = false
+	_all = false
+	_si = 0
+	_radars.clear()
+	_character_radius = -1.0
+	_dirty = true
+	_quad.visible = false
+	_show_chunks()
 
 
 ## Every frame: whether the remote view is on, and where it looks (tiles). Leaving it forgets the
@@ -172,11 +186,13 @@ func _hide_chunks() -> void:
 		if hide and cv.visible:
 			cv.visible = false
 			_hidden[c] = cv
+			chunk_visibility_changed.emit(c, false)
 		elif not hide and _hidden.has(c):
 			cv.visible = true
 			_hidden.erase(c)
 			if world.has_method("chunk_shown"):
 				world.chunk_shown(c)  # its levels of detail, kept while hidden
+			chunk_visibility_changed.emit(c, true)
 	for c in _hidden.keys():
 		if not is_instance_valid(_hidden[c]) or chunks.get(c) != _hidden[c]:
 			_hidden.erase(c)
@@ -192,6 +208,7 @@ func _show_chunks() -> void:
 			cv.visible = true
 			if world != null and world.has_method("chunk_shown"):
 				world.chunk_shown(c)
+			chunk_visibility_changed.emit(c, true)
 	_hidden.clear()
 
 

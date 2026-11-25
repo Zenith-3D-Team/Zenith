@@ -1,171 +1,80 @@
 # Writing add-ons for Zenith
 
-An add-on is a small program that runs inside Zenith, the 3D view for Factorio, and adds to what
-the client does: a camera for filming, an overlay, a window of your own. It is written in
-GDScript, Godot's scripting language, and gets one object from Zenith, the add-on API, through
-which it reads what the client knows of the game and changes what the client shows.
+An add-on is a GDScript program running inside Zenith that extends the camera, visuals, UI, weather, terrain, or sound via the versioned add-on API (**API `1.93`**).
 
-**Add-ons are programs.** An add-on runs inside Zenith with the player's own rights: like any
-program on the PC it can read and change files, start other programs and use the network, and Godot
-has no way to wall it off. So Zenith leaves a new add-on off until the player switches it on in the
-Add-ons menu, and says there that only add-ons from people you trust should be switched on. Model
-and icon packs are data, not programs: they are the safe way to share models and icons.
+> **Contents:** [Architecture](#architecture) · [Installing](#installing-an-add-on) · [Folder & dependencies](#the-folder) · [Entry script](#the-entry-script) · [The API](#the-api) · [Factorio mod link (`api.game`)](#messages-to-your-factorio-mod) · [Testing & errors](#testing)
 
-**An add-on changes the game only through a Factorio mod of its own that everyone in that game has.** The rest of
-the API only reads the client's own copy of the world and moves the camera, the interface and what is drawn:
-everyone else sees nothing of it and Factorio's simulation is untouched. An add-on that wants to change the game
-(a sprint, a new tool) comes with a Factorio mod; `api.game` carries messages between the two, and the mod, which
-Factorio gives to every player in that game, makes the change. Zenith only carries the messages and never looks
-inside them.
+## Architecture
 
-The [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) add-on (free
-camera, timelapses, tracking shots, paths, idle mode, a recorder camera filming in the background,
-screenshots at full detail) is the worked example: everything below is what it uses.
+```mermaid
+flowchart LR
+    PKG["Add-on folder or .zip<br/>addon.json + main.gd + scripts/"] --> LOADER["AddonLoader<br/>version/dependency order"]
+    LOADER --> HOST["AddonHost<br/>permission toggle & lifecycle"]
+    HOST --> API["API 1.93 Modules<br/>camera, keys, world, character,<br/>view, ui, settings, terrain, shaders,<br/>sound, weather, creatures, updates, storage"]
+    HOST <-- "api.game (best-effort 4 KB ext)" --> MOD["Optional Companion Factorio Mod<br/>remote.call('zenith', ...)"]
+```
 
-Recording a viewport of your own: Godot's movie writer (`--write-movie`) only films the whole
-window at a fixed rate from start-up, so an add-on records its own `SubViewport` instead: draw it
-only when a frame is due (`UPDATE_ONCE`), copy it back without waiting
-(`RenderingDevice.texture_get_data_async` on the viewport's texture: `get_image()` waits for the
-graphics card, 13-20 ms a 1080p frame), and encode on worker threads. The Cinematic camera's
-`scripts/recorder.gd` and `scripts/avi_writer.gd` (a Motion-JPEG `.avi`) show how.
+- **Security model:** Add-ons execute normal GDScript with your OS user permissions (files, processes, network). New third-party add-ons always start **off** until explicitly enabled in the **Add-ons** menu. Model/icon/tile packs are pure asset data and cannot execute code.
+- **Simulation separation:** Add-ons cannot mutate Factorio's world directly. Gameplay changes must pair your add-on with a Factorio mod and exchange messages through `api.game` (see [`addons-src/sprint/`](../addons-src/sprint) and the `4` in-repo examples under `addons-src/`: `cinematic-shaders`, `immersive-weather`, `immersive-enemies`, `sprint`).
+- **Worked camera/recording reference:** [Zenith-Cinematic-Camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) demonstrates free camera, paths, and async `SubViewport` recording (`UPDATE_ONCE` + `RenderingDevice.texture_get_data_async` + worker AVI encoding).
 
 ## Installing an add-on
 
-An add-on is a folder with an `addon.json` in it, or a `.zip` of that folder. Put the folder or
-the zip in one of these places:
+Place an add-on folder (containing `addon.json`) or an uncompressed/compressed `.zip` (`addon.json` at root or one subfolder deep, unpacked on change to `user://addons-cache/<id>/`) in:
 
-| Where | For |
+| Location | Use |
 |---|---|
-| `%APPDATA%\Godot\app_userdata\Zenith\addons\` (Windows), `~/.local/share/godot/app_userdata/Zenith/addons/` (Linux) | Your own add-ons, kept across Zenith updates |
-| `addons\` beside `Zenith.exe` | Add-ons that come with a copy of Zenith |
-| `--addons=<folder>` on the command line | Development: an add-on's own folder or zip, or a folder of add-ons (several, separated by commas) |
+| `%APPDATA%\Godot\app_userdata\Zenith\addons\` (Win) / `~/.local/share/godot/app_userdata/Zenith/addons/` (Linux) | Player add-ons (kept across updates) |
+| `addons\` beside `Zenith.exe` | Add-ons bundled with a release |
+| `--addons=<dir>` *(comma-separated for multiple)* | Active development — always loads enabled and overrides installed copies |
 
-A zip is used as it is, without unpacking it by hand: `addon.json` at the zip's root or one
-folder down (as Factorio's mod zips: `my-addon_1.0.0.zip` holding `my-addon/addon.json`). Zenith
-unpacks it into `user://addons-cache/<id>/` when it starts the add-on, again only when the zip
-changes, so the add-on's relative preloads work as they do from a folder. A broken zip, or one
-without an `addon.json`, is listed with the reason. When an add-on with the same id is found
-twice (a folder and a zip, two zips), the newer version is used (a folder on a tie, and one given
-with `--addons` always), and its page in the Add-ons menu names the copy left out.
-
-A newly found add-on is **off until you switch it on** in the Add-ons menu (its page says so, and
-where it was found): it is a program, and switching it on is your say-so. The add-ons that come with
-a download start as its `addons/bundled.json` says (the Cinematic camera and shaders on, Terrain
-Elevation off), and one given with `--addons` is always on. Add-ons that were already on before
-Zenith turned new ones off stay on. `-- --addons-default=on` starts every add-on not yet switched as
-on, as before.
-
-Zenith looks for add-ons when it starts. The **Add-ons** menu (the main menu and the game menu Esc
-opens) lists them, each with its version, whether it's on and the reason when one
-couldn't load; clicking one opens its page: its switch (it applies at once, in a game too), its
-settings (`api.settings`, API 1.1), the options it builds itself (`api.ui.set_options`) and its
-keys. The main menu's **Mods** window lists them too, under *Zenith add-ons*. An add-on given with
-`--addons` is always on, and takes the place of an installed one with the same id.
-
-The downloads come with three of Zenith's own add-ons in their `addons/` folder: the
-[Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera/releases), switched on, the
-Cinematic shaders (the Cinematic look), switched on, and
-[Terrain Elevation](https://github.com/unjustodin/Terrain-Elevation/releases), switched off until you
-turn it on in the Add-ons menu. `addons/bundled.json` holds those first states (`{"id": true}`);
-once you switch an add-on yourself, your choice is kept instead.
-
-An add-on's keys are on its page of the Add-ons menu and in **Settings → Controls**, under the
-add-on's name, and are rebound there like Zenith's own.
+- **Precedence & state:** Duplicate `id`s resolve to highest semantic version (`--addons` always wins, then folders beat zips on ties). New add-ons start off (`--addons-default=on` starts them enabled); bundled defaults are seeded once by `addons/bundled.json` (releases ship **Cinematic camera**, **Cinematic shaders**, **Immersive Weather**, **Immersive Enemies** and **Terrain Elevation**, all on).
+- **In-game UI:** Manage switches, per-add-on settings (`api.settings`), custom controls (`api.ui.set_options`), and rebindable keys under **Add-ons** (main menu / Esc menu) and **Settings → Controls**.
 
 ## The folder
 
-To share an add-on, zip its folder: `my-addon_<version>.zip`, holding `my-addon/` (or the files
-at the zip's root).
-
-```
-my-addon/
-  addon.json
-  main.gd          the entry script
-  scripts/...      anything else it needs
-```
-
-`addon.json`:
+Zip `my-addon/` (`my-addon_<version>.zip`) containing `addon.json`, `main.gd`, and helper scripts:
 
 ```json
 {
 	"id": "my-addon",
 	"name": "My add-on",
 	"version": "1.0.0",
-	"api": 1,
+	"api": 1.91,
 	"entry": "main.gd",
 	"author": "you",
 	"description": "One line for the Mods window."
 }
 ```
 
-| Field | |
+| Field | Purpose |
 |---|---|
-| `id` | Lower case letters, digits, `-` and `_`. Names the add-on's keys, data folder and node |
-| `name`, `version`, `description`, `author` | Shown in the Add-ons menu, the Mods window and Settings → Controls |
-| `api` | The add-on API it was written for: `1` (any 1.x), or `1.1` to `1.7` (needs the additions marked with that level below). Zenith refuses an add-on that needs a newer API than it has, and says so in the Add-ons menu: update Zenith |
-| `entry` | The entry script, a `.gd` file in the folder |
-| `dependencies` | *(1.7)* Other add-ons and Factorio mods it needs, works with or can't run with, in Factorio's form (below). Optional |
+| `id` | Lowercase `a-z`, `0-9`, `-`, `_` (`:` forbidden). Keys actions, `api.storage` folder, and node names. |
+| `name`, `version`, `description`, `author` | Displayed in the Add-ons menu, Mods window, and Settings → Controls. |
+| `api` | Minimum required API level (`1`, `1.1`..`1.9`, or `1.91`..`1.93`; note numeric levels: `1.91` follows `1.9`). Zenith refuses add-ons requiring a newer level. |
+| `entry` | Path to the entry `.gd` script inside the add-on folder. |
+| `dependencies` | *(1.7)* Optional array of required/optional/incompatible add-ons and `mod:<name>` Factorio mods. |
 
-This page describes add-on API **1.7**: version 1 with additions that keep every 1.0 add-on
-working. The additions are marked *(1.1)* to *(1.7)*. An add-on that wants to run on a Zenith with 1.0 too
-asks for `"api": 1` and checks before using them:
-
-```gdscript
-if api.get("level") != null and api.level >= 1.1:
-	api.settings.add("distance", "number", 60.0, "Distance", {"min": 10, "max": 300, "unit": "tiles"})
-```
+Compatibility note: target `"api": 1` and guard newer features via `api.get("level") != null and api.level >= 1.7` if supporting older Zenith builds.
 
 ### Dependencies *(1.7)*
-
-An add-on that needs another add-on, or a Factorio mod in the game, says so in `addon.json` the way
-Factorio's `info.json` does:
 
 ```json
 "dependencies": ["cinematic-camera >= 0.3.0", "? terrain-elevation", "mod:space-age >= 2.1.0", "! old-camera"]
 ```
 
-Each entry is `"<prefix> <name> <op> <version>"`; the prefix and the version are optional, the ops are
-`<`, `<=`, `=`, `>=` and `>`. A bare name is another add-on's id; `mod:<name>` is a Factorio mod (ids
-can't hold `:`). A Factorio mod whose name has a space (Factorio allows it) can't be named after `mod:`
-yet. The Zenith API it needs stays in `api`. The prefixes, as Factorio's:
+Format `"<prefix><name> <op> <version>"` (`op`: `<`, `<=`, `=`, `>=`, `>`; bare name = add-on id, `mod:<name>` = Factorio mod without spaces):
 
-| Prefix | |
+| Prefix | Rule |
 |---|---|
-| none | Required: the add-on doesn't start without it, at a fitting version |
-| `?` | Optional: absent or switched off, nothing happens; there and on, its version must fit, and it starts first |
-| `(?)` | Optional, as `?`, and not named on the add-on's page |
-| `!` | Incompatible: the two don't run together. Whichever is already running wins: if one stops for a game's Factorio mods, the other may start in its place and keeps it when the game ends |
-| `~` | Required, but doesn't change the order the add-ons start in, so two add-ons may need each other this way: it only has to be installed, switched on and at a fitting version |
-| `+` | Recommended: treated as optional (Zenith has no launcher to suggest it) |
+| *(none)* | Required — must be installed, enabled, and version-matched; starts before dependent add-on. |
+| `?` / `(?)` | Optional — ignored if missing/disabled; if present & enabled, version must match and starts first (`(?)` hides from UI page). |
+| `!` | Incompatible — never runs alongside target; running add-on/game mod takes priority. |
+| `~` | Required without ordering constraint (allows mutually dependent add-ons). |
+| `+` | Treated as optional. |
 
-**Other add-ons** are checked when the add-on starts. If one isn't met the add-on doesn't start, and
-its page in the Add-ons window says why in red: the other isn't installed, is switched off, is too old
-(the version found is named), or couldn't load; or one running can't run with it. Add-ons that need
-each other in a circle (A needs B, B needs A) are all refused. Zenith never switches another add-on on
-for yours: switching an add-on on is the player's consent, so the page says what to switch on instead.
-Switching off an add-on that others need stops them first, with the reason on their pages; their own
-switches stay on, so switching it back on starts them again. Reloading an add-on (Testing, below)
-reloads the add-ons that need it too.
-
-**Factorio mods** can only be checked in a game: Zenith learns the game's mods when it joins. An add-on
-whose required mod the game doesn't have, at a fitting version, stops for that game (its page says
-which mod) and starts again when the game ends; in the menu it runs, so its keys and settings are there.
-An optional mod only stops it when the game has it at a version that doesn't fit; `!` stops it when the
-game has the mod.
-
-**Order.** Add-ons start by the depth of their dependency chains, as Factorio loads its mods: one that
-needs nothing first, then one that needs only those, and so on. Two at the same depth start in the order
-they were found (the command line's, your user folder's, Zenith's own; by folder name in each), where
-Factorio sorts by name; so add-ons without dependencies start exactly as before. A stop for a dependency
-goes the other way: the add-ons that need it stop first.
-
-Ask `api.addons.version(id)` *(1.7)* whether an optional add-on is running: its version, or `""`.
-An add-on with an optional Factorio mod (`"? mod:<name>"`) asks `api.game.mod(name)` whether this game has it.
-Reaching into another add-on's node or scripts works today but isn't promised: its insides may change in
-any version. Calls between add-ons may come later, as part of the API.
-
-An older Zenith (before 1.7) ignores `dependencies`. If your add-on relies on them being checked, ask for
-`"api": 1.7`. `--addon-requires=off` loads add-ons without checking them, in the order found.
+- **Add-on checks:** Resolved at start-up/reload in topological depth order (cycles refused). Zenith never auto-enables dependencies; disabling or reloading an add-on stops/reloads dependents cleanly.
+- **Factorio mod checks:** Checked on joining a game; unsatisfied `mod:<name>` deps suspend the add-on only during that game and resume in the menu. Query optional versions via `api.addons.version(id)` *(1.7)* and `api.game.mod(name)`. `--addon-requires=off` bypasses dependency checks for debugging.
 
 ## The entry script
 
@@ -218,6 +127,8 @@ A few GDScript notes:
 | `api.id`, `api.name`, `api.addon_version`, `api.dir` | From your `addon.json`, and the add-on's folder |
 | `api.in_game()` | A game is on |
 | `api.game_started`, `api.game_ended` | Signals |
+| `api.native_class(name)` *(1.93)* | An instance of one of Zenith's native C++ classes for an add-on's hot loops (`BiterRagdollNative`, `BiterGoreNative`, `AcidGooNative`, `BiterAnimNative`; any other name gives null); null too where the native library is missing (Linux, macOS, ARM64) or with `--enemies-native=off`: keep your GDScript for null |
+| `api.cue_changed(tick)` *(1.92)* | Signal: the game set a filmed scene's cue (a mod's `remote.call("zenith", "set_cue", tick)`), `-1` when it cleared it |
 | `api.note(text)` | A line in Zenith's log, marked with the add-on's id |
 | `api.load_script(path)` | One of the add-on's own scripts, by its path in its folder |
 | `api.addons.version(id)` | *(1.7)* The version of the add-on with that id while it runs, `""` when it isn't (not installed, off, refused): for optional dependencies |
@@ -327,6 +238,9 @@ returns copies.
 | `entities_in_chunk(chunk, types = [])` | Its buildings, trees, rocks...: `[{unit, name, type, position (Vector2), direction (0-15), working (true, false, or null)}]` |
 | `entities_near(point, radius, types = [])` | The same round a ground point |
 | `focus()` | The point the world is loaded round |
+| `tick()` *(1.91)* | The game's tick (Factorio's `game.tick`) of the newest message handled; `-1` outside a game. It holds while the game is paused and slows with it: time what must repeat the same way each run (a filmed scene) on it, not on the clock |
+| `smooth_tick()` *(1.91)* | The game's tick as moving things are timed: a float running on smoothly between messages at the rate ticks arrive, for motion keyed to ticks; `tick()` until moving things' first message, `-1` outside a game |
+| `cue_tick()` *(1.91)* | The tick a filmed scene starts on, for every add-on to time its part from: *(1.92)* the cue the game set while running (`set_cue`, see "Messages for add-ons and their mods"), else `--cue-tick=<game tick>` from Zenith's command line; `-1` when neither |
 | `stand_height_at(point)` *(1.7)* | How high the character would stand at a ground point (a `Vector2`), in tiles over the ground there: the drawn top of a belt, underground belt, splitter, loader, pipe-to-ground, heat pipe or ground rail (Factorio's character walks over these), the highest where several meet; 0 for bare ground and everything else. The model's top once it is in, else its placeholder's. This is the whole answer, uncapped: Zenith's own belt step-up uses only the belt family (belts, undergrounds, splitters, loaders, linked belts) and stands the body at most 0.3 tiles up. Cheap enough to ask each frame (a few box tests). From the prototype types only: a mod that changes what the character collides with isn't seen |
 | `hold_chunks(on)` *(1.6)* | While on, chunks the camera leaves aren't unloaded: the world keeps everything already drawn, as the bridge last sent it (it no longer updates chunks out of the view), and the chunks round the new focus still come. For a screenshot or a film of a long flight. Capped by memory: at most 1,600 chunks held past the view (a 40 x 40 square, about 1,300 tiles across), and fewer once the computer has under 1 GB of memory free; past either the held chunks farthest from the focus go first, and Zenith's log says so once. Held while any add-on asks; switching the add-on off lets them go |
 | `holding_chunks()`, `held_chunks()` *(1.6)* | Chunks are held now (by any add-on); how many are held past the view |
@@ -586,13 +500,15 @@ icons, effects), and the mouse's ground point and the camera follow. The
 
 | | |
 |---|---|
-| `set_heights(image, origin, tiles_per_texel)` | The heights: an `Image` (`FORMAT_RF`, heights in tiles), its first texel's corner at world `origin` (`Vector2`: x, z), each texel that many tiles square. Bilinear between texel centres, 0 outside: fade the edges yourself. One field for the whole client; the last add-on to set it wins. Zenith measures each field's lowest and highest height (for culling); an image that carries them as the meta `lift_range` (`image.set_meta("lift_range", Vector2(lowest, highest))`, tiles) is taken at its word instead, which spares a worker thread a pass over every texel (about 15 ms for 768 x 768) each time the field changes. Older Zenith ignores it |
+| `set_heights(image, origin, tiles_per_texel)` | The heights: an `Image` (`FORMAT_RF`, heights in tiles; `FORMAT_RGF` adds in green the ground without cliffs' terraces, which cliffs' rock is seated on: the low ground, grown with a terrace taller than 2 tiles, never under the high ground; `FORMAT_RGBF` adds in blue how near a cliff each texel is, 0-1, where Zenith tints the ground towards bare rock and dirt; other formats are converted to `FORMAT_RF`), its first texel's corner at world `origin` (`Vector2`: x, z), each texel that many tiles square. Bilinear between texel centres, 0 outside: fade the edges yourself. One field for the whole client; the last add-on to set it wins. Zenith measures each field's lowest and highest height (for culling); an image that carries them as the meta `lift_range` (`image.set_meta("lift_range", Vector2(lowest, highest))`, tiles) is taken at its word instead, which spares a worker thread a pass over every texel (about 15 ms for 768 x 768) each time the field changes. Older Zenith ignores it. The meta `fade_in` (`float`, seconds, up to 3) fades the new field in over the one before it (or over flat ground), shaders and `height_at` alike, so new hills rise instead of popping up; without it the field shows at once, as before |
+| `channels()` | How many of the image's channels this Zenith reads: 3 (red, green, blue as above). Older Zenith has no `channels()` and turns a three-channel image into one, losing the green: ask `has_method("channels")` before giving three |
+| `native()` *(0.2.3)* | Zenith's C++ for a height field's hot loops (a `TerrainFieldNative`), or `null` where the native library isn't (Linux, macOS, ARM64; `--terrain-native=off`). Ask `has_method("native")` first. Stateless: one object serves any number of worker threads. Its methods are the Terrain Elevation add-on's `scripts/heights.gd` stages and give the same floats as that GDScript (Godot's own `FastNoiseLite` for the noise): `hills(h, size, origin, step, seed, height, hill_size, detail, i0, i1, j0, j1)`, `cliffs(size, origin, step, cliffs, seat, trace, cliff_height)` → `[raise, near]` (11 floats a cliff: position, high side, line kind, line points), `water_distance(size, origin, step, wet)`, `base(hills, raise, water, size, step, shore, edge, with_cliffs)` → `[ground, full, lift]`, `pads(f, size, origin, step, pads, margin)` (`PackedVector2Array` of position, half size pairs), `interleave(full, ground, tint, channels)`; `version()` is 1. Main thread only (the library loads on it) |
 | `clear()` | Flat again (only your own field). Done for you when the add-on is switched off or the game ends |
 | `is_on()`, `area()` | A field is drawn; the square it covers (`Rect2`, tiles) |
 | `height_at(x, z)` | The height drawn under a point |
 | `chunk_kinds(chunk)` | A drawn chunk's 32 x 32 tiles as kinds (0 land, 1 water, 2 empty space), row by row from its north-west corner; empty when not loaded. A loop on the main thread: a few chunks a frame |
 | `cliffs_in_chunk(chunk)` | Its cliffs: `[{position, orientation}]`, Factorio's orientation (`"west-to-east"`: from the middle of one edge of the 4 x 4 cell to another, the high ground on its left) |
-| `buildings_in_chunk(chunk)` | Its buildings, for levelling the ground under them: `[[centre, half size], ...]` (Vector2 tiles; a building turned east or west has its sides swapped). Not trees, rocks, ore, cliffs, units or ghosts |
+| `buildings_in_chunk(chunk)` | Its buildings, for levelling the ground under them: `[[centre, half size], ...]` (Vector2 tiles; a building turned east or west has its sides swapped). Not trees, rocks, ore, cliffs, units, ghosts or vehicles (cars, tanks, spidertrons, rolling stock) |
 | `take_changed_chunks()` | The chunks whose buildings came, went or changed since the last call (a chunk loaded late, a building placed or mined); the first call starts watching |
 
 ### Looks and shaders: `api.shaders` *(1.3)*
@@ -629,7 +545,7 @@ Everything goes when the add-on is switched off. A look is a Dictionary; every k
 | `factorio_lut` | `true`: Factorio's own colour lookup for the planet and time of day, from the player's install |
 | `roughness_min` | 0-1: no model's surface shinier than this |
 | `texture_light` *(0.2.2)* | Vector2(sides, tops): the light balance on the textured models of a pack whose pack.json says `"shading": "pbr"` (absent: (1, 1), as Godot's own material lights them; Factorio's part colours keep their own (0.95, 0.6)). Lower the tops (0.8) if a look washes those packs out. The player's Packs' own shading setting (Factorio's everywhere) and `--pack-shading=factorio` turn the path off |
-| `texture_metal` *(0.2.2)* | 0-1: the share of a modeller's metallic-roughness picture's metal drawn (absent: 0.1, as paint, the share of every other surface's metal; 1: in full). The player's Metal on textured models setting (Full) and `--texture-metal` win over it |
+| `texture_metal` *(0.2.2)* | 0-1: the share of a modeller's metallic-roughness picture's metal drawn (absent: 0.1, as paint, the share of every other surface's metal; 1: in full). `--texture-metal` wins over it |
 | `pbr_env` *(pbr-standard)* | 0-2: the neutral reflection a pack whose pack.json says `"shading": "pbr"` reflects (`shaders/pbr_env.gdshaderinc`): its upper half is the ambient plus this much of the sun, its lower half 0.45 of that (absent: 0.45, a rough metal about as bright as paint of its colour). `--pbr-env=off` (the sky's reflection, as in 0.2.2) or a number wins |
 | `pbr_metal` *(pbr-standard)* | 0-1: the share of such a pack's metal drawn (absent: 1, in full). `--pbr-metal=0.1` (0.2.2's) or another number wins |
 | `pbr_fill`, `pbr_ambient` *(pbr-light-balance)* | 0-2: such a pack's share of the look's `model_fill` (absent: 0.3) and of the ambient (absent: 1), its ambient and reflection then lit by direction (the sky above, darker below, the sun's side brighter) so the sun decides its light and shaded sides. `--pbr-light=flat` gives the flat balance back (both in full, the reflection the same all round) |
@@ -692,6 +608,9 @@ and they are read from the player's install).
 | `kinds()` | The kinds (below) |
 | `volume(bus)` | The player's volume for a bus, 0 to 1 (0 while its tick box is off). Read-only |
 | `played(kind, info)` | Signal: Zenith played a sound of a kind (`"step/grass"`). `info`: `at` (a `Vector3`, or `null` for the windows'), `path` (the file), `by` (the add-on whose replacement it was, `""` for Zenith's own), `bus` (the key, as `play`'s `bus` option and `volume()` take it: `"walking"`, `"ui"`...). Sent only while something is connected (from the next frame after you connect), and not for a muted kind |
+| `loop(sound, options = {})` | *(1.8)* Starts a looping sound (`"sounds/rain.ogg"`, a Factorio path, or an `AudioStream`). Options: `at` (`Vector3`; absent: non-positional), `bus` (`"effects"`, `"ambient"`...), `volume` (0 to 1), `pitch` (0.25 to 4), `reach`, `fade_in` (seconds, default 0.35). Decodes on a worker if needed and fades in once ready. Returns a positive handle, or 0 on failure or voice cap |
+| `update_loop(handle, options = {})` | *(1.8)* Moves or adjusts an active loop: `volume`, `pitch`, `reach`, or `at` |
+| `stop_loop(handle, fade_out = 0.35)` | *(1.8)* Fades out and frees an active loop (`0` stops at once) |
 
 **Buses:** `effects` (the default), `walking`, `environment` (machines and vehicles), `weapons`,
 `explosions`, `enemies`, `ambient`, `ui`, `music`. Not `master`: a sound asked for there plays on
@@ -719,13 +638,71 @@ mute of the exact kind first, then of its base: `replace("step", ...)` changes e
 or stops (switched off, or Zenith closes), the one before comes back. `--sfx-log` prints
 `step/grass replaced by <your id>` (or `muted by`) each time an add-on decided a sound.
 
-**Undone on stop.** Switching your add-on off takes your replaces and mutes away and forgets your files.
+**Undone on stop.** Switching your add-on off takes your replaces, mutes, and active loops away and forgets your files.
 
 **The player's switch:** `--addon-sounds=off` ignores every `replace` and `mute` (they return false);
-your own `play` still works. Files are Ogg Vorbis (`.ogg`); Ogg Opus and `.wav` don't play yet.
+your own `play` and `loop` still work. Files are Ogg Vorbis (`.ogg`); Ogg Opus and `.wav` don't play yet.
 
-Looping sounds (`loop(sound, options)` and `stop(handle)`, mixed with the machines' loops) come in a
-later level.
+### Weather and surfaces: `api.weather` *(1.8)*
+
+Client-only atmosphere, sky, cloud, lighting mood, wind, and surface wetness/puddle overrides layered on
+top of whichever Look is active (Factorio, Classic Zenith, or Cinematic Shaders). Single-owner (the last
+add-on to call `set_state` wins), ignored on space platforms, and cleared automatically when your add-on
+stops or the game ends.
+
+| | |
+|---|---|
+| `set_state(spec)` | Applies a Dictionary of weather overrides (returns `false` outside a game or under `--addon-weather=off`). Every key is optional; omitted keys stay neutral |
+| `clear()` | Restores Zenith's defaults (only if this add-on is the owner) |
+| `is_on()`, `disabled()` | Weather overrides are active; `--addon-weather=off` was passed |
+| `state()` | Copy of the current sanitized weather state (`{}` when off) |
+| `add_puddle_ripple(pos, dir, radius, strength, life)` | *(Zenith 0.3.0; optional, check `has_method`)* Injects an expanding terrain puddle wake / dispersive ripple impulse at world XZ `pos` (`Vector2` tiles), optional travel direction `dir` (`Vector2`, default `Vector2.ZERO`), `radius` (`0.3-10` tiles, default `2.4`), `strength` (`0-3`, default `1.0`), and `life` (`0.15-6` s, default `1.6`). Up to 64 active impulses; returns `false` outside a game, under `--addon-weather=off` or `--puddle-splashes=off`, or when this add-on does not own `api.weather` |
+| `set_puddle_ripple_strength(strength)` | *(Zenith 0.3.0; optional, check `has_method`)* Scales active terrain puddle wake impulses (`0.0-2.5`) while this add-on owns `api.weather` |
+| `clear_puddle_ripples()` | *(Zenith 0.3.0; optional, check `has_method`)* Clears all active terrain puddle wake impulses owned by this add-on |
+| `splashes_disabled()` | *(Zenith 0.3.0; optional, check `has_method`)* Whether vehicle puddle splashes and terrain puddle wakes were disabled via `--puddle-splashes=off` |
+
+Supported keys in `spec`:
+
+- **Lighting & sky:** `sun_energy_scale` (0-2), `sun_color_tint` (`Color`), `sun_tint_amount` (0-1), `sun_disc_scale` (0-1.5), `shadow_opacity_scale` (0-1), `ambient_energy_scale` (0-2), `ambient_tint` (`Color`), `ambient_tint_amount` (0-1), `sky_zenith_tint` (`Color`), `sky_horizon_tint` (`Color`), `sky_tint_amount` (0-1), `star_visibility_scale` (0-1.5), `flash` (0-2: sky/ambient/cloud lightning flash).
+- **Clouds, fog & wind:** `cloud_cover` (-1 unset, or 0 open skies to 1 solid overcast), `cloud_alpha_scale` (0-1.5), `cloud_shadow_scale` (0-2), `cloud_darkness` (0-1), `cloud_tint` (`Color`), `cloud_tint_amount` (0-1), `wind` (`Vector2` tiles/s cloud drift), `wind_strength` (0-3, scales 3D grass sway when enabled), `fog_density_add` (0-0.03), `fog_color` (`Color`), `fog_color_amount` (0-1), `haze_strength` (0-0.35), `haze_color` (`Color`), `god_rays_scale` (0-2).
+- **Wetness & puddles:** `ground_wetness` (0-1), `model_wetness` (0-1), `puddle_amount` (0-1), `model_puddles` (0-1), `rain_ripples` (0-1), `puddle_scale` (0.03-0.6), `puddle_reflect` (0-1.5), `wet_darken` (0-1).
+
+### Creatures, ragdolls and combat hooks: `api.creatures` *(1.9)*
+
+Client-only enemy damage and death hooks, per-limb ragdoll shader helpers (`rig_mode = 5`), blood puddle decals, live creature animation overrides, and terrain/solid collision queries. Cleared automatically when your add-on stops or the game ends.
+
+**Signals:**
+
+| Signal | Payload (`Dictionary`) |
+|---|---|
+| `damaged(info)` | *(1.9)* Fired on combat hit/burn effects (`afx`). Keys: `unit` (`int`), `name` (`String`), `pos` (`Vector3`), `cause_pos` (`Vector3` or `null`), `damage_type` (`String`), `fx` (`String`), `dmg` (`int`, damage dealt in thousandths of max health, `0` if unavailable), `hp` (`int`, remaining health `0..1000`, `-1` if unavailable), `src` (`String`, damage source prototype name, `""` if unavailable) |
+| `died(info)` | *(1.9)* Fired when a creature dies (`died`). Keys: `unit` (`int`), `name` (`String`), `pos` (`Vector3`), `yaw` (`float`), `vel` (`Vector3`), `scale` (`float`), `phase` (`float`), `cause_pos` (`Vector3` or `null`), `damage_type` (`String`), `dmg` (`int`), `src` (`String`), `handled` (`bool`). Setting `info["handled"] = true` skips Zenith's default collapse animation and corpse |
+| `stream_event(info)` | *(1.9)* Fired when a stream projectile (`pj` stream, e.g. spitter/worm acid spit) starts, ends, or resets. For `"start"`: `event`, `id` (`int`), `name` (`String`), `pos` (`Vector2`), `from` (`Vector3`), `to` (`Vector3`), `hs`, `va`, `pst`, `psi` (`float`), `handled` (`bool`). Setting `info["handled"] = true` suppresses Zenith's 2D stream particles |
+| `ground_fx(info)` | *(1.9)* Fired when a ground fire/acid pool (`gf`) starts, ends, or resets. For `"start"`: `event`, `id` (`int`), `name` (`String`), `pos` (`Vector3`), `fade_in`, `fade_out` (`float`), `handled` (`bool`). Setting `info["handled"] = true` suppresses Zenith's 2D ground cards for that pool |
+
+**Methods:**
+
+| | |
+|---|---|
+| `make_ragdoll_node(proto)` | *(1.9)* Returns an unparented `MeshInstance3D` using `proto`'s mesh with cloned `ShaderMaterial`s set to `rig_mode = 5` (keeping all `rig_*` and skin tint uniforms), or `null` if the model is not ready. Mount it under `api.world.node()` and free it in `addon_stop()` |
+| `make_ragdoll_leg_node(proto, limb_idx)` | *(1.9)* Extracts and returns an unparented single-limb `MeshInstance3D` centred around limb `limb_idx`'s bounding centroid (with `leg_centroid` metadata and the ragdoll/decay shader at `rig_mode = 0`), or `null` if unavailable |
+| `precut(proto, limbs := 0)` | *(Zenith 0.3.0; optional, check `has_method`)* Cuts `proto`'s three split parts and its first `limbs` legs on a worker thread, ahead of its first explosive death (each cut is 7-25 ms of GDScript). Call again later: `true` once they are cut or the model has none, `false` while the model loads or the cutting runs. Cuts are kept until that proto's model changes |
+| `make_ragdoll_part_node(proto, part)` | *(1.9)* Extracts and caches an unparented solid body-chunk `MeshInstance3D` for `part` (`"head"`, `"thorax"`, or `"abdomen"`) partitioned by Z relative to tier scale, with a closed bloody purple-violet inner-meat cross-section cap fan along cut boundaries, `part_centroid` metadata, and `RagdollShader` (`rig_mode = 0`), or `null` if unavailable |
+| `set_ragdoll_limbs(node, limbs, twists = [])` | *(1.9)* Sets `rig_ragdoll[12]` on all `ShaderMaterial` surfaces of `node` from a `PackedVector3Array` of per-limb `(swing, lift, knee)` angles in radians (up to 12 limbs); optional `twists` `PackedFloat32Array` sets `.w` twist radians (values `> 50.0` collapse a severed limb into its socket) |
+| `set_ragdoll_decay(node, decay, floor_y = NAN)` | *(1.9)* Sets `rig_decay` (`0..1`) and optional world ground height `rig_decay_floor` on all `ShaderMaterial` surfaces of `node` to drive organic corpse deflation, desiccation, and noise erosion |
+| `set_ragdoll_wounds(node, blood, holes)` | *(1.9)* Sets `rig_blood` (`0..1`) and up to 6 local mesh-space bullet/shrapnel impact craters (`rig_holes[6]`, each `Vector4(x, y, z, radius)`) on all `ShaderMaterial` surfaces of a ragdoll, detached limb, or split body chunk |
+| `set_ragdoll_burn(node, burn)` | *(1.9)* Sets `rig_burn` (`0..1`) charring, ash darkening, and pulsing glowing ember veins on all `ShaderMaterial` surfaces of a ragdoll, detached limb, or split body chunk |
+| `set_unit_wounds(unit, blood, hits)` | *(1.9)* Applies live bloodiness (`0..1`) and procedural bullet craters (`hits`: `0..8`) to a living creature `unit` (promoting it cleanly out of GPU-walker mode while wounded; pass `0.0, 0` to clear; automatically cleared on death or add-on teardown) |
+| `set_pack_override(family, pack_id)` | *(1.9)* Sets a transient runtime model-pack override for `family` (e.g. `"big-biter"` -> `"builtin:placeholders"`), consulted only when the player has no explicit choice for that family and never written to `settings.cfg`; reloads meshes via `ModelLibrary.choices_changed`. Pass `""` to clear; cleared automatically on `clear()` / `addon_stop()` |
+| `rig_info(proto)` | *(1.9)* Returns a scaled copy of `proto`'s rig dictionary (`limbs`, `body`, `mode`, `rate`, plus `"scale": float`), or `{}` if none |
+| `add_blood_puddle(pos, scale = 1.0)` | *(1.9)* Places a Factorio blood puddle decal on the ground at `pos` via Zenith's corpse puddle layer |
+| `set_anim_enabled(on)` | *(1.9)* Enables or disables live per-unit animation overrides. When disabled, walking creatures stay on the GPU walker path with zero per-frame CPU overhead |
+| `set_unit_override(unit, data)` | *(1.9)* Applies a temporary pose/gait override to a live creature (`pitch`, `roll`, `yaw_offset`, `offset: Vector3`, `gait_mul`, `bite_mul`, `ttl: float`; pass `{}` to clear) |
+| `list_live(prefix = "")` | *(1.9)* Lists live creatures whose prototype name contains `prefix` (`""` for all): each entry is `{"unit", "name", "pos", "yaw", "speed", "attacking", "scale"}` |
+| `ground_height(x, z)` | *(1.9)* Ground elevation (tiles) at world `(x, z)` |
+| `ground_normal(x, z)` | *(1.9)* Upward ground surface normal at `(x, z)` (`Vector3.UP` when flat) |
+| `solid_at(x, z)` | *(1.9)* `true` when a solid static entity (wall, turret, building, rock, cliff, tree, spawner) occupies tile `(floor(x), floor(z))` |
+| `clear()` | *(1.9)* Clears this add-on's creature animation overrides, live unit wounds, and transient pack overrides |
 
 ### Lighter updates: `api.updates`
 
@@ -809,6 +786,7 @@ calls in its `zenith` remote interface. Depend on it optionally (`"? factorio-3d
 | `clients()` | `{ {client, player_index}, ... }`, the first one first |
 | `character(client)`, `player(client)`, `name(client)` | That Zenith's character (LuaEntity), its player (LuaPlayer, nil for the bridge's own), the player's name. Without an argument, as before |
 | `link()` | 1: this bridge has the link |
+| `set_cue(tick)` | A filmed scene's cue at that game tick (usually `game.tick`; `nil` or `-1` clears it), for every connected Zenith's add-ons: `api.world.cue_tick()` returns it from then on (it replaces `--cue-tick`) and `api.cue_changed` fires; a Zenith joining later gets it in its welcome. Returns the cue now set, `-1` when none. Call it from an event (`remote.call("zenith", "set_cue", game.tick)`) |
 
 ```lua
 local function on_message(e)
@@ -856,55 +834,25 @@ Factorio listens for UDP (`machine` is that player):
 
 ## Good manners
 
-- Leave the camera, the keys and the mouse alone unless the player asked (a key, a button).
-- Work in small steps: `_process` runs every frame, and anything slow there is a stutter.
-- Say what your keys are (`api.keys.text`) rather than naming them in your text: the player may
-  have rebound them.
-- Keep your add-on's own files inside its folder and its data in `api.storage`.
+- Never hijack camera, keys, or mouse unless the user invoked your key/UI control.
+- Keep `_process()` fast and incremental—stalls directly stutter frames.
+- Query current bindings with `api.keys.text()` instead of hardcoding key names.
+- Keep assets inside the add-on folder and persistent state in `api.storage`.
 
 ## Licence
 
-Zenith is GPL-3.0, with an exception for add-ons: an add-on that works with Zenith only through
-this API may use any licence you like ([LICENSING.md](../LICENSING.md)). One that copies Zenith's
-own code into it is under the GPL.
+Zenith is GPL-3.0 with an add-on exception ([LICENSING.md](../LICENSING.md)): add-ons interfacing strictly through this API may use any licence (copying Zenith source puts that work under GPL-3.0).
 
 ## Testing
 
-Run Zenith from its project with your add-on's folder:
+Launch Zenith pointed at your add-on folder during development:
 
-```
+```bash
 godot --path client -- --addons=C:/my-addon
 ```
 
-Zenith's log (the console it was started from) says which add-ons started, which were refused
-and why, and the add-on's own `api.note` lines. Script errors show there too, with the line.
+Check console output (`api.note` lines, manifest load errors, script traces).
 
-**Edit, then reload.** No restart is needed after a change: press **Ctrl+Shift+F5** (Zenith's
-"Reload the add-ons given with --addons", rebindable in Settings → Controls while `--addons` is given)
-or the **Reload** button on the add-on's page in the Add-ons window. Zenith stops the add-on
-(`addon_stop`), reads its `addon.json`, its scripts and shaders from disk again (a changed zip is
-unpacked again) and starts it (`addon_start`), so its keys and settings are declared afresh, once.
-Reload is on the page of every add-on given with `--addons`; with `-- --addons-dev` it is on every
-add-on's page that is switched on. Switching an add-on off and on in the Add-ons window reads it
-again too. A reload reads every `.gd` file in the add-on's folder, so a broken file anywhere in it is
-reported (in the log and on the page) even when nothing uses it, such as a work in progress. What the
-add-on keeps outside the API survives a reload: a `static var`, a node it added
-somewhere else than under its own, an autoload-like object of its own. Clear them in `addon_stop`.
-
-**Script errors in the game.** A downloaded Zenith has no console, so an error in an add-on's files
-also goes to its page in the Add-ons window, under "Script errors (n)": the file (its path in the
-add-on's folder), the line and the message, how many times it happened, and Copy for a bug report.
-Paths in a message are shown in the add-on's folder too, and any other in the player's own folders as
-`<user folder>`, so a copied report names no folder of the PC.
-A Factorio mod's error on one of the add-on's channels is listed there too, as a short line naming the
-mod (the game went on; Copy gives Factorio's whole report), and the row says "Factorio mod error" when
-it has only those; these aren't announced in the game.
-The add-on's row says "script error", and the first error of each add-on in a run is announced once in
-the game. An entry script that doesn't parse is refused with the first error since it started or was reloaded
-(the cause, such as a preloaded file's parse error, not the errors that follow from it). The add-on
-keeps running: Godot ends the call that failed and goes on. Factorio stops the game on a mod's error;
-Zenith is only the view, so it shows the error and carries on. A reload clears the list. (This needs
-Godot 4.5 or newer, which Zenith's downloads use; on an older Godot errors stay in the log.)
-
-The project's own add-on test (`client/tests/addon_test.tscn`) loads a small add-on from
-`client/tests/addon_fixtures/` and is a compact example of each part of the API.
+- **Hot reload (`Ctrl+Shift+F5`):** Re-reads `addon.json`, `.gd` scripts, and shaders on demand via `addon_stop()` → reload → `addon_start()`, without restarting Zenith (**Reload** appears on `--addons` pages, or everywhere with `-- --addons-dev`). Clear any `static var` or external scene nodes in `addon_stop()`. All `.gd` files in the folder are checked at reload time.
+- **In-game error reporting:** Exported builds show parse/runtime traces under `"Script errors (n)"` on the add-on's UI page with OS paths masked (`<user folder>`) and one-click bug-report copy. Factorio mod channel errors appear similarly on the add-on's page (after `10` errors in 1 minute, the bridge closes the channel until reconnect).
+- **Automated harness:** See [client/tests/addon_test.tscn](../client/tests/addon_test.tscn) and `client/tests/addon_fixtures/` for working examples of every API subsystem.

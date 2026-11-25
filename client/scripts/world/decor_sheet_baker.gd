@@ -62,6 +62,10 @@ var _active_size := 0
 var _active_compress := false
 var _active_upload := true
 var _active_swapped_rb := false
+const PROBE_NONE := -1
+const PROBE_INVALID := 2
+var _bgra_cached := -1  # -1 unknown, 0 not BGRA, 1 BGRA (viewport format, read once on the render thread)
+var _probe_result := PROBE_NONE
 
 var _inbox := ReadbackInbox.new()
 var _post_jobs: Array = []  # [task_id, PostJob]
@@ -142,7 +146,22 @@ func step(delta: float, on_finished: Callable) -> void:
 			_clear_bake_root()
 			var up_tex := _unpremul_vp.get_texture()
 			var up_rid := up_tex.get_rid() if up_tex != null else RID()
-			_active_swapped_rb = _is_bgra_viewport(up_rid)
+			# The format is read once on the render thread (texture_get_format is render-thread only
+			# with a separate render thread) and cached; the bake waits a frame for the first answer.
+			if _bgra_cached < 0:
+				if _probe_result == PROBE_NONE:
+					RenderingServer.call_on_render_thread(_probe_format.bind(up_rid))
+					if _probe_result == PROBE_NONE:
+						return
+				var pr := _probe_result
+				_probe_result = PROBE_NONE
+				if pr == PROBE_INVALID:
+					_active_swapped_rb = false
+				else:
+					_bgra_cached = pr
+					_active_swapped_rb = pr == 1
+			else:
+				_active_swapped_rb = _bgra_cached == 1
 			_unpremul_mat.set_shader_parameter(&"swap_rb", _active_swapped_rb)
 			_unpremul_mat.set_shader_parameter(&"src", _bake_vp.get_texture())
 			_unpremul_vp.render_target_update_mode = SubViewport.UPDATE_ONCE
@@ -356,15 +375,19 @@ func _clear_bake_root() -> void:
 		child.queue_free()
 
 
-static func _is_bgra_viewport(vp_rid: RID) -> bool:
+## Runs on the render thread (via call_on_render_thread); stores 1 (BGRA), 0 (other) or PROBE_INVALID.
+func _probe_format(vp_rid: RID) -> void:
 	var rd := RenderingServer.get_rendering_device()
 	if rd == null or not vp_rid.is_valid():
-		return false
+		_probe_result = PROBE_INVALID
+		return
 	var rd_tex := RenderingServer.texture_get_rd_texture(vp_rid)
 	if not rd_tex.is_valid():
-		return false
+		_probe_result = PROBE_INVALID
+		return
 	var fmt := rd.texture_get_format(rd_tex)
-	return fmt.format == RenderingDevice.DATA_FORMAT_B8G8R8A8_UNORM or fmt.format == RenderingDevice.DATA_FORMAT_B8G8R8A8_SRGB
+	var is_bgra := fmt.format == RenderingDevice.DATA_FORMAT_B8G8R8A8_UNORM or fmt.format == RenderingDevice.DATA_FORMAT_B8G8R8A8_SRGB
+	_probe_result = 1 if is_bgra else 0
 
 
 static func _request_readback(vp_rid: RID, token: int, inbox: ReadbackInbox, swapped_rb: bool = false) -> void:

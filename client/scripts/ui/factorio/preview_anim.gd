@@ -36,6 +36,7 @@ const InserterArms := preload("res://scripts/world/inserter_arms.gd")
 const Swing := preload("res://scripts/world/inserter_swing.gd")
 const ItemModels := preload("res://scripts/world/item_models.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
+const VehicleAnim := preload("res://scripts/world/vehicle_anim.gd")
 ## The ticks the hand stands at each end, the item taken (or let go) ARM_TAKE ticks after it arrives.
 const ARM_WAIT := 12.0
 const ARM_TAKE := 2.0
@@ -57,6 +58,8 @@ var _anim: Anim = null
 var _own_time := 0.0
 var _working := {UNIT: 1}
 var _rest := {}  # a copy at rest -> its custom data
+var _tracks: Array = []  # [[MultiMeshInstance3D, track_x], ...] for tank treads
+var _track_travel := 0.0
 ## The baked parts timed in place while playing (the preview's own MultiMeshInstance3D).
 var in_place: Array[MultiMeshInstance3D] = []
 ## (An inserter) Whether its hand is moving now (inserter_arms.gd _moving's rule: drawn turning or reaching,
@@ -93,7 +96,8 @@ var _signal_t := 0.0
 static func can_play(holder: Node3D, model: String) -> bool:
 	for part: ModelLibrary.AnimPart in ModelLibrary.parts_for(model):
 		Anim.setup_part(part)
-		if part.mesh != null and part.motion > Anim.MOTION_NONE:
+		if part.mesh != null and (part.motion > Anim.MOTION_NONE \
+				or (VehicleAnim.enhanced and (part.kind == "tread_l" or part.kind == "tread_r"))):
 			return true
 	for c in holder.get_children():
 		if c.has_meta("arm_piece"):
@@ -173,6 +177,15 @@ func build(holder: Node3D, model: String, play: bool) -> void:
 			continue
 		var part: ModelLibrary.AnimPart = parts.get(mi.mesh)
 		parts.erase(mi.mesh)
+		if play and VehicleAnim.enhanced and part != null and (part.kind == "tread_l" or part.kind == "tread_r"):
+			var tmm := VehicleAnim.build_track_mm(part)
+			if tmm != null:
+				tmm.transform = mi.transform
+				holder.add_child(tmm)
+				copies.append(tmm)
+				_tracks.append([tmm, part.pivot.origin.x])
+				_hide(mi)
+				continue
 		var moves := part != null and part.motion > Anim.MOTION_NONE
 		if play and (moves or _glows(mi.mesh) or _belt(mi.mesh)):
 			_copy(holder, mi.mesh, mi.transform, part if moves else null)
@@ -208,6 +221,8 @@ func clear() -> void:
 	copies.clear()
 	groups.clear()
 	_rest.clear()
+	_tracks.clear()
+	_track_travel = 0.0
 	_hidden.clear()
 	if _anim != null:
 		_anim.free()  # a Node out of the tree: its last reference going doesn't free it
@@ -222,6 +237,11 @@ func process(holder: Node3D, delta: float) -> void:
 		return
 	_own_time += delta
 	_swing_arm(delta)
+	if playing and not _tracks.is_empty():
+		_track_travel += delta * Anim.PREVIEW_ROLL_SPEED
+		for tr in _tracks:
+			var t_pair: Array = tr
+			VehicleAnim.update_track_mm(t_pair[0], float(t_pair[1]), _track_travel)
 	var changed := _signal_cycle(delta)
 	if _tick(holder) or changed:
 		for g in groups:

@@ -14,10 +14,13 @@ extends Node3D
 ## item's icon not loaded yet is loaded on a worker too (IconJob), and its chunks wait for it: a
 ## tinted icon is composed pixel by pixel, which is what made one message take 30 ms (D6's probe).
 
+const FreeLater := preload("res://scripts/world/free_later.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const ModelLods := preload("res://scripts/world/model_lods.gd")
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const LaneInset := preload("res://scripts/world/belt_lane_inset.gd")
 const WorldMirror := preload("res://scripts/world/world.gd")
@@ -27,6 +30,9 @@ const ItemCards := preload("res://scripts/world/item_cards.gd")
 const ItemModels := preload("res://scripts/world/item_models.gd")
 const Looks := preload("res://scripts/world/looks.gd")
 const PerfLog := preload("res://scripts/world/perf_log.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## Before the mod says which square it read (an older mod), lane icons start this far inside the
 ## distance round the focus, so there is no gap.
@@ -48,6 +54,35 @@ const PILE_TURN := ItemCards.PILE_TURN
 const LAYER_STEP := 0.006
 ## Main-thread time a frame may spend making chunks' MultiMeshes: its slice in frame_budget.gd
 ## (`lanes`).
+## --belt-lane-vcull=off: keep near/far lane culling in the fragment shader only instead of discarding in vertex().
+static var belt_lane_vcull := Switches.on("--belt-lane-vcull")
+## --far-belt-3d-dist=<tiles|all>: distance from hand_over_centre() within which far belt chunks draw
+## 3D item models instead of flat icons ("all" keeps 3D models at every distance).
+static var _far_3d_cli := false
+static var _far_3d_debug := false
+static var far_3d_dist := _far_3d_dist_arg()
+const FAR_3D_BY_QUALITY := {"low": 18.0, "medium": 48.0, "high": 64.0, "ultra": 80.0}
+## --far-belt-variants=on: draw model variants on far belts (default off: one mesh kind per item far away).
+static var far_belt_variants: bool:
+	get:
+		return Job.far_variants
+	set(v):
+		Job.far_variants = v
+## --far-item-pbr=full: bind ORM and normal textures on far belt items instead of scalar roughness/metallic.
+static var far_item_pbr_full := Switches.has("--far-item-pbr=full")
+const FAR_3D_HYSTERESIS := 8.0
+
+
+static func _far_3d_dist_arg() -> float:
+	for a in Switches.args():
+		if a.begins_with("--far-belt-3d-dist="):
+			_far_3d_cli = true
+			var v := a.get_slice("=", 1)
+			if v == "all":
+				return -1.0
+			if v.is_valid_float():
+				return maxf(0.0, v.to_float())
+	return 48.0
 
 var protos: ProtoDB
 var world: WorldMirror
@@ -165,11 +200,15 @@ var _held := {}
 var _unknown := {}
 var _materials := {}  # item id -> ShaderMaterial
 var _model_materials := {}  # item id -> ShaderMaterial for its far model (models())
+var _lod2_model_materials := {}  # item id -> ShaderMaterial for its far LOD2 proxy box
 var _own_models := {}  # item id -> [its model, the model dressed for far belts] (item_models.gd dressed)
 var _steps := {}  # item id -> its model's pile step (its height), once its model is read
 var _variants := {}  # item id -> how many variants its model has (2 or more), learnt with its step
 var _models := false  # models() when the chunks were last made: a change makes them all again
 var _models_gen := 0  # ItemModels.current_generation() when they were: a change makes them again too
+var _lod2_mode := ItemModels.lod2_mode
+var _chunk_3d := {}  # Vector2i -> bool: whether the built chunk uses 3D models instead of icons
+var _last_3d_focus := Vector2(INF, INF)
 var _quad := QuadMesh.new()
 var _height := 0.2
 var _height_known := false
@@ -193,6 +232,7 @@ var worst_apply_usec := 0
 
 ## One batch of chunks' icons, worked out on a worker thread: buffers only, no nodes.
 class Job:
+	static var far_variants := Switches.has("--far-belt-variants=on")
 	var msgs: Array = []  # [chunk, l, c, h]
 	var height := 0.2
 	## Far models (models()): item id -> a pile's step for items whose model is known, laid out as
@@ -206,11 +246,16 @@ class Job:
 	var variants := {}
 	## Each lane's distance from its belt's centre line: the belt's pack's (belt_lane_inset.gd), else Factorio's.
 	var lane := LANE
+	var proxy_lod2 := false
 	var results: Array = []  # [chunk, {item id: PackedFloat32Array of TRANSFORM_3D + custom instances}, steps]
 
 	func run() -> void:
 		for m: Array in msgs:
-			results.append([m[0], build(m[1], m[2], height, m[3], steps, curves, variants, lane), steps])
+			var use_3d := bool(m[4]) if m.size() > 4 else true
+			var use_steps := use_3d or proxy_lod2
+			var built := build(m[1], m[2], height, m[3], steps if use_steps else null, curves,
+				variants if (use_3d and far_variants) else {}, lane)
+			results.append([m[0], built, steps if use_steps else null, use_3d])
 
 	## The seed of a far icon's turn (ItemCards.turn_for): its belt's centre (1/256 tile, as `l`), its
 	## lane and its place on it, so it stays put while the lane's icons do.
@@ -228,7 +273,7 @@ class Job:
 		var row := 0
 		for i in range(0, l.size() - 4, 5):
 			var at := Vector2(int(l[i]), int(l[i + 1])) / 256.0
-			var a := int(l[i + 2]) / 16.0 * TAU
+			var a := -Wire.direction_yaw(int(l[i + 2]))
 			var right := Vector2(cos(a), sin(a))
 			var ahead := Vector2(sin(a), -cos(a))
 			var turn_way := int(curves.get(Vector2i(int(l[i]), int(l[i + 1])), 0))
@@ -349,8 +394,36 @@ func _dump_cam() -> void:
 		"fps": Engine.get_frames_per_second(), "process_ms": snappedf(Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0, 0.01)})
 
 
+var _behind_connected: Object = null
+
+
+func _watch_behind() -> void:
+	if world == null or not is_instance_valid(world):
+		return
+	var bc: Variant = world.get("behind_cull")
+	if bc == _behind_connected or bc == null or not is_instance_valid(bc):
+		return
+	_behind_connected = bc
+	if bc.has_signal("chunk_visibility_changed"):
+		bc.chunk_visibility_changed.connect(_on_behind_visibility)
+
+
+func _behind_hidden(c: Vector2i) -> bool:
+	if not ViewPriority.tight_cull or world == null or not is_instance_valid(world):
+		return false
+	var bc: Variant = world.get("behind_cull")
+	return bc != null and is_instance_valid(bc) and bc.is_active() and bc.hidden(c)
+
+
+func _on_behind_visibility(c: Vector2i, drawn: bool) -> void:
+	var node: Node3D = _chunks.get(c)
+	if node != null:
+		node.visible = not _held.has(c) and (drawn or not _behind_hidden(c))
+
+
 func _ready() -> void:
-	for a in OS.get_cmdline_user_args():
+	_watch_behind()
+	for a in Switches.args():
 		if a.begins_with("--belt-lanes-dump="):
 			_dump = FileAccess.open(a.substr(len("--belt-lanes-dump=")), FileAccess.WRITE)
 	_quad.size = Vector2(ICON, ICON)
@@ -384,6 +457,8 @@ func reset() -> void:
 	_done.clear()
 	for c in _chunks.keys():
 		_drop(c)
+	_chunk_3d.clear()
+	_last_3d_focus = Vector2(INF, INF)
 	covered = Vector3(0.0, 0.0, -1.0)
 	_cut_since = -1
 	bridge_work = -1.0
@@ -395,6 +470,7 @@ func reset() -> void:
 
 
 func _process(_delta: float) -> void:
+	_watch_behind()
 	if auto:
 		_auto(_delta)
 	if not Bridge.world_ready:
@@ -405,14 +481,21 @@ func _process(_delta: float) -> void:
 		_sent_smooth = int(smooth)
 		_sent_cap = cap
 		Bridge.send({"t": "bfar", "r": distance, "n": near, "m": cap, "u": SMOOTH_UNITS if smooth else 0})
+	var tp := Time.get_ticks_usec()
 	if _task >= 0 and WorkerThreadPool.is_task_completed(_task):
 		_finish()
+	Probing.add("bl_finish", tp)
+	tp = Time.get_ticks_usec()
 	if _task < 0 and not _pending.is_empty():
 		_start()
+	Probing.add("bl_start", tp)
+	tp = Time.get_ticks_usec()
 	if _icon_task >= 0 and WorkerThreadPool.is_task_completed(_icon_task):
 		_finish_icons()
 	if _icon_task < 0 and not _icons_wanted.is_empty():
 		_start_icons()
+	Probing.add("bl_icons", tp)
+	tp = Time.get_ticks_usec()
 	if _done.is_empty():
 		FrameBudget.waiting(&"lanes", 0)
 	else:
@@ -421,11 +504,21 @@ func _process(_delta: float) -> void:
 		if allow > 0:
 			_apply_some(allow)
 		FrameBudget.spent(&"lanes", Time.get_ticks_usec() - t0, _done.size())
+	Probing.add("bl_apply", tp)
+	tp = Time.get_ticks_usec()
 	_follow_models()
+	Probing.add("bl_follow", tp)
+	tp = Time.get_ticks_usec()
+	if _models and far_3d_dist >= 0.0 and hand_over_centre().distance_squared_to(_last_3d_focus) > 16.0:
+		_last_3d_focus = hand_over_centre()
+		for c in _chunks:
+			if _want_chunk_3d(c) != bool(_chunk_3d.get(c, false)) and _latest.has(c) and not _pending.has(c):
+				_pending[c] = _latest[c]
 	# Only when what they say changed: three parameters on every item's material every frame (each
 	# queues the material's uniforms to be sent again), while the square moves once an update.
-	if [hand_over_centre(), near_edge(), distance, _materials.size(), _model_materials.size(), _own_models.size()] != _params_key:
+	if [hand_over_centre(), near_edge(), distance, far_3d_dist, ItemCards.lod_blend, ItemModels.lod2_mode, _materials.size(), _model_materials.size(), _lod2_model_materials.size(), _own_models.size()] != _params_key:
 		_set_params()
+	Probing.add("bl_params", tp)
 	if _dump != null and Time.get_ticks_usec() - _dump_cam_usec >= DUMP_CAM_USEC:
 		_dump_cam_usec = Time.get_ticks_usec()
 		_dump_cam()
@@ -506,56 +599,214 @@ static func log_auto(why: String, binding := true) -> void:
 		PerfLog.lower("belts", "auto", str(int(auto_cap)))
 
 
+func apply_lod_quality(quality: String, custom_distance := 0.0) -> void:
+	if _far_3d_cli or _far_3d_debug:
+		return
+	var want: float
+	if custom_distance > 0.0:
+		want = clampf(custom_distance, 12.0, 240.0)
+	elif ModelLods.old_low_lod and quality.to_lower() == "low":
+		want = 32.0
+	else:
+		want = float(FAR_3D_BY_QUALITY.get(quality.to_lower(), 48.0))
+	if is_equal_approx(far_3d_dist, want):
+		return
+	far_3d_dist = want
+	for c in _chunks:
+		if _want_chunk_3d(c) != bool(_chunk_3d.get(c, false)) and _latest.has(c) and not _pending.has(c):
+			_pending[c] = _latest[c]
+
+
+func _rebuild_chunk_sync(c: Vector2i) -> void:
+	var m: Array = _latest[c]
+	var use_3d := _want_chunk_3d(c)
+	var use_steps := use_3d or (_models and ItemModels.item_geom_lod and ItemModels.lod2_mode == "proxy")
+	var curves := {}
+	_curves_of(c, curves)
+	if use_steps and protos != null:
+		var l = m[0]
+		for i in range(0, l.size() - 4, 5):
+			for lane in 2:
+				var item := int(l[i + 3 + lane])
+				if item == 0 or _steps.has(item):
+					continue
+				var name := protos.item_name(item)
+				if name != "" and ItemModels.ready(name):
+					var mesh := ItemModels.mesh_for(name)
+					if mesh != null:
+						_steps[item] = clampf(mesh.get_aabb().size.y, 0.03, 0.2)
+						var nv := ItemModels.variant_count(name)
+						if nv >= 2:
+							_variants[item] = nv
+	_make(c, Job.build(m[0], m[1], _belt_height(), m[2] if m.size() > 2 else [],
+		_steps if use_steps else null, curves, _variants if (use_3d and far_belt_variants) else {}, _lane), use_3d)
+
+
+## Applies live debug-menu changes to far belt item settings.
+func apply_debug_far_settings(dist_changed := false, rebuild_all := false) -> void:
+	if rebuild_all:
+		_model_materials.clear()
+		_lod2_model_materials.clear()
+		_own_models.clear()
+		_steps.clear()
+		_variants.clear()
+		_params_key.clear()
+		_models = models()
+		_lod2_mode = ItemModels.lod2_mode
+		_last_3d_focus = hand_over_centre()
+		for c in _latest.keys():
+			if sync:
+				_rebuild_chunk_sync(c)
+			else:
+				_pending[c] = _latest[c]
+	elif dist_changed:
+		for c in _chunks.keys():
+			if _want_chunk_3d(c) != bool(_chunk_3d.get(c, false)) and _latest.has(c):
+				if sync:
+					_rebuild_chunk_sync(c)
+				else:
+					_pending[c] = _latest[c]
+
+
+func set_far_3d_dist(d: float, debug_override := true) -> void:
+	_far_3d_debug = debug_override
+	far_3d_dist = d
+	apply_debug_far_settings(true, false)
+
+
+func _want_chunk_3d(c: Vector2i) -> bool:
+	if not _models:
+		return false
+	if far_3d_dist < 0.0:
+		return true
+	if far_3d_dist == 0.0:
+		return false
+	var f := hand_over_centre()
+	var x0 := float(c.x * 32)
+	var z0 := float(c.y * 32)
+	var dx := maxf(x0 - f.x, maxf(0.0, f.x - (x0 + 32.0)))
+	var dz := maxf(z0 - f.y, maxf(0.0, f.y - (z0 + 32.0)))
+	var limit := far_3d_dist + FAR_3D_HYSTERESIS if bool(_chunk_3d.get(c, false)) else far_3d_dist
+	return dx * dx + dz * dz <= limit * limit
+
+
 ## Items in 3D turned models on or off, or an item's model file changed with the packs
 ## (ItemModels.generation): every chunk is made again (an int compare otherwise).
 func _follow_models() -> void:
 	var gen := ItemModels.current_generation() if ItemModels.kinds_follow else _models_gen
-	if _models == models() and _models_gen == gen:
+	var mode := ItemModels.lod2_mode
+	if _models == models() and _models_gen == gen and _lod2_mode == mode:
 		return
 	_models = models()
 	_models_gen = gen
+	_lod2_mode = mode
+	_last_3d_focus = hand_over_centre()
 	_steps.clear()  # (a pile's step is its model's height: read again from the new one)
 	_variants.clear()
 	for c in _latest:
 		if sync:
 			var m: Array = _latest[c]
-			_make(c, Job.build(m[0], m[1], _belt_height(), m[2] if m.size() > 2 else [], null, {}, {}, _lane))
+			var use_3d := _want_chunk_3d(c)
+			var use_steps := use_3d or (_models and ItemModels.item_geom_lod and _lod2_mode == "proxy")
+			_make(c, Job.build(m[0], m[1], _belt_height(), m[2] if m.size() > 2 else [], _steps if use_steps else null, {}, {}, _lane), use_3d)
 		else:
 			_pending[c] = _latest[c]
 
 
-## Far belts' items drawn as their small models: Items in 3D is
-## All (with a cap the items past it are icons, and the far ones are past it).
+## Whether nearby 3D belt items have exhausted ItemCards.model_cap (updated by belt_items.gd).
+static var near_3d_exhausted := false
+
+
+func set_near_3d_exhausted(v: bool) -> void:
+	if near_3d_exhausted == v:
+		return
+	near_3d_exhausted = v
+	_follow_models()
+
+
+## Far belts' items drawn as their small models: Items in 3D is on and either
+## All (`model_cap < 0`) or nearby 3D items have not exhausted `model_cap`.
 static func models() -> bool:
-	return ItemCards.use_models and ItemCards.model_cap < 0
+	return ItemCards.use_models and (ItemCards.model_cap < 0 or (ItemCards.model_cap > 0 and not near_3d_exhausted))
 
 
 ## Every icon material's square and distance (an item belt_items.gd doesn't draw yet: no square).
-## What _set_params last set: [centre, edge, distance, materials, model materials].
+## What _set_params last set: [centre, edge, distance, far_3d_dist, lod_blend, lod2_mode, materials, model materials, lod2 materials, own models].
 var _params_key: Array = []
+var _mat_sent := {}  # ShaderMaterial -> [focus, near, far, vcull, fade_on, f0, f1]
+
+
+func _sync_mat_params(m: ShaderMaterial, target_shader: Shader, centre: Vector2, near_val: float, far_val: float,
+		vcull_val: bool, has_fade: bool, fade_on: bool, f0: float, f1: float) -> void:
+	if target_shader != null and m.shader != target_shader:
+		m.shader = target_shader
+	var prev: Variant = _mat_sent.get(m)
+	if prev is Array:
+		var p := prev as Array
+		if has_fade:
+			if bool(p[4]) != fade_on:
+				m.set_shader_parameter("lod_fade_albedo", fade_on)
+				p[4] = fade_on
+			if not is_equal_approx(float(p[5]), f0):
+				m.set_shader_parameter("lod_fade_start", f0)
+				p[5] = f0
+			if not is_equal_approx(float(p[6]), f1):
+				m.set_shader_parameter("lod_fade_end", f1)
+				p[6] = f1
+		if not (p[0] as Vector2).is_equal_approx(centre):
+			m.set_shader_parameter("focus", centre)
+			p[0] = centre
+		if not is_equal_approx(float(p[1]), near_val):
+			m.set_shader_parameter("near", near_val)
+			p[1] = near_val
+		if not is_equal_approx(float(p[2]), far_val):
+			m.set_shader_parameter("far", far_val)
+			p[2] = far_val
+		if bool(p[3]) != vcull_val:
+			m.set_shader_parameter("vcull", vcull_val)
+			p[3] = vcull_val
+		return
+	if has_fade:
+		m.set_shader_parameter("lod_fade_albedo", fade_on)
+		m.set_shader_parameter("lod_fade_start", f0)
+		m.set_shader_parameter("lod_fade_end", f1)
+	m.set_shader_parameter("focus", centre)
+	m.set_shader_parameter("near", near_val)
+	m.set_shader_parameter("far", far_val)
+	m.set_shader_parameter("vcull", vcull_val)
+	_mat_sent[m] = [centre, near_val, far_val, vcull_val, fade_on, f0, f1]
 
 
 func _set_params() -> void:
 	var centre := hand_over_centre()
 	var edge := near_edge()
-	_params_key = [centre, edge, distance, _materials.size(), _model_materials.size(), _own_models.size()]
+	_params_key = [centre, edge, distance, far_3d_dist, ItemCards.lod_blend, ItemModels.lod2_mode, _materials.size(), _model_materials.size(), _lod2_model_materials.size(), _own_models.size()]
 	if _dump != null:
 		var held: Array = []
 		for c in _held:
 			held.append_array([c.x, c.y])
 		_dump_line({"p": [centre.x, centre.y, edge, float(distance)], "held": held, "unknown": _unknown.keys()})
-	for mats: Dictionary in [_materials, _model_materials]:
+	var model_shader := Looks.shader_for(LaneModelShader if belt_lane_vcull else ItemModels.LaneModelCutShader)
+	var vcull_on_sh := Looks.shader_for(LaneModelShader)
+	var vcull_off_sh := Looks.shader_for(ItemModels.LaneModelCutShader)
+	var fade_on := ItemModels.lod2_mode == "proxy" and ItemCards.lod_blend and far_3d_dist > 0.0
+	var f0 := far_3d_dist * 0.75 if fade_on else 0.0
+	var f1 := far_3d_dist if fade_on else 0.0
+	var far_val := float(distance)
+	for mats: Dictionary in [_materials, _model_materials, _lod2_model_materials]:
+		var target_shader: Shader = model_shader if mats != _materials else null
 		for item in mats:
 			var m: ShaderMaterial = mats[item]
-			m.set_shader_parameter("focus", centre)
-			m.set_shader_parameter("near", -1.0 if _unknown.has(ItemCards.item_of(int(item))) else edge)
-			m.set_shader_parameter("far", float(distance))
+			var has_fade := mats == _model_materials and bool(m.get_meta(&"has_tex_fade", false))
+			var near_val := -1.0 if _unknown.has(ItemCards.item_of(int(item))) else edge
+			_sync_mat_params(m, target_shader, centre, near_val, far_val, belt_lane_vcull, has_fade, fade_on, f0, f1)
 	for item in _own_models:
 		var pair: Array = _own_models[item]
+		var near_val := -1.0 if _unknown.has(ItemCards.item_of(int(item))) else edge
 		for m: ShaderMaterial in ItemModels.surface_materials(pair[1]):
-			m.set_shader_parameter("focus", centre)
-			m.set_shader_parameter("near", -1.0 if _unknown.has(ItemCards.item_of(int(item))) else edge)
-			m.set_shader_parameter("far", float(distance))
+			var am: Variant = m.get_shader_parameter("alpha_mode")
+			var target: Shader = model_shader if ((am == null or int(am) == 0) and (m.shader == vcull_on_sh or m.shader == vcull_off_sh)) else null
+			_sync_mat_params(m, target, centre, near_val, far_val, belt_lane_vcull, false, false, 0.0, 0.0)
 
 
 ## Called by belt_items.gd in the frame its job's result is drawn: the square its items cover,
@@ -567,7 +818,7 @@ func hand_over(square: Vector3, held: Dictionary, unknown: Array) -> void:
 	_held = held
 	for c in was:
 		if not held.has(c) and _chunks.has(c):
-			(_chunks[c] as Node3D).visible = true
+			(_chunks[c] as Node3D).visible = not _behind_hidden(c)
 	for c in held:
 		if _chunks.has(c):
 			(_chunks[c] as Node3D).visible = false
@@ -620,7 +871,8 @@ func handle(msg: Dictionary) -> void:
 	else:
 		_latest[c] = [l, counts, piles]
 	if sync:
-		_make(c, Job.build(l, counts, _belt_height(), piles, null, {}, {}, _lane))
+		var use_3d := _want_chunk_3d(c)
+		_make(c, Job.build(l, counts, _belt_height(), piles, null, {}, {}, _lane), use_3d)
 		return
 	_pending[c] = [l, counts, piles]
 
@@ -638,18 +890,34 @@ func _belt_height() -> float:
 	return _height
 
 
+static var start_sliced := Switches.on("--belt-lanes-start-sliced")
+const START_USEC := 1000
+
+
 func _start() -> void:
 	var job := Job.new()
 	job.height = _belt_height()
 	job.lane = _lane
+	job.proxy_lod2 = _models and ItemModels.item_geom_lod and ItemModels.lod2_mode == "proxy"
 	if _models:
 		job.steps = _steps.duplicate()
 		job.variants = _variants.duplicate()
+	# The chunks' curves are read here on the main thread (every entity of each chunk): a job takes
+	# what fits START_USEC (at least one chunk), the rest the next job. --belt-lanes-start-sliced=off: all.
+	var t0 := Time.get_ticks_usec()
+	var took: Array = []
 	for c in _pending:
+		if start_sliced and not took.is_empty() and Time.get_ticks_usec() - t0 > START_USEC:
+			break
 		var m: Array = _pending[c]
 		_curves_of(c, job.curves)
-		job.msgs.append([c, m[0], m[1], m[2] if m.size() > 2 else []])
-	_pending.clear()
+		job.msgs.append([c, m[0], m[1], m[2] if m.size() > 2 else [], _want_chunk_3d(c)])
+		took.append(c)
+	if took.size() == _pending.size():
+		_pending.clear()
+	else:
+		for c in took:
+			_pending.erase(c)
 	_job = job
 	_task = WorkerThreadPool.add_task(job.run, false, "belt lanes")
 
@@ -698,14 +966,20 @@ func _finish_icons() -> void:
 ## same chunk can't be overtaken).
 func _apply_some(usec: int) -> void:
 	var start := Time.get_ticks_usec()
+	var made := 0
 	while not _done.is_empty():
+		# Not one more chunk's icons than fit (its typical cost, FrameBudget.item_est; --budget-predict=off: the clock alone).
+		if not FrameBudget.fits(start, usec, made, FrameBudget.item_est(&"lanes")):
+			return
 		var r: Array = _done[0]
 		var by_item: Dictionary = r[1]
+		var use_3d := (bool(r[3]) if r.size() > 3 else _models) and _models
+		var use_proxy := (not use_3d) and _models and ItemModels.item_geom_lod and ItemModels.lod2_mode == "proxy"
 		var missing := false
 		var relay := false
 		for key in by_item:
 			var item := ItemCards.item_of(int(key))
-			if _models and protos != null:
+			if (use_3d or use_proxy) and _models and protos != null:
 				var name := protos.item_name(item)
 				if not ItemModels.ready(name):
 					missing = true  # its model is read on a thread meanwhile
@@ -733,20 +1007,25 @@ func _apply_some(usec: int) -> void:
 			if _latest.has(r[0]):
 				_pending[r[0]] = _latest[r[0]]
 			continue
-		_make(r[0], by_item)
+		var tm := Time.get_ticks_usec()
+		_make(r[0], by_item, use_3d)
+		FrameBudget.note_item(&"lanes", Time.get_ticks_usec() - tm)
+		made += 1
 		var spent := Time.get_ticks_usec() - start
 		worst_apply_usec = maxi(worst_apply_usec, spent)
 		if spent >= usec:
 			return
 
 
-func _make(c: Vector2i, by_item: Dictionary) -> void:
+func _make(c: Vector2i, by_item: Dictionary, use_3d := true) -> void:
 	var had := _chunks.has(c)
 	_drop(c, false)
 	if by_item.is_empty() or (world != null and not world.chunks.has(c)):
 		if had:
 			chunks_ver += 1
 		return
+	_chunk_3d[c] = use_3d and _models
+	var use_proxy := (not use_3d) and _models and ItemModels.item_geom_lod and ItemModels.lod2_mode == "proxy"
 	var node := Node3D.new()
 	node.name = "Lanes %d,%d" % [c.x, c.y]
 	for key in by_item:
@@ -756,21 +1035,32 @@ func _make(c: Vector2i, by_item: Dictionary) -> void:
 		mm.transform_format = MultiMesh.TRANSFORM_3D
 		mm.use_custom_data = true
 		var model: Mesh = null
-		if _models and protos != null:
+		if (use_3d or use_proxy) and _models and protos != null:
 			model = ItemModels.mesh_for(protos.item_name(item), ItemCards.variant_of(int(key)))
-		var own := ItemModels.has_own(model)
-		var use_simple := own and ItemModels.item_lod and ItemModels.needs_lod(model)
-		var drawn: Mesh = ItemModels.simple_mesh(model) if use_simple else ((_own_model(int(key), model) if own else model) if model != null else _quad)
+		var drawn: Mesh = _quad
+		var draw_own := false
+		if model != null:
+			if use_proxy:
+				drawn = ItemModels.lod2_mesh(model)
+			elif ItemModels.item_geom_lod:
+				drawn = ItemModels.lod_mesh(model)
+			elif ItemModels.has_own(model) and ItemModels.item_lod and ItemModels.needs_lod(model):
+				drawn = ItemModels.simple_mesh(model)
+			else:
+				drawn = model
+			draw_own = ItemModels.has_own(drawn) and drawn == model
+			if draw_own:
+				drawn = _own_model(int(key), model)
 		mm.mesh = drawn
 		mm.instance_count = buf.size() / STRIDE
 		mm.buffer = buf
 		var inst := MultiMeshInstance3D.new()
 		inst.multimesh = mm
-		if not own or use_simple:
-			inst.material_override = _model_material(int(key), drawn) if model != null else _material(item)
+		if not draw_own:
+			inst.material_override = _model_material(int(key), drawn, model) if model != null else _material(item)
 		inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		node.add_child(inst)
-	node.visible = not _held.has(c)
+	node.visible = not _held.has(c) and not _behind_hidden(c)
 	add_child(node)
 	if _dump != null:
 		var icons := {}
@@ -797,9 +1087,10 @@ func icons_in(c: Vector2i) -> int:
 
 
 func _drop(c: Vector2i, count := true) -> void:
+	_chunk_3d.erase(c)
 	var node: Node3D = _chunks.get(c)
 	if node != null:
-		node.queue_free()
+		FreeLater.node(node)
 		_chunks.erase(c)
 		if count:
 			chunks_ver += 1
@@ -809,39 +1100,104 @@ func _drop(c: Vector2i, count := true) -> void:
 
 ## A kind's model material (one per kind, shared by its MultiMeshes): a modeller's item model with a
 ## picture drawn with it, as the modeller made it (item_models.gd material_for).
-func _model_material(item: int, model: Mesh = null) -> ShaderMaterial:
-	var tex := ItemModels.picture(model)
-	var exp_val := 1.0 if (tex != null or ItemModels.is_simple(model)) else ItemModels.EXPOSURE
-	if _model_materials.has(item):
-		var had: ShaderMaterial = _model_materials[item]
-		if had.get_shader_parameter("picture") == tex and is_equal_approx(float(had.get_shader_parameter("exposure")), exp_val):
+func _model_material(item: int, model: Mesh = null, source: Mesh = null) -> ShaderMaterial:
+	var src_mesh := source if source != null else model
+	var is_lod2 := ItemModels.is_lod2(model)
+	var cache := _lod2_model_materials if is_lod2 else _model_materials
+	var dropped_uv := model != null and model.has_meta(ItemModels.LOD1_NO_UV_META)
+	var src_tex := ItemModels.lod_picture(src_mesh) if src_mesh != null else null
+	var tex: Texture2D = null if dropped_uv else src_tex
+	var exp_val := ItemModels._lod_exposure(src_mesh, model)
+	var want_shader := Looks.shader_for(LaneModelShader if belt_lane_vcull else ItemModels.LaneModelCutShader)
+	var want_pbr := ItemModels.pbr_material(src_mesh)
+	if cache.has(item):
+		var had: ShaderMaterial = cache[item]
+		if had.shader == want_shader \
+				and had.get_meta(&"src_mesh", null) == src_mesh \
+				and had.get_meta(&"drawn_mesh", null) == model \
+				and bool(had.get_meta(&"pbr_full", false)) == far_item_pbr_full:
 			return had
+		_mat_sent.erase(had)
 	var m := ShaderMaterial.new()
-	m.shader = Looks.shader_for(LaneModelShader)
+	m.shader = want_shader
+	m.set_meta(&"src_mesh", src_mesh)
+	m.set_meta(&"drawn_mesh", model)
+	m.set_meta(&"pbr_full", far_item_pbr_full)
 	m.set_shader_parameter("exposure", exp_val)
 	if tex != null:
 		m.set_shader_parameter("picture", tex)
 		m.set_shader_parameter("use_picture", true)
-		ItemModels.set_pbr(m, model)
-	m.set_shader_parameter("focus", hand_over_centre())
-	m.set_shader_parameter("near", near_edge())
-	m.set_shader_parameter("far", float(distance))
-	_model_materials[item] = m
+	else:
+		m.set_shader_parameter("use_picture", false)
+	var stats := ItemModels.lod_stats(src_mesh) if src_mesh != null else {}
+	var is_own_src := src_mesh != null and ItemModels.has_own(src_mesh)
+	var has_em := not stats.is_empty() and bool(stats["has_emission"]) and (is_lod2 or not ItemModels.is_simple(model))
+	if want_pbr != null:
+		if far_item_pbr_full and tex != null and not is_lod2:
+			ItemModels.set_pbr(m, src_mesh)
+			if not ItemModels.has_tangents(model):
+				m.set_shader_parameter("use_tangent", false)
+		else:
+			m.set_shader_parameter("pbr", true)
+			m.set_shader_parameter("pbr_roughness", float(stats["eff_roughness"]))
+			m.set_shader_parameter("pbr_metallic", float(stats["eff_metallic"]))
+			if is_own_src or has_em:
+				m.set_shader_parameter("use_own_rm", true)
+			if has_em:
+				m.set_shader_parameter("emission", stats["eff_emission"])
+				m.set_shader_parameter("emission_energy", float(stats["eff_emission_energy"]))
+	elif is_own_src:
+		m.set_shader_parameter("use_own_rm", true)
+		m.set_shader_parameter("pbr_roughness", float(stats["eff_roughness"]))
+		m.set_shader_parameter("pbr_metallic", float(stats["eff_metallic"]))
+		if has_em:
+			m.set_shader_parameter("emission", stats["eff_emission"])
+			m.set_shader_parameter("emission_energy", float(stats["eff_emission_energy"]))
+	var fade_on_m := false
+	var fade_s_m := 0.0
+	var fade_e_m := 0.0
+	if not is_lod2 and tex != null and not stats.is_empty():
+		var tm: Color = stats["tex_mean"]
+		fade_on_m = ItemModels.lod2_mode == "proxy" and ItemCards.lod_blend and far_3d_dist > 0.0
+		fade_s_m = far_3d_dist * 0.75 if fade_on_m else 0.0
+		fade_e_m = far_3d_dist if fade_on_m else 0.0
+		m.set_shader_parameter("lod_fade_albedo", fade_on_m)
+		m.set_shader_parameter("lod_albedo_mean", Vector3(tm.r, tm.g, tm.b))
+		m.set_shader_parameter("lod_fade_start", fade_s_m)
+		m.set_shader_parameter("lod_fade_end", fade_e_m)
+		m.set_meta(&"has_tex_fade", true)
+	var centre_m := hand_over_centre()
+	var near_m := near_edge()
+	var far_m := float(distance)
+	m.set_shader_parameter("focus", centre_m)
+	m.set_shader_parameter("near", near_m)
+	m.set_shader_parameter("far", far_m)
+	m.set_shader_parameter("vcull", belt_lane_vcull)
+	_mat_sent[m] = [centre_m, near_m, far_m, belt_lane_vcull, fade_on_m, fade_s_m, fade_e_m]
+	cache[item] = m
 	return m
 
 
 ## An own-look item model (item_models.gd has_own) dressed for far belts: its surfaces each with its file's
 ## material, as the lane model shader draws it (one per kind; _set_params keeps their square and distance).
 func _own_model(item: int, model: Mesh) -> Mesh:
+	var base_shader := LaneModelShader if belt_lane_vcull else ItemModels.LaneModelCutShader
 	if _own_models.has(item):
 		var had: Array = _own_models[item]
 		if had[0] == model:
 			return had[1]
-	var dressed := ItemModels.dressed(model, LaneModelShader)
+		for om: ShaderMaterial in ItemModels.surface_materials(had[1]):
+			_mat_sent.erase(om)
+	var dressed := ItemModels.dressed(model, base_shader)
+	var centre_m := hand_over_centre()
+	var near_m := near_edge()
+	var far_m := float(distance)
 	for m: ShaderMaterial in ItemModels.surface_materials(dressed):
-		m.set_shader_parameter("focus", hand_over_centre())
-		m.set_shader_parameter("near", near_edge())
-		m.set_shader_parameter("far", float(distance))
+		m.set_shader_parameter("focus", centre_m)
+		m.set_shader_parameter("near", near_m)
+		m.set_shader_parameter("far", far_m)
+		m.set_shader_parameter("vcull", belt_lane_vcull)
+		_mat_sent[m] = [centre_m, near_m, far_m, belt_lane_vcull, false, 0.0, 0.0]
 	_own_models[item] = [model, dressed]
 	return dressed
 
@@ -855,8 +1211,13 @@ func _material(item: int) -> ShaderMaterial:
 	var tex := ItemIcons.texture_for(name) if name != "" else null
 	if tex != null:
 		m.set_shader_parameter("icon", tex)
-	m.set_shader_parameter("focus", hand_over_centre())
-	m.set_shader_parameter("near", near_edge())
-	m.set_shader_parameter("far", float(distance))
+	var centre_m := hand_over_centre()
+	var near_m := near_edge()
+	var far_m := float(distance)
+	m.set_shader_parameter("focus", centre_m)
+	m.set_shader_parameter("near", near_m)
+	m.set_shader_parameter("far", far_m)
+	m.set_shader_parameter("vcull", belt_lane_vcull)
+	_mat_sent[m] = [centre_m, near_m, far_m, belt_lane_vcull, false, 0.0, 0.0]
 	_materials[item] = m
 	return m

@@ -8,6 +8,10 @@ extends RefCounted
 ## add-on is switched off or the game ends.
 
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const NativeLibrary := preload("res://scripts/native_library.gd")
+const Switches := preload("res://scripts/switches.gd")
+## The native height-field maths (client/native/belt_sim/src/terrain_field_native.cpp).
+const NATIVE_FIELD := "TerrainFieldNative"
 
 var _host
 var _api
@@ -18,14 +22,38 @@ func _init(host, api) -> void:
 	_api = api
 
 
-## Sets the heights: `heights` an Image (FORMAT_RF, heights in tiles; other formats are converted,
-## their red channel read), its first texel's corner at world `origin` (x east, z south), each
+## Sets the heights: `heights` an Image (FORMAT_RF, heights in tiles; FORMAT_RGF adds the ground
+## without its cliffs' terraces in green, what cliffs' rock is seated on; FORMAT_RGBF adds how near
+## a cliff each texel is in blue, 0-1, where the ground is tinted to bare rock and dirt; other
+## formats are converted, their red channel read), its first texel's corner at world `origin` (x east, z south), each
 ## texel `tiles_per_texel` tiles square. Between texel centres the height is bilinear, outside
 ## the image it is 0: fade the edges to 0 yourself. An image with the meta `lift_range` (Vector2:
-## its lowest and highest height) isn't measured (ground_height.gd). Main thread only.
+## its lowest and highest height) isn't measured (ground_height.gd). An image with the meta
+## `fade_in` (float, seconds, up to 3) fades in over the field before it (or over flat ground),
+## so new hills never pop up; without it the field shows at once, as before. Main thread only.
 func set_heights(heights: Image, origin: Vector2, tiles_per_texel: float) -> void:
 	GroundHeight.set_field(heights, origin, tiles_per_texel)
 	_host.set("_terrain_owner", _api.id)
+
+
+## (0.2.3, `has_method("native")`) Zenith's C++ for a height field's hot loops, a TerrainFieldNative,
+## or null where the native library isn't (Linux, macOS, ARM64) or `--terrain-native=off`. Stateless:
+## one object serves any number of worker threads. Its methods are the Terrain Elevation add-on's
+## heights.gd stages (hills, cliffs, water_distance, base, pads, interleave; docs/ADDONS.md), giving
+## the same floats as that GDScript. Main thread only (the library loads on it).
+func native():
+	if not Switches.on("--terrain-native"):
+		return null
+	if not NativeLibrary.ensure() or not ClassDB.class_exists(NATIVE_FIELD):
+		return null
+	return ClassDB.instantiate(NATIVE_FIELD)
+
+
+## How many of an image's channels this Zenith reads (3: red, green and blue, as above). An add-on
+## that gives three asks first (`has_method("channels")`): an older Zenith turned a three-channel
+## image into one and lost the green.
+func channels() -> int:
+	return 3
 
 
 ## Back to flat ground (only if this add-on's field is the one shown).
@@ -93,10 +121,14 @@ func cliffs_in_chunk(chunk: Vector2i) -> Array:
 	return out
 
 
-## Types whose ground isn't levelled under them: the land itself and what grows or lies on it.
+## Types whose ground isn't levelled under them: the land itself, what grows or lies on it, and
+## what drives over it (a car or tank parked on a hillside sat in a pit cut to its centre's height;
+## rolling stock rides its rails, which stay levelled).
 const NOT_BUILDINGS := ["cliff", "tree", "simple-entity", "resource", "fish", "corpse", "rail-remnants",
 	"item-entity", "character", "character-corpse", "unit", "spider-unit", "segmented-unit", "segment",
-	"asteroid", "asteroid-chunk", "plant", "entity-ghost", "tile-ghost", "deconstructible-tile-proxy"]
+	"asteroid", "asteroid-chunk", "plant", "entity-ghost", "tile-ghost", "deconstructible-tile-proxy",
+	"car", "spider-vehicle", "spider-leg", "locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon",
+	"infinity-cargo-wagon"]
 
 var _changed := {}  # Vector2i -> true: chunks whose buildings came or changed (take_changed_chunks)
 var _read_revs := {}  # Vector2i -> int: ChunkView.content_rev last read or reported

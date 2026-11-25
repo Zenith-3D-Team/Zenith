@@ -29,6 +29,7 @@ const Info := preload("res://scripts/ui/factorio/info_text.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const CraftingPanel := preload("res://scripts/ui/factorio/crafting_panel.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 signal close_requested
 
@@ -99,21 +100,21 @@ const CENTER_FRAMES := 10
 ## researched; one researched (most often the research that just finished) sat with the researched ones at
 ## the bottom of the list, which opened scrolled down there. The first available one, at the top, instead.
 ## --research-open=last opens on the one looked at last whatever it is, as J17 had it.
-var open_on_researched := OS.get_cmdline_user_args().has("--research-open=last")
+var open_on_researched := Switches.has("--research-open=last")
 ## L12: Start research / Add to queue on a technology whose prerequisites aren't researched: the bridge queues
 ## the missing ones first, as Factorio's technology screen does. --research-chain=off greys it as before.
-var research_chain := not OS.get_cmdline_user_args().has("--research-chain=off")
+var research_chain := Switches.on("--research-chain")
 ## The orange slot (Factorio's conditionally_available_technology_slot) for a technology not yet available
 ## that Start research can queue with what it needs: none of its missing prerequisites a trigger technology
 ## (slot_state). Factorio's own queue takes only a technology whose prerequisites are all researched or
 ## queued, and the wiki's orange is those; --research-orange=factorio draws only them orange.
-var orange_factorio := OS.get_cmdline_user_args().has("--research-orange=factorio")
+var orange_factorio := Switches.has("--research-orange=factorio")
 ## M3: a recipe the technology unlocks, among its Effects, has Factorio's recipe tooltip: "<name> (Recipe)",
 ## its ingredients, crafting time, products and Total raw, then the item's own lines (Slot.info), from the hand
 ## recipe's details or the recipe's Factoriopedia page asked for as the mouse comes on it (J14's way; nothing
 ## red: it isn't measured against the inventory). --research-effect-tips=old: the name and "Unlocked by this
 ## technology" (Zenith's words, not Factorio's) over the item's lines, as before.
-static var effect_recipe_tips := not OS.get_cmdline_user_args().has("--research-effect-tips=old")
+static var effect_recipe_tips := not Switches.has("--research-effect-tips=old")
 ## tech -> whether a prerequisite still to be researched, all the way down, is a trigger technology
 ## (_chain_blocked); emptied on each refresh, as the technologies or the queue may have changed.
 var _blocked := {}

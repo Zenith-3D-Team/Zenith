@@ -71,7 +71,7 @@ for y = oy - 18, oy + 18, 18 do
 end
 local eei = mk({ name = "electric-energy-interface", position = { ox - 8, oy } })
 if eei then eei.power_production = 1e9 / 60 eei.electric_buffer_size = 1e9 end
-c.teleport({ ox - 10, oy })  -- the wall in the client's default view
+c.teleport({ ox - 10, oy })
 rcon.print("built " .. #storage.f3d_wave)
 """
 

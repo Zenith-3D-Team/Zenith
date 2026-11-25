@@ -72,6 +72,7 @@ const BeltSimConst := preload("res://scripts/world/belt_sim.gd")
 const RestShader := preload("res://shaders/item.gdshader")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
 
 ## An arm missing from this many updates in a row (the inserter left the radius, or was mined) is
 ## dropped. Every update is the full list, so this counts updates (`k` changes), not ticks.
@@ -95,6 +96,8 @@ const FOLLOW_RATE := 30.0
 const STEEL := Color(0.52, 0.52, 0.5)
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ModelRig := preload("res://scripts/world/model_rig.gd")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 ## A rig's grip (between its pincers) goes where the held item is drawn.
 const GRIP_HEIGHT := HAND_HEIGHT - ITEM_DROP
 ## (--inserter-grip) The grip rides this far above where belt items are drawn when that is higher (a modeller's
@@ -167,6 +170,8 @@ static var held_grip := true
 ## (at once), put together at most every REST_REFRESH seconds (at once for a live arm), never per frame. Off:
 ## as before.
 static var rest_arms := true
+## --rest-arms-chunked=off: fall back to rebuilding the single global resting-arms MultiMesh.
+static var rest_arms_chunked := true
 ## --inserter-sprite-arms=on (the default) | off: see the top (an inserter drawn by the Factorio pack).
 static var sprite_arms := true
 ## --ih-apply=quick (the default) | old: a hand update (`ih`) binds an arm to its record again only when the
@@ -175,6 +180,13 @@ static var sprite_arms := true
 ## is a flag, not a search of the queue; a new arm's belt at its pickup (_belt_at) is looked for only among what
 ## stands within a tile. Old: as before. What is drawn is the same either way.
 static var quick_apply := true
+## --inserter-fast-upload=on (the default) | off: bulk upload transforms and colors via
+## RenderingServer.multimesh_set_buffer instead of per-instance set_instance_transform / color.
+static var fast_upload := Switches.on("--inserter-fast-upload")
+## --native-inserters=on (the default) | off: the arms' geometry (every arm's pieces, their transforms written
+## straight into the MultiMesh buffers) worked out by InserterArmsNative (native/belt_sim/src/inserter_arms_native.cpp)
+## when the native library has it; off, or without it: the GDScript below, the same arms.
+static var native_inserters := Switches.on("--native-inserters")
 const REST_USEC := 300
 const REST_REFRESH := 0.25
 const REST_UPPER := 0.07  # the boxes' thickness: upper arm, forearm
@@ -279,6 +291,13 @@ class Arm:
 	var bound_pack := ""
 	var bound_gen := -1
 	var bound_ver := -1
+	# (render dispatch cache) Mode and model version when the arm's draw dispatch was determined.
+	enum Mode { NONE, SPRITE, RIG, MODEL, BASIC }
+	var mode := Mode.NONE
+	var mode_pack_ver := -1
+	var mode_model_ver := -1
+	var mode_cards: Dictionary = {}
+	var mode_rig: Dictionary = {}
 	var preplanned := false  # (quick_apply) in _preplan
 	var last_heard := -1.0  # the newest event's or sample's tick
 	# (events) By tick, oldest first: kind (Swing.Ev), count, item, c (PICKED/DROPPED: how many
@@ -422,6 +441,37 @@ var steered := 0  # (handoff, probes) hands steered onto a belt item, frames x a
 ## (--inserter-arms-trace with --inserter-handoff) Each meeting as it comes: {"meet": [inserter, tick, uid,
 ## x, z, why]} (tools/inserter_check.py).
 var trace_meets := true
+var _upload_bufs := {}  # RID -> PackedFloat32Array
+var _scratch_lists := []
+var _scratch_colors: Array[Color] = []
+var _scratch_held := {}
+var _scratch_held_yaws := {}
+var _scratch_model_lists := {}
+var _scratch_rig_lists := {}
+var _scratch_sprite_lists := {}
+var _scratch_live := {}
+const NativeLibrary := preload("res://scripts/native_library.gd")
+## (--native-inserters) The native geometry, null when off or missing; tried once, on the first frame.
+var _native: RefCounted = null
+var _native_tried := false
+## (tests) Keep each sprite arm's transforms in Arm.sprite_xf with the native path too.
+var keep_sprite_xf := false
+## One mode's arms of one key (model name or prototype) this frame, for the native batch: its inputs and the
+## order slots (_ord_*) their wrists and grips are put back in.
+class NBatch:
+	var inp := PackedFloat32Array()
+	var slots := PackedInt32Array()
+	var first: Arm = null
+	var arms: Array = []  # (tests, keep_sprite_xf) the sprite arms in order
+## Native batches by mode (0 sprite, 1 rig, 2 model, 3 basic), each key -> NBatch, and the arms in the order drawn:
+## the arm, its unit, and (once the batches ran) its wrist, grip and whether it grips.
+var _nb: Array = [{}, {}, {}, {}]
+var _ord_arms: Array = []
+var _ord_units := PackedInt64Array()
+var _ord_wrist := PackedVector3Array()
+var _ord_grip := PackedVector3Array()
+var _ord_gripped := PackedByteArray()
+var _nres: Array = [{}, {}, {}, null]  # per mode: key -> the native result
 
 
 static func read_flags(args: PackedStringArray) -> void:
@@ -438,10 +488,16 @@ static func read_flags(args: PackedStringArray) -> void:
 			held_grip = a.substr(16) != "off"
 		elif a.begins_with("--inserter-rest-arms="):
 			rest_arms = a.substr(21) != "off"
+		elif a.begins_with("--rest-arms-chunked="):
+			rest_arms_chunked = a.substr(20) != "off"
 		elif a.begins_with("--inserter-sprite-arms="):
 			sprite_arms = a.substr(23) != "off"
 		elif a.begins_with("--ih-apply="):
 			quick_apply = a.substr(11) != "old"
+		elif a.begins_with("--inserter-fast-upload="):
+			fast_upload = a.substr(23) != "off"
+		elif a.begins_with("--native-inserters="):
+			native_inserters = a.substr(19) != "off"
 	if handoff and not events:
 		# (The hand-off needs the events: the pose stays the samples', the held item follows the events.)
 		events = true
@@ -471,13 +527,15 @@ static func hello_ie() -> int:
 
 
 func _ready() -> void:
-	read_flags(OS.get_cmdline_user_args())
-	for a in OS.get_cmdline_user_args():
+	read_flags(Switches.args())
+	for a in Switches.args():
 		if a.begins_with("--inserter-arms-trace="):
 			_trace = FileAccess.open(a.substr(22), FileAccess.WRITE)
 	_cards.name = "HeldItems"
 	add_child(_cards)
+	_scratch_lists.clear()
 	for p in Part.size():
+		_scratch_lists.append([])
 		var mesh: Mesh
 		if p == Part.TURNTABLE or p == Part.SHOULDER:
 			var cyl := CylinderMesh.new()
@@ -515,10 +573,33 @@ func reset() -> void:
 	_newest_event = -1.0
 	_swept = -1.0
 	_events_heard = false
+	_upload_bufs.clear()
+	for a in _scratch_lists:
+		(a as Array).clear()
+	_scratch_colors.clear()
+	_scratch_held.clear()
+	_scratch_held_yaws.clear()
+	_scratch_model_lists.clear()
+	_scratch_rig_lists.clear()
+	_scratch_sprite_lists.clear()
+	_scratch_live.clear()
 	_rest.clear()
 	_rest_sprites.clear()
 	_rest_now.clear()
 	_rest_live.clear()
+	_rest_upload.clear()
+	_rest_chunk_counts.clear()
+	_rest_total_instances = 0
+	rest_chunk_uploads = 0
+	rest_count = 0
+	_rest_buffer_cache = PackedFloat32Array()
+	for mmi in _rest_chunk_mmis.values():
+		var node := mmi as MultiMeshInstance3D
+		if node != null and is_instance_valid(node):
+			node.queue_free()
+	_rest_chunk_mmis.clear()
+	if _rest_mmi != null and _rest_mmi.multimesh != null:
+		_rest_mmi.multimesh.visible_instance_count = 0
 	_rest_put = true
 	if world != null:
 		for c in world.chunks:
@@ -626,6 +707,7 @@ func _bind(arm: Arm, rec) -> void:
 	if model != arm.model_name:
 		arm.model_name = model
 		arm.card_lift = NAN
+		arm.mode = Arm.Mode.NONE
 	if proto != null:
 		arm.placed = ModelLibrary.placed(proto.name, proto.type, rec.dir, rec.extra, Vector3(rec.pos.x, 0.0, rec.pos.y))
 	arm.bound = true
@@ -756,7 +838,7 @@ static func _vec(v) -> Vector2:
 
 ## A north-facing vector turned to a 16-way direction (as cursor_overlay.gd turn).
 static func _turn(v: Vector2, dir: int) -> Vector2:
-	return v.rotated(float(dir) / 16.0 * TAU)
+	return v.rotated(-Wire.direction_yaw(dir))
 
 
 ## Whether a belt (transport belt, underground, splitter, loader) stands at this position.
@@ -1058,23 +1140,57 @@ func _process(delta: float) -> void:
 			_preplan_some()
 		if handoff and belts != null and belts.has_method("take_hands"):
 			_take_meets(belts.take_hands())
-	var lists := []
+	while _scratch_lists.size() < Part.size():
+		_scratch_lists.append([])
 	for p in Part.size():
-		lists.append([])
-	var colors: Array[Color] = []
-	var held := {}  # item id -> Array of positions
-	var held_yaws := {}  # item id -> Array of turns
-	var model_lists := {}  # proto name -> [Array of Transform3D per ArmPiece]
-	var rig_lists := {}  # proto name -> [Array of Transform3D per ModelRig.Part]
-	var sprite_lists := {}  # model name -> [Array of Transform3D per SpritePiece]
-	var live := {}  # unit -> its chunk: the arms drawn live this frame (rest arms leave them out)
+		(_scratch_lists[p] as Array).clear()
+	_scratch_colors.clear()
+	_scratch_held.clear()
+	_scratch_held_yaws.clear()
+	_scratch_live.clear()
+	for arrs in _scratch_model_lists.values():
+		for a in (arrs as Array):
+			(a as Array).clear()
+	for arrs in _scratch_rig_lists.values():
+		for a in (arrs as Array):
+			(a as Array).clear()
+	for arrs in _scratch_sprite_lists.values():
+		for a in (arrs as Array):
+			(a as Array).clear()
+	var lists: Array = _scratch_lists
+	var colors: Array[Color] = _scratch_colors
+	var held: Dictionary = _scratch_held
+	var held_yaws: Dictionary = _scratch_held_yaws
+	var model_lists: Dictionary = _scratch_model_lists
+	var rig_lists: Dictionary = _scratch_rig_lists
+	var sprite_lists: Dictionary = _scratch_sprite_lists
+	var live: Dictionary = _scratch_live
+	if not _native_tried:
+		_native_tried = true
+		if native_inserters and NativeLibrary.ensure() and ClassDB.class_exists("InserterArmsNative"):
+			_native = ClassDB.instantiate("InserterArmsNative")
+	if _native != null:
+		for m in 4:
+			for b: NBatch in (_nb[m] as Dictionary).values():
+				b.inp.clear()
+				b.slots.clear()
+				b.arms.clear()
+		_ord_arms.clear()
+		_ord_units.clear()
 	# (L4) The game tick the hands are drawn at, for how long one has stood still; the world's animator lights
 	# a modeller's burner while its hand moves.
 	var now: float = _drawn if belt_clock and _drawn >= 0.0 else Time.get_ticks_msec() * 0.06
 	var animator = world.get("animator") if world != null else null
+	var bc: Variant = world.get("behind_cull") if world != null else null
+	var check_behind: bool = ViewPriority.tight_cull and bc != null and is_instance_valid(bc) and bc.is_active()
 	for unit in _arms:
 		if world != null and not world.entities.has(unit):
 			continue  # mined since the last update, or its chunk not here yet (events)
+		if check_behind and world != null:
+			var rec_chk = world.entities[unit]
+			if bc.hidden(rec_chk.chunk):
+				live[unit] = rec_chk.chunk
+				continue
 		var arm: Arm = _arms[unit]
 		if not arm.bound:
 			if world == null:
@@ -1092,26 +1208,70 @@ func _process(delta: float) -> void:
 			arm.reach = lerpf(arm.reach, arm.path_reach, follow)
 		var wrist: Vector3
 		_gripped = false
-		var cards := _sprite_set_for(arm.model_name)
-		var rig = {} if not cards.is_empty() else _rig_for(arm.proto_name)
-		if rig == null:
-			continue  # its model is still being read: neither base nor arm is drawn yet
-		if not cards.is_empty():
-			if not sprite_lists.has(arm.model_name):
-				sprite_lists[arm.model_name] = [[], [], []]
-			wrist = _draw_sprite_arm(arm, cards, sprite_lists[arm.model_name])
-		elif not (rig as Dictionary).is_empty():
-			if not rig_lists.has(arm.proto_name):
-				rig_lists[arm.proto_name] = [[], [], [], [], []]
-			arm.close = ease_close(arm.close, arm.item_id > 0, delta)
-			wrist = _draw_rig_arm(arm, rig, rig_lists[arm.proto_name])
-		elif _pieces_for(arm.proto_name) != null:
-			if not model_lists.has(arm.proto_name):
-				model_lists[arm.proto_name] = [[], [], []]
-			wrist = _draw_model_arm(arm, model_lists[arm.proto_name])
+		var pack_ver := ModelLibrary.ModelPacks.version
+		var model_ver: int = ModelLibrary.generation
+		if arm.mode == Arm.Mode.NONE or arm.mode_pack_ver != pack_ver or arm.mode_model_ver != model_ver:
+			var cards := _sprite_set_for(arm.model_name)
+			var rig = {} if not cards.is_empty() else _rig_for(arm.proto_name)
+			if rig == null:
+				continue  # its model is still being read: neither base nor arm is drawn yet
+			if not cards.is_empty():
+				arm.mode = Arm.Mode.SPRITE
+				arm.mode_cards = cards
+				arm.mode_rig = {}
+			elif not (rig as Dictionary).is_empty():
+				arm.mode = Arm.Mode.RIG
+				arm.mode_cards = {}
+				arm.mode_rig = rig as Dictionary
+			elif _pieces_for(arm.proto_name) != null:
+				arm.mode = Arm.Mode.MODEL
+				arm.mode_cards = {}
+				arm.mode_rig = {}
+			else:
+				if not _model_parts.has(arm.proto_name):
+					continue  # its pieces are still being read
+				arm.mode = Arm.Mode.BASIC
+				arm.mode_cards = {}
+				arm.mode_rig = {}
+			arm.mode_pack_ver = pack_ver
+			arm.mode_model_ver = model_ver
+		if _native != null:
+			# (--native-inserters) Batched by mode and key; run once after the loop.
+			var slot := -1
+			if arm.item_id > 0:
+				slot = _ord_arms.size()
+				_ord_arms.append(arm)
+				_ord_units.append(unit)
+			match arm.mode:
+				Arm.Mode.SPRITE:
+					if is_nan(arm.card_lift):
+						arm.card_lift = _platform_lift(arm.proto_name, arm.dir)
+					_nb_add(0, arm.model_name, arm, slot)
+				Arm.Mode.RIG:
+					arm.close = ease_close(arm.close, arm.item_id > 0, delta)
+					_nb_add(1, arm.proto_name, arm, slot)
+				Arm.Mode.MODEL:
+					_nb_add(2, arm.proto_name, arm, slot)
+				Arm.Mode.BASIC:
+					_nb_add(3, "basic", arm, slot)
 		else:
-			wrist = _draw_arm(arm, lists)
-			colors.append(arm.color)
+			match arm.mode:
+				Arm.Mode.SPRITE:
+					if not sprite_lists.has(arm.model_name):
+						sprite_lists[arm.model_name] = [[], [], []]
+					wrist = _draw_sprite_arm(arm, arm.mode_cards, sprite_lists[arm.model_name])
+				Arm.Mode.RIG:
+					if not rig_lists.has(arm.proto_name):
+						rig_lists[arm.proto_name] = [[], [], [], [], []]
+					arm.close = ease_close(arm.close, arm.item_id > 0, delta)
+					wrist = _draw_rig_arm(arm, arm.mode_rig, rig_lists[arm.proto_name])
+				Arm.Mode.MODEL:
+					if not model_lists.has(arm.proto_name):
+						model_lists[arm.proto_name] = [[], [], []]
+					wrist = _draw_model_arm(arm, model_lists[arm.proto_name])
+				Arm.Mode.BASIC:
+					wrist = _draw_arm(arm, lists)
+					colors.append(arm.color)
 		if world != null:
 			live[unit] = world.entities[unit].chunk
 			if animator != null:
@@ -1121,58 +1281,44 @@ func _process(delta: float) -> void:
 			if arm.item_id > 0:
 				arm.grabs += 1
 				arm.held_key = 0
-		if arm.item_id > 0:
-			if arm.held_key == 0 or ItemCards.item_of(arm.held_key) != arm.item_id:
-				arm.held_key = _cards.variant_key(arm.item_id, hash([unit, arm.grabs]))
-			var key := arm.held_key
-			if not held.has(key):
-				held[key] = []
-				held_yaws[key] = []
-			held[key].append(held_at(arm, wrist))
-			# (--inserter-grip) A model sits square in the grip, turned with the hand; an icon card keeps its
-			# slight turn (an icon turned with the hand would stand on its head on the way back).
-			held_yaws[key].append(-arm.angle if _gripped and _cards.turns(key) else ItemCards.turn_for(unit))
+		if _native == null and arm.item_id > 0:
+			_hold(arm, unit, wrist, held, held_yaws)
+	if _native != null:
+		_run_native(held, held_yaws)
+		_cards.draw(held, held_yaws)
+		_update_rest(live, delta)
+		if animator != null and not animator.arm_working.is_empty():
+			_stop_unseen(animator, live)
+		_frames += 1
+		if _trace != null and not _arms.is_empty():
+			_write_trace(Time.get_ticks_usec() - usec, t)
+		return
 	for p in _parts.size():
-		var mm := _parts[p].multimesh
-		var xforms: Array = lists[p]
+		var mm: MultiMesh = _parts[p].multimesh
 		var per_arm := 2 if p == Part.FINGERS else 1
-		if mm.instance_count < xforms.size():
-			mm.instance_count = maxi(xforms.size(), mm.instance_count * 2)
-		mm.visible_instance_count = xforms.size()
-		for i in xforms.size():
-			mm.set_instance_transform(i, xforms[i])
-			mm.set_instance_color(i, _part_color(p, colors[i if per_arm == 1 else i >> 1]))
+		_fill_xforms_colored(mm, lists[p], colors, per_arm, p)
 	for proto_name in _model_parts:
 		var pieces = _model_parts[proto_name]
 		if pieces == null:
 			continue
 		var per_piece: Array = model_lists.get(proto_name, [[], [], []])
 		for p in ArmPiece.size():
-			var mm: MultiMesh = pieces[p].multimesh
-			var xforms: Array = per_piece[p]
-			if mm.instance_count < xforms.size():
-				mm.instance_count = maxi(xforms.size(), mm.instance_count * 2)
-			mm.visible_instance_count = xforms.size()
-			for i in xforms.size():
-				mm.set_instance_transform(i, xforms[i])
+			_fill_xforms((pieces[p] as MultiMeshInstance3D).multimesh, per_piece[p])
 	for proto_name in _rigs:
-		var mmis: Array = (_rigs[proto_name] as Dictionary).get("mmis", [])
+		var rig_entry: Variant = _rigs[proto_name]
+		if not (rig_entry is Dictionary):
+			continue
+		var mmis: Array = (rig_entry as Dictionary).get("mmis", [])
 		var per_part: Array = rig_lists.get(proto_name, [[], [], [], [], []])
 		for p in mmis.size():
 			if mmis[p] == null:
 				continue
-			var mm: MultiMesh = (mmis[p] as MultiMeshInstance3D).multimesh
-			var xforms: Array = per_part[p]
-			if mm.instance_count < xforms.size():
-				mm.instance_count = maxi(xforms.size(), mm.instance_count * 2)
-			mm.visible_instance_count = xforms.size()
-			for i in xforms.size():
-				mm.set_instance_transform(i, xforms[i])
+			_fill_xforms((mmis[p] as MultiMeshInstance3D).multimesh, per_part[p])
 	for model in _sprite_mmis:
 		var mmis: Array = _sprite_mmis[model]
 		var per_piece: Array = sprite_lists.get(model, [[], [], []])
 		for p in mmis.size():
-			_fill(mmis[p].multimesh, per_piece[p])
+			_fill_xforms((mmis[p] as MultiMeshInstance3D).multimesh, per_piece[p])
 	_cards.draw(held, held_yaws)
 	_update_rest(live, delta)
 	if animator != null and not animator.arm_working.is_empty():
@@ -1180,6 +1326,225 @@ func _process(delta: float) -> void:
 	_frames += 1
 	if _trace != null and not _arms.is_empty():
 		_write_trace(Time.get_ticks_usec() - usec, t)
+
+
+## What an arm holds, queued for ItemCards.draw: the kind it is drawn as, where it hangs (held_at, with the
+## grip _gripped/_grip_at the arm's drawing left) and how it is turned.
+func _hold(arm: Arm, unit: int, wrist: Vector3, held: Dictionary, held_yaws: Dictionary) -> void:
+	if arm.held_key == 0 or ItemCards.item_of(arm.held_key) != arm.item_id:
+		arm.held_key = _cards.variant_key(arm.item_id, hash([unit, arm.grabs]))
+	var key := arm.held_key
+	if not held.has(key):
+		held[key] = []
+		held_yaws[key] = []
+	held[key].append(held_at(arm, wrist))
+	# (--inserter-grip) A model sits square in the grip, turned with the hand; an icon card keeps its
+	# slight turn (an icon turned with the hand would stand on its head on the way back).
+	held_yaws[key].append(-arm.angle if _gripped and _cards.turns(key) else ItemCards.turn_for(unit))
+
+
+## (--native-inserters) Queues `arm` for its mode's native batch under `key` (0 sprite: model name; 1 rig, 2 model:
+## prototype; 3 basic): its drawn pose and what the geometry needs of it. `slot` is its place in _ord_* (-1: it
+## holds nothing, its wrist isn't needed).
+func _nb_add(mode: int, key: String, arm: Arm, slot: int) -> void:
+	var batches: Dictionary = _nb[mode]
+	var b: NBatch = batches.get(key)
+	if b == null:
+		b = NBatch.new()
+		batches[key] = b
+	if b.slots.is_empty():
+		b.first = arm
+	b.slots.append(slot)
+	var inp := b.inp
+	inp.push_back(arm.base.x)
+	inp.push_back(arm.base.y)
+	inp.push_back(arm.angle)
+	inp.push_back(arm.reach)
+	match mode:
+		0:
+			inp.push_back(1.0 if arm.item_id > 0 else 0.0)
+			inp.push_back(arm.card_lift)
+			if keep_sprite_xf:
+				b.arms.append(arm)
+		1:
+			inp.push_back(arm.close)
+			var p := arm.placed
+			inp.push_back(p.basis.x.x)
+			inp.push_back(p.basis.x.y)
+			inp.push_back(p.basis.x.z)
+			inp.push_back(p.basis.y.x)
+			inp.push_back(p.basis.y.y)
+			inp.push_back(p.basis.y.z)
+			inp.push_back(p.basis.z.x)
+			inp.push_back(p.basis.z.y)
+			inp.push_back(p.basis.z.z)
+			inp.push_back(p.origin.x)
+			inp.push_back(p.origin.y)
+			inp.push_back(p.origin.z)
+		2:
+			inp.push_back(1.0 if arm.item_id > 0 else 0.0)
+		3:
+			inp.push_back(arm.color.r)
+			inp.push_back(arm.color.g)
+			inp.push_back(arm.color.b)
+			inp.push_back(arm.color.a)
+
+
+static func _caps_of(mmis: Variant) -> PackedInt32Array:
+	var caps := PackedInt32Array()
+	if mmis is Array:
+		for mmi in (mmis as Array):
+			caps.append(0 if mmi == null else (mmi as MultiMeshInstance3D).multimesh.instance_count)
+	return caps
+
+
+## (--native-inserters) Runs the queued batches, puts the wrists and grips back, queues the held items and fills
+## the MultiMeshes (every one: those with no arm this frame show none).
+func _run_native(held: Dictionary, held_yaws: Dictionary) -> void:
+	_native_batches()
+	for s in _ord_arms.size():
+		_gripped = _ord_gripped[s] == 1
+		_grip_at = _ord_grip[s]
+		_hold(_ord_arms[s], _ord_units[s], _ord_wrist[s], held, held_yaws)
+	_native_fill()
+
+
+## (--native-inserters) The batches themselves: native results into _nres, wrists and grips into their slots.
+func _native_batches() -> void:
+	var gh := _grip_height()
+	var n := _ord_arms.size()
+	_ord_wrist.resize(n)
+	_ord_grip.resize(n)
+	_ord_gripped.resize(n)
+	for m in 3:
+		(_nres[m] as Dictionary).clear()
+	_nres[3] = null
+	for m in 4:
+		for key: String in (_nb[m] as Dictionary):
+			var b: NBatch = _nb[m][key]
+			if b.slots.is_empty():
+				continue
+			var arm := b.first
+			var r: Array
+			match m:
+				0:
+					var lengths: Array = ARM_LENGTHS[ARM_FAMILIES.get(arm.proto_name, "basic")]
+					var w: Array = arm.mode_cards["widths"]
+					r = _native.sprite_arms(b.inp, _caps_of(_sprite_mmis.get(key)), PackedFloat32Array([gh, MODEL_SHOULDER,
+						lengths[0], lengths[1], lengths[2], CLAW_DEFAULT, SpriteStandins.FACTORIO_PITCH, HAND_TIP, SPRITE_DEPTH,
+						SPRITE_HAND_DEPTH, w[0], w[1], w[2], ITEM_DROP]))
+				1:
+					var rig_entry: Variant = _rigs.get(key)
+					r = _native.rig_arms(b.inp, _caps_of((rig_entry as Dictionary).get("mmis") if rig_entry is Dictionary else null),
+						_rig_params(arm.mode_rig, gh))
+					if float(r[5]) > 1.0 and not _stretched.has(key):
+						_stretched[key] = true
+						var lengths: Array = arm.mode_rig["lengths"]
+						print("[inserters] %s: the model's arm (%.3f) is shorter than the hand's reach: stretched to reach (x%.3f)" % [
+							key, float(lengths[0]) + float(lengths[1]), float(r[5])])
+				2:
+					var lengths: Array = ARM_LENGTHS[ARM_FAMILIES.get(arm.proto_name, "basic")]
+					var stretch: float = lengths[2]
+					r = _native.model_arms(b.inp, _caps_of(_model_parts.get(key)), PackedFloat32Array([MODEL_SHOULDER, HAND_HEIGHT,
+						float(lengths[0]) * stretch, float(lengths[1]) * stretch, lengths[0], lengths[1], 1.0 if held_grip else 0.0,
+						gh, _claw.get(arm.proto_name, 1.0), ITEM_DROP]))
+				3:
+					r = _native.basic_arms(b.inp, _caps_of(_parts), PackedFloat32Array([Visuals.HEIGHTS.get("inserter", 0.3),
+						SHOULDER_HEIGHT, HAND_HEIGHT, UPPER_ARM, FOREARM, TURNTABLE.x, TURNTABLE.y, TURNTABLE.z, SHOULDER.x,
+						SHOULDER.y, SHOULDER.z, HAND_SIZE.x, HAND_SIZE.y, HAND_SIZE.z, FINGER_SIZE.x, FINGER_SIZE.y, FINGER_SIZE.z,
+						ARM_THICKNESS, STEEL.r, STEEL.g, STEEL.b, DARK_STEEL.r, DARK_STEEL.g, DARK_STEEL.b]))
+			if m == 3:
+				_nres[3] = r
+			else:
+				(_nres[m] as Dictionary)[key] = r
+			var wr: PackedFloat32Array = r[2]
+			var gr: PackedFloat32Array = r[3]
+			var gripped: int = 1 if r[4] else 0
+			for i in b.slots.size():
+				var s := b.slots[i]
+				if s >= 0:
+					_ord_wrist[s] = Vector3(wr[i * 3], wr[i * 3 + 1], wr[i * 3 + 2])
+					_ord_grip[s] = Vector3(gr[i * 3], gr[i * 3 + 1], gr[i * 3 + 2])
+					_ord_gripped[s] = gripped
+			if m == 0 and keep_sprite_xf:
+				var bufs: Array = r[0]
+				var next := [0, 0, 0]
+				for i in b.arms.size():
+					var a: Arm = b.arms[i]
+					var hand: int = SpritePiece.CLOSED if a.item_id > 0 else SpritePiece.OPEN
+					a.sprite_xf = [_buf_xf(bufs[0], i * 12), _buf_xf(bufs[hand], next[hand] * 12), hand]
+					next[hand] += 1
+
+
+## (--native-inserters) Every arm MultiMesh filled from the batches' results (those with no arm this frame show none).
+func _native_fill() -> void:
+	for p in _parts.size():
+		_fill_native(_parts[p].multimesh, _nres[3], p, 16)
+	for proto_name in _model_parts:
+		var pieces = _model_parts[proto_name]
+		if pieces == null:
+			continue
+		for p in ArmPiece.size():
+			_fill_native((pieces[p] as MultiMeshInstance3D).multimesh, (_nres[2] as Dictionary).get(proto_name), p, 12)
+	for proto_name in _rigs:
+		var rig_entry: Variant = _rigs[proto_name]
+		if not (rig_entry is Dictionary):
+			continue
+		var mmis: Array = (rig_entry as Dictionary).get("mmis", [])
+		for p in mmis.size():
+			if mmis[p] != null:
+				_fill_native((mmis[p] as MultiMeshInstance3D).multimesh, (_nres[1] as Dictionary).get(proto_name), p, 12)
+	for model in _sprite_mmis:
+		var mmis: Array = _sprite_mmis[model]
+		for p in mmis.size():
+			_fill_native((mmis[p] as MultiMeshInstance3D).multimesh, (_nres[0] as Dictionary).get(model), p, 12)
+
+
+static func _buf_xf(buf: PackedFloat32Array, o: int) -> Transform3D:
+	return Transform3D(Basis(Vector3(buf[o], buf[o + 4], buf[o + 8]), Vector3(buf[o + 1], buf[o + 5], buf[o + 9]),
+		Vector3(buf[o + 2], buf[o + 6], buf[o + 10])), Vector3(buf[o + 3], buf[o + 7], buf[o + 11]))
+
+
+## (--native-inserters) Puts piece `p` of a native result (null: none) into `mm`, as _fill_xforms does the lists.
+func _fill_native(mm: MultiMesh, r: Variant, p: int, stride: int) -> void:
+	var count := 0
+	var buf := PackedFloat32Array()
+	if r != null:
+		count = (r[1] as PackedInt32Array)[p]
+		buf = (r[0] as Array)[p]
+	if mm.instance_count < count:
+		mm.instance_count = maxi(count, maxi(mm.instance_count * 2, 16))
+	mm.visible_instance_count = count
+	if count == 0:
+		return
+	var needed := mm.instance_count * stride
+	if buf.size() != needed:
+		buf.resize(needed)
+	RenderingServer.multimesh_set_buffer(mm.get_rid(), buf)
+
+
+## (--native-inserters) _draw_rig_arm's constants for one rig, as inserter_arms_native.h lists them.
+func _rig_params(rig: Dictionary, gh: float) -> PackedFloat32Array:
+	var hinge: Vector3 = rig["hinge"]
+	var pivot: Vector3 = rig["pivot"]
+	var shoulder: Vector3 = rig["shoulder"]
+	var elbow: Vector3 = rig["elbow"]
+	var grip: Vector3 = rig["grip"]
+	var lengths: Array = rig["lengths"]
+	var heads: Array = rig["heads"]
+	var axes: Array = rig["axes"]
+	var angles: Array = rig.get("grip_angles", rig["angles"]) if held_grip else rig["angles"]
+	var out := PackedFloat32Array([hinge.x, hinge.y, hinge.z, pivot.x, pivot.y, pivot.z, shoulder.x, shoulder.y, shoulder.z,
+		elbow.x, elbow.y, elbow.z, grip.x, grip.y, grip.z, lengths[0], lengths[1], 1.0 if held_grip else 0.0, gh, ITEM_DROP, RIG_REACH,
+		1.0 if heads[ModelRig.Part.TURNTABLE] != null else 0.0])
+	for p in [ModelRig.Part.PINCER_A, ModelRig.Part.PINCER_B]:
+		if heads[p] == null or angles[p] == null:
+			out.append_array(PackedFloat32Array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+		else:
+			var head: Vector3 = heads[p]
+			var axis: Vector3 = axes[p]
+			out.append_array(PackedFloat32Array([1.0, head.x, head.y, head.z, axis.x, axis.y, axis.z, float(angles[p])]))
+	return out
 
 
 ## A rig's pincers `delta` seconds on: closing onto a held item, opening once it is let go, over CLOSE_TIME.
@@ -1214,7 +1579,14 @@ func _stop_unseen(animator, live: Dictionary) -> void:
 ## arm came or went: at once), the arms drawn live last frame (unit -> chunk), and what was last put together.
 ## A chunk whose inserter waits for its model is tried again on the next frames.
 var _rest_mmi: MultiMeshInstance3D = null
+var _rest_box_mesh: BoxMesh = null
+var _rest_box_mat: ShaderMaterial = null
 var _rest := {}  # chunk -> PackedFloat32Array
+var _rest_chunk_mmis := {}  # (chunked rest arms) Vector2i chunk -> MultiMeshInstance3D
+var _rest_chunk_counts := {}  # (chunked rest arms) Vector2i chunk -> instance count
+var _rest_upload := {}  # Vector2i chunk -> true (needs MMI upload/erase)
+var _rest_total_instances := 0
+var rest_chunk_uploads := 0  # (tests) per-chunk rest MMI uploads/removals performed
 var _rest_sprites := {}  # (sprite arms) chunk -> {model name -> [PackedFloat32Array per SpritePiece]}
 var sprite_rest_count := 0  # (tests) resting arms drawn as pictures
 var _rest_dirty := {}  # chunk -> true
@@ -1225,7 +1597,17 @@ var _rest_wait := 0.0
 var _rest_eprops := -1
 var _rest_hooked := false
 var _is_inserter := {}  # proto id -> bool
-var rest_buffer := PackedFloat32Array()  # (tests) the instances last put together
+var _rest_buffer_cache := PackedFloat32Array()
+var rest_buffer: PackedFloat32Array:  # (tests) the instances last put together
+	get:
+		if not rest_arms_chunked:
+			return _rest_buffer_cache
+		var combined := PackedFloat32Array()
+		for c: Vector2i in _rest:
+			combined.append_array(_rest[c])
+		return combined
+	set(v):
+		_rest_buffer_cache = v
 var rest_count := 0  # (tests, probes) resting arms drawn
 
 
@@ -1245,19 +1627,19 @@ func _update_rest(live: Dictionary, delta: float) -> void:
 		for c in world.chunks:
 			_rest_dirty[c] = true
 	if _rest_mmi == null:
-		var box := BoxMesh.new()
-		box.size = Vector3.ONE
+		_rest_box_mesh = BoxMesh.new()
+		_rest_box_mesh.size = Vector3.ONE
 		var mm := MultiMesh.new()
 		mm.transform_format = MultiMesh.TRANSFORM_3D
 		mm.use_colors = true
-		mm.mesh = box
-		var mat := ShaderMaterial.new()
-		mat.shader = RestShader
-		mat.set_shader_parameter("roughness", 0.6)
+		mm.mesh = _rest_box_mesh
+		_rest_box_mat = ShaderMaterial.new()
+		_rest_box_mat.shader = RestShader
+		_rest_box_mat.set_shader_parameter("roughness", 0.6)
 		_rest_mmi = MultiMeshInstance3D.new()
 		_rest_mmi.name = "RestingArms"
 		_rest_mmi.multimesh = mm
-		_rest_mmi.material_override = mat
+		_rest_mmi.material_override = _rest_box_mat
 		_rest_mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		add_child(_rest_mmi)
 	_rest_mmi.visible = true
@@ -1290,24 +1672,101 @@ func _update_rest(live: Dictionary, delta: float) -> void:
 	if _rest_put and (at_once or _rest_wait <= 0.0):
 		_rest_put = false
 		_rest_wait = REST_REFRESH
-		var all := PackedFloat32Array()
-		for c in _rest:
-			all.append_array(_rest[c])
-		var count := all.size() / 16
-		var mm := _rest_mmi.multimesh
-		if mm.instance_count < count or mm.instance_count > maxi(64, count * 4):
-			mm.visible_instance_count = 0
-			mm.instance_count = maxi(64, count + count / 2)
-		all.resize(mm.instance_count * 16)  # (the rest scaled to nothing, and not drawn)
-		rest_buffer = all
-		mm.buffer = all
-		mm.visible_instance_count = count
-		rest_count = count / 3
-		_put_rest_sprites()
+		if rest_arms_chunked:
+			_flush_rest_chunks()
+		else:
+			var all := PackedFloat32Array()
+			for c in _rest:
+				all.append_array(_rest[c])
+			var count := all.size() / 16
+			var mm := _rest_mmi.multimesh
+			if mm.instance_count < count or mm.instance_count > maxi(64, count * 4):
+				mm.visible_instance_count = 0
+				mm.instance_count = maxi(64, count + count / 2)
+			all.resize(mm.instance_count * 16)  # (the rest scaled to nothing, and not drawn)
+			_rest_buffer_cache = all
+			mm.buffer = all
+			mm.visible_instance_count = count
+			rest_count = count / 3
+		if not _rest_sprites.is_empty() or not _sprite_rest_mmis.is_empty():
+			_put_rest_sprites()
+		else:
+			sprite_rest_count = 0
+
+
+## (chunked rest arms) Upload only dirty chunks into per-chunk MultiMesh children of _rest_mmi.
+var _rest_behind_connected: Object = null
+
+
+func _rest_behind_hidden(c: Vector2i) -> bool:
+	if not ViewPriority.tight_cull or world == null or not is_instance_valid(world):
+		return false
+	var bc: Variant = world.get("behind_cull")
+	return bc != null and is_instance_valid(bc) and bc.is_active() and bc.hidden(c)
+
+
+func _on_rest_behind_visibility(c: Vector2i, drawn: bool) -> void:
+	var mmi: MultiMeshInstance3D = _rest_chunk_mmis.get(c)
+	if mmi != null and is_instance_valid(mmi):
+		mmi.visible = drawn or not _rest_behind_hidden(c)
+
+
+func _flush_rest_chunks() -> void:
+	if world != null and is_instance_valid(world):
+		var bc: Variant = world.get("behind_cull")
+		if bc != _rest_behind_connected and bc != null and is_instance_valid(bc):
+			_rest_behind_connected = bc
+			if bc.has_signal("chunk_visibility_changed"):
+				bc.chunk_visibility_changed.connect(_on_rest_behind_visibility)
+	if _rest_mmi != null and _rest_mmi.multimesh != null:
+		_rest_mmi.multimesh.visible_instance_count = 0
+	for c: Vector2i in _rest_upload.keys():
+		_rest_upload.erase(c)
+		var buf: PackedFloat32Array = _rest.get(c, PackedFloat32Array())
+		var count := buf.size() / 16
+		var prev: int = _rest_chunk_counts.get(c, 0)
+		_rest_total_instances += count - prev
+		var mmi: MultiMeshInstance3D = _rest_chunk_mmis.get(c)
+		if count == 0:
+			_rest_chunk_counts.erase(c)
+			if mmi != null:
+				_rest_chunk_mmis.erase(c)
+				mmi.queue_free()
+				rest_chunk_uploads += 1
+			continue
+		_rest_chunk_counts[c] = count
+		if mmi == null:
+			var mm := MultiMesh.new()
+			mm.transform_format = MultiMesh.TRANSFORM_3D
+			mm.use_colors = true
+			mm.mesh = _rest_box_mesh
+			mmi = MultiMeshInstance3D.new()
+			mmi.name = "RestChunk_%d_%d" % [c.x, c.y]
+			mmi.multimesh = mm
+			mmi.material_override = _rest_box_mat
+			mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			_rest_mmi.add_child(mmi)
+			_rest_chunk_mmis[c] = mmi
+		var cmm := mmi.multimesh
+		if cmm.instance_count < count or cmm.instance_count > maxi(16, count * 2):
+			cmm.visible_instance_count = 0
+			cmm.instance_count = maxi(16, count + count / 2)
+		var padded := buf
+		if padded.size() != cmm.instance_count * 16:
+			padded = buf.duplicate()
+			padded.resize(cmm.instance_count * 16)
+		cmm.buffer = padded
+		cmm.visible_instance_count = count
+		mmi.visible = not _rest_behind_hidden(c)
+		rest_chunk_uploads += 1
+	rest_count = _rest_total_instances / 3
 
 
 ## (sprite arms) The resting arms drawn as pictures put together, one MultiMesh per model and picture.
 func _put_rest_sprites() -> void:
+	if _rest_sprites.is_empty() and _sprite_rest_mmis.is_empty():
+		sprite_rest_count = 0
+		return
 	var all := {}  # model -> [PackedFloat32Array per SpritePiece]
 	for c in _rest_sprites:
 		for model: String in _rest_sprites[c]:
@@ -1345,8 +1804,10 @@ func _put_rest_sprites() -> void:
 func _rest_chunk(c: Vector2i) -> bool:
 	var cv = world.chunks.get(c)
 	_rest_put = true
+	_rest_upload[c] = true
 	if cv == null:
 		_rest.erase(c)
+		_rest_sprites.erase(c)
 		return true
 	var buf := PackedFloat32Array()
 	var sprites := {}  # model name -> [PackedFloat32Array per SpritePiece]
@@ -1656,6 +2117,7 @@ func _sprite_set_for(name: String) -> Dictionary:
 	if _sprite_version != ModelLibrary.ModelPacks.version:
 		_sprite_version = ModelLibrary.ModelPacks.version
 		_sprite_known.clear()
+		_scratch_sprite_lists.clear()
 		for list: Dictionary in [_sprite_mmis, _sprite_rest_mmis]:
 			for mmis: Array in list.values():
 				for mmi in mmis:
@@ -1831,12 +2293,96 @@ static func _fill(mm: MultiMesh, xforms: Array) -> void:
 		mm.set_instance_transform(i, xforms[i])
 
 
+## Fills a MultiMesh with `xforms`, using fast bulk buffer upload or per-instance fallback.
+func _fill_xforms(mm: MultiMesh, xforms: Array) -> void:
+	if mm.instance_count < xforms.size():
+		mm.instance_count = maxi(xforms.size(), maxi(mm.instance_count * 2, 16))
+	mm.visible_instance_count = xforms.size()
+	if xforms.is_empty():
+		return
+	if not fast_upload:
+		for i in xforms.size():
+			mm.set_instance_transform(i, xforms[i] as Transform3D)
+		return
+	var rid := mm.get_rid()
+	var needed := mm.instance_count * 12
+	var buf: PackedFloat32Array = _upload_bufs.get(rid, PackedFloat32Array())
+	if buf.size() != needed:
+		buf.resize(needed)
+	var o := 0
+	for i in xforms.size():
+		var t: Transform3D = xforms[i]
+		var b := t.basis
+		buf[o] = b.x.x
+		buf[o + 1] = b.y.x
+		buf[o + 2] = b.z.x
+		buf[o + 3] = t.origin.x
+		buf[o + 4] = b.x.y
+		buf[o + 5] = b.y.y
+		buf[o + 6] = b.z.y
+		buf[o + 7] = t.origin.y
+		buf[o + 8] = b.x.z
+		buf[o + 9] = b.y.z
+		buf[o + 10] = b.z.z
+		buf[o + 11] = t.origin.z
+		o += 12
+	_upload_bufs[rid] = buf
+	RenderingServer.multimesh_set_buffer(rid, buf)
+
+
+## Fills a MultiMesh with `xforms` and `colors` (stride 16), using fast bulk buffer upload or fallback.
+func _fill_xforms_colored(mm: MultiMesh, xforms: Array, colors: Array[Color], per_arm: int, part: int = -1) -> void:
+	if mm.instance_count < xforms.size():
+		mm.instance_count = maxi(xforms.size(), maxi(mm.instance_count * 2, 16))
+	mm.visible_instance_count = xforms.size()
+	if xforms.is_empty():
+		return
+	if not fast_upload:
+		for i in xforms.size():
+			var arm_col: Color = colors[i if per_arm == 1 else i >> 1]
+			var c: Color = _part_color(part, arm_col) if part >= 0 else arm_col
+			mm.set_instance_transform(i, xforms[i] as Transform3D)
+			mm.set_instance_color(i, c)
+		return
+	var rid := mm.get_rid()
+	var needed := mm.instance_count * 16
+	var buf: PackedFloat32Array = _upload_bufs.get(rid, PackedFloat32Array())
+	if buf.size() != needed:
+		buf.resize(needed)
+	var o := 0
+	for i in xforms.size():
+		var t: Transform3D = xforms[i]
+		var b := t.basis
+		var arm_col: Color = colors[i if per_arm == 1 else i >> 1]
+		var c: Color = _part_color(part, arm_col) if part >= 0 else arm_col
+		buf[o] = b.x.x
+		buf[o + 1] = b.y.x
+		buf[o + 2] = b.z.x
+		buf[o + 3] = t.origin.x
+		buf[o + 4] = b.x.y
+		buf[o + 5] = b.y.y
+		buf[o + 6] = b.z.y
+		buf[o + 7] = t.origin.y
+		buf[o + 8] = b.x.z
+		buf[o + 9] = b.y.z
+		buf[o + 10] = b.z.z
+		buf[o + 11] = t.origin.z
+		buf[o + 12] = c.r
+		buf[o + 13] = c.g
+		buf[o + 14] = c.b
+		buf[o + 15] = c.a
+		o += 16
+	_upload_bufs[rid] = buf
+	RenderingServer.multimesh_set_buffer(rid, buf)
+
+
 ## The arm pieces of an inserter prototype, made on first use; null without the models.
 func _pieces_for(proto_name: String):
 	# A pack chosen for an inserter's family (the Model packs window, the building's Model button)
 	# takes its arm too (ModelPacks.PREFIX_FAMILIES): the pieces are made again from the new models.
 	if _parts_packs != ModelLibrary.ModelPacks.version:
 		_parts_packs = ModelLibrary.ModelPacks.version
+		_scratch_model_lists.clear()
 		for pieces in _model_parts.values():
 			if pieces != null:
 				for mmi in pieces:

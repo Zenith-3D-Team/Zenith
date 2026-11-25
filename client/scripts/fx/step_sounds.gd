@@ -11,9 +11,11 @@ extends RefCounted
 ## Armours' sounds are kept but not played yet (task 3b waits for a listen in Factorio).
 
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## `--steps=table`: the name table as before, whatever the bridge sends.
-static var use_table := "--steps=table" in OS.get_cmdline_user_args()
+static var use_table := Switches.has("--steps=table")
 
 ## What a lookup gives for a sound that is listed as none.
 const SILENT := 0
@@ -51,14 +53,14 @@ func handle(msg: Dictionary) -> void:
 	var part := int(msg.get("part", 1))
 	if part == 1 or _gathering.is_empty():
 		_gathering = {"s": [null], "tl": {}, "el": {}, "dl": {}, "al": {}, "u": [0, 0], "nv": [0, 0]}
-	for e in _array(msg.get("s")):
+	for e in Wire.array(msg.get("s")):
 		_gathering["s"].append(e if e is Array and e.size() >= 3 else null)
 	for key in ["tl", "el", "dl"]:
 		var into: Dictionary = _gathering[key]
-		for rec in _array(msg.get(key)):
+		for rec in Wire.array(msg.get(key)):
 			if rec is Array and rec.size() >= 2:
 				into[int(rec[0])] = int(rec[1])
-	for rec in _array(msg.get("al")):
+	for rec in Wire.array(msg.get("al")):
 		if rec is Array and rec.size() >= 3:
 			_gathering["al"][int(rec[0])] = [int(rec[1]), int(rec[2])]
 	var u = msg.get("u")
@@ -184,7 +186,3 @@ static func name_of(d: SoundBank.SoundDef) -> String:
 	if dash > 0 and f.substr(dash + 1).is_valid_int():
 		f = f.substr(0, dash)
 	return f
-
-
-static func _array(v: Variant) -> Array:
-	return v if v is Array else []

@@ -54,7 +54,28 @@ static func states(data_dir := "") -> Dictionary:
 static func is_on(name: String, choices: Dictionary) -> bool:
 	if name == "base" or name == BRIDGE:
 		return true
+	if GAME.has(name) and not installed(name):
+		return false  # issue #28: no Space Age bought, so no Space Age map controls Factorio refuses
 	return bool(choices.get(name, GAME.has(name)))
+
+
+static var _installed_cache := {}
+
+## Whether one of Wube's mods is in the install's data folder (a copy without Space Age has none of
+## its DLC). True when no Factorio is found, as before; `--dlc-detect=off` always says true.
+static func installed(name: String) -> bool:
+	if name == "base" or "--dlc-detect=off" in OS.get_cmdline_user_args():
+		return true
+	var exe := Paths.factorio_exe()
+	if exe == "":
+		return true
+	var dir := Paths.read_data_dir(exe)
+	if not DirAccess.dir_exists_absolute(dir.path_join("base")):
+		return true
+	var key := dir + "|" + name
+	if not _installed_cache.has(key):
+		_installed_cache[key] = DirAccess.dir_exists_absolute(dir.path_join(name))
+	return bool(_installed_cache[key])
 
 
 ## The mods other than Wube's and the bridge turned on: what a loaded save gets added.

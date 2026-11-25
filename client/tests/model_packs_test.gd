@@ -13,6 +13,8 @@ const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const TerrainTextures := preload("res://scripts/world/terrain_textures.gd")
+const Decoratives := preload("res://scripts/world/decoratives.gd")
 const TestEnv := preload("res://tests/test_env.gd")
 const Tones := preload("res://tests/sound_fixtures.gd")
 
@@ -30,16 +32,21 @@ func _initialize() -> void:
 	_unit()
 	_builtin()
 	_packs()
+	_cache_keep()
 	_choices()
 	_bundled()
 	_icons()
 	_sounds()
+	_tiles()
+	_decoratives()
 	_items()
 	_item_pictures()
 	_pack_shading()
 	_item_kinds_follow()
 	_numbered_ores()
 	_variants()
+	_cliffs()
+	_gate_model()
 	_factorio()
 	_copies()
 	_builtin_copies()
@@ -226,6 +233,47 @@ func _packs() -> void:
 		print("NOTE the damaged zip's entry isn't deflated (%s): not checked" % [entry])
 
 
+## The unpacked copies of zips another launcher's folder has (not this one's) are kept until unused
+## --pack-cache-keep days (their stamp), so switching launchers doesn't unpack them again; 0 removes
+## them at once, as before; a changed zip's old copy (the same zip name) goes at once either way.
+func _cache_keep() -> void:
+	var dir := ProjectSettings.globalize_path("user://models-keep")
+	var chest := FileAccess.get_file_as_bytes(ProjectSettings.globalize_path("res://assets/models/packs/wube3dp/wooden-chest.glb"))
+	var zip_path := dir.path_join("keep-pack.zip")
+	DirAccess.make_dir_recursive_absolute(dir)
+	_zip(zip_path, {"keep-pack/wooden-chest.glb": chest})
+	var root := ProjectSettings.globalize_path(ModelPacks.cache_root)
+	var other := root.path_join("Other-123-456")  # another launcher's zip
+	var old_used := root.path_join("Older-123-456")  # and one unused for longer than kept
+	var mine_old := root.path_join("keep-pack-1-2")  # this folder's zip, changed since
+	for d in [other, old_used, mine_old]:
+		_write(d.path_join("pack/wooden-chest.glb"), chest)
+	var now := int(Time.get_unix_time_from_system())
+	_write(old_used + ModelPacks.USED_SUFFIX, str(now - (ModelPacks.PACK_CACHE_KEEP_DAYS + 1) * 86400).to_utf8_buffer())
+	_write(root.path_join("Gone-1-2" + ModelPacks.USED_SUFFIX), str(now).to_utf8_buffer())  # a stamp without its copy
+	var saved := ModelPacks.pack_cache_keep
+	ModelPacks.pack_cache_keep = ModelPacks.PACK_CACHE_KEEP_DAYS
+	ModelPacks.configure(dir, ["zip:keep-pack.zip"], [])
+	ModelPacks.wait()
+	var cache := str(_pack(ModelPacks.packs, "zip:keep-pack.zip")["cache"])
+	check(DirAccess.dir_exists_absolute(cache) and DirAccess.dir_exists_absolute(other) and FileAccess.file_exists(other.path_join("pack/wooden-chest.glb")),
+		"another launcher's unpacked copy is kept (used lately)")
+	check(not DirAccess.dir_exists_absolute(old_used) and not FileAccess.file_exists(old_used + ModelPacks.USED_SUFFIX),
+		"a copy unused for longer than --pack-cache-keep days is removed with its stamp")
+	check(not DirAccess.dir_exists_absolute(mine_old), "this folder's changed zip's old copy is removed at once")
+	check(not FileAccess.file_exists(root.path_join("Gone-1-2" + ModelPacks.USED_SUFFIX)), "a stamp left without its copy is removed")
+	check(ModelPacks.last_used(cache) >= now and ModelPacks.last_used(cache) <= now + 60, "the copy in use is stamped used now: %d" % ModelPacks.last_used(cache))
+	check(ModelPacks._copy_zip_name("Zenith-1663000000-1763000000") == "Zenith" and ModelPacks._copy_zip_name("my-pack-v2-12-34") == "my-pack-v2"
+		and ModelPacks._copy_zip_name("odd") == "odd", "a copy's zip name read from its folder's name")
+	# --pack-cache-keep=0: as before, every copy this folder has no zip for goes.
+	ModelPacks.pack_cache_keep = 0
+	ModelPacks.configure(dir, ["zip:keep-pack.zip"], [])
+	ModelPacks.wait()
+	check(not DirAccess.dir_exists_absolute(other) and DirAccess.dir_exists_absolute(cache), "--pack-cache-keep=0: another launcher's copy is removed at once")
+	ModelPacks.pack_cache_keep = saved
+	_remove_tree(dir)
+
+
 ## M7: Zenith's own models are three built-in packs (res://assets/models/packs/), and the Factorio
 ## pack (the install's pictures): under the models folder's in their default order, Factorio last;
 ## Placeholders moves and switches off as any pack.
@@ -238,7 +286,7 @@ func _builtin() -> void:
 		and by_id.has(ModelPacks.FACTORIO_ID), "three built-in packs and Factorio's: %s" % [by_id.keys()])
 	var counts: Array = [int(by_id.get("builtin:wube3dp", {}).get("count", 0)), int(by_id.get("builtin:fue5", {}).get("count", 0)),
 		int(by_id.get("builtin:placeholders", {}).get("count", 0))]
-	check(counts == [94, 142, 348], "Wube3DP 94 models, FUE5 142, Placeholders 348 (584): %s" % [counts])
+	check(counts == [94, 142, 377], "Wube3DP 94 models, FUE5 142, Placeholders 377 (613): %s" % [counts])
 	check(by_id.get("builtin:wube3dp", {}).get("title") == "Wube3DP (Adapted)" and by_id.get("builtin:fue5", {}).get("title") == "FUE5 (Adapted)"
 		and by_id.get("builtin:wube3dp", {}).get("short") == "Wube3DP" and by_id.get("builtin:fue5", {}).get("short") == "FUE5"
 		and by_id.get("builtin:placeholders", {}).get("title") == "Placeholders"
@@ -271,7 +319,7 @@ func _builtin() -> void:
 		and not ModelPacks.owns(ModelPacks.BUILTIN_DIR + "fue5/locomotive.glb"), "the model library reads the built-in packs, not as a modeller's")
 	# Families: a prototype's model with its variants.
 	var cases := {"inserter-east": "inserter", "transport-belt-curve-left": "transport-belt", "underground-belt-input": "underground-belt",
-		"stone-wall-es-fill": "stone-wall", "big-biter-corpse-2": "big-biter", "pipe-straight-horizontal": "pipe", "pipe-to-ground-west": "pipe-to-ground",
+		"stone-wall-es-fill": "stone-wall", "stone-wall-gate-s": "stone-wall", "stone-wall-gate-single-e": "stone-wall", "stone-wall-gate-ew": "stone-wall", "big-biter-corpse-2": "big-biter", "pipe-straight-horizontal": "pipe", "pipe-to-ground-west": "pipe-to-ground",
 		"straight-rail-ne": "straight-rail", "cargo-bay-wall-n": "cargo-bay", "inserter-arm-long-hand-open": "long-handed-inserter",
 		"inserter-arm-basic-upper": "inserter", "inserter-arm-bulk-hand-closed": "bulk-inserter", "inserter-arm-stack-upper": "stack-inserter",
 		"character-armor-2": "character", "character-corpse": "character", "demolisher-segment": "demolisher",
@@ -612,6 +660,369 @@ func _sounds() -> void:
 		"the built-in packs carry no sounds")
 
 
+## Packs' ground textures (terrain_textures.gd asks tile_source() first): folder, zip and loose packs
+## of tiles alone, subfolders, numbered variant subfolders without stripping -1 from tile names,
+## aliases and pack.json "tiles" overrides (size, count, roughness, specular), template sheets,
+## seamless tile repeat, order/choice/on-off switches, and live TerrainTextures reload.
+func _tiles() -> void:
+	ModelPacks.set_choices({})
+	ModelPacks.set_tiles_on(true)
+	ModelPacks.set_tile_pbr_on(true)
+	var dir := ProjectSettings.globalize_path("user://tile-models")
+	_write(dir.path_join("Tile folder/inner/tiles/nauvis/grass-1.png"), _png(64, 64, Color(1, 0, 0)))
+	_write(dir.path_join("Tile folder/inner/tiles/nauvis/grass-1.jpg"), _png_or_jpg(64, 64, Color(0, 1, 0)))
+	_write(dir.path_join("Tile folder/inner/tiles/dirt-1-normal.png"), _png(64, 64, Color(0.5, 0.5, 1.0)))
+	_write(dir.path_join("Tile folder/inner/tiles/dirt-1-height.png"), _png(64, 64, Color(0.8, 0.8, 0.8)))
+	_write(dir.path_join("Tile folder/inner/tiles/concrete/10.png"), _png(64, 64, Color(0.1, 0.1, 0.8)))
+	_write(dir.path_join("Tile folder/inner/tiles/concrete/2.png"), _png(64, 64, Color(0.1, 0.8, 0.1)))
+	_write(dir.path_join("Tile folder/inner/tiles/concrete/1.png"), _png(64, 64, Color(0.8, 0.1, 0.1)))
+	_write(dir.path_join("Tile folder/inner/tiles/notes.txt"), "not a tile".to_utf8_buffer())
+	_write(dir.path_join("tiles/sand-1.png"), _png(64, 64, Color(0.9, 0.8, 0.2)))
+	var strip := Image.create(128, 64, false, Image.FORMAT_RGBA8)
+	strip.fill_rect(Rect2i(0, 0, 64, 64), Color(0.2, 0.4, 0.8))
+	strip.fill_rect(Rect2i(64, 0, 64, 64), Color(0.8, 0.4, 0.2))
+	var template_img := Image.create(1024, 576, false, Image.FORMAT_RGBA8)
+	template_img.fill(Color(0.3, 0.6, 0.3))
+	# Template normal sheet whose 2x2 strip (y=128..255) has a 1px black Sobel gap edge along y=128.
+	var template_nrm := Image.create(1024, 576, false, Image.FORMAT_RGBA8)
+	template_nrm.fill(Color(0.5, 0.5, 1.0))
+	template_nrm.fill_rect(Rect2i(0, 128, 1024, 1), Color(0, 0, 0, 1))
+	var zip_info := {
+		"name": "Zipped tiles",
+		"aliases": {"my-mud": "dirt-1"},
+		"tiles": {
+			"*": {"roughness": 0.9},
+			"grass-*": {"size": 2, "normal_flip_x": true, "normal_strength": 1.5, "height_strength": 0.75},
+			"concrete": {"count": 2, "roughness": 0.65, "specular": 0.25},
+		},
+	}
+	_zip(dir.path_join("tile-zip.zip"), {
+		"pack/pack.json": JSON.stringify(zip_info).to_utf8_buffer(),
+		"pack/tiles/grass-1.png": _png(128, 128, Color(0, 0, 1)),
+		"pack/tiles/grass-1-normal.png": _png(128, 128, Color(0.25, 0.75, 1.0)),
+		"pack/tiles/grass-1-roughness.png": _png(128, 128, Color(0.35, 0.35, 0.35)),
+		"pack/tiles/my-mud.png": _png(64, 64, Color(0.5, 0.3, 0.1)),
+		"pack/tiles/concrete.png": strip.save_png_to_buffer(),
+		"pack/tiles/sand-2.png": template_img.save_png_to_buffer(),
+		"pack/tiles/sand-2-normal.png": template_nrm.save_png_to_buffer(),
+	})
+	var found := ModelPacks.scan(dir)
+	var folder := _pack(found, "dir:Tile folder")
+	var zipped := _pack(found, "zip:tile-zip.zip")
+	var loose := _pack(found, ModelPacks.LOOSE_ID)
+	check(int(folder.get("tile_count", 0)) == 3 and int(folder.get("count", -1)) == 0 and folder.get("problem", "?") == "",
+		"a folder of tiles and PBR maps is a pack (subfolders, multi-variant folders, and PBR-only stems counted): %s" % [folder])
+	check(ModelPacks.tile_names(folder) == ["concrete", "dirt-1", "grass-1"], "tile_names includes PBR-only stems and keeps -1 suffixes intact: %s" % [ModelPacks.tile_names(folder)])
+	check(ModelPacks.tile_maps_in(folder, "dirt-1").has("normal") and ModelPacks.tile_maps_in(folder, "dirt-1").has("height"),
+		"tile_maps_in parses -normal and -height companion maps: %s" % [ModelPacks.tile_maps_in(folder, "dirt-1")])
+	check(ModelPacks.tile_in(folder, "grass-1").size() == 1 and str(ModelPacks.tile_in(folder, "grass-1")[0]).ends_with(".png"),
+		"png beats jpg for the same tile stem: %s" % [ModelPacks.tile_in(folder, "grass-1")])
+	var con_files := ModelPacks.tile_in(folder, "concrete")
+	check(con_files.size() == 3 and str(con_files[0]).ends_with("/1.png") and str(con_files[1]).ends_with("/2.png") and str(con_files[2]).ends_with("/10.png"),
+		"numbered tile variants sorted naturally (1, 2, 10): %s" % [con_files])
+	check(zipped.get("problem", "?") == "" and int(zipped.get("tile_count", 0)) == 4,
+		"a zip of tiles and PBR maps is a pack: %s" % [zipped])
+	check(int(loose.get("tile_count", 0)) == 1 and not found.any(func(p: Dictionary) -> bool: return p["id"] == "dir:tiles"),
+		"the folder's own tiles/ is the loose pack's, not a pack of its own")
+
+	var v := ModelPacks.tiles_version
+	ModelPacks.configure(dir, ["zip:tile-zip.zip", "dir:Tile folder"], [])
+	ModelPacks.wait()
+	check(ModelPacks.tiles_version != v, "tiles_version moved with the packs")
+	var z_live := _pack(ModelPacks.packs, "zip:tile-zip.zip")
+	check(int(z_live["tile_count"]) == 4 and ModelPacks.tile_pack("grass-1").get("id") == "zip:tile-zip.zip",
+		"the zip's tiles taken in once unpacked; the higher pack wins")
+	check(ModelPacks.tile_file("dirt-1").ends_with("my-mud.png") and ModelPacks.tile_file("my-mud") == "",
+		"pack.json aliases rename tiles too: %s" % ModelPacks.tile_file("dirt-1"))
+	var spec := ModelPacks.tile_spec(z_live, "grass-1")
+	check(is_equal_approx(float(spec.get("roughness", 0.0)), 0.9) and spec.get("size") == [2, 2]
+		and bool(spec.get("normal_flip_x", false)) and is_equal_approx(float(spec.get("normal_strength", 0.0)), 1.5)
+		and is_equal_approx(float(spec.get("height_strength", 0.0)), 0.75),
+		"tile_spec merges wildcards, size, and PBR rules: %s" % [spec])
+
+	# Load into TerrainTextures and verify packed pixels, PBR companion array, flip_x, template clamping, and live reload.
+	var was_disabled := TerrainTextures.disabled
+	TerrainTextures.disabled = false
+	var loaded_names := ["grass-1", "concrete", "sand-2"]
+	for tn in loaded_names:
+		TerrainTextures.lookup(tn)
+	var until := Time.get_ticks_msec() + 5000
+	while Time.get_ticks_msec() < until:
+		TerrainTextures.poll()
+		if loaded_names.all(func(tn: String) -> bool: return TerrainTextures.peek(tn) != null):
+			break
+		OS.delay_msec(5)
+	var g_grass: TerrainTextures.TileGfx = TerrainTextures.peek("grass-1")
+	var g_con: TerrainTextures.TileGfx = TerrainTextures.peek("concrete")
+	var g_sand: TerrainTextures.TileGfx = TerrainTextures.peek("sand-2")
+	check(g_grass != null and g_grass.layer >= 0 and g_grass.material == Vector2i(2, 2) and g_grass.material_count == 1,
+		"grass-1 packed as 2x2 single material: %s" % [g_grass.material if g_grass != null else Vector2i.ZERO])
+	if g_grass != null and g_grass.layer >= 0:
+		var px0 := _layer_pixel(TerrainTextures._images[g_grass.layer], 0, 0)
+		var px_wrap := _layer_pixel(TerrainTextures._images[g_grass.layer], 128, 128)
+		check(px0.b > 0.8 and px0.r < 0.2 and px_wrap.b > 0.8 and px_wrap.r < 0.2,
+			"grass-1 seamless blue block repeated across layer: %s / %s" % [px0, px_wrap])
+		check(is_equal_approx(g_grass.surface, TerrainTextures.surface_code(Vector2(0.9, TerrainTextures.surface_of("grass-1").y))),
+			"grass-1 takes pack.json * roughness 0.9: %s" % g_grass.surface)
+		var gm: Color = TerrainTextures._pbr_metas[g_grass.layer]
+		var gpbr_idx := int(roundf(gm.r))
+		check(TerrainTextures._pbr_array != null and gpbr_idx >= 0 and int(roundf(gm.g)) == 5
+			and is_equal_approx(gm.b, 1.5) and is_equal_approx(gm.a, 0.75),
+			"grass-1 companion PBR metadata uploaded with normal+roughness flags (5) and strengths: %s" % [gm])
+		if gpbr_idx >= 0:
+			var gppx := TerrainTextures._pbr_images[gpbr_idx].get_pixel(10, 10)
+			check(gppx.r > 0.7 and gppx.g > 0.7 and absf(gppx.b - 0.35) < 0.03,
+				"grass-1 PBR normal_flip_x flips R (0.25 -> ~0.75) and B stores roughness ~0.35: %s" % [gppx])
+	check(g_con != null and g_con.layer >= 0 and g_con.material_count == 2 and g_con.material == Vector2i(1, 1),
+		"concrete strip sliced into 2 variants: %s / %s" % [g_con.material if g_con != null else Vector2i.ZERO, g_con.material_count if g_con != null else -1])
+	if g_con != null and g_con.layer >= 0:
+		var c0 := _layer_pixel(TerrainTextures._images[g_con.layer], 16, 16)
+		var c1 := _layer_pixel(TerrainTextures._images[g_con.layer], 64 + 16, 16)
+		check(c0.b > 0.6 and c0.r < 0.4 and c1.r > 0.6 and c1.b < 0.4,
+			"concrete strip variants packed into slots 0 and 1: %s / %s" % [c0, c1])
+		check(is_equal_approx(g_con.surface, TerrainTextures.surface_code(Vector2(0.65, 0.25))),
+			"concrete takes pack.json roughness/specular: %s" % g_con.surface)
+	check(g_sand != null and g_sand.layer >= 0 and g_sand.sizes.size() >= 3,
+		"sand-2 1024x576 template sheet unpacked into 4x4/2x2/1x1 variants: %s" % [g_sand.sizes if g_sand != null else []])
+	if g_sand != null and g_sand.layer >= 0:
+		var sm: Color = TerrainTextures._pbr_metas[g_sand.layer]
+		var spbr_idx := int(roundf(sm.r))
+		check(spbr_idx >= 0 and int(roundf(sm.g)) == 1, "sand-2 template normal map uploaded with flag 1: %s" % [sm])
+		if spbr_idx >= 0:
+			var dst2: Vector2i = TerrainTextures._slot_px(2, 0)
+			var edge_px := TerrainTextures._pbr_images[spbr_idx].get_pixel(dst2.x + 8, dst2.y)
+			check(edge_px.r > 0.4 and edge_px.g > 0.4,
+				"sand-2 _clamp_template_slot_borders replaces 1px black Sobel spike at y=128: %s" % [edge_px])
+
+	# Order swap triggers live TerrainTextures reload, and albedo-only pack isolates lower PBR maps.
+	var layout_before := TerrainTextures.layout
+	ModelPacks.configure(dir, ["dir:Tile folder", "zip:tile-zip.zip"], [])
+	ModelPacks.wait()
+	var grass_src := ModelPacks.tile_source("grass-1")
+	check(grass_src.get("pack", {}).get("id") == "dir:Tile folder" and (grass_src.get("maps", {}) as Dictionary).is_empty(),
+		"higher albedo-only pack does not mix lower pack's PBR maps: %s" % [grass_src])
+	TerrainTextures.poll()
+	check(TerrainTextures.layout > layout_before and TerrainTextures.peek("grass-1") == null,
+		"changing tile packs reloads TerrainTextures and bumps layout")
+	TerrainTextures.lookup("grass-1")
+	until = Time.get_ticks_msec() + 5000
+	while TerrainTextures.peek("grass-1") == null and Time.get_ticks_msec() < until:
+		TerrainTextures.poll()
+		OS.delay_msec(5)
+	var g_red: TerrainTextures.TileGfx = TerrainTextures.peek("grass-1")
+	if g_red != null and g_red.layer >= 0:
+		var px_red := _layer_pixel(TerrainTextures._images[g_red.layer], 0, 0)
+		check(px_red.r > 0.8 and px_red.b < 0.2, "after order swap, folder pack's red grass-1 loads: %s" % px_red)
+
+	# PBR-only source & preview swatch, plus --pack-tile-pbr=off / set_tiles_on(false).
+	ModelPacks.configure(dir, ["dir:Tile folder"], ["zip:tile-zip.zip"])
+	ModelPacks.wait()
+	var dirt_src := ModelPacks.tile_source("dirt-1")
+	var dirt_preview := TerrainTextures.pack_preview_image([], {}, dirt_src.get("maps", {}))
+	check((dirt_src.get("files", []) as Array).is_empty() and not (dirt_src.get("maps", {}) as Dictionary).is_empty()
+		and dirt_preview != null and not dirt_preview.is_empty(),
+		"PBR-only tile pack exposes companion maps and generates a preview swatch: %s" % [dirt_src])
+	v = ModelPacks.tiles_version
+	ModelPacks.set_tile_pbr_on(false)
+	check(ModelPacks.tiles_version != v and ModelPacks.tile_source("dirt-1").is_empty(),
+		"set_tile_pbr_on(false) leaves companion PBR maps out")
+	ModelPacks.set_tile_pbr_on(true)
+	ModelPacks.configure(dir, ["dir:Tile folder", "zip:tile-zip.zip"], [])
+	ModelPacks.wait()
+
+	v = ModelPacks.tiles_version
+	ModelPacks.set_choices({ModelPacks.TILE_PREFIX + "grass-1": "zip:tile-zip.zip"})
+	check(ModelPacks.tile_pack("grass-1").get("id") == "zip:tile-zip.zip" and ModelPacks.tile_choice("grass-1") == "zip:tile-zip.zip"
+		and ModelPacks.tiles_version != v, "a tile: choice takes the chosen pack's whatever the order")
+	check(ModelPacks.model_choice_count() == 0 and ModelPacks.choice("grass-1") == "", "a tile's choice is no model family's")
+	v = ModelPacks.tiles_version
+	ModelPacks.set_choices({})
+	check(ModelPacks.tile_pack("grass-1").get("id") == "dir:Tile folder" and ModelPacks.tiles_version != v, "the choice undone: the order's again")
+
+	v = ModelPacks.tiles_version
+	ModelPacks.set_tiles_on(false)
+	TerrainTextures.poll()
+	check(ModelPacks.tile_file("grass-1") == "" and ModelPacks.tile_file("grass-1", true) == "" and ModelPacks.tiles_version != v
+		and TerrainTextures._pbr_array == null and TerrainTextures._pbr_images.is_empty(),
+		"packs' tiles off (--pack-tiles=off, Settings): none and clears PBR array")
+	ModelPacks.set_tiles_on(true)
+
+	ModelPacks.configure(dir, ["dir:Tile folder", "zip:tile-zip.zip"], ["dir:Tile folder"])
+	ModelPacks.wait()
+	check(ModelPacks.tile_pack("grass-1").get("id") == "zip:tile-zip.zip" and ModelPacks.tile_pack("concrete").get("id") == "zip:tile-zip.zip",
+		"a pack off gives nothing: the other pack's")
+	ModelPacks.configure(dir, [ModelPacks.FACTORIO_ID, "dir:Tile folder", "zip:tile-zip.zip"], [])
+	ModelPacks.wait()
+	if ModelPacks.factorio_usable():
+		check(ModelPacks.tile_file("grass-1") == "" and ModelPacks.tile_file("grass-1", true).contains("Tile folder"),
+			"packs below the Factorio pack: Factorio's own first, theirs only past it")
+	ModelPacks.configure("", [], [])
+	check(ModelPacks.tile_file("grass-1") == "" and ModelPacks.active().all(func(p: Dictionary) -> bool: return int(p["tile_count"]) == 0),
+		"the built-in packs carry no tiles")
+	TerrainTextures.disabled = was_disabled
+	TerrainTextures.poll()
+
+
+func _decoratives() -> void:
+	ModelPacks.set_choices({})
+	ModelPacks.set_decor_on(true)
+	var dir := ProjectSettings.globalize_path("user://decor-models")
+	# Folder pack with subfolder, -1/-2 variants, .png beating .jpg, and digit-variant folder sorted naturally.
+	_write(dir.path_join("Decor folder/inner/decoratives/nauvis/green-hairy-grass-2.png"), _png(32, 32, Color(0, 0.9, 0.2)))
+	_write(dir.path_join("Decor folder/inner/decoratives/nauvis/green-hairy-grass-1.png"), _png(32, 32, Color(0.1, 0.7, 0.1)))
+	_write(dir.path_join("Decor folder/inner/decoratives/nauvis/green-hairy-grass-1.jpg"), _png_or_jpg(32, 32, Color(0.9, 0, 0)))
+	_write(dir.path_join("Decor folder/inner/decoratives/small-rock/10.png"), _png(24, 24, Color(0.2, 0.2, 0.9)))
+	_write(dir.path_join("Decor folder/inner/decoratives/small-rock/2.png"), _png(24, 24, Color(0.5, 0.5, 0.5)))
+	_write(dir.path_join("Decor folder/inner/decoratives/small-rock/1.png"), _png(24, 24, Color(0.8, 0.2, 0.2)))
+	_write(dir.path_join("Decor folder/inner/decoratives/notes.txt"), "not a decorative".to_utf8_buffer())
+	# Loose decoratives/ in models root + hide-only pack with pack.json rules only.
+	_write(dir.path_join("decoratives/red-desert-bush.png"), _png(32, 32, Color(0.9, 0.2, 0.1)))
+	var hide_info := {"name": "Hide shrubs", "decoratives": {"small-rock": {"hide": true}}}
+	_write(dir.path_join("HideOnly/pack.json"), JSON.stringify(hide_info).to_utf8_buffer())
+	var zip_info := {
+		"name": "Zipped decor",
+		"aliases": {"my-fern": "brown-carpet-grass"},
+		"decoratives": {
+			"*": {"scale": 0.75},
+			"green-hairy-grass": {"size": [1.5, 1.5], "shift": [0.1, -0.2], "layer": "decals", "grass": true, "grass_height": 0.42, "grass_style": "bush"},
+			"brown-carpet-grass": {"hide": true},
+		},
+	}
+	_zip(dir.path_join("decor-zip.zip"), {
+		"pack/pack.json": JSON.stringify(zip_info).to_utf8_buffer(),
+		"pack/decoratives/green-hairy-grass.png": _png(48, 48, Color(0.0, 0.2, 0.95)),
+		"pack/decoratives/my-fern.png": _png(32, 32, Color(0.6, 0.4, 0.2)),
+	})
+	var found := ModelPacks.scan(dir)
+	var folder := _pack(found, "dir:Decor folder")
+	var zipped := _pack(found, "zip:decor-zip.zip")
+	var hider := _pack(found, "dir:HideOnly")
+	var loose := _pack(found, ModelPacks.LOOSE_ID)
+	check(int(folder.get("decor_count", 0)) == 2 and int(folder.get("count", -1)) == 0 and folder.get("problem", "?") == "",
+		"a folder of decoratives alone is a pack (subfolders and variants grouped): %s" % [folder])
+	check(ModelPacks.decor_names(folder) == ["green-hairy-grass", "small-rock"],
+		"decor_names strips -1/-2 variant suffixes and groups folders: %s" % [ModelPacks.decor_names(folder)])
+	var grass_files := ModelPacks.decor_in(folder, "green-hairy-grass")
+	check(grass_files.size() == 2 and str(grass_files[0]).ends_with("green-hairy-grass-1.png") and str(grass_files[1]).ends_with("green-hairy-grass-2.png"),
+		"numbered decorative variants sorted and png beats jpg: %s" % [grass_files])
+	var rock_files := ModelPacks.decor_in(folder, "small-rock")
+	check(rock_files.size() == 3 and str(rock_files[0]).ends_with("/1.png") and str(rock_files[1]).ends_with("/2.png") and str(rock_files[2]).ends_with("/10.png"),
+		"digit-folder decorative variants sorted naturally (1, 2, 10): %s" % [rock_files])
+	check(zipped.get("problem", "?") == "" and int(zipped.get("decor_count", 0)) == 2,
+		"a zip of decoratives alone is a pack: %s" % [zipped])
+	check(hider.get("problem", "?") == "" and int(hider.get("decor_count", 0)) >= 1,
+		"a pack with only pack.json decoratives hide rules counts as a pack: %s" % [hider])
+	check(int(loose.get("decor_count", 0)) == 1 and not found.any(func(p: Dictionary) -> bool: return p["id"] == "dir:decoratives"),
+		"the folder's own decoratives/ is the loose pack's, not a pack of its own")
+
+	var v := ModelPacks.decor_version
+	ModelPacks.configure(dir, ["zip:decor-zip.zip", "dir:Decor folder"], [])
+	ModelPacks.wait()
+	check(ModelPacks.decor_version != v, "decor_version moved with the packs")
+	var z_live := _pack(ModelPacks.packs, "zip:decor-zip.zip")
+	check(ModelPacks.decor_pack("green-hairy-grass").get("id") == "zip:decor-zip.zip"
+		and ModelPacks.decor_has(z_live, "brown-carpet-grass"),
+		"higher zip pack wins and exposes aliased hidden decorative: %s" % [ModelPacks.decor_names(z_live)])
+	var gspec := ModelPacks.decor_spec(z_live, "green-hairy-grass")
+	check(is_equal_approx(float(gspec.get("scale", 0.0)), 0.75) and gspec.get("size") == [1.5, 1.5]
+		and gspec.get("shift") == [0.1, -0.2] and str(gspec.get("layer", "")) == "decals"
+		and bool(gspec.get("grass", false)) and is_equal_approx(float(gspec.get("grass_height", 0.0)), 0.42)
+		and str(gspec.get("grass_style", "")) == "bush",
+		"decor_spec merges wildcard + exact pack.json fields: %s" % [gspec])
+	var preview := Decoratives.pack_preview_image(ModelPacks.decor_in(z_live, "green-hairy-grass"))
+	check(preview != null and not preview.is_empty(), "Decoratives.pack_preview_image returns swatch image")
+
+	# Decoratives._kind_data_for loads custom pack image + raised 3D grass, and respects hide: true.
+	var saved_idx := Decoratives._index.duplicate(true)
+	var saved_gen := Decoratives._index_generation
+	Decoratives._index = {}
+	Decoratives._index_generation = -999
+	Decoratives._sync_packs()
+	var kd: Decoratives.KindData = Decoratives._kind_data_for("green-hairy-grass")
+	check(kd != null and kd.atlas != null and kd.grass_height > 0.35 and not kd.grass_carpet and kd.sizes.size() == 1 and kd.sizes[0].is_equal_approx(Vector2(1.5, 1.5)),
+		"Decoratives._kind_data_for loads pack replacement, size override, and 3D bush grass_height")
+	if kd != null and kd.atlas != null:
+		var cpx := kd.atlas.get_pixel(24, 24)
+		check(cpx.b > 0.8 and cpx.r < 0.2, "Decoratives._kind_data_for drew the zip pack's blue decorative: %s" % [cpx])
+	var hidden_kd: Decoratives.KindData = Decoratives._kind_data_for("brown-carpet-grass")
+	check(hidden_kd == null, "Decoratives._kind_data_for returns null when pack.json sets hide: true")
+
+	# Choices, disabling, Factorio barrier, and restoration.
+	v = ModelPacks.decor_version
+	ModelPacks.set_choices({ModelPacks.DECOR_PREFIX + "green-hairy-grass": "dir:Decor folder"})
+	check(ModelPacks.decor_pack("green-hairy-grass").get("id") == "dir:Decor folder"
+		and ModelPacks.decor_choice("green-hairy-grass") == "dir:Decor folder"
+		and ModelPacks.decor_version != v and ModelPacks.model_choice_count() == 0,
+		"decor:<name> choice overrides pack order without counting as a model family choice")
+	ModelPacks.set_choices({})
+
+	v = ModelPacks.decor_version
+	ModelPacks.set_decor_on(false)
+	check(ModelPacks.decor_source("green-hairy-grass").is_empty() and ModelPacks.decor_source("green-hairy-grass", true).is_empty()
+		and ModelPacks.decor_version != v,
+		"set_decor_on(false) disables pack decoratives and bumps decor_version")
+	ModelPacks.set_decor_on(true)
+
+	ModelPacks.configure(dir, ["dir:HideOnly", "dir:Decor folder"], ["zip:decor-zip.zip"])
+	ModelPacks.wait()
+	check(bool(ModelPacks.decor_source("small-rock").get("spec", {}).get("hide", false))
+		and ModelPacks.decor_source("green-hairy-grass").get("pack", {}).get("id") == "dir:Decor folder",
+		"hide-only pack hides targeted decorative without blocking other decoratives below")
+
+	ModelPacks.configure(dir, [ModelPacks.FACTORIO_ID, "zip:decor-zip.zip"], ["dir:Decor folder", "dir:HideOnly"])
+	ModelPacks.wait()
+	if ModelPacks.factorio_usable():
+		check(ModelPacks.decor_source("green-hairy-grass").is_empty()
+			and ModelPacks.decor_source("green-hairy-grass", true).get("pack", {}).get("id") == "zip:decor-zip.zip",
+			"packs below Factorio only supply past_factorio decoratives")
+
+	# Built-in Placeholders 3D decorative models (.glb) + decor_models_on switch + custom image override above Placeholders.
+	var was_dm := ModelPacks.decor_models_on
+	ModelPacks.set_decor_models_on(true)
+	ModelPacks.configure("", [], [])
+	var ph := _pack(ModelPacks.active(), "builtin:placeholders")
+	var ph_decor := ModelPacks.decor_names(ph)
+	# (The 48 placeholder 3D decoratives were removed by the owner, 2a52be70: a pack's own still work.)
+	check(ph_decor.is_empty() and ModelPacks.decor_models_in(ph, "green-hairy-grass").is_empty(),
+		"builtin:placeholders ships no 3D decorative models: %d" % [ph_decor.size()])
+	var all_decor_glbs_ok := true
+	for dn: String in ph_decor:
+		var mpaths := ModelPacks.decor_models_in(ph, dn)
+		all_decor_glbs_ok = all_decor_glbs_ok and not mpaths.is_empty() and FileAccess.file_exists(str(mpaths[0]))
+	check(all_decor_glbs_ok, "every built-in decorative GLB file exists on disk")
+	ModelPacks.configure(dir, ["dir:Decor folder", "builtin:placeholders", ModelPacks.FACTORIO_ID], ["zip:decor-zip.zip", "dir:HideOnly"])
+	ModelPacks.wait()
+	var custom_wins := ModelPacks.decor_source("green-hairy-grass")
+	check(custom_wins.get("pack", {}).get("id") == "dir:Decor folder"
+		and (custom_wins.get("models", []) as Array).is_empty() and not (custom_wins.get("files", []) as Array).is_empty(),
+		"a custom pack's 2D decoratives override Placeholders' 3D models cleanly: %s" % [custom_wins])
+	ModelPacks.configure("", [], [])
+	ModelPacks.set_decor_models_on(false)
+	var ph_src_off := ModelPacks.decor_source("green-hairy-grass", true)
+	check(ph_src_off.is_empty(), "set_decor_models_on(false) skips .glb-only decoratives so Factorio 2D fallback applies")
+	ModelPacks.set_decor_models_on(was_dm)
+
+	Decoratives._index = saved_idx
+	Decoratives._index_generation = saved_gen
+	ModelPacks.set_choices({})
+	ModelPacks.configure("", [], [])
+	Decoratives._sync_packs()
+	_remove_tree(dir)
+
+
+static func _png_or_jpg(w: int, h: int, colour: Color) -> PackedByteArray:
+	var image := Image.create(w, h, false, Image.FORMAT_RGB8)
+	image.fill(colour)
+	return image.save_jpg_to_buffer()
+
+
+static func _layer_pixel(img: Image, x: int, y: int) -> Color:
+	var copy := img.duplicate() as Image
+	if copy.is_compressed():
+		copy.decompress()
+	return copy.get_pixel(x, y)
+
+
 static func _png(w: int, h: int, colour: Color) -> PackedByteArray:
 	var image := Image.create(w, h, false, Image.FORMAT_RGBA8)
 	image.fill(colour)
@@ -642,10 +1053,11 @@ func _items() -> void:
 			missing.append(f)
 	check(held.size() == 198 and int(placeholders["item_count"]) == 198 and missing.is_empty(),
 		"Placeholders' items/ has the 198 item models the old folder had: %d, missing %s" % [held.size(), missing])
-	check(not (placeholders["models"] as Dictionary).has("iron-plate") and int(placeholders["count"]) == 348
+	check(not (placeholders["models"] as Dictionary).has("iron-plate") and int(placeholders["count"]) == 377
+		and int(placeholders.get("decor_count", 0)) == 0
 		and (placeholders["models"] as Dictionary).has("accumulator") and held.has("accumulator")
 		and str(held["accumulator"]) != str(placeholders["models"]["accumulator"]),
-		"its items aren't entity models (348 still; the accumulator entity and item each its own file)")
+		"its items aren't entity models (377 still; the accumulator entity and item each its own file)")
 	check(ModelPacks.builtin_packs().all(func(p: Dictionary) -> bool: return p["id"] == "builtin:placeholders" or (p["items"] as Dictionary).is_empty()),
 		"only Placeholders has item models built in")
 
@@ -742,12 +1154,16 @@ func _copies() -> void:
 	_write(data.path_join("base/info.json"), '{"name": "base", "version": "2.1.0"}'.to_utf8_buffer())
 	_write(data.path_join("base/sound/walking/grass-1.ogg"), sound)
 	_write(data.path_join("base/graphics/entity/chest/chest.png"), picture)
+	_write(data.path_join("base/graphics/terrain/grass-1.png"), _noise(4500, 4))
+	_write(data.path_join("base/graphics/decorative/green-hairy-grass/green-hairy-grass-13.png"), _noise(4600, 5))
 	_write(data.path_join("core/graphics/tiny.png"), tiny)
 	var chest := FileAccess.get_file_as_bytes(ProjectSettings.globalize_path("res://assets/models/packs/wube3dp/wooden-chest.glb"))
 	# A pack with two copies (one at the install's path, one renamed), a small copy and a look-alike.
 	_write(dir.path_join("Copies/zz-copied-entity.glb"), chest)
 	_write(dir.path_join("Copies/sounds/base/sound/walking/grass-1.ogg"), sound)
 	_write(dir.path_join("Copies/icons/zz-copied-entity.png"), picture)
+	_write(dir.path_join("Copies/tiles/grass-1.png"), _noise(4500, 4))
+	_write(dir.path_join("Copies/decoratives/green-hairy-grass-13.png"), _noise(4600, 5))
 	_write(dir.path_join("Copies/tiny.png"), tiny)
 	var other := picture.duplicate()
 	other[100] = other[100] ^ 0xff
@@ -767,13 +1183,14 @@ func _copies() -> void:
 		"[models] Clean (Clean/): being checked for copies of Factorio's files, used once it is clean"), "nothing of a pack being checked is drawn")
 	ModelPacks.wait()
 	var copies := _pack(ModelPacks.packs, "dir:Copies")
-	check(ModelPacks.refused(copies) and copies["copies"] == ["icons/zz-copied-entity.png", "sounds/base/sound/walking/grass-1.ogg"]
+	check(ModelPacks.refused(copies) and copies["copies"] == ["decoratives/green-hairy-grass-13.png", "icons/zz-copied-entity.png", "sounds/base/sound/walking/grass-1.ogg", "tiles/grass-1.png"]
 		and copies["problem"] == PackCheck.REFUSED,
-		"the pack with copies refused: the one at the install's path and the renamed one, not the small one: %s" % [copies.get("copies")])
+		"the pack with copies refused: the one at the install's path and the renamed ones, not the small one: %s" % [copies.get("copies")])
 	check(ModelPacks.pack("dir:Copies").is_empty() and ModelPacks.find("zz-copied-entity", true) == ""
-		and ModelPacks.icon_file("item", "zz-copied-entity") == "" and ModelPacks.sound_file("base/sound/walking/grass-1.ogg") == "",
-		"nothing of a refused pack is used: no model, icon or sound")
-	check(PackCheck.detail(copies["copies"]).begins_with("2 of its files are copies of files from your Factorio install, for example icons/zz-copied-entity.png. ")
+		and ModelPacks.icon_file("item", "zz-copied-entity") == "" and ModelPacks.sound_file("base/sound/walking/grass-1.ogg") == ""
+		and ModelPacks.tile_file("grass-1") == "" and ModelPacks.decor_pack("green-hairy-grass").get("id", "") != "dir:Copies",
+		"nothing of a refused pack is used: no model, icon, sound, tile or decorative")
+	check(PackCheck.detail(copies["copies"]).begins_with("4 of its files are copies of files from your Factorio install, for example decoratives/green-hairy-grass-13.png. ")
 		and not PackCheck.detail(copies["copies"]).contains(root),
 		"the card's words: the count and an example path in the pack, never the user's folder")
 	# The wording the manager approved (docs/leads/mods.md, 23), whole; one copy: "a copy of a file".
@@ -817,8 +1234,10 @@ func _copies() -> void:
 	ModelPacks.configure(dir, order, [])
 	check(none_waits.call() and ModelPacks.refused(_pack(ModelPacks.packs, "zip:copied.zip")), "the answers kept on disk")
 	# Changed: checked again (the copy taken out: now it loads).
+	DirAccess.remove_absolute(dir.path_join("Copies/decoratives/green-hairy-grass-13.png"))
 	DirAccess.remove_absolute(dir.path_join("Copies/icons/zz-copied-entity.png"))
 	DirAccess.remove_absolute(dir.path_join("Copies/sounds/base/sound/walking/grass-1.ogg"))
+	DirAccess.remove_absolute(dir.path_join("Copies/tiles/grass-1.png"))
 	ModelPacks.configure(dir, order, [])
 	check(bool(_pack(ModelPacks.packs, "dir:Copies").get("checking")) and not bool(_pack(ModelPacks.packs, "dir:Clean").get("checking")),
 		"a changed pack is checked again, an unchanged one not")
@@ -1030,14 +1449,74 @@ func _pack_shading() -> void:
 	check(ModelPacks.pbr(dir.path_join("Pbr/stone-furnace.glb")) and ModelPacks.pbr(dir.path_join("Pbr/items/pictured-plate.glb"))
 		and not ModelPacks.pbr(dir.path_join("Fact/stone-furnace.glb")) and not ModelPacks.pbr(dir.path_join("None/stone-furnace.glb")),
 		"pack shading: a model's and an item's file are pbr only in the pbr pack")
-	var builtin_shading: Array = []
+	var builtin_shading := {}
 	for p: Dictionary in ModelPacks.builtin_packs():
-		builtin_shading.append(ModelPacks.shading(p))
-	var forged := ModelPacks.builtin_packs()[0] as Dictionary
-	(forged["info"] as Dictionary)["shading"] = "pbr"
-	check(builtin_shading.size() >= 3 and builtin_shading.all(func(v: String) -> bool: return v == "factorio")
-		and ModelPacks.shading(forged) == "factorio" and ModelPacks.shading({}) == "factorio",
-		"pack shading: Zenith's own packs are Factorio's, even if their pack.json said pbr: %s" % [builtin_shading])
+		builtin_shading[str(p.get("id", ""))] = ModelPacks.shading(p)
+	var fue5_pack := ModelPacks.pack(ModelPacks.FUE5_ID)
+	var saved_fue5_pbr := ModelPacks.fue5_pbr
+	ModelPacks.fue5_pbr = false
+	var fue5_off := ModelPacks.shading(fue5_pack)
+	var fue5_pbr_off_model := ModelPacks.pbr("res://assets/models/packs/fue5/wooden-chest.glb")
+	ModelPacks.fue5_pbr = saved_fue5_pbr
+	var wube_pack := ModelPacks.pack(ModelPacks.WUBE3DP_ID)
+	var saved_wube_pbr := ModelPacks.wube3dp_pbr
+	ModelPacks.wube3dp_pbr = false
+	var wube_off := ModelPacks.shading(wube_pack)
+	var wube_pbr_off_model := ModelPacks.pbr("res://assets/models/packs/wube3dp/wooden-chest.glb")
+	ModelPacks.wube3dp_pbr = saved_wube_pbr
+	var ph_pack := ModelPacks.pack(ModelPacks.LAST_ID)
+	var saved_ph_pbr := ModelPacks.placeholder_pbr
+	ModelPacks.placeholder_pbr = false
+	var ph_off := ModelPacks.shading(ph_pack)
+	ModelPacks.placeholder_pbr = saved_ph_pbr
+	var factorio_forged := ModelPacks.pack(ModelPacks.FACTORIO_ID).duplicate() as Dictionary
+	var forged_info := (factorio_forged["info"] as Dictionary).duplicate() as Dictionary
+	forged_info["shading"] = "pbr"
+	factorio_forged["info"] = forged_info
+	check(builtin_shading.get("builtin:fue5") == ("pbr" if saved_fue5_pbr else "factorio")
+		and fue5_off == "factorio" and not fue5_pbr_off_model
+		and ModelPacks.pbr("res://assets/models/packs/fue5/wooden-chest.glb") == saved_fue5_pbr
+		and builtin_shading.get("builtin:wube3dp") == ("pbr" if saved_wube_pbr else "factorio")
+		and wube_off == "factorio" and not wube_pbr_off_model
+		and builtin_shading.get(ModelPacks.FACTORIO_ID) == "factorio"
+		and builtin_shading.get(ModelPacks.LAST_ID) == ("pbr" if saved_ph_pbr else "factorio")
+		and ph_off == "factorio"
+		and ModelPacks.shading(factorio_forged) == "factorio" and ModelPacks.shading({}) == "factorio",
+		"pack shading: built-in packs (Factorio factorio, FUE5/Wube3DP/Placeholders pbr unless --*-pbr=off): %s" % [builtin_shading])
+	const WUBE_DIR := "res://assets/models/packs/wube3dp/"
+	check(ModelPacks.pbr(WUBE_DIR + "wooden-chest.glb") == saved_wube_pbr
+		and ModelPacks.pbr(WUBE_DIR + "assembling-machine-1.glb") == saved_wube_pbr
+		and ModelPacks.pbr(WUBE_DIR + "inserter-arm-basic-upper.glb") == saved_wube_pbr
+		and not ModelPacks.pbr(WUBE_DIR + "big-biter.glb")
+		and not ModelPacks.pbr(WUBE_DIR + "character.glb")
+		and not ModelPacks.pbr(WUBE_DIR + "transport-belt.glb")
+		and not ModelPacks.pbr(WUBE_DIR + "underground-belt-input.glb"),
+		"pack shading: Wube3DP's per-model PBR rules separate baked models from rigged creatures/character and belts")
+	const PH_DIR := "res://assets/models/packs/placeholders/"
+	check(ModelPacks.pbr(PH_DIR + "assembling-machine-2.glb") == saved_ph_pbr
+		and not ModelPacks.pbr(PH_DIR + "burner-mining-drill.glb")
+		and not ModelPacks.pbr(PH_DIR + "burner-mining-drill-east.glb")
+		and not ModelPacks.pbr(PH_DIR + "character-mech-armor.glb")
+		and ModelPacks.pbr(PH_DIR + "items/pipe.glb") == saved_ph_pbr
+		and not ModelPacks.pbr(PH_DIR + "items/iron-plate.glb")
+		and ModelPacks.pbr(PH_DIR + "items/tungsten-plate.glb") == saved_ph_pbr,
+		"pack shading: Placeholders' per-model PBR rules separate baked models from Zenith/rigged and items/")
+	var saved_packs_ov := ModelPacks.pbr_packs.duplicate()
+	var saved_models_ov := ModelPacks.pbr_models.duplicate()
+	ModelPacks.set_pbr_overrides({ModelPacks.WUBE3DP_ID: true, ModelPacks.LAST_ID: true}, {})
+	check(not ModelPacks.pbr(WUBE_DIR + "big-biter.glb")
+		and not ModelPacks.pbr(WUBE_DIR + "biter-spawner.glb")
+		and not ModelPacks.pbr(PH_DIR + "big-worm-turret.glb")
+		and not ModelPacks.pbr(PH_DIR + "items/iron-plate.glb")
+		and ModelPacks.pbr(WUBE_DIR + "wooden-chest.glb") == saved_wube_pbr
+		and ModelPacks.pbr(PH_DIR + "assembling-machine-2.glb") == saved_ph_pbr
+		and ModelPacks.pack_pbr_state(wube_pack) == ("mixed" if saved_wube_pbr else "off")
+		and ModelPacks.pack_pbr_state(ph_pack) == ("mixed" if saved_ph_pbr else "off"),
+		"pack shading: pack-level PBR ON keeps pack.json shading_models Factorio exclusions for untextured creatures and items")
+	ModelPacks.set_pbr_overrides({ModelPacks.WUBE3DP_ID: false}, {})
+	check(not ModelPacks.pbr(WUBE_DIR + "wooden-chest.glb") and ModelPacks.pack_pbr_state(wube_pack) == "off",
+		"pack shading: pack-level PBR OFF disables PBR across the pack")
+	ModelPacks.set_pbr_overrides(saved_packs_ov, saved_models_ov)
 	# Items: the pbr pack's pictured plate takes the lit path; the others' the picture alone.
 	var pbr_mesh := ItemModels.read(dir.path_join("Pbr/items/pictured-plate.glb"))
 	var fact_mesh := ItemModels.read(dir.path_join("Fact/items/pictured-plate.glb"))
@@ -1090,13 +1569,19 @@ func _item_kinds_follow() -> void:
 	var dir := ProjectSettings.globalize_path("user://models-kinds")
 	_remove_tree(dir)
 	_write(dir.path_join("Plates/items/copper-plate.glb"), coal)  # a copper plate shaped as coal
+	# The kinds made again at once: a pack's file read here (--item-models-later=off). With the reads on
+	# workers (the default) the kind waits a frame or two for its model: checked at the end.
+	var saved_later := ItemModels.later
+	ItemModels.later = false
 	ModelPacks.set_choices({})
 	ModelPacks.configure(dir, ["dir:Plates"], ["dir:Plates"])  # A: the pack off, Placeholders' plate
 	ModelPacks.wait()
 	ItemModels._cache.clear()
 	ItemModels._paths.clear()
 	var builtin_size := ItemModels.read(ItemModels.DIR + "copper-plate.glb").get_aabb().size
-	var pack_size := ItemModels.read(dir.path_join("Plates/items/copper-plate.glb")).get_aabb().size
+	var pack_mesh := ItemModels.read(dir.path_join("Plates/items/copper-plate.glb"))
+	var pack_size := pack_mesh.get_aabb().size
+	var far_pack_size := ItemModels.lod_mesh(pack_mesh).get_aabb().size
 	check(not builtin_size.is_equal_approx(pack_size), "the fixture plate's shape differs from Placeholders' (%s, %s)" % [builtin_size, pack_size])
 	var protos := ProtoDB.new()
 	protos.item_names = {1: "copper-plate"}
@@ -1106,6 +1591,7 @@ func _item_kinds_follow() -> void:
 	var lanes: Node3D = BeltLanes.new()
 	lanes.set("protos", protos)
 	lanes.set("sync", true)
+	lanes.set("focus", Vector2(100.0, 40.0))
 	lanes.call("_follow_models")
 	var at := {1: [Vector3.ZERO]}
 	var lane_msg := {"t": "bfar", "cx": 3, "cy": 1, "l": [100 * 256, 40 * 256, 4, 1, 0]}
@@ -1134,7 +1620,8 @@ func _item_kinds_follow() -> void:
 	var b_far: Vector3 = far_size.call()
 	check(b_near.is_equal_approx(pack_size) and cards.epoch != epoch,
 		"B: ground, near belt and hand items made again with the pack's plate on top (%s, want %s)" % [b_near, pack_size])
-	check(b_far.is_equal_approx(pack_size), "B: far belt lanes made again with the pack's plate (%s, want %s)" % [b_far, pack_size])
+	check(b_far.is_equal_approx(far_pack_size) and not b_far.is_equal_approx(builtin_size),
+		"B: far belt lanes made again with the pack's plate (%s, want %s)" % [b_far, far_pack_size])
 	epoch = cards.epoch
 	cards.draw(at)
 	lanes.call("_follow_models")
@@ -1153,6 +1640,32 @@ func _item_kinds_follow() -> void:
 	check((kind_size.call() as Vector3).is_equal_approx(builtin_size) and (far_size.call() as Vector3).is_equal_approx(builtin_size),
 		"--item-kinds-follow=off: items already drawn keep their model")
 	ItemModels.kinds_follow = true
+	# Read on a worker (the default): not ready at once, then the pack's plate once its read is in.
+	ItemModels.later = true
+	ModelPacks.configure(dir, ["dir:Plates"], ["dir:Plates"])
+	ModelPacks.wait()
+	ItemModels.ready("copper-plate")
+	ModelPacks.configure(dir, ["dir:Plates"], [])
+	ModelPacks.wait()
+	var first := ItemModels.ready("copper-plate")
+	var waited := 0
+	while not ItemModels.ready("copper-plate") and waited < 5000:
+		RenderingServer.force_sync()  # (the worker's mesh calls wait for the main thread's frame)
+		OS.delay_msec(5)
+		waited += 5
+	var later_mesh := ItemModels.mesh_for("copper-plate")
+	check(not first and later_mesh != null and later_mesh.get_aabb().size.is_equal_approx(pack_size) and waited < 5000,
+		"read on a worker: the pack's plate in once read (%s, want %s, %d ms)" % [later_mesh.get_aabb().size if later_mesh != null else Vector3.ZERO, pack_size, waited])
+	# Quit with a read still on a worker (main.gd's _exit_tree): waited for, not hung on.
+	ItemModels._cache.clear()
+	ItemModels._paths.clear()
+	ItemModels._all_ready.clear()
+	var queued := not ItemModels.ready("copper-plate") and not ItemModels._jobs.is_empty()
+	var tq := Time.get_ticks_msec()
+	ItemModels.wait_all()
+	check(queued and ItemModels._jobs.is_empty() and ItemModels._orphans.is_empty() and Time.get_ticks_msec() - tq < 10000,
+		"wait_all: a read on a worker waited for at quit (%s, %d ms)" % [queued, Time.get_ticks_msec() - tq])
+	ItemModels.later = saved_later
 	cards.free()
 	lanes.free()
 	ItemModels._cache.clear()
@@ -1305,8 +1818,158 @@ func _variants() -> void:
 	_remove_tree(dir)
 
 
+## The Placeholders gate (tools/models/railway.py): the new model and the old one (`gate-old`, drawn by
+## `--gate-model=old`, never a variant) both keep the sinking door part anim.gd opens, and the new one
+## a frame that stays (more than the old one's low rails) with an emissive warning light.
+func _gate_model() -> void:
+	ModelPacks.configure("", [], [])
+	ModelPacks.wait()
+	ModelPacks.set_choices({})
+	ModelLibrary.choices_changed([])
+	var placeholders := ModelPacks.pack("builtin:placeholders")
+	check(not placeholders.is_empty() and placeholders["models"].has("gate") and placeholders["models"].has("gate-old"),
+		"gate: the new and the old model are in the Placeholders pack")
+	if placeholders.is_empty():
+		return
+	check(ModelPacks.family("gate-old") == "gate" and ModelPacks.variants_in(placeholders["models"], "gate") == ["gate"],
+		"gate: the old model is the gate's family and never one of its variants")
+	var was := ModelLibrary.gate_model_old
+	ModelLibrary.gate_model_old = false
+	var now := ModelLibrary.model_name("gate", "gate", {})
+	ModelLibrary.gate_model_old = true
+	var old := ModelLibrary.model_name("gate", "gate", {})
+	ModelLibrary.gate_model_old = was
+	check(now == "gate" and old == "gate-old", "gate: --gate-model=old draws gate-old (%s, %s)" % [now, old])
+	for name: String in ["gate", "gate-old"]:
+		var doors := 0
+		for p: ModelLibrary.AnimPart in ModelLibrary.parts_for(name):
+			if p.kind == "gate_door":
+				doors += 1
+		check(doors == 1, "gate: %s has its sinking door part (%d)" % [name, doors])
+	var heights := {}
+	var lit := {}
+	for name: String in ["gate", "gate-old"]:
+		var path := ModelPacks.find_in("builtin:placeholders", name)
+		var doc := GLTFDocument.new()
+		var state := GLTFState.new()
+		check(path != "" and doc.append_from_file(path, state) == OK, "gate: %s reads" % name)
+		heights[name] = 0.0
+		lit[name] = false
+		var meshes := state.get_meshes()
+		for node: GLTFNode in state.get_nodes():
+			if node.resource_name != "body" or node.mesh < 0:
+				continue
+			var arr: ImporterMesh = meshes[node.mesh].mesh
+			for s in arr.get_surface_count():
+				var verts: PackedVector3Array = arr.get_surface_arrays(s)[Mesh.ARRAY_VERTEX]
+				for v: Vector3 in verts:
+					heights[name] = maxf(float(heights[name]), v.y)
+				var mat := arr.get_surface_material(s)
+				if mat is StandardMaterial3D and (mat as StandardMaterial3D).emission_enabled:
+					lit[name] = true
+	check(float(heights["gate"]) > float(heights["gate-old"]) + 0.1 and bool(lit["gate"]),
+		"gate: the frame that stays stands taller than the old rails and has a warning light (%s, %s)" % [heights, lit])
+
+
 ## A .glb of one triangle with UVs and a base-colour picture (a 2x2 PNG, red at its first pixel), no
 ## vertex colours.
+## Nauvis's cliffs (tools/models/nature/cliffs.py): the five pieces' variants are found, the old
+## pieces (`cliff-<piece>-old`) are never one of them and `--cliff-pieces=old` draws them, and every
+## piece and variant has the same cross-section where it meets its cell's edge, so any joins any.
+func _cliffs() -> void:
+	ModelPacks.configure("", [], [])
+	ModelPacks.wait()
+	ModelPacks.set_choices({})
+	ModelLibrary.choices_changed([])
+	var placeholders := ModelPacks.pack("builtin:placeholders")
+	check(not placeholders.is_empty(), "cliffs: the Placeholders pack is in use")
+	if placeholders.is_empty():
+		return
+	var counts := {"sides": 4, "outer": 3, "inner": 3, "exit": 2, "entrance": 2}
+	for piece: String in counts:
+		var found := ModelPacks.variants_in(placeholders["models"], "cliff-" + piece)
+		var want: Array = ["cliff-" + piece]
+		for i in range(1, int(counts[piece])):
+			want.append("cliff-%s-%d" % [piece, i])
+		check(found == want, "cliffs: %s's variants found: %s" % [piece, found])
+		check(placeholders["models"].has("cliff-%s-old" % piece), "cliffs: the old %s kept" % piece)
+		check(ModelPacks.family("cliff-%s-old" % piece) == "cliff" and ModelPacks.family("cliff-%s-1" % piece) == "cliff",
+			"cliffs: the old %s and its variants are the cliff's family" % piece)
+		check(ModelPacks.variants_in(placeholders["models"], "cliff-%s-old" % piece) == ["cliff-%s-old" % piece],
+			"cliffs: the old %s has no variants of its own" % piece)
+	var was := ModelLibrary.cliff_pieces_old
+	ModelLibrary.cliff_pieces_old = false
+	var seen := {}
+	for x in range(0, 64, 4):
+		var extra := {"co": "west-to-east", ModelLibrary.VARIANT_KEY: ModelPacks.variant_seed(Vector2i(x * 256, 128))}
+		seen[str(ModelLibrary.entity_models("cliff", "cliff", extra)[0])] = true
+	var keys := seen.keys()
+	keys.sort()
+	check(keys.size() >= 3 and keys.all(func(k: String) -> bool: return k.begins_with("cliff-sides") and not k.contains("-old")),
+		"cliffs: a straight run draws several variants, never the old piece: %s" % [keys])
+	ModelLibrary.cliff_pieces_old = true
+	var old_models := ModelLibrary.entity_models("cliff", "cliff", {"co": "north-to-east", ModelLibrary.VARIANT_KEY: 12345})
+	check(ModelLibrary.model_name("cliff", "cliff", {"co": "west-to-east"}) == "cliff-sides-old"
+		and str(old_models[0]) == "cliff-outer-old"
+		and ModelLibrary.model_name("cliff-vulcanus", "cliff", {"co": "west-to-east"}) == "cliff-vulcanus-sides",
+		"cliffs: --cliff-pieces=old draws Nauvis's old pieces, other planets' as before: %s" % [old_models])
+	ModelLibrary.cliff_pieces_old = was
+	# The cross-sections at the cell's edges, as (offset towards the face, height) in the edge's own
+	# frame: [plane axis (0 x, 2 z), plane value, inward sign, right axis, right sign].
+	var starts := [0, -2.0, 1.0, 2, 1.0]
+	var ends := {"sides": [0, 2.0, -1.0, 2, 1.0], "entrance": [0, 2.0, -1.0, 2, 1.0],
+		"outer": [2, -2.0, 1.0, 0, 1.0], "inner": [2, 2.0, -1.0, 0, -1.0]}
+	var canonical: Array = []
+	for piece: String in counts:
+		for i in range(int(counts[piece])):
+			var name := "cliff-" + piece + ("" if i == 0 else "-%d" % i)
+			var points := _cliff_points(str(placeholders["models"][name]))
+			check(points.size() > 100, "cliffs: %s read (%d points)" % [name, points.size()])
+			var edges: Array = []
+			if piece != "entrance":
+				edges.append(starts)
+			if ends.has(piece):
+				edges.append(ends[piece])
+			for e: Array in edges:
+				var section := {}
+				var beyond := 0.0
+				for v: Vector3 in points:
+					var d: float = (v[int(e[0])] - float(e[1])) * float(e[2])
+					beyond = maxf(beyond, -d)
+					if absf(d) < 0.002:
+						section["%.2f,%.2f" % [v[int(e[3])] * float(e[4]), v.y]] = true
+				var list := section.keys()
+				list.sort()
+				if canonical.is_empty():
+					canonical = list
+				check(list == canonical and list.size() >= 10, "cliffs: %s's edge cross-section is the shared one (%d points): %s" % [name, list.size(), list])
+				check(beyond < 0.005, "cliffs: nothing of %s past its cell's edge (%.3f)" % [name, beyond])
+
+
+## A model's vertices, every mesh in the scene's own frame.
+static func _cliff_points(path: String) -> Array:
+	var doc := GLTFDocument.new()
+	var state := GLTFState.new()
+	if doc.append_from_file(path, state) != OK:
+		return []
+	var out: Array = []
+	var nodes := state.get_nodes()
+	for i in nodes.size():
+		var node: GLTFNode = nodes[i]
+		if node.mesh < 0:
+			continue
+		var xf := Transform3D.IDENTITY
+		var at := i
+		while at >= 0:
+			xf = (nodes[at] as GLTFNode).xform * xf
+			at = (nodes[at] as GLTFNode).parent
+		var mesh: ImporterMesh = (state.get_meshes()[node.mesh] as GLTFMesh).mesh
+		for s in mesh.get_surface_count():
+			for v: Vector3 in mesh.get_surface_arrays(s)[Mesh.ARRAY_VERTEX]:
+				out.append(xf * v)
+	return out
+
+
 static func _pictured_glb() -> PackedByteArray:
 	var img := Image.create(2, 2, false, Image.FORMAT_RGBA8)
 	img.fill(Color(0, 0, 1))
@@ -1435,3 +2098,29 @@ func _test_shading_models(dir: String) -> void:
 		got2[f] = ModelPacks.pbr(dir.path_join("Mix2/" + f + ".glb"))
 	check(got2 == {"stone-furnace": false, "stone-wall": true, "coal": true, "items/stone-wall": true, "steel-furnace": false},
 		"shading_models: the first pattern that fits wins unless the name is exact (stone-furnace is 'factorio' exact): %s" % [got2])
+	# The Model packs window's pack-level PBR toggle only sets the pack's default: pack.json's shading_models entries win.
+	var keep_packs := ModelPacks.pbr_packs.duplicate()
+	var keep_models := ModelPacks.pbr_models.duplicate()
+	var mix_id := str(a["id"])
+	var mix2_id := str((ModelPacks.pack("dir:Mix2") as Dictionary)["id"])
+	var names := ["stone-furnace", "steel-furnace", "coal-2", "stone-wall", "coal"]
+	var pbr_of := func(pack: String) -> Dictionary:
+		var out := {}
+		for f: String in names:
+			out[f] = ModelPacks.pbr(dir.path_join(pack + "/" + f + ".glb"))
+		return out
+	ModelPacks.set_pbr_overrides({mix_id: false, mix2_id: true}, {})
+	var mix_off: Dictionary = pbr_of.call("Mix")
+	var mix2_on: Dictionary = pbr_of.call("Mix2")
+	ModelPacks.set_pbr_overrides({mix_id: true, mix2_id: false}, {})
+	var mix_on: Dictionary = pbr_of.call("Mix")
+	var mix2_off: Dictionary = pbr_of.call("Mix2")
+	ModelPacks.set_pbr_overrides({mix_id: true}, {mix_id + "|stone-furnace": true})
+	var mix_model_wins: bool = ModelPacks.pbr(dir.path_join("Mix/stone-furnace.glb"))
+	ModelPacks.set_pbr_overrides(keep_packs, keep_models)
+	check(not mix_off["stone-furnace"] and mix_off["coal-2"] and not mix_off["steel-furnace"] and not mix_off["stone-wall"]
+		and not mix2_on["stone-furnace"] and mix2_on["steel-furnace"] and mix2_on["stone-wall"]
+		and not mix_on["stone-furnace"] and mix_on["steel-furnace"]
+		and not mix2_off["stone-furnace"] and mix2_off["stone-wall"] and mix2_off["coal"] and not mix2_off["steel-furnace"]
+		and mix_model_wins,
+		"pack toggle: pack.json's shading_models entries win over the pack-level PBR toggle (it only moves the pack default), a per-model override over both: %s %s %s %s" % [mix_off, mix2_on, mix_on, mix2_off])

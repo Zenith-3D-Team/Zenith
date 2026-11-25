@@ -9,6 +9,7 @@ local belt_items = require("scripts.belt_items")
 local ground_items = require("scripts.ground_items")
 local fluids_power = require("scripts.fluids_power")
 local inserters = require("scripts.inserters")
+local robots = require("scripts.robots")
 local sky = require("scripts.sky")
 local pollution = require("scripts.pollution")
 local puppet = require("scripts.puppet")
@@ -18,10 +19,12 @@ local combat = require("scripts.combat")
 local repair = require("scripts.repair")
 local turrets = require("scripts.turrets")
 local shots = require("scripts.shots")
+local corpses = require("scripts.corpses")
 local inventory = require("scripts.inventory")
 local crafting = require("scripts.crafting")
 local research = require("scripts.research")
 local map = require("scripts.map")
+local lod = require("scripts.lod")
 local trains = require("scripts.trains")
 local logistics = require("scripts.logistics")
 local platforms = require("scripts.platforms")
@@ -44,6 +47,8 @@ local alt_mode = require("scripts.alt_mode")
 local belt_switch = require("scripts.belt_switch")
 local gfx = require("scripts.gfx")
 local mod_gui = require("scripts.mod_gui")
+local perf = require("scripts.perf")
+local gc_pace = require("scripts.gc_pace")
 -- (Its event ids are made as it loads: unconditionally, the same on every peer. link.lua)
 local link = require("scripts.link")
 
@@ -66,6 +71,7 @@ end)
 -- for the bridge's own.
 script.on_event(defines.events.on_udp_packet_received, function(event)
   barrier.call("packet", session.on_packet, event)
+  gc_pace.guard()  -- the heap's ceiling between ticks (gc_pace.lua)
   barrier.call("link", link.raise)
 end)
 
@@ -76,14 +82,37 @@ local STEPS = {
   { "repair", repair.tick }, { "combat", combat.tick }, { "turrets", turrets.tick }, { "shots", shots.tick },
   { "driving", driving.tick }, { "screens", screens.tick },
   { "inventory", inventory.tick }, { "crafting", crafting.tick }, { "research", research.tick },
-  { "map", map.tick }, { "trains", trains.tick }, { "logistics", logistics.tick }, { "platforms", platforms.tick },
+  { "map", map.tick }, { "lod", lod.tick }, { "trains", trains.tick }, { "logistics", logistics.tick }, { "platforms", platforms.tick },
   { "planets", planets.tick }, { "space", space.tick }, { "collectors", collectors.tick },
-  { "world", world.tick }, { "movers", movers.tick }, { "belt_items", belt_items.tick }, { "belt_lanes", belt_items.far_tick },
+  { "world", world.tick }, { "movers", movers.tick }, { "robots", robots.tick }, { "belt_items", belt_items.tick }, { "belt_lanes", belt_items.far_tick },
   { "ground_items", ground_items.tick }, { "fluids_power", fluids_power.tick },
   { "inserters", inserters.tick }, { "sky", sky.tick }, { "pollution", pollution.tick }, { "ui_actions", ui_actions.tick }, { "alt_mode", alt_mode.tick }, { "belt_switch", belt_switch.tick },
   { "alerts", alerts.tick }, { "equipment", equipment.tick }, { "players", players.tick },
   { "enemies", enemies.tick }, { "enemy_sight", enemy_sight.tick }, { "requests", requests.tick }, { "gfx", gfx.tick }, { "mod_gui", mod_gui.tick },
 }
+
+-- Near-world simulation steps run ahead of background map/lod/trains/space scans, bulk outbox
+-- flushes at index 1, and priority outbox flushes again at the end of serve() so interactive
+-- replies and unblocked deltas leave on the same tick. Share step entries with STEPS so runtime
+-- step wrappers (tests) affect both tables.
+local FAST_ORDER = {
+  "transport", "tracker", "puppet", "repair", "combat", "turrets", "shots", "driving", "screens",
+  "inventory", "crafting", "research",
+  "world", "movers", "robots", "belt_items", "belt_lanes", "ground_items", "fluids_power", "inserters",
+  "map", "lod", "trains", "logistics", "platforms", "planets", "space", "collectors",
+  "sky", "pollution", "ui_actions", "alt_mode", "belt_switch", "alerts", "equipment", "players",
+  "enemies", "enemy_sight", "requests", "gfx", "mod_gui",
+}
+local STEPS_FAST = {}
+do
+  local by_name = {}
+  for _, step in ipairs(STEPS) do
+    by_name[step[1]] = step
+  end
+  for _, name in ipairs(FAST_ORDER) do
+    STEPS_FAST[#STEPS_FAST + 1] = by_name[name]
+  end
+end
 
 local function serve()
   if not storage.f3d.client or not session.tick() then
@@ -97,9 +126,13 @@ local function serve()
     profile.run("transport", barrier.call, "transport", transport.flush)
     profile.run("handshake", barrier.call, "handshake", session.handshake_tick)
   else
-    for _, step in ipairs(STEPS) do
+    local flush_end = perf.on("flush_end")
+    for _, step in ipairs(flush_end and STEPS_FAST or STEPS) do
       -- Each step once, inside its own barrier (barrier.lua), so one failing leaves the others.
       profile.run(step[1], barrier.call, step[1], step[2])
+    end
+    if flush_end then
+      profile.run("transport", barrier.call, "transport", transport.flush_priority)
     end
   end
   budget.finish()
@@ -131,20 +164,25 @@ script.on_event(defines.events.on_tick, function()
   barrier.call("link", link.raise)  -- clients that timed out
   profile.run("transport", barrier.call, "transport", transport.end_tick)
   barrier.call("launch", session.launch_tick)
+  barrier.call("corpses", corpses.tick)  -- the map's corpses marked once after loading (corpses.lua)
   barrier.call("shot_hold", console.hold_tick)
+  -- The garbage collector's work, once a tick after the rest (gc_pace.lua; `/f3d-perf gc_pace`).
+  profile.run("gc", barrier.call, "gc", gc_pace.tick, perf.on("gc_pace"))
   barrier.call("profile", profile.end_tick)
 end)
 
 tracker.register()
 puppet.register()
 combat.register()
--- on_object_destroyed takes one handler: shots' projectiles and tracker's rolling stock ghosts.
+-- on_object_destroyed takes one handler: shots' projectiles, tracker's rolling stock ghosts, characters' corpses.
 script.on_event(defines.events.on_object_destroyed, function(event)
   shots.on_object_destroyed(event)
   tracker.on_object_destroyed(event)
+  barrier.call("corpses", corpses.on_object_destroyed, event)
 end)
 research.register()
 map.register()
+lod.register()
 planets.register()
 trains.register()
 script.on_event(defines.events.on_console_chat, ui_actions.on_console_chat)
@@ -160,7 +198,9 @@ local function admins_only(fn)
       end
       return
     end
-    return barrier.call("/" .. tostring(cmd.name), fn, cmd)
+    local r = barrier.call("/" .. tostring(cmd.name), fn, cmd)
+    gc_pace.guard()  -- the heap's ceiling between ticks (gc_pace.lua)
+    return r
   end
 end
 commands.add_command("f3d-status", { "command-help.f3d-status" }, admins_only(session.status_command))

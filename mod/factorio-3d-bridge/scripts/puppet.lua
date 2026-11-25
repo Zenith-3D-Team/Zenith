@@ -493,6 +493,7 @@ end
 function M.reset()
   local s = storage.f3d
   s.walk = nil
+  s.me_now = nil
   s.mining = nil
   s.mine_at = nil
   s.pickup = nil
@@ -549,18 +550,33 @@ function M.walk(cmd)
   if d and d >= 16 then
     d = -1
   end
+  local prev = s.walk
+  local was_going = prev and game.tick <= prev.until_tick
+  local prev_d = was_going and prev.dir or -1
+  local prev_a = was_going and prev.angle or nil
   if a and a >= 0 and a < 1000 and (not d or d >= 0) then
     local w = s.walk
     local going = w and w.angle and game.tick <= w.until_tick
-    s.walk = { dir = w and w.dir or walk_direction(math.floor(a * 16 / 1000 + 0.5)), angle = math.floor(a),
+    local ang = math.floor(a)
+    s.walk = { dir = w and w.dir or walk_direction(math.floor(a * 16 / 1000 + 0.5)), angle = ang,
       err = going and w.err or 0, until_tick = game.tick + HOLD_TICKS,
       -- Where the character stood at the last step and what that step was, kept across the
       -- repeated walk commands, so a step a wall stopped is seen (angle_step).
       lx = going and w.lx or nil, ly = going and w.ly or nil,
       last = going and w.last or nil, stuck = going and w.stuck or nil, moved = going and w.moved or nil }
+    if not was_going or prev_a ~= ang then
+      s.me_now = true
+    end
   elseif d and d >= 0 then
-    s.walk = { dir = walk_direction(d), until_tick = game.tick + HOLD_TICKS }
+    local nd = walk_direction(d)
+    s.walk = { dir = nd, until_tick = game.tick + HOLD_TICKS }
+    if not was_going or prev_a ~= nil or prev_d ~= nd then
+      s.me_now = true
+    end
   elseif s.walk then
+    if was_going then
+      s.me_now = true
+    end
     s.walk.until_tick = 0
   end
 end
@@ -935,7 +951,7 @@ local function finish_mining_now(c, e, force)
     return false, "Inventory full"
   end
   if removal and not e.valid then
-    transport.send_reliable(removal)
+    transport.send_reliable_priority(removal, math.floor(removal.x / 8192), math.floor(removal.y / 8192))
   end
   return true
 end
@@ -1181,7 +1197,7 @@ local function send_inventory(c, s)
   local sig = table.concat(parts, ",")
   if sig ~= s.inv_sig then
     s.inv_sig = sig
-    transport.send_reliable({ t = "inv", l = list })
+    transport.send_reliable_priority({ t = "inv", l = list })
   end
 end
 
@@ -1648,6 +1664,7 @@ function M.tick()
   local s = storage.f3d
   local c = M.get()
   if not c then
+    s.me_now = nil
     if game.tick % DEAD_INTERVAL == 0 then
       send_dead(s)
     end
@@ -1659,7 +1676,8 @@ function M.tick()
   tick_walk(c, s)
   tick_mining(c, s)
   tick_pickup(c, s)
-  if game.tick % STATE_INTERVAL == 0 then
+  if game.tick % STATE_INTERVAL == 0 or (s.me_now and perf.on("prio_queue")) then
+    s.me_now = nil
     send_state(c, s)
   end
   if game.tick % INVENTORY_INTERVAL == 0 then

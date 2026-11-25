@@ -4,7 +4,7 @@
 // surface whose glass is in its picture's alpha, and its opaque pixels (the liquid, the cap) still write depth and
 // cast shadow, only the see-through ones blend. `--item-glass=dither`: not used.
 shader_type spatial;
-render_mode world_vertex_coords, blend_mix, depth_prepass_alpha, cull_back;
+render_mode blend_mix, depth_prepass_alpha, cull_back;
 
 #define ITEM_OWN
 #define ITEM_BLEND

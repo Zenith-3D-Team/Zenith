@@ -10,6 +10,8 @@ render_mode cull_back, specular_schlick_ggx;
 
 #include "res://shaders/noise.gdshaderinc"
 #include "res://shaders/pollution.gdshaderinc"
+#include "res://shaders/lamp_light.gdshaderinc"
+#include "res://shaders/weather_surface.gdshaderinc"
 
 uniform vec3 sky_tint : source_color = vec3(0.50, 0.62, 0.72);
 uniform vec3 foam_color : source_color = vec3(0.86, 0.90, 0.90);
@@ -60,6 +62,7 @@ void fragment() {
 	vec3 b = noised(p * 1.3 + vec2(-t * 0.17, t * 0.12) + 13.1);
 	vec3 c = noised(p * 3.4 + vec2(t * 0.31, -t * 0.23) + 47.9);
 	vec2 grad = ripple * (a.yz * 0.45 * 0.30 + b.yz * 1.3 * 0.11 + c.yz * 3.4 * 0.035);
+	grad += weather_water_ripples(p, length(VERTEX)) * 0.55;
 	vec3 n = normalize(vec3(-grad.x, 1.0, -grad.y));
 	NORMAL = normalize((VIEW_MATRIX * vec4(n, 0.0)).xyz);
 
@@ -116,6 +119,7 @@ void fragment() {
 	if (textured) foam = 0.0;
 
 	ALBEDO = mix(col, foam_color, foam * 0.65);
+	EMISSION = lamp_light_emission(ALBEDO, p, 0.0, 1.0) * 0.85;
 	// Specular anti-aliasing (Tokuyoshi and Kaplanyan): where the ripples' normal changes faster than
 	// a pixel shows, the highlight widens instead of the sun glinting off one pixel at hundreds of
 	// times the water's brightness, which sparkled and, through the looks' sharpening, left black

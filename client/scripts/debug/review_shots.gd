@@ -15,6 +15,8 @@ extends Node
 ## each side (north.png is the view from the north), a low side view and a close perspective one,
 ## each cropped to the box's outline on screen.
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## yaw, pitch, distance for a 3-tile model (scaled to the box), orthographic; the cameras the
 ## owner's review set uses (model brief). "factorio" is Factorio's own view and zoom.
 const VIEWS := {
@@ -41,14 +43,14 @@ var fly_path := ""
 
 
 static func requested() -> bool:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--review-shots="):
 			return true
 	return false
 
 
 func _ready() -> void:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--review-shots="):
 			var spec := arg.get_slice("=", 1)
 			out_dir = spec.get_slice("@", 0)

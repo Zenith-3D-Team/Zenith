@@ -2,85 +2,43 @@
 
 <p align="center"><img src="client/assets/branding/logo.png" alt="Zenith" width="640"></p>
 
-Play your real Factorio game in 3D, with an angled camera close to your
-character and a 3D model for every entity.
+Play your real Factorio game in 3D, with an angled camera close to your character and a 3D model for every entity.
 
-This isn't a remake. Factorio itself still runs the game, unchanged, as a headless server with
-no window. A bridge mod streams the live game state to a separate 3D client built in Godot 4.
-The client draws it and sends your input back. Saves, research, belts, trains, biters and Space
-Age all work the way the real game does them, because the real game is the one doing them.
+This isn't a remake. Factorio 2.1 still runs the game, unchanged, as a headless server with no window. A bridge mod streams live game state to a separate Godot 4.7+ 3D client, which renders the world and sends your input back. Saves, research, belts, trains, biters, mods, and Space Age all run natively inside real Factorio.
 
 You need your own copy of Factorio 2.1. Space Age is supported but not required.
 
 ## Download
 
-Get the latest release from the [Releases page](../../releases/latest):
+Get a release from the [Releases page](../../releases/latest):
 
-- **Zenith-<version>-windows.zip** or **Zenith-<version>-linux.zip**: the game. Unzip it anywhere
-  and start `Zenith.exe` (Windows) or `Zenith.x86_64` (Linux); `START HERE.txt` inside says the rest.
-  The bridge mod and the server scripts come with it.
-- **factorio-3d-bridge_<version>.zip**: the bridge mod on its own, for a server you run yourself.
-- Zenith's own add-ons come inside the game's zip: the Cinematic look and the
-  [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) (free camera, tracking
-  shots, timelapses, recording, screenshots on F12), both on, and
-  [Terrain Elevation](https://github.com/unjustodin/Terrain-Elevation)'s hills, off until you switch
-  them on in the Add-ons menu.
+- **`Zenith-<version>-windows.zip`** or **`Zenith-<version>-linux.zip`**: The full client, bundled with the bridge mod and server scripts (`START HERE.txt` inside covers first launch). *(Pre-release `Zenith-0.3.0-dev` builds also include the debug menu and performance benchmark.)*
+- **`factorio-3d-bridge_<version>.zip`**: Standalone bridge mod for dedicated servers or single-player hybrid mode.
+- **Bundled add-ons & packs:** Releases ship with **Cinematic shaders**, **Cinematic camera** ([repo](https://github.com/unjustodin/Zenith-Cinematic-Camera)), **Immersive Weather** (dynamic sky, rain, puddles, lightning), **Immersive Enemies** (ragdolls, gore, acid), and **Terrain Elevation** ([repo](https://github.com/unjustodin/Terrain-Elevation)), all on by default. Builds can also bundle Vasillo's textured PBR **Zenith** model pack (`models/Zenith.zip`).
 
 ## What works today
 
-- **Your own saves.** Load any save from the main menu: the client copies it, starts headless
-  Factorio and takes over your save's character, with its inventory, armour and logistic
-  requests. Your original save is never touched.
-- **Factorio's interface, rebuilt in 3D.** The inventory, crafting, machine screens, research,
-  map and minimap, blueprints and planners, the circuit network, train schedules, logistics,
-  Factoriopedia, alerts and tooltips. They are drawn with Factorio's own GUI art and fonts from
-  your install, and use Factorio's hotkeys.
-- **A 3D model for every entity** in the base game and Space Age, over 400 files with their variants. Belts,
-  inserters, walls, logistic chests, the character and biters are converted from the 3D-printable
-  models Wube released. 39
-  base-game buildings and vehicles (assemblers, furnaces, chests, power, oil, trains and more) use
-  the textured models of [FUE5](https://github.com/FUE5BASE/FUE5), the fan remake of Factorio in
-  Unreal Engine 5. Everything else is modelled to match Factorio's own sprites, and coloured from them.
-- **The world, live.** Items ride the belts, inserters swing, machines animate, trains and cars
-  drive, biters attack and turrets fire. Day and night with working lamps. Factorio's own terrain
-  textures, water, cliffs, decoratives, sky and clouds for each planet, and Factorio's sounds
-  played by its own rules.
-- **Space Age.** Space platforms, travel between planets, Vulcanus, Fulgora, Gleba and Aquilo,
-  quality and spoilage.
+- **Your own saves:** Load any save from the menu; Zenith copies it, starts headless Factorio, and takes over your save's character with its inventory, armour, quickbar, and logistic requests without modifying your original save.
+- **Factorio's interface in 3D:** Inventory, crafting, machine screens, research, map and minimap, blueprints and planners, circuit networks, train schedules, logistics, Factoriopedia, alerts, and tooltips—drawn with Factorio's own UI art and fonts from your install, matching Factorio 2.1 bindings.
+- **Full 3D entity & item coverage:** Over **800 `.glb` files** across built-in **FUE5 (Adapted)**, **Wube3DP (Adapted)**, and **Placeholders** packs (plus 198 3D item meshes, optional Vasillo PBR packs, and Factorio 2D sprite cutouts).
+- **Megabase simulation & scaling:** Client-side belt and worker-robot simulation accelerated by a native C++ GDExtension (`client/native/belt_sim/`), compact binary wire frames (`v1–5`), **Distant Horizon** 2.5D terrain/factory rendering out to 512 chunks, **AMD FSR 2.2**, per-pack PBR shading, and automatic **Hold 60 UPS** throttling.
+- **Space Age & multiplayer:** Space platforms, rocket rides, Vulcanus, Fulgora, Gleba, Aquilo, quality, spoilage, local multi-client (`1–8` players), regular Factorio `Ctrl+F9` window handoff, and LAN play via `server/relay.py`.
 
-Press **F6** at any time to jump to Factorio's own camera angle for comparison.
+Press **F6** at any time to snap to Factorio's 2D camera angle for comparison, or **F5** for first-person mode.
 
 ## What still needs work
 
-This is an early release, and it still has rough edges:
+- Some built-in models still differ from Factorio's sprites in shape or colour ([docs/ASSET-INVENTORY.md](docs/ASSET-INVENTORY.md)), and FUE5 models are missing a few moving parts and glow effects. Model refiners can follow [docs/MODELLERS.md](docs/MODELLERS.md).
+- Dense forests and extreme view distances remain the heaviest GPU cost; 3D ground clutter (`C14`) and last UI parity details are open.
+- Single-player **hybrid mode** (attaching directly to a windowed Factorio instance) works, but has had less testing than headless server mode.
+- Field-tested on Windows 11 with Factorio 2.1.23 / 2.1.24; the Linux client export has not been play-tested extensively yet.
 
-- Some models still differ from Factorio's sprites in shape or colour (the inventory in
-  [docs/ASSET-INVENTORY.md](docs/ASSET-INVENTORY.md) says which), and several animations haven't
-  been watched against a real game yet.
-- Big bases are heavy. Zenith holds the game at 60 UPS by asking for less when it has to, and
-  walking around a large save is mostly smooth now, but dense forests and long view distances
-  still cost the graphics card a lot.
-- FUE5's models follow older Factorio designs in places, and a few of their moving parts aren't
-  back yet.
-- The models will keep improving: I'm working with 3D modellers (David, who also made Zenith's
-  logo, among them) to refine them a few at a time, worst first, and each release ships the ones
-  finished since the last.
-  [docs/MODELLERS.md](docs/MODELLERS.md) is the guide for anyone making them.
-- Single-player "hybrid" mode, where the 3D client attaches to a normal Factorio window, has
-  been played once, side by side, but not tried much yet.
-- It's only been tested on Windows 11 with Factorio 2.1.23 and 2.1.24.
-
-Known bugs are on the issue tracker.
+Detailed tracking lives in [STATUS.md](STATUS.md) and [PROGRESS.md](PROGRESS.md).
 
 ## Quick start
 
-Players: [download a release](../../releases/latest), unzip it and start Zenith. Its main menu
-makes or loads a world and starts Factorio for you; [docs/USER-GUIDE.md](docs/USER-GUIDE.md) has the
-rest.
-
-From the source: open `client/project.godot` in Godot 4.4+ and press F5 for the same main menu. With
-no Factorio at hand, run `python3 tools/mock_server.py` first for a fake world.
-[docs/RUNNING.md](docs/RUNNING.md) has the details, the tests and running a server yourself.
+- **Players:** [Download a release](../../releases/latest), unzip it, and launch Zenith. See [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
+- **Developers from source:** Import assets once (`godot --headless --audio-driver Dummy --path client --import`), then run `godot --path client` (or press `F5` in Godot 4.7+). Without Factorio, run `python3 tools/mock_server.py` first. See [docs/RUNNING.md](docs/RUNNING.md).
 
 ## Why I made this
 
@@ -124,65 +82,30 @@ Hurricane and Nuke, converted to Zenith's scale and kept under their licence.
 
 ## Where it's going
 
-**Open source, one maintainer.** The code is GPL-3.0 and you're welcome to fork it, but
-Zenith stays a personal project: I don't take pull requests or feature requests. Bug reports are
-welcome. [CONTRIBUTING.md](CONTRIBUTING.md) has notes for working on a fork; you don't need
-Factorio for most client work, since a mock server plays a fake game.
-
-**Your own models, add-ons and mods.** Today:
-- Every model comes from a model pack, like a texture pack: Zenith's own three (FUE5, Wube3DP and
-  Placeholders), folders or `.zip`s in the `models` folder beside Zenith, or your own folder
-  (`--models=/path/to/folder`, and `--models-first` to win over every pack). Any `.glb` named after
-  a prototype in a higher pack replaces that entity's model. The Model packs window orders and
-  switches them, shows each model turning and takes any one from a pack of your choice; a building's
-  window does it for that building alone. Models may bring their own textures.
-- Add-ons: small GDScript programs in a folder of their own that add to the client without
-  forking it, through one versioned API (the camera, keys, windows, the world read-only, events).
-  The first is the [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) for filming (free camera, timelapses, tracking
-  shots, paths, recording).
-  [docs/ADDONS.md](docs/ADDONS.md) is for add-on authors.
-- The menu's Mods window runs other Factorio mods on the server. Their entities appear as boxes
-  sized and coloured from the game until someone models them. Nobody has tried a big overhaul
-  mod yet.
-
-Next for modding: model packs for other mods, their icons, and more hooks as add-ons need them.
-[MODDING.md](MODDING.md) covers what works today, how other mods behave, and what's planned.
-
-**Roadmap.** Six goals worked on side by side, in priority order: stability, performance, the
-interface, models and animation, Space Age, and mods and add-ons. Each release carries progress on
-any of them; 1.0 comes when all six are met. [docs/ROADMAP.md](docs/ROADMAP.md) says what each covers.
+- **Open source, single maintainer:** Code is GPL-3.0. Forks are welcome ([CONTRIBUTING.md](CONTRIBUTING.md)), though Zenith does not accept pull requests or feature requests; bug reports are welcome.
+- **Custom models & packs:** Built-in packs (**FUE5**, **Wube3DP**, **Placeholders**, **Factorio**) layer cleanly with custom `.zip`/folder packs (`models/` or `--models=<dir>`). Per-pack PBR shading, custom ground tiles, 3D decoratives, and sound overrides are supported.
+- **Add-ons (API 1.91):** GDScript add-ons hook the camera, keys, shaders, weather, terrain, sound, creatures, read-only world state, custom UI, per-save storage, and optional companion Factorio mods (`api.game`). See [docs/ADDONS.md](docs/ADDONS.md) and `addons-src/`.
+- **Other Factorio mods:** Mods enabled in the Mods window run in real Factorio. Zenith reads mod graphics, icons, terrain tiles, and step sounds via `gfx` so modded items/buildings appear automatically even before custom 3D models exist. See [MODDING.md](MODDING.md).
+- **Roadmap:** Six parallel priority tracks toward `1.0`: Stability, Performance, Interface, Models & Animation, Space Age, and Mods & Add-ons ([docs/ROADMAP.md](docs/ROADMAP.md)).
 
 ## Docs
 
-- [docs/USER-GUIDE.md](docs/USER-GUIDE.md): for players: install, first game, controls, settings
-- [docs/RUNNING.md](docs/RUNNING.md): setup, controls, troubleshooting
-- [ARCHITECTURE.md](ARCHITECTURE.md): how the pieces fit together, for anyone reading the code
-- [docs/PROTOCOL.md](docs/PROTOCOL.md): messages between the mod and the client
-- [docs/ROADMAP.md](docs/ROADMAP.md): the goals to 1.0, their priorities, and how versions are numbered
-- [docs/PLAN.md](docs/PLAN.md): the approach, where each part stands, the art pipeline and risks
-- [docs/ASSET-INVENTORY.md](docs/ASSET-INVENTORY.md): every entity's 3D model, family by family
-- [CONTRIBUTING.md](CONTRIBUTING.md): no pull requests; notes for working on a fork
-- [MODDING.md](MODDING.md): your own models, other Factorio mods, and add-ons
-- [docs/ADDONS.md](docs/ADDONS.md): writing add-ons for the client
-- [docs/MODELLERS.md](docs/MODELLERS.md): making 3D models for Zenith (what each model needs, belts, pipes and other pieces)
+- **Players:** [USER-GUIDE.md](docs/USER-GUIDE.md) (setup, controls, settings, packs) · [RUNNING.md](docs/RUNNING.md) (headless, hybrid, relay) · [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- **Architecture & reference:** [ARCHITECTURE.md](ARCHITECTURE.md) · [PROTOCOL.md](docs/PROTOCOL.md) · [SWITCHES.md](docs/SWITCHES.md) · [COMMANDS-TESTS.md](docs/COMMANDS-TESTS.md) · [REPO-MAP.md](docs/REPO-MAP.md)
+- **Modding & art:** [MODDING.md](MODDING.md) · [ADDONS.md](docs/ADDONS.md) · [MODELLERS.md](docs/MODELLERS.md) · [ASSET-INVENTORY.md](docs/ASSET-INVENTORY.md)
+- **Planning & contributor notes:** [ROADMAP.md](docs/ROADMAP.md) · [PLAN.md](docs/PLAN.md) · [CONTRIBUTING.md](CONTRIBUTING.md)
 
-```
-mod/factorio-3d-bridge/   Factorio mod: world streaming + a character the client controls
-client/                   Godot 4 project: the 3D client
-server/                   scripts to run headless Factorio with the mod and UDP enabled
-tools/                    mock server (no Factorio needed), protocol checks, tests, model scripts
-docs/                     guides, protocol, plan, asset inventory
+```text
+mod/factorio-3d-bridge/   Factorio 2.1 mod: state streaming, mod graphics (gfx), character control
+client/                   Godot 4.7+ client (GDScript + native C++ GDExtension in client/native/)
+addons-src/               Bundled client add-ons (cinematic shaders, weather, enemies, sprint)
+server/                   Headless Factorio launchers (.ps1 / .sh) and LAN TCP relay (relay.py)
+tools/                    Unified test runner (check.py), mock server, live checks, model & release tools
+docs/                     Player guides, protocol spec, switches, asset inventory, plans & trackers
 ```
 
 ## Licence
 
-The code is free software under the GNU GPL, version 3 ([LICENSE](LICENSE)); add-ons may use any
-licence ([LICENSING.md](LICENSING.md)). Version 0.1.0 was MIT and stays so. You need your own copy of Factorio: the client
-reads Factorio's graphics, sounds and fonts from your install at runtime, and none of Wube's
-assets are in this repository. Models converted from Wube's printable release keep Wube's
-non-commercial licence, those from FUE5 keep theirs (CC BY-NC-SA 3.0), and the logo and icon are
-David's; see
-[CREDITS.md](CREDITS.md).
+Code is GPL-3.0 ([LICENSE](LICENSE)); add-ons may use any licence ([LICENSING.md](LICENSING.md)); `0.1.0` remains MIT. Requires your own Factorio 2.1 install—no Wube graphics, sounds, or fonts are committed. Wube printable conversions, FUE5 models, and logo artwork keep their respective licences ([CREDITS.md](CREDITS.md)).
 
-This is an unofficial fan project. "Factorio" is a trademark of Wube Software; this project is
-not made, endorsed or supported by Wube.
+This is an unofficial fan project. "Factorio" is a trademark of Wube Software; Zenith is not made, endorsed, or supported by Wube.

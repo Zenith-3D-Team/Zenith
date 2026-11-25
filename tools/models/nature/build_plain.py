@@ -47,7 +47,8 @@ def build(name, registry):
     """One model built: (plain_geo.Model, triangles)."""
     import plain_geo
     import trees
-    seed = trees.SEED_AS.get(name, name)
+    import cliffs
+    seed = {**trees.SEED_AS, **cliffs.SEED_AS}.get(name, name)
     m = plain_geo.Model(name, random.Random(zlib.crc32(seed.encode())))
     registry[name](m)
     return m, m.triangles()

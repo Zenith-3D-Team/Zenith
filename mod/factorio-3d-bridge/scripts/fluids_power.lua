@@ -11,15 +11,30 @@ local registry = require("scripts.registry")
 local transport = require("scripts.transport")
 local world = require("scripts.world")
 local rate = require("scripts.rate")
+local budget = require("scripts.budget")
+local perf = require("scripts.perf")
 
 local M = {}
 
 local INTERVAL = 60
 local read_n = 0  -- entities read this run (rate.read)
 local BOXES_PER_MESSAGE = 200
+local SLICE_PRICE = 40
+local MAX_SLICES_PER_TICK = 2
+-- Module-local counters for tests/probes (never in storage).
+M.counts = { runs = 0, slices = 0 }
 
 local function area(f, r)
   return { { f.x - r, f.y - r }, { f.x + r, f.y + r } }
+end
+
+local function strip_area(fx, fy, r, strip, strips)
+  if strips <= 1 then
+    return { { fx - r, fy - r }, { fx + r, fy + r } }
+  end
+  local y0, y1 = fy - r, fy + r
+  local h = (y1 - y0) / strips
+  return { { fx - r, y0 + (strip - 1) * h }, { fx + r, strip == strips and y1 or y0 + strip * h } }
 end
 
 local function send_parts(t, flat, width)
@@ -45,50 +60,57 @@ function M.storages(e)
 end
 
 -- [unit, box, fluid id, amount, capacity, temperature, ...] for every box with fluid in it.
-local function collect_fluids(surface, f, r)
-  local flat = {}
+local function collect_fluids_area(surface, box, flat, seen)
   local types = registry.fluid_types()
   if #types == 0 then
-    return flat
+    return 0
   end
-  local found = surface.find_entities_filtered({ area = area(f, r), type = types })
-  read_n = read_n + #found
+  local found = surface.find_entities_filtered({ area = box, type = types })
+  local rn = #found
   for _, e in pairs(found) do
     local unit = e.unit_number
-    if unit then
-      for i, box in ipairs(M.storages(e)) do
-        local fluid = box.fluid
+    if unit and (not seen or not seen[unit]) then
+      if seen then
+        seen[unit] = true
+      end
+      for i, b in ipairs(M.storages(e)) do
+        local fluid = b.fluid
         if fluid then
           flat[#flat + 1] = unit
           flat[#flat + 1] = i
           flat[#flat + 1] = registry.fluid_id(fluid.name)
           flat[#flat + 1] = math.floor(fluid.amount + 0.5)
-          flat[#flat + 1] = math.floor(box.capacity + 0.5)
+          flat[#flat + 1] = math.floor(b.capacity + 0.5)
           flat[#flat + 1] = math.floor((fluid.temperature or 0) + 0.5)
         end
       end
     end
   end
-  return flat
+  return rn
 end
 
 -- [unit, temperature (whole degrees), ...] for every entity with a heat buffer.
-local function collect_heat(surface, f, r)
-  local flat = {}
+local function collect_heat_area(surface, box, flat, seen)
   local types = registry.heat_types()
   if #types == 0 then
-    return flat
+    return 0
   end
-  local found = surface.find_entities_filtered({ area = area(f, r), type = types })
-  read_n = read_n + #found
+  local found = surface.find_entities_filtered({ area = box, type = types })
+  local rn = #found
   for _, e in pairs(found) do
-    local ok, temperature = pcall(function() return e.temperature end)
-    if e.unit_number and ok and temperature then
-      flat[#flat + 1] = e.unit_number
-      flat[#flat + 1] = math.floor(temperature + 0.5)
+    local unit = e.unit_number
+    if unit and (not seen or not seen[unit]) then
+      if seen then
+        seen[unit] = true
+      end
+      local ok, temperature = pcall(function() return e.temperature end)
+      if ok and temperature then
+        flat[#flat + 1] = unit
+        flat[#flat + 1] = math.floor(temperature + 0.5)
+      end
     end
   end
-  return flat
+  return rn
 end
 
 -- entity_status -> what `pw` says: 0 no power, 1 low power, 2 not connected to any pole.
@@ -159,69 +181,187 @@ M.listeners = {}
 -- with enough power are left out. Also those found unplugged, and {no_fuel, no_ammo, depleted}: the
 -- same read's machines out of fuel and drills with nothing to mine, and a read of the turrets and
 -- burners the electric types leave out (turrets by their ammo inventory, as the alerts' pass).
-local function collect_power(surface, f, r)
-  local flat = {}
-  local warn = { no_fuel = {}, no_ammo = {}, depleted = {} }
+local function collect_power_area(surface, box, flat, unplugged, warn, seen)
+  local rn = 0
   local types = registry.electric_types()
-  if #types == 0 then
-    return flat, {}, warn
-  end
-  local unplugged = {}
   local no_fuel, no_ore = statuses()
-  local found = surface.find_entities_filtered({ area = area(f, r), type = types })
-  read_n = read_n + #found
-  for _, e in pairs(found) do
-    local status = e.status
-    local state = M.power_state(e, status)
-    if e.unit_number and state then
-      flat[#flat + 1] = e.unit_number
-      flat[#flat + 1] = state
-      if state == 2 then
-        unplugged[#unplugged + 1] = e
+  if #types > 0 then
+    local found = surface.find_entities_filtered({ area = box, type = types })
+    rn = rn + #found
+    for _, e in pairs(found) do
+      local unit = e.unit_number
+      if not (unit and seen and seen[unit]) then
+        if unit and seen then
+          seen[unit] = true
+        end
+        local status = e.status
+        local state = M.power_state(e, status)
+        if unit and state then
+          flat[#flat + 1] = unit
+          flat[#flat + 1] = state
+          if state == 2 then
+            unplugged[#unplugged + 1] = e
+          end
+        elseif status == no_fuel then
+          warn.no_fuel[#warn.no_fuel + 1] = e
+        elseif no_ore and status == no_ore then
+          warn.depleted[#warn.depleted + 1] = e
+        end
       end
-    elseif status == no_fuel then
-      warn.no_fuel[#warn.no_fuel + 1] = e
-    elseif no_ore and status == no_ore then
-      warn.depleted[#warn.depleted + 1] = e
     end
   end
   local extra = M.status_types()
   if #extra > 0 then
-    local more = surface.find_entities_filtered({ area = area(f, r), type = extra })
-    read_n = read_n + #more
+    local more = surface.find_entities_filtered({ area = box, type = extra })
+    rn = rn + #more
     local ammo = defines.inventory.turret_ammo
     for _, e in pairs(more) do
-      if e.type == "ammo-turret" then
-        local inv = e.get_inventory(ammo)
-        if inv and inv.is_empty() then
-          warn.no_ammo[#warn.no_ammo + 1] = e
+      local unit = e.unit_number
+      if not (unit and seen and seen[unit]) then
+        if unit and seen then
+          seen[unit] = true
         end
-      elseif e.status == no_fuel then
-        warn.no_fuel[#warn.no_fuel + 1] = e
+        if e.type == "ammo-turret" then
+          local inv = e.get_inventory(ammo)
+          if inv and inv.is_empty() then
+            warn.no_ammo[#warn.no_ammo + 1] = e
+          end
+        elseif e.status == no_fuel then
+          warn.no_fuel[#warn.no_fuel + 1] = e
+        end
       end
     end
   end
-  return flat, unplugged, warn
+  return rn
+end
+
+local function make_job(surface, f, dr)
+  local steps = {}
+  if dr > 0 then
+    local fl_strips = (#registry.fluid_types() > 0 and dr > 32) and 2 or 1
+    for k = 1, fl_strips do
+      steps[#steps + 1] = { "fl", k, fl_strips }
+    end
+    steps[#steps + 1] = { "ht", 1, 1 }
+  end
+  local pw_strips = f.r > 32 and 4 or 2
+  for k = 1, pw_strips do
+    steps[#steps + 1] = { "pw", k, pw_strips }
+  end
+  return {
+    si = surface.index,
+    fx = f.x,
+    fy = f.y,
+    r = f.r,
+    dr = dr,
+    steps = steps,
+    i = 1,
+    read_n = 0,
+    fl = {},
+    ht = {},
+    pw = {},
+    unplugged = {},
+    warn = { no_fuel = {}, no_ammo = {}, depleted = {} },
+    seen_fl = {},
+    seen_ht = {},
+    seen_pw = {},
+  }
+end
+
+local function run_job_step(surface, job)
+  local step = job.steps[job.i]
+  local kind, strip, strips = step[1], step[2], step[3]
+  local rn = 0
+  if kind == "fl" then
+    rn = collect_fluids_area(surface, strip_area(job.fx, job.fy, job.dr, strip, strips), job.fl, job.seen_fl)
+    if strip == strips then
+      send_parts("fl", job.fl, 6)
+    end
+  elseif kind == "ht" then
+    rn = collect_heat_area(surface, strip_area(job.fx, job.fy, job.dr, strip, strips), job.ht, job.seen_ht)
+    if strip == strips then
+      send_parts("ht", job.ht, 2)
+    end
+  elseif kind == "pw" then
+    rn = collect_power_area(surface, strip_area(job.fx, job.fy, job.r, strip, strips),
+      job.pw, job.unplugged, job.warn, job.seen_pw)
+  end
+  job.read_n = job.read_n + rn
+  job.i = job.i + 1
+  M.counts.slices = M.counts.slices + 1
+  return rn
 end
 
 function M.tick()
-  if not rate.due("fp", INTERVAL) then
+  local s = storage.f3d
+  local surface = world.surface()
+  if not perf.on("fluids_budget") then
+    s.fp_job = nil
+    if not rate.due("fp", INTERVAL) then
+      return
+    end
+    local r = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
+    read_n = 0
+    if r > 0 then
+      local fl, ht = {}, {}
+      read_n = read_n + collect_fluids_area(surface, area(s.focus, r), fl, nil)
+      send_parts("fl", fl, 6)
+      read_n = read_n + collect_heat_area(surface, area(s.focus, r), ht, nil)
+      send_parts("ht", ht, 2)
+    end
+    local flat, unplugged, warn = {}, {}, { no_fuel = {}, no_ammo = {}, depleted = {} }
+    read_n = read_n + collect_power_area(surface, area(s.focus, s.focus.r), flat, unplugged, warn, nil)
+    send_parts("pw", flat, 2)
+    for _, fn in ipairs(M.listeners) do
+      read_n = read_n + (fn(surface.index, s.focus, s.focus.r, unplugged, warn) or 0)
+    end
+    rate.read("fp", read_n)
+    M.counts.runs = M.counts.runs + 1
     return
   end
-  local s = storage.f3d
-  local r = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
-  local surface = world.surface()
-  read_n = 0
-  if r > 0 then
-    send_parts("fl", collect_fluids(surface, s.focus, r), 6)
-    send_parts("ht", collect_heat(surface, s.focus, r), 2)
+
+  local job = s.fp_job
+  if job and job.si ~= surface.index then
+    job, s.fp_job = nil, nil
   end
-  local flat, unplugged, warn = collect_power(surface, s.focus, s.focus.r)
-  send_parts("pw", flat, 2)
+  local started_now = false
+  if not job then
+    if not rate.due("fp", INTERVAL) then
+      return
+    end
+    local dr = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
+    job = make_job(surface, s.focus, dr)
+    s.fp_job = job
+    started_now = true
+  end
+
+  local did = 0
+  while job.i <= #job.steps do
+    local rn = run_job_step(surface, job)
+    did = did + 1
+    if not started_now and rn > 0 then
+      budget.spend(math.max(1, math.floor(rn * 0.14)), "fp")
+    end
+    if job.i > #job.steps or did >= MAX_SLICES_PER_TICK then
+      break
+    end
+    if rn > 0 and not budget.can(SLICE_PRICE, "fp", 0.25) then
+      break
+    end
+  end
+
+  if job.i <= #job.steps then
+    return
+  end
+  send_parts("pw", job.pw, 2)
+  local total_read = job.read_n
+  local f = { x = job.fx, y = job.fy }
   for _, fn in ipairs(M.listeners) do
-    read_n = read_n + (fn(surface.index, s.focus, s.focus.r, unplugged, warn) or 0)
+    total_read = total_read + (fn(surface.index, f, job.r, job.unplugged, job.warn) or 0)
   end
-  rate.read("fp", read_n)
+  rate.read("fp", total_read)
+  s.fp_job = nil
+  M.counts.runs = M.counts.runs + 1
 end
 
 return M

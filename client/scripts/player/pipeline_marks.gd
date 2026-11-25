@@ -31,8 +31,9 @@ const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const FluidsPowerLayer := preload("res://scripts/world/fluids_power.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
+const Switches := preload("res://scripts/switches.gd")
 
-static var on := not ("--pipeline-vis=off" in OS.get_cmdline_user_args())
+static var on := Switches.on("--pipeline-vis")
 
 ## What a pipeline is made of in the client; anything else with fluid (pumps, machines) ends it.
 const PIPE_TYPES := ["pipe", "infinity-pipe", "pipe-to-ground", "storage-tank"]

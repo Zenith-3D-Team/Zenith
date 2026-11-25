@@ -43,8 +43,10 @@ const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MoverRecords := preload("res://scripts/world/mover_records.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const Settings := preload("res://scripts/menu/settings.gd")
 const MoverShader := preload("res://shaders/factorio_material_mover.gdshader")
 const MoverAlphaShader := preload("res://shaders/factorio_material_mover_alpha.gdshader")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## Tiles walked per loop of the run animation (Factorio's distance_per_frame x 16 frames).
 const LOOP_DISTANCE := {
@@ -247,6 +249,17 @@ var _warm := 0
 const WARM_MODEL := "small-biter-corpse"
 var _puddle_task := -1  # loading the puddles' sheet on a worker thread; -2 once done
 var _puddle_images: Array = []  # what that task made, one per variation
+var _mv_active := false
+## Optional hook called when a creature dies (addon_host.gd / api.creatures.died):
+## receives mutable Dictionary {unit, name, pos, yaw, vel, scale, phase, cause_pos, damage_type, dmg, src, handled}.
+## If a listener sets info["handled"] = true, _collapse and the default corpse are skipped.
+var on_died_hook := Callable()
+var _pending_death := {}  # unit -> [cause_pos: Variant, damage_type: String, dmg: int, src: String]
+var _anim_enabled := false
+var _overrides := {}  # unit -> Dictionary {pitch, roll, yaw_offset, offset, gait_mul, bite_mul, until}
+var _wounds := {}  # unit -> float (packed negative INSTANCE_CUSTOM.b; absent/0 when healthy)
+var _model_gen := -1
+var _source_meshes := {}  # model name -> Mesh last seen from ModelLibrary.mesh_for
 
 
 func clear() -> void:
@@ -264,6 +277,10 @@ func clear() -> void:
 	_cells.clear()
 	_dying.clear()
 	_attacks.clear()
+	_pending_death.clear()
+	_overrides.clear()
+	_wounds.clear()
+	_mv_active = false
 
 
 func count() -> int:
@@ -286,7 +303,7 @@ func add(unit: int, name: String, node: Node3D, slot := -1) -> void:
 	c.slot = slot
 	c.at = node.position
 	_creatures[unit] = c
-	if slot >= 0:
+	if slot >= 0 and not _wounds.has(unit):
 		_walk(c)
 	else:
 		_posed[unit] = c
@@ -374,11 +391,16 @@ func _unwalk(c: Creature) -> void:
 
 ## A GPU creature starts to be posed here (it attacks): from where its record draws it now.
 func _pose(c: Creature) -> void:
+	var prev_slot := c.slot
 	_unwalk(c)
 	var xf := _pose_now(c)
 	c.last = xf.origin
 	c.yaw = xf.basis.get_euler().y
-	c.speed = 0.0
+	if prev_slot >= 0 and records != null:
+		var st: Dictionary = records.state(prev_slot)
+		c.speed = maxf(float(st.get("speed", 0.0)), float(st.get("average", 0.0)))
+	else:
+		c.speed = 0.0
 	_posed[c.unit] = c
 
 
@@ -387,6 +409,18 @@ func _pose_now(c: Creature) -> Transform3D:
 	if c.slot >= 0 and records != null:
 		return Transform3D(Basis(Vector3.UP, records.yaw_at(c.slot, records.tick)), records.position(c.slot))
 	return c.node.transform
+
+
+## Marks `mesh`'s materials to be lifted whole onto the hills by the ground under the model's origin
+## (factorio_material.gdshaderinc ground_rigid), as a mover is, so it doesn't bend over a cliff's step.
+## Its view LODs share these materials. Only a mover's own model: buildings keep the lift per vertex.
+static func mark_rigid(mesh: Mesh) -> void:
+	if mesh == null:
+		return
+	for i in mesh.get_surface_count():
+		var m := mesh.surface_get_material(i) as ShaderMaterial
+		if m != null:
+			m.set_shader_parameter("ground_rigid", true)
 
 
 ## The model's copy whose materials use the mover shader (its walkers drawn from their records), made
@@ -398,6 +432,7 @@ func _mover_mesh(model: String) -> ArrayMesh:
 	if not pose_source.is_valid() or not ModelLibrary.ready(model):
 		return null
 	var mesh := ModelLibrary.mesh_for(model) as ArrayMesh
+	_source_meshes[model] = mesh
 	var base := CreatureModels.base_model(model)
 	var out: ArrayMesh = null
 	if mesh != null and CreatureModels.rig(model if base == "" else base).get("mode", "") == "walk":
@@ -479,16 +514,171 @@ func attacks_reported() -> bool:
 	return _en_seen
 
 
+## Stores cause_pos, damage_type, dmg, and src from `died` right before movers.remove(unit) calls remove(unit, true).
+func set_pending_death(unit: int, cause_pos: Variant, damage_type: String, dmg := 0, src := "") -> void:
+	_pending_death[unit] = [cause_pos, damage_type, dmg, src]
+
+
+func clear_pending_death(unit: int) -> void:
+	_pending_death.erase(unit)
+
+
+## Prototype name of a live creature `unit`, or "".
+func name_of(unit: int) -> String:
+	var c: Creature = _creatures.get(unit)
+	return c.name if c != null else ""
+
+
+## Places a Factorio blood puddle decal at `pos` (without a corpse mesh).
+func add_blood_puddle(pos: Vector3, scale := 1.0) -> void:
+	_add_corpse("", Transform3D(Basis.IDENTITY, Vector3(pos.x, 0.0, pos.z)), randi() % PUDDLE_VARIATIONS, maxf(scale, 0.05), CORPSE_SECONDS)
+
+
+## Enables or disables live per-unit animation overrides (api.creatures.set_anim_enabled).
+## When disabled, GPU walkers stay 100% on the GPU path with zero per-frame CPU overhead.
+func set_anim_enabled(on: bool) -> void:
+	_anim_enabled = on
+	if not on:
+		_overrides.clear()
+
+
+## Sets live visual wound state (blood 0..1, hits 0..8) for `unit`, promoting wounded units out of
+## GPU-walker mode cleanly while wounded so the shader receives packed INSTANCE_CUSTOM.b.
+## Pass blood <= 0 and hits <= 0 to clear.
+func set_unit_wounds(unit: int, blood: float, hits: int) -> void:
+	var b := clampf(blood, 0.0, 1.0)
+	var h := clampi(hits, 0, 8)
+	var c: Creature = _creatures.get(unit)
+	if b <= 0.001 and h <= 0:
+		_wounds.erase(unit)
+		if c != null:
+			c.drawn = PackedFloat32Array()
+		return
+	_wounds[unit] = -(1.0 + float(h) * 2.0 + b)
+	if c != null:
+		c.drawn = PackedFloat32Array()
+		if c.walker != null:
+			_pose(c)
+
+
+## Clears all live per-unit wound states so non-attacking units return to the GPU-walker path.
+func clear_wounds() -> void:
+	if _wounds.is_empty():
+		return
+	for unit in _wounds.keys():
+		var c: Creature = _creatures.get(unit)
+		if c != null:
+			c.drawn = PackedFloat32Array()
+	_wounds.clear()
+
+
+## Sets a temporary live override for `unit` (pitch, roll, yaw_offset, offset, gait_mul, bite_mul, ttl).
+func set_unit_override(unit: int, data: Dictionary) -> void:
+	if data.is_empty():
+		_overrides.erase(unit)
+		return
+	var raw_off: Variant = data.get("offset", Vector3.ZERO)
+	var offset: Vector3 = raw_off if raw_off is Vector3 else Vector3.ZERO
+	_overrides[unit] = {
+		"pitch": float(data.get("pitch", 0.0)),
+		"roll": float(data.get("roll", 0.0)),
+		"yaw_offset": float(data.get("yaw_offset", 0.0)),
+		"offset": offset,
+		"gait_mul": maxf(float(data.get("gait_mul", 1.0)), 0.0),
+		"bite_mul": maxf(float(data.get("bite_mul", 1.0)), 0.0),
+		"until": _clock + maxf(float(data.get("ttl", 0.25)), 0.01),
+	}
+	if _anim_enabled:
+		var c: Creature = _creatures.get(unit)
+		if c != null and c.walker != null:
+			_pose(c)
+
+
+## Lists live creatures whose prototype name contains `prefix` (or all when `prefix == ""`).
+func list_live(prefix := "") -> Array:
+	var out: Array = []
+	for c: Creature in _creatures.values():
+		if prefix != "" and not c.name.contains(prefix):
+			continue
+		var pos := Vector3.ZERO
+		var yw := 0.0
+		var spd := 0.0
+		if c.slot >= 0 and c.walker != null and records != null:
+			var st: Dictionary = records.state(c.slot)
+			pos = st["pos"]
+			yw = float(st["yaw"])
+			spd = float(st["speed"])
+		else:
+			var xf := _pose_now(c)
+			pos = xf.origin
+			yw = c.yaw if c.attacking else xf.basis.get_euler().y
+			spd = c.speed
+		out.append({
+			"unit": c.unit,
+			"name": c.name,
+			"pos": pos,
+			"yaw": yw,
+			"speed": spd,
+			"attacking": c.attacking,
+			"scale": _scale_of(c.name),
+		})
+	return out
+
+
 ## `died`: it collapses where it was, then leaves its corpse.
-func remove(unit: int, died := false) -> void:
+func remove(unit: int, died := false, cause_pos: Variant = null, damage_type := "", dmg := 0, src := "") -> void:
 	var c: Creature = _creatures.get(unit)
 	if c == null:
+		_wounds.erase(unit)
 		return
 	_creatures.erase(unit)
 	_posed.erase(unit)
 	_attacks.erase(unit)
+	_overrides.erase(unit)
+	_wounds.erase(unit)
+	if died and _pending_death.has(unit):
+		var pd: Array = _pending_death[unit]
+		_pending_death.erase(unit)
+		if cause_pos == null:
+			cause_pos = pd[0]
+		if damage_type == "":
+			damage_type = str(pd[1])
+		if dmg == 0 and pd.size() > 2:
+			dmg = int(pd[2])
+		if src == "" and pd.size() > 3:
+			src = str(pd[3])
 	var xform := _pose_now(c)
+	var yw := c.yaw if c.attacking else xform.basis.get_euler().y
+	var vel := Vector3(-sin(yw), 0.0, -cos(yw)) * c.speed
+	var ph := c.phase
+	if c.slot >= 0 and records != null:
+		var st: Dictionary = records.state(c.slot)
+		var spd := maxf(float(st.get("speed", 0.0)), maxf(float(st.get("average", 0.0)), c.speed))
+		if not c.attacking:
+			yw = float(st.get("yaw", yw))
+		vel = Vector3(-sin(yw), 0.0, -cos(yw)) * spd
+		var k: Vector4 = st.get("kind", Vector4.ZERO)
+		if k.y > 0.0:
+			ph = fposmod(k.x + k.y * float(st.get("walked", 0.0)), TAU)
 	_unwalk(c)
+	if died and on_died_hook.is_valid():
+		var info := {
+			"unit": unit,
+			"name": c.name,
+			"pos": xform.origin,
+			"yaw": yw,
+			"vel": vel,
+			"scale": _scale_of(c.name),
+			"phase": ph,
+			"cause_pos": cause_pos,
+			"damage_type": damage_type,
+			"dmg": dmg,
+			"src": src,
+			"handled": false,
+		}
+		on_died_hook.call(info)
+		if bool(info.get("handled", false)):
+			return
 	if died and _has_model(c.name + "-corpse"):
 		var d := Dying.new()
 		d.name = c.name
@@ -503,9 +693,27 @@ func remove(unit: int, died := false) -> void:
 
 ## An enemy that isn't drawn here died (a worm, a spawner): its corpse, if it has a model. Gleba's
 ## spawners first slump into it with their own model over their corpse's dying time.
-func died_at(name: String, at: Vector3) -> void:
+func died_at(name: String, at: Vector3, cause_pos: Variant = null, damage_type := "", unit := 0, dmg := 0, src := "") -> void:
 	if CreatureModels.walks(name) or not _has_model(name + "-corpse"):
 		return
+	if on_died_hook.is_valid():
+		var info := {
+			"unit": unit,
+			"name": name,
+			"pos": at,
+			"yaw": 0.0,
+			"vel": Vector3.ZERO,
+			"scale": _scale_of(name),
+			"phase": 0.0,
+			"cause_pos": cause_pos,
+			"damage_type": damage_type,
+			"dmg": dmg,
+			"src": src,
+			"handled": false,
+		}
+		on_died_hook.call(info)
+		if bool(info.get("handled", false)):
+			return
 	if DYING_SECONDS.has(name) and _has_model(name):
 		var d := Dying.new()
 		d.name = name
@@ -583,6 +791,8 @@ func prewarm() -> void:
 func _process(delta: float) -> void:
 	var t0 := Time.get_ticks_usec()
 	_clock += delta
+	if _model_gen != ModelLibrary.generation:
+		_refresh_models()
 	if _warm == 1 and target != null and not _poll_puddles() and ModelLibrary.ready(WARM_MODEL):
 		_warm = 2
 		# Under the ground below the focus (in view, hidden by the terrain), sinking out of the
@@ -637,6 +847,10 @@ func _process(delta: float) -> void:
 		for unit in _attacks.keys():
 			if _clock - float(_attacks[unit][1]) > ATTACK_HOLD:
 				_attacks.erase(unit)
+	if not _overrides.is_empty() and Engine.get_process_frames() % 60 == 0:
+		for unit in _overrides.keys():
+			if _clock > float((_overrides[unit] as Dictionary)["until"]):
+				_overrides.erase(unit)
 	var t4 := Time.get_ticks_usec()
 	_flush(focus, delta)
 	process_usec = Time.get_ticks_usec() - t0
@@ -682,14 +896,15 @@ func _append_cell(cell: CorpseCell) -> void:
 	var puddled := false
 	for corpse in cell.pending:
 		var puddle := corpse.puddle >= 0 and corpse.puddle < _puddle_meshes.size()
-		if not _has_model(corpse.model) or not cell.layers.has(corpse.model) or not cell.buffers.has(corpse.model) \
-				or (puddle and cell.puddles.size() != _puddle_meshes.size()) or (corpse.puddle >= 0 and _poll_puddles()):
+		var need_model := corpse.model != "" and (not _has_model(corpse.model) or not cell.layers.has(corpse.model) or not cell.buffers.has(corpse.model))
+		if need_model or (puddle and cell.puddles.size() != _puddle_meshes.size()) or (corpse.puddle >= 0 and _poll_puddles()):
 			cell.dirty = true
 			cell.pending.clear()
 			return
 	for corpse in cell.pending:
-		_append_instance(cell.buffers[corpse.model], corpse.xform, 0.0, 0.0)
-		touched[corpse.model] = true
+		if corpse.model != "":
+			_append_instance(cell.buffers[corpse.model], corpse.xform, 0.0, 0.0)
+			touched[corpse.model] = true
 		if corpse.puddle >= 0 and corpse.puddle < _puddle_meshes.size():
 			var at := corpse.xform.origin
 			var k := corpse.size
@@ -720,16 +935,18 @@ func _build_cell(cell: CorpseCell, key: Vector2i) -> void:
 	puddles.resize(PUDDLE_VARIATIONS)
 	var waiting := false
 	for corpse: Corpse in cell.corpses:
-		if not _has_model(corpse.model):
+		var has_mesh := corpse.model != ""
+		if has_mesh and not _has_model(corpse.model):
 			waiting = waiting or not _missing.has(corpse.model)
 			continue
 		waiting = waiting or (puddles_coming and corpse.puddle >= 0)
 		var xf := corpse.xform
 		var sink := clampf((_clock - corpse.born - corpse.life) / CORPSE_SINK, 0.0, 1.0)
 		xf.origin.y -= sink * 0.6
-		if not by_model.has(corpse.model):
-			by_model[corpse.model] = PackedFloat32Array()
-		_append_instance(by_model[corpse.model], xf, 0.0, 0.0)
+		if has_mesh:
+			if not by_model.has(corpse.model):
+				by_model[corpse.model] = PackedFloat32Array()
+			_append_instance(by_model[corpse.model], xf, 0.0, 0.0)
 		if corpse.puddle >= 0 and corpse.puddle < _puddle_meshes.size() and sink < 1.0:
 			var at := corpse.xform.origin
 			var k := corpse.size * (1.0 - sink)
@@ -813,6 +1030,16 @@ func _guess_attacks(delta: float, focus: Vector3) -> void:
 ## Poses a creature for this frame; true when a GPU creature has stopped attacking and walks on its
 ## record again.
 func _step(c: Creature, delta: float, focus: Vector3, reported: bool) -> bool:
+	var ov: Dictionary = {}
+	if _anim_enabled and _overrides.has(c.unit):
+		var entry: Dictionary = _overrides[c.unit]
+		if _clock <= float(entry["until"]):
+			ov = entry
+		else:
+			_overrides.erase(c.unit)
+	var gait_mul := float(ov.get("gait_mul", 1.0))
+	var bite_mul := float(ov.get("bite_mul", 1.0))
+	var wound := float(_wounds.get(c.unit, 0.0))
 	var xf := _pose_now(c)
 	var pos := xf.origin
 	var moved := Vector2(pos.x - c.last.x, pos.z - c.last.z).length()
@@ -820,7 +1047,7 @@ func _step(c: Creature, delta: float, focus: Vector3, reported: bool) -> bool:
 	var speed := moved / maxf(delta, 0.0001)
 	c.speed = lerpf(c.speed, speed, 1.0 - exp(-delta * 10.0))
 	var loop: float = LOOP_DISTANCE.get(c.name, DEFAULT_LOOP)
-	c.phase = fposmod(c.phase + (moved / loop + IDLE_LOOPS * delta) * TAU, TAU)
+	c.phase = fposmod(c.phase + (moved / loop * gait_mul + IDLE_LOOPS * delta) * TAU, TAU)
 	c.still = c.still + delta if c.speed < STILL_SPEED else 0.0
 	var family := "spitter" if c.name.contains("spitter") else "biter"
 	var at: Variant = null  # the target's position while attacking
@@ -832,12 +1059,14 @@ func _step(c: Creature, delta: float, focus: Vector3, reported: bool) -> bool:
 		at = focus
 	if at == null:
 		c.attacking = false
-		if c.slot >= 0:
+		if c.slot >= 0 and ov.is_empty() and wound == 0.0:
 			return true
-		var gait := clampf(c.speed / 1.5, 0.0, 1.0)
+		var gait := clampf(c.speed / 1.5 * gait_mul, 0.0, 1.0)
 		# The body bobs twice a loop, once per step of each tripod.
 		xf.origin.y += absf(sin(c.phase)) * 0.025 * gait * _scale_of(c.name)
-		_push(look_of(c.unit), xf, c.phase, maxf(gait, 0.15))
+		if not ov.is_empty():
+			xf = _apply_override(xf, ov)
+		_push(look_of(c.unit), xf, c.phase, maxf(gait, 0.15), 1.0, wound)
 		return false
 	if not c.attacking:
 		c.attacking = true
@@ -870,14 +1099,19 @@ func _step(c: Creature, delta: float, focus: Vector3, reported: bool) -> bool:
 			if c.lunge < seconds:
 				amount = _bite_amount(c.lunge / seconds, WRIGGLER_STRIKE_TOP, WRIGGLER_STRIKE_BACK) if wriggler \
 					else _bite_amount(c.lunge / seconds)
-			xf = _posed_body(xf, pose_model, amount, size)
-			_push(c.name, xf, c.phase, 0.0, _pose_code(pose_model, amount))
+			var posed_amount := clampf(amount * bite_mul, 0.0, 1.35)
+			xf = _posed_body(xf, pose_model, posed_amount, size)
+			if not ov.is_empty():
+				xf = _apply_override(xf, ov)
+			_push(c.name, xf, c.phase, 0.0, _pose_code(pose_model, amount * bite_mul), wound)
 			return false
-		var bite := _bite_pulse(c.lunge / seconds) if c.lunge < seconds else 0.0
+		var bite := (_bite_pulse(c.lunge / seconds) if c.lunge < seconds else 0.0) * bite_mul
 		xf.origin += forward * bite * 0.14 * size
 		xf.origin.y += maxf(bite, 0.0) * 0.035 * size
 		xf.basis = xf.basis * Basis(Vector3.RIGHT, -bite * 0.08)
-		_push(pose_model if _has_model(pose_model) else c.name, xf, c.phase, 0.0)
+		if not ov.is_empty():
+			xf = _apply_override(xf, ov)
+		_push(pose_model if _has_model(pose_model) else c.name, xf, c.phase, 0.0, 1.0, wound)
 		return false
 	# Spitters brace on their legs, throw the head forward and spit, then settle (Factorio's
 	# attack runs forward then backward). The `-attack` model is that stance, legs planted wide
@@ -895,15 +1129,34 @@ func _step(c: Creature, delta: float, focus: Vector3, reported: bool) -> bool:
 		xf = _posed_body(xf, stance, up, size)
 		xf.origin += forward * spit * 0.06 * size
 		xf.basis = Basis(xf.basis.x.normalized(), spit * 0.06) * xf.basis
-		_push(c.name, xf, c.phase, 0.0, _pose_code(stance, up))
+		if not ov.is_empty():
+			xf = _apply_override(xf, ov)
+		_push(c.name, xf, c.phase, 0.0, _pose_code(stance, up), wound)
 		return false
 	var pivot := -forward * 0.45 * size  # the back legs
 	var reared := rise > SPIT_SWAP and _has_model(c.name + "-attack")
 	var tilt := Basis(xf.basis.x.normalized(), rise * (0.08 if reared else 0.32))
 	xf.origin += pivot - tilt * pivot + forward * spit * 0.06 * size
 	xf.basis = tilt * xf.basis
-	_push(c.name + "-attack" if reared else c.name, xf, c.phase, 0.0)
+	if not ov.is_empty():
+		xf = _apply_override(xf, ov)
+	_push(c.name + "-attack" if reared else c.name, xf, c.phase, 0.0, 1.0, wound)
 	return false
+
+
+static func _apply_override(xf: Transform3D, ov: Dictionary) -> Transform3D:
+	var yaw_off := float(ov["yaw_offset"])
+	var pitch := float(ov["pitch"])
+	var roll := float(ov["roll"])
+	var off: Vector3 = ov["offset"]
+	var rot := Basis.IDENTITY
+	if yaw_off != 0.0:
+		rot = rot * Basis(Vector3.UP, yaw_off)
+	if pitch != 0.0:
+		rot = rot * Basis(Vector3.RIGHT, pitch)
+	if roll != 0.0:
+		rot = rot * Basis(Vector3.BACK, roll)
+	return Transform3D(xf.basis * rot, xf.origin + off)
 
 
 ## The puddles' meshes, made on first use from Factorio's sheet (none without an install). The
@@ -1018,7 +1271,7 @@ func _pick_corpse(d: Dying) -> void:
 		model = d.name + "-corpse"
 	d.corpse = model
 	var origin := d.xform.origin
-	d.xform = Transform3D(Basis(Vector3.UP, -float(dir) / 16.0 * TAU), origin)
+	d.xform = Transform3D(Basis(Vector3.UP, Wire.direction_yaw(dir)), origin)
 
 
 ## How a creature (any tier) falls into its corpse: {at, to: Vector3, turn: Quaternion, scale}
@@ -1147,13 +1400,13 @@ static func _ensure(layer: Layer, n: int) -> void:
 	layer.dirty = true
 
 
-func _push(model: String, xf: Transform3D, phase: float, gait: float, pose := 1.0) -> void:
+func _push(model: String, xf: Transform3D, phase: float, gait: float, pose := 1.0, wound := 0.0) -> void:
 	var layer := _layer(model, _cell_of(xf.origin))
 	if layer == null:
 		return
 	# Appended in place: taking the packed array out into a variable and putting it back copied the
 	# whole buffer for every creature.
-	_append_instance(layer.posed, xf, phase, gait, pose)
+	_append_instance(layer.posed, xf, phase, gait, pose, wound)
 	layer.low = layer.low.min(xf.origin)
 	layer.high = layer.high.max(xf.origin)
 	if _stepping != null:
@@ -1177,14 +1430,14 @@ static func _append_drawn(b: PackedFloat32Array, drawn: PackedFloat32Array) -> v
 	b.append_array(drawn)
 
 
-## MultiMesh buffer: a 3x4 transform (rows) then the custom data (phase, gait, 0, the pose: 1 none,
-## else _pose_code's).
-static func _append_instance(b: PackedFloat32Array, xf: Transform3D, phase: float, gait: float, pose := 1.0) -> void:
+## MultiMesh buffer: a 3x4 transform (rows) then the custom data (phase, gait, wound or 0, the pose:
+## 1 none, else _pose_code's).
+static func _append_instance(b: PackedFloat32Array, xf: Transform3D, phase: float, gait: float, pose := 1.0, wound := 0.0) -> void:
 	var x := xf.basis.x
 	var y := xf.basis.y
 	var z := xf.basis.z
 	var o := xf.origin
-	b.append_array([x.x, y.x, z.x, o.x, x.y, y.y, z.y, o.y, x.z, y.z, z.z, o.z, phase, gait, 0.0, pose])
+	b.append_array([x.x, y.x, z.x, o.x, x.y, y.y, z.y, o.y, x.z, y.z, z.z, o.z, phase, gait, wound, pose])
 
 
 func _new_layer(model: String) -> MultiMeshInstance3D:
@@ -1195,11 +1448,49 @@ func _new_layer(model: String) -> MultiMeshInstance3D:
 	var mesh: Mesh = _mover_meshes.get(model)
 	if mesh == null:
 		mesh = ModelLibrary.mesh_for(model)
+		mark_rigid(mesh)  # drawn by its instance transform: lifted whole by its origin
+	if not _source_meshes.has(model):
+		_source_meshes[model] = ModelLibrary.mesh_for(model)
 	ModelLods.request_view_lods(mesh as ArrayMesh)
 	mm.mesh = ModelLods.lod_copy(mesh) if ModelLods.lod_copy(mesh) != null else mesh
 	mmi.multimesh = mm
 	add_child(mmi)
 	return mmi
+
+
+## Reloads any creature or corpse layer whose underlying ModelLibrary mesh changed (e.g. a model
+## pack switch or add-on transient pack override).
+func _refresh_models() -> void:
+	_model_gen = ModelLibrary.generation
+	_missing.clear()
+	for model: String in _source_meshes.keys():
+		if not ModelLibrary.ready(model):
+			continue
+		var fresh := ModelLibrary.mesh_for(model)
+		if fresh == _source_meshes[model]:
+			continue
+		_source_meshes[model] = fresh
+		_mover_meshes.erase(model)
+		var mover_mesh := _mover_mesh(model)
+		var active_mesh: Mesh = mover_mesh if mover_mesh != null else fresh
+		if active_mesh != null:
+			ModelLods.request_view_lods(active_mesh as ArrayMesh)
+			var lods := ModelLods.lod_copy(active_mesh)
+			var use_mesh: Mesh = lods if lods != null else active_mesh
+			if _layers.has(model):
+				var cells: Dictionary = _layers[model]
+				for layer: Layer in cells.values():
+					layer.mover = mover_mesh != null
+					layer.mmi.multimesh.mesh = use_mesh
+					layer.lods = lods != null
+					layer.still = false
+		if fresh != null:
+			ModelLods.request_view_lods(fresh as ArrayMesh)
+			var clods := ModelLods.lod_copy(fresh)
+			var cmesh: Mesh = clods if clods != null else fresh
+			for cell: CorpseCell in _cells.values():
+				if cell.layers.has(model):
+					(cell.layers[model] as MultiMeshInstance3D).multimesh.mesh = cmesh
 
 
 ## Swaps a layer to its mesh's copy with view LODs once that is made (ModelLods.request_view_lods);
@@ -1230,16 +1521,26 @@ func _flush(focus: Vector3, delta := 0.0) -> void:
 		_idle_sweep_at = _clock + 1.0
 	var gone: Array = []
 	layers_seen = 0
+	var vp: Viewport = get_viewport() if is_inside_tree() else null
+	var want_mv := records != null and Settings.temporal_aa_active(vp)
+	var c_even := 0.0
+	var c_odd := 0.0
+	var inv_rate := 1.0 / 60.0
+	if want_mv:
+		var cl := records.clocks()
+		c_even = MoverRecords._f32(cl.x)
+		c_odd = MoverRecords._f32(cl.y)
+		inv_rate = 1.0 / maxf(records.rate, 1.0)
 	for model in _layers:
 		var layers: Dictionary = _layers[model]
 		for cell in layers:
 			var layer: Layer = layers[cell]
 			var posed := layer.posed.size() / 16
-			if layer.still and posed == 0 and not layer.dirty and not moved and not sweep and (layer.lods or not lod_beat):
+			var walkers := layer.walkers.size()
+			if layer.still and posed == 0 and not layer.dirty and not moved and not sweep and (layer.lods or not lod_beat) and not ((want_mv or _mv_active) and walkers > 0):
 				continue
 			layers_seen += 1
 			var mm := layer.mmi.multimesh
-			var walkers := layer.walkers.size()
 			var total := walkers + posed
 			if total == 0:
 				layer.dirty = false
@@ -1252,6 +1553,48 @@ func _flush(focus: Vector3, delta := 0.0) -> void:
 					gone.append([layers, cell])
 				continue
 			_ensure(layer, total)
+			if want_mv and walkers > 0:
+				var nat := MoverRecords.native()
+				if nat != null:
+					var slots := PackedInt32Array()
+					slots.resize(walkers)
+					for i in walkers:
+						slots[i] = (layer.walkers[i] as Creature).slot
+					layer.buffer = nat.write_xforms(records.data, slots, walkers, layer.buffer, c_even, c_odd, inv_rate, 1)
+				else:
+					var wb := layer.buffer
+					for i in walkers:
+						var w: Creature = layer.walkers[i]
+						var wo := i * 16
+						records.write_xform(w.slot, wb, wo, c_even, c_odd, inv_rate)
+						wb[wo + 12] = 0.0
+						wb[wo + 13] = 1.0
+						wb[wo + 14] = float(w.slot + 1)
+						wb[wo + 15] = 1.0
+				layer.dirty = true
+			elif _mv_active and not want_mv and walkers > 0:
+				var wb := layer.buffer
+				var centre := (Vector2(layer.cell) + Vector2(0.5, 0.5)) * LIVE_CELL
+				for i in walkers:
+					var w: Creature = layer.walkers[i]
+					var wo := i * 16
+					wb[wo] = 1.0
+					wb[wo + 1] = 0.0
+					wb[wo + 2] = 0.0
+					wb[wo + 3] = centre.x
+					wb[wo + 4] = 0.0
+					wb[wo + 5] = 1.0
+					wb[wo + 6] = 0.0
+					wb[wo + 7] = 0.0
+					wb[wo + 8] = 0.0
+					wb[wo + 9] = 0.0
+					wb[wo + 10] = 1.0
+					wb[wo + 11] = centre.y
+					wb[wo + 12] = 0.0
+					wb[wo + 13] = 0.0
+					wb[wo + 14] = float(w.slot + 1)
+					wb[wo + 15] = 1.0
+				layer.dirty = true
 			if posed > 0:
 				var b := layer.buffer.slice(0, walkers * 16)
 				b.append_array(layer.posed)
@@ -1284,13 +1627,14 @@ func _flush(focus: Vector3, delta := 0.0) -> void:
 				layer.mmi.custom_aabb = box
 			if not layer.lods:
 				layer.lods = _use_lods(layer.mmi)
-			layer.still = posed == 0
+			layer.still = posed == 0 and not (want_mv and walkers > 0)
 			var centre := (Vector2(cell) + Vector2(0.5, 0.5)) * LIVE_CELL
 			var near := centre.distance_to(Vector2(focus.x, focus.z)) <= LIVE_SHADOW_RANGE + LIVE_CELL * 0.71
 			var cast := GeometryInstance3D.SHADOW_CASTING_SETTING_ON if near else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 			if layer.cast != cast:
 				layer.cast = cast
 				layer.mmi.cast_shadow = cast
+	_mv_active = want_mv
 	for g in gone:
 		var layers: Dictionary = g[0]
 		(layers[g[1]] as Layer).mmi.queue_free()

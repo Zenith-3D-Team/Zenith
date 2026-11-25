@@ -286,8 +286,12 @@ XSTATS = collections.Counter()
 # other output moves) unless it had room before its own move. MOVED: id(lane) -> whether its items moved
 # last tick; LAST_X: (unit, side) -> the tick an item last crossed there.
 SPLIT_WAKE = [False]
+WAKE_PRIO = [False]  # --wake-prio: split_wake also for priority and filter splitters (offline only: it made rec80 worse with rule r0)
+WAKE_RULE = ["r4"]  # r4 (R&D's rule, the client's default) or r0 (the earlier one: a crossing 1-2 ticks ago, 3 with the other output moving)
 MOVED = {}
 LAST_X = {}
+LAST_IN = {}  # (unit, side) -> the input half an item last crossed from
+SNAP = {}  # id(lane) -> (lane, its items at the start of the tick): splitter outputs and inputs
 
 
 def tick(order, game_next, given):
@@ -296,11 +300,17 @@ def tick(order, game_next, given):
     TICK[0] += 1
     now = TICK[0]
     done = set()
-    snap = {}
+    snap = SNAP
+    snap.clear()
     if SPLIT_WAKE[0]:
         for x in order:
             if isinstance(x, Lane) and x.type in ("splitter", "lane-splitter"):
                 snap[id(x)] = (x, [(it[0], it[1]) for it in x.items])
+            elif isinstance(x, Splitter):
+                for row in x.ins:
+                    for q in row:
+                        if q is not None:
+                            snap[id(q)] = (q, [(it[0], it[1]) for it in q.items])
     for x in order:
         if isinstance(x, Splitter):
             for side in (0, 1):
@@ -480,13 +490,27 @@ def step_lane(L, now, done, game_next, given):
                     at = o.length - SPLIT_BUFFER + it[0]
                     if o.items:
                         at = max(at, o.items[-1][0] + GAP)
-                        if (SPLIT_WAKE[0] and at < o.length and sp.in_prio is None and sp.out_prio is None and not sp.filter
+                        if (SPLIT_WAKE[0] and at < o.length and (WAKE_PRIO[0] or (sp.in_prio is None and sp.out_prio is None and not sp.filter))
                                 and not MOVED.get(id(o), True)):
                             lx = now - LAST_X.get((sp.unit, side), -100)
                             oo = sp.outs[1][side] if o is sp.outs[0][side] else sp.outs[0][side]
                             b = o.items[-1]
-                            if (1 <= lx <= 2 or (lx == 3 and oo is not None and MOVED.get(id(oo), False))) and                                     (b[4] if len(b) > 5 and b[5] == now else b[0]) + GAP >= o.length:
-                                continue
+                            if (b[4] if len(b) > 5 and b[5] == now else b[0]) + GAP >= o.length:
+                                if WAKE_RULE[0] == "r0":
+                                    cond = 1 <= lx <= 2 or (lx == 3 and oo is not None and MOVED.get(id(oo), False))
+                                else:
+                                    # R4 (docs/BELT-RULES.md section 6): the input that crossed last moved last tick and
+                                    # crossed less than 64 + one step of travel ago, or the other output moved last
+                                    # tick and moves now with a crossing 3 ticks ago or less.
+                                    li = LAST_IN.get((sp.unit, side))
+                                    oth = sp.ins[li][side] if li is not None else None
+                                    oth_mv = oth is not None and MOVED.get(id(oth), False)
+                                    closing = lx * L.step < GAP + L.step
+                                    oo_mv = oo is not None and MOVED.get(id(oo), False)
+                                    oo_now = oo is not None and id(oo) in SNAP and SNAP[id(oo)][1] != [(q[0], q[1]) for q in oo.items]
+                                    cond = (oth_mv and closing) or (oo_mv and oo_now and lx <= 3)
+                                if cond:
+                                    continue
                     hold = False
                     if at >= o.length and sp.in_prio == L.half and (not o.items or o.items[-1][0] < o.length - 1):
                         # The priority input's item goes in anyway, at the output's back (127), however
@@ -502,6 +526,7 @@ def step_lane(L, now, done, game_next, given):
                         o.items.sort()
                         went = True
                         LAST_X[(sp.unit, side)] = now
+                        LAST_IN[(sp.unit, side)] = L.half
                         sp.went(L.half, side, 0 if o is sp.outs[0][side] else 1)
                         break
                 if not went:
@@ -729,6 +754,8 @@ def main():
     ap.add_argument("--lanes", type=int, default=0, help="list the N lanes with the most items off")
     ap.add_argument("--split-wake", action="store_true", help="an awake splitter goes before the belts that start moving "
                     "(docs/BELT-RULES.md section 6; the client's split_wake)")
+    ap.add_argument("--wake-rule", default="r4", choices=["r0", "r4"], help="with --split-wake: R4 (the default, the client's) or the earlier rule")
+    ap.add_argument("--wake-prio", action="store_true", help="with --split-wake: also for splitters with a priority or a filter")
     ap.add_argument("--crossings-from-game", type=int, default=0, metavar="N",
                     help="every N ticks the splitters' output lanes are set to the game's (the bridge's `sl` at that latency)")
     ap.add_argument("--xmode", default="predict", choices=["predict", "hold", "turns"],
@@ -740,6 +767,8 @@ def main():
     ap.add_argument("--near", type=int, default=38, help="an item within this (1/256) counts as drawn in place (0.15 tile)")
     a = ap.parse_args()
     SPLIT_WAKE[0] = a.split_wake
+    WAKE_RULE[0] = a.wake_rule
+    WAKE_PRIO[0] = a.wake_prio
     XGAME[0] = a.crossings_from_game
     XHOLD[0] = a.xmode == "hold"
     XINPUTS[0] = a.xinputs
@@ -761,7 +790,7 @@ def main():
     print("%d lanes (kinds %s); lanes going on into none recorded: %d; side-loads: %s" % (
         len(lanes), dict(kinds), sum(1 for L in lanes if L.next is None and L.side is None),
         [(L.j, L.side[0].j, L.side[1]) for L in lanes if L.side]))
-    if "rows" in d:
+    if isinstance(d.get("rows"), dict):
         tick_no = sorted(d["rows"])
         ticks = [d["rows"][k] for k in tick_no]
 

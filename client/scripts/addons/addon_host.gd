@@ -25,6 +25,9 @@ const ShotPause := preload("res://scripts/addons/shot_pause.gd")
 const MomentHold := preload("res://scripts/world/moment_hold.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const BeltBlur := preload("res://scripts/world/belt_blur.gd")
+const WeatherState := preload("res://scripts/world/weather_state.gd")
+const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## The list changed, or an add-on started or stopped (the Mods window redraws).
 signal addons_changed
@@ -45,6 +48,8 @@ var world := AddonWorld.new(self)
 var watch := AddonWatch.new(self)
 ## The add-on whose hills (api.terrain) are drawn now, "" for flat ground.
 var _terrain_owner := ""
+## The add-on whose weather overrides (api.weather) are active now, "" for none.
+var _weather_owner := ""
 ## Add-ons' windows: over the HUD, under Zenith's menus.
 var layer := CanvasLayer.new()
 var ui_root := Control.new()
@@ -80,7 +85,7 @@ var _toast_left := 0.0
 ## waits, and shows when the interface comes back (it never showed at all). A note shown when the interface
 ## hides waits again. --shot-note=old leaves it hidden as before.
 var _toast_waiting := false
-var shot_note_waits := not OS.get_cmdline_user_args().has("--shot-note=old")
+var shot_note_waits := not Switches.has("--shot-note=old")
 ## Tests without a renderer (headless draws nothing): makes a screenshot's picture instead, given its size.
 var test_capture := Callable()
 ## The interface-hidden state's reason for a screenshot.
@@ -228,6 +233,7 @@ func game_started() -> void:
 	_check_game_mods()
 	events.attach(main)
 	watch.attach(main)
+	_attach_creatures()
 	_push_lift()  # one set between games (game_ended dropped the rest)
 	_push_camera_mod()
 	_push_character()  # (1.7) add-ons' attachments and pose, kept across games
@@ -272,6 +278,7 @@ func game_ended() -> void:
 	_shot_pause.end()  # a game held for a screenshot is let go before the server is left
 	events.detach()
 	watch.detach()
+	_detach_creatures()
 	_pull_character()
 	_drop_lifts()
 	_drop_camera_mods()
@@ -282,11 +289,126 @@ func game_ended() -> void:
 	if _terrain_owner != "":
 		preload("res://scripts/world/ground_height.gd").clear()
 		_terrain_owner = ""
+	if _weather_owner != "":
+		WeatherState.clear()
+		_weather_owner = ""
 	_start_held()  # add-ons stopped for this game's Factorio mods start again
 
 
 func in_game() -> bool:
 	return _game_on
+
+
+# --- api.creatures (1.9): damage/death hooks and live animation overrides ------------------------
+
+func creatures_node():
+	var movers = game_node("movers")
+	if movers == null:
+		return null
+	var c = movers.get("creatures")
+	return c if c is Object and is_instance_valid(c) else null
+
+
+func _attach_creatures() -> void:
+	var c = creatures_node()
+	if c != null:
+		c.on_died_hook = _on_creature_died
+	var fx = game_node("fx")
+	if fx != null and fx.get("on_damaged_hook") != null:
+		fx.on_damaged_hook = _on_creature_damaged
+	var weapons = fx.get("weapons") if fx != null else null
+	if weapons is Object and is_instance_valid(weapons):
+		if weapons.get("on_stream_hook") != null:
+			weapons.on_stream_hook = _on_weapon_stream
+		if weapons.get("on_ground_hook") != null:
+			weapons.on_ground_hook = _on_weapon_ground
+	_update_creatures_anim()
+
+
+func _detach_creatures() -> void:
+	var c = creatures_node()
+	if c != null:
+		c.on_died_hook = Callable()
+		c.set_anim_enabled(false)
+		c.clear_wounds()
+	var fx = game_node("fx")
+	if fx != null and fx.get("on_damaged_hook") != null:
+		fx.on_damaged_hook = Callable()
+	var weapons = fx.get("weapons") if fx != null else null
+	if weapons is Object and is_instance_valid(weapons):
+		if weapons.get("on_stream_hook") != null:
+			weapons.on_stream_hook = Callable()
+		if weapons.get("on_ground_hook") != null:
+			weapons.on_ground_hook = Callable()
+	for m in running():
+		var api = m["object"]
+		if api != null and api.creatures != null:
+			api.creatures._anim_enabled = false
+			api.creatures._wounded_units.clear()
+
+
+func _on_creature_died(info: Dictionary) -> void:
+	for m in running():
+		var api = m["object"]
+		if api != null and api.creatures != null:
+			api.creatures.died.emit(info)
+
+
+func _on_creature_damaged(info: Dictionary) -> void:
+	for m in running():
+		var api = m["object"]
+		if api != null and api.creatures != null:
+			api.creatures.damaged.emit(info)
+
+
+func _on_weapon_stream(info: Dictionary) -> void:
+	for m in running():
+		var api = m["object"]
+		if api != null and api.creatures != null:
+			api.creatures.stream_event.emit(info)
+
+
+func _on_weapon_ground(info: Dictionary) -> void:
+	for m in running():
+		var api = m["object"]
+		if api != null and api.creatures != null:
+			api.creatures.ground_fx.emit(info)
+
+
+func _update_creatures_anim() -> void:
+	var c = creatures_node()
+	if c == null:
+		return
+	var on := false
+	for m in running():
+		var api = m["object"]
+		if api != null and api.creatures != null and api.creatures._anim_enabled:
+			on = true
+			break
+	c.set_anim_enabled(on)
+
+
+func _sync_creature_pack_overrides(families: Array = []) -> void:
+	var next := {}
+	for m in running():
+		var api = m["object"]
+		if api != null and api.creatures != null:
+			for fam: String in api.creatures._pack_overrides:
+				next[fam] = api.creatures._pack_overrides[fam]
+	var all_fams := {}
+	for fam in ModelLibrary.addon_pack_overrides:
+		all_fams[str(fam)] = true
+	for fam in next:
+		all_fams[str(fam)] = true
+	for fam in families:
+		all_fams[str(fam)] = true
+	var changed: Array = []
+	for fam: String in all_fams:
+		if str(ModelLibrary.addon_pack_overrides.get(fam, "")) != str(next.get(fam, "")):
+			changed.append(fam)
+	ModelLibrary.addon_pack_overrides = next
+	if not changed.is_empty():
+		ModelLibrary.choices_changed(changed)
 
 
 # --- api.game: add-ons' messages to their Factorio mods (addon_game.gd) ---------------------------
@@ -300,6 +422,13 @@ func _connect_link() -> void:
 	Bridge.ext_received.connect(_on_ext)
 	Bridge.welcomed.connect(_on_link_welcome)
 	Bridge.connection_lost.connect(_set_link.bind(false))
+	Bridge.cue_changed.connect(_on_cue)
+
+
+## (1.92) The game set a filmed scene's cue: every running add-on hears it.
+func _on_cue(tick: int) -> void:
+	for m in running():
+		m["object"].cue_changed.emit(tick)
 
 
 ## The bridge of the game on carries add-ons' messages (its welcome said `ext`).
@@ -505,7 +634,19 @@ func _process(delta: float) -> void:
 			# main.gd and ride.gd turn the player's controls back on when their own reasons end.
 			_lock_input()
 			r.taken_focus = _holder.camera._focus_point()
+			r.taken_cone = _holder.camera.has_method("_uses_cone") and bool(_holder.camera._uses_cone())
+	_push_view_cone()
 	_apply_mouse()
+
+
+## Tells the world whether the add-on camera's view cone picks the chunks to stream (the rig's `use_view_cone()`;
+## only acts with `--camera-cone=on`, see ViewPriority.cone_streaming). Off whenever no add-on holds the camera.
+func _push_view_cone() -> void:
+	var w = game_node("world")
+	if w == null or not w.has_method("set_view_cone"):
+		return
+	var r = rig()
+	w.set_view_cone(r != null and _holder != null and bool(r.use_view_cone()))
 
 
 ## While an add-on has the camera and the player's controls, the events of its camera keys are
@@ -641,7 +782,7 @@ func _apply_hidden() -> void:
 		_hidden_nodes.clear()
 		var input = game_node("input")
 		if input != null and input.get("_clean_shot") != null:
-			input.set("_clean_shot", OS.get_cmdline_user_args().has("--clean-shot"))
+			input.set("_clean_shot", Switches.has("--clean-shot"))
 	InterfaceState.set_hidden(&"addons", hiding, get_tree() if is_inside_tree() else null)
 	for m in running():
 		m["object"].ui._interface_hidden(hiding)
@@ -698,6 +839,14 @@ func _finish_frames() -> void:
 
 func _exit_tree() -> void:
 	Settings.unlisten(_on_cam_setting)
+	var had_pack_overrides := false
+	for m in running():
+		var api = m["object"]
+		if api != null and api.creatures != null and not api.creatures._pack_overrides.is_empty():
+			api.creatures._pack_overrides.clear()
+			had_pack_overrides = true
+	if had_pack_overrides:
+		_sync_creature_pack_overrides()
 	for t in _frame_tasks:
 		WorkerThreadPool.wait_for_task_completion(t)
 	_frame_tasks.clear()
@@ -1663,11 +1812,11 @@ func _pull_character() -> void:
 
 ## Reload: the Add-ons window's Reload button, the reload key (addons_reload) and switching an add-on off
 ## and on read its addon.json and scripts from disk again. --addon-reload=off: as before (a restart).
-var reload_on := not OS.get_cmdline_user_args().has("--addon-reload=off")
+var reload_on := Switches.on("--addon-reload")
 ## --addons-dev: every add-on's page has Reload, not only those given with --addons.
-var addons_dev := OS.get_cmdline_user_args().has("--addons-dev")
+var addons_dev := Switches.has("--addons-dev")
 ## Script errors in add-ons' files listed on their pages (addon_errors.gd). --addon-errors=off: only the log.
-var errors_on := not OS.get_cmdline_user_args().has("--addon-errors=off")
+var errors_on := Switches.on("--addon-errors")
 ## Kept per add-on: the newest, repeats counted.
 const ERRORS_KEPT := 20
 const Controls := preload("res://scripts/player/controls.gd")

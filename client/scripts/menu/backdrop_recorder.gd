@@ -25,6 +25,7 @@ signal failed(reason: String)
 signal progress(fraction: float)
 
 const WireDecode := preload("res://scripts/net/wire_decode.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 const PATH := "user://menu-backdrop.json.gz"
 const VERSION := 1
 const PROTO_KINDS := ["protos", "tprotos", "iprotos", "fprotos", "eprops"]
@@ -214,7 +215,7 @@ func _keep(c: Variant, msg: Dictionary) -> void:
 	copy["dt"] = snappedf(maxf(0.0, _elapsed - maxf(_started, 0.0)), 0.001)
 	_kept.append([c, copy])
 	if c is Vector2i and str(msg.get("t", "")) == "ents":
-		for e in _array(msg.get("e")):
+		for e in Wire.array(msg.get("e")):
 			if e is Array and (e as Array).size() > 0 and int(e[0]) != 0:
 				_units[int(e[0])] = c
 
@@ -353,10 +354,6 @@ static func build(job: Dictionary, radius: int, live: bool) -> Dictionary:
 	return data
 
 
-static func _array(v: Variant) -> Array:
-	return v if v is Array else []
-
-
 ## The chunk of a map position in 1/256 tile.
 static func _chunk_256(x: int, y: int) -> Vector2i:
 	return Vector2i(floori(x / 8192.0), floori(y / 8192.0))
@@ -369,7 +366,7 @@ static func _near(c: Vector2i, c0: Vector2i, radius: int) -> bool:
 ## Notes where each lane of a `bs`'s `lm` lies ([its chunk (the line's middle point), the chunk half
 ## a tile past its exit end]), in or out of the square, as `lanes` keeps them for cut_live().
 static func note_lanes(lanes: Dictionary, msg: Dictionary) -> void:
-	var a := _array(msg.get("lm"))
+	var a := Wire.array(msg.get("lm"))
 	for i in range(0, a.size() - 11, 12):
 		var x0 := int(a[i + 4])
 		var y0 := int(a[i + 5])
@@ -396,7 +393,7 @@ static func cut_live(msg: Dictionary, radius: int, c0: Vector2i, lanes: Dictiona
 			var deltas := int(msg.get("z", 0)) == 1
 			var sums := [0, 0, 0, 0]
 			var out: Array = []
-			for rec in _array(WireDecode.mv_records(msg)):  # (a binary frame's packed records, whole)
+			for rec in Wire.array(WireDecode.mv_records(msg)):  # (a binary frame's packed records, whole)
 				if not (rec is Array and (rec as Array).size() >= 4):
 					continue
 				var r: Array = (rec as Array).duplicate()
@@ -410,7 +407,7 @@ static func cut_live(msg: Dictionary, radius: int, c0: Vector2i, lanes: Dictiona
 		"ih":
 			var deltas := int(msg.get("z", 0)) == 1
 			var v := [0, 0, 0, 0]
-			var l := _array(msg.get("l"))
+			var l := Wire.array(msg.get("l"))
 			var out: Array = []
 			var i := 0
 			while i + 3 < l.size():
@@ -422,7 +419,7 @@ static func cut_live(msg: Dictionary, radius: int, c0: Vector2i, lanes: Dictiona
 			copy.erase("z")
 			copy["l"] = out
 		"gi":
-			var l := _array(msg.get("l"))
+			var l := Wire.array(msg.get("l"))
 			var out: Array = []
 			for i in range(0, l.size() - 2, 3):
 				if _near(_chunk_256(int(l[i + 1]), int(l[i + 2])), c0, radius):
@@ -431,7 +428,7 @@ static func cut_live(msg: Dictionary, radius: int, c0: Vector2i, lanes: Dictiona
 		"st":
 			for key: String in ["l", "lc", "ao"]:
 				if msg.has(key):
-					copy[key] = _cut_pairs(_array(msg[key]), func(u: int) -> bool: return units.has(u) and _near(units[u], c0, radius))
+					copy[key] = _cut_pairs(Wire.array(msg[key]), func(u: int) -> bool: return units.has(u) and _near(units[u], c0, radius))
 		"bs":
 			_cut_belts(msg, copy, radius, c0, lanes, units)
 	return copy
@@ -450,7 +447,7 @@ static func _cut_belts(msg: Dictionary, copy: Dictionary, radius: int, c0: Vecto
 	var inside := func(key: int) -> bool:
 		return lanes.has(key) and _near((lanes[key] as Array)[0], c0, radius)
 	if msg.has("lm"):
-		var a := _array(msg["lm"])
+		var a := Wire.array(msg["lm"])
 		var out: Array = []
 		for i in range(0, a.size() - 11, 12):
 			var key := int(a[i])
@@ -467,7 +464,7 @@ static func _cut_belts(msg: Dictionary, copy: Dictionary, radius: int, c0: Vecto
 		copy["lm"] = out
 	var uids := {}
 	if msg.has("sl"):
-		var a := _array(msg["sl"])
+		var a := Wire.array(msg["sl"])
 		var out: Array = []
 		var i := 0
 		while i + 2 < a.size():
@@ -482,14 +479,14 @@ static func _cut_belts(msg: Dictionary, copy: Dictionary, radius: int, c0: Vecto
 		if not msg.has(key):
 			continue
 		var width: int = WIDTHS[key]
-		var a := _array(msg[key])
+		var a := Wire.array(msg[key])
 		var out: Array = []
 		for i in range(0, a.size() - width + 1, width):
 			if inside.call(int(a[i])):
 				out.append_array(a.slice(i, i + width))
 		copy[key] = out
 	if msg.has("qu"):
-		copy["qu"] = _cut_pairs(_array(msg["qu"]), func(u: int) -> bool: return uids.has(u))
+		copy["qu"] = _cut_pairs(Wire.array(msg["qu"]), func(u: int) -> bool: return uids.has(u))
 	if msg.has("of"):
 		var belt := func(u: int) -> bool:
 			if units.has(u):
@@ -498,7 +495,7 @@ static func _cut_belts(msg: Dictionary, copy: Dictionary, radius: int, c0: Vecto
 				if inside.call(u * 8 + line):
 					return true
 			return false
-		copy["of"] = _cut_pairs(_array(msg["of"]), belt)
+		copy["of"] = _cut_pairs(Wire.array(msg["of"]), belt)
 
 
 static func chunk_of(tile: Vector2) -> Vector2i:

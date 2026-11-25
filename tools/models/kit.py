@@ -54,6 +54,7 @@ MATERIALS = {
     "arc_blue": ("b8f0ff", 0.4, 0.0, "58d8ff", 4.0),   # electric arcs (kit.arc), shown only while lit
     "lamp_red": ("c0301c", 0.4, 0.0, "ff2a10", 0.6),
     "lamp_green": ("4e8a3a", 0.4, 0.0, "6cff4a", 0.8),   # chemical plant's pump light
+    "lamp_headlight": ("fff4d6", 0.15, 0.0, "ffe8a8", 3.0),  # vehicle headlights (driven at night)
     "ceramic": ("ddd8c8", 0.5, 0.0, None, 0),
     # Picked against the 2D sprites of the machines that use them.
     "glass_dark": ("585d5b", 0.15, 0.25, None, 0),    # lab dome panes

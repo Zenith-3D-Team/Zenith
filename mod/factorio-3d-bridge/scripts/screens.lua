@@ -28,7 +28,8 @@ local tracker = require("scripts.tracker")
 local M = {}
 
 local INTERVAL = 30          -- state twice a second while a screen is open
-local RECIPE_LIST_EVERY = 10 -- the recipe list rides along with the first state and every 10th after
+local RECIPE_LIST_EVERY = 10 -- check the recipe list every 10th state (~5 s) and send on change or resend
+local RECIPE_LIST_RESEND = 60 -- periodic fallback resend (~30 s) for unreliable UDP recovery
 local MAX_MOVE = 100000
 
 local CONTAINER_TYPES = {
@@ -149,15 +150,49 @@ local function can_make(e, recipe)
   return false
 end
 
--- Names of the force's enabled recipes that this machine's crafting categories allow.
-local function recipe_names(c, e)
-  local names = {}
-  for name, recipe in pairs(c.force.recipes) do
-    if can_make(e, recipe) then
-      names[#names + 1] = name
+-- Module-local prototype cache (derived strictly from prototypes, deterministic across peers):
+-- entity prototype name -> sorted list of { name = recipe_name, group = { ... } }.
+local machine_candidates = {}
+
+local function candidates_for(e)
+  local pname = e.prototype.name
+  local cached = machine_candidates[pname]
+  if cached then
+    return cached
+  end
+  local cats = machine_categories(e)
+  local list = {}
+  for name, recipe in pairs(prototypes.recipe) do
+    if not recipe.hidden and not puppet.is_parameter(recipe) then
+      local fits = false
+      for _, cat in pairs(puppet.recipe_categories(recipe)) do
+        if cats[cat] then
+          fits = true
+          break
+        end
+      end
+      if fits then
+        list[#list + 1] = { name = name, group = machine_info.recipe_group(recipe) }
+      end
     end
   end
-  return names
+  table.sort(list, function(a, b) return a.name < b.name end)
+  machine_candidates[pname] = list
+  return list
+end
+
+-- Names and group entries of the force's enabled recipes allowed by this machine's categories.
+local function machine_recipes(c, e)
+  local force_recipes = c.force.recipes
+  local names, groups = {}, {}
+  for _, entry in ipairs(candidates_for(e)) do
+    local r = force_recipes[entry.name]
+    if r and r.enabled and not r.hidden then
+      names[#names + 1] = entry.name
+      groups[#groups + 1] = entry.group
+    end
+  end
+  return names, groups
 end
 
 local function close(s, why)
@@ -327,11 +362,12 @@ local function send_state(c, e, sc)
     msg.ps = okr and rate or nil
   end
   if kind == "crafter" and sc.sent % RECIPE_LIST_EVERY == 0 then
-    msg.rl = recipe_names(c, e)
-    -- The chooser's item group tabs: [group, group order, subgroup key, order] by recipe.
-    msg.rg = {}
-    for i, name in ipairs(msg.rl) do
-      msg.rg[i] = machine_info.recipe_group(c.force.recipes[name])
+    local rl, rg = machine_recipes(c, e)
+    local sig = table.concat(rl, ",")
+    if sc.sent == 0 or sig ~= sc.rl_sig or sc.sent % RECIPE_LIST_RESEND == 0 then
+      msg.rl = rl
+      msg.rg = rg
+      sc.rl_sig = sig
     end
   end
   sc.sent = sc.sent + 1

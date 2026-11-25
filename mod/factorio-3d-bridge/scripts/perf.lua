@@ -103,11 +103,65 @@
 -- of a run becomes its ending piece, a belt beside a mined one straightens; off: as before (their records kept the
 -- connection to what was mined, the run's last pipe drawn as a straight, open at its end in FUE5's kit).
 --
--- The Stability lead (not performance either):
+-- Stability lead (not performance either):
 -- enemy_sight: the enemy units within their vision of a character with no player (a headless server's) that have no
 -- distraction are given one, attack it, with their whole nest, held and chasing, as the engine does for a real
 -- player's (enemy_sight.lua): a nest's idle biters ignored such a character until it shot (2.1.24); off: nothing
 -- done, as before.
+-- enemy_sight_vehicle: the same for that character driving or riding a car, tank or spidertron, the vehicle the
+-- target (a real player's in one is attacked so); off: nothing done in a vehicle, as before.
+-- gate_state: the gates within 64 tiles of the focus send their real state (`st`: 0 closed, 1 opening, 2 opened,
+-- 3 closing; read every 3 ticks, changes only, movers.lua), so the client's doors open when Factorio opens them;
+-- off: nothing sent, the client guesses from the character and vehicles near (states already sent stay until
+-- their chunk is dropped).
+--
+-- robot_sim: worker robots (`logistic-robot`, `construction-robot`) stream leg/order updates (`rb`) and
+-- fly smoothly on the client/GPU between Factorio's 20-tick sleep steps instead of polling positions in `mv`.
+--
+-- prio_queue: reliable player interaction replies (`inv`, `slots`, `qb`, `craftable`, `guns`, `bp_ok`, `hist`,
+-- plus `add`/`upd`/`del` for chunks without a pending snapshot in the bulk outbox) flush ahead of bulk
+-- chunk/state streaming (`outbox_prio` vs `outbox`) with sequence numbers `r` assigned at flush time, and `me`
+-- sends on the tick movement/driving changes instead of waiting for STATE_INTERVAL; off: single FIFO `outbox`
+-- and fixed cadence, as before.
+-- flush_end: run `transport.flush_priority` at the end of `serve()` (keeping bulk `transport.flush` at
+-- index 1) with near-world steps ordered ahead of background jobs (`map`, `lod`, `trains`, etc.);
+-- off: original `STEPS` with `transport.flush` at index 1 only.
+-- near_first: prioritize near-bubble queues (chunks within `NEAR_CHUNK_RING`, inserters within
+-- `NEAR_INSERTER_RADIUS`, robots within `NEAR_ROBOT_RADIUS`) ahead of outer background work; off: flat order.
+-- near_rate: keep near-bubble update rates (`st`, `ih`, near `mv`, near chunk budget floor) responsive when
+-- `rate` or Hold 60 UPS budget backs off outer work; off: uniform rate and budget across all distances.
+-- prio_cap: `transport.flush_priority` (flush_end) counts the bytes `transport.flush` already sent this tick, so
+-- the tick's total stays within the priority budget; off: each starts its own budget (two in one tick, as before).
+-- nack_ring: keep a 256-slot module-local reliable retransmit ring per client port so `nack` resends lost `r`
+-- messages via `send_raw` without touching `rseq` or `storage`; off: `nack` falls back to `world.resend(c)`.
+--
+-- Main-bus UPS round (each off: old behaviour):
+-- mover_move_scan: raise movers.lua's walking full-area rescan threshold to 16 tiles with a 20-tick cooldown
+-- (jumps >= SCAN_JUMP still scan at once); off: SCAN_MOVE = 4 tiles bypasses backoff while running.
+-- st_working_slice: rotate/expire `s.working` refresh in slices per region (`unit % slice == phase`) instead
+-- of wiping `s.working = {}` in one tick every 300 ticks; off: full wipe every 300 ticks.
+-- splitter_throttle: reuse `storage.f3d.bs.lanes` when a belt-sim-tracked splitter is empty or visibly
+-- changed, and cap/rotate remaining `splitter_moving()` (`get_detailed_contents()`, weight 7) checks to at
+-- most 16 per pass; off: check every splitter every pass.
+-- inserter_look_budget: budget and slice `inserters.lua`'s `look_over()` fresh chunk searches and
+-- `found()`/`describe()` work across ticks, nearest chunks first (using read-only `budget.left()`); off: full
+-- `look_over()` synchronously in one tick.
+-- fluids_budget: slice `fluids_power.lua`'s `collect_fluids`, `collect_heat`, and `collect_power` across
+-- stages and horizontal strips under `budget` instead of running all full-square searches in one tick.
+-- alt_cadence: stagger `alt_mode.lua`'s container vs. machine `find_entities_filtered` searches across
+-- separate ticks (plus strip-slice huge `r > 64` squares) and extend round interval while walking; off:
+-- double-scan `focus_area` on one tick at fixed `CONTENTS_ROUND`.
+--
+-- Bridge UPS round, whole-base jobs (each off: old behaviour):
+-- map_trains_slice: the map's trains (`mtr`) read in a job under the work budget, a train at a time from a list
+-- the ask took (the packet handler only starts it), sent when the pass ends; the alerts' train scan (out of fuel,
+-- no path) a slice of trains a tick. Off: every carriage read in the packet handler, every train in one tick.
+-- alerts_topk: `al`'s nearest PER_KIND of a kind picked in one pass (no sort of the whole list), kept until the
+-- list, the focus or the near square changes (a shown one gone makes it again); the alerts' pass stops inside a
+-- chunk at its allowance and goes on there next tick. Off: every list sorted each time, each chunk read whole.
+-- events_enqueue: game events about a watched entity (built, marked, cancelled, flipped, rotated, recoloured) tell
+-- the listeners and queue the entity; its record and the reads round it go from on_tick, nearest first, under the
+-- work budget (tracker.lua). Off: all of it in the event, as before.
 
 local M = {}
 
@@ -117,12 +171,36 @@ M.OPTIONS = { chunk_text = true, far_lanes = true, wire_strips = true, lightning
   alt_machines = true, mined_tell = true, research_chain = true, zenith_join = true,
   no_crash_site = true, fluid_icons = true, pipe_alerts = true, under_clear = true, alt_ammo_fuel = true,
   pickup_stop = true, fast_take = true, vehicle_ammo = true, mined_neighbours = true, enemy_sight = true,
-  drop_put = true }
+  drop_put = true, robot_sim = true, prio_queue = true, flush_end = true, near_first = true, near_rate = true,
+  nack_ring = true, mover_move_scan = true, st_working_slice = true, splitter_throttle = true,
+  inserter_look_budget = true, fluids_budget = true, alt_cadence = true, prio_cap = true,
+  map_trains_slice = true, alerts_topk = true, events_enqueue = true, gc_pace = true, enemy_sight_vehicle = true,
+  gate_state = true }
 M.ORDER = { "chunk_text", "far_lanes", "wire_strips", "lightning_planets", "states_near", "requeue_slices",
   "records_by_prototype", "alerts_quiet", "one_search", "dec_distance", "chart_same", "status_near", "mined_now",
   "put_lanes", "belts_last", "belt_pickup", "alt_machines", "mined_tell", "research_chain", "zenith_join",
   "no_crash_site", "fluid_icons", "pipe_alerts", "under_clear", "alt_ammo_fuel", "pickup_stop", "fast_take",
-  "vehicle_ammo", "mined_neighbours", "enemy_sight", "drop_put" }
+  "vehicle_ammo", "mined_neighbours", "enemy_sight", "drop_put", "robot_sim", "prio_queue", "flush_end",
+  "near_first", "near_rate", "nack_ring", "mover_move_scan", "st_working_slice", "splitter_throttle",
+  "inserter_look_budget", "fluids_budget", "alt_cadence", "prio_cap", "map_trains_slice",
+  "alerts_topk", "events_enqueue", "gc_pace", "enemy_sight_vehicle", "gate_state" }
+
+-- Numeric settings (`/f3d-perf <name> <number>|default`), kept in storage.f3d_perf_num: name -> { default, min, max }.
+-- shots_radius: how far from the focus shots.lua sends projectiles, streams (flamethrowers), beams, explosions and
+-- ground fires (pj, gf), for wide shots from high above a base. 48 (default) keeps min(focus radius, 48) as before;
+-- a set value is used as it is (8-256), independent of the focus radius, and the flying/ground caps grow with it.
+M.NUMBERS = { shots_radius = { 48, 8, 256 } }
+
+-- The value of numeric setting `name` (its default when unset).
+function M.number(name)
+  local spec = M.NUMBERS[name]
+  local set = storage.f3d_perf_num
+  local v = set and set[name]
+  if v == nil then
+    return spec[1], false
+  end
+  return v, true
+end
 
 -- Whether switch `name` is on.
 function M.on(name)
@@ -139,7 +217,19 @@ function M.command(param)
   local name, value = tostring(param or ""):match("^%s*([%w_]+)%s+(%S+)")
   local out = {}
   if name then
-    if M.OPTIONS[name] == nil then
+    local num = M.NUMBERS[name]
+    if num then
+      if value == "default" then
+        if storage.f3d_perf_num then
+          storage.f3d_perf_num[name] = nil
+        end
+      elseif tonumber(value) then
+        storage.f3d_perf_num = storage.f3d_perf_num or {}
+        storage.f3d_perf_num[name] = math.max(num[2], math.min(num[3], math.floor(tonumber(value))))
+      else
+        out[#out + 1] = "[Zenith] /f3d-perf " .. name .. ": a number " .. num[2] .. "-" .. num[3] .. " or default"
+      end
+    elseif M.OPTIONS[name] == nil then
       out[#out + 1] = "[Zenith] /f3d-perf: no switch " .. name
     elseif value == "on" or value == "1" or value == "true" or value == "off" or value == "0" or value == "false"
         or value == "default" then
@@ -156,6 +246,10 @@ function M.command(param)
   local parts = {}
   for _, k in ipairs(M.ORDER) do
     parts[#parts + 1] = k .. " " .. (M.on(k) and "on" or "off") .. ((storage.f3d_perf or {})[k] == nil and "" or " (set)")
+  end
+  for name in pairs(M.NUMBERS) do
+    local v, set = M.number(name)
+    parts[#parts + 1] = name .. " " .. v .. (set and " (set)" or "")
   end
   out[#out + 1] = "[Zenith] performance switches: " .. table.concat(parts, ", ")
   return out

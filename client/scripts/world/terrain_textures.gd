@@ -19,12 +19,17 @@ extends RefCounted
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const PX := 64  # Factorio's high-resolution tiles: 64 px each (scale 0.5 of 128 px/tile)
 const COLS := 32
 const ROWS := 16
 const MAX_LAYERS := 96  # the shaders' per-layer table
+const CACHE_DIR := "user://tex-cache"
+const CACHE_VERSION := 1
+const CACHE_KEEP := 96
 ## A surface change drops every layer once this many are in use, so a session that visits every
 ## planet doesn't run out (each planet needs 15-55 kinds of ground) and leave the last one bare.
 const TRIM_LAYERS := 40
@@ -167,6 +172,11 @@ static var _images: Array[Image] = []
 static var _array: Texture2DArray
 static var _infos := PackedColorArray()
 static var _reflects := PackedFloat32Array()
+static var _pbr_images: Array[Image] = []
+static var _pbr_metas := PackedColorArray()  # parallel to _images: (pbr_layer or -1, flags, normal_strength, height_strength)
+static var _pbr_array: Texture2DArray
+static var _pbr_room := 0
+static var _pbr_uploaded := 0
 static var _dirty := false
 ## Whether the ground's pictures are compressed (S3TC/BC1): 1 yes, 0 no. Only an editor build can:
 ## in Godot 4.7.2 etcpak's compressors (BC1-3, ETC) are registered only with TOOLS_ENABLED, and CVTT
@@ -180,7 +190,13 @@ static var _dirty := false
 ## video memory and as much RAM, against 70 and 60 MB.
 static var _compress := 1 if OS.has_feature("editor") else 0
 ## --plain-terrain keeps the procedural ground even with an install (for comparisons).
-static var disabled := "--plain-terrain" in OS.get_cmdline_user_args()
+static var disabled := Switches.has("--plain-terrain")
+static var disk_cache := Switches.on("--tex-cache")
+static var cache_hits := 0
+static var _data_stamp := ""
+static var _cache_dir_made := false
+static var _cache_mutex := Mutex.new()
+static var _cache_writes := 0
 ## The array on the GPU is made with room for ARRAY_ROOM layers (grown ARRAY_STEP at a time when
 ## full), and a new kind of ground is written into its layer alone (update_layer): one picture's
 ## upload, 2-3 ms. Making the whole array again from every picture loaded, on each new kind of
@@ -192,7 +208,7 @@ static var disabled := "--plain-terrain" in OS.get_cmdline_user_args()
 const ARRAY_ROOM := 48
 const ARRAY_STEP := 16
 const ARRAY_STEP_PLAIN := 4
-static var rebuild_layers := "--terrain-layers=rebuild" in OS.get_cmdline_user_args()
+static var rebuild_layers := Switches.has("--terrain-layers=rebuild")
 static var _room := 0  # layers the array on the GPU has (0: none made since the last trim)
 static var _uploaded := 0  # of _images, how many are in it
 ## Arrays made and single layers written (for tests and probes).
@@ -200,11 +216,13 @@ static var arrays_made := 0
 static var layers_written := 0
 
 
-## Pictures being read on worker threads: tile name -> [task id, TileGfx]. A TileGfx is only
-## handed out once it is final, so terrain jobs on other threads never see one change.
+## Pictures being read on worker threads: tile name -> [task id, TileGfx, holder]. A TileGfx is
+## only handed out once it is final, so terrain jobs on other threads never see one change.
 static var _pending := {}
-static var _loaded := {}  # tile name -> Image (or null), written by the workers
+static var _loaded := {}  # unused legacy placeholder; per-task holders carry loaded images
 static var _loaded_mutex := Mutex.new()
+static var _abandoned_tasks: Array[int] = []
+static var _packs_version := -1  # ModelPacks.tiles_version last synced
 ## Goes up whenever lookup() can answer more tiles than before.
 static var generation := 0
 ## Goes up when tiles' layers change under meshes already built (a trim, or a graphics list that
@@ -222,15 +240,59 @@ static var _changed := false
 ## still written on the main thread, update_layer.) A tile whose layer is in an array still being
 ## made stays unknown (lookup() null, _staged) until that array is in use, so no ground is built with
 ## a layer the bound array lacks. off: made on the main thread.
-static var upload_thread := not ("--terrain-upload-thread=off" in OS.get_cmdline_user_args())
+static var upload_thread := Switches.on("--terrain-upload-thread")
 static var _upload: Array = []  # [task id, [Texture2DArray or null], infos, reflects, layers] while a worker makes the next array
 static var _staged := {}  # tile name -> TileGfx: published, its layer in an array not yet in use
+
+
+static func _sync_packs() -> void:
+	if _packs_version < 0:
+		ModelPacks.active()
+		_packs_version = ModelPacks.tiles_version
+		return
+	if _packs_version == ModelPacks.tiles_version:
+		return
+	_packs_version = ModelPacks.tiles_version
+	_reload_all()
+
+
+static func _reload_all() -> void:
+	if _gfx.is_empty() and _pending.is_empty() and _staged.is_empty() and _images.is_empty() and _array == null and _upload.is_empty():
+		return
+	if not _upload.is_empty():
+		WorkerThreadPool.wait_for_task_completion(int(_upload[0]))
+		_upload = []
+	for entry: Array in _pending.values():
+		_abandoned_tasks.append(int(entry[0]))
+	_pending.clear()
+	_staged.clear()
+	_gfx.clear()
+	_images.clear()
+	_infos = PackedColorArray()
+	_reflects = PackedFloat32Array()
+	_pbr_images.clear()
+	_pbr_metas = PackedColorArray()
+	_pbr_array = null
+	_pbr_room = 0
+	_pbr_uploaded = 0
+	_array = null
+	_room = 0
+	_uploaded = 0
+	_dirty = false
+	Visuals.set_terrain_param(&"textured", false)
+	Visuals.set_terrain_param(&"has_tile_pbr", false)
+	Visuals.water_material().set_shader_parameter("textured", false)
+	_changed = true
+	relook = true
+	generation += 1
+	layout += 1
 
 
 ## The graphics for a tile, or null while its picture is being read (on a worker thread: reading
 ## and compressing one takes 50-350 ms, which on the main thread was a hitch for every new kind
 ## of ground). Draw it in its map colour meanwhile and ask again after `generation` changes.
 static func lookup(tile_name: String) -> TileGfx:
+	_sync_packs()
 	var g: TileGfx = _gfx.get(tile_name)
 	if g != null or _pending.has(tile_name) or _staged.has(tile_name):
 		return g
@@ -243,24 +305,61 @@ static func lookup(tile_name: String) -> TileGfx:
 	if not disabled and ItemIcons.factorio_data_dir() != "":
 		_read_defs()
 		block = _defs.get(tile_name, "")
+	var fp := ModGraphics.fingerprint
+	var comp_req := _compress
 	var rec := _record(tile_name)
+	var pack_src := {}
+	if not disabled:
+		pack_src = ModelPacks.tile_source(tile_name, false)
+		if pack_src.is_empty() and rec.is_empty() and block == "":
+			pack_src = ModelPacks.tile_source(tile_name, true)
+	var pack_files: Array = pack_src.get("files", [])
+	var pack_maps: Dictionary = pack_src.get("maps", {})
+	var spec: Dictionary = pack_src.get("spec", {})
 	if not rec.is_empty():
-		# The bridge's list (mod_graphics.gd): a mod's tile, read from the mod's own files.
 		var group := str(rec.get("group", "ground-natural"))
 		g.water = g.water or int(rec.get("water", 0)) == 1
 		g.priority = int(GROUP_RANK.get(group, 2)) * 1000 + int(rec.get("layer", 0))
 		g.spills = group in ["ground-natural", "zero", "water-overlay"]
+	elif block != "":
+		var group := _str(block, "layer_group", "water" if g.water else "ground-natural")
+		g.priority = int(GROUP_RANK.get(group, 2)) * 1000 + int(_layer_of.get(tile_name, 0))
+		g.spills = group in ["ground-natural", "zero", "water-overlay"]
+	elif not pack_files.is_empty():
+		if g.water:
+			g.priority = 0
+			g.spills = false
+		elif surface_of(tile_name) != NATURAL_SURFACE:
+			g.priority = int(GROUP_RANK["ground-artificial"]) * 1000
+			g.spills = false
+		else:
+			g.priority = int(GROUP_RANK["ground-natural"]) * 1000
+			g.spills = true
+	if not pack_src.is_empty() and (spec.has("roughness") or spec.has("specular")):
+		var base_surf := surface_of(tile_name)
+		var r := float(spec.get("roughness", base_surf.x))
+		var s := float(spec.get("specular", base_surf.y))
+		g.surface = surface_code(Vector2(r, s))
+	if not pack_files.is_empty():
 		if _images.size() + _pending.size() >= MAX_LAYERS:
 			push_warning("Terrain textures: no room for %s (%d kinds of ground in use)" % [tile_name, MAX_LAYERS])
 			_gfx[tile_name] = g
 			_changed = true
 			return g
-		_pending[tile_name] = [WorkerThreadPool.add_task(_load_record.bind(g, rec)), g]
+		var holder: Array = [null, null, 0, 1.0, 1.0]
+		_pending[tile_name] = [WorkerThreadPool.add_task(_load_pack.bind(g, pack_files, block, spec, comp_req, holder, pack_maps)), g, holder]
+		return null
+	if not rec.is_empty():
+		# The bridge's list (mod_graphics.gd): a mod's tile, read from the mod's own files.
+		if _images.size() + _pending.size() >= MAX_LAYERS:
+			push_warning("Terrain textures: no room for %s (%d kinds of ground in use)" % [tile_name, MAX_LAYERS])
+			_gfx[tile_name] = g
+			_changed = true
+			return g
+		var holder: Array = [null, null, 0, 1.0, 1.0]
+		_pending[tile_name] = [WorkerThreadPool.add_task(_load_record.bind(g, rec, fp, comp_req, holder, pack_maps, spec)), g, holder]
 		return null
 	if block != "":
-		var group := _str(block, "layer_group", "water" if g.water else "ground-natural")
-		g.priority = int(GROUP_RANK.get(group, 2)) * 1000 + int(_layer_of.get(tile_name, 0))
-		g.spills = group in ["ground-natural", "zero", "water-overlay"]
 		g.tint = _tint_of.get(tile_name, Color.WHITE)
 	if block == "" or _images.size() + _pending.size() >= MAX_LAYERS:
 		if block != "":
@@ -268,7 +367,8 @@ static func lookup(tile_name: String) -> TileGfx:
 		_gfx[tile_name] = g
 		_changed = true
 		return g
-	_pending[tile_name] = [WorkerThreadPool.add_task(_load.bind(g, block)), g]
+	var holder: Array = [null, null, 0, 1.0, 1.0]
+	_pending[tile_name] = [WorkerThreadPool.add_task(_load.bind(g, block, comp_req, holder, pack_maps, spec)), g, holder]
 	return null
 
 
@@ -310,6 +410,12 @@ static func trim(next_surface := -1) -> bool:
 	_images.clear()
 	_infos = PackedColorArray()
 	_reflects = PackedFloat32Array()
+	_pbr_images.clear()
+	_pbr_metas = PackedColorArray()
+	_pbr_array = null
+	_pbr_room = 0
+	_pbr_uploaded = 0
+	Visuals.set_terrain_param(&"has_tile_pbr", false)
 	_room = 0  # the next commit makes a new array (a loading moment: the surface changed)
 	_uploaded = 0
 	_changed = true
@@ -349,11 +455,14 @@ static func peek(tile_name: String) -> TileGfx:
 ## don't define (a mod's), or one a mod has given pictures from outside the built-in mods. The
 ## built-in tiles keep the path tuned for them (copies of water, frozen floors). {} for none.
 static func _record(tile_name: String) -> Dictionary:
-	if disabled:
-		return {}
-	var rec = ModGraphics.tiles.get(tile_name)
+	return {} if disabled else _mod_tile_record(tile_name)
+
+
+static func _mod_tile_record(tile_name: String) -> Dictionary:
+	var rec: Variant = ModGraphics.tiles.get(tile_name)
 	if not rec is Dictionary:
 		return {}
+	var r := rec as Dictionary
 	# Whether the game's own files define it decides which path draws it, so read them first:
 	# is_water_tile() asks before lookup() has, and a built-in tile taken for a mod's got the list's
 	# water flag (empty space round every platform drawn as water).
@@ -361,23 +470,548 @@ static func _record(tile_name: String) -> Dictionary:
 		_read_defs()
 	if _defs.has(tile_name):
 		var first := ""
-		if rec.get("mat") is Array:
-			first = str(rec.mat[0])
-		elif rec.get("main") is Array and not (rec.main as Array).is_empty():
-			first = str(rec.main[0][0])
+		if r.get("mat") is Array:
+			first = str(r.mat[0])
+		elif r.get("main") is Array and not (r.main as Array).is_empty():
+			first = str(r.main[0][0])
 		if ModFiles.split(first)[0] in ModFiles.BUILT_IN:
 			return {}
-	return rec
+	return r
 
 
-static func _load_record(g: TileGfx, rec: Dictionary) -> void:
-	var t0 := Time.get_ticks_msec()
-	var image := _build_layer_from_record(g, rec)
+static func _def_cache_key(g: TileGfx, block: String, comp_req: int) -> String:
+	return "%d|def|%s|%d|%s|%s|%s" % [CACHE_VERSION, g.name, comp_req, str(g.tint), _data_stamp, block]
+
+
+static func _rec_cache_key(g: TileGfx, rec: Dictionary, fp: String, comp_req: int) -> String:
+	return "%d|rec|%s|%d|%s|%s" % [CACHE_VERSION, g.name, comp_req, fp, JSON.stringify(rec)]
+
+
+static func _pack_cache_key(g: TileGfx, files: Array, spec: Dictionary, comp_req: int) -> String:
+	var fparts := PackedStringArray()
+	for f: Variant in files:
+		var p := str(f)
+		fparts.append("%s:%d:%d" % [p, FileAccess.get_size(p), FileAccess.get_modified_time(p)])
+	return "%d|pack|%s|%d|%s|%s" % [CACHE_VERSION, g.name, comp_req, JSON.stringify(spec), "|".join(fparts)]
+
+
+static func _cache_path(tile_name: String, key_hash: String) -> String:
+	return CACHE_DIR.path_join("terrain-%s-%s.bin" % [tile_name.validate_filename(), key_hash.substr(0, 16)])
+
+
+static func _read_tile_cache(g: TileGfx, key: String, comp_req: int) -> Image:
+	if not disk_cache or key == "":
+		return null
+	var key_hash := key.sha256_text()
+	var path := _cache_path(g.name, key_hash)
+	if not FileAccess.file_exists(path):
+		return null
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return null
+	var raw: Variant = f.get_var(false)
+	f.close()
+	if not (raw is Dictionary):
+		return null
+	var d := raw as Dictionary
+	if int(d.get("v", 0)) != CACHE_VERSION or str(d.get("k", "")) != key_hash:
+		return null
+	var w := int(d.get("w", 0))
+	var h := int(d.get("h", 0))
+	var fmt := int(d.get("fmt", -1))
+	var raw_len := int(d.get("raw_len", 0))
+	var raw_data: Variant = d.get("data")
+	if w <= 0 or h <= 0 or fmt < 0 or raw_len <= 0 or not (raw_data is PackedByteArray):
+		return null
+	if (comp_req == 0 and fmt != Image.FORMAT_RGBA8) or (comp_req != 0 and fmt == Image.FORMAT_RGBA8):
+		return null
+	var packed: PackedByteArray = raw_data
+	var bytes: PackedByteArray = packed.decompress(raw_len, FileAccess.COMPRESSION_FASTLZ) if int(d.get("comp", 0)) == 1 else packed
+	if bytes.size() != raw_len:
+		return null
+	var img := Image.create_from_data(w, h, bool(d.get("mip", true)), fmt as Image.Format, bytes)
+	if img == null or img.is_empty():
+		return null
+	var raw_sizes: Variant = d.get("sizes")
+	var raw_mat: Variant = d.get("mat")
+	g.sizes = raw_sizes if raw_sizes is Array else []
+	g.material = raw_mat if raw_mat is Vector2i else Vector2i.ZERO
+	g.material_count = int(d.get("mat_n", 0))
+	g.reflect = float(d.get("ref", 1.0))
 	_loaded_mutex.lock()
-	_loaded[g.name] = image
+	cache_hits += 1
 	_loaded_mutex.unlock()
+	return img
+
+
+static func _write_tile_cache(g: TileGfx, key: String, img: Image) -> void:
+	if not disk_cache or key == "" or img == null or img.is_empty():
+		return
+	_cache_mutex.lock()
+	if not _cache_dir_made:
+		DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(CACHE_DIR))
+		_cache_dir_made = true
+	_cache_mutex.unlock()
+	var key_hash := key.sha256_text()
+	var path := _cache_path(g.name, key_hash)
+	var tmp := path + ".tmp." + str(OS.get_thread_caller_id())
+	var raw := img.get_data()
+	var comp := 0
+	var payload := raw
+	if img.get_format() == Image.FORMAT_RGBA8:
+		var z := raw.compress(FileAccess.COMPRESSION_FASTLZ)
+		if not z.is_empty() and z.size() < raw.size():
+			payload = z
+			comp = 1
+	var f := FileAccess.open(tmp, FileAccess.WRITE)
+	if f == null:
+		return
+	var entry := {
+		"v": CACHE_VERSION, "k": key_hash,
+		"w": img.get_width(), "h": img.get_height(), "fmt": int(img.get_format()), "mip": img.has_mipmaps(),
+		"comp": comp, "raw_len": raw.size(), "data": payload,
+		"sizes": g.sizes, "mat": g.material, "mat_n": g.material_count, "ref": g.reflect,
+	}
+	f.store_var(entry, false)
+	var ok := f.get_error() == OK
+	f.close()
+	var abs_tmp := ProjectSettings.globalize_path(tmp)
+	var abs_path := ProjectSettings.globalize_path(path)
+	if not ok or DirAccess.rename_absolute(abs_tmp, abs_path) != OK:
+		if FileAccess.file_exists(tmp):
+			DirAccess.remove_absolute(abs_tmp)
+		return
+	_cache_mutex.lock()
+	_cache_writes += 1
+	_cache_mutex.unlock()
+
+
+static func _prune_tile_cache() -> void:
+	_cache_mutex.lock()
+	var writes := _cache_writes
+	_cache_writes = 0
+	_cache_mutex.unlock()
+	if writes <= 0 or not DirAccess.dir_exists_absolute(ProjectSettings.globalize_path(CACHE_DIR)):
+		return
+	var files: Array = []
+	for fname in DirAccess.get_files_at(CACHE_DIR):
+		if fname.begins_with("terrain-") and fname.ends_with(".bin"):
+			files.append([FileAccess.get_modified_time(CACHE_DIR.path_join(fname)), fname])
+	if files.size() <= CACHE_KEEP:
+		return
+	files.sort()
+	while files.size() > CACHE_KEEP:
+		var oldest: String = str(files.pop_front()[1])
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(CACHE_DIR.path_join(oldest)))
+
+
+static func _load_record(g: TileGfx, rec: Dictionary, fp := "", comp_req := _compress, holder := [], maps := {}, spec := {}) -> void:
+	var t0 := Time.get_ticks_msec()
+	var from_cache := true
+	var image := _read_tile_cache(g, _rec_cache_key(g, rec, fp, comp_req), comp_req)
+	if image == null:
+		from_cache = false
+		image = _build_layer_from_record(g, rec)
+		if image != null:
+			var actual_comp := 0 if image.get_format() == Image.FORMAT_RGBA8 else 1
+			_write_tile_cache(g, _rec_cache_key(g, rec, fp, actual_comp), image)
+	if image != null and not maps.is_empty():
+		_build_pbr_layer(g, maps, spec, holder)
+	if not holder.is_empty():
+		holder[0] = image
 	if image != null:
-		print_verbose("Terrain: %s from its mod's graphics (layer %d, %d ms)" % [g.name, g.priority, Time.get_ticks_msec() - t0])
+		print_verbose("Terrain: %s from %s (layer %d, %d ms)" % [g.name, "disk cache" if from_cache else "its mod's graphics", g.priority, Time.get_ticks_msec() - t0])
+
+
+static func _load_pack(g: TileGfx, files: Array, block: String, spec: Dictionary, comp_req := _compress, holder := [], maps := {}) -> void:
+	var t0 := Time.get_ticks_msec()
+	var from_cache := true
+	var image := _read_tile_cache(g, _pack_cache_key(g, files, spec, comp_req), comp_req)
+	if image == null:
+		from_cache = false
+		image = _build_layer_from_pack(g, files, block, spec)
+		if image != null:
+			var actual_comp := 0 if image.get_format() == Image.FORMAT_RGBA8 else 1
+			_write_tile_cache(g, _pack_cache_key(g, files, spec, actual_comp), image)
+	if image != null and not maps.is_empty():
+		_build_pbr_layer(g, maps, spec, holder)
+	if not holder.is_empty():
+		holder[0] = image
+	if image != null:
+		print_verbose("Terrain: %s from %s (layer %d, %d ms)" % [g.name, "disk cache" if from_cache else "model pack", g.priority, Time.get_ticks_msec() - t0])
+
+
+static func _load_pack_image(path: String) -> Image:
+	var img: Image = null
+	if path.begins_with("res://") and not FileAccess.file_exists(path):
+		var tex := load(path) as Texture2D
+		if tex != null:
+			img = tex.get_image()
+	else:
+		img = Image.load_from_file(path)
+	if img == null or img.is_empty():
+		return null
+	if img.is_compressed():
+		img.decompress()
+	img.convert(Image.FORMAT_RGBA8)
+	return img
+
+
+static func _pbr_cache_key(g: TileGfx, maps: Dictionary, spec: Dictionary) -> String:
+	var parts := PackedStringArray()
+	for kind: String in ["normal", "height", "roughness"]:
+		var files: Variant = maps.get(kind)
+		if files is Array:
+			for f: Variant in files:
+				var p := str(f)
+				parts.append("%s:%s:%d:%d" % [kind, p, FileAccess.get_size(p), FileAccess.get_modified_time(p)])
+	var sp := {
+		"flip_x": bool(spec.get("normal_flip_x", false)),
+		"flip_y": bool(spec.get("normal_flip_y", false)),
+		"count": int(spec.get("count", 1)),
+		"size": spec.get("size", []),
+		"sizes": g.sizes,
+		"mat": [g.material.x, g.material.y, g.material_count],
+	}
+	return "%d|pbr|%s|%s|%s" % [CACHE_VERSION, g.name, JSON.stringify(sp), "|".join(parts)]
+
+
+static func _read_pbr_cache(tile_name: String, key: String) -> Array:
+	if not disk_cache or key == "":
+		return []
+	var key_hash := key.sha256_text()
+	var path := _cache_path(tile_name + "-pbr", key_hash)
+	if not FileAccess.file_exists(path):
+		return []
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return []
+	var raw: Variant = f.get_var(false)
+	f.close()
+	if not (raw is Dictionary):
+		return []
+	var d := raw as Dictionary
+	if int(d.get("v", 0)) != CACHE_VERSION or str(d.get("k", "")) != key_hash:
+		return []
+	var w := int(d.get("w", 0))
+	var h := int(d.get("h", 0))
+	var raw_len := int(d.get("raw_len", 0))
+	var raw_data: Variant = d.get("data")
+	if w <= 0 or h <= 0 or raw_len <= 0 or not (raw_data is PackedByteArray):
+		return []
+	var packed: PackedByteArray = raw_data
+	var bytes: PackedByteArray = packed.decompress(raw_len, FileAccess.COMPRESSION_FASTLZ) if int(d.get("comp", 0)) == 1 else packed
+	if bytes.size() != raw_len:
+		return []
+	var img := Image.create_from_data(w, h, bool(d.get("mip", true)), Image.FORMAT_RGBA8, bytes)
+	if img == null or img.is_empty():
+		return []
+	return [img, int(d.get("pflags", 0))]
+
+
+static func _write_pbr_cache(tile_name: String, key: String, img: Image, pflags: int) -> void:
+	if not disk_cache or key == "" or img == null or img.is_empty():
+		return
+	_cache_mutex.lock()
+	if not _cache_dir_made:
+		DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(CACHE_DIR))
+		_cache_dir_made = true
+	_cache_mutex.unlock()
+	var key_hash := key.sha256_text()
+	var path := _cache_path(tile_name + "-pbr", key_hash)
+	var tmp := path + ".tmp." + str(OS.get_thread_caller_id())
+	var raw := img.get_data()
+	var comp := 0
+	var payload := raw
+	var z := raw.compress(FileAccess.COMPRESSION_FASTLZ)
+	if not z.is_empty() and z.size() < raw.size():
+		payload = z
+		comp = 1
+	var f := FileAccess.open(tmp, FileAccess.WRITE)
+	if f == null:
+		return
+	var entry := {
+		"v": CACHE_VERSION, "k": key_hash, "pflags": pflags,
+		"w": img.get_width(), "h": img.get_height(), "mip": img.has_mipmaps(),
+		"comp": comp, "raw_len": raw.size(), "data": payload,
+	}
+	f.store_var(entry, false)
+	var ok := f.get_error() == OK
+	f.close()
+	var abs_tmp := ProjectSettings.globalize_path(tmp)
+	var abs_path := ProjectSettings.globalize_path(path)
+	if not ok or DirAccess.rename_absolute(abs_tmp, abs_path) != OK:
+		if FileAccess.file_exists(tmp):
+			DirAccess.remove_absolute(abs_tmp)
+		return
+	_cache_mutex.lock()
+	_cache_writes += 1
+	_cache_mutex.unlock()
+
+
+## Repacks optional -normal, -height, and -roughness maps into one linear 2048 x 1024 RGBA8
+## companion layer aligned to g's slot layout (RG = XY normal, B = roughness, A = height).
+static func _build_pbr_layer(g: TileGfx, maps: Dictionary, spec: Dictionary, holder: Array) -> void:
+	if maps.is_empty() or holder.size() < 5:
+		return
+	var pbr_key := _pbr_cache_key(g, maps, spec)
+	var cached := _read_pbr_cache(g.name, pbr_key)
+	var norm_strength := clampf(float(spec.get("normal_strength", 1.0)), 0.0, 4.0)
+	var height_strength := clampf(float(spec.get("height_strength", 1.0)), 0.0, 4.0)
+	if cached.size() == 2:
+		holder[1] = cached[0]
+		holder[2] = cached[1]
+		holder[3] = norm_strength
+		holder[4] = height_strength
+		return
+	var n_img: Image = _repack_map_into_slots(g, maps.get("normal", []), spec, true) if maps.has("normal") else null
+	var h_img: Image = _repack_map_into_slots(g, maps.get("height", []), spec, false) if maps.has("height") else null
+	var r_img: Image = _repack_map_into_slots(g, maps.get("roughness", []), spec, false) if maps.has("roughness") else null
+	var flags := (1 if n_img != null else 0) | (2 if h_img != null else 0) | (4 if r_img != null else 0)
+	if flags == 0:
+		return
+	var lw := COLS * PX
+	var lh := ROWS * PX
+	var total := lw * lh * 4
+	var out_bytes := PackedByteArray()
+	out_bytes.resize(total)
+	var n_bytes := n_img.get_data() if n_img != null else PackedByteArray()
+	var h_bytes := h_img.get_data() if h_img != null else PackedByteArray()
+	var r_bytes := r_img.get_data() if r_img != null else PackedByteArray()
+	var flip_x := bool(spec.get("normal_flip_x", false))
+	var flip_y := bool(spec.get("normal_flip_y", false))
+	var has_n := not n_bytes.is_empty()
+	var has_h := not h_bytes.is_empty()
+	var has_r := not r_bytes.is_empty()
+	var o := 0
+	while o < total:
+		if has_n:
+			var nx := n_bytes[o]
+			var ny := n_bytes[o + 1]
+			out_bytes[o] = 255 - nx if flip_x else nx
+			out_bytes[o + 1] = 255 - ny if flip_y else ny
+		else:
+			out_bytes[o] = 128
+			out_bytes[o + 1] = 128
+		out_bytes[o + 2] = r_bytes[o] if has_r else 255
+		out_bytes[o + 3] = h_bytes[o] if has_h else 128
+		o += 4
+	var pbr := Image.create_from_data(lw, lh, false, Image.FORMAT_RGBA8, out_bytes)
+	pbr.generate_mipmaps()
+	_write_pbr_cache(g.name, pbr_key, pbr, flags)
+	holder[1] = pbr
+	holder[2] = flags
+	holder[3] = norm_strength
+	holder[4] = height_strength
+
+
+static func _clamp_template_slot_borders(layer: Image, dst: Vector2i, sw: int, clamp_top: bool, clamp_bottom: bool, clamp_right: bool) -> void:
+	if sw < 4:
+		return
+	if clamp_top:
+		layer.blit_rect(layer, Rect2i(dst.x, dst.y + 1, sw, 1), Vector2i(dst.x, dst.y))
+	if clamp_bottom:
+		layer.blit_rect(layer, Rect2i(dst.x, dst.y + sw - 2, sw, 1), Vector2i(dst.x, dst.y + sw - 1))
+	if clamp_right:
+		layer.blit_rect(layer, Rect2i(dst.x + sw - 2, dst.y, 1, sw), Vector2i(dst.x + sw - 1, dst.y))
+
+
+static func _repack_map_into_slots(g: TileGfx, files: Array, spec: Dictionary, is_normal: bool) -> Image:
+	if files.is_empty():
+		return null
+	var images: Array[Image] = []
+	for f: Variant in files:
+		var im := _load_pack_image(str(f))
+		if im != null:
+			images.append(im)
+	if images.is_empty():
+		return null
+	var layer := Image.create_empty(COLS * PX, ROWS * PX, false, Image.FORMAT_RGBA8)
+	if not g.sizes.is_empty():
+		if images.size() == 1 and _is_template_sheet(images[0]) and not spec.has("size") and not spec.has("count"):
+			var sheet := images[0]
+			sheet.convert(Image.FORMAT_RGB8)
+			sheet.convert(Image.FORMAT_RGBA8)
+			var any := false
+			for entry: Array in g.sizes:
+				var s := int(entry[0])
+				var cnt := int(entry[3])
+				var y: int = TEMPLATE_Y[s]
+				cnt = mini(cnt, mini(16, sheet.get_width() / (s * PX)))
+				if y + s * PX > sheet.get_height() or cnt <= 0:
+					continue
+				var sw := s * PX
+				for v in cnt:
+					var dst := _slot_px(s, v)
+					layer.blit_rect(sheet, Rect2i(v * sw, y, sw, sw), dst)
+					if is_normal:
+						_clamp_template_slot_borders(layer, dst, sw, y > 0, s < 4, v == cnt - 1 and cnt * sw < sheet.get_width())
+				any = true
+			if not any:
+				return null
+			_fill_empty_slots(layer)
+			return layer
+		var im0: Image = images[0].duplicate()
+		var wf := float(im0.get_width()) / float(PX)
+		var hf := float(im0.get_height()) / float(PX)
+		if wf > float(COLS) or hf > float(ROWS):
+			var scale_down := minf(float(COLS) / wf, float(ROWS) / hf)
+			wf *= scale_down
+			hf *= scale_down
+		var w := clampi(roundi(wf), 1, COLS)
+		var h := clampi(roundi(hf), 1, ROWS)
+		if spec.has("size"):
+			var sz: Array = spec["size"]
+			w = clampi(int(sz[0]), 1, COLS)
+			h = clampi(int(sz[1]), 1, ROWS)
+		var target_w := w * PX
+		var target_h := h * PX
+		if im0.get_width() != target_w or im0.get_height() != target_h:
+			var interp := Image.INTERPOLATE_LANCZOS if (im0.get_width() > target_w or im0.get_height() > target_h) else Image.INTERPOLATE_BILINEAR
+			im0.resize(target_w, target_h, interp)
+		im0.convert(Image.FORMAT_RGB8)
+		im0.convert(Image.FORMAT_RGBA8)
+		layer.blit_rect(im0, Rect2i(0, 0, target_w, target_h), Vector2i.ZERO)
+		_tile_fill_layer(layer, target_w, target_h)
+		return layer
+	if g.material_count > 0:
+		var w := clampi(g.material.x, 1, COLS)
+		var h := clampi(g.material.y, 1, ROWS)
+		if images.size() == 1:
+			var cnt := int(spec.get("count", 1))
+			if cnt <= 1 and g.material_count > 1 and images[0].get_width() >= images[0].get_height() * g.material_count:
+				cnt = g.material_count
+			if cnt > 1:
+				var strip := images[0]
+				var sw := strip.get_width() / cnt
+				var sh := strip.get_height()
+				if sw > 0 and sh > 0:
+					var sliced: Array[Image] = []
+					for i in cnt:
+						sliced.append(strip.get_region(Rect2i(i * sw, 0, sw, sh)))
+					images = sliced
+		var per_row := COLS / w
+		var target_w := w * PX
+		var target_h := h * PX
+		for v in g.material_count:
+			var im: Image = images[v % images.size()].duplicate()
+			if im.get_width() != target_w or im.get_height() != target_h:
+				var interp := Image.INTERPOLATE_LANCZOS if (im.get_width() > target_w or im.get_height() > target_h) else Image.INTERPOLATE_BILINEAR
+				im.resize(target_w, target_h, interp)
+			im.convert(Image.FORMAT_RGB8)
+			im.convert(Image.FORMAT_RGBA8)
+			layer.blit_rect(im, Rect2i(0, 0, target_w, target_h), Vector2i((v % per_row) * w, (v / per_row) * h) * PX)
+		if g.material_count == 1:
+			_tile_fill_layer(layer, target_w, target_h)
+		else:
+			_fill_empty_slots(layer)
+		return layer
+	return null
+
+
+static func _build_layer_from_pack(g: TileGfx, files: Array, block: String, spec: Dictionary) -> Image:
+	var images: Array[Image] = []
+	for f: Variant in files:
+		var im := _load_pack_image(str(f))
+		if im != null:
+			images.append(im)
+	if images.is_empty():
+		return null
+	var layer := Image.create_empty(COLS * PX, ROWS * PX, false, Image.FORMAT_RGBA8)
+	# Mode A: Factorio-style template sheet (1x1, 2x2, 4x4 rows).
+	if images.size() == 1 and _is_template_sheet(images[0]) and not spec.has("size") and not spec.has("count"):
+		var sheet: Image = images[0]
+		var max_size := int(_num(block, "max_size", 4)) if block != "" else 4
+		var default_probs := {4: 0.4, 2: 0.6, 1: 1.0}
+		var any := false
+		for s in [4, 2, 1]:
+			if s > max_size:
+				continue
+			var opts: Array = _size_options(block, s) if block != "" else [float(default_probs[s]), PackedFloat32Array()]
+			var weights: PackedFloat32Array = opts[1]
+			var count := weights.size() if not weights.is_empty() else 16
+			var y: int = TEMPLATE_Y[s]
+			count = mini(count, mini(16, sheet.get_width() / (s * PX)))
+			if y + s * PX > sheet.get_height() or count <= 0:
+				continue
+			for v in count:
+				layer.blit_rect(sheet, Rect2i(v * s * PX, y, s * PX, s * PX), _slot_px(s, v))
+			g.sizes.append([s, opts[0], _cumulative(weights, count), count])
+			any = true
+		if not any:
+			return null
+		_fill_empty_slots(layer)
+		return _finish_layer(layer)
+	# Mode B: Horizontal strip of `count` variants in one image.
+	if images.size() == 1 and int(spec.get("count", 1)) > 1:
+		var strip: Image = images[0]
+		var cnt := int(spec["count"])
+		var sw := strip.get_width() / cnt
+		var sh := strip.get_height()
+		if sw <= 0 or sh <= 0:
+			return null
+		var sliced: Array[Image] = []
+		for i in cnt:
+			sliced.append(strip.get_region(Rect2i(i * sw, 0, sw, sh)))
+		images = sliced
+	# Mode C: Seamless texture or multi-variant list packed into material_background slots.
+	var w := 1
+	var h := 1
+	if spec.has("size"):
+		var sz: Array = spec["size"]
+		w = clampi(int(sz[0]), 1, COLS)
+		h = clampi(int(sz[1]), 1, ROWS)
+	else:
+		var img0: Image = images[0]
+		var wf := float(img0.get_width()) / float(PX)
+		var hf := float(img0.get_height()) / float(PX)
+		if wf > float(COLS) or hf > float(ROWS):
+			var scale_down := minf(float(COLS) / wf, float(ROWS) / hf)
+			wf *= scale_down
+			hf *= scale_down
+		w = clampi(roundi(wf), 1, COLS)
+		h = clampi(roundi(hf), 1, ROWS)
+		if images.size() > 1:
+			while (COLS / w) * (ROWS / h) < images.size() and (w > 1 or h > 1):
+				if w >= h and w > 1:
+					w = maxi(1, w / 2)
+				elif h > 1:
+					h = maxi(1, h / 2)
+	var per_row := COLS / w
+	var max_slots := per_row * (ROWS / h)
+	var count := mini(images.size(), max_slots)
+	if count <= 0:
+		return null
+	var target_w := w * PX
+	var target_h := h * PX
+	for v in count:
+		var im: Image = images[v].duplicate()
+		if im.get_width() != target_w or im.get_height() != target_h:
+			var interp := Image.INTERPOLATE_LANCZOS if (im.get_width() > target_w or im.get_height() > target_h) else Image.INTERPOLATE_BILINEAR
+			im.resize(target_w, target_h, interp)
+		# Keep alpha solid so _fill_empty_slots never mistakes a translucent pixel for an empty slot.
+		im.convert(Image.FORMAT_RGB8)
+		im.convert(Image.FORMAT_RGBA8)
+		layer.blit_rect(im, Rect2i(0, 0, target_w, target_h), Vector2i((v % per_row) * w, (v / per_row) * h) * PX)
+	g.material = Vector2i(w, h)
+	g.material_count = count
+	if count == 1:
+		_tile_fill_layer(layer, target_w, target_h)
+	else:
+		_fill_empty_slots(layer)
+	return _finish_layer(layer)
+
+
+## Repeats a single `(0, 0, bw, bh)` seamless block across the whole layer so mipmaps and filtering
+## wrap cleanly past the block's edges.
+static func _tile_fill_layer(layer: Image, bw: int, bh: int) -> void:
+	var lw := COLS * PX
+	var lh := ROWS * PX
+	for y in range(0, lh, bh):
+		for x in range(0, lw, bw):
+			if x == 0 and y == 0:
+				continue
+			layer.blit_rect(layer, Rect2i(0, 0, mini(bw, lw - x), mini(bh, lh - y)), Vector2i(x, y))
 
 
 ## One layer from the bridge's record (gfx_extract.lua's tile format), as _build_layer does from
@@ -463,19 +1097,32 @@ static func _scaled(sheet: Image, scale: float) -> Image:
 	return sheet
 
 
-static func _load(g: TileGfx, block: String) -> void:
+static func _load(g: TileGfx, block: String, comp_req := _compress, holder := [], maps := {}, spec := {}) -> void:
 	var t0 := Time.get_ticks_msec()
-	var image := _build_layer(g, block)
-	_loaded_mutex.lock()
-	_loaded[g.name] = image
-	_loaded_mutex.unlock()
+	var from_cache := true
+	var image := _read_tile_cache(g, _def_cache_key(g, block, comp_req), comp_req)
+	if image == null:
+		from_cache = false
+		image = _build_layer(g, block)
+		if image != null:
+			var actual_comp := 0 if image.get_format() == Image.FORMAT_RGBA8 else 1
+			_write_tile_cache(g, _def_cache_key(g, block, actual_comp), image)
+	if image != null and not maps.is_empty():
+		_build_pbr_layer(g, maps, spec, holder)
+	if not holder.is_empty():
+		holder[0] = image
 	if image != null:
-		print_verbose("Terrain: %s from Factorio's graphics (layer %d, %d ms)" % [g.name, g.priority, Time.get_ticks_msec() - t0])
+		print_verbose("Terrain: %s from %s (layer %d, %d ms)" % [g.name, "disk cache" if from_cache else "Factorio's graphics", g.priority, Time.get_ticks_msec() - t0])
 
 
 ## Hands out the pictures read since the last call and puts them on the GPU. Main thread, once a
 ## frame. True when lookup() can answer more tiles than before.
 static func poll() -> bool:
+	_sync_packs()
+	for i in range(_abandoned_tasks.size() - 1, -1, -1):
+		if WorkerThreadPool.is_task_completed(_abandoned_tasks[i]):
+			WorkerThreadPool.wait_for_task_completion(_abandoned_tasks[i])
+			_abandoned_tasks.remove_at(i)
 	if _list_generation != ModGraphics.generation:
 		# A graphics list arrived: tiles drawn in their map colour so far may have pictures now.
 		_list_generation = ModGraphics.generation
@@ -486,11 +1133,13 @@ static func poll() -> bool:
 				relook = true
 				layout += 1
 	for tile_name in _pending.keys():
-		var task: int = _pending[tile_name][0]
+		var entry: Array = _pending[tile_name]
+		var task := int(entry[0])
 		if not WorkerThreadPool.is_task_completed(task):
 			continue
-		_publish(tile_name, task)
+		_publish(tile_name, task, entry[2] as Array)
 	commit()
+	_prune_tile_cache()
 	var changed := _changed
 	_changed = false
 	if changed:
@@ -500,19 +1149,20 @@ static func poll() -> bool:
 
 ## Waits for the pictures still being read (before quitting).
 static func finish_all() -> void:
+	for task in _abandoned_tasks:
+		WorkerThreadPool.wait_for_task_completion(task)
+	_abandoned_tasks.clear()
 	for tile_name in _pending.keys():
-		_publish(tile_name, _pending[tile_name][0])
+		var entry: Array = _pending[tile_name]
+		_publish(tile_name, int(entry[0]), entry[2] as Array)
 	commit(true)
 
 
-static func _publish(tile_name: String, task: int) -> void:
+static func _publish(tile_name: String, task: int, holder: Array) -> void:
 	WorkerThreadPool.wait_for_task_completion(task)
 	var g: TileGfx = _pending[tile_name][1]
 	_pending.erase(tile_name)
-	_loaded_mutex.lock()
-	var image: Image = _loaded.get(tile_name)
-	_loaded.erase(tile_name)
-	_loaded_mutex.unlock()
+	var image: Image = holder[0] if not holder.is_empty() else null
 	if image == null:
 		g.sizes = []
 		g.material_count = 0
@@ -521,6 +1171,16 @@ static func _publish(tile_name: String, task: int) -> void:
 		_images.append(image)
 		_infos.append(g.shader_info())
 		_reflects.append(g.reflect)
+		var pbr_img: Image = holder[1] if holder.size() >= 2 else null
+		if pbr_img != null:
+			var pbr_idx := _pbr_images.size()
+			_pbr_images.append(pbr_img)
+			var pflags := int(holder[2]) if holder.size() >= 3 else 0
+			var ns := float(holder[3]) if holder.size() >= 4 else 1.0
+			var hs := float(holder[4]) if holder.size() >= 5 else 1.0
+			_pbr_metas.append(Color(float(pbr_idx), float(pflags), ns, hs))
+		else:
+			_pbr_metas.append(Color(-1.0, 0.0, 1.0, 1.0))
 		_dirty = true
 		if upload_thread:
 			_staged[tile_name] = g  # known once the array with its layer is in use (commit)
@@ -543,7 +1203,9 @@ static func commit(wait := false) -> void:
 			var holder: Array = _upload[1]
 			if holder[0] != null:
 				_take_array(holder[0], int(_upload[5]), int(_upload[4]))
-				_apply(_upload[2], _upload[3])
+				if holder.size() >= 2 and holder[1] != null:
+					_take_pbr_array(holder[1], int(_upload[8]), int(_upload[7]))
+				_apply(_upload[2], _upload[3], _upload[6])
 			_release(int(_upload[4]))
 			_upload = []
 		if not _dirty or _images.is_empty():
@@ -554,24 +1216,65 @@ static func commit(wait := false) -> void:
 			if not _fit(i):
 				_plain_all()  # (a picture that wouldn't compress after others did: rare)
 				break
-		if not (rebuild_layers or _room < _images.size() or _uploaded > _images.size()):
+		var need_albedo := rebuild_layers or _room < _images.size() or _uploaded > _images.size()
+		var need_pbr := not _pbr_images.is_empty() and (_pbr_array == null or rebuild_layers or _pbr_room < _pbr_images.size() or _pbr_uploaded > _pbr_images.size())
+		if not need_albedo and not need_pbr:
 			for i in range(_uploaded, _images.size()):
 				_array.update_layer(_images[i], i)
 				layers_written += 1
 			_uploaded = _images.size()
-			_apply(_infos, _reflects)
+			for i in range(_pbr_uploaded, _pbr_images.size()):
+				_pbr_array.update_layer(_pbr_images[i], i)
+			_pbr_uploaded = _pbr_images.size()
+			_apply(_infos, _reflects, _pbr_metas)
 			_release(_uploaded)
 			return
+		if not need_albedo and need_pbr:
+			for i in range(_uploaded, _images.size()):
+				_array.update_layer(_images[i], i)
+				layers_written += 1
+			_uploaded = _images.size()
+			var pbr_layers := _pbr_layers_with_room()
+			if not upload_thread:
+				var parr := Texture2DArray.new()
+				if _make_array(parr, pbr_layers):
+					_take_pbr_array(parr, pbr_layers.size(), _pbr_images.size())
+					_apply(_infos, _reflects, _pbr_metas)
+				_release(_uploaded)
+				return
+			var holder: Array = [_array, Texture2DArray.new()]
+			_upload = [WorkerThreadPool.add_task(_upload_task.bind(holder, [], pbr_layers), false, "terrain pbr layers"),
+				holder, _infos.duplicate(), _reflects.duplicate(), _images.size(), _room,
+				_pbr_metas.duplicate(), _pbr_images.size(), pbr_layers.size()]
+			if not wait:
+				return
+			continue
 		var layers := _layers_with_room()
+		var pbr_layers: Array[Image] = []
+		if need_pbr:
+			pbr_layers = _pbr_layers_with_room()
 		if not upload_thread:
 			var arr := Texture2DArray.new()
 			if _make_array(arr, layers):
 				_take_array(arr, layers.size(), _images.size())
-				_apply(_infos, _reflects)
+				if need_pbr:
+					var parr := Texture2DArray.new()
+					if _make_array(parr, pbr_layers):
+						_take_pbr_array(parr, pbr_layers.size(), _pbr_images.size())
+				elif _pbr_array != null:
+					for i in range(_pbr_uploaded, _pbr_images.size()):
+						_pbr_array.update_layer(_pbr_images[i], i)
+					_pbr_uploaded = _pbr_images.size()
+				_apply(_infos, _reflects, _pbr_metas)
 			return
-		var holder: Array = [Texture2DArray.new()]
-		_upload = [WorkerThreadPool.add_task(_upload_task.bind(holder, layers), false, "terrain layers"), holder,
-			_infos.duplicate(), _reflects.duplicate(), _images.size(), layers.size()]
+		var holder: Array = [Texture2DArray.new(), Texture2DArray.new() if need_pbr else null]
+		if not need_pbr and _pbr_array != null:
+			for i in range(_pbr_uploaded, _pbr_images.size()):
+				_pbr_array.update_layer(_pbr_images[i], i)
+			_pbr_uploaded = _pbr_images.size()
+		_upload = [WorkerThreadPool.add_task(_upload_task.bind(holder, layers, pbr_layers), false, "terrain layers"),
+			holder, _infos.duplicate(), _reflects.duplicate(), _images.size(), layers.size(),
+			_pbr_metas.duplicate(), _pbr_images.size(), pbr_layers.size() if need_pbr else _pbr_room]
 		if not wait:
 			return
 
@@ -586,9 +1289,13 @@ static func _release(layers: int) -> void:
 
 
 ## A worker's part: the array made from the layers it was given (null in `holder` if that failed).
-static func _upload_task(holder: Array, images: Array) -> void:
-	if not _make_array(holder[0], images):
-		holder[0] = null
+static func _upload_task(holder: Array, images: Array, pbr_images: Array = []) -> void:
+	if not images.is_empty():
+		if not _make_array(holder[0], images):
+			holder[0] = null
+	if not pbr_images.is_empty() and holder.size() >= 2 and holder[1] != null:
+		if not _make_array(holder[1], pbr_images):
+			holder[1] = null
 
 
 static func _make_array(arr: Texture2DArray, images: Array) -> bool:
@@ -600,20 +1307,53 @@ static func _make_array(arr: Texture2DArray, images: Array) -> bool:
 
 
 ## The array in use and the layers' table go to the ground's materials.
-static func _apply(layer_infos: PackedColorArray, layer_reflects: PackedFloat32Array) -> void:
+static func _apply(layer_infos: PackedColorArray, layer_reflects: PackedFloat32Array, pbr_metas := PackedColorArray()) -> void:
 	# Vectors, not Colors: a Color array would be converted from sRGB on the way in.
 	var infos := PackedVector4Array()
 	infos.resize(MAX_LAYERS)
 	for i in layer_infos.size():
 		var c := layer_infos[i]
 		infos[i] = Vector4(c.r, c.g, c.b, c.a)
-	for m: ShaderMaterial in [Visuals.terrain_material(), Visuals.water_material()]:
-		m.set_shader_parameter("tiles", _array)
-		m.set_shader_parameter("tile_info", infos)
-		m.set_shader_parameter("textured", true)
+	var pbrs := PackedVector4Array()
+	pbrs.resize(MAX_LAYERS)
+	pbrs.fill(Vector4(-1.0, 0.0, 1.0, 1.0))
+	for i in mini(pbr_metas.size(), MAX_LAYERS):
+		var c := pbr_metas[i]
+		pbrs[i] = Vector4(c.r, c.g, c.b, c.a)
+	# The coast's material has them too (Visuals.set_terrain_param); the water's own.
+	Visuals.set_terrain_param(&"tiles", _array)
+	Visuals.set_terrain_param(&"tile_info", infos)
+	Visuals.set_terrain_param(&"textured", true)
+	Visuals.set_terrain_param(&"tile_pbr", pbrs)
+	var has_pbr := _pbr_array != null and not _pbr_images.is_empty()
+	Visuals.set_terrain_param(&"has_tile_pbr", has_pbr)
+	if has_pbr:
+		Visuals.set_terrain_param(&"tiles_pbr", _pbr_array)
+	var water := Visuals.water_material()
+	water.set_shader_parameter("tiles", _array)
+	water.set_shader_parameter("tile_info", infos)
+	water.set_shader_parameter("textured", true)
 	var reflects := layer_reflects.duplicate()
 	reflects.resize(MAX_LAYERS)
 	Visuals.water_material().set_shader_parameter("tile_reflect", reflects)
+
+
+static func _pbr_layers_with_room() -> Array[Image]:
+	var step := ARRAY_STEP_PLAIN
+	var room := _pbr_images.size()
+	if not rebuild_layers:
+		room = _pbr_images.size() + step
+		room = mini(room, MAX_LAYERS)
+	var layers: Array[Image] = _pbr_images.duplicate()
+	while layers.size() < room:
+		layers.append(_pbr_images[0])
+	return layers
+
+
+static func _take_pbr_array(array: Texture2DArray, room: int, n: int) -> void:
+	_pbr_array = array
+	_pbr_room = room
+	_pbr_uploaded = n
 
 
 ## Every picture loaded and room for more (copies of the first, never sampled): a new array's layers.
@@ -633,13 +1373,14 @@ static func _layers_with_room() -> Array[Image]:
 
 ## A new array in use: `room` layers, the first `n` of _images.
 static func _take_array(array: Texture2DArray, room: int, n: int) -> void:
+	if _array != array:
+		arrays_made += 1
 	_array = array
 	_room = room
 	_uploaded = n
-	if arrays_made == 0 and not OS.has_feature("editor"):
+	if arrays_made == 1 and _array == array and not OS.has_feature("editor"):
 		print("Terrain textures: the ground's pictures are kept uncompressed (this build has no texture compressor): "
 			+ "about 11 MB of video memory a kind of ground")
-	arrays_made += 1
 
 
 ## Layer `i` in the first one's format, which every layer of the array shares. False if it can't be.
@@ -687,6 +1428,13 @@ static func _read_defs() -> void:
 		return
 	_defs_read = true
 	var data := ItemIcons.factorio_data_dir()
+	if data != "":
+		var info := data.path_join("base/info.json")
+		var fi := FileAccess.open(info, FileAccess.READ)
+		var info_sz := fi.get_length() if fi != null else 0
+		if fi != null:
+			fi.close()
+		_data_stamp = "%s|%d|%d" % [info, info_sz, FileAccess.get_modified_time(info)]
 	var files: Array[String] = [data.path_join("base/prototypes/tile/tiles.lua")]
 	var sa := data.path_join("space-age/prototypes/tile")
 	if DirAccess.dir_exists_absolute(sa):
@@ -1041,4 +1789,164 @@ static func _cumulative(weights: PackedFloat32Array, count: int) -> PackedFloat3
 	for i in count:
 		total += weights[i] if i < weights.size() else 1.0
 		out.append(total)
+	return out
+
+
+## Sorted list of every tile name known from Factorio's definitions and active mods' graphics list.
+static func known_tile_names() -> Array:
+	if ItemIcons.factorio_data_dir() != "":
+		_read_defs()
+	var seen := {}
+	for k in _defs:
+		seen[str(k)] = true
+	for k in ModGraphics.tiles:
+		seen[str(k)] = true
+	var out := seen.keys()
+	out.sort()
+	return out
+
+
+## Whether Factorio's definitions or the active mods' graphics list defines `tile_name`.
+static func has_tile_def(tile_name: String) -> bool:
+	if ItemIcons.factorio_data_dir() != "":
+		_read_defs()
+		if _defs.has(tile_name):
+			return true
+	return ModGraphics.tiles.has(tile_name)
+
+
+## Swatch preview (up to 128 x 128, FORMAT_RGBA8) of Factorio's or a mod's own tile picture
+## (ignoring --plain-terrain so Model packs can preview it), or null without an install/mod.
+static func preview_image(tile_name: String) -> Image:
+	if ItemIcons.factorio_data_dir() != "":
+		_read_defs()
+	var mod_rec := _mod_tile_record(tile_name)
+	if not mod_rec.is_empty():
+		var mod_img := _preview_from_record(mod_rec)
+		if mod_img != null:
+			return mod_img
+	if ItemIcons.factorio_data_dir() == "":
+		return null
+	var block := str(_defs.get(tile_name, ""))
+	if block == "":
+		return null
+	return _preview_from_block(block, _tint_of.get(tile_name, Color.WHITE))
+
+
+## Swatch preview (up to 128 x 128, FORMAT_RGBA8) from a model pack's tile file list, spec, and optional PBR maps.
+static func pack_preview_image(files: Array, spec := {}, maps := {}) -> Image:
+	var show_files := files
+	if show_files.is_empty() and not maps.is_empty():
+		for kind: String in ["normal", "height", "roughness"]:
+			var mf: Variant = maps.get(kind)
+			if mf is Array and not (mf as Array).is_empty():
+				show_files = mf as Array
+				break
+	if show_files.is_empty():
+		return null
+	var img := _load_pack_image(str(show_files[0]))
+	if img == null or img.is_empty():
+		return null
+	if show_files.size() == 1 and _is_template_sheet(img) and not spec.has("size") and not spec.has("count"):
+		if img.get_height() >= TEMPLATE_Y[2] + 2 * PX and img.get_width() >= 2 * PX:
+			img = img.get_region(Rect2i(0, TEMPLATE_Y[2], 2 * PX, 2 * PX))
+		else:
+			img = img.get_region(Rect2i(0, 0, mini(PX, img.get_width()), mini(PX, img.get_height())))
+	elif show_files.size() == 1 and int(spec.get("count", 1)) > 1:
+		var cnt := int(spec["count"])
+		var sw := img.get_width() / cnt
+		if sw > 0:
+			img = img.get_region(Rect2i(0, 0, sw, img.get_height()))
+	elif img.get_width() != img.get_height():
+		var side := mini(img.get_width(), img.get_height())
+		img = img.get_region(Rect2i((img.get_width() - side) / 2, (img.get_height() - side) / 2, side, side))
+	return _fit_preview_swatch(img)
+
+
+static func _preview_from_record(rec: Dictionary) -> Image:
+	if rec.get("fx") is String:
+		var effect := _sheet(str(rec.fx))
+		if effect != null:
+			var r := Rect2i(0, 0, mini(128, effect.get_width()), mini(128, effect.get_height()))
+			return _fit_preview_swatch(effect.get_region(r))
+	if rec.get("mat") is Array and (rec.mat as Array).size() >= 2:
+		var m: Array = rec.mat
+		var sheet := _scaled(_sheet(str(m[0])), float(m[2]) if m.size() > 2 else 0.5)
+		var count := maxi(1, int(m[1]))
+		if sheet != null:
+			var w := maxi(1, sheet.get_width() / count)
+			return _fit_preview_swatch(sheet.get_region(Rect2i(0, 0, mini(w, sheet.get_width()), sheet.get_height())))
+	if rec.get("main") is Array:
+		for e in rec.main:
+			if e is Array and (e as Array).size() >= 6:
+				var scale := float(e[8]) if (e as Array).size() > 8 else 1.0
+				var sheet := _scaled(_sheet(str(e[0])), scale)
+				if sheet == null:
+					continue
+				var sz := clampi(int(e[2]), 1, 4)
+				var k := 2.0 * scale
+				var x0 := clampi(roundi(float(e[3]) * k), 0, maxi(0, sheet.get_width() - 1))
+				var y0 := clampi(roundi(float(e[4]) * k), 0, maxi(0, sheet.get_height() - 1))
+				var sw := mini(sz * PX, sheet.get_width() - x0)
+				var sh := mini(sz * PX, sheet.get_height() - y0)
+				if sw > 0 and sh > 0:
+					return _fit_preview_swatch(sheet.get_region(Rect2i(x0, y0, sw, sh)))
+	return null
+
+
+static func _preview_from_block(block: String, tint: Color) -> Image:
+	var effect := _effect_picture(block)
+	if effect != null:
+		return _fit_preview_swatch(effect.get_region(Rect2i(0, 0, mini(128, effect.get_width()), mini(128, effect.get_height()))))
+	var mat := RegEx.create_from_string("material_background\\s*(?:\\(\\s*\"([^\"]+)\"\\s*,\\s*(\\d+)|=\\s*\\{[^}]*?picture\\s*=\\s*\"([^\"]+)\"[^}]*?count\\s*=\\s*(\\d+))").search(block)
+	if mat != null:
+		var sheet := _sheet(mat.get_string(1) if mat.get_string(1) != "" else mat.get_string(3))
+		var count := maxi(1, int(mat.get_string(2) if mat.get_string(2) != "" else mat.get_string(4)))
+		if sheet != null:
+			var w := maxi(1, sheet.get_width() / count)
+			return _fit_preview_swatch(sheet.get_region(Rect2i(0, 0, mini(w, sheet.get_width()), sheet.get_height())))
+	var template := RegEx.create_from_string("\\w*template\\w*\\(\\s*\"([^\"]+)\"").search(block)
+	var main := RegEx.create_from_string("main\\s*=\\s*\\{").search(block)
+	var template_sheet: Image = null
+	if template != null:
+		template_sheet = _sheet(template.get_string(1), tint)
+	elif main != null:
+		var only := RegEx.create_from_string("\\{\\s*picture\\s*=\\s*\"([^\"]+)\"([^{}]*)\\}").search_all(block.substr(main.get_start()))
+		if only.size() == 1 and int(_num(only[0].get_string(2), "count", 1)) == 1:
+			var sheet := _sheet(only[0].get_string(1), tint)
+			if sheet != null and _is_template_sheet(sheet):
+				template_sheet = sheet
+	if template_sheet != null:
+		if template_sheet.get_height() >= TEMPLATE_Y[2] + 2 * PX and template_sheet.get_width() >= 2 * PX:
+			return _fit_preview_swatch(template_sheet.get_region(Rect2i(0, TEMPLATE_Y[2], 2 * PX, 2 * PX)))
+		return _fit_preview_swatch(template_sheet.get_region(Rect2i(0, 0, mini(PX, template_sheet.get_width()), mini(PX, template_sheet.get_height()))))
+	if main != null:
+		var entries := RegEx.create_from_string("\\{\\s*picture\\s*=\\s*\"([^\"]+)\"([^{}]*)\\}").search_all(block.substr(main.get_start()))
+		for e in entries:
+			var sheet := _sheet(e.get_string(1), tint)
+			if sheet == null:
+				continue
+			var props := e.get_string(2)
+			var s := clampi(int(_num(props, "size", 1)), 1, 4)
+			var x0 := clampi(int(_num(props, "x", 0)), 0, maxi(0, sheet.get_width() - 1))
+			var y0 := clampi(int(_num(props, "y", 0)), 0, maxi(0, sheet.get_height() - 1))
+			var sw := mini(s * PX, sheet.get_width() - x0)
+			var sh := mini(s * PX, sheet.get_height() - y0)
+			if sw > 0 and sh > 0:
+				return _fit_preview_swatch(sheet.get_region(Rect2i(x0, y0, sw, sh)))
+	return null
+
+
+static func _fit_preview_swatch(img: Image) -> Image:
+	if img == null or img.is_empty():
+		return null
+	var out := img.duplicate() as Image
+	if out.is_compressed():
+		out.decompress()
+	out.convert(Image.FORMAT_RGBA8)
+	var w := out.get_width()
+	var h := out.get_height()
+	if w > 128 or h > 128:
+		var scale := minf(128.0 / float(w), 128.0 / float(h))
+		out.resize(maxi(1, roundi(w * scale)), maxi(1, roundi(h * scale)), Image.INTERPOLATE_LANCZOS)
 	return out

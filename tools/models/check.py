@@ -37,14 +37,28 @@ import specs  # noqa: E402
 
 INVENTORY = os.path.join(REPO, "docs", "ASSET-INVENTORY.md")
 ITEMS = os.path.join(REPO, "client", "assets", "models", "packs", "placeholders", "items")
+DECORATIVES_JSON = os.path.join(REPO, "client", "data", "decoratives.json")
+DECOR_SIZE = 4.5
+DECOR_BUDGET = 250
 
 
 def known_items():
     return {os.path.splitext(f)[0] for f in os.listdir(ITEMS) if f.endswith(".glb")} if os.path.isdir(ITEMS) else set()
 
 
+def known_decoratives():
+    if not os.path.isfile(DECORATIVES_JSON):
+        return set()
+    with open(DECORATIVES_JSON, encoding="utf-8") as f:
+        return set(json.load(f).keys())
+
+
 def is_item(path):
     return os.path.basename(os.path.dirname(os.path.abspath(path))).lower() == "items"
+
+
+def is_decorative(path):
+    return os.path.basename(os.path.dirname(os.path.abspath(path))).lower() == "decoratives"
 
 
 def is_ore_variant(name):
@@ -167,7 +181,24 @@ def check_item(name, lo, hi, tris, rotated, items):
     return problems
 
 
-def check(path, known, items=None):
+def check_decorative(name, lo, hi, tris, rotated, decors):
+    problems = []
+    base = re.sub(r"-\d+$", "", name)
+    if name not in decors and base not in decors:
+        problems.append("unknown decorative (not in client/data/decoratives.json)")
+    w, d = hi[0] - lo[0], hi[2] - lo[2]
+    if abs(lo[1]) > specs.GROUND_TOLERANCE:
+        problems.append("lowest point at y=%.3f, not on the ground" % lo[1])
+    if rotated:
+        problems.append("rotated root node(s) %s: model the rotation into the mesh" % ", ".join(rotated))
+    if w > DECOR_SIZE or d > DECOR_SIZE:
+        problems.append("decorative %.2f x %.2f exceeds %g x %g" % (w, d, DECOR_SIZE, DECOR_SIZE))
+    if tris > DECOR_BUDGET:
+        problems.append("%d triangles, decorative budget %d" % (tris, DECOR_BUDGET))
+    return problems
+
+
+def check(path, known, items=None, decors=None):
     name = os.path.splitext(os.path.basename(path))[0]
     problems, notes = [], []
     if is_item(path):
@@ -179,6 +210,16 @@ def check(path, known, items=None):
             return name, ["no meshes"], [], None
         problems = check_item(name, lo, hi, tris, rotated, known_items() if items is None else items)
         return "items/" + name, problems, [], "%5.2f x %5.2f x %4.2f  %6d tris" % (
+            hi[0] - lo[0], hi[2] - lo[2], hi[1] - lo[1], tris)
+    if is_decorative(path):
+        try:
+            lo, hi, tris, rotated = measure(read_glb(path))
+        except Exception as e:
+            return name, ["unreadable: %s" % e], [], None
+        if lo[0] == math.inf:
+            return name, ["no meshes"], [], None
+        problems = check_decorative(name, lo, hi, tris, rotated, known_decoratives() if decors is None else decors)
+        return "decoratives/" + name, problems, [], "%5.2f x %5.2f x %4.2f  %6d tris" % (
             hi[0] - lo[0], hi[2] - lo[2], hi[1] - lo[1], tris)
     spec = specs.SPECS.get(name)
     if spec is None and name not in known and not is_ore_variant(name):
@@ -221,6 +262,7 @@ def check(path, known, items=None):
 def main(argv):
     known = known_prototypes()
     items = known_items()
+    decors = known_decoratives()
     paths = []
     for arg in argv:
         if arg.endswith((".glb", ".gltf")):
@@ -235,7 +277,7 @@ def main(argv):
             print("FAIL %-28s missing: %s" % (os.path.basename(path), path))
             failed += 1
             continue
-        name, problems, notes, summary = check(path, known, items)
+        name, problems, notes, summary = check(path, known, items, decors)
         if packs.pack_of(path) == "fue5":
             name = "fue5/" + name  # most share a name with one of ours
         print("%s %-28s %s" % ("FAIL" if problems else "ok  ", name, summary or ""))

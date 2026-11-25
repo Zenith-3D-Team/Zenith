@@ -6,10 +6,12 @@ shader_type spatial;
 render_mode cull_disabled, depth_draw_opaque;
 
 #include "res://shaders/sprite_card.gdshaderinc"
+#include "res://shaders/lamp_light.gdshaderinc"
 
 void fragment() {
 	vec4 c = card_colour(UV, TIME);
 	ALBEDO = c.rgb;
+	EMISSION = lamp_light_emission(ALBEDO, card_xz, 0.5, 0.5);
 	ALPHA = c.a;
 	ALPHA_SCISSOR_THRESHOLD = 0.5;
 	ALPHA_ANTIALIASING_EDGE = 0.45;

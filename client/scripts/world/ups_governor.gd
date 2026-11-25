@@ -32,6 +32,7 @@ const BeltCaps := preload("res://scripts/world/belt_lanes.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const AddonRequests := preload("res://scripts/addons/addon_requests.gd")
 const PerfLog := preload("res://scripts/world/perf_log.gd")
+const RenderDistance := preload("res://scripts/world/render_distance.gd")
 
 signal changed
 
@@ -92,16 +93,30 @@ const NO_GAIN_RETRY := 300.0  # and nothing is held back for this long
 ## while work waits in the bridge's queues, up to BUDGET_MAX (about 10-15 ms of work in a tick).
 const BUDGET_DEFAULT := 300
 const BUDGET_FLOOR := 60
-const BUDGET_MAX := 600
+const BUDGET_MAX := 1800
 ## While a screenshot loads its chunks (photo, full_detail.gd cover) the budget may grow to this, by
 ## the same rule (only while the game holds HIGH and work waits), and is cut the same way: the shot
 ## is a loading screen, the bridge's photo mode gives chunks most of it (photo.lua). Back at
 ## BUDGET_MAX at once when the shot ends.
-const BUDGET_PHOTO_MAX := 1200
+const BUDGET_PHOTO_MAX := 2400
 const BUDGET_EVERY := 0.5
 const BUDGET_TIGHT := 58.5
 const BUDGET_CUT := 0.7
 const BUDGET_GROW := 1.2
+## --budget-fast=on|off (on): Lua can't read a clock, so the client times the ticks' arrival. When the ticks that
+## arrived over the last BUDGET_FAST_WINDOW seconds come under BUDGET_FAST_UPS a second (a normal window holds
+## 15 at 60 UPS; a 130 ms tick or two in it reads 50 or less), the budget is cut at once, by BUDGET_CUT, at most
+## every BUDGET_FAST_PAUSE seconds, instead of waiting for the 3 s reading (BUDGET_EVERY's cadence and
+## BUDGET_TIGHT). The growing back is the 10 s reading's, as before. Not while loading, a screenshot's full
+## detail, a pinned --bridge-budget=, Hold 60 UPS off, or when no tick arrived in the window (a save or pause).
+## Off: only the slower rule above.
+const BUDGET_FAST_WINDOW := 0.25
+const BUDGET_FAST_UPS := 50.0
+const BUDGET_FAST_PAUSE := 0.25
+var budget_fast := Settings.arg_value("--budget-fast=") != "off"
+var _fast_samples: Array = []  # [seconds, tick], the last BUDGET_FAST_WINDOW plus a frame
+var _fast_since := 1e9
+var fast_cuts := 0  # how many the fast rule made (tests, the F4 log)
 ## The first load (see the top): how much of the belt item distance loaded still counts as one, the
 ## seconds after it before the UPS is judged again, and the budget's floor meanwhile.
 const BIG_LOAD := 0.75
@@ -193,6 +208,7 @@ func _on_setting(section: String, key: String) -> void:
 ## Everything back to the player's settings (switched off; a new game makes a new governor).
 func reset() -> void:
 	_samples.clear()
+	_fast_samples.clear()
 	_ready_for = 0.0
 	_low_for = 0.0
 	_high_for = 0.0
@@ -254,6 +270,7 @@ func status() -> String:
 
 func _process(delta: float) -> void:
 	if not Bridge.world_ready:
+		_fast_samples.clear()
 		if not _samples.is_empty():
 			_samples.clear()
 			_ready_for = 0.0
@@ -288,6 +305,7 @@ func feed(tick: int, delta: float) -> void:
 		budget = BUDGET_DEFAULT  # (sent by _keep_budget now: it differs from what was sent)
 		_budget_for = BUDGET_EVERY
 	_keep_budget(delta)
+	_fast_cut(tick, delta)
 	if lifted and rest_lifted:
 		# Full detail (a screenshot loading its view): see rest_lifted. Judged afresh START_DELAY after.
 		_samples.clear()
@@ -358,6 +376,34 @@ func _keep_budget(delta: float) -> void:
 		budget_changed.emit(budget)
 
 
+## BUDGET_FAST_*: cut the budget within a quarter second of the ticks running long.
+func _fast_cut(tick: int, delta: float) -> void:
+	_fast_since += delta
+	_fast_samples.append([_clock, tick])
+	while _fast_samples.size() > 2 and _clock - float(_fast_samples[1][0]) >= BUDGET_FAST_WINDOW:
+		_fast_samples.pop_front()
+	if not budget_fast or not enabled or lifted or loading or _since_load < AFTER_LOAD or _ready_for < START_DELAY:
+		return
+	if Settings.has_arg("--bridge-budget=") or budget <= BUDGET_FLOOR or _fast_since < BUDGET_FAST_PAUSE:
+		return
+	var first: Array = _fast_samples[0]
+	var secs := _clock - float(first[0])
+	if secs < BUDGET_FAST_WINDOW:
+		return
+	var ticks := tick - int(first[1])
+	if ticks <= 0:
+		return  # nothing arrived: a save, a pause or a dropped link, not a long tick
+	if float(ticks) / secs >= BUDGET_FAST_UPS:
+		return
+	_fast_since = 0.0
+	fast_cuts += 1
+	budget = maxi(BUDGET_FLOOR, int(budget * BUDGET_CUT))
+	_log_budget()
+	_budget_sent = budget
+	_budget_for = 0.0
+	budget_changed.emit(budget)
+
+
 ## Whether the bridge is making a first load (see the top).
 func _big_load() -> bool:
 	if loading_probe.is_valid():
@@ -414,7 +460,7 @@ static func _player(knob: String) -> float:
 		"entity": return float(Settings.get_value("graphics", "entity_radius"))
 		"far": return float(Settings.get_value("graphics", "belt_distance"))
 		"updates": return BeltCaps.cap_wanted(float(Settings.get_value("graphics", "belt_updates")))
-		"view": return float(Settings.get_value("graphics", "view_radius"))
+		"view": return float(RenderDistance.from_settings()["real_radius"])
 		"fps": return float(Settings.get_value("graphics", "fps_cap"))
 		"rate": return 0.0
 	return 1.0

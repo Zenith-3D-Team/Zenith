@@ -3,7 +3,10 @@
 These models are built from Wube Software's official 3D-printable Factorio models (Friday
 Facts #447, https://www.printables.com/@WubeSoftware/models), which Printables lists under
 CC BY-NC. They were converted (scaled, assembled, decimated and coloured) by
-`tools/models/wube.py`. Not for commercial use.
+`tools/models/wube.py`, and the 70 non-rigged, non-belt models then have procedural PBR atlases
+(Albedo JPEG + ORM/Normal PNG) baked by `tools/models/bake_pbr.py --pack wube3dp` with
+`pack.json` `"shading": "pbr"` (reversible via `--wube3dp-pbr=off` or `--pack-shading=factorio`;
+rigged creatures, the character, and flat-stand-in belts keep `"factorio"`). Not for commercial use.
 
 | Model | Wube source files |
 |---|---|

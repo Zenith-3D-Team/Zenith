@@ -33,6 +33,7 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## The Surfaces panel's list (GUI pixels), as Factorio's.
 const SURFACES_WIDTH := 238
@@ -47,7 +48,7 @@ const REFRESH := 6.0
 ## L6: how long the mouse rests on a tile before its resource patch is asked for, and the outline's colour and width.
 const PATCH_REST := 0.12
 const PATCH_OUTLINE := Color(1, 1, 1, 0.95)
-static var patch_info := not ("--map-resource-info=off" in OS.get_cmdline_user_args())
+static var patch_info := Switches.on("--map-resource-info")
 ## The most chunks asked for at once around the middle of the view (the mod sends 240 a second).
 const MAX_CHUNKS := 96
 ## Screen pixels a second WASD moves the map.
@@ -78,6 +79,10 @@ var platforms: Control = null
 ## The space map is open: its row is the chosen one (set_space_open).
 var space_open := false
 var _surface_box := VBoxContainer.new()
+## The "Space map" row, outside the scrolled list so it stays in view.
+var _space_box := VBoxContainer.new()
+var _surface_scroll: ScrollContainer
+var _fit_key := ""
 var settings = UiSettings.shared()
 
 ## Tiles in the middle of the window, and GUI pixels per tile (times Kit.scale on screen).
@@ -383,14 +388,50 @@ func _build_surfaces() -> void:
 	var deep := Kit.panel("FDeepFrame")
 	deep.custom_minimum_size.x = Kit.px(SURFACES_WIDTH)
 	outer.add_child(deep)
+	var inner := VBoxContainer.new()
+	inner.add_theme_constant_override("separation", 0)
+	deep.add_child(inner)
+	_space_box.add_theme_constant_override("separation", 0)
+	inner.add_child(_space_box)
+	# The list scrolls (the wheel scrolls it, not the map's zoom, while the mouse is over it); its height is
+	# capped by fit_surfaces() so the panel stays above the weapon slots.
+	_surface_scroll = ScrollContainer.new()
+	_surface_scroll.name = "SurfaceScroll"
+	_surface_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_surface_scroll.focus_mode = Control.FOCUS_NONE
+	_surface_scroll.custom_minimum_size.x = Kit.px(SURFACES_WIDTH)
+	inner.add_child(_surface_scroll)
 	_surface_box.add_theme_constant_override("separation", 0)
-	deep.add_child(_surface_box)
+	_surface_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_surface_scroll.add_child(_surface_box)
+
+
+## Caps the Surfaces list's height so the panel's bottom stays at or above `limit_y` (screen pixels: the top
+## of the weapon slots), from the panel's place, the window and the interface scale. Called each frame by
+## remote_frame.gd; it only re-lays out when the numbers change. limit_y <= 0: no cap.
+func fit_surfaces(limit_y: float) -> void:
+	if _surface_scroll == null or not surfaces_panel.visible:
+		return
+	var content := _surface_box.get_combined_minimum_size().y
+	var key := "%d|%d|%d|%d" % [roundi(limit_y), roundi(surfaces_panel.position.y), roundi(content), Kit.px(100)]
+	if key == _fit_key:
+		return
+	_fit_key = key
+	var h := content
+	if limit_y > 0.0:
+		var fixed := surfaces_panel.get_combined_minimum_size().y - _surface_scroll.custom_minimum_size.y
+		var room := limit_y - surfaces_panel.position.y - fixed - Kit.px(4)
+		h = minf(content, maxf(room, float(Kit.px(60))))
+	_surface_scroll.custom_minimum_size.y = h
+	surfaces_panel.reset_size()
 
 
 func _on_surfaces_changed() -> void:
-	for child in _surface_box.get_children():
-		_surface_box.remove_child(child)
-		child.queue_free()
+	_fit_key = ""
+	for box in [_surface_box, _space_box]:
+		for child in box.get_children():
+			box.remove_child(child)
+			child.queue_free()
 	var list: Array = model.map_surfaces
 	surfaces_panel.visible = list.size() >= 1
 	_redraw = true
@@ -408,7 +449,7 @@ func _on_surfaces_changed() -> void:
 	space.focus_mode = Control.FOCUS_NONE
 	space.custom_minimum_size.y = Kit.px(30)
 	space.pressed.connect(func() -> void: space_map_requested.emit())
-	_surface_box.add_child(space)
+	_space_box.add_child(space)
 	_surface_box.add_child(_subheader("Planets"))
 	for entry in planets:
 		_surface_box.add_child(_surface_button(entry))

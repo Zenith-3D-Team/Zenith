@@ -17,6 +17,7 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const GhostShader := preload("res://shaders/ghost.gdshader")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 const DATA_PATH := "res://data/rail_extensions.json"
 ## Rails each piece costs (items_to_place_this, checked in 2.1.23).
@@ -192,7 +193,7 @@ static func anchor_dir(a: Dictionary, goal: Vector2) -> int:
 	if not a.get("fork", false):
 		return dir
 	var to := goal - Vector2(a["pos"])
-	var ang := dir / 16.0 * TAU
+	var ang := -Wire.direction_yaw(dir)
 	return dir if Vector2(sin(ang), -cos(ang)).dot(to) >= 0.0 else posmod(dir + 8, 16)
 
 
@@ -339,7 +340,8 @@ func update(item: String, has_ground: bool, ground: Vector2, ghost_mode: bool) -
 	if target_layer != layer and dir % 4 == 0 and int(use[1]) == 1:
 		# A ramp first: up from the ground, or down from elevated rails (it then faces back).
 		var ramp_dir := dir if layer == 0 else posmod(dir + 8, 16)
-		var ahead := Vector2i(roundi(sin(dir / 16.0 * TAU)), -roundi(cos(dir / 16.0 * TAU)))
+		var ang := -Wire.direction_yaw(dir)
+		var ahead := Vector2i(roundi(sin(ang)), -roundi(cos(ang)))
 		pieces.append({"name": "rail-ramp", "pos": start + ahead * 8, "dir": ramp_dir, "end": [start + ahead * 16, dir]})
 		start = start + ahead * 16
 		layer = target_layer
@@ -449,7 +451,7 @@ func _show_arrows(list: Array) -> void:
 		if not m.visible:
 			continue
 		var e: Array = list[i]
-		var a := int(e[1]) / 16.0 * TAU
+		var a := -Wire.direction_yaw(int(e[1]))
 		var out := Vector2(sin(a), -cos(a))
 		var at := Vector2(e[0]) + out * (ARROW_SIZE.y / 2.0 + 0.1)
 		m.transform = Transform3D(Basis(Vector3.UP, -a), Vector3(at.x, 0.15 + ELEVATED_Y * int(e[2]), at.y))

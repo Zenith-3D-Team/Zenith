@@ -8,14 +8,19 @@ extends RefCounted
 
 ## Removes `path` and what it holds; a link there (or under it) loses the link only.
 static func remove_tree(path: String) -> void:
+	remove_tree_checked(path)
+
+
+## Removes `path` and what it holds without following links; returns true only if `path` no longer exists.
+static func remove_tree_checked(path: String) -> bool:
 	path = path.replace("\\", "/").trim_suffix("/")
 	if path == "":
-		return
+		return false
 	if is_link(path):
 		DirAccess.remove_absolute(path)
-		return
+		return not _exists(path)
 	if not DirAccess.dir_exists_absolute(path):
-		return
+		return not FileAccess.file_exists(path)
 	var dir := DirAccess.open(path)
 	if dir != null:
 		for d in DirAccess.get_directories_at(path):
@@ -23,10 +28,16 @@ static func remove_tree(path: String) -> void:
 			if dir.is_link(d):
 				DirAccess.remove_absolute(child)
 			else:
-				remove_tree(child)
+				remove_tree_checked(child)
+		dir = null
 	for f in DirAccess.get_files_at(path):
 		DirAccess.remove_absolute(path.path_join(f))
 	DirAccess.remove_absolute(path)
+	return not _exists(path)
+
+
+static func _exists(path: String) -> bool:
+	return is_link(path) or DirAccess.dir_exists_absolute(path) or FileAccess.file_exists(path)
 
 
 ## Whether `path` is a junction or symlink (asked of the folder holding it).

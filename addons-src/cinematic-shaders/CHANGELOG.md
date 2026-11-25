@@ -2,6 +2,43 @@
 
 Newest first. Versions before 0.4.5 are summarised from Zenith's history.
 
+## 0.6.2
+
+Lightning no longer whites out the sky (`shaders/cinematic_grade.gdshader`).
+
+- A weather flash lit every cloud with a fixed 0.75-0.8, twenty times a stormy night's cloud; the look's
+  exposure, AgX and film curve made the whole sky white. Now the clouds, and Zenith's sky behind them,
+  brighten in proportion to their own light (about 2-4x at night), capped; Flash brightness still scales
+  it. `--cinematic-flash=old` brings back 0.6.1's flash.
+
+## 0.6.1 (with Zenith 0.2.3)
+
+HDR-safe sharpening and night signal colours (`shaders/cinematic_grade.gdshader`).
+
+- Normalized clarity and sharpening by local luminance with HDR-spike halo suppression so bright
+  sub-pixel emitters (rail signals, water glints, fire) no longer carve dark ringing boxes into dark
+  night rails and terrain.
+- Preserved vivid hues on bright self-lit pixels during night/blue hour (`emissive_keep`) instead of
+  desaturating them toward cold sky blue.
+
+Headless shader checks only; not yet seen in a window.
+
+## 0.6.0 (with Zenith 0.2.3)
+
+Volumetric 3D clouds.
+
+- New 3D cloud raymarcher (`sky_clouds_volumetric` in `shaders/cinematic_grade.gdshader`): pairs the `1024 x 1024`
+  weather/cloud-type field (`cloud_field.gdshader`'s alpha channel) with two seamless `32 x 32 x 32` 3D Worley
+  shape and detail volumes (`ImageTexture3D`), raymarched through a curved-horizon shell (`210-390` tiles)
+  with adaptive empty-space skipping, Interleaved Gradient Noise dithering, 4-step sun self-shadowing,
+  Beer-Powder multiple scattering, dual-lobe Henyey-Greenstein silver linings, ambient sky-bounce undersides,
+  and aerial perspective fading toward the horizon.
+- Syncs with Zenith's volumetric smog and God rays through `looks.cloud_source()`.
+- New settings under Picture: "Volumetric clouds" (on by default; off brings back 0.5.3's lighter flat cloud
+  layer, or pass `--volumetric-clouds=off`) and "Cloud quality" (`Low` 18 steps, `Medium` 28 steps, `High` 40 steps).
+
+Headless tests only; not yet seen in a window.
+
 ## 0.5.3 (with Zenith 0.2.3)
 
 Tuned default ambient occlusion.

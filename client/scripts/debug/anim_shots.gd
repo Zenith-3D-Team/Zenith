@@ -9,6 +9,8 @@ extends Node
 ## Pair it with --anim-pose=<run|mine|aim|...> (avatar.gd) to hold the character in one
 ## animation, and --camera=<yaw>,<pitch>,<distance> to frame it.
 
+const Switches := preload("res://scripts/switches.gd")
+
 var game: Node
 var out_dir := ""
 var start := 6.0
@@ -17,14 +19,14 @@ var step := 0.05
 
 
 static func requested() -> bool:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--anim-shots="):
 			return true
 	return false
 
 
 func _ready() -> void:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--anim-shots="):
 			var spec := arg.get_slice("=", 1)
 			out_dir = spec.get_slice("@", 0)
@@ -41,11 +43,11 @@ func _ready() -> void:
 
 func _run() -> void:
 	await get_tree().create_timer(start).timeout
-	if not OS.get_cmdline_user_args().has("--anim-hud"):
+	if not Switches.has("--anim-hud"):
 		Input.mouse_mode = Input.MOUSE_MODE_HIDDEN
 		for layer in game.find_children("*", "CanvasLayer", true, false):
 			(layer as CanvasLayer).visible = false
-	if OS.get_cmdline_user_args().has("--clean-shot"):
+	if Switches.has("--clean-shot"):
 		var avatar := game.get_node_or_null("Avatar") as Node3D
 		if avatar != null:
 			avatar.visible = false

@@ -117,7 +117,8 @@ def build(name, reg=None):
     """Builds one model into a new Blender object; returns (object, triangle count)."""
     from geo import Model
     import trees
-    seed = trees.SEED_AS.get(name, name)
+    import cliffs
+    seed = {**trees.SEED_AS, **cliffs.SEED_AS}.get(name, name)
     m = Model(name, random.Random(zlib.crc32(seed.encode())))
     (reg or registry())[name](m)
     tris = m.triangles()

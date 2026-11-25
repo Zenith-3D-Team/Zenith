@@ -6,20 +6,24 @@ local registry = require("scripts.registry")
 local transport = require("scripts.transport")
 local budget = require("scripts.budget")
 local alt_mode = require("scripts.alt_mode")
-local belt_switch = require("scripts.belt_switch")
-local entity_ui = require("scripts.entity_ui")
 local photo = require("scripts.photo")
 local perf = require("scripts.perf")
+local corpses = require("scripts.corpses")
+local world_chunk = require("scripts.world_chunk")
 
 local M = {}
 
 local CHUNK = 32
+M.REGION = 16
 local ENTITIES_PER_MESSAGE = 120
+local BIN_ENTITIES_PER_MESSAGE = 400
 local MAX_SUBSCRIPTIONS = 10201 -- a 101x101 chunk square, 3232x3232 tiles (the client's view distance 50)
-local MAX_BACKLOG = 64        -- don't read more chunks while this many messages wait to be sent
-local ROOM_STARTS = 4         -- chunks started a tick while the work budget has room (I18; f3d-chunks-per-tick the least)
+local MAX_BACKLOG = 128       -- don't read more chunks while this many messages wait to be sent
+local ROOM_STARTS = 8         -- chunks started a tick while the work budget has room (I18; f3d-chunks-per-tick the least)
 local REFRESH_INTERVAL = 300  -- ticks between re-sending one subscribed chunk
 local COUNT_NEAR = 121        -- the nearest this many subscribed chunks (11x11) are counted in turn
+local NEAR_CHUNK_RING = 2     -- chunks within this Chebyshev distance of sub_o sort/stream ahead of outer work
+local NEAR_CHUNK_FLOOR = 150  -- minimum budget floor (units) for near chunk snapshots under near_rate
 local DECORATIVES_PER_MESSAGE = 1000 -- 4 numbers each
 local MAX_DECORATIVES = 8000       -- per chunk; a lush Nauvis chunk has a few hundred
 local DECORATIVE_INTERVAL = 30     -- ticks between resending chunks whose decoratives changed
@@ -106,15 +110,43 @@ local function rev_table(si)
   return t
 end
 
+local function lod_rev_table(si)
+  local s = storage.f3d
+  s.lod_revs = s.lod_revs or {}
+  local t = s.lod_revs[si]
+  if not t then
+    t = {}
+    s.lod_revs[si] = t
+  end
+  return t
+end
+
 function M.rev(si, k)
   local t = storage.f3d.revs and storage.f3d.revs[si]
   return t and t[k] or 0
+end
+
+function M.region_rev(si, rx, ry)
+  local t = storage.f3d.lod_revs and storage.f3d.lod_revs[si]
+  return t and t[key(rx, ry)] or 0
+end
+
+function M.all_region_revs(si)
+  local t = storage.f3d.lod_revs and storage.f3d.lod_revs[si]
+  return t or {}
+end
+
+function M.bump_region(si, rx, ry)
+  local rt = lod_rev_table(si)
+  local rk = key(rx, ry)
+  rt[rk] = (rt[rk] or 0) + 1
 end
 
 -- Raises the counts of the chunk at `position` and of neighbours within 2 tiles (a belt's or pipe's
 -- look follows the ones next to it, which may be across the edge).
 function M.bump(si, position)
   local t = rev_table(si)
+  local rt = lod_rev_table(si)
   local x, y = position.x or position[1], position.y or position[2]
   local cx, cy = math.floor(x / CHUNK), math.floor(y / CHUNK)
   local lx, ly = x - cx * CHUNK, y - cy * CHUNK
@@ -126,10 +158,17 @@ function M.bump(si, position)
   if counted and si ~= storage.f3d.surface_index then
     counted = nil
   end
+  local seen_regions = {}
   for dy = y0, y1 do
     for dx = x0, x1 do
-      local k = key(cx + dx, cy + dy)
+      local ncx, ncy = cx + dx, cy + dy
+      local k = key(ncx, ncy)
       t[k] = (t[k] or 0) + 1
+      local rk = key(math.floor(ncx / M.REGION), math.floor(ncy / M.REGION))
+      if not seen_regions[rk] then
+        seen_regions[rk] = true
+        rt[rk] = (rt[rk] or 0) + 1
+      end
       if counted then
         counted[k] = nil -- an event changed it: the client was told, so count_check starts again from here
       end
@@ -145,288 +184,10 @@ function M.is_subscribed(surface, position)
   return s.subs[key(math.floor(position.x / CHUNK), math.floor(position.y / CHUNK))] ~= nil
 end
 
--- Which sides a pipe connects on, as a bitmask: 1 north, 2 east, 4 south, 8 west. Only ordinary
--- connections to something (a pipe-to-ground's underground side isn't one).
-local function pipe_mask(entity)
-  local mask = 0
-  local p = entity.position
-  -- 2.1 has no LuaEntity.fluidbox: fluid boxes are counted by fluids_count.
-  for i = 1, entity.fluids_count do
-    for _, c in pairs(entity.get_fluid_box_pipe_connections(i) or {}) do
-      if c.target and c.connection_type == "normal" then
-        local dx, dy = c.target_position.x - p.x, c.target_position.y - p.y
-        if math.abs(dy) >= math.abs(dx) then
-          mask = bit32.bor(mask, dy < 0 and 1 or 4)
-        else
-          mask = bit32.bor(mask, dx > 0 and 2 or 8)
-        end
-      end
-    end
-  end
-  return mask
-end
-
--- Types whose colour the player sets (the client tints their paint with it).
-local PAINTED = { locomotive = true, ["cargo-wagon"] = true, ["fluid-wagon"] = true, ["artillery-wagon"] = true,
-  ["train-stop"] = true }
-
-local function extra_of_type(entity, t)
-  if registry.is_pipe(t) then
-    local ok, mask = pcall(pipe_mask, entity)
-    return ok and { pc = mask } or nil
-  end
-  if t == "transport-belt" then
-    return { s = string.sub(entity.belt_shape, 1, 1) }
-  elseif t == "underground-belt" then
-    return { u = string.sub(entity.belt_to_ground_type, 1, 1) }
-  elseif t == "linked-belt" then
-    return { u = string.sub(entity.linked_belt_type, 1, 1) }
-  elseif t == "corpse" or t == "rail-remnants" then
-    -- What the remnants were (the client draws its model broken).
-    local of = registry.remnant_of(entity.name)
-    return of and { rm = of } or nil
-  elseif t == "resource" then
-    return { a = entity.amount }
-  elseif t == "entity-ghost" then
-    if entity.ghost_type == "underground-belt" then
-      return { gh = registry.entity_id(entity.ghost_name), u = string.sub(entity.belt_to_ground_type, 1, 1) }
-    end
-    return { gh = registry.entity_id(entity.ghost_name) }
-  elseif t == "tile-ghost" then
-    return { tg = registry.tile_id(entity.ghost_name) }
-  elseif t == "train-stop" then
-    return { n = entity.backer_name }
-  elseif t == "cliff" then
-    -- Which piece of a cliff chain this is ("west-to-east", "none-to-north", ...).
-    return { co = entity.cliff_orientation }
-  end
-  return nil
-end
-
-local function quality_of(entity)
-  return entity.quality.name
-end
-
--- Marked for deconstruction (d = 1) or for an upgrade (up = the target's prototype id).
-local function marks(entity)
-  local out
-  if entity.to_be_deconstructed() then
-    out = { d = 1 }
-  end
-  if entity.to_be_upgraded() then
-    out = out or {}
-    out.up = registry.entity_id(entity.get_upgrade_target().name)
-  end
-  return out
-end
-
--- Copper and circuit wires from this entity, by the unit numbers at their other end:
--- {w = copper, r = red, g = green}, or nil without any. 2.x keeps wires on wire connectors.
-local WIRE_KEYS
-local function wires(entity)
-  if not WIRE_KEYS then
-    WIRE_KEYS = { [defines.wire_type.copper] = "w", [defines.wire_type.red] = "r", [defines.wire_type.green] = "g" }
-  end
-  local out
-  for _, connector in pairs(entity.get_wire_connectors(false)) do
-    local key = WIRE_KEYS[connector.wire_type]
-    for _, connection in pairs(connector.connections) do
-      local unit = connection.target.owner.unit_number
-      if key and unit then
-        out = out or {}
-        out[key] = out[key] or {}
-        table.insert(out[key], unit)
-      end
-    end
-  end
-  return out
-end
-
--- The entity's wires as a string, to notice when one is added or removed (no event for that).
-function M.wire_signature(entity)
-  local ok, w = pcall(wires, entity)
-  if not ok or not w then
-    return ""
-  end
-  local parts = {}
-  for _, key in ipairs({ "w", "r", "g" }) do
-    local units = w[key] or {}
-    table.sort(units)
-    parts[#parts + 1] = key .. table.concat(units, ",")
-  end
-  return table.concat(parts, ";")
-end
-
--- Quality (2.x) only when it isn't normal, so most records stay short.
-local function quality_extra(entity)
-  local q = quality_of(entity)
-  return q ~= "normal" and { q = q } or nil
-end
-
--- Quality, marks and, for entities with a unit number, wires: the client draws a wire when
--- either end lists the other.
-local function all_extras(entity, has_unit)
-  local out = quality_extra(entity) or {}
-  for k, v in pairs(marks(entity) or {}) do
-    out[k] = v
-  end
-  if has_unit then
-    for k, v in pairs(wires(entity) or {}) do
-      out[k] = v
-    end
-  end
-  return out
-end
-
--- What a record carries beyond its id, place and direction; painted things add their colour.
-local function extra(entity, t)
-  local x = extra_of_type(entity, t)
-  if PAINTED[t] then
-    -- The colour the player gave it (H21: trains and stops were drawn in their models' grey).
-    local ok, c = pcall(function()
-      -- A stop nobody painted still wears its prototype's red, as Factorio draws it.
-      return entity.color or (t == "train-stop" and entity.prototype.color) or nil
-    end)
-    if ok and c then
-      x = x or {}
-      x.col = entity_ui.color_out(c)
-    end
-  end
-  return x
-end
-
--- Ghosts of rolling stock (issue #13). Their `direction` stays north whichever way they face, so
--- the record gets the nearest of 16 directions to their orientation. And a train the robots build
--- is a mover, never `add`ed, so the client can't drop its ghost on seeing it built there, as it
--- does for buildings: the ghost is registered for on_object_destroyed when it is sent, and its
--- going sends `del` (tracker.on_object_destroyed). Kept per client, in storage.f3d.stock_ghosts.
-local STOCK = { locomotive = true, ["cargo-wagon"] = true, ["fluid-wagon"] = true, ["artillery-wagon"] = true }
-
-local function stock_ghost(entity, rec)
-  local ok, orientation = pcall(function() return entity.orientation end)
-  if ok and type(orientation) == "number" then
-    rec[5] = math.floor(orientation * 16 + 0.5) % 16
-  end
-  local s = storage.f3d
-  local ok_reg, reg = pcall(script.register_on_object_destroyed, entity)
-  if s and ok_reg and reg then
-    s.stock_ghosts = s.stock_ghosts or {}
-    s.stock_ghosts[reg] = { u = rec[1], p = rec[2], x = rec[3], y = rec[4], s = entity.surface.index }
-  end
-end
-
--- records_by_prototype (perf.lua): what a record needs of its entity's prototype, read once a name
--- ({type, id, natural}; from prototypes alone, so module-local is fine), not entity.type five or six
--- times a record. Natural entities (trees, rocks, ore, cliffs, fish: most of a chunk away from a base)
--- have no quality, upgrade or wires to read: only their deconstruction mark.
-local NATURAL = { tree = true, ["simple-entity"] = true, resource = true, cliff = true, fish = true }
-local proto_info = {}
-
-local function info_of(entity)
-  local name = entity.name
-  local info = proto_info[name]
-  if not info then
-    local t = entity.type
-    info = { t, registry.entity_id(name), NATURAL[t] or false }
-    proto_info[name] = info
-  end
-  return info
-end
-
-local function natural_record(entity, info)
-  local p = entity.position
-  local t = info[1]
-  local rec = { entity.unit_number or 0, info[2], M.fixed(p.x), M.fixed(p.y), entity.direction or 0 }
-  local x = extra_of_type(entity, t)
-  local ok, marked = pcall(entity.to_be_deconstructed)
-  if ok and marked then
-    x = x or {}
-    x.d = 1
-  end
-  if x then
-    rec[6] = x
-  end
-  return rec
-end
-
--- [unit_number or 0, prototype id, x, y, direction, extra?]
--- Entities without a unit number (trees, rocks, ore) are identified by prototype + position.
-local record_of
-function M.record(entity)
-  if perf.on("records_by_prototype") then
-    local info = info_of(entity)
-    if info[3] then
-      return natural_record(entity, info)
-    end
-    return record_of(entity, info[1], info[2])
-  end
-  return record_of(entity, entity.type, registry.entity_id(entity.name))
-end
-
-record_of = function(entity, t, id)
-  local p = entity.position
-  local rec = { entity.unit_number or 0, id, M.fixed(p.x), M.fixed(p.y), entity.direction or 0 }
-  if t == "entity-ghost" and STOCK[entity.ghost_type] then
-    stock_ghost(entity, rec)
-  end
-  local x = extra(entity, t)
-  -- Quality, marks and wires (2.x API) in one protected call: a record is made for every entity
-  -- in a chunk snapshot, so this is the bridge's busiest path. If it fails, each is tried alone
-  -- so one missing API doesn't lose the others.
-  local ok, more = pcall(all_extras, entity, rec[1] ~= 0)
-  if not ok then
-    more = {}
-    for _, f in ipairs({ quality_extra, marks, rec[1] ~= 0 and wires or nil }) do
-      local ok2, part = pcall(f, entity)
-      if ok2 and part then
-        for k, v in pairs(part) do
-          more[k] = v
-        end
-      end
-    end
-  end
-  if more and next(more) then
-    x = x or {}
-    for k, v in pairs(more) do
-      x[k] = v
-    end
-  end
-  -- Alt-mode's icon (issue #9): with the record, so every loaded machine has it, no scanning.
-  -- and its machine or pump arrows (part 2, extra.fa).
-  if rec[1] ~= 0 and alt_mode.TYPES[t] then
-    local icon, arrows = alt_mode.state(entity)
-    if icon then
-      x = x or {}
-      x.ai = icon
-    end
-    if arrows then
-      x = x or {}
-      x.fa = arrows
-      -- Which fluid each connection takes or gives (L10).
-      x.fc = alt_mode.connections(entity)
-    end
-    alt_mode.recorded(entity, icon, x, arrows)
-  end
-  if rec[1] ~= 0 and belt_switch.TYPES[t] then
-    belt_switch.recorded(entity, x)
-  end
-  if x then
-    rec[6] = x
-  end
-  return rec
-end
-
--- A record as JSON text (chunk_text, perf.lua): its five numbers (integers all) by table.concat, its
--- extras key by key (transport.json_object). Read by the client as what helpers.table_to_json wrote,
--- at a tenth of the cost.
 local concat = table.concat
-function M.record_text(rec)
-  local x = rec[6]
-  if x then
-    return "[" .. concat(rec, ",", 1, 5) .. "," .. transport.json_object(x) .. "]"
-  end
-  return "[" .. concat(rec, ",", 1, 5) .. "]"
-end
+M.wire_signature = world_chunk.wire_signature
+M.record = world_chunk.record
+M.record_text = world_chunk.record_text
 
 -- A chunk's place in the client's order, nearest the character first. A list subscription (`c`)
 -- gives each chunk its place in `s.rank`; a square one (`w`) orders by squared distance from its
@@ -511,9 +272,22 @@ local function qlist(q)
   return out
 end
 
--- Where rank `rank` goes in list `q` (from its head), by rank_of.
-local function qplace(s, q, rank)
-  local lo, hi = q.h or 1, #q + 1
+local function is_near_chunk(s, k)
+  local o = s.sub_o
+  if not o then
+    return false
+  end
+  local c = s.subs[k]
+  if not c then
+    return false
+  end
+  return math.max(math.abs(c[1] - o[1]), math.abs(c[2] - o[2])) <= NEAR_CHUNK_RING
+end
+
+-- Where rank `rank` goes in list `q` (from `lo`, default q.h or 1, to `hi`, default #q + 1), by rank_of.
+local function qplace(s, q, rank, lo, hi)
+  lo = lo or q.h or 1
+  hi = hi or (#q + 1)
   while lo < hi do
     local mid = math.floor((lo + hi) / 2)
     local r = rank_of(s, q[mid])
@@ -585,9 +359,13 @@ local function enqueue(k)
   end
   s.queued[k] = true
   local rank = rank_of(s, k)
+  local near_first = perf.on("near_first") and s.sub_o ~= nil
+  local near = near_first and is_near_chunk(s, k)
   local rq = s.rq
   if rq then
-    if rq.phase == 1 then
+    if near then
+      rq.rank[k] = nil
+    elseif rq.phase == 1 then
       rq_put(s, rq, k, rank)  -- (and in the old queue below, so it can still be taken meanwhile)
     elseif rank == math.huge or bucket_of(s, rank) >= rq.d then
       rq_put(s, rq, k, rank)
@@ -595,7 +373,20 @@ local function enqueue(k)
     end
   end
   local q = s.queue
-  table.insert(q, qplace(s, q, rank), k)
+  if near_first then
+    local head = qhead(q)
+    local split = head
+    while split <= #q and is_near_chunk(s, q[split]) do
+      split = split + 1
+    end
+    if near then
+      table.insert(q, qplace(s, q, rank, head, split), k)
+    else
+      table.insert(q, qplace(s, q, rank, split, #q + 1), k)
+    end
+  else
+    table.insert(q, qplace(s, q, rank), k)
+  end
 end
 
 M.enqueue = enqueue
@@ -651,6 +442,12 @@ local function drop_sub(s, k)
   if s.have then
     s.have[k] = nil
   end
+  if s.dec_queued then
+    s.dec_queued[k] = nil
+  end
+  if s.sent then
+    s.sent[k] = nil
+  end
 end
 
 -- A requeue job stopped: what it holds goes back into the queue (in no order: a new order follows).
@@ -697,9 +494,19 @@ local function rq_step(s, limit)
     if rq.i <= #src then
       return n
     end
-    -- Every chunk queued is in the buckets: the queue is made anew from them.
+    -- Every chunk queued is in the buckets: the queue keeps any remaining near chunks ahead of outer buckets.
+    local keep = {}
+    if perf.on("near_first") and s.sub_o then
+      local q = s.queue
+      for idx = qhead(q), #q do
+        local k = q[idx]
+        if s.queued[k] and is_near_chunk(s, k) and rq.rank[k] == nil then
+          keep[#keep + 1] = k
+        end
+      end
+    end
     rq.phase, rq.src, rq.d = 2, nil, 0
-    s.queue = {}
+    s.queue = keep
   end
   local q = s.queue
   local queued, ranks = s.queued, rq.rank
@@ -754,14 +561,34 @@ local function requeue_now(s)
     rank[k] = rank_of(s, k)
   end
   local by_rank = function(a, b) return rank[a] < rank[b] end
+  local near_first = perf.on("near_first") and s.sub_o ~= nil
   if #q <= REQUEUE_NOW or not s.sub_o then
+    if near_first then
+      local near, outer = {}, {}
+      for _, k in ipairs(q) do
+        if is_near_chunk(s, k) then
+          near[#near + 1] = k
+        else
+          outer[#outer + 1] = k
+        end
+      end
+      table.sort(near, by_rank)
+      table.sort(outer, by_rank)
+      for _, k in ipairs(outer) do
+        near[#near + 1] = k
+      end
+      s.queue = near
+      return
+    end
     table.sort(q, by_rank)
     return
   end
-  local buckets, tail = {}, {}
+  local near, buckets, tail = {}, {}, {}
   for _, k in ipairs(q) do
     local r = rank[k]
-    if r == math.huge then
+    if near_first and is_near_chunk(s, k) then
+      near[#near + 1] = k
+    elseif r == math.huge then
       tail[#tail + 1] = k
     else
       local d = bucket_of(s, r)
@@ -780,6 +607,12 @@ local function requeue_now(s)
   end
   table.sort(ds)
   local out = {}
+  if near_first then
+    table.sort(near, by_rank)
+    for _, k in ipairs(near) do
+      out[#out + 1] = k
+    end
+  end
   for _, d in ipairs(ds) do
     local b = buckets[d]
     table.sort(b, by_rank)
@@ -797,6 +630,36 @@ local function requeue(s)
   rq_stop(s)
   if s.sub_o and qlen(s.queue) > REQUEUE_NOW and perf.on("requeue_slices") then
     local q = s.queue
+    if perf.on("near_first") then
+      local near, outer = {}, {}
+      for i = qhead(q), #q do
+        local k = q[i]
+        if s.queued[k] then
+          if is_near_chunk(s, k) then
+            near[#near + 1] = k
+          else
+            outer[#outer + 1] = k
+          end
+        end
+      end
+      if #near > 1 then
+        local rank = {}
+        for _, k in ipairs(near) do
+          rank[k] = rank_of(s, k)
+        end
+        table.sort(near, function(a, b) return rank[a] < rank[b] end)
+      end
+      local merged = {}
+      for _, k in ipairs(near) do
+        merged[#merged + 1] = k
+      end
+      for _, k in ipairs(outer) do
+        merged[#merged + 1] = k
+      end
+      s.queue = merged
+      s.rq = { phase = 1, src = outer, i = 1, buckets = {}, top = 0, d = 0, tail = {}, rank = {}, n = 0, out = 0 }
+      return
+    end
     s.rq = { phase = 1, src = q, i = qhead(q), buckets = {}, top = 0, d = 0, tail = {}, rank = {}, n = 0, out = 0 }
     return
   end
@@ -1132,10 +995,10 @@ end
 function M.clear()
   local s = storage.f3d
   s.subs, s.queue, s.queued, s.dec_dirty, s.rank, s.have = {}, {}, {}, {}, {}, {}
-  s.order, s.counted = {}, {}
+  s.order, s.counted, s.sent = {}, {}, {}
   s.sub_o, s.sub_r, s.sub_rows, s.sub_n, s.sub_f = nil, nil, nil, nil, nil
   s.refresh_cursor, s.snap, s.count_cursor, s.kept, s.rq = nil, nil, nil, nil, nil
-  s.dec_held, s.dec_sent = nil, nil
+  s.dec_held, s.dec_sent, s.dec_queue, s.dec_queued = nil, nil, nil, nil
   alt_mode.contents_forget() -- the chests' Alt-mode icons are sent again with the new world
 end
 
@@ -1307,6 +1170,30 @@ function M.dec_in_range()
   end
 end
 
+-- Queues a chunk's decoratives into a lower-priority list so chunk snapshots (tiles + buildings)
+-- finish ahead of clutter when many chunks stream at once. Chunks outside dd+margin move straight
+-- to s.dec_held without spending decorative budget.
+local function queue_decoratives(s, k, cx, cy)
+  if not (s.client and s.client.dc) then
+    return
+  end
+  if not dec_near(s, cx, cy) then
+    s.dec_held = s.dec_held or {}
+    s.dec_held[k] = true
+    if s.dec_sent then
+      s.dec_sent[k] = nil
+    end
+    return
+  end
+  s.dec_queued = s.dec_queued or {}
+  if s.dec_queued[k] then
+    return
+  end
+  s.dec_queued[k] = true
+  s.dec_queue = s.dec_queue or {}
+  s.dec_queue[#s.dec_queue + 1] = { k, cx, cy }
+end
+
 local function send_dirty_decoratives(surface)
   local s = storage.f3d
   local dirty = s.dec_dirty
@@ -1314,6 +1201,26 @@ local function send_dirty_decoratives(surface)
     return
   end
   s.dec_dirty = {}
+  if perf.on("prio_queue") then
+    local keys, rank = {}, {}
+    for k in pairs(dirty) do
+      keys[#keys + 1] = k
+      rank[k] = rank_of(s, k)
+    end
+    table.sort(keys, function(a, b)
+      if rank[a] ~= rank[b] then
+        return rank[a] < rank[b]
+      end
+      return a < b
+    end)
+    for _, k in ipairs(keys) do
+      local c = s.subs[k]
+      if c and not s.queued[k] then
+        queue_decoratives(s, k, c[1], c[2])
+      end
+    end
+    return
+  end
   for k in pairs(dirty) do
     local c = s.subs[k]
     if c and not s.queued[k] then
@@ -1355,14 +1262,14 @@ local function snap_price(job)
   elseif job.step <= job.strips then
     return 2 + RECORD_PRICE * math.ceil(job.count / job.strips)
   end
-  return DECORATIVE_PRICE
+  return math.max(10, math.min(60, math.floor((job.count or #job.records) / 8)))
 end
 
 -- A snapshot's frames for a wire version 3 client (docs/PROTOCOL.md, "Binary frames"): `chunk` (kind 19) with
 -- its tiles' runs as a block, then each `ents` part (kind 20): the records' five numbers as one block, the
 -- indexes of those with extras as another, and their extras as JSON text after them (transport.json_object,
 -- as chunk_text writes them). Made whole before any is sent; throws when string.pack refuses a number.
-local function snapshot_frames(job, parts)
+local function snapshot_frames(job, parts, per)
   local records = job.records
   local out = { string.pack("<i4i4I4I4I4I4", job.cx, job.cy, parts, job.si, job.rev, job.count) }
   transport.pack_block(out, job.tiles)
@@ -1370,9 +1277,9 @@ local function snapshot_frames(job, parts)
   local head = string.pack("<i4i4", job.cx, job.cy)
   for part = 1, parts do
     local flat, xi, extras = {}, {}, {}
-    local first = (part - 1) * ENTITIES_PER_MESSAGE + 1
+    local first = (part - 1) * per + 1
     local n = 0
-    for i = first, math.min(part * ENTITIES_PER_MESSAGE, #records) do
+    for i = first, math.min(part * per, #records) do
       local rec = records[i]
       flat[n + 1], flat[n + 2], flat[n + 3], flat[n + 4], flat[n + 5] = rec[1], rec[2], rec[3], rec[4], rec[5]
       n = n + 5
@@ -1395,14 +1302,15 @@ end
 
 local function send_snapshot(job)
   local records = job.records
-  local parts = math.max(1, math.ceil(#records / ENTITIES_PER_MESSAGE))
+  local ckey = job.cx .. "," .. job.cy
   if job.bin then
     if transport.binary(3) then
-      local ok, frames = pcall(snapshot_frames, job, parts)
+      local parts = math.max(1, math.ceil(#records / BIN_ENTITIES_PER_MESSAGE))
+      local ok, frames = pcall(snapshot_frames, job, parts, BIN_ENTITIES_PER_MESSAGE)
       if ok then
-        transport.send_reliable_frame(transport.KIND_CHUNK, "chunk", frames[1], 3)
+        transport.send_reliable_frame(transport.KIND_CHUNK, "chunk", frames[1], 3, ckey)
         for part = 1, parts do
-          transport.send_reliable_frame(transport.KIND_ENTS, "ents", frames[part + 1], 3)
+          transport.send_reliable_frame(transport.KIND_ENTS, "ents", frames[part + 1], 3, ckey)
         end
         return
       end
@@ -1416,25 +1324,26 @@ local function send_snapshot(job)
       end
     end
   end
+  local parts = math.max(1, math.ceil(#records / ENTITIES_PER_MESSAGE))
   if job.text then
     -- (chunk_text: the tiles and records are text already, made in the job's slices.)
     local at = ',"cx":' .. job.cx .. ',"cy":' .. job.cy
     transport.send_reliable_text("chunk", at .. ',"tiles":[' .. job.tiles .. '],"parts":' .. parts .. ',"rs":' .. job.si
-      .. ',"rv":' .. job.rev .. ',"n":' .. job.count)
+      .. ',"rv":' .. job.rev .. ',"n":' .. job.count, ckey)
     for part = 1, parts do
       transport.send_reliable_text("ents", at .. ',"part":' .. part .. ',"parts":' .. parts .. ',"e":['
-        .. concat(records, ",", (part - 1) * ENTITIES_PER_MESSAGE + 1, math.min(part * ENTITIES_PER_MESSAGE, #records)) .. "]")
+        .. concat(records, ",", (part - 1) * ENTITIES_PER_MESSAGE + 1, math.min(part * ENTITIES_PER_MESSAGE, #records)) .. "]", ckey)
     end
     return
   end
   transport.send_reliable({ t = "chunk", cx = job.cx, cy = job.cy, tiles = job.tiles, parts = parts,
-    rs = job.si, rv = job.rev, n = job.count })
+    rs = job.si, rv = job.rev, n = job.count }, ckey)
   for part = 1, parts do
     local slice = {}
     for i = (part - 1) * ENTITIES_PER_MESSAGE + 1, math.min(part * ENTITIES_PER_MESSAGE, #records) do
       slice[#slice + 1] = records[i]
     end
-    transport.send_reliable({ t = "ents", cx = job.cx, cy = job.cy, part = part, parts = parts, e = slice })
+    transport.send_reliable({ t = "ents", cx = job.cx, cy = job.cy, part = part, parts = parts, e = slice }, ckey)
   end
 end
 
@@ -1450,11 +1359,12 @@ local function snapshot_step(surface, s)
   local cx, cy = job.cx, job.cy
   local x0, y0 = cx * CHUNK, cy * CHUNK
   if job.step < 0 then
+    local ckey = cx .. "," .. cy
     if not surface.is_chunk_generated({ cx, cy }) then
       if job.text then
-        transport.send_reliable_text("chunk", ',"cx":' .. cx .. ',"cy":' .. cy .. ',"none":true')
+        transport.send_reliable_text("chunk", ',"cx":' .. cx .. ',"cy":' .. cy .. ',"none":true', ckey)
       else
-        transport.send_reliable({ t = "chunk", cx = cx, cy = cy, none = true })
+        transport.send_reliable({ t = "chunk", cx = cx, cy = cy, none = true }, ckey)
       end
       surface.request_to_generate_chunks({ cx * CHUNK + 16, cy * CHUNK + 16 }, 0)
       s.snap = nil
@@ -1471,14 +1381,16 @@ local function snapshot_step(surface, s)
       s.have[job.k] = nil
       if h.si == job.si and h.rv == job.rev and h.n == job.count then
         counted(s)[job.k] = job.count
+        s.sent = s.sent or {}
+        s.sent[job.k] = { si = job.si, rv = job.rev, n = job.count }
         if job.text then
-          transport.send_reliable_text("chunk", ',"cx":' .. cx .. ',"cy":' .. cy .. ',"rs":' .. job.si .. ',"same":' .. job.rev)
+          transport.send_reliable_text("chunk", ',"cx":' .. cx .. ',"cy":' .. cy .. ',"rs":' .. job.si .. ',"same":' .. job.rev, ckey)
         else
-          transport.send_reliable({ t = "chunk", cx = cx, cy = cy, rs = job.si, same = job.rev })
+          transport.send_reliable({ t = "chunk", cx = cx, cy = cy, rs = job.si, same = job.rev }, ckey)
         end
         -- (dec_distance: the client's copy may have been made while the chunk was too far for its decoratives.)
         if s.client and s.client.dd and s.client.dc and not (s.dec_sent and s.dec_sent[job.k]) then
-          send_decoratives(surface, cx, cy)
+          queue_decoratives(s, job.k, cx, cy)
         end
         s.snap = nil
         return
@@ -1510,6 +1422,10 @@ local function snapshot_step(surface, s)
         found[#found + 1] = e
       end
     end
+    -- So are characters' corpses (corpses.lua; f3d-character-corpses off: not sent).
+    for _, e in pairs(corpses.in_area(surface, area)) do
+      found[#found + 1] = e
+    end
     -- An entity overlapping several chunks (or strips) belongs to the one containing its centre.
     local records, text = job.records, job.text and not job.bin
     for _, e in pairs(found) do
@@ -1528,7 +1444,9 @@ local function snapshot_step(surface, s)
   s.snap = nil
   send_snapshot(job)
   counted(s)[job.k] = not job.touched and job.count or nil
-  send_decoratives(surface, cx, cy)
+  s.sent = s.sent or {}
+  s.sent[job.k] = not job.touched and { si = job.si, rv = job.rev, n = job.count } or nil
+  queue_decoratives(s, job.k, cx, cy)
   if job.touched then
     enqueue(job.k)
   end
@@ -1569,18 +1487,35 @@ end
 function M.queue_length()
   local s = storage.f3d
   return (s.queue and qlen(s.queue) or 0) + rq_waiting(s) + (s.snap and 1 or 0) + (s.kept and qlen(s.kept) or 0)
+    + (s.dec_queue and qlen(s.dec_queue) or 0)
 end
 budget.register_queue("chunks", M.queue_length)
 
-local function next_refresh()
+local function next_refresh(surface)
   local s = storage.f3d
   if s.refresh_cursor and not s.subs[s.refresh_cursor] then
     s.refresh_cursor = nil
   end
-  s.refresh_cursor = next(s.subs, s.refresh_cursor)
-  if s.refresh_cursor then
-    enqueue(s.refresh_cursor)
+  s.refresh_cursor = next(s.subs, s.refresh_cursor) or next(s.subs, nil)
+  local k = s.refresh_cursor
+  if not k or s.queued[k] or (s.snap and s.snap.k == k) then
+    return
   end
+  local sent = s.sent and s.sent[k]
+  if sent and surface and sent.si == surface.index and M.rev(surface.index, k) == sent.rv then
+    local c = s.subs[k]
+    local x0, y0 = c[1] * CHUNK, c[2] * CHUNK
+    local count = surface.count_entities_filtered({
+      area = { { x0, y0 }, { x0 + CHUNK, y0 + CHUNK } }, type = registry.excluded_types(), invert = true,
+    })
+    budget.spend(2, "chunks")
+    if count == sent.n then
+      counted(s)[k] = count
+      return
+    end
+    M.bump(surface.index, { x = x0 + 16, y = y0 + 16 })
+  end
+  enqueue(k)
 end
 
 -- Entities made or removed by a script without an event (`destroy()` without raise_destroy,
@@ -1661,10 +1596,10 @@ end
 
 function M.tick()
   local s = storage.f3d
-  if game.tick % REFRESH_INTERVAL == 0 then
-    next_refresh()
-  end
   local surface = M.surface()
+  if game.tick % REFRESH_INTERVAL == 0 then
+    next_refresh(surface)
+  end
   if M.count_interval > 0 and game.tick % M.count_interval == 0 then
     count_check(surface, s)
   end
@@ -1696,7 +1631,7 @@ function M.tick()
     end
     if not s.snap then
       if starts <= 0 or qlen(s.queue) == 0 then
-        return
+        break
       end
       local k = M.take_next()
       local c = s.subs[k]
@@ -1709,14 +1644,49 @@ function M.tick()
     end
     if s.snap then
       local price = snap_price(s.snap)
-      if not budget.can(price, "chunks", share) then
-        return
+      local can
+      if perf.on("near_rate") and s.sub_o
+          and math.max(math.abs(s.snap.cx - s.sub_o[1]), math.abs(s.snap.cy - s.sub_o[2])) <= NEAR_CHUNK_RING then
+        can = budget.can(price, "chunks", share, NEAR_CHUNK_FLOOR)
+      else
+        can = budget.can(price, "chunks", share)
+      end
+      if not can then
+        break
       end
       budget.spend(price, "chunks")
       local checking = s.snap.step < 0
       snapshot_step(surface, s)
       if checking and s.snap then
         starts = starts - 1 -- it has to be read
+      end
+    end
+  end
+  if not s.snap and qlen(s.queue) == 0 and s.dec_queue then
+    while transport.backlog() < backlog and qlen(s.dec_queue) > 0 do
+      local entry = s.dec_queue[qhead(s.dec_queue)]
+      local k, cx, cy = entry[1], entry[2], entry[3]
+      if not s.subs[k] then
+        qpop(s, "dec_queue")
+        if s.dec_queued then
+          s.dec_queued[k] = nil
+        end
+      elseif not dec_near(s, cx, cy) then
+        qpop(s, "dec_queue")
+        if s.dec_queued then
+          s.dec_queued[k] = nil
+        end
+        send_decoratives(surface, cx, cy)
+      else
+        if not budget.can(DECORATIVE_PRICE, "chunks", share) then
+          break
+        end
+        qpop(s, "dec_queue")
+        if s.dec_queued then
+          s.dec_queued[k] = nil
+        end
+        budget.spend(DECORATIVE_PRICE, "chunks")
+        send_decoratives(surface, cx, cy)
       end
     end
   end
@@ -1758,14 +1728,16 @@ function M.tiles_changed(surface, positions)
       list[#list + 1] = y
       list[#list + 1] = registry.tile_id(surface.get_tile(x, y).name)
       if #list >= 1500 then
-        transport.send_reliable({ t = "tiles", l = list })
+        transport.send_reliable_priority({ t = "tiles", l = list })
         list = {}
       end
     end
   end
   if #list > 0 then
-    transport.send_reliable({ t = "tiles", l = list })
+    transport.send_reliable_priority({ t = "tiles", l = list })
   end
 end
+
+corpses.bind(M)
 
 return M

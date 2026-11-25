@@ -1038,8 +1038,11 @@ def add_inside(doc, chunks):
         return len(views) - 1
 
     doubled, added = {}, 0  # accessor -> its doubled accessor; shared ones are doubled once
+    mats = doc.get("materials", [])
     for mesh in doc.get("meshes", []):
         for p in mesh.get("primitives", []):
+            if p.get("material") is not None and mats[p["material"]].get("alphaMode") == "BLEND":
+                continue  # glass and other see-through surfaces keep one side (drawn twice creates blend seams)
             if p.get("mode", 4) != 4 or p.get("targets"):
                 raise ValueError("adding an inside needs plain triangles without morph targets")
             attrs = p["attributes"]
@@ -1083,32 +1086,187 @@ def add_inside(doc, chunks):
                                      "count": len(every), "type": "SCALAR"})
             p["indices"] = len(doc["accessors"]) - 1
             added += tris
-    # The old accessors nothing uses any more fall out with their bytes (compact keeps the views accessors use).
-    used = {i for m in doc.get("meshes", []) for p in m["primitives"] for i in list(p["attributes"].values()) + [p.get("indices")]}
+    doc["buffers"] = [{"byteLength": len(data)}]
+    _drop_unused_accessors(doc)
+    new = [(b"BIN\0", bytes(data))] + [c for c in chunks or [] if c[0] != b"BIN\0"]
+    return compact(doc, new), added
+
+
+def _drop_unused_accessors(doc):
+    """Drops accessors nothing references and remaps all accessor indices."""
+    used = {i for m in doc.get("meshes", []) for p in m["primitives"]
+            for i in list(p["attributes"].values()) + ([p["indices"]] if "indices" in p else [])}
     for s in doc.get("skins", []):
-        used.add(s.get("inverseBindMatrices"))
+        if "inverseBindMatrices" in s:
+            used.add(s["inverseBindMatrices"])
     for an in doc.get("animations", []):
         for s in an.get("samplers", []):
             used.update((s["input"], s["output"]))
     remap, kept = {}, []
-    for i, a in enumerate(doc["accessors"]):
+    for i, a in enumerate(doc.get("accessors", [])):
         if i in used:
             remap[i] = len(kept)
             kept.append(a)
-    doc["accessors"] = kept
+    if "accessors" in doc:
+        doc["accessors"] = kept
     for m in doc.get("meshes", []):
         for p in m["primitives"]:
             p["attributes"] = {k: remap[v] for k, v in p["attributes"].items()}
-            p["indices"] = remap[p["indices"]]
+            if "indices" in p:
+                p["indices"] = remap[p["indices"]]
     for s in doc.get("skins", []):
         if "inverseBindMatrices" in s:
             s["inverseBindMatrices"] = remap[s["inverseBindMatrices"]]
     for an in doc.get("animations", []):
         for s in an.get("samplers", []):
             s["input"], s["output"] = remap[s["input"]], remap[s["output"]]
+
+
+def _tri_key(pos, tri):
+    return tuple(sorted(tuple(round(c, 3) for c in pos[v]) for v in tri))
+
+
+def _filter_triangles(doc, chunks, keep_fn):
+    """Filters triangle primitives via keep_fn(pos, idx) -> kept_idx (or None to keep unchanged).
+    Drops primitives left empty and compacts kept vertices and indices into the BIN chunk."""
+    refuse_unremapped(doc, "the model")
+    if len(doc.get("buffers", [])) > 1 or any("uri" in b for b in doc.get("buffers", [])):
+        raise ValueError("filtering triangles needs a single-buffer .glb file")
+    orig_data = bin_chunk(chunks)
+    data = bytearray(orig_data)
+    views = doc.setdefault("bufferViews", [])
+    accessors = doc.setdefault("accessors", [])
+    changed = False
+    kept_total = 0
+    dropped_total = 0
+    for mesh in doc.get("meshes", []):
+        new_prims = []
+        for p in mesh.get("primitives", []):
+            if p.get("mode", 4) != 4 or p.get("targets"):
+                raise ValueError("filtering triangles needs plain triangles without morph targets")
+            attrs = p["attributes"]
+            pos = read_accessor(doc, chunks, attrs["POSITION"])
+            if pos is None:
+                raise ValueError("filtering triangles: POSITION can't be read")
+            idx = [v[0] for v in read_accessor(doc, chunks, p["indices"])] if "indices" in p else list(range(len(pos)))
+            kept = keep_fn(pos, idx)
+            if kept is None or len(kept) == len(idx):
+                kept_total += len(idx) // 3
+                new_prims.append(p)
+                continue
+            changed = True
+            dropped_total += (len(idx) - len(kept)) // 3
+            if not kept:
+                continue
+            kept_total += len(kept) // 3
+            used_verts = sorted(set(kept))
+            v_remap = {old_i: new_i for new_i, old_i in enumerate(used_verts)}
+            remapped = [v_remap[i] for i in kept]
+            new_attrs = {}
+            for key, acc_idx in sorted(attrs.items()):
+                a = accessors[acc_idx]
+                form, n = _COMPONENTS.get(a.get("componentType")), _COUNTS.get(a.get("type"))
+                if form is None or n is None or "bufferView" not in a or "sparse" in a:
+                    raise ValueError("filtering triangles: attribute %s can't be copied" % key)
+                view = doc["bufferViews"][a["bufferView"]]
+                elem_size = struct.calcsize("<%d%s" % (n, form))
+                stride = view.get("byteStride") or elem_size
+                base = view.get("byteOffset", 0) + a.get("byteOffset", 0)
+                raw = b"".join(orig_data[base + v * stride:base + v * stride + elem_size] for v in used_verts)
+                data.extend(b"\0" * (-len(data) % 4))
+                views.append({"buffer": 0, "byteOffset": len(data), "byteLength": len(raw), "target": 34962})
+                data.extend(raw)
+                acc = {"bufferView": len(views) - 1, "componentType": a["componentType"],
+                       "count": len(used_verts), "type": a["type"]}
+                if a.get("normalized"):
+                    acc["normalized"] = True
+                if key == "POSITION":
+                    kept_pos = [pos[v] for v in used_verts]
+                    acc["min"] = [min(pt[k] for pt in kept_pos) for k in range(3)]
+                    acc["max"] = [max(pt[k] for pt in kept_pos) for k in range(3)]
+                accessors.append(acc)
+                new_attrs[key] = len(accessors) - 1
+            p["attributes"] = new_attrs
+            data.extend(b"\0" * (-len(data) % 4))
+            form, ctype = ("I", 5125) if len(used_verts) > 65535 else ("H", 5123)
+            body = b"".join(struct.pack("<%s" % form, i) for i in remapped)
+            views.append({"buffer": 0, "byteOffset": len(data), "byteLength": len(body), "target": 34963})
+            data.extend(body)
+            accessors.append({"bufferView": len(views) - 1, "componentType": ctype,
+                              "count": len(remapped), "type": "SCALAR"})
+            p["indices"] = len(accessors) - 1
+            new_prims.append(p)
+        mesh["primitives"] = new_prims
+    if not changed:
+        return chunks, kept_total, 0
     doc["buffers"] = [{"byteLength": len(data)}]
+    _drop_unused_accessors(doc)
     new = [(b"BIN\0", bytes(data))] + [c for c in chunks or [] if c[0] != b"BIN\0"]
-    return compact(doc, new), added
+    return compact(doc, new), kept_total, dropped_total
+
+
+def drop_shells_in_boxes(doc, chunks, boxes):
+    """Drops disconnected triangle shells whose vertices touch any [lo, hi] box in boxes."""
+    def keep_fn(pos, idx):
+        parent = {}
+
+        def find(x):
+            while parent.get(x, x) != x:
+                parent[x] = parent.get(parent[x], parent[x])
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        tris = []
+        vkeys = [tuple(round(c, 3) for c in v) for v in pos]
+        for t in range(0, len(idx) - 2, 3):
+            a, b, c = idx[t], idx[t + 1], idx[t + 2]
+            union(vkeys[a], vkeys[b])
+            union(vkeys[b], vkeys[c])
+            tris.append((a, b, c))
+        bad_roots = set()
+        for a, b, c in tris:
+            for v in (a, b, c):
+                p = pos[v]
+                if any(all(lo[k] <= p[k] <= hi[k] for k in range(3)) for lo, hi in boxes):
+                    bad_roots.add(find(vkeys[a]))
+                    break
+        if not bad_roots:
+            return None
+        kept = []
+        for a, b, c in tris:
+            if find(vkeys[a]) not in bad_roots:
+                kept.extend((a, b, c))
+        return kept
+
+    new_chunks, _kept, dropped = _filter_triangles(doc, chunks, keep_fn)
+    return new_chunks, dropped
+
+
+def diff_triangles(doc, chunks, other_doc, other_chunks):
+    """Keeps only triangles in doc whose rounded vertex positions do not appear in other_doc."""
+    other_keys = set()
+    for mesh in other_doc.get("meshes", []):
+        for p in mesh.get("primitives", []):
+            pos = read_accessor(other_doc, other_chunks, p["attributes"]["POSITION"])
+            idx = [v[0] for v in read_accessor(other_doc, other_chunks, p["indices"])] if "indices" in p else list(range(len(pos)))
+            for t in range(0, len(idx) - 2, 3):
+                other_keys.add(_tri_key(pos, (idx[t], idx[t + 1], idx[t + 2])))
+
+    def keep_fn(pos, idx):
+        kept = []
+        for t in range(0, len(idx) - 2, 3):
+            tri = (idx[t], idx[t + 1], idx[t + 2])
+            if _tri_key(pos, tri) not in other_keys:
+                kept.extend(tri)
+        return kept
+
+    new_chunks, kept_count, _dropped = _filter_triangles(doc, chunks, keep_fn)
+    return new_chunks, kept_count
 
 
 def mask_materials(doc, names, cutoff):
@@ -1183,7 +1341,13 @@ def fix_pack(src, dst, fixes, log=print):
             path = os.path.join(folder, f)
             rel = os.path.relpath(path, src)
             name = model_name(rel)
-            entry = entries.get(name) if name is not None else None
+            entry_key = name
+            entry = entries.get(entry_key) if entry_key is not None else None
+            if entry is None and entry_key is not None and "/" in entry_key:
+                base_key = entry_key.rsplit("/", 1)[1]
+                if base_key in entries:
+                    entry_key = base_key
+                    entry = entries[base_key]
             ext = os.path.splitext(f)[1]
             if entry is None and name is not None and (rules or recolour):
                 entry = {}  # not listed, but the material rules cover every model
@@ -1193,12 +1357,15 @@ def fix_pack(src, dst, fixes, log=print):
                 shutil.copy2(path, out)
                 claim(rel, rel)
                 continue
-            seen.add(name)
+            seen.add(entry_key)
             doc, chunks = read_model(path)
             if os.path.dirname(rel) == "":
                 _doc, _chunks, offset = source(name)
             else:
                 offset = [float(c) for c in entry.get("offset", [0, 0, 0])]
+                if entry.get("centre"):
+                    lo, hi = box(doc)
+                    offset = [offset[0] - (lo[0] + hi[0]) / 2, offset[1], offset[2] - (lo[2] + hi[2]) / 2]
             for out in entry.get("out", [{"name": name}]):
                 piece, piece_chunks = copy.deepcopy(doc), chunks
                 turn = float(out.get("turn", 0))
@@ -1210,6 +1377,10 @@ def fix_pack(src, dst, fixes, log=print):
                         piece_chunks, kept, trouble = keep_rest_turn(piece, piece_chunks, entry["keep_rest_turn"])
                         adds += kept
                         problems += ["%s: %s" % (out["name"], t) for t in trouble]
+                if out.get("drop_shells"):
+                    piece_chunks, dropped = drop_shells_in_boxes(piece, piece_chunks, out["drop_shells"])
+                    if dropped:
+                        adds.append("dropped %d shell tris" % dropped)
                 how = transform_roots(piece, turn, offset, os.path.basename(out["name"]))
                 for part in out.get("add", []):
                     try:
@@ -1218,6 +1389,15 @@ def fix_pack(src, dst, fixes, log=print):
                         problems.append("%s: %s" % (out["name"], e))
                         continue
                     pdoc = copy.deepcopy(pdoc)
+                    diff_note = ""
+                    if part.get("diff"):
+                        try:
+                            ddoc, dchunks, _doffset = source(part["diff"])
+                        except ValueError as e:
+                            problems.append("%s: %s" % (out["name"], e))
+                            continue
+                        pchunks, kept_tris = diff_triangles(pdoc, pchunks, ddoc, dchunks)
+                        diff_note = " diff %s (%d tris)" % (part["diff"], kept_tris)
                     transform_roots(pdoc, float(part.get("turn", 0)), poffset, part["model"])
                     inside = ""
                     try:
@@ -1227,18 +1407,18 @@ def fix_pack(src, dst, fixes, log=print):
                         piece_chunks = merge_into(piece, piece_chunks, pdoc, pchunks)
                     except ValueError as e:
                         raise ValueError("%s + %s: %s" % (rel, part["model"], e)) from e
-                    adds.append("+ %s%s%s" % (part["model"], " turned %g" % part["turn"] if part.get("turn") else "", inside))
+                    adds.append("+ %s%s%s%s" % (part["model"], diff_note, " turned %g" % part["turn"] if part.get("turn") else "", inside))
+                missing = mask_materials(piece, entry.get("mask", []), cutoff)
+                if missing:
+                    problems.append("%s: no material %s to mask" % (name, ", ".join(missing)))
+                cleaned = clean_materials(piece, piece_chunks, rules, folder) if rules else []
                 if entry.get("inside"):
                     try:
                         piece_chunks, added = add_inside(piece, piece_chunks)
                     except ValueError as e:
                         raise ValueError("%s: %s" % (rel, e)) from e
                     adds.append("inside added (%d back faces)" % added)
-                missing = mask_materials(piece, entry.get("mask", []), cutoff)
-                if missing:
-                    problems.append("%s: no material %s to mask" % (name, ", ".join(missing)))
-                cleaned = clean_materials(piece, piece_chunks, rules, folder) if rules else []
-                if piece_chunks is not None and (out.get("add") or any("emission" in c for c in cleaned)):
+                if piece_chunks is not None and not entry.get("inside") and (out.get("add") or out.get("drop_shells") or any("emission" in c for c in cleaned)):
                     try:
                         piece_chunks = compact(piece, piece_chunks)
                     except ValueError as e:
@@ -1252,7 +1432,7 @@ def fix_pack(src, dst, fixes, log=print):
                     cleaned += coloured
                     problems += ["%s: %s" % (out["name"], t) for t in trouble]
                 changed = piece != doc or piece_chunks is not chunks
-                rel_out = os.path.join(os.path.dirname(rel), out["name"].replace("/", os.sep) + ext)
+                rel_out = (out["name"].replace("/", os.sep) + ext) if "/" in out["name"] else os.path.join(os.path.dirname(rel), out["name"] + ext)
                 if changed:
                     write_model(os.path.join(dst, rel_out), piece, piece_chunks)
                 else:

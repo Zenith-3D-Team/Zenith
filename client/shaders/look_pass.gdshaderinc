@@ -42,6 +42,10 @@ uniform vec3 look_ambient_color : source_color = vec3(0.7, 0.76, 0.85);
 uniform float look_space = 0.0;
 // The scene's light against what the game set (the debug menu's sliders): x the ambient's share, y the sun's.
 uniform vec2 look_scene_light = vec2(1.0);
+uniform float look_focus_dist = 0.0;
+uniform float look_pre_aa = 0.0;
+// 1.0 while AMD FSR 2.2 is active (with fixes enabled): passes skip pre-resolve sharpen/grain/aberration.
+uniform float look_fsr2 = 0.0;
 
 void vertex() {
 	POSITION = vec4(VERTEX.xy, 1.0, 1.0);
@@ -58,9 +62,92 @@ vec3 finite_hdr(vec3 c) {
 	return clamp(c, vec3(0.0), vec3(LOOK_HDR_MAX));
 }
 
-// The solid scene's colour (linear, HDR, finite); `blur` > 0 reads a mip that much smaller (a soft copy).
-vec3 scene_color(vec2 uv) {
+vec3 scene_color_fast(vec2 uv) {
 	return finite_hdr(textureLod(look_screen, uv, 0.0).rgb);
+}
+
+float _look_aa_luma(vec3 c) {
+	float y = dot(c, vec3(0.299, 0.587, 0.114));
+	return sqrt(max(y, 0.0) / (1.0 + max(y, 0.0)));
+}
+
+// The solid scene's colour (linear, HDR, finite); when look_pre_aa > 0 (FXAA/SMAA active under a
+// look pass), smooths high-contrast edges in perceptual luma before sharpening, grading and grain run.
+vec3 scene_color(vec2 uv) {
+	vec3 rgbM = finite_hdr(textureLod(look_screen, uv, 0.0).rgb);
+	if (look_pre_aa <= 0.01) {
+		return rgbM;
+	}
+	vec2 inv_sz = 1.0 / max(vec2(textureSize(look_screen, 0)), vec2(1.0));
+	float lM = _look_aa_luma(rgbM);
+	float lN = _look_aa_luma(finite_hdr(textureLod(look_screen, uv + vec2(0.0, -inv_sz.y), 0.0).rgb));
+	float lS = _look_aa_luma(finite_hdr(textureLod(look_screen, uv + vec2(0.0, inv_sz.y), 0.0).rgb));
+	float lW = _look_aa_luma(finite_hdr(textureLod(look_screen, uv + vec2(-inv_sz.x, 0.0), 0.0).rgb));
+	float lE = _look_aa_luma(finite_hdr(textureLod(look_screen, uv + vec2(inv_sz.x, 0.0), 0.0).rgb));
+	float lMax = max(lM, max(max(lN, lS), max(lW, lE)));
+	float lMin = min(lM, min(min(lN, lS), min(lW, lE)));
+	float lRange = lMax - lMin;
+	if (lRange < max(0.0312, lMax * 0.0833)) {
+		return rgbM;
+	}
+	float lNW = _look_aa_luma(finite_hdr(textureLod(look_screen, uv + vec2(-inv_sz.x, -inv_sz.y), 0.0).rgb));
+	float lNE = _look_aa_luma(finite_hdr(textureLod(look_screen, uv + vec2(inv_sz.x, -inv_sz.y), 0.0).rgb));
+	float lSW = _look_aa_luma(finite_hdr(textureLod(look_screen, uv + vec2(-inv_sz.x, inv_sz.y), 0.0).rgb));
+	float lSE = _look_aa_luma(finite_hdr(textureLod(look_screen, uv + vec2(inv_sz.x, inv_sz.y), 0.0).rgb));
+	float lNS = lN + lS;
+	float lEW = lE + lW;
+	float lAvg = (2.0 * (lNS + lEW) + (lNW + lNE) + (lSW + lSE)) * (1.0 / 12.0);
+	float subpix = smoothstep(0.0, 1.0, clamp(abs(lAvg - lM) / lRange, 0.0, 1.0));
+	subpix = subpix * subpix * mix(0.55, 0.80, clamp((look_pre_aa - 0.75) * 4.0, 0.0, 1.0));
+	float edgeH = abs(lNW + lNE - 2.0 * lN) + abs(lW + lE - 2.0 * lM) * 2.0 + abs(lSW + lSE - 2.0 * lS);
+	float edgeV = abs(lNW + lSW - 2.0 * lW) + abs(lN + lS - 2.0 * lM) * 2.0 + abs(lNE + lSE - 2.0 * lE);
+	bool is_h = edgeH >= edgeV;
+	float l1 = is_h ? lN : lW;
+	float l2 = is_h ? lS : lE;
+	float g1 = abs(l1 - lM);
+	float g2 = abs(l2 - lM);
+	bool p1 = g1 >= g2;
+	float lSteep = p1 ? l1 : l2;
+	float grad_max = 0.25 * max(g1, g2);
+	vec2 step_dir = is_h ? vec2(0.0, p1 ? -inv_sz.y : inv_sz.y) : vec2(p1 ? -inv_sz.x : inv_sz.x, 0.0);
+	vec2 tangent = is_h ? vec2(inv_sz.x, 0.0) : vec2(0.0, inv_sz.y);
+	vec2 uv_edge = uv + step_dir * 0.5;
+	float lEdge = 0.5 * (lM + lSteep);
+	const float AA_STEPS[5] = float[5](1.0, 1.5, 2.0, 2.5, 4.0);
+	vec2 uvP = uv_edge + tangent;
+	vec2 uvN = uv_edge - tangent;
+	float dP = _look_aa_luma(finite_hdr(textureLod(look_screen, uvP, 0.0).rgb)) - lEdge;
+	float dN = _look_aa_luma(finite_hdr(textureLod(look_screen, uvN, 0.0).rgb)) - lEdge;
+	bool doneP = abs(dP) >= grad_max;
+	bool doneN = abs(dN) >= grad_max;
+	for (int i = 1; i < 5; i++) {
+		if (doneP && doneN) {
+			break;
+		}
+		if (!doneP) {
+			uvP += tangent * AA_STEPS[i];
+			dP = _look_aa_luma(finite_hdr(textureLod(look_screen, uvP, 0.0).rgb)) - lEdge;
+			doneP = abs(dP) >= grad_max;
+		}
+		if (!doneN) {
+			uvN -= tangent * AA_STEPS[i];
+			dN = _look_aa_luma(finite_hdr(textureLod(look_screen, uvN, 0.0).rgb)) - lEdge;
+			doneN = abs(dN) >= grad_max;
+		}
+	}
+	float distP = is_h ? (uvP.x - uv.x) : (uvP.y - uv.y);
+	float distN = is_h ? (uv.x - uvN.x) : (uv.y - uvN.y);
+	bool min_is_N = distN < distP;
+	float min_dist = min(distP, distN);
+	float span = max(distP + distN, 1e-6);
+	float dEnd = min_is_N ? dN : dP;
+	bool good_span = (lM < lEdge) ? (dEnd >= 0.0) : (dEnd < 0.0);
+	float edge_blend = good_span ? max(0.0, 0.5 - min_dist / span) : 0.0;
+	float final_blend = max(subpix, edge_blend) * clamp(look_pre_aa, 0.0, 1.0);
+	if (final_blend <= 0.001) {
+		return rgbM;
+	}
+	return finite_hdr(textureLod(look_screen, uv + step_dir * final_blend, 0.0).rgb);
 }
 
 vec3 scene_color_blurred(vec2 uv, float blur) {

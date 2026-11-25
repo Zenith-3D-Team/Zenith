@@ -16,6 +16,7 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
 const AddonLoader := preload("res://scripts/addons/addon_loader.gd")
+const SettingsWindow := preload("res://scripts/menu/settings_window.gd")
 
 ## Said on every page: an add-on is a program (GDScript can't be sandboxed), so the switch is the
 ## player's consent; packs are the data-only way to share.
@@ -154,9 +155,12 @@ func _fill_list() -> void:
 		if not errs.is_empty():
 			state += ", script error" if errs.any(func(e: Dictionary) -> bool: return not e.has("mod")) else ", Factorio mod error"
 		b.text = "%s  %s  (%s)" % [str(m["name"]), str(m["version"]), state]
-		b.tooltip_text = str(m["description"]) + ("\nFrom a zip: " + str(m["zip"]) if m.has("zip") else "")
+		var tip := str(m["description"])
+		if m.has("zip"):
+			tip += ("\n" if tip != "" else "") + "From a zip: " + str(m["zip"])
 		if not (m.get("also", []) as Array).is_empty():
-			b.tooltip_text += "\nAlso found: " + "; ".join(m["also"])
+			tip += ("\n" if tip != "" else "") + "Also found: " + "; ".join(m["also"])
+		b.tooltip_text = SettingsWindow.wrap_tooltip(tip)
 		if _problem(m) != "":
 			b.add_theme_color_override("font_color", Kit.RED_TEXT)
 		b.pressed.connect(func() -> void:
@@ -209,7 +213,7 @@ func _show_page() -> void:
 	on.name = "addon-switch-" + id
 	on.disabled = not bool(m["ok"]) or str(m["source"]) == "command line"
 	if str(m["source"]) == "command line":
-		on.tooltip_text = "Given with --addons: always on (Reload restarts it)." if addons.has_method("can_reload") and addons.can_reload(m) else "Given with --addons: always on."
+		on.tooltip_text = SettingsWindow.wrap_tooltip("Given with --addons: always on (Reload restarts it)." if addons.has_method("can_reload") and addons.can_reload(m) else "Given with --addons: always on.")
 	on.toggled.connect(func(v: bool) -> void:
 		Sfx.play_ui("gui-checkbox-click")
 		addons.set_enabled(id, v))  # addons_changed redraws the page
@@ -218,7 +222,7 @@ func _show_page() -> void:
 		var reload := MenuKit.button("Reload")
 		reload.name = "addon-reload-" + id
 		reload.custom_minimum_size.x = Kit.px(120)
-		reload.tooltip_text = "Reads its addon.json, scripts and shaders from disk again and restarts it."
+		reload.tooltip_text = SettingsWindow.wrap_tooltip("Reads its addon.json, scripts and shaders from disk again and restarts it.")
 		reload.pressed.connect(func() -> void:
 			Sfx.play_ui("gui-click")
 			addons.reload(m))  # addons_changed redraws the page
@@ -266,7 +270,7 @@ func _error_rows(id: String) -> void:
 	head.add_child(title)
 	var copy := MenuKit.button("Copy")
 	copy.name = "addon-errors-copy-" + id
-	copy.tooltip_text = "Copies these lines (paths are in the add-on's folder)."
+	copy.tooltip_text = SettingsWindow.wrap_tooltip("Copies these lines (paths are in the add-on's folder).")
 	copy.pressed.connect(func() -> void:
 		Sfx.play_ui("gui-click")
 		DisplayServer.clipboard_set(addons.script_errors_text(id, true)))
@@ -313,70 +317,91 @@ func _settings_rows(api) -> void:
 
 func _setting_row(grid: GridContainer, api, def: Dictionary) -> void:
 	var sid := str(def["id"])
+	var wrapped_note := SettingsWindow.wrap_tooltip(str(def["note"]))
 	var l := Kit.label(str(def["label"]))
 	l.custom_minimum_size.x = Kit.px(230)
 	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	l.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	l.tooltip_text = str(def["note"])
+	l.tooltip_text = wrapped_note
 	l.mouse_filter = Control.MOUSE_FILTER_PASS
 	grid.add_child(l)
+	var reset := MenuKit.button("Default")
+	reset.custom_minimum_size.x = Kit.px(72)
+	reset.tooltip_text = SettingsWindow.wrap_tooltip("Back to " + _value_text(def["default"], def))
+	reset.disabled = api.settings.is_default(sid)
 	var control: Control
 	var value = api.settings.value(sid)
 	match str(def["type"]):
 		"bool":
 			var c := MenuKit.checkbox("", bool(value))
-			c.toggled.connect(func(v: bool) -> void:
+			var on_bool_toggled := func(v: bool) -> void:
 				Sfx.play_ui("gui-checkbox-click")
-				api.settings.set_value(sid, v))
+				api.settings.set_value(sid, v)
+				reset.disabled = api.settings.is_default(sid)
+			c.toggled.connect(on_bool_toggled)
 			control = c
 		"number":
 			var row := HBoxContainer.new()
 			row.add_theme_constant_override("separation", Kit.px(8))
-			var s := MenuKit.slider(float(def["min"]), float(def["max"]), float(def["step"]) if float(def["step"]) > 0.0 else 0.001, float(value))
+			var raw_step := float(def["step"])
+			var sstep := raw_step if raw_step > 0.0 else 0.001
+			var s := MenuKit.slider(float(def["min"]), float(def["max"]), sstep, float(value))
 			s.custom_minimum_size.x = Kit.px(200)
+			s.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 			s.name = "slider"
-			var shown := Kit.label(_number_text(value, def))
-			shown.custom_minimum_size.x = Kit.px(90)
-			s.value_changed.connect(func(v: float) -> void:
+			s.tooltip_text = wrapped_note
+			var d_scale := 100.0 if SettingsWindow.addon_unit_scaled(def) else 1.0
+			var num_fmt := func(v: float) -> String: return _number_text(v, def)
+			var on_num_changed := func(v: float) -> void:
 				api.settings.set_value(sid, v, false)
-				shown.text = _number_text(api.settings.value(sid), def))
-			s.drag_ended.connect(func(_changed: bool) -> void: Settings.save())
+				reset.disabled = api.settings.is_default(sid)
+			s.value_changed.connect(on_num_changed)
+			var on_num_commit := func(v: float) -> void:
+				Sfx.play_ui("gui-slider")
+				api.settings.set_value(sid, v, true)
+				reset.disabled = api.settings.is_default(sid)
+			var on_num_drag := func(_changed: bool) -> void: on_num_commit.call(s.value)
+			s.drag_ended.connect(on_num_drag)
+			var val_ed := SettingsWindow.make_slider_value_editor(s, num_fmt, on_num_commit, {
+				"name": "value",
+				"display_scale": d_scale,
+				"min_width": Kit.px(90),
+			})
 			row.add_child(s)
-			row.add_child(shown)
+			row.add_child(val_ed["box"])
 			control = row
 		"choice":
 			var o := MenuKit.dropdown(def["choices"], value)
-			o.item_selected.connect(func(i: int) -> void:
+			var on_choice := func(i: int) -> void:
 				Sfx.play_ui("gui-click")
-				api.settings.set_value(sid, o.get_item_metadata(i)))
+				api.settings.set_value(sid, o.get_item_metadata(i))
+				reset.disabled = api.settings.is_default(sid)
+			o.item_selected.connect(on_choice)
 			control = o
 		"text":
 			var e := MenuKit.textbox(str(value), str(def["placeholder"]))
 			e.custom_minimum_size.x = Kit.px(260)
-			e.text_submitted.connect(func(t: String) -> void: api.settings.set_value(sid, t))
-			e.focus_exited.connect(func() -> void: api.settings.set_value(sid, e.text))
+			var commit_text := func(t: String) -> void:
+				api.settings.set_value(sid, t)
+				reset.disabled = api.settings.is_default(sid)
+			var on_submit := func(t: String) -> void: commit_text.call(t)
+			var on_focus := func() -> void: commit_text.call(e.text)
+			e.text_submitted.connect(on_submit)
+			e.focus_exited.connect(on_focus)
 			control = e
 	control.name = "addon-setting-%s-%s" % [str(api.id), sid]
-	control.tooltip_text = str(def["note"])
+	control.tooltip_text = wrapped_note
 	grid.add_child(control)
-	var reset := MenuKit.button("Default")
-	reset.custom_minimum_size.x = Kit.px(72)
-	reset.tooltip_text = "Back to " + _value_text(def["default"], def)
-	reset.disabled = api.settings.is_default(sid)
-	reset.pressed.connect(func() -> void:
+	var on_reset := func() -> void:
 		Sfx.play_ui("gui-click")
 		api.settings.reset(sid)
-		_show_page())
+		_show_page()
+	reset.pressed.connect(on_reset)
 	grid.add_child(reset)
 
 
 static func _number_text(v: Variant, def: Dictionary) -> String:
-	var f := float(v)
-	var text := str(int(f)) if f == floorf(f) else str(snappedf(f, maxf(float(def["step"]), 0.01)))
-	var unit := str(def["unit"])
-	if unit == "":
-		return text
-	return text + (unit if unit.begins_with("°") or unit.begins_with("×") or unit.begins_with("%") else " " + unit)
+	return SettingsWindow.addon_number_text(v, def)
 
 
 static func _value_text(v: Variant, def: Dictionary) -> String:
@@ -410,7 +435,7 @@ func _key_rows(api) -> void:
 		var l := Kit.label(ControlsInfo.name_of(action))
 		if str(api.keys._contexts.get(key_name, "")) == "camera":
 			l.text += "  (camera)"
-			l.tooltip_text = "Works while the add-on has the camera."
+			l.tooltip_text = SettingsWindow.wrap_tooltip("Works while the add-on has the camera.")
 			l.mouse_filter = Control.MOUSE_FILTER_PASS
 		l.custom_minimum_size.x = Kit.px(230)
 		l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -425,7 +450,7 @@ func _key_rows(api) -> void:
 			var clash := Settings.conflicts(action, int(keys[slot]))
 			if not clash.is_empty():
 				b.add_theme_color_override("font_color", Kit.RED_TEXT)
-				b.tooltip_text = "Also bound to: " + ", ".join(clash.map(func(a: String) -> String: return ControlsInfo.name_of(a)))
+				b.tooltip_text = SettingsWindow.wrap_tooltip("Also bound to: " + ", ".join(clash.map(func(a: String) -> String: return ControlsInfo.name_of(a))))
 			if _capturing == target:
 				b.text = "Press a key…"
 			b.pressed.connect(func() -> void:

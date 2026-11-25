@@ -62,7 +62,8 @@ local function resend(...)
   local s = storage.f3d
   for _, e in ipairs({ ... }) do
     if e.valid and e.unit_number and world.is_subscribed(e.surface, e.position) then
-      transport.send_reliable({ t = "upd", e = world.record(e) })
+      local p = e.position
+      transport.send_reliable_priority({ t = "upd", e = world.record(e) }, math.floor(p.x / 32), math.floor(p.y / 32))
       if s.wire_sigs then
         s.wire_sigs[e.unit_number] = world.wire_signature(e)
       end

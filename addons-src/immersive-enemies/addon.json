@@ -1,0 +1,9 @@
+{
+	"id": "immersive-enemies",
+	"name": "Immersive Enemies",
+	"version": "0.1.2",
+	"api": 1.9,
+	"entry": "main.gd",
+	"author": "Zenith",
+	"description": "Physics-driven biter, spitter, worm & nest ragdolls with spring-animated legs, explosive body splitting, burning-to-ash corpses, progressive wounds, pooled ichor splatter and gibs, and reworked tier-weighted animations."
+}

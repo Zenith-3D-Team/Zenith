@@ -139,21 +139,25 @@ def start_server(build, save, ports):
     raise RuntimeError(f"{build.label}: the server didn't start (see {log_file})")
 
 
-def run_once(build, scenario, run_dir, ports):
+def run_once(build, scenario, run_dir, ports, extra=()):
+    """extra: more client arguments, after the bench's own (a variant's switches)."""
     run_dir.mkdir(parents=True, exist_ok=True)
     save = run_dir / "save.zip"
     shutil.copyfile(SAVE, save)
     stop_server(build, ports)
     start_server(build, save, ports)
-    probe = run_dir / "probe.json"
-    args = [f"--factorio-port={ports[0]}", f"--port={ports[3]}", "--gpu-profile", f"--stutter-probe={probe}@{ROUTE[scenario]}"]
+    # Absolute: an exported game reads a relative path as res://, which it can't write.
+    probe = (run_dir / "probe.json").resolve()
+    args = [f"--factorio-port={ports[0]}", f"--port={ports[3]}", "--gpu-profile", f"--stutter-probe={probe}@{ROUTE[scenario]}"] + list(extra)
     started = time.time()
     with open(run_dir / "client.log", "w", encoding="utf-8", errors="ignore") as out:
         client = subprocess.Popen(build.client_cmd(args, (run_dir / "godot.log").resolve()), stdout=out, stderr=subprocess.STDOUT)
         time.sleep(TRACE_AT)
         try:
-            log("   trace:", rcon.run(TRACE % TRACE_TICKS[scenario], port=ports[2],
-                                     password=(build.data / "rcon-password.txt").read_text().strip()).strip())
+            password = (build.data / "rcon-password.txt").read_text().strip()
+            # A save's first /c only gets Factorio's achievements warning and doesn't run.
+            rcon.run("/c rcon.print('')", port=ports[2], password=password)
+            log("   trace:", rcon.run(TRACE % TRACE_TICKS[scenario], port=ports[2], password=password).strip())
         except Exception as e:
             log("   trace failed:", e)
         try:
@@ -179,6 +183,16 @@ def measure(run_dir):
         out.update({"frame_p50": walk["p50"], "frame_p99": walk["p99"], "frame_worst": walk["worst"],
                     "frames_over_16": walk["over16"], "frames_over_33": walk["over33"], "frames": walk["frames"],
                     "gpu_p50": walk["gpu_p50"]})
+    elif (run_dir / "client.log").exists():
+        # No probe file (a run before the path was absolute): the probe prints the same summary.
+        text = (run_dir / "client.log").read_text(errors="ignore")
+        m = re.search(r"STUTTER walk: frames (\d+) \| p50 ([\d.]+) p99 ([\d.]+) worst ([\d.]+) ms \| "
+                      r"over 16.7 ms (\d+), over 33 ms (\d+)", text)
+        g = re.search(r"STUTTER walk: _process .*?\| gpu p50 ([\d.]+)", text)
+        if m:
+            out.update({"frames": int(m.group(1)), "frame_p50": float(m.group(2)), "frame_p99": float(m.group(3)),
+                        "frame_worst": float(m.group(4)), "frames_over_16": int(m.group(5)),
+                        "frames_over_33": int(m.group(6)), "gpu_p50": float(g.group(1)) if g else None})
     ticks, stamps = {}, {}
     for line in (run_dir / "factorio.log").read_text(errors="ignore").splitlines():
         m = re.match(r"\s*([\d.]+) .*f3dtrace (\d+) (\S+) Duration: ([\d.]+) ?ms", line)

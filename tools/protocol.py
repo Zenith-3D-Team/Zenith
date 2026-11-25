@@ -6,11 +6,30 @@ two can't drift apart. `problems(msg)` returns a list of strings; empty means va
 
 RELIABLE = {"cmdr", "welcome", "protos", "tprotos", "iprotos", "fprotos", "ready", "chunk", "ents", "add", "upd", "del", "aiu", "tiles", "st", "inv", "recipes",
             "guns", "slots", "qb", "rdet", "craftable", "techs", "rdone", "clog", "surface", "eprops", "surfs", "planet",
-            "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol", "kept", "ac", "am", "steps"}
-IMMEDIATE = {"me", "mv", "bi", "ih", "ie", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "plat",
+            "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol", "kept", "ac", "am", "steps", "cue"}
+IMMEDIATE = {"me", "mv", "bi", "ih", "ie", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "atk", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "rb", "plat",
              "ai", "clip", "chat", "stats", "trl", "seg", "lt", "legs", "cp", "pg", "sp", "fz", "rk", "pst", "bf",
              "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui", "bs", "dg", "pol",
-             "mnd", "pku", "rpatch", "ext"}
+             "mnd", "pku", "rpatch", "ext", "pols", "lodm", "lodr", "lod"}
+CLIENT = {
+    "alt", "altc", "bfar", "blueprint", "bonuses", "bp_del", "bp_get", "bp_lib", "bp_page", "bp_rec", "bp_set",
+    "bre", "budget", "build", "bye", "cancel_craft", "chat", "close", "cmd", "copy", "craft", "decon", "drive",
+    "drop", "enter", "eq_move", "eq_put", "eq_take", "eq_toggle", "ext", "fast", "flip", "flush", "focus", "gfx",
+    "gun", "hello", "hinfo", "inv_filter", "land", "lnet", "lnets", "lod_sub", "lpad", "map", "mine", "mine_stop",
+    "modreq", "move", "mpress", "mrp", "mtr", "nack", "open", "paste", "paste_settings", "pedia", "pedia_index",
+    "perms", "photo", "pickup", "pickup_stop", "plat_board", "plat_go", "plat_new", "plat_pause", "plat_sched",
+    "put", "qb_page", "qb_sel", "qb_set", "rails", "rate", "redo", "repair", "research", "research_cancel",
+    "respawn", "resync", "ride", "rotate", "rpatch", "set_artillery", "set_bar", "set_cb", "set_cc",
+    "set_char_color", "set_char_requests", "set_chest_logistics", "set_collector", "set_color", "set_desc",
+    "set_hub", "set_inserter", "set_interrupts", "set_lamp", "set_pad", "set_panel", "set_pump", "set_recipe",
+    "set_requests", "set_schedule", "set_section", "set_silo", "set_speaker", "set_splitter", "set_stop",
+    "set_storage_filter", "set_switch", "set_targets", "set_train_group", "set_vehicle", "shoot", "silo_launch",
+    "smap", "sort", "spider_go", "spider_q", "stats", "sub", "tag_add", "tag_del", "take", "throw", "tile",
+    "tile_mine", "train_go", "train_mode", "train_mode_id", "train_temp", "trains_list", "undo", "unghost",
+    "upgrade", "view", "walk", "wire", "wire_clear", "xfer",
+}
+NACK_RING_SIZE = 256
+NACK_MAX_R = 64
 CHARACTER_ROLES = {"main", "guns", "ammo", "armor", "trash"}
 DICTIONARY_WIDTH = {"protos": 12, "tprotos": 5, "iprotos": 2, "fprotos": 5, "dprotos": 2}
 GUI_KINDS = {"container", "crafter", "furnace", "lab", "combinator", "train", "stop", "roboport", "other",
@@ -61,12 +80,14 @@ def doc_problems(path=None):
 # starts with k u32 (and r u32 with flag bit 0), then the kind's scalar fields, then its blocks: width u8 (4 or
 # 8), count u32, `count` signed numbers of `width` bytes.
 WIRE_MAGIC = 0xF3
-WIRE_VERSION = 3  # 1: mv; 2: bs and bfar too; 3: chunk, ents, st and ih too (a datagram's second byte: the version
-# its client was answered)
+WIRE_VERSION = 5  # 1: mv; 2: bs and bfar too; 3: chunk, ents, st and ih too; 4: rb too; 5: bs's crossing hints (sx, a block
+# after qu's text in a part that has some) (a datagram's second byte: the version its client was answered)
+SX_STRIDE = 7  # a bs crossing hint: unit, side, tick, out0, out1, in0, in1
 KIND_JSON, KIND_DG, KIND_MV, KIND_BS, KIND_BFAR = 0, 1, 16, 17, 18
-KIND_CHUNK, KIND_ENTS, KIND_ST, KIND_IH = 19, 20, 21, 22
+KIND_CHUNK, KIND_ENTS, KIND_ST, KIND_IH, KIND_RB = 19, 20, 21, 22, 23
 ENT_STRIDE = 5  # an `ents` record's numbers: unit, prototype id, x, y, direction (its extras in the JSON tail)
 IH_STRIDE = 4  # an `ih` hand: unit, hand x, hand y, item id
+RB_STRIDE = 11  # unit, proto, t0, sx, sy, tx, ty, nx, ny, ori, flags
 ST_LISTS = ("l", "lc", "ao")
 FLAG_RELIABLE = 1
 MV_STRIDE = 5  # unit, prototype id, x, y, orientation (-1: not oriented)
@@ -144,20 +165,24 @@ def _bs_join(field, flat):
     return out
 
 
-def _bs_body(msg, width=None):
+def _bs_body(msg, width=None, version=WIRE_VERSION):
     import struct
     blocks = [_bs_split(f, msg.get(f) or []) for f in BS_FIELDS]
     qu = msg.get("qu") or []
     uids, names = qu[0::2], qu[1::2]
+    sx = list(msg.get("sx") or []) if version >= 5 else []
     if width is None:
-        width = 4 if all(-2 ** 31 <= v < 2 ** 31 for b in blocks + [uids] for v in b) else 8
+        width = 4 if all(-2 ** 31 <= v < 2 ** 31 for b in blocks + [uids, sx] for v in b) else 8
     code = "i" if width == 4 else "q"
     body = struct.pack("<IIIIIiiII", msg["k"], msg["part"], msg["parts"], msg.get("p", 0), msg.get("w", 0),
                        msg.get("fx", 0), msg.get("fy", 0), msg.get("fr", 0), msg.get("ld", 0))
     for b in blocks + [uids]:
         body += struct.pack(f"<BI{len(b)}{code}", width, len(b), *b)
     text = ",".join(names).encode()
-    return body + struct.pack("<I", len(text)) + text
+    body += struct.pack("<I", len(text)) + text
+    if sx:
+        body += struct.pack(f"<BI{len(sx)}{code}", width, len(sx), *sx)
+    return body
 
 
 def encode_frame(kind, body, flags=0):
@@ -219,6 +244,13 @@ def encode_message(msg, version=WIRE_VERSION):
             flat = _undelta(flat, IH_STRIDE)
         body = struct.pack("<IIII", msg["k"], msg.get("part", 1), msg.get("parts", 1), msg.get("p", 0)) + _block(flat)
         return encode_frame(KIND_IH, body)
+    if version >= 4 and t == "rb" and "r" not in msg:
+        u_flat = msg.get("u") or []
+        g_flat = msg.get("g") or []
+        body = struct.pack("<IIIIII", msg["k"], msg.get("part", 1), msg.get("parts", 1),
+                           msg.get("p", 0), msg.get("sm", 1000), msg.get("snap", 0))
+        body += _block(u_flat) + _block(g_flat)
+        return encode_frame(KIND_RB, body)
     if t == "mv" and "r" not in msg:
         flat = []
         prev = None
@@ -231,7 +263,7 @@ def encode_message(msg, version=WIRE_VERSION):
         body = struct.pack("<IIII", msg["k"], msg["part"], msg["parts"], msg.get("p", 0)) + _block(flat)
         return encode_frame(KIND_MV, body)
     if version >= 2 and msg.get("t") == "bs" and "r" not in msg:
-        return encode_frame(KIND_BS, _bs_body(msg))
+        return encode_frame(KIND_BS, _bs_body(msg, version=version))
     if version >= 2 and msg.get("t") == "bfar" and "r" not in msg:
         h = msg.get("h") or []
         body = struct.pack("<Iii", msg["k"], msg["cx"], msg["cy"])
@@ -307,9 +339,11 @@ def decode_frames(data):
                         for i in range(0, len(flat), MV_STRIDE)]
             out.append(msg)
         elif kind == KIND_BS and data[1] >= 2:
-            out.append(_decode_bs(data, at, end, flags))
+            out.append(_decode_bs(data, at, end, flags, data[1]))
         elif kind in (KIND_CHUNK, KIND_ENTS, KIND_ST, KIND_IH) and data[1] >= 3:
             out.append(_decode_v3(kind, data, at, end, flags))
+        elif kind == KIND_RB and data[1] >= 4:
+            out.append(_decode_rb(data, at, end, flags))
         elif kind == KIND_BFAR and data[1] >= 2:
             if length < 12:
                 raise ValueError("bfar frame too short")
@@ -332,8 +366,9 @@ def decode_frames(data):
     return out
 
 
-def _decode_bs(data, at, end, flags):
-    """A kind 17 body as the dict its JSON gives (lists absent when empty, as the bridge leaves them)."""
+def _decode_bs(data, at, end, flags, version=WIRE_VERSION):
+    """A kind 17 body as the dict its JSON gives (lists absent when empty, as the bridge leaves them). From wire
+    version 5 a part may end with its crossing hints' block (sx) after qu's text; before 5 the text ends it."""
     import struct
     p = at
     if p + 4 > end:
@@ -360,9 +395,16 @@ def _decode_bs(data, at, end, flags):
         raise ValueError("bs qu names past the frame")
     n = struct.unpack_from("<I", data, p)[0]
     p += 4
-    if p + n != end:
+    text_end = p + n
+    if text_end > end or (text_end != end and version < 5):
         raise ValueError("bs qu names of the wrong length")
-    names = data[p:end].decode("utf-8").split(",") if n else []
+    if text_end != end:
+        sx, q = _read_block(data, text_end, end)
+        if q != end or len(sx) % SX_STRIDE:
+            raise ValueError("bs sx: not records of 7 ending the frame")
+        if sx:
+            msg["sx"] = sx
+    names = data[p:text_end].decode("utf-8").split(",") if n else []
     if len(names) != len(uids):
         raise ValueError("bs qu: ids and names differ in number")
     if uids:
@@ -429,6 +471,35 @@ def _decode_v3(kind, data, at, end, flags):
         msg["l"], p = _read_block(data, p + 12, end)
         if p != end or len(msg["l"]) % IH_STRIDE:
             raise ValueError("ih hands of the wrong size")
+    return msg
+
+
+def _decode_rb(data, at, end, flags):
+    """A kind 23 body (`rb`) as the dict its JSON gives."""
+    import struct
+    p = at
+    if p + 4 > end:
+        raise ValueError("rb frame too short")
+    msg = {"t": "rb", "k": struct.unpack_from("<I", data, p)[0]}
+    p += 4
+    if flags & FLAG_RELIABLE:
+        if p + 4 > end:
+            raise ValueError("rb frame too short")
+        msg["r"] = struct.unpack_from("<I", data, p)[0]
+        p += 4
+    if p + 20 > end:
+        raise ValueError("rb frame too short")
+    msg["part"], msg["parts"], msg["p"], msg["sm"], snap = struct.unpack_from("<IIIII", data, p)
+    p += 20
+    if snap:
+        msg["snap"] = snap
+    u, p = _read_block(data, p, end)
+    g, p = _read_block(data, p, end)
+    if p != end or len(u) % RB_STRIDE:
+        raise ValueError("rb records of the wrong size")
+    msg["u"] = u
+    if g:
+        msg["g"] = g
     return msg
 
 
@@ -502,7 +573,7 @@ def bs_problems(msg):
         return out
     if not (1 <= msg["part"] <= msg["parts"]) or msg["p"] < 1 or msg["w"] < 0 or msg["fr"] < 0:
         out.append(f"bs: part 1..parts, p >= 1, w >= 0, fr >= 0: {msg['part']} {msg['parts']} {msg['p']} {msg['w']} {msg['fr']}")
-    for k in ("lm", "sl", "qu", "pc", "pu", "ew", "dl", "of"):
+    for k in ("lm", "sl", "qu", "pc", "pu", "ew", "dl", "of", "sx"):
         if k in msg and not _list(msg[k]):
             out.append(f"bs: {k} must be a list")
     if out:
@@ -567,6 +638,11 @@ def bs_problems(msg):
     of = _items(msg.get("of", []))
     if len(of) % 2 or not all(_int(v) for v in of) or not all(v in (0, 1) for v in of[1::2]):
         out.append(f"bs: of must be [unit number, 0 or 1, ...]: {of!r}"[:200])
+    sx = _items(msg.get("sx", []))
+    if "sx" in msg and (not sx or len(sx) % SX_STRIDE or not all(_int(v) and v >= 0 for v in sx)
+                        or not all(u > 0 and side in (0, 1) and t >= 0 for u, side, t in zip(sx[0::7], sx[1::7], sx[2::7]))):
+        out.append(f"bs: sx must be [splitter unit > 0, side 0 or 1, tick, out0, out1, in0, in1 (unique ids, 0: none), ...], "
+                   f"not empty: {sx!r}"[:200])
     return out
 
 
@@ -605,6 +681,14 @@ def entity_record_problems(rec, where):
         out.append(f"{where}: extra.ai (Alt-mode icon) is [icon type, name, more filters?]: {rec!r}")
     elif len(rec) == 6 and "fc" in rec[5] and not _fluid_connections(rec[5]["fc"]):
         out.append(f"{where}: extra.fc (L10) is [[dx, dy, way 0/4/8/12, \"i\"|\"o\"|\"b\", fluid], ...]: {rec!r}")
+    elif len(rec) == 6 and "lp" in rec[5] and not (_int(rec[5]["lp"]) and 1 <= rec[5]["lp"] <= 3):
+        out.append(f"{where}: extra.lp (lamp power/always-on hint) is 1-3: {rec!r}")
+    elif len(rec) == 6 and "lc" in rec[5] and not (_int(rec[5]["lc"]) and 0 <= rec[5]["lc"] <= 0xFFFFFF):
+        out.append(f"{where}: extra.lc (lamp colour hint) is 0-0xFFFFFF: {rec!r}")
+    elif len(rec) == 6 and "sg" in rec[5] and not (_int(rec[5]["sg"]) and 1 <= rec[5]["sg"] <= 4):
+        out.append(f"{where}: extra.sg (rail signal state hint) is 1-4: {rec!r}")
+    elif len(rec) == 6 and "el" in rec[5] and rec[5]["el"] != 1:
+        out.append(f"{where}: extra.el (a rail signal on elevated rails) is 1: {rec!r}")
     return out
 
 
@@ -701,6 +785,10 @@ def eprops_overlay_problems(x):
             ok = _num(v) and v >= 0
         elif k in ("rs", "es"):
             ok = _num(v) and v > 0  # an inserter's rotation (turns a tick) and extension (tiles a tick) speed
+        elif k == "spd":
+            ok = _num(v) and v > 0  # worker robot base speed (tiles a tick)
+        elif k in ("low", "epm", "ept"):
+            ok = _num(v) and v >= 0  # worker robot out-of-energy speed multiplier and energy costs
         elif k in ("fb", "fj"):
             # fb: the connections drawn as arrows; fj: where a tank or valve joins a pipeline (N9), never drawn.
             ok = isinstance(v, list) and all(isinstance(c, list) and len(c) == 4 and _num(c[0]) and _num(c[1]) and _int(c[2])
@@ -1512,6 +1600,53 @@ def ext_problems(msg, sender):
     return out
 
 
+def nack_problems(msg):
+    """A `nack` (client -> mod): r (1..64 positive integers) and optional c ([[cx, cy], ...])."""
+    out = []
+    if not isinstance(msg, dict):
+        return [f"nack: message is not an object: {msg!r}"]
+    if msg.get("t") != "nack":
+        out.append(f"nack: t must be 'nack': {msg.get('t')!r}")
+    extra = set(msg) - {"t", "r", "c"}
+    if extra:
+        out.append(f"nack: carries only t, r and optional c: {sorted(msg)}")
+    r = msg.get("r")
+    if not (isinstance(r, list) and 1 <= len(r) <= NACK_MAX_R and all(_int(v) and v >= 1 for v in r)):
+        out.append(f"nack: r must be 1-{NACK_MAX_R} positive integers: {r!r}")
+    if "c" in msg:
+        c = msg["c"]
+        if not (isinstance(c, list) and all(isinstance(p, list) and len(p) == 2 and _int(p[0]) and _int(p[1]) for p in c)):
+            out.append(f"nack: c must be [[cx, cy], ...] integer pairs: {c!r}")
+    return out
+
+
+def client_problems(msg):
+    """Checks a client-to-mod command against docs/PROTOCOL.md."""
+    if not isinstance(msg, dict):
+        return [f"message is not an object: {msg!r}"]
+    t = msg.get("t")
+    if t not in CLIENT:
+        return [f"unknown client message type {t!r}"]
+    if t == "nack":
+        return nack_problems(msg)
+    if t == "ext":
+        return ext_problems(msg, "client")
+    out = []
+    if t == "resync":
+        if "full" in msg and msg["full"] not in (0, 1):
+            out.append(f"resync: full must be 0 or 1: {msg['full']!r}")
+        if "c" in msg:
+            c = msg["c"]
+            if not (isinstance(c, list) and len(c) <= 1000 and all(
+                    isinstance(p, list) and len(p) == 2 and _int(p[0]) and _int(p[1]) for p in c)):
+                out.append(f"resync: c must be at most 1000 [cx, cy] integer pairs: {c!r}")
+    elif t == "bre":
+        l = msg.get("l")
+        if not (isinstance(l, list) and len(l) <= 512 and all(_int(v) and v > 0 for v in l)):
+            out.append(f"bre: l must be up to 512 positive integer lane keys: {l!r}")
+    return out
+
+
 def problems(msg):
     out = []
     if not isinstance(msg, dict):
@@ -1547,6 +1682,13 @@ def problems(msg):
             out.append(f"welcome: bin is the binary wire version the bridge sends, 1..{WIRE_VERSION}: {msg['bin']!r}")
         if "ext" in msg and not (_int(msg["ext"]) and msg["ext"] >= 1):
             out.append(f"welcome: ext is the add-on link's version, 1 or more: {msg['ext']!r}")
+        if "lod" in msg and not (_int(msg["lod"]) and msg["lod"] == 1):
+            out.append(f"welcome: lod is 1 when supported: {msg['lod']!r}")
+        if "cue" in msg and not (_int(msg["cue"]) and msg["cue"] >= 0):
+            out.append(f"welcome: cue is the scene's cue tick, 0 or more: {msg['cue']!r}")
+    elif t == "cue":
+        if not (_int(msg.get("c")) and msg["c"] >= -1):
+            out.append(f"cue: c is the cue tick, or -1 when cleared: {msg.get('c')!r}")
     elif t == "ext":
         out += ext_problems(msg, "mod")
     elif t == "surface":
@@ -1630,6 +1772,16 @@ def problems(msg):
         out += entity_record_problems(msg.get("e"), t)
     elif t in ("del", "died"):
         need("u", "p", "x", "y")
+        if t == "died":
+            for f in ("cx", "cy"):
+                if f in msg and not _int(msg[f]):
+                    out.append(f"died: {f} must be an integer: {msg[f]!r}")
+            if "dt" in msg and not isinstance(msg["dt"], str):
+                out.append(f"died: dt must be a string: {msg['dt']!r}")
+            if "dmg" in msg and (not _int(msg["dmg"]) or msg["dmg"] < 0):
+                out.append(f"died: dmg must be an integer >= 0: {msg['dmg']!r}")
+            if "src" in msg and not isinstance(msg["src"], str):
+                out.append(f"died: src must be a string: {msg['src']!r}")
     elif t == "mnd":
         need("u", "p", "x", "y")
         if msg.get("g") not in (0, 1) or msg.get("gi", 0) not in (0, 1):
@@ -1679,6 +1831,26 @@ def problems(msg):
         for rec in _items(msg.get("l")):
             if not isinstance(rec, list) or len(rec) not in (4, 5) or not all(_int(v) for v in rec):
                 out.append(f"mv: mover must be 4 or 5 integers: {rec!r}")
+    elif t == "rb":
+        need("part", "parts", "p", "sm")
+        if _int(msg.get("p")) and msg["p"] < 1:
+            out.append(f"rb: p must be >= 1: {msg['p']!r}")
+        if _int(msg.get("sm")) and msg["sm"] < 1:
+            out.append(f"rb: sm (speed multiplier x 1000) must be >= 1: {msg['sm']!r}")
+        if "snap" in msg and msg["snap"] not in (0, 1):
+            out.append(f"rb: snap must be 0 or 1: {msg['snap']!r}")
+        u = msg.get("u")
+        if not _list(u) or len(_items(u)) % RB_STRIDE or not all(_int(v) for v in _items(u)):
+            out.append(f"rb: u must be flat groups of {RB_STRIDE} integers")
+        else:
+            items = _items(u)
+            for i in range(0, len(items), RB_STRIDE):
+                ori, fl = items[i + 9], items[i + 10]
+                if not (0 <= ori <= 1000) or fl < 0:
+                    out.append(f"rb: bad ori/flags in record: {items[i:i + RB_STRIDE]!r}")
+        g = msg.get("g")
+        if "g" in msg and (not _list(g) or not all(_int(v) for v in _items(g))):
+            out.append(f"rb: g must be a list of integers: {g!r}")
     elif t in ("bi", "ih", "ie", "gi", "fl", "pw", "ht"):
         need("part", "parts")
         l = msg.get("l")
@@ -1728,6 +1900,15 @@ def problems(msg):
                 out.append(f"pol: l must be w * w whole, non-negative pollution amounts, row by row: {msg!r}")
         elif _int(w) and w < 0:
             out.append(f"pol: w must be 0 (none) or the square's side in chunks: {msg!r}")
+    elif t == "pols":
+        need("si", "md")
+        if _int(msg.get("md")) and msg["md"] < 1:
+            out.append(f"pols: md must be >= 1: {msg['md']!r}")
+        l = msg.get("l")
+        if not isinstance(l, list) or len(l) % 3 or not all(_int(v) for v in l):
+            out.append(f"pols: l must be [cx, cy, amount, ...] integers: {l!r}")
+        elif any(l[i] < 0 for i in range(2, len(l), 3)):
+            out.append(f"pols: amounts must be >= 0: {l!r}")
     elif t == "sky":
         need("d", "n")
         if _int(msg.get("d")) and _int(msg.get("n")) and not (0 <= msg["d"] < 1000 and 0 <= msg["n"] <= 1000):
@@ -1860,6 +2041,24 @@ def problems(msg):
             out.append(f"afx: fx must be blood or burn: {msg.get('fx')!r}")
         if _int(msg.get("u")) and msg["u"] < 0:
             out.append(f"afx: u must be a unit number, or 0 for a character without one: {msg['u']!r}")
+        for f in ("cx", "cy"):
+            if f in msg and not _int(msg[f]):
+                out.append(f"afx: {f} must be an integer: {msg[f]!r}")
+        if "dt" in msg and not isinstance(msg["dt"], str):
+            out.append(f"afx: dt must be a string: {msg['dt']!r}")
+        if "dmg" in msg and (not _int(msg["dmg"]) or msg["dmg"] < 0):
+            out.append(f"afx: dmg must be an integer >= 0: {msg['dmg']!r}")
+        if "hp" in msg and (not _int(msg["hp"]) or not (0 <= msg["hp"] <= 1000)):
+            out.append(f"afx: hp must be an integer 0..1000: {msg['hp']!r}")
+        if "src" in msg and not isinstance(msg["src"], str):
+            out.append(f"afx: src must be a string: {msg['src']!r}")
+    elif t == "atk":
+        # An enemy unit's melee attack landed (combat.lua attack_cue): its attack roar.
+        need("u", "p", "x", "y")
+        if _int(msg.get("u")) and msg["u"] <= 0:
+            out.append(f"atk: u must be the attacker's unit number: {msg['u']!r}")
+        if _int(msg.get("p")) and msg["p"] <= 0:
+            out.append(f"atk: p must be a prototype id: {msg['p']!r}")
     elif t == "hp":
         need("part", "parts")
         l = msg.get("l")
@@ -2437,4 +2636,65 @@ def problems(msg):
         need("q", check=_strs)
     elif t == "steps":
         out += steps_problems(msg)
+    elif t == "lodm":
+        need("si", "q", "part", "parts")
+        need("w", check=lambda v: isinstance(v, list))
+        if _int(msg.get("part")) and _int(msg.get("parts")):
+            if not (1 <= msg["part"] <= msg["parts"]):
+                out.append(f"lodm: bad part/parts: {msg['part']}/{msg['parts']}")
+        for row in _items(msg.get("w")):
+            if not (isinstance(row, list) and len(row) >= 3 and len(row) % 2 == 1 and all(_int(v) for v in row)):
+                out.append(f"lodm: row must be [cy, x, count, ...]: {row!r}")
+                break
+            if any(row[i] < 1 for i in range(2, len(row), 2)):
+                out.append(f"lodm: run count must be >= 1: {row!r}")
+                break
+    elif t == "lodr":
+        need("si", "q")
+        need("l", check=lambda v: isinstance(v, list))
+        l = msg.get("l")
+        if isinstance(l, list):
+            if len(l) % 3 or not all(_int(v) for v in l):
+                out.append(f"lodr: l must be [rx, ry, rev, ...] integers: {l!r}")
+            elif any(l[i] < 0 for i in range(2, len(l), 3)):
+                out.append(f"lodr: rev must be >= 0: {l!r}")
+    elif t == "lod":
+        need("si", "cx", "cy")
+        res = msg.get("res")
+        if not (_int(res) and res in (2, 4, 8, 16, 32)):
+            out.append(f"lod: bad or missing res: {res!r}")
+        elif "none" in msg:
+            if not (_int(msg["none"]) and msg["none"] == 1):
+                out.append(f"lod: none must be 1: {msg['none']!r}")
+        else:
+            if not (_int(msg.get("rv")) and msg["rv"] >= 0):
+                out.append(f"lod: bad or missing rv: {msg.get('rv')!r}")
+            if "pol" in msg and not (_int(msg["pol"]) and msg["pol"] >= 0):
+                out.append(f"lod: pol must be a whole number >= 0: {msg['pol']!r}")
+            cells = (32 // res) ** 2
+            tl = msg.get("tl")
+            if not (isinstance(tl, list) and len(tl) >= 2 and len(tl) % 2 == 0 and all(_int(v) for v in tl)):
+                out.append(f"lod: tl must be non-empty [tile_id, count, ...] integers: {tl!r}")
+            elif any(tl[i] < 1 for i in range(0, len(tl), 2)) or any(tl[i] < 1 for i in range(1, len(tl), 2)):
+                out.append(f"lod: tl tile_id and count must be >= 1: {tl!r}")
+            elif sum(tl[1::2]) != cells:
+                out.append(f"lod: tl covers {sum(tl[1::2])} cells, not {cells}")
+            el = msg.get("el")
+            if not (isinstance(el, list) and len(el) >= 3 and len(el) % 3 == 0 and all(_int(v) for v in el)):
+                out.append(f"lod: el must be non-empty [proto_id, flags, count, ...] integers: {el!r}")
+            else:
+                total_e = 0
+                for i in range(0, len(el), 3):
+                    pid, flags, cnt = el[i], el[i + 1], el[i + 2]
+                    if pid < 0 or not (0 <= flags <= 255) or cnt < 1:
+                        out.append(f"lod: bad el triple [{pid}, {flags}, {cnt}]")
+                        break
+                    dens = flags % 16
+                    if (pid == 0 and dens != 0) or (pid > 0 and dens == 0):
+                        out.append(f"lod: bad density {dens} for proto_id {pid}")
+                        break
+                    total_e += cnt
+                else:
+                    if total_e != cells:
+                        out.append(f"lod: el covers {total_e} cells, not {cells}")
     return out

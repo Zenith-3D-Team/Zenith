@@ -9,6 +9,7 @@ local rate = require("scripts.rate")
 local budget = require("scripts.budget")
 local profile = require("scripts.profile")
 local perf = require("scripts.perf")
+local robots = require("scripts.robots")
 
 local M = {}
 
@@ -60,12 +61,19 @@ end
 -- depends on it. What sending them is charged (budget.commit) comes from storage too: how many the
 -- search found (mv_scan.n), not this peer's list, which after a load is its own, found later.
 local SCAN_TICKS = 8
+local NEAR_MOVER_RADIUS = 48
+local NEAR_MOVER_COUNT_CAP = 150
+local NEAR_MOVER_PERIOD_CAP = 4
 local MOVER_PRICE = 0.5  -- units per mover's position read and sent
 local SCAN_MOVE = 4
+local SCAN_MOVE_WIDE = 16
+local SCAN_MOVE_COOLDOWN = 20
 local SCAN_SLACK = 8
 local SCAN_JUMP = 32
 local SCAN_PRICE = 0.02  -- units per entity found, beside SCAN_BASE for the area searched
 local SCAN_BASE = 380  -- ~7.8 ms a search on the owner's save, most of it the area
+-- Module-local counters for tests/probes (never in storage).
+M.counts = { mv_scans = 0, st_refreshes = 0, splitter_checks = 0, splitter_bs_skips = 0, splitter_throttled = 0, gate_reads = 0 }
 -- The list found, per client (its state table, weak: a state loaded from a save is a new table and
 -- searches again): with two clients one list for both gave each the other's movers, or searched
 -- again every tick.
@@ -116,6 +124,10 @@ local function by_kind(found)
   return by, n
 end
 
+local function mover_search_types()
+  return robots.active() and registry.other_mover_types() or registry.mover_types()
+end
+
 local function movers_in_focus(surface, s)
   local f = s.focus
   local m = s.mv_scan
@@ -123,24 +135,33 @@ local function movers_in_focus(surface, s)
   local factor = rate.factor("mv")
   local want, force = true, true
   local scan = scans[s] or {}
+  local sim_on = robots.active()
   -- (every: the ticks between searches, SCAN_TICKS, doubled while searches find the same movers,
   -- up to the f3d-mover-rescan setting: rescan_every.)
   local every = m and m.every or SCAN_TICKS
-  if m and m.si == surface.index and m.r == f.r then
+  if m and m.si == surface.index and m.r == f.r and m.rb == sim_on then
     local moved = math.max(math.abs(f.x - m.x), math.abs(f.y - m.y))
     local age = t - m.tick
-    want = age >= every * factor or moved >= SCAN_MOVE
+    local move_due
+    if perf.on("mover_move_scan") then
+      move_due = moved >= SCAN_MOVE_WIDE and age >= SCAN_MOVE_COOLDOWN
+    else
+      move_due = moved >= SCAN_MOVE
+    end
+    want = age >= every * factor or move_due or moved >= SCAN_JUMP
     force = moved >= SCAN_JUMP or age >= (every + SCAN_SLACK) * factor
   end
   if want and budget.admit("mvscan", SCAN_BASE, force) then
+    M.counts.mv_scans = M.counts.mv_scans + 1
     local tp = profile.start()
-    local found = surface.find_entities_filtered({ area = focus_area(s), type = registry.mover_types() })
+    local found = surface.find_entities_filtered({ area = focus_area(s), type = mover_search_types() })
     profile.stop("mv.scan", tp)
     scan = { tick = t, list = found, ids = ids_of(found) }
     scans[s] = scan
     local sig = signature(found)
     s.mv_scan = { tick = t, si = surface.index, x = f.x, y = f.y, r = f.r, n = #found, sig = sig,
-      every = rescan_every(m, sig, every) }
+      every = rescan_every(m, sig, every), rb = sim_on }
+    s.mv_near_tick = t
     if perf.on("one_search") then
       scan.by, s.mv_scan.kinds = by_kind(found)
     end
@@ -150,10 +171,73 @@ local function movers_in_focus(surface, s)
   if scan.tick ~= (s.mv_scan and s.mv_scan.tick) then
     -- This peer has no list for the search storage remembers (loaded since): its own, uncharged,
     -- registering nothing (until the next search its movers without a unit number aren't sent).
-    scan = { tick = s.mv_scan and s.mv_scan.tick, list = surface.find_entities_filtered({ area = focus_area(s), type = registry.mover_types() }),
+    scan = { tick = s.mv_scan and s.mv_scan.tick, list = surface.find_entities_filtered({ area = focus_area(s), type = mover_search_types() }),
       ids = {} }
-    scan.by = by_kind(scan.list)
+    if perf.on("one_search") then
+      scan.by = by_kind(scan.list)
+    end
     scans[s] = scan
+  end
+  -- near_rate: when the full square scan is backed off past SCAN_TICKS (or stretched by rate),
+  -- keep the near box around the focus fresh every SCAN_TICKS and register new near unitless movers deterministically.
+  if not want and perf.on("near_rate") and t - (s.mv_near_tick or -999) >= SCAN_TICKS then
+    s.mv_near_tick = t
+    local nr = math.min(NEAR_MOVER_RADIUS, f.r)
+    local near_found = surface.find_entities_filtered({
+      area = { { f.x - nr, f.y - nr }, { f.x + nr, f.y + nr } },
+      type = mover_search_types(),
+    })
+    local nids = ids_of(near_found)
+    local near_unitless = {}
+    for ne, nid in pairs(nids) do
+      near_unitless[#near_unitless + 1] = { ne, nid }
+    end
+    scan.ids = scan.ids or {}
+    local seen = {}
+    local merged = {}
+    for _, e in pairs(scan.list) do
+      if e.valid then
+        local uid = e.unit_number or scan.ids[e]
+        if not uid then
+          local nid = nids[e]
+          if not nid and #near_unitless > 0 then
+            for i = 1, #near_unitless do
+              if e == near_unitless[i][1] then
+                nid = near_unitless[i][2]
+                break
+              end
+            end
+          end
+          if nid then
+            scan.ids[e] = nid
+            uid = nid
+          else
+            uid = e
+          end
+        end
+        if not seen[uid] then
+          seen[uid] = true
+          merged[#merged + 1] = e
+        end
+      end
+    end
+    for _, e in pairs(near_found) do
+      if e.valid then
+        local nid = nids[e]
+        local uid = e.unit_number or nid or scan.ids[e] or e
+        if not seen[uid] then
+          seen[uid] = true
+          if nid then
+            scan.ids[e] = nid
+          end
+          merged[#merged + 1] = e
+        end
+      end
+    end
+    scan.list = merged
+    if perf.on("one_search") then
+      scan.by = by_kind(scan.list)
+    end
   end
   local list = {}
   for _, e in pairs(scan.list) do
@@ -171,6 +255,9 @@ for _, t in ipairs(map.ROBOT_TYPES) do
   ROBOT[t] = true
 end
 map.robots_in = function(surface, own, x0, y0, x1, y1)
+  if robots.active() then
+    return robots.live_in(surface, own, x0, y0, x1, y1)
+  end
   local s = storage.f3d
   local m = s and s.mv_scan
   local scan = s and scans[s]
@@ -223,6 +310,7 @@ function M.wake()
   local s = storage.f3d
   if s and s.mv_scan and perf.on("one_search") then
     s.mv_scan = nil
+    s.mv_near_tick = nil
   end
 end
 
@@ -231,6 +319,7 @@ function M.reset()
   if storage.f3d then
     scans[storage.f3d] = nil
     storage.f3d.mv_scan = nil
+    storage.f3d.mv_near_tick = nil
   end
 end
 
@@ -280,7 +369,7 @@ local function send_movers(surface, s, every)
   local pu, pe, px, py = 0, 0, 0, 0
   for _, e in pairs(found) do
     local unit = e.unit_number or ids[e]
-    if unit then
+    if unit and (not robots.active() or (e.type ~= "logistic-robot" and e.type ~= "construction-robot")) then
       local eid = info[e]
       if not eid then
         eid = { registry.entity_id(e.name), oriented[e.type] or false }
@@ -459,8 +548,12 @@ local SPLITTER_TYPES = { splitter = true, ["lane-splitter"] = true }
 -- belt_items measured), near 2 work units against an ordinary machine's 0.28: it counts as this
 -- many entities in what the job says it read.
 local SPLITTER_WEIGHT = 7
+local SPLITTER_PER_PASS = 16
+local WORKING_SLICES_NEAR = 10
+local WORKING_SLICES_FAR = 2
 
 local function splitter_moving(e, sig)
+  M.counts.splitter_checks = M.counts.splitter_checks + 1
   local parts = {}
   local front
   for i = 1, e.get_max_transport_line_index() do
@@ -482,6 +575,112 @@ local function splitter_moving(e, sig)
   local was = sig[e.unit_number]
   sig[e.unit_number] = now
   return (was ~= nil and was ~= now) and 1 or 0
+end
+
+-- Uses belt_sim's already-read lane records when available (0 Factorio API calls): returns 0 if empty
+-- or confirmed quiet by belt_sim, 1 if belt_sim saw any lane change, or nil when an API check is needed.
+local function bs_splitter_moving(bs, unit, sig, bs_sig)
+  local brec = bs and bs.belts and bs.belts[unit]
+  if not brec then
+    return nil
+  end
+  local lanes = bs.lanes
+  local parts = {}
+  for i = 1, 8 do
+    local lr = lanes[unit * 8 + i]
+    if lr and lr[1] > 0 then
+      parts[#parts + 1] = i .. ":" .. lr[1] .. ":" .. lr[2] .. ":" .. lr[3] .. ":" .. tostring(lr[10] or 0)
+    end
+  end
+  if #parts == 0 then
+    sig[unit] = nil
+    bs_sig[unit] = nil
+    M.counts.splitter_bs_skips = M.counts.splitter_bs_skips + 1
+    return 0
+  end
+  local now = table.concat(parts, ",")
+  local was = bs_sig[unit]
+  bs_sig[unit] = now
+  if was ~= nil and was ~= now then
+    sig[unit] = nil
+    M.counts.splitter_bs_skips = M.counts.splitter_bs_skips + 1
+    return 1
+  end
+  if brec[13] and game.tick < brec[13] then
+    M.counts.splitter_bs_skips = M.counts.splitter_bs_skips + 1
+    return 0
+  end
+  return nil
+end
+
+-- Selects up to SPLITTER_PER_PASS splitters from `todo` ({{unit, entity}, ...}) deterministically
+-- by oldest last-checked tick (`s.st_spl_tick[unit]`) so alternating regions/strips never starve.
+local function pick_splitters(s, todo)
+  local n = #todo
+  local st = s.st_spl_tick or {}
+  s.st_spl_tick = st
+  local now = game.tick
+  if n <= SPLITTER_PER_PASS then
+    for i = 1, n do
+      st[todo[i][1]] = now
+    end
+    return nil
+  end
+  table.sort(todo, function(a, b)
+    local ta, tb = st[a[1]] or -1, st[b[1]] or -1
+    if ta ~= tb then
+      return ta < tb
+    end
+    return a[1] < b[1]
+  end)
+  local pick = {}
+  for i = 1, SPLITTER_PER_PASS do
+    local unit = todo[i][1]
+    pick[unit] = true
+    st[unit] = now
+  end
+  return pick
+end
+
+-- Collects splitter pre-checks from belt_sim and selects up to SPLITTER_PER_PASS remaining splitters.
+local function prepare_splitters(s, found_lists, sig, bs_sig)
+  local spl_todo, spl_pre = {}, {}
+  local bs = s.bs
+  for _, found in ipairs(found_lists) do
+    for _, e in pairs(found) do
+      local unit = e.unit_number
+      if unit and SPLITTER_TYPES[e.type] and spl_pre[unit] == nil then
+        local v = bs_splitter_moving(bs, unit, sig, bs_sig)
+        if v ~= nil then
+          spl_pre[unit] = v
+        else
+          spl_pre[unit] = false
+          spl_todo[#spl_todo + 1] = { unit, e }
+        end
+      end
+    end
+  end
+  return spl_pre, pick_splitters(s, spl_todo)
+end
+
+local function eval_splitter(e, unit, sig, sig_was, spl_pre, spl_pick, fallback_on, throttle_on)
+  if throttle_on then
+    local pre = spl_pre[unit]
+    if pre ~= false and pre ~= nil then
+      return pre, 0
+    elseif spl_pick and not spl_pick[unit] then
+      if sig_was then
+        sig[unit] = sig_was[unit]
+      end
+      M.counts.splitter_throttled = M.counts.splitter_throttled + 1
+      return fallback_on or 0, 0
+    end
+  end
+  if sig_was then
+    sig[unit] = sig_was[unit]
+  end
+  local ok, v = pcall(splitter_moving, e, sig)
+  return ok and v or 0, SPLITTER_WEIGHT - 1
 end
 
 -- K10: the colour a lit lamp shows, packed 0xRRGGBB, or -1 for white (Factorio's plain lamp light,
@@ -554,22 +753,33 @@ local function lamp_change(e, unit, on, state_sent, s, lc, ao)
   return LAMP_WEIGHT - 1
 end
 
-local function send_state_changes(changes, lc, ao)
+local function send_state_changes(changes, lc, ao, priority)
   if #changes > 0 or #lc > 0 or #ao > 0 then
-    transport.send_states(changes, lc, ao)
+    if priority ~= nil then
+      transport.send_states(changes, lc, ao, priority)
+    else
+      transport.send_states(changes, lc, ao)
+    end
   end
 end
 
 -- Sends only machines whose working state changed since the last report. `strip` (1..STATE_STRIPS,
 -- f3d-spread-jobs): only that horizontal strip of the area, the rest on the ticks after; nil: all.
 local function send_states(surface, s, strip)
+  local slice_on = perf.on("st_working_slice")
+  local throttle_on = perf.on("splitter_throttle")
   -- Every few seconds report everything, so machines in freshly loaded chunks catch up.
   if (strip or 1) == 1 then
-    if rate.crossed("st", STATE_INTERVAL * 10) then
-      s.working = {}
+    if not slice_on then
+      if rate.crossed("st", STATE_INTERVAL * 10) then
+        s.working = {}
+      end
+    else
+      s.st_refresh_all = ((s.st_refresh_all or -1) + 1) % WORKING_SLICES_NEAR
     end
     s.st_seen, s.st_sig, s.st_read = {}, {}, 0
   end
+  local phase = slice_on and (s.st_refresh_all or 0) or nil
   local area = focus_area(s)
   if strip then
     local y0, y1 = area[1][2], area[2][2]
@@ -583,18 +793,23 @@ local function send_states(surface, s, strip)
   local seen = s.st_seen or {}
   local sig_was = s.split_sig or {}
   local sig = s.st_sig or {}
+  s.bs_split_sig = s.bs_split_sig or {}
+  local bs_sig = s.bs_split_sig
   s.lamp_col, s.lamp_ao = s.lamp_col or {}, s.lamp_ao or {}
   local lcol, lao = s.lamp_col, s.lamp_ao
+  local spl_pre, spl_pick
+  if throttle_on then
+    spl_pre, spl_pick = prepare_splitters(s, { found }, sig, bs_sig)
+  end
   for _, e in pairs(found) do
     local unit = e.unit_number
     if unit then
       local state_of = STATE_OF[e.type]
       local on
       if SPLITTER_TYPES[e.type] then
-        read = read + SPLITTER_WEIGHT - 1
-        sig[unit] = sig_was[unit]
-        local ok, v = pcall(splitter_moving, e, sig)
-        on = ok and v or 0
+        local w
+        on, w = eval_splitter(e, unit, sig, sig_was, spl_pre, spl_pick, s.working[unit], throttle_on)
+        read = read + w
       elseif state_of then
         local ok, v = pcall(state_of, e)
         on = ok and v or 0
@@ -603,8 +818,12 @@ local function send_states(surface, s, strip)
       end
       -- (A machine on a strip's edge is found by both strips: once is enough.)
       if seen[unit] == nil or seen[unit] ~= on then
-        local sent = s.working[unit] ~= on
+        local force_refresh = slice_on and (unit % WORKING_SLICES_NEAR == phase)
+        local sent = s.working[unit] ~= on or force_refresh
         if sent then
+          if force_refresh and s.working[unit] == on then
+            M.counts.st_refreshes = M.counts.st_refreshes + 1
+          end
           changes[#changes + 1] = unit
           changes[#changes + 1] = on
         end
@@ -624,7 +843,7 @@ local function send_states(surface, s, strip)
     s.st_seen, s.st_sig, s.st_read = nil, nil, nil
     -- (A lamp the round no longer found: its state goes again when it comes back, its colour and
     -- Always on with it.)
-    for _, t in pairs({ lcol, lao }) do
+    for _, t in pairs({ lcol, lao, bs_sig, s.st_spl_tick or {} }) do
       for unit in pairs(t) do
         if seen[unit] == nil then
           t[unit] = nil
@@ -686,15 +905,35 @@ local function state_region(surface, s, region)
   local sent = s.working
   local sig = s.split_sig or {}
   s.split_sig = sig
+  s.bs_split_sig = s.bs_split_sig or {}
+  local bs_sig = s.bs_split_sig
   s.st_at, s.st_in = s.st_at or {}, s.st_in or {}
   s.lamp_col, s.lamp_ao = s.lamp_col or {}, s.lamp_ao or {}
   local at, lcol, lao = s.st_at, s.lamp_col, s.lamp_ao
+  local slice_on = perf.on("st_working_slice")
+  local throttle_on = perf.on("splitter_throttle")
+  local rphase, rmod
+  if slice_on then
+    s.st_refresh = s.st_refresh or {}
+    rmod = region == 0 and WORKING_SLICES_NEAR or WORKING_SLICES_FAR
+    rphase = ((s.st_refresh[region] or -1) + 1) % rmod
+    s.st_refresh[region] = rphase
+  end
   local mine = {}
   local changes, lc, ao = {}, {}, {}
   local read = 0
-  for _, area in ipairs(region_areas(s, region)) do
+  local boxes = region_areas(s, region)
+  local found_lists = {}
+  for b_i, area in ipairs(boxes) do
     local found = surface.find_entities_filtered({ area = area, type = types })
+    found_lists[b_i] = found
     read = read + #found
+  end
+  local spl_pre, spl_pick
+  if throttle_on then
+    spl_pre, spl_pick = prepare_splitters(s, found_lists, sig, bs_sig)
+  end
+  for _, found in ipairs(found_lists) do
     for _, e in pairs(found) do
       local unit = e.unit_number
       -- (One on the edge of two boxes is found by both: once is enough.)
@@ -704,9 +943,9 @@ local function state_region(surface, s, region)
         local state_of = STATE_OF[e.type]
         local on
         if SPLITTER_TYPES[e.type] then
-          read = read + SPLITTER_WEIGHT - 1
-          local ok, v = pcall(splitter_moving, e, sig)
-          on = ok and v or 0
+          local w
+          on, w = eval_splitter(e, unit, sig, nil, spl_pre, spl_pick, sent[unit], throttle_on)
+          read = read + w
         elseif state_of then
           local ok, v = pcall(state_of, e)
           on = ok and v or 0
@@ -714,45 +953,173 @@ local function state_region(surface, s, region)
           on = (e.status == working) and 1 or 0
         end
         local was = sent[unit]
-        if was ~= on then
+        local force_refresh = slice_on and (unit % rmod == rphase)
+        if was ~= on or force_refresh then
+          if force_refresh and was == on then
+            M.counts.st_refreshes = M.counts.st_refreshes + 1
+          end
           changes[#changes + 1] = unit
           changes[#changes + 1] = on
           sent[unit] = on
         end
         if e.type == "lamp" then
-          read = read + lamp_change(e, unit, on, was ~= on, s, lc, ao)
+          read = read + lamp_change(e, unit, on, was ~= on or force_refresh, s, lc, ao)
         end
       end
     end
   end
+  local spl_tick = s.st_spl_tick
   -- Gone from this area and not found in another since: forgotten, as a round's replace did.
   for unit in pairs(s.st_in[region] or {}) do
     if not mine[unit] and at[unit] == region then
-      at[unit], sent[unit], sig[unit], lcol[unit], lao[unit] = nil, nil, nil, nil, nil
+      at[unit], sent[unit], sig[unit], bs_sig[unit], lcol[unit], lao[unit] = nil, nil, nil, nil, nil, nil
+      if spl_tick then
+        spl_tick[unit] = nil
+      end
     end
   end
   s.st_in[region] = mine
-  send_state_changes(changes, lc, ao)
+  send_state_changes(changes, lc, ao, region == 0)
   return read
 end
 
 -- A round of states_near: the near square on its due tick, the far strip of the round on the next.
+-- When near_rate is on, region 0 keeps its base cadence (rate.due_near) while FAR_STRIPS slow
+-- independently under rate.due("st", STATE_INTERVAL).
 local function states_by_distance(surface, s)
-  if rate.due("st", STATE_INTERVAL) then
-    -- Every few seconds report everything, so machines in freshly loaded chunks catch up.
-    if rate.crossed("st", STATE_INTERVAL * 10) then
+  local slice_on = perf.on("st_working_slice")
+  if not perf.on("near_rate") then
+    if rate.due("st", STATE_INTERVAL) then
+      -- Every few seconds report everything, so machines in freshly loaded chunks catch up.
+      if not slice_on and rate.crossed("st", STATE_INTERVAL * 10) then
+        s.working = {}
+      end
+      s.st_read = state_region(surface, s, 0)
+      s.st_far = (s.st_far or 0) % FAR_STRIPS + 1
+      s.st_next = game.tick + 1
+      if not settings.global["f3d-spread-jobs"].value then
+        s.st_next = nil
+        rate.read("st", s.st_read + state_region(surface, s, s.st_far))
+      end
+    elseif s.st_next and game.tick >= s.st_next then
+      s.st_next = nil
+      rate.read("st", (s.st_read or 0) + state_region(surface, s, s.st_far or 1))
+    end
+    return
+  end
+  local near_due, far_due
+  if rate.due_near then
+    near_due = rate.due_near("st", STATE_INTERVAL)
+    far_due = rate.due("st", STATE_INTERVAL)
+  else
+    near_due = rate.due("st", STATE_INTERVAL)
+    far_due = near_due
+  end
+  local spread = settings.global["f3d-spread-jobs"].value
+  local nr = 0
+  if near_due then
+    if not slice_on and rate.crossed(rate.due_near and "st_near" or "st", STATE_INTERVAL * 10) then
       s.working = {}
     end
-    s.st_read = state_region(surface, s, 0)
+    nr = state_region(surface, s, 0)
+    if not far_due and not (s.st_next and game.tick >= s.st_next) then
+      rate.read("st", nr)
+    end
+  end
+  if far_due then
     s.st_far = (s.st_far or 0) % FAR_STRIPS + 1
-    s.st_next = game.tick + 1
-    if not settings.global["f3d-spread-jobs"].value then
+    if near_due and spread then
+      s.st_read = nr
+      s.st_next = game.tick + 1
+    else
       s.st_next = nil
-      rate.read("st", s.st_read + state_region(surface, s, s.st_far))
+      rate.read("st", nr + state_region(surface, s, s.st_far))
     end
   elseif s.st_next and game.tick >= s.st_next then
     s.st_next = nil
-    rate.read("st", (s.st_read or 0) + state_region(surface, s, s.st_far or 1))
+    rate.read("st", (s.st_read or 0) + nr + state_region(surface, s, s.st_far or 1))
+  end
+end
+
+-- gate_state (perf.lua): each gate's real state (Factorio opens a gate for whatever comes near, a script's
+-- request_to_open too), so the client's doors follow it instead of guessing from the movers it is sent. The
+-- gates within GATE_NEAR tiles of the focus are searched for every GATE_LOOK ticks (one search, by type: nothing
+-- found, nothing else done) and read every GATE_TICKS ticks; only changes go, as `st` states (0 closed, 1 opening,
+-- 2 opened, 3 closing), on the priority lane; every GATE_REFRESH ticks each again, so a client that dropped a chunk
+-- gets them back. A gate opens in 15 ticks (opening_speed 0.0667), so a state is at most 3 ticks late.
+-- s.gates (the LuaEntity list) and s.gate_sent (unit -> state sent) are storage, from on_tick only.
+local GATE_TICKS = 3
+local GATE_LOOK = 30
+local GATE_REFRESH = 300
+local GATE_NEAR = 64
+
+local function gate_state(e)
+  if e.is_opening() then
+    return 1
+  elseif e.is_closing() then
+    return 3
+  elseif e.is_opened() then
+    return 2
+  end
+  return 0
+end
+
+local function send_gates(surface, s)
+  if not perf.on("gate_state") then
+    s.gates, s.gate_sent = nil, nil
+    return
+  end
+  local t = game.tick
+  local looked = false
+  if not s.gates or t % GATE_LOOK == 0 then
+    local f = s.focus
+    local n = math.min(GATE_NEAR, f.r)
+    s.gates = surface.find_entities_filtered({ area = { { f.x - n, f.y - n }, { f.x + n, f.y + n } }, type = "gate" })
+    looked = true
+    if not s.gate_sent or t % GATE_REFRESH == 0 then
+      s.gate_sent = {}
+    end
+  end
+  local gates = s.gates
+  if #gates == 0 then
+    if looked then
+      s.gate_sent = {}
+    end
+    return
+  end
+  if not looked and t % GATE_TICKS ~= 0 then
+    return
+  end
+  local sent = s.gate_sent
+  local now = looked and {} or nil
+  local changes = {}
+  for _, e in pairs(gates) do
+    local unit = e.valid and e.unit_number
+    if unit then
+      local ok, v = pcall(gate_state, e)
+      if ok then
+        if now then
+          now[unit] = true
+        end
+        if sent[unit] ~= v then
+          sent[unit] = v
+          changes[#changes + 1] = unit
+          changes[#changes + 1] = v
+        end
+      end
+    end
+  end
+  if now then
+    -- (A gate the search no longer finds: forgotten, sent again when it comes back.)
+    for unit in pairs(sent) do
+      if not now[unit] then
+        sent[unit] = nil
+      end
+    end
+  end
+  M.counts.gate_reads = M.counts.gate_reads + #gates
+  if #changes > 0 then
+    transport.send_states(changes, nil, nil, true)
   end
 end
 
@@ -760,8 +1127,13 @@ function M.tick()
   local s = storage.f3d
   local surface = world.surface()
   local interval = settings.global["f3d-mover-interval"].value
-  if rate.due("mv", interval) then
-    send_movers(surface, s, rate.period("mv", interval))
+  local mv_cap = (perf.on("near_rate") and (s.mv_scan and s.mv_scan.n or 0) <= NEAR_MOVER_COUNT_CAP)
+    and NEAR_MOVER_PERIOD_CAP or nil
+  if rate.due("mv", interval, nil, mv_cap) then
+    send_movers(surface, s, rate.period("mv", interval, nil, mv_cap))
+  end
+  if s.focus then
+    send_gates(surface, s)
   end
   if perf.on("states_near") then
     s.st_strip = nil

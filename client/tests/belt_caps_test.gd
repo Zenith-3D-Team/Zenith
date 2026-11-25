@@ -6,6 +6,8 @@ extends SceneTree
 ##   godot --headless --path client -s res://tests/belt_caps_test.gd [-- --models-dir=<folder>]
 
 const BeltCaps := preload("res://scripts/world/belt_caps.gd")
+const BeltLattice := preload("res://scripts/world/belt_lattice.gd")
+const ItemCards := preload("res://scripts/world/item_cards.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const BeltReturn := preload("res://scripts/world/belt_return.gd")
 const TestEnv := preload("res://tests/test_env.gd")
@@ -23,6 +25,7 @@ func check(ok: bool, what: String) -> void:
 func _init() -> void:
 	TestEnv.isolate("belt-caps-test")
 	_fixtures()
+	_model_caps()
 	_built_in()
 	_vasillo()
 	print("BELT CAPS FAILS: %d" % fails)
@@ -172,6 +175,27 @@ func _belt_files(dir: String) -> PackedStringArray:
 		if f.ends_with(".glb") and BeltCaps.wanted(f.get_basename()):
 			out.append(dir.path_join(f))
 	return out
+
+
+func _model_caps() -> void:
+	var was_cap := ItemCards.model_cap
+	var was_cap_near := BeltLattice.model_cap_near
+	var lat := BeltLattice.new()
+	lat.model_cap_near = true
+	check(BeltLattice._look_key(-2) == -2 and BeltLattice._look_key(5 + 2 * ItemCards.BAND_STEP) == 5,
+		"_look_key strips distance band while preserving icon keys")
+	var k := ItemCards.band_key(5 + 2 * ItemCards.VARIANT_STEP, 2)
+	check(ItemCards.band_of(k) == 2 and ItemCards.variant_of(k) == 2 and ItemCards.item_of(k) == 5,
+		"band_key encodes band, variant, and item id losslessly")
+	check(BeltLattice.band_for_dist(7, 10.0, 28.0, 56.0, Vector2.ZERO, -1) == 0
+		and BeltLattice.band_for_dist(7, 40.0, 28.0, 56.0, Vector2.ZERO, -1) == 1
+		and BeltLattice.band_for_dist(7, 70.0, 28.0, 56.0, Vector2.ZERO, -1) == 2,
+		"band_for_dist separates near/mid/far tiers accurately")
+	check(BeltLattice.band_for_dist(7, 29.0, 28.0, 56.0, Vector2.ZERO, 0) == 0
+		and BeltLattice.band_for_dist(7, 30.0, 28.0, 56.0, Vector2.ZERO, 0) == 1,
+		"band_for_dist applies BAND_HYST=1.5 hysteresis at band 0->1 boundary")
+	BeltLattice.model_cap_near = was_cap_near
+	ItemCards.model_cap = was_cap
 
 
 func _built_in() -> void:

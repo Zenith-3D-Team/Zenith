@@ -6,6 +6,7 @@ extends Node3D
 ##   godot --headless --path client res://tests/decor_test.tscn
 
 const Decoratives := preload("res://scripts/world/decoratives.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const DecorSheetBaker := preload("res://scripts/world/decor_sheet_baker.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
@@ -13,6 +14,7 @@ const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const SettingsFile := preload("res://scripts/menu/settings.gd")
 const Protos := preload("res://scripts/world/protos.gd")
+const FreeLater := preload("res://scripts/world/free_later.gd")
 
 var fails := 0
 
@@ -62,6 +64,8 @@ func check(cond: bool, what: String) -> void:
 
 
 func _ready() -> void:
+	var was_decor_models := ModelPacks.decor_models_on
+	ModelPacks.set_decor_models_on(false)
 	# A 64x32 sheet with two 32x32 variants, in a stand-in data folder.
 	var dir := OS.get_user_data_dir().path_join("decor_test")
 	DirAccess.make_dir_recursive_absolute(dir.path_join("base/graphics/decorative"))
@@ -186,6 +190,7 @@ func _ready() -> void:
 	await _mask_checks()
 	_parallel_load_checks()
 	await _sheet_checks(dir)
+	ModelPacks.set_decor_models_on(was_decor_models)
 
 	print("decor test: %s" % ("all passed" if fails == 0 else "%d failed" % fails))
 	get_tree().quit(1 if fails > 0 else 0)
@@ -623,6 +628,9 @@ func _meshes(d: Node) -> int:
 
 
 func _all(node: Node) -> Array:
+	# A replaced chunk's nodes are hidden and freed over the next frames (free_later.gd, frame-spikes2):
+	# gone before counting, as a few frames would have them.
+	FreeLater.flush()
 	var out := []
 	for child in node.get_children():
 		if child is MultiMeshInstance3D:
@@ -864,6 +872,121 @@ func _sheet_checks(_dir: String) -> void:
 	await get_tree().process_frame
 	check(sd._bake_dirty.is_empty() and sd._flat_groups.is_empty() and sd._sheet_size.is_empty(),
 		"reset clears all sheet state")
+
+	# Live model-pack decorative override -> hide -> toggle off restores fallback.
+	var pdir := ProjectSettings.globalize_path("user://decor-test-packs")
+	var pack_root := pdir.path_join("DecorPack")
+	DirAccess.make_dir_recursive_absolute(pack_root.path_join("decoratives"))
+	var blue_img := Image.create(32, 32, false, Image.FORMAT_RGBA8)
+	blue_img.fill(Color(0.05, 0.2, 0.95, 1.0))
+	blue_img.save_png(pack_root.path_join("decoratives/green-carpet-grass.png"))
+	ModelPacks.set_decor_on(true)
+	ModelPacks.configure("", [], [])
+	Decoratives._sync_packs()
+	var before_pack: Decoratives.KindData = Decoratives._kind_data_for("green-carpet-grass")
+	var before_px := before_pack.atlas.get_pixel(8, 8) if before_pack != null and before_pack.atlas != null else Color.BLACK
+	ModelPacks.configure(pdir, ["dir:DecorPack"], [])
+	ModelPacks.wait()
+	var from_pack: Decoratives.KindData = Decoratives._kind_data_for("green-carpet-grass")
+	var pack_px := from_pack.atlas.get_pixel(8, 8) if from_pack != null and from_pack.atlas != null else Color.BLACK
+	check(before_px.g > before_px.b and from_pack != null and pack_px.b > 0.8 and pack_px.r < 0.2,
+		"ModelPacks decoratives live-reloads green-carpet-grass from green install (%s) to blue pack (%s)" % [before_px, pack_px])
+	var hf := FileAccess.open(pack_root.path_join("pack.json"), FileAccess.WRITE)
+	hf.store_string('{"decoratives": {"green-carpet-grass": {"hide": true}}}')
+	hf.close()
+	ModelPacks.configure(pdir, ["dir:DecorPack"], [])
+	ModelPacks.wait()
+	check(Decoratives._kind_data_for("green-carpet-grass") == null,
+		"ModelPacks decoratives hide rule returns null on live reload")
+	ModelPacks.set_decor_on(false)
+	var fallback_kd: Decoratives.KindData = Decoratives._kind_data_for("green-carpet-grass")
+	var fallback_px := fallback_kd.atlas.get_pixel(8, 8) if fallback_kd != null and fallback_kd.atlas != null else Color.BLACK
+	check(fallback_kd != null and fallback_px.g > fallback_px.b,
+		"ModelPacks.set_decor_on(false) restores install decorative picture (%s)" % [fallback_px])
+	ModelPacks.set_decor_on(true)
+	ModelPacks.configure("", [], [])
+	Decoratives._sync_packs()
+	DirAccess.remove_absolute(pack_root.path_join("decoratives/green-carpet-grass.png"))
+	DirAccess.remove_absolute(pack_root.path_join("decoratives"))
+	DirAccess.remove_absolute(pack_root.path_join("pack.json"))
+	DirAccess.remove_absolute(pack_root)
+	DirAccess.remove_absolute(pdir)
+
+	# A pack's own 3D decorative models (+ --decor-models toggle). Placeholders' 48 were removed (owner,
+	# 2a52be70): a pack in the models folder with .glb decoratives stands in for them.
+	var sheet_was_dm := ModelPacks.decor_models_on
+	var mdir := ProjectSettings.globalize_path("user://decor-test-3d")
+	var mpack := mdir.path_join("Decor3D/decoratives")
+	DirAccess.make_dir_recursive_absolute(mpack)
+	var rock := FileAccess.get_file_as_bytes(ProjectSettings.globalize_path("res://assets/models/packs/placeholders/big-rock.glb"))
+	for dn in ["green-hairy-grass", "green-carpet-grass", "garballo"]:
+		var mf := FileAccess.open(mpack.path_join(dn + ".glb"), FileAccess.WRITE)
+		mf.store_buffer(rock)
+		mf.close()
+	ModelPacks.set_decor_on(true)
+	ModelPacks.set_decor_models_on(true)
+	ModelPacks.configure(mdir, ["dir:Decor3D"], [])
+	ModelPacks.wait()
+	Decoratives._sync_packs()
+	var kd_grass: Decoratives.KindData = Decoratives._kind_data_for("green-hairy-grass")
+	var kd_carpet: Decoratives.KindData = Decoratives._kind_data_for("green-carpet-grass")
+	var kd_garballo: Decoratives.KindData = Decoratives._kind_data_for("garballo")
+	check(kd_grass != null and not kd_grass.model_paths.is_empty() and kd_carpet != null and not kd_carpet.model_paths.is_empty()
+		and kd_garballo != null and not kd_garballo.model_paths.is_empty() and kd_garballo.upright,
+		"a pack provides 3D .glb paths for raised grass, carpets, and upright object decoratives")
+	var k_grass: Decoratives.Kind = Decoratives._kind("green-hairy-grass", kd_grass)
+	var k_garballo: Decoratives.Kind = Decoratives._kind("garballo", kd_garballo)
+	check(k_grass != null and k_grass.is_model and k_grass.model_meshes.size() == 1 and k_grass.model_meshes[0] != null
+		and k_grass.grass_material != null and k_grass.grass_material.shader == Decoratives.SHADER_MODEL
+		and k_garballo != null and k_garballo.is_model and k_garballo.model_meshes[0] != null
+		and k_garballo.model_materials[0].shader == Decoratives.SHADER_MODEL,
+		"3D decorative models build MultiMesh-ready meshes with decorative_model.gdshader")
+	var md := Decoratives.new()
+	var mworld := FakeWorld.new()
+	var mfocus := Node3D.new()
+	var mrig := FakeRig.new()
+	mrig.target = mfocus
+	add_child(mfocus)
+	mfocus.position = Vector3(16.0, 0.0, 16.0)
+	add_child(mrig)
+	add_child(mworld)
+	md.world = mworld
+	md.rig = mrig
+	add_child(md)
+	md.set_grass("normal")
+	md._process(0.0)
+	mworld.chunks[Vector2i(0, 0)] = true
+	md.handle({"t": "dprotos", "part": 1, "parts": 1, "l": [[1, "green-hairy-grass"], [2, "garballo"]]})
+	md.handle({"t": "dec", "cx": 0, "cy": 0, "part": 1, "parts": 1, "l": [1, 4, 4, 1, 2, 8, 8, 1]})
+	md.finish_jobs()
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var cnode: Node3D = md._chunks.get(Vector2i(0, 0))
+	var gnode: Node3D = md._grass.get(Vector2i(0, 0))
+	var has_upright_3d := cnode != null and cnode.get_children().any(func(ch: Node) -> bool:
+		return ch is MultiMeshInstance3D and (ch as MultiMeshInstance3D).material_override is ShaderMaterial \
+			and ((ch as MultiMeshInstance3D).material_override as ShaderMaterial).shader == Decoratives.SHADER_MODEL)
+	var has_grass_3d := gnode != null and gnode.get_children().any(func(ch: Node) -> bool:
+		return ch is MultiMeshInstance3D and (ch as MultiMeshInstance3D).material_override is ShaderMaterial \
+			and ((ch as MultiMeshInstance3D).material_override as ShaderMaterial).shader == Decoratives.SHADER_MODEL)
+	check(has_upright_3d and has_grass_3d,
+		"3D decorative chunk renders both upright object GLBs and raised 3D grass GLBs (%s %s)" % [has_upright_3d, has_grass_3d])
+	ModelPacks.set_decor_models_on(false)
+	var kd_2d: Decoratives.KindData = Decoratives._kind_data_for("green-hairy-grass")
+	check(kd_2d == null or kd_2d.model_paths.is_empty(), "set_decor_models_on(false) disables 3D decorative models cleanly")
+	md.queue_free()
+	mworld.queue_free()
+	mrig.queue_free()
+	mfocus.queue_free()
+	ModelPacks.set_decor_models_on(sheet_was_dm)
+	ModelPacks.configure("", [], [])
+	Decoratives._sync_packs()
+	for dn in ["green-hairy-grass", "green-carpet-grass", "garballo"]:
+		DirAccess.remove_absolute(mpack.path_join(dn + ".glb"))
+	DirAccess.remove_absolute(mpack)
+	DirAccess.remove_absolute(mdir.path_join("Decor3D"))
+	DirAccess.remove_absolute(mdir)
+
 	sd.queue_free()
 	sworld.queue_free()
 	await get_tree().process_frame

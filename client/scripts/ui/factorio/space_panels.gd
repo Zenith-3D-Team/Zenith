@@ -25,6 +25,7 @@ const LocaleNames := preload("res://scripts/world/locale_names.gd")
 const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.gd")
 const LogicKit := preload("res://scripts/ui/factorio/logic_kit.gd")
 const ScheduleEditor := preload("res://scripts/ui/factorio/schedule_editor.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## Factorio's platform wait conditions (WaitConditionType), in the order its menu lists them.
 const PLATFORM_WAITS := [["time", "Time passed"], ["inactivity", "Inactivity"],
@@ -71,10 +72,6 @@ static func _dim(text: String) -> Label:
 	var l := Kit.label(text)
 	l.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
 	return l
-
-
-static func _array(v) -> Array:
-	return v if v is Array else []
 
 
 # --- the hub -------------------------------------------------------------------------------------
@@ -171,7 +168,7 @@ static func refresh(screen, msg: Dictionary) -> void:
 		var length := int(h["len"])
 		parts.append("%s / %s km" % [Kit.count_text(int(length * int(h.get("d", 0)) / 1000.0)), Kit.count_text(length)])
 	parts.append("Weight %d t" % roundi(int(h.get("w", 0)) / 1000.0))
-	var th := _array(h.get("th"))
+	var th := Wire.array(h.get("th"))
 	if th.size() >= 2:
 		parts.append("Thrusters %d / %d working" % [int(th[1]), int(th[0])])
 	(live["info"] as Label).text = " · ".join(parts)
@@ -179,7 +176,7 @@ static func refresh(screen, msg: Dictionary) -> void:
 	for c in fuel_box.get_children():
 		fuel_box.remove_child(c)
 		c.queue_free()
-	for f in _array(h.get("fuel")):
+	for f in Wire.array(h.get("fuel")):
 		if f is Array and f.size() >= 3:
 			var r := EntityPanels.row(8)
 			var name := Kit.label(Kit.pretty(str(f[0])))
@@ -201,13 +198,13 @@ static func _schedule(screen, h: Dictionary) -> Control:
 	var box := EntityPanels.column(6)
 	box.name = "Schedule"
 	var sched: Dictionary = h.get("sched") if h.get("sched") is Dictionary else {}
-	var dest := _array(h.get("dest"))
+	var dest := Wire.array(h.get("dest"))
 	var head := EntityPanels.row(8)
 	head.add_child(EntityPanels.heading("Schedule"))
 	if str(sched.get("group", "")) != "":
 		head.add_child(_dim("Group: %s" % sched["group"]))
 	box.add_child(head)
-	var records: Array = _array(sched.get("records")).duplicate(true)
+	var records: Array = Wire.array(sched.get("records")).duplicate(true)
 	var unit: int = screen.unit
 	var send := func(l: Array) -> void: screen.model.set_schedule(unit, l)
 	var kind := _schedule_kind(dest)
@@ -216,7 +213,7 @@ static func _schedule(screen, h: Dictionary) -> Control:
 	frame.add_child(LogicKit.padded(list, 4, 4))
 	ScheduleEditor.records(screen, list, records, int(sched.get("current", 0)), kind, true, send, "stations")
 	list.add_child(ScheduleEditor.add_station(screen, records, kind, send, true))
-	ScheduleEditor.interrupts(screen, list, _array(sched.get("interrupts")).duplicate(true), kind)
+	ScheduleEditor.interrupts(screen, list, Wire.array(sched.get("interrupts")).duplicate(true), kind)
 	box.add_child(frame)
 	return box
 
@@ -266,7 +263,7 @@ static func planet_icon(name: String) -> Texture2D:
 static func sections(screen, secs: Array, dest: Array, hub_like: bool) -> Control:
 	var box := EntityPanels.column(6)
 	box.add_child(EntityPanels.heading("Requests from planets" if hub_like else "Requests"))
-	var qualities := _array(screen._last.get("ql"))
+	var qualities := Wire.array(screen._last.get("ql"))
 	var slots := func(sec: Dictionary, filters: Array, send: Callable) -> Control:
 		if int(sec.get("man", 1)) != 1:
 			return _dim("Set by the game")
@@ -418,7 +415,7 @@ static func silo(screen, rk: Dictionary) -> Control:
 	var unit: int = screen.unit
 	var auto := func(on: bool) -> void: Bridge.send({"t": "set_silo", "u": unit, "auto": 1 if on else 0})
 	box.add_child(EntityPanels.checkbox("Send to orbit automatically", int(rk.get("auto", 0)) == 1, auto))
-	var to := _array(rk.get("to"))
+	var to := Wire.array(rk.get("to"))
 	box.add_child(EntityPanels.heading("Launch to"))
 	if to.is_empty():
 		box.add_child(_dim("No platform in orbit here"))
@@ -458,7 +455,7 @@ static func collector(screen, col: Dictionary) -> Control:
 	var box := EntityPanels.column(6)
 	box.add_child(EntityPanels.heading("Asteroid chunk filter"))
 	var n := int(col.get("n", 0))
-	var filters: Array = _array(col.get("f")).duplicate()
+	var filters: Array = Wire.array(col.get("f")).duplicate()
 	while filters.size() < n:
 		filters.append("")
 	var chunks := _chunk_names(screen)

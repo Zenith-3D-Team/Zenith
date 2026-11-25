@@ -518,7 +518,7 @@ function M.copy(cmd)
       slot.label = label
       pcall(function() slot.blueprint_description = description end)
       puppet.send_inventory_now()
-      transport.send_reliable({ t = "bp_ok", q = 0, i = index, item = "blueprint", new = 1 })
+      transport.send_reliable_priority({ t = "bp_ok", q = 0, i = index, item = "blueprint", new = 1 })
       return puppet.message("Blueprint contents replaced")
     end
     if main then
@@ -530,7 +530,7 @@ function M.copy(cmd)
     slot.set_stack(stack)
     puppet.send_inventory_now()
     -- Its slot, so the client can open the blueprint's window as Factorio does after a selection.
-    transport.send_reliable({ t = "bp_ok", q = 0, i = index or 0, item = "blueprint", new = 1 })
+    transport.send_reliable_priority({ t = "bp_ok", q = 0, i = index or 0, item = "blueprint", new = 1 })
     return puppet.message("Blueprint added to the inventory")
   end
   send_clip(stack)
@@ -940,6 +940,23 @@ local function overlay(proto)
     local ok, lr, cr = pcall(function() return proto.logistic_radius, proto.construction_radius end)
     if ok and lr then
       x.lr, x.cr = lr, cr or 0
+    end
+  elseif t == "logistic-robot" or t == "construction-robot" then
+    local ok, spd = pcall(function() return proto.speed end)
+    if ok and type(spd) == "number" and spd > 0 then
+      x.spd = spd
+    end
+    local ok2, low = pcall(function() return proto.speed_multiplier_when_out_of_energy end)
+    if ok2 and type(low) == "number" and low >= 0 then
+      x.low = low
+    end
+    local ok3, epm = pcall(function() return proto.energy_per_move end)
+    if ok3 and type(epm) == "number" and epm >= 0 then
+      x.epm = epm
+    end
+    local ok4, ept = pcall(function() return proto.energy_per_tick end)
+    if ok4 and type(ept) == "number" and ept >= 0 then
+      x.ept = ept
     end
   elseif t == "mining-drill" then
     local ok, r, v = pcall(function() return proto.mining_drill_radius, proto.vector_to_place_result end)

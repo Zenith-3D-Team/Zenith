@@ -50,6 +50,10 @@ const ItemCards := preload("res://scripts/world/item_cards.gd")
 const GAP := 64
 const CELLS := 4
 const MASK := 2048
+const MASK_TILE := 512
+const MASK_GRID := 4
+const MASK_TILES := 16
+static var mask_tiled := true
 ## A drawn lattice whose phase is this far (1/256) off the simulation's front item, or whose speed
 ## differs, is made again.
 const DRIFT := 24
@@ -332,6 +336,16 @@ static var start := true
 ## ahead of the drawn clock, hid; and a stopping lane waits for the drawn clock before it takes a read).
 static var start_stops := false
 const RELEASE_TICKS := 120
+## Intermediate Items-in-3D cap (`500..20000`) draws nearest full-band packed lanes in 3D up to the
+## unified budget (--lattice-model-cap=off restores the binary all-3D-or-all-icon check).
+static var model_cap_near := true
+const BAND_STEP := ItemCards.BAND_STEP
+const CAP_SLACK := 1.5
+const CAP_EVERY := 30
+const CAM_STEP := 2.0
+const CAM_TURN := 0.996
+const CAM_MARGIN := 3.0
+const BAND_HYST := 1.5
 
 class Lane:
 	var item := 0
@@ -383,9 +397,10 @@ var info := {}  # lane key -> [full (bool), item id (-1: none or mixed), stack (
 var drawn := {}  # lane key -> Lane
 var kinds := {}  # kind key -> LKind
 var records := BeltRecords.new()
-var mask: Image = null
+var mask_tiles: Array[Image] = []
 var mask_n := PackedByteArray()  # lanes marking each cell
-var mask_dirty := false
+var mask_dirty_bits := 0
+var mask_sent_all := false
 var lanes_n := 0  # lanes drawn after the last update
 var slots_n := 0
 var want := {}  # lane key -> item: lanes to draw (full of one kind, in the planned ground)
@@ -408,6 +423,60 @@ var links_seen := -1  # (start) the simulation's links_ver at the last update
 ## speed times that lag: who its items are is matched as both lattices are drawn then (matched at the
 ## simulation's tick, a stop handed each slot the item behind it, a jump of over half a gap seen).
 var shown := -1.0
+var tight_cull := true
+var cap_anchor := Vector2.ZERO
+var cap_anchor_set := false
+var cap_cam_led := false
+var cap_cam_pos := Vector3.ZERO
+var cap_cam_dir := Vector3(0.0, 0.0, -1.0)
+var cap_cam_planes: Array[Plane] = []
+var cap_sim_d2 := PackedFloat32Array()
+var cap_sim_dirty := false
+var cap_round := 0
+var capped_anchor := Vector2.INF
+var capped_cam := false
+var capped_cam_pos := Vector3.ZERO
+var capped_cam_dir := Vector3(0.0, 0.0, -1.0)
+var cap_3d_slots := 0
+var cap_eligible_slots := 0
+var cap_limit_d2 := INF
+var lod_split := false
+var lod_anchor := Vector3.ZERO
+var lod_d1 := INF
+var lod_d2 := INF
+var lod_jit := Vector2.ZERO
+var lod_band_at := Vector3.INF
+var lod_d1_seen := INF
+var lod_d2_seen := INF
+var lod_split_seen := false
+var lane_keys := {}  # lane key -> target kind_key (cap + distance band)
+
+
+func set_tight_cull(v: bool) -> void:
+	tight_cull = v
+
+
+## Sets the focus anchor/frustum and current simulated-item squared distances for unified 3D capping.
+func set_cap_anchor(anchor: Vector2, cam_led: bool, cam_pos: Vector3, cam_dir: Vector3,
+		cam_planes: Array[Plane], sim_d2: PackedFloat32Array) -> void:
+	cap_anchor = anchor
+	cap_anchor_set = true
+	cap_cam_led = cam_led
+	cap_cam_pos = cam_pos
+	cap_cam_dir = cam_dir
+	cap_cam_planes = cam_planes
+	if sim_d2.size() != cap_sim_d2.size():
+		cap_sim_dirty = true
+	cap_sim_d2 = sim_d2
+
+
+## Configures distance-band MultiMesh bucketing parameters for packed lattice lanes.
+func set_lod_bands(split: bool, anchor: Vector3, d1: float, d2: float, jit: Vector2) -> void:
+	lod_split = split
+	lod_anchor = anchor
+	lod_d1 = d1
+	lod_d2 = d2
+	lod_jit = jit
 
 
 ## A lane read in full (`sl`): items as [uid, item id, pos, stack] four a lane item, front first.
@@ -484,19 +553,25 @@ func update(job_state, sim, tick: int, view: Rect2, view_all: bool, known: Dicti
 		dump: bool) -> Dictionary:
 	var lanes: Dictionary = job_state.lanes
 	var res := {"written": [], "unknown": [], "dump_ids": PackedInt64Array(), "dump_recs": PackedFloat32Array(),
-		"dump_gone": PackedInt64Array(), "mask": null, "dump_on": dump, "removed_keys": {}, "added_keys": {}}
+		"dump_gone": PackedInt64Array(), "mask_tiles": [], "mask_all": false, "dump_on": dump, "removed_keys": {}, "added_keys": {}}
 	records.base = job_state.records.base
 	# Which lanes to draw: all again when the planned ground or the look changed, else only those the
 	# bridge said something about.
-	var replan := full or view_all != planned_all or not planned_any or (not view_all and not planned.encloses(view)) 		or model_cap != planned_cap
+	var keep: float = clampf(maxf(view.size.x, view.size.y) * 0.15, 2.0, 8.0) if tight_cull else VIEW_KEEP
+	var shrunk := tight_cull and not view_all and planned_any \
+		and (planned.size.x > view.size.x + 2.0 * keep + 6.0 or planned.size.y > view.size.y + 2.0 * keep + 6.0)
+	var replan := full or view_all != planned_all or not planned_any or (not view_all and (not planned.encloses(view) or shrunk)) \
+		or model_cap != planned_cap
+	var prev_cap := planned_cap
 	var look_at: Array
 	if replan:
 		planned_cap = model_cap
-		planned = view.grow(VIEW_KEEP)
+		planned = view.grow(keep)
 		planned_all = view_all
 		planned_any = true
 		want.clear()
 		undrawn.clear()
+		lane_keys.clear()
 		look_at = info.keys()
 		for key: int in drawn:
 			if not info.has(key):
@@ -512,6 +587,7 @@ func update(job_state, sim, tick: int, view: Rect2, view_all: bool, known: Dicti
 		if item < 0:
 			want.erase(key)
 			undrawn.erase(key)
+			lane_keys.erase(key)
 		else:
 			want[key] = item
 			check[key] = true
@@ -522,10 +598,41 @@ func update(job_state, sim, tick: int, view: Rect2, view_all: bool, known: Dicti
 		if not drawn.has(key):
 			continue
 		var ln: Lane = drawn[key]
-		if not want.has(key) or want[key] != ln.item or ln.kind_key != _kind_key(want[key], model_cap):
+		if not want.has(key) or int(want[key]) != ln.item:
 			_remove(key, res)
 			if want.has(key):
 				undrawn[key] = true
+	cap_round += 1
+	var anchor := cap_anchor if cap_anchor_set else (view.get_center() if not view_all else Vector2.ZERO)
+	var cap_moved := replan or model_cap != prev_cap or cap_sim_dirty or not undrawn.is_empty() or cap_round >= CAP_EVERY \
+		or (model_cap > 0 and model_cap_near and (cap_cam_led != capped_cam \
+		or (cap_cam_led and (cap_cam_pos.distance_squared_to(capped_cam_pos) > CAM_STEP * CAM_STEP or cap_cam_dir.dot(capped_cam_dir) < CAM_TURN)) \
+		or (not cap_cam_led and anchor.distance_squared_to(capped_anchor) > CAM_STEP * CAM_STEP)))
+	var band_moved := replan or lod_split != lod_split_seen or not is_equal_approx(lod_d1, lod_d1_seen) \
+		or not is_equal_approx(lod_d2, lod_d2_seen) \
+		or (lod_split and (lod_band_at == Vector3.INF or lod_anchor.distance_squared_to(lod_band_at) > 16.0))
+	if cap_moved or band_moved:
+		if cap_moved:
+			cap_round = 0
+			cap_sim_dirty = false
+			capped_cam = cap_cam_led
+			capped_cam_pos = cap_cam_pos
+			capped_cam_dir = cap_cam_dir
+			capped_anchor = anchor
+		if band_moved:
+			lod_split_seen = lod_split
+			lod_d1_seen = lod_d1
+			lod_d2_seen = lod_d2
+			lod_band_at = lod_anchor
+		_plan_lane_keys(job_state, lanes, known, model_cap, anchor, check)
+	else:
+		for key_u: int in undrawn:
+			var item_u := int(want.get(key_u, -1))
+			if item_u >= 0 and not lane_keys.has(key_u):
+				var mid_u := _lane_mid(job_state, key_u, lanes[key_u])
+				var kk_u := _compute_lane_key(key_u, item_u, mid_u, job_state.height, known, model_cap, true)
+				lane_keys[key_u] = kk_u
+				check[key_u] = true
 	# A slice of the drawn lanes has its phase checked against the simulation's each update.
 	round_no += 1
 	var slice := round_no % SLICES
@@ -570,16 +677,20 @@ func update(job_state, sim, tick: int, view: Rect2, view_all: bool, known: Dicti
 	for q in keys.size():
 		var key := keys[q]
 		var item: int = want[key]
-		var kk := _kind_key(item, model_cap)
-		var look: Array = known.get(kk, [])
-		if look.is_empty():
-			unknown[kk] = true
-			continue
 		var m: PackedInt32Array = lanes[key]
+		var ln: Lane = drawn.get(key)
+		var kk: int = ln.kind_key if ln != null else int(lane_keys.get(key, _kind_key(item, model_cap)))
+		var lk := _look_key(kk)
+		var look: Array = known.get(lk, [])
+		if look.is_empty():
+			unknown[lk] = true
+			continue
+		if ln == null and kk >= 0 and not bool(look[1]) and ItemCards.band_of(kk) > 0:
+			kk = item
+			lane_keys[key] = kk
 		var f := fronts[q * 3]
 		var v := fronts[q * 3 + 1]
 		var has := fronts[q * 3 + 2] > 0
-		var ln: Lane = drawn.get(key)
 		var wl := world and (m[0] == BeltSim.STRAIGHT or m[0] == BeltSim.UG_VISIBLE or world_all and (m[0] == BeltSim.CURVE
 			or m[0] == BeltSim.SPLIT_IN or m[0] == BeltSim.SPLIT_OUT))
 		# (standing_obs: the game's front on the lane at its last read or check, -1 none.)
@@ -817,7 +928,30 @@ func update(job_state, sim, tick: int, view: Rect2, view_all: bool, known: Dicti
 		if not nums.is_empty() and has and nums[q * 3 + 2] >= 0 and not _ring(sim, key):
 			_seed(ln, f, nums[q * 3 + 2], tick)
 		_write_lane(job_state, key, ln, m, look, base, res, st)
+	for key: int in drawn:
+		var ln: Lane = drawn[key]
+		var target_kk: int = int(lane_keys.get(key, ln.kind_key))
+		if target_kk == ln.kind_key:
+			continue
+		var lk := _look_key(target_kk)
+		var look: Array = known.get(lk, [])
+		if look.is_empty():
+			unknown[lk] = true
+			continue
+		if target_kk >= 0 and not bool(look[1]) and ItemCards.band_of(target_kk) > 0:
+			target_kk = ln.item
+			lane_keys[key] = target_kk
+			if target_kk == ln.kind_key:
+				continue
+		var m_rekey: PackedInt32Array = lanes.get(key, PackedInt32Array())
+		if m_rekey.is_empty():
+			continue
+		_rekey_lane(key, ln, target_kk, res)
+		_write_lane(job_state, key, ln, m_rekey, look, base, res, ln.stack)
 	_open_ends(job_state, sim, known, base, res, front_at, tick)
+	if tight_cull:
+		for kk in kinds:
+			_compact_kind(int(kk), kinds[kk] as LKind)
 	for kk in kinds:
 		var kd: LKind = kinds[kk]
 		var told := Vector3i(kd.base, kd.top, kd.cap)
@@ -826,9 +960,18 @@ func update(job_state, sim, tick: int, view: Rect2, view_all: bool, known: Dicti
 			res["written"].append([kk, kd.base, kd.top, kd.cap])
 	res["unknown"] = unknown.keys()
 	res["pages"] = records.take_pages()
-	if mask_dirty:
-		mask_dirty = false
-		res["mask"] = mask
+	var dirty_tiles: Array = []
+	var send_all := false
+	if mask_dirty_bits != 0 and mask_tiles.size() == MASK_TILES:
+		send_all = not mask_sent_all or not mask_tiled
+		mask_sent_all = true
+		var bits := 0xFFFF if send_all else mask_dirty_bits
+		mask_dirty_bits = 0
+		for ti in MASK_TILES:
+			if (bits & (1 << ti)) != 0:
+				dirty_tiles.append([ti, mask_tiles[ti]])
+	res["mask_tiles"] = dirty_tiles
+	res["mask_all"] = send_all
 	lanes_n = drawn.size()
 	slots_n = 0
 	for kk in kinds:
@@ -882,7 +1025,7 @@ func _open_ends(job_state, sim, known: Dictionary, base: float, res: Dictionary,
 			_unmark(ln)
 			ln.open = o
 			_mark(job_state, key, ln, 0)
-		var look: Array = known.get(ln.kind_key, [])
+		var look: Array = known.get(_look_key(ln.kind_key), [])
 		if not look.is_empty():
 			_write_lane(job_state, key, ln, lanes[key], look, base, res, ln.stack)
 
@@ -922,16 +1065,203 @@ func _wanted(job_state, key: int, lanes: Dictionary) -> int:
 	if m.is_empty() or not _drawn_kind(m[0]) or m[1] <= 0 or m[1] > MAX_LENGTH:
 		return -1
 	if not planned_all:
-		var mid: Vector2
-		if mids.has(key):
-			mid = mids[key]
-		else:
-			var p := _point(job_state, key, m[1] * 0.5)
-			mid = Vector2(p.x, p.z)
-			mids[key] = mid
+		var mid := _lane_mid(job_state, key, m)
 		if not planned.has_point(mid):
 			return -1
 	return int(e[1])
+
+
+func _lane_mid(job_state, key: int, m: PackedInt32Array) -> Vector2:
+	if mids.has(key):
+		return mids[key]
+	var p := _point(job_state, key, m[1] * 0.5)
+	var mid := Vector2(p.x, p.z)
+	mids[key] = mid
+	return mid
+
+
+static func _look_key(kk: int) -> int:
+	return kk if kk < 0 else (kk % BAND_STEP)
+
+
+static func _hash_u32(x: int) -> float:
+	var h := (x ^ (x >> 16)) & 0xFFFFFFFF
+	h = (h * 0x45d9f3b) & 0xFFFFFFFF
+	h = (h ^ (h >> 16)) & 0xFFFFFFFF
+	return float(h & 0xFFFF) / 65536.0
+
+
+static func _view_dist_sq(p: Vector3, cpos: Vector3, planes: Array[Plane], margin: float) -> float:
+	for pl in planes:
+		if pl.distance_to(p) > margin:
+			return INF
+	return cpos.distance_squared_to(p)
+
+
+static func band_for_dist(id: int, d: float, d1: float, d2: float, jit: Vector2, cur_band: int) -> int:
+	if d2 <= 0.0:
+		return 2
+	if not is_finite(d1):
+		return 0
+	var j := _hash_u32(id) - 0.5
+	var t2 := (d2 + j * jit.y) if is_finite(d2) else INF
+	if d1 <= 0.0:
+		if cur_band < 1:
+			return 1 if d < t2 else 2
+		if cur_band == 1:
+			return 2 if is_finite(t2) and d >= t2 + BAND_HYST else 1
+		return 1 if is_finite(t2) and d < t2 - BAND_HYST else 2
+	var t1 := d1 + j * jit.x
+	if cur_band < 0:
+		return 0 if d < t1 else (1 if d < t2 else 2)
+	if cur_band == 0:
+		if d < t1 + BAND_HYST:
+			return 0
+		return 1 if d < t2 else 2
+	if cur_band == 1:
+		if d < t1 - BAND_HYST:
+			return 0
+		if is_finite(t2) and d >= t2 + BAND_HYST:
+			return 2
+		return 1
+	if d < t1 - BAND_HYST:
+		return 0
+	if is_finite(t2) and d < t2 - BAND_HYST:
+		return 1
+	return 2
+
+
+func _band_for(key: int, mid: Vector2, h: float, cur_band: int) -> int:
+	return band_for_dist(key, Vector3(mid.x, h, mid.y).distance_to(lod_anchor), lod_d1, lod_d2, lod_jit, cur_band)
+
+
+func _compute_lane_key(key: int, item: int, mid: Vector2, h: float, known: Dictionary, _model_cap: int, is_3d: bool) -> int:
+	if not is_3d:
+		return ItemCards.icon_key(item)
+	if not lod_split:
+		return item
+	var look: Array = known.get(item, [])
+	if not look.is_empty() and not bool(look[1]):
+		return item
+	var ln: Lane = drawn.get(key)
+	var cur_band := ItemCards.band_of(ln.kind_key) if ln != null and ln.kind_key >= 0 else -1
+	return ItemCards.band_key(item, _band_for(key, mid, h, cur_band))
+
+
+func _plan_lane_keys(job_state, lanes: Dictionary, known: Dictionary, model_cap: int, anchor: Vector2, check: Dictionary) -> void:
+	cap_3d_slots = 0
+	cap_eligible_slots = 0
+	cap_limit_d2 = INF
+	var h: float = job_state.height
+	if model_cap == 0 or (model_cap > 0 and not model_cap_near):
+		cap_limit_d2 = -1.0
+		for key_v in want:
+			var key := int(key_v)
+			var item := int(want[key])
+			var look: Array = known.get(item, [])
+			var icon_only := not look.is_empty() and not bool(look[1])
+			if not icon_only and lanes.has(key):
+				var mv: PackedInt32Array = lanes[key]
+				cap_eligible_slots += maxi(1, ceili(float(mv[1]) / float(GAP))) * _stack_of(key)
+			var target := item if icon_only else ItemCards.icon_key(item)
+			lane_keys[key] = target
+			var ln: Lane = drawn.get(key)
+			if ln != null and ln.kind_key != target:
+				check[key] = true
+		return
+	if model_cap < 0:
+		for key_v in want:
+			var key := int(key_v)
+			var item := int(want[key])
+			if not lanes.has(key):
+				continue
+			var mv: PackedInt32Array = lanes[key]
+			var look: Array = known.get(item, [])
+			var icon_only := not look.is_empty() and not bool(look[1])
+			if not icon_only:
+				var sl := maxi(1, ceili(float(mv[1]) / float(GAP))) * _stack_of(key)
+				cap_eligible_slots += sl
+				cap_3d_slots += sl
+			var mid := _lane_mid(job_state, key, mv)
+			var target := _compute_lane_key(key, item, mid, h, known, model_cap, true)
+			lane_keys[key] = target
+			var ln: Lane = drawn.get(key)
+			if ln != null and ln.kind_key != target:
+				check[key] = true
+		return
+	var cands: Array = []
+	for key_v in want:
+		var key := int(key_v)
+		if not lanes.has(key):
+			continue
+		var item := int(want[key])
+		var mv: PackedInt32Array = lanes[key]
+		var mid := _lane_mid(job_state, key, mv)
+		var look: Array = known.get(item, [])
+		if not look.is_empty() and not bool(look[1]):
+			lane_keys[key] = item
+			continue
+		var sl := maxi(1, ceili(float(mv[1]) / float(GAP))) * _stack_of(key)
+		cap_eligible_slots += sl
+		var ln: Lane = drawn.get(key)
+		var was_3d := ln != null and ln.kind_key >= 0
+		var d2: float
+		if cap_cam_led:
+			d2 = _view_dist_sq(Vector3(mid.x, h, mid.y), cap_cam_pos, cap_cam_planes, CAM_MARGIN + (CAP_SLACK if was_3d else 0.0))
+		else:
+			d2 = anchor.distance_squared_to(mid)
+		cands.append([d2, key, item, mid, sl, was_3d])
+	cands.sort_custom(func(a: Array, b: Array) -> bool: return float(a[0]) < float(b[0]))
+	var li := 0
+	var si := 0
+	var used := 0
+	var limit_d2 := -1.0
+	var all_within := true
+	while li < cands.size() or si < cap_sim_d2.size():
+		var cand_d2 := float((cands[li] as Array)[0]) if li < cands.size() else INF
+		if cand_d2 == INF and si >= cap_sim_d2.size():
+			break
+		var take_lat := si >= cap_sim_d2.size() or (li < cands.size() and cand_d2 <= cap_sim_d2[si])
+		if take_lat:
+			if cand_d2 == INF:
+				all_within = false
+				break
+			var sl := int((cands[li] as Array)[4])
+			if used < model_cap:
+				used += sl
+				limit_d2 = cand_d2
+				li += 1
+			else:
+				all_within = false
+				break
+		else:
+			if used < model_cap:
+				used += 1
+				limit_d2 = cap_sim_d2[si]
+				si += 1
+			else:
+				all_within = false
+				break
+	if all_within:
+		limit_d2 = INF
+	cap_limit_d2 = limit_d2
+	var keep_d2 := limit_d2 if (limit_d2 == INF or limit_d2 < 0.0) else pow(sqrt(limit_d2) + CAP_SLACK, 2.0)
+	for entry_v in cands:
+		var entry: Array = entry_v
+		var d2 := float(entry[0])
+		var key := int(entry[1])
+		var item := int(entry[2])
+		var mid := entry[3] as Vector2
+		var sl := int(entry[4])
+		var was_3d := bool(entry[5])
+		var want_3d := d2 < INF and d2 <= (keep_d2 if was_3d else limit_d2)
+		if want_3d:
+			cap_3d_slots += sl
+		var target := _compute_lane_key(key, item, mid, h, known, model_cap, want_3d)
+		lane_keys[key] = target
+		var ln: Lane = drawn.get(key)
+		if ln != null and ln.kind_key != target:
+			check[key] = true
 
 
 static func _drawn_kind(kind: int) -> bool:
@@ -1337,6 +1667,18 @@ static func _ring(sim, key: int) -> bool:
 	return false
 
 
+func _rekey_lane(key: int, ln: Lane, new_kk: int, res: Dictionary) -> void:
+	var old_kd: LKind = kinds.get(ln.kind_key)
+	for i in ln.slots.size():
+		if old_kd != null:
+			records.hide(old_kd.base + ln.slots[i])
+			old_kd.free.append(ln.slots[i])
+		if i % ln.stack == 0:
+			res["dump_gone"].append(_uid(key, i / ln.stack))
+	ln.slots.clear()
+	ln.kind_key = new_kk
+
+
 func _remove(key: int, res: Dictionary) -> void:
 	var ln: Lane = drawn[key]
 	drawn.erase(key)
@@ -1589,6 +1931,57 @@ func _drop_slot(key: int, ln: Lane, kd: LKind, res: Dictionary) -> void:
 	ln.slots.resize(i)
 
 
+func _compact_kind(kk: int, kd: LKind) -> void:
+	if kd == null or kd.base < 0 or kd.top <= 0 or kd.free.is_empty():
+		return
+	var live := 0
+	var owned: Array = []
+	for ln_var in drawn.values():
+		var ln: Lane = ln_var
+		if ln.kind_key == kk and not ln.slots.is_empty():
+			live += ln.slots.size()
+			owned.append(ln)
+	if live > 0 and (kd.free.size() <= 16 or kd.free.size() * 2 <= kd.top):
+		return
+	var old_top := kd.top
+	if live == 0:
+		for i in range(old_top):
+			records.hide(kd.base + i)
+		kd.top = 0
+		kd.free.clear()
+		return
+	var d: PackedFloat32Array = records.data
+	records.data = PackedFloat32Array()
+	var tmp := PackedFloat32Array()
+	tmp.resize(live * BeltRecords.FLOATS)
+	var next := 0
+	for ln_var in owned:
+		var ln: Lane = ln_var
+		var st := maxi(ln.stack, 1)
+		var slots: PackedInt32Array = ln.slots
+		for i in range(slots.size()):
+			var s_old := slots[i]
+			var src_o := (kd.base + s_old) * BeltRecords.FLOATS
+			var dst_o := next * BeltRecords.FLOATS
+			for q in BeltRecords.FLOATS:
+				tmp[dst_o + q] = d[src_o + q]
+			var j := i % st
+			if j > 0:
+				tmp[dst_o + 12] = float(-j)
+			slots[i] = next
+			next += 1
+		ln.slots = slots
+	var base_o := kd.base * BeltRecords.FLOATS
+	for k in tmp.size():
+		d[base_o + k] = tmp[k]
+	records.data = d
+	for i in range(live, old_top):
+		records.hide(kd.base + i)
+	records._mark_range(kd.base, old_top)
+	kd.top = live
+	kd.free.clear()
+
+
 ## A lane's exit and entry and the way items go there: [exit, direction there, entry, direction there].
 static func _ends(job_state, key: int, length: int) -> Array:
 	var exit := _point(job_state, key, 0.0)
@@ -1634,8 +2027,10 @@ static func _point(job_state, key: int, pos: float) -> Vector4:
 
 ## The mask's cells along a lane's centre line (sampled every 1/32 tile).
 func _mark(job_state, key: int, ln: Lane, _add: int) -> void:
-	if mask == null:
-		mask = Image.create(MASK, MASK, false, Image.FORMAT_R8)
+	if mask_tiles.size() != MASK_TILES:
+		mask_tiles.resize(MASK_TILES)
+		for ti in MASK_TILES:
+			mask_tiles[ti] = Image.create(MASK_TILE, MASK_TILE, false, Image.FORMAT_R8)
 		mask_n = PackedByteArray()
 		mask_n.resize(MASK * MASK)
 	var m: PackedInt32Array = job_state.lanes[key]
@@ -1668,8 +2063,9 @@ func _mark(job_state, key: int, ln: Lane, _add: int) -> void:
 		if mask_n[c] < 255:
 			mask_n[c] += 1
 		if mask_n[c] == 1:
-			mask.set_pixel(cx, cz, Color(1.0, 0.0, 0.0))
-			mask_dirty = true
+			var ti := (cz >> 9) * 4 + (cx >> 9)
+			mask_tiles[ti].set_pixel(cx & 511, cz & 511, Color(1.0, 0.0, 0.0))
+			mask_dirty_bits |= 1 << ti
 
 
 func _unmark(ln: Lane) -> void:
@@ -1677,8 +2073,11 @@ func _unmark(ln: Lane) -> void:
 		if mask_n[c] > 0:
 			mask_n[c] -= 1
 			if mask_n[c] == 0:
-				mask.set_pixel(c % MASK, c / MASK, Color(0.0, 0.0, 0.0))
-				mask_dirty = true
+				var cx := int(c) % MASK
+				var cz := int(c) / MASK
+				var ti := (cz >> 9) * 4 + (cx >> 9)
+				mask_tiles[ti].set_pixel(cx & 511, cz & 511, Color(0.0, 0.0, 0.0))
+				mask_dirty_bits |= 1 << ti
 	ln.cells = PackedInt32Array()
 
 
@@ -1688,3 +2087,7 @@ func clear(res_gone: PackedInt64Array) -> void:
 	for key: int in drawn.keys():
 		_remove(key, res)
 	feeds.clear()
+	lane_keys.clear()
+	cap_3d_slots = 0
+	cap_eligible_slots = 0
+	cap_limit_d2 = INF

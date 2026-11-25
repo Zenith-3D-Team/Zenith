@@ -17,9 +17,11 @@ more depth and detail. Needs Zenith's add-on API 1.5 (`api.shaders`, docs/ADDONS
   in sunlight too gives the darker one before 0.5.2); bounce light (SSIL) as its own option, off by default
 - the sky's reflection on metal
 - depth haze that grows with distance
-- clouds: soft, shaded clouds in the sky and their shadows drifting over the factory, from one
-  pattern the add-on draws once into a texture when it starts (`shaders/cloud_field.gdshader`, about
-  8 MB of video memory), in place of Zenith's own flat clouds
+- clouds: 3D sculpted volumetric cumulus clouds (`Volumetric clouds`, on by default, with `Cloud quality`
+  Low/Medium/High) built from seamless `32 x 32 x 32` 3D Worley volumes and the once-drawn `1024 x 1024`
+  weather/type pattern (`shaders/cloud_field.gdshader`, about 8 MB of video memory), curved toward the
+  horizon with sunlit silver linings, self-shadowing, and ground shadows drifting over the factory in
+  place of Zenith's own flat clouds; switching "Volumetric clouds" off restores 0.5.3's lighter flat layer
 - temporal anti-aliasing as an option (off by default: it softens moving belts), so far detail doesn't shimmer as the camera moves
   (your own anti-aliasing setting comes back when the add-on is off). MSAA is off while the look is on:
   Zenith draws SMAA in its place, since the grade pass reads a depth MSAA blurs at every edge (from the
@@ -36,10 +38,10 @@ more depth and detail. Needs Zenith's add-on API 1.5 (`api.shaders`, docs/ADDONS
 
 Put this folder (or a zip of it) in Zenith's `addons` folder and switch it on in the Add-ons menu:
 the add-on is the look, so the world is drawn with it while it is on, and switching it off brings
-back Zenith's Factorio look (which has no settings of its own). Its page in the Add-ons menu has its
-sliders: grade strength, bloom, depth haze, softening the far distance, vignette, film grain,
-temporal anti-aliasing, ambient occlusion, bounce light, soft shadows, shadows that soften with
-distance and the sun's size, whether the sun moves, and how strong sunrise and sunset are.
+back Zenith's Factorio look (which has no settings of its own). Its page in the Add-ons menu has its sliders: grade strength, bloom, depth haze, softening the far
+distance, clouds, cloud cover, volumetric clouds toggle and cloud quality (`Low` / `Medium` / `High`),
+vignette, film grain, temporal anti-aliasing, ambient occlusion, bounce light, soft shadows, shadows
+that soften with distance and the sun's size, whether the sun moves, and how strong sunrise and sunset are.
 
 It costs GPU time: ambient occlusion most (about 1-1.5 ms a frame on a desktop graphics card at a
 busy base: Godot's depth pre-pass then writes every pixel's normal), bounce light about as much again

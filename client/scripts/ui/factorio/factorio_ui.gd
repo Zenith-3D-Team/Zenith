@@ -105,6 +105,8 @@ const AchievementsWindow := preload("res://scripts/ui/factorio/achievements_wind
 const PermissionsWindow := preload("res://scripts/ui/factorio/permissions_window.gd")
 const DebugMenu := preload("res://scripts/ui/factorio/debug_menu.gd")
 const TipsWindow := preload("res://scripts/ui/factorio/tips_window.gd")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## Gap between the HUD's pieces and from the window's edges (GUI pixels).
 const MARGIN := 8
@@ -240,7 +242,7 @@ var hand := {}
 ## slot marked with the hand; building, Z and Ctrl+click take from that stack (`hs`), the next stack
 ## comes into the hand when it runs out, Q puts it back, a click on a slot puts it down.
 ## `--hand-stack=all`: the quickbar's item with every one of it counted, as before.
-static var stack_hand := not ("--hand-stack=all" in OS.get_cmdline_user_args())
+static var stack_hand := not (Switches.has("--hand-stack=all"))
 
 ## Ctrl+clicks on entities sent and not answered yet, oldest first (player_input.gd's
 ## _fast_transfer): {"item" (held, "": taking), "counts" (the inventory before), "at" (msec),
@@ -481,7 +483,7 @@ func _ready() -> void:
 	# and take the mouse there: the full-screen technology screen covers and blurs it with the rest of the
 	# HUD instead of the gear sitting on "Research queue" ("earch queue"). Still over the map view and the
 	# Remote view frame, which come before. --mod-button=over keeps it over every window, as before.
-	if not OS.get_cmdline_user_args().has("--mod-button=over"):
+	if not Switches.has("--mod-button=over"):
 		move_child(factorio_button, window.get_index())
 	perf_warning = PerfWarning.new()
 	add_child(perf_warning)
@@ -580,7 +582,7 @@ func _ready() -> void:
 	if bool(Settings.get_value("interface", "alt_mode")):
 		set_alt_mode.call_deferred(true)
 
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg == "--ui=inventory":
 			window.open_crafting(true)
 		elif arg == "--ui=armor":  # the armour's grid open beside the inventory
@@ -773,6 +775,8 @@ func layout() -> void:
 	weapons.scale = Vector2(f, f)
 	weapons.global_position = Vector2(0.0, view.y - weapons.size.y * f)
 	var arms := weapons.get_global_rect()
+	if remote_frame != null:
+		remote_frame.left_bottom = arms.position.y - Kit.px(4)
 	chat.right_edge = bar.end.x  # Factorio's open console reaches the quickbar's right edge
 
 	# Top right, flush with the corner: research, the side menu's buttons, the minimap.
@@ -1259,7 +1263,7 @@ func mined(msg: Dictionary) -> void:
 	if flying == null:
 		return
 	var from := Vector3(int(msg.get("x", 0)) / 256.0, 0.6, int(msg.get("y", 0)) / 256.0)
-	var l: Array = UiModel._array(msg.get("l"))
+	var l: Array = Wire.array(msg.get("l"))
 	for i in mini(l.size(), 6):
 		var r = l[i]
 		if r is Array and r.size() >= 2 and int(r[1]) > 0:
@@ -1273,7 +1277,7 @@ func mined(msg: Dictionary) -> void:
 func picked(msg: Dictionary) -> void:
 	var order: Array[String] = []
 	var got := {}  # item -> [count, where the nearest was]
-	for r in UiModel._array(msg.get("l")):
+	for r in Wire.array(msg.get("l")):
 		if not (r is Array) or r.size() < 4 or int(r[1]) <= 0:
 			continue
 		var item := str(r[0])
@@ -1409,9 +1413,9 @@ func toggle_personal_logistics() -> void:
 
 ## The hovered entity for the info panel (player_input.gd, every frame), or null. Where the mouse
 ## is goes with it, so the panel holds its entity while the mouse goes to its pack symbol (N8).
-func set_selected(r, fast := false) -> void:
+func set_selected(r, fast := false, running := false) -> void:
 	var mouse := Vector2.INF if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED else mouse_position()
-	entity_info.show_entity(r if entity_info.get_meta("enabled", true) else null, mouse, fast)
+	entity_info.show_entity(r if entity_info.get_meta("enabled", true) else null, mouse, fast, running)
 
 
 ## The Model packs window on `pack` with family `fam` shown (the entity info's pack symbol, N8): the

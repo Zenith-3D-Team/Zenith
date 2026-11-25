@@ -4,6 +4,8 @@ extends RefCounted
 ## a belt. main.gd hides those off the ground (ground_items.gd), flies them all to the character
 ## (factorio_ui.gd picked) and hands those off a belt to the belt layer as an inserter's picks.
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## The `ie` kind for a hand's pick (inserter_arms.gd EV_PICKED).
 const EV_PICKED := 1
 
@@ -11,7 +13,7 @@ const EV_PICKED := 1
 ## drawn belt in the belt layer's next job, as they start flying (`hu` in the message below; a packed lane the
 ## lattice draws gets its take's hole from the drawn tick); off, as before: they left the drawn belt only when the
 ## drawn clock, about half a second behind, reached the take.
-static var hide_now := not OS.get_cmdline_user_args().has("--pickup-hide-now=off")
+static var hide_now := Switches.on("--pickup-hide-now")
 
 
 ## The items taken off a belt (all of each: `left` 0) as an `ie` message of picks by no inserter (unit 0), on

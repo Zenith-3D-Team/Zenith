@@ -6,8 +6,8 @@ server scripts beside it, zipped as dist/Zenith-<version>-<platform>.zip. Upload
         [--no-addons] [--addon <add-on folder>[:off]]... [--models <folder>]
     python3 tools/release/package.py --models <folder> --zenith-zip <out.zip>   # the zip alone
 
-Two channels (owner: public downloads carry no testing tools; development builds do). `public`, the
-default, is the release on the public repo. `dev` is a development build for testers:
+Two channels (owner: public downloads carry no testing tools; dev builds do). `public`, the
+default, is the release on the public repo. `dev` is for testers' builds:
 dist/Zenith-<version>-dev-<platform>.zip, exported with the custom feature tag `zenith_dev` (set
 on the export preset for that export alone, export_presets.cfg put back after), which
 Settings.dev_tools() reads: the main menu's Performance test and --perf-test, the debug menu
@@ -15,12 +15,13 @@ Settings.dev_tools() reads: the main menu's Performance test and --perf-test, th
 the docs' dev-build parts (between <!-- dev --> and <!-- /dev --> marks, cut from a public zip's
 copies), and START HERE.txt says it is a development build.
 
-Every download carries Zenith's own add-ons (BUNDLED: the Cinematic camera, switched on; Terrain
-Elevation, switched off until the player turns it on; the Cinematic shaders, from addons-src, are
-added with --addon addons-src/cinematic-shaders, switched on), each fetched from its GitHub repo's latest
-release (or its default branch when it has none) into addons/<id>_<version>.zip, with
-addons/bundled.json giving each one's first state (addon_loader.gd). --addon <folder>[:off] bundles a
-local folder instead of (or besides) them; --no-addons leaves them all out.
+Every download can carry Zenith's own add-ons (BUNDLED: the Cinematic camera, switched on; Terrain
+Elevation, switched off until the player turns it on; and any local add-ons from addons-src/ such
+as cinematic-shaders, immersive-enemies, immersive-weather, or sprint via --addon), each fetched
+from a pinned GitHub release tag in BUNDLED (never floating on an unpinned branch) into
+addons/<id>_<version>.zip, with addons/bundled.json giving each one's first state
+(addon_loader.gd) and BUILD.json recording the build's version, channel, and bundled add-ons.
+--addon <folder>[:off] bundles a local folder instead of (or besides) them; --no-addons leaves them all out.
 
 --models <folder> zips a modeller's models (the .glb and .gltf files at the folder's top and in its
 items/ folder, with any files a .gltf points at) into the download's models/Zenith.zip beside the program, with a pack.json
@@ -28,7 +29,7 @@ items/ folder, with any files a .gltf points at) into the download's models/Zeni
 start-up and the zip is a model pack (model_packs.gd), on top of the built-in ones (FUE5, Wube3DP,
 Placeholders) the first time, so the download shows them out of the box; the Model packs window
 moves it or turns it off, and `-- --no-custom-models` leaves it out. Only for builds whose modeller
-agreed (development builds with Vasillo's models): the models aren't Zenith's, and the zip and
+agreed (the dev builds with Vasillo's models): the models aren't Zenith's, and the zip and
 the models folder's README.txt say so. --zenith-zip <out.zip> (or its old name
 --default-zip) writes that zip alone (a source build's models/Zenith.zip) and builds nothing else.
 
@@ -224,9 +225,9 @@ USER-GUIDE.md has the controls and everything else. Bug reports are welcome on t
 issue tracker.
 """
 START_HERE_DEV = """
-This is the development build, the same Zenith as the main download plus the testing tools that
-one leaves out: the main menu's Performance test (PERFORMANCE-TEST.md) and the debug menu (Ctrl+F12
-in a game).
+This is a DEVELOPMENT BUILD, for testers: it has the testing tools the public
+downloads leave out, the main menu's Performance test (PERFORMANCE-TEST.md) and the debug menu
+(Ctrl+F12 in a game). Please don't pass it on.
 """
 
 
@@ -320,8 +321,21 @@ def export(godot, preset, out_exe):
 EXECUTABLE = (".x86_64", ".arm64", ".sh")
 
 
-# Zenith's own add-ons, in every download: (GitHub repo, on until the player switches it).
-BUNDLED = [("unjustodin/Zenith-Cinematic-Camera", True), ("unjustodin/Terrain-Elevation", False)]
+# In-repo add-ons under addons-src/ (each can be bundled locally with --addon addons-src/<name>).
+IN_REPO_ADDONS = {
+    "cinematic-shaders": {"path": "addons-src/cinematic-shaders", "default_on": True},
+    "immersive-enemies": {"path": "addons-src/immersive-enemies", "default_on": True},
+    "immersive-weather": {"path": "addons-src/immersive-weather", "default_on": True},
+    "sprint": {"path": "addons-src/sprint", "default_on": False},
+}
+
+# Zenith's own external add-ons, in every download unless --no-addons is passed.
+# Each entry pins a GitHub repo and release tag (e.g. "v0.3.0"); an empty tag requires
+# setting the pinned tag here when cutting a release or passing --no-addons with --addon <folder>.
+BUNDLED = [
+    {"repo": "unjustodin/Zenith-Cinematic-Camera", "tag": "", "on": True},
+    {"repo": "unjustodin/Terrain-Elevation", "tag": "", "on": True},
+]
 
 
 def _get(url):
@@ -337,16 +351,18 @@ def zip_manifest(data):
         return json.loads(z.read(sorted(names, key=len)[0])) if names else None
 
 
-def fetch_addon(repo):
-    """The add-on's zip from its repo's latest release (its first .zip), else its default branch."""
+def fetch_addon(repo, tag):
+    """Fetch an add-on's zip from a pinned GitHub release tag (its first .zip asset, else tag archive)."""
+    if not tag:
+        sys.exit(f"{repo} has no pinned release tag in BUNDLED: set 'tag' in package.py or pass --no-addons / --addon <folder>")
     try:
-        release = json.loads(_get(f"https://api.github.com/repos/{repo}/releases/latest"))
+        release = json.loads(_get(f"https://api.github.com/repos/{repo}/releases/tags/{tag}"))
         assets = [a for a in release.get("assets", []) if a["name"].endswith(".zip")]
         if assets:
-            return _get(assets[0]["browser_download_url"]), f"release {release['tag_name']}"
+            return _get(assets[0]["browser_download_url"]), f"github:{repo}@{tag}"
     except urllib.error.HTTPError:
-        pass  # no release yet
-    return _get(f"https://api.github.com/repos/{repo}/zipball"), "default branch"
+        pass  # fall back to the pinned tag archive
+    return _get(f"https://github.com/{repo}/archive/refs/tags/{tag}.zip"), f"github:{repo}@{tag}"
 
 
 def folder_zip(folder):
@@ -361,18 +377,20 @@ def folder_zip(folder):
     return buf.getvalue()
 
 
+def _safe_local_source(folder):
+    """Repo-relative POSIX path when inside ROOT, else folder basename only (never leak user paths)."""
+    resolved = pathlib.Path(folder).resolve()
+    try:
+        return f"local:{resolved.relative_to(ROOT).as_posix()}"
+    except ValueError:
+        return f"local:{resolved.name}"
+
+
 def gather_addons(args):
-    """[(file name, zip bytes, id, on), ...] for the downloads, fetched once."""
-    out = []
-    if not args.no_addons:
-        for repo, on in BUNDLED:
-            data, where = fetch_addon(repo)
-            m = zip_manifest(data)
-            if not m:
-                sys.exit(f"{repo} ({where}) has no addon.json")
-            print(f"add-on {m['id']} {m['version']} from {repo}, {where}, {'on' if on else 'off'}")
-            out.append((f"{m['id']}_{m['version']}.zip", data, m["id"], on))
-    for spec in args.addon:
+    """List of dicts {filename, data, id, version, source, on} for the downloads, fetched once."""
+    local_addons = []
+    override_ids = set()
+    for spec in getattr(args, "addon", ()):
         # Only a trailing :off or :on is the state: a Windows path has its own colon (C:\...).
         folder, state = spec, "on"
         if spec.endswith((":off", ":on")):
@@ -381,8 +399,48 @@ def gather_addons(args):
         m = zip_manifest(data)
         if not m:
             sys.exit(f"--addon {folder}: no addon.json in that folder")
-        out = [a for a in out if a[2] != m["id"]]
-        out.append((f"{m['id']}_{m['version']}.zip", data, m["id"], state != "off"))
+        override_ids.add(m["id"])
+        local_addons.append({
+            "filename": f"{m['id']}_{m['version']}.zip",
+            "data": data,
+            "id": m["id"],
+            "version": str(m["version"]),
+            "source": _safe_local_source(folder),
+            "on": state != "off",
+        })
+
+    out = []
+    channel = getattr(args, "channel", "public")
+    if not getattr(args, "no_addons", False):
+        for entry in BUNDLED:
+            repo = entry["repo"]
+            tag = entry["tag"]
+            on = entry["on"]
+            hint_id = repo.rsplit("/", 1)[-1].removeprefix("Zenith-").lower()
+            if hint_id in override_ids:
+                continue
+            if not tag and channel == "dev":
+                print(f"note: skipping untagged bundled add-on {repo} on dev channel (pass --addon <folder> to bundle locally)")
+                continue
+            data, where = fetch_addon(repo, tag)
+            m = zip_manifest(data)
+            if not m:
+                sys.exit(f"{repo} ({where}) has no addon.json")
+            if m["id"] in override_ids:
+                continue
+            print(f"add-on {m['id']} {m['version']} from {repo}, {where}, {'on' if on else 'off'}")
+            out.append({
+                "filename": f"{m['id']}_{m['version']}.zip",
+                "data": data,
+                "id": m["id"],
+                "version": str(m["version"]),
+                "source": where,
+                "on": on,
+            })
+
+    for a in local_addons:
+        out = [x for x in out if x["id"] != a["id"]]
+        out.append(a)
     return out
 
 
@@ -422,6 +480,42 @@ def default_zip(models, out):
         for p, name in models:
             z.write(p, name)
     return sum(1 for p, _ in models if p.suffix.lower() in (".glb", ".gltf"))
+
+
+def build_manifest(version, channel, addons):
+    """Return the BUILD.json payload recording Zenith version, channel, and bundled add-ons."""
+    return {
+        "version": version,
+        "channel": channel,
+        "addons": [
+            {
+                "id": a["id"],
+                "version": a["version"],
+                "source": a["source"],
+                "on": a["on"],
+            }
+            for a in addons
+        ],
+    }
+
+
+def validate_versions(version, project_path=None, presets_path=None):
+    """Verify project.godot config/version and export_presets.cfg version strings match info.json."""
+    project_path = pathlib.Path(project_path) if project_path else ROOT / "client" / "project.godot"
+    presets_path = pathlib.Path(presets_path) if presets_path else ROOT / "client" / "export_presets.cfg"
+    shown = re.search(r'^config/version="([^"]*)"', project_path.read_text(encoding="utf-8"), re.M)
+    if not shown or shown.group(1) != version:
+        raise ValueError(
+            f"{project_path} config/version ({shown.group(1) if shown else 'missing'}) "
+            f"doesn't match the mod's info.json ({version}): set both to the release's version"
+        )
+    presets_txt = presets_path.read_text(encoding="utf-8")
+    for m in re.finditer(r'^(application/(?:short_)?version)="([^"]*)"', presets_txt, re.M):
+        if m.group(2) != version:
+            raise ValueError(
+                f"{presets_path} {m.group(1)} ({m.group(2)}) "
+                f"doesn't match the mod's info.json ({version}): set all preset versions to {version}"
+            )
 
 
 def package(godot, platform, version, addons=(), channel="public", models=()):
@@ -467,11 +561,12 @@ def package(godot, platform, version, addons=(), channel="public", models=()):
                                                   encoding="utf-8")
     (folder / "addons").mkdir()
     (folder / "addons" / "README.txt").write_text(ADDONS_README, encoding="utf-8")
-    for name, data, _, _ in addons:
-        (folder / "addons" / name).write_bytes(data)
-        print(f"  bundled add-on {name}")
+    for a in addons:
+        (folder / "addons" / a["filename"]).write_bytes(a["data"])
+        print(f"  bundled add-on {a['filename']}")
     if addons:
-        (folder / "addons" / "bundled.json").write_text(json.dumps({a[2]: a[3] for a in addons}, indent=1), encoding="utf-8")
+        (folder / "addons" / "bundled.json").write_text(json.dumps({a["id"]: a["on"] for a in addons}, indent=1), encoding="utf-8")
+    (folder / "BUILD.json").write_text(json.dumps(build_manifest(version, channel, addons), indent=1) + "\n", encoding="utf-8")
     out = folder.parent / f"{folder.name}.zip"
     app_zip = folder / exe if platform == "macos" else None
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
@@ -499,7 +594,7 @@ def main():
     parser.add_argument("--godot", default=default_godot())
     parser.add_argument("--platform", choices=list(PRESETS) + ["supported", "unsupported", "all"], default="windows")
     parser.add_argument("--channel", choices=CHANNELS, default="public",
-                        help="public (the release; no testing tools) or dev (development builds: the performance test and debug menu)")
+                        help="public (the release; no testing tools) or dev (the performance test and debug menu)")
     parser.add_argument("--addon", action="append", default=[], help="a local add-on folder to bundle, :off for off (repeatable)")
     parser.add_argument("--no-addons", action="store_true", help="bundle no add-ons")
     parser.add_argument("--models", help="a folder of a modeller's models to put in the download's models/" + BUNDLED_ZIP)
@@ -513,11 +608,10 @@ def main():
         print(f"wrote {args.zenith_zip}: {count} model(s), pack.json, README.txt and zenith.png")
         return
     version = json.loads((MOD / "info.json").read_text())["version"]
-    # The game shows its version from project.godot: a download must say the same as its mod.
-    shown = re.search(r'^config/version="([^"]*)"', (ROOT / "client" / "project.godot").read_text(), re.M)
-    if not shown or shown.group(1) != version:
-        sys.exit(f"client/project.godot config/version ({shown.group(1) if shown else 'missing'}) "
-                 f"doesn't match the mod's info.json ({version}): set both to the release's version")
+    try:
+        validate_versions(version)
+    except ValueError as exc:
+        sys.exit(str(exc))
     groups = {"all": list(PRESETS), "supported": SUPPORTED, "unsupported": list(UNSUPPORTED)}
     models = bundled_models(args.models) if args.models else []
     addons = gather_addons(args)

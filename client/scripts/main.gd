@@ -36,15 +36,25 @@ const UpsGovernor := preload("res://scripts/world/ups_governor.gd")
 const PerfLog := preload("res://scripts/world/perf_log.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const ShaderWarmup := preload("res://scripts/world/shader_warmup.gd")
+const RenderWarm := preload("res://scripts/world/render_warm.gd")
 const MoverLayer := preload("res://scripts/world/movers.gd")
 const RemoteFog := preload("res://scripts/world/remote_fog.gd")
 const Pollution := preload("res://scripts/world/pollution.gd")
+const GodRays := preload("res://scripts/world/god_rays.gd")
+const DistantHorizon := preload("res://scripts/world/distant_horizon.gd")
+const RenderDistance := preload("res://scripts/world/render_distance.gd")
+const FarChunks := preload("res://scripts/world/far_chunks.gd")
+const CliffWall := preload("res://scripts/world/cliff_wall.gd")
+const WeaponFx := preload("res://scripts/fx/weapon_fx.gd")
+const BeltLods := preload("res://scripts/world/belt_lods.gd")
+const FullDetail := preload("res://scripts/world/full_detail.gd")
 const BeltItemLayer := preload("res://scripts/world/belt_items.gd")
 const BeltLaneLayer := preload("res://scripts/world/belt_lanes.gd")
 const GroundItemLayer := preload("res://scripts/world/ground_items.gd")
 const DecorativeLayer := preload("res://scripts/world/decoratives.gd")
 const InserterArmLayer := preload("res://scripts/world/inserter_arms.gd")
 const LampLayer := preload("res://scripts/world/lamp_lights.gd")
+const SignalLayer := preload("res://scripts/world/signal_lights.gd")
 const FluidsPowerLayer := preload("res://scripts/world/fluids_power.gd")
 const WireLayer := preload("res://scripts/world/wires.gd")
 const GhostLayer := preload("res://scripts/world/ghosts.gd")
@@ -63,10 +73,12 @@ const Fx := preload("res://scripts/fx/fx.gd")
 const TurretLayer := preload("res://scripts/world/turrets.gd")
 const ReviewShots := preload("res://scripts/debug/review_shots.gd")
 const AnimShots := preload("res://scripts/debug/anim_shots.gd")
+const DebugOverlay := preload("res://scripts/debug/debug_overlay.gd")
 const WorkingGlow := preload("res://scripts/world/working_glow.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
+const ShaderRefresh := preload("res://scripts/menu/shader_refresh.gd")
 const ContactShade := preload("res://scripts/world/contact_shade.gd")
 const AoZoom := preload("res://scripts/world/ao_zoom.gd")
 const FrontEnd := preload("res://scripts/menu/front_end.gd")
@@ -85,7 +97,10 @@ const SunShadows := preload("res://scripts/world/sun_shadows.gd")
 const AddonHost := preload("res://scripts/addons/addon_host.gd")
 const InterfaceState := preload("res://scripts/ui/interface_state.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const WeatherState := preload("res://scripts/world/weather_state.gd")
+const VehicleLights := preload("res://scripts/world/vehicle_lights.gd")
 const EscTooltip := preload("res://scripts/ui/esc_tooltip.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Options that start a game at once, without the menu.
 const DIRECT_OPTIONS := ["--factorio-port=", "--factorio-host=", "--port=", "--open=", "--ui=", "--ui-sample", "--ui-hold=",
@@ -98,23 +113,47 @@ const Looks := preload("res://scripts/world/looks.gd")
 const BeltBlur := preload("res://scripts/world/belt_blur.gd")
 const PickUp := preload("res://scripts/world/pick_up.gd")
 const VrSession := preload("res://scripts/vr/vr_session.gd")
+const StallWatchdog := preload("res://scripts/debug/stall_watchdog.gd")
+const StallCrumb := preload("res://scripts/debug/stall_crumb.gd")
+const ItemModels := preload("res://scripts/world/item_models.gd")
 const SPACE_SKY := preload("res://shaders/space_sky.gdshader")
+const Wire := preload("res://scripts/util/wire.gd")
 ## Roughly each planet's colour from orbit, for the space backdrop.
 const PLANET_COLORS := {
 	"nauvis": Color(0.26, 0.42, 0.52), "vulcanus": Color(0.62, 0.32, 0.16), "gleba": Color(0.42, 0.5, 0.28),
 	"fulgora": Color(0.5, 0.38, 0.42), "aquilo": Color(0.62, 0.76, 0.86),
 }
+## The planets' clouds from space (space_sky.gdshader's layered look; `--planet-clouds=old` the look
+## before: luminance as alpha, no flow, relief or shadow). Factorio's own cloud maps give the shapes
+## and colours; these set how each planet's read: cover [alpha where cloud starts, where full,
+## opacity, edge breakup], tint [r, g, b, saturation], style [shadow on the ground, flow distance,
+## relief, limb thinning]. Nauvis white swirls, Vulcanus grey-brown ash, Fulgora a dark streaked
+## storm, Gleba a soft haze, Aquilo thin icy streams over the ice.
+static var planet_clouds_old := Switches.has("--planet-clouds=old")
+## True once `scenes/boot.tscn` (`boot.gd`) already ran `ShaderRefresh` and staged warm-up.
+static var booted_from_screen := false
+const PLANET_CLOUDS := {
+	"nauvis": {"cover": Vector4(0.6, 1.0, 0.88, 0.55), "tint": Vector4(1.12, 1.12, 1.15, 1.0), "style": Vector4(0.4, 0.006, 0.9, 0.45)},
+	"vulcanus": {"cover": Vector4(0.42, 0.9, 0.78, 0.6), "tint": Vector4(0.88, 0.85, 0.82, 0.3), "style": Vector4(0.35, 0.008, 1.0, 0.4)},
+	"fulgora": {"cover": Vector4(0.3, 0.95, 0.82, 0.7), "tint": Vector4(1.3, 1.25, 1.35, 0.7), "style": Vector4(0.45, 0.01, 1.1, 0.4)},
+	"gleba": {"cover": Vector4(0.35, 1.0, 0.55, 0.3), "tint": Vector4(1.05, 1.08, 0.95, 1.0), "style": Vector4(0.2, 0.005, 0.6, 0.6)},
+	"aquilo": {"cover": Vector4(0.78, 0.95, 0.65, 0.45), "tint": Vector4(2.3, 2.55, 2.75, 0.3), "style": Vector4(0.25, 0.007, 0.5, 0.5)},
+}
+const PLANET_CLOUDS_OTHER := {"cover": Vector4(0.45, 1.0, 0.85, 0.5), "tint": Vector4(1.0, 1.0, 1.0, 1.0), "style": Vector4(0.3, 0.006, 0.8, 0.5)}
 
 var world: WorldMirror
 var movers: MoverLayer
 var remote_fog: RemoteFog
 var pollution: Pollution  # dying trees, green lakes and smog where the chunks are polluted (I15)
+var god_rays: GodRays
+var distant_horizon: DistantHorizon
 var belt_items: BeltItemLayer
 var belt_lanes: BeltLaneLayer
 var ground_items: GroundItemLayer
 var decoratives: DecorativeLayer
 var arms: InserterArmLayer
 var lamps: LampLayer
+var signal_lights: SignalLayer
 var working_glow: WorkingGlow
 var fluids_power: FluidsPowerLayer
 var wires: WireLayer
@@ -164,6 +203,8 @@ var _tick_before := -1
 var _ups := 0.0
 var _headless := DisplayServer.get_name() == "headless"
 var _log_timer := 0.0
+var _welcome_sid := ""
+var _welcome_gf := ""
 var _env: Environment
 var ao_zoom: AoZoom
 ## The sun's shadow biases (Light3D.shadow_bias, shadow_normal_bias): see where the sun is made.
@@ -180,6 +221,8 @@ var _sky_daytime := 0.15
 var _sky_darkness := 0.0
 ## On a space platform: space instead of the planet's sky.
 var _space := false
+var _space_platform := 0  # platform index the 3D view shows (boarded or remote view), 0 on a planet
+var _viewing_away := false  # the remote view shows another surface than the character's (gates don't open for it)
 var _space_material: ShaderMaterial
 var _planet_sky: PlanetSky
 var _planet_sky_res: Sky
@@ -198,17 +241,40 @@ var _asked_space_map := false
 ## Back from another window (Factorio's own, say): keys changed in Factorio's controls meanwhile
 ## are followed now (issue #26), not only at the next start. --factorio-keys-refresh=off: start only.
 func _notification(what: int) -> void:
-	if what == NOTIFICATION_APPLICATION_FOCUS_IN and Settings.arg_value("--factorio-keys-refresh=") != "off":
+	if what == NOTIFICATION_WM_CLOSE_REQUEST and hud != null and is_instance_valid(hud):
+		hud.ui.model.flush_pedia_cache(true)
+	if what == NOTIFICATION_APPLICATION_FOCUS_IN and ShaderRefresh.child_pid == 0 and Settings.arg_value("--factorio-keys-refresh=") != "off":
 		Settings.refresh_factorio_keys()
 
 
 ## Quitting while a model pack's zip is still being unpacked (model_packs.gd) waits for it: Godot
 ## crashes on its way out with a task still on a worker.
 func _exit_tree() -> void:
+	StallWatchdog.mark("main _exit_tree")
+	if hud != null and is_instance_valid(hud):
+		hud.ui.model.flush_pedia_cache(true)
+	if distant_horizon != null and is_instance_valid(distant_horizon):
+		distant_horizon.finish_all()
 	ModelLibrary.ModelPacks.wait()
+	ItemModels.wait_all()
+	ModelLibrary.wait_prune()
+	# Their workers too: a task still running when Godot stops the renderer (on its own thread) can hang the quit.
+	BeltLods.wait_running()
+	CliffWall.wait_running()
+	StallWatchdog.stop()
 
 
 func _ready() -> void:
+	# A new build's first start: the old shader and pipeline caches deleted and the game started again
+	# (shader_refresh.gd); this process only waits, hidden, for the new one and ends with it. Skipped
+	# when `boot.gd` already checked before loading `main.tscn`.
+	if not booted_from_screen and ShaderRefresh.restart_if_new_build():
+		ShaderRefresh.wait_for_child(self)
+		return
+	Switches.warn_unknown(Switches.args())
+	# A thread that says in the log where the main thread stands if frames stop (stall_watchdog.gd).
+	StallWatchdog.start()
+	StallWatchdog.mark("main _ready: settings")
 	# Factorio's own settings are the defaults (factorio_settings.gd), so they are read before any
 	# is applied; the install is found the same way the graphics are (--factorio-data first).
 	ItemIcons.configure_from_command_line()
@@ -216,9 +282,24 @@ func _ready() -> void:
 	Settings.apply_startup(DisplayServer.window_get_size().y)
 	Settings.apply_window(get_tree().root)
 	FxSettings.load_settings()
+	# Movers (the character, vehicles, creatures, robots) lifted whole onto the hills, by the ground under
+	# their origin, so they don't bend over a cliff's step (factorio_material.gdshaderinc ground_rigid);
+	# --mover-lift=vertex: vertex by vertex as before.
+	RenderingServer.global_shader_parameter_set(&"f3d_mover_rigid",
+		0.0 if Switches.has("--mover-lift=vertex") else 1.0)
+	# Cliffs and rocks wet like rough stone in the rain (weather_surface.gdshaderinc); --wet-rock=old: as any model.
+	RenderingServer.global_shader_parameter_set(&"f3d_wet_rock",
+		0.0 if Switches.has("--wet-rock=old") else 1.0)
+	# Organic creature surfaces (chitin/flesh micro-bump and non-mirror rain wetness); --organic-surface=old: off.
+	RenderingServer.global_shader_parameter_set(&"f3d_organic_surface",
+		0.0 if Switches.has("--organic-surface=old") else 1.0)
 	# Packs' own shading (Settings, --pack-shading) in the shader's global now: the menu's model preview
 	# draws with it before any game makes the Looks node (project.godot's 1.0 till then).
 	Looks.apply_pack_shading()
+	ModelLibrary.ModelPacks.set_tiles_on(ModelLibrary.ModelPacks.arg_on("--pack-tiles") and bool(Settings.get_value("graphics", "pack_tiles")))
+	ModelLibrary.ModelPacks.set_decor_on(ModelLibrary.ModelPacks.arg_on("--pack-decoratives") and bool(Settings.get_value("graphics", "pack_decoratives")))
+	ModelLibrary.ModelPacks.set_decor_models_on(ModelLibrary.ModelPacks.arg_on("--decor-models") and bool(Settings.get_value("graphics", "decor_models")))
+	StallWatchdog.mark("main _ready: model packs")
 	ModelLibrary.configure_from_command_line()
 	ModFiles.configure_from_command_line()
 	# Names in the language set in Factorio, unless --factorio-locale says otherwise.
@@ -237,7 +318,10 @@ func _ready() -> void:
 	get_tree().root.size_changed.connect(func() -> void: ModelLods.fit_lines(get_tree().root))
 	# --warm-shaders=loaded|all: the world's shaders used once now, so the first item, robot, clutter
 	# and character don't wait for their shaders' compiles in the frame they appear (shader_warmup.gd).
+	StallWatchdog.mark("main _ready: shader warm-up")
 	ShaderWarmup.start(self)
+	RenderWarm.start(self)  # hover marks, Alt-mode and post effects (render_warm.gd, --pipe-warm-extra=off)
+	StallWatchdog.mark("main _ready: after shader warm-up")
 
 	Bridge.welcomed.connect(_on_welcome)
 	Bridge.message_received.connect(_on_message)
@@ -255,6 +339,7 @@ func _ready() -> void:
 		vr.main = self
 		add_child(vr)
 
+	StallWatchdog.mark("main _ready: front end")
 	backdrop_recorder = BackdropRecorder.new()
 	backdrop_recorder.name = "BackdropRecorder"
 	add_child(backdrop_recorder)
@@ -268,9 +353,11 @@ func _ready() -> void:
 	add_child(esc_tooltip)
 	move_child(esc_tooltip, 0)
 	# Add-ons (scripts/addons/, docs/ADDONS.md), after the menu: they get input before it does.
+	StallWatchdog.mark("main _ready: add-ons")
 	addons = AddonHost.new()
 	addons.main = self
 	add_child(addons)
+	StallWatchdog.mark("main _ready: after add-ons")
 	# Their looks are registered now: a saved MSAA under a look with passes becomes SMAA, before anything
 	# is drawn (Settings.MSAA_UNDER_LOOK).
 	Settings.settle_antialiasing(get_tree().root)
@@ -285,9 +372,15 @@ func _ready() -> void:
 		Bridge.connect_to(Bridge.factorio_host, Bridge.factorio_port, Bridge.listen_port)
 		front_end.open_direct("%s:%d" % [Bridge.factorio_host, Bridge.factorio_port])
 	else:
+		StallWatchdog.mark("main _ready: open_menu")
 		front_end.open_menu()
+	StallWatchdog.mark("main _ready: done")
+	# The frame's first and last scripts leave their crumbs (a stall between "frame end" and the next
+	# "frame start" is the engine's own work: drawing, the GPU).
+	add_child(StallCrumb.new("frame start", -(1 << 30)))
+	add_child(StallCrumb.new("frame end", 1 << 30))
 
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--screenshot="):
 			var spec := arg.get_slice("=", 1)
 			var delay := 10.0
@@ -374,6 +467,8 @@ func start_game() -> void:
 		return
 	_game = Node3D.new()
 	_game.name = "Game"
+	Settings.in_menu = false  # the menu's 60 FPS cap off in the game
+	Engine.max_fps = Settings.fps_limit()
 	add_child(_game)
 	move_child(_game, 0)
 	_build_environment()
@@ -404,7 +499,20 @@ func start_game() -> void:
 	pollution = Pollution.new()
 	pollution.name = "Pollution"
 	_game.add_child(pollution)
-	for arg in OS.get_cmdline_user_args():
+	god_rays = GodRays.new()
+	god_rays.name = "GodRays"
+	_game.add_child(god_rays)
+	distant_horizon = DistantHorizon.new()
+	distant_horizon.name = "DistantHorizon"
+	_game.add_child(distant_horizon)
+	world.dh_covers_chunk = distant_horizon.covers_chunk
+	world.dh_handoff_ready = distant_horizon.handoff_ready
+	distant_horizon.is_chunk_ready_cb = world.chunk_is_drawn_visible
+	world.chunk_drawn.connect(_on_world_chunk_drawn)
+	world.chunk_unloaded.connect(_on_world_chunk_unloaded)
+	world.behind_cull.chunk_visibility_changed.connect(_on_chunk_visibility_changed)
+	remote_fog.chunk_visibility_changed.connect(_on_chunk_visibility_changed)
+	for arg in Switches.args():
 		if arg.begins_with("--robot-probe="):
 			var probe: Node = preload("res://scripts/debug/robot_probe.gd").new()
 			probe.movers = movers
@@ -475,7 +583,7 @@ func start_game() -> void:
 	belt_lanes.name = "BeltLanes"
 	belt_lanes.protos = world.protos
 	belt_lanes.world = world
-	belt_lanes.distance = clampi(int(Settings.get_value("graphics", "belt_distance")), 0, 640)
+	belt_lanes.distance = clampi(int(Settings.get_value("graphics", "belt_distance")), 0, Settings.VIEW_RADIUS_MAX * 32)
 	belt_lanes.near = mini(belt_lanes.distance, BeltLaneLayer.MOVING_MAX)
 	belt_lanes.cap = BeltLaneLayer.cap_of(float(Settings.get_value("graphics", "belt_updates")))
 	_game.add_child(belt_lanes)
@@ -502,11 +610,22 @@ func start_game() -> void:
 	lamps.name = "Lamps"
 	lamps.protos = world.protos
 	lamps.world = world
+	lamps.far_chunks = world.far_chunks
 	_game.add_child(lamps)
+	signal_lights = SignalLayer.new()
+	signal_lights.name = "SignalLights"
+	signal_lights.protos = world.protos
+	signal_lights.world = world
+	signal_lights.far_chunks = world.far_chunks
+	signal_lights.fog = remote_fog
+	_game.add_child(signal_lights)
 	working_glow = WorkingGlow.new()
 	working_glow.name = "WorkingGlow"
 	working_glow.world = world
+	working_glow.far_chunks = world.far_chunks
 	_game.add_child(working_glow)
+	lamps.working_glow = working_glow
+	lamps.signal_lights = signal_lights
 
 	fluids_power = FluidsPowerLayer.new()
 	fluids_power.name = "FluidsPower"
@@ -547,7 +666,11 @@ func start_game() -> void:
 	rig.name = "CameraRig"
 	rig.target = avatar
 	decoratives.rig = rig
+	if ao_zoom != null:
+		ao_zoom.rig = rig
 	_game.add_child(rig)
+	rig.projection_changed.connect(_on_camera_projection_changed)
+	Settings.set_camera_orthographic(rig.camera.projection == Camera3D.PROJECTION_ORTHOGONAL, get_tree().root)
 	if ReviewShots.requested():
 		var shots := ReviewShots.new()
 		shots.rig = rig
@@ -566,8 +689,12 @@ func start_game() -> void:
 	hud.ui.run_command = _run_command
 	hud.ui.has_rcon = _has_rcon
 	hud.ui.debug_menu.main = self  # its benchmarks and tests drive the world, camera and probes
+	if DebugOverlay.spike_arg_ms() > 0.0:
+		hud.ui.debug_menu.start_spike_log.call_deferred()  # after the game's nodes are in, so its marks name them
 	remote_fog.model = hud.ui.model  # roboports reveal under the remote view's fog too (H13)
+	hud.ui.model.map_changed.connect(_on_map_pollution_changed)
 	arms.eprops = hud.ui.model.eprops  # inserters' pickup/drop vectors and hand speeds, for the swing model
+	movers.eprops = hud.ui.model.eprops  # worker robot speeds and low-energy multipliers, for `rb`
 
 	rockets = RocketLayer.new()
 	rockets.name = "Rockets"
@@ -631,7 +758,7 @@ func start_game() -> void:
 			_planet_sky.strike_flash(at.distance_to(Vector2(avatar.position.x, avatar.position.z)))
 	hud.ui.model.lightning_struck.connect(sky_flash)
 	# Another mod's planet goes in a platform's sky once the solar system says it is one.
-	hud.ui.model.space_map_changed.connect(func() -> void: _show_planet_for(platform_panel.current()))
+	hud.ui.model.space_map_changed.connect(func() -> void: _show_planet_for(_sky_platform()))
 
 	player_tags = PlayerTags.new()
 	player_tags.name = "PlayerTags"
@@ -675,6 +802,7 @@ func start_game() -> void:
 	turrets.world = world
 	_game.add_child(turrets)
 	world.animator.turrets = turrets
+	fx.weapons.turrets = turrets  # the game's laser and tesla beams from the turrets' emitters
 	world.animator.rockets = rockets
 	movers.vehicles.model = hud.ui.model
 	movers.vehicles.turrets = turrets
@@ -694,17 +822,30 @@ func start_game() -> void:
 ## Frees the game's nodes and disconnects (the menu takes over).
 func end_game() -> void:
 	Bridge.disconnect_from()
+	_welcome_sid = ""
+	_welcome_gf = ""
 	if _game == null:
 		return
+	if hud != null and is_instance_valid(hud):
+		hud.ui.model.flush_pedia_cache(true)
 	addons.game_ended()  # while the game's nodes are still there
+	WeatherState.clear()
 	backdrop_recorder.cancel()
 	backdrop_recorder.world = null
 	if rig != null and rig.first_person:
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	if distant_horizon != null and is_instance_valid(distant_horizon):
+		distant_horizon.finish_all()
+	ItemModels.wait_all()  # (item models' reads on workers: never claimed for items not asked for again)
 	_game.queue_free()
 	_game = null
+	Settings.in_menu = true  # back in the front end: the menu's FPS cap
+	Engine.max_fps = Settings.fps_limit()
 	world = null
+	distant_horizon = null
 	movers = null
+	pollution = null
+	god_rays = null
 	belt_items = null
 	ground_items = null
 	decoratives = null
@@ -733,6 +874,8 @@ func end_game() -> void:
 	# The space sky belonged to the freed environment.
 	_space_material = null
 	_space = false
+	Settings.set_camera_orthographic(false, get_tree().root)
+	_space_platform = 0
 	_planet_sky = null
 	_planet_sky_res = null
 	_space_sky = null
@@ -795,20 +938,39 @@ func _on_setting_changed(section: String, key: String) -> void:
 	# Game or not: the menu's model preview follows Packs' own shading too (a game's Looks settles it again).
 	if section == "graphics" and key == "pack_shading":
 		Looks.apply_pack_shading()
+	if section == "graphics" and key == "pack_tiles":
+		ModelLibrary.ModelPacks.set_tiles_on(ModelLibrary.ModelPacks.arg_on("--pack-tiles") and bool(Settings.get_value("graphics", "pack_tiles")))
+	if section == "graphics" and key == "pack_decoratives":
+		ModelLibrary.ModelPacks.set_decor_on(ModelLibrary.ModelPacks.arg_on("--pack-decoratives") and bool(Settings.get_value("graphics", "pack_decoratives")))
+	if section == "graphics" and key == "decor_models":
+		ModelLibrary.ModelPacks.set_decor_models_on(ModelLibrary.ModelPacks.arg_on("--decor-models") and bool(Settings.get_value("graphics", "decor_models")))
 	if section == "interface" and key in MENU_ONLY_SETTINGS:
 		return
 	if section in ["graphics", "interface", "camera"]:
 		_apply_game_settings()
+	if section == "graphics" and (key == "antialiasing" or key == "look"):
+		Settings.apply_antialiasing(get_tree().root)
+	# The upscaler and anything that changes the 3D scale apply live (FSR 2.2 takes anti-aliasing over).
+	if section == "graphics" and key in UPSCALER_SETTINGS:
+		Settings.apply_window_scales(get_tree().root)
+		Settings.apply_antialiasing(get_tree().root)
+
+
+## Graphics settings that change the 3D scaling mode, scale or sharpness (Settings.apply_window_scales).
+const UPSCALER_SETTINGS := ["upscaler", "upscaler_sharpness", "render_scale", "resolution", "window_mode"]
+
+
+func _on_camera_projection_changed(ortho: bool) -> void:
+	Settings.set_camera_orthographic(ortho, get_tree().root)
 
 
 ## Zenith's clouds: the Clouds setting, unless the look in use draws its own.
 ## A look with passes switched on in a running game: a saved MSAA becomes SMAA (Settings.MSAA_UNDER_LOOK)
-## and is applied, and a message says so.
+## and is applied, and a message says so; leaving one restores the configured AA right away.
 func _note_look_antialiasing(_look := "") -> void:
-	if not Settings._addons_started or not Settings.switch_msaa_for_look():
-		return
+	var switched := Settings._addons_started and Settings.switch_msaa_for_look()
 	Settings.apply_antialiasing(get_tree().root)
-	if hud != null:
+	if switched and hud != null:
 		hud.show_message("Anti-aliasing: SMAA in place of MSAA, which the look in use breaks at every edge.")
 
 
@@ -844,9 +1006,24 @@ func _apply_game_settings() -> void:
 	_apply_clouds()
 	Probing.add("gs_clouds", tp)
 	tp = Time.get_ticks_usec()
-	ModelLods.apply_quality(str(Settings.get_value("graphics", "lod_quality")), get_viewport())
-	Visuals.set_ground_relief(str(Settings.get_value("graphics", "lod_quality")) != "low")
+	var lod_q := str(Settings.get_value("graphics", "lod_quality"))
+	var lod_dist := float(Settings.get_value("graphics", "lod_distance"))
+	ModelLods.apply_quality(lod_q, get_viewport(), lod_dist)
+	BeltLods.apply_lod_quality(lod_q, lod_dist)
+	BeltItemLayer.ItemCards.apply_lod_quality(lod_q, lod_dist)
+	if belt_lanes != null:
+		belt_lanes.apply_lod_quality(lod_q, lod_dist)
+	Visuals.set_ground_relief(lod_q != "low")
 	world.far_chunks.enabled = bool(Settings.get_value("graphics", "merge_far"))
+	if CliffWall.set_on(bool(Settings.get_value("graphics", "cliff_wall"))):
+		world.cliff_wall_changed()
+	WeaponFx.set_tracers(bool(Settings.get_value("graphics", "bullet_tracers")))
+	WeaponFx.CombatLights.set_strength(float(Settings.get_value("graphics", "combat_light_strength")))
+	lamps.apply_lod_quality(lod_q, lod_dist)
+	lamps.set_far_lights_enabled(bool(Settings.get_value("graphics", "far_lights")))
+	signal_lights.apply_lod_quality(lod_q, lod_dist)
+	signal_lights.set_far_lights_enabled(bool(Settings.get_value("graphics", "far_lights")))
+	working_glow.apply_lod_quality(lod_q, lod_dist)
 	var animate_cards := bool(Settings.get_value("graphics", "animate_mod_buildings"))
 	if SpriteStandins.animate != animate_cards:
 		SpriteStandins.animate = animate_cards
@@ -865,7 +1042,7 @@ func _apply_game_settings() -> void:
 	Bridge.decorative_distance = int(decoratives.distance)
 	Bridge.mod_windows = bool(Settings.get_value("interface", "mod_windows"))
 	Bridge.factorio_player = Paths.factorio_player_name()  # L13: who plays this character from Factorio
-	InserterArmLayer.read_flags(OS.get_cmdline_user_args())
+	InserterArmLayer.read_flags(Switches.args())
 	Bridge.inserter_events = InserterArmLayer.hello_ie()
 	Bridge.inserter_handoff = InserterArmLayer.wants_handoff()
 	Probing.add("gs_decoratives", tp)
@@ -876,7 +1053,36 @@ func _apply_game_settings() -> void:
 	hud.help.visible = bool(Settings.get_value("interface", "show_help"))
 	hud.ui.debug_overlay = bool(Settings.get_value("interface", "debug_overlay"))
 	rig.apply_settings()
+	_apply_render_distance()
 	Probing.add("gs_rest", tp)
+
+
+## Applies the Render distance: separate View distance (full) + Distant horizon (default), or, with Manual horizon
+## split off, the unified Render distance + Level of detail auto-balancing, across
+## real chunks (`world.view_radius`), `far_chunks`, `distant_horizon`, camera far plane, and fog scale.
+func _apply_render_distance() -> void:
+	var dh_cli := DistantHorizon.cli_override()
+	var rd := RenderDistance.from_settings(dh_cli)
+	var real_r := clampi(int(ups_governor.limit("view", float(rd["real_radius"]))), 1, WorldMirror.MAX_VIEW_RADIUS)
+	world.view_radius = real_r
+	if world.far_chunks != null:
+		world.far_chunks.apply_lod_scale(float(rd["far_merge_scale"]))
+	var eff := RenderDistance.with_governed_real(rd, real_r, dh_cli)
+	if distant_horizon != null:
+		distant_horizon.enabled = bool(eff["dh_enabled"])
+		distant_horizon.radius_chunks = int(eff["dh_radius"])
+		distant_horizon.quality = str(eff["dh_quality"])
+		distant_horizon.dropoff = str(eff["dh_dropoff"])
+		distant_horizon.detail_lod_enabled = bool(dh_cli["detail_lod_enabled"]) if dh_cli.has("detail_lod_enabled") else true
+		distant_horizon.glow_enabled = bool(dh_cli["glow_enabled"]) if dh_cli.has("glow_enabled") else bool(Settings.get_value("graphics", "distant_horizon_glow"))
+		distant_horizon.inner_chunks = mini(real_r + WorldMirror.warm_rings + DistantHorizon.LAYOUT_HYSTERESIS + 2, DistantHorizon.MASK_SIZE / 2 - 4)
+		if rig != null and rig.camera != null:
+			rig.camera.far = maxf(distant_horizon.desired_camera_far(), FullDetail.FAR if FullDetail.is_on() else 2000.0)
+		if looks != null:
+			looks.fog_distance_scale = 1.0 if (not distant_horizon.enabled or distant_horizon.radius_chunks <= 50) else clampf(50.0 / float(distant_horizon.radius_chunks), 0.12, 1.0)
+	else:
+		if looks != null:
+			looks.fog_distance_scale = 1.0
 
 
 ## Every distance and rate the bridge works for in the game's tick, under the player's own setting
@@ -887,8 +1093,8 @@ func _apply_game_settings() -> void:
 func _apply_held() -> void:
 	var tp := Time.get_ticks_usec()
 	var held := ups_governor
-	world.view_radius = clampi(int(held.limit("view", float(Settings.get_value("graphics", "view_radius")))), 1, WorldMirror.MAX_VIEW_RADIUS)
-	belt_lanes.distance = clampi(int(held.limit("far", float(Settings.get_value("graphics", "belt_distance")))), 0, 640)
+	_apply_render_distance()
+	belt_lanes.distance = clampi(int(held.limit("far", float(Settings.get_value("graphics", "belt_distance")))), 0, Settings.VIEW_RADIUS_MAX * 32)
 	# Items move as far out as the cap allows, within the distance (an add-on may ask for less: near).
 	belt_lanes.near = clampi(int(held.limit("near", float(belt_lanes.distance))), 0, BeltLaneLayer.MOVING_MAX)
 	belt_lanes.cap = BeltLaneLayer.cap_of(held.limit("updates", BeltLaneLayer.cap_wanted(float(Settings.get_value("graphics", "belt_updates")))))
@@ -896,7 +1102,7 @@ func _apply_held() -> void:
 	belt_lanes.smooth = bool(Settings.get_value("graphics", "belt_smooth")) and held.limit("smooth", 1.0) >= 1.0
 	Probing.add("gs_held_belts", tp)
 	tp = Time.get_ticks_usec()
-	world.set_focus_radius(clampi(int(held.limit("entity", float(Settings.get_value("graphics", "entity_radius")))), 16, 256))
+	world.set_focus_radius(clampi(int(held.limit("entity", float(Settings.get_value("graphics", "entity_radius")))), 16, Settings.VIEW_RADIUS_MAX * 32))
 	hud.ui.map_cache.refresh_scale = held.limit("map", 1.0)
 	Bridge.set_update_rate(int(held.limit("rate", 0.0)))
 	Settings.fps_hold = int(held.limit("fps", 0.0))
@@ -924,7 +1130,7 @@ func _save_screenshot_later(path: String, delay: float) -> void:
 	# A still picture shows nothing moving: belts drawn without their motion smear.
 	BeltBlur.sharp_frames(4)
 	# --clean-shot: just the world, for model screenshots (the character stands on the model).
-	if OS.get_cmdline_user_args().has("--clean-shot") and _game != null:
+	if Switches.has("--clean-shot") and _game != null:
 		Input.mouse_mode = Input.MOUSE_MODE_HIDDEN
 		InterfaceState.set_hidden(&"clean_shot", true, get_tree())  # the icons over entities too
 		hud.visible = false
@@ -960,7 +1166,7 @@ var _came_from_factorio := false
 ## at once with its loading screen, or the key looks dead meanwhile. Factorio stays as it is until
 ## the welcome (it is minimised then), in case Zenith can't join.
 func _forward_while_joining() -> void:
-	if not "--from-factorio" in OS.get_cmdline_user_args() or DisplayServer.get_name() == "headless":
+	if not Switches.has("--from-factorio") or DisplayServer.get_name() == "headless":
 		return
 	await get_tree().process_frame
 	await get_tree().process_frame
@@ -1089,13 +1295,27 @@ func _on_welcome(msg: Dictionary) -> void:
 	if not Bridge.server_on_this_pc():
 		_tell_missing_mods()
 	# Started by Ctrl+F9 in Factorio (server/factorio-with-zenith.ps1): come to the front over it.
-	if "--from-factorio" in OS.get_cmdline_user_args() and not _came_from_factorio:
+	if Switches.has("--from-factorio") and not _came_from_factorio:
 		_came_from_factorio = true
 		GameSwap.show_client(bool(Settings.get_value("factorio", "minimize_factorio")))
-	# A new handshake (maybe another game): the map's stamps no longer say what the bridge has (`map` h).
-	hud.ui.model.map_stamps.clear()
-	world.reset()
+	# A new handshake: keep map & chunk caches on same-save reconnects/respawns, and reload
+	# Factoriopedia's cached static index/pages by mod-graphics fingerprint (`gf`).
+	var sid := str(msg.get("sid", ""))
+	var gf := str(msg.get("gf", ""))
+	var same_save := sid != "" and sid == _welcome_sid and gf != "" and gf == _welcome_gf
+	_welcome_sid = sid
+	_welcome_gf = gf
+	hud.ui.model.set_pedia_fingerprint(gf)
+	if distant_horizon != null:
+		distant_horizon.finish_all()
+	if not same_save:
+		hud.ui.map_cache.reset()
+		world.reset()
+	else:
+		world.reset(false, int(msg.get("si", -1)), true)
 	world.surface_index = int(msg.get("si", -1))
+	if distant_horizon != null:
+		distant_horizon.configure(sid, maxi(1, int(msg.get("si", 1))), null)
 	world.replay_dec = decoratives.handle
 	movers.reset()
 	belt_items.reset()
@@ -1104,11 +1324,16 @@ func _on_welcome(msg: Dictionary) -> void:
 	ground_items.reset()
 	decoratives.reset()
 	arms.reset()
+	signal_lights.reset()
 	working_glow.reset()
 	fluids_power.reset()
 	wires.reset()
 	ghosts.reset()
-	pollution.clear()
+	remote_fog.reset()
+	if same_save:
+		pollution.set_surface(world.surface_index, true)
+	else:
+		pollution.configure(sid, world.surface_index)
 	predicted.reset()
 	combat.reset()
 	fx.reset()
@@ -1118,6 +1343,7 @@ func _on_welcome(msg: Dictionary) -> void:
 	quality_marks.reset()
 	hud.reset()
 	avatar.unit = int(msg.get("u", 0))
+	_viewing_away = false
 	avatar.heard_me = false  # the character's state is known again from its first `me` (api.character)
 	movers.puppet_unit = avatar.unit
 	avatar.snap_to(Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0)
@@ -1127,10 +1353,14 @@ func _on_welcome(msg: Dictionary) -> void:
 	platform_panel.reset()
 	# From the start, not only after a trip: launches on other planets aren't drawn on this one.
 	rockets.surface = str(msg.get("surface", ""))
-	platform_panel.surface_changed(int(msg.get("pf", 0)), str(msg.get("planet", "")))
+	var pf := int(msg.get("pf", 0))
+	platform_panel.surface_changed(pf, str(msg.get("planet", "")))
+	_space_platform = pf
 	_planet_sky.set_planet(str(msg.get("planet", "nauvis")))
-	fx.set_planet(str(msg.get("planet", "nauvis")), int(msg.get("pf", 0)) > 0)
-	_set_space(int(msg.get("pf", 0)) > 0)
+	fx.set_planet(str(msg.get("planet", "nauvis")), pf > 0)
+	_set_space(pf > 0)
+	if same_save and not _space and hud.ui.model.shown_surface() == world.surface_index:
+		pollution.sync_map_pollution(hud.ui.model.map_pollution)
 	var mode := "server" if msg.get("mp", false) else "single-player"
 	hud.show_message("Connected to Factorio (%s, surface %s)" % [mode, str(msg.get("surface", "?"))])
 
@@ -1140,17 +1370,21 @@ func _on_welcome(msg: Dictionary) -> void:
 func _on_surface(msg: Dictionary) -> void:
 	world.reset(true, int(msg.get("si", -1)))
 	world.surface_index = int(msg.get("si", -1))
+	if distant_horizon != null:
+		distant_horizon.reset_surface(maxi(1, int(msg.get("si", 1))), world.protos if Bridge.world_ready else null, FarChunks._bakes)
 	movers.reset()
 	belt_items.reset()
 	belt_lanes.reset()
 	ground_items.reset()
 	decoratives.reset(true)  # the ids stay: no `dprotos` for a surface
 	arms.reset()
+	signal_lights.reset()
 	working_glow.reset()
 	fluids_power.reset()
 	wires.reset()
 	ghosts.reset()
-	pollution.clear()
+	remote_fog.reset()
+	pollution.set_surface(world.surface_index, true)
 	predicted.reset()
 	combat.reset()
 	fx.reset()
@@ -1161,11 +1395,11 @@ func _on_surface(msg: Dictionary) -> void:
 	quality_marks.reset()
 	hud.screen.close_local()
 	hud.set_mining(-1)
-	hud.ui.map_cache.reset()
 	var at := Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0
 	# `view`: the remote view looks at another surface; the character stays where it is, unseen.
 	var viewing := int(msg.get("view", 0)) == 1
 	avatar.visible = not viewing
+	_viewing_away = viewing
 	if viewing:
 		hud.ui.model.set_map_surface(int(msg.get("si", 0)))
 		world.set_focus(at)
@@ -1177,11 +1411,23 @@ func _on_surface(msg: Dictionary) -> void:
 			rig.global_position = avatar.global_position
 		world.set_focus(avatar.ground_position())
 	var pf := int(msg.get("pf", 0))
-	platform_panel.surface_changed(pf, str(msg.get("planet", "")))
+	if not viewing:
+		platform_panel.surface_changed(pf, str(msg.get("planet", "")))
+	_space_platform = pf
 	_planet_sky.set_planet(str(msg.get("planet", "nauvis")))
 	fx.set_planet(str(msg.get("planet", "nauvis")), pf > 0)
 	_set_space(pf > 0)
+	if not _space and hud.ui.model.shown_surface() == world.surface_index:
+		pollution.sync_map_pollution(hud.ui.model.map_pollution)
 	hud.show_message("Now on %s" % (str(msg.get("surface", "?")) if pf > 0 else LocaleNames.space_location(str(msg.get("planet", msg.get("surface", "?"))))))
+
+
+func _on_map_pollution_changed(chunk: Vector2i) -> void:
+	if pollution == null or world == null or hud == null or _space:
+		return
+	var m = hud.ui.model
+	if m != null and m.shown_surface() == world.surface_index:
+		pollution.ingest_chart_pollution(chunk, float(m.map_pollution.get(chunk, 0)))
 
 
 func _on_message(msg: Dictionary) -> void:
@@ -1193,12 +1439,16 @@ func _on_message(msg: Dictionary) -> void:
 			avatar.update_from(ride.handle_me(msg))
 			movers.puppet_unit = avatar.unit
 			movers.driven = avatar.vehicle
+			movers.avatar_pos = avatar.position
 			hud.set_mining(avatar.mining)
 			hud.set_health(avatar.health, avatar.max_health)
 			hud.set_shield(int(msg.get("sd", 0)), int(msg.get("msd", 0)))
 			hud.ui.death_screen.alive()
 		"mv":
 			movers.handle(msg)
+		"rb":
+			if Bridge.world_ready:
+				movers.handle_robots(msg)
 		# Live state is sent at once, but on a real game the prototype dictionaries take several
 		# ticks to arrive; an item drawn before its name is known would never get its icon.
 		"bs":
@@ -1255,13 +1505,17 @@ func _on_message(msg: Dictionary) -> void:
 			combat.handle_died(msg)
 			var dead = world.protos.entity(int(msg.get("p", 0)))
 			if dead != null:
-				movers.creatures.died_at(dead.name, Vector3(int(msg.get("x", 0)) / 256.0, 0.0, int(msg.get("y", 0)) / 256.0))
+				var cause: Variant = Vector3(int(msg["cx"]) / 256.0, 0.0, int(msg["cy"]) / 256.0) if msg.has("cx") and msg.has("cy") else null
+				var dt := str(msg.get("dt", ""))
+				var dmg := int(msg.get("dmg", 0))
+				var src := str(msg.get("src", ""))
+				movers.creatures.died_at(dead.name, Vector3(int(msg.get("x", 0)) / 256.0, 0.0, int(msg.get("y", 0)) / 256.0), cause, dt, int(msg.get("u", 0)), dmg, src)
 		"en":
 			movers.creatures.handle_attacks(msg)
 			fx.weapons.prewarm_fights()
 			movers.creatures.prewarm()
 		"guns":
-			hud.set_guns(int(msg.get("sel", 1)), _array(msg.get("l")), int(msg.get("v", 0)))
+			hud.set_guns(int(msg.get("sel", 1)), Wire.array(msg.get("l")), int(msg.get("v", 0)))
 		"fl", "pw", "ht":
 			if Bridge.world_ready:
 				fluids_power.handle(msg)
@@ -1288,22 +1542,31 @@ func _on_message(msg: Dictionary) -> void:
 		"raise":
 			GameSwap.show_client(bool(Settings.get_value("factorio", "minimize_factorio")))
 		"cov":
-			remote_fog.handle(msg)
+			if int(msg.get("si", -1)) == world.surface_index or world.surface_index < 0:
+				remote_fog.handle(msg)
 		"pol":
 			if int(msg.get("si", -1)) == world.surface_index or world.surface_index < 0:
 				pollution.handle(msg)
+		"pols":
+			if int(msg.get("si", -1)) == world.surface_index or world.surface_index < 0:
+				pollution.handle_sparse(msg)
+		"lodm", "lodr", "lod":
+			if msg.get("t") == "lod" and msg.has("pol") and not _space and (int(msg.get("si", -1)) == world.surface_index or world.surface_index < 0):
+				pollution.ingest_chart_pollution(Vector2i(int(msg.get("cx", 0)), int(msg.get("cy", 0))), float(msg.get("pol", 0)))
+			if distant_horizon != null:
+				distant_horizon.handle(msg)
 		"plat":
 			platform_panel.handle(msg)
 			if msg.has("k"):
-				planet_spin.heard(float(msg["k"]), _array(msg.get("days")))
-			_show_planet_for(platform_panel.current())
+				planet_spin.heard(float(msg["k"]), Wire.array(msg.get("days")))
+			_show_planet_for(_sky_platform())
 		"sky":
 			_sky_daytime = int(msg.get("d", 0)) / 1000.0
 			_sky_darkness = int(msg.get("n", 0)) / 1000.0
 		"inv":
-			hud.set_inventory(_array(msg.get("l")))
+			hud.set_inventory(Wire.array(msg.get("l")))
 		"recipes":
-			hud.set_recipes(_array(msg.get("l")))
+			hud.set_recipes(Wire.array(msg.get("l")))
 		"gui":
 			hud.screen.handle(msg)
 		"msg":
@@ -1357,18 +1620,60 @@ func _on_connection_lost() -> void:
 func _process(delta: float) -> void:
 	if _game == null:
 		return
-	world.set_focus(rig.focus_point())
-	belt_lanes.focus = rig.focus_point()
+	if hud != null:
+		hud.ui.model.flush_pedia_cache(false)
+	var char_focus := rig.focus_point()
+	var cam_lod := ViewPriority.lod_by_camera(rig)
+	world.set_focus(char_focus)
+	# Gates open for the character, not for the focus an add-on's camera moves (anim.gd, --gate-open=old).
+	world.animator.character_at = avatar.ground_position() if avatar.unit != 0 and not _viewing_away else Vector2.INF
+	world.lod_by_camera = cam_lod
+	ContactShade.update_anchor(char_focus, not cam_lod)
+	BeltItemLayer.ItemCards.update_contact_anchor(Vector3(char_focus.x, 0.0, char_focus.y), not cam_lod)
+	belt_lanes.focus = char_focus
 	belt_lanes.covered = belt_items.covered()
 	# An add-on's camera, first person, the remote view: the models go to what that camera sees.
 	belt_items.view_led = ViewPriority.camera_led(rig)
 	# Factorio's remote view: dark fog where no radar sees, and nothing drawn there.
 	world.set_remote_view(hud.ui.remote)
-	remote_fog.update(hud.ui.remote, rig.focus_point())
-	pollution.update(rig.focus_point(), _sky_darkness, delta)
+	remote_fog.update(hud.ui.remote, char_focus)
 	_update_sky(delta)
 	_update_planet(delta)
 	_sync_sky_view()
+	var atmo := _planet_sky.atmosphere()
+	var look_clouds := looks.cloud_source()
+	if not look_clouds.is_empty():
+		atmo.merge(look_clouds, true)
+	atmo["ambient_color"] = _env.ambient_light_color if _env != null else Color(0.75, 0.78, 0.82)
+	atmo["space"] = _space
+	atmo["scene_light"] = looks.scene_now
+	pollution.update(char_focus, _sky_darkness, delta, atmo)
+	god_rays.update(atmo, pollution.strength())
+	if distant_horizon != null:
+		distant_horizon.set_pollution_far(pollution.far_texture(), pollution.far_rect(), pollution.far_version())
+		if Bridge.world_ready and distant_horizon.enabled and distant_horizon.radius_chunks > 0:
+			distant_horizon.ensure_palette_and_cache(world.protos, FarChunks._bakes)
+			distant_horizon.refresh_palette_if_needed(world.protos, FarChunks._bakes, delta)
+		var dh_cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+		if dh_cam == null and rig != null:
+			dh_cam = rig.camera
+		if distant_horizon.enabled and distant_horizon.radius_chunks > 0:
+			var min_far := distant_horizon.desired_camera_far()
+			if dh_cam != null and dh_cam.far < min_far:
+				dh_cam.far = min_far
+			if rig != null and rig.camera != null and rig.camera.far < min_far:
+				rig.camera.far = min_far
+		var dh_night := clampf(_darkness / 0.85, 0.0, 1.0)
+		if _planet_sky.forced_daytime >= 0.0:
+			dh_night = clampf(PlanetSky.darkness_at(_planet_sky.forced_daytime) / 0.85, 0.0, 1.0)
+		var dh_hide_ok := false
+		if world != null:
+			var dh_vp := get_viewport() if is_inside_tree() else null
+			dh_hide_ok = not world.remote_view and not ModelLods.full_detail \
+				and (world.behind_cull == null or not world.behind_cull.other_view_open()) \
+				and not (dh_vp != null and dh_vp.use_xr)
+		distant_horizon.update(dh_cam, _env.background_color, dh_night, _space,
+			Vector3.INF if cam_lod else Vector3(char_focus.x, 0.0, char_focus.y), dh_hide_ok)
 	_status_timer += delta
 	if _status_timer >= 0.5:
 		_update_status(_status_timer)
@@ -1502,6 +1807,7 @@ func _build_environment() -> void:
 	ao_zoom = AoZoom.new()
 	ao_zoom.name = "AoZoom"
 	ao_zoom.env = env
+	ao_zoom.rig = rig
 	ao_zoom.process_priority = 100  # after the looks and the sky have set this frame's environment
 	_game.add_child(ao_zoom)
 
@@ -1544,6 +1850,14 @@ const PLANET_TILT_BEHIND := 0.5
 const PLANET_EASE := 3.0
 
 
+## The platform whose sky the 3D view draws: the one shown on screen (whether the character is
+## on board or looking at it in the remote view), or {} on a planet.
+func _sky_platform() -> Dictionary:
+	if _space_platform <= 0 or platform_panel == null:
+		return {}
+	return platform_panel.platforms.get(_space_platform, {})
+
+
 ## Space behind a platform, or the planet's sky.
 func _set_space(on: bool) -> void:
 	_space = on
@@ -1557,7 +1871,7 @@ func _set_space(on: bool) -> void:
 			_space_sky.process_mode = Sky.PROCESS_MODE_INCREMENTAL
 		_env.sky = _space_sky
 		_sky_planet = "\n"  # none yet: the first update places it without gliding
-		_show_planet_for(platform_panel.current())
+		_show_planet_for(_sky_platform())
 	else:
 		_env.sky = _planet_sky_res
 
@@ -1590,6 +1904,8 @@ func _update_planet(delta: float) -> void:
 	planet_spin.advance(delta)
 	if not _space or _space_material == null or _sky_planet == "":
 		return
+	if _planet_tasks.has(_sky_planet) and WorkerThreadPool.is_task_completed(int(_planet_tasks[_sky_planet])):
+		_show_planet(_sky_planet)
 	var want := _sky_goal + _sky_rate * minf((Time.get_ticks_msec() - _sky_goal_msec) / 1000.0, 2.0)
 	if _sky_goal <= 0.0:
 		want = minf(want, 0.0)  # it may stop there: only an update takes it past
@@ -1597,6 +1913,7 @@ func _update_planet(delta: float) -> void:
 	_pose_planet()
 	_space_material.set_shader_parameter("planet_spin", planet_spin.turns(_sky_planet))
 	_space_material.set_shader_parameter("planet_cloud_spin", planet_spin.cloud_turns(_sky_planet))
+	_space_material.set_shader_parameter("planet_cloud_flow_t", planet_spin.cloud_flow())
 	if _sun != null:
 		_space_material.set_shader_parameter("planet_sun", _sun.global_transform.basis.z.normalized())
 
@@ -1665,6 +1982,12 @@ func _show_planet(location: String) -> void:
 	_space_material.set_shader_parameter("planet_map_on", 1.0 if maps.has("map") else 0.0)
 	_space_material.set_shader_parameter("planet_clouds_on", 1.0 if maps.has("clouds") else 0.0)
 	_space_material.set_shader_parameter("planet_emission_on", 1.0 if maps.has("emission") else 0.0)
+	_space_material.set_shader_parameter("planet_cloud_look", 0.0 if planet_clouds_old else 1.0)
+	_space_material.set_shader_parameter("planet_cloud_flow_on", 1.0 if maps.has("cloud_flow") else 0.0)
+	_space_material.set_shader_parameter("planet_cloud_normal_on", 1.0 if maps.has("cloud_normal") else 0.0)
+	var look: Dictionary = PLANET_CLOUDS.get(location, PLANET_CLOUDS_OTHER)
+	for key in ["cover", "tint", "style"]:
+		_space_material.set_shader_parameter("planet_cloud_" + key, look[key])
 	for key in maps:
 		_space_material.set_shader_parameter("planet_" + str(key), maps[key])
 
@@ -1709,13 +2032,24 @@ static func planet_maps_soon(location: String) -> Dictionary:
 
 static func _load_planet_maps(location: String, base: String) -> void:
 	var images := {}
-	for pair in [["map", ""], ["clouds", "-cloud"], ["emission", "-emission"]]:
+	var pairs := [["map", ""], ["clouds", "-cloud"], ["emission", "-emission"]]
+	if not planet_clouds_old:
+		# The layered clouds' flow and relief (Factorio's own, beside the cloud map).
+		pairs.append_array([["cloud_flow", "-cloud-flow"], ["cloud_normal", "-cloud-normal"]])
+	for pair in pairs:
 		var path: String = base + str(pair[1]) + ".png"
 		if not FileAccess.file_exists(path):
 			continue
 		var image := Image.load_from_file(path)
 		if image == null or image.is_empty():
 			continue
+		if not planet_clouds_old:
+			# Some cloud maps are grey and alpha, some colour and alpha: all RGBA, so the shader
+			# reads colour and alpha alike; the flow needs only its two channels.
+			if pair[0] == "clouds" and image.get_format() != Image.FORMAT_RGBA8:
+				image.convert(Image.FORMAT_RGBA8)
+			elif pair[0] == "cloud_flow" and image.get_format() != Image.FORMAT_RG8:
+				image.convert(Image.FORMAT_RG8)
 		image.generate_mipmaps()
 		images[pair[0]] = image
 	_planet_lock.lock()
@@ -1748,6 +2082,38 @@ func _is_planet(location: String) -> bool:
 	return false
 
 
+func _on_world_chunk_drawn(c: Vector2i) -> void:
+	if distant_horizon == null:
+		return
+	var cv = world.chunks.get(c)
+	if cv == null or not cv.revealed:
+		return
+	if cv.visible:
+		distant_horizon.set_chunk_loaded(c, true, false, DistantHorizon.MASK_GRACE_FRAMES)
+	if distant_horizon.enabled and distant_horizon.radius_chunks > 0 and Bridge.world_ready:
+		if cv.tile_ids.size() == WorldMirror.CHUNK * WorldMirror.CHUNK:
+			distant_horizon.bake_world_chunk(c.x, c.y, world.chunk_rev(c), cv.tile_ids, cv.entities, world.protos)
+
+
+func _on_world_chunk_unloaded(c: Vector2i) -> void:
+	if distant_horizon == null:
+		return
+	var cv = world.chunks.get(c) if world != null else null
+	if cv != null and cv.tile_ids.size() == WorldMirror.CHUNK * WorldMirror.CHUNK and Bridge.world_ready:
+		distant_horizon.prepare_unload_takeover(c, world.chunk_rev(c), cv.tile_ids, cv.entities, world.protos)
+	else:
+		distant_horizon.prepare_unload_takeover(c)
+
+
+func _on_chunk_visibility_changed(c: Vector2i, drawn: bool) -> void:
+	if distant_horizon == null:
+		return
+	if not drawn:
+		distant_horizon.set_chunk_loaded(c, false)
+	elif world != null and world.chunk_is_drawn_visible(c):
+		distant_horizon.set_chunk_loaded(c, true, false, DistantHorizon.MASK_GRACE_FRAMES)
+
+
 ## Eases towards the game's time of day (it only arrives once a second) and lights the scene
 ## for it: the sun's height and colour, ambient light and sky, the character's light, lamps.
 func _update_sky(delta: float) -> void:
@@ -1764,6 +2130,7 @@ func _update_sky(delta: float) -> void:
 	_planet_sky.twilight = looks.twilight()
 	_planet_sky.sky_twilight = looks.sky_twilight()
 	_planet_sky.noon_yaw = looks.noon_yaw(PlanetSky.YAW_NOON)
+	WeatherState.advance(delta, _space)
 	_planet_sky.apply(_env, _sun, _daytime, night, delta, _space)
 	# Night vision equipment: Factorio's turns on past half darkness while it has power and lifts
 	# the night with its colour lookup (a brighter, greener picture). The look adds it before the debug
@@ -1774,9 +2141,12 @@ func _update_sky(delta: float) -> void:
 	looks.apply(_daytime, night, _planet_sky.planet, _space, _planet_sky.state)
 	_night_vision_feedback(nv_on)
 	avatar.set_night(night)
-	movers.set_night(night)
+	var wx_now: Dictionary = WeatherState.state if (WeatherState.active and not _space) else {}
+	movers.set_night(VehicleLights.screen_night(night, wx_now))
 	lamps.darkness = _darkness
 	lamps.focus = rig.focus_point()
+	signal_lights.darkness = _darkness
+	signal_lights.focus = lamps.focus
 
 
 ## Night vision's feedback: the equipment's own activate / deactivate sound when it switches (from the
@@ -1823,7 +2193,3 @@ func _sync_sky_view() -> void:
 		if ortho:
 			m.set_shader_parameter("view_basis", cam.global_transform.basis.orthonormalized())
 			m.set_shader_parameter("view_tan", view_tan)
-
-
-static func _array(v) -> Array:
-	return v if v is Array else []

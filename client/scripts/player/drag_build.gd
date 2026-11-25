@@ -39,6 +39,7 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const VisualTurns := preload("res://scripts/world/visual_turns.gd")
 const Predicted := preload("res://scripts/world/predicted.gd")
 const UndergroundPairs := preload("res://scripts/world/underground_pairs.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const DIRS := {Vector2i(0, -1): 0, Vector2i(1, 0): 4, Vector2i(0, 1): 8, Vector2i(-1, 0): 12}
 const UNDERGROUND_TYPES := ["underground-belt", "pipe-to-ground"]
@@ -47,7 +48,7 @@ const UNDERGROUND_TYPES := ["underground-belt", "pipe-to-ground"]
 ## keeps the line straight.
 const TURN_SLACK := 2
 ## N5: walls follow the cursor's path; `--wall-drag=line` holds them to one line as before.
-static var walls_follow := not ("--wall-drag=line" in OS.get_cmdline_user_args())
+static var walls_follow := not (Switches.has("--wall-drag=line"))
 
 ## player_input (world, hud, build_dir, _blocked, _remember); untyped to keep the scripts apart.
 var pi: Node
@@ -647,6 +648,10 @@ func _send_at(item: String, at: Vector2, dir: int) -> void:
 			cmd["hs"] = hs
 	Bridge.send(cmd)
 	sent.append(cmd)
+	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
+	var is_under := proto != null and UndergroundPairs.is_underground(proto.type)
+	var under_pos := Vector2(pi._snap(at.x, 1), pi._snap(at.y, 1)) if is_under else Vector2.ZERO
+	var will_place_under := is_under and _can_place_under(proto, under_pos, _ghost)
 	if not cmd.has("ghost"):
 		pi._remember({"do": "build", "item": item, "x": at.x, "y": at.y, "d": dir})
 		_spend(item, at, dir)
@@ -656,6 +661,11 @@ func _send_at(item: String, at: Vector2, dir: int) -> void:
 		if look != null:
 			# K21: the game puts it down unturned; it keeps the cursor's turn once its `add` comes.
 			VisualTurns.expect(look.id, Vector2(pi._snap(at.x, look.tile_size.x), pi._snap(at.y, look.tile_size.y)), dir)
+	if will_place_under and pi.predicted != null:
+		_record_sent_under(proto, under_pos, dir, _ghost)
+	# Placing a pipe-to-ground flips the held cursor 180 degrees to face its connecting end.
+	if will_place_under and _proto != null and _proto.type == "pipe-to-ground" and item == _item:
+		pi.build_dir = posmod(dir + 8, 16)
 
 
 ## The building `item` places, when it is one Factorio can't turn (a furnace, a chest, a lab:
@@ -696,14 +706,43 @@ static func _snapped_size(proto: ProtoDB.EntityProto, dir: int) -> Vector2i:
 	return size
 
 
+## Whether an underground (real or ghost) sent at `pos` will place a piece there, rather than
+## being blocked, out of reach, or clicking an entity/ghost of the same prototype already at `pos`.
+func _can_place_under(proto: ProtoDB.EntityProto, pos: Vector2, ghost: bool) -> bool:
+	if proto == null or pi == null or pi.world == null:
+		return false
+	if pi.hud != null and pi.hud.ui != null and pi.hud.ui.model != null and pi.hud.ui.model.cant_build_reason(proto.id) != "":
+		return false
+	if pi._on_void(pos, Vector2i.ONE):
+		return false
+	if not ghost and not pi._bridge_reach(pos):
+		return false
+	if not (ghost and pi._lmb_super) and pi._blocked(proto, pos, Vector2i.ONE, true):
+		return false
+	var existing: WorldMirror.Rec = pi.world.pick(pos)
+	if existing != null and existing.pos.distance_squared_to(pos) < 0.01:
+		if existing.proto_id == proto.id or (existing.extra.has("gh") and int(existing.extra["gh"]) == proto.id):
+			return false
+	if pi.predicted != null:
+		for s: WorldMirror.Rec in pi.predicted.sent_undergrounds():
+			if s.proto_id == proto.id and s.pos.distance_squared_to(pos) < 0.01:
+				return false
+	return true
+
+
+func _record_sent_under(proto: ProtoDB.EntityProto, pos: Vector2, dir: int, ghost: bool) -> void:
+	var reach: int = pi._under_reach(proto)
+	var sent_u: Array = pi.predicted.sent_undergrounds()
+	var join := UndergroundPairs.held_join(pi.world, proto, pos, dir, reach, sent_u)
+	pi.predicted.sent_underground(proto, pos, dir, join.is_empty() or bool(join["far"]), ghost)
+
+
 ## M2: an underground (pipe-to-ground) completing a pair over a plain run of belts (pipes): the game mines the run with
 ## the build, so it is hidden at once (predicted.gd clear_run), as the cursor marked it (underground_pairs.gd
 ## cleared); shown again if the game keeps it. Only where the client's own check says the build goes (in reach); the
-## run is looked for before this build's own entity is in the world, as the cursor saw it. A drag's exit whose
-## entrance went in the same drag pairs with that entrance though its `add` hasn't come: each piece sent is kept
-## until the world has it (predicted.gd sent_underground), with the end the bridge will make it.
+## run is looked for before this build's own entity is in the world, as the cursor saw it.
 func _predict_clear(item: String, at: Vector2, dir: int) -> void:
-	if pi.predicted == null or pi.hud.ui.remote or not UndergroundPairs.clear_on:
+	if _ghost or pi.predicted == null or pi.hud.ui.remote or not UndergroundPairs.clear_on:
 		return
 	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
 	if proto == null or not UndergroundPairs.is_underground(proto.type):
@@ -713,12 +752,10 @@ func _predict_clear(item: String, at: Vector2, dir: int) -> void:
 	if not pi._in_reach(at, size) or pi._blocked(proto, at, size, true):
 		return
 	var reach: int = pi._under_reach(proto)
-	var sent: Array = pi.predicted.sent_undergrounds()
-	var run := UndergroundPairs.cleared(pi.world, proto, at, dir, reach, sent)
+	var sent_u: Array = pi.predicted.sent_undergrounds()
+	var run := UndergroundPairs.cleared(pi.world, proto, at, dir, reach, sent_u)
 	if not run.is_empty():
 		pi.predicted.clear_run(run)
-	var join := UndergroundPairs.held_join(pi.world, proto, at, dir, reach, sent)
-	pi.predicted.sent_underground(proto, at, dir, join.is_empty() or bool(join["far"]))
 
 
 ## Shows what was just built at once (the latency layer, FFF #83), where the client's own check

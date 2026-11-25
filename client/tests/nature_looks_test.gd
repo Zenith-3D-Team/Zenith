@@ -42,6 +42,7 @@ func _init() -> void:
 	_shader()
 	_matte()
 	_synthetic_grain()
+	_disk_cache()
 	_dressed(dump)
 	# Loading the trees starts their leaf atlases and grain on workers, which _dressed waits for only
 	# with an install. Without one Godot quit with them still running and crashed on its way out, after
@@ -272,3 +273,42 @@ func _dressed(dump: String) -> void:
 			g.clear_mipmaps()
 			g.save_png(dump.path_join("gd-grain-%d.png" % i))
 		print("nature_looks_test: atlases and grain in ", dump)
+
+
+func _disk_cache() -> void:
+	var was_disk := NatureLooks.disk_cache
+	NatureLooks.disk_cache = true
+	var a_img := Image.create(32, 32, false, Image.FORMAT_RGBA8)
+	a_img.fill(Color(0.2, 0.6, 0.3, 0.9))
+	a_img.set_pixel(5, 7, Color(0.8, 0.4, 0.1, 1.0))
+	a_img.generate_mipmaps()
+	var a_hash := "test-atlas-hash-0123456789abcdef".sha256_text()
+	var a_path := NatureLooks._image_cache_path("nature-atlas", a_hash)
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(a_path))
+	var hits0 := NatureLooks.cache_hits
+	NatureLooks._write_image_cache(a_path, a_hash, [a_img])
+	var got_a := NatureLooks._read_image_cache(a_path, a_hash)
+	var miss_a := NatureLooks._read_image_cache(a_path, a_hash + "x")
+	check(got_a.size() == 1 and (got_a[0] as Image).has_mipmaps()
+		and (got_a[0] as Image).get_data() == a_img.get_data()
+		and NatureLooks.cache_hits == hits0 + 1 and miss_a.is_empty(),
+		"nature leaf atlas disk cache round-trips pixels, mipmaps, and misses on key mismatch")
+
+	var g1 := Image.create(16, 16, false, Image.FORMAT_RGBA8)
+	g1.fill(Color(0.4, 0.5, 0.6, 1.0))
+	g1.generate_mipmaps()
+	var g2 := Image.create(16, 16, false, Image.FORMAT_RGBA8)
+	g2.fill(Color(0.7, 0.3, 0.2, 1.0))
+	g2.generate_mipmaps()
+	var g_hash := "test-grain-hash-0123456789abcdef".sha256_text()
+	var g_path := NatureLooks._image_cache_path("nature-grain", g_hash)
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(g_path))
+	NatureLooks._write_image_cache(g_path, g_hash, [g1, g2])
+	var got_g := NatureLooks._read_image_cache(g_path, g_hash)
+	check(got_g.size() == 2 and (got_g[0] as Image).get_data() == g1.get_data()
+		and (got_g[1] as Image).get_data() == g2.get_data()
+		and NatureLooks.cache_hits == hits0 + 2,
+		"nature grain layers disk cache round-trips multi-layer image arrays cleanly")
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(a_path))
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(g_path))
+	NatureLooks.disk_cache = was_disk

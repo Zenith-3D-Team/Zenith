@@ -1,5 +1,6 @@
 extends RefCounted
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
 ## api.camera: an add-on takes Zenith's camera, moves it as it likes, and hands it back; the
 ## player's own view (the angled view, Factorio's view, first person, the zoom) comes back exactly
 ## as it was. One add-on has the camera at a time. While it does:
@@ -201,6 +202,11 @@ func center_ground():
 	return ground_point(rig.get_viewport().get_visible_rect().size * 0.5)
 
 
+## Whether the host should subscribe a camera-origin viewing cone while this add-on holds the camera.
+func _uses_cone() -> bool:
+	return _focus == null and _focus_mode == "camera"
+
+
 ## Where the world should load round now (the host asks each frame while this add-on has it).
 func _focus_point() -> Vector2:
 	if _focus is Vector2:
@@ -210,6 +216,12 @@ func _focus_point() -> Vector2:
 		if avatar is Node3D:
 			return Vector2(avatar.global_position.x, avatar.global_position.z)
 	var t := transform()
+	if ViewPriority.camera_cone:
+		var w = _host.game_node("world")
+		var er := 96.0
+		if w != null and is_instance_valid(w) and w.get("focus_radius") != null:
+			er = float(w.get("focus_radius"))
+		return ViewPriority.addon_focus_point(t, er)
 	var o := t.origin
 	var d := -t.basis.z
 	if d.y < -0.05:

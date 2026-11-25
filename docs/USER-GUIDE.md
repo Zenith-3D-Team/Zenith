@@ -1,539 +1,187 @@
-# Zenith: player's guide
+# Zenith: Player's Guide
 
-Zenith lets you play Factorio in 3D, with an angled camera close to your character. Factorio itself still runs the game: a small mod (the **bridge**) streams the world to
-the **Zenith client**, a separate program that draws it in 3D and sends your keys and clicks
-back. Everything stays on your computer.
+Zenith lets you play your real Factorio 2.1 save in 3D with an angled camera close to your character. Factorio itself still runs the simulation; a bridge mod streams the world to the **Zenith client**, which renders it in 3D and sends your inputs back.
 
-This guide is for playing. [RUNNING.md](RUNNING.md) has every detail (all controls, settings and
-command-line options); [ARCHITECTURE.md](../ARCHITECTURE.md) is for people working on it.
+This guide covers playing Zenith. For developer flags and testing, see [RUNNING.md](RUNNING.md), [SWITCHES.md](SWITCHES.md), and [ARCHITECTURE.md](../ARCHITECTURE.md).
 
 ## What you need
 
-- **Factorio 2.1** (Space Age is optional). Your own copy: the client reads Factorio's graphics,
-  sounds, fonts and names from your install and never copies them.
-- **Zenith itself:** the download (`Zenith-<version>-windows.zip`, or `-linux`), or this
-  repository with [Godot 4.4 or newer](https://godotengine.org/download).
-- Windows or Linux. The client and Factorio must run on the same computer.
+- **Factorio 2.1** (Space Age is optional). Zenith reads sprites, icons, sounds, and fonts straight from your install at runtime.
+- **Zenith:** Either a release zip (`Zenith-<version>-windows.zip` or `-linux.zip`) or [Godot 4.7+](https://godotengine.org/download) running from this repository.
 
 ## Installing
 
-**From the download** (the easy way):
+**From a download:**
 
-1. Unpack the zip anywhere you can write to (your Documents, say): it is one folder with
-   `Zenith.exe` (on Linux `Zenith.x86_64`), the bridge mod in `mod/` and the server scripts in
-   `server/`. Your Zenith worlds and the servers' data are kept in Zenith's user folder, with its
-   settings (`%APPDATA%\Godot\app_userdata\Zenith` on Windows, `~/.local/share/godot/app_userdata/Zenith`
-   on Linux), so a new version unpacked anywhere finds them. A version unpacked over an older
-   one brings that one's `server/saves` and server mods over by itself, once.
-2. Start `Zenith.exe`. That's all: when you start a game from its menu, it runs Factorio in the
-   background with the bridge mod and connects by itself. If it can't find Factorio, set
-   Factorio's folder in Settings → Factorio install. (The Linux download hasn't been tried yet.)
+1. Unzip anywhere writable (e.g. your Documents folder). Worlds, server data, and settings live in your user folder (`%APPDATA%\Godot\app_userdata\Zenith` on Windows, `~/.local/share/godot/app_userdata/Zenith` on Linux), so updates keep your saves and config. *(The Linux build has not been field-tested yet.)*
+2. Run `Zenith.exe` (Windows) or `Zenith.x86_64` (Linux). If Zenith cannot find your copy of Factorio automatically, set its folder in **Settings → Factorio install**.
 
-**From the repository** (to change it, or on a system the download doesn't cover):
+**From the repository:**
 
-1. Start the client once with `godot --headless --path client --import` so Godot imports the
-   models, then `godot --path client`. `python3 tools/release/package.py` builds the download.
-2. The menu uses the mod in `mod/` the same way.
+1. Run `godot --headless --audio-driver Dummy --path client --import` once to import 3D models.
+2. Start the client with `godot --path client`.
 
-**Playing in your own Factorio window** (single-player "hybrid" mode, or joining someone's
-server) needs the bridge mod in Factorio's own `mods` folder: get *Zenith Bridge* from the mod
-portal (Factorio: Mods → Install), or put `factorio-3d-bridge_<version>.zip` there (built with
-`python3 tools/release/build_mod_zip.py`). Factorio must also open its UDP port for the bridge:
-add `--enable-lua-udp 34200` to its command line (Steam: Properties → Launch options). Without it
-the mod does nothing. Hybrid mode works (it has been played side by side with Factorio's
-window, and with mods), but it has been tried less than a server.
+## Ways to play & first game
 
-## First game
+```mermaid
+flowchart LR
+    P["Zenith Client"]
+    H["1. Menu / Headless Server (Default)<br/>Zenith starts Factorio silently<br/>Safest & fastest for single/co-op"]
+    Y["2. Single-player Hybrid<br/>Your own windowed Factorio<br/>+ Zenith Bridge mod + --enable-lua-udp 34200"]
+    R["3. Server on Another PC<br/>Headless Factorio + server/relay.py<br/>Client connects over LAN TCP :34200"]
 
-Start the client. Its main menu works like Factorio's:
+    P <== "Local UDP :34200" ==> H
+    P <== "Local UDP :34200" ==> Y
+    P <== "LAN TCP :34200" ==> R
+```
 
-- **Single player → New game** makes a map with Factorio's map generator and starts it (a
-  headless Factorio runs in the background; the client connects by itself).
-- **Single player → Load game** continues one of your saves. Your original save is copied first,
-  never changed. Saves in folders show as `[folder]`: click one to go in, `[..]` to go back up.
-- **Multiplayer → Host new game** (or **Host saved game**) starts a server friends can join with
-  normal Factorio, while you play in 3D.
-- **Multiplayer → Connect to address** joins a bridge that is already running, for example
-  `127.0.0.1:34200`.
+From the main menu:
 
-Leaving a game asks whether to save; the server the client started stops with it, even if the
-client crashes.
-
-The first time, Settings → Factorio install lets you point the client at your Factorio install if
-it wasn't found (Steam installs usually are).
+- **Single player → New game:** Uses Factorio's map generator and starts a local headless server automatically.
+- **Single player → Load game:** Copies your selected save into Zenith's own folder (never modifying your original save) and launches headless Factorio.
+- **Multiplayer → Host new / saved game:** Starts a server friends can join with regular Factorio while you play in 3D.
+- **Multiplayer → Connect to address:** Joins an already-running bridge (`127.0.0.1:34200`) or a LAN relay (`<host-ip>:34200`).
+- **Single player → Single-player (hybrid):** Attaches to your own open Factorio window (requires *Zenith Bridge* installed and `--enable-lua-udp 34200` in Factorio's launch options).
 
 <!-- dev -->
-**Performance test** in the main menu (development builds only: development downloads and Zenith
-run from source; the public downloads leave it out) measures how smoothly Zenith runs on your PC:
-pick Quick (about 3 minutes), Default or Extensive, keep your hands off while Zenith plays by itself
-full screen, then send the text file it writes. PERFORMANCE-TEST.md says what it does and what's in
-the file; your own saves, mods and settings aren't touched.
+**Performance test** *(development builds only — omitted from public downloads)* runs a ~3-minute automated benchmark from the main menu without touching your saves or settings and writes a report file you can attach to feedback; see [PERFORMANCE-TEST.md](PERFORMANCE-TEST.md).
 
 <!-- /dev -->
 
 ## Playing
 
-Factorio's keys work as in Factorio: WASD walks, the right mouse button mines, E opens your
-inventory (or closes the window that is open), the left mouse builds what you hold or, with
-nothing held, opens the building under the mouse, R rotates, Q
-picks up the item under the mouse (pipette), F picks up the items in reach, on the ground and on
-belts, T is the technology screen, Tab or M the map, 1–0 the quickbar, Enter gets in and out of
-vehicles, Esc closes windows or opens the game menu. The game starts in the angled view, and the
-camera is yours to move:
+### Controls & camera
 
-| Input | Camera |
+Factorio's normal keys apply (`WASD` move, `Right click` mine—including vehicles/trains with cargo inside, `Left click` build/open, `E` inventory, `R` rotate, `Q` pipette, `F` pick up items, `T` tech, `M`/`Tab` map, `Enter` enter/exit vehicles, `` ` `` console).
+
+When Zenith detects Factorio's `config.ini`, it follows Factorio 2.1's bindings by default (turn on **Settings → Controls → Zenith 0.2.2's keys** to restore the older key set). Press **F1** at any time for the live grouped control list, or rebind everything in **Settings → Controls**.
+
+| Input | Camera action |
 |---|---|
-| Mouse wheel | Zoom |
-| Middle mouse drag | Turn around the character and tilt |
-| , and . | Turn 90° |
-| Page Up / Page Down | Tilt |
-| F6 | Factorio's own view from above, and back |
-| F5 | First person, and back |
-| F7 | Perspective or orthographic, for the view you're in (first person, the map's remote view or the normal one); Settings > Camera shows it |
-| F8 | The Cinematic camera's free camera (an add-on, on by default): WASD flies it, F8 again comes back; F11 hides the interface, F12 takes a screenshot |
+| **Mouse wheel** | Zoom in / out |
+| **Middle mouse drag** | Orbit and tilt around your character |
+| **`,` / `.`** | Rotate camera 90° |
+| **Page Up / Page Down** | Adjust tilt |
+| **F5** | Toggle **First Person** (direct crosshair aim, build on sides or ground within reach) |
+| **F6** | Toggle **Factorio's 2D angle** |
+| **F7** | Toggle Perspective / Orthographic for the active view |
+| **F8** | Free camera *(Cinematic camera add-on; `F11` hides HUD, `F12` saves screenshot)* |
+| **Ctrl+F9** | **Show in Factorio** — switch to Factorio's window (and back via `Ctrl+F9` or Zenith's gear button) |
 
-The right mouse button mines whatever is under it, trains, wagons, cars, tanks and spidertrons
-too: they go into your inventory with what is inside them (fuel, cargo), and the rails stay.
+### World views & gameplay tools
 
-In first person (F5) the crosshair works on what it is on, as in a shooter: look at a machine, a
-belt, a tree or a car and it is the one hovered, mined, opened or turned, not the ground behind or
-under it, and something in front hides what is behind. A building you hold goes beside the side you
-look at, or where you look on the ground. Factorio's reach still applies.
-
-Alt (or the ALT button on the shortcut bar) is Factorio's Alt-mode: every machine you can see
-shows what it makes or lets through (recipes, inserter, splitter and filter chest filters), however
-big the base, and the moment it comes into view. As in Factorio, machines also show arrows where
-fluids go in and out (the connections their recipe uses), pumps the way they pump, and a recycler
-the side it drops onto; inserters' pickup and drop arrows are off by default (Settings → Interface
-→ Alt-mode turns each kind on or off, as Factorio's Interface settings do).
-
-Hovering a building shows Factorio's entity info on the right: its status, recipe, modules and
-beacons, and for powered buildings "Consumes electricity" with the Electricity bar; hovering a
-roboport draws lines to the roboports it is linked to. On a space platform (and in the map view of
-one) Factorio's platform panel under the minimap says where it is stopped or what it is travelling
-between, its speed and mass, and on board has **Drop to a planet**.
-
-When it finds Factorio's config.ini, Zenith follows Factorio 2.1's own keys, so the arrow keys don't walk, `/` doesn't open the console and Keypad
-Enter doesn't get in, as in Factorio (the console is on `` ` ``, getting in on Enter or G). To have Zenith 0.2.2's keys
-back, tick Settings → Controls → **Zenith 0.2.2's keys**.
-
-Settings → Controls lists and rebinds everything. F1 shows the help: every control under the key
-you have it on now, grouped, with each add-on's keys under the add-on while it is on (the mouse wheel
-over it scrolls it when the window is too short). The debug line shows a status line (the
-game's UPS beside the frame rate, and what Hold the game at 60 UPS holds back); it has no key at first:
-bind one in Settings → Controls (Miscellaneous, Debug line), or tick Settings → Interface → Debug line. Ctrl+F9
-opens the same game in Factorio itself, and Ctrl+F9 there comes back, minimising Factorio to save
-its drawing. On a world you made in Zenith, Factorio joins as the character you were playing in Zenith,
-with everything it carries, and Factorio's crashed-ship intro doesn't happen there: anyone else who
-joins gets a character of their own. Started through `server/factorio-with-zenith.ps1` (RUNNING.md says how to set it as
-Steam's launch options), Factorio's Ctrl+F9 (or the Zenith gear among its top-left mod buttons) also starts Zenith when it isn't running (Settings → Other → Copy launch options gives the line for Steam; open Zenith once before setting it). When it can't start Zenith, Factorio shows a window saying what is missing: Zenith itself (with its download page), the launch options (with the line to copy), or both. Windows move by dragging their title bars.
-
-Playing through Factorio (hybrid single-player, or joined to the server as yourself), mods'
-windows show in Zenith too, and on Windows their buttons work: see Playing with mods below.
+- **Alt-mode (`Alt`):** Shows machine recipes, filters, fluid arrows, pump flow, and cargo wagon contents (`Settings → Interface → Alt-mode` configures each layer).
+- **Entity info & links:** Hovering buildings shows status, recipes, modules, electricity usage, and roboport links; on Space Platforms, the platform panel shows route, speed, mass, and **Drop to a planet**.
+- **Launching Zenith from Steam/Factorio:** Copy the launch line from **Settings → Other → Copy launch options** into Steam's Factorio Launch Options (after running Zenith once) so `Ctrl+F9` inside Factorio can launch Zenith on demand.
 
 ## Playing with mods
 
-The game Zenith shows is real Factorio, so every mod runs exactly as it does in Factorio: its
-recipes, machines, planets and scripts all work. What differs is what Zenith can draw and what
-the mod can see of you.
+Because real Factorio runs underneath, mods' recipes, machines, research, and planets work as authored. Modded items, ground tiles, plants, rocks, and step sounds render from the mods' own files; modded buildings appear as animated or still Factorio sprite cards (or boxes if no sprite exists).
 
-### Two ways to play a modded game
-
-- **On a server** (Single player → New game or Load game, or Multiplayer → Host): Factorio runs
-  in the background with no window, and Zenith's bridge plays a character of its own. Add mods
-  in the main menu's **Mods** window, which lists the server's mods folder: put the mods' zips in
-  `%APPDATA%\Godot\app_userdata\Zenith\server-data\mods` (the download) or `server/data/mods`
-  (from the repository), tick them, and start the game. Every load also links the mods from your
-  own Factorio mods folder (`%APPDATA%\Factorio\mods`) into the server's, so after the first load
-  you can tick those too (a mod there isn't on until you tick it). **New game** uses the mods
-  ticked there. **Load game** starts a save with its own mods at the save's versions (and its mod
-  settings), with the mods ticked in the Mods window added, as Factorio adds the mods you have on
-  to a save you load: so you can add a mod to a world. Tick **Sync mods with save** beside the save
-  to load it with exactly its own mods instead. Space Age and its DLC always follow the save (a
-  Space Exploration world stays without Space Age); a ticked mod that can't run with the save's
-  mods, or needs one you don't have, is left out, and Zenith says which when the game starts. If
-  one of the save's own mods is missing, or there at another version, Zenith names it: start the
-  save in Factorio once (it downloads them), or put that mod in your mods folder. This is the
-  cheapest way to play, and the one most tested.
-- **Hybrid** (Single player → Single-player (hybrid)): you start your own Factorio with your own
-  mods and save, with the Zenith Bridge mod and `--enable-lua-udp 34200` in its launch options,
-  and Zenith connects to it and plays *your* character. Both windows show the same game; Ctrl+F9
-  swaps between them and minimises Factorio. Joining a server as yourself with normal Factorio
-  while Zenith plays your character works the same way.
-
-### What works where
-
-| Kind of mod | Examples | On a server | Hybrid |
+| Mod type | Examples | Headless Server | Hybrid Mode |
 |---|---|---|---|
-| New items, buildings, planets, recipes | Space Exploration, Krastorio 2 | Yes | Yes |
-| Mods that change the game's rules or data | Squeak Through, bigger stacks | Yes | Yes |
-| Mods that give *players* a bonus | Far Reach | No: the bridge's character isn't a player | Yes |
-| Mods that react to what *a player* does | auto-filling, build logging | Partly: they see buildings appear, not who built them | Yes |
-| Mods with their own windows | Informatron, Factory Planner, Helmod | Use Factorio (Ctrl+F9) | Use Factorio (Ctrl+F9): not drawn in Zenith for now |
-| Mods' own hotkeys, text fields, dropdowns | most mods with a window | Use Factorio (Ctrl+F9) | Use Factorio (Ctrl+F9) |
+| New content / data tweaks | Space Exploration, Krastorio 2, Squeak Through | **Yes** | Yes |
+| Player-triggered bonuses/scripts | Far Reach, auto-fillers | Limited *(bridge uses script character)* | **Yes** |
+| Custom mod GUIs & hotkeys | Factory Planner, Helmod, Informatron | Use `Ctrl+F9` *(Informatron buttons work)* | Best via `Ctrl+F9` *(Windows auto-click experimental)* |
 
-- **Graphics:** a mod's own icons, ground, plants and rocks, and names in your language are drawn
-  from the mod's files, read from the server's mods folder and your own Factorio mods folder.
-  Its buildings have no 3D model, so Zenith shows the mod's own picture of them on a card that
-  faces Factorio's camera (still pictures; Settings > Graphics > Animate modded buildings, off by default, runs their loops while they work). Only Factorio's and Space Age's buildings
-  have 3D models.
-- **Mods' windows aren't drawn in Zenith for now** (Settings > Interface > Show mods' windows, off):
-  their layout and buttons don't match Factorio's yet. Use them in Factorio: Ctrl+F9, or the Factorio
-  button at Zenith's top left, swaps to the same game in Factorio's window, and the Zenith button (the
-  gear) among Factorio's top-left mod buttons, or Ctrl+F9 there, comes back. With the setting on:
-- **Mods' windows** in Zenith show what the mod shows, as it changes, and long text wraps where
-  Factorio wraps it. A mod only hears clicks made in Factorio itself (no script can fake one), so:
-  - **Informatron's** buttons (its menu pages, close, and its top button) are pressed by the bridge
-    through Informatron's own script interface: they always work, on a server too.
-  - **Any other mod's** buttons, in hybrid on Windows, are clicked in your Factorio window: Factorio
-    comes to the front for a moment, the button is clicked there, and Zenith comes back (a
-    minimised Factorio is minimised again). Zenith's copy of a window doesn't have the mod's own
-    sizes, so a click often lands beside the button; use Ctrl+F9 when it does. Typing in a mod's
-    text fields and picking from its dropdowns needs Factorio too.
-  Settings → Interface → Click mods' buttons in Factorio turns the clicking off, and then such a
-  button says to use Ctrl+F9.
-- **Map setting "Act as the player for other mods"** (on by default): in hybrid, building,
-  mining, rotating, pasting settings and opening machines go through your player, so other mods
-  see them as yours and Factorio's own reach rules (with Far Reach's bonus) apply.
-
-Tried so far: Space Exploration's mod pack (graphics, and its save loaded from the menu), and Far
-Reach and Informatron in hybrid.
-The rest of the table follows from how each kind of mod works and hasn't been tried with every
-mod; if one doesn't behave as it says, Report a bug in the main menu.
-
-### Which to choose
-
-- **Use a server** for content mods (new items, buildings, planets) and for the best speed. Your
-  own save can be loaded too: the bridge takes over its character.
-- **Use hybrid** when a mod needs a real player: player bonuses (Far Reach), mods that track who
-  did what, or mods whose windows you use often (they're used in Factorio's window: Ctrl+F9 swaps
-  to it and back, and with a server there is no Factorio window to swap to). Also when you want to
-  drop into Factorio itself now and then.
-
-### What hybrid costs
-
-Factorio keeps its own window while you play in Zenith, and draws it unless it is minimised (Ctrl+F9
-minimises it for you). Measured with the same test on a big base, standing at its busiest belts:
-
-| | Server | Hybrid | Hybrid, Factorio minimised |
-|---|---:|---:|---:|
-| Game speed | 59.3 UPS | 58.8 UPS | 57.9 UPS |
-| Zenith frame time, middle | 6.3 ms | 6.5 ms | 6.4 ms |
-| Zenith frame time, slowest 1% | 11.7 ms | 11.8 ms | 11.8 ms |
-| Zenith frames over 16.7 ms (per 75 s) | 1.5 | 5 | 4.5 |
-
-So hybrid cost about 1 UPS and a few more slow frames there, and minimising Factorio made no
-difference in this test. On a PC with less to spare it can cost more, since Factorio's window
-competes with Zenith for the processor and the graphics card: if the game slows down in hybrid,
-minimise Factorio or play on a server. Hybrid single-player takes one Zenith; a server takes up
-to 8.
+- **Recommended:** Use **Headless Server** (via **Mods** window or **Load game → Sync mods with save**) for speed and stability. Use **Hybrid** only when a mod specifically requires a real logged-in player or custom Factorio GUI. Running both windows side by side costs ~1 UPS on dense bases and shares CPU/GPU with Factorio.
+- Toggle experimental **Show mods' windows** in **Settings → Interface** if you want Zenith to mirror mod windows (`Act as the player for other mods` map setting controls whether player events fire).
 
 ## Settings worth knowing
 
-- **Graphics → Resolution**: in a window, the window's size. In full screen (borderless or
-  exclusive), the size the world is drawn at, scaled up to fill the monitor: 1920 × 1080 on a 4K
-  monitor costs what 1080p costs. The picture keeps its proportions, the interface stays sharp and
-  is laid out as at that size, and Game render scaling multiplies on top of it. Default puts a
-  window back to its own size, 1600 × 900.
-- **Graphics → View distance** (chunks drawn around you, up to 50) and **Entity distance** (how far
-  moving things and machine states are streamed). Lower them if the game stutters. View distance
-  turns yellow past 10 chunks and red past 20: what is drawn grows with the square of it, so far views
-  cost the graphics card, memory and the server a lot. Past 14 chunks (Ultra's view) the ground is drawn simpler, and
-  there is ground only where Factorio's map has been generated.
-- **Graphics → Level of detail**: how soon far-away models are drawn simpler. On a screen taller than
-  1440 lines (1080 on Low), such as 4K, models simplify at the size on screen they do at 1440p, not
-  twice as far out. Low also leaves out the ground's small bumps and cracks.
-- **Graphics → Look**: how the world is lit and coloured. **Factorio** (the default) is matched to
-  Factorio's own pictures: its colours, its shadows' angle and darkness, its colour grading on each
-  planet. **Classic Zenith** is the look before 0.1.4. Add-ons can add looks of their own, such as
-  the Cinematic shaders add-on (bloom, soft shadows, ambient occlusion, haze, clouds, film grain, and a
-  real sunrise and sunset, which Factorio's own look doesn't have: Factorio has none to match). The
-  downloads come with it switched on, and while it is on its look is used: switch it off in the
-  Add-ons menu for the Factorio look.
-- **Graphics → Metal on textured models** (As paint): a model pack's own metal pictures are drawn
-  mostly as paint, as every other model's metal is, so they take the sun and the shadows. Full, as
-  before draws them in full, reflecting only the sky: darker and bluer. Built-in models look the same
-  either way.
-- **Graphics → Packs' own shading** (As each pack says): a model pack that asks for it in its pack.json
-  (Vasillo's do) has its textured models, and its items, drawn as their files say, lit as Blender and Godot
-  light them. Factorio's everywhere draws every pack with the balance made for Factorio's pictures (tops
-  darker than sides), as before. The Model packs window's card says each pack's. Built-in models look the
-  same either way.
-- **Graphics → Anti-aliasing** (SMAA): how edges are smoothed. SMAA keeps fine detail sharp, FXAA is
-  softer, TAA is the steadiest far away but softens moving belts, MSAA costs the most. While a look that
-  draws its own full-screen passes is on, such as the Cinematic shaders, MSAA is greyed out and a saved
-  MSAA is switched to SMAA: those passes would draw a fringe round every edge with it. Pick MSAA again
-  under the Factorio look if you want it back.
-- **Graphics → Merge far buildings** (on): past about four chunks from the camera (and away from
-  your character), each chunk's buildings are drawn as one simplified mesh with no moving parts,
-  which costs far fewer draws when the camera is pulled back over a big base. Trees, ore and nests
-  keep their own models. Off draws every building in full however far it is.
-- **Graphics → Preset** (Low, Medium, High, Ultra) sets shadows, level of detail, the distances,
-  Moving belt items, decorative density and clouds together, turns ambient occlusion on in High and Ultra and
-  contact shading on in all of them; **Shadows** alone (Off to Ultra) sets how far and how sharp
-  the sun's shadows are, and how close the camera must be for items on belts to cast them (none on
-  Low, 30 tiles on Medium, 45 on High, 60 on Ultra). Your character's lantern and flashlight cast no
-  shadows of items on belts.
-- **Graphics → Ambient occlusion** (on in High and Ultra): shading in corners and between machines, kept
-  tight as Factorio's sprites have it. It shows when you are zoomed in close enough to see it and fades
-  out as you zoom out, from about 60 tiles away, until none of it shows past about 140 tiles from the
-  camera, whatever the screen. It is switched off, and costs nothing, once the view is about 140 tiles
-  away at 1080p and 185 at 1440p and 4K (4K is measured as 1440p, as Level of detail is; 1080p's 140 at
-  Level of detail Low) (F6's view, first person and add-on cameras by the same measure, the size of a
-  pixel where the view looks): at 1440p and 4K it still costs its time between 140 tiles and there,
-  though none of it shows. Up close it costs
-  about 0.7 ms of graphics time a frame at a busy base on a desktop card, more on a laptop. The Cinematic
-  look's own ambient occlusion fades the same way. While the Cinematic look is on, its own Ambient
-  occlusion setting (Add-ons menu) decides, and this row is greyed out; so is **Clouds**, whose place
-  its own Clouds slider takes.
-- **Graphics → Contact shading** (on): the dark rim on the ground round each building's foot that
-  Factorio's pictures have, so buildings stand in the ground rather than on it. Faint under chests,
-  a light band along belts and splitters, none under rails, walls, pipes and trees. It fades out when
-  zoomed far out, where it would be under a pixel. It costs next to nothing.
-- **Graphics → Merged materials (may help when CPU-bound)** (off): each model is drawn as one
-  surface with one material instead of one per material, so the renderer has far fewer draws to
-  send, at the cost of a little more GPU time. Try it if your graphics card idles while the frame
-  rate is low. Takes effect after a restart. Recommended turns it on for a big desktop graphics card
-  when the game measures the CPU holding the frames up.
-- **Graphics → Recommended**: picks the preset this PC holds at a steady 60 UPS and 60 FPS (from its
-  CPU and graphics card), with Hold the game at 60 UPS on, and Merged
-  materials as above. Pressed in a game,
-  it measures for six seconds first and goes a preset lower if the game or the frames fall short.
-- **Graphics → Step onto belts** (on): walking over a belt, underground belt, splitter, loader, heat pipe
-  or anything else Factorio's character walks over, your character is drawn standing on its top
-  (eased up and down, no pop) instead of wading through it. It is only drawn: the camera stays where it
-  is in every view, first person too, and the character's place in the game, its reach and what it
-  collides with don't change. Off: it walks through them, as before.
-- **Graphics → Hold the game at 60 UPS** (on): when the game runs slow on a big base, the client
-  asks the bridge for less for a while (shorter distances, fewer minimap refreshes, then a lower
-  frame rate) and gives it back when the game recovers. Your settings stay as they are; the debug line (Settings → Controls) shows
-  what is held back, and so does a yellow warning icon at the top left, with how many settings are held back:
-  hover it for the list, click it for the log of what was held back, when and why (**Interface → Performance
-  warnings** hides the icon).
-- **Graphics → items on belts**, three settings: **Belt item distance**, how far items on belts are
-  drawn; **Moving belt items**, how many of them move (Automatic raises and lowers it with the room
-  the frames, the game and the server's tick have; counted from the character outwards: past those, out
-  to the distance, they stand still on their lanes); and **Items in 3D**, how many are 3D models,
-  nearest first, the rest icons (All: every one, far belts too; Icons only: Factorio's icons
-  everywhere, on the ground and in hands too). In first person, the map's remote view or an add-on's
-  camera they go to what is in front of the camera, nearest it first, as 3D grass does. A stack inserter's stacks are drawn as piles, as
-  Factorio draws them.
-- **Camera → View when a game starts** (Angled view, Factorio's view or First person) and
-  **Projection** (the angled view in perspective or orthographic), **Projection on the map** (the
-  remote view you zoom into from the map; F7 switches whichever view you're in) and **Furthest
-  zoom** (how far the wheel zooms out, 60 to 400 tiles; 140 by default) and **Zoom out to the map at**
-  (how far the view you zoomed into from the map zooms out before the map comes back, 80 to 480 tiles;
-  240 by default). The camera keeps the character in the middle of the screen in every view, on the
-  hills of an add-on such as Terrain Elevation too, rising and falling with them; where a hill would
-  come between the camera and the character, it tilts up over it instead of going into the ground.
-  **Add-ons' camera motion** (100% by default) scales the bob, sway and shake add-ons put on the view; turn it
-  down, or to 0% for none, if that motion makes you feel ill.
-- **Interface → UI scale**, and Ctrl+= / Ctrl+- / Ctrl+0 while playing.
-- **The bridge's own settings** are in Factorio's Mod settings (Map tab), or Settings → Mod
-  settings in a game the menu started: how much it sends per tick, how far moving things are
-  streamed, which player the client plays as on a server.
-- **Footsteps** sound as each ground, rail and ore's own Factorio sound, mods' too, with plants rustling
-  underfoot; start the client with `-- --steps=table` for Zenith's older guess from the tile's name.
+Settings live in **Settings** (split into *Graphics*, *Sound*, *Controls*, *Interface*, *Other*, *Mod settings*, *Camera*, *Factorio install*, and *Add-ons*). Defaults mirror your Factorio `config.ini` where applicable.
+
+### Display & upscaling
+
+- **Resolution & Render scaling:** Windowed sets window dimensions; fullscreen renders the 3D scene at the chosen resolution and scales to fit your monitor while keeping UI crisp (`Game render scaling` multiplies resolution).
+- **Upscaling & Anti-aliasing:** Choose **Bilinear**, **FSR 1.0**, or **AMD FSR 2.2 (Temporal)** plus an **Upscaler sharpness** slider (`FSR 2.2` performs its own temporal anti-aliasing and greys out manual AA; orthographic F6/map views fall back smoothly). Outside FSR 2.2, **SMAA** keeps edges sharp while **MSAA** is unavailable under full-screen shader looks like *Cinematic shaders*.
+
+### View distance & Distant horizon
+
+- **View distance & Distant horizon:** Control full 3D loaded chunks near you alongside **Distant horizon**, which streams cached 2.5D terrain, water, trees, and factory silhouettes far toward the horizon (with configurable detail, LOD dropoff, night lamp/furnace glow, and wide-screenshot mode). You can optionally toggle both sliders into one unified **Render distance** bar.
+- **Level of detail:** Controls when far entities simplify; higher resolutions scale threshold distances appropriately so detail doesn't collapse prematurely on 4K displays.
+
+### Lighting & shading
+
+- **Look:** Switch between **Factorio** (sprite-matched lighting, shadows, and planetary colour grading), **Classic Zenith**, or add-on looks like **Cinematic shaders** (bloom, soft shadows, haze, depth effects, real sunrise/sunset).
+- **Packs' own shading:** Lets packs declaring PBR in `pack.json` (like Vasillo's `Zenith.zip` and adapted FUE5/Wube3DP PBR) render with full roughness/metal/normal maps, or forces uniform Factorio lighting across all packs.
+- **Shadows, Ambient occlusion & Contact shading:** Sun shadows range from `Off` to `Ultra` (also controlling belt-item shadow range). **Ambient occlusion (SSAO)** adds tight corner shading in `High`/`Ultra` and fades cleanly at zoom distance (~0.7 ms GPU up close). **Contact shading** grounds machines and belts softly against the terrain.
+
+### Performance & belts
+
+- **Preset & Recommended:** Presets (`Low`–`Ultra`) tune shadows, distances, AO, and clouds together; **Recommended** benchmarks your hardware for 6 seconds in-game and selects the best 60 UPS/FPS preset.
+- **Hold the game at 60 UPS:** Automatically dials back update rates (`rate` 1–3), distances, and optionally frame cap when a megabase drops below ~57 UPS, displaying a clickable performance icon top-left *(hide via Interface → Performance warnings)* without overwriting your saved settings.
+- **Merge far buildings & Merged materials:** Combines distant chunks into single low-draw meshes (excluding trees/ores/nests); **Merged materials** reduces CPU draw calls per model at a slight GPU trade-off after restart.
+- **Items on belts & Step onto belts:** Independently set **Belt item distance**, **Moving belt items** (*Automatic* budgets bridge cost), and **Items in 3D** (*All*, up to 20k, or *Icons only*). **Step onto belts** smoothly lifts your character model over belts/splitters without altering collisions.
+
+### Camera, controls & UI
+
+- **Camera tab:** Sets starting camera angle, Perspective/Orthographic defaults, **Furthest zoom** (`60–400` tiles), map zoom-out threshold (`80–480` tiles), and **Add-ons' camera motion** intensity (`0–100%` for motion comfort).
+- **Bridge settings (`Settings → Mod settings`):** Adjust server tick budgets, streaming radius, and active `/f3d-player` assignment without restarting.
+- **UI scale & Audio:** Adjust UI scaling live (`Ctrl+=` / `Ctrl+-` / `Ctrl+0`), and hear per-tile Factorio footsteps (or pack replacement sounds) across terrain, ore, rails, and plants.
 
 <!-- dev -->
 ## The debug menu
 
-This is a testing tool of the development builds (development downloads and Zenith run from
-source); the public downloads leave it out, with its key.
+*(Development builds and source runs only — omitted from public downloads along with its keybinding.)*
 
-**Ctrl+F12** in a game opens Zenith's debug menu (rebind it in Settings → Controls →
-Miscellaneous), with the Cinematic camera flying and the interface hidden (F11) too, the mouse shown
-while it's open. It's for testing and for reports when something runs slowly:
+Press **Ctrl+F12** in-game (also usable while in free camera or `F11` hidden HUD) to open the debug overlay:
 
-- **Time**: set the time of day (or Dawn, Noon, Sunset, Night), freeze the day/night cycle, change
-  the game's speed or pause it. This changes the game itself, for everyone in it, so in a
-  multiplayer game only admins can; otherwise the controls are greyed and say why. The time slider
-  is a clock: midnight at both ends, noon in the middle. Pausing works on a server Zenith's menu
-  started (it resumes the game over RCON); in single-player, pause in Factorio itself.
-- **Benchmarks**: standing still, laps, a camera flyover and a zoom out and back, each measured in
-  your game and ending in a report (frame times, frame rate, GPU time, draw calls, the game's UPS,
-  your settings) compared with your last run of it. Copy it or save it to a file to send with a
-  bug report. Keep your hands off the keys while one runs; Esc stops it.
-- **Tests**: checks and overlays for finding problems (a frame-time graph, counters, chunk borders,
-  the bridge's self-test, which model pack each model comes from) and spots to move your character
-  to (the same rule as Time).
-- **Updates**: see where and when the game sends Zenith its updates. Tick a kind (chunks arriving,
-  buildings built, removed or changed, machines starting and stopping, belt lanes read or checked,
-  inserters' takes, movers, power, alerts...) and each update outlines what it touched on the ground,
-  in its colour, fading over a second; a legend at the left counts them a second. Three show a state
-  instead: the chunks still to come, how each belt lane is drawn, and packed belts drawn standing while
-  their items move.
+- **Time:** Jump time of day, freeze daylight, change speed, or pause/resume (admin-restricted in multiplayer).
+- **Benchmarks:** Run standardized standing, lap, flyover, and zoom tests comparing FPS, GPU time, draw calls, and UPS against your previous run.
+- **Tests:** Live frame-time graphs, chunk borders, `/f3d-selftest`, pack provenance, and test teleport spots.
+- **Updates:** Visualizes live bridge packets on the ground (chunks, entity deltas, belt reads, inserters, power, pending queues).
 
 <!-- /dev -->
+
 ## Model packs
 
-Every model Zenith draws comes from a model pack, like a texture pack. Four come with Zenith, in
-this order from the top:
+Zenith resolves models through stacked packs (highest pack in **Selected** wins for each prototype):
 
-- **FUE5 (Adapted)**: textured models from FUE5, a fan remake of Factorio, of 39 machines, chests, poles,
-  trains and the rocket silo;
-- **Wube3DP (Adapted)**: Wube's official 3D-printable Factorio models (belts, chests, inserters, furnaces,
-  the electric mining drill, biters and more), scaled and coloured to Factorio's sprites. Where FUE5
-  has a model of the same thing (the chests, furnaces, electric mining drill and small pole), FUE5's
-  is drawn unless you move Wube3DP up;
-- **Placeholders**: Zenith's own model of every Nauvis and Space Age entity, built from Factorio's
-  sprites;
-- **Factorio**: Factorio's own pictures, read from your Factorio install (nothing of Wube's comes with
-  Zenith): buildings, belts and trees as their sprites standing on cards, like cardboard cutouts, and
-  items as their icons. At the bottom it only fills in what no other pack has; move it up and the game
-  shows Factorio's 2D pictures instead of the packs below it. Without a Factorio install it is greyed
-  out and says why.
+1. **Vasillo's Zenith pack** *(when bundled as `models/Zenith.zip`)* — textured PBR logistics, belts, inserters, rocks, and ores.
+2. **FUE5 (Adapted)** — textured FUE5 fan-remake models converted to Zenith's scale with PBR support.
+3. **Wube3DP (Adapted)** — scaled, coloured models converted from Wube's official 3D print files.
+4. **Placeholders** — built-in blender models covering Nauvis and Space Age entities (`198` 3D item meshes; custom packs can also add 3D `.glb` or 2D `decoratives/`).
+5. **Factorio** — 2D sprite cutouts and item icons read live from your install (never shipped in Zenith).
 
-Every pack can be moved and switched off, Placeholders and Factorio too. A building no pack in use has a
-model for is drawn as its Factorio picture, or, with Factorio off, as a plain box in its map colour.
+Drop third-party `.zip` packs, folders, or loose `.glb` files into `models/` beside `Zenith.exe` (**Open folder** in the Model packs window opens it). Any pack shipping copies of Factorio's copyrighted assets is rejected automatically.
 
-"Adapted" marks the two packs of other people's models, converted and fitted for Zenith.
-
-Some downloads come with a fourth, **Zenith**: Vasillo's textured belts, undergrounds, splitters,
-inserters and burner mining drill, made for Zenith (`models/Zenith.zip` beside Zenith), on top of
-the others.
-
-Packs made by other people go in the `models` folder beside Zenith (beside `Zenith.exe`; **Open
-folder** in the Model packs window opens it). A pack can be:
-
-- **a .zip**, as you downloaded it: no need to unpack it. Zenith unpacks a copy into its own user
-  folder (`model-packs`) the first time, and again only when the zip changes;
-- **a folder**, its models anywhere inside it;
-- **loose .glb files** at the top of the models folder, which count as one pack, "Loose models".
-
-Have as many as you like. Each model is a file named after the Factorio building it draws
-(`transport-belt.glb`). A pack may also carry its author's own sounds in a `sounds/` folder, played in
-place of Factorio's (Settings → Sound → **Sounds from model packs** turns them off). A pack that
-carries copies of Factorio's own files isn't loaded: its card in the Model packs window turns red and
-says which files (Zenith reads Factorio's files from your own install; ask the pack's author for a
-version without them).
-
-**Model packs**, in the main menu and the Esc menu, opens the Model packs window. On the
-left, **Available**: the packs not in use. On the right, **Selected**: the packs in use, the top one
-winning when two have a model of the same thing. ▶ on a pack adds it on top of Selected, ◀ takes it
-out, ▲ and ▼ move it up and down. A new pack in the models folder goes on top, in use (one added while
-Zenith runs is marked new, and is drawn from the next start or as soon as you change anything in the
-window). Each pack shows its picture, name, how many models it has and, from its `pack.json`, its
-version, author and licence; one that can't be read is left out and says why.
-
-Click a pack to see its models, with a search box. Click a model to see it turning, which pack's
-version is drawn now, and a button for each pack that has one, to look at theirs. **Use <pack>'s**
-takes that model, with its curves, directions and other pieces, from the pack shown whatever the
-order; **By the order** gives it back, and **Reset choices** gives them all back.
-
-Changes show at once, in a game too: buildings change straight away; trains, robots, creatures and
-inserter arms the next time Zenith starts.
-
-**One building's model:** in a game, a building's window has a **Model** button in its title bar,
-beside the circuit network buttons. It shows the building turning in each pack in use that has a model
-of it. **This one** draws only that building with that model, kept for this save until the building
-is mined or destroyed; **Every one** draws every building of its kind with it, as Use in the Model
-packs window does. **Usual model** and **Every one by the order** undo them. Only Zenith's picture
-changes: nothing goes to the game. An inserter's arm keeps its usual model.
-
-To play with the built-in packs alone without moving yours, start Zenith with
-`-- --no-custom-models`.
+In the **Model packs** window (or a building's **Model** title-bar button), you can toggle/reorder packs, inspect spinning 3D previews, override individual entities (`This one` / `Every one`), or start with `-- --no-custom-models` to isolate built-in packs.
 
 ## The main menu's backdrop
 
-Zenith's own, not Factorio's (Factorio's menu always shows its own scenes): the main menu can show
-a spot in one of your games instead of Zenith's default (a corner of a Space Age factory, recorded the
-same way). In a game, go to the spot, turn and
-zoom the camera as you like it, then **Esc > Use this view as the menu backdrop**. Zenith records
-the view and a few seconds of what moves there (about 10 s, with the controls held meanwhile), and the
-main menu shows it from then on, with the camera turning a little either way, in the menu's own
-afternoon light. Belts, inserters, trains, robots and biters move as they did; your character is
-left out.
-
-Each recording is kept: the main menu's **Menu backdrop** lists them under **Default** (Zenith's
-factory), newest first, each named after its save with the date and time, the one shown marked "In
-use". Click a name to change it; **Use** shows that one, **Delete** deletes it (after asking).
-**Open folder** opens the folder they are kept in (`backdrops` in Zenith's user folder; a backdrop a
-friend sends you can be dropped there), and **Choose from a world…** opens Load game, to go and record
-one. A backdrop from before 0.2.2 is moved into the list the first time. To keep only one, replaced by
-each new recording as before, start Zenith with `-- --menu-backdrop-save=overwrite`. Backdrops stay on
-your PC and are drawn with the model packs in use, so a
-modeller can drop new models in, open Model packs or restart Zenith, and see them in their own
-factory without loading a game. The menu shows no grass or small rocks, and no add-ons such as
-Terrain Elevation; a building from a mod may be drawn as a box. To start with Zenith's own backdrop
-once, start Zenith with `-- --menu-backdrop=default`.
+In any loaded save, frame your factory and click **Esc → Use this view as the menu backdrop**. Zenith captures nearby `5x5` chunks and ~10 seconds of live belt/train/biter motion into `user://backdrops/` (your character omitted) and plays it behind the main menu using your active model packs. Manage saved backdrops from **Menu backdrop** on the main menu, or pass `-- --menu-backdrop=default` to launch with the built-in scene once.
 
 ## Add-ons
 
-Add-ons add to what Zenith does, for example the [Cinematic camera](https://github.com/unjustodin/Zenith-Cinematic-Camera) for filming your
-base (its keys and modes are in its own guide there). One is a
-folder or a .zip of it (no need to unpack it): put it in Zenith's add-ons folder, `%APPDATA%\Godot\app_userdata\Zenith\addons\` on
-Windows (or an `addons` folder beside `Zenith.exe`), and start Zenith. The **Add-ons** menu (on
-the main menu and in the game menu that Esc opens) lists every add-on
-found with its version, whether it's on, and why it couldn't load (for example one that needs a
-newer Zenith). Click one for its page: its switch, its settings (changed there at once, in a game
-too, and kept for next time) and its keys, rebound as in Settings → Controls (click, press the
-key; right click clears). With two copies of one add-on (a folder and a zip, say), the newer
-version is used and its page says so. The Mods window lists them as well. Add-ons can move the camera and
-change what is shown, never the game itself. Writing one: [ADDONS.md](ADDONS.md).
+Add-ons extend Zenith's camera, visuals, weather, and UI via GDScript without touching Factorio's simulation unless paired with a companion Factorio mod (`api.game`). Writing one: [ADDONS.md](ADDONS.md).
 
-An add-on is a program: it runs inside Zenith with your rights and can read and change your files.
-So one you add is off until you switch it on in the Add-ons menu: switch on only add-ons from people
-you trust. Zenith's own come with it, and model and icon packs are only data, not programs.
+- **Installed add-ons live off by default** because add-ons run full GDScript code with your PC permissions. Switch on only add-ons you trust in the **Add-ons** menu. Drop add-on `.zip`s or folders into `%APPDATA%\Godot\app_userdata\Zenith\addons\` (or `addons/` beside `Zenith.exe`).
+- **Bundled `0.3.0` add-ons:** **Cinematic camera** (on — free cam, paths, recording), **Cinematic shaders** (on — filmic post-processing look), **Immersive Weather** (on — wind, 3D rain, puddles, lightning on Nauvis), **Immersive Enemies** (on — ragdolls, gore, acid), and **Terrain Elevation** (on — 3D hills). *(Note: avoid manually minimizing Zenith while background-recording video with Cinematic camera, or frames stop drawing.)*
 
-The download already has Zenith's own in its `addons` folder, each starting as its
-`addons/bundled.json` says: the Cinematic camera, switched on;
-[Terrain Elevation](https://github.com/unjustodin/Terrain-Elevation) (hills under the world),
-switched off (turn it on in the Add-ons menu); and the Cinematic shaders, switched on, in a release
-built with them. Newer versions are on each add-on's releases page.
+## Several players & servers on another PC
 
-An add-on that records in the background (the Cinematic camera's recorder) keeps Zenith drawing
-while its window is behind Factorio's: Zenith isn't minimised when it loses focus while it
-records. Don't minimise Zenith yourself while recording: a minimised window draws nothing, so
-nothing is recorded meanwhile.
+- **Multiplayer (standard Factorio):** Host from Zenith's menu so Factorio friends connect normally on port `34197` and see your character.
+- **Multiple 3D clients:** Start additional Zenith instances on the same PC to share one bridge server (`34202+`), each driving its own character. Admins can run `/cheat` and `/f3d-*` console commands.
+- **Dedicated server on another PC:** Because Factorio Lua UDP only talks on `127.0.0.1`, run `python3 server/relay.py` beside your server (`--rcon-port 34198` if you want Zenith pause/save), allow TCP `34200` for your LAN subnet **only** (never expose to the internet), and connect to `<server-ip>:34200`. Your PC still needs Factorio installed locally for sprites and sounds. See [RUNNING.md](RUNNING.md#server-on-another-pc).
 
-## Several players
+### Checking for a new version
 
-- **With friends in normal Factorio**: host a multiplayer game from the client's menu; they join
-  the server with Factorio as usual and see your character.
-- **Several 3D players**: on a server (headless or hosted), more 3D clients on the same computer
-  connect to the same bridge. Each gets its own character; they see each other walking around.
-- **Console commands in a multiplayer game** (`/cheat`, `/f3d-player` and the rest, from Zenith's
-  console or the bridge's `/f3d-*` commands in Factorio's) are for admins. A player playing through
-  Zenith on their own machine needs to be an admin (`/promote` them); Zenith on the server's own
-  computer always may.
-- **The server on another PC**: see the next section.
-- **Single-player (hybrid)**: start Factorio normally with `--enable-lua-udp 34200` and connect
-  the client (Single player → Single-player (hybrid) → Connect). It plays your own character; both
-  windows show the same game. It has been tried less than a server: if it doesn't work, use
-  Single player → New game or Load game instead.
-
-## The server on another PC
-
-To keep the game's work off the PC you play on, the headless server can run on another PC on your
-network. Factorio only talks to programs on its own PC, so a small relay runs beside it and passes
-everything along:
-
-1. On the server PC: start the server (`server/run-headless.sh` on Linux, `server\run-server.ps1` on
-   Windows), then the relay: `python3 server/relay.py`. It prints the address to use.
-2. Open TCP port 34200 in that PC's firewall, for your home network only.
-3. In Zenith: Play → Connect to address, and type that PC's address, like `192.168.1.20:34200`.
-
-The relay lets in only PCs on your local network (`--allow` sets your own list). Never open the port to
-the internet: whoever gets in plays on your server, with the console commands of the server's own PC.
-To pause the game from Zenith, start the relay with `--rcon-port 34198` and give the server's RCON
-password (its `server/data/rcon-password.txt`) when connecting. Your PC still needs Factorio installed
-for its graphics and sounds, and the server's mods for theirs. Ctrl+F9 shows Factorio only if you
-joined the server with it on your PC. docs/RUNNING.md, "Server on another PC", has the details. Tried on
-one PC so far, not yet between two.
+**Check for updates** (bottom left of the main menu) asks GitHub's public releases page of Zenith's own repository whether a newer release exists, and tells you. It is one HTTPS request with only the usual headers (`Accept`, and `User-Agent: Zenith/<your version>`): nothing about you or your PC is sent, no id, nothing is downloaded or installed (**Download** just opens the releases page in your browser). **Nothing is requested until you click it**, unless you turn on **Auto check on open** (in that popup or Settings > Interface; off by default): then the main menu asks at most once in 6 hours and says something only when a newer version exists (**Don't show again** keeps that version quiet). `--update-check=off` removes the button and every request; `--update-check=test` shows the popup with a made-up newer version and no request. A build with the testing tools (a dev build, or `--dev-tools`) has no button.
 
 ## When something goes wrong
 
 | Problem | What to try |
 |---|---|
-| "Waiting for Factorio on 127.0.0.1:34200" | Is Factorio running with `--enable-lua-udp 34200`, and the bridge mod enabled? In Factorio's console, `/f3d-status` says whether a client is connected |
-| "No relay answers at ..." (a server on another PC) | Is `python3 server/relay.py` running on that PC, its TCP port open in the firewall, and your PC on its local network (or in `--allow`)? The relay's window says when it refuses a PC, and why |
-| A game from the menu doesn't start | The message shows the lines of Factorio's log that matter. Check Settings → Factorio install, and that no other Factorio uses the same server data folder |
-| "Can't open UDP port 34201" | Other programs have it and 34202–34208, which the client tries by itself. Close other clients |
-| No item icons, flat-coloured ground, no sound | The client didn't find your Factorio install: set it in Settings → Factorio install |
-| The game stutters on a big base | Try Settings → Graphics → Recommended, or a lower Preset; keep Hold the game at 60 UPS on; lower View distance, Entity distance, Moving belt items and Items in 3D |
-| Something else | `/f3d-selftest` in Factorio's console checks the bridge in your game; RUNNING.md's Troubleshooting section has more |
+| `"No answer from the bridge"` on dedicated server | Set `"auto_pause": false` in `server-settings.json`, pass `--enable-lua-udp 34200`, and verify bridge mod is active via `/c __factorio-3d-bridge__ rcon.print(tostring(game.tick_paused))`. |
+| `"Waiting for Factorio on 127.0.0.1:34200"` | Confirm Factorio started with `--enable-lua-udp 34200` and check `/f3d-status` in Factorio's console. |
+| `"No relay answers"` on another PC | Check `python3 server/relay.py` is running, LAN firewall allows TCP `34200`, and your client IP matches `--allow`. |
+| Menu server fails to start | Read the Factorio log excerpt in the popup, confirm **Settings → Factorio install**, and close duplicate servers sharing `server-data`. |
+| `"Can't open UDP port 34201"` | Ports `34201`–`34208` are all occupied; close extra Zenith clients or mock tests. |
+| Flat ground, missing icons, or no audio | Set Factorio's path in **Settings → Factorio install**. |
+| Stutters or low FPS on huge bases | Click **Settings → Graphics → Recommended**, keep **Hold the game at 60 UPS** on, or reduce View/Distant Horizon/Belt item distances. |
+| Other bridge issues | Run `/f3d-selftest` in Factorio or check [TROUBLESHOOTING.md](TROUBLESHOOTING.md#troubleshooting). |
 
-To report a bug, use **Report a bug** in the main menu or the Esc menu. It packs Zenith's recent logs and the server's into one zip, then opens GitHub's bug report page (with your versions filled in) and the folder holding the zip. Drag the zip into the report. The logs may show your user name in file paths.
+Use **Report a bug** in the main or Esc menu to zip recent client/server logs (note: logs may include your OS username in paths) and open GitHub's issue form.
 
-Zenith is a fan project, not made or endorsed by Wube Software. Factorio is theirs.
+Zenith is an unofficial fan project, not made, endorsed, or supported by Wube Software. Factorio is theirs.

@@ -41,6 +41,7 @@ local rate = require("scripts.rate")
 local registry = require("scripts.registry")
 local fluids_power = require("scripts.fluids_power")
 local pipelines = require("scripts.pipelines")
+local profile = require("scripts.profile")
 
 local M = {}
 
@@ -666,6 +667,32 @@ local function start_pass()
   pass = { surfaces = list, i = 1, iter = nil, found = found, seen = {}, types = pass_types, ghosts = 0, segs = {} }
 end
 
+-- One entity of the pass (not seen yet this pass): what it costs.
+local function pass_entity(e, f)
+  local key = e.unit_number or key_of(e)
+  if pass.seen[key] then
+    return 0
+  end
+  pass.seen[key] = true
+  if pipelines.SET[e.type] then
+    if pipelines.overextended(e) then
+      local seg = pipelines.segment(e)
+      if seg and not pass.segs[seg] then
+        pass.segs[seg] = true
+        table.insert(pass.found.pipeline, entry(pipelines.spot(e), "pipeline_overextended"))
+      end
+    end
+    return PIPE_COST
+  elseif e.type == "entity-ghost" then
+    pass.ghosts = pass.ghosts + 1
+    if pass.ghosts <= GHOSTS_MAX then
+      return check_entity(e, pass.found)
+    end
+    return 0
+  end
+  return check_entity(e, pass.found)
+end
+
 local function step_pass(now)
   if not pass then
     if not now and game.tick < next_pass then
@@ -677,7 +704,32 @@ local function step_pass(now)
   local chunks, cost = 0, 0
   local quiet = perf.on("alerts_quiet")
   local recheck = passes % EMPTY_EVERY == 0
+  local inside = perf.on("alerts_topk")
   while chunks < CHUNKS_PER_TICK and cost < ENTITIES_PER_TICK do
+    -- (alerts_topk) A chunk's entities left from the last tick first: a chunk dense with machines or pipes was
+    -- read whole in one tick (35-50 ms on the megabase).
+    local left = pass.left
+    if left then
+      local surface = game.get_surface(left.si)
+      if not (surface and surface.valid) then
+        pass.left = nil
+      else
+        local f_at = left.at
+        while f_at <= #left.found and cost < ENTITIES_PER_TICK do
+          local e = left.found[f_at]
+          f_at = f_at + 1
+          if e.valid then
+            cost = cost + pass_entity(e, f)
+          end
+        end
+        left.at = f_at
+        if f_at > #left.found then
+          pass.left = nil
+        end
+      end
+      goto continue
+    end
+    do
     local si = pass.surfaces[pass.i]
     if not si then
       for k, v in pairs(pass.found) do
@@ -715,30 +767,16 @@ local function step_pass(now)
           es[ckey] = nil
         end
       end
-      for _, e in pairs(found) do
-        local key = e.unit_number or key_of(e)
-        if not pass.seen[key] then
-          pass.seen[key] = true
-          if pipelines.SET[e.type] then
-            cost = cost + PIPE_COST
-            if pipelines.overextended(e) then
-              local seg = pipelines.segment(e)
-              if seg and not pass.segs[seg] then
-                pass.segs[seg] = true
-                table.insert(pass.found.pipeline, entry(pipelines.spot(e), "pipeline_overextended"))
-              end
-            end
-          elseif e.type == "entity-ghost" then
-            pass.ghosts = pass.ghosts + 1
-            if pass.ghosts <= GHOSTS_MAX then
-              cost = cost + check_entity(e, pass.found)
-            end
-          else
-            cost = cost + check_entity(e, pass.found)
-          end
+      if inside then
+        pass.left = { si = si, found = found, at = 1 }
+      else
+        for _, e in pairs(found) do
+          cost = cost + pass_entity(e, f)
         end
       end
     end
+    end
+    ::continue::
   end
 end
 
@@ -798,21 +836,65 @@ local function out_of_fuel(train)
   return any
 end
 
-local function scan_trains()
+local function check_train(train, fuel, path)
+  local front = train.front_stock
+  if front and front.valid then
+    if not train.manual_mode and out_of_fuel(train) then
+      fuel[#fuel + 1] = entry(front, train.id)
+    elseif train.state == defines.train_state.no_path then
+      path[#path + 1] = entry(front, train.id)
+    end
+  end
+end
+
+local function scan_trains_all()
   local fuel, path = {}, {}
   local trains = game.train_manager.get_trains({ force = force() })
   for _, train in pairs(trains) do
-    local front = train.front_stock
-    if front and front.valid then
-      if not train.manual_mode and out_of_fuel(train) then
-        fuel[#fuel + 1] = entry(front, train.id)
-      elseif train.state == defines.train_state.no_path then
-        path[#path + 1] = entry(front, train.id)
-      end
-    end
+    check_train(train, fuel, path)
   end
   scans.train_fuel = fuel
   scans.train_path = path
+end
+
+-- map_trains_slice (perf.lua): the trains' scan takes the list at its turn and reads TRAINS_PER_TICK of them a
+-- tick (once a tick for every client, as the pass), the last scan's lists kept until it ends. Module-local, as
+-- the other scans: it only feeds `al`.
+local TRAINS_PER_TICK = 40
+local train_scan = nil
+local train_scan_at = -1
+
+local function scan_trains()
+  if not perf.on("map_trains_slice") then
+    train_scan = nil
+    return scan_trains_all()
+  end
+  if not train_scan then
+    train_scan = { list = game.train_manager.get_trains({ force = force() }), i = 1, fuel = {}, path = {} }
+  end
+end
+
+local function step_train_scan(t)
+  local job = train_scan
+  if not job or train_scan_at == t then
+    return
+  end
+  train_scan_at = t
+  local list, i = job.list, job.i
+  local last = math.min(#list, i + TRAINS_PER_TICK - 1)
+  while i <= last do
+    local train = list[i]
+    if train.valid then
+      check_train(train, job.fuel, job.path)
+    end
+    i = i + 1
+  end
+  job.i = i
+  if i > #list then
+    scans.train_fuel = job.fuel
+    scans.train_path = job.path
+    train_scan = nil
+  end
 end
 
 local function scan_platforms()
@@ -835,6 +917,7 @@ local function scan_platforms()
 end
 
 local SCANS = { scan_repair, scan_trains, scan_platforms }
+local SCANS_NOW = { scan_repair, scan_trains_all, scan_platforms }
 
 ---------------------------------------------------------------------------------------------
 
@@ -879,7 +962,7 @@ local function near_list(kind)
   return out
 end
 
-local function message()
+local function message_sorted()
   local al = state()
   local here = puppet.get()
   local si = here and here.surface.index or 0
@@ -923,18 +1006,230 @@ local function message()
   return { t = "al", l = l }
 end
 
+
+-- alerts_topk (perf.lua): a kind's PER_KIND nearest in one pass over its list, with the entries gone left out
+-- and counted out, in message_sorted's order (the character's surface first, then nearest the focus, then by unit
+-- number). On the megabase the sort of every list, a closure a call, took 51-103 ms once a second.
+local function before(on, d, u, on2, d2, u2)
+  if on ~= on2 then
+    return on < on2
+  end
+  if d ~= d2 then
+    return d < d2
+  end
+  return u < u2
+end
+
+-- {count, shown}: `list`'s entries (still there when `check`; outside `near`'s square when given) counted, the
+-- nearest `k` (PER_KIND) of them in order, kept in a sorted array. A scan's list comes chunk by chunk, so on the
+-- megabase nearly every entry beat the last kept one in list order (57 ms for 16,301 entries, a k-shift each):
+-- the list is visited in a fixed stride order instead (a step coprime with its length), which leaves about
+-- k * ln(n / k) entries to insert, and the rest are turned away by an inline comparison. (A heap of closures took
+-- 49 ms, table.sort of the distances 34-38 ms, a quickselect 22-45 ms in Factorio's Lua: function calls cost.)
+local STRIDES = { 7919, 7907, 7901, 7883, 7877 }
+
+local function stride_for(n)
+  for _, p in ipairs(STRIDES) do
+    if n % p ~= 0 then
+      return p % n
+    end
+  end
+  return 1
+end
+
+local function pick(list, si, fx, fy, check, near, k)
+  k = k or PER_KIND
+  local shown, ons, ds, us = {}, {}, {}, {}
+  local n, count = 0, 0
+  local len = #list
+  local step = len > 0 and stride_for(len) or 1
+  if step == 0 then
+    step = 1
+  end
+  local at = 0
+  for _ = 1, len do
+    local rec = list[at + 1]
+    at = (at + step) % len
+    local keep = true
+    if check then
+      local e = subjects[rec]
+      keep = e == nil or e.valid
+    end
+    if keep and near and inside_near(near, rec[3], rec[1], rec[2]) then
+      keep = false
+    end
+    if keep then
+      count = count + 1
+      local on = rec[3] == si and 0 or 1
+      local dx, dy = rec[1] - fx, rec[2] - fy
+      local d = dx * dx + dy * dy
+      -- (Full: turned away unless it beats the last kept one, compared inline.)
+      local last_on = ons[n]
+      if n < k or on < last_on or (on == last_on and (d < ds[n] or (d == ds[n] and rec[5] < us[n]))) then
+        local u = rec[5]
+        local j = n < k and n + 1 or n
+        if n < k then
+          n = n + 1
+        end
+        while j > 1 and before(on, d, u, ons[j - 1], ds[j - 1], us[j - 1]) do
+          shown[j], ons[j], ds[j], us[j] = shown[j - 1], ons[j - 1], ds[j - 1], us[j - 1]
+          j = j - 1
+        end
+        shown[j], ons[j], ds[j], us[j] = rec, on, d, u
+      end
+    end
+  end
+  return count, shown
+end
+
+-- pick with `check` for a long list, checking only the nearest: on the megabase `valid` on 16,301 machines was
+-- 43 ms of 46. The nearest PER_KIND + SPARE are picked unchecked, then checked; when fewer than PER_KIND of them are
+-- there and the list has more, the whole list is checked (pick). The count leaves out the gone it found; others gone
+-- since the scan are counted until the next scan replaces the list.
+local SPARE = 16
+
+local function pick_lazy(list, si, fx, fy, near)
+  local count, cands = pick(list, si, fx, fy, false, near, PER_KIND + SPARE)
+  local shown, gone = {}, 0
+  for _, rec in ipairs(cands) do
+    local e = subjects[rec]
+    if e ~= nil and not e.valid then
+      gone = gone + 1
+    elseif #shown < PER_KIND then
+      shown[#shown + 1] = rec
+    end
+  end
+  if #shown < PER_KIND and count - gone > #shown then
+    return pick(list, si, fx, fy, true, near)
+  end
+  return count - gone, shown
+end
+
+-- A client's picks of the scans' long lists (client state -> kind -> {list, si, fx, fy, near box, count, shown}),
+-- kept while the list (a new one each scan), the focus, the surface and the near square are the same and every
+-- shown entity is still there. Weak keys: a client's state that went takes its picks along. Only what is sent.
+local picks = setmetatable({}, { __mode = "k" })
+
+local function same_near(a, b)
+  if a == nil or b == nil then
+    return a == b
+  end
+  return a.si == b.si and a.x0 == b.x0 and a.y0 == b.y0 and a.x1 == b.x1 and a.y1 == b.y1
+end
+
+local function shown_there(shown)
+  for _, rec in ipairs(shown) do
+    local e = subjects[rec]
+    if e ~= nil and not e.valid then
+      return false
+    end
+  end
+  return true
+end
+
+-- A scan list's {count, shown}, from the cache when it still holds (near: the square to leave out, or nil).
+local function pick_cached(kind, list, si, fx, fy, near)
+  local s = storage.f3d
+  local mine = picks[s]
+  if not mine then
+    mine = {}
+    picks[s] = mine
+  end
+  local c = mine[kind]
+  if c and c.list == list and c.si == si and c.fx == fx and c.fy == fy and same_near(c.near, near)
+      and shown_there(c.shown) then
+    return c.count, c.shown
+  end
+  local tp = profile.start()
+  local count, shown = pick_lazy(list, si, fx, fy, near)
+  profile.stop("alerts.pick", tp)
+  local box = near and { si = near.si, x0 = near.x0, y0 = near.y0, x1 = near.x1, y1 = near.y1 } or nil
+  mine[kind] = { list = list, si = si, fx = fx, fy = fy, near = box, count = count, shown = shown }
+  return count, shown
+end
+
+local function message_topk()
+  local al = state()
+  local here = puppet.get()
+  local si = here and here.surface.index or 0
+  local f = storage.f3d.focus
+  local fx, fy = world.fixed(f.x), world.fixed(f.y)
+  local l = {}
+  for _, kind in ipairs(ORDER) do
+    local count, shown
+    if LIFETIME[kind] then
+      count, shown = pick(from_events(al, kind), si, fx, fy, false, nil)
+    elseif kind == "pipeline" then
+      local tp = profile.start()
+      count, shown = pick(pipeline_list(), si, fx, fy, false, nil)
+      profile.stop("alerts.pipe", tp)
+    elseif NEAR[kind] then
+      local near = storage.f3d.al_near
+      if not (near and near_on(kind)) then
+        near = nil
+      end
+      count, shown = 0, {}
+      if scans[kind] then
+        count, shown = pick_cached(kind, scans[kind], si, fx, fy, near)
+      end
+      -- The last read's machines inside the square (a few): with the cached ones, picked again.
+      local inside = {}
+      for _, e in pairs(near and near[NEAR[kind]] or {}) do
+        if e.valid then
+          if kind == "unplugged" then
+            inside[#inside + 1] = entry(e, status_name(e.status))
+          else
+            inside[#inside + 1] = entry(e, NEAR_EXTRA[kind])
+          end
+        end
+      end
+      if #inside > 0 then
+        local both = {}
+        for i, rec in ipairs(shown) do
+          both[i] = rec
+        end
+        for _, rec in ipairs(inside) do
+          both[#both + 1] = rec
+        end
+        local _
+        _, shown = pick(both, si, fx, fy, false, nil)
+        count = count + #inside
+      end
+    elseif scans[kind] then
+      count, shown = pick_cached(kind, scans[kind], si, fx, fy, nil)
+    end
+    if count and count > 0 then
+      l[#l + 1] = { kind, count, shown }
+    end
+  end
+  return { t = "al", l = l }
+end
+
+local function message()
+  if perf.on("alerts_topk") then
+    return message_topk()
+  end
+  return message_sorted()
+end
+
 function M.tick()
   local t = game.tick
   -- (alerts_quiet: one step a tick for every client: its results are the same for all.)
   if not (perf.on("alerts_quiet") and stepped_at == t) then
     stepped_at = t
+    local tp = profile.start()
     local ok, err = pcall(step_pass)
+    profile.stop("alerts.pass", tp)
     if not ok then
       pass = nil
       log("[factorio-3d-bridge] alert pass: " .. tostring(err))
     end
   end
-  local ok, err
+  local ok, err = pcall(step_train_scan, t)
+  if not ok then
+    train_scan = nil
+    log("[factorio-3d-bridge] alert train scan: " .. tostring(err))
+  end
   if t % SCAN_STEP == 0 then
     local i = (t / SCAN_STEP) % #SCANS + 1
     ok, err = pcall(SCANS[i])
@@ -958,13 +1253,22 @@ function M.tick()
   if (t + 29) % SEND_INTERVAL == 0 or (s.al_dirty and t - (s.al_sent_at or -CHANGE_GAP) >= CHANGE_GAP) then
     s.al_dirty = nil
     s.al_sent_at = t
-    transport.send_now(message())
+    local tp = profile.start()
+    local msg = message()
+    profile.stop("alerts.msg", tp)
+    transport.send_now(msg)
   end
+end
+
+-- What `al` says from the scans as they are now (tests: alerts_topk's picks and their cache).
+function M.message_now()
+  return message()
 end
 
 -- What the next `al` would say (live_check, /c).
 function M.current()
-  for _, scan in ipairs(SCANS) do
+  train_scan = nil
+  for _, scan in ipairs(SCANS_NOW) do
     scan()
   end
   pass = nil
@@ -976,6 +1280,7 @@ end
 
 function M.reset()
   scans = {}
+  train_scan = nil
   pass = nil
   next_pass = 0
   empty = {}

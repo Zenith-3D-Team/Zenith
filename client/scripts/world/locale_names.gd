@@ -8,6 +8,7 @@ extends RefCounted
 
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 static var language := "en"
 static var _sections := {}  # "item-name" -> {key: text}
@@ -16,7 +17,7 @@ static var _mods_loaded := -1  # ModFiles.generation whose mods' locale is in _s
 
 
 static func configure_from_command_line() -> void:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--factorio-locale="):
 			language = arg.get_slice("=", 1)
 
@@ -36,6 +37,16 @@ static func recipe(name: String) -> String:
 ## Planets and other places in space ("Vulcanus", "Solar system edge").
 static func space_location(name: String) -> String:
 	return _first(name, ["space-location-name"])
+
+
+## Ground tiles ("Grass 1", "Concrete").
+static func tile(name: String) -> String:
+	return _first(name, ["tile-name", "item-name"])
+
+
+## Decoratives ("Green hairy grass", "Small rock").
+static func decorative(name: String) -> String:
+	return _first(name, ["decorative-name", "entity-name", "item-name"])
 
 
 ## Levelled technologies ("logistics-2") are their base name plus the level.

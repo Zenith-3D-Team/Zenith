@@ -19,7 +19,7 @@ data:extend({
     type = "int-setting",
     name = "f3d-bytes-per-tick",
     setting_type = "runtime-global",
-    default_value = 32768,
+    default_value = 131072,
     minimum_value = 4096,
     maximum_value = 1048576,
     order = "c",
@@ -94,6 +94,13 @@ data:extend({
     setting_type = "runtime-global",
     default_value = true,
     order = "f",
+  },
+  {
+    type = "bool-setting",
+    name = "f3d-character-corpses",
+    setting_type = "runtime-global",
+    default_value = true,
+    order = "f2",
   },
   {
     type = "bool-setting",

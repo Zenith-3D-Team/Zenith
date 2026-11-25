@@ -13,6 +13,7 @@ extends RefCounted
 const TRAIN_TYPES := ["locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon", "infinity-cargo-wagon"]
 const ROBOT_TYPES := ["logistic-robot", "construction-robot", "combat-robot", "capture-robot"]
 const StandHeight := preload("res://scripts/world/stand_height.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 var _host
 ## The add-on this copy belongs to (each add-on has its own, for hold_chunks); null for the host's.
@@ -35,8 +36,10 @@ func character() -> Dictionary:
 	if not avatar is Node3D:
 		return {}
 	var a := avatar as Node3D
-	return {"unit": int(a.get("unit")), "position": a.global_position, "forward": _forward(a),
-		"vehicle": int(a.get("vehicle")), "visible": a.visible}
+	var u: Variant = a.get("unit")
+	var v: Variant = a.get("vehicle")
+	return {"unit": int(u) if u != null else 0, "position": a.global_position, "forward": _forward(a),
+		"vehicle": int(v) if v != null else 0, "visible": a.visible}
 
 
 ## The moving things of these types (all when empty) near the focus:
@@ -190,6 +193,59 @@ func held_chunks() -> int:
 func focus() -> Vector2:
 	var rig = _host.rig()
 	return rig.focus_point() if rig != null else Vector2.ZERO
+
+
+## (API 1.91) The game's tick (Factorio's game.tick) of the newest message the client has handled;
+## -1 outside a game. It stands still while the game is paused and runs slower while the game does:
+## what to time things on that must repeat the same way each run (a filmed scene), not the clock.
+func tick() -> int:
+	return Bridge.server_tick if in_game() else -1
+
+
+## (API 1.91) The game's tick as moving things are timed, as a float that runs on smoothly between
+## messages at the rate ticks arrive (game_clock.gd): for motion keyed to ticks. tick() until the
+## first message of moving things; -1 outside a game.
+func smooth_tick() -> float:
+	if not in_game():
+		return -1.0
+	var movers = _host.game_node("movers")
+	var clock = movers.get("clock") if movers != null else null
+	var t: float = float(clock.tick) if clock != null else -1.0
+	return t if t >= 0.0 else float(tick())
+
+
+## (API 1.91) The cue tick: the game tick a filmed scene starts on, for every add-on to time its part
+## from; -1 when none. (1.92) A cue the game sets while running (a mod's
+## `remote.call("zenith", "set_cue", tick)`) replaces `--cue-tick=<game tick>` from Zenith's command
+## line; api.cue_changed(tick) tells an add-on when it arrives or changes.
+func cue_tick() -> int:
+	var run := run_cue()
+	return run if run >= 0 else cue_from_args(Switches.args())
+
+
+static var run_cue_override := -2  # tests: anything but -2 stands in for the bridge's cue
+
+
+## (API 1.92) The cue the game set while running, -1 none (cue_tick() falls back to --cue-tick).
+static func run_cue() -> int:
+	if run_cue_override != -2:
+		return run_cue_override
+	var tree := Engine.get_main_loop() as SceneTree
+	var bridge = tree.root.get_node_or_null("Bridge") if tree != null else null
+	return int(bridge.get("cue_tick")) if bridge != null and bridge.get("cue_tick") != null else -1
+
+
+static var cue_override := -2  # tests: anything but -2 stands in for the command line
+
+
+static func cue_from_args(args: PackedStringArray) -> int:
+	if cue_override != -2:
+		return cue_override
+	for a: String in args:
+		if a.begins_with("--cue-tick="):
+			var v := a.substr(11).strip_edges()
+			return int(v) if v.is_valid_int() and int(v) >= 0 else -1
+	return -1
 
 
 ## The time of day as drawn: 0 noon, 0.5 midnight; and how dark it is, 0 to 0.85.

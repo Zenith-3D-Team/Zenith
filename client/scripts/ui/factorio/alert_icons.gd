@@ -8,6 +8,9 @@ extends Node3D
 
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const InterfaceState := preload("res://scripts/ui/interface_state.gd")
+const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const WorldMirror := preload("res://scripts/world/world.gd")
+const FluidsPower := preload("res://scripts/world/fluids_power.gd")
 ## Cut out with the depth test on: hidden behind buildings in front, and no blending order to swap
 ## (blended, they flickered against each other and the no-power icons). Shown with or without Alt-mode.
 const IconShader := preload("res://shaders/billboard_icon_cut.gdshader")
@@ -35,6 +38,9 @@ var _meshes := {}  # kind -> MultiMeshInstance3D
 var shown := {}
 ## Where they are, by kind (tests).
 var placed := {}
+var _last_lists := {}
+var _last_si := 0
+var _model_generation := -1
 
 
 func _ready() -> void:
@@ -64,6 +70,8 @@ func _ready() -> void:
 ## Gone while the interface is hidden, by whatever hid it (interface_state.gd), on every surface.
 func _process(_delta: float) -> void:
 	InterfaceState.follow(self)
+	if not _last_lists.is_empty() and _model_generation != ModelLibrary.generation:
+		show_alerts(_last_lists, _last_si)
 
 
 ## lists: kind -> [{"position", "si", "unit", ...}]; si: the character's surface (0: unknown, draw all).
@@ -71,6 +79,9 @@ func _process(_delta: float) -> void:
 ## pass over every surface that is seconds old, so a building mined, destroyed or on another surface
 ## (the remote view of another planet) would otherwise leave its icon over empty ground.
 func show_alerts(lists: Dictionary, si: int) -> void:
+	_last_lists = lists
+	_last_si = si
+	_model_generation = ModelLibrary.generation
 	if _meshes.is_empty():
 		return
 	var power = get_parent().get_node_or_null("FluidsPower") if get_parent() != null else null
@@ -104,11 +115,16 @@ func _place(e: Dictionary, si: int, power) -> Variant:
 		var top := 1.6
 		if power != null and power.has_method("entity_top"):
 			top = float(power.entity_top(rec))
+		elif world is WorldMirror:
+			top = FluidsPower.entity_top_in(world, rec)
 		return Vector3(rec.pos.x, top + 0.3 + SIZE * 0.5, rec.pos.y)
 	# Rolling stock is a mover, not part of the chunks.
 	var m = movers.position_of(unit) if movers != null else null
 	if m is Vector3:
-		return Vector3(m.x, m.y + 2.8 + SIZE * 0.5, m.z)
+		var mtop := float(movers.top_of(unit)) if movers != null and movers.has_method("top_of") else -1.0
+		if mtop <= 0.0:
+			mtop = 2.8
+		return Vector3(m.x, m.y + mtop + 0.3 + SIZE * 0.5, m.z)
 	return null
 
 

@@ -11,6 +11,7 @@ uniform float pbr_metallic = 0.0;
 uniform bool use_orm = false;
 uniform sampler2D orm_picture : hint_default_white, filter_linear_mipmap, repeat_enable;
 uniform bool use_normal = false;
+uniform bool use_tangent = false;
 uniform sampler2D normal_picture : hint_normal, filter_linear_mipmap, repeat_enable;
 uniform float normal_scale = 1.0;
 
@@ -60,6 +61,50 @@ vec3 item_pbr_normal(vec3 n_in, vec3 vertex, vec2 uv) {
 	float inv = inversesqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
 	vec3 n = normalize(mat3(t * inv * hand, -b * inv * hand, n0) * nm);
 	return any(isnan(n)) ? n0 : n;
+}
+
+// Normal map using precomputed MikkTSpace vertex tangents (Godot's BINORMAL = cross(N, T) * w = -dP/dv,
+// matching OpenGL normal map +Y green up); falls back to screen-space derivatives when disabled or degenerate.
+// `scale_mul` smoothly fades normal relief down toward 0 across LOD transitions.
+vec3 item_pbr_normal_scale(vec3 n_in, vec3 vertex, vec2 uv, vec3 t_in, vec3 b_in, float scale_mul) {
+	if (!use_normal || scale_mul <= 0.001) {
+		return n_in;
+	}
+	if (!use_tangent) {
+		vec3 nm = texture(normal_picture, uv).rgb * 2.0 - 1.0;
+		nm.xy *= normal_scale * scale_mul;
+		vec3 n0 = normalize(n_in);
+		vec3 dp1 = dFdx(vertex);
+		vec3 dp2 = dFdy(vertex);
+		vec2 duv1 = dFdx(uv);
+		vec2 duv2 = dFdy(uv);
+		vec3 dp2perp = cross(dp2, n0);
+		vec3 dp1perp = cross(n0, dp1);
+		vec3 t = dp2perp * duv1.x + dp1perp * duv2.x;
+		vec3 b = dp2perp * duv1.y + dp1perp * duv2.y;
+		float hand = dot(dp1, dp2perp) < 0.0 ? -1.0 : 1.0;
+		float inv = inversesqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
+		vec3 n = normalize(mat3(t * inv * hand, -b * inv * hand, n0) * nm);
+		return any(isnan(n)) ? n0 : n;
+	}
+	vec3 nm = texture(normal_picture, uv).rgb * 2.0 - 1.0;
+	nm.xy *= normal_scale * scale_mul;
+	vec3 n0 = normalize(n_in);
+	vec3 t0 = t_in - n0 * dot(n0, t_in);
+	vec3 b0 = b_in - n0 * dot(n0, b_in);
+	float t2 = dot(t0, t0);
+	float b2 = dot(b0, b0);
+	if (t2 < 1e-12 || b2 < 1e-12) {
+		return n0;
+	}
+	t0 *= inversesqrt(t2);
+	b0 *= inversesqrt(b2);
+	vec3 n = normalize(mat3(t0, b0, n0) * nm);
+	return any(isnan(n)) ? n0 : n;
+}
+
+vec3 item_pbr_normal_tan(vec3 n_in, vec3 vertex, vec2 uv, vec3 t_in, vec3 b_in) {
+	return item_pbr_normal_scale(n_in, vertex, uv, t_in, b_in, 1.0);
 }
 
 // The look's balance of light on the picture by the way the surface faces (world up 0-1).

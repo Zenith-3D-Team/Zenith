@@ -77,8 +77,9 @@ def decode(msg):
             l[i] = [p + d for p, d in zip(prev, rec[:4])] + rec[4:]
             prev = l[i][:4]
     else:
-        for i in range(4, len(l)):
-            l[i] += l[i - 4]
+        width = 9 if msg["t"] == "ie" else 4
+        for i in range(width, len(l)):
+            l[i] += l[i - width]
 
 
 batched = 0  # the most messages seen in one datagram
@@ -153,6 +154,19 @@ check(chunks[:1] == [(0, 0)], "nearest chunk first")
 ents = [rec for m in of_type(msgs, "ents") for rec in m["e"]]
 check(any(r[1] == protos["assembling-machine-1"] for r in ents), "starter base is in the snapshot")
 check(any(r[1] == protos["iron-ore"] for r in ents), "ore patch is in the snapshot")
+lamp_recs = [r for r in ents if r[1] == protos["small-lamp"]]
+unplugged_rec = next(r for r in lamp_recs if r[2] == int(-6.5 * 256) and r[3] == int(-14.5 * 256))
+powered_lamps = [r for r in lamp_recs if r[0] != unplugged_rec[0]]
+check(len(powered_lamps) >= 3 and all(len(r) == 6 and r[5].get("lp") in (1, 3) for r in powered_lamps),
+      f"mock powered lamps carry snapshot lp hints: {powered_lamps}")
+check(any(len(r) == 6 and r[5].get("lp") == 3 for r in powered_lamps)
+      and any(len(r) == 6 and "lc" in r[5] for r in powered_lamps),
+      f"mock lamps include always-on lp=3 and lc colour hints: {powered_lamps}")
+check(len(unplugged_rec) == 5 or "lp" not in unplugged_rec[5],
+      f"mock unplugged lamp omits lp hint: {unplugged_rec}")
+sig_recs = [r for r in ents if r[1] in (protos["rail-signal"], protos["rail-chain-signal"])]
+check(len(sig_recs) >= 2 and all(len(r) == 6 and r[5].get("sg") in (1, 2, 3, 4) for r in sig_recs),
+      f"mock rail signals carry snapshot sg hints: {sig_recs}")
 cliffs = {r[5]["co"] for r in ents if r[1] == protos["cliff"]}
 check(len(cliffs) == 14, f"the cliffs round the plateau show every straight, outer and inner piece, the free one both ends: {sorted(cliffs)}")
 check(of_type(msgs, "mv"), "movers are streamed")
@@ -574,11 +588,19 @@ check(any(0 < h < 1000 for _, h in damaged), f"hp: damaged biters report their h
 died = of_type(msgs, "died")
 check(len(died) >= 2 and all(d["p"] in (protos["small-biter"], protos["medium-biter"]) for d in died),
       f"died: biters die when shot: {len(died)}")
+check(died and all(d.get("cx") == mock_server.fixed(game.player["x"]) and d.get("cy") == mock_server.fixed(game.player["y"]) and d.get("dt") == "physical" for d in died),
+      f"died: carries attacker position cx,cy and damage type dt: {died[:1]}")
+check(died and all(d.get("dmg") in (333, 67) and d.get("src") == "firearm-magazine" for d in died),
+      f"died: carries dmg and src: {died[:1]}")
 after = msgs[msgs.index(died[0]) + 1:] if died else []
 check(died and all(r[0] != died[0]["u"] for m in of_type(after, "mv") for r in m["l"]), "a dead biter leaves the movers")
 hits = of_type(msgs, "afx")
 check(hits and all(h["fx"] == "blood" for h in hits) and died[0]["u"] in {h["u"] for h in hits},
       f"afx: a biter that is hit bleeds (combat.lua's hit effect), the one that died too: {hits[:1]}")
+check(hits and all(h.get("cx") == mock_server.fixed(game.player["x"]) and h.get("cy") == mock_server.fixed(game.player["y"]) and h.get("dt") == "physical" for h in hits),
+      f"afx: carries attacker position cx,cy and damage type dt: {hits[:1]}")
+check(hits and all(h.get("dmg") in (333, 67) and 0 <= h.get("hp") <= 1000 and h.get("src") == "firearm-magazine" for h in hits),
+      f"afx: carries dmg, hp, src: {hits[:1]}")
 guns = of_type(msgs, "guns")
 check(guns and guns[-1]["sel"] == 1 and guns[-1]["l"][0][0] == "pistol" and 0 < guns[-1]["l"][0][2] < 10,
       f"guns: magazines get used up: {guns[-1:]}")
@@ -1976,6 +1998,114 @@ step(2)
 after = of_type(take(), "ext")
 check([m.get("d") for m in after] == [{"echo": 2}], f"link: a closed channel is dropped, the others still answer: {after}")
 
+# Distant Horizon LOD (mock_server.py): hello.lod, welcome.lod, lod_sub map/revs/want/stop, procedural biomes.
+HELLO_LOD = dict(HELLO, sid="dh-mock", w=0, lod=1)
+send(HELLO_LOD)
+step(2)
+wel = of_type(take(), "welcome")
+check(wel and wel[-1].get("lod") == 1, f"dh mock: welcome carries lod=1 when asked: {wel[-1:]}")
+
+send({"t": "lod_sub", "si": 1, "q": 11, "act": "map"})
+step(1)
+msgs = take()
+lodms = of_type(msgs, "lodm")
+lodrs = of_type(msgs, "lodr")
+check(lodms and lodms[0]["q"] == 11 and lodms[0]["si"] == 1 and len(lodms[0]["w"]) >= 500,
+      f"dh mock: map returns wide charted row runs: {len(lodms)} parts, {lodms and len(lodms[0]['w'])} rows")
+check(lodrs and lodrs[0]["q"] == 11 and len(lodrs[0]["l"]) >= 3,
+      f"dh mock: map returns initial non-zero region revs: {lodrs}")
+
+# Change something in region (0, 0) and ask revs with stale rev 0 vs current rev.
+flat0 = lodrs[0]["l"]
+revs_map = {(flat0[i], flat0[i + 1]): flat0[i + 2] for i in range(0, len(flat0), 3)}
+rev00 = revs_map[(0, 0)]
+send({"t": "lod_sub", "si": 1, "q": 12, "act": "revs", "rg": [[0, 0, 0], [9, 9, 0]]})
+step(1)
+rev_ans = of_type(take(), "lodr")
+check(len(rev_ans) == 1 and rev_ans[0]["l"] == [0, 0, rev00], f"dh mock: revs reports stale region only: {rev_ans}")
+send({"t": "lod_sub", "si": 1, "q": 13, "act": "revs", "rg": [[0, 0, rev00], [9, 9, 0]]})
+step(1)
+check(of_type(take(), "lodr")[0]["l"] == [], "dh mock: revs returns empty list when matched")
+
+# Procedural & starter chunks across wide -256..256 range at all 5 resolutions + uncharted (500, 500).
+for res_v in (32, 16, 8, 4, 2):
+    send({"t": "lod_sub", "si": 1, "res": res_v, "act": "want",
+          "c": [[0, 0], [32, 32], [-128, 64], [200, -180], [500, 500]]})
+    step(2)
+    lods = {(m["cx"], m["cy"]): m for m in of_type(take(), "lod") if m["res"] == res_v}
+    check(len(lods) == 5, f"dh mock: got all 5 requested lod chunks at res {res_v}: {list(lods)}")
+    check(lods[(500, 500)].get("none") == 1, f"dh mock: outside -256..256 returns none=1 at res {res_v}")
+    expected_cells = (32 // res_v) ** 2
+    for kc in ((0, 0), (32, 32), (-128, 64), (200, -180)):
+        cm = lods[kc]
+        check("none" not in cm and sum(cm["tl"][1::2]) == expected_cells and sum(cm["el"][2::3]) == expected_cells,
+              f"dh mock: valid lod RLE sums at {kc} res={res_v}")
+
+# Verify procedural area generates multiple tiles/entities and stop clears pending queue.
+wide_chunks = [[cx, cy] for cx in range(10, 30) for cy in range(10, 14)]
+send({"t": "lod_sub", "si": 1, "res": 8, "act": "want", "c": wide_chunks})
+step(2)
+wide_msgs = of_type(take(), "lod")
+check(any(any(m["el"][i] > 0 for i in range(0, len(m["el"]), 3)) for m in wide_msgs),
+      "dh mock: procedural chunks contain entities")
+send({"t": "lod_sub", "act": "stop"})
+step(2)
+check(not of_type(take(), "lod"), "dh mock: stop cancels queued lod chunks")
+
+# Multi-surface (platform si=2, planet si=3), unknown surface, cap at 256, and entity rotation rev bump:
+send({"t": "lod_sub", "si": 2, "q": 14, "act": "map"})
+step(1)
+plat_m = of_type(take(), "lodm")
+check(plat_m and plat_m[0]["si"] == 2 and plat_m[0]["w"] == [[-1, -1, 2], [0, -1, 2]],
+      f"dh mock: space platform lodm returns 2x2 platform footprint: {plat_m}")
+send({"t": "lod_sub", "si": 4, "res": 8, "act": "want", "c": [[0, 0], [99, 99]]})
+step(2)
+p_lods = {(m["cx"], m["cy"]): m for m in of_type(take(), "lod") if m["si"] == 4}
+check((0, 0) in p_lods and "none" not in p_lods[(0, 0)] and p_lods.get((99, 99), {}).get("none") == 1,
+      f"dh mock: planet si=4 (vulcanus) serves charted lod chunks and none=1 outside: {p_lods}")
+send({"t": "lod_sub", "si": 999, "q": 15, "act": "map"})
+send({"t": "lod_sub", "si": 1, "res": 7, "act": "want", "c": [[i, 0] for i in range(300)]})
+step(1)
+check(len(game.lod_queue) <= 256 and game.lod_res == 8 and not of_type(take(), "lodm"),
+      "dh mock: unknown surface ignored, bad res falls back to 8, want capped at 256")
+send({"t": "lod_sub", "act": "stop"})
+step(1)
+take()
+
+# Rotating an entity bumps lod_revs and shows up in lod_sub revs:
+rot_ent = next(e for e in game.entities.values() if e.unit)
+rot_reg = (math.floor(rot_ent.x / 32 / 16), math.floor(rot_ent.y / 32 / 16))
+rev_before_rot = revs_map.get(rot_reg, 0)
+send({"t": "rotate", "x": mock_server.fixed(rot_ent.x), "y": mock_server.fixed(rot_ent.y), "u": rot_ent.unit})
+step(1)
+take()
+send({"t": "lod_sub", "si": 1, "q": 16, "act": "revs", "rg": [[rot_reg[0], rot_reg[1], rev_before_rot]]})
+step(1)
+rot_revs = of_type(take(), "lodr")
+check(rot_revs and len(rot_revs[0]["l"]) == 3 and rot_revs[0]["l"][2] > rev_before_rot,
+      f"dh mock: entity rotation bumps region rev reported by revs: {rot_revs}")
+
+# Check lod chunk carries pol on Nauvis and tick 150 emits valid pols:
+send({"t": "lod_sub", "si": 1, "res": 8, "act": "want", "c": [[0, 0]]})
+step(2)
+nauvis_lods = [m for m in of_type(take(), "lod") if m["si"] == 1 and (m["cx"], m["cy"]) == (0, 0) and "none" not in m]
+check(nauvis_lods and int(nauvis_lods[0].get("pol", 0)) > 0,
+      f"dh mock: nauvis lod chunk carries non-zero pol: {nauvis_lods[:1]}")
+saved_tick = game.tick
+game.tick = 149
+step(1)
+mock_pols = of_type(take(), "pols")
+game.tick = saved_tick
+check(mock_pols and len(mock_pols[0].get("l", [])) >= 3 and len(mock_pols[0]["l"]) % 3 == 0,
+      f"dh mock: emits pols sparse distant pollution on tick % 300 == 150: {mock_pols[:1]}")
+
+# Reset without lod flag so binary test checks clean default welcome (without lod).
+HELLO.update({"w": 0, "sid": "reset-after-dh"})
+send(HELLO)
+step(2)
+reset_wel = of_type(take(), "welcome")
+check(reset_wel and "lod" not in reset_wel[-1], f"dh mock: welcome omits lod when hello omits lod: {reset_wel[-1:]}")
+
 # Binary frames (docs/PROTOCOL.md, "Binary frames"): a client whose hello says bin gets every datagram as
 # frames, mv in binary, the rest as JSON text inside them, and a welcome that says bin.
 HELLO.update({"sid": "binary", "w": 0, "bin": protocol.WIRE_VERSION})
@@ -2022,6 +2152,137 @@ for _ in range(20):
         except BlockingIOError:
             break
 check(raw and not any(d[:1] == bytes((protocol.WIRE_MAGIC,)) for d in raw), "without bin again: JSON text")
+
+# Simulated worker robots (`rb: 1`): JSON and binary v4 emit valid `rb` and exclude worker robots from `mv` and `rc`.
+robot_eid = {mock_server.EID["logistic-robot"], mock_server.EID["construction-robot"]}
+for use_bin in (False, True):
+    HELLO["rb"] = 1
+    if use_bin:
+        HELLO["bin"] = 4
+    else:
+        HELLO.pop("bin", None)
+    send(HELLO)
+    rb_seen, mv_bots, rc_seen = [], [], []
+    for _ in range(25):
+        step(1)
+        for m in take():
+            if m["t"] == "rb":
+                rb_seen.append(m)
+            elif m["t"] == "mv":
+                for rec in m["l"]:
+                    if rec[1] in robot_eid:
+                        mv_bots.append(rec)
+            elif m["t"] == "rc":
+                rc_seen.append(m)
+    mode = "bin4" if use_bin else "json"
+    check(rb_seen and any(len(m.get("u", [])) >= 11 for m in rb_seen), f"rb ({mode}): emits rb records")
+    check(not mv_bots, f"rb ({mode}): excludes worker robots from mv: {mv_bots[:3]}")
+    check(not rc_seen, f"rb ({mode}): skips rc when rb is active")
+HELLO.pop("rb", None)
+HELLO.pop("bin", None)
+
+# Selective NACK ring replay hit & aged-out chunk requeue miss fallback (and protocol.client_problems):
+check(not protocol.client_problems({"t": "nack", "r": [1, 2], "c": [[0, 0]]})
+      and bool(protocol.client_problems({"t": "nack", "r": []}))
+      and bool(protocol.client_problems({"t": "nack", "r": list(range(1, 66))})),
+      "protocol.client_problems validates nack schema (1-64 positive r, optional c)")
+HELLO.update({"w": 0, "sid": "nack-ring-test"})
+send(HELLO)
+step(4)
+take()
+send({"t": "sub", "c": [[0, 0]]})
+step(3)
+take()
+game.send_reliable({"t": "inv", "l": [["iron-plate", 777]]})
+step(1)
+ring_msgs = take()
+inv_hit = next((m for m in ring_msgs if m.get("t") == "inv" and m.get("l") == [["iron-plate", 777]]), None)
+check(inv_hit is not None, f"nack mock setup sent inv reliable frame: {ring_msgs}")
+hit_r = inv_hit["r"]
+rseq_before_nack = game.rseq
+send({"t": "nack", "r": [hit_r], "c": [[0, 0]]})
+game.receive()  # processes incoming UDP without stepping world updates; sends ring hit directly
+for addr_b in list(game.batches):
+    game.send_batch(addr_b)
+hit_raw = []
+while True:
+    try:
+        hit_raw.extend(protocol.split_datagram(client.recvfrom(65536)[0]))
+    except BlockingIOError:
+        break
+check(len(hit_raw) == 1 and hit_raw[0].get("r") == hit_r and hit_raw[0].get("l") == [["iron-plate", 777]]
+      and game.rseq == rseq_before_nack and not game.queue,
+      f"nack mock hit: replayed exact r={hit_r} without incrementing rseq ({rseq_before_nack}->{game.rseq}) or queuing chunks: {hit_raw}")
+
+# Push > NACK_RING_SIZE reliable messages so hit_r ages out, then nack with c=[[0,0]] must miss and requeue (0,0):
+for idx in range(protocol.NACK_RING_SIZE + 8):
+    game.send_reliable({"t": "inv", "l": [["copper-plate", idx + 1]]})
+while game.outbox:
+    step(1)
+    take()
+send({"t": "nack", "r": [hit_r], "c": [[0, 0]]})
+game.receive()
+for addr_b in list(game.batches):
+    game.send_batch(addr_b)
+miss_raw = []
+while True:
+    try:
+        miss_raw.extend(protocol.split_datagram(client.recvfrom(65536)[0]))
+    except BlockingIOError:
+        break
+check(not any(m.get("r") == hit_r for m in miss_raw) and (0, 0) in game.queue,
+      f"nack mock miss (>256 aged out): skips ring replay and requeues chunk (0,0) (queue={game.queue})")
+step(3)
+requeued = take()
+check(any(m.get("t") == "chunk" and (m.get("cx"), m.get("cy")) == (0, 0) for m in requeued),
+      f"nack mock miss: requeued chunk (0,0) delivers cleanly: {[m['t'] for m in requeued]}")
+
+# hello/bye clears nack_ring:
+send({"t": "bye"})
+game.receive()
+check(all(x is None for x in game.nack_ring), "nack mock: bye clears nack_ring")
+
+# Inserter events (`ie`), datagram numbering (`dg` via `dq`), and `raise`:
+HELLO.update({"w": 0, "sid": "ie-dg-raise", "ie": 1, "dq": 1})
+send(HELLO)
+step(4)
+msgs_ie = take()
+for _ in range(SWING_TICKS := 80):
+    step(1)
+    msgs_ie.extend(take())
+ie_msgs = of_type(msgs_ie, "ie")
+ih_msgs = of_type(msgs_ie, "ih")
+dg_msgs = of_type(msgs_ie, "dg")
+check(bool(ie_msgs) and any(len(m["l"]) >= 9 and len(m["l"]) % 9 == 0 for m in ie_msgs),
+      "ie=1 emits 9-int inserter event records")
+check(not ih_msgs, f"ie=1 suppresses ih samples (got {len(ih_msgs)})")
+check(bool(dg_msgs) and all(b["n"] > a["n"] for a, b in zip(dg_msgs, dg_msgs[1:])),
+      f"dq=1 emits monotonically numbered dg trailers ({len(dg_msgs)} dgs)")
+
+# Binary mode also emits valid KIND_DG frames and ie=2 emits both ie and ih:
+HELLO.update({"w": 1, "ie": 2, "bin": protocol.WIRE_VERSION})
+send(HELLO)
+step(10)
+msgs_both = take()
+check(bool(of_type(msgs_both, "ie")) and bool(of_type(msgs_both, "ih")) and bool(of_type(msgs_both, "dg")),
+      "ie=2 + dq=1 + bin emits ie, ih, and binary dg frames")
+
+# `raise` via /f3d-debug raise:
+send({"t": "cmd", "id": 9901, "text": "/f3d-debug raise"})
+step(2)
+msgs_raise = take()
+check(bool(of_type(msgs_raise, "raise")), "cmd /f3d-debug raise emits raise message")
+HELLO.pop("ie", None)
+HELLO.pop("dq", None)
+HELLO.pop("bin", None)
+
+# Every RELIABLE | IMMEDIATE protocol type must be represented across tools/mock*.py:
+import re as _re
+_mock_src = "\n".join(p.read_text(encoding="utf-8") for p in sorted(pathlib.Path(__file__).resolve().parent.glob("mock*.py")))
+_mock_types = set(_re.findall(r'["\']t["\']\s*:\s*["\']([a-z0-9_]+)["\']', _mock_src))
+_mock_types |= set(_re.findall(r'send_(?:list|parts|now|reliable)\(\s*["\']([a-z0-9_]+)["\']', _mock_src))
+_missing_mock = sorted((protocol.RELIABLE | protocol.IMMEDIATE) - _mock_types)
+check(not _missing_mock, f"100% RELIABLE | IMMEDIATE mock coverage (missing: {_missing_mock})")
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

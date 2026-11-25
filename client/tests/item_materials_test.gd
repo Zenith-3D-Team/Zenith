@@ -56,15 +56,20 @@ func _init() -> void:
 			"preview: the glass keeps its glow and alpha")
 
 	# The shaders parse (headless, Godot's own shader front end): each has the own materials' uniforms.
-	for shader: Shader in [ItemModels.ItemShader, ItemModels.ItemOwnShader, LaneModelShader,
-			ItemModels.ItemOwnBlendShader, ItemModels.LaneModelBlendShader]:
+	for shader: Shader in [ItemModels.ItemShader, ItemModels.ItemOwnShader, ItemModels.ItemOwnCutShader, LaneModelShader,
+			ItemModels.LaneModelCutShader, ItemModels.ItemOwnBlendShader, ItemModels.LaneModelBlendShader]:
 		var names := shader.get_shader_uniform_list().map(func(u: Dictionary) -> String: return str(u["name"]))
 		check(names.has("alpha_mode") and names.has("emission_picture") and names.has("picture"),
 			"%s parses, with the own materials' uniforms" % shader.resource_path)
-	for shader: Shader in [ItemModels.ItemShader, ItemModels.ItemOwnShader, ItemModels.ItemOwnBlendShader]:
+	for shader: Shader in [ItemModels.ItemShader, ItemModels.ItemOwnShader, ItemModels.ItemOwnCutShader, ItemModels.ItemOwnBlendShader]:
 		var names := shader.get_shader_uniform_list().map(func(u: Dictionary) -> String: return str(u["name"]))
 		check(names.has("lod_cam") and names.has("lod_min_sq") and names.has("lod_max_sq"),
 			"%s parses with item LOD uniforms" % shader.resource_path)
+	check(_only_guarded_discards("res://shaders/item_own.gdshader", "res://shaders/item_body.gdshaderinc", ["ITEM_CUT"]),
+		"item_own.gdshader opaque path has no unguarded discard (Early-Z intact)")
+	check(_only_guarded_discards("res://shaders/belt_lane_model.gdshader", "res://shaders/belt_lane_model.gdshaderinc",
+		["LANE_FRAG_CULL", "ITEM_CUT", "ITEM_BLEND"]),
+		"belt_lane_model.gdshader opaque path only discards inside LANE_FRAG_CULL / ITEM_CUT / ITEM_BLEND")
 
 	# Phase 2: single-surface opaque LOD for multi-surface / see-through own-look items.
 	if mesh != null:
@@ -105,17 +110,31 @@ func _init() -> void:
 		check(text.contains("#ifdef ITEM_BLEND") and text.contains("ALPHA = own_a;") and text.contains("item_own_cut(own_a"),
 			"%s: ALPHA only with ITEM_BLEND, dithered otherwise" % src.get_file())
 
-	# --item-glass=dither: every surface in the opaque shader, the glass dithered there (as before).
+	# --item-glass=dither: body stays on opaque Early-Z shader; glass & liquid use cut twin (ITEM_CUT / discard).
 	ItemModels.glass_blend = false
 	var dithered := ItemModels.read(path)
 	if dithered != null:
 		var d := ItemModels.dressed(dithered, ItemModels.ItemOwnShader)
-		var all_opaque := true
-		for i in d.get_surface_count():
-			var m := d.surface_get_material(i) as ShaderMaterial
-			all_opaque = all_opaque and m != null and m.shader == ItemModels.ItemOwnShader and m.render_priority == 0
-		check(all_opaque and (d.surface_get_material(1) as ShaderMaterial).get_shader_parameter("alpha_mode") == 2,
-			"--item-glass=dither: every surface opaque, the glass dithered")
+		var body_d := d.surface_get_material(0) as ShaderMaterial
+		var glass_d := d.surface_get_material(1) as ShaderMaterial
+		var liquid_d := d.surface_get_material(2) as ShaderMaterial
+		check(body_d != null and body_d.shader == ItemModels.ItemOwnShader and body_d.render_priority == 0,
+			"--item-glass=dither: body stays on opaque ItemOwnShader, render_priority 0")
+		check(glass_d != null and glass_d.shader == ItemModels.ItemOwnCutShader and glass_d.render_priority == 0
+			and glass_d.get_shader_parameter("alpha_mode") == 2,
+			"--item-glass=dither: glass uses ItemOwnCutShader, render_priority 0, alpha_mode 2")
+		check(liquid_d != null and liquid_d.shader == ItemModels.ItemOwnCutShader and liquid_d.render_priority == 0
+			and liquid_d.get_shader_parameter("alpha_mode") == 2,
+			"--item-glass=dither: liquid uses ItemOwnCutShader, render_priority 0, alpha_mode 2")
+		var dl := ItemModels.dressed(dithered, LaneModelShader)
+		var l_body := dl.surface_get_material(0) as ShaderMaterial
+		var l_glass := dl.surface_get_material(1) as ShaderMaterial
+		var l_liquid := dl.surface_get_material(2) as ShaderMaterial
+		check(l_body != null and l_body.shader == LaneModelShader and l_body.render_priority == 0
+			and l_glass != null and l_glass.shader == ItemModels.LaneModelCutShader and l_glass.render_priority == 0
+			and l_glass.get_shader_parameter("alpha_mode") == 2
+			and l_liquid != null and l_liquid.shader == ItemModels.LaneModelCutShader and l_liquid.render_priority == 0,
+			"--item-glass=dither: far belt model body uses LaneModelShader, glass/liquid use LaneModelCutShader")
 	ItemModels.glass_blend = true
 
 	# The old way: no picture shared by both surfaces, so plain colours and one shared material.
@@ -224,3 +243,46 @@ func _add_box(mesh: ArrayMesh, centre: Vector3, size: Vector3, material: Materia
 	arrays[Mesh.ARRAY_VERTEX] = verts
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 	mesh.surface_set_material(mesh.get_surface_count() - 1, material)
+
+
+func _only_guarded_discards(shader_path: String, inc_path: String, guards: Array) -> bool:
+	var sh_src := FileAccess.get_file_as_string(shader_path)
+	var inc_src := FileAccess.get_file_as_string(inc_path)
+	if sh_src == "" or inc_src == "":
+		return false
+	for g in guards:
+		if sh_src.contains("#define " + str(g)):
+			return false
+	var stack: Array[String] = []
+	for raw_line in inc_src.split("\n"):
+		var line := raw_line.get_slice("//", 0).strip_edges()
+		if line.begins_with("#ifdef "):
+			stack.append(line.substr(7).strip_edges())
+			continue
+		elif line.begins_with("#ifndef "):
+			stack.append("!" + line.substr(8).strip_edges())
+			continue
+		elif line.begins_with("#if "):
+			stack.append(line.substr(4).strip_edges())
+			continue
+		elif line.begins_with("#elif "):
+			if not stack.is_empty():
+				stack[stack.size() - 1] = line.substr(6).strip_edges()
+			continue
+		elif line.begins_with("#else"):
+			if not stack.is_empty():
+				stack[stack.size() - 1] = "ELSE:" + stack[stack.size() - 1]
+			continue
+		elif line.begins_with("#endif"):
+			if not stack.is_empty():
+				stack.pop_back()
+			continue
+		if line.contains("discard"):
+			var ok := false
+			for cond in stack:
+				for g in guards:
+					if cond == str(g) or cond == "defined(" + str(g) + ")":
+						ok = true
+			if not ok:
+				return false
+	return true

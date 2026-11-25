@@ -13,6 +13,7 @@ const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const AlertIcons := preload("res://scripts/ui/factorio/alert_icons.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Look at a position (tiles) in remote view.
 signal show_at(at: Vector2)
@@ -116,12 +117,12 @@ var last_seen := {}
 const SOUND_KINDS := ["destroyed"]
 const SOUND_KINDS_AMMO := ["destroyed", "no_ammo"]
 const SOUND_GAP_MSEC := 1000
-static var sounds_on := not ("--alert-sounds=off" in OS.get_cmdline_user_args())
+static var sounds_on := Switches.on("--alert-sounds")
 ## The bar's alerts on the minimap and the map view (Factorio's changelog 0.7.1: "Alert notifications
 ## are visible on the minimap as well"). `--minimap-alerts=off`: neither draws them, as before.
-static var map_marks_on := not ("--minimap-alerts=off" in OS.get_cmdline_user_args())
+static var map_marks_on := Switches.on("--minimap-alerts")
 ## `--alert-sounds=ammo`: the out-of-ammunition beep as before.
-static var sound_kinds: Array = SOUND_KINDS_AMMO if "--alert-sounds=ammo" in OS.get_cmdline_user_args() else SOUND_KINDS
+static var sound_kinds: Array = SOUND_KINDS_AMMO if Switches.has("--alert-sounds=ammo") else SOUND_KINDS
 ## Kinds muted in the Alerts configuration (alerts_config.gd apply).
 var muted_kinds: Array = []
 ## Plays it (the UI test counts it instead).

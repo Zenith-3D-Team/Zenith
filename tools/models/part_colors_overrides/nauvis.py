@@ -72,8 +72,13 @@ OVERRIDES = {
     # The name board is in the station's colour, a mask Factorio tints at runtime (default red);
     # the sprite the sampler reads is the grey one under it.
     "train-stop": {"colors": {"paint_stop": "#b03426"}},
-    # Yellow and black hazard stripes; the sample greyed the yellow to mud.
-    "gate": {"sprite_colors": {"hazard": "#a08650", "hazard_black": "#2a2620"}},
+    # Yellow and black hazard stripes; the sample greyed the yellow to mud (and the wall's stone
+    # colour, so a gate row read as wall): Factorio's mustard yellow on dark plates, as the lit
+    # stripes of gate-horizontal.png, the open frame's pale rails and the dark buttresses.
+    "gate": {"colors": {"hazard": "#b8902c", "gate_plate": "#24231f", "steel": "#878079",
+                        "steel_dark": "#45423d", "steel_black": "#1c1b19"}},
+    # The model the gate had before (`gate-old.glb`, `--gate-model=old`).
+    "gate-old": {"sprite_colors": {"hazard": "#a08650", "hazard_black": "#2a2620"}},
     "elevated-*": {"sprite_colors": dict(DECK)},
     # The ramp has no sprite entry (its picture smears over the embankment): the ground rails'
     # ballast, ties and rails, the elevated deck, and the supports' stone, as those models sampled

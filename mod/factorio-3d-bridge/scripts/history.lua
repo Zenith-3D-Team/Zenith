@@ -39,7 +39,7 @@ function M.record(entry)
   h.next = id + 1
   h.entries[id] = entry
   h.entries[id - KEEP] = nil
-  transport.send_reliable({ t = "hist", h = id, what = entry.what })
+  transport.send_reliable_priority({ t = "hist", h = id, what = entry.what })
   return id
 end
 

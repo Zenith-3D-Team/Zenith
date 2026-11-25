@@ -25,6 +25,9 @@ kit.MATERIALS.update({
     "paint_stop": ("c8402a", 0.55, 0.3, None, 0),
     "stone_block": ("857a68", 0.95, 0.0, None, 0),  # the supports' dressed stone, brown-grey
     "lamp_stop": ("ffd6a0", 0.3, 0.0, "ffc070", 2.0),
+    # The gate's door plates (dark steel, the hazard stripes' black) and its small warning lights.
+    "gate_plate": ("2a2926", 0.6, 0.6, None, 0),
+    "lamp_gate": ("ffb040", 0.3, 0.0, "ff9020", 1.2),
 })
 
 
@@ -435,43 +438,74 @@ def _clip(poly, y0, y1, z0, z1):
 
 GATE_H = 1.2
 GATE_BOTTOM, GATE_TOP = 0.34, 0.11  # half widths of the door's tapered section
+GATE_RAIL = 0.355  # the ground rails' inner edge, clear of the door's foot
+
+
+def _gate_half(z):
+    """The door's half width at height z."""
+    return GATE_BOTTOM - (GATE_BOTTOM - GATE_TOP) * z / GATE_H
 
 
 @model("gate")
 def gate():
     """Factorio's gate, facing north: it stands in a north-south wall (the "vertical" gate; turned
-    east it is the horizontal one). A steel frame on the ground and the door (`anim_gate_door`,
-    pivot on the ground): a tapered slab with hazard stripes and steel caps that sinks into the
-    ground to open (anim.gd)."""
+    east it is the horizontal one). Made to read as a gate from a player's distance and at night:
+
+    - the door (`anim_gate_door`, pivot on the ground, sunk into the ground to open by anim.gd): a
+      tapered dark steel slab, both long faces in Factorio's bold diagonal yellow-and-black hazard
+      stripes, a dark rim at its foot and yellow caps with dark slots along its crown;
+    - the frame that stays when it is down: light steel ground rails either side of the dark slot
+      the door sinks into, and a dark steel buttress housing in the middle of each side (the dark
+      wedges at the foot of Factorio's door), each with a small amber warning light on top.
+
+    The previous model (pale stripes the stone wall's colour) is kept as `gate-old.glb`
+    (`--gate-model=old`)."""
     frame = Part()
+    # The slot and the ground rails.
+    frame.slab(-GATE_RAIL, -0.5, 0.0, GATE_RAIL, 0.5, 0.015, "soot")
     for sx in (-1, 1):
-        frame.slab(sx * 0.36, -0.5, 0.0, sx * 0.47, 0.5, 0.14, "steel", bevel=0.02)
-        frame.slab(sx * 0.4, -0.18, 0.0, sx * 0.5, 0.18, 0.3, "steel_dark", bevel=0.03)
-        for y in (-0.35, 0.35):
-            frame.bolt((sx * 0.415, y, 0.14), radius=0.025)
-    frame.slab(-0.36, -0.5, 0.0, 0.36, 0.5, 0.015, "soot")
+        x0, x1 = sorted((sx * GATE_RAIL, sx * 0.48))
+        frame.slab(x0, -0.5, 0.0, x1, 0.5, 0.11, "steel", bevel=0.02)
+        xi0, xi1 = sorted((sx * (GATE_RAIL + 0.005), sx * (GATE_RAIL + 0.035)))
+        frame.slab(xi0, -0.5, 0.11, xi1, 0.5, 0.125, "steel_black")  # the slot's lip
+        for y in (-0.38, 0.38):
+            frame.bolt((sx * 0.43, y, 0.11), radius=0.022)
+    # Buttress housings, sloped against the door, with a warning light each.
+    to_y = Matrix.Rotation(math.radians(90), 4, "X")
+    hb, hz = 0.15, 0.46
+    for sx in (-1, 1):
+        inner0, inner1 = _gate_half(0.11) + 0.012, _gate_half(hz) + 0.012
+        prof = [(inner0, 0.11), (0.5, 0.11), (0.5, 0.2), (inner1 + 0.07, hz), (inner1, hz)]
+        if sx < 0:
+            prof = [(-x, z) for x, z in reversed(prof)]
+        frame.prism(prof, 0.0, 2 * hb, "steel_dark", bevel=0.015, matrix=T(0, hb, 0) @ to_y)
+        lx = sx * (inner1 + 0.035)
+        frame.slab(lx - 0.035, -0.06, hz, lx + 0.035, 0.06, hz + 0.02, "steel_black")
+        frame.slab(lx - 0.026, -0.045, hz + 0.02, lx + 0.026, 0.045, hz + 0.055, "lamp_gate")
+        for y in (-0.1, 0.1):
+            frame.bolt((sx * 0.46, y, 0.2), radius=0.018, axis="X")
+
     door = Part("anim_gate_door")
     profile = [(-GATE_BOTTOM, 0.0), (GATE_BOTTOM, 0.0), (GATE_TOP, GATE_H), (-GATE_TOP, GATE_H)]
-    to_y = T(0, 0.49, 0) @ Matrix.Rotation(math.radians(90), 4, "X")
-    door.prism(profile, 0.0, 0.98, "hazard", bevel=0.01, matrix=to_y)
-    # Black stripes on both sloped faces: diagonal bands clipped to the face, just proud of it.
+    door.prism(profile, 0.0, 0.98, "gate_plate", bevel=0.01, matrix=T(0, 0.49, 0) @ to_y)
+    # Yellow stripes on both sloped faces (the plate between them is the black): diagonal bands
+    # clipped to the face, just proud of it, above a dark rim at the foot.
     slope = (GATE_BOTTOM - GATE_TOP) / GATE_H
     for side in (-1, 1):
         for k in range(-5, 6):
             c = -0.6 + k * 0.3
-            band = [(c, 0.0), (c + 0.15, 0.0), (c + 0.15 + GATE_H * 0.9, GATE_H), (c + GATE_H * 0.9, GATE_H)]
-            band = _clip(band, -0.48, 0.48, 0.02, GATE_H - 0.02)
+            band = [(c, 0.0), (c + 0.14, 0.0), (c + 0.14 + GATE_H * 0.9, GATE_H), (c + GATE_H * 0.9, GATE_H)]
+            band = _clip(band, -0.47, 0.47, 0.1, GATE_H - 0.06)
             if len(band) < 3:
                 continue
             pts = [(side * (GATE_BOTTOM - slope * z + 0.005), y, z) for y, z in band]
             if side < 0:
                 pts.reverse()
-            door.poly(pts, "hazard_black")
+            door.poly(pts, "hazard")
+    # The crown: yellow caps with two dark slots each, as Factorio's.
     for y in (-0.33, 0.0, 0.33):
-        door.slab(-0.13, y - 0.12, GATE_H - 0.02, 0.13, y + 0.12, GATE_H + 0.06, "steel", bevel=0.015)
-        door.slab(-0.1, y - 0.09, GATE_H + 0.06, 0.1, y + 0.09, GATE_H + 0.075, "hazard")
-    for sy in (-1, 1):
-        y = sy * 0.49
-        nose = T(0, y + (0.0 if sy > 0 else 0.06), 0) @ Matrix.Rotation(math.radians(90), 4, "X")
-        door.prism([(-0.1, 0.0), (0.1, 0.0), (0.06, 0.32), (-0.06, 0.32)], 0.0, 0.06, "steel_black", matrix=nose)
+        door.slab(-0.13, y - 0.13, GATE_H - 0.02, 0.13, y + 0.13, GATE_H + 0.06, "hazard", bevel=0.015)
+        for sy in (-1, 1):
+            door.slab(-0.05, y + sy * 0.05 - 0.02, GATE_H + 0.06, 0.05, y + sy * 0.05 + 0.02, GATE_H + 0.068,
+                      "steel_black")
     return [frame, door]

@@ -3,7 +3,7 @@
 importer="scene"
 importer_version=1
 type="PackedScene"
-uid="uid://ck1d161a7aeuk"
+uid="uid://ch27wkp06vfsk"
 path="res://.godot/imported/cliff-outer.glb-1d76811efe5dfc3c3115ad32499978b8.scn"
 
 [deps]
@@ -41,5 +41,5 @@ materials/extract_format=0
 materials/extract_path=""
 _subresources={}
 gltf/naming_version=2
-gltf/embedded_image_handling=1
+gltf/embedded_image_handling=3
 gltf/texture_map_mode=1

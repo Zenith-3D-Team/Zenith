@@ -19,6 +19,11 @@ if env["platform"] == "windows" and not env.get("use_mingw"):
 	# A folder with a space is quoted on the command line, and a quote after one backslash would be
 	# read as a literal quote: two there, which cl reads as one.
 	env.Append(CCFLAGS=["/d1trimfile:" + r + ("\\\\" if " " in r else "\\") for r in sorted(trim_roots)])
+elif env["platform"] == "linux":
+	# Trim host paths from __FILE__ / debug info so built .so files do not carry runner paths.
+	native_root = os.path.abspath(os.path.join(Dir("#").abspath, ".."))
+	trim_roots = {native_root, os.path.dirname(os.path.abspath(godot_cpp))}
+	env.Append(CCFLAGS=["-ffile-prefix-map=" + r.rstrip("/") + "/=" for r in sorted(trim_roots)])
 # (A clone for our own flags: changing env itself would rebuild all of godot-cpp.) Symbols in a .pdb
 # beside the DLL (git-ignored), for crash backtraces. /PDBALTPATH:%_PDB% records the .pdb's file name
 # alone in the DLL, not the full path it was linked at (debuggers look beside the DLL first).

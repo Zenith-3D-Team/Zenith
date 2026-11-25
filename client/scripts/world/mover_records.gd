@@ -16,6 +16,8 @@ extends RefCounted
 ## state() works out a record on the CPU the same way as the shader, for what still needs a mover's
 ## place (following one, picking, tags, sparks, a creature that starts to attack) and for tests.
 
+const Switches := preload("res://scripts/switches.gd")
+
 const TEXELS := 8  # texels a record
 const ROW := 1024  # texels a row of the texture
 const FLOATS := TEXELS * 4
@@ -33,6 +35,10 @@ const HIDDEN := 2  # the remote view's fog hides it
 const BUILDER := 4  # a construction robot: works when it stands still
 const CARGO := 8  # a robot carrying cargo
 const ANIMATED := 16  # a robot that bobs, swings its thrusters and so on (not combat robots)
+const SIMULATED := 32  # simulated worker robot (2-leg flight / orbit, exact shader mirror)
+const SIM_WORKING := 64  # simulated construction robot actively working at target
+const SIM_ORBIT := 128  # simulated robot orbiting roboport while queuing to charge
+const SIM_NEXT_CARGO := 256  # simulated Leg 2 cargo state
 
 ## Robots (robot_swarm.gd and the shader): flying at full speed, standing before work, arms out.
 const ROBOT_FULL_SPEED := 2.5
@@ -171,6 +177,63 @@ func write(slot: int, spots: Array[Vector3], ticks: Array[float], flags: int, he
 	_dirty = true
 
 
+## Writes a simulated worker robot's flight record (rb / SIMULATED): 2 straight flight legs or a
+## charging orbit, with smooth residual blend (`err` decaying at `blend_decay`). All 4 ticks of
+## texel 2 (`t_start`, `t_arr1`, `t_arr2`, `t_arr2`) are epoch-relative so `_move_some()` migrates them.
+func write_sim(slot: int, start: Vector2, end1: Vector2, end2: Vector2, err: Vector2,
+		t_start: float, t_arr1: float, t_arr2: float, flags: int, height: float, now: float,
+		yaw0: float, leg1_yaw: float, leg2_yaw: float, c0: float, c1: float, bob_phase: float,
+		orbit_radius: float, orbit_rate: float, orbit_phase: float, blend_decay: float,
+		hover_still_ticks: float, speed_tpt: float) -> void:
+	if absi(_epoch_of(now) - _epoch) > 1:
+		_set_epoch(_epoch_of(now))
+	var k := _epoch
+	var parity := posmod(k, 2)
+	var base := _base(parity, k)
+	var o := slot * FLOATS
+	var to := slot * 5
+	var d := data
+	d[o + 0] = start.x
+	d[o + 1] = start.y
+	d[o + 2] = end1.x
+	d[o + 3] = end1.y
+	d[o + 4] = end2.x
+	d[o + 5] = end2.y
+	d[o + 6] = err.x
+	d[o + 7] = err.y
+	d[o + 8] = t_start - base
+	d[o + 9] = t_arr1 - base
+	d[o + 10] = t_arr2 - base
+	d[o + 11] = t_arr2 - base
+	d[o + 12] = float(((flags | SIMULATED) & ~ODD) | (ODD if parity == 1 else 0))
+	d[o + 13] = height
+	d[o + 14] = leg1_yaw
+	d[o + 15] = now - base
+	d[o + 16] = yaw0
+	d[o + 17] = leg2_yaw
+	d[o + 18] = c0
+	d[o + 19] = c1
+	d[o + 20] = bob_phase
+	d[o + 21] = orbit_radius
+	d[o + 22] = orbit_rate
+	d[o + 23] = orbit_phase
+	d[o + 24] = blend_decay
+	d[o + 25] = hover_still_ticks
+	d[o + 26] = 0.0
+	d[o + 27] = speed_tpt
+	d[o + 28] = 0.0
+	d[o + 29] = 0.0
+	d[o + 30] = 0.0
+	d[o + 31] = 0.0
+	_ticks[to + 0] = t_start
+	_ticks[to + 1] = t_arr1
+	_ticks[to + 2] = t_arr2
+	_ticks[to + 3] = t_arr2
+	_ticks[to + 4] = now
+	_epochs[slot] = k
+	_dirty = true
+
+
 ## Sets or clears flags (HIDDEN, CARGO) without writing the rest.
 func set_flag(slot: int, flag: int, on: bool) -> void:
 	var o := slot * FLOATS + 12
@@ -183,6 +246,9 @@ func set_flag(slot: int, flag: int, on: bool) -> void:
 
 ## The clock tick at which a record's mover is drawn at its last point, as its lag is now (absolute).
 func last_tick(slot: int) -> float:
+	if (int(data[slot * FLOATS + 12]) & SIMULATED) != 0:
+		var end_t := maxf(_ticks[slot * 5 + 1], _ticks[slot * 5 + 2])
+		return end_t - data[slot * FLOATS + 25]
 	return _ticks[slot * 5 + 3] + _lag(slot, tick)
 
 
@@ -211,8 +277,30 @@ func lag_at(slot: int, t: float) -> float:
 ## A mover's facing at clock tick `t` (absolute) as its record has it (as state()["yaw"]).
 func yaw_at(slot: int, t: float) -> float:
 	var o := slot * FLOATS
-	var since := maxf(t - _ticks[slot * 5 + 4], 0.0) / maxf(rate, 1.0)
-	return data[o + 17] + wrapf(data[o + 16] - data[o + 17], -PI, PI) * exp(-TURN_RATE * since)
+	var d := data
+	var flags := int(d[o + 12])
+	var r := maxf(rate, 1.0)
+	if (flags & SIMULATED) != 0:
+		var to := slot * 5
+		var t_start := _ticks[to]
+		var t_arr1 := _ticks[to + 1]
+		var t_arr2 := _ticks[to + 2]
+		var t_write := _ticks[to + 4]
+		var since := maxf(t - t_write, 0.0) / r
+		if (flags & SIM_ORBIT) != 0:
+			var ang: float = d[o + 23] + maxf(t - t_start, 0.0) * d[o + 22]
+			var sgn := 1.0 if d[o + 22] >= 0.0 else -1.0
+			var tang_yaw := atan2(sin(ang) * sgn, -cos(ang) * sgn)
+			return tang_yaw + wrapf(d[o + 16] - tang_yaw, -PI, PI) * exp(-TURN_RATE * since)
+		if t < t_arr1 and t_arr1 > t_start + 1e-4:
+			return d[o + 14] + wrapf(d[o + 16] - d[o + 14], -PI, PI) * exp(-TURN_RATE * since)
+		var had_leg2 := t_arr2 > t_arr1 + 1e-4
+		if had_leg2:
+			var since2 := maxf(t - maxf(t_write, t_arr1), 0.0) / r
+			return d[o + 17] + wrapf(d[o + 14] - d[o + 17], -PI, PI) * exp(-TURN_RATE * since2)
+		return d[o + 14] + wrapf(d[o + 16] - d[o + 14], -PI, PI) * exp(-TURN_RATE * since)
+	var since := maxf(t - _ticks[slot * 5 + 4], 0.0) / r
+	return d[o + 17] + wrapf(d[o + 16] - d[o + 17], -PI, PI) * exp(-TURN_RATE * since)
 
 
 ## Once a frame: the clock, records moved onto a newer clock, and the texture if records changed.
@@ -292,6 +380,8 @@ func state(slot: int) -> Dictionary:
 	var o := slot * FLOATS
 	var d := data
 	var flags := int(d[o + 12])
+	if (flags & SIMULATED) != 0:
+		return _state_sim(o, d, flags)
 	var c := clocks()
 	# As the shader sees it: float32 numbers.
 	var now := _f32(c.y if flags & ODD else c.x)
@@ -345,12 +435,84 @@ func state(slot: int) -> Dictionary:
 		"carried": Vector4(d[o + 16], d[o + 17], d[o + 18], d[o + 19]), "kind": Vector4(d[o + 20], d[o + 21], d[o + 22], d[o + 23])}
 
 
+func _state_sim(o: int, d: PackedFloat32Array, flags: int) -> Dictionary:
+	var c := clocks()
+	var now := _f32(c.y if flags & ODD else c.x)
+	var r := maxf(rate, 1.0)
+	var since := maxf(now - d[o + 15], 0.0) / r
+	var at := Vector2(d[o], d[o + 1])
+	var speed_tpt := 0.0
+	var still_ticks := 0.0
+	var yaw: float = d[o + 14]
+	var out_flags := flags
+	if (flags & SIM_ORBIT) != 0:
+		var ang: float = d[o + 23] + maxf(now - d[o + 8], 0.0) * d[o + 22]
+		at = Vector2(d[o + 2], d[o + 3]) + Vector2(cos(ang), sin(ang)) * d[o + 21]
+		var sgn := 1.0 if d[o + 22] >= 0.0 else -1.0
+		var tang_yaw := atan2(sin(ang) * sgn, -cos(ang) * sgn)
+		yaw = tang_yaw + wrapf(d[o + 16] - tang_yaw, -PI, PI) * exp(-TURN_RATE * since)
+		speed_tpt = absf(d[o + 21] * d[o + 22])
+	elif now < d[o + 9] and d[o + 9] > d[o + 8] + 1e-4:
+		var f := clampf((now - d[o + 8]) / (d[o + 9] - d[o + 8]), 0.0, 1.0)
+		at = Vector2(d[o], d[o + 1]).lerp(Vector2(d[o + 2], d[o + 3]), f)
+		speed_tpt = d[o + 27]
+		yaw = d[o + 14] + wrapf(d[o + 16] - d[o + 14], -PI, PI) * exp(-TURN_RATE * since)
+	elif d[o + 10] > d[o + 9] + 1e-4 and now < d[o + 10]:
+		var f := clampf((now - d[o + 9]) / (d[o + 10] - d[o + 9]), 0.0, 1.0)
+		at = Vector2(d[o + 2], d[o + 3]).lerp(Vector2(d[o + 4], d[o + 5]), f)
+		speed_tpt = d[o + 27]
+		var since2 := maxf(now - maxf(d[o + 15], d[o + 9]), 0.0) / r
+		yaw = d[o + 17] + wrapf(d[o + 14] - d[o + 17], -PI, PI) * exp(-TURN_RATE * since2)
+		if (flags & SIM_NEXT_CARGO) != 0:
+			out_flags |= CARGO
+		else:
+			out_flags &= ~CARGO
+	else:
+		var had_leg2: bool = d[o + 10] > d[o + 9] + 1e-4
+		at = Vector2(d[o + 4], d[o + 5]) if had_leg2 else Vector2(d[o + 2], d[o + 3])
+		var end_t := maxf(d[o + 9], d[o + 10])
+		still_ticks = maxf(now - end_t, 0.0) + d[o + 25]
+		if had_leg2:
+			if (flags & SIM_NEXT_CARGO) != 0:
+				out_flags |= CARGO
+			else:
+				out_flags &= ~CARGO
+			var since2 := maxf(now - maxf(d[o + 15], d[o + 9]), 0.0) / r
+			yaw = d[o + 17] + wrapf(d[o + 14] - d[o + 17], -PI, PI) * exp(-TURN_RATE * since2)
+		else:
+			yaw = d[o + 14] + wrapf(d[o + 16] - d[o + 14], -PI, PI) * exp(-TURN_RATE * since)
+	at += Vector2(d[o + 6], d[o + 7]) * exp(-d[o + 24] * since)
+	var spd := speed_tpt * r
+	return {"pos": Vector3(at.x, d[o + 13], at.y), "yaw": yaw,
+		"walked": 0.0, "speed": spd, "average": spd, "still": still_ticks / r, "since": since, "flags": out_flags,
+		"carried": Vector4(d[o + 16], d[o + 17], d[o + 18], d[o + 19]), "kind": Vector4(d[o + 20], d[o + 21], d[o + 22], d[o + 23])}
+
+
 ## Only where a record's mover is drawn now (as state()["pos"], with less to do).
 func position(slot: int) -> Vector3:
 	var o := slot * FLOATS
 	var d := data
+	var flags := int(d[o + 12])
 	var c := clocks()
-	var now := _f32(c.y if int(d[o + 12]) & ODD else c.x)
+	var now := _f32(c.y if flags & ODD else c.x)
+	if (flags & SIMULATED) != 0:
+		var r := maxf(rate, 1.0)
+		var since := maxf(now - d[o + 15], 0.0) / r
+		var at: Vector2
+		if (flags & SIM_ORBIT) != 0:
+			var ang: float = d[o + 23] + maxf(now - d[o + 8], 0.0) * d[o + 22]
+			at = Vector2(d[o + 2], d[o + 3]) + Vector2(cos(ang), sin(ang)) * d[o + 21]
+		elif now < d[o + 9] and d[o + 9] > d[o + 8] + 1e-4:
+			var f := clampf((now - d[o + 8]) / (d[o + 9] - d[o + 8]), 0.0, 1.0)
+			at = Vector2(lerpf(d[o], d[o + 2], f), lerpf(d[o + 1], d[o + 3], f))
+		elif d[o + 10] > d[o + 9] + 1e-4 and now < d[o + 10]:
+			var f := clampf((now - d[o + 9]) / (d[o + 10] - d[o + 9]), 0.0, 1.0)
+			at = Vector2(lerpf(d[o + 2], d[o + 4], f), lerpf(d[o + 3], d[o + 5], f))
+		else:
+			var had_leg2: bool = d[o + 10] > d[o + 9] + 1e-4
+			at = Vector2(d[o + 4], d[o + 5]) if had_leg2 else Vector2(d[o + 2], d[o + 3])
+		at += Vector2(d[o + 6], d[o + 7]) * exp(-d[o + 24] * since)
+		return Vector3(at.x, d[o + 13], at.y)
 	var drawn := now - _lag_after(o, maxf(now - d[o + 15], 0.0))
 	if drawn <= d[o + 8]:
 		return Vector3(d[o], d[o + 13], d[o + 1])
@@ -366,7 +528,105 @@ func position(slot: int) -> Vector3:
 	return Vector3(lerpf(d[o + 4], d[o + 6], f), d[o + 13], lerpf(d[o + 5], d[o + 7], f))
 
 
+## Allocation-free 3x4 transform writer matching mover_state(slot) and state(slot) for native MultiMesh motion vectors.
+func write_xform(slot: int, buf: PackedFloat32Array, bo: int, c_even: float, c_odd: float, inv_rate: float) -> void:
+	var o := slot * FLOATS
+	var d := data
+	var flags := int(d[o + 12])
+	var now := c_odd if (flags & ODD) != 0 else c_even
+	var px: float
+	var pz: float
+	var yaw: float
+	if (flags & SIMULATED) != 0:
+		var since := maxf(now - d[o + 15], 0.0) * inv_rate
+		if (flags & SIM_ORBIT) != 0:
+			var ang: float = d[o + 23] + maxf(now - d[o + 8], 0.0) * d[o + 22]
+			px = d[o + 2] + cos(ang) * d[o + 21]
+			pz = d[o + 3] + sin(ang) * d[o + 21]
+			var sgn := 1.0 if d[o + 22] >= 0.0 else -1.0
+			var tang_yaw := atan2(sin(ang) * sgn, -cos(ang) * sgn)
+			yaw = tang_yaw + wrapf(d[o + 16] - tang_yaw, -PI, PI) * exp(-TURN_RATE * since)
+		elif now < d[o + 9] and d[o + 9] > d[o + 8] + 1e-4:
+			var f := clampf((now - d[o + 8]) / (d[o + 9] - d[o + 8]), 0.0, 1.0)
+			px = lerpf(d[o], d[o + 2], f)
+			pz = lerpf(d[o + 1], d[o + 3], f)
+			yaw = d[o + 14] + wrapf(d[o + 16] - d[o + 14], -PI, PI) * exp(-TURN_RATE * since)
+		elif d[o + 10] > d[o + 9] + 1e-4 and now < d[o + 10]:
+			var f := clampf((now - d[o + 9]) / (d[o + 10] - d[o + 9]), 0.0, 1.0)
+			px = lerpf(d[o + 2], d[o + 4], f)
+			pz = lerpf(d[o + 3], d[o + 5], f)
+			var since2 := maxf(now - maxf(d[o + 15], d[o + 9]), 0.0) * inv_rate
+			yaw = d[o + 17] + wrapf(d[o + 14] - d[o + 17], -PI, PI) * exp(-TURN_RATE * since2)
+		else:
+			var had_leg2: bool = d[o + 10] > d[o + 9] + 1e-4
+			if had_leg2:
+				px = d[o + 4]
+				pz = d[o + 5]
+				var since2 := maxf(now - maxf(d[o + 15], d[o + 9]), 0.0) * inv_rate
+				yaw = d[o + 17] + wrapf(d[o + 14] - d[o + 17], -PI, PI) * exp(-TURN_RATE * since2)
+			else:
+				px = d[o + 2]
+				pz = d[o + 3]
+				yaw = d[o + 14] + wrapf(d[o + 16] - d[o + 14], -PI, PI) * exp(-TURN_RATE * since)
+		var blend := exp(-d[o + 24] * since)
+		px += d[o + 6] * blend
+		pz += d[o + 7] * blend
+	else:
+		var after := maxf(now - d[o + 15], 0.0)
+		var lag := _lag_after(o, after)
+		var drawn := now - lag
+		px = d[o]
+		pz = d[o + 1]
+		if drawn > d[o + 8]:
+			var found := false
+			for i in 3:
+				if drawn <= d[o + 9 + i]:
+					var span2: float = d[o + 9 + i] - d[o + 8 + i]
+					var f2: float = (drawn - d[o + 8 + i]) / span2 if span2 > 1e-4 else 1.0
+					px = lerpf(d[o + i * 2], d[o + i * 2 + 2], f2)
+					pz = lerpf(d[o + i * 2 + 1], d[o + i * 2 + 3], f2)
+					found = true
+					break
+			if not found:
+				var span3: float = d[o + 11] - d[o + 10]
+				if span3 > 1e-4:
+					var f3 := minf((drawn - d[o + 10]) / span3, d[o + 23])
+					px = lerpf(d[o + 4], d[o + 6], f3)
+					pz = lerpf(d[o + 5], d[o + 7], f3)
+				else:
+					px = d[o + 6]
+					pz = d[o + 7]
+		var since3 := after * inv_rate
+		yaw = d[o + 17] + wrapf(d[o + 16] - d[o + 17], -PI, PI) * exp(-TURN_RATE * since3)
+	var py: float = d[o + 13]
+	var c := cos(yaw)
+	var s := sin(yaw)
+	buf[bo] = c
+	buf[bo + 1] = 0.0
+	buf[bo + 2] = s
+	buf[bo + 3] = px
+	buf[bo + 4] = 0.0
+	buf[bo + 5] = 1.0
+	buf[bo + 6] = 0.0
+	buf[bo + 7] = py
+	buf[bo + 8] = -s
+	buf[bo + 9] = 0.0
+	buf[bo + 10] = c
+	buf[bo + 11] = pz
+
+
 static var _f32_buf := PackedFloat32Array([0.0])
+const NativeLibrary := preload("res://scripts/native_library.gd")
+## The native twin of write_xform for a batch (movers_native.cpp); --native-movers=off keeps the script path.
+static var use_native := Switches.on("--native-movers")
+static var _native: RefCounted
+
+
+## The shared MoversNative, or null (the class missing, or --native-movers=off).
+static func native() -> RefCounted:
+	if _native == null and use_native and NativeLibrary.ensure() and ClassDB.class_exists(&"MoversNative"):
+		_native = ClassDB.instantiate(&"MoversNative")
+	return _native
 
 
 static func _f32(x: float) -> float:
@@ -383,7 +643,7 @@ static func robot_anim(st: Dictionary) -> Vector4:
 	var carried: Vector4 = st["carried"]
 	var since: float = st["since"]
 	var amount := move_toward(carried.z, clampf(float(st["speed"]) / ROBOT_FULL_SPEED, 0.0, 1.0), 3.0 * since)
-	var working: bool = flags & BUILDER and float(st["still"]) > ROBOT_WORK_STILL
+	var working: bool = flags & BUILDER and (not (flags & SIMULATED) or (flags & SIM_WORKING) != 0) and float(st["still"]) > ROBOT_WORK_STILL
 	var reach := 0.0
 	if working:
 		var began := maxf(since - (float(st["still"]) - ROBOT_WORK_STILL), 0.0)
@@ -404,6 +664,28 @@ func robot_carry(slot: int) -> Vector2:
 	var c := clocks()
 	var now := _f32(c.y if flags & ODD else c.x)
 	var r := maxf(rate, 1.0)
+	if (flags & SIMULATED) != 0:
+		var since := maxf(now - d[o + 15], 0.0) / r
+		var speed_tpt := 0.0
+		var still_ticks := 0.0
+		if (flags & SIM_ORBIT) != 0:
+			speed_tpt = absf(d[o + 21] * d[o + 22])
+		elif now < d[o + 9] and d[o + 9] > d[o + 8] + 1e-4:
+			speed_tpt = d[o + 27]
+		elif d[o + 10] > d[o + 9] + 1e-4 and now < d[o + 10]:
+			speed_tpt = d[o + 27]
+		else:
+			still_ticks = maxf(now - maxf(d[o + 9], d[o + 10]), 0.0) + d[o + 25]
+		var amount := move_toward(d[o + 18], clampf(speed_tpt * r / ROBOT_FULL_SPEED, 0.0, 1.0), 3.0 * since)
+		var stl := still_ticks / r
+		var working := (flags & BUILDER) != 0 and (flags & SIM_WORKING) != 0 and stl > ROBOT_WORK_STILL
+		var reach := 0.0
+		if working:
+			var began := maxf(since - (stl - ROBOT_WORK_STILL), 0.0)
+			reach = move_toward(move_toward(d[o + 19], 0.0, 3.0 * began), ROBOT_ARMS_REACH, 3.0 * (since - began))
+		else:
+			reach = move_toward(d[o + 19], 0.0, 3.0 * since)
+		return Vector2(amount, reach)
 	var after := maxf(now - d[o + 15], 0.0)
 	var lag := _lag_after(o, after)
 	var drawn := now - lag

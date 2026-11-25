@@ -155,7 +155,7 @@ local event_names = {
   "on_resource_depleted", "on_player_rotated_entity", "on_player_flipped_entity", "on_entity_settings_pasted", "on_entity_color_changed", "on_gui_closed", "on_gui_click", "on_player_dropped_item_into_entity", "on_player_created",
   "on_player_built_tile", "on_robot_built_tile", "on_space_platform_built_tile",
   "on_player_mined_tile", "on_robot_mined_tile", "on_space_platform_mined_tile",
-  "script_raised_set_tiles", "on_chunk_generated", "on_entity_damaged", "on_research_finished",
+  "script_raised_set_tiles", "on_chunk_generated", "on_chunk_charted", "on_chunk_deleted", "on_entity_damaged", "on_research_finished",
   "on_research_reversed", "on_marked_for_deconstruction", "on_cancelled_deconstruction",
   "on_marked_for_upgrade", "on_cancelled_upgrade", "on_chart_tag_added", "on_chart_tag_modified",
   "on_chart_tag_removed", "on_entity_renamed", "on_console_chat", "on_rocket_launch_ordered",
@@ -184,6 +184,7 @@ defines = strict("defines", {
     disabled_by_control_behavior = 14, no_minable_resources = 15, turned_off_during_daytime = 16, pipeline_overextended = 17 }),
   signal_state = strict("defines.signal_state", { open = 0, closed = 1, reserved = 2, reserved_by_circuit_network = 3 }),
   chain_signal_state = strict("defines.chain_signal_state", { none = 0, all_open = 1, partially_open = 2, none_open = 3 }),
+  rail_layer = strict("defines.rail_layer", { ground = 0, elevated = 1 }),
   wire_type = strict("defines.wire_type", { red = 1, green = 2, copper = 3 }),
   -- A combinator's input connectors share the ids of everything else's red and green ones.
   wire_connector_id = strict("defines.wire_connector_id", { circuit_red = 1, circuit_green = 2, combinator_input_red = 1,
@@ -246,6 +247,10 @@ defines = strict("defines", {
   space_platform_state = strict("defines.space_platform_state", {
     waiting_for_starter_pack = 0, starter_pack_on_the_way = 1, on_the_path = 2, waiting_for_departure = 3,
     no_schedule = 4, no_path = 5, waiting_at_station = 6, paused = 7, starter_pack_requested = 8,
+  }),
+  robot_order_type = strict("defines.robot_order_type", {
+    pickup = 0, repair = 1, construct = 2, deconstruct = 3, deliver_items = 4,
+    upgrade = 5, explode_cliff = 6, deliver = 7, pickup_items = 8,
   }),
 })
 
@@ -336,7 +341,7 @@ settings = strict("LuaSettings", {
   global = {
     ["f3d-surface"] = { value = "nauvis" },
     ["f3d-chunks-per-tick"] = { value = 1 },
-    ["f3d-bytes-per-tick"] = { value = 32768 },
+    ["f3d-bytes-per-tick"] = { value = 131072 },
     ["f3d-max-focus-radius"] = { value = 64 },
     ["f3d-mover-interval"] = { value = 2 },
     -- (8: a search every 8 ticks, as before the setting; the tests of the longer waits set 32.)
@@ -346,6 +351,7 @@ settings = strict("LuaSettings", {
     ["f3d-spread-jobs"] = { value = true },
     ["f3d-binary-messages"] = { value = true },
     ["f3d-starter-kit"] = { value = true },
+    ["f3d-character-corpses"] = { value = true },
     ["f3d-player"] = { value = "" },
     ["f3d-act-as-player"] = { value = true },
   },
@@ -417,6 +423,7 @@ local function entity_proto(name, type, w, h, extra)
     infinite_resource = false, mining_speed = nil, crafting_categories = nil,
     unit_numbered = true, rotatable = false, build_grid_size = 1,
     items_to_place_this = { { name = name, count = 1 } },
+    max_health = 100,
   }
   for k, v in pairs(extra or {}) do
     p[k] = v
@@ -459,6 +466,7 @@ local entity_protos = {
     fluidbox_prototypes = { { pipe_connections = {} }, { pipe_connections = {} } } }),
   splitter = entity_proto("splitter", "splitter", 2, 1, { rotatable = true, fast_replaceable_group = "transport-belt" }),
   ["power-switch"] = entity_proto("power-switch", "power-switch", 2, 2),
+  gate = entity_proto("gate", "gate", 1, 1),
   ["gun-turret"] = entity_proto("gun-turret", "ammo-turret", 2, 2),
   ["small-lamp"] = entity_proto("small-lamp", "lamp", 1, 1),
   pipe = entity_proto("pipe", "pipe", 1, 1, { fast_replaceable_group = "pipe" }),
@@ -484,7 +492,12 @@ local entity_protos = {
   ["rail-signal"] = entity_proto("rail-signal", "rail-signal", 1, 1, { rotatable = true }),
   ["rail-chain-signal"] = entity_proto("rail-chain-signal", "rail-chain-signal", 1, 1, { rotatable = true }),
   accumulator = entity_proto("accumulator", "accumulator", 2, 2),
-  ["construction-robot"] = entity_proto("construction-robot", "construction-robot", 0.5, 0.5),
+  ["construction-robot"] = entity_proto("construction-robot", "construction-robot", 0.5, 0.5, {
+    speed = 0.06, energy_per_move = 5000, energy_per_tick = 50,
+    speed_multiplier_when_out_of_energy = 0.2, min_to_charge = 0.2, max_to_charge = 0.95,
+    max_energy = 3000000,
+    get_max_energy = function(q) return 3000000 end,
+  }),
   ["tree-01"] = entity_proto("tree-01", "tree", 1, 1, {
     unit_numbered = false,
     mineable_properties = { minable = true, mining_time = 0.3, products = { { type = "item", name = "wood", amount = 4 } } },
@@ -525,6 +538,7 @@ local entity_protos = {
     vision_distance = 12 }),
   -- What weapons fire: none of these has a unit_number.
   ["shotgun-pellet"] = entity_proto("shotgun-pellet", "projectile", 0.2, 0.5, { unit_numbered = false }),
+  grenade = entity_proto("grenade", "projectile", 0.2, 0.5, { unit_numbered = false }),
   ["rocket"] = entity_proto("rocket", "projectile", 0.2, 0.5, { unit_numbered = false }),
   ["handheld-flamethrower-fire-stream"] = entity_proto("handheld-flamethrower-fire-stream", "stream", 0, 0, { unit_numbered = false }),
   ["chain-tesla-gun-beam-start"] = entity_proto("chain-tesla-gun-beam-start", "beam", 0, 0, { unit_numbered = false }),
@@ -555,7 +569,12 @@ local entity_protos = {
   ["heat-pipe"] = entity_proto("heat-pipe", "heat-pipe", 1, 1),
   ["requester-chest"] = entity_proto("requester-chest", "logistic-container", 1, 1, { logistic_mode = "requester" }),
   ["storage-chest"] = entity_proto("storage-chest", "logistic-container", 1, 1, { logistic_mode = "storage" }),
-  ["logistic-robot"] = entity_proto("logistic-robot", "logistic-robot", 0.5, 0.5),
+  ["logistic-robot"] = entity_proto("logistic-robot", "logistic-robot", 0.5, 0.5, {
+    speed = 0.05, energy_per_move = 5000, energy_per_tick = 50,
+    speed_multiplier_when_out_of_energy = 0.2, min_to_charge = 0.2, max_to_charge = 0.95,
+    max_energy = 1500000,
+    get_max_energy = function(q) return 1500000 end,
+  }),
   -- Space Age: Vulcanus, Fulgora, Gleba, Aquilo, travel.
   ["small-demolisher"] = entity_proto("small-demolisher", "segmented-unit", 6, 6),
   ["small-demolisher-segment"] = entity_proto("small-demolisher-segment", "segment", 5, 5, { unit_numbered = false }),
@@ -576,7 +595,9 @@ local entity_protos = {
   ["small-stomper-pentapod-leg"] = entity_proto("small-stomper-pentapod-leg", "spider-leg", 0.5, 0.5),
   ["biter-spawner"] = entity_proto("biter-spawner", "unit-spawner", 5, 5),
   ["gleba-spawner"] = entity_proto("gleba-spawner", "unit-spawner", 5, 5),
+  fish = entity_proto("fish", "fish", 1, 1, { unit_numbered = false }),
   ["heating-tower"] = entity_proto("heating-tower", "reactor", 3, 3, { heating_radius = 12 }),
+  ["nuclear-reactor"] = entity_proto("nuclear-reactor", "reactor", 5, 5),
   ["cargo-pod"] = entity_proto("cargo-pod", "cargo-pod", 2, 2),
   ["train-stop"] = entity_proto("train-stop", "train-stop", 2, 2, { rotatable = true }),
   cliff = entity_proto("cliff", "cliff", 3, 3, { unit_numbered = false }),
@@ -825,6 +846,8 @@ end
 entity_protos["assembling-machine-1-remnants"] = entity_proto("assembling-machine-1-remnants", "corpse", 3, 3,
   { unit_numbered = false })
 entity_protos["small-remnants"] = entity_proto("small-remnants", "corpse", 1, 1, { unit_numbered = false })
+-- What a dead character leaves (corpses.lua): no unit number.
+entity_protos["character-corpse"] = entity_proto("character-corpse", "character-corpse", 0.4, 0.4, { unit_numbered = false })
 entity_protos["small-biter-corpse"] = entity_proto("small-biter-corpse", "corpse", 1, 1, { unit_numbered = false })
 entity_protos["assembling-machine-1"].corpses = { ["assembling-machine-1-remnants"] = entity_protos["assembling-machine-1-remnants"] }
 entity_protos["wooden-chest"].corpses = { ["small-remnants"] = entity_protos["small-remnants"] }
@@ -895,12 +918,22 @@ local mod_data = {
   }),
 }
 
+-- Damage types (prototypes.damage_type)
+local damage_type_protos = {}
+for _, n in ipairs({ "physical", "impact", "fire", "laser", "poison", "explosion", "acid", "electric" }) do
+  damage_type_protos[n] = strict("LuaDamagePrototype", { name = n })
+end
+F.damage_types = damage_type_protos
+
 prototypes = strict("LuaPrototypes", {
   mod_data = mod_data,
   utility_constants = strict("UtilityConstants", { default_pipeline_extent = 320 }),
   entity = entity_protos, tile = tile_protos, item = item_protos, fluid = fluid_protos,
   space_location = space_locations, space_connection = space_connections, surface_property = surface_properties,
   asteroid_chunk = asteroid_chunks, quality = qualities, recipe = recipe_protos, decorative = decorative_protos, technology = {},
+  -- Only the skull (corpses.lua's map marker).
+  virtual_signal = { ["signal-skull"] = strict("LuaVirtualSignalPrototype", { name = "signal-skull" }) },
+  damage_type = damage_type_protos,
   -- Only the "type" filter (enemy_sight.lua's units).
   get_entity_filtered = function(filters)
     assert(#filters == 1 and filters[1].filter == "type", "get_entity_filtered: only {filter = \"type\"} is faked")
@@ -1069,6 +1102,8 @@ forces.player = setmetatable({
     end
   end,
   manual_mining_speed_modifier = 0,
+  worker_robots_speed_modifier = 0,
+  worker_robots_battery_modifier = 0,
   mining_with_fluid = false, -- the "Uranium mining" research's effect (false on a new map)
   character_logistic_requests = false,
   recipes = {
@@ -2118,6 +2153,7 @@ function F.make_cell(owner, logistic_radius, construction_radius)
   return strict("LuaLogisticCell", {
     valid = true, owner = owner, logistic_radius = logistic_radius, construction_radius = construction_radius,
     mobile = owner.type ~= "roboport",
+    charging_robots = {}, to_charge_robots = {},
     is_in_construction_range = function(position) return in_square(owner, construction_radius, position) end,
   })
 end
@@ -2174,11 +2210,17 @@ local function make_entity(surface, params)
     direction = params.direction or 0, surface = surface,
     force = params.force and (type(params.force) == "string" and forces[params.force] or params.force) or forces.neutral,
     prototype = proto, health = 100, max_health = 100, minable = true, rotatable = proto.rotatable, destructible = true,
+    object_name = "LuaEntity",
     quality = qualities[params.quality or "normal"] or strict("LuaQualityPrototype", { name = params.quality }),
   }
   data.get_health_ratio = function() return data.health / data.max_health end
+  if proto.type == "character-corpse" then
+    -- No player's (the bridge's own character's), as 2.1.24 says for one: 65536.
+    data.character_corpse_player_index = params.character_corpse_player_index or 65536
+  end
   if proto.type == "rail-signal" or proto.type == "rail-chain-signal" then
     data.signal_state = 1 -- defines.signal_state.closed
+    data.rail_layer = params.rail_layer or 0 -- defines.rail_layer.ground
   end
   if proto.type == "rail-chain-signal" then
     data.chain_signal_state = 3 -- defines.chain_signal_state.none_open
@@ -2311,7 +2353,7 @@ local function make_entity(surface, params)
   local optional = {
     unit_number = true, status = true, vehicle = true, crafting_queue = true, player = true, trains_limit = true, grid = true,
     selected = true, electric_network_id = true, logistic_network = true, signal_state = true, splitter_filter = true,
-    shooting_target = true, commandable = true, chain_signal_state = true, item_request_proxy = true,
+    shooting_target = true, commandable = true, chain_signal_state = true, item_request_proxy = true, max_health = true,
     -- A character's hub and cargo pod (LuaControl), nil when it sits in neither.
     hub = true, cargo_pod = true, cargo_pod_origin = true,
   }
@@ -2320,13 +2362,13 @@ local function make_entity(surface, params)
     shooting_state = true, selected_gun_index = true, selected = true, backer_name = true, trains_limit = true,
     train_stop_priority = true, always_on = true, combinator_description = true,
     entity_label = true, artillery_auto_targeting = true, insert_plan = true,
-    player = "harness", frozen = "harness", tick_grown = true, units = "harness", owned_plants = "harness",
+    player = "harness", frozen = "harness", tick_grown = true, units = "harness", owned_plants = "harness", max_health = "harness",
     cargo_pod_destination = true, cargo_pod_state = "harness",
     held_stack = "harness", held_stack_position = "harness", position = "harness", crafting_progress = "harness",
     speed = "harness", shooting_target = "harness", orientation = "harness",
     relative_turret_orientation = true, torso_orientation = "harness", driver_is_gunner = true,
     crafting_queue_progress = "harness", status = "harness", energy = "harness",
-    signal_state = "harness", chain_signal_state = "harness",
+    signal_state = "harness", chain_signal_state = "harness", rail_layer = "harness",
     electric_network_id = "harness", is_flying = "harness", flight_height = "harness", productivity_bonus = "harness",
     color = true, character_inventory_slots_bonus = true, grid = "harness", allow_dispatching_robots = true,
     ignore_unprioritised_targets = true,
@@ -2352,6 +2394,11 @@ local function make_entity(surface, params)
   if proto.type == "inserter" then
     optional.pickup_position, optional.drop_position = true, true
     writable.pickup_position, writable.drop_position = "harness", "harness"
+  elseif proto.type == "logistic-robot" or proto.type == "construction-robot" then
+    data.robot_order_queue = params.robot_order_queue or {}
+    data.energy = params.energy ~= nil and params.energy or (proto.type == "construction-robot" and 3000000 or 1500000)
+    data.orientation = params.orientation or 0
+    writable.robot_order_queue = "harness"
   elseif proto.type == "mining-drill" then
     optional.drop_position = true
     data.mining_progress, data.bonus_mining_progress = 0, 0
@@ -2586,6 +2633,8 @@ local function make_entity(surface, params)
     -- the character to the vehicle; getting out puts it two tiles east of it.
     data.orientation = 0.25
     data.speed = 0
+    -- (LuaEntity.is_military_target: a car's and a tank's prototypes say true, rolling stock's false.)
+    data.is_military_target = t == "car"
     data.burner = strict("LuaBurner", { remaining_burning_fuel = 0, inventory = make_inventory() })
     local seats = {}
     local function seat(name, who)
@@ -2613,9 +2662,25 @@ local function make_entity(surface, params)
     data.entity_label = ""
     data.orientation, data.speed = 0, 0
     data.color = { r = 1, g = 0.5, b = 0, a = 1 }
-    -- Its seats, as a car's (turrets.lua asks who fires its guns); nobody gets in in the tests.
-    data.get_driver = function() return nil end
-    data.get_passenger = function() return nil end
+    -- Its seats, as a car's (turrets.lua asks who fires its guns; enemy_sight.lua's character drives one).
+    -- A military target (its prototype says so).
+    data.is_military_target = true
+    local seats = {}
+    local function seat(name, who)
+      local old = seats[name]
+      if old then
+        old.vehicle_seat(nil)
+      end
+      seats[name] = who
+      if who then
+        assert(who.type == "character", "set_" .. name .. ": expected a character")
+        who.vehicle_seat(e)
+      end
+    end
+    data.get_driver = function() return seats.driver end
+    data.set_driver = function(who) seat("driver", who) end
+    data.get_passenger = function() return seats.passenger end
+    data.set_passenger = function(who) seat("passenger", who) end
     local targeting = { auto_target_without_gunner = true, auto_target_with_gunner = false }
     local waypoints = {}
     data.add_autopilot_destination = function(p)
@@ -2719,8 +2784,11 @@ local function make_entity(surface, params)
     if t == "roboport" then
       -- Its logistic cell (H14): neighbours are the roboports whose logistic squares meet its own.
       local r = proto.logistic_radius or 25
+      local cell_charging = params.charging_robots or {}
+      local cell_to_charge = params.to_charge_robots or {}
       data.logistic_cell = setmetatable({ valid = true, object_name = "LuaLogisticCell", logistic_radius = r,
-        construction_radius = proto.construction_radius or 55, logistics_connection_distance = r }, {
+        construction_radius = proto.construction_radius or 55, logistics_connection_distance = r,
+        charging_robots = cell_charging, to_charge_robots = cell_to_charge }, {
         __index = function(_, k)
           if k == "owner" then
             return data.self
@@ -2920,6 +2988,15 @@ local function make_entity(surface, params)
       id = 1, parent_network = network })
   elseif t == "power-switch" then
     data.power_switch_state = false
+  elseif t == "gate" then
+    -- A gate's state (LuaEntity.is_opened / is_opening / is_closed / is_closing, gates only): the harness sets
+    -- gate_phase ("closed", "opening", "opened", "closing"); not a Factorio key.
+    data.gate_phase = "closed"
+    writable.gate_phase = "harness"
+    data.is_opened = function() return data.gate_phase == "opened" end
+    data.is_opening = function() return data.gate_phase == "opening" end
+    data.is_closed = function() return data.gate_phase == "closed" end
+    data.is_closing = function() return data.gate_phase == "closing" end
   elseif t == "ammo-turret" then
     -- Priority targets by index (set_priority_target(i) clears one and closes the gap).
     local targets = {}
@@ -3077,7 +3154,7 @@ local function make_entity(surface, params)
     end
   elseif t == "roboport" then
     invs.robots, invs.repair = make_inventory(7), make_inventory(7)
-  elseif t == "logistic-robot" then
+  elseif t == "logistic-robot" or t == "construction-robot" then
     invs.robot_cargo = make_inventory(1)
   elseif t == "cargo-wagon" then
     invs.cargo = make_inventory(40)
@@ -3795,7 +3872,9 @@ local function make_surface(index, name, default_tile)
     local cx, cy = c.x or c[1], c.y or c[2]
     return math.abs(cx) <= 3 and math.abs(cy) <= 3
   end
-  surface.request_to_generate_chunks = function() end
+  surface.request_to_generate_chunks = function()
+    F.chunk_generate_requests = (F.chunk_generate_requests or 0) + 1
+  end
   -- LuaChunkIterator: called again and again, it gives each generated chunk, then nil.
   surface.get_chunks = function()
     local cx, cy = -4, -3
@@ -3869,6 +3948,9 @@ local function make_surface(index, name, default_tile)
       local key = type(f.type) == "table" and table.concat(f.type, ",") or tostring(f.type)
       F.finds[key] = (F.finds[key] or 0) + 1
     end
+    if f.limit and not f.collision_mask and f.limit <= 0 then
+      return {}
+    end
     local out = {}
     for _, e in ipairs(surface.entities) do
       local ok = true
@@ -3910,6 +3992,9 @@ local function make_surface(index, name, default_tile)
       end
       if ok then
         out[#out + 1] = e
+        if f.limit and not f.collision_mask and #out >= f.limit then
+          break
+        end
       end
     end
     return out
@@ -5336,6 +5421,10 @@ function F.make_grid(w, h)
       inhibit = v
     end,
   })
+end
+
+function F.raise(name, data)
+  return raise(name, data)
 end
 
 function F.take_sent()

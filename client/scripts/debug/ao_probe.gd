@@ -6,6 +6,7 @@ extends Node
 ## a modeller's baked occlusion and shadows (docs/SESSION-LOG.md, the AO work).
 
 const Settings := preload("res://scripts/menu/settings.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 var main: Node
 var out_path := ""
@@ -21,17 +22,17 @@ func _ready() -> void:
 	if f != null:
 		f.store_string("\n".join(lines) + "\n")
 	print("ao probe: %d lines to %s" % [lines.size(), out_path])
-	if "--ao-probe-shots" in OS.get_cmdline_user_args():
+	if Switches.has("--ao-probe-shots"):
 		await _shots()
 		get_tree().quit()
 		return
-	if "--aa-probe-shots" in OS.get_cmdline_user_args():
+	if Switches.has("--aa-probe-shots"):
 		await _aa_shots()
 		get_tree().quit()
 		return
 	# --ao-probe-ab=<bias>,<normal bias>: the window now and a few frames after setting those biases
 	# (<file>-a.png, <file>-b.png), so the difference is the biases' alone.
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--ao-probe-ab="):
 			var spec := arg.get_slice("=", 1)
 			await RenderingServer.frame_post_draw
@@ -143,10 +144,10 @@ func _baked_materials() -> Dictionary:
 ## --ao-probe-bias=<bias>,<normal bias>: the sun's shadow biases held there (to try them).
 func _process(_delta: float) -> void:
 	var spec := ""
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--ao-probe-bias="):
 			spec = arg.get_slice("=", 1)
-	if "--ao-probe-own-shadows" in OS.get_cmdline_user_args():
+	if Switches.has("--ao-probe-own-shadows"):
 		# Every model casts its own shadow, the stand-ins none (to tell the two apart).
 		for n in get_tree().root.find_children("*", "MultiMeshInstance3D", true, false):
 			var m := n as MultiMeshInstance3D

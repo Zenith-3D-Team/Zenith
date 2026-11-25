@@ -7,7 +7,7 @@ extends MeshInstance3D
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const WIDTH := 0.18  # tiles
-const HEIGHT := 0.06  # just over the ground
+const HEIGHT := 0.02  # just over the ground
 const COLOR := Color(0.9, 0.12, 0.08, 0.7)
 
 var model  # ui_model.gd
@@ -15,7 +15,7 @@ var model  # ui_model.gd
 
 func _ready() -> void:
 	cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	material_override = GroundHeight.mark_material(COLOR, false)
+	material_override = GroundHeight.mark_material(COLOR, false, GroundHeight.AREA_PRIORITY)
 	if model != null:
 		model.territories_changed.connect(rebuild)
 	rebuild()

@@ -20,7 +20,7 @@ const MAX_ROWS := 24
 const FLAG_GLOW := 1
 const FLAG_FADES := 2
 const FLAG_BELT := 4
-const FLAG_NO_SPRITE := 8
+## Bit 8 was FLAG_NO_SPRITE when the old sprite projection existed (now removed).
 ## A creature's tinted skin (creature_models.gd): Factorio's two mask layers, or one over the part colour
 ## (both flags: skin_mode 3, the one mask as 0.2.1 read it).
 const FLAG_SKIN_MASKS := 16
@@ -31,12 +31,18 @@ const FLAG_PAINT_GLOW := 64
 const FLAG_KEEP_ALBEDO := 128
 ## modeller_tex: a "pbr" pack's untextured surface merged into rows uses its own glTF shading.
 const FLAG_MODELLER_TEX := 256
+## wet_rock: cliffs and rocks wet like rough stone in the rain (weather_surface.gdshaderinc).
+const FLAG_WET_ROCK := 512
+## organic_surface: 1 flesh/hide, 2 chitin/shell (micro-bump and damp-organic rain wetness).
+const FLAG_ORGANIC_FLESH := 1024
+const FLAG_ORGANIC_CHITIN := 2048
 ## The uniforms each row has its own value of, in the table.
 const ROW_PARAMS := ["albedo", "roughness", "metallic", "emission", "emission_energy", "activity_glow", "glow_fades",
 	"glow_flicker", "glow_pulse", "glow_rate", "vertex_data", "edge_data", "view_data", "part_data", "part_colors",
 	"part_weathering", "part_light", "ao_strength", "grime", "grime_color", "ground_grime_height", "edge_wear", "edge_color",
 	"edge_metallic", "rust", "rust_color", "streaks", "dust", "dust_color", "desaturate", "value", "grain",
-	"skin_mode", "skin_tint2", "nature_grain", "emission_from_paint", "glow_keeps_albedo", "modeller_tex"]
+	"skin_mode", "skin_tint2", "nature_grain", "emission_from_paint", "glow_keeps_albedo", "modeller_tex", "wet_rock",
+	"organic_surface"]
 ## The vec4s a row takes in material_table.
 const ROW_SIZE := 11
 ## Meta on a row changed by edit(): only those are looked at for the model's own uniforms.
@@ -142,15 +148,19 @@ static func row_vectors(row: ShaderMaterial) -> Array[Vector4]:
 	var speed: Variant = row.get_shader_parameter("belt_speed")
 	if speed != null and float(speed) != 0.0:
 		flags |= FLAG_BELT
-	var cells: Variant = row.get_shader_parameter("sprite_cells")
-	if cells != null and int(cells) == 0:
-		flags |= FLAG_NO_SPRITE
 	if bool(v["emission_from_paint"]):
 		flags |= FLAG_PAINT_GLOW
 	if bool(v["glow_keeps_albedo"]):
 		flags |= FLAG_KEEP_ALBEDO
 	if bool(v["modeller_tex"]):
 		flags |= FLAG_MODELLER_TEX
+	if bool(v["wet_rock"]):
+		flags |= FLAG_WET_ROCK
+	var org := int(v["organic_surface"])
+	if org == 1:
+		flags |= FLAG_ORGANIC_FLESH
+	elif org == 2:
+		flags |= FLAG_ORGANIC_CHITIN
 	var albedo: Color = v["albedo"]
 	var emission: Color = v["emission"]
 	var energy := float(v["emission_energy"])
@@ -259,7 +269,7 @@ static func _uniform_names(shader: Shader) -> PackedStringArray:
 			# are the model's. leaf_core stays its row's: a crown's cores share the leaf cards' surface,
 			# each vertex's UV saying which it is (factorio_material.gdshaderinc), or every card would
 			# be drawn as a core.
-			for u in ROW_PARAMS + ["material_table", "material_rows", "sprite_cells", "leaf_core"]:
+			for u in ROW_PARAMS + ["material_table", "material_rows", "leaf_core"]:
 				_not_lifted[u] = true
 		var names := PackedStringArray()
 		for u: Dictionary in shader.get_shader_uniform_list():

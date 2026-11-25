@@ -34,7 +34,7 @@ extends Node3D
 ##                              keep the roughness their files give (--pbr-rough=floor: the floor on them too, 0.2.2)
 ##   texture_metal              0-1: the share of a modeller's metallic-roughness picture's metal drawn
 ##                              (absent: 0.1, as paint, the share every other surface gets; 1: in full).
-##                              Settings' "Metal on textured models" Full and --texture-metal win over it
+##                              --texture-metal wins over it
 ##   texture_light              Vector2(sides, tops): the light balance on a "pbr" pack's pictures (model_packs.gd
 ##                              shading(); absent: (1, 1), as Godot's own material draws them). Factorio's
 ##                              part colours keep their own (0.95, 0.6): their colours have light in them
@@ -82,6 +82,9 @@ const SunShadows := preload("res://scripts/world/sun_shadows.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const PlanetSky := preload("res://scripts/world/sky.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const WeatherState := preload("res://scripts/world/weather_state.gd")
+const REACTIVE_CLEAR_SHADER := preload("res://shaders/look_reactive_clear.gdshader")
+const Switches := preload("res://scripts/switches.gd")
 
 signal look_changed(id: String)
 
@@ -124,6 +127,7 @@ const FACTORIO := {
 	# The sun's highlight at half Godot's: Factorio's sprites show modest highlights (0.25 before 0.2.3, cut when the
 	# only reflection was a dim blue sky; metal has no diffuse light, so its sun was that alone). --sun-specular wins.
 	"sun": {"light_specular": 0.5},
+	"roughness_limiter": Vector2(0.5, 0.22),
 }
 ## Zenith's look before 0.1.4: filmic tonemapping, the sun crossing the sky.
 const CLASSIC := {
@@ -139,6 +143,10 @@ static var looks := {}
 static var order: Array[String] = []
 ## The node drawing the game's look, while a game is on.
 static var active: Node = null
+## --grade-focus-uniform=off: read centre-screen depth in the grade pass on every pixel instead of passing focus distance.
+static var grade_focus_uniform := Switches.on("--grade-focus-uniform")
+## --fast-night-clouds=off: keep 14 sky-cloud march steps and solar scattering lookups at deep night.
+static var fast_night_clouds := Switches.on("--fast-night-clouds")
 
 ## A look's texture_metal when it has none, and the menu's and model preview's (project.godot): a
 ## picture's metal drawn as paint, as part colours and Factorio's sprites are. In full, metal shows
@@ -185,7 +193,7 @@ const NIGHT_VISION_AMBIENT_OLD := 1.4
 const NIGHT_VISION_COLOR := Color(0.62, 0.86, 0.62)
 ## --tree-sheen=old (or --grass-backlight=old): trees as 0.2.2 drew them, specular 0.5-0.2 with a white sheen at
 ## grazing angles (the shaders' f3d_tree_matte 0).
-static var tree_sheen_old: bool = "--tree-sheen=old" in OS.get_cmdline_user_args() or "--grass-backlight=old" in OS.get_cmdline_user_args()
+static var tree_sheen_old: bool = Switches.has("--tree-sheen=old") or Switches.has("--grass-backlight=old")
 const FILL_PITCH := 35.0
 const FILL_YAW := 20.0
 const FILL_SPECULAR := 0.25
@@ -224,6 +232,7 @@ var _base_sun := {}
 var _set_env: Array = []  # properties the current look set
 var _set_sun: Array = []
 var _pass_nodes: Array = []  # [MeshInstance3D] of the current look
+var _reactive_clear: MeshInstance3D = null  # clears RB_TEX_COLOR.a right after LookPasses under FSR 2.2
 ## Passes over any look (api.shaders.add_pass), kept between games: id -> {spec, owner}; their
 ## nodes while a game is on in _extra_nodes (id -> MeshInstance3D).
 static var extras := {}
@@ -243,9 +252,8 @@ var sun_state := {}
 
 
 var _forced := ""
-## --texture-metal=full or a number (texture_metal_arg), -1 without; Settings' choice, read in settle().
+## --texture-metal=full or a number (texture_metal_arg), -1 without.
 var _metal_arg := -1.0
-var _metal_full := false
 ## --pbr-env's number (pbr_env_arg) and switch (pbr_env_switch), --pbr-metal's share (pbr_metal_arg), read once in
 ## _ready: apply() runs every frame and must not parse the command line.
 var _pbr_env_arg := -1.0
@@ -279,7 +287,7 @@ var sky_put := Vector2.ONE
 ## --light-env: true (the sky's cubemap lights everything, the default) or false (=shader: 0.2.2's constant ambient,
 ## the planet's sky reflected and "pbr" packs' own terms), read in _ready.
 var _light_env_sky := true
-static var _shader_light_env := not light_env_switch(OS.get_cmdline_user_args()) or "--preview-light=studio" in OS.get_cmdline_user_args()
+static var _shader_light_env := not light_env_switch(Switches.args()) or Switches.has("--preview-light=studio")
 static var _env_shaders := {}  # Shader -> Shader compiled with #define SHADER_LIGHT_ENV
 var _env_sky_mat: ShaderMaterial = null
 var _env_cache := {}
@@ -289,13 +297,17 @@ var env_put := {}
 var _env_held := {}
 ## The fog's light as the look left it, while apply() scales it by the debug menu's sliders (released with _env_held).
 var _scene_held := {}
+## Environment and sun properties adjusted by active weather (released with _env_held).
+var _weather_held := {}
 ## The scene's light this frame against what the game set, after the debug menu's sliders: x the ambient's, y the
 ## sun's (1 untouched, 0 at none). The fill light, the fog's light and the looks' passes (look_scene_light) follow it.
 var scene_now := Vector2.ONE
+## Fog density scale applied when Distant Horizon extends past 50 chunks, preventing extreme horizon white-out.
+var fog_distance_scale := 1.0
 ## Night vision equipment's lift, 0-1 (main.gd): apply() adds its ambient before the sliders, so they hold it too.
 var night_vision := 0.0
 ## --night-vision-fx=old: the first night vision look (ambient lift 1.4, the edge at 0.42).
-static var night_vision_old: bool = "--night-vision-fx=old" in OS.get_cmdline_user_args()
+static var night_vision_old: bool = Switches.has("--night-vision-fx=old")
 ## The roughness floors apply() last put (x built-in packs and icon items, y "pbr" packs and modellers' items), for the tests.
 var rough_put := Vector2.ZERO
 ## The look's ao_direct _put_on last put (f3d_look_ao_direct), for the tests.
@@ -320,12 +332,12 @@ func _ready() -> void:
 	name = "Looks"
 	active = self
 	put_tree_matte()
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--look="):
 			_forced = arg.get_slice("=", 1)
 		elif arg.begins_with("--look-file="):
 			load_file(arg.get_slice("=", 1))
-	var args := OS.get_cmdline_user_args()
+	var args := Switches.args()
 	_metal_arg = texture_metal_arg(args)
 	_pbr_env_arg = pbr_env_arg(args)
 	_pbr_env_on = pbr_env_switch(args)
@@ -337,7 +349,6 @@ func _ready() -> void:
 	_pbr_scene_on = pbr_scene_switch(args)
 	_model_fill_arg = model_fill_arg(args)
 	_fill_light_arg = fill_light_arg(args)
-	_metal_full = str(Settings.get_value("graphics", "texture_metal")) == "full"
 	apply_pack_shading()
 
 
@@ -476,6 +487,7 @@ func use(id: String, force := false) -> void:
 			_key_params(node, L)
 	if not L.get("factorio_lut", false):
 		_luts.clear(env)
+	sync_pre_aa()
 	look_changed.emit(id)
 
 
@@ -624,6 +636,45 @@ func own_clouds() -> bool:
 	return bool(looks.get(current, {}).get("own_clouds", true))
 
 
+## The active look's own cloud layer parameters for volumetric passes (empty when Zenith's own
+## clouds apply, `cloud_mode = 0` when the look suppresses clouds without supplying its own).
+func cloud_source() -> Dictionary:
+	if own_clouds():
+		return {}
+	var pass_list: Variant = looks.get(current, {}).get("passes", [])
+	if pass_list is Array:
+		for spec_val: Variant in pass_list as Array:
+			if not (spec_val is Dictionary):
+				continue
+			var spec: Dictionary = spec_val
+			var params_val: Variant = spec.get("params", {})
+			if not (params_val is Dictionary):
+				continue
+			var params: Dictionary = params_val
+			var field_val: Variant = params.get("cloud_field")
+			if field_val is Texture2D and float(params.get("clouds", 0.0)) > 0.0:
+				var wind_val: Variant = params.get("wind", Vector2(3.2, 1.1))
+				var wind: Vector2 = wind_val if wind_val is Vector2 else Vector2(3.2, 1.1)
+				var look_cov := float(params.get("cloud_cover", 0.58))
+				var look_str := float(params.get("clouds", 1.0))
+				if WeatherState.active and float(WeatherState.state.get("cloud_cover", -1.0)) >= 0.0:
+					look_cov = clampf(float(WeatherState.state["cloud_cover"]), 0.0, 1.0)
+					if look_cov <= 0.005:
+						look_str = 0.0
+				return {
+					"cloud_mode": 2,
+					"look_cloud_field": field_val,
+					"look_cloud_cover": look_cov,
+					"look_cloud_strength": look_str,
+					"look_cloud_low": float(params.get("cloud_low", 230.0)),
+					"look_cloud_high": float(params.get("cloud_high", 300.0)),
+					"look_cloud_scale": float(params.get("cloud_scale", 0.009)),
+					"look_cloud_period": float(params.get("cloud_period", 16.0)),
+					"look_cloud_wind": wind,
+				}
+	return {"cloud_mode": 0}
+
+
 func _take_off() -> void:
 	_env_release()
 	for key in _set_env:
@@ -644,13 +695,10 @@ func _restore() -> void:
 	_tw_params.clear()
 
 
-## The share of a picture's metal drawn under look `L`: the command line's, else Settings' Full (1),
-## else the look's texture_metal.
+## The share of a picture's metal drawn under look `L`: the command line's, else the look's texture_metal.
 func texture_metal(L: Dictionary) -> float:
 	if _metal_arg >= 0.0:
 		return _metal_arg
-	if _metal_full:
-		return 1.0
 	return clampf(float(L.get("texture_metal", TEXTURE_METAL)), 0.0, 1.0)
 
 
@@ -824,7 +872,7 @@ static func pack_shading_arg(args: PackedStringArray) -> String:
 
 ## Whether packs' own shading is on: the command line's, else Settings' (Graphics > Advanced > Packs' own
 ## shading; "pack" by default).
-static func pack_shading(args: PackedStringArray = OS.get_cmdline_user_args()) -> bool:
+static func pack_shading(args: PackedStringArray = Switches.args()) -> bool:
 	var arg := pack_shading_arg(args)
 	if arg != "":
 		return arg == "pack"
@@ -838,7 +886,7 @@ static func apply_pack_shading() -> void:
 	packs_shade = pack_shading()
 	RenderingServer.global_shader_parameter_set(&"f3d_pack_shading", 1.0 if packs_shade else 0.0)
 	# The neutral reflection and metal share outside a game (a game's look sets both each frame, apply()).
-	var args := OS.get_cmdline_user_args()
+	var args := Switches.args()
 	var rest := PBR_ENV_REST
 	rest.w = 1.0 if pbr_env_switch(args) else 0.0
 	RenderingServer.global_shader_parameter_set(&"f3d_pbr_env", rest)
@@ -860,7 +908,6 @@ func lift() -> void:
 
 ## After Settings wrote: the look the player picked, its own values winning again.
 func settle(id: String) -> void:
-	_metal_full = str(Settings.get_value("graphics", "texture_metal")) == "full"
 	apply_pack_shading()
 	if env == null:
 		return
@@ -870,6 +917,20 @@ func settle(id: String) -> void:
 	else:
 		_put_on(looks.get(current, {}))
 	_luts.reapply(env)
+
+
+func _focus_distance() -> float:
+	if not grade_focus_uniform or not is_inside_tree():
+		return 0.0
+	var cam := get_viewport().get_camera_3d()
+	if cam == null:
+		return 0.0
+	if cam.projection == Camera3D.PROJECTION_ORTHOGONAL:
+		return clampf(cam.size, 4.0, 600.0)
+	var fwd := -cam.global_transform.basis.z
+	if fwd.y < -0.02 and cam.global_position.y > 0.0:
+		return clampf(cam.global_position.y / -fwd.y, 4.0, 600.0)
+	return 0.0
 
 
 ## Once a frame, after sky.gd lit the scene for the time of day: the look's light on top.
@@ -892,6 +953,8 @@ func apply(daytime: float, night: float, planet: String, space: bool, state := {
 		env.ambient_light_color = env.ambient_light_color.lerp(L["ambient_tint"], float(L.get("ambient_tint_amount", 1.0)) * (1.0 - low))
 	_blend_keyed(L, low, bool(state.get("morning", false)))
 	_space_env(space)
+	if not space and WeatherState.active:
+		_apply_weather_env(WeatherState.state)
 	if night_vision > 0.0:
 		# Factorio's night vision lifts the night (a brighter, greener ambient); its colour lookup is the LUT's.
 		env.ambient_light_energy += (NIGHT_VISION_AMBIENT_OLD if night_vision_old else NIGHT_VISION_AMBIENT) * night_vision
@@ -919,6 +982,8 @@ func apply(daytime: float, night: float, planet: String, space: bool, state := {
 		m.set_shader_parameter("look_daytime", daytime)
 		m.set_shader_parameter("look_night", night)
 		m.set_shader_parameter("look_space", 1.0 if space else 0.0)
+		m.set_shader_parameter("look_focus_dist", _focus_distance())
+		m.set_shader_parameter("fast_night_clouds", 1.0 if fast_night_clouds else 0.0)
 		if not state.is_empty():
 			m.set_shader_parameter("look_sun_height", state["height"])
 			m.set_shader_parameter("look_twilight", low)
@@ -986,15 +1051,17 @@ static func fill_light_arg(args: PackedStringArray) -> float:
 ## The fog's own light scaled as the debug menu's sliders scale the scene's (scene_now): its colour's energy by the
 ## ambient's, its glow towards the sun by the sun's, so at none of either the haze is no lit veil. Untouched otherwise.
 func _put_scene_fog() -> void:
-	if scene_now == Vector2.ONE:
+	if scene_now == Vector2.ONE and is_equal_approx(fog_distance_scale, 1.0):
 		return
-	_scene_held = {"fog_light_energy": env.fog_light_energy, "fog_sun_scatter": env.fog_sun_scatter}
+	_scene_held = {"fog_light_energy": env.fog_light_energy, "fog_sun_scatter": env.fog_sun_scatter, "fog_density": env.fog_density}
 	env.fog_light_energy *= scene_now.x
 	env.fog_sun_scatter *= scene_now.y
+	env.fog_density *= fog_distance_scale
 
 
 ## Returns `base`, or a variant compiled with SHADER_LIGHT_ENV when --light-env=shader is active.
 static func shader_for(base: Shader) -> Shader:
+	_static_mv_old_once()
 	if not _shader_light_env or base == null:
 		return base
 	if _env_shaders.has(base):
@@ -1004,6 +1071,59 @@ static func shader_for(base: Shader) -> Shader:
 	s.code = (base.code.substr(0, idx) + "#define SHADER_LIGHT_ENV\n" + base.code.substr(idx)) if idx >= 0 else ("#define SHADER_LIGHT_ENV\n" + base.code)
 	_env_shaders[base] = s
 	return s
+
+
+## Standing buildings out of FSR 2.2's / TAA's motion-vector pass (--static-mv): Godot draws every
+## surface whose shader reads TIME in vertex() (or TIME and a discard in fragment()) there each frame,
+## as if it moved, so factorio_material.gdshaderinc reads the world's clock (f3d_time, belt_blur.gd)
+## instead, and only materials whose vertices move with time are given TIME back (timed_shader():
+## worms and idle rigs; movers, robots and ragdolls have it in their own shaders).
+## `--static-mv=old`: every factorio_material shader keeps TIME, as before (all of them in the pass).
+const TIMED_DEFINE := "#define F3D_SHADER_TIME\n"
+const STATIC_MV_SHADERS: Array[String] = [
+	"res://shaders/factorio_material.gdshader",
+	"res://shaders/factorio_material_alpha.gdshader",
+	"res://shaders/factorio_material_clip.gdshader",
+	"res://shaders/factorio_material_ore.gdshader",
+	"res://shaders/factorio_material_leaf.gdshader",
+]
+static var _timed_shaders := {}  # base Shader -> its F3D_SHADER_TIME variant
+static var _static_mv_checked := false
+
+
+## Whether `--static-mv=old` is given (every model material keeps TIME, all in the motion-vector pass).
+static func static_mv_old() -> bool:
+	return Settings.has_arg("--static-mv=old")
+
+
+## `base`, or a variant of it compiled with F3D_SHADER_TIME (TIME, not f3d_time: its vertex motion
+## gets motion vectors), for materials whose vertices move with time. `base` itself when it has it.
+static func timed_shader(base: Shader) -> Shader:
+	if base == null or base.code.contains(TIMED_DEFINE):
+		return base
+	if _timed_shaders.has(base):
+		return _timed_shaders[base]
+	var s := Shader.new()
+	var idx := base.code.find("#include ")
+	s.code = (base.code.substr(0, idx) + TIMED_DEFINE + base.code.substr(idx)) if idx >= 0 else (TIMED_DEFINE + base.code)
+	_timed_shaders[base] = s
+	return s
+
+
+## --static-mv=old: the factorio_material shaders themselves given F3D_SHADER_TIME, in place, before
+## any material or variant is made from them (shader_for() is on every model material's way).
+static func _static_mv_old_once() -> void:
+	if _static_mv_checked:
+		return
+	_static_mv_checked = true
+	if not static_mv_old():
+		return
+	for path in STATIC_MV_SHADERS:
+		var sh := load(path) as Shader
+		if sh == null or sh.code.contains(TIMED_DEFINE):
+			continue
+		var idx := sh.code.find("#include ")
+		sh.code = (sh.code.substr(0, idx) + TIMED_DEFINE + sh.code.substr(idx)) if idx >= 0 else (TIMED_DEFINE + sh.code)
 
 
 func _set_env_param(mat: ShaderMaterial, key: String, val: Variant) -> void:
@@ -1196,11 +1316,40 @@ func _env_release() -> void:
 	for key in _scene_held:
 		env.set(key, _scene_held[key])
 	_scene_held.clear()
+	for key in _weather_held:
+		if key == "sun_shadow_opacity":
+			if sun != null:
+				sun.shadow_opacity = float(_weather_held[key])
+		else:
+			env.set(key, _weather_held[key])
+	_weather_held.clear()
 	if _env_held.is_empty():
 		return
 	for key in _env_held:
 		env.set(key, _env_held[key])
 	_env_held.clear()
+
+
+func _apply_weather_env(wx: Dictionary) -> void:
+	var fog_add := float(wx.get("fog_density_add", 0.0))
+	var fog_amt := float(wx.get("fog_color_amount", 0.0))
+	if fog_add > 0.00001 or fog_amt > 0.001:
+		for k in ["fog_enabled", "fog_density", "fog_light_color", "fog_light_energy", "fog_aerial_perspective"]:
+			_weather_held[k] = env.get(k)
+		if fog_add > 0.00001:
+			if not env.fog_enabled:
+				env.fog_enabled = true
+				env.fog_density = fog_add
+				env.fog_light_energy = 0.7
+				env.fog_aerial_perspective = 0.45
+			else:
+				env.fog_density = env.fog_density + fog_add
+		if fog_amt > 0.001 and wx.get("fog_color") is Color:
+			env.fog_light_color = env.fog_light_color.lerp(wx["fog_color"], fog_amt)
+	var sh_scale := float(wx.get("shadow_opacity_scale", 1.0))
+	if sh_scale < 0.999 and sun != null:
+		_weather_held["sun_shadow_opacity"] = sun.shadow_opacity
+		sun.shadow_opacity = clampf(sun.shadow_opacity * sh_scale, 0.0, 1.0)
 
 
 ## `--light-env=shader` (or old): 0.2.2's light (a constant ambient colour, the planet's sky reflected, "pbr" packs'
@@ -1307,6 +1456,7 @@ static func remove_pass(id: int) -> void:
 	if active != null and active._extra_nodes.has(id):
 		(active._extra_nodes[id] as Node).queue_free()
 		active._extra_nodes.erase(id)
+		active.sync_pre_aa()
 
 
 ## A uniform of a pass over every look (kept for the next game too), or with id 0 of every pass of
@@ -1333,6 +1483,46 @@ func _show_extra(id: int) -> void:
 	var node := _make_pass(extras[id]["spec"], str(extras[id]["owner"]), 16)
 	if node != null:
 		_extra_nodes[id] = node
+		sync_pre_aa()
+
+
+static func _fsr2_flag(vp: Viewport) -> float:
+	if vp != null and Settings.fsr2_fixes_enabled() and vp.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2:
+		return 1.0
+	return 0.0
+
+
+func _sync_reactive_clear(vp: Viewport) -> void:
+	var need := _fsr2_flag(vp) > 0.5 and (not _pass_nodes.is_empty() or not _extra_nodes.is_empty())
+	if need and _reactive_clear == null:
+		var m := ShaderMaterial.new()
+		m.shader = REACTIVE_CLEAR_SHADER
+		m.render_priority = -101
+		var quad := QuadMesh.new()
+		quad.size = Vector2(2.0, 2.0)
+		var mi := MeshInstance3D.new()
+		mi.mesh = quad
+		mi.material_override = m
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		mi.extra_cull_margin = 16384.0
+		mi.sorting_offset = 100000.0
+		mi.name = "LookReactiveClear"
+		add_child(mi)
+		_reactive_clear = mi
+	if _reactive_clear != null:
+		_reactive_clear.visible = need
+
+
+func sync_pre_aa(vp: Viewport = null) -> void:
+	var v := vp if vp != null else (get_viewport() if is_inside_tree() else null)
+	var amt := Settings.look_pre_aa_for(v)
+	var fsr2 := _fsr2_flag(v)
+	for n: MeshInstance3D in _pass_nodes + _extra_nodes.values():
+		var m := n.material_override as ShaderMaterial
+		if m != null:
+			m.set_shader_parameter("look_pre_aa", amt)
+			m.set_shader_parameter("look_fsr2", fsr2)
+	_sync_reactive_clear(v)
 
 
 static func _shader_of(spec: Dictionary) -> Shader:
@@ -1353,13 +1543,17 @@ func _make_pass(spec: Dictionary, owner: String, base := 0) -> MeshInstance3D:
 		return null
 	var m := ShaderMaterial.new()
 	m.shader = shader
-	# Before every other see-through thing (cloud shadows are at -100), so it reads and replaces
-	# only the solid scene; later passes in a list draw after earlier ones.
+	# Before every other see-through thing (-101 is reserved for LookReactiveClear, cloud shadows are
+	# at -100), so it reads and replaces only the solid scene; later passes draw after earlier ones.
 	var n := _pass_nodes.size() if base == 0 else _extra_nodes.size()
-	m.render_priority = clampi(-128 + base + int(spec.get("order", n)), -128, -101)
+	m.render_priority = clampi(-128 + base + int(spec.get("order", n)), -128, -102)
 	var params: Dictionary = spec.get("params", {})
 	for k in params:
 		m.set_shader_parameter(k, params[k])
+	if is_inside_tree():
+		var vp := get_viewport()
+		m.set_shader_parameter("look_pre_aa", Settings.look_pre_aa_for(vp))
+		m.set_shader_parameter("look_fsr2", _fsr2_flag(vp))
 	var quad := QuadMesh.new()
 	quad.size = Vector2(2.0, 2.0)
 	var mi := MeshInstance3D.new()

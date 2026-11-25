@@ -6,5 +6,32 @@
 	"credit": "© Wube Software · CC BY-NC · adapted",
 	"description": "Wube's official 3D-printable Factorio models (Friday Facts #447): belts, undergrounds, chests, inserters, furnaces, the assembling machine 1, the electric mining drill, the small pole, walls, the character, biters, spitters and the spawner, scaled and coloured to Factorio's sprites. Not for commercial use; CREDITS.md lists every model and its source files.",
 	"icon": "assembling-machine-1",
-	"icon_image": "factorio:data/core/graphics/wube-logo.png"
+	"icon_image": "factorio:data/core/graphics/wube-logo.png",
+	"shading": "pbr",
+	"shading_models": {
+		"big-biter": "factorio",
+		"big-biter-attack": "factorio",
+		"big-biter-corpse": "factorio",
+		"big-biter-corpse-1": "factorio",
+		"big-biter-corpse-2": "factorio",
+		"big-biter-corpse-3": "factorio",
+		"big-spitter": "factorio",
+		"big-spitter-attack": "factorio",
+		"big-spitter-corpse": "factorio",
+		"big-spitter-corpse-1": "factorio",
+		"big-spitter-corpse-2": "factorio",
+		"big-spitter-corpse-3": "factorio",
+		"biter-spawner": "factorio",
+		"biter-spawner-corpse": "factorio",
+		"character": "factorio",
+		"character-armor-2": "factorio",
+		"character-armor-3": "factorio",
+		"character-corpse": "factorio",
+		"character-gun": "factorio",
+		"transport-belt": "factorio",
+		"transport-belt-curve-left": "factorio",
+		"transport-belt-curve-right": "factorio",
+		"underground-belt-input": "factorio",
+		"underground-belt-output": "factorio"
+	}
 }

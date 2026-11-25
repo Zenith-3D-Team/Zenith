@@ -11,6 +11,8 @@ extends RefCounted
 ## the model's body; the rest become one moving part, "baked" (model_library.gd Load).
 ## Worker-thread safe: plain arrays and an ImageTexture.
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## Frames a second an action is sampled at, at least (between frames the shader blends): an action
 ## keyed more often is sampled at its own key rate, up to MAX_FPS, so every key is a frame.
 const FPS := 30.0
@@ -21,7 +23,7 @@ const MAX_FRAMES := 4096
 ## 57% of its width). The cosine of that turn, for the shader's bake_snap; -2 always mixes.
 const SNAP := 0.866
 ## --baked-anim=old: as before 0.2.2, every action at 30 frames a second, at most 512, always mixed.
-static var old_anim := OS.get_cmdline_user_args().has("--baked-anim=old")
+static var old_anim := Switches.has("--baked-anim=old")
 const OLD_MAX_FRAMES := 512
 ## Bones whose matrix changes less than this over the action count as still.
 const STILL := 0.0005
@@ -36,8 +38,9 @@ const STILL := 0.0005
 ##              tex (ImageTexture RGBAF: 3 texels a joint, a row a frame), image, moving
 ##              (PackedByteArray: 1 a joint that moves), snap (the shader's bake_snap)
 ## Every action is played at once (Blender exports one per object), each looping on its own length.
-static func bake(path: String) -> Dictionary:
-	var glb := _read(path)
+## `read`: the file read already (model_textures.gd read_glb), else it is read here.
+static func bake(path: String, read := {}) -> Dictionary:
+	var glb := _read(path) if read.is_empty() else _from_read(read)
 	if glb.is_empty():
 		return {}
 	var doc: Dictionary = glb["doc"]
@@ -259,6 +262,73 @@ static func box_of(bake: Dictionary, rest: AABB) -> AABB:
 	return box
 
 
+## Highest Y any vertex of a baked animated part reaches across its action's frames, using each
+## bone's own vertex bounds (tighter than box_of(), which turns the whole model's box by each bone).
+static func peak_y(bake: Dictionary, groups: Array) -> float:
+	var image: Image = bake.get("image")
+	var frames := int(bake.get("frames", 0))
+	var joints := int(bake.get("joints", 0))
+	if image == null or frames <= 0 or joints <= 0:
+		return -INF
+	var has_box := PackedByteArray()
+	var bmin := PackedVector3Array()
+	var bmax := PackedVector3Array()
+	has_box.resize(joints)
+	bmin.resize(joints)
+	bmax.resize(joints)
+	for g: Array in groups:
+		var arrays: Array = g[1]
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var c3: Variant = arrays[Mesh.ARRAY_CUSTOM3]
+		if verts.is_empty() or not (c3 is PackedFloat32Array):
+			continue
+		var weights := c3 as PackedFloat32Array
+		if weights.size() != verts.size() * 4:
+			continue
+		var used := PackedByteArray()
+		var idx: Variant = arrays[Mesh.ARRAY_INDEX]
+		if idx is PackedInt32Array and not (idx as PackedInt32Array).is_empty():
+			used.resize(verts.size())
+			for vi in (idx as PackedInt32Array):
+				if vi >= 0 and vi < verts.size():
+					used[vi] = 1
+		for v in verts.size():
+			if not used.is_empty() and used[v] == 0:
+				continue
+			var p: Vector3 = verts[v]
+			for k in 4:
+				var enc := weights[v * 4 + k]
+				var w := enc - floorf(enc)
+				if w <= 0.01:
+					continue
+				var j := int(floorf(enc))
+				if j < 0 or j >= joints:
+					continue
+				if has_box[j] == 0:
+					has_box[j] = 1
+					bmin[j] = p
+					bmax[j] = p
+				else:
+					bmin[j] = bmin[j].min(p)
+					bmax[j] = bmax[j].max(p)
+	var best := -INF
+	var step := maxi(1, frames / 120)
+	var frame := 0
+	while frame < frames:
+		for j in joints:
+			if has_box[j] == 0:
+				continue
+			var r1 := image.get_pixel(j * 3 + 1, frame)
+			var lo: Vector3 = bmin[j]
+			var hi: Vector3 = bmax[j]
+			var py := r1.r * (hi.x if r1.r >= 0.0 else lo.x) + r1.g * (hi.y if r1.g >= 0.0 else lo.y) + r1.b * (hi.z if r1.b >= 0.0 else lo.z) + r1.a
+			best = maxf(best, py)
+		if frame == frames - 1:
+			break
+		frame = mini(frame + step, frames - 1)
+	return best
+
+
 ## Each vertex's four bones and weights for CUSTOM3: bone + weight * 0.999 per channel, so the shader
 ## reads the bone with floor() and the weight with fract() (renormalised there). Weights are bones of
 ## the skin's joint list, as glTF's JOINTS_0.
@@ -367,6 +437,12 @@ static func _mat(m: PackedFloat32Array, o: int) -> Transform3D:
 
 
 ## The .glb's JSON and binary chunk, or {}.
+static func _from_read(read: Dictionary) -> Dictionary:
+	var bytes: PackedByteArray = read["bytes"]
+	var at := int(read["bin_at"])
+	return {"doc": read["doc"], "bin": bytes.slice(at, at + int(read["bin_len"])) if at >= 0 else PackedByteArray()}
+
+
 static func _read(path: String) -> Dictionary:
 	var f := FileAccess.open(path, FileAccess.READ)
 	if f == null or f.get_length() < 20 or f.get_32() != 0x46546C67:

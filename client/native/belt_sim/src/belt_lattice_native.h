@@ -11,14 +11,17 @@
 #include "belt_native_common.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/packed_float64_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
 #include <godot_cpp/variant/packed_int64_array.hpp>
+#include <godot_cpp/variant/plane.hpp>
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/vector2.hpp>
 #include <godot_cpp/variant/vector3.hpp>
@@ -43,6 +46,9 @@ public:
 	static constexpr i64 GAP = 64;
 	static constexpr i64 CELLS = 4;
 	static constexpr i64 MASK = 2048;
+	static constexpr i64 MASK_TILE = 512;
+	static constexpr i64 MASK_GRID = 4;
+	static constexpr i64 MASK_TILES = 16;
 	static constexpr i64 DRIFT = 24;
 	static constexpr i64 SPEED_CHECKS = 2;
 	static constexpr double LAYER_STEP = 0.006;
@@ -56,6 +62,13 @@ public:
 	static constexpr i64 TURN_RUN = 40503;  // (turn_id) belt_lattice.gd TURN_RUN
 	static constexpr i64 SEED_AFTER = 120;  // (turn_id) belt_lattice.gd SEED_AFTER
 	static constexpr i64 SEED_WL = 28;  // (turn_id) belt_lattice.gd SEED_WL
+	static constexpr i64 BAND_STEP = (i64)1 << 28;
+	static constexpr double CAP_SLACK = 1.5;
+	static constexpr int CAP_EVERY = 30;
+	static constexpr double CAM_STEP = 2.0;
+	static constexpr double CAM_TURN = 0.996;
+	static constexpr double CAM_MARGIN = 3.0;
+	static constexpr double BAND_HYST = 1.5;
 	// belt_sim.gd's lane kinds
 	enum Kinds { STRAIGHT = 1, CURVE = 2, UG_VISIBLE = 3, UG_HIDDEN = 4, SPLIT_IN = 5, SPLIT_OUT = 6, LOADER = 7, OTHER = 8 };
 
@@ -142,9 +155,12 @@ private:
 	beltn::Ordered<i64, LKind *> kinds;
 	beltn::Records records;
 	double base = -1.0;
-	Ref<Image> mask;
+	Ref<Image> mask_tiles[MASK_TILES];
+	bool mask_init = false;
 	std::vector<uint8_t> mask_n;  // lanes marking each cell
-	bool mask_dirty = false;
+	uint32_t mask_dirty_bits = 0;
+	bool mask_sent_all = false;
+	bool mask_tiled = true;
 	i64 lanes_n = 0;  // lanes drawn after the last update
 	i64 slots_n = 0;
 	beltn::Ordered<i64, i64> want;  // lane key -> item: lanes to draw
@@ -160,7 +176,35 @@ private:
 	bool item_turns = true;  // belt_lattice.gd item_turns (set_item_turns)
 	bool turn_id = true;  // belt_lattice.gd turn_id (set_turn_id)
 	bool edge_shut = true;  // belt_lattice.gd edge_shut (set_edge_shut)
+	bool tight_cull = true;
 	double shown = -1.0;  // belt_lattice.gd shown (set_shown): the drawn clock when the update is first drawn
+	bool model_cap_near = true;
+	Vector2 cap_anchor;
+	bool cap_anchor_set = false;
+	bool cap_cam_led = false;
+	Vector3 cap_cam_pos;
+	Vector3 cap_cam_dir = Vector3(0.0f, 0.0f, -1.0f);
+	std::vector<Plane> cap_cam_planes;
+	std::vector<float> cap_sim_d2;
+	bool cap_sim_dirty = false;
+	int cap_round = 0;
+	Vector2 capped_anchor = Vector2(INFINITY, INFINITY);
+	bool capped_cam = false;
+	Vector3 capped_cam_pos;
+	Vector3 capped_cam_dir = Vector3(0.0f, 0.0f, -1.0f);
+	i64 cap_3d_slots = 0;
+	i64 cap_eligible_slots = 0;
+	double cap_limit_d2 = INFINITY;
+	bool lod_split = false;
+	Vector3 lod_anchor;
+	double lod_d1 = INFINITY;
+	double lod_d2 = INFINITY;
+	Vector2 lod_jit;
+	Vector3 lod_band_at = Vector3(INFINITY, INFINITY, INFINITY);
+	double lod_d1_seen = INFINITY;
+	double lod_d2_seen = INFINITY;
+	bool lod_split_seen = false;
+	std::unordered_map<i64, i64> lane_keys;  // lane key -> target kind_key
 
 	// --- this update
 	bool on = true;
@@ -275,6 +319,11 @@ private:
 	static i64 _uid(i64 key, i64 k) { return -(key * 8 + k + 1); }
 	static bool _drawn_kind(int kind);
 	static i64 _kind_key(i64 item, int model_cap) { return model_cap < 0 ? item : -item - 1; }
+	Vector2 _lane_mid(i64 key, const int32_t *m);
+	static double _view_dist_sq(const Vector3 &p, const Vector3 &cpos, const std::vector<Plane> &planes, double margin);
+	i64 _compute_lane_key(i64 key, i64 item, const Vector2 &mid, double h, int model_cap, bool is_3d);
+	void _plan_lane_keys(int model_cap, const Vector2 &anchor, beltn::Ordered<i64, bool> &check);
+	void _rekey_lane(i64 key, Lane *ln, i64 new_kk);
 	static i64 _world_phase(const int32_t *m);
 	static i64 _world_tau(const int32_t *m);
 	static i64 _world_run(const int32_t *m);
@@ -294,6 +343,7 @@ private:
 	void _remove(i64 key);
 	void _write_lane(i64 key, Lane *ln, const int32_t *m, const Look &look, int stack);
 	void _drop_slot(i64 key, Lane *ln, LKind *kd);
+	void _compact_kind(i64 kk, LKind *kd);
 	void _mark(i64 key, Lane *ln);
 	void _unmark(Lane *ln);
 
@@ -301,13 +351,87 @@ protected:
 	static void _bind_methods();
 
 public:
+	static i64 look_key(i64 kk) { return kk < 0 ? kk : (kk % BAND_STEP); }
+	static int band_of(i64 kk) { return kk >= 0 ? (int)(kk / BAND_STEP) : 0; }
+	static i64 band_key(i64 kk, int band) { return (kk >= 0 && band > 0) ? (kk + (i64)band * BAND_STEP) : kk; }
+	static double hash_u32(i64 x) {
+		uint32_t h = (uint32_t)(((uint64_t)x ^ (uint64_t)(x >> 16)) & 0xFFFFFFFFull);
+		h = (uint32_t)((uint64_t)h * 0x45d9f3bu);
+		h = (h ^ (h >> 16)) & 0xFFFFFFFFu;
+		return (double)(h & 0xFFFFu) / 65536.0;
+	}
+	static int band_for_dist(i64 id, double d, double d1, double d2, const Vector2 &jit, int cur_band) {
+		if (d2 <= 0.0) {
+			return 2;
+		}
+		if (!std::isfinite(d1)) {
+			return 0;
+		}
+		double j = hash_u32(id) - 0.5;
+		double t2 = std::isfinite(d2) ? (d2 + j * (double)jit.y) : INFINITY;
+		if (d1 <= 0.0) {
+			if (cur_band < 1) {
+				return d < t2 ? 1 : 2;
+			}
+			if (cur_band == 1) {
+				return (std::isfinite(t2) && d >= t2 + BAND_HYST) ? 2 : 1;
+			}
+			return (std::isfinite(t2) && d < t2 - BAND_HYST) ? 1 : 2;
+		}
+		double t1 = d1 + j * (double)jit.x;
+		if (cur_band < 0) {
+			return d < t1 ? 0 : (d < t2 ? 1 : 2);
+		}
+		if (cur_band == 0) {
+			if (d < t1 + BAND_HYST) {
+				return 0;
+			}
+			return d < t2 ? 1 : 2;
+		}
+		if (cur_band == 1) {
+			if (d < t1 - BAND_HYST) {
+				return 0;
+			}
+			if (std::isfinite(t2) && d >= t2 + BAND_HYST) {
+				return 2;
+			}
+			return 1;
+		}
+		if (d < t1 - BAND_HYST) {
+			return 0;
+		}
+		if (std::isfinite(t2) && d < t2 - BAND_HYST) {
+			return 1;
+		}
+		return 2;
+	}
 	void set_sim(Object *p_sim);
 	void set_small_pages(bool on) { records.set_small(on); }
 	void set_item_turns(bool on) { item_turns = on; }
 	void set_turn_id(bool on) { turn_id = on; }
 	void set_edge_shut(bool on) { edge_shut = on; }
+	void set_mask_tiled(bool on) { mask_tiled = on; }
+	void set_tight_cull(bool on) { tight_cull = on; }
 	void set_shown(double t) { shown = t; }
+	void set_model_cap_near(bool on) { model_cap_near = on; }
+	void set_cap_anchor(const Vector2 &anchor, bool cam_led, const Vector3 &cam_pos, const Vector3 &cam_dir,
+			const Array &cam_planes, const PackedFloat32Array &sim_d2);
+	void set_lod_bands(bool split, const Vector3 &anchor, double d1, double d2, const Vector2 &jit);
+	i64 get_cap_3d_slots() const { return cap_3d_slots; }
+	i64 get_cap_eligible_slots() const { return cap_eligible_slots; }
+	double get_cap_limit_d2() const { return cap_limit_d2; }
 	void set_lane(i64 key, const PackedInt32Array &meta, const PackedFloat64Array &arc);
+	bool has_lane_meta(i64 key) const { return lanes.find(key) != lanes.end(); }
+	bool get_lane_kind_len(i64 key, int &out_kind, i64 &out_len) const {
+		auto it = lanes.find(key);
+		if (it == lanes.end()) {
+			return false;
+		}
+		out_kind = it->second.m[0];
+		out_len = it->second.m[1];
+		return true;
+	}
+	void note_read_raw(i64 key, i64 length, const i64 *it, i64 n_ints);
 	void note_read(i64 key, i64 length, const PackedInt64Array &items);
 	void note_check(i64 key, i64 length, i64 count, i64 front, i64 back);
 	void drop(i64 key);

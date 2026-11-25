@@ -25,11 +25,12 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const CraftingPanel := preload("res://scripts/ui/factorio/crafting_panel.gd")
 const Controls := preload("res://scripts/player/controls.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## A lab's research box after a research finished with none started since: Factorio's "<name> finished.
 ## Press T." (core.cfg's research-finished) with that technology's icon and a full bar, where ours said
 ## "No research in progress. Press T." (docs/UI-DIFFERENCES.md, Biolab). `--lab-finished=old`: as before.
-static var lab_finished := not ("--lab-finished=old" in OS.get_cmdline_user_args())
+static var lab_finished := not (Switches.has("--lab-finished=old"))
 
 ## Factorio's colours: production_progressbar (green), heat_progressbar (red), burning_progressbar,
 ## bonus_progressbar (purple).

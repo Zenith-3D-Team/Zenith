@@ -22,7 +22,18 @@
 //      a gap and its own spacing, at half a tick a tick growing and a tick a tick shrinking)
 //   7  how fast the clock's gap grows (ticks a tick; game_clock.gd `ease`)
 // flags: 1 on the odd clock, 2 hidden (remote view fog), 4 a construction robot, 8 carrying cargo,
-// 16 a robot that animates (logistic, construction).
+// 16 a robot that animates (logistic, construction), 32 simulated worker robot (2-leg flight /
+// orbit instead of 4-point history), 64 simulated construction robot actively working at target,
+// 128 simulated robot in charging orbit around r0.zw, 256 simulated Leg 2 carrying cargo bit.
+//
+// When flag 32 (SIMULATED) is set, the texels hold a parametric flight plan (t_start..t_arr2):
+//   0  start.x, start.z, end1.x, end1.z
+//   1  end2.x, end2.z, err.x, err.z (smooth blend residual decaying from t_write)
+//   2  t_start, t_arr1, t_arr2, t_arr2 (all epoch-relative clock ticks)
+//   3  flags, height, leg1_yaw, t_write
+//   4  yaw0, leg2_yaw, c0_flying, c1_reach
+//   5  bob_phase, orbit_radius, orbit_rate_rad_per_tick, orbit_phase
+//   6  blend_decay_per_sec, hover_still_ticks, 0.0, speed_tpt
 // The clock: x and y are the clock tick since the latest even and odd epoch began (two clocks, so
 // the numbers stay small and precise in a long game: mover_records.gd moves every record onto the
 // newer clock before the older one starts again), z the game's ticks a second as the client
@@ -84,6 +95,72 @@ MoverState mover_state(int slot) {
 	s.flags = r3.x;
 	float now = mover_flag(r3.x, 1.0) ? f3d_mover_clock.y : f3d_mover_clock.x;
 	float rate = max(f3d_mover_clock.z, 1.0);
+	if (mover_flag(r3.x, 32.0)) {
+		vec4 r4 = s.carried;
+		vec4 r5 = s.kind;
+		float drawn = now;
+		float since = max(now - r3.w, 0.0) / rate;
+		vec2 at = r0.xy;
+		float speed_tpt = 0.0;
+		float still_ticks = 0.0;
+		float yaw = r3.z;
+		if (mover_flag(r3.x, 128.0)) {
+			float ang = r5.w + max(drawn - r2.x, 0.0) * r5.z;
+			at = r0.zw + vec2(cos(ang), sin(ang)) * r5.y;
+			float sgn = r5.z >= 0.0 ? 1.0 : -1.0;
+			float vx = -sin(ang) * sgn;
+			float vz = cos(ang) * sgn;
+			float tang_yaw = atan(-vx, -vz);
+			float od = mod(r4.x - tang_yaw + 3.14159265, 6.2831853) - 3.14159265;
+			yaw = tang_yaw + od * exp(-MOVER_TURN_RATE * since);
+			speed_tpt = abs(r5.y * r5.z);
+		} else if (drawn < r2.y && r2.y > r2.x + 1e-4) {
+			float f = clamp((drawn - r2.x) / (r2.y - r2.x), 0.0, 1.0);
+			at = mix(r0.xy, r0.zw, f);
+			speed_tpt = r6.w;
+			float d1 = mod(r4.x - r3.z + 3.14159265, 6.2831853) - 3.14159265;
+			yaw = r3.z + d1 * exp(-MOVER_TURN_RATE * since);
+		} else if (r2.z > r2.y + 1e-4 && drawn < r2.z) {
+			float f = clamp((drawn - r2.y) / (r2.z - r2.y), 0.0, 1.0);
+			at = mix(r0.zw, r1.xy, f);
+			speed_tpt = r6.w;
+			float since2 = max(now - max(r3.w, r2.y), 0.0) / rate;
+			float d2 = mod(r3.z - r4.y + 3.14159265, 6.2831853) - 3.14159265;
+			yaw = r4.y + d2 * exp(-MOVER_TURN_RATE * since2);
+			bool has_c = mover_flag(s.flags, 8.0);
+			bool want_c = mover_flag(s.flags, 256.0);
+			if (has_c != want_c) {
+				s.flags += want_c ? 8.0 : -8.0;
+			}
+		} else {
+			bool had_leg2 = r2.z > r2.y + 1e-4;
+			at = had_leg2 ? r1.xy : r0.zw;
+			float end_t = max(r2.y, r2.z);
+			still_ticks = max(drawn - end_t, 0.0) + r6.y;
+			if (had_leg2) {
+				bool has_c = mover_flag(s.flags, 8.0);
+				bool want_c = mover_flag(s.flags, 256.0);
+				if (has_c != want_c) {
+					s.flags += want_c ? 8.0 : -8.0;
+				}
+				float since2 = max(now - max(r3.w, r2.y), 0.0) / rate;
+				float d2 = mod(r3.z - r4.y + 3.14159265, 6.2831853) - 3.14159265;
+				yaw = r4.y + d2 * exp(-MOVER_TURN_RATE * since2);
+			} else {
+				float d1 = mod(r4.x - r3.z + 3.14159265, 6.2831853) - 3.14159265;
+				yaw = r3.z + d1 * exp(-MOVER_TURN_RATE * since);
+			}
+		}
+		at += r1.zw * exp(-r6.x * since);
+		s.pos = vec3(at.x, r3.y, at.y);
+		s.yaw = yaw;
+		s.walked = 0.0;
+		s.speed = speed_tpt * rate;
+		s.average = s.speed;
+		s.still = still_ticks / rate;
+		s.since = since;
+		return s;
+	}
 	// The tick drawn now: the clock less the lag.
 	float after = max(now - r3.w, 0.0);
 	float lag = mover_lag(r6, ease, after);

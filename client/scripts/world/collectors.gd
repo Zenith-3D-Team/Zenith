@@ -19,6 +19,7 @@ extends Node3D
 
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Rockets := preload("res://scripts/world/rockets.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 const CATCH_RADIUS := 7.5
 const CATCH_OFFSET := 5.0
@@ -98,7 +99,7 @@ func reset() -> void:
 func handle(msg: Dictionary) -> void:
 	if msg.has("l"):
 		var seen := {}
-		for r in _array(msg.get("l")):
+		for r in Wire.array(msg.get("l")):
 			if not (r is Array and r.size() >= 5):
 				continue
 			var c := _collector(int(r[0]))
@@ -106,13 +107,13 @@ func handle(msg: Dictionary) -> void:
 			c.speed = int(r[2]) / 1000.0 * 60.0
 			c.moving = int(r[3]) == 1
 			c.folded = int(r[3]) == 2
-			c.filters = _array(r[4]).map(func(f) -> String: return str(f))
+			c.filters = Wire.array(r[4]).map(func(f) -> String: return str(f))
 			c.known = true
 			seen[c.unit] = true
 		for unit in _collectors.keys():
 			if not seen.has(unit) and (_collectors[unit] as Collector).known:
 				_forget(unit)
-	for g in _array(msg.get("g")):
+	for g in Wire.array(msg.get("g")):
 		if g is Array and g.size() >= 4:
 			_caught(int(g[0]), str(g[1]), Vector2(int(g[2]), int(g[3])) / 256.0)
 
@@ -497,7 +498,3 @@ func _flush_extra() -> void:
 		mm.visible_instance_count = xf.size()
 		xf.clear()
 		(e["custom"] as Array).clear()
-
-
-static func _array(v) -> Array:
-	return v if v is Array else []

@@ -73,6 +73,7 @@ const PICTURE_ZOOM := 3.0
 
 const BurnerFx := preload("res://scripts/fx/burner_fx.gd")
 const SpriteFx := preload("res://scripts/fx/sprite_fx.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Radians a second the model turns.
 const TURN_SPEED := 0.5
@@ -265,7 +266,7 @@ func _init() -> void:
 	add_child(_note)
 	add_child(_sound)
 	set_process(false)
-	studio = not Looks.preview_light_switch(OS.get_cmdline_user_args())
+	studio = not Looks.preview_light_switch(Switches.args())
 	_put_light()
 
 
@@ -386,6 +387,26 @@ func show_model(name: String) -> void:
 		viewport.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
 		set_process(false)
 	_try()
+
+
+## Reloads the current model/item in place (keeping camera spin, tilt, zoom and pan).
+func reload() -> void:
+	if model == "" or is_picture():
+		return
+	var was_playing := is_playing()
+	shown_mesh = null
+	_stop_playing()
+	for c in _holder.get_children():
+		_holder.remove_child(c)
+		c.queue_free()
+	_waiting_since = Time.get_ticks_msec()
+	_note.text = "Reading the model..."
+	_put_tonemap()
+	place_apart()
+	_wake_render(2)
+	_try()
+	if was_playing:
+		set_playing(true)
 
 
 ## Shows item `item`'s model (items on belts, the ground, hands): the one in use, or with `path` that
@@ -1079,7 +1100,7 @@ func _notification(what: int) -> void:
 			else:
 				# SubViewportContainer resets child SubViewports to UPDATE_WHEN_VISIBLE on show.
 				viewport.render_target_update_mode = SubViewport.UPDATE_DISABLED
-	elif what == NOTIFICATION_EXIT_TREE and studio != (not Looks.preview_light_switch(OS.get_cmdline_user_args())):
+	elif what == NOTIFICATION_EXIT_TREE and studio != (not Looks.preview_light_switch(Switches.args())):
 		# The globals back to what the menu's backdrop and the other previews draw with.
 		Looks.put_idle_globals({} if studio else Looks.noon_rig())
 	elif what == NOTIFICATION_PREDELETE:

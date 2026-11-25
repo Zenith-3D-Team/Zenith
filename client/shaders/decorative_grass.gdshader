@@ -5,13 +5,16 @@ shader_type spatial;
 // a clump. A bush or carpet rises where the picture has most plant (a blurred read of its alpha, from
 // the atlas's own mipmaps). Points rise along Factorio's camera ray, so from Factorio's angle the plant
 // covers exactly what the picture shows and from any other it has height. It is one sheet that doesn't
-// overlap itself, so from above each pixel is drawn once. Blended, written to no depth and in a fixed
-// order, like the flat pictures: hard cut-outs crawled and sparkled as the view moved.
+// overlap itself, so from above each pixel is drawn once. Cut out with alpha to coverage in the opaque pass
+// (as decorative_carpet.gdshader; MSAA smooths the edges, TAA holds them still), written to depth, with
+// no specular: the plants' sheen is nearly zero anyway. --grass-opt=old: the blended copy
+// (decorative_grass_old.gdshader).
 // INSTANCE_CUSTOM is (u start, u width, v height, 1 + the root packed by decoratives.gd).
-render_mode blend_mix, depth_draw_never, cull_disabled;
+render_mode cull_disabled, specular_disabled;
 
 #include "res://shaders/ground_height.gdshaderinc"
 #include "res://shaders/decorative_grass.gdshaderinc"
+#include "res://shaders/lamp_light.gdshaderinc"
 
 uniform sampler2D atlas : source_color, filter_linear_mipmap_anisotropic, repeat_disable;
 uniform float height = 0.3;  // tiles, where the picture is thickest
@@ -24,9 +27,11 @@ const float RAY_SOUTH = 0.9;
 varying float level;  // as decorative_flat.gdshader: fades out on steep ground
 varying float rise;  // 0 at the ground, 1 at the top
 varying float grow;
+varying vec2 ground_at;
 
 void vertex() {
 	vec2 at = MODEL_MATRIX[3].xz;
+	ground_at = at;
 	grow = grass_grow(at);
 	level = 1.0;
 	rise = 0.0;
@@ -57,33 +62,34 @@ void vertex() {
 		float h = height * rise * grow;
 		vec2 size = vec2(MODEL_MATRIX[0].x, MODEL_MATRIX[2].z);
 		vec2 sway = vec2(0.0);
-		if (f3d_grass_wind > 0.5) {
+		if (f3d_grass_wind > 0.01) {
+			float w = clamp(f3d_grass_wind, 0.0, 3.0);
 			float t = TIME * 1.6 + at.x * 0.35 + at.y * 0.21 + mesh_uv.x * 1.3;
-			sway = vec2(sin(t), sin(t * 0.73 + 1.7)) * (0.07 * h * rise);
+			float gust = max(w - 1.0, 0.0) * 0.28 * sin(t * 2.1 + at.x * 0.12 - at.y * 0.09);
+			sway = (vec2(sin(t), sin(t * 0.73 + 1.7)) * w + vec2(gust, gust * 0.6)) * (0.07 * h * rise);
 		}
 		VERTEX.x += sway.x / size.x;
 		VERTEX.z += (h * RAY_SOUTH + sway.y) / size.y;
 		VERTEX.y += h + 0.004;
 		level = ground_n((MODEL_MATRIX * vec4(VERTEX, 1.0)).xz).y;
+		ground_at = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xz;
 		VERTEX = ground_lift(VERTEX, MODEL_MATRIX);
 	}
 }
-
-global uniform float f3d_look_ground_specular;  // looks.gd "ground_specular"
 
 void fragment() {
 	vec4 c = texture(atlas, UV);
 	// The pictures' baked shadows are pure black and part see-through; they stay on the ground with
 	// the flat picture. The plant itself is never that dark.
 	float blade = c.a * smoothstep(0.002, 0.016, max(c.r, max(c.g, c.b)));
-	if (blade < 0.02) {
-		discard;
-	}
 	// Darker at the root, a little lighter at the tips: the height reads from any angle.
 	ALBEDO = c.rgb * mix(1.0, mix(0.7, 1.12, clamp(rise, 0.0, 1.0)), grow);
-	SPECULAR = plant_specular() * f3d_look_ground_specular;
-	ROUGHNESS = plant_roughness(1.0);
+	EMISSION = lamp_light_emission(ALBEDO, ground_at, rise * height, 0.85);
 	// Lit as the flat picture, from straight up, on whichever side the view sees.
 	NORMAL = normalize((VIEW_MATRIX * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
 	ALPHA = blade * smoothstep(0.0, 0.4, grow) * smoothstep(0.75, 0.9, level);
+	ALPHA_SCISSOR_THRESHOLD = 0.25;
+	// Alpha to coverage with MSAA, as the carpet: edges spread over the pixel's samples.
+	ALPHA_ANTIALIASING_EDGE = 0.25;
+	ALPHA_TEXTURE_COORDINATE = UV * vec2(textureSize(atlas, 0));
 }

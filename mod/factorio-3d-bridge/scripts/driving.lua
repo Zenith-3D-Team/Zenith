@@ -11,6 +11,8 @@ local HOLD_TICKS = 30      -- a drive command lasts this long unless the client 
 local ENTER_DISTANCE = 5   -- from the character's centre to the vehicle's
 -- The numbers the client sends, by their defines.riding names.
 local ACCELERATION = { [0] = "nothing", [1] = "accelerating", [2] = "braking", [3] = "reversing" }
+-- Below this speed (tiles a tick) a vehicle braking under "hold" counts as stopped.
+local STOP_SPEED = 0.002
 local DIRECTION = { [-1] = "left", [0] = "straight", [1] = "right" }
 
 local function distance(a, b)
@@ -113,8 +115,10 @@ function M.enter()
           v.set_passenger(c)
         end
         puppet.message("Nowhere to get out here")
+        return
       end
     end
+    s.me_now = true
     return
   end
   v = nearest_vehicle(c)
@@ -133,20 +137,37 @@ function M.enter()
   end
   if puppet.vehicle(c) ~= v then
     puppet.message("Can't get in")
+  else
+    s.me_now = true
   end
 end
 
 -- a: 0 nothing, 1 accelerate, 2 brake, 3 reverse; s: -1 left, 0 straight, 1 right. Both 0 stops.
+-- h: 1 (optional, the client's "opposite key brakes and holds" option): holding the key opposite
+-- to the motion (a 3 while going forward, a 1 while reversing) brakes to a stop and then stays
+-- stopped until that key is let go; see M.tick. Old clients never send it.
 function M.drive(cmd)
   local s = storage.f3d
   local a = math.floor(tonumber(cmd.a) or 0)
   local d = math.floor(tonumber(cmd.s) or 0)
+  local h = (tonumber(cmd.h) or 0) == 1
+  local prev = s.drive
+  local was_going = prev and game.tick <= prev.until_tick
   if not (ACCELERATION[a] and DIRECTION[d]) or (a == 0 and d == 0) then
+    if was_going or s.riding then
+      s.me_now = true
+    end
     s.drive = nil
     return
   end
-  local drive = s.drive or {}
-  drive.a, drive.d = a, d
+  if not was_going or prev.a ~= a or prev.d ~= d then
+    s.me_now = true
+  end
+  local drive = prev or {}
+  if prev and (prev.a ~= a or prev.h ~= h) then
+    drive.braking, drive.held = nil, nil -- another key (or none) than the one that braked: let go
+  end
+  drive.a, drive.d, drive.h = a, d, h
   drive.until_tick = game.tick + HOLD_TICKS
   s.drive = drive
 end
@@ -172,8 +193,25 @@ function M.tick()
     end
     return
   end
+  local accel = drive.a
+  if drive.h and (accel == 1 or accel == 3) and (v.type == "car" or v.type == "locomotive") then
+    local ok, sp = pcall(function() return v.speed end)
+    sp = ok and tonumber(sp) or 0
+    local against = (accel == 3 and sp > STOP_SPEED) or (accel == 1 and sp < -STOP_SPEED)
+    if drive.held then
+      accel = 0 -- stopped by the brake: stay put until the key is let go
+    elseif against then
+      drive.braking = true
+      accel = 2
+    elseif drive.braking then
+      drive.braking, drive.held = nil, true -- the brake got it to a stop
+      accel = 0
+    end
+  else
+    drive.braking, drive.held = nil, nil
+  end
   c.riding_state = {
-    acceleration = defines.riding.acceleration[ACCELERATION[drive.a]],
+    acceleration = defines.riding.acceleration[ACCELERATION[accel]],
     direction = defines.riding.direction[DIRECTION[drive.d]],
   }
   s.riding = true

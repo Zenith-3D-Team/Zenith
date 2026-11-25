@@ -14,11 +14,13 @@ instance uniform int belt_tex = 0;
 // (2 or more), only the slots whose item is variant `belt_variant` (belt_lattice_variant) are drawn by it.
 instance uniform int belt_variant = 0;
 instance uniform int belt_variants = 0;
+uniform bool belt_lod_all_variants = false;
 global uniform sampler2DArray f3d_belt_records;
 global uniform sampler2DArray f3d_belt_lattice;
-global uniform sampler2D f3d_belt_mask;
+global uniform sampler2DArray f3d_belt_mask;
 global uniform float f3d_belt_lattice_on;
 global uniform float f3d_belt_clock;
+global uniform vec4 f3d_item_view_rect;
 uniform sampler2D belt_paths : filter_nearest, repeat_disable;
 
 // Along a path: code = first point × 64 + points - 2; g, 0 to 1.
@@ -78,14 +80,15 @@ vec4 belt_texel(int r, int k, int per) {
 }
 
 // Moves a vertex (world coordinates; a belt item's instance is unmoved) where its item is drawn now,
-// turned, and its normal with it; not drawn: nowhere (also from the tick in an item's texel 3 w on). A pile's copy (texel 3: k > 0) is drawn from
+// turned, and its normal (plus optional tangent/binormal basis) with it; not drawn: nowhere (also from the tick in an item's texel 3 w on). A pile's copy (texel 3: k > 0) is drawn from
 // its item's record, k pile steps higher, with its own turn (its texel 2: every copy turns, cards and
 // blocks too; belt_items.gd). A lattice slot's copies (belt_lattice.gd) slide with their slot (its texel
 // 3) and, as it, aren't masked. A lattice slot whose texel 3 z is 2 holds who its item is in texel 2 (x:
 // on its record's clock, y: its run's seed): each period slid, the item there is the one that was a slot
 // behind, so who it is goes up by one and its turn goes on with it. A slot's own texel 3 y below 0 says where in its
 // period it hides at its lane's open end (belt_lattice.gd handover).
-void belt_place(inout vec3 vertex, inout vec3 normal, int id) {
+void _belt_place_xf(inout vec3 vertex, inout vec3 normal, inout vec3 tangent, inout vec3 binormal, out float lod_jitter, int id, bool has_basis, bool want_jitter) {
+	lod_jitter = 0.0;
 	if (belt_base < 0) {
 		return;
 	}
@@ -106,6 +109,7 @@ void belt_place(inout vec3 vertex, inout vec3 normal, int id) {
 		vertex = vec3(0.0);
 		return;
 	}
+	vec2 base_c = c.xy;  // saved before pile copies overwrite c.xy so piles and bands share one hash
 	vec2 who = c.xy;  // (a lattice slot's item, below)
 	if (d.y > 0.5) {
 		c.z += d.z * d.y;
@@ -129,14 +133,23 @@ void belt_place(inout vec3 vertex, inout vec3 normal, int id) {
 		g = fract(q);
 		slid = floor(q);
 	}
+#ifndef BELT_IGNORE_VARIANTS
+	// The slot's item is another variant: that variant's kind draws it (slot turns: no one to pick by, the first).
+	// Checked before computing belt_lattice_turn / cos / sin / path / mask so discarded variant vertices exit early.
+	if (!belt_lod_all_variants && lattice && belt_variants > 1 && (e.z > 1.5 ? belt_lattice_variant(int(round(who.x)) + int(slid), who.y, belt_variants) : 0) != belt_variant) {
+		vertex = vec3(0.0);
+		return;
+	}
+#endif
 	if (lattice && e.z > 1.5) {
 		float turn = belt_lattice_turn(int(round(who.x)) + int(slid), who.y) + BELT_PILE_TURN * max(d.y, 0.0);
 		c.xy = vec2(cos(turn), sin(turn));
 	}
-	// The slot's item is another variant: that variant's kind draws it (slot turns: no one to pick by, the first).
-	if (lattice && belt_variants > 1 && (e.z > 1.5 ? belt_lattice_variant(int(round(who.x)) + int(slid), who.y, belt_variants) : 0) != belt_variant) {
-		vertex = vec3(0.0);
-		return;
+	if (want_jitter) {
+		uint lh = (lattice && e.z > 1.5)
+			? belt_lattice_hash(int(round(base_c.x)) + int(slid), base_c.y)
+			: belt_lattice_hash(int(round(base_c.y * 100000.0)), round((base_c.x + 2.0) * 100000.0));
+		lod_jitter = float((lh >> 16u) & 65535u) / 32767.5 - 1.0;
 	}
 	// A slot at a lane's open end hides while its item is the simulation's to draw there (belt_lattice.gd handover:
 	// its own texel 3 y -(1 + h), hidden from g h on; -(3 + h), hidden before g h).
@@ -170,14 +183,48 @@ void belt_place(inout vec3 vertex, inout vec3 normal, int id) {
 		}
 		at += o.xyz;
 	}
+#ifndef BELT_NO_VIEW_CULL
+	if (at.x < f3d_item_view_rect.x || at.x > f3d_item_view_rect.z || at.z < f3d_item_view_rect.y || at.z > f3d_item_view_rect.w) {
+		vertex = vec3(0.0);
+		return;
+	}
+#endif
 	if (!lattice && f3d_belt_lattice_on > 0.5) {
-		vec2 size = vec2(textureSize(f3d_belt_mask, 0));
-		vec2 cell = mod(floor(at.xz * 4.0), size);
-		if (texelFetch(f3d_belt_mask, ivec2(cell), 0).r > 0.5) {
-			vertex = vec3(0.0);
-			return;
+		ivec3 msz = textureSize(f3d_belt_mask, 0);
+		if (msz.x > 0 && msz.y > 0) {
+			int side = msz.x * 4;
+			ivec2 cell = clamp(ivec2(mod(floor(at.xz * 4.0), float(side))), ivec2(0), ivec2(side - 1));
+			int tx = cell.x / msz.x;
+			int tz = cell.y / msz.y;
+			int layer = tz * 4 + tx;
+			if (texelFetch(f3d_belt_mask, ivec3(cell.x - tx * msz.x, cell.y - tz * msz.y, layer), 0).r > 0.5) {
+				vertex = vec3(0.0);
+				return;
+			}
 		}
 	}
 	vertex = vec3(c.x * vertex.x + c.y * vertex.z, vertex.y + c.z, -c.y * vertex.x + c.x * vertex.z) + at;
 	normal = vec3(c.x * normal.x + c.y * normal.z, normal.y, -c.y * normal.x + c.x * normal.z);
+	if (has_basis) {
+		tangent = vec3(c.x * tangent.x + c.y * tangent.z, tangent.y, -c.y * tangent.x + c.x * tangent.z);
+		binormal = vec3(c.x * binormal.x + c.y * binormal.z, binormal.y, -c.y * binormal.x + c.x * binormal.z);
+	}
+}
+
+void belt_place(inout vec3 vertex, inout vec3 normal, int id) {
+	vec3 dummy_t = vec3(0.0);
+	vec3 dummy_b = vec3(0.0);
+	float dummy_j = 0.0;
+	_belt_place_xf(vertex, normal, dummy_t, dummy_b, dummy_j, id, false, false);
+}
+
+void belt_place_lod(inout vec3 vertex, inout vec3 normal, out float lod_jitter, int id) {
+	vec3 dummy_t = vec3(0.0);
+	vec3 dummy_b = vec3(0.0);
+	_belt_place_xf(vertex, normal, dummy_t, dummy_b, lod_jitter, id, false, true);
+}
+
+void belt_place_basis(inout vec3 vertex, inout vec3 normal, inout vec3 tangent, inout vec3 binormal, int id) {
+	float dummy_j = 0.0;
+	_belt_place_xf(vertex, normal, tangent, binormal, dummy_j, id, true, false);
 }

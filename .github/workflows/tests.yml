@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: pip install "lupa==2.*" "gdtoolkit==4.*"
+        run: pip install -r requirements-dev.txt
       - name: The fast suites (tools/check.py --all)
         timeout-minutes: 15
         run: python tools/check.py --all fast --logs ci-logs
@@ -69,6 +69,22 @@ jobs:
           curl -fsSL -o /tmp/godot.zip "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
           unzip -q /tmp/godot.zip -d ~/godot
           mv ~/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot/godot
+      - name: Cache godot-cpp
+        id: godot-cpp-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/godot-cpp
+          key: godot-cpp-4.5-${{ hashFiles('client/native/belt_sim/SConstruct') }}
+      - name: Clone godot-cpp
+        if: steps.godot-cpp-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: git clone --branch 4.5 --depth 1 https://github.com/godotengine/godot-cpp.git ~/godot-cpp
+      - name: Build native belt_sim (.so)
+        timeout-minutes: 15
+        run: |
+          pip install scons
+          scons -C client/native/belt_sim target=template_release platform=linux godot_cpp="$HOME/godot-cpp" -j"$(nproc)"
+          python tools/release/leak_scan.py client/native/bin
       - name: Import the project
         timeout-minutes: 10
         run: ~/godot/godot --headless --path client --log-file "$PWD/ci-logs/import.godot.log" --import
@@ -86,7 +102,7 @@ jobs:
           if-no-files-found: ignore
 
   # The bridge mod in the real game: Factorio's free Linux headless build, a new map, then
-  # tools/live_check.py over UDP and RCON, as on a desktop PC.
+  # tools/live_check.py over UDP and RCON, as on the owner's PC.
   live:
     runs-on: ubuntu-24.04
     timeout-minutes: 35

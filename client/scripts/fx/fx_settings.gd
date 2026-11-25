@@ -12,6 +12,7 @@ extends RefCounted
 
 const Settings := preload("res://scripts/menu/settings.gd")
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Volume key -> [bus, the bus it feeds]. Factorio's categories: walking, environment (machines and
 ## vehicles), weapons, explosions and enemies are parts of the game effects.
@@ -29,7 +30,7 @@ static var volumes := {
 ## Factorio's box beside each slider: false mutes that bus.
 static var enabled := {}
 ## Machine and vehicle loops playing at once; one-shot sounds have their own pool.
-static var max_voices := 12
+static var max_voices := 32
 static var log_sounds := false
 static var effects_enabled := true
 static var _loaded := false
@@ -42,7 +43,7 @@ static func load_settings() -> void:
 		return
 	_loaded = true
 	_read()
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		var value := arg.get_slice("=", 1)
 		if arg.begins_with("--volume="):
 			_override("master", value)
@@ -65,6 +66,12 @@ static func load_settings() -> void:
 	Settings.listen(_on_setting)
 	setup_buses()
 	apply_device()
+
+
+## True when the player (or the command line) chose max_voices; else it is the default, which
+## `--sound-pool=old` reads as the old 12.
+static func voices_chosen() -> bool:
+	return _overridden.has("max_voices") or Settings.has_value("sound", "max_voices")
 
 
 static func _override(key: String, value: String) -> void:

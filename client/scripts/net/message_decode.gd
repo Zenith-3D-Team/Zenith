@@ -7,9 +7,11 @@ extends RefCounted
 ## A message whose fields aren't what they should be (the fuzz tests send anything) is left as it
 ## came, and its handler reads it the old way. `--decode-thread=off`: everything on the main thread.
 
+const Switches := preload("res://scripts/switches.gd")
+
 const CHUNK := 32
 
-static var enabled := not OS.get_cmdline_user_args().has("--decode-thread=off")
+static var enabled := Switches.on("--decode-thread")
 
 
 ## A datagram's text. The mod's JSON is ASCII but for names and text players typed (UTF-8), so ASCII

@@ -13,7 +13,8 @@ const TestEnv := preload("res://tests/test_env.gd")
 
 const MODELS := ["locomotive@builtin:fue5", "cargo-wagon@builtin:fue5", "fluid-wagon@builtin:fue5",
 	"locomotive@builtin:placeholders", "cargo-wagon@builtin:placeholders", "fluid-wagon@builtin:placeholders",
-	"artillery-wagon@builtin:placeholders", "infinity-cargo-wagon@builtin:placeholders", "car@builtin:placeholders"]
+	"artillery-wagon@builtin:placeholders", "infinity-cargo-wagon@builtin:placeholders", "car@builtin:placeholders",
+	"tank@builtin:placeholders"]
 
 var fails := 0
 
@@ -61,6 +62,8 @@ func _run() -> void:
 			_world(layer, name, part, r)
 			_preview(name, part, r)
 	check(wheels >= 30, "the rolling stock's wheels found: %d" % wheels)
+	_tank_differential(layer)
+	_car_steer_fenders(layer)
 	layer.free()
 	print("wheel_roll_test: %d wheels, %s" % [wheels, "PASS" if fails == 0 else "%d FAILED" % fails])
 	quit(0 if fails == 0 else 1)
@@ -115,3 +118,73 @@ func _preview(name: String, part: ModelLibrary.AnimPart, r: float) -> void:
 		if mat != null:
 			check((mat.get_shader_parameter("anim_axis") as Vector3).is_equal_approx(Vector3.RIGHT) and float(mat.get_shader_parameter("anim_rate")) < 0.0,
 				"%s %s: its shader turns it about X, forward: %s %s" % [name, part.kind, mat.get_shader_parameter("anim_axis"), mat.get_shader_parameter("anim_rate")])
+
+
+## Pure pivot turn on the tank: right wheels (+X) roll forward (-Z top), left wheels (-X) reverse (+Z top).
+func _tank_differential(layer: Movers) -> void:
+	var left_part: ModelLibrary.AnimPart = null
+	var right_part: ModelLibrary.AnimPart = null
+	for p: ModelLibrary.AnimPart in ModelLibrary.parts_for("tank@builtin:placeholders"):
+		if p.kind != "wheel_track" or p.mesh == null:
+			continue
+		if p.pivot.origin.x < -0.1 and left_part == null:
+			left_part = p
+		elif p.pivot.origin.x > 0.1 and right_part == null:
+			right_part = p
+	check(left_part != null and right_part != null, "tank differential: both left and right track wheels found")
+	if left_part == null or right_part == null:
+		return
+	var node := Node3D.new()
+	root.add_child(node)
+	var left_mi := MeshInstance3D.new()
+	left_mi.mesh = left_part.mesh
+	left_mi.set_meta("wheel", left_part)
+	node.add_child(left_mi)
+	var right_mi := MeshInstance3D.new()
+	right_mi.mesh = right_part.mesh
+	right_mi.set_meta("wheel", right_part)
+	node.add_child(right_mi)
+	var m := Movers.Mover.new()
+	m.node = node
+	m.wheels = layer._wheels_of(node)
+	layer._roll_wheels(m, Vector3.ZERO, 0.25, 0.016)
+	var lr := left_part.wheel_radius()
+	var rr := right_part.wheel_radius()
+	var ltop := _top_after(left_part, left_mi.transform, lr)
+	var rtop := _top_after(right_part, right_mi.transform, rr)
+	check(rtop.z < -0.005 and ltop.z > 0.005,
+		"tank differential left turn: right wheel forward (%s), left wheel backward (%s)" % [rtop, ltop])
+	node.free()
+
+
+## Front fenders (`anim_steer_front`) follow the car's front wheel steering angle.
+func _car_steer_fenders(layer: Movers) -> void:
+	var wheel_part: ModelLibrary.AnimPart = null
+	var steer_part: ModelLibrary.AnimPart = null
+	for p: ModelLibrary.AnimPart in ModelLibrary.parts_for("car@builtin:placeholders"):
+		if p.kind == "wheel_front" and p.mesh != null and wheel_part == null:
+			wheel_part = p
+		elif p.kind == "steer_front" and p.mesh != null and steer_part == null:
+			steer_part = p
+	check(wheel_part != null and steer_part != null, "car steering: wheel_front and steer_front found")
+	if wheel_part == null or steer_part == null:
+		return
+	var node := Node3D.new()
+	root.add_child(node)
+	var wmi := MeshInstance3D.new()
+	wmi.mesh = wheel_part.mesh
+	wmi.set_meta("wheel", wheel_part)
+	node.add_child(wmi)
+	var smi := MeshInstance3D.new()
+	smi.mesh = steer_part.mesh
+	smi.set_meta("steer", steer_part)
+	node.add_child(smi)
+	var m := Movers.Mover.new()
+	m.node = node
+	m.wheels = layer._wheels_of(node)
+	m.steers = layer._steers_of(node)
+	for _i in 10:
+		layer._roll_wheels(m, Vector3(0.0, 0.0, -0.2), 0.1, 0.05)
+	check(m.steer > 0.1 and smi.transform.basis.x.z < -0.05,
+		"car front fender steers with front wheel (steer=%.3f, basis.x=%s)" % [m.steer, smi.transform.basis.x])
+	node.free()

@@ -28,13 +28,20 @@ const ADDONS_OFF_BY_DEFAULT := "addons_off_by_default"
 
 const DEFAULTS := {
 	"graphics": {
-		"window_mode": "windowed",  # windowed, borderless, fullscreen
+		"window_mode": "borderless",  # windowed, borderless, fullscreen
 		"resolution": "",  # "1920x1080"; "" keeps the window's size, or in full screen the monitor's
 		"screen": -1,  # Factorio's preferred screen; -1: the primary one
 		"minimize_on_focus_loss": false,  # in full screen
 		"vsync": true,
 		"fps_cap": 0,  # 0: unlimited
-		"render_scale": 1.0,
+		"render_scale": 0.8,
+		# 3D upscaler (scaling_mode_for; --upscaler=bilinear|fsr1|fsr2): "bilinear", "fsr1" (FSR 1.0, spatial,
+		# works with MSAA/SMAA) or "fsr2" (AMD FSR 2.2, temporal: Godot 4.7's Viewport.SCALING_3D_MODE_FSR2,
+		# replaces TAA/MSAA/SMAA while it is on).
+		"upscaler": "fsr2",
+		# 0.0 softest .. 1.0 sharpest (fsr_sharpness_value maps it to Godot's 2 softest .. 0 sharpest);
+		# 0.575 is the 0.85 FSR_SHARPNESS Zenith has always used.
+		"upscaler_sharpness": 0.575,
 		# off, fxaa, smaa, taa, msaa2, msaa4, msaa8. SMAA: sharper than FXAA for about 0.3 ms more GPU
 		# at 4K on the owner's desktop (a run with the PC in use had it cheaper, 10.7 against 11.4 ms
 		# standing), and it works under every look, where MSAA doesn't under a look with its own passes
@@ -44,20 +51,35 @@ const DEFAULTS := {
 		# "classic" (Zenith's look before 0.1.4), or an add-on's look
 		"look": "factorio",
 		"look_before": "factorio",  # what an add-on's look replaced, back when the add-on goes
-		# A modeller's metallic-roughness picture's metal (looks.gd texture_metal): "paint" (drawn at the
-		# share every other surface's metal is, the look's own) or "full" (in full, as before 0.2.2)
-		"texture_metal": "paint",
 		# Packs' own shading (looks.gd pack_shading, model_packs.gd shading()): "pack" (each pack as its pack.json
 		# says: a "pbr" pack's textured models drawn as their files say) or "factorio" (Factorio's everywhere, as
 		# before 0.2.2; --pack-shading=factorio)
 		"pack_shading": "pack",
+		"pack_tiles": true,  # ground textures from model packs (model_packs.gd tiles_on; --pack-tiles=off)
+		"pack_decoratives": true,  # decoratives and 3D grass from model packs (model_packs.gd decor_on; --pack-decoratives=off)
+		"decor_models": false,  # off: the placeholder 3D decoratives were removed (owner); a pack's own 3D .glb/.gltf decorative models vs 2D sprites (model_packs.gd decor_models_on; --decor-models=off)
 		"shadows": "high",  # off, low, medium, high, ultra (sun_shadows.gd)
 		"shadow_distance": 0,  # tiles the shadows may reach from the camera; 0: the quality's (sun_shadows.gd)
 		# high, medium, low: how soon far-away models and their shadows simplify (model_lods.gd); the
 		# models near the character stay whole at every level
 		"lod_quality": "medium",
+		# Custom distance (tiles) where LODs start falling off; 0 follows lod_quality (Auto).
+		# Models, belts, items, far merged chunks, and lights auto-adjust from this distance.
+		"lod_distance": 0,
 		# Far chunks' buildings drawn as one simplified mesh each (far_chunks.gd): far fewer draws
 		"merge_far": true,
+		# Nauvis's cliffs as one generated wall a chunk instead of the pack's pieces (cliff_wall.gd; --cliff-wall=off: the pieces)
+		"cliff_wall": true,
+		# Bullet tracers: a short streak from the muzzle to the hit per shot, the ammo's colour (weapon_fx.gd;
+		# a look of ours, Factorio draws none; --bullet-tracers=off)
+		"bullet_tracers": true,
+		# How strongly fights light their surroundings at night: muzzle flashes, explosions, flamethrowers and
+		# their fires (combat_lights.gd), 0 none to 2; --combat-lights=old the older lights
+		"combat_light_strength": 1.0,
+		# Detailed 3D lamp/machine light budget tied to Level of detail plus a 2D world lightmap beyond (lamp_lights.gd)
+		"far_lights": true,
+		# Persist visited chunk snapshots to user://chunk-cache/ (Zstd compressed regions) so revisiting areas loads immediately
+		"chunk_disk_cache": true,
 		"animate_mod_buildings": false,  # off by the owner (their card animations looked wrong); a setting still
 		# Each model drawn as one surface with one material (material_rows.gd): fewer draws and less
 		# render CPU, but its per-pixel table reads cost GPU time (laptop at Ultra: 1-2 ms more
@@ -74,15 +96,24 @@ const DEFAULTS := {
 		# The dark rim on the ground round each building's foot that Factorio's sprites have
 		# (contact_shade.gd): one MultiMesh per chunk, on in every preset.
 		"contact_shading": true,
-		# Godot's renderer on a thread of its own (faster on busy bases); off: the main thread, as
-		# before. Read at start-up from ENGINE_OVERRIDES, so it applies after a restart.
-		"render_thread": false,  # Godot calls it experimental; no gain measured, rare hangs on quitting
-		"view_radius": 10,  # chunks around the camera that are drawn (owner's B1: doubled from 5)
-		"entity_radius": 192,  # tiles around the camera where moving things and machine states are shown (doubled from 96)
+		# Godot's renderer on a thread of its own: walking the Zenith Test bus 58 -> 63-73 FPS (stutter-live),
+		# once nothing reads the renderer every frame (render_stats.gd, item_models.gd's CPU arrays, Alt-mode's
+		# icons kept on the CPU); quitting waits for the workers and a drawn frame, exit_guard.gd ends a stuck
+		# one. Off: the main thread, as before 0.3.x. Read at start-up from ENGINE_OVERRIDES, so it applies after
+		# a restart (sync_engine_overrides writes it at start when it differs).
+		"render_thread": true,
+		"view_radius": 4,  # chunks around the camera (inner full radius in dual-slider default; or total seamless Render distance in unified mode)
+		"distant_horizon": 96,  # extreme LOD horizon radius in chunks (0 off, up to 512; distant_horizon.gd)
+		"distant_horizon_manual": true,  # on (default): separate View distance (full) & Distant horizon sliders; off: unified Render distance slider + Level of detail
+		"distant_horizon_quality": "medium",  # minimal, low, medium, high, ultra cell size & progressive detail per LOD ring
+		"distant_horizon_dropoff": "balanced",  # near, balanced, far ring transition distances
+		"distant_horizon_glow": true,  # emissive factory silhouette clusters at night on distant LODs
+		"distant_horizon_shots": true,  # let Distant Horizon cover the far horizon for wide screenshots
+		"entity_radius": 128,  # tiles around the camera where moving things and machine states are shown (doubled from 96)
 		# Items on belts are drawn out to belt_distance (0 off): moving, from the character outwards, as
 		# far as belt_updates allows (the most items and lanes the server reads an update), and past
 		# that each lane as icons of what it carries (owner: one distance and a cap, not two distances).
-		"belt_distance": 160,
+		"belt_distance": 128,
 		"belt_updates": -1,  # -1: Automatic (belt_lanes.gd follows the room there is); 0: Unlimited, every item within belt_distance moves
 		"belt_smooth": true,  # belt items read in one tick, every update (smooth on curves) rather than spread over ticks
 		"decorative_distance": 192,  # tiles out to which ground clutter is drawn, thinner far away (B9)
@@ -100,10 +131,11 @@ const DEFAULTS := {
 		"decoratives": true,  # grass, flowers and small rocks from Factorio (scripts/world/decoratives.gd)
 		"decorative_density": 1.0,  # the share of them drawn, 0.1 to 1
 		"grass_3d": "normal",  # grass and low plants near the character in 3D: off, short, normal, far (decoratives.gd)
-		"smog": 0.5,  # how thick the haze over polluted ground is, 0 (none) to 1 (pollution.gd, shaders/smog.gdshader)
+		"smog": 0.0,  # smog off by default; how thick the volumetric smog over polluted ground and sky is, 0 (none) to 1 (pollution.gd, shaders/smog.gdshader)
+		"god_rays": 0.5,  # volumetric sunbeams through clouds, silhouettes, and smog, 0 (off) to 1 (god_rays.gd, shaders/god_rays.gdshader)
 		"brightness": 1.0,  # 0.5 to 1.5, as Factorio's sliders
 		"contrast": 1.0,
-		"saturation": 1.0,
+		"saturation": 1.25,
 		"color_filter": "none",  # color_filter.gd FILTERS
 	},
 	"sound": {
@@ -111,7 +143,7 @@ const DEFAULTS := {
 		"master": 0.8, "effects": 1.0, "music": 0.0, "ui": 1.0,
 		"walking": 1.0, "environment": 1.0, "weapons": 1.0, "explosions": 1.0, "enemies": 1.0,
 		"ambient": 1.0,  # wind and each planet's background sounds (fx/ambience.gd)
-		"max_voices": 12,  # machine and vehicle loops playing at once
+		"max_voices": 32,  # machine and vehicle loops playing at once (12 before the sound pool)
 		"output_device": "Default",
 		"pack_sounds": true,  # sounds from model packs (model_packs.gd sounds_on; --pack-sounds=off)
 	},
@@ -125,6 +157,14 @@ const DEFAULTS := {
 		"tooltip_delay": 0.5,  # seconds before a tooltip shows
 		"message_delay": 4.0,  # seconds a message stays (Factorio's "Chat message delay")
 		"alt_mode": false,  # Alt-mode, remembered between games like Factorio's
+		# "A new version is available" (update_check.gd; --update-check=off): "Auto check on open" (off: nothing is
+		# requested until the main menu's "Check for updates" is clicked), when it last asked (unix seconds), the
+		# newest release seen, and the one "Don't show again" was pressed for
+		"update_check": false,
+		"update_checked_at": 0,
+		"update_seen": "",
+		"update_seen_url": "",
+		"update_skip": "",
 		# Factorio's Interface > Alt-mode arrows (issue #9), with its defaults (seen in 2.1.23 with a fresh
 		# config: machines' and pumps' arrows show, inserters' don't)
 		"alt_inserter_arrows": false,
@@ -141,6 +181,9 @@ const DEFAULTS := {
 		# Factorio's "Lock belt building to straight line": on, belts drag along the held belt's line as
 		# Factorio 2.x always does (it dropped the setting); off, Zenith's own drag round corners
 		"lock_belt_straight": true,
+		# off: Factorio's driving, the opposite key brakes and then reverses; on: it brakes to a stop and holds
+		# there until let go (settings.gd vehicle_brake_hold, sent by player_input.gd; --vehicle-brake-hold=on|off)
+		"vehicle_brake_hold": false,
 		# Factorio 2.1's fluid pipeline visualization (N9, pipeline_marks.gd): with a fluid entity held, in
 		# Alt-mode, every pipeline in view; and the hovered entity's pipelines
 		"fluid_vis": true,
@@ -197,10 +240,14 @@ const DEFAULTS := {
 	# ("builtin:<folder>", "loose", "dir:<folder>", "zip:<file>"), top first, and those turned off.
 	# A pack of the models folder not listed goes on top, a built-in one in its place under them.
 	# `choices`: a model family -> the pack it is taken from whatever the order.
+	# `pbr_packs`: canonical pack id -> bool overriding the pack's PBR shading.
+	# `pbr_models`: "<pack id>|<family or item:<name>>" -> bool overriding one model/item's PBR shading.
 	"model_packs": {
 		"order": [],
 		"off": [],
 		"choices": {},
+		"pbr_packs": {},
+		"pbr_models": {},
 	},
 }
 
@@ -212,6 +259,18 @@ const ENGINE_OVERRIDES := "user://engine.cfg"
 ## Godot's thread models: the renderer on the main thread, or on its own.
 const THREAD_SAFE := 1
 const THREAD_SEPARATE := 2
+
+
+## At start: ENGINE_OVERRIDES written again when the thread model running now isn't the setting's (a new default,
+## or no file yet), so the next start follows it. Only for the player's own settings file in a window: tests and
+## probes (--settings-file, headless) never write the owner's.
+static func sync_engine_overrides() -> void:
+	load_settings()
+	if path != PATH or DisplayServer.get_name() == "headless":
+		return
+	var want := THREAD_SEPARATE if bool(get_value("graphics", "render_thread")) else THREAD_SAFE
+	if int(ProjectSettings.get_setting("rendering/driver/threads/thread_model", THREAD_SAFE)) != want:
+		write_engine_overrides()
 
 
 ## Writes ENGINE_OVERRIDES from the settings; Godot reads it at the next start.
@@ -230,16 +289,16 @@ static func write_engine_overrides() -> void:
 const PRESETS := {
 	"low": {"shadows": "low", "ssao": false, "lod_quality": "low", "view_radius": 5, "entity_radius": 96,
 		"belt_updates": 2000, "belt_distance": 64, "decorative_distance": 96, "decorative_density": 0.5, "grass_3d": "off",
-		"clouds": false, "contact_shading": true},
+		"clouds": false, "contact_shading": true, "god_rays": 0.0},
 	"medium": {"shadows": "medium", "ssao": false, "lod_quality": "medium", "view_radius": 7, "entity_radius": 128,
 		"belt_updates": 4000, "belt_distance": 96, "decorative_distance": 128, "decorative_density": 0.75, "grass_3d": "short",
-		"clouds": true, "contact_shading": true},
-	"high": {"shadows": "high", "ssao": true, "lod_quality": "medium", "view_radius": 10, "entity_radius": 192,
-		"belt_updates": -1, "belt_distance": 160, "decorative_distance": 192, "decorative_density": 1.0, "grass_3d": "normal",
-		"clouds": true, "contact_shading": true},
+		"clouds": true, "contact_shading": true, "god_rays": 0.25},
+	"high": {"shadows": "high", "ssao": true, "lod_quality": "medium", "view_radius": 4, "entity_radius": 128,
+		"belt_updates": -1, "belt_distance": 128, "decorative_distance": 192, "decorative_density": 1.0, "grass_3d": "normal",
+		"clouds": true, "contact_shading": true, "god_rays": 0.5},
 	"ultra": {"shadows": "ultra", "ssao": true, "lod_quality": "high", "view_radius": 14, "entity_radius": 256,
 		"belt_updates": -1, "belt_distance": 320, "decorative_distance": 256, "decorative_density": 1.0, "grass_3d": "far",
-		"clouds": true, "contact_shading": true},
+		"clouds": true, "contact_shading": true, "god_rays": 0.5},
 }
 
 
@@ -373,7 +432,7 @@ static var factorio_keys_lookups := 0
 static var factorio_values := {}
 
 ## The build's channel (tools/release/package.py --channel): the public downloads carry no testing
-## tools, development builds and a checkout do (owner). A dev export has the custom feature tag
+## tools, development downloads and a checkout do (owner). A dev export has the custom feature tag
 ## DEV_FEATURE, baked into its .pck by package.py, so the build itself says what it is: no file
 ## beside the program to lose, copy or forge.
 const DEV_FEATURE := "zenith_dev"
@@ -387,8 +446,8 @@ static var dev_tools_override := -1
 static func dev_tools() -> bool:
 	if dev_tools_override != -1:
 		return dev_tools_override == 1
-	if OS.has_feature(DEV_FEATURE):
-		return true
+	if OS.has_feature(DEV_FEATURE) or has_arg("--dev-tools"):
+		return true  # --dev-tools: a public download with the testing tools (owner: one download, no separate dev build)
 	return not OS.has_feature("template") and not has_arg("--public-build")
 
 
@@ -415,10 +474,11 @@ static func load_settings() -> void:
 	var still_cards := _mod_anim_off_once()
 	var full_res := _full_screen_resolution_once()
 	var grass := _grass_preset_once()
+	var dual := _dual_distance_once()
 	if fresh:
 		# Add-ons are off until switched on; a new file has none to keep on (addon_loader.gd _migrate_once).
 		_cfg.set_value("meta", ADDONS_OFF_BY_DEFAULT, true)
-	if _migrate() or renamed or reset or belt_auto or still_cards or full_res or grass or not existed:
+	if _migrate() or renamed or reset or belt_auto or still_cards or full_res or grass or dual or not existed:
 		_cfg.save(path)
 
 
@@ -522,6 +582,34 @@ static func _grass_preset_once() -> bool:
 	for preset in ["low", "medium"]:
 		if _stored_preset(preset, "grass_3d"):
 			_cfg.set_value("graphics", "grass_3d", PRESETS[preset]["grass_3d"])
+	return true
+
+
+## Unified Render distance mode used a single `view_radius` (up to 512) with `distant_horizon_manual = false`.
+## Once, when migrating back to separate View distance (full) and Distant horizon sliders:
+## switch `distant_horizon_manual` to true, and if `view_radius` exceeds VIEW_RADIUS_MAX, preserve the outer
+## distance in `distant_horizon` and map `view_radius` back to a safe full-chunk radius from `lod_quality`.
+static func _dual_distance_once() -> bool:
+	if bool(_cfg.get_value("meta", "dual_distance_migrated", false)):
+		return false
+	_cfg.set_value("meta", "dual_distance_migrated", true)
+	_cfg.set_value("graphics", "distant_horizon_manual", true)
+	var vr := int(_cfg.get_value("graphics", "view_radius", DEFAULTS["graphics"]["view_radius"]))
+	if vr > VIEW_RADIUS_MAX:
+		var dh := clampi(int(_cfg.get_value("graphics", "distant_horizon", 0)), 0, RENDER_DISTANCE_MAX)
+		_cfg.set_value("graphics", "distant_horizon", maxi(dh, clampi(vr, 0, RENDER_DISTANCE_MAX)))
+		var lod := str(_cfg.get_value("graphics", "lod_quality", DEFAULTS["graphics"]["lod_quality"])).to_lower()
+		var safe_vr := 9
+		match lod:
+			"low":
+				safe_vr = 6
+			"high":
+				safe_vr = 14
+			"ultra":
+				safe_vr = 16
+			_:
+				safe_vr = 9
+		_cfg.set_value("graphics", "view_radius", safe_vr)
 	return true
 
 
@@ -728,6 +816,7 @@ static func has_arg(prefix: String) -> bool:
 ## icons on items, the tooltip delay. Called first thing by main.gd.
 static func apply_startup(window_height: float) -> void:
 	load_settings()
+	sync_engine_overrides()
 	var ui_scale := str(get_value("interface", "ui_scale"))
 	if ui_scale != "auto" and not has_arg("--ui-scale="):
 		Kit.scale = clampf(float(ui_scale), 0.5, 4.0)
@@ -743,11 +832,15 @@ static func apply_startup(window_height: float) -> void:
 ## Settings → Graphics → Items in 3D: the slider's top end draws every item as a model.
 const ITEM_MODELS_ALL := 20500
 
-## Settings → Graphics → View distance, in chunks round the camera: the slider's top end (world.gd
-## MAX_VIEW_RADIUS, the bridge's world.lua MAX_RADIUS), and past where its value shows yellow and
-## then red (owner's request). What is drawn grows with the square: 20 is four times 10's ground,
-## 50 twenty-five times.
+## Settings → Graphics → View distance, in chunks round the camera: the slider stops at
+## VIEW_RADIUS_SLIDER_MAX (10) and allows custom typing up to VIEW_RADIUS_MAX (50, world.gd
+## MAX_VIEW_RADIUS, the bridge's world.lua MAX_RADIUS), turning red past the slider max.
+## Distant horizon's slider stops at DISTANT_HORIZON_SLIDER_MAX (256) and allows typing up to
+## RENDER_DISTANCE_MAX (512), turning red past 256.
+const VIEW_RADIUS_SLIDER_MAX := 10
 const VIEW_RADIUS_MAX := 50
+const DISTANT_HORIZON_SLIDER_MAX := 256
+const RENDER_DISTANCE_MAX := 512
 const VIEW_RADIUS_DEAR := 10
 const VIEW_RADIUS_DEAREST := 20
 
@@ -827,8 +920,24 @@ static var fps_hold := 0
 
 
 ## The frame rate cap to use: the player's, or the governor's when that is lower (0: unlimited).
+## In the front end (no game running) the frame rate is held at MENU_FPS at most (owner: the menu at 60 FPS
+## max); --menu-fps=0 leaves the menu uncapped, as before. main.gd sets in_menu on start_game/end_game.
+const MENU_FPS := 60
+static var in_menu := true
+static var menu_fps := _menu_fps_arg()
+
+
+static func _menu_fps_arg() -> int:
+	for a in OS.get_cmdline_user_args():
+		if a.begins_with("--menu-fps="):
+			return maxi(int(a.get_slice("=", 1)), 0)
+	return MENU_FPS
+
+
 static func fps_limit() -> int:
 	var cap := int(get_value("graphics", "fps_cap"))
+	if in_menu and menu_fps > 0:
+		cap = menu_fps if cap <= 0 else mini(cap, menu_fps)
 	if fps_hold > 0:
 		return fps_hold if cap <= 0 else mini(cap, fps_hold)
 	return cap
@@ -930,6 +1039,18 @@ static func settle_antialiasing(root: Window) -> void:
 static func apply_antialiasing(root: Window) -> void:
 	if root == null or DisplayServer.get_name() == "headless":
 		return
+	var looks_script = load("res://scripts/world/looks.gd")
+	if fsr2_active(root):
+		# FSR 2.2 does its own temporal anti-aliasing from motion vectors: MSAA, SMAA/FXAA and TAA
+		# would fight it (and TAA is what it replaces), so all three stay off while it is on.
+		root.msaa_3d = Viewport.MSAA_DISABLED
+		root.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+		root.use_taa = false
+		_smaa_held = false
+		if looks_script.active != null:
+			looks_script.active.sync_pre_aa(root)
+		sync_temporal_uniforms(root)
+		return
 	var aa := antialiasing_in_effect()
 	var msaa: int = MSAA.get(aa, Viewport.MSAA_DISABLED)
 	if root.msaa_3d != msaa:
@@ -939,14 +1060,36 @@ static func apply_antialiasing(root: Window) -> void:
 	if root.screen_space_aa != ss:
 		root.screen_space_aa = ss as Viewport.ScreenSpaceAA
 	root.use_taa = taa_on()
+	if looks_script.active != null:
+		looks_script.active.sync_pre_aa(root)
+	sync_temporal_uniforms(root)
 
 
-## The screen-space anti-aliasing drawn for an anti-aliasing choice: none under TAA in place of SMAA.
+## Pre-grade directional AA strength for full-screen look passes (look_pass.gdshaderinc):
+## active when MSAA and TAA are off and screen-space AA (FXAA/SMAA) is enabled, so edges are
+## smoothed before Cinematic's sharpening, contrast, aberration and film grain run.
+static func look_pre_aa_for(vp: Viewport) -> float:
+	if vp == null or vp.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2:
+		return 0.0  # FSR 2.2 resolves the edges itself
+	if vp.msaa_3d != Viewport.MSAA_DISABLED or vp.use_taa:
+		return 0.0
+	if vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_FXAA:
+		return 1.0
+	if vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_SMAA:
+		return 0.75
+	return 0.0
+
+
+## The screen-space anti-aliasing drawn for an anti-aliasing choice: none under TAA in place of SMAA,
+## and SMAA paired with MSAA (unless TAA is on) so interior textures, cutouts, and specular edges get
+## smoothed alongside geometry silhouettes.
 ## TAA already resolves the edges, and SMAA's three full-screen passes kept running over it: 0.37-0.40 ms
 ## of GPU at 4K under the Cinematic look with its TAA on (measured on the owner's desktop) for nothing.
 static func screen_space_aa_for(aa: String, taa: bool) -> int:
 	if aa == "smaa" and taa:
 		return Viewport.SCREEN_SPACE_AA_DISABLED
+	if MSAA.has(aa):
+		return Viewport.SCREEN_SPACE_AA_DISABLED if taa else Viewport.SCREEN_SPACE_AA_SMAA
 	return int(SCREEN_SPACE_AA.get(aa, Viewport.SCREEN_SPACE_AA_DISABLED))
 
 
@@ -960,6 +1103,15 @@ static var _smaa_held := false
 static func follow_taa(vp: Viewport) -> void:
 	if vp == null:
 		return
+	if vp.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2:
+		# FSR 2.2 replaces TAA and SMAA: nothing to follow while it is on.
+		vp.use_taa = false
+		vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+		var fsr_looks = load("res://scripts/world/looks.gd")
+		if fsr_looks.active != null:
+			fsr_looks.active.sync_pre_aa(vp)
+		sync_temporal_uniforms(vp)
+		return
 	vp.use_taa = taa_on()
 	if vp.use_taa and vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_SMAA:
 		vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
@@ -968,6 +1120,10 @@ static func follow_taa(vp: Viewport) -> void:
 		_smaa_held = false
 		if vp.screen_space_aa == Viewport.SCREEN_SPACE_AA_DISABLED:
 			vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_SMAA
+	var looks_script = load("res://scripts/world/looks.gd")
+	if looks_script.active != null:
+		looks_script.active.sync_pre_aa(vp)
+	sync_temporal_uniforms(vp)
 
 
 ## A Resolution setting ("1920x1080") as a size; (0, 0) for none or one too small to use.
@@ -996,6 +1152,147 @@ static func render_scale_for(render_scale: float, ratio: float) -> float:
 	return clampf(clampf(render_scale, 0.25, 2.0) * ratio, 0.1, 2.0)
 
 
+## FSR 1 sharpness when upscaling below native resolution (Godot 4.x range 0 sharpest .. 2 softest:
+## 0.85 preserves edge anti-aliasing instead of re-sharpening SMAA/FXAA edges into jaggies).
+const FSR_SHARPNESS := 0.85
+
+
+## The upscaler in use: "bilinear", "fsr1" or "fsr2" (AMD FSR 2.2, Godot 4.7's SCALING_3D_MODE_FSR2).
+## --upscaler=bilinear|fsr|fsr1|fsr2|fsr2.1|fsr2.2 wins over the Upscaling setting for one run (fsr is
+## FSR 1; fsr2.1 and fsr2.2 are FSR 2 under Godot's one implementation); an unknown value is "fsr1".
+static func upscaler_in_effect() -> String:
+	var arg := arg_value("--upscaler=").strip_edges().to_lower()
+	if arg == "":
+		arg = str(get_value("graphics", "upscaler")).strip_edges().to_lower()
+	if arg == "bilinear":
+		return "bilinear"
+	if arg == "fsr2" or arg.begins_with("fsr2."):
+		return "fsr2"
+	return "fsr1"
+
+
+## The Upscaler sharpness setting (0 softest .. 1 sharpest) as Godot's fsr_sharpness (2 softest .. 0
+## sharpest): the default 0.575 is FSR_SHARPNESS, 0.85.
+static func fsr_sharpness_value() -> float:
+	var s := clampf(float(get_value("graphics", "upscaler_sharpness")), 0.0, 1.0)
+	return clampf((1.0 - s) * 2.0, 0.0, 2.0)
+
+
+## Whether the FSR 2.2 pipeline fixes (LookPass reactive clear, pre-resolve sharpen/grain/aberration
+## suppression, and orthographic camera fallback) are enabled (`--fsr2-fixes=old` rolls back).
+static func fsr2_fixes_enabled() -> bool:
+	return not has_arg("--fsr2-fixes=old")
+
+
+## Test/CLI overrides for temporal motion vectors and belt reactive mask (-1 auto, 0 off, 1 on).
+static var temporal_mv_override := -1
+static var belt_reactive_override := -1
+static var _mv_arg := -2
+static var _reactive_arg := -2
+
+
+static func _read_mv_arg() -> int:
+	if _mv_arg == -2:
+		_mv_arg = 0 if has_arg("--temporal-motion-vectors=off") else (1 if has_arg("--temporal-motion-vectors=on") else -1)
+	return _mv_arg
+
+
+static func _read_reactive_arg() -> int:
+	if _reactive_arg == -2:
+		_reactive_arg = 0 if has_arg("--belt-reactive-mask=off") else (1 if has_arg("--belt-reactive-mask=on") else -1)
+	return _reactive_arg
+
+
+## Whether native MultiMesh per-instance motion vectors are allowed (`--temporal-motion-vectors=off` disables).
+static func temporal_motion_vectors_enabled() -> bool:
+	return temporal_mv_override != 0 and _read_mv_arg() != 0
+
+
+## Whether temporal AA (TAA or FSR 2.2) is active and MultiMesh motion vectors should be driven.
+static func temporal_aa_active(vp: Viewport = null) -> bool:
+	if temporal_mv_override == 0 or _read_mv_arg() == 0:
+		return false
+	if temporal_mv_override == 1 or _read_mv_arg() == 1:
+		return true
+	if vp == null:
+		var loop := Engine.get_main_loop()
+		if loop is SceneTree:
+			vp = (loop as SceneTree).root
+	if vp != null:
+		return vp.use_taa or vp.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2
+	return taa_on() or fsr2_wanted()
+
+
+## Whether the FSR 2.2 belt-surface reactive mask is enabled (`--belt-reactive-mask=off` or `--fsr2-fixes=old` disables).
+static func belt_reactive_mask_enabled() -> bool:
+	return fsr2_fixes_enabled() and belt_reactive_override != 0 and _read_reactive_arg() != 0
+
+
+## Whether the FSR 2.2 belt-surface reactive mask is active for `vp` now.
+static func belt_reactive_mask_active(vp: Viewport = null) -> bool:
+	return belt_reactive_mask_enabled() and (belt_reactive_override == 1 or _read_reactive_arg() == 1 or fsr2_active(vp))
+
+
+## Syncs the global belt reactive uniform and ModelLibrary's reactive `next_pass` attachment.
+static func sync_temporal_uniforms(vp: Viewport = null) -> void:
+	var reactive := belt_reactive_mask_active(vp)
+	RenderingServer.global_shader_parameter_set(&"f3d_belt_reactive", 1.0 if reactive else 0.0)
+	var ml = load("res://scripts/world/model_library.gd")
+	if ml != null and ml.has_method("sync_belt_reactive"):
+		ml.sync_belt_reactive(reactive)
+
+
+## Set while the in-game camera is in an orthographic projection (Factorio view F6, F7, or Remote map),
+## so FSR 2.2 falls back cleanly until perspective resumes.
+static var camera_orthographic := false
+
+
+static func set_camera_orthographic(ortho: bool, root: Window = null) -> void:
+	if camera_orthographic == ortho:
+		return
+	camera_orthographic = ortho
+	if root != null:
+		apply_window_scales(root)
+
+
+## Upscaler for 3D render scaling: FSR 1 when drawing below native resolution (sharper than bilinear,
+## works with MSAA and needs no motion vectors), plain bilinear at or above 1.0 (or with
+## --upscaler=bilinear), and FSR 2.2 (temporal, from motion vectors: sharper than FSR 1 but replaces
+## TAA/MSAA, and it can't draw above native) at 1.0 and below. Orthographic views temporarily fall
+## back to FSR 1 / bilinear because FSR 2.2 depth clip/reprojection assume perspective. `upscaler` ""
+## is upscaler_in_effect().
+static func scaling_mode_for(scale_3d: float, upscaler := "") -> Viewport.Scaling3DMode:
+	if upscaler == "":
+		upscaler = upscaler_in_effect()
+	match upscaler:
+		"bilinear":
+			return Viewport.SCALING_3D_MODE_BILINEAR
+		"fsr2":
+			if camera_orthographic and fsr2_fixes_enabled():
+				return Viewport.SCALING_3D_MODE_FSR if scale_3d < 0.999 else Viewport.SCALING_3D_MODE_BILINEAR
+			return Viewport.SCALING_3D_MODE_FSR2 if scale_3d <= 1.001 else Viewport.SCALING_3D_MODE_BILINEAR
+	return Viewport.SCALING_3D_MODE_FSR if scale_3d < 0.999 else Viewport.SCALING_3D_MODE_BILINEAR
+
+
+## Whether the settings (Upscaling, Game render scaling, Resolution) ask for FSR 2.2 right now, which
+## apply_window_scales then sets: Settings > Graphics greys out the anti-aliasing choice for it
+## regardless of temporary orthographic views (F6/F7/Map).
+static func fsr2_wanted() -> bool:
+	var scale_3d := render_scale_for(float(get_value("graphics", "render_scale")), full_screen_ratio())
+	return upscaler_in_effect() == "fsr2" and scale_3d <= 1.001
+
+
+## Whether FSR 2.2 is the 3D scaling mode of a viewport/window now (the main one without `root`): it takes over
+## anti-aliasing (apply_antialiasing).
+static func fsr2_active(root: Viewport = null) -> bool:
+	if root == null:
+		var tree := Engine.get_main_loop() as SceneTree
+		if tree == null:
+			return false
+		root = tree.root
+	return root != null and root.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2
+
+
 ## The resolution_ratio() in use now: 1 unless the window really is full screen. VR draws for the
 ## headset, whatever the desktop window is. --scale-like-full-screen does the sums with the window
 ## as the monitor, so a test can see the scaling without taking the screen over.
@@ -1019,8 +1316,20 @@ static func apply_window_scales(root: Window) -> void:
 	if root == null or DisplayServer.get_name() == "headless":
 		return
 	var scale_3d := render_scale_for(float(get_value("graphics", "render_scale")), full_screen_ratio())
+	var mode := scaling_mode_for(scale_3d)
+	var was_fsr2 := root.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2
+	if root.scaling_3d_mode != mode:
+		root.scaling_3d_mode = mode
+	if mode == Viewport.SCALING_3D_MODE_FSR or mode == Viewport.SCALING_3D_MODE_FSR2:
+		var sharp := fsr_sharpness_value()
+		if not is_equal_approx(root.fsr_sharpness, sharp):
+			root.fsr_sharpness = sharp
 	if not is_equal_approx(root.scaling_3d_scale, scale_3d):
 		root.scaling_3d_scale = scale_3d
+	if was_fsr2 != (mode == Viewport.SCALING_3D_MODE_FSR2):
+		apply_antialiasing(root)
+	else:
+		sync_temporal_uniforms(root)
 	apply_ui_scale(root)
 
 
@@ -1036,7 +1345,7 @@ static func chosen_screen() -> int:
 ## that fit on it; in full screen the monitor's own and the common sizes it can scale up from.
 static func resolution_choices(monitor: Vector2i, full_screen: bool) -> Array:
 	var own := default_window_size()
-	var choices: Array = [["Monitor's own (%d × %d)" % [monitor.x, monitor.y] if full_screen else "Default (%d × %d)" % [own.x, own.y], ""]]
+	var choices: Array = [["%d × %d (default)" % [monitor.x, monitor.y] if full_screen else "%d × %d (default)" % [own.x, own.y], ""]]
 	var listed: Array = RESOLUTIONS.duplicate()
 	var native := "%dx%d" % [monitor.x, monitor.y]
 	if not full_screen and not listed.has(native):
@@ -1075,6 +1384,7 @@ static func apply_window(root: Window) -> void:
 		return
 	Engine.max_fps = fps_limit()
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_ENABLED if bool(get_value("graphics", "vsync")) else DisplayServer.VSYNC_DISABLED)
+	apply_window_scales(root)
 	apply_antialiasing(root)
 	# --borderless: a window without a frame, for screenshot runs that shouldn't look like the game opening.
 	if has_arg("--borderless"):
@@ -1164,6 +1474,7 @@ static func apply_ssao(env: Environment, on: Variant = null) -> void:
 	for key in SSAO_FACTORIO:
 		env.set(key, SSAO_FACTORIO[key])
 	RenderingServer.environment_set_ssao_quality(RenderingServer.ENV_SSAO_QUALITY_MEDIUM, true, 0.5, 2, SSAO_FADE.x, SSAO_FADE.y)
+	RenderingServer.environment_set_ssil_quality(RenderingServer.ENV_SSIL_QUALITY_MEDIUM, true, 0.5, 2, SSAO_FADE.x, SSAO_FADE.y)
 
 
 ## The shadow atlas for a quality; "off" turns the sun's shadows off (main.gd).
@@ -1542,3 +1853,15 @@ static func _set_keys(action: String, keys: Array) -> void:
 		ev.alt_pressed = int(code) & KEY_MASK_ALT != 0
 		ev.meta_pressed = int(code) & KEY_MASK_META != 0
 		InputMap.action_add_event(action, ev)
+
+
+## Whether the key opposite to the vehicle's motion brakes it to a stop and holds it there until let go
+## (a departure from Factorio, which brakes and then reverses): `--vehicle-brake-hold=on|off` for one run,
+## else Settings > Interface > Interaction (off by default). The mod does the braking (driving.lua `h`).
+static func vehicle_brake_hold() -> bool:
+	for arg in OS.get_cmdline_user_args():
+		if arg == "--vehicle-brake-hold=on":
+			return true
+		if arg == "--vehicle-brake-hold=off":
+			return false
+	return bool(get_value("interface", "vehicle_brake_hold"))

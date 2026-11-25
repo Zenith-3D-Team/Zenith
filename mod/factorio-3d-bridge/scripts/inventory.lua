@@ -191,7 +191,7 @@ local function send_slots(c, s)
     if #icons > 0 then
       msg.ic = icons
     end
-    transport.send_reliable(msg)
+    transport.send_reliable_priority(msg)
   end
 end
 
@@ -244,7 +244,7 @@ local function send_quickbar()
   local qb = quickbar()
   local list, page = quickbar_state()
   qb.sig = table.concat(list, ",") .. "|" .. page .. "|" .. qb.sel
-  transport.send_reliable({ t = "qb", p = page, sel = qb.sel, held = list[qb.sel] or "", l = list })
+  transport.send_reliable_priority({ t = "qb", p = page, sel = qb.sel, held = list[qb.sel] or "", l = list })
 end
 
 -- The slots now, if they changed (ui_actions.lua's Ctrl+clicks: the client's hand and its sound

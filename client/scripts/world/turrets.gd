@@ -27,6 +27,12 @@ const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
 const BeamShader := preload("res://shaders/fx_beam.gdshader")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const VehicleAnim := preload("res://scripts/world/vehicle_anim.gd")
+const CombatLights := preload("res://scripts/fx/combat_lights.gd")
+const FlameSound := preload("res://scripts/fx/flame_sound.gd")
+const Switches := preload("res://scripts/switches.gd")
+## `--flame-streams=old`: the stream drawn here (no `pj` from the mod) arcs as low as before.
+static var flame_streams_old := Switches.has("--flame-streams=old")
 
 ## A target counts as current this long after a report names it (reports come every 6 ticks).
 const TARGET_HOLD := 0.4
@@ -83,10 +89,14 @@ const TURRETS := {
 }
 ## Vehicle guns: cooldown, kind, recoil, sound.
 const GUNS := {
-	"vehicle-machine-gun": {"cooldown": 4, "kind": "bullet", "recoil": [0.02, 0.05], "sound": "base/sound/fight/heavy-gunshot"},
-	"tank-machine-gun": {"cooldown": 4, "kind": "bullet", "recoil": [0.0, 0.05], "sound": "base/sound/fight/heavy-gunshot"},
-	"tank-cannon": {"cooldown": 90, "kind": "cannon", "recoil": [0.18, 0.4], "sound": "base/sound/fight/tank-cannon"},
-	"tank-flamethrower": {"cooldown": 1, "kind": "flame", "recoil": [0.0, 0.1], "stream": 27.0, "gravity": 5.4,
+	"vehicle-machine-gun": {"cooldown": 4, "kind": "bullet", "recoil": [0.04, 0.06], "casing": "shell-particle",
+		"sound": "base/sound/fight/heavy-gunshot"},
+	"tank-machine-gun": {"cooldown": 4, "kind": "bullet", "recoil": [0.03, 0.05], "casing": "shell-particle",
+		"part": "turret_coax", "sound": "base/sound/fight/heavy-gunshot"},
+	"tank-cannon": {"cooldown": 90, "kind": "cannon", "recoil": [0.22, 0.42], "hull_kick": 0.48,
+		"part": "turret_barrel", "sound": "base/sound/fight/tank-cannon"},
+	"tank-flamethrower": {"cooldown": 1, "kind": "flame", "recoil": [0.0, 0.1], "part": "turret_coax",
+		"stream": 27.0, "gravity": 5.4,
 		"sound": "base/sound/fight/flamethrower-mid", "start": "base/sound/fight/flamethrower-start",
 		"end": "base/sound/fight/flamethrower-end"},
 	"spidertron-rocket-launcher": {"cooldown": 60, "kind": "rocket", "recoil": [0.0, 0.1],
@@ -113,6 +123,19 @@ const FLAME_ENERGY := 2.4
 const FLAME_LANDING_ENERGY := 2.2
 const FLAME_LANDING_RANGE := 7.0
 const FLAME_LANDING_HEIGHT := 2.0
+## The stronger lights (combat_lights.gd; `--combat-lights=old` the ones above): a shot lights the
+## turret and the ground round it brightly for about 0.1-0.2 s (a gun turret's 0.1 s shots keep it lit,
+## pulsing), the flame's nozzle and where it lands light the area to be seen from far out.
+const FLASH_RANGE_NEW := 11.0
+const FLASH_GAIN_NEW := 2.4
+const FLASH_FADE_NEW := 22.0  # energy lost a second (14 before)
+const FLAME_ENERGY_NEW := 3.4
+const FLAME_LANDING_ENERGY_NEW := 4.0
+const FLAME_LANDING_RANGE_NEW := 14.0
+const FLAME_LANDING_HEIGHT_NEW := 2.6
+## Nudge the muzzle light slightly ahead of the barrel tip along `st.forward` so the turret's
+## own head/barrel geometry doesn't shadow its own flash.
+const MUZZLE_LIGHT_OFFSET := 0.25
 ## On an add-on's hills (ground_height.gd) the turret's model and its cards are lifted in their
 ## shaders; its lights and beams are placed here, lifted by the height under the muzzle and under the
 ## target. Each is read again only when the hills change or its point moves this far (tiles).
@@ -136,6 +159,7 @@ class TurretState:
 	var since_shot := 100.0
 	var launcher := 0
 	var muzzle := Vector3.ZERO  # world position, updated with the head
+	var at := Vector2.INF  # a chunk turret's centre on the ground plane (its model's origin), once drawn
 	var forward := Vector3.FORWARD
 	var beam_kind := ""
 	var beam_left := 0.0
@@ -175,6 +199,9 @@ var _beam_materials := {}  # kind -> ShaderMaterial (null when the sheet is miss
 var game_beams := false
 ## How far the railgun's beam runs (the Model packs window's preview keeps it in its picture).
 var railgun_length := RAILGUN_LENGTH
+## Laser beams from the emitter at the top front of the head; `--laser-origin=old`: from the middle
+## of the head's foremost faces, and the game's beams (`pj`) from the turret's centre (weapon_fx.gd).
+static var laser_origin_old := Switches.has("--laser-origin=old")
 
 
 ## A new game, or (`keep_beams`) another surface of the same one, whose bridge still sends `pj`.
@@ -182,8 +209,13 @@ func reset(keep_beams := false) -> void:
 	for st: TurretState in _states.values():
 		_free_nodes(st)
 	_states.clear()
+	CombatLights.clear_shadow_source(get_instance_id())
 	if not keep_beams:
 		game_beams = false
+
+
+func _exit_tree() -> void:
+	CombatLights.clear_shadow_source(get_instance_id())
 
 
 func count() -> int:
@@ -251,6 +283,7 @@ func head_transform(unit: int, part: ModelLibrary.AnimPart, base: Transform3D, d
 	var local_yaw := -(st.yaw - base_turns) * TAU
 	var xf := _pose(part, local_yaw, st.fold, st.cfg, st.since_shot)
 	var world := base * xf
+	st.at = Vector2(base.origin.x, base.origin.z)
 	st.muzzle = world * _muzzle_point(part, st)
 	st.forward = (world.basis * head_front(part)).normalized()
 	_fire_due(st)
@@ -270,8 +303,20 @@ func _process(delta: float) -> void:
 					st.fold = 1.0
 			if st.vehicle:
 				_vehicle(st, delta)
+	var shadow_candidates: Array = []
+	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+	var eye := cam.global_position if cam != null else Vector3.ZERO
 	for st: TurretState in _states.values():
 		_update_effects(st, delta)
+		if st.light != null and st.light.visible:
+			shadow_candidates.append([st.light, CombatLights.light_score(st.light.global_position, eye, st.light.light_energy, st.light.omni_range)])
+		elif st.light != null:
+			st.light.shadow_enabled = false
+		if st.flame_light != null and st.flame_light.visible:
+			shadow_candidates.append([st.flame_light, CombatLights.light_score(st.flame_light.global_position, eye, st.flame_light.light_energy, st.flame_light.omni_range)])
+		elif st.flame_light != null:
+			st.flame_light.shadow_enabled = false
+	CombatLights.submit_shadow_candidates(get_instance_id(), shadow_candidates)
 	_forget_timer += delta
 	if _forget_timer >= FORGET_INTERVAL and world != null:
 		_forget_timer = 0.0
@@ -349,17 +394,58 @@ func _vehicle(st: TurretState, delta: float) -> void:
 	if node == null:
 		return
 	_advance(st, delta)
-	var found := false
+	var veh: Node = movers.get("vehicles") if movers != null else null
+	var chassis := Transform3D.IDENTITY
+	if veh != null and VehicleAnim.enhanced:
+		chassis = veh.call("chassis_xform", st.unit)
+	var head_nodes: Array = []
+	var barrel_node: Node3D = null
+	var barrel_part: ModelLibrary.AnimPart = null
+	var coax_node: Node3D = null
+	var coax_part: ModelLibrary.AnimPart = null
 	for child in node.get_children():
 		if child.has_meta("turret_head"):
-			var part: ModelLibrary.AnimPart = child.get_meta("turret_head")
-			var gcfg := _gun_cfg(st)
-			var xf := _pose(part, -st.yaw * TAU, 1.0, gcfg, st.since_shot)
-			(child as Node3D).transform = xf
-			var world := node.global_transform * xf
-			st.muzzle = world * _muzzle_point(part, st)
-			st.forward = (world.basis * Vector3.FORWARD).normalized()
-			found = true
+			head_nodes.append([child, child.get_meta("turret_head")])
+		elif child.has_meta("turret_barrel"):
+			barrel_node = child as Node3D
+			barrel_part = child.get_meta("turret_barrel")
+		elif child.has_meta("turret_coax"):
+			coax_node = child as Node3D
+			coax_part = child.get_meta("turret_coax")
+	var found := not head_nodes.is_empty()
+	if found:
+		var gcfg := _gun_cfg(st)
+		var yaw := -st.yaw * TAU
+		var has_barrels := barrel_node != null or coax_node != null
+		var active_kind := str(gcfg.get("part", "turret_barrel"))
+		var head_shot := st.since_shot if (not VehicleAnim.enhanced or not has_barrels) else 100.0
+		var active_part: ModelLibrary.AnimPart = null
+		var active_xf := Transform3D.IDENTITY
+		for pair in head_nodes:
+			var hnode := pair[0] as Node3D
+			var hpart: ModelLibrary.AnimPart = pair[1]
+			var hxf := chassis * _pose(hpart, yaw, 1.0, gcfg, head_shot)
+			hnode.transform = hxf
+			if active_part == null:
+				active_part = hpart
+				active_xf = hxf
+		if barrel_node != null:
+			var bshot := st.since_shot if (not VehicleAnim.enhanced or active_kind != "turret_coax" or coax_node == null) else 100.0
+			var bxf := chassis * _pose(barrel_part, yaw, 1.0, gcfg, bshot)
+			barrel_node.transform = bxf
+			if active_kind != "turret_coax" or coax_node == null:
+				active_part = barrel_part
+				active_xf = bxf
+		if coax_node != null:
+			var cshot := st.since_shot if (not VehicleAnim.enhanced or active_kind == "turret_coax") else 100.0
+			var cxf := chassis * _pose(coax_part, yaw, 1.0, gcfg, cshot)
+			coax_node.transform = cxf
+			if active_kind == "turret_coax":
+				active_part = coax_part
+				active_xf = cxf
+		var world_xf := node.global_transform * active_xf
+		st.muzzle = world_xf * _muzzle_point(active_part, st)
+		st.forward = (world_xf.basis * Vector3.FORWARD).normalized()
 	if not found:
 		# No turret part (the spidertron): launchers on top of the body, turned with the torso.
 		var top := 1.6
@@ -413,6 +499,16 @@ func _fire(st: TurretState, gcfg: Dictionary) -> void:
 	var dir := (target - st.muzzle).normalized() if target.distance_to(st.muzzle) > 0.05 else st.forward
 	var sprites: Node = fx.get("sprites") if fx != null else null
 	var effects := FxSettings.effects_enabled and sprites != null
+	if effects and gcfg.has("casing") and fx != null:
+		var weapons: Node = fx.get("weapons")
+		if weapons != null:
+			weapons.call("emit_casing", str(gcfg["casing"]), st.muzzle, dir, 0.25, 0.12, 0.06)
+	if VehicleAnim.enhanced and movers != null:
+		var kick := float(gcfg.get("hull_kick", 0.0))
+		if kick > 0.0:
+			var veh: Node = movers.get("vehicles")
+			if veh != null:
+				veh.call("impulse", st.unit, -dir, kick)
 	match kind:
 		"bullet":
 			_flash(st, Color(1.0, 0.75, 0.35), 1.6)
@@ -420,9 +516,15 @@ func _fire(st: TurretState, gcfg: Dictionary) -> void:
 				var flash = sprites.call("emit", "muzzle", st.muzzle + dir * 0.12, 0.45, 0.07)
 				if flash != null:
 					flash.spin = atan2(dir.y, Vector2(dir.x, dir.z).length())
-				var hit = sprites.call("emit", "bullet-hit", target + Vector3(randf_range(-0.2, 0.2), 0.1, randf_range(-0.2, 0.2)), 0.55, 0.15)
+				var hit_at := target + Vector3(randf_range(-0.2, 0.2), 0.1, randf_range(-0.2, 0.2))
+				var hit = sprites.call("emit", "bullet-hit", hit_at, 0.55, 0.15)
 				if hit != null:
 					hit.spin = randf() * TAU
+			# A tracer from the barrels to the hit (weapon_fx.gd; a look of ours, --bullet-tracers=off).
+			# Turrets' ammo isn't reported: a firearm magazine's colour.
+			var weapons: Node = fx.get("weapons") if fx != null else null
+			if weapons != null:
+				weapons.call("tracer", st.muzzle + dir * 0.15, target, "", st.unit)
 		"cannon":
 			_flash(st, Color(1.0, 0.7, 0.3), 3.0)
 			if effects:
@@ -453,12 +555,67 @@ func _fire(st: TurretState, gcfg: Dictionary) -> void:
 				_beam_start(st, kind)
 			_flash(st, BEAMS[kind][8], 1.0)
 		"flame":
-			if st.flame_left <= 0.0:
-				_sound_path(st, str(gcfg.get("start", "")))
-				st.flame_sound = 0.0
-			st.flame_left = maxf(st.flame_left, float(gcfg.get("cooldown", 4)) / 60.0 + 0.12)
+			_flame_on(st, gcfg)
 			return
 	_sound_path(st, str(gcfg.get("sound", "")))
+
+
+## A flamethrower's shot (or a stream of its seen in `pj`): its flame burns on for a little longer.
+func _flame_on(st: TurretState, gcfg: Dictionary) -> void:
+	if st.flame_left <= 0.0:
+		if FlameSound.old:
+			_sound_path(st, str(gcfg.get("start", "")))
+		st.flame_sound = 0.0
+	st.flame_left = maxf(st.flame_left, float(gcfg.get("cooldown", 4)) / 60.0 + 0.12)
+
+
+## The flamethrower (a turret's, a tank's) whose stream lands at `at`: [its nozzle, its unit], or
+## [] when none is near enough. Factorio puts a stream entity where it lands (seen in 2.1.24: a
+## turret's, a step at a time from its minimum range out to the target, and the character's at its
+## aim), so the nozzle is the one within `reach` whose head points the closest to `at`, a firing
+## one before an idle one. The nozzle is the head's, turned as it aims (head_transform, _vehicle).
+func flame_nozzle(at: Vector2, reach: float) -> Array:
+	var best: TurretState = null
+	var best_score := INF
+	for st: TurretState in _states.values():
+		if st.muzzle == Vector3.ZERO or str(_gun_cfg(st).get("kind", st.cfg.get("kind", ""))) != "flame":
+			continue
+		var to := at - Vector2(st.muzzle.x, st.muzzle.z)
+		var d := to.length()
+		if d > reach:
+			continue
+		var ahead := Vector2(st.forward.x, st.forward.z)
+		var off := 0.0 if d < 0.5 or ahead.length() < 0.01 else absf(ahead.angle_to(to))
+		var score := off + d * 0.002 + (0.0 if st.flame_left > 0.0 or st.since_shot < 1.0 else 1.0)
+		if score < best_score:
+			best_score = score
+			best = st
+	if best == null:
+		return []
+	return [best.muzzle, best.unit]
+
+
+## Whether `unit`'s shots are lit here (a turret's or vehicle's own flash light), so weapon_fx.gd
+## doesn't light them twice.
+func lights_shots(unit: int) -> bool:
+	var st: TurretState = _states.get(unit)
+	return st != null and not st.cfg.is_empty()
+
+
+## Where flamethrower `unit` (a turret, a vehicle) shoots: its last `ts` target (a turret's
+## shooting_target, a vehicle gunner's aim) while current, else null (weapon_fx.gd lands its stream there).
+func flame_target(unit: int) -> Variant:
+	var st: TurretState = _states.get(unit)
+	if st == null or _clock - st.target_seen >= 1.5:
+		return null
+	return st.target
+
+
+## A stream from turret `unit` was seen: it fires now (its flame, light and sound go on).
+func flame_fired(unit: int) -> void:
+	var st: TurretState = _states.get(unit)
+	if st != null and not st.cfg.is_empty():
+		_flame_on(st, _gun_cfg(st))
 
 
 func _launcher_point(st: TurretState) -> Vector3:
@@ -489,9 +646,14 @@ func _flash(st: TurretState, color: Color, energy: float) -> void:
 		st.light = OmniLight3D.new()
 		st.light.omni_range = FLASH_RANGE
 		st.light.shadow_enabled = false
+		CombatLights.configure_light(st.light)
 		add_child(st.light)
 	st.light.light_color = color
-	st.light_energy = maxf(st.light_energy, energy * FLASH_GAIN)
+	if CombatLights.old:
+		st.light_energy = maxf(st.light_energy, energy * FLASH_GAIN)
+	else:
+		st.light.omni_range = FLASH_RANGE_NEW
+		st.light_energy = maxf(st.light_energy, energy * FLASH_GAIN_NEW * CombatLights.strength)
 
 
 func _sound(st: TurretState, key: String) -> void:
@@ -521,12 +683,14 @@ func _beam_start(st: TurretState, kind: String) -> void:
 ## Beams, flame streams and lights, every frame.
 func _update_effects(st: TurretState, delta: float) -> void:
 	if st.light != null:
-		st.light_energy = maxf(0.0, st.light_energy - delta * 14.0)
+		st.light_energy = maxf(0.0, st.light_energy - delta * (14.0 if CombatLights.old else FLASH_FADE_NEW))
 		var on := st.light_energy > 0.01
 		st.light.visible = on
 		if on:
-			st.light.global_position = st.muzzle + Vector3(0.0, _muzzle_ground(st), 0.0)
+			st.light.global_position = st.muzzle + st.forward * MUZZLE_LIGHT_OFFSET + Vector3(0.0, _muzzle_ground(st), 0.0)
 			st.light.light_energy = st.light_energy
+		else:
+			st.light.shadow_enabled = false
 	if st.beam_left > 0.0:
 		st.beam_left -= delta
 		st.beam_age += delta
@@ -536,10 +700,11 @@ func _update_effects(st: TurretState, delta: float) -> void:
 	if st.flame_left > 0.0:
 		st.flame_left -= delta
 		_flame(st, delta)
-		if st.flame_left <= 0.0:
+		if st.flame_left <= 0.0 and FlameSound.old:
 			_sound_path(st, str(_gun_cfg(st).get("end", "")))
 	elif st.flame_light != null and st.flame_light.visible:
 		st.flame_light.visible = false
+		st.flame_light.shadow_enabled = false
 
 
 func _draw_beam(st: TurretState) -> void:
@@ -632,11 +797,16 @@ func _beam_material(kind: String) -> ShaderMaterial:
 ## (flamethrower-fire-stream: 0.25 tiles a tick out, 0.003 down; the tank's 0.45 and 0.0015).
 func _flame(st: TurretState, delta: float) -> void:
 	var gcfg := _gun_cfg(st)
-	st.flame_sound -= delta
-	if st.flame_sound <= 0.0:
-		st.flame_sound = 0.9
-		_sound_path(st, str(gcfg.get("sound", "")))
-	_flash(st, Color(1.0, 0.5, 0.0), FLAME_ENERGY * _flicker(st, 0.0))
+	var looped = fx.get("flame_sound") if fx != null and not FlameSound.old else null
+	if looped != null:
+		# flame_sound.gd: Factorio's begin, middle looped and end, from the nozzle, capped.
+		looped.call("firing", st.unit, st.muzzle, "tank" if st.vehicle else "turret")
+	else:
+		st.flame_sound -= delta
+		if st.flame_sound <= 0.0:
+			st.flame_sound = 0.9
+			_sound_path(st, str(gcfg.get("sound", "")))
+	_flash(st, Color(1.0, 0.5, 0.0), (FLAME_ENERGY if CombatLights.old else FLAME_ENERGY_NEW) * _flicker(st, 0.0))
 	_light_landing(st)
 	var sprites: Node = fx.get("sprites") if fx != null else null
 	if not FxSettings.effects_enabled or sprites == null:
@@ -656,6 +826,10 @@ func _flame(st: TurretState, delta: float) -> void:
 	var speed := float(gcfg.get("stream", 15.0))
 	var g := float(gcfg.get("gravity", 10.8))
 	var t := clampf(flat.length() / speed, 0.08, 2.5)
+	if not flame_streams_old:
+		# The higher arc weapon_fx.gd draws the game's streams in (FLAME_ARC_LIFT, FLAME_ARC_MIN).
+		var top := maxf(g * t * t / 8.0 * 1.35, flat.length() * 0.12)
+		g = 8.0 * top / (t * t)
 	# Factorio's particle starts at 0.2 of its 124 px (at 0.666) and grows on the way.
 	var card = sprites.call("emit", "flame-stream", st.muzzle, 0.55, t)
 	if card != null:
@@ -678,27 +852,40 @@ func _light_landing(st: TurretState) -> void:
 		st.flame_light.omni_range = FLAME_LANDING_RANGE
 		st.flame_light.light_color = Color(1.0, 0.48, 0.1)
 		st.flame_light.shadow_enabled = false
+		CombatLights.configure_light(st.flame_light)
 		add_child(st.flame_light)
 	var at := st.target if _clock - st.target_seen < 1.5 else st.muzzle + st.forward * 10.0
-	st.flame_light.global_position = Vector3(at.x, FLAME_LANDING_HEIGHT + _ground_under(st, at), at.z)
-	st.flame_light.light_energy = FLAME_LANDING_ENERGY * _flicker(st, 1.7)
-	st.flame_light.visible = true
+	if CombatLights.old:
+		st.flame_light.global_position = Vector3(at.x, FLAME_LANDING_HEIGHT + _ground_under(st, at), at.z)
+		st.flame_light.light_energy = FLAME_LANDING_ENERGY * _flicker(st, 1.7)
+		st.flame_light.visible = true
+		return
+	st.flame_light.omni_range = FLAME_LANDING_RANGE_NEW
+	st.flame_light.global_position = Vector3(at.x, FLAME_LANDING_HEIGHT_NEW + _ground_under(st, at), at.z)
+	st.flame_light.light_energy = FLAME_LANDING_ENERGY_NEW * CombatLights.strength * _flicker(st, 1.7)
+	st.flame_light.visible = CombatLights.strength > 0.0
+	if not st.flame_light.visible:
+		st.flame_light.shadow_enabled = false
 
 
 ## Where shots leave the head, in model space: the middle of its foremost faces (the barrels'
-## ends); the tesla's from the top of its coil.
+## ends); the tesla's from the top of its coil; the laser's from its emitter, the foremost faces of
+## the head's upper half (`--laser-origin=old`: of the whole head, as before).
 func _muzzle_point(part: ModelLibrary.AnimPart, st: TurretState) -> Vector3:
-	var key := part.model
+	var key := part.source + ":" + part.model + ":" + part.kind
 	if _muzzles.has(key):
 		return _muzzles[key]
 	var aabb := part.mesh.get_aabb() if part.mesh != null else AABB()
 	var point := aabb.get_center()
-	if str(st.cfg.get("kind", "")) == "tesla":
+	var kind := str(st.cfg.get("kind", ""))
+	if kind == "tesla":
 		point = Vector3(aabb.get_center().x, aabb.end.y - 0.1, aabb.get_center().z)
 	elif part.mesh != null:
 		var faces := _faces(part.mesh)
-		if not faces.is_empty():
-			var ahead := head_front(part)
+		var ahead := head_front(part)
+		if kind == "laser" and not laser_origin_old:
+			point = emitter_point(faces, aabb, ahead)
+		elif not faces.is_empty():
 			var front := -INF
 			for v in faces:
 				front = maxf(front, v.dot(ahead))
@@ -712,6 +899,51 @@ func _muzzle_point(part: ModelLibrary.AnimPart, st: TurretState) -> Vector3:
 				point = sum / n
 	_muzzles[key] = point
 	return point
+
+
+## A laser head's emitter in model space: the middle of the foremost faces of its upper half (the
+## lens at the top front), else the top front of its bounds.
+static func emitter_point(faces: PackedVector3Array, aabb: AABB, ahead: Vector3) -> Vector3:
+	var mid_y := aabb.position.y + aabb.size.y * 0.5
+	var front := -INF
+	for v in faces:
+		if v.y >= mid_y:
+			front = maxf(front, v.dot(ahead))
+	var sum := Vector3.ZERO
+	var n := 0
+	if front > -INF:
+		for v in faces:
+			if v.y >= mid_y and v.dot(ahead) >= front - 0.03:
+				sum += v
+				n += 1
+	if n > 0:
+		return sum / n
+	var c := aabb.get_center()
+	var reach := absf(aabb.size.dot(ahead.abs())) * 0.5
+	return Vector3(c.x, aabb.end.y - aabb.size.y * 0.15, c.z) + ahead * reach
+
+
+## The chunk turret whose centre is nearest `at` (tiles, ground plane) within `radius`, or 0: where
+## the game's laser and tesla beams (`pj`) start, so weapon_fx.gd draws them from its emitter.
+func turret_near(at: Vector2, radius: float) -> int:
+	var best := 0
+	var best_d := radius * radius
+	for st: TurretState in _states.values():
+		if st.vehicle or st.at == Vector2.INF:
+			continue
+		var d := st.at.distance_squared_to(at)
+		if d <= best_d:
+			best_d = d
+			best = st.unit
+	return best
+
+
+## A turret's or armed vehicle's muzzle now (world, over flat ground), or null when it is not known.
+func muzzle_of(unit: int) -> Variant:
+	var st: TurretState = _states.get(unit)
+	if st == null or st.muzzle == Vector3.ZERO:
+		return null
+	return st.muzzle
 
 
 ## Mesh.get_faces() from the mesh's CPU arrays (ModelLods.arrays_of): get_faces reads them from the
@@ -745,8 +977,10 @@ static func _load_texture(file: String) -> Texture2D:
 
 func _free_nodes(st: TurretState) -> void:
 	if st.light != null:
+		st.light.shadow_enabled = false
 		st.light.queue_free()
 	if st.flame_light != null:
+		st.flame_light.shadow_enabled = false
 		st.flame_light.queue_free()
 	if st.beam != null:
 		st.beam.queue_free()

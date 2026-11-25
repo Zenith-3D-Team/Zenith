@@ -97,11 +97,39 @@ func create_map(path: String, settings: Variant, seed_text: String, exchange := 
 			OS.kill(creator)
 			break
 		await get_tree().create_timer(0.2).timeout
+	var timed_out := Time.get_ticks_msec() - started_msec > CREATE_TIMEOUT_MSEC
 	_helper_pid = -1
 	if not FileAccess.file_exists(path) or FileAccess.get_modified_time(path) < int(started) - 1:
-		error = "Map creation failed.\n" + _log_errors(int(started))
+		var reason := _log_errors(int(started))
+		# Factorio prints a bad argument or settings file only to its console ("... is not a valid
+		# autoplace control name"), not to its log: run it again once to read that (issue #28).
+		if not timed_out and not reason.contains("Error") and not "--create-console=off" in OS.get_cmdline_user_args():
+			var out: Array = []
+			OS.execute(_exe, args, out, true)
+			if FileAccess.file_exists(path) and FileAccess.get_modified_time(path) >= int(started) - 1:
+				return true
+			var said := _console_error("\n".join(out))
+			if said != "":
+				reason = said + "\n" + reason
+		error = "Map creation failed.\n" + reason
 		return false
 	return true
+
+
+## The text of Factorio's console error box ("--- Error ---" ... "---"), or "".
+static func _console_error(text: String) -> String:
+	var lines: Array = []
+	var inside := false
+	for line in text.split("\n"):
+		var t := line.strip_edges()
+		if t.begins_with("---") and t.contains("Error"):
+			inside = true
+			continue
+		if inside and t.begins_with("---"):
+			break
+		if inside and t != "":
+			lines.append(t)
+	return "\n".join(lines)
 
 
 ## Factorio's map preview (--generate-map-preview) for these settings: a PNG of `size` pixels

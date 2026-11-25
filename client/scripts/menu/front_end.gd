@@ -39,6 +39,8 @@ const SettingsWindow := preload("res://scripts/menu/settings_window.gd")
 const Saves := preload("res://scripts/menu/saves.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
 const BugReport := preload("res://scripts/menu/bug_report.gd")
+const UpdateCheck := preload("res://scripts/menu/update_check.gd")
+const Switches := preload("res://scripts/switches.gd")
 const ServerLauncher := preload("res://scripts/menu/server_launcher.gd")
 const MenuBackground := preload("res://scripts/menu/menu_background.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
@@ -93,6 +95,9 @@ var remote_rcon: Rcon = null
 var _root := Control.new()
 var _page: Control = null
 var _overlays: Array[Control] = []
+var _update_check: Node  # update_check.gd, made once the menu opens
+var _update_button: Button
+var _update_popup: Control
 var _background: Node3D = null
 var _sfx: Node = null
 var _progress: Dictionary = {}  # "root", "label", "bar", "cancel" while a progress window shows
@@ -105,6 +110,12 @@ var _backdrop_entry := {}
 var _backdrop_button_check := 0.0
 var _settings: Control = null
 var _connect_started := 0
+## The connect wait counts only time the client ran (each frame's gap capped at CONNECT_STEP_MSEC): a
+## client stuck for seconds (a first start compiling shaders, a heavy world build) doesn't use up
+## CONNECT_TIMEOUT_MSEC while the bridge's answer waits in the socket, and the launched server stays up.
+const CONNECT_STEP_MSEC := 250
+var _connect_waited := 0
+var _connect_last := 0
 var _ready_since := 0
 var _saves: Array = []
 ## The folder the load screen shows: {} for the top (every root), else {"source", "dir", "root"}.
@@ -157,7 +168,10 @@ func _ready() -> void:
 func open_menu() -> void:
 	state = State.MENU
 	_show_background(true)
+	_start_update_check()
 	_show_main_menu()
+	if _update_check != null:
+		_update_check.start_auto()
 	var page := Settings.arg_value("--menu=")
 	match page.get_slice(":", 0):
 		"worlds":
@@ -465,6 +479,8 @@ func _show_main_menu(sub := "") -> void:
 	version.offset_bottom = -Kit.px(8)
 	version.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	page.add_child(version)
+	if sub == "" and UpdateCheck.enabled():
+		_update_check_button(page)
 	var credits := Label.new()
 	credits.theme_type_variation = "FVersionLabel"
 	credits.add_theme_font_size_override("font_size", Kit.px(13))
@@ -1063,6 +1079,10 @@ func _record_backdrop() -> void:
 	var id := using if BackdropList.overwrite and BackdropList.valid_id(using) else BackdropList.new_id(now)
 	var called := BackdropList.default_name(save, now)
 	var info := {"save": save, "name": called, "puppet": int(avatar.unit) if avatar != null else 0}
+	# On a space platform: the menu draws space behind it, with the planet it is stopped at (menu_background.gd).
+	if bool(main.get("_space")):
+		info["space"] = true
+		info["planet"] = str(main.get("_sky_planet")).strip_edges()
 	if not rec.done.is_connected(_on_backdrop_done):
 		rec.done.connect(_on_backdrop_done)
 		rec.failed.connect(_on_backdrop_failed)
@@ -1366,6 +1386,7 @@ func _show_settings_page(tab: String, list: Control, close_all: Callable) -> voi
 	window.in_game = state == State.PLAYING
 	window.start_tab = tab
 	window.page_mode = true
+	window.addons = main.get("addons") if main != null else null
 	if state == State.PLAYING and session == "launched":
 		window.rcon = launcher.rcon
 	MenuKit.overlay_center(o).add_child(window)
@@ -1396,6 +1417,90 @@ func _report_bug() -> void:
 	_show_confirm("Report a bug",
 		"Zenith packs its recent logs (and the server's) into one zip, then opens GitHub's bug report page in your browser and the folder with the zip. Drag the zip into the report. A GitHub account is needed to post it. The logs may show your user name in file paths.",
 		"Open", func() -> void: BugReport.open())
+
+
+## "A new version is available" (update_check.gd). The "Check for updates" button (bottom left of the main
+## menu) asks GitHub when clicked; "Auto check on open" (off by default) asks when the menu opens.
+func _start_update_check() -> void:
+	Settings.load_settings()
+	if _update_check != null or not UpdateCheck.enabled():
+		return
+	if Settings.path != Settings.PATH and Switches.value("--update-check") != "test":
+		return  # a test's own settings file
+	_update_check = UpdateCheck.new()
+	_update_check.name = "UpdateCheck"
+	add_child(_update_check)
+	_update_check.done.connect(_on_update_done)
+
+
+func _update_check_button(page: Control) -> void:
+	if _update_check == null:
+		return
+	var b := MenuKit.button("Checking..." if _update_check.busy else "Check for updates")
+	b.name = "UpdateButton"
+	b.disabled = _update_check.busy
+	b.custom_minimum_size = Kit.pxv(150, 28)
+	b.anchor_top = 1.0
+	b.anchor_bottom = 1.0
+	b.offset_left = Kit.px(12)
+	b.offset_top = -Kit.px(70)  # above the version line
+	b.offset_bottom = -Kit.px(40)
+	b.offset_right = Kit.px(12) + Kit.px(150)
+	page.add_child(b)
+	_update_button = b
+	b.pressed.connect(func() -> void:
+		Sfx.play_ui("gui-click")
+		b.text = "Checking..."
+		b.disabled = true
+		_update_check.check_now())
+
+
+func _on_update_done(kind: String, version: String, current: String, url: String, manual: bool) -> void:
+	if is_instance_valid(_update_button):
+		_update_button.text = "Check for updates"
+		_update_button.disabled = false
+	if state != State.MENU:
+		return
+	_show_update_popup(kind, version, current, url, manual)
+
+
+func _show_update_popup(kind: String, version: String, current: String, url: String, manual: bool) -> void:
+	if is_instance_valid(_update_popup):
+		return  # one at a time
+	var o := MenuKit.overlay(0.35)
+	o.name = "UpdatePopup"
+	_update_popup = o
+	var title := "New version available" if kind == "newer" else "Check for updates"
+	var parts := MenuKit.window(title)
+	MenuKit.overlay_center(o).add_child(parts[0])
+	var box: VBoxContainer = parts[1]
+	var text := "Zenith %s is available. You have %s." % [version, current]
+	if kind == "latest":
+		text = "You have the latest version (%s)." % current
+	elif kind == "failed":
+		text = "Couldn't check for updates (no connection?)."
+	box.add_child(MenuKit.paragraph(text, 420))
+	var auto := MenuKit.checkbox("Auto check on open", UpdateCheck.auto_on())
+	auto.tooltip_text = "Asks GitHub's public release page when the main menu opens, at most once in 6 hours, and only says something if a newer version exists. Sends nothing about you. Off by default."
+	auto.toggled.connect(func(on: bool) -> void: Settings.set_value("interface", "update_check", on))
+	box.add_child(auto)
+	var offer := kind == "newer"
+	var row: Array = MenuKit.dialog_buttons("Close" if (manual or not offer) else "Dismiss", "Download" if offer else "")
+	if offer and not manual:
+		var never := MenuKit.button("Don't show again")
+		row[0].add_child(never)
+		row[0].move_child(never, 1)
+		_on(never, func() -> void:
+			UpdateCheck.skip(version)
+			_pop_overlay())
+	box.add_child(row[0])
+	# Esc and Close/Dismiss close it; Download opens the release's page.
+	_on(row[1], _pop_overlay, "gui-back")
+	if offer:
+		_on(row[2], func() -> void:
+			_pop_overlay()
+			OS.shell_open(UpdateCheck.safe_url(url)))
+	_push_overlay(o)
 
 
 func _show_confirm(title: String, text: String, confirm_text: String, on_confirm: Callable, danger := false) -> void:
@@ -1710,7 +1815,12 @@ func _enter_game(host: String, port: int, listen: int, title: String) -> void:
 	_show_progress(title, ("Connecting to the relay at %s…" if Bridge.via_relay else "Connecting to the bridge at %s…") % session_address, 0.8, true)
 	state = State.CONNECTING
 	_connect_started = Time.get_ticks_msec()
+	_connect_waited = 0
+	_connect_last = _connect_started
 	_ready_since = 0
+	var freeze := Settings.arg_value("--connect-freeze=")  # test: the main thread stuck this many seconds while connecting
+	if freeze != "":
+		OS.delay_msec(int(float(freeze) * 1000.0))
 	if Bridge.via_relay:
 		print("menu: connecting to %s through its relay (TCP)" % session_address)
 	else:
@@ -1731,13 +1841,16 @@ func _update_connecting() -> void:
 			return
 		if relay == "connected":
 			_set_progress("Connected to the relay, waiting for the bridge…", 0.8)
-		if Time.get_ticks_msec() - _connect_started > CONNECT_TIMEOUT_MSEC:
+		var now := Time.get_ticks_msec()
+		_connect_waited += mini(now - _connect_last, CONNECT_STEP_MSEC)
+		_connect_last = now
+		if _connect_waited > CONNECT_TIMEOUT_MSEC:
 			if relay == "connected":
 				_fail_connect("The relay at %s answers, but no bridge behind it.\nIs Factorio running on that PC with --enable-lua-udp and the factorio-3d-bridge mod, and the relay's --bridge-port the same port?" % session_address)
 			elif Bridge.via_relay:
 				_fail_connect("No relay answers at %s (%s).\nIs python3 server/relay.py running on that PC, its TCP port open in the firewall, and this PC's address allowed (--allow; the default is the local network)?" % [session_address, relay])
 			else:
-				_fail_connect("No answer from the bridge at %s.\nIs Factorio running with --enable-lua-udp %d and the factorio-3d-bridge mod enabled?" % [session_address, Bridge.factorio_port])
+				_fail_connect("No answer from the bridge at %s.\nIs Factorio running with --enable-lua-udp %d and the factorio-3d-bridge mod enabled?\nOn a dedicated server with nobody connected, also check that server-settings.json has \"auto_pause\": false: a paused game runs no ticks, so the bridge never reads the hello." % [session_address, Bridge.factorio_port])
 		return
 	if not Bridge.world_ready:
 		_set_progress("Receiving prototypes…", 0.85)
@@ -1846,6 +1959,10 @@ func _quit(save: bool) -> void:
 		await launcher.stop(save)
 	Bridge.disconnect_from()
 	ExitGuard.arm()
+	# The renderer on its own thread: its queue drained (a frame drawn) before Godot stops it, so nothing of ours
+	# is left waiting on it; ExitGuard ends the program if even that sticks.
+	if int(ProjectSettings.get_setting("rendering/driver/threads/thread_model", 1)) == 2 and is_inside_tree():
+		await RenderingServer.frame_post_draw
 	get_tree().quit()
 
 

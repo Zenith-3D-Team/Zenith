@@ -13,6 +13,8 @@ extends RefCounted
 ## gets MIN_SLICE, so everything keeps draining. With `shared` off each system gets its own slice
 ## as before (and the numbers are still recorded, for --stutter-probe).
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## [priority (lower first), the system's own slice in µs (its old constant, and its most from the
 ## pool), its floor: what it gets whenever it asks, pool or deadline (the near work always moves:
 ## the old code did at least one message, one build, one chunk freed a frame)].
@@ -22,17 +24,22 @@ const SYSTEMS := {
 	&"terrain": [1, 3000, 500],  # world.gd: finished terrain meshes put in (holes in the ground)
 	&"blueprint": [1, 3000, 1000],  # blueprint_preview.gd: a held blueprint laid out and checked at the cursor
 	&"build": [2, 6000, 1500],  # world.gd: chunks' buildings built, nearest first
+	&"hydrate": [2, 2500, 500],  # world.gd: chunks replayed from the disk cache, a step at a time (--optimistic-slice)
 	&"models": [3, 4000, 500],  # model_library.gd: models made on workers finished here
-	&"unload": [4, 1500, 300],  # world.gd: unloaded chunks taken apart
+	&"unload": [4, 2500, 800],  # world.gd: unloaded chunks taken apart
 	&"shadows": [5, 1000, 300],  # world.gd: chunks' shadow tiers set
-	&"lods": [5, 1500, 300],  # world.gd: chunks' levels of detail looked at, band by band
+	&"lods": [5, 2000, 600],  # world.gd: chunks' levels of detail looked at, band by band
+	&"belt_lods": [5, 800, 0],  # belt_lods.gd: belt stand-ins checked across tracked chunks
 	&"pick": [5, 1500, 0],  # world.gd: the index of what is under the mouse
 	&"decoratives": [6, 3000, 0],  # decoratives.gd: clutter built on workers put in
+	&"cliff_wall": [6, 1500, 0],  # cliff_wall.gd: chunks' generated cliff walls put in (--cliff-wall=on)
 	&"lanes": [6, 2000, 0],  # belt_lanes.gd: far belt icons put in
 	&"wires": [7, 1500, 0],  # wires.gd: chunks' wires drawn again
 	&"pipelines": [6, 2000, 300],  # pipeline_marks.gd: fluid pipelines found for their visualization (N9)
+	&"far_decide": [7, 1000, 0],  # far_chunks.gd: annulus far/coarse visibility diff & slice
 	&"far_collect": [8, 1000, 0],  # far_chunks.gd: far chunks' entities gathered for merging
 	&"far_install": [8, 1500, 0],  # far_chunks.gd: finished merges put in
+	&"lod_install": [8, 1200, 0],  # distant_horizon.gd: finished LOD section meshes put in
 	&"anim_migrate": [9, 300, 0],  # anim.gd: groups moved onto the newer clock
 	&"mover_migrate": [9, 300, 0],  # mover_records.gd: the same for movers' records
 }
@@ -66,12 +73,43 @@ static var shared := true
 ## belt job's results don't wait in the pool at all (bridge.gd --belt-messages-first; belt_items.gd).
 static var belts_first := true
 const BELTS_FIRST := {&"lanes": [0, 2000, 500]}
+## --far-priority=legacy: keep uncovered far-chunk merging at priority 8 with a 0 floor (can starve behind terrain/build).
+static var far_priority_boost := not Switches.has("--far-priority=legacy")
+## Set by far_chunks.gd while uncovered far chunks (no full MultiMeshes and no merged mesh yet) await collect/install.
+static var far_urgent := false
+const FAR_URGENT := [2, 2000, 600]
+## --budget-hard-cap=off: allow lower-priority systems to keep stacking guaranteed floors past the frame pool ceiling.
+static var hard_cap := Switches.on("--budget-hard-cap")
+## P4 (owner: "it takes like 5 seconds after looking away from a dense area to gain FPS"): the systems whose work
+## takes drawing away (levels of detail, belt stand-ins, shadow tiers, far merging's decide pass, gathering and
+## putting in) get these floors whenever they have work waiting, past the pool's hard cap and the frame's deadline.
+## In a frame already over TARGET_USEC (first person over a busy base: 40-50 ms) the deadline left them nothing and
+## the hard cap kept their floors out, so each had one MIN_SLICE about every STARVE_FRAMES frames: after a run, 348
+## chunks' levels of detail and 275 far chunks waited 10 s and more, drawn in full meanwhile (5,800 draw calls
+## instead of 2,400). At most REDUCE_TOTAL µs a frame together (a floor times the grant's `scale`). `--unload-fast=off`: as before.
+static var reduce_floors := Switches.on("--unload-fast")
+const REDUCERS := {&"lods": 600, &"belt_lods": 300, &"shadows": 300, &"far_decide": 400, &"far_collect": 400, &"far_install": 400}
+const REDUCE_TOTAL := 2500
+static var _reduce_used := 0
+static var _starve_granted_frame := -1
+## Spikes part B (R&D run-spikes, step 6). `--budget-spent=off`: grants don't take off the frame's other scripts'
+## time already spent past their usual share (_other_over).
+static var spent_aware := Switches.on("--budget-spent")
+## `--budget-predict=off`: slices check only the clock between items, not the next item's typical cost (item_est).
+static var predict := Switches.on("--budget-predict")
+## How fast an item's typical cost falls back after a slow one (note_item).
+const ITEM_EMA := 0.1
+static var _item_ema := {}  # "system" or "system:kind" -> µs
+## For tests: the frame's other scripts' time so far, instead of the clock's.
+static var test_spent_other_usec := -1
 
 
 ## A system's [priority, slice, floor]: SYSTEMS', or with belts_first the belts' own.
 static func _sys(system: StringName) -> Array:
 	if belts_first and BELTS_FIRST.has(system):
 		return BELTS_FIRST[system]
+	if far_priority_boost and far_urgent and (system == &"far_collect" or system == &"far_install"):
+		return FAR_URGENT
 	return SYSTEMS[system]
 
 ## A screenshot settling (addon_host.gd): the interface is hidden and nobody plays meanwhile, so the
@@ -118,7 +156,7 @@ static var test_other_usec := -1
 ## second held the pool at POOL_MIN, and the renderer counted twice beside RESERVE_USEC. On the
 ## owner's base the pool was 3.000 ms in every one of 7,162 frames (client-cpu.md 5).
 ## `--frame-budget-measure=godot` measures it from TIME_PROCESS again.
-static var measure_frame := not OS.get_cmdline_user_args().has("--frame-budget-measure=godot")
+static var measure_frame := not Switches.has("--frame-budget-measure=godot")
 static var _end_usec := 0
 static var _end_frame := -1
 ## The last frame's other scripts as measured, µs (for probes; -1 before any).
@@ -133,11 +171,13 @@ static func frame_end() -> void:
 
 static func _check_arg() -> void:
 	_arg_checked = true
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--frame-budget="):
 			shared = arg.get_slice("=", 1) != "separate"
 		elif arg.begins_with("--frame-budget-belts="):
 			belts_first = arg.get_slice("=", 1) != "off"
+		elif arg.begins_with("--budget-hard-cap="):
+			hard_cap = arg.get_slice("=", 1) != "off"
 
 
 ## Starts a new frame's books when the frame changed (the first system to ask in a frame).
@@ -171,6 +211,7 @@ static func _roll() -> void:
 	pool = clampi(int(target - RESERVE_USEC - _other_ema), POOL_MIN, (POOL_MAX if busy else POOL_IDLE) * (BOOST if boost else 1))
 	_last_frame_used = used_total
 	used_total = 0
+	_reduce_used = 0
 	used.clear()
 	granted.clear()
 
@@ -204,15 +245,41 @@ static func grant(system: StringName, scale := 1, behind := false) -> int:
 	var left := pool - used_total - reserve
 	if not test_no_deadline:
 		left = mini(left, _frame_start + _target() - RESERVE_USEC - Time.get_ticks_usec() - reserve)
+	if spent_aware:
+		left -= _other_over()
 	var g := mini(left, own)
+	var is_starved := false
 	if g < MIN_SLICE:
 		g = 0
 		if int(queued.get(system, 0)) > 0:
 			var n := int(_starved.get(system, 0)) + 1
 			_starved[system] = n
 			if n >= STARVE_FRAMES:
+				is_starved = true
 				g = MIN_SLICE
-	g = maxi(g, int(_sys(system)[2]) * scale)
+	var reducer := reduce_floors and REDUCERS.has(system) and int(queued.get(system, 0)) > 0 and _reduce_used < REDUCE_TOTAL
+	if hard_cap and not behind and prio > 4 and system != &"pipelines":
+		var cap_left := maxi(pool - used_total, 0)
+		if is_starved and g >= MIN_SLICE:
+			if _starve_granted_frame == _frame or used_total >= pool + MIN_SLICE:
+				g = 0
+			else:
+				_starve_granted_frame = _frame
+		else:
+			var fl := mini(int(_sys(system)[2]) * scale, cap_left)
+			if fl >= MIN_SLICE:
+				g = maxi(g, fl)
+			if g > cap_left:
+				g = cap_left if cap_left >= MIN_SLICE else 0
+	else:
+		g = maxi(g, int(_sys(system)[2]) * scale)
+	if reducer:
+		# Never less than the old floors: raised after them to its floor whatever the pool and the deadline
+		# say (REDUCERS), within REDUCE_TOTAL for them all (only what the raise added counts).
+		var rf := mini(int(REDUCERS[system]) * scale, REDUCE_TOTAL - _reduce_used)
+		var add := maxi(rf - g, 0)
+		g += add
+		_reduce_used += add
 	if behind:
 		var slice := int(_sys(system)[1]) * (BOOST if boost else 1)
 		if g < slice:
@@ -222,6 +289,52 @@ static func grant(system: StringName, scale := 1, behind := false) -> int:
 		_starved.erase(system)
 	granted[system] = maxi(int(granted.get(system, 0)), g)
 	return g
+
+
+## The frame's unbudgeted scripts (everything since the first ask that wasn't sliced work) past what the pool was
+## sized for (their smoothed time a whole frame, _other_ema): a frame whose other scripts already ran long (a burst of
+## messages' side effects, the hover panel, inserters) has that much less for the sliced work, whatever the pool's
+## clamp (POOL_MAX kept 6 ms for them while the other scripts already took 10, so the frame was their sum: 20-30 ms).
+## The floors and the reducing systems' raise (REDUCERS) are applied after it, so they stay.
+## `--budget-spent=off`: as before (only the pool and the frame's deadline).
+static func _other_over() -> int:
+	if test_spent_other_usec < 0 and (test_no_deadline or test_other_usec >= 0):
+		return 0  # the UI test's frames: no clock
+	var spent_other := test_spent_other_usec if test_spent_other_usec >= 0 else Time.get_ticks_usec() - _frame_start - used_total
+	return maxi(spent_other - int(_other_ema), 0)
+
+
+## Before another item of a sliced system's queue: what one of them typically costs (a smoothed cost of the last
+## ones, note_item()), for the slice's clock check, so the slice stops before an item that would take it past its
+## grant instead of after (the slices checked the clock only between items: belt lanes' chunks +3.3 ms past theirs,
+## LOD installs +4.5, wires 58 times a minute +1.4, messages up to +7.1, R&D run-spikes). 0 with `--budget-predict=off`
+## (the clock alone, as before). `kind`: a kind of item within the system (a message type), "" for all.
+static func item_est(system: StringName, kind := "") -> int:
+	if not predict:
+		return 0
+	return int(_item_ema.get(_item_key(system, kind), 0.0))
+
+
+## An item of `system` (of `kind`) took `usec` µs.
+static func note_item(system: StringName, usec: int, kind := "") -> void:
+	if not predict:
+		return
+	var k := _item_key(system, kind)
+	var was := float(_item_ema.get(k, -1.0))
+	# Rises at once halfway to a slow item, falls slowly: one big chunk's install is warning enough.
+	_item_ema[k] = float(usec) if was < 0.0 else (lerpf(was, float(usec), 0.5) if usec > was else lerpf(was, float(usec), ITEM_EMA))
+
+
+## Whether a slice that began at `start` with `allow` µs and has done `done` items may start another of `est` µs:
+## at least one item a frame (the floor's progress), then only while it fits.
+static func fits(start: int, allow: int, done: int, est: int) -> bool:
+	if done <= 0:
+		return true
+	return Time.get_ticks_usec() - start + est <= allow
+
+
+static func _item_key(system: StringName, kind: String) -> String:
+	return String(system) if kind == "" else "%s:%s" % [system, kind]
 
 
 ## The frame the sliced work aims for: TARGET_USEC, an FPS cap's under 60, or BOOST_TARGET_USEC.
@@ -265,6 +378,9 @@ static func snapshot() -> Dictionary:
 ## For tests: everything back to its start.
 static func reset() -> void:
 	_frame = -1
+	_starve_granted_frame = -1
+	_reduce_used = 0
+	far_urgent = false
 	used.clear()
 	granted.clear()
 	queued.clear()
@@ -275,6 +391,8 @@ static func reset() -> void:
 	used_total = 0
 	_last_frame_used = 0
 	_other_ema = 6000.0
+	_item_ema.clear()
+	test_spent_other_usec = -1
 	_end_frame = -1
 	other_usec = -1
 	pool = POOL_MAX

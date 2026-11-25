@@ -27,6 +27,7 @@ signal _played(kind: String, info: Dictionary)
 
 var _api
 var _listening := false
+var _loops: Array[int] = []
 
 
 func _init(_host, api) -> void:
@@ -67,6 +68,52 @@ func play(sound: Variant, options := {}) -> bool:
 func preload_sounds(sounds: Variant) -> void:
 	for f in _files(sounds):
 		SoundBank.stream_soon(f)
+
+
+## (1.8) Starts a looping sound (a path in the add-on's folder, a Factorio path, or an
+## AudioStream). Options: `at` (Vector3; absent: non-positional), `bus` ("effects", "ambient"...),
+## `volume` (0 to 1), `pitch` (0.25 to 4), `reach`, `fade_in` (seconds). Returns a positive handle,
+## or 0 on failure / voice cap.
+func loop(sound: Variant, options := {}) -> int:
+	var sfx = Sfx.instance
+	if sfx == null or not is_instance_valid(sfx):
+		return 0
+	var at: Variant = options.get("at")
+	if at != null and not (at is Vector3):
+		push_warning("[%s] api.sound.loop: `at` must be a Vector3" % _api.id)
+		return 0
+	var bus := _bus(str(options.get("bus", "effects")))
+	var loud := clampf(float(options.get("volume", 1.0)), 0.0, 1.0)
+	var pitch := clampf(float(options.get("pitch", 1.0)), 0.25, 4.0)
+	var reach := maxf(float(options.get("reach", 1.0)), 0.05)
+	var fade_in := maxf(float(options.get("fade_in", 0.35)), 0.02)
+	var what: Variant = sound
+	if not (sound is AudioStream):
+		var files := _files(sound)
+		if files.is_empty():
+			return 0
+		what = files[randi() % files.size()]
+	var handle: int = int(sfx.start_addon_loop(str(_api.id), what, at, loud, pitch, reach, bus, fade_in))
+	if handle > 0:
+		_loops.append(handle)
+	return handle
+
+
+## (1.8) Updates an active loop's `volume` (0 to 1), `pitch` (0.25 to 4), `reach`, or `at` (Vector3).
+func update_loop(handle: int, options := {}) -> bool:
+	var sfx = Sfx.instance
+	if sfx == null or not is_instance_valid(sfx) or handle <= 0:
+		return false
+	return bool(sfx.update_addon_loop(str(_api.id), handle, options))
+
+
+## (1.8) Fades out and stops a loop started by loop() (0 stops immediately).
+func stop_loop(handle: int, fade_out := 0.35) -> bool:
+	_loops.erase(handle)
+	var sfx = Sfx.instance
+	if sfx == null or not is_instance_valid(sfx) or handle <= 0:
+		return false
+	return bool(sfx.stop_addon_loop(str(_api.id), handle, fade_out))
 
 
 ## Zenith plays these (as play() takes them, one or an Array; a random one each time) where it would
@@ -112,12 +159,15 @@ func volume(bus: String) -> float:
 	return float(FxSettings.volumes[bus]) if bool(FxSettings.enabled.get(bus, true)) else 0.0
 
 
-## The add-on stopped: its replaces and mutes go, its files are forgotten.
+## The add-on stopped: its replaces, mutes and loops go, its files are forgotten.
 func _release() -> void:
 	Sfx.pop_kinds(_api.id)
 	Sfx.listeners.erase(self)
 	_listening = false
 	Sfx.refresh_hearing()
+	if Sfx.instance != null and is_instance_valid(Sfx.instance):
+		Sfx.instance.stop_addon_loops(str(_api.id))
+	_loops.clear()
 	SoundBank.forget_files("addon:%s/" % _api.id)
 
 

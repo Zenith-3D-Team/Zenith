@@ -3,7 +3,7 @@
 importer="scene"
 importer_version=1
 type="PackedScene"
-uid="uid://8rupmh2wpl4a"
+uid="uid://cl1vesc18n0o3"
 path="res://.godot/imported/cliff-sides.glb-039554eb46fb386a7f730d6df9d8e34b.scn"
 
 [deps]
@@ -41,5 +41,5 @@ materials/extract_format=0
 materials/extract_path=""
 _subresources={}
 gltf/naming_version=2
-gltf/embedded_image_handling=1
+gltf/embedded_image_handling=3
 gltf/texture_map_mode=1

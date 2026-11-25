@@ -74,6 +74,38 @@ func heard(k: float, period := 0.0) -> void:
 		_anchor_t = now
 
 
+## Updates newest tick / rate without clobbering `gap` or `_gap_goal` (used by `rb` messages whose
+## 20-tick heartbeat must not inflate `mv` lag on cars, trains and biters).
+func tick_heard(k: float) -> void:
+	if tick < 0.0:
+		heard(k, 2.0)
+		return
+	var now := _now
+	if k <= newest:
+		return
+	newest = k
+	_newest_t = now
+	if absf(tick - k) > maxf(60.0, gap * 4.0):
+		if MomentHold.on:
+			_anchor_k = k
+			_anchor_t = now
+			return
+		tick = k
+		_anchor_k = k
+		_anchor_t = now
+		return
+	var span := now - _anchor_t
+	if span > 2.0:
+		_anchor_k = k
+		_anchor_t = now
+	elif span >= RATE_WINDOW:
+		var measured := (k - _anchor_k) / span
+		rate = clampf(measured if not _measured else lerpf(rate, measured, 0.3), RATE_MIN, RATE_MAX)
+		_measured = true
+		_anchor_k = k
+		_anchor_t = now
+
+
 ## The gap the clock's `gap` eases to (advance): what the messages' `p` asks for, else the gap itself.
 func gap_goal() -> float:
 	return _gap_goal if _gap_goal > 0.0 else gap

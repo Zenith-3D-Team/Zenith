@@ -20,6 +20,8 @@ const BackdropRecorder := preload("res://scripts/menu/backdrop_recorder.gd")
 const BackdropList := preload("res://scripts/menu/backdrop_list.gd")
 const Looks := preload("res://scripts/world/looks.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const StallWatchdog := preload("res://scripts/debug/stall_watchdog.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const DATA := "res://data/menu_world.json"
 const LIVE := ["mv", "bs", "ih", "gi"]
@@ -128,6 +130,8 @@ func _load() -> void:
 		if str(cam.get("proj", "")) == "orthogonal":
 			camera.projection = Camera3D.PROJECTION_ORTHOGONAL
 			camera.size = maxf(1.0, float(cam.get("size", camera.size)))
+	if bool(parsed.get("space", false)) and Settings.arg_value("--menu-backdrop-space=") != "off":
+		_show_space(str(parsed.get("planet", "")))
 	_movers.puppet_unit = int(parsed.get("puppet", 0))
 	var center: Array = parsed.get("center", [0, 0])
 	_center = Vector2(float(center[0]), float(center[1]))
@@ -171,6 +175,7 @@ func _factory_center(fallback: Vector2) -> Vector2:
 func _process(delta: float) -> void:
 	# Models are made on worker threads and a chunk leaves one out until it is ready; world.gd draws
 	# them again only while a game runs, so the menu does it here (its buildings were missing).
+	StallWatchdog.mark("menu backdrop: models")
 	var made := ModelLibrary.poll()
 	if PipelineWarm.poll():
 		made = true  # models whose pipelines were compiling (pipeline_warm.gd)
@@ -178,7 +183,9 @@ func _process(delta: float) -> void:
 		for c in world.chunks:
 			if world.chunks[c].waiting_models:
 				world._dirty[c] = true
+	StallWatchdog.mark("menu backdrop: chunks")
 	world._rebuild_dirty()
+	StallWatchdog.mark("menu backdrop: after chunks")
 	_time += delta
 	_clock += delta
 	while _next < _live.size() and float(_live[_next][0]) <= _clock:
@@ -249,7 +256,7 @@ func _build_environment() -> void:
 	env.ambient_light_color = Color(0.78, 0.78, 0.8)
 	env.ambient_light_energy = 0.6
 	env.tonemap_mode = Environment.TONE_MAPPER_FILMIC
-	var game_light := Looks.preview_light_switch(OS.get_cmdline_user_args())
+	var game_light := Looks.preview_light_switch(Switches.args())
 	Settings.apply_ssao(env)
 	_env = env
 	Settings.apply_environment(env)
@@ -278,6 +285,34 @@ func _build_environment() -> void:
 		add_child(_fill)
 		Looks.put_noon_fill(_fill, rig, camera.rotation.y)
 	Looks.put_idle_globals(rig)
+
+
+## A snapshot taken on a space platform: space behind it (the game's space_sky.gdshader) with the
+## planet it was stopped at as a coloured sphere below, instead of the planet's sky colour.
+## `--menu-backdrop-space=off`: the plain sky colour as before.
+const SPACE_SKY := preload("res://shaders/space_sky.gdshader")
+const SPACE_PLANET_COLORS := {
+	"nauvis": Color(0.26, 0.42, 0.52), "vulcanus": Color(0.62, 0.32, 0.16), "gleba": Color(0.42, 0.5, 0.28),
+	"fulgora": Color(0.5, 0.38, 0.42), "aquilo": Color(0.62, 0.76, 0.86),
+}
+var space := false
+
+
+func _show_space(planet: String) -> void:
+	if _env == null:
+		return
+	space = true
+	var mat := ShaderMaterial.new()
+	mat.shader = SPACE_SKY
+	if SPACE_PLANET_COLORS.has(planet):
+		var c: Color = SPACE_PLANET_COLORS[planet]
+		mat.set_shader_parameter("planet_on", 1.0)
+		mat.set_shader_parameter("planet_color", Vector3(c.r, c.g, c.b))
+		mat.set_shader_parameter("planet_radius", 0.9)
+	var sky := Sky.new()
+	sky.sky_material = mat
+	_env.background_mode = Environment.BG_SKY
+	_env.sky = sky
 
 
 ## Brightness, contrast and saturation change as they are dragged in Settings.

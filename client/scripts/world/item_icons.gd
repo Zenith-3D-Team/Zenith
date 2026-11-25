@@ -19,6 +19,7 @@ extends RefCounted
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const MODS := ["base", "space-age", "quality", "elevated-rails", "recycler"]
 const INDEX := "res://data/icons.json"
@@ -40,6 +41,9 @@ const COLORS := {
 	"logistic-science-pack": Color(0.3, 0.8, 0.3),
 }
 
+## The meta an icon's ImageTexture keeps its Image in (_texture); the same name item_models.gd caches pictures by.
+const CPU_IMAGE_META := &"f3d_cpu_image"
+static var keep_images := not Switches.has("--render-reads=old")
 static var data_dir := ""
 static var _searched := false
 static var _textures := {}  # name -> Texture2D, or null when there is no icon
@@ -52,7 +56,7 @@ static var _any := {}  # name -> true: load_any_uncached()'s icons for it are in
 
 
 static func configure_from_command_line() -> void:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--factorio-data="):
 			data_dir = arg.get_slice("=", 1)
 
@@ -223,7 +227,7 @@ static func pack_texture(kind: String, name: String) -> Texture2D:
 	if image == null:
 		return null
 	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
+	return _texture(image)
 
 
 ## The prototypes' icons (tools/icon_index.py): {kind: {name: [[file, icon_size, tint, scale,
@@ -295,7 +299,7 @@ static func _compose(layers: Array, size := COMPOSED) -> Texture2D:
 			if a > 0.0:
 				out.set_pixel(x, y, Color(minf(acc[i] / a, 1.0), minf(acc[i + 1] / a, 1.0), minf(acc[i + 2] / a, 1.0), a))
 	out.generate_mipmaps()
-	return ImageTexture.create_from_image(out)
+	return _texture(out)
 
 
 ## Layers without tints (technologies' bonus badges): blended whole, much faster than per pixel.
@@ -314,7 +318,18 @@ static func _compose_plain(layers: Array, size: int, ppu: float) -> Texture2D:
 		var at := Vector2i(roundi(size * 0.5 + shift.x * ppu - px * 0.5), roundi(size * 0.5 + shift.y * ppu - px * 0.5))
 		out.blend_rect(image, Rect2i(0, 0, px, px), at)
 	out.generate_mipmaps()
-	return ImageTexture.create_from_image(out)
+	return _texture(out)
+
+
+## An icon's texture keeping its picture on the CPU (CPU_IMAGE_META) when it is icon sized: ImageTexture.get_image()
+## reads it back from the renderer, which waits for the render thread when it runs on its own (Alt-mode's
+## icons on the card read every icon once). Big pictures (technologies' 256 px) aren't kept.
+## `--render-reads=old`: none kept.
+static func _texture(image: Image) -> ImageTexture:
+	var tex := ImageTexture.create_from_image(image)
+	if keep_images and tex != null and image.get_width() <= 128:
+		tex.set_meta(CPU_IMAGE_META, image)
+	return tex
 
 
 static func _scale_of(layer: Array, size := COMPOSED) -> float:
@@ -344,7 +359,7 @@ static func _load_icon(path: String, size := 0) -> Texture2D:
 	if image.get_width() != side or image.get_height() != side:
 		image = image.get_region(Rect2i(0, 0, side, side))
 	image.generate_mipmaps()
-	return ImageTexture.create_from_image(image)
+	return _texture(image)
 
 
 static func _find_data_dir() -> String:

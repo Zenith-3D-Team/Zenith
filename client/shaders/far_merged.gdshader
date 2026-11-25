@@ -11,6 +11,7 @@ shader_type spatial;
 render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_schlick_ggx;
 
 #include "res://shaders/ground_height.gdshaderinc"
+#include "res://shaders/lamp_light.gdshaderinc"
 
 uniform vec2 part_light = vec2(0.95, 0.6);
 uniform vec3 grime_color : source_color = vec3(0.13, 0.11, 0.09);
@@ -18,16 +19,20 @@ uniform float ground_grime = 0.3;
 uniform float ground_grime_height = 0.45;
 // On for the trees' and plants' own surface (far_chunks.gd nature_material): matte as near trees; buildings keep the old values.
 uniform bool nature = false;
+// On for the surface of models on the low ground (far_chunks.gd low_material: cliffs' rock), lifted as near.
+uniform bool ground_low = false;
 
-varying float world_y;
+varying vec3 world_pos;
 
 void vertex() {
-	world_y = (MODEL_MATRIX * vec4(VERTEX, 1.0)).y;
-	VERTEX = ground_lift(VERTEX, MODEL_MATRIX);
+	world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+	VERTEX = ground_lift_low(VERTEX, MODEL_MATRIX, ground_low);
 }
 
 global uniform float f3d_tree_matte;  // looks.gd: 0 = --tree-sheen=old
 global uniform float f3d_look_model_fill;  // looks.gd "model_fill", as factorio_material's (0 by default)
+global uniform vec4 f3d_weather_wet;
+global uniform vec4 f3d_weather_puddle;
 
 void fragment() {
 	vec3 col = clamp(COLOR.rgb, 0.0, 1.0);
@@ -35,7 +40,7 @@ void fragment() {
 	float packed = floor(clamp(COLOR.a, 0.0, 1.0) * 255.0 + 0.5);
 	float pc = mod(packed, 16.0) / 15.0;
 	float metal = floor(packed / 16.0) / 15.0;
-	float ground = 1.0 - smoothstep(0.0, ground_grime_height, world_y);
+	float ground = 1.0 - smoothstep(0.0, ground_grime_height, world_pos.y);
 	col = mix(col, grime_color, ground_grime * ground);
 	// Flat shading from the faces themselves: the merged meshes carry no normals (clustered
 	// vertices are shared by faces turned every way), and Factorio's buildings are boxy.
@@ -46,10 +51,17 @@ void fragment() {
 	float up = clamp((INV_VIEW_MATRIX * vec4(NORMAL, 0.0)).y, 0.0, 1.0);
 	ALBEDO = col * mix(1.0, mix(part_light.x, part_light.y, up), pc);
 	EMISSION = ALBEDO * f3d_look_model_fill * (0.35 + 0.65 * max(dot(NORMAL, VIEW), 0.0));
+	EMISSION += lamp_light_emission(ALBEDO, world_pos.xz, world_pos.y, up);
 	// Trunks and plants merge into a surface of their own (nature on): matte as the near trees
 	// (factorio_material.gdshaderinc); buildings keep their values.
 	float matte = nature ? f3d_tree_matte * (1.0 - pc) * (1.0 - metal) : 0.0;
 	ROUGHNESS = mix(mix(0.65, 0.85, pc), 1.0, matte);
 	METALLIC = metal;
 	SPECULAR = mix(mix(0.5, 0.2, pc), 0.05, matte);
+	if (f3d_weather_wet.y > 0.001) {
+		float wet = clamp(f3d_weather_wet.y, 0.0, 1.0);
+		ALBEDO *= 1.0 - clamp(f3d_weather_puddle.z, 0.0, 1.0) * 0.2 * wet;
+		ROUGHNESS = mix(ROUGHNESS, 0.26, wet * 0.7);
+		SPECULAR = max(SPECULAR, 0.45 * wet);
+	}
 }

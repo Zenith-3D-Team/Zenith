@@ -1,21 +1,18 @@
 extends MeshInstance3D
-## Factorio's selection and placement marks, drawn flat just above the ground and over everything
-## (no depth test, like Factorio's overlays on its sprites): the selection box's corner brackets
-## round the hovered entity or vehicle; the yellow arrows of inserters (where they pick up and
-## drop), of belts, splitters, undergrounds and loaders being placed (the way they run), of mining
-## drills (where they drop) and of fluid connections (in, out, or both ways); and the areas of
-## roboports (logistic orange, construction green) and mining drills; the lines between linked
-## roboports (H14, roboport_links.gd); electric poles' supply areas in Factorio's blue, one tint
-## where several meet (J4, pole_coverage.gd); and a held underground's connection and reach (J24,
-## underground_pairs.gd). A crafting machine's connections with its record's `fc` (L10: which fluid goes in or
-## out where, read by the bridge) get the fluid's icon at each, as Factorio draws it on a machine selected
-## (PipeConnectionDefinition::hide_connection_info); --fluid-icons=off draws the prototype's arrows alone, as before.
+## Factorio's selection and placement marks: brackets, arrows, fluid icons, roboport links and
+## underground tunnel marks draw flat over everything (no depth test, ground_overlay.gdshader),
+## while ground area showcases ("area" and "cover": mining drill radius, roboport logistic and
+## construction coverage, electric pole supply range, resource highlights, tile buildability rules,
+## spidertron waypoints) draw on the ground under 3D models (ground_mark.gdshader at
+## GroundHeight.AREA_PRIORITY), riding on hills as the terrain does.
 ##
 ## marks_for() works the marks out as plain data from the mod's `eprops` overlay (ui_model.eprops
 ## "x"), so the UI test can check them; show_marks() draws a list of marks.
 
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 const YELLOW := Color(1.0, 0.8, 0.1, 0.95)
 const SELECTION := Color(1.0, 0.86, 0.3, 0.95)
@@ -34,16 +31,34 @@ const SUPPLY := Color(55.0 / 255.0, 85.0 / 255.0, 217.0 / 255.0, 0.28)
 ## Arrows are this long and wide (tiles).
 const ARROW := Vector2(0.5, 0.42)
 const LIFT := 0.06
+## Ground area showcases sit just over the terrain (below ground items and 3D models), slightly
+## higher on curved Terrain Elevation hills, subdivided up to HILL_MAX_CELLS per side on hills.
+const AREA_LIFT := 0.02
+const AREA_HILL_LIFT := 0.04
+const HILL_MAX_CELLS := 32
 const BELT_TYPES := ["transport-belt", "underground-belt", "splitter", "lane-splitter", "loader", "loader-1x1", "linked-belt"]
 ## A fluid's icon at a connection (tiles across), on the connection's own tile just inside the machine's edge.
 const FLUID_ICON := 0.55
 ## L10: on unless --fluid-icons=off (docs/RUNNING.md).
-static var fluid_icons := not ("--fluid-icons=off" in OS.get_cmdline_user_args())
+static var fluid_icons := Switches.on("--fluid-icons")
 
 var _mesh := ImmediateMesh.new()
+## Ground-level area marks ("area" and "cover"), depth-tested under models at AREA_PRIORITY.
+var _areas := MeshInstance3D.new()
+var _areas_mesh := ImmediateMesh.new()
+var _last_area_marks: Array = []
+var _last_hills_ver := -2
 ## Pictures drawn flat (fluid icons): a pool of quads, one material a picture.
 var _icon_quads: Array[MeshInstance3D] = []
 var _icon_materials := {}
+
+
+func _init() -> void:
+	_areas.mesh = _areas_mesh
+	_areas.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_areas.material_override = GroundHeight.mark_material(Color.WHITE, true, GroundHeight.AREA_PRIORITY)
+	_areas.visible = false
+	add_child(_areas)
 
 
 func _ready() -> void:
@@ -55,7 +70,7 @@ func _ready() -> void:
 
 ## A Factorio vector (x east, y south) turned clockwise by a 16-way direction.
 static func turn(v: Vector2, dir: int) -> Vector2:
-	return v.rotated(float(dir) / 16.0 * TAU)
+	return v.rotated(-Wire.direction_yaw(dir))
 
 
 ## The unit vector a 16-way direction points along (north is (0, -1)).
@@ -254,41 +269,106 @@ static func _vec(v) -> Vector2:
 
 ## Draws these marks (replacing the last ones); an empty list hides them.
 func show_marks(marks: Array) -> void:
-	_mesh.clear_surfaces()
 	visible = not marks.is_empty()
 	_show_icons(marks)
 	if marks.is_empty():
+		_mesh.clear_surfaces()
+		_clear_areas()
 		return
-	var drawn := 0
-	_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+	var area_marks: Array = []
+	var top_marks: Array = []
 	for m: Dictionary in marks:
-		if str(m["k"]) != "icon":
-			drawn += 1
-		match str(m["k"]):
-			"area":
+		var kind := str(m["k"])
+		if kind == "area" or kind == "cover":
+			area_marks.append(m)
+		elif kind != "icon":
+			top_marks.append(m)
+	_mesh.clear_surfaces()
+	if not top_marks.is_empty():
+		_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+		for m: Dictionary in top_marks:
+			match str(m["k"]):
+				"brackets":
+					_brackets(m["at"], m["half"], float(m["yaw"]), m["c"])
+				"arrow":
+					_arrow(m["at"], m["dir"], bool(m["both"]), m["c"])
+				"line":
+					var a: Vector2 = m["a"]
+					var b: Vector2 = m["b"]
+					var side := (b - a).normalized().orthogonal() * float(m["w"]) * 0.5
+					_quad(a + side, b + side, b - side, a - side, m["c"])
+				"tunnel":
+					_tunnel(m["at"], m["dir"], m["c"], bool(m.get("arrow", true)))
+				"unbuilt":
+					_unbuilt(m["at"], m["dir"], m["c"], m["ca"], bool(m.get("arrow", true)))
+		_mesh.surface_end()
+	_show_areas(area_marks)
+
+
+func _clear_areas() -> void:
+	_areas_mesh.clear_surfaces()
+	_areas.visible = false
+	_last_area_marks = []
+	_last_hills_ver = -2
+
+
+func _show_areas(area_marks: Array) -> void:
+	if area_marks.is_empty():
+		_clear_areas()
+		return
+	var hills_on := GroundHeight.is_on()
+	var hills_ver := GroundHeight.version() if hills_on else -1
+	if hills_ver == _last_hills_ver and area_marks == _last_area_marks:
+		_areas.visible = _areas_mesh.get_surface_count() > 0
+		return
+	_areas_mesh.clear_surfaces()
+	var has_any := false
+	for m: Dictionary in area_marks:
+		var k := str(m["k"])
+		if k == "area":
+			if (m["rect"] as Rect2).has_area():
+				has_any = true
+				break
+		elif k == "cover":
+			for r: Rect2 in m["rects"]:
+				if r.has_area():
+					has_any = true
+					break
+			if has_any:
+				break
+	if has_any:
+		var lift := AREA_HILL_LIFT if hills_on else AREA_LIFT
+		_areas_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+		for m: Dictionary in area_marks:
+			var k := str(m["k"])
+			if k == "area":
 				var r: Rect2 = m["rect"]
-				_quad(r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y), m["fill"], LIFT * 0.5)
-				var w := clampf(r.size.x * 0.004, 0.06, 0.2)
-				_frame(r, w, m["edge"])
-			"cover":
-				for r: Rect2 in m["rects"]:
-					_quad(r.position, Vector2(r.end.x, r.position.y), r.end, Vector2(r.position.x, r.end.y), m["c"], LIFT * 0.5)
-			"brackets":
-				_brackets(m["at"], m["half"], float(m["yaw"]), m["c"])
-			"arrow":
-				_arrow(m["at"], m["dir"], bool(m["both"]), m["c"])
-			"line":
-				var a: Vector2 = m["a"]
-				var b: Vector2 = m["b"]
-				var side := (b - a).normalized().orthogonal() * float(m["w"]) * 0.5
-				_quad(a + side, b + side, b - side, a - side, m["c"])
-			"tunnel":
-				_tunnel(m["at"], m["dir"], m["c"], bool(m.get("arrow", true)))
-			"unbuilt":
-				_unbuilt(m["at"], m["dir"], m["c"], m["ca"], bool(m.get("arrow", true)))
-	if drawn == 0:  # (only pictures: a surface can't be empty)
-		_tri(Vector2.ZERO, Vector2.ZERO, Vector2.ZERO, Color(0, 0, 0, 0))
-	_mesh.surface_end()
+				if r.has_area():
+					var fill: Color = m["fill"]
+					var edge: Color = m["edge"]
+					_area_rect(r, fill, lift, hills_on)
+					var w := clampf(r.size.x * 0.004, 0.06, 0.2)
+					_area_frame(r, w, edge, lift, hills_on)
+			elif k == "cover":
+				var col: Color = m["c"]
+				var rects: Array = m["rects"]
+				for r: Rect2 in rects:
+					if r.has_area():
+						_area_rect(r, col, lift, hills_on)
+		_areas_mesh.surface_end()
+	_areas.visible = _areas_mesh.get_surface_count() > 0
+	_last_hills_ver = hills_ver
+	_last_area_marks = _copy_area_marks(area_marks)
+
+
+static func _copy_area_marks(marks: Array) -> Array:
+	var out: Array = []
+	for m: Dictionary in marks:
+		var copy := m.duplicate()
+		if copy.has("rects") and copy["rects"] is Array:
+			copy["rects"] = (copy["rects"] as Array).duplicate()
+		out.append(copy)
+	return out
 
 
 ## The marks' pictures on quads of their own (the mesh above has colours, no textures).
@@ -326,13 +406,36 @@ func _show_icons(marks: Array) -> void:
 		_icon_quads[j].visible = false
 
 
-func _frame(r: Rect2, w: float, c: Color) -> void:
-	var a := r.position
-	var b := r.end
-	_quad(a, Vector2(b.x, a.y), Vector2(b.x, a.y + w), Vector2(a.x, a.y + w), c)
-	_quad(Vector2(a.x, b.y - w), Vector2(b.x, b.y - w), b, Vector2(a.x, b.y), c)
-	_quad(a, Vector2(a.x + w, a.y), Vector2(a.x + w, b.y), Vector2(a.x, b.y), c)
-	_quad(Vector2(b.x - w, a.y), Vector2(b.x, a.y), b, Vector2(b.x - w, b.y), c)
+func _area_rect(r: Rect2, color: Color, lift: float, hills_on: bool) -> void:
+	if not r.has_area():
+		return
+	var nx := 1
+	var ny := 1
+	if hills_on:
+		var base := clampf(GroundHeight.tile_step(), 1.0, 2.0)
+		var step := maxf(base, maxf(r.size.x, r.size.y) / float(HILL_MAX_CELLS))
+		nx = clampi(int(ceilf(r.size.x / step)), 1, HILL_MAX_CELLS)
+		ny = clampi(int(ceilf(r.size.y / step)), 1, HILL_MAX_CELLS)
+	var dx := r.size.x / float(nx)
+	var dy := r.size.y / float(ny)
+	for iy in ny:
+		var y0 := r.position.y + dy * float(iy)
+		var y1 := r.end.y if iy == ny - 1 else r.position.y + dy * float(iy + 1)
+		for ix in nx:
+			var x0 := r.position.x + dx * float(ix)
+			var x1 := r.end.x if ix == nx - 1 else r.position.x + dx * float(ix + 1)
+			_quad_on(_areas_mesh, Vector2(x0, y0), Vector2(x1, y0), Vector2(x1, y1), Vector2(x0, y1), color, lift)
+
+
+func _area_frame(r: Rect2, w: float, color: Color, lift: float, hills_on: bool) -> void:
+	var bw := minf(w, minf(r.size.x, r.size.y) * 0.5)
+	if bw <= 0.0:
+		return
+	_area_rect(Rect2(r.position.x, r.position.y, r.size.x, bw), color, lift, hills_on)
+	_area_rect(Rect2(r.position.x, r.end.y - bw, r.size.x, bw), color, lift, hills_on)
+	if r.size.y > bw * 2.0:
+		_area_rect(Rect2(r.position.x, r.position.y + bw, bw, r.size.y - bw * 2.0), color, lift, hills_on)
+		_area_rect(Rect2(r.end.x - bw, r.position.y + bw, bw, r.size.y - bw * 2.0), color, lift, hills_on)
 
 
 ## Factorio's selection corners: an L in each corner, a third of the shorter side long at most.
@@ -426,11 +529,19 @@ func _unbuilt(at: Vector2, flow: Vector2, c: Color, arrow_c: Color, arrow: bool)
 
 
 func _tri(a: Vector2, b: Vector2, c: Vector2, color: Color, lift := LIFT) -> void:
-	for p in [a, b, c]:
-		_mesh.surface_set_color(color)
-		_mesh.surface_add_vertex(Vector3(p.x, lift, p.y))
+	_tri_on(_mesh, a, b, c, color, lift)
 
 
 func _quad(a: Vector2, b: Vector2, c: Vector2, d: Vector2, color: Color, lift := LIFT) -> void:
-	_tri(a, b, c, color, lift)
-	_tri(a, c, d, color, lift)
+	_quad_on(_mesh, a, b, c, d, color, lift)
+
+
+static func _tri_on(target: ImmediateMesh, a: Vector2, b: Vector2, c: Vector2, color: Color, lift: float) -> void:
+	for p in [a, b, c]:
+		target.surface_set_color(color)
+		target.surface_add_vertex(Vector3(p.x, lift, p.y))
+
+
+static func _quad_on(target: ImmediateMesh, a: Vector2, b: Vector2, c: Vector2, d: Vector2, color: Color, lift: float) -> void:
+	_tri_on(target, a, b, c, color, lift)
+	_tri_on(target, a, c, d, color, lift)

@@ -13,6 +13,7 @@ from mathutils import Vector
 import detail
 import kit
 from kit import Part, R, S, T, model
+import space_kit
 from vehicles import along_y, bogie, buffers, mirrored, own_materials
 
 # Colours picked against the sprites of the models below.
@@ -333,122 +334,342 @@ def artillery_turret():
 # ---------------------------------------------------------------------------------------------
 # Vehicles.
 
-def track(p, x, y0, y1, r=0.27, w=0.36, wheels=5):
-    """A track run along y at x: a dark belt round two end sprockets with road wheels between
-    and treads across its top and sides. Returns its moving parts: the treads on top
-    (`anim_tread`, which the client slides forward by the distance driven, one tread's spacing
-    round and round: Factorio's two-frame track animation) and the road wheels' hubs
-    (`anim_wheel_track`, rolling)."""
-    p.cyl((x, y0 + r, r), r, w, "steel_black", segs=14, axis="X", bevel=0.03)
-    p.cyl((x, y1 - r, r), r, w, "steel_black", segs=14, axis="X", bevel=0.03)
-    p.slab(x - w / 2, y0 + r, 0.02, x + w / 2, y1 - r, 2 * r, "steel_black", bevel=0.03)
-    n = int((y1 - y0) / 0.11)
-    tread = Part("anim_tread", pivot=(x, 0.0, 2 * r))
-    for k in range(n + 1):
-        y = y0 + 0.04 + (y1 - y0 - 0.08) * k / n
-        tread.box((x, y, 2 * r + 0.01), (w + 0.02, 0.05, 0.03), "rubber")
-    parts = [tread]
+# Closed-loop 3-circle caterpillar track contour in Blender (y_north, z_up) coordinates
+# (shared verbatim with client/scripts/world/vehicle_anim.gd).
+# C0 = rear drive sprocket, C1 = front-most road wheel, C2 = raised front idler.
+TANK_CIRCLES = ((-1.06, 0.34, 0.28), (0.82, 0.22, 0.16), (1.24, 0.39, 0.23))
+TANK_CLEATS = 32
+TANK_CLEAT_START_Y = 0.85  # Cleat #0 sits open on the horizontal top run (y = +0.85, z = 0.62).
+
+
+def _tank_track_segments():
+    """Precomputes the 6 C1-continuous segments (lines + CW circular arcs) starting at
+    (y=TANK_CLEAT_START_Y, z=0.62) going forward (+Y), down the front idler, back along
+    the bottom run, and up the rear sprocket."""
+    c0, c1, c2 = TANK_CIRCLES
+
+    def ext_tangent(a, b):
+        ay, az, ra = a
+        by, bz, rb = b
+        dy, dz = by - ay, bz - az
+        d = math.hypot(dy, dz)
+        ang = math.atan2(dz, dy) + math.acos((ra - rb) / d)
+        nx, nz = math.cos(ang), math.sin(ang)
+        return (ay + ra * nx, az + ra * nz), (by + rb * nx, bz + rb * nz), ang
+
+    top_a, top_b, ang_top = ext_tangent(c0, c2)
+    diag_a, diag_b, ang_diag = ext_tangent(c2, c1)
+    bot_a, bot_b, ang_bot = ext_tangent(c1, c0)
+    # Start on top straight at y = TANK_CLEAT_START_Y going forward (+Y) -> wrap CW loop.
+    segs = [
+        ("line", (TANK_CLEAT_START_Y, top_b[1]), top_b, ang_top),
+        ("arc", c2, ang_top, ang_diag),
+        ("line", diag_a, diag_b, ang_diag),
+        ("arc", c1, ang_diag, ang_bot - 2 * math.pi if ang_bot > ang_diag else ang_bot),
+        ("line", bot_a, bot_b, ang_bot),
+        ("arc", c0, ang_bot if ang_bot < ang_top else ang_bot - 2 * math.pi, ang_top - 2 * math.pi),
+        ("line", top_a, (TANK_CLEAT_START_Y, top_a[1]), ang_top),
+    ]
+    out = []
+    total = 0.0
+    for seg in segs:
+        if seg[0] == "line":
+            _, p0, p1, ang = seg
+            L = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+            out.append(("line", L, p0, p1, ang))
+        else:
+            _, (cy, cz, r), a0, a1 = seg
+            while a1 > a0:
+                a1 -= 2 * math.pi
+            L = r * (a0 - a1)
+            out.append(("arc", L, cy, cz, r, a0, a1))
+        total += L
+    return out, total
+
+
+_TANK_SEGS, _TANK_PERIM = _tank_track_segments()
+
+
+def tank_track_sample(s):
+    """(y, z, normal_angle_rad) along the CW track loop at arc length s (0.._TANK_PERIM)."""
+    s = s % _TANK_PERIM
+    for seg in _TANK_SEGS:
+        L = seg[1]
+        if s <= L or seg is _TANK_SEGS[-1]:
+            t = 0.0 if L <= 1e-8 else min(1.0, s / L)
+            if seg[0] == "line":
+                _, _, p0, p1, ang = seg
+                return p0[0] + (p1[0] - p0[0]) * t, p0[1] + (p1[1] - p0[1]) * t, ang
+            _, _, cy, cz, r, a0, a1 = seg
+            ang = a0 + (a1 - a0) * t
+            return cy + r * math.cos(ang), cz + r * math.sin(ang), ang
+        s -= L
+    return TANK_CLEAT_START_Y, 0.62, math.pi / 2
+
+
+def _track_wheel(part, wx, wy, wz, r, w, spokes=3, teeth=0):
+    """Symmetric circular track wheel centered on (wx, wy, wz) for zero-slip rolling."""
+    sx = 1 if wx > 0 else -1
+    part.cyl((wx, wy, wz), r, w, "steel_dark", segs=10, axis="X")
+    out_x = wx + sx * (w * 0.5 - 0.005)
+    part.cyl((out_x, wy, wz), r * 0.74, 0.025, "steel_black", segs=10, axis="X")
+    part.cyl((out_x + sx * 0.015, wy, wz), r * 0.44, 0.030, "rust_brown", segs=8, axis="X")
+    if teeth > 0 or r > 0.20:
+        part.cyl((out_x + sx * 0.028, wy, wz), r * 0.22, 0.032, "steel", segs=8, axis="X")
+    bar_count = 1 if spokes <= 3 else 2
+    for k in range(bar_count):
+        a = k * math.pi / bar_count
+        m = T(out_x + sx * 0.014, wy, wz) @ R("X", math.degrees(a))
+        part.box((0, 0, 0), (0.022, r * 1.36, 0.038), "steel", matrix=m)
+    if teeth > 0:
+        # 8 symmetric sprocket teeth (every 45°) keep bounding radius symmetric on X/Y/Z.
+        nt = min(teeth, 8)
+        for k in range(nt):
+            a = math.radians(k * 360.0 / nt)
+            ca, sa = math.cos(a), math.sin(a)
+            m = T(wx + sx * 0.01, wy + ca * (r - 0.005), wz + sa * (r - 0.005)) @ R("X", math.degrees(a) - 90.0)
+            part.box((0, 0, 0), (w * 0.94, 0.040, 0.032), "steel", matrix=m)
+
+
+def track_assembly(body, x, side_tag, w=0.36):
+    """One side of the tank's caterpillar tracks: solid dark core band in `body`, exterior
+    open bogie suspension frame in `body`, 7 true-circle wheels (`anim_wheel_track`), and
+    32 closed-loop cleats (`anim_tread_l` / `anim_tread_r`) around the 3-circle contour."""
     sx = 1 if x > 0 else -1
-    for k in range(wheels):
-        y = y0 + r + (y1 - y0 - 2 * r) * k / (wheels - 1)
-        hub = Part("anim_wheel_track", pivot=(x, y, r * 0.95))
-        hub.cyl((x + sx * (w / 2 + 0.01), y, r * 0.95), r * 0.62, 0.03, "rust_brown", segs=12, axis="X")
-        hub.cyl((x + sx * (w / 2 + 0.02), y, r * 0.95), r * 0.22, 0.03, "steel", segs=8, axis="X")
-        # A spoke, so the turning shows.
-        hub.slab(x + sx * (w / 2 + 0.02) - 0.012, y - 0.02, r * 0.95 - r * 0.55, x + sx * (w / 2 + 0.02) + 0.012, y + 0.02,
-                 r * 0.95 + r * 0.55, "steel_dark")
-        parts.append(hub)
-    return parts
+    # Inner track band polygon sampled around the 3-circle loop (inset slightly inside cleats).
+    core_pts = []
+    for k in range(28):
+        y, z, ang = tank_track_sample(_TANK_PERIM * k / 28)
+        core_pts.append((y - 0.005 * math.cos(ang), z - 0.005 * math.sin(ang)))
+    # CW in (y, z) -> reverse for CCW in side_prism seen from +X.
+    body.side_prism(list(reversed(core_pts)), x - w * 0.45, x + w * 0.45, "steel_black")
+
+    # Open exterior bogie suspension beam & swing-arm brackets outside the wheels.
+    bx = x + sx * (w * 0.5 + 0.055)
+    body.slab(bx - 0.035, -0.78, 0.17, bx + 0.035, 0.90, 0.25, "rust_brown", bevel=0.01)
+    body.beam((bx, 0.86, 0.22), (bx, 1.24, 0.39), 0.06, 0.06, "rust_dark", up=(sx, 0, 0))
+    body.beam((bx, -0.74, 0.22), (bx, -1.06, 0.34), 0.07, 0.07, "rust_dark", up=(sx, 0, 0))
+    body.cyl((bx, 1.24, 0.39), 0.08, 0.07, "steel_dark", segs=8, axis="X")
+    body.cyl((bx, -1.06, 0.34), 0.11, 0.08, "steel_dark", segs=8, axis="X")
+    road_ys = (-0.58, -0.23, 0.12, 0.47, 0.82)
+    for wy in road_ys:
+        body.slab(bx - 0.03, wy - 0.045, 0.20, bx + 0.03, wy + 0.045, 0.50, "steel_dark")
+        body.bolt((bx + sx * 0.035, wy, 0.22), "steel_light", radius=0.022, axis="X")
+
+    # True-circle rolling wheels (5 road wheels, 1 raised front idler, 1 toothed rear sprocket).
+    wheels = []
+    for wy in road_ys:
+        wpart = Part("anim_wheel_track", pivot=(x, wy, 0.22))
+        _track_wheel(wpart, x, wy, 0.22, 0.16, w * 0.82, spokes=3)
+        wheels.append(wpart)
+    idler = Part("anim_wheel_track", pivot=(x, 1.24, 0.39))
+    _track_wheel(idler, x, 1.24, 0.39, 0.215, w * 0.84, spokes=4)
+    wheels.append(idler)
+    sprocket = Part("anim_wheel_track", pivot=(x, -1.06, 0.34))
+    _track_wheel(sprocket, x, -1.06, 0.34, 0.26, w * 0.88, spokes=4, teeth=10)
+    wheels.append(sprocket)
+
+    # 32 closed-loop caterpillar cleats (`anim_tread_l` / `anim_tread_r`), Cleat #0 exposed at top.
+    tread = Part("anim_tread_" + side_tag, pivot=(x, 0.0, 0.62))
+    pad_prof = [(-0.064, 0.0), (0.064, 0.0), (0.052, 0.042), (-0.052, 0.042)]
+    for k in range(TANK_CLEATS):
+        y, z, ang = tank_track_sample(_TANK_PERIM * k / TANK_CLEATS)
+        # Local pad +Z aligns with outward track normal ang (ang - pi/2 rotation about X: local +Z -> (cos, sin) in (y, z)? Wait:
+        # In Blender R("X", deg): Y' = Y*cos - Z*sin, Z' = Y*sin + Z*cos!
+        # Setting local +Z along (cos(ang), sin(ang)) requires -sin(rot) = cos(ang), cos(rot) = sin(ang) => rot = ang - pi/2!
+        # Let's check top run ang = +pi/2 => rot = 0 deg -> local +Z = +Z world!
+        # Bottom run ang = -pi/2 => rot = -180 deg -> local +Z = -Z world!
+        m = T(x, y, z) @ R("X", math.degrees(ang) - 90.0)
+        tread.side_prism(pad_prof, -w * 0.52, w * 0.52, "rubber", matrix=m)
+        tread.box((0.0, 0.0, 0.051), (w * 0.96, 0.030, 0.018), "steel_dark", matrix=m)
+
+    return [tread] + wheels
 
 
 @model("tank")
 def tank():
-    """Factorio's tank, front north: two broad tracks, a rusty hull riding high on them with
-    fenders over the tracks, the engine at the front (ribbed cylinders behind a sloped glacis,
-    mudguard flaps hanging over the track ends), two cream fuel tanks in a cage at the back with
-    a perforated side plate. The turret (`anim_turret_head`) turns on its ring mid-hull: a
-    round ribbed drum under a rusty octagonal cap with a hatch, twin barrels north."""
+    """Factorio's tank, front north, built directly in true world proportions: two 3-circle
+    caterpillar track runs (`anim_tread_l`/`anim_tread_r` + 14 true-circle `anim_wheel_track`
+    wheels) in open bogie suspension frames; stepped rusty side fenders with a rear-west
+    perforated steel catwalk; a curved V-notched front bulldozer ram/plough framing recessed
+    glowing headlights (`anim_headlight`); a pale steel front engine deck with 4 curved exhaust
+    manifold pipes per side; a sloped riveted casemate with bolted steel side access doors and
+    rear-corner cylindrical drums; ONE horizontal east-west cream rear fuel tank with bolted
+    top hatch in a protective roll frame; and a ribbed cast-iron domed cupola turret
+    (`anim_turret_head`) with independent recoiling twin cannons (`anim_turret_barrel`) and
+    lower central coaxial MG/flamethrower barrel (`anim_turret_coax`)."""
     p = Part()
     running = []
-    for sx in (-1, 1):
-        running += track(p, sx * 0.72, -1.42, 1.38)
-    # Hull and fenders.
-    p.slab(-0.55, -1.38, 0.22, 0.55, 1.3, 0.78, "rust_dark", bevel=0.05)
-    p.slab(-0.94, -1.3, 0.62, 0.94, 1.2, 0.8, "rust_brown", bevel=0.04)
-    p.prism(octagon(0.72), 0.78, 0.98, "rust_dark", bevel=0.04, matrix=T(0, -0.05, 0))
-    # Front: engine with its ribbed cylinders, a sloped glacis.
-    p.slab(-0.55, 0.45, 0.78, 0.55, 1.05, 1.0, "steel_dark", bevel=0.04)
-    for k in range(4):
-        x = -0.36 + k * 0.24
-        p.cyl((x, 0.78, 1.1), 0.1, 0.28, "steel", segs=10, bevel=0.01)
-        for z in (1.02, 1.08, 1.14, 1.2):
-            p.cyl((x, 0.78, z), 0.125, 0.025, "steel_light", segs=10)
-    p.side_prism([(1.0, 0.3), (1.42, 0.38), (1.42, 0.62), (1.05, 0.98), (1.0, 0.98)], -0.6, 0.6, "rust_brown",
-                 bevel=0.03)
-    p.slab(-0.25, 1.2, 0.8, 0.25, 1.32, 0.95, "steel", bevel=0.02)
-    for sx in (-1, 1):
-        # Mudguards hanging over the front of the tracks.
-        p.beam((sx * 0.72, 1.3, 0.85), (sx * 0.78, 1.62, 0.42), 0.42, 0.04, "rust_brown", up=(0, 1, 1), bevel=0.01)
-        p.cyl((sx * 0.4, 1.36, 0.62), 0.07, 0.08, "steel_light", segs=8, axis="Y")
-        p.cyl((sx * 0.4, 1.4, 0.62), 0.05, 0.01, "glass", segs=8, axis="Y")
-    # Rear: two cream tanks in a cage.
-    for x in (-0.33, 0.33):
-        p.cyl((x, -0.95, 0.98), 0.27, 0.62, "tank_white", segs=14, axis="Y", bevel=0.06)
-        p.sphere((x, -1.26, 0.98), 0.27, "tank_white", segs=14, rings=6, scale=(1, 0.5, 1))
-        for y in (-1.15, -0.8):
-            p.cyl((x, y, 0.98), 0.285, 0.04, "steel_dark", segs=14, axis="Y")
-    for sx in (-1, 1):
-        p.beam((sx * 0.68, -1.4, 0.8), (sx * 0.68, -1.4, 1.3), 0.05, 0.05, "steel_dark")
-        p.beam((sx * 0.68, -0.6, 0.8), (sx * 0.68, -0.6, 1.3), 0.05, 0.05, "steel_dark")
-        p.beam((sx * 0.68, -1.4, 1.3), (sx * 0.68, -0.6, 1.3), 0.05, 0.05, "steel_dark")
-    p.beam((-0.68, -1.4, 1.3), (0.68, -1.4, 1.3), 0.05, 0.05, "steel_dark")
-    # Perforated plate on the west side.
-    p.slab(-1.0, -1.25, 0.42, -0.95, -0.3, 0.86, "steel_light", bevel=0.01)
-    for k in range(7):
-        for z in (0.5, 0.62, 0.74):
-            p.cyl((-1.005, -1.15 + k * 0.13, z), 0.025, 0.01, "soot", segs=6, axis="X")
-    p.slab(-0.3, -1.45, 0.4, 0.3, -1.38, 0.7, "steel_dark", bevel=0.02)
-    # Hull seams and rivet rows, so the sides and back read as riveted plate from any side.
-    for sx in (-1, 1):
-        for y in (-0.9, -0.3, 0.3, 0.9):
-            p.slab(sx * 0.551, y - 0.015, 0.3, sx * 0.56, y + 0.015, 0.75, "steel_dark")
-        for k in range(12):
-            y = -1.25 + k * 0.22
-            p.bolt((sx * 0.94, y, 0.805), "steel_light", radius=0.022)
-            p.bolt((sx * 0.56, y, 0.7), "steel_light", radius=0.02, axis="X")
-    for x in (-0.4, -0.2, 0.0, 0.2, 0.4):
-        p.bolt((x, -1.385, 0.74), "steel_light", radius=0.02, axis="Y")
-        p.bolt((x, 1.305, 0.72), "steel_light", radius=0.02, axis="Y")
+    for sx, side_tag in ((-1, "l"), (1, "r")):
+        running += track_assembly(p, sx * 0.66, side_tag, w=0.36)
 
-    head = Part("anim_turret_head", pivot=(0.0, -0.05, 0.98))
-    tz = 0.98
-    head.cyl((0, -0.05, tz + 0.2), 0.52, 0.4, "steel_light", segs=20, bevel=0.06)
-    for k in range(20):
-        a = math.radians(k * 18)
-        head.box((0.53 * math.cos(a), -0.05 + 0.53 * math.sin(a), tz + 0.2), (0.06, 0.06, 0.34), "steel", rz=k * 18,
-                 bevel=0.015)
-    head.prism(octagon(0.42), tz + 0.36, tz + 0.46, "rust_brown", bevel=0.03, matrix=T(0, -0.13, 0))
-    head.cyl((0, -0.2, tz + 0.49), 0.17, 0.08, "rust_dark", segs=12, bevel=0.02)
-    for k in range(6):
-        a = math.radians(k * 60 + 30)
-        head.bolt((0.12 * math.cos(a), -0.2 + 0.12 * math.sin(a), tz + 0.54), "steel_light", radius=0.025)
-    head.slab(-0.22, 0.41, tz + 0.12, 0.22, 0.71, tz + 0.38, "rust_dark", bevel=0.04)
+    # Lower armored hull spine & front/rear plates.
+    p.slab(-0.48, -1.28, 0.24, 0.48, 1.38, 0.74, "rust_dark", bevel=0.04)
+
+    # Mid-track stepped rusty fenders & side skirt boxes (leaving front/rear top cleats exposed!).
     for sx in (-1, 1):
-        head.cyl((sx * 0.143, 0.87, tz + 0.184), 0.052, 0.66, "steel_light", segs=8, axis="Y")
-        head.cyl((sx * 0.143, 1.18, tz + 0.184), 0.066, 0.1, "steel_dark", segs=8, axis="Y")
-    # Built compact, then stretched to the sprite's size, measured against all 64 rotation frames
-    # of the body and of the turret (tools/models/turntable.py): the tank draws longer and much
-    # taller than its selection box, the hull's middle 0.2 tiles north of the vehicle's position.
-    # The turret turns about the vehicle's position (Factorio draws its frames there), riding high
-    # on the hull: a narrower, taller drum.
-    body = T(0, 0.2, 0) @ S(0.902, 1.071, 1.353)
-    p.transform(body)
-    for part in running:
-        part.transform(body)
-        part.pivot = body @ part.pivot
-    head.transform(T(0, 0.05, 0.299) @ S(0.923, 1.009, 1.39))
-    head.pivot = Vector((0.0, 0.0, tz * 1.39 + 0.299))
-    return [p, own_materials(head, "turret")] + running
+        x0, x1 = sorted((sx * 0.45, sx * 0.90))
+        p.slab(x0, -0.56, 0.69, x1, 0.62, 0.80, "rust_brown", bevel=0.025)
+        # Stepped mid-fender storage/armor blocks.
+        bx0, bx1 = sorted((sx * 0.72, sx * 0.93))
+        p.slab(bx0, -0.32, 0.54, bx1, 0.36, 0.84, "steel_dark", bevel=0.02)
+        p.slab(bx0, -0.24, 0.82, bx1 - sx * 0.03, 0.28, 0.92, "steel", bevel=0.015)
+        for k in range(5):
+            p.bolt((sx * 0.905, -0.45 + k * 0.24, 0.77), "steel_light", radius=0.018, axis="X")
+
+    # Signature rear-west perforated steel catwalk step (-X side only, as in Factorio's sprite).
+    p.slab(-0.98, -1.30, 0.65, -0.76, -0.46, 0.73, "steel_light", bevel=0.015)
+    for k in range(6):
+        p.slab(-0.94, -1.22 + k * 0.13, 0.725, -0.80, -1.16 + k * 0.13, 0.738, "soot")
+
+    # Curved V-notched front bulldozer ram/plough (`y = 1.40..1.78`) leaving central notch open.
+    wing_prof = [
+        (1.40, 0.14), (1.58, 0.11), (1.72, 0.23), (1.77, 0.44), (1.69, 0.68),
+        (1.60, 0.72), (1.66, 0.44), (1.56, 0.26), (1.40, 0.26),
+    ]
+    for sx in (-1, 1):
+        m_wing = T(sx * 0.54, 1.56, 0.0) @ R("Z", sx * 8.0) @ T(-sx * 0.54, -1.56, 0.0)
+        x0, x1 = sorted((sx * 0.21, sx * 0.88))
+        p.side_prism(wing_prof, x0, x1, "rust_brown", bevel=0.015, matrix=m_wing)
+        p.beam((sx * 0.46, 1.24, 0.56), (sx * 0.56, 1.60, 0.36), 0.11, 0.07, "steel_dark", up=(0, 0, 1))
+        p.beam((sx * 0.38, 1.32, 0.36), (sx * 0.52, 1.56, 0.24), 0.09, 0.06, "steel_dark", up=(0, 0, 1))
+        for z in (0.28, 0.54):
+            p.bolt((sx * 0.64, 1.72, z), "steel_light", radius=0.02, axis="Y")
+    # Lower chin bar uniting the V-notch below the headlights.
+    p.slab(-0.24, 1.44, 0.14, 0.24, 1.64, 0.38, "rust_dark", bevel=0.02)
+
+    # Front armored engine deck (`steel_light`) + recessed headlight bay + 4 curved exhaust pipes/side.
+    p.slab(-0.36, 0.52, 0.72, 0.36, 1.34, 1.04, "steel_light", bevel=0.03)
+    p.slab(-0.24, 0.60, 1.03, 0.24, 1.26, 1.09, "steel", bevel=0.015)
+    for sx in (-1, 1):
+        p.slab(min(sx * 0.08, sx * 0.22), 0.62, 1.08, max(sx * 0.08, sx * 0.22), 1.22, 1.12, "steel_dark")
+        for k in range(4):
+            py = 0.68 + k * 0.165
+            p.pipe([(sx * 0.33, py, 0.94), (sx * 0.52, py, 0.92), (sx * 0.56, py, 0.74)], 0.044, "steel_light", segs=6)
+    # Recessed twin headlight bay in the front nose (visible through the V-notch).
+    p.slab(-0.26, 1.26, 0.66, 0.26, 1.40, 0.92, "steel_dark", bevel=0.02)
+    p.slab(-0.22, 1.37, 0.70, 0.22, 1.41, 0.86, "soot")
+    p.cyl((0.0, 1.415, 0.87), 0.022, 0.48, "steel", segs=6, axis="X")
+    headlight = Part("anim_headlight", pivot=(0.0, 1.39, 0.78))
+    for sx in (-1, 1):
+        headlight.cyl((sx * 0.12, 1.395, 0.78), 0.052, 0.015, "lamp_headlight", segs=10, axis="Y")
+
+    # Tall sloped trapezoidal armored casemate (`y = -0.60..0.56, z = 0.74..1.40`).
+    # Built as a smooth tapered octagonal/box hull tapering into the turret collar.
+    casemate = Part()
+    casemate.prism([(-0.68, -0.60), (0.68, -0.60), (0.68, 0.42), (0.48, 0.60), (-0.48, 0.60), (-0.68, 0.42)],
+                   0.74, 1.38, "rust_brown", bevel=0.04)
+    casemate.warp(lambda co: (
+        co.x * (1.0 - 0.18 * max(0.0, co.z - 0.74) / 0.64),
+        co.y * (1.0 - 0.10 * max(0.0, co.z - 0.74) / 0.64),
+        co.z,
+    ))
+    p.add_part(casemate)
+    # Heavy circular bolted turret ring collar at z = 1.36..1.42 (zero gap beneath turret!).
+    p.ring_band((0.0, 0.0), 0.48, 0.59, 1.34, 1.42, 0, 360, "rust_dark", segs=18, bevel=0.015)
+    p.bolts_ring((0.0, 0.0, 1.425), 0.54, 10, "steel_light", radius=0.016)
+
+    # Bolted steel side access doors on both flanks of the casemate (with horizontal rusty hinges).
+    for sx in (-1, 1):
+        m_door = T(sx * 0.62, -0.05, 1.08) @ R("Y", sx * -9.0)
+        p.box((0, 0, 0), (0.07, 0.52, 0.42), "steel_dark", bevel=0.015, matrix=m_door)
+        p.box((sx * 0.025, 0, 0), (0.04, 0.44, 0.34), "steel_light", bevel=0.01, matrix=m_door)
+        for dz in (-0.09, 0.09):
+            p.box((sx * 0.048, -0.10, dz), (0.025, 0.22, 0.055), "rust_brown", matrix=m_door)
+        p.box((sx * 0.048, 0.15, 0.0), (0.03, 0.06, 0.04), "steel_dark", matrix=m_door)
+        # Rear-corner vertical cylindrical air-filter / coolant drums.
+        p.cyl((sx * 0.61, -0.58, 1.04), 0.135, 0.42, "steel_light", segs=12)
+        p.sphere((sx * 0.61, -0.58, 1.25), 0.135, "steel_light", segs=12, rings=4, hemisphere=True, scale=(1, 1, 0.4))
+        for z in (0.94, 1.16):
+            p.cyl((sx * 0.61, -0.58, z), 0.145, 0.035, "steel_dark", segs=12)
+
+    # Rear ONE horizontal east-west weathered-white fuel tank + bolted top hatch + protective frame.
+    p.slab(-0.56, -1.28, 0.72, 0.56, -0.60, 0.80, "rust_dark", bevel=0.02)
+    p.cyl((0.0, -0.94, 1.04), 0.275, 0.86, "tank_white", segs=12, axis="X", bevel=0.04)
+    for sx in (-1, 1):
+        p.sphere((sx * 0.43, -0.94, 1.04), 0.275, "tank_white", segs=12, rings=4, scale=(0.45, 1.0, 1.0))
+        p.cyl((sx * 0.24, -0.94, 1.04), 0.288, 0.042, "steel_dark", segs=12, axis="X")
+    # Bolted circular filler hatch on top of the rear fuel tank.
+    p.cyl((0.0, -0.94, 1.32), 0.165, 0.05, "steel_light", segs=10, bevel=0.01)
+    p.bolts_ring((0.0, -0.94, 1.35), 0.125, 6, "steel_dark", radius=0.016)
+    p.cyl((0.0, -0.94, 1.36), 0.045, 0.04, "rust_brown", segs=8)
+    # Protective rear steel roll-bar frame & 3 rear exhaust/tow stubs.
+    for sx in (-1, 1):
+        p.pipe([(sx * 0.60, -0.62, 1.24), (sx * 0.60, -1.28, 1.24), (sx * 0.60, -1.28, 0.78)], 0.036, "steel_dark", segs=6)
+    p.cyl((0.0, -1.28, 1.24), 0.036, 1.20, "steel_dark", segs=6, axis="X")
+    for rx in (-0.18, 0.0, 0.18):
+        p.cyl((rx, -1.35, 0.58), 0.048, 0.16, "steel_dark", segs=8, axis="Y")
+        p.cyl((rx, -1.43, 0.58), 0.034, 0.02, "soot", segs=6, axis="Y")
+
+    # Ribbed cast-iron domed cupola turret + independent recoiling twin cannon & coax MG barrels.
+    tz = 1.40
+    head = Part("anim_turret_head", pivot=(0.0, 0.0, tz))
+    head.cyl((0.0, 0.0, tz + 0.05), 0.55, 0.10, "steel_dark", segs=14)
+    space_kit.lathe(
+        head,
+        (0.0, 0.0, tz + 0.06),
+        [(0.54, 0.0), (0.53, 0.14), (0.47, 0.34), (0.39, 0.45), (0.36, 0.50), (0.0, 0.51)],
+        "steel_light",
+        segs=14,
+    )
+    # 16 vertical fluted armor ribs around the dome slope (clear of front gun mantlet).
+    for k in range(16):
+        ang = 22.5 * k
+        if 65.0 < ang < 115.0:
+            continue
+        rad = math.radians(ang)
+        ca, sa = math.cos(rad), math.sin(rad)
+        m_rib = T(0.49 * ca, 0.49 * sa, tz + 0.27) @ R("Z", ang) @ R("Y", -17.0)
+        head.box((0.0, 0.0, 0.0), (0.065, 0.070, 0.34), "steel", matrix=m_rib)
+    # Domed upper cupola cap & perimeter rivets.
+    space_kit.lathe(
+        head,
+        (0.0, 0.0, tz + 0.54),
+        [(0.38, 0.0), (0.37, 0.09), (0.28, 0.20), (0.15, 0.26), (0.0, 0.27)],
+        "steel_light",
+        segs=12,
+    )
+    head.bolts_ring((0.0, 0.0, tz + 0.62), 0.35, 8, "steel_dark", radius=0.018)
+    # Signature rusty spine arch strap cleanly outside the dome + bolted commander's cupola hatch.
+    spine = [(-0.56, tz + 0.14), (-0.54, tz + 0.34), (-0.42, tz + 0.62), (-0.28, tz + 0.79),
+             (0.0, tz + 0.85), (0.28, tz + 0.79), (0.42, tz + 0.62), (0.50, tz + 0.44),
+             (0.42, tz + 0.42), (0.34, tz + 0.56), (0.22, tz + 0.72), (0.0, tz + 0.78),
+             (-0.22, tz + 0.72), (-0.35, tz + 0.54), (-0.46, tz + 0.32), (-0.46, tz + 0.14)]
+    head.side_prism(spine, -0.10, 0.10, "rust_brown")
+    head.cyl((0.0, -0.02, tz + 0.80), 0.165, 0.07, "rust_dark", segs=12, bevel=0.015)
+    head.bolts_ring((0.0, -0.02, tz + 0.84), 0.12, 6, "steel_light", radius=0.016)
+    head.cyl((0.0, -0.02, tz + 0.85), 0.04, 0.04, "steel", segs=8)
+    # Armored front gun mantlet & recoil cradle sleeves.
+    head.slab(-0.26, 0.34, tz + 0.08, 0.26, 0.64, tz + 0.48, "rust_dark", bevel=0.03)
+    head.slab(-0.22, 0.52, tz + 0.24, 0.22, 0.70, tz + 0.42, "rust_brown", bevel=0.02)
+    for sx in (-1, 1):
+        head.cyl((sx * 0.135, 0.62, tz + 0.34), 0.082, 0.16, "steel_dark", segs=10, axis="Y")
+    head.cyl((0.0, 0.60, tz + 0.16), 0.056, 0.14, "steel_dark", segs=8, axis="Y")
+
+    # Twin heavy cannon barrels (`anim_turret_barrel`).
+    barrel = Part("anim_turret_barrel", pivot=(0.0, 0.0, tz))
+    for sx in (-1, 1):
+        bx = sx * 0.135
+        bz = tz + 0.34
+        barrel.cyl((bx, 0.74, bz), 0.062, 0.26, "steel_dark", segs=10, axis="Y", bevel=0.01)
+        barrel.cyl((bx, 1.09, bz), 0.045, 0.46, "steel_light", segs=10, axis="Y")
+        barrel.cyl((bx, 1.35, bz), 0.060, 0.12, "steel_dark", segs=10, axis="Y", bevel=0.01)
+        barrel.cyl((bx, 1.415, bz), 0.034, 0.02, "soot", segs=8, axis="Y")
+
+    # Lower centered coaxial MG / flamethrower tube (`anim_turret_coax`).
+    coax = Part("anim_turret_coax", pivot=(0.0, 0.0, tz))
+    cz = tz + 0.16
+    coax.cyl((0.0, 0.72, cz), 0.040, 0.26, "steel_dark", segs=8, axis="Y", bevel=0.008)
+    coax.cyl((0.0, 0.94, cz), 0.028, 0.20, "steel", segs=8, axis="Y")
+    coax.cyl((0.0, 1.045, cz), 0.018, 0.015, "soot", segs=6, axis="Y")
+
+    return [
+        p,
+        own_materials(head, "turret"),
+        own_materials(barrel, "turret"),
+        own_materials(coax, "turret"),
+        headlight,
+    ] + running
 
 
 # Spidertron: legs from the hips (Factorio's mount_position) to the feet (ground_position),

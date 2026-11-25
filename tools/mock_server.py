@@ -29,8 +29,8 @@ import math
 import os
 import random
 import socket
+import struct
 import time
-import zlib
 import zlib
 
 import mock_space
@@ -77,9 +77,10 @@ RECORDS_PER_MESSAGE = 80
 MOVERS_PER_MESSAGE = 200
 MAX_EXTRA_CLIENTS = 7
 # What each client has of its own (MockGame.serving swaps these); the rest is the shared world.
-PER_CLIENT = ("client", "rseq", "outbox", "subs", "queue", "focus", "player", "guns_sig", "inv_sig", "layout",
+PER_CLIENT = ("client", "rseq", "outbox", "nack_ring", "subs", "queue", "focus", "player", "guns_sig", "inv_sig", "layout",
               "slots_sig", "craftable_sig", "quickbar", "queue_sent", "queue_empty_tick", "screen", "char_logistics", "char_color", "map_queue", "map_have",
-              "map_res", "tags_dirty", "map_si", "alt", "altc", "filters", "clipboard", "remote_view", "work_budget")
+              "map_res", "tags_dirty", "map_si", "alt", "altc", "filters", "clipboard", "remote_view", "work_budget",
+              "lod_queue", "lod_res", "lod_si")
 EQUIPMENT_SHAPES = {"solar-panel-equipment": (1, 1), "battery-equipment": (1, 2), "energy-shield-equipment": (2, 2),
                     "personal-roboport-equipment": (2, 2)}
 ITEMS_PER_MESSAGE = 300
@@ -90,7 +91,7 @@ GROUND_ITEM_INTERVAL = 30
 # The mod's rate.lua for the jobs the mock has: the level a job first slows down at, its longest
 # period and the tick it runs on while stretched (the client's `rate` command, 0-3). After a
 # slow-down movers and belt items also keep their old ticks for RATE_EASE_TICKS, as the mod's do.
-RATE_JOBS = {"mv": (1, 16, 1), "bi": (1, 48, 1), "ih": (3, 24, 3)}
+RATE_JOBS = {"mv": (1, 16, 1), "bi": (1, 48, 1), "ih": (3, 24, 3), "rb": (3, 16, 9)}
 RATE_EASE = {"mv", "bi"}
 RATE_EASE_TICKS = 120
 PICKUP_DISTANCE = 1.5  # the character's item_pickup_distance plus the mod's slack
@@ -285,7 +286,7 @@ HUB_DROP = 40.0        # onto a hub
 HUB_HATCH = (0.5, -3.5)
 # What the world keeps per surface; switch_surface swaps it.
 SURFACE_STATE = ("entities", "by_chunk", "generated", "tile_overrides", "working", "movers", "belt", "inserters",
-                 "fluids", "heat", "ground", "belt_lanes", "frozen", "belt_field")
+                 "fluids", "heat", "ground", "belt_lanes", "frozen", "belt_field", "lod_revs")
 # The other planets (`--planet`, or `land` from the platform when it is stopped at one): a small
 # surface each, with its tiles, a few of its buildings and its data. Surface properties and day
 # lengths are close to Space Age's (day in ticks); mb and sol are min brightness and solar power
@@ -599,6 +600,40 @@ MAP_RESOLUTIONS = (2, 4, 8, 16, 32)
 MAP_GHOST = (145, 97, 145)
 MAP_LAYERS = {"resource": 1, "tree": 2, "simple-entity": 2}
 MAP_SKIP = {"character", "unit", "car", "locomotive", "cargo-wagon", "logistic-robot"}
+LOD_CHUNKS_PER_TICK = 16
+LOD_NAUVIS_RADIUS = 256
+LOD_REGION = 16
+LOD_VALID_RES = (2, 4, 8, 16, 32)
+LOD_EXCLUDED = MAP_SKIP | {
+    "corpse", "item-entity", "item-request-proxy", "spider-vehicle", "fluid-wagon", "artillery-wagon",
+    "construction-robot", "combat-robot", "capture-robot", "spider-unit", "segmented-unit", "segment",
+    "asteroid", "cargo-pod", "rocket-silo-rocket", "projectile", "beam", "explosion", "fire",
+}
+LOD_GLOW_STRONG = {"lamp", "reactor", "fusion-reactor", "rocket-silo", "lab", "beacon", "electric-turret"}
+LOD_GLOW_SOFT = {
+    "furnace", "burner-generator", "heating-tower", "boiler", "generator", "fusion-generator",
+    "radar", "roboport", "accumulator", "lightning-attractor", "heat-exchanger",
+}
+LOD_NATURE = {"tree", "plant"}
+LOD_LOW = {
+    "resource", "transport-belt", "underground-belt", "splitter", "lane-splitter", "loader",
+    "loader-1x1", "linked-belt", "straight-rail", "half-diagonal-rail", "curved-rail-a",
+    "curved-rail-b", "legacy-straight-rail", "legacy-curved-rail", "elevated-straight-rail",
+    "elevated-half-diagonal-rail", "elevated-curved-rail-a", "elevated-curved-rail-b",
+    "rail-ramp", "rail-support",
+}
+LOD_BUILDING = {
+    "assembling-machine", "furnace", "mining-drill", "lab", "boiler", "generator", "reactor",
+    "fusion-reactor", "fusion-generator", "accumulator", "radar", "roboport", "rocket-silo",
+    "beacon", "ammo-turret", "electric-turret", "fluid-turret", "artillery-turret", "wall",
+    "gate", "container", "logistic-container", "storage-tank", "pump", "offshore-pump",
+    "pipe", "pipe-to-ground", "heat-pipe", "heat-exchanger", "lamp", "electric-pole",
+    "train-stop", "rail-signal", "rail-chain-signal", "inserter", "arithmetic-combinator",
+    "decider-combinator", "selector-combinator", "constant-combinator", "power-switch",
+    "programmable-speaker", "display-panel", "cargo-bay", "cargo-landing-pad",
+    "space-platform-hub", "asteroid-collector", "thruster", "agricultural-tower",
+    "lightning-attractor", "heating-tower", "burner-generator", "unit-spawner",
+}
 EID = {p[0]: i + 1 for i, p in enumerate(ENTITY_PROTOS)}
 mock_creature_showcase.EID.update(EID)
 mock_enemy_showcase.EID.update(EID)
@@ -646,6 +681,8 @@ for _n in ("electric-mining-drill", "burner-mining-drill"):
     _overlay(_n).update(rk=["basic-solid"], rr=1)
 for _n in ("iron-ore", "copper-ore", "coal", "stone"):
     _overlay(_n)["rk"] = "basic-solid"
+_overlay("logistic-robot").update(spd=0.05, low=0.2, epm=5000, ept=50)
+_overlay("construction-robot").update(spd=0.06, low=0.2, epm=5000, ept=50)
 
 
 def alt_sequence(kind, width, shift=(0, 0.7), scale=0.5, per_row=None, rows=None, sep=1.1, lift=-0.1):
@@ -838,7 +875,13 @@ class MockGame(mock_info.InfoMixin):
         self.next_unit = 1000
         self.client = None  # {"addr", "sid", "last_seen"}
         self.rseq = 0
+        self.dg_n = 0
+        self.ie_events = []
+        self.ie_last_sync = {}
+        self.ie_prev_p = {}
+        self.ie_last_hb = -100
         self.outbox = []
+        self.nack_ring = [None] * protocol.NACK_RING_SIZE
         self.batches = {}  # client address -> [datagrams waiting to be joined, bytes] (send_raw)
         self.subs, self.queue, self.kept_queue = {}, [], []
         self.focus = (0.0, 0.0, 48.0)
@@ -847,6 +890,7 @@ class MockGame(mock_info.InfoMixin):
         self.entities = {}  # key -> Entity
         self.by_chunk = {}  # (cx, cy) -> set of keys
         self.tile_overrides = {}
+        self.lod_revs = {}
         self.working = {}
         # K10: lamps showing a colour (unit -> colours it goes through, a step every 300 ticks), and what the
         # client was last told of each (st's lc). K13: buildings started damaged, unit -> health.
@@ -893,6 +937,8 @@ class MockGame(mock_info.InfoMixin):
         self.charted = {(cx, cy) for cx in range(-MAP_START_RADIUS, MAP_START_RADIUS + 1)
                         for cy in range(-MAP_START_RADIUS, MAP_START_RADIUS + 1)}
         self.map_queue, self.map_res, self.map_have = [], 4, {}
+        self.lod_revs = {}
+        self.lod_queue, self.lod_res, self.lod_si = [], 8, None
         self.work_budget = WORK_BUDGET  # units a tick (budget.lua); the mock only reports it in `wb`
         self.photo_until = None  # photo mode (`photo`) lapses at this tick
         # Tags by surface index: [id, x, y, text, icon type, icon name]. map_si: the surface the
@@ -980,6 +1026,7 @@ class MockGame(mock_info.InfoMixin):
         self.entities[key] = entity
         chunk = (math.floor(entity.x / CHUNK), math.floor(entity.y / CHUNK))
         self.by_chunk.setdefault(chunk, set()).add(key)
+        self._bump_lod_rev(*chunk)
         if entity.type == "pipe":
             entity.extra["pc"] = self.pipe_mask(entity)
         self.refresh_alt(entity)
@@ -995,6 +1042,7 @@ class MockGame(mock_info.InfoMixin):
         self.entities.pop(key, None)
         chunk = (math.floor(entity.x / CHUNK), math.floor(entity.y / CHUNK))
         self.by_chunk.get(chunk, set()).discard(key)
+        self._bump_lod_rev(*chunk)
         if announce and self.watched(entity):
             self.send_reliable({"t": "del", "u": entity.unit, "p": EID[entity.name],
                                 "x": fixed(entity.x), "y": fixed(entity.y)})
@@ -1130,6 +1178,10 @@ class MockGame(mock_info.InfoMixin):
         self.lamp_colors = {lamps[0].unit: [0xFF0000, 0x00FF00, 0x0000FF], lamps[1].unit: [0xFFA000]}
         # K20: the third set to Always on: the client lights it by day too.
         self.always_on_lamps = {lamps[2].unit}
+        for e in lamps:
+            e.extra["lp"] = 3 if e.unit in self.always_on_lamps else 1
+            if e.unit in self.lamp_colors:
+                e.extra["lc"] = self.lamp_colors[e.unit][0]
         # Copper wires along the line of poles; each pole lists its neighbours, like the mod.
         for i, pole in enumerate(poles):
             pole.extra = {"w": [other.unit for other in poles[max(0, i - 1):i + 2] if other is not pole]}
@@ -1155,7 +1207,7 @@ class MockGame(mock_info.InfoMixin):
         const.extra["r"].append(decider.unit)
         lamp = next(e for e in self.entities.values() if e.unit and e.name == "small-lamp" and (e.x, e.y) == (13.5, 9.5))
         decider.extra = {"r": [const.unit], "g": [lamp.unit]}  # its output switches the lamp beside it
-        lamp.extra = {"g": [decider.unit]}
+        lamp.extra["g"] = [decider.unit]
         self.wired[decider.unit] = const.unit
         boiler = add("boiler", -10.5, -10.0)
         engine = add("steam-engine", -10.5, -6.5)
@@ -1190,6 +1242,8 @@ class MockGame(mock_info.InfoMixin):
             self.ground.append([item, -5.0 + (i % 4) * 0.45, 3.0 + (i // 4) * 0.4])
         for x in range(-100, 101, 2):
             self.add(Entity(self._unit(), "straight-rail", float(x), -48.0, 4))
+        add("rail-signal", -2.5, -46.5, 4, {"sg": 1})
+        add("rail-chain-signal", 2.5, -46.5, 4, {"sg": 4})
         add("train-stop", -82.0, -46.0, 12, {"n": "West", "col": [242, 0, 0]})
         add("train-stop", 82.0, -46.0, 4, {"n": "East", "col": [30, 140, 255]})
         self.space.build_nauvis(add)
@@ -1214,6 +1268,7 @@ class MockGame(mock_info.InfoMixin):
                 setattr(self, k, v)
         else:
             self.entities, self.by_chunk, self.generated, self.tile_overrides, self.working = {}, {}, set(), {}, {}
+            self.lod_revs = {}
             self.belt, self.inserters, self.fluids, self.heat, self.ground = [], [], {}, {}, []
             self.belt_field = []
             self.belt_lanes, self.frozen = ("iron-plate", "copper-plate"), set()
@@ -1228,6 +1283,7 @@ class MockGame(mock_info.InfoMixin):
         p = self.player
         p.update(x=float(x), y=float(y), walk=None, mining=None, mine_at=None, pickup=None, shoot=None)
         self.subs, self.queue, self.kept_queue = {}, [], []
+        self.lod_queue = []
         self.screen = None
         if self.altc is not None:
             self.altc["sent"], self.altc["msent"] = {}, {}  # Alt-mode's icons are sent again on the new surface
@@ -1832,6 +1888,19 @@ class MockGame(mock_info.InfoMixin):
                         out.append((base + (int(cycle) * length * 4 + i) % 1_000_000, item, belt.x + dx, top + s))
         return self.not_taken(out)
 
+    def _inserter_hand_pos(self, e):
+        """Return (p, x, y) for inserter entity `e` at the current tick."""
+        a = e.dir / 16 * 2 * math.pi
+        ux, uy = math.sin(a), -math.cos(a)  # towards the drop side
+        vx, vy = uy, -ux  # 90 degrees to the left of it
+        p = ((self.tick + e.unit * 7) % SWING_TICKS) / SWING_TICKS
+        s = p * 2 if p < 0.5 else 2 - p * 2
+        s = s * s * (3 - 2 * s)
+        phi = math.pi * (1 - s)  # pi: over the pickup, 0: over the drop
+        x = e.x + math.cos(phi) * ux + math.sin(phi) * vx
+        y = e.y + math.cos(phi) * uy + math.sin(phi) * vy
+        return p, x, y
+
     def inserter_hands(self):
         """Each inserter swings from the tile behind it to the tile in front (the way it
         faces), over its left side, carrying its item, then back empty. Returns
@@ -1840,17 +1909,42 @@ class MockGame(mock_info.InfoMixin):
         for e, item in self.inserters:
             if e.key() not in self.entities:
                 continue
-            a = e.dir / 16 * 2 * math.pi
-            ux, uy = math.sin(a), -math.cos(a)  # towards the drop side
-            vx, vy = uy, -ux  # 90 degrees to the left of it
-            p = ((self.tick + e.unit * 7) % SWING_TICKS) / SWING_TICKS
-            s = p * 2 if p < 0.5 else 2 - p * 2
-            s = s * s * (3 - 2 * s)
-            phi = math.pi * (1 - s)  # pi: over the pickup, 0: over the drop
-            x = e.x + math.cos(phi) * ux + math.sin(phi) * vx
-            y = e.y + math.cos(phi) * uy + math.sin(phi) * vy
+            p, x, y = self._inserter_hand_pos(e)
             out.append((e.unit, x, y, item if p < 0.5 else None))
         return out
+
+    def _tick_inserter_events(self):
+        """Record inserter hand events (`ie`: pick, drop, sync, gone) for visible inserters."""
+        fx, fy, fr = self.focus
+        r = min(BELT_ITEM_RADIUS, fr)
+        seen_now = set()
+        for e, item in self.inserters:
+            if e.key() not in self.entities:
+                continue
+            p, x, y = self._inserter_hand_pos(e)
+            if abs(x - fx) > r or abs(y - fy) > r:
+                continue
+            seen_now.add(e.unit)
+            held = p < 0.5
+            iid = IID[item]
+            hx, hy = fixed(x), fixed(y)
+            prev_p = self.ie_prev_p.get(e.unit)
+            if e.unit not in self.ie_last_sync:
+                self.ie_events.append((self.tick, [4, e.unit, self.tick, 1 if held else 0, iid if held else 0, 0, hx, hy, 0]))
+                self.ie_last_sync[e.unit] = self.tick
+            elif prev_p is not None and p < prev_p:
+                self.ie_events.append((self.tick, [1, e.unit, self.tick, 1, iid, 0, hx, hy, 0]))
+            elif prev_p is not None and prev_p < 0.5 <= p:
+                self.ie_events.append((self.tick, [2, e.unit, self.tick, 0, iid, 0, hx, hy, 0]))
+            elif self.tick - self.ie_last_sync[e.unit] >= 300:
+                self.ie_events.append((self.tick, [4, e.unit, self.tick, 1 if held else 0, iid if held else 0, 0, hx, hy, 0]))
+                self.ie_last_sync[e.unit] = self.tick
+            self.ie_prev_p[e.unit] = p
+        for unit in list(self.ie_last_sync):
+            if unit not in seen_now:
+                self.ie_events.append((self.tick, [5, unit, self.tick, 0, 0, 0, 0, 0, 0]))
+                self.ie_last_sync.pop(unit, None)
+                self.ie_prev_p.pop(unit, None)
 
     def daytime(self):
         if self.day_frozen is not None:
@@ -1911,12 +2005,37 @@ class MockGame(mock_info.InfoMixin):
         elif what == "teleport" and num(1) is not None and num(2) is not None:
             p["x"], p["y"] = num(1), num(2)
             lines = [f"Moved the character to {p['x']:.1f}, {p['y']:.1f}"]
+        elif what == "raise":
+            self.send_raise()
+            lines = ["Raised Zenith"]
         state = {"dt": round(self.daytime(), 3), "fz": 0 if self.day_frozen is None else 1, "sp": self.speed,
                  "pa": 1 if self.paused else 0, "hd": 0 if self.hold is None else 1, "ad": 0, "s": self.surface,
                  "x": fixed(p["x"]), "y": fixed(p["y"]), "sx": 0, "sy": 0}
         return lines, state
 
+    def send_raise(self):
+        """Sends the `raise` cue as Factorio does when the player presses Show in Zenith."""
+        self.send_now({"t": "raise"})
+
     # --- networking -----------------------------------------------------------------------
+
+    def _send_udp(self, addr, payload, binary):
+        if self.client and self.client.get("dq") and self.client["addr"] == addr:
+            self.dg_n += 1
+            if binary:
+                if len(payload) + 18 <= 65507:
+                    payload = payload + protocol.encode_frame(
+                        protocol.KIND_DG, struct.pack("<III", self.dg_n, self.tick, len(payload))
+                    )
+            else:
+                dg_line = json.dumps(
+                    {"t": "dg", "n": self.dg_n, "k": self.tick, "b": len(payload)},
+                    separators=(",", ":"),
+                ).encode()
+                if len(payload) + 1 + len(dg_line) <= 65507:
+                    payload = payload + b"\n" + dg_line
+        if self.rng.random() >= self.drop:
+            self.sock.sendto(payload, addr)
 
     def send_raw(self, msg):
         if self.client is None:
@@ -1924,7 +2043,8 @@ class MockGame(mock_info.InfoMixin):
         msg["k"] = self.tick
         addr = self.client["addr"]
         # A client whose hello says bin gets binary frames, as from transport.lua: mv in binary (bs and bfar
-        # too from wire version 2; chunk, ents, st and ih from 3), anything else as its JSON text in a frame
+        # too from wire version 2; chunk, ents, st and ih from 3; rb from 4; bs's crossing hints, sx, from 5: none
+        # here, the mock's belts have no splitters), anything else as its JSON text in a frame
         # (protocol.encode_message).
         binary = self.client.get("bin") or 0
         data = protocol.encode_message(msg, binary) if binary else json.dumps(msg, separators=(",", ":")).encode()
@@ -1932,7 +2052,8 @@ class MockGame(mock_info.InfoMixin):
             # A client whose hello says b gets the tick's messages joined by newlines, like the mod's
             # transport.lua (sending a datagram costs Factorio about a millisecond).
             batch = self.batches.get(addr)
-            if batch and (batch[2] != binary or batch[1] + len(data) + 1 > BATCH_BYTES):
+            reserve = 64 if self.client.get("dq") else 0
+            if batch and (batch[2] != binary or batch[1] + len(data) + 1 + reserve > BATCH_BYTES):
                 self.send_batch(addr)
                 batch = None
             if batch is None:
@@ -1941,14 +2062,15 @@ class MockGame(mock_info.InfoMixin):
             batch[1] += len(data) + (0 if binary else 1)
             return len(data)
         self.send_batch(addr)
-        if self.rng.random() >= self.drop:
-            self.sock.sendto(protocol.encode_datagram([data], binary) if binary else data, addr)
+        payload = protocol.encode_datagram([data], binary) if binary else data
+        self._send_udp(addr, payload, binary)
         return len(data)
 
     def send_batch(self, addr):
         batch = self.batches.pop(addr, None)
-        if batch and self.rng.random() >= self.drop:
-            self.sock.sendto(protocol.encode_datagram(batch[0], batch[2]) if batch[2] else b"\n".join(batch[0]), addr)
+        if batch:
+            payload = protocol.encode_datagram(batch[0], batch[2]) if batch[2] else b"\n".join(batch[0])
+            self._send_udp(addr, payload, batch[2])
 
     def send_now(self, msg):
         self.send_raw(msg)
@@ -1998,10 +2120,15 @@ class MockGame(mock_info.InfoMixin):
     def flush(self):
         sent = 0
         while self.outbox and sent < BYTES_PER_TICK:
-            sent += self.send_raw(self.outbox.pop(0))
+            msg = self.outbox.pop(0)
+            r = msg.get("r")
+            if isinstance(r, int) and not isinstance(r, bool) and r > 0:
+                self.nack_ring[r % protocol.NACK_RING_SIZE] = dict(msg)
+            sent += self.send_raw(msg)
 
     def handshake(self):
         self.rseq, self.outbox = 0, []
+        self.nack_ring = [None] * protocol.NACK_RING_SIZE
         self.subs, self.queue, self.kept_queue = {}, [], []
         self.altc = None  # a client in Alt-mode says `altc` again after the welcome
         p = self.player
@@ -2013,6 +2140,10 @@ class MockGame(mock_info.InfoMixin):
         mock_link.welcome_fields(welcome)
         if self.client and self.client.get("bin"):
             welcome["bin"] = self.client["bin"]
+        if self.client and self.client.get("lod"):
+            welcome["lod"] = 1
+        if getattr(self, "cue", -1) >= 0:
+            welcome["cue"] = self.cue  # link.lua's set_cue, kept for a late joiner
         self.send_reliable(welcome)
         recs = []
         for name, etype, w, h, color in ENTITY_PROTOS:
@@ -2169,8 +2300,13 @@ class MockGame(mock_info.InfoMixin):
                                "chat_at": self.tick + 240,
                                "z": msg.get("z") == 1, "dc": msg.get("dc") == 1, "b": msg.get("b") == 1,
                                "bl": msg.get("bl") == 1, "bs": msg.get("bs") == 1, "mg": msg.get("mg") != 0,
-                               "lv": msg.get("lv") == 1, "dd": msg.get("dd"), "bin": binary_version(msg.get("bin"))}
+                               "lv": msg.get("lv") == 1, "dd": msg.get("dd"), "bin": binary_version(msg.get("bin")),
+                               "rb": msg.get("rb") == 1, "rb_snap": True,
+                               "ie": msg.get("ie") if msg.get("ie") in (1, 2) else 0,
+                               "ho": msg.get("ho") == 1, "dq": msg.get("dq") == 1,
+                               "lod": msg.get("lod") in (1, True)}
                 self.lanes, self.bs_lanes, self.bs_next = {}, {}, {}
+                self.ie_events, self.ie_last_sync, self.ie_prev_p, self.ie_last_hb = [], {}, {}, -100
                 self.rate, self.rate_from, self.rate_at = 0, 0, -10 ** 9
                 self.photo_until = None
                 self.handshake()
@@ -2178,13 +2314,21 @@ class MockGame(mock_info.InfoMixin):
                 self.client["last_seen"] = self.tick
                 self.client["z"] = msg.get("z") == 1
                 self.client["b"] = msg.get("b") == 1
+                self.client["ie"] = msg.get("ie") if msg.get("ie") in (1, 2) else 0
+                self.client["ho"] = msg.get("ho") == 1
+                self.client["dq"] = msg.get("dq") == 1
                 bs = msg.get("bs") == 1
                 if self.client.get("bl") != (msg.get("bl") == 1) or self.client.get("bs") != bs:
                     self.lanes, self.bs_lanes, self.bs_next = {}, {}, {}
                 self.client["bl"] = msg.get("bl") == 1
                 self.client["bs"] = bs
                 self.client["lv"] = msg.get("lv") == 1  # told the counts of chunks it keeps (`kept`)
+                self.client["lod"] = msg.get("lod") in (1, True)
                 self.client["bin"] = binary_version(msg.get("bin"))  # binary frames (send_raw)
+                rb = msg.get("rb") == 1
+                if self.client.get("rb") != rb:
+                    self.client["rb"] = rb
+                    self.client["rb_snap"] = rb
                 # How far it draws decoratives (`dd`): the bridge leaves out the chunks past it (dec_distance);
                 # the mock, whose world is small, sends every chunk's as a bridge before it did.
                 self.client["dd"] = msg.get("dd")
@@ -2219,6 +2363,8 @@ class MockGame(mock_info.InfoMixin):
         p = self.player
         if t == "bye":
             print("client said bye")
+            self.lod_queue = []
+            self.nack_ring = [None] * protocol.NACK_RING_SIZE
             self.client = None
         elif t == "sub":
             # Same rules as the mod: newly subscribed chunks are queued nearest first.
@@ -2269,6 +2415,29 @@ class MockGame(mock_info.InfoMixin):
                     self.handshake()
                 else:
                     self.queue = list(self.subs)
+        elif t == "nack":
+            r_list = msg.get("r")
+            if isinstance(r_list, list):
+                seen = set()
+                misses = 0
+                for r in r_list[:protocol.NACK_MAX_R]:
+                    if not (isinstance(r, int) and not isinstance(r, bool) and r > 0):
+                        continue
+                    if r in seen:
+                        continue
+                    seen.add(r)
+                    entry = self.nack_ring[r % protocol.NACK_RING_SIZE]
+                    if entry is not None and entry.get("r") == r:
+                        self.send_raw(dict(entry))
+                    else:
+                        misses += 1
+                if misses > 0 and isinstance(msg.get("c"), list):
+                    for c in msg["c"]:
+                        if isinstance(c, list) and len(c) >= 2 and isinstance(c[0], int) and not isinstance(c[0], bool) \
+                                and isinstance(c[1], int) and not isinstance(c[1], bool):
+                            cc = (c[0], c[1])
+                            if cc in self.subs and cc not in self.queue:
+                                self.queue.append(cc)
         elif self.trip and t in ("walk", "mine", "build", "pickup", "enter", "ride"):
             if t != "walk":
                 self.message("Not while flying")
@@ -2306,7 +2475,13 @@ class MockGame(mock_info.InfoMixin):
         elif t == "drive":
             a, steer = msg.get("a", 0), msg.get("s", 0)
             if a in (1, 2, 3) or steer in (-1, 1):
-                p["drive"] = {"a": a if a in (1, 2, 3) else 0, "s": steer if steer in (-1, 1) else 0,
+                prev = p["drive"]
+                a = a if a in (1, 2, 3) else 0
+                h = msg.get("h") == 1
+                # h: the opposite key brakes to a stop and holds there until let go (the mod's driving.lua)
+                keep = prev is not None and prev["a"] == a and prev["h"] == h
+                p["drive"] = {"a": a, "s": steer if steer in (-1, 1) else 0, "h": h,
+                              "braking": keep and prev["braking"], "held": keep and prev["held"],
                               "until": self.tick + HOLD_TICKS}
             else:
                 p["drive"] = None
@@ -2323,6 +2498,7 @@ class MockGame(mock_info.InfoMixin):
             target = self.find(msg)
             if target is not None and target.unit:
                 target.dir = (target.dir + (12 if msg.get("rev") else 4)) % 16
+                self._bump_lod_rev(math.floor(target.x / CHUNK), math.floor(target.y / CHUNK))
                 self.send_reliable({"t": "upd", "e": target.record()})
                 self.record_history({"what": "rotation", "e": target, "rev": bool(msg.get("rev"))})
         elif t in ("bp_get", "bp_set", "bp_page", "bp_lib", "bp_rec", "bp_del", "undo", "redo"):
@@ -2347,6 +2523,8 @@ class MockGame(mock_info.InfoMixin):
             self.screen = None
         elif t == "map":
             self.request_map(msg)
+        elif t == "lod_sub":
+            self.handle_lod_sub(msg)
         elif t == "cmd":
             # console.lua: the commands the bridge runs for its character; Lua never.
             words = str(msg.get("text", "")).lstrip("/").split()
@@ -2358,6 +2536,13 @@ class MockGame(mock_info.InfoMixin):
             reply = {"t": "cmdr", "id": int(msg.get("id", 0)), "l": answers.get(name, [])}
             if name == "f3d-debug":
                 reply["l"], reply["dbg"] = self.debug_command(words[1:])
+            elif name == "f3d-cue":
+                # The mock's stand-in for remote.call("zenith", "set_cue", tick): `f3d-cue` (now),
+                # `f3d-cue <tick>`, `f3d-cue off`.
+                arg = words[1] if len(words) > 1 else "now"
+                self.cue = -1 if arg == "off" else (self.tick if arg == "now" else max(-1, int(arg)) if arg.lstrip("-").isdigit() else self.tick)
+                self.send_reliable({"t": "cue", "c": self.cue})
+                reply["l"] = [f"cue {self.cue}"]
             elif name not in answers:
                 reply["ok"] = 0
             self.send_reliable(reply)
@@ -2833,11 +3018,15 @@ class MockGame(mock_info.InfoMixin):
     def send_tile_changes(self, changed):
         if changed:
             flat = []
+            chunks = set()
             for tx, ty in changed:
                 flat += [tx, ty, TID[self.tile_at(tx, ty)]]
+                chunks.add((math.floor(tx / CHUNK), math.floor(ty / CHUNK)))
                 for e in list(self.entities_at(tx + 0.5, ty + 0.5)):
                     if e.type == "tile-ghost" and e.extra.get("tg") == TID[self.tile_at(tx, ty)]:
                         self.remove(e, announce=False)  # robots don't say either
+            for cx, cy in chunks:
+                self._bump_lod_rev(cx, cy)
             self.send_reliable({"t": "tiles", "l": flat})
 
     def throw(self, msg):
@@ -3192,6 +3381,18 @@ class MockGame(mock_info.InfoMixin):
                 p["drive"] = d = None
             v = m["speed"]
             a = d["a"] if d else 0
+            if d and d["h"] and a in (1, 3):
+                against = (a == 3 and v > 0.002) or (a == 1 and v < -0.002)
+                if d["held"]:
+                    a = 0
+                    v = 0.0
+                elif against:
+                    d["braking"] = True
+                    a = 2
+                elif d["braking"]:
+                    d["braking"], d["held"] = False, True
+                    a = 0
+                    v = 0.0
             if a == 1:
                 v = min(CAR_MAX_SPEED, v + CAR_ACCELERATION)
             elif a == 3:
@@ -4776,6 +4977,10 @@ class MockGame(mock_info.InfoMixin):
         if near and self.tick % 10 == 0:
             # The biters biting are attacking the character (the mod's `en`).
             self.send_now({"t": "en", "l": [v for m, _, _ in near for v in (m["unit"], fixed(p["x"]), fixed(p["y"]))]})
+        if near and self.tick % 20 == 0:
+            # combat.lua's attack_cue: each biter's bite landing, for its attack roar.
+            for m, x, y in near:
+                self.send_now({"t": "atk", "u": m["unit"], "p": EID[m["name"]], "x": fixed(x), "y": fixed(y)})
         if near:
             self.hurt(BITE_DAMAGE * len(near))
             if not self.mortal:
@@ -4859,13 +5064,42 @@ class MockGame(mock_info.InfoMixin):
         m, x, y = target
         m["hp"] -= SHOT_DAMAGE
         fx, fy, fr = self.focus
+        cx, cy = fixed(p["x"]), fixed(p["y"])
+        dt = "fire" if "flame" in gun[0] else ("explosion" if "rocket" in gun[0] else "physical")
+        max_hp = BITER_HEALTH.get(m["name"], 15)
+        dmg = int(round(SHOT_DAMAGE / max_hp * 1000))
+        hp = max(0, min(1000, int(round(m["hp"] / max_hp * 1000))))
+        src = gun[1] or gun[0]
         if abs(x - fx) <= fr and abs(y - fy) <= fr:
             # combat.lua's hit effect: blood, or burning from a flamethrower.
-            self.send_now({"t": "afx", "fx": "burn" if "flame" in gun[0] else "blood", "u": m["unit"], "x": fixed(x), "y": fixed(y)})
+            self.send_now({
+                "t": "afx",
+                "fx": "burn" if "flame" in gun[0] else "blood",
+                "u": m["unit"],
+                "x": fixed(x),
+                "y": fixed(y),
+                "cx": cx,
+                "cy": cy,
+                "dt": dt,
+                "dmg": dmg,
+                "hp": hp,
+                "src": src,
+            })
         if m["hp"] <= 0:
             m["dead_until"] = self.tick + RESPAWN_TICKS
             if abs(x - fx) <= fr and abs(y - fy) <= fr:
-                self.send_now({"t": "died", "u": m["unit"], "p": EID[m["name"]], "x": fixed(x), "y": fixed(y)})
+                self.send_now({
+                    "t": "died",
+                    "u": m["unit"],
+                    "p": EID[m["name"]],
+                    "x": fixed(x),
+                    "y": fixed(y),
+                    "cx": cx,
+                    "cy": cy,
+                    "dt": dt,
+                    "dmg": dmg,
+                    "src": src,
+                })
 
     # --- main loop ------------------------------------------------------------------------
 
@@ -4937,7 +5171,8 @@ class MockGame(mock_info.InfoMixin):
             self.send_now(self.alert_message())
             # What the bridge did each tick (budget.lua): the mock does its work in one go, so none.
             wb = {"t": "wb", "b": self.work_budget, "avg": 0, "max": 0, "over": 0, "n": 60,
-                  "q": {"chunks": len(self.queue), "map": len(self.map_queue), "reqs": 0, "radars": 0, "techs": 0}}
+                  "q": {"chunks": len(self.queue), "map": len(self.map_queue), "lod": len(self.lod_queue),
+                        "reqs": 0, "radars": 0, "techs": 0}}
             if self.photo_on():
                 wb["ph"] = 1
             self.send_now(wb)
@@ -4950,6 +5185,7 @@ class MockGame(mock_info.InfoMixin):
         self.tick_screen()
         self.tick_alt()
         self.tick_map()
+        self.tick_lod()
         self.tick_platform()
         self.tick_planet()
         self.space.tick()
@@ -4971,6 +5207,8 @@ class MockGame(mock_info.InfoMixin):
             for m in self.movers:
                 if m.get("dead_until", 0) > self.tick:
                     continue
+                if self.client.get("rb") and m["name"] in ("logistic-robot", "construction-robot"):
+                    continue
                 x, y, o = self.mover_state(m)
                 if abs(x - fx) <= fr and abs(y - fy) <= fr and self.view_seen(x, y):
                     rec = [m["unit"], EID[m["name"]], fixed(x), fixed(y)]
@@ -4984,6 +5222,8 @@ class MockGame(mock_info.InfoMixin):
             for i in range(parts):
                 self.send_list("mv", i + 1, parts, recs[i * MOVERS_PER_MESSAGE:(i + 1) * MOVERS_PER_MESSAGE], None,
                                {"p": self.rate_period("mv", 2)})
+        if self.client.get("rb") and (self.client.get("rb_snap") or self.rate_due("rb", 20)):
+            self.tick_robots()
         if self.tick % 60 == 30 and getattr(self, "far_r", 0) > 0:
             self.send_far_belts()
         near = getattr(self, "near_r", None)
@@ -5033,14 +5273,26 @@ class MockGame(mock_info.InfoMixin):
                     chunk = flat[i * per:(i + 1) * per]
                     st = self.stacks_in(chunk)
                     self.send_list("bi", i + 1, parts, chunk, 4, dict(extra, st=st) if st else extra)
+        if self.client.get("ie"):
+            self._tick_inserter_events()
         if self.rate_due("ih", BELT_ITEM_INTERVAL):
             fx, fy, fr = self.focus
             r = min(BELT_ITEM_RADIUS, fr)  # inserters.lua: the map's detail radius, not the client's belt distance
-            hands = []
-            for unit, x, y, item in self.inserter_hands():
-                if abs(x - fx) <= r and abs(y - fy) <= r:
-                    hands += [unit, fixed(x), fixed(y), IID[item] if item else 0]
-            self.send_list("ih", 1, 1, hands, 4, {"p": self.rate_period("ih", BELT_ITEM_INTERVAL)})
+            period = self.rate_period("ih", BELT_ITEM_INTERVAL)
+            ie_mode = self.client.get("ie") or 0
+            if ie_mode in (1, 2):
+                window = 6
+                self.ie_events = [(tk, rec) for tk, rec in self.ie_events if tk > self.tick - window]
+                flat_ie = [v for _, rec in self.ie_events for v in rec]
+                if flat_ie or self.tick - self.ie_last_hb >= 30:
+                    self.ie_last_hb = self.tick
+                    self.send_list("ie", 1, 1, flat_ie, 9, {"n": window, "p": period})
+            if ie_mode != 1:
+                hands = []
+                for unit, x, y, item in self.inserter_hands():
+                    if abs(x - fx) <= r and abs(y - fy) <= r:
+                        hands += [unit, fixed(x), fixed(y), IID[item] if item else 0]
+                self.send_list("ih", 1, 1, hands, 4, {"p": period})
         if self.tick % (BELT_ITEM_INTERVAL if self.player["pickup"] is not None else GROUND_ITEM_INTERVAL) == 0:
             fx, fy, fr = self.focus
             r = min(BELT_ITEM_RADIUS, fr)
@@ -5087,6 +5339,17 @@ class MockGame(mock_info.InfoMixin):
                 self.send_now({"t": "pol", "si": self.surface_index(), "w": 0})
             else:
                 self.send_now({"t": "pol", "si": self.surface_index(), "cx": cx, "cy": cy, "w": w, "l": l, "md": 60})
+        if self.tick % 300 == 150 and self.surface == "nauvis":
+            fx, fy, fr = self.focus
+            n = min(12, math.ceil(fr / 32) + 2)
+            lcx, lcy = math.floor(fx / 32), math.floor(fy / 32)
+            far_chunks = [(30, 0), (31, 0), (0, 30)]
+            sparse = []
+            for scx, scy in far_chunks:
+                if abs(scx - lcx) > n or abs(scy - lcy) > n:
+                    sparse += [scx, scy, int(4000 / (1 + scx * scx + scy * scy)) or 120]
+            if sparse:
+                self.send_now({"t": "pols", "si": self.surface_index(), "md": 60, "l": sparse})
         if self.belts_off and self.tick % 300 == 0:
             state = 5 if self.tick // 300 % 2 else 0
             self.send_reliable({"t": "st", "l": [v for b in self.belts_off for v in (b.unit, state)]})
@@ -5396,6 +5659,344 @@ class MockGame(mock_info.InfoMixin):
                 break
             self.chart(*self.map_queue.pop(0), self.map_res)
 
+    # --- distant horizon (lod) --------------------------------------------------------------
+
+    def _bump_lod_rev(self, cx, cy):
+        key = (math.floor(cx / LOD_REGION), math.floor(cy / LOD_REGION))
+        self.lod_revs[key] = self.lod_revs.get(key, 0) + 1
+
+    def _lod_int(self, v, default=None, lo=-2147483648, hi=2147483647):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            return default
+        if v < lo or v > hi:
+            return default
+        return math.floor(v)
+
+    def _lod_surface_name(self, si):
+        planets = list(PLANETS)
+        if si == 1:
+            return "nauvis"
+        if si == 2:
+            return "platform-1"
+        idx = si - 3
+        if 1 <= idx < len(planets):
+            return planets[idx]
+        return None
+
+    def _lod_resolve_si(self, msg):
+        raw_si = msg.get("si")
+        if raw_si is None:
+            return self.surface_index()
+        si = self._lod_int(raw_si)
+        if si is None:
+            return self.surface_index()
+        return si if self._lod_surface_name(si) is not None else None
+
+    def _lod_surface_state(self, sname):
+        if sname == self.surface:
+            return {
+                "entities": self.entities,
+                "by_chunk": self.by_chunk,
+                "generated": self.generated,
+                "tile_overrides": self.tile_overrides,
+                "lod_revs": self.lod_revs,
+            }
+        return self.worlds.get(sname) or {}
+
+    def _lod_is_charted(self, sname, cx, cy):
+        if sname == "nauvis":
+            if -LOD_NAUVIS_RADIUS <= cx <= LOD_NAUVIS_RADIUS and -LOD_NAUVIS_RADIUS <= cy <= LOD_NAUVIS_RADIUS:
+                return True
+            return sname == self.surface and (cx, cy) in self.charted
+        if sname == "platform-1":
+            return -1 <= cx <= 0 and -1 <= cy <= 0
+        return -32 <= cx <= 32 and -32 <= cy <= 32
+
+    def _lod_tile_at(self, sname, tx, ty):
+        if sname == self.surface:
+            return self.tile_at(tx, ty)
+        saved_s, saved_ov = self.surface, self.tile_overrides
+        self.surface = sname
+        self.tile_overrides = (self.worlds.get(sname) or {}).get("tile_overrides", {})
+        try:
+            return self.tile_at(tx, ty)
+        finally:
+            self.surface, self.tile_overrides = saved_s, saved_ov
+
+    @staticmethod
+    def _lod_proto_meta(name):
+        if name not in EID:
+            return None
+        etype = ETYPE[name]
+        if etype in LOD_EXCLUDED:
+            return None
+        w, h = ESIZE[name]
+        hw, hh = max(0.25, w * 0.5), max(0.25, h * 0.5)
+        area = max(0.25, w * h)
+        glow = 2 if etype in LOD_GLOW_STRONG else 1 if etype in LOD_GLOW_SOFT else 0
+        cat = 1 if etype in LOD_BUILDING else 2 if etype in LOD_NATURE else 3 if etype in LOD_LOW else 0
+        if cat == 1:
+            prio = 300 + min(80, area) + glow * 10
+        elif cat == 3:
+            prio = 50 if etype == "resource" else 200 + min(40, area)
+        elif cat == 2:
+            prio = 150
+        elif etype in ("entity-ghost", "tile-ghost"):
+            prio = 10
+        else:
+            prio = 100
+        return EID[name], hw, hh, area, glow, cat, prio
+
+    def _lod_send_rev_pages(self, si, q, triples):
+        if not triples:
+            self.send_now({"t": "lodr", "si": si, "q": q, "l": []})
+            return
+        per = 800 * 3
+        for i in range(0, len(triples), per):
+            self.send_now({"t": "lodr", "si": si, "q": q, "l": triples[i:i + per]})
+
+    def _lod_charted_rows(self, sname):
+        if sname == "platform-1":
+            return [[-1, -1, 2], [0, -1, 2]]
+        r = LOD_NAUVIS_RADIUS if sname == "nauvis" else 32
+        rows = {}
+        for cy in range(-r, r + 1):
+            rows[cy] = set(range(-r, r + 1))
+        if sname == self.surface:
+            for cx, cy in self.charted:
+                rows.setdefault(cy, set()).add(cx)
+        out = []
+        for cy in sorted(rows):
+            xs = sorted(rows[cy])
+            row = [cy]
+            start = cnt = None
+            for cx in xs:
+                if start is None:
+                    start, cnt = cx, 1
+                elif cx == start + cnt:
+                    cnt += 1
+                else:
+                    row += [start, cnt]
+                    start, cnt = cx, 1
+            if start is not None:
+                row += [start, cnt]
+            out.append(row)
+        return out
+
+    def _lod_procedural_cell(self, sname, wx, wy, cx, cy, res):
+        tile = self._lod_tile_at(sname, math.floor(wx), math.floor(wy))
+        if tile in ("water", "deepwater", "empty-space", "lava", "lava-hot", "oil-ocean-shallow"):
+            return None
+        if sname == "platform-1":
+            if abs(wx) < 20 and abs(wy) < 20 and hash01(math.floor(wx / 4), math.floor(wy / 4), 101) > 0.72:
+                return ("cargo-bay" if hash01(cx, cy, 102) > 0.4 else "thruster"), 10
+            return None
+        if sname != "nauvis":
+            choices = {
+                "vulcanus": ("big-volcanic-rock", 5),
+                "fulgora": ("lightning-rod" if hash01(math.floor(wx / 4), math.floor(wy / 4), 103) > 0.5 else "fulgoran-ruin-small", 6),
+                "gleba": ("yumako-tree", 7),
+                "aquilo": ("heating-tower", 6),
+            }
+            pick, dens = choices.get(sname, ("big-rock", 5))
+            if noise(wx, wy, 28, self.seed + 19) > 0.66:
+                return pick, dens
+            return None
+        mid_x, mid_y = cx * CHUNK + 16, cy * CHUNK + 16
+        if (cx % 16 == 0 and abs(wx - mid_x) <= res) or (cy % 16 == 0 and abs(wy - mid_y) <= res):
+            return "straight-rail", 5
+        block_h = hash01(math.floor(cx / 2), math.floor(cy / 2), 91)
+        if block_h > 0.72:
+            if hash01(cx, cy, 97) > 0.90 and abs(wx - mid_x) <= res and abs(wy - mid_y) <= res:
+                return "rocket-silo", 15
+            factory_roster = (
+                ("assembling-machine-2", 9), ("assembling-machine-1", 8), ("stone-furnace", 10),
+                ("lab", 11), ("beacon", 10), ("small-lamp", 7), ("roboport", 12), ("accumulator", 11),
+                ("radar", 10), ("laser-turret", 9), ("transport-belt", 12), ("transport-belt", 10),
+                ("pipe", 7),
+            )
+            idx = int(hash01(math.floor(wx / 4), math.floor(wy / 4), 93) * len(factory_roster))
+            return factory_roster[min(idx, len(factory_roster) - 1)]
+        if noise(wx, wy, 40, self.seed + 11) > 0.72:
+            ores = ("iron-ore", "copper-ore", "coal", "stone")
+            return ores[int(noise(cx, cy, 3, self.seed + 17) * 4) % 4], 8
+        if noise(wx, wy, 28, self.seed + 13) > 0.52:
+            tname = "tree-01" if hash01(math.floor(wx), math.floor(wy), 95) > 0.4 else "tree-02"
+            return tname, 6 + int(hash01(math.floor(wx / 2), math.floor(wy / 2), 96) * 6)
+        return None
+
+    def handle_lod_sub(self, msg):
+        act = msg.get("act")
+        if not isinstance(act, str):
+            return
+        if act == "stop":
+            self.lod_queue = []
+            return
+        si = self._lod_resolve_si(msg)
+        if si is None:
+            return
+        sname = self._lod_surface_name(si)
+        q = self._lod_int(msg.get("q"), 0)
+        if act == "map":
+            rows = self._lod_charted_rows(sname)
+            pages, page, page_bytes = [], [], 0
+            for row in rows:
+                sz = len(json.dumps(row, separators=(",", ":"))) + 2
+                if page and page_bytes + sz > 27000:
+                    pages.append(page)
+                    page, page_bytes = [], 0
+                page.append(row)
+                page_bytes += sz
+            if page or not pages:
+                pages.append(page)
+            parts = len(pages)
+            for idx, w_rows in enumerate(pages, 1):
+                self.send_now({"t": "lodm", "si": si, "q": q, "part": idx, "parts": parts, "w": w_rows})
+            revs = self._lod_surface_state(sname).get("lod_revs", {})
+            triples = []
+            for (rx, ry), rev in sorted(revs.items(), key=lambda item: (item[0][1], item[0][0])):
+                if rev > 0:
+                    triples += [rx, ry, rev]
+            self._lod_send_rev_pages(si, q, triples)
+            return
+        if act == "revs":
+            rg = msg.get("rg")
+            revs = self._lod_surface_state(sname).get("lod_revs", {})
+            diff = []
+            if isinstance(rg, list):
+                for entry in rg[:512]:
+                    if isinstance(entry, list) and len(entry) >= 3:
+                        rx = self._lod_int(entry[0], lo=-4096, hi=4096)
+                        ry = self._lod_int(entry[1], lo=-4096, hi=4096)
+                        crev = self._lod_int(entry[2])
+                        if rx is not None and ry is not None and crev is not None:
+                            srev = revs.get((rx, ry), 0)
+                            if srev != crev:
+                                diff += [rx, ry, srev]
+            self._lod_send_rev_pages(si, q, diff)
+            return
+        if act == "want":
+            res = self._lod_int(msg.get("res"), 8)
+            if res not in LOD_VALID_RES:
+                res = 8
+            raw_c = msg.get("c")
+            queue, seen = [], set()
+            if isinstance(raw_c, list):
+                for entry in raw_c[:2048]:
+                    if len(queue) >= 256:
+                        break
+                    if isinstance(entry, list) and len(entry) >= 2:
+                        cx = self._lod_int(entry[0], lo=-31251, hi=31251)
+                        cy = self._lod_int(entry[1], lo=-31251, hi=31251)
+                        if cx is not None and cy is not None and (cx, cy) not in seen:
+                            seen.add((cx, cy))
+                            queue.append((cx, cy))
+            self.lod_queue = queue
+            self.lod_res = res
+            self.lod_si = si
+
+    def send_lod_chunk(self, si, cx, cy, res):
+        sname = self._lod_surface_name(si)
+        if sname is None or not self._lod_is_charted(sname, cx, cy):
+            self.send_now({"t": "lod", "si": si, "cx": cx, "cy": cy, "res": res, "none": 1})
+            return
+        n = CHUNK // res
+        cells = n * n
+        x0, y0 = cx * CHUNK, cy * CHUNK
+        half = res // 2
+        tl, cur_tid, cur_cnt = [], None, 0
+        for cy_i in range(n):
+            ty = y0 + cy_i * res + half
+            for cx_i in range(n):
+                tx = x0 + cx_i * res + half
+                tid = TID[self._lod_tile_at(sname, tx, ty)]
+                if tid == cur_tid:
+                    cur_cnt += 1
+                else:
+                    if cur_tid is not None:
+                        tl += [cur_tid, cur_cnt]
+                    cur_tid, cur_cnt = tid, 1
+        tl += [cur_tid, cur_cnt]
+
+        st = self._lod_surface_state(sname)
+        revs = st.get("lod_revs", {})
+        rv = revs.get((math.floor(cx / LOD_REGION), math.floor(cy / LOD_REGION)), 0)
+        ep = [0] * cells
+        ef = [0] * cells
+        if (cx, cy) in st.get("generated", ()):
+            ents = st.get("entities", {})
+            keys = st.get("by_chunk", {}).get((cx, cy), ())
+            prios = [0.0] * cells
+            covs = [0.0] * cells
+            for k in keys:
+                e = ents.get(k)
+                if e is None:
+                    continue
+                meta = self._lod_proto_meta(e.name)
+                if meta is None:
+                    continue
+                pid, hw, hh, _area, glow, cat, prio = meta
+                bx1, by1, bx2, by2 = e.x - hw, e.y - hh, e.x + hw, e.y + hh
+                i1 = max(0, math.floor((bx1 - x0) / res))
+                i2 = min(n - 1, math.floor((bx2 - x0 - 0.001) / res))
+                j1 = max(0, math.floor((by1 - y0) / res))
+                j2 = min(n - 1, math.floor((by2 - y0 - 0.001) / res))
+                for j in range(j1, j2 + 1):
+                    cy0 = y0 + j * res
+                    oy = max(0.0, min(by2, cy0 + res) - max(by1, cy0))
+                    for i in range(i1, i2 + 1):
+                        cx0 = x0 + i * res
+                        ox = max(0.0, min(bx2, cx0 + res) - max(bx1, cx0))
+                        idx = j * n + i
+                        covs[idx] += ox * oy if ox * oy > 0 else 0.25
+                        if prio > prios[idx] or (prio == prios[idx] and (ep[idx] == 0 or pid < ep[idx])):
+                            prios[idx] = prio
+                            ep[idx] = pid
+                            ef[idx] = glow * 16 + cat * 64
+            cell_area = res * res
+            for idx in range(cells):
+                if ep[idx] != 0:
+                    dens = max(1, min(15, math.floor(min(1.0, covs[idx] / cell_area) * 14 + 1)))
+                    ef[idx] += dens
+        else:
+            for cy_i in range(n):
+                wy = y0 + cy_i * res + res * 0.5
+                for cx_i in range(n):
+                    wx = x0 + cx_i * res + res * 0.5
+                    pick = self._lod_procedural_cell(sname, wx, wy, cx, cy, res)
+                    if pick is not None:
+                        pname, dens = pick
+                        meta = self._lod_proto_meta(pname)
+                        if meta is not None:
+                            idx = cy_i * n + cx_i
+                            ep[idx] = meta[0]
+                            ef[idx] = max(1, min(15, dens)) + meta[4] * 16 + meta[5] * 64
+
+        el, cur_pid, cur_fl, cur_cnt = [], None, None, 0
+        for idx in range(cells):
+            pid, fl = ep[idx], ef[idx]
+            if pid == cur_pid and fl == cur_fl:
+                cur_cnt += 1
+            else:
+                if cur_pid is not None:
+                    el += [cur_pid, cur_fl, cur_cnt]
+                cur_pid, cur_fl, cur_cnt = pid, fl, 1
+        el += [cur_pid, cur_fl, cur_cnt]
+        msg = {"t": "lod", "si": si, "cx": cx, "cy": cy, "res": res, "rv": rv, "tl": tl, "el": el}
+        if sname == "nauvis":
+            pol = int(4000 / (1 + cx * cx + cy * cy))
+            if pol > 0:
+                msg["pol"] = pol
+        self.send_now(msg)
+
+    def tick_lod(self):
+        si = self.lod_si or self.surface_index()
+        for _ in range(LOD_CHUNKS_PER_TICK):
+            if not self.lod_queue or len(self.outbox) >= MAX_BACKLOG:
+                break
+            cx, cy = self.lod_queue.pop(0)
+            self.send_lod_chunk(si, cx, cy, self.lod_res)
+
     # --- trains -----------------------------------------------------------------------------
 
     def mover_entity(self, unit):
@@ -5497,7 +6098,7 @@ class MockGame(mock_info.InfoMixin):
         if self.tick % NETWORK_INTERVAL == 0:
             inside = self.roboport is not None and abs(p["x"] - self.roboport.x) <= LOGISTIC_REACH and abs(p["y"] - self.roboport.y) <= LOGISTIC_REACH
             self.send_now(dict(self.network_summary(False), t="ln") if inside else {"t": "ln", "id": 0})
-        if self.tick % CARGO_INTERVAL == 0:
+        if self.tick % CARGO_INTERVAL == 0 and not self.client.get("rb"):
             fx, fy, fr = self.focus
             r = min(BELT_ITEM_RADIUS, fr)
             flat = []
@@ -5508,6 +6109,48 @@ class MockGame(mock_info.InfoMixin):
                     if abs(x - fx) <= r and abs(y - fy) <= r:
                         flat += [m["unit"], IID["iron-plate"], 4]
             self.send_now({"t": "rc", "l": flat})
+
+    def tick_robots(self):
+        fx, fy, fr = self.focus
+        snap = bool(self.client.pop("rb_snap", False))
+        records = []
+        robots_per_part = 120
+        for m in self.movers:
+            if m["name"] not in ("logistic-robot", "construction-robot") or m.get("dead_until", 0) > self.tick:
+                continue
+            x, y, _ = self.mover_state(m)
+            if abs(x - fx) > fr or abs(y - fy) > fr or not self.view_seen(x, y):
+                continue
+            ax, ay, bx, by = m["ax"], m["ay"], m["bx"], m["by"]
+            if ax == bx and ay == by:
+                flags = 2 | 128 | (512 if snap else 0)
+                tx, ty, nx, ny, ori_i = ax, ay, 0, 0, 0
+            else:
+                cycle = (self.tick + m["phase"]) % 240
+                if cycle < 120:
+                    tx, ty, nx, ny = bx, by, ax, ay
+                    flags = 0 | 8 | 32 | (512 if snap else 0)
+                else:
+                    tx, ty, nx, ny = ax, ay, bx, by
+                    flags = 0 | 32 | 64 | (512 if snap else 0)
+                dx, dy = tx - x, ty - y
+                ori_i = int(((math.atan2(dx, -dy) / (2 * math.pi)) % 1.0) * 1000 + 0.5) % 1000
+            records += [
+                m["unit"], EID[m["name"]], self.tick,
+                fixed(x), fixed(y), fixed(tx), fixed(ty),
+                0 if ax == bx and ay == by else fixed(nx),
+                0 if ax == bx and ay == by else fixed(ny),
+                ori_i, flags,
+            ]
+        nu = len(records) // 11
+        parts = max(1, math.ceil(nu / robots_per_part))
+        period = self.rate_period("rb", 20)
+        for p_idx in range(parts):
+            u_slice = records[p_idx * robots_per_part * 11:(p_idx + 1) * robots_per_part * 11]
+            msg = {"t": "rb", "part": p_idx + 1, "parts": parts, "p": period, "sm": 1000, "u": u_slice}
+            if snap and p_idx == 0:
+                msg["snap"] = 1
+            self.send_now(msg)
 
     def tick_trains(self):
         tr = self.train

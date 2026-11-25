@@ -13,6 +13,7 @@ const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const CharacterPoints := preload("res://scripts/player/character_points.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const FOLLOW_RATE := 18.0
 
@@ -80,7 +81,9 @@ const NOT_SELF := 0xFFFFFFFF & ~SELF_LAYER
 ## Nor do they cast belt items' shadows (ItemCards.BELT_LAYER): an item kind is one MultiMesh over the
 ## whole square round the character, so at night every 3D item went through the flashlight's pass and
 ## each lantern cube face it touched, for shadows a few pixels long. --item-light-shadows=on keeps them.
-static var item_light_shadows := "--item-light-shadows=on" in OS.get_cmdline_user_args()
+static var item_light_shadows := Switches.has("--item-light-shadows=on")
+## --lantern-shadow=cube: render all 6 cube faces instead of dual-paraboloid for the character lantern.
+static var lantern_dual_paraboloid := not (Switches.has("--lantern-shadow=cube"))
 var _lantern := OmniLight3D.new()
 ## Factorio's character also lights a cone ahead of it at night (its `light`'s oriented cone,
 ## shifted 13 tiles forward): a flashlight.
@@ -158,7 +161,7 @@ const STAND_MAX := 0.3
 const STEP_UP_RATE := 30.0  # most of the way up in about 0.1 s,
 const STEP_DOWN_RATE := 20.0  # down a touch slower
 ## `--belt-step=off`: walking through belts, as before, whatever the setting says (docs/RUNNING.md).
-static var belt_step_switch := not ("--belt-step=off" in OS.get_cmdline_user_args())
+static var belt_step_switch := Switches.on("--belt-step")
 static var _belt_step := -1  # Settings > Graphics > Step onto belts: -1 unread, then 0 or 1
 var _body: Array = []  # the nodes hidden while in a vehicle or seen from inside (first person)
 var _body_at: Array = []  # their own positions, for the capsule stand-in's lift
@@ -227,6 +230,7 @@ func _ready() -> void:
 	_lantern.position = Vector3(0, LANTERN_HEIGHT, 0)
 	_lantern.light_energy = 0.0
 	_lantern.shadow_enabled = true
+	_lantern.omni_shadow_mode = OmniLight3D.SHADOW_DUAL_PARABOLOID if lantern_dual_paraboloid else OmniLight3D.SHADOW_CUBE
 	add_child(_lantern)
 	_flashlight.light_color = Color(1.0, 0.83, 0.62)
 	var casters := NOT_SELF if item_light_shadows else NOT_SELF & ~ItemCards.BELT_LAYER
@@ -258,7 +262,7 @@ func _ready() -> void:
 	_flashlight.light_energy = 0.0
 	_flashlight.visible = false
 	add_child(_flashlight)
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--anim-pose="):
 			_demo = arg.get_slice("=", 1)
 		elif arg.begins_with("--anim-rate="):
@@ -375,6 +379,7 @@ func _own_copy(model: ArrayMesh) -> ArrayMesh:
 		if m != null:
 			m = ModelLibrary.ModelLods.copy_material(m)
 			_materials.append(m)
+			m.set_shader_parameter("ground_rigid", true)  # lifted whole onto hills: no bend at a cliff
 		out.surface_set_material(i, m)
 	return out
 
@@ -597,7 +602,7 @@ func _update_body() -> void:
 ## N1: in a vehicle the character's lights go out, as Factorio draws nothing of a character in a
 ## vehicle, its lights neither; the vehicle's own lights shine instead (vehicle_lights.gd).
 ## --vehicle-lights=off keeps them on, as before.
-static var vehicle_lights := not ("--vehicle-lights=off" in OS.get_cmdline_user_args())
+static var vehicle_lights := Switches.on("--vehicle-lights")
 var _night := 0.0
 
 
@@ -640,7 +645,7 @@ static func flashlight_height() -> float:
 
 static func _flashlight_mode() -> String:
 	var mode := "new"
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--flashlight="):
 			mode = "old" if arg.get_slice("=", 1) == "old" else "new"
 	if RenderingServer.get_current_rendering_method() == "gl_compatibility":

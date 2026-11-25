@@ -25,7 +25,8 @@ extends Node
 ##   (`door_n`, `door_s`) open and its charging points (`charge`) light up while a robot flies
 ##   within a few tiles, and a logistic chest's hatch (`hatch_e`, `hatch_w`) while a robot hovers
 ##   over it (also guesses: the mod doesn't send door states); gate doors sink into the ground
-##   while the character or a friendly vehicle is close (Factorio opens them for its own force).
+##   as the bridge says Factorio opens and closes them (`st`), else (no state sent) while the
+##   character or a friendly vehicle is close (Factorio opens them for its own force).
 ##   Those near the camera are looked for here a few times a second; the shader moves them.
 ##
 ## What needs the game's state every frame stays here, in the chunks near the camera:
@@ -51,6 +52,8 @@ const SILO_CLOSING := 5
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const MomentHold := preload("res://scripts/world/moment_hold.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Entity types the mod reports working states for (ANIMATED_TYPES in the mod's registry.lua).
 ## Others (turrets, chests) count as always working for their glow.
@@ -102,7 +105,7 @@ const ROCK_DRIVER := "spin_crank"
 ## The agricultural tower's crane swings slowly round while the tower works (m-space2); a
 ## splitter's gear wheels turn about once per two loops of its 32-frame structure (a guess at the
 ## gears' turn from the sprite, at yellow speed).
-const SPIN_SPEEDS_EXTRA := {"spin_crane": 0.04, "spin_turbine_pad": 0.09, "spin_turbine_fan": 0.23, "spin_gear": 60.0 / 64.0}
+const SPIN_SPEEDS_EXTRA := {"spin_crane": 0.04, "spin_turbine_pad": 0.09, "spin_turbine_fan": 0.23, "spin_gear": 60.0 / 64.0, "engine_fan": 2.2}
 ## Models whose parts move whether or not the mod reports them working (Factorio runs their
 ## animation all the time): the landing pad's turbine.
 const ALWAYS_MOVING := {"cargo-landing-pad": true}
@@ -171,7 +174,23 @@ const WORM_TURN := 8.0  # radians a second (Factorio's worms turn almost at once
 ## must be to open one (tiles from the gate's centre).
 const GATE_SPEED := 0.0666666 * 60.0
 const GATE_REACH := 2.5
+## Factorio's gate prototypes have activation_distance 3, but the client isn't sent it: 4 kept.
 const GATE_VEHICLE_REACH := 4.0
+## `--gate-open=old`: the old rule, the world's focus (where an add-on's camera looks) opening gates
+## within GATE_REACH and flying robots opening them like vehicles.
+static var gate_old := Switches.has("--gate-open=old")
+## A gate's real state, from the bridge (`st`, its perf switch gate_state): 0 closed, 1 opening, 2 opened,
+## 3 closing. A gate with one follows it and isn't guessed for; one without (an old bridge, the switch off, the
+## mock) is guessed as before. `--gate-state=guess`: every gate guessed whatever is sent, with the fixed vehicle
+## reach (the behaviour before the bridge sent gates).
+static var gate_guess := Switches.has("--gate-state=guess")
+const GATE_CLOSED := 0
+const GATE_OPENING := 1
+const GATE_OPENED := 2
+const GATE_CLOSING := 3
+## The guess: a vehicle's reach grows to GATE_LEAD seconds of its travel (at least GATE_VEHICLE_REACH), so the
+## doors are down when a fast one arrives (they take a quarter second).
+const GATE_LEAD := 0.4
 
 ## How the shader moves a part (factorio_material.gdshaderinc anim_mode). NONE: turned here
 ## (turret heads, collectors' arms) or not at all.
@@ -185,6 +204,7 @@ const MOTION_LINEAR := 6
 const MOTION_FADE := 7
 ## A modeller's baked (skeletal) animation, played from its bones' texture (model_skin.gd).
 const MOTION_BAKED := 8
+const MOTION_BAKED_LINEAR := 9
 const WAVES := {"out": 0, "swing": 1, "spin": 2}
 ## What this node does with a Group (Group.kind).
 const KIND_GLOW := 0  # a glowing model's instances: written when the working state changes
@@ -217,14 +237,19 @@ class Group:
 	var units := PackedInt64Array()
 	var bases: Array[Transform3D] = []
 	var stateful := PackedByteArray()  # state_source per instance: 1 the entity reports a working state, 2 its hand says
+	var hint_sg := PackedByteArray()  # snapshot `extra.sg` fallback per instance (1-4) for distant rail signals
 	## Each instance's custom data as last set, so nothing reads it back from the RenderingServer
 	## (a wait for the render thread when it runs on its own).
 	var customs := PackedColorArray()
 	var kind := -1  # KIND_*
+	var woundable := false  # true for worms (rig_mode == 4) and spawners (rig_mode == 2)
 	var epoch := -1  # the clock epoch all its instances were last written on
 	var look := 0.0  # near-checked groups: seconds to the next look (each group on its own beat)
 	var drawn: Array[Transform3D] = []  # turret heads, collectors' arms: each instance's transform as last set
 	var _index := {}  # entity key -> instance index, or an Array of them (indices_of)
+	var _buf := PackedFloat32Array()
+	var _stride := 0
+	var _custom_off := 0
 
 	## The instances of an entity in this group (cargo bays' pieces put one entity in several).
 	func indices_of(key) -> Array:
@@ -302,6 +327,10 @@ var turrets: Node
 var collectors: Node
 ## rockets.gd: a launch holds its silo's doors open.
 var rockets: Node
+## Where the client's own character stands (tiles, ground plane), or Vector2.INF when it has none
+## here (not connected, the remote view on another surface). main.gd sets it every frame: gates open
+## for it, not for the focus, which an add-on's camera moves to wherever it looks.
+var character_at := Vector2.INF
 ## Instances' states written (place, state changes, migration) and the microseconds that took,
 ## for probes and tests.
 var writes := 0
@@ -321,6 +350,10 @@ var _arm_units := {}
 ## (HEAT_STATE_TYPES) The heat pipes hot enough to glow (unit -> 1), and those a glowing group holds.
 var heat_working := {}
 var _heat_units := {}
+## Live blood & bullet wounds on static creatures (worms rig_mode == 4, spawners rig_mode == 2):
+## unit -> packed negative INSTANCE_CUSTOM.b, and unit -> Array of [WeakRef(Group), instance_idx].
+var _wounds := {}
+var _wound_groups := {}
 
 ## Group.stateful: the entity's glow and parts follow `st` (world.working), or its hand (arm_working).
 const STATE_REPORTED := 1
@@ -329,7 +362,7 @@ const STATE_HEAT := 3
 
 
 func _ready() -> void:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--worm-state="):
 			_worm_override = float(arg.get_slice("=", 1))
 		elif arg.begins_with("--inserter-glow="):
@@ -406,6 +439,83 @@ func reset() -> void:
 	_arm_units.clear()
 	heat_working.clear()
 	_heat_units.clear()
+	_wounds.clear()
+	_wound_groups.clear()
+
+
+## Sets live bloodiness (0..1) and bullet-hit count (0..8) on a living static creature `unit`
+## (worm rig_mode == 4 or spawner rig_mode == 2), packed into negative INSTANCE_CUSTOM.b.
+## Pass blood <= 0 and hits <= 0 to clear.
+func set_unit_wounds(unit: int, blood: float, hits: int) -> void:
+	var b := clampf(blood, 0.0, 1.0)
+	var h := clampi(hits, 0, 8)
+	var packed := 0.0
+	if b <= 0.001 and h <= 0:
+		_wounds.erase(unit)
+	else:
+		packed = -(1.0 + float(h) * 2.0 + b)
+		_wounds[unit] = packed
+	_apply_wound_to_groups(unit, packed)
+
+
+## Clears all live static-creature wounds and resets INSTANCE_CUSTOM.b to 0.0 on loaded groups.
+func clear_wounds() -> void:
+	if _wounds.is_empty():
+		return
+	var units: Array = _wounds.keys()
+	_wounds.clear()
+	for unit_var in units:
+		_apply_wound_to_groups(int(unit_var), 0.0)
+
+
+func _register_wound_group(group: Group) -> void:
+	if group == null or group.mm == null:
+		return
+	var wr: WeakRef = weakref(group)
+	var seen_in_group := {}
+	for i in group.units.size():
+		var unit := int(group.units[i])
+		if unit <= 0:
+			continue
+		var entries: Array = _wound_groups.get(unit, [])
+		if not seen_in_group.has(unit):
+			seen_in_group[unit] = true
+			var kept: Array = []
+			for entry in entries:
+				var e: Array = entry
+				var g: Group = (e[0] as WeakRef).get_ref() as Group
+				if g != null and g != group and g.mm != null and g.mm != group.mm:
+					kept.append(e)
+			entries = kept
+			_wound_groups[unit] = entries
+		entries.append([wr, i])
+
+
+func _apply_wound_to_groups(unit: int, packed: float) -> void:
+	var entries_var: Variant = _wound_groups.get(unit)
+	if not (entries_var is Array):
+		return
+	var entries: Array = entries_var
+	var kept: Array = []
+	for entry in entries:
+		var e: Array = entry
+		var g: Group = (e[0] as WeakRef).get_ref() as Group
+		var idx := int(e[1])
+		if g == null or g.mm == null or idx < 0 or idx >= g.units.size() or int(g.units[idx]) != unit:
+			continue
+		if idx >= g.customs.size() or idx >= g.mm.instance_count:
+			continue
+		kept.append(e)
+		var c: Color = g.customs[idx]
+		if c.b != packed:
+			c.b = packed
+			g.customs[idx] = c
+			if g.mm.use_custom_data:
+				g.mm.set_instance_custom_data(idx, c)
+	if kept.is_empty():
+		_wound_groups.erase(unit)
+	elif kept.size() != entries.size():
+		_wound_groups[unit] = kept
 
 
 ## The clock time now (seconds since this node started).
@@ -417,14 +527,22 @@ func now() -> float:
 static func kind_of(group: Group) -> int:
 	var part := group.part
 	if part == null:
-		return KIND_WORM if _is_worm(group) else KIND_GLOW
+		if _is_worm(group):
+			return KIND_WORM
+		if _is_idle_rig(group):
+			return KIND_STILL
+		return KIND_GLOW
 	var kind := part.kind
 	if kind == "turret_head":
 		return KIND_TURRET
-	if kind == "still":
+	if kind == "headlight":
+		return KIND_GLOW
+	if kind == "still" or kind == "steer_front" or kind == "turret_barrel" or kind == "turret_coax" or kind == "tread_l" or kind == "tread_r" or kind == "tread":
 		return KIND_STILL
 	if kind.begins_with(COLLECTOR_PREFIX):
 		return KIND_COLLECTOR
+	if kind == "gate_door" or (kind == "baked" and part.model.get_slice("@", 0) == "gate"):
+		return KIND_GATE
 	if ModelLibrary.CYCLES.has(kind) or kind == "baked":
 		return KIND_TIMED
 	if ModelLibrary.HATCHES.has(kind):
@@ -433,8 +551,6 @@ static func kind_of(group: Group) -> int:
 		return KIND_TIMED
 	if ROBOPORT_KINDS.has(kind):
 		return KIND_ROBOPORT
-	if kind == "gate_door":
-		return KIND_GATE
 	if part.lit:
 		return KIND_LIT
 	if BOB_PHASE.has(kind):
@@ -512,9 +628,9 @@ static func setup_part(part: ModelLibrary.AnimPart) -> void:
 			speed = CHARGE_SPEED if kind == "charge" else (HATCH_SPEED if kind.begins_with("hatch_") else DOOR_SPEED)
 			open = float(DOOR_OPEN.get(kind, 1.0))
 		KIND_GATE:
-			motion = MOTION_LINEAR
+			motion = MOTION_BAKED_LINEAR if kind == "baked" else MOTION_LINEAR
 			speed = GATE_SPEED
-	if motion == MOTION_LINEAR or motion == MOTION_FADE:
+	if motion == MOTION_LINEAR or motion == MOTION_FADE or motion == MOTION_BAKED_LINEAR:
 		part.rate = speed
 		part.phase = open
 		range_hi = open * amount if motion == MOTION_LINEAR else 0.0
@@ -529,7 +645,7 @@ static func setup_part(part: ModelLibrary.AnimPart) -> void:
 		m.set_shader_parameter("anim_mode", motion)
 		m.set_shader_parameter("anim_wave", wave)
 		m.set_shader_parameter("anim_rate", part.rate if motion < MOTION_LIT or motion == MOTION_BAKED else 0.0)
-		if motion == MOTION_BAKED:
+		if motion == MOTION_BAKED or motion == MOTION_BAKED_LINEAR:
 			m.set_shader_parameter("bake_tex", part.bake["tex"])
 			m.set_shader_parameter("bake_frames", int(part.bake["frames"]))
 			m.set_shader_parameter("bake_snap", float(part.bake.get("snap", -2.0)))
@@ -574,26 +690,81 @@ static func _turns(model: String, kind: String) -> float:
 ## Draws a new group's instances where their entities' states have them now (chunk_view.gd, after
 ## filling its MultiMesh with the entities' transforms and `customs` with custom_for's). Without an
 ## animator they stay at rest.
+static func _write_buf_xform(group: Group, i: int, t: Transform3D) -> void:
+	var b: Basis = t.basis
+	var o: Vector3 = t.origin
+	var k: int = i * group._stride
+	group._buf[k + 0] = b.x.x
+	group._buf[k + 1] = b.y.x
+	group._buf[k + 2] = b.z.x
+	group._buf[k + 3] = o.x
+	group._buf[k + 4] = b.x.y
+	group._buf[k + 5] = b.y.y
+	group._buf[k + 6] = b.z.y
+	group._buf[k + 7] = o.y
+	group._buf[k + 8] = b.x.z
+	group._buf[k + 9] = b.y.z
+	group._buf[k + 10] = b.z.z
+	group._buf[k + 11] = o.z
+
+
+static func _write_buf_custom(group: Group, i: int, c: Color) -> void:
+	var k: int = i * group._stride + group._custom_off
+	group._buf[k + 0] = c.r
+	group._buf[k + 1] = c.g
+	group._buf[k + 2] = c.b
+	group._buf[k + 3] = c.a
+
+
+static func place_into_buffer(group: Group, anim: Node, working: Dictionary, buf: PackedFloat32Array,
+		stride: int, custom_off: int) -> PackedFloat32Array:
+	group._buf = buf
+	group._stride = stride
+	group._custom_off = custom_off
+	place(group, anim, working)
+	var out := group._buf
+	group._buf = PackedFloat32Array()
+	group._stride = 0
+	group._custom_off = 0
+	return out
+
+
 static func place(group: Group, anim: Node, working: Dictionary) -> void:
 	setup_part(group.part)
 	group.kind = kind_of(group)
+	group.woundable = _is_woundable(group)
 	group.look = randf() * TURRET_LOOK  # a new chunk's groups look on different frames
 	if group.part != null and group.part.upright:
-		for i in group.bases.size():
-			group.mm.set_instance_transform(i, group.bases[i])
+		if group._stride > 0:
+			for i in group.bases.size():
+				_write_buf_xform(group, i, group.bases[i])
+		else:
+			for i in group.bases.size():
+				group.mm.set_instance_transform(i, group.bases[i])
 	if anim != null:
 		anim._place(group, working)
 		return
 	# Nothing moves them: at rest, lit parts hidden (custom_for's data, as parts turned on the CPU read it).
 	for i in group.keys.size():
 		if group.part != null and group.part.lit:
-			group.mm.set_instance_transform(i, group.bases[i] * ModelLibrary.HIDDEN)
-		group.mm.set_instance_custom_data(i, group.customs[i])
+			var hidden_t: Transform3D = group.bases[i] * ModelLibrary.HIDDEN
+			if group._stride > 0:
+				_write_buf_xform(group, i, hidden_t)
+			else:
+				group.mm.set_instance_transform(i, hidden_t)
+		if group._stride > 0:
+			_write_buf_custom(group, i, group.customs[i])
+		else:
+			group.mm.set_instance_custom_data(i, group.customs[i])
 
 
 func _place(group: Group, working: Dictionary) -> void:
 	var t0 := Time.get_ticks_usec()
 	group.epoch = _epoch
+	var woundable: bool = group.woundable or _is_woundable(group)
+	group.woundable = woundable
+	if woundable:
+		_register_wound_group(group)
 	if group.stateful.has(STATE_ARM):
 		for i in group.units.size():
 			if group.stateful[i] == STATE_ARM:
@@ -613,8 +784,13 @@ func _place(group: Group, working: Dictionary) -> void:
 					custom.a = st.glow_at(_time)
 				elif group.stateful[i] == 1:
 					custom.a = 1.0 if int(working.get(group.units[i], 0)) == 1 else 0.0
+				if woundable:
+					custom.b = float(_wounds.get(int(group.units[i]), 0.0))
 				group.customs[i] = custom
-				group.mm.set_instance_custom_data(i, custom)
+				if group._stride > 0:
+					_write_buf_custom(group, i, custom)
+				else:
+					group.mm.set_instance_custom_data(i, custom)
 		_:
 			for i in group.keys.size():
 				_write(group, i, working)
@@ -655,7 +831,15 @@ func _write(group: Group, i: int, working: Dictionary) -> void:
 				shown = _time - st.strike_at < STRIKE_GONE
 				t = st.strike_at - start if shown else 0.0
 			else:
-				shown = (LIT_STATES.get(part.kind, []) as Array).has(int(working.get(unit, 0)))
+				var sig_val := int(working.get(unit, 0))
+				if sig_val == 0 and not working.has(unit):
+					if i < group.hint_sg.size() and group.hint_sg[i] > 0:
+						sig_val = int(group.hint_sg[i])
+					elif world != null and world.get("entities") != null:
+						var rec = world.entities.get(unit)
+						if rec != null:
+							sig_val = int(rec.extra.get("sg", 0))
+				shown = (LIT_STATES.get(part.kind, []) as Array).has(sig_val)
 			custom = Color(t, 0.0, -(1.0 + (1 if shown else 0) + parity), 1.0)
 		_:  # linear: switches (open while on), hatches, doors, gates, charging lights
 			var st := _state(key)
@@ -666,8 +850,13 @@ func _write(group: Group, i: int, working: Dictionary) -> void:
 			var glowing := group.stateful[i] == 0 or int(working.get(unit, 0)) == 1
 			custom = Color(float(l[0]) - start, float(l[1]), -(1.0 + (1 if l[2] else 0) + parity + (4 if glowing else 0)),
 				1.0 if glowing else 0.0)
+	if group.woundable:
+		custom.b = float(_wounds.get(unit, 0.0))
 	group.customs[i] = custom
-	group.mm.set_instance_custom_data(i, custom)
+	if group._stride > 0:
+		_write_buf_custom(group, i, custom)
+	else:
+		group.mm.set_instance_custom_data(i, custom)
 	writes += 1
 
 
@@ -837,9 +1026,14 @@ func _process(delta: float) -> void:
 	var spent := {}  # KIND_* -> microseconds this frame (world.prof, for --stutter-probe)
 	var lo := Vector2i(floori((focus.x - TURRET_RADIUS) / 32.0), floori((focus.y - TURRET_RADIUS) / 32.0))
 	var hi := Vector2i(floori((focus.x + TURRET_RADIUS) / 32.0), floori((focus.y + TURRET_RADIUS) / 32.0))
+	var bc: Variant = world.get("behind_cull")
+	var check_behind: bool = ViewPriority.tight_cull and bc != null and is_instance_valid(bc) and bc.is_active()
 	for cy in range(lo.y, hi.y + 1):
 		for cx in range(lo.x, hi.x + 1):
-			var cv = world.chunks.get(Vector2i(cx, cy))
+			var c := Vector2i(cx, cy)
+			if check_behind and bc.hidden(c):
+				continue
+			var cv = world.chunks.get(c)
 			if cv == null or cv.anim_groups.is_empty():
 				continue
 			var rect := Rect2(Vector2(cx, cy) * 32.0, Vector2(32.0, 32.0))
@@ -880,6 +1074,13 @@ func _process(delta: float) -> void:
 				_states.erase(key)
 				if turrets != null and key is int:
 					turrets.call("forget", key)
+		if world.get("entities") != null:
+			for unit_var in _wounds.keys():
+				if not world.entities.has(unit_var):
+					_wounds.erase(unit_var)
+			for unit_var in _wound_groups.keys():
+				if not world.entities.has(unit_var):
+					_wound_groups.erase(unit_var)
 
 
 ## Opens or shuts instance i of a linear group, writing it only when that changes.
@@ -974,25 +1175,76 @@ func _roboport(group: Group, delta: float) -> void:
 		_set_open(group, i, st, st.target == true)
 
 
-## Gate doors: open (sunk) while the character (every frame) or a friendly vehicle (looked for
-## every TURRET_LOOK or so) is near, at the gate's speed; closed again once it has gone.
+## Gate doors: with a real state from the bridge (world.working, GATE_*), they follow it: open while it opens
+## or is open, at the gate's speed, drawn at once where it settled (a gate coming into view already open is
+## drawn open). Without one: open (sunk) while the client's own character (every frame) or a friendly vehicle
+## (looked for every TURRET_LOOK or so; flying robots don't open gates, as in Factorio) is near, at the gate's
+## speed; closed again once it has gone. A character riding is the vehicle's mover; a vehicle's reach grows with
+## its speed (GATE_LEAD). `--gate-open=old`: the focus stands for the character and robots count.
+## `--gate-state=guess`: always the guess, with the fixed vehicle reach.
 func _gates(group: Group, focus: Vector2, delta: float) -> void:
 	var look := _looks(group, delta) and movers != null and movers.has_method("friendly_near")
+	var me := focus if gate_old else character_at
+	var real: Dictionary = world.working if world != null and not gate_guess else {}
+	var lead := not gate_guess and not gate_old and movers != null and movers.has_method("friendly_near_moving")
 	for i in group.keys.size():
+		var st := _state(group.keys[i])
+		var unit := int(group.units[i]) if i < group.units.size() else 0
+		if unit > 0 and real.has(unit):
+			_gate_real(group, i, st, int(real[unit]))
+			continue
 		var base := group.bases[i]
 		var at := Vector2(base.origin.x, base.origin.z)
-		var st := _state(group.keys[i])
 		if look:
-			st.target = movers.friendly_near(Vector3(at.x, 0.0, at.y), GATE_VEHICLE_REACH)
-		_set_open(group, i, st, at.distance_to(focus) <= GATE_REACH or st.target == true)
+			var from := Vector3(at.x, 0.0, at.y)
+			if lead:
+				st.target = movers.friendly_near_moving(from, GATE_VEHICLE_REACH, GATE_LEAD, false)
+			else:
+				st.target = movers.friendly_near(from, GATE_VEHICLE_REACH, gate_old)
+		_set_open(group, i, st, at.distance_to(me) <= GATE_REACH or st.target == true)
+
+
+## A gate's doors as the bridge says (GATE_*): opening or opened open them, closing or closed shut them, at the
+## gate's speed; a settled state (opened, closed) the doors aren't moving towards is drawn at once.
+func _gate_real(group: Group, i: int, st: State, state: int) -> void:
+	var open := state == GATE_OPENING or state == GATE_OPENED
+	if state == GATE_OPENED or state == GATE_CLOSED:
+		var l := _linear(st, group.part, false, false)
+		if bool(l[2]) != open:
+			st.lin[group.part.kind] = [_time, group.part.phase if open else 0.0, open]
+			_write(group, i, world.working if world != null else {})
+		return
+	_set_open(group, i, st, open)
+
+
+static func _rig_mode(group: Group) -> int:
+	# A mesh without a rig (or no mesh yet) has no rig_mode, which comes back null.
+	var mesh := group.mm.mesh if group.mm != null else null
+	if mesh == null:
+		return 0
+	for i in mesh.get_surface_count():
+		var m := mesh.surface_get_material(i) as ShaderMaterial
+		if m == null:
+			continue
+		var mode: Variant = m.get_shader_parameter("rig_mode")
+		if mode != null and int(mode) != 0:
+			return int(mode)
+	return 0
 
 
 static func _is_worm(group: Group) -> bool:
-	# A mesh without a rig (or no mesh yet) has no rig_mode, which comes back null.
-	var mesh := group.mm.mesh if group.mm != null else null
-	var m := mesh.surface_get_material(0) as ShaderMaterial if mesh != null and mesh.get_surface_count() > 0 else null
-	var mode: Variant = m.get_shader_parameter("rig_mode") if m != null else null
-	return mode != null and int(mode) == 4
+	return _rig_mode(group) == 4
+
+
+static func _is_idle_rig(group: Group) -> bool:
+	return _rig_mode(group) == 2
+
+
+static func _is_woundable(group: Group) -> bool:
+	if group.part != null:
+		return false
+	var mode := _rig_mode(group)
+	return mode == 2 or mode == 4
 
 
 ## Worms: folded (0), prepared (1) or attacking (2), in the instance's custom data, moving
@@ -1040,7 +1292,9 @@ func _worms(group: Group, focus: Vector2, delta: float) -> void:
 			st.yaw += clampf(wrapf(want - st.yaw, -PI, PI), -WORM_TURN * delta, WORM_TURN * delta)
 		_draw_at(group, i, base * Transform3D(Basis(Vector3.UP, st.yaw), Vector3.ZERO))
 		var custom := group.customs[i]
-		if custom.a != st.activity:
+		var wound := float(_wounds.get(int(group.units[i]), 0.0))
+		if custom.a != st.activity or custom.b != wound:
 			custom.a = st.activity
+			custom.b = wound
 			group.customs[i] = custom
 			group.mm.set_instance_custom_data(i, custom)

@@ -64,6 +64,7 @@ func _init() -> void:
 	_idle_glow()
 	_blend_clip()
 	_baked()
+	_fue5_pumpjack()
 	_baked_own_look()
 	_bake_rates()
 	_rig()
@@ -84,24 +85,36 @@ func _init() -> void:
 ## path the global scales.
 func _texture_metal() -> void:
 	var files := 0
-	var with_metal: Array = []
-	var with_normal_or_occlusion: Array = []
+	var unexpected_metal: Array = []
+	var unexpected_extra: Array = []
+	var missing_pbr: Array = []
 	for pack in ["placeholders", "wube3dp", "fue5"]:
-		for path in _glbs("res://assets/models/packs/" + pack):
+		for path: String in _glbs("res://assets/models/packs/" + pack):
 			files += 1
 			var doc: Variant = _glb_json(path)
+			var has_metal := false
+			var has_norm := false
+			var has_occ := false
 			for m in (doc.get("materials", []) if doc is Dictionary else []):
-				if (m as Dictionary).get("pbrMetallicRoughness", {}).has("metallicRoughnessTexture"):
-					with_metal.append(path.get_file())
-					break
-			for m in (doc.get("materials", []) if doc is Dictionary else []):
-				if (m as Dictionary).has("normalTexture") or (m as Dictionary).has("occlusionTexture"):
-					with_normal_or_occlusion.append(path.get_file())
-					break
-	check(files > 500 and with_metal.is_empty(),
-		"texture metal: no built-in pack's .glb has a metallic-roughness picture (%d files): %s" % [files, with_metal])
-	check(with_normal_or_occlusion.is_empty(),
-		"pack shading: no built-in pack's .glb has a normal or occlusion picture either (%d files): %s" % [files, with_normal_or_occlusion])
+				var md := m as Dictionary
+				if (md.get("pbrMetallicRoughness", {}) as Dictionary).has("metallicRoughnessTexture"):
+					has_metal = true
+				if md.has("normalTexture"):
+					has_norm = true
+				if md.has("occlusionTexture"):
+					has_occ = true
+			if ModelLibrary.ModelPacks.pbr(path):
+				if not (has_metal and has_norm and has_occ):
+					missing_pbr.append(pack + "/" + path.get_file())
+			else:
+				if has_metal:
+					unexpected_metal.append(pack + "/" + path.get_file())
+				if has_norm or has_occ:
+					unexpected_extra.append(pack + "/" + path.get_file())
+	check(files > 500 and unexpected_metal.is_empty(),
+		"texture metal: only PBR built-in .glbs have a metallic-roughness picture (%d files): %s" % [files, unexpected_metal])
+	check(unexpected_extra.is_empty() and missing_pbr.is_empty(),
+		"pack shading: non-PBR built-ins have no normal/occlusion pictures (%s), and every PBR built-in has all three (%s)" % [unexpected_extra, missing_pbr])
 	var shader_text := FileAccess.get_file_as_string("res://shaders/factorio_material.gdshaderinc")
 	check(shader_text.contains("global uniform float f3d_look_texture_metal;")
 		and shader_text.contains("metal = metallic * orm.b * (mp ? f3d_look_pbr_metal : f3d_look_texture_metal);"),
@@ -159,7 +172,40 @@ func _pack_pbr() -> void:
 				if m != null and (ModelLibrary._factorio(m, false, false, false) as ShaderMaterial).get_shader_parameter("modeller_tex") == true:
 					any_on = true
 		root.free()
-	check(fue5 != null and not any_on, "pack shading: FUE5's textured chest keeps Factorio's balance")
+	check(fue5 != null and not any_on, "pack shading: unmarked scene materials stay off modeller_tex")
+	var fue5_ld := ModelLibrary.Load.new()
+	fue5_ld.path = SOURCE
+	fue5_ld.pbr = ModelLibrary.ModelPacks.pbr(SOURCE)
+	fue5_ld.run()
+	var fue5_mesh := ModelLibrary._commit_load(fue5_ld, []) if fue5_ld.ok else null
+	var fue5_sm := fue5_mesh.surface_get_material(0) as ShaderMaterial if fue5_mesh != null and fue5_mesh.get_surface_count() > 0 else null
+	var wube_ld := ModelLibrary.Load.new()
+	wube_ld.path = "res://assets/models/packs/wube3dp/wooden-chest.glb"
+	wube_ld.pbr = ModelLibrary.ModelPacks.pbr(wube_ld.path)
+	wube_ld.run()
+	var wube_mesh := ModelLibrary._commit_load(wube_ld, []) if wube_ld.ok else null
+	var wube_sm := wube_mesh.surface_get_material(0) as ShaderMaterial if wube_mesh != null and wube_mesh.get_surface_count() > 0 else null
+	var wube_belt_ld := ModelLibrary.Load.new()
+	wube_belt_ld.path = "res://assets/models/packs/wube3dp/transport-belt.glb"
+	wube_belt_ld.pbr = ModelLibrary.ModelPacks.pbr(wube_belt_ld.path)
+	wube_belt_ld.run()
+	var wube_belt_mesh := ModelLibrary._commit_load(wube_belt_ld, []) if wube_belt_ld.ok else null
+	var wube_belt_on := false
+	for i in (wube_belt_mesh.get_surface_count() if wube_belt_mesh != null else 0):
+		var bsm := wube_belt_mesh.surface_get_material(i) as ShaderMaterial
+		wube_belt_on = wube_belt_on or (bsm != null and bsm.get_shader_parameter("modeller_tex") == true)
+	check(fue5_sm != null and fue5_sm.get_shader_parameter("modeller_tex") == fue5_ld.pbr
+		and fue5_sm.get_shader_parameter("use_orm_tex") == true
+		and fue5_sm.get_shader_parameter("use_normal_tex") == true
+		and fue5_sm.get_shader_parameter("occlusion_mode") == 1,
+		"pack shading: FUE5's textured chest takes PBR maps when ModelPacks.pbr() is on")
+	check(wube_sm != null and wube_sm.get_shader_parameter("modeller_tex") == wube_ld.pbr
+		and wube_sm.get_shader_parameter("use_orm_tex") == true
+		and wube_sm.get_shader_parameter("use_normal_tex") == true
+		and wube_sm.get_shader_parameter("occlusion_mode") == 1,
+		"pack shading: Wube3DP's baked wooden chest takes PBR maps when ModelPacks.pbr() is on")
+	check(wube_belt_mesh != null and not wube_belt_on,
+		"pack shading: Wube3DP's excluded belt stays on Factorio's balance")
 	var shader_text := FileAccess.get_file_as_string("res://shaders/factorio_material.gdshaderinc")
 	check(shader_text.contains("uniform bool modeller_tex = false;") and shader_text.contains("global uniform float f3d_pack_shading;")
 		and shader_text.contains("bool mp = m_modeller_tex && f3d_pack_shading > 0.5;")
@@ -300,16 +346,76 @@ func _pbr_untextured() -> void:
 	check(not bool(on_path.call(false, true)[0]), "pbr untextured: off the path with --pbr-untextured=off")
 	ModelLibrary.Load.pbr_all = true
 	check(not bool(on_path.call(false, false)[0]), "pbr untextured: a modeller's pack without \"shading\": \"pbr\" stays off it")
-	var any_on := false
-	for f in ["res://assets/models/packs/wube3dp/steel-chest.glb", "res://assets/models/packs/placeholders/stone-furnace.glb"]:
+	var non_pbr_on := false
+	for f in ["res://assets/models/packs/wube3dp/transport-belt.glb", "res://assets/models/packs/placeholders/burner-mining-drill.glb"]:
 		var ld := ModelLibrary.Load.new()
 		ld.path = f
+		ld.pbr = ModelLibrary.ModelPacks.pbr(f)
 		ld.run()
 		var mesh: Mesh = ModelLibrary._commit_load(ld, []) if ld.ok else null
 		for i in (mesh.get_surface_count() if mesh != null else 0):
 			var sm := mesh.surface_get_material(i) as ShaderMaterial
-			any_on = any_on or (sm != null and sm.get_shader_parameter("modeller_tex") == true)
-	check(not any_on, "pbr untextured: built-in models never take the pbr path")
+			non_pbr_on = non_pbr_on or (sm != null and sm.get_shader_parameter("modeller_tex") == true)
+	var sf_ld := ModelLibrary.Load.new()
+	sf_ld.path = "res://assets/models/packs/placeholders/electric-furnace.glb"
+	sf_ld.pbr = ModelLibrary.ModelPacks.pbr(sf_ld.path)
+	sf_ld.run()
+	var sf_mesh: Mesh = ModelLibrary._commit_load(sf_ld, []) if sf_ld.ok else null
+	var sf_on := false
+	for i in (sf_mesh.get_surface_count() if sf_mesh != null else 0):
+		var sm := sf_mesh.surface_get_material(i) as ShaderMaterial
+		sf_on = sf_on or (sm != null and sm.get_shader_parameter("modeller_tex") == true)
+	check(not non_pbr_on and sf_mesh != null and sf_on == ModelLibrary.ModelPacks.pbr(sf_ld.path),
+		"pbr untextured: non-PBR built-ins stay off modeller_tex while baked Placeholders take it")
+	var c1_leaked := ""
+	for f in ["res://assets/models/packs/wube3dp/big-biter.glb", "res://assets/models/packs/placeholders/big-worm-turret.glb"]:
+		for combine in [false, true]:
+			var ld := ModelLibrary.Load.new()
+			ld.path = f
+			ld.combine = combine
+			ld.pbr = true
+			ld.run()
+			var mesh: Mesh = ModelLibrary._commit_load(ld, []) if ld.ok else null
+			if mesh == null:
+				c1_leaked = "%s failed to load (combine=%s)" % [f.get_file(), combine]
+				break
+			for i in mesh.get_surface_count():
+				var sm := mesh.surface_get_material(i) as ShaderMaterial
+				var list: Array = ModelLibrary.MaterialRows.rows(sm)
+				for r in (list if not list.is_empty() else [sm]):
+					var row := r as ShaderMaterial
+					if row != null and (row.get_shader_parameter("modeller_tex") == true \
+							or (int(ModelLibrary.MaterialRows.row_vectors(row)[1].w) & ModelLibrary.MaterialRows.FLAG_MODELLER_TEX) != 0):
+						c1_leaked = "%s/%s (combine=%s)" % [f.get_file(), row.resource_name, combine]
+						break
+				if c1_leaked != "":
+					break
+			if c1_leaked != "":
+				break
+		if c1_leaked != "":
+			break
+	var ls_ld := ModelLibrary.Load.new()
+	ls_ld.path = "res://assets/models/packs/placeholders/lane-splitter.glb"
+	ls_ld.combine = false
+	ls_ld.pbr = true
+	ls_ld.run()
+	var ls_mesh: Mesh = ModelLibrary._commit_load(ls_ld, []) if ls_ld.ok else null
+	var ls_body_pbr := false
+	var ls_belt_c1_off := true
+	for i in (ls_mesh.get_surface_count() if ls_mesh != null else 0):
+		var sm := ls_mesh.surface_get_material(i) as ShaderMaterial
+		if sm == null:
+			continue
+		if sm.resource_name == "pbr_body" and sm.get_shader_parameter("modeller_tex") == true:
+			ls_body_pbr = true
+		if sm.resource_name == "belt_surface" and sm.get_shader_parameter("modeller_tex") == true:
+			ls_belt_c1_off = false
+	ModelLibrary.ModelPacks.wait()
+	var invalidated := ModelLibrary.mesh_for("behemoth-biter") != null and ModelLibrary.choices_changed(["big-biter"]) \
+		and not ModelLibrary._cache.has("behemoth-biter")
+	check(c1_leaked == "" and ls_body_pbr and ls_belt_c1_off and invalidated,
+		"pbr untextured: CUSTOM1 surfaces stay off modeller_tex while textured lane-splitter surfaces keep it (%s, body=%s, belt_off=%s, alias=%s)"
+		% [c1_leaked, ls_body_pbr, ls_belt_c1_off, invalidated])
 
 
 func _pbr_reference() -> void:
@@ -1288,6 +1394,79 @@ func _baked() -> void:
 	check(none.is_empty(), "a model without a skin has nothing to bake")
 
 
+static func _bone_xform(image: Image, j: int, f: int) -> Transform3D:
+	var r0: Color = image.get_pixel(j * 3, f)
+	var r1: Color = image.get_pixel(j * 3 + 1, f)
+	var r2: Color = image.get_pixel(j * 3 + 2, f)
+	return Transform3D(
+		Basis(Vector3(r0.r, r1.r, r2.r), Vector3(r0.g, r1.g, r2.g), Vector3(r0.b, r1.b, r2.b)),
+		Vector3(r0.a, r1.a, r2.a)
+	)
+
+
+func _fue5_pumpjack() -> void:
+	var path := ProjectSettings.globalize_path("res://assets/models/packs/fue5/pumpjack.glb")
+	var bake := ModelSkin.bake(path)
+	check(bool(bake.get("animated", false)) and int(bake.get("frames", 0)) == 81
+			and absf(float(bake.get("duration", 0.0)) - 4.0 / 3.0) < 0.01,
+		"fue5 pumpjack: animated 81 frames over 4/3 s (animated=%s frames=%s dur=%s)" % [
+			bake.get("animated"), bake.get("frames"), bake.get("duration")])
+	check(Array(bake.get("moving", PackedByteArray())) == [0, 1, 1, 1, 1, 1, 1],
+		"fue5 pumpjack: Base static and 6 bones moving (%s)" % [bake.get("moving")])
+	var image: Image = bake.get("image")
+	check(image != null, "fue5 pumpjack: baked texture image present")
+	if image != null:
+		var rest_ok := true
+		var loop_ok := true
+		for j in 7:
+			var m0 := _bone_xform(image, j, 0)
+			var m80 := _bone_xform(image, j, 80)
+			if not m0.is_equal_approx(Transform3D.IDENTITY):
+				rest_ok = false
+			if not m80.is_equal_approx(Transform3D.IDENTITY):
+				loop_ok = false
+		check(rest_ok and loop_ok, "fue5 pumpjack: frame 0 and frame 80 are Identity (%s, %s)" % [rest_ok, loop_ok])
+		var m_beam := _bone_xform(image, 1, 40)
+		var m_crank := _bone_xform(image, 2, 40)
+		var m_pit := _bone_xform(image, 3, 40)
+		var m_rod := _bone_xform(image, 4, 40)
+		var hh_tdc := m_beam * Vector3(0.0, 3.0, -1.3)
+		var eq_pt := Vector3(0.0, 2.1519, 1.0469)
+		var pin_pt := Vector3(0.0, 0.5396, 1.0456)
+		var eq_b := m_beam * eq_pt
+		var eq_p := m_pit * eq_pt
+		var pin_c := m_crank * pin_pt
+		var pin_p := m_pit * pin_pt
+		var rod_pt := Vector3(0.0, 2.0, -1.3323)
+		var rod_tdc := m_rod * rod_pt
+		check(hh_tdc.y < 2.5 and eq_b.y > 2.5,
+			"fue5 pumpjack TDC: horsehead lowers (%.3f) and tail rises (%.3f)" % [hh_tdc.y, eq_b.y])
+		check(eq_b.distance_to(eq_p) < 0.005 and pin_c.distance_to(pin_p) < 0.005,
+			"fue5 pumpjack TDC: pitman pins stay locked (eq=%.4f, crank=%.4f)" % [eq_b.distance_to(eq_p), pin_c.distance_to(pin_p)])
+		check(absf(rod_tdc.x - rod_pt.x) < 0.001 and absf(rod_tdc.z - rod_pt.z) < 0.001 and rod_pt.y - rod_tdc.y > 0.6,
+			"fue5 pumpjack TDC: polished rod drops purely vertically (%s)" % [rod_tdc])
+	var load := ModelLibrary.Load.new()
+	load.path = path
+	load.pbr = true
+	load.run()
+	check(load.ok and load.groups.size() == 1 and load.parts.size() == 1,
+		"fue5 pumpjack Load(pbr=true): 1 static group, 1 baked part (%d, %d)" % [load.groups.size(), load.parts.size()])
+	var parts: Array = []
+	var body := ModelLibrary._commit_load(load, parts)
+	var body_mat := body.surface_get_material(0) as ShaderMaterial if body != null and body.get_surface_count() > 0 else null
+	var body_arr: Array = body.surface_get_arrays(0) if body != null and body.get_surface_count() > 0 else []
+	var part_ok := parts.size() == 1 and (parts[0] as ModelLibrary.AnimPart).kind == "baked"
+	var pmesh: Mesh = (parts[0] as ModelLibrary.AnimPart).mesh if part_ok else null
+	var part_mat := pmesh.surface_get_material(0) as ShaderMaterial if pmesh != null and pmesh.get_surface_count() > 0 else null
+	var part_arr: Array = pmesh.surface_get_arrays(0) if pmesh != null and pmesh.get_surface_count() > 0 else []
+	check(part_ok and body_mat != null and part_mat != null
+			and body_mat.get_shader_parameter("modeller_tex") == true
+			and part_mat.get_shader_parameter("modeller_tex") == true
+			and not body_arr.is_empty() and body_arr[Mesh.ARRAY_COLOR] != null
+			and not part_arr.is_empty() and part_arr[Mesh.ARRAY_COLOR] != null and part_arr[Mesh.ARRAY_CUSTOM3] != null,
+		"fue5 pumpjack PBR: static body and baked part keep modeller_tex, COLOR_0, and CUSTOM3")
+
+
 ## A modeller's textured material whose every triangle moves (Vasillo's drill's Electric_Drill_Moving) keeps
 ## its own look as the still ones do: Zenith's weathering off (vas-round3-code). The baked box with its
 ## spinning half given a textured material of its own, so that material goes wholly into the baked part.
@@ -1755,6 +1934,33 @@ func _textured_levels() -> void:
 			var l_err := ModelLods.switch_error([null, l_levels[k][0], l_levels[k][2]])
 			check(l_err >= longest / float(ModelLods.TEXTURED_PIXELS[k]) * ModelLods.lod_threshold - 1e-4,
 				"legacy level %d is drawn only once the model is %d px or less" % [k + 1, int(ModelLods.TEXTURED_PIXELS[k])])
+	# Hard-edged Wube3DP models baked with PBR textures also get view LODs with intact UV islands.
+	for wube_path: String in [
+		"res://assets/models/packs/wube3dp/assembling-machine-1.glb",
+		"res://assets/models/packs/wube3dp/electric-mining-drill.glb",
+		"res://assets/models/packs/wube3dp/steel-furnace.glb",
+	]:
+		ModelLibrary._sources["f3d-test-wube-lod"] = ModelLibrary.GLTF_SOURCE + wube_path
+		var w_mesh := ModelLibrary.mesh_for("f3d-test-wube-lod") as ArrayMesh
+		ModelLibrary._sources.erase("f3d-test-wube-lod")
+		var w_name: String = wube_path.get_file()
+		check(w_mesh != null and ModelLods.textured(w_mesh), "%s loads as a textured PBR model" % w_name)
+		if w_mesh == null:
+			continue
+		var w_job: Variant = ModelLods._job_for(w_mesh)
+		check(w_job != null and w_job.textured, "%s gets a textured LOD job" % w_name)
+		if w_job == null:
+			continue
+		w_job.run()
+		w_job.run_levels()
+		ModelLods._make_levels(w_mesh, w_job.levels)
+		var w_levels := ModelLods.levels(w_mesh)
+		check(not w_levels.is_empty(), "%s produces at least one textured view LOD (%d)" % [w_name, w_levels.size()])
+		for k in w_levels.size():
+			var lod: ArrayMesh = w_levels[k][0]
+			for i in lod.get_surface_count():
+				var spread := _across_islands(ModelLods.arrays_of(w_mesh, i), lod.surface_get_arrays(i))
+				check(spread >= 0.0 and spread < 0.001, "%s level %d surface %d keeps UV islands (%.2f%% across)" % [w_name, k + 1, i, spread * 100.0])
 
 
 func _triangles(mesh: Mesh) -> int:

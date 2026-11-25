@@ -10,6 +10,7 @@ local world = require("scripts.world")
 local puppet = require("scripts.puppet")
 local space = require("scripts.space")
 local rate = require("scripts.rate")
+local robots = require("scripts.robots")
 
 local M = {}
 
@@ -427,7 +428,7 @@ function M.tick()
     local info = ok and summary(net, false) or nil
     transport.send_now(info and { t = "ln", id = info.id, log = info.log, con = info.con } or { t = "ln", id = 0 })
   end
-  if rate.due("rc", CARGO_INTERVAL) then
+  if not robots.active() and rate.due("rc", CARGO_INTERVAL) then
     local r = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
     local flat, read = {}, 0
     if r > 0 then

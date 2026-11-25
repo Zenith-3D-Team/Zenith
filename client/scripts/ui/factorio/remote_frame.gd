@@ -41,6 +41,8 @@ var networks_open := false
 ## Where the panels down the left start (screen pixels): under the title bar, and under anything of
 ## Zenith's in that corner (factorio_ui.gd's Show in Factorio button). 0: right under the title bar.
 var left_top := 0.0
+## The top of the weapon / ammo slots (screen pixels): the Surfaces panel stays above it. 0: no cap.
+var left_bottom := 0.0
 
 var title_bar := PanelContainer.new()
 ## "Remote view", the title bar's caption.
@@ -117,6 +119,7 @@ func _process(_delta: float) -> void:
 	if map_view != null and map_view.surfaces_panel.get_parent() == self:
 		map_view.surfaces_panel.visible = not networks_open and not map_view.model.map_surfaces.is_empty()
 		map_view.surfaces_panel.position = Vector2(Kit.px(BORDER) + Kit.px(4), maxf(Kit.px(TITLE_HEIGHT) + Kit.px(4), left_top))
+		map_view.fit_surfaces(left_bottom)
 		var settings_panel: Control = map_view.panel
 		settings_panel.visible = mode == "map"
 		settings_panel.reset_size()

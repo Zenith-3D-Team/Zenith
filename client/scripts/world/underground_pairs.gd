@@ -15,6 +15,7 @@ extends RefCounted
 const WorldMirror := preload("res://scripts/world/world.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const CursorOverlay := preload("res://scripts/player/cursor_overlay.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Factorio's underground_sprite (core/graphics/arrows/underground-lines.png): the lane's edges orange
 ## to yellow, its arrow yellow. Where the furthest exit can go it is tinted green (the utility
@@ -32,7 +33,7 @@ const TOO_FAR := Color(1.0, 0.0, 0.14, 0.95)
 ## underground_remove_belts sprite (underground-lines-remove.png: red-orange corner brackets round each tile, the
 ## belts' frame with the yellow arrow), and the build hides them at once (predicted.gd clear_run).
 ## `--underground-clear=off`: neither (the bridge's own switch is `/f3d-perf under_clear`).
-static var clear_on := not ("--underground-clear=off" in OS.get_cmdline_user_args())
+static var clear_on := Switches.on("--underground-clear")
 const REMOVE := Color(1.0, 0.3, 0.03, 0.95)
 const REMOVE_ARROW := Color(1.0, 1.0, 0.0, 0.95)
 ## M2's leftover: the pieces just sent to be built count as standing (`sent` below: predicted.gd
@@ -40,7 +41,7 @@ const REMOVE_ARROW := Color(1.0, 1.0, 0.0, 0.95)
 ## `add` came pairs with that entrance, so its run is hidden with the build, not when the game's `mnd`
 ## comes a tick later, and the cursor marks it meanwhile. `--underground-clear-sent=off`: only what the
 ## world has, as before.
-static var sent_on := not ("--underground-clear-sent=off" in OS.get_cmdline_user_args())
+static var sent_on := Switches.on("--underground-clear-sent")
 
 
 static func is_underground(type: String) -> bool:
@@ -172,6 +173,8 @@ static func cleared(world: WorldMirror, proto: ProtoDB.EntityProto, pos: Vector2
 	if join.is_empty() or bool(join["far"]):
 		return []
 	var r: WorldMirror.Rec = join["partner"]
+	if r.extra.has("gh"):
+		return []
 	var k: int = join["k"]
 	var way := (pos - r.pos).normalized().round()
 	var belt := proto.type == "underground-belt"

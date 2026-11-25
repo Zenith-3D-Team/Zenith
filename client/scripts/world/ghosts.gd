@@ -17,9 +17,15 @@ const Visuals := preload("res://scripts/world/visuals.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const FluidsPower := preload("res://scripts/world/fluids_power.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
+const ModelLods := preload("res://scripts/world/model_lods.gd")
 const GhostShader := preload("res://shaders/ghost.gdshader")
 const GhostDepthShader := preload("res://shaders/ghost_depth.gdshader")
 const IconShader := preload("res://shaders/billboard_icon.gdshader")
+const Switches := preload("res://scripts/switches.gd")
+
+## --ghost-lod=off: keep full-detail meshes for far entity ghosts instead of using coarse LODs.
+static var ghost_lod := Switches.on("--ghost-lod")
+const GHOST_LOD_DIST := 96.0
 
 const MARK_SIZE := 0.9
 const GHOST_TINT := Color(0.58, 0.68, 1.0, 0.42)  # ghost.gdshader's
@@ -160,8 +166,14 @@ func _rebuild(c: Vector2i) -> void:
 	add_child(node)
 	_nodes[c] = node
 	_ghosts += ghosts
+	var far_ghost := ghost_lod and world != null and (Vector2(c) * 32.0 + Vector2(16.0, 16.0)).distance_to(world.focus()) > GHOST_LOD_DIST
 	for mesh in by_model:
-		_add(node, mesh, by_model[mesh], _ghost_material)
+		var draw_mesh: Mesh = mesh
+		if far_ghost:
+			var lvls := ModelLods.levels(mesh)
+			if not lvls.is_empty():
+				draw_mesh = lvls[0][0]
+		_add(node, draw_mesh, by_model[mesh], _ghost_material)
 	for card in cards:
 		_add(node, card, cards[card], SpriteStandins.ghost_material(card, GHOST_TINT))
 	_add(node, Visuals.box_mesh(), boxes, _ghost_material)
@@ -207,5 +219,5 @@ static func _add(parent: Node3D, mesh: Mesh, xforms: Array, material: Material) 
 	mmi.multimesh = mm
 	mmi.material_override = material
 	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	mmi.lod_bias = 8.0  # the whole model at every normal zoom, should a mesh carry Godot's levels
+	mmi.lod_bias = 1.0 if ghost_lod else 8.0  # coarse levels save far ghosts when enabled; old keeps full mesh
 	parent.add_child(mmi)

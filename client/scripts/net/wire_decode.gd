@@ -13,16 +13,25 @@ extends RefCounted
 ##             numbers each), the indexes of those with extras, and their extras as one JSON array's text
 ##   kind 21   `st` (wire version 3, reliable): k, r, then blocks l, lc, ao (empty: absent)
 ##   kind 22   `ih` (wire version 3): k, part, parts, p, then one block of hands (IH_STRIDE numbers, whole)
+##   kind 23   `rb` (wire version 4): k, part, parts, p, sm, snap, then blocks u (RB_STRIDE numbers each), g
 ## A block is width u8 (4 or 8), count u32, then `count` signed numbers, read with one call
 ## (PackedByteArray.to_int32_array: no GDScript loop over them). Every length is checked against the
 ## datagram: a bad frame drops the rest of it (counted in Bridge.stats "bad_frames").
 
 const MessageDecode := preload("res://scripts/net/message_decode.gd")
+const Switches := preload("res://scripts/switches.gd")
+
+## --native-decode=off: the GDScript reader below (the default reads in C++, WireDecodeNative, when the
+## extension is loaded; same results).
+const NATIVE_CLASS := "WireDecodeNative"
+static var native_enabled := Switches.on("--native-decode")
+static var _native: RefCounted = null
 
 const WIRE_MAGIC := 0xF3
-## The highest wire version read (the hello's `bin`): 1 mv; 2 bs and bfar too; 3 chunk, ents, st and ih too.
-## A datagram's second byte is the version the bridge answered.
-const WIRE_VERSION := 3
+## The highest wire version read (the hello's `bin`): 1 mv; 2 bs and bfar too; 3 chunk, ents, st and ih too;
+## 4 rb too; 5 bs's crossing hints (`sx`: a block after qu's text, only in a part that has some). A datagram's
+## second byte is the version the bridge answered.
+const WIRE_VERSION := 5
 const KIND_JSON := 0
 const KIND_DG := 1
 const KIND_MV := 16
@@ -32,6 +41,8 @@ const KIND_CHUNK := 19
 const KIND_ENTS := 20
 const KIND_ST := 21
 const KIND_IH := 22
+const KIND_RB := 23
+const RB_STRIDE := 11
 ## An `ents` record in its block: unit, prototype id, x, y (1/256 tile), direction. Its extras, when it has
 ## any, are in the message's `xe` (Bridge parses the frame's JSON text, `xt`) at the same place as its index
 ## in `xi`.
@@ -43,6 +54,8 @@ const IH_STRIDE := 4
 const BS_FIELDS := ["lm", "sl", "ew", "sh", "pc", "pu", "dl", "of"]
 ## Numbers a record as JSON has them (sl: by its count), and whether it starts with a lane key.
 const BS_STRIDE := {"lm": 12, "ew": 4, "sh": 2, "pc": 5, "pu": 3, "dl": 1, "of": 2}
+## A `bs` crossing hint (wire version 5): unit, side, tick, out0, out1, in0, in1 (unique ids, 0: none).
+const SX_STRIDE := 7
 const LANE_KEYS := 8
 const FLAG_RELIABLE := 1
 ## An `mv` record: unit, prototype id, x, y (1/256 tile), orientation x 1000 (NO_ORIENTATION: none).
@@ -58,6 +71,23 @@ static func is_binary(packet: PackedByteArray) -> bool:
 ## parsed by the caller as a line is) or a binary message (a Dictionary, its list packed); `lengths` their
 ## bytes; `dg` the datagram's number (-1 without one); `bad` 1 when a frame was bad and the rest dropped.
 static func read(packet: PackedByteArray) -> Array:
+	var nat := native()
+	if nat != null:
+		return nat.read(packet, WIRE_VERSION)
+	return read_gd(packet)
+
+
+## The native reader, or null (switched off, or the extension isn't loaded).
+static func native() -> RefCounted:
+	if not native_enabled:
+		return null
+	if _native == null and ClassDB.class_exists(NATIVE_CLASS):
+		_native = ClassDB.instantiate(NATIVE_CLASS)
+	return _native
+
+
+## read() in GDScript: the fallback, and the reference the native one is tested against.
+static func read_gd(packet: PackedByteArray) -> Array:
 	var entries: Array = []
 	var lengths := PackedInt32Array()
 	var dg := -1
@@ -82,7 +112,7 @@ static func read(packet: PackedByteArray) -> Array:
 				return [entries, lengths, dg, 1]
 			dg = packet.decode_u32(start)
 		else:
-			var msg := message(kind, flags, packet, start, end)
+			var msg := message(kind, flags, packet, start, end, packet[1])
 			if msg.is_empty():
 				return [entries, lengths, dg, 1]
 			entries.append(msg)
@@ -91,12 +121,15 @@ static func read(packet: PackedByteArray) -> Array:
 	return [entries, lengths, dg, 0]
 
 
-## One binary frame's message, or {} when its kind is unknown or its body doesn't add up.
-static func message(kind: int, flags: int, packet: PackedByteArray, start: int, end: int) -> Dictionary:
+## One binary frame's message, or {} when its kind is unknown or its body doesn't add up. `version`: the
+## datagram's wire version (its second byte).
+static func message(kind: int, flags: int, packet: PackedByteArray, start: int, end: int, version := WIRE_VERSION) -> Dictionary:
 	if kind >= KIND_CHUNK and kind <= KIND_IH:
 		return _v3(kind, flags, packet, start, end)
+	if kind == KIND_RB:
+		return _rb(flags, packet, start, end)
 	if kind == KIND_BS:
-		return _bs(flags, packet, start, end)
+		return _bs(flags, packet, start, end, version)
 	if kind == KIND_BFAR:
 		return _bfar(packet, start, end)
 	if kind != KIND_MV:
@@ -149,7 +182,7 @@ static func _block(packet: PackedByteArray, at: int, end: int) -> Array:
 ## A `bs` part (kind 17) as its JSON gives it, the lists as PackedInt64Array in JSON's layout (keys whole
 ## again), absent when empty as the bridge leaves them; {} when it doesn't add up. The keys are joined
 ## per record (slices, no loop over the items), here on the parsing thread.
-static func _bs(flags: int, packet: PackedByteArray, start: int, end: int) -> Dictionary:
+static func _bs(flags: int, packet: PackedByteArray, start: int, end: int, version := WIRE_VERSION) -> Dictionary:
 	var p := start
 	if p + 4 > end:
 		return {}
@@ -189,11 +222,19 @@ static func _bs(flags: int, packet: PackedByteArray, start: int, end: int) -> Di
 	p = uids[1]
 	var n := packet.decode_u32(p)
 	p += 4
-	if p + n != end:
+	# (Wire version 5: after qu's text, a part with crossing hints has their block, sx; before 5 the text ends it.)
+	var text_end := p + n
+	if text_end > end or (text_end != end and version < 5):
 		return {}
+	if text_end != end:
+		var sx := _block(packet, text_end, end)
+		if sx.is_empty() or int(sx[1]) != end or (sx[0].size() % SX_STRIDE) != 0:
+			return {}
+		if sx[0].size() > 0:
+			msg["sx"] = _wide(sx[0])
 	var ids: Variant = uids[0]
 	if n > 0 or ids.size() > 0:
-		var names := packet.slice(p, end).get_string_from_utf8().split(",")
+		var names := packet.slice(p, text_end).get_string_from_utf8().split(",")
 		if names.size() != ids.size():
 			return {}
 		var qu: Array = []
@@ -230,7 +271,7 @@ static func _bs_join(field: String, flat: PackedInt64Array) -> Variant:
 			if i + 4 > size:
 				return null
 			var n := flat[i + 3]
-			if n < 0 or i + 4 + n * 4 > size:
+			if n < 0 or n > (size - i - 4) / 4:  # (not i + 4 + n * 4: a garbled n overflows it)
 				return null
 			out.append(lane_key(flat[i], flat[i + 1]))
 			out.append_array(flat.slice(i + 2, i + 4 + n * 4))
@@ -356,6 +397,44 @@ static func _v3(kind: int, flags: int, packet: PackedByteArray, start: int, end:
 	if hands.is_empty() or int(hands[1]) != end or hands[0].size() % IH_STRIDE != 0:
 		return {}
 	msg["l"] = hands[0]
+	return msg
+
+
+## A simulated worker robots message (kind 23, wire version 4): k, optional r, part, parts, p, sm,
+## snap, then packed u and optional g blocks; {} when it doesn't add up.
+static func _rb(flags: int, packet: PackedByteArray, start: int, end: int) -> Dictionary:
+	var p := start
+	if p + 4 > end:
+		return {}
+	var msg := {"t": "rb", "k": packet.decode_u32(p)}
+	p += 4
+	if flags & FLAG_RELIABLE:
+		if p + 4 > end:
+			return {}
+		msg["r"] = packet.decode_u32(p)
+		p += 4
+	if p + 20 > end:
+		return {}
+	msg["part"] = packet.decode_u32(p)
+	msg["parts"] = packet.decode_u32(p + 4)
+	msg["p"] = packet.decode_u32(p + 8)
+	msg["sm"] = packet.decode_u32(p + 12)
+	var snap := packet.decode_u32(p + 16)
+	if snap != 0:
+		msg["snap"] = snap
+	var u_block := _block(packet, p + 20, end)
+	if u_block.is_empty():
+		return {}
+	var g_block := _block(packet, int(u_block[1]), end)
+	if g_block.is_empty() or int(g_block[1]) != end:
+		return {}
+	var u_nums: Variant = u_block[0]
+	if u_nums.size() % RB_STRIDE != 0:
+		return {}
+	msg["u"] = u_nums
+	var g_nums: Variant = g_block[0]
+	if not g_nums.is_empty():
+		msg["g"] = g_nums
 	return msg
 
 

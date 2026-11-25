@@ -22,6 +22,8 @@ local inventory = require("scripts.inventory")
 local crafting = require("scripts.crafting")
 local research = require("scripts.research")
 local map = require("scripts.map")
+local lod = require("scripts.lod")
+local pollution = require("scripts.pollution")
 local trains = require("scripts.trains")
 local logistics = require("scripts.logistics")
 local planets = require("scripts.planets")
@@ -43,6 +45,7 @@ local resource_patch = require("scripts.resource_patch")
 local spiders = require("scripts.spiders")
 local belt_items = require("scripts.belt_items")
 local movers = require("scripts.movers")
+local robots = require("scripts.robots")
 local inserters = require("scripts.inserters")
 local console = require("scripts.console")
 local modules = require("scripts.modules")
@@ -54,6 +57,7 @@ local gfx = require("scripts.gfx")
 local mod_gui = require("scripts.mod_gui")
 local belt_sim = require("scripts.belt_sim")
 local perf = require("scripts.perf")
+local gc_pace = require("scripts.gc_pace")
 local barrier = require("scripts.barrier")
 local alt_mode = require("scripts.alt_mode")
 local link = require("scripts.link")
@@ -77,6 +81,11 @@ function M.init_storage()
   s.outbox = s.outbox or {}
   s.outbox_head = s.outbox_head or 1
   s.outbox_tail = s.outbox_tail or 0
+  s.outbox_prio = s.outbox_prio or {}
+  s.outbox_prio_head = s.outbox_prio_head or 1
+  s.outbox_prio_tail = s.outbox_prio_tail or 0
+  s.outbox_chunks = s.outbox_chunks or {}
+  s.outbox_chunk_wait = s.outbox_chunk_wait or {}
   s.focus = s.focus or { x = 0, y = 0, r = 32 }
   s.working = s.working or {}
   s.belt_refresh = s.belt_refresh or {}
@@ -111,6 +120,7 @@ function M.handshake(keep_view)
   s.remote_view = nil
   belt_items.far_reset()
   movers.reset()
+  robots.reset()
   rate.reset()
   photo.reset()
   transport.reset()
@@ -124,6 +134,8 @@ function M.handshake(keep_view)
   shots.reset()
   driving.reset()
   map.reset()
+  lod.reset()
+  pollution.reset()
   ui_actions.reset()
   alerts.reset()
   requests.reset()
@@ -131,6 +143,7 @@ function M.handshake(keep_view)
   s.working, s.st_at, s.st_in, s.split_sig, s.lamp_col, s.lamp_ao = {}, nil, nil, nil, nil, nil
   s.belt_refresh = {}
   s.pipe_refresh = {}
+  s.evq = nil
   s.wire_sigs, s.wire_at, s.wire_in = {}, nil, nil
   s.handshake_tick = game.tick
   local c = puppet.get()
@@ -159,8 +172,12 @@ function M.handshake(keep_view)
     sid = s.save_id,
     -- The link between add-ons and their mods (link.lua), its version.
     ext = link.VERSION,
+    -- A filmed scene's cue tick set by remote.call("zenith", "set_cue", tick) (link.lua), if any.
+    cue = link.cue(),
     -- The binary wire version it sends this client (transport.lua), absent for JSON text.
     bin = s.client and s.client.bin or nil,
+    -- Distant Horizon LOD support (lod.lua), present when the client's hello asked for `lod`.
+    lod = s.client and s.client.lod and 1 or nil,
   })))
   -- The rest a stage a tick (handshake_tick): together they took 35 ms in one tick on the owner's
   -- save. Meanwhile only the transport and the stages run (control.lua), as before for one tick.
@@ -258,6 +275,7 @@ function M.change_surface(c)
   end
   belt_items.far_reset()
   movers.reset()
+  robots.reset()
   world.clear()
   screens.reset()
   combat.reset()
@@ -267,10 +285,13 @@ function M.change_surface(c)
   shots.reset()
   driving.reset()
   map.reset()
+  lod.reset()
+  pollution.reset()
   puppet.reset()
   s.working, s.st_at, s.st_in, s.split_sig, s.lamp_col, s.lamp_ao = {}, nil, nil, nil, nil, nil
   s.belt_refresh = {}
   s.pipe_refresh = {}
+  s.evq = nil
   s.wire_sigs, s.wire_at, s.wire_in = {}, nil, nil
   s.surface_index = surface.index
   s.focus = { x = p.x, y = p.y, r = 32 }
@@ -531,10 +552,13 @@ local function drop_client()
   shots.reset()
   driving.reset()
   map.reset()
+  lod.reset()
+  pollution.reset()
   world.clear()
   transport.reset()
   s.belt_refresh = {}
   s.pipe_refresh = {}
+  s.evq = nil
   s.client = nil
 end
 
@@ -623,9 +647,9 @@ function handlers.hello(msg, port)
     end
     s.client = { sid = sid, port = port, last_seen = game.tick, z = msg.z == 1, dc = msg.dc == 1, b = msg.b == 1,
       bl = msg.bl == 1, bs = msg.bs == 1, bg = msg.bl == 1 and msg.bg == 1, br = msg.bl == 1 and msg.br == 1,
-      ie = msg.ie == 1 or msg.ie == 2, ih_too = msg.ie == 2, ho = msg.ho == 1, v = tonumber(msg.v) or 0, mg = msg.mg ~= 0,
+      ie = msg.ie == 1 or msg.ie == 2, ih_too = msg.ie == 2, ho = msg.ho == 1, rb = msg.rb == 1, v = tonumber(msg.v) or 0, mg = msg.mg ~= 0,
       dq = msg.dq == 1, lv = msg.lv == 1, dd = decorative_distance(msg.dd), pn = player_name(msg.pn),
-      bin = binary_version(msg.bin) }
+      bin = binary_version(msg.bin), lod = msg.lod == 1 or msg.lod == true }
     if not rate.held() then
       s.rate = nil -- a new client starts at full rate; it sends `rate` if it wants another
     end
@@ -651,6 +675,8 @@ function handlers.hello(msg, port)
   -- And with `ho` 1 (inserters.lua placed records) the items a hand put on a belt, by id, for the
   -- client's belt simulation to put on as the hand lets go.
   s.client.ho = msg.ho == 1
+  -- Worker robot flight simulation (robots.lua `rb`).
+  s.client.rb = msg.rb == 1
   -- Belt groups (belt_items.lua) build on kept lanes: a client says both.
   s.client.bg = msg.bl == 1 and msg.bg == 1
   -- Straight runs (belt_items.lua): plain lanes moved by the client, also on kept lanes.
@@ -661,6 +687,7 @@ function handlers.hello(msg, port)
   s.client.dq = msg.dq == 1
   -- Chunks it keeps after they leave its square (world.lua `kept`): told the counts its copy matches.
   s.client.lv = msg.lv == 1
+  s.client.lod = msg.lod == 1 or msg.lod == true
   -- Binary frames (transport.lua): every hello says it again, so the map setting turned off takes
   -- effect at the next one (the client reads both kinds of datagram whatever the welcome said).
   local bin = binary_version(msg.bin)
@@ -741,6 +768,24 @@ function handlers.resync(msg)
     world.resend_all()
     belt_items.far_reset()
     movers.reset()
+    robots.reset()
+  end
+end
+
+-- Selective NACK for missed reliable sequence numbers `r` (retransmits from transport's ring
+-- buffer when `nack_ring` is on; when off, falls back to `world.resend(msg.c)` so aged-out or
+-- cold misses when `nack_ring` is on rely on the client's timeout `resync` instead of gating
+-- storage writes on the module-local ring).
+function handlers.nack(msg)
+  if type(msg.r) ~= "table" then
+    return
+  end
+  if perf.on("nack_ring") then
+    transport.retransmit(msg.r)
+    return
+  end
+  if type(msg.c) == "table" then
+    world.resend(msg.c)
   end
 end
 
@@ -810,6 +855,7 @@ handlers.unghost = map.unghost
 handlers.mtr = map.trains
 handlers.mrp = map.roboports
 handlers.lpad = map.landing_pad
+handlers.lod_sub = lod.handle
 handlers.bfar = belt_items.set_far
 handlers.bre = belt_items.resend
 handlers.rate = rate.set
@@ -1197,6 +1243,9 @@ function M.status_command(cmd)
   end
   for _, line in ipairs(profile.report()) do
     lines[#lines + 1] = line
+  end
+  if perf.on("gc_pace") then
+    lines[#lines + 1] = "[Zenith] " .. gc_pace.status()
   end
   M.reply(cmd, lines)
 end

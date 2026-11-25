@@ -17,6 +17,7 @@
 local transport = require("scripts.transport")
 local profile = require("scripts.profile")
 local photo = require("scripts.photo")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -62,12 +63,17 @@ function M.limit()
 end
 
 -- Units left this tick. With `job` and `share` (0-1), also no more than that share of the budget
--- for this job, so one long queue can't starve the others.
-function M.left(job, share)
+-- for this job, so one long queue can't starve the others. With `floor_units` and `near_rate` on,
+-- evaluates limit/share against `math.max(b.limit, floor_units)` while `b.used` stays unchanged.
+function M.left(job, share, floor_units)
   local b = state()
-  local free = b.limit - b.used
+  local limit = b.limit
+  if type(floor_units) == "number" and floor_units > 0 and perf.on("near_rate") then
+    limit = math.max(limit, floor_units)
+  end
+  local free = limit - b.used
   if job and share then
-    free = math.min(free, math.floor(b.limit * share) - (b.jobs[job] or 0))
+    free = math.min(free, math.floor(limit * share) - (b.jobs[job] or 0))
   end
   return free
 end
@@ -75,8 +81,8 @@ end
 -- Whether a slice of `price` units may run now: when it fits what is left, or, when it doesn't,
 -- as the job's first slice this tick while anything is left (so a slice dearer than the whole
 -- budget still moves; that tick goes over by at most that slice, and `wb` counts it).
-function M.can(price, job, share)
-  local left = M.left(job, share)
+function M.can(price, job, share, floor_units)
+  local left = M.left(job, share, floor_units)
   if price <= left then
     return true
   end

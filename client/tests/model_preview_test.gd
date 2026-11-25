@@ -1183,7 +1183,8 @@ func _lit(state) -> Array:
 ## turns about its axle (X), its top towards the front (-Z), working on the animator's clock.
 func _play_wheels(pv: ModelPreview) -> void:
 	pv.interactive = false
-	for name: String in ["cargo-wagon@builtin:fue5", "locomotive@builtin:fue5", "cargo-wagon@builtin:placeholders"]:
+	for name: String in ["cargo-wagon@builtin:fue5", "locomotive@builtin:fue5", "cargo-wagon@builtin:placeholders",
+			"car@builtin:placeholders", "tank@builtin:placeholders"]:
 		await _show(pv, name)
 		await process_frame
 		check(pv.can_play(), "%s: its wheels can play" % name)
@@ -1195,10 +1196,32 @@ func _play_wheels(pv: ModelPreview) -> void:
 				continue
 			var c: Color = g.customs[0]
 			var top: Vector3 = g.part.turned(-0.1) * (g.part.pivot.origin + Vector3.UP * g.part.wheel_radius()) - g.part.pivot.origin
-			if c.b < -0.5 and int(floor(-c.b - 1.0)) & 1 == 1 and g.part.motion == Anim.MOTION_SPIN 					and g.part.axis.is_equal_approx(Vector3.RIGHT) and g.part.rate < 0.0 and top.z < 0.0:
+			if c.b < -0.5 and int(floor(-c.b - 1.0)) & 1 == 1 and g.part.motion == Anim.MOTION_SPIN \
+					and g.part.axis.is_equal_approx(Vector3.RIGHT) and g.part.rate < 0.0 and top.z < 0.0:
 				wheels += 1
 		check(wheels >= 4, "%s: playing, its wheels roll forward about their axles: %d" % [name, wheels])
+		if name.begins_with("tank"):
+			var track_mms := 0
+			var first_mm: MultiMeshInstance3D = null
+			for c_copy in state.copies:
+				if c_copy is MultiMeshInstance3D and c_copy.multimesh != null and c_copy.multimesh.instance_count == 32:
+					track_mms += 1
+					if first_mm == null:
+						first_mm = c_copy
+			check(track_mms == 2 and first_mm != null, "tank preview: 2 closed-loop track MultiMeshes (%d)" % track_mms)
+			if first_mm != null:
+				var x0: Vector3 = first_mm.get_meta("cleat0_origin", Vector3.ZERO)
+				for _j in 5:
+					await process_frame
+				var x1: Vector3 = first_mm.get_meta("cleat0_origin", Vector3.ZERO)
+				check(not x0.is_equal_approx(x1), "tank preview: cleats advance while playing: %s -> %s" % [x0, x1])
 		pv.set_playing(false)
+		if name.begins_with("tank"):
+			var shown_after := 0
+			for child in pv._holder.get_children():
+				if child is MeshInstance3D and (child as MeshInstance3D).visible:
+					shown_after += 1
+			check(shown_after > 0 and state.copies.is_empty(), "tank preview: stopped restores originals and clears copies")
 
 
 func _play(pv: ModelPreview) -> void:
@@ -1233,6 +1256,22 @@ func _play(pv: ModelPreview) -> void:
 		if c is MeshInstance3D and (c as MeshInstance3D).visible:
 			shown += 1
 	check(not pv.is_playing() and state.groups.is_empty() and state.time() == 0.0 and shown > 0, "stopped: back at rest, the originals drawn")
+	# FUE5's pumpjack: rigged & baked animation plays in place.
+	await _show(pv, "pumpjack@builtin:fue5")
+	await process_frame
+	check(pv.can_play(), "FUE5 pumpjack has baked moving parts to play")
+	var fue5_baked := 0
+	for c in pv._holder.get_children():
+		if c is MultiMeshInstance3D and c.has_meta("anim_part"):
+			var part: ModelLibrary.AnimPart = c.get_meta("anim_part")
+			var rest_box: AABB = c.get_meta("rest_box", AABB())
+			var mm := (c as MultiMeshInstance3D).multimesh
+			var mat := mm.mesh.surface_get_material(0) as ShaderMaterial if mm != null and mm.mesh != null and mm.mesh.get_surface_count() > 0 else null
+			if part != null and part.kind == "baked" and mat != null and mat.get_shader_parameter("anim_mode") == 8 \
+					and mat.get_shader_parameter("bake_tex") is Texture2D and rest_box.end.y > 3.3:
+				fue5_baked += 1
+	check(fue5_baked == 1, "FUE5 pumpjack draws 1 baked MultiMeshInstance3D with anim_mode 8 (%d)" % fue5_baked)
+	_play_baked(pv, "pumpjack@builtin:fue5", 1)
 	# A belt: standing still at rest, scrolling while playing.
 	await _show(pv, "transport-belt@builtin:wube3dp")
 	await process_frame

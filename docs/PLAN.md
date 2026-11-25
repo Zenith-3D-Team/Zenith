@@ -1,21 +1,14 @@
 # Zenith: Project Plan
 
-**Goal:** play a running Factorio game in true 3D, with an angled camera close to the character
-and a 3D model for every entity. Factorio still runs the game; Zenith draws it.
+**Goal:** Play a real running Factorio 2.1 game in 3D, with an angled camera close to the character and a 3D model for every entity. Factorio remains the sole simulation; Zenith renders it and sends input back.
 
-This document covers the approach, the architecture and the art pipeline, and where each stands.
-The models, family by family, are in [ASSET-INVENTORY.md](ASSET-INVENTORY.md).
+Model-by-model asset status lives in [ASSET-INVENTORY.md](ASSET-INVENTORY.md).
 
 ---
 
 ## 1. The constraint that shapes everything
 
-Factorio's engine is a closed-source 2D sprite renderer. The Lua modding API can define
-prototypes, swap sprites, run game logic and draw 2D overlays (`LuaRendering`). It has
-**no access to the renderer**: no meshes, no custom shaders, and no camera control.
-So a mod cannot turn the Factorio window itself into a 3D game.
-
-That leaves three routes:
+Factorio's Lua API cannot control 3D meshes, custom shaders, or the 3D camera. That leaves three routes:
 
 ```mermaid
 flowchart TD
@@ -25,7 +18,7 @@ flowchart TD
     Q --> C["C. Remake the game<br/>in a 3D engine"]
     A --> A2["Same fixed camera:<br/>looks 3D, isn't"]
     B --> B2["Real 3D, and the real game:<br/>saves, multiplayer, other mods"]
-    C --> C2["Years of work, legal risk,<br/>not a mod any more"]
+    C --> C2["Years of work, legal risk,<br/>no longer Factorio"]
     B2 --> CHOSEN(["Chosen"])
 
     classDef no fill:#eeeeee,stroke:#999,color:#444
@@ -34,20 +27,7 @@ flowchart TD
     class B,B2,CHOSEN yes
 ```
 
-| Route | What it is | Real 3D? | Verdict |
-|---|---|---|---|
-| **A. Pre-rendered reskin** | Model in Blender, render to sprite sheets, ship as a normal mod | No. Same fixed camera, just a "rendered from 3D" look | A by-product, not the goal |
-| **B. Factorio as the simulation, external 3D client** | A mod streams game state over localhost to a separate 3D app that renders it, and player input flows back | **Yes** | **Chosen** |
-| C. Remake the game in a 3D engine | Clone Factorio from scratch | Yes | Years of work, legal risk, and no longer a mod |
-
-**Why B:** Factorio keeps doing all the hard work: belts, fluids, trains, biters, power,
-saves, multiplayer, and compatibility with other mods. You only build a renderer and an
-input layer. Every Blender model you make for B can also be rendered into sprites for A,
-so the art is never wasted.
-
-The key enabler was added in **Factorio 2.0.59**: `helpers.send_udp` / `helpers.recv_udp` and the
-`on_udp_packet_received` event. These let a mod talk to a local program over UDP when the game
-is launched with `--enable-lua-udp <port>`.
+Factorio 2.0.59's `helpers.send_udp` / `recv_udp` (`--enable-lua-udp <port>`) unlocks **Route B** cleanly: belts, fluids, trains, biters, saves, multiplayer, and Factorio mods stay untouched inside Factorio while the client handles 3D rendering and UI.
 
 ---
 
@@ -55,12 +35,12 @@ is launched with `--enable-lua-udp <port>`.
 
 ```mermaid
 flowchart LR
-    MOD["<b>Factorio, unchanged engine</b><br/>mod: factorio-3d-bridge (Lua)<br/><br/>on connect: prototype dictionaries<br/>chunk snapshots: tiles and entities<br/>build, mine, die, rotate events as deltas<br/>near the camera, every 1-4 ticks:<br/>movers, belt items, inserter hands, machine states<br/>incoming packets become the character's actions"]
-    CL["<b>3D client (Godot 4)</b><br/><br/>world mirror: chunks, entity records, smoothing<br/>renderer: glTF models, MultiMesh instancing, LOD, lighting<br/>camera: angled view, Factorio's view, first person<br/>input becomes commands: walk, mine, build, rotate, open<br/>fallback: a box for anything without a model"]
-    MOD == "helpers.send_udp" ==> CL
-    CL == "helpers.recv_udp, every tick" ==> MOD
-    GLB[("Model packs<br/>assets/models/packs/, models/")] --> CL
-    INST[("The player's Factorio install<br/>icons, sprites, sounds")] -.-> CL
+    MOD["<b>Factorio 2.1 Engine (Unchanged)</b><br/>mod: factorio-3d-bridge<br/><br/>data-final-fixes: mod gfx &amp; step sounds<br/>handshake: protos, recipes, eprops, gfx<br/>sliced chunks &amp; Distant Horizon tiles<br/>belt_sim + robots deltas, 256-frame NACK ring<br/>commands -> puppet/player actions"]
+    CL["<b>Zenith 3D Client (Godot 4.7+)</b><br/><br/>Bridge + WireDecodeNative + C++ Belt/Mover Sim<br/>MultiMesh chunks + Distant Horizon 2.5D<br/>FSR 2.2 / LookPass shaders / PBR packs<br/>Add-on Host (API 1.91 + api.game link)<br/>Factorio-matched UI (ui_model.gd)"]
+    MOD == "Binary Wire v1-5 / JSON over UDP :34200<br/>(or TCP :34200 via server/relay.py)" ==> CL
+    CL == "Commands &amp; NACK/Resync -> recv_udp" ==> MOD
+    GLB[("Model Packs<br/>Zenith.zip, FUE5, Wube3DP, Placeholders")] --> CL
+    INST[("Player's Factorio Install<br/>sprites, icons, sounds, fonts, config.ini")] -.-> CL
 
     classDef game fill:#f4d9a6,stroke:#9a6b1f,color:#1d1608
     classDef client fill:#cfe3f7,stroke:#2f6aa3,color:#0b1a2a
@@ -70,195 +50,90 @@ flowchart LR
     class GLB,INST data
 ```
 
-**Why Godot 4 for the client:** it is free (MIT), imports glTF from Blender cleanly, has
-`MultiMeshInstance3D` for drawing thousands of belts and items cheaply, and has UDP built in
-(`PacketPeerUDP`).
+**Why Godot 4.7+:** MIT-licensed, clean glTF/PBR workflow, `MultiMeshInstance3D` instancing, native AMD FSR 2.2 support, and GDExtension C++ support (`client/native/belt_sim/`) for hot loops.
 
 **Two play modes:**
 
-1. **Headless mode (the main setup).** The client's menu starts Factorio as a headless server
-   with no window, and the bridge mod drives a character for the client: your save's own
-   character when you load a save. Every screen (inventory, crafting, machines, research, map,
-   trains, logistics, blueprints) is rebuilt in the client in Factorio's style, so you never need
-   Factorio's window. Ctrl+F9 can still open Factorio itself, joined to the same game.
-2. **Hybrid mode.** Factorio runs normally in single-player with its window open (launched with
-   `--enable-lua-udp 34200`), and the client drives the player's own character, so both windows
-   show the same game. It has been played once, on Factorio 2.1.24, but not tried much yet.
+1. **Headless server (primary):** The menu launches headless Factorio (`server/`), taking over the save's character (`takeover.lua`) and rendering every Factorio GUI in-client. Press `Ctrl+F9` to inspect or join in Factorio's window.
+2. **Hybrid single-player:** Connects to an open Factorio window launched with `--enable-lua-udp 34200` and controls the player's active character directly.
 
 ---
 
-## 3. Verified API building blocks (Factorio 2.1.x)
+## 3. Verified API & UDP transport notes (Factorio 2.1.x)
 
-| Need | API |
+| Need | Factorio Lua API |
 |---|---|
-| Send state to the client | `helpers.send_udp(port, data, for_player?)` (needs `--enable-lua-udp`) |
-| Receive commands | `helpers.recv_udp(for_player?)` each tick, then `defines.events.on_udp_packet_received` (`payload`, `source_port`, `player_index`) |
-| Encode/decode | `helpers.table_to_json`, `helpers.json_to_table` |
-| Debug dump / fallback transport | `helpers.write_file(filename, data, append?, for_player?)` → `script-output/` |
-| World snapshot | `surface.find_entities_filtered{area=...}`, `surface.find_tiles_filtered{area=...}`, `surface.get_chunks()` |
-| Change tracking | `on_built_entity`, `on_robot_built_entity`, `on_space_platform_built_entity`, `script_raised_built`, `script_raised_revive`, `on_player_mined_entity`, `on_robot_mined_entity`, `on_entity_died`, `script_raised_destroy`, `on_object_destroyed`, `on_player_rotated_entity`, `on_player_flipped_entity`, tile events, `on_chunk_generated` |
-| Belts | `entity.belt_shape` (straight/left/right), `transport_line.get_detailed_contents()` (item, position, `unique_id`) |
-| Inserter arms | `entity.held_stack`, `entity.held_stack_position`, `entity.pickup_position`, `entity.drop_position` |
-| Machine animation | `entity.status`, `entity.is_crafting()`, `entity.crafting_progress` |
-| Vehicles / trains / spidertron | `entity.orientation`, `entity.torso_orientation` |
-| Placeholders | `prototype.collision_box`, `prototype.tile_width`, `prototype.map_color` / `friendly_map_color` |
-| Control | `player.walking_state`, `player.mining_state`, `player.selected`, `player.build_from_cursor{position, direction}`, `entity.rotate{by_player=...}`, `player.opened` |
-| Lighting | `surface.daytime`, `surface.darkness` |
+| Stream state & receive commands | `helpers.send_udp`, `helpers.recv_udp`, `on_udp_packet_received` |
+| Encode / dump | `helpers.table_to_json`, `helpers.json_to_table`, `helpers.write_file` |
+| World & mod data | `surface.find_entities_filtered`, `find_tiles_filtered`, `prototypes.mod_data` (`LuaModData.get`) |
+| Live change events | Built/mined/died/destroyed/rotated/flipped/tile/chunk events |
+| Belts, arms & vehicles | `belt_shape`, `transport_line.get_detailed_contents()`, `held_stack_position`, `orientation` |
+| Machines & atmosphere | `status`, `is_crafting()`, `crafting_progress`, `daytime`, `darkness` |
+| Character control | `walking_state`, `mining_state`, `build_from_cursor`, `rotate`, `opened` |
 
-Things to know about the UDP channel:
-- `--enable-lua-udp <port>` sets the port **Factorio** binds (34200 here). The mod sends to the
-  **client's** port (34201). Avoid 34197 (Factorio's multiplayer port), and make sure
-  the port is free: 2.0.60 crashed when it was already in use (since fixed).
-- Incoming packets go through the game's input-action system, so the event fires a tick or more
-  later. That keeps multiplayer deterministic. The receive buffer is 256 KB, so keep commands
-  tiny and call `recv_udp()` every tick.
-- Outgoing data is just a string. Datagrams up to 65,507 bytes arrive and bigger ones are dropped
-  silently. Each `send_udp` costs about a millisecond whatever its size, so the bridge joins
-  messages into datagrams of up to 60 KB, numbers them, and the client asks for a resync when it
-  sees a gap ([PROTOCOL.md](PROTOCOL.md)).
+Key transport constraints: Factorio UDP listens on `127.0.0.1` (`server/relay.py` handles LAN TCP bridging); packets arrive asynchronously via input actions; batching + Binary Wire `v1–5` (`0xF3`) keep datagrams under `65,507` bytes; reliable sequence numbers (`r`) use a `256`-frame retransmit ring (`nack`) backed by chunk `resync` ([PROTOCOL.md](PROTOCOL.md)).
 
 ---
 
-## 4. Conventions (decide once, never revisit)
+## 4. Conventions (fixed)
 
-- **Units:** 1 Factorio tile = 1 metre = 1 Blender unit = 1 Godot unit.
-- **Axes:** Factorio `(x, y)` (x east, y south) maps to Godot `(x, height, y)`. Factorio north is
-  Godot `-Z` and Blender `+Y`.
-- **Facing:** model every entity facing **north**. The client rotates it:
-  `yaw = -direction / 16 * TAU` (2.x uses 16 directions: north=0, east=4, south=8, west=12),
-  or `yaw = -orientation * TAU` for vehicles.
-- **Origin:** the centre of the entity's footprint, at ground level.
-- **File names:** `<prototype-name>.glb` in a model pack: the built-in ones are
-  `client/assets/models/packs/<pack>/`, more go in the `models` folder beside Zenith. The client
-  looks models up by prototype name in the packs' order, and a missing model falls back to a box
-  sized from the selection box.
-- **Animated parts:** nodes named `anim_*` (`anim_spin_*`, `anim_glow_*`, `anim_lit_*`, ...), which
-  the client cuts out and drives from the machine's state without a skeleton; the full list is
-  in [client/assets/models/README.md](../client/assets/models/README.md).
+- **Scale & axes:** `1` Factorio tile = `1` Blender unit = `1` Godot unit. Factorio `(x, y)` maps to Godot `(x, height, y)`. North = Blender `+Y` / Godot `-Z`.
+- **Facing & origin:** Models face **north**, origin at ground footprint centre. Client rotates by `yaw = -direction / 16 * TAU` (vehicles `-orientation * TAU`).
+- **Model lookup:** `client/assets/models/packs/<pack>/<prototype>.glb` (external overrides in `models/`), falling back to Factorio 2D sprite cards or selection-box blocks.
+- **Animation:** Either `anim_*` cut-out objects moved by shader state (`anim.gd`) or a single baked skeletal glTF action (`client/assets/models/README.md`).
 
 ---
 
 ## 5. Where it stands
 
-The project was planned in phases. Each has been built; what's left inside them is play-test
-findings and polish.
+Public `0.2.1` is out and `0.3.0` was a testers' pre-release:
 
-| Phase | What it covers | Status |
-|---|---|---|
-| The bridge | UDP link, handshake, sequence numbers and resync; walking the character from the client | Done, checked against real Factorio 2.1 |
-| Static world mirror | Chunk streaming nearest first, terrain with Factorio's tile textures, entities as records, live build/mine/rotate/destroy updates | Done |
-| A living world | Moving things, items on belts, inserter hands, machine states, day and night, lamps, fluids and power, weapons and effects, sound | Done: movers drawn on the game's measured clock, robots, creatures and machines' moving parts moved on the GPU, belt items along their lanes |
-| Control | Walking at any angle, mining, building with previews, rotating, every screen, blueprints and planners, wires, vehicles, trains, Space Age | Done in headless mode; hybrid mode played once, side by side with Factorio's window |
-| Models | A model for every entity in the base game and Space Age | Every family has one; 39 entities use FUE5's textured models; some are still being refined against the sprites ([ASSET-INVENTORY.md](ASSET-INVENTORY.md)) |
-| Scale | Level of detail, shadows fitted to the view, far chunks merged, frame budgets; on the bridge's side a per-tick work budget, update rates and a client that holds the game at 60 UPS | Mostly there: the owner's save holds about 60 UPS and walks mostly smoothly; forests and long view distances still cost the GPU most ([PERFORMANCE-PLAN.md](PERFORMANCE-PLAN.md)) |
-| Add-ons | Programs that add to the client without forking it, through one versioned API | Built (add-on API 1); the cinematic camera add-on is the first |
-| Release | Mod zip for the portal, an exported client with the mod and server scripts beside it | Released: 0.1 is out ([ROADMAP.md](ROADMAP.md) has what comes next) |
+| Area | Status |
+|---|---|
+| **UDP bridge & binary wire** | Built & live-verified: Binary Wire `v1–5`, `nack` ring, `budget`/`rate` throttling, `server/relay.py` LAN TCP relay |
+| **World & simulation** | Headless + hybrid loops, C++ `BeltSimNative` / `WireDecodeNative` (`11`-module GDExtension), `rb` robot sim, `sx` splitter hints |
+| **Rendering & views** | MultiMesh chunks, GPU shaders, **Distant Horizon** (to `512` chunks), **AMD FSR 2.2**, per-pack PBR shading, fitted sun shadows |
+| **3D models & packs** | **`811` built-in `.glb` files** across `Placeholders` (`575`), `FUE5` (`142`), and `Wube3DP` (`94`), plus `198` 3D items, pack-supplied 3D/2D decoratives, and optional Vasillo PBR `Zenith.zip` |
+| **UI & modding** | Factorio 2.1 key parity, all core screens, `gfx` mod sprites/icons/tiles, **Add-on API `1.91`** (`4` in-repo add-ons in `addons-src/` + `Zenith-Cinematic-Camera` & `Terrain-Elevation`) |
 
-A side idea that stays open: render the finished models from Factorio's camera into sprite
-sheets, as a 3D-rendered reskin that runs inside Factorio itself (route A above).
+Remaining polish sits in `STATUS.md` and `PROGRESS.md` (dense forest GPU cost, UI last-mile differences, FUE5 missing glow/moving parts, and overhaul mod testing).
 
 ---
 
 ## 6. Converting the 2D sprites into 3D models
 
-### 6.1 Scope
-Factorio has more than 250 visible entity prototypes across base, Space Age and Elevated Rails.
-Collapsing tier variants (four belt colours share one mesh, three assemblers share one base)
-leaves roughly 120 model families for the base game and about 190 with Space Age; with
-variants (belt curves, pipe shapes, per-direction models, corpses, remnants) the client has
-over 400 `.glb` files. [ASSET-INVENTORY.md](ASSET-INVENTORY.md) lists them by family. For an authoritative
-list, including any other mods you play with, run `factorio --dump-data` and read
-`script-output/data-raw-dump.json`.
+### 6.1 Scope & exclusions
 
-The following are **not models**, so they are handled differently:
-- Terrain tiles: textures on the terrain mesh, plus a water shader.
-- Decoratives (grass tufts, pebbles): scattered instances.
-- Items on belts and on the ground: Factorio's icons on small cards, and one icon per lane for
-  belts far away.
-- Explosions, smoke, fire, projectiles, beams: Factorio's own sprite sheets on camera-facing
-  cards, from the player's install.
-- Remnants: the original model, flattened, broken and rusted by a shader.
+Factorio + Space Age + Elevated Rails cover ~`190` model families (`811` built-in `.glb` variants/pieces tracked in [ASSET-INVENTORY.md](ASSET-INVENTORY.md)). Terrain tiles, item icons/cards, particle sprite sheets (`weapon_fx.gd`), and shader-deformed remnants are handled procedurally rather than standalone entity `.glb`s.
 
-### 6.2 Priority rule
-Order by *how often it's on screen × how big it is*. Belts, inserters, pipes, poles, assemblers,
-furnaces and drills fill every screenshot of every factory. Do them first, and do them well.
+### 6.2 Model pipeline & workflow
 
-### 6.3 Per-model workflow
-**Source order (the project's rule):** 1) Wube's printable model if the entity has one (convert it);
-2) otherwise build it to match the 2D sprites as closely as possible: same silhouette,
-proportions, colours, materials and wear, so the 3D game reads as Factorio. Models are built
-from code (Blender scripts in `tools/models/`), not generated by image-to-3D. Where the FUE5 fan
-project (a Factorio remake in Unreal Engine 5) has a textured model, the owner chose to draw that
-instead (`tools/models/fue5.py`, into the FUE5 pack, `client/assets/models/packs/fue5/`; 39
-entities, all drawn by the packs' default order, Wube3DP's 7 of the same name included): richer close up, though its
-outlines follow the sprites more loosely and some follow older Factorio designs. Our own models
-stay beside them, in their packs.
+**Source priority:** Convert Wube's 3D printables (`wube.py`) where available; otherwise build procedural Blender scripts (`tools/models/`) matched to Factorio HR sprites, or adapt/pack modeller assets (`fue5.py`, `fix_pack.py`).
 
 ```mermaid
 flowchart TD
-    START(["A prototype to model"]) --> W{"Did Wube release<br/>a printable model?"}
-    W -- yes --> CONV["Convert it<br/>(tools/models/wube.py)"]
-    W -- no --> REF["Collect references:<br/>HR sprites, every direction and frame"]
-    REF --> BLOCK["Block out the footprint<br/>against the sprite in Factorio's camera"]
-    BLOCK --> KIT["Detail with the shared kit"]
-    CONV --> FIT["Fit to the sprite"]
-    KIT --> FIT
-    FIT --> COL["Colours sampled from the sprite<br/>(part_colors.py)"]
-    COL --> ANIM["Moving parts as anim_* nodes"]
-    ANIM --> CHECK{"check.py passes, and it matches<br/>the sprite in gallery.py?"}
-    CHECK -- no --> FIT
-    CHECK -- yes --> DONE(["Export .glb, import into the client"])
+    START(["Prototype to model"]) --> SRC{"Source?"}
+    SRC -- "Wube printable" --> WUBE["Convert Wube STL/OBJ<br/>(tools/models/wube.py)"]
+    SRC -- "Modeller / FUE5 asset" --> ADAPT["Convert / normalize pack<br/>(fue5.py / fix_pack.py)"]
+    SRC -- "Sprite-matched Blender" --> REF["Gather HR sprites + --dump-data<br/>Block out & detail with kit.py"]
+
+    WUBE --> FIT["Fit silhouette & score vs sprites<br/>(compare.py / gallery.py)"]
+    ADAPT --> FIT
+    REF --> FIT
+
+    FIT --> COL["Sample colors / bake PBR<br/>(part_colors.py / bake_pbr.py)"]
+    COL --> ANIM["Tag anim_* nodes or baked loop"]
+    ANIM --> CHK{"tools/models/check.py<br/>& client review pass?"}
+    CHK -- no --> FIT
+    CHK -- yes --> EXP(["Export .glb + godot --import"])
 
     classDef wube fill:#c9ecc9,stroke:#2e7d32,color:#0d260d
     classDef step fill:#cfe3f7,stroke:#2f6aa3,color:#0b1a2a
-    class CONV wube
-    class REF,BLOCK,KIT,FIT,COL,ANIM step
+    class WUBE,ADAPT wube
+    class REF,FIT,COL,ANIM step
 ```
 
-1. **Collect references.** The HR sprite sheets in the player's install
-   (`<Factorio>/data/*/graphics/entity/<name>/`), every direction and animation frame, and the
-   prototype data from `factorio --dump-data`. References stay in the git-ignored `art-src/` and
-   are never committed.
-2. **Block out the footprint** to the prototype's `collision_box` and `selection_box`, and build
-   the shape in Factorio's camera so its silhouette matches the sprite. Vehicles, wagons and
-   turrets ship with 64-256 rotation frames, which amount to a free turntable.
-3. **Detail** with the shared kit (`kit.py`, `detail.py`): pipe flanges, bolts, rivets, vents,
-   seams, hazard stripes, grilles.
-4. **Score it** against the sprite in every direction: the silhouette overlap from `score.py`,
-   `score_proto.py`, `score_world.py`, `space_score.py` or `creature_score.py`. Where Factorio drew
-   each direction as its own render, the model is one per direction too.
-5. **Colour** each part from the sprite (`part_colors.py`); the client adds weathering by material
-   name.
-6. **Animate** (the cheapest technique that looks right):
-
-   | Kind | Technique | Examples |
-   |---|---|---|
-   | Rigid moving parts | `anim_*` nodes moved by the model shader from the machine's state, timed from the prototype's animation | Assembler arms, drill heads, radar dish, pistons, hatches |
-   | Arm reaching a point | Parts turned towards the hand position the mod sends | Inserters |
-   | Scrolling surface | UV scroll at belt speed | Belts, undergrounds, splitters |
-   | Creatures and character | A skeleton (character), posed models and a limb rig in the shader | Character, biters, spitters, worms, pentapods |
-   | Shape depends on neighbours | Variant models picked at runtime | Pipes, walls, heat pipes, rails, curved belts |
-   | Long or curved geometry | Procedural mesh | Power-pole wires, demolisher segments, spidertron legs |
-
-7. **Check** with `check.py` (name, footprint, origin, triangle budget), compare side by side with
-   the sprite in `gallery.py`, and look at it in the client with `review.py`.
-
-### 6.4 Budgets
-| Category | Triangles (LOD0) | LODs |
-|---|---|---|
-| Spammed logistics (belts, inserters, pipes, poles, chests) | ≤ 1.5k | 2 (≤ 300 at distance) |
-| Common machines (assemblers, furnaces, drills) | ≤ 10k | 2 |
-| Landmarks (rocket silo, refinery, nuclear reactor, foundry) | ≤ 40k | 2-3 |
-| Creatures | ≤ 8k, ≤ 40 bones | 2 |
-| Trees and rocks | ≤ 3k | 2 + impostor |
-
-### 6.5 How it went
-
-The plan expected 150-250 working days of hand modelling. Instead the models were written as
-Blender scripts by AI coding agents, checked against the sprites by the scores above and
-reviewed by the owner in the client. Every family has a model; the ones whose shape or colours
-still differ from the sprite are marked in [ASSET-INVENTORY.md](ASSET-INVENTORY.md). Later the owner
-swapped in FUE5's hand-made, textured models for 39 base-game entities.
+**Triangle budgets (LOD0):** Spammed logistics `<= 1.5k` (2 LODs); common machines `<= 10k` (2 LODs); landmarks `<= 40k` (2–3 LODs); creatures `<= 8k` (`<= 40` bones); trees & rocks `<= 3k` (2 LODs + impostor).
 
 ---
 
@@ -266,25 +141,22 @@ swapped in FUE5's hand-made, textured models for 39 base-game entities.
 
 | Risk | Mitigation |
 |---|---|
-| Lua time per tick makes the game stutter | Stream only within a radius, use change events instead of polling, do big jobs in slices under a per-tick work budget, send the costliest updates less often when the game runs slow (the client's `rate`), profile with `/f3d-profile` |
-| UDP packet loss or size limits | Sequence numbers, resync on gaps, datagrams under the measured 65,507-byte limit |
-| Modded entities with no model | Automatic box + icon placeholder, so every mod renders |
-| Multiplayer desync | `send_udp` never changes game state, and received input arrives via input actions. Never let the bridge read client-local state into the simulation |
-| Factorio API changes (2.0 → 2.1 → …) | Keep the bridge mod small, pin `factorio_version`, isolate API calls in one file |
-| Art that doesn't read as Factorio | Every model is scored against its sprite and reviewed in the client; box placeholders keep anything unmodelled playable |
-| Legal | Keep it free and non-commercial, credit Wube, and **never redistribute Factorio's own PNGs or sounds**. The client loads them from the player's install. Most 3D models are the project's own; those converted from Wube's prints or from FUE5 keep their own non-commercial licences (CREDITS.md). Not legal advice; Wube's terms of service are the authority. |
+| Lua UPS cost on megabases | Event deltas, focus-radius culling, sliced `budget.lua`, client `rate` governor (`60 UPS` hold), `C++` belt/robot offloading |
+| Packet loss or datagram caps | Binary Wire `v1–5` under `60 KB`, `256`-frame `nack` ring + `resync`, TCP `relay.py` over LAN |
+| Multiplayer desync | Pure deterministic `storage` updates in ticks/events; input travels via Factorio input actions |
+| Legal / IP boundaries | Never redistribute Factorio assets; load sprites/sounds/fonts from player install at runtime; GPL-3.0 code + upstream NC credits ([CREDITS.md](../CREDITS.md)) |
 
 ---
 
 ## 8. Repository layout
 
-```
+```text
 zenith/
-├── README.md, ARCHITECTURE.md, MODDING.md
-├── docs/                     ← this plan, the asset inventory, protocol, running and player's guide
-├── mod/factorio-3d-bridge/   ← the Factorio mod (Lua)
-├── client/                   ← the Godot 4 project; models in client/assets/models/packs/
-├── server/                   ← scripts that run headless Factorio with the mod
-└── tools/                    ← mock server, tests, live checks, model scripts, release packaging
+├── README.md, ARCHITECTURE.md, MODDING.md, STATUS.md, PROGRESS.md
+├── mod/factorio-3d-bridge/   # Bridge mod (Lua + data-final-fixes mod graphics)
+├── client/                   # Godot 4.7+ client, packs/, native C++ GDExtension (native/)
+├── addons-src/               # In-repo add-ons (shaders, weather, enemies, sprint)
+├── server/                   # Headless Factorio launchers (.ps1/.sh) + LAN relay (relay.py)
+├── tools/                    # check.py, mock_server.py, live_check.py, models/, release/
+└── docs/                     # Guides, PROTOCOL.md, SWITCHES.md, ASSET-INVENTORY.md, plans
 ```
-

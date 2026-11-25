@@ -25,6 +25,8 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const CursorOverlay := preload("res://scripts/player/cursor_overlay.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## [sprite under core/graphics, size in tiles] for the three kinds: Factorio's utility sprites
 ## indication_arrow (64 px at scale 0.5) and fluid_indication_arrow(_both_ways) (48 px at 0.5).
@@ -42,6 +44,18 @@ const CRAFTERS := ["assembling-machine", "furnace"]
 const MACHINES := ["boiler", "generator", "fusion-reactor", "fusion-generator"]
 const PUMPS := ["pump", "offshore-pump"]
 
+## --alt-arrows-opt=off: rebuild all MultiMeshes with fresh buffers and string key on every view shift.
+static var opt_enabled := Switches.on("--alt-arrows-opt")
+## The changed chunks' arrows worked out a slice a frame (nearest first), and a little each frame while
+## Alt-mode is off so turning it on finds them ready (the owner's spike log: 58.6 ms in the frame
+## Alt-mode came on, every chunk at once). --alt-marks-sliced=off: all at once when shown, as before
+## (quality_marks.gd reads the same switch).
+static var sliced := Switches.on("--alt-marks-sliced")
+const ON_USEC := 2000
+const OFF_USEC := 300
+## Chunks' arrows worked out while Alt-mode was off (that _work_dirty said changed): refresh() redraws.
+var _off_changed := false
+
 var world: WorldMirror
 var model  # ui_model.gd: eprops
 var fog: Node = null  # remote_fog.gd
@@ -51,15 +65,35 @@ var _layers: Array[MultiMeshInstance3D] = []
 ## Fluid icons by fluid (L10), made as a fluid is first drawn.
 var _icon_layers := {}
 var _chunk_arrows := {}  # chunk -> [[Transform3D], [Transform3D], [Transform3D], {fluid: [Transform3D]}] by kind
+var _chunk_vers := {}  # chunk -> int revision
+var _next_chunk_ver := 1
 var _dirty := {}  # chunk -> true
 var _all_dirty := true
-var _shown_key := ""  # the chunks in view (and the fog's state) the MultiMeshes were filled for
+var _shown_key := ""  # fallback key when --alt-arrows-opt=off
+var _shown_chunks: Array[Vector2i] = []
+var _last_shown: Array[Vector2i] = []
+var _last_shown_hash := 0
+var _last_fog_key: Array = []
+var _last_cam_xform := Transform3D.IDENTITY
+var _last_cam_proj := -1
+var _last_cam_size := -1.0
+var _last_cam_fov := -1.0
+var _has_cam_snap := false
+var _layer_bufs := {}  # kind (int) -> PackedFloat32Array
+var _icon_bufs := {}  # fluid -> PackedFloat32Array
+var _layer_sigs: Array = [[], [], []]
+var _icon_sigs := {}  # fluid -> Array
+var _layer_lists: Array = [[], [], []]
+var _by_fluid_lists := {}  # fluid -> Array
+var _wired_world: WorldMirror = null
 var _settings_key := ""
 var _settings_timer := 0.0
 ## Arrows drawn (tests).
 var drawn := 0
 ## Fluid icons drawn (tests).
 var icons_drawn := 0
+## MultiMesh buffer uploads performed (tests).
+var layer_uploads := 0
 
 
 func _ready() -> void:
@@ -73,18 +107,45 @@ func _ready() -> void:
 		var mm := MultiMesh.new()
 		mm.transform_format = MultiMesh.TRANSFORM_3D
 		mm.mesh = quad
+		mm.visible_instance_count = 0
 		var mmi := MultiMeshInstance3D.new()
 		mmi.multimesh = mm
 		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		mmi.visible = false
 		add_child(mmi)
 		_layers.append(mmi)
+	_sync_world()
+
+
+func _exit_tree() -> void:
+	_disconnect_world()
+
+
+func _disconnect_world() -> void:
+	if is_instance_valid(_wired_world):
+		if _wired_world.entities_changed.is_connected(_on_chunk_dirty):
+			_wired_world.entities_changed.disconnect(_on_chunk_dirty)
+		if _wired_world.alt_changed.is_connected(_on_chunk_dirty):
+			_wired_world.alt_changed.disconnect(_on_chunk_dirty)
+	_wired_world = null
+
+
+func _sync_world() -> void:
+	if _wired_world == world:
+		return
+	_disconnect_world()
+	_wired_world = world
 	if world != null:
-		world.entities_changed.connect(func(c: Vector2i) -> void: _dirty[c] = true)
-		world.alt_changed.connect(func(c: Vector2i) -> void: _dirty[c] = true)
+		world.entities_changed.connect(_on_chunk_dirty)
+		world.alt_changed.connect(_on_chunk_dirty)
+
+
+func _on_chunk_dirty(c: Vector2i) -> void:
+	_dirty[c] = true
 
 
 func _process(delta: float) -> void:
+	_sync_world()
 	_settings_timer -= delta
 	if _settings_timer <= 0.0:
 		_settings_timer = 0.5
@@ -99,61 +160,257 @@ func _process(delta: float) -> void:
 			l.visible = false
 		for l in _icon_layers.values():
 			(l as MultiMeshInstance3D).visible = false
+		if sliced and world != null and model != null and (_all_dirty or not _dirty.is_empty()):
+			# (What changed is kept for refresh(): the arrows shown again must be made again then.)
+			_off_changed = _work_dirty(OFF_USEC) or _off_changed
 		return
 	refresh(camera)
+
+
+static func _fog_key(fog_node: Node) -> Array:
+	if fog_node == null or not fog_node.has_method("hiding") or not bool(fog_node.hiding()):
+		return [false]
+	return [true, fog_node.get("_origin"), fog_node.get("_drawn"), fog_node.get("_roboports_drawn"),
+		fog_node.get("_character"), fog_node.get("_character_radius")]
 
 
 ## Works out the dirty chunks' arrows and, if the chunks in view or any arrows changed, fills the
 ## MultiMeshes again.
 func refresh(camera: Camera3D) -> void:
+	_sync_world()
+	var changed := _work_dirty(ON_USEC if sliced else -1) or _off_changed
+	_off_changed = false
+	_refill(camera, changed)
+
+
+## Works out the dirty chunks' arrows, `budget_usec` µs' worth (at least one; all when negative);
+## whether any changed.
+func _work_dirty(budget_usec: int) -> bool:
 	var changed := false
 	if _all_dirty:
 		_all_dirty = false
 		_chunk_arrows.clear()
+		_chunk_vers.clear()
 		_dirty.clear()
-		for c in world.chunks:
-			_dirty[c] = true
+		_shown_key = ""
+		_last_shown.clear()
+		_last_shown_hash = 0
+		_has_cam_snap = false
+		for kind in _layer_sigs.size():
+			_layer_sigs[kind] = []
+		_icon_sigs.clear()
+		if sliced and budget_usec >= 0:
+			# Nearest the focus first, so what is on screen comes in the first frames.
+			var order: Array = world.chunks.keys()
+			var f: Vector2 = world.focus() if world.has_method("focus") else Vector2.ZERO
+			var fc := Vector2(f.x / 32.0, f.y / 32.0)
+			var nearer := func(a: Vector2i, b: Vector2i) -> bool:
+				return Vector2(a).distance_squared_to(fc) < Vector2(b).distance_squared_to(fc)
+			order.sort_custom(nearer)
+			for c in order:
+				_dirty[c] = true
+		else:
+			for c in world.chunks:
+				_dirty[c] = true
+		changed = true
+	if _dirty.is_empty():
+		return changed
+	var t0 := Time.get_ticks_usec()
+	var done: Array = []
 	for c in _dirty:
 		_chunk_arrows.erase(c)
+		_chunk_vers.erase(c)
 		var cv = world.chunks.get(c)
 		if cv != null:
 			var arrows := chunk_arrows(cv)
 			if not arrows.is_empty():
 				_chunk_arrows[c] = arrows
+				_chunk_vers[c] = _next_chunk_ver
+				_next_chunk_ver += 1
 		changed = true
-	_dirty.clear()
-	var planes := camera.get_frustum()
-	var shown: Array = []
-	for c in _chunk_arrows:
-		if AltOverlay._chunk_in_view(c, planes) and (fog == null or fog.seen(Vector2(c) * 32.0 + Vector2(16, 16))):
-			shown.append(c)
-	var key := str(shown)
-	if not changed and key == _shown_key:
+		done.append(c)
+		if budget_usec >= 0 and Time.get_ticks_usec() - t0 > budget_usec:
+			break
+	if done.size() >= _dirty.size():
+		_dirty.clear()
+	else:
+		for c in done:
+			_dirty.erase(c)
+	return changed
+
+
+## Fills the MultiMeshes from the chunks in view when they or (`changed`) their arrows changed.
+func _refill(camera: Camera3D, changed: bool) -> void:
+	if not opt_enabled:
+		var planes := camera.get_frustum()
+		var shown: Array = []
+		for c in _chunk_arrows:
+			if AltOverlay._chunk_in_view(c, planes) and (fog == null or fog.seen(Vector2(c) * 32.0 + Vector2(16, 16))):
+				shown.append(c)
+		var key := str(shown)
+		if not changed and key == _shown_key:
+			for l in _layers:
+				l.visible = l.multimesh.visible_instance_count > 0
+			for l in _icon_layers.values():
+				(l as MultiMeshInstance3D).visible = (l as MultiMeshInstance3D).multimesh.visible_instance_count > 0
+			return
+		_shown_key = key
+		drawn = 0
+		for kind in _layers.size():
+			var list: Array = []
+			for c in shown:
+				list.append_array(_chunk_arrows[c][kind])
+			drawn += _fill(_layers[kind], list)
+			layer_uploads += 1
+		var by_fluid := {}
+		for c in shown:
+			var icons: Dictionary = _chunk_arrows[c][ICON]
+			for fluid in icons:
+				if not by_fluid.has(fluid):
+					by_fluid[fluid] = []
+				(by_fluid[fluid] as Array).append_array(icons[fluid])
+		for fluid in by_fluid:
+			if not _icon_layers.has(fluid):
+				_icon_layers[fluid] = _icon_layer(str(fluid))
+		icons_drawn = 0
+		for fluid in _icon_layers:
+			icons_drawn += _fill(_icon_layers[fluid], by_fluid.get(fluid, []))
+			layer_uploads += 1
+		return
+	var fog_key := _fog_key(fog)
+	if not changed and _has_cam_snap and camera.global_transform == _last_cam_xform \
+			and camera.projection == _last_cam_proj and camera.size == _last_cam_size \
+			and camera.fov == _last_cam_fov and fog_key == _last_fog_key:
 		for l in _layers:
 			l.visible = l.multimesh.visible_instance_count > 0
 		for l in _icon_layers.values():
 			(l as MultiMeshInstance3D).visible = (l as MultiMeshInstance3D).multimesh.visible_instance_count > 0
 		return
-	_shown_key = key
+	_last_cam_xform = camera.global_transform
+	_last_cam_proj = camera.projection
+	_last_cam_size = camera.size
+	_last_cam_fov = camera.fov
+	_last_fog_key = fog_key
+	_has_cam_snap = true
+	var planes := camera.get_frustum()
+	var lift := GroundHeight.lift_range()
+	var has_fog := fog != null and fog.has_method("hiding") and bool(fog.hiding())
+	_shown_chunks.clear()
+	for c: Vector2i in _chunk_arrows:
+		if AltOverlay._chunk_in_view_lift(c, planes, lift) and (not has_fog or bool(fog.seen(Vector2(c) * 32.0 + Vector2(16, 16)))):
+			_shown_chunks.append(c)
+	_shown_chunks.sort()
+	var sh := _shown_chunks.size()
+	for c: Vector2i in _shown_chunks:
+		sh = sh * 1000003 ^ (c.x * 73856093 ^ c.y * 19349663)
+	if not changed and sh == _last_shown_hash and _shown_chunks == _last_shown:
+		for l in _layers:
+			l.visible = l.multimesh.visible_instance_count > 0
+		for l in _icon_layers.values():
+			(l as MultiMeshInstance3D).visible = (l as MultiMeshInstance3D).multimesh.visible_instance_count > 0
+		return
+	_last_shown_hash = sh
+	var swap := _last_shown
+	_last_shown = _shown_chunks
+	_shown_chunks = swap
 	drawn = 0
 	for kind in _layers.size():
-		var list: Array = []
-		for c in shown:
-			list.append_array(_chunk_arrows[c][kind])
-		drawn += _fill(_layers[kind], list)
-	var by_fluid := {}
-	for c in shown:
+		var sig: Array = []
+		for c: Vector2i in _last_shown:
+			var arr: Array = _chunk_arrows[c][kind]
+			if not arr.is_empty():
+				sig.append(c.x)
+				sig.append(c.y)
+				sig.append(int(_chunk_vers.get(c, 0)))
+		var mmi: MultiMeshInstance3D = _layers[kind]
+		if sig != (_layer_sigs[kind] as Array):
+			_layer_sigs[kind] = sig
+			var list: Array = _layer_lists[kind]
+			list.clear()
+			for c: Vector2i in _last_shown:
+				var arr: Array = _chunk_arrows[c][kind]
+				if not arr.is_empty():
+					list.append_array(arr)
+			drawn += _fill_buf(mmi, list, _layer_bufs, kind)
+			layer_uploads += 1
+		else:
+			var cnt := maxi(mmi.multimesh.visible_instance_count, 0)
+			mmi.visible = cnt > 0
+			drawn += cnt
+	for f in _by_fluid_lists:
+		(_by_fluid_lists[f] as Array).clear()
+	var fluid_sigs := {}
+	for c: Vector2i in _last_shown:
 		var icons: Dictionary = _chunk_arrows[c][ICON]
+		var ver := int(_chunk_vers.get(c, 0))
 		for fluid in icons:
-			if not by_fluid.has(fluid):
-				by_fluid[fluid] = []
-			(by_fluid[fluid] as Array).append_array(icons[fluid])
-	for fluid in by_fluid:
+			var arr: Array = icons[fluid]
+			if arr.is_empty():
+				continue
+			if not _by_fluid_lists.has(fluid):
+				_by_fluid_lists[fluid] = []
+			(_by_fluid_lists[fluid] as Array).append_array(arr)
+			var fsig: Array = fluid_sigs.get(fluid, [])
+			if fsig.is_empty():
+				fluid_sigs[fluid] = fsig
+			fsig.append(c.x)
+			fsig.append(c.y)
+			fsig.append(ver)
+	for fluid in fluid_sigs:
 		if not _icon_layers.has(fluid):
 			_icon_layers[fluid] = _icon_layer(str(fluid))
+			_icon_bufs[fluid] = PackedFloat32Array()
 	icons_drawn = 0
 	for fluid in _icon_layers:
-		icons_drawn += _fill(_icon_layers[fluid], by_fluid.get(fluid, []))
+		var mmi: MultiMeshInstance3D = _icon_layers[fluid]
+		var fsig: Array = fluid_sigs.get(fluid, [])
+		if fsig != (_icon_sigs.get(fluid, []) as Array):
+			_icon_sigs[fluid] = fsig
+			var flist: Array = _by_fluid_lists.get(fluid, [])
+			icons_drawn += _fill_buf(mmi, flist, _icon_bufs, fluid)
+			layer_uploads += 1
+		else:
+			var cnt := maxi(mmi.multimesh.visible_instance_count, 0)
+			mmi.visible = cnt > 0
+			icons_drawn += cnt
+
+
+## Fills a MultiMesh with these transforms using a reusable buffer in `bufs[key]`; how many.
+static func _fill_buf(layer: MultiMeshInstance3D, list: Array, bufs: Dictionary, key: Variant) -> int:
+	var n := list.size()
+	var mm := layer.multimesh
+	if n == 0:
+		mm.visible_instance_count = 0
+		layer.visible = false
+		return 0
+	if mm.instance_count < n:
+		mm.instance_count = maxi(n, mm.instance_count * 2)
+	var need := mm.instance_count * 12
+	var buf: PackedFloat32Array = bufs.get(key, PackedFloat32Array())
+	bufs.erase(key)
+	if buf.size() != need:
+		buf.resize(need)
+	var o := 0
+	for t: Transform3D in list:
+		buf[o] = t.basis.x.x
+		buf[o + 1] = t.basis.y.x
+		buf[o + 2] = t.basis.z.x
+		buf[o + 3] = t.origin.x
+		buf[o + 4] = t.basis.x.y
+		buf[o + 5] = t.basis.y.y
+		buf[o + 6] = t.basis.z.y
+		buf[o + 7] = t.origin.y
+		buf[o + 8] = t.basis.x.z
+		buf[o + 9] = t.basis.y.z
+		buf[o + 10] = t.basis.z.z
+		buf[o + 11] = t.origin.z
+		o += 12
+	if mm.instance_count > 0:
+		mm.buffer = buf
+	bufs[key] = buf
+	mm.visible_instance_count = n
+	layer.visible = true
+	return n
 
 
 ## Fills a MultiMesh with these transforms; how many.
@@ -187,6 +444,7 @@ func _icon_layer(fluid: String) -> MultiMeshInstance3D:
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.mesh = quad
+	mm.visible_instance_count = 0
 	var mmi := MultiMeshInstance3D.new()
 	mmi.multimesh = mm
 	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
@@ -286,7 +544,7 @@ static func transform(at: Vector2, way: Vector2) -> Transform3D:
 
 
 static func _turn(v: Vector2, dir: int) -> Vector2:
-	return v.rotated(float(dir) / 16.0 * TAU)
+	return v.rotated(-Wire.direction_yaw(dir))
 
 
 static func _vec(v) -> Vector2:

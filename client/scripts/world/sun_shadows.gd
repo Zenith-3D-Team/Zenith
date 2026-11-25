@@ -20,6 +20,8 @@ extends Node
 ## -> 390, triangles 1.5 -> 0.5 million). A second split cost more than it saved (each is drawn in
 ## full), and so did 8192 (+1.4 ms for sharper shadows than before).
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## Ultra's filter: Soft High's 16 PCF taps on the 8192 map; PCSS caps at Soft Medium (12 + 12 taps
 ## instead of 24 + 24) to keep contact-hardening shadows affordable.
 const ULTRA_FILTER := RenderingServer.SHADOW_QUALITY_SOFT_HIGH
@@ -39,7 +41,7 @@ const PCSS_MAX_FILTER := RenderingServer.SHADOW_QUALITY_SOFT_MEDIUM
 ## and the Cinematic look's sun size (1.4 degrees, PCSS) searched for blockers over some 200 texels with
 ## 8 taps, missing thin casters (holes) and hard at contacts. Now: Soft Medium (8 taps) on High and
 ## Soft High (16 taps PCF, capped at Soft Medium under PCSS) on Ultra, the blur fitted, and PCSS only
-## when a look asks for it. No screen-space anti-aliasing cleans shadow
+## when a look asks for it (art-src notes: shadows-bp.md). No screen-space anti-aliasing cleans shadow
 ## noise (only TAA or FSR2 average it, and both ghost on belts and arms), so the filter leaves none to clean.
 const QUALITY := {
 	"low": {"splits": 1, "horizon_splits": 2, "atlas": 2048, "cap": 80.0, "fade": 0.8, "blend": false, "filter": RenderingServer.SHADOW_QUALITY_SOFT_VERY_LOW, "blur": 1.0, "items": 0.0},
@@ -55,7 +57,7 @@ const OLD_FILTER := {
 	"high": {"filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 0.6},
 	"ultra": {"filter": RenderingServer.SHADOW_QUALITY_SOFT_LOW, "blur": 1.0},
 }
-static var old_filter := "--shadow-filter=old" in OS.get_cmdline_user_args()
+static var old_filter := Switches.has("--shadow-filter=old")
 ## The PCF filter's radius in texels at shadow_blur 1 for each soft filter quality: Godot's own
 ## (renderer_scene_render_rd.cpp, directional_soft_shadow_filter_set_quality, 4.7.2).
 const QUALITY_RADIUS := {
@@ -101,7 +103,7 @@ const MODES := {1: DirectionalLight3D.SHADOW_ORTHOGONAL, 2: DirectionalLight3D.S
 ## --legacy-render: the shadows as they were before (a fixed 150 tiles, four splits, two on Low;
 ## and model_lods.gd's levels of detail), for comparisons.
 const LEGACY_ATLAS := {"low": 2048, "medium": 4096, "high": 8192, "ultra": 8192}
-static var legacy := "--legacy-render" in OS.get_cmdline_user_args()
+static var legacy := Switches.has("--legacy-render")
 ## --soft-shadow-atlas=<size> (off by default: the quality's own map; 4096 measured): while the sun has an angular
 ## size (a look's soft shadows, the Cinematic look's) its shadow map is at most this big. The penumbra
 ## blurs away what Ultra's 8192 map adds, and on it the soft filter's blocker search and taps (8 + 8 a
@@ -116,21 +118,21 @@ static var soft_atlas_cap := _soft_atlas_arg()
 ## ladder's distance, the ground measured at y = 0 under a camera riding the hills (each hill walked
 ## over could flip the mode or the distance step, every shadow popping as the map moved), a
 ## 32-tile shortest distance, and split fractions set in one-map mode too.
-static var old_fit := "--shadow-fit=old" in OS.get_cmdline_user_args()
+static var old_fit := Switches.has("--shadow-fit=old")
 ## The furthest ground is measured against a plane this far under the ground at the screen's
 ## centre (with hills on), so the valleys beyond it keep their shadows.
 const VALLEY := 1.5
 
 
 static func _pancake_arg() -> float:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--shadow-pancake="):
 			return maxf(float(arg.get_slice("=", 1)), 0.1)
 	return PCSS_PANCAKE
 
 
 static func _soft_atlas_arg() -> int:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--soft-shadow-atlas="):
 			return maxi(int(arg.get_slice("=", 1)), 0)  # ("off" reads as 0)
 	return SOFT_ATLAS_DEFAULT

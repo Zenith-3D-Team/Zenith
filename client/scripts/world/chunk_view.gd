@@ -3,6 +3,7 @@ extends Node3D
 ## model (or per placeholder shape). Rebuilt whenever its contents change. A model's moving
 ## parts get a MultiMesh each, which the model shader (or anim.gd) moves between rebuilds (anim_groups).
 
+const FreeLater := preload("res://scripts/world/free_later.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
@@ -18,6 +19,10 @@ const ContactShade := preload("res://scripts/world/contact_shade.gd")
 const PipelineWarm := preload("res://scripts/world/pipeline_warm.gd")
 const NatureLooks := preload("res://scripts/world/nature_looks.gd")
 const PipeCovers := preload("res://scripts/world/pipe_covers.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const CliffWall := preload("res://scripts/world/cliff_wall.gd")
+const NativeLibrary := preload("res://scripts/native_library.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const SIZE := 32
 ## Entity types whose models get a per-entity random turn and size (see _model_transform).
@@ -25,11 +30,28 @@ const VARIED_TYPES := {"tree": true, "simple-entity": true, "resource": true}
 ## How far up its model a train stop's paint starts: Factorio paints only the top (its mask over the
 ## girder above the rails), which on FUE5's model starts at 3 of its 4.76 tiles.
 const PAINT_FROM := 0.63
+## --build-rec-cache=off: resolve every entity's model, transform, and moving parts fresh on every
+## rebuild instead of reusing the static lookup cached on Rec.
+static var build_rec_cache := Switches.on("--build-rec-cache")
+## --chunk-mm-worker=off: pack MultiMesh buffers, instance bounds, and contact-shade rings on the main
+## thread as before rather than in a WorkerThreadPool task when total instances >= WORKER_MIN_INSTANCES.
+static var chunk_mm_worker := Switches.on("--chunk-mm-worker")
+const WORKER_MIN_INSTANCES := 48
+const CHUNK_PREP_JOBS := 4
+
+
+static func prep_job_limit() -> int:
+	return clampi(OS.get_processor_count() - 2, CHUNK_PREP_JOBS, 8)
 
 var coord := Vector2i.ZERO
 var tile_ids := PackedInt32Array()
 ## False until the chunk's snapshot has arrived (or the chunk doesn't exist on the server).
 var loaded := false
+## True once both ground and initial entity visuals (or fallback timeout) are ready to reveal cleanly.
+var revealed := false
+var _terrain_held := false
+## True while this chunk displays optimistic cached data ahead of server confirmation.
+var optimistic := false
 var created_msec := Time.get_ticks_msec()
 ## When the chunk's tiles first arrived and its ground was first drawn (0: not yet).
 var tiles_msec := 0
@@ -39,11 +61,15 @@ var entities := {}  # key -> WorldMirror.Rec
 ## Raised whenever its tiles or entities change (decoratives.gd builds its mask of ground no
 ## decorative may cover again only when this moved).
 var content_rev := 0
+var build_serial := 0
+var _prep_pending: ChunkPrepJob
 var alt := {}  # key -> WorldMirror.Rec: those with an Alt-mode icon (extra.ai, issue #9)
 ## world.gd pick()'s index of `entities` by PICK_CELL square: built when first needed, emptied
 ## whenever an entity comes or goes. [protos count it was built with, {cell: [[rec, rect, area]]}];
 ## while being built a slice a frame, [protos count, grid so far, the records, the next one].
 var pick_grid: Array = []
+## world.gd rail_height()'s index of the chunk's rails and ramps: [content_rev, frame built, {cell: entries}].
+var rail_grid: Array = []
 ## The snapshot being received: how many `ents` parts its header announced (-1 before any
 ## header), and which have arrived.
 var parts_expected := -1
@@ -60,6 +86,9 @@ var placeholder_keys := {}
 var waiting_models := false
 ## Far from the camera, the buildings are one merged mesh (far_chunks.gd).
 var far := FarChunks.State.new()
+## Its cliffs as one generated wall (cliff_wall.gd, --cliff-wall=on), and how many cliffs its last build read.
+var wall := CliffWall.State.new()
+var cliff_count := 0
 ## Belts drawn small on screen are drawn with their stand-ins (belt_lods.gd, which sets belt_flat).
 ## belt_bounds: round this chunk's belts; belt_waiting: a belt was drawn whole as its stand-in was
 ## still being made (belt_lods.gd builds the chunk again once it is).
@@ -90,6 +119,15 @@ enum { SHADOWS_NONE, SHADOWS_FAR, SHADOWS_NEAR }
 ## The shadow stand-ins' GeometryInstance3D.lod_bias in SHADOWS_NEAR chunks (_apply_shadows).
 const NEAR_SHADOW_LOD_BIAS := 4.0
 var shadow_tier := SHADOWS_NEAR
+## --shadow-small=old: every model casts at every tier, as before. On (default): models under
+## FLAT_TOP tiles high cast nothing, and under FAR_SMALL_TOP nothing in SHADOWS_FAR chunks
+## (too_low_to_cast), fewer draw calls in the sun's shadow pass (the owner's 1,353).
+static var shadow_small := not (Switches.has("--shadow-small=old"))
+const FLAT_TOP := 0.08
+const FAR_SMALL_TOP := 0.55
+## Mesh's instance id -> the top of its box with its moving parts' reach (too_low_to_cast), kept for good: meshes
+## are few and their boxes don't change.
+static var _tops := {}
 ## [model's MultiMeshInstance3D, its shadow stand-in's (shown while it is ready), the proxy]
 var _shadow_pairs: Array = []
 var _proxy_generation := -1
@@ -115,7 +153,21 @@ const LOD_LOOK_AGAIN := 0.03
 ## How high a chunk's buildings reach, for its nearest point to the camera (tiles).
 const LOD_HEIGHT := 12.0
 ## --lod-cpu-copy=off: read `mm.buffer` back from RenderingServer on LOD cross-fades as before.
-static var lod_cpu_copy := not OS.get_cmdline_user_args().has("--lod-cpu-copy=off")
+static var lod_cpu_copy := Switches.on("--lod-cpu-copy")
+## --render-reads=old: a LOD switch with no CPU copy of its instances reads them back from the RenderingServer
+## (`mm.buffer`, `get_instance_transform`) as before; else it switches without the cross-fade (each read waits for
+## the render thread when it runs on its own: frames of 15 -> 76 ms).
+static var lod_no_readback := not Switches.has("--render-reads=old")
+## --lod-mesh-touch=off: skip re-writing instance 0's transform after a LOD `MultiMesh.mesh` swap
+## (Godot 4.7 Forward+ FSR2/TAA motion-vector workaround).
+static var lod_mesh_touch := Switches.on("--lod-mesh-touch")
+## --lod-fade-moving=off: keep cross-fading LOD transitions even while moving fast.
+static var lod_fade_moving := Switches.on("--lod-fade-moving")
+const LOD_SNAP_SPEED := 12.0
+
+
+static func should_snap_for_speed(speed_tiles_per_sec: float) -> bool:
+	return lod_fade_moving and speed_tiles_per_sec > LOD_SNAP_SPEED
 
 
 class LodState:
@@ -131,6 +183,7 @@ class LodState:
 	var custom := false
 	var group: Anim.Group
 	var switches: Array = []
+	var buffer := PackedFloat32Array()
 ## Each tile's texture slot (x + 64 * y), kept between rebuilds: it depends only on this chunk's
 ## tiles and their pictures, and neighbours arriving rebuild the terrain several times. Empty:
 ## work them out again (terrain_mesher.gd).
@@ -203,6 +256,8 @@ func clear_entities() -> void:
 	alt.clear()
 	pick_grid = []
 	content_rev += 1
+	build_serial += 1
+	_prep_pending = null
 
 
 func start_snapshot(parts: int) -> void:
@@ -233,6 +288,24 @@ func is_incomplete() -> bool:
 ## Whether the ground drawn is the simpler one of far chunks (TerrainMesher.coarse, world.gd COARSE_FROM).
 var ground_coarse := false
 
+## The chunk's baked flat decoratives drawn by the ground's own shader (decoratives.gd, terrain_common.gdshaderinc):
+## the land and shore surfaces of the terrain mesh, and the chunk's own copies of their materials that
+## carry the sheet. Set on the MeshInstance3D, never on the mesh: a kept mesh is shared with other builds.
+var _land_surface_idx := -1
+var _shore_surface_idx := -1
+var _decor_sheet_tex: ImageTexture
+var _decor_raised_shade := 0.0
+var _decor_chunk_origin := Vector2.ZERO
+var _decor_shown := true
+var _decor_land_mat: ShaderMaterial
+var _decor_shore_mat: ShaderMaterial
+
+
+func set_terrain_held(held: bool) -> void:
+	_terrain_held = held
+	if _terrain != null:
+		_terrain.visible = not held
+
 
 ## Shows the terrain a TerrainMesher job built for this chunk (on a worker thread, see world.gd).
 func apply_terrain(job: TerrainMesher) -> void:
@@ -240,9 +313,17 @@ func apply_terrain(job: TerrainMesher) -> void:
 	ground_coarse = job.coarse
 	var mesh := ArrayMesh.new()
 	var t0 := Time.get_ticks_usec() if Probing.on else 0
+	_land_surface_idx = -1
+	_shore_surface_idx = -1
 	if job.land.has_faces():
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, job.land.arrays(), [], {}, TerrainMesher.TerrainSurface.FORMAT)
 		mesh.surface_set_material(mesh.get_surface_count() - 1, Visuals.terrain_material())
+		_land_surface_idx = mesh.get_surface_count() - 1
+	if job.shore.has_faces():
+		# The coast, with its own shader: it cuts the shore with `discard`, which the land's has none of.
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, job.shore.arrays(), [], {}, TerrainMesher.TerrainSurface.FORMAT)
+		mesh.surface_set_material(mesh.get_surface_count() - 1, Visuals.terrain_shore_material())
+		_shore_surface_idx = mesh.get_surface_count() - 1 if Visuals.terrain_shore_material() != Visuals.terrain_material() else -1
 	if job.water.has_faces():
 		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, job.water.arrays(), [], {}, TerrainMesher.TerrainSurface.FORMAT)
 		mesh.surface_set_material(mesh.get_surface_count() - 1, Visuals.water_material())
@@ -255,11 +336,13 @@ func apply_terrain(job: TerrainMesher) -> void:
 		_terrain.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		_terrain.layers = Visuals.GROUND_LAYER
 		add_child(_terrain)
+	_terrain.visible = not _terrain_held
 	_terrain.mesh = mesh
 	if Probing.on:
 		Probing.add("ta_mesh_set", t0)
 		t0 = Time.get_ticks_usec()
 	GroundHeight.hold_mesh(_terrain)  # on hills, room for their lift
+	_reapply_decor_sheet()
 	if Probing.on:
 		Probing.add("ta_hold", t0)
 	if drawn_msec == 0:
@@ -276,10 +359,109 @@ func apply_kept_terrain(mesh: ArrayMesh, kept_slots: PackedInt32Array, coarse :=
 		_terrain.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		_terrain.layers = Visuals.GROUND_LAYER
 		add_child(_terrain)
+	_terrain.visible = not _terrain_held
 	_terrain.mesh = mesh
+	_find_ground_surfaces(mesh)
 	GroundHeight.hold_mesh(_terrain)  # on hills, room for their lift
+	_reapply_decor_sheet()
 	if drawn_msec == 0:
 		drawn_msec = Time.get_ticks_msec()
+
+
+## Which of a kept mesh's surfaces are the ground's land and shore (by material).
+func _find_ground_surfaces(mesh: ArrayMesh) -> void:
+	_land_surface_idx = -1
+	_shore_surface_idx = -1
+	var land_mat := Visuals.terrain_material()
+	var shore_mat := Visuals.terrain_shore_material()
+	for i in mesh.get_surface_count():
+		var m := mesh.surface_get_material(i)
+		if m == land_mat:
+			_land_surface_idx = i
+		elif m == shore_mat:
+			_shore_surface_idx = i
+
+
+## Whether the chunk's ground can draw its decorative sheet itself: its full (not far) terrain is drawn, with
+## a land surface, and not --terrain-opt=old (whose one shader has no sheet).
+func can_composite_decor() -> bool:
+	return not Visuals.terrain_opt_old and _terrain != null and _terrain.mesh != null and not ground_coarse and _land_surface_idx >= 0
+
+
+func has_decor_sheet() -> bool:
+	return _decor_sheet_tex != null
+
+
+## The ground draws `tex` (decoratives.gd's baked sheet for this chunk, `origin` its north-west corner in
+## tiles) with `raised_shade` for the plants under their 3D copies. False (nothing set) when it can't now.
+func set_decor_sheet(tex: ImageTexture, raised_shade: float, origin: Vector2) -> bool:
+	if tex == null or not can_composite_decor():
+		clear_decor_sheet()
+		return false
+	_decor_sheet_tex = tex
+	_decor_raised_shade = raised_shade
+	_decor_chunk_origin = origin
+	_apply_decor_sheet()
+	return true
+
+
+## Hides the composited sheet while the chunk's decoratives are out of range or behind the camera (it follows
+## decoratives.gd's chunk node), shows it again.
+func set_decor_sheet_visible(shown: bool) -> void:
+	if shown == _decor_shown:
+		return
+	_decor_shown = shown
+	for m in [_decor_land_mat, _decor_shore_mat]:
+		if m != null:
+			(m as ShaderMaterial).set_shader_parameter(&"has_decor_sheet", shown)
+
+
+func clear_decor_sheet() -> void:
+	_decor_sheet_tex = null
+	if _decor_land_mat == null and _decor_shore_mat == null:
+		return
+	_decor_land_mat = null
+	_decor_shore_mat = null
+	_clear_surface_overrides()
+
+
+func _clear_surface_overrides() -> void:
+	if _terrain != null and _terrain.mesh != null:
+		for i in _terrain.mesh.get_surface_count():
+			_terrain.set_surface_override_material(i, null)
+
+
+## The terrain mesh was replaced: the sheet goes on its new surfaces, or off if it can't be drawn there.
+func _reapply_decor_sheet() -> void:
+	if _decor_land_mat != null or _decor_shore_mat != null:
+		_clear_surface_overrides()  # a mesh swap keeps the old surfaces' overrides by index
+	if _decor_sheet_tex == null:
+		return
+	if can_composite_decor():
+		_apply_decor_sheet()
+	else:
+		clear_decor_sheet()
+
+
+func _apply_decor_sheet() -> void:
+	if _decor_land_mat == null:
+		_decor_land_mat = Visuals.make_chunk_terrain_material(Visuals.terrain_material())
+	_set_decor_params(_decor_land_mat)
+	_terrain.set_surface_override_material(_land_surface_idx, _decor_land_mat)
+	if _shore_surface_idx >= 0:
+		if _decor_shore_mat == null:
+			_decor_shore_mat = Visuals.make_chunk_terrain_material(Visuals.terrain_shore_material())
+		_set_decor_params(_decor_shore_mat)
+		_terrain.set_surface_override_material(_shore_surface_idx, _decor_shore_mat)
+	else:
+		_decor_shore_mat = null
+
+
+func _set_decor_params(m: ShaderMaterial) -> void:
+	m.set_shader_parameter(&"decor_sheet", _decor_sheet_tex)
+	m.set_shader_parameter(&"decor_chunk_origin", _decor_chunk_origin)
+	m.set_shader_parameter(&"decor_raised_shade", _decor_raised_shade)
+	m.set_shader_parameter(&"has_decor_sheet", _decor_shown)
 
 
 func terrain_mesh() -> ArrayMesh:
@@ -288,8 +470,13 @@ func terrain_mesh() -> ArrayMesh:
 
 func clear_terrain() -> void:
 	if _terrain != null:
-		_terrain.queue_free()
+		FreeLater.node(_terrain)  # hidden now, freed in a later frame's slice
 		_terrain = null
+	_land_surface_idx = -1
+	_shore_surface_idx = -1
+	_decor_sheet_tex = null
+	_decor_land_mat = null
+	_decor_shore_mat = null
 
 
 func set_shadow_tier(tier: int) -> void:
@@ -324,12 +511,28 @@ func _apply_shadows() -> void:
 	# setting's own when that is finer).
 	var bias := maxf(NEAR_SHADOW_LOD_BIAS, ModelLods.lod_bias) if shadow_tier == SHADOWS_NEAR else ModelLods.lod_bias
 	var stood_in := {}
+	var quiet := {}  # (shadow_small) too low to cast at this tier: neither it nor its stand-in casts
+	if shadow_small and shadow_tier != SHADOWS_NONE:
+		var belts := {}
+		for bp: Array in _belt_pairs:
+			for m in bp[0]:
+				belts[m] = true
+			if bp[1] != null:
+				belts[bp[1]] = true
+		# Bodies only (keyed by their Mesh): a moving part's mesh can sit low in its own space and
+		# be drawn high by its instances.
+		for key in _nodes:
+			if not (key is Mesh):
+				continue
+			var mmi: MultiMeshInstance3D = _nodes[key]
+			if not belts.has(mmi) and too_low_to_cast(key, shadow_tier):
+				quiet[mmi] = true
 	_unready = 0
 	for pair in _shadow_pairs:
 		var ready := ModelLods.is_ready(pair[2])
 		if not ready:
 			_unready += 1
-		var stand_in := shadow_tier != SHADOWS_NONE and ready and not no_stand_ins and not FarChunks.hides(self, pair[0]) and (pair[0] as MultiMeshInstance3D).visible
+		var stand_in := shadow_tier != SHADOWS_NONE and ready and not no_stand_ins and not quiet.has(pair[0]) and not FarChunks.hides(self, pair[0]) and (pair[0] as MultiMeshInstance3D).visible
 		var proxy_mmi: MultiMeshInstance3D = pair[1]
 		if proxy_mmi.visible != stand_in:
 			proxy_mmi.visible = stand_in
@@ -338,7 +541,26 @@ func _apply_shadows() -> void:
 		if stand_in:
 			stood_in[pair[0]] = true
 	for mmi in _instances:
-		_set_cast(mmi, GeometryInstance3D.SHADOW_CASTING_SETTING_OFF if stood_in.has(mmi) else cast)
+		_set_cast(mmi, GeometryInstance3D.SHADOW_CASTING_SETTING_OFF if stood_in.has(mmi) or quiet.has(mmi) else cast)
+
+
+## Whether a model (a MultiMesh's body) reaches too little above the ground for its shadow to be worth a
+## draw in the shadow pass at this tier (shadow_small): under FLAT_TOP everywhere (decals, plates,
+## rails' ties: their shadow is under themselves), under FAR_SMALL_TOP in SHADOWS_FAR chunks (past
+## the ring round the character a half-tile-high thing's shadow is a few pixels, but each kind of
+## model costs a draw call in the shadow map all the same). Belts are left out by the caller (their
+## shadows going was seen and reported). The top is the model's box with its moving parts' reach.
+static func too_low_to_cast(mesh: Mesh, tier: int) -> bool:
+	if mesh == null:
+		return false
+	var id := mesh.get_instance_id()
+	var top: float = _tops.get(id, NAN)
+	if is_nan(top):
+		top = _mesh_box(mesh).end.y
+		_tops[id] = top
+	if top < FLAT_TOP:
+		return true
+	return tier == SHADOWS_FAR and top < FAR_SMALL_TOP
 
 
 ## belt_lods.gd: draws this chunk's belts with their stand-ins (flat) or whole.
@@ -405,7 +627,6 @@ static func _cast(on: bool) -> GeometryInstance3D.ShadowCastingSetting:
 	return GeometryInstance3D.SHADOW_CASTING_SETTING_ON if on else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 
 
-
 ## Whether there's ground to see, or the chunk has none (not generated on the server).
 func has_ground() -> bool:
 	return _terrain != null or (loaded and tile_ids.is_empty())
@@ -440,6 +661,138 @@ class Want:
 	var starts := false
 	var paint := Color.WHITE  # a train stop's colour (_painted_wants)
 	var paint_from := -1000.0
+	var buf := PackedFloat32Array()
+	var stride := 12
+	var custom_off := 12
+	var with_colors := false
+	var upright := false
+	var use_buf := false
+	var pack_lod_buf := false
+	var compute_bounds := false
+	var bounds_done := false
+	var mesh_box := AABB()
+	var body_bounds := AABB()
+	var shadow_proxy: Mesh
+	var shadow_key: Variant
+	var shadow_box := AABB()
+	var shadow_buf := PackedFloat32Array()
+	var shadow_bounds := AABB()
+	var shadow_bounds_done := false
+
+
+class ChunkPrepJob:
+	var coord := Vector2i.ZERO
+	var serial := 0
+	var task_id := -1
+	var wants: Array[Want] = []
+	var wanted := {}
+	var rings: Array = []
+	var patch_reach := 0.0
+	var merged: Variant
+	var placeholder_keys := {}
+	var ore_near := {}
+	var belt_models := {}
+	var has_belts := false
+	var belt_bounds := AABB()
+	var waiting_models := false
+	var belt_waiting := false
+	var total_instances := 0
+	var contact_prep: ContactShade.Prepared
+	var done := false
+
+	## --native-chunk-build=off: the packing and bounds loops in GDScript, not ChunkBuildNative.
+	static var native_chunk_build := Switches.on("--native-chunk-build")
+	static var _chunk_native: Object  # a stateless ChunkBuildNative, shared by the worker threads
+	static var _chunk_native_tried := false
+
+	static func chunk_native() -> Object:
+		if not _chunk_native_tried:
+			_chunk_native_tried = true
+			if native_chunk_build and NativeLibrary.ensure() and ClassDB.class_exists(&"ChunkBuildNative"):
+				_chunk_native = ClassDB.instantiate(&"ChunkBuildNative")
+		return _chunk_native
+
+	static func pack_buffer(xforms: Array, colors: Array, custom: bool, upright: bool) -> PackedFloat32Array:
+		var nat: Object = chunk_native()
+		if nat != null:
+			return nat.pack_buffer(xforms, colors, custom, upright)
+		return pack_buffer_gd(xforms, colors, custom, upright)
+
+	static func pack_buffer_gd(xforms: Array, colors: Array, custom: bool, upright: bool) -> PackedFloat32Array:
+		var n: int = xforms.size()
+		if n == 0:
+			return PackedFloat32Array()
+		var with_colors: bool = not colors.is_empty()
+		var stride: int = 12 + (4 if with_colors else 0) + (4 if custom else 0)
+		var out := PackedFloat32Array()
+		out.resize(n * stride)
+		for i in n:
+			var t: Transform3D = xforms[i]
+			var off: int = i * stride
+			if upright:
+				out[off + 0] = 1.0
+				out[off + 3] = t.origin.x
+				out[off + 5] = 1.0
+				out[off + 7] = t.origin.y
+				out[off + 10] = 1.0
+				out[off + 11] = t.origin.z
+			else:
+				var b: Basis = t.basis
+				var o: Vector3 = t.origin
+				out[off + 0] = b.x.x
+				out[off + 1] = b.y.x
+				out[off + 2] = b.z.x
+				out[off + 3] = o.x
+				out[off + 4] = b.x.y
+				out[off + 5] = b.y.y
+				out[off + 6] = b.z.y
+				out[off + 7] = o.y
+				out[off + 8] = b.x.z
+				out[off + 9] = b.y.z
+				out[off + 10] = b.z.z
+				out[off + 11] = o.z
+			if with_colors:
+				var c: Color = colors[i]
+				out[off + 12] = c.r
+				out[off + 13] = c.g
+				out[off + 14] = c.b
+				out[off + 15] = c.a
+		return out
+
+	static func box_bounds(box: AABB, xforms: Array) -> AABB:
+		var nat: Object = chunk_native()
+		if nat != null:
+			return nat.box_bounds(box, xforms)
+		return box_bounds_gd(box, xforms)
+
+	static func box_bounds_gd(box: AABB, xforms: Array) -> AABB:
+		var out := AABB()
+		for i in xforms.size():
+			var b: AABB = (xforms[i] as Transform3D) * box
+			out = b if i == 0 else out.merge(b)
+		return out
+
+	func run() -> void:
+		for w: Want in wants:
+			var n: int = w.xforms.size()
+			if n > 0:
+				if w.use_buf or w.pack_lod_buf:
+					w.buf = pack_buffer(w.xforms, w.colors, w.custom, w.upright)
+				if w.compute_bounds or w.use_buf:
+					w.body_bounds = box_bounds(w.mesh_box, w.xforms)
+					w.bounds_done = true
+			if w.shadow_proxy != null:
+				if n > 0:
+					w.shadow_buf = pack_buffer(w.xforms, [], false, false)
+					w.shadow_bounds = box_bounds(w.shadow_box, w.xforms)
+					w.shadow_bounds_done = true
+		contact_prep = ContactShade.prepare(rings, patch_reach)
+		done = true
+
+
+## Packs MultiMesh instance rows (3x4 transform, optional color, optional zeroed custom data).
+static func pack_multimesh_buffer(xforms: Array, colors: Array, custom: bool, upright := false) -> PackedFloat32Array:
+	return ChunkPrepJob.pack_buffer(xforms, colors, custom, upright)
 
 
 ## Rebuilds the entity MultiMeshes. `working` maps unit numbers to machine working state;
@@ -451,13 +804,27 @@ class Want:
 ## took up to 10-24 ms in one frame while walking (docs/PERFORMANCE-AUDIT.md 4.7). The MultiMeshes
 ## drawn before stay until it is done.
 func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, budget: Budget = null, until_usec := 0) -> void:
+	await collect_entities(protos, working, until_usec)
+	if _prep_pending == null:
+		return
+	var job := _prep_pending
+	_prep_pending = null
+	if chunk_mm_worker:
+		job.run()
+	await apply_prepared(job, working, anim, budget, until_usec)
+
+
+## Reads entity records and resolves models/Wants on the main thread, storing the resulting
+## ChunkPrepJob in `_prep_pending` so a worker (or inline run()) can pack buffers before apply_prepared().
+func collect_entities(protos: ProtoDB, working: Dictionary, until_usec := 0) -> void:
 	_until = until_usec
-	anim_groups.clear()
-	placeholder_keys.clear()
-	waiting_models = false
+	build_serial += 1
+	var my_serial := build_serial
+	_prep_pending = null
 	pending.clear()
 
 	var by_model := {}  # Mesh -> Array of Transform3D
+	ChunkPrepJob.chunk_native()  # made here on the main thread, before a worker packs with it
 	var recs_by_model := {}  # Mesh -> Array of [rec, proto type]
 	var parts_by_model := {}  # Mesh -> Array of ModelLibrary.AnimPart
 	var boxes: Array[Transform3D] = []
@@ -469,15 +836,18 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 	var cards := {}  # sprite stand-in Mesh -> Array of Transform3D
 	var card_colors := {}  # sprite stand-in Mesh -> Array of Color (running, phase)
 	var merged := FarChunks.skips(self)
-	_belt_models.clear()
-	_switches.clear()
+	var col_belt_models := {}
+	var col_placeholder_keys := {}
+	var col_waiting_models := false
+	var col_belt_waiting := false
 	var switchable := {}  # keys of belts and loaders a network can switch off
-	belt_waiting = false
 	var belt_kinds := {}  # belt Mesh -> its stand-in's kind (belt_lods.gd)
 	var belt_lo := Vector2.INF
 	var belt_hi := -Vector2.INF
 	var rings: Array = []  # contact_shade.gd collect()
 	var scattered := {}  # ore rock Mesh -> per rank, Array of [Transform3D, rec]
+	var wall_cells: Array = []  # cliff_wall.gd cell()s: Nauvis's cliffs drawn as one wall
+	var cliffs := 0
 
 	var done := 0
 	var t_recs := Time.get_ticks_usec()  # (--stutter-probe: the records' pass and the MultiMeshes' as c_us_*)
@@ -486,22 +856,33 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 		if _until > 0 and (done & 15) == 0 and Time.get_ticks_usec() > _until:
 			count("us_build_recs", Time.get_ticks_usec() - t_recs)
 			await _wait_for_more()
+			if retired or my_serial != build_serial:
+				return
 			t_recs = Time.get_ticks_usec()
 		var proto: ProtoDB.EntityProto = protos.entity(rec.proto_id)
 		if proto == null or rec.extra.has("gh") or rec.extra.has("tg") or ModelLibrary.hidden(proto.name):
 			continue  # ghosts (and tile ghosts) are drawn by ghosts.gd
 		if rec.extra.has("hid"):
 			continue  # a belt the build of an underground pair mines, until the game says so (predicted.gd clear_run)
+		if proto.type == "cliff":
+			cliffs += 1
+			if CliffWall.covers(proto.name, rec.extra):
+				var wcell := CliffWall.cell(rec.pos, rec.fixed, str(rec.extra["co"]))
+				if not wcell.is_empty():
+					wall_cells.append(wcell)
+					# (Its piece still loaded: a far merge draws it, far_chunks.gd.)
+					ModelLibrary.entity_ready(proto.name, proto.type, rec.extra, rec.dir)
+					continue
 		if ModelLibrary.REMNANT_TYPES.has(proto.type):
 			var remnant := _remnant(protos, proto, rec)
 			if remnant.is_empty():
-				waiting_models = true
+				col_waiting_models = true
 				continue
 			var rmesh: Mesh = remnant[0]
 			if merged and FarChunks.merges(proto.type, rmesh):
 				continue
 			if not PipelineWarm.mesh_ready(rmesh):
-				waiting_models = true  # its pipelines compiling (pipeline_warm.gd): drawn in a moment
+				col_waiting_models = true  # its pipelines compiling (pipeline_warm.gd): drawn in a moment
 				continue
 			if not by_model.has(rmesh):
 				by_model[rmesh] = []
@@ -513,24 +894,49 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 		if proto.type == "resource" and ModelLibrary.ORE_STAGES.has(proto.name):
 			var rocks: Variant = ModelLibrary.ore_rocks(proto.name)
 			if rocks == null:
-				waiting_models = true
+				col_waiting_models = true
 				continue
 			if not (rocks as Array).is_empty():
 				if not _scatter_ore(rec, proto.name, rocks, scattered):
-					waiting_models = true
+					col_waiting_models = true
 				continue
+		var has_rec_cache: bool = "cache_gen" in rec
+		if build_rec_cache and has_rec_cache and int(rec.cache_gen) == ModelLibrary.generation and rec.cache_mesh != null \
+				and not rec.extra.has("cb") and not (rec.extra.has("fa") and proto.type == "mining-drill") \
+				and rec.covers == 0 and rec.belt_ends == 0:
+			var cmesh: Mesh = rec.cache_mesh
+			if merged and FarChunks.merges(proto.type, cmesh):
+				continue
+			if not PipelineWarm.model_ready(cmesh, proto.name, proto.type, rec.extra, rec.dir):
+				col_waiting_models = true
+				continue
+			if not by_model.has(cmesh):
+				by_model[cmesh] = []
+				recs_by_model[cmesh] = []
+				parts_by_model[cmesh] = rec.cache_parts
+			var cxform: Transform3D = rec.cache_xform
+			by_model[cmesh].append(cxform)
+			recs_by_model[cmesh].append([rec, proto.type])
+			ContactShade.collect(rings, proto.name, proto.type, cmesh, cxform, proto.box_min, proto.box_max, Vector2(proto.tile_size))
+			if Anim.SWITCHABLE_TYPES.has(proto.type) and (rec.extra.has("r") or rec.extra.has("g") or int(working.get(rec.unit, 0)) == Anim.SWITCHED_OFF):
+				switchable[rec.key] = true
+			if rec.cache_is_belt:
+				belt_kinds[cmesh] = rec.cache_belt_kind
+				belt_lo = belt_lo.min(rec.pos)
+				belt_hi = belt_hi.max(rec.pos)
+			continue
 		var t_ready := Time.get_ticks_usec() if Probing.on else 0
 		var ready := ModelLibrary.entity_ready(proto.name, proto.type, rec.extra, rec.dir)
 		if Probing.on:
 			Probing.add("cb_ready", t_ready)  # (--stutter-probe: the models asked for, w_cb_ready)
 		if not ready:
-			waiting_models = true  # nothing drawn until its model is made (no placeholder popping up)
+			col_waiting_models = true  # nothing drawn until its model is made (no placeholder popping up)
 			continue
 		var mesh := ModelLibrary.mesh_for_entity(proto.name, proto.type, rec.extra, rec.dir)
 		if merged and FarChunks.merges(proto.type, mesh):
 			continue
 		if mesh != null and not PipelineWarm.model_ready(mesh, proto.name, proto.type, rec.extra, rec.dir):
-			waiting_models = true  # its pipelines compiling (pipeline_warm.gd): drawn in a moment, not in a frozen frame
+			col_waiting_models = true  # its pipelines compiling (pipeline_warm.gd): drawn in a moment, not in a frozen frame
 			continue
 		if mesh != null and proto.type == "train-stop" and rec.extra.get("col") is Array and rec.extra["col"].size() >= 3:
 			var col: Array = rec.extra["col"]
@@ -541,31 +947,44 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 			painted[paint_key][1].append([rec, proto.type])
 			continue
 		if mesh != null:
+			var mparts: Array = ModelLibrary.parts_for_entity(proto.name, proto.type, rec.extra, rec.dir)
+			var mxform: Transform3D = _model_transform(proto, rec)
 			if not by_model.has(mesh):
 				by_model[mesh] = []
 				recs_by_model[mesh] = []
-				parts_by_model[mesh] = ModelLibrary.parts_for_entity(proto.name, proto.type, rec.extra, rec.dir)
-			by_model[mesh].append(_model_transform(proto, rec))
+				parts_by_model[mesh] = mparts
+			by_model[mesh].append(mxform)
 			recs_by_model[mesh].append([rec, proto.type])
-			ContactShade.collect(rings, proto.name, proto.type, mesh, by_model[mesh][-1], proto.box_min, proto.box_max, Vector2(proto.tile_size))
+			ContactShade.collect(rings, proto.name, proto.type, mesh, mxform, proto.box_min, proto.box_max, Vector2(proto.tile_size))
 			if Anim.SWITCHABLE_TYPES.has(proto.type) and (rec.extra.has("r") or rec.extra.has("g") or int(working.get(rec.unit, 0)) == Anim.SWITCHED_OFF):
 				switchable[rec.key] = true
-			if BeltLods.TYPES.has(proto.type):
-				belt_kinds[mesh] = BeltLods.kind_of(proto.type, rec.extra)
+			var is_belt: bool = BeltLods.TYPES.has(proto.type)
+			var belt_kind: String = BeltLods.kind_of(proto.type, rec.extra) if is_belt else ""
+			if is_belt:
+				belt_kinds[mesh] = belt_kind
 				belt_lo = belt_lo.min(rec.pos)
 				belt_hi = belt_hi.max(rec.pos)
+			if build_rec_cache and has_rec_cache and not rec.extra.has("cb") \
+					and not (rec.extra.has("fa") and proto.type == "mining-drill") \
+					and rec.covers == 0 and rec.belt_ends == 0:
+				rec.cache_gen = ModelLibrary.generation
+				rec.cache_mesh = mesh
+				rec.cache_parts = mparts
+				rec.cache_xform = mxform
+				rec.cache_is_belt = is_belt
+				rec.cache_belt_kind = belt_kind
 			if rec.extra.has("cb"):
-				if _add_cargo_pieces(rec, by_model[mesh][-1], by_model, recs_by_model, parts_by_model):
-					waiting_models = true
+				if _add_cargo_pieces(rec, mxform, by_model, recs_by_model, parts_by_model):
+					col_waiting_models = true
 			if rec.extra.has("fa") and proto.type == "mining-drill":
-				if _add_wet(rec, proto, by_model[mesh][-1], by_model, recs_by_model, parts_by_model):
-					waiting_models = true
+				if _add_wet(rec, proto, mxform, by_model, recs_by_model, parts_by_model):
+					col_waiting_models = true
 			if rec.covers != 0:
-				if _add_covers(rec, proto, by_model[mesh][-1], by_model, recs_by_model, parts_by_model):
-					waiting_models = true
+				if _add_covers(rec, proto, mxform, by_model, recs_by_model, parts_by_model):
+					col_waiting_models = true
 			if rec.belt_ends != 0:
-				if _add_belt_ends(rec, proto, by_model[mesh][-1], by_model, recs_by_model, parts_by_model, cap_parts):
-					waiting_models = true
+				if _add_belt_ends(rec, proto, mxform, by_model, recs_by_model, parts_by_model, cap_parts):
+					col_waiting_models = true
 			continue
 		# No model: the entity's own picture from the bridge's list (a mod's building), else a box.
 		var t_card := Time.get_ticks_usec() if Probing.on else 0
@@ -573,14 +992,14 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 		if Probing.on:
 			Probing.add("cb_card", t_card)
 		if card == null and SpriteStandins.coming(proto.name, rec.dir):
-			waiting_models = true  # drawn once its picture is composed, not as a box first
+			col_waiting_models = true  # drawn once its picture is composed, not as a box first
 			continue
 		if card != null and not PipelineWarm.mesh_ready(card):
-			waiting_models = true
+			col_waiting_models = true
 			continue
 		if card == null and proto.type != "resource" and SpriteStandins.in_use():
 			continue  # with a graphics list, no boxes or cones: only pictures (owner's choice)
-		placeholder_keys[rec.key] = true
+		col_placeholder_keys[rec.key] = true
 		var height := Visuals.height_for(proto)
 		if proto.type == "resource":
 			height = Visuals.resource_height(int(rec.extra.get("a", 1000)))
@@ -605,7 +1024,11 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 			box_colors.append(color)
 
 	count("us_build_recs", Time.get_ticks_usec() - t_recs)
-	_ore_near.clear()
+	cliff_count = cliffs
+	if not wall_cells.is_empty() or wall.sig != 0:
+		wall_cells.sort_custom(func(a: Array, b: Array) -> bool: return int(a[3]) < int(b[3]))
+		CliffWall.want(self, wall_cells)
+	var col_ore_near := {}
 	for rock: Mesh in scattered:
 		if not by_model.has(rock):
 			by_model[rock] = []
@@ -617,9 +1040,11 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 				by_model[rock].append(entry[0])
 				recs_by_model[rock].append([entry[1], "resource"])
 			if rank == 0:
-				_ore_near[rock] = (by_model[rock] as Array).size()
+				col_ore_near[rock] = (by_model[rock] as Array).size()
 	if _until > 0 and done > 16 and Time.get_ticks_usec() > _until:
 		await _wait_for_more()  # the records are read: the MultiMeshes next time
+		if retired or my_serial != build_serial:
+			return
 	var t_wants := Time.get_ticks_usec()
 	var wants: Array[Want] = []
 	for model in by_model:
@@ -634,25 +1059,20 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 			var part: ModelLibrary.AnimPart = parts[i]
 			wants.append(_want([model, i], part.mesh, by_model[model], [], null, true, recs_by_model[model], part, true))
 		if belt_kinds.has(model):
-			_belt_models[model] = parts.size()
+			col_belt_models[model] = parts.size()
 			var flat := BeltLods.stand_in(model, belt_kinds[model])
 			if flat != null:
 				var flat_want := _want([model, BeltLods.FLAT], flat, by_model[model], [], null, not switches.is_empty(), [], null, false)
 				flat_want.switches = switches
 				wants.append(flat_want)
 			elif BeltLods.coming(model):
-				belt_waiting = true
+				col_belt_waiting = true
 	for paint_key: Array in painted:
 		wants.append_array(_painted_wants(paint_key, painted[paint_key]))
 	for key: Array in cap_parts:
 		var entry: Array = cap_parts[key]
 		var cap_part: ModelLibrary.AnimPart = entry[2]
 		wants.append(_want(key, cap_part.mesh, entry[0], [], null, true, entry[1], cap_part, true))
-	if _belt_models.is_empty() or retired:
-		BeltLods.untrack(self)
-	else:
-		belt_bounds = AABB(Vector3(belt_lo.x - 1.0, 0.0, belt_lo.y - 1.0), Vector3(belt_hi.x - belt_lo.x + 2.0, 1.0, belt_hi.y - belt_lo.y + 2.0))
-		BeltLods.track(self)
 	for card in cards:
 		wants.append(_want(["card", card], card, cards[card], card_colors[card], null, false, [], null, false))
 	if not boxes.is_empty():
@@ -660,18 +1080,80 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 	if not cones.is_empty():
 		wants.append(_want("cone", Visuals.cone_mesh(), cones, cone_colors, Visuals.instance_material(), false, [], null, false))
 	var wanted := {}
+	var total_instances := 0
+	var hold_ground := GroundHeight.holding()
 	for w in wants:
 		wanted[w.key] = true
 		if w.part == null and (w.key is String or (w.key is Array and w.key[0] is String)):
 			w.starts = true  # cards, boxes, cones
-	for key in _nodes.keys():
-		if not wanted.has(key):
-			_drop(key)
+		Anim.setup_part(w.part)  # main thread only: updates shared part bounds before worker packs
+		w.upright = w.part != null and w.part.upright
+		w.with_colors = not w.colors.is_empty()
+		w.stride = 12 + (4 if w.with_colors else 0) + (4 if w.custom else 0)
+		w.custom_off = 12 + (4 if w.with_colors else 0)
+		var has_lods := _want_has_lods(w)
+		w.use_buf = not w.group and w.switches.is_empty() and not has_lods
+		w.pack_lod_buf = not w.group and w.switches.is_empty() and has_lods
+		w.compute_bounds = hold_ground and (ViewPriority.tight_cull or not w.group)
+		if w.compute_bounds or w.use_buf:
+			w.mesh_box = _mesh_box(w.mesh)
+		var smodel: Mesh = w.key if (w.part == null and w.key is Mesh) else (w.mesh if ModelLods.part_has_levels(w.part) else null)
+		if smodel != null:
+			w.shadow_proxy = ModelLods.proxy_for(smodel)
+			if w.shadow_proxy != null:
+				w.shadow_key = w.key
+				w.shadow_box = smodel.get_aabb()
+		total_instances += w.xforms.size()
+	waiting_models = col_waiting_models
+	belt_waiting = col_belt_waiting
 	count("us_build_wants", Time.get_ticks_usec() - t_wants)
+
+	var job := ChunkPrepJob.new()
+	job.coord = coord
+	job.serial = my_serial
+	job.wants = wants
+	job.wanted = wanted
+	job.rings = rings
+	job.patch_reach = ContactShade.patch_ring_reach()
+	job.merged = merged
+	job.placeholder_keys = col_placeholder_keys
+	job.ore_near = col_ore_near
+	job.belt_models = col_belt_models
+	job.has_belts = not col_belt_models.is_empty()
+	if job.has_belts:
+		job.belt_bounds = AABB(Vector3(belt_lo.x - 1.0, 0.0, belt_lo.y - 1.0), Vector3(belt_hi.x - belt_lo.x + 2.0, 1.0, belt_hi.y - belt_lo.y + 2.0))
+	job.waiting_models = col_waiting_models
+	job.belt_waiting = col_belt_waiting
+	job.total_instances = total_instances
+	_prep_pending = job
+
+
+## Applies a completed ChunkPrepJob (whose MultiMesh buffers, bounds, and ContactShade matrices
+## were packed off-thread or inline) within the frame deadline and MultiMesh creation budget.
+func apply_prepared(job: ChunkPrepJob, working: Dictionary, anim: Anim = null, budget: Budget = null, until_usec := 0) -> void:
+	if job == null or retired or job.serial != build_serial:
+		return
+	_until = until_usec
+	anim_groups.clear()
+	placeholder_keys = job.placeholder_keys
+	_ore_near = job.ore_near
+	_belt_models = job.belt_models
+	_switches.clear()
+	pending.clear()
+	waiting_models = job.waiting_models
+	belt_waiting = job.belt_waiting
+	if not job.has_belts or retired:
+		BeltLods.untrack(self)
+	else:
+		belt_bounds = job.belt_bounds
+		BeltLods.track(self)
+	for key in _nodes.keys():
+		if not job.wanted.has(key):
+			_drop(key)
 	var t_apply := Time.get_ticks_usec()
 	var applied := 0
 	var listed := false
-	for w in wants:
+	for w in job.wants:
 		# The MultiMeshes stop at the deadline too (between models): filling a busy chunk's 60-150
 		# ran to the end whatever it cost, 171 overruns a laps run, the worst 11 ms against a 6 ms
 		# grant (client-cpu.md 6). Those filled stay drawn with the new instances, the rest with the old.
@@ -681,10 +1163,15 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 				listed = true
 				_refresh_lists()  # none of the dropped ones left in the lists while it waits
 			await _wait_for_more()
+			if retired or job.serial != build_serial:
+				return
 			t_apply = Time.get_ticks_usec()
 			applied = 0
 		if budget == null or budget.left > 0 or _nodes.has(w.key):
-			_apply(w, working, anim, budget)
+			if chunk_mm_worker:
+				_apply_prepared(w, working, anim, budget)
+			else:
+				_apply(w, working, anim, budget)
 			applied += 1
 		else:
 			pending.append(w)
@@ -693,11 +1180,16 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 		if not listed:
 			_refresh_lists()
 		await _wait_for_more()  # the lists, shadows and contact rings next time
+		if retired or job.serial != build_serial:
+			return
 	t_apply = Time.get_ticks_usec()
 	_refresh_lists()
 	_apply_shadows()
-	contact_node = ContactShade.apply(self, contact_node, rings)
-	FarChunks.built(self, merged)
+	if job.contact_prep != null:
+		contact_node = ContactShade.apply_prepared(self, contact_node, job.contact_prep)
+	else:
+		contact_node = ContactShade.apply(self, contact_node, job.rings)
+	FarChunks.built(self, job.merged)
 	count("us_build_finish", Time.get_ticks_usec() - t_apply)
 
 
@@ -705,7 +1197,7 @@ func build_entities(protos: ProtoDB, working: Dictionary, anim: Anim = null, bud
 signal _more_time
 ## Builds stop at their deadline between models' MultiMeshes too, not only in the records' pass
 ## (`--build-apply-deadline=off`: the MultiMeshes all filled in one go, as before).
-static var apply_deadline := not OS.get_cmdline_user_args().has("--build-apply-deadline=off")
+static var apply_deadline := Switches.on("--build-apply-deadline")
 ## True while a build waits part-way through for resume_build().
 var building := false
 var _until := 0
@@ -724,12 +1216,20 @@ func resume_build(until_usec: int) -> void:
 		_more_time.emit()
 
 
-## Adds MultiMeshes a build left for later, within `budget`. True once none are left.
-func add_pending(working: Dictionary, anim: Anim, budget: Budget) -> bool:
+## Adds MultiMeshes a build left for later, within `budget` (and optional `until_usec` deadline). True once none are left.
+func add_pending(working: Dictionary, anim: Anim, budget: Budget, until_usec := 0) -> bool:
 	if pending.is_empty():
 		return true
+	var did := false
 	while not pending.is_empty() and budget.left > 0:
-		_apply(pending.pop_front(), working, anim, budget)
+		if did and until_usec > 0 and Time.get_ticks_usec() > until_usec:
+			break
+		var w: Want = pending.pop_front()
+		if chunk_mm_worker:
+			_apply_prepared(w, working, anim, budget)
+		else:
+			_apply(w, working, anim, budget)
+		did = true
 	_refresh_lists()
 	_apply_shadows()
 	FarChunks.built(self, null)
@@ -785,7 +1285,7 @@ func _apply(w: Want, working: Dictionary, anim: Anim, budget: Budget) -> void:
 	# On hills the bounds grow in height only by what they lift (ground_height.gd), not every way.
 	# Parts anim.gd moves on the CPU (turret heads turning) keep the MultiMesh's own bounds, which
 	# follow them, and the margin.
-	if GroundHeight.holding() and not w.group:
+	if GroundHeight.holding() and (ViewPriority.tight_cull or not w.group):
 		GroundHeight.cull_box(mmi, _bounds(_mesh_box(w.mesh), w.xforms))
 	else:
 		GroundHeight.cull_box(mmi, AABB())
@@ -806,6 +1306,7 @@ func _apply(w: Want, working: Dictionary, anim: Anim, budget: Budget) -> void:
 		st.custom = w.custom
 		st.group = group
 		st.switches = w.switches if not w.group else []
+		st.buffer = PackedFloat32Array()
 	if w.part == null and w.key is Mesh:
 		_shadow_proxy(w.key, w.xforms, budget)
 	elif ModelLods.part_has_levels(w.part):
@@ -813,6 +1314,83 @@ func _apply(w: Want, working: Dictionary, anim: Anim, budget: Budget) -> void:
 		# rollers turning in a belt's shadow can't be seen, and the part's own shadow at full detail was
 		# most of the shadow pass's triangles on a base of a modeller's belts.
 		_shadow_proxy(w.mesh, w.xforms, budget, w.key)
+
+
+func _fill_buffer(mm: MultiMesh, mesh: Mesh, n: int, with_colors: bool, custom: bool, buf: PackedFloat32Array, bounds := AABB()) -> void:
+	if mm.transform_format != MultiMesh.TRANSFORM_3D or mm.use_colors != with_colors or mm.use_custom_data != custom:
+		mm.instance_count = 0
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.use_colors = with_colors
+		mm.use_custom_data = custom
+	if mm.instance_count != n:
+		mm.instance_count = n
+	mm.custom_aabb = AABB(bounds.position, bounds.size.max(Vector3(0.01, 0.01, 0.01))) if n > 0 else AABB()
+	if mm.mesh != mesh:
+		mm.mesh = mesh
+	if n > 0 and not buf.is_empty():
+		mm.buffer = buf
+
+
+func _apply_prepared(w: Want, working: Dictionary, anim: Anim, budget: Budget) -> void:
+	var mmi: MultiMeshInstance3D = _nodes.get(w.key)
+	if mmi == null:
+		mmi = _new_mmi(w.material)
+		_nodes[w.key] = mmi
+		if budget != null:
+			budget.left -= maxi(w.mesh.get_surface_count(), 1)
+		count("mmi")
+		count("surfaces", w.mesh.get_surface_count())
+	var group: Anim.Group = null
+	var st_buf := PackedFloat32Array()
+	if not w.use_buf:
+		# MultiMeshes mutated per-instance or on LOD mesh switch keep CPU data_cache.
+		_fill(mmi.multimesh, _lod_mesh(mmi, w), w.xforms, w.colors, w.custom)
+		_thin(mmi.multimesh, w.key if w.part == null else null)
+		if w.compute_bounds:
+			if not w.bounds_done and not w.xforms.is_empty():
+				w.body_bounds = ChunkPrepJob.box_bounds(w.mesh_box, w.xforms)
+				w.bounds_done = true
+			GroundHeight.cull_box(mmi, w.body_bounds)
+		else:
+			GroundHeight.cull_box(mmi, AABB())
+		if w.paint != Color.WHITE:
+			mmi.set_instance_shader_parameter("f3d_paint", w.paint)
+			mmi.set_instance_shader_parameter("f3d_paint_from", w.paint_from)
+		if not w.switches.is_empty() and not w.group:
+			_draw_switches(w, mmi.multimesh, working)
+		if w.group:
+			group = _add_group(mmi.multimesh, w.part, w.xforms, w.recs, working, anim)
+		if w.pack_lod_buf:
+			if w.buf.is_empty() and not w.xforms.is_empty():
+				w.buf = ChunkPrepJob.pack_buffer(w.xforms, w.colors, w.custom, w.upright)
+			st_buf = w.buf
+	else:
+		if w.buf.is_empty() and not w.xforms.is_empty():
+			w.buf = ChunkPrepJob.pack_buffer(w.xforms, w.colors, w.custom, w.upright)
+		if not w.bounds_done and not w.xforms.is_empty():
+			if w.mesh_box.size == Vector3.ZERO:
+				w.mesh_box = _mesh_box(w.mesh)
+			w.body_bounds = ChunkPrepJob.box_bounds(w.mesh_box, w.xforms)
+			w.bounds_done = true
+		_fill_buffer(mmi.multimesh, _lod_mesh(mmi, w), w.xforms.size(), w.with_colors, w.custom, w.buf, w.body_bounds)
+		_thin(mmi.multimesh, w.key if w.part == null else null)
+		GroundHeight.cull_box(mmi, w.body_bounds if w.compute_bounds else AABB())
+		if w.paint != Color.WHITE:
+			mmi.set_instance_shader_parameter("f3d_paint", w.paint)
+			mmi.set_instance_shader_parameter("f3d_paint_from", w.paint_from)
+		st_buf = w.buf
+	count("instances", w.xforms.size())
+	var st: LodState = _lods.get(mmi)
+	if st != null:
+		st.from_apply = true
+		st.xforms = w.xforms
+		st.colors = w.colors
+		st.custom = w.custom
+		st.group = group
+		st.switches = w.switches if not w.group else []
+		st.buffer = st_buf
+	if w.shadow_proxy != null:
+		_shadow_proxy_buf(w, budget)
 
 
 ## [instance, unit] of the records in `recs` a network can switch off.
@@ -867,6 +1445,8 @@ static func _fill(mm: MultiMesh, mesh: Mesh, xforms: Array, colors: Array, custo
 		mm.instance_count = 0  # the formats change only while it is empty
 		mm.use_colors = with_colors
 		mm.use_custom_data = custom
+	if mm.custom_aabb != AABB():
+		mm.custom_aabb = AABB()
 	if mm.mesh != mesh:
 		mm.mesh = mesh
 	if mm.instance_count != xforms.size():
@@ -884,6 +1464,8 @@ func _drop(key) -> void:
 		if st != null:
 			_end_fade(mmi as MultiMeshInstance3D, st)
 			_lods.erase(mmi)
+		if far != null and not far.hidden.is_empty():
+			far.hidden.erase(mmi)  # far_chunks.gd's list of MultiMeshes hidden behind the merged mesh
 		mmi.free()
 	_nodes.erase(key)
 	var shadow: Node = _shadows.get(key)
@@ -892,10 +1474,14 @@ func _drop(key) -> void:
 	_shadows.erase(key)
 
 
+static func _want_has_lods(w: Want) -> bool:
+	return not ((w.part != null and not ModelLods.part_has_levels(w.part)) or not (w.mesh is ArrayMesh) or w.key is String)
+
+
 ## The mesh a Want's MultiMesh draws: for a model with levels of detail, the level its chunk is at
 ## (a build keeps it, so filling the MultiMesh again doesn't pop it back to the whole model).
 func _lod_mesh(mmi: MultiMeshInstance3D, w: Want) -> Mesh:
-	if (w.part != null and not ModelLods.part_has_levels(w.part)) or not (w.mesh is ArrayMesh) or w.key is String:
+	if not _want_has_lods(w):
 		return w.mesh
 	var st: LodState = _lods.get(mmi)
 	if st == null or st.model != w.mesh:
@@ -965,14 +1551,24 @@ func _switch_level(mmi: MultiMeshInstance3D, st: LodState, level: int, levels: A
 	_end_fade(mmi, st)
 	st.level = level
 	mm.mesh = st.model if level == 0 else levels[level - 1][0]
+	if lod_mesh_touch and mm.instance_count > 0:
+		_touch_after_mesh_swap(mm, st)
 	if lod_snap:
 		return
 	if ModelLods.FADE_SECONDS <= 0.0 or ModelLods.full_detail or not mmi.visible or not mmi.is_inside_tree() or mm.instance_count == 0 or before == null:
 		return
 	var copy := MultiMesh.new()
 	copy.transform_format = mm.transform_format
-	if lod_cpu_copy and st.from_apply:
-		var xforms: Array = st.group.drawn if (st.group != null and not st.group.drawn.is_empty()) else (st.group.bases if st.group != null else st.xforms)
+	if lod_cpu_copy and not st.buffer.is_empty() and st.group == null and st.switches.is_empty():
+		copy.use_colors = mm.use_colors
+		copy.use_custom_data = mm.use_custom_data
+		copy.instance_count = mm.instance_count
+		copy.custom_aabb = mm.custom_aabb
+		copy.mesh = before
+		copy.buffer = st.buffer
+		count("lod_cpu_copies")
+	elif lod_cpu_copy and st.from_apply:
+		var xforms: Array = _lod_xforms(st)
 		_fill(copy, before, xforms, st.colors, st.custom)
 		if st.custom:
 			if st.group != null:
@@ -987,6 +1583,9 @@ func _switch_level(mmi: MultiMeshInstance3D, st: LodState, level: int, levels: A
 							copy.set_instance_custom_data(int(s[0]), Anim.BELT_STOPPED)
 							break
 		count("lod_cpu_copies")
+	elif lod_no_readback:
+		count("lod_readbacks_skipped")
+		return  # no CPU copy: switched at once, not read back for a cross-fade
 	else:
 		copy.use_colors = mm.use_colors
 		copy.use_custom_data = mm.use_custom_data
@@ -1015,6 +1614,36 @@ func _switch_level(mmi: MultiMeshInstance3D, st: LodState, level: int, levels: A
 	st.fade = node
 	st.fade_left = ModelLods.FADE_SECONDS
 	_lod_fading += 1
+
+
+static func _lod_xforms(st: LodState) -> Array:
+	if st == null:
+		return []
+	if st.group != null:
+		return st.group.drawn if not st.group.drawn.is_empty() else st.group.bases
+	return st.xforms
+
+
+## Re-writes instance 0's transform on the same frame as `mm.mesh = ...`: in Godot 4.7 Forward+
+## with motion vectors (FSR2 or TAA), swapping `MultiMesh.mesh` without touching an instance that
+## frame causes a later `set_instance_custom_data` / `set_instance_transform` (e.g.
+## Anim.state_changed on working buildings or splitters) to zero every instance's transform.
+static func _touch_after_mesh_swap(mm: MultiMesh, st: LodState) -> void:
+	var xforms: Array = _lod_xforms(st)
+	var xf0: Transform3D
+	if not xforms.is_empty():
+		xf0 = xforms[0] as Transform3D
+	elif lod_no_readback:
+		var b := st.buffer if st != null else PackedFloat32Array()
+		if b.size() < 12:
+			return  # no CPU copy of instance 0: not read back from the renderer
+		# A TRANSFORM_3D buffer's row-major 3x4: basis columns' x, origin x; then y; then z.
+		xf0 = Transform3D(Vector3(b[0], b[4], b[8]), Vector3(b[1], b[5], b[9]), Vector3(b[2], b[6], b[10]),
+			Vector3(b[3], b[7], b[11]))
+	else:
+		xf0 = mm.get_instance_transform(0)
+	mm.set_instance_transform(0, xf0)
+	count("lod_mesh_touches")
 
 
 ## A level of detail is cross-fading here.
@@ -1255,6 +1884,27 @@ func _shadow_proxy(model: Mesh, xforms: Array, budget: Budget, key: Variant = nu
 	GroundHeight.cull_box(mmi, _bounds(model.get_aabb(), xforms))
 
 
+func _shadow_proxy_buf(w: Want, budget: Budget) -> void:
+	var key: Variant = w.shadow_key
+	var mmi: MultiMeshInstance3D = _shadows.get(key)
+	if mmi == null:
+		count("shadow_mmi")
+		mmi = _new_mmi(null)
+		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY
+		mmi.visible = false
+		_shadows[key] = mmi
+		if budget != null:
+			budget.left -= 1
+	if w.shadow_buf.is_empty() and not w.xforms.is_empty():
+		w.shadow_buf = ChunkPrepJob.pack_buffer(w.xforms, [], false, false)
+	if not w.shadow_bounds_done and not w.xforms.is_empty():
+		w.shadow_bounds = ChunkPrepJob.box_bounds(w.shadow_box, w.xforms)
+		w.shadow_bounds_done = true
+	_fill_buffer(mmi.multimesh, w.shadow_proxy, w.xforms.size(), false, false, w.shadow_buf, w.shadow_bounds)
+	_thin(mmi.multimesh, key)
+	GroundHeight.cull_box(mmi, w.shadow_bounds)
+
+
 ## A mesh's bounds with what its moving parts reach (anim.gd gives a part's mesh bounds over its
 ## whole motion as its custom AABB, which get_aabb() leaves out).
 static func _mesh_box(mesh: Mesh) -> AABB:
@@ -1268,11 +1918,7 @@ static func _mesh_box(mesh: Mesh) -> AABB:
 ## The box round every instance of a mesh with bounds `box`: worked out here rather than asked of
 ## the MultiMesh, which waits for the render thread when that runs on its own.
 static func _bounds(box: AABB, xforms: Array) -> AABB:
-	var out := AABB()
-	for i in xforms.size():
-		var b: AABB = (xforms[i] as Transform3D) * box
-		out = b if i == 0 else out.merge(b)
-	return out
+	return ChunkPrepJob.box_bounds(box, xforms)
 
 
 ## A remnant's [mesh, transform]: the model of what died (extra.rm), broken, turned the way it
@@ -1319,25 +1965,32 @@ func _model_transform(proto: ProtoDB.EntityProto, rec) -> Transform3D:
 	return Transform3D(Basis(Vector3.UP, yaw) * Basis.from_scale(Vector3(size, height, size)), at)
 
 
-## A moving part's or glowing model's instances, handed to anim.gd, which sets them to where their
-## entities' states have them now (most move in the shader from there).
-func _add_group(mm: MultiMesh, part: ModelLibrary.AnimPart, xforms: Array, recs: Array, working: Dictionary, anim: Anim) -> Anim.Group:
+func _build_group(part: ModelLibrary.AnimPart, xforms: Array, recs: Array) -> Anim.Group:
 	var group := Anim.Group.new()
-	group.mm = mm
 	group.part = part
+	var upright: bool = part != null and part.upright
 	for i in xforms.size():
 		var rec = recs[i][0]
 		var base: Transform3D = xforms[i]
-		if part != null and part.upright:
+		if upright:
 			base = Transform3D(Basis.IDENTITY, base.origin)
 		group.keys.append(rec.key)
 		group.units.append(rec.unit)
 		group.bases.append(base)
 		group.stateful.append(Anim.state_source(str(recs[i][1])))
+		group.hint_sg.append(clampi(int(rec.extra.get("sg", 0)), 0, 255))
 		var custom := Anim.custom_for(rec, 1.0)
-		if part != null and part.upright:
+		if upright:
 			custom.b = 0.0  # its sprite is drawn facing north
 		group.customs.append(custom)
+	return group
+
+
+## A moving part's or glowing model's instances, handed to anim.gd, which sets them to where their
+## entities' states have them now (most move in the shader from there).
+func _add_group(mm: MultiMesh, part: ModelLibrary.AnimPart, xforms: Array, recs: Array, working: Dictionary, anim: Anim) -> Anim.Group:
+	var group := _build_group(part, xforms, recs)
+	group.mm = mm
 	Anim.place(group, anim, working)
 	anim_groups.append(group)
 	return group

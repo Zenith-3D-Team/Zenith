@@ -243,7 +243,7 @@ fixture_msgs = [
             929, 5, 256, 8, 1, 2, 3, 4, 5, 6, 13, -2400000001],
      "sl": [2400000001, 6, 2, 501, 3, 64, 1, 502, 3, 128, 4, 929, 6, 0], "ew": [929, 6, 501, 64], "sh": [930, 6],
      "pc": [929, 6, 1, 64, 64], "pu": [929, 501, 501], "dl": [931, 2400000008], "of": [116, 1],
-     "qu": [501, "rare", 502, "epic"]},
+     "qu": [501, "rare", 502, "epic"], "sx": [116, 0, 7, 501, 0, 502, 0, 116, 0, 7, 2 ** 33 + 1, 0, 502, 0]},
     {"t": "bs", "k": 7, "part": 2, "parts": 2, "p": 6, "w": 0, "fx": -5120, "fy": 2688, "fr": 160, "dl": [16]},
     {"t": "bfar", "k": 7, "cx": -3, "cy": 2, "l": [-768, 512, 4, 12, 0, -512, 512, 4, 12, 13], "c": [4, 0, 2, 1], "h": [2, 1, 1, 1]},
     {"t": "bfar", "k": 7, "cx": 5, "cy": 5, "l": [], "c": []},
@@ -256,6 +256,11 @@ fixture_msgs = [
     {"t": "st", "k": 7, "r": 15, "l": [118, 1, 119, 0], "lc": [120, 16711680, 121, -1]},
     {"t": "st", "k": 7, "r": 16, "l": []},
     {"t": "ih", "k": 7, "part": 1, "parts": 1, "p": 3, "l": [118, -30500, 25800, 12, 122, -30400, 25800, 0]},
+    {"t": "rb", "k": 7, "part": 1, "parts": 2, "p": 20, "sm": 1200, "snap": 1,
+     "u": [42, 7, 7, -2560, 768, 2560, -512, 0, 0, 125, 552,
+           2 ** 40 + 7, 8, 5, 1024, -256, 3072, 1024, -1024, 512, 375, 40],
+     "g": [91, 2 ** 40 + 9]},
+    {"t": "rb", "k": 7, "part": 2, "parts": 2, "p": 20, "sm": 1200, "u": []},
 ]
 datagram = protocol.encode_datagram([protocol.encode_message(m) for m in fixture_msgs] + [
     protocol.encode_frame(protocol.KIND_DG, struct.pack("<III", 41, 7, 0))])
@@ -416,6 +421,52 @@ check(got_far and all(len(m["l"]) % 5 == 0 and len(m["c"]) * 5 == len(m["l"]) * 
 bs_bytes = sum(6 + len(b) for d in belts.raw if d[:1] == bytes((protocol.WIRE_MAGIC,)) for k, _, b in frames_of(d) if k == protocol.KIND_BS)
 print(f"bs: {len(got_bs)} binary parts, {sum(len(t[1]) for t in twins)} bytes as JSON, {bs_bytes} as binary frames")
 
+# Wire version 5: bs's crossing hints (sx, /f3d-bs crossings hints, the default) as a block after qu's text, only in
+# a part that has some; a version 4 client's parts never carry the block (its decoder ends a part at qu's text).
+# (A lane splitter: one side, lines 1-2 its inputs, 3-4 its outputs.)
+def hinted_game(version):
+    game = Game()
+    spl = game.spawn("lane-splitter", 3.5, 8.5, force="player", direction=4)
+    game.F.put_on_belt(spl, 1, "iron-plate", 0.25, 9300)
+    game.F.put_on_belt(spl, 2, "copper-plate", 0.3, 9301)
+    game.F.put_on_belt(spl, 3, "iron-plate", 0.2, 9302)
+    game.F.on_init()
+    game.send({**HELLO, "bin": version})
+    game.send({"t": "focus", "x": 3 * 256, "y": 8 * 256, "r": 48})
+    for i in range(120):
+        if i == 60:
+            game.F.put_on_belt(spl, 4, "copper-plate", 0.4, 9303)  # (as if an item crossed into half 1's output)
+        game.tick()
+    msgs = []
+    for d in game.raw:
+        if d[:1] != bytes((protocol.WIRE_MAGIC,)):
+            continue
+        check(d[1] == version, f"a version {version} client's datagrams say version {version}: {d[1]}")
+        for kind, _, body in frames_of(d):
+            if kind == protocol.KIND_BS:
+                msgs.append(protocol.decode_frames(bytes((protocol.WIRE_MAGIC, d[1])) + protocol.encode_frame(kind, body))[0])
+    return msgs, int(spl.unit_number)
+
+
+v5_bs, v5_unit = hinted_game(5)
+v5_sx = [m["sx"][i:i + 7] for m in v5_bs if "sx" in m for i in range(0, len(m["sx"]), 7)]
+check(v5_bs and not [p for m in v5_bs for p in protocol.problems(m)], f"v5: bs parts with hints are valid: {[protocol.problems(m) for m in v5_bs][:2]}")
+check(any(r[0] == v5_unit and r[1] == 0 and r[3] == 9302 and r[4] == 9303 and r[5] == 9300 and r[6] == 9301 for r in v5_sx),
+      f"v5: a splitter side's hint in binary: unit, side, tick, the outputs' items, the inputs' fronts: {v5_sx[-3:]}")
+check(any("sx" not in m for m in v5_bs), "v5: parts without hints end at qu's text as before")
+v4_bs, _ = hinted_game(4)
+check(v4_bs and not any("sx" in m for m in v4_bs), f"v4: no part carries the sx block ({len(v4_bs)} parts)")
+try:
+    for m in v5_bs:
+        if "sx" in m:
+            protocol.decode_frames(protocol.encode_datagram([protocol.encode_message(m, 5)], 4))
+    v4_refuses = False
+except ValueError:
+    v4_refuses = True
+check(v4_refuses, "a version 4 datagram whose bs part ends in an sx block is refused")
+check(all(protocol.decode_frames(protocol.encode_datagram([protocol.encode_message(m, 4)], 4))[0] == {k: v for k, v in m.items() if k != "sx"}
+          for m in v5_bs), "v5 parts written for version 4 read back without sx")
+
 # Wire version 3: chunk snapshots (chunk, ents: kinds 19, 20), st (21), reliable, and ih (22). Each is made twice
 # in one game: send_snapshot for the binary job, then again with the client's bin cleared (the text fallback the
 # same job takes when its client no longer reads binary); transport.send_states and the hands' send_hands_bin
@@ -562,6 +613,65 @@ late = [m for d in v3.raw[at:] for m in protocol.split_datagram(d)]
 check(any(m["t"] == "welcome" for m in late), f"bin 3 -> 2 with binary waiting: started over {sorted({m['t'] for m in late})}")
 check(not any(k in V3_KINDS for d in v3.raw[at:] if d[:1] == bytes((protocol.WIRE_MAGIC,)) for k, _, _ in frames_of(d)),
       "... and no version 3 frame goes to it after")
+
+# Wire version 4: rb (kind 23) binary vs JSON twin, and a bin 3 client gets rb as JSON text.
+v4 = Game()
+chest_a = v4.spawn("wooden-chest", 8.5, 4.5, force="player")
+rb1 = v4.spawn("logistic-robot", 2.5, 2.5, force="player")
+rb1.orientation = 0.25
+rb1.robot_order_queue = v4.lua.table_from([{"type": v4.g.defines.robot_order_type.deliver, "target": chest_a}])
+rb2 = v4.spawn("construction-robot", 5.5, 5.5, force="player")
+v4.F.on_init()
+v4.lua.execute("""
+local robots = package.loaded["scripts.robots"]
+local transport = package.loaded["scripts.transport"]
+local send_rb, i = nil, 1
+while true do
+  local name, fn = debug.getupvalue(robots.tick, i)
+  if not name then break end
+  if name == "send_rb" then send_rb = fn; break end
+  i = i + 1
+end
+assert(send_rb, "robots.tick reaches send_rb")
+local orig = send_rb
+debug.setupvalue(robots.tick, i, function(st, out_u, out_g, tick, period, sm, snap_only)
+  local c = storage.f3d.client
+  local bin = c.bin
+  c.bin = nil
+  local keep_snap = st.need_snap
+  orig(st, out_u, out_g, tick, period, sm, snap_only)
+  c.bin = bin
+  st.need_snap = keep_snap
+  orig(st, out_u, out_g, tick, period, sm, snap_only)
+end)
+""")
+v4.send({**HELLO, "bin": 4, "rb": 1})
+v4.send({"t": "focus", "x": 5 * 256, "y": 5 * 256, "r": 48})
+rb_text, rb_bin = [], []
+for _ in range(12):
+    v4.tick()
+for d in v4.raw:
+    if d[:1] != bytes((protocol.WIRE_MAGIC,)):
+        for m in protocol.split_datagram(d):
+            if m.get("t") == "rb":
+                rb_text.append(m)
+    else:
+        for k, _, body in frames_of(d):
+            if k == protocol.KIND_RB:
+                m = protocol.decode_frames(protocol.encode_datagram([protocol.encode_frame(k, body, 0)]))[0]
+                rb_bin.append(m)
+check(rb_text and rb_bin and rb_text == rb_bin,
+      f"v4: rb binary (kind 23) and JSON decode the same ({len(rb_bin)} vs {len(rb_text)})")
+check(any(m.get("u") for m in rb_bin), "v4: binary rb carried tracked robots")
+
+v4.raw = []
+v4.send({**HELLO, "w": 1, "bin": 3, "rb": 1})
+rb1.energy = 0
+for _ in range(22):
+    v4.tick()
+check(any(m.get("t") == "rb" for d in v4.raw for m in protocol.split_datagram(d))
+      and not any(k == protocol.KIND_RB for d in v4.raw if d[:1] == bytes((protocol.WIRE_MAGIC,)) for k, _, _ in frames_of(d)),
+      "v4: a bin 3 client gets rb as JSON text inside frames, never kind 23")
 
 print(f"{ticks} ticks compared, {mv_parts} binary mv parts")
 if failures:

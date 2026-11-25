@@ -7,7 +7,7 @@ extends PanelContainer
 ## "icon" model, else its first model), name and model count, pack.json's lines in its tooltip.
 ## Middle, a click on a pack (its row turns Factorio's selected orange) lists its models in tabs:
 ## Models (every entity model, by family: a prototype's model with its variants, ModelPacks.family),
-## Items, Icons and Other (empty for now: room for other kinds of pack content); the search box
+## Items, Icons, Tiles, Decoratives and Other (empty for now: room for other kinds of pack content); the search box
 ## filters the open tab, in as many columns as fit, the list filled a slice a frame (FILL_BUDGET_USEC)
 ## with "Loading... N / M" over it until it is whole. Right, a click on one shows it
 ## turning (model_preview.gd), which pack's version is in use, every pack's version of it to look at,
@@ -26,7 +26,8 @@ extends PanelContainer
 ## models they have until they are made again (a restart at the latest): the note says so in a game.
 ## Controls are named for tests: "Available", "Selected", "pack-<id>" (its "title", "count", "add",
 ## "remove", "up", "down"), "AvailableNone", "OpenFolder", "Tabs" ("PackName", "TabModels", "TabItems",
-## "TabIcons", "TabOther"), "Models", "ModelsLoading", "model-<family>", "icon-<key>" (the Icons tab's, "/" as "_"),
+## "TabIcons", "TabTiles", "TabDecoratives", "TabOther"), "Models", "ModelsLoading", "model-<family>", "icon-<key>" (the Icons tab's, "/" as "_"),
+## "tile-<name>" (the Tiles tab's), "decor-<name>" (the Decoratives tab's),
 ## "IconCompare" (its "PackIcon", "FactorioIcon" and their captions), "EmptyNote", "Search",
 ## "Preview", "PreviewTools" (its corner's "PlayAnim", "Speaker"), "PackDetails", "Versions" (a
 ## "version-<pack id>" card each: "InUseTag", View "show-<pack id>", Select "use-<pack id>"),
@@ -43,6 +44,9 @@ const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const ModelPreview := preload("res://scripts/ui/factorio/model_preview.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const LocaleNames := preload("res://scripts/world/locale_names.gd")
+const TerrainTextures := preload("res://scripts/world/terrain_textures.gd")
+const Decoratives := preload("res://scripts/world/decoratives.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
@@ -88,7 +92,11 @@ const TAB_GAP := 4  # between the middle column's tabs
 const CARD_TEXT_ROOM := 96  # the least a card's name and tag keep beside its buttons, else the buttons go under them
 var _icon := ""  # the Icons tab's icon shown: its key in the pack ("iron-plate", "fluid/water"), "" none
 var _icon_shown_pack := ""  # whose version of it is shown
-var _icon_view: Control  # the pack's icon and Factorio's side by side, over the 3D preview in the Icons tab
+var _tile := ""  # the Tiles tab's ground tile shown ("grass-1", "concrete"...), "" none
+var _tile_shown_pack := ""  # whose version of it is shown
+var _decor := ""  # the Decoratives tab's decorative shown ("green-hairy-grass"...), "" none
+var _decor_shown_pack := ""  # whose version of it is shown
+var _icon_view: Control  # the pack's icon/tile/decorative and Factorio's side by side, over the 3D preview
 var _loading: Label  # "Loading... N / M" in the list's corner while the Models tab fills
 var _fill: Dictionary = {}  # the Models tab's fill under way: pack, families, names, at ({} none)
 var fill_slice_max_usec := 0  # the longest slice a fill took (tests)
@@ -97,17 +105,25 @@ static var _family_cache_key: Array = []
 static var _pack_families := {}  # pack id -> [version, model count, families_of]
 var _pack_pictures := {}  # a pack's picture's key -> [texture or null], read once while the window is open
 static var _pack_icon_textures := {}  # an icon file -> its texture (the window's own; the UI's go by the order)
+static var _pack_tile_textures := {}  # "<file>|<mtime>|<spec>" -> tile swatch Texture2D
+static var _pack_decor_textures := {}  # "<file>|<mtime>" -> decorative swatch Texture2D
 var _factorio_icon_queue: Array = []  # [button, icon key] of the Factorio pack's Icons tab, read a few a frame
+var _factorio_tile_queue: Array = []  # [button, tile name] of the Factorio pack's Tiles tab, read a few a frame
+var _factorio_decor_queue: Array = []  # [button, decor name] of the Factorio pack's Decoratives tab, read a few a frame
 static var _factorio_icons := {}  # icon key -> Factorio's own texture (or null), this graphics list's
 static var _factorio_icons_generation := -1
+static var _factorio_tile_textures := {}  # tile name -> Factorio's/mod's own swatch Texture2D (or null)
+static var _factorio_tiles_generation := -1
+static var _factorio_decor_textures := {}  # decor name -> Factorio's/mod's own swatch Texture2D (or null)
+static var _factorio_decor_generation := -1
 static var _factorio_keys: Array = []  # the install's icon keys, sorted by kind then name
 static var _factorio_keys_generation := -1
 ## The Factorio pack's icon kinds, in the order the Icons tab lists them (an item's key is its bare name).
 const FACTORIO_ICON_KINDS := ["item", "entity", "fluid", "recipe", "technology", "virtual-signal"]
 
-## The middle column's tabs: [id, label]. Models: the pack's entity models; Items and Icons: its
-## items and icons (_fill_items_tab, _fill_icons_tab); Other: kept for kinds of pack content to come.
-const TABS := [["models", "Models"], ["items", "Items"], ["icons", "Icons"], ["other", "Other"]]
+## The middle column's tabs: [id, label]. Models: the pack's entity models; Items, Icons, Tiles and
+## Decoratives: its items, icons, ground tiles and decoratives; Other: kept for kinds of pack content to come.
+const TABS := [["models", "Models"], ["items", "Items"], ["icons", "Icons"], ["tiles", "Tiles"], ["decoratives", "Decoratives"], ["other", "Other"]]
 
 ## Family buttons' icons are drawn this many pixels across (at UI scale 1); a family without one
 ## gets a clear square of the same size, so every name starts at the same place.
@@ -369,6 +385,8 @@ func _process(_delta: float) -> void:
 	_fill_step()
 	_load_queued_icons()
 	_load_factorio_icons()
+	_load_factorio_tiles()
+	_load_factorio_decor()
 	_update_play_row()
 	if not _packs.any(func(p: Dictionary) -> bool: return bool(p["unpacking"]) or bool(p["checking"])):
 		return
@@ -486,21 +504,48 @@ func _pack_row(p: Dictionary, on: bool, at: int, of: int) -> Control:
 	# The count on the row; the rest of pack_line (where, version, author, licence) and the
 	# description in its tooltip, and in the details on the right once it is listed.
 	var n := int(p["count"])
-	var count := Kit.label("%d model%s" % [n, "" if n == 1 else "s"] + (", unpacking" if bool(p["unpacking"]) else "")
+	var tiles_n := int(p.get("tile_count", 0))
+	var tiles_bit := (", %d tile%s" % [tiles_n, "" if tiles_n == 1 else "s"]) if tiles_n > 0 else ""
+	var decor_n := int(p.get("decor_count", 0))
+	var decor_bit := (", %d decor" % decor_n) if decor_n > 0 else ""
+	var count := Kit.label("%d model%s%s%s" % [n, "" if n == 1 else "s", tiles_bit, decor_bit] + (", unpacking" if bool(p["unpacking"]) else "")
 		+ (", new" if bool(p.get("new", false)) else ""))
 	count.name = "count"
 	count.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
 	count.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	count.custom_minimum_size.x = Kit.px(40)
 	text.add_child(count)
-	var shading_text := shading_line(p)
-	if shading_text != "":
-		var shading := Kit.label(shading_text)
+	var problem := str(p["problem"])
+	if not ModelPacks.is_sprite_pack(p) and not ModelPacks.refused(p) and problem == "":
+		var shading_row := HBoxContainer.new()
+		shading_row.name = "shading_row"
+		shading_row.add_theme_constant_override("separation", Kit.px(6))
+		shading_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var pbr_btn := MenuKit.button("")
+		pbr_btn.name = "pbr"
+		pbr_btn.toggle_mode = true
+		pbr_btn.custom_minimum_size = Kit.pxv(62, 22)
+		pbr_btn.toggled.connect(func(want: bool) -> void: set_pack_pbr(id, want))
+		shading_row.add_child(pbr_btn)
+		var shading := Kit.label("")
 		shading.name = "shading"
 		shading.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
 		shading.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
-		shading.custom_minimum_size.x = Kit.px(40)
-		text.add_child(shading)
+		shading.custom_minimum_size.x = Kit.px(20)
+		shading.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		shading.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		shading_row.add_child(shading)
+		_sync_pack_pbr_controls(pbr_btn, shading, p)
+		text.add_child(shading_row)
+	else:
+		var shading_text := shading_line(p)
+		if shading_text != "":
+			var shading := Kit.label(shading_text)
+			shading.name = "shading"
+			shading.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+			shading.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+			shading.custom_minimum_size.x = Kit.px(40)
+			text.add_child(shading)
 	var description := str((p["info"] as Dictionary).get("description", ""))
 	row.tooltip_text = pack_line(p) + ("\n" + description if description != "" else "") \
 		+ ("\n" + PackCheck.UNCHECKED if bool(p["unchecked"]) else "")
@@ -624,9 +669,13 @@ func _pack_picture(p: Dictionary) -> Control:
 ## The pack's texture from `cache` (reading pack.json "icon_image", pack.png or icon.png once), or null.
 static func pack_texture(p: Dictionary, cache: Dictionary) -> Texture2D:
 	var root := str(p["root"])
+	var tiles_dict: Dictionary = p.get("tiles", {})
+	var tmaps_dict: Dictionary = p.get("tile_maps", {})
+	var decor_dict: Dictionary = p.get("decoratives", {})
 	# Read once a window session's packs: the files, and a zip not unpacked yet listed (Default.zip's
 	# directory), were read again on every refresh (each order change).
-	var key := "%s|%s|%s|%s" % [p["id"], root, p["source"], (p["info"] as Dictionary).get("icon_image", "")]
+	var key := "%s|%s|%s|%s|%d|%d|%d" % [p["id"], root, p["source"], (p["info"] as Dictionary).get("icon_image", ""),
+		tiles_dict.size(), tmaps_dict.size(), decor_dict.size()]
 	if ModelPacks.refused(p):
 		cache[key] = [null]  # nothing of a refused pack is read, its pictures neither
 	if not cache.has(key):
@@ -634,6 +683,16 @@ static func pack_texture(p: Dictionary, cache: Dictionary) -> Texture2D:
 		for file in ["pack.png", "icon.png"]:
 			if image == null and root != "":
 				image = _image_at(root.path_join(file))
+		if image == null and (p.get("models", {}) as Dictionary).is_empty():
+			var tnames := ModelPacks.tile_names(p)
+			if not tnames.is_empty():
+				var first_tile := str(tnames[0])
+				image = TerrainTextures.pack_preview_image(ModelPacks.tile_in(p, first_tile),
+					ModelPacks.tile_spec(p, first_tile), ModelPacks.tile_maps_in(p, first_tile))
+			elif not decor_dict.is_empty():
+				var dnames := decor_dict.keys()
+				dnames.sort()
+				image = Decoratives.pack_preview_image(decor_dict[str(dnames[0])] as Array)
 		cache[key] = [ImageTexture.create_from_image(image) if image != null else null]
 	return (cache[key] as Array)[0] as Texture2D
 
@@ -757,11 +816,23 @@ static func _image_from(bytes: PackedByteArray, ext: String) -> Image:
 static func shading_line(p: Dictionary) -> String:
 	if ModelPacks.is_sprite_pack(p):
 		return ""
+	if ModelPacks.pbr_override_off(p):
+		return "Shading: Factorio's"
+	var id := str(p.get("id", ""))
+	var off_note := "" if Looks.pack_shading() else ", Factorio's in Settings"
+	if ModelPacks.has_pack_pbr_overrides(id):
+		match ModelPacks.pack_pbr_state(p):
+			"mixed":
+				return "Shading: mixed (PBR / Factorio's, custom)" + off_note
+			"on":
+				return "Shading: PBR (custom)" + off_note
+			_:
+				return "Shading: Factorio's (custom)"
 	var mixed := not ((p.get("info", {}) as Dictionary).get("shading_models", {}) as Dictionary).is_empty()
 	if mixed:
-		return "Shading: set per model (PBR or Factorio's)" + ("" if Looks.pack_shading() else ", Factorio's in Settings")
+		return "Shading: set per model (PBR or Factorio's)" + off_note
 	if ModelPacks.shading(p) == "pbr":
-		return "Shading: as its files say (PBR)" + ("" if Looks.pack_shading() else ", Factorio's in Settings")
+		return "Shading: as its files say (PBR)" + off_note
 	return "Shading: Factorio's"
 
 
@@ -770,7 +841,11 @@ static func pack_line(p: Dictionary) -> String:
 	var info: Dictionary = p["info"]
 	var parts := PackedStringArray()
 	var n := int(p["count"])
-	parts.append("%d model%s" % [n, "" if n == 1 else "s"] + (", unpacking" if bool(p["unpacking"]) else ""))
+	var tiles_n := int(p.get("tile_count", 0))
+	var tiles_bit := (", %d tile%s" % [tiles_n, "" if tiles_n == 1 else "s"]) if tiles_n > 0 else ""
+	var decor_n := int(p.get("decor_count", 0))
+	var decor_bit := (", %d decorative%s" % [decor_n, "" if decor_n == 1 else "s"]) if decor_n > 0 else ""
+	parts.append("%d model%s%s%s" % [n, "" if n == 1 else "s", tiles_bit, decor_bit] + (", unpacking" if bool(p["unpacking"]) else ""))
 	parts.append(ModelPacks.where(p))
 	if str(info.get("version", "")) != "":
 		parts.append("version " + str(info["version"]))
@@ -858,7 +933,7 @@ func _paint_row(row: PanelContainer, state: String) -> void:
 	row.add_theme_stylebox_override("panel", _row_style(state, bool(row.get_meta("card", false))))
 	var lit := state != "normal"
 	var lit_color := MenuKit.theme().get_color("font_color" if state == "selected" else "font_hover_color", "FListItemSelected" if state == "selected" else "FListItem")
-	for key: String in ["title", "count", "fixed", "words"]:
+	for key: String in ["title", "count", "shading", "fixed", "words"]:
 		var l := row.find_child(key, true, false) as Label
 		if l == null:
 			continue
@@ -922,13 +997,15 @@ func _save_order() -> void:
 
 ## Opens one of the middle column's tabs (TABS' id), kept until the window closes.
 func open_tab(id: String) -> void:
-	var icons_changed := (_tab == "icons") != (id == "icons")
+	var before_flat := _tab == "icons" or _tab == "tiles" or _tab == "decoratives"
+	var now_flat := id == "icons" or id == "tiles" or id == "decoratives"
+	var icons_changed := before_flat != now_flat or (before_flat and _tab != id)
 	_tab = id
 	for key: String in _tab_buttons:
 		(_tab_buttons[key] as Button).set_pressed_no_signal(key == id)
 	_fill_models()
 	if icons_changed:
-		_show_family()  # the Icons tab shows icons where the others show the model turning
+		_show_family()  # the Icons, Tiles and Decoratives tabs show flat pictures where the others show the model turning
 
 
 ## The open tab's id.
@@ -965,6 +1042,10 @@ func _fill_models() -> void:
 			_fill_items_tab(p, filter)
 		"icons":
 			_fill_icons_tab(p, filter)
+		"tiles":
+			_fill_tiles_tab(p, filter)
+		"decoratives":
+			_fill_decoratives_tab(p, filter)
 		"other":
 			_grid_note("Nothing here yet: room for other kinds of pack content.")
 		_:
@@ -975,6 +1056,8 @@ func _fill_models() -> void:
 func _clear_grid() -> void:
 	_icon_queue.clear()
 	_factorio_icon_queue.clear()
+	_factorio_tile_queue.clear()
+	_factorio_decor_queue.clear()
 	_fill = {}  # an unfinished fill of another pack, tab or search goes with the grid
 	if _loading != null:
 		_loading.visible = false
@@ -1076,6 +1159,26 @@ func _load_factorio_icons(budget := ICON_BUDGET_USEC) -> void:
 		var job: Array = _factorio_icon_queue.pop_front()
 		if is_instance_valid(job[0]):
 			var t := factorio_icon_cached(str(job[1]))
+			(job[0] as Button).icon = t if t != null else blank_icon()
+
+
+## The Factorio pack's tiles not read yet, a few a frame (ICON_BUDGET_USEC).
+func _load_factorio_tiles(budget := ICON_BUDGET_USEC) -> void:
+	var start := Time.get_ticks_usec()
+	while not _factorio_tile_queue.is_empty() and Time.get_ticks_usec() - start < budget:
+		var job: Array = _factorio_tile_queue.pop_front()
+		if is_instance_valid(job[0]):
+			var t := factorio_tile_cached(str(job[1]))
+			(job[0] as Button).icon = t if t != null else blank_icon()
+
+
+## The Factorio pack's decoratives not read yet, a few a frame (ICON_BUDGET_USEC).
+func _load_factorio_decor(budget := ICON_BUDGET_USEC) -> void:
+	var start := Time.get_ticks_usec()
+	while not _factorio_decor_queue.is_empty() and Time.get_ticks_usec() - start < budget:
+		var job: Array = _factorio_decor_queue.pop_front()
+		if is_instance_valid(job[0]):
+			var t := factorio_decor_cached(str(job[1]))
 			(job[0] as Button).icon = t if t != null else blank_icon()
 
 
@@ -1365,6 +1468,489 @@ func _show_icon() -> void:
 	order.disabled = chosen == ""
 	order.tooltip_text = "From the highest pack in Selected that has it" if chosen != "" else "Already from the pack order: Select a pack's version to take it whatever the order"
 	order.pressed.connect(func() -> void: choose_icon(_icon, ""))
+	_info.add_child(order)
+
+
+## The Tiles tab: the pack's ground tiles (model_packs.gd: its tiles/<name>.<ext> or
+## tiles/<name>/<n>.<ext>), each its swatch and name; a click shows it large beside Factorio's own
+## (_show_tile). The Factorio pack's are the install's and mods' tiles, read a few a frame.
+func _fill_tiles_tab(pack: Dictionary, filter: String) -> void:
+	_clear_grid()
+	var sprite := ModelPacks.is_sprite_pack(pack)
+	var keys: Array = TerrainTextures.known_tile_names() if (sprite and ModelPacks.factorio_usable()) else ModelPacks.tile_names(pack)
+	if keys.is_empty():
+		if sprite:
+			_grid_note(ModelPacks.NO_INSTALL + "." if not ModelPacks.factorio_usable() else "No tiles in this pack.")
+		else:
+			_grid_note("Use the pack to see its tiles (a zip is unpacked first)." if int(pack.get("tile_count", 0)) > 0
+				else "No tiles in this pack.")
+		return
+	var names: Array = []
+	for tile_name: String in keys:
+		if filter == "" or tile_name.contains(filter) or tile_label(tile_name).to_lower().contains(filter):
+			names.append(tile_name)
+	if names.is_empty():
+		_grid_note("No tiles in this pack match.")
+		return
+	var make_btn := func(tile_name: String) -> Control: return _tile_button(pack, tile_name)
+	_start_fill(pack, names, make_btn)
+
+
+func _tile_button(pack: Dictionary, tile_name: String) -> Button:
+	var listed := str(pack["id"])
+	var sprite := ModelPacks.is_sprite_pack(pack)
+	var b := Button.new()
+	b.name = "tile-" + tile_name
+	b.set_meta("tile_name", tile_name)
+	b.theme_type_variation = "FListItemSelected" if tile_name == _tile else "FListItem"
+	b.focus_mode = Control.FOCUS_NONE
+	b.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	b.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	b.custom_minimum_size = Kit.pxv(0, 28)
+	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	b.expand_icon = false
+	b.add_theme_constant_override("icon_max_width", Kit.px(FAMILY_ICON))
+	if sprite:
+		if _factorio_tile_cached_now(tile_name):
+			var t := factorio_tile_cached(tile_name)
+			b.icon = t if t != null else blank_icon()
+		else:
+			b.icon = blank_icon()
+			_factorio_tile_queue.append([b, tile_name])
+	else:
+		var files := ModelPacks.tile_in(pack, tile_name)
+		var maps := ModelPacks.tile_maps_in(pack, tile_name)
+		var spec := ModelPacks.tile_spec(pack, tile_name)
+		var picture := pack_tile_texture(files, spec, maps)
+		b.icon = picture if picture != null else blank_icon()
+	b.text = tile_label(tile_name)
+	var using := _tile_in_use(tile_name)
+	if ModelPacks.tile_choice(tile_name) == listed:
+		b.text = "✔ " + b.text
+	if not using.is_empty() and using["id"] != listed:
+		b.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+	var where := "Factorio's own, from your install"
+	if not sprite:
+		var files := ModelPacks.tile_in(pack, tile_name)
+		var maps := ModelPacks.tile_maps_in(pack, tile_name)
+		var map_names: Array = maps.keys()
+		map_names.sort()
+		var map_txt := ", ".join(PackedStringArray(map_names))
+		if files.is_empty() and not map_names.is_empty():
+			where = "tiles/%s (%s)" % [tile_name, map_txt]
+		elif files.size() == 1:
+			where = ("tiles/%s (+ %s)" % [str(files[0]).get_file(), map_txt]) if not map_names.is_empty() else ("tiles/%s" % str(files[0]).get_file())
+		else:
+			where = ("tiles/%s (%d variants, + %s)" % [tile_name, files.size(), map_txt]) if not map_names.is_empty() else ("tiles/%s (%d variants)" % [tile_name, files.size()])
+	b.tooltip_text = "%s (%s)\n%s" % [where, tile_name, ("In use: %s's" % using.get("short", using["title"])) if not using.is_empty()
+		else "Not in use (the pack is off)"]
+	var on_press := func() -> void:
+		Sfx.play_ui("gui-click")
+		select_tile(tile_name, listed)
+	b.pressed.connect(on_press)
+	return b
+
+
+static func _factorio_tile_cached_now(tile_name: String) -> bool:
+	return _factorio_tiles_generation == ModGraphics.generation and _factorio_tile_textures.has(tile_name)
+
+
+static func factorio_tile_cached(tile_name: String) -> Texture2D:
+	if _factorio_tiles_generation != ModGraphics.generation:
+		_factorio_tile_textures = {}
+		_factorio_tiles_generation = ModGraphics.generation
+	if not _factorio_tile_textures.has(tile_name):
+		_factorio_tile_textures[tile_name] = factorio_tile_texture(tile_name)
+	return _factorio_tile_textures[tile_name]
+
+
+static func _tile_in_use(tile_name: String) -> Dictionary:
+	var p := ModelPacks.tile_pack(tile_name, false)
+	if not p.is_empty():
+		return p
+	if ModelPacks.factorio_on() and TerrainTextures.has_tile_def(tile_name):
+		return ModelPacks.pack(ModelPacks.FACTORIO_ID)
+	var below := ModelPacks.tile_pack(tile_name, true)
+	if not below.is_empty():
+		return below
+	if ModelPacks.factorio_on():
+		return ModelPacks.pack(ModelPacks.FACTORIO_ID)
+	return {}
+
+
+static func tile_label(tile_name: String) -> String:
+	var shown := LocaleNames.tile(tile_name)
+	return shown if shown != "" else tile_name
+
+
+static func pack_tile_texture(files: Array, spec := {}, maps := {}) -> Texture2D:
+	var first := str(files[0]) if not files.is_empty() else ""
+	if first == "" and not maps.is_empty():
+		for kind: String in ["normal", "height", "roughness"]:
+			var mf: Variant = maps.get(kind)
+			if mf is Array and not (mf as Array).is_empty():
+				first = str((mf as Array)[0])
+				break
+	if first == "":
+		return null
+	var key := "%s|%d|%s|%d" % [first, FileAccess.get_modified_time(first), JSON.stringify(spec), maps.size()]
+	if _pack_tile_textures.has(key):
+		return _pack_tile_textures[key]
+	var image := TerrainTextures.pack_preview_image(files, spec, maps)
+	var texture: Texture2D = null
+	if image != null:
+		image.generate_mipmaps()
+		texture = ImageTexture.create_from_image(image)
+	_pack_tile_textures[key] = texture
+	return texture
+
+
+static func factorio_tile_texture(tile_name: String) -> Texture2D:
+	var image := TerrainTextures.preview_image(tile_name)
+	if image == null:
+		return null
+	image.generate_mipmaps()
+	return ImageTexture.create_from_image(image)
+
+
+func select_tile(tile_name: String, pack := "") -> void:
+	_tile = tile_name
+	_tile_shown_pack = pack
+	for b in _models.get_children():
+		if b is Button and b.has_meta("tile_name"):
+			(b as Button).theme_type_variation = "FListItemSelected" if str(b.get_meta("tile_name")) == tile_name else "FListItem"
+	_show_family()
+
+
+func choose_tile(tile_name: String, pack: String) -> void:
+	Sfx.play_ui("gui-click")
+	var choice_key := ModelPacks.TILE_PREFIX + tile_name.to_lower()
+	var saved: Variant = Settings.get_value("model_packs", "choices")
+	var map: Dictionary = (saved as Dictionary).duplicate() if saved is Dictionary else {}
+	if pack == "":
+		map.erase(choice_key)
+	else:
+		map[choice_key] = pack
+	Settings.set_value("model_packs", "choices", map)
+	ModelLibrary.apply_choices([choice_key])
+	_fill_models()
+	_show_family()
+	_say()
+
+
+func _show_tile() -> void:
+	_preview.show_model("")
+	var compare_row := _icon_view.get_child(0)
+	if _tile == "":
+		_icon_view.visible = false
+		_set_credit("")
+		_pack_details(_pack_by_id(selected_pack))
+		var hint := _wrapped("Click a tile to see it beside Factorio's, and to take it from a pack of your choice whatever the order.")
+		hint.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+		_info.add_child(hint)
+		return
+	var having: Array = []
+	var factorio_own := factorio_tile_cached(_tile)
+	for p: Dictionary in ModelPacks.active():
+		if not ModelPacks.tile_in(p, _tile).is_empty() or not ModelPacks.tile_maps_in(p, _tile).is_empty() \
+				or (ModelPacks.is_sprite_pack(p) and factorio_own != null):
+			having.append(p)
+	if _tile_shown_pack == ModelPacks.FACTORIO_ID and factorio_own != null and ModelPacks.pack(ModelPacks.FACTORIO_ID).is_empty():
+		having.append(_pack_by_id(ModelPacks.FACTORIO_ID))
+	var in_use_id := str(_tile_in_use(_tile).get("id", ""))
+	var shown := _tile_shown_pack
+	if shown == "" or not having.any(func(p: Dictionary) -> bool: return p["id"] == shown):
+		if having.any(func(p: Dictionary) -> bool: return p["id"] == in_use_id):
+			shown = in_use_id
+		elif having.any(func(p: Dictionary) -> bool: return p["id"] == selected_pack):
+			shown = selected_pack
+		else:
+			shown = str(having[0]["id"]) if not having.is_empty() else ""
+	_tile_shown_pack = shown
+	var shown_pack := ModelPacks.pack(shown)
+	if shown_pack.is_empty():
+		shown_pack = _pack_by_id(shown if shown != "" else selected_pack)
+	var files := ModelPacks.tile_in(shown_pack, _tile)
+	var maps := ModelPacks.tile_maps_in(shown_pack, _tile)
+	var spec := ModelPacks.tile_spec(shown_pack, _tile)
+	_icon_view.visible = true
+	_set_credit(credit_line(shown_pack))
+	var pack_pic := compare_row.find_child("PackIcon", true, false) as TextureRect
+	var factorio := factorio_own
+	var factorio_pic := compare_row.find_child("FactorioIcon", true, false) as TextureRect
+	var own := ModelPacks.is_sprite_pack(shown_pack)
+	factorio_pic.get_parent().visible = not own
+	if own:
+		pack_pic.texture = factorio
+		(compare_row.find_child("PackIconCaption", true, false) as Label).text = "Factorio's"
+	else:
+		var has_any := not files.is_empty() or not maps.is_empty()
+		pack_pic.texture = pack_tile_texture(files, spec, maps) if has_any else null
+		var cap := "%s's" % shown_pack.get("short", shown_pack.get("title", "")) if has_any else ""
+		if files.is_empty() and not maps.is_empty():
+			cap += " (PBR)"
+		(compare_row.find_child("PackIconCaption", true, false) as Label).text = cap
+	factorio_pic.texture = factorio
+	(compare_row.find_child("FactorioIconCaption", true, false) as Label).text = "Factorio's" if factorio != null else "Factorio's: none (no install)"
+	var title := Kit.label(tile_label(_tile), "FHeading")
+	title.name = "Family"
+	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	title.custom_minimum_size.x = Kit.px(60)
+	_info.add_child(title)
+	var chosen := ModelPacks.tile_choice(_tile)
+	var cards := VBoxContainer.new()
+	cards.name = "Versions"
+	cards.add_theme_constant_override("separation", Kit.px(4))
+	_info.add_child(cards)
+	for p: Dictionary in having:
+		cards.add_child(_version_card(_tile, p, p["id"] == shown, p["id"] == in_use_id, chosen, "tile"))
+	var order := MenuKit.button("Use the pack order")
+	order.name = "UseOrder"
+	order.custom_minimum_size.x = 0
+	order.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	order.disabled = chosen == ""
+	order.tooltip_text = "From the highest pack in Selected that has it" if chosen != "" else "Already from the pack order: Select a pack's version to take it whatever the order"
+	order.pressed.connect(func() -> void: choose_tile(_tile, ""))
+	_info.add_child(order)
+
+
+## The Decoratives tab: the pack's ground decoratives and grass (model_packs.gd: its
+## decoratives/<name>.<ext>, variants, or hidden rules in pack.json); a click shows it beside Factorio's.
+func _fill_decoratives_tab(pack: Dictionary, filter: String) -> void:
+	_clear_grid()
+	var sprite := ModelPacks.is_sprite_pack(pack)
+	var keys: Array = Decoratives.known_decor_names() if (sprite and ModelPacks.factorio_usable()) else ModelPacks.decor_names(pack)
+	if keys.is_empty():
+		if sprite:
+			_grid_note(ModelPacks.NO_INSTALL + "." if not ModelPacks.factorio_usable() else "No decoratives in this pack.")
+		else:
+			_grid_note("Use the pack to see its decoratives (a zip is unpacked first)." if int(pack.get("decor_count", 0)) > 0
+				else "No decoratives in this pack.")
+		return
+	var names: Array = []
+	for decor_name: String in keys:
+		if filter == "" or decor_name.contains(filter) or decor_label(decor_name).to_lower().contains(filter):
+			names.append(decor_name)
+	if names.is_empty():
+		_grid_note("No decoratives in this pack match.")
+		return
+	var make_btn := func(decor_name: String) -> Control: return _decor_button(pack, decor_name)
+	_start_fill(pack, names, make_btn)
+
+
+func _decor_button(pack: Dictionary, decor_name: String) -> Button:
+	var listed := str(pack["id"])
+	var sprite := ModelPacks.is_sprite_pack(pack)
+	var b := Button.new()
+	b.name = "decor-" + decor_name
+	b.set_meta("decor_name", decor_name)
+	b.theme_type_variation = "FListItemSelected" if decor_name == _decor else "FListItem"
+	b.focus_mode = Control.FOCUS_NONE
+	b.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	b.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	b.custom_minimum_size = Kit.pxv(0, 28)
+	b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	b.expand_icon = false
+	b.add_theme_constant_override("icon_max_width", Kit.px(FAMILY_ICON))
+	var imgs := [] if sprite else ModelPacks.decor_images_in(pack, decor_name)
+	var mods := [] if sprite else ModelPacks.decor_models_in(pack, decor_name)
+	var spec := {} if sprite else ModelPacks.decor_spec(pack, decor_name)
+	var hidden := not sprite and bool(spec.get("hide", false))
+	if sprite or (imgs.is_empty() and not mods.is_empty() and not hidden):
+		if _factorio_decor_cached_now(decor_name):
+			var t := factorio_decor_cached(decor_name)
+			b.icon = t if t != null else blank_icon()
+		else:
+			b.icon = blank_icon()
+			_factorio_decor_queue.append([b, decor_name])
+	else:
+		var picture := pack_decor_texture(imgs) if not hidden else null
+		b.icon = picture if picture != null else blank_icon()
+	b.text = decor_label(decor_name)
+	if hidden:
+		b.text += " (hidden)"
+	var using := _decor_in_use(decor_name)
+	if ModelPacks.decor_choice(decor_name) == listed:
+		b.text = "✔ " + b.text
+	if not using.is_empty() and using["id"] != listed:
+		b.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+	var where := "Factorio's own, from your install"
+	if not sprite:
+		if hidden and imgs.is_empty() and mods.is_empty():
+			where = "Hidden by pack.json"
+		elif not mods.is_empty() and imgs.is_empty():
+			where = "decoratives/%s (3D model)" % str(mods[0]).get_file() if mods.size() == 1 else "decoratives/%s (%d 3D variants)" % [decor_name, mods.size()]
+		elif imgs.size() == 1:
+			where = "decoratives/%s" % str(imgs[0]).get_file()
+		else:
+			where = "decoratives/%s (%d variants)" % [decor_name, imgs.size()]
+	b.tooltip_text = "%s (%s)\n%s" % [where, decor_name, ("In use: %s's" % using.get("short", using["title"])) if not using.is_empty()
+		else "Not in use (the pack is off)"]
+	var on_decor_press := func() -> void:
+		Sfx.play_ui("gui-click")
+		select_decor(decor_name, listed)
+	b.pressed.connect(on_decor_press)
+	return b
+
+
+static func _factorio_decor_cached_now(decor_name: String) -> bool:
+	return _factorio_decor_generation == ModGraphics.generation and _factorio_decor_textures.has(decor_name)
+
+
+static func factorio_decor_cached(decor_name: String) -> Texture2D:
+	if _factorio_decor_generation != ModGraphics.generation:
+		_factorio_decor_textures = {}
+		_factorio_decor_generation = ModGraphics.generation
+	if not _factorio_decor_textures.has(decor_name):
+		_factorio_decor_textures[decor_name] = factorio_decor_texture(decor_name)
+	return _factorio_decor_textures[decor_name]
+
+
+static func _decor_in_use(decor_name: String) -> Dictionary:
+	var p := ModelPacks.decor_pack(decor_name, false)
+	if not p.is_empty():
+		return p
+	if ModelPacks.factorio_on() and Decoratives.has_decor_def(decor_name):
+		return ModelPacks.pack(ModelPacks.FACTORIO_ID)
+	var below := ModelPacks.decor_pack(decor_name, true)
+	if not below.is_empty():
+		return below
+	if ModelPacks.factorio_on():
+		return ModelPacks.pack(ModelPacks.FACTORIO_ID)
+	return {}
+
+
+static func decor_label(decor_name: String) -> String:
+	var shown := LocaleNames.decorative(decor_name)
+	return shown if shown != "" else decor_name
+
+
+static func pack_decor_texture(files: Array) -> Texture2D:
+	if files.is_empty():
+		return null
+	var first := str(files[0])
+	var key := "%s|%d" % [first, FileAccess.get_modified_time(first)]
+	if _pack_decor_textures.has(key):
+		return _pack_decor_textures[key]
+	var image := Decoratives.pack_preview_image(files)
+	var texture: Texture2D = null
+	if image != null:
+		image.generate_mipmaps()
+		texture = ImageTexture.create_from_image(image)
+	_pack_decor_textures[key] = texture
+	return texture
+
+
+static func factorio_decor_texture(decor_name: String) -> Texture2D:
+	var image := Decoratives.preview_image(decor_name)
+	if image == null:
+		return null
+	image.generate_mipmaps()
+	return ImageTexture.create_from_image(image)
+
+
+func select_decor(decor_name: String, pack := "") -> void:
+	_decor = decor_name
+	_decor_shown_pack = pack
+	for b in _models.get_children():
+		if b is Button and b.has_meta("decor_name"):
+			(b as Button).theme_type_variation = "FListItemSelected" if str(b.get_meta("decor_name")) == decor_name else "FListItem"
+	_show_family()
+
+
+func choose_decor(decor_name: String, pack: String) -> void:
+	Sfx.play_ui("gui-click")
+	var choice_key := ModelPacks.DECOR_PREFIX + decor_name.to_lower()
+	var saved: Variant = Settings.get_value("model_packs", "choices")
+	var map: Dictionary = (saved as Dictionary).duplicate() if saved is Dictionary else {}
+	if pack == "":
+		map.erase(choice_key)
+	else:
+		map[choice_key] = pack
+	Settings.set_value("model_packs", "choices", map)
+	ModelLibrary.apply_choices([choice_key])
+	_fill_models()
+	_show_family()
+	_say()
+
+
+func _show_decor() -> void:
+	_preview.show_model("")
+	var compare_row := _icon_view.get_child(0)
+	if _decor == "":
+		_icon_view.visible = false
+		_set_credit("")
+		_pack_details(_pack_by_id(selected_pack))
+		var hint := _wrapped("Click a decorative or grass type to see it beside Factorio's, and to take it from a pack of your choice whatever the order.")
+		hint.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+		_info.add_child(hint)
+		return
+	var having: Array = []
+	var factorio_own := factorio_decor_cached(_decor)
+	for p: Dictionary in ModelPacks.active():
+		if ModelPacks.decor_has(p, _decor) or (ModelPacks.is_sprite_pack(p) and factorio_own != null):
+			having.append(p)
+	if _decor_shown_pack == ModelPacks.FACTORIO_ID and factorio_own != null and ModelPacks.pack(ModelPacks.FACTORIO_ID).is_empty():
+		having.append(_pack_by_id(ModelPacks.FACTORIO_ID))
+	var in_use_id := str(_decor_in_use(_decor).get("id", ""))
+	var shown := _decor_shown_pack
+	if shown == "" or not having.any(func(p: Dictionary) -> bool: return p["id"] == shown):
+		if having.any(func(p: Dictionary) -> bool: return p["id"] == in_use_id):
+			shown = in_use_id
+		elif having.any(func(p: Dictionary) -> bool: return p["id"] == selected_pack):
+			shown = selected_pack
+		else:
+			shown = str(having[0]["id"]) if not having.is_empty() else ""
+	_decor_shown_pack = shown
+	var shown_pack := ModelPacks.pack(shown)
+	if shown_pack.is_empty():
+		shown_pack = _pack_by_id(shown if shown != "" else selected_pack)
+	var imgs := ModelPacks.decor_images_in(shown_pack, _decor)
+	var mods := ModelPacks.decor_models_in(shown_pack, _decor)
+	var spec := ModelPacks.decor_spec(shown_pack, _decor)
+	var hidden := bool(spec.get("hide", false))
+	var own := ModelPacks.is_sprite_pack(shown_pack)
+	var factorio := factorio_own
+	var factorio_pic := compare_row.find_child("FactorioIcon", true, false) as TextureRect
+	var pack_pic := compare_row.find_child("PackIcon", true, false) as TextureRect
+	_set_credit(credit_line(shown_pack))
+	if not own and not hidden and not mods.is_empty():
+		_icon_view.visible = false
+		_preview.show_item(_decor, str(mods[0]))
+	else:
+		_preview.show_model("")
+		_icon_view.visible = true
+		factorio_pic.get_parent().visible = not own
+		if own:
+			pack_pic.texture = factorio
+			(compare_row.find_child("PackIconCaption", true, false) as Label).text = "Factorio's"
+		elif hidden:
+			pack_pic.texture = null
+			(compare_row.find_child("PackIconCaption", true, false) as Label).text = "%s's (hidden)" % shown_pack.get("short", shown_pack.get("title", ""))
+		else:
+			pack_pic.texture = pack_decor_texture(imgs) if not imgs.is_empty() else null
+			(compare_row.find_child("PackIconCaption", true, false) as Label).text = "%s's" % shown_pack.get("short", shown_pack.get("title", "")) if not imgs.is_empty() else ""
+		factorio_pic.texture = factorio
+		(compare_row.find_child("FactorioIconCaption", true, false) as Label).text = "Factorio's" if factorio != null else "Factorio's: none (no install)"
+	var title := Kit.label(decor_label(_decor), "FHeading")
+	title.name = "Family"
+	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	title.custom_minimum_size.x = Kit.px(60)
+	_info.add_child(title)
+	var chosen := ModelPacks.decor_choice(_decor)
+	var cards := VBoxContainer.new()
+	cards.name = "Versions"
+	cards.add_theme_constant_override("separation", Kit.px(4))
+	_info.add_child(cards)
+	for p: Dictionary in having:
+		cards.add_child(_version_card(_decor, p, p["id"] == shown, p["id"] == in_use_id, chosen, "decor"))
+	var order := MenuKit.button("Use the pack order")
+	order.name = "UseOrder"
+	order.custom_minimum_size.x = 0
+	order.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	order.disabled = chosen == ""
+	order.tooltip_text = "From the highest pack in Selected that has it" if chosen != "" else "Already from the pack order: Select a pack's version to take it whatever the order"
+	order.pressed.connect(func() -> void: choose_decor(_decor, ""))
 	_info.add_child(order)
 
 
@@ -1696,6 +2282,10 @@ func load_icons_now() -> void:
 		_load_queued_icons()
 	while not _factorio_icon_queue.is_empty():
 		_load_factorio_icons()
+	while not _factorio_tile_queue.is_empty():
+		_load_factorio_tiles()
+	while not _factorio_decor_queue.is_empty():
+		_load_factorio_decor()
 
 
 ## The clear square in a family button without an icon, as wide as an icon is drawn.
@@ -1763,6 +2353,12 @@ func _show_family() -> void:
 		c.queue_free()
 	if _tab == "icons":
 		_show_icon()
+		return
+	if _tab == "tiles":
+		_show_tile()
+		return
+	if _tab == "decoratives":
+		_show_decor()
 		return
 	if _icon_view != null:
 		_icon_view.visible = false
@@ -2102,9 +2698,12 @@ static func variant_label(fam: String, name: String) -> String:
 ## with Factorio's green tick on the one drawn in the game, View (pressed on the one shown) and
 ## Select ("Selected" on the one chosen).
 ## `kind`: "icon" for the Icons tab's card for icon key `fam` (View and Select its icon, not a
-## model), "item" for the Items tab's card for item `fam`, "" for a model family.
+## model), "tile" for the Tiles tab's card for tile `fam`, "decor" for the Decoratives tab's card
+## for decorative `fam`, "item" for the Items tab's card for item `fam`, "" for a model family.
 func _version_card(fam: String, p: Dictionary, shown: bool, in_use: bool, chosen: String, kind := "") -> Control:
 	var icon := kind == "icon"
+	var tile := kind == "tile"
+	var decor := kind == "decor"
 	var item := kind == "item"
 	var id := str(p["id"])
 	var key := id.replace(":", "_")
@@ -2165,14 +2764,19 @@ func _version_card(fam: String, p: Dictionary, shown: bool, in_use: bool, chosen
 	view.toggle_mode = true
 	view.button_pressed = shown
 	view.tooltip_text = "Look at %s's version in the preview%s" % [short, " (the one in use)" if in_use else ""]
-	view.pressed.connect(func() -> void:
+	var on_view := func() -> void:
 		Sfx.play_ui("gui-click")
 		if icon:
 			select_icon(fam, id)
+		elif tile:
+			select_tile(fam, id)
+		elif decor:
+			select_decor(fam, id)
 		elif item:
 			select_item(fam, id)
 		else:
-			select_family(fam, id))
+			select_family(fam, id)
+	view.pressed.connect(on_view)
 	buttons.add_child(view)
 	var select := MenuKit.button("Selected" if chosen == id else "Select")
 	select.name = "use-" + key
@@ -2181,17 +2785,47 @@ func _version_card(fam: String, p: Dictionary, shown: bool, in_use: bool, chosen
 	var select_what := "Draw %s's version of this model and its variants in the game, whatever the order"
 	if icon:
 		select_what = "Draw %s's icon everywhere in the game, whatever the order"
+	elif tile:
+		select_what = "Draw %s's ground texture for this tile in the game, whatever the order"
+	elif decor:
+		select_what = "Draw %s's version of this decorative in the game, whatever the order"
 	elif item:
 		select_what = "Draw %s's version of this item in the game, whatever the order"
 	select.tooltip_text = ("%s's version is chosen: Use the pack order gives it back" % short) if chosen == id else (select_what % short)
-	select.pressed.connect(func() -> void:
+	var on_select := func() -> void:
 		if icon:
 			choose_icon(fam, id)
+		elif tile:
+			choose_tile(fam, id)
+		elif decor:
+			choose_decor(fam, id)
 		elif item:
 			choose_item_pack(fam, id)
 		else:
-			choose_pack(fam, id))
+			choose_pack(fam, id)
+	select.pressed.connect(on_select)
 	buttons.add_child(select)
+	if not icon and not tile and not ModelPacks.is_sprite_pack(p):
+		var target_fam := fam if item else _pbr_family_for_pack(p, fam)
+		var item_rep := fam
+		if item:
+			var item_paths := ModelPacks.item_files(p, fam)
+			if not item_paths.is_empty():
+				item_rep = str(item_paths[0]).get_file().get_basename()
+		var pbr_on := (ModelPacks.model_shading(p, item_rep, true) == "pbr") if item else (ModelPacks.family_shading(p, target_fam) == "pbr")
+		var custom := ModelPacks.has_model_pbr_override(id, target_fam, item)
+		var pbr_btn := MenuKit.button("PBR: On" if pbr_on else "PBR: Off")
+		pbr_btn.name = "pbr-" + key
+		pbr_btn.custom_minimum_size.x = Kit.px(68)
+		pbr_btn.toggle_mode = true
+		pbr_btn.set_pressed_no_signal(pbr_on)
+		pbr_btn.disabled = ModelPacks.pbr_override_off(p)
+		var noun := "item" if item else "model"
+		var state_desc := "PBR shading on" if pbr_on else "PBR shading off (Factorio look)"
+		var off_warn := " Packs' own shading is off in Settings." if (pbr_on and not Looks.pack_shading()) else ""
+		pbr_btn.tooltip_text = "%s for %s's %s%s.%s" % [state_desc, short, noun, " (custom override)" if custom else "", off_warn]
+		pbr_btn.toggled.connect(func(want: bool) -> void: set_model_pbr(id, fam, want, item))
+		buttons.add_child(pbr_btn)
 	# Deferred: a container is sorting its children while it says it was resized.
 	card.resized.connect(func() -> void: _fit_card.call_deferred(card))
 	_fit_card(card)
@@ -2437,8 +3071,13 @@ func _pack_details(p: Dictionary) -> void:
 	var n := int(p["count"])
 	var icons := int(p.get("icon_count", 0))
 	var sounds := int(p.get("sound_count", 0))
-	var lines := PackedStringArray(["%d model%s%s%s%s, %s" % [n, "" if n == 1 else "s", ", %d icon%s" % [icons, "" if icons == 1 else "s"] if icons > 0 else "",
-		", %d sound%s" % [sounds, "" if sounds == 1 else "s"] if sounds > 0 else "", ", unpacking" if bool(p["unpacking"]) else "", ModelPacks.where(p)]])
+	var tiles := int(p.get("tile_count", 0))
+	var decor := int(p.get("decor_count", 0))
+	var lines := PackedStringArray(["%d model%s%s%s%s%s%s, %s" % [n, "" if n == 1 else "s", ", %d icon%s" % [icons, "" if icons == 1 else "s"] if icons > 0 else "",
+		", %d sound%s" % [sounds, "" if sounds == 1 else "s"] if sounds > 0 else "",
+		", %d tile%s" % [tiles, "" if tiles == 1 else "s"] if tiles > 0 else "",
+		", %d decorative%s" % [decor, "" if decor == 1 else "s"] if decor > 0 else "",
+		", unpacking" if bool(p["unpacking"]) else "", ModelPacks.where(p)]])
 	for key: String in ["version", "author", "licence", "source", "url"]:
 		if str(info.get(key, "")) != "":
 			lines.append("%s: %s" % [key.capitalize(), info[key]])
@@ -2455,6 +3094,27 @@ func _pack_details(p: Dictionary) -> void:
 	var facts := _wrapped("\n".join(lines))
 	facts.name = "Facts"
 	details.add_child(facts)
+	if not ModelPacks.is_sprite_pack(p) and not ModelPacks.refused(p) and str(p["problem"]) == "":
+		var pid := str(p["id"])
+		var state := ModelPacks.pack_pbr_state(p)
+		var pbr_row := HBoxContainer.new()
+		pbr_row.name = "PackPbrRow"
+		pbr_row.add_theme_constant_override("separation", Kit.px(8))
+		var pbr_label := "PBR shading (entire pack — mixed)" if state == "mixed" else "PBR shading (entire pack)"
+		var pbr_check := MenuKit.checkbox(pbr_label, ModelPacks.shading(p) == "pbr")
+		pbr_check.name = "PackPbrToggle"
+		pbr_check.disabled = ModelPacks.pbr_override_off(p)
+		pbr_check.tooltip_text = "Disabled by a startup flag for this pack." if pbr_check.disabled else "Turn PBR shading on or off for every model and item in this pack."
+		pbr_check.toggled.connect(func(want: bool) -> void: set_pack_pbr(pid, want))
+		pbr_row.add_child(pbr_check)
+		var reset_btn := MenuKit.button("Reset shading")
+		reset_btn.name = "ResetPackPbr"
+		reset_btn.custom_minimum_size.x = 0
+		reset_btn.visible = ModelPacks.has_pack_pbr_overrides(pid)
+		reset_btn.tooltip_text = "Restore this pack's default shading from pack.json"
+		reset_btn.pressed.connect(func() -> void: reset_pack_pbr(pid))
+		pbr_row.add_child(reset_btn)
+		details.add_child(pbr_row)
 	if str(info.get("description", "")) != "":
 		var about := _wrapped(str(info["description"]))
 		about.name = "Description"
@@ -2507,7 +3167,11 @@ func reset_choices() -> void:
 	Settings.set_value("model_packs", "choices", {})
 	ModelLibrary.apply_choices(families)
 	if world != null:
-		world.models_changed(families.filter(func(f) -> bool: return not str(f).begins_with(ModelPacks.ICON_PREFIX)))
+		var is_model_choice := func(f) -> bool:
+			var s := str(f)
+			return not s.begins_with(ModelPacks.ICON_PREFIX) and not s.begins_with(ModelPacks.TILE_PREFIX) \
+				and not s.begins_with(ModelPacks.DECOR_PREFIX) and not s.begins_with(ModelPacks.SOUND_PREFIX)
+		world.models_changed(families.filter(is_model_choice))
 	_fill_models()
 	_show_family()
 	_say()
@@ -2517,7 +3181,9 @@ func _say() -> void:
 	var used := ModelPacks.model_count()
 	var chosen := ModelPacks.model_choice_count()
 	var items_chosen := ModelPacks.choices.keys().filter(func(k: Variant) -> bool: return str(k).begins_with(ModelPacks.ITEM_PREFIX)).size()
-	var icons_chosen := ModelPacks.choices.size() - chosen - items_chosen
+	var icons_chosen := ModelPacks.choices.keys().filter(func(k: Variant) -> bool: return str(k).begins_with(ModelPacks.ICON_PREFIX)).size()
+	var tiles_chosen := ModelPacks.choices.keys().filter(func(k: Variant) -> bool: return str(k).begins_with(ModelPacks.TILE_PREFIX)).size()
+	var decor_chosen := ModelPacks.choices.keys().filter(func(k: Variant) -> bool: return str(k).begins_with(ModelPacks.DECOR_PREFIX)).size()
 	var text := "%d models in use from %d packs." % [used, ModelPacks.active().size()]
 	if chosen > 0:
 		text += " %d model%s from a chosen pack." % [chosen, "" if chosen == 1 else "s"]
@@ -2525,6 +3191,19 @@ func _say() -> void:
 		text += " %d item%s from a chosen pack." % [items_chosen, "" if items_chosen == 1 else "s"]
 	if icons_chosen > 0:
 		text += " %d icon%s from a chosen pack." % [icons_chosen, "" if icons_chosen == 1 else "s"]
+	if tiles_chosen > 0:
+		text += " %d tile%s from a chosen pack." % [tiles_chosen, "" if tiles_chosen == 1 else "s"]
+	if decor_chosen > 0:
+		text += " %d decorative%s from a chosen pack." % [decor_chosen, "" if decor_chosen == 1 else "s"]
+	var custom_pbr_packs := ModelPacks.pbr_packs.size()
+	var custom_pbr_models := ModelPacks.pbr_models.size()
+	if custom_pbr_packs > 0 or custom_pbr_models > 0:
+		var pbr_parts := PackedStringArray()
+		if custom_pbr_packs > 0:
+			pbr_parts.append("%d pack%s" % [custom_pbr_packs, "" if custom_pbr_packs == 1 else "s"])
+		if custom_pbr_models > 0:
+			pbr_parts.append("%d model%s" % [custom_pbr_models, "" if custom_pbr_models == 1 else "s"])
+		text += " Custom PBR shading for %s." % [" and ".join(pbr_parts)]
 	if not ModelPacks.is_ready():
 		text += " Unpacking a zip or checking a pack for copies of Factorio's files: its models come in a moment."
 	if ModelPacks.models_dir == "":
@@ -2533,6 +3212,169 @@ func _say() -> void:
 		text += " Buildings and items change at once; trains, robots, creatures and inserter arms already drawn at the next start."
 	_note.text = text
 	(find_child("ResetChoices", true, false) as Button).disabled = ModelPacks.choices.is_empty()
+
+
+func _sync_pack_pbr_controls(pbr_btn: Button, shading: Label, p: Dictionary) -> void:
+	if pbr_btn == null or p.is_empty():
+		return
+	var id := str(p.get("id", ""))
+	var state := ModelPacks.pack_pbr_state(p)
+	pbr_btn.text = "PBR: On" if state == "on" else ("PBR: Mix" if state == "mixed" else "PBR: Off")
+	var pressed := state == "on" or (state == "mixed" and ModelPacks.shading(p) == "pbr")
+	pbr_btn.set_pressed_no_signal(pressed)
+	pbr_btn.disabled = ModelPacks.pbr_override_off(p)
+	var off_note := "" if Looks.pack_shading() else " Packs' own shading is off in Settings."
+	if pbr_btn.disabled:
+		pbr_btn.tooltip_text = "PBR disabled for this pack by a startup flag."
+	elif state == "mixed":
+		pbr_btn.tooltip_text = "Mixed PBR shading (per-model rules or overrides). Click to set the entire pack %s.%s" % [
+			"off" if pressed else "on", off_note]
+	else:
+		pbr_btn.tooltip_text = "PBR shading is %s for %s. Click to toggle for the entire pack.%s" % [
+			"on" if state == "on" else "off", str(p["title"]), off_note if state == "on" else ""]
+	if shading != null:
+		if not Looks.pack_shading() and state != "off":
+			shading.text = "Off in Settings"
+		elif ModelPacks.has_pack_pbr_overrides(id):
+			shading.text = "Custom"
+		else:
+			shading.text = ""
+		shading.visible = shading.text != ""
+
+
+func _update_pack_pbr_rows(reload_thumb_pack := "") -> void:
+	var target_pid := ModelPacks.canonical_id(reload_thumb_pack) if reload_thumb_pack != "" else ""
+	for list: VBoxContainer in [_available, _selected]:
+		if list == null:
+			continue
+		for child in list.get_children():
+			if not (child is PanelContainer):
+				continue
+			var row := child as PanelContainer
+			var pid := str(row.get_meta("pack", ""))
+			var p := _pack_by_id(pid)
+			if p.is_empty():
+				continue
+			var pbr_btn := row.find_child("pbr", true, false) as Button
+			var shading := row.find_child("shading", true, false) as Label
+			if pbr_btn != null:
+				_sync_pack_pbr_controls(pbr_btn, shading, p)
+			var row_state := "selected" if bool(row.get_meta("selected", false)) else ("hover" if bool(row.get_meta("hovered", false)) else "normal")
+			_paint_row(row, row_state)
+			if target_pid != "" and ModelPacks.canonical_id(pid) == target_pid:
+				var thumb := row.find_child("picture", true, false)
+				if thumb != null and thumb.has_method("reload"):
+					thumb.reload()
+
+
+func _pbr_family_for_pack(p: Dictionary, fam: String) -> String:
+	if p.is_empty():
+		return fam
+	if ModelPacks.provides(p, fam):
+		return fam
+	var base := ModelLibrary._tier_base(main_model(fam))
+	if base == "":
+		base = ModelLibrary.CreatureModels.base_model(main_model(fam))
+	if base != "":
+		var base_fam := ModelPacks.family(base)
+		if ModelPacks.provides(p, base_fam):
+			return base_fam
+	return fam
+
+
+func _matches_default_model_pbr(p: Dictionary, packs_map: Dictionary, fam: String, on: bool, is_item: bool) -> bool:
+	var pid := ModelPacks.canonical_id(str(p.get("id", "")))
+	if pid != "" and packs_map.has(pid) and not (bool(packs_map[pid]) and ModelPacks.pack_default_shading(p) == "pbr"):
+		return on == bool(packs_map[pid])
+	var want := "pbr" if on else "factorio"
+	if is_item:
+		var files := ModelPacks.item_files(p, fam)
+		if files.is_empty():
+			return ModelPacks.pack_default_model_shading(p, fam, true) == want
+		for fpath: Variant in files:
+			if ModelPacks.pack_default_model_shading(p, str(fpath).get_file().get_basename(), true) != want:
+				return false
+		return true
+	var names := ModelPacks.family_names(fam, [p])
+	if names.is_empty():
+		return ModelPacks.pack_default_model_shading(p, fam, false) == want
+	for n: Variant in names:
+		if ModelPacks.pack_default_model_shading(p, str(n), false) != want:
+			return false
+	return true
+
+
+static func _pbr_setting_dict(key: String) -> Dictionary:
+	var saved: Variant = Settings.get_value("model_packs", key)
+	return (saved as Dictionary).duplicate() if saved is Dictionary else {}
+
+
+func _apply_pack_pbr_change(pid: String, packs_map: Dictionary, models_map: Dictionary,
+		fams: Array = [], save_packs := true, is_item := false) -> void:
+	if save_packs:
+		Settings.set_value("model_packs", "pbr_packs", packs_map)
+	Settings.set_value("model_packs", "pbr_models", models_map)
+	ModelLibrary.apply_pbr_overrides(fams, pid)
+	if world != null and not is_item:
+		world.models_changed(fams)
+	_update_pack_pbr_rows(pid)
+	_show_family()
+	_say()
+	if _shown_pack == "" or ModelPacks.canonical_id(_shown_pack) == pid:
+		_preview.reload()
+
+
+## Turns PBR shading on or off for every model and item in `pack_id`, saved and applied at once.
+func set_pack_pbr(pack_id: String, on: bool) -> void:
+	Sfx.play_ui("gui-click")
+	var packs_map := _pbr_setting_dict("pbr_packs")
+	var models_map := _pbr_setting_dict("pbr_models")
+	var pid := ModelPacks.canonical_id(pack_id)
+	var prefix := pid + "|"
+	for mk: Variant in models_map.keys():
+		if str(mk).begins_with(prefix):
+			models_map.erase(mk)
+	var p := _pack_by_id(pack_id)
+	var has_pack_mix := not ((p.get("info", {}) as Dictionary).get("shading_models", {}) as Dictionary).is_empty()
+	var default_pbr := ModelPacks.pack_default_shading(p) == "pbr"
+	if (not has_pack_mix and on == default_pbr) or (has_pack_mix and on and default_pbr):
+		packs_map.erase(pid)
+	else:
+		packs_map[pid] = on
+	_apply_pack_pbr_change(pid, packs_map, models_map)
+
+
+## Restores `pack_id`'s shading (and clears any per-model PBR overrides on it) back to pack.json.
+func reset_pack_pbr(pack_id: String) -> void:
+	Sfx.play_ui("gui-click")
+	var packs_map := _pbr_setting_dict("pbr_packs")
+	var models_map := _pbr_setting_dict("pbr_models")
+	var pid := ModelPacks.canonical_id(pack_id)
+	packs_map.erase(pid)
+	var prefix := pid + "|"
+	for mk: Variant in models_map.keys():
+		if str(mk).begins_with(prefix):
+			models_map.erase(mk)
+	_apply_pack_pbr_change(pid, packs_map, models_map)
+
+
+## Turns PBR shading on or off for one model family or item inside `pack_id`, saved and applied at once.
+func set_model_pbr(pack_id: String, fam: String, on: bool, is_item := false) -> void:
+	Sfx.play_ui("gui-click")
+	var pid := ModelPacks.canonical_id(pack_id)
+	var p := _pack_by_id(pack_id)
+	var target_fam := fam if is_item else _pbr_family_for_pack(p, fam)
+	var packs_map := _pbr_setting_dict("pbr_packs")
+	var models_map := _pbr_setting_dict("pbr_models")
+	var key := ModelPacks.pbr_model_key(pid, target_fam, is_item)
+	if _matches_default_model_pbr(p, packs_map, target_fam, on, is_item):
+		models_map.erase(key)
+	else:
+		models_map[key] = on
+	var fams: Array = [ModelPacks.ITEM_PREFIX + fam] if is_item else [fam]
+	if not is_item and target_fam != fam:
+		fams.append(target_fam)
+	_apply_pack_pbr_change(pid, packs_map, models_map, fams, false, is_item)
 
 
 static func _folder() -> String:

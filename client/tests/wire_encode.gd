@@ -1,6 +1,7 @@
 extends RefCounted
 ## Tests only: a `bs` or `bfar` message, as its JSON gives it, written as the bridge writes it for a client of
-## wire version 2 (docs/PROTOCOL.md "Binary frames"; belt_sim.lua part_bin, belt_items.lua far_finish,
+## wire version 2 by default, or the `version` given: from 5 a `bs` part's crossing hints (`sx`) follow qu's text
+## as one more block when it has any (docs/PROTOCOL.md "Binary frames"; belt_sim.lua part_bin, belt_items.lua far_finish,
 ## tools/protocol.py encode_message), so a capture replays through wire_decode.gd as a binary stream would
 ## (tests/belt_bs_replay.gd --binary, ui_test's _binary_belts).
 
@@ -82,7 +83,7 @@ static func _ints(v: Variant) -> Array:
 
 
 ## The frame (kind, flags, length, body) of a `bs` or `bfar` message; empty for any other.
-static func frame(msg: Dictionary) -> PackedByteArray:
+static func frame(msg: Dictionary, version := 2) -> PackedByteArray:
 	var body := PackedByteArray()
 	var kind := 0
 	if msg.get("t") == "bs":
@@ -106,6 +107,9 @@ static func frame(msg: Dictionary) -> PackedByteArray:
 		var text := ",".join(names).to_utf8_buffer()
 		_u32(body, text.size())
 		body.append_array(text)
+		var sx := _ints(msg.get("sx"))
+		if version >= 5 and not sx.is_empty():
+			_block(body, sx)
 	elif msg.get("t") == "bfar":
 		kind = WireDecode.KIND_BFAR
 		_u32(body, int(msg.get("k", 0)))
@@ -121,18 +125,18 @@ static func frame(msg: Dictionary) -> PackedByteArray:
 	return out
 
 
-## A datagram of version 2 holding these messages' frames.
-static func datagram(msgs: Array) -> PackedByteArray:
-	var out := PackedByteArray([WireDecode.WIRE_MAGIC, 2])
+## A datagram of version 2 (or `version`) holding these messages' frames.
+static func datagram(msgs: Array, version := 2) -> PackedByteArray:
+	var out := PackedByteArray([WireDecode.WIRE_MAGIC, version])
 	for m: Dictionary in msgs:
-		out.append_array(frame(m))
+		out.append_array(frame(m, version))
 	return out
 
 
 ## The message written and read back (wire_decode.gd), as the client gets it from a binary stream; {} when
 ## that fails.
-static func round_trip(msg: Dictionary) -> Dictionary:
-	var got: Array = WireDecode.read(datagram([msg]))
+static func round_trip(msg: Dictionary, version := 2) -> Dictionary:
+	var got: Array = WireDecode.read(datagram([msg], version))
 	if int(got[3]) != 0 or (got[0] as Array).size() != 1:
 		return {}
 	return got[0][0]

@@ -214,6 +214,13 @@ private:
 	bool capped_cam = false;  // and whether the camera led it, from where, facing which way
 	Vector3 capped_cam_pos = Vector3(INFINITY, INFINITY, INFINITY);
 	Vector3 capped_cam_dir;
+	bool capped_lod_split = false;
+	double capped_d1 = INFINITY;
+	double capped_d2 = INFINITY;
+	Vector3 capped_lod_anchor = Vector3(INFINITY, INFINITY, INFINITY);
+	int capped_sim_cap = -2;
+	bool sim_d2_dirty = false;
+	std::vector<float> sim_cap_d2;
 	Rect2 planned_view;
 	bool planned_any = false;
 	int writes = 0;
@@ -244,6 +251,16 @@ private:
 	bool full = false;
 	std::unordered_map<i64, Look> known;
 	int model_cap = -1;
+	int sim_cap = -1;
+	bool lat_cap_near = false;
+	double lat_limit_d2 = INFINITY;
+	bool lod_split = false;
+	Vector3 lod_anchor;
+	double lod_d1 = INFINITY;
+	double lod_d2 = INFINITY;
+	Vector2 lod_jit;
+	i64 sim_3d = 0;
+	i64 sim_eligible = 0;
 	bool known_given = false;  // this job's params gave the looks (they changed)
 	// The camera drawing, when it leads Items in 3D's cap (belt_items.gd Job.cam_led, view_priority.gd).
 	bool cam_led = false;
@@ -258,6 +275,7 @@ private:
 	bool early = true;  // --belt-draw-early: changes after the drawn tick taken now when nothing shows early
 	bool early_stop = true;  // --belt-draw-early-stop: a record cut to end at a stop waiting that it runs into
 	bool view_cull = true;
+	bool tight_cull = true;
 	bool lead_on = true;
 	bool gone_order = true;
 	bool pile_one = true;  // --belt-draw-pile: a copy's record points at its item's (else its own, as before)
@@ -330,6 +348,8 @@ private:
 	bool _cam_moved() const;
 	void _rekey(Item *it, i64 key);
 	i64 _model_key(const Item *it) const;
+	i64 _desired_3d_key(const Item *it, const Vector3 &pos, int cur_band) const;
+	void _set_unpark_key(Item *it, const Vector3 &pos);
 	int _put(Kind *kind, SlotRef e);
 	void _unplace(Item *it);
 	void _write();

@@ -372,10 +372,40 @@ var hold_inputs := true
 ## in it at the end of the tick before and the one before that (-1: none); _side_x: unit * 2 + side ->
 ## the tick an item last crossed there.
 var split_wake := true
+## split_wake_r4 (the default under split_wake; false: the rule above): the output stood last tick and is
+## full at its back, and either the input that crossed last moved last tick and crossed less than 64 + its step
+## of travel ago, or the other output moved last tick and moves now and a crossing was 3 ticks ago or less.
+## _ib1/_ib2: each splitter input's line's front and back where they are, as _ob1/_ob2; _side_in: unit * 2 +
+## side -> the input half that last crossed there.
+var split_wake_r4 := true
 var _ob1 := {}
 var _ob2 := {}
+var _ib1 := {}
+var _ib2 := {}
 var _side_x := {}
+var _side_in := {}
 var n_woke := 0  # (probes) crossings split_wake held back
+## split_hints (--belt-sim-split-hints=off): whether the game lets a waiting splitter item cross on the tick its
+## output restarts or one later is its hidden update order (docs/BELT-RULES.md section 6). The bridge's crossing
+## hints (`bs.sx`, /f3d-bs crossings hints) say, for a splitter side whose output changed, which item was at each
+## input's front and which came into each output last at a tick; they arrive before the client steps to that tick
+## (step_to never passes the newest update). An item a queued hint (at the crossing's tick or later) still has at
+## an input's front doesn't cross yet; one a hint has as an output's last item crosses into that output. Nothing
+## is loaded into the lanes (no `sl`): the simulation stays its own. _sx: unit * 2 + side -> [tick, out0, out1,
+## in0, in1] * n, by tick (0: no item); the ones before the simulation's tick dropped as more come.
+var split_hints := true
+var _sx := {}
+var _sx_sweep := -1
+const SX_STRIDE := 5
+var n_hint_held := 0  # (probes) crossings held back as a hint has the item at its input's front
+var n_hint_steered := 0  # (probes) crossings sent to the output a hint has the item on
+## split_reconcile (--belt-sim-split-reconcile=off): a read (`sl`) of a splitter's input or output lane that
+## differs from the simulation only by when items crossed (the reads of the splitter's other lanes in the same
+## batch, or the hints, have them across) or by a lane's lag isn't applied (_split_timing). Off: applied as before.
+var split_reconcile := true
+var n_reconciled := 0  # (probes) splitter reads left unapplied as only the crossings' timing differed
+## (split_reconcile) The batch being applied's reads of splitter lanes: uid -> [lane key, the read's tick].
+var _sx_batch := {}
 var n_held := 0  # (probes) crossings held back
 var _queue: Dictionary = {}  # tick -> Array of [tick, seq, kind, data] (by the tick they apply at: see _apply_queue)
 var _qseq := 0
@@ -1046,6 +1076,16 @@ func _apply_queue(now: int) -> void:
 			if int(q[2]) == 0:
 				var data: Array = q[3]
 				_note_seen(int(data[0]), int(q[0]), data[1])
+	if split_reconcile and not _splitters.is_empty():
+		_sx_batch.clear()
+		for q in due:
+			if int(q[2]) == 0:
+				var d2: Array = q[3]
+				var li2: int = _key_idx.get(int(d2[0]), -1)
+				if li2 >= 0 and (l_kind[li2] == SPLIT_IN or l_kind[li2] == SPLIT_OUT):
+					var its2: PackedInt64Array = d2[1]
+					for k2 in range(0, its2.size(), 4):
+						_sx_batch[its2[k2]] = PackedInt64Array([int(d2[0]), int(q[0])])
 	for q in due:
 		var data: Array = q[3]
 		_read_t = int(q[0])
@@ -1077,6 +1117,8 @@ func _apply_queue(now: int) -> void:
 			6:
 				_apply_put(int(q[0]), int(data[0]), int(data[1]), int(data[2]), int(data[3]), int(data[4]), int(data[5]))
 	_read_t = -1
+	if not _sx_batch.is_empty():
+		_sx_batch.clear()
 
 
 ## (rescue_seen) Item uid left the belts.
@@ -1587,6 +1629,9 @@ func _apply_load(key: int, items: PackedInt64Array) -> void:
 		return
 	var lo := l_base[i]
 	var hi := lo + l_len[i]
+	if split_reconcile and (l_kind[i] == SPLIT_IN or l_kind[i] == SPLIT_OUT) and _split_timing(i, L, items, lo, hi):
+		n_reconciled += 1
+		return
 	var n := L.uid.size()
 	var total: int = L.base[L.base.size() - 1] + l_len[L.lanes[L.lanes.size() - 1]] if read_bound else -1
 	# Each item's position now and its record's speed.
@@ -1776,6 +1821,73 @@ func _apply_load(key: int, items: PackedInt64Array) -> void:
 	_touched(L, tick)
 
 
+## (split_reconcile) Whether a read of splitter lane i differs from the simulation only by when items crossed the
+## splitter, or by a lane's lag: every item the simulation has in the lane (or past its exit) that the read hasn't is
+## on another lane of the same splitter in a read in the same batch (whatever its tick), or a queued hint has it crossed (an input's) or
+## still at an input's front (an output's); every item the read has that the simulation has elsewhere is on another
+## lane of the same splitter, the input's feeder or the output's next. Such a read isn't applied: the hints time the
+## crossings, and applying it tore the line behind the splitter's input (its items moved a gap at once while the
+## line behind them didn't, the back end carried off and lost: 5.9% off on rec80 with reads every 6 ticks, 2.8%).
+func _split_timing(i: int, L: Line, items: PackedInt64Array, lo: int, hi: int) -> bool:
+	var unit := _unit(l_key[i])
+	var rt := _read_t if _read_t >= 0 else tick
+	var sp: Splitter = _splitters.get(unit)
+	if sp == null:
+		return false
+	var side := l_sp1[i] if l_kind[i] == SPLIT_IN else -1
+	if side < 0:
+		for k in 4:
+			if sp.outs[k] == i:
+				side = k % 2
+	var ha: PackedInt64Array = _sx.get(unit * 2 + side, PackedInt64Array())
+	var mine := {}
+	for k in range(0, items.size(), 4):
+		mine[items[k]] = true
+	var have := {}
+	var pos := L.f
+	for j in L.uid.size():
+		if j > 0:
+			pos += L.gap[j]
+		if pos >= hi:
+			break
+		if pos < lo and not (lo == 0 and pos < 0):
+			continue
+		var u: int = L.uid[j]
+		have[u] = true
+		if mine.has(u):
+			continue
+		var ok := false
+		if _sx_batch.has(u):
+			var e: PackedInt64Array = _sx_batch[u]
+			ok = e[0] != l_key[i] and _unit(e[0]) == unit
+		if not ok and not ha.is_empty():
+			var hv := _hint_for(ha, rt, u)
+			ok = hv == 2 if l_kind[i] == SPLIT_OUT else (hv == 0 or hv == 1)
+		if not ok:
+			return false
+	for k in range(0, items.size(), 4):
+		var u: int = items[k]
+		if have.has(u):
+			continue
+		var other: int = _uid_line.get(u, -1)
+		if other < 0 or _lines[other] == null:
+			return false
+		var O: Line = _lines[other]
+		_materialize(O, tick)
+		var m := O.uid.find(u)
+		if m < 0:
+			return false
+		var q := O.f
+		for x in range(1, m + 1):
+			q += O.gap[x]
+		var ol: int = O.lanes[_lane_at(O, q)]
+		if _unit(l_key[ol]) == unit and (l_kind[ol] == SPLIT_IN or l_kind[ol] == SPLIT_OUT):
+			continue
+		if not (l_kind[i] == SPLIT_IN and l_feeders[i].has(ol)) and not (l_kind[i] == SPLIT_OUT and l_next[i] == ol):
+			return false
+	return true
+
+
 ## (_apply_load, read_forward) Items a read of lane l0, its line's first, left past its exit ([uid, item,
 ## stack, how far past], the furthest first): in the game they went on. Across a splitter they go into the
 ## output its turn (or priority, or filter) says, where there is room, else the other, as a crossing does
@@ -1849,6 +1961,7 @@ func _forward_split(sp: Splitter, l0: int, uid: int, item: int, stk: int, over: 
 			X.bp_tick = tick
 		sp.crossed += 1
 		_side_x[sp.unit * 2 + side] = tick
+		_side_in[sp.unit * 2 + side] = half
 		sp.out_turn[side] = 1 - (0 if o == sp.outs[side] else 1)
 		sp.in_turn[side] = 1 - half
 		_wake(X)
@@ -3355,6 +3468,52 @@ func _note_outputs() -> void:
 					if q >= 0 and q < l_len[o]:
 						b = q
 			_ob1[o] = b
+		if split_wake_r4:
+			for i in sp.ins:
+				if i >= 0:
+					_ib2[i] = _ib1.get(i, -1)
+					_ib1[i] = _lane_sig(i, tick)
+
+
+## (split_wake_r4) A lane's line's front and back where they are at tick t, as one number (-1: no items):
+## it differs between two ticks when the lane's items moved.
+func _lane_sig(lane: int, t: int) -> int:
+	var id := l_line[lane]
+	if id < 0 or _lines[id] == null:
+		return -1
+	var X: Line = _lines[id]
+	if X.uid.is_empty():
+		return -1
+	_materialize(X, t)
+	return (X.f - l_base[lane] + 1048576) * 4194304 + (X.f + X.span - l_base[lane] + 1048576)
+
+
+## (split_wake_r4) R&D's wait rule for output o of splitter sp's side, an item of input l0 waiting at t.
+func _r4_wait(sp: Splitter, side: int, o: int, l0: int, t: int) -> bool:
+	var lx: int = t - int(_side_x.get(sp.unit * 2 + side, -100))
+	var li: int = int(_side_in.get(sp.unit * 2 + side, -1))
+	var oth := sp.ins[li * 2 + side] if li >= 0 else -1
+	var oth_mv := oth >= 0 and int(_ib1.get(oth, -1)) != int(_ib2.get(oth, -1))
+	var step := l_step[l0]
+	if oth_mv and lx * step < GAP + step:
+		return true
+	var oo: int = sp.outs[(1 if o == sp.outs[side] else 0) * 2 + side]
+	if oo < 0 or lx > 3 or int(_ob1.get(oo, -1)) == int(_ob2.get(oo, -1)):
+		return false
+	return _out_back(oo, t) != int(_ob1.get(oo, -1))
+
+
+## (split_wake_r4) An output's hindmost item's position in it at tick t (-1: none), as _note_outputs.
+func _out_back(o: int, t: int) -> int:
+	var id := l_line[o]
+	if id < 0 or _lines[id] == null:
+		return -1
+	var X: Line = _lines[id]
+	if X.uid.is_empty():
+		return -1
+	_materialize(X, t)
+	var q := X.f + X.span - l_base[o]
+	return q if q >= 0 and q < l_len[o] else -1
 
 
 func _step_input(lane: int, t: int) -> void:
@@ -4130,6 +4289,16 @@ func _split_put(A: Line, k: int, l0: int, new_pos: int, t: int, hp: PackedInt32A
 	var side := l_sp1[l0]
 	var uid: int = A.uid[k]
 	var item: int = A.itm[k]
+	var hint_out := -1
+	if split_hints and not _sx.is_empty():
+		var hk := sp.unit * 2 + side
+		if _sx.has(hk):
+			var hv := _hint_for(_sx[hk], t, uid)
+			if hv == 2:
+				n_hint_held += 1
+				return false
+			if hv == 0 or hv == 1:
+				hint_out = sp.outs[hv * 2 + side]
 	if sp.out_turn[side] < 0 and sp.out_prio < 0 and sp.filter == 0:
 		# Its turn not known yet: the way the game sent this item says it (the replay).
 		var g: Variant = oracle.get(uid)
@@ -4149,6 +4318,9 @@ func _split_put(A: Line, k: int, l0: int, new_pos: int, t: int, hp: PackedInt32A
 		var tt := maxi(sp.out_turn[side], 0)
 		tries.append(sp.outs[tt * 2 + side])
 		tries.append(sp.outs[(1 - tt) * 2 + side])
+	if hint_out >= 0:
+		tries = PackedInt32Array([hint_out])
+		n_hint_steered += 1
 	for ti in tries.size():
 		var o: int = tries[ti]
 		if o < 0:
@@ -4168,7 +4340,11 @@ func _split_put(A: Line, k: int, l0: int, new_pos: int, t: int, hp: PackedInt32A
 				if b1 >= 0 and b1 + GAP >= olen and b1 == int(_ob2.get(o, -1)):
 					var lx: int = t - int(_side_x.get(sp.unit * 2 + side, -100))
 					var oo: int = sp.outs[(1 if o == sp.outs[side] else 0) * 2 + side]
-					if lx >= 1 and (lx <= 2 or lx == 3 and oo >= 0 and int(_ob1.get(oo, -1)) != int(_ob2.get(oo, -1))):
+					if split_wake_r4:
+						if _r4_wait(sp, side, o, l0, t):
+							n_woke += 1
+							continue
+					elif lx >= 1 and (lx <= 2 or lx == 3 and oo >= 0 and int(_ob1.get(oo, -1)) != int(_ob2.get(oo, -1))):
 						n_woke += 1
 						continue
 		var hold := false
@@ -4187,12 +4363,63 @@ func _split_put(A: Line, k: int, l0: int, new_pos: int, t: int, hp: PackedInt32A
 				X.bp_tick = t
 			sp.crossed += 1
 			_side_x[sp.unit * 2 + side] = t
+			_side_in[sp.unit * 2 + side] = half
 			sp.out_turn[side] = 1 - (0 if o == sp.outs[side] else 1)
 			sp.in_turn[side] = 1 - half
 			_wake(X)
 			_touched_promise(X, t)
 			return true
 	return false
+
+
+## (split_hints) What the hints queued for a splitter side at tick `t` or later say of item `uid`: 2 a hint has it
+## at an input's front (the game hadn't let it cross by then), 0 or 1 a hint has it as that output half's last
+## item (it crossed there), -1 nothing. An input outweighs an output: the game had it there later or at once.
+static func _hint_for(a: PackedInt64Array, t: int, uid: int) -> int:
+	var out := -1
+	for j in range(0, a.size(), SX_STRIDE):
+		if a[j] < t:
+			continue
+		if a[j + 3] == uid or a[j + 4] == uid:
+			return 2
+		if out < 0:
+			if a[j + 1] == uid:
+				out = 0
+			elif a[j + 2] == uid:
+				out = 1
+	return out
+
+
+## (split_hints) A crossing hint (`bs.sx`): at `at_tick` splitter `unit`'s side `side` had items `out0`, `out1`
+## last into its output halves 0 and 1 and `in0`, `in1` at its input halves' fronts (0: no item). Hints before the
+## simulation's tick are dropped as this one is queued, and every few seconds for sides no longer hinted.
+func add_split_hint(unit: int, side: int, at_tick: int, out0: int, out1: int, in0: int, in1: int) -> void:
+	if not split_hints:
+		return
+	var hk := unit * 2 + side
+	var a := PackedInt64Array()
+	if _sx.has(hk):
+		a = _sx[hk]
+		var j := 0
+		while j < a.size() and a[j] < tick:
+			j += SX_STRIDE
+		if j > 0:
+			a = a.slice(j)
+	a.append(at_tick)
+	a.append(out0)
+	a.append(out1)
+	a.append(in0)
+	a.append(in1)
+	_sx[hk] = a
+	if tick - _sx_sweep >= SX_SWEEP:
+		_sx_sweep = tick
+		for k2: int in _sx.keys():
+			var b: PackedInt64Array = _sx[k2]
+			if b.size() == 0 or b[b.size() - SX_STRIDE] < tick:
+				_sx.erase(k2)
+
+
+const SX_SWEEP := 600
 
 
 ## With an output priority, may an item the priority output has no room for go into the other one

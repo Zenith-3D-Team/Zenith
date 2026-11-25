@@ -21,6 +21,8 @@ const SNAP := 0.05
 const EASE := 2.0
 ## The clouds turn this much faster than the ground.
 const CLOUD_LEAD := 0.08
+## The clouds' flow along Factorio's cloud flow map runs one cycle in this many ticks (30 s).
+const CLOUD_FLOW_TICKS := 1800.0
 
 var clock := GameClock.new()
 ## name -> {day: ticks, at: daytime at tick k (turns), k: tick, frozen: bool, off: eased correction}
@@ -92,6 +94,11 @@ func tick_now() -> float:
 ## The clouds' turn: the ground's and a little ahead.
 func cloud_turns(name: String) -> float:
 	return fposmod(turns(name) + float(_cloud.get(name, 0.0)), 1.0)
+
+
+## Where the clouds are in their flow cycle (0-1): the game's ticks, so it stops with a paused game.
+func cloud_flow() -> float:
+	return fposmod(tick_now() / CLOUD_FLOW_TICKS, 1.0)
 
 
 ## Radians, for the test and the shader's callers.

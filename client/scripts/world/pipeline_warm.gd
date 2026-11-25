@@ -21,6 +21,7 @@ extends RefCounted
 
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const HOLD_MSEC := 300
 const WARM_FRAMES := 3
@@ -69,7 +70,7 @@ static var _preload_warm_i := 0
 static func _read_args() -> void:
 	_args_read = true
 	enabled = DisplayServer.get_name() != "headless"
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--pipeline-warm="):
 			var v := arg.get_slice("=", 1)
 			if v == "off":

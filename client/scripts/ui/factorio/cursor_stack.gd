@@ -6,10 +6,11 @@ extends Control
 ## as Factorio does (L7). factorio_ui.gd sets `item`, `count` and `over_world_too`.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## L7 (the owner's playtest: "I can't see how many big electric poles I have through my hand"):
 ## holding a building over the world showed its ghost and no count at all. `--cursor-count=old`: none.
-static var count_fix := not ("--cursor-count=old" in OS.get_cmdline_user_args())
+static var count_fix := not (Switches.has("--cursor-count=old"))
 
 var item := ""
 ## -1 hides the count.

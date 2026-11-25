@@ -42,11 +42,36 @@ const FIELD_PERIOD := 16.0
 ## sprites are lit from, so a model shows the camera a lit side and a shaded one. Zenith's own noon sun (-30, high
 ## behind the default view) lit every face the camera sees: Vasillo's rocks drew flat.
 const NOON_YAW := -135.0
+## Resolution per axis of the seamless 3D Worley shape and detail textures (32^3 = 32 KB each).
+const VOL_SIZE := 32
+const CLOUD_LOW_OLD := 230.0
+const CLOUD_HIGH_OLD := 300.0
+const CLOUD_LOW_VOL := 210.0
+const CLOUD_HIGH_VOL := 390.0
+const QUALITY_STEPS := {"low": 18.0, "medium": 28.0, "high": 40.0}
+static var volumetric_arg_off: bool = "--volumetric-clouds=off" in OS.get_cmdline_user_args()
+## --cinematic-flash=old: lightning adds a fixed 0.75-0.8 to the clouds (and Zenith's sky its own), as
+## before 0.6.2: under this look's exposure, AgX and film curve a strike at night turned the sky white.
+static var flash_arg_old: bool = "--cinematic-flash=old" in OS.get_cmdline_user_args()
+## The grade's lightning on a cloud (cinematic_grade.gdshader's flash_light, its defaults): in proportion
+## to the cloud's own brightness `base`, plus a little, capped.
+const FLASH_LIFT := 1.6
+const FLASH_ADD := 0.05
+const FLASH_CAP := 0.25
+
+
+## How much brighter a cloud of brightness `base` is at `flash` (the weather's, after its Flash
+## brightness setting): the grade's sum, for tests and for anyone tuning it. `old`: before 0.6.2.
+static func flash_ratio(base: float, flash: float, old := false) -> float:
+	var add := 0.8 * flash if old else flash * minf(FLASH_LIFT * base + FLASH_ADD, FLASH_CAP)
+	return (base + add) / maxf(base, 1e-4)
 
 var api
 ## The viewport the pattern is drawn in, once (its texture lives as long as it does); null until the
 ## clouds are first on.
 var _field: SubViewport
+var _shape_3d: ImageTexture3D
+var _detail_3d: ImageTexture3D
 
 
 func addon_start(a) -> void:
@@ -66,6 +91,11 @@ func addon_start(a) -> void:
 	s.add("clouds", "number", 1.0, "Clouds", {"min": 0.0, "max": 1.0, "step": 0.05, "section": "Picture",
 		"note": "Soft, shaded clouds in the sky and their shadows drifting over the ground (in place of Zenith's own clouds while this look is on)."})
 	s.add("cloud_cover", "number", 0.58, "Cloud cover", {"min": 0.1, "max": 0.9, "step": 0.05, "section": "Picture"})
+	s.add("volumetric_clouds", "bool", true, "Volumetric clouds", {"section": "Picture",
+		"note": "3D sculpted cumulus clouds with billowing tops, eroded edges, sunlit silver linings, and curved-horizon depth. Off keeps the lighter flat layer from 0.5.3."})
+	s.add("cloud_quality", "choice", "high", "Cloud quality", {"section": "Picture",
+		"choices": [["Low", "low"], ["Medium", "medium"], ["High", "high"]],
+		"note": "Raymarch steps for volumetric clouds (18 / 28 / 40 steps with empty-space skipping). Lower saves GPU time when the sky fills the screen."})
 	s.add("vignette", "number", 0.35, "Vignette", {"min": 0.0, "max": 1.0, "step": 0.05, "section": "Picture"})
 	s.add("grain", "number", 0.02, "Film grain", {"min": 0.0, "max": 0.15, "step": 0.005, "section": "Picture"})
 	s.add("taa", "bool", false, "Temporal anti-aliasing", {"section": "Picture",
@@ -97,7 +127,13 @@ func addon_start(a) -> void:
 
 ## Switched off, Zenith takes the look away and puts back the one it replaced.
 func addon_stop() -> void:
-	pass
+	_shape_3d = null
+	_detail_3d = null
+
+
+func _exit_tree() -> void:
+	_shape_3d = null
+	_detail_3d = null
 
 
 ## The look from the settings now (registered again when one changes; Zenith puts it on again if
@@ -110,6 +146,10 @@ func _register() -> void:
 	var ao_sun := bool(s.value("ao_sun"))
 	var haze := float(s.value("haze"))
 	var bloom := float(s.value("bloom"))
+	var clouds_amt := float(s.value("clouds"))
+	var vol_on := bool(s.value("volumetric_clouds")) and not volumetric_arg_off
+	var qual := str(s.value("cloud_quality"))
+	var steps := float(QUALITY_STEPS.get(qual, 40.0))
 	var look := {
 		"name": "Cinematic",
 		"description": "Filmic colour, bloom, soft shadows, ambient occlusion and bounce light, depth haze, local contrast, vignette and grain (the Cinematic shaders add-on).",
@@ -181,7 +221,13 @@ func _register() -> void:
 			"vignette": float(s.value("vignette")), "grain": float(s.value("grain")),
 			"aberration": 0.0015 * grade, "soften": float(s.value("soften")),
 			"night_cool": float(s.value("sunset")),
-			"clouds": float(s.value("clouds")), "cloud_cover": float(s.value("cloud_cover")),
+			"clouds": clouds_amt, "cloud_cover": float(s.value("cloud_cover")),
+			"cloud_volumetric": 1.0 if vol_on else 0.0,
+			"cloud_steps": steps,
+			"cloud_low": CLOUD_LOW_VOL if vol_on else CLOUD_LOW_OLD,
+			"cloud_high": CLOUD_HIGH_VOL if vol_on else CLOUD_HIGH_OLD,
+			"flash_old": 1.0 if flash_arg_old else 0.0,
+			"flash_lift": FLASH_LIFT, "flash_add": FLASH_ADD, "flash_cap": FLASH_CAP,
 		}}],
 	}
 	if not ao_sun:
@@ -192,12 +238,40 @@ func _register() -> void:
 		look["sun_angle"] = Vector2(-42.0, -112.0)
 	elif bool(s.value("sun_side")):
 		look["sun_noon_yaw"] = NOON_YAW
-	var field: Texture2D = _cloud_field() if float(s.value("clouds")) > 0.0 else null
+	var field: Texture2D = _cloud_field() if clouds_amt > 0.0 else null
 	if field != null:
 		var params: Dictionary = look["passes"][0]["params"]
 		params["cloud_field"] = field
 		params["cloud_period"] = FIELD_PERIOD
+		if vol_on and _ensure_cloud_volumes():
+			params["cloud_shape_3d"] = _shape_3d
+			params["cloud_detail_3d"] = _detail_3d
 	api.shaders.add_look(LOOK, look)
+
+
+static func _make_volume_3d(freq: float, octaves: int, seed_val: int) -> ImageTexture3D:
+	var noise := FastNoiseLite.new()
+	noise.noise_type = FastNoiseLite.TYPE_CELLULAR
+	noise.cellular_return_type = FastNoiseLite.RETURN_DISTANCE
+	noise.fractal_type = FastNoiseLite.FRACTAL_FBM
+	noise.fractal_octaves = octaves
+	noise.frequency = freq
+	noise.seed = seed_val
+	var slices: Array[Image] = noise.get_seamless_image_3d(VOL_SIZE, VOL_SIZE, VOL_SIZE, true, 0.25)
+	if slices.size() != VOL_SIZE or slices[0] == null or slices[0].is_empty():
+		return null
+	var tex := ImageTexture3D.new()
+	if tex.create(slices[0].get_format(), VOL_SIZE, VOL_SIZE, VOL_SIZE, false, slices) != OK:
+		return null
+	return tex
+
+
+func _ensure_cloud_volumes() -> bool:
+	if _shape_3d == null:
+		_shape_3d = _make_volume_3d(0.065, 3, 31)
+	if _detail_3d == null:
+		_detail_3d = _make_volume_3d(0.13, 2, 109)
+	return _shape_3d != null and _detail_3d != null
 
 
 ## The clouds' pattern as a texture: drawn by the GPU in a viewport of its own the first time it is

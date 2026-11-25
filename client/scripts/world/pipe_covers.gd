@@ -20,9 +20,11 @@ extends RefCounted
 
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## On unless --pipe-covers=off.
-static var enabled := not ("--pipe-covers=off" in OS.get_cmdline_user_args())
+static var enabled := Switches.on("--pipe-covers")
 ## The model a pack can give for its covers.
 const MODEL := "pipe-cover"
 ## The pipe kit's pieces the end cap is taken from: the ending joined from the south (cap at the north
@@ -235,6 +237,6 @@ static func places(port_list: Array, covers: int, base: Transform3D) -> Array:
 		if covers & (1 << int(port[2])) == 0:
 			continue
 		var at: Vector2 = port[0]
-		var local := Transform3D(Basis(Vector3.UP, -float(int(port[1])) / 16.0 * TAU), Vector3(at.x, 0.0, at.y))
+		var local := Transform3D(Basis(Vector3.UP, Wire.direction_yaw(int(port[1]))), Vector3(at.x, 0.0, at.y))
 		out.append(base * local)
 	return out

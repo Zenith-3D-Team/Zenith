@@ -479,7 +479,7 @@ function M.set(cmd)
   local slot = import_into(c, cmd.i, data)
   if slot then
     local stack = stack_at(c, slot)
-    transport.send_reliable({ t = "bp_ok", q = math.floor(tonumber(cmd.q) or 0), i = slot, item = stack and stack.name or "" })
+    transport.send_reliable_priority({ t = "bp_ok", q = math.floor(tonumber(cmd.q) or 0), i = slot, item = stack and stack.name or "" })
   end
 end
 
@@ -565,7 +565,7 @@ function M.record(cmd)
     local slot = import_into(c, -1, data)
     if slot then
       local stack = cursor_stack()
-      transport.send_reliable({ t = "bp_ok", q = q, i = -1, item = stack.valid_for_read and stack.name or "" })
+      transport.send_reliable_priority({ t = "bp_ok", q = q, i = -1, item = stack.valid_for_read and stack.name or "" })
     end
     return
   end

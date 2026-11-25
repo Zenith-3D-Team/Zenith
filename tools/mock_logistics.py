@@ -58,8 +58,8 @@ SHOWCASE = (
     + [("lightning-rod", 35.5, -19.5, 0, None), ("lightning-collector", 39.0, -19.0, 0, None)]
     # A track running east, its signals beside it on the south (facing west, for trains going west).
     + [("straight-rail", 23.0 + 2 * i, -13.0, 4, None) for i in range(8)]
-    + [("rail-signal", 25.5, -11.5, 12, None), ("rail-chain-signal", 29.5, -11.5, 12, None),
-       ("rail-signal", 33.5, -11.5, 12, None)]
+    + [("rail-signal", 25.5, -11.5, 12, {"sg": 1}), ("rail-chain-signal", 29.5, -11.5, 12, {"sg": 1}),
+       ("rail-signal", 33.5, -11.5, 12, {"sg": 2})]
 )
 ROBOTS = [(990 + i, 22.5, 30.5, -19.5, i * 80) for i in range(2)]  # unit, from x, to x, y, phase
 SIGNAL_STEP = 120  # ticks each colour shows
@@ -109,6 +109,9 @@ def tick(game):
         sent = game.logistics["sent"]
         changes = []
         for u, v in sorted(now.items()):
+            ent = game.entities.get(u)
+            if ent is not None and ent.type in ("rail-signal", "rail-chain-signal"):
+                ent.extra["sg"] = v
             if sent.get(u) != v or game.tick % 300 == 0:
                 sent[u] = v
                 changes += [u, v]

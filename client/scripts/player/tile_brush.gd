@@ -11,6 +11,7 @@ const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
 const MAX_SIZE := 32
 const REPEAT := 0.1
+const LIFT := 0.02
 const COLORS := {"ok": Color(0.35, 1.0, 0.45, 0.35), "bad": Color(1.0, 0.3, 0.25, 0.35), "ghost": Color(0.45, 0.65, 1.0, 0.35),
 	"mine": Color(1.0, 0.75, 0.3, 0.3)}
 
@@ -36,7 +37,7 @@ func _ready() -> void:
 	_mm.mesh = quad
 	_mmi.multimesh = _mm
 	# Each tile's colour, riding on an add-on's hills (ground_height.gd) as the ground does.
-	_mmi.material_override = GroundHeight.mark_material(Color.WHITE)
+	_mmi.material_override = GroundHeight.mark_material(Color.WHITE, true, GroundHeight.AREA_PRIORITY)
 	_mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_mmi)
 	visible = false
@@ -106,7 +107,7 @@ func update_preview(item: String, has_ground: bool, ground: Vector2, ghost_mode:
 	for i in states.size():
 		var t: Vector2i = states[i][0]
 		var state: String = states[i][1]
-		_mm.set_instance_transform(i, Transform3D(Basis.IDENTITY, Vector3(t.x + 0.5, 0.05, t.y + 0.5)))
+		_mm.set_instance_transform(i, Transform3D(Basis.IDENTITY, Vector3(t.x + 0.5, LIFT, t.y + 0.5)))
 		var c: Color = COLORS["mine"] if mining else COLORS.get(state, Color(1, 1, 1, 0.12))
 		_mm.set_instance_color(i, c)
 

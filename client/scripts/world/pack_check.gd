@@ -2,7 +2,7 @@ extends RefCounted
 ## Model packs that pass on Factorio's own files are refused whole (the owner's rule: "if any model pack
 ## is redistributing Factorio's work we won't load any of it and make it red explaining why"). A pack
 ## holding a file that is a byte-for-byte copy of one in the player's install (a sound, a picture,
-## anything) gives nothing: no model, item, icon or sound. Factorio's graphics and sounds are Wube's;
+## anything) gives nothing: no model, item, icon, sound, tile or decorative. Factorio's graphics and sounds are Wube's;
 ## Zenith reads them from the player's own install and never takes them from a pack.
 ##
 ## One place for every pack source (model_packs.gd: loose models, folders, zips, --models, the
@@ -80,7 +80,7 @@ static func install_stamp(data: String) -> String:
 
 
 ## Every file of a pack, as path in the pack -> file (find_copies leaves out those under MIN_SIZE). `loose`: the models folder's
-## top (its loose models' pack): its files there and its icons/, items/ and sounds/ folders, not the
+## top (its loose models' pack): its files there and its icons/, items/, sounds/, tiles/ and decoratives/ folders, not the
 ## other packs (folders and zips) beside them.
 static func pack_files(root: String, loose := false) -> Dictionary:
 	var out := {}
@@ -93,7 +93,7 @@ static func pack_files(root: String, loose := false) -> Dictionary:
 		if f.get_extension().to_lower() != "zip":
 			out[f] = root.path_join(f)
 	for sub in DirAccess.get_directories_at(root):
-		if sub.to_lower() in ["icons", "items", "sounds"]:
+		if sub.to_lower() in ["icons", "items", "sounds", "tiles", "decoratives"]:
 			_list(root.path_join(sub), sub + "/", 1, out)
 	return out
 
@@ -219,6 +219,26 @@ static func _guesses(rel: String) -> Array:
 			var kind := parts[i + 1].to_lower() if parts.size() - i == 3 else ""
 			for mod: String in _mods.values():
 				out.append("%s/graphics/%s/%s" % [mod, "technology" if kind == "technology" else "icons", name])
+			break
+		if parts[i].to_lower() == "tiles":
+			var name := parts[parts.size() - 1]
+			var stem := name.get_basename()
+			for mod: String in _mods.values():
+				out.append("%s/graphics/terrain/%s" % [mod, name])
+				if stem != "":
+					out.append("%s/graphics/terrain/%s/%s" % [mod, stem, name])
+			break
+		if parts[i].to_lower() == "decoratives":
+			var name := parts[parts.size() - 1]
+			var stem := name.get_basename()
+			var at := stem.rfind("-")
+			var base := stem.substr(0, at) if at > 0 and stem.substr(at + 1).is_valid_int() else ""
+			for mod: String in _mods.values():
+				out.append("%s/graphics/decorative/%s" % [mod, name])
+				if stem != "":
+					out.append("%s/graphics/decorative/%s/%s" % [mod, stem, name])
+				if base != "":
+					out.append("%s/graphics/decorative/%s/%s" % [mod, base, name])
 			break
 	return out
 

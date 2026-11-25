@@ -19,6 +19,7 @@ extends Node3D
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const WireDecode := preload("res://scripts/net/wire_decode.gd")
 const FlashShader := preload("res://shaders/update_flash.gdshader")
+const Wire := preload("res://scripts/util/wire.gd")
 
 const FADE := 1.0
 const LIFT := 0.06
@@ -393,7 +394,7 @@ func _footprint(proto_id: int, pos: Vector2, dir: int, dir_known := true) -> Arr
 		return [pos, Vector2(0.9, 0.9), 0.0]
 	if not dir_known:
 		dir = guess_dir(p.tile_size, pos)
-	var a := dir / 16.0 * TAU
+	var a := -Wire.direction_yaw(dir)
 	var lo: Vector2 = p.box_min
 	var hi: Vector2 = p.box_max
 	return [pos + ((lo + hi) * 0.5).rotated(a), (hi - lo).max(Vector2(0.3, 0.3)), a]

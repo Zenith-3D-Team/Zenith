@@ -146,6 +146,8 @@ local function charted(surface, force, cx, cy)
   return seen ~= nil and seen[cx] ~= nil and seen[cx][cy] == true
 end
 
+M.chunk_charted = charted
+
 -- Whether the force has charted the chunk at a map position (remote building needs it, as in the
 -- game).
 function M.is_charted(surface, force, position)
@@ -352,6 +354,7 @@ end
 local ROBOPORT_SEEN_TICKS = 60
 local rp_seen = {}  -- "si,force,cx,cy" -> {seen, until}
 local rp_seen_count = 0
+local rp_lookups = 0     -- roboport_sees calls made (the map trains' job prices them)
 
 local function roboport_seen(surface, force, cx, cy)
   local key = surface.index .. "," .. force.name .. "," .. cx .. "," .. cy
@@ -365,6 +368,7 @@ local function roboport_seen(surface, force, cx, cy)
     end
     rp_seen_count = rp_seen_count + 1
   end
+  rp_lookups = rp_lookups + 1
   local seen = roboport_sees(surface, force, cx, cy)
   rp_seen[key] = { seen, game.tick + ROBOPORT_SEEN_TICKS + (cx * 7 + cy * 13) % ROBOPORT_SEEN_TICKS }
   return seen
@@ -403,6 +407,9 @@ function M.covered(surface, force, position)
   return roboport_sees(surface, force, cx, cy)
 end
 
+local COV_TICKS = 60
+local cov_sent = false
+
 local function state()
   local s = storage.f3d
   s.map = s.map or { queue = {}, head = 1, res = 4 }
@@ -410,6 +417,7 @@ local function state()
 end
 
 function M.reset()
+  cov_sent = false
   storage.f3d.map = nil
   storage.f3d.map_rp = nil
   storage.f3d.map_rp_next = nil
@@ -425,6 +433,11 @@ local MAX_OVERLAY = 400 -- per chunk
 local TURRET_TYPES = { ["ammo-turret"] = true, ["electric-turret"] = true, ["fluid-turret"] = true }
 local SIGNAL_TYPES = { ["rail-signal"] = true, ["rail-chain-signal"] = true }
 local ROBOT_TYPES = { "construction-robot", "logistic-robot" }
+local OVERLAY_TYPES = {
+  "electric-pole", "ammo-turret", "electric-turret", "fluid-turret",
+  "roboport", "train-stop", "rail-signal", "rail-chain-signal",
+  "assembling-machine", "furnace",
+}
 M.ROBOT_TYPES = ROBOT_TYPES
 -- fn(surface, force name, x0, y0, x1, y1) -> the force's robots in that box, or nil when it can't say
 -- (movers.lua sets it: the movers its last search found, where the search covered the box).
@@ -754,6 +767,8 @@ local function chart_step(surface, force, m)
     local hit = chart_cache[key]
     if hit and hit.count == job.count and hit.own == own and (job.st or game.tick - hit.tick < CHART_KEEP_TICKS) then
       scratches[port] = { id = id, cached = hit }
+    elseif job.same then
+      scratches[port] = { id = id, same_only = true, ov = {}, signals = {} }
     else
       sc = { id = id, pal = {}, index = {}, px = {}, layers = {}, ov = {}, signals = {} }
       local half = math.floor(res / 2)
@@ -775,30 +790,39 @@ local function chart_step(surface, force, m)
     local h = CHUNK / job.strips
     local ya = y0 + (job.step - 1) * h
     local yb = ya + h
-    local found = surface.find_entities_filtered({ area = { { x0, ya }, { x0 + CHUNK, yb } },
-      type = registry.excluded_types(), invert = true })
-    for _, e in pairs(found) do
-      local f = e.force.name
-      local st = style(e, f == own and "own" or (f == "neutral" and "neutral" or "enemy"))
-      if st then
-        local box = e.bounding_box
-        local i1 = math.max(0, math.floor((box.left_top.x - x0) / res))
-        local i2 = math.min(n - 1, math.floor((box.right_bottom.x - x0 - 0.001) / res))
-        local j1 = math.max(0, math.floor((box.left_top.y - y0) / res))
-        local j2 = math.min(n - 1, math.floor((box.right_bottom.y - y0 - 0.001) / res))
-        local ci, layer = nil, st[2]
-        for j = j1, j2 do
-          for i = i1, i2 do
-            local k = j * n + i + 1
-            if layer >= sc.layers[k] then
-              ci = ci or colour_index(sc, st[1])
-              sc.px[k], sc.layers[k] = ci, layer
+    if sc.same_only then
+      local found = surface.find_entities_filtered({
+        area = { { x0, ya }, { x0 + CHUNK, yb } },
+        type = OVERLAY_TYPES,
+        force = own,
+      })
+      overlay(found, own, x0, y0, ya, yb, sc.ov, sc.signals)
+    else
+      local found = surface.find_entities_filtered({ area = { { x0, ya }, { x0 + CHUNK, yb } },
+        type = registry.excluded_types(), invert = true })
+      for _, e in pairs(found) do
+        local f = e.force.name
+        local st = style(e, f == own and "own" or (f == "neutral" and "neutral" or "enemy"))
+        if st then
+          local box = e.bounding_box
+          local i1 = math.max(0, math.floor((box.left_top.x - x0) / res))
+          local i2 = math.min(n - 1, math.floor((box.right_bottom.x - x0 - 0.001) / res))
+          local j1 = math.max(0, math.floor((box.left_top.y - y0) / res))
+          local j2 = math.min(n - 1, math.floor((box.right_bottom.y - y0 - 0.001) / res))
+          local ci, layer = nil, st[2]
+          for j = j1, j2 do
+            for i = i1, i2 do
+              local k = j * n + i + 1
+              if layer >= sc.layers[k] then
+                ci = ci or colour_index(sc, st[1])
+                sc.px[k], sc.layers[k] = ci, layer
+              end
             end
           end
         end
       end
+      overlay(found, own, x0, y0, ya, yb, sc.ov, sc.signals)
     end
-    overlay(found, own, x0, y0, ya, yb, sc.ov, sc.signals)
   end
   if job.step < job.strips then
     job.step = job.step + 1
@@ -809,6 +833,16 @@ local function chart_step(surface, force, m)
     return
   end
   scratches[port] = nil
+  if sc.same_only then
+    local st = job.st and stamp_of(surface.index, cx, cy, job.count, m.res) == job.st and job.st or nil
+    if st and job.same then
+      local msg = { t = "chart", cx = cx, cy = cy, si = surface.index, same = st }
+      live_parts(msg, surface, own, cx, cy, sc)
+      transport.send_now(msg)
+      M.counts.same = M.counts.same + 1
+    end
+    return
+  end
   local hit = sc.cached
   if not hit then
     if not chart_cache[key] then
@@ -1192,9 +1226,6 @@ end
 -- `cov` {si, l: [cx, cy, d, ...], x?, y?, cr?}: what the 3D remote view sees, about once a second
 -- while it is on: each working radar's chunk and reveal distance, and the character's position
 -- (1/256 tile) and charting radius (tiles) when it is on that surface. `all` = 1 on a platform.
-local COV_TICKS = 60
-local cov_sent = false
-
 local function send_view_coverage(c)
   local on = storage.f3d.remote_view ~= nil
   if not on then
@@ -1243,6 +1274,163 @@ local function colour_of(car)
   return car.type == "locomotive" and LOCO_COLOR or WAGON_COLOR
 end
 
+-- One carriage into a pass's numbers (`acc` {parts, current}) when it is seen: a working radar's chunk, the
+-- character's charting radius, or a roboport's construction area.
+local function add_carriage(acc, car, surface, force, covered_set, near)
+  local p = car.position
+  local cx, cy = math.floor(p.x / CHUNK), math.floor(p.y / CHUNK)
+  local seen = covered_set[cx .. "," .. cy]
+  if not seen and near then
+    local dx, dy = near.x - p.x, near.y - p.y
+    seen = dx * dx + dy * dy <= CHART_RADIUS * CHART_RADIUS
+  end
+  if not seen then
+    seen = roboport_seen(surface, force, cx, cy)
+  end
+  if seen then
+    local current = acc.current
+    local size = size_of(car)
+    local n = #current
+    current[n + 1] = world.fixed(p.x)
+    current[n + 2] = world.fixed(p.y)
+    current[n + 3] = math.floor(car.orientation * 1000 + 0.5) % 1000
+    current[n + 4] = size[1]
+    current[n + 5] = size[2]
+    current[n + 6] = colour_of(car)
+    if n + 6 >= TRAIN_PART * 6 then
+      acc.parts[#acc.parts + 1] = current
+      acc.current = {}
+    end
+  end
+end
+
+-- A pass's `mtr` messages, in order (the first with `cov`, and `all` on a platform).
+local function train_messages(surface, radars, acc)
+  local parts = acc.parts
+  if #acc.current > 0 or #parts == 0 then
+    parts[#parts + 1] = acc.current
+  end
+  local okp, platform = pcall(function() return surface.platform end)
+  local msgs = {}
+  for i, l in ipairs(parts) do
+    local msg = { t = "mtr", si = surface.index, part = i, parts = #parts, l = l }
+    if i == 1 then
+      msg.cov = radars
+      -- A space platform is seen whole (as `cov` says with `all`); it has no radars to list.
+      if okp and platform then
+        msg.all = 1
+      end
+    end
+    msgs[i] = msg
+  end
+  return msgs
+end
+
+local function send_trains(surface, radars, acc)
+  for _, msg in ipairs(train_messages(surface, radars, acc)) do
+    transport.send_now(msg)
+  end
+end
+
+-- map_trains_slice (perf.lua): the ask only starts a pass; M.tick reads it a carriage at a time and sends `mtr`
+-- when it ends. On the megabase every carriage in the handler took 63-110 ms once a second. What a carriage costs
+-- depends on module-local caches (a chunk no radar covers asks the roboport networks, roboport_seen, kept a second
+-- or two; the radars' statuses kept a second), so the pass is module-local and spends nothing from the work budget:
+-- it reads what is left of it (read-only, as inserters.lua's look does) and takes up to TRAIN_SHARE of the budget, at
+-- least TRAIN_LEAST, pricing a carriage CAR_PRICE and each roboport lookup LOOKUP_PRICE. Only what is sent depends on
+-- it, so peers may differ; after a load the pass is gone and the next ask starts another. Its parts go one a tick,
+-- the first as it ends (the client keeps the parts until the last). An ask while a pass for that surface is under way (or sending)
+-- waits for it (one older than TRAIN_STALE_TICKS starts again).
+local TRAIN_SHARE = 0.3
+local TRAIN_LEAST = 24
+local CAR_PRICE = 1
+local LOOKUP_PRICE = 20
+local TRAIN_STALE_TICKS = 600
+-- A client's state -> its pass {id, si, asked, trains?, i, cars?, k, parts, current} (weak: a client gone takes it).
+local mtr_jobs = setmetatable({}, { __mode = "k" })
+local mtr_seq = 0
+
+local function trains_step(c)
+  local job = mtr_jobs[storage.f3d]
+  if not job then
+    return
+  end
+  local surface = game.get_surface(job.si)
+  if not (surface and surface.valid) then
+    mtr_jobs[storage.f3d] = nil
+    return
+  end
+  local force = c and c.force or game.forces.player
+  local tp = profile.start()
+  if job.sending then
+    -- (A part a tick: written as JSON, 400 carriages are 4.3 ms; the megabase's 4,124 were 45 ms in one tick.)
+    local msg = job.sending[job.sent + 1]
+    job.sent = job.sent + 1
+    if msg then
+      transport.send_now(msg)
+    end
+    if job.sent >= #job.sending then
+      mtr_jobs[storage.f3d] = nil
+    end
+    profile.stop("map.trains_send", tp)
+    return
+  end
+  if not job.trains then
+    local ok, list = pcall(function() return game.train_manager.get_trains({ surface = surface, force = force }) end)
+    job.trains = ok and list or {}
+    job.i, job.k = 1, 1
+    profile.stop("map.trains_list", tp)
+    tp = profile.start()
+  end
+  local radars, covered_set = radar_coverage(surface, force)
+  profile.stop("map.trains_cov", tp)
+  tp = profile.start()
+  local limit = budget.limit()
+  local allowance = math.max(TRAIN_LEAST, math.min(budget.left(), math.floor(limit * TRAIN_SHARE)))
+  local near = c and c.valid and c.surface == surface and c.position or nil
+  local trains = job.trains
+  local units = 0
+  while units < allowance do
+    local cars = job.cars
+    if not cars then
+      local train = trains[job.i]
+      if not train then
+        break
+      end
+      job.i = job.i + 1
+      cars = train.valid and train.carriages or {}
+      job.cars, job.k = cars, 1
+      units = units + CAR_PRICE
+    end
+    local car = cars[job.k]
+    if car then
+      job.k = job.k + 1
+      if car.valid then
+        local before = rp_lookups
+        add_carriage(job, car, surface, force, covered_set, near)
+        units = units + CAR_PRICE + (rp_lookups - before) * LOOKUP_PRICE
+      end
+    else
+      job.cars = nil
+    end
+  end
+  profile.stop("map.trains_cars", tp)
+  if job.cars == nil and not trains[job.i] then
+    -- Done: its first part now, the rest one a tick.
+    job.sending, job.sent = train_messages(surface, radars, job), 1
+    transport.send_now(job.sending[1])
+    if #job.sending <= 1 then
+      mtr_jobs[storage.f3d] = nil
+    end
+  end
+end
+
+-- The trains' pass under way (tests, /c): nil, or {id, si, i, n}.
+function M.trains_job()
+  local job = mtr_jobs[storage.f3d]
+  return job and { id = job.id, si = job.si, i = job.i, n = job.trains and #job.trains or nil } or nil
+end
+
 -- When the last ask was answered is kept in storage, the same on every peer.
 function M.trains(cmd)
   local c = puppet.get()
@@ -1253,54 +1441,27 @@ function M.trains(cmd)
     return
   end
   s.mtr_ask = game.tick
+  if perf.on("map_trains_slice") then
+    local job = mtr_jobs[s]
+    -- (One that hasn't moved for TRAIN_STALE_TICKS, the map's step not running without a character, starts again.)
+    if job and job.si == surface.index and game.tick - job.asked < TRAIN_STALE_TICKS then
+      return
+    end
+    mtr_seq = mtr_seq + 1
+    mtr_jobs[s] = { id = mtr_seq, si = surface.index, asked = game.tick, parts = {}, current = {} }
+    return
+  end
   local force = c and c.force or game.forces.player
   local ok, list = pcall(function() return game.train_manager.get_trains({ surface = surface, force = force }) end)
   local radars, covered_set = radar_coverage(surface, force)
   local near = c and c.valid and c.surface == surface and c.position or nil
-  -- A space platform is seen whole (as `cov` says with `all`); it has no radars to list.
-  local okp, platform = pcall(function() return surface.platform end)
-  local parts, current = {}, {}
+  local acc = { parts = {}, current = {} }
   for _, train in pairs(ok and list or {}) do
     for _, car in pairs(train.carriages) do
-      local p = car.position
-      local cx, cy = math.floor(p.x / CHUNK), math.floor(p.y / CHUNK)
-      local seen = covered_set[cx .. "," .. cy]
-      if not seen and near then
-        local dx, dy = near.x - p.x, near.y - p.y
-        seen = dx * dx + dy * dy <= CHART_RADIUS * CHART_RADIUS
-      end
-      if not seen then
-        seen = roboport_seen(surface, force, cx, cy)
-      end
-      if seen then
-        local size = size_of(car)
-        local n = #current
-        current[n + 1] = world.fixed(p.x)
-        current[n + 2] = world.fixed(p.y)
-        current[n + 3] = math.floor(car.orientation * 1000 + 0.5) % 1000
-        current[n + 4] = size[1]
-        current[n + 5] = size[2]
-        current[n + 6] = colour_of(car)
-        if n + 6 >= TRAIN_PART * 6 then
-          parts[#parts + 1] = current
-          current = {}
-        end
-      end
+      add_carriage(acc, car, surface, force, covered_set, near)
     end
   end
-  if #current > 0 or #parts == 0 then
-    parts[#parts + 1] = current
-  end
-  for i, l in ipairs(parts) do
-    local msg = { t = "mtr", si = surface.index, part = i, parts = #parts, l = l }
-    if i == 1 then
-      msg.cov = radars
-      if okp and platform then
-        msg.all = 1
-      end
-    end
-    transport.send_now(msg)
-  end
+  send_trains(surface, radars, acc)
 end
 
 -- The map's logistic networks layer (H13): Factorio's map draws every roboport's logistic and
@@ -1505,6 +1666,13 @@ function M.tick()
     send_surfaces(c.force, false)
   end
   send_view_coverage(c)
+  do
+    local ok, err = pcall(trains_step, c)
+    if not ok then
+      mtr_jobs[storage.f3d] = nil
+      log("[factorio-3d-bridge] map trains: " .. tostring(err))
+    end
+  end
   for _, step in ipairs({ roboports_step, answer_landing_pad }) do
     local ok, err = pcall(step, c.force)
     if not ok then

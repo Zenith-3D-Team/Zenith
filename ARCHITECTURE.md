@@ -1,230 +1,139 @@
 # Architecture
 
-How Zenith fits together, for anyone reading or forking the code. [docs/RUNNING.md](docs/RUNNING.md)
-gets it running, [CONTRIBUTING.md](CONTRIBUTING.md) has the tests and rules, [docs/PROTOCOL.md](docs/PROTOCOL.md)
-every message; this file explains why things are the way they are.
+How Zenith's pieces fit together for anyone reading or forking the codebase. Setup lives in [docs/RUNNING.md](docs/RUNNING.md), contributor rules in [CONTRIBUTING.md](CONTRIBUTING.md), tests in [docs/COMMANDS-TESTS.md](docs/COMMANDS-TESTS.md), and every wire field in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
-## The idea
+## System overview
 
-Factorio can't draw in 3D, and mods can't touch its renderer. So the game runs unchanged
-(normally as a headless server) and is the only simulation; a separate program draws it.
+Factorio stays the authoritative simulation. Mods have no access to Factorio's 2D renderer, so Factorio runs headless (or windowed in hybrid mode) while the `factorio-3d-bridge` Lua mod exchanges state and commands with a standalone Godot 4.7+ client over Factorio 2.x's local UDP API (`helpers.send_udp` / `recv_udp`, `--enable-lua-udp`).
 
 ```mermaid
 flowchart TB
-    subgraph F["Factorio 2.1: headless server, or the game itself"]
+    subgraph F["Factorio 2.1 (headless server or hybrid game)"]
         direction LR
-        SIM["The simulation, unchanged<br/>belts, trains, biters, saves, other mods"] <--> MOD["factorio-3d-bridge mod (Lua)<br/>reads the world near each client<br/>and plays a character for it"]
+        SIM["Simulation (unchanged)<br/>entities, rails, saves, other mods"] <--> MOD["factorio-3d-bridge mod (Lua)<br/>data-final-fixes + control + scripts/"]
     end
-    MOD <== "JSON over localhost UDP<br/>down: world and state · up: commands" ==> NET
-    subgraph C["Zenith client (Godot 4)"]
-        direction LR
-        INPUT["Keys and mouse"] --> NET["Bridge<br/>socket, handshake, resync"]
-        NET --> WORLD["World mirror<br/>and 3D models"]
-        NET --> UI["Factorio-style UI"]
+
+    MOD <== "Binary Wire v1-5 (0xF3) or JSON over UDP :34200<br/>(or TCP :34200 via optional server/relay.py)" ==> NET
+
+    subgraph C["Zenith client (Godot 4.7+)"]
+        direction TB
+        INPUT["Player Input & Switches<br/>(player/*.gd, switches.gd)"] --> NET["Bridge + WireDecodeNative<br/>(net/bridge.gd, native/belt_sim)"]
+        NET --> WORLD["World Mirror + C++ Belt/Robot Sim<br/>(world/*.gd, Distant Horizon 2.5D)"]
+        NET --> UI["ui_model.gd -> Factorio UI<br/>(ui/factorio/*.gd)"]
+        WORLD --> ADDONS["Add-on Host (API 1.91)<br/>+ optional api.game mod link"]
     end
-    INSTALL[("The player's Factorio install<br/>sprites, icons, sounds, fonts<br/>read at runtime, never copied")] -.-> C
+
+    INSTALL[("Player's Factorio install<br/>sprites, icons, sounds, fonts, config.ini<br/>read at runtime, never copied")] -.-> C
+    PACKS[("Model packs (.glb)<br/>Zenith.zip, FUE5, Wube3DP, Placeholders")] --> WORLD
 
     classDef game fill:#f4d9a6,stroke:#9a6b1f,color:#1d1608
     classDef client fill:#cfe3f7,stroke:#2f6aa3,color:#0b1a2a
     classDef data fill:#e5e5e5,stroke:#777,color:#111
     class SIM,MOD game
-    class NET,WORLD,UI,INPUT client
-    class INSTALL data
+    class NET,WORLD,UI,INPUT,ADDONS client
+    class INSTALL,PACKS data
 ```
-
-Factorio 2.0.59 added `helpers.send_udp` / `recv_udp` for mods, started with `--enable-lua-udp
-<port>`; that is the only way in or out. Because the mod runs inside the deterministic
-simulation, every peer of a multiplayer game runs it too, which shapes most of the mod's rules.
 
 ## The bridge mod (`mod/factorio-3d-bridge/`)
 
-- **One module per concern** in `scripts/`, each named for what it does. `control.lua` wires events
-  and runs each module's `tick()` in a fixed order every tick; `scripts/profile.lua` times them
-  (`/f3d-profile`, `/f3d-status`).
-- **Determinism.** `storage` only changes from events and `on_tick`, which every peer replays in
-  the same order; module-level Lua state is only allowed for caches derived from prototypes
-  (`registry.lua`). Sending UDP doesn't touch the game, so it is free to differ (only the server
-  instance actually sends).
-- **The character.** A player-less character (`puppet.lua`) does what the client asks: walking
-  state, mining, building through `create_entity` with `raise_built`, inventories by slot. In
-  single-player it is the player's own character; on a server it can stand in for a player while
-  they are away (`takeover.lua`). Much of Factorio's UI belongs to a player (cursor, clipboard,
-  alerts, blueprint library), so the mod rebuilds what it can: its own clipboard, the alerts
-  (`alerts.lua`), the quickbar.
-- **What is sent.** The world in 32x32 chunks: a snapshot when the client subscribes
-  (`world.lua`), then deltas from the build, mine, die and rotate events (`tracker.lua`). Fast
-  things near the client's focus are polled at a few Hz: movers, belt items, inserter hands,
-  fluids, power, machine states. Window data (`gui`) is sent while a screen is open.
-- **No slow ticks** (`budget.lua`). A big request (the map zoomed out, the chunks after a jump or a
-  join, another planet's remote view, a Factoriopedia page, the trains on the map) must never make
-  one slow game tick, and the client only hears of it after the tick. So every job that can be big
-  works through a queue in slices paid from a per-tick budget, counted in work units (a mod can't
-  read a clock: it would differ between peers); one-off answers wait in `requests.lua`'s queue.
-  The client can set the budget (`budget`) and hears how it is used (`wb`).
-- **Update rates** (`rate.lua`). Under load the client asks for a `rate` level (0-3) and the
-  costliest periodic jobs (belt items, far lanes and movers first) run less often, each on a tick
-  of its own, rather than sending less of the world: the world may lag, the server won't. The
-  messages the client glides (`mv`, `bi`, `ih`) say how far apart they come (`p`).
-- **Reliability.** Snapshots and deltas are *reliable*: numbered (`r`), queued, sent under a byte
-  budget per tick (`transport.lua`); a client that sees a gap asks for a resync of what it is
-  missing. Live state is *immediate*: no number, the next one replaces it. Lists that dominate the
-  traffic (`bi`, `ih`, `mv`) are delta-coded for clients that ask (`z` in the hello).
-- **Several clients** (`session.lua`): the first client's state is `storage.f3d`. A hello from
-  another port on a server starts another state of its own (with its own character) in
-  `storage.f3d_extra`. While a client is served (its packets, its tick, each game event) its
-  state is swapped in as `storage.f3d`, so every module simply works on "the client".
-- **Robustness.** Every command runs inside `pcall` (`session.on_packet`): a bad packet answers
-  with a "Bridge error" message and never stops the game. `tools/mod_tests/test_fuzz.py` throws
-  garbage at every command to keep it that way.
-- **Almost no data stage.** The mod adds one prototype, the "Show in Zenith" key (a
-  `custom-input` on Ctrl+F9, `data.lua`), and changes none, so it can be added to or removed
-  from a save at any time.
+- **Data stage (`data.lua`, `data-final-fixes.lua`):** Adds the `"Show in Zenith"` (`Ctrl+F9`) custom input and packs non-destructive mod metadata (`zenith-step-sounds` tile footsteps and `gfx` mod sprites/icons/tiles) into `mod-data` prototypes for runtime streaming.
+- **Modular tick loop (`control.lua`, `scripts/*.lua`):** Dispatches game events and runs module ticks in fixed order; `profile.lua` instruments script cost (`/f3d-profile`, `/f3d-status`).
+- **Determinism:** `storage.f3d` mutates strictly in events and `on_tick` so multiplayer peers never desync. Only prototype-derived read caches live at module level (`registry.lua`); UDP sends happen without altering simulation state.
+- **Character & takeover (`puppet.lua`, `takeover.lua`):** Drives a player-less character (mining, building with `raise_built`, inventories, quickbar, alerts), seamlessly handing items and state back and forth when real players log into the server.
+- **Chunk & state streaming:** Streams `32x32` chunk snapshots (`world.lua`, `world_chunk.lua`) and far `lod_chunk` tiles, plus event deltas (`tracker.lua`) and focus-radius polls (movers, inserters, fluids, power, machines).
+- **Client-driven belt & robot sims (`belt_sim*.lua`, `robots.lua`):** Instead of resending every item every tick, the mod sends lane deltas, splitter crossing hints (`sx`), and robot schedules (`rb`), letting the client predict motion smoothly between ticks.
+- **Budgets & adaptive rates (`budget.lua`, `rate.lua`):** Large requests (chunks, map view, trains, Factoriopedia, Distant Horizon) slice cleanly under a per-tick work-unit cap; `rate` levels `0–3` slow costly polls first under server load.
+- **Reliability & recovery (`transport.lua`):** Reliable packets carry monotonic sequence `r` and are retained in a `256`-frame retransmit ring for low-latency `nack` recovery; older gaps fall back to chunk `resync`. Bad incoming packets are isolated inside `pcall` (`session.on_packet`).
+- **Multi-client & add-on link (`session.lua`, `link.lua`):** Swaps per-client state in `storage.f3d_extra` (up to 8 clients) and relays `ext` messages between GDScript add-ons (`api.game`) and companion Factorio mods.
 
-## The protocol
+## Wire protocol & recovery
 
-JSON over localhost UDP, one message per datagram (at most 65507 bytes), or several joined by
-newlines for a client that asks (`b` in the hello: a datagram costs the game about a millisecond
-whatever its size, so the mod fills each one), positions as integers
-in 1/256 tile, entity identity by `unit_number` (or prototype + position). It changes in five
-places together: the mod, the client, `tools/mock_server.py`, `tools/protocol.py` (the validator
-every test runs every message through) and `docs/PROTOCOL.md`. It stays at version 1 by only
-adding messages and fields old clients can ignore.
-
-A session, and what happens when a packet is lost:
+Payloads run over localhost UDP (or LAN TCP frames `ZRL1`/`ZRC1` via `server/relay.py`). Positions use signed integers in **`1/256` tile**; batches combine messages up to `60 KB` (`b: 1`), tracked with datagram counters (`dq: 1`). Binary frames (`0xF3`, wire `v1–5`) pack hot streams (`mv`, `bs`, `bfar`, `chunk`, `ents`, `st`, `ih`, `rb`, and `sx` splitter hints) in little-endian binary to avoid JSON text overhead. Protocol changes must stay in lockstep across five places: mod, client, `tools/mock_server.py`, `tools/protocol.py`, and [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant M as Bridge mod
-    C->>M: hello (every second, keeps the session alive)
-    M->>C: welcome, protos, tprotos, iprotos, ready, inventory, recipes
-    C->>M: sub (chunks near the camera, nearest first), focus
-    M->>C: chunk + ents for each chunk (reliable, numbered r)
+    participant C as Client (Bridge)
+    participant M as Bridge Mod (Lua)
+
+    C->>M: hello (v:1, sid, bin:5, b:1, dq:1)
+    M->>C: welcome (bin:5), protos, eprops, steps, gfx, ready
+    C->>M: sub / lod_sub (nearest chunks + horizon), focus
+    M->>C: chunk + ents (binary v3, reliable r), lod_chunk
+
     loop Every tick
-        M->>C: add / upd / del when things are built, mined, rotated, destroyed (reliable)
-        M->>C: mv, bi, ih, st... live state near the focus (immediate, the next replaces it)
+        M->>C: add / upd / del / died (reliable r)
+        M->>C: bs / bfar / rb / mv / ih / st (binary v1-5 immediate)
     end
-    C->>M: walk, build, open, craft... (commands)
-    Note over C,M: A reliable message is lost: r jumps ahead
-    C->>M: resync with the chunks that are incomplete
-    M->>C: those chunks again
-    Note over C,M: No hello for 10 s: the mod drops the client
+
+    C->>M: walk, build, rotate, open, craft, ext (commands)
+
+    Note over C,M: Packet loss detected (r skips ahead)
+    C->>M: nack (missing r list)
+    M->>C: retransmit from 256-frame ring (same r)
+    Note over C,M: NACK timeout / cold gap -> fallback resync
+    Note over C,M: 10 s without hello -> mod drops session
 ```
 
 ## The client (`client/`)
 
-- **`Bridge`** (`scripts/net/bridge.gd`, an autoload): the socket (on its own thread), the
-  handshake, sequence checking and resyncs. Everything else gets parsed messages.
-- **The world mirror** (`scripts/world/`): entity records per chunk, drawn as one
-  `MultiMeshInstance3D` per mesh per chunk (never a node per belt); movers, belt items, inserter
-  arms, ground items, fluids and power, wires, ghosts each have their own layer. Chunks are asked
-  for a few at a time, nearest first, and built within a per-frame allowance.
-- **Models**: every model comes from a model pack (`model_packs.gd`), the higher pack in one order
-  winning where two have a model of one name. Three are built in,
-  `client/assets/models/packs/<pack>/<prototype>.glb`: Placeholders, made by the Blender scripts in
-  `tools/models/` (always last, so every entity keeps a model), Wube3DP, converted from Wube's
-  printable models, and FUE5's textured models (CC BY-NC-SA, see CREDITS.md). The `models` folder
-  beside Zenith adds more (loose files, folders, zips), on top; the Model packs window orders them and
-  takes any model family from a pack of the player's choice, and a building window's Model button one
-  building. Each of our parts carries a colour sampled from Factorio's sprite when the model is built
-  (`tools/models/part_colors.py`; only the numbers are stored), and one shader adds weathering
-  (`shaders/factorio_material`). A model may also bring its own textures (`model_textures.gd`), as
-  FUE5's do. Models are read and merged on worker threads (`model_library.gd`), so a model's first
-  appearance doesn't stall a frame. Each model is flattened into one mesh for instanced drawing.
-  Nothing of Wube's art is in the repository; graphics, sounds and fonts are read from the player's
-  Factorio.
-- **Motion on the GPU.** Machines' moving parts (`anim_*` nodes: spinning, sliding, rocking, lit,
-  glowing) are moved by the model shader from each instance's state, which `anim.gd` writes only
-  when a machine starts or stops, so every loaded chunk animates at no script cost; turret heads,
-  collectors' arms and worms are still moved by script near the camera. Flying robots and walking
-  creatures each have a record in one float texture (`mover_records.gd`: their last positions and
-  ticks), and the shaders work out where to draw them each frame; robots are one MultiMesh per kind
-  and part (`robot_swarm.gd`). Everything that moves is drawn a little behind the game's clock
-  (`game_clock.gd`, the tick rate measured from the messages), between the positions it was sent.
-  Creatures bend their limbs in the vertex shader.
-- **Belt items** glide between updates along their lanes (`belt_paths.gd`, from the belts the client
-  already has): round curves, through splitters, hidden inside undergrounds, never across empty
-  ground. Past "Belt items in full" each lane shows icons instead (`belt_lanes.gd`).
-- **Drawing a big base.** The sun's shadow map is fitted to the ground in view (`sun_shadows.gd`),
-  instead of four splits out to 150 tiles. Models have levels of detail and simple shadow stand-ins
-  (`model_lods.gd`). Past about four chunks from the camera a chunk's buildings are merged into one
-  simplified, vertex-coloured mesh (`far_chunks.gd`, Merge far buildings): one draw instead of
-  dozens.
-- **Holding 60 UPS** (`ups_governor.gd`). What the client asks for is worked out in the game's
-  tick, so when the game runs slow the client asks for less: first a `rate` level, then shorter
-  distances, the minimap's refreshes and a frame cap, never changing the player's settings, and
-  gives it back once the game recovers. It also keeps the bridge's work budget to the room the game
-  has before anything big is asked.
-- **The UI** (`scripts/ui/factorio/`): Factorio's windows drawn with the game's GUI atlas and
-  fonts. `ui_model.gd` is the one place bridge messages become UI data and UI actions become
-  commands; the windows only read and call it.
-- **The front end** (`scripts/menu/`): main menu, starting headless Factorio for new games and
-  saves, settings.
-- **Add-ons** (`scripts/addons/`, [docs/ADDONS.md](docs/ADDONS.md)): folders with an `addon.json`,
-  loaded at start-up, each given one versioned API object (add-on API 1): the camera taken and
-  handed back, keys in Settings → Controls, the world read-only, events, what is shown, windows,
-  lighter updates and data per save. Nothing an add-on does reaches the game.
-
 ```mermaid
 flowchart LR
-    UDP(["UDP from the mod"]) --> B["Bridge<br/>(net/bridge.gd)"]
-    B --> W["World mirror<br/>(world/*.gd)"]
-    B --> M["ui_model.gd"]
-    W --> R["Chunks: one MultiMesh per mesh, far ones merged<br/>movers, belt items, arms, wires, ghosts"]
-    M --> UI["Factorio's windows<br/>(ui/factorio/*.gd)"]
-    UI -- "clicks become commands" --> M
-    IN["Keys and mouse<br/>(player/*.gd)"] --> B
-    M --> B
-    B --> OUT(["UDP to the mod"])
-    FE["Front end<br/>(menu/*.gd)"] -- "starts headless Factorio,<br/>then connects" --> B
+    INP["Input & Switches<br/>(player/*.gd, switches.gd)"] --> BR["Bridge + UdpSocketNative<br/>(net/bridge.gd, wire_decode.gd)"]
+    FE["Front End<br/>(menu/*.gd, server launch)"] --> BR
+    UDP(["UDP / LAN Relay Stream"]) --> BR
+    BR --> OUT(["UDP Commands"])
+
+    BR --> WM["World Mirror & Layering<br/>(chunks, MultiMesh, far_chunks, Distant Horizon)"]
+    BR --> SIM["Belt & Robot Simulators<br/>(BeltSimNative / GDScript fallback)"]
+    BR --> UM["ui_model.gd"]
+
+    UM --> UI["Factorio UI Windows<br/>(ui/factorio/*.gd)"]
+    UI -- "actions -> commands" --> UM
+    WM --> ADD["Add-on Host (API 1.91)<br/>(addons/*.gd, api.game)"]
+    SIM --> WM
 
     classDef io fill:#e5e5e5,stroke:#777,color:#111
     classDef core fill:#cfe3f7,stroke:#2f6aa3,color:#0b1a2a
     class UDP,OUT io
-    class B,W,M,R,UI,IN,FE core
+    class INP,FE,BR,WM,SIM,UM,UI,ADD core
 ```
 
-## Tests
+- **Networking & C++ native twin (`scripts/net/`, `native/belt_sim/`):** `Bridge` decodes UDP/relay frames via `WireDecodeNative` / `UdpSocketNative` (`native/belt_sim/` registers 13 C++ GDExtension classes: `BeltSimNative`, `BeltDrawNative`, `BeltItemsNative`, `BeltLatticeNative`, `BeltMvNative`, `MoversNative`, `InserterArmsNative`, `ChunkBuildNative`, `LodMesherNative`, `DecorNative`, `TerrainFieldNative`, `WireDecodeNative`, and `UdpSocketNative`). Every native path falls back cleanly to GDScript when absent or disabled via [SWITCHES.md](docs/SWITCHES.md).
+- **World rendering (`scripts/world/`):** Draws `MultiMeshInstance3D` batches per chunk per mesh (never one node per belt), worker-threaded `.glb` imports (`model_library.gd`), GPU-driven animations/robots/creatures (`anim.gd`, `mover_records.gd`, `robot_swarm.gd`), far chunk merging (`far_chunks.gd`), **Distant Horizon** 2.5D terrain/silhouettes (`lod_horizon`), and view-fitted sun shadows (`sun_shadows.gd`).
+- **Model packs & graphics (`model_packs.gd`, `mod_graphics.gd`):** Resolves stacked packs (**Zenith.zip**, **FUE5**, **Wube3DP**, **Placeholders**, **Factorio** 2D cutouts + user folders/zips), per-pack PBR vs Factorio sprite balance, and runtime-extracted icons/tiles/sprite cards for external Factorio mods.
+- **UPS & frame pacing (`ups_governor.gd`):** Adapts `rate` levels, bridge `budget`, distances, and FPS cap automatically to preserve `60 UPS` on slow ticks without overwriting saved settings.
+- **CLI switches & UI (`switches.gd`, `scripts/ui/factorio/`):** `Switches` centralizes all CLI flags (`--*`); `ui_model.gd` decouples bridge state/commands from Factorio UI windows; `menu/*.gd` handles server lifecycle, Factorio `config.ini` defaults sync, and `Settings.dev_tools()` gating.
+- **Add-on runtime (`scripts/addons/`):** Runs sandbox-switched user add-ons against versioned **API `1.91`** (camera, keys, settings, custom UI, read-only world, events, shaders, terrain, weather, audio, creatures, storage, and `api.game` mod messaging).
 
-| Test | What it covers | Needs |
+## Testing & verification pipeline
+
+Run [tools/check.py](tools/check.py) to run only checks matching modified files vs `main`, or run full CI suites (`--all fast`, `--all godot`, `--all both`). See [docs/COMMANDS-TESTS.md](docs/COMMANDS-TESTS.md) for the complete command table.
+
+| Check | What it verifies | Environment |
 |---|---|---|
-| `tools/mod_tests/test_bridge.py` | the real mod in Lua 5.2 (lupa) against `fake_factorio.lua`, a strict fake API where unknown keys throw | Python, lupa |
-| `tools/mod_tests/test_fuzz.py` | the mod under malformed, huge and out-of-order packets | Python, lupa |
-| `tools/mod_tests/test_binary.py` | binary frames (`bin`): the movers as JSON and as binary decode the same; `bs` parts and their text twins from the same ranges; chunk snapshots, `st` and `ih` (wire version 3) and their JSON twins; wire versions 1 to 3 (`test_bridge.py --binary` runs every bridge check over binary frames) | Python, lupa |
-| `tools/test_mock_server.py`, `test_mock_fuzz.py` | the mock over real UDP, and fuzzed | Python |
-| gdparse over `client/` | every GDScript file parses | gdtoolkit |
-| `client/tests/ui_test.tscn`, `bridge_fuzz_test.tscn` | the UI's input paths with synthetic input; the client's packet parsing fuzzed | Godot |
-| `client/tests/decor_test.tscn`, `vr_test.tscn` | the decoratives layer; the VR panel and session without a headset | Godot |
-| `client/tests/addon_test.tscn` | add-on loading, the API version, keys, the camera hand-back, data | Godot |
-| `client/tests/model_load_test.gd` | every model read on a worker thread matches the imported scene | Godot |
-| `client/tests/belt_path_replay.tscn` with `tools/belt_path_check.py` | belt items drawn on their lanes, against a recording from real Factorio | Godot (a server to record) |
-| `tools/models/check.py` | every model's name, footprint, origin, rotation and triangle budget | Python |
-| `tools/live_check.py` | the mod against real Factorio, section by section | a running server |
-| `tools/busy_base.py --big --measure` | the bridge's script time on a big base, against a budget | a running server |
-| `tools/net_cost.py` | bytes and messages per type (mock busy base or a server) | Python |
-
-CI (`.github/workflows/tests.yml`) runs all of them but `net_cost.py`, `model_load_test.gd` and the
-belt path replay (run those by hand after model or belt changes), including live_check and
-the busy-base budget against the free headless Factorio build. When the mod starts using a new API, it goes into the fake API (strict,
-so the tests notice) and gets a live_check section, because the fake can only be as right as
-what we believe about the real game.
+| `tools/mod_tests/test_bridge.py` + `--binary` | Split bridge suites (`01..09`) in Lua 5.2 against strict `fake_factorio.lua` (JSON + Binary v1–5) | Python, `lupa` |
+| `tools/mod_tests/test_{fuzz,binary,data_stage}.py` | Packet fuzzing, binary vs JSON parity, mod `gfx` data stage | Python, `lupa` |
+| `tools/test_{mock_server,mock_fuzz,relay,events,protocol_sync}.py` | Mock UDP server, fuzzing, TCP relay reconnects, protocol & table sync | Python |
+| `tools/test_{check,code_health,safe_delete}.py` + `gdparse` | `check.py` area map & `SECTION_ORDER`, code health metrics, Windows junction-safe deletes, GDScript parse | Python, `gdtoolkit` |
+| `tools/models/check.py` + `tools/release/leak_scan.py` | `.glb` footprints, origins, poly budgets; zero leaked credentials or local paths | Python |
+| `client/tests/ui_test.tscn`, `addon_test.tscn`, `switches_test.gd` | Split UI suites (`16` area modules), add-on API `1.91` (`4` area modules), CLI `Switches` registry | Godot 4.7+ |
+| `client/tests/belt_sim_native_test.gd`, `wire_decode_native_test.gd` | Step-for-step C++ GDExtension parity vs GDScript | Godot 4.7+ |
+| `client/tests/{model_load,mod_files,model_packs,decor,vr}_test` | Model worker loads, mod file indexing, pack layering, decoratives, VR panel | Godot 4.7+ |
+| `tools/live_check.py` + `tools/busy_base.py --big --measure` | Modular live suite (`tools/live/*.py`) & UPS perf budget against real Factorio headless | Running Factorio 2.1 |
 
 ## Adding a feature
 
 ```mermaid
 flowchart LR
-    A["1. Mod<br/>module, commands, tick"] --> B["2. Fake API<br/>test_bridge, live_check"]
-    B --> C["3. Mock server<br/>test_mock_server"]
-    C --> D["4. Validator<br/>and PROTOCOL.md"]
-    D --> E["5. Client<br/>ui_model, then drawing"]
-    E --> F{"All tests pass?<br/>live_check on real Factorio?"}
-    F -- yes --> G(["Merge"])
-    F -- no --> A
+    A["1. Mod<br/>scripts module + session handler"] --> B["2. Protocol & Validator<br/>protocol.py + PROTOCOL.md"]
+    B --> C["3. Fake API & Mock<br/>fake_factorio + mock_server"]
+    C --> D["4. Client & Native<br/>WireDecode, ui_model / world (+ C++ twin)"]
+    D --> E{"tools/check.py --all both<br/>& live_check.py pass?"}
+    E -- yes --> F(["Commit / Merge"])
+    E -- no --> A
 ```
 
-1. Mod: a module (or a function in one), its commands in `session.lua`'s handlers, its tick in
-   `control.lua`'s order if it streams something.
-2. The fake API and `test_bridge.py`; a live_check section.
-3. The mock, with checks in `test_mock_server.py`.
-4. The validator and PROTOCOL.md.
-5. The client: data and commands in `ui_model.gd`, then whatever draws it.
+1. **Mod:** Implement in a `scripts/*.lua` module, wire `session.lua` / `control.lua`, and register any new Factorio API keys in `fake_factorio.lua`.
+2. **Protocol:** Update sender, client decoder, `tools/mock_server.py`, `tools/protocol.py`, and [docs/PROTOCOL.md](docs/PROTOCOL.md) together.
+3. **Client & native parity:** Route data/commands through `ui_model.gd`, register new flags in `switches.gd`, and update matching C++ files in `client/native/belt_sim/src/` if touching belts/decoders/movers.
+4. **Verify:** Run `python tools/check.py --done` (plus `live_check.py` and `leak_scan.py` as needed).

@@ -29,8 +29,9 @@ Zenith project's user://logs/ (%APPDATA%/Godot/app_userdata/Zenith/logs), which 
 Godot: $GODOT, else `godot` on PATH, else the console build under ~/Tools/Godot, else winget's.
 Python: this checkout's .venv, else the main checkout's, else the one running this.
 """
+from __future__ import annotations
+
 import argparse
-import dataclasses
 import fnmatch
 import glob
 import json
@@ -106,11 +107,56 @@ def default_base() -> str:
     raise SystemExit("no main branch to compare with: pass --base <commit>")
 
 
-@dataclasses.dataclass
 class Check:
-    name: str
-    command: list[str]
-    godot: bool = False
+    """A single runnable check command."""
+
+    def __init__(self, name: str, command: list[str], godot: bool = False) -> None:
+        self.name = name
+        self.command = command
+        self.godot = godot
+
+    def __repr__(self) -> str:
+        return f"Check(name={self.name!r}, command={self.command!r}, godot={self.godot!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Check):
+            return NotImplemented
+        return (self.name, self.command, self.godot) == (other.name, other.command, other.godot)
+
+
+class TestEntry:
+    """One test or suite in the unified registry driving both plan() and all_checks()."""
+
+    def __init__(
+        self,
+        name: str,
+        kind: str,
+        target: str = "",
+        args: tuple[str, ...] = (),
+        suite: str = "fast",
+        triggers: tuple[str, ...] = (),
+        done_only: bool = False,
+        if_exists: bool = False,
+    ) -> None:
+        self.name = name
+        self.kind = kind
+        self.target = target
+        self.args = args
+        self.suite = suite
+        self.triggers = triggers
+        self.done_only = done_only
+        self.if_exists = if_exists
+
+    def to_check(self, py: str, extra_args: tuple[str, ...] = ()) -> Check:
+        if self.kind == "godot_scene":
+            return godot_scene(self.name, self.target, *self.args, *extra_args)
+        if self.kind == "godot_script":
+            return godot_script(self.name, self.target, *self.args, *extra_args)
+        if self.kind == "gdparse":
+            return Check(self.name, [py, "-m", "gdtoolkit.parser", *(extra_args or all_scripts())])
+        if self.kind == "models_check":
+            return Check(self.name, [py, self.target, *extra_args])
+        return Check(self.name, [py, self.target, *self.args, *extra_args])
 
 
 def any_match(files: list[str], *patterns: str) -> bool:
@@ -121,13 +167,372 @@ def godot_scene(name: str, scene: str, *args: str) -> Check:
     return Check(name, ["res://tests/" + scene, *args], godot=True)
 
 
-def godot_script(name: str, script: str) -> Check:
-    return Check(name, ["-s", "res://tests/" + script], godot=True)
+def godot_script(name: str, script: str, *args: str) -> Check:
+    return Check(name, ["-s", "res://tests/" + script, *args], godot=True)
+
+
+# The splitter crossing hints (BeltSim.split_hints) on their lab fixture, belt_sim.gd's: the one-tick wait the game made
+# is reproduced from the bridge's hints (nothing off), missed without them (client/tests/belt_sim_replay.gd's header).
+_SPLIT_WAIT = ("--", "res://tests/data/belt_sim_split_wait.json", "--gd", "--split-wake=off")
+SPLIT_HINTS_ON = godot_script("belt_sim_replay split_wait hints on", "belt_sim_replay.gd", *_SPLIT_WAIT, "--split-hints=6", "--max-off=0")
+SPLIT_HINTS_OFF = godot_script("belt_sim_replay split_wait hints off", "belt_sim_replay.gd", *_SPLIT_WAIT, "--min-off=1")
 
 
 # Issue #26's switch for one run: factorio_keys_test checks --keys-defaults=old on its own command line.
-FACTORIO_KEYS_OLD = Check("factorio_keys_test --keys-defaults=old",
-                          ["-s", "res://tests/factorio_keys_test.gd", "--", "--keys-defaults=old"], godot=True)
+FACTORIO_KEYS_OLD = godot_script("factorio_keys_test --keys-defaults=old", "factorio_keys_test.gd", "--", "--keys-defaults=old")
+
+
+_MOD_LUA_TRIGGERS = ("mod/*.lua", "tools/mod_tests/*", "tools/protocol.py", "docs/PROTOCOL.md")
+_MOCK_TRIGGERS = ("tools/mock*.py", "tools/test_mock*.py", "tools/protocol.py", "docs/PROTOCOL.md")
+_MODEL_DONE_TRIGGERS = ("client/scripts/world/model_*.gd", "client/shaders/factorio_material*")
+_UI_TRIGGERS = ("client/scripts/*", "client/tests/ui_test*", "client/tests/test_*")
+
+# Tests intentionally excluded from --all godot (live-server probes or tests blocked by a client bug).
+MANUAL: dict[str, str] = {
+    "udp_burst_test.gd": "interactive UDP listener waiting on an external burst sender (--port/--timeout=30)",
+    "inserter_events_test.gd": "blocked by client bug in client/scripts/world/inserter_arms.gd:1229-1230 (skips BASIC fallback and live[unit] while arm pieces load, failing K12)",
+}
+
+# Area rules mapping runtime files (including UI, menu, player, debug, fx, world, shaders) to
+# targeted ui_test --only=<sections> checks when --ui and --done are not passed.
+# Tuple: (check_name, patterns, ui_sections, always_run). Narrower areas come before broad ones;
+# always_run=False rules only apply to files not already matched by a dedicated test or earlier area.
+AREAS: list[tuple[str, tuple[str, ...], str, bool]] = [
+    ("ui_test contact", ("client/scripts/world/contact_shade.gd", "client/shaders/contact_shade.gdshader*",
+                         "client/scripts/world/chunk_view.gd", "client/scripts/world/model_library.gd"),
+     "_contact_shade,_contact_drills,_contact_chunk", True),
+    ("ui_test map", ("client/scripts/ui/factorio/map_*.gd", "client/scripts/ui/factorio/minimap.gd",
+                     "client/scripts/ui/factorio/alert*.gd", "client/scripts/ui/factorio/remote_frame.gd",
+                     "client/scripts/world/player_tags.gd"),
+     "_map,_map_layers_cache,_minimap_alerts,_map_title", False),
+    ("ui_test space", ("client/scripts/ui/factorio/space_*.gd", "client/scripts/ui/factorio/planet_*.gd",
+                       "client/scripts/ui/factorio/platform_*.gd", "client/scripts/world/planet_spin.gd",
+                       "client/scripts/world/rockets.gd", "client/scripts/world/collectors.gd",
+                       "client/shaders/space_sky*", "client/shaders/planet_sky*"),
+     "_space,_modded_planets", False),
+    ("ui_test planners", ("client/scripts/ui/factorio/bp_*.gd", "client/scripts/ui/factorio/blueprint_*.gd",
+                          "client/scripts/ui/factorio/book_window.gd", "client/scripts/ui/factorio/planner_*.gd",
+                          "client/scripts/ui/factorio/library_window.gd", "client/scripts/player/blueprint_preview.gd",
+                          "client/scripts/player/tile_brush.gd", "client/scripts/player/rail_planner.gd"),
+     "_planners,_blueprint_preview", False),
+    ("ui_test circuits", ("client/scripts/ui/factorio/circuit_*.gd", "client/scripts/ui/factorio/logic_*.gd",
+                          "client/scripts/ui/factorio/switch.gd", "client/scripts/player/wire_tool.gd",
+                          "client/scripts/world/wires.gd", "client/shaders/wire*"),
+     "_parity,_wires", False),
+    ("ui_test ui", ("client/scripts/ui/factorio/*.gd", "client/scripts/ui/*.gd"),
+     "_hud,_play,_parity,_info,_gear,_layout,_help,_icons,_esc_tooltip", False),
+    ("ui_test backdrop", ("client/scripts/menu/backdrop_*.gd", "client/scripts/menu/menu_background.gd"),
+     "_menu_backdrop,_menu_backdrop_cases,_menu_backdrop_list,_menu_backdrop_ground", False),
+    ("ui_test menu", ("client/scripts/menu/*.gd",),
+     "_menus,_load_mods,_mod_windows,_window_bounds,_model_packs_window,_perf_test", False),
+    ("ui_test player", ("client/scripts/player/*.gd",),
+     "_play,_build_tools,_wall_drag,_wires,_planners,_mine_reach,_first_person_aim,_center_aim", False),
+    ("ui_test debug", ("client/scripts/debug/*.gd",),
+     "_debug_menu,_debug_sim_switches,_debug_light_sliders,_debug_live_sliders,_dev_tools,_update_overlays", False),
+    ("ui_test fx", ("client/scripts/fx/*.gd", "client/shaders/fx_*", "client/shaders/lightning*",
+                    "client/shaders/smog*", "client/shaders/pollution*"),
+     "_fx_movers,_lightning,_weapons,_acid_aim", False),
+    ("ui_test world", ("client/scripts/world/*.gd", "client/scripts/net/game_pause.gd"),
+     "_terrain,_lamps,_signal_lights,_states_sliced,_predictions,_pipe_covers,_underground_clear,_working_near,_view_priority,_gpu_anim,_gate_open,_creature_motion,_tree_crowns", False),
+    ("ui_test shaders", ("client/shaders/*.gdshader", "client/shaders/*.gdshaderinc"),
+     "_terrain,_pbr_look,_pack_shading_look,_predictions,_lamps", False),
+]
+
+TESTS: list[TestEntry] = [
+    # --- Fast Python / static suites (CI's tests job) ---
+    TestEntry("test_bridge", "py", "tools/mod_tests/test_bridge.py", suite="fast", triggers=_MOD_LUA_TRIGGERS),
+    # (Every check again with every hello asking for binary frames: mv, bs and bfar through protocol.py.)
+    TestEntry("test_bridge --binary", "py", "tools/mod_tests/test_bridge.py", args=("--binary",), suite="fast", triggers=_MOD_LUA_TRIGGERS),
+    TestEntry("test_data_stage", "py", "tools/mod_tests/test_data_stage.py", suite="fast",
+              triggers=("mod/*/data*.lua", "mod/*/scripts/gfx_extract.lua", "tools/mod_tests/test_data_stage.py")),
+    TestEntry("test_mock_server", "py", "tools/test_mock_server.py", suite="fast", triggers=_MOCK_TRIGGERS),
+    # One Python start for them all: gdparse takes many files (~270 paths, ~10 KB of command line).
+    TestEntry("gdparse", "gdparse", suite="fast"),
+    TestEntry("models check.py", "models_check", "tools/models/check.py", suite="fast", triggers=("tools/models/*.py",)),
+    TestEntry("test_fix_pack", "py", "tools/models/test_fix_pack.py", suite="fast",
+              triggers=("tools/models/fix_pack.py", "tools/models/fixes/*", "tools/models/test_fix_pack.py",
+                        "tools/models/check.py", "tools/models/specs.py")),
+    TestEntry("test_fuzz", "py", "tools/mod_tests/test_fuzz.py", suite="fast", triggers=_MOD_LUA_TRIGGERS),
+    # Binary frames (transport.lua) decode as their JSON does.
+    TestEntry("test_binary", "py", "tools/mod_tests/test_binary.py", suite="fast", triggers=_MOD_LUA_TRIGGERS),
+    TestEntry("test_events", "py", "tools/mod_tests/test_events.py", suite="fast",
+              triggers=(*_MOD_LUA_TRIGGERS, "tools/mod_tests/test_events.py")),
+    TestEntry("test_mock_fuzz", "py", "tools/test_mock_fuzz.py", suite="fast", triggers=_MOCK_TRIGGERS),
+    # The relay for a server on another PC, and the mock behind it losing packets.
+    TestEntry("test_relay", "py", "tools/test_relay.py", suite="fast",
+              triggers=("server/relay.py", "tools/relay_check.py", "tools/test_relay.py")),
+    # package.py's Zenith.zip: a pack's items/ folder goes in.
+    TestEntry("test_package", "py", "tools/release/test_package.py", suite="fast",
+              triggers=("tools/release/*.py",)),
+    # Deleting a folder that holds a junction (a linked mod) never empties the junction's target.
+    TestEntry("test_safe_delete", "py", "tools/test_safe_delete.py", suite="fast",
+              triggers=("tools/safe_delete.py", "tools/test_safe_delete.py", "tools/belt_view_check.py",
+                        "tools/bench/hybrid_cost.py", "tools/look/factorio_reference.py")),
+    TestEntry("test_code_health", "py", "tools/test_code_health.py", suite="fast",
+              triggers=("tools/code_health.py", "tools/test_code_health.py")),
+    TestEntry("test_check", "py", "tools/test_check.py", suite="fast",
+              triggers=("tools/check.py", "tools/test_check.py", "client/tests/*_test.gd", "tools/*test_*.py")),
+    TestEntry("test_protocol_sync", "py", "tools/test_protocol_sync.py", suite="fast",
+              triggers=("tools/protocol.py", "docs/PROTOCOL.md", "mod/factorio-3d-bridge/scripts/session.lua",
+                        "mod/factorio-3d-bridge/scripts/space.lua", "mod/factorio-3d-bridge/scripts/transport.lua",
+                        "client/scripts/net/bridge.gd", "client/scripts/net/wire_decode.gd",
+                        "tools/mock_server.py", "tools/test_protocol_sync.py")),
+    TestEntry("test_belt_view_check", "py", "tools/test_belt_view_check.py", suite="fast",
+              triggers=("tools/belt_view_check.py", "tools/test_belt_view_check.py")),
+    TestEntry("test_belt_walk_check", "py", "tools/test_belt_walk_check.py", suite="fast",
+              triggers=("tools/belt_walk_check.py", "tools/test_belt_walk_check.py", "client/scripts/debug/stutter_probe.gd")),
+    TestEntry("test_bs_offline", "py", "tools/test_bs_offline.py", suite="fast",
+              triggers=("tools/bs_offline.py", "tools/test_bs_offline.py", "mod/factorio-3d-bridge/scripts/belt_sim*.lua")),
+    # Private tracker suites: left out of the release tree, so only where present.
+    TestEntry("test_agents_merge", "py", "tools/tracker/test_agents_merge.py", suite="fast", if_exists=True,
+              triggers=("tools/tracker/agents_merge.py", "tools/tracker/test_agents_merge.py")),
+    TestEntry("test_releases", "py", "tools/tracker/test_releases.py", suite="fast", if_exists=True,
+              triggers=("tools/tracker/releases.py", "tools/tracker/test_releases.py")),
+    TestEntry("test_usage", "py", "tools/tracker/test_usage.py", suite="fast", if_exists=True,
+              triggers=("tools/tracker/usage.py", "tools/tracker/test_usage.py")),
+    TestEntry("test_refresh_dashboard", "py", "tools/tracker/test_refresh_dashboard.py", suite="fast", if_exists=True,
+              triggers=("tools/tracker/refresh_dashboard.py", "tools/tracker/test_refresh_dashboard.py")),
+
+    # --- Headless Godot tests (CI's ui job) ---
+    TestEntry("ui_test", "godot_scene", "ui_test.tscn", suite="godot", triggers=_UI_TRIGGERS, done_only=True),
+    TestEntry("bridge_fuzz_test", "godot_scene", "bridge_fuzz_test.tscn", suite="godot",
+              triggers=("client/scripts/net/bridge.gd", "client/scripts/net/wire_decode.gd",
+                        "client/scripts/net/message_decode.gd", "client/tests/bridge_fuzz*")),
+    TestEntry("bridge_queue_stress_test", "godot_scene", "bridge_queue_stress_test.tscn", suite="godot",
+              triggers=("client/scripts/net/bridge.gd", "client/scripts/net/wire_decode.gd",
+                        "client/scripts/net/message_decode.gd", "client/scripts/world/world.gd",
+                        "client/tests/bridge_queue_stress*")),
+    TestEntry("megabase_prio_test", "godot_scene", "megabase_prio_test.tscn", suite="godot",
+              triggers=("client/scripts/net/bridge.gd", "client/scripts/player/player_input.gd",
+                        "client/scripts/world/quality_marks.gd", "client/scripts/world/inserter_arms.gd",
+                        "client/scripts/world/movers.gd", "client/scripts/world/fluids_power.gd",
+                        "client/scripts/ui/factorio/alt_overlay.gd", "client/scripts/fx/fx.gd",
+                        "client/tests/megabase_prio_test*")),
+    TestEntry("chunk_streaming_test", "godot_scene", "chunk_streaming_test.tscn", suite="godot",
+              triggers=("client/scripts/world/world.gd", "client/scripts/world/chunk_view.gd",
+                        "client/scripts/world/far_chunks.gd", "client/scripts/world/frame_budget.gd",
+                        "client/scripts/world/ups_governor.gd", "client/scripts/world/chunk_disk_cache.gd",
+                        "client/tests/chunk_streaming*")),
+    TestEntry("decor_test", "godot_scene", "decor_test.tscn", suite="godot",
+              triggers=("client/scripts/world/decorative*", "client/shaders/decorative*", "client/tests/decor*")),
+    TestEntry("decor_native_test", "godot_script", "decor_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/decorative*", "client/shaders/decorative*",
+                        "client/native/belt_sim/src/decor_native*", "client/tests/decor*")),
+    TestEntry("terrain_decor_opt_test", "godot_script", "terrain_decor_opt_test.gd", suite="godot",
+              triggers=("client/scripts/world/terrain_mesher.gd", "client/scripts/world/chunk_view.gd",
+                        "client/scripts/world/visuals.gd", "client/scripts/world/decoratives.gd",
+                        "client/shaders/terrain*", "client/shaders/decorative*", "client/tests/terrain_decor_opt*")),
+    TestEntry("mod_files_test", "godot_script", "mod_files_test.gd", suite="godot",
+              triggers=("client/scripts/world/mod_files.gd", "client/scripts/world/mod_graphics.gd",
+                        "client/scripts/world/sprite_standins.gd", "client/tests/mod_files*")),
+    TestEntry("model_packs_test", "godot_script", "model_packs_test.gd", suite="godot",
+              triggers=("client/scripts/world/model_packs.gd", "client/scripts/world/model_library.gd",
+                        "client/scripts/world/mod_files.gd", "client/scripts/world/pack_check.gd",
+                        "client/tests/model_packs*")),
+    TestEntry("sound_files_test", "godot_script", "sound_files_test.gd", suite="godot",
+              triggers=("client/scripts/fx/sound_bank.gd", "client/scripts/world/model_packs.gd",
+                        "client/scripts/world/mod_files.gd", "client/tests/sound_f*")),
+    TestEntry("model_preview_test", "godot_script", "model_preview_test.gd", suite="godot",
+              triggers=("client/scripts/ui/factorio/model_preview.gd", "client/scripts/world/model_library.gd",
+                        "client/scripts/world/ground_height.gd", "client/tests/model_preview*")),
+    TestEntry("belt_caps_test", "godot_script", "belt_caps_test.gd", suite="godot",
+              triggers=("client/scripts/world/belt_caps.gd", "client/scripts/world/model_library.gd",
+                        "client/tests/belt_caps*")),
+    TestEntry("belt_cover_test", "godot_script", "belt_cover_test.gd", suite="godot",
+              triggers=("client/scripts/world/belt_return.gd", "client/shaders/factorio_material.gdshaderinc",
+                        "client/tests/belt_cover*")),
+    TestEntry("night_vision_test", "godot_script", "night_vision_test.gd", suite="godot",
+              triggers=("client/scripts/ui/night_vision_overlay.gd", "client/scripts/ui/factorio/night_vision_icon.gd",
+                        "client/scripts/fx/step_sounds.gd", "client/tests/night_vision*")),
+    TestEntry("belt_lane_inset_test", "godot_script", "belt_lane_inset_test.gd", suite="godot",
+              triggers=("client/scripts/world/belt_lane_inset.gd", "client/scripts/world/belt_items.gd",
+                        "client/tests/belt_lane_inset*", "client/scripts/world/model_packs.gd")),
+    TestEntry("contact_belt_under_test", "godot_script", "contact_belt_under_test.gd", suite="godot",
+              triggers=("client/scripts/world/contact_shade.gd", "client/scripts/world/belt_return.gd",
+                        "client/tests/contact_belt_under*")),
+    TestEntry("belt_sim_replay split_wait hints on", "godot_script", "belt_sim_replay.gd",
+              args=(*_SPLIT_WAIT, "--split-hints=6", "--max-off=0"), suite="godot",
+              triggers=("client/scripts/world/belt_sim.gd", "client/native/belt_sim/**",
+                        "client/tests/belt_sim_replay*", "client/tests/data/belt_sim_split_wait*")),
+    TestEntry("belt_sim_replay split_wait hints off", "godot_script", "belt_sim_replay.gd",
+              args=(*_SPLIT_WAIT, "--min-off=1"), suite="godot",
+              triggers=("client/scripts/world/belt_sim.gd", "client/native/belt_sim/**",
+                        "client/tests/belt_sim_replay*", "client/tests/data/belt_sim_split_wait*")),
+    TestEntry("belt_sim_native_test", "godot_script", "belt_sim_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/belt_sim.gd", "client/native/belt_sim/**",
+                        "client/scripts/native_library.gd",
+                        "client/tests/belt_sim_native*", "client/tests/data/belt_sim_*")),
+    TestEntry("belt_sim_walls_test", "godot_script", "belt_sim_walls_test.gd", suite="godot",
+              triggers=("client/scripts/world/belt_sim.gd", "client/native/belt_sim/src/belt_sim_native*",
+                        "client/tests/belt_sim_walls*")),
+    TestEntry("belt_items_native_test", "godot_script", "belt_items_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/item_cards.gd", "client/scripts/world/belt_items.gd",
+                        "client/native/belt_sim/**", "client/tests/belt_items_native*")),
+    TestEntry("chunk_build_native_test", "godot_script", "chunk_build_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/chunk_view.gd", "client/native/belt_sim/src/chunk_build_native*",
+                        "client/native/belt_sim/src/belt_native_common*", "client/tests/chunk_build_native*")),
+    TestEntry("wire_decode_native_test", "godot_script", "wire_decode_native_test.gd", suite="godot",
+              triggers=("client/scripts/net/wire_decode.gd", "client/native/belt_sim/src/wire_decode_native*",
+                        "client/tests/wire_decode_native*")),
+    TestEntry("nature_looks_test", "godot_script", "nature_looks_test.gd", suite="godot",
+              triggers=("client/scripts/world/nature_looks.gd", "client/data/nature_looks.json",
+                        "client/tests/nature_looks*", "client/shaders/factorio_material*",
+                        "client/scripts/world/material_rows.gd")),
+    TestEntry("factorio_keys_test", "godot_script", "factorio_keys_test.gd", suite="godot",
+              triggers=("client/scripts/player/factorio_keys.gd", "client/scripts/menu/settings.gd",
+                        "client/tests/factorio_keys*", "client/scripts/player/controls.gd",
+                        "client/scripts/player/player_input.gd", "client/scripts/menu/settings_window.gd",
+                        "client/scripts/menu/paths.gd", "client/scripts/main.gd")),
+    TestEntry("factorio_keys_test --keys-defaults=old", "godot_script", "factorio_keys_test.gd",
+              args=("--", "--keys-defaults=old"), suite="godot",
+              triggers=("client/scripts/player/factorio_keys.gd", "client/scripts/menu/settings.gd",
+                        "client/tests/factorio_keys*", "client/scripts/player/controls.gd",
+                        "client/scripts/player/player_input.gd", "client/scripts/menu/settings_window.gd",
+                        "client/scripts/menu/paths.gd", "client/scripts/main.gd")),
+    TestEntry("icons_later_test", "godot_script", "icons_later_test.gd", suite="godot",
+              triggers=("client/scripts/world/item_icons.gd", "client/scripts/ui/factorio/kit.gd",
+                        "client/scripts/ui/factorio/entity_info.gd", "client/tests/icons_later*")),
+    TestEntry("sound_decode_test", "godot_script", "sound_decode_test.gd", suite="godot",
+              triggers=("client/scripts/fx/sound_bank.gd", "client/tests/sound_decode*")),
+    TestEntry("sound_cache_test", "godot_script", "sound_cache_test.gd", suite="godot",
+              triggers=("client/scripts/fx/sound_bank.gd", "client/tests/sound_cache*")),
+    TestEntry("sound_pool_test", "godot_script", "sound_pool_test.gd", suite="godot",
+              triggers=("client/scripts/fx/sfx.gd", "client/scripts/fx/sound_bank.gd", "client/tests/sound_pool*")),
+    TestEntry("combat_sound_test", "godot_script", "combat_sound_test.gd", suite="godot",
+              triggers=("client/scripts/fx/sfx.gd", "client/scripts/fx/sound_bank.gd", "client/tests/combat_sound*")),
+    TestEntry("combat_shadows_test", "godot_script", "combat_shadows_test.gd", suite="godot",
+              triggers=("client/scripts/fx/combat_lights.gd", "client/scripts/fx/weapon_fx.gd",
+                        "client/scripts/world/turrets.gd", "client/tests/combat_shadows*")),
+    TestEntry("safe_delete_test", "godot_script", "safe_delete_test.gd", suite="godot",
+              triggers=("client/scripts/safe_delete.gd", "client/scripts/addons/addon_loader.gd",
+                        "client/scripts/world/model_packs.gd", "client/tests/safe_delete*")),
+    TestEntry("shader_refresh_test", "godot_script", "shader_refresh_test.gd", suite="godot",
+              triggers=("client/scripts/menu/shader_refresh.gd", "client/scripts/safe_delete.gd",
+                        "client/addons/zenith_export/shader_hash_export.gd", "client/tests/shader_refresh*")),
+    TestEntry("shader_warmup_staged_test", "godot_script", "shader_warmup_staged_test.gd", suite="godot",
+              triggers=("client/scripts/world/shader_warmup.gd", "client/scripts/world/render_warm.gd",
+                        "client/tests/shader_warmup_staged*")),
+    TestEntry("boot_screen_test", "godot_script", "boot_screen_test.gd", suite="godot",
+              triggers=("client/scenes/boot.tscn", "client/scripts/menu/boot.gd",
+                        "client/scripts/main.gd", "client/tests/boot_screen*")),
+    TestEntry("item_materials_test", "godot_script", "item_materials_test.gd", suite="godot",
+              triggers=("client/scripts/world/item_models.gd", "client/scripts/world/model_textures.gd",
+                        "client/shaders/item*", "client/tests/item_materials*")),
+    TestEntry("item_3d_perf_test", "godot_scene", "item_3d_perf_test.tscn", suite="godot",
+              triggers=("client/scripts/world/item_models.gd", "client/scripts/world/item_cards.gd",
+                        "client/scripts/world/belt_lanes.gd", "client/scripts/world/belt_items.gd",
+                        "client/shaders/item*", "client/shaders/belt_lane_model*", "client/tests/item_3d_perf*")),
+    TestEntry("debug_menu_tools_test", "godot_scene", "debug_menu_tools_test.tscn", suite="godot",
+              triggers=("client/scripts/ui/factorio/debug_menu.gd", "client/scripts/debug/debug_overlay.gd",
+                        "client/scripts/world/belt_items.gd", "client/scripts/world/belt_lanes.gd",
+                        "client/scripts/world/item_cards.gd", "client/tests/debug_menu_tools*")),
+    TestEntry("item_contact_test", "godot_script", "item_contact_test.gd", suite="godot",
+              triggers=("client/scripts/world/item_cards.gd", "client/shaders/item_contact*", "client/tests/item_contact*")),
+    TestEntry("temporal_mv_test", "godot_script", "temporal_mv_test.gd", suite="godot",
+              triggers=("client/scripts/world/belt_mv.gd", "client/scripts/world/belt_items.gd",
+                        "client/scripts/world/item_cards.gd", "client/scripts/world/mover_records.gd",
+                        "client/scripts/world/robot_swarm.gd", "client/scripts/world/creatures.gd",
+                        "client/scripts/world/belt_blur.gd", "client/scripts/menu/settings.gd",
+                        "client/scripts/world/model_library.gd", "client/scripts/world/model_lods.gd",
+                        "client/shaders/belt_reactive*", "client/shaders/robot_shadow*",
+                        "client/shaders/item*", "client/shaders/factorio_material*",
+                        "client/tests/temporal_mv*")),
+    TestEntry("alt_perf_test", "godot_scene", "alt_perf_test.tscn", suite="godot",
+              triggers=("client/scripts/ui/factorio/alt_overlay.gd", "client/scripts/world/alt_arrows.gd",
+                        "client/scripts/world/quality_marks.gd", "client/tests/alt_perf*")),
+    TestEntry("addon_test", "godot_scene", "addon_test.tscn", suite="godot",
+              triggers=("client/scripts/addons/*", "client/tests/addon*", "addons-src/*",
+                        "client/scripts/world/looks.gd")),
+    TestEntry("vr_test", "godot_scene", "vr_test.tscn", suite="godot",
+              triggers=("client/scripts/vr/*", "client/tests/vr*")),
+    TestEntry("lod_data_test", "godot_script", "lod_data_test.gd", suite="godot",
+              triggers=("client/scripts/world/lod_*.gd", "client/scripts/world/distant_horizon.gd",
+                        "client/shaders/lod_*", "client/tests/lod_*")),
+    TestEntry("lod_mesher_test", "godot_script", "lod_mesher_test.gd", suite="godot",
+              triggers=("client/scripts/world/lod_*.gd", "client/scripts/world/distant_horizon.gd",
+                        "client/shaders/lod_*", "client/tests/lod_*")),
+    TestEntry("lod_mesher_native_test", "godot_script", "lod_mesher_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/lod_mesher.gd", "client/scripts/world/far_chunks.gd",
+                        "client/native/belt_sim/src/lod_mesher_native*", "client/tests/lod_mesher_native*")),
+    TestEntry("far_nature_merge_test", "godot_script", "far_nature_merge_test.gd", suite="godot",
+              triggers=("client/scripts/world/far_chunks.gd", "client/tests/far_nature_merge*")),
+    TestEntry("cliff_low_shadow_test", "godot_script", "cliff_low_shadow_test.gd", suite="godot",
+              triggers=("client/scripts/world/model_lods.gd", "client/scripts/world/far_chunks.gd",
+                        "client/shaders/shadow_stand_in*", "client/shaders/far_merged*",
+                        "client/tests/cliff_low_shadow*", "client/shaders/ground_height*",
+                        "client/shaders/lod_common*", "client/shaders/terrain_common*")),
+    TestEntry("cliff_wall_test", "godot_script", "cliff_wall_test.gd", suite="godot",
+              triggers=("client/scripts/world/cliff_wall.gd", "client/scripts/world/chunk_view.gd",
+                        "client/tests/cliff_wall*")),
+    TestEntry("inserter_arms_native_test", "godot_script", "inserter_arms_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/scripts/world/model_rig.gd",
+                        "client/native/belt_sim/src/inserter_arms_native*", "client/tests/inserter_arms_native*")),
+    TestEntry("inserter_buffer_test", "godot_script", "inserter_buffer_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/scripts/world/model_library.gd",
+                        "client/tests/inserter_buffer*")),
+    TestEntry("inserter_swing_test", "godot_script", "inserter_swing_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_swing.gd", "client/tests/inserter_swing*")),
+    TestEntry("wheel_roll_test", "godot_script", "wheel_roll_test.gd", suite="godot",
+              triggers=("client/scripts/world/vehicle_anim.gd", "client/scripts/world/vehicle_lights.gd",
+                        "client/scripts/world/movers.gd", "client/scripts/world/turrets.gd",
+                        "client/scripts/fx/fx.gd", "client/scripts/fx/weapon_fx.gd",
+                        "client/scripts/ui/factorio/preview_anim.gd", "client/scripts/world/anim.gd",
+                        "client/assets/models/packs/placeholders/car.glb",
+                        "client/assets/models/packs/placeholders/tank.glb",
+                        "client/tests/wheel_roll*", "client/tests/vehicle_anim*")),
+    TestEntry("vehicle_anim_test", "godot_script", "vehicle_anim_test.gd", suite="godot",
+              triggers=("client/scripts/world/vehicle_anim.gd", "client/scripts/world/vehicle_lights.gd",
+                        "client/scripts/world/movers.gd", "client/scripts/world/turrets.gd",
+                        "client/scripts/fx/fx.gd", "client/scripts/fx/weapon_fx.gd",
+                        "client/scripts/ui/factorio/preview_anim.gd", "client/scripts/world/anim.gd",
+                        "client/assets/models/packs/placeholders/car.glb",
+                        "client/assets/models/packs/placeholders/tank.glb",
+                        "client/tests/wheel_roll*", "client/tests/vehicle_anim*")),
+    TestEntry("vehicle_brake_hold_test", "godot_script", "vehicle_brake_hold_test.gd", suite="godot",
+              triggers=("client/scripts/player/player_input.gd", "client/scripts/menu/settings.gd",
+                        "client/tests/vehicle_brake_hold*")),
+    TestEntry("spikes_b_test", "godot_script", "spikes_b_test.gd", suite="godot",
+              triggers=("client/scripts/world/frame_budget.gd", "client/scripts/world/item_models.gd",
+                        "client/tests/spikes_b*")),
+    TestEntry("stall_watchdog_test", "godot_script", "stall_watchdog_test.gd",
+              args=("--", "--stall-watchdog=1"), suite="godot",
+              triggers=("client/scripts/debug/stall_watchdog.gd", "client/scripts/debug/stall_crumb.gd",
+                        "client/tests/stall_watchdog*")),
+    TestEntry("switches_test", "godot_script", "switches_test.gd", suite="godot",
+              triggers=("client/scripts/switches.gd", "client/scripts/main.gd", "client/tests/switches_test*")),
+    TestEntry("model_pictures_test", "godot_script", "model_pictures_test.gd", suite="godot",
+              triggers=("client/scripts/world/model_textures.gd", "client/scripts/world/model_library.gd",
+                        "client/scripts/world/model_skin.gd", "client/tests/model_pictures_test*")),
+    TestEntry("model_load_test", "godot_script", "model_load_test.gd", suite="godot",
+              triggers=_MODEL_DONE_TRIGGERS, done_only=True),
+    TestEntry("model_textures_test", "godot_script", "model_textures_test.gd", suite="godot",
+              triggers=_MODEL_DONE_TRIGGERS, done_only=True),
+    TestEntry("char_lod_zoom_test", "godot_script", "char_lod_zoom_test.gd", suite="godot",
+              triggers=("client/scripts/world/view_priority.gd", "client/scripts/world/belt_lods.gd",
+                        "client/scripts/world/far_chunks.gd", "client/scripts/world/ao_zoom.gd",
+                        "client/scripts/world/model_lods.gd", "client/scripts/world/world.gd",
+                        "client/tests/char_lod_zoom*")),
+    TestEntry("cliff_fit_test", "godot_script", "cliff_fit_test.gd", suite="godot",
+              triggers=("client/scripts/world/ground_height.gd", "client/shaders/ground_height*",
+                        "client/scripts/addons/addon_terrain.gd", "client/tests/cliff_fit*")),
+    TestEntry("profiler_overlay_test", "godot_script", "profiler_overlay_test.gd", suite="godot",
+              triggers=("client/scripts/debug/debug_overlay.gd", "client/scripts/debug/probing.gd",
+                        "client/tests/profiler_overlay*")),
+    # Starts one Godot test itself, as above: the player's own Godot logs left alone.
+    TestEntry("test_godot_logs", "py", "tools/test_godot_logs.py", suite="godot",
+              triggers=("tools/check.py", "tools/test_godot_logs.py")),
+]
+
+
+def _changed_models(files: list[str]) -> list[str]:
+    """The packs' models (tools/models/packs.py) as check.py names them: FUE5's share names with ours.
+    Not their items/ (item models, which items.py checks; fnmatch's * crosses folders), nor files deleted
+    since the base (the removed placeholder decoratives were each a 'missing' FAIL)."""
+    return sorted({
+        (f if "/decoratives/" in f else ("fue5/" if f.startswith("client/assets/models/packs/fue5/") else "") + pathlib.Path(f).name[:-4])
+        for f in files
+        if fnmatch.fnmatch(f, "client/assets/models/packs/*/*.glb") and "/items/" not in f and (REPO / f).exists()
+    })
 
 
 def plan(files: list[str], ui: str | None, done: bool) -> tuple[list[Check], list[str]]:
@@ -140,128 +545,55 @@ def plan(files: list[str], ui: str | None, done: bool) -> tuple[list[Check], lis
         if not any(c.name == check.name for c in checks):
             checks.append(check)
 
-    def tool(script: str) -> Check:
-        return Check(pathlib.Path(script).stem, [py, script])
-
     scripts = [f for f in files if f.endswith(".gd") and (REPO / f).exists()]
-    if scripts:
-        # One Python start for them all: gdparse takes many files.
-        add(Check("gdparse", [py, "-m", "gdtoolkit.parser", *scripts]))
+    models = _changed_models(files)
+    client_code = any_match(files, *_UI_TRIGGERS)
+    covered_by_tests: set[str] = set()
+    ui_area_added = False
 
-    protocol = any_match(files, "tools/protocol.py", "docs/PROTOCOL.md")
-    if any_match(files, "mod/*.lua", "tools/mod_tests/*") or protocol:
-        add(tool("tools/mod_tests/test_bridge.py"))
-        # (Every check again with every hello asking for binary frames: mv, bs and bfar through protocol.py.)
-        add(Check("test_bridge --binary", [py, "tools/mod_tests/test_bridge.py", "--binary"]))
-        add(tool("tools/mod_tests/test_fuzz.py"))
-        add(tool("tools/mod_tests/test_binary.py"))
-    if any_match(files, "mod/*/data*.lua", "mod/*/scripts/gfx_extract.lua", "tools/mod_tests/test_data_stage.py"):
-        add(tool("tools/mod_tests/test_data_stage.py"))
-    if any_match(files, "tools/mock*.py", "tools/test_mock*.py") or protocol:
-        add(tool("tools/test_mock_server.py"))
-        add(tool("tools/test_mock_fuzz.py"))
-    if any_match(files, "server/relay.py", "tools/relay_check.py", "tools/test_relay.py"):
-        add(tool("tools/test_relay.py"))
-    if any_match(files, "tools/models/fix_pack.py", "tools/models/fixes/*", "tools/models/test_fix_pack.py",
-               "tools/models/check.py", "tools/models/specs.py"):
-        add(tool("tools/models/test_fix_pack.py"))
-    if any_match(files, "tools/release/package.py", "tools/release/test_package.py"):
-        add(tool("tools/release/test_package.py"))
-    if any_match(files, "tools/safe_delete.py", "tools/test_safe_delete.py", "tools/belt_view_check.py",
-                 "tools/bench/hybrid_cost.py", "tools/look/factorio_reference.py"):
-        add(tool("tools/test_safe_delete.py"))  # a delete never goes through a junction
-    if any_match(files, "tools/check.py", "tools/test_godot_logs.py"):
-        add(tool("tools/test_godot_logs.py"))  # starts Godot: the player's logs stay theirs
-    if any_match(files, "tools/tracker/agents_merge.py", "tools/tracker/test_agents_merge.py"):
-        add(tool("tools/tracker/test_agents_merge.py"))
-    if any_match(files, "tools/tracker/releases.py", "tools/tracker/test_releases.py"):
-        add(tool("tools/tracker/test_releases.py"))
-    if any_match(files, "tools/tracker/usage.py", "tools/tracker/test_usage.py"):
-        add(tool("tools/tracker/test_usage.py"))
-    if any_match(files, "tools/tracker/refresh_dashboard.py", "tools/tracker/test_refresh_dashboard.py"):
-        add(tool("tools/tracker/test_refresh_dashboard.py"))
+    for entry in TESTS:
+        if entry.kind == "gdparse":
+            if scripts:
+                add(entry.to_check(py, tuple(scripts)))
+            continue
+        if entry.kind == "models_check":
+            if models:
+                add(entry.to_check(py, tuple(models)))
+            elif any_match(files, *entry.triggers):
+                covered_by_tests.update(f for f in files if any_match([f], *entry.triggers))
+                add(entry.to_check(py))
+            continue
+        if entry.target == "ui_test.tscn":
+            if ui:
+                add(godot_scene("ui_test " + ui, "ui_test.tscn", "--", "--only=" + ui))
+            elif done and client_code:
+                add(entry.to_check(py))
+            continue
+        if entry.done_only:
+            if done and (any_match(files, *entry.triggers) or (models and entry.triggers == _MODEL_DONE_TRIGGERS)):
+                add(entry.to_check(py))
+            continue
+        if entry.triggers and any_match(files, *entry.triggers):
+            covered_by_tests.update(f for f in files if any_match([f], *entry.triggers))
+            add(entry.to_check(py))
 
-    # The packs' models (tools/models/packs.py) as check.py names them: FUE5's share names with ours.
-    # Not their items/ (item models, which items.py checks; fnmatch's * crosses folders).
-    models = sorted({("fue5/" if f.startswith("client/assets/models/packs/fue5/") else "") + pathlib.Path(f).name[:-4]
-                     for f in files if fnmatch.fnmatch(f, "client/assets/models/packs/*/*.glb") and "/items/" not in f})
-    if models:
-        add(Check("models check.py", [py, "tools/models/check.py", *models]))
-    elif any_match(files, "tools/models/*.py"):
-        add(Check("models check.py", [py, "tools/models/check.py"]))
+    if not ui and not done:
+        unmatched = [f for f in files if f not in covered_by_tests]
+        covered_by_area: set[str] = set()
+        for area_name, patterns, sections, always_run in AREAS:
+            pool = files if always_run else [f for f in unmatched if f not in covered_by_area]
+            hits = [f for f in pool if any_match([f], *patterns)]
+            if hits:
+                add(godot_scene(area_name, "ui_test.tscn", "--", "--only=" + sections))
+                ui_area_added = True
+                if not always_run:
+                    covered_by_area.update(hits)
+        if client_code and not ui_area_added:
+            notes.append("the UI test isn't run: --ui <sections> for the sections you touched, --done for all of it once the change is finished")
 
-    if any_match(files, "client/scripts/addons/*", "client/tests/addon*", "addons-src/*", "client/scripts/world/looks.gd"):
-        add(godot_scene("addon_test", "addon_test.tscn"))
-    if any_match(files, "client/scripts/net/bridge.gd", "client/tests/bridge_fuzz*"):
-        add(godot_scene("bridge_fuzz_test", "bridge_fuzz_test.tscn"))
-    if any_match(files, "client/scripts/world/decorative*", "client/shaders/decorative*", "client/tests/decor*"):
-        add(godot_scene("decor_test", "decor_test.tscn"))
-    if any_match(files, "client/scripts/vr/*", "client/tests/vr*"):
-        add(godot_scene("vr_test", "vr_test.tscn"))
-    if any_match(files, "client/scripts/world/mod_files.gd", "client/scripts/world/mod_graphics.gd",
-                 "client/scripts/world/sprite_standins.gd", "client/tests/mod_files*"):
-        add(godot_script("mod_files_test", "mod_files_test.gd"))
-    if any_match(files, "client/scripts/world/model_packs.gd", "client/scripts/world/model_library.gd",
-                 "client/scripts/world/mod_files.gd", "client/scripts/world/pack_check.gd", "client/tests/model_packs*"):
-        add(godot_script("model_packs_test", "model_packs_test.gd"))
-    if any_match(files, "client/scripts/fx/sound_bank.gd", "client/scripts/world/model_packs.gd",
-                 "client/scripts/world/mod_files.gd", "client/tests/sound_f*"):
-        add(godot_script("sound_files_test", "sound_files_test.gd"))
-    if any_match(files, "client/scripts/player/factorio_keys.gd", "client/scripts/menu/settings.gd", "client/tests/factorio_keys*",
-                 "client/scripts/player/controls.gd", "client/scripts/player/player_input.gd",
-                 "client/scripts/menu/settings_window.gd", "client/scripts/menu/paths.gd", "client/scripts/main.gd"):
-        add(godot_script("factorio_keys_test", "factorio_keys_test.gd"))
-        add(FACTORIO_KEYS_OLD)
-    if any_match(files, "client/scripts/world/item_icons.gd", "client/scripts/ui/factorio/kit.gd",
-                 "client/scripts/ui/factorio/entity_info.gd", "client/tests/icons_later*"):
-        add(godot_script("icons_later_test", "icons_later_test.gd"))
-    if any_match(files, "client/scripts/world/belt_return.gd", "client/shaders/factorio_material.gdshaderinc", "client/tests/belt_cover*"):
-        add(godot_script("belt_cover_test", "belt_cover_test.gd"))
-    if any_match(files, "client/scripts/world/belt_caps.gd", "client/scripts/world/model_library.gd", "client/tests/belt_caps*"):
-        add(godot_script("belt_caps_test", "belt_caps_test.gd"))
-    if any_match(files, "client/scripts/ui/night_vision_overlay.gd", "client/scripts/ui/factorio/night_vision_icon.gd",
-                 "client/scripts/fx/step_sounds.gd", "client/tests/night_vision*"):
-        add(godot_script("night_vision_test", "night_vision_test.gd"))
-    if any_match(files, "client/scripts/world/belt_lane_inset.gd", "client/scripts/world/belt_items.gd", "client/tests/belt_lane_inset*",
-                 "client/scripts/world/model_packs.gd"):
-        add(godot_script("belt_lane_inset_test", "belt_lane_inset_test.gd"))
-    if any_match(files, "client/scripts/world/contact_shade.gd", "client/scripts/world/belt_return.gd", "client/tests/contact_belt_under*"):
-        add(godot_script("contact_belt_under_test", "contact_belt_under_test.gd"))
-    if any_match(files, "client/scripts/ui/factorio/model_preview.gd", "client/scripts/world/model_library.gd",
-                 "client/scripts/world/ground_height.gd", "client/tests/model_preview*"):
-        add(godot_script("model_preview_test", "model_preview_test.gd"))
-    if any_match(files, "client/scripts/world/nature_looks.gd", "client/data/nature_looks.json", "client/tests/nature_looks*",
-                 "client/shaders/factorio_material*", "client/scripts/world/material_rows.gd"):
-        add(godot_script("nature_looks_test", "nature_looks_test.gd"))
-    if any_match(files, "client/scripts/safe_delete.gd", "client/scripts/addons/addon_loader.gd",
-                 "client/scripts/world/model_packs.gd", "client/tests/safe_delete*"):
-        add(godot_script("safe_delete_test", "safe_delete_test.gd"))  # a delete never goes through a link
-    if any_match(files, "client/scripts/world/item_models.gd", "client/scripts/world/model_textures.gd",
-                 "client/shaders/item*", "client/tests/item_materials*"):
-        add(godot_script("item_materials_test", "item_materials_test.gd"))  # an item keeps its file's materials
-    if any_match(files, "client/scripts/world/item_cards.gd", "client/shaders/item_contact*", "client/tests/item_contact*"):
-        add(godot_script("item_contact_test", "item_contact_test.gd"))  # items' contact rims: the box surface, switches
-    if any_match(files, "client/scripts/fx/sound_bank.gd", "client/tests/sound_decode*", "client/tests/sound_cache*"):
-        add(godot_script("sound_decode_test", "sound_decode_test.gd"))
-        add(godot_script("sound_cache_test", "sound_cache_test.gd"))
-
-    client_code = any_match(files, "client/scripts/*", "client/tests/ui_test*", "client/tests/test_*")
-    if not ui and not done and any_match(files, "client/scripts/world/contact_shade.gd", "client/shaders/contact_shade.gdshader",
-                                         "client/scripts/world/chunk_view.gd", "client/scripts/world/model_library.gd"):
-        # Contact shading: the rings' rules, the drills' patch and rim, a built chunk's rings.
-        add(godot_scene("ui_test contact", "ui_test.tscn", "--", "--only=_contact_shade,_contact_drills,_contact_chunk"))
-    if ui:
-        add(godot_scene("ui_test " + ui, "ui_test.tscn", "--", "--only=" + ui))
-    elif done and client_code:
-        add(godot_scene("ui_test", "ui_test.tscn"))
-    elif client_code:
-        notes.append("the UI test isn't run: --ui <sections> for the sections you touched, --done for all of it once the change is finished")
-    if done and (models or any_match(files, "client/scripts/world/model_*.gd", "client/shaders/factorio_material*")):
-        add(godot_script("model_load_test", "model_load_test.gd"))
-        add(godot_script("model_textures_test", "model_textures_test.gd"))
-    elif models:
+    if models and not done:
         notes.append("model loading isn't run: --done once the change is finished")
-    if any_match(files, "client/shaders/*"):
+    if any_match(files, "client/shaders/*") and not ui_area_added and not ui and not done:
         notes.append("shaders have no automatic check here")
     return checks, notes
 
@@ -272,71 +604,20 @@ def all_scripts() -> list[str]:
 
 
 def all_checks(which: str) -> list[Check]:
-    """--all: the fast suites (CI's tests job) or the headless Godot tests (CI's ui job), in CI's order."""
+    """--all: the fast suites (CI's tests job) or the headless Godot tests (CI's ui job), in registry order."""
     py = python_path()
-    checks: list[Check] = []
+    wanted: set[str] = set()
     if which in ("fast", "both"):
-        checks += [
-            Check("test_bridge", [py, "tools/mod_tests/test_bridge.py"]),
-            Check("test_bridge --binary", [py, "tools/mod_tests/test_bridge.py", "--binary"]),
-            Check("test_data_stage", [py, "tools/mod_tests/test_data_stage.py"]),
-            Check("test_mock_server", [py, "tools/test_mock_server.py"]),
-            # One Python start for them all: gdparse takes many files (~270 paths, ~10 KB of command line).
-            Check("gdparse", [py, "-m", "gdtoolkit.parser", *all_scripts()]),
-            Check("models check.py", [py, "tools/models/check.py"]),
-            Check("test_fix_pack", [py, "tools/models/test_fix_pack.py"]),
-            Check("test_fuzz", [py, "tools/mod_tests/test_fuzz.py"]),
-            # Binary frames (transport.lua) decode as their JSON does.
-            Check("test_binary", [py, "tools/mod_tests/test_binary.py"]),
-            Check("test_mock_fuzz", [py, "tools/test_mock_fuzz.py"]),
-            # The relay for a server on another PC, and the mock behind it losing packets.
-            Check("test_relay", [py, "tools/test_relay.py"]),
-            # package.py's Zenith.zip: a pack's items/ folder goes in.
-            Check("test_package", [py, "tools/release/test_package.py"]),
-            # Deleting a folder that holds a junction (a linked mod) never empties the junction's target.
-            Check("test_safe_delete", [py, "tools/test_safe_delete.py"]),
-        ]
-        # The dashboard's Agents table merged from every session's rows file: a private tool, left out of the
-        # release tree, so only where it is.
-        if (REPO / "tools/tracker/test_agents_merge.py").exists():
-            checks.append(Check("test_agents_merge", [py, "tools/tracker/test_agents_merge.py"]))
-        # The Releases page's data (tools/tracker/releases.py): private too.
-        if (REPO / "tools/tracker/test_releases.py").exists():
-            checks.append(Check("test_releases", [py, "tools/tracker/test_releases.py"]))
-        # The Usage panel's data (tools/tracker/usage.py), offline: private too.
-        if (REPO / "tools/tracker/test_usage.py").exists():
-            checks.append(Check("test_usage", [py, "tools/tracker/test_usage.py"]))
-        if (REPO / "tools/tracker/test_refresh_dashboard.py").exists():
-            checks.append(Check("test_refresh_dashboard", [py, "tools/tracker/test_refresh_dashboard.py"]))
+        wanted.add("fast")
     if which in ("godot", "both"):
-        checks += [
-            godot_scene("ui_test", "ui_test.tscn"),
-            godot_scene("bridge_fuzz_test", "bridge_fuzz_test.tscn"),
-            godot_scene("decor_test", "decor_test.tscn"),
-            godot_script("mod_files_test", "mod_files_test.gd"),
-            godot_script("model_packs_test", "model_packs_test.gd"),
-            godot_script("sound_files_test", "sound_files_test.gd"),
-            godot_script("model_preview_test", "model_preview_test.gd"),
-            godot_script("belt_caps_test", "belt_caps_test.gd"),
-            godot_script("belt_cover_test", "belt_cover_test.gd"),
-            godot_script("night_vision_test", "night_vision_test.gd"),
-            godot_script("belt_lane_inset_test", "belt_lane_inset_test.gd"),
-            godot_script("contact_belt_under_test", "contact_belt_under_test.gd"),
-            godot_script("nature_looks_test", "nature_looks_test.gd"),
-            godot_script("factorio_keys_test", "factorio_keys_test.gd"),
-            FACTORIO_KEYS_OLD,
-            godot_script("icons_later_test", "icons_later_test.gd"),
-            godot_script("sound_decode_test", "sound_decode_test.gd"),
-            godot_script("sound_cache_test", "sound_cache_test.gd"),
-            godot_script("safe_delete_test", "safe_delete_test.gd"),
-            godot_script("item_materials_test", "item_materials_test.gd"),
-            godot_script("item_contact_test", "item_contact_test.gd"),
-            godot_scene("addon_test", "addon_test.tscn"),
-            godot_scene("vr_test", "vr_test.tscn"),
-            godot_script("model_load_test", "model_load_test.gd"),
-            # Starts one Godot test itself, as above: the player's own Godot logs left alone.
-            Check("test_godot_logs", [py, "tools/test_godot_logs.py"]),
-        ]
+        wanted.add("godot")
+    checks: list[Check] = []
+    for entry in TESTS:
+        if entry.suite not in wanted:
+            continue
+        if entry.if_exists and not (REPO / entry.target).exists():
+            continue
+        checks.append(entry.to_check(py))
     return checks
 
 

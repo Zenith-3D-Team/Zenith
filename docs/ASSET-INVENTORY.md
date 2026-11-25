@@ -1,160 +1,136 @@
-# Asset Inventory: 2D sprites → 3D models
+# Asset Inventory: 2D Sprites → 3D Models
 
-Every visible Factorio entity that needs a 3D model, grouped into **families** so that tier
-variants share one mesh and differ only by tint or material. This list was built from Wube's
-public prototype definitions for **Factorio 2.1.23** (base, Space Age, Elevated Rails).
-For the authoritative list, including other mods, run `factorio --dump-data` and read
-`script-output/data-raw-dump.json`.
+Every visible Factorio entity that needs a 3D model, grouped into **families** so tier variants share meshes where possible. Prototypes come from **Factorio 2.1.23** (base game, Space Age, Elevated Rails). Authoritative tracker status lives in [docs/tracker/models.json](tracker/models.json).
 
-Conventions, workflow and budgets are in [PLAN.md §4 and §6](PLAN.md#6-converting-the-2d-sprites-into-3d-models).
-The models are built by `tools/models/` (see `client/assets/models/README.md`): Wube's printable
-models converted by `wube.py` where they exist, the rest built in Blender from Factorio's sprites.
-For 39 base-game entities there are the FUE5 fan project's textured models too (owner's choice;
-`fue5.py`, the FUE5 pack in `client/assets/models/packs/fue5/`, CC BY-NC-SA 3.0): they are marked
-**FUE5** below. By the default order of the model packs (FUE5 above Wube3DP and Placeholders) the
-client draws all 39 in place of ours, the 7 with a Wube3DP model too (electric mining drill, small
-electric pole, stone and steel furnace, wooden, iron and steel chest) included. Ours stay in their packs
-(`packs/placeholders/`, `packs/wube3dp/`); FUE5's outlines follow the sprites more loosely (its
-README and the tracker give each one's overlap, ours and theirs).
-Each model is scored against its sprite in every direction by silhouette overlap (`compare.py`
-and the scorers beside it); the scores and what keeps a model short of 0.90 are in
-`docs/tracker/models.json` and COORDINATION.md. That tracker is the source of truth for each
-family's stage; this page follows it.
+For conventions and the Blender/glTF pipeline, see [PLAN.md §6](PLAN.md#6-converting-the-2d-sprites-into-3d-models), [MODELLERS.md](MODELLERS.md), and `client/assets/models/README.md`.
 
-Nearly every family has a real model now: the Placeholders and Wube3DP packs hold 442 `.glb` files
-(348 and 94; directions, belt curves, wall pieces, corpses and poses count separately), FUE5's 142
-more (the stone wall's 21 pieces, the heat pipe's 17, the 18 pipes, both rail signals, both robots, the six inserters, 20 belt pieces, four splitters and the four tiers' underground entrances and exits among them), and `client/assets/models/packs/placeholders/items/` 198 small item models. Crude oil is the one entity still without a
-model fitted to its sprite.
+## Built-in pack counts
 
-**Status legend:** `todo` → `blockout` → `modelled` → `textured` → `animated` → `in-client`
+| Pack | Role & Source | `.glb` Files | Notes |
+|---|---|---:|---|
+| **FUE5 (Adapted)** | Textured PBR models converted from FUE5 (`CC BY-NC-SA 3.0`, `fue5.py` + `bake_fue5_pbr.py`) | **142** | Highest default priority among built-ins; covers 39+ base machines, belts, pipes, walls, rail signals, inserters & robots |
+| **Wube3DP (Adapted)** | Scaled, sprite-matched models from Wube printables (`CC BY-NC`, `wube.py` + `bake_pbr.py`) | **94** | Character, biters, spitters, assembler-1, chests, drill, furnaces, belts, inserters, walls |
+| **Placeholders** | Sprite-matched procedural Blender models covering every base & Space Age family | **575** | `377` entity/variant `.glb`s + `198` `items/` meshes (`3D` items on belts/ground) |
+| **Total built-in** | Shipped across `client/assets/models/packs/` | **811** | Plus **Factorio** runtime 2D sprite pack & optional Vasillo **Zenith.zip** PBR pack |
 
-- `blockout`: procedural or unchecked against the sprite.
-- `modelled`: the shape matches Factorio's sprite or Wube's model.
-- `textured`: colours sampled from the sprite, but they still differ in places.
-- `animated`: moves the way Factorio's animation does (drawn in the client too).
-- `in-client`: shape and materials match, checked in the client.
+Every family has a dedicated model except `crude-oil` (still an unchecked blockout). Motion uses either separate shader-driven `anim_*` objects, single-action baked glTF skeletal animations, shader vertex rigs (creatures/character), or mod-driven aims/positions (`turrets.gd`, `collectors.gd`, `inserter_arms.gd`).
 
-| Tier | Meaning | Families (tracker rows) |
-|---|---|---|
-| P0 | On screen in the first hour | 26 |
+**Stage summary (`73` tracker families):** `42` In the client · `21` Animated · `8` Textured · `2` Modelled.
+
+| Tier | Meaning | Families |
+|---|---|---:|
+| P0 | First hour on Nauvis | 27 |
 | P1 | Mid-game base | 12 |
 | P2 | Late base game | 6 |
 | ER | Elevated Rails | 1 |
 | P3 | Space Age | 27 |
-| | **Total** | **72**: 42 in-client, 21 animated, 7 textured, 2 modelled |
-
-Models are flattened into one mesh for instanced drawing, so glTF skeletons and clips aren't
-used (FUE5's moving parts are cut out of its animated files by bone when converted). Moving parts
-are separate `anim_*` nodes that the model shader turns, slides or lights from the machine's state;
-creatures' limbs move in the material's vertex shader; turrets, vehicles and robots are driven
-from what the mod reports.
 
 ---
 
 ## P0: First hour
 
-| Family | Prototypes | Models | Technique | Status |
+| Family | Prototypes | Models | Animation / Drawing Technique | Status |
 |---|---|---|---|---|
-| Character | `character` | 1 rig (+ gun, corpse) | Wube's print on the client's own rig: idle, run (Factorio's 4.77 tiles a loop), mine, shoot; flashlight | animated |
-| Transport belt | `transport-belt`, `fast-transport-belt`, `express-transport-belt` | 1 (straight, left and right curves) | Slats and the tier's chevrons scroll in the shader | in-client (Wube's belt and curves; fast, express and turbo in their own paint). FUE5 (Adapted): every tier's straight, curves and line ends, FUE5's textured slab with its slat picture scrolling, each tier's chevrons repainted (`fue5.py`); textured, not seen in a window |
-| Underground belt | `underground-belt`, `fast-underground-belt`, `express-underground-belt` | 1 (entrance, exit) | Belt inside scrolls, tier paint | in-client (Wube's entrance and exit; higher tiers in their own paint). FUE5 (Adapted): all four tiers' entrance and exit, FUE5's hood refit to the sprite, its chevrons redrawn in each tier's paint (headless only) |
-| Splitter | `splitter`, `fast-splitter`, `express-splitter` | 1 | Belts scroll; gear wheels and cranks turn on its 32-frame loop | in-client (rebuilt from its four sprites; higher tiers in their own paint). FUE5 (Adapted): all four tiers, FUE5's textured structure mirrored to the sprite's side, over two of FUE5's straight belts of the tier (their surfaces scroll), its four gears turning, the chevron plates in each tier's sprite paint (`fue5.py`); overlap 0.76/0.86/0.81/0.87 (ours 0.81/0.90/0.79/0.92); textured, not seen in a window |
-| Inserters | `burner-inserter`, `inserter`, `long-handed-inserter`, `fast-inserter`, `bulk-inserter` | Wube's platform, one per direction; arm pieces per family (basic, long, bulk). **FUE5**: one platform with its own arm as a rig (pincers from its fingers), each tier in flat sprite colours (FUE5's pictures carry a stock watermark), the long-handed arm 1.6x; base overlap 0.75/0.66/0.69/0.67 with the folded arm (0.78/0.66/0.73/0.68 without) | The client swings the upper arm and hand to the hand position the mod reports, stretched to the reach; the hand closes on an item (FUE5's: its rig, the same IK) | animated (FUE5's: blockout, not seen in a window) |
-| Chests | `wooden-chest`, `iron-chest`, `steel-chest` | 3 | none | in-client (**FUE5**'s by the packs' default order; Wube's, 0.95-0.97, beside them in Wube3DP) |
-| Mining drills | `burner-mining-drill`, `electric-mining-drill` | 2 (burner drill one per direction) | Auger turns while working; the burner drill's gears rock, rod bobs, fire flickers | modelled (burner drill 0.74-0.80; electric drill **FUE5**'s by the packs' default order, its drill turning from FUE5's own file; Wube's beside it in Wube3DP, its auger turning) |
-| Furnaces | `stone-furnace`, `steel-furnace` | 2 | Fire flickers while working | in-client (**FUE5**'s by the packs' default order; Wube's beside them in Wube3DP) |
-| Assemblers | `assembling-machine-1`, `assembling-machine-2`, `assembling-machine-3` | 3 | Parts turn while crafting | animated (1 is Wube's printable model, Wube3DP; 2 and 3 rebuilt from their sprites) |
-| Steam power | `offshore-pump`, `boiler`, `steam-engine` | 3 (boiler and offshore pump one per direction, steam engine two) | Boiler fire, flywheel spin, pump pistons | in-client (boiler and steam engine **FUE5**, FUE5's one model turned per direction; its steam engine's wheels turn) |
-| Electric poles | `small-electric-pole`, `medium-electric-pole`, `big-electric-pole`, `substation` | 4 | Wires hang between Factorio's connection points | modelled (all four **FUE5**, the small pole too by the packs' default order, Wube's beside it in Wube3DP; wires against FUE5's insulators not checked yet) |
-| Pipes | `pipe`, `pipe-to-ground` | Pipe kit of 16 pieces, pipe-to-ground one per direction | Piece chosen by connections (`extra.pc`, from the mod) | in-client (also **FUE5**: the 17 pipe pieces swept from FUE5's straight pipe and its pipe-to-ground, turned to each direction; not seen in a window) |
-| Lab | `lab` | 1 | Lights pulse while researching | in-client (**FUE5**; its glow not back yet) |
-| Gun turret | `gun-turret` | 1 | Head turns to the mod's real aim, raises and folds, recoils, muzzle flash (`turrets.gd`) | textured (**FUE5**, its head as the turning part) |
-| Wall & gate | `stone-wall`, `gate` | Wall pieces per connection shape; gate | Piece chosen by neighbours; the gate opens for the character or a friendly vehicle | in-client (Wube's wall pieces; FUE5's 21, cut from its one wall piece, drawn by the default order) |
-| Car | `car` | 1 | Turret part follows its aim | textured |
-| Ores | `iron-ore`, `copper-ore`, `coal`, `stone` | 1 nugget set × 4 materials, 3 richness stages | Instanced, stage picked by the tile's amount | in-client |
-| Trees | `tree-01` … `tree-09` (+ colour variants) | 9 | Leaf-card crowns cut ragged in the shader; no wind yet | in-client (`-red`/`-brown` variants are the same models in their own colours) |
-| Dead trees | `dead-dry-hairy-tree`, `dead-grey-trunk`, `dead-tree-desert`, `dry-hairy-tree`, `dry-tree` | 5 | none | textured (the sprites' fine twigs aren't modelled) |
-| Rocks | `big-rock`, `huge-rock`, `big-sand-rock` | 3 | none | in-client |
-| Cliffs | `cliff` (+ `cliff-vulcanus`, `cliff-gleba`, `cliff-fulgora`) | 5 pieces per planet (sides, outer, inner, exit, entrance), turned for the 20 orientations | none | in-client: Nauvis shaped from the sprites seen from the low side; the planets' layered versions are blockouts (not in the tracker) |
-| Fish | `fish` | 1 | Tail sway (ours: Factorio's fish are still pictures) | in-client |
-| Biters | `small-biter`, `medium-biter`, `big-biter`, `behemoth-biter` | 1 (Wube's print, scaled and tinted per tier), attack pose, 4 corpses | Limbs move in the vertex shader; bites timed to the attack cooldown; dying biters fall into one of four corpse poses fitted to the sprites | animated |
-| Spitters | `small-spitter`, `medium-spitter`, `big-spitter`, `behemoth-spitter` | 1 (Wube's print), attack stance, 4 corpses | As biters | animated |
-| Spawners | `biter-spawner`, `spitter-spawner` | 1 + corpse | Pulses at Factorio's 0.9 Hz | animated |
-| Worms | `small-worm-turret`, `medium-worm-turret`, `big-worm-turret`, `behemoth-worm-turret` | 1 (rebuilt from the sprites) + corpse | Folds, rises and lunges at its target at the prototype's speeds; falls over as it dies | animated |
-| Crash site | `crash-site-spaceship`, `crash-site-spaceship-wreck-big-1/2`, `-medium-1/2/3`, `-small-1…6`, `crash-site-chest-1/2` | 14 | none | textured (the ship's seams read partly as cracks; some olive paint left) |
+| Character | `character` | 1 rig + gun, corpse | Wube printable rig: idle, run (4.77 tiles/loop), mine, shoot, flashlight | animated |
+| Transport belt | `transport-belt`, `fast-`, `express-` | Straight, L/R curves | Shader-scrolling `belt_surface` slats/chevrons + tier paint (FUE5 adapted pack also covered) | in-client *(FUE5 unverified in-window)* |
+| Underground belt | `underground-belt`, `fast-`, `express-` | Entrance, exit | Inner belt scrolls + tier paint (Wube3DP + FUE5 adapted) | in-client |
+| Splitter | `splitter`, `fast-`, `express-` | 1 (+ FUE5 4 tiers) | Scrolling belts + 32-frame gear/crank animation (`fue5.py` adapted overlap 0.76–0.87; ours 0.79–0.92) | in-client |
+| Inserters | `burner-`, `inserter`, `long-handed-`, `fast-`, `bulk-inserter` | Direction bases + arm kits | Arm stretches between shoulder and mod hand target (`FUE5` uses rigged arm pack, watermarked textures) | animated *(FUE5 blockout)* |
+| Chests | `wooden-chest`, `iron-chest`, `steel-chest` | 3 | Static (`FUE5` default, `Wube3DP` 0.95–0.97 fallback) | in-client |
+| Mining drills | `burner-mining-drill`, `electric-mining-drill` | 2 (direction variants + `-wet`) | Auger spin, burner rocker gears/rod/fire (`FUE5` electric drill default, `Wube3DP` fallback) | modelled |
+| Furnaces | `stone-furnace`, `steel-furnace` | 2 | Animated burner fire glow (`FUE5` default, `Wube3DP` fallback) | in-client |
+| Assemblers | `assembling-machine-1`, `-2`, `-3` | 3 | Moving gears/arms while crafting (`1` Wube3DP, `2–3` sprite-matched) | animated |
+| Steam power | `offshore-pump`, `boiler`, `steam-engine` | 3 (direction bases) | Boiler fire, flywheel spin, pump pistons (`FUE5` boiler & steam engine default) | in-client |
+| Electric poles | `small-`, `medium-`, `big-electric-pole`, `substation` | 4 | Catenary wires attached to prototype insulators (`FUE5` default, `Wube3DP` small pole fallback) | modelled *(FUE5 wire pins unverified)* |
+| Pipes | `pipe`, `pipe-to-ground` | 16 shapes (+ windows) + 4 dirs | Connection bitmask (`extra.pc`) selects shape & window/cover (`Wube3DP` + `FUE5` 17-piece kit) | in-client |
+| Lab | `lab` | 1 | Activity pulse (`FUE5` default; glow restoration pending) | in-client |
+| Gun turret | `gun-turret` | 1 | Aims toward mod turret target, folds/recoils, muzzle flash (`FUE5` default) | textured |
+| Wall & gate | `stone-wall`, `gate` | Neighbor shapes + fill + gate | Bitmask wall joins + proximity-opening gate (`Wube3DP` + `FUE5` 21-piece kit) | in-client |
+| Car | `car` | 1 | Orientation + turret gun tracks aim (`vehicles.py`) | textured |
+| Ores | `iron-ore`, `copper-ore`, `coal`, `stone` | 4 rock sets (3 richness stages) | Scattered/tiered instances by tile ore count | in-client |
+| Trees | `tree-01` … `tree-09` (+ colour variants) | 9 | Shader leaf-card crowns (`tree_looks.json` tints/grain) | in-client |
+| Dead trees | `dead-dry-hairy-tree`, `dead-grey-trunk`, `dead-tree-desert`, `dry-hairy-tree`, `dry-tree` | 5 | Static trunk/branch meshes | textured |
+| Rocks | `big-rock`, `huge-rock`, `big-sand-rock` | 3 | Static meshes | in-client |
+| Cliffs | `cliff` (+ `vulcanus`, `gleba`, `fulgora`) | 5 piece families (with variants) | Oriented block-wall system (`cliff_wall.gd`; planet variants blockout) | textured |
+| Fish | `fish` | 1 | Subtle tail sway | in-client |
+| Biters | `small-`, `medium-`, `big-`, `behemoth-biter` | Rigged body + attack + 4 corpses | Wube3DP mesh scaled/tinted per tier; shader limb walk + corpse poses | animated |
+| Spitters | `small-`, `medium-`, `big-`, `behemoth-spitter` | Rigged body + attack + 4 corpses | As biters | animated |
+| Spawners | `biter-spawner`, `spitter-spawner` | 1 + corpse | 0.9 Hz idle pulse | animated |
+| Worms | `small-`, `medium-`, `big-`, `behemoth-worm-turret` | 1 + corpse | Folds, rises, and lunges at prototype attack speeds | animated |
+| Crash site | `crash-site-spaceship`, wrecks (`big`, `medium`, `small`), chests | 14 | Static meshes | textured |
+
+---
 
 ## P1: Mid-game base
 
-| Family | Prototypes | Models | Technique | Status |
+| Family | Prototypes | Models | Animation / Drawing Technique | Status |
 |---|---|---|---|---|
-| Oil | `pumpjack`, `oil-refinery`, `chemical-plant`, `storage-tank`, `pump`, `crude-oil` (resource) | 6 (pumpjack and chemical plant one per direction) | Pumpjack beam rocks, refinery flare, pump pistons | pumpjack, oil-refinery, chemical-plant, storage-tank, pump animated, all five **FUE5** (their beam, pistons, gears and lamp not back yet); crude-oil blockout (procedural, not fitted) |
-| Electric | `solar-panel`, `accumulator`, `electric-furnace`, `small-lamp` | 4 | Lamp light; accumulator glows while charging and arcs while discharging (state from the mod); the electric furnace's fans turn | animated, all four **FUE5** (the accumulator's sparks not back yet) |
-| Logistic network | `roboport`, `logistic-robot`, `construction-robot` | 3 | Robots' thrusters swing and glow, antenna lamp red with cargo, construction sparks; robots drawn together and animated in the shader | animated (roboport and both robots **FUE5**; the roboport's doors and charging lights not back yet; the robots' thrusters, lamps and arms split into Zenith's moving parts, silhouette overlap against the sprite's north, east, south and west frames: construction robot 0.75 (N 0.82, E 0.69, S 0.76, W 0.74; ours 0.66), logistic robot 0.72 (ours 0.62)) |
-| Logistic chests | `active-provider-chest`, `passive-provider-chest`, `storage-chest`, `buffer-chest`, `requester-chest` | 1 + 5 colours | Hatch slides open while a robot is over the chest | in-client (Wube's chest; **FUE5**'s by the packs' order, painted from each sprite, its hatch not moving) |
-| Circuit network | `arithmetic-combinator`, `decider-combinator`, `selector-combinator`, `constant-combinator`, `power-switch`, `programmable-speaker`, `display-panel` | 7 | Indicator lights; the power switch's contact closes | in-client (the three combinators and the speaker **FUE5**) |
-| Valves | `one-way-valve`, `overflow-valve`, `top-up-valve` | 1 per direction | none | in-client |
-| Rails | `straight-rail`, `half-diagonal-rail`, `curved-rail-a`, `curved-rail-b` | 1 per piece, with a diagonal variant (+ legacy rails) | none | in-client |
-| Rail props | `rail-signal`, `rail-chain-signal`, `train-stop` | 3 | Signals placed per direction as Factorio draws them; lamps lit by the mod's reported colour | animated (train stop, rail and chain signals **FUE5**) |
-| Trains | `locomotive`, `cargo-wagon`, `fluid-wagon` (+ `infinity-cargo-wagon`) | 4 | Orientation from the mod; wheels roll; locomotive headlights at night | textured (locomotive, cargo and fluid wagons **FUE5**) |
-| Defence | `laser-turret`, `flamethrower-turret`, `land-mine`, `tank` | 4 | Turret heads aim at the mod's real targets: the laser head rises, the flamethrower's nozzle slides out; the tank's turret aims, its treads slide and wheels roll | in-client |
-| Combat robots | `defender`, `distractor`, `destroyer` | 3 | Hover | in-client |
-| Radar & beacon | `radar`, `beacon` | 2 | Dish spins, beacon glow | in-client (both **FUE5**; the beacon's glow not back yet) |
+| Oil | `pumpjack`, `oil-refinery`, `chemical-plant`, `storage-tank`, `pump`, `crude-oil` | 6 (direction bases) | Pumpjack rocks (FUE5 animated in 0.3.0), refinery flare, pump pistons; `crude-oil` unchecked procedural | 5 animated (`FUE5`), 1 blockout (`crude-oil`) |
+| Electric | `solar-panel`, `accumulator`, `electric-furnace`, `small-lamp` | 4 | Furnace fans, lamp light, accumulator glow (`FUE5` default; accumulator arc pending) | animated |
+| Logistic network | `roboport`, `logistic-robot`, `construction-robot` | 3 | Client `rb` robot sim + GPU multi-mesh thrusters/cargo lamp (`FUE5` overlap 0.72–0.75; roboport doors pending) | animated |
+| Logistic chests | `active-`, `passive-provider`, `storage`, `buffer`, `requester` | 1 + 5 colours | Hatches slide open near robots (`Wube3DP`; `FUE5` hatch animation pending) | in-client |
+| Circuit network | `arithmetic-`, `decider-`, `selector-`, `constant-combinator`, `power-switch`, `programmable-speaker`, `display-panel` | 7 | Status indicators & power-switch contact (`FUE5` combinators/speaker) | in-client |
+| Valves | `one-way-valve`, `overflow-valve`, `top-up-valve` | 1 per direction | Static | in-client |
+| Rails | `straight-rail`, `half-diagonal-rail`, `curved-rail-a`, `curved-rail-b` | Piece + `-ne` diagonals | Quarter-turn orientation | in-client |
+| Rail props | `rail-signal`, `rail-chain-signal`, `train-stop` | 3 | Directional lamp colour from bridge (`FUE5` signals/stop) | animated |
+| Trains | `locomotive`, `cargo-wagon`, `fluid-wagon` (+ `infinity-cargo-wagon`) | 4 | Orientation, rolling wheels, night headlights (`FUE5` rolling stock) | textured |
+| Defence | `laser-turret`, `flamethrower-turret`, `land-mine`, `tank` | 4 | Turret tracking/retracting/nozzle slide + tank tread scroll & turret aim | in-client |
+| Combat robots | `defender`, `distractor`, `destroyer` | 3 | Hover offset | in-client |
+| Radar & beacon | `radar`, `beacon` | 2 | Radar dish rotation (`FUE5` default; beacon glow pending) | in-client |
+
+---
 
 ## P2: Late base game
 
-| Family | Prototypes | Models | Technique | Status |
+| Family | Prototypes | Models | Animation / Drawing Technique | Status |
 |---|---|---|---|---|
-| Nuclear | `nuclear-reactor`, `heat-pipe`, `heat-exchanger`, `steam-turbine`, `centrifuge`, `uranium-ore` | 4 + heat pipe kit of 17 pieces; uranium ore at 3 richness stages | Heat glow; heat pipe piece chosen by neighbours; rotors turn | animated (reactor, centrifuge, steam turbine and the 17 heat pipe pieces **FUE5**, the heat pipes cut and bent from FUE5's one piece, their copper glowing from 350 °C; the reactor's glow not back yet) |
-| Rocket | `rocket-silo`, `rocket-silo-rocket`, `cargo-pod`, `cargo-landing-pad` | 4 | Silo doors open with a rocket ready; launch and the ride up; cargo pod panels and thruster; landing pad hatch | in-client (rocket silo **FUE5**, its hatch cut into two doors; the rocket stays ours) |
-| Artillery | `artillery-turret`, `artillery-wagon` | 2 | Cannon turns and recoils, muzzle flash | in-client |
-| Spidertron | `spidertron` | 1 body, legs in two parts | Each leg bent between hip, knee and the foot the mod reports; the shell turns with the torso | animated |
-| Armour looks | `character` in light/heavy, modular, power armour | 2 plate sets (light armour keeps the plain look) | Plates on the character's own skeleton, so every animation carries over | animated |
-| Misc | `market`, `lane-splitter`, `loader`, `fast-loader`, `express-loader`, `loader-1x1` | 4 (market, lane splitter, loader, 1x1 loader) | Loaders' belts move | in-client |
+| Nuclear | `nuclear-reactor`, `heat-pipe`, `heat-exchanger`, `steam-turbine`, `centrifuge`, `uranium-ore` | 4 + 17 heat-pipe shapes + ore stages | 350°C+ copper glow (`FUE5` pipes/reactor/centrifuge/turbine), rotor spin (`reactor` glow pending) | animated |
+| Rocket | `rocket-silo`, `rocket-silo-rocket`, `cargo-pod`, `cargo-landing-pad` | 4 | Silo doors (`FUE5` split doors) + rocket ascent & cargo pod docking | in-client |
+| Artillery | `artillery-turret`, `artillery-wagon` | 2 | Barrel rotation, recoil, muzzle flash | in-client |
+| Spidertron | `spidertron` | Body + 2-part legs | Procedural IK legs between hip, knee & mod foot targets | animated |
+| Armour looks | `character` in light/heavy, modular, power armour | 2 plate sets | Shared character rig animations | animated |
+| Misc | `market`, `lane-splitter`, `loader`, `fast-`, `express-loader`, `loader-1x1` | 4 | Loader belt scroll | in-client |
+
+---
 
 ## ER: Elevated Rails
 
-| Family | Prototypes | Models | Technique | Status |
+| Family | Prototypes | Models | Animation / Drawing Technique | Status |
 |---|---|---|---|---|
-| Elevated rails | `elevated-straight-rail`, `elevated-half-diagonal-rail`, `elevated-curved-rail-a`, `elevated-curved-rail-b`, `rail-ramp`, `rail-support` | 1 per deck piece, with a diagonal variant; ramp; support | none | in-client |
+| Elevated rails | `elevated-straight-rail`, `-half-diagonal-rail`, `-curved-rail-a`, `-curved-rail-b`, `rail-ramp`, `rail-support` | Deck pieces + `-ne`, ramp, support | Height-offset chunk placement (`world.gd`) | in-client |
+
+---
 
 ## P3: Space Age
 
-| Family | Prototypes | Models | Technique | Status |
+| Family | Prototypes | Models | Animation / Drawing Technique | Status |
 |---|---|---|---|---|
-| Machines | `foundry`, `electromagnetic-plant`, `cryogenic-plant`, `biochamber`, `crusher`, `recycler`, `big-mining-drill`, `agricultural-tower`, `heating-tower`, `captive-biter-spawner`, `biolab`, `fusion-reactor`, `fusion-generator` | 13 | Parts turn, slide and glow while working, timed from each prototype's animation; crane for the agricultural tower | foundry and big-mining-drill animated; the other eleven in-client |
-| Logistics tier | `turbo-transport-belt`, `turbo-underground-belt`, `turbo-splitter`, `turbo-loader`, `stack-inserter` | 1 (stack inserter, one per direction; the rest are P0 models in their own paint) | Arm as the other inserters | stack-inserter animated |
-| Space platform | `space-platform-hub`, `cargo-bay`, `thruster`, `asteroid-collector` | 4 | Thruster plume; hub and bay hatches open while a pod passes; collector arms fly out and catch real chunks (`collectors.gd`) | in-client |
-| Turrets | `railgun-turret`, `rocket-turret`, `tesla-turret` | 3 | Heads aim at the mod's targets: the railgun lowers from upright, the rocket pods open, the tesla head rises | railgun-turret and rocket-turret in-client; tesla-turret animated |
-| Lightning | `lightning-rod`, `lightning-collector` | 2 | Sparks after a strike lands on it | in-client |
-| Capture robot | `capture-robot` | 1 | Hover; hanging cables sway | in-client |
-| Mech armour look | `character` in mech armour | 1 | Idle, run, mining and aiming on its own model; flight not drawn | animated |
-| Vulcanus | `small-demolisher`, `medium-demolisher`, `big-demolisher`; `big-volcanic-rock`, `huge-volcanic-rock` (+`-hot`); `vulcanus-chimney` (+`-cold`, `-faded`, `-short`, `-truncated`); `ashland-lichen-tree` (+`-flaming`); `tungsten-ore`, `calcite`; `sulfuric-acid-geyser` | Demolisher head, segment and tail; 2 rocks (+ hot); 5 chimneys; lichen (+ flaming); geyser; 2 ores | Demolisher parts glide after the head at their prototypes' scales (`demolishers.gd`); hot and flaming ones glow | demolishers animated (against the mock only); rocks, chimneys, lichen and geyser in-client; tungsten-ore and calcite have models but no tracker row |
-| Fulgora | `fulgoran-ruin-tiny/small/small-tall/medium/medium-tall/big/huge/huge-tall/colossal/stonehenge/vault/attractor`, `fulgora-sunk-ruin-big`, `fulgora-sunk-ruin-medium-tall`, `fulgurite`, `fulgurite-small`, `scrap` | 11 ruins, 2 fulgurites, scrap | none | in-client |
-| Gleba flora | `yumako-tree`, `jellystem`, `boompuff`, `cuttlepop`, `funneltrunk`, `hairyclubnub`, `lickmaw`, `slipstack`, `stingfrond`, `sunnycomb`, `teflilly`, `water-cane`, `copper-stromatolite`, `iron-stromatolite` (`tree-plant` reuses the P0 trees) | 14 | none yet (no wind) | textured (lickmaw and funneltrunk paler than their sprites; thin strands) |
-| Gleba enemies | `small/medium/big-wriggler-pentapod`, `small/medium/big-strafer-pentapod`, `small/medium/big-stomper-pentapod`, `small/medium/big-stomper-shell`, `gleba-spawner`, `gleba-spawner-small` | Wriggler, 3 strafers, 3 stompers, 3 stomper shells; 2 spawners + corpse | Strafers' and stompers' legs bent between hip, knee and the mod's feet; wrigglers on the shader's limb rig; spawners' sacs swell, a dying spawner slumps into its corpse | animated (against the mock only) |
-| Aquilo | `lithium-iceberg-big`, `lithium-iceberg-huge`, `lithium-brine`, `fluorine-vent` | 4 | none | in-client |
-| Asteroids | `small/medium/big/huge` × `metallic/carbonic/oxide/promethium-asteroid` | 16 | Tumble rotation | textured (lighter and smoother than the pitted sprites) |
+| Machines | `foundry`, `electromagnetic-plant`, `cryogenic-plant`, `biochamber`, `crusher`, `recycler`, `big-mining-drill`, `agricultural-tower`, `heating-tower`, `captive-biter-spawner`, `biolab`, `fusion-reactor`, `fusion-generator` | 13 | Prototype-timed spinning, sliding, glow & ag-tower crane | `foundry`, `big-mining-drill` animated; 11 in-client |
+| Logistics tier | `turbo-transport-belt`, `-underground-belt`, `-splitter`, `-loader`, `stack-inserter` | 1 (`stack-inserter` 4 dirs; rest paint variants) | Tier colour + shared inserter IK | animated (`stack-inserter`) |
+| Space platform | `space-platform-hub`, `cargo-bay`, `thruster`, `asteroid-collector` | 4 (+ bay edge pieces) | Thruster plume, pod hatches, collector arms (`collectors.gd`) | in-client |
+| Turrets | `railgun-turret`, `rocket-turret`, `tesla-turret` | 3 | Live target tracking, rising tesla head, opening rocket pods | `tesla-turret` animated; 2 in-client |
+| Lightning | `lightning-rod`, `lightning-collector` | 2 | Post-strike electrical arc sparks | in-client |
+| Capture robot | `capture-robot` | 1 | Hover + swaying cables | in-client |
+| Mech armour look | `character` in mech armour | 1 | Shared character rig (flight pose pending) | animated |
+| Vulcanus | `small/medium/big-demolisher`, volcanic rocks (`-hot`), chimneys, `ashland-lichen-tree` (`-flaming`), `tungsten-ore`, `calcite`, `sulfuric-acid-geyser` | Segmented worm + rocks + chimneys + vents + ores | Trailing demolisher segments (`demolishers.gd`); hot/flaming emission | demolishers animated *(mock)*; rest in-client |
+| Fulgora | `fulgoran-ruin-*` (11), `fulgora-sunk-ruin-*` (2), `fulgurite` (2), `scrap` | 14 | Static meshes | in-client |
+| Gleba flora | `yumako-tree`, `jellystem`, `boompuff`, `cuttlepop`, `funneltrunk`, `hairyclubnub`, `lickmaw`, `slipstack`, `stingfrond`, `sunnycomb`, `teflilly`, `water-cane`, `copper/iron-stromatolite` | 14 | Static meshes (wind shader pending) | textured |
+| Gleba enemies | `wriggler-`, `strafer-`, `stomper-pentapod`, `stomper-shell`, `gleba-spawner` (`-small`) | Wriggler, 3 strafers, 3 stompers, shells, 2 spawners + corpse | IK walking legs, shader wriggle, swelling spawners | animated *(mock)* |
+| Aquilo | `lithium-iceberg-big/huge`, `lithium-brine`, `fluorine-vent` | 4 | Static meshes | in-client |
+| Asteroids | `small/medium/big/huge` × `metallic/carbonic/oxide/promethium-asteroid` | 16 | Tumble rotation | textured |
 
 ---
 
 ## Not models (handled by the client)
 
-| What | How |
+| Element | How the client draws it |
 |---|---|
-| Terrain tiles (grass, dirt, sand, desert, water, …) | Factorio's own tile textures from the install on the per-chunk terrain mesh, with ragged transitions, an irregular coast and a water shader |
-| Player floors (`stone-path`, `concrete`, `refined-concrete`, hazard concrete, space platform foundation) | Factorio's tile textures, like the terrain |
-| Decoratives (grass tufts, pebbles, …) | Factorio's pictures, one MultiMesh per chunk per decorative (`decoratives.gd`), thinned with distance |
-| Items on belts, on the ground, in inserter hands | Small models for 198 items (Placeholders' `items/`, any pack's `items/`, `tools/models/items.py`); icon cards for the rest and for belts far away |
-| Explosions, fire, smoke, projectiles, beams, streams | Factorio's own sprite sheets from the install, played on cards (`weapon_fx.gd`, `sprite_fx.gd`) |
-| Remnants | The parent model flattened, broken and rusted |
+| Terrain & player floors | Factorio install tile textures (`stone-path`, `concrete`, space foundation) + coastal/water shaders (or pack `tiles/` overrides) |
+| Decoratives & grass | Factorio sprite-sheet MultiMesh batches (`decoratives.gd`), or pack-provided 3D `.glb`/2D `decoratives/` overrides |
+| Items on belts/ground/hands | **198** 3D item meshes in `Placeholders` (`items/`) + Factorio icon cards for everything else / distant belts |
+| Projectiles, fire, smoke & particles | Factorio sprite sheets animated on camera-facing cards (`weapon_fx.gd`, `sprite_fx.gd`) |
+| Remnants | Base entity model flattened, shattered, and rusted by shader |
 
 ## Skipped (editor, test or hidden)
 
-`bottomless-chest`, `infinity-chest`, `linked-chest`, `electric-energy-interface`,
-`heat-interface`, `simple-entity-with-force`, `simple-entity-with-owner`,
-`factorio-logo-11tiles/16tiles/22tiles`, `wube-logo-space-platform`, all `dummy-*` and
-`parameter-*` entities. These get the automatic placeholder box.
-
-Drawn after all with other models: `infinity-cargo-wagon` (the cargo wagon tinted as Factorio
-draws it), `infinity-pipe` (the pipe kit tinted), `burner-generator` (the steam engine, as Factorio
-draws it), `linked-belt` (a steel underground end).
+`bottomless-chest`, `infinity-chest`, `linked-chest`, `electric-energy-interface`, `heat-interface`, `simple-entity-with-force`, `simple-entity-with-owner`, `factorio-logo-*`, `wube-logo-space-platform`, `dummy-*`, and `parameter-*` use fallback selection-box colouring. Aliased via existing meshes: `infinity-cargo-wagon`, `infinity-pipe`, `burner-generator`, and `linked-belt`.

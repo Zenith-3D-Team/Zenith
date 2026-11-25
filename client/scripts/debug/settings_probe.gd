@@ -22,6 +22,7 @@ const ContactShade := preload("res://scripts/world/contact_shade.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const UiSettings := preload("res://scripts/ui/ui_settings.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 var main: Node
 var out_dir := ""
@@ -36,7 +37,7 @@ var _layer: CanvasLayer
 func _ready() -> void:
 	DirAccess.make_dir_recursive_absolute(out_dir)
 	await get_tree().create_timer(seconds).timeout
-	if "--settings-probe-verify" in OS.get_cmdline_user_args():
+	if Switches.has("--settings-probe-verify"):
 		await _verify()
 		_write("verify.txt")
 		get_tree().quit()
@@ -48,7 +49,7 @@ func _ready() -> void:
 	await _frames(60)
 	await _walk()
 	_write("report.txt")
-	if "--settings-probe-restart" in OS.get_cmdline_user_args():
+	if Switches.has("--settings-probe-restart"):
 		_write_restart_values()
 	get_tree().quit()
 
@@ -251,6 +252,7 @@ func _walk() -> void:
 	await _row("Graphics", "graphics", "grass_3d", "off", func() -> float: return main.decoratives.grass_range, 0.0, true)
 	await _row("Graphics", "graphics", "grass_3d", "far", func() -> float: return main.decoratives.grass_range, func(r: float) -> bool: return r >= 50.0, true)
 	await _row("Graphics", "graphics", "smog", 0.0, func() -> float: return main.pollution.strength(), 0.0)
+	await _row("Graphics", "graphics", "god_rays", 0.0, func() -> float: return main.god_rays.strength(), 0.0)
 	await _row("Graphics", "graphics", "look", "classic", func() -> String: return main.looks.current, "classic", true, 60)
 	# Advanced
 	for aa in ["off", "fxaa", "smaa", "taa", "msaa4"]:

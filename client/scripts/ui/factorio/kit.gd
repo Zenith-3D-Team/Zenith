@@ -21,6 +21,7 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const LayeredStyle := preload("res://scripts/ui/factorio/layered_style.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const SLOT := 40  # slot_size
 ## The pieces are baked at the size they are drawn, so nearest filtering keeps them sharp and stops
@@ -211,7 +212,7 @@ static var _icon_jobs := {}
 static var _icon_waiting: Array = []
 ## `--icons-later=off`: icon_into() reads an icon that isn't cached yet at once, on the main thread, as
 ## the hover panel always did (13-15 ms frames as the camera swept new kinds under a still cursor).
-static var icons_later := not OS.get_cmdline_user_args().has("--icons-later=off")
+static var icons_later := Switches.on("--icons-later")
 const ICON_META := &"kit_icon"
 
 
@@ -220,7 +221,7 @@ static func configure(window_height: float) -> void:
 		return
 	_scale_set = true
 	scale = scale_for(window_height)
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--ui-scale="):
 			scale = clampf(float(arg.get_slice("=", 1)), 0.5, 4.0)
 

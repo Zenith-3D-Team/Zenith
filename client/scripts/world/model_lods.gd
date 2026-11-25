@@ -32,6 +32,14 @@ extends RefCounted
 ## Welding and simplifying take up to ~25 ms a model, the checks about as much again; until a
 ## model's job is done its chunks draw it whole and it casts its own shadow.
 
+const Switches := preload("res://scripts/switches.gd")
+
+## --tree-shadow-decimate=off: keep all non-core leaf cards in tree shadow stand-ins (50% decimation off).
+static var tree_shadow_decimate: bool:
+	get:
+		return Job.decimate_cards
+	set(v):
+		Job.decimate_cards = v
 ## Surfaces smaller than this keep their own shadow and get no LODs: they would save next to nothing.
 const MIN_TRIANGLES := 200
 ## Jobs at once (terrain meshing shares the worker pool).
@@ -59,6 +67,9 @@ const BOUNDS_SLACK := 1.5
 const COPLANAR_EPS := 0.003
 const COPLANAR_SLACK := 0.0005
 const COPLANAR_SHARE := 0.1
+## Textured models: far-only LODs (TEXTURED_PIXELS) keep UV seams locked, so simplifying across
+## many UV charts adds tiny sub-pixel seam slivers; allow up to this share of total surface area.
+const TEXTURED_COPLANAR_AREA := 0.003
 ## Textured models: vertices whose normals differ by more than this (degrees) stay apart (hard edges).
 const TEXTURED_MERGE_ANGLE := 60.0
 ## Textured models: the least share of the model's triangles each level keeps (so at most this many
@@ -75,7 +86,23 @@ const TEXTURED_DENSE_FLOORS := [0.3, 0.15, 0.07]
 const TEXTURED_DENSE_PIXELS := [64.0, 32.0, 16.0]
 const TEXTURED_PX_PER_TRI := 4.0
 const TEXTURED_MAX_PIXELS := 256.0
-static var textured_density_lod := not ("--textured-lod=legacy" in OS.get_cmdline_user_args())
+static var textured_density_lod := not (Switches.has("--textured-lod=legacy"))
+## Heavy models (assembler 13.9k triangles, beacon 9.9k, roboport 9.8k, medium pole 2.5k): each
+## level's switch error is divided by sqrt(triangles / HEAVY_REF_TRIS), at most HEAVY_MAX_SCALE, so
+## the model drops to its lighter levels at a smaller size on screen (up close it is unchanged:
+## a model under HEAVY_REF_TRIS has no change). --heavy-lods=off keeps the old thresholds.
+const HEAVY_REF_TRIS := 1000.0
+const HEAVY_MAX_SCALE := 3.5
+## Textured models of at least this many triangles get a fourth, coarsest level (3% of the
+## triangles, switched in at a sixth of the first level's size, like the others by density).
+const HEAVY_EXTRA_TRIS := 8000
+const HEAVY_EXTRA_FLOOR := 0.03
+const HEAVY_EXTRA_PIXELS := 8.0
+static var heavy_lods: bool:
+	get:
+		return Job.heavy
+	set(v):
+		Job.heavy = v
 ## Card-level view LODs for trees: drop whole leaf cards evenly across the crown and scale the
 ## surviving ones about their own centres so normals and lighting stay steady without flicker.
 ## Each entry is [keep every Nth card, scale factor, High pixel switch height, Med/Low pixel floor,
@@ -87,7 +114,7 @@ const TREE_LOD_TIERS := [
 	[8, 1.65, 55.0, 85.0, 0.25],
 ]
 const TREE_MIN_CARDS := 8
-static var tree_lods := not ("--tree-lod=off" in OS.get_cmdline_user_args())
+static var tree_lods := Switches.on("--tree-lod")
 ## The custom channel formats in a surface's format, which add_surface_from_arrays needs again.
 const CUSTOM_FORMATS := 0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE
 ## Meta on an ArrayMesh holding its surfaces' arrays on the CPU (model_library.gd keeps them):
@@ -129,6 +156,11 @@ static func copy_material(source: ShaderMaterial) -> ShaderMaterial:
 		if source.has_meta(meta):
 			var value: Variant = source.get_meta(meta)
 			out.set_meta(meta, (value as Array).duplicate() if value is Array else value)
+	if source.has_meta(&"f3d_belt_reactive_pass"):
+		out.set_meta(&"f3d_belt_reactive_pass", source.get_meta(&"f3d_belt_reactive_pass"))
+		var ml: GDScript = load("res://scripts/world/model_library.gd")
+		if ml != null:
+			ml.register_belt_reactive_mat(out)
 	if source.shader == null:
 		return out
 	if not _uniforms.has(source.shader):
@@ -212,6 +244,8 @@ class Job:
 		for s in surfaces:
 			total_tris += (s[2] as PackedInt32Array).size() / 3 if s[2] != null else (s[0] as PackedVector3Array).size() / 3
 		var min_floor := float(TEXTURED_DENSE_FLOORS[-1]) if (textured and density_lod and total_tris >= TEXTURED_DENSE_TRIS) else float(TEXTURED_FLOORS[-1])
+		if textured and density_lod and Job.heavy and total_tris >= HEAVY_EXTRA_TRIS:
+			min_floor = HEAVY_EXTRA_FLOOR
 		for i in surfaces.size():
 			var s: Array = surfaces[i]
 			if tree_cards and crown.has(i) and not bool(crown[i]):
@@ -234,6 +268,9 @@ class Job:
 	## (factorio_material.gdshaderinc, in the shadow pass: radius 0.78-0.96 of the half side, about
 	## 0.59 of the square's area) as a square of the same area.
 	const CARD_SHADOW := 0.77
+	const CARD_SHADOW_DECIMATED := 0.985
+	static var heavy := Switches.on("--heavy-lods")
+	static var decimate_cards := Switches.on("--tree-shadow-decimate")
 
 	## A crown surface's triangles for its shadow stand-in (Job.run, on a worker): their positions, a
 	## card's corners drawn in to CARD_SHADOW of the way from its middle, and per vertex (the card's
@@ -253,12 +290,19 @@ class Job:
 		else:
 			for i in verts.size():
 				index.append(i)
+		var card_tri := 0
+		var scale := CARD_SHADOW_DECIMATED if decimate_cards else CARD_SHADOW
 		for t in range(0, index.size() - 2, 3):
 			var k := [index[t], index[t + 1], index[t + 2]]
 			var kind := 1.0 if all_core else 0.0
 			if not all_core and uvs.size() == verts.size():
 				var u0: float = uvs[k[0]].x
 				kind = 2.0 if u0 < -1.5 else (1.0 if u0 < -0.5 else 0.0)
+			if kind == 0.0:
+				var card_id := card_tri / 2
+				card_tri += 1
+				if decimate_cards and (card_id & 1) == 1:
+					continue
 			var seed: float = seeds[k[0]].y if seeds.size() == verts.size() else 0.0
 			var p := [verts[k[0]], verts[k[1]], verts[k[2]]]
 			if kind == 0.0 and uvs.size() == verts.size():
@@ -274,7 +318,7 @@ class Job:
 					var uv0: Vector2 = uvs[k[0]]
 					var middle: Vector3 = p[0] - ax * (uv0.x - 0.5) - ay * (uv0.y - 0.5)
 					for c in 3:
-						p[c] = middle + (p[c] - middle) * CARD_SHADOW
+						p[c] = middle + (p[c] - middle) * scale
 			for c in 3:
 				out_v.append(p[c])
 				out_uv.append(Vector2(seed, kind))
@@ -418,6 +462,49 @@ class ModelLodsMath:
 	## simplified corner is one of the surface's vertices, its UV with it. Material rows are kept
 	## apart the same way: each row's UVs are moved apart for the merging only. LODs under the last of
 	## TEXTURED_FLOORS, or that lose a part or the silhouette (Parts), are left out.
+	static func _textured_im_lods(arrays: Array, merge_angle: float, remap: PackedInt32Array, parts: Parts, least: int) -> Dictionary:
+		var im := ImporterMesh.new()
+		im.add_surface(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		im.generate_lods(merge_angle, merge_angle, [])
+		var out := {}
+		for l in im.get_surface_lod_count(0):
+			if out.size() >= MAX_LODS:
+				break
+			var lod := im.get_surface_lod_indices(0, l)
+			if lod.size() < maxi(least, 3):
+				continue
+			var as_welded := PackedInt32Array()
+			as_welded.resize(lod.size())
+			for k in lod.size():
+				as_welded[k] = remap[lod[k]]
+			var size := im.get_surface_lod_size(0, l)
+			if parts.kept_by(as_welded, size):
+				out[size] = lod
+		return out
+
+	static func _surface_area(surfaces: Array, indices: Array) -> float:
+		var area := 0.0
+		for i in surfaces.size():
+			var v: PackedVector3Array = surfaces[i][0]
+			var idx: PackedInt32Array = indices[i]
+			for t in range(0, idx.size() - 2, 3):
+				area += (v[idx[t + 1]] - v[idx[t]]).cross(v[idx[t + 2]] - v[idx[t]]).length() * 0.5
+		return area
+
+	static func _best_clean_size(surface: Array, lods: Dictionary, full_count: int, first_floor: int, own_limit: float) -> float:
+		var best := INF
+		var max_count := int(full_count * (1.0 - LEVEL_SAVING))
+		for sz in lods:
+			var li: PackedInt32Array = lods[sz]
+			if li.size() < first_floor or li.size() > max_count:
+				continue
+			var cov: PackedInt32Array = without_covered([surface], [li])[0]
+			if cov.size() < first_floor or cov.size() > max_count:
+				continue
+			if float(fights([surface], [cov])[0]) <= own_limit and float(sz) < best:
+				best = float(sz)
+		return best
+
 	static func textured_lods(src: PackedVector3Array, src_normals, src_idx, uv: PackedVector2Array, rows: Variant = null, min_floor := -1.0) -> Dictionary:
 		var idx: PackedInt32Array = src_idx if src_idx != null else PackedInt32Array(range(src.size()))
 		var normals: PackedVector3Array
@@ -436,28 +523,29 @@ class ModelLodsMath:
 		arrays[Mesh.ARRAY_NORMAL] = normals
 		arrays[Mesh.ARRAY_TEX_UV] = merge_uv
 		arrays[Mesh.ARRAY_INDEX] = idx
-		var im := ImporterMesh.new()
-		im.add_surface(Mesh.PRIMITIVE_TRIANGLES, arrays)
-		im.generate_lods(TEXTURED_MERGE_ANGLE, TEXTURED_MERGE_ANGLE, [])
 		var welded := weld([[src, src_normals, idx]])
 		var remap: PackedInt32Array = welded[2]
 		var parts := Parts.new(welded[0], welded[1])
 		var floor_share := min_floor if min_floor > 0.0 else float(TEXTURED_FLOORS[-1])
 		var least := int(idx.size() * floor_share)
-		var out := {}
-		for l in im.get_surface_lod_count(0):
-			if out.size() >= MAX_LODS:
-				break
-			var lod := im.get_surface_lod_indices(0, l)
-			if lod.size() < maxi(least, 3):
-				continue
-			var as_welded := PackedInt32Array()
-			as_welded.resize(lod.size())
-			for k in lod.size():
-				as_welded[k] = remap[lod[k]]
-			var size := im.get_surface_lod_size(0, l)
-			if parts.kept_by(as_welded, size):
-				out[size] = lod
+		var out := _textured_im_lods(arrays, TEXTURED_MERGE_ANGLE, remap, parts, least)
+		var first_floor := maxi(int(idx.size() * float(TEXTURED_FLOORS[0])), 3)
+		var surf := [src, src_normals, idx, rows]
+		var own_limit := float(fights([surf], [idx])[0]) * (1.0 + COPLANAR_SHARE) + COPLANAR_SLACK + _surface_area([surf], [idx]) * TEXTURED_COPLANAR_AREA
+		var best_sz := _best_clean_size(surf, out, idx.size(), first_floor, own_limit)
+		if best_sz > 0.5 or out.size() < 2:
+			# Hard-edged CAD/STL textured meshes (e.g. Wube3DP, baked Placeholders) can lock
+			# most vertices across 90-degree creases at TEXTURED_MERGE_ANGLE; try wider normal
+			# merge angles (still keeping UV islands and material rows strictly apart via
+			# ARRAY_TEX_UV) and only adopt one that passes the coplanar overlap check cleanly.
+			for angle: float in [75.0, 95.0, 120.0, 180.0]:
+				var cand := _textured_im_lods(arrays, angle, remap, parts, least)
+				var cand_sz := _best_clean_size(surf, cand, idx.size(), first_floor, own_limit)
+				if cand_sz < best_sz:
+					out = cand
+					best_sz = cand_sz
+					if best_sz <= 0.25 and out.size() >= 2:
+						break
 		return out
 
 	## The model's levels from its surfaces' LODs (surface_lods): for each level's error, every
@@ -489,10 +577,14 @@ class ModelLodsMath:
 		# Faces a model already has over each other (most are its own, partly overlapping) are simplified
 		# with it, a little more or less: what counts is overlap the level adds beyond that.
 		var base_fight := base * (1.0 + COPLANAR_SHARE)
+		var coplanar_limit := base_fight + COPLANAR_SLACK + (_surface_area(surfaces, full) * TEXTURED_COPLANAR_AREA if textured else 0.0)
 		var own_fights := {}  # surface -> the overlap of its own faces in the model (textured only)
 		var dense_tex := textured and density_lod and (full_count / 3) >= TEXTURED_DENSE_TRIS
 		var tex_floors: Array = TEXTURED_DENSE_FLOORS if dense_tex else TEXTURED_FLOORS
 		var tex_pixels: Array = TEXTURED_DENSE_PIXELS if dense_tex else TEXTURED_PIXELS
+		if dense_tex and Job.heavy and (full_count / 3) >= HEAVY_EXTRA_TRIS:
+			tex_floors = tex_floors + [HEAVY_EXTRA_FLOOR]
+			tex_pixels = tex_pixels + [HEAVY_EXTRA_PIXELS]
 		var out: Array = []
 		var previous: Array = full.duplicate()
 		var previous_count := full_count
@@ -507,7 +599,7 @@ class ModelLodsMath:
 				continue
 			chosen = without_covered(surfaces, chosen)
 			var fight := fights(surfaces, chosen)
-			if float(fight[0]) > base_fight + COPLANAR_SLACK and textured:
+			if float(fight[0]) > coplanar_limit and textured:
 				# A textured surface keeps its UV seams, so its simplifications fold more faces onto
 				# others: each surface found takes its coarsest LOD within the error that adds none
 				# of its own, before the whole is looked at again.
@@ -516,10 +608,10 @@ class ModelLodsMath:
 				fight = fights(surfaces, chosen)
 				if _count(chosen) > previous_count * (1.0 - LEVEL_SAVING):
 					continue
-			if float(fight[0]) > base_fight + COPLANAR_SLACK:
+			if float(fight[0]) > coplanar_limit:
 				for i: int in fight[1]:
 					chosen[i] = previous[i]
-				if float(fights(surfaces, chosen)[0]) > base_fight + COPLANAR_SLACK or _count(chosen) > previous_count * (1.0 - LEVEL_SAVING):
+				if float(fights(surfaces, chosen)[0]) > coplanar_limit or _count(chosen) > previous_count * (1.0 - LEVEL_SAVING):
 					continue
 			var pixel := 0.0
 			if textured:
@@ -546,7 +638,8 @@ class ModelLodsMath:
 	## surface's own overlap in the model.
 	static func _without_own_fights(surface: Array, lods: Dictionary, before: PackedInt32Array, error: float, own: Dictionary, i: int) -> PackedInt32Array:
 		if not own.has(i):
-			own[i] = float(fights([surface], [_indices_of(surface)])[0]) * (1.0 + COPLANAR_SHARE) + COPLANAR_SLACK
+			var full_i := _indices_of(surface)
+			own[i] = float(fights([surface], [full_i])[0]) * (1.0 + COPLANAR_SHARE) + COPLANAR_SLACK + _surface_area([surface], [full_i]) * TEXTURED_COPLANAR_AREA
 		var sizes: Array = []
 		for size in lods:
 			if float(size) <= error and (lods[size] as PackedInt32Array).size() < before.size():
@@ -1064,8 +1157,25 @@ static func level_for(model_levels: Array, current: int, allowed: float) -> int:
 static func switch_error(level: Array) -> float:
 	var error := float(level[1])
 	if level.size() > 2:
-		error = maxf(error, float(level[2]) * lod_threshold)
+		error = maxf(error, float(level[2]) * lod_threshold * distance_scale)
+	if level.size() > 3 and heavy_lods:
+		error /= maxf(float(level[3]), 1.0)
 	return error
+
+
+## How much sooner (smaller on screen) a heavy model switches to its levels: sqrt(triangles /
+## HEAVY_REF_TRIS), 1 to HEAVY_MAX_SCALE. Moving parts' meshes count as they are.
+static func heavy_scale(mesh: Mesh) -> float:
+	var tris := 0
+	var am := mesh as ArrayMesh
+	if am == null:
+		return 1.0
+	for i in am.get_surface_count():
+		var n: int = am.surface_get_array_index_len(i)
+		if n <= 0:
+			n = am.surface_get_array_len(i)
+		tris += n / 3
+	return clampf(sqrt(float(tris) / HEAVY_REF_TRIS), 1.0, HEAVY_MAX_SCALE)
 
 
 ## Whether a model brings textures of its own (a modeller's, FUE5's): a surface's material, or a row
@@ -1091,6 +1201,7 @@ static var lod_models := 0
 ## Main-thread time spent here (for --stutter-probe).
 static var main_usec := 0
 static var _material: ShaderMaterial
+static var _low_material: ShaderMaterial
 static var _leaf_material: ShaderMaterial
 ## The stand-ins' GeometryInstance3D.lod_bias away from the character (Level of detail setting,
 ## QUALITY's second value). Godot picks their LOD in the shadow pass by the main camera's distance, in
@@ -1117,10 +1228,24 @@ static var view_lods := true
 ## view's threshold over the bias). Their shadows are drawn once a frame and the error still grows with
 ## distance in tiles, so far chunks and long zooms stay cheap; the Shadows setting decides the rest.
 ## The third value is max_lines.
-const QUALITY := {"high": [1.0, 1.0, 1440.0], "medium": [4.0, 2.0, 1440.0], "low": [4.0, 0.5, 1080.0]}
+const QUALITY := {"high": [1.0, 1.0, 1440.0], "medium": [4.0, 2.0, 1440.0], "low": [7.5, 0.5, 1080.0],
+	"ultra": [0.75, 1.0, 2160.0]}
+const LOD_DIST_REF := 48.0
+const QUALITY_START_DIST := {"low": 24.0, "medium": 48.0, "high": 72.0, "ultra": 96.0}
+const QUALITY_DIST_SCALE := {"low": 0.52, "medium": 1.0, "high": 1.35, "ultra": 1.75}
+const LEGACY_LOW := [4.0, 0.5, 1080.0]
+static var old_low_lod := Switches.has("--lod-low=old")
+static var distance_scale := 1.0
+static var custom_distance := 0.0
 ## Before that (--legacy-render, the stutter probe's "legacy render").
 const LEGACY_THRESHOLDS := {"high": 1.0, "medium": 2.0, "low": 4.0}
-static var _legacy := "--legacy-render" in OS.get_cmdline_user_args()
+static var _legacy := Switches.has("--legacy-render")
+
+
+static func _quality_spec(quality: String) -> Array:
+	if old_low_lod and quality == "low":
+		return LEGACY_LOW
+	return QUALITY.get(quality, QUALITY["high"])
 
 
 ## The shadow stand-in for `mesh` (maybe still being made: see is_ready), or null when the model
@@ -1141,7 +1266,7 @@ static func proxy_for(mesh: Mesh) -> ArrayMesh:
 
 
 ## --no-part-levels: a modeller's baked moving parts drawn whole everywhere, as before (for comparing).
-static var part_levels := not ("--no-part-levels" in OS.get_cmdline_user_args())
+static var part_levels := not (Switches.has("--no-part-levels"))
 static var _part_textured := {}  # part mesh -> whether it gets levels
 
 
@@ -1192,6 +1317,44 @@ static func material() -> ShaderMaterial:
 		_material = ShaderMaterial.new()
 		_material.shader = preload("res://shaders/shadow_stand_in.gdshader")
 	return _material
+
+
+## The stand-ins' material on the low ground: lifted by the ground without its cliffs' terraces, as the
+## model it stands in for is (a cliff's rock: ModelLibrary.sits_low).
+static func low_material() -> ShaderMaterial:
+	if _low_material == null:
+		_low_material = ShaderMaterial.new()
+		_low_material.shader = preload("res://shaders/shadow_stand_in.gdshader")
+		_low_material.set_shader_parameter("ground_low", true)
+	return _low_material
+
+
+## The stand-in material for `model`: low_material() when it sits on the low ground, else material().
+static func material_for(model: Mesh) -> ShaderMaterial:
+	return low_material() if low_stand_ins and sits_low(model) else material()
+
+
+## What stands in for a model that sits on the low ground (its materials' ground_low: a cliff's rock,
+## model_library.gd _factorio) is lifted the same way: its shadow stand-in (here) and its far merge
+## (far_chunks.gd). Lifted by the terraced ground instead, a cliff's stand-in floated up to the terrace's
+## height (2.2 tiles with Terrain Elevation) over its rock and shaded all of it and the ground at its
+## foot, sunlit faces too. --cliff-low-shadow=old: as before.
+static var low_stand_ins := not (Switches.has("--cliff-low-shadow=old"))
+
+
+## Whether `mesh` sits on the low ground: one of its materials (or a merged one's rows) has ground_low.
+static func sits_low(mesh: Mesh) -> bool:
+	if mesh == null:
+		return false
+	for i in mesh.get_surface_count():
+		var m := mesh.surface_get_material(i)
+		var all: Array = [m]
+		if m != null and m.has_meta(ROWS_META):
+			all.append_array(m.get_meta(ROWS_META))
+		for row in all:
+			if row is ShaderMaterial and (row as ShaderMaterial).get_shader_parameter("ground_low") == true:
+				return true
+	return false
 
 
 ## A tree crown's stand-in material: as material(), dropping the leaves and cores pollution took
@@ -1263,7 +1426,7 @@ static func poll() -> bool:
 	var t0 := Time.get_ticks_usec()
 	if not _finish_arg_read:
 		_finish_arg_read = true
-		for a in OS.get_cmdline_user_args():
+		for a in Switches.args():
 			if a.begins_with("--lods-finish-usec="):
 				finish_usec = maxi(0, int(a.substr(19)))
 	var done := false
@@ -1290,7 +1453,7 @@ static func poll() -> bool:
 				arrays[Mesh.ARRAY_NORMAL] = job.normals
 				arrays[Mesh.ARRAY_INDEX] = job.indices
 				proxy.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], job.lods)
-				proxy.surface_set_material(proxy.get_surface_count() - 1, material())
+				proxy.surface_set_material(proxy.get_surface_count() - 1, material_for(entry[3] as Mesh))
 			if job.crown_vertices.size() >= 3:
 				var crown := []
 				crown.resize(Mesh.ARRAY_MAX)
@@ -1334,6 +1497,7 @@ static func _make_levels(mesh: ArrayMesh, made: Array) -> void:
 	if mesh == null or made.is_empty():
 		return
 	var out: Array = []
+	var scale := heavy_scale(mesh)
 	var box := mesh.get_aabb()
 	# A moving part's bounds over its whole motion (anim.gd setup_part, a baked part's bones).
 	if mesh.custom_aabb.has_volume():
@@ -1349,7 +1513,7 @@ static func _make_levels(mesh: ArrayMesh, made: Array) -> void:
 			lod.surface_set_name(i, mesh.surface_get_name(i))
 		lod.custom_aabb = box
 		lod.resource_name = mesh.resource_name
-		out.append([lod, float(level[0]), float(level[2]) if level.size() > 2 else 0.0])
+		out.append([lod, float(level[0]), float(level[2]) if level.size() > 2 else 0.0, scale])
 	_levels[mesh] = out
 	level_generation += 1
 	lod_models += 1
@@ -1387,16 +1551,28 @@ static func finish_all() -> void:
 			entry[0] = -1
 
 
-## Settings > Graphics > Level of detail.
-static func apply_quality(quality: String, viewport: Viewport) -> void:
-	var q: Array = QUALITY.get(quality, QUALITY["high"])
-	lod_bias = q[1]
-	lod_threshold = q[0]
-	max_lines = float(q[2])
-	for arg in OS.get_cmdline_user_args():
+## Settings > Graphics > Level of detail (and optional custom LOD falloff distance in tiles).
+static func apply_quality(quality: String, viewport: Viewport, lod_dist := 0.0) -> void:
+	var prev_thresh := lod_threshold
+	var prev_scale := distance_scale
+	custom_distance = maxf(lod_dist, 0.0)
+	_quality = quality
+	if custom_distance > 0.0:
+		distance_scale = clampf(custom_distance / LOD_DIST_REF, 0.2, 4.0)
+		lod_threshold = clampf(4.0 / distance_scale, 0.5, 16.0)
+		lod_bias = clampf(2.0 * distance_scale, 0.35, 2.0)
+		max_lines = 1080.0 if custom_distance <= 32.0 else (2160.0 if custom_distance >= 88.0 else 1440.0)
+	else:
+		var q := _quality_spec(quality)
+		lod_bias = float(q[1])
+		lod_threshold = float(q[0])
+		max_lines = float(q[2])
+		distance_scale = 1.0 if (old_low_lod and quality == "low") else float(QUALITY_DIST_SCALE.get(quality, 1.0))
+	for arg in Switches.args():
 		if arg.begins_with("--lod-lines="):
 			max_lines = maxf(float(arg.get_slice("=", 1)), 0.0)
-	_quality = quality
+	if not is_equal_approx(lod_threshold, prev_thresh) or not is_equal_approx(distance_scale, prev_scale):
+		level_generation += 1
 	fit_lines(viewport)
 
 
@@ -1422,11 +1598,10 @@ static func counted_lines(lines: float) -> float:
 static func fit_lines(viewport: Viewport) -> void:
 	if viewport == null:
 		return
-	var q: Array = QUALITY.get(_quality, QUALITY["high"])
 	if full_detail:
 		viewport.mesh_lod_threshold = 0.0
 	elif _legacy:
 		viewport.mesh_lod_threshold = float(LEGACY_THRESHOLDS.get(_quality, 1.0))
 	else:
 		var lines := float((viewport as Window).size.y) if viewport is Window else viewport.get_visible_rect().size.y
-		viewport.mesh_lod_threshold = float(q[0]) * maxf(lines, 1.0) / counted_lines(lines)
+		viewport.mesh_lod_threshold = lod_threshold * maxf(lines, 1.0) / counted_lines(lines)

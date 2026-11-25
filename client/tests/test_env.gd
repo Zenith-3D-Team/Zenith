@@ -6,7 +6,8 @@ extends RefCounted
 ## config.ini and mods folder (246 zips once broke 63 checks).
 ##
 ## The Factorio install itself is still found (Steam's, through the registry): some checks read its
-## real pictures when there is one, and all of them pass without one, as in CI.
+## real pictures when there is one, and all of them pass without one, as in CI. Passing
+## `-- --no-factorio` hides a local Factorio install so tests run the same no-install path as CI.
 
 const Paths := preload("res://scripts/menu/paths.gd")
 
@@ -34,6 +35,10 @@ static func isolate(test_name: String) -> void:
 	Paths.user_data_dir = OS.get_user_data_dir()
 	# Godot's own log stays where it was opened: a stand-in for what reads user://logs (bug_report.gd).
 	FileAccess.open("user://logs/godot.log", FileAccess.WRITE).store_string("a test run\n")
+	if "--no-factorio" in OS.get_cmdline_user_args():
+		var icons = load("res://scripts/world/item_icons.gd")
+		icons.data_dir = ""
+		icons._searched = true
 
 
 ## A modeller's models folder for the checks that read one (Vasillo's files are never in the repo):

@@ -872,6 +872,7 @@ func _sprite_arms() -> void:
 		arms.eprops = {1: ends, 2: {"x": {"ip": [0, -2], "id": [0, 2.2], "rs": 0.02, "es": 0.05}}}
 		var belts := StubBelts.new()
 		arms.belts = belts
+		arms.keep_sprite_xf = true  # (the native path keeps the sprite arms' transforms only when asked)
 		arms._ready()  # (not in the tree yet under _init: its parts made here)
 		arms.handle_events({"t": "ie", "k": 100, "n": 6, "p": 2, "part": 1, "parts": 1,
 			"l": [Swing.Ev.SYNC, 77, 100, 0, 0, 0, roundi(at_pick.x), roundi(at_pick.y), 0]})

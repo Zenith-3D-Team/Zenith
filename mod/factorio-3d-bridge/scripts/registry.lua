@@ -140,6 +140,13 @@ local function build()
   c.fluid_types = existing(FLUID_TYPES, c.present)
   c.electric_types = existing(ELECTRIC_TYPES, c.present)
   c.mover_types = existing(MOVER_TYPES, c.present)
+  local other_movers = {}
+  for _, t in ipairs(c.mover_types) do
+    if t ~= "logistic-robot" and t ~= "construction-robot" then
+      other_movers[#other_movers + 1] = t
+    end
+  end
+  c.other_mover_types = other_movers
   c.animated_types = existing(ANIMATED_TYPES, c.present)
   c.belt_types = existing(BELT_TYPES, c.present)
   c.rail_types = existing(RAIL_TYPES, c.present)
@@ -227,6 +234,10 @@ end
 
 function M.mover_types()
   return get().mover_types
+end
+
+function M.other_mover_types()
+  return get().other_mover_types
 end
 
 function M.belt_types()

@@ -15,10 +15,19 @@ const float SHADOW_HEIGHT = 0.03;
 
 void vertex() {
 	MoverState s = mover_state(int(INSTANCE_CUSTOM.r + 0.5));
-	s.pos = vec3(s.pos.x + SHADOW_OFFSET.x, SHADOW_HEIGHT, s.pos.z + SHADOW_OFFSET.z);
 	vec3 v = vec3(VERTEX.x, VERTEX.y * SHADOW_SQUASH, VERTEX.z);
-	vec3 n = NORMAL;
-	mover_place(v, n, s, MODEL_MATRIX[3].xyz);
+	if (INSTANCE_CUSTOM.g > 0.5) {
+		if (mover_flag(s.flags, 2.0)) {
+			v = vec3(0.0);
+		} else {
+			vec3 world_off = vec3(SHADOW_OFFSET.x, SHADOW_HEIGHT - s.pos.y, SHADOW_OFFSET.z);
+			v += transpose(mat3(MODEL_MATRIX)) * world_off;
+		}
+	} else {
+		s.pos = vec3(s.pos.x + SHADOW_OFFSET.x, SHADOW_HEIGHT, s.pos.z + SHADOW_OFFSET.z);
+		vec3 n = NORMAL;
+		mover_place(v, n, s, MODEL_MATRIX[3].xyz);
+	}
 	VERTEX = ground_lift(v, MODEL_MATRIX);
 }
 

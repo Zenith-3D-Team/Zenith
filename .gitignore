@@ -3,10 +3,16 @@ __pycache__/
 
 # Downloaded source art (Wube's printable STLs); the converted .glb files are committed
 art-src/
+docs/tracker/meshes.json
+# Screenshots of models wearing Factorio's textures: only for the owner's private dashboard
+docs/tracker/shots/
+docs/tracker/meshes*.json
 dist/
 
 # UI reference capture: its own Factorio config, write-data and save copies
 tools/ui_reference/run/
+docs/tracker/github.json
+docs/tracker/usage.json
 
 # The modellers' folder (models/ beside Zenith): models being tried, not the project's own
 /models/

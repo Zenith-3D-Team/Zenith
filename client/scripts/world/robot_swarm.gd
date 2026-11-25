@@ -17,10 +17,12 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const VehicleAnim := preload("res://scripts/world/vehicle_anim.gd")
 const MoverRecords := preload("res://scripts/world/mover_records.gd")
+const Settings := preload("res://scripts/menu/settings.gd")
 const RobotShader := preload("res://shaders/factorio_material_robot.gdshader")
 const RobotAlphaShader := preload("res://shaders/factorio_material_robot_alpha.gdshader")
 const ShadowShader := preload("res://shaders/robot_shadow.gdshader")
 const Probing := preload("res://scripts/debug/probing.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## The robots drawn here: their models' parts are all this knows how to move. Combat robots have a
 ## body only and don't bob (vehicle_anim.gd never rigged them); capture robots' cables stay nodes.
@@ -68,13 +70,14 @@ var vehicles: Node
 var records: MoverRecords
 
 ## False with --robot-nodes: robots are drawn the old way, a node each (for comparing).
-static var enabled := not OS.get_cmdline_user_args().has("--robot-nodes")
+static var enabled := not Switches.has("--robot-nodes")
 ## The last frame's draw time, microseconds (--robot-probe).
 var draw_usec := 0
 
 var _batches := {}  # proto name -> Batch
 var _shadow_material: ShaderMaterial
 var _look := 0.0
+var _mv_active := false
 
 
 ## Whether robots of this prototype are drawn here (their model must be ready).
@@ -167,6 +170,7 @@ func clear() -> void:
 			bot.batch = null
 		batch.bots.clear()
 	_batches.clear()
+	_mv_active = false
 
 
 func _notification(what: int) -> void:
@@ -247,10 +251,46 @@ func _draw(delta: float) -> void:
 	var look := _look <= 0.0
 	if look:
 		_look = WORK_LOOK
+	var vp: Viewport = get_viewport() if is_inside_tree() else null
+	var want_mv := records != null and Settings.temporal_aa_active(vp)
+	var c_even := 0.0
+	var c_odd := 0.0
+	var inv_rate := 1.0 / 60.0
+	if want_mv:
+		var cl := records.clocks()
+		c_even = MoverRecords._f32(cl.x)
+		c_odd = MoverRecords._f32(cl.y)
+		inv_rate = 1.0 / maxf(records.rate, 1.0)
 	for batch: Batch in _batches.values():
 		var n := batch.bots.size()
 		if n > batch.capacity:
 			_grow(batch, n)
+		if want_mv and n > 0:
+			var nat := MoverRecords.native()
+			if nat != null:
+				var slots := PackedInt32Array()
+				slots.resize(n)
+				for i in n:
+					slots[i] = (batch.bots[i] as Bot).record
+				batch.buffer = nat.write_xforms(records.data, slots, n, batch.buffer, c_even, c_odd, inv_rate, 0)
+				if nat.skipped() > 0:
+					for i in n:
+						if slots[i] < 0:
+							_write_instance(batch, i, slots[i])
+			else:
+				for i in n:
+					var bot: Bot = batch.bots[i]
+					if bot.record >= 0:
+						records.write_xform(bot.record, batch.buffer, i * STRIDE, c_even, c_odd, inv_rate)
+						batch.buffer[i * STRIDE + 12] = float(bot.record)
+						batch.buffer[i * STRIDE + 13] = 1.0
+					else:
+						_write_instance(batch, i, bot.record)
+			batch.dirty = true
+		elif _mv_active and not want_mv and n > 0:
+			for i in n:
+				_write_instance(batch, i, batch.bots[i].record)
+			batch.dirty = true
 		if batch.dirty:
 			batch.dirty = false
 			for mmi in batch.parts:
@@ -271,6 +311,8 @@ func _draw(delta: float) -> void:
 			var end := mini(batch.sweep + CARGO_SLICE, n)
 			for i in range(batch.sweep, end):
 				var bot: Bot = batch.bots[i]
+				if bot.record >= 0 and (int(records.data[bot.record * MoverRecords.FLOATS + 12]) & MoverRecords.SIMULATED) != 0:
+					continue
 				var has := cargo.has(bot.unit)
 				if has != bot.cargo:
 					bot.cargo = has
@@ -278,6 +320,7 @@ func _draw(delta: float) -> void:
 			batch.sweep = end if end < n else 0
 		if look and batch.kind == "construction":
 			_sparks(batch, WORK_LOOK)
+	_mv_active = want_mv
 
 
 ## Construction robots standing still for VehicleAnim.WORK_STILL work: sparks fly from their nozzle
@@ -292,15 +335,24 @@ func _sparks(batch: Batch, step: float) -> void:
 	for bot in batch.bots:
 		if bot.hidden or bot.record < 0:
 			continue
+		var o := bot.record * MoverRecords.FLOATS
+		var flags := int(d[o + 12])
+		if (flags & MoverRecords.SIMULATED) != 0 and (flags & MoverRecords.SIM_WORKING) == 0:
+			continue
 		if (records.tick - records.last_tick(bot.record)) / rate <= VehicleAnim.WORK_STILL:
 			continue
 		bot.spark -= step
 		if bot.spark > 0.0:
 			continue
 		bot.spark = VehicleAnim.SPARK_EVERY * randf_range(0.6, 1.4)
-		var o := bot.record * MoverRecords.FLOATS
-		var yaw: float = d[o + 17]
-		var at := Vector3(d[o + 6], d[o + 13], d[o + 7])
+		var yaw: float
+		var at: Vector3
+		if (flags & MoverRecords.SIMULATED) != 0:
+			at = records.position(bot.record)
+			yaw = records.yaw_at(bot.record, records.tick)
+		else:
+			yaw = d[o + 17]
+			at = Vector3(d[o + 6], d[o + 13], d[o + 7])
 		sprites.call("emit", "sparks", at + Vector3(-0.35 * sin(yaw), 0.0, -0.35 * cos(yaw)), 0.45, 0.35)
 
 

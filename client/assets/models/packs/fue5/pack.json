@@ -6,5 +6,6 @@
 	"credit": "FUE5 (Hurricane and Nuke) · CC BY-NC-SA 3.0 · adapted",
 	"description": "Textured models from FUE5, a fan remake of Factorio in Unreal Engine 5: machines, chests, poles, combinators, trains, the rocket silo and more. Not for commercial use, and shared only under the same licence; README.md says what was changed.",
 	"icon": "locomotive",
-	"icon_image": "logo.png"
+	"icon_image": "logo.png",
+	"shading": "pbr"
 }

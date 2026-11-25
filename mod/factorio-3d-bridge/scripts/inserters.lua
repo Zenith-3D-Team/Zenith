@@ -27,13 +27,16 @@ local transport = require("scripts.transport")
 local world = require("scripts.world")
 local map = require("scripts.map")
 local rate = require("scripts.rate")
+local perf = require("scripts.perf")
 local tracker = require("scripts.tracker")
 local belt_sim = require("scripts.belt_sim")
+local budget = require("scripts.budget")
 
 local M = {}
 
 local HANDS_PER_MESSAGE = 300
 local EVENTS_PER_MESSAGE = 400
+local NEAR_INSERTER_RADIUS = 12
 -- Numbers an `ie` record holds (docs/PROTOCOL.md).
 local EVENT_WIDTH = 9
 -- A chunk's inserters are searched for again after this many ticks (something built without an
@@ -95,7 +98,8 @@ end
 M.options = O
 
 -- What has been read and sent since loading: /f3d-ih says, and tests read them.
-M.counts = { checks = 0, ticks = 0, events = 0, sends = 0, bytes = 0, searches = 0, syncs = 0, probes = 0, carried = 0 }
+M.counts = { checks = 0, ticks = 0, events = 0, sends = 0, bytes = 0, searches = 0, syncs = 0, probes = 0, carried = 0,
+  look_slices = 0 }
 
 -- --- module state (see the top: nothing in storage) ----------------------------------------------
 
@@ -107,6 +111,7 @@ local events = {}       -- pending {tick, record} (sent O.repeat times over O.ev
 local inside = {}       -- unit -> true: in the focus square now
 local order = {}        -- the units inside, by chunk (the `ih` samples' order)
 local square            -- {fx, fy, r, si, tick}: the square last looked over
+local look_job          -- active sliced look_over scan when inserter_look_budget is on
 local client_seen       -- storage.f3d.client the state was made for
 local events_were = false
 local last_heartbeat = 0
@@ -123,7 +128,7 @@ local function code_of(status)
 end
 
 local function reset()
-  S, chunks, dirty, due, events, inside, order, square = {}, {}, {}, {}, {}, {}, {}, nil
+  S, chunks, dirty, due, events, inside, order, square, look_job = {}, {}, {}, {}, {}, {}, {}, nil, nil
 end
 M.reset = reset
 
@@ -286,31 +291,16 @@ end
 
 -- Looks the focus square over: the inserters in it now (found ones get their first check next
 -- tick), those gone from it said so. Every SQUARE_TICKS, when the focus moved, and when a chunk
--- is dirty.
-local function look_over(surface, f, r, now)
-  local fx, fy = f.x, f.y
-  local moved = not square or square.si ~= surface.index or math.abs(square.fx - fx) >= 0.5 or math.abs(square.fy - fy) >= 0.5 or square.r ~= r
-  if square and not moved and now - square.tick < SQUARE_TICKS and not next(dirty) then
-    return
-  end
-  square = { fx = fx, fy = fy, r = r, si = surface.index, tick = now }
-  local seen = map.view_filter()
-  local now_inside, new_order = {}, {}
-  for cy = math.floor((fy - r) / 32), math.floor((fy + r) / 32) do
-    for cx = math.floor((fx - r) / 32), math.floor((fx + r) / 32) do
-      for _, entry in ipairs(chunk_list(surface, cx, cy, now)) do
-        local x, y = entry[3], entry[4]
-        if math.abs(x - fx) <= r and math.abs(y - fy) <= r and (not seen or seen(x, y)) and entry[1].valid then
-          local u = entry[2]
-          now_inside[u] = true
-          new_order[#new_order + 1] = u
-          if not S[u] then
-            found(entry, now)
-          end
-        end
-      end
-    end
-  end
+-- is dirty. With inserter_look_budget, chunks order nearest-first and fresh searches + describe()
+-- slice across ticks using read-only budget.left() (module-local state never mutates storage).
+local LOOK_CHUNK_COST = 15
+local LOOK_ENTRY_COST = 1
+local LOOK_CACHED_COST = 0.05
+local LOOK_MIN_UNITS = 40
+local LOOK_MAX_UNITS = 200
+local LOOK_MAX_SEARCHES = 4
+
+local function finish_look(now_inside, new_order, visited, now)
   for u in pairs(inside) do
     if not now_inside[u] and S[u] then
       S[u] = nil
@@ -319,10 +309,138 @@ local function look_over(surface, f, r, now)
   end
   -- (Dirty chunks outside the square: searched afresh when they come in.)
   for key in pairs(dirty) do
-    chunks[key] = nil
+    if not visited or not visited[key] then
+      chunks[key] = nil
+      dirty[key] = nil
+    end
   end
-  dirty = {}
   inside, order = now_inside, new_order
+end
+
+local function look_over(surface, f, r, now)
+  local fx, fy = f.x, f.y
+  if not perf.on("inserter_look_budget") then
+    look_job = nil
+    local moved = not square or square.si ~= surface.index or math.abs(square.fx - fx) >= 0.5 or math.abs(square.fy - fy) >= 0.5 or square.r ~= r
+    if square and not moved and now - square.tick < SQUARE_TICKS and not next(dirty) then
+      return
+    end
+    square = { fx = fx, fy = fy, r = r, si = surface.index, tick = now }
+    local seen = map.view_filter()
+    local now_inside, new_order = {}, {}
+    for cy = math.floor((fy - r) / 32), math.floor((fy + r) / 32) do
+      for cx = math.floor((fx - r) / 32), math.floor((fx + r) / 32) do
+        for _, entry in ipairs(chunk_list(surface, cx, cy, now)) do
+          local x, y = entry[3], entry[4]
+          if math.abs(x - fx) <= r and math.abs(y - fy) <= r and (not seen or seen(x, y)) and entry[1].valid then
+            local u = entry[2]
+            now_inside[u] = true
+            new_order[#new_order + 1] = u
+            if not S[u] then
+              found(entry, now)
+            end
+          end
+        end
+      end
+    end
+    finish_look(now_inside, new_order, nil, now)
+    return
+  end
+
+  if look_job then
+    local j = look_job
+    if j.si ~= surface.index or j.r ~= r
+        or math.abs(j.fx - fx) >= math.max(8, r / 2)
+        or math.abs(j.fy - fy) >= math.max(8, r / 2) then
+      look_job = nil
+    end
+  end
+  if not look_job then
+    local moved = not square or square.si ~= surface.index or math.abs(square.fx - fx) >= 0.5 or math.abs(square.fy - fy) >= 0.5 or square.r ~= r
+    if square and not moved and now - square.tick < SQUARE_TICKS and not next(dirty) then
+      return
+    end
+    local clist = {}
+    for cy = math.floor((fy - r) / 32), math.floor((fy + r) / 32) do
+      for cx = math.floor((fx - r) / 32), math.floor((fx + r) / 32) do
+        local dist = math.max(math.abs(cx * 32 + 16 - fx), math.abs(cy * 32 + 16 - fy))
+        clist[#clist + 1] = { cx, cy, dist }
+      end
+    end
+    table.sort(clist, function(a, b)
+      if a[3] ~= b[3] then return a[3] < b[3] end
+      if a[2] ~= b[2] then return a[2] < b[2] end
+      return a[1] < b[1]
+    end)
+    look_job = { fx = fx, fy = fy, r = r, si = surface.index, list = clist, ci = 1, ei = 1,
+      now_inside = {}, new_order = {}, seen_u = {}, visited = {} }
+  end
+
+  local job = look_job
+  local seen = map.view_filter()
+  local left = budget.left()
+  local unit_cap = math.max(LOOK_MIN_UNITS, math.min(LOOK_MAX_UNITS, math.floor(math.max(0, left))))
+  local search_cap = left <= 0 and 1 or LOOK_MAX_SEARCHES
+  local spent, searches = 0, 0
+  while job.ci <= #job.list and spent < unit_cap do
+    if not job.cur then
+      local c = job.list[job.ci]
+      local key = surface.index .. ":" .. chunk_key(c[1] * 32, c[2] * 32)
+      local cached = chunks[key]
+      local needs_search = not cached or dirty[key] or now - cached.tick >= CHUNK_REFRESH
+      if needs_search and searches > 0 and (searches >= search_cap or spent + LOOK_CHUNK_COST > unit_cap) then
+        break
+      end
+      if needs_search then
+        searches = searches + 1
+        spent = spent + LOOK_CHUNK_COST
+      end
+      job.visited[key] = true
+      job.cur = chunk_list(surface, c[1], c[2], now)
+      job.ei = 1
+    end
+    local cur = job.cur
+    while job.ei <= #cur do
+      local entry = cur[job.ei]
+      local u = entry[2]
+      if not S[u] and spent > 0 and spent + LOOK_ENTRY_COST > unit_cap then
+        break
+      end
+      job.ei = job.ei + 1
+      local x, y = entry[3], entry[4]
+      if math.abs(x - job.fx) <= job.r and math.abs(y - job.fy) <= job.r and (not seen or seen(x, y)) and entry[1].valid then
+        if not job.seen_u[u] then
+          job.seen_u[u] = true
+          job.now_inside[u] = true
+          job.new_order[#job.new_order + 1] = u
+          if not S[u] then
+            found(entry, now)
+            spent = spent + LOOK_ENTRY_COST
+          else
+            spent = spent + LOOK_CACHED_COST
+          end
+        end
+      else
+        spent = spent + LOOK_CACHED_COST
+      end
+      if spent >= unit_cap and job.ei <= #cur then
+        break
+      end
+    end
+    if job.ei > #cur then
+      job.cur = nil
+      job.ci = job.ci + 1
+    else
+      break
+    end
+  end
+  if job.ci <= #job.list then
+    M.counts.look_slices = M.counts.look_slices + 1
+    return
+  end
+  square = { fx = job.fx, fy = job.fy, r = job.r, si = job.si, tick = now }
+  finish_look(job.now_inside, job.new_order, job.visited, now)
+  look_job = nil
 end
 
 -- --- the checks ----------------------------------------------------------------------------------
@@ -426,145 +544,37 @@ local function wait(st, now, at_pick)
   schedule(st, now + st.idle_gap)
 end
 
-local function check(st, now)
-  local e = st.e
-  if not e.valid then
-    S[st.u] = nil
-    inside[st.u] = nil
-    emit(st, GONE, now, 0, 0, 0)
-    return
+local function check_sync_or_slow(st, now, e, cnt, item, code, sync, probe, hx, hy, px, py)
+  if not (sync or probe or (SLOW[code] and not hx)) then
+    return hx, hy, px, py
   end
-  M.counts.checks = M.counts.checks + 1
-  local stack = e.held_stack
-  local cnt = stack.valid_for_read and stack.count or 0
-  local item = st.item
-  if cnt > 0 and (st.cnt <= 0 or cnt ~= st.cnt) then
-    item = registry.item_id(stack.name)
-  elseif cnt == 0 then
-    item = 0
-  end
-  local code = code_of(e.status)
-  local was, was_code, was_item = st.cnt, st.st, st.item
-  local unc = (st.pred == now or now - st.last <= 1) and 0 or now - st.last - 1
-  if st.recheck then
-    st.recheck = nil
-    describe(st)
-  end
-  local sync = st.sync_at and now >= st.sync_at
-  local probe = st.probe and now >= st.probe
-  if probe then
-    st.probe = nil
-  end
-  st.cnt, st.st, st.item, st.last = cnt, code, item, now
-  local hx, hy, px, py
-  if was < 0 then
-    -- First seen: its position, what it holds and its status: the client's starting point.
+  if not hx then
     hx, hy, px, py = hand_fixed(e)
+  end
+  if sync then
     emit(st, SYNC, now, cnt, item, code, hx, hy, 0)
     M.counts.syncs = M.counts.syncs + 1
     st.sync_at = now + O.resync + st.u % 60
-    sync = false
-  elseif cnt > was then
-    hx, hy, px, py = hand_fixed(e)
-    emit(st, PICKED, now, cnt, item, unc, hx, hy, st.pu)
-  elseif cnt < was then
-    hx, hy, px, py = hand_fixed(e)
-    emit(st, DROPPED, now, cnt, was_item, unc, hx, hy, st.du)
-    local client = storage.f3d.client
-    if st.du ~= 0 and client and client.ho then
-      pcall(placed, st, now, px, py, was - cnt)
+    describe(st)
+  elseif probe then
+    emit(st, SYNC, now, cnt, item, code, hx, hy, 1)  -- (belt 1: a mid-swing probe)
+    M.counts.probes = M.counts.probes + 1
+    -- (A probe that found the hand still at an end (it waited there before setting off) says
+    -- nothing of the side: another on the next leg.)
+    local near_end = st.ppx and (math.abs(px - st.ppx) + math.abs(py - st.ppy) < 0.5 or math.abs(px - st.dpx) + math.abs(py - st.dpy) < 0.5)
+    if near_end then
+      st.probes = st.probes + 1
     end
+  elseif hx ~= st.slow_x or hy ~= st.slow_y then
+    -- (Slow: its position whenever it moved since the last; one standing still is checked less
+    -- and less often, up to O.idle, a change waking it.)
+    emit(st, SYNC, now, cnt, item, code, hx, hy, 0)
+    M.counts.syncs = M.counts.syncs + 1
   end
-  if code ~= was_code and was >= 0 then
-    -- (With a pick or drop too: a hand that took but waits where it is, its destination full, says
-    -- so, and the client holds it there until the status says it works.)
-    if not hx then
-      hx, hy, px, py = hand_fixed(e)
-    end
-    emit(st, STATUS, now, cnt, item, code, hx, hy, 0)
-  end
-  if sync or probe or (SLOW[code] and not hx) then
-    if not hx then
-      hx, hy, px, py = hand_fixed(e)
-    end
-    if sync then
-      emit(st, SYNC, now, cnt, item, code, hx, hy, 0)
-      M.counts.syncs = M.counts.syncs + 1
-      st.sync_at = now + O.resync + st.u % 60
-      describe(st)
-    elseif probe then
-      emit(st, SYNC, now, cnt, item, code, hx, hy, 1)  -- (belt 1: a mid-swing probe)
-      M.counts.probes = M.counts.probes + 1
-      -- (A probe that found the hand still at an end (it waited there before setting off) says
-      -- nothing of the side: another on the next leg.)
-      local near_end = st.ppx and (math.abs(px - st.ppx) + math.abs(py - st.ppy) < 0.5 or math.abs(px - st.dpx) + math.abs(py - st.dpy) < 0.5)
-      if near_end then
-        st.probes = st.probes + 1
-      end
-    elseif hx ~= st.slow_x or hy ~= st.slow_y then
-      -- (Slow: its position whenever it moved since the last; one standing still is checked less
-      -- and less often, up to O.idle, a change waking it.)
-      emit(st, SYNC, now, cnt, item, code, hx, hy, 0)
-      M.counts.syncs = M.counts.syncs + 1
-    end
-  end
-  -- What next.
-  if SLOW[code] then
-    if st.mode == "slow" and hx == st.slow_x and hy == st.slow_y then
-      st.slow_gap = math.min(O.idle, (st.slow_gap or SLOW_TICKS) * 2)
-    else
-      st.slow_gap = SLOW_TICKS
-    end
-    st.slow_x, st.slow_y = hx, hy
-    st.mode = "slow"
-    st.pred = nil
-    schedule(st, now + st.slow_gap)
-    return
-  end
-  st.slow_x, st.slow_y = nil, nil
-  if cnt ~= was or code ~= was_code then
-    st.since = nil  -- (something happened: the wait at a belt starts over)
-  end
-  if was < 0 then
-    -- (Its hand's phase isn't known yet: holding, it is on its way to the drop or waiting there;
-    -- empty, the other way. Checked as if it just set off: when it arrives nothing has changed
-    -- and it waits, or something changed before.)
-    set_off(st, now, px, py)
-    if cnt > 0 and st.cap > 1 then
-      st.mode = "collect"
-      st.pred = nil
-      st.collect_from = now
-      st.hx, st.hy = px, py
-      schedule(st, now + O.chase)
-    end
-    return
-  end
-  if cnt > was then
-    if st.cap > 1 and cnt < st.cap and st.mode ~= "to_drop" then
-      -- A hand that takes several (bulk, stack): more may come before it leaves, so it is checked
-      -- every O.chase ticks until half a leg has passed with no more, then as one set off.
-      st.mode = "collect"
-      st.pred = nil
-      st.collect_from = now
-      st.hx, st.hy = px, py
-      schedule(st, now + O.chase)
-    else
-      set_off(st, now, px, py)
-    end
-    return
-  end
-  if cnt < was then
-    if cnt == 0 then
-      set_off(st, now, px, py)
-    else
-      -- Dropping one a tick onto a belt (or part of a hand into a nearly full machine).
-      st.mode = "drop_wait"
-      st.pred = nil
-      schedule(st, now + O.chase)
-    end
-    return
-  end
-  -- Nothing changed hands.
+  return hx, hy, px, py
+end
+
+local function check_idle_leg(st, now, e, cnt, item, code, was_code, hx, hy, px, py)
   local mode = st.mode
   if mode == "collect" then
     if code == CODE_MORE then
@@ -638,6 +648,123 @@ local function check(st, now)
     hx, hy, px, py = hand_fixed(e)
   end
   set_off(st, now, px, py)
+end
+
+local function check(st, now)
+  local e = st.e
+  if not e.valid then
+    S[st.u] = nil
+    inside[st.u] = nil
+    emit(st, GONE, now, 0, 0, 0)
+    return
+  end
+  M.counts.checks = M.counts.checks + 1
+  local stack = e.held_stack
+  local cnt = stack.valid_for_read and stack.count or 0
+  local item = st.item
+  if cnt > 0 and (st.cnt <= 0 or cnt ~= st.cnt) then
+    item = registry.item_id(stack.name)
+  elseif cnt == 0 then
+    item = 0
+  end
+  local code = code_of(e.status)
+  local was, was_code, was_item = st.cnt, st.st, st.item
+  local unc = (st.pred == now or now - st.last <= 1) and 0 or now - st.last - 1
+  if st.recheck then
+    st.recheck = nil
+    describe(st)
+  end
+  local sync = st.sync_at and now >= st.sync_at
+  local probe = st.probe and now >= st.probe
+  if probe then
+    st.probe = nil
+  end
+  st.cnt, st.st, st.item, st.last = cnt, code, item, now
+  local hx, hy, px, py
+  if was < 0 then
+    -- First seen: its position, what it holds and its status: the client's starting point.
+    hx, hy, px, py = hand_fixed(e)
+    emit(st, SYNC, now, cnt, item, code, hx, hy, 0)
+    M.counts.syncs = M.counts.syncs + 1
+    st.sync_at = now + O.resync + st.u % 60
+    sync = false
+  elseif cnt > was then
+    hx, hy, px, py = hand_fixed(e)
+    emit(st, PICKED, now, cnt, item, unc, hx, hy, st.pu)
+  elseif cnt < was then
+    hx, hy, px, py = hand_fixed(e)
+    emit(st, DROPPED, now, cnt, was_item, unc, hx, hy, st.du)
+    local client = storage.f3d.client
+    if st.du ~= 0 and client and client.ho then
+      pcall(placed, st, now, px, py, was - cnt)
+    end
+  end
+  if code ~= was_code and was >= 0 then
+    -- (With a pick or drop too: a hand that took but waits where it is, its destination full, says
+    -- so, and the client holds it there until the status says it works.)
+    if not hx then
+      hx, hy, px, py = hand_fixed(e)
+    end
+    emit(st, STATUS, now, cnt, item, code, hx, hy, 0)
+  end
+  hx, hy, px, py = check_sync_or_slow(st, now, e, cnt, item, code, sync, probe, hx, hy, px, py)
+  -- What next.
+  if SLOW[code] then
+    if st.mode == "slow" and hx == st.slow_x and hy == st.slow_y then
+      st.slow_gap = math.min(O.idle, (st.slow_gap or SLOW_TICKS) * 2)
+    else
+      st.slow_gap = SLOW_TICKS
+    end
+    st.slow_x, st.slow_y = hx, hy
+    st.mode = "slow"
+    st.pred = nil
+    schedule(st, now + st.slow_gap)
+    return
+  end
+  st.slow_x, st.slow_y = nil, nil
+  if cnt ~= was or code ~= was_code then
+    st.since = nil  -- (something happened: the wait at a belt starts over)
+  end
+  if was < 0 then
+    -- (Its hand's phase isn't known yet: holding, it is on its way to the drop or waiting there;
+    -- empty, the other way. Checked as if it just set off: when it arrives nothing has changed
+    -- and it waits, or something changed before.)
+    set_off(st, now, px, py)
+    if cnt > 0 and st.cap > 1 then
+      st.mode = "collect"
+      st.pred = nil
+      st.collect_from = now
+      st.hx, st.hy = px, py
+      schedule(st, now + O.chase)
+    end
+    return
+  end
+  if cnt > was then
+    if st.cap > 1 and cnt < st.cap and st.mode ~= "to_drop" then
+      -- A hand that takes several (bulk, stack): more may come before it leaves, so it is checked
+      -- every O.chase ticks until half a leg has passed with no more, then as one set off.
+      st.mode = "collect"
+      st.pred = nil
+      st.collect_from = now
+      st.hx, st.hy = px, py
+      schedule(st, now + O.chase)
+    else
+      set_off(st, now, px, py)
+    end
+    return
+  end
+  if cnt < was then
+    if cnt == 0 then
+      set_off(st, now, px, py)
+    else
+      -- Dropping one a tick onto a belt (or part of a hand into a nearly full machine).
+      st.mode = "drop_wait"
+      st.pred = nil
+      schedule(st, now + O.chase)
+    end
+    return
+  end
+  check_idle_leg(st, now, e, cnt, item, code, was_code, hx, hy, px, py)
 end
 
 -- --- the sends -----------------------------------------------------------------------------------
@@ -957,6 +1084,22 @@ function M.tick()
   local checks = 0
   if list then
     local budget = O.budget
+    if perf.on("near_first") and #list > budget then
+      local f = s.focus
+      local near_list, outer_list = {}, {}
+      for _, u in ipairs(list) do
+        local st = S[u]
+        if st and math.max(math.abs(st.x - f.x), math.abs(st.y - f.y)) <= NEAR_INSERTER_RADIUS then
+          near_list[#near_list + 1] = u
+        else
+          outer_list[#outer_list + 1] = u
+        end
+      end
+      for _, u in ipairs(outer_list) do
+        near_list[#near_list + 1] = u
+      end
+      list = near_list
+    end
     for i, u in ipairs(list) do
       local st = S[u]
       if st and st.next == now then
@@ -986,7 +1129,15 @@ function M.tick()
     tr.checks = (tr.checks or 0) + checks
   end
   local interval = settings.global["f3d-detail-interval"].value
-  if ev and rate.due("ih", O.every) then
+  local ie_due = false
+  if ev then
+    if perf.on("near_rate") and rate.due_near then
+      ie_due = rate.due_near("ih", O.every)
+    else
+      ie_due = rate.due("ih", O.every)
+    end
+  end
+  if ie_due then
     local window = O.every * O["repeat"]
     local n = #events
     local bytes = send_events(now, window)

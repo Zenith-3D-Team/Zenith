@@ -32,6 +32,7 @@ const BlueprintWindow := preload("res://scripts/ui/factorio/blueprint_window.gd"
 const PlannerWindow := preload("res://scripts/ui/factorio/planner_window.gd")
 const BookWindow := preload("res://scripts/ui/factorio/book_window.gd")
 const BlueprintPicture := preload("res://scripts/ui/factorio/blueprint_picture.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const PLANNER_ITEMS := ["blueprint", "blueprint-book", "deconstruction-planner", "upgrade-planner"]
 
@@ -119,7 +120,7 @@ func _ready() -> void:
 
 
 func _debug_options() -> void:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		var value := arg.get_slice("=", 1)
 		if arg == "--ui=library":
 			get_tree().create_timer(2.0).timeout.connect(func() -> void: open_library(true))

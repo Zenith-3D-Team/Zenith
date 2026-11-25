@@ -225,7 +225,7 @@ function M.mine(cmd)
       local removal = tracker.removal_message(g)
       g.destroy()
       if removal then
-        transport.send_reliable(removal)
+        transport.send_reliable_priority(removal, math.floor(removal.x / 8192), math.floor(removal.y / 8192))
       end
     end
     local mp = tile.valid and tile.prototype.mineable_properties

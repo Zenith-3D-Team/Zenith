@@ -35,23 +35,60 @@ extends Node3D
 ## or next to it. Building, mining or laying tiles (world.gd's entities_changed, tiles_changed) builds
 ## the chunk again; its nodes are only replaced when its mask or its flat tufts changed.
 
+const NativeLibrary := preload("res://scripts/native_library.gd")
+const FreeLater := preload("res://scripts/world/free_later.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const ItemModels := preload("res://scripts/world/item_models.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
+const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const DecorSheetBaker := preload("res://scripts/world/decor_sheet_baker.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const WeatherState := preload("res://scripts/world/weather_state.gd")
+const ModelLods := preload("res://scripts/world/model_lods.gd")
 const SHADER := preload("res://shaders/decorative.gdshader")
 const SHADER_FLAT := preload("res://shaders/decorative_flat.gdshader")
 const SHADER_SHEET := preload("res://shaders/decorative_sheet.gdshader")
 const SHADER_GRASS := preload("res://shaders/decorative_grass.gdshader")
 const SHADER_CARPET := preload("res://shaders/decorative_carpet.gdshader")
+const SHADER_MODEL := preload("res://shaders/decorative_model.gdshader")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 ## --grass-backlight=old: the ground plants' 0.2.2 specular and roughness, which glared white with the sun
 ## low behind them (decorative_grass.gdshaderinc plant_specular).
-static var old_sheen_on: bool = "--grass-backlight=old" in OS.get_cmdline_user_args()
+static var old_sheen_on: bool = Switches.has("--grass-backlight=old")
+## --grass-opt=old: the ground plants' shaders from before the GPU optimisation (3D tufts and bushes blended
+## in the transparent pass, carpet density 0.45/0.35, flat pictures with specular): the *_old.gdshader
+## copies. --grass-backlight=old needs them too (the optimised shaders have no specular to bring back).
+static var grass_opt_old: bool = Switches.has("--grass-opt=old")
+static var legacy_shaders: bool = grass_opt_old or old_sheen_on
+## --decor-composite=off: each chunk's baked flat-decorative sheet is a blended FlatSheet mesh over the ground,
+## as before, not drawn by the ground's own shader (terrain_common.gdshaderinc, chunk_view.gd set_decor_sheet).
+## The legacy plant shaders (--grass-opt=old, --grass-backlight=old) keep the separate sheets too.
+static var decor_composite: bool = Switches.on("--decor-composite") and not legacy_shaders
+const SHADER_FLAT_OLD := "res://shaders/decorative_flat_old.gdshader"
+const SHADER_SHEET_OLD := "res://shaders/decorative_sheet_old.gdshader"
+const SHADER_GRASS_OLD := "res://shaders/decorative_grass_old.gdshader"
+const SHADER_CARPET_OLD := "res://shaders/decorative_carpet_old.gdshader"
+## --grass-zoom-lines=raw: measure 3D grass pixel zoom on raw viewport lines instead of capping with ModelLods.
+static var grass_cap_lines := not (Switches.has("--grass-zoom-lines=raw"))
+## --decor-nodes=<n>: at most about n new decorative MultiMeshes put in a frame (whole chunks; the
+## first chunk of a frame always goes in). Default 96; 0 no cap, as before (only the time slice).
+## The owner's spike log: frames with 580-810 nodes appearing at once drew for 55-92 ms.
+static var nodes_per_frame := _nodes_arg()
+
+
+static func _nodes_arg() -> int:
+	for a in Switches.args():
+		if a.begins_with("--decor-nodes="):
+			return maxi(int(a.get_slice("=", 1)), 0)
+	return 96
+
+
 const INDEX := "res://data/decoratives.json"
 
 const CHUNK := 32
@@ -78,9 +115,10 @@ const LAYER_LIFT := {"decals": 0.010, "ground-layer-1": 0.016, "ground-layer-2":
 ## same layer overlapping resolve the same way every frame.
 const TILE_STEP := 0.0012
 const TILE_STEPS := 4
-## Render priorities from the lowest: flat decoratives, then raised ones, under 0 (and -1, flat effects).
+## Render priorities from the lowest: flat decoratives (-128..-33), ground area showcases
+## (-32, GroundHeight.AREA_PRIORITY), then raised grass (-31..-2), under -1 (flat effects) and 0.
 const FLAT_PRIORITIES := 96
-const GRASS_PRIORITIES := 31
+const GRASS_PRIORITIES := 30
 ## Baked flat decorative chunk sheet (decor_sheet_baker.gd): flattens all flat MultiMeshes per chunk
 ## into one lit layer, sized by distance with a hysteresis band to avoid thrashing while walking.
 const SHEET_LIFT := 0.024
@@ -185,6 +223,17 @@ class KindData:
 	var carpet_cells: Image
 	var carpet_texture: ImageTexture
 	var carpet_clumps := 0
+	var model_paths := PackedStringArray()
+	var model_scale := 1.0
+	var model_height_scale := 1.0
+	var model_shift := Vector2.ZERO
+	var model_rigid := false
+	var has_flat := true
+	## DecorNative's inputs, made once from the arrays above (nat_ready last).
+	var nat_uvs := PackedFloat32Array()
+	var nat_sizes := PackedFloat32Array()
+	var nat_shifts := PackedFloat32Array()
+	var nat_ready := false
 
 
 ## A decorative's atlas goes on the GPU on the worker thread that read its pictures
@@ -192,15 +241,20 @@ class KindData:
 ## in, the first chunk's twenty-odd new kinds made a 115-135 ms frame once a join at -62,-26 (an
 ## atlas is up to a few MB with its mipmaps, and the renderer takes the upload on the calling thread).
 ## off: made by _kind on the main thread, as before.
-static var texture_thread := not ("--decor-texture-thread=off" in OS.get_cmdline_user_args())
+static var texture_thread := Switches.on("--decor-texture-thread")
 ## --decor-parallel-load=off: holds _kind_mutex across decorative picture loading (one worker at a
 ## time, blocking main-thread index() swaps) as before.
-static var parallel_kind_load := not ("--decor-parallel-load=off" in OS.get_cmdline_user_args())
+static var parallel_kind_load := Switches.on("--decor-parallel-load")
+## --native-decor=off: the per-decorative loops of a chunk's build (placement, order, instance buffers) stay
+## in GDScript; else DecorNative (native/belt_sim/src/decor_native.cpp) does them when the library is there.
+static var native_decor := Switches.on("--native-decor")
+## Made once on the main thread (_build); its methods keep no state, so workers share it.
+static var _decor_native: Object = null
 ## --decor-sheet=off: keeps flat decoratives as overlapping MultiMeshInstance3Ds per chunk.
-static var sheet_enabled := not ("--decor-sheet=off" in OS.get_cmdline_user_args())
+static var sheet_enabled := Switches.on("--decor-sheet")
 ## Block-compress baked decorative sheets only when opted in via --decor-sheet-compress=on in
 ## editor builds (Image.compress S3TC fans across all WorkerThreadPool threads).
-static var sheet_compress := OS.has_feature("editor") and ("--decor-sheet-compress=on" in OS.get_cmdline_user_args())
+static var sheet_compress := OS.has_feature("editor") and (Switches.has("--decor-sheet-compress=on"))
 
 
 ## One decorative's pictures, ready to draw (made on the main thread from its KindData).
@@ -213,6 +267,9 @@ class Kind:
 	var grass_mesh: Mesh  # null: stays flat
 	var grass_material: ShaderMaterial
 	var grass_triangles := 0
+	var is_model := false
+	var model_meshes: Array[Mesh] = []
+	var model_materials: Array[ShaderMaterial] = []
 
 
 ## A chunk's clutter worked out on a worker thread: per decorative [name, buffer, instances, KindData,
@@ -248,8 +305,11 @@ class BuildJob:
 ## made from them.
 static var _index := {}
 static var _index_generation := -1  # ModGraphics.generation the index was merged with
+static var _packs_version := -1  # ModelPacks.decor_version last synced
 static var _retired: Array = []
 static var _kind_data := {}  # name -> KindData (null: no pictures), each holding the Kind made from it
+static var _model_tris_cache := {}  # glb path -> int triangle count (guarded by _kind_mutex)
+static var _model_mesh_cache := {}  # glb path -> [mtime, Mesh] (main thread only)
 static var _flat_order := {}  # flat decorative -> its rank in the drawing order (_flat_priority)
 static var _grass_order := {}  # raised decorative -> its rank in the drawing order (_grass_priority)
 static var _grass_meshes := {}  # grid cells a side -> the grid; minus a carpet's clumps -> its mesh
@@ -288,6 +348,7 @@ var _chunks := {}  # Vector2i -> Node3D holding that chunk's MultiMeshInstance3D
 var _lists := {}  # Vector2i -> the chunk's last full list, to rebuild when the density changes
 var _sweep := 0.0
 var _built_generation := 0  # ModGraphics.generation the chunks were built with
+var _built_packs_version := -1  # ModelPacks.decor_version the chunks were built with
 var _shares := {}  # Vector2i -> the share of the chunk's clutter drawn now (1, 0.5, 0.25, 0)
 var _versions := {}  # Vector2i -> the number of the chunk's latest build (older jobs' results are dropped)
 ## Builds are numbered on from game to game, so a job still running from before reset() never
@@ -302,7 +363,7 @@ const FREE_USEC := 1000
 ## far out that was the clutter of 4,000 chunks queued to be freed at once: 32,000 nodes, a 95-100 ms frame
 ## at the end of the sweep's frame. They go into _freeing too, freed FREE_USEC a frame (_free_some).
 ## `--unload-hide=off`: queue_free as before.
-static var drop_sliced := not OS.get_cmdline_user_args().has("--unload-hide=off")
+static var drop_sliced := Switches.on("--unload-hide")
 ## 3D grass (set_grass). Tiles from the character; 0: off.
 var grass_range := 0.0
 var grass_wind := false
@@ -347,6 +408,9 @@ var _edge_dirs := {}  # Vector2i -> int direction bitmask of overhanging edges
 var _sheet_gen := {}  # Vector2i -> int, bumped on each chunk rebuild or drop
 var _sheet_size := {}  # Vector2i -> int baked texture resolution (0 if unbaked)
 var _sheet_shade := {}  # Vector2i -> float weighted raised_shade for this chunk
+var _sheet_tex := {}  # Vector2i -> ImageTexture: the chunk's baked sheet, drawn by its ground or a FlatSheet
+var _composited := {}  # Vector2i -> true: that chunk's ground (chunk_view.gd) draws the sheet
+var _composite_tick := 0
 var _bake_dirty := {}  # Vector2i -> true: chunk sheet needs (re)baking or resize
 var _sheet_content_dirty := {}  # Vector2i -> true: chunk sheet content/overhang changed (not resize-only)
 var _sheet_move_pos := Vector2.INF
@@ -385,6 +449,7 @@ func reset(keep_names := false) -> void:
 	_flat_groups.clear()
 	_edge_flat.clear()
 	_edge_dirs.clear()
+	_drop_composites()
 	_sheet_gen.clear()
 	_sheet_size.clear()
 	_sheet_shade.clear()
@@ -418,6 +483,8 @@ func set_options(on: bool, share: float) -> void:
 	enabled = on
 	density = clampf(share, 0.0, 1.0)
 	visible = on
+	# The sheets the ground draws itself go with the layer.
+	RenderingServer.global_shader_parameter_set(&"f3d_decor_composite_on", 1.0 if on else 0.0)
 	if rebuild:
 		for c in _lists.keys():
 			_build(c)
@@ -429,7 +496,8 @@ func set_grass(mode: String) -> void:
 	var m: Array = GRASS_MODES.get(mode, GRASS_MODES["off"])
 	grass_range = m[0]
 	grass_wind = m[1]
-	RenderingServer.global_shader_parameter_set(&"f3d_grass_wind", 1.0 if grass_wind else 0.0)
+	WeatherState.base_grass_wind = grass_wind
+	RenderingServer.global_shader_parameter_set(&"f3d_grass_wind", WeatherState.grass_wind_value())
 	if grass_range <= 0.0:
 		RenderingServer.global_shader_parameter_set(&"f3d_grass", Vector4.ZERO)
 
@@ -437,7 +505,7 @@ func set_grass(mode: String) -> void:
 func handle(msg: Dictionary) -> void:
 	match str(msg.get("t", "")):
 		"dprotos":
-			for rec in _array(msg.get("l")):
+			for rec in Wire.array(msg.get("l")):
 				if rec is Array and rec.size() >= 2:
 					_names[_int(rec[0])] = str(rec[1])
 		"iuse":
@@ -445,7 +513,7 @@ func handle(msg: Dictionary) -> void:
 			if _int(msg.get("part", 1)) == 1:
 				_floor_names.clear()
 			_floor_gen += 1
-			for rec in _array(msg.get("l")):
+			for rec in Wire.array(msg.get("l")):
 				if rec is Array and rec.size() >= 3 and str(rec[1]) == "t":
 					for i in range(2, mini(rec.size(), 4)):
 						if rec[i] is String and rec[i] != "":
@@ -458,7 +526,7 @@ func handle(msg: Dictionary) -> void:
 				p = {"parts": _int(msg.get("parts", 1)), "got": 0, "l": []}
 				_parts[c] = p
 			p["got"] = int(p["got"]) + 1
-			(p["l"] as Array).append_array(_array(msg.get("l")))
+			(p["l"] as Array).append_array(Wire.array(msg.get("l")))
 			if int(p["got"]) >= int(p["parts"]):
 				_parts.erase(c)
 				_lists[c] = p["l"]
@@ -470,10 +538,13 @@ func _process(delta: float) -> void:
 	_free_some()
 	Probing.add("dc_free", tp)
 	tp = Time.get_ticks_usec()
-	if _built_generation != ModGraphics.generation:
-		# A graphics list (mod_graphics.gd): every chunk's clutter is built again from it, nearest
-		# the focus first, a slice a frame (_build_some): all at once was a 92 ms frame (client-cpu.md 5).
+	_sync_packs()
+	if _built_packs_version < 0:
+		_built_packs_version = _packs_version
+	if _built_generation != ModGraphics.generation or _built_packs_version != _packs_version:
+		# A graphics list or model packs' decoratives changed: rebuild chunks nearest focus first.
 		_built_generation = ModGraphics.generation
+		_built_packs_version = _packs_version
 		index()
 		_relist = _near_first(_lists.keys())
 		_relist_at = 0
@@ -560,15 +631,26 @@ func _build_some(t0: int, allow: int) -> void:
 	_relist_at = 0
 
 
+func _focus_xz() -> Vector2:
+	if rig == null or not is_instance_valid(rig):
+		return Vector2.INF
+	if ViewPriority.camera_cone and rig.has_method("taken") and rig.taken() and rig.has_method("focus_point"):
+		return rig.focus_point()
+	var focus: Node3D = rig.get("target")
+	if focus == null or not is_instance_valid(focus):
+		return Vector2.INF
+	return Vector2(focus.global_position.x, focus.global_position.z)
+
+
 ## Chunks nearest the camera's target first: bucketed by distance, not sorted with a GDScript
 ## comparison (thousands of chunks at a long view).
 func _near_first(list: Array) -> Array[Vector2i]:
 	var out: Array[Vector2i] = []
-	var focus: Node3D = rig.get("target") if rig != null and is_instance_valid(rig) else null
-	if focus == null or not is_instance_valid(focus) or list.size() < 2:
+	var at_xz := _focus_xz()
+	if not at_xz.is_finite() or list.size() < 2:
 		out.assign(list)
 		return out
-	var at := Vector2i(floori(focus.global_position.x / 32.0), floori(focus.global_position.z / 32.0))
+	var at := Vector2i(floori(at_xz.x / 32.0), floori(at_xz.y / 32.0))
 	var buckets := {}
 	for c: Vector2i in list:
 		var d := (c - at).length_squared()
@@ -584,7 +666,11 @@ func _near_first(list: Array) -> Array[Vector2i]:
 
 
 ## Listens to world.gd's changes (once it is set; tests stand in a world without them).
+var _behind_watched: Object = null
+
+
 func _watch_world() -> void:
+	_watch_behind()
 	if world == _connected or world == null or not is_instance_valid(world):
 		return
 	_connected = world
@@ -592,6 +678,42 @@ func _watch_world() -> void:
 		world.entities_changed.connect(_world_changed)
 	if world.has_signal("tiles_changed"):
 		world.tiles_changed.connect(_world_changed)
+
+
+func _watch_behind() -> void:
+	if world == null or not is_instance_valid(world):
+		return
+	var bc: Variant = world.get("behind_cull")
+	if bc == _behind_watched or bc == null or not is_instance_valid(bc):
+		return
+	_behind_watched = bc
+	if bc.has_signal("chunk_visibility_changed"):
+		bc.chunk_visibility_changed.connect(_on_behind_visibility)
+
+
+func _behind_hidden(c: Vector2i) -> bool:
+	if not ViewPriority.tight_cull or world == null or not is_instance_valid(world):
+		return false
+	var bc: Variant = world.get("behind_cull")
+	return bc != null and is_instance_valid(bc) and bc.is_active() and bc.hidden(c)
+
+
+func _on_behind_visibility(c: Vector2i, drawn: bool) -> void:
+	var node: Node3D = _chunks.get(c)
+	if node != null:
+		if not drawn:
+			node.visible = false
+		elif _culled_at.is_finite():
+			_cull_one(c, node, _culled_at)
+		else:
+			node.visible = true
+		_composite_visible(c, node.visible)
+	var gnode: Node3D = _grass.get(c)
+	if gnode != null:
+		if not drawn:
+			gnode.visible = false
+		elif _grass_at.is_finite():
+			gnode.visible = _grass_chunk_visible(c, _grass_at)
 
 
 ## Something was built, mined or laid in a chunk: built again next frame if its tiles or entities
@@ -780,10 +902,10 @@ func freeing_count() -> int:
 ## Shows the chunks near the focus only: one distance per chunk, again whenever the focus has moved
 ## a little or the distance changed; a chunk whose MultiMeshes were just made is culled alone (_replace).
 func _cull() -> void:
-	var focus: Node3D = rig.get("target") if rig != null and is_instance_valid(rig) else null
-	if focus == null or not is_instance_valid(focus):
+	_watch_behind()
+	var at := _focus_xz()
+	if not at.is_finite():
 		return
-	var at := Vector2(focus.global_position.x, focus.global_position.z)
 	_mask_follow(at)
 	_grass_follow(_grass_centre(at))
 	if at.distance_squared_to(_culled_at) < CULL_STEP * CULL_STEP and distance == _culled_distance:
@@ -800,7 +922,8 @@ func _cull_one(c: Vector2i, node: Node3D, at: Vector2) -> void:
 	var near := area.get_center() + (at - area.get_center()).clamp(-area.size * 0.5, area.size * 0.5)
 	var d := near.distance_to(at)
 	var share := 0.0 if d > distance else (1.0 if d <= FULL_DISTANCE or full_detail else (0.5 if d <= HALF_DISTANCE else 0.25))
-	node.visible = share > 0.0
+	node.visible = share > 0.0 and not _behind_hidden(c)
+	_composite_visible(c, node.visible)
 	if share > 0.0 and _shares.get(c, -1.0) != share:
 		_shares[c] = share
 		for inst in node.get_children():
@@ -848,6 +971,18 @@ func _grass_follow(g: Vector2) -> void:
 	_cull_grass(g)
 
 
+func _grass_chunk_visible(c: Vector2i, at: Vector2, planes: Array[Plane] = []) -> bool:
+	if _chunk_distance(c, at) > grass_range or _behind_hidden(c):
+		return false
+	if planes.is_empty():
+		return true
+	var area := GroundHeight.grow(AABB(Vector3(c.x * CHUNK - 2.0, -2.0, c.y * CHUNK - 2.0), Vector3(CHUNK + 4.0, 6.0, CHUNK + 4.0)))
+	for p: Plane in planes:
+		if p.is_point_over(area.get_support(-p.normal)):
+			return false
+	return true
+
+
 ## The shaders' range and centre, every frame: the flat pictures and their raised copies ease by it.
 func _grass_view(at: Vector2) -> void:
 	if grass_range <= 0.0:
@@ -855,17 +990,29 @@ func _grass_view(at: Vector2) -> void:
 	var zoom := _grass_zoom(at) * _grass_fade
 	_grass_root.visible = zoom > 0.0
 	RenderingServer.global_shader_parameter_set(&"f3d_grass", Vector4(at.x, at.y, grass_range, zoom))
+	if zoom > 0.0 and ViewPriority.tight_cull and not _grass.is_empty() and world != null and is_instance_valid(world):
+		var bc: Variant = world.get("behind_cull")
+		if bc != null and is_instance_valid(bc) and bc.is_active():
+			var camera := get_viewport().get_camera_3d() if is_inside_tree() else null
+			var planes: Array[Plane] = ViewPriority.planes(camera) if camera != null else []
+			for c: Vector2i in _grass:
+				_grass[c].visible = _grass_chunk_visible(c, at, planes)
 
 
 ## 1 close enough for height to show, 0 too far out, from the pixels a tile at the focus.
 func _grass_zoom(at: Vector2) -> float:
+	if rig != null and not ViewPriority.lod_by_camera(rig):
+		return 1.0
 	var camera := get_viewport().get_camera_3d() if is_inside_tree() else null
 	if camera == null:
 		return 1.0
 	var span := camera.size
 	if camera.projection != Camera3D.PROJECTION_ORTHOGONAL:
 		span = 2.0 * tan(deg_to_rad(camera.fov) * 0.5) * camera.global_position.distance_to(Vector3(at.x, 0.0, at.y))
-	var px := get_viewport().get_visible_rect().size.y / maxf(span, 0.01)
+	var lines := get_viewport().get_visible_rect().size.y
+	if grass_cap_lines:
+		lines = ModelLods.counted_lines(lines)
+	var px := lines / maxf(span, 0.01)
 	return clampf((px - GRASS_PX_OFF) / (GRASS_PX_FULL - GRASS_PX_OFF), 0.0, 1.0)
 
 
@@ -887,7 +1034,7 @@ func _cull_grass(at: Vector2) -> void:
 			_grass_queue.append(c)
 	for c: Vector2i in _grass.keys():
 		var d := _chunk_distance(c, at)
-		_grass[c].visible = d <= grass_range
+		_grass[c].visible = _grass_chunk_visible(c, at)
 		if d > grass_range + GRASS_MARGIN + CHUNK * 0.5:
 			_free_grass(c)
 
@@ -912,23 +1059,36 @@ func _make_grass(c: Vector2i) -> void:
 	var node := Node3D.new()
 	node.name = "Grass %d,%d" % [c.x, c.y]
 	# Each mesh is flat until the shader raises it (and the hills lift it): bounds that hold it all.
-	var bounds := AABB(Vector3(c.x * CHUNK - 8.0, -64.0, c.y * CHUNK - 8.0), Vector3(CHUNK + 16.0, 128.0, CHUNK + 16.0))
+	var flat_bounds := AABB(Vector3(c.x * CHUNK - 8.0, -2.0, c.y * CHUNK - 8.0), Vector3(CHUNK + 16.0, 6.0, CHUNK + 16.0))
+	var legacy_bounds := AABB(Vector3(c.x * CHUNK - 8.0, -64.0, c.y * CHUNK - 8.0), Vector3(CHUNK + 16.0, 128.0, CHUNK + 16.0))
 	for g: Array in _grass_lists[c]:
 		var kind: Kind = g[0]
+		var mesh_use: Mesh = kind.grass_mesh
+		var mat_use: ShaderMaterial = kind.grass_material
+		if kind.is_model and g.size() >= 4:
+			var vi := int(g[3])
+			if vi >= 0 and vi < kind.model_meshes.size():
+				mesh_use = kind.model_meshes[vi]
+				mat_use = kind.model_materials[vi]
+		if mesh_use == null or mat_use == null:
+			continue
 		var mm := MultiMesh.new()
 		mm.transform_format = MultiMesh.TRANSFORM_3D
 		mm.use_custom_data = true
-		mm.mesh = kind.grass_mesh
+		mm.mesh = mesh_use
 		mm.instance_count = int(g[2])
 		mm.buffer = g[1]
 		var inst := MultiMeshInstance3D.new()
 		inst.multimesh = mm
-		inst.material_override = kind.grass_material
+		inst.material_override = mat_use
 		inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		inst.layers = Visuals.GROUND_LAYER  # ground cover: the fill light leaves it (looks.gd fill_light)
-		inst.custom_aabb = bounds
+		if ViewPriority.tight_cull:
+			GroundHeight.cull_box(inst, flat_bounds)
+		else:
+			inst.custom_aabb = legacy_bounds
 		node.add_child(inst)
-	node.visible = _chunk_distance(c, _grass_at) <= grass_range
+	node.visible = _grass_chunk_visible(c, _grass_at)
 	_grass_root.add_child(node)
 	_grass[c] = node
 
@@ -936,7 +1096,7 @@ func _make_grass(c: Vector2i) -> void:
 func _free_grass(c: Vector2i) -> void:
 	var node: Node3D = _grass.get(c)
 	if node != null:
-		node.queue_free()
+		FreeLater.node(node)
 		_grass.erase(c)
 
 
@@ -950,7 +1110,8 @@ func grass_stats() -> Dictionary:
 	for c: Vector2i in _grass:
 		if not _grass[c].visible:
 			continue
-		var area := AABB(Vector3(c.x * CHUNK - 2.0, -2.0, c.y * CHUNK - 2.0), Vector3(CHUNK + 4.0, 6.0, CHUNK + 4.0))
+		var flat_area := AABB(Vector3(c.x * CHUNK - 2.0, -2.0, c.y * CHUNK - 2.0), Vector3(CHUNK + 4.0, 6.0, CHUNK + 4.0))
+		var area := GroundHeight.grow(flat_area) if ViewPriority.tight_cull else flat_area
 		var seen := camera != null
 		for p: Plane in planes:
 			seen = seen and not p.is_point_over(area.get_support(-p.normal))
@@ -975,7 +1136,7 @@ func grass_stats() -> Dictionary:
 ## --grass-stats: grass_stats() every 5 seconds, to read the budget on a real base.
 func _print_grass_stats(delta: float) -> void:
 	_grass_stats_at -= delta
-	if _grass_stats_at > 0.0 or not OS.get_cmdline_user_args().has("--grass-stats"):
+	if _grass_stats_at > 0.0 or not Switches.has("--grass-stats"):
 		if _grass_stats_at <= 0.0:
 			_grass_stats_at = 1e9
 		return
@@ -1015,7 +1176,7 @@ func _drop(c: Vector2i) -> void:
 			node.visible = false
 			_freeing.append(node)  # freed FREE_USEC a frame, the last dropped first (_free_some)
 		else:
-			node.queue_free()
+			FreeLater.node(node)
 
 
 ## Rebuilds a chunk's MultiMeshes from its list: [id, x, y, amount, ...], x and y the tile in the
@@ -1028,7 +1189,7 @@ func _build(c: Vector2i, mask_only := false) -> void:
 	_versions[c] = version
 	var l: Array = _lists.get(c, [])
 	var data_dir := ItemIcons.factorio_data_dir()
-	if data_dir == "":
+	if data_dir == "" and not ModelPacks.has_any_decoratives() and ModGraphics.decor.is_empty():
 		_replace(c, null)
 		return
 	if l.is_empty():
@@ -1044,6 +1205,7 @@ func _build(c: Vector2i, mask_only := false) -> void:
 	# loads paths.gd there while the main thread may be waiting for that worker (finish_jobs,
 	# quitting), and both wait for ever. Once found, this returns at once.
 	ModFiles.prepare()
+	_ensure_native()
 	index()  # a new list's index made here, never on a worker (_kind and _flat_priority read it here)
 	var job := BuildJob.new()
 	job.chunk = c
@@ -1054,6 +1216,11 @@ func _build(c: Vector2i, mask_only := false) -> void:
 	job.mask_only = mask_only
 	_mask_inputs(c, job)
 	_jobs.append([WorkerThreadPool.add_task(_run_job.bind(job), false, "decoratives"), job])
+
+
+static func _ensure_native() -> void:
+	if native_decor and _decor_native == null and NativeLibrary.ensure() and ClassDB.class_exists(&"DecorNative"):
+		_decor_native = ClassDB.instantiate(&"DecorNative")
 
 
 ## What the job's mask is made from, read here on the main thread: the chunk's tiles and records
@@ -1085,14 +1252,18 @@ func _mask_inputs(c: Vector2i, job: BuildJob) -> void:
 
 
 ## Makes the MultiMeshes of finished jobs, oldest first, for up to `usec` (at least one chunk).
-func _finish_jobs(usec: int) -> void:
+func _finish_jobs(usec: int, node_cap := -1) -> void:
 	var start := Time.get_ticks_usec()
 	var made := 0
+	var nodes := 0
+	var cap := nodes_per_frame if node_cap < 0 else node_cap
 	while not _jobs.is_empty():
 		var entry: Array = _jobs[0]
 		var waited := int(entry[0]) < 0
 		if not (waited or WorkerThreadPool.is_task_completed(entry[0])) or (made > 0 and Time.get_ticks_usec() - start > usec):
 			return
+		if made > 0 and cap > 0 and nodes >= cap:
+			return  # the rest next frame: each new MultiMesh is work for the render thread
 		_jobs.pop_front()
 		if not waited:
 			WorkerThreadPool.wait_for_task_completion(entry[0])
@@ -1104,7 +1275,10 @@ func _finish_jobs(usec: int) -> void:
 			_full_pending.erase(job.chunk)
 		elif not ground_changed:
 			continue  # a build or a tile that changed nothing here: the nodes stay
-		_replace(job.chunk, _node_for(job))
+		var built := _node_for(job)
+		if built != null:
+			nodes += built.get_child_count()
+		_replace(job.chunk, built)
 		made += 1
 
 
@@ -1167,7 +1341,7 @@ static func _spill_neighbours(c: Vector2i, spill: PackedInt32Array, touched: Dic
 ## Waits for every chunk being built and shows them (tests; a world being left).
 func finish_jobs() -> void:
 	_wait_all()
-	_finish_jobs(1 << 30)
+	_finish_jobs(1 << 30, 0)
 
 
 func _exit_tree() -> void:
@@ -1193,7 +1367,7 @@ func _replace(c: Vector2i, node: Node3D) -> void:
 			old.remove_child(kept_sheet)
 			node.add_child(kept_sheet)
 	if old != null:
-		old.queue_free()
+		FreeLater.node(old)
 		_chunks.erase(c)
 	if node == null:
 		_clear_flat_sheet_state(c)
@@ -1222,9 +1396,10 @@ func _node_for(job: BuildJob) -> Node3D:
 	var shade_sum := 0.0
 	var rising_total := 0
 	var old_chunk: Node3D = _chunks.get(c)
-	var has_existing_sheet := sheet_enabled and not _chunk_fully_blocked(c) and old_chunk != null and not old_chunk.is_queued_for_deletion() and old_chunk.get_node_or_null("FlatSheet") != null
+	var has_existing_sheet := sheet_enabled and not _chunk_fully_blocked(c) and old_chunk != null and not old_chunk.is_queued_for_deletion() and (old_chunk.get_node_or_null("FlatSheet") != null or _composited.has(c))
 	var node := Node3D.new()
 	node.name = "Decor %d,%d" % [c.x, c.y]
+	var flat_bounds := AABB(Vector3(c.x * CHUNK - 8.0, -2.0, c.y * CHUNK - 8.0), Vector3(CHUNK + 16.0, 6.0, CHUNK + 16.0))
 	for g: Array in job.groups:
 		var tk := Time.get_ticks_usec()
 		var kind := _kind(str(g[0]), g[3])
@@ -1232,10 +1407,34 @@ func _node_for(job: BuildJob) -> Node3D:
 		if kind == null:
 			continue
 		var is_flat := not kind.upright
-		if is_flat:
+		if is_flat and kind.mesh != null:
 			flat_list.append([kind, g[1], int(g[2])])
 		if is_flat and has_existing_sheet:
 			pass  # keep the chunk's existing FlatSheet drawn until its updated sheet finishes baking
+		elif is_flat and kind.mesh == null:
+			pass  # 3D grass model without a 2D flat fallback picture (e.g. no Factorio install)
+		elif kind.upright and kind.is_model:
+			var buckets: Array = g[5] if g.size() >= 6 else []
+			for vi in mini(buckets.size(), kind.model_meshes.size()):
+				var bentry: Array = buckets[vi]
+				var bcnt := int(bentry[1])
+				if bcnt <= 0 or kind.model_meshes[vi] == null:
+					continue
+				tk = Time.get_ticks_usec()
+				var mm := MultiMesh.new()
+				mm.transform_format = MultiMesh.TRANSFORM_3D
+				mm.use_custom_data = true
+				mm.mesh = kind.model_meshes[vi]
+				mm.instance_count = bcnt
+				mm.buffer = bentry[0]
+				var inst := MultiMeshInstance3D.new()
+				inst.multimesh = mm
+				inst.material_override = kind.model_materials[vi]
+				inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+				if ViewPriority.tight_cull:
+					GroundHeight.cull_box(inst, flat_bounds)
+				node.add_child(inst)
+				Probing.add("dc_multimeshes", tk)
 		else:
 			tk = Time.get_ticks_usec()
 			var mm := MultiMesh.new()
@@ -1255,8 +1454,20 @@ func _node_for(job: BuildJob) -> Node3D:
 			Probing.add("dc_multimeshes", tk)
 		var rising := int(g[4])
 		if rising > 0 and kind.grass_mesh != null:
-			raised.append([kind, (g[1] as PackedFloat32Array).slice(0, rising * STRIDE), rising])
 			var data: KindData = g[3]
+			if kind.is_model and g.size() >= 6:
+				var mbuckets: Array = g[5]
+				var added_model := false
+				for vi in mini(mbuckets.size(), kind.model_meshes.size()):
+					var bentry: Array = mbuckets[vi]
+					var bcnt := int(bentry[1])
+					if bcnt > 0 and kind.model_meshes[vi] != null:
+						raised.append([kind, bentry[0], bcnt, vi])
+						added_model = true
+				if not added_model:
+					raised.append([kind, (g[1] as PackedFloat32Array).slice(0, rising * STRIDE), rising])
+			else:
+				raised.append([kind, (g[1] as PackedFloat32Array).slice(0, rising * STRIDE), rising])
 			shade_sum += float(rising) * (CARPET_SHADE if data.grass_carpet else FLAT_SHADE_TUFT)
 			rising_total += rising
 	if not raised.is_empty():
@@ -1281,7 +1492,14 @@ static func _run_job(job: BuildJob) -> void:
 	var mask := job.mask
 	var flat_near := _any_blocked(job)
 	var groups := {}  # id -> [x, y, ...] tiles kept
-	for i in range(0, l.size() - 3, 4):
+	var nat: Object = _decor_native
+	if nat != null:
+		var placed: Dictionary = nat.call("place", PackedInt32Array(l), c.x, c.y, mask, job.density)
+		var pids: PackedInt32Array = placed["ids"]
+		var ptiles: Array = placed["tiles"]
+		for pi in pids.size():
+			groups[pids[pi]] = ptiles[pi]
+	for i in (range(0, l.size() - 3, 4) if nat == null else range(0)):
 		var id := _int(l[i])
 		var lx := _int(l[i + 1])
 		var ly := _int(l[i + 2])
@@ -1313,8 +1531,11 @@ static func _run_job(job: BuildJob) -> void:
 		var data := _kind_data_for(name)
 		if data == null:
 			continue
-		var tiles: Array = groups[id]
-		var count := tiles.size() >> 1
+		var tiles = groups[id]
+		var count: int = tiles.size() >> 1
+		if nat != null:
+			_fill_native(nat, job, name, data, tiles, flat_near, carpet_share if data.grass_carpet else stand_share, id)
+			continue
 		var order: Array = range(count)
 		order.sort_custom(func(a: int, b: int) -> bool: return hash(Vector3i(tiles[a * 2], tiles[a * 2 + 1], 5)) < hash(Vector3i(tiles[b * 2], tiles[b * 2 + 1], 5)))
 		var rising := 0
@@ -1342,13 +1563,19 @@ static func _run_job(job: BuildJob) -> void:
 		var z0_c := float(c.y * CHUNK)
 		var x1_c := x0_c + CHUNK
 		var z1_c := z0_c + CHUNK
+		var has_models := not data.model_paths.is_empty()
+		var model_count := data.model_paths.size()
+		var bucket_arrs: Array = []
+		if has_models:
+			for _vi in model_count:
+				bucket_arrs.append([])
 		for j in count:
 			var k: int = order[j]
 			var x: int = tiles[k * 2]
 			var y: int = tiles[k * 2 + 1]
-			var v := posmod(hash(Vector3i(x, y, 11)), data.uvs.size())
-			var size: Vector2 = data.sizes[v]
-			var shift: Vector2 = data.shifts[v]
+			var v := posmod(hash(Vector3i(x, y, 11)), maxi(data.uvs.size(), 1))
+			var size: Vector2 = data.sizes[v] if v < data.sizes.size() else Vector2.ONE
+			var shift: Vector2 = data.shifts[v] if v < data.shifts.size() else Vector2.ZERO
 			var lift := data.lift + TILE_STEP * posmod(hash(Vector2i(x, y)), TILE_STEPS)
 			var origin := Vector3(x + 0.5 + shift.x, lift, y + 0.5 + shift.y)
 			var scale := Vector3(size.x, 1.0, size.y)
@@ -1364,12 +1591,29 @@ static func _run_job(job: BuildJob) -> void:
 			buffer[o + 7] = origin.y
 			buffer[o + 10] = scale.z
 			buffer[o + 11] = origin.z
-			buffer[o + 12] = data.uvs[v].x
-			buffer[o + 13] = data.uvs[v].y
-			buffer[o + 14] = data.uvs[v].z
+			var uv4: Vector4 = data.uvs[v] if v < data.uvs.size() else Vector4.ZERO
+			buffer[o + 12] = uv4.x
+			buffer[o + 13] = uv4.y
+			buffer[o + 14] = uv4.z
 			# Over 0.5: has a raised copy (decorative_flat.gdshader); the fraction is the plant's root.
-			buffer[o + 15] = 1.0 + data.uvs[v].w if j < rising else 0.0
-			if not data.upright:
+			buffer[o + 15] = 1.0 + uv4.w if j < rising else 0.0
+			if has_models and (data.upright or j < rising):
+				var mv := posmod(hash(Vector3i(x, y, 19)), model_count)
+				var ang := float(hash(Vector3i(x, y, 23)) & 0xffff) / 65536.0 * TAU
+				var cs := cos(ang)
+				var sn := sin(ang)
+				var js := (0.86 + 0.28 * (float(hash(Vector3i(x, y, 29)) & 0xffff) / 65536.0)) * data.model_scale
+				var jy := js * data.model_height_scale
+				var phase := float(hash(Vector3i(x, y, 31)) & 0xffff) / 65536.0
+				var mox := float(x) + 0.5 + data.model_shift.x
+				var moz := float(y) + 0.5 + data.model_shift.y
+				var barr: Array = bucket_arrs[mv]
+				barr.append_array([
+					cs * js, 0.0, sn * js, mox,
+					0.0, jy, 0.0, 0.0,
+					-sn * js, 0.0, cs * js, moz,
+					phase, 0.0, 0.0, 0.0])
+			if not data.upright and data.has_flat:
 				var min_x := origin.x - scale.x * 0.5
 				var max_x := origin.x + scale.x * 0.5
 				var min_z := origin.z - scale.z * 0.5
@@ -1388,10 +1632,68 @@ static func _run_job(job: BuildJob) -> void:
 						0.0, scale.y, 0.0, origin.y,
 						0.0, 0.0, scale.z, origin.z,
 						buffer[o + 12], buffer[o + 13], buffer[o + 14], buffer[o + 15]])
-		job.groups.append([name, buffer, count, data, rising])
+		if has_models:
+			var buckets: Array = []
+			for barr: Array in bucket_arrs:
+				buckets.append([PackedFloat32Array(barr), barr.size() / STRIDE])
+			job.groups.append([name, buffer, count, data, rising, buckets])
+		else:
+			job.groups.append([name, buffer, count, data, rising])
 		if not edge_floats.is_empty():
 			job.edge_groups.append([name, PackedFloat32Array(edge_floats), edge_floats.size() / STRIDE, data])
 			job.edge_dirs |= edge_mask
+
+
+## One kind's instances through DecorNative: the same as the loop in _run_job (order, raised first part,
+## buffer, edge list, model buckets), appended to the job's groups.
+static func _fill_native(nat: Object, job: BuildJob, name: String, data: KindData, tiles: PackedInt32Array, flat_near: bool, share: float, id: int) -> void:
+	if not data.nat_ready:
+		var uv := PackedFloat32Array()
+		for u: Vector4 in data.uvs:
+			uv.append_array([u.x, u.y, u.z, u.w])
+		var sz := PackedFloat32Array()
+		for v: Vector2 in data.sizes:
+			sz.append_array([v.x, v.y])
+		var sh := PackedFloat32Array()
+		for v: Vector2 in data.shifts:
+			sh.append_array([v.x, v.y])
+		data.nat_uvs = uv
+		data.nat_sizes = sz
+		data.nat_shifts = sh
+		data.nat_ready = true
+	var count := tiles.size() >> 1
+	var rising := 0
+	if data.grass_height > 0.0:
+		rising = floori(count * share)
+	var blocks: Array = []
+	if flat_near and data.grass_height > 0.0 and not data.grass_carpet:
+		for dy in range(-1, 2):
+			for dx in range(-1, 2):
+				blocks.append(job.mask if dx == 0 and dy == 0 else job.near.get(Vector2i(dx, dy), PackedInt32Array()))
+	var cfg := {
+		"cx": job.chunk.x, "cy": job.chunk.y, "upright": data.upright, "has_flat": data.has_flat,
+		"lift": data.lift, "grass_height": data.grass_height, "grass_carpet": data.grass_carpet,
+		"rising": rising, "flat_near": flat_near and not blocks.is_empty(),
+		"model_count": data.model_paths.size(), "model_scale": data.model_scale,
+		"model_hs": data.model_height_scale, "model_shift": data.model_shift,
+	}
+	var r: Dictionary = nat.call("fill_group", tiles, cfg, data.nat_uvs, data.nat_sizes, data.nat_shifts, blocks)
+	rising = int(r["rising"])
+	var buffer: PackedFloat32Array = r["buffer"]
+	var edge_tiles: PackedInt32Array = r["edge_tiles"]
+	for i in range(0, edge_tiles.size() - 1, 2):
+		job.edge.append_array([id, edge_tiles[i], edge_tiles[i + 1]])
+	if data.model_paths.size() > 0:
+		var buckets: Array = []
+		for barr: PackedFloat32Array in r["buckets"]:
+			buckets.append([barr, barr.size() / STRIDE])
+		job.groups.append([name, buffer, count, data, rising, buckets])
+	else:
+		job.groups.append([name, buffer, count, data, rising])
+	var edge_floats: PackedFloat32Array = r["edge_floats"]
+	if not edge_floats.is_empty():
+		job.edge_groups.append([name, edge_floats, edge_floats.size() / STRIDE, data])
+		job.edge_dirs |= int(r["edge_mask"])
 
 
 ## The job's mask (the header): floor tiles, then its buildings' footprints and those of its
@@ -1495,32 +1797,124 @@ static func _tuft_blocked(job: BuildJob, x: int, y: int, data: KindData) -> bool
 ## old list's KindData, whose atlas went into its first Kind. A cache by name, which the new list
 ## empties, made a second Kind from the spent atlas ("Invalid image: null", six of them in a cold join)
 ## and kept that one, without a picture, for the session.
+static func _is_rigid_decor(name: String) -> bool:
+	for word: String in ["stump", "coral", "barnacle", "ruin", "iceberg", "fungus", "rock"]:
+		if name.contains(word):
+			return true
+	return false
+
+
+static func _cached_model_tris(path: String, fallback: int) -> int:
+	_kind_mutex.lock()
+	var t := int(_model_tris_cache.get(path, fallback))
+	_kind_mutex.unlock()
+	return t
+
+
+static func _mesh_tris(mesh: Mesh) -> int:
+	if mesh == null:
+		return 0
+	var total := 0
+	for s in mesh.get_surface_count():
+		var arrays := mesh.surface_get_arrays(s)
+		var idx: Variant = arrays[Mesh.ARRAY_INDEX]
+		if idx is PackedInt32Array and not (idx as PackedInt32Array).is_empty():
+			total += (idx as PackedInt32Array).size() / 3
+		elif arrays[Mesh.ARRAY_VERTEX] is PackedVector3Array:
+			total += (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() / 3
+	return total
+
+
+static func _read_decor_mesh(path: String) -> Mesh:
+	var mtime := FileAccess.get_modified_time(path)
+	var cached: Variant = _model_mesh_cache.get(path)
+	if cached is Array and (cached as Array).size() >= 2 and int((cached as Array)[0]) == mtime:
+		return (cached as Array)[1] as Mesh
+	var mesh := ItemModels.read(path)
+	if mesh != null:
+		_model_mesh_cache[path] = [mtime, mesh]
+		var tris := _mesh_tris(mesh)
+		if tris > 0:
+			_kind_mutex.lock()
+			_model_tris_cache[path] = tris
+			_kind_mutex.unlock()
+	return mesh
+
+
 static func _kind(name: String, data: KindData) -> Kind:
 	if name == "" or data == null:
 		return null
 	if data.kind != null:
 		return data.kind
 	var kind: Kind = null
-	if data.atlas != null:
+	var has_models := not data.model_paths.is_empty()
+	if data.atlas != null or has_models:
 		kind = Kind.new()
 		kind.name = name
 		kind.upright = data.upright
-		var t0 := Time.get_ticks_usec()
-		kind.material = ShaderMaterial.new()
-		kind.material.shader = SHADER if kind.upright else SHADER_FLAT
-		if old_sheen_on:
-			kind.material.set_shader_parameter(&"old_sheen", true)
-		Probing.add("dc_k_material", t0)
-		t0 = Time.get_ticks_usec()
-		var texture: ImageTexture = data.texture if data.texture != null else ImageTexture.create_from_image(data.atlas)
-		Probing.add("dc_k_texture", t0)
-		t0 = Time.get_ticks_usec()
-		kind.material.set_shader_parameter("atlas", texture)
-		Probing.add("dc_k_param", t0)
-		data.atlas = null  # the texture has it now; jobs only read the regions
-		data.texture = null
-		t0 = Time.get_ticks_usec()
-		if data.grass_height > 0.0:
+		var texture: ImageTexture = null
+		if data.atlas != null and data.has_flat:
+			var t0 := Time.get_ticks_usec()
+			kind.material = ShaderMaterial.new()
+			kind.material.shader = SHADER if kind.upright else _plant_shader(SHADER_FLAT, SHADER_FLAT_OLD)
+			if old_sheen_on:
+				kind.material.set_shader_parameter(&"old_sheen", true)
+			Probing.add("dc_k_material", t0)
+			t0 = Time.get_ticks_usec()
+			texture = data.texture if data.texture != null else ImageTexture.create_from_image(data.atlas)
+			Probing.add("dc_k_texture", t0)
+			t0 = Time.get_ticks_usec()
+			kind.material.set_shader_parameter("atlas", texture)
+			Probing.add("dc_k_param", t0)
+			data.atlas = null  # the texture has it now; jobs only read the regions
+			data.texture = null
+			t0 = Time.get_ticks_usec()
+			if kind.upright:
+				kind.material.set_shader_parameter("upright", true)
+				var quad := QuadMesh.new()
+				quad.size = Vector2.ONE
+				quad.center_offset = Vector3(0.0, 0.5, 0.0)
+				kind.mesh = quad
+			else:
+				var prio := _flat_priority(name)
+				kind.material.render_priority = prio
+				kind.bake_material = ShaderMaterial.new()
+				kind.bake_material.shader = DecorSheetBaker.SHADER_BAKE
+				kind.bake_material.set_shader_parameter("atlas", texture)
+				kind.bake_material.render_priority = prio
+				var plane := PlaneMesh.new()
+				plane.size = Vector2.ONE
+				kind.mesh = plane
+			Probing.add("dc_k_priority", t0)
+		if has_models:
+			var first_tris := 0
+			for p: String in data.model_paths:
+				var m := _read_decor_mesh(p)
+				var mat := ShaderMaterial.new()
+				mat.shader = SHADER_MODEL
+				mat.set_shader_parameter(&"grass_mode", not kind.upright)
+				mat.set_shader_parameter(&"sway_enabled", not data.model_rigid)
+				mat.set_shader_parameter(&"follow_slope", (not kind.upright) and data.grass_carpet)
+				mat.set_shader_parameter(&"exposure", 0.85)
+				if old_sheen_on:
+					mat.set_shader_parameter(&"old_sheen", true)
+				if m != null and m.has_meta(ItemModels.PICTURE_META):
+					mat.set_shader_parameter(&"use_picture", true)
+					mat.set_shader_parameter(&"picture", m.get_meta(ItemModels.PICTURE_META))
+				kind.model_meshes.append(m)
+				kind.model_materials.append(mat)
+				if first_tris <= 0 and m != null:
+					first_tris = _mesh_tris(m)
+			if not kind.model_meshes.is_empty() and kind.model_meshes[0] != null:
+				kind.is_model = true
+				if not kind.upright:
+					kind.grass_mesh = kind.model_meshes[0]
+					kind.grass_material = kind.model_materials[0]
+					kind.grass_triangles = maxi(first_tris, data.grass_triangles)
+					if kind.material != null:
+						kind.material.set_shader_parameter("raised_shade", CARPET_SHADE if data.grass_carpet else 0.0)
+		elif data.grass_height > 0.0 and texture != null:
+			var tg := Time.get_ticks_usec()
 			kind.grass_triangles = data.grass_triangles
 			kind.grass_material = ShaderMaterial.new()
 			kind.grass_material.set_shader_parameter("atlas", texture)
@@ -1528,7 +1922,7 @@ static func _kind(name: String, data: KindData) -> Kind:
 				kind.grass_material.set_shader_parameter(&"old_sheen", true)
 			if data.grass_carpet:
 				kind.grass_mesh = _carpet_mesh(data.carpet_clumps)
-				kind.grass_material.shader = SHADER_CARPET
+				kind.grass_material.shader = _plant_shader(SHADER_CARPET, SHADER_CARPET_OLD)
 				var cells_tex: ImageTexture = data.carpet_texture if data.carpet_texture != null else ImageTexture.create_from_image(data.carpet_cells)
 				kind.grass_material.set_shader_parameter("cells", cells_tex)
 				data.carpet_texture = null
@@ -1538,44 +1932,23 @@ static func _kind(name: String, data: KindData) -> Kind:
 				kind.material.set_shader_parameter("raised_shade", CARPET_SHADE)
 			else:
 				kind.grass_mesh = _grass_mesh(data.grass_cells)
-				kind.grass_material.shader = SHADER_GRASS
+				kind.grass_material.shader = _plant_shader(SHADER_GRASS, SHADER_GRASS_OLD)
 				kind.grass_material.set_shader_parameter("height", data.grass_height)
 				kind.grass_material.set_shader_parameter("mass_lod", data.grass_lod)
 				kind.grass_material.set_shader_parameter("tuft", data.grass_tuft)
 			kind.grass_material.render_priority = _grass_priority(name)
-		Probing.add("dc_k_grass", t0)
-		t0 = Time.get_ticks_usec()
-		if kind.upright:
-			kind.material.set_shader_parameter("upright", true)
-		else:
-			var prio := _flat_priority(name)
-			kind.material.render_priority = prio
-			kind.bake_material = ShaderMaterial.new()
-			kind.bake_material.shader = DecorSheetBaker.SHADER_BAKE
-			kind.bake_material.set_shader_parameter("atlas", texture)
-			kind.bake_material.render_priority = prio
-		Probing.add("dc_k_priority", t0)
-		t0 = Time.get_ticks_usec()
-		if kind.upright:
-			var quad := QuadMesh.new()
-			quad.size = Vector2.ONE
-			quad.center_offset = Vector3(0.0, 0.5, 0.0)
-			kind.mesh = quad
-		else:
-			var plane := PlaneMesh.new()
-			plane.size = Vector2.ONE
-			kind.mesh = plane
-		Probing.add("dc_k_mesh", t0)
+			Probing.add("dc_k_grass", tg)
 	data.kind = kind
 	return kind
 
 
 ## The decorative's pictures as one atlas (variants side by side), or null without any. Read once,
 ## on whichever thread asks first (worker threads, from _run_job). Each picture is read through
-## mod_files.gd, a mod's from its own folder or zip: none needs the Factorio install here.
+## model_packs.gd first (when a pack overrides it), else mod_files.gd (install / mods).
 static func _kind_data_for(name: String) -> KindData:
 	if name == "":
 		return null
+	_sync_packs()
 	index()
 	if not parallel_kind_load:
 		_kind_mutex.lock()
@@ -1603,10 +1976,11 @@ static func _kind_data_for(name: String) -> KindData:
 		return found
 	var entry: Variant = _index.get(name)
 	var gen := _index_generation
+	var pver := _packs_version
 	_kind_mutex.unlock()
 	var data := _load_kind_data(name, entry)
 	_kind_mutex.lock()
-	if _index_generation == gen:
+	if _index_generation == gen and _packs_version == pver:
 		if not _kind_data.has(name):
 			_kind_data[name] = data
 		else:
@@ -1616,9 +1990,23 @@ static func _kind_data_for(name: String) -> KindData:
 	return data
 
 
-static func _load_kind_data(name: String, entry: Variant) -> KindData:
-	if not (entry is Dictionary):
+static func _load_pack_image(path: String) -> Image:
+	var img: Image = null
+	if path.begins_with("res://") and not FileAccess.file_exists(path):
+		var tex := load(path) as Texture2D
+		if tex != null:
+			img = tex.get_image()
+	else:
+		img = Image.load_from_file(path)
+	if img == null or img.is_empty():
 		return null
+	if img.is_compressed():
+		img.decompress()
+	img.convert(Image.FORMAT_RGBA8)
+	return img
+
+
+static func _load_install_kind_data(name: String, entry: Dictionary) -> KindData:
 	var images: Array[Image] = []
 	var pics: Array = []
 	var files := {}  # path -> Image, as a sheet holds several variants
@@ -1628,6 +2016,144 @@ static func _load_kind_data(name: String, entry: Variant) -> KindData:
 			images.append(image)
 			pics.append(pic)
 	return _make_kind_data(name, entry, images, pics) if not images.is_empty() else null
+
+
+static func _load_kind_data(name: String, entry: Variant) -> KindData:
+	var pack_src := ModelPacks.decor_source(name, false)
+	if pack_src.is_empty() and not (entry is Dictionary):
+		pack_src = ModelPacks.decor_source(name, true)
+	var base_entry: Dictionary = entry if entry is Dictionary else {}
+	if not pack_src.is_empty():
+		var spec: Dictionary = pack_src.get("spec", {})
+		if bool(spec.get("hide", false)):
+			return null
+		var files: Array = pack_src.get("files", [])
+		var mods: Array = pack_src.get("models", [])
+		var pimages: Array[Image] = []
+		for f: Variant in files:
+			var im := _load_pack_image(str(f))
+			if im != null:
+				pimages.append(im)
+		if not mods.is_empty():
+			var layer := str(spec.get("layer", base_entry.get("layer", "decorative")))
+			var upright := layer == UPRIGHT_LAYER
+			var raises: bool = bool(spec["grass"]) if spec.has("grass") else is_grass(name, layer)
+			if not upright and not raises:
+				upright = true
+			var mshift := Vector2.ZERO
+			if spec.get("shift") is Array and (spec["shift"] as Array).size() >= 2:
+				var sa: Array = spec["shift"]
+				mshift = Vector2(float(sa[0]), float(sa[1]))
+			var mscale := maxf(float(spec.get("scale", 1.0)), 0.05)
+			if not upright and raises:
+				var kd: KindData = null
+				if not pimages.is_empty():
+					kd = _make_pack_kind_data(name, base_entry, pimages, spec)
+				elif not base_entry.is_empty():
+					kd = _load_install_kind_data(name, base_entry)
+				if kd == null:
+					kd = KindData.new()
+					kd.name = name
+					kd.upright = false
+					kd.has_flat = false
+					kd.lift = float(LAYER_LIFT.get(layer, 0.036))
+					kd.uvs.append(Vector4.ZERO)
+					kd.sizes.append(Vector2.ONE)
+					kd.shifts.append(mshift)
+				kd.model_paths = PackedStringArray(mods)
+				var style := str(spec.get("grass_style", "auto"))
+				kd.grass_carpet = (style == "carpet") or (style == "auto" and name.contains("carpet"))
+				kd.grass_height = maxf(float(spec.get("grass_height", 0.35)), 0.05)
+				kd.grass_triangles = _cached_model_tris(str(mods[0]), 64 if kd.grass_carpet else 36)
+				kd.model_scale = mscale
+				kd.model_height_scale = (float(spec["grass_height"]) / 0.35) if spec.has("grass_height") else 1.0
+				kd.model_rigid = _is_rigid_decor(name)
+				kd.model_shift = mshift
+				return kd
+			var ukd := KindData.new()
+			ukd.name = name
+			ukd.upright = true
+			ukd.has_flat = false
+			ukd.lift = float(LAYER_LIFT.get(layer, 0.036))
+			ukd.model_paths = PackedStringArray(mods)
+			ukd.model_scale = mscale
+			ukd.model_rigid = _is_rigid_decor(name)
+			ukd.model_shift = mshift
+			for _m in mods.size():
+				ukd.uvs.append(Vector4.ZERO)
+				ukd.sizes.append(Vector2.ONE)
+				ukd.shifts.append(mshift)
+			return ukd
+		if not pimages.is_empty():
+			return _make_pack_kind_data(name, base_entry, pimages, spec)
+	if not (entry is Dictionary):
+		return null
+	return _load_install_kind_data(name, base_entry)
+
+
+static func _make_pack_kind_data(name: String, base_entry: Dictionary, images: Array[Image], spec: Dictionary) -> KindData:
+	var cell := Vector2i.ZERO
+	for image in images:
+		cell = Vector2i(maxi(cell.x, image.get_width()), maxi(cell.y, image.get_height()))
+	var atlas := Image.create(cell.x * images.size(), cell.y, false, Image.FORMAT_RGBA8)
+	var kind := KindData.new()
+	kind.name = name
+	var layer := str(spec.get("layer", base_entry.get("layer", "decorative")))
+	kind.upright = layer == UPRIGHT_LAYER
+	kind.lift = float(LAYER_LIFT.get(layer, 0.036))
+	var mean_span := 0.0
+	var base_pics: Variant = base_entry.get("pics")
+	if base_pics is Array and not (base_pics as Array).is_empty():
+		for bp: Variant in (base_pics as Array):
+			if bp is Array and (bp as Array).size() >= 6:
+				var psc := float((bp as Array)[5])
+				mean_span += maxf(float((bp as Array)[3]) * psc / PX_PER_TILE, float((bp as Array)[4]) * psc / PX_PER_TILE)
+		mean_span /= float((base_pics as Array).size())
+	var shift := Vector2.ZERO
+	if spec.get("shift") is Array and (spec["shift"] as Array).size() >= 2:
+		var sa: Array = spec["shift"]
+		shift = Vector2(float(sa[0]), float(sa[1]))
+	var synth_pics: Array = []
+	var mean_size := Vector2.ZERO
+	for i in images.size():
+		var image := images[i]
+		atlas.blit_rect(image, Rect2i(Vector2i.ZERO, image.get_size()), Vector2i(i * cell.x, 0))
+		var iw := float(maxi(image.get_width(), 1))
+		var ih := float(maxi(image.get_height(), 1))
+		var size := Vector2.ZERO
+		var pic_scale := 0.5
+		if spec.has("size"):
+			var sz: Array = spec["size"]
+			size = Vector2(float(sz[0]), float(sz[1]))
+			pic_scale = maxf(size.x * PX_PER_TILE / iw, size.y * PX_PER_TILE / ih)
+		elif spec.has("scale"):
+			pic_scale = float(spec["scale"])
+			size = Vector2(iw, ih) * pic_scale / PX_PER_TILE
+		elif mean_span > 0.0:
+			pic_scale = mean_span * PX_PER_TILE / maxf(iw, ih)
+			size = Vector2(iw, ih) * pic_scale / PX_PER_TILE
+		else:
+			pic_scale = 0.5
+			size = Vector2(iw, ih) * pic_scale / PX_PER_TILE
+		kind.uvs.append(Vector4(float(i * cell.x) / atlas.get_width(), iw / atlas.get_width(),
+			ih / atlas.get_height(), 0.0))
+		kind.sizes.append(size)
+		kind.shifts.append(shift)
+		mean_size += size / float(images.size())
+		synth_pics.append(["", 0, 0, int(iw), int(ih), pic_scale, shift.x, shift.y])
+	var raises: bool = bool(spec["grass"]) if spec.has("grass") else is_grass(name, layer)
+	if raises and not kind.upright:
+		var box := _box_of(base_entry) if base_entry.has("box") else Rect2(-mean_size * 0.5, mean_size)
+		_size_grass(kind, synth_pics, images, box, spec)
+	if not kind.upright:
+		atlas.fix_alpha_edges()
+	atlas.generate_mipmaps()
+	kind.atlas = atlas
+	if texture_thread:
+		kind.texture = ImageTexture.create_from_image(atlas)
+		if kind.carpet_cells != null:
+			kind.carpet_texture = ImageTexture.create_from_image(kind.carpet_cells)
+	return kind
 
 
 static func _make_kind_data(name: String, entry: Dictionary, images: Array[Image], pics: Array) -> KindData:
@@ -1675,12 +2201,13 @@ static func is_grass(name: String, layer: String) -> bool:
 ## tiles tall). Roots: where each picture's plant is centred, left out of its baked shadow, packed in
 ## its region's spare number (the shader unpacks it). Carpets, wide scatters of short blades, are clumps
 ## of their own picture's pieces (_carpet_cells).
-static func _size_grass(kind: KindData, pics: Array, images: Array[Image], box: Rect2) -> void:
+static func _size_grass(kind: KindData, pics: Array, images: Array[Image], box: Rect2, spec := {}) -> void:
 	var mean := Vector2.ZERO
 	for s in kind.sizes:
 		mean += s / kind.sizes.size()
 	var span := maxf(mean.x, mean.y)
-	var carpet := span > GRASS_CARPET
+	var style := str(spec.get("grass_style", "auto"))
+	var carpet := (style == "carpet") if style != "auto" else (span > GRASS_CARPET)
 	var cover := 0.0
 	for i in images.size():
 		var plant := _plant_of(images[i])
@@ -1688,14 +2215,19 @@ static func _size_grass(kind: KindData, pics: Array, images: Array[Image], box: 
 		var root := Vector2(plant.x, plant.y).clamp(Vector2(0.2, 0.2), Vector2(0.8, 0.8))
 		kind.uvs[i].w = floorf(root.x * 63.0) / 64.0 + floorf(root.y * 63.0) / 4096.0
 	kind.grass_carpet = carpet
-	kind.grass_tuft = not carpet and cover < GRASS_BUSH_COVER
+	if style == "tuft":
+		kind.grass_tuft = true
+	elif style == "bush":
+		kind.grass_tuft = false
+	else:
+		kind.grass_tuft = not carpet and cover < GRASS_BUSH_COVER
 	kind.grass_cells = GRASS_CELLS
 	if carpet:
 		_carpet_cells(kind, pics, images, box)
-		kind.grass_height = CARPET_CLUMP.y / 0.9 * CARPET_STRETCH
+		kind.grass_height = float(spec["grass_height"]) if spec.has("grass_height") else (CARPET_CLUMP.y / 0.9 * CARPET_STRETCH)
 		kind.grass_triangles = kind.carpet_clumps * 4
 		return
-	kind.grass_height = clampf(0.42 * sqrt(mean.x * mean.y), 0.2, 0.7)
+	kind.grass_height = float(spec["grass_height"]) if spec.has("grass_height") else clampf(0.42 * sqrt(mean.x * mean.y), 0.2, 0.7)
 	kind.grass_triangles = _grid_triangles(kind.grass_cells)
 	var px_per_cell := span / kind.grass_cells * PX_PER_TILE / maxf(float(pics[0][5]), 0.01)
 	kind.grass_lod = maxf(log(px_per_cell) / log(2.0) - 1.0, 0.0)
@@ -1839,10 +2371,16 @@ static func _grass_mesh(cells: int) -> Mesh:
 static func _flat_priority(name: String) -> int:
 	if _flat_order.is_empty():
 		var flat: Array = []
+		var packs_used := ModelPacks.has_any_decoratives()
 		for n: String in index():
 			var entry: Dictionary = index()[n]
-			if str(entry.get("layer", "")) != UPRIGHT_LAYER:
-				flat.append([float(LAYER_LIFT.get(str(entry.get("layer", "")), 0.036)), n])
+			var layer := str(entry.get("layer", ""))
+			if packs_used:
+				var src := ModelPacks.decor_source(n, true)
+				if not src.is_empty():
+					layer = str((src.get("spec", {}) as Dictionary).get("layer", layer))
+			if layer != UPRIGHT_LAYER:
+				flat.append([float(LAYER_LIFT.get(layer, 0.036)), n])
 		flat.sort()
 		for i in flat.size():
 			_flat_order[flat[i][1]] = i
@@ -1855,14 +2393,23 @@ static func _flat_priority(name: String) -> int:
 static func _grass_priority(name: String) -> int:
 	if _grass_order.is_empty():
 		var names: Array = []
+		var packs_used := ModelPacks.has_any_decoratives()
 		for n: String in index():
-			if is_grass(n, str(index()[n].get("layer", ""))):
+			var layer := str(index()[n].get("layer", ""))
+			var raises := is_grass(n, layer)
+			if packs_used:
+				var src := ModelPacks.decor_source(n, true)
+				if not src.is_empty():
+					var sp: Dictionary = src.get("spec", {})
+					layer = str(sp.get("layer", layer))
+					raises = bool(sp["grass"]) if sp.has("grass") else is_grass(n, layer)
+			if raises and layer != UPRIGHT_LAYER:
 				names.append(n)
 		names.sort()
 		for i in names.size():
 			_grass_order[names[i]] = i
 	var rank := int(_grass_order.get(name, _grass_order.size()))
-	return Material.RENDER_PRIORITY_MIN + FLAT_PRIORITIES + mini(rank * GRASS_PRIORITIES / maxi(_grass_order.size(), 1), GRASS_PRIORITIES - 1)
+	return Material.RENDER_PRIORITY_MIN + FLAT_PRIORITIES + 1 + mini(rank * GRASS_PRIORITIES / maxi(_grass_order.size(), 1), GRASS_PRIORITIES - 1)
 
 
 ## [file, x, y, width, height, scale, shift x, shift y] -> that region of the file, or null.
@@ -1885,12 +2432,33 @@ static func _region(pic: Array, files: Dictionary) -> Image:
 	return image.get_region(r)
 
 
+static func _sync_packs() -> void:
+	if _packs_version < 0:
+		ModelPacks.active()
+		_packs_version = ModelPacks.decor_version
+		return
+	if _packs_version == ModelPacks.decor_version:
+		return
+	_packs_version = ModelPacks.decor_version
+	_kind_mutex.lock()
+	# Keep previously built textures alive in _retired while chunks rebuild on worker threads.
+	_retired = [_kind_data.duplicate()]
+	_kind_data.clear()
+	_flat_order = {}
+	_grass_order = {}
+	_model_tris_cache.clear()
+	_kind_mutex.unlock()
+	if OS.get_thread_caller_id() == OS.get_main_thread_id():
+		_model_mesh_cache.clear()
+
+
 ## tools/decor_index.py's {name: {layer, box, pics}}, with the bridge's list (mod_graphics.gd: every
 ## mod's decoratives) over it; empty without either. A new list drops the pictures read for names
 ## it has, and those found missing, so they are read again from it. Made again on the main thread
 ## only (_process, _build): workers (_kind_data_for, under the mutex) read the one there is, as the
 ## main thread's _kind and _flat_priority read their KindData's Kind and _flat_order without it.
 static func index() -> Dictionary:
+	_sync_packs()
 	if _index_generation != ModGraphics.generation and OS.get_thread_caller_id() == OS.get_main_thread_id():
 		var target_gen := ModGraphics.generation
 		var merged := {}
@@ -1912,10 +2480,6 @@ static func index() -> Dictionary:
 		_index = merged
 		_kind_mutex.unlock()
 	return _index
-
-
-static func _array(v) -> Array:
-	return v if v is Array else []
 
 
 ## A number from the wire, 0 for anything else (null, a list, a string).
@@ -1964,6 +2528,13 @@ static func _edges_equal(a: Array, b: Array) -> bool:
 		if (ea[1] as PackedFloat32Array) != (eb[1] as PackedFloat32Array):
 			return false
 	return true
+
+
+## The optimised shader, or with --grass-opt=old (or --grass-backlight=old) the legacy copy at old_path.
+static func _plant_shader(optimised: Shader, old_path: String) -> Shader:
+	if legacy_shaders:
+		return load(old_path) as Shader
+	return optimised
 
 
 static func _sheet_mesh(hills: bool) -> PlaneMesh:
@@ -2056,9 +2627,12 @@ func _record_flat_sheet_state(c: Vector2i, flat_list: Array, edge_list: Array, n
 	else:
 		_bake_dirty.erase(c)
 		_sheet_content_dirty.erase(c)
+		_drop_composite(c)
+		_sheet_size.erase(c)
 
 
 func _clear_flat_sheet_state(c: Vector2i) -> void:
+	_drop_composite(c)
 	var old_dirs := int(_edge_dirs.get(c, 0))
 	_flat_groups.erase(c)
 	_edge_flat.erase(c)
@@ -2108,11 +2682,10 @@ func _sync_sheet_hills() -> void:
 
 
 func _update_sheet_move(delta: float) -> void:
-	var focus: Node3D = rig.get("target") if rig != null and is_instance_valid(rig) else null
-	if focus == null or not is_instance_valid(focus) or delta <= 0.0:
+	var at := _focus_xz()
+	if not at.is_finite() or delta <= 0.0:
 		_sheet_move_hold = maxf(_sheet_move_hold - maxf(delta, 0.0), 0.0)
 		return
-	var at := Vector2(focus.global_position.x, focus.global_position.z)
 	if _sheet_move_pos.is_finite():
 		var speed := at.distance_to(_sheet_move_pos) / delta
 		if speed >= SHEET_MOVE_FREEZE_SPEED:
@@ -2136,6 +2709,7 @@ func _has_eligible_bake() -> bool:
 func _step_sheets(delta: float) -> void:
 	_sync_sheet_hills()
 	_update_sheet_move(delta)
+	_sync_composites()
 	if not sheet_enabled or not enabled or not DecorSheetBaker.gpu_available():
 		return
 	if _baker == null and is_inside_tree():
@@ -2206,21 +2780,31 @@ func _apply_sheet(c: Vector2i, gen: int, size: int, texture: ImageTexture, empty
 					node.remove_child(ch)
 					ch.queue_free()
 	if empty or texture == null:
+		_drop_composite(c)
 		_sheet_size.erase(c)
 		if node != null and node.get_child_count() == 0:
 			_chunks.erase(c)
-			node.queue_free()
+			FreeLater.node(node)
 		return
 	if node == null:
 		node = Node3D.new()
 		node.name = "Decor %d,%d" % [c.x, c.y]
 		add_child(node)
 		_chunks[c] = node
+	_sheet_tex[c] = texture
+	if _try_composite(c, texture):
+		# The ground draws it: no separate sheet.
+		if existing_sheet != null:
+			node.remove_child(existing_sheet)
+			existing_sheet.queue_free()
+		_finish_sheet(c, node, size)
+		return
+	_uncomposite(c)
 	if existing_sheet != null:
 		var mat := existing_sheet.material_override as ShaderMaterial
 		if mat == null:
 			mat = ShaderMaterial.new()
-			mat.shader = SHADER_SHEET
+			mat.shader = _plant_shader(SHADER_SHEET, SHADER_SHEET_OLD)
 			if old_sheen_on:
 				mat.set_shader_parameter(&"old_sheen", true)
 			mat.render_priority = SHEET_PRIORITY
@@ -2230,7 +2814,7 @@ func _apply_sheet(c: Vector2i, gen: int, size: int, texture: ImageTexture, empty
 		existing_sheet.mesh = _sheet_mesh(_sheet_hills)
 	else:
 		var mat := ShaderMaterial.new()
-		mat.shader = SHADER_SHEET
+		mat.shader = _plant_shader(SHADER_SHEET, SHADER_SHEET_OLD)
 		if old_sheen_on:
 			mat.set_shader_parameter(&"old_sheen", true)
 		mat.set_shader_parameter(&"sheet", texture)
@@ -2244,8 +2828,142 @@ func _apply_sheet(c: Vector2i, gen: int, size: int, texture: ImageTexture, empty
 		inst.position = Vector3(c.x * CHUNK + CHUNK * 0.5, SHEET_LIFT, c.y * CHUNK + CHUNK * 0.5)
 		inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		inst.layers = Visuals.GROUND_LAYER
-		inst.custom_aabb = AABB(Vector3(-CHUNK * 0.5, -64.0, -CHUNK * 0.5), Vector3(CHUNK, 128.0, CHUNK))
+		if ViewPriority.tight_cull:
+			GroundHeight.cull_box(inst, AABB(Vector3(-CHUNK * 0.5, -1.0, -CHUNK * 0.5), Vector3(CHUNK, 2.5, CHUNK)))
+		else:
+			inst.custom_aabb = AABB(Vector3(-CHUNK * 0.5, -64.0, -CHUNK * 0.5), Vector3(CHUNK, 128.0, CHUNK))
 		node.add_child(inst)
+	_finish_sheet(c, node, size)
+
+
+func _finish_sheet(c: Vector2i, node: Node3D, size: int) -> void:
 	_sheet_size[c] = size
 	if _culled_at.is_finite():
 		_cull_one(c, node, _culled_at)
+	elif _behind_hidden(c):
+		node.visible = false
+	_composite_visible(c, node.visible)
+
+
+## The chunk's ground draws `texture` itself (--decor-composite=off, a coarse or missing ground, or no
+## chunk view: it can't, and a FlatSheet is drawn).
+func _try_composite(c: Vector2i, texture: ImageTexture) -> bool:
+	var cv: Object = _chunk_view(c)
+	if not decor_composite or cv == null or not cv.has_method("set_decor_sheet"):
+		return false
+	if not cv.set_decor_sheet(texture, float(_sheet_shade.get(c, 0.0)), Vector2(c) * float(CHUNK)):
+		_composited.erase(c)
+		return false
+	_composited[c] = true
+	return true
+
+
+## The chunk's ground stops drawing its sheet (a FlatSheet takes over, or the sheet is gone).
+func _uncomposite(c: Vector2i) -> void:
+	if _composited.erase(c):
+		var cv: Object = _chunk_view(c)
+		if cv != null and cv.has_method("clear_decor_sheet"):
+			cv.clear_decor_sheet()
+
+
+func _drop_composite(c: Vector2i) -> void:
+	_uncomposite(c)
+	_sheet_tex.erase(c)
+
+
+func _drop_composites() -> void:
+	for c: Vector2i in _composited.keys():
+		_uncomposite(c)
+	_composited.clear()
+	_sheet_tex.clear()
+
+
+func _composite_visible(c: Vector2i, shown: bool) -> void:
+	if _composited.has(c):
+		var cv: Object = _chunk_view(c)
+		if cv != null and cv.has_method("set_decor_sheet_visible"):
+			cv.set_decor_sheet_visible(shown)
+
+
+func _chunk_view(c: Vector2i) -> Object:
+	if world == null or not is_instance_valid(world):
+		return null
+	var cv = world.chunks.get(c)
+	return cv if cv is Object and is_instance_valid(cv) else null
+
+
+## A chunk's ground meshes in and out (built later than its sheet, rebuilt, far and coarse again): the sheet
+## moves between the ground's own shader and a FlatSheet to suit, a few times a second.
+func _sync_composites() -> void:
+	_composite_tick += 1
+	if _composite_tick % 6 != 0 or _sheet_tex.is_empty():
+		return
+	for c: Vector2i in _sheet_tex.keys():
+		var cv: Object = _chunk_view(c)
+		if cv == null or not cv.has_method("can_composite_decor"):
+			continue
+		var want: bool = decor_composite and cv.can_composite_decor()
+		var have: bool = _composited.has(c) and cv.has_decor_sheet()
+		if want != have or (_composited.has(c) and not have):
+			_apply_sheet(c, int(_sheet_gen.get(c, 0)), int(_sheet_size.get(c, 0)), _sheet_tex[c], false)
+
+
+## Sorted list of every decorative known from Factorio's index and active mods' graphics list.
+static func known_decor_names() -> Array:
+	var idx := index()
+	var seen := {}
+	if ItemIcons.factorio_data_dir() != "" or not ModGraphics.decor.is_empty():
+		for k in idx:
+			seen[str(k)] = true
+	else:
+		return []
+	var out := seen.keys()
+	out.sort()
+	return out
+
+
+## Whether Factorio's definitions or the active mods' graphics list defines `decor_name`.
+static func has_decor_def(decor_name: String) -> bool:
+	var idx := index()
+	if ModGraphics.decor.has(decor_name):
+		return true
+	return ItemIcons.factorio_data_dir() != "" and idx.has(decor_name)
+
+
+## Swatch preview (up to 128 x 128, FORMAT_RGBA8) of Factorio's or a mod's own decorative picture.
+static func preview_image(decor_name: String) -> Image:
+	var entry: Variant = index().get(decor_name)
+	if not (entry is Dictionary):
+		return null
+	if not ModGraphics.decor.has(decor_name) and ItemIcons.factorio_data_dir() == "":
+		return null
+	var files := {}
+	for pic in (entry as Dictionary).get("pics", []):
+		if pic is Array:
+			var img := _region(pic as Array, files)
+			if img != null and not img.is_empty():
+				return _fit_preview_swatch(img)
+	return null
+
+
+## Swatch preview (up to 128 x 128, FORMAT_RGBA8) from a model pack's decorative file list.
+static func pack_preview_image(files: Array) -> Image:
+	if files.is_empty():
+		return null
+	var img := _load_pack_image(str(files[0]))
+	return _fit_preview_swatch(img)
+
+
+static func _fit_preview_swatch(img: Image) -> Image:
+	if img == null or img.is_empty():
+		return null
+	var out := img.duplicate() as Image
+	if out.is_compressed():
+		out.decompress()
+	out.convert(Image.FORMAT_RGBA8)
+	var w := out.get_width()
+	var h := out.get_height()
+	if w > 128 or h > 128:
+		var scale := minf(128.0 / float(w), 128.0 / float(h))
+		out.resize(maxi(1, roundi(w * scale)), maxi(1, roundi(h * scale)), Image.INTERPOLATE_LANCZOS)
+	return out

@@ -81,6 +81,9 @@ signal lnet_received(id: int)
 signal pinged
 
 const MessageDecode := preload("res://scripts/net/message_decode.gd")
+const PediaCache := preload("res://scripts/ui/factorio/pedia_cache.gd")
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 const QUICKBAR_SLOTS := 10
 ## The character's main inventory in 2.x, used until the mod sends the real size.
@@ -107,7 +110,7 @@ var counts := {}
 ## build (predicted.gd drops the spend). `--slot-counts=report`: the slots wait for the report, as
 ## before.
 signal shown_changed
-static var shown_fix := not ("--slot-counts=report" in OS.get_cmdline_user_args())
+static var shown_fix := not (Switches.has("--slot-counts=report"))
 var _spent := {}
 ## The main inventory slot (1-based) the hand holds its stack from, its item and quality (0, "": none).
 var _spent_hand := 0
@@ -365,6 +368,9 @@ var pedia_groups: Array = []
 var pedia_pages := {}
 var _pedia_asked := {}  # "kind/name" -> msec of the request
 var _pedia_index_asked := -100000
+var _pedia_fp := ""
+var _pedia_dirty := false
+var _pedia_dirty_msec := 0
 ## The logistic networks window: [{"id", "si", "surface", "logistic": [available, all], "construction",
 ## "cells", "storages", "providers", "requesters", "position" (tiles), "name"}], and networks' contents
 ## by id ({"id", "logistic", "construction", "items": [[item, count, quality?], ...]}).
@@ -426,32 +432,32 @@ func _init() -> void:
 func handle(msg: Dictionary) -> bool:
 	match str(msg.get("t", "")):
 		"inv":
-			set_inventory_totals(_array(msg.get("l")))
+			set_inventory_totals(Wire.array(msg.get("l")))
 		"recipes":
-			set_recipe_list(_array(msg.get("l")))
+			set_recipe_list(Wire.array(msg.get("l")))
 		"slots":
 			var lists = msg.get("l")
 			main_filters.clear()
-			for f in _array(msg.get("fl")):
+			for f in Wire.array(msg.get("fl")):
 				if f is Array and f.size() >= 2:
 					main_filters[int(f[0])] = str(f[1])
 			if lists is Dictionary:
 				other_slots.clear()
 				for role in lists:
-					var list := _array(lists[role])
+					var list := Wire.array(lists[role])
 					if role == "main":
 						set_inventory_slots(list, list.size())
 					else:
 						other_slots[role] = _slot_dicts(list)
 				# The icons of blueprints, books and planners, drawn over the item (slot.gd).
-				for e in _array(msg.get("ic")):
+				for e in Wire.array(msg.get("ic")):
 					var at := int(e[0]) - 1 if e is Array and e.size() >= 2 else -1
 					if at >= 0 and at < main_slots.size() and not (main_slots[at] as Dictionary).is_empty():
-						main_slots[at]["icons"] = _array(e[1])
+						main_slots[at]["icons"] = Wire.array(e[1])
 				inventory_changed.emit()
 		"qb":
 			quickbar_page = maxi(1, int(msg.get("p", 1)))
-			_server_quickbar = _array(msg.get("l"))
+			_server_quickbar = Wire.array(msg.get("l"))
 			var first := (quickbar_page - 1) * QUICKBAR_SLOTS
 			set_quickbar(_server_quickbar.slice(first, first + QUICKBAR_SLOTS))
 		"rdet":
@@ -461,7 +467,7 @@ func handle(msg: Dictionary) -> bool:
 				_apply_recipe_details()
 		"craftable":
 			_craftable.clear()
-			for entry in _array(msg.get("l")):
+			for entry in Wire.array(msg.get("l")):
 				if entry is Array and entry.size() >= 2:
 					_craftable[str(entry[0])] = int(entry[1])
 			if not _rdet.is_empty():
@@ -469,7 +475,7 @@ func handle(msg: Dictionary) -> bool:
 		"cq":
 			var progress := int(msg.get("pr", 0)) / 1000.0
 			var entries: Array = []
-			for entry in _array(msg.get("l")):
+			for entry in Wire.array(msg.get("l")):
 				if entry is Array and entry.size() >= 4:
 					entries.append({"index": int(entry[0]), "recipe": str(entry[1]), "count": int(entry[2]),
 						"progress": progress if entries.is_empty() else 0.0})
@@ -481,16 +487,16 @@ func handle(msg: Dictionary) -> bool:
 				for r in list:
 					if r is Array and r.size() >= 8:
 						techs[str(r[0])] = {
-							"order": str(r[1]), "prerequisites": _array(r[2]), "ingredients": _array(r[3]),
+							"order": str(r[1]), "prerequisites": Wire.array(r[2]), "ingredients": Wire.array(r[3]),
 							"count": int(r[4]), "seconds": float(r[5]), "state": int(r[6]), "trigger": str(r[7]),
 							"effects": [], "level": 1, "max_level": 1, "trigger_detail": [], "saved": 0.0, "formula": "",
 						}
 						if r.size() >= 14:
 							var t: Dictionary = techs[str(r[0])]
-							t["effects"] = _array(r[8])
+							t["effects"] = Wire.array(r[8])
 							t["level"] = int(r[9])
 							t["max_level"] = int(r[10])
-							t["trigger_detail"] = _array(r[11])
+							t["trigger_detail"] = Wire.array(r[11])
 							t["saved"] = int(r[12]) / 1000.0
 							t["formula"] = str(r[13])
 						techs[str(r[0])]["essential"] = int(r[14]) == 1 if r.size() >= 15 else true
@@ -507,8 +513,8 @@ func handle(msg: Dictionary) -> bool:
 			# the overlay come as they are now.
 			map_chart_same = msg.has("same")
 			if not map_chart_same:
-				var pal := _array(msg.get("pal"))
-				var px := _array(msg.get("px"))
+				var pal := Wire.array(msg.get("pal"))
+				var px := Wire.array(msg.get("px"))
 				# Made on the bridge's parsing thread when the message was read (message_decode.gd).
 				var image: Image = msg.get("_img") if msg.get("_img") is Image else null
 				if image == null and n > 0 and px.size() == n * n:
@@ -525,7 +531,7 @@ func handle(msg: Dictionary) -> bool:
 			else:
 				map_pollution.erase(chunk)
 			var ov: Array = []
-			for r in _array(msg.get("ov")):
+			for r in Wire.array(msg.get("ov")):
 				if r is Array and r.size() >= 3:
 					var entry: Array = r.duplicate()
 					entry[1] = int(r[1]) / 256.0
@@ -544,11 +550,11 @@ func handle(msg: Dictionary) -> bool:
 			char_requests = _requests(msg.get("l"))
 			char_requests_on = int(msg.get("on", 1)) == 1
 			char_trash_unrequested = int(msg.get("trash", 0)) == 1
-			char_sections = _array(msg.get("sec")).duplicate(true) if msg.has("sec") else null
-			logistic_groups = _array(msg.get("lgs"))
+			char_sections = Wire.array(msg.get("sec")).duplicate(true) if msg.has("sec") else null
+			logistic_groups = Wire.array(msg.get("lgs"))
 			logistics_changed.emit()
 		"ccol":
-			var c := _array(msg.get("c"))
+			var c := Wire.array(msg.get("c"))
 			if c.size() >= 3:
 				char_color = Color8(int(c[0]), int(c[1]), int(c[2]))
 				char_color_known = true
@@ -556,7 +562,7 @@ func handle(msg: Dictionary) -> bool:
 		"ln":
 			network = {}
 			if int(msg.get("id", 0)) != 0:
-				network = {"id": int(msg.get("id")), "logistic": _array(msg.get("log")), "construction": _array(msg.get("con"))}
+				network = {"id": int(msg.get("id")), "logistic": Wire.array(msg.get("log")), "construction": Wire.array(msg.get("con"))}
 			logistics_changed.emit()
 		"planet":
 			planet = {"name": str(msg.get("name", "")), "props": msg.get("props") if msg.get("props") is Dictionary else {},
@@ -565,20 +571,20 @@ func handle(msg: Dictionary) -> bool:
 				"dusk": int(msg.get("dusk", 0)) / 1000.0, "evening": int(msg.get("evening", 0)) / 1000.0,
 				"morning": int(msg.get("morning", 0)) / 1000.0, "dawn": int(msg.get("dawn", 0)) / 1000.0}
 			heating_radius.clear()
-			for h in _array(msg.get("heat")):
+			for h in Wire.array(msg.get("heat")):
 				if h is Array and h.size() >= 2:
 					heating_radius[int(h[0])] = float(h[1])
 			not_buildable.clear()
-			for r in _array(msg.get("nb")):
+			for r in Wire.array(msg.get("nb")):
 				if r is Array and r.size() >= 4:
 					not_buildable[int(r[0])] = [str(r[1]), float(r[2]), float(r[3])]
 			planet_changed.emit()
 		"seg":
 			demolishers.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 3:
 					var segs: Array = []
-					var f := _array(r[2])
+					var f := Wire.array(r[2])
 					var i := 0
 					while i + 3 < f.size():
 						segs.append({"proto": int(f[i]), "position": Vector2(int(f[i + 1]), int(f[i + 2])) / 256.0,
@@ -588,12 +594,12 @@ func handle(msg: Dictionary) -> bool:
 			demolishers_serial += 1
 			planet_data_changed.emit()
 		"lt":
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 3:
 					lightning_struck.emit(Vector2(int(r[0]), int(r[1])) / 256.0, int(r[2]) == 1)
 		"pg":
 			plant_growth.clear()
-			var l := _array(msg.get("l"))
+			var l := Wire.array(msg.get("l"))
 			var i := 0
 			while i + 3 < l.size():
 				plant_growth[Vector2(int(l[i + 1]), int(l[i + 2])) / 256.0] = int(l[i + 3]) / 1000.0
@@ -601,7 +607,7 @@ func handle(msg: Dictionary) -> bool:
 			planet_data_changed.emit()
 		"sp":
 			spawner_units.clear()
-			var l := _array(msg.get("l"))
+			var l := Wire.array(msg.get("l"))
 			var i := 0
 			while i + 1 < l.size():
 				spawner_units[int(l[i])] = int(l[i + 1])
@@ -610,10 +616,10 @@ func handle(msg: Dictionary) -> bool:
 		"legs":
 			legs_heard += 1
 			legs.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 2:
 					var feet := PackedVector2Array()
-					var f := _array(r[1])
+					var f := Wire.array(r[1])
 					var i := 0
 					while i + 1 < f.size():
 						feet.append(Vector2(int(f[i]), int(f[i + 1])) / 256.0)
@@ -623,19 +629,19 @@ func handle(msg: Dictionary) -> bool:
 		"bf":
 			if int(msg.get("part", 1)) == 1:
 				belt_freshness.clear()
-			var l := _array(msg.get("l"))
+			var l := Wire.array(msg.get("l"))
 			var i := 0
 			while i + 1 < l.size():
 				belt_freshness[int(l[i])] = int(l[i + 1]) / 1000.0
 				i += 2
 		"fz":
 			frozen.clear()
-			for u in _array(msg.get("l")):
+			for u in Wire.array(msg.get("l")):
 				frozen[int(u)] = true
 			planet_data_changed.emit()
 		"cp":
 			cargo_pods.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 4:
 					cargo_pods[int(r[0])] = {"state": str(r[1]), "destination": str(r[2]), "surface": str(r[3])}
 					if r.size() >= 6:
@@ -643,20 +649,20 @@ func handle(msg: Dictionary) -> bool:
 			planet_data_changed.emit()
 		"smap":
 			space_locations.clear()
-			for r in _array(msg.get("loc")):
+			for r in Wire.array(msg.get("loc")):
 				if r is Array and r.size() >= 6:
 					space_locations.append({"name": str(r[0]), "type": str(r[1]), "position": Vector2(int(r[2]), int(r[3])) / 1000.0,
 						"unlocked": int(r[4]) == 1, "surface": int(r[5]) == 1,
 						"magnitude": int(r[6]) / 1000.0 if r.size() >= 9 else 1.0, "orbit": int(r[7]) == 1 if r.size() >= 9 else true,
 						"label": int(r[8]) / 1000.0 if r.size() >= 9 else 0.25})
 			space_connections.clear()
-			for r in _array(msg.get("con")):
+			for r in Wire.array(msg.get("con")):
 				if r is Array and r.size() >= 4:
 					space_connections.append({"from": str(r[0]), "to": str(r[1]), "length": int(r[2]), "danger": int(r[3]) / 1000.0})
 			space_map_changed.emit()
 		"ach":
 			asteroid_chunks.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 5:
 					asteroid_chunks.append({"name": str(r[0]), "position": Vector2(int(r[1]), int(r[2])) / 256.0,
 						"velocity": Vector2(int(r[3]), int(r[4])) / 256.0})
@@ -664,7 +670,7 @@ func handle(msg: Dictionary) -> bool:
 			asteroid_chunks_changed.emit()
 		"bq":
 			belt_quality.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 2:
 					belt_quality[int(r[0])] = str(r[1])
 		"rk":
@@ -673,7 +679,7 @@ func handle(msg: Dictionary) -> bool:
 			platform_state_changed.emit(int(msg.get("i", 0)), str(msg.get("st", "")), str(msg.get("old", "")), str(msg.get("loc", "")))
 		"rc":
 			robot_cargo.clear()
-			var l := _array(msg.get("l"))
+			var l := Wire.array(msg.get("l"))
 			var i := 0
 			while i + 2 < l.size():
 				robot_cargo[int(l[i])] = {"item_id": int(l[i + 1]), "count": int(l[i + 2])}
@@ -681,11 +687,11 @@ func handle(msg: Dictionary) -> bool:
 		"tr":
 			trains.clear()
 			train_of_unit.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 7:
 					var id := int(r[0])
 					var units: Array = []
-					for u in _array(r[6]):
+					for u in Wire.array(r[6]):
 						units.append(int(u))
 						train_of_unit[int(u)] = id
 					trains[id] = {"state": str(r[1]), "manual": int(r[2]) == 1, "speed": int(r[3]) / 1000.0,
@@ -700,11 +706,11 @@ func handle(msg: Dictionary) -> bool:
 						trains_overview.append({"id": int(r[0]), "state": str(r[1]), "manual": int(r[2]) == 1, "stop": str(r[3]),
 							"group": str(r[4]), "carriages": int(r[5]), "unit": int(r[6]),
 							"position": Vector2(int(r[7]), int(r[8])) / 256.0, "si": int(r[9]), "speed": int(r[10]) / 1000.0,
-							"cargo": _array(r[11]), "fluid": _array(r[12])})
+							"cargo": Wire.array(r[11]), "fluid": Wire.array(r[12])})
 				trains_overview_changed.emit()
 		"surfs":
 			map_surfaces.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 5:
 					map_surfaces.append({"si": int(r[0]), "name": str(r[1]), "planet": str(r[2]),
 						"platform": str(r[3]), "pf": int(r[4])})
@@ -713,7 +719,7 @@ func handle(msg: Dictionary) -> bool:
 			if not _shown_surface(msg):
 				return true
 			map_tags.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 6:
 					map_tags.append({"id": int(r[0]), "position": Vector2(int(r[1]), int(r[2])) / 256.0,
 						"text": str(r[3]), "icon_type": str(r[4]), "icon_name": str(r[5])})
@@ -730,7 +736,7 @@ func handle(msg: Dictionary) -> bool:
 				var patch := {}
 				if msg.has("n"):
 					patch = {"n": str(msg["n"]), "a": int(msg.get("a", 0)), "c": int(msg.get("c", 0)), "q": _patch_q,
-						"o": _array(msg.get("o"))}
+						"o": Wire.array(msg.get("o"))}
 					if msg.has("y"):
 						patch["y"] = int(msg["y"])
 					if msg.has("more"):
@@ -753,7 +759,7 @@ func handle(msg: Dictionary) -> bool:
 					for k in msg["eff"]:
 						eff[str(k)] = int(msg["eff"][k])
 					info["eff"] = eff
-				for r in _array(msg.get("m")):
+				for r in Wire.array(msg.get("m")):
 					if r is Array and r.size() >= 2:
 						info["m"].append([str(r[0]), int(r[1]), str(r[2]) if r.size() >= 3 else "normal"])
 				for k in ["b", "n", "de"]:
@@ -761,7 +767,7 @@ func handle(msg: Dictionary) -> bool:
 						info[k] = int(msg[k])
 				if msg.has("rn"):
 					var links: Array = []
-					var flat := _array(msg["rn"])
+					var flat := Wire.array(msg["rn"])
 					for i in range(0, flat.size() - 1, 2):
 						links.append(Vector2(int(flat[i]), int(flat[i + 1])) / 256.0)
 					info["rn"] = links
@@ -772,10 +778,10 @@ func handle(msg: Dictionary) -> bool:
 					info["el"] = el
 				# I2: what is inside, [[role, [[item, count, quality], ...]], ...]
 				var inv: Array = []
-				for rec in _array(msg.get("inv")):
+				for rec in Wire.array(msg.get("inv")):
 					if rec is Array and rec.size() >= 2:
 						var items: Array = []
-						for it in _array(rec[1]):
+						for it in Wire.array(rec[1]):
 							if it is Array and it.size() >= 2:
 								items.append([str(it[0]), int(it[1]), str(it[2]) if it.size() >= 3 else "normal"])
 						if not items.is_empty():
@@ -791,7 +797,7 @@ func handle(msg: Dictionary) -> bool:
 					var io := {}
 					for k in ["i", "o"]:
 						var rows: Array = []
-						for r in _array(msg["io"].get(k)):
+						for r in Wire.array(msg["io"].get(k)):
 							if r is Array and r.size() >= 3:
 								rows.append([str(r[0]), str(r[1]), int(r[2])])
 						io[k] = rows
@@ -803,19 +809,19 @@ func handle(msg: Dictionary) -> bool:
 			if _answered_early.erase(int(msg.get("id", 0))):
 				return true  # answered when it was read
 			var lines: Array = []
-			for l in _array(msg.get("l")):
+			for l in Wire.array(msg.get("l")):
 				lines.append(str(l))
 			command_answered.emit(int(msg.get("id", 0)), lines, int(msg.get("ok", 1)) != 0)
 			command_reply.emit(int(msg.get("id", 0)), msg)
 		"terr":
 			if int(msg.get("part", 1)) == 1:
 				_territory_parts.clear()
-			_territory_parts.append_array(_array(msg.get("l")))
+			_territory_parts.append_array(Wire.array(msg.get("l")))
 			if int(msg.get("part", 1)) >= int(msg.get("parts", 1)):
 				territory_edges = territory_borders(_territory_parts)
 				territory_chunks.clear()
 				for t in _territory_parts:
-					var flat := _array(t)
+					var flat := Wire.array(t)
 					for i in range(0, flat.size() - 1, 2):
 						territory_chunks[Vector2i(int(flat[i]), int(flat[i + 1]))] = true
 				territory_si = int(msg.get("si", 0))
@@ -825,14 +831,14 @@ func handle(msg: Dictionary) -> bool:
 				if int(msg.get("part", 1)) == 1:
 					_map_train_parts.clear()
 					if msg.has("cov"):
-						var cov := _array(msg.get("cov"))
+						var cov := Wire.array(msg.get("cov"))
 						map_coverage.clear()
 						for i in range(0, cov.size() - 2, 3):
 							var d := int(cov[i + 2])
 							map_coverage.append(Rect2i(int(cov[i]) - d, int(cov[i + 1]) - d, 2 * d + 1, 2 * d + 1))
 						map_coverage_known = true
 						map_coverage_all = int(msg.get("all", 0)) == 1
-				for v in _array(msg.get("l")):
+				for v in Wire.array(msg.get("l")):
 					_map_train_parts.append(int(v))
 				if int(msg.get("part", 1)) >= int(msg.get("parts", 1)):
 					map_trains = _map_train_parts.duplicate()
@@ -841,14 +847,14 @@ func handle(msg: Dictionary) -> bool:
 			planners.handle(msg)
 		"clip":
 			clipboard.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 4:
 					clipboard.append({"p": int(r[0]), "at": Vector2(int(r[1]), int(r[2])) / 256.0, "d": int(r[3])})
 			clipboard_changed.emit()
 		"iuse":
 			if int(msg.get("part", 1)) == 1:
 				item_uses.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if not (r is Array and r.size() >= 3):
 					continue
 				var item := str(r[0])
@@ -871,12 +877,12 @@ func handle(msg: Dictionary) -> bool:
 						u["h"] = [float(r[2]), float(r[3]) if r.size() > 3 else 0.0]
 				item_uses[item] = u
 		"eprops":
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 4:
 					eprops[int(r[0])] = {"under": float(r[1]), "wire": float(r[2]), "supply": float(r[3]),
 						"x": r[4] if r.size() > 4 and r[4] is Dictionary else {}}
 		"chat":
-			var c := _array(msg.get("c"))
+			var c := Wire.array(msg.get("c"))
 			var line := [str(msg.get("from", "")), str(msg.get("text", "")), Time.get_ticks_msec(),
 				Color(float(c[0]), float(c[1]), float(c[2])) if c.size() >= 3 else Color(0, 0, 0, 0)]
 			chat_log.append(line)
@@ -885,22 +891,22 @@ func handle(msg: Dictionary) -> bool:
 			chat_received.emit(line[0], line[1])
 		"bonus":
 			bonuses = []
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 3:
-					bonuses.append([str(r[0]), float(r[1]), _array(r[2])])
+					bonuses.append([str(r[0]), float(r[1]), Wire.array(r[2])])
 			bonuses_changed.emit()
 		"perms":
 			perm_groups = []
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 2:
-					perm_groups.append([str(r[0]), _array(r[1])])
+					perm_groups.append([str(r[0]), Wire.array(r[1])])
 			perm_me = str(msg.get("me", ""))
 			perms_changed.emit()
 		"stats":
-			stats_graph = _array(msg.get("gr"))
-			stats_storage = _array(msg.get("st"))
-			stats_flow = _array(msg.get("ef"))
-			stats_received.emit(str(msg.get("kind", "item")), int(msg.get("prec", 2)), _array(msg.get("l")))
+			stats_graph = Wire.array(msg.get("gr"))
+			stats_storage = Wire.array(msg.get("st"))
+			stats_flow = Wire.array(msg.get("ef"))
+			stats_received.emit(str(msg.get("kind", "item")), int(msg.get("prec", 2)), Wire.array(msg.get("l")))
 		"eq":
 			var kind := str(msg.get("kind", "char"))
 			var g := {"unit": int(msg.get("u", 0)), "w": int(msg.get("w", 0)), "h": int(msg.get("h", 0)), "equipment": [],
@@ -908,7 +914,7 @@ func handle(msg: Dictionary) -> bool:
 				"max_battery": float(msg.get("mbat", 0)), "power": float(msg.get("gen", 0)), "movement": int(msg.get("mv", 0)) / 1000.0,
 				"inventory": int(msg.get("inv", 0)), "movement_on": int(msg.get("mvon", 1)) == 1, "night_vision": int(msg.get("nv", 0)) == 1,
 				"roboport_on": int(msg.get("rb", -1))}
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 11:
 					g["equipment"].append({"name": str(r[0]), "x": int(r[1]), "y": int(r[2]), "w": int(r[3]), "h": int(r[4]),
 						"quality": str(r[5]), "energy": float(r[6]), "max_energy": float(r[7]), "shield": float(r[8]),
@@ -929,7 +935,7 @@ func handle(msg: Dictionary) -> bool:
 			players.clear()
 			me_player = int(msg.get("me", 0))
 			me_unit = int(msg.get("u", 0))
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 11:
 					players.append({"index": int(r[0]), "name": str(r[1]), "connected": int(r[2]) == 1,
 						"color": Color8(int(r[3]), int(r[4]), int(r[5])), "unit": int(r[6]), "surface": str(r[7]),
@@ -939,17 +945,17 @@ func handle(msg: Dictionary) -> bool:
 		"al":
 			alerts.clear()
 			alerts_known = true
-			for a in _array(msg.get("l")):
+			for a in Wire.array(msg.get("l")):
 				if a is Array and a.size() >= 3:
 					var ents: Array = []
-					for e in _array(a[2]):
+					for e in Wire.array(a[2]):
 						if e is Array and e.size() >= 5:
 							ents.append({"position": Vector2(int(e[0]), int(e[1])) / 256.0, "si": int(e[2]), "name": str(e[3]),
 								"unit": int(e[4]), "subject": str(e[5]) if e.size() > 5 else ""})
 					alerts.append({"kind": str(a[0]), "count": int(a[1]), "entities": ents})
 			alerts_changed.emit()
 		"pidx":
-			var groups := _array(msg.get("g"))
+			var groups := Wire.array(msg.get("g"))
 			if int(msg.get("part", 1)) == 1:
 				pedia_groups = groups
 			var list = _gather(msg)
@@ -958,39 +964,46 @@ func handle(msg: Dictionary) -> bool:
 				for r in list:
 					if r is Array and r.size() >= 5:
 						pedia_index.append({"kind": str(r[0]), "name": str(r[1]), "group": str(r[2]), "sub": str(r[3]), "order": str(r[4])})
+				if _pedia_fp != "":
+					_pedia_dirty = true
+					_pedia_dirty_msec = Time.get_ticks_msec()
 				pedia_index_changed.emit()
 		"pedia":
 			var key := "%s/%s" % [str(msg.get("kind", "")), str(msg.get("name", ""))]
-			pedia_pages[key] = {"found": int(msg.get("found", 0)) == 1, "d": msg.get("d") if msg.get("d") is Dictionary else {}}
+			var found := int(msg.get("found", 0)) == 1
+			pedia_pages[key] = {"found": found, "d": msg.get("d") if msg.get("d") is Dictionary else {}}
 			_pedia_asked.erase(key)
+			if _pedia_fp != "" and found and PediaCache.is_cacheable_kind(str(msg.get("kind", ""))):
+				_pedia_dirty = true
+				_pedia_dirty_msec = Time.get_ticks_msec()
 			pedia_page_received.emit(str(msg.get("kind", "")), str(msg.get("name", "")))
 		"lnets":
 			lnets.clear()
-			for r in _array(msg.get("l")):
+			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 12:
-					lnets.append({"id": int(r[0]), "si": int(r[1]), "surface": str(r[2]), "logistic": _array(r[3]),
-						"construction": _array(r[4]), "cells": int(r[5]), "storages": int(r[6]), "providers": int(r[7]),
+					lnets.append({"id": int(r[0]), "si": int(r[1]), "surface": str(r[2]), "logistic": Wire.array(r[3]),
+						"construction": Wire.array(r[4]), "cells": int(r[5]), "storages": int(r[6]), "providers": int(r[7]),
 						"requesters": int(r[8]), "position": Vector2(int(r[9]), int(r[10])) / 256.0, "name": str(r[11])})
 			lnets_changed.emit()
 		"lnet":
 			var id := int(msg.get("id", 0))
 			if int(msg.get("found", 0)) == 1:
-				lnet[id] = {"id": id, "logistic": _array(msg.get("log")), "construction": _array(msg.get("con")),
-					"items": _array(msg.get("items"))}
+				lnet[id] = {"id": id, "logistic": Wire.array(msg.get("log")), "construction": Wire.array(msg.get("con")),
+					"items": Wire.array(msg.get("items"))}
 			else:
 				lnet.erase(id)
 			lnet_received.emit(id)
 		"rs":
 			research = str(msg.get("cur", ""))
 			research_progress = int(msg.get("pr", 0)) / 1000.0
-			research_queue = _array(msg.get("q"))
+			research_queue = Wire.array(msg.get("q"))
 			if research != "":
 				research_finished = ""
 				research_finished_level = 0
 			research_changed.emit()
 		"rdone":
 			var done: Array = []
-			for e in _array(msg.get("l")):
+			for e in Wire.array(msg.get("l")):
 				if e is Array and not (e as Array).is_empty() and str(e[0]) != "":
 					var level := 0
 					if e.size() > 1 and (e[1] is float or e[1] is int):
@@ -1446,8 +1459,8 @@ func recipe_info(name: String) -> Dictionary:
 	var d := pedia_data("recipe", name)
 	if d.is_empty():
 		return r if not r.is_empty() else {"name": name}
-	return {"name": name, "energy": float(d.get("time", -1.0)), "ingredients": _pairs(_array(d.get("ing"))),
-		"products": _pairs(_array(d.get("prod")))}
+	return {"name": name, "energy": float(d.get("time", -1.0)), "ingredients": _pairs(Wire.array(d.get("ing"))),
+		"products": _pairs(Wire.array(d.get("prod")))}
 
 
 func _add_raw(r: Dictionary, crafts: float, out: Dictionary, path: Array) -> void:
@@ -1475,8 +1488,8 @@ func _recipe(d: Dictionary) -> Dictionary:
 		"order": str(d.get("order", "")),
 		"group_index": 0,
 		"energy": float(d.get("energy", -1)),
-		"ingredients": _array(d.get("ingredients")),
-		"products": _array(d.get("products")),
+		"ingredients": Wire.array(d.get("ingredients")),
+		"products": Wire.array(d.get("products")),
 		"server_craftable": int(d.get("craftable", -1)),
 		"craftable": int(d.get("craftable", -1)),
 	}
@@ -1524,7 +1537,7 @@ func _apply_recipe_details() -> void:
 		list.append({
 			"name": str(r[0]), "energy": float(r[1]), "group": str(r[3]),
 			"subgroup": "%s %s" % [str(r[6]), str(r[5])], "order": str(r[7]),
-			"ingredients": _pairs(_array(r[8])), "products": _pairs(_array(r[9])),
+			"ingredients": _pairs(Wire.array(r[8])), "products": _pairs(Wire.array(r[9])),
 			"craftable": int(_craftable.get(str(r[0]), 0)),
 		})
 	var order: Array = group_orders.keys()
@@ -1877,6 +1890,49 @@ func forget_pedia_page(kind: String, name: String) -> void:
 	_pedia_asked.erase(key)
 
 
+## Associates Factoriopedia with mod-graphics fingerprint `fp`, loading cached static pages or
+## clearing force-dependent pages (`recipe`, `technology`) on reconnect within the same modpack.
+func set_pedia_fingerprint(fp: String) -> void:
+	if _pedia_dirty and _pedia_fp != "" and _pedia_fp != fp:
+		flush_pedia_cache(true)
+	if fp == _pedia_fp:
+		for k in pedia_pages.keys():
+			if not PediaCache.is_cacheable_kind(str(k).get_slice("/", 0)):
+				pedia_pages.erase(k)
+		for k in _pedia_asked.keys():
+			if not PediaCache.is_cacheable_kind(str(k).get_slice("/", 0)):
+				_pedia_asked.erase(k)
+		return
+	_pedia_fp = fp
+	_pedia_dirty = false
+	pedia_groups = []
+	pedia_index.clear()
+	pedia_pages.clear()
+	_pedia_asked.clear()
+	_pedia_index_asked = -100000
+	if fp != "":
+		var cached := PediaCache.load_for(fp)
+		if not cached.is_empty():
+			var c_groups: Variant = cached.get("groups")
+			var c_index: Variant = cached.get("index")
+			var c_pages: Variant = cached.get("pages")
+			pedia_groups = c_groups if c_groups is Array else []
+			pedia_index = c_index if c_index is Array else []
+			pedia_pages = c_pages if c_pages is Dictionary else {}
+			if not pedia_index.is_empty():
+				pedia_index_changed.emit()
+
+
+## Writes dirty Factoriopedia index and static pages to disk once settled or when forced on exit.
+func flush_pedia_cache(force := false) -> void:
+	if not _pedia_dirty or _pedia_fp == "":
+		return
+	if not force and Time.get_ticks_msec() - _pedia_dirty_msec < PediaCache.SAVE_DELAY_MSEC:
+		return
+	_pedia_dirty = false
+	PediaCache.save_for(_pedia_fp, pedia_groups, pedia_index, pedia_pages)
+
+
 ## An item's or entity's page data ("d"), the entity's own part for an item that builds one; {}
 ## while it isn't known.
 func pedia_data(kind: String, name: String) -> Dictionary:
@@ -2061,7 +2117,7 @@ func set_character_requests(requests: Array, on := true, trash_unrequested := fa
 ## [[item, min, max, quality?], ...] from the wire into dictionaries.
 static func _requests(v) -> Array:
 	var out: Array = []
-	for r in _array(v):
+	for r in Wire.array(v):
 		if r is Array and r.size() >= 3:
 			out.append({"item": str(r[0]), "min": int(r[1]), "max": int(r[2]), "quality": str(r[3]) if r.size() >= 4 else "normal"})
 	return out
@@ -2178,8 +2234,20 @@ func set_map_surface(si: int) -> void:
 
 ## The character is on surface `si` now (welcome, surface): the map shows it again.
 func set_character_surface(si: int) -> void:
+	var prev := shown_surface()
 	character_si = si
 	map_si = 0
+	if prev > 0 and shown_surface() != prev:
+		map_charts.clear()
+		map_pollution.clear()
+		map_overlays.clear()
+		map_tags.clear()
+		map_trains.clear()
+		map_coverage.clear()
+		map_coverage_known = false
+		map_coverage_all = false
+		tags_changed.emit()
+		map_trains_changed.emit()
 	# Joined (perhaps another game) or moved: the roboports are listed again when next needed.
 	_roboports.clear()
 	_roboport_parts.clear()
@@ -2213,7 +2281,7 @@ func _roboport_part(msg: Dictionary) -> void:
 		_roboport_parts.erase(si)
 		return
 	var l: PackedInt32Array = got[1]
-	for v in _array(msg.get("l")):
+	for v in Wire.array(msg.get("l")):
 		l.append(int(v))
 	if int(msg.get("last", 0)) != 1:
 		_roboport_parts[si] = [part + 1, l]
@@ -2332,7 +2400,7 @@ static func territory_borders(territories: Array) -> PackedVector2Array:
 	var sides := [[Vector2i(0, -1), Vector2(0, 0), Vector2(1, 0)], [Vector2i(1, 0), Vector2(1, 0), Vector2(1, 1)],
 		[Vector2i(0, 1), Vector2(0, 1), Vector2(1, 1)], [Vector2i(-1, 0), Vector2(0, 0), Vector2(0, 1)]]
 	for t in territories:
-		var flat := _array(t)
+		var flat := Wire.array(t)
 		var mine := {}
 		for i in range(0, flat.size() - 1, 2):
 			mine[Vector2i(int(flat[i]), int(flat[i + 1]))] = true
@@ -2461,7 +2529,7 @@ func _gather(msg: Dictionary) -> Variant:
 		_parts[t] = []
 	if not _parts.has(t):
 		return null
-	(_parts[t] as Array).append_array(_array(msg.get("l")))
+	(_parts[t] as Array).append_array(Wire.array(msg.get("l")))
 	if part < int(msg.get("parts", 1)):
 		return null
 	var list: Array = _parts[t]
@@ -2476,5 +2544,6 @@ static func chart_image(n: int, pal: Array, px: Array) -> Image:
 	return MessageDecode.chart_image(n, pal, px)
 
 
+## Kept for external callers (mod_gui.gd).
 static func _array(v) -> Array:
-	return v if v is Array else []
+	return Wire.array(v)

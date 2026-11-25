@@ -15,8 +15,12 @@ extends SceneTree
 ## crashed the C++ twin on Aquilo) runs sparse and packed.
 
 const BeltSim := preload("res://scripts/world/belt_sim.gd")
+const BeltLattice := preload("res://scripts/world/belt_lattice.gd")
+const BeltRecords := preload("res://scripts/world/belt_records.gd")
+const ItemCards := preload("res://scripts/world/item_cards.gd")
 const NativeLibrary := preload("res://scripts/native_library.gd")
 const Replay := preload("res://tests/belt_sim_replay.gd")
+const BeltItems := preload("res://scripts/world/belt_items.gd")
 const DEFAULT := "res://tests/data/belt_sim_small.json"
 const STATE_KEYS := ["uid", "item", "stack", "key", "pos", "tick", "speed", "reach", "run", "num", "gone", "gone_tick", "gone_at", "mismatch",
 	"mismatch_n", "hand_uid", "hand_tick", "hand_ins", "hand_key", "hand_pos", "hand_why"]
@@ -68,6 +72,9 @@ func compare(where: String) -> bool:
 			gd.n_carried, nat.n_carried, gd.n_shifted, nat.n_shifted])
 	if gd.n_held != nat.n_held or gd.n_woke != nat.n_woke:
 		return _fail(where, "held crossings %d/%d, woke %d/%d" % [gd.n_held, nat.n_held, gd.n_woke, nat.n_woke])
+	if gd.n_hint_held != nat.n_hint_held or gd.n_hint_steered != nat.n_hint_steered or gd.n_reconciled != nat.n_reconciled:
+		return _fail(where, "hints held %d/%d, steered %d/%d, reads reconciled %d/%d" % [gd.n_hint_held, nat.n_hint_held,
+			gd.n_hint_steered, nat.n_hint_steered, gd.n_reconciled, nat.n_reconciled])
 	if gd.n_line_steps != nat.n_line_steps or gd.prof != nat.prof or gd.tick != nat.tick:
 		return _fail(where, "counters: steps %d/%d prof %s/%s tick %d/%d" % [gd.n_line_steps, nat.n_line_steps,
 			gd.prof, nat.prof, gd.tick, nat.tick])
@@ -103,6 +110,12 @@ var read_forward := true
 var shift_keep := true
 ## Splitters as before --belt-sim-split-wake: a pass.
 var split_wake := true
+## Splitters' wait rule R4, as --belt-sim-split-wake default (false: =old, the earlier rule).
+var split_wake_r4 := true
+## Splitters follow the bridge's crossing hints, as --belt-sim-split-hints default: a pass off.
+var split_hints := true
+## Splitter reads that differ only by the crossings' timing left unapplied, as --belt-sim-split-reconcile default.
+var split_reconcile := true
 ## Reads as before --belt-sim-read-skip-same: a pass.
 var read_skip_same := true
 ## Takes and reads in the order they came, as before --belt-sim-take-first: a pass.
@@ -136,6 +149,12 @@ func _fresh(edge: int) -> void:
 	nat.shift_keep = shift_keep
 	gd.split_wake = split_wake
 	nat.split_wake = split_wake
+	gd.split_wake_r4 = split_wake_r4
+	nat.split_wake_r4 = split_wake_r4
+	gd.split_hints = split_hints
+	nat.split_hints = split_hints
+	gd.split_reconcile = split_reconcile
+	nat.split_reconcile = split_reconcile
 	gd.read_skip_same = read_skip_same
 	nat.read_skip_same = read_skip_same
 	gd.take_first = take_first
@@ -150,10 +169,37 @@ func _fresh(edge: int) -> void:
 	nat.rescue_seen = rescue_seen
 
 
+## --belt-sim-lattice-no-bre: a lane the lattice draws whose drift check failed is not asked for again
+## while it is drawn (and is held to be asked when it leaves the lattice); off (or a lane not in the
+## lattice), it is asked as before.
+func _lat_no_bre_case() -> void:
+	var was := BeltItems.Job.lat_no_bre
+	for on in [true, false]:
+		BeltItems.Job.lat_no_bre = on
+		var job := BeltItems.Job.new()
+		job.state = BeltItems.State.new()
+		job.view_all = true
+		job.state.lat[7] = true
+		var ch := {"mismatch": PackedInt64Array([7, 9]), "mismatch_n": PackedInt32Array([1, 1])}
+		job._ask_mismatches(ch)
+		var asked7: bool = job.resend.has(7)
+		var asked9: bool = job.resend.has(9)
+		var ok: bool = asked9 and asked7 != on and (job.state.lat_pend.has(7) == on)
+		print("lattice no-bre %s: lattice lane asked %s, other lane asked %s -> %s" % ["on" if on else "off", asked7, asked9, "ok" if ok else "WRONG"])
+		checked += 1
+		if not ok:
+			fails += 1
+	BeltItems.Job.lat_no_bre = was
+
+
 func _initialize() -> void:
 	if not NativeLibrary.ensure():
-		print("BeltSimNative isn't loaded: nothing to compare (skipped)")
-		quit(0)
+		if OS.get_name() == "Windows":
+			printerr("FAIL: BeltSimNative extension failed to load on Windows")
+			quit(1)
+		else:
+			print("BeltSimNative isn't loaded: nothing to compare (skipped)")
+			quit(0)
 		return
 	var path := DEFAULT
 	var max_ticks := 1 << 30
@@ -232,6 +278,16 @@ func _initialize() -> void:
 		print("synthetic world 1, split_wake off: %d checks, %d differences" % [checked, fails])
 		split_wake = true
 	if fails == 0:
+		split_wake_r4 = false
+		for seed in [1, 2]:
+			_synthetic(seed, 1500)
+			print("synthetic world %d, split-wake old (not R4): %d checks, %d differences, %d split_wake" % [seed, checked, fails, gd.n_woke])
+		split_wake_r4 = true
+	if fails == 0:
+		_split_cases()
+	if fails == 0:
+		_lat_no_bre_case()
+	if fails == 0:
 		read_skip_same = false
 		_synthetic(3, 1500)
 		print("synthetic world 3, read_skip_same off: %d checks, %d differences" % [checked, fails])
@@ -256,12 +312,46 @@ func _initialize() -> void:
 		_synthetic(3, 1500)
 		print("synthetic world 3, rescue_seen off: %d checks, %d differences" % [checked, fails])
 		rescue_seen = true
+	if fails == 0:
+		_lattice_model_cap_and_bands()
 	print("%s in %d ms: %d checks, %d differences" % ["PASS" if fails == 0 else "FAIL", Time.get_ticks_msec() - t0,
 		checked, fails])
 	quit(1 if fails > 0 else 0)
 
 
-func _recording(path: String, edge: int, max_ticks: int) -> void:
+## Splitters (the splitter crossing hints round): the wait fixture and the small one replayed into both, with the
+## bridge's crossing hints every 6 ticks (belt_sim_replay.gd's side_hints, queued 6 ticks ahead as live) and the
+## splitters' output and input lanes read every 6 ticks (queued ahead too, so reads land on hints' ticks): R4's
+## holds, the hints' holds and steers and the reads left unapplied (split_reconcile: with hints and split_wake off
+## the simulation's crossings go a tick off the reads') must all happen, alike.
+func _split_cases() -> void:
+	var totals := PackedInt64Array([0, 0, 0, 0])
+	for path in ["res://tests/data/belt_sim_split_wait.json", DEFAULT]:
+		for mode in ["all on", "split_wake off", "reconcile off", "hints off", "hints and split_wake off"]:
+			split_wake = mode != "split_wake off" and mode != "hints and split_wake off"
+			split_reconcile = mode != "reconcile off"
+			split_hints = mode != "hints off" and mode != "hints and split_wake off"
+			_recording(path, BeltSim.EDGE_ORACLE, 1 << 30, 6)
+			print("splitters, %s, %s: %d checks, %d differences; R4 waits %d, hints held %d, steered %d, reads left %d" % [
+				path.get_file(), mode, checked, fails, gd.n_woke, gd.n_hint_held, gd.n_hint_steered, gd.n_reconciled])
+			if true:
+				totals[0] += gd.n_woke
+				totals[1] += gd.n_hint_held
+				totals[2] += gd.n_hint_steered
+				totals[3] += gd.n_reconciled
+			if fails > 0:
+				break
+		if fails > 0:
+			break
+	split_wake = true
+	split_reconcile = true
+	split_hints = true
+	if fails == 0 and (totals[0] == 0 or totals[1] == 0 or totals[2] == 0 or totals[3] == 0):
+		_fail("splitters", "R4 waits %d, hints held %d, steered %d, reads left %d: each must happen" % [totals[0], totals[1],
+			totals[2], totals[3]])
+
+
+func _recording(path: String, edge: int, max_ticks: int, every := 0) -> void:
 	_fresh(edge)
 	var d: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(path))
 	var metas: Array = d["lanes"]
@@ -294,8 +384,32 @@ func _recording(path: String, edge: int, max_ticks: int) -> void:
 	both("mark_split_holds")
 	if not compare("recording set-up"):
 		return
-	for t in range(mini(ticks.size(), max_ticks) - 1):
+	var sides := Replay.split_sides(metas) if every > 0 else {}
+	var sig := {}
+	var n_ticks := mini(ticks.size(), max_ticks)
+	for t in range(n_ticks - 1):
 		var row: Array = ticks[t + 1]
+		if every > 0 and t % every == 0 and t + every < n_ticks:
+			# (Splitter hints and reads `every` ticks on, queued now, as belt_sim_replay.gd --split-hints and
+			# --game-crossings --game-inputs.)
+			var ahead: Array = ticks[t + every]
+			var recs := Replay.side_hints(ahead, kinds, sides, sig)
+			for r in range(0, recs.size(), 7):
+				both("add_split_hint", [recs[r], recs[r + 1], recs[r + 2], recs[r + 3], recs[r + 4], recs[r + 5], recs[r + 6]])
+			var reads := {}
+			for j in range(1, metas.size() + 1):
+				if kinds[j] == 5 or kinds[j] == 6:
+					reads[keys[j]] = []
+			for i in range(1, ahead.size(), 5):
+				if reads.has(keys[int(ahead[i])]):
+					(reads[keys[int(ahead[i])]] as Array).append([int(ahead[i + 2]), int(ahead[i + 1]), int(ahead[i + 4]), int(ahead[i + 3])])
+			for k: int in reads:
+				var its: Array = reads[k]
+				its.sort()
+				var flat := PackedInt64Array()
+				for e: Array in its:
+					flat.append_array([int(e[1]), int(e[2]), int(e[0]), int(e[3])])
+				both("load_lane", [k, int(ahead[0]), flat])
 		var game := {}
 		for i in range(1, row.size(), 5):
 			game[int(row[i + 1])] = [keys[int(row[i])], int(row[i + 2]), kinds[int(row[i])], int(row[i + 4]), int(row[i + 3])]
@@ -1171,3 +1285,123 @@ func _self_side_loop(packed: bool) -> void:
 		was_on = on
 	if not packed and crossings < 2:
 		_fail("self side-load loop", "the first item went over the side-load %d times in 900 ticks (2 laps)" % crossings)
+
+
+class LatJobState:
+	var lanes := {}
+	var arcs := {}
+	var records := BeltRecords.new()
+	var height := 0.16
+
+
+func _lattice_model_cap_and_bands() -> void:
+	if not ClassDB.class_exists("BeltLatticeNative"):
+		return
+	var was_cap_near := BeltLattice.model_cap_near
+	_fresh(BeltSim.EDGE_STOP)
+	both("step_to", [0])
+	var lat_gd := BeltLattice.new()
+	var lat_nat: RefCounted = ClassDB.instantiate("BeltLatticeNative")
+	lat_nat.set_sim(nat)
+	var jst := LatJobState.new()
+	jst.records.base = 0.0
+	var known := {1: [Vector3.ZERO, true, 0.07, 1], -2: [Vector3.ZERO, false, 0.07, 1]}
+	# 100 packed lanes (8 slots each = 800 slots) from x=2 to x=81.2.
+	for i in 100:
+		var k := (10 + i) * 8 + 1
+		var x0 := 2.0 + float(i) * 0.8
+		var ex := roundi((x0 + 2.0) * 256.0)
+		var nx := roundi(x0 * 256.0)
+		var mx := (ex + nx) / 2
+		var y := roundi(0.5 * 256.0)
+		both("set_lane", [k, BeltSim.STRAIGHT, 512, 8, Vector2i(ex, y), Vector2i(mx, y), Vector2i(nx, y), 0, 0])
+		var meta := PackedInt32Array([BeltSim.STRAIGHT, 512, 8, ex, y, mx, y, nx, y])
+		jst.lanes[k] = meta
+		lat_nat.set_lane(k, meta, PackedFloat64Array())
+		var sl := PackedInt64Array()
+		for j in 8:
+			sl.append_array([1000 + i * 8 + j, 1, 32 + j * 64, 1])
+		both("load_lane", [k, 0, sl])
+		lat_gd.note_read(k, 512, sl)
+		lat_nat.note_read(k, 512, sl)
+	both("step_to", [1])
+	var empty_planes: Array[Plane] = []
+	var empty_d2 := PackedFloat32Array()
+	var view := Rect2(-10.0, -10.0, 120.0, 30.0)
+	var tick := 1
+	for case: Array in [
+		[0, true, false, Vector3.ZERO],
+		[500, true, false, Vector3.ZERO],
+		[2000, true, false, Vector3.ZERO],
+		[-1, true, false, Vector3.ZERO],
+		[-1, true, true, Vector3(0.0, 0.16, 0.0)],
+		[-1, true, true, Vector3(40.0, 0.16, 0.0)],
+		[500, false, false, Vector3.ZERO],
+	]:
+		tick += 1
+		both("step_to", [tick])
+		var mcap := int(case[0])
+		var cap_near := bool(case[1])
+		var split := bool(case[2])
+		var anchor: Vector3 = case[3]
+		BeltLattice.model_cap_near = cap_near
+		lat_nat.set_model_cap_near(cap_near)
+		lat_gd.set_cap_anchor(Vector2.ZERO, false, Vector3.ZERO, Vector3.FORWARD, empty_planes, empty_d2)
+		lat_nat.set_cap_anchor(Vector2.ZERO, false, Vector3.ZERO, Vector3.FORWARD, Array(), empty_d2)
+		lat_gd.set_lod_bands(split, anchor, 28.0, 56.0, Vector2(3.0, 5.0))
+		lat_nat.set_lod_bands(split, anchor, 28.0, 56.0, Vector2(3.0, 5.0))
+		lat_gd.drawn_tick = tick
+		lat_nat.set_drawn_tick(tick)
+		var rgd := lat_gd.update(jst, gd, tick, view, true, known, mcap, false, false)
+		var rnat: Dictionary = lat_nat.update(tick, view, true, known, mcap, false, false, 0.0, 0.16,
+			true, true, true, true, true, true)
+		checked += 1
+		if rgd["unknown"] != rnat["unknown"]:
+			_fail("lattice cap/band unknown", "cap=%d near=%s split=%s" % [mcap, cap_near, split])
+			break
+		var gd_slots: int = lat_gd.cap_3d_slots
+		var nat_slots := int(lat_nat.get_cap_3d_slots())
+		if gd_slots != nat_slots:
+			_fail("lattice cap_3d_slots", "cap=%d near=%s: gd=%d nat=%d" % [mcap, cap_near, gd_slots, nat_slots])
+			break
+		if mcap == 0 and gd_slots != 0:
+			_fail("lattice cap=0", "expected 0 3D slots, got %d" % gd_slots)
+			break
+		if mcap == 500 and cap_near and (gd_slots <= 0 or gd_slots > 508):
+			_fail("lattice cap=500", "expected ~500 nearest 3D slots, got %d" % gd_slots)
+			break
+		if mcap == 500 and not cap_near and gd_slots != 0:
+			_fail("lattice --lattice-model-cap=off", "expected 0 3D slots, got %d" % gd_slots)
+			break
+		if (mcap == 2000 or mcap == -1) and gd_slots != 800:
+			_fail("lattice cap=%d" % mcap, "expected 800 3D slots, got %d" % gd_slots)
+			break
+		var gd_keys: Array = lat_gd.kinds.keys()
+		var nat_keys: Array = lat_nat.kind_keys()
+		gd_keys.sort()
+		nat_keys.sort()
+		var gd_counts := {}
+		for kk in gd_keys:
+			var kd = lat_gd.kinds[kk]
+			gd_counts[int(kk)] = kd.top - kd.free.size()
+		var nat_counts := {}
+		for kk in nat_keys:
+			var arr: Array = lat_nat.drawn_lattice(int(kk), float(tick))
+			var live_n := 0
+			for item_e in arr:
+				if item_e != null:
+					live_n += 1
+			nat_counts[int(kk)] = live_n
+		for k_chk in gd_counts:
+			if int(gd_counts[k_chk]) != int(nat_counts.get(k_chk, -1)):
+				_fail("lattice kind count mismatch", "case=%s key=%d gd=%d nat=%s" % [str(case), int(k_chk), int(gd_counts[k_chk]), str(nat_counts)])
+				break
+		if split:
+			var b0 := int(gd_counts.get(1, 0))
+			var b1 := int(gd_counts.get(1 + ItemCards.BAND_STEP, 0))
+			var b2 := int(gd_counts.get(1 + 2 * ItemCards.BAND_STEP, 0))
+			if anchor == Vector3(0.0, 0.16, 0.0) and (b0 <= 0 or b1 <= 0 or b2 <= 0 or b0 + b1 + b2 != 800):
+				_fail("lattice split bands", "expected near/mid/far split totaling 800, got %d/%d/%d" % [b0, b1, b2])
+				break
+	BeltLattice.model_cap_near = was_cap_near
+	print("lattice model_cap & distance bands (GDScript vs C++): %d checks, %d differences" % [checked, fails])

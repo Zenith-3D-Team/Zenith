@@ -39,6 +39,10 @@ uniform float speckle = 0.45;
 // them from ao_zoom.gd (RIM_FULL, RIM_GONE), where every ambient occlusion fade's thresholds are.
 uniform float fade_from = 0.07;
 uniform float fade_to = 0.16;
+uniform bool use_anchor = false;
+uniform vec2 anchor_xz = vec2(0.0);
+uniform float anchor_fade_from = 56.0;
+uniform float anchor_fade_to = 96.0;
 // The patch's reach past the edge (tiles), and how far out the ring goes with and without a patch
 // (contact_shade.gd sets them: PATCH_EDGE, REACH, patch_ring_reach(); 0.5 and 0.55 under
 // --contact-patch=wide, which drew a dark band round every drill).
@@ -142,9 +146,16 @@ void fragment() {
 	float cell = speckle_hash(floor(world_xz * speckle_cells));
 	float sp = 1.0 + speckle * (cell * 2.0 - 1.0) * (1.0 - smoothstep(0.5, 1.0, px * speckle_cells))
 		* (1.0 - smoothstep(0.0, 0.08, dd));
-	rim = clamp(rim * sp, 0.0, 0.85) * s * (1.0 - smoothstep(fade_from, fade_to, px));
+	float rim_fade = 1.0 - smoothstep(fade_from, fade_to, px);
+	float patch_fade = 1.0 - smoothstep(fade_from * 2.0, fade_to * 2.0, px);
+	if (use_anchor) {
+		float ad = length(world_xz - anchor_xz);
+		rim_fade = 1.0 - smoothstep(anchor_fade_from, anchor_fade_to, ad);
+		patch_fade = 1.0 - smoothstep(anchor_fade_from * 1.4, anchor_fade_to * 1.4, ad);
+	}
+	rim = clamp(rim * sp, 0.0, 0.85) * s * rim_fade;
 	// The big machines' patch: a faint darkening under them, fading out just past their foot.
-	float pa = patch * (1.0 - smoothstep(-0.05, patch_reach, patch_d)) * (1.0 - smoothstep(fade_from * 2.0, fade_to * 2.0, px));
+	float pa = patch * (1.0 - smoothstep(-0.05, patch_reach, patch_d)) * patch_fade;
 	// Under the foot: faded out before the hole (inner_fade), no hard inner edge where the ground shows.
 	float inner = fade_in > 0.0 ? smoothstep(-fade_in, 0.0, d) : 1.0;
 	float dark = 1.0 - (1.0 - rim * inner) * (1.0 - pa * inner);

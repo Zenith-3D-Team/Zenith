@@ -575,11 +575,66 @@ def inside_tests():
         doc, chunks = fix_pack.read_model(os.path.join(dst, "bare.glb"))
         part = mesh_triangles(doc, chunks, 1)
         expect(len(part) == 2 and not has_back_faces(part), "the same part added without inside keeps one side (%d)" % len(part))
+        # A model with an OPAQUE surface and a BLEND glass surface (like pipe-alt): OPAQUE gets back faces, BLEND stays single-sided.
+        pos_g = pos + [(0, 0.5, 0), (1, 0.5, 0), (1, 0.5, 1), (0, 0.5, 1)]
+        nor_g = nor + [(0, 1, 0)] * 4
+        uv_g = uv + uv
+        bin_g = (b"".join(struct.pack("<3f", *v) for v in pos_g) + b"".join(struct.pack("<3f", *v) for v in nor_g)
+                 + b"".join(struct.pack("<2f", *v) for v in uv_g)
+                 + struct.pack("<6H", 0, 2, 1, 0, 3, 2)
+                 + struct.pack("<6H", 4, 6, 5, 4, 7, 6))
+        doc_g = {
+            "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [
+                {"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 3, "material": 0},
+                {"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 4, "material": 1},
+            ]}],
+            "materials": [{"name": "Body", "doubleSided": True}, {"name": "Glass", "alphaMode": "BLEND", "doubleSided": True}],
+            "buffers": [{"byteLength": len(bin_g)}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 96},
+                {"buffer": 0, "byteOffset": 96, "byteLength": 96},
+                {"buffer": 0, "byteOffset": 192, "byteLength": 64},
+                {"buffer": 0, "byteOffset": 256, "byteLength": 12},
+                {"buffer": 0, "byteOffset": 268, "byteLength": 12},
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 8, "type": "VEC3", "min": [0, 0, 0], "max": [1, 0.5, 1]},
+                {"bufferView": 1, "componentType": 5126, "count": 8, "type": "VEC3"},
+                {"bufferView": 2, "componentType": 5126, "count": 8, "type": "VEC2"},
+                {"bufferView": 3, "componentType": 5123, "count": 6, "type": "SCALAR"},
+                {"bufferView": 4, "componentType": 5123, "count": 6, "type": "SCALAR"},
+            ],
+        }
+        src_g = os.path.join(tmp, "glass_src")
+        dst_g = os.path.join(tmp, "glass_dst")
+        os.makedirs(src_g)
+        fix_pack.write_model(os.path.join(src_g, "pipe_win.glb"), doc_g, [(b"BIN\0", bin_g)])
+        lines = []
+        _count, problems = fix_pack.fix_pack(src_g, dst_g, {"files": {"pipe_win": {"inside": True}}}, log=lines.append)
+        expect(problems == [] and any("inside added (2 back faces)" in l for l in lines), "inside skips BLEND: logged (%s)" % lines)
+        out_g, chunks_g = fix_pack.read_model(os.path.join(dst_g, "pipe_win.glb"))
+        prims_g = out_g["meshes"][0]["primitives"]
+        idx_opaque = fix_pack.read_accessor(out_g, chunks_g, prims_g[0]["indices"])
+        idx_blend = fix_pack.read_accessor(out_g, chunks_g, prims_g[1]["indices"])
+        expect(len(idx_opaque) == 12 and len(idx_blend) == 6,
+               "inside skips BLEND: opaque doubled (%d indices) while BLEND kept single-sided (%d indices)" % (len(idx_opaque), len(idx_blend)))
 
 
-def source_triangles(entries, src, name):
-    doc, chunks = fix_pack.read_model(os.path.join(src, name + ".glb"))
-    return len(triangles(doc, chunks))
+def source_triangles(_entries, src, name, skip_materials=()):
+    doc, _chunks = fix_pack.read_model(os.path.join(src, name + ".glb"))
+    mats = doc.get("materials", [])
+    kept, skipped = 0, 0
+    for mesh in doc.get("meshes", []):
+        for prim in mesh["primitives"]:
+            idx = prim.get("indices")
+            tris = (doc["accessors"][idx]["count"] if idx is not None else doc["accessors"][prim["attributes"]["POSITION"]]["count"]) // 3
+            m = prim.get("material")
+            if m is not None and mats[m].get("name", "") in skip_materials:
+                skipped += tris
+            else:
+                kept += tris
+    return kept, skipped
 
 
 def base_pictures(path):
@@ -596,18 +651,20 @@ def base_pictures(path):
 
 def real_pack_tests(src, fixed):
     """Every pipe file of the fixed copy against the modeller's export and the list: its triangles are its
-    source's (with each added part's), twice over with an inside, and its base colour pictures its source's; pipe-to-ground's
-    open end has one."""
+    source's (with each added part's), twice over with an inside (except keep_blend glass), and its base colour
+    pictures its source's; pipe-to-ground's open end has one."""
     fixes = fix_pack.load_fixes(fix_pack.DEFAULT_FIXES)
+    keep_blend = set((fixes.get("materials") or {}).get("keep_blend", []))
     checked = 0
     for name, entry in fixes["files"].items():
         if not name.startswith(("pipe", "ppe")) or not os.path.isfile(os.path.join(src, name + ".glb")):
             continue
         for out in entry.get("out", [{"name": name}]):
-            want = source_triangles(fixes["files"], src, name)
-            if entry.get("inside"):
-                want *= 2
-            want += sum(source_triangles(fixes["files"], src, a["model"]) * (2 if a.get("inside") else 1) for a in out.get("add", []))
+            kept, skipped = source_triangles(fixes["files"], src, name, keep_blend if entry.get("inside") else ())
+            want = kept * (2 if entry.get("inside") else 1) + skipped
+            for a in out.get("add", []):
+                ak, ask = source_triangles(fixes["files"], src, a["model"])
+                want += (ak + ask) * (2 if a.get("inside") else 1)
             path = os.path.join(fixed, out["name"] + ".glb")
             got = len(triangles(*fix_pack.read_model(path))) if os.path.isfile(path) else -1
             insides = [a["model"] for a in out.get("add", []) if a.get("inside")]
@@ -728,6 +785,97 @@ def pack_json_tests():
     expect((real.get("pack_json") or {}).get("shading") == "pbr", "vasillo.json: his copy's pack.json says shading pbr")
 
 
+def drop_and_diff_tests():
+    """drop_shells and add[].diff: drop a disconnected shell inside a box and merge only unique triangles."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "export")
+        dst = os.path.join(tmp, "fixed")
+        os.makedirs(src)
+
+        def write_tris_glb(path, prim_specs):
+            pos, nor, views, accessors, prims = [], [], [], [], []
+            binary = bytearray()
+
+            def add_view(raw, target=None):
+                binary.extend(b"\0" * (-len(binary) % 4))
+                v = {"buffer": 0, "byteOffset": len(binary), "byteLength": len(raw)}
+                if target is not None:
+                    v["target"] = target
+                views.append(v)
+                binary.extend(raw)
+                return len(views) - 1
+
+            for mat_idx, tris in prim_specs:
+                p_list, n_list, i_list = [], [], []
+                for tri in tris:
+                    base = len(p_list)
+                    p_list.extend(tri)
+                    n_list.extend([(0.0, 1.0, 0.0)] * 3)
+                    i_list.extend([base, base + 1, base + 2])
+                pv = add_view(b"".join(struct.pack("<3f", *v) for v in p_list), 34962)
+                nv = add_view(b"".join(struct.pack("<3f", *v) for v in n_list), 34962)
+                iv = add_view(struct.pack("<%dH" % len(i_list), *i_list), 34963)
+                lo = [min(v[k] for v in p_list) for k in range(3)]
+                hi = [max(v[k] for v in p_list) for k in range(3)]
+                pa = len(accessors)
+                accessors.append({"bufferView": pv, "componentType": 5126, "count": len(p_list), "type": "VEC3", "min": lo, "max": hi})
+                na = len(accessors)
+                accessors.append({"bufferView": nv, "componentType": 5126, "count": len(n_list), "type": "VEC3"})
+                ia = len(accessors)
+                accessors.append({"bufferView": iv, "componentType": 5123, "count": len(i_list), "type": "SCALAR"})
+                prims.append({"attributes": {"POSITION": pa, "NORMAL": na}, "indices": ia, "material": mat_idx})
+            binary.extend(b"\0" * (-len(binary) % 4))
+            doc = {"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+                   "nodes": [{"name": "Mesh", "mesh": 0}], "meshes": [{"primitives": prims}],
+                   "materials": [{"name": "Wall"}, {"name": "Light"}],
+                   "accessors": accessors, "bufferViews": views, "buffers": [{"byteLength": len(binary)}]}
+            fix_pack.write_model(path, doc, [(b"BIN\0", bytes(binary))])
+
+        body_tri = [(-0.2, 0.0, -0.2), (0.2, 0.0, -0.2), (0.0, 0.5, 0.2)]
+        south_shell = [(-0.1, 0.0, 0.48), (0.1, 0.0, 0.48), (0.0, 0.2, 0.52)]
+        cap_tri = [(-0.2, 0.0, 0.35), (0.2, 0.0, 0.35), (0.0, 0.4, 0.5)]
+        light_tri = [(-0.05, 0.9, 0.4), (0.05, 0.9, 0.4), (0.0, 1.0, 0.45)]
+        write_tris_glb(os.path.join(src, "single.glb"), [(0, [body_tri, south_shell])])
+        write_tris_glb(os.path.join(src, "end.glb"), [(0, [body_tri])])
+        write_tris_glb(os.path.join(src, "side.glb"), [(0, [body_tri, cap_tri]), (1, [light_tri])])
+        fixes = {"files": {
+            "single": {"out": [{"name": "single-gate-e", "turn": 270,
+                                "drop_shells": [[[-1, -1, 0.46], [1, 3, 1]]],
+                                "add": [{"model": "side", "diff": "end", "turn": 270}]}]},
+            "end": {"out": []},
+            "side": {"out": []},
+        }}
+        _count, problems = fix_pack.fix_pack(src, dst, fixes, log=lambda _l: None)
+        expect(problems == [], "drop_shells + diff: no warnings (%s)" % problems)
+        out_path = os.path.join(dst, "single-gate-e.glb")
+        out_doc, out_chunks = fix_pack.read_model(out_path)
+        tris = triangles(out_doc, out_chunks)
+        expect(len(tris) == 3, "drop_shells dropped south_shell (1) and diff added cap + light (2) -> 3 tris (%d)" % len(tris))
+        lo, hi = bounds(out_path)
+        expect(close([lo[0], hi[0]], [-0.2, 0.5]), "turned 270: gate cap spans x=-0.2..0.5 (%s %s)" % (lo, hi))
+
+
+def subfolder_tests():
+    """Subfolder exports (Items/<name>.glb): base name matches entry, centre applies, items/<name> writes to dst/items/."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "export")
+        dst = os.path.join(tmp, "fixed")
+        os.makedirs(os.path.join(src, "Items"))
+        make_glb(os.path.join(src, "Items", "grenade.glb"), (0.3, 0.1, -0.2), (-0.1, 0, -0.1), (0.1, 0.2, 0.1))
+        make_glb(os.path.join(src, "Items", "extra.glb"), (0, 0, 0), (-0.1, 0, -0.1), (0.1, 0.2, 0.1))
+        fixes = {"materials": {"alpha_by_picture": True},
+                 "files": {"grenade": {"centre": True, "out": [{"name": "items/grenade"}]}}}
+        _count, problems = fix_pack.fix_pack(src, dst, fixes, log=lambda _l: None)
+        expect(problems == [], "subfolder: no warnings (%s)" % problems)
+        out_item = os.path.join(dst, "items", "grenade.glb")
+        expect(os.path.isfile(out_item) and not os.path.exists(os.path.join(dst, "Items", "items", "grenade.glb")),
+               "subfolder Items/grenade writes to items/grenade.glb")
+        lo, hi = bounds(out_item)
+        expect(close([(lo[0] + hi[0]) / 2, lo[1], (lo[2] + hi[2]) / 2], [0, 0.1, 0]),
+               "subfolder grenade centred in x, z with y kept (%s %s)" % (lo, hi))
+        expect(os.path.isfile(os.path.join(dst, "Items", "extra.glb")), "unlisted subfolder file keeps its path")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "Modeller export")
@@ -836,7 +984,27 @@ def main():
            and fixes["files"]["sulfur-1"].get("centre"), "his 10 new items and the sulfur centred into items/<name>")
     expect(all(names.get("sulfur-%d" % i) == ["items/sulfur-%d" % i] for i in (1, 2, 3)),
            "sulfur-1, -2 and -3 are items/sulfur-N")
-    expect(len(items) == 17, "17 items written to items/ (%d)" % len(items))
+    expect(len(items) == 28, "28 items written to items/ (%d)" % len(items))
+    newest_items = ["atomic-bomb", "engine-unit", "explosive-rocket", "firearm-magazine", "flamethrower-ammo",
+                    "grenade", "piercing-rounds-magazine", "piercing-shotgun-shell", "rocket", "shotgun-shell",
+                    "uranium-rounds-magazine"]
+    expect(all(names.get(k) == ["items/" + k] and fixes["files"][k].get("centre") for k in newest_items),
+           "his 11 new items centred into items/<name>")
+    wall_block = re.search(r"const WALL_SHAPES := \[(.*?)\]", lib, re.S).group(1)
+    wall_shapes = ({"stone-wall"}
+                   | {"stone-wall-" + s for s in re.findall(r'"([a-z-]+)"', wall_block)}
+                   | {"stone-wall-%s-fill" % s for s in ("es", "nes", "esw", "nesw")}
+                   | {"stone-wall-gate-%s" % d for d in ("n", "e", "s", "w")}
+                   | {"stone-wall-gate-single-%s" % d for d in ("n", "e", "s", "w")}
+                   | {"stone-wall-gate-ns", "stone-wall-gate-ew"})
+    walls_written = {n for n in written if n.startswith("stone-wall")}
+    expect(walls_written == wall_shapes, "vasillo.json writes all 31 wall shapes (%d; missing %s, extra %s)"
+           % (len(walls_written), sorted(wall_shapes - walls_written), sorted(walls_written - wall_shapes)))
+    expect(names.get("wall-gate") == ["gate"]
+           and any(a["model"] == "wall-gate-gap" for a in fixes["files"]["wall-gate"]["out"][0].get("add", []))
+           and fixes["files"]["wall-gate-gap"].get("out") == []
+           and names.get("wall-gate-side") == ["stone-wall-gate-s", "stone-wall-gate-w", "stone-wall-gate-n", "stone-wall-gate-e"],
+           "wall-gate merges wall-gate-gap into gate; wall-gate-side writes stone-wall-gate-{s,w,n,e}")
     # The owner's rule: rock isn't metal. Every ore, coal, stone, sulfur and uranium file gets metal 0, as an entity and an item.
     rocks = [k for k in names if k.startswith(("iron-ore-", "copper-ore-", "coal-", "stone-", "uranium-ore-", "sulfur-"))
              and k != "stone-brick"]
@@ -852,6 +1020,8 @@ def main():
     expect(fixes["files"]["pipe-cap"].get("out") == [], "pipe-cap itself is not written")
     expect(fixes["files"]["pipe-to-ground"].get("inside") is True,
            "pipe-to-ground gets an inside (its tube is single-sided, its north end open)")
+    expect(fixes["files"]["pipe-alt"].get("inside") is True,
+           "pipe-alt gets an inside (its tube shows through its glass window)")
     caps = [o["name"] for o in fixes["files"]["pipe"]["out"] if any(a["model"] == "pipe-cap" for a in o.get("add", []))]
     expect(len(caps) == 5 and all(a.get("inside") for o in fixes["files"]["pipe"]["out"] for a in o.get("add", []) if a["model"] == "pipe-cap"),
            "every pipe-cap added (%s) has an inside" % caps)
@@ -871,6 +1041,8 @@ def main():
     rest_turn_tests()
     check_tests()
     pack_json_tests()
+    subfolder_tests()
+    drop_and_diff_tests()
     print("FIX PACK FAILS: %d" % len(failures))
     return 1 if failures else 0
 

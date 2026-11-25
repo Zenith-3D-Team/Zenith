@@ -17,6 +17,7 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Game ticks after the send with no entity: the mod answers on its next tick, so by then it was
 ## refused. Also at least this long in real time, for a server that stalls.
@@ -57,13 +58,13 @@ var refused := 0
 ## building came has paid for it (or the game refused it, or GIVE_UP_MSEC): drag_build.gd sends and
 ## predicts nothing past what is left (player_input.gd items_left), as Factorio places nothing then.
 ## `--build-spend=off`: as before.
-static var spend_fix := not ("--build-spend=off" in OS.get_cmdline_user_args())
+static var spend_fix := Switches.on("--build-spend")
 ## Whether a build spends is judged by the bridge's own reach (building.lua: the build distance plus
 ## 1.5 tiles to the building's middle), not the cursor's (to the footprint's edge): a small building
 ## up to a tile past the cursor's reach has a red preview and the bridge still builds it, so a drag
 ## begun there sent one or two more than the hand held, shown and taken away again (seen in a
 ## window with 6 belts: 7 drawn). `--build-spend-reach=cursor`: the cursor's reach, as before.
-static var spend_bridge_reach := not ("--build-spend-reach=cursor" in OS.get_cmdline_user_args())
+static var spend_bridge_reach := not (Switches.has("--build-spend-reach=cursor"))
 
 class Spend:
 	var item := ""
@@ -90,6 +91,7 @@ class SentUnder:
 	var rec: WorldMirror.Rec
 	var tick := 0
 	var msec := 0
+	var ghost := false
 
 var _sent_unders: Array[SentUnder] = []
 
@@ -391,6 +393,7 @@ func turn(rec: WorldMirror.Rec, reverse: bool) -> bool:
 		rec.dir = posmod(rec.dir + 8, 16)
 	else:
 		rec.dir = posmod(rec.dir + (-4 if reverse else 4), 16)
+	rec.cache_gen = -1
 	world.redraw(rec.chunk)
 	return true
 
@@ -443,8 +446,9 @@ func clear_run(recs: Array) -> int:
 
 ## M2: an underground of `proto` was just sent to be built at `pos` (snapped) facing `dir`, where the
 ## client's own check says the game takes it; `entrance`: the end an underground belt will be (as
-## the bridge's underground_type decides it: an exit when it joins an entrance behind it).
-func sent_underground(proto: ProtoDB.EntityProto, pos: Vector2, dir: int, entrance: bool) -> void:
+## the bridge's underground_type decides it: an exit when it joins an entrance behind it). `ghost`:
+## built as a ghost (Shift+click or remote view), so a held partner sees it on frame 0 too.
+func sent_underground(proto: ProtoDB.EntityProto, pos: Vector2, dir: int, entrance: bool, ghost := false) -> void:
 	if proto == null:
 		return
 	for s in _sent_unders:
@@ -458,13 +462,16 @@ func sent_underground(proto: ProtoDB.EntityProto, pos: Vector2, dir: int, entran
 	r.fixed = Vector2i(roundi(pos.x * 256.0), roundi(pos.y * 256.0))
 	r.dir = dir
 	r.chunk = WorldMirror.chunk_of(pos)
+	if ghost:
+		r.extra["gh"] = proto.id
 	if proto.type == "underground-belt":
-		r.extra = {"u": "i" if entrance else "o"}
+		r.extra["u"] = "i" if entrance else "o"
 	r.extra[ModelLibrary.VARIANT_KEY] = ModelLibrary.ModelPacks.variant_seed(r.fixed)  # as the game's record will be (world.gd)
 	var s := SentUnder.new()
 	s.rec = r
 	s.tick = Bridge.server_tick
 	s.msec = Time.get_ticks_msec()
+	s.ghost = ghost
 	_sent_unders.append(s)
 
 
@@ -481,7 +488,12 @@ func _check_sent_unders(now: int) -> void:
 	while i < _sent_unders.size():
 		var s := _sent_unders[i]
 		var r: WorldMirror.Rec = world.pick(s.rec.pos) if world != null else null
-		var stands := r != null and r.proto_id == s.rec.proto_id and not r.extra.has("gh") and r.pos.distance_squared_to(s.rec.pos) < 0.01
+		var same_pos := r != null and r.pos.distance_squared_to(s.rec.pos) < 0.01
+		var stands := false
+		if s.ghost:
+			stands = same_pos and (int(r.extra.get("gh", 0)) == s.rec.proto_id or (r.proto_id == s.rec.proto_id and not r.extra.has("gh")))
+		else:
+			stands = same_pos and r.proto_id == s.rec.proto_id and not r.extra.has("gh")
 		if stands or (Bridge.server_tick - s.tick >= REFUSED_TICKS and now - s.msec >= REFUSED_MSEC) or now - s.msec >= GIVE_UP_MSEC:
 			_sent_unders.remove_at(i)
 		else:
@@ -511,6 +523,7 @@ func _check_turns(now: int) -> void:
 		elif Bridge.server_tick - t.tick >= REFUSED_TICKS and now - t.msec >= REFUSED_MSEC:
 			t.rec.dir = t.old_dir
 			t.rec.extra = t.old_extra
+			t.rec.cache_gen = -1
 			world.redraw(t.rec.chunk)
 			refused += 1
 			_turns.erase(key)

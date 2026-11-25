@@ -1,7 +1,8 @@
 extends Control
 ## Zenith's debug menu, opened only by its key (Settings > Controls > Miscellaneous > Debug menu,
-## Ctrl+F12): out of players' way, and only in dev builds (Settings.dev_tools(): development downloads and a checkout); a public download has no key for it and it never opens, so its
-## overlays and probes can't be switched on there either. Three tabs in Factorio's style:
+## Ctrl+F12): out of players' way, and only in dev builds (Settings.dev_tools(): development
+## downloads and a checkout); a public download has no key for it and it never opens, so its
+## overlays and probes can't be switched on there either. Eight tabs in Factorio's style:
 ## - Time: the time of day (a slider and Dawn / Noon / Sunset / Night), freezing the day/night
 ##   cycle, the game's speed and pausing. They change the game, through the bridge's /f3d-debug
 ##   (console.lua), with the console's rule: in a multiplayer game only an admin's (or the server's
@@ -30,6 +31,10 @@ extends Control
 ##   them SSAO and SSIL on/off and their numbers, the contact shading's strength and widths, the sun's energy,
 ##   shadow softness and biases, and the ambient energy: each shows what the game has now and, once moved, is kept
 ##   over the look each frame (looks.gd light_tune) until its Reset.
+## - Render: viewport debug draw modes, live layer visibility toggles, 3D item LOD overrides,
+##   lattice variants mode, far belt 3D distance, render feature toggles, and Reset all render overrides.
+## - Bridge: quick /f3d-* commands, update rate holds, arbitrary console commands, PerfLog viewer,
+##   debug snapshot copy, user:// folder shortcuts, and output viewer.
 ## Esc cancels a running benchmark, then closes the report, then the menu.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
@@ -38,24 +43,31 @@ const UiModel := preload("res://scripts/ui/factorio/ui_model.gd")
 const GamePause := preload("res://scripts/net/game_pause.gd")
 const BenchRunner := preload("res://scripts/debug/bench_runner.gd")
 const DebugOverlay := preload("res://scripts/debug/debug_overlay.gd")
+const RenderStats := preload("res://scripts/debug/render_stats.gd")
 const ChunkGrid := preload("res://scripts/debug/chunk_grid.gd")
 const UpdateOverlay := preload("res://scripts/debug/update_overlay.gd")
 const RobotProbe := preload("res://scripts/debug/robot_probe.gd")
 const FlickerProbe := preload("res://scripts/debug/flicker_probe.gd")
 const BeltPathProbe := preload("res://scripts/debug/belt_path_probe.gd")
 const TerrainProbe := preload("res://scripts/debug/terrain_probe.gd")
+const LodDump := preload("res://scripts/debug/lod_dump.gd")
 const FxDemo := preload("res://scripts/fx/fx_demo.gd")
 const Sfx := preload("res://scripts/fx/sfx.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const PerfWarning := preload("res://scripts/ui/factorio/perf_warning.gd")
 const BeltItems := preload("res://scripts/world/belt_items.gd")
+const BeltLanes := preload("res://scripts/world/belt_lanes.gd")
+const BeltLods := preload("res://scripts/world/belt_lods.gd")
+const FarChunks := preload("res://scripts/world/far_chunks.gd")
+const ItemModels := preload("res://scripts/world/item_models.gd")
+const PerfLog := preload("res://scripts/world/perf_log.gd")
 const Looks := preload("res://scripts/world/looks.gd")
 const ContactShade := preload("res://scripts/world/contact_shade.gd")
 const ItemCards := preload("res://scripts/world/item_cards.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 
-const TABS := ["Time", "Benchmarks", "Tests", "Updates", "Simulation", "Lighting"]
+const TABS := ["Time", "Benchmarks", "Tests", "Updates", "Simulation", "Lighting", "Render", "Bridge"]
 ## Factorio's day: 0 is noon, dusk 0.25, evening (darkest from) 0.45, morning 0.55, dawn 0.75.
 const DAY_PRESETS := [["Dawn", 0.65], ["Noon", 0.0], ["Sunset", 0.35], ["Night", 0.5]]
 const SPEEDS := [0.25, 0.5, 1.0, 2.0, 4.0]
@@ -76,6 +88,8 @@ const TESTS := [
 	["ups", "UPS overlay", "The game's UPS in big type at the top left (--ups-overlay)", true],
 	["graph", "Frame-time graph", "The last 300 frames' times, with lines at 16.7 and 33.3 ms", true],
 	["counters", "Counters", "FPS, draw calls, triangles, nodes, chunks, entities, movers, belt items, 3D grass (--grass-stats)", true],
+	["profiler", "GPU & net breakdown", "Live GPU/Render CPU ms, view vs shadow draws/tris, item LOD, Distant Horizon, camera/pos and network rate/loss", true],
+	["spikes", "Spike log", "Every frame over 33 ms as a line in user://debug/spikes.log: scripts, deferred calls and frees, draw, the rest, the slowest scripts and what happened (--spike-log[=ms])", true],
 	["chunks", "Chunk borders", "Lines on the 32-tile chunk edges round the view: yellow loaded, grey not yet", true],
 	["terrain", "Terrain streaming", "Every 5 s: how long new chunks' ground took to come and be drawn, holes near the view (--terrain-probe)", true],
 	["robots", "Robots in view", "Waits for the movers in view to settle (up to a minute), then measures 10 s of their cost (--robot-probe)", false],
@@ -83,8 +97,10 @@ const TESTS := [
 	["flicker", "Flicker frames", "Turns the camera 0.1 degrees a frame and saves 40 frames for tools/flicker_count.py (--flicker-probe)", false],
 	["fx", "Effects demo", "The character walks, mines, builds a furnace and an inserter, shoots and mines them back, as a player would (--fx-demo). Hands off the keys", false],
 	["redraw", "Redraw chunks", "Every loaded chunk's buildings built again from what the client has (models changed on disk need a restart)", false],
+	["lods", "Dump building LODs", "Writes nearby chunks' building MultiMeshes, LOD levels, cross-fade state and bounds to user://debug/lod-dump.txt (and shows a summary below)", false],
 	["perfwarn", "Performance warnings", "The warning icon at the top left while settings are held back for UPS; its log fills either way. The same as Settings > Interface > Performance warnings, saved", true],
 	["packs", "Model packs", "Which model pack each model in use comes from, and the packs off or left out (the Model packs window)", false],
+	["ao_audit", "Scene render audit", "Counts loaded MultiMeshes, shadow casters, contact rings, baked AO materials, and active item LODs", false],
 ]
 
 ## ui_model.gd: command() and its answers.
@@ -116,6 +132,7 @@ var _daytime_wanted := -1.0
 var _daytime_wait := 0.0
 var _dragging := false
 var _refresh := 0.0
+var _tab_refresh := 0.0
 ## Paused from this menu (net/game_pause.gd): the bridge is silent until it resumes over RCON.
 var _paused_here := false
 var _resuming := false
@@ -135,6 +152,9 @@ var _report_text := ""
 var _report := {}
 
 var _results: Label
+var _pos_label: Label
+var _tp_x: LineEdit
+var _tp_y: LineEdit
 var _toggles := {}  # test id -> Button
 var _test_buttons: Array[Button] = []
 var _overlay: DebugOverlay
@@ -161,6 +181,22 @@ var light_shadows
 var _sim_boxes := {}  # belt switch id -> CheckBox
 var _sim_note: Label
 
+var _render_note: Label
+var _render_draw_btns := {}  # id -> Button
+var _layer_boxes := {}  # id -> CheckBox
+var _lod_btns := {}  # "auto"/"0"/"1"/"2" -> Button
+var _lattice_btns := {}  # "close"/"all"/"off" -> Button
+var _far3d_slider: HSlider
+var _far3d_val: Label
+var _far3d_all_btn: Button
+var _render_opt_boxes := {}  # id -> CheckBox
+var _render_stats: Label
+var _render_was := {}  # key -> initial value before first Render override
+var _layer_was := {}  # id -> initial visibility before first Layer override
+
+var _bridge_cmd_box: LineEdit
+var _bridge_out: Label
+
 
 func _ready() -> void:
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
@@ -186,7 +222,7 @@ func _ready() -> void:
 		b.theme_type_variation = "FTab"
 		b.toggle_mode = true
 		b.focus_mode = Control.FOCUS_NONE
-		b.custom_minimum_size = Kit.pxv(110, 32)
+		b.custom_minimum_size = Kit.pxv(90, 32)
 		b.add_theme_font_override("font", Kit.font("bold"))
 		var index := i
 		b.pressed.connect(func() -> void:
@@ -195,7 +231,7 @@ func _ready() -> void:
 		tabs.add_child(b)
 		_tab_buttons.append(b)
 	var pane := Kit.panel("FShallowFrame")
-	pane.custom_minimum_size = Kit.pxv(700, 460)
+	pane.custom_minimum_size = Kit.pxv(740, 480)
 	box.add_child(pane)
 	var scroll := ScrollContainer.new()
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
@@ -207,7 +243,7 @@ func _ready() -> void:
 	scroll.add_child(pad)
 	var pages := VBoxContainer.new()
 	pad.add_child(pages)
-	for page in [_time_page(), _bench_page(), _tests_page(), _updates_page(), _sim_page(), _light_page()]:
+	for page in [_time_page(), _bench_page(), _tests_page(), _updates_page(), _sim_page(), _light_page(), _render_page(), _bridge_page()]:
 		page.visible = false
 		pages.add_child(page)
 		_pages.append(page)
@@ -242,9 +278,12 @@ func open(on: bool) -> void:
 	_frame.visible = on
 	if on:
 		_refresh = 0.0
+		_tab_refresh = 0.0
 		_ask("/f3d-debug", "state")
 		_show_bench_lasts()
 		_sync_updates()
+		_sync_pos_label()
+		_sync_render()
 		if _toggles.has("perfwarn"):  # the setting may have changed in Settings since
 			var pw: Button = _toggles["perfwarn"]
 			pw.set_pressed_no_signal(PerfWarning.enabled())
@@ -274,6 +313,10 @@ func _open_tab(index: int) -> void:
 		_sync_light()
 	if TABS[index] == "Simulation":
 		_sync_sim()
+	if TABS[index] == "Render":
+		_sync_render()
+	if TABS[index] == "Tests":
+		_sync_pos_label()
 	for i in _pages.size():
 		_pages[i].visible = i == index
 		_tab_buttons[i].button_pressed = i == index
@@ -290,6 +333,13 @@ func _process(delta: float) -> void:
 		return
 	if TABS[_tab] == "Lighting":
 		_sync_live()  # the numbers the game moves itself (the time of day, a look) follow
+	_tab_refresh += delta
+	if _tab_refresh >= 0.5:
+		_tab_refresh = 0.0
+		if TABS[_tab] == "Render":
+			_sync_render_stats()
+		elif TABS[_tab] == "Tests":
+			_sync_pos_label()
 	var now := Time.get_ticks_msec()
 	for id in _asked.keys():
 		if now - int(_asked[id][0]) > ANSWER_MSEC:
@@ -302,7 +352,7 @@ func _process(delta: float) -> void:
 			_daytime_wanted = -1.0
 			_daytime_wait = SEND_EVERY
 	_refresh += delta
-	if _refresh >= REFRESH and _tab == 0 and _asked.is_empty() and not _paused_here:
+	if _refresh >= REFRESH and (_tab == 0 or TABS[_tab] == "Tests") and _asked.is_empty() and not _paused_here:
 		_refresh = 0.0
 		_ask("/f3d-debug", "state")
 
@@ -524,18 +574,32 @@ func _on_reply(id: int, msg: Dictionary) -> void:
 			_apply()
 			_ask("/f3d-debug", "state")
 			return
+	var joined := "\n".join(PackedStringArray(lines.map(func(l) -> String: return str(l))))
 	if int(msg.get("na", 0)) == 1:
 		_set_why(NOT_ADMIN)
+		if what == "bridge" and _bridge_out != null:
+			_bridge_out.text = NOT_ADMIN
 		return
 	if int(msg.get("ok", 1)) == 0:
-		_set_why("This bridge has no /f3d-debug: the mod is older than the client (update it)")
+		if what == "bridge":
+			if _bridge_out != null:
+				_bridge_out.text = joined if joined != "" else "Command not recognised or refused (ok=0)"
+		else:
+			_set_why("This bridge has no /f3d-debug: the mod is older than the client (update it)")
 		return
 	if msg.get("dbg") is Dictionary:
 		_state = msg["dbg"]
 		_why = ""
 		_apply()
 	if what in ["selftest", "status"]:
-		_show_result("\n".join(PackedStringArray(lines.map(func(l) -> String: return str(l)))))
+		_show_result(joined)
+		if _bridge_out != null:
+			_bridge_out.text = joined
+	elif what == "bridge":
+		if _bridge_out != null:
+			_bridge_out.text = joined if joined != "" else "(ok, no output)"
+		if not lines.is_empty():
+			_last_line.text = str(lines[-1])
 	elif what != "state" and not lines.is_empty():
 		_last_line.text = str(lines[-1])
 		if what == "teleport":
@@ -567,6 +631,7 @@ func _apply() -> void:
 	_pause_note.visible = _pause_note.text != ""
 	_note.text = _why
 	_note.visible = _why != ""
+	_sync_pos_label()
 	if _state.is_empty():
 		return
 	var dt := float(_state.get("dt", 0.0))
@@ -934,6 +999,36 @@ func _tests_page() -> Control:
 		spots.add_child(b)
 		_game_controls.append(b)
 	page.add_child(spots)
+	_pos_label = Kit.label("Position: (not connected)")
+	_pos_label.name = "PosLabel"
+	_pos_label.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+	page.add_child(_pos_label)
+	var tp_row := HBoxContainer.new()
+	tp_row.add_theme_constant_override("separation", Kit.px(8))
+	_tp_x = MenuKit.textbox("", "x")
+	_tp_x.name = "TeleportX"
+	_tp_x.custom_minimum_size.x = Kit.px(90)
+	_tp_x.text_submitted.connect(_on_teleport_submitted)
+	tp_row.add_child(_tp_x)
+	_tp_y = MenuKit.textbox("", "y")
+	_tp_y.name = "TeleportY"
+	_tp_y.custom_minimum_size.x = Kit.px(90)
+	_tp_y.text_submitted.connect(_on_teleport_submitted)
+	tp_row.add_child(_tp_y)
+	var tp_go := MenuKit.button("Go")
+	tp_go.name = "TeleportGo"
+	tp_go.custom_minimum_size.x = Kit.px(64)
+	tp_go.pressed.connect(_on_teleport_go)
+	tp_row.add_child(tp_go)
+	var tp_copy := MenuKit.button("Copy pos")
+	tp_copy.name = "CopyPos"
+	tp_copy.custom_minimum_size.x = Kit.px(100)
+	tp_copy.pressed.connect(_copy_pos)
+	tp_row.add_child(tp_copy)
+	_game_controls.append(_tp_x)
+	_game_controls.append(_tp_y)
+	_game_controls.append(tp_go)
+	page.add_child(tp_row)
 	var head := HBoxContainer.new()
 	head.add_child(Kit.label("Results", "FHeading"))
 	var space := Control.new()
@@ -979,6 +1074,9 @@ func run_test(id: String) -> void:
 		"packs":
 			_show_result(ModelPacks.report())
 			return
+		"ao_audit":
+			_show_result(run_scene_audit())
+			return
 	if main == null or not Bridge.world_ready:
 		_show_result("This one needs a game: connect first")
 		return
@@ -1018,6 +1116,10 @@ func run_test(id: String) -> void:
 				main.world.redraw(c)
 				n += 1
 			_show_result("Redrawing %d chunks" % n)
+		"lods":
+			var out_path := DEBUG_DIR + "/lod-dump.txt"
+			var res: Dictionary = LodDump.dump(main, out_path)
+			_show_result(str(res.get("summary", "")))
 
 
 func _start_probe(p: Node, what: String) -> void:
@@ -1038,12 +1140,22 @@ func set_toggle(id: String, on: bool) -> void:
 		"ups":
 			if main != null:
 				main.ups_overlay_on = on
-		"graph", "counters":
+		"graph", "counters", "profiler":
 			if _overlay == null:
 				_overlay = DebugOverlay.new()
-				_overlay.main = main
 				add_child(_overlay)
+			_overlay.main = main
 			_overlay.set(id, on)
+		"spikes":
+			if _overlay == null:
+				_overlay = DebugOverlay.new()
+				add_child(_overlay)
+			_overlay.main = main
+			var ms := DebugOverlay.spike_arg_ms()
+			_overlay.spike_ms = ms if ms > 0.0 else DebugOverlay.SPIKE_DEFAULT_MS
+			_overlay.spike_log = on
+			if on:
+				_show_result("Spike log: frames over %.0f ms to %s" % [_overlay.spike_ms, ProjectSettings.globalize_path(DebugOverlay.SPIKE_PATH)])
 		"chunks":
 			if on and main != null and main.world != null:
 				if _grid == null:
@@ -1070,6 +1182,15 @@ func toggled_on(id: String) -> bool:
 	return _toggles.has(id) and (_toggles[id] as Button).button_pressed
 
 
+## --spike-log[=ms]: the spike log on from the start of the game, its button shown pressed.
+func start_spike_log() -> void:
+	set_toggle("spikes", true)
+	if _toggles.has("spikes"):
+		var b: Button = _toggles["spikes"]
+		b.set_pressed_no_signal(true)
+		b.text = "Hide"
+
+
 ## Moves the character to a spot (/f3d-debug teleport): the force's spawn, the map's centre, 500
 ## tiles east of it (fresh ground to stream), or back where it stood before the last move.
 func teleport(spot: String) -> void:
@@ -1091,6 +1212,158 @@ func teleport(spot: String) -> void:
 		return
 	_back = here
 	_ask("/f3d-debug teleport %.1f %.1f" % [to.x, to.y], "teleport")
+
+
+func teleport_to(x_str: String, y_str: String) -> bool:
+	if not Settings.dev_tools() or _state.is_empty() or _why != "":
+		return false
+	var xs := x_str.strip_edges()
+	var ys := y_str.strip_edges()
+	if not xs.is_valid_float() or not ys.is_valid_float():
+		_show_result("Teleport: enter numeric x and y coordinates")
+		return false
+	var tx := float(xs)
+	var ty := float(ys)
+	if not is_finite(tx) or not is_finite(ty) or absf(tx) > 1e6 or absf(ty) > 1e6:
+		_show_result("Teleport: coordinates must be finite and within +-1,000,000")
+		return false
+	_back = Vector2(float(_state.get("x", 0)), float(_state.get("y", 0))) / 256.0
+	_ask("/f3d-debug teleport %.1f %.1f" % [tx, ty], "teleport")
+	return true
+
+
+func _on_teleport_go() -> void:
+	if _tp_x != null and _tp_y != null:
+		teleport_to(_tp_x.text, _tp_y.text)
+
+
+func _on_teleport_submitted(_text: String) -> void:
+	_on_teleport_go()
+
+
+func _current_pos() -> Dictionary:
+	if _state.has("x") and _state.has("y"):
+		return {"ok": true, "x": float(_state["x"]) / 256.0, "y": float(_state["y"]) / 256.0, "s": str(_state.get("s", ""))}
+	if main != null and main.get("avatar") != null:
+		var av = main.get("avatar")
+		if av != null and av.has_method("ground_position"):
+			var gp: Vector2 = av.ground_position()
+			return {"ok": true, "x": gp.x, "y": gp.y, "s": str(_state.get("s", ""))}
+	return {"ok": false}
+
+
+func _sync_pos_label() -> void:
+	if _pos_label == null:
+		return
+	var p := _current_pos()
+	if not bool(p.get("ok", false)):
+		_pos_label.text = "Position: (not connected)"
+		return
+	var surf := str(p.get("s", ""))
+	if surf != "":
+		_pos_label.text = "Position: %.1f, %.1f (%s)" % [float(p["x"]), float(p["y"]), surf]
+	else:
+		_pos_label.text = "Position: %.1f, %.1f" % [float(p["x"]), float(p["y"])]
+
+
+func _copy_pos() -> void:
+	var p := _current_pos()
+	if not bool(p.get("ok", false)):
+		_show_result("Position: (not connected)")
+		return
+	var text := "%.1f %.1f" % [float(p["x"]), float(p["y"])]
+	DisplayServer.clipboard_set(text)
+	_show_result("Copied position: " + text)
+
+
+func run_scene_audit() -> String:
+	var root: Node = main if main is Node else (get_tree().root if is_inside_tree() else self)
+	var mmi_nodes := 0
+	var vis_mmis := 0
+	var vis_instances := 0
+	var shadow_mmis := 0
+	var shadow_instances := 0
+	var shadows_only_mmis := 0
+	var shadows_only_instances := 0
+	var contact_nodes := 0
+	var contact_instances := 0
+	var mats_seen := {}
+	var baked_ao_mats := 0
+	var stack: Array[Node] = [root]
+	while not stack.is_empty():
+		var node: Node = stack.pop_back()
+		for i in node.get_child_count():
+			stack.append(node.get_child(i))
+		if node is MultiMeshInstance3D:
+			var mmi := node as MultiMeshInstance3D
+			mmi_nodes += 1
+			var is_vis := mmi.is_visible_in_tree() if mmi.is_inside_tree() else mmi.visible
+			var mm := mmi.multimesh
+			var inst := 0
+			if mm != null:
+				inst = mm.visible_instance_count if mm.visible_instance_count >= 0 else mm.instance_count
+			if is_vis:
+				vis_mmis += 1
+				vis_instances += inst
+			if mmi.name == "ContactShade" or mmi.name == "ContactMasks":
+				contact_nodes += 1
+				if is_vis:
+					contact_instances += inst
+			if is_vis and mmi.cast_shadow != GeometryInstance3D.SHADOW_CASTING_SETTING_OFF:
+				shadow_mmis += 1
+				shadow_instances += inst
+			if is_vis and mmi.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY:
+				shadows_only_mmis += 1
+				shadows_only_instances += inst
+			_audit_collect_materials(mmi.material_override, mm.mesh if mm != null else null, mats_seen)
+		elif node is MeshInstance3D:
+			var mi := node as MeshInstance3D
+			_audit_collect_materials(mi.material_override, mi.mesh, mats_seen)
+	for m_key in mats_seen:
+		var sm := m_key as ShaderMaterial
+		if sm != null and _material_has_baked_ao(sm):
+			baked_ao_mats += 1
+	var forced := ItemCards.forced_lod_tier
+	var forced_str := "auto" if forced < 0 else "LOD%d" % forced
+	var near_lod_str := "-"
+	var bi = main.get("belt_items") if main != null else null
+	if bi != null:
+		var cards = bi.get("_cards")
+		if cards != null and cards.get("lod_tier") != null:
+			near_lod_str = "LOD%d (%s)" % [int(cards.get("lod_tier")), str(ItemCards.lod_mode)]
+	var far_str := "all" if BeltLanes.far_3d_dist < 0.0 else "%.0f tiles" % BeltLanes.far_3d_dist
+	var lines := PackedStringArray([
+		"Scene render audit:",
+		"MultiMeshes: %d total, %d visible (%d instances)" % [mmi_nodes, vis_mmis, vis_instances],
+		"Shadow casters: %d visible (%d instances) | shadows-only: %d (%d instances)" % [shadow_mmis, shadow_instances, shadows_only_mmis, shadows_only_instances],
+		"Contact rings: %d nodes (%d visible instances) | Baked AO materials: %d / %d" % [contact_nodes, contact_instances, baked_ao_mats, mats_seen.size()],
+		"Item LOD: forced=%s, belt=%s, far 3D=%s, lattice=%s" % [forced_str, near_lod_str, far_str, ItemCards.lattice_variants_mode],
+	])
+	var summary := "\n".join(lines)
+	print(summary)
+	return summary
+
+
+static func _audit_collect_materials(override: Material, mesh: Mesh, seen: Dictionary) -> void:
+	if override != null:
+		seen[override] = true
+	if mesh != null:
+		for s in mesh.get_surface_count():
+			var sm := mesh.surface_get_material(s)
+			if sm != null:
+				seen[sm] = true
+
+
+static func _material_has_baked_ao(sm: ShaderMaterial) -> bool:
+	var ao_v: Variant = sm.get_shader_parameter("ao_strength")
+	if ao_v != null and float(ao_v) > 0.0:
+		return true
+	var vd_v: Variant = sm.get_shader_parameter("vertex_data")
+	if vd_v != null and float(vd_v) > 0.0:
+		return true
+	if sm.get_shader_parameter("material_rows") != null:
+		return true
+	return false
 
 
 # --- Updates -------------------------------------------------------------------------------------
@@ -1366,14 +1639,34 @@ func _light_page() -> Control:
 		row.add_child(reset)
 		page.add_child(row)
 		_live_sliders[key] = [sl, val]
+	var light_btns := HBoxContainer.new()
+	light_btns.add_theme_constant_override("separation", Kit.px(8))
 	var copy := Button.new()
 	copy.text = "Copy values"
 	copy.name = "LightCopy"
 	copy.focus_mode = Control.FOCUS_NONE
 	copy.pressed.connect(copy_light)
-	page.add_child(copy)
+	light_btns.add_child(copy)
+	var reset_all := Button.new()
+	reset_all.text = "Reset all"
+	reset_all.name = "LightResetAll"
+	reset_all.focus_mode = Control.FOCUS_NONE
+	reset_all.pressed.connect(reset_all_light)
+	light_btns.add_child(reset_all)
+	page.add_child(light_btns)
 	_sync_light()
 	return page
+
+
+func reset_all_light() -> void:
+	if not Settings.dev_tools():
+		return
+	Looks.pbr_tune.clear()
+	for t: Array in LIVE_TOGGLES:
+		reset_live(str(t[0]))
+	for l: Array in LIVE:
+		reset_live(str(l[0]))
+	_sync_light()
 
 
 ## One pbr light number set live (Looks.pbr_tune). False in a public build.
@@ -1516,7 +1809,7 @@ func _live_put(key: String, v: float) -> void:
 	if CONTACT_UNIFORMS.has(key):
 		_contact_put(key, v)
 	elif key == "ground_rough":
-		Visuals.terrain_material().set_shader_parameter("surface_roughness_add", v)
+		Visuals.set_terrain_param(&"surface_roughness_add", v)
 	elif key == "shadow_blur":
 		var sh = _live_shadows()
 		if sh != null:
@@ -1591,3 +1884,960 @@ func _sync_live() -> void:
 		(pair[1] as Label).text = "%.2f (%s%.2f)" % [v, "was " if Looks.light_tune.has(key) else "now ", float(_live_was.get(key, v))]
 	for key in _live_boxes:
 		(_live_boxes[key] as CheckBox).set_pressed_no_signal(live_value(key) > 0.5)
+
+
+# --- Render --------------------------------------------------------------------------------------
+
+const RENDER_DRAWS := [
+	["disabled", "Normal", Viewport.DEBUG_DRAW_DISABLED],
+	["wireframe", "Wireframe", Viewport.DEBUG_DRAW_WIREFRAME],
+	["overdraw", "Overdraw", Viewport.DEBUG_DRAW_OVERDRAW],
+	["unshaded", "Unshaded", Viewport.DEBUG_DRAW_UNSHADED],
+	["lighting", "Lighting", Viewport.DEBUG_DRAW_LIGHTING],
+	["normal", "Normals", Viewport.DEBUG_DRAW_NORMAL_BUFFER],
+	["shadows", "Shadow atlas", Viewport.DEBUG_DRAW_DIRECTIONAL_SHADOW_ATLAS],
+]
+const RENDER_LAYERS := [
+	["world", "Chunks & buildings"],
+	["belt_items", "Near belt items"],
+	["belt_lanes", "Far belt items"],
+	["ground_items", "Ground items"],
+	["decoratives", "3D grass & clutter"],
+	["arms", "Inserter arms"],
+	["movers", "Robots & creatures"],
+	["distant_horizon", "Distant horizon"],
+	["pollution", "Pollution & smog"],
+	["god_rays", "God rays"],
+	["lights", "Lamps & glow"],
+	["wires", "Power & circuit wires"],
+	["fx", "Particles & smoke"],
+	["sun_shadows", "Sun shadows"],
+]
+const RENDER_TOGGLES := [
+	["item_models", "3D item models", "Draw loose items as 3D meshes instead of icons"],
+	["item_geom_lod", "Item geometric LOD", "Decimate dense item meshes at mid range and switch to 2-tri icons far out"],
+	["item_shadow_proxy", "Item 12-tri shadow proxy", "Cast shadows from simple AABB boxes on 3D belt items"],
+	["far_item_pbr", "Far item full PBR", "Keep normal and ORM texture reads on far belt 3D items"],
+	["far_belt_variants", "Far belt variants", "Draw multiple ore/coal/stone model variants on far belt chunks"],
+	["belt_stand_ins", "Belt LOD stand-ins", "Use simplified flat belt geometry below screen-size threshold"],
+	["far_merge", "Merge far buildings", "Hierarchical merged meshes for distant chunks"],
+	["far_coarse", "Coarse far HLOD", "Outer 0.8 m coarse merge tier for very far chunks"],
+]
+
+
+func _render_page() -> Control:
+	var page := VBoxContainer.new()
+	page.name = "RenderPage"
+	page.add_theme_constant_override("separation", Kit.px(8))
+	_render_note = Kit.label("")
+	_render_note.name = "RenderNote"
+	_render_note.add_theme_color_override("font_color", Kit.RED_TEXT)
+	_render_note.visible = false
+	page.add_child(_render_note)
+
+	page.add_child(Kit.label("Viewport debug draw", "FHeading"))
+	var draw_grid := GridContainer.new()
+	draw_grid.columns = 4
+	draw_grid.add_theme_constant_override("h_separation", Kit.px(6))
+	draw_grid.add_theme_constant_override("v_separation", Kit.px(6))
+	for d: Array in RENDER_DRAWS:
+		var id: String = str(d[0])
+		var b := MenuKit.button(str(d[1]))
+		b.name = "RenderDraw_" + id
+		b.toggle_mode = true
+		b.custom_minimum_size.x = Kit.px(150)
+		var on_press := func() -> void: set_render_draw(id)
+		var on_toggle := func(on: bool) -> void:
+			if on:
+				set_render_draw(id)
+			else:
+				_sync_render()
+		b.pressed.connect(on_press)
+		b.toggled.connect(on_toggle)
+		draw_grid.add_child(b)
+		_render_draw_btns[id] = b
+	page.add_child(draw_grid)
+
+	page.add_child(Kit.label("Layers", "FHeading"))
+	var layer_grid := GridContainer.new()
+	layer_grid.columns = 2
+	layer_grid.add_theme_constant_override("h_separation", Kit.px(16))
+	layer_grid.add_theme_constant_override("v_separation", Kit.px(4))
+	for l: Array in RENDER_LAYERS:
+		var id: String = str(l[0])
+		var box := MenuKit.checkbox(str(l[1]), true)
+		box.name = "Layer_" + id
+		box.custom_minimum_size.x = Kit.px(260)
+		var on_layer := func(on: bool) -> void: set_layer_visible(id, on)
+		box.toggled.connect(on_layer)
+		layer_grid.add_child(box)
+		_layer_boxes[id] = box
+	page.add_child(layer_grid)
+	var all_layers := MenuKit.button("Show all layers")
+	all_layers.name = "Layer_all_on"
+	all_layers.custom_minimum_size.x = Kit.px(160)
+	all_layers.pressed.connect(show_all_layers)
+	page.add_child(all_layers)
+
+	page.add_child(Kit.label("3D items & LOD", "FHeading"))
+	var lod_row := HBoxContainer.new()
+	lod_row.add_theme_constant_override("separation", Kit.px(6))
+	var lod_lbl := Kit.label("Force item LOD")
+	lod_lbl.custom_minimum_size.x = Kit.px(130)
+	lod_row.add_child(lod_lbl)
+	for spec: Array in [["auto", "Auto", -1], ["0", "LOD0", 0], ["1", "LOD1", 1], ["2", "LOD2", 2]]:
+		var key: String = str(spec[0])
+		var tier: int = int(spec[2])
+		var b := MenuKit.button(str(spec[1]))
+		b.name = "ItemLod_" + key
+		b.toggle_mode = true
+		b.custom_minimum_size.x = Kit.px(84)
+		var on_press := func() -> void: set_item_lod_override(tier)
+		var on_toggle := func(on: bool) -> void:
+			if on:
+				set_item_lod_override(tier)
+			else:
+				_sync_render()
+		b.pressed.connect(on_press)
+		b.toggled.connect(on_toggle)
+		lod_row.add_child(b)
+		_lod_btns[key] = b
+	page.add_child(lod_row)
+
+	var lat_row := HBoxContainer.new()
+	lat_row.add_theme_constant_override("separation", Kit.px(6))
+	var lat_lbl := Kit.label("Lattice variants")
+	lat_lbl.custom_minimum_size.x = Kit.px(130)
+	lat_row.add_child(lat_lbl)
+	for spec: Array in [["close", "Close"], ["all", "All"], ["off", "Off"]]:
+		var mode: String = str(spec[0])
+		var b := MenuKit.button(str(spec[1]))
+		b.name = "LatticeVar_" + mode
+		b.toggle_mode = true
+		b.custom_minimum_size.x = Kit.px(84)
+		var on_press := func() -> void: set_lattice_variants_mode(mode)
+		var on_toggle := func(on: bool) -> void:
+			if on:
+				set_lattice_variants_mode(mode)
+			else:
+				_sync_render()
+		b.pressed.connect(on_press)
+		b.toggled.connect(on_toggle)
+		lat_row.add_child(b)
+		_lattice_btns[mode] = b
+	page.add_child(lat_row)
+
+	var far_row := HBoxContainer.new()
+	far_row.add_theme_constant_override("separation", Kit.px(8))
+	var far_lbl := Kit.label("Far 3D items")
+	far_lbl.custom_minimum_size.x = Kit.px(130)
+	far_row.add_child(far_lbl)
+	_far3d_slider = MenuKit.slider(0.0, 160.0, 4.0, 48.0)
+	_far3d_slider.name = "Far3dDist"
+	_far3d_slider.custom_minimum_size.x = Kit.px(240)
+	_far3d_slider.value_changed.connect(_on_far3d_changed)
+	far_row.add_child(_far3d_slider)
+	_far3d_val = Kit.label("")
+	_far3d_val.name = "Far3dDistValue"
+	_far3d_val.custom_minimum_size.x = Kit.px(90)
+	far_row.add_child(_far3d_val)
+	_far3d_all_btn = MenuKit.button("All")
+	_far3d_all_btn.name = "Far3dDistAll"
+	_far3d_all_btn.toggle_mode = true
+	_far3d_all_btn.custom_minimum_size.x = Kit.px(64)
+	_far3d_all_btn.pressed.connect(_on_far3d_all_pressed)
+	_far3d_all_btn.toggled.connect(_on_far3d_all_toggled)
+	far_row.add_child(_far3d_all_btn)
+	page.add_child(far_row)
+
+	var opt_grid := GridContainer.new()
+	opt_grid.columns = 2
+	opt_grid.add_theme_constant_override("h_separation", Kit.px(16))
+	opt_grid.add_theme_constant_override("v_separation", Kit.px(4))
+	for opt: Array in RENDER_TOGGLES:
+		var id: String = str(opt[0])
+		var box := MenuKit.checkbox(str(opt[1]), true)
+		box.name = "RenderOpt_" + id
+		box.tooltip_text = str(opt[2])
+		box.custom_minimum_size.x = Kit.px(260)
+		var on_opt := func(on: bool) -> void: set_render_toggle(id, on)
+		box.toggled.connect(on_opt)
+		opt_grid.add_child(box)
+		_render_opt_boxes[id] = box
+	page.add_child(opt_grid)
+
+	_render_stats = Kit.label("")
+	_render_stats.name = "RenderStats"
+	_render_stats.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_render_stats.custom_minimum_size.x = Kit.px(660)
+	page.add_child(_render_stats)
+
+	var reset_btn := MenuKit.button("Reset all render overrides")
+	reset_btn.name = "RenderResetAll"
+	reset_btn.custom_minimum_size.x = Kit.px(220)
+	reset_btn.pressed.connect(reset_render)
+	page.add_child(reset_btn)
+
+	_sync_render()
+	return page
+
+
+func _render_viewport() -> Viewport:
+	if main != null and main is Node and (main as Node).is_inside_tree():
+		return (main as Node).get_viewport()
+	if is_inside_tree():
+		return get_viewport()
+	return null
+
+
+func _set_render_note(text: String) -> void:
+	if _render_note == null:
+		return
+	_render_note.text = text
+	_render_note.visible = text != ""
+
+
+func _far_chunks_node():
+	if main == null:
+		return null
+	var w = main.get("world")
+	return w.get("far_chunks") if w != null else null
+
+
+func _light_layer_nodes() -> Array:
+	var out: Array = []
+	if main == null:
+		return out
+	for key: String in ["lamps", "signal_lights", "working_glow"]:
+		var n = main.get(key)
+		if n != null:
+			out.append(n)
+	return out
+
+
+func _layer_is_visible(id: String) -> bool:
+	if main == null:
+		return true
+	if id == "sun_shadows":
+		var sun = main.get("_sun")
+		return bool(sun.get("shadow_enabled")) if sun != null else true
+	if id == "lights":
+		var nodes := _light_layer_nodes()
+		if nodes.is_empty():
+			return true
+		for n in nodes:
+			if bool(n.get("visible")):
+				return true
+		return false
+	var layer = main.get(id)
+	return bool(layer.get("visible")) if layer != null else true
+
+
+func _apply_belt_item_debug(rebuild_kinds: bool) -> void:
+	if main != null and main.get("belt_items") != null:
+		var bi = main.get("belt_items")
+		if bi.has_method("apply_debug_item_settings"):
+			bi.apply_debug_item_settings(rebuild_kinds)
+
+
+func _apply_belt_lanes_debug(dist_changed: bool, rebuild_all: bool) -> void:
+	if main != null and main.get("belt_lanes") != null:
+		var bl = main.get("belt_lanes")
+		if bl.has_method("apply_debug_far_settings"):
+			bl.apply_debug_far_settings(dist_changed, rebuild_all)
+
+
+func _on_far3d_changed(v: float) -> void:
+	set_far_3d_dist(v)
+
+
+func _on_far3d_all_pressed() -> void:
+	set_far_3d_dist(-1.0)
+
+
+func _on_far3d_all_toggled(on: bool) -> void:
+	if on:
+		set_far_3d_dist(-1.0)
+	else:
+		_sync_render()
+
+
+func set_render_draw(id: String) -> bool:
+	if not Settings.dev_tools():
+		_sync_render()
+		return false
+	var target_mode := -1
+	for d: Array in RENDER_DRAWS:
+		if str(d[0]) == id:
+			target_mode = int(d[2])
+			break
+	if target_mode < 0:
+		return false
+	var vp := _render_viewport()
+	if vp == null:
+		_set_render_note("Viewport not available")
+		_sync_render()
+		return false
+	if not _render_was.has("debug_draw"):
+		_render_was["debug_draw"] = int(vp.debug_draw)
+	vp.debug_draw = target_mode
+	_set_render_note("")
+	_sync_render()
+	return true
+
+
+func _apply_layer(id: String, on: bool) -> String:
+	if id == "sun_shadows":
+		var sun = main.get("_sun")
+		if sun == null:
+			return "Sun light not available"
+		if not _layer_was.has(id):
+			_layer_was[id] = bool(sun.get("shadow_enabled"))
+		sun.set("shadow_enabled", on)
+		return ""
+	if id == "lights":
+		var nodes := _light_layer_nodes()
+		if nodes.is_empty():
+			return "Light layers not available"
+		if not _layer_was.has(id):
+			var was := {}
+			for key: String in ["lamps", "signal_lights", "working_glow"]:
+				var n = main.get(key)
+				if n != null:
+					was[key] = bool(n.get("visible"))
+			_layer_was[id] = was
+		for n in nodes:
+			n.set("visible", on)
+		return ""
+	var layer = main.get(id)
+	if layer == null:
+		return "Layer not available: " + id
+	if not _layer_was.has(id):
+		_layer_was[id] = bool(layer.get("visible"))
+	layer.set("visible", on)
+	return ""
+
+
+func set_layer_visible(id: String, on: bool) -> bool:
+	if not Settings.dev_tools():
+		_sync_render()
+		return false
+	if main == null:
+		_set_render_note("Layers need a game: connect first")
+		_sync_render()
+		return false
+	var err := _apply_layer(id, on)
+	if err != "":
+		_set_render_note(err)
+		_sync_render()
+		return false
+	_set_render_note("")
+	_sync_render()
+	return true
+
+
+func show_all_layers() -> bool:
+	if not Settings.dev_tools():
+		_sync_render()
+		return false
+	if main == null:
+		_set_render_note("Layers need a game: connect first")
+		_sync_render()
+		return false
+	for l: Array in RENDER_LAYERS:
+		_apply_layer(str(l[0]), true)
+	_set_render_note("")
+	_sync_render()
+	return true
+
+
+func set_item_lod_override(tier: int) -> bool:
+	if not Settings.dev_tools():
+		_sync_render()
+		return false
+	var clamped := -1 if tier < 0 else clampi(tier, 0, 2)
+	if not _render_was.has("forced_lod_tier"):
+		_render_was["forced_lod_tier"] = ItemCards.forced_lod_tier
+	ItemCards.forced_lod_tier = clamped
+	_apply_belt_item_debug(false)
+	_set_render_note("")
+	_sync_render()
+	return true
+
+
+func set_lattice_variants_mode(mode: String) -> bool:
+	if not Settings.dev_tools():
+		_sync_render()
+		return false
+	if not (mode in ["close", "all", "off"]):
+		return false
+	if not _render_was.has("lattice_variants_mode"):
+		_render_was["lattice_variants_mode"] = ItemCards.lattice_variants_mode
+	ItemCards.lattice_variants_mode = mode
+	_apply_belt_item_debug(true)
+	_set_render_note("")
+	_sync_render()
+	return true
+
+
+func set_far_3d_dist(dist: float) -> bool:
+	if not Settings.dev_tools():
+		_sync_render()
+		return false
+	var want := -1.0 if dist < 0.0 else clampf(dist, 0.0, 160.0)
+	if not _render_was.has("far_3d_dist"):
+		_render_was["far_3d_dist"] = BeltLanes.far_3d_dist
+		_render_was["far_3d_debug"] = BeltLanes._far_3d_debug
+	var bl = main.get("belt_lanes") if main != null else null
+	if bl != null and bl.has_method("set_far_3d_dist"):
+		bl.set_far_3d_dist(want, true)
+	else:
+		BeltLanes._far_3d_debug = true
+		BeltLanes.far_3d_dist = want
+	_set_render_note("")
+	_sync_render()
+	return true
+
+
+func set_render_toggle(id: String, on: bool) -> bool:
+	if not Settings.dev_tools():
+		_sync_render()
+		return false
+	match id:
+		"item_models":
+			if not _render_was.has(id):
+				_render_was[id] = ItemCards.use_models
+			if not _render_was.has("item_model_cap"):
+				_render_was["item_model_cap"] = ItemCards.model_cap
+			ItemCards.use_models = on
+			if on and ItemCards.model_cap == 0:
+				ItemCards.model_cap = -1
+			_apply_belt_item_debug(true)
+			_apply_belt_lanes_debug(false, true)
+		"item_geom_lod":
+			if not _render_was.has(id):
+				_render_was[id] = ItemModels.item_geom_lod
+			ItemModels.item_geom_lod = on
+			_apply_belt_item_debug(true)
+			_apply_belt_lanes_debug(false, true)
+		"item_shadow_proxy":
+			if not _render_was.has(id):
+				_render_was[id] = ItemCards.shadow_proxy_enabled
+			ItemCards.shadow_proxy_enabled = on
+			_apply_belt_item_debug(true)
+		"far_item_pbr":
+			if not _render_was.has(id):
+				_render_was[id] = BeltLanes.far_item_pbr_full
+			BeltLanes.far_item_pbr_full = on
+			_apply_belt_lanes_debug(false, true)
+		"far_belt_variants":
+			if not _render_was.has(id):
+				_render_was[id] = BeltLanes.far_belt_variants
+			BeltLanes.far_belt_variants = on
+			_apply_belt_lanes_debug(false, true)
+		"belt_stand_ins":
+			if not _render_was.has(id):
+				_render_was[id] = BeltLods.enabled
+			BeltLods.enabled = on
+			BeltLods._dirty = true
+		"far_merge":
+			var fc = _far_chunks_node()
+			if fc == null:
+				_set_render_note("Merge far buildings needs a game: connect first")
+				_sync_render()
+				return false
+			if not _render_was.has(id):
+				_render_was[id] = bool(fc.get("enabled"))
+			fc.set("enabled", on)
+			if fc.has_method("reset_decide"):
+				fc.reset_decide()
+		"far_coarse":
+			if not _render_was.has(id):
+				_render_was[id] = FarChunks.far_coarse
+			FarChunks.far_coarse = on
+			var fc = _far_chunks_node()
+			if fc != null and fc.has_method("reset_decide"):
+				fc.reset_decide()
+		_:
+			return false
+	_set_render_note("")
+	_sync_render()
+	return true
+
+
+func reset_render() -> bool:
+	if not Settings.dev_tools():
+		_sync_render()
+		return false
+	var vp := _render_viewport()
+	if _render_was.has("debug_draw") and vp != null:
+		vp.debug_draw = int(_render_was["debug_draw"])
+	var item_changed := false
+	var item_rebuild := false
+	var far_dist_changed := false
+	var far_rebuild := false
+	var fc_dirty := false
+	if _render_was.has("forced_lod_tier"):
+		ItemCards.forced_lod_tier = int(_render_was["forced_lod_tier"])
+		item_changed = true
+	if _render_was.has("lattice_variants_mode"):
+		ItemCards.lattice_variants_mode = str(_render_was["lattice_variants_mode"])
+		item_rebuild = true
+	if _render_was.has("far_3d_dist"):
+		BeltLanes._far_3d_debug = bool(_render_was.get("far_3d_debug", false))
+		BeltLanes.far_3d_dist = float(_render_was["far_3d_dist"])
+		far_dist_changed = true
+	if _render_was.has("item_models"):
+		ItemCards.use_models = bool(_render_was["item_models"])
+		item_rebuild = true
+		far_rebuild = true
+	if _render_was.has("item_model_cap"):
+		ItemCards.model_cap = int(_render_was["item_model_cap"])
+		item_rebuild = true
+		far_rebuild = true
+	if _render_was.has("item_geom_lod"):
+		ItemModels.item_geom_lod = bool(_render_was["item_geom_lod"])
+		item_rebuild = true
+		far_rebuild = true
+	if _render_was.has("item_shadow_proxy"):
+		ItemCards.shadow_proxy_enabled = bool(_render_was["item_shadow_proxy"])
+		item_rebuild = true
+	if _render_was.has("far_item_pbr"):
+		BeltLanes.far_item_pbr_full = bool(_render_was["far_item_pbr"])
+		far_rebuild = true
+	if _render_was.has("far_belt_variants"):
+		BeltLanes.far_belt_variants = bool(_render_was["far_belt_variants"])
+		far_rebuild = true
+	if _render_was.has("belt_stand_ins"):
+		BeltLods.enabled = bool(_render_was["belt_stand_ins"])
+		BeltLods._dirty = true
+	var fc = _far_chunks_node()
+	if _render_was.has("far_merge") and fc != null:
+		fc.set("enabled", bool(_render_was["far_merge"]))
+		fc_dirty = true
+	if _render_was.has("far_coarse"):
+		FarChunks.far_coarse = bool(_render_was["far_coarse"])
+		fc_dirty = true
+	_render_was.clear()
+
+	if main != null:
+		for id: String in _layer_was:
+			if id == "sun_shadows":
+				var sun = main.get("_sun")
+				if sun != null:
+					sun.set("shadow_enabled", bool(_layer_was[id]))
+			elif id == "lights":
+				var prev: Variant = _layer_was[id]
+				if prev is Dictionary:
+					for key: String in (prev as Dictionary):
+						var n = main.get(key)
+						if n != null:
+							n.set("visible", bool((prev as Dictionary)[key]))
+				else:
+					for n in _light_layer_nodes():
+						n.set("visible", bool(prev))
+			else:
+				var layer = main.get(id)
+				if layer != null:
+					layer.set("visible", bool(_layer_was[id]))
+	_layer_was.clear()
+
+	if item_rebuild or item_changed:
+		_apply_belt_item_debug(item_rebuild)
+	if far_dist_changed or far_rebuild:
+		_apply_belt_lanes_debug(far_dist_changed, far_rebuild)
+	if fc_dirty and fc != null and fc.has_method("reset_decide"):
+		fc.reset_decide()
+	_set_render_note("")
+	_sync_render()
+	return true
+
+
+func _sync_render() -> void:
+	var vp := _render_viewport()
+	var mode: int = int(vp.debug_draw) if vp != null else int(Viewport.DEBUG_DRAW_DISABLED)
+	for d: Array in RENDER_DRAWS:
+		var id: String = str(d[0])
+		var btn: Button = _render_draw_btns.get(id)
+		if btn != null:
+			btn.set_pressed_no_signal(mode == int(d[2]))
+	for l: Array in RENDER_LAYERS:
+		var id: String = str(l[0])
+		var box: CheckBox = _layer_boxes.get(id)
+		if box != null:
+			box.set_pressed_no_signal(_layer_is_visible(id))
+	var forced := ItemCards.forced_lod_tier
+	var lod_key := "auto" if forced < 0 else str(forced)
+	for key: String in _lod_btns:
+		var btn: Button = _lod_btns[key]
+		btn.set_pressed_no_signal(key == lod_key)
+	for mode_key: String in _lattice_btns:
+		var btn: Button = _lattice_btns[mode_key]
+		btn.set_pressed_no_signal(mode_key == ItemCards.lattice_variants_mode)
+	var far_d: float = BeltLanes.far_3d_dist
+	if _far3d_slider != null and far_d >= 0.0:
+		_far3d_slider.set_value_no_signal(clampf(far_d, 0.0, 160.0))
+	if _far3d_val != null:
+		if far_d < 0.0:
+			_far3d_val.text = "All"
+		elif is_zero_approx(far_d):
+			_far3d_val.text = "0 (icons)"
+		else:
+			_far3d_val.text = "%.0f tiles" % far_d
+	if _far3d_all_btn != null:
+		_far3d_all_btn.set_pressed_no_signal(far_d < 0.0)
+	var fc = _far_chunks_node()
+	var opt_values := {
+		"item_models": ItemCards.use_models,
+		"item_geom_lod": ItemModels.item_geom_lod,
+		"item_shadow_proxy": ItemCards.shadow_proxy_enabled,
+		"far_item_pbr": BeltLanes.far_item_pbr_full,
+		"far_belt_variants": BeltLanes.far_belt_variants,
+		"belt_stand_ins": BeltLods.enabled,
+		"far_merge": bool(fc.get("enabled")) if fc != null else true,
+		"far_coarse": FarChunks.far_coarse,
+	}
+	for id: String in _render_opt_boxes:
+		var box: CheckBox = _render_opt_boxes[id]
+		box.set_pressed_no_signal(bool(opt_values.get(id, true)))
+	_sync_render_stats()
+
+
+func _sync_render_stats() -> void:
+	if _render_stats == null:
+		return
+	var fps := Engine.get_frames_per_second()
+	var rs := RenderStats.read()  # (read on the render thread when it runs on its own: no wait)
+	var draws := int(rs.get("draws", 0))
+	var tris := int(rs.get("prims", 0))
+	var objs := int(rs.get("objects", 0))
+	var vp := _render_viewport()
+	var draw_name := "Normal"
+	if vp != null:
+		for d: Array in RENDER_DRAWS:
+			if int(d[2]) == int(vp.debug_draw):
+				draw_name = str(d[1])
+				break
+	var forced := ItemCards.forced_lod_tier
+	var lod_str := "Auto" if forced < 0 else "LOD%d" % forced
+	var far_str := "All" if BeltLanes.far_3d_dist < 0.0 else "%.0f tiles" % BeltLanes.far_3d_dist
+	var lines := PackedStringArray([
+		"FPS %d · draws %d · tris %s · objects %d" % [int(fps), draws, DebugOverlay._big(tris), objs],
+		"Debug draw: %s · Item LOD: %s · Far 3D: %s · Lattice: %s" % [draw_name, lod_str, far_str, ItemCards.lattice_variants_mode],
+	])
+	if main != null:
+		var w = main.get("world")
+		if w != null:
+			var fc = w.get("far_chunks")
+			var fc_str := ""
+			if fc != null and fc.has_method("census"):
+				var c: Array = fc.census()
+				fc_str = " · far merged %d (%s tris, %d far)" % [int(c[0]), DebugOverlay._big(int(c[1])), int(c[2])]
+			if w.has_method("loaded_chunk_count") and w.get("chunks") is Dictionary:
+				lines.append("Chunks: %d loaded / %d%s" % [int(w.loaded_chunk_count()), (w.get("chunks") as Dictionary).size(), fc_str])
+		var bi = main.get("belt_items")
+		if bi != null and bi.has_method("count"):
+			lines.append("Belt items: %d" % int(bi.count()))
+		var dh = main.get("distant_horizon")
+		if dh != null and dh.get("enabled") != null:
+			lines.append("Distant Horizon: %s" % ("on" if bool(dh.get("enabled")) else "off"))
+	_render_stats.text = "\n".join(lines)
+
+
+# --- Bridge --------------------------------------------------------------------------------------
+
+func _bridge_page() -> Control:
+	var page := VBoxContainer.new()
+	page.name = "BridgePage"
+	page.add_theme_constant_override("separation", Kit.px(8))
+
+	page.add_child(Kit.label("Bridge actions", "FHeading"))
+	var actions := GridContainer.new()
+	actions.columns = 3
+	actions.add_theme_constant_override("h_separation", Kit.px(8))
+	actions.add_theme_constant_override("v_separation", Kit.px(6))
+	for spec: Array in [
+		["profile", "Toggle profiler", "/f3d-profile"],
+		["trace", "Trace 600 ticks", "/f3d-profile trace 600"],
+		["status", "Status", "/f3d-status"],
+		["selftest", "Self-test", "/f3d-selftest"],
+		["perf", "Perf switches", "/f3d-perf"],
+		["bs", "Belt-sim switches", "/f3d-bs"],
+	]:
+		var b := MenuKit.button(str(spec[1]))
+		b.name = "Bridge_" + str(spec[0])
+		b.custom_minimum_size.x = Kit.px(190)
+		var cmd: String = str(spec[2])
+		var on_action := func() -> void: send_bridge_cmd(cmd)
+		b.pressed.connect(on_action)
+		actions.add_child(b)
+	page.add_child(actions)
+
+	var rate_row := HBoxContainer.new()
+	rate_row.add_theme_constant_override("separation", Kit.px(6))
+	var rate_lbl := Kit.label("Update rate")
+	rate_lbl.custom_minimum_size.x = Kit.px(100)
+	rate_row.add_child(rate_lbl)
+	for n in 4:
+		var b := MenuKit.button("Hold %d" % n)
+		b.name = "BridgeRate_%d" % n
+		b.custom_minimum_size.x = Kit.px(88)
+		var cmd := "/f3d-rate %d hold" % n
+		var on_rate := func() -> void: send_bridge_cmd(cmd)
+		b.pressed.connect(on_rate)
+		rate_row.add_child(b)
+	var rate_free := MenuKit.button("Release")
+	rate_free.name = "BridgeRate_free"
+	rate_free.custom_minimum_size.x = Kit.px(88)
+	var on_free := func() -> void: send_bridge_cmd("/f3d-rate free")
+	rate_free.pressed.connect(on_free)
+	rate_row.add_child(rate_free)
+	page.add_child(rate_row)
+
+	page.add_child(Kit.label("Console command", "FHeading"))
+	var cmd_row := HBoxContainer.new()
+	cmd_row.add_theme_constant_override("separation", Kit.px(8))
+	_bridge_cmd_box = MenuKit.textbox("", "/f3d-perf, /f3d-bs, /evolution, /seed...")
+	_bridge_cmd_box.name = "BridgeCmdBox"
+	_bridge_cmd_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_bridge_cmd_box.text_submitted.connect(_on_bridge_cmd_submitted)
+	cmd_row.add_child(_bridge_cmd_box)
+	var cmd_send := MenuKit.button("Send")
+	cmd_send.name = "BridgeCmdSend"
+	cmd_send.custom_minimum_size.x = Kit.px(90)
+	cmd_send.pressed.connect(_on_bridge_cmd_send)
+	cmd_row.add_child(cmd_send)
+	page.add_child(cmd_row)
+
+	var quick_row := HBoxContainer.new()
+	quick_row.add_theme_constant_override("separation", Kit.px(8))
+	var quick_lbl := Kit.label("Quick")
+	quick_lbl.custom_minimum_size.x = Kit.px(64)
+	quick_row.add_child(quick_lbl)
+	for q: Array in [["evo", "Evolution", "/evolution"], ["seed", "Seed", "/seed"], ["time", "Time", "/time"], ["players", "Players", "/players"]]:
+		var b := MenuKit.button(str(q[1]))
+		b.name = "BridgeQuick_" + str(q[0])
+		b.custom_minimum_size.x = Kit.px(110)
+		var cmd: String = str(q[2])
+		var on_quick := func() -> void: send_bridge_cmd(cmd)
+		b.pressed.connect(on_quick)
+		quick_row.add_child(b)
+	page.add_child(quick_row)
+
+	var util_row := HBoxContainer.new()
+	util_row.add_theme_constant_override("separation", Kit.px(8))
+	var perf_show := MenuKit.button("Show perf holds")
+	perf_show.name = "BridgePerfLog"
+	perf_show.custom_minimum_size.x = Kit.px(150)
+	perf_show.pressed.connect(_on_bridge_perf_log)
+	util_row.add_child(perf_show)
+	var perf_clear := MenuKit.button("Clear holds")
+	perf_clear.name = "BridgePerfClear"
+	perf_clear.custom_minimum_size.x = Kit.px(130)
+	perf_clear.pressed.connect(_on_bridge_perf_clear)
+	util_row.add_child(perf_clear)
+	var snap_btn := MenuKit.button("Copy debug snapshot")
+	snap_btn.name = "CopySnapshot"
+	snap_btn.custom_minimum_size.x = Kit.px(190)
+	snap_btn.pressed.connect(_on_copy_snapshot)
+	util_row.add_child(snap_btn)
+	page.add_child(util_row)
+
+	var dir_row := HBoxContainer.new()
+	dir_row.add_theme_constant_override("separation", Kit.px(8))
+	for d: Array in [["OpenLogs", "Open logs", "user://logs"], ["OpenDebug", "Open debug", DEBUG_DIR], ["OpenBenchmarks", "Open benchmarks", REPORT_DIR]]:
+		var b := MenuKit.button(str(d[1]))
+		b.name = str(d[0])
+		b.custom_minimum_size.x = Kit.px(150)
+		var path: String = str(d[2])
+		var on_open := func() -> void: _open_user_dir(path)
+		b.pressed.connect(on_open)
+		dir_row.add_child(b)
+	page.add_child(dir_row)
+
+	var out_head := HBoxContainer.new()
+	out_head.add_theme_constant_override("separation", Kit.px(8))
+	out_head.add_child(Kit.label("Output", "FHeading"))
+	var out_space := Control.new()
+	out_space.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	out_head.add_child(out_space)
+	var out_copy := MenuKit.button("Copy")
+	out_copy.name = "BridgeOutCopy"
+	out_copy.custom_minimum_size.x = Kit.px(80)
+	out_copy.pressed.connect(_on_bridge_out_copy)
+	out_head.add_child(out_copy)
+	var out_clear := MenuKit.button("Clear")
+	out_clear.name = "BridgeOutClear"
+	out_clear.custom_minimum_size.x = Kit.px(80)
+	out_clear.pressed.connect(_on_bridge_out_clear)
+	out_head.add_child(out_clear)
+	page.add_child(out_head)
+
+	var deep: Array = Kit.deep_scroll(Kit.pxv(680, 170))
+	var pad := MarginContainer.new()
+	pad.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	for side in ["left", "top", "right", "bottom"]:
+		pad.add_theme_constant_override("margin_" + side, Kit.px(8))
+	(deep[1] as Control).add_child(pad)
+	_bridge_out = Kit.label("No output yet")
+	_bridge_out.name = "BridgeOut"
+	_bridge_out.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_bridge_out.custom_minimum_size.x = Kit.px(640)
+	pad.add_child(_bridge_out)
+	page.add_child(deep[0] as Control)
+
+	return page
+
+
+func send_bridge_cmd(text: String) -> bool:
+	if not Settings.dev_tools():
+		return false
+	var cmd := text.strip_edges()
+	if cmd == "":
+		return false
+	if not cmd.begins_with("/"):
+		cmd = "/" + cmd
+	if model == null or _paused_here:
+		if _bridge_out != null:
+			_bridge_out.text = "Paused: resume first" if _paused_here else "No bridge model"
+		return false
+	if not Bridge.world_ready:
+		_set_why("Not in a game")
+		if _bridge_out != null:
+			_bridge_out.text = "Not in a game: connect first"
+		return false
+	if _bridge_out != null:
+		_bridge_out.text = "Asking the bridge..."
+	_ask(cmd, "bridge")
+	return true
+
+
+func snapshot_text() -> String:
+	var ver := str(ProjectSettings.get_setting("application/config/version", "?"))
+	var fps := Engine.get_frames_per_second()
+	var rs := RenderStats.read()
+	var draws := int(rs.get("draws", 0))
+	var tris := int(rs.get("prims", 0))
+	var objs := int(rs.get("objects", 0))
+	var vmem := float(rs.get("vmem", 0)) / 1048576.0
+	var lines := PackedStringArray([
+		"Zenith %s (%s, %s)" % [ver, OS.get_name(), RenderingServer.get_video_adapter_name()],
+		"Bridge: connected=%s ready=%s mod=%s save=%s tick=%d newest=%d rate=%d relay=%s" % [
+			str(Bridge.connected), str(Bridge.world_ready),
+			Bridge.mod_version if Bridge.mod_version != "" else "-",
+			Bridge.save_id if Bridge.save_id != "" else "-",
+			Bridge.server_tick, Bridge.newest_tick, Bridge.update_rate, str(Bridge.via_relay)],
+	])
+	var stats: Dictionary = Bridge.stats
+	var loss: Dictionary = Bridge.loss
+	lines.append("Net: packets=%d bytes=%d gaps=%d resyncs=%d full=%d dg=%d lost=%d unnumbered=%d" % [
+		int(stats.get("packets", 0)), int(stats.get("bytes", 0)), int(stats.get("gaps", 0)),
+		int(stats.get("resyncs", 0)), int(stats.get("full_resyncs", 0)),
+		int(loss.get("datagrams", 0)), int(loss.get("lost", 0)), int(loss.get("unnumbered", 0))])
+	var wb: Dictionary = Bridge.work_budget
+	if not wb.is_empty():
+		lines.append("Budget: b=%s avg=%s max=%s over=%s q=%s" % [
+			str(wb.get("b", "?")), str(wb.get("avg", "?")), str(wb.get("max", "?")),
+			str(wb.get("over", "?")), str(wb.get("q", "?"))])
+	var pos := _current_pos()
+	if bool(pos.get("ok", false)):
+		lines.append("Pos: %.1f, %.1f (%s)" % [float(pos["x"]), float(pos["y"]), str(pos.get("s", ""))])
+	lines.append("Render: %d fps (%.1f ms) | draws=%d tris=%s objects=%d vmem=%.0f MB" % [
+		int(fps), 1000.0 / maxf(fps, 1.0), draws, DebugOverlay._big(tris), objs, vmem])
+	var forced := ItemCards.forced_lod_tier
+	var far_str := "all" if BeltLanes.far_3d_dist < 0.0 else "%.0f" % BeltLanes.far_3d_dist
+	lines.append("Render opts: forced_lod=%s item_models=%s geom_lod=%s shadow_proxy=%s far_3d=%s far_pbr=%s far_var=%s lattice=%s stand_ins=%s far_coarse=%s" % [
+		"auto" if forced < 0 else str(forced), str(ItemCards.use_models), str(ItemModels.item_geom_lod),
+		str(ItemCards.shadow_proxy_enabled), far_str, str(BeltLanes.far_item_pbr_full),
+		str(BeltLanes.far_belt_variants), ItemCards.lattice_variants_mode, str(BeltLods.enabled), str(FarChunks.far_coarse)])
+	if main != null:
+		var w = main.get("world")
+		if w != null and w.has_method("loaded_chunk_count") and w.get("chunks") is Dictionary:
+			var fc = w.get("far_chunks")
+			var fc_str := "far_merge=%s" % str(fc.get("enabled")) if fc != null else ""
+			if fc != null and fc.has_method("census"):
+				var c: Array = fc.census()
+				fc_str += " merged=%d(%s tris)" % [int(c[0]), DebugOverlay._big(int(c[1]))]
+			lines.append("World: chunks=%d/%d entities=%d %s" % [
+				int(w.loaded_chunk_count()), (w.get("chunks") as Dictionary).size(),
+				int(w.entity_count()) if w.has_method("entity_count") else 0, fc_str])
+		var bi = main.get("belt_items")
+		var gi = main.get("ground_items")
+		var mv = main.get("movers")
+		lines.append("Counts: belt_items=%s ground_items=%s movers=%s" % [
+			str(bi.count()) if bi != null and bi.has_method("count") else "-",
+			str(gi.count()) if gi != null and gi.has_method("count") else "-",
+			str(mv.count()) if mv != null and mv.has_method("count") else "-"])
+	if _overlay != null and _overlay.has_method("profiler_text"):
+		var pt := str(_overlay.call("profiler_text"))
+		if pt != "":
+			lines.append("Profiler:\n" + pt)
+	lines.append(light_text())
+	var holds := PerfLog.text()
+	if holds != "":
+		lines.append("PerfLog (%d):\n%s" % [PerfLog.entries.size(), holds])
+	else:
+		lines.append("PerfLog: none")
+	return "\n".join(lines)
+
+
+func copy_snapshot() -> String:
+	var txt := snapshot_text()
+	DisplayServer.clipboard_set(txt)
+	if _bridge_out != null:
+		_bridge_out.text = txt
+	return txt
+
+
+func _on_bridge_cmd_submitted(_text: String) -> void:
+	_on_bridge_cmd_send()
+
+
+func _on_bridge_cmd_send() -> void:
+	if _bridge_cmd_box != null:
+		send_bridge_cmd(_bridge_cmd_box.text)
+
+
+func _on_bridge_perf_log() -> void:
+	if not Settings.dev_tools() or _bridge_out == null:
+		return
+	var t := PerfLog.text()
+	_bridge_out.text = t if t != "" else "No performance holds recorded"
+
+
+func _on_bridge_perf_clear() -> void:
+	if not Settings.dev_tools():
+		return
+	PerfLog.clear()
+	if _bridge_out != null:
+		_bridge_out.text = "Cleared performance holds"
+
+
+func _on_copy_snapshot() -> void:
+	if not Settings.dev_tools():
+		return
+	copy_snapshot()
+
+
+func _on_bridge_out_copy() -> void:
+	if _bridge_out != null:
+		DisplayServer.clipboard_set(_bridge_out.text)
+
+
+func _on_bridge_out_clear() -> void:
+	if _bridge_out != null:
+		_bridge_out.text = "No output yet"
+
+
+func _open_user_dir(dir_path: String) -> void:
+	if not Settings.dev_tools():
+		return
+	DirAccess.make_dir_recursive_absolute(dir_path)
+	var abs_path := ProjectSettings.globalize_path(dir_path)
+	if DisplayServer.get_name() == "headless":
+		if _bridge_out != null:
+			_bridge_out.text = "Headless mode (would open): " + abs_path
+		return
+	OS.shell_open(abs_path)
+	if _bridge_out != null:
+		_bridge_out.text = "Opened: " + abs_path

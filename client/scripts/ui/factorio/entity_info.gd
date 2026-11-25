@@ -37,9 +37,10 @@ const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const ModelPacksWindow := preload("res://scripts/menu/model_packs_window.gd")
 const ModelPreview := preload("res://scripts/ui/factorio/model_preview.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## The pack symbol (N8); --entity-info-pack=off leaves it out.
-static var show_pack := not OS.get_cmdline_user_args().has("--entity-info-pack=off")
+static var show_pack := Switches.on("--entity-info-pack")
 const PACK_SIZE := 24
 ## How long the panel holds its entity while the mouse heads for it across the world (ms).
 const HOLD_MSEC := 600
@@ -85,6 +86,13 @@ var _key := ""
 ## (a new Dictionary per answer) and how much Factoriopedia knows. The key itself took three
 ## JSON.stringify calls and a copy of the answer every frame (client-cpu.md 8).
 var _seen_rec: Object = null
+## --hover-rate=off: the panel rebuilt for every new entity and change while running too, as before.
+static var run_rate := Switches.on("--hover-rate")
+const RUN_REBUILD_MSEC := 100
+var _rebuilt_msec := -1000000
+## Full rebuilds and held-back ones so far (for tests and probes).
+var rebuilds := 0
+var held_backs := 0
 var _seen_extra := 0
 var _seen_health := -2.0
 var _seen_working := -2
@@ -210,8 +218,9 @@ func _ready() -> void:
 
 ## The hovered entity (a world record) or null; `mouse` where the mouse is (INF: unknown, the
 ## mouse captured), for holding the entity while it goes to the pack symbol; `fast`: camera/mouse
-## whipping past entities, skipping transient hover rebuilds and `hinfo` sends until it slows.
-func show_entity(r, mouse := Vector2.INF, fast := false) -> void:
+## whipping past entities, skipping transient hover rebuilds and `hinfo` sends until it slows; `running`: the
+## character moving (player_input.gd HOVER_RUN_SPEED), the panel rebuilt at most every RUN_REBUILD_MSEC.
+func show_entity(r, mouse := Vector2.INF, fast := false, running := false) -> void:
 	Kit.poll_icons()  # icons read on a worker since (Kit.icon_into)
 	r = _held(r, mouse)
 	if r == null and player != null and model != null and not (model.map_patch as Dictionary).is_empty():
@@ -223,6 +232,12 @@ func show_entity(r, mouse := Vector2.INF, fast := false) -> void:
 		_seen_rec = null
 		return
 	if fast and not is_same(r, _seen_rec):
+		return
+	# While running, entities slide under a still cursor: a rebuild (2-6 ms, R&D run-spikes) at most every
+	# RUN_REBUILD_MSEC, the panel showing the last one meanwhile.
+	var held_back := running and run_rate and visible and _key != "" and Time.get_ticks_msec() - _rebuilt_msec < RUN_REBUILD_MSEC
+	if held_back and not is_same(r, _seen_rec):
+		held_backs += 1
 		return
 	var world = player.get("world")
 	var proto = world.protos.entity(r.proto_id) if world != null else null
@@ -261,6 +276,10 @@ func show_entity(r, mouse := Vector2.INF, fast := false) -> void:
 		visible = true
 		_draw_bars()
 		return
+	if held_back:
+		held_backs += 1
+		_draw_bars()
+		return
 	_seen_rec = r
 	_seen_extra = extra_hash
 	_seen_health = health
@@ -279,6 +298,8 @@ func show_entity(r, mouse := Vector2.INF, fast := false) -> void:
 		_draw_bars()
 		return
 	_key = key
+	_rebuilt_msec = Time.get_ticks_msec()
+	rebuilds += 1
 	_craft_bar = null
 	_fuel_bar = null
 	for c in _lines.get_children():

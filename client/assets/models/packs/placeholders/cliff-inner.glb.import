@@ -3,7 +3,7 @@
 importer="scene"
 importer_version=1
 type="PackedScene"
-uid="uid://chau2lvyov8tr"
+uid="uid://chkx42cclrluy"
 path="res://.godot/imported/cliff-inner.glb-38ae546f6902f952163861a03a665d4b.scn"
 
 [deps]
@@ -41,5 +41,5 @@ materials/extract_format=0
 materials/extract_path=""
 _subresources={}
 gltf/naming_version=2
-gltf/embedded_image_handling=1
+gltf/embedded_image_handling=3
 gltf/texture_map_mode=1

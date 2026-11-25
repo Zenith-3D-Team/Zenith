@@ -28,6 +28,25 @@ extends Node
 ## INSTANCE_CUSTOM to carry the buildings' working glow.
 
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const Switches := preload("res://scripts/switches.gd")
+
+## `--vehicle-anim=old`: keep static linear track slide and disable chassis suspension/rumble/fan/recoil rock.
+static var enhanced := not (Switches.has("--vehicle-anim=old"))
+
+## Factorio's tank closed-loop caterpillar contour in Blender (y_north, z_up, radius) coordinates,
+## shared verbatim with tools/models/military.py.
+const TANK_CIRCLES := [
+	Vector3(-1.06, 0.34, 0.28),
+	Vector3(0.82, 0.22, 0.16),
+	Vector3(1.24, 0.39, 0.23),
+]
+const TANK_CLEATS := 32
+const TANK_CLEAT_START_Y := 0.85
+const TANK_CLEAT_TOP_Z := 0.62
+
+static var _track_segs: Array = []
+static var _track_perim := 0.0
+static var _cleat_cache := {}  # Mesh -> ArrayMesh (extracted top Cleat #0)
 
 ## Factorio's spidertron legs (spider_engine.legs, base/prototypes/entity/spidertron.lua, from
 ## `factorio --dump-data`), in the order the mod sends their feet: mount position, ground
@@ -93,7 +112,7 @@ const POD_THRUST_SPEED := 0.5
 const TREAD_SPACING := {"tank": (1.38 + 1.42 - 0.08) / 25.0 * 1.071}
 
 const RIG_KINDS := {"spidertron": "spider", "logistic-robot": "logistic", "construction-robot": "construction",
-	"capture-robot": "capture", "cargo-pod": "pod", "tank": "tracks"}
+	"capture-robot": "capture", "cargo-pod": "pod", "car": "car", "tank": "tracks"}
 
 
 class Leg:
@@ -131,6 +150,20 @@ class Rig:
 	var knee_at := KNEE_AT
 	var step_size := STEP_TRIGGER  # minimal_step_size
 	var size := 1.0  # the legs' reach against the spidertron's
+	var last_yaw := 0.0
+	var prev_speed := 0.0
+	var pitch := 0.0
+	var pitch_vel := 0.0
+	var roll := 0.0
+	var roll_vel := 0.0
+	var chassis_xf := Transform3D.IDENTITY
+	var fan_angle := 0.0
+	var left_travel := 0.0
+	var right_travel := 0.0
+	var track_l_mm: MultiMeshInstance3D
+	var track_r_mm: MultiMeshInstance3D
+	var track_l_x := -0.66
+	var track_r_x := 0.66
 
 
 ## ui_model.gd (legs, robot_cargo), turrets.gd (the spidertron's torso), sprite_fx.gd (sparks):
@@ -159,19 +192,21 @@ func attach(unit: int, node: Node3D, proto_name: String) -> void:
 	rig.node = node
 	rig.kind = RIG_KINDS.get(proto_name, "")
 	rig.last = node.position
+	rig.last_yaw = node.rotation.y
 	rig.phase = float(posmod(unit * 7919, 1000)) / 1000.0 * TAU
 	for child in node.get_children():
 		var mi := child as MeshInstance3D
 		if mi == null:
 			continue
 		rig.meshes.append(mi)
-		mi.set_instance_shader_parameter("f3d_glow", 1.0)
 		if child.has_meta("part"):
 			var part: ModelLibrary.AnimPart = child.get_meta("part")
+			mi.set_instance_shader_parameter("f3d_glow", 0.0 if part.kind == "headlight" else 1.0)
 			var list: Array = rig.parts.get(part.kind, [])
 			list.append([mi, part])
 			rig.parts[part.kind] = list
 		else:
+			mi.set_instance_shader_parameter("f3d_glow", 1.0)
 			rig.body = mi
 	if proto_name == "rocket-silo-rocket":
 		# Its engines glow only once they start (rockets.gd lights the launching one).
@@ -183,6 +218,8 @@ func attach(unit: int, node: Node3D, proto_name: String) -> void:
 		return
 	if rig.kind == "spider":
 		_rig_legs(rig, proto_name)
+	elif rig.kind == "tracks" and enhanced:
+		_attach_tank_tracks(rig)
 	_rigs[unit] = rig
 
 
@@ -226,9 +263,12 @@ func _animate(delta: float) -> void:
 		if not is_instance_valid(rig.node):
 			continue
 		var moved := rig.node.position - rig.last
+		var turned := wrapf(rig.node.rotation.y - rig.last_yaw, -PI, PI)
 		rig.last = rig.node.position
+		rig.last_yaw = rig.node.rotation.y
 		if moved.length() > 4.0:
 			moved = Vector3.ZERO  # a teleport
+			turned = 0.0
 		rig.velocity = rig.velocity.lerp(moved / delta, 1.0 - exp(-delta * 8.0))
 		match rig.kind:
 			"spider":
@@ -239,8 +279,30 @@ func _animate(delta: float) -> void:
 				_capture(rig, delta)
 			"pod":
 				_pod(rig, delta)
+			"car":
+				_car(rig, moved, turned, delta)
 			"tracks":
-				_tracks(rig, moved)
+				_tracks(rig, moved, turned, delta)
+
+
+## Current sprung hull offset transform for a rigged vehicle (`car` / `tank`), or IDENTITY.
+func chassis_xform(unit: int) -> Transform3D:
+	if not enhanced:
+		return Transform3D.IDENTITY
+	var rig: Rig = _rigs.get(unit)
+	return rig.chassis_xf if rig != null else Transform3D.IDENTITY
+
+
+## Adds a suspension impulse in `world_dir` (e.g. -muzzle_forward for tank cannon recoil).
+func impulse(unit: int, world_dir: Vector3, strength: float) -> void:
+	if not enhanced or strength == 0.0:
+		return
+	var rig: Rig = _rigs.get(unit)
+	if rig == null or not is_instance_valid(rig.node) or world_dir.length_squared() < 1e-6:
+		return
+	var local_dir := (rig.node.global_transform.basis.inverse() * world_dir).normalized()
+	rig.pitch_vel += local_dir.z * strength
+	rig.roll_vel += -local_dir.x * strength
 
 
 # --- spidertron --------------------------------------------------------------------------------
@@ -528,12 +590,307 @@ func _pod(rig: Rig, delta: float) -> void:
 			mi.scale = Vector3(1.0, (0.5 + 0.5 * thrust) * flicker, 1.0)
 
 
-# --- tracks ------------------------------------------------------------------------------------
+# --- car & tank chassis, closed-loop caterpillar tracks ------------------------------------------
 
-func _tracks(rig: Rig, moved: Vector3) -> void:
+func _car(rig: Rig, moved: Vector3, turned: float, delta: float) -> void:
+	if not enhanced:
+		rig.chassis_xf = Transform3D.IDENTITY
+		_apply_chassis(rig)
+		for pair in rig.parts.get("engine_fan", []):
+			(pair[0] as MeshInstance3D).transform = Transform3D.IDENTITY
+		return
 	var forward := -rig.node.global_transform.basis.z
-	rig.travelled += moved.dot(forward)
-	var spacing: float = TREAD_SPACING.get("tank", 0.12)
-	var slide := fposmod(rig.travelled, spacing)
-	for pair in rig.parts.get("tread", []):
-		(pair[0] as MeshInstance3D).position = Vector3(0.0, 0.0, -slide)
+	var dist := moved.dot(forward)
+	var speed := dist / delta
+	var accel := clampf((speed - rig.prev_speed) / delta, -25.0, 25.0)
+	rig.prev_speed = speed
+	var lat_accel := clampf(speed * (turned / delta), -25.0, 25.0)
+	var rumble := (0.0025 + 0.003 * clampf(absf(speed) / 10.0, 0.0, 1.0)) * sin(_time * 42.0 + rig.phase)
+	_step_chassis(rig, accel, lat_accel, delta, 110.0, 13.0, 0.0022, 0.0045, 0.045, 0.055, rumble, 0.36)
+	_apply_chassis(rig)
+	var fan_turns := 1.2 + clampf(absf(speed) * 0.28, 0.0, 3.2)
+	rig.fan_angle = fposmod(rig.fan_angle - delta * fan_turns * TAU, TAU)
+	for pair in rig.parts.get("engine_fan", []):
+		var mi: MeshInstance3D = pair[0]
+		var part: ModelLibrary.AnimPart = pair[1]
+		mi.transform = rig.chassis_xf * part.pivot * Transform3D(Basis(part.axis, rig.fan_angle), Vector3.ZERO) \
+			* part.pivot.affine_inverse()
+
+
+func _tracks(rig: Rig, moved: Vector3, turned: float, delta: float) -> void:
+	var forward := -rig.node.global_transform.basis.z
+	var dist := moved.dot(forward)
+	rig.travelled += dist
+	if not enhanced:
+		rig.chassis_xf = Transform3D.IDENTITY
+		_apply_chassis(rig)
+		var spacing: float = TREAD_SPACING.get("tank", 0.12)
+		var slide := fposmod(rig.travelled, spacing)
+		for key in ["tread", "tread_l", "tread_r"]:
+			for pair in rig.parts.get(key, []):
+				(pair[0] as MeshInstance3D).position = Vector3(0.0, 0.0, -slide)
+		return
+	rig.left_travel += dist + turned * rig.track_l_x
+	rig.right_travel += dist + turned * rig.track_r_x
+	if absf(dist) > 1e-5 or absf(turned) > 1e-5:
+		if rig.track_l_mm != null:
+			update_track_mm(rig.track_l_mm, rig.track_l_x, rig.left_travel)
+		if rig.track_r_mm != null:
+			update_track_mm(rig.track_r_mm, rig.track_r_x, rig.right_travel)
+	var speed := dist / delta
+	var accel := clampf((speed - rig.prev_speed) / delta, -20.0, 20.0)
+	rig.prev_speed = speed
+	var lat_accel := clampf(speed * (turned / delta), -20.0, 20.0)
+	var move_factor := clampf(absf(speed) / 4.0, 0.0, 1.0)
+	var tread_heave := sin(rig.travelled * 7.5) * 0.008 * move_factor
+	var clunk := sin(rig.travelled * 17.0 + rig.phase) * 0.0035 * move_factor
+	var engine_hum := (0.0016 + 0.0022 * clampf(absf(speed) / 8.0, 0.0, 1.0)) * sin(_time * 24.0 + rig.phase)
+	var rumble := engine_hum + tread_heave + clunk
+	_step_chassis(rig, accel, lat_accel, delta, 68.0, 8.8, 0.0024, 0.0032, 0.052, 0.042, rumble, 0.48)
+	_apply_chassis(rig)
+
+
+func _step_chassis(rig: Rig, forward_accel: float, lat_accel: float, delta: float,
+		stiffness: float, damping: float, pitch_gain: float, roll_gain: float,
+		max_pitch: float, max_roll: float, heave: float, pivot_y: float) -> void:
+	var target_pitch := clampf(forward_accel * pitch_gain, -max_pitch, max_pitch)
+	var target_roll := clampf(-lat_accel * roll_gain, -max_roll, max_roll)
+	var steps := maxi(1, ceili(delta / 0.015))
+	var dt := delta / float(steps)
+	for _i in steps:
+		var p_acc := (target_pitch - rig.pitch) * stiffness - rig.pitch_vel * damping
+		var r_acc := (target_roll - rig.roll) * stiffness - rig.roll_vel * damping
+		rig.pitch_vel += p_acc * dt
+		rig.roll_vel += r_acc * dt
+		rig.pitch = clampf(rig.pitch + rig.pitch_vel * dt, -max_pitch * 1.4, max_pitch * 1.4)
+		rig.roll = clampf(rig.roll + rig.roll_vel * dt, -max_roll * 1.4, max_roll * 1.4)
+	var pivot := Vector3(0.0, pivot_y, 0.0)
+	var rot := Basis(Vector3.RIGHT, rig.pitch) * Basis(Vector3.BACK, rig.roll)
+	rig.chassis_xf = Transform3D(Basis.IDENTITY, pivot + Vector3(0.0, heave, 0.0)) \
+		* Transform3D(rot, Vector3.ZERO) * Transform3D(Basis.IDENTITY, -pivot)
+
+
+func _apply_chassis(rig: Rig) -> void:
+	if rig.body != null:
+		rig.body.transform = rig.chassis_xf
+	for pair in rig.parts.get("headlight", []):
+		(pair[0] as MeshInstance3D).transform = rig.chassis_xf
+
+
+func _attach_tank_tracks(rig: Rig) -> void:
+	for key in ["tread_l", "tread_r"]:
+		for pair in rig.parts.get(key, []):
+			var mi: MeshInstance3D = pair[0]
+			var part: ModelLibrary.AnimPart = pair[1]
+			mi.visible = false
+			var mmi := build_track_mm(part)
+			if mmi == null:
+				continue
+			mmi.name = "TrackCleatsL" if key == "tread_l" else "TrackCleatsR"
+			rig.node.add_child(mmi)
+			if key == "tread_l":
+				rig.track_l_mm = mmi
+				rig.track_l_x = part.pivot.origin.x
+			else:
+				rig.track_r_mm = mmi
+				rig.track_r_x = part.pivot.origin.x
+
+
+static func _ensure_track_contour() -> void:
+	if not _track_segs.is_empty():
+		return
+	var c0: Vector3 = TANK_CIRCLES[0]
+	var c1: Vector3 = TANK_CIRCLES[1]
+	var c2: Vector3 = TANK_CIRCLES[2]
+	var top := _ext_tangent(c0, c2)
+	var diag := _ext_tangent(c2, c1)
+	var bot := _ext_tangent(c1, c0)
+	var top_a: Vector2 = top[0]
+	var top_b: Vector2 = top[1]
+	var ang_top: float = top[2]
+	var diag_a: Vector2 = diag[0]
+	var diag_b: Vector2 = diag[1]
+	var ang_diag: float = diag[2]
+	var bot_a: Vector2 = bot[0]
+	var bot_b: Vector2 = bot[1]
+	var ang_bot: float = bot[2]
+	var c1_a1 := ang_bot - TAU if ang_bot > ang_diag else ang_bot
+	var c0_a0 := ang_bot if ang_bot < ang_top else ang_bot - TAU
+	var raw := [
+		["line", Vector2(TANK_CLEAT_START_Y, top_b.y), top_b, ang_top],
+		["arc", c2, ang_top, ang_diag],
+		["line", diag_a, diag_b, ang_diag],
+		["arc", c1, ang_diag, c1_a1],
+		["line", bot_a, bot_b, ang_bot],
+		["arc", c0, c0_a0, ang_top - TAU],
+		["line", top_a, Vector2(TANK_CLEAT_START_Y, top_a.y), ang_top],
+	]
+	_track_perim = 0.0
+	for seg in raw:
+		var seg_arr: Array = seg
+		if str(seg_arr[0]) == "line":
+			var p0: Vector2 = seg_arr[1]
+			var p1: Vector2 = seg_arr[2]
+			var l := p0.distance_to(p1)
+			_track_segs.append(["line", l, p0, p1, float(seg_arr[3])])
+			_track_perim += l
+		else:
+			var c: Vector3 = seg_arr[1]
+			var a0 := float(seg_arr[2])
+			var a1 := float(seg_arr[3])
+			while a1 > a0:
+				a1 -= TAU
+			var l := c.z * (a0 - a1)
+			_track_segs.append(["arc", l, c.x, c.y, c.z, a0, a1])
+			_track_perim += l
+
+
+static func _ext_tangent(a: Vector3, b: Vector3) -> Array:
+	var dy := b.x - a.x
+	var dz := b.y - a.y
+	var d := sqrt(dy * dy + dz * dz)
+	var ang := atan2(dz, dy) + acos(clampf((a.z - b.z) / d, -1.0, 1.0))
+	var nx := cos(ang)
+	var nz := sin(ang)
+	return [Vector2(a.x + a.z * nx, a.y + a.z * nz), Vector2(b.x + b.z * nx, b.y + b.z * nz), ang]
+
+
+static func track_perimeter() -> float:
+	_ensure_track_contour()
+	return _track_perim
+
+
+## Returns Vector3(blender_y_north, blender_z_up, normal_angle_rad) along the CW closed loop.
+static func track_sample(s: float) -> Vector3:
+	_ensure_track_contour()
+	var d := fposmod(s, _track_perim)
+	for i in _track_segs.size():
+		var seg: Array = _track_segs[i]
+		var l := float(seg[1])
+		if d <= l or i == _track_segs.size() - 1:
+			var t := 0.0 if l <= 1e-8 else minf(1.0, d / l)
+			if str(seg[0]) == "line":
+				var p0: Vector2 = seg[2]
+				var p1: Vector2 = seg[3]
+				var p := p0.lerp(p1, t)
+				return Vector3(p.x, p.y, float(seg[4]))
+			var cy := float(seg[2])
+			var cz := float(seg[3])
+			var r := float(seg[4])
+			var ang := lerpf(float(seg[5]), float(seg[6]), t)
+			return Vector3(cy + r * cos(ang), cz + r * sin(ang), ang)
+		d -= l
+	return Vector3(TANK_CLEAT_START_Y, TANK_CLEAT_TOP_Z, PI * 0.5)
+
+
+static func extract_top_cleat(part: ModelLibrary.AnimPart) -> ArrayMesh:
+	if part == null or part.mesh == null:
+		return null
+	if _cleat_cache.has(part.mesh):
+		return _cleat_cache[part.mesh]
+	var out := ArrayMesh.new()
+	var origin_shift := Vector3(part.pivot.origin.x, TANK_CLEAT_TOP_Z, -TANK_CLEAT_START_Y)
+	for s in part.mesh.get_surface_count():
+		var arrays := ModelLibrary.ModelLods.arrays_of(part.mesh, s)
+		if arrays.size() <= Mesh.ARRAY_VERTEX or arrays[Mesh.ARRAY_VERTEX] == null:
+			continue
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		if verts.is_empty():
+			continue
+		var src_idx_var: Variant = arrays[Mesh.ARRAY_INDEX]
+		var kept_order: Array[int] = []
+		var remap := {}
+		var new_idx := PackedInt32Array()
+		var tri_indices: PackedInt32Array
+		if src_idx_var is PackedInt32Array and not (src_idx_var as PackedInt32Array).is_empty():
+			tri_indices = src_idx_var
+		else:
+			tri_indices = PackedInt32Array()
+			tri_indices.resize(verts.size())
+			for v_i in verts.size():
+				tri_indices[v_i] = v_i
+		var j := 0
+		while j + 2 < tri_indices.size():
+			var i0 := tri_indices[j]
+			var i1 := tri_indices[j + 1]
+			var i2 := tri_indices[j + 2]
+			j += 3
+			var c := (verts[i0] + verts[i1] + verts[i2]) / 3.0
+			if absf(c.z - (-TANK_CLEAT_START_Y)) < 0.095 and c.y > 0.58:
+				for old_i in [i0, i1, i2]:
+					if not remap.has(old_i):
+						remap[old_i] = kept_order.size()
+						kept_order.append(old_i)
+					new_idx.append(int(remap[old_i]))
+		if new_idx.is_empty():
+			continue
+		var new_arrays: Array = []
+		new_arrays.resize(Mesh.ARRAY_MAX)
+		var v_count := verts.size()
+		var kept_count := kept_order.size()
+		for k in Mesh.ARRAY_MAX:
+			if k == Mesh.ARRAY_INDEX:
+				new_arrays[k] = new_idx
+				continue
+			var src_var: Variant = arrays[k]
+			if src_var == null:
+				continue
+			var total: int = src_var.size()
+			if total == 0 or total % v_count != 0:
+				continue
+			var stride: int = total / v_count
+			var dst: Variant = src_var.duplicate()
+			dst.resize(kept_count * stride)
+			if k == Mesh.ARRAY_VERTEX and stride == 1:
+				var dst_v: PackedVector3Array = dst
+				for ni in kept_count:
+					dst_v[ni] = verts[kept_order[ni]] - origin_shift
+				new_arrays[k] = dst_v
+			else:
+				for ni in kept_count:
+					var oi := kept_order[ni]
+					for el in stride:
+						dst[ni * stride + el] = src_var[oi * stride + el]
+				new_arrays[k] = dst
+		var fmt := int(part.mesh.surface_get_format(s))
+		out.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, new_arrays, [], {},
+			fmt & ModelLibrary.ModelLods.CUSTOM_FORMATS)
+		var surf_idx := out.get_surface_count() - 1
+		out.surface_set_material(surf_idx, part.mesh.surface_get_material(s))
+		out.surface_set_name(surf_idx, part.mesh.surface_get_name(s))
+	_cleat_cache[part.mesh] = out
+	return out
+
+
+static func build_track_mm(part: ModelLibrary.AnimPart) -> MultiMeshInstance3D:
+	var cleat := extract_top_cleat(part)
+	if cleat == null or cleat.get_surface_count() == 0:
+		return null
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = cleat
+	mm.instance_count = TANK_CLEATS
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	mmi.set_instance_shader_parameter("f3d_glow", 0.0)
+	var track_x := part.pivot.origin.x
+	mmi.custom_aabb = AABB(Vector3(track_x - 0.35, -0.05, -1.65), Vector3(0.7, 0.85, 3.15))
+	update_track_mm(mmi, track_x, 0.0)
+	return mmi
+
+
+static func update_track_mm(mmi: MultiMeshInstance3D, track_x: float, travel: float) -> void:
+	if mmi == null or mmi.multimesh == null:
+		return
+	var mm := mmi.multimesh
+	var perim := track_perimeter()
+	var n := mm.instance_count
+	var xf0 := Transform3D.IDENTITY
+	for k in n:
+		var sample := track_sample(perim * float(k) / float(n) + travel)
+		var xf := Transform3D(Basis(Vector3.RIGHT, sample.z - PI * 0.5), Vector3(track_x, sample.y, -sample.x))
+		if k == 0:
+			xf0 = xf
+		mm.set_instance_transform(k, xf)
+	mmi.set_meta("travel", travel)
+	mmi.set_meta("cleat0_origin", xf0.origin)

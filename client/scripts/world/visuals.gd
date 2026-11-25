@@ -5,6 +5,12 @@ extends RefCounted
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const TerrainShader := preload("res://shaders/terrain.gdshader")
+const TerrainShoreShader := preload("res://shaders/terrain_shore.gdshader")
+const Switches := preload("res://scripts/switches.gd")
+## --terrain-opt=old: the original ground, one surface and shader (terrain_old.gdshader) with the coast's
+## quads in it; loaded only then.
+const TERRAIN_OLD_SHADER := "res://shaders/terrain_old.gdshader"
+static var terrain_opt_old: bool = Switches.has("--terrain-opt=old")
 const WaterShader := preload("res://shaders/water.gdshader")
 ## The ground's render layer: terrain and water, flat decoratives and their grass. Every
 ## light reaches it but a look's fill light (looks.gd fill_light), which lights what stands on the ground, as Factorio
@@ -56,6 +62,8 @@ static var _box: BoxMesh
 static var _cone: CylinderMesh
 static var _instance_material: StandardMaterial3D
 static var _terrain_material: ShaderMaterial
+static var _terrain_shore_material: ShaderMaterial
+static var _terrain_chunk_mats: Array[WeakRef] = []  # chunks' own copies (make_chunk_terrain_material)
 static var _water_material: ShaderMaterial
 
 
@@ -114,24 +122,64 @@ static func instance_material() -> StandardMaterial3D:
 static func terrain_material() -> ShaderMaterial:
 	if _terrain_material == null:
 		_terrain_material = ShaderMaterial.new()
-		_terrain_material.shader = TerrainShader
-		if "--relief-fade=off" in OS.get_cmdline_user_args():
-			_terrain_material.set_shader_parameter("relief_fades", false)
+		if terrain_opt_old:
+			_terrain_material.shader = load(TERRAIN_OLD_SHADER) as Shader
+		else:
+			_terrain_material.shader = TerrainShader
+			# The coast's own material (terrain_shore.gdshader): the same parameters as this one, kept in
+			# step by set_terrain_param().
+			_terrain_shore_material = ShaderMaterial.new()
+			_terrain_shore_material.shader = TerrainShoreShader
+		if not Switches.on("--relief-fade"):
+			set_terrain_param(&"relief_fades", false)
 		# --ground-rough=off: 0.2.2's one roughness and specular for natural ground and one for floors,
 		# not each tile family's own (terrain_textures.gd SURFACES).
-		if "--ground-rough=off" in OS.get_cmdline_user_args():
-			_terrain_material.set_shader_parameter("per_tile_surface", false)
+		if not Switches.on("--ground-rough"):
+			set_terrain_param(&"per_tile_surface", false)
 	return _terrain_material
+
+
+## The coast's ground (terrain_mesher.gd shore, terrain_shore.gdshader): wet rim and shelves, cut with
+## `discard` where the interior ground has none. With --terrain-opt=old the one ground material.
+static func terrain_shore_material() -> ShaderMaterial:
+	terrain_material()
+	return _terrain_shore_material if _terrain_shore_material != null else _terrain_material
+
+
+## Sets a shader parameter on the ground's materials, the interior's and the coast's (both read the same
+## ones). Use it instead of terrain_material().set_shader_parameter().
+static func set_terrain_param(param: StringName, value: Variant) -> void:
+	terrain_material().set_shader_parameter(param, value)
+	if _terrain_shore_material != null:
+		_terrain_shore_material.set_shader_parameter(param, value)
+	if _terrain_chunk_mats.is_empty():
+		return
+	var alive: Array[WeakRef] = []
+	for ref in _terrain_chunk_mats:
+		var m := ref.get_ref() as ShaderMaterial
+		if m != null:
+			m.set_shader_parameter(param, value)
+			alive.append(ref)
+	_terrain_chunk_mats = alive
+
+
+## A copy of the ground's material (`base`: terrain_material() or terrain_shore_material()) for one chunk, which
+## carries that chunk's decorative sheet (chunk_view.gd set_decor_sheet). set_terrain_param() keeps it in
+## step with the rest while it lives.
+static func make_chunk_terrain_material(base: ShaderMaterial) -> ShaderMaterial:
+	var m := base.duplicate() as ShaderMaterial
+	_terrain_chunk_mats.append(weakref(m))
+	return m
 
 
 ## The ground's bumps and crevices from its own picture (terrain.gdshader ground_relief): three more
 ## texture reads a ground pixel, twice with SSAO. Off at Settings > Graphics > Level of detail Low
 ## (the Low preset), on otherwise (main.gd); --ground-relief=on or off wins.
 static func set_ground_relief(on: bool) -> void:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--ground-relief="):
 			on = arg.get_slice("=", 1) != "off"
-	terrain_material().set_shader_parameter("ground_relief", on)
+	set_terrain_param(&"ground_relief", on)
 
 
 ## Water tiles: animated ripples and shore foam (vertex alpha marks corners touching land).

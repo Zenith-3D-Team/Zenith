@@ -5,7 +5,8 @@ extends SceneTree
 ## the simulation doesn't, and back), and every item is compared with where the game has it.
 ##
 ##   godot --headless --path client -s res://tests/belt_sim_replay.gd -- [rec.json] [--ticks=N] [--bench]
-##       [--gd | --native] [--split-wake=off] [--game-crossings=N] [--game-inputs]
+##       [--gd | --native] [--split-wake=off|old] [--game-crossings=N] [--game-inputs] [--split-hints=N|off]
+##       [--split-reconcile=off] [--read-probe] [--max-off=N] [--min-off=N]
 ##
 ## Exits 1 when an item is anywhere else than where the game has it on the default fixture
 ## (tests/data/belt_sim_small.json: Zenith Test -272,-23 to -266,-18, 300 ticks: straight belts,
@@ -16,7 +17,14 @@ extends SceneTree
 ## each splitter's output lanes are read from the recording and given to the simulation as the bridge's
 ## `sl` would be (load_lane at that tick), --game-inputs its inputs too; the summary then also says how
 ## many items were within 0.15 tile on the game's lane and how many of the game's items on packed
-## straight lanes had no simulated item near them (holes).
+## straight lanes had no simulated item near them (holes). Each read is queued when the ticks before it
+## start, as a live update arrives before the client steps to its tick. --split-hints=N: every N ticks the
+## bridge's crossing hints (`bs.sx`, /f3d-bs crossings hints) for each splitter side whose outputs changed since
+## the last ones, made from the recording N ticks on and queued now (BeltSim.add_split_hint); off (the default)
+## none. --split-reconcile=off: reads of splitter lanes applied as before (BeltSim.split_reconcile). --max-off=N /
+## --min-off=N exit 1 when the item-ticks not where the game has them are past those bounds (the wait fixture,
+## tests/data/belt_sim_split_wait.json: the R&D's lab1.lua, its turbo block k = -1, ticks from 299: one splitter
+## whose first cycle holds an item a tick where the second, the same to the eye, doesn't).
 
 const BeltSim := preload("res://scripts/world/belt_sim.gd")
 const NativeLibrary := preload("res://scripts/native_library.gd")
@@ -54,6 +62,67 @@ static func prio(v: Variant) -> int:
 	return 0
 
 
+## (--split-hints) Each splitter side's lanes by recording lane index: unit * 2 + side -> [out0, out1, in0, in1] (0:
+## none). A splitter: lines 1 + side, 3 + side in, 5 + side, 7 + side out; a lane splitter: 1, 2 in, 3, 4 out.
+static func split_sides(metas: Array) -> Dictionary:
+	var sides := {}
+	for j in metas.size():
+		var m: Array = metas[j]
+		var t2 := str(m[2])
+		if t2 != "splitter" and t2 != "lane-splitter":
+			continue
+		var line := int(m[5])
+		var side := 0
+		var slot := -1
+		if t2 == "lane-splitter":
+			slot = {1: 2, 2: 3, 3: 0, 4: 1}.get(line, -1)
+		elif line >= 1 and line <= 8:
+			side = (line - 1) % 2
+			slot = [2, 3, 0, 1][(line - 1) / 2]
+		if slot < 0:
+			continue
+		var sk := int(m[0]) * 2 + side
+		if not sides.has(sk):
+			sides[sk] = PackedInt32Array([0, 0, 0, 0])
+		var l4: PackedInt32Array = sides[sk]
+		l4[slot] = j + 1
+		sides[sk] = l4
+	return sides
+
+
+## (--split-hints) The bridge's crossing hints (`bs.sx`, belt_sim.lua emit_hints) for a recorded tick: for each
+## splitter side whose outputs changed since the last look (`sig`, kept: side -> their items), one record per pair
+## of output items, back first, the inputs' fronts in each: [unit, side, tick, out0, out1, in0, in1] * n.
+static func side_hints(hrow: Array, kinds: PackedInt32Array, sides: Dictionary, sig: Dictionary) -> PackedInt64Array:
+	var out := PackedInt64Array()
+	var on := {}  # recording lane index -> Array of [pos, uid]
+	for i in range(1, hrow.size(), 5):
+		var li := int(hrow[i])
+		if kinds[li] != 5 and kinds[li] != 6:
+			continue
+		if not on.has(li):
+			on[li] = []
+		(on[li] as Array).append([int(hrow[i + 2]), int(hrow[i + 1])])
+	for li: int in on:
+		(on[li] as Array).sort()
+	for sk: int in sides:
+		var l4: PackedInt32Array = sides[sk]
+		var o0: Array = on.get(l4[0], [])
+		var o1: Array = on.get(l4[1], [])
+		var now := str([o0, o1])
+		if now == str(sig.get(sk, "")):
+			continue
+		sig[sk] = now
+		var i0: Array = on.get(l4[2], [])
+		var i1: Array = on.get(l4[3], [])
+		var f0 := int(i0[0][1]) if not i0.is_empty() else 0
+		var f1 := int(i1[0][1]) if not i1.is_empty() else 0
+		for r in maxi(1, maxi(o0.size(), o1.size())):
+			out.append_array([sk / 2, sk % 2, int(hrow[0]), int(o0[o0.size() - 1 - r][1]) if r < o0.size() else 0,
+				int(o1[o1.size() - 1 - r][1]) if r < o1.size() else 0, f0, f1])
+	return out
+
+
 ## belt_sim.gd ("gd"), its C++ twin ("native", null when its extension isn't loaded), or the one
 ## belt_items.gd would use ("").
 static func make_sim(which: String) -> RefCounted:
@@ -73,8 +142,14 @@ func _initialize() -> void:
 	var tile := 1
 	var runoff := false
 	var split_wake := true  # --split-wake=off: splitters as before (BeltSim.split_wake)
+	var split_r4 := true  # --split-wake=old: the earlier wait rule instead of R4 (BeltSim.split_wake_r4)
 	var game_x := 0  # --game-crossings=N
 	var game_in := false  # --game-inputs
+	var hints_x := 0  # --split-hints=N
+	var reconcile := true  # --split-reconcile=off
+	var read_probe := false  # --read-probe: what the reads took off, by why (BeltSim.gone_probe)
+	var max_off := -1  # --max-off=N
+	var min_off := -1  # --min-off=N
 	var dump: FileAccess = null
 	var which := ""
 	for a in OS.get_cmdline_user_args():
@@ -90,10 +165,22 @@ func _initialize() -> void:
 			which = a.substr(2)
 		elif a == "--split-wake=off":
 			split_wake = false
+		elif a == "--split-wake=old":
+			split_r4 = false
 		elif a.begins_with("--game-crossings="):
 			game_x = int(a.substr(17))
 		elif a == "--game-inputs":
 			game_in = true
+		elif a.begins_with("--split-hints="):
+			hints_x = 0 if a.substr(14) == "off" else int(a.substr(14))
+		elif a == "--split-reconcile=off":
+			reconcile = false
+		elif a == "--read-probe":
+			read_probe = true
+		elif a.begins_with("--max-off="):
+			max_off = int(a.substr(10))
+		elif a.begins_with("--min-off="):
+			min_off = int(a.substr(10))
 		elif a.begins_with("--dump="):
 			dump = FileAccess.open(a.substr(7), FileAccess.WRITE)
 		elif not a.begins_with("--"):
@@ -117,6 +204,11 @@ func _initialize() -> void:
 		return
 	sim.edge_mode = BeltSim.EDGE_STOP if runoff else BeltSim.EDGE_ORACLE
 	sim.split_wake = split_wake
+	sim.set("split_wake_r4", split_r4)
+	sim.set("split_hints", hints_x > 0)
+	sim.set("split_reconcile", reconcile)
+	if game_x > 0 and read_probe and sim.get("probe_reads") != null:
+		sim.set("probe_reads", true)
 	sim.emit_changes = bench
 	sim.profile = bench
 	# (A recording has no `lm` next: a tunnel's next 0 here says nothing, not "no exit". The fixture's entrance 50704
@@ -151,6 +243,9 @@ func _initialize() -> void:
 				Vector2i(int(mid[0]), int(mid[1])) + sh, Vector2i(int(en[0]), int(en[1])) + sh, extra,
 				next_key + c * KEY_OFF if next_key != 0 else 0)
 	var n_ticks := mini(ticks.size(), max_ticks)
+	var sides := split_sides(metas)  # (--split-hints)
+	var hint_sig := {}  # unit * 2 + side -> the outputs' last look (side_hints)
+	var n_hints := 0
 	# Packed straight lanes (the bus): those the game keeps at 3 or more items of 4 over the run.
 	var full := {}
 	for t in n_ticks:
@@ -197,21 +292,36 @@ func _initialize() -> void:
 		sim.oracle = game
 		if OS.get_environment("BS_WATCH") != "" and int(row[0]) >= int(OS.get_environment("BS_T0")):
 			print(int(row[0]) - 1, " ", sim.debug_item(int(OS.get_environment("BS_WATCH"))))
-		if game_x > 0 and (t + 1) % game_x == 0:
-			# The splitters' output (and input) lanes as the game has them at this tick, as `sl` reads.
+		if hints_x > 0 and t % hints_x == 0 and t + hints_x < n_ticks:
+			# The bridge's crossing hints for the tick hints_x on, queued now (as a live update arrives before
+			# the client steps to its tick): per splitter side whose outputs changed since the last look, one
+			# record per item on its outputs (back first, the two halves side by side), the inputs' fronts in each.
+			var hrow: Array = ticks[t + hints_x]
+			var recs := side_hints(hrow, kinds, sides, hint_sig)
+			for r in range(0, recs.size(), 7):
+				for c in tile:
+					var off := c * UID_OFF
+					sim.add_split_hint(recs[r] + c * (KEY_OFF / 8), recs[r + 1], recs[r + 2],
+						recs[r + 3] + off if recs[r + 3] != 0 else 0, recs[r + 4] + off if recs[r + 4] != 0 else 0,
+						recs[r + 5] + off if recs[r + 5] != 0 else 0, recs[r + 6] + off if recs[r + 6] != 0 else 0)
+					n_hints += 1
+		if game_x > 0 and t % game_x == 0 and t + game_x < n_ticks:
+			# The splitters' output (and input) lanes as the game has them game_x ticks on, as `sl` reads
+			# them, queued now: the update arrives before the client steps to its tick.
+			var rrow: Array = ticks[t + game_x]
 			var reads := {}
 			for c in tile:
-				for i in range(1, row.size(), 5):
-					var k: int = kinds[int(row[i])]
+				for i in range(1, rrow.size(), 5):
+					var k: int = kinds[int(rrow[i])]
 					if k == 6 or (game_in and k == 5):
-						var key := keys[int(row[i])] + c * KEY_OFF
+						var key := keys[int(rrow[i])] + c * KEY_OFF
 						if not reads.has(key):
 							reads[key] = PackedInt64Array()
 						var arr: PackedInt64Array = reads[key]
-						arr.append(int(row[i + 1]) + c * UID_OFF)
-						arr.append(int(row[i + 4]))
-						arr.append(int(row[i + 2]))
-						arr.append(int(row[i + 3]))
+						arr.append(int(rrow[i + 1]) + c * UID_OFF)
+						arr.append(int(rrow[i + 4]))
+						arr.append(int(rrow[i + 2]))
+						arr.append(int(rrow[i + 3]))
 						reads[key] = arr
 			for j in range(1, metas.size() + 1):
 				if kinds[j] == 6 or (game_in and kinds[j] == 5):
@@ -227,7 +337,7 @@ func _initialize() -> void:
 						for e in order:
 							var q: int = e[1]
 							sorted.append_array(arr.slice(q * 4, q * 4 + 4))
-						sim.load_lane(key, int(row[0]), sorted)
+						sim.load_lane(key, int(rrow[0]), sorted)
 		var c0 := Time.get_ticks_usec()
 		sim.step_to(int(row[0]))
 		var c1 := Time.get_ticks_usec() - c0
@@ -307,7 +417,14 @@ func _initialize() -> void:
 		100.0 * near_ok / maxf(1.0, right + wrong), lost, bus_ticks, bus_holes, 100.0 * bus_holes / maxf(1.0, bus_ticks),
 		100.0 * bus_sim / maxf(1.0, bus_ticks)])
 	if game_x > 0:
-		print("  crossings from the game every %d ticks%s" % [game_x, " + inputs" if game_in else ""])
+		print("  crossings from the game every %d ticks%s; reconcile %s: %d" % [game_x, " + inputs" if game_in else "",
+			"on" if reconcile else "off", int(sim.get("n_reconciled") if sim.get("n_reconciled") != null else -1)])
+	if game_x > 0 and sim.get("probe_reads") == true:
+		print("  read probe, items reads took off: %s" % [sim.gone_probe])
+	if hints_x > 0:
+		print("  crossing hints every %d ticks: %d queued; held %d, steered %d" % [hints_x, n_hints,
+			int(sim.get("n_hint_held") if sim.get("n_hint_held") != null else -1),
+			int(sim.get("n_hint_steered") if sim.get("n_hint_steered") != null else -1)])
 	for kn in tot_kind:
 		print("  %-20s %8d item-ticks, %6.3f%% not where the game has them" % [kn, tot_kind[kn],
 			100.0 * int(by_kind.get(kn, 0)) / float(tot_kind[kn])])
@@ -317,4 +434,11 @@ func _initialize() -> void:
 	if bench:
 		print("line steps: %.1f us a tick in lines leading out of the square (the replay's oracle), %.1f us in the rest" % [
 			sim.step_us[0] / nt, sim.step_us[1] / nt])
-	quit(1 if wrong > 0 and path == DEFAULT else 0)
+	var bad := wrong > 0 and path == DEFAULT
+	if max_off >= 0 and wrong > max_off:
+		printerr("FAIL: %d item-ticks not where the game has them (at most %d)" % [wrong, max_off])
+		bad = true
+	if min_off >= 0 and wrong < min_off:
+		printerr("FAIL: %d item-ticks not where the game has them (at least %d expected)" % [wrong, min_off])
+		bad = true
+	quit(1 if bad else 0)

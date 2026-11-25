@@ -23,7 +23,7 @@ const HELD_TYPES := {
 	"mv": true, "bi": true, "bf": true, "bq": true, "bfar": true, "ih": true, "ie": true, "gi": true,
 	"pj": true, "gf": true, "shot": true, "afx": true, "died": true, "ts": true, "tf": true, "en": true,
 	"seg": true, "legs": true, "ach": true, "acol": true, "cp": true, "lt": true, "tr": true, "rc": true,
-	"hp": true, "pku": true,
+	"hp": true, "pku": true, "atk": true,
 }
 
 static var on := false

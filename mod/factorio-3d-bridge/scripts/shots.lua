@@ -15,6 +15,7 @@
 local transport = require("scripts.transport")
 local world = require("scripts.world")
 local map = require("scripts.map")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -42,9 +43,19 @@ local function area(r)
   return { { f.x - r, f.y - r }, { f.x + r, f.y + r } }
 end
 
+-- /f3d-perf shots_radius N (8-256, default 48 = as before): the range is N round the focus whatever the focus radius,
+-- and the flying and ground caps grow in proportion (a wide shot of a whole base's walls).
 local function radius()
   local f = storage.f3d.focus
-  return f and math.min(f.r, MAX_RADIUS) or 0
+  if not f then
+    return 0
+  end
+  local n, set = perf.number("shots_radius")
+  return set and n or math.min(f.r, MAX_RADIUS)
+end
+
+local function scale()
+  return math.max(1, perf.number("shots_radius") / MAX_RADIUS)
 end
 
 -- Where a beam starts or ends: the entity it is attached to, else its position.
@@ -78,6 +89,7 @@ end
 local function scan(sh, r)
   local p, b, x = {}, {}, {}
   local live, seen = {}, {}
+  local max_flying = MAX_FLYING * scale()
   local found = world.surface().find_entities_filtered({ area = area(r), type = FLYING_TYPES })
   for _, e in pairs(found) do
     local id = script.register_on_object_destroyed(e)
@@ -91,7 +103,7 @@ local function scan(sh, r)
         x[#x + 1] = fixed(pos.y)
       end
     elseif t == "beam" then
-      if #b < MAX_FLYING * 6 then
+      if #b < max_flying * 6 then
         local s0 = beam_end(e, e.get_beam_source)
         local t0 = beam_end(e, e.get_beam_target)
         b[#b + 1] = id
@@ -101,7 +113,7 @@ local function scan(sh, r)
         b[#b + 1] = fixed(t0.x)
         b[#b + 1] = fixed(t0.y)
       end
-    elseif #p < MAX_FLYING * 4 then
+    elseif #p < max_flying * 4 then
       p[#p + 1] = id
       p[#p + 1] = e.name
       p[#p + 1] = fixed(pos.x)
@@ -130,9 +142,10 @@ end
 
 local function scan_ground(sh, r)
   local l = {}
+  local max_ground = MAX_GROUND * scale()
   local found = world.surface().find_entities_filtered({ area = area(r), type = GROUND_TYPES })
   for _, e in pairs(found) do
-    if #l >= MAX_GROUND * 5 then
+    if #l >= max_ground * 5 then
       break
     end
     local pos = e.position

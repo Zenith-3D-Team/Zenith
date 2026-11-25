@@ -6,11 +6,12 @@ Each model is matched to Factorio's HR sprite with compare.py (see client/assets
 
 import math
 
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 import detail
 import kit
 from kit import Part, R, S, T, model
+import space_kit
 
 
 def own_materials(part, suffix):
@@ -69,86 +70,243 @@ def bogie(p, y):
 
 
 def tyre(p, x, y, r, w, segs=16):
-    """A fat tyre on its rim, axle along x, with the hub cap on the outside (sign of x)."""
+    """A fat off-road tyre on a deep-dish rim, axle along X, hub cap outside (sign of x).
+    12 symmetric tread lugs touch outer radius r at 90° and 270° so lowest point is
+    z = 0.0 and vertical midpoint equals pivot z = r (wheel_roll_test.gd)."""
     sx = 1 if x > 0 else -1
-    p.cyl((x, y, r), r, w, "rubber", segs=segs, axis="X", bevel=0.06)
-    p.cyl((x + sx * w / 2, y, r), r * 0.62, 0.03, "steel_dark", segs=segs, axis="X")
-    p.cyl((x + sx * (w / 2 + 0.02), y, r), r * 0.28, 0.04, "steel", segs=8, axis="X")
-    # Three lugs on the hub cap, so the turning shows.
+    p.cyl((x, y, r), r - 0.006, w, "rubber", segs=segs, axis="X", bevel=0.05)
+    # 12 symmetric lugs: 3*90° = multiples of 30° hit exact top (90°) and bottom (270°).
+    lug_len = 0.054
+    lug_h = 0.012
+    for k in range(12):
+        a = k * 2 * math.pi / 12
+        ca, sa = math.cos(a), math.sin(a)
+        m = T(x, y + ca * (r - lug_h * 0.5), r + sa * (r - lug_h * 0.5)) @ R("X", math.degrees(a) - 90.0)
+        p.box((0, 0, 0), (w * 0.86, lug_len, lug_h), "rubber", matrix=m)
+    # Deep-dish steel rim, dark recessed inner dish, 3 spokes, center hub and 6 lug bolts.
+    out_x = x + sx * (w * 0.5 - 0.01)
+    p.cyl((out_x, y, r), r * 0.62, 0.032, "steel_dark", segs=12, axis="X")
+    p.cyl((out_x + sx * 0.012, y, r), r * 0.52, 0.02, "steel_black", segs=12, axis="X")
+    p.cyl((out_x + sx * 0.030, y, r), r * 0.25, 0.045, "steel", segs=10, axis="X", bevel=0.01)
     for k in range(3):
         a = k * 2 * math.pi / 3
-        p.cyl((x + sx * (w / 2 + 0.04), y + math.cos(a) * r * 0.45, r + math.sin(a) * r * 0.45), 0.035, 0.03,
-              "steel_dark", segs=6, axis="X")
+        m = T(out_x + sx * 0.024, y, r) @ R("X", math.degrees(a))
+        p.box((0, r * 0.27, 0), (0.026, r * 0.42, 0.052), "steel", matrix=m)
+    for k in range(6):
+        a = k * 2 * math.pi / 6 + 0.26
+        p.cyl((out_x + sx * 0.042, y + math.cos(a) * r * 0.42, r + math.sin(a) * r * 0.42),
+              0.022, 0.020, "steel_light", segs=6, axis="X")
+
+
+def cycle_fender(p, x, y, z, r_in, r_out, w, a0_deg=32.0, a1_deg=148.0, segs=8, mat="paint_cream"):
+    """Curved wheel mudguard arch hugging (x, y, z), spanning angles a0..a1 in (y, z) from +Y (front)."""
+    outer = []
+    inner = []
+    for k in range(segs + 1):
+        a = math.radians(a0_deg + (a1_deg - a0_deg) * k / segs)
+        ca, sa = math.cos(a), math.sin(a)
+        outer.append((y + r_out * ca, z + r_out * sa))
+        inner.append((y + r_in * ca, z + r_in * sa))
+    p.side_prism(outer + list(reversed(inner)), x - w * 0.5, x + w * 0.5, mat)
+    liner = []
+    for k in range(segs + 1):
+        a = math.radians(a0_deg + (a1_deg - a0_deg) * k / segs)
+        ca, sa = math.cos(a), math.sin(a)
+        liner.append((y + (r_in - 0.01) * ca, z + (r_in - 0.01) * sa))
+    p.side_prism(inner + list(reversed(liner)), x - w * 0.46, x + w * 0.46, "steel_dark")
+
+
+def striped_hose(p, points, radius, segs=8, pitch=0.068, smooth=4):
+    """Corrugated yellow-and-black hazard hose along a smooth spline."""
+    pts = space_kit.resample(space_kit.catmull(points, smooth), pitch)
+    for k in range(len(pts) - 1):
+        a, b = pts[k], pts[k + 1]
+        mat = "hazard" if k % 2 == 0 else "hazard_black"
+        r = radius if k % 2 == 0 else radius * 0.84
+        p.tube(tuple(a), tuple(b), r, mat, segs=segs, caps=(k == 0 or k == len(pts) - 2))
 
 
 @model("car")
 def car():
-    """Factorio's car: a buggy. Four big tyres stand out beside a narrow riveted cream body
-    (the whole thing sits about 0.13 tiles forward of the vehicle's position, as in the
-    sprite). The radiator grille slopes down to the front (north) between two headlights on the
-    bumper; behind the open cockpit the engine block, its fan and the yellow hoses are bare at
-    the back; coil-sprung arms reach out to the wheels. The roof machine gun is the separate
-    `anim_turret_head`, its pivot on the vehicle's axis, barrel north at rest."""
+    """Factorio's car: an armored desert buggy. Four chunky treaded tyres on exposed wishbone
+    and coil-over suspension under tight curved cream cycle fenders (`anim_steer_front` on the
+    front pair); a compact riveted cabin with raised door frames and recessed windows; a sloped
+    dark radiator grille with rusty louver slats between cream hood rails, twin round headlights
+    (`anim_headlight`) and tubular steel bull-bars; an exposed rear V-engine under a tubular
+    roll-cage with spinning cooling fan (`anim_engine_fan`), compact exhaust loop and thick
+    yellow-and-black striped hoses; and a low-slung roof machine gun (`anim_turret_head` +
+    `anim_turret_barrel`)."""
     p = Part()
     wheels = []
-    # The rear tyres are bigger than the front ones, as in the sprite. Each is a part of its own
-    # (`anim_wheel_front` steers and rolls, `anim_wheel_rear` rolls), its pivot on its axle.
-    # Sizes and places measured against all 64 of the car's rotation frames (turntable.py).
-    for y, r, w in ((0.955, 0.358, 0.336), (-0.705, 0.414, 0.38)):
-        for sx in (-1, 1):
-            wheel = Part("anim_wheel_front" if y > 0 else "anim_wheel_rear", pivot=(sx * 0.77, y, r))
-            tyre(wheel, sx * 0.77, y, r, w)
-            wheels.append(wheel)
-            # Wishbone arms and a coil spring from the body to each hub.
-            for dy in (-0.12, 0.12):
-                p.beam((sx * 0.45, y + dy * 1.5, 0.5), (sx * 0.66, y + dy * 0.3, r), 0.05, 0.05, "steel_dark")
-            p.cyl((sx * 0.55, y, 0.62), 0.06, 0.32, "steel_light", segs=8)
-    # Chassis tub: low and narrow between the wheels.
-    p.slab(-0.52, -1.18, 0.22, 0.52, 1.2, 0.64, "paint_cream", bevel=0.06)
-    # Front: the grille slopes from the cockpit down to a rounded nose over the bumper.
-    # (A little bigger and lower than built, its middle 0.08 further back.)
-    hood = T(0, 0.67, 0.68) @ S(1.12, 1.12, 1.12) @ T(0, -0.75, -0.76)
-    p.side_prism([(0.0, 0.38), (1.36, 0.38), (1.36, 0.58), (1.27, 0.77), (1.12, 0.86), (0.08, 1.15), (0.0, 1.15)],
-                 -0.42, 0.42, "paint_cream", bevel=0.04, matrix=hood)
-    for k in range(10):
-        t = (k + 0.5) / 10
-        y, z = 0.12 + 0.98 * t, 1.15 - 0.29 * t + 0.015
-        a, b = hood @ Vector((-0.32, y, z)), hood @ Vector((0.32, y, z))
-        p.beam(tuple(a), tuple(b), 0.05, 0.034, "rust_brown")
-    # Bumper and headlights on the nose.
-    p.slab(-0.56, 1.27, 0.39, 0.56, 1.41, 0.51, "steel", bevel=0.03)
-    for x in (-0.4, 0.4):
-        p.cyl((x, 1.35, 0.62), 0.084, 0.11, "steel_light", segs=10, axis="Y")
-        p.cyl((x, 1.41, 0.62), 0.062, 0.01, "glass", segs=10, axis="Y")
-    # Side panels with the round-cornered window in the middle.
-    for sx in (-1, 1):
-        p.slab(sx * 0.5, -0.3, 0.4, sx * 0.56, 0.3, 0.9, "paint_cream", bevel=0.03)
-        p.slab(sx * 0.55, -0.15, 0.6, sx * 0.57, 0.15, 0.75, "soot")
-    # Cockpit roof frame.
-    p.slab(-0.45, -0.25, 0.9, 0.45, 0.25, 0.98, "steel_dark", bevel=0.03)
-    # Rear: engine block, fan and exhaust, rear bumper.
-    p.slab(-0.47, -1.17, 0.58, 0.47, -0.17, 0.97, "steel_dark", bevel=0.05)
-    p.cyl((0, -1.05, 0.72), 0.24, 0.12, "steel", segs=12, axis="Y")
-    p.slab(-0.62, -1.2, 0.39, 0.62, -1.08, 0.53, "steel", bevel=0.03)
-    p.pipe([(0.1, -0.8, 0.95), (0.1, -0.8, 1.28), (0.1, -1.0, 1.28)], 0.04, "steel_dark", segs=6)
-    for sx in (-1, 1):
-        p.pipe([(sx * 0.3, -0.4, 0.9), (sx * 0.48, -0.6, 0.85), (sx * 0.4, -1.0, 0.8)], 0.05, "hazard", segs=6)
+    front_fenders = []
 
-    # The gun sits mostly behind its post, as in the turret sheet (measured against all 64 of its
-    # frames by tools/models/turntable.py): a short barrel north, the receiver over the post, the
-    # ammo box on the west side and the belt's round loop standing up behind.
-    turret = Part("anim_turret_head", pivot=(0.0, 0.0, 0.98))
-    turret.cyl((0, 0.02, 1.2), 0.1, 0.2, "steel_dark", segs=10)
-    turret.slab(-0.16, -0.39, 1.33, 0.08, 0.03, 1.65, "steel", bevel=0.03)
-    turret.slab(-0.0, -0.41, 1.51, 0.16, -0.17, 1.61, "steel_dark", bevel=0.02)
-    turret.cyl((0.02, 0.14, 1.58), 0.04, 0.32, "steel_dark", segs=8, axis="Y")
-    turret.cyl((0.04, 0.13, 1.54), 0.057, 0.09, "steel_black", segs=8, axis="Y")
-    turret.cyl((0.04, 0.29, 1.58), 0.045, 0.04, "steel_black", segs=8, axis="Y")
-    turret.slab(-0.21, -0.2, 1.22, -0.08, 0.08, 1.46, "brass", bevel=0.02)
+    # 4 wheel stations: rear tyres larger than front, seated cleanly to Factorio's rotation sheets.
+    stations = ((0.985, 0.358, 0.320, True), (-0.655, 0.410, 0.365, False))
+    for y, r, w, is_front in stations:
+        for sx in (-1, 1):
+            wx = sx * 0.745
+            wheel = Part("anim_wheel_front" if is_front else "anim_wheel_rear", pivot=(wx, y, r))
+            tyre(wheel, wx, y, r, w)
+            wheels.append(wheel)
+
+            # Exposed wishbone A-arms and tall coil-over shock tower from chassis to hub upright.
+            p.slab(sx * 0.57, y - 0.05, r - 0.04, sx * 0.65, y + 0.05, r + 0.14, "steel_dark", bevel=0.015)
+            for dy in (-0.12, 0.12):
+                p.tube((sx * 0.40, y + dy * 1.4, 0.34), (sx * 0.60, y + dy * 0.35, r - 0.02), 0.028, "steel_dark", segs=6)
+                p.tube((sx * 0.42, y + dy * 1.1, 0.56), (sx * 0.60, y + dy * 0.30, r + 0.09), 0.024, "steel_dark", segs=6)
+            bot = (sx * 0.56, y, r + 0.06)
+            top = (sx * 0.45, y, r + 0.47)
+            p.tube(bot, top, 0.026, "steel_dark", segs=6)
+            detail.spring(p, (sx * 0.54, y, r + 0.12), (sx * 0.47, y, r + 0.42), 0.052, "steel_light", turns=6, wire=0.015)
+            p.box((sx * 0.45, y, r + 0.48), (0.08, 0.09, 0.06), "steel_dark", bevel=0.01)
+
+            # Tight cycle fenders hugging each wheel closely.
+            if is_front:
+                fender = Part("anim_steer_front", pivot=(wx, y, r))
+                cycle_fender(fender, wx, y, r, r + 0.012, r + 0.044, 0.330, a0_deg=42.0, a1_deg=148.0)
+                fender.tube((sx * 0.62, y - 0.07, r + 0.08), (sx * 0.62, y - 0.20, r + 0.26), 0.018, "steel_dark", segs=6)
+                fender.tube((sx * 0.62, y + 0.07, r + 0.08), (sx * 0.62, y + 0.18, r + 0.26), 0.018, "steel_dark", segs=6)
+                front_fenders.append(fender)
+            else:
+                cycle_fender(p, wx, y, r, r + 0.012, r + 0.046, 0.372, a0_deg=36.0, a1_deg=150.0)
+                p.tube((sx * 0.62, y - 0.08, r + 0.08), (sx * 0.62, y - 0.23, r + 0.30), 0.020, "steel_dark", segs=6)
+                p.tube((sx * 0.62, y + 0.08, r + 0.08), (sx * 0.62, y + 0.22, r + 0.30), 0.020, "steel_dark", segs=6)
+
+    # Lower armored chassis tub & rear axle differential.
+    p.slab(-0.44, -1.08, 0.24, 0.44, 1.28, 0.48, "steel_dark", bevel=0.04)
+    p.slab(-0.47, -0.32, 0.38, 0.47, 0.40, 0.56, "paint_cream", bevel=0.04)
+    p.cyl((0.0, -0.655, 0.410), 0.050, 1.20, "steel_dark", segs=8, axis="X")
+    p.sphere((0.0, -0.655, 0.410), 0.12, "steel_black", segs=8, rings=4)
+
+    # Front hood & sloped radiator grille (y in 0.28..1.35).
+    hood_cheek = [(0.28, 0.48), (1.18, 0.48), (1.18, 0.61), (0.38, 0.94), (0.28, 0.94)]
+    for sx in (-1, 1):
+        x0, x1 = sorted((sx * 0.31, sx * 0.44))
+        p.side_prism(hood_cheek, x0, x1, "paint_cream", bevel=0.022)
+        detail.rivet_line(p, (sx * 0.375, 0.42, 0.93), (sx * 0.375, 1.12, 0.64), 6, "Z")
+    p.side_prism([(0.34, 0.44), (1.16, 0.44), (1.16, 0.56), (0.38, 0.89), (0.34, 0.89)], -0.32, 0.32, "soot")
+    p.beam((0.0, 0.38, 0.91), (0.0, 1.16, 0.58), 0.042, 0.036, "steel_dark", up=(0, 0.4, 1))
+    for k in range(11):
+        t = (k + 0.5) / 11
+        gy = 0.40 + 0.74 * t
+        gz = 0.91 - 0.31 * t
+        p.beam((-0.31, gy, gz), (0.31, gy, gz), 0.048, 0.030, "rust_brown", up=(0, 0.38, 1))
+
+    # Rounded nose cowling, front inspection plate, bull-bar bumper & headlights.
+    p.side_prism([(1.10, 0.38), (1.35, 0.38), (1.35, 0.56), (1.25, 0.65), (1.10, 0.65)],
+                 -0.42, 0.42, "paint_cream", bevel=0.03)
+    p.slab(-0.24, 1.25, 0.43, 0.24, 1.37, 0.58, "steel_dark", bevel=0.02)
+    detail.rivet_line(p, (-0.20, 1.372, 0.54), (0.20, 1.372, 0.54), 5, "Y")
+    # Front tubular bull-bar bumper.
+    p.cyl((0.0, 1.40, 0.40), 0.038, 1.06, "steel", segs=8, axis="X", bevel=0.01)
+    for sx in (-1, 1):
+        p.tube((sx * 0.51, 1.40, 0.40), (sx * 0.40, 1.26, 0.40), 0.032, "steel_dark", segs=6)
+        p.tube((sx * 0.30, 1.40, 0.40), (sx * 0.30, 1.28, 0.51), 0.026, "steel_dark", segs=6)
+        p.cyl((sx * 0.36, 1.28, 0.63), 0.080, 0.12, "steel_light", segs=12, axis="Y", bevel=0.015)
+        p.cyl((sx * 0.36, 1.33, 0.63), 0.068, 0.028, "steel_dark", segs=12, axis="Y")
+
+    # Glowing headlight lenses (lit at night while driven via movers._light_vehicles).
+    headlight = Part("anim_headlight", pivot=(0.0, 1.345, 0.63))
+    for sx in (-1, 1):
+        headlight.cyl((sx * 0.36, 1.348, 0.63), 0.060, 0.015, "lamp_headlight", segs=10, axis="Y")
+
+    # Armored cabin (y in -0.32..0.34, z in 0.44..0.97).
+    cab_sec = mirrored([(0.46, 0.46), (0.46, 0.82), (0.38, 0.97)])
+    along_y(p, cab_sec, -0.32, 0.34, "paint_cream", bevel=0.03)
+    for sx in (-1, 1):
+        lo, hi = (min(sx * 0.45, sx * 0.51), -0.24, 0.46), (max(sx * 0.45, sx * 0.51), 0.26, 0.84)
+        p.slab(*lo, *hi, "paint_cream", bevel=0.018)
+        p.slab(min(sx * 0.49, sx * 0.525), -0.15, 0.60, max(sx * 0.49, sx * 0.525), 0.16, 0.78, "steel_dark", bevel=0.01)
+        p.slab(min(sx * 0.515, sx * 0.535), -0.11, 0.63, max(sx * 0.515, sx * 0.535), 0.12, 0.75, "soot")
+        p.slab(min(sx * 0.52, sx * 0.54), -0.10, 0.64, max(sx * 0.52, sx * 0.54), 0.11, 0.74, "glass")
+        p.box((sx * 0.515, -0.18, 0.55), (0.025, 0.07, 0.025), "steel_light")
+        for zy in ((-0.20, 0.50), (0.22, 0.50), (-0.20, 0.80), (0.22, 0.80)):
+            p.bolt((sx * 0.512, zy[0], zy[1]), "steel_light", radius=0.016, axis="X")
+        p.slab(min(sx * 0.38, sx * 0.49), -0.52, 0.48, max(sx * 0.38, sx * 0.49), -0.31, 0.75, "steel_dark", bevel=0.02)
+
+    # Cab roof plate & bolted turret collar ring.
+    p.slab(-0.39, -0.30, 0.94, 0.39, 0.32, 0.99, "steel_dark", bevel=0.02)
+    p.ring_band((0.0, 0.0), 0.19, 0.29, 0.97, 1.03, 0, 360, "steel", segs=14, bevel=0.01)
+    p.bolts_ring((0.0, 0.0, 1.035), 0.24, 8, "steel_light", radius=0.015)
+
+    # Exposed rear engine bay, open tubular roll-cage, cooling fan, compact exhaust & striped hoses.
+    for sx in (-1, 1):
+        p.pipe([(sx * 0.37, -0.28, 0.95), (sx * 0.39, -0.72, 0.90), (sx * 0.42, -1.04, 0.55),
+                (sx * 0.50, -1.09, 0.40)], 0.028, "steel_dark", segs=6)
+        p.tube((sx * 0.39, -0.72, 0.90), (sx * 0.42, -0.62, 0.46), 0.024, "steel_dark", segs=6)
+    p.cyl((0.0, -0.72, 0.90), 0.026, 0.78, "steel_dark", segs=6, axis="X")
+
+    p.slab(-0.22, -0.88, 0.44, 0.22, -0.33, 0.79, "steel_black", bevel=0.025)
+    p.slab(-0.16, -0.82, 0.77, 0.16, -0.37, 0.88, "steel_dark", bevel=0.02)
+    for sx in (-1, 1):
+        m_bank = T(sx * 0.19, -0.60, 0.70) @ R("Y", sx * -28.0)
+        p.box((0, 0, 0), (0.14, 0.40, 0.14), "steel", bevel=0.018, matrix=m_bank)
+        for k in range(3):
+            p.box((0, -0.12 + k * 0.12, 0.075), (0.16, 0.042, 0.025), "steel_light", matrix=m_bank)
+    p.pipe([(0.14, -0.68, 0.85), (0.16, -0.84, 0.95), (0.14, -0.99, 1.04), (0.04, -1.01, 0.95)],
+           0.032, "steel", segs=6)
+    p.cyl((0.02, -1.01, 0.94), 0.022, 0.02, "soot", segs=6, axis="X")
+
+    # Rear cooling fan shroud + spinning fan (`anim_engine_fan`).
+    fan_shroud = Part()
+    fan_shroud.ring_band((0.0, 0.0), 0.195, 0.245, -0.04, 0.04, 0, 360, "steel", segs=14, bevel=0.01)
+    p.add_part(fan_shroud, T(0.0, -0.96, 0.70) @ R("X", 90))
+    p.cyl((0.0, -0.91, 0.70), 0.195, 0.03, "soot", segs=12, axis="Y")
+
+    engine_fan = Part("anim_engine_fan", pivot=(0.0, -0.96, 0.70))
+    engine_fan.cyl((0.0, -0.96, 0.70), 0.056, 0.06, "steel_dark", segs=8, axis="Y")
+    for k in range(6):
+        m_blade = T(0.0, -0.96, 0.70) @ R("Y", k * 60.0) @ R("Z", 25.0)
+        engine_fan.box((0.105, 0.0, 0.0), (0.14, 0.014, 0.048), "steel_light", matrix=m_blade)
+
+    # Rear tubular bumper.
+    p.cyl((0.0, -1.11, 0.40), 0.038, 1.08, "steel", segs=8, axis="X", bevel=0.01)
+    for sx in (-1, 1):
+        p.tube((sx * 0.51, -1.11, 0.40), (sx * 0.40, -1.00, 0.40), 0.032, "steel_dark", segs=6)
+
+    # Signature yellow-and-black striped hoses arcing over the rear engine & tucked beside front wheel wells.
+    for sx in (-1, 1):
+        striped_hose(p, [
+            (sx * 0.18, -0.30, 0.95),
+            (sx * 0.36, -0.52, 1.04),
+            (sx * 0.38, -0.78, 0.96),
+            (sx * 0.26, -0.96, 0.75),
+        ], 0.048, segs=6, pitch=0.068)
+        striped_hose(p, [
+            (sx * 0.44, 0.30, 0.52),
+            (sx * 0.50, 0.48, 0.48),
+            (sx * 0.42, 0.68, 0.48),
+        ], 0.034, segs=6, pitch=0.058)
+
+    # Roof machine gun turret (low-slung on the collar): `anim_turret_head` + `anim_turret_barrel`.
+    tz = 0.99
+    turret = Part("anim_turret_head", pivot=(0.0, 0.0, tz))
+    turret.cyl((0.0, 0.0, tz + 0.09), 0.095, 0.14, "steel_dark", segs=10)
+    turret.slab(-0.12, -0.05, tz + 0.15, 0.12, 0.07, tz + 0.25, "steel_dark", bevel=0.018)
+    turret.slab(-0.10, -0.32, tz + 0.21, 0.08, 0.15, tz + 0.42, "steel", bevel=0.02)
+    turret.slab(-0.07, -0.27, tz + 0.41, 0.05, 0.09, tz + 0.46, "steel_dark", bevel=0.012)
+    turret.slab(-0.09, -0.39, tz + 0.26, 0.07, -0.31, tz + 0.38, "steel_black", bevel=0.012)
+    turret.slab(-0.21, -0.15, tz + 0.15, -0.09, 0.08, tz + 0.37, "brass", bevel=0.018)
+    turret.slab(-0.215, -0.155, tz + 0.32, -0.085, 0.085, tz + 0.375, "steel_dark")
     loop = Part()
-    loop.ring_band((0, 0), 0.088, 0.15, -0.03, 0.03, 0, 360, "brass", segs=14)
-    turret.add_part(loop, T(0.02, -0.34, 1.46) @ R("Y", 90))
-    return [p, own_materials(turret, "turret")] + wheels
+    loop.ring_band((0, 0), 0.078, 0.130, -0.025, 0.025, 0, 360, "brass", segs=12)
+    turret.add_part(loop, T(0.02, -0.27, tz + 0.32) @ R("Y", 90))
+
+    barrel = Part("anim_turret_barrel", pivot=(0.0, 0.0, tz))
+    barrel.cyl((-0.01, 0.26, tz + 0.35), 0.046, 0.25, "steel_dark", segs=10, axis="Y", bevel=0.01)
+    for y in (0.19, 0.26, 0.33):
+        barrel.cyl((-0.01, y, tz + 0.35), 0.050, 0.026, "soot", segs=8, axis="Y")
+    barrel.cyl((-0.01, 0.46, tz + 0.35), 0.026, 0.17, "steel", segs=8, axis="Y")
+    barrel.cyl((-0.01, 0.56, tz + 0.35), 0.036, 0.06, "steel_black", segs=8, axis="Y", bevel=0.01)
+    barrel.cyl((-0.01, 0.595, tz + 0.35), 0.018, 0.01, "soot", segs=6, axis="Y")
+
+    return [
+        p,
+        own_materials(turret, "turret"),
+        own_materials(barrel, "turret"),
+        engine_fan,
+        headlight,
+    ] + wheels + front_fenders
 
 
 

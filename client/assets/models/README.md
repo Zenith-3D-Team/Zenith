@@ -43,8 +43,8 @@ JPEG) and read through the material's first UV map. The client mipmaps them when
 colour, times the material's base colour factor (keep it white), with the usual light weathering
 on top; normal maps are ignored (the merged meshes carry no tangents). The picture's roughness is
 used as it is; its metal is drawn at the look's `texture_metal` share (0.1 by default, as part
-colours' metal is), so it takes the sun, the shadows and the look's fill as paint does; Settings'
-Metal on textured models, Full, as before, or `--texture-metal=full` draws it in full (docs/RUNNING.md). Far merged chunks
+colours' metal is), so it takes the sun, the shadows and the look's fill as paint does;
+`--texture-metal=full` draws it in full (docs/RUNNING.md). Far merged chunks
 (`far_chunks.gd`) colour each vertex from a small copy of the texture. One material with one atlas
 per model is cheapest (`tools/models/fue5.py` bakes FUE5's textures that way). Models without
 textures are drawn as before.
@@ -167,8 +167,8 @@ the moment is, with the look's fill on top; model_packs.gd
 (Factorio's everywhere) and `--pack-shading=factorio` turn it off for every pack (docs/RUNNING.md).
 
 `aliases` (optional): `{"coal-ore": "coal", "stone-ore": "stone"}`, the pack's own names for Factorio's (model_packs.gd
-`alias_name`): its `coal-ore-1.glb` is read as `coal-1`, `coal-ore-rich.glb` as `coal-rich`, `items/` and `icons/`
-(`icons/item/coal-ore.png`) the same way; a file the pack also has under Factorio's own name keeps it.
+`alias_name`): its `coal-ore-1.glb` is read as `coal-1`, `coal-ore-rich.glb` as `coal-rich`, `items/`, `icons/`
+(`icons/item/coal-ore.png`) and `tiles/` (`tiles/coal-ore.png`) the same way; a file the pack also has under Factorio's own name keeps it.
 
 **Variants**, one rule for every entity model, item model (`items/`) and icon (model_packs.gd `variant_base`,
 `variants_in`): `<name>-1.glb`, `<name>-2.glb`, ... (numbered from 1) and `<name>.glb` are the variants of `<name>`,
@@ -225,8 +225,48 @@ sound choice or Settings > Sound's "Sounds from model packs" changes (`ModelPack
 `--pack-sounds=off` leaves every pack's sounds out. Packs carry their authors' own sounds, never
 Factorio's; no built-in pack ships any. A pack of sounds alone is a pack.
 
+A pack may carry ground textures too, in place of Factorio's terrain (`terrain_textures.gd` asks
+`model_packs.gd` `tile_source()` before reading the install): a `tiles/` folder at the pack's top or
+one folder down (the models folder's own top `tiles/` is the loose pack's), holding `.png`, `.webp`,
+`.jpg`, or `.jpeg` images. Put each tile at `tiles/<tile-name>.png` (e.g. `tiles/grass-1.png` or in a
+subfolder like `tiles/nauvis/grass-1.png` — Factorio tile suffixes like `-1` and `-2` stay part of the
+name), or put numbered variants inside a folder named after the tile (`tiles/grass-1/1.png`,
+`2.png`, ...). Companion PBR maps (`-normal`, `-height`/`-bump`, `-roughness` or `_normal`,
+`_height`, `_bump`, `_roughness`, or `<tile>/normal.png` etc.) in the same format can sit beside a
+pack's own albedo or on their own (PBR-only) to layer tangent normals, height parallax/AO, and
+per-pixel roughness onto Factorio's terrain (`--pack-tile-pbr=off` disables companion maps; albedo-only
+packs above never mix with a lower pack's PBR maps). `terrain_textures.gd` accepts a full
+Factorio-size tile sheet (`>= 2048x1024`), a horizontal strip (`width = height * count`, with `"count"`
+set in `"tiles"`), or one or more seamless images (scaled to `64` px per `1x1` cell across the tile
+atlas). Optional `pack.json` `"tiles"` entries (supporting `*` wildcards such as `"grass-*"`:
+`{"grass-1": {"size": 1, "count": 4, "roughness": 0.9, "specular": 0.08, "normal_strength": 1.0,
+"height_strength": 1.0, "normal_flip_x": false, "normal_flip_y": false}}`) override `size` (`n` for
+`nxn` or `[w, h]`), `count`, `roughness`, `specular`, or PBR map scale/orientation. Same pack order and
+switches as icons and sounds; the Tiles tab saves a choice as `"tile:<name>": <pack id>`, a pack below
+Factorio gives only tiles Factorio hasn't, and changing the order, choice, or Settings > Graphics >
+"Ground textures from model packs" (`[graphics] pack_tiles`, `--pack-tiles=off`) reloads the ground
+live (`ModelPacks.tiles_version`). A pack of tiles or companion maps alone is a pack.
+
+A pack may also carry 3D models (`.glb`, `.gltf`) or 2D images (`.png`, `.webp`, `.jpg`, `.jpeg`) for
+decoratives and grass (`decoratives.gd` reads `model_packs.gd` `decor_source()` before reading the
+install): a `decoratives/` folder at the pack's top or one folder down (the models folder's own top
+`decoratives/` is the loose pack's). Put each decorative at `decoratives/<name>.glb` or `.png` (e.g.
+`decoratives/green-hairy-grass.glb` or `decoratives/small-rock.png`), or group numbered variants
+(`-1`, `-2`, ... or inside `decoratives/<name>/1.glb`, `2.glb`, ...). The built-in `Placeholders`
+pack ships 3D placeholder `.glb` models for all 48 raised decoratives (23 grass/bush/carpet types and
+25 upright `"object"` plants, corals, fungi, icebergs, and stumps), and 2D pack images automatically
+drive flat decals, upright cards, and 3D raised grass shaders. Optional `pack.json` `"decoratives"`
+entries (supporting `*` wildcards) override `scale`, `size` (`[w, h]` or `n`), `shift` (`[x, y]`),
+`layer` (`"decals"`, `"decorative"`, `"object"`, etc.), `grass` (force 3D grass on/off), `grass_height`,
+`grass_style` (`"tuft"`, `"bush"`, `"carpet"`), or `hide` (`true` suppresses that decorative). The
+**Decoratives** tab previews 3D models or 2D swatches beside Factorio's and saves per-decorative choices
+as `"decor:<name>": <pack id>`; changing the order, choice, Settings > Graphics > **Decoratives from
+model packs** (`[graphics] pack_decoratives`, `--pack-decoratives=off`), or Settings > Graphics > **3D
+decorative models** (`[graphics] decor_models`, `--decor-models=off`) rebuilds decoratives live
+(`ModelPacks.decor_version`). A pack of decoratives or `"decoratives"` hide rules alone is a pack.
+
 A pack holding a copy of any file of the player's Factorio install (byte for byte, over 1 KB: a sound,
-a picture, anything) is not loaded at all, none of its models, items, icons or sounds, and its card in
+a picture, anything) is not loaded at all, none of its models, items, icons, tiles, decoratives or sounds, and its card in
 the Model packs window is red with the copies listed (`pack_check.gd`, the owner's rule; every pack is
 checked but the Factorio pack and Wube3DP, and there is no switch: it is a bound, not a look).
 

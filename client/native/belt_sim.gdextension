@@ -3,8 +3,10 @@
 ; start-up (this folder's .gdignore), so a platform without its library logs no errors.
 [configuration]
 entry_symbol = "belt_sim_library_init"
-compatibility_minimum = "4.5"
+compatibility_minimum = "4.7"
 
 [libraries]
 windows.debug.x86_64 = "res://native/bin/belt_sim.windows.template_release.x86_64.dll"
 windows.release.x86_64 = "res://native/bin/belt_sim.windows.template_release.x86_64.dll"
+linux.debug.x86_64 = "res://native/bin/libbelt_sim.linux.template_release.x86_64.so"
+linux.release.x86_64 = "res://native/bin/libbelt_sim.linux.template_release.x86_64.so"

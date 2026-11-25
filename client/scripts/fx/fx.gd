@@ -28,7 +28,13 @@ const WeaponFx := preload("res://scripts/fx/weapon_fx.gd")
 const WeaponsDemo := preload("res://scripts/fx/weapons_demo.gd")
 const Lightning := preload("res://scripts/fx/lightning.gd")
 const BurnerFx := preload("res://scripts/fx/burner_fx.gd")
+const FlameSound := preload("res://scripts/fx/flame_sound.gd")
+const CombatSounds := preload("res://scripts/fx/combat_sounds.gd")
 const StepSounds := preload("res://scripts/fx/step_sounds.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const VehicleAnim := preload("res://scripts/world/vehicle_anim.gd")
+const VehicleTracks := preload("res://scripts/fx/vehicle_tracks.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const SCAN_INTERVAL := 0.25
 ## Machines and vehicles further than this from the listener (tiles) are not considered.
@@ -48,7 +54,7 @@ const MINE_DEFAULTS := {"tree": "wood", "plant": "wood", "resource": "ore", "sim
 const MINED_SOUNDS := ["core/sound/deconstruct-small.ogg", "core/sound/deconstruct-medium.ogg",
 	"core/sound/deconstruct-large.ogg", "core/sound/deconstruct-bricks.ogg"]
 ## M1: `--building-swing=ore`: a building's swing plays the ore sound with its sparks, as J11 had it.
-static var silent_buildings := not ("--building-swing=ore" in OS.get_cmdline_user_args())
+static var silent_buildings := not (Switches.has("--building-swing=ore"))
 ## K13: what a repair pack mending something plays, Factorio's default_manual_repair (a drill, 3.3-3.6 s
 ## a variation, at full volume), for what has no repair_sound of its own (stone walls and furnaces
 ## hammer: base/sound/manual-repair-simple, at half volume). Each plays to its end, then the next.
@@ -116,6 +122,8 @@ class Tracked:
 	var scan_pos := Vector2.ZERO
 	var speed := 0.0  # tiles per second
 	var seen := 0
+	var exhaust_due := 0.0
+	var dust_due := 0.0
 
 
 class Emitter:
@@ -133,17 +141,26 @@ var movers: MoverLayer
 var combat: CombatLayer
 var avatar: Avatar
 var rig: CameraRig
+## Optional hook called when `afx` arrives (addon_host.gd / api.creatures.damaged).
+var on_damaged_hook := Callable()
 
 var sfx := Sfx.new()
 var sprites := SpriteFx.new()
 ## What weapons fire: shots, projectiles, beams, explosions, fires and clouds (weapon_fx.gd).
 var weapons := WeaponFx.new()
+## Flamethrowers' begin/loop/end sounds (turrets.gd's turrets and tank, the character's here).
+var flame_sound := FlameSound.new()
+var combat_sounds := CombatSounds.new()
+## The combat sounds were decoded ahead (on the first combat message, _warm_combat).
+var _combat_warmed := false
 ## Fulgora's lightning bolts (`lt`).
 var lightning := Lightning.new()
 ## A modeller's burner inserters' wisps and crackle while they burn (burner_fx.gd).
 var burners := BurnerFx.new()
 ## The steps' sounds from the prototypes (`steps`, step_sounds.gd); the name table below without them.
 var steps := StepSounds.new()
+## Persistent vehicle tread tracks and ballistic dirt/mud clods & dust plumes (vehicle_tracks.gd).
+var vehicle_tracks := VehicleTracks.new()
 
 var _tracked := {}  # unit -> Tracked, from mv
 var _gun := "pistol"
@@ -170,6 +187,7 @@ var _biter_wait := 0.0
 var _burning := {}  # unit -> [remaining seconds, last position]
 var _tops := {}  # proto name -> height of the model's top
 var _states := {}  # unit -> working state last scan, for activate/deactivate sounds
+var _track_proto := {}  # proto_id -> bool (true only for vehicles and enemies tracked in _scan)
 ## Working machines near with sound accents: unit -> [Loop, position, animation frame, proto name].
 var _accents := {}
 
@@ -184,12 +202,19 @@ func _ready() -> void:
 	weapons.name = "Weapons"
 	weapons.sprites = sprites
 	weapons.sfx = sfx
+	combat_sounds.sfx = sfx
+	weapons.extra_sounds = combat_sounds
 	add_child(weapons)
+	flame_sound.name = "FlameSound"
+	add_child(flame_sound)
 	lightning.name = "Lightning"
 	add_child(lightning)
+	vehicle_tracks.name = "VehicleTracks"
+	vehicle_tracks.visible = FxSettings.effects_enabled
+	add_child(vehicle_tracks)
 	# After the player's input (which sets combat's aim each frame) and fx_demo.gd.
 	process_priority = 2
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg == "--weapons-demo":
 			var weapons_demo := WeaponsDemo.new()
 			weapons_demo.fx = self
@@ -219,10 +244,12 @@ func reset() -> void:
 	burners.clear()
 	sprites.clear()
 	lightning.clear()
+	vehicle_tracks.clear()
 	sfx.stop_all()
 	weapons.reset()
 	_burning.clear()
 	_tops.clear()
+	_track_proto.clear()
 
 
 ## Every message from the bridge, before main.gd routes it.
@@ -244,13 +271,23 @@ func handle(msg: Dictionary) -> void:
 			if int(msg.get("g", 0)) == 1 and int(msg.get("gi", 0)) == 0:
 				_on_del(msg)
 		"died":
+			_warm_combat()
 			_on_died(msg)
 		"afx":
+			_warm_combat()
+			combat_sounds.hit(msg, avatar.unit if avatar != null else 0)
 			_on_combat_fx(msg)
+		"atk":
+			_warm_combat()
+			_on_attack(msg)
 		"shot":
+			_warm_combat()
 			_on_shot(msg)
 			weapons.handle(msg)
-		"pj", "gf":
+		"pj":
+			_warm_combat()
+			weapons.handle(msg)
+		"gf":
 			weapons.handle(msg)
 		"lt":
 			_on_lightning(msg)
@@ -295,10 +332,13 @@ func _process(delta: float) -> void:
 	_update_repair(delta)
 	_update_accents(delta)
 	_update_shots(delta)
+	combat_sounds.character(delta, avatar.health, avatar.max_health, avatar.position + Vector3(0, 1, 0))
 	sprites.visible = FxSettings.effects_enabled  # the Settings window can change it in the game
+	vehicle_tracks.visible = FxSettings.effects_enabled
 	if FxSettings.effects_enabled:
 		_update_emitters(delta)
 		burners.step(sprites, delta, WIND)
+		_update_vehicle_fx(delta)
 	_update_combat_fx(delta)
 
 
@@ -358,12 +398,13 @@ func _scan(elapsed: float) -> void:
 		var proto: ProtoDB.EntityProto = protos.entity(t.proto_id)
 		if proto == null:
 			continue
-		if VEHICLE_SOUNDS.has(proto.type):
-			var spec: Array = VEHICLE_SOUNDS[proto.type]
-			var inside: bool = avatar.vehicle == int(unit)
+		var vkey := vehicle_sound_key(proto)
+		if vkey != "":
+			var spec: Array = VEHICLE_SOUNDS[vkey]
+			var inside: bool = avatar != null and avatar.vehicle == int(unit)
 			var at := Vector3(t.pos.x, 1.0, t.pos.y)
 			var rules := SoundBank.working_sound(proto.name)
-			var vehicle := {"key": "v%d" % unit, "pos": at, "group": proto.type, "reach": 1.0,
+			var vehicle := {"key": "v%d" % unit, "pos": at, "group": vkey, "reach": 1.0, "own": inside,
 				"per_group": rules.max_per_prototype if rules != null else 0,
 				"fade_in": rules.fade_in if rules != null else 0.13, "fade_out": rules.fade_out if rules != null else 0.33}
 			if t.speed > 0.4:
@@ -376,6 +417,10 @@ func _scan(elapsed: float) -> void:
 				sources.append(vehicle)
 		elif ENEMY_TYPES.has(proto.type) and t.pos.distance_to(focus) < 24.0:
 			biters.append([proto.name, t.pos])
+		elif proto.type == "combat-robot":
+			var robot := CombatSounds.robot_loop(proto.name, int(unit), Vector3(t.pos.x, 1.5, t.pos.y))
+			if not robot.is_empty():
+				sources.append(robot)
 	sfx.set_loops(sources)
 	_biter_chatter(biters, elapsed)
 
@@ -450,19 +495,64 @@ func _biter_chatter(biters: Array, elapsed: float) -> void:
 	_biter_wait = randf_range(0.6, 2.0)
 	var b: Array = biters[randi() % biters.size()]
 	var name: String = b[0]
-	var path := ""
-	if "spitter" in name:
-		path = "base/sound/creatures/Spiters_%d_%d.ogg" % [randi_range(1, 5), randi_range(1, 2)]
-	elif "behemoth" in name:
-		path = SoundBank.pick("base/sound/creatures/biter-roar-behemoth")
-	elif "big" in name:
-		path = SoundBank.pick("base/sound/creatures/biter-roar-big")
-	elif "medium" in name:
-		path = SoundBank.pick("base/sound/creatures/biter-roar-mid")
-	else:
-		path = SoundBank.pick("base/sound/creatures/biter-roar")
+	var path := _chatter_sound(name)
 	var pos: Vector2 = b[1]
 	sfx.play_at(path, Vector3(pos.x, 0.5, pos.y), 0.45, 0.08, 1.0, "Enemies")
+
+
+## The idle call of an enemy: Factorio's `working_sound` (biter-call*, spitter-call-*), not the attack
+## roars the old code used. `--combat-sound-limit=old`: the old files.
+static func _chatter_sound(name: String) -> String:
+	if not Sfx.combat_limits:
+		if "spitter" in name:
+			return "base/sound/creatures/Spiters_%d_%d.ogg" % [randi_range(1, 5), randi_range(1, 2)]
+		if "behemoth" in name:
+			return SoundBank.pick("base/sound/creatures/biter-roar-behemoth")
+		if "big" in name:
+			return SoundBank.pick("base/sound/creatures/biter-roar-big")
+		if "medium" in name:
+			return SoundBank.pick("base/sound/creatures/biter-roar-mid")
+		return SoundBank.pick("base/sound/creatures/biter-roar")
+	if "spitter" in name:
+		if "behemoth" in name or "big" in name:
+			return SoundBank.pick("base/sound/creatures/spitter-call-big")
+		if "medium" in name:
+			return SoundBank.pick("base/sound/creatures/spitter-call-med")
+		return SoundBank.pick("base/sound/creatures/spitter-call-small")
+	if "behemoth" in name:
+		return SoundBank.pick("base/sound/creatures/biter-call-behemoth")
+	if "big" in name:
+		return SoundBank.pick("base/sound/creatures/biter-call-big")
+	return SoundBank.pick("base/sound/creatures/biter-call")
+
+
+## The sound an enemy's death makes, its prototype's `dying_sound` (units: biter-death*, spitter-death*;
+## worms: worm-death*; nests: spawner-death), or "" for anything else.
+static func enemy_death_prefix(proto: ProtoDB.EntityProto) -> String:
+	var n: String = proto.name
+	var base := "base/sound/creatures/"
+	if proto.type == "unit-spawner":
+		return base + "spawner-death"
+	if proto.type == "turret" and "worm" in n:
+		if "behemoth" in n:
+			return base + "worm-death-behemoth"
+		if "big" in n:
+			return base + "worm-death-big"
+		if "medium" in n:
+			return base + "worm-death"
+		return base + "worm-death-small"
+	if ENEMY_TYPES.has(proto.type):
+		var big := "big" in n or "behemoth" in n
+		if "spitter" in n:
+			if "behemoth" in n:
+				return base + "spitter-death-behemoth"
+			if "big" in n:
+				return base + "spitter-death-big"
+			if "medium" in n:
+				return base + "spitter-death-mid"
+			return base + "spitter-death"
+		return base + ("biter-death-big" if big else "biter-death")
+	return ""
 
 
 func _track(msg: Dictionary) -> void:
@@ -501,6 +591,17 @@ func _track(msg: Dictionary) -> void:
 
 
 func _track_one(unit: int, proto: int, x: int, y: int, now: int) -> void:
+	var wanted = _track_proto.get(proto)
+	if wanted != null:
+		if not bool(wanted):
+			return
+	elif proto > 0 and world != null and world.protos != null:
+		var ep: ProtoDB.EntityProto = world.protos.entity(proto)
+		if ep != null:
+			var keep: bool = vehicle_sound_key(ep) != "" or ENEMY_TYPES.has(ep.type) or ep.type == "combat-robot"
+			_track_proto[proto] = keep
+			if not keep:
+				return
 	var t: Tracked = _tracked.get(unit)
 	var pos := Vector2(x, y) / 256.0
 	if t == null:
@@ -520,6 +621,118 @@ func _update_emitters(delta: float) -> void:
 		while e.due <= 0.0:
 			e.due += 1.0
 			_puff(e)
+
+
+static func vehicle_sound_key(proto: ProtoDB.EntityProto) -> String:
+	if proto == null:
+		return ""
+	if VEHICLE_SOUNDS.has(proto.name):
+		return proto.name
+	if VEHICLE_SOUNDS.has(proto.type):
+		return proto.type
+	return ""
+
+
+## Surface kind ("grass", "dirt", "sand", "mud", "stone", "concrete", "metal", "water"), ground
+## tint color, and whether the tile kicks up natural dust for a vehicle at `p`.
+func _vehicle_ground(p: Vector2) -> Array:
+	var ground := _ground_under(p)
+	var kind := "dirt"
+	var color := Color(0.42, 0.36, 0.28)
+	var id := world.tile_at(floori(p.x), floori(p.y))
+	if id >= 0 and id < world.protos.tile_names.size():
+		if world.protos.is_water(id):
+			kind = "water"
+		else:
+			var tile: String = world.protos.tile_names[id]
+			if "concrete" in tile:
+				kind = "concrete"
+			elif "stone-path" in tile or "paving" in tile or "brick" in tile:
+				kind = "stone"
+			elif "platform" in tile or "foundation" in tile or "metal" in tile or "machinery" in tile:
+				kind = "metal"
+			elif "sand" in tile or "desert" in tile or "dunes" in tile:
+				kind = "sand"
+			elif "grass" in tile:
+				kind = "grass"
+			elif "mud" in tile or "wetland" in tile or "lowland" in tile:
+				kind = "mud"
+			color = world.protos.tile_color(id)
+	if ground[1] is Color:
+		color = ground[1] as Color
+	elif kind != "water" and (str(ground[0]).contains("transport-belt") or str(ground[0]).contains("rails")):
+		kind = "metal"
+	return [kind, color, ground[1] is Color]
+
+
+## Exhaust smoke, persistent tread tracks, ballistic dirt/mud clods, and wheel/track dust for
+## moving, turning, and occupied idling cars & tanks.
+func _update_vehicle_fx(delta: float) -> void:
+	if MomentHold.on or world == null or world.protos == null:
+		return
+	var here := sfx.listener_position()
+	var focus := Vector2(here.x, here.z)
+	vehicle_tracks.tick(delta, focus)
+	if not VehicleAnim.enhanced and not VehicleTracks.enabled:
+		return
+	for unit in _tracked.keys():
+		var t: Tracked = _tracked[unit]
+		if t.pos.distance_to(focus) > HEARING:
+			continue
+		var proto: ProtoDB.EntityProto = world.protos.entity(t.proto_id)
+		if proto == null or (proto.name != "car" and proto.name != "tank"):
+			continue
+		var is_tank := proto.name == "tank"
+		var inside: bool = avatar != null and avatar.vehicle == int(unit)
+		var yaw := float(movers.yaw_of(int(unit))) if movers != null else 0.0
+		var mpos: Variant = movers.position_of(int(unit)) if movers != null else null
+		var vpos := Vector2((mpos as Vector3).x, (mpos as Vector3).z) if mpos is Vector3 else t.pos
+		var driving := t.speed > 0.35
+		var track_step := VehicleTracks.enabled and (driving or inside or vehicle_tracks.needs_step(int(unit), vpos, yaw))
+		if not track_step and (not VehicleAnim.enhanced or (not driving and not inside)):
+			continue
+		var vground: Array = []
+		if track_step:
+			vground = _vehicle_ground(vpos)
+			vehicle_tracks.step_vehicle(int(unit), vpos, yaw, t.speed, is_tank,
+				str(vground[0]), vground[1] as Color, delta)
+		if not VehicleAnim.enhanced or (not driving and not inside):
+			continue
+		var rot := Basis(Vector3.UP, yaw)
+		var gy := GroundHeight.at(vpos.x, vpos.y)
+		var base := Vector3(vpos.x, gy, vpos.y)
+		var ex_rate := (2.0 if is_tank else 1.5) + clampf(t.speed * 0.45, 0.0, 5.5 if is_tank else 4.5)
+		t.exhaust_due -= delta * ex_rate
+		while t.exhaust_due <= 0.0:
+			t.exhaust_due += 1.0
+			var ex_local := Vector3(randf_range(-0.22, 0.22), 0.65, 1.42) if is_tank else Vector3(0.28, 0.55, 1.05)
+			var ex_col := Color(0.28, 0.27, 0.26, 0.48) if is_tank else Color(0.45, 0.44, 0.43, 0.36)
+			var puff := sprites.emit("smoke", base + rot * ex_local,
+				randf_range(0.38, 0.58) if is_tank else randf_range(0.28, 0.42),
+				randf_range(0.7, 1.05) if is_tank else randf_range(0.55, 0.85), ex_col)
+			if puff != null:
+				puff.vel = WIND + rot * Vector3(0.0, 0.0, 0.45) + Vector3(randf_range(-0.15, 0.15), randf_range(0.4, 0.8), randf_range(-0.15, 0.15))
+				puff.rise = 0.25
+		if t.speed <= 1.2:
+			continue
+		var dust_scale := 0.45 if VehicleTracks.enabled else 1.0
+		var dust_rate := clampf(t.speed * 1.1, 2.0, 12.0) * dust_scale
+		t.dust_due -= delta * dust_rate
+		while t.dust_due <= 0.0:
+			t.dust_due += 1.0
+			if vground.is_empty():
+				vground = _vehicle_ground(vpos)
+			if not bool(vground[2]):
+				continue
+			var tint := (vground[1] as Color).lerp(Color(0.72, 0.68, 0.60), 0.35)
+			tint.a = randf_range(0.32, 0.48) * (0.65 if VehicleTracks.enabled else 1.0)
+			var side := -1.0 if randf() < 0.5 else 1.0
+			var wheel_local := Vector3(side * (0.66 if is_tank else 0.56), 0.14, 1.15 if is_tank else 0.85)
+			var dp := sprites.emit("dust", base + rot * wheel_local,
+				randf_range(0.45, 0.72) if is_tank else randf_range(0.32, 0.52),
+				randf_range(0.45, 0.75), tint)
+			if dp != null:
+				dp.vel = WIND * 0.5 + rot * Vector3(side * randf_range(0.15, 0.4), randf_range(0.25, 0.55), randf_range(0.2, 0.5))
 
 
 func _puff(e: Emitter) -> void:
@@ -560,6 +773,8 @@ func _top(proto: ProtoDB.EntityProto) -> float:
 
 
 func _on_combat_fx(msg: Dictionary) -> void:
+	if on_damaged_hook.is_valid():
+		_notify_damaged(msg)
 	if not FxSettings.effects_enabled:
 		return
 	var pos := Vector3(int(msg.get("x", 0)) / 256.0, 0.04, int(msg.get("y", 0)) / 256.0)
@@ -579,6 +794,41 @@ func _on_combat_fx(msg: Dictionary) -> void:
 		var drop := sprites.emit("hit", pos + Vector3(randf_range(-0.25, 0.25), randf_range(0.2, 0.65), randf_range(-0.25, 0.25)), 0.2, 0.28, Color(0.8, 0.05, 0.025, 0.85))
 		if drop != null:
 			drop.vel = Vector3(randf_range(-0.7, 0.7), randf_range(0.1, 0.6), randf_range(-0.7, 0.7))
+
+
+func _notify_damaged(msg: Dictionary) -> void:
+	var unit := int(msg.get("u", 0))
+	var pos := Vector3(int(msg.get("x", 0)) / 256.0, 0.0, int(msg.get("y", 0)) / 256.0)
+	var cause: Variant = Vector3(int(msg["cx"]) / 256.0, 0.0, int(msg["cy"]) / 256.0) if msg.has("cx") and msg.has("cy") else null
+	var proto_name := ""
+	if unit != 0:
+		if _tracked.has(unit) and world != null and world.protos != null:
+			var t: Tracked = _tracked[unit]
+			var ep: ProtoDB.EntityProto = world.protos.entity(t.proto_id)
+			if ep != null:
+				proto_name = ep.name
+		if proto_name == "" and movers != null and movers.creatures != null:
+			proto_name = movers.creatures.name_of(unit)
+		if proto_name == "" and world != null and world.entities.has(unit) and world.protos != null:
+			var rec: WorldMirror.Rec = world.entities[unit]
+			var ep2: ProtoDB.EntityProto = world.protos.entity(rec.proto_id)
+			if ep2 != null:
+				proto_name = ep2.name
+	if proto_name == "" and msg.has("p") and world != null and world.protos != null:
+		var ep3: ProtoDB.EntityProto = world.protos.entity(int(msg["p"]))
+		if ep3 != null:
+			proto_name = ep3.name
+	on_damaged_hook.call({
+		"unit": unit,
+		"name": proto_name,
+		"pos": pos,
+		"cause_pos": cause,
+		"damage_type": str(msg.get("dt", "")),
+		"fx": str(msg.get("fx", "")),
+		"dmg": int(msg.get("dmg", 0)),
+		"hp": int(msg.get("hp", -1)),
+		"src": str(msg.get("src", "")),
+	})
 
 
 func _update_combat_fx(delta: float) -> void:
@@ -624,7 +874,7 @@ func _update_steps(delta: float) -> void:
 		if not _def_ready(def):
 			return  # this ground's sounds are still being decoded (they all start now)
 		_step_timer = 0.0
-		sfx.play_def(def, at, "Walking", 1.0, "step/" + StepSounds.name_of(def))
+		sfx.play_def(def, at, "Walking", 1.0, "step/" + StepSounds.name_of(def), true)
 	elif surface[0] == "":
 		_step_timer = 0.0
 		return  # a ground Factorio walks on in silence (its tile has no walking_sound)
@@ -633,11 +883,11 @@ func _update_steps(delta: float) -> void:
 		if sound == "":
 			return
 		_step_timer = 0.0
-		sfx.play_at(sound, at, 0.5, 0.06, 1.0, "Walking", "step/" + surface[0].get_file())
+		sfx.play_at(sound, at, 0.5, 0.06, 1.0, "Walking", "step/" + surface[0].get_file(), true)
 	if surface[3]:
 		var rustle: SoundBank.SoundDef = _rustle_under(ground)
 		if rustle != null and _def_ready(rustle):
-			sfx.play_def(rustle, at, "Walking", 1.0, StepSounds.rustle_kind(rustle))
+			sfx.play_def(rustle, at, "Walking", 1.0, StepSounds.rustle_kind(rustle), true)
 	if FxSettings.effects_enabled and surface[1] is Color:
 		var tint: Color = surface[1]
 		var c := sprites.emit("dust", feet + Vector3(randf_range(-0.15, 0.15), 0.15, randf_range(-0.15, 0.15)), 0.35, 0.7, Color(tint.r, tint.g, tint.b, 0.22))
@@ -774,7 +1024,7 @@ func _update_mining(delta: float) -> void:
 	# A resource is mined over and over: each time the bar comes round, an item came out.
 	if avatar.mining >= 0:
 		if _mine_kind == "ore" and _last_mining_progress > avatar.mining + 30:
-			sfx.play_at(SoundBank.pick("core/sound/picked-up-item"), avatar.position, 0.35, 0.05, 1.0, "Effects", "pickup")
+			sfx.play_at(SoundBank.pick("core/sound/picked-up-item"), avatar.position, 0.35, 0.05, 1.0, "Effects", "pickup", true)
 		_last_mining_progress = avatar.mining
 	_mine_timer -= delta
 	if _mine_timer > 0.0:
@@ -789,7 +1039,7 @@ func _update_mining(delta: float) -> void:
 	var toward := (avatar.position - target)
 	toward.y = 0.0
 	var hit := target + toward.normalized() * minf(0.5, toward.length()) + Vector3(0, 0.45, 0)
-	sfx.play_at(sound, hit, 0.6, 0.06, 1.0, "Effects", "mine/" + _mine_detail(_mine_sound))
+	sfx.play_at(sound, hit, 0.6, 0.06, 1.0, "Effects", "mine/" + _mine_detail(_mine_sound), true)
 	if not FxSettings.effects_enabled:
 		return
 	if _mine_kind == "wood":
@@ -923,27 +1173,32 @@ func _on_lightning(msg: Dictionary) -> void:
 func _on_shot(msg: Dictionary) -> void:
 	var gun := str(msg.get("g", ""))
 	var at := Vector3(avatar.position.x, CombatLayer.MUZZLE_HEIGHT, avatar.position.z)
-	if int(msg.get("u", 0)) != avatar.unit:
+	var own := int(msg.get("u", 0)) == avatar.unit
+	if not own:
 		var p = movers.position_of(int(msg.get("u", 0)))
 		if p == null:
 			return
 		at = p
 	if GUN_SOUNDS.has(gun):
-		sfx.play_at(SoundBank.pick(GUN_SOUNDS[gun]), at, 0.55, 0.05, 1.0, "Weapons", "shot/" + gun)
+		sfx.play_at(SoundBank.pick(GUN_SOUNDS[gun]), at, 0.55, 0.05, 1.0, "Weapons", "shot/" + gun, own)
 
 
-## The flamethrower fires every tick, so no `shot` comes: its sound repeats while the character
-## fires it (its streams are drawn from `pj`).
+## The flamethrower fires every tick, so no `shot` comes: its sound plays while the character
+## fires it (its streams are drawn from `pj`): flame_sound.gd's begin, loop and end from the gun,
+## or with `--flame-sound=old` the middle sound again every 0.5 s.
 func _update_shots(delta: float) -> void:
 	if not avatar.firing or combat == null or combat.aim_mode < 0 or _gun != "flamethrower":
 		_shot_clock = 0.0
+		return
+	if not FlameSound.old:
+		flame_sound.firing("hand", avatar.muzzle_position(), "handheld")
 		return
 	var before := _shot_clock
 	_shot_clock += delta
 	var interval := 0.5
 	if before > 0.0 and floori(before / interval) == floori(_shot_clock / interval):
 		return
-	sfx.play_at(SoundBank.pick(GUN_SOUNDS["flamethrower"]), avatar.position + Vector3(0, CombatLayer.MUZZLE_HEIGHT, 0), 0.55, 0.05, 1.0, "Weapons", "shot/flamethrower")
+	sfx.play_at(SoundBank.pick(GUN_SOUNDS["flamethrower"]), avatar.position + Vector3(0, CombatLayer.MUZZLE_HEIGHT, 0), 0.55, 0.05, 1.0, "Weapons", "shot/flamethrower", true)
 
 
 # --- Building, rotating, mining out ---------------------------------------------------------------
@@ -1026,15 +1281,51 @@ static func _size_class(proto: ProtoDB.EntityProto) -> String:
 
 # --- Deaths -------------------------------------------------------------------------------------
 
+## Every combat sound decoded ahead, on the first combat message (sfx.gd skips a file's first play
+## while it decodes, and a fight's explosions are few and varied, so many first ones were silent).
+## `--sound-pool=old`: not done.
+func _warm_combat() -> void:
+	if _combat_warmed or not Sfx.pool:
+		return
+	_combat_warmed = true
+	var files: Array = []
+	for prefix in GUN_SOUNDS.values():
+		files.append_array(SoundBank.variants(prefix))
+	for prefix in ["base/sound/fight/gun-turret-gunshot", "base/sound/fight/heavy-gunshot", "base/sound/fight/laser-beam",
+			"base/sound/fight/tank-cannon", "base/sound/fight/rocket-launcher", "base/sound/fight/artillery-shoots",
+			"space-age/sound/ammo/rocket-turret-launcher", "base/sound/creatures/biter-death", "base/sound/creatures/biter-death-big",
+			"base/sound/creatures/spitter-death", "base/sound/creatures/spitter-death-mid", "base/sound/creatures/spitter-death-big",
+			"base/sound/creatures/worm-death-small", "base/sound/creatures/worm-death", "base/sound/creatures/worm-death-big",
+			"base/sound/creatures/spawner-death", "base/sound/fight/car-explosion", "base/sound/fight/large-explosion",
+			"base/sound/fight/medium-explosion", "base/sound/small-explosion"]:
+		files.append_array(SoundBank.variants(prefix))
+	files.append_array(weapons.explosion_sound_files())
+	CombatSounds.warm(files)
+
+
+func _on_attack(msg: Dictionary) -> void:
+	var proto: ProtoDB.EntityProto = world.protos.entity(int(msg.get("p", 0))) if world != null and world.protos != null else null
+	if proto != null:
+		combat_sounds.attack(proto.name, Vector3(int(msg.get("x", 0)) / 256.0, 0.6, int(msg.get("y", 0)) / 256.0))
+
+
 func _on_died(msg: Dictionary) -> void:
 	var proto: ProtoDB.EntityProto = world.protos.entity(int(msg.get("p", 0)))
 	var pos := Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0
 	var at := Vector3(pos.x, 0.0, pos.y)
 	if proto == null:
 		return
+	if proto.type == "character" and avatar != null and int(msg.get("u", 0)) == avatar.unit and avatar.unit != 0:
+		combat_sounds.character_died()
+	var death := enemy_death_prefix(proto)
+	if not Sfx.combat_limits:
+		death = ""
+		if ENEMY_TYPES.has(proto.type):
+			var old_big := "big" in proto.name or "behemoth" in proto.name
+			death = "base/sound/creatures/biter-death-big" if old_big else "base/sound/creatures/biter-death"
+	if death != "":
+		sfx.play_at(SoundBank.pick(death), at, 0.6, 0.06, 1.0, "Enemies")
 	if ENEMY_TYPES.has(proto.type):
-		var big := "big" in proto.name or "behemoth" in proto.name
-		sfx.play_at(SoundBank.pick("base/sound/creatures/biter-death-big" if big else "base/sound/creatures/biter-death"), at, 0.6, 0.06, 1.0, "Enemies")
 		if FxSettings.effects_enabled:
 			for i in 3:
 				var c := sprites.emit("dust", at + Vector3(randf_range(-0.3, 0.3), 0.3, randf_range(-0.3, 0.3)), 0.5, 0.7, Color(0.42, 0.3, 0.12, 0.6))
@@ -1048,7 +1339,13 @@ func _on_died(msg: Dictionary) -> void:
 	var s := proto.size()
 	var extent := maxf(s.x, s.y)
 	var kind := "explosion/" + proto.name
-	if proto.type == "car":
+	# The entity's dying explosion carries its own sound (142 of the 185 prototypes' do), so the generic
+	# one by size is only for what has none; worms and nests have their death sound above and no explosion.
+	var dying := weapons.dying_explosion(proto.name)
+	var own_sound: bool = Sfx.combat_limits and (death != "" or (FxSettings.effects_enabled and weapons.explosion_has_sound(dying)))
+	if own_sound:
+		pass
+	elif proto.type == "car":
 		sfx.play_at(SoundBank.pick("base/sound/fight/car-explosion"), at, 0.8, 0.0, 1.0, "Explosions", kind)
 	elif extent >= 4.0:
 		sfx.play_at(SoundBank.pick("base/sound/fight/large-explosion"), at, 0.8, 0.0, 1.0, "Explosions", kind)
@@ -1059,7 +1356,6 @@ func _on_died(msg: Dictionary) -> void:
 	if not FxSettings.effects_enabled:
 		return
 	# The entity's own dying explosion, as Factorio plays it.
-	var dying := weapons.dying_explosion(proto.name)
 	if dying != "":
 		weapons.explode(dying, at)
 		return

@@ -14,3 +14,24 @@ static var prof := {}
 static func add(key: String, t0: int) -> void:
 	if on:
 		prof[key] = int(prof.get(key, 0)) + Time.get_ticks_usec() - t0
+
+
+## Counts of the client's rarer events while `on` (the spike log, debug_overlay.gd, names a slow frame's
+## share of each): `dh_palette` Distant Horizon's colour table rebuilt, `item_models` an item model read,
+## `hydrated` a chunk filled from the disk cache.
+static var counts := {}
+
+
+static func count(key: String, n := 1) -> void:
+	if on:
+		counts[key] = int(counts.get(key, 0)) + n
+
+
+## The slowest message bridge.gd handled since the spike log last looked (once a frame), while `on`:
+## [type, µs].
+static var slowest_message: Array = ["", 0]
+
+
+static func note_message(t: String, usec: int) -> void:
+	if on and usec > int(slowest_message[1]):
+		slowest_message = [t, usec]

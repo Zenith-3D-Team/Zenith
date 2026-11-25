@@ -121,7 +121,7 @@ local function finish_craftable(s, list, parts)
   local sig = table.concat(parts, ",")
   if sig ~= s.craftable_sig then
     s.craftable_sig = sig
-    transport.send_reliable({ t = "craftable", l = list })
+    transport.send_reliable_priority({ t = "craftable", l = list })
   end
 end
 

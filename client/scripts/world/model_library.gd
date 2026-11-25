@@ -33,6 +33,9 @@ extends RefCounted
 ## do emissive materials (furnace fire): the shader reads the activity from INSTANCE_CUSTOM.a.
 ## Belt surfaces (`belt_surface`) scroll at their tier's speed in the shader (_setup_belt).
 
+const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
+
 ## Prototype name prefix -> [prototype whose model to use, colour for its tier_paint]. Each colour
 ## is the paint's median in that tier's own sprite sheet, picked the way the yellow tier's part
 ## colours are (the faster splitters are lighter and the faster undergrounds darker than their
@@ -95,7 +98,7 @@ const STEEL_FRAMES := ["transport-belt"]
 const X_AXIS_KINDS := {"spin_flywheel": true, "wheel_rail": true, "wheel_front": true, "wheel_rear": true, "wheel_track": true}
 ## ... and these about the node's Z axis (north-south): the pumpjack's crank and walking beam,
 ## the flywheel of a steam engine lying east-west.
-const Z_AXIS_KINDS := {"spin_crank": true, "rock_beam": true, "spin_flywheel_ns": true}
+const Z_AXIS_KINDS := {"spin_crank": true, "rock_beam": true, "spin_flywheel_ns": true, "engine_fan": true}
 ## Parts named `anim_upright_<kind>` keep facing north whatever way the entity faces, as
 ## Factorio draws them (the pumpjack's beam, post and gearbox are one layer for every
 ## direction; only its ground pipes turn).
@@ -239,6 +242,7 @@ class AnimPart:
 	var motion := -1
 	var rate := 0.0
 	var phase := 0.0
+	var top := -INF  # highest Y of this part in model space, before custom_aabb expansion
 	var _radius := -1.0
 
 	## A wheel's radius: half its mesh's height at rest, from its vertices (its bounds may have been
@@ -278,6 +282,7 @@ const ModelRig := preload("res://scripts/world/model_rig.gd")
 const ContactShade := preload("res://scripts/world/contact_shade.gd")
 const BeltReturn := preload("res://scripts/world/belt_return.gd")
 const BeltCaps := preload("res://scripts/world/belt_caps.gd")
+const PipeInsides := preload("res://scripts/world/pipe_insides.gd")
 const CreatureModels := preload("res://scripts/world/creature_models.gd")
 const NatureLooks := preload("res://scripts/world/nature_looks.gd")
 const BurnerFx := preload("res://scripts/fx/burner_fx.gd")
@@ -288,12 +293,70 @@ const FactorioClipShader := preload("res://shaders/factorio_material_clip.gdshad
 const FactorioOreShader := preload("res://shaders/factorio_material_ore.gdshader")
 ## Trees' leaf cards (tools/models/nature/geo.py `card`): leaves cut out, both sides drawn.
 const FactorioLeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
+const BeltReactiveShader := preload("res://shaders/belt_reactive.gdshader")
+
+const BELT_REACTIVE_META := &"f3d_belt_reactive_pass"
+static var _belt_reactive_mats: Array[WeakRef] = []
+static var _belt_reactive_on := false
+static var _belt_reactive_init := false
+
+
+## Registers a belt material carrying a `f3d_belt_reactive_pass` next_pass for runtime FSR 2.2 toggling.
+static func register_belt_reactive_mat(m: ShaderMaterial) -> void:
+	if m == null or not m.has_meta(BELT_REACTIVE_META):
+		return
+	if not _belt_reactive_init:
+		_belt_reactive_init = true
+		var s: GDScript = load("res://scripts/menu/settings.gd")
+		_belt_reactive_on = s != null and bool(s.belt_reactive_mask_active())
+	_belt_reactive_mats.append(weakref(m))
+	m.next_pass = (m.get_meta(BELT_REACTIVE_META) as Material) if _belt_reactive_on else null
+
+
+## Toggles the belt reactive mask `next_pass` across all loaded belt materials and LOD copies.
+static func sync_belt_reactive(on: bool) -> void:
+	_belt_reactive_init = true
+	_belt_reactive_on = on
+	var keep: Array[WeakRef] = []
+	for wr: WeakRef in _belt_reactive_mats:
+		var obj: Object = wr.get_ref()
+		if obj is ShaderMaterial:
+			var m := obj as ShaderMaterial
+			m.next_pass = (m.get_meta(BELT_REACTIVE_META) as Material) if on else null
+			keep.append(wr)
+	_belt_reactive_mats = keep
+
+
+static func _attach_belt_reactive(mesh: ArrayMesh) -> void:
+	if mesh == null:
+		return
+	for i in mesh.get_surface_count():
+		var m := mesh.surface_get_material(i) as ShaderMaterial
+		if m == null:
+			continue
+		var sp: Variant = m.get_shader_parameter("belt_speed")
+		if sp == null or absf(float(sp)) <= 0.0:
+			continue
+		var mask := 0
+		var rows_list := MaterialRows.rows(m)
+		for ri in mini(rows_list.size(), 24):
+			var row: ShaderMaterial = rows_list[ri]
+			var rsp: Variant = row.get_shader_parameter("belt_speed")
+			if rsp != null and absf(float(rsp)) > 0.0:
+				mask |= (1 << ri)
+		var rp := ShaderMaterial.new()
+		rp.shader = BeltReactiveShader
+		rp.render_priority = -95
+		rp.set_shader_parameter("belt_speed", float(sp))
+		rp.set_shader_parameter("belt_row_mask", mask)
+		m.set_meta(BELT_REACTIVE_META, rp)
+		register_belt_reactive_mat(m)
 
 ## Material name fragments -> class, first match wins (names from tools/models/kit.py's palette
 ## and tools/models/nature/). Anything else is painted metal.
 const MATERIAL_CLASSES := [
 	["fulgurite", "fulgurite"], ["scrap", "scrap"], ["wreck_yellow", "wreck_paint"],
-	["glass", "glass"], ["leaf", "foliage"], ["flesh", "organic"], ["chitin", "organic"],
+	["glass", "glass"], ["leaf", "foliage"], ["flesh", "organic"], ["chitin", "organic"], ["_worm", "organic"],
 	["ice", "ice"],  # Aquilo ice (m-space2)
 	["rubber", "dark"], ["belt_surface", "dark"], ["hazard_black", "dark"], ["soot", "dark"],
 	["steel_black", "dark"],
@@ -378,6 +441,7 @@ static var _cache := {}  # name -> Mesh, or null when there is no model
 static var _parts := {}  # name -> Array of AnimPart (empty for models without moving parts)
 static var _glowing := {}  # Mesh -> true when it has surfaces that glow while working
 static var _rigs := {}  # name -> an inserter rig's parts and numbers (rig_for)
+static var _tops := {}  # name -> highest drawn Y (tiles) over body, moving parts and arm rig
 static var _factorio_cache := {}  # [imported material, has COLOR, UV2, CUSTOM0] -> ShaderMaterial
 
 
@@ -389,6 +453,10 @@ static var _factorio_cache := {}  # [imported material, has COLOR, UV2, CUSTOM0]
 const CUSTOM_MODELS_DIR := "models"
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
 static var _packs_version := -1  # ModelPacks.version when generation last followed it
+## Transient runtime pack overrides requested by add-ons (family -> pack_id, e.g.
+## "big-biter" -> "builtin:placeholders"). Consulted in _source() only when the player has no
+## explicit choice for that family; never persisted to settings.cfg.
+static var addon_pack_overrides := {}
 
 
 static func custom_models_dir() -> String:
@@ -399,7 +467,7 @@ static func custom_models_dir() -> String:
 static func configure_from_command_line() -> void:
 	var custom := true
 	var extra := ""
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--models="):
 			extra = arg.get_slice("=", 1)
 		elif arg == "--models-first":
@@ -435,6 +503,7 @@ static func _configure_packs() -> void:
 	var off := _pack_ids(settings, "off")
 	var chosen: Variant = settings.get_value("model_packs", "choices")
 	ModelPacks.set_choices(chosen if chosen is Dictionary else {})
+	_load_pbr_overrides(settings)
 	# Again: the folder found at start-up (tests give another), its packs used as they were.
 	var again := ModelPacks.folder != ""
 	var dir := ModelPacks.folder if again else custom_models_dir()
@@ -462,6 +531,21 @@ static func apply_choices(families: Array) -> bool:
 	var chosen: Variant = settings.get_value("model_packs", "choices")
 	ModelPacks.set_choices(chosen if chosen is Dictionary else {})
 	return choices_changed(families)
+
+
+static func _load_pbr_overrides(settings: Variant) -> void:
+	var saved_packs: Variant = settings.get_value("model_packs", "pbr_packs")
+	var saved_models: Variant = settings.get_value("model_packs", "pbr_models")
+	ModelPacks.set_pbr_overrides(saved_packs if saved_packs is Dictionary else {},
+		saved_models if saved_models is Dictionary else {})
+
+
+## The Model packs window changed pack or per-model PBR toggles (settings.cfg saved): applied now,
+## matching models (including pinned `name@pack` entries) invalidated so previews and world reload.
+static func apply_pbr_overrides(families: Array = [], pack_id := "*") -> bool:
+	var settings = load("res://scripts/menu/settings.gd")
+	_load_pbr_overrides(settings)
+	return choices_changed(families, pack_id)
 
 
 ## settings.cfg's [model_packs] `order` or `off`: pack ids.
@@ -608,7 +692,7 @@ static func belt_tiles(pos: Vector2) -> Array:
 static func belt_end_places(proto_name: String, proto_type: String, dir: int, pos: Vector2, mask: int, height := 0.0, pack := "") -> Array:
 	var out: Array = []
 	var family := belt_end_family(proto_name, proto_type)
-	var basis := Basis(Vector3.UP, -float(dir) / 16.0 * TAU)
+	var basis := Basis(Vector3.UP, Wire.direction_yaw(dir))
 	var tiles := belt_tiles(pos)
 	for i in tiles.size():
 		var tile: Vector2i = tiles[i]
@@ -675,7 +759,7 @@ static func lone_belt_pieces(name: String) -> Variant:
 	var extra: Dictionary = lone[2]
 	var dir := 0
 	var pos: Vector2 = lone[3]
-	var host := Transform3D(Basis(Vector3.UP, -float(turn_dir(lone[1], dir, extra, lone[0])) / 16.0 * TAU),
+	var host := Transform3D(Basis(Vector3.UP, Wire.direction_yaw(turn_dir(lone[1], dir, extra, lone[0]))),
 		Vector3(pos.x, 0.0, pos.y))
 	var inverse := host.affine_inverse()
 	var host_parts := parts_for(name)
@@ -780,10 +864,16 @@ static func model_name(proto_name: String, proto_type: String, extra: Dictionary
 		"wall":
 			if extra.has("wc"):
 				var wc := int(extra["wc"])
+				var wg := int(extra.get("wg", 0))
+				if wg != 0:
+					return wall_gate_shape(proto_name, wc, wg, entity_pack(extra))
 				return proto_name + "-" + WALL_SHAPES[wc & 15] + ("-fill" if wc & 16 else "")
+		"gate":
+			if gate_model_old and proto_name == "gate":
+				return "gate-old"
 		"cliff":
 			if CLIFF_PIECES.has(str(extra.get("co", ""))):
-				return proto_name + "-" + str(CLIFF_PIECES[str(extra["co"])][0])
+				return cliff_piece(proto_name, str(CLIFF_PIECES[str(extra["co"])][0]))
 		"resource":
 			if ORE_STAGES.has(proto_name) and extra.has("a"):
 				var amount := int(extra["a"])
@@ -815,7 +905,7 @@ const ORE_SPARSE_AT := 5  # "-sparse" under this one's (400; uranium 270)
 ## `straight_horizontal_window`. A pack draws them with `pipe-straight-vertical-window.glb` and
 ## `pipe-straight-horizontal-window.glb`; a pack without them, its plain straight. `--pipe-windows=off`:
 ## no windows.
-static var pipe_windows := not OS.get_cmdline_user_args().has("--pipe-windows=off")
+static var pipe_windows := Switches.on("--pipe-windows")
 static var _windows := {}  # straight's name@pack -> its window's, or the straight's own when the pack has none
 static var _windows_version := -1
 
@@ -836,6 +926,53 @@ static func pipe_window(shape: String, pack := "") -> String:
 		out = shape + "-window"
 	_windows[key] = out
 	return out
+
+
+static var _wall_gates := {}  # proto@pack -> bitmask of gate-wall capabilities (1: -gate-s, 2: -gate-single-s, 4: -gate-ns)
+static var _wall_gates_version := -1
+const _WALL_GATE_DIRS := {1: "n", 2: "e", 4: "s", 8: "w"}
+
+
+## Gate-adjacent wall shape when the pack drawing this wall has capped `<proto>-gate-*` pieces:
+## straight walls abutting one gate use `-gate-{n,e,s,w}`, lone walls abutting one gate use
+## `-gate-single-{n,e,s,w}`, walls between two opposite gates use `-gate-{ns,ew}`, and other
+## gate-touching shapes strip `wg` so no open end faces a gate. Packs without `<proto>-gate-s`
+## keep their usual wall shapes.
+static func wall_gate_shape(proto_name: String, wc: int, wg: int, pack := "") -> String:
+	var shape := proto_name + "-" + str(WALL_SHAPES[wc & 15]) + ("-fill" if wc & 16 else "")
+	if wg == 0 or not ModelPacks.is_ready():
+		return shape
+	if _wall_gates_version != ModelPacks.version:
+		_wall_gates.clear()
+		_wall_gates_version = ModelPacks.version
+	var key := proto_name + ("@" + pack if pack != "" else "")
+	var flags := 0
+	if _wall_gates.has(key):
+		flags = int(_wall_gates[key])
+	else:
+		var from := _drawing_pack_of(proto_name + "-ns" + ("@" + pack if pack != "" else ""))
+		if not from.is_empty():
+			var pid := str(from["id"])
+			if ModelPacks.find_in(pid, proto_name + "-gate-s") != "":
+				flags |= 1
+			if ModelPacks.find_in(pid, proto_name + "-gate-single-s") != "":
+				flags |= 2
+			if ModelPacks.find_in(pid, proto_name + "-gate-ns") != "":
+				flags |= 4
+		_wall_gates[key] = flags
+	if (flags & 1) == 0:
+		return shape
+	var conn := wc & 15
+	if ((conn == 5 and (wg == 1 or wg == 4)) or (conn == 10 and (wg == 2 or wg == 8))) and _WALL_GATE_DIRS.has(wg):
+		return proto_name + "-gate-" + str(_WALL_GATE_DIRS[wg])
+	if conn == wg:
+		if (flags & 2) != 0 and _WALL_GATE_DIRS.has(wg):
+			return proto_name + "-gate-single-" + str(_WALL_GATE_DIRS[wg])
+		if (flags & 4) != 0 and (wg == 5 or wg == 10):
+			return proto_name + "-gate-" + ("ns" if wg == 5 else "ew")
+	var clean := conn & ~wg
+	var fill := (wc & 16) != 0 and (clean & 6) == 6
+	return proto_name + "-" + str(WALL_SHAPES[clean]) + ("-fill" if fill else "")
 
 
 ## The pack in use whose file draws model `name` (`name@pack` too; a family's chosen pack), {} for none.
@@ -878,7 +1015,7 @@ static var _ore_scatter := ""
 
 
 static func _arg_value(prefix: String, fallback: String) -> String:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with(prefix):
 			return arg.substr(prefix.length())
 	return fallback
@@ -1020,7 +1157,7 @@ static func ore_rock_places(fixed: Vector2i, at: Vector3, amount: int, count: in
 ## that needs fluid to mine, uranium ore's sulfuric acid): `<drill>-wet.glb`, drawn over the drill
 ## at its own place while its record's extra.fa has bit 1 (the bridge's alt_mode.lua), if the pack
 ## that draws the drill has it. `--drill-wet=off`: never.
-static var drill_wet := not OS.get_cmdline_user_args().has("--drill-wet=off")
+static var drill_wet := Switches.on("--drill-wet")
 
 
 ## The `-wet` model drawn over a mining drill's record (name@pack), "" for none.
@@ -1045,6 +1182,29 @@ const CLIFF_PIECES := {
 	"west-to-none": ["exit", 0], "north-to-none": ["exit", 4], "east-to-none": ["exit", 8], "south-to-none": ["exit", 12],
 	"none-to-east": ["entrance", 0], "none-to-south": ["entrance", 4], "none-to-west": ["entrance", 8], "none-to-north": ["entrance", 12],
 }
+
+
+## Nauvis's cliff pieces are one fused wall of blocks with variants (`cliff-sides-1`...);
+## `--cliff-pieces=old` draws its first pieces (separate columns on a ridge, `cliff-<piece>-old`,
+## never one of the variants: ModelPacks.variants_in takes only `-<number>`). Other planets' as before.
+## Elevated rails' deck height (tools/models/rails.py ELEVATION) and their track's (the rails sit 0.05
+## under the deck's top): rolling stock rides at ELEVATED_TRACK on them, and up a ramp as its model
+## climbs (world.gd rail_height); signals on elevated rails (extra.el, the bridge's rail_layer) stand
+## at it too. --elevated-trains=old: as before (3 tiles, a straight ramp, no pitch, signals on the ground).
+const ELEVATION := 4.5
+const ELEVATED_TRACK := 4.45
+static var elevated_old := Switches.has("--elevated-trains=old")
+static var cliff_pieces_old := Switches.has("--cliff-pieces=old")
+## The Placeholders gate reads as a gate (dark plates in bold hazard stripes, a frame with warning
+## lights that stays when the door is down, tools/models/railway.py); `--gate-model=old` draws the
+## model it had before (`gate-old`: pale stripes the stone wall's colour).
+static var gate_model_old := Switches.has("--gate-model=old")
+
+
+## The model of cliff `proto_name`'s `piece` (CLIFF_PIECES).
+static func cliff_piece(proto_name: String, piece: String) -> String:
+	var name := proto_name + "-" + piece
+	return name + "-old" if cliff_pieces_old and proto_name == "cliff" else name
 
 
 ## Rail pieces (tools/models/rails.py) come in eight directions (0, 2, ... 14): each has a model
@@ -1146,11 +1306,13 @@ const PLACEMENT_OFFSETS := {
 ## The model's transform for an entity at `at` facing `dir`: turned by turn_dir (as
 ## Visuals.direction_yaw) and moved by its PLACEMENT_OFFSETS, if it has any. `flip` mirrors the build preview.
 static func placed(proto_name: String, proto_type: String, dir: int, extra: Dictionary, at: Vector3, flip := Basis.IDENTITY) -> Transform3D:
-	var basis := Basis(Vector3.UP, -float(turn_dir(proto_type, dir, extra, proto_name)) / 16.0 * TAU)
+	var basis := Basis(Vector3.UP, Wire.direction_yaw(turn_dir(proto_type, dir, extra, proto_name)))
 	var table: Array = PLACEMENT_OFFSETS.get(proto_name, [])
 	if not table.is_empty():
 		var o: Array = table[posmod(dir, table.size())]
 		at += basis * (flip * Vector3(float(o[0]), 0.0, float(o[1])))
+	if extra.has("el") and not elevated_old:
+		at.y += ELEVATED_TRACK  # a signal on elevated rails
 	return Transform3D(basis * flip, at)
 
 
@@ -1233,6 +1395,37 @@ static func parts_for(name: String) -> Array:
 	return _parts.get(name, [])
 
 
+## Highest drawn Y of a loaded model (tiles), including moving parts and arm rigs; -1 if not loaded.
+static func top_for(name: String) -> float:
+	return float(_tops.get(name, -1.0))
+
+
+## Highest drawn Y of an entity record's loaded model (tiles), or -1 when no model is loaded.
+static func top_for_entity(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> float:
+	for name: String in entity_models(proto_name, proto_type, extra, dir):
+		var h := float(_tops.get(name, -1.0))
+		if h > 0.0:
+			return h
+	return -1.0
+
+
+static func _model_top(mesh: Mesh, parts: Array, rig: Dictionary) -> float:
+	var hi := mesh.get_aabb().end.y if mesh != null else -INF
+	for part: AnimPart in parts:
+		if part.mesh == null:
+			continue
+		var pt := part.top if part.top > -1e8 else part.mesh.get_aabb().end.y
+		if part.slide.y > 0.0:
+			pt += part.slide.y
+		hi = maxf(hi, pt)
+	if not rig.is_empty():
+		var shoulder: Vector3 = rig.get("shoulder", Vector3.ZERO)
+		var lengths: Array = rig.get("lengths", [])
+		if not lengths.is_empty():
+			hi = maxf(hi, shoulder.y + float(lengths[0]) + 0.15)
+	return hi if hi > -1e8 else -1.0
+
+
 ## True when some of the mesh's surfaces glow only while the machine works (INSTANCE_CUSTOM.a).
 static func glows(mesh: Mesh) -> bool:
 	return _glowing.has(mesh)
@@ -1276,6 +1469,7 @@ static func _make(name: String) -> Mesh:
 	if draws_sprite(name):
 		_cache[name] = null  # the Factorio pack comes first: its picture's card (chunk_view.gd), no model
 		_parts[name] = []
+		_tops.erase(name)
 		return null
 	var alias := _alias_of(name)
 	if alias != "":
@@ -1285,6 +1479,8 @@ static func _make(name: String) -> Mesh:
 		_parts[name] = _parts.get(alias, [])
 		if _rigs.has(alias):
 			_rigs[name] = _rigs[alias]
+		if _tops.has(alias):
+			_tops[name] = _tops[alias]
 		return drawn
 	var mesh: Mesh = null
 	var parts: Array = []
@@ -1299,6 +1495,8 @@ static func _make(name: String) -> Mesh:
 		mesh = mesh_for(other)
 		_cache[name] = mesh
 		_parts[name] = _parts.get(other, [])
+		if _tops.has(other):
+			_tops[name] = _tops[other]
 		return mesh
 	if root != null or built != null:
 		if built != null:
@@ -1306,7 +1504,8 @@ static func _make(name: String) -> Mesh:
 			if not built.rig.is_empty():
 				_rigs[name] = _commit_rig(built.rig, name)
 		else:
-			mesh = _flatten(root, parts)
+			var scene_path := source.substr(SCENE_SOURCE.length())
+			mesh = _flatten(root, parts, ModelPacks.pbr(scene_path))
 			root.free()
 		# Creatures: a tier is its family's model scaled and tinted; limbs move in the shader.
 		mesh = CreatureModels.prepare(mesh as ArrayMesh, file)
@@ -1322,13 +1521,23 @@ static func _make(name: String) -> Mesh:
 	if mesh != null:
 		_setup_belt(mesh as ArrayMesh, file)
 		NatureLooks.prepare(mesh, file)
+		if is_wet_rock(file):
+			_mark_wet_rock(mesh as ArrayMesh)
 		BurnerFx.prepare(mesh, file)  # a modeller's glowing burner inserter: its coals' heat
 		for i in mesh.get_surface_count():
 			var material := mesh.surface_get_material(i) as ShaderMaterial
-			if material != null and material.get_shader_parameter("activity_glow"):
+			if material == null:
+				continue
+			var rig_mode: Variant = material.get_shader_parameter("rig_mode")
+			if material.get_shader_parameter("activity_glow") or (rig_mode != null and int(rig_mode) == 2):
 				_glowing[mesh] = true
 	_cache[name] = mesh
 	_parts[name] = parts
+	var top := _model_top(mesh, parts, _rigs.get(name, {}))
+	if top > 0.0:
+		_tops[name] = top
+	else:
+		_tops.erase(name)
 	return mesh
 
 
@@ -1378,21 +1587,21 @@ static func _setup_belt(mesh: ArrayMesh, name: String) -> void:
 	edit_materials(mesh, pick, change)
 	# The space under the top run (the return strip, the rollers) is a covered space: shaded in every
 	# material of the model (belt_return.gd cover). A line's end pieces wrap the belt round the roller: none.
-	if name.ends_with("-start") or name.ends_with("-end"):
-		return
-	var all: Array = mesh.get_meta(ModelLods.ARRAYS_META, [])
-	for i in mesh.get_surface_count():
-		var m := mesh.surface_get_material(i) as ShaderMaterial
-		if m == null or i >= all.size() or not m.resource_name.to_lower().contains(BELT_MATERIAL) \
-				or m.get_shader_parameter("use_albedo_tex") != true:
-			continue
-		var cover := BeltReturn.cover(all[i], shape)
-		if cover.w > 0.0:
-			var set_cover := func(mm: ShaderMaterial) -> void:
-				mm.set_shader_parameter("belt_cover", cover)
-				mm.set_shader_parameter("belt_shape", shape)
-			edit_materials(mesh, func(_mm: ShaderMaterial) -> bool: return true, set_cover)
-		break
+	if not (name.ends_with("-start") or name.ends_with("-end")):
+		var all: Array = mesh.get_meta(ModelLods.ARRAYS_META, [])
+		for i in mesh.get_surface_count():
+			var m := mesh.surface_get_material(i) as ShaderMaterial
+			if m == null or i >= all.size() or not m.resource_name.to_lower().contains(BELT_MATERIAL) \
+					or m.get_shader_parameter("use_albedo_tex") != true:
+				continue
+			var cover := BeltReturn.cover(all[i], shape)
+			if cover.w > 0.0:
+				var set_cover := func(mm: ShaderMaterial) -> void:
+					mm.set_shader_parameter("belt_cover", cover)
+					mm.set_shader_parameter("belt_shape", shape)
+				edit_materials(mesh, func(_mm: ShaderMaterial) -> bool: return true, set_cover)
+			break
+	_attach_belt_reactive(mesh)
 
 
 ## How a textured belt surface's UVs change per tile along the belt (a least-squares fit of U and V
@@ -1476,8 +1685,7 @@ static func _tinted(base: ArrayMesh, color: Color) -> ArrayMesh:
 	var change := func(m: ShaderMaterial) -> void:
 		var alpha: Color = m.get_shader_parameter("albedo")
 		m.set_shader_parameter("albedo", Color(color, alpha.a))
-		m.set_shader_parameter("sprite_cells", 0)  # the sprite shows the base tier's colour
-		m.set_shader_parameter("part_colors", false)  # ... and so do the part colours
+		m.set_shader_parameter("part_colors", false)  # the part colours show the base tier's colour
 	edit_materials(out, pick, change)
 	return out
 
@@ -1521,6 +1729,21 @@ const SCENE_SOURCE := "scene:"
 const LOAD_JOBS := 3
 ## Raised while the join's loading screen is up (world.gd set_joining): nothing else is drawn then.
 static var load_jobs := LOAD_JOBS
+## --model-load-mb=<MB>: models read at once hold at most this many MB of .glb files between them (one
+## alone may be larger; a file is held in memory whole while read, with its pictures decoded); 0: no
+## bound, only load_jobs, as before.
+const LOAD_MB := 512
+static var load_bytes := _load_mb() << 20
+static var _pruned_at := 0  # ModelTextures.cache_writes when the disk cache was last pruned
+static var _prune_task := -1  # the disk cache's trim on a worker (waited for once done)
+
+
+## Quit: the disk cache's trim, if one is still on a worker, waited for (files only: it never needs the
+## main thread).
+static func wait_prune() -> void:
+	if _prune_task >= 0:
+		WorkerThreadPool.wait_for_task_completion(_prune_task)
+		_prune_task = -1
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 static var _sources := {}  # name -> GLTF_SOURCE + path, SCENE_SOURCE + path, or ""
 static var _jobs := {}  # name -> [task id (-1 while queued), Load]
@@ -1553,7 +1776,10 @@ class Load:
 	## weathering, no part colours, never merged (pbr-standard step 2), while packs' own shading is on when the model
 	## loads (Looks.packs_shade: a change in Settings reaches them when they next load). --pbr-untextured=off: only
 	## pictured ones, as in 0.2.2 (Zenith's material classes by name for the rest).
-	static var pbr_all := not ("--pbr-untextured=off" in OS.get_cmdline_user_args())
+	static var pbr_all := Switches.on("--pbr-untextured")
+	## --model-read-once=off: Godot's reader, the pictures and a baked animation each read the .glb from
+	## disk again, as before; on, it is read once and handed to all three (model_textures.gd read_glb).
+	static var read_once := Switches.on("--model-read-once")
 	## The format bits of CUSTOM0 and CUSTOM1 (the baked views and part colours).
 	const CUSTOM_KEEP := (Mesh.ARRAY_FORMAT_CUSTOM_MASK << Mesh.ARRAY_FORMAT_CUSTOM_BASE) \
 		| (Mesh.ARRAY_FORMAT_CUSTOM_MASK << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + Mesh.ARRAY_FORMAT_CUSTOM_BITS)) \
@@ -1562,6 +1788,7 @@ class Load:
 	const CUSTOM3_FLAGS := Mesh.ARRAY_CUSTOM_RGBA_FLOAT << (Mesh.ARRAY_FORMAT_CUSTOM_BASE + 3 * Mesh.ARRAY_FORMAT_CUSTOM_BITS)
 	## The model's baked animation, if it has one that moves (model_skin.gd).
 	var bake := {}
+	var baked_tops := {}  # part index -> ModelSkin.peak_y across the action's frames
 	## An inserter's model: a skin rigged as an inserter arm is cut into parts for inserter_arms.gd
 	## (model_rig.gd) instead of drawn whole.
 	var rig_wanted := false
@@ -1584,14 +1811,17 @@ class Load:
 	## A belt-family model: its side plates' open ends are capped (BeltCaps), `caps` of them.
 	var belt_caps := false
 	var caps := 0
+	## A windowed pipe model: hollow single-sided walls get inward faces (PipeInsides).
+	var pipe_insides := false
+	var insides := 0
 
 	func run() -> void:
-		var doc := GLTFDocument.new()
-		var state := GLTFState.new()
-		if doc.append_from_file(path, state) == OK:
-			ModelTextures.prepare(path, state, modeller)
+		var got := read_model(path, modeller)
+		var state: GLTFState = got["state"]
+		if state != null:
 			if not state.get_skins().is_empty() or not state.get_animations().is_empty():
-				bake = ModelSkin.bake(path)
+				bake = ModelSkin.bake(path, got["read"] if read_once else {})
+			got.clear()
 			var nodes := state.get_nodes()
 			var meshes := state.get_meshes()
 			var tools := {}
@@ -1617,6 +1847,15 @@ class Load:
 				for p: Array in parts:
 					for g: Array in p[2]:
 						caps += BeltCaps.cap(g[1])
+			if bake.get("animated", false):
+				for i in parts.size():
+					var p: Array = parts[i]
+					if str(p[0]) == BAKED_NODE:
+						var py := ModelSkin.peak_y(bake, p[2])
+						if py > -1e8:
+							baked_tops[i] = py
+			if pipe_insides:
+				insides = PipeInsides.add_to_groups(groups)
 			returns = BeltReturn.for_groups(groups, belt_shape)
 			contact = ContactShade.feet_of(groups)
 			if contact_wanted and not ContactShade.box_shape:
@@ -1716,6 +1955,45 @@ class Load:
 		return arrays[Mesh.ARRAY_COLOR] != null and (not modeller or arrays[Mesh.ARRAY_TEX_UV2] != null)
 
 	## As ModelLibrary._collect, over the glTF's nodes: `in_parts` false inside a moving part.
+	var _size := -1
+
+	## The size of the model's file (once; poll()'s load_bytes).
+	func file_bytes() -> int:
+		if _size < 0:
+			var f := FileAccess.open(path, FileAccess.READ)
+			_size = f.get_length() if f != null else 0
+		return _size
+
+	## A model's file read by Godot's glTF reader and its textures made ready (model_textures.gd prepare):
+	## {"state": the GLTFState (null when unreadable), "read": the file as read_glb read it ({}: not read
+	## once), "wired": its pictures left out of Godot's reader and put on by Zenith (own_pictures)}.
+	static func read_model(path: String, modeller: bool) -> Dictionary:
+		var read: Dictionary = ModelTextures.read_glb(path) if read_once or ModelTextures.own_pictures else {}
+		var wired := ModelTextures.own_pictures and ModelTextures.can_wire(read)
+		var state := _parse(path, read, wired)
+		if state != null and wired and not ModelTextures.prepare(path, state, modeller, read, true):
+			wired = false  # a picture Zenith can't decode: Godot's reader tries it
+			state = _parse(path, read, false)
+		if state != null and not wired:
+			ModelTextures.prepare(path, state, modeller, read if read_once else {})
+		return {"state": state, "read": read, "wired": wired}
+
+	## The file read by Godot's glTF reader: from `read` (read_glb) when it has it, its pictures left out
+	## when `wired` (model_textures.gd strip_pictures); null when it can't be read.
+	static func _parse(path: String, read: Dictionary, wired: bool) -> GLTFState:
+		var doc := GLTFDocument.new()
+		var state := GLTFState.new()
+		var err := FAILED
+		if wired:
+			state.handle_binary_image = GLTFState.HANDLE_BINARY_DISCARD_TEXTURES
+			var bytes := ModelTextures.strip_pictures(read)
+			err = doc.append_from_buffer(bytes, path.get_base_dir(), state) if not bytes.is_empty() else FAILED
+		elif not read.is_empty() and read_once:
+			err = doc.append_from_buffer(read["bytes"], path.get_base_dir(), state)
+		else:
+			err = doc.append_from_file(path, state)
+		return state if err == OK else null
+
 	func _walk(nodes: Array, meshes: Array, i: int, parent: Transform3D, tools: Dictionary, order: Array, in_parts: bool, glow: String) -> void:
 		var node: GLTFNode = nodes[i]
 		var xform := parent * node.xform
@@ -1741,10 +2019,12 @@ class Load:
 				var material: Material = mesh.get_surface_material(k)
 				if k < overrides.size() and overrides[k] != null:
 					material = overrides[k]
-				# A modeller's own textured material keeps its own look (no weathering), marked before the roller, rig
+				# A modeller's or "pbr" pack's material keeps its own look (no weathering), marked before the roller, rig
 				# and baked-split paths below can move every triangle of it into a part and skip the rest. A "pbr"
-				# pack's every material, a picture or not: its file is the whole look (pbr-standard step 2).
-				if modeller and material is BaseMaterial3D and ((material as BaseMaterial3D).albedo_texture != null or (pbr and pbr_all and Looks.packs_shade)):
+				# pack's every non-leaf material, a picture or not: its file is the whole look (pbr-standard step 2).
+				var has_part_colors := arrays[Mesh.ARRAY_CUSTOM1] != null
+				if material is BaseMaterial3D and (modeller or (pbr and not is_leaf_name((material as BaseMaterial3D).resource_name))) \
+						and ((material as BaseMaterial3D).albedo_texture != null or (pbr and pbr_all and Looks.packs_shade and not has_part_colors)):
 					material.set_meta(OWN_LOOK_META, true)
 					if pbr:
 						material.set_meta(PACK_PBR_META, true)
@@ -2030,7 +2310,12 @@ static func _source(name: String) -> String:
 	if name.contains("@"):
 		path = ModelPacks.find_in(name.get_slice("@", 1), file)
 	else:
-		path = ModelPacks.find(file, true)
+		var fam := ModelPacks.family(file)
+		var override_pack := str(addon_pack_overrides.get(fam, ""))
+		if override_pack != "" and ModelPacks.choice(fam) == "" and ModelPacks.choice(file_of(name)) == "":
+			path = ModelPacks.find_in(override_pack, file)
+		if path == "":
+			path = ModelPacks.find(file, true)
 		if path == "":
 			path = ModelPacks.find(file, false)
 	var found := ""
@@ -2136,7 +2421,7 @@ static func entity_models(proto_name: String, proto_type: String, extra: Diction
 ## drawn at random, the same for a placed entity every time: its record's VARIANT_KEY (world.gd, a hash
 ## of its position: ModelPacks.variant_seed) picks one of those the pack that draws it has (variant_pack;
 ## its building's own pack for `name@pack`). `--model-variants=off`: always the plain model, as before.
-static var model_variants := not OS.get_cmdline_user_args().has("--model-variants=off")
+static var model_variants := Switches.on("--model-variants")
 ## The extra key of a record's variant seed. Client only (world.gd, predicted.gd set it).
 const VARIANT_KEY := "zv"
 static var _variants := {}  # name (name@pack) -> its variants as name@pack, [] for none or the plain alone
@@ -2172,11 +2457,14 @@ static func variants_of(name: String) -> Array:
 	return out
 
 
-## The packs' choices changed (ModelPacks.set_choices): the models of the families in `families`
-## (all with an empty list) are found and made again; true when any was made already, so whatever
-## drew them must be drawn again. Jobs reading them are waited for first (it is the player's click).
-static func choices_changed(families: Array) -> bool:
+## The packs' choices or PBR overrides changed (ModelPacks.set_choices / set_pbr_overrides): the
+## models of the families in `families` (all with an empty list) are found and made again; true when
+## any was made already, so whatever drew them must be drawn again. `pack_id` (when non-empty, or "*")
+## also clears `name@pack` entries matching that pack (all `@pack` entries for "*"). Jobs reading them
+## are waited for first (it is the player's click).
+static func choices_changed(families: Array, pack_id := "") -> bool:
 	var all := families.is_empty()
+	var target_pack := "" if pack_id == "" else ("*" if pack_id == "*" else ModelPacks.canonical_id(pack_id))
 	var wanted := {}
 	for f in families:
 		wanted[str(f)] = true
@@ -2184,7 +2472,7 @@ static func choices_changed(families: Array) -> bool:
 		if all:
 			return true
 		var file := file_of(name)
-		for drawn in [file, _tier_base(file), str(MODEL_ALIASES.get(file, ""))]:
+		for drawn in [file, CreatureModels.base_model(file), _tier_base(file), str(MODEL_ALIASES.get(file, ""))]:
 			if drawn != "" and wanted.has(ModelPacks.family(drawn)):
 				return true
 		return false
@@ -2197,7 +2485,8 @@ static func choices_changed(families: Array) -> bool:
 		if not touched.call(name):
 			continue
 		if name.contains("@") and _pack_draws(name.get_slice("@", 1), file_of(name)):
-			continue  # a pack's own model, asked of it by name: no choice changes it
+			if target_pack == "" or (target_pack != "*" and ModelPacks.canonical_id(name.get_slice("@", 1)) != target_pack):
+				continue  # a pack's own model, asked of it by name: no choice changes it
 		if _jobs.has(name):
 			var entry: Array = _jobs[name]
 			if int(entry[0]) >= 0:
@@ -2210,11 +2499,19 @@ static func choices_changed(families: Array) -> bool:
 		_cache.erase(name)
 		_parts.erase(name)
 		_rigs.erase(name)
+		_tops.erase(name)
 		if not _remnant_jobs.has(name):
 			_remnant_cache.erase(name)  # its wreck, broken from the model it was (one being broken finishes as it is)
 	if hit:
 		generation += 1
 	return hit
+
+
+static func _load_mb() -> int:
+	for a: String in Switches.args():
+		if a.begins_with("--model-load-mb="):
+			return maxi(0, a.trim_prefix("--model-load-mb=").to_int())
+	return LOAD_MB
 
 
 ## True when the model of `name` (or the knowledge that there is none) is ready: mesh_for() then
@@ -2242,10 +2539,11 @@ static func ready(name: String) -> bool:
 			load.path = source.substr(GLTF_SOURCE.length())
 			load.combine = merge_materials
 			load.modeller = ModelPacks.owns(load.path)
-			load.pbr = load.modeller and ModelPacks.pbr(load.path)
+			load.pbr = ModelPacks.pbr(load.path)
 			load.rig_wanted = rig_name(file)
 			load.belt_shape = BeltReturn.shape_for(file)
 			load.belt_caps = BeltCaps.wanted(file)
+			load.pipe_insides = PipeInsides.wanted(file)
 			load.contact_wanted = ContactShade.mask_wanted(file)
 			load.contact_joins = ContactShade.join_wanted(file)
 			_jobs[name] = [-1, load]
@@ -2298,13 +2596,23 @@ static func poll() -> bool:
 		var entry: Array = _jobs[name]
 		if int(entry[0]) >= 0:
 			running += 1
+	var held := 0  # bytes of .glb files being read (load_bytes)
+	if load_bytes > 0:
+		for name in _job_order:
+			var entry: Array = _jobs[name]
+			if int(entry[0]) >= 0 and not WorkerThreadPool.is_task_completed(entry[0]):
+				held += (entry[1] as Load).file_bytes()
 	for name in _job_order:
 		if running >= load_jobs:
 			break
 		var entry: Array = _jobs[name]
 		if int(entry[0]) < 0:
+			var size := (entry[1] as Load).file_bytes() if load_bytes > 0 else 0
+			if held > 0 and held + size > load_bytes:
+				break  # in order: a big model isn't passed by small ones for ever
 			entry[0] = WorkerThreadPool.add_task((entry[1] as Load).run, false, "model " + name)
 			running += 1
+			held += size
 	var start := Time.get_ticks_usec()
 	var made := 0
 	var done := 0  # jobs finished on their worker, waiting to be made here
@@ -2313,6 +2621,13 @@ static func poll() -> bool:
 		if int(entry[0]) >= 0 and WorkerThreadPool.is_task_completed(entry[0]):
 			done += 1
 	if done == 0 and _remnant_jobs.is_empty():
+		if _prune_task >= 0 and WorkerThreadPool.is_task_completed(_prune_task):
+			WorkerThreadPool.wait_for_task_completion(_prune_task)
+			_prune_task = -1
+		if _job_order.is_empty() and ModelTextures.cache_writes != _pruned_at and _prune_task < 0:
+			# Pictures were added to the disk cache: its oldest go past its size, off this thread.
+			_pruned_at = ModelTextures.cache_writes
+			_prune_task = WorkerThreadPool.add_task(ModelTextures.prune_cache.bind(ModelTextures.CACHE_BYTES), false, "model picture cache")
 		FrameBudget.waiting(&"models", 0)
 		return packs_in
 	var allow := FrameBudget.grant(&"models")
@@ -2355,10 +2670,11 @@ static func _built(name: String) -> Load:
 		load.path = _source(name).substr(GLTF_SOURCE.length())
 		load.combine = merge_materials
 		load.modeller = ModelPacks.owns(load.path)
-		load.pbr = load.modeller and ModelPacks.pbr(load.path)
+		load.pbr = ModelPacks.pbr(load.path)
 		load.rig_wanted = rig_name(file_of(name))
 		load.belt_shape = BeltReturn.shape_for(file_of(name))
 		load.belt_caps = BeltCaps.wanted(file_of(name))
+		load.pipe_insides = PipeInsides.wanted(file_of(name))
 		load.contact_wanted = ContactShade.mask_wanted(file_of(name))
 		load.contact_joins = ContactShade.join_wanted(file_of(name))
 		_parsed_here = true
@@ -2375,13 +2691,20 @@ static func _commit_load(load: Load, parts: Array) -> Mesh:
 			mesh.set_meta(ContactShade.MASK_META, ContactShade.commit_mask(load.contact_mask))
 		if load.caps > 0:
 			mesh.set_meta(BeltCaps.META, load.caps)
-	for p: Array in load.parts:
+		if load.insides > 0:
+			mesh.set_meta(PipeInsides.META, load.insides)
+	for i in load.parts.size():
+		var p: Array = load.parts[i]
 		var part := _new_part(str(p[0]), p[1])
 		part.mesh = _commit_groups(p[2])
+		if part.mesh != null:
+			part.top = part.mesh.get_aabb().end.y
 		if part.kind == "baked":
 			part.roller = p.size() > 3 and bool(p[3])
 			part.bake = load.bake
 			part.pivot = Transform3D.IDENTITY
+			if load.baked_tops.has(i):
+				part.top = maxf(part.top, float(load.baked_tops[i]))
 			if part.mesh is ArrayMesh:
 				(part.mesh as ArrayMesh).custom_aabb = ModelSkin.box_of(load.bake, part.mesh.get_aabb()).grow(0.05)
 		if part.mesh != null:
@@ -2443,10 +2766,10 @@ static func _load_scene(res_path: String) -> Node:
 ## Merges every MeshInstance3D under `root` into one ArrayMesh, one surface per material.
 ## Skeletons and animations are dropped: this is for static, instanced drawing. Moving parts
 ## (`anim_*` nodes other than `anim_glow_*`) are left out and flattened on their own into `parts`.
-static func _flatten(root: Node, parts: Array) -> Mesh:
+static func _flatten(root: Node, parts: Array, pbr := false) -> Mesh:
 	var tools := {}  # Material (or null) -> SurfaceTool
 	var order: Array = []
-	_collect(root, Transform3D.IDENTITY, tools, order, parts, "")
+	_collect(root, Transform3D.IDENTITY, tools, order, parts, "", pbr)
 	var mesh := _commit(tools, order)
 	return mesh
 
@@ -2464,7 +2787,7 @@ static func _commit(tools: Dictionary, order: Array) -> ArrayMesh:
 
 ## `parts` collects moving parts; null inside a moving part (nested ones turn with it). `glow`
 ## is the style of the `anim_glow_*` node it is under ("on" for a plain one), "" outside one.
-static func _collect(node: Node, parent: Transform3D, tools: Dictionary, order: Array, parts, glow: String) -> void:
+static func _collect(node: Node, parent: Transform3D, tools: Dictionary, order: Array, parts, glow: String, pbr := false) -> void:
 	var xform := parent
 	if node is Node3D:
 		xform = parent * (node as Node3D).transform
@@ -2477,9 +2800,10 @@ static func _collect(node: Node, parent: Transform3D, tools: Dictionary, order: 
 		var part := _new_part(node_name, xform)
 		var part_tools := {}
 		var part_order: Array = []
-		_collect(node, parent, part_tools, part_order, null, glow)
+		_collect(node, parent, part_tools, part_order, null, glow, pbr)
 		part.mesh = _commit(part_tools, part_order)
 		if part.mesh != null:
+			part.top = part.mesh.get_aabb().end.y
 			parts.append(part)
 		return
 	if node is MeshInstance3D:
@@ -2487,9 +2811,17 @@ static func _collect(node: Node, parent: Transform3D, tools: Dictionary, order: 
 		if mi.mesh != null:
 			for i in mi.mesh.get_surface_count():
 				var format := int(mi.mesh.surface_get_format(i))
-				var material := _factorio(mi.get_active_material(i), (format & Mesh.ARRAY_FORMAT_COLOR) != 0,
+				var has_part_colors := (format & Mesh.ARRAY_FORMAT_CUSTOM1) != 0
+				var base_mat := mi.get_active_material(i)
+				if pbr and base_mat is BaseMaterial3D and not Load.is_leaf_name(base_mat.resource_name) \
+						and ((base_mat as BaseMaterial3D).albedo_texture != null or (Load.pbr_all and Looks.packs_shade and not has_part_colors)):
+					if not base_mat.has_meta(PACK_PBR_META):
+						base_mat = base_mat.duplicate()
+						base_mat.set_meta(OWN_LOOK_META, true)
+						base_mat.set_meta(PACK_PBR_META, true)
+				var material := _factorio(base_mat, (format & Mesh.ARRAY_FORMAT_COLOR) != 0,
 					(format & Mesh.ARRAY_FORMAT_TEX_UV2) != 0, (format & Mesh.ARRAY_FORMAT_CUSTOM0) != 0, glow,
-					(format & Mesh.ARRAY_FORMAT_CUSTOM1) != 0)
+					has_part_colors)
 				if not tools.has(material):
 					var st := SurfaceTool.new()
 					st.begin(Mesh.PRIMITIVE_TRIANGLES)
@@ -2498,7 +2830,7 @@ static func _collect(node: Node, parent: Transform3D, tools: Dictionary, order: 
 				var tool: SurfaceTool = tools[material]
 				tool.append_from(mi.mesh, i, xform)
 	for child in node.get_children():
-		_collect(child, xform, tools, order, parts, glow)
+		_collect(child, xform, tools, order, parts, glow, pbr)
 
 
 ## The shader's occlusion_channel for BaseMaterial3D.TextureChannel (red, green, blue, alpha, grey).
@@ -2508,7 +2840,7 @@ const OCCLUSION_CHANNELS := [Vector4(1, 0, 0, 0), Vector4(0, 1, 0, 0), Vector4(0
 
 ## --idle-dims-glow-paint=on: a modeller's glowing material's base colour dims to 30% at rest too, as
 ## before 0.2.2 (only one without an emission picture did).
-static var glow_keeps_albedo := not ("--idle-dims-glow-paint=on" in OS.get_cmdline_user_args())
+static var glow_keeps_albedo := not (Switches.has("--idle-dims-glow-paint=on"))
 ## Marks a modeller's textured material (Load, from the models folder): drawn with its textures only.
 const OWN_LOOK_META := "f3d_own_look"
 ## And one whose pack says "shading": "pbr": drawn as its file says (the shader's modeller_tex, while
@@ -2556,6 +2888,34 @@ static func anim_kind(node_name: String) -> String:
 	return Load.kind(node_name)
 
 
+## Models wet like rough stone in the rain (factorio_material.gdshaderinc wet_rock): cliffs, rocks
+## (huge-rock, big-sand-rock, the volcanic ones...) and the ores' rocks, by model name ("@pack" off).
+static func is_wet_rock(file: String) -> bool:
+	if file.begins_with("cliff") or (file.contains("rock") and not file.contains("rocket")):
+		return true
+	var base := file
+	for tail in ["-rich", "-sparse"]:
+		if base.ends_with(tail):
+			base = base.trim_suffix(tail)
+	var dash := base.rfind("-")
+	if dash > 0 and base.substr(dash + 1).is_valid_int():
+		base = base.substr(0, dash)
+	return ORE_STAGES.has(base)
+
+
+## Every material of a freshly made rock model marked wet_rock (once, as it loads).
+static func _mark_wet_rock(mesh: ArrayMesh) -> void:
+	if mesh == null:
+		return
+	var pick := func(m: ShaderMaterial) -> bool: return m.get_shader_parameter("wet_rock") != true
+	var give := func(m: ShaderMaterial) -> void: m.set_shader_parameter("wet_rock", true)
+	for i in mesh.get_surface_count():
+		var material := mesh.surface_get_material(i)
+		var edited := MaterialRows.edit(material, pick, give)
+		if edited != material:
+			mesh.surface_set_material(i, edited)
+
+
 ## The Factorio material for an imported one: same colour, roughness, metallic and emission,
 ## weathered by its material class. Shared by every surface with the same material and data.
 ## Emissive materials, and anything under an `anim_glow_*` node (`glow`), light up only while
@@ -2598,6 +2958,12 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 	# Cliffs' rock sits on the low ground when there are hills (ground_height.gd).
 	if name.begins_with("cliff-"):
 		out.set_shader_parameter("ground_low", true)
+	# Cliffs' and ore's rock: wet like rough stone in the rain (weather_surface.gdshaderinc, --wet-rock=old).
+	if name.begins_with("cliff-") or ore_rock:
+		out.set_shader_parameter("wet_rock", true)
+	var org_kind := organic_surface_kind(name, base != null and base.emission_enabled)
+	if org_kind > 0:
+		out.set_shader_parameter("organic_surface", org_kind)
 	if base != null:
 		out.set_shader_parameter("albedo", base.albedo_color)
 		out.set_shader_parameter("roughness", base.roughness)
@@ -2662,7 +3028,8 @@ static func _factorio(material: Material, has_color: bool, has_uv2: bool, has_vi
 	var params: Dictionary = CLASS_PARAMS[material_class(name, base != null and base.emission_enabled)]
 	for param in params:
 		out.set_shader_parameter(param, params[param])
-	if base != null and base.has_meta(OWN_LOOK_META):
+	var own_look := base != null and base.has_meta(OWN_LOOK_META) and (base.albedo_texture != null or not has_parts)
+	if own_look:
 		# A modeller's textured material: its own wear and dirt are in its textures. Zenith's laid on
 		# top would sit still in model space while a belt's texture runs under it, and muddy the paint.
 		for param in OWN_LOOK:
@@ -2686,6 +3053,20 @@ static func material_class(material_name: String, emissive := false) -> String:
 		if lower.contains(str(entry[0])):
 			return str(entry[1])
 	return "paint"
+
+
+## Organic surface kind for procedural micro-bump and rain wetness: 0 none, 1 flesh/hide, 2 chitin/shell.
+static func organic_surface_kind(material_name: String, emissive := false) -> int:
+	if emissive:
+		return 0
+	var lower := material_name.to_lower()
+	if lower.contains("eye") or lower.begins_with("cliff-"):
+		return 0
+	if lower.contains("chitin") or lower.contains("horn_"):
+		return 2
+	if material_class(material_name, false) == "organic":
+		return 1
+	return 0
 
 
 ## True for prototypes that are never drawn (HIDDEN_PROTOS, "dummy-...").
@@ -2845,8 +3226,6 @@ static func _burnt(material: Material) -> Material:
 	if _factorio_cache.has(key):
 		return _factorio_cache[key]
 	var burn := func(b: ShaderMaterial) -> void:
-		b.set_shader_parameter("sprite_cells", 0)
-		b.set_shader_parameter("depth_on", false)
 		b.set_shader_parameter("activity_glow", false)
 		b.set_shader_parameter("animated", false)
 		b.set_shader_parameter("emission_energy", 0.0)

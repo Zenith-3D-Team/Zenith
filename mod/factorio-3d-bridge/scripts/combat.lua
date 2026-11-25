@@ -19,6 +19,9 @@ local HEALTH_INTERVAL = 10
 local GUNS_INTERVAL = 10
 local PAIRS_PER_MESSAGE = 400
 local HIT_FX_TICKS = 3     -- at most one `afx` per unit this often
+local ATTACK_TICKS = 20    -- at most one `atk` per attacking unit this often (a biter bites every 35)
+local ATTACK_KEEP = 600    -- `atk` times older than this are dropped once the table holds ATTACK_PRUNE
+local ATTACK_PRUNE = 256
 
 -- Within the live-update square around the client's camera.
 local function near_focus(entity)
@@ -157,24 +160,271 @@ end
 ---------------------------------------------------------------------------------------------
 -- Events
 
+-- Damage cues are also used for creature blood, fire hits and ground scorch/fire marks.
+-- Keep these sparse and local; the client pools their sprite cards.
+local function is_valid_entity(obj)
+  if not obj then return false end
+  local ok, valid = pcall(function() return obj.valid end)
+  return ok and valid == true
+end
+
+local function cause_position(event)
+  local attacker = nil
+  local ok_c, cause = pcall(function() return event.cause end)
+  if ok_c and is_valid_entity(cause) then
+    attacker = cause
+  else
+    local ok_s, source = pcall(function() return event.source end)
+    if ok_s and is_valid_entity(source) then
+      attacker = source
+    end
+  end
+  if attacker then
+    local ok_p, pos = pcall(function() return attacker.position end)
+    if ok_p and pos then
+      local ok_x, x = pcall(function() return pos.x or pos[1] end)
+      local ok_y, y = pcall(function() return pos.y or pos[2] end)
+      if ok_x and ok_y and type(x) == "number" and type(y) == "number" then
+        return world.fixed(x), world.fixed(y)
+      end
+    end
+  end
+  return nil, nil
+end
+
+local function damage_type_name(event)
+  local ok_dt, dt = pcall(function() return event.damage_type end)
+  if ok_dt and dt then
+    local ok_name, name = pcall(function() return dt.name end)
+    if ok_name and type(name) == "string" and name ~= "" then
+      return name
+    end
+  end
+  return nil
+end
+
+local function entity_max_health(e)
+  local ok_mh, mh = pcall(function() return e.max_health end)
+  if ok_mh and type(mh) == "number" and mh > 0 then
+    return mh
+  end
+  local ok_p, proto = pcall(function() return e.prototype end)
+  if ok_p and proto then
+    local ok_pmh, pmh = pcall(function() return proto.max_health end)
+    if ok_pmh and type(pmh) == "number" and pmh > 0 then
+      return pmh
+    end
+  end
+  return nil
+end
+
+local function damage_amount(event, e)
+  local ok_fd, fd = pcall(function() return event.final_damage_amount end)
+  if not (ok_fd and type(fd) == "number" and fd >= 0) then
+    return nil
+  end
+  local mh = entity_max_health(e)
+  if mh and mh > 0 then
+    return math.max(0, math.floor(fd / mh * 1000 + 0.5))
+  end
+  return nil
+end
+
+local function remaining_health(e)
+  local ok_h, h = pcall(function() return e.health end)
+  if not (ok_h and type(h) == "number") then
+    return nil
+  end
+  local mh = entity_max_health(e)
+  if mh and mh > 0 then
+    return math.max(0, math.min(1000, math.floor(h / mh * 1000 + 0.5)))
+  end
+  return nil
+end
+
+local function source_name(event)
+  local ok_s, source = pcall(function() return event.source end)
+  if ok_s and is_valid_entity(source) then
+    local ok_n, n = pcall(function() return source.name end)
+    if ok_n and type(n) == "string" and n ~= "" then
+      return n
+    end
+  end
+  return nil
+end
+
+local function died_source_name(event)
+  local ok_c, cause = pcall(function() return event.cause end)
+  if ok_c and is_valid_entity(cause) then
+    local ok_n, n = pcall(function() return cause.name end)
+    if ok_n and type(n) == "string" and n ~= "" then
+      return n
+    end
+  end
+  local ok_s, source = pcall(function() return event.source end)
+  if ok_s and is_valid_entity(source) then
+    local ok_n, n = pcall(function() return source.name end)
+    if ok_n and type(n) == "string" and n ~= "" then
+      return n
+    end
+  end
+  return nil
+end
+
+local function is_enemy_turret(e)
+  local ok_t, t = pcall(function() return e.type end)
+  if not (ok_t and t == "turret") then
+    return false
+  end
+  local ok_f, f = pcall(function() return e.force end)
+  if ok_f and f then
+    local ok_fn, fname = pcall(function() return f.name end)
+    if ok_fn and fname == "enemy" then
+      return true
+    end
+  end
+  local ok_n, n = pcall(function() return e.name end)
+  if ok_n and type(n) == "string" and string.find(n, "worm", 1, true) ~= nil then
+    return true
+  end
+  return false
+end
+
+local function is_damage_fx_target(e)
+  local ok_t, t = pcall(function() return e.type end)
+  if not (ok_t and type(t) == "string") then
+    return false
+  end
+  if t == "unit" or t == "spider-unit" or t == "character" or t == "unit-spawner" then
+    return true
+  end
+  return is_enemy_turret(e)
+end
+
+local function should_cache_last_hit(e)
+  local ok_t, t = pcall(function() return e.type end)
+  if not (ok_t and type(t) == "string") then
+    return false
+  end
+  if t == "unit" or t == "spider-unit" or t == "unit-spawner" then
+    return true
+  end
+  return is_enemy_turret(e)
+end
+
+-- `atk`: an enemy unit's own attack landed (a biter's bite on anything: a building, a wall, the
+-- character), so the client can play its attack roar (Factorio's attack_parameters.sound). Only melee:
+-- the unit is the damage's source as well as its cause (a spitter's acid comes from its stream, whose
+-- start the client hears from `pj`). Near the focus, at most once per ATTACK_TICKS per attacker.
+local function attack_cue(event)
+  local ok_c, cause = pcall(function() return event.cause end)
+  if not (ok_c and is_valid_entity(cause)) then
+    return
+  end
+  local ok_t, t = pcall(function() return cause.type end)
+  if not (ok_t and t == "unit") then
+    return
+  end
+  local ok_s, source = pcall(function() return event.source end)
+  if ok_s and is_valid_entity(source) then
+    local ok_st, st = pcall(function() return source.type end)
+    if not (ok_st and st == "unit") then
+      return
+    end
+  end
+  if not near_focus(cause) then
+    return
+  end
+  local ok_u, un = pcall(function() return cause.unit_number end)
+  if not (ok_u and un) then
+    return
+  end
+  local s = storage.f3d
+  local ticks = s.attack_ticks
+  if not ticks then
+    ticks = {}
+    s.attack_ticks = ticks
+    s.attack_count = 0
+  end
+  local last = ticks[un]
+  if last and game.tick - last < ATTACK_TICKS then
+    return
+  end
+  if not last then
+    s.attack_count = (s.attack_count or 0) + 1
+    if s.attack_count > ATTACK_PRUNE then
+      local n = 0
+      for k, v in pairs(ticks) do
+        if game.tick - v > ATTACK_KEEP then
+          ticks[k] = nil
+        else
+          n = n + 1
+        end
+      end
+      s.attack_count = n + 1
+    end
+  end
+  ticks[un] = game.tick
+  local p = cause.position
+  transport.send_now({ t = "atk", u = un, p = registry.entity_id(cause.name), x = world.fixed(p.x), y = world.fixed(p.y) })
+end
+
 function M.on_damaged(event)
   alerts.on_damaged(event)
   local e = event.entity
   turrets.on_hit(event)
+  attack_cue(event)
   -- Damage cues are also used for creature blood, fire hits and ground scorch/fire marks.
   -- Keep these sparse and local; the client pools their sprite cards.
-  if e.valid and near_focus(e) and (e.type == "unit" or e.type == "spider-unit" or e.type == "character") then
+  if e.valid and near_focus(e) and is_damage_fx_target(e) then
     local p = e.position
-    local source = event.source
-    local source_name = source and source.valid and source.name or ""
-    local burning = source and source.valid and (source.type == "fire" or string.find(source_name, "flame", 1, true) ~= nil)
+    local dmg = damage_amount(event, e)
+    local hp = remaining_health(e)
+    local src = source_name(event)
+    if e.unit_number and should_cache_last_hit(e) then
+      local s = storage.f3d
+      s.last_hit = s.last_hit or {}
+      s.last_hit[e.unit_number] = { tick = game.tick, dmg = dmg, src = src }
+    end
+    local ok_s, source = pcall(function() return event.source end)
+    source = (ok_s and is_valid_entity(source)) and source or nil
+    local source_name_str = ""
+    local source_type = ""
+    if source then
+      pcall(function() source_name_str = source.name or "" end)
+      pcall(function() source_type = source.type or "" end)
+    end
+    local burning = source_type == "fire" or string.find(source_name_str, "flame", 1, true) ~= nil
     local s = storage.f3d
     s.hit_fx_ticks = s.hit_fx_ticks or {}
     local hit_key = e.unit_number or ("character:" .. math.floor(p.x) .. ":" .. math.floor(p.y))
     if game.tick - (s.hit_fx_ticks[hit_key] or -HIT_FX_TICKS) >= HIT_FX_TICKS then
       s.hit_fx_ticks[hit_key] = game.tick
-      transport.send_now({ t = "afx", fx = burning and "burn" or "blood", u = e.unit_number or 0,
-        x = world.fixed(p.x), y = world.fixed(p.y) })
+      local msg = {
+        t = "afx",
+        fx = burning and "burn" or "blood",
+        u = e.unit_number or 0,
+        x = world.fixed(p.x),
+        y = world.fixed(p.y),
+      }
+      local cx, cy = cause_position(event)
+      if cx and cy then
+        msg.cx, msg.cy = cx, cy
+      end
+      local dt = damage_type_name(event)
+      if dt then
+        msg.dt = dt
+      end
+      if dmg ~= nil then
+        msg.dmg = dmg
+      end
+      if hp ~= nil then
+        msg.hp = hp
+      end
+      if src ~= nil then
+        msg.src = src
+      end
+      transport.send_now(msg)
     end
   end
   if e.valid and e.unit_number and near_focus(e) then
@@ -189,22 +439,54 @@ function M.on_died(event)
     puppet.on_died(e)
   end
   tracker.removed(e)
+  local lh = nil
   if e.unit_number then
     storage.f3d.damaged[e.unit_number] = nil
     if storage.f3d.hit_fx_ticks then
       storage.f3d.hit_fx_ticks[e.unit_number] = nil
     end
+    if storage.f3d.attack_ticks and storage.f3d.attack_ticks[e.unit_number] then
+      storage.f3d.attack_ticks[e.unit_number] = nil
+      storage.f3d.attack_count = math.max(0, (storage.f3d.attack_count or 1) - 1)
+    end
+    if storage.f3d.last_hit then
+      lh = storage.f3d.last_hit[e.unit_number]
+      storage.f3d.last_hit[e.unit_number] = nil
+    end
     turrets.on_removed(e.unit_number)
   end
   if near_focus(e) then
     local p = e.position
-    transport.send_now({
+    local msg = {
       t = "died",
       u = e.unit_number or 0,
       p = registry.entity_id(e.name),
       x = world.fixed(p.x),
       y = world.fixed(p.y),
-    })
+    }
+    local cx, cy = cause_position(event)
+    if cx and cy then
+      msg.cx, msg.cy = cx, cy
+    end
+    local dt = damage_type_name(event)
+    if dt then
+      msg.dt = dt
+    end
+    local src = died_source_name(event)
+    local dmg = nil
+    if lh and (game.tick - lh.tick <= 2) then
+      dmg = lh.dmg
+      if not src then
+        src = lh.src
+      end
+    end
+    if dmg ~= nil then
+      msg.dmg = dmg
+    end
+    if src ~= nil then
+      msg.src = src
+    end
+    transport.send_now(msg)
   end
 end
 
@@ -355,7 +637,7 @@ local function send_guns(c, s)
     local sig = "v" .. tostring(v.unit_number) .. ":" .. sel .. ":" .. table.concat(parts, ",")
     if sig ~= s.guns_sig then
       s.guns_sig = sig
-      transport.send_reliable({ t = "guns", sel = sel, l = list, v = v.unit_number or 0 })
+      transport.send_reliable_priority({ t = "guns", sel = sel, l = list, v = v.unit_number or 0 })
     end
     return
   end
@@ -384,7 +666,7 @@ local function send_guns(c, s)
   local sig = sel .. ":" .. table.concat(parts, ",")
   if sig ~= s.guns_sig then
     s.guns_sig = sig
-    transport.send_reliable({ t = "guns", sel = sel, l = list })
+    transport.send_reliable_priority({ t = "guns", sel = sel, l = list })
   end
 end
 
@@ -430,6 +712,11 @@ function M.tick()
         s.hit_fx_ticks[key] = nil
       end
     end
+    for u, lh in pairs(s.last_hit or {}) do
+      if game.tick - lh.tick > 2 then
+        s.last_hit[u] = nil
+      end
+    end
   end
 end
 
@@ -440,6 +727,9 @@ function M.reset()
   s.guns_sig = nil
   s.damaged = {}
   s.hit_fx_ticks = nil
+  s.last_hit = nil
+  s.attack_ticks = nil
+  s.attack_count = nil
   local c = s.puppet
   if s.shot and c and c.valid then
     c.shooting_state = { state = defines.shooting.not_shooting, position = c.position }

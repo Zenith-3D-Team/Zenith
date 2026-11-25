@@ -24,7 +24,15 @@
 -- - Worms are turrets, which see the player-less character on their own (the diagnostic: shot from 21.5 tiles,
 --   their range), as for a real player; nothing done for them.
 -- With a real player (hybrid single-player, an L13 claimed player) the engine does it and this does nothing.
--- In a vehicle nothing is done (a real player's in a vehicle wasn't measured; never more than Factorio would).
+-- - In a vehicle: a real player driving or riding a car, tank or spidertron near a nest wakes it and the biters
+--   attack the vehicle (the engine's targets are military targets, and the vehicle is the one in reach; the
+--   character inside can't be hit). So for the player-less character in such a vehicle the same vision, nest
+--   wake, holds and chase are counted from the vehicle and the command's target is the vehicle; on getting in or
+--   out, the units this woke whose distraction was on the old target are given the new one (the chase rule for
+--   that pass). Trains (locomotives, wagons) are not military targets in Factorio's prototypes and biters don't
+--   go for a train going by, so nothing is done for a character in one (nor anything for a vehicle that is not a
+--   military target, not destructible, or that a real player shares: the engine sees that one). Switch
+--   /f3d-perf enemy_sight_vehicle (on); off: nothing done in any vehicle, as before.
 --
 -- Switch: /f3d-perf enemy_sight (perf.lua); off: nothing done, as before.
 --
@@ -134,23 +142,44 @@ local function read(obj, key)
   return nil
 end
 
--- Whether a real player's character here could be sighted at all.
-local function sightable(c)
-  if not (c and c.valid) or puppet.player_of(c) then
+local function hittable(e)
+  return read(e, "destructible") ~= false and (read(e, "health") or 1) > 0
+end
+
+-- Whether a seat's occupant (a character, or a LuaPlayer) has a real player.
+local function real_occupant(o, c)
+  if not o or o == c then
     return false
   end
-  if read(c, "destructible") == false or (read(c, "health") or 1) <= 0 then
-    return false
-  end
-  if puppet.vehicle(c) or puppet.hub(c) then
-    return false
+  return read(o, "object_name") == "LuaPlayer" or puppet.player_of(o) ~= nil
+end
+
+-- What enemies would see of a real player's character here: the character on foot, the car, tank or spidertron it
+-- drives or rides (a military target); nil when they would see nothing (or the engine already does).
+local function sight_target(c)
+  if not (c and c.valid) or puppet.player_of(c) or not hittable(c) or puppet.hub(c) then
+    return nil
   end
   local surface = c.surface
   if read(surface, "peaceful_mode") or read(surface, "no_enemies_mode") then
-    return false
+    return nil
   end
-  return true
+  local v = puppet.vehicle(c)
+  if not v then
+    return c
+  end
+  if not (v.valid and perf.on("enemy_sight_vehicle") and read(v, "is_military_target") == true and hittable(v)) then
+    return nil
+  end
+  for _, seat in ipairs({ "get_driver", "get_passenger" }) do
+    local ok, o = pcall(function() return v[seat]() end)
+    if ok and real_occupant(o, c) then
+      return nil
+    end
+  end
+  return v
 end
+M.sight_target = sight_target
 
 -- A unit free to be woken: no distraction, a command that takes one and isn't an attack of its own, in no group.
 local function asleep(cmd)
@@ -170,13 +199,13 @@ function M.tick()
     return
   end
   local s = storage.f3d
-  local c = puppet.get()
-  if not perf.on("enemy_sight") or not sightable(c) then
+  local t = perf.on("enemy_sight") and sight_target(puppet.get())
+  if not t then
     s.sight = nil
     return
   end
   local now = game.tick
-  local at = c.position
+  local at = t.position
   local st = s.sight
   if not st then
     st = { x = at.x, y = at.y, moved = -1e9, units = {} }
@@ -187,8 +216,25 @@ function M.tick()
     st.moved = now
   end
   st.x, st.y = at.x, at.y
+  -- Into or out of a vehicle: the units on the old target are given the new one, and the chase rule runs this pass.
+  local old_target = st.target
+  local retarget = old_target ~= nil and old_target ~= t.unit_number
+  st.target = t.unit_number
+  if retarget then
+    st.moved = now
+  end
   local recs, woken = st.units, st.nests
-  local command = { type = defines.command.attack, target = c, distraction = defines.distraction.by_enemy }
+  local command = { type = defines.command.attack, target = t, distraction = defines.distraction.by_enemy }
+
+  -- Whether a unit this woke is still on the old target (or its distraction's target is gone).
+  local function on_old(cmd)
+    local d = read(cmd, "distraction_command")
+    local tg = d and d.target
+    if not tg then
+      return false
+    end
+    return not tg.valid or tg.unit_number == old_target
+  end
 
   local function give(cmd)
     return pcall(cmd.set_distraction_command, command)
@@ -211,7 +257,7 @@ function M.tick()
     -- spawners wakes together). A neighbouring nest's units in the circle are not its own and stay asleep.
     local p, r = sp.position, v + M.NEST_EXTRA
     local cluster = { [key] = true }
-    local ok, near = pcall(c.surface.find_entities_filtered,
+    local ok, near = pcall(t.surface.find_entities_filtered,
       { type = "unit-spawner", position = p, radius = M.NEST_EXTRA, force = u.force })
     if ok and near then
       for _, o in ipairs(near) do
@@ -223,7 +269,7 @@ function M.tick()
     for k in pairs(cluster) do
       woken[k] = now
     end
-    for _, o in ipairs(c.surface.find_units({
+    for _, o in ipairs(t.surface.find_units({
       area = { { p.x - r, p.y - r }, { p.x + r, p.y + r } }, force = u.force, condition = "same",
     })) do
       local cmd, n = o.commandable, o.unit_number
@@ -235,8 +281,8 @@ function M.tick()
   end
 
   local r = radius()
-  for _, u in ipairs(c.surface.find_units({
-    area = { { at.x - r, at.y - r }, { at.x + r, at.y + r } }, force = c.force, condition = "enemy",
+  for _, u in ipairs(t.surface.find_units({
+    area = { { at.x - r, at.y - r }, { at.x + r, at.y + r } }, force = t.force, condition = "enemy",
   })) do
     local cmd, n = u.commandable, u.unit_number
     if cmd and n then
@@ -245,7 +291,7 @@ function M.tick()
         rec.seen = now
       end
       local v = vision(u)
-      if dist(u.position, at) <= v and asleep(cmd) then
+      if dist(u.position, at) <= v and (asleep(cmd) or (rec and retarget and on_old(cmd))) then
         if not rec then
           -- A fresh sighting: it and its nest, unless its nest woke lately (then it alone: a straggler, a new
           -- spawn). Past MAX_NESTS this pass, a unit of a nest not yet woken waits (no command, no record), so it

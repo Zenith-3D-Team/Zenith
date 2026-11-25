@@ -40,6 +40,26 @@ uniform float planet_cloud_spin = 0.0;
 // Towards the sun (the scene's sun, so the planet's day side is the side the deck is lit from).
 uniform vec3 planet_sun = vec3(0.5, 0.8, 0.3);
 uniform float planet_emission_on = 0.0;
+// The layered cloud look (on unless --planet-clouds=old): Factorio's own cloud flow and relief maps
+// (<planet>-cloud-flow.png, -cloud-normal.png, from the install) move and light the cloud map; the
+// clouds' own colour and alpha (the old look read luminance as alpha), each planet's coverage and
+// character (planet_cloud_style), edges broken up by a little domain-warped noise on the sphere
+// (no seam, no pinch at the poles, faded out where it would be finer than a pixel), lit with a soft,
+// warm terminator a little past the ground's, a shadow cast on the surface below, thinner at the
+// limb, and an atmosphere rim on the lit side.
+uniform float planet_cloud_look = 1.0;
+uniform sampler2D planet_cloud_flow : filter_linear_mipmap, repeat_enable;
+uniform sampler2D planet_cloud_normal : filter_linear_mipmap, repeat_enable;
+uniform float planet_cloud_flow_on = 0.0;
+uniform float planet_cloud_normal_on = 0.0;
+// Where the clouds are in their flow cycle (0-1, the game's ticks: planet_spin.gd cloud_flow()).
+uniform float planet_cloud_flow_t = 0.0;
+// x: alpha where cover starts, y: where it is full, z: opacity, w: edge breakup.
+uniform vec4 planet_cloud_cover = vec4(0.45, 1.0, 0.9, 0.5);
+// rgb: multiplies the map's colour, a: its saturation (0 grey).
+uniform vec4 planet_cloud_tint = vec4(1.0, 1.0, 1.0, 1.0);
+// x: shadow on the ground, y: flow distance (map widths a cycle), z: relief strength, w: limb thinning.
+uniform vec4 planet_cloud_style = vec4(0.35, 0.006, 0.8, 0.5);
 
 float hash13(vec3 p) {
 	p = fract(p * 0.1031);
@@ -118,7 +138,59 @@ void sky() {
 				float day = dot(n, sun);
 				float light = smoothstep(-0.15, 0.35, day);
 				vec3 lit = surface * (0.03 + 1.05 * light);
-				if (planet_clouds_on > 0.5) {
+				float mu = sqrt(1.0 - r * r);
+				if (planet_clouds_on > 0.5 && planet_cloud_look > 0.5) {
+					vec2 cuv = uv + vec2(planet_spin - planet_cloud_spin, 0.0);
+					// The surface's frame at this point: east and north, in the sky's directions.
+					float lon0 = atan(local.x, local.z);
+					float cl = cos(lat);
+					vec3 east = right * cos(lon0) + pd * sin(lon0);
+					vec3 north = right * (-sin(lat) * sin(lon0)) + up * cl + pd * (sin(lat) * cos(lon0));
+					// A point on the sphere turning with the clouds: noise there has no seam or pole.
+					float clon = lon - planet_cloud_spin * TAU;
+					vec3 q = vec3(cl * sin(clon), sin(lat), cl * cos(clon));
+					float n_low = value_noise(q * 5.0 + 3.7);
+					vec3 qh = q * 26.0 + vec3(n_low * 2.5);
+					float n_hi = value_noise(qh);
+					float fine = 1.0 - smoothstep(0.35, 0.9, length(fwidth(qh)));
+					// Factorio's flow: two phases a half cycle apart, faded across, the phase shifted
+					// by the slow noise so no wide pulse shows.
+					vec2 flow = vec2(0.0);
+					if (planet_cloud_flow_on > 0.5) {
+						flow = textureGrad(planet_cloud_flow, cuv, gx, gy).rg * 2.0 - 1.0;
+					}
+					float t0 = fract(planet_cloud_flow_t + n_low);
+					float t1 = fract(t0 + 0.5);
+					float wa = 1.0 - abs(t0 * 2.0 - 1.0);
+					vec2 fd = flow * planet_cloud_style.y;
+					vec4 ca = textureGrad(planet_clouds, cuv - fd * (t0 - 0.5), gx, gy);
+					vec4 cb = textureGrad(planet_clouds, cuv - fd * (t1 - 0.5), gx, gy);
+					vec4 c = mix(cb, ca, wa);
+					float a = smoothstep(planet_cloud_cover.x, planet_cloud_cover.y, c.a);
+					// Edges broken up, the middles left whole.
+					a = clamp(a + (n_hi - 0.5) * planet_cloud_cover.w * 4.0 * a * (1.0 - a) * fine, 0.0, 1.0);
+					a *= planet_cloud_cover.z * mix(1.0 - planet_cloud_style.w, 1.0, smoothstep(0.0, 0.45, mu));
+					vec3 cc = c.rgb;
+					cc = mix(vec3(dot(cc, vec3(0.299, 0.587, 0.114))), cc, planet_cloud_tint.a) * planet_cloud_tint.rgb;
+					// Relief from Factorio's cloud normals; the clouds sit higher, so they stay lit a
+					// little past the ground's terminator, going warm there.
+					vec3 cn = n;
+					if (planet_cloud_normal_on > 0.5) {
+						vec3 tn = textureGrad(planet_cloud_normal, cuv, gx, gy).rgb * 2.0 - 1.0;
+						tn.xy *= planet_cloud_style.z;
+						cn = normalize(east * tn.x + north * tn.y + n * max(tn.z, 0.05));
+					}
+					float cday = dot(n, sun);
+					float clight = smoothstep(-0.12, 0.3, cday) * mix(1.0, clamp(0.55 + 0.6 * dot(cn, sun) / max(abs(cday), 0.25), 0.35, 1.25), smoothstep(-0.1, 0.2, cday));
+					vec3 warm = mix(vec3(1.0, 0.74, 0.58), vec3(1.0), smoothstep(-0.05, 0.16, cday));
+					vec3 cloud = cc * warm * (0.035 + 1.1 * clight);
+					// The cloud above the ground towards the sun shades it.
+					vec2 sd = vec2(dot(sun, east), dot(sun, north)) * (0.012 / max(cday, 0.2));
+					vec2 suv = cuv + vec2(sd.x / (TAU * max(cl, 0.15)), -sd.y / PI);
+					float sa = smoothstep(planet_cloud_cover.x, planet_cloud_cover.y, textureGrad(planet_clouds, suv, gx, gy).a) * planet_cloud_cover.z;
+					lit *= 1.0 - planet_cloud_style.x * sa * smoothstep(0.0, 0.25, cday);
+					lit = mix(lit, cloud, a);
+				} else if (planet_clouds_on > 0.5) {
 					vec2 cuv = uv + vec2(planet_spin - planet_cloud_spin, 0.0);
 					vec4 c = textureGrad(planet_clouds, cuv, gx, gy);
 					lit = mix(lit, vec3(c.r) * (0.04 + 1.1 * light), c.g * 0.85);
@@ -128,10 +200,18 @@ void sky() {
 					lit += glow * (1.0 - light) * 1.4;
 				}
 				// The limb darkens a little, as a ball does.
-				col = lit * mix(0.75, 1.0, sqrt(1.0 - r * r));
+				col = lit * mix(0.75, 1.0, mu);
+				if (planet_cloud_look > 0.5) {
+					// Air seen edge-on, where the sun reaches it.
+					col += planet_color * pow(1.0 - mu, 3.0) * 0.35 * smoothstep(-0.25, 0.35, dot(n, sun));
+				}
 			}
 			// Atmosphere: a thin glow of the planet's colour round the lit edge.
 			float rim = smoothstep(1.12, 1.0, r) * smoothstep(0.86, 1.0, r);
+			if (planet_cloud_look > 0.5 && rim > 0.0) {
+				vec3 edge = normalize(d - pd * dot(d, pd));
+				rim *= 0.3 + 0.9 * smoothstep(-0.35, 0.45, dot(edge, sun));
+			}
 			col += planet_color * rim * 0.45;
 		} else if (planet_tex_on > 0.5 && ang < planet_radius * 1.05) {
 			// The picture's top towards north (-Z) when the planet is straight below.

@@ -4,6 +4,7 @@
 // rest is double, so both paths write identical records.
 #include "belt_draw_native.h"
 
+#include "belt_lattice_native.h"
 #include "belt_sim_native.h"
 
 #include <godot_cpp/core/class_db.hpp>
@@ -250,10 +251,17 @@ bool BeltDrawNative::_set_view() {
 	if (!view_cull || view_all) {
 		return false;
 	}
+	double keep = tight_cull ? clampd((double)std::max(view.size.x, view.size.y) * 0.15, 2.0, 8.0) : (double)VIEW_KEEP;
 	if (planned_any && planned_view.encloses(view)) {
-		return false;
+		if (!tight_cull) {
+			return false;
+		}
+		if ((double)planned_view.size.x <= (double)view.size.x + 2.0 * keep + 6.0
+				&& (double)planned_view.size.y <= (double)view.size.y + 2.0 * keep + 6.0) {
+			return false;
+		}
 	}
-	planned_view = view.grow((float)VIEW_KEEP);
+	planned_view = view.grow((float)keep);
 	planned_any = true;
 	return true;
 }
@@ -336,6 +344,16 @@ void BeltDrawNative::_replan_parked() {
 	i64 now = (i64)std::floor(fold_tick);
 	for (Item *it : items.val_list()) {
 		if (!it->parked) {
+			if (tight_cull && it->slot >= 0 && !kept.has(it) && it->hide_at < 0.0 && it->show_at < 0.0) {
+				i64 d = (it->v > 0 && now > it->t0) ? std::min<i64>(it->v * (now - it->t0), it->reach) : 0;
+				Vector2i at = d > 0 ? _advance(it->lane, it->pos, d) : Vector2i((int32_t)it->lane, (int32_t)it->pos);
+				int why = _hide_why(at.x, at.y, it->reach - d, it->v);
+				if (why != 0) {
+					_park(it);
+					_set_lat(it, why == 2);
+					parked++;
+				}
+			}
 			continue;
 		}
 		i64 d = (it->v > 0 && now > it->t0) ? std::min<i64>(it->v * (now - it->t0), it->reach) : 0;
@@ -352,6 +370,13 @@ void BeltDrawNative::_replan_parked() {
 			auto f = lanes.find(it->lane);
 			it->run = (f != lanes.end() && f->second.m[0] == STRAIGHT) ? it->pos + sim->run_of(it->lane) : 0;
 			it->t0 = now;
+		}
+		if (model_cap < 0 && it->key < 0) {
+			it->key = it->item_id;
+		}
+		if (lod_split && it->key >= 0) {
+			Vector4 p_up = _point(it->lane, (double)it->pos);
+			_set_unpark_key(it, Vector3(p_up.x, p_up.y, p_up.z));
 		}
 		_unpark(it);
 		_plan(it);
@@ -550,6 +575,7 @@ bool BeltDrawNative::_stand_dropped(Item *it, i64 now) {
 	if (view_cull && !view_all && !planned_view.grow((float)VIEW_MARGIN).has_point(Vector2(q.x, q.z))) {
 		return false;
 	}
+	_set_unpark_key(it, Vector3(q.x, q.y, q.z));
 	_unpark(it);
 	it->v = 0;
 	it->from = Vector3(q.x, q.y, q.z);
@@ -1105,7 +1131,8 @@ void BeltDrawNative::_cut_at_stop(Item *it, i64 key, i64 pos, i64 t0, i64 now) {
 void BeltDrawNative::_apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run) {
 	Item **pit = items.get(uid);
 	Item *it;
-	if (pit == nullptr) {
+	bool fresh_item = pit == nullptr;
+	if (fresh_item) {
 		it = new Item();
 		it->uid = uid;
 		it->item_id = item;
@@ -1134,10 +1161,26 @@ void BeltDrawNative::_apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, 
 			it->s = std::sin(na);
 		}
 	}
+	Vector3 pos3 = it->from;
+	if (lod_split || fresh_item || it->parked) {
+		Vector4 p_est = _point(key, (double)pos);
+		pos3 = Vector3(p_est.x, p_est.y, p_est.z);
+	}
 	if (it->key >= 0) {
-		i64 mk = _model_key(it);
-		if (mk != it->key) {
-			_rekey(it, mk);
+		int cur_b = (fresh_item || it->parked) ? -1 : BeltLatticeNative::band_of(it->key);
+		i64 dk = _desired_3d_key(it, pos3, cur_b);
+		if (fresh_item && model_cap == 0) {
+			auto lkf = known.find(item);
+			if (lkf == known.end() || lkf->second.turns) {
+				dk = -item - 1;
+			}
+		}
+		if (dk != it->key) {
+			if (it->parked) {
+				it->key = dk;
+			} else {
+				_rekey(it, dk);
+			}
 		}
 	}
 	_set_count(it, stack);
@@ -1439,12 +1482,77 @@ void BeltDrawNative::_place(Item *it) {
 	it->slot = _put(kind, SlotRef{ it, 0 });
 }
 
+void BeltDrawNative::_set_unpark_key(Item *it, const Vector3 &pos) {
+	if (model_cap < 0 && it->key < 0) {
+		it->key = it->item_id;
+	}
+	if (lod_split && it->key >= 0) {
+		it->key = _desired_3d_key(it, pos, -1);
+	}
+}
+
+i64 BeltDrawNative::_desired_3d_key(const Item *it, const Vector3 &pos, int cur_band) const {
+	i64 mk = _model_key(it);
+	if (!lod_split) {
+		return mk;
+	}
+	auto lk = known.find(it->item_id);
+	if (lk != known.end() && !lk->second.turns) {
+		return mk;
+	}
+	double d = (double)pos.distance_to(lod_anchor);
+	return BeltLatticeNative::band_key(mk, BeltLatticeNative::band_for_dist(it->uid, d, lod_d1, lod_d2, lod_jit, cur_band));
+}
+
 void BeltDrawNative::_cap_models() {
-	if (model_cap < 0) {
+	sim_3d = 0;
+	sim_eligible = 0;
+	if (model_cap == 0) {
+		if (!sim_cap_d2.empty()) {
+			sim_cap_d2.clear();
+			sim_d2_dirty = true;
+		}
 		for (Item *it : items.val_list()) {
-			i64 mk = _model_key(it);
-			if (it->key != mk) {
-				_rekey(it, mk);
+			auto lk = known.find(it->item_id);
+			bool icon_only = lk != known.end() && !lk->second.turns;
+			i64 target = icon_only ? _model_key(it) : (-it->item_id - 1);
+			if (it->key != target) {
+				_rekey(it, target);
+			}
+			if (!icon_only && !it->parked && (!lat_cap_near || !lat.count(it->lane))) {
+				sim_eligible++;
+			}
+		}
+		return;
+	}
+	if (model_cap < 0) {
+		if (!sim_cap_d2.empty()) {
+			sim_cap_d2.clear();
+			sim_d2_dirty = true;
+		}
+		for (Item *it : items.val_list()) {
+			auto lk = known.find(it->item_id);
+			bool icon_only = lk != known.end() && !lk->second.turns;
+			if (icon_only) {
+				i64 mk = _model_key(it);
+				if (it->key != mk) {
+					_rekey(it, mk);
+				}
+				continue;
+			}
+			if (it->parked) {
+				if (it->key < 0) {
+					it->key = it->item_id;
+				}
+				continue;
+			}
+			i64 dk = _desired_3d_key(it, it->from, it->key >= 0 ? BeltLatticeNative::band_of(it->key) : -1);
+			if (it->key != dk) {
+				_rekey(it, dk);
+			}
+			if (!lat.count(it->lane)) {
+				sim_eligible++;
+				sim_3d++;
 			}
 		}
 		return;
@@ -1452,62 +1560,75 @@ void BeltDrawNative::_cap_models() {
 	Vector2 c(square.x, square.y);
 	std::vector<Item *> sel;
 	std::vector<float> dists;
+	std::vector<float> order;
 	std::vector<char> models;
+	double lat_keep = (!std::isfinite(lat_limit_d2) || lat_limit_d2 < 0.0) ? lat_limit_d2 : std::pow(std::sqrt(lat_limit_d2) + CAP_SLACK, 2.0);
 	for (Item *it : items.val_list()) {
 		auto lk = known.find(it->item_id);
-		i64 mk = _model_key(it);
 		if (lk != known.end() && !lk->second.turns) {
+			i64 mk = _model_key(it);
 			if (it->key != mk) {
 				_rekey(it, mk);
 			}
 			continue;
 		}
-		bool model = it->key >= 0;
-		if (model && it->key != mk) {
-			_rekey(it, mk);
+		if (it->parked) {
+			continue;
 		}
-		sel.push_back(it);
-		models.push_back(model ? 1 : 0);
+		bool was_3d = it->key >= 0;
+		float d;
 		if (cam_led) {
-			// view_priority.gd view_distance_sq: within the margin of every plane, else INF (never counted).
-			// A model already keeps its look a little further outside the view too.
-			double margin = CAM_MARGIN + (model ? CAP_SLACK : 0.0);
-			float d = cam_pos.distance_squared_to(it->from);
+			double margin = CAM_MARGIN + (was_3d ? CAP_SLACK : 0.0);
+			d = cam_pos.distance_squared_to(it->from);
 			for (const Plane &pl : cam_planes) {
 				if ((double)pl.distance_to(it->from) > margin) {
 					d = INFINITY;
 					break;
 				}
 			}
-			dists.push_back(d);
 		} else {
-			dists.push_back(c.distance_squared_to(Vector2(it->from.x, it->from.z)));
+			d = c.distance_squared_to(Vector2(it->from.x, it->from.z));
 		}
-	}
-	if (sel.empty()) {
-		return;
-	}
-	// view_priority.gd choose(): the cap nearest first among the counted (finite) ones.
-	std::vector<float> order;
-	order.reserve(dists.size());
-	for (float d : dists) {
+		if (lat_cap_near && lat.count(it->lane)) {
+			bool want_lat = std::isfinite(d) && (double)d <= (was_3d ? lat_keep : lat_limit_d2);
+			i64 target_lat = want_lat ? _desired_3d_key(it, it->from, was_3d ? BeltLatticeNative::band_of(it->key) : -1) : (-it->item_id - 1);
+			if (it->key != target_lat) {
+				_rekey(it, target_lat);
+			}
+			continue;
+		}
+		sim_eligible++;
+		sel.push_back(it);
+		models.push_back(was_3d ? 1 : 0);
+		dists.push_back(d);
 		if (d < INFINITY) {
 			order.push_back(d);
 		}
 	}
+	std::sort(order.begin(), order.end());
+	if (order != sim_cap_d2) {
+		sim_cap_d2 = order;
+		sim_d2_dirty = true;
+	}
+	if (sel.empty()) {
+		return;
+	}
 	double limit = INFINITY;
-	if (model_cap < (int)order.size()) {
-		std::sort(order.begin(), order.end());
-		limit = model_cap > 0 ? (double)order[std::max(model_cap - 1, 0)] : -1.0;
+	if (sim_cap < (int)order.size()) {
+		limit = sim_cap > 0 ? (double)order[std::max(sim_cap - 1, 0)] : -1.0;
 	}
 	double keep = (limit == INFINITY || limit < 0.0) ? limit : std::pow(std::sqrt(limit) + CAP_SLACK, 2.0);
 	for (size_t i = 0; i < sel.size(); i++) {
 		Item *it = sel[i];
-		bool model = models[i] == 1;
+		bool was_3d = models[i] == 1;
 		double d = (double)dists[i];
-		bool want = d < INFINITY && d <= (model ? keep : limit);
-		if (want != model) {
-			_rekey(it, want ? _model_key(it) : -it->item_id - 1);
+		bool want = d < INFINITY && d <= (was_3d ? keep : limit);
+		if (want) {
+			sim_3d++;
+		}
+		i64 target = want ? _desired_3d_key(it, it->from, was_3d ? BeltLatticeNative::band_of(it->key) : -1) : (-it->item_id - 1);
+		if (it->key != target) {
+			_rekey(it, target);
 		}
 	}
 }
@@ -1630,9 +1751,11 @@ void BeltDrawNative::_write() {
 		}
 		it->code_at = writing;
 	}
+	std::unordered_set<i64> unknown_seen;
 	for (i64 item_id : kinds.key_list()) {
 		Kind *kind = *kinds.get(item_id);
-		auto lk = known.find(item_id);
+		i64 lk_id = BeltLatticeNative::look_key(item_id);
+		auto lk = known.find(lk_id);
 		if (full) {
 			kind->known = false;
 		}
@@ -1666,7 +1789,10 @@ void BeltDrawNative::_write() {
 			kind->cap = cap;
 		}
 		if (!kind->known) {
-			unknown.push_back(item_id);
+			if (!unknown_seen.count(lk_id)) {
+				unknown_seen.insert(lk_id);
+				unknown.push_back(lk_id);
+			}
 			continue;
 		}
 		for (int i : kind->emptied) {
@@ -1815,7 +1941,14 @@ void BeltDrawNative::_compact(Kind *kind) {
 		kind->slots.pop_back();
 	}
 	int n = (int)kind->slots.size();
-	if (kind->free.size() > 64 && kind->free.size() * 2 > (size_t)n) {
+	if (n == 0) {
+		kind->slots.clear();
+		kind->fresh.clear();
+		kind->free.clear();
+		kind->emptied.clear();
+		return;
+	}
+	if (kind->free.size() > 16 && kind->free.size() * 2 > (size_t)n) {
 		std::vector<SlotRef> packed;
 		for (const SlotRef &e : kind->slots) {
 			if (e.it != nullptr) {
@@ -1857,6 +1990,14 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	now_msec = (i64)params.get("now_msec", 0);
 	full = (bool)params.get("full", false);
 	model_cap = (int)params.get("model_cap", -1);
+	sim_cap = (int)params.get("sim_cap", model_cap);
+	lat_cap_near = (bool)params.get("lat_cap_near", false);
+	lat_limit_d2 = (double)params.get("lat_limit_d2", INFINITY);
+	lod_split = (bool)params.get("lod_split", false);
+	lod_anchor = (Vector3)params.get("lod_anchor", Vector3());
+	lod_d1 = (double)params.get("lod_d1", INFINITY);
+	lod_d2 = (double)params.get("lod_d2", INFINITY);
+	lod_jit = (Vector2)params.get("lod_jit", Vector2());
 	square = (Vector3)params.get("square", Vector3(0.0f, 0.0f, -1.0f));
 	base = (double)params.get("base", -1.0);
 	height = (double)params.get("height", 0.16);
@@ -1865,6 +2006,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	early = (bool)params.get("early", true);
 	early_stop = (bool)params.get("early_stop", true);
 	view_cull = (bool)params.get("view_cull", true);
+	tight_cull = (bool)params.get("tight_cull", true);
 	lead_on = (bool)params.get("lead_on", true);
 	gone_order = (bool)params.get("gone_order", true);
 	pile_one = (bool)params.get("pile_one", true);
@@ -2029,12 +2171,24 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	i64 tk = now_us();
 	_keep_or_drop();
 	i64 cap_us = 0;
-	if (known_given || model_cap != capped_at || (model_cap >= 0 && (square != capped_square || cap_jobs >= CAP_EVERY || _cam_moved()))) {
+	bool d1_changed = !(lod_d1 == capped_d1 || (!std::isfinite(lod_d1) && !std::isfinite(capped_d1)));
+	bool d2_changed = !(lod_d2 == capped_d2 || (!std::isfinite(lod_d2) && !std::isfinite(capped_d2)));
+	bool lod_moved = lod_split != capped_lod_split || d1_changed || d2_changed
+			|| (lod_split && (!std::isfinite(capped_lod_anchor.x) || (double)lod_anchor.distance_squared_to(capped_lod_anchor) > 16.0));
+	if (known_given || model_cap != capped_at || sim_cap != capped_sim_cap || lod_moved
+			|| (model_cap >= 0 && (square != capped_square || cap_jobs >= CAP_EVERY || _cam_moved()))) {
 		capped_square = square;
 		capped_at = model_cap;
+		capped_sim_cap = sim_cap;
 		capped_cam = cam_led;
 		capped_cam_pos = cam_pos;
 		capped_cam_dir = cam_dir;
+		capped_lod_split = lod_split;
+		capped_d1 = lod_d1;
+		capped_d2 = lod_d2;
+		if (lod_moved) {
+			capped_lod_anchor = lod_anchor;
+		}
 		cap_jobs = 0;
 		i64 tc = now_us();
 		_cap_models();
@@ -2143,6 +2297,13 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	res["slots_hidden"] = g_hidden;
 	res["parked_view"] = g_parked_view;
 	res["parked_lat"] = g_parked_lat;
+	res["sim_3d"] = sim_3d;
+	res["sim_eligible"] = sim_eligible;
+	res["capped_lod_anchor"] = capped_lod_anchor;
+	if (sim_d2_dirty) {
+		sim_d2_dirty = false;
+		res["sim_d2"] = to_packed<PackedFloat32Array>(sim_cap_d2);
+	}
 	if (paths.is_valid()) {
 		res["paths"] = paths;
 		if (dumping) {

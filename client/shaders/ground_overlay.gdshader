@@ -1,7 +1,8 @@
 shader_type spatial;
-// Factorio's flat marks over the world (the hover brackets, arrows, roboport and drill areas, rail
-// planner arrows, Alt-mode arrows, health bars), drawn over everything as before but riding on the
-// hills (ground_height.gdshaderinc): the vertex colour, times a picture when one is set.
+// Factorio's flat marks over the world (the hover brackets, arrows, fluid icons, roboport links,
+// rail planner arrows, Alt-mode arrows, health bars), drawn over everything as before but riding on
+// the hills (ground_height.gdshaderinc): the vertex colour, times a picture when one is set. Areas
+// on the ground under models (drill radius, roboport coverage, pole supply) use ground_mark.gdshader.
 render_mode unshaded, blend_mix, depth_test_disabled, depth_draw_never, cull_disabled, shadows_disabled, fog_disabled;
 
 #include "res://shaders/ground_height.gdshaderinc"

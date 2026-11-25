@@ -26,6 +26,8 @@ extends Node
 ## real pixels: they cost nothing, and what ends them is shimmering under a real pixel.
 
 const ModelLods := preload("res://scripts/world/model_lods.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Tiles per pixel at the view's middle. At 1080p with the angled view's 35 degree field of view a
 ## camera 10 tiles off is about 0.006, the default 30 tiles about 0.018, the furthest zoom (140)
@@ -55,26 +57,63 @@ const REPUSH := 0.5
 
 const SSAO_KEYS := ["ssao_enabled", "ssao_radius", "ssao_intensity", "ssao_power", "ssao_detail", "ssao_horizon",
 	"ssao_sharpness", "ssao_light_affect", "ssao_ao_channel_affect"]
+## --ssil-zoom-fade=off: leave SSIL active at every zoom even when SSAO switches off.
+static var ssil_zoom_fade := Switches.on("--ssil-zoom-fade")
 
 var env: Environment
+var rig = null
 ## How much of SSAO shows (0-1), and whether it is on now (after the hysteresis).
 var ssao_share := 1.0
 var ssao_on := false
+var ssil_on := false
 ## The view's tiles per pixel this frame (for tests and the F4 line).
 var tiles_per_pixel := 0.0
 var _pushed: Array = []
 var _since_push := 0.0
+var _ssil_env: Environment
+var _ssil_tracked := false
+var _ssil_base_on := false
+var _ssil_base_intensity := 0.5
+var _ssil_applied_on := false
+var _ssil_applied_intensity := 0.5
+
+
+func _exit_tree() -> void:
+	if _ssil_tracked and _ssil_env != null:
+		_ssil_env.ssil_enabled = _ssil_base_on
+		_ssil_env.ssil_intensity = _ssil_base_intensity
+		_ssil_tracked = false
+		_ssil_env = null
 
 
 func _process(delta: float) -> void:
 	if env == null:
 		return
+	if not _ssil_tracked or _ssil_env != env:
+		if _ssil_tracked and _ssil_env != null:
+			_ssil_env.ssil_enabled = _ssil_base_on
+			_ssil_env.ssil_intensity = _ssil_base_intensity
+		_ssil_env = env
+		_ssil_tracked = true
+		_ssil_base_on = env.ssil_enabled
+		_ssil_base_intensity = env.ssil_intensity
+		_ssil_applied_on = env.ssil_enabled
+		_ssil_applied_intensity = env.ssil_intensity
+	else:
+		if env.ssil_enabled != _ssil_applied_on:
+			_ssil_base_on = env.ssil_enabled
+		if not is_equal_approx(env.ssil_intensity, _ssil_applied_intensity):
+			_ssil_base_intensity = env.ssil_intensity
 	var cam := get_viewport().get_camera_3d()
-	if cam == null:
-		return
-	var screen := get_viewport().get_visible_rect().size
-	tiles_per_pixel = view_tiles_per_pixel(cam, Vector2(screen.x, ModelLods.counted_lines(screen.y)))
-	ssao_share = 1.0 - smoothstep(SSAO_FULL, SSAO_GONE, tiles_per_pixel)
+	if rig != null and not ViewPriority.lod_by_camera(rig) and not ViewPriority.char_lod_zoom:
+		tiles_per_pixel = 0.0
+		ssao_share = 1.0
+	else:
+		if cam == null:
+			return
+		var screen := get_viewport().get_visible_rect().size
+		tiles_per_pixel = view_tiles_per_pixel(cam, Vector2(screen.x, ModelLods.counted_lines(screen.y)))
+		ssao_share = 1.0 - smoothstep(SSAO_FULL, SSAO_GONE, tiles_per_pixel)
 	var wanted := env.ssao_enabled
 	if not wanted:
 		ssao_on = false
@@ -82,7 +121,26 @@ func _process(delta: float) -> void:
 		ssao_on = false
 	elif not ssao_on and ssao_share > SSAO_ON_AGAIN:
 		ssao_on = true
-	var values: Array = [wanted, ssao_on, snappedf(ssao_share, 0.01)]
+	var want_ssil := _ssil_base_on
+	if not want_ssil:
+		ssil_on = false
+	elif not ssil_zoom_fade:
+		ssil_on = true
+	elif ssil_on and ssao_share < SSAO_OFF:
+		ssil_on = false
+	elif not ssil_on and ssao_share > SSAO_ON_AGAIN:
+		ssil_on = true
+	var k := snappedf(ssao_share, 0.01)
+	var k_ssil := k if ssil_zoom_fade else 1.0
+	var target_ssil_on := ssil_on
+	var target_ssil_intensity := _ssil_base_intensity * k_ssil
+	if env.ssil_enabled != target_ssil_on:
+		env.ssil_enabled = target_ssil_on
+	if not is_equal_approx(env.ssil_intensity, target_ssil_intensity):
+		env.ssil_intensity = target_ssil_intensity
+	_ssil_applied_on = env.ssil_enabled
+	_ssil_applied_intensity = env.ssil_intensity
+	var values: Array = [wanted, ssao_on, k]
 	for key in SSAO_KEYS:
 		values.append(env.get(key))
 	_since_push += delta
@@ -90,7 +148,6 @@ func _process(delta: float) -> void:
 		return
 	_pushed = values
 	_since_push = 0.0
-	var k := snappedf(ssao_share, 0.01)
 	RenderingServer.environment_set_ssao(env.get_rid(), ssao_on, env.ssao_radius, env.ssao_intensity * k,
 		env.ssao_power, env.ssao_detail, env.ssao_horizon, env.ssao_sharpness, env.ssao_light_affect * k,
 		env.ssao_ao_channel_affect * k)

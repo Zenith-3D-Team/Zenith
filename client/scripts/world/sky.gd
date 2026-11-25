@@ -23,6 +23,8 @@ const SKY_SHADER := preload("res://shaders/planet_sky.gdshader")
 const SHADOW_SHADER := preload("res://shaders/cloud_shadows.gdshader")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
+const WeatherState := preload("res://scripts/world/weather_state.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Per planet: sky by day and night, sun and ambient light by day and night, clouds (shadow
 ## opacity, cover: lower is more cloud, 1 none), haze (strength and its two colours), lightning.
@@ -196,10 +198,16 @@ var noon_yaw := YAW_NOON
 ## (its sine), twilight (0-1, as the look asked), morning, direction (towards the sun), color,
 ## ambient, fog (the sky's colour on the sun's side).
 var state := {}
+var sky_sun_dir := Vector3(0.0, 0.7, -0.7)
+var sky_sun_strength := 1.0
+var _cloud_alpha := 0.0
+var _haze_now := 0.0
 var _water_tint := Color(-1.0, 0.0, 0.0)  # none yet: the shared material may hold the last game's
 ## The light's rotation last put, with --sun-step (null: none yet).
 var _held_sun: Variant = null
 var _sky_cache := {}
+var _weather_cloud_dirty := false
+var _weather_haze_dirty := false
 
 
 func _set_sky_param(key: String, val: Variant) -> void:
@@ -219,7 +227,7 @@ func _set_sky_param(key: String, val: Variant) -> void:
 
 
 static func _sun_step_arg() -> float:
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--sun-step="):
 			return maxf(float(arg.get_slice("=", 1)), 0.0)
 	return 0.0
@@ -250,7 +258,7 @@ func _ready() -> void:
 	_shadow_quad.extra_cull_margin = 16384.0  # it covers the screen wherever it is
 	_shadow_quad.name = "CloudShadows"
 	add_child(_shadow_quad)
-	for arg in OS.get_cmdline_user_args():
+	for arg in Switches.args():
 		if arg.begins_with("--sky="):
 			var spec := arg.get_slice("=", 1)
 			_forced_planet = spec.get_slice("@", 0)
@@ -451,12 +459,31 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 		zenith = zenith.lerp(m["zenith"], sky_warm)
 		sun_side = horizon.lerp(m["sun_side"], sky_warm)
 		horizon = horizon.lerp(m["horizon"], sky_warm)
+	var wx_on := not space and WeatherState.active
+	var wx: Dictionary = WeatherState.state if wx_on else {}
+	if wx_on:
+		sun.light_energy *= float(wx.get("sun_energy_scale", 1.0))
+		var st_amt := float(wx.get("sun_tint_amount", 0.0))
+		if st_amt > 0.0 and wx.get("sun_color_tint") is Color:
+			sun.light_color = sun.light_color.lerp(wx["sun_color_tint"], st_amt)
+		env.ambient_light_energy *= float(wx.get("ambient_energy_scale", 1.0))
+		var at_amt := float(wx.get("ambient_tint_amount", 0.0))
+		if at_amt > 0.0 and wx.get("ambient_tint") is Color:
+			env.ambient_light_color = env.ambient_light_color.lerp(wx["ambient_tint"], at_amt)
+		var sky_amt := float(wx.get("sky_tint_amount", 0.0))
+		if sky_amt > 0.0:
+			if wx.get("sky_zenith_tint") is Color:
+				zenith = zenith.lerp(wx["sky_zenith_tint"], sky_amt)
+			if wx.get("sky_horizon_tint") is Color:
+				horizon = horizon.lerp(wx["sky_horizon_tint"], sky_amt)
+				sun_side = sun_side.lerp(wx["sky_horizon_tint"], sky_amt * 0.85)
 	env.background_color = horizon
 	if space:
 		env.ambient_light_energy *= SPACE_AMBIENT
 		env.ambient_light_color = env.ambient_light_color.lerp(SPACE_AMBIENT_COLOR, 0.6)
 		env.background_color = SPACE_BACKGROUND
-	_update_lightning(env, delta, night)
+	var wx_flash := float(wx.get("flash", 0.0)) if wx_on else 0.0
+	var eff_flash := _update_lightning(env, delta, night, wx_flash)
 	if not _loaded.is_empty():
 		_take_loaded()
 	var to_sun := sun.global_transform.basis.z.normalized()
@@ -469,20 +496,64 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 	if sky_warm > 0.0:
 		sky_sun = m["sky_dir"]
 		sun_color = _pair("sun", 0.0).lerp(m["sun_color"], sky_warm)
+		if wx_on:
+			var st_amt2 := float(wx.get("sun_tint_amount", 0.0))
+			if st_amt2 > 0.0 and wx.get("sun_color_tint") is Color:
+				sun_color = sun_color.lerp(wx["sun_color_tint"], st_amt2)
 	state = {
 		"elevation": float(m["elevation"]), "height": sin(deg_to_rad(float(m["elevation"]))),
 		"twilight": float(m["twilight"]) * warm, "morning": bool(m["morning"]),
 		"direction": sky_sun if warm > 0.0 else to_sun, "color": sun_color if warm > 0.0 else sun.light_color,
 		"ambient": env.ambient_light_color, "fog": sun_side.lerp(horizon, 0.35),
 	}
+	var w_cov := float(wx.get("cloud_cover", -1.0)) if wx_on else -1.0
 	var cloudy := clouds_on and float(_p["cover"]) < 1.0
+	if w_cov >= 0.0:
+		_weather_cloud_dirty = true
+		var cov := clampf(w_cov, 0.0, 1.0)
+		var eff_cover := lerpf(1.25, -0.15, cov)
+		_set_sky_param("cloud_cover", eff_cover)
+		_shadow_material.set_shader_parameter("cloud_cover", eff_cover)
+		cloudy = clouds_on and cov > 0.005
+	elif _weather_cloud_dirty:
+		_weather_cloud_dirty = false
+		_set_sky_param("cloud_cover", float(_p["cover"]))
+		_shadow_material.set_shader_parameter("cloud_cover", float(_p["cover"]))
 	# Shadows fade as the light does; Factorio's clouds shade daylight, not the lamps' light.
 	var fades := float(m["cloud_shadow"]) if warm > 0.0 else 1.0 - night
 	var shadow_strength := float(_p["shadow"]) * fades if cloudy else 0.0
 	var haze_strength := float(_p["haze"]) * (1.0 - 0.6 * night)
+	var w_haze := float(wx.get("haze_strength", 0.0)) if wx_on else 0.0
+	if w_haze > 0.0001:
+		_weather_haze_dirty = true
+		haze_strength += w_haze * (1.0 - 0.55 * night)
+		var whc: Color = wx.get("haze_color", Color(0.75, 0.8, 0.86))
+		var hz: Array = _p.get("haze_colors", [Color.WHITE, Color.WHITE])
+		var h_blend := clampf(w_haze / maxf(w_haze + float(_p["haze"]), 0.01), 0.0, 1.0)
+		_shadow_material.set_shader_parameter("haze_color", (hz[0] as Color).lerp(whc, h_blend))
+		_shadow_material.set_shader_parameter("haze_color2", (hz[1] as Color).lerp(whc, h_blend))
+		_set_sky_param("haze_color", ((hz[0] as Color).lerp(_pair("horizon", 0.0), 0.5)).lerp(whc, h_blend))
+	elif _weather_haze_dirty:
+		_weather_haze_dirty = false
+		var hz_base: Array = _p.get("haze_colors", [Color.WHITE, Color.WHITE])
+		_shadow_material.set_shader_parameter("haze_color", hz_base[0])
+		_shadow_material.set_shader_parameter("haze_color2", hz_base[1])
+		_set_sky_param("haze_color", (hz_base[0] as Color).lerp(_pair("horizon", 0.0), 0.5))
+	_cloud_alpha = (0.85 - 0.25 * night) if (cloudy and not space) else 0.0
+	if wx_on and w_cov >= 0.0:
+		var cov_fade := smoothstep(0.0, 0.08, clampf(w_cov, 0.0, 1.0))
+		shadow_strength *= float(wx.get("cloud_shadow_scale", 1.0)) * cov_fade
+		_cloud_alpha *= float(wx.get("cloud_alpha_scale", 1.0)) * cov_fade
 	# Hidden whenever it would draw nothing (at night on a planet without haze): its pixels read the
 	# depth and three textures before discarding every one of them.
 	_shadow_quad.visible = not space and clouds_on and (shadow_strength > 0.0 or haze_strength > 0.0)
+	sky_sun_dir = sky_sun
+	var old_strength := clampf(to_sun.y * 4.0, 0.0, 1.0) * (1.0 - night)
+	var sky_strength := float(m["sun_strength"]) if sky_warm > 0.0 else old_strength
+	if wx_on:
+		sky_strength *= float(wx.get("sun_disc_scale", 1.0))
+	sky_sun_strength = 0.0 if space else sky_strength
+	_haze_now = 0.0 if space else haze_strength
 	if space:
 		return
 	_set_sky_param("zenith_color", zenith)
@@ -491,22 +562,22 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 	_set_sky_param("ground_color", horizon * 0.45)
 	_set_sky_param("sun_dir", sky_sun)
 	_set_sky_param("sun_color", sun_color)
-	var old_strength := clampf(to_sun.y * 4.0, 0.0, 1.0) * (1.0 - night)
-	_set_sky_param("sun_strength", float(m["sun_strength"]) if sky_warm > 0.0 else old_strength)
+	_set_sky_param("sun_strength", sky_strength)
 	_set_sky_param("twilight", float(m["twilight"]) * sky_warm)
 	_set_sky_param("belt_color", m["belt"])
 	_set_sky_param("belt", float(m["belt_strength"]) * sky_warm)
 	var old_stars := smoothstep(0.4, 0.9, night)
-	_set_sky_param("stars", float(_p["stars"]) * (float(m["stars"]) if sky_warm > 0.0 else old_stars))
-	_set_sky_param("haze", float(_p["haze"]) * 6.0)
+	var star_scale := float(wx.get("star_visibility_scale", 1.0)) if wx_on else 1.0
+	_set_sky_param("stars", float(_p["stars"]) * (float(m["stars"]) if sky_warm > 0.0 else old_stars) * star_scale)
+	_set_sky_param("haze", (float(_p["haze"]) + w_haze) * 6.0)
 	# Water follows the sky: its colour only in a look with no sunset, the warm horizon in one with.
 	var water_sky := horizon.lerp(sun_side, 0.7 * float(m["twilight"]) * warm)
 	var tint := water_tint(water_sky, _p["horizon"][0])
 	if not tint.is_equal_approx(_water_tint):
 		_water_tint = tint
 		Visuals.water_material().set_shader_parameter("sky_tint", tint)
-	_set_sky_param("flash", _flash)
-	_set_sky_param("cloud_alpha", (0.85 - 0.25 * night) if cloudy else 0.0)
+	_set_sky_param("flash", eff_flash)
+	_set_sky_param("cloud_alpha", _cloud_alpha)
 	# Lit by the sun by day, grey-blue shapes against the night sky.
 	var cc: Array = _p["clouds"]
 	var lit := lerpf(1.0, 0.12, night)
@@ -518,6 +589,16 @@ func apply(env: Environment, sun: DirectionalLight3D, daytime: float, night: flo
 		var lit_sun := Color(cc[0].r * sun_color.r, cc[0].g * sun_color.g, cc[0].b * sun_color.b) * low_lit
 		cloud_color = cloud_color.lerp(lit_sun, sky_warm)
 		cloud_shade = cloud_shade.lerp(zenith.lerp(horizon, 0.5) * lerpf(0.5, 1.0, low_lit), sky_warm)
+	if wx_on:
+		var ct_amt := float(wx.get("cloud_tint_amount", 0.0))
+		if ct_amt > 0.0 and wx.get("cloud_tint") is Color:
+			var ct: Color = wx["cloud_tint"]
+			cloud_color = cloud_color.lerp(ct * lit, ct_amt)
+			cloud_shade = cloud_shade.lerp(ct * lit * 0.72, ct_amt)
+		var c_dark := float(wx.get("cloud_darkness", 0.0))
+		if c_dark > 0.0:
+			cloud_color *= (1.0 - 0.55 * c_dark)
+			cloud_shade *= (1.0 - 0.65 * c_dark)
 	_set_sky_param("cloud_color", cloud_color)
 	_set_sky_param("cloud_shade", cloud_shade)
 	if _shadow_quad.visible:
@@ -538,17 +619,19 @@ func strike_flash(distance: float) -> void:
 	_flash = maxf(_flash, clampf(1.0 - distance / 150.0, 0.25, 1.0) * 0.8)
 
 
-## Fulgora's storms at night: a flash lights the sky and the ground for a moment.
-func _update_lightning(env: Environment, delta: float, night: float) -> void:
+## Fulgora's storms at night (and weather lightning flashes): a flash lights the sky and the ground for a moment.
+func _update_lightning(env: Environment, delta: float, night: float, weather_flash := 0.0) -> float:
 	_flash = maxf(0.0, _flash - delta * 5.0)
 	if _p.get("lightning", false) and night > 0.4 and clouds_on:
 		_lightning_wait -= delta
 		if _lightning_wait <= 0.0:
 			_lightning_wait = randf_range(LIGHTNING_GAP.x, LIGHTNING_GAP.y)
 			_flash = randf_range(0.5, 1.0)
-	if _flash > 0.0:
-		env.ambient_light_energy += _flash * 0.35
-		env.ambient_light_color = env.ambient_light_color.lerp(Color(0.75, 0.8, 1.0), _flash * 0.5)
+	var eff := maxf(_flash, weather_flash)
+	if eff > 0.0:
+		env.ambient_light_energy += eff * 0.35
+		env.ambient_light_color = env.ambient_light_color.lerp(Color(0.75, 0.8, 1.0), clampf(eff, 0.0, 1.0) * 0.5)
+	return eff
 
 
 ## Factorio's cloud noise from the player's install, loaded in the background and shared by every
@@ -610,4 +693,99 @@ static func _generated_noise(seed_value: int) -> Texture2D:
 	tex.generate_mipmaps = true
 	tex.noise = noise
 	return tex
+
+
+## Current sky, sun, cloud, and planet haze snapshot for downstream volumetric passes (smog, god rays).
+func atmosphere() -> Dictionary:
+	var dir_val: Variant = state.get("direction", Vector3(0.0, 0.7, -0.7))
+	var col_val: Variant = state.get("color", Color.WHITE)
+	var amb_val: Variant = state.get("ambient", Color(0.75, 0.78, 0.82))
+	var hz: Array = _p.get("haze_colors", [Color.WHITE, Color.WHITE])
+	var eff_cover := float(_p["cover"])
+	var has_clouds := eff_cover < 1.0
+	if WeatherState.active and float(WeatherState.state.get("cloud_cover", -1.0)) >= 0.0:
+		var cov := clampf(float(WeatherState.state["cloud_cover"]), 0.0, 1.0)
+		eff_cover = lerpf(1.25, -0.15, cov)
+		has_clouds = cov > 0.005
+	var mode := 1 if (clouds_on and has_clouds and _shape_tex != null and _detail_tex != null) else 0
+	return {
+		"sun_dir": dir_val,
+		"sky_sun_dir": sky_sun_dir,
+		"sun_color": col_val,
+		"ambient_color": amb_val,
+		"sun_strength": sky_sun_strength,
+		"twilight": float(state.get("twilight", 0.0)),
+		"cloud_mode": mode,
+		"cloud_shape": _shape_tex,
+		"cloud_detail": _detail_tex,
+		"cloud_cover": eff_cover,
+		"cloud_height": CLOUD_HEIGHT,
+		"cloud_alpha": _cloud_alpha,
+		"haze": _haze_now,
+		"haze_color": hz[0],
+		"planet": planet,
+		"god_rays_scale": float(WeatherState.state.get("god_rays_scale", 1.0)) if WeatherState.active else 1.0,
+	}
+
+
+static func _set_cached_param(mat: ShaderMaterial, cache: Dictionary, key: String, val: Variant) -> void:
+	if cache.has(key):
+		var prev: Variant = cache[key]
+		if val is float and prev is float and absf(float(val) - float(prev)) <= 1e-4:
+			return
+		if val is Vector2 and prev is Vector2 and (val as Vector2).distance_squared_to(prev as Vector2) <= 1e-8:
+			return
+		if typeof(prev) == typeof(val) and prev == val:
+			return
+	cache[key] = val
+	mat.set_shader_parameter(key, val)
+
+
+## Binds the active cloud layer (0 none, 1 Zenith clouds, 2 look cloud_field) onto `mat`.
+static func apply_cloud_uniforms(mat: ShaderMaterial, atmo: Dictionary, cache: Dictionary) -> void:
+	var mode := int(atmo.get("cloud_mode", 0))
+	var shape_tex: Texture2D = atmo.get("cloud_shape") as Texture2D
+	var detail_tex: Texture2D = atmo.get("cloud_detail") as Texture2D
+	var field_tex: Texture2D = atmo.get("look_cloud_field") as Texture2D
+	if mode == 1 and (shape_tex == null or detail_tex == null):
+		mode = 0
+	elif mode == 2 and field_tex == null:
+		mode = 0
+	_set_cached_param(mat, cache, "cloud_mode", float(mode))
+	if mode == 1:
+		_set_cached_param(mat, cache, "cloud_shape", shape_tex)
+		_set_cached_param(mat, cache, "cloud_detail", detail_tex)
+		_set_cached_param(mat, cache, "cloud_cover", float(atmo.get("cloud_cover", 0.5)))
+		_set_cached_param(mat, cache, "cloud_height", float(atmo.get("cloud_height", CLOUD_HEIGHT)))
+		_set_cached_param(mat, cache, "cloud_alpha", float(atmo.get("cloud_alpha", 0.85)))
+		if cache.get("look_cloud_field") != null:
+			_set_cached_param(mat, cache, "look_cloud_field", null)
+	elif mode == 2:
+		var wind_val: Variant = atmo.get("look_cloud_wind", Vector2(3.2, 1.1))
+		var wind: Vector2 = wind_val if wind_val is Vector2 else Vector2(3.2, 1.1)
+		_set_cached_param(mat, cache, "look_cloud_field", field_tex)
+		_set_cached_param(mat, cache, "look_cloud_cover", float(atmo.get("look_cloud_cover", 0.58)))
+		_set_cached_param(mat, cache, "look_cloud_strength", float(atmo.get("look_cloud_strength", 1.0)))
+		_set_cached_param(mat, cache, "look_cloud_low", float(atmo.get("look_cloud_low", 230.0)))
+		_set_cached_param(mat, cache, "look_cloud_high", float(atmo.get("look_cloud_high", 300.0)))
+		_set_cached_param(mat, cache, "look_cloud_scale", float(atmo.get("look_cloud_scale", 0.009)))
+		_set_cached_param(mat, cache, "look_cloud_period", float(atmo.get("look_cloud_period", 16.0)))
+		_set_cached_param(mat, cache, "look_cloud_wind", wind)
+		if cache.get("cloud_shape") != null:
+			_set_cached_param(mat, cache, "cloud_shape", null)
+			_set_cached_param(mat, cache, "cloud_detail", null)
+	else:
+		if cache.get("cloud_shape") != null:
+			_set_cached_param(mat, cache, "cloud_shape", null)
+			_set_cached_param(mat, cache, "cloud_detail", null)
+		if cache.get("look_cloud_field") != null:
+			_set_cached_param(mat, cache, "look_cloud_field", null)
+
+
+## Releases shared cloud textures from `mat` on exit so Godot reports no texture leaks.
+static func clear_cloud_uniforms(mat: ShaderMaterial, cache: Dictionary) -> void:
+	mat.set_shader_parameter("cloud_shape", null)
+	mat.set_shader_parameter("cloud_detail", null)
+	mat.set_shader_parameter("look_cloud_field", null)
+	cache.clear()
 

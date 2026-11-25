@@ -19,6 +19,8 @@ OVERRIDES = {
             "steel": "#77736d",
             "rust_brown": "#5d4134",
             "hazard": "#896c20",
+            "hazard_black": "#242220",
+            "rust_dark": "#483328",
         },
     },
     # Rust-red plated hull and fenders, grey steel, cream fuel tanks; the turret (own materials)
@@ -30,6 +32,7 @@ OVERRIDES = {
             "steel_dark": "#4c4a47",
             "steel": "#6d6a66",
             "steel_light": "#73726d",
+            "steel_black": "#262524",
             "tank_white": "#837e63",
             "steel_light_turret": "#73736f",
             "steel_turret": "#5f5e5c",

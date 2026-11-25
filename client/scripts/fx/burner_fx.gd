@@ -17,6 +17,8 @@ extends RefCounted
 ## fx.gd runs it in the world (scan with the machines, wisps each frame); the Model packs window's
 ## preview (model_preview.gd) with one burner of its own. --burner-fx=off: none of it, as before.
 
+const Switches := preload("res://scripts/switches.gd")
+
 ## The prototypes whose glowing models burn (file names, "@pack" and a direction's suffix off).
 const MODELS := ["burner-inserter"]
 ## glow_heat on the burner's glowing material: 1 is 0.75 to 1.15 of its glow (the shader's sum).
@@ -50,7 +52,7 @@ static var _burners := {}
 static func enabled() -> bool:
 	if not _read_args:
 		_read_args = true
-		for arg in OS.get_cmdline_user_args():
+		for arg in Switches.args():
 			if arg.begins_with("--burner-fx="):
 				on = arg.get_slice("=", 1) != "off"
 	return on

@@ -243,7 +243,9 @@ SPECS["capture-robot"]["overhang"] = 1.0
 
 # Stone wall pieces converted from Wube's walls set (wube_recipes.py), one per connection shape,
 # picked by the client from the wall's neighbours (model_library.gd). Walls run edge to edge.
-for _shape in ("pylon", "n", "e", "s", "w", "ns", "ew", "ne", "nw", "es", "sw", "new", "nes", "esw", "nsw", "nesw"):
+for _shape in ("pylon", "n", "e", "s", "w", "ns", "ew", "ne", "nw", "es", "sw", "new", "nes", "esw", "nsw", "nesw",
+               "gate-n", "gate-e", "gate-s", "gate-w",
+               "gate-single-n", "gate-single-e", "gate-single-s", "gate-single-w", "gate-ns", "gate-ew"):
     SPECS["stone-wall-" + _shape] = {"size": (1, 1), "budget": LOGISTICS, "base": "stone-wall", "fill": (0.3, 0.3)}
 SPECS["stone-wall"]["fill"] = (0.3, 0.3)
 
@@ -264,6 +266,8 @@ SPECS["rail-signal"] = {"size": (0.9, 1.3), "budget": LOGISTICS * 2, "fill": (0.
 SPECS["rail-chain-signal"] = {"size": (1, 1), "budget": LOGISTICS * 2, "fill": (0.5, 0.4)}
 SPECS["train-stop"] = {"size": (1.8, 1.8), "budget": MACHINE, "overhang": 2.0, "centre": 1.0, "fill": (0.5, 0.4)}
 SPECS["gate"] = {"size": (1, 1), "budget": LOGISTICS * 2, "fill": (0.6, 0.6)}
+# The gate's model before it was rebuilt to read as a gate, kept for --gate-model=old (railway.py).
+SPECS["gate-old"] = dict(SPECS["gate"], base="gate")
 for _shape in ("es", "nes", "esw", "nesw"):
     SPECS["stone-wall-%s-fill" % _shape] = {"size": (1, 1), "budget": LOGISTICS, "base": "stone-wall", "fill": (0.3, 0.3),
                                             "overhang": 0.4, "centre": 0.3}
@@ -416,6 +420,10 @@ for _planet in ("", "vulcanus-", "gleba-", "fulgora-"):
     for _kind in ("sides", "outer", "inner", "exit", "entrance"):
         SPECS["cliff-%s%s" % (_planet, _kind)] = {"size": (4, 4), "budget": NATURE, "sink": 0.2, "overhang": 1.5,
                                                    "fill": (0.0, 0.0), "centre": 0.6, "base": "cliff"}
+# Nauvis's variants (`cliff-sides-1`...) and its old pieces kept for --cliff-pieces=old (cliffs.py).
+for _kind, _count in (("sides", 3), ("outer", 2), ("inner", 2), ("exit", 1), ("entrance", 1)):
+    for _name in ["cliff-%s-%d" % (_kind, _i) for _i in range(1, _count + 1)] + ["cliff-%s-old" % _kind]:
+        SPECS[_name] = dict(SPECS["cliff-" + _kind])
 
 # The placeholder audit (placeholders.py, nature/rocks.py).
 SPECS["lane-splitter"] = {"size": (1, 1), "budget": LOGISTICS * 2}

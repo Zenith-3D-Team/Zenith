@@ -350,6 +350,26 @@ function M.clients()
   return out
 end
 
+-- set_cue(tick): the game tick a filmed scene's cue happens on (usually game.tick), for every
+-- client's add-ons (api.world.cue_tick, Immersive Weather's timeline and strikes); nil or a negative
+-- number clears it. Kept in `storage` (the remote call runs inside the caller's event, so every
+-- peer sets it alike), sent at once to each client as {t = "cue", c}, and in each later welcome.
+-- Returns the cue now set, -1 when none.
+function M.set_cue(tick)
+  local v = tonumber(tick)
+  v = (v and v == v and v >= 0 and v < 2 ^ 53) and math.floor(v) or -1
+  storage.f3d_cue = v >= 0 and v or nil
+  session.each_client(function()
+    transport.send_reliable({ t = "cue", c = v })
+  end)
+  return v
+end
+
+-- The cue set by set_cue, or nil (session.lua's welcome).
+function M.cue()
+  return storage.f3d_cue
+end
+
 function M.on_message()
   return ON_MESSAGE
 end

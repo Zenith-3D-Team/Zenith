@@ -349,11 +349,18 @@ func _queued_ask() -> void:
 	var asks: Array[String] = []
 	for i in 40:
 		asks.append("base/sound/zenith-test-queued-%d.ogg" % i)
-	# The running ones real sounds when the install is there, so clear_cache() has a decode to wait for.
-	for i in mini(_keys.size(), _cap()):
-		asks[i] = _keys[_keys.size() - 1 - i]
-	var queued_key := REAL if SoundBank.exists(REAL) else asks[_cap()]
-	asks[_cap()] = queued_key
+	# The running ones real sounds (the install's, else the test's own Vorbis fixtures), so the
+	# queued ask stays queued until stream() pulls it and clear_cache() has a decode to wait for.
+	var busy_sounds: Array[String] = []
+	if not _keys.is_empty():
+		for i in mini(_keys.size(), _cap()):
+			busy_sounds.append(_keys[_keys.size() - 1 - i])
+	else:
+		busy_sounds = [PACK_SOUND, MOD + "/sound/step-1.ogg", MOD + "/sound/step-2.ogg", MOD + "/sound/rustle.ogg"]
+	for i in mini(busy_sounds.size(), _cap()):
+		asks[i] = busy_sounds[i]
+	var queued_key := REAL if SoundBank.exists(REAL) else asks[asks.size() - 1]
+	asks[asks.size() - 1] = queued_key
 	for path in asks:
 		SoundBank.stream_soon(path)
 	var script: Script = SoundBank

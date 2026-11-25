@@ -1,0 +1,9 @@
+{
+	"id": "immersive-weather",
+	"name": "Immersive Weather",
+	"version": "0.3.4",
+	"api": 1.8,
+	"entry": "main.gd",
+	"author": "Zenith",
+	"description": "Dynamic Nauvis weather: open skies, sunny varieties, overcast ceilings, wind, 3D rain with splashes, wet surfaces, puddles, ripples, thunderstorms with 3D lightning bolts, cloud flashes, and speed-of-sound thunder."
+}

@@ -348,7 +348,9 @@ function M.check(e, known)
     w.v = v
   end
   if v ~= known then
-    transport.send_reliable({ t = "aiu", l = { row(e.unit_number, icon) }, fa = { M.fa_row(e, arrows) } })
+    local p = e.position
+    transport.send_reliable_priority({ t = "aiu", l = { row(e.unit_number, icon) }, fa = { M.fa_row(e, arrows) } },
+      math.floor(p.x / CHUNK), math.floor(p.y / CHUNK))
   end
   return v
 end
@@ -638,6 +640,10 @@ local MACHINE_PRICE = 3
 -- The search of the focus square for chests (and for machines), at the start of a round.
 local CONTENTS_FIND_PRICE = 20
 local CONTENTS_ROUND = 60
+local CONTENTS_ROUND_MOVE = 120
+local MOVE_CADENCE_TILES = 4
+-- Module-local counters for tests/probes (never in storage).
+M.counts = { container_scans = 0, machine_scans = 0, rounds = 0 }
 local container_types
 local machine_names
 
@@ -734,7 +740,12 @@ end
 function M.contents_cmd(cmd)
   local s = storage.f3d
   if tonumber(cmd.on) == 1 then
-    s.altc = { g = math.floor(tonumber(cmd.g) or 0), sent = {}, msent = {}, due = game.tick, lf = tonumber(cmd.lf) == 1 }
+    local g = math.floor(tonumber(cmd.g) or 0)
+    local lf = tonumber(cmd.lf) == 1
+    if perf.on("alt_cadence") and s.altc and s.altc.g == g and s.altc.lf == lf then
+      return
+    end
+    s.altc = { g = g, sent = {}, msent = {}, due = game.tick, lf = lf }
   else
     s.altc = nil
   end
@@ -744,7 +755,7 @@ end
 function M.contents_forget()
   local c = storage.f3d.altc
   if c then
-    c.sent, c.msent, c.round, c.due = {}, {}, nil, game.tick
+    c.sent, c.msent, c.round, c.due, c.last_fx, c.last_fy = {}, {}, nil, game.tick, nil, nil
   end
 end
 
@@ -774,13 +785,42 @@ local function contents_row(unit, names)
   return row
 end
 
+local function area_strips(f)
+  local r = f.r
+  if r <= 64 then
+    return { { { f.x - r, f.y - r }, { f.x + r, f.y + r } } }, CONTENTS_FIND_PRICE
+  end
+  return {
+    { { f.x - r, f.y - r }, { f.x + r, f.y } },
+    { { f.x - r, f.y }, { f.x + r, f.y + r } },
+  }, math.floor(CONTENTS_FIND_PRICE / 2)
+end
+
+local function append_unique(round, found)
+  local added = round.added
+  local list = round.list
+  for _, e in ipairs(found) do
+    local u = e.unit_number
+    if not u or not added[u] then
+      if u then
+        added[u] = true
+      end
+      list[#list + 1] = e
+    end
+  end
+end
+
 local function contents_tick()
   local s = storage.f3d
   local c = s.altc
   if not c then
     return
   end
+  local cadence = perf.on("alt_cadence")
   local round = c.round
+  if not cadence and round and round.searches then
+    c.round, round = nil, nil
+  end
   if not round then
     if game.tick < (c.due or 0) then
       return
@@ -791,27 +831,79 @@ local function contents_tick()
       return
     end
     local machines = perf.on("alt_machines") and present_machine_names(perf.on("alt_ammo_fuel"), c.lf) or {}
-    local price = CONTENTS_FIND_PRICE * (#machines > 0 and 2 or 1)
-    if not budget.can(price, "altc", 0.1) then
-      return
-    end
-    budget.spend(price, "altc")
     local f = s.focus
-    local area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } }
-    round = { i = 1, seen = {}, list = surface.find_entities_filtered({ area = area, type = types }) }
-    if #machines > 0 then
-      -- After the chests, in the same round.
-      for _, e in ipairs(surface.find_entities_filtered({ area = area, name = machines })) do
-        round.list[#round.list + 1] = e
+    if not cadence then
+      local price = CONTENTS_FIND_PRICE * (#machines > 0 and 2 or 1)
+      if not budget.can(price, "altc", 0.1) then
+        return
+      end
+      budget.spend(price, "altc")
+      local area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } }
+      round = { i = 1, seen = {}, list = surface.find_entities_filtered({ area = area, type = types }) }
+      M.counts.container_scans = M.counts.container_scans + 1
+      if #machines > 0 then
+        -- After the chests, in the same round.
+        for _, e in ipairs(surface.find_entities_filtered({ area = area, name = machines })) do
+          round.list[#round.list + 1] = e
+        end
+        M.counts.machine_scans = M.counts.machine_scans + 1
+      end
+      c.round = round
+    else
+      local strips, find_price = area_strips(f)
+      if not budget.can(find_price, "altc", 0.1) then
+        return
+      end
+      budget.spend(find_price, "altc")
+      local moved = c.last_fx and math.max(math.abs(f.x - c.last_fx), math.abs(f.y - c.last_fy)) or 0
+      c.last_fx, c.last_fy = f.x, f.y
+      local searches = {}
+      for _, box in ipairs(strips) do
+        searches[#searches + 1] = { "container", box }
+      end
+      if #machines > 0 then
+        for _, box in ipairs(strips) do
+          searches[#searches + 1] = { "machine", box }
+        end
+      end
+      round = { i = 1, seen = {}, list = {}, added = {}, searches = searches, si = 2, find_tick = game.tick,
+        find_price = find_price, moved = moved, r = f.r }
+      append_unique(round, surface.find_entities_filtered({ area = searches[1][2], type = types }))
+      M.counts.container_scans = M.counts.container_scans + 1
+      c.round = round
+    end
+  elseif cadence and round.si and round.si <= #round.searches and game.tick > (round.find_tick or -1) then
+    local surface = game.get_surface(s.surface_index)
+    local step = round.searches[round.si]
+    local find_price = round.find_price or CONTENTS_FIND_PRICE
+    if surface and surface.valid and budget.can(find_price, "altc", 0.1) then
+      budget.spend(find_price, "altc")
+      round.si = round.si + 1
+      round.find_tick = game.tick
+      if step[1] == "container" then
+        local types = present_container_types()
+        if #types > 0 then
+          append_unique(round, surface.find_entities_filtered({ area = step[2], type = types }))
+          M.counts.container_scans = M.counts.container_scans + 1
+        end
+      else
+        local machines = perf.on("alt_machines") and present_machine_names(perf.on("alt_ammo_fuel"), c.lf) or {}
+        if #machines > 0 then
+          append_unique(round, surface.find_entities_filtered({ area = step[2], name = machines }))
+          M.counts.machine_scans = M.counts.machine_scans + 1
+        end
       end
     end
-    c.round = round
   end
   c.msent = c.msent or {}
+  local searches_done = not round.searches or round.si > #round.searches
   local out, mout
   for _ = 1, CONTENTS_PER_TICK do
     local e = round.list[round.i]
     if e == nil then
+      if not searches_done then
+        break
+      end
       -- The round is over: chests and machines not in it any more lose their icons.
       for unit in pairs(c.sent) do
         if not round.seen[unit] then
@@ -827,8 +919,13 @@ local function contents_tick()
           mout[#mout + 1] = { unit }
         end
       end
+      local interval = CONTENTS_ROUND
+      if cadence and (round.moved or 0) >= MOVE_CADENCE_TILES and (round.moved or 0) < (round.r or math.huge) then
+        interval = CONTENTS_ROUND_MOVE
+      end
       c.round = nil
-      c.due = game.tick + CONTENTS_ROUND * rate.factor("ac")
+      c.due = game.tick + interval * rate.factor("ac")
+      M.counts.rounds = M.counts.rounds + 1
       break
     end
     local chest = not e.valid or CONTAINER_SET[e.type]

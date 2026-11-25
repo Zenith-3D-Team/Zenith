@@ -12,6 +12,7 @@ extends RefCounted
 ## world can load it and build the chunk again.
 
 const TerrainTextures := preload("res://scripts/world/terrain_textures.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const SIZE := 32
 ## Water is drawn below the land. Where land meets water (or a neighbour that isn't loaded yet)
@@ -33,6 +34,8 @@ const VOID := 3
 const DECK_BOTTOM := -0.6
 const PADDED := SIZE + 2  # a chunk's tiles plus a one-tile border from its neighbours
 const COARSE := 4  # tiles a side of a far chunk's ground quads (`coarse`)
+## --terrain-opt=old: the coast's quads stay in `land`, drawn with Visuals' one terrain_old.gdshader.
+static var shore_split: bool = not (Switches.has("--terrain-opt=old"))
 const SIDES: Array[Vector2i] = [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
 ## The 8 neighbours in the shaders' mask order: E W S N SE SW NE NW (Factorio's x east, y south).
 const NEIGHBOURS: Array[Vector2i] = [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1),
@@ -56,6 +59,11 @@ var slots := PackedInt32Array()  # cached variant slots (x + 64 * y), empty: wor
 var coarse := false
 # --- output -----------------------------------------------------------------------------------
 var land: TerrainSurface
+## The coast's quads (terrain_shore.gdshader, Visuals.terrain_shore_material()): the wet shelf under a land
+## tile that touches water, that tile itself, and the shelf over the water beside it. Their shader cuts the
+## ragged shore with `discard`, which the rest of the ground (`land`, terrain.gdshader) has none of, so the
+## interior keeps the hardware's early depth test. Empty with --terrain-opt=old (all in `land`).
+var shore: TerrainSurface
 var water: TerrainSurface
 ## Ids drawn without their picture because it isn't loaded (yet).
 var missing := PackedInt32Array()
@@ -68,6 +76,7 @@ var _plain := {}  # id -> TileGfx standing in for one whose picture isn't loaded
 func run() -> void:
 	var t0 := Time.get_ticks_usec()
 	land = TerrainSurface.new()
+	shore = TerrainSurface.new()
 	water = TerrainSurface.new()
 	if tile_ids.size() == SIZE * SIZE:
 		_mesh()
@@ -101,7 +110,9 @@ func _mesh() -> void:
 	if coarse:
 		_mesh_coarse(kinds, slot)
 		return
-	var shore := PackedFloat32Array()
+	var shore_corners := PackedFloat32Array()
+	# Where the coast's quads go: their own surface, or with --terrain-opt=old the land's.
+	var coast_surface: TerrainSurface = shore if shore_split else land
 	var x0 := coord.x * SIZE
 	var z0 := coord.y * SIZE
 	for ty in SIZE:
@@ -120,8 +131,8 @@ func _mesh() -> void:
 				uv = Rect2(Vector2(s % 64, s / 64) * slot, slot)
 				color = Color.WHITE
 			if kinds[pi] == WATER:
-				if shore.is_empty():
-					shore = _shore_corners(kinds)
+				if shore_corners.is_empty():
+					shore_corners = _shore_corners(kinds)
 				var c := ty * (SIZE + 1) + tx
 				var other := _other_water(ids, pi, g.layer)
 				var shares := Vector4.ZERO
@@ -130,7 +141,7 @@ func _mesh() -> void:
 						_share(ids, (ty + 1) * PADDED + tx + 1, other), _share(ids, (ty + 1) * PADDED + tx, other))
 				var wc := _color(id)
 				water.quad(Vector3(x, WATER_Y, z), Vector3(x + 1.0, WATER_Y, z), Vector3(x + 1.0, WATER_Y, z + 1.0), Vector3(x, WATER_Y, z + 1.0), Vector3.UP,
-					Color(wc, shore[c]), Color(wc, shore[c + 1]), Color(wc, shore[c + SIZE + 2]), Color(wc, shore[c + SIZE + 1]),
+					Color(wc, shore_corners[c]), Color(wc, shore_corners[c + 1]), Color(wc, shore_corners[c + SIZE + 2]), Color(wc, shore_corners[c + SIZE + 1]),
 					uv, Color(g.layer, other, 0.0, 0.0), Color(), shares)
 				var land_bits := _mask(kinds, pi, LAND) if textured else 0
 				if land_bits != 0:
@@ -138,7 +149,7 @@ func _mesh() -> void:
 					var lid := _land_neighbour(ids, pi)
 					var lg := _gfx(lid)
 					var lc := Color.WHITE if lg.layer >= 0 else _color(lid)
-					land.quad(Vector3(x, SHELF_Y, z), Vector3(x + 1.0, SHELF_Y, z), Vector3(x + 1.0, SHELF_Y, z + 1.0), Vector3(x, SHELF_Y, z + 1.0), Vector3.UP,
+					coast_surface.quad(Vector3(x, SHELF_Y, z), Vector3(x + 1.0, SHELF_Y, z), Vector3(x + 1.0, SHELF_Y, z + 1.0), Vector3(x, SHELF_Y, z + 1.0), Vector3.UP,
 						lc, lc, lc, lc, Rect2(), Color(lg.layer, -1.0, -1.0, 0.0), Color(land_bits, SHELF_OVER_WATER, 0.0, 0.0))
 				continue
 			if g.layer < 0:
@@ -147,13 +158,15 @@ func _mesh() -> void:
 				color = Color(color.r * shade, color.g * shade, color.b * shade)
 			var spread := _spreading(spreads, prio, pi, g.layer)
 			var wet := _mask(kinds, pi, WATER) if textured else 0
-			land.quad(Vector3(x, 0.0, z), Vector3(x + 1.0, 0.0, z), Vector3(x + 1.0, 0.0, z + 1.0), Vector3(x, 0.0, z + 1.0), Vector3.UP,
+			# A tile with water beside it is cut back raggedly by its shader: the coast's surface.
+			var ground_surface: TerrainSurface = coast_surface if wet != 0 else land
+			ground_surface.quad(Vector3(x, 0.0, z), Vector3(x + 1.0, 0.0, z), Vector3(x + 1.0, 0.0, z + 1.0), Vector3(x, 0.0, z + 1.0), Vector3.UP,
 				color, color, color, color, uv, spread, Color(wet, 0.0, _floor(g), g.surface))
 			var plain := Color(g.layer, -1.0, -1.0, 0.0)
 			if wet != 0:
 				# The ground's edge is cut back raggedly along the water (terrain.gdshader); this
 				# wet shelf just above the water shows underneath.
-				land.quad(Vector3(x, SHELF_Y, z), Vector3(x + 1.0, SHELF_Y, z), Vector3(x + 1.0, SHELF_Y, z + 1.0), Vector3(x, SHELF_Y, z + 1.0), Vector3.UP,
+				coast_surface.quad(Vector3(x, SHELF_Y, z), Vector3(x + 1.0, SHELF_Y, z), Vector3(x + 1.0, SHELF_Y, z + 1.0), Vector3(x, SHELF_Y, z + 1.0), Vector3.UP,
 					color, color, color, color, uv, plain, Color(wet, SHELF_UNDER_LAND, 0.0, 0.0))
 				# And water under it all, where the coast bites into the tile.
 				var wid := _water_neighbour(ids, pi)
@@ -416,15 +429,15 @@ func _share(ids: PackedInt32Array, pi: int, other: int) -> float:
 ## 1.0 at tile corners (SIZE + 1 squared, row by row) that touch a land tile, else 0.0. The
 ## water shader draws foam where this, interpolated across each tile, is high.
 static func _shore_corners(kinds: PackedByteArray) -> PackedFloat32Array:
-	var shore := PackedFloat32Array()
-	shore.resize((SIZE + 1) * (SIZE + 1))
+	var corners := PackedFloat32Array()
+	corners.resize((SIZE + 1) * (SIZE + 1))
 	for cy in SIZE + 1:
 		for cx in SIZE + 1:
 			# The corner's four tiles in padded coordinates are (cx, cy) to (cx + 1, cy + 1).
 			var k := cy * PADDED + cx
 			if kinds[k] == LAND or kinds[k + 1] == LAND or kinds[k + PADDED] == LAND or kinds[k + PADDED + 1] == LAND:
-				shore[cy * (SIZE + 1) + cx] = 1.0
-	return shore
+				corners[cy * (SIZE + 1) + cx] = 1.0
+	return corners
 
 
 ## Mesh arrays for one terrain surface, filled a quad at a time. UV is the tile's slot in its

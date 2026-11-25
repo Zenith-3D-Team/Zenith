@@ -30,6 +30,7 @@ const MAX_DT := 1.0 / 60.0
 const SMOOTHING := 0.1
 
 const Settings := preload("res://scripts/menu/settings.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## The frame length last given to the shaders (0: no smear this frame).
 static var frame_dt := 0.0
@@ -39,6 +40,12 @@ static var _smooth := -1.0
 static var _off := -1
 ## The process frame before which belts aren't smeared (sharp_frames()).
 static var _sharp_until := 0
+## The shaders' clock for standing buildings (factorio_material.gdshaderinc f3d_time, --static-mv):
+## TIME's twin (the same frame steps, wrapped at the same rollover), set here every frame since
+## both world.gd and the model preview call frame().
+static var shader_time := 0.0
+static var _rollover := -1.0
+static var _time_frame := -1  # the process frame shader_time last stepped on (once a frame)
 
 
 ## Tiles a belt of `speed` tiles a second is smeared over in a frame of `dt` seconds, as the shader
@@ -56,11 +63,12 @@ static func sharp_frames(frames := 2) -> void:
 	RenderingServer.global_shader_parameter_set(&"f3d_frame_dt", 0.0)
 
 
-## Whether belts are drawn without the smear this frame: --no-belt-smear, sharp_frames() or TAA.
+## Whether belts are drawn without the smear this frame: --no-belt-smear, sharp_frames(), TAA,
+## or FSR 2.2 when its belt reactive mask is disabled.
 static func sharp_now() -> bool:
 	if _off < 0:
-		_off = 1 if OS.get_cmdline_user_args().has("--no-belt-smear") else 0
-	return _off == 1 or Engine.get_process_frames() < _sharp_until or Settings.taa_on()
+		_off = 1 if Switches.has("--no-belt-smear") else 0
+	return _off == 1 or Engine.get_process_frames() < _sharp_until or Settings.taa_on() or (Settings.fsr2_active() and not Settings.belt_reactive_mask_active())
 
 
 ## This frame's length for the shaders (`delta`: under --fixed-fps it is 1/fps, as TIME's step).
@@ -69,3 +77,11 @@ static func frame(delta: float) -> void:
 	_smooth = capped if _smooth < 0.0 else lerpf(_smooth, capped, SMOOTHING)
 	frame_dt = 0.0 if sharp_now() else _smooth
 	RenderingServer.global_shader_parameter_set(&"f3d_frame_dt", frame_dt)
+	if _rollover < 0.0:
+		_rollover = maxf(float(ProjectSettings.get_setting("rendering/limits/time/time_rollover_secs", 3600.0)), 1.0)
+	var f := Engine.get_process_frames()
+	if f == _time_frame:
+		return
+	_time_frame = f
+	shader_time = fmod(shader_time + maxf(delta, 0.0), _rollover)
+	RenderingServer.global_shader_parameter_set(&"f3d_time", shader_time)

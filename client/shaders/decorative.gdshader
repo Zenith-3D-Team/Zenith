@@ -6,12 +6,16 @@ shader_type spatial;
 render_mode cull_disabled, shadows_disabled;
 
 #include "res://shaders/ground_height.gdshaderinc"
+#include "res://shaders/lamp_light.gdshaderinc"
 
 uniform sampler2D atlas : source_color, filter_linear_mipmap_anisotropic, repeat_disable;
 uniform bool upright = false;
 
+varying vec2 world_xz;
+
 void vertex() {
 	UV = vec2(INSTANCE_CUSTOM.x + UV.x * INSTANCE_CUSTOM.y, UV.y * INSTANCE_CUSTOM.z);
+	world_xz = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xz;
 	if (!upright) {
 		VERTEX = ground_lift(VERTEX, MODEL_MATRIX);
 	} else {
@@ -33,6 +37,7 @@ global uniform float f3d_look_ground_specular;  // looks.gd "ground_specular"
 void fragment() {
 	vec4 c = texture(atlas, UV);
 	ALBEDO = c.rgb;
+	EMISSION = lamp_light_emission(ALBEDO, world_xz, 0.0, 0.8);
 	SPECULAR = 0.5 * f3d_look_ground_specular;
 	ALPHA = c.a;
 	ALPHA_SCISSOR_THRESHOLD = 0.4;

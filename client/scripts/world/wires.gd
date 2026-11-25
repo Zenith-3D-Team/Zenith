@@ -11,6 +11,8 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 const KINDS := ["w", "r", "g"]
 ## Factorio's wire sprites: copper is a warm orange-brown, circuit wires plain red and green.
@@ -46,6 +48,7 @@ var _spans := 0
 ## The remote view's fog (remote_fog.gd): wires starting in chunks no radar sees are hidden (G18).
 var fog: Node
 var _fogged := false
+var _behind_connected: Object = null
 
 
 func _ready() -> void:
@@ -55,6 +58,46 @@ func _ready() -> void:
 	_material.shader = preload("res://shaders/wire.gdshader")
 	if world != null:
 		world.entities_changed.connect(_on_entities_changed)
+	_watch_behind()
+
+
+func _watch_behind() -> void:
+	if world == null or not is_instance_valid(world):
+		return
+	var bc: Variant = world.get("behind_cull")
+	if bc == _behind_connected or bc == null or not is_instance_valid(bc):
+		return
+	_behind_connected = bc
+	if bc.has_signal("chunk_visibility_changed"):
+		bc.chunk_visibility_changed.connect(_on_behind_visibility)
+
+
+func _behind_allows(c: Vector2i) -> bool:
+	if not ViewPriority.tight_cull or world == null or not is_instance_valid(world):
+		return true
+	var bc: Variant = world.get("behind_cull")
+	if bc == null or not is_instance_valid(bc) or not bc.is_active():
+		return true
+	if not bc.hidden(c):
+		return true
+	for d: Vector2i in [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]:
+		var n := c + d
+		if world.chunks.has(n) and not bc.hidden(n):
+			return true
+	return false
+
+
+func _chunk_visible(c: Vector2i) -> bool:
+	var hiding: bool = fog != null and fog.hiding()
+	var fog_ok: bool = not hiding or bool(fog.seen(Vector2(c) * 32.0 + Vector2(16, 16)))
+	return fog_ok and _behind_allows(c)
+
+
+func _on_behind_visibility(c: Vector2i, _drawn: bool) -> void:
+	for n: Vector2i in [c, c + Vector2i(1, 0), c + Vector2i(-1, 0), c + Vector2i(0, 1), c + Vector2i(0, -1)]:
+		var mi: MeshInstance3D = _meshes.get(n)
+		if mi != null and is_instance_valid(mi):
+			mi.visible = _chunk_visible(n)
 
 
 func reset() -> void:
@@ -96,10 +139,14 @@ func _process(_delta: float) -> void:
 	for c in _dirty.keys():
 		# Also within its slice (frame_budget.gd `wires`, at least one): each new chunk dirties its eight neighbours, and on
 		# the owner's busy save a frame of rebuilds took 4-7 ms while walking.
-		if allow <= 0 or budget <= 0 or (budget < REBUILDS_PER_FRAME and Time.get_ticks_usec() - started > allow):
+		# (And not one more than fits: a rebuild's typical cost counted before it, FrameBudget.item_est, --budget-predict.)
+		if allow <= 0 or budget <= 0 or (budget < REBUILDS_PER_FRAME and Time.get_ticks_usec() - started > allow) \
+				or not FrameBudget.fits(started, allow, REBUILDS_PER_FRAME - budget, FrameBudget.item_est(&"wires")):
 			break
 		_dirty.erase(c)
+		var tr := Time.get_ticks_usec()
 		_rebuild(c)
+		FrameBudget.note_item(&"wires", Time.get_ticks_usec() - tr)
 		budget -= 1
 	FrameBudget.spent(&"wires", Time.get_ticks_usec() - started, _dirty.size())
 
@@ -127,7 +174,7 @@ func _rebuild(c: Vector2i) -> void:
 			var list = rec.extra.get(kind)
 			if list is Array and not (list as Array).is_empty():
 				wired = true
-			for other_unit in _array(list):
+			for other_unit in Wire.array(list):
 				var other: WorldMirror.Rec = world.entities.get(int(other_unit))
 				if other == null or other.extra.has("gh"):
 					continue
@@ -150,6 +197,7 @@ func _rebuild(c: Vector2i) -> void:
 		_meshes[c] = mi
 	mi.mesh = tube.mesh(_material)
 	mi.set_meta("spans", spans)
+	mi.visible = _chunk_visible(c)
 	_spans += spans
 
 
@@ -185,14 +233,10 @@ func _add_span(tube: Tube, a: Vector3, b: Vector3, kind: String) -> void:
 
 
 static func _lists(rec: WorldMirror.Rec, kind: String, unit: int) -> bool:
-	for u in _array(rec.extra.get(kind)):
+	for u in Wire.array(rec.extra.get(kind)):
 		if int(u) == unit:
 			return true
 	return false
-
-
-static func _array(v) -> Array:
-	return v if v is Array else []
 
 
 ## Thin three-sided tubes along polylines, in one surface with vertex colours.
@@ -241,6 +285,7 @@ class Tube:
 
 ## Under the remote view's fog, a chunk's wires show only where it is seen; out of it, all of them.
 func _apply_fog() -> void:
+	_watch_behind()
 	var hiding: bool = fog != null and fog.hiding()
 	if not hiding and not _fogged:
 		return
@@ -248,4 +293,4 @@ func _apply_fog() -> void:
 	for c in _meshes:
 		var mi: MeshInstance3D = _meshes[c]
 		if is_instance_valid(mi):
-			mi.visible = not hiding or fog.seen(Vector2(c) * 32.0 + Vector2(16, 16))
+			mi.visible = _chunk_visible(c)

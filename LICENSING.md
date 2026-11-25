@@ -40,6 +40,9 @@ These keep their own terms. They are separate works shipped alongside Zenith:
   printable release (listed in
   [client/assets/models/packs/wube3dp/CREDITS.md](client/assets/models/packs/wube3dp/CREDITS.md)),
   under Wube's CC BY-NC licence.
+- **`addons-src/immersive-weather/sounds/`** (wind, rain and thunder audio clips):
+  from *Weather Elements* by Helton Yan (https://heltonyan.itch.io/weatherelements), CC BY 4.0;
+  see [addons-src/immersive-weather/CREDITS.md](addons-src/immersive-weather/CREDITS.md).
 - **Factorio** itself and its graphics, sounds and fonts are © Wube Software and aren't part of
   Zenith: the client reads them from your own Factorio install.
 

@@ -21,6 +21,9 @@ extends RefCounted
 
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
+const FrameBudget := preload("res://scripts/world/frame_budget.gd")
+const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Pixels a tile is drawn at, at a chunk's nearest belt, below which its belts go flat, and above
 ## which they are drawn in full again. The default camera draws its farthest ground at about 28 px a
@@ -28,6 +31,8 @@ const MaterialRows := preload("res://scripts/world/material_rows.gd")
 ## and its rollers half one.
 const FLAT_BELOW := 20.0
 const FULL_ABOVE := 24.0
+const LOD_QUALITY_SCALE := {"low": 1.9, "medium": 1.0, "high": 0.85, "ultra": 0.70}
+static var lod_scale := 1.0
 ## The tallest picture these thresholds count, in lines: a taller one is measured as if this tall,
 ## so 4K draws as many belt triangles as 1080p. Measured in real pixels, belts at 4K only went flat
 ## 171 tiles out, past the furthest default zoom, and stayed at 1,450 triangles a tile however far
@@ -41,9 +46,17 @@ const FLAT := &"flat"
 const JOBS := 2
 ## Seconds between looks when the camera hasn't moved.
 const CHECK_INTERVAL := 0.25
+## Minimum deadband quantization step in tiles when `move_deadband` is active.
+const DEADBAND_TILES := 4.0
+## Minimum tracked belt chunks before time-slicing kicks in under FrameBudget.
+const SLICE_MIN_CHUNKS := 64
 
 ## --no-belt-stand-ins: full belts everywhere (for comparing).
-static var enabled := not ("--no-belt-stand-ins" in OS.get_cmdline_user_args())
+static var enabled := not (Switches.has("--no-belt-stand-ins"))
+## --belt-lods-every-frame: re-check belt stand-ins on every transform change instead of quantizing position.
+static var move_deadband := not (Switches.has("--belt-lods-every-frame"))
+## --belt-lods-slice=off: check every tracked belt chunk in a single frame instead of time-slicing.
+static var slice_enabled := Switches.on("--belt-lods-slice")
 ## Mesh -> its stand-in (ArrayMesh, empty until its job is done), or null: none (not a mesh it can make).
 static var _stand_ins := {}
 static var _ready := {}  # stand-in -> true once it has its shape
@@ -54,6 +67,15 @@ static var _chunks := {}
 static var _dirty := false
 static var _timer := 0.0
 static var _last_view := []
+static var _pass_todo: Array = []
+static var _pass_next := 0
+static var _pass_by_cam := true
+static var _pass_at := Vector3.ZERO
+static var _pass_cam: Camera3D
+static var _pass_pixels := 0.0
+static var _pass_ortho := false
+static var _pass_ref_focal := 0.0
+static var _pass_zoom_px := INF
 
 
 ## The plan a stand-in is made on: "s" straight, "l"/"r" curves, "u" underground ends, "x" splitters.
@@ -112,36 +134,120 @@ static func untrack(cv) -> void:
 	_chunks.erase(cv)
 
 
+static func apply_lod_quality(quality: String, custom_distance := 0.0) -> void:
+	var want: float
+	if custom_distance > 0.0:
+		want = clampf(ModelLods.LOD_DIST_REF / custom_distance, 0.4, 3.2)
+	elif ModelLods.old_low_lod and quality.to_lower() == "low":
+		want = 1.0
+	else:
+		want = float(LOD_QUALITY_SCALE.get(quality.to_lower(), 1.0))
+	if not is_equal_approx(lod_scale, want):
+		lod_scale = want
+		_dirty = true
+
+
 ## Each frame (far_chunks.gd): finishes stand-ins made on workers, and sets each chunk with belts
 ## flat or full by how big a tile is drawn at its nearest belt.
 static func update(world, cam: Camera3D, delta: float) -> void:
 	_poll(world)
 	_timer += delta
-	if cam == null:
+	var by_cam: bool = true if world == null or world.get("lod_by_camera") == null else bool(world.get("lod_by_camera"))
+	if by_cam and cam == null:
 		return
-	var vp := cam.get_viewport()
+	var vp := cam.get_viewport() if cam != null and cam.is_inside_tree() else null
 	# Real pixels: a window's visible rect is in the interface's units, which the UI scale divides.
 	var size := Vector2(1920, 1080)
 	if vp != null:
 		size = Vector2((vp as Window).size) if vp is Window else vp.get_visible_rect().size
+	elif world != null and world.is_inside_tree():
+		size = world.get_viewport().get_visible_rect().size
 	var scale := 1.0
 	if vp != null and vp.scaling_3d_mode != Viewport.SCALING_3D_MODE_FSR2:
 		scale = vp.scaling_3d_scale
-	var view := [cam.global_transform, cam.projection, cam.fov, cam.size, size, scale, enabled]
-	if not _dirty and _timer < CHECK_INTERVAL and view == _last_view:
+	var at := Vector3.ZERO
+	var view: Array
+	var zoom_q := 0.0
+	if not by_cam:
+		var f: Vector2 = world.focus() if world != null and world.has_method("focus") else Vector2.ZERO
+		at = Vector3(f.x, 0.0, f.y)
+		if ViewPriority.char_lod_zoom and cam != null:
+			var cam_d := ViewPriority.camera_zoom_distance(cam, f)
+			if cam_d >= 48.0:
+				zoom_q = floorf(cam_d / 8.0) * 8.0
+		view = [(at / DEADBAND_TILES).round(), size, scale, enabled, false, lod_scale, ViewPriority.char_lod_zoom, zoom_q]
+		if zoom_q > 0.0 and cam != null:
+			view.append_array([cam.projection, roundi(cam.fov * 10.0), roundi(cam.size * 10.0)])
+	elif move_deadband:
+		at = cam.global_position
+		var step := clampf(floorf(at.y * 0.08 / 2.0) * 2.0, DEADBAND_TILES, 12.0)
+		view = [(at / step).round(), step, cam.projection, roundi(cam.fov * 10.0), roundi(cam.size * 10.0),
+			cam.keep_aspect, size, scale, enabled, true, lod_scale]
+	else:
+		at = cam.global_position
+		view = [cam.global_transform, cam.projection, cam.fov, cam.size, size, scale, enabled, true, lod_scale]
+	var slicing := _pass_next < _pass_todo.size()
+	if not slicing and not _dirty and _timer < CHECK_INTERVAL and view == _last_view:
 		return
-	_timer = 0.0
-	_dirty = false
-	_last_view = view
-	var at := cam.global_position
-	var pixels := view_pixels(size, scale, cam.keep_aspect == Camera3D.KEEP_WIDTH)
-	var orthographic := cam.projection == Camera3D.PROJECTION_ORTHOGONAL
-	for cv in _chunks.keys():
+	if _dirty or view != _last_view or (not slicing and _timer >= CHECK_INTERVAL):
+		_timer = 0.0
+		_dirty = false
+		_last_view = view
+		_pass_todo = _chunks.keys()
+		_pass_next = 0
+		_pass_by_cam = by_cam
+		_pass_at = at
+		_pass_cam = cam
+		var keep_w := cam != null and cam.keep_aspect == Camera3D.KEEP_WIDTH
+		_pass_pixels = view_pixels(size, scale, keep_w)
+		_pass_ortho = by_cam and cam.projection == Camera3D.PROJECTION_ORTHOGONAL
+		_pass_ref_focal = _pass_pixels / maxf(2.0 * tan(deg_to_rad(35.0 * 0.5)), 0.001)
+		if not ViewPriority.char_lod_zoom or cam == null or zoom_q <= 0.0:
+			_pass_zoom_px = INF
+		elif cam.projection == Camera3D.PROJECTION_ORTHOGONAL:
+			_pass_zoom_px = _pass_pixels / maxf(cam.size, 0.01)
+		else:
+			_pass_zoom_px = (_pass_pixels / maxf(2.0 * tan(deg_to_rad(clampf(cam.fov, 5.0, 170.0) * 0.5)), 0.001)) / maxf(zoom_q, 0.01)
+	if _pass_next >= _pass_todo.size():
+		_pass_todo = []
+		_pass_next = 0
+		_pass_cam = null
+		FrameBudget.waiting(&"belt_lods", 0)
+		return
+	var use_slice := slice_enabled and not ModelLods.full_detail and _pass_todo.size() >= SLICE_MIN_CHUNKS
+	var allow := 0x3fffffff
+	if use_slice:
+		allow = FrameBudget.grant(&"belt_lods")
+		if FrameBudget.shared and allow <= 0:
+			FrameBudget.waiting(&"belt_lods", _pass_todo.size() - _pass_next)
+			return
+	var t0 := Time.get_ticks_usec()
+	var did := 0
+	while _pass_next < _pass_todo.size():
+		if use_slice and did > 0 and (did & 15) == 0 and Time.get_ticks_usec() - t0 >= allow:
+			break
+		var cv = _pass_todo[_pass_next]
+		_pass_next += 1
 		if not is_instance_valid(cv):
 			_chunks.erase(cv)
 			continue
-		var px := tile_pixels(cam, at, pixels, cv.belt_bounds)
-		cv.set_belt_flat(enabled and flat_at(px, cv.belt_flat, orthographic))
+		var px: float
+		if not _pass_by_cam:
+			var d := _pass_at.distance_to(_pass_at.clamp(cv.belt_bounds.position, cv.belt_bounds.end))
+			px = minf(_pass_ref_focal / maxf(d, 0.01), _pass_zoom_px)
+		else:
+			if not is_instance_valid(_pass_cam):
+				break
+			px = tile_pixels(_pass_cam, _pass_at, _pass_pixels, cv.belt_bounds)
+		cv.set_belt_flat(enabled and flat_at(px, cv.belt_flat, _pass_ortho))
+		did += 1
+	if _pass_next >= _pass_todo.size():
+		_pass_todo = []
+		_pass_next = 0
+		_pass_cam = null
+	var rem := maxi(_pass_todo.size() - _pass_next, 0)
+	if use_slice or did > 0:
+		FrameBudget.spent(&"belt_lods", Time.get_ticks_usec() - t0, rem)
 
 
 ## The window's height (or width, for a camera keeping its width) as tile_pixels() counts it: the
@@ -157,10 +263,13 @@ static func view_pixels(size: Vector2, scale: float, keep_width := false) -> flo
 ## gap: a tile is the same size wherever the camera is, so only zooming can cross the line, and
 ## Factorio's view (F6), which shows more ground in a bigger window, comes to 21.5 at 4K: with the
 ## gap belts flat when it was snapped to would stay flat there.
-static func flat_at(px: float, was_flat: bool, orthographic: bool) -> bool:
-	if px > (FLAT_BELOW if orthographic else FULL_ABOVE):
+static func flat_at(px: float, was_flat: bool, orthographic: bool, scale := -1.0) -> bool:
+	var s := lod_scale if scale <= 0.0 else clampf(scale, 0.4, 3.2)
+	var fb := FLAT_BELOW * s
+	var fa := FULL_ABOVE * s
+	if px > (fb if orthographic else fa):
 		return false
-	return px < FLAT_BELOW or was_flat
+	return px < fb or was_flat
 
 
 ## How many pixels tall one tile is drawn at the nearest point of `box`, for `pixels` from
@@ -192,6 +301,17 @@ static func _poll(world) -> void:
 	for cv in _chunks.keys():
 		if is_instance_valid(cv) and cv.belt_waiting:
 			world.redraw(cv.coord)
+
+
+## Quitting or leaving a game (main.gd _exit_tree): waits for the stand-ins being made on workers and puts them in
+## (a task still running when Godot stops its renderer can wait for it for ever); the queue, not started, stays.
+static func wait_running() -> void:
+	for entry in _running:
+		if int(entry[0]) >= 0:
+			WorkerThreadPool.wait_for_task_completion(entry[0])
+	for entry in _running:
+		_commit(entry[1], entry[2], entry[3])
+	_running.clear()
 
 
 ## Makes every stand-in asked for now, waiting for the workers (tests).
