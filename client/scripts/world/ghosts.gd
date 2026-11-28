@@ -15,13 +15,18 @@ const WorldMirror := preload("res://scripts/world/world.gd")
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const PipeCovers := preload("res://scripts/world/pipe_covers.gd")
+const InserterArms := preload("res://scripts/world/inserter_arms.gd")
 const FluidsPower := preload("res://scripts/world/fluids_power.gd")
 const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
+const Turrets := preload("res://scripts/world/turrets.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
+const RenderReads := preload("res://scripts/world/render_reads.gd")
 const GhostShader := preload("res://shaders/ghost.gdshader")
 const GhostDepthShader := preload("res://shaders/ghost_depth.gdshader")
 const IconShader := preload("res://shaders/billboard_icon.gdshader")
 const Switches := preload("res://scripts/switches.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## --ghost-lod=off: keep full-detail meshes for far entity ghosts instead of using coarse LODs.
 static var ghost_lod := Switches.on("--ghost-lod")
@@ -45,6 +50,9 @@ var _ghost_material: ShaderMaterial
 var _mark_materials := {}  # "d" / "up" -> ShaderMaterial
 var _quad := QuadMesh.new()
 var _ghosts := 0
+
+static var _baked_meshes := {}  # [Mesh, Image] -> ArrayMesh
+static var _baked_gen := -1
 
 
 func _ready() -> void:
@@ -115,6 +123,22 @@ func _rebuild(c: Vector2i) -> void:
 	var marks := {"d": [], "up": []}
 	var ghosts := 0
 	var tiles: Array = []
+	var has_capped_belt := false
+	var has_pipe_ghost := false
+	var belt_check := ModelLibrary.has_belt_ends()
+	for rec: WorldMirror.Rec in cv.entities.values():
+		if rec.extra.has("hid") or not rec.extra.has("gh"):
+			continue
+		var gp: ProtoDB.EntityProto = world.protos.entity(int(rec.extra["gh"]))
+		if gp == null:
+			continue
+		if belt_check and WorldMirror.CAPPED_TYPES.has(gp.type):
+			has_capped_belt = true
+		elif gp.type == "pipe" or gp.type == "infinity-pipe" or gp.type == "heat-pipe":
+			has_pipe_ghost = true
+	var belt_map := _local_belt_map(c) if has_capped_belt else {}
+	var pipe_map := _local_pipe_map(c) if has_pipe_ghost else {}
+
 	for rec: WorldMirror.Rec in cv.entities.values():
 		if rec.extra.has("hid"):
 			continue  # removed by the player, the game's `del` on its way (predicted.gd)
@@ -129,35 +153,48 @@ func _rebuild(c: Vector2i) -> void:
 			if shown == null:
 				continue
 			ghosts += 1
-			if not ModelLibrary.entity_ready(shown.name, shown.type, rec.extra, rec.dir):
+			var g_extra := rec.extra
+			if (shown.type == "pipe" or shown.type == "infinity-pipe" or shown.type == "heat-pipe" or shown.type == "pipe-to-ground") \
+					and int(rec.extra.get("pc", 0)) == 0 and not pipe_map.is_empty():
+				var pm := _ghost_pipe_mask(rec.pos, shown.type == "heat-pipe", pipe_map)
+				if pm != 0:
+					g_extra = rec.extra.duplicate()
+					g_extra["pc"] = pm
+			var b_ends := _ghost_belt_ends(shown.type, rec.dir, rec.pos, g_extra, belt_map) if not belt_map.is_empty() else 0
+			var cb := world.cargo_mask(WorldMirror.cargo_rect(shown, rec.pos), true) if shown.type == "cargo-bay" else -1
+			var fb: Variant = world._fluid_ports.get(shown.id)
+			if not ModelLibrary.entity_ready(shown.name, shown.type, g_extra, rec.dir):
 				cv.waiting_models = true  # drawn again with the chunk once the model is made
 				continue
-			var mesh := ModelLibrary.mesh_for_entity(shown.name, shown.type, rec.extra, rec.dir)
-			if mesh != null:
-				if not by_model.has(mesh):
-					by_model[mesh] = []
-				(by_model[mesh] as Array).append(ModelLibrary.placed(shown.name, shown.type, rec.dir, rec.extra, Vector3(rec.pos.x, 0.0, rec.pos.y)))
-				if shown.type == "cargo-bay" and not _add_cargo_pieces(shown, rec, by_model):
+			var pieces := ghost_pieces(shown.name, shown.type, g_extra, rec.dir, rec.pos, b_ends, Basis.IDENTITY, cb, fb)
+			if not pieces.is_empty():
+				if not ghost_pieces_ready(shown.name, shown.type, g_extra, rec.dir, rec.pos, b_ends, cb, fb):
 					cv.waiting_models = true
+				for piece: Array in pieces:
+					var pm: Mesh = piece[0]
+					if not by_model.has(pm):
+						by_model[pm] = []
+					(by_model[pm] as Array).append(piece[1])
 			else:
 				# No model: its picture card, as the built one (no box while it is composed, and none
 				# at all with a graphics list, as chunk_view.gd).
+				var lift := Visuals.flight_lift(shown.type)
 				var card := SpriteStandins.card(shown.name, rec.dir, shown.size(), shown.type) if shown.type != "resource" else null
 				if card != null:
 					if not cards.has(card):
 						cards[card] = []
-					(cards[card] as Array).append(SpriteStandins.transform(rec.pos))
+					(cards[card] as Array).append(SpriteStandins.transform(rec.pos, lift))
 				elif SpriteStandins.coming(shown.name, rec.dir):
 					cv.waiting_models = true
 				elif not SpriteStandins.in_use():
-					boxes.append(Visuals.placeholder_transform(shown, rec.pos, rec.dir, Visuals.height_for(shown)))
+					boxes.append(Visuals.placeholder_transform(shown, rec.pos, rec.dir, Visuals.height_for(shown), lift))
 		if shown == null:
 			continue
 		for key in marks:
 			if rec.extra.has(key):
 				var top := _top(shown, rec)
 				# Over the middle of the entity as seen from the camera, like Factorio's marks.
-				var at := Vector3(rec.pos.x, top * 0.6 + 0.2, rec.pos.y)
+				var at := Vector3(rec.pos.x, Visuals.flight_lift(shown.type) + top * 0.6 + 0.2, rec.pos.y)
 				(marks[key] as Array).append(Transform3D(Basis.from_scale(Vector3.ONE * MARK_SIZE), at))
 	if ghosts == 0 and (marks["d"] as Array).is_empty() and (marks["up"] as Array).is_empty():
 		return
@@ -182,21 +219,301 @@ func _rebuild(c: Vector2i) -> void:
 		_add(node, _quad, marks[key], _mark_materials[key])
 
 
-## A ghost bay's edge pieces, framed as it will be once built (world.cargo_mask): without them it
-## would show only its machine, about 3 by 2 of its 4 by 4 tiles. False while a piece is being made.
-func _add_cargo_pieces(proto: ProtoDB.EntityProto, rec: WorldMirror.Rec, by_model: Dictionary) -> bool:
-	var cb := world.cargo_mask(WorldMirror.cargo_rect(proto, rec.pos), true)
-	var ready := true
-	for place in ModelLibrary.cargo_places(cb, Vector3(rec.pos.x, 0.0, rec.pos.y)):
-		if not ModelLibrary.ready(place[0]):
-			ready = false
-			continue
-		var mesh := ModelLibrary.mesh_for(place[0])
+## CPU-skinned frame-0 mesh for a `baked` AnimPart (ghost.gdshader has no bone skinning pass).
+static func skinned_part_mesh(part: ModelLibrary.AnimPart) -> Mesh:
+	if part.mesh == null or part.kind != "baked" or part.bake.is_empty():
+		return part.mesh
+	if _baked_gen != ModelLibrary.generation:
+		_baked_meshes.clear()
+		_baked_gen = ModelLibrary.generation
+	var image: Image = part.bake.get("image")
+	if image == null:
+		return part.mesh
+	var key := [part.mesh, image]
+	if _baked_meshes.has(key):
+		return _baked_meshes[key]
+	var out := ArrayMesh.new()
+	for s in part.mesh.get_surface_count():
+		var arrays := RenderReads.arrays(part.mesh, s).duplicate()  # the CPU copy: no renderer read
+		var verts: PackedVector3Array = (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).duplicate()
+		var norms: PackedVector3Array = (arrays[Mesh.ARRAY_NORMAL] as PackedVector3Array).duplicate() if arrays[Mesh.ARRAY_NORMAL] != null else PackedVector3Array()
+		var tangs: PackedFloat32Array = (arrays[Mesh.ARRAY_TANGENT] as PackedFloat32Array).duplicate() if arrays[Mesh.ARRAY_TANGENT] != null else PackedFloat32Array()
+		var skin: PackedFloat32Array = arrays[Mesh.ARRAY_CUSTOM3] if arrays[Mesh.ARRAY_CUSTOM3] != null else PackedFloat32Array()
+		var has_norms := norms.size() == verts.size()
+		var has_tangs := tangs.size() == verts.size() * 4
+		for v in verts.size():
+			var m := Transform3D(Basis(Vector3.ZERO, Vector3.ZERO, Vector3.ZERO), Vector3.ZERO)
+			var total := 0.0
+			for k in 4:
+				if v * 4 + k >= skin.size():
+					break
+				var code := skin[v * 4 + k]
+				var w := fposmod(code, 1.0) / 0.999
+				if w <= 0.0:
+					continue
+				var j := int(floor(code))
+				var r0 := image.get_pixel(j * 3, 0)
+				var r1 := image.get_pixel(j * 3 + 1, 0)
+				var r2 := image.get_pixel(j * 3 + 2, 0)
+				m.basis.x += w * Vector3(r0.r, r1.r, r2.r)
+				m.basis.y += w * Vector3(r0.g, r1.g, r2.g)
+				m.basis.z += w * Vector3(r0.b, r1.b, r2.b)
+				m.origin += w * Vector3(r0.a, r1.a, r2.a)
+				total += w
+			if total > 0.0:
+				verts[v] = (m * verts[v]) / total
+				if has_norms:
+					var n := (m.basis * norms[v]) / total
+					if n.length_squared() > 1e-10:
+						norms[v] = n.normalized()
+				if has_tangs:
+					var tb := v * 4
+					var tv := (m.basis * Vector3(tangs[tb], tangs[tb + 1], tangs[tb + 2])) / total
+					if tv.length_squared() > 1e-10:
+						tv = tv.normalized()
+						tangs[tb] = tv.x
+						tangs[tb + 1] = tv.y
+						tangs[tb + 2] = tv.z
+		arrays[Mesh.ARRAY_VERTEX] = verts
+		if has_norms:
+			arrays[Mesh.ARRAY_NORMAL] = norms
+		if has_tangs:
+			arrays[Mesh.ARRAY_TANGENT] = tangs
+		var format: int = part.mesh.surface_get_format(s)
+		var flags: int = format & (Mesh.ARRAY_FLAG_USE_2D_VERTICES | Mesh.ARRAY_FLAG_USE_8_BONE_WEIGHTS)
+		for shift in [Mesh.ARRAY_FORMAT_CUSTOM0_SHIFT, Mesh.ARRAY_FORMAT_CUSTOM1_SHIFT,
+				Mesh.ARRAY_FORMAT_CUSTOM2_SHIFT, Mesh.ARRAY_FORMAT_CUSTOM3_SHIFT]:
+			flags |= format & (Mesh.ARRAY_FORMAT_CUSTOM_MASK << shift)
+		out.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays, [], {}, flags)
+		out.surface_set_material(out.get_surface_count() - 1, part.mesh.surface_get_material(s))
+	_baked_meshes[key] = out
+	return out
+
+
+## Default end-cap bitmask for a lone belt-like entity standing alone.
+static func lone_belt_ends(proto_type: String, extra: Dictionary) -> int:
+	match proto_type:
+		"transport-belt":
+			return 3 if str(extra.get("s", "s")) == "s" else 0
+		"underground-belt", "linked-belt":
+			return 2 if str(extra.get("u", "i")) == "o" else 1
+		"lane-splitter":
+			return 3
+		"splitter":
+			return 15
+	return 0
+
+
+static func _resolved_entity_model(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> Array:
+	for name: String in ModelLibrary.entity_models(proto_name, proto_type, extra, dir):
+		var mesh := ModelLibrary.mesh_for(name)
 		if mesh != null:
-			if not by_model.has(mesh):
-				by_model[mesh] = []
-			(by_model[mesh] as Array).append(Transform3D(Basis(), place[1]))
-	return ready
+			return [name, mesh]
+	return ["", null]
+
+
+## Whether the base model and every attachment/sub-piece for a ghost entity are ready.
+static func ghost_pieces_ready(proto_name: String, proto_type: String, extra: Dictionary, dir: int, pos: Vector2,
+		belt_ends: int = 0, cargo_mask := 0, fb: Variant = null, _covers := -1) -> bool:
+	if not ModelLibrary.entity_ready(proto_name, proto_type, extra, dir):
+		return false
+	var res := _resolved_entity_model(proto_name, proto_type, extra, dir)
+	var resolved: String = res[0]
+	if resolved == "":
+		return true
+	if proto_type == "inserter":
+		var at := resolved.find("@")
+		var arm_name := proto_name + (resolved.substr(at) if at >= 0 else "")
+		if InserterArms.resting_pieces(arm_name) == null:
+			return false
+	if WorldMirror.CAPPED_TYPES.has(proto_type):
+		if belt_ends > 0:
+			var pack := ModelLibrary.entity_pack(extra)
+			for place: Array in ModelLibrary.belt_end_places(proto_name, proto_type, dir, pos, belt_ends, 0.0, pack):
+				if not ModelLibrary.ready(str(place[0])):
+					return false
+		elif belt_ends < 0:
+			if ModelLibrary.lone_belt_pieces(resolved) == null:
+				return false
+	if proto_type == "mining-drill":
+		var wet_name := ModelLibrary.wet_model(proto_name, proto_type, extra, dir)
+		if wet_name != "" and not ModelLibrary.ready(wet_name):
+			return false
+	if PipeCovers.enabled and proto_type != "pipe" and proto_type != "infinity-pipe" and proto_type != "heat-pipe" \
+			and (proto_type == "pipe-to-ground" or not PipeCovers.ports(fb, proto_type, int(extra.get("fa", 0))).is_empty()):
+		var cap_ready := func(n: String) -> bool:
+			return ModelLibrary.ready(n)
+		if not PipeCovers.cover_ready(ModelLibrary.drawing_pack(proto_name, proto_type, extra, dir), cap_ready):
+			return false
+	if proto_type == "cargo-bay" and cargo_mask >= 0:
+		for place: Array in ModelLibrary.cargo_places(cargo_mask, Vector3(pos.x, 0.0, pos.y)):
+			if not ModelLibrary.ready(str(place[0])):
+				return false
+	return true
+
+
+## All [Mesh, Transform3D] pieces that make up a full ghost building at `pos`, facing `dir`:
+## base mesh, non-lit moving parts (CPU-skinned if baked), resting inserter arms, belt end caps,
+## wet drill attachments, pipe cover caps, and cargo bay edges. Returns [] when the entity has no model.
+static func ghost_pieces(proto_name: String, proto_type: String, extra: Dictionary, dir: int, pos: Vector2,
+		belt_ends: int = 0, flip := Basis.IDENTITY, cargo_mask := 0, fb: Variant = null, covers := -1) -> Array:
+	var res := _resolved_entity_model(proto_name, proto_type, extra, dir)
+	var resolved: String = res[0]
+	var mesh: Mesh = res[1]
+	if mesh == null:
+		return []
+	var out: Array = []
+	var lift := Visuals.flight_lift(proto_type)
+	var base_xf := ModelLibrary.placed(proto_name, proto_type, dir, extra, Vector3(pos.x, lift, pos.y), flip)
+	out.append([mesh, base_xf])
+	var host_parts := ModelLibrary.parts_for(resolved)
+	for part: ModelLibrary.AnimPart in host_parts:
+		if part.mesh == null or part.lit:
+			continue
+		var part_xf := base_xf
+		if part.kind == "turret_head" and Turrets.head_front(part) == Vector3.LEFT:
+			var align := part.pivot * Transform3D(Basis(Vector3.UP, -PI / 2.0), Vector3.ZERO) * part.pivot.affine_inverse()
+			part_xf = base_xf * align
+		out.append([skinned_part_mesh(part), part_xf])
+	if proto_type == "inserter":
+		var at := resolved.find("@")
+		var arm_name := proto_name + (resolved.substr(at) if at >= 0 else "")
+		var arm: Variant = InserterArms.resting_pieces(arm_name)
+		if arm is Array:
+			var arm_base := Transform3D(Basis(Vector3.UP, Wire.direction_yaw(dir)) * flip, Vector3(pos.x, 0.0, pos.y))
+			for p: Array in (arm as Array):
+				out.append([p[0], arm_base * (p[1] as Transform3D)])
+	if WorldMirror.CAPPED_TYPES.has(proto_type):
+		if belt_ends > 0:
+			var inverse := base_xf.affine_inverse()
+			var pack := ModelLibrary.entity_pack(extra)
+			for place: Array in ModelLibrary.belt_end_places(proto_name, proto_type, dir, pos, belt_ends, 0.0, pack):
+				var piece: String = place[0]
+				if not ModelLibrary.ready(piece):
+					continue
+				var pm := ModelLibrary.mesh_for(piece)
+				if pm == null:
+					continue
+				var at_xf: Transform3D = place[1]
+				out.append([pm, at_xf])
+				for part: ModelLibrary.AnimPart in ModelLibrary.parts_for(piece):
+					if part.mesh != null and not part.lit and not ModelLibrary.part_doubled(part, inverse * at_xf, host_parts):
+						out.append([skinned_part_mesh(part), at_xf])
+		elif belt_ends < 0:
+			var lone: Variant = ModelLibrary.lone_belt_pieces(resolved)
+			if lone is Array:
+				for p: Array in (lone as Array):
+					var pm: Mesh = skinned_part_mesh(p[2]) if p.size() > 2 and p[2] is ModelLibrary.AnimPart else p[0]
+					out.append([pm, base_xf * (p[1] as Transform3D)])
+	if proto_type == "mining-drill":
+		var wet_name := ModelLibrary.wet_model(proto_name, proto_type, extra, dir)
+		if wet_name != "" and ModelLibrary.ready(wet_name):
+			var wm := ModelLibrary.mesh_for(wet_name)
+			if wm != null:
+				out.append([wm, base_xf])
+				for part: ModelLibrary.AnimPart in ModelLibrary.parts_for(wet_name):
+					if part.mesh != null and not part.lit:
+						out.append([skinned_part_mesh(part), base_xf])
+	if PipeCovers.enabled and proto_type != "pipe" and proto_type != "infinity-pipe" and proto_type != "heat-pipe" \
+			and (proto_type == "pipe-to-ground" or not PipeCovers.ports(fb, proto_type, int(extra.get("fa", 0))).is_empty()):
+		var cap_mesh := func(n: String) -> Mesh:
+			return ModelLibrary.mesh_for(n)
+		out.append_array(PipeCovers.ghost_cap_pieces(proto_type, fb, extra, dir, pos,
+			ModelLibrary.drawing_pack(proto_name, proto_type, extra, dir), cap_mesh, covers, flip, lift))
+	if proto_type == "cargo-bay" and cargo_mask >= 0:
+		for place: Array in ModelLibrary.cargo_places(cargo_mask, Vector3(pos.x, 0.0, pos.y)):
+			var cname: String = str(place[0])
+			if not ModelLibrary.ready(cname):
+				continue
+			var cm := ModelLibrary.mesh_for(cname)
+			if cm != null:
+				out.append([cm, Transform3D(Basis(), place[1])])
+	return out
+
+
+func _local_belt_map(c: Vector2i) -> Dictionary:
+	var out := {}
+	var lo := Vector2(c) * 32.0 - Vector2(2.0, 2.0)
+	var hi := Vector2(c + Vector2i.ONE) * 32.0 + Vector2(2.0, 2.0)
+	var area := Rect2(lo, hi - lo)
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			var other = world.chunks.get(c + Vector2i(dx, dy))
+			if other == null:
+				continue
+			for r: WorldMirror.Rec in other.entities.values():
+				if r.extra.has("hid"):
+					continue
+				if (dx != 0 or dy != 0) and not area.has_point(r.pos):
+					continue
+				var p: ProtoDB.EntityProto = world.protos.entity(int(r.extra["gh"])) if r.extra.has("gh") else world.protos.entity(r.proto_id)
+				if p == null or not WorldMirror.BELT_TYPES.has(p.type):
+					continue
+				var row := [p.type, r.dir, str(r.extra.get("u", "")), str(r.extra.get("s", "s"))]
+				for t: Vector2i in ModelLibrary.belt_tiles(r.pos):
+					out[t] = row
+	return out
+
+
+static func _ghost_belt_ends(proto_type: String, dir: int, pos: Vector2, extra: Dictionary, belt_map: Dictionary) -> int:
+	if not WorldMirror.CAPPED_TYPES.has(proto_type):
+		return 0
+	var step: Vector2i = WorldMirror.PIPE_STEPS[(dir >> 2) & 3]
+	var under := str(extra.get("u", "i")) if (proto_type == "underground-belt" or proto_type == "linked-belt") else ""
+	var starts := under != "o" and str(extra.get("s", "s")) == "s"
+	var ends := under != "i"
+	var mask := 0
+	var tiles := ModelLibrary.belt_tiles(pos)
+	for i in tiles.size():
+		var t: Vector2i = tiles[i]
+		if starts:
+			var back = belt_map.get(t - step)
+			if back == null or not WorldMirror.belt_feeds(dir, str(back[0]), int(back[1]), str(back[2])):
+				mask |= 1 << (2 * i)
+		if ends:
+			var front = belt_map.get(t + step)
+			if front == null or not WorldMirror.belt_continues(dir, str(front[0]), int(front[1]), str(front[2]), str(front[3])):
+				mask |= 2 << (2 * i)
+	return mask
+
+
+func _local_pipe_map(c: Vector2i) -> Dictionary:
+	var out := {}
+	var lo := Vector2(c) * 32.0 - Vector2(2.0, 2.0)
+	var hi := Vector2(c + Vector2i.ONE) * 32.0 + Vector2(2.0, 2.0)
+	var area := Rect2(lo, hi - lo)
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			var other = world.chunks.get(c + Vector2i(dx, dy))
+			if other == null:
+				continue
+			for r: WorldMirror.Rec in other.entities.values():
+				if r.extra.has("hid"):
+					continue
+				if (dx != 0 or dy != 0) and not area.has_point(r.pos):
+					continue
+				var p: ProtoDB.EntityProto = world.protos.entity(int(r.extra["gh"])) if r.extra.has("gh") else world.protos.entity(r.proto_id)
+				if p == null:
+					continue
+				if p.type == "pipe" or p.type == "infinity-pipe" or p.type == "heat-pipe" or p.type == "pipe-to-ground":
+					out[Vector2i(floori(r.pos.x), floori(r.pos.y))] = [p.type, r.dir]
+	return out
+
+
+static func _ghost_pipe_mask(pos: Vector2, heat: bool, pipe_map: Dictionary) -> int:
+	var tile := Vector2i(floori(pos.x), floori(pos.y))
+	var mask := 0
+	for i in 4:
+		var other = pipe_map.get(tile + WorldMirror.PIPE_STEPS[i])
+		if other == null:
+			continue
+		var ot := str(other[0])
+		if heat != (ot == "heat-pipe"):
+			continue
+		if ot == "pipe-to-ground" and int(other[1]) != ((i + 2) % 4) * 4:
+			continue
+		mask |= 1 << i
+	return mask
 
 
 func _top(proto: ProtoDB.EntityProto, rec: WorldMirror.Rec) -> float:

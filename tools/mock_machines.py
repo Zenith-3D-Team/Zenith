@@ -255,8 +255,8 @@ def command(game, t, msg):
     m = game.machine(entity)
     if m is not None and entity.type == "rocket-silo":
         m.setdefault("sec", [])
-    with_requests = ("logistic-container", "rocket-silo") if t == "set_section" else ("logistic-container", "rocket-silo",
-                                                                                         "cargo-landing-pad")
+    with_requests = ("logistic-container", "rocket-silo", "roboport", "spider-vehicle") if t == "set_section" else (
+        "logistic-container", "rocket-silo", "cargo-landing-pad", "roboport", "spider-vehicle")
     if m is None or "sec" not in m or entity.type not in with_requests:
         if t == "set_chest_logistics":
             game.message("That chest has no requests")
@@ -264,7 +264,7 @@ def command(game, t, msg):
         return False
     sc["due"] = game.tick
     if t == "set_chest_logistics":
-        for k in ("tu", "rb"):
+        for k in ("tu", "rb", "on", "mv"):
             if msg.get(k) in (0, 1):
                 m[k] = msg[k]
         return True
@@ -279,8 +279,14 @@ def command(game, t, msg):
         if 1 <= i <= len(m["sec"]):
             sec = m["sec"][i - 1]
             if isinstance(msg.get("f"), list):
-                sec["f"] = [[str(f[0]), str(f[1] or ""), int(f[2]), int(f[3]), str(f[4]), int(f[5])]
-                            for f in msg["f"] if isinstance(f, list) and len(f) == 6]
+                parsed = []
+                for f in msg["f"]:
+                    if isinstance(f, list) and len(f) in (6, 7):
+                        entry = [str(f[0]), str(f[1] or ""), int(f[2]), int(f[3]), str(f[4]), int(f[5])]
+                        if len(f) == 7 and f[6]:
+                            entry.append(str(f[6]))
+                        parsed.append(entry)
+                sec["f"] = parsed
             if isinstance(msg.get("g"), str) and int(msg.get("i", 0)):
                 sec["g"] = msg["g"]
                 if msg["g"]:

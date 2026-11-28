@@ -39,6 +39,7 @@ const POSE_SLOTS := ["-attack", "-corpse", "-corpse-1", "-corpse-2", "-corpse-3"
 const POSE_SCALE := 0.999
 ## Material name fragments that take the tier's colour.
 const TINTED := ["chitin", "flesh_worm", "flesh_spawner_dome"]
+const GLEBA_BLOOD_COLOR := Vector3(0.065, 0.145, 0.018)
 ## Demolishers' lava (tools/models/vulcanus.py): its .glb glows 2.5 times a bright red (the crust 0.6
 ## times a dark one), over part colours that already are the sprite's lava (space_skin.py): 4 to 7
 ## times the sprite's brightness, a red glare. Factorio paints its lava in (the demolisher has no glow
@@ -201,6 +202,9 @@ static func prepare(mesh: ArrayMesh, name: String) -> ArrayMesh:
 				copy.set_shader_parameter("rig_mode", 4)
 				copy.shader = Looks.timed_shader(copy.shader)  # swaying by TIME: kept in the motion-vector pass (--static-mv)
 				copy.set_shader_parameter("worm_height", out.get_aabb().end.y)
+		var base_unposed := _unposed(model)
+		if base_unposed.contains("wriggler") or base_unposed.begins_with("gleba-spawner"):
+			copy.set_shader_parameter("rig_blood_color", GLEBA_BLOOD_COLOR)
 		out.surface_set_material(i, copy)
 	return out
 

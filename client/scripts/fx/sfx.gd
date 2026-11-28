@@ -204,10 +204,10 @@ var _stat_dropped := 0
 ## A click or other window sound: "gui-click", "gui-tab", "inventory-move"... (Factorio's
 ## core/sound names), or a full path relative to Factorio's data folder. Its kind is "ui/<name>"
 ## unless given.
-static func play_ui(sound: String, volume := 1.0, kind := "") -> void:
+static func play_ui(sound: String, volume := 1.0, kind := "", bus := "UI") -> void:
 	if instance != null and is_instance_valid(instance):
 		var path := sound if sound.ends_with(".ogg") else "core/sound/%s.ogg" % sound
-		instance.play_flat(path, volume, kind if kind != "" else "ui/" + path.get_file().get_basename())
+		instance.play_flat(path, volume, kind if kind != "" else "ui/" + path.get_file().get_basename(), bus)
 
 
 ## An add-on's replace (`files` non-empty) or mute (`files` empty) of `kind`, on top of its stack.
@@ -855,11 +855,11 @@ func _heard(s: Shot) -> float:
 
 
 ## Not positional: the windows' sounds. `kind` ("ui/gui-click") lets add-ons replace or mute it.
-func play_flat(path: String, volume := 1.0, kind := "") -> void:
+func play_flat(path: String, volume := 1.0, kind := "", bus := "UI") -> void:
 	if kind != "" and _kinds_on:
-		_play_kind(kind, path, null, null, volume, "UI")
+		_play_kind(kind, path, null, null, volume, bus)
 	else:
-		_flat(path, volume)
+		_flat(path, volume, bus)
 
 
 func _flat(path: String, volume: float, bus := "UI", given: AudioStream = null) -> bool:

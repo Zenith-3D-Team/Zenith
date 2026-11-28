@@ -1,9 +1,9 @@
 extends Control
 ## The stack in the cursor, drawn at the mouse like Factorio: the item's icon with its count in the
-## count font (Factorio's count-font: default-bold 13, bordered), over windows and wherever the world
-## shows no build ghost (an item that can't be built, or one held over nothing). Where the world shows
-## the held building's ghost, the ghost shows what it is and only the count is drawn by the pointer,
-## as Factorio does (L7). factorio_ui.gd sets `item`, `count` and `over_world_too`.
+## count font (Factorio's count-font: default-bold 13, bordered), over windows and over the world
+## (`over_world_too`, which player_input.gd sets true for buildings too unless `--cursor-icon-world=old`,
+## where a build ghost shows only the count by the pointer, L7). factorio_ui.gd sets `item`, `count`
+## and `over_gui`.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Switches := preload("res://scripts/switches.gd")

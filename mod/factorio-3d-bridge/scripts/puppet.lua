@@ -13,6 +13,12 @@ local perf = require("scripts.perf")
 
 local M = {}
 
+-- What a freeplay player gets when respawning (freeplay.lua's respawn_items).
+local RESPAWN_KIT = {
+  { name = "pistol", count = 1 },
+  { name = "firearm-magazine", count = 10 },
+}
+
 -- What a new freeplay player starts with.
 local STARTER_KIT = {
   { name = "iron-plate", count = 8 },
@@ -347,13 +353,15 @@ function M.get()
   local surface = game.get_surface(settings.global["f3d-surface"].value) or game.get_surface(1)
   local force = game.forces.player
   local at = force.get_spawn_position(surface)
+  local respawning = s.respawn ~= nil
   surface, at = M.respawn_place(surface, at, force)
   local character = create_character(surface, at, force)
   if not character then
     return nil
   end
   if settings.global["f3d-starter-kit"].value then
-    for _, stack in pairs(STARTER_KIT) do
+    -- After a death the game gives its respawn items only, not the new player's kit.
+    for _, stack in pairs(respawning and RESPAWN_KIT or STARTER_KIT) do
       if prototypes.item[stack.name] then
         character.insert(stack)
       end
@@ -602,8 +610,12 @@ local function can_hand_mine(c, e)
       end
     end
   end
-  local reach = (e.type == "resource") and c.resource_reach_distance or c.reach_distance
-  if distance(c.position, e.position) > reach + REACH_SLACK then
+  if e.type ~= "resource" then
+    -- The game's own check, measured to the entity's edge: a big entity's centre may be 14 tiles off.
+    if not M.can_reach(c, e) then
+      return false, "Out of reach"
+    end
+  elseif distance(c.position, e.position) > c.resource_reach_distance + REACH_SLACK then
     return false, "Out of reach"
   end
   return true
@@ -1008,10 +1020,37 @@ function M.rotate(cmd)
   end
   local e = M.find_target(M.surface(c), cmd)
   if e and e.rotatable and e.force == c.force then
+    -- R needs the entity in reach (a ghost, or anything from another surface's remote view).
+    if e.type ~= "entity-ghost" and not M.remote_view(c) and not M.can_reach(c, e) then
+      return M.message("Out of reach")
+    end
     -- by_player raises on_player_rotated_entity for other mods (as_player.lua).
     e.rotate({ reverse = cmd.rev == 1 or cmd.rev == true, by_player = as_player.by(c) })
     tracker.rotated(e) -- an underground's other end turns with it (J23)
   end
+end
+
+local function hidden_from_player(recipe)
+  local proto = recipe
+  if recipe.object_name == "LuaRecipe" then
+    proto = recipe.prototype
+  end
+  local ok, h = pcall(function() return proto.hidden_from_player_crafting end)
+  return ok and h == true
+end
+
+local function can_hand_craft(c, recipe)
+  if not (recipe and recipe.enabled and not recipe.hidden) or M.is_parameter(recipe) or hidden_from_player(recipe) then
+    return false
+  end
+  local ok, cats = pcall(function() return c.prototype.crafting_categories end)
+  local hand = ok and cats or {}
+  for _, cat in pairs(M.recipe_categories(recipe)) do
+    if hand[cat] then
+      return true
+    end
+  end
+  return false
 end
 
 function M.craft(cmd)
@@ -1024,7 +1063,12 @@ function M.craft(cmd)
   if not (recipe and recipe.enabled) then
     return message("Recipe not available: " .. name)
   end
-  local count = math.max(1, math.min(100, math.floor(tonumber(cmd.n) or 1)))
+  -- (core's recipe-not-craftable-in-hand: a chemistry or smelting recipe is no "missing ingredients")
+  if not can_hand_craft(c, recipe) then
+    return message("This recipe cannot be crafted by hand.")
+  end
+  -- Shift+click crafts all the inventory allows (hundreds of gears), so no small cap: only a sanity one.
+  local count = math.max(1, math.min(100000, math.floor(tonumber(cmd.n) or 1)))
   -- The queue grows here, not by crafting: crafting.lua looks at it afresh (see count_crafts).
   storage.f3d.craft_seen = nil
   if c.begin_crafting({ recipe = name, count = count, silent = true }) == 0 then
@@ -1219,6 +1263,7 @@ end
 -- Derived only from prototypes (like registry.lua), so a check only reads `enabled` for these
 -- instead of every recipe of the force (over a thousand with Space Age).
 local hand_recipes = {}
+local all_recipes
 
 -- Factorio's parameter recipes (parameter-0..9, for blueprint parameters) sit in every crafting
 -- category and aren't hidden, but nothing makes them and Factorio's choosers leave them out.
@@ -1241,7 +1286,9 @@ function M.hand_recipe_names(c)
     local hand = proto.crafting_categories or {}
     list = {}
     for name, recipe in pairs(prototypes.recipe) do
-      if not recipe.hidden and not M.is_parameter(recipe) then
+      -- hide_from_player_crafting (barrel filling, rocket parts): never in the crafting menu, even when the
+      -- character has the recipe's category (a mod giving it crafting-with-fluid).
+      if not recipe.hidden and not hidden_from_player(recipe) and not M.is_parameter(recipe) then
         for _, cat in pairs(M.recipe_categories(recipe)) do
           if hand[cat] then
             list[#list + 1] = name
@@ -1254,6 +1301,33 @@ function M.hand_recipe_names(c)
     hand_recipes[proto.name] = list
   end
   return list
+end
+
+-- All visible prototype recipe names (including fluid and machine-only recipes), sorted.
+function M.all_recipe_names(_c)
+  if not all_recipes then
+    all_recipes = {}
+    for name, recipe in pairs(prototypes.recipe) do
+      if not recipe.hidden and not hidden_from_player(recipe) and not M.is_parameter(recipe) then
+        all_recipes[#all_recipes + 1] = name
+      end
+    end
+    table.sort(all_recipes)
+  end
+  return all_recipes
+end
+
+-- Sorted list of crafting category names the character can craft by hand.
+function M.hand_categories(c)
+  local out = {}
+  local ok, cats = pcall(function() return c.prototype.crafting_categories end)
+  for cat, allowed in pairs(ok and cats or {}) do
+    if allowed then
+      out[#out + 1] = cat
+    end
+  end
+  table.sort(out)
+  return out
 end
 
 -- Names of the recipes this character can craft by hand right now.
@@ -1395,6 +1469,8 @@ local PICKED_MAX = 32 -- records a `pku` lists, at most (PICKS_PER_TICK of them 
 
 -- Listeners called with the belts F took items off this tick (ui_actions.lua reads their lanes again).
 M.belt_listeners = {}
+-- Listeners called when send_inventory_now runs (inventory.lua keeps slots in step).
+M.inventory_listeners = {}
 
 -- A line's items as read now: `list` in the game's order, `by` unique id -> {count, line position, name,
 -- quality, the DetailedItemOnLine}. (The read's stacks stay good only until the line changes: names are kept.)
@@ -1693,7 +1769,15 @@ function M.send_inventory_now()
   local c = M.get()
   if c then
     send_inventory(c, storage.f3d)
+    for _, fn in ipairs(M.inventory_listeners) do
+      fn(c)
+    end
   end
+end
+
+-- Acting from the remote view of another surface (or from a hub): no reach to check.
+function M.remote_view(c)
+  return storage.f3d.act_si ~= nil or M.hub(c) ~= nil
 end
 
 -- Whether the character can reach an entity to open it or move items in and out: the game's own

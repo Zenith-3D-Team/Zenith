@@ -215,15 +215,15 @@ func start(path: String, host := {}, exact_mods := false) -> bool:
 		base = int(Settings.arg_value("--port-base="))
 	if port_base >= 1024:
 		base = port_base
-	udp_port = free_udp_port(base)
-	game_port = free_udp_port(udp_port + 1)
-	if not host.is_empty():
-		game_port = int(host.get("port", 34197))
-		if not _udp_free(game_port):
-			error = "Port %d is in use: another Factorio server? Pick another port to host on." % game_port
-			return false
-	rcon_port = free_tcp_port(game_port + 1)
-	client_port = free_udp_port(rcon_port + 1)
+	var host_port := int(host.get("port", 34197)) if not host.is_empty() else 0
+	if host_port > 0 and not _udp_free(host_port):
+		error = "Port %d is in use: another Factorio server? Pick another port to host on." % host_port
+		return false
+	var ports := pick_ports(base, host_port)
+	udp_port = ports[0]
+	game_port = ports[1]
+	rcon_port = ports[2]
+	client_port = ports[3]
 	if udp_port == 0 or game_port == 0 or rcon_port == 0 or client_port == 0:
 		error = "No free ports found from %d up. Close other servers, or start this one with --port-base=<port>." % base
 		return false
@@ -394,6 +394,21 @@ func _end_watch() -> void:
 	if _watch_pid > 0 and OS.is_process_running(_watch_pid):
 		OS.kill(_watch_pid)
 	_watch_pid = -1
+
+
+## The ports of a server as [bridge UDP, game, RCON TCP, client UDP], searched up from `base`; the game
+## port is `host_port` when hosting (0: any). A hosted port inside the range searched must not be
+## taken again for the bridge's or the client's port (hosting on 34200 gave both the same port).
+static func pick_ports(base: int, host_port := 0) -> Array:
+	var udp := free_udp_port(base)
+	while udp != 0 and udp == host_port:
+		udp = free_udp_port(udp + 1)
+	var game := host_port if host_port > 0 else free_udp_port(udp + 1)
+	var rcon := free_tcp_port(game + 1)
+	var client := free_udp_port(rcon + 1)
+	while client != 0 and (client == udp or client == game):
+		client = free_udp_port(client + 1)
+	return [udp, game, rcon, client]
 
 
 static func free_udp_port(from: int) -> int:

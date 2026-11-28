@@ -136,7 +136,9 @@ func _item_models_later() -> void:
 	_check(not ItemModels.ready("iron-plate"), "a .glb not read yet: not ready, its read started")
 	_check(ItemModels._jobs.has("iron-plate"), "one read on a worker")
 	ItemModels.ready("iron-plate")
-	_check(ItemModels._jobs.size() == 1, "asked again: still one read")
+	# (A quick read may be in by the second ask: taken in then, counted once, no second read started.)
+	_check(ItemModels._jobs.size() == 1 or (ItemModels._jobs.is_empty() and ItemModels.reads_later == reads + 1),
+		"asked again: still one read (or that one read already in)")
 	_check(await _wait_ready("iron-plate"), "the read ends and it is ready")
 	var mesh := ItemModels.mesh_for("iron-plate")
 	_check(mesh != null and mesh.get_surface_count() > 0, "its mesh from the worker's read")

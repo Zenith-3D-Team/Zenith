@@ -1,0 +1,288 @@
+Zenith patch 0002: native callbacks for extensions (RenderingDevice.native_callback_add).
+
+PR #114670 runs a script callback at the upscale point, but upscaler libraries (AMD FSR, NVIDIA DLSS) record
+their work into the engine's own command list, which no bound API hands out. This binds the engine's
+driver_callback_add (as MetalFX uses it) for extensions: a C function run with the native command list at its
+place in the render graph, the D3D12 device and queue, and each handed texture's ID3D12Resource with the state
+(legacy barriers) or layout (enhanced barriers) it is in. Legacy barriers: the textures are moved to the states
+their usages ask for first. After the callback the D3D12 driver forgets its cached command-list state
+(descriptor heaps, root signatures, pipelines, dynamic state). D3D12 only; other drivers report version 0.
+Zenith's own work, vendor-free, MIT like Godot.
+
+diff --git a/drivers/d3d12/rendering_device_driver_d3d12.cpp b/drivers/d3d12/rendering_device_driver_d3d12.cpp
+index 5afb1b7..7c3d5fc 100644
+--- a/drivers/d3d12/rendering_device_driver_d3d12.cpp
++++ b/drivers/d3d12/rendering_device_driver_d3d12.cpp
+@@ -5634,6 +5634,80 @@ uint64_t RenderingDeviceDriverD3D12::timestamp_query_result_to_time(uint64_t p_r
+ 	return p_result / (double)device_limits.timestamp_frequency * 1000000000.0;
+ }
+ 
++/******************/
++/**** CALLBACK ****/
++/******************/
++
++bool RenderingDeviceDriverD3D12::command_native_callback_begin(CommandBufferID p_cmd_buffer, VectorView<TextureID> p_textures, VectorView<TextureLayout> p_layouts, NativeCallbackInfo &r_info, uint64_t *r_resources, uint32_t *r_states) {
++	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
++	const bool enhanced = barrier_capabilities.enhanced_barriers_supported;
++
++	if (!enhanced) {
++		// Legacy barriers: the render graph's barriers don't reach D3D12, states are set lazily on use, so set them here.
++		for (uint32_t i = 0; i < p_textures.size(); i++) {
++			TextureInfo *tex_info = (TextureInfo *)p_textures[i].id;
++			D3D12_RESOURCE_STATES wanted_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++			switch (p_layouts[i]) {
++				case TEXTURE_LAYOUT_STORAGE_OPTIMAL:
++					wanted_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++					break;
++				case TEXTURE_LAYOUT_COPY_SRC_OPTIMAL:
++					wanted_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
++					break;
++				case TEXTURE_LAYOUT_COPY_DST_OPTIMAL:
++					wanted_state = D3D12_RESOURCE_STATE_COPY_DEST;
++					break;
++				default:
++					break;
++			}
++			uint32_t planes = 1;
++			if ((tex_info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
++				planes = format_get_plane_count(tex_info->format);
++			}
++			for (uint32_t l = 0; l < tex_info->layers; l++) {
++				for (uint32_t m = 0; m < tex_info->mipmaps; m++) {
++					uint32_t subresource = D3D12CalcSubresource(tex_info->base_mip + m, tex_info->base_layer + l, 0, tex_info->desc.MipLevels, tex_info->desc.ArraySize());
++					_resource_transition_batch(cmd_buf_info, tex_info, subresource, planes, wanted_state);
++				}
++			}
++		}
++		_resource_transitions_flush(cmd_buf_info);
++	}
++
++	for (uint32_t i = 0; i < p_textures.size(); i++) {
++		const TextureInfo *tex_info = (const TextureInfo *)p_textures[i].id;
++		r_resources[i] = (uint64_t)tex_info->resource;
++		if (enhanced) {
++			// The render graph has already moved the texture to the layout of its usage.
++			r_states[i] = (uint32_t)_rd_texture_layout_to_d3d12_barrier_layout(p_layouts[i]);
++		} else {
++			uint32_t subresource = D3D12CalcSubresource(tex_info->base_mip, tex_info->base_layer, 0, tex_info->desc.MipLevels, tex_info->desc.ArraySize());
++			r_states[i] = (uint32_t)tex_info->states_ptr->subresource_states[subresource];
++		}
++	}
++
++	r_info.api = NATIVE_API_D3D12;
++	r_info.command_list = (uint64_t)cmd_buf_info->cmd_list.Get();
++	r_info.barrier_model = enhanced ? NATIVE_BARRIERS_ENHANCED_LAYOUTS : NATIVE_BARRIERS_LEGACY_STATES;
++	r_info.resource_count = p_textures.size();
++	r_info.resources = r_resources;
++	r_info.states = r_states;
++	return true;
++}
++
++void RenderingDeviceDriverD3D12::command_native_callback_end(CommandBufferID p_cmd_buffer) {
++	// The native code may have set its own descriptor heaps, root signatures, pipelines and dynamic state.
++	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
++	cmd_buf_info->graphics_pso = nullptr;
++	cmd_buf_info->graphics_root_signature_crc = 0;
++	cmd_buf_info->compute_pso = nullptr;
++	cmd_buf_info->compute_root_signature_crc = 0;
++	cmd_buf_info->nir_graphics_runtime_data_root_param_idx = UINT32_MAX;
++	cmd_buf_info->nir_compute_runtime_data_root_param_idx = UINT32_MAX;
++	cmd_buf_info->pending_dyn_params = true;
++	cmd_buf_info->descriptor_heaps_set = false;
++}
++
+ void RenderingDeviceDriverD3D12::command_timestamp_query_pool_reset(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_query_count) {
+ }
+ 
+diff --git a/drivers/d3d12/rendering_device_driver_d3d12.h b/drivers/d3d12/rendering_device_driver_d3d12.h
+index 14b3c41..dedbc80 100644
+--- a/drivers/d3d12/rendering_device_driver_d3d12.h
++++ b/drivers/d3d12/rendering_device_driver_d3d12.h
+@@ -860,6 +860,14 @@ public:
+ 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) override final;
+ 	virtual void command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) override final;
+ 
++	/******************/
++	/**** CALLBACK ****/
++	/******************/
++
++	virtual bool command_native_callback_begin(CommandBufferID p_cmd_buffer, VectorView<TextureID> p_textures, VectorView<TextureLayout> p_layouts, NativeCallbackInfo &r_info, uint64_t *r_resources, uint32_t *r_states) override final;
++	virtual void command_native_callback_end(CommandBufferID p_cmd_buffer) override final;
++	virtual bool native_callbacks_supported() const override final { return true; }
++
+ 	/*****************/
+ 	/**** QUERIES ****/
+ 	/*****************/
+diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
+index 7574038..4578d70 100644
+--- a/servers/rendering/rendering_device.cpp
++++ b/servers/rendering/rendering_device.cpp
+@@ -1235,6 +1235,87 @@ Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void
+ 	return OK;
+ }
+ 
++struct RenderingDevice::NativeCallbackPayload {
++	NativeCallback callback = nullptr;
++	void *userdata = nullptr;
++	uint64_t device = 0;
++	uint64_t command_queue = 0;
++	uint32_t count = 0;
++	RDD::TextureID textures[RDD::NATIVE_CALLBACK_MAX_RESOURCES];
++	RDD::TextureLayout layouts[RDD::NATIVE_CALLBACK_MAX_RESOURCES];
++};
++
++int RenderingDevice::native_callback_get_version() const {
++	return driver->native_callbacks_supported() ? 1 : 0;
++}
++
++Error RenderingDevice::native_callback_add(uint64_t p_callback, uint64_t p_userdata, const TypedArray<RID> &p_textures, const PackedInt32Array &p_usages) {
++	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
++	ERR_FAIL_COND_V_MSG(!driver->native_callbacks_supported(), ERR_UNAVAILABLE, "Native callbacks are not supported by this rendering driver.");
++	ERR_FAIL_COND_V(p_callback == 0, ERR_INVALID_PARAMETER);
++	ERR_FAIL_COND_V(p_textures.size() != p_usages.size(), ERR_INVALID_PARAMETER);
++	ERR_FAIL_COND_V(p_textures.size() > (int)RDD::NATIVE_CALLBACK_MAX_RESOURCES, ERR_INVALID_PARAMETER);
++
++	NativeCallbackPayload *payload = memnew(NativeCallbackPayload);
++	payload->callback = (NativeCallback)p_callback;
++	payload->userdata = (void *)p_userdata;
++	payload->device = driver->get_resource_native_handle(RDD::DRIVER_RESOURCE_LOGICAL_DEVICE, RDD::ID());
++	payload->command_queue = driver->get_resource_native_handle(RDD::DRIVER_RESOURCE_COMMAND_QUEUE, main_queue);
++	payload->count = p_textures.size();
++
++	CallbackResource resources[RDD::NATIVE_CALLBACK_MAX_RESOURCES];
++	for (uint32_t i = 0; i < payload->count; i++) {
++		RID rid = p_textures[i];
++		Texture *texture = texture_owner.get_or_null(rid);
++		CallbackResourceUsage usage = (CallbackResourceUsage)p_usages[i];
++		RDD::TextureLayout layout = RDD::TEXTURE_LAYOUT_UNDEFINED;
++		switch (usage) {
++			case CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE:
++				layout = RDD::TEXTURE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++				break;
++			case CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ:
++			case CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE:
++				layout = RDD::TEXTURE_LAYOUT_STORAGE_OPTIMAL;
++				break;
++			case CALLBACK_RESOURCE_USAGE_COPY_FROM:
++				layout = RDD::TEXTURE_LAYOUT_COPY_SRC_OPTIMAL;
++				break;
++			case CALLBACK_RESOURCE_USAGE_COPY_TO:
++				layout = RDD::TEXTURE_LAYOUT_COPY_DST_OPTIMAL;
++				break;
++			default:
++				break;
++		}
++		if (texture == nullptr || layout == RDD::TEXTURE_LAYOUT_UNDEFINED) {
++			memdelete(payload);
++			ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, vformat("Native callback texture %d is not a valid texture with a supported usage.", i));
++		}
++		resources[i] = { rid, CALLBACK_RESOURCE_TYPE_TEXTURE, usage };
++		payload->textures[i] = texture->driver_id;
++		payload->layouts[i] = layout;
++	}
++
++	Error err = driver_callback_add(_native_callback_run, payload, VectorView<CallbackResource>(resources, payload->count));
++	if (err != OK) {
++		memdelete(payload);
++	}
++	return err;
++}
++
++void RenderingDevice::_native_callback_run(RDD *p_driver, RDD::CommandBufferID p_command_buffer, void *p_userdata) {
++	NativeCallbackPayload *payload = (NativeCallbackPayload *)p_userdata;
++	uint64_t resources[RDD::NATIVE_CALLBACK_MAX_RESOURCES] = {};
++	uint32_t states[RDD::NATIVE_CALLBACK_MAX_RESOURCES] = {};
++	RDD::NativeCallbackInfo info;
++	info.device = payload->device;
++	info.command_queue = payload->command_queue;
++	if (p_driver->command_native_callback_begin(p_command_buffer, VectorView<RDD::TextureID>(payload->textures, payload->count), VectorView<RDD::TextureLayout>(payload->layouts, payload->count), info, resources, states)) {
++		payload->callback(&info, payload->userdata);
++		p_driver->command_native_callback_end(p_command_buffer);
++	}
++	memdelete(payload);
++}
++
+ String RenderingDevice::get_perf_report() const {
+ 	String perf_report_text;
+ 	perf_report_text += " gpu:" + String::num_int64(gpu_copy_count);
+@@ -9224,6 +9305,8 @@ void RenderingDevice::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_memory_usage", "type"), &RenderingDevice::get_memory_usage);
+ 
+ 	ClassDB::bind_method(D_METHOD("get_driver_resource", "resource", "rid", "index"), &RenderingDevice::get_driver_resource);
++	ClassDB::bind_method(D_METHOD("native_callback_add", "callback", "userdata", "textures", "usages"), &RenderingDevice::native_callback_add);
++	ClassDB::bind_method(D_METHOD("native_callback_get_version"), &RenderingDevice::native_callback_get_version);
+ 
+ 	ClassDB::bind_method(D_METHOD("get_perf_report"), &RenderingDevice::get_perf_report);
+ 
+diff --git a/servers/rendering/rendering_device.h b/servers/rendering/rendering_device.h
+index 38c4b14..e53d2fe 100644
+--- a/servers/rendering/rendering_device.h
++++ b/servers/rendering/rendering_device.h
+@@ -317,6 +317,21 @@ public:
+ 
+ 	Error driver_callback_add(RDD::DriverCallback p_callback, void *p_userdata, VectorView<CallbackResource> p_resources);
+ 
++	// Native callbacks for extensions: p_callback is a C function
++	// void (*)(const RenderingDeviceDriver::NativeCallbackInfo *p_info, void *p_userdata), run with the native
++	// command list at this point of the render graph, with p_textures in the states p_usages ask for
++	// (CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE, _STORAGE_IMAGE_READ, _STORAGE_IMAGE_READ_WRITE, _COPY_FROM, _COPY_TO).
++	typedef void (*NativeCallback)(const RDD::NativeCallbackInfo *p_info, void *p_userdata);
++	Error native_callback_add(uint64_t p_callback, uint64_t p_userdata, const TypedArray<RID> &p_textures, const PackedInt32Array &p_usages);
++	// 1 when this rendering driver supports native callbacks (D3D12), 0 otherwise.
++	int native_callback_get_version() const;
++
++private:
++	struct NativeCallbackPayload;
++	static void _native_callback_run(RDD *p_driver, RDD::CommandBufferID p_command_buffer, void *p_userdata);
++
++public:
++
+ 	/*****************/
+ 	/**** TEXTURE ****/
+ 	/*****************/
+diff --git a/servers/rendering/rendering_device_driver.h b/servers/rendering/rendering_device_driver.h
+index 103bd99..3164f8f 100644
+--- a/servers/rendering/rendering_device_driver.h
++++ b/servers/rendering/rendering_device_driver.h
+@@ -816,6 +816,41 @@ public:
+ 
+ 	typedef void (*DriverCallback)(RenderingDeviceDriver *p_driver, CommandBufferID p_command_buffer, void *p_userdata);
+ 
++	// Native callbacks: an extension records its own GPU work (e.g. an upscaler library) into the command buffer
++	// the engine is recording, at the callback's place in the render graph. Plain C layout shared with
++	// extensions (RenderingDevice::native_callback_add); append-only, struct_size tells versions apart.
++	enum NativeApi {
++		NATIVE_API_NONE = 0,
++		NATIVE_API_D3D12 = 1,
++	};
++
++	enum NativeBarrierModel {
++		NATIVE_BARRIERS_LEGACY_STATES = 0, // states[] are D3D12_RESOURCE_STATES.
++		NATIVE_BARRIERS_ENHANCED_LAYOUTS = 1, // states[] are D3D12_BARRIER_LAYOUT.
++	};
++
++	struct NativeCallbackInfo {
++		uint32_t struct_size = sizeof(NativeCallbackInfo);
++		uint32_t api = NATIVE_API_NONE;
++		uint64_t device = 0; // ID3D12Device*.
++		uint64_t command_queue = 0; // ID3D12CommandQueue* the command list goes to.
++		uint64_t command_list = 0; // ID3D12GraphicsCommandList* being recorded.
++		uint32_t barrier_model = NATIVE_BARRIERS_LEGACY_STATES;
++		uint32_t resource_count = 0;
++		const uint64_t *resources = nullptr; // ID3D12Resource* of each texture handed over, in order.
++		const uint32_t *states = nullptr; // The state or layout each one is in; the callback must leave it there.
++	};
++
++	static const uint32_t NATIVE_CALLBACK_MAX_RESOURCES = 16;
++
++	// Puts the textures in the states their layouts ask for and fills r_info (r_resources and r_states hold
++	// p_textures.size() entries). False if this driver can't hand its command buffer to native code.
++	virtual bool command_native_callback_begin(CommandBufferID p_cmd_buffer, VectorView<TextureID> p_textures, VectorView<TextureLayout> p_layouts, NativeCallbackInfo &r_info, uint64_t *r_resources, uint32_t *r_states) { return false; }
++	// Forgets the command buffer's cached state (descriptor heaps, root signatures, pipelines, dynamic state),
++	// which the native code may have changed.
++	virtual void command_native_callback_end(CommandBufferID p_cmd_buffer) {}
++	virtual bool native_callbacks_supported() const { return false; }
++
+ 	/*****************/
+ 	/**** QUERIES ****/
+ 	/*****************/

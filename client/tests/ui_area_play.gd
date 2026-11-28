@@ -288,7 +288,7 @@ func _hand_stack_more(hud: Hud) -> void:
 		ui._quickbar_key(1)
 		input.cursor_item = holder.cursor_item
 		r["grenade_slot"] = ui.held_slot()
-		input.capsule_aim._timer = 0.0
+		input.capsule_aim._next_msec = 0  # (the capsule's cooldown, held across clicks)
 		input.capsule_aim.hold("grenade", Vector2(3, 3), 1.0)
 		r["throw"] = sent_one("throw")
 		input.has_ground = true
@@ -616,10 +616,10 @@ func _ninth_list(hud: Hud, player: Node) -> void:
 	m.handle({"t": "slots", "l": {"main": row10.call([0, ["iron-plate", 10], 0, 0, ["coal", 5]])}})
 	ui._sort_sent_ms = -100000
 	await get_tree().process_frame
-	check(sorts.call().is_empty(), "J12: not while the window shows it (stacks put where the player wants stay there)")
+	check(sorts.call().size() == (0 if Switches.has("--auto-sort-open=old") else 1),
+		"J12: inventory sorts even while the window is open (unless --auto-sort-open=old)")
 	ui.close_all()
 	await get_tree().process_frame
-	check(sorts.call().size() == 1, "J12: closing the window sorts it")
 	m.handle({"t": "slots", "l": {"main": row10.call([["coal", 5], ["iron-plate", 10]])}})
 	ui.toggle_inventory()
 	click_main(ui, 1)
@@ -632,7 +632,282 @@ func _ninth_list(hud: Hud, player: Node) -> void:
 	ui._sort_sent_ms = -100000
 	await get_tree().process_frame
 	check(sorts.call().size() == 1, "J12: and once the hand is empty again")
+	# Bug #19: a sort answer that still has a gap re-triggers sorting if counts match.
+	m.handle({"t": "slots", "l": {"main": row10.call([["coal", 5], 0, ["iron-plate", 10], ["wood", 4]])}})
+	ui._sort_sent_ms = -100000
+	await get_tree().process_frame
+	check(sorts.call().size() == 1, "#19: a sort answer with a gap still schedules a re-sort")
 	ui.auto_sort = false
+
+	# --- Batch 3 C12: All-inventory auto-sort (trash, chest, cargo, trunk) ------------------------
+	check(bool(Settings.DEFAULTS["interface"].get("auto_sort_inventory", false))
+		and bool(Settings.DEFAULTS["interface"].get("auto_sort_containers", false)),
+		"C12: Settings defaults enable auto_sort_inventory and auto_sort_containers")
+	var was_auto_containers: bool = ui.auto_sort_containers
+	ui.auto_sort_containers = true
+	ui._trash_sent_ms = -100000
+	m.handle({"t": "slots", "l": {"main": row10.call([["iron-plate", 5]]), "trash": [0, ["wood", 3]]}})
+	await get_tree().process_frame
+	var trash_sorts: Array = sorts.call().filter(func(c: Dictionary) -> bool: return str(c.get("inv", "")) == "trash")
+	check(trash_sorts.size() == 1, "C12: character trash gap triggers sort inv='trash': %s" % [trash_sorts])
+	ui.screen.request(520, {"t": "open", "u": 520, "p": 0, "x": 0, "y": 0})
+	ui.screen.handle({"t": "gui", "u": 520, "p": 0, "kind": "container", "name": "wooden-chest",
+		"inv": {"chest": {}}, "slots": {"chest": [0, ["iron-plate", 4]]}})
+	await get_tree().process_frame
+	var chest_sorts: Array = sorts.call().filter(func(c: Dictionary) -> bool: return str(c.get("inv", "")) == "chest" and int(c.get("u", 0)) == 520)
+	check(chest_sorts.size() == 1, "C12: open chest gap triggers sort inv='chest': %s" % [chest_sorts])
+	ui.screen.request(521, {"t": "open", "u": 521, "p": 0, "x": 0, "y": 0})
+	ui.screen.handle({"t": "gui", "u": 521, "p": 0, "kind": "train", "name": "cargo-wagon",
+		"inv": {"cargo": {}}, "slots": {"cargo": [0, ["coal", 4]]}, "bar": 2})
+	await get_tree().process_frame
+	var cargo_sorts: Array = sorts.call().filter(func(c: Dictionary) -> bool: return str(c.get("inv", "")) == "cargo" and int(c.get("u", 0)) == 521)
+	check(cargo_sorts.size() == 1, "C12: open cargo-wagon gap triggers sort inv='cargo': %s" % [cargo_sorts])
+	ui.screen.request(522, {"t": "open", "u": 522, "p": 0, "x": 0, "y": 0})
+	ui.screen.handle({"t": "gui", "u": 522, "p": 0, "kind": "vehicle", "name": "car",
+		"inv": {"trunk": {}}, "slots": {"trunk": [0, ["stone", 2]]}})
+	await get_tree().process_frame
+	var trunk_sorts: Array = sorts.call().filter(func(c: Dictionary) -> bool: return str(c.get("inv", "")) == "trunk" and int(c.get("u", 0)) == 522)
+	check(trunk_sorts.size() == 1, "C12: open car trunk gap triggers sort inv='trunk': %s" % [trunk_sorts])
+	ui.auto_sort_containers = false
+	m.handle({"t": "slots", "l": {"main": row10.call([["iron-plate", 5]]), "trash": [0, ["coal", 2]]}})
+	ui.screen.handle({"t": "gui", "u": 520, "p": 0, "kind": "container", "name": "wooden-chest",
+		"inv": {"chest": {}}, "slots": {"chest": [0, ["copper-plate", 4]]}})
+	await get_tree().process_frame
+	check(sorts.call().is_empty(), "C12: auto_sort_containers=false suppresses container and trash auto-sorts")
+	ui.screen.close()
+	ui.auto_sort_containers = was_auto_containers
+
+	# --- Batch 3 C2: 1 s orange new-item slot flash preserved across sort & --inv-slot-flash=off --
+	var fm := UiModel.new()
+	fm.set_inventory_slots([["iron-plate", 5], 0, 0, 0], 4)
+	var first_load_hl := fm.main_highlight_until(1)
+	fm.set_inventory_slots([["iron-plate", 5], 0, ["copper-plate", 3], 0], 4)
+	var added_hl := fm.main_highlight_until(3)
+	fm.set_inventory_slots([["copper-plate", 3], ["iron-plate", 5], 0, 0], 4)
+	var sorted_new_hl := fm.main_highlight_until(1)
+	var sorted_old_hl := fm.main_highlight_until(3)
+	check(first_load_hl == 0 and added_hl > 0 and sorted_new_hl > 0 and sorted_old_hl == 0,
+		"C2: new item flashes 1s and flash moves with stack across sort (init=%d add=%d moved=%d old=%d)" % [first_load_hl, added_hl, sorted_new_hl, sorted_old_hl])
+	var hl_slot := Slot.new()
+	var was_flash := Slot.slot_flash
+	Slot.slot_flash = true
+	hl_slot.set_highlight(Time.get_ticks_msec() + 900)
+	var flash_on := hl_slot.highlight_until > 0 and hl_slot.is_processing()
+	Slot.slot_flash = false
+	hl_slot.set_highlight(Time.get_ticks_msec() + 900)
+	var flash_off := hl_slot.highlight_until == 0
+	check(flash_on and flash_off, "C2: Slot.set_highlight honours --inv-slot-flash=off (%s, %s)" % [flash_on, flash_off])
+	Slot.slot_flash = was_flash
+	hl_slot.free()
+
+	# --- Batch 2 #1: UI item move/pickup SFX & --inv-move-sfx=off -------------------------------
+	const Sfx := preload("res://scripts/fx/sfx.gd")
+	var sfx_stub_script := GDScript.new()
+	sfx_stub_script.source_code = "extends Node\nvar played := []\nfunc play_flat(path: String, volume: float, kind := \"\", bus := \"UI\") -> void:\n\tplayed.append([path, volume, kind, bus])\n"
+	sfx_stub_script.reload()
+	var sfx_stub: Node = sfx_stub_script.new()
+	var was_sfx = Sfx.instance
+	var was_move_sfx := FactorioUi.inv_move_sfx
+	Sfx.instance = sfx_stub
+	FactorioUi.inv_move_sfx = true
+	m.handle({"t": "slots", "l": {"main": row10.call([["iron-plate", 10], 0, 0])}})
+	ui.toggle_inventory()
+	await get_tree().process_frame
+	sfx_stub.played.clear()
+	ui._on_character_slot("main", 1, MOUSE_BUTTON_LEFT, false, false)
+	var pick_sfx_count: int = sfx_stub.played.size()
+	ui._on_character_slot("main", 2, MOUSE_BUTTON_LEFT, false, false)
+	var put_sfx_count: int = sfx_stub.played.size() - pick_sfx_count
+	ui._on_character_slot("main", 1, MOUSE_BUTTON_LEFT, false, false)
+	sfx_stub.played.clear()
+	ui.clear_cursor()
+	var clear_sfx_count: int = sfx_stub.played.size()
+	FactorioUi.inv_move_sfx = false
+	sfx_stub.played.clear()
+	ui._on_character_slot("main", 2, MOUSE_BUTTON_LEFT, false, false)
+	ui._on_character_slot("main", 1, MOUSE_BUTTON_LEFT, false, false)
+	var off_sfx_count: int = sfx_stub.played.size()
+	check(pick_sfx_count >= 1 and put_sfx_count >= 1 and clear_sfx_count >= 1 and off_sfx_count == 0,
+		"B2#1: inventory pick/move/clear play UI SFX and --inv-move-sfx=off silences them (pick=%d put=%d clear=%d off=%d)" % [pick_sfx_count, put_sfx_count, clear_sfx_count, off_sfx_count])
+	FactorioUi.inv_move_sfx = was_move_sfx
+	Sfx.instance = was_sfx
+	sfx_stub.free()
+	ui.clear_cursor()
+	ui.close_all()
+	sent()
+
+	# --- Bug #4 + Batch 2 #6/#7/#8: LimitButton clear-and-reselect, hover preview, Esc/RMB, barred move ---
+	var chest_slots := []
+	for i in 10:
+		chest_slots.append({})
+	m.handle({"t": "slots", "l": {"main": row10.call([["iron-plate", 5], ["copper-plate", 5], ["coal", 5]])}})
+	ui.screen.request(501, {"t": "open", "u": 501, "p": 0, "x": 0, "y": 0})
+	ui.screen.handle({"t": "gui", "u": 501, "p": 0, "kind": "container", "name": "wooden-chest",
+		"inv": {"chest": {}}, "slots": {"chest": chest_slots}, "bar": 2})
+	await get_tree().process_frame
+	var limit_btn := ui.screen.find_child("LimitButton", true, false) as Slot
+	var chest_grid_node := limit_btn.get_parent() if limit_btn != null else null
+	check(limit_btn != null and chest_grid_node != null and chest_grid_node.get_child(10) == limit_btn,
+		"#4: container LimitButton is placed after the last slot (index 10), not at bar=2")
+	sent()
+	if limit_btn != null:
+		limit_btn.clicked.emit(MOUSE_BUTTON_LEFT, false)
+		var first_bar_cmds: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "set_bar")
+		check(ui.screen._setting_bar and first_bar_cmds.size() == 1 and int(first_bar_cmds[0].get("n", -1)) == 10,
+			"#4 + B2#8: first LMB on LimitButton with bar=2 clears to 10 immediately AND enters bar-setting mode: %s" % [first_bar_cmds])
+		# B2#7: live mouse-hover red barred preview and Esc / RMB cancel (re-fetch grid after _rebuild_now).
+		var grid_fn := func() -> Control:
+			var lb := ui.screen.find_child("LimitButton", true, false) as Slot
+			return lb.get_parent() if lb != null else null
+		var g_hover: Control = grid_fn.call()
+		ui.screen.set_bar_hover(4)
+		var prev_ok: bool = g_hover != null and not (g_hover.get_child(2) as Slot).blocked and (g_hover.get_child(3) as Slot).blocked
+		var esc := InputEventKey.new()
+		esc.pressed = true
+		esc.physical_keycode = KEY_ESCAPE
+		ui.screen._unhandled_key_input(esc)
+		var g_esc: Control = grid_fn.call()
+		var esc_ok: bool = not ui.screen._setting_bar and g_esc != null and not (g_esc.get_child(3) as Slot).blocked
+		check(prev_ok and esc_ok, "B2#7: live hover previews red barred slots and Esc cancels without changing limit (%s, %s)" % [prev_ok, esc_ok])
+		var limit_btn2 := ui.screen.find_child("LimitButton", true, false) as Slot
+		if limit_btn2 != null:
+			limit_btn2.clicked.emit(MOUSE_BUTTON_LEFT, false)
+		ui.screen.set_bar_hover(6)
+		var g_rmb: Control = grid_fn.call()
+		if g_rmb != null:
+			(g_rmb.get_child(5) as Slot).clicked.emit(MOUSE_BUTTON_RIGHT, false)
+		check(not ui.screen._setting_bar and sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "set_bar").is_empty(),
+			"B2#7: RMB cancels bar-setting without sending set_bar")
+		# Select limit bar = 4 (clicking slot index 5) and test B2#6 manual move into barred slot 7.
+		var limit_btn3 := ui.screen.find_child("LimitButton", true, false) as Slot
+		if limit_btn3 != null:
+			limit_btn3.clicked.emit(MOUSE_BUTTON_LEFT, false)
+		var g_pick: Control = grid_fn.call()
+		if g_pick != null:
+			(g_pick.get_child(4) as Slot).clicked.emit(MOUSE_BUTTON_LEFT, false)
+		var pick_bar_cmds: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "set_bar")
+		var g_barred: Control = grid_fn.call()
+		check(not ui.screen._setting_bar and pick_bar_cmds.size() == 1 and int(pick_bar_cmds[0].get("n", -1)) == 4
+			and g_barred != null and (g_barred.get_child(5) as Slot).blocked,
+			"B2#7: clicking slot 5 sets bar=4 and marks slots 5+ blocked: %s" % [pick_bar_cmds])
+		ui._on_character_slot("main", 1, MOUSE_BUTTON_LEFT, false, false)
+		sent()
+		if g_barred != null:
+			(g_barred.get_child(6) as Slot).clicked.emit(MOUSE_BUTTON_LEFT, false)
+		var barred_moves: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "move" and str(c.get("to", "")) == "chest" and int(c.get("ti", 0)) == 7)
+		check(barred_moves.size() == 1, "B2#6: manual click into barred chest slot 7 sends move command: %s" % [barred_moves])
+		ui.clear_cursor()
+		sent()
+
+	# --- Bug #11: Shift+LMB drag transfers multiple same-side slots without Godot DnD ---
+	var test_slot := Slot.new()
+	test_slot.drag_item = "iron-plate"
+	Slot.spreading = false
+	check(test_slot._get_drag_data(Vector2.ZERO) != null, "#11: normal slot drag returns preview")
+	Slot.spreading = true
+	check(test_slot._get_drag_data(Vector2.ZERO) == null, "#11: Slot.spreading suppresses Godot DnD hijack")
+	Slot.spreading = false
+	test_slot.free()
+	m.handle({"t": "slots", "l": {"main": row10.call([["iron-plate", 5], ["copper-plate", 5], ["coal", 5]])}})
+	ui.toggle_inventory()
+	await get_tree().process_frame
+	sent()
+	ui._on_character_slot("main", 1, MOUSE_BUTTON_LEFT, true, false)
+	var s2 := Slot.new()
+	s2.slot_role = "main"
+	s2.slot_index = 2
+	var s3 := Slot.new()
+	s3.slot_role = "main"
+	s3.slot_index = 3
+	var s_opp := Slot.new()
+	s_opp.slot_role = "chest"
+	s_opp.slot_index = 1
+	ui._shift_drag_to(s2)
+	ui._shift_drag_to(s2)  # duplicate visit ignored
+	ui._shift_drag_to(s3)
+	ui._shift_drag_to(s_opp)  # opposite side ignored
+	ui._end_shift_drag()
+	var xfers: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "xfer")
+	check(xfers.size() == 3 and xfers.map(func(c: Dictionary) -> int: return int(c.get("fi", 0))) == [1, 2, 3],
+		"#11: Shift+LMB drag transfers each same-side slot once and ignores opposite side: %s" % [xfers])
+	for n in [s2, s3, s_opp]:
+		n.free()
+	ui.close_all()
+	await get_tree().process_frame
+
+	# --- Bug #13: clickable inserter hand and transport-belt lane slots ---
+	ui.screen.request(502, {"t": "open", "u": 502, "p": 0, "x": 0, "y": 0})
+	ui.screen.handle({"t": "gui", "u": 502, "p": 0, "kind": "inserter", "name": "inserter", "ins": {"h": ["iron-plate", 2]}})
+	await get_tree().process_frame
+	var ins_hand := ui.screen.find_child("Hand", true, false) as Slot
+	check(ins_hand != null and ins_hand.slot_role == "hand" and ins_hand.slot_index == 1 and ins_hand.item == "iron-plate",
+		"#13: inserter Hand slot has role=hand, index=1, item=iron-plate")
+	sent()
+	if ins_hand != null:
+		ins_hand.clicked.emit(MOUSE_BUTTON_LEFT, true)
+	var hand_xfers: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "xfer" and c.get("from") == "hand")
+	check(hand_xfers.size() == 1 and int(hand_xfers[0].get("u", 0)) == 502,
+		"#13: Shift+click on inserter Hand emits xfer from=hand: %s" % [hand_xfers])
+	var had_screen_protos: Variant = ui.screen.protos
+	if ui.screen.protos == null:
+		ui.screen.protos = ProtoDB.new()
+	if ui.screen.protos.entities_by_name.get("transport-belt") == null:
+		ui.screen.protos.add_entities([[503, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 100, 140, 200, 1, 1]])
+	var belt_proto: ProtoDB.EntityProto = ui.screen.protos.entities_by_name.get("transport-belt")
+	var belt_pid: int = belt_proto.id if belt_proto != null else 0
+	ui.screen.request(503, {"t": "open", "u": 503, "p": belt_pid, "x": 0, "y": 0})
+	ui.screen.handle({"t": "gui", "u": 503, "p": belt_pid, "kind": "other", "name": "transport-belt",
+		"bl": [[{"name": "iron-plate", "count": 1}], [{"name": "copper-plate", "count": 1}]]})
+	await get_tree().process_frame
+	var b1 := ui.screen.find_child("belt_1_1", true, false) as Slot
+	var b2 := ui.screen.find_child("belt_2_1", true, false) as Slot
+	check(b1 != null and b1.item == "iron-plate" and b2 != null and b2.item == "copper-plate",
+		"#13: transport-belt screen populates clickable lane slots from gui.bl")
+	sent()
+	if b2 != null:
+		b2.clicked.emit(MOUSE_BUTTON_LEFT, true)
+	var belt_xfers: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "xfer" and c.get("from") == "belt_2")
+	check(belt_xfers.size() == 1 and int(belt_xfers[0].get("u", 0)) == 503,
+		"#13: Shift+click on belt_2_1 emits xfer from=belt_2: %s" % [belt_xfers])
+	ui.close_all()
+	ui.screen.protos = had_screen_protos
+	await get_tree().process_frame
+
+	# --- Bug #9: fluid/machine-only recipes appear in crafting tab with hand=false and refuse hand craft ---
+	var had_hc: Array = m.hand_categories.duplicate()
+	var had_rdet: Array = m._rdet.duplicate()
+	m.handle({"t": "rdet", "part": 1, "parts": 1, "hc": ["crafting"], "l": [
+		["iron-gear-wheel", 0.5, ["crafting"], "intermediate-products", "d", "intermediate-product", "a", "a", [["item", "iron-plate", 2]], [["item", "iron-gear-wheel", 1]]],
+		["oil-processing", 5.0, ["oil-processing"], "intermediate-products", "d", "fluid-recipes", "a", "b", [["fluid", "crude-oil", 100]], [["fluid", "petroleum-gas", 55]]],
+	]})
+	var oil_rec: Dictionary = m.recipe("oil-processing")
+	var gear_rec: Dictionary = m.recipe("iron-gear-wheel")
+	check(not oil_rec.is_empty() and not bool(oil_rec.get("hand", true)) and bool(gear_rec.get("hand", false)),
+		"#9: rdet.hc marks hand=true for crafting and hand=false for oil-processing")
+	ui.toggle_inventory()
+	await get_tree().process_frame
+	var find_slot_by_item := func(root_n: Node, target_item: String) -> Slot:
+		var stack_q: Array = [root_n]
+		while not stack_q.is_empty():
+			var n: Node = stack_q.pop_back()
+			if n is Slot and (str(n.get_meta("recipe", "")) == target_item or (n as Slot).item == target_item):
+				return n as Slot
+			for ch in n.get_children():
+				stack_q.append(ch)
+		return null
+	var oil_slot: Slot = find_slot_by_item.call(ui.window, "oil-processing")
+	check(oil_slot != null and oil_slot.ghost and oil_slot.count == -1,
+		"#9: machine-only recipe appears in crafting panel as ghost with no count")
+	sent()
+	if oil_slot != null:
+		oil_slot.clicked.emit(MOUSE_BUTTON_LEFT, false)
+	check(sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "craft").is_empty(),
+		"#9: clicking machine-only recipe sends no craft command")
+	ui.close_all()
+	await get_tree().process_frame
+	m.hand_categories = had_hc
+	m._rdet = had_rdet
+	m._apply_recipe_details()
 
 	# --- J13: a crafting queue longer than its row ------------------------------------------------
 	var q = ui.craft_queue
@@ -1365,6 +1640,14 @@ func _play(hud: Hud, player: Node) -> void:
 	check(w._guns[1].item == "submachine-gun" and not w._guns[1].button_pressed and w._ammo[1].item == "", "and the others")
 	w._guns[1].clicked.emit(MOUSE_BUTTON_LEFT, false)
 	check(int(sent_one("gun").get("i", 0)) == 2, "clicking a gun uses it")
+	var gin := PlayerInput.new()
+	gin.hud = hud
+	gin._next_gun()
+	check(sent_one("gun").is_empty(), "Next weapon skips a gun with no ammo (Factorio: the weapon to change to must have ammo)")
+	hud.set_guns(1, [["pistol", "firearm-magazine", 10], ["submachine-gun", "firearm-magazine", 5], ["", "", 0]])
+	gin._next_gun()
+	gin.free()
+	check(int(sent_one("gun").get("i", 0)) == 2, "and takes one that has")
 	hud.set_health(100, 250)
 	check(hud.health_bar.visible and hud.health_bar.value == 100, "the health bar shows while hurt")
 	hud.set_health(250, 250)

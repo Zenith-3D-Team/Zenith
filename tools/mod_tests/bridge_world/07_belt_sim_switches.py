@@ -723,7 +723,7 @@ got_on, finds_on = one_search_round()
 set_perf(one_search=False)
 got_off, finds_off = one_search_round()
 set_perf()
-own = ("cargo-pod", "locomotive,cargo-wagon", "unit,turret", "spider-unit,spider-vehicle")  # (the types the fake has)
+own = ("cargo-pod", "locomotive,cargo-wagon,fluid-wagon", "unit,turret", "spider-unit,spider-vehicle")  # (the types the fake has)
 check(all(got_on.values()) and all(got_off.values()),
       f"one_search: cargo pods, trains and attacking enemies are sent either way: {got_on} / {got_off}")
 check(not any(finds_on.get(k) for k in own) and finds_on.get("turret", 0) <= 1 and all(finds_off.get(k) for k in own),

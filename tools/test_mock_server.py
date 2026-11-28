@@ -1006,6 +1006,17 @@ check(any(r[0] == "e" and r[3] == 2.5 for r in ov), f"charts carry the map view'
 send({"t": "unghost", "q": 3, "x": 300 * 256, "y": 300 * 256})
 step(1)
 check([(m["q"], m["n"]) for m in of_type(take(), "unghost")] == [(3, 0)], "unghost with no ghost there answers n = 0")
+# The 2D map's click: `pick` answers the building under a point of the map (the nearest centre), or nothing; the
+# client then opens it with `rv`, from afar where radars cover it.
+send({"t": "pick", "q": 8, "x": int(5.5 * 256) + 40, "y": int(10.5 * 256) - 40, "r": 64})
+step(1)
+pk = of_type(take(), "pick")
+check(pk and pk[0]["q"] == 8 and pk[0].get("u") == chest[0] and pk[0]["p"] == protos["wooden-chest"] and pk[0]["x"] == chest[2],
+      f"pick names the chest under the point: {pk}")
+send({"t": "pick", "q": 9, "x": 300 * 256, "y": 300 * 256, "r": 64})
+step(1)
+pk = of_type(take(), "pick")
+check(pk and pk[0]["q"] == 9 and "u" not in pk[0], f"pick with nothing there carries no unit: {pk}")
 # G12: the hover panel's beacon effects (`hinfo`), with --beacon's beacon by the starter assemblers.
 hb = game.add(mock_server.Entity(game._unit(), "beacon", 8.5, -6.5))
 send({"t": "hinfo", "q": 6, "u": hb.unit, "p": 0, "x": 0, "y": 0})
@@ -1752,6 +1763,30 @@ mock_server.MOD_WINDOW = False
 check(mg and all(len(m["l"]) == 1 and m["ids"] == [901, 902] and m.get("ds") == [1920, 1080, 1] for m in mg)
       and {m["l"][0]["i"] for m in mg} == {901, 902},
       f"mgui: one window a message, with ds, the top button too: {[(m['l'][0]['i'], m.get('ds')) for m in mg][:4]}")
+# mset: the player's change to a mod's checkbox and textfield is set (a wrong kind of value isn't).
+mock_server.MOD_WINDOW = True
+send({"t": "mset", "ix": 919, "v": True})
+send({"t": "mset", "ix": 920, "v": "hello"})
+send({"t": "mset", "ix": 919, "v": "not a bool"})
+step(240)
+mg = [m for m in of_type(take(), "mgui") if m["l"] and m["l"][0]["i"] == 901]
+mock_server.MOD_WINDOW = False
+
+
+def _mgui_find(node, ix):
+    if node.get("ix") == ix:
+        return node
+    for child in node.get("a", []):
+        hit = _mgui_find(child, ix)
+        if hit is not None:
+            return hit
+    return None
+
+
+mset_box = _mgui_find(mg[-1]["l"][0]["e"], 919) if mg else None
+mset_text = _mgui_find(mg[-1]["l"][0]["e"], 920) if mg else None
+check(mset_box is not None and mset_box.get("s") is True and mset_text is not None and mset_text.get("tx") == "hello",
+      f"mset: the mod window's checkbox and textfield take the player's values: {mset_box} {mset_text}")
 # A client not drawing them says so in its hello (mg 0): one last empty message, then none.
 mock_server.MOD_WINDOW = True
 HELLO["mg"] = 0  # (step() says hello as a keep-alive)
@@ -2178,8 +2213,31 @@ for use_bin in (False, True):
     check(rb_seen and any(len(m.get("u", [])) >= 11 for m in rb_seen), f"rb ({mode}): emits rb records")
     check(not mv_bots, f"rb ({mode}): excludes worker robots from mv: {mv_bots[:3]}")
     check(not rc_seen, f"rb ({mode}): skips rc when rb is active")
-HELLO.pop("rb", None)
+
+HELLO.update({"w": 0, "sid": "rb-altc-test", "rb": 1})
 HELLO.pop("bin", None)
+send(HELLO)
+HELLO["w"] = 1
+step(4)
+take()
+send({"t": "altc", "on": 1, "g": 1})
+rc_alt_on = []
+for _ in range(15):
+    step(1)
+    rc_alt_on.extend(m for m in take() if m["t"] == "rc")
+check(bool(rc_alt_on) and all(not protocol.problems(m) for m in rc_alt_on),
+      f"rb + altc on: mock server emits valid rc: {rc_alt_on[:2]}")
+send({"t": "altc", "on": 0})
+step(2)
+rc_alt_clr = [m for m in take() if m["t"] == "rc"]
+check(len(rc_alt_clr) >= 1 and rc_alt_clr[-1].get("l") == [],
+      f"rb + altc off: mock server clears rc with empty l: {rc_alt_clr}")
+rc_alt_after = []
+for _ in range(15):
+    step(1)
+    rc_alt_after.extend(m for m in take() if m["t"] == "rc")
+check(not rc_alt_after, f"rb + altc off: mock server stops rc after clear: {rc_alt_after}")
+HELLO.pop("rb", None)
 
 # Selective NACK ring replay hit & aged-out chunk requeue miss fallback (and protocol.client_problems):
 check(not protocol.client_problems({"t": "nack", "r": [1, 2], "c": [[0, 0]]})
@@ -2275,6 +2333,108 @@ check(bool(of_type(msgs_raise, "raise")), "cmd /f3d-debug raise emits raise mess
 HELLO.pop("ie", None)
 HELLO.pop("dq", None)
 HELLO.pop("bin", None)
+
+# Batch 3 mock coverage: rblk, rdet.cm, and container sort (C1, C11, C12)
+HELLO.update({"sid": "batch3-mock", "w": 0})
+send(HELLO)
+step(2)
+b3_msgs = take()
+b3_rdet = [m for m in of_type(b3_msgs, "rdet") if m.get("part") == 1]
+check(b3_rdet and "assembling-machine-1" in b3_rdet[0].get("cm", {}).get("crafting", []),
+      f"mock rdet part 1 sends cm crafting machines: {b3_rdet[:1] and b3_rdet[0].get('cm')}")
+
+send({"t": "rblk", "u": [101, 102, 103]})
+step(1)
+b3_rblk = of_type(take(), "rblk")
+check(len(b3_rblk) == 1 and b3_rblk[0].get("b") == [[101, 1], [102, 1], [103, 1]],
+      f"mock rblk returns [unit, block_id] rows: {b3_rblk}")
+
+chest_ent = next(e for e in game.entities.values() if e.name == "wooden-chest")
+game.player["x"], game.player["y"] = chest_ent.x - 1.0, chest_ent.y
+game.machine(chest_ent)["inv"]["chest"] = {"copper-plate": 5, "coal": 3, "iron-plate": 10}
+send({"t": "open", "u": chest_ent.unit, "p": protos["wooden-chest"],
+      "x": mock_server.fixed(chest_ent.x), "y": mock_server.fixed(chest_ent.y)})
+step(2)
+take()
+send({"t": "sort", "inv": "chest", "u": chest_ent.unit})
+step(1)
+b3_gui = [m for m in of_type(take(), "gui") if m.get("u") == chest_ent.unit]
+check(list(game.machine(chest_ent)["inv"]["chest"].keys()) == ["coal", "copper-plate", "iron-plate"]
+      and bool(b3_gui),
+      f"mock sort inv=chest sorts chest inventory and refreshes gui: {list(game.machine(chest_ent)['inv']['chest'])}")
+send({"t": "close"})
+step(1)
+take()
+
+# Other #2: protocol.client_problems & mock_server clipboard bp_get (i == -2) + optional `to` slot
+check(not protocol.client_problems({"t": "bp_get", "q": 1, "i": -2}), "protocol allows bp_get i=-2")
+check(not protocol.client_problems({"t": "bp_get", "q": 1, "i": -2, "to": 0}), "protocol allows bp_get i=-2 to=0")
+check(not protocol.client_problems({"t": "bp_get", "q": 1, "i": -2, "to": -1}), "protocol allows bp_get i=-2 to=-1")
+check(not protocol.client_problems({"t": "bp_get", "q": 1, "i": -2, "to": 12}), "protocol allows bp_get i=-2 to=12")
+check(bool(protocol.client_problems({"t": "bp_get", "q": 1, "i": -2, "to": -2})), "protocol rejects bp_get to=-2")
+check(bool(protocol.client_problems({"t": "bp_get", "q": 1, "i": "bad"})), "protocol rejects non-int bp_get i")
+
+# rel-031-arms: focus `ir` (live inserter radius) is optional, whole tiles 0..128; the mock keeps it as session.lua does.
+check(not protocol.client_problems({"t": "focus", "x": 0, "y": 0, "r": 48}) and not protocol.client_problems({"t": "focus", "x": 0, "y": 0, "r": 48, "ir": 0})
+      and not protocol.client_problems({"t": "focus", "x": 0, "y": 0, "r": 48, "ir": 128}), "protocol allows focus without ir and ir 0..128")
+check(all(protocol.client_problems({"t": "focus", "x": 0, "y": 0, "r": 48, "ir": v}) for v in (-1, 129, 40.5, "40", True)),
+      "protocol rejects focus ir outside whole tiles 0..128")
+send({"t": "focus", "x": 0, "y": 0, "r": 48, "ir": 40})
+step(1)
+ir_kept = game.live_ir
+send({"t": "focus", "x": 0, "y": 0, "r": 48, "ir": 400})
+step(1)
+ir_bad = game.live_ir
+send({"t": "focus", "x": 0, "y": 0, "r": 48})
+step(1)
+check(ir_kept == 40 and ir_bad is None and game.live_ir is None, f"mock keeps focus ir 40, drops a bad one and none: {ir_kept}, {ir_bad}, {game.live_ir}")
+take()
+
+game.clipboard = []
+send({"t": "bp_get", "q": 810, "i": -2})
+step(1)
+m_empty_clip = [m for m in of_type(take(), "bp") if m.get("q") == 810]
+check(len(m_empty_clip) == 1 and "empty" in str(m_empty_clip[0].get("err", "")).lower(),
+      f"mock bp_get i=-2 on empty clipboard returns error: {m_empty_clip}")
+
+# Copy an entity into mock clipboard, then export (i=-2), save to=0, save to=specific slot, reject occupied, save to=-1.
+send({"t": "copy", "x1": mock_server.fixed(chest_ent.x - 1), "y1": mock_server.fixed(chest_ent.y - 1),
+      "x2": mock_server.fixed(chest_ent.x + 1), "y2": mock_server.fixed(chest_ent.y + 1), "cut": 0, "bp": 0})
+step(1)
+take()
+send({"t": "bp_get", "q": 811, "i": -2})
+step(1)
+m_clip_bp = [m for m in of_type(take(), "bp") if m.get("q") == 811]
+check(len(m_clip_bp) == 1 and m_clip_bp[0].get("i") == -2 and m_clip_bp[0].get("item") == "blueprint"
+      and bool(m_clip_bp[0].get("s")),
+      f"mock bp_get i=-2 exports clipboard blueprint string: {m_clip_bp}")
+
+send({"t": "bp_get", "q": 812, "i": -2, "to": 0})
+step(1)
+m_save0 = take()
+m_ok0 = [m for m in of_type(m_save0, "bp_ok") if m.get("q") == 812]
+saved_slot = m_ok0[0]["i"] if m_ok0 else 0
+check(len(m_ok0) == 1 and saved_slot >= 1 and m_ok0[0].get("item") == "blueprint"
+      and bool(of_type(m_save0, "slots")) and bool(of_type(m_save0, "inv")),
+      f"mock bp_get i=-2 to=0 saves clipboard to free slot and refreshes slots/inv: {m_ok0}")
+
+send({"t": "bp_get", "q": 813, "i": -2, "to": saved_slot})
+step(1)
+m_occ = [m for m in of_type(take(), "bp") if m.get("q") == 813]
+check(len(m_occ) == 1 and "empty" in str(m_occ[0].get("err", "")).lower(),
+      f"mock bp_get i=-2 to=occupied slot returns error: {m_occ}")
+
+send({"t": "bp_get", "q": 814, "i": -2, "to": -1})
+step(1)
+m_cur = [m for m in of_type(take(), "bp_ok") if m.get("q") == 814]
+check(len(m_cur) == 1 and m_cur[0].get("i") == -1 and m_cur[0].get("item") == "blueprint" and bool(game.lib_cursor),
+      f"mock bp_get i=-2 to=-1 copies clipboard into lib_cursor: {m_cur}")
+
+check(protocol.problems({"t": "hinfo", "k": 1, "q": 1, "u": 1, "fl": [{"fluid": "water", "amount": 500, "capacity": 50000, "temperature": 15}]}) == [],
+      "protocol accepts valid hinfo.fl fluid-wagon boxes")
+fl_bad = protocol.problems({"t": "hinfo", "k": 1, "q": 1, "u": 1, "fl": [{"fluid": "", "amount": -1, "capacity": 10}]})
+check(any("hinfo: fl" in p for p in fl_bad),
+      f"protocol rejects invalid hinfo.fl entries: {fl_bad}")
 
 # Every RELIABLE | IMMEDIATE protocol type must be represented across tools/mock*.py:
 import re as _re

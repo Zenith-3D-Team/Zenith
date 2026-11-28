@@ -4,14 +4,16 @@ extends CanvasLayer
 ## over the quickbar, and what the character is driving. All text is Factorio's font, white with
 ## a dark border like Factorio's in-game text.
 ##
-## Over the health bar, as in Factorio, the armour's shield (purple) and its batteries' charge,
-## each while not full. Taking damage flashes the screen's edges red, and low health tints it red
-## (damage_overlay.gd).
+## Over the health bar, as in Factorio, the armour's shield (purple) while not full; the armour's
+## battery charge updates the vertical bar beside the bottom-left armour slot (`--power-bar=middle`
+## restores the old bar above the quickbar). Taking damage flashes the screen's edges red, and low
+## health tints it red (damage_overlay.gd).
 
 const MachineScreen := preload("res://scripts/ui/factorio/machine_screen.gd")
 const FactorioUi := preload("res://scripts/ui/factorio/factorio_ui.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
+const Switches := preload("res://scripts/switches.gd")
 const DamageOverlay := preload("res://scripts/ui/damage_overlay.gd")
 const NightVisionOverlay := preload("res://scripts/ui/night_vision_overlay.gd")
 const Controls := preload("res://scripts/player/controls.gd")
@@ -106,7 +108,8 @@ func _ready() -> void:
 	mining_bar.custom_minimum_size.y = Kit.px(8)
 	mining_bar.visible = false
 	ui.quickbar.add_bar(mining_bar)
-	# The armour's batteries (yellow) and shield (shield_progressbar's purple) over the health bar.
+	# The armour's shield (shield_progressbar's purple) over the health bar; `energy_bar` stays
+	# hidden unless `--power-bar=middle` restores the old middle yellow bar.
 	energy_bar = Kit.progress_bar(ENERGY_COLOR)
 	energy_bar.custom_minimum_size.y = Kit.px(8)
 	energy_bar.visible = false
@@ -413,6 +416,8 @@ func reset() -> void:
 	set_guns(1, [])
 	mining_bar.visible = false
 	shield_bar.visible = false
+	energy_bar.visible = false
+	ui.weapons.set_energy(0.0, 0.0)
 	damage.reset()
 	screen.close_local()
 
@@ -457,10 +462,15 @@ func show_message(text: String) -> void:
 	get_tree().create_timer(clampf(float(Settings.get_value("interface", "message_delay")), 1.0, 60.0)).timeout.connect(expire)
 
 
+static func _power_bar_middle() -> bool:
+	return Switches.value("--power-bar").to_lower() in ["middle", "old"]
+
+
 ## Factorio shows the character's health over the quickbar while it is hurt.
 func set_health(hp: int, max_hp: int) -> void:
 	damage.set_health(hp, max_hp)
-	ui.weapons.set_health(hp, max_hp)  # Factorio's bar beside the armour slot
+	if _power_bar_middle():
+		ui.weapons.set_health(hp, max_hp)  # legacy bar beside the armour slot
 	health_bar.max_value = maxi(1, max_hp)
 	health_bar.value = hp
 	health_bar.visible = hp > 0 and hp < max_hp
@@ -482,15 +492,20 @@ func set_shield(shield: int, max_shield: int) -> void:
 	shield_bar.tooltip_text = "Shield: %d / %d" % [shield, max_shield]
 
 
-## The armour's batteries (`eq` bat / mbat), shown while they aren't full.
+## The armour's batteries (`eq` bat / mbat), shown beside the bottom-left armour slot
+## (`--power-bar=middle` restores the old yellow bar over the quickbar while not full).
 func _show_energy() -> void:
 	var g: Dictionary = ui.model.grid("char")
 	var full := float(g.get("max_battery", 0))
 	var now := float(g.get("battery", 0))
-	energy_bar.visible = full > 0.0 and now < full * 0.999
-	energy_bar.max_value = maxf(1.0, full)
-	energy_bar.value = now
-	energy_bar.tooltip_text = "Energy: %d%%" % roundi(now * 100.0 / maxf(1.0, full))
+	if _power_bar_middle():
+		energy_bar.visible = full > 0.0 and now < full * 0.999
+		energy_bar.max_value = maxf(1.0, full)
+		energy_bar.value = now
+		energy_bar.tooltip_text = "Energy: %d%%" % roundi(now * 100.0 / maxf(1.0, full))
+	else:
+		energy_bar.visible = false
+		ui.weapons.set_energy(now, full)
 
 
 ## {t: "guns", sel, l, v}: the weapon slots beside the quickbar show them (`v`: a vehicle's, N3).

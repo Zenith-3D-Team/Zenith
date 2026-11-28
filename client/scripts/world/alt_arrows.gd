@@ -462,17 +462,23 @@ func chunk_arrows(cv) -> Array:
 	var any := false
 	for key in cv.entities:
 		var r: WorldMirror.Rec = cv.entities[key]
-		if r.unit <= 0:
+		if r.unit <= 0 or r.extra.has("hid"):
 			continue
-		var proto = world.protos.entity(r.proto_id)
+		var pid := r.proto_id
+		var proto = world.protos.entity(pid)
 		if proto == null:
 			continue
+		if proto.type == "entity-ghost" and r.extra.has("gh"):
+			pid = int(r.extra["gh"])
+			proto = world.protos.entity(pid)
+			if proto == null:
+				continue
 		var t: String = proto.type
 		var wanted := (inserters and t == "inserter") or (pumps and PUMPS.has(t)) \
 			or (machines and (CRAFTERS.has(t) or MACHINES.has(t)))
 		if not wanted:
 			continue
-		var x: Dictionary = (model.eprops.get(r.proto_id, {}) as Dictionary).get("x", {})
+		var x: Dictionary = (model.eprops.get(pid, {}) as Dictionary).get("x", {})
 		var fc = r.extra.get("fc")
 		for a in arrows_for(t, x, r.pos, r.dir, int(r.extra.get("fa", 0)), fc if fc is Array else []):
 			if int(a[0]) == ICON:
@@ -495,11 +501,16 @@ static func arrows_for(type: String, x: Dictionary, pos: Vector2, dir: int, fa: 
 		for c in fc:
 			if not (c is Array) or c.size() < 5:
 				continue
+			var flow := str(c[3])
+			if not ((flow == "i" and (fa & 1) != 0) or (flow == "o" and (fa & 2) != 0) or (flow == "b" and fa != 0)):
+				continue
 			var way := _turn(Vector2(0, -1), int(c[2]))
 			var tile := pos + Vector2(float(c[0]), float(c[1]))
-			var flow := str(c[3])
 			if flow == "b":
-				out.append([FLUID_BOTH, tile + way * 0.5, way])
+				if (fa & 3) == 3:
+					out.append([FLUID_BOTH, tile + way * 0.5, way])
+				else:
+					out.append([FLUID, tile + way * 0.5, -way if (fa & 1) != 0 else way])
 			else:
 				out.append([FLUID, tile + way * 0.5, -way if flow == "i" else way])
 			if str(c[4]) != "":
@@ -528,7 +539,10 @@ static func arrows_for(type: String, x: Dictionary, pos: Vector2, dir: int, fa: 
 		var way := _turn(Vector2(0, -1), int(c[2]) + dir)
 		var at := pos + _turn(Vector2(float(c[0]), float(c[1])), dir) + way * 0.5
 		if flow == "b":
-			out.append([FLUID_BOTH, at, way])
+			if not crafter or (fa & 3) == 3:
+				out.append([FLUID_BOTH, at, way])
+			else:
+				out.append([FLUID, at, -way if (fa & 1) != 0 else way])
 		else:
 			out.append([FLUID, at, -way if flow == "i" else way])
 	if crafter and x.has("vp"):

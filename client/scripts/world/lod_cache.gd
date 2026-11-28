@@ -9,7 +9,8 @@ const Switches := preload("res://scripts/switches.gd")
 
 const REGION := 16
 const MAGIC := "ZLOD"
-const VERSION := 1
+## 2: v1 regions dropped once (chunk counts by tick in the bridge, as chunk_disk_cache.gd VERSION 2).
+const VERSION := 2
 
 const _HEADER_BYTES := 32
 const _CHUNK_HEADER_BYTES := 21

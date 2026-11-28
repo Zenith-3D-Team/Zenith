@@ -1,0 +1,8 @@
+; Zenith's upscalers library (client/native/upscalers), copied in by hook_window_test.ps1.
+[configuration]
+entry_symbol = "upscalers_library_init"
+compatibility_minimum = "4.7"
+
+[libraries]
+windows.debug.x86_64 = "res://bin/upscalers.windows.template_release.x86_64.dll"
+windows.release.x86_64 = "res://bin/upscalers.windows.template_release.x86_64.dll"

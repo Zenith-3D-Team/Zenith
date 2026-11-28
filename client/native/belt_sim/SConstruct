@@ -30,6 +30,10 @@ elif env["platform"] == "linux":
 lib_env = env.Clone()
 if env["platform"] == "windows" and not env.get("use_mingw"):
 	lib_env.Append(CCFLAGS=["/Zi", "/FS"], LINKFLAGS=["/DEBUG", "/PDBALTPATH:%_PDB%", "/OPT:REF", "/OPT:ICF", "/MAP"])
+else:
+	# GCC/Clang may fuse a*b+c into one FMA (x86-64-v3, ARM), rounding once where MSVC and GDScript round
+	# twice: the parity tests (native against GDScript) want the same floats on every platform.
+	lib_env.Append(CCFLAGS=["-ffp-contract=off"])
 if env["platform"] == "windows":
 	lib_env.Append(LIBS=["ws2_32"])  # UdpSocketNative (udp_socket_native.cpp)
 sources = Glob("src/*.cpp")

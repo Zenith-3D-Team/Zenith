@@ -36,6 +36,30 @@ function M.throw(cmd)
       return puppet.message("Out of range")
     end
   end
+  if action.type == "artillery-remote" then
+    -- The artillery targeting remote ("only-in-cursor", the shortcut spawns it): a flare at the target,
+    -- which every artillery turret of the force in range then shells (what the game does for its player).
+    local made, flare = pcall(c.surface.create_entity, { name = action.flare or "artillery-flare", position = target,
+      force = c.force, movement = { 0, 0 }, height = 0, vertical_speed = 0, frame_speed = 0 })
+    if not made or not flare then
+      log("[factorio-3d-bridge] artillery flare: " .. tostring(flare))
+      puppet.message("Can't use " .. item_name)
+    end
+    return
+  end
+  if action.type == "equipment-remote" then
+    -- The discharge defense remote: no stack in the inventory (it is only ever in the cursor), so the
+    -- capsule is used from a script inventory's.
+    local scratch = game.create_inventory(1)
+    scratch.insert({ name = item_name, count = 1 })
+    local used, err = pcall(scratch[1].use_capsule, c, target)
+    scratch.destroy()
+    if not used then
+      log("[factorio-3d-bridge] use_capsule: " .. tostring(err))
+      puppet.message("Can't use " .. item_name)
+    end
+    return
+  end
   local inventory = c.get_main_inventory()
   -- The stack the client's hand holds, in its own quality (`throw` carries none), as Factorio throws
   -- from the cursor (L7); else the first of the item.

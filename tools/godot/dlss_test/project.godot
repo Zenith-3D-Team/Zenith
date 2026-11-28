@@ -1,0 +1,24 @@
+; NVIDIA DLSS's window test (tools/godot/dlss_window_test.ps1): hook_test's project (copied in first) with this main
+; scene, exported with Zenith's patched Godot template and vendor/nvidia beside the program. Nothing here ships.
+config_version=5
+
+[application]
+
+config/name="Zenith DLSS test"
+run/main_scene="res://dlss_test.tscn"
+config/features=PackedStringArray("4.7")
+
+[audio]
+
+driver/driver="Dummy"
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/size/resizable=false
+
+[rendering]
+
+renderer/rendering_method="forward_plus"
+rendering_device/driver.windows="d3d12"

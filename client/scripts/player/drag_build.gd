@@ -39,6 +39,7 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const VisualTurns := preload("res://scripts/world/visual_turns.gd")
 const Predicted := preload("res://scripts/world/predicted.gd")
 const UndergroundPairs := preload("res://scripts/world/underground_pairs.gd")
+const RailBlocks := preload("res://scripts/player/rail_blocks.gd")
 const Switches := preload("res://scripts/switches.gd")
 
 const DIRS := {Vector2i(0, -1): 0, Vector2i(1, 0): 4, Vector2i(0, 1): 8, Vector2i(-1, 0): 12}
@@ -49,6 +50,10 @@ const UNDERGROUND_TYPES := ["underground-belt", "pipe-to-ground"]
 const TURN_SLACK := 2
 ## N5: walls follow the cursor's path; `--wall-drag=line` holds them to one line as before.
 static var walls_follow := not (Switches.has("--wall-drag=line"))
+## Pipes follow the cursor's path; `--pipe-drag=line` holds them to one line as before.
+static var pipes_follow := not (Switches.has("--pipe-drag=line"))
+## Cap stepped tiles per frame while preserving remaining drag path so fast drags don't spike.
+const MAX_STEPS_PER_FRAME := 4
 
 ## player_input (world, hud, build_dir, _blocked, _remember); untyped to keep the scripts apart.
 var pi: Node
@@ -101,6 +106,27 @@ var _walled := {}
 var _ran_out := false
 ## Commands sent during this drag, for tests: [cmd, ...].
 var sent: Array = []
+## Per-frame step cap state and queued waypoints for fast drags.
+var _step_frame := -1
+var _steps_in_frame := 0
+var _queued_targets: Array[Vector2i] = []
+var _pending_stop := false
+var _pending_ground := Vector2.ZERO
+var _last_rail_snap: Array = []
+var _rail_start_ground := Vector2.ZERO
+
+
+func _held_dir() -> int:
+	if pi != null and pi.has_method("effective_build_dir"):
+		return int(pi.effective_build_dir(_proto, _ghost))
+	return int(pi.build_dir)
+
+
+func _snap_rail_spot(at: Vector2, fallback_dir: int) -> Dictionary:
+	if pi != null and pi.get("rail_blocks") != null and _proto != null and RailBlocks.is_rail_attachment(_proto.type):
+		var eprops: Dictionary = pi.hud.ui.model.eprops if pi.hud != null else {}
+		return pi.rail_blocks.snap_spot(pi.world, _proto, at, fallback_dir, _ghost, eprops)
+	return {}
 
 
 func begin(item: String, proto: ProtoDB.EntityProto, ground: Vector2, ghost: bool) -> void:
@@ -117,7 +143,8 @@ func begin(item: String, proto: ProtoDB.EntityProto, ground: Vector2, ghost: boo
 	_under_open = false
 	_under_along = 0
 	_heading = Vector2i.ZERO
-	_flow = _vec(int(pi.build_dir))
+	var dir := _held_dir()
+	_flow = _vec(dir)
 	_backward = false
 	_line_from = _start
 	_ahead = 0
@@ -125,28 +152,63 @@ func begin(item: String, proto: ProtoDB.EntityProto, ground: Vector2, ghost: boo
 	_path.clear()
 	_walled = {_start: true}
 	_ran_out = false
+	_queued_targets.clear()
+	_pending_stop = false
+	_pending_ground = Vector2.ZERO
+	_last_rail_snap = []
+	_rail_start_ground = Vector2.ZERO
 	_first_waits = _under_reach() > 0
+	if _proto != null and RailBlocks.is_rail_attachment(_proto.type):
+		_rail_start_ground = ground
+		var rb := _snap_rail_spot(ground, dir)
+		if not rb.is_empty() and bool(rb.get("snapped", false)):
+			var spos: Vector2 = rb["pos"]
+			var sdir := int(rb["dir"])
+			_last_rail_snap = [spos, sdir]
+			_send_at(_item, spos, sdir)
+			_last_dir = sdir
+		else:
+			_send_at(_item, ground, dir)
+			_last_dir = dir
+		_last_built = _start
+		_has_last = true
+		_line_last = _start
+		_line_k = 0
+		_line_pos0 = ground
+		return
 	if _proto.type == "electric-pole":
 		# A pole two tiles wide is centred on a grid corner, up to a tile from the cursor's tile:
 		# the line and its wire reach are measured from where it really stands.
-		var size := _size_for(int(pi.build_dir))
+		var size := _size_for(dir)
 		_start = Vector2i(floori(pi._snap(ground.x, size.x)), floori(pi._snap(ground.y, size.y)))
 		_cur = _start
-	# The first one goes exactly where a click puts it (the mod snaps it to the grid).
+	# The first one goes exactly where a click puts it (the mod snaps it to the grid); clicking a belt
+	# with another direction rotates/fast-replaces it to `dir`, while drag-crossing avoids perpendicular belts.
 	if not _first_waits:
-		_send_at(_item, ground, int(pi.build_dir))
-	_last_built = _start
-	_last_dir = int(pi.build_dir)
-	_has_last = true
+		_send_at(_item, ground, dir)
+		_last_built = _start
+		_last_dir = dir
+		_has_last = true
+	else:
+		_last_built = _start
+		_last_dir = dir
+		_has_last = true
 	_line_last = _start
 	_line_k = 0
 	_line_pos0 = ground
 
 
 func end() -> void:
-	if _active and _first_waits and str(pi.cursor_item) == _item:
-		_first_waits = false
-		_send_at(_item, _line_pos0, int(pi.build_dir))  # a plain click: as held
+	if _active:
+		if _pending_stop or not _queued_targets.is_empty():
+			update(_pending_ground, -1)
+		if _first_waits and str(pi.cursor_item) == _item:
+			_first_waits = false
+			_send_at(_item, _line_pos0, _held_dir())  # a plain click: as held
+	_queued_targets.clear()
+	_pending_stop = false
+	_last_rail_snap = []
+	_rail_start_ground = Vector2.ZERO
 	_active = false
 
 
@@ -155,29 +217,106 @@ func active() -> bool:
 
 
 ## Called every frame while the button is held, with the cursor's ground point.
-func update(ground: Vector2) -> void:
+## When `max_steps > 0`, caps stepped tiles per process frame and preserves remaining path.
+func update(ground: Vector2, max_steps := -1) -> void:
 	if not _active:
 		return
+	if _proto != null and RailBlocks.is_rail_attachment(_proto.type):
+		if ground.distance_squared_to(_rail_start_ground) < 0.25:
+			return
+		var rb := _snap_rail_spot(ground, _held_dir())
+		if not rb.is_empty() and bool(rb.get("snapped", false)) and bool(rb.get("valid", false)):
+			var spos: Vector2 = rb["pos"]
+			var sdir := int(rb["dir"])
+			var snap_key := [spos, sdir]
+			if snap_key != _last_rail_snap:
+				if _last_rail_snap.size() == 2 and ground.distance_squared_to(_last_rail_snap[0] as Vector2) <= ground.distance_squared_to(spos) + 0.0001:
+					return
+				_last_rail_snap = snap_key
+				_rail_start_ground = ground
+				_send_at(_item, spos, sdir)
+		return
+	var budget := 1 << 20
+	if max_steps > 0:
+		var frame := Engine.get_process_frames()
+		if frame != _step_frame:
+			_step_frame = frame
+			_steps_in_frame = 0
+		budget = maxi(0, max_steps - _steps_in_frame)
+		if budget <= 0:
+			_pending_stop = true
+			_pending_ground = ground
+			if (_proto.type == "wall" and walls_follow) or ((_proto.type == "pipe" or _proto.type == "heat-pipe") and pipes_follow) or (_proto.type == "transport-belt" and not locked()):
+				_queue_path_target(Vector2i(floori(ground.x), floori(ground.y)))
+			return
 	if _proto.type == "electric-pole" and _wire() > 0.0:
+		_pending_stop = false
 		_follow_poles(ground)
 		return
 	var tile := Vector2i(floori(ground.x), floori(ground.y))
-	if tile == _cur:
+	if tile == _cur and not _pending_stop and _queued_targets.is_empty():
 		return
-	if _axis == Vector2i.ZERO:
+	if _axis == Vector2i.ZERO and tile != _start:
 		var d := tile - _start
 		_axis = Vector2i(signi(d.x), 0) if absi(d.x) >= absi(d.y) else Vector2i(0, signi(d.y))
 	if _proto.type == "wall" and walls_follow:
-		_follow_walls(tile)
+		_step_queued_path(tile, ground, budget, max_steps > 0, _follow_walls)
+		return
+	if (_proto.type == "pipe" or _proto.type == "heat-pipe") and pipes_follow:
+		_step_queued_path(tile, ground, budget, max_steps > 0, _follow_pipes)
 		return
 	if _proto.type == "transport-belt":
 		if locked():
-			_belt_line(tile)
-			_cur = tile
+			var res := _belt_line(tile, budget)
+			if max_steps > 0:
+				_steps_in_frame += int(res[0])
+			if bool(res[1]):
+				_pending_stop = false
+				_cur = tile
+			else:
+				_pending_stop = true
+				_pending_ground = ground
 		else:
-			_follow(tile)
+			_step_queued_path(tile, ground, budget, max_steps > 0, _follow)
 	else:
-		_along_line(tile)
+		var res := _along_line(tile, budget)
+		if max_steps > 0:
+			_steps_in_frame += int(res[0])
+		if bool(res[1]):
+			_pending_stop = false
+		else:
+			_pending_stop = true
+			_pending_ground = ground
+
+
+func _queue_path_target(tile: Vector2i) -> void:
+	if _queued_targets.is_empty():
+		if tile != _cur:
+			_queued_targets.append(tile)
+	elif _queued_targets[_queued_targets.size() - 1] != tile:
+		_queued_targets.append(tile)
+
+
+func _step_queued_path(tile: Vector2i, ground: Vector2, budget: int, track_frame: bool, stepper: Callable) -> void:
+	_queue_path_target(tile)
+	var left := budget
+	while not _queued_targets.is_empty() and left > 0:
+		var target: Vector2i = _queued_targets[0]
+		var res: Array = stepper.call(target, left)
+		var used := int(res[0])
+		var done := bool(res[1])
+		left -= used
+		if track_frame:
+			_steps_in_frame += used
+		if done:
+			_queued_targets.remove_at(0)
+		else:
+			break
+	if _queued_targets.is_empty():
+		_pending_stop = false
+	else:
+		_pending_stop = true
+		_pending_ground = ground
 
 
 ## Belts held to one line (Factorio 2.x; Settings' "Lock belt building to straight line").
@@ -187,20 +326,27 @@ static func locked() -> bool:
 
 ## Belts on a locked line: every tile from the line's built end to the cursor's place on the line,
 ## ahead along the flow or behind it (see the top of this file). Back within what is built: nothing.
-func _belt_line(tile: Vector2i) -> void:
+## Returns [steps_used, finished].
+func _belt_line(tile: Vector2i, budget := 1 << 20) -> Array:
 	if _flow == Vector2i.ZERO:
-		return
+		return [0, true]
+	var used := 0
 	var along := _along_flow(tile - _line_from)
 	if along > _ahead:
 		_side(false)
-		while _ahead < along:
+		while _ahead < along and used < budget:
 			_ahead += 1
+			used += 1
 			_step_belt(_line_from + _flow * _ahead, _flow, _flow)
+		return [used, _ahead >= along]
 	elif along < _behind:
 		_side(true)
-		while _behind > along:
+		while _behind > along and used < budget:
 			_behind -= 1
+			used += 1
 			_step_belt(_line_from + _flow * _behind, -_flow, _flow)
+		return [used, _behind <= along]
+	return [0, true]
 
 
 ## The line grows on its other side now: a jump in progress is dropped, and the last belt is that
@@ -221,19 +367,23 @@ func _along_flow(v: Vector2i) -> int:
 ## Belts following the cursor: one tile at a time towards the cursor along the line's heading,
 ## turning a corner only once the cursor has clearly left the line (see TURN_SLACK and the top of
 ## this file). Begun against the held way, the belts face back along the drag.
-func _follow(target: Vector2i) -> void:
+## Returns [steps_used, done].
+func _follow(target: Vector2i, budget := 1 << 20) -> Array:
 	if _heading == Vector2i.ZERO:
 		_heading = _axis
 		_backward = _axis == -_flow
+	var used := 0
 	var guard := 0
-	while _cur != target and guard < 64:
+	while _cur != target and used < budget and guard < 64:
 		guard += 1
 		var step := follow_step(target - _cur, _heading)
 		if step == Vector2i.ZERO:
-			break
+			return [used, true]
 		_heading = step
 		_step_belt(_cur + step, step, -step if _backward else step)
 		_cur += step
+		used += 1
+	return [used, _cur == target or guard >= 64]
 
 
 ## The belt drag's next step for the cursor `d` tiles from the last belt, running along `heading`:
@@ -284,6 +434,8 @@ func rotate(reverse: bool, ground: Vector2) -> bool:
 	_cur = corner
 	_heading = turned
 	_axis = turned
+	_queued_targets.clear()
+	_pending_stop = false
 	update(ground)
 	return true
 
@@ -297,7 +449,8 @@ func _wire() -> float:
 ## tile of the path that is in reach, free and not on the last pole. A pole the cursor crosses
 ## becomes the last one.
 func _follow_poles(ground: Vector2) -> void:
-	var size := _size_for(int(pi.build_dir))
+	var dir := _held_dir()
+	var size := _size_for(dir)
 	var tile := Vector2i(floori(pi._snap(ground.x, size.x)), floori(pi._snap(ground.y, size.y)))
 	if tile == _cur:
 		return
@@ -334,23 +487,45 @@ func _follow_poles(ground: Vector2) -> void:
 			_path.clear()
 			return
 		var at: Vector2i = _path[placed]
-		_place(at, int(pi.build_dir))
+		_place(at, dir)
 		_line_last = at
 		_path = _path.slice(placed + 1)
 
 
 ## Walls: one tile at a time from the last tile to the cursor's, along whichever axis has further to
 ## go (a diagonal makes a staircase of tiles sharing sides, as Factorio fills a dragged wall), a wall
-## on each tile not built on yet in this drag.
-func _follow_walls(target: Vector2i) -> void:
+## on each tile not built on yet in this drag. Returns [steps_used, done].
+func _follow_walls(target: Vector2i, budget := 1 << 20) -> Array:
+	var used := 0
 	var guard := 0
-	while _cur != target and guard < 256:
+	while _cur != target and used < budget and guard < 256:
 		guard += 1
 		_cur += wall_step(target - _cur)
+		used += 1
 		if _walled.has(_cur):
 			continue
 		_walled[_cur] = true
-		_place(_cur, int(pi.build_dir))
+		_place(_cur, _held_dir())
+	return [used, _cur == target or guard >= 256]
+
+
+## Pipes and heat-pipes: follow the cursor's path tile by tile without locking to a straight line
+## (Bug #8), while jumping obstacles with pipes-to-ground when moving along a cardinal run.
+## Returns [steps_used, done].
+func _follow_pipes(target: Vector2i, budget := 1 << 20) -> Array:
+	var used := 0
+	var guard := 0
+	while _cur != target and used < budget and guard < 256:
+		guard += 1
+		var step := wall_step(target - _cur)
+		_cur += step
+		used += 1
+		var dir := int(DIRS.get(step, int(pi.build_dir)))
+		if _walled.has(_cur):
+			_gap_dir = -1
+			continue
+		_step_pipe(_cur, dir, step)
+	return [used, _cur == target or guard >= 256]
 
 
 ## A wall drag's next step towards a cursor `d` tiles away: along the longer way, x on a tie.
@@ -365,17 +540,19 @@ static func _overlaps(a: Vector2i, b: Vector2i, size: Vector2i) -> bool:
 
 
 ## Straight-line entities: the cursor projected on the first line.
-func _along_line(tile: Vector2i) -> void:
+## Returns [steps_used, finished].
+func _along_line(tile: Vector2i, budget := 1 << 20) -> Array:
 	var along := (tile - _start).x * _axis.x + (tile - _start).y * _axis.y
 	var target := _start + _axis * along
 	if along < 0:
-		return  # Factorio doesn't build back past where the drag started
+		return [0, true]  # Factorio doesn't build back past where the drag started
 	var dir := int(DIRS.get(_axis, int(pi.build_dir)))
-	while _cur != target:
+	var used := 0
+	while _cur != target and used < budget:
 		var next := _cur + _axis if (target - _cur).x * _axis.x + (target - _cur).y * _axis.y > 0 else _cur - _axis
 		match _proto.type:
-			"pipe":
-				_step_pipe(next, dir)
+			"pipe", "heat-pipe":
+				_step_pipe(next, dir, next - _cur)
 			"electric-pole":
 				_step_pole(next)
 			"underground-belt", "pipe-to-ground":
@@ -383,6 +560,8 @@ func _along_line(tile: Vector2i) -> void:
 			_:
 				_step_footprint(next, dir)
 		_cur = next
+		used += 1
+	return [used, _cur == target]
 
 
 ## One belt of a drag at `next`, the drag going `step` and the belt facing `flow` (the same way going
@@ -406,15 +585,19 @@ func _step_belt(next: Vector2i, step: Vector2i, flow: Vector2i) -> void:
 	_place(next, dir)
 
 
-func _step_pipe(next: Vector2i, dir: int) -> void:
+func _step_pipe(next: Vector2i, dir: int, step := Vector2i.ZERO) -> void:
+	if step == Vector2i.ZERO:
+		step = _vec(dir)
 	if _gap_dir >= 0:
-		_continue_gap(next, dir, _under_item("p"), _vec(dir))
-		return
+		if dir == _gap_dir and step == _gap_step:
+			_continue_gap(next, dir, _under_item("p"), step)
+			return
+		_gap_dir = -1
 	if _obstacle(next, dir):
 		if _under_item("p") != "" and _has_last:
 			_gap_from = _last_built
 			_gap_dir = dir
-			_gap_step = _vec(dir)
+			_gap_step = step
 		return
 	_place(next, dir)
 
@@ -442,6 +625,7 @@ func _continue_gap(next: Vector2i, dir: int, under_item: String, step: Vector2i)
 		# entrance, forward at the exit (checked in 2.1.23).
 		_send(under_item, _gap_from, posmod(dir + 8, 16))
 		_send(under_item, next, dir)
+		_walled[next] = true
 	elif step == _vec(dir):
 		# The mod makes the second of a pair the exit (both face the way items go).
 		_send(under_item, _gap_from, dir)
@@ -561,11 +745,11 @@ func _size_for(dir: int) -> Vector2i:
 
 func _step_footprint(next: Vector2i, dir: int) -> void:
 	var size := _size_for(dir)
-	var span := absi(_axis.x) * size.x + absi(_axis.y) * size.y
+	var span := maxi(1, absi(_axis.x) * size.x + absi(_axis.y) * size.y)
 	var along := (next - _start).x * _axis.x + (next - _start).y * _axis.y
 	while (_line_k + 1) * span <= along:
 		_line_k += 1
-		_send_at(_item, _line_pos0 + Vector2(_axis * span * _line_k), int(pi.build_dir))
+		_send_at(_item, _line_pos0 + Vector2(_axis * span * _line_k), _held_dir())
 
 
 static func _vec(dir: int) -> Vector2i:
@@ -584,23 +768,34 @@ func _under_item(kind: String) -> String:
 	return under
 
 
-## In the way of the line: what player_input's build check calls blocked, and for belts a belt
-## crossing the line (a belt along it is replaced or turned instead).
+## An existing non-ghost transport-belt standing perpendicular to `dir` at `pos` (Bug #17).
+func _perpendicular_belt_rec(pos: Vector2, dir: int) -> WorldMirror.Rec:
+	if _proto == null or _proto.type != "transport-belt" or pi == null or pi.world == null:
+		return null
+	var r: WorldMirror.Rec = pi.world.pick(pos)
+	if r == null or r.extra.has("gh"):
+		return null
+	var p: ProtoDB.EntityProto = pi.world.protos.entity(r.proto_id)
+	if p != null and p.type == "transport-belt" and (r.dir % 8) != (dir % 8):
+		return r
+	return null
+
+
+## In the way of the line: what player_input's build check calls blocked, and for belts any
+## perpendicular belt crossing the line regardless of smart_belt_building (Bug #17).
 func _obstacle(tile: Vector2i, dir: int) -> bool:
 	var pos := Vector2(tile) + Vector2(0.5, 0.5)
 	if pi._blocked(_proto, pos, Vector2i.ONE):
 		return true
-	if _proto.type == "transport-belt" and bool(Settings.get_value("interface", "smart_belt_building")):
-		var r: WorldMirror.Rec = pi.world.pick(pos)
-		if r != null:
-			var p: ProtoDB.EntityProto = pi.world.protos.entity(r.proto_id)
-			if p != null and p.type == "transport-belt" and (r.dir % 8) != (dir % 8):
-				return true
+	if _perpendicular_belt_rec(pos, dir) != null:
+		return true
 	return false
 
 
 func _place(tile: Vector2i, dir: int) -> void:
 	_send(_item, tile, dir, _size_for(dir))
+	if _proto != null and _proto.type in ["wall", "pipe", "heat-pipe"]:
+		_walled[tile] = true
 	_last_built = tile
 	_last_dir = dir
 	_has_last = true
@@ -651,21 +846,36 @@ func _send_at(item: String, at: Vector2, dir: int) -> void:
 	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
 	var is_under := proto != null and UndergroundPairs.is_underground(proto.type)
 	var under_pos := Vector2(pi._snap(at.x, 1), pi._snap(at.y, 1)) if is_under else Vector2.ZERO
-	var will_place_under := is_under and _can_place_under(proto, under_pos, _ghost)
+	var check_cache := {}
+	var will_place_under := is_under and _can_place_under(proto, under_pos, _ghost, check_cache)
+	var look := _look_turned(item, dir)
 	if not cmd.has("ghost"):
 		pi._remember({"do": "build", "item": item, "x": at.x, "y": at.y, "d": dir})
-		_spend(item, at, dir)
-		var look := _look_turned(item, dir)
-		_predict_clear(item, at, dir)
-		_predict(item, at, dir, look != null)
-		if look != null:
-			# K21: the game puts it down unturned; it keeps the cursor's turn once its `add` comes.
-			VisualTurns.expect(look.id, Vector2(pi._snap(at.x, look.tile_size.x), pi._snap(at.y, look.tile_size.y)), dir)
+		_spend(item, at, dir, check_cache)
+		_predict_clear(item, at, dir, check_cache)
+		_predict(item, at, dir, look != null, check_cache)
+	if look != null:
+		# K21: the game puts it down unturned (real or ghost); it keeps the cursor's turn once its `add` comes.
+		VisualTurns.expect(look.id, Vector2(pi._snap(at.x, look.tile_size.x), pi._snap(at.y, look.tile_size.y)), dir)
 	if will_place_under and pi.predicted != null:
 		_record_sent_under(proto, under_pos, dir, _ghost)
 	# Placing a pipe-to-ground flips the held cursor 180 degrees to face its connecting end.
 	if will_place_under and _proto != null and _proto.type == "pipe-to-ground" and item == _item:
 		pi.build_dir = posmod(dir + 8, 16)
+
+
+func _cached_blocked(cache: Dictionary, proto: ProtoDB.EntityProto, pos: Vector2, size: Vector2i, replacing: bool) -> bool:
+	var key := [proto.id, pos, size, replacing]
+	if not cache.has(key):
+		cache[key] = pi._blocked(proto, pos, size, replacing)
+	return bool(cache[key])
+
+
+func _cached_void(cache: Dictionary, pos: Vector2, size: Vector2i) -> bool:
+	var key := ["void", pos, size]
+	if not cache.has(key):
+		cache[key] = pi._on_void(pos, size)
+	return bool(cache[key])
 
 
 ## The building `item` places, when it is one Factorio can't turn (a furnace, a chest, a lab:
@@ -685,7 +895,7 @@ func _look_turned(item: String, dir: int) -> ProtoDB.EntityProto:
 ## (predicted.gd), where the client's own check says the game will take it: within the bridge's
 ## reach, not in the way (a build the game refuses spends nothing, and isn't counted against what
 ## is left).
-func _spend(item: String, at: Vector2, dir: int) -> void:
+func _spend(item: String, at: Vector2, dir: int, check_cache := {}) -> void:
 	if pi.predicted == null or not Predicted.spend_fix:
 		return
 	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
@@ -694,7 +904,7 @@ func _spend(item: String, at: Vector2, dir: int) -> void:
 	var size := _snapped_size(proto, dir)
 	at = Vector2(pi._snap(at.x, size.x), pi._snap(at.y, size.y))
 	var reach: bool = pi._bridge_reach(at) if Predicted.spend_bridge_reach else pi._in_reach(at, size)
-	if not reach or pi._blocked(proto, at, size) or pi._on_void(at, size):
+	if not reach or _cached_blocked(check_cache, proto, at, size, false) or _cached_void(check_cache, at, size):
 		return
 	pi.predicted.spend(item, proto, at)
 
@@ -708,16 +918,16 @@ static func _snapped_size(proto: ProtoDB.EntityProto, dir: int) -> Vector2i:
 
 ## Whether an underground (real or ghost) sent at `pos` will place a piece there, rather than
 ## being blocked, out of reach, or clicking an entity/ghost of the same prototype already at `pos`.
-func _can_place_under(proto: ProtoDB.EntityProto, pos: Vector2, ghost: bool) -> bool:
+func _can_place_under(proto: ProtoDB.EntityProto, pos: Vector2, ghost: bool, check_cache := {}) -> bool:
 	if proto == null or pi == null or pi.world == null:
 		return false
 	if pi.hud != null and pi.hud.ui != null and pi.hud.ui.model != null and pi.hud.ui.model.cant_build_reason(proto.id) != "":
 		return false
-	if pi._on_void(pos, Vector2i.ONE):
+	if _cached_void(check_cache, pos, Vector2i.ONE):
 		return false
 	if not ghost and not pi._bridge_reach(pos):
 		return false
-	if not (ghost and pi._lmb_super) and pi._blocked(proto, pos, Vector2i.ONE, true):
+	if not (ghost and pi._lmb_super) and _cached_blocked(check_cache, proto, pos, Vector2i.ONE, true):
 		return false
 	var existing: WorldMirror.Rec = pi.world.pick(pos)
 	if existing != null and existing.pos.distance_squared_to(pos) < 0.01:
@@ -741,7 +951,7 @@ func _record_sent_under(proto: ProtoDB.EntityProto, pos: Vector2, dir: int, ghos
 ## the build, so it is hidden at once (predicted.gd clear_run), as the cursor marked it (underground_pairs.gd
 ## cleared); shown again if the game keeps it. Only where the client's own check says the build goes (in reach); the
 ## run is looked for before this build's own entity is in the world, as the cursor saw it.
-func _predict_clear(item: String, at: Vector2, dir: int) -> void:
+func _predict_clear(item: String, at: Vector2, dir: int, check_cache := {}) -> void:
 	if _ghost or pi.predicted == null or pi.hud.ui.remote or not UndergroundPairs.clear_on:
 		return
 	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
@@ -749,7 +959,7 @@ func _predict_clear(item: String, at: Vector2, dir: int) -> void:
 		return
 	var size := _snapped_size(proto, dir)
 	at = Vector2(pi._snap(at.x, size.x), pi._snap(at.y, size.y))
-	if not pi._in_reach(at, size) or pi._blocked(proto, at, size, true):
+	if not pi._in_reach(at, size) or _cached_blocked(check_cache, proto, at, size, true):
 		return
 	var reach: int = pi._under_reach(proto)
 	var sent_u: Array = pi.predicted.sent_undergrounds()
@@ -760,7 +970,7 @@ func _predict_clear(item: String, at: Vector2, dir: int) -> void:
 
 ## Shows what was just built at once (the latency layer, FFF #83), where the client's own check
 ## says it can go: within reach and not in the way. The mod's answer replaces or drops it.
-func _predict(item: String, at: Vector2, dir: int, look_turned := false) -> void:
+func _predict(item: String, at: Vector2, dir: int, look_turned := false, check_cache := {}) -> void:
 	if pi.predicted == null or pi._lmb_super or pi.build_mirror or pi.hud.ui.remote:
 		return
 	var proto: ProtoDB.EntityProto = pi.world.protos.placed_entity(item)
@@ -771,7 +981,7 @@ func _predict(item: String, at: Vector2, dir: int, look_turned := false) -> void
 	# the grid: drawn unsnapped, the prediction stood up to half a tile off the game's building and
 	# never matched it, so both showed until it timed out.
 	at = Vector2(pi._snap(at.x, size.x), pi._snap(at.y, size.y))
-	if not pi._in_reach(at, size) or pi._blocked(proto, at, size) or pi._on_void(at, size):
+	if not pi._in_reach(at, size) or _cached_blocked(check_cache, proto, at, size, false) or _cached_void(check_cache, at, size):
 		return
 	# L2: with the spends counted, only what the hand could pay for was sent (see _send_at).
 	if not Predicted.spend_fix and pi.hud.count_of(item) <= pi.predicted.pending_of(proto):

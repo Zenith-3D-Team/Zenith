@@ -32,19 +32,19 @@ signal pressed(name: String)
 ## discharge, spidertron). The wires have no style there: plain grey buttons like the others.
 const SHORTCUTS := [
 	["alt", "alt-mode", "Toggle \"Alt-mode\"", "alt_mode", "", ""],
-	["undo", "undo", "Undo", "undo", "", ""], ["redo", "redo", "Redo", "redo", "", ""],
-	["copy", "copy", "Copy", "copy", "", ""], ["cut", "cut", "Cut", "cut", "", ""],
-	["paste", "paste", "Paste", "paste", "", ""],
-	["import", "import-string", "Import string", "", "", ""],
-	["blueprint", "new-blueprint", "Blueprint", "give_blueprint", "blue", ""],
-	["book", "new-blueprint-book", "Blueprint book", "", "blue", ""],
-	["decon", "new-deconstruction-planner", "Deconstruction planner", "give_deconstruction_planner", "red", ""],
-	["upgrade", "new-upgrade-planner", "Upgrade planner", "give_upgrade_planner", "green", ""],
-	["roboport", "toggle-personal-roboport", "Toggle personal roboport", "toggle_personal_roboport", "", ""],
-	["exoskeleton", "toggle-exoskeleton", "Toggle exoskeleton", "toggle_equipment_movement_bonus", "", ""],
-	["copper-wire", "new-copper-wire", "Make copper wire", "give_copper_wire", "", ""],
-	["green-wire", "new-green-wire", "Make green wire", "give_green_wire", "", ""],
-	["red-wire", "new-red-wire", "Make red wire", "give_red_wire", "", ""],
+	["undo", "undo", "Undo", "undo", "", "construction-robotics"], ["redo", "redo", "Redo", "redo", "", "construction-robotics"],
+	["copy", "copy", "Copy", "copy", "", "construction-robotics"], ["cut", "cut", "Cut", "cut", "", "construction-robotics"],
+	["paste", "paste", "Paste", "paste", "", "construction-robotics"],
+	["import", "import-string", "Import string", "", "", "construction-robotics"],
+	["blueprint", "new-blueprint", "Blueprint", "give_blueprint", "blue", "construction-robotics"],
+	["book", "new-blueprint-book", "Blueprint book", "", "blue", "construction-robotics"],
+	["decon", "new-deconstruction-planner", "Deconstruction planner", "give_deconstruction_planner", "red", "construction-robotics"],
+	["upgrade", "new-upgrade-planner", "Upgrade planner", "give_upgrade_planner", "green", "construction-robotics"],
+	["roboport", "toggle-personal-roboport", "Toggle personal roboport", "toggle_personal_roboport", "", "personal-roboport-equipment"],
+	["exoskeleton", "toggle-exoskeleton", "Toggle exoskeleton", "toggle_equipment_movement_bonus", "", "exoskeleton-equipment"],
+	["copper-wire", "new-copper-wire", "Make copper wire", "give_copper_wire", "", "electronics"],
+	["green-wire", "new-green-wire", "Make green wire", "give_green_wire", "", "circuit-network"],
+	["red-wire", "new-red-wire", "Make red wire", "give_red_wire", "", "circuit-network"],
 	["artillery", "artillery-targeting-remote", "Create artillery targeting remote", "", "", "artillery"],
 	["discharge", "discharge-defense-remote", "Create discharge defense remote", "", "", "discharge-defense-equipment"],
 	["spidertron", "new-rts-tool", "Create spidertron remote", "", "", "spidertron"],
@@ -58,7 +58,8 @@ var _order: Array[Button] = []
 var _grid := GridContainer.new()
 var _columns := 6
 var _gaps: Array[Control] = []
-var _available := {}  # name -> false while its equipment or research is missing
+var _available := {}  # name -> false while its equipment is missing
+var _locked := {}  # name -> true while its technology (shortcuts.lua's technology_to_unlock) isn't researched
 var _hidden := {}  # name -> true: unticked in the chooser
 var _expand := Button.new()
 ## The chooser above the bar.
@@ -132,7 +133,7 @@ func _ready() -> void:
 		_buttons[name] = b
 		_order.append(b)
 		if str(s[5]) != "":
-			_available[name] = false
+			_locked[name] = true
 	_build_chooser()
 	_refresh_visible()
 
@@ -150,18 +151,25 @@ func is_on(name: String) -> bool:
 
 
 ## Whether a shortcut can be used: the equipment toggles while the armour has the equipment, the
-## remotes once researched (Factorio shows those only when unlocked).
+## technology once researched (Factorio shows those only when unlocked).
 func show_shortcut(name: String, on: bool) -> void:
 	if _available.get(name, true) != on:
 		_available[name] = on
 		_refresh_visible()
 
 
-## The remotes once their technology is researched (techs: ui_model.gd's, state 2 = researched).
+## The shortcuts with a technology to unlock (shortcuts.lua's technology_to_unlock: "must be researched
+## before this shortcut can be used") once it is researched (techs: ui_model.gd's, state 2 = researched).
 func update_unlocks(techs: Dictionary) -> void:
+	var changed := false
 	for s in SHORTCUTS:
 		if str(s[5]) != "":
-			show_shortcut(str(s[0]), int(techs.get(str(s[5]), {}).get("state", 0)) == 2)
+			var locked: bool = int(techs.get(str(s[5]), {}).get("state", 0)) != 2
+			if _locked.get(str(s[0]), false) != locked:
+				_locked[str(s[0])] = locked
+				changed = true
+	if changed:
+		_refresh_visible()
 
 
 ## Shows or hides a shortcut on the bar, as the chooser's checkbox does (saved in the settings).
@@ -312,7 +320,7 @@ func _refresh_chooser() -> void:
 	for s in SHORTCUTS:
 		var name := str(s[0])
 		var c: CheckBox = _rows[name][1]
-		var usable: bool = str(s[5]) == "" or bool(_available.get(name, false))
+		var usable: bool = not _locked.get(name, false)
 		c.disabled = not usable
 		c.set_pressed_no_signal(usable and not _hidden.has(name))
 		c.modulate = Color.WHITE if usable else Color(1, 1, 1, 0.45)
@@ -329,7 +337,7 @@ func _refresh_visible() -> void:
 	for s in SHORTCUTS:
 		var name := str(s[0])
 		var b: Button = _buttons[name]
-		b.visible = bool(_available.get(name, true)) and not _hidden.has(name)
+		b.visible = bool(_available.get(name, true)) and not _locked.get(name, false) and not _hidden.has(name)
 	if chooser.visible:
 		_refresh_chooser()
 	_arrange()

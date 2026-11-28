@@ -13,6 +13,10 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const UiModel := preload("res://scripts/ui/factorio/ui_model.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
+const Switches := preload("res://scripts/switches.gd")
+
+## --recipe-made-in=off: restore category text ("Made in: ...") instead of machine icon rows.
+static var recipe_made_in := not (Switches.has("--recipe-made-in=off"))
 
 ## Rows of recipes visible at once, with and without tabs (the panel then matches the inventory).
 const ROWS_WITH_TABS := 6
@@ -168,12 +172,28 @@ func _recipe_slot(r: Dictionary) -> Slot:
 	var craft := func(button_index: int, shift: bool) -> void:
 		if button_index == MOUSE_BUTTON_MIDDLE:
 			return
+		var cur := model.recipe(name)
+		if not bool(cur.get("hand", true)):
+			_show_notice("Cannot be crafted by hand")
+			return
 		var n := 5 if button_index == MOUSE_BUTTON_RIGHT else 1
 		if shift:  # Factorio: as many as the inventory has ingredients for
-			n = maxi(1, int(model.recipe(name).get("craftable", 1)))
+			n = maxi(1, int(cur.get("craftable", 1)))
 		model.craft(name, n)
 	s.clicked.connect(craft)
 	return s
+
+
+func _show_notice(text: String) -> void:
+	var p := get_parent()
+	while p != null:
+		if p.has_method("hud_message"):
+			p.hud_message(text)
+			return
+		if p.has_method("show_message"):
+			p.show_message(text)
+			return
+		p = p.get_parent()
 
 
 ## Factorio's recipe tooltip: "Ingredients:" (have/need in red where the inventory is short),
@@ -222,6 +242,18 @@ static func recipe_tip_lines(m, r: Dictionary, inventory := true) -> Array:
 				lines.append(["%d/%s × %s" % [have, _amount(need), Kit.pretty(str(item))], str(item), Kit.RED_TEXT])
 			else:
 				lines.append(["%s × %s" % [_amount(need), Kit.pretty(str(item))], str(item)])
+	if inventory and not bool(r.get("hand", true)):
+		lines.append(["Cannot be crafted by hand", "", Kit.RED_TEXT])
+		var machines: Array[String] = m.made_in(r) if recipe_made_in and m != null and m.has_method("made_in") else ([] as Array[String])
+		if not machines.is_empty():
+			lines.append(["Made in:", machines, Kit.DISABLED_TEXT, "icons"])
+		else:
+			var cats: Array = r.get("categories", [])
+			if not cats.is_empty():
+				var cat_names: Array = []
+				for c in cats:
+					cat_names.append(Kit.pretty(str(c)))
+				lines.append(["Made in: %s" % ", ".join(PackedStringArray(cat_names)), "", Kit.DISABLED_TEXT])
 	return lines
 
 
@@ -233,9 +265,11 @@ static func _amount(v: float) -> String:
 ## The tooltip's lines are worked out as it opens (J16 follows intermediates: too much to do for
 ## every slot on each inventory change).
 func _style_recipe(s: Slot, r: Dictionary) -> void:
+	var hand := bool(r.get("hand", true))
 	var n: int = r["craftable"]
-	s.theme_type_variation = "FRedSlotButton" if n == 0 else "FSlotButton"
-	s.count = n if n > 0 else -1
+	s.theme_type_variation = "FRedSlotButton" if (not hand or n == 0) else "FSlotButton"
+	s.ghost = not hand
+	s.count = n if (hand and n > 0) else -1
 	var name := str(r["name"])
 	s.set_tip("%s (Recipe)" % Kit.recipe_name(name))
 	if not s.tip_fn.is_valid():
@@ -243,13 +277,16 @@ func _style_recipe(s: Slot, r: Dictionary) -> void:
 	s.queue_redraw()
 
 
-## The icon to show: the recipe's own name is an item for almost every hand recipe; otherwise its
-## first product.
+## The icon to show: the recipe's own icon when it has one (fluids, multi-product and cracking
+## recipes via Kit.item_icon), else its single product, else the recipe's name.
 func _icon_item(r: Dictionary) -> String:
+	var name := str(r["name"])
+	if GuiAssets.other_icon(name) != null:
+		return name
 	var products: Array = r["products"]
 	if products.size() == 1 and products[0] is Array:
 		return str(products[0][0])
-	return r["name"]
+	return name
 
 
 ## Closed, only noted (as character_window.gd's slots): drawn when the panel shows.

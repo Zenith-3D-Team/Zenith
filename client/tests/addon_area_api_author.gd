@@ -320,7 +320,7 @@ func _sound_call_sites() -> void:
 						break
 			check(calls > 0 and named == calls, "sound: %s %s names its kind on every play (%d of %d)" % [file.get_file(), fn, named, calls])
 	var fx_text := FileAccess.get_file_as_string("res://scripts/fx/fx.gd")
-	check(fx_text.contains("sfx.play_def(rustle, at, \"Walking\", 1.0, StepSounds.rustle_kind(rustle))"),
+	check(fx_text.contains("sfx.play_def(rustle, at, \"Walking\", 1.0, StepSounds.rustle_kind(rustle)"),
 		"sound: fx.gd's rustle plays as its own kind, rustle/<name>")
 	check(fx_text.contains("\"mined/\" + proto.name") and fx_text.contains("\"explosion/\" + proto.name"),
 		"sound: mined and explosion kinds carry the thing's name")

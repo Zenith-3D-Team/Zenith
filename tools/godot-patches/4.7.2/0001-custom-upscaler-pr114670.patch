@@ -1,0 +1,1099 @@
+Zenith patch 0001: custom 3D scaling mode and ViewportUpscaler (backport of Godot PR #114670).
+
+Upstream: https://github.com/godotengine/godot/pull/114670 "Add custom upscaler implementation to RD
+renderer" (open, milestone 4.x), taken as it is: it applies to 4.7.2-stable without changes.
+Adds Viewport.SCALING_3D_MODE_CUSTOM, the ViewportUpscaler resource and RenderingServer.viewport_upscaler_*,
+whose render callback runs where FSR 2.2 would, with the upscaled texture to fill. MIT, like Godot.
+
+diff --git a/doc/classes/RenderSceneBuffersConfiguration.xml b/doc/classes/RenderSceneBuffersConfiguration.xml
+index 6ca8f8e1ea08..ed14e9f9e058 100644
+--- a/doc/classes/RenderSceneBuffersConfiguration.xml
++++ b/doc/classes/RenderSceneBuffersConfiguration.xml
+@@ -24,6 +24,9 @@
+ 		<member name="render_target" type="RID" setter="set_render_target" getter="get_render_target" default="RID()">
+ 			The render target associated with these buffer.
+ 		</member>
++		<member name="scaling_3d_custom_upscaler" type="RID" setter="set_scaling_3d_custom_upscaler" getter="get_scaling_3d_custom_upscaler" default="RID()">
++			The custom viewport upscaler to use if [member scaling_3d_mode] is [constant RenderingServer.VIEWPORT_SCALING_3D_MODE_CUSTOM].
++		</member>
+ 		<member name="scaling_3d_mode" type="int" setter="set_scaling_3d_mode" getter="get_scaling_3d_mode" enum="RenderingServer.ViewportScaling3DMode" default="255">
+ 			The requested scaling mode with which we upscale/downscale if [member internal_size] and [member target_size] are not equal.
+ 		</member>
+diff --git a/doc/classes/RenderSceneBuffersRD.xml b/doc/classes/RenderSceneBuffersRD.xml
+index 1d6ebc88056b..67ec62a1687b 100644
+--- a/doc/classes/RenderSceneBuffersRD.xml
++++ b/doc/classes/RenderSceneBuffersRD.xml
+@@ -114,6 +114,12 @@
+ 				Returns the render target associated with this buffers object.
+ 			</description>
+ 		</method>
++		<method name="get_scaling_3d_custom_upscaler" qualifiers="const">
++			<return type="RID" />
++			<description>
++				The custom viewport upscaler being used if [method get_scaling_3d_mode] returns [code]VIEWPORT_SCALING_3D_MODE_CUSTOM[/code].
++			</description>
++		</method>
+ 		<method name="get_scaling_3d_mode" qualifiers="const">
+ 			<return type="int" enum="RenderingServer.ViewportScaling3DMode" />
+ 			<description>
+@@ -188,6 +194,19 @@
+ 				Returns a specific view of a slice (layer or mipmap) for a cached texture.
+ 			</description>
+ 		</method>
++		<method name="get_upscaled_layer">
++			<return type="RID" />
++			<param index="0" name="layer" type="int" />
++			<description>
++				Returns the specified layer from the upscaled texture used if 3D scaling is set to [code]FSR2[/code], [code]MetalFX (Temporal)[/code], or [code]custom[/code].
++			</description>
++		</method>
++		<method name="get_upscaled_texture" qualifiers="const">
++			<return type="RID" />
++			<description>
++				Returns the upscaled texture used if 3D scaling is set to [code]FSR2[/code], [code]MetalFX (Temporal)[/code], or [code]custom[/code].
++			</description>
++		</method>
+ 		<method name="get_use_debanding" qualifiers="const">
+ 			<return type="bool" />
+ 			<description>
+diff --git a/doc/classes/RenderingServer.xml b/doc/classes/RenderingServer.xml
+index 6ae5bfaa3f31..cf22003944a5 100644
+--- a/doc/classes/RenderingServer.xml
++++ b/doc/classes/RenderingServer.xml
+@@ -4356,6 +4356,14 @@
+ 				If [code]true[/code], render the contents of the viewport directly to screen. This allows a low-level optimization where you can skip drawing a viewport to the root viewport. While this optimization can result in a significant increase in speed (especially on older devices), it comes at a cost of usability. When this is enabled, you cannot read from the viewport or from the screen_texture. You also lose the benefit of certain window settings, such as the various stretch modes. Another consequence to be aware of is that in 2D the rendering happens in window coordinates, so if you have a viewport that is double the size of the window, and you set this, then only the portion that fits within the window will be drawn, no automatic scaling is possible, even if your game scene is significantly larger than the window size.
+ 			</description>
+ 		</method>
++		<method name="viewport_set_scaling_3d_custom_upscaler">
++			<return type="void" />
++			<param index="0" name="viewport" type="RID" />
++			<param index="1" name="upscaler" type="RID" />
++			<description>
++				The custom viewport upscaler to use if [method viewport_set_scaling_3d_mode] was set to [constant VIEWPORT_SCALING_3D_MODE_CUSTOM].
++			</description>
++		</method>
+ 		<method name="viewport_set_scaling_3d_mode">
+ 			<return type="void" />
+ 			<param index="0" name="viewport" type="RID" />
+@@ -4515,6 +4523,44 @@
+ 				If set to [constant RenderingServer.VIEWPORT_VRS_UPDATE_ONCE], the input texture is copied once and the mode is changed to [constant RenderingServer.VIEWPORT_VRS_UPDATE_DISABLED].
+ 			</description>
+ 		</method>
++		<method name="viewport_upscaler_create">
++			<return type="RID" />
++			<description>
++				Creates a new viewport upscaler object.
++			</description>
++		</method>
++		<method name="viewport_upscaler_set_jitter_phase_count">
++			<return type="void" />
++			<param index="0" name="viewport_upscaler" type="RID" />
++			<param index="1" name="jitter_phase_count" type="int" />
++			<description>
++				Sets the jitter phase count that will be used for a viewport using this upscaler.
++			</description>
++		</method>
++		<method name="viewport_upscaler_set_mipmap_bias">
++			<return type="void" />
++			<param index="0" name="viewport_upscaler" type="RID" />
++			<param index="1" name="mipmap_bias" type="float" />
++			<description>
++				Sets the mipmap bias that will be subtracted from the computer mipmap bias for a viewport using this upscaler.
++			</description>
++		</method>
++		<method name="viewport_upscaler_set_render_callback">
++			<return type="void" />
++			<param index="0" name="viewport_upscaler" type="RID" />
++			<param index="1" name="callback" type="Callable" />
++			<description>
++				Sets the callback that is called when this upscaler is used to upscale. The method called should implement the actual upscale logic.
++			</description>
++		</method>
++		<method name="viewport_upscaler_set_requires_motion_vectors">
++			<return type="void" />
++			<param index="0" name="viewport_upscaler" type="RID" />
++			<param index="1" name="requires_motion_vectors" type="bool" />
++			<description>
++				If set to [code]true[/code], this upscaler requires motion vectors to be produced.
++			</description>
++		</method>
+ 		<method name="visibility_notifier_create">
+ 			<return type="RID" />
+ 			<description>
+@@ -5361,7 +5407,10 @@
+ 			Use nearest-neighbor filtering for the viewport's 3D buffer. This looks crisper than [constant VIEWPORT_SCALING_3D_MODE_BILINEAR] and has no additional rendering cost. The amount of scaling can be set using [member Viewport.scaling_3d_scale]. Values greater than [code]1.0[/code] are not supported and bilinear downsampling will be used instead. A value of [code]1.0[/code] disables scaling.
+ 			[b]Note:[/b] When using the [b]Nearest[/b] scaling mode, to avoid uneven pixel scaling, it's highly recommended to use a value equal to an integer divisor with a dividend of [code]1[/code]. For example, it's best to use a scale of [code]0.5[/code] (1/2), [code]0.3333[/code] (1/3), [code]0.25[/code] (1/4), [code]0.2[/code] (1/5), and so on.
+ 		</constant>
+-		<constant name="VIEWPORT_SCALING_3D_MODE_MAX" value="6" enum="ViewportScaling3DMode">
++		<constant name="VIEWPORT_SCALING_3D_MODE_CUSTOM" value="6" enum="ViewportScaling3DMode">
++			Use a custom viewport upscaler for the viewport's 3D buffer. The amount of scaling can be set using [member Viewport.scaling_3d_scale].
++		</constant>
++		<constant name="VIEWPORT_SCALING_3D_MODE_MAX" value="7" enum="ViewportScaling3DMode">
+ 			Represents the size of the [enum ViewportScaling3DMode] enum.
+ 		</constant>
+ 		<constant name="VIEWPORT_UPDATE_DISABLED" value="0" enum="ViewportUpdateMode">
+diff --git a/doc/classes/Viewport.xml b/doc/classes/Viewport.xml
+index 318f4455923f..97df510be4fd 100644
+--- a/doc/classes/Viewport.xml
++++ b/doc/classes/Viewport.xml
+@@ -425,6 +425,9 @@
+ 			The shadow atlas' resolution (used for omni and spot lights). The value is rounded up to the nearest power of 2.
+ 			[b]Note:[/b] If this is set to [code]0[/code], no positional shadows will be visible at all. This can improve performance significantly on low-end systems by reducing both the CPU and GPU load (as fewer draw calls are needed to draw the scene without shadows).
+ 		</member>
++		<member name="scaling_3d_custom_upscaler" type="ViewportUpscaler" setter="set_scaling_3d_custom_upscaler" getter="get_scaling_3d_custom_upscaler">
++			The custom viewport upscaler to use if [member scaling_3d_mode] is set to [constant SCALING_3D_MODE_CUSTOM].
++		</member>
+ 		<member name="scaling_3d_mode" type="int" setter="set_scaling_3d_mode" getter="get_scaling_3d_mode" enum="Viewport.Scaling3DMode" default="0">
+ 			Sets scaling 3D mode. Bilinear scaling renders at different resolution to either undersample or supersample the viewport. FidelityFX Super Resolution 1.0, abbreviated to FSR, is an upscaling technology that produces high quality images at fast framerates by using a spatially aware upscaling algorithm. FSR is slightly more expensive than bilinear, but it produces significantly higher image quality. FSR should be used where possible.
+ 			To control this property on the root viewport, set the [member ProjectSettings.rendering/scaling_3d/mode] project setting.
+@@ -578,7 +581,10 @@
+ 			Use nearest-neighbor filtering for the viewport's 3D buffer. This looks crisper than [constant SCALING_3D_MODE_BILINEAR] and has no additional rendering cost. The amount of scaling can be set using [member scaling_3d_scale]. Values greater than [code]1.0[/code] are not supported and bilinear downsampling will be used instead. A value of [code]1.0[/code] disables scaling.
+ 			[b]Note:[/b] When using the [b]Nearest[/b] scaling mode, to avoid uneven pixel scaling, it's highly recommended to use a value equal to an integer divisor with a dividend of [code]1[/code]. For example, it's best to use a scale of [code]0.5[/code] (1/2), [code]0.3333[/code] (1/3), [code]0.25[/code] (1/4), [code]0.2[/code] (1/5), and so on.
+ 		</constant>
+-		<constant name="SCALING_3D_MODE_MAX" value="6" enum="Scaling3DMode">
++		<constant name="SCALING_3D_MODE_CUSTOM" value="6" enum="Scaling3DMode">
++			Use a custom viewport upscaler for the viewport's 3D buffer. The amount of scaling can be set using [member scaling_3d_scale].
++		</constant>
++		<constant name="SCALING_3D_MODE_MAX" value="7" enum="Scaling3DMode">
+ 			Represents the size of the [enum Scaling3DMode] enum.
+ 		</constant>
+ 		<constant name="MSAA_DISABLED" value="0" enum="MSAA">
+diff --git a/doc/classes/ViewportUpscaler.xml b/doc/classes/ViewportUpscaler.xml
+new file mode 100644
+index 000000000000..d4dfdf9111d6
+--- /dev/null
++++ b/doc/classes/ViewportUpscaler.xml
+@@ -0,0 +1,31 @@
++<?xml version="1.0" encoding="UTF-8" ?>
++<class name="ViewportUpscaler" inherits="Resource" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
++	<brief_description>
++		Base class for implementing viewport upscalers.
++	</brief_description>
++	<description>
++		This resource type allows you to implement a viewport upscaler that can be used if the 3D scaling mode of a viewport is set to [constant Viewport.SCALING_3D_MODE_CUSTOM].
++	</description>
++	<tutorials>
++	</tutorials>
++	<methods>
++		<method name="_render_callback" qualifiers="virtual">
++			<return type="void" />
++			<param index="0" name="render_data" type="RenderData" />
++			<description>
++				This method is called by the rendering thread, implement your upscale logic here. Use [method RenderSceneBuffersRD.get_color_layer] to access the rendering result and [method RenderSceneBuffersRD.get_upscaled_layer] to access the destination buffer.
++			</description>
++		</method>
++	</methods>
++	<members>
++		<member name="jitter_phase_count" type="int" setter="set_jitter_phase_count" getter="get_jitter_phase_count">
++			The jitter phase count that will be used for a viewport using this upscaler.
++		</member>
++		<member name="mipmap_bias" type="float" setter="set_mipmap_bias" getter="get_mipmap_bias">
++			The mipmap bias that will be subtracted from the computer mipmap bias for a viewport using this upscaler.
++		</member>
++		<member name="requires_motion_vectors" type="bool" setter="set_requires_motion_vectors" getter="get_requires_motion_vectors">
++			If [code]true[/code] this upscaler requires motion vectors.
++		</member>
++	</members>
++</class>
+diff --git a/scene/main/viewport.cpp b/scene/main/viewport.cpp
+index f01861301590..35dc741dc7d8 100644
+--- a/scene/main/viewport.cpp
++++ b/scene/main/viewport.cpp
+@@ -5055,8 +5055,14 @@ void Viewport::set_scaling_3d_mode(Scaling3DMode p_scaling_3d_mode) {
+ 		return;
+ 	}
+ 
++	if (p_scaling_3d_mode != SCALING_3D_MODE_CUSTOM && scaling_3d_custom_upscaler.is_valid()) {
++		set_scaling_3d_custom_upscaler(Ref<ViewportUpscaler>());
++	}
++
+ 	scaling_3d_mode = p_scaling_3d_mode;
+ 	RS::get_singleton()->viewport_set_scaling_3d_mode(viewport, (RSE::ViewportScaling3DMode)(int)p_scaling_3d_mode);
++
++	notify_property_list_changed();
+ }
+ 
+ Viewport::Scaling3DMode Viewport::get_scaling_3d_mode() const {
+@@ -5079,6 +5085,23 @@ float Viewport::get_scaling_3d_scale() const {
+ 	return scaling_3d_scale;
+ }
+ 
++void Viewport::set_scaling_3d_custom_upscaler(const Ref<ViewportUpscaler> &p_upscaler) {
++	ERR_MAIN_THREAD_GUARD;
++	ERR_FAIL_COND_MSG(scaling_3d_mode != SCALING_3D_MODE_CUSTOM && p_upscaler.is_valid(), "Can't set a custom upscaler if the scaling mode isn't set to custom.");
++
++	scaling_3d_custom_upscaler = p_upscaler;
++	if (p_upscaler.is_valid()) {
++		RS::get_singleton()->viewport_set_scaling_3d_custom_upscaler(viewport, p_upscaler->get_rid());
++	} else {
++		RS::get_singleton()->viewport_set_scaling_3d_custom_upscaler(viewport, RID());
++	}
++}
++
++Ref<ViewportUpscaler> Viewport::get_scaling_3d_custom_upscaler() const {
++	ERR_READ_THREAD_GUARD_V(Ref<ViewportUpscaler>());
++	return scaling_3d_custom_upscaler;
++}
++
+ void Viewport::set_fsr_sharpness(float p_fsr_sharpness) {
+ 	ERR_MAIN_THREAD_GUARD;
+ 	if (fsr_sharpness == p_fsr_sharpness) {
+@@ -5328,6 +5351,9 @@ void Viewport::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("set_scaling_3d_scale", "scale"), &Viewport::set_scaling_3d_scale);
+ 	ClassDB::bind_method(D_METHOD("get_scaling_3d_scale"), &Viewport::get_scaling_3d_scale);
+ 
++	ClassDB::bind_method(D_METHOD("set_scaling_3d_custom_upscaler", "upscaler"), &Viewport::set_scaling_3d_custom_upscaler);
++	ClassDB::bind_method(D_METHOD("get_scaling_3d_custom_upscaler"), &Viewport::get_scaling_3d_custom_upscaler);
++
+ 	ClassDB::bind_method(D_METHOD("set_fsr_sharpness", "fsr_sharpness"), &Viewport::set_fsr_sharpness);
+ 	ClassDB::bind_method(D_METHOD("get_fsr_sharpness"), &Viewport::get_fsr_sharpness);
+ 
+@@ -5371,8 +5397,9 @@ void Viewport::_bind_methods() {
+ 
+ #ifndef _3D_DISABLED
+ 	ADD_GROUP("Scaling 3D", "");
+-	ADD_PROPERTY(PropertyInfo(Variant::INT, "scaling_3d_mode", PROPERTY_HINT_ENUM, "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4"), "set_scaling_3d_mode", "get_scaling_3d_mode");
++	ADD_PROPERTY(PropertyInfo(Variant::INT, "scaling_3d_mode", PROPERTY_HINT_ENUM, "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4,Custom:6"), "set_scaling_3d_mode", "get_scaling_3d_mode");
+ 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "scaling_3d_scale", PROPERTY_HINT_RANGE, "0.1,2.0,0.0001"), "set_scaling_3d_scale", "get_scaling_3d_scale");
++	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "scaling_3d_custom_upscaler", PROPERTY_HINT_RESOURCE_TYPE, "ViewportUpscaler"), "set_scaling_3d_custom_upscaler", "get_scaling_3d_custom_upscaler");
+ 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "texture_mipmap_bias", PROPERTY_HINT_RANGE, "-2,2,0.001"), "set_texture_mipmap_bias", "get_texture_mipmap_bias");
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "anisotropic_filtering_level", PROPERTY_HINT_ENUM, String::utf8("Disabled (Fastest),2× (Faster),4× (Fast),8× (Average),16x (Slow)")), "set_anisotropic_filtering_level", "get_anisotropic_filtering_level");
+ 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "fsr_sharpness", PROPERTY_HINT_RANGE, "0,2,0.01"), "set_fsr_sharpness", "get_fsr_sharpness");
+@@ -5435,6 +5462,7 @@ void Viewport::_bind_methods() {
+ 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_METALFX_SPATIAL);
+ 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_METALFX_TEMPORAL);
+ 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_NEAREST);
++	BIND_ENUM_CONSTANT(SCALING_3D_MODE_CUSTOM);
+ 	BIND_ENUM_CONSTANT(SCALING_3D_MODE_MAX);
+ 
+ 	BIND_ENUM_CONSTANT(MSAA_DISABLED);
+@@ -5534,6 +5562,11 @@ void Viewport::_validate_property(PropertyInfo &p_property) const {
+ 	if (!Engine::get_singleton()->is_editor_hint()) {
+ 		return;
+ 	}
++
++	if (scaling_3d_mode != SCALING_3D_MODE_CUSTOM && (p_property.name == "scaling_3d_custom_upscaler")) {
++		p_property.usage = PROPERTY_USAGE_NO_EDITOR;
++	}
++
+ 	if (vrs_mode != VRS_TEXTURE && (p_property.name == "vrs_texture")) {
+ 		p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+ 	} else if (vrs_mode == VRS_DISABLED && (p_property.name == "vrs_update_mode")) {
+diff --git a/scene/main/viewport.h b/scene/main/viewport.h
+index 4e1c272d71a6..43ecb4e4a0e1 100644
+--- a/scene/main/viewport.h
++++ b/scene/main/viewport.h
+@@ -32,6 +32,7 @@
+ 
+ #include "scene/main/node.h"
+ #include "scene/resources/texture.h"
++#include "scene/resources/viewport_upscaler.h"
+ #include "servers/display/display_server_enums.h"
+ #include "servers/rendering/rendering_server_enums.h"
+ 
+@@ -104,6 +105,7 @@ class Viewport : public Node {
+ 		SCALING_3D_MODE_METALFX_SPATIAL,
+ 		SCALING_3D_MODE_METALFX_TEMPORAL,
+ 		SCALING_3D_MODE_NEAREST,
++		SCALING_3D_MODE_CUSTOM,
+ 		SCALING_3D_MODE_MAX
+ 	};
+ 
+@@ -322,6 +324,7 @@ class Viewport : public Node {
+ 
+ 	Scaling3DMode scaling_3d_mode = SCALING_3D_MODE_BILINEAR;
+ 	float scaling_3d_scale = 1.0;
++	Ref<ViewportUpscaler> scaling_3d_custom_upscaler;
+ 	float fsr_sharpness = 0.2f;
+ 	float texture_mipmap_bias = 0.0f;
+ 	AnisotropicFiltering anisotropic_filtering_level = ANISOTROPY_4X;
+@@ -607,6 +610,9 @@ class Viewport : public Node {
+ 	void set_scaling_3d_scale(float p_scaling_3d_scale);
+ 	float get_scaling_3d_scale() const;
+ 
++	void set_scaling_3d_custom_upscaler(const Ref<ViewportUpscaler> &p_upscaler);
++	Ref<ViewportUpscaler> get_scaling_3d_custom_upscaler() const;
++
+ 	void set_fsr_sharpness(float p_fsr_sharpness);
+ 	float get_fsr_sharpness() const;
+ 
+diff --git a/scene/register_scene_types.cpp b/scene/register_scene_types.cpp
+index ffd748c04627..162e6a504551 100644
+--- a/scene/register_scene_types.cpp
++++ b/scene/register_scene_types.cpp
+@@ -165,6 +165,7 @@
+ #include "scene/resources/texture_rd.h"
+ #include "scene/resources/theme.h"
+ #include "scene/resources/video_stream.h"
++#include "scene/resources/viewport_upscaler.h"
+ #include "scene/theme/theme_db.h"
+ #include "servers/display/display_server.h"
+ #include "servers/rendering/rendering_server.h"
+@@ -452,6 +453,7 @@ void register_scene_types() {
+ 	GDREGISTER_CLASS(ViewportTexture);
+ 
+ 	GDREGISTER_VIRTUAL_CLASS(CompositorEffect);
++	GDREGISTER_VIRTUAL_CLASS(ViewportUpscaler);
+ 
+ 	GDREGISTER_ABSTRACT_CLASS(MultiplayerPeer);
+ 	GDREGISTER_CLASS(MultiplayerPeerExtension);
+diff --git a/scene/resources/viewport_upscaler.cpp b/scene/resources/viewport_upscaler.cpp
+new file mode 100644
+index 000000000000..557441fb75ce
+--- /dev/null
++++ b/scene/resources/viewport_upscaler.cpp
+@@ -0,0 +1,104 @@
++/**************************************************************************/
++/*  viewport_upscaler.cpp                                                 */
++/**************************************************************************/
++/*                         This file is part of:                          */
++/*                             GODOT ENGINE                               */
++/*                        https://godotengine.org                         */
++/**************************************************************************/
++/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
++/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
++/*                                                                        */
++/* Permission is hereby granted, free of charge, to any person obtaining  */
++/* a copy of this software and associated documentation files (the        */
++/* "Software"), to deal in the Software without restriction, including    */
++/* without limitation the rights to use, copy, modify, merge, publish,    */
++/* distribute, sublicense, and/or sell copies of the Software, and to     */
++/* permit persons to whom the Software is furnished to do so, subject to  */
++/* the following conditions:                                              */
++/*                                                                        */
++/* The above copyright notice and this permission notice shall be         */
++/* included in all copies or substantial portions of the Software.        */
++/*                                                                        */
++/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
++/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
++/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
++/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
++/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
++/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
++/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
++/**************************************************************************/
++
++#include "viewport_upscaler.h"
++
++#include "core/object/callable_mp.h"
++#include "core/object/class_db.h"
++#include "servers/rendering/rendering_server.h"
++
++void ViewportUpscaler::_bind_methods() {
++	ClassDB::bind_method(D_METHOD("set_requires_motion_vectors", "enabled"), &ViewportUpscaler::set_requires_motion_vectors);
++	ClassDB::bind_method(D_METHOD("get_requires_motion_vectors"), &ViewportUpscaler::get_requires_motion_vectors);
++	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "requires_motion_vectors"), "set_requires_motion_vectors", "get_requires_motion_vectors");
++
++	ClassDB::bind_method(D_METHOD("set_mipmap_bias", "mipmap_bias"), &ViewportUpscaler::set_mipmap_bias);
++	ClassDB::bind_method(D_METHOD("get_mipmap_bias"), &ViewportUpscaler::get_mipmap_bias);
++	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "mipmap_bias"), "set_mipmap_bias", "get_mipmap_bias");
++
++	ClassDB::bind_method(D_METHOD("set_jitter_phase_count", "jitter_phase_count"), &ViewportUpscaler::set_jitter_phase_count);
++	ClassDB::bind_method(D_METHOD("get_jitter_phase_count"), &ViewportUpscaler::get_jitter_phase_count);
++	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "jitter_phase_count"), "set_jitter_phase_count", "get_jitter_phase_count");
++
++	GDVIRTUAL_BIND(_render_callback, "render_data");
++}
++
++void ViewportUpscaler::render_callback(const RenderData *p_render_data) {
++	GDVIRTUAL_CALL(_render_callback, p_render_data);
++}
++
++void ViewportUpscaler::set_requires_motion_vectors(bool p_enabled) {
++	requires_motion_vectors = p_enabled;
++	if (rid.is_valid()) {
++		RenderingServer *rs = RenderingServer::get_singleton();
++		ERR_FAIL_NULL(rs);
++		rs->viewport_upscaler_set_requires_motion_vectors(rid, requires_motion_vectors);
++	}
++}
++
++bool ViewportUpscaler::get_requires_motion_vectors() const {
++	return requires_motion_vectors;
++}
++
++void ViewportUpscaler::set_mipmap_bias(float p_mipmap_bias) {
++	mipmap_bias = p_mipmap_bias;
++	if (rid.is_valid()) {
++		RenderingServer *rs = RenderingServer::get_singleton();
++		ERR_FAIL_NULL(rs);
++		rs->viewport_upscaler_set_mipmap_bias(rid, mipmap_bias);
++	}
++}
++
++float ViewportUpscaler::get_mipmap_bias() const {
++	return mipmap_bias;
++}
++
++void ViewportUpscaler::set_jitter_phase_count(uint32_t p_jitter_phase_count) {
++	jitter_phase_count = p_jitter_phase_count;
++}
++
++uint32_t ViewportUpscaler::get_jitter_phase_count() const {
++	return jitter_phase_count;
++}
++
++ViewportUpscaler::ViewportUpscaler() {
++	RenderingServer *rs = RenderingServer::get_singleton();
++	if (rs != nullptr) {
++		rid = rs->viewport_upscaler_create();
++		rs->viewport_upscaler_set_render_callback(rid, callable_mp(this, &ViewportUpscaler::render_callback));
++	}
++}
++
++ViewportUpscaler::~ViewportUpscaler() {
++	RenderingServer *rs = RenderingServer::get_singleton();
++	if (rs != nullptr && rid.is_valid()) {
++		rs->free_rid(rid);
++	}
++}
+diff --git a/scene/resources/viewport_upscaler.h b/scene/resources/viewport_upscaler.h
+new file mode 100644
+index 000000000000..abc01673ca83
+--- /dev/null
++++ b/scene/resources/viewport_upscaler.h
+@@ -0,0 +1,66 @@
++/**************************************************************************/
++/*  viewport_upscaler.h                                                   */
++/**************************************************************************/
++/*                         This file is part of:                          */
++/*                             GODOT ENGINE                               */
++/*                        https://godotengine.org                         */
++/**************************************************************************/
++/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
++/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
++/*                                                                        */
++/* Permission is hereby granted, free of charge, to any person obtaining  */
++/* a copy of this software and associated documentation files (the        */
++/* "Software"), to deal in the Software without restriction, including    */
++/* without limitation the rights to use, copy, modify, merge, publish,    */
++/* distribute, sublicense, and/or sell copies of the Software, and to     */
++/* permit persons to whom the Software is furnished to do so, subject to  */
++/* the following conditions:                                              */
++/*                                                                        */
++/* The above copyright notice and this permission notice shall be         */
++/* included in all copies or substantial portions of the Software.        */
++/*                                                                        */
++/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
++/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
++/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
++/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
++/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
++/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
++/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
++/**************************************************************************/
++
++#pragma once
++
++#include "core/io/resource.h"
++#include "core/object/gdvirtual.gen.h"
++#include "servers/rendering/storage/render_data.h"
++
++class ViewportUpscaler : public Resource {
++	GDCLASS(ViewportUpscaler, Resource);
++
++private:
++	RID rid;
++	bool requires_motion_vectors = false;
++	float mipmap_bias = 0.0;
++	uint32_t jitter_phase_count = 0;
++
++protected:
++	static void _bind_methods();
++
++	GDVIRTUAL1(_render_callback, const RenderData *)
++
++public:
++	virtual void render_callback(const RenderData *p_render_data);
++	virtual RID get_rid() const override { return rid; }
++
++	void set_requires_motion_vectors(bool p_enabled);
++	bool get_requires_motion_vectors() const;
++
++	void set_mipmap_bias(float p_mipmap_bias);
++	float get_mipmap_bias() const;
++
++	void set_jitter_phase_count(uint32_t p_jitter_phase_count);
++	uint32_t get_jitter_phase_count() const;
++
++	ViewportUpscaler();
++	~ViewportUpscaler();
++};
+diff --git a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
+index 4bfb1e10b86d..8d3793c03f03 100644
+--- a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
++++ b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
+@@ -1776,8 +1776,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 		SCALE_NONE,
+ 		SCALE_FSR2,
+ 		SCALE_MFX,
++		SCALE_CUSTOM,
+ 	} scale_type = SCALE_NONE;
+ 
++	RID custom_upscaler = rb->get_scaling_3d_custom_upscaler();
+ 	switch (rb->get_scaling_3d_mode()) {
+ 		case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
+ 			scale_type = SCALE_FSR2;
+@@ -1789,6 +1791,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 			scale_type = SCALE_NONE;
+ #endif
+ 			break;
++		case RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM:
++			if (custom_upscaler.is_valid()) {
++				scale_type = SCALE_CUSTOM;
++			}
++			break;
+ 		default:
+ 			break;
+ 	}
+@@ -1803,6 +1810,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 		motion_vectors_required = true;
+ 	} else if (!is_reflection_probe && using_taa) {
+ 		motion_vectors_required = true;
++	} else if (!is_reflection_probe && scale_type == SCALE_CUSTOM) {
++		motion_vectors_required = RSG::viewport->viewport_upscaler_get_requires_motion_vectors(custom_upscaler);
+ 	} else if (!is_reflection_probe && using_upscaling) {
+ 		motion_vectors_required = true;
+ 	} else {
+@@ -1829,7 +1838,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 	bool using_voxelgi = false;
+ 	bool reverse_cull = p_render_data->scene_data->cam_transform.basis.determinant() < 0;
+ 	bool using_ssil = !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssil_enabled(p_render_data->environment);
+-	bool using_motion_pass = rb_data.is_valid() && using_upscaling;
++	bool using_motion_pass = rb_data.is_valid() && using_upscaling && motion_vectors_required;
+ 
+ 	if (is_reflection_probe) {
+ 		uint32_t resolution = light_storage->reflection_probe_instance_get_resolution(p_render_data->reflection_probe);
+@@ -2447,7 +2456,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 	}
+ 
+ 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {
+-		if (scale_type == SCALE_FSR2) {
++		if (scale_type == SCALE_CUSTOM) {
++			Callable callback = RSG::viewport->viewport_upscaler_get_render_callback(custom_upscaler);
++			callback.call(p_render_data);
++		} else if (scale_type == SCALE_FSR2) {
+ 			rb_data->ensure_fsr2(fsr2_effect);
+ 
+ 			RID exposure;
+@@ -2472,7 +2484,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 				params.velocity = rb->get_velocity_buffer(false, v);
+ 				params.reactive = rb->get_internal_texture_reactive(v);
+ 				params.exposure = exposure;
+-				params.output = rb->get_upscaled_texture(v);
++				params.output = rb->get_upscaled_layer(v);
+ 				params.z_near = p_render_data->scene_data->z_near;
+ 				params.z_far = p_render_data->scene_data->z_far;
+ 				params.fovy = fovy;
+@@ -2513,7 +2525,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 				params.depth = rb->get_depth_texture(v);
+ 				params.motion = rb->get_velocity_buffer(false, v);
+ 				params.exposure = exposure;
+-				params.dst = rb->get_upscaled_texture(v);
++				params.dst = rb->get_upscaled_layer(v);
+ 				params.jitter_offset = jitter;
+ 				params.reset = reset;
+ 
+diff --git a/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp b/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp
+index 4c539a5fc199..52156b0d387d 100644
+--- a/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp
++++ b/servers/rendering/renderer_rd/renderer_scene_render_rd.cpp
+@@ -470,7 +470,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
+ 	bool can_use_storage = _render_buffers_can_be_storage();
+ 
+ 	RSE::ViewportScaling3DMode scale_mode = rb->get_scaling_3d_mode();
+-	bool use_upscaled_texture = rb->has_upscaled_texture() && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL);
++	bool use_upscaled_texture = rb->has_upscaled_texture() && (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR2 || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL || scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM);
+ 	SpatialUpscaler *spatial_upscaler = nullptr;
+ 	if (can_use_effects) {
+ 		if (scale_mode == RSE::VIEWPORT_SCALING_3D_MODE_FSR) {
+@@ -513,7 +513,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
+ 
+ 		if (can_use_storage) {
+ 			for (uint32_t i = 0; i < rb->get_view_count(); i++) {
+-				buffers.base_texture = use_upscaled_texture ? rb->get_upscaled_texture(i) : rb->get_internal_texture(i);
++				buffers.base_texture = use_upscaled_texture ? rb->get_upscaled_layer(i) : rb->get_internal_texture(i);
+ 				buffers.depth_texture = rb->get_depth_texture(i);
+ 
+ 				// In stereo p_render_data->z_near and p_render_data->z_far can be offset for our combined frustum.
+@@ -535,7 +535,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
+ 			buffers.base_weight_fb = rb->weight_buffers[0].fb;
+ 
+ 			for (uint32_t i = 0; i < rb->get_view_count(); i++) {
+-				buffers.base_texture = use_upscaled_texture ? rb->get_upscaled_texture(i) : rb->get_internal_texture(i);
++				buffers.base_texture = use_upscaled_texture ? rb->get_upscaled_layer(i) : rb->get_internal_texture(i);
+ 				buffers.depth_texture = p_use_msaa ? rb->get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_BACK_DEPTH, i, 0) : rb->get_depth_texture(i);
+ 				buffers.base_fb = FramebufferCacheRD::get_singleton()->get_cache(buffers.base_texture); // TODO move this into bokeh_dof_raster, we can do this internally
+ 
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
+index 610ab9284166..8b6cfc3f92ab 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
++++ b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
+@@ -33,9 +33,11 @@
+ 
+ #include "core/object/class_db.h"
+ #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
++#include "servers/rendering/renderer_viewport.h"
+ #include "servers/rendering/rendering_device_binds.h"
+ #include "servers/rendering/rendering_server.h" // IWYU pragma: keep // Needed to bind RSE enums.
+ #include "servers/rendering/rendering_server_enums.h"
++#include "servers/rendering/rendering_server_globals.h"
+ 
+ RenderSceneBuffersRD::RenderSceneBuffersRD() {
+ }
+@@ -67,6 +69,8 @@ void RenderSceneBuffersRD::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_depth_layer", "layer", "msaa"), &RenderSceneBuffersRD::_get_depth_layer, DEFVAL(false));
+ 	ClassDB::bind_method(D_METHOD("get_velocity_texture", "msaa"), &RenderSceneBuffersRD::_get_velocity_texture, DEFVAL(false));
+ 	ClassDB::bind_method(D_METHOD("get_velocity_layer", "layer", "msaa"), &RenderSceneBuffersRD::_get_velocity_layer, DEFVAL(false));
++	ClassDB::bind_method(D_METHOD("get_upscaled_texture"), &RenderSceneBuffersRD::get_upscaled_texture);
++	ClassDB::bind_method(D_METHOD("get_upscaled_layer", "layer"), &RenderSceneBuffersRD::get_upscaled_layer);
+ 
+ 	// Expose a few properties we're likely to use externally
+ 	ClassDB::bind_method(D_METHOD("get_render_target"), &RenderSceneBuffersRD::get_render_target);
+@@ -74,6 +78,7 @@ void RenderSceneBuffersRD::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_internal_size"), &RenderSceneBuffersRD::get_internal_size);
+ 	ClassDB::bind_method(D_METHOD("get_target_size"), &RenderSceneBuffersRD::get_target_size);
+ 	ClassDB::bind_method(D_METHOD("get_scaling_3d_mode"), &RenderSceneBuffersRD::get_scaling_3d_mode);
++	ClassDB::bind_method(D_METHOD("get_scaling_3d_custom_upscaler"), &RenderSceneBuffersRD::get_scaling_3d_custom_upscaler);
+ 	ClassDB::bind_method(D_METHOD("get_fsr_sharpness"), &RenderSceneBuffersRD::get_fsr_sharpness);
+ 	ClassDB::bind_method(D_METHOD("get_msaa_3d"), &RenderSceneBuffersRD::get_msaa_3d);
+ 	ClassDB::bind_method(D_METHOD("get_texture_samples"), &RenderSceneBuffersRD::get_texture_samples);
+@@ -106,7 +111,9 @@ void RenderSceneBuffersRD::free_named_texture(NamedTexture &p_named_texture) {
+ void RenderSceneBuffersRD::update_samplers() {
+ 	float computed_mipmap_bias = texture_mipmap_bias;
+ 
+-	if (use_taa || (RSE::scaling_3d_mode_type(scaling_3d_mode) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL)) {
++	if (scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM && scaling_3d_custom_upscaler.is_valid()) {
++		computed_mipmap_bias -= RSG::viewport->viewport_upscaler_get_mipmap_bias(scaling_3d_custom_upscaler);
++	} else if (use_taa || (RSE::scaling_3d_mode_type(scaling_3d_mode) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL)) {
+ 		// Use negative mipmap LOD bias when TAA or FSR2 is enabled to compensate for loss of sharpness.
+ 		// This restores sharpness in still images to be roughly at the same level as without TAA,
+ 		// but moving scenes will still be blurrier.
+@@ -163,6 +170,7 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
+ 	view_count = p_config->get_view_count();
+ 
+ 	scaling_3d_mode = p_config->get_scaling_3d_mode();
++	scaling_3d_custom_upscaler = p_config->get_scaling_3d_custom_upscaler();
+ 	msaa_3d = p_config->get_msaa_3d();
+ 	screen_space_aa = p_config->get_screen_space_aa();
+ 
+@@ -517,7 +525,8 @@ void RenderSceneBuffersRD::allocate_blur_textures() {
+ 	}
+ 
+ 	Size2i blur_size = internal_size;
+-	if (RSE::scaling_3d_mode_type(scaling_3d_mode) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL) {
++	RSE::ViewportScaling3DType scaling_3d_mode_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
++	if ((scaling_3d_mode_type == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL) || (scaling_3d_mode_type == RSE::VIEWPORT_SCALING_3D_TYPE_CUSTOM)) {
+ 		// The blur texture should be as big as the target size when using an upscaler.
+ 		blur_size = target_size;
+ 	}
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
+index cae09e190c82..2eb49676267c 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
++++ b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
+@@ -83,6 +83,7 @@ class RenderSceneBuffersRD : public RenderSceneBuffers {
+ 	// The internal size of the textures we render 3D to in case we render at a lower resolution and upscale
+ 	Size2i internal_size = Size2i(0, 0);
+ 	RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_OFF;
++	RID scaling_3d_custom_upscaler;
+ 	float fsr_sharpness = 0.2f;
+ 	float texture_mipmap_bias = 0.0f;
+ 	RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
+@@ -239,6 +240,7 @@ class RenderSceneBuffersRD : public RenderSceneBuffers {
+ 	_FORCE_INLINE_ Size2i get_internal_size() const { return internal_size; }
+ 	_FORCE_INLINE_ Size2i get_target_size() const { return target_size; }
+ 	_FORCE_INLINE_ RSE::ViewportScaling3DMode get_scaling_3d_mode() const { return scaling_3d_mode; }
++	_FORCE_INLINE_ RID get_scaling_3d_custom_upscaler() const { return scaling_3d_custom_upscaler; }
+ 	_FORCE_INLINE_ float get_fsr_sharpness() const { return fsr_sharpness; }
+ 	_FORCE_INLINE_ RSE::ViewportMSAA get_msaa_3d() const { return msaa_3d; }
+ 	_FORCE_INLINE_ RD::TextureSamples get_texture_samples() const { return texture_samples; }
+@@ -312,7 +314,7 @@ class RenderSceneBuffersRD : public RenderSceneBuffers {
+ 	_FORCE_INLINE_ RID get_upscaled_texture() const {
+ 		return get_texture(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED);
+ 	}
+-	_FORCE_INLINE_ RID get_upscaled_texture(const uint32_t p_layer) {
++	_FORCE_INLINE_ RID get_upscaled_layer(const uint32_t p_layer) {
+ 		return get_texture_slice(RB_SCOPE_BUFFERS, RB_TEX_COLOR_UPSCALED, p_layer, 0);
+ 	}
+ 
+diff --git a/servers/rendering/renderer_viewport.cpp b/servers/rendering/renderer_viewport.cpp
+index f80a9cc6caf8..2a9204c67345 100644
+--- a/servers/rendering/renderer_viewport.cpp
++++ b/servers/rendering/renderer_viewport.cpp
+@@ -141,7 +141,7 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
+ 			const float EPSILON = 0.0001;
+ 			float scaling_3d_scale = p_viewport->scaling_3d_scale;
+ 			RSE::ViewportScaling3DMode scaling_3d_mode = p_viewport->scaling_3d_mode;
+-			bool upscaler_available = p_viewport->fsr_enabled;
++			bool upscaler_available = p_viewport->fsr_enabled || (scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM && p_viewport->scaling_3d_custom_upscaler.is_valid());
+ 			RSE::ViewportScaling3DType scaling_type = RSE::scaling_3d_mode_type(scaling_3d_mode);
+ 
+ 			if ((!upscaler_available || (scaling_type == RSE::VIEWPORT_SCALING_3D_TYPE_SPATIAL)) && scaling_3d_scale >= (1.0 - EPSILON) && scaling_3d_scale <= (1.0 + EPSILON)) {
+@@ -237,6 +237,7 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
+ 				case RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL:
+ 				case RSE::VIEWPORT_SCALING_3D_MODE_FSR:
+ 				case RSE::VIEWPORT_SCALING_3D_MODE_FSR2:
++				case RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM:
+ 					target_width = p_viewport->size.width;
+ 					target_height = p_viewport->size.height;
+ 					render_width = MAX(target_width * scaling_3d_scale, 1.0); // target_width / (target_width * scaling)
+@@ -261,7 +262,9 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
+ 			}
+ 
+ 			uint32_t jitter_phase_count = 0;
+-			if (scaling_type == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL) {
++			if (scaling_type == RSE::VIEWPORT_SCALING_3D_TYPE_CUSTOM) {
++				jitter_phase_count = RSG::viewport->viewport_upscaler_get_jitter_phase_count(p_viewport->scaling_3d_custom_upscaler);
++			} else if (scaling_type == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL) {
+ 				// Implementation has been copied from ffxFsr2GetJitterPhaseCount.
+ 				// Also used for MetalFX Temporal scaling.
+ 				jitter_phase_count = uint32_t(8.0f * std::pow(float(target_width) / render_width, 2.0f));
+@@ -283,6 +286,7 @@ void RendererViewport::_configure_3d_render_buffers(Viewport *p_viewport) {
+ 			rb_config.set_target_size(Size2(target_width, target_height));
+ 			rb_config.set_view_count(p_viewport->view_count);
+ 			rb_config.set_scaling_3d_mode(scaling_3d_mode);
++			rb_config.set_scaling_3d_custom_upscaler(p_viewport->scaling_3d_custom_upscaler);
+ 			rb_config.set_msaa_3d(msaa_3d);
+ 			rb_config.set_screen_space_aa(p_viewport->screen_space_aa);
+ 			rb_config.set_fsr_sharpness(p_viewport->fsr_sharpness);
+@@ -978,6 +982,70 @@ void RendererViewport::draw_viewports(bool p_swap_buffers) {
+ 	}
+ }
+ 
++RID RendererViewport::viewport_upscaler_allocate() {
++	return viewport_upscaler_owner.allocate_rid();
++}
++
++void RendererViewport::viewport_upscaler_initialize(RID p_rid) {
++	viewport_upscaler_owner.initialize_rid(p_rid, ViewportUpscaler());
++}
++
++void RendererViewport::viewport_upscaler_set_render_callback(RID p_viewport_upscaler, const Callable &p_callback) {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL(viewport_upscaler);
++
++	viewport_upscaler->render_callback = p_callback;
++}
++
++Callable RendererViewport::viewport_upscaler_get_render_callback(RID p_viewport_upscaler) const {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL_V(viewport_upscaler, Callable());
++
++	return viewport_upscaler->render_callback;
++}
++
++void RendererViewport::viewport_upscaler_set_requires_motion_vectors(RID p_viewport_upscaler, bool p_requires_motion_vectors) {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL(viewport_upscaler);
++
++	viewport_upscaler->requires_motion_vectors = p_requires_motion_vectors;
++}
++
++bool RendererViewport::viewport_upscaler_get_requires_motion_vectors(RID p_viewport_upscaler) const {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL_V(viewport_upscaler, false);
++
++	return viewport_upscaler->requires_motion_vectors;
++}
++
++void RendererViewport::viewport_upscaler_set_mipmap_bias(RID p_viewport_upscaler, float p_mipmap_bias) {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL(viewport_upscaler);
++
++	viewport_upscaler->mipmap_bias = p_mipmap_bias;
++}
++
++float RendererViewport::viewport_upscaler_get_mipmap_bias(RID p_viewport_upscaler) const {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL_V(viewport_upscaler, 0.0);
++
++	return viewport_upscaler->mipmap_bias;
++}
++
++void RendererViewport::viewport_upscaler_set_jitter_phase_count(RID p_viewport_upscaler, uint32_t p_jitter_phase_count) {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL(viewport_upscaler);
++
++	viewport_upscaler->jitter_phase_count = p_jitter_phase_count;
++}
++
++uint32_t RendererViewport::viewport_upscaler_get_jitter_phase_count(RID p_viewport_upscaler) const {
++	ViewportUpscaler *viewport_upscaler = viewport_upscaler_owner.get_or_null(p_viewport_upscaler);
++	ERR_FAIL_NULL_V(viewport_upscaler, 0);
++
++	return viewport_upscaler->jitter_phase_count;
++}
++
+ RID RendererViewport::viewport_allocate() {
+ 	return viewport_owner.allocate_rid();
+ }
+@@ -1040,6 +1108,9 @@ void RendererViewport::viewport_set_scaling_3d_mode(RID p_viewport, RSE::Viewpor
+ 
+ 	bool motion_vectors_before = _viewport_requires_motion_vectors(viewport);
+ 	viewport->scaling_3d_mode = p_mode;
++	if (viewport->scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM) {
++		viewport->scaling_3d_custom_upscaler = RID();
++	}
+ 
+ 	bool motion_vectors_after = _viewport_requires_motion_vectors(viewport);
+ 	if (motion_vectors_before != motion_vectors_after) {
+@@ -1088,6 +1159,22 @@ void RendererViewport::viewport_set_scaling_3d_scale(RID p_viewport, float p_sca
+ 	_configure_3d_render_buffers(viewport);
+ }
+ 
++void RendererViewport::viewport_set_scaling_3d_custom_upscaler(RID p_viewport, RID p_viewport_upscaler) {
++	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
++	ERR_FAIL_NULL(viewport);
++	ERR_FAIL_COND_MSG(p_viewport_upscaler.is_valid() && viewport->scaling_3d_mode != RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM, "3D Scaling mode must be set to custom before setting an upscaler.");
++
++	bool motion_vectors_before = _viewport_requires_motion_vectors(viewport);
++	viewport->scaling_3d_custom_upscaler = p_viewport_upscaler;
++
++	bool motion_vectors_after = _viewport_requires_motion_vectors(viewport);
++	if (motion_vectors_before != motion_vectors_after) {
++		num_viewports_with_motion_vectors += motion_vectors_after ? 1 : -1;
++	}
++
++	_configure_3d_render_buffers(viewport);
++}
++
+ void RendererViewport::viewport_set_size(RID p_viewport, int p_width, int p_height, int p_view_count) {
+ 	ERR_FAIL_COND(p_width < 0 || p_height < 0 || p_view_count < 0);
+ 
+@@ -1111,6 +1198,10 @@ void RendererViewport::_viewport_set_size(Viewport *p_viewport, int p_width, int
+ }
+ 
+ bool RendererViewport::_viewport_requires_motion_vectors(Viewport *p_viewport) {
++	if (p_viewport->scaling_3d_mode == RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM && p_viewport->scaling_3d_custom_upscaler.is_valid()) {
++		return viewport_upscaler_get_requires_motion_vectors(p_viewport->scaling_3d_custom_upscaler);
++	}
++
+ 	return p_viewport->use_taa ||
+ 			RSE::scaling_3d_mode_type(p_viewport->scaling_3d_mode) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL ||
+ 			p_viewport->debug_draw == RSE::VIEWPORT_DEBUG_DRAW_MOTION_VECTORS || p_viewport->force_motion_vectors;
+@@ -1655,7 +1746,11 @@ void RendererViewport::viewport_set_vrs_texture(RID p_viewport, RID p_texture) {
+ }
+ 
+ bool RendererViewport::free(RID p_rid) {
+-	if (viewport_owner.owns(p_rid)) {
++	if (viewport_upscaler_owner.owns(p_rid)) {
++		viewport_upscaler_owner.free(p_rid);
++
++		return true;
++	} else if (viewport_owner.owns(p_rid)) {
+ 		Viewport *viewport = viewport_owner.get_or_null(p_rid);
+ 
+ 		RSG::texture_storage->render_target_free(viewport->render_target);
+diff --git a/servers/rendering/renderer_viewport.h b/servers/rendering/renderer_viewport.h
+index 2c70de5eb894..550c399570d8 100644
+--- a/servers/rendering/renderer_viewport.h
++++ b/servers/rendering/renderer_viewport.h
+@@ -42,6 +42,15 @@ class RendererViewport {
+ 	struct CanvasBase {
+ 	};
+ 
++	struct ViewportUpscaler {
++		Callable render_callback;
++		bool requires_motion_vectors = false;
++		float mipmap_bias = 0.0;
++		uint32_t jitter_phase_count = 0;
++	};
++
++	mutable RID_Owner<ViewportUpscaler, true> viewport_upscaler_owner;
++
+ 	struct Viewport {
+ 		RID self;
+ 		RID parent;
+@@ -57,6 +66,7 @@ class RendererViewport {
+ 
+ 		RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_BILINEAR;
+ 		float scaling_3d_scale = 1.0;
++		RID scaling_3d_custom_upscaler;
+ 		float fsr_sharpness = 0.2f;
+ 		float texture_mipmap_bias = 0.0f;
+ 		RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
+@@ -217,6 +227,19 @@ class RendererViewport {
+ 	void _resize_occlusion_culling_buffer(const Size2i &p_size);
+ 
+ public:
++	RID viewport_upscaler_allocate();
++	void viewport_upscaler_initialize(RID p_rid);
++
++	void viewport_upscaler_set_render_callback(RID p_viewport_upscaler, const Callable &p_callback);
++	Callable viewport_upscaler_get_render_callback(RID p_viewport_upscaler) const;
++
++	void viewport_upscaler_set_requires_motion_vectors(RID p_viewport_upscaler, bool p_requires_motion_vectors);
++	bool viewport_upscaler_get_requires_motion_vectors(RID p_viewport_upscaler) const;
++	void viewport_upscaler_set_mipmap_bias(RID p_viewport_upscaler, float p_mipmap_bias);
++	float viewport_upscaler_get_mipmap_bias(RID p_viewport_upscaler) const;
++	void viewport_upscaler_set_jitter_phase_count(RID p_viewport_upscaler, uint32_t p_jitter_phase_count);
++	uint32_t viewport_upscaler_get_jitter_phase_count(RID p_viewport_upscaler) const;
++
+ 	RID viewport_allocate();
+ 	void viewport_initialize(RID p_rid);
+ 
+@@ -234,6 +257,7 @@ class RendererViewport {
+ 
+ 	void viewport_set_scaling_3d_mode(RID p_viewport, RSE::ViewportScaling3DMode p_mode);
+ 	void viewport_set_scaling_3d_scale(RID p_viewport, float p_scaling_3d_scale);
++	void viewport_set_scaling_3d_custom_upscaler(RID p_viewport, RID p_viewport_upscaler);
+ 	void viewport_set_fsr_sharpness(RID p_viewport, float p_sharpness);
+ 	void viewport_set_texture_mipmap_bias(RID p_viewport, float p_mipmap_bias);
+ 	void viewport_set_anisotropic_filtering_level(RID p_viewport, RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level);
+diff --git a/servers/rendering/rendering_server.cpp b/servers/rendering/rendering_server.cpp
+index 460eeb67d1d2..49399df7f182 100644
+--- a/servers/rendering/rendering_server.cpp
++++ b/servers/rendering/rendering_server.cpp
+@@ -2846,6 +2846,15 @@ void RenderingServer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("camera_set_compositor", "camera", "compositor"), &RenderingServer::camera_set_compositor);
+ 	ClassDB::bind_method(D_METHOD("camera_set_use_vertical_aspect", "camera", "enable"), &RenderingServer::camera_set_use_vertical_aspect);
+ 
++	/* VIEWPORT UPSCALER */
++
++	ClassDB::bind_method(D_METHOD("viewport_upscaler_create"), &RenderingServer::viewport_upscaler_create);
++
++	ClassDB::bind_method(D_METHOD("viewport_upscaler_set_render_callback", "viewport_upscaler", "callback"), &RenderingServer::viewport_upscaler_set_render_callback);
++	ClassDB::bind_method(D_METHOD("viewport_upscaler_set_requires_motion_vectors", "viewport_upscaler", "requires_motion_vectors"), &RenderingServer::viewport_upscaler_set_requires_motion_vectors);
++	ClassDB::bind_method(D_METHOD("viewport_upscaler_set_mipmap_bias", "viewport_upscaler", "mipmap_bias"), &RenderingServer::viewport_upscaler_set_mipmap_bias);
++	ClassDB::bind_method(D_METHOD("viewport_upscaler_set_jitter_phase_count", "viewport_upscaler", "jitter_phase_count"), &RenderingServer::viewport_upscaler_set_jitter_phase_count);
++
+ 	/* VIEWPORT */
+ 
+ 	ClassDB::bind_method(D_METHOD("viewport_create"), &RenderingServer::viewport_create);
+@@ -2861,6 +2870,7 @@ void RenderingServer::_bind_methods() {
+ 
+ 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_mode", "viewport", "scaling_3d_mode"), &RenderingServer::viewport_set_scaling_3d_mode);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_scale", "viewport", "scale"), &RenderingServer::viewport_set_scaling_3d_scale);
++	ClassDB::bind_method(D_METHOD("viewport_set_scaling_3d_custom_upscaler", "viewport", "upscaler"), &RenderingServer::viewport_set_scaling_3d_custom_upscaler);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_fsr_sharpness", "viewport", "sharpness"), &RenderingServer::viewport_set_fsr_sharpness);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_texture_mipmap_bias", "viewport", "mipmap_bias"), &RenderingServer::viewport_set_texture_mipmap_bias);
+ 	ClassDB::bind_method(D_METHOD("viewport_set_anisotropic_filtering_level", "viewport", "anisotropic_filtering_level"), &RenderingServer::viewport_set_anisotropic_filtering_level);
+@@ -2920,6 +2930,7 @@ void RenderingServer::_bind_methods() {
+ 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL);
+ 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL);
+ 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_NEAREST);
++	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_CUSTOM);
+ 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_SCALING_3D_MODE_MAX);
+ 
+ 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_UPDATE_DISABLED);
+diff --git a/servers/rendering/rendering_server.h b/servers/rendering/rendering_server.h
+index 4a5f852bcd19..3b2fc5cf20e8 100644
+--- a/servers/rendering/rendering_server.h
++++ b/servers/rendering/rendering_server.h
+@@ -531,6 +531,15 @@ class RenderingServer : public Object {
+ 	virtual void camera_set_compositor(RID p_camera, RID p_compositor) = 0;
+ 	virtual void camera_set_use_vertical_aspect(RID p_camera, bool p_enable) = 0;
+ 
++	/* VIEWPORT UPSCALER API */
++
++	virtual RID viewport_upscaler_create() = 0;
++
++	virtual void viewport_upscaler_set_render_callback(RID p_viewport_upscaler, const Callable &p_callback) = 0;
++	virtual void viewport_upscaler_set_requires_motion_vectors(RID p_viewport_upscaler, bool p_requires_motion_vectors) = 0;
++	virtual void viewport_upscaler_set_mipmap_bias(RID p_viewport_upscaler, float p_mipmap_bias) = 0;
++	virtual void viewport_upscaler_set_jitter_phase_count(RID p_viewport_upscaler, uint32_t p_jitter_phase_count) = 0;
++
+ 	/* VIEWPORT API */
+ 
+ 	virtual RID viewport_create() = 0;
+@@ -549,6 +558,7 @@ class RenderingServer : public Object {
+ 
+ 	virtual void viewport_set_scaling_3d_mode(RID p_viewport, RSE::ViewportScaling3DMode p_scaling_3d_mode) = 0;
+ 	virtual void viewport_set_scaling_3d_scale(RID p_viewport, float p_scaling_3d_scale) = 0;
++	virtual void viewport_set_scaling_3d_custom_upscaler(RID p_viewport, RID p_viewport_upscaler) = 0;
+ 	virtual void viewport_set_fsr_sharpness(RID p_viewport, float p_fsr_sharpness) = 0;
+ 	virtual void viewport_set_texture_mipmap_bias(RID p_viewport, float p_texture_mipmap_bias) = 0;
+ 	virtual void viewport_set_anisotropic_filtering_level(RID p_viewport, RSE::ViewportAnisotropicFiltering p_anisotropic_filtering_level) = 0;
+diff --git a/servers/rendering/rendering_server_default.h b/servers/rendering/rendering_server_default.h
+index 9bc71818ed30..a6e227d4bae0 100644
+--- a/servers/rendering/rendering_server_default.h
++++ b/servers/rendering/rendering_server_default.h
+@@ -728,6 +728,15 @@ class RenderingServerDefault : public RenderingServer {
+ #define ServerName RendererViewport
+ #define server_name RSG::viewport
+ 
++	/* VIEWPORT UPSCALER API */
++
++	FUNCRIDSPLIT(viewport_upscaler)
++
++	FUNC2(viewport_upscaler_set_render_callback, RID, const Callable &)
++	FUNC2(viewport_upscaler_set_requires_motion_vectors, RID, bool)
++	FUNC2(viewport_upscaler_set_mipmap_bias, RID, float)
++	FUNC2(viewport_upscaler_set_jitter_phase_count, RID, uint32_t)
++
+ 	/* VIEWPORT TARGET API */
+ 
+ 	FUNCRIDSPLIT(viewport)
+@@ -748,6 +757,7 @@ class RenderingServerDefault : public RenderingServer {
+ 
+ 	FUNC2(viewport_set_scaling_3d_mode, RID, RSE::ViewportScaling3DMode)
+ 	FUNC2(viewport_set_scaling_3d_scale, RID, float)
++	FUNC2(viewport_set_scaling_3d_custom_upscaler, RID, RID)
+ 	FUNC2(viewport_set_fsr_sharpness, RID, float)
+ 	FUNC2(viewport_set_texture_mipmap_bias, RID, float)
+ 	FUNC2(viewport_set_anisotropic_filtering_level, RID, RSE::ViewportAnisotropicFiltering)
+diff --git a/servers/rendering/rendering_server_enums.h b/servers/rendering/rendering_server_enums.h
+index 47d4dbf23516..ede1d44af07c 100644
+--- a/servers/rendering/rendering_server_enums.h
++++ b/servers/rendering/rendering_server_enums.h
+@@ -460,6 +460,7 @@ enum ViewportScaling3DMode {
+ 	VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL,
+ 	VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL,
+ 	VIEWPORT_SCALING_3D_MODE_NEAREST,
++	VIEWPORT_SCALING_3D_MODE_CUSTOM,
+ 	VIEWPORT_SCALING_3D_MODE_MAX,
+ 	VIEWPORT_SCALING_3D_MODE_OFF = 255, // for internal use only
+ };
+@@ -468,11 +469,14 @@ enum ViewportScaling3DType {
+ 	VIEWPORT_SCALING_3D_TYPE_NONE,
+ 	VIEWPORT_SCALING_3D_TYPE_TEMPORAL,
+ 	VIEWPORT_SCALING_3D_TYPE_SPATIAL,
++	VIEWPORT_SCALING_3D_TYPE_CUSTOM,
+ 	VIEWPORT_SCALING_3D_TYPE_MAX,
+ };
+ 
+ inline ViewportScaling3DType scaling_3d_mode_type(ViewportScaling3DMode p_mode) {
+-	if (p_mode == VIEWPORT_SCALING_3D_MODE_NEAREST || p_mode == VIEWPORT_SCALING_3D_MODE_BILINEAR || p_mode == VIEWPORT_SCALING_3D_MODE_FSR || p_mode == VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL) {
++	if (p_mode == VIEWPORT_SCALING_3D_MODE_CUSTOM) {
++		return VIEWPORT_SCALING_3D_TYPE_CUSTOM;
++	} else if (p_mode == VIEWPORT_SCALING_3D_MODE_NEAREST || p_mode == VIEWPORT_SCALING_3D_MODE_BILINEAR || p_mode == VIEWPORT_SCALING_3D_MODE_FSR || p_mode == VIEWPORT_SCALING_3D_MODE_METALFX_SPATIAL) {
+ 		return VIEWPORT_SCALING_3D_TYPE_SPATIAL;
+ 	} else if (p_mode == VIEWPORT_SCALING_3D_MODE_FSR2 || p_mode == VIEWPORT_SCALING_3D_MODE_METALFX_TEMPORAL) {
+ 		return VIEWPORT_SCALING_3D_TYPE_TEMPORAL;
+diff --git a/servers/rendering/storage/render_scene_buffers.cpp b/servers/rendering/storage/render_scene_buffers.cpp
+index 37367098595d..4cf498eb0d5e 100644
+--- a/servers/rendering/storage/render_scene_buffers.cpp
++++ b/servers/rendering/storage/render_scene_buffers.cpp
+@@ -54,6 +54,10 @@ void RenderSceneBuffersConfiguration::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("set_scaling_3d_mode", "scaling_3d_mode"), &RenderSceneBuffersConfiguration::set_scaling_3d_mode);
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "scaling_3d_mode", PROPERTY_HINT_ENUM, "Nearest (Fastest):5,Bilinear (Fastest):0,FSR 1.0 (Fast):1,FSR 2.2 (Slow):2,MetalFX (Spatial - Fast):3,MetalFX (Temporal - Slow):4"), "set_scaling_3d_mode", "get_scaling_3d_mode"); // TODO VIEWPORT_SCALING_3D_MODE_OFF is possible here too, but we can't specify an enum string for it.
+ 
++	ClassDB::bind_method(D_METHOD("get_scaling_3d_custom_upscaler"), &RenderSceneBuffersConfiguration::get_scaling_3d_custom_upscaler);
++	ClassDB::bind_method(D_METHOD("set_scaling_3d_custom_upscaler", "scaling_3d_custom_upscaler"), &RenderSceneBuffersConfiguration::set_scaling_3d_custom_upscaler);
++	ADD_PROPERTY(PropertyInfo(Variant::RID, "scaling_3d_custom_upscaler"), "set_scaling_3d_custom_upscaler", "get_scaling_3d_custom_upscaler");
++
+ 	ClassDB::bind_method(D_METHOD("get_msaa_3d"), &RenderSceneBuffersConfiguration::get_msaa_3d);
+ 	ClassDB::bind_method(D_METHOD("set_msaa_3d", "msaa_3d"), &RenderSceneBuffersConfiguration::set_msaa_3d);
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "msaa_3d", PROPERTY_HINT_ENUM, "Disabled,2x,4x,8x"), "set_msaa_3d", "get_msaa_3d");
+diff --git a/servers/rendering/storage/render_scene_buffers.h b/servers/rendering/storage/render_scene_buffers.h
+index c67a022bf4d6..7bb65cbbf28f 100644
+--- a/servers/rendering/storage/render_scene_buffers.h
++++ b/servers/rendering/storage/render_scene_buffers.h
+@@ -44,6 +44,7 @@ class RenderSceneBuffersConfiguration : public RefCounted {
+ 	uint32_t view_count = 1;
+ 
+ 	RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_OFF;
++	RID scaling_3d_custom_upscaler;
+ 	RSE::ViewportMSAA msaa_3d = RSE::VIEWPORT_MSAA_DISABLED;
+ 	RSE::ViewportScreenSpaceAA screen_space_aa = RSE::VIEWPORT_SCREEN_SPACE_AA_DISABLED;
+ 	RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
+@@ -72,6 +73,9 @@ class RenderSceneBuffersConfiguration : public RefCounted {
+ 	RSE::ViewportScaling3DMode get_scaling_3d_mode() const { return scaling_3d_mode; }
+ 	void set_scaling_3d_mode(RSE::ViewportScaling3DMode p_scaling_3d_mode) { scaling_3d_mode = p_scaling_3d_mode; }
+ 
++	RID get_scaling_3d_custom_upscaler() const { return scaling_3d_custom_upscaler; }
++	void set_scaling_3d_custom_upscaler(RID p_scaling_3d_custom_upscaler) { scaling_3d_custom_upscaler = p_scaling_3d_custom_upscaler; }
++
+ 	RSE::ViewportMSAA get_msaa_3d() const { return msaa_3d; }
+ 	void set_msaa_3d(RSE::ViewportMSAA p_msaa_3d) { msaa_3d = p_msaa_3d; }
+ 

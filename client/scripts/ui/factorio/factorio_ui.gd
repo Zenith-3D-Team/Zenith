@@ -93,6 +93,7 @@ const EquipmentGrid := preload("res://scripts/ui/factorio/equipment_grid.gd")
 const PlannerUi := preload("res://scripts/ui/factorio/planner_ui.gd")
 const SpaceMap := preload("res://scripts/ui/factorio/space_map.gd")
 const Factoriopedia := preload("res://scripts/ui/factorio/factoriopedia.gd")
+const PinnedPage := preload("res://scripts/ui/factorio/pinned_page.gd")
 const NetworksWindow := preload("res://scripts/ui/factorio/networks_window.gd")
 const TechSlot := preload("res://scripts/ui/factorio/tech_slot.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
@@ -127,7 +128,7 @@ const TWO_ROWS_HEIGHT := 600
 ## The shortcut buttons _grey_undo greys every frame, with the player's stack each follows.
 const UNDO_BUTTONS := [["undo", "_undo"], ["redo", "_redo"]]
 const MACHINE_ROLES := ["chest", "input", "output", "fuel", "burnt", "modules", "cargo", "trunk", "turret_ammo", "car_ammo",
-	"robots", "repair", "rocket"]
+	"robots", "repair", "rocket", "hand", "belt_1", "belt_2"]
 
 var model := UiModel.new()
 ## Set by hud.gd before this enters the tree.
@@ -243,6 +244,7 @@ var hand := {}
 ## comes into the hand when it runs out, Q puts it back, a click on a slot puts it down.
 ## `--hand-stack=all`: the quickbar's item with every one of it counted, as before.
 static var stack_hand := not (Switches.has("--hand-stack=all"))
+static var inv_move_sfx := not (Switches.has("--inv-move-sfx=off"))
 
 ## Ctrl+clicks on entities sent and not answered yet, oldest first (player_input.gd's
 ## _fast_transfer): {"item" (held, "": taking), "counts" (the inventory before), "at" (msec),
@@ -257,18 +259,33 @@ var flying: FlyingItems
 ## where the rest goes back to), "slots" ([[role, index, unit], ...] visited), "added" (how many
 ## each got)}; {} when not dragging.
 var _spread := {}
+## Shift+LMB/RMB held while sweeping across inventory slots to transfer multiple stacks:
+## {"side": "char"|"machine", "button": int, "visited": Dictionary}; {} when not dragging.
+var _shift_drag := {}
 ## J12: Factorio sorts the character's main inventory by itself: whenever it changes while no
 ## window shows it, and when the window closes after changes made in it. The bridge's character has
 ## no player for the game to do it, so the client asks the bridge (`sort`) at those moments. Off in
 ## the UI test where it counts the commands sent.
 var auto_sort := true
+var auto_sort_containers := true
+var _auto_sort_setting := true
+var _auto_sort_containers_setting := true
 ## The main inventory changed since it was last sorted; a `sort` was sent and its answer (the next
 ## change) is awaited, since when (msec); the main slots' signature last seen.
 var _sort_due := false
 var _sort_pending := false
 var _sort_sent_ms := -100000
+var _sort_counts := {}
 var _main_sig := 0
-const SORT_GAP_MS := 250
+var _trash_due := false
+var _trash_pending := false
+var _trash_sent_ms := -100000
+var _trash_counts := {}
+var _trash_sig := 0
+var _screen_sorts := {}
+var _screen_sort_unit := 0
+const SORTABLE_SCREEN_ROLES := ["chest", "cargo", "trunk", "trash"]
+const SORT_GAP_MS := 50
 const SORT_ANSWER_MS := 1000
 var _hover_at := Vector2(-1, -1)
 var _shortcuts_room := Rect2()
@@ -311,6 +328,14 @@ func _ready() -> void:
 	minimap.open_map.connect(func() -> void: open_map(true))
 	add_child(minimap)
 	map_view.zoom_to_world.connect(_zoom_into_world)
+	# A click on a building or train on the map opens its window (the mod checks radar and roboport coverage).
+	map_view.entity_picked.connect(_open_from_map)
+	map_view.proto_name = func(id: int) -> String:
+		var world = player.get("world") if player != null else null
+		var proto = world.protos.entity(id) if world != null else null
+		return proto.name if proto != null else ""
+	# A map tag's icon is any signal, as Factorio's: the tag dialog's last slot asks the chooser.
+	map_view.dialog.choose_icon = func(chosen: Callable) -> void: picker.choose(["item", "fluid", "virtual"], chosen)
 	remote_frame = RemoteFrame.new()
 	remote_frame.map_view = map_view
 	add_child(remote_frame)
@@ -330,11 +355,13 @@ func _ready() -> void:
 		elif map_view.is_open():
 			map_view.show_surface(0)
 	remote_frame.reset_requested.connect(back_home)
+	remote_frame.search_requested.connect(map_view.toggle_search)
+	remote_frame.view_mode_toggled.connect(_toggle_map_view_mode)
 	remote_frame.info_panel.drop_requested.connect(func() -> void: _frame_drop("?"))
 	remote_frame.info_panel.drop_chosen.connect(_frame_drop)
 	remote_frame.info_panel.drop_cancelled.connect(func() -> void: _frame_drop(""))
 	var other_surface := func(si: int) -> void:
-		if remote and si != 0:
+		if remote and si != viewing_si:
 			end_remote_view()
 			map_view.open(true)
 			map_view.show_surface(si)
@@ -419,6 +446,25 @@ func _ready() -> void:
 	window.grid_clicked.connect(_on_grid_clicked)
 	add_child(window)
 	screen.slot_clicked.connect(_on_machine_slot)
+	var on_screen_open := func(open: bool) -> void:
+		if not open and str(_shift_drag.get("side", "")) == "machine":
+			_end_shift_drag()
+		if not open:
+			_clear_screen_sorts()
+	screen.opened_changed.connect(on_screen_open)
+	screen.slots_updated.connect(_note_screen_slots)
+	var on_open_network := func(id: int) -> void:
+		if networks == null:
+			return
+		close_all()
+		if networks.has_method("open_network"):
+			networks.call("open_network", id)
+		else:
+			if id > 0:
+				networks.selected = id
+				model.request_lnet(id)
+			networks.open(true)
+	screen.open_network_requested.connect(on_open_network)
 
 	research = ResearchWindow.new()
 	research.model = model
@@ -524,6 +570,7 @@ func _ready() -> void:
 		open_research(true)
 		research.select(tech)
 	pedia.open_technology.connect(to_tech)
+	pedia.pin_requested.connect(pin_pedia)
 	add_child(pedia)
 	chat.gps.connect(_on_gps)
 	Slot.info = item_info
@@ -531,6 +578,7 @@ func _ready() -> void:
 	model.inventory_changed.connect(_note_inventory_change)
 
 	picker = ItemPicker.new()
+	mod_gui.picker = picker
 	picker.items = func() -> Array: return _protos().item_names.values() if _protos() != null else []
 	picker.fluids = func() -> Array: return _protos().fluid_names.values() if _protos() != null else []
 	picker.entities = func() -> Array:
@@ -540,6 +588,31 @@ func _ready() -> void:
 				if e.type in TARGET_TYPES:
 					out.append(e.name)
 		return out
+	picker.tiles = func() -> Array: return Array(_protos().tile_names).filter(func(n: String) -> bool: return n != "") if _protos() != null else []
+	picker.map_entities = func() -> Array:
+		# Factorio's deconstruction filters are entity prototypes, not items: what an item builds (a rail
+		# item: the straight rail), and trees, rocks and cliffs, which have no item to pick.
+		var out: Array = []
+		var protos = _protos()
+		if protos != null:
+			for item in protos.item_names.values():
+				var built = protos.placed_entity(str(item))
+				if built != null and not out.has(built.name):
+					out.append(built.name)
+			for e in protos.entities.values():
+				if e.type in ["tree", "simple-entity", "cliff", "fish"] and not out.has(e.name):
+					out.append(e.name)
+		return out
+	picker.pedia_groups = func() -> Array: return model.pedia_groups
+	picker.pedia_index = func() -> Array: return model.pedia_index
+	var on_picker_open := func() -> void:
+		if model.pedia_index.is_empty():
+			model.request_pedia_index()
+	picker.on_open = on_picker_open
+	var on_pedia_index := func() -> void:
+		if picker != null and picker.is_open():
+			picker.refresh()
+	model.pedia_index_changed.connect(on_pedia_index)
 	add_child(picker)
 	planners = PlannerUi.new()
 	planners.ui = self
@@ -554,6 +627,7 @@ func _ready() -> void:
 	screen.open_stats = func(kind: String, target: Dictionary) -> void: stats.toggle(kind, target)
 	screen.remote_follow = remote_follow
 	chat.console.open_window = open_global
+	chat.console.alert_command = alerts_config.command
 	chat.console.rcon = func(command: String) -> String:
 		if not run_command.is_valid():
 			return ""
@@ -716,7 +790,7 @@ func _process(_delta: float) -> void:
 		hand_slot = ["main", at, 0] if at > 0 else []
 	window.set_hand_slot(hand_slot if not hand_slot.is_empty() and not MACHINE_ROLES.has(hand["role"]) else [])
 	screen.set_hand_slot(hand_slot if not hand_slot.is_empty() and MACHINE_ROLES.has(hand["role"]) else [])
-	Slot.spreading = not _spread.is_empty()
+	Slot.spreading = not _spread.is_empty() or not _shift_drag.is_empty()
 	cursor.item = held
 	_grey_undo()
 	var tool = player.get("cursor_tool") if player != null else null
@@ -1140,6 +1214,9 @@ func _check_hand(held: String) -> void:
 				return
 		elif Time.get_ticks_msec() - int(hand["at"]) > 3000:
 			hand.erase("merge")  # nothing fitted (the target was full): the cursor keeps it all
+	if player != null and str(player.get("cursor_tool")) != "":
+		hand = {}
+		return
 	if held == "" or (hand["role"] != "main" and _stack(hand["role"], int(hand["index"])).get("item", "") != held):
 		hand = {}
 		return
@@ -1155,36 +1232,145 @@ func _check_hand(held: String) -> void:
 			_drop_hand()
 
 
-## A `slots` change: the main inventory needs sorting again, unless it is the answer to the last
-## `sort` (or only the guns, ammo, armour or trash changed).
+func _clear_screen_sorts() -> void:
+	_screen_sorts.clear()
+	_screen_sort_unit = 0
+
+
+static func _slot_counts(slots: Array) -> Dictionary:
+	var out := {}
+	for s in slots:
+		if s is Dictionary and not (s as Dictionary).is_empty():
+			var d: Dictionary = s
+			var item := str(d.get("item", ""))
+			if item != "":
+				var q := str(d.get("quality", ""))
+				if q == "":
+					q = "normal"
+				var key := "%s\t%s" % [item, q]
+				out[key] = int(out.get(key, 0)) + int(d.get("count", 0))
+	return out
+
+
+## A `slots` change: the main inventory (and character trash) needs sorting again whenever its
+## slots changed (unless it is the clean sorted answer to the last `sort` with unchanged item
+## totals and no gaps).
 func _note_inventory_change() -> void:
 	if not model.has_slots:
 		return
+	var was_pending := _sort_pending
+	_sort_pending = false
 	var sig := str(model.main_slots).hash()
-	if sig == _main_sig:
+	if sig != _main_sig:
+		_main_sig = sig
+		if not (was_pending and model.counts == _sort_counts and not _has_gap(model.main_slots, "main")):
+			_sort_due = true
+	if not model.knows_slots("trash"):
+		_trash_sig = 0
+		_trash_due = false
+		_trash_pending = false
 		return
-	_main_sig = sig
-	if _sort_pending:
-		_sort_pending = false  # the bridge's sorted inventory
-		return
-	_sort_due = true
+	var trash_was_pending := _trash_pending
+	_trash_pending = false
+	var trash_slots := model.slots_of("trash")
+	var tsig := str(trash_slots).hash()
+	if tsig != _trash_sig:
+		_trash_sig = tsig
+		var tcounts := _slot_counts(trash_slots)
+		if tcounts.is_empty():
+			_trash_due = false
+		elif not (trash_was_pending and tcounts == _trash_counts and not _has_gap(trash_slots, "trash")):
+			_trash_due = true
 
 
-## J12: sends the bridge a `sort` of the main inventory when it is due and no window shows it, at
-## most every SORT_GAP_MS. Not while the hand holds one of its stacks: Factorio's cursor stack is
-## out of the inventory, but here the hand points at its slot, which sorting would move.
+func _note_screen_slots() -> void:
+	if not screen.is_open() or screen.unit == 0:
+		_clear_screen_sorts()
+		return
+	if screen.unit != _screen_sort_unit:
+		_clear_screen_sorts()
+		_screen_sort_unit = screen.unit
+	for role in SORTABLE_SCREEN_ROLES:
+		if not screen.knows_slots(role):
+			_screen_sorts.erase(role)
+			continue
+		var st: Dictionary = _screen_sorts.get(role, {})
+		if st.is_empty():
+			st = {"due": false, "pending": false, "sent_ms": -100000, "counts": {}, "sig": 0}
+			_screen_sorts[role] = st
+		var was_pending := bool(st["pending"])
+		st["pending"] = false
+		var slots := screen._slot_list(role)
+		var sig := str(slots).hash()
+		if sig == int(st["sig"]):
+			continue
+		st["sig"] = sig
+		var counts := _slot_counts(slots)
+		if counts.is_empty():
+			st["due"] = false
+			continue
+		if was_pending and counts == st["counts"] and not _has_gap(slots, role):
+			continue
+		st["due"] = true
+
+
+func _has_gap(slots: Array, role: String) -> bool:
+	var seen_empty := false
+	for i in slots.size():
+		if role == "main" and model.main_filters.has(i + 1):
+			continue
+		if role == "cargo" and screen.wagon_filter(i + 1) != "":
+			continue
+		var s: Dictionary = slots[i]
+		if s.is_empty():
+			seen_empty = true
+		elif seen_empty:
+			return true
+	return false
+
+
+## J12: sends the bridge a `sort` of the main inventory, character trash, and open container/entity
+## inventories when due, at most every SORT_GAP_MS. Not while the hand holds a stack or a drag is
+## active: sorting would move slots mid-action. `--auto-sort-open=old` waits until the character
+## window closes for character inventories.
 func _auto_sort() -> void:
 	var now := Time.get_ticks_msec()
 	if _sort_pending and now - _sort_sent_ms > SORT_ANSWER_MS:
 		_sort_pending = false  # nothing moved: the bridge sent no slots
-	if not auto_sort or not _sort_due or _sort_pending or window.is_open() or not hand.is_empty():
-		return
-	if not model.knows_slots("main") or now - _sort_sent_ms < SORT_GAP_MS:
-		return
-	_sort_due = false
-	_sort_pending = true
-	_sort_sent_ms = now
-	model.sort_inventory("main")
+	if _trash_pending and now - _trash_sent_ms > SORT_ANSWER_MS:
+		_trash_pending = false
+	for role in _screen_sorts:
+		var st: Dictionary = _screen_sorts[role]
+		if bool(st["pending"]) and now - int(st["sent_ms"]) > SORT_ANSWER_MS:
+			st["pending"] = false
+	var blocked_by_window := window.is_open() and Switches.has("--auto-sort-open=old")
+	var busy := not hand.is_empty() or not _spread.is_empty() or not _shift_drag.is_empty()
+	if auto_sort and _sort_due and not _sort_pending and not blocked_by_window and not busy:
+		if model.knows_slots("main") and now - _sort_sent_ms >= SORT_GAP_MS:
+			_sort_due = false
+			_sort_pending = true
+			_sort_sent_ms = now
+			_sort_counts = model.counts.duplicate()
+			model.sort_inventory("main")
+	if auto_sort_containers and _trash_due and not _trash_pending and not blocked_by_window and not busy:
+		if model.knows_slots("trash") and now - _trash_sent_ms >= SORT_GAP_MS:
+			_trash_due = false
+			_trash_pending = true
+			_trash_sent_ms = now
+			_trash_counts = _slot_counts(model.slots_of("trash"))
+			model.sort_inventory("trash")
+	if auto_sort_containers and screen.is_open() and not screen.far() and not screen._setting_bar and not busy:
+		for role in SORTABLE_SCREEN_ROLES:
+			var st: Dictionary = _screen_sorts.get(role, {})
+			if st.is_empty() or not bool(st["due"]) or bool(st["pending"]):
+				continue
+			if not screen.knows_slots(role) or now - int(st["sent_ms"]) < SORT_GAP_MS:
+				continue
+			st["due"] = false
+			st["pending"] = true
+			st["sent_ms"] = now
+			st["counts"] = _slot_counts(screen._slot_list(role))
+			model.sort_inventory(role, screen.unit)
 
 
 ## The main inventory slot (1-based) the held stack is in, or 0 (none in particular, or not from
@@ -1368,13 +1554,21 @@ func typing() -> bool:
 	return focus is LineEdit or focus is TextEdit
 
 
-## Settings → Interface → In the game: which HUD parts show.
+## Settings → Interface → In the game: which HUD parts show and auto-sort preferences.
 func _apply_settings() -> void:
 	shortcuts.visible = bool(Settings.get_value("interface", "shortcut_bar"))
 	research_hud.set_meta("enabled", bool(Settings.get_value("interface", "research_progress")))
 	research_hud._refresh()
 	entity_info.set_meta("enabled", bool(Settings.get_value("interface", "entity_info")))
 	alerts.visible = bool(Settings.get_value("interface", "alerts"))
+	var inv_sort := bool(Settings.get_value("interface", "auto_sort_inventory"))
+	if auto_sort == _auto_sort_setting:
+		auto_sort = inv_sort
+	_auto_sort_setting = inv_sort
+	var cont_sort := bool(Settings.get_value("interface", "auto_sort_containers"))
+	if auto_sort_containers == _auto_sort_containers_setting:
+		auto_sort_containers = cont_sort
+	_auto_sort_containers_setting = cont_sort
 
 
 func _on_setting(section: String, key: String) -> void:
@@ -1515,7 +1709,7 @@ func _on_shortcut(name: String) -> void:
 		"spidertron":
 			player.hold_tool("spidertron")
 		"artillery", "discharge":
-			hud_message("Remotes aren't in the 3D client yet")
+			player.hold_tool(name)
 		"roboport":
 			toggle_personal_roboport()
 		"exoskeleton":
@@ -1639,12 +1833,20 @@ func remote_view(at: Vector2) -> void:
 	rig.target = _remote_anchor
 	rig.set("in_remote", true)
 	remote = true
-	map_view.open(false)
+	map_view.open(false, viewing_si != 0)
 	minimap.set_map_open(false)
 
 
 ## Remote view that keeps a mover (a train's front, a vehicle) in the middle until the view is
 ## panned or left, as Factorio's train window does when its camera is clicked.
+## A click on the map opened a building, train or vehicle: its window, from afar, as in the remote view.
+func _open_from_map(unit: int, proto_id: int, fixed: Vector2i) -> void:
+	var cmd := {"t": "open", "u": unit, "p": proto_id, "x": fixed.x, "y": fixed.y, "rv": 1}
+	if model.map_si > 0:
+		cmd["si"] = model.map_si
+	screen.request(unit, cmd)
+
+
 func remote_follow(unit: int, at: Vector2) -> void:
 	remote_view(at)
 	_remote_follow = unit
@@ -1673,25 +1875,39 @@ func _zoom_into_world(at: Vector2) -> void:
 	if remote and rig != null and rig.has_method("in_factorio_view") and not rig.in_factorio_view():
 		rig.toggle_factorio_view()
 		_map_factorio_view = true
-	# Zooming back out goes to the map again (issue #4), at Settings > Camera > Zoom out to the map at
-	# (240 tiles by default; it was four times the opening distance, capped by Furthest zoom at 140).
+	# Zooming back out goes to the map again (issue #4) when auto-swap is enabled, at Settings > Camera >
+	# Zoom out to the map at (240 tiles by default; off by default so the top-bar toggle switches 2D/3D).
 	if remote and rig != null and "map_handoff_distance" in rig:
-		var opened := float(rig.get("_distance_goal"))
-		rig.map_handoff_distance = maxf(float(Settings.get_value("camera", "map_zoom_out")), opened * 1.5)
-		if not rig.zoomed_out_to_map.is_connected(_zoom_out_to_map):
-			rig.zoomed_out_to_map.connect(_zoom_out_to_map)
+		if MapView.map_auto_swap_enabled():
+			var opened := float(rig.get("_distance_goal"))
+			rig.map_handoff_distance = maxf(float(Settings.get_value("camera", "map_zoom_out")), opened * 1.5)
+			if not rig.zoomed_out_to_map.is_connected(_zoom_out_to_map):
+				rig.zoomed_out_to_map.connect(_zoom_out_to_map)
+		else:
+			rig.map_handoff_distance = INF
 
 
 func _zoom_out_to_map() -> void:
+	_return_to_map(true)
+
+
+func _return_to_map(from_zoom := true) -> void:
 	# In a hub the remote view stays round the hub and the map opens over it.
 	if not remote:
 		return
 	var si := viewing_si
 	var at := Vector2(_remote_anchor.position.x, _remote_anchor.position.z) if _remote_anchor != null else Vector2.INF
-	end_remote_view()
+	end_remote_view(true)
 	open_map(true)
 	if at != Vector2.INF:
-		map_view.return_from_world(si, at)
+		map_view.return_from_world(si, at, from_zoom)
+
+
+func _toggle_map_view_mode() -> void:
+	if map_view.is_open():
+		_zoom_into_world(map_view.centre)
+	elif remote:
+		_return_to_map(false)
 
 
 ## The character is inside a platform's hub at `at` (ride.gd): the remote view there, for good.
@@ -1711,12 +1927,14 @@ func in_hub() -> bool:
 	return hub_at != Vector2.INF
 
 
-func end_remote_view() -> void:
+func end_remote_view(keep_surface := false) -> void:
 	# In a hub there is no character to go back to: back to the hub instead.
 	if hub_at != Vector2.INF:
 		if viewing_si != 0:
 			viewing_si = 0
 			Bridge.send({"t": "view", "si": 0})
+		if not keep_surface and model.map_si != 0:
+			model.set_map_surface(0)
 		_remote_follow = 0
 		if _remote_anchor != null:
 			_remote_anchor.position = Vector3(hub_at.x, 0.0, hub_at.y)
@@ -1725,6 +1943,8 @@ func end_remote_view() -> void:
 	if viewing_si != 0:
 		viewing_si = 0
 		Bridge.send({"t": "view", "si": 0})
+	if not keep_surface and model.map_si != 0:
+		model.set_map_surface(0)
 	var rig = player.get("rig") if player != null else null
 	if rig != null:
 		rig.target = player.get("avatar")
@@ -1760,6 +1980,8 @@ func character_on_map() -> Array:
 ## Closes the character window, any machine screen, the technology screen and statistics (E,
 ## Esc, ×).
 func close_all() -> void:
+	_spread = {}
+	_end_shift_drag()
 	if screen.unit != 0:
 		screen.close()
 	window.open_crafting(false)
@@ -1801,6 +2023,8 @@ func escape() -> bool:
 		minimap.set_map_open(space_map.is_open())
 	elif remote and not _at_hub():
 		end_remote_view()
+	elif screen.is_open() and screen.cancel_bar_setting():
+		pass
 	elif is_open() or screen.unit != 0:
 		close_all()
 	else:
@@ -1894,6 +2118,25 @@ func open_pedia(kind: String, name: String) -> void:
 		pedia.open_page(kind, name)
 
 
+## The pedia's Pin: the page as a small panel on the screen, each page once, stacked down the left.
+var pinned_pages: Array = []
+
+
+func pin_pedia(kind: String, name: String) -> void:
+	for p: Control in pinned_pages:
+		if p.kind == kind and p.thing == name:
+			return
+	var pinned := PinnedPage.new()
+	pinned.setup(kind, name)
+	pinned.position = Kit.pxv(12 + 24 * (pinned_pages.size() % 6), 140 + 36 * (pinned_pages.size() % 6))
+	pinned.open_page.connect(open_pedia)
+	pinned.closed.connect(func() -> void:
+		pinned_pages.erase(pinned)
+		pinned.queue_free())
+	pinned_pages.append(pinned)
+	add_child(pinned)
+
+
 ## Alt+click on a window's slot opens its Factoriopedia page, as in Factorio (before the slot sees
 ## the click).
 func _input(event: InputEvent) -> void:
@@ -1902,13 +2145,31 @@ func _input(event: InputEvent) -> void:
 		var up := event as InputEventMouseButton
 		if up != null and not up.pressed and up.button_index == int(_spread["button"]):
 			_spread = {}
+			_auto_sort()
 		elif motion != null:
 			if motion.button_mask & (MOUSE_BUTTON_MASK_LEFT if int(_spread["button"]) == MOUSE_BUTTON_LEFT else MOUSE_BUTTON_MASK_RIGHT) == 0:
 				_spread = {}
+				_auto_sort()
 			else:
 				var s := _slot_under(motion.position)
 				if s != null:
 					_spread_to(s.slot_role, s.slot_index, screen.unit if MACHINE_ROLES.has(s.slot_role) else 0)
+	if not _shift_drag.is_empty():
+		var sd_up := event as InputEventMouseButton
+		var sd_key := event as InputEventKey
+		var sd_motion := event as InputEventMouseMotion
+		if sd_up != null and not sd_up.pressed and sd_up.button_index == int(_shift_drag["button"]):
+			_end_shift_drag()
+		elif sd_key != null and not sd_key.pressed and sd_key.physical_keycode == KEY_SHIFT:
+			_end_shift_drag()
+		elif sd_motion != null:
+			var mask := MOUSE_BUTTON_MASK_LEFT if int(_shift_drag["button"]) == MOUSE_BUTTON_LEFT else MOUSE_BUTTON_MASK_RIGHT
+			if (sd_motion.button_mask & mask) == 0 or not sd_motion.shift_pressed:
+				_end_shift_drag()
+			else:
+				var s := _slot_under(sd_motion.position)
+				if s != null:
+					_shift_drag_to(s)
 	var mb := event as InputEventMouseButton
 	if mb == null or not mb.pressed or mb.button_index != MOUSE_BUTTON_LEFT or not mb.alt_pressed or not mouse_over_gui():
 		return
@@ -2028,8 +2289,20 @@ func _select_item(item: String, quality := "normal") -> void:
 ## (K18: that item was pinned over it); only an empty slot takes the held item. Right and middle
 ## click clear it (Factorio: middle; its right click picks half a stack).
 func _on_quickbar_clicked(index: int, button_index: int) -> void:
-	if button_index == MOUSE_BUTTON_RIGHT or button_index == MOUSE_BUTTON_MIDDLE:
+	if button_index == MOUSE_BUTTON_RIGHT:
 		model.unpin(index)
+	elif button_index == MOUSE_BUTTON_MIDDLE:
+		if str(model.quickbar[index]) != "":
+			model.unpin(index)
+		else:
+			var held := held_item()
+			if held != "":
+				model.pin(index, held)
+			else:
+				var chosen := func(_kind: String, name: String) -> void: model.pin(index, name)
+				if model.pedia_index.is_empty():
+					model.request_pedia_index()
+				picker.choose(["item"], chosen)
 	elif button_index == MOUSE_BUTTON_LEFT:
 		var held := held_item()
 		if str(model.quickbar[index]) == "" and held != "":
@@ -2046,8 +2319,20 @@ func _on_second_quickbar_clicked(index: int, button_index: int) -> void:
 ## A slot of any quickbar page (the second row, the page chooser's rows).
 func _on_page_slot_clicked(page: int, index: int, button_index: int) -> void:
 	var item := str(model.quickbar_page_items(page)[index])
-	if button_index == MOUSE_BUTTON_RIGHT or button_index == MOUSE_BUTTON_MIDDLE:
+	if button_index == MOUSE_BUTTON_RIGHT:
 		model.pin_on_page(page, index, "")
+	elif button_index == MOUSE_BUTTON_MIDDLE:
+		if item != "":
+			model.pin_on_page(page, index, "")
+		else:
+			var held := held_item()
+			if held != "":
+				model.pin_on_page(page, index, held)
+			else:
+				var chosen := func(_kind: String, name: String) -> void: model.pin_on_page(page, index, name)
+				if model.pedia_index.is_empty():
+					model.request_pedia_index()
+				picker.choose(["item"], chosen)
 	elif button_index == MOUSE_BUTTON_LEFT:
 		var held := held_item()
 		if item == "" and held != "":
@@ -2064,7 +2349,9 @@ func _on_character_slot(role: String, index: int, button_index: int, shift: bool
 		# (the right button: one), as Factorio's tool bar takes ammo while driving.
 		if not hand.is_empty() and str(hand.get("role", "")) == "main" and held_item() != "" \
 				and (button_index == MOUSE_BUTTON_LEFT or button_index == MOUSE_BUTTON_RIGHT):
+			var put_item := held_item()
 			model.move("main", int(hand["index"]), "vammo", index, 1 if button_index == MOUSE_BUTTON_RIGHT else int(hand.get("n", 0)))
+			_play_move_sfx(put_item)
 			if button_index == MOUSE_BUTTON_LEFT:
 				_drop_hand()
 		return
@@ -2081,12 +2368,22 @@ func _on_character_slot(role: String, index: int, button_index: int, shift: bool
 	var stack := model.stack_at(role, index)
 	if not hand.is_empty() and hand["role"] == "grid" and role == "main":
 		# Equipment from a grid back into the inventory: into this slot if it is empty.
+		var grid_item := held_item()
+		if grid_item == "":
+			grid_item = str(model.equipment_at(str(hand["kind"]), hand["cell"]).get("name", ""))
 		model.take_equipment(str(hand["kind"]), hand["cell"], index if stack.is_empty() else 0)
+		_play_move_sfx(grid_item)
 		_drop_hand()
+		return
+	if shift and not ctrl and (button_index == MOUSE_BUTTON_LEFT or button_index == MOUSE_BUTTON_RIGHT):
+		_shift_drag = {"side": "char", "button": button_index, "visited": {"%s:%d" % [role, index]: true}}
+		Slot.spreading = true
+		_transfer_char_slot(role, index, button_index)
 		return
 	if shift and role == "main" and not stack.is_empty() and _equipment_target() != "" and is_equipment(str(stack["item"])):
 		# Shift+click on equipment: into the open vehicle's grid, else the armour's (where it fits).
 		model.put_equipment(_equipment_target(), index)
+		_play_move_sfx(str(stack["item"]))
 		return
 	# Right click on a blueprint, book or planner opens its window, as in Factorio.
 	if button_index == MOUSE_BUTTON_RIGHT and role == "main" and not shift and not ctrl 			and PlannerUi.PLANNER_ITEMS.has(str(stack.get("item", ""))) and held_item() == "":
@@ -2096,6 +2393,15 @@ func _on_character_slot(role: String, index: int, button_index: int, shift: bool
 		_transfer(role, index, stack, button_index, ctrl, screen.unit if screen.is_open() else 0)
 		return
 	_click_slot(role, index, stack, button_index, 0)
+
+
+func _transfer_char_slot(role: String, index: int, button_index: int) -> void:
+	var stack := model.stack_at(role, index)
+	if role == "main" and not stack.is_empty() and _equipment_target() != "" and is_equipment(str(stack["item"])):
+		model.put_equipment(_equipment_target(), index)
+		_play_move_sfx(str(stack["item"]))
+		return
+	_transfer(role, index, stack, button_index, false, screen.unit if screen.is_open() else 0)
 
 
 ## Factorio's Shift and Ctrl clicks on a slot, to "the other inventory" (the open machine, or the
@@ -2110,11 +2416,28 @@ func _transfer(role: String, index: int, stack: Dictionary, button_index: int, c
 	if stack.is_empty() and unit == 0:
 		return  # "everything" needs another inventory to go to
 	var half := button_index == MOUSE_BUTTON_RIGHT
-	model.xfer(role, index, ("allhalf" if half else "all") if ctrl else ("half" if half else "stack"), unit)
+	var to_trash := unit == 0 and role == "main" and window.is_open() and window.current_tab() == "Logistics"
+	model.xfer(role, index, ("allhalf" if half else "all") if ctrl else ("half" if half else "stack"), unit, to_trash)
+	_play_move_sfx(str(stack.get("item", "")), true)
 
 
 ## Factorio's middle click on an inventory slot: filter it to its item (or the held one), or clear
 ## the filter it has.
+## Middle click on an open cargo wagon's slot: the slot's item (or the held one) becomes its
+## filter, a click on a filtered slot of that item clears it, an empty slot asks which item.
+func _toggle_wagon_filter(index: int, slot_item: String) -> void:
+	var unit: int = screen.unit
+	var current: String = screen.wagon_filter(index)
+	var item: String = slot_item if slot_item != "" else held_item()
+	if current != "" and (item == "" or item == current):
+		model.set_slot_filter(index, "", unit)
+	elif item != "":
+		model.set_slot_filter(index, item, unit)
+	else:
+		var chosen := func(_kind: String, name: String) -> void: model.set_slot_filter(index, name, unit)
+		picker.choose(["item"], chosen)
+
+
 func _toggle_filter(index: int) -> void:
 	var current: String = model.main_filters.get(index, "")
 	var stack := model.stack_at("main", index)
@@ -2136,9 +2459,11 @@ func _toggle_filter(index: int) -> void:
 func _on_grid_clicked(kind: String, cell: Vector2i, button_index: int, shift: bool) -> void:
 	var e := model.equipment_at(kind, cell)
 	if (shift or button_index == MOUSE_BUTTON_RIGHT) and not e.is_empty():
+		var eq_name := str(e["name"])
 		if not hand.is_empty() and hand["role"] == "grid" and hand["cell"] == Vector2i(int(e["x"]), int(e["y"])):
 			_drop_hand()
 		model.take_equipment(kind, Vector2i(int(e["x"]), int(e["y"])))
+		_play_move_sfx(eq_name)
 		return
 	if button_index != MOUSE_BUTTON_LEFT:
 		return
@@ -2147,21 +2472,27 @@ func _on_grid_clicked(kind: String, cell: Vector2i, button_index: int, shift: bo
 		var from: Vector2i = hand["cell"]
 		if str(hand["kind"]) != kind:
 			hud_message("Put it in the inventory first")
-		elif cell != from:
-			model.move_equipment(kind, from, cell)
+		else:
+			if cell != from:
+				model.move_equipment(kind, from, cell)
+			_play_move_sfx(held)
 		_drop_hand()
 		return
 	if held != "" and not hand.is_empty() and hand["role"] == "main":
 		model.put_equipment(kind, int(hand["index"]), cell)
+		_play_move_sfx(held)
 		return
 	if held != "" and hand.is_empty():
 		var slot := _slot_of(held)
 		if slot > 0:
 			model.put_equipment(kind, slot, cell)
+			_play_move_sfx(held)
 			return
 	if not e.is_empty() and player != null:
-		player.hold(str(e["name"]))
+		var eq_name := str(e["name"])
+		player.hold(eq_name)
 		hand = {"role": "grid", "kind": kind, "cell": Vector2i(int(e["x"]), int(e["y"])), "index": 0, "n": 0, "unit": 0}
+		_play_pick_sfx(eq_name)
 
 
 ## The main inventory slot (1-based) holding an item, or 0 ("": the first empty slot).
@@ -2253,6 +2584,8 @@ func _update_equipment_shortcuts() -> void:
 ## A slot of the open machine. Shift (Ctrl: all of that item) takes the stack into the inventory.
 func _on_machine_slot(role: String, index: int, item: String, count: int, button_index: int, shift: bool, ctrl: bool) -> void:
 	if button_index == MOUSE_BUTTON_MIDDLE:
+		if role == "cargo" and index > 0 and not screen.far():
+			_toggle_wagon_filter(index, item)
 		return
 	# From the remote view out of reach, as Factorio 2.x: a module held and clicked into a module
 	# slot is asked for, right click takes the request back (F6).
@@ -2270,27 +2603,77 @@ func _on_machine_slot(role: String, index: int, item: String, count: int, button
 		return
 	if shift or ctrl:
 		if index > 0:
-			_transfer(role, index, {} if item == "" else {"item": item, "count": count}, button_index, ctrl, screen.unit)
+			if shift and not ctrl and (button_index == MOUSE_BUTTON_LEFT or button_index == MOUSE_BUTTON_RIGHT):
+				_shift_drag = {"side": "machine", "button": button_index, "visited": {"%s:%d" % [role, index]: true}}
+				Slot.spreading = true
+				_transfer_machine_slot(role, index, button_index)
+			else:
+				_transfer(role, index, {} if item == "" else {"item": item, "count": count}, button_index, ctrl, screen.unit)
 		elif item != "":  # no slot data: the slot is the item's total
 			var n := count if not ctrl else 1 << 30
 			if button_index == MOUSE_BUTTON_RIGHT:
 				n = ceili(count / 2.0)
 			screen.take(role if not ctrl else "", item, n)
+			_play_move_sfx(item)
 		return
 	if index == 0:  # no slot data: the slot is the item's total, so a click takes it
 		if held_item() != "" and not hand.is_empty() and hand["role"] == "main":
-			screen.put(held_item(), hand_count())
+			var put_item := held_item()
+			screen.put(put_item, hand_count())
+			_play_move_sfx(put_item)
 			_drop_hand()
 		elif item != "":
 			screen.take(role, item, ceili(count / 2.0) if button_index == MOUSE_BUTTON_RIGHT else count)
+			_play_move_sfx(item)
 		return
 	var stack := {} if item == "" else {"item": item, "count": count}
 	_click_slot(role, index, stack, button_index, screen.unit)
 
 
+func _transfer_machine_slot(role: String, index: int, button_index: int) -> void:
+	if role == "modules" and screen.far():
+		hud_message("Out of reach")
+		return
+	var stack := screen.stack_at(role, index)
+	_transfer(role, index, stack, button_index, false, screen.unit)
+
+
+func _shift_drag_to(s: Slot) -> void:
+	if _shift_drag.is_empty():
+		return
+	var role := s.slot_role
+	var index := s.slot_index
+	if role == "" or index <= 0:
+		return
+	var side := "machine" if MACHINE_ROLES.has(role) else "char"
+	if side != str(_shift_drag["side"]):
+		return
+	var key := "%s:%d" % [role, index]
+	var visited: Dictionary = _shift_drag["visited"]
+	if visited.has(key):
+		return
+	visited[key] = true
+	var btn := int(_shift_drag["button"])
+	if side == "char":
+		_transfer_char_slot(role, index, btn)
+	else:
+		_transfer_machine_slot(role, index, btn)
+
+
+func _end_shift_drag() -> void:
+	if _shift_drag.is_empty():
+		return
+	_shift_drag = {}
+	Slot.spreading = not _spread.is_empty()
+	_auto_sort()
+
+
 ## Factorio's slot click: pick up, put down, swap, merge, put back, or (right click) half / one.
 func _click_slot(role: String, index: int, stack: Dictionary, button_index: int, unit: int) -> void:
 	var held := held_item()
+	if role == "main" and stack.is_empty() and (button_index == MOUSE_BUTTON_LEFT or button_index == MOUSE_BUTTON_RIGHT) \
+			and planners != null and planners.save_clipboard(index):
+		return
 	if held == "" or hand.is_empty():
 		# An empty cursor, or one holding a quickbar item (not any stack in particular): pick up.
 		if stack.is_empty():
@@ -2308,17 +2691,22 @@ func _click_slot(role: String, index: int, stack: Dictionary, button_index: int,
 	if from_role == role and from_index == index:
 		if button_index == MOUSE_BUTTON_RIGHT and int(hand["n"]) > 1:
 			hand["n"] = int(hand["n"]) - 1  # one back into its own slot
+			_play_move_sfx(held)
 		elif button_index == MOUSE_BUTTON_RIGHT and int(hand["n"]) == 0 and int(stack.get("count", 0)) > 1:
 			hand["n"] = int(stack["count"]) - 1
+			_play_move_sfx(held)
 		else:
+			_play_move_sfx(held)
 			_drop_hand()  # back where it came from
 		return
 	if not (_knows_slots(from_role) and _knows_slots(role)):
 		# An old mod: no moves by slot, only take and put.
 		if MACHINE_ROLES.has(role) and from_role == "main":
 			screen.put(held, hand_count())
+			_play_move_sfx(held)
 		elif MACHINE_ROLES.has(from_role) and role == "main":
 			screen.take(from_role, held, hand_count())
+			_play_move_sfx(held)
 		_drop_hand()
 		return
 	var u := int(hand["unit"]) if MACHINE_ROLES.has(from_role) else unit
@@ -2340,6 +2728,7 @@ func _click_slot(role: String, index: int, stack: Dictionary, button_index: int,
 	var total := hand_count()
 	var origin_left := int(_stack(from_role, from_index).get("count", 0)) - total
 	model.move(from_role, from_index, role, index, int(hand["n"]), u)
+	_play_move_sfx(held)
 	if same:
 		# Onto the same item: as much as fits; the rest stays in the cursor (_check_hand).
 		hand["merge"] = [role, index]
@@ -2360,7 +2749,9 @@ func _click_slot(role: String, index: int, stack: Dictionary, button_index: int,
 
 ## Right click with a stack held: one of it into this slot.
 func _place_one(role: String, index: int, unit: int) -> void:
+	var held := held_item()
 	model.move(hand["role"], int(hand["index"]), role, index, 1, unit)
+	_play_move_sfx(held)
 	if int(hand["n"]) > 1:
 		hand["n"] = int(hand["n"]) - 1
 	elif int(hand["n"]) == 1 or hand_count() <= 1:
@@ -2395,16 +2786,21 @@ func _spread_to(role: String, index: int, unit: int) -> void:
 	var u := int(_spread["unit"])
 	var need := each
 	var back := 0
+	var moved_items := 0
 	for i in slots.size():
 		var excess := int(added[i]) - each
 		var to_new := mini(excess, need)
 		if to_new > 0:
 			model.move(slots[i][0], int(slots[i][1]), role, index, to_new, u)
 			need -= to_new
+			moved_items += to_new
 		if excess - to_new > 0:
 			model.move(slots[i][0], int(slots[i][1]), origin[0], int(origin[1]), excess - to_new, u)
 			back += excess - to_new
+			moved_items += excess - to_new
 		added[i] = each
+	if moved_items > 0:
+		_play_move_sfx(str(_spread["item"]))
 	slots.append([role, index])
 	added.append(each)
 	var rest := total - k * each
@@ -2442,7 +2838,9 @@ static func _collect_slots(node: Node, out: Array) -> void:
 ## stack never left that slot, so only the cursor and the hand are emptied.
 func clear_cursor() -> void:
 	_spread = {}
-	if not hand.is_empty() and MACHINE_ROLES.has(hand["role"]) and screen.is_open():
+	var held := held_item()
+	var had_hand := not hand.is_empty()
+	if had_hand and MACHINE_ROLES.has(hand["role"]) and screen.is_open():
 		# Taken from a machine: Factorio's clear cursor puts it in the character's inventory.
 		var n := int(hand["n"])
 		if n > 0:
@@ -2452,6 +2850,8 @@ func clear_cursor() -> void:
 		else:
 			model.xfer(hand["role"], int(hand["index"]), "stack", int(hand["unit"]))
 	_drop_hand()
+	if had_hand and held != "":
+		_play_move_sfx(held)
 
 
 ## The pipette's stack: the first stack of the item in the main inventory goes in the cursor, its
@@ -2519,6 +2919,7 @@ func _pick_up(role: String, index: int, unit: int, item: String, n: int, count :
 		return
 	hand = {"role": role, "index": index, "n": n, "unit": unit}
 	player.hold(item)
+	_play_pick_sfx(item)
 	if stack_hand and role == "main" and player.get("cursor_quality") != null:
 		# The cursor's quality is its stack's (L7): what a build from it places, and the quality of
 		# the stack it refills from first.
@@ -2536,10 +2937,30 @@ func _pick_up(role: String, index: int, unit: int, item: String, n: int, count :
 				"count": n if n > 0 else count}
 
 
+func _play_pick_sfx(item: String) -> void:
+	if not inv_move_sfx or item == "":
+		return
+	var sound := ItemSounds.pick_sound(item)
+	Sfx.play_ui(str(sound[0]), float(sound[1]))
+
+
+func _play_move_sfx(item: String, empty_generic := false) -> void:
+	if not inv_move_sfx:
+		return
+	if item == "":
+		if empty_generic:
+			Sfx.play_ui(ItemSounds.GENERIC, 1.0)
+		return
+	var sound := ItemSounds.move_sound(item)
+	Sfx.play_ui(str(sound[0]), float(sound[1]))
+
+
 func _drop_hand() -> void:
 	hand = {}
 	if player != null:
 		player.hold("")
+		if player.get("cursor_tool") != null:
+			player.set("cursor_tool", "")
 
 
 ## Factorio's cursor refill (J3): the hand's stack went into an entity, so the next stack of the

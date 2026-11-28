@@ -7,6 +7,7 @@
 #include <godot_cpp/variant/packed_string_array.hpp>
 #include <godot_cpp/variant/array.hpp>
 
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -551,6 +552,59 @@ Dictionary read_rb(const Buf &b, int flags, int64_t start, int64_t end) {
 	return msg;
 }
 
+// A `lod` run list (lod_cells): its numbers read as LodChunk._is_num + float() do. A list of another type
+// has no numbers (Wire.array: []).
+struct LodList {
+	const int32_t *p32 = nullptr;
+	const int64_t *p64 = nullptr;
+	const Array *arr = nullptr;
+	int64_t size = 0;
+	// false for a non-number (or a float that isn't finite), as LodChunk._is_num.
+	bool num(int64_t i, double &out) const {
+		if (p32) {
+			out = (double)p32[i];
+			return true;
+		}
+		if (p64) {
+			out = (double)p64[i];
+			return true;
+		}
+		const Variant &v = (*arr)[i];
+		Variant::Type t = v.get_type();
+		if (t == Variant::INT) {
+			out = (double)(int64_t)v;
+			return true;
+		}
+		if (t == Variant::FLOAT) {
+			out = (double)v;
+			return std::isfinite(out);
+		}
+		return false;
+	}
+};
+
+void lod_list_of(const Variant &v, LodList &l, PackedInt32Array &k32, PackedInt64Array &k64, Array &ka) {
+	switch (v.get_type()) {
+		case Variant::PACKED_INT32_ARRAY:
+			k32 = v;
+			l.p32 = k32.ptr();
+			l.size = k32.size();
+			break;
+		case Variant::PACKED_INT64_ARRAY:
+			k64 = v;
+			l.p64 = k64.ptr();
+			l.size = k64.size();
+			break;
+		case Variant::ARRAY:
+			ka = v;
+			l.arr = &ka;
+			l.size = ka.size();
+			break;
+		default:
+			break;
+	}
+}
+
 } // namespace
 
 Array WireDecodeNative::read(const PackedByteArray &packet, int max_version) {
@@ -619,7 +673,83 @@ String WireDecodeNative::packet_text(const PackedByteArray &packet) {
 	return text_of(packet.ptr(), packet.size());
 }
 
+Array WireDecodeNative::lod_cells(const Variant &tl, const Variant &el, int total) {
+	Array none;
+	if (total <= 0) {
+		return none;
+	}
+	PackedInt32Array k32a, k32b;
+	PackedInt64Array k64a, k64b;
+	Array kaa, kab;
+	LodList t, e;
+	lod_list_of(tl, t, k32a, k64a, kaa);
+	lod_list_of(el, e, k32b, k64b, kab);
+	// Tiles: [tile, count, ...].
+	if (t.size <= 0 || t.size % 2 != 0) {
+		return none;
+	}
+	PackedInt32Array tiles;
+	tiles.resize(total);
+	int32_t *tp = tiles.ptrw();
+	int64_t pos = 0;
+	for (int64_t i = 0; i < t.size; i += 2) {
+		double tid_f, cnt_f;
+		if (!t.num(i, tid_f) || !t.num(i + 1, cnt_f)) {
+			return none;
+		}
+		if (tid_f < 0.0 || tid_f > 2147483647.0 || cnt_f <= 0.0 || cnt_f > (double)(total - pos)) {
+			return none;
+		}
+		int32_t tid = (int32_t)(int64_t)tid_f;
+		int64_t cnt = (int64_t)cnt_f;
+		for (int64_t k = 0; k < cnt; k++) {
+			tp[pos++] = tid;
+		}
+	}
+	if (pos != total) {
+		return none;
+	}
+	// Entities: [proto, flags, count, ...].
+	if (e.size <= 0 || e.size % 3 != 0) {
+		return none;
+	}
+	PackedInt32Array protos;
+	PackedByteArray flags;
+	protos.resize(total);
+	flags.resize(total);
+	int32_t *pp = protos.ptrw();
+	uint8_t *fp = flags.ptrw();
+	pos = 0;
+	for (int64_t i = 0; i < e.size; i += 3) {
+		double pid_f, flg_f, cnt_f;
+		if (!e.num(i, pid_f) || !e.num(i + 1, flg_f) || !e.num(i + 2, cnt_f)) {
+			return none;
+		}
+		if (pid_f < 0.0 || pid_f > 2147483647.0 || flg_f < 0.0 || flg_f > 255.0 || cnt_f <= 0.0 ||
+				cnt_f > (double)(total - pos)) {
+			return none;
+		}
+		int32_t pid = (int32_t)(int64_t)pid_f;
+		uint8_t flg = (uint8_t)(int64_t)flg_f;
+		int64_t cnt = (int64_t)cnt_f;
+		for (int64_t k = 0; k < cnt; k++) {
+			pp[pos] = pid;
+			fp[pos] = flg;
+			pos++;
+		}
+	}
+	if (pos != total) {
+		return none;
+	}
+	Array out;
+	out.append(tiles);
+	out.append(protos);
+	out.append(flags);
+	return out;
+}
+
 void WireDecodeNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("read", "packet", "max_version"), &WireDecodeNative::read);
 	ClassDB::bind_method(D_METHOD("packet_text", "packet"), &WireDecodeNative::packet_text);
+	ClassDB::bind_method(D_METHOD("lod_cells", "tl", "el", "total"), &WireDecodeNative::lod_cells);
 }

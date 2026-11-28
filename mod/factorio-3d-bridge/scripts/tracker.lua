@@ -121,6 +121,7 @@ end
 
 local function tell(entity)
   world.touched(entity)
+  alt_mode.on_entity_changed(entity)
   for _, f in ipairs(M.listeners) do
     f(entity)
   end

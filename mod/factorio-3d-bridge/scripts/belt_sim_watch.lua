@@ -254,9 +254,11 @@ local function watch_lane(b, belt, unit, i, lines, p)
     return 0.5
   end
   local n, p1, pn, total
-  -- (two_call: not for a lane leading out or fed from outside: their walls and what comes in.)
+  -- (two_call: not for a lane leading out or fed from outside, or a belt woken under wake_strict.)
+  local strict_woke = O.wake_strict and woke
+  local strict_pickup = strict_woke and brec and brec[11] == 2
   local f = H.fns(lines, i)
-  if O.two_call and not edge and not fed then
+  if O.two_call and not edge and not fed and not strict_woke then
     n, p1, pn, total = H.two_call_line(lines[i], rec, f)
   else
     n, p1, pn, total = H.check_line(lines[i], f)
@@ -266,10 +268,15 @@ local function watch_lane(b, belt, unit, i, lines, p)
     brec[13] = nil
   end
   local same = n == rec[1] and p1 == rec[2] and pn == rec[3] and total == rec[4]
+  if same and n == 0 and strict_pickup then
+    -- (wake_strict: emit empty sl on a woken pickup belt even if rec was already empty, so the client clears phantoms.)
+    same = false
+  end
   local extra = 0
   local shifted, sfu, sbu = false, nil, nil
-  -- (At most every identity_ticks a lane, but every update for a lane leading out: its wall.)
-  if same and n > 0 and pn - p1 == GAP * (n - 1) and M.identity and (edge or ((fed or woke or cp) and n > 1) or (handled and now - (rec[12] or -1e9) >= M.identity_ticks and extra_left(b))) then
+  -- (At most every identity_ticks a lane, but every update for a lane leading out: its wall; wake_strict:
+  -- any n >= 1 on a woken pickup belt checks front/back ids so single-item or unpacked swaps are caught.)
+  if same and n > 0 and M.identity and (strict_pickup or (pn - p1 == GAP * (n - 1) and (edge or ((fed or woke or cp) and n > 1) or (handled and now - (rec[12] or -1e9) >= M.identity_ticks and extra_left(b))))) then
     rec[12] = now
     if edge then
       M.counts.identity_edge = (M.counts.identity_edge or 0) + 1
@@ -335,7 +342,7 @@ local function watch_lane(b, belt, unit, i, lines, p)
   -- Every item moved on the same way and nothing came or went: what the client simulates itself,
   -- not sent (in 2.1 a lane's items move on as one; an inserter's take or put changes the count or
   -- breaks the even shift).
-  if M.skip_flow and not edge and not fed and n == rec[1] and total == rec[4] and p1 - rec[2] == pn - rec[3] and p1 < rec[2] then
+  if M.skip_flow and not edge and not fed and not strict_woke and n == rec[1] and total == rec[4] and p1 - rec[2] == pn - rec[3] and p1 < rec[2] then
     M.counts.flow = M.counts.flow + 1
     rec[2], rec[3], rec[6], rec[7], rec[8], rec[14] = p1, pn, now, 0, true, nil
     return H.CHECK_UNITS

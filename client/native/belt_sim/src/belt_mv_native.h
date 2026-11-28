@@ -7,7 +7,9 @@
 #include <godot_cpp/classes/image.hpp>
 #include <godot_cpp/classes/ref_counted.hpp>
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/aabb.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
+#include <godot_cpp/variant/packed_byte_array.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/vector4.hpp>
 
@@ -43,12 +45,62 @@ public:
 		int last_visible = -1;
 		bool on_records = true;
 		bool has_written = false;
+		// Buffer content changed since the last update this kind emitted (a slot written with new
+		// values, or the buffer resized): BeltMv's change flag, in place of hashing the buffer.
+		bool changed = true;
+		// (--belt-mv-page-dirty) A page update touched some of this kind's records: re-evaluate only
+		// those slots (and copies pointing into a touched page) plus the moving ones, not the whole kind.
+		bool page_dirty = false;
+		// (--belt-mv-tight-cap) Steps in a row the tight size would have been a quarter smaller.
+		int low_steps = 0;
+		// (--belt-mv-native-put) The last put BeltMv's GDScript made for this kind went through
+		// BeltItemsNative's fast path with this visible count, size and bounds: the next like it may be
+		// done here (see step).
+		bool put_known = false;
+		int put_vis = -1;
+		int put_cap = -1;
+		AABB put_bnds;
 	};
 
+	// A record page held as the Image's own bytes (copy-on-write, no copy made): read-only.
+	struct Page {
+		PackedByteArray bytes;
+		const float *f = nullptr;
+		size_t n = 0;
+		size_t size() const { return n; }
+		const float *data() const { return f; }
+	};
+
+	// (--belt-mv-tight-cap) Buffers sized to the kind's items: rounded up to TIGHT_STEP with a quarter
+	// of slack when growing, shrunk after TIGHT_SHRINK_STEPS steps where the size would be a quarter smaller.
+	static constexpr int TIGHT_STEP = 256;
+	static constexpr int TIGHT_SHRINK_STEPS = 120;
+
+	// Kinds evaluated on the engine's worker pool when at least this many are due with this many
+	// slots between them (`--belt-mv-threads`); below it the step runs inline as before.
+	static constexpr int THREAD_MIN_KINDS = 2;
+	static constexpr int64_t THREAD_MIN_SLOTS = 4096;
+	enum Emit : int { EMIT_NONE = 0, EMIT_RESTORE = 1, EMIT_EMPTY = 2, EMIT_PUT = 3 };
+	// One kind's share of a step: decided on the calling thread, evaluated by _eval_job (maybe on a
+	// pool thread, touching only this kind), emitted on the calling thread in kind order.
+	struct StepJob {
+		KindState *ks = nullptr;
+		float *dst = nullptr;
+		int nw = 0;
+		int target_vis = 0;
+		bool need_vis_sync = false;
+		bool was_on_records = false;
+		bool page_part = false;
+		int evaluated = 0;
+		int emit = EMIT_NONE;
+	};
+
+	void _eval_job(StepJob &j, float clock, float min_x, float max_x, float min_z, float max_z) const;
+
 private:
-	std::vector<std::vector<float>> rec_pages;
+	std::vector<Page> rec_pages;
 	int rec_per_page = 0;
-	std::vector<std::vector<float>> lat_pages;
+	std::vector<Page> lat_pages;
 	int lat_per_page = 0;
 	std::vector<float> paths;
 	int paths_w = 0;
@@ -63,9 +115,36 @@ private:
 	std::vector<int64_t> rec_order;
 	std::vector<int64_t> lat_order;
 	float last_clock = -1.0e20f;
+	bool threads = true;
+	int threaded_steps = 0;
+	std::vector<StepJob> step_jobs;
+	std::vector<int> step_due;
+	// (--belt-mv-page-dirty) Pages touched since the last step, per records texture.
+	bool page_dirty_on = true;
+	std::vector<uint8_t> rec_touched;
+	std::vector<uint8_t> lat_touched;
+	int page_steps = 0;
+	int64_t page_slots = 0;
+	// (--belt-mv-tight-cap)
+	bool tight_on = true;
+	// (--belt-mv-native-put) ItemCards' BeltItemsNative fast paths, their band mask and epoch, and the
+	// step's bounds; puts done here since the last take_put_counts().
+	bool native_put_on = false;
+	uint64_t put_fast_id[2] = { 0, 0 };
+	int put_mask[2] = { 0, 0 };
+	int64_t put_epoch[2] = { 0, 0 };
+	AABB put_bounds;
+	bool put_ready = false;
+	int put_done = 0;
+	int put_uploads[2] = { 0, 0 };
+	int put_skips = 0;
+	uint64_t put_usec = 0;
 
-	void _update_pages(const Dictionary &p, std::vector<std::vector<float>> &pages,
-			std::unordered_map<int64_t, KindState> &kinds, int &per_page);
+	void _update_pages(const Dictionary &p, std::vector<Page> &pages,
+			std::unordered_map<int64_t, KindState> &kinds, int &per_page, std::vector<uint8_t> &touched_acc);
+	int _tight_size(const KindState &ks, int need) const;
+	void _fit_buffer(KindState &ks, int size);
+	bool _touched_slot(const KindState &ks, int s) const;
 	void _set_kind(std::unordered_map<int64_t, KindState> &kinds, std::vector<int64_t> &order,
 			int64_t item_id, int base, int n, int cap, bool is_lat);
 	int _eval_sim_slot(const KindState &ks, float *buf, int s, float clock) const;
@@ -97,6 +176,24 @@ public:
 	PackedFloat32Array get_buf(bool is_lattice, int64_t item_id) const;
 	int get_moving_count(bool is_lattice, int64_t item_id) const;
 	Array step(float clock, const Vector4 &vrect);
+	void set_threads(bool on);
+	bool get_threads() const;
+	int get_threaded_steps() const;
+	void set_page_dirty(bool on);
+	bool get_page_dirty() const;
+	// [steps that re-evaluated only touched pages' slots, slots evaluated by them]
+	Array get_page_stats() const;
+	void set_tight_cap(bool on);
+	bool get_tight_cap() const;
+	int get_inst_cap(bool is_lattice, int64_t item_id) const;
+	void set_native_put(bool on);
+	bool get_native_put() const;
+	void set_put_targets(const Variant &rec_fast, int rec_mask, int64_t rec_epoch,
+			const Variant &lat_fast, int lat_mask, int64_t lat_epoch, const AABB &bounds);
+	void mark_put(bool is_lattice, int64_t item_id, int vis, int cap);
+	void forget_puts();
+	// [puts done, uploads to records' cards, uploads to lattice cards, puts skipped unchanged]; resets them.
+	Array take_put_counts();
 };
 
 } // namespace godot

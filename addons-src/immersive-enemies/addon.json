@@ -1,9 +1,9 @@
 {
 	"id": "immersive-enemies",
 	"name": "Immersive Enemies",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"api": 1.9,
 	"entry": "main.gd",
 	"author": "Zenith",
-	"description": "Physics-driven biter, spitter, worm & nest ragdolls with spring-animated legs, explosive body splitting, burning-to-ash corpses, progressive wounds, pooled ichor splatter and gibs, and reworked tier-weighted animations."
+	"description": "Physics-driven Nauvis & Gleba enemy ragdolls (biters, spitters, worms, nests, wrigglers, strafers, stompers & egg rafts) with spring/articulated legs, explosive body splitting, burning-to-ash corpses, progressive wounds, pooled splatter/gibs, slimy acid goo, and reworked animations."
 }

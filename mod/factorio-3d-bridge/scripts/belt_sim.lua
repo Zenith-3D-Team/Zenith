@@ -717,7 +717,7 @@ local function queue_drift(b, sc, q)
       for j = j0 + (turn - (j0 - 1)) % stride, j1, stride do
         local unit = sc.units[j]
         local r = b.belts[unit]
-        if r and (O.drift_watched or not b.wset[unit] or (driven and r[16])) and not b.oset[unit] and not b.iset[unit] then
+        if r and (O.drift_watched or not b.wset[unit] or (driven and r[16]) or (O.wake_strict and r[11] == 2)) and not b.oset[unit] and not b.iset[unit] then
           if not (quiet and not b.wset[unit] and not H.quiet_due(r, now)) then
             list[#list + 1] = unit
           end
@@ -881,6 +881,37 @@ local function actor_check(b, unit, period, p)
     return 0
   end
   local backoff = O.actor_backoff
+  local now = game.tick
+  if O.wake_strict and not a[4] then
+    local pu = a[2]
+    local pickup_active = false
+    if pu then
+      local has_items = false
+      for li = 1, LANE_KEYS do
+        local lr = b.lanes[pu * LANE_KEYS + li]
+        if lr and lr[1] > 0 then
+          has_items = true
+          break
+        end
+      end
+      if has_items then
+        a[12] = now
+        pickup_active = true
+      elseif a[12] and now - a[12] <= 30 then
+        pickup_active = true
+      end
+    end
+    if not pickup_active then
+      local ok_st, st = pcall(function() return a[1].status end)
+      if ok_st and st == defines.entity_status.working then
+        pickup_active = true
+      end
+    end
+    if pickup_active then
+      backoff = false
+      a[7] = nil
+    end
+  end
   -- (ins_driven: an inserter at a belt watched for inserters alone is checked every update: its checks are all that
   -- reads that belt. M.ins_eager false: backed off as the rest, for measuring.)
   local driven = not a[4] and ins_driven()
@@ -903,7 +934,6 @@ local function actor_check(b, unit, period, p)
   local was, was_mp = a[5], a[9]
   a[5], a[9] = v, mp
   M.counts.actors = (M.counts.actors or 0) + 1
-  local now = game.tick
   if was == nil or v == was or (a[4] and v > was) then
     if backoff then
       if a[4] then
@@ -1107,7 +1137,9 @@ local function step_watch(b, belt, v, rec, p, far)
   -- (Only where an inserter, a drill or a splitter put or took items: elsewhere the client's
   -- simulation already carries them as the game does.)
   local t = rec[14] or belt.type
+  local was_woke = b.wake[v]
   b.wake[v] = nil
+  local pickup_woke = O.wake_strict and was_woke and rec[11] == 2
   -- (drill_tails: a drill dropping here put out since its check before: the tails back to then.)
   local since = last
   local dsince = b.dwake and b.dwake[v]
@@ -1122,7 +1154,7 @@ local function step_watch(b, belt, v, rec, p, far)
     -- (quiet_pc: the belts its tails reach woken, read or not: a put or take there runs on into them.)
     H.wake_after(b, v, H.TAIL_DEPTH)
   end
-  if not far and (changed or dsince) and M.tails and (rec[11] or t == "splitter" or t == "lane-splitter") and H.extra_left(b) then
+  if not far and (changed or dsince or pickup_woke) and M.tails and (rec[11] or t == "splitter" or t == "lane-splitter") and H.extra_left(b) then
     local r0, c0 = M.counts.read, H.set_cause("tail")
     for _, u in ipairs(rec[7] or {}) do
       extra = extra + H.catch_up(b, u, math.max(1, now - since), p, H.CATCH_DEPTH - H.TAIL_DEPTH + 1)

@@ -21,10 +21,24 @@ const ItemCards := preload("res://scripts/world/item_cards.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Controls := preload("res://scripts/player/controls.gd")
+const Upscalers := preload("res://scripts/menu/upscalers.gd")
+const DlssHost := preload("res://scripts/menu/dlss_host.gd")
+const FsrHost := preload("res://scripts/menu/fsr_host.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const PATH := "user://settings.cfg"
 ## [meta]: set once add-ons found under an earlier Zenith were kept on (addon_loader.gd _migrate_once).
 const ADDONS_OFF_BY_DEFAULT := "addons_off_by_default"
+## [model_packs] `choices` for a settings file that has none: the owner's own picks (0.3.1), so a new
+## player sees what the owner sees: Placeholders' rigged biters, spitters and spawners over Wube3DP's,
+## FUE5's lab and pumpjack whatever pack comes above. `--default-model-choices=off`: none, as before.
+const DEFAULT_MODEL_CHOICES := {
+	"big-biter": "builtin:placeholders",
+	"big-spitter": "builtin:placeholders",
+	"biter-spawner": "builtin:placeholders",
+	"lab": "builtin:fue5",
+	"pumpjack": "builtin:fue5",
+}
 
 const DEFAULTS := {
 	"graphics": {
@@ -35,10 +49,15 @@ const DEFAULTS := {
 		"vsync": true,
 		"fps_cap": 0,  # 0: unlimited
 		"render_scale": 0.8,
-		# 3D upscaler (scaling_mode_for; --upscaler=bilinear|fsr1|fsr2): "bilinear", "fsr1" (FSR 1.0, spatial,
-		# works with MSAA/SMAA) or "fsr2" (AMD FSR 2.2, temporal: Godot 4.7's Viewport.SCALING_3D_MODE_FSR2,
-		# replaces TAA/MSAA/SMAA while it is on).
+		# 3D upscaler (scaling_mode_for; --upscaler=bilinear|fsr1|fsr2|fsr3|fsr4|dlss|auto): "bilinear", "fsr1" (FSR 1.0,
+		# spatial, works with MSAA/SMAA) or "fsr2" (AMD FSR 2.2, temporal: Godot 4.7's Viewport.SCALING_3D_MODE_FSR2,
+		# replaces TAA/MSAA/SMAA while it is on); "fsr4" (AMD FSR 4.1, Radeon RX 6000+), "fsr3" (AMD FSR 3.1, any GPU), "dlss" (NVIDIA
+		# DLSS) and "auto" need a vendor runtime this build doesn't have yet (upscalers.gd): FSR 2.2 runs instead.
 		"upscaler": "fsr2",
+		# The player's OK for NVIDIA DLSS (alt/dlss-s7c): NVIDIA's driver runs its own updater (nvngx_update.exe, may go
+		# online) once DLSS starts, so DLSS asks first; off until they say yes, withdrawn under Upscaling
+		# (set_dlss_consent; --dlss-consent=yes / no for one run).
+		"dlss_consent": false,
 		# 0.0 softest .. 1.0 sharpest (fsr_sharpness_value maps it to Godot's 2 softest .. 0 sharpest);
 		# 0.575 is the 0.85 FSR_SHARPNESS Zenith has always used.
 		"upscaler_sharpness": 0.575,
@@ -102,6 +121,12 @@ const DEFAULTS := {
 		# one. Off: the main thread, as before 0.3.x. Read at start-up from ENGINE_OVERRIDES, so it applies after
 		# a restart (sync_engine_overrides writes it at start when it differs).
 		"render_thread": true,
+		# Godot's rendering driver on Windows: "d3d12" (default since 0.3.1; the overnight soak measured the client
+		# at 4.3-4.5 GB against Vulkan's 8.2-8.6 GB on the same world) or "vulkan" (as before 0.3.1). Godot picks
+		# the driver before any script runs, so it is written to ENGINE_OVERRIDES and applies after a restart;
+		# project.godot falls back to Vulkan when Direct3D 12 can't start. `--rendering-driver vulkan` on the
+		# command line wins over both. Other systems ignore it (Vulkan / Metal as before).
+		"renderer": "d3d12",
 		"view_radius": 4,  # chunks around the camera (inner full radius in dual-slider default; or total seamless Render distance in unified mode)
 		"distant_horizon": 96,  # extreme LOD horizon radius in chunks (0 off, up to 512; distant_horizon.gd)
 		"distant_horizon_manual": true,  # on (default): separate View distance (full) & Distant horizon sliders; off: unified Render distance slider + Level of detail
@@ -142,7 +167,9 @@ const DEFAULTS := {
 		# Linear volumes, 0 to 1 (fx_settings.gd); "<name>_on" false mutes that slider.
 		"master": 0.8, "effects": 1.0, "music": 0.0, "ui": 1.0,
 		"walking": 1.0, "environment": 1.0, "weapons": 1.0, "explosions": 1.0, "enemies": 1.0,
-		"ambient": 1.0,  # wind and each planet's background sounds (fx/ambience.gd)
+		"ambient": 1.0,  # each planet's base background loops (fx/ambience.gd)
+		"wind": 1.0,  # the wind and the planet's semi-persistent sounds (fx/ambience.gd)
+		"alerts": 1.0,  # the alert beep (ui/factorio/alerts.gd)
 		"max_voices": 32,  # machine and vehicle loops playing at once (12 before the sound pool)
 		"output_device": "Default",
 		"pack_sounds": true,  # sounds from model packs (model_packs.gd sounds_on; --pack-sounds=off)
@@ -184,6 +211,9 @@ const DEFAULTS := {
 		# off: Factorio's driving, the opposite key brakes and then reverses; on: it brakes to a stop and holds
 		# there until let go (settings.gd vehicle_brake_hold, sent by player_input.gd; --vehicle-brake-hold=on|off)
 		"vehicle_brake_hold": false,
+		# Auto-sort character main inventory and other inventories (trash, open chests, cargo, trunks)
+		"auto_sort_inventory": true,
+		"auto_sort_containers": true,
 		# Factorio 2.1's fluid pipeline visualization (N9, pipeline_marks.gd): with a fluid entity held, in
 		# Alt-mode, every pipeline in view; and the hovered entity's pipelines
 		"fluid_vis": true,
@@ -204,6 +234,7 @@ const DEFAULTS := {
 		"map_orthographic": true,  # the remote view's, from the map (F7 switches the view in use)
 		"first_person_orthographic": false,  # first person's (owner's I19: each view keeps its own; F7 switches)
 		"max_zoom": 140,  # how far the wheel zooms out, in tiles from the focus
+		"map_auto_swap": false,  # wheel zoom swaps between the 2D map and 3D remote view
 		"map_zoom_out": 240,  # the map's remote view: how far out before the map comes back (tiles)
 		# add-ons' camera modifiers (bob, sway, shake) scaled to this percentage, 0: none drawn
 		"addon_motion": 100,
@@ -239,13 +270,15 @@ const DEFAULTS := {
 	# The Model packs window (model_packs.gd, model_packs_window.gd): the packs by id
 	# ("builtin:<folder>", "loose", "dir:<folder>", "zip:<file>"), top first, and those turned off.
 	# A pack of the models folder not listed goes on top, a built-in one in its place under them.
-	# `choices`: a model family -> the pack it is taken from whatever the order.
+	# `choices`: a model family -> the pack it is taken from whatever the order. A file without
+	# `choices` gets DEFAULT_MODEL_CHOICES (the owner's picks, 0.3.1; `--default-model-choices=off`:
+	# none, as before); a saved one, `{}` too (the window's reset), stays the player's.
 	# `pbr_packs`: canonical pack id -> bool overriding the pack's PBR shading.
 	# `pbr_models`: "<pack id>|<family or item:<name>>" -> bool overriding one model/item's PBR shading.
 	"model_packs": {
 		"order": [],
 		"off": [],
-		"choices": {},
+		"choices": DEFAULT_MODEL_CHOICES,
 		"pbr_packs": {},
 		"pbr_models": {},
 	},
@@ -259,6 +292,8 @@ const ENGINE_OVERRIDES := "user://engine.cfg"
 ## Godot's thread models: the renderer on the main thread, or on its own.
 const THREAD_SAFE := 1
 const THREAD_SEPARATE := 2
+## The Windows rendering drivers the Renderer setting offers (the first is the default).
+const RENDERERS := ["d3d12", "vulkan"]
 
 
 ## At start: ENGINE_OVERRIDES written again when the thread model running now isn't the setting's (a new default,
@@ -269,14 +304,41 @@ static func sync_engine_overrides() -> void:
 	if path != PATH or DisplayServer.get_name() == "headless":
 		return
 	var want := THREAD_SEPARATE if bool(get_value("graphics", "render_thread")) else THREAD_SAFE
-	if int(ProjectSettings.get_setting("rendering/driver/threads/thread_model", THREAD_SAFE)) != want:
+	var has_threads_arg := arg_value("--worker-threads=") != ""
+	var want_threads := worker_threads_cap()
+	if int(ProjectSettings.get_setting("rendering/driver/threads/thread_model", THREAD_SAFE)) != want \
+			or str(ProjectSettings.get_setting("rendering/rendering_device/driver.windows", "")) != renderer() \
+			or (not has_threads_arg and int(ProjectSettings.get_setting("threading/worker_pool/max_threads", -1)) != want_threads):
 		write_engine_overrides()
+
+
+## Maximum WorkerThreadPool threads written to ENGINE_OVERRIDES so background shader/asset jobs leave
+## cores free for the OS, DWM, and other apps (`--worker-threads=all|<n>` overrides).
+static func worker_threads_cap(cores: int = -1) -> int:
+	if cores <= 0:
+		cores = OS.get_processor_count()
+	var raw := arg_value("--worker-threads=").strip_edges().to_lower()
+	if raw == "all" or raw == "-1":
+		return -1
+	if raw.is_valid_int():
+		return clampi(int(raw), 1, maxi(1, cores))
+	if cores <= 2:
+		return 1
+	return clampi(cores - maxi(2, cores / 3), 1, 16)
+
+
+## The Renderer setting (Windows' rendering driver), one of RENDERERS.
+static func renderer() -> String:
+	var r := str(get_value("graphics", "renderer")).to_lower()
+	return r if RENDERERS.has(r) else str(RENDERERS[0])
 
 
 ## Writes ENGINE_OVERRIDES from the settings; Godot reads it at the next start.
 static func write_engine_overrides() -> void:
 	var cfg := ConfigFile.new()
 	cfg.set_value("rendering", "driver/threads/thread_model", THREAD_SEPARATE if bool(get_value("graphics", "render_thread")) else THREAD_SAFE)
+	cfg.set_value("rendering", "rendering_device/driver.windows", renderer())
+	cfg.set_value("threading", "worker_pool/max_threads", worker_threads_cap())
 	cfg.save(ENGINE_OVERRIDES)
 
 
@@ -296,7 +358,7 @@ const PRESETS := {
 	"high": {"shadows": "high", "ssao": true, "lod_quality": "medium", "view_radius": 4, "entity_radius": 128,
 		"belt_updates": -1, "belt_distance": 128, "decorative_distance": 192, "decorative_density": 1.0, "grass_3d": "normal",
 		"clouds": true, "contact_shading": true, "god_rays": 0.5},
-	"ultra": {"shadows": "ultra", "ssao": true, "lod_quality": "high", "view_radius": 14, "entity_radius": 256,
+	"ultra": {"shadows": "ultra", "ssao": true, "lod_quality": "ultra", "view_radius": 14, "entity_radius": 256,
 		"belt_updates": -1, "belt_distance": 320, "decorative_distance": 256, "decorative_density": 1.0, "grass_3d": "far",
 		"clouds": true, "contact_shading": true, "god_rays": 0.5},
 }
@@ -475,10 +537,11 @@ static func load_settings() -> void:
 	var full_res := _full_screen_resolution_once()
 	var grass := _grass_preset_once()
 	var dual := _dual_distance_once()
+	var wind := _wind_volume_once()
 	if fresh:
 		# Add-ons are off until switched on; a new file has none to keep on (addon_loader.gd _migrate_once).
 		_cfg.set_value("meta", ADDONS_OFF_BY_DEFAULT, true)
-	if _migrate() or renamed or reset or belt_auto or still_cards or full_res or grass or dual or not existed:
+	if _migrate() or renamed or reset or belt_auto or still_cards or full_res or grass or dual or wind or not existed:
 		_cfg.save(path)
 
 
@@ -585,6 +648,21 @@ static func _grass_preset_once() -> bool:
 	return true
 
 
+## 0.3.0's Ambient slider covered the wind too; since then Wind is a slider of its own (default full).
+## Once, in files saved before: one with an Ambient volume (or mute) and no Wind takes the Ambient
+## one for Wind, so a player who turned Ambient down doesn't get the wind back at full volume.
+## True when the file needs saving.
+static func _wind_volume_once() -> bool:
+	if bool(_cfg.get_value("meta", "wind_volume", false)):
+		return false
+	_cfg.set_value("meta", "wind_volume", true)
+	if _cfg.has_section_key("sound", "ambient") and not _cfg.has_section_key("sound", "wind"):
+		_cfg.set_value("sound", "wind", _cfg.get_value("sound", "ambient"))
+	if _cfg.has_section_key("sound", "ambient_on") and not _cfg.has_section_key("sound", "wind_on"):
+		_cfg.set_value("sound", "wind_on", _cfg.get_value("sound", "ambient_on"))
+	return true
+
+
 ## Unified Render distance mode used a single `view_radius` (up to 512) with `distant_horizon_manual = false`.
 ## Once, when migrating back to separate View distance (full) and Distant horizon sliders:
 ## switch `distant_horizon_manual` to true, and if `view_radius` exceeds VIEW_RADIUS_MAX, preserve the outer
@@ -682,6 +760,8 @@ static func get_value(section: String, key: String) -> Variant:
 	if not _held.is_empty() and _held.has(section) and (_held[section] as Dictionary).has(key):
 		return _held[section][key]
 	var fallback = factorio_values.get(section, {}).get(key, DEFAULTS.get(section, {}).get(key))
+	if section == "model_packs" and key == "choices" and not Switches.on("--default-model-choices"):
+		fallback = {}  # no default choices: the pack order alone, as before 0.3.1
 	return _cfg.get_value(section, key, fallback)
 
 
@@ -718,7 +798,7 @@ static func set_value(section: String, key: String, value: Variant, persist := t
 		apply_interface()
 	if section == "graphics" and key == "item_models_max":
 		apply_item_look()
-	if section == "graphics" and key == "render_thread" and persist:
+	if section == "graphics" and (key == "render_thread" or key == "renderer") and persist:
 		write_engine_overrides()
 	if section == "factorio" and key == Controls.OLD_KEYS_SETTING and not _default_keys.is_empty():
 		apply_old_defaults()
@@ -1080,16 +1160,19 @@ static func look_pre_aa_for(vp: Viewport) -> float:
 	return 0.0
 
 
+## `--msaa-with-smaa=on`: restore stacking SMAA on top of active MSAA (2x/4x/8x).
+static var msaa_with_smaa := Switches.on("--msaa-with-smaa", false)
+
+
 ## The screen-space anti-aliasing drawn for an anti-aliasing choice: none under TAA in place of SMAA,
-## and SMAA paired with MSAA (unless TAA is on) so interior textures, cutouts, and specular edges get
-## smoothed alongside geometry silhouettes.
+## and none stacked over active MSAA (`--msaa-with-smaa=on` restores pairing SMAA with MSAA).
 ## TAA already resolves the edges, and SMAA's three full-screen passes kept running over it: 0.37-0.40 ms
 ## of GPU at 4K under the Cinematic look with its TAA on (measured on the owner's desktop) for nothing.
 static func screen_space_aa_for(aa: String, taa: bool) -> int:
 	if aa == "smaa" and taa:
 		return Viewport.SCREEN_SPACE_AA_DISABLED
 	if MSAA.has(aa):
-		return Viewport.SCREEN_SPACE_AA_DISABLED if taa else Viewport.SCREEN_SPACE_AA_SMAA
+		return Viewport.SCREEN_SPACE_AA_SMAA if (msaa_with_smaa and not taa) else Viewport.SCREEN_SPACE_AA_DISABLED
 	return int(SCREEN_SPACE_AA.get(aa, Viewport.SCREEN_SPACE_AA_DISABLED))
 
 
@@ -1157,18 +1240,43 @@ static func render_scale_for(render_scale: float, ratio: float) -> float:
 const FSR_SHARPNESS := 0.85
 
 
-## The upscaler in use: "bilinear", "fsr1" or "fsr2" (AMD FSR 2.2, Godot 4.7's SCALING_3D_MODE_FSR2).
-## --upscaler=bilinear|fsr|fsr1|fsr2|fsr2.1|fsr2.2 wins over the Upscaling setting for one run (fsr is
-## FSR 1; fsr2.1 and fsr2.2 are FSR 2 under Godot's one implementation); an unknown value is "fsr1".
-static func upscaler_in_effect() -> String:
-	var arg := arg_value("--upscaler=").strip_edges().to_lower()
+## The Upscaling choice (one of Upscalers.VALUES, aliases resolved): --upscaler=bilinear|fsr|fsr1|fsr2|fsr2.1|
+## fsr2.2|fsr3|fsr3.1|fsr4|fsr4.1|dlss|auto wins over the setting for one run (fsr is FSR 1; fsr2.1 and fsr2.2 are FSR 2 under
+## Godot's one implementation; fsr3 is AMD FSR 3.1, fsr4 AMD FSR 4.1); an unknown value is "fsr1".
+static func upscaler_choice() -> String:
+	var arg := arg_value("--upscaler=").strip_edges()
 	if arg == "":
-		arg = str(get_value("graphics", "upscaler")).strip_edges().to_lower()
-	if arg == "bilinear":
-		return "bilinear"
-	if arg == "fsr2" or arg.begins_with("fsr2."):
-		return "fsr2"
-	return "fsr1"
+		arg = str(get_value("graphics", "upscaler"))
+	return Upscalers.normalize(arg)
+
+
+## The upscaler in use: "bilinear", "fsr1", "fsr2" (AMD FSR 2.2, Godot 4.7's SCALING_3D_MODE_FSR2), or "fsr4" / "fsr3" /
+## "dlss" once a build can run them. Automatic is picked here (Upscalers.auto_pick), and a vendor upscaler this
+## PC or build can't run draws with FSR 2.2 for the run (FSR 4.1 or DLSS: FSR 3.1
+## when that can run), the saved choice kept (said once in the log).
+static func upscaler_in_effect() -> String:
+	var choice := upscaler_choice()
+	var now := Upscalers.resolve(choice)
+	if Upscalers.VENDOR.has(choice) and now != choice and _upscaler_fallback_said != choice:
+		_upscaler_fallback_said = choice
+		print("Upscaling: %s can't run here (%s): %s this run" % [choice, Upscalers.unavailable_reason(choice), "FSR 3.1" if now == "fsr3" else "FSR 2.2"])
+	return now
+
+
+static var _upscaler_fallback_said := ""
+
+
+## Gives or withdraws the player's OK for NVIDIA's updater (the Upscaling prompt, the Withdraw button): saved, the
+## capabilities asked again (Upscalers.caps follows it), and the window's upscaler applied again, so withdrawing
+## stops DLSS at once (a saved dlss / Automatic then draws with FSR 3.1 / 2.2, the saved choice kept). Streamline,
+## once loaded, stays loaded in the process until Zenith closes; nothing more is asked of it.
+static func set_dlss_consent(yes: bool) -> void:
+	_upscaler_fallback_said = ""
+	set_value("graphics", "dlss_consent", yes)
+	print("Upscaling: the player's OK for NVIDIA's updater %s" % ("given" if yes else "withdrawn"))
+	var tree := Engine.get_main_loop() as SceneTree
+	if tree != null and tree.root != null:
+		apply_window(tree.root)
 
 
 ## The Upscaler sharpness setting (0 softest .. 1 sharpest) as Godot's fsr_sharpness (2 softest .. 0
@@ -1208,7 +1316,8 @@ static func temporal_motion_vectors_enabled() -> bool:
 	return temporal_mv_override != 0 and _read_mv_arg() != 0
 
 
-## Whether temporal AA (TAA or FSR 2.2) is active and MultiMesh motion vectors should be driven.
+## Whether temporal AA (TAA, or a temporal upscaler: FSR 2.2, AMD FSR 4.1/3.1, DLSS) is active and MultiMesh
+## motion vectors should be driven (belt_mv.gd's gate, creatures, robots).
 static func temporal_aa_active(vp: Viewport = null) -> bool:
 	if temporal_mv_override == 0 or _read_mv_arg() == 0:
 		return false
@@ -1219,8 +1328,8 @@ static func temporal_aa_active(vp: Viewport = null) -> bool:
 		if loop is SceneTree:
 			vp = (loop as SceneTree).root
 	if vp != null:
-		return vp.use_taa or vp.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2
-	return taa_on() or fsr2_wanted()
+		return vp.use_taa or temporal_upscaler_active(vp)
+	return taa_on() or temporal_upscaler_wanted()
 
 
 ## Whether the FSR 2.2 belt-surface reactive mask is enabled (`--belt-reactive-mask=off` or `--fsr2-fixes=old` disables).
@@ -1267,30 +1376,55 @@ static func scaling_mode_for(scale_3d: float, upscaler := "") -> Viewport.Scalin
 	match upscaler:
 		"bilinear":
 			return Viewport.SCALING_3D_MODE_BILINEAR
-		"fsr2":
+		"fsr2", "fsr4", "fsr3", "dlss":
+			# fsr4/fsr3/dlss only get here once a build runs them. AMD FSR (FsrHost.can_run) and NVIDIA DLSS
+			# (DlssHost.can_run, only with the player's OK for NVIDIA's updater) draw in the engine hook's own (custom)
+			# mode when they can run this run; otherwise they take FSR 2.2's slot. Orthographic views keep FSR 2.2's
+			# fallback.
 			if camera_orthographic and fsr2_fixes_enabled():
 				return Viewport.SCALING_3D_MODE_FSR if scale_3d < 0.999 else Viewport.SCALING_3D_MODE_BILINEAR
-			return Viewport.SCALING_3D_MODE_FSR2 if scale_3d <= 1.001 else Viewport.SCALING_3D_MODE_BILINEAR
+			if scale_3d > 1.001:
+				return Viewport.SCALING_3D_MODE_BILINEAR
+			if upscaler == "dlss" and DlssHost.can_run():
+				return DlssHost.SCALING_3D_MODE_CUSTOM as Viewport.Scaling3DMode
+			if (upscaler == "fsr4" or upscaler == "fsr3") and FsrHost.can_run():
+				return FsrHost.SCALING_3D_MODE_CUSTOM as Viewport.Scaling3DMode
+			return Viewport.SCALING_3D_MODE_FSR2
 	return Viewport.SCALING_3D_MODE_FSR if scale_3d < 0.999 else Viewport.SCALING_3D_MODE_BILINEAR
 
 
-## Whether the settings (Upscaling, Game render scaling, Resolution) ask for FSR 2.2 right now, which
-## apply_window_scales then sets: Settings > Graphics greys out the anti-aliasing choice for it
-## regardless of temporary orthographic views (F6/F7/Map).
-static func fsr2_wanted() -> bool:
+## Whether the settings (Upscaling, Game render scaling, Resolution) ask for a temporal upscaler (FSR 2.2, AMD
+## FSR Upscaling or DLSS) right now, which apply_window_scales then sets: Settings > Graphics greys out the
+## anti-aliasing choice for it regardless of temporary orthographic views (F6/F7/Map).
+static func temporal_upscaler_wanted() -> bool:
 	var scale_3d := render_scale_for(float(get_value("graphics", "render_scale")), full_screen_ratio())
-	return upscaler_in_effect() == "fsr2" and scale_3d <= 1.001
+	return Upscalers.TEMPORAL.has(upscaler_in_effect()) and scale_3d <= 1.001
 
 
-## Whether FSR 2.2 is the 3D scaling mode of a viewport/window now (the main one without `root`): it takes over
-## anti-aliasing (apply_antialiasing).
-static func fsr2_active(root: Viewport = null) -> bool:
+## The old name of temporal_upscaler_wanted (FSR 2.2 was the only temporal upscaler).
+static func fsr2_wanted() -> bool:
+	return temporal_upscaler_wanted()
+
+
+## True while a vendor upscaler (AMD FSR through FsrHost, NVIDIA DLSS through DlssHost) draws the main window
+## (apply_window_scales sets it).
+static var vendor_upscaler_running := false
+
+
+## Whether a temporal upscaler (FSR 2.2, or a vendor one) is the 3D scaling of a viewport/window now (the main
+## one without `root`): it takes over anti-aliasing (apply_antialiasing) and needs motion vectors.
+static func temporal_upscaler_active(root: Viewport = null) -> bool:
 	if root == null:
 		var tree := Engine.get_main_loop() as SceneTree
 		if tree == null:
 			return false
 		root = tree.root
-	return root != null and root.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2
+	return root != null and (root.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2 or vendor_upscaler_running)
+
+
+## The old name of temporal_upscaler_active.
+static func fsr2_active(root: Viewport = null) -> bool:
+	return temporal_upscaler_active(root)
 
 
 ## The resolution_ratio() in use now: 1 unless the window really is full screen. VR draws for the
@@ -1318,6 +1452,24 @@ static func apply_window_scales(root: Window) -> void:
 	var scale_3d := render_scale_for(float(get_value("graphics", "render_scale")), full_screen_ratio())
 	var mode := scaling_mode_for(scale_3d)
 	var was_fsr2 := root.scaling_3d_mode == Viewport.SCALING_3D_MODE_FSR2
+	var was_vendor := vendor_upscaler_running
+	# AMD FSR / NVIDIA DLSS (custom mode): its host attaches it, which sets the mode; if it can't, FSR 2.2 this run.
+	# Only one of them draws a window: the other is stopped first.
+	var vendor := upscaler_in_effect() if int(mode) == FsrHost.SCALING_3D_MODE_CUSTOM else ""
+	if vendor != "dlss":
+		DlssHost.stop(root)
+	if vendor != "fsr4" and vendor != "fsr3":
+		FsrHost.stop(root)
+	if vendor == "dlss":
+		if not DlssHost.use(root, scale_3d):
+			mode = Viewport.SCALING_3D_MODE_FSR2
+		else:
+			# At most the DLSS mode's own render size (a larger one draws black, DlssHost.fit_scale).
+			scale_3d = DlssHost.fit_scale(root, scale_3d)
+	elif vendor != "":
+		if not FsrHost.use(root, vendor, scale_3d, float(get_value("graphics", "upscaler_sharpness"))):
+			mode = Viewport.SCALING_3D_MODE_FSR2
+	vendor_upscaler_running = FsrHost.running(root) or DlssHost.running(root)
 	if root.scaling_3d_mode != mode:
 		root.scaling_3d_mode = mode
 	if mode == Viewport.SCALING_3D_MODE_FSR or mode == Viewport.SCALING_3D_MODE_FSR2:
@@ -1326,7 +1478,7 @@ static func apply_window_scales(root: Window) -> void:
 			root.fsr_sharpness = sharp
 	if not is_equal_approx(root.scaling_3d_scale, scale_3d):
 		root.scaling_3d_scale = scale_3d
-	if was_fsr2 != (mode == Viewport.SCALING_3D_MODE_FSR2):
+	if was_fsr2 != (mode == Viewport.SCALING_3D_MODE_FSR2) or was_vendor != vendor_upscaler_running:
 		apply_antialiasing(root)
 	else:
 		sync_temporal_uniforms(root)

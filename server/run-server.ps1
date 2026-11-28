@@ -30,7 +30,8 @@ if ($Factorio -eq "") {
     $vdf = Join-Path $steam "steamapps\libraryfolders.vdf"
     if (Test-Path $vdf) {
       foreach ($m in (Select-String -Path $vdf -Pattern '"path"\s+"([^"]+)"').Matches) {
-        $candidates += Join-Path $m.Groups[1].Value.Replace('\\', '\') "steamapps\common\Factorio\bin\x64\factorio.exe"
+        # Plain string joining: Join-Path throws for a library on a drive that is gone (a removed disk).
+        $candidates += $m.Groups[1].Value.Replace('\\', '\').TrimEnd('\') + "\steamapps\common\Factorio\bin\x64\factorio.exe"
       }
     }
   }

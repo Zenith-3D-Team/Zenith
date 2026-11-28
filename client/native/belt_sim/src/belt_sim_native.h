@@ -37,6 +37,7 @@ public:
 	// (handoff) belt_sim.gd's HAND_* and TAKE_REACH.
 	enum Hand { HAND_TAKEN = 0, HAND_READ = 1, HAND_NONE = 2, HAND_PUT = 3, HAND_HAD = 4, HAND_NO_LANE = 5 };
 	static constexpr i64 TAKE_REACH = 160;
+	static constexpr i64 TAKE_REACH_SYNC = 192;
 
 private:
 	struct Line {
@@ -187,11 +188,13 @@ private:
 	// lane; a take after a read as of its tick takes the item that read's _rescue moved (belt_sim.gd's
 	// take_first: _takes_first, _take_rescued; K9). _takes: unit -> takes not made yet, by seq; _rescued: lane
 	// index -> what its last read's _rescue moved.
+	bool take_sync = true;
 	bool take_first = true;
 	static constexpr i64 TAKE_LEAD = 3;
+	static constexpr i64 TAKE_LEAD_SYNC = 5;
 	static constexpr i64 RESCUE_WINDOW = 60;
 	struct PendingTake {
-		i64 seq, at, item, left, hx, hy, ins;
+		i64 seq, at, item, left, hx, hy, ins, unc = 0;
 	};
 	std::unordered_map<i64, std::vector<PendingTake>> _takes;
 	struct Rescued {
@@ -200,7 +203,7 @@ private:
 		std::vector<int32_t> itm, stk;
 		std::vector<uint8_t> fl;  // (rescue_seen) 1: denied (gone at the read), a late take's still; 2: taken
 	};
-	std::unordered_map<int, Rescued> _rescued;
+	std::unordered_map<int, std::vector<Rescued>> _rescued;
 	i64 n_take_read = 0;
 	i64 n_take_rescued = 0;
 	// belt_sim.gd's rescue_seen: a read's _rescue doesn't put an item back into a lane read as of its tick or
@@ -210,6 +213,7 @@ private:
 	// tick of the read being applied (-1: the sim's).
 	bool rescue_seen = true;
 	static constexpr i64 RESCUE_STRIKES = 3;
+	static constexpr i64 EMPTY_SEEN_TICKS = 120;
 	i64 n_rescue_denied = 0;
 	struct Seen {
 		i64 key, tick, place;
@@ -218,7 +222,7 @@ private:
 	std::unordered_map<i64, i64> _strikes;
 	i64 _read_t = -1;
 	void _note_seen(i64 key, i64 t, const std::vector<i64> &items);
-	bool _may_rescue(i64 uid, Line *L, int to, i64 at);
+	bool _may_rescue(i64 uid, Line *L, int to, i64 at, bool feeder = true, bool empty = false, i64 step = 0);
 	void _forget_seen(i64 uid) {
 		if (!_seen.empty()) {
 			_seen.erase(uid);
@@ -242,12 +246,13 @@ private:
 	bool next_named = true;
 	i64 n_take_known = 0;
 	std::unordered_map<i64, std::vector<std::pair<i64, std::vector<i64>>>> _qload;
-	i64 _take_known(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins);
+	i64 _take_known(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins, i64 unc = 0);
 	i64 _take_left(i64 unit, i64 seq, i64 n);
 	void _takes_first(int i, const std::vector<i64> &items);
-	void _note_rescued(int i, Line *L, const std::vector<i64> &P, const std::vector<i64> &before, i64 lo,
-			const std::vector<int> &denied);
-	i64 _take_rescued(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins);
+	void _prune_rescued(int i, const std::vector<i64> &items);
+	void _note_rescued(int i, Line *L, const std::vector<i64> &P, const std::vector<i64> &before, i64 lo, i64 hi,
+			const std::vector<int> &denied, const std::vector<uint8_t> &gone_between, const std::vector<i64> &items);
+	i64 _take_rescued(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins, i64 unc = 0);
 	// Splitter inputs the bridge saw stand as their last read left them (`sh`): lane index -> the tick
 	// from which their items don't cross into the outputs, until the lane's next read (belt_sim.gd's
 	// _in_holds, hold_inputs).
@@ -311,6 +316,7 @@ private:
 	std::vector<int32_t> l_xm, l_ym;  // (handoff) its middle (line position length / 2)
 	std::vector<i64> l_read;  // (handoff) the tick of its newest read applied (-1 none)
 	std::vector<i64> l_seen;  // (rescue_seen) the tick of its newest read, applied or in the batch (-1 none)
+	std::vector<i64> l_empty;  // (rescue_seen) newest tick read/checked empty (-1 none or seen non-empty since)
 	std::vector<int32_t> l_next, l_side, l_side_at, l_sp0, l_sp1, l_line, l_base, l_lpos, l_run;
 	std::vector<uint8_t> l_off, l_alive;
 	std::vector<std::vector<int>> l_feeders, l_sideins;
@@ -381,18 +387,19 @@ private:
 	i64 n_hand[6] = { 0, 0, 0, 0, 0, 0 };
 	double _pj_pos = 0.0;
 	double _pj_d2 = 0.0;
-	void _apply_take(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins);
+	void _apply_take(i64 at, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 ins, i64 unc = 0);
 	struct TakeCand {
 		double d2;
 		i64 uid;
 		int32_t stk;
 		int lane;
 		i64 pos;
+		i64 raw_pos = 0;
 		int src = -1;  // (_take_rescued) the record's lane
 	};
 	std::vector<TakeCand> _tc;  // belt_sim.gd's _tc_u, _tc_s, _tc_l, _tc_p
 	int _tc_lane = -1;
-	i64 _take_cands(i64 at, i64 unit, i64 item, i64 hx, i64 hy, bool ignore_read = false);
+	i64 _take_cands(i64 at, i64 unit, i64 item, i64 hx, i64 hy, bool ignore_read = false, i64 unc = 0);
 	void _apply_put(i64 at, i64 key, i64 uid, i64 item, i64 stack, i64 pos, i64 ins);
 	void _project(int i, double hx, double hy);
 	void _take_one(i64 uid, i64 at);
@@ -655,9 +662,9 @@ public:
 	i64 run_of(i64 key);
 	void put_item(i64 key, i64 uid, i64 item, i64 stack, i64 pos);
 	void take_item(i64 uid, bool gone);
-	void take_at(i64 at_tick, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 inserter);
+	void take_at(i64 at_tick, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 inserter, i64 unc = 0);
 	void put_at(i64 at_tick, i64 key, i64 uid, i64 item, i64 stack, i64 pos, i64 inserter);
-	PackedInt64Array peek_take(i64 at_tick, i64 unit, i64 item, i64 n, i64 hx, i64 hy);
+	PackedInt64Array peek_take(i64 at_tick, i64 unit, i64 item, i64 n, i64 hx, i64 hy, i64 unc = 0);
 	PackedInt64Array get_n_hand() const;
 	void set_n_hand(const PackedInt64Array &a);
 	Dictionary take_changes();
@@ -705,6 +712,8 @@ public:
 	bool get_read_skip_same() const { return read_skip_same; }
 	void set_n_same(i64 v) { n_same = v; }
 	i64 get_n_same() const { return n_same; }
+	void set_take_sync(bool v) { take_sync = v; }
+	bool get_take_sync() const { return take_sync; }
 	void set_take_first(bool v) { take_first = v; }
 	bool get_take_first() const { return take_first; }
 	void set_n_take_read(i64 v) { n_take_read = v; }

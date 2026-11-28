@@ -7,7 +7,8 @@ extends Node3D
 ## open (anim.gd), the rocket rises RISE_DEPTH up the shaft and waits with its nose in the hatch.
 ## On `rk` (a launch was ordered, ui_model.rocket_launched) the engines start, shaking it, their
 ## light and steam coming up through the hatch, and at LIFT_AFTER it climbs at the game's pace out
-## of the shaft, on the jet, with the smoke columns round the hatch and a billow across the ground.
+## of the shaft, on the volumetric plume (rocket_vfx.gd), with fire-lit billowing smoke, sparks,
+## and rim blast wash (`--rocket-vfx=old` restores legacy sprite cards).
 ## The rocket mover the mod sends for that silo (rocket-silo-rocket) is hidden meanwhile, so it
 ## isn't drawn twice. When the character rides that rocket, ride.gd drives it instead (drive()):
 ## its height comes from the game's own flight.
@@ -20,6 +21,7 @@ extends Node3D
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const RocketVfx := preload("res://scripts/world/rocket_vfx.gd")
 
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
@@ -37,6 +39,10 @@ const ENGINE_START := 5.5
 const BLINK_TIME := 3.0
 ## How much further down the rocket is until it rises: its nose under the shut doors.
 const RISE_DEPTH := 7.0
+const RISE_DEPTH_3D := 10.5
+const ELEVATOR_RETURN_TIME := 3.5
+const CLAMP_ENGAGE_TIME := 1.1
+const CLAMP_RELEASE_TIME := 0.55
 ## Seconds after the launch order: the engines start, and the rocket lets go (a pod's
 ## awaiting_launch took about 8 s in 2.1.23: the engine's start and the arms drawing back).
 const IGNITE_AFTER := 0.8
@@ -78,6 +84,7 @@ const CHUNK_HEIGHT := 0.6
 const MATCH_DISTANCE := 1.0
 ## How fast the gap between a chunk's drawn and sent place closes (per second).
 const CHUNK_SETTLE := 6.0
+const WIND := Vector3(0.45, 0.0, 0.15)
 
 var movers  # movers.gd
 ## The surface the world shows (main.gd sets it on `surface`): launches elsewhere aren't drawn here
@@ -93,19 +100,32 @@ var fx      # fx.gd: its sprites and sounds; set by main.gd
 ## The cargo pod the character rides in (ride.gd draws it), left alone here.
 var ridden := 0
 
-var _launches: Array = []        # [{"node", "light", "at" (Vector2), "t", "cards"}]
-var _silos := {}                 # silo unit -> {"at", "phase", "since", "keep", "glow", "cards"}, while busy
+var _launches: Array = []        # [{"node", "light", "at" (Vector2), "t", "cards", "plume"}]
+var _silos := {}                 # silo unit -> {"at", "phase", "since", "keep", "glow", "ember", "shock", "steam_t", "cards"}
 var _pods := {}                  # unit -> {"state", "t"}
 var _chunk_meshes := {}          # chunk name -> MultiMeshInstance3D
 var _chunks_msec := 0            # when the chunks drawn now were sent (Time.get_ticks_msec)
+var _vfx: RocketVfx
 
 
 func _ready() -> void:
 	# Asked for now, read on a worker thread: made here at a launch it took 36-48 ms in that frame
 	# on the owner's save (its silos launch on their own).
 	ModelLibrary.ready("rocket-silo-rocket")
-	model.rocket_launched.connect(_on_launch)
-	model.asteroid_chunks_changed.connect(_on_chunks)
+	_ensure_vfx()
+	if model != null:
+		model.rocket_launched.connect(_on_launch)
+		model.asteroid_chunks_changed.connect(_on_chunks)
+
+
+func _ensure_vfx() -> RocketVfx:
+	if not ModelLibrary.rocket_vfx_enhanced:
+		return null
+	if _vfx == null:
+		_vfx = RocketVfx.new()
+		_vfx.name = "RocketVfx"
+		add_child(_vfx)
+	return _vfx
 
 
 func reset() -> void:
@@ -120,6 +140,8 @@ func reset() -> void:
 	_pods.clear()
 	_rocket_start.clear()
 	_rocket_hidden.clear()
+	if _vfx != null:
+		_vfx.reset()
 	for mm in _chunk_meshes.values():
 		(mm as MultiMeshInstance3D).multimesh.visible_instance_count = 0
 
@@ -159,6 +181,17 @@ func _launch_at(at: Vector2) -> Dictionary:
 	return {}
 
 
+func _hole_pos(at: Vector2) -> Vector2:
+	if not ModelLibrary.rocket_vfx_enhanced:
+		return at
+	var spec := ModelLibrary.silo_hole_spec("rocket-silo")
+	return at + Vector2(spec.x, spec.y)
+
+
+func _hole_radius() -> float:
+	return ModelLibrary.silo_hole_spec("rocket-silo").z
+
+
 # --- rockets ----------------------------------------------------------------------------------
 
 ## How much of the engine's start is done `t` seconds after the launch was ordered, 0 to 1.
@@ -191,8 +224,9 @@ func _start_launch(at: Vector2, launch_surface: String) -> Dictionary:
 	# Only out of a silo the world has: `rk` comes for every silo the force has, wherever it stands.
 	if movers != null and movers.world != null and not movers.world.has_near("rocket-silo", at, SILO_REACH):
 		return {}
+	var hole := _hole_pos(at)
 	var root := Node3D.new()
-	root.position = Vector3(at.x, -Visuals.ROCKET_SINK, at.y)
+	root.position = Vector3(hole.x, -Visuals.ROCKET_SINK, hole.y)
 	var body := MeshInstance3D.new()
 	body.mesh = ModelLibrary.mesh_for("rocket-silo-rocket") if ModelLibrary.ready("rocket-silo-rocket") else null
 	if body.mesh == null:  # no model (or not read yet): a white rocket of the right size
@@ -202,15 +236,18 @@ func _start_launch(at: Vector2, launch_surface: String) -> Dictionary:
 		c.height = 12.0
 		body.mesh = c
 		# Its plain material isn't lifted onto an add-on's hills, as the model's is: lifted here.
-		body.position.y = 6.0 + GroundHeight.at(at.x, at.y)
+		body.position.y = 6.0 + GroundHeight.at(hole.x, hole.y)
 	root.add_child(body)
+	var vfx := _ensure_vfx()
+	var plume: RocketVfx.PlumeRig = vfx.attach_plume(root) if vfx != null else null
 	var light := OmniLight3D.new()
-	light.light_color = Color(1.0, 0.65, 0.3)
-	light.omni_range = 30.0  # base_engine_light's and glow_light's size
+	light.light_color = Color(1.0, 0.68, 0.32)
+	light.omni_range = 46.0 if vfx != null else 30.0
 	light.light_energy = 0.0
 	add_child(root)
 	add_child(light)
-	var l := {"node": root, "light": light, "at": at, "t": 0.0, "cards": {}, "steam": 0.0, "billow": 0.0, "trail": 0.0,
+	var l := {"node": root, "light": light, "plume": plume, "at": at, "t": 0.0, "cards": {},
+		"steam": 0.0, "billow": 0.0, "trail": 0.0, "sparks": 0.0, "clamps": false, "lifted": false,
 		"ground": 0.0, "hills": -1}
 	_launches.append(l)
 	_sound("base/sound/silo-clamps-off", at, 0.8)
@@ -271,12 +308,14 @@ func _sound(prefix: String, at: Vector2, volume: float, reach := 3.0) -> void:
 
 func _update_launches(delta: float) -> void:
 	var done: Array = []
+	var vfx := _ensure_vfx()
 	for l in _launches:
 		l["t"] = float(l["t"]) + delta
 		var t: float = l["t"]
 		var root: Node3D = l["node"]
 		var light: OmniLight3D = l["light"]
 		var at: Vector2 = l["at"]
+		var hole := _hole_pos(at)
 		var driven := bool(l.get("driven", false))
 		var ignition := ignition_at(t)
 		var climbed := climb_at(t - LIFT_AFTER)
@@ -285,25 +324,40 @@ func _update_launches(delta: float) -> void:
 			climbed = float(l["h"])
 			l["seen"] = float(l["seen"]) + delta
 		var y := -Visuals.ROCKET_SINK + climbed
-		# The engines shake it in its clamps, less as it gets away.
-		var shake := 0.04 * ignition * (1.0 - clampf(climbed / 40.0, 0.0, 1.0))
-		root.position = Vector3(at.x + sin(t * 53.0) * shake, y, at.y + cos(t * 47.0) * shake)
-		var flicker := 0.85 + 0.15 * sin(t * 37.0)
+		# Mechanical hold-down shudder and liftoff vibration, fading as the rocket clears the tower.
+		var shake_amp := (0.045 * ignition + 0.025 * ignition * ignition) * (1.0 - clampf(climbed / 45.0, 0.0, 1.0))
+		var sx := (sin(t * 53.0) * 0.7 + cos(t * 19.0) * 0.3) * shake_amp
+		var sz := (cos(t * 47.0) * 0.7 + sin(t * 23.0) * 0.3) * shake_amp
+		root.position = Vector3(hole.x + sx, y, hole.y + sz)
+		var flicker := 0.85 + 0.10 * sin(t * 37.0) + 0.05 * cos(t * 71.0)
 		(root.get_child(0) as MeshInstance3D).set_instance_shader_parameter("f3d_glow", ignition)  # rocket-static-emission
 		# Until the engines are out of the shaft their light comes up through the hatch.
 		var glow_y := maxf(y, HATCH_GLOW_HEIGHT)
-		light.position = Vector3(at.x, glow_y + _ground(l), at.y)
-		light.light_energy = 6.0 * ignition * flicker
-		var far := 1.0 - clampf((climbed - 120.0) / 120.0, 0.0, 1.0)
+		light.position = Vector3(hole.x, glow_y + _ground(l), hole.y)
+		var far := 1.0 - clampf((climbed - 120.0) / 140.0, 0.0, 1.0)
 		var cards: Dictionary = l["cards"]
-		_held(cards, "jet", "rocket-jet", Vector3(at.x, y - 2.6, at.y), 6.5 + clampf(climbed / 20.0, 0.0, 2.5), ignition * flicker, Color.WHITE, JET_FPS)
-		_held(cards, "glare", "rocket-glare", Vector3(at.x, glow_y, at.y), 15.0, 0.75 * ignition * far * flicker)
-		_smoke_columns(cards, at, y, climbed)
-		_exhaust(l, delta, at, y, ignition, climbed)
+		if vfx != null:
+			light.light_energy = (14.0 if climbed > 0.1 else 8.0) * ignition * far * flicker
+			var plume: RocketVfx.PlumeRig = l.get("plume")
+			vfx.update_plume(plume, ignition, climbed, flicker)
+			_held(cards, "glare", "rocket-glare", Vector3(hole.x, glow_y, hole.y), lerpf(12.0, 18.0, ignition), 0.55 * ignition * far * flicker)
+			_exhaust_vfx(vfx, l, delta, hole, y, ignition, climbed)
+		else:
+			light.light_energy = 6.0 * ignition * flicker
+			_held(cards, "jet", "rocket-jet", Vector3(at.x, y - 2.6, at.y), 6.5 + clampf(climbed / 20.0, 0.0, 2.5), ignition * flicker, Color.WHITE, JET_FPS)
+			_held(cards, "glare", "rocket-glare", Vector3(at.x, glow_y, at.y), 15.0, 0.75 * ignition * far * flicker)
+			_smoke_columns(cards, at, y, climbed)
+			_exhaust_legacy(l, delta, at, y, ignition, climbed)
 		var silo := _silo_at(at)
 		if not silo.is_empty():
-			silo["glow"] = ignition * (1.0 - clampf(climbed / 60.0, 0.0, 1.0))
+			var shaft_heat := ignition * (1.0 - clampf(climbed / 48.0, 0.0, 1.0))
+			silo["glow"] = shaft_heat
+			silo["ember"] = maxf(float(silo.get("ember", 0.0)), shaft_heat * 0.9)
 			silo["keep"] = DOOR_TIME + 0.5
+			if vfx != null and not bool(l.get("lifted", false)) and climbed > 0.05:
+				l["lifted"] = true
+				silo["shock"] = 0.01
+				_liftoff_surge(vfx, hole, y)
 		if not bool(l.get("roared", false)) and ignition > 0.4:
 			l["roared"] = true
 			_sound("base/sound/entity/silo-rocket-takeoff/silo-rocket", at, 1.0, 6.0)  # audible_distance_modifier
@@ -318,11 +372,106 @@ func _update_launches(delta: float) -> void:
 		_launches.erase(l)
 
 
-## Factorio's smoke columns (rocket_smoke_top1-3, bottom1-2), which come in once the rocket is 4.5 to
-## 7.5 tiles on its way and thin out as it goes. I24: Factorio shifts them from the rocket's own
-## position, so they ride up with it round its tail; standing on the ground (as before) they hung
-## beside the middle of the rising rocket. Each hangs from just above the nozzle (`y`, the rocket's
-## base) down; the ground's clouds are _exhaust()'s billow, which stays at the silo.
+## Act 3 & Act 4 volumetric smoke, pyroclastic ground doughnut, sparks, and contrail.
+func _exhaust_vfx(vfx: RocketVfx, l: Dictionary, delta: float, hole: Vector2, y: float, ignition: float, climbed: float) -> void:
+	if not FxSettings.effects_enabled:
+		return
+	var t: float = l["t"]
+	# Act 3a: Hold-down clamp release steam burst right after launch command.
+	if not bool(l.get("clamps", false)) and t >= 0.15:
+		l["clamps"] = true
+		var r := _hole_radius()
+		for k in 14:
+			var ang := float(k) / 14.0 * TAU + randf_range(-0.1, 0.1)
+			var dir := Vector2.from_angle(ang)
+			vfx.emit_smoke(
+				Vector3(hole.x + dir.x * r * 0.9, 0.55, hole.y + dir.y * r * 0.9),
+				Vector3(dir.x * randf_range(2.2, 4.2), randf_range(3.0, 5.5), dir.y * randf_range(2.2, 4.2)),
+				randf_range(1.1, 1.7), randf_range(3.6, 5.2), randf_range(2.0, 3.2),
+				Color(0.92, 0.94, 0.98, 0.55), 0.0, 1.3, 0.9, 0.5)
+	if ignition <= 0.04:
+		return
+	# Act 3b: Igniter & engine spark eruption from the shaft and climbing nozzle.
+	if y < 90.0:
+		var spark_rate := 55.0 * ignition if y < 8.0 else 32.0 * ignition
+		l["sparks"] = float(l["sparks"]) + delta * spark_rate
+		while float(l["sparks"]) >= 1.0:
+			l["sparks"] = float(l["sparks"]) - 1.0
+			var ang := randf() * TAU
+			var dir := Vector2.from_angle(ang)
+			var in_pit := y < 2.0
+			var spawn := Vector3(hole.x + dir.x * randf_range(0.2, 1.8), 0.35 if in_pit else maxf(y - 0.6, 0.4), hole.y + dir.y * randf_range(0.2, 1.8))
+			var spd := randf_range(7.0, 19.0)
+			var vy := randf_range(9.0, 21.0) if in_pit else randf_range(-16.0, -4.0)
+			var col := Color(1.0, randf_range(0.55, 0.92), randf_range(0.15, 0.45), 1.0)
+			vfx.emit_spark(spawn, Vector3(dir.x * spd, vy, dir.y * spd), randf_range(0.45, 1.1), col, randf_range(0.12, 0.22), 0.65)
+	# Act 3c: Pre-liftoff steam + fire-lit shaft exhaust pushing out of the hatch.
+	if y < 0.0:
+		l["steam"] = float(l["steam"]) + delta * 28.0 * ignition
+		while float(l["steam"]) >= 1.0:
+			l["steam"] = float(l["steam"]) - 1.0
+			var off := Vector2.from_angle(randf() * TAU) * randf_range(0.3, 2.3)
+			var heat := clampf((ignition - 0.2) * 1.1, 0.0, 0.95)
+			vfx.emit_smoke(
+				Vector3(hole.x + off.x, 0.45, hole.y + off.y),
+				Vector3(off.x * 1.4, randf_range(3.5, 7.5), off.y * 1.4) + WIND,
+				randf_range(1.6, 2.5), randf_range(5.0, 7.8), randf_range(2.4, 3.8),
+				Color(0.84, 0.82, 0.80, 0.65), heat, 0.9, 1.1, 0.6)
+	# Act 3d / 4a: Massive 360-degree ground-hugging fire-lit pyroclastic smoke doughnut.
+	if y > -10.0 and climbed < 75.0:
+		var billow_rate := 68.0 * (0.45 + 0.55 * ignition) * (1.0 - clampf((climbed - 45.0) / 30.0, 0.0, 1.0))
+		l["billow"] = float(l["billow"]) + delta * billow_rate
+		while float(l["billow"]) >= 1.0:
+			l["billow"] = float(l["billow"]) - 1.0
+			var dir := Vector2.from_angle(randf() * TAU)
+			var speed := randf_range(7.5, 19.5) * (0.65 + 0.35 * ignition)
+			var heat := clampf(ignition * (1.0 - clampf((climbed - 15.0) / 45.0, 0.0, 1.0)), 0.15, 1.0)
+			var tint := Color(0.68, 0.65, 0.62, 0.72)
+			vfx.emit_smoke(
+				Vector3(hole.x + dir.x * 2.1, 0.65, hole.y + dir.y * 2.1),
+				Vector3(dir.x * speed, randf_range(0.6, 3.4), dir.y * speed) + WIND * 1.5,
+				randf_range(2.2, 3.4), randf_range(8.5, 13.0), randf_range(3.6, 6.2),
+				tint, heat, 1.35, 0.45, 0.5)
+	# Act 4b: Towering ascending fire-lit smoke contrail behind the climbing rocket.
+	if y > -1.0 and climbed < 220.0:
+		var trail_rate := 42.0 * (1.0 - clampf((climbed - 150.0) / 70.0, 0.0, 1.0))
+		l["trail"] = float(l["trail"]) + delta * trail_rate
+		while float(l["trail"]) >= 1.0:
+			l["trail"] = float(l["trail"]) - 1.0
+			var jitter := Vector2.from_angle(randf() * TAU) * randf_range(0.0, 1.1)
+			var tail_y := maxf(y - randf_range(2.0, 5.5), 0.6)
+			var heat := clampf(0.95 - climbed / 190.0, 0.25, 0.95)
+			vfx.emit_smoke(
+				Vector3(hole.x + jitter.x, tail_y, hole.y + jitter.y),
+				Vector3(jitter.x * 2.2, randf_range(-6.5, -2.5), jitter.y * 2.2) + WIND * 2.5,
+				randf_range(2.0, 3.2), randf_range(7.5, 12.0), randf_range(5.5, 9.5),
+				Color(0.82, 0.80, 0.78, 0.68), heat, 0.75, 0.35, 0.35)
+
+
+func _liftoff_surge(vfx: RocketVfx, hole: Vector2, y: float) -> void:
+	if not FxSettings.effects_enabled:
+		return
+	var r := _hole_radius()
+	for k in 28:
+		var ang := float(k) / 28.0 * TAU + randf_range(-0.08, 0.08)
+		var dir := Vector2.from_angle(ang)
+		var spd := randf_range(12.0, 22.0)
+		vfx.emit_smoke(
+			Vector3(hole.x + dir.x * r * 0.95, 0.7, hole.y + dir.y * r * 0.95),
+			Vector3(dir.x * spd, randf_range(1.2, 4.2), dir.y * spd),
+			randf_range(2.4, 3.6), randf_range(9.5, 13.5), randf_range(4.0, 6.4),
+			Color(0.75, 0.72, 0.68, 0.78), 0.95, 1.4, 0.55, 0.55)
+	for k in 36:
+		var ang := randf() * TAU
+		var dir := Vector2.from_angle(ang)
+		var spd := randf_range(9.0, 24.0)
+		vfx.emit_spark(
+			Vector3(hole.x + dir.x * 1.4, maxf(y, 0.5), hole.y + dir.y * 1.4),
+			Vector3(dir.x * spd, randf_range(8.0, 22.0), dir.y * spd),
+			randf_range(0.6, 1.3), Color(1.0, 0.82, 0.38, 1.0), randf_range(0.14, 0.25), 0.55)
+
+
+## Factorio's smoke columns (rocket_smoke_top1-3, bottom1-2), used only under `--rocket-vfx=old`.
 func _smoke_columns(cards: Dictionary, at: Vector2, y: float, climbed: float) -> void:
 	var alpha := clampf((climbed - SMOKE_FROM) / (SMOKE_FULL - SMOKE_FROM), 0.0, 1.0) * (1.0 - clampf((climbed - 90.0) / 110.0, 0.0, 1.0))
 	if alpha <= 0.0 and cards.is_empty():
@@ -334,9 +483,8 @@ func _smoke_columns(cards: Dictionary, at: Vector2, y: float, climbed: float) ->
 		_held(cards, "smoke%d" % i, "rocket-smoke", Vector3(at.x + spot.x, y + SMOKE_TOP - width * 1.79, at.y + spot.z), width, alpha, SMOKE_TINT, SMOKE_FPS)
 
 
-## Steam out of the hatch while the engines start, a billow across the ground as the exhaust comes
-## out of the shaft, then a trail behind the rocket. Factorio's smoke sheet on each.
-func _exhaust(l: Dictionary, delta: float, at: Vector2, y: float, ignition: float, climbed: float) -> void:
+## Legacy Factorio sprite smoke under `--rocket-vfx=old`.
+func _exhaust_legacy(l: Dictionary, delta: float, at: Vector2, y: float, ignition: float, climbed: float) -> void:
 	var sprites: Node = _sprites()
 	if sprites == null or ignition <= 0.05:
 		return
@@ -412,22 +560,53 @@ func _silo_at(at: Vector2) -> Dictionary:
 func _watch(unit: int, at: Vector2) -> Dictionary:
 	var s: Dictionary = _silos.get(unit, {})
 	if s.is_empty():
-		s = {"unit": unit, "at": at, "phase": 0, "since": 0.0, "keep": DOOR_TIME + 0.5, "glow": 0.0, "cards": {}}
+		var cur_phase := int(movers.world.working.get(unit, 0)) if movers != null and movers.world != null else 0
+		var up_now := cur_phase == SILO_UP
+		var launching := _launch_near(at)
+		s = {"unit": unit, "at": at, "phase": cur_phase, "since": 0.0, "keep": DOOR_TIME + 0.5,
+			"glow": 0.0, "ember": 0.0, "shock": 0.0, "steam_t": 0.0,
+			"lift": 1.0 if up_now else 0.0, "clamps": 1.0 if (up_now and not launching) else 0.0,
+			"work": 0.0, "rise_p": 1.0 if up_now else 0.0, "cards": {}}
 		_silos[unit] = s
 	return s
 
 
-## What a busy silo shows besides its doors (anim.gd): the shaft's walls under them, lit by the
-## engines, and the red lights blinking round the hatch before the doors move.
+func _sync_world_silos() -> void:
+	var vfx := _ensure_vfx()
+	if vfx == null or movers == null or movers.world == null:
+		return
+	var pos_map: Variant = movers.world.get("silo_positions")
+	if not (pos_map is Dictionary):
+		return
+	var map_dict: Dictionary = pos_map
+	var wanted := {}
+	var spec := ModelLibrary.silo_hole_spec("rocket-silo")
+	var off := Vector2(spec.x, spec.y)
+	for unit_var: Variant in map_dict:
+		var unit := int(unit_var)
+		var pos: Vector2 = map_dict[unit_var]
+		wanted[unit] = pos + off
+		if int(movers.world.working.get(unit, 0)) >= SILO_OPENING and not _silos.has(unit):
+			_watch(unit, pos)
+	vfx.sync_shafts(wanted, spec.z)
+
+
+## What a busy silo shows besides its doors (anim.gd): the shaft's walls under them, elevator
+## cradle & clamp arms during reload, engine firelight, red alarm lights, and post-launch steam.
 func _update_silos(delta: float) -> void:
+	var vfx := _ensure_vfx()
 	var gone: Array = []
 	for unit: int in _silos:
 		var s: Dictionary = _silos[unit]
 		var at: Vector2 = s["at"]
+		var hole := _hole_pos(at)
 		var phase := int(movers.world.working.get(unit, 0)) if movers != null and movers.world != null else 0
-		if phase != int(s["phase"]):
-			if phase >= SILO_OPENING or int(s["phase"]) >= SILO_OPENING:
+		var prev_phase := int(s["phase"])
+		if phase != prev_phase:
+			if phase >= SILO_OPENING or prev_phase >= SILO_OPENING:
 				_phase_sound(phase, at)
+			if phase == SILO_RISING and prev_phase < SILO_RISING:
+				s["rise_p"] = 0.0
 			s["phase"] = phase
 			s["since"] = 0.0
 		s["since"] = float(s["since"]) + delta
@@ -437,19 +616,103 @@ func _update_silos(delta: float) -> void:
 		if float(s["keep"]) <= 0.0:
 			gone.append(unit)
 			continue
-		var cards: Dictionary = s["cards"]
-		var ground := Vector3(at.x, SHAFT_HEIGHT, at.y)
-		_held(cards, "hole", "silo-hole", ground, SHAFT_WIDTH, 1.0)
-		_held(cards, "light", "silo-hole-light", ground + Vector3(0.0, 0.01, 0.0), SHAFT_WIDTH, float(s["glow"]))
+		var launching := _launch_near(at)
+		if not launching:
+			s["glow"] = move_toward(float(s["glow"]), 0.0, delta * 2.5)
+		var lift := float(s.get("lift", 0.0))
+		var clamps := float(s.get("clamps", 0.0))
+		var work_goal := 0.0
+		match phase:
+			SILO_OPENING:
+				lift = move_toward(lift, 0.0, delta / ELEVATOR_RETURN_TIME)
+				clamps = move_toward(clamps, 0.0, delta / CLAMP_RELEASE_TIME)
+				if float(s["since"]) > 0.6:
+					work_goal = 0.55
+			SILO_RISING:
+				var rp := clampf(float(s.get("rise_p", 0.0)) + delta / RISE_TIME, 0.0, 1.0)
+				s["rise_p"] = rp
+				lift = rp * rp * (3.0 - 2.0 * rp)
+				clamps = move_toward(clamps, 0.0, delta / CLAMP_RELEASE_TIME)
+				work_goal = 1.0
+			SILO_UP:
+				if not launching:
+					lift = move_toward(lift, 1.0, delta / 1.5)
+					if lift >= 0.96:
+						clamps = move_toward(clamps, 1.0, delta / CLAMP_ENGAGE_TIME)
+					else:
+						clamps = move_toward(clamps, 0.0, delta / CLAMP_RELEASE_TIME)
+					if clamps < 0.95:
+						work_goal = 0.45
+				else:
+					clamps = move_toward(clamps, 0.0, delta / CLAMP_RELEASE_TIME)
+			SILO_CLOSING:
+				lift = move_toward(lift, 0.0, delta / ELEVATOR_RETURN_TIME)
+				clamps = move_toward(clamps, 0.0, delta / CLAMP_RELEASE_TIME)
+			_:
+				if not launching:
+					lift = move_toward(lift, 0.0, delta / ELEVATOR_RETURN_TIME)
+				clamps = move_toward(clamps, 0.0, delta / CLAMP_RELEASE_TIME)
+		s["lift"] = lift
+		s["clamps"] = clamps
+		var work_glow := move_toward(float(s.get("work", 0.0)), work_goal, delta * 2.2)
+		s["work"] = work_glow
+		var glow := float(s["glow"])
+		var ember := move_toward(float(s.get("ember", 0.0)), 0.0, delta * 0.14)
+		s["ember"] = ember
+		var shock := float(s.get("shock", 0.0))
+		if shock > 0.0 and shock < 1.0:
+			shock = minf(shock + delta / 0.65, 1.0)
+			if shock >= 1.0:
+				shock = 0.0
+			s["shock"] = shock
 		var blink := 0.0
 		if phase == SILO_OPENING or phase == SILO_CLOSING:
 			blink = 0.5 + 0.5 * sin(float(s["since"]) * TAU / BLINK_TIME - PI / 2.0)
-		for i in RED_LIGHTS.size():
-			var spot: Vector2 = RED_LIGHTS[i]
-			_held(cards, "red%d" % i, "silo-light", Vector3(at.x + spot.x, RED_LIGHT_HEIGHT, at.y + spot.y), 1.2, blink)
+		elif glow > 0.05:
+			blink = 0.5 + 0.5 * sin(float(s["since"]) * TAU / 0.45)
+		if vfx != null:
+			var shaft := vfx.ensure_shaft(unit, hole, _hole_radius())
+			var pit_col := Color(1.0, 0.55, 0.18).lerp(Color(1.0, 0.14, 0.08), clampf((1.0 - glow) * blink, 0.0, 1.0))
+			var pit_energy := maxf(glow * 12.0, maxf(ember * 2.5, blink * 1.4))
+			if pit_energy < work_glow * 2.4:
+				pit_energy = work_glow * 2.4
+				pit_col = Color(1.0, 0.76, 0.42)
+			vfx.update_shaft(shaft, glow, ember, blink, shock, pit_energy, pit_col, glow * 0.95, lift, clamps, work_glow)
+			if FxSettings.effects_enabled:
+				for i in RED_LIGHTS.size():
+					var spot: Vector2 = RED_LIGHTS[i]
+					vfx.queue_beacon(Vector3(hole.x + spot.x, RED_LIGHT_HEIGHT, hole.y + spot.y), blink)
+				_silo_ambient_steam(vfx, s, delta, hole, phase, glow, ember)
+		else:
+			var cards: Dictionary = s["cards"]
+			var ground := Vector3(at.x, SHAFT_HEIGHT, at.y)
+			_held(cards, "hole", "silo-hole", ground, SHAFT_WIDTH, 1.0)
+			_held(cards, "light", "silo-hole-light", ground + Vector3(0.0, 0.01, 0.0), SHAFT_WIDTH, glow)
+			for i in RED_LIGHTS.size():
+				var spot: Vector2 = RED_LIGHTS[i]
+				_held(cards, "red%d" % i, "silo-light", Vector3(at.x + spot.x, RED_LIGHT_HEIGHT, at.y + spot.y), 1.2, blink)
 	for unit in gone:
 		_drop_cards(_silos[unit]["cards"])
 		_silos.erase(unit)
+		if vfx != null:
+			var s_gone: RocketVfx.SiloShaft = vfx.get_shaft(int(unit))
+			if s_gone != null:
+				vfx.update_shaft(s_gone, 0.0, 0.0, 0.0, 0.0, 0.0, Color(1.0, 0.55, 0.18), 0.0, 0.0, 0.0, 0.0)
+
+
+func _silo_ambient_steam(vfx: RocketVfx, s: Dictionary, delta: float, hole: Vector2, phase: int, glow: float, ember: float) -> void:
+	if glow > 0.05:
+		return
+	if phase == SILO_CLOSING and ember > 0.05:
+		s["steam_t"] = float(s.get("steam_t", 0.0)) + delta * 4.5 * ember
+		while float(s["steam_t"]) >= 1.0:
+			s["steam_t"] = float(s["steam_t"]) - 1.0
+			var off := Vector2.from_angle(randf() * TAU) * randf_range(0.2, 1.6)
+			vfx.emit_smoke(
+				Vector3(hole.x + off.x, 0.4, hole.y + off.y),
+				Vector3(off.x * 0.4, randf_range(1.8, 3.4), off.y * 0.4) + WIND,
+				randf_range(1.1, 1.7), randf_range(3.4, 5.2), randf_range(2.4, 3.6),
+				Color(0.86, 0.85, 0.84, 0.42), ember * 0.35, 0.8, 0.55, 0.35)
 
 
 func _phase_sound(phase: int, at: Vector2) -> void:
@@ -650,16 +913,30 @@ func _place_chunks() -> void:
 
 
 func _process(delta: float) -> void:
+	_sync_world_silos()
 	_update_launches(delta)
 	_update_silos(delta)
 	_update_pods(delta)
 	_hide_flying_rockets()
 	_place_chunks()
+	if _vfx != null:
+		var sprites: Variant = fx.get("sprites") if fx != null else null
+		if sprites != null:
+			_vfx.night = float(sprites.get("night"))
+		_vfx.step(delta)
 
 
 ## The game's own rocket moves north across the map once it lifts off (Factorio draws its height
 ## that way); our launch draws the flight, so a rocket mover that has moved is hidden (H2: rockets
 ## slid across the ground away from their silos).
+func _silo_pos(silo_unit: int, fallback: Vector2) -> Vector2:
+	if silo_unit != 0 and movers != null and movers.world != null:
+		var pos_map: Variant = movers.world.get("silo_positions")
+		if pos_map is Dictionary and (pos_map as Dictionary).has(silo_unit):
+			return (pos_map as Dictionary)[silo_unit] as Vector2
+	return fallback
+
+
 func _hide_flying_rockets() -> void:
 	if movers == null:
 		return
@@ -671,15 +948,23 @@ func _hide_flying_rockets() -> void:
 		var at := Vector2(node.position.x, node.position.z)
 		if not _rocket_start.has(unit):
 			_rocket_start[unit] = at
-		if at.distance_to(_rocket_start[unit]) > 0.5 or not _on_silo(unit, at):
+		var on_silo := _on_silo(unit, at)
+		var silo_unit := int((_rocket_silo.get(unit, [0, 0]) as Array)[0])
+		var silo_at := _silo_pos(silo_unit, at)
+		var flying_away := (not on_silo) or _launch_near(silo_at) or at.distance_to(silo_at) > 4.8 or at.y < silo_at.y - 3.6
+		if flying_away:
 			node.visible = false
 			_rocket_hidden[unit] = true
-		elif _rocket_hidden.has(unit) and not _launch_near(at) and not movers.is_fogged(unit):
-			# Its silo's chunk came after it: the rocket was standing in a silo all along.
+		elif _rocket_hidden.has(unit) and not movers.is_fogged(unit):
+			# Its silo's chunk came after it (or reload brought it back inside the silo).
 			_rocket_hidden.erase(unit)
 			node.visible = true
 		if node.visible:
-			node.position.y = _waiting_height(unit, at)
+			node.position.y = _waiting_height(silo_unit, silo_at)
+			if ModelLibrary.rocket_vfx_enhanced:
+				var hole := _hole_pos(silo_at)
+				node.position.x = hole.x
+				node.position.z = hole.y
 	for unit in _rocket_start.keys():
 		if not seen.has(unit):
 			_rocket_start.erase(unit)
@@ -694,14 +979,15 @@ func _launch_near(at: Vector2) -> bool:
 	return false
 
 
-## How high a rocket in its silo is drawn: down the shaft until the doors are open, then rising to
-## where it waits.
-func _waiting_height(unit: int, at: Vector2) -> float:
-	var silo_unit := int((_rocket_silo.get(unit, [0, 0]) as Array)[0])
+## How high a rocket in its silo is drawn: down the shaft until the doors are open, then rising
+## smoothly on the elevator cradle to its waiting pad position.
+func _waiting_height(silo_unit: int, silo_at: Vector2) -> float:
 	if silo_unit == 0:
 		return -Visuals.ROCKET_SINK
-	var s := _watch(silo_unit, at)
+	var s := _watch(silo_unit, silo_at)
 	s["keep"] = DOOR_TIME + 0.5
+	if ModelLibrary.rocket_vfx_enhanced:
+		return -Visuals.ROCKET_SINK - RISE_DEPTH_3D * (1.0 - float(s.get("lift", 0.0)))
 	var risen := 1.0
 	match int(s["phase"]):
 		SILO_OPENING:

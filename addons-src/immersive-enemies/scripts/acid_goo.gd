@@ -91,18 +91,28 @@ func _native_on() -> bool:
 
 
 func _is_acid_stream(proto: String) -> bool:
-	return proto.begins_with("acid-stream-spitter-") or proto.begins_with("acid-stream-worm-")
+	return (
+		proto.begins_with("acid-stream-spitter-")
+		or proto.begins_with("acid-stream-worm-")
+		or proto.ends_with("-acid-stream-stomper")
+	)
 
 
 func _is_acid_pool(proto: String) -> bool:
-	return proto.begins_with("acid-splash-fire-spitter-") or proto.begins_with("acid-splash-fire-worm-")
+	return (
+		proto.begins_with("acid-splash-fire-spitter-")
+		or proto.begins_with("acid-splash-fire-worm-")
+		or proto.ends_with("-acid-splash-fire-stomper")
+	)
 
 
 func _tier_scale(proto: String) -> float:
+	var stomper_mul := 1.18 if proto.ends_with("-stomper") else 1.0
 	for k in TIER_SCALE:
-		if proto.ends_with("-" + str(k)):
-			return float(TIER_SCALE[k])
-	return 1.0
+		var ks := str(k)
+		if proto.ends_with("-" + ks) or proto.begins_with(ks + "-"):
+			return float(TIER_SCALE[k]) * stomper_mul
+	return 1.0 * stomper_mul
 
 
 func on_stream_event(info: Dictionary) -> void:

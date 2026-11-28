@@ -301,7 +301,8 @@ func _entries(trains: Array) -> Array:
 			counts[n] = int(counts.get(n, 0)) + 1
 	if tab == "Stations":
 		for n in _stop_names():
-			if not counts.has(n):
+			# A station with no train in view is listed only when it matches the search too.
+			if not counts.has(n) and (search == "" or str(n).to_lower().contains(search)):
 				counts[n] = 0
 	var names := counts.keys()
 	names.sort()
@@ -522,7 +523,11 @@ static func state_text(t: Dictionary) -> String:
 		"no_schedule":
 			return "No schedule"
 		"no_path":
-			return "No path"
-		"manual_control", "manual_control_stop":
-			return "Manual"
+			return "No path to %s" % stop if stop != "" else "No path"
+		"destination_full":
+			return "Destination full %s" % stop if stop != "" else "Destination full"
+		"manual_control":
+			return "Manually driving"
+		"manual_control_stop":
+			return "Manually stopped"
 	return state.replace("_", " ").capitalize()

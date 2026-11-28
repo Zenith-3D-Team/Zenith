@@ -48,6 +48,8 @@ extends Node
 
 ## A rocket silo's `st`: the doors open from the first (rockets.gd), and the second shuts them.
 const SILO_OPENING := 2
+const SILO_RISING := 3
+const SILO_UP := 4
 const SILO_CLOSING := 5
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
@@ -125,6 +127,10 @@ const GLOW_UP := 0.25
 const GLOW_DOWN := 0.9
 const TURRET_LOOK := 0.15  # seconds between looking for a robot near a roboport
 const CLEANUP_INTERVAL := 5.0
+## The cleanup's script time a frame: a pass over the states of entities gone walks this long a frame
+## until it has seen them all (`--anim-sweep=old`: all of them in one frame, as before; with tens of
+## thousands of states that was a 4-6 ms frame every five seconds).
+const SWEEP_USEC := 200
 ## Roboports: doors open (slide this many tiles) while a robot is this close; how fast they move.
 const DOOR_TRAVEL := 0.5
 const DOOR_SPEED := 1.2
@@ -335,8 +341,22 @@ var character_at := Vector2.INF
 ## for probes and tests.
 var writes := 0
 var write_usec := 0
+## Counts the working states the mod reported (state_changed), so signal_lights.gd can tell whether
+## any changed since it last looked.
+var state_serial := 0
 
 var _states := {}  # entity key -> State
+## Every key in _states, in the order they came (only the cleanup and reset take keys out of _states, so
+## each is here once): the spread cleanup walks it from _sweep_at with no copy of the keys.
+var _state_keys: Array = []
+## The spread cleanup's pass: -1 between passes, else the next index into _state_keys; then the
+## wound tables' keys as they were when it reached them (small: worms and spawners loaded).
+var _sweep_at := -1
+var _sweep_wounds: Array = []
+var _sweep_wound_groups: Array = []
+var _sweep_stage := 0
+## `--anim-sweep=old`: the whole cleanup in one frame every CLEANUP_INTERVAL.
+static var sweep_old := Switches.value("--anim-sweep") == "old"
 var _time := 0.0
 var _epoch := 0
 var _migrate: Array = []  # chunk coords whose groups still need moving onto the current clock
@@ -434,6 +454,10 @@ static func custom_for(rec, level: float) -> Color:
 
 func reset() -> void:
 	_states.clear()
+	_state_keys.clear()
+	_sweep_at = -1
+	_sweep_wounds.clear()
+	_sweep_wound_groups.clear()
 	_migrate.clear()
 	arm_working.clear()
 	_arm_units.clear()
@@ -658,12 +682,19 @@ static func setup_part(part: ModelLibrary.AnimPart) -> void:
 		m.set_shader_parameter("anim_open", open)
 		m.set_shader_parameter("anim_flicker", FLICKER.has(kind))
 		m.set_shader_parameter("anim_strike", kind == "lit_strike")
-	if range_hi > range_lo and part.mesh is ArrayMesh:
+		if ModelLibrary.rocket_vfx_enhanced and kind.begins_with("door_silo"):
+			var hole := ModelLibrary.silo_hole_spec(part.model if part.model != "" else "rocket-silo")
+			m.set_shader_parameter("anim_clip_center", Vector3(hole.x, hole.y, hole.z + 0.06))
+		else:
+			m.set_shader_parameter("anim_clip_center", Vector3.ZERO)
+	var aabb_lo := minf(range_lo, range_hi)
+	var aabb_hi := maxf(range_lo, range_hi)
+	if aabb_hi > aabb_lo and part.mesh is ArrayMesh:
 		var rest := part.mesh.get_aabb()
 		var box := rest
 		var steps := 16 if motion == MOTION_SPIN or wave == 2 else 8
 		for s in steps + 1:
-			box = box.merge(part.turned(lerpf(range_lo, range_hi, float(s) / steps)) * rest)
+			box = box.merge(part.turned(lerpf(aabb_lo, aabb_hi, float(s) / steps)) * rest)
 		(part.mesh as ArrayMesh).custom_aabb = box.grow(0.05)
 
 
@@ -843,6 +874,10 @@ func _write(group: Group, i: int, working: Dictionary) -> void:
 			custom = Color(t, 0.0, -(1.0 + (1 if shown else 0) + parity), 1.0)
 		_:  # linear: switches (open while on), hatches, doors, gates, charging lights
 			var st := _state(key)
+			if group.kind == KIND_HATCH and part.kind.begins_with("door_silo") and not st.lin.has(part.kind):
+				var silo_st := int(working.get(unit, 0))
+				if silo_st == SILO_RISING or silo_st == SILO_UP:
+					st.lin[part.kind] = [_time, part.phase, true]
 			var l: Array = _linear(st, part, group.kind == KIND_SWITCH, int(working.get(unit, 0)) == 1)
 			if float(l[0]) < start:
 				l = [start, _amount(l, part, start), l[2]]
@@ -865,6 +900,7 @@ func _state(key) -> State:
 	if st == null:
 		st = State.new()
 		_states[key] = st
+		_state_keys.append(key)
 	return st
 
 
@@ -919,6 +955,7 @@ static func _amount(l: Array, part: ModelLibrary.AnimPart, t: float) -> float:
 func state_changed(rec) -> void:
 	if world == null or rec == null:
 		return
+	state_serial += 1
 	var cv = world.chunks.get(rec.chunk)
 	if cv == null or cv.anim_groups.is_empty():
 		return
@@ -928,6 +965,12 @@ func state_changed(rec) -> void:
 		if group.kind == KIND_GLOW or group.kind == KIND_TIMED or group.kind == KIND_LIT or group.kind == KIND_SWITCH:
 			for i in group.indices_of(rec.key):
 				_write(group, i, working)
+		elif group.kind == KIND_HATCH and group.part != null and group.part.kind.begins_with("door_silo"):
+			for i in group.indices_of(rec.key):
+				var base := group.bases[i]
+				var at := Vector2(base.origin.x, base.origin.z)
+				var near: bool = movers != null and not movers.pick(at, 2.0, ["rocket-silo-rocket"]).is_empty()
+				_set_open(group, i, _state(group.keys[i]), _silo_open(int(group.units[i]), at, near))
 	var spent := Time.get_ticks_usec() - t0
 	write_usec += spent
 	if Probing.on and "prof" in world:
@@ -1042,7 +1085,8 @@ func _process(delta: float) -> void:
 				continue
 			var near := dist <= RADIUS
 			for group: Group in cv.anim_groups:
-				if not near and group.kind != KIND_TURRET:
+				var is_silo_door := group.kind == KIND_HATCH and group.part != null and group.part.kind.begins_with("door_silo")
+				if not near and group.kind != KIND_TURRET and not is_silo_door:
 					continue
 				if group.kind < KIND_WORM or group.kind == KIND_STILL or group.kind == KIND_TIMED or group.kind == KIND_LIT or group.kind == KIND_SWITCH:
 					continue
@@ -1069,19 +1113,88 @@ func _process(delta: float) -> void:
 	_cleanup_timer += delta
 	if _cleanup_timer >= CLEANUP_INTERVAL:
 		_cleanup_timer = 0.0
-		for key in _states.keys():
-			if not world.entities.has(key):
+		if sweep_old:
+			_cleanup_all()
+		elif _sweep_at < 0:
+			_sweep_at = 0
+			_sweep_stage = 0
+	if _sweep_at >= 0:
+		sweep_some(SWEEP_USEC)
+
+
+## Forgets every state, wound and wound group of an entity no longer in the world, in one go
+## (`--anim-sweep=old`).
+func _cleanup_all() -> void:
+	for key in _states.keys():
+		if not world.entities.has(key):
+			_states.erase(key)
+			if turrets != null and key is int:
+				turrets.call("forget", key)
+	if _state_keys.size() != _states.size():
+		_state_keys = _states.keys()
+	if world.get("entities") != null:
+		for unit_var in _wounds.keys():
+			if not world.entities.has(unit_var):
+				_wounds.erase(unit_var)
+		for unit_var in _wound_groups.keys():
+			if not world.entities.has(unit_var):
+				_wound_groups.erase(unit_var)
+
+
+## The spread cleanup: walks on for about `usec` microseconds (0: to the end), forgetting the states,
+## wounds and wound groups of entities no longer in the world, as _cleanup_all does. Whether the pass
+## is still going. A state is checked once per pass; one made during the pass is checked next time.
+func sweep_some(usec: int) -> bool:
+	if _sweep_at < 0 or world == null:
+		_sweep_at = -1
+		return false
+	var t0 := Time.get_ticks_usec()
+	var entities: Dictionary = world.entities
+	var n := 0
+	if _sweep_stage == 0:
+		var i := _sweep_at
+		while i < _state_keys.size():
+			var key = _state_keys[i]
+			if not entities.has(key):
 				_states.erase(key)
 				if turrets != null and key is int:
 					turrets.call("forget", key)
-		if world.get("entities") != null:
-			for unit_var in _wounds.keys():
-				if not world.entities.has(unit_var):
-					_wounds.erase(unit_var)
-			for unit_var in _wound_groups.keys():
-				if not world.entities.has(unit_var):
-					_wound_groups.erase(unit_var)
+				# Swap the last key in: the one at i is checked next (order doesn't matter).
+				_state_keys[i] = _state_keys[-1]
+				_state_keys.pop_back()
+			else:
+				i += 1
+			n += 1
+			if usec > 0 and (n & 15) == 0 and Time.get_ticks_usec() - t0 >= usec:
+				_sweep_at = i
+				return true
+		_sweep_stage = 1
+		_sweep_wounds = _wounds.keys()
+		_sweep_wound_groups = _wound_groups.keys()
+	while not _sweep_wounds.is_empty():
+		var unit_var = _sweep_wounds.pop_back()
+		if not entities.has(unit_var):
+			_wounds.erase(unit_var)
+		n += 1
+		if usec > 0 and (n & 15) == 0 and Time.get_ticks_usec() - t0 >= usec:
+			_sweep_at = 0
+			return true
+	while not _sweep_wound_groups.is_empty():
+		var unit_var = _sweep_wound_groups.pop_back()
+		if not entities.has(unit_var):
+			_wound_groups.erase(unit_var)
+		n += 1
+		if usec > 0 and (n & 15) == 0 and Time.get_ticks_usec() - t0 >= usec:
+			_sweep_at = 0
+			return true
+	_sweep_at = -1
+	_sweep_stage = 0
+	return false
 
+
+## How many entity states it holds (tests and probes).
+func state_count() -> int:
+	return _states.size()
 
 ## Opens or shuts instance i of a linear group, writing it only when that changes.
 func _set_open(group: Group, i: int, st: State, open: bool) -> void:

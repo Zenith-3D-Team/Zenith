@@ -4,6 +4,7 @@ extends RefCounted
 ##   chart   its pixels as an Image (`_img`, the palette indexes `px` dropped there): a chunk's
 ##           1,024 pixels were looked up one by one in GDScript on the main thread (ui_model.gd)
 ##   chunk   its tiles' runs as one id per tile (`_tiles`, a PackedInt32Array; chunk_view.gd)
+##   lod     its tile and entity runs as one value per cell (`_lod`, in C++; lod_data.gd from_msg)
 ## A message whose fields aren't what they should be (the fuzz tests send anything) is left as it
 ## came, and its handler reads it the old way. `--decode-thread=off`: everything on the main thread.
 
@@ -12,6 +13,10 @@ const Switches := preload("res://scripts/switches.gd")
 const CHUNK := 32
 
 static var enabled := Switches.on("--decode-thread")
+## `--native-lod-decode=off`: `lod` left to the main thread's GDScript (lod_data.gd); the parse thread's own
+## WireDecodeNative (stateless, so not shared with the main thread's).
+static var lod_native_enabled := Switches.on("--native-lod-decode")
+static var _lod_native: RefCounted = null
 
 
 ## A datagram's text. The mod's JSON is ASCII but for names and text players typed (UTF-8), so ASCII
@@ -87,6 +92,31 @@ static func prepare(msg: Dictionary, t: Variant) -> void:
 		_chart(msg)
 	elif t == "chunk":
 		_chunk(msg)
+	elif t == "lod":
+		_lod(msg)
+
+
+## A Distant Horizon `lod` chunk's runs (`tl`, `el`) as one value per cell (`_lod`: [tiles, protos, flags],
+## WireDecodeNative.lod_cells, C++), read by lod_data.gd LodChunk.from_msg. `--native-lod-decode=off` or no
+## extension: left for from_msg's GDScript on the main thread, as before.
+static func _lod(msg: Dictionary) -> void:
+	msg.erase("_lod")
+	if not lod_native_enabled or msg.get("none", false):
+		return
+	var res_v: Variant = msg.get("res", 0)
+	if not _num(res_v) or (res_v is float and not is_finite(float(res_v))):
+		return
+	var r := int(res_v)
+	if not (r == 2 or r == 4 or r == 8 or r == 16 or r == 32):
+		return
+	if _lod_native == null:
+		if not ClassDB.class_exists("WireDecodeNative"):
+			return
+		_lod_native = ClassDB.instantiate("WireDecodeNative")
+	var n := CHUNK / r
+	var cells: Array = _lod_native.lod_cells(msg.get("tl"), msg.get("el"), n * n)
+	if not cells.is_empty():
+		msg["_lod"] = cells
 
 
 static func _num(v: Variant) -> bool:

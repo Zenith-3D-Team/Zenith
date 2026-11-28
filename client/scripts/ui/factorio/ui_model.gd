@@ -32,6 +32,8 @@ signal territories_changed
 signal map_trains_changed
 ## The mod's answer to unghost(): `n` ghosts were removed (0: nothing there).
 signal unghost_answered(q: int, n: int)
+## The mod's answer to pick(): the building under a map point (`unit` 0: none) with its prototype id and place (1/256 tiles).
+signal picked(q: int, unit: int, proto_id: int, fixed: Vector2i)
 ## A surface's roboports arrived and differ from before (`mrp`): roboports_of() and roboport_covers().
 signal roboports_changed
 ## The mod's answer to ask_landing_pad(): the force's cargo landing pad on surface `si` (`found` false: none).
@@ -77,6 +79,7 @@ signal pedia_index_changed
 signal pedia_page_received(kind: String, name: String)
 signal lnets_changed
 signal lnet_received(id: int)
+signal lnet_locs_received(id: int, si: int, locs: Array)
 ## A map ping (a gps link clicked or posted in the chat): the map and minimap draw it a while.
 signal pinged
 
@@ -94,6 +97,8 @@ const NO_LIMIT := 1 << 30
 
 ## Main inventory, slot by slot: {"item": String, "count": int}, or {} for an empty slot.
 var main_slots: Array = []
+## Time.get_ticks_msec() expiry for new-item orange slot highlights, indexed 0-based like main_slots.
+var main_highlights: Array[int] = []
 ## True once the mod sends real slots; until then main_slots are `inv`'s totals in order.
 var has_slots := false
 ## Slot filters of the main inventory (Factorio's middle click): slot (1-based) -> item.
@@ -236,6 +241,7 @@ var selected_gun := 1
 var guns_vehicle := 0
 
 var _unghost_q := 0
+var _pick_q := 0
 ## Demolisher territories (`terr`): their borders as tile segments, [a0, b0, a1, b1, ...] where a
 ## chunk of a territory meets ground that isn't that territory's.
 var territory_edges := PackedVector2Array()
@@ -299,14 +305,18 @@ var char_trash_unrequested := false
 ## and the force's logistic group names (`clog.lgs`); null when the mod doesn't send them.
 var char_sections = null
 var logistic_groups: Array = []
+## Items on the way (`clog.del`) and scheduled for pickup (`clog.pick`) to the character.
+var char_deliver: Array = []
+var char_pickup: Array = []
 ## The character's colour (`ccol`); Factorio's default player orange until the mod says.
 var char_color := Color8(255, 161, 66)
 var char_color_known := false
 ## The logistic network the character stands in (`ln`): {"id", "logistic" [available, all],
 ## "construction" [available, all]}, or {} outside any network.
 var network := {}
-## What robots near the camera carry (`rc`): unit -> {"item_id" (world.protos.item_name), "count"}.
+## What robots near the camera carry (`rc`): unit -> {"item_id" (world.protos.item_name), "count", "quality"}.
 var robot_cargo := {}
+var robot_cargo_rev := 0
 
 ## The planet the character is on (`planet`): {"name" ("space" on a platform), "props" (surface
 ## properties: gravity, pressure, magnetic-field, solar-power, ...), "day" (ticks per day),
@@ -373,7 +383,9 @@ var _pedia_dirty := false
 var _pedia_dirty_msec := 0
 ## The logistic networks window: [{"id", "si", "surface", "logistic": [available, all], "construction",
 ## "cells", "storages", "providers", "requesters", "position" (tiles), "name"}], and networks' contents
-## by id ({"id", "logistic", "construction", "items": [[item, count, quality?], ...]}).
+## by id ({"id", "logistic", "construction", "items": [[item, count, quality?], ...],
+## "members": [[proto, count], ...], "req": [[item, req, missing, quality?], ...],
+## "transit": [[item, count, quality?], ...], "ch": [charging, waiting]}).
 var lnets: Array = []
 var lnet := {}
 ## The last statistics reply's graph lines ([[name, [in...], [out...]], ...]).
@@ -398,6 +410,8 @@ var _raw_cache := {}  # recipe -> total_raw()'s answer
 var _raw_by_product := {}  # item -> the hand recipe that makes it
 const RAW_DEPTH := 32
 var _rdet: Array = []  # the latest complete `rdet` records
+var hand_categories: Array = []  # crafting categories the character can craft by hand (`rdet.hc`)
+var category_machines := {}  # crafting category -> [machine prototype names in Factorio order] (`rdet.cm`)
 var _parts := {}  # message type -> the multi-part list being received
 
 
@@ -461,6 +475,18 @@ func handle(msg: Dictionary) -> bool:
 			var first := (quickbar_page - 1) * QUICKBAR_SLOTS
 			set_quickbar(_server_quickbar.slice(first, first + QUICKBAR_SLOTS))
 		"rdet":
+			if msg.has("hc"):
+				hand_categories = []
+				for cat in Wire.array(msg.get("hc")):
+					hand_categories.append(str(cat))
+			if msg.has("cm") and msg["cm"] is Dictionary:
+				category_machines = {}
+				var cm_dict: Dictionary = msg["cm"]
+				for cat in cm_dict:
+					var machines: Array[String] = []
+					for m in Wire.array(cm_dict[cat]):
+						machines.append(str(m))
+					category_machines[str(cat)] = machines
 			var list = _gather(msg)
 			if list != null:
 				_rdet = list
@@ -552,6 +578,8 @@ func handle(msg: Dictionary) -> bool:
 			char_trash_unrequested = int(msg.get("trash", 0)) == 1
 			char_sections = Wire.array(msg.get("sec")).duplicate(true) if msg.has("sec") else null
 			logistic_groups = Wire.array(msg.get("lgs"))
+			char_deliver = Wire.array(msg.get("del"))
+			char_pickup = Wire.array(msg.get("pick"))
 			logistics_changed.emit()
 		"ccol":
 			var c := Wire.array(msg.get("c"))
@@ -682,8 +710,17 @@ func handle(msg: Dictionary) -> bool:
 			var l := Wire.array(msg.get("l"))
 			var i := 0
 			while i + 2 < l.size():
-				robot_cargo[int(l[i])] = {"item_id": int(l[i + 1]), "count": int(l[i + 2])}
+				robot_cargo[int(l[i])] = {"item_id": int(l[i + 1]), "count": int(l[i + 2]), "quality": "normal"}
 				i += 3
+			var q_arr := Wire.array(msg.get("q"))
+			var qi := 0
+			while qi + 1 < q_arr.size():
+				var qu := int(q_arr[qi])
+				var entry: Variant = robot_cargo.get(qu)
+				if entry is Dictionary:
+					(entry as Dictionary)["quality"] = str(q_arr[qi + 1])
+				qi += 2
+			robot_cargo_rev += 1
 		"tr":
 			trains.clear()
 			train_of_unit.clear()
@@ -726,6 +763,9 @@ func handle(msg: Dictionary) -> bool:
 			tags_changed.emit()
 		"unghost":
 			unghost_answered.emit(int(msg.get("q", 0)), int(msg.get("n", 0)))
+		"pick":
+			picked.emit(int(msg.get("q", 0)), int(msg.get("u", 0)), int(msg.get("p", 0)),
+				Vector2i(int(msg.get("x", 0)), int(msg.get("y", 0))))
 		"mrp":
 			_roboport_part(msg)
 		"lpad":
@@ -802,6 +842,23 @@ func handle(msg: Dictionary) -> bool:
 								rows.append([str(r[0]), str(r[1]), int(r[2])])
 						io[k] = rows
 					info["io"] = io
+				if msg.has("fl"):
+					var fl: Array = []
+					for box in Wire.array(msg["fl"]):
+						if box is Dictionary:
+							var bd: Dictionary = box
+							var fname := str(bd.get("fluid", ""))
+							if fname != "":
+								fl.append({
+									"fluid": fname,
+									"amount": int(bd.get("amount", 0)),
+									"capacity": int(bd.get("capacity", 0)),
+									"temperature": int(bd.get("temperature", 15)),
+								})
+					if not fl.is_empty():
+						info["fl"] = fl
+				if msg.get("ln") is Dictionary:
+					info["ln"] = (msg["ln"] as Dictionary).duplicate(true)
 				info["at"] = Time.get_ticks_msec()
 				hover_info = info
 				hover_info_changed.emit()
@@ -849,7 +906,13 @@ func handle(msg: Dictionary) -> bool:
 			clipboard.clear()
 			for r in Wire.array(msg.get("l")):
 				if r is Array and r.size() >= 4:
-					clipboard.append({"p": int(r[0]), "at": Vector2(int(r[1]), int(r[2])) / 256.0, "d": int(r[3])})
+					var entry := {"p": int(r[0]), "at": Vector2(int(r[1]), int(r[2])) / 256.0, "d": int(r[3])}
+					if r.size() >= 5 and r[4] is Dictionary:
+						var extra: Dictionary = (r[4] as Dictionary).duplicate()
+						if int(extra.get("f", 0)) == 1:
+							entry["f"] = true
+						entry["x"] = extra
+					clipboard.append(entry)
 			clipboard_changed.emit()
 		"iuse":
 			if int(msg.get("part", 1)) == 1:
@@ -867,7 +930,7 @@ func handle(msg: Dictionary) -> bool:
 							on[int(id)] = true
 						u["t"] = [str(r[2]), str(r[3]) if r.size() > 3 else "", on]
 					"c":
-						u["c"] = [str(r[2]), float(r[3]) if r.size() > 3 else 0.0, float(r[4]) if r.size() > 4 else 0.0]
+						u["c"] = [str(r[2]), float(r[3]) if r.size() > 3 else 0.0, float(r[4]) if r.size() > 4 else 0.0, float(r[5]) if r.size() > 5 else 0.0]
 					"r":
 						u["r"] = [str(r[2]), int(r[3]) if r.size() > 3 else 0]
 					"b", "p", "m":
@@ -988,11 +1051,31 @@ func handle(msg: Dictionary) -> bool:
 		"lnet":
 			var id := int(msg.get("id", 0))
 			if int(msg.get("found", 0)) == 1:
-				lnet[id] = {"id": id, "logistic": Wire.array(msg.get("log")), "construction": Wire.array(msg.get("con")),
-					"items": Wire.array(msg.get("items"))}
+				lnet[id] = {
+					"id": id,
+					"logistic": Wire.array(msg.get("log")),
+					"construction": Wire.array(msg.get("con")),
+					"items": Wire.array(msg.get("items")),
+					"members": Wire.array(msg.get("members")),
+					"req": Wire.array(msg.get("req")),
+					"transit": Wire.array(msg.get("transit")),
+					"ch": Wire.array(msg.get("ch")),
+				}
 			else:
 				lnet.erase(id)
 			lnet_received.emit(id)
+		"lnet_locs":
+			var id := int(msg.get("id", 0))
+			var si := int(msg.get("si", 0))
+			var locs: Array = []
+			for r in Wire.array(msg.get("l")):
+				if r is Array and r.size() >= 4:
+					locs.append({
+						"position": Vector2(int(r[0]), int(r[1])) / 256.0,
+						"proto": str(r[2]),
+						"count": int(r[3]),
+					})
+			lnet_locs_received.emit(id, si, locs)
 		"rs":
 			research = str(msg.get("cur", ""))
 			research_progress = int(msg.get("pr", 0)) / 1000.0
@@ -1056,11 +1139,12 @@ func set_inventory_totals(list: Array) -> void:
 ## The main inventory by slot. `slots` is [[item, count(, quality)] or empty ([] / {} / 0), ...]
 ## in slot order; `size` the inventory size (slots beyond the list are empty).
 func set_inventory_slots(slots: Array, size: int) -> void:
+	var had_slots := has_slots
 	has_slots = true
 	var out := _slot_dicts(slots)
 	while out.size() < size:
 		out.append({})
-	_set_slots(out)
+	_set_slots(out, had_slots)
 
 
 ## [{"item", "count", "quality"?} or {}, ...] from the protocol's slot list.
@@ -1083,7 +1167,7 @@ static func _slot_dicts(slots: Array) -> Array:
 
 ## Moves the stack in slot `from_slot` (1-based) of `from_role` to `to_slot` of `to_role`, like a
 ## click in Factorio (merge, swap; `n` > 0 splits). Roles: main, guns, ammo, armor, trash, or the
-## open machine's chest, input, output, fuel, burnt, modules (give its unit).
+## open machine's chest, input, output, fuel, burnt, modules, hand, belt_1, belt_2 (give its unit).
 func move(from_role: String, from_slot: int, to_role: String, to_slot: int, n := 0, unit := 0) -> void:
 	var cmd := {"t": "move", "from": from_role, "fi": from_slot, "to": to_role, "ti": to_slot, "n": n}
 	if unit != 0:
@@ -1093,16 +1177,21 @@ func move(from_role: String, from_slot: int, to_role: String, to_slot: int, n :=
 
 ## Factorio's Shift / Ctrl clicks on slot `index` of `role`: `kind` "stack", "half", "all" or
 ## "allhalf", to the other inventory (the open machine's with its unit, else the character's own).
-func xfer(role: String, index: int, kind: String, unit := 0) -> void:
+func xfer(role: String, index: int, kind: String, unit := 0, to_trash := false) -> void:
 	var cmd := {"t": "xfer", "from": role, "fi": index, "k": kind}
 	if unit != 0:
 		cmd["u"] = unit
+	if to_trash:
+		cmd["trash"] = 1
 	Bridge.send(cmd)
 
 
 ## Filters slot `index` (1-based) of the main inventory to an item ("" clears it).
-func set_slot_filter(index: int, item: String) -> void:
-	Bridge.send({"t": "inv_filter", "i": index, "item": item})
+func set_slot_filter(index: int, item: String, unit := 0) -> void:
+	var cmd := {"t": "inv_filter", "i": index, "item": item}
+	if unit != 0:
+		cmd["u"] = unit  # an open cargo wagon's slot
+	Bridge.send(cmd)
 
 
 func sort_inventory(role := "main", unit := 0) -> void:
@@ -1112,7 +1201,68 @@ func sort_inventory(role := "main", unit := 0) -> void:
 	Bridge.send(cmd)
 
 
-func _set_slots(slots: Array) -> void:
+func main_highlight_until(index: int) -> int:
+	if index < 1 or index > main_highlights.size():
+		return 0
+	var until: int = main_highlights[index - 1]
+	return until if until > Time.get_ticks_msec() else 0
+
+
+static func _slot_item_key(s: Dictionary) -> String:
+	var q := str(s.get("quality", ""))
+	if q == "":
+		q = "normal"
+	return "%s\t%s" % [str(s.get("item", "")), q]
+
+
+func _set_slots(slots: Array, track_highlights := false) -> void:
+	if track_highlights:
+		var now := Time.get_ticks_msec()
+		var before_totals := {}
+		var old_active := {}
+		for i in main_slots.size():
+			var os: Variant = main_slots[i]
+			if os is Dictionary and not (os as Dictionary).is_empty():
+				var old_d: Dictionary = os
+				var key := _slot_item_key(old_d)
+				before_totals[key] = int(before_totals.get(key, 0)) + int(old_d.get("count", 0))
+				if i < main_highlights.size() and main_highlights[i] > now:
+					old_active[key] = maxi(int(old_active.get(key, 0)), main_highlights[i])
+		var after_totals := {}
+		for s in slots:
+			if s is Dictionary and not (s as Dictionary).is_empty():
+				var d: Dictionary = s
+				var key := _slot_item_key(d)
+				after_totals[key] = int(after_totals.get(key, 0)) + int(d.get("count", 0))
+		var increased := {}
+		for key in after_totals:
+			if int(after_totals[key]) > int(before_totals.get(key, 0)):
+				increased[key] = true
+		var next_highlights: Array[int] = []
+		next_highlights.resize(slots.size())
+		var expire := now + 1000
+		for i in slots.size():
+			var s: Variant = slots[i]
+			if not (s is Dictionary) or (s as Dictionary).is_empty():
+				next_highlights[i] = 0
+				continue
+			var d: Dictionary = s
+			var key := _slot_item_key(d)
+			var same_pos := i < main_slots.size() and main_slots[i] is Dictionary and not (main_slots[i] as Dictionary).is_empty() and _slot_item_key(main_slots[i] as Dictionary) == key
+			var old_c := int((main_slots[i] as Dictionary).get("count", 0)) if same_pos else 0
+			var new_c := int(d.get("count", 0))
+			var old_exp := main_highlights[i] if same_pos and i < main_highlights.size() and main_highlights[i] > now else 0
+			if increased.has(key):
+				next_highlights[i] = expire if (not same_pos or new_c > old_c) else old_exp
+			elif same_pos and new_c == old_c:
+				next_highlights[i] = old_exp
+			else:
+				next_highlights[i] = int(old_active.get(key, 0))
+		main_highlights = next_highlights
+	else:
+		main_highlights = []
+		main_highlights.resize(slots.size())
+		main_highlights.fill(0)
 	main_slots = slots
 	_shown = []
 	counts.clear()
@@ -1401,6 +1551,8 @@ func total_raw(name: String, given: Dictionary = {}) -> Dictionary:
 func _makers() -> Dictionary:
 	if _raw_by_product.is_empty():
 		for r in recipes:
+			if not bool(r.get("hand", true)):
+				continue
 			var products: Array = r["products"]
 			if products.size() == 1 and products[0] is Array and float(products[0][1]) > 0.0 and not r["ingredients"].is_empty():
 				var made := str(products[0][0])
@@ -1481,6 +1633,16 @@ func _add_raw(r: Dictionary, crafts: float, out: Dictionary, path: Array) -> voi
 
 
 func _recipe(d: Dictionary) -> Dictionary:
+	var cats: Array = Wire.array(d.get("categories"))
+	var is_hand := true
+	if d.has("hand"):
+		is_hand = bool(d["hand"])
+	elif not hand_categories.is_empty():
+		is_hand = false
+		for cat in cats:
+			if hand_categories.has(str(cat)):
+				is_hand = true
+				break
 	return {
 		"name": str(d.get("name", "")),
 		"group": str(d.get("group", "")),
@@ -1488,6 +1650,8 @@ func _recipe(d: Dictionary) -> Dictionary:
 		"order": str(d.get("order", "")),
 		"group_index": 0,
 		"energy": float(d.get("energy", -1)),
+		"categories": cats,
+		"hand": is_hand,
 		"ingredients": Wire.array(d.get("ingredients")),
 		"products": Wire.array(d.get("products")),
 		"server_craftable": int(d.get("craftable", -1)),
@@ -1515,6 +1679,9 @@ func _update_groups(order: Array) -> void:
 ## direct ingredients only.
 func _update_craftable() -> void:
 	for r in recipes:
+		if not bool(r.get("hand", true)):
+			r["craftable"] = 0
+			continue
 		if r["server_craftable"] >= 0 or r["ingredients"].is_empty():
 			r["craftable"] = r["server_craftable"]
 			continue
@@ -1535,7 +1702,7 @@ func _apply_recipe_details() -> void:
 			continue
 		group_orders[str(r[3])] = str(r[4])
 		list.append({
-			"name": str(r[0]), "energy": float(r[1]), "group": str(r[3]),
+			"name": str(r[0]), "energy": float(r[1]), "categories": Wire.array(r[2]), "group": str(r[3]),
 			"subgroup": "%s %s" % [str(r[6]), str(r[5])], "order": str(r[7]),
 			"ingredients": _pairs(Wire.array(r[8])), "products": _pairs(Wire.array(r[9])),
 			"craftable": int(_craftable.get(str(r[0]), 0)),
@@ -1543,6 +1710,31 @@ func _apply_recipe_details() -> void:
 	var order: Array = group_orders.keys()
 	order.sort_custom(func(a, b) -> bool: return group_orders[a] < group_orders[b])
 	set_recipe_details(list, order)
+
+
+## Machine prototype names that can craft recipe `r` (deduplicated in category order), from
+## `rdet.cm`, falling back to already-cached Factoriopedia recipe data if `cm` is empty.
+func made_in(r: Dictionary) -> Array[String]:
+	var out: Array[String] = []
+	var seen := {}
+	for cat in Wire.array(r.get("categories")):
+		for m in Wire.array(category_machines.get(str(cat), [])):
+			var ms := str(m)
+			if ms != "" and not seen.has(ms):
+				seen[ms] = true
+				out.append(ms)
+	if not category_machines.is_empty():
+		return out
+	var rname := str(r.get("name", ""))
+	var pkey := "recipe/%s" % rname
+	if rname != "" and pedia_pages.has(pkey):
+		var pd := pedia_data("recipe", rname)
+		for m in Wire.array(pd.get("made_in")):
+			var ms := str(m)
+			if ms != "" and not seen.has(ms):
+				seen[ms] = true
+				out.append(ms)
+	return out
 
 
 ## [[type, name, amount], ...] -> [[name, amount], ...] (whole amounts shown rounded).
@@ -1561,6 +1753,9 @@ func cancel_craft(index: int, n := 1) -> void:
 ## Hand-craft n of a recipe. Shown in the queue at once when the ingredients are there (owner's
 ## P48); the game's next `cq` takes over.
 func craft(name: String, n: int) -> void:
+	var r := recipe(name)
+	if not r.is_empty() and not bool(r.get("hand", true)):
+		return
 	Bridge.send({"t": "craft", "recipe": name, "n": n})
 	_predict_craft(name, n)
 
@@ -1582,7 +1777,7 @@ func _craftable_now(r: Dictionary, n: int) -> int:
 
 func _predict_craft(name: String, n: int) -> void:
 	var r := recipe(name)
-	if r.is_empty() or r["ingredients"].is_empty():
+	if r.is_empty() or not bool(r.get("hand", true)) or r["ingredients"].is_empty():
 		return
 	var can := _craftable_now(r, n)
 	if can <= 0:
@@ -1967,6 +2162,18 @@ func request_lnet(id: int) -> void:
 	Bridge.send({"t": "lnet", "id": id})
 
 
+func set_lnet_name(id: int, new_name: String) -> void:
+	Bridge.send({"t": "set_lnet_name", "id": id, "name": new_name})
+
+
+func find_in_lnet(id: int, query: Dictionary) -> void:
+	var cmd := {"t": "lnet_find", "id": id}
+	for k in ["item", "q", "proto", "role"]:
+		if query.has(k) and str(query[k]) != "":
+			cmd[k] = str(query[k])
+	Bridge.send(cmd)
+
+
 # --- entity settings on the open screen (entity_ui.lua) ------------------------------------------
 
 ## An inserter's filters ([item or ""] by slot), mode ("whitelist" / "blacklist"), whether it uses
@@ -2114,6 +2321,12 @@ func set_character_requests(requests: Array, on := true, trash_unrequested := fa
 		"trash": 1 if trash_unrequested else 0})
 
 
+## Only the two switches (no request list): with logistic sections the requests are the sections',
+## and one flat list would merge an item two sections both request.
+func set_character_switches(on: bool, trash_unrequested: bool) -> void:
+	Bridge.send({"t": "set_char_requests", "on": 1 if on else 0, "trash": 1 if trash_unrequested else 0})
+
+
 ## [[item, min, max, quality?], ...] from the wire into dictionaries.
 static func _requests(v) -> Array:
 	var out: Array = []
@@ -2153,6 +2366,11 @@ func set_train_automatic(unit: int, automatic: bool) -> void:
 	Bridge.send({"t": "train_mode", "u": unit, "auto": 1 if automatic else 0})
 
 
+## The open locomotive's "Use destination train stop color".
+func set_train_copy_color(unit: int, on: bool) -> void:
+	Bridge.send({"t": "train_mode", "u": unit, "ctc": 1 if on else 0})
+
+
 ## The open train stop's priority and circuit settings ({"pri"?, "cb"?: {key: value}}, see
 ## docs/PROTOCOL.md "Trains").
 func set_stop_settings(unit: int, settings: Dictionary) -> void:
@@ -2178,11 +2396,14 @@ func request_trains_overview(show := false) -> void:
 		trains_overview_requested.emit()
 
 
-## Renames a train stop ("" keeps the name) and sets its trains limit (-1 none, -2 unchanged).
-func set_stop(unit: int, stop_name := "", limit := -2) -> void:
+## Renames a train stop ("" keeps the name; `all`: every stop of that name, Ctrl while submitting) and
+## sets its trains limit (-1 none, -2 unchanged).
+func set_stop(unit: int, stop_name := "", limit := -2, all := false) -> void:
 	var cmd := {"t": "set_stop", "u": unit}
 	if stop_name != "":
 		cmd["name"] = stop_name
+		if all:
+			cmd["all"] = 1
 	if limit >= -1:
 		cmd["limit"] = limit
 	Bridge.send(cmd)
@@ -2232,11 +2453,13 @@ func set_map_surface(si: int) -> void:
 	map_trains_changed.emit()
 
 
-## The character is on surface `si` now (welcome, surface): the map shows it again.
+## The character is on surface `si` now (welcome, surface): the map shows it unless the character stayed on the same surface while viewing another.
 func set_character_surface(si: int) -> void:
 	var prev := shown_surface()
+	var same := character_si > 0 and si == character_si
 	character_si = si
-	map_si = 0
+	if not same or map_si == si:
+		map_si = 0
 	if prev > 0 and shown_surface() != prev:
 		map_charts.clear()
 		map_pollution.clear()
@@ -2249,12 +2472,13 @@ func set_character_surface(si: int) -> void:
 		tags_changed.emit()
 		map_trains_changed.emit()
 	# Joined (perhaps another game) or moved: the roboports are listed again when next needed.
-	_roboports.clear()
-	_roboport_parts.clear()
-	_roboports_asked.clear()
-	roboports_version += 1
+	if not same:
+		_roboports.clear()
+		_roboport_parts.clear()
+		_roboports_asked.clear()
+		roboports_version += 1
+		roboports_changed.emit()
 	map_surfaces_changed.emit()
-	roboports_changed.emit()
 
 
 ## A map or the remote view shows surface `si`: asks for its roboports (`mrp`) at once the first
@@ -2493,6 +2717,18 @@ func unghost(position: Vector2) -> int:
 		cmd["si"] = map_si
 	Bridge.send(cmd)
 	return _unghost_q
+
+
+## A click or hover on the map: asks the mod which building, train or vehicle is under `position` (tiles) on the
+## map's surface, within `radius` tiles; `picked` carries the answer. Returns the request's id.
+func pick(position: Vector2, radius: float) -> int:
+	_pick_q += 1
+	var cmd := {"t": "pick", "q": _pick_q, "x": roundi(position.x * 256), "y": roundi(position.y * 256),
+		"r": roundi(radius * 256)}
+	if map_si > 0:
+		cmd["si"] = map_si
+	Bridge.send(cmd)
+	return _pick_q
 
 
 func add_map_tag(position: Vector2, text: String, icon_type := "", icon_name := "") -> void:

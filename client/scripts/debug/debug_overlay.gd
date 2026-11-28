@@ -15,6 +15,13 @@ extends CanvasLayer
 ## slow frame's line also says "addons <id> <ms>, ..." (the three slowest), each add-on's own node and
 ## what it runs under it in _process (its frame's work, the API calls it makes from there). Marks only
 ## exist while the spike log or the profiler is on.
+## Each slow line also says what the renderer did (`render ...`): its draw calls (view and shadow passes) and
+## the viewport's measured CPU and GPU times, and with Godot started with --gpu-profile (an engine option,
+## before `--`) its stages' CPU/GPU ms (shadows, depth pre-pass, opaque, motion vectors, transparent, post,
+## rest; the last frame the GPU finished, a frame or two behind). With "Render on a separate thread" (thread
+## model 2) the draw runs on the render thread: the line has no draw bucket, and "wait for renderer" is the main
+## thread waiting (RenderingServer.sync) for the render thread's last frame before it queues the next.
+## `--spike-render=off`: neither, the line as before.
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
@@ -31,6 +38,8 @@ const COUNT_EVERY := 0.5
 const SPIKE_PATH := "user://debug/spikes.log"
 const SPIKE_DEFAULT_MS := 33.0
 const SPIKE_MAX_BYTES := 8 * 1024 * 1024  # the log stops (one last line says so) past this
+## `--spike-render=off`: no render stages or draw calls on a spike line, the draw bucket as before.
+static var spike_render := Switches.on("--spike-render")
 const MARK_RESCAN := 5.0  # seconds between looks for new children of main and the game to mark
 ## A mark's label for one add-on's own time ("addon " + its id); the spike line sums them back into Addons.
 const ADDON_MARK := "addon "
@@ -90,6 +99,7 @@ var spike_log := false:
 			_spike_close()
 			if not profiler:
 				_clear_proc_marks()
+		_sync_measure()
 		_update()
 var spike_ms := SPIKE_DEFAULT_MS
 ## Lines written since the log was switched on (tests).
@@ -193,7 +203,7 @@ func _exit_tree() -> void:
 func _sync_measure() -> void:
 	if not is_inside_tree():
 		return
-	if profiler:
+	if profiler or (spike_log and spike_render):
 		var thread_model := int(ProjectSettings.get_setting("rendering/driver/threads/thread_model", 1))
 		# Measured with the render thread too now its times are read on that thread (render_stats.gd).
 		var can := thread_model != 2 or not RenderStats.old
@@ -532,6 +542,18 @@ func _spike_open() -> void:
 	_spike_write("# spike log on: frames over %.0f ms (Zenith %s, Godot %s, thread model %d)" % [spike_ms,
 		str(ProjectSettings.get_setting("application/config/version", "")), Engine.get_version_info().get("string", ""),
 		int(ProjectSettings.get_setting("rendering/driver/threads/thread_model", 1))])
+	if spike_render:
+		_spike_write(spike_header(RenderStats.threaded(), RenderingServer.get_rendering_device() != null))
+
+
+## The spike log's second line: what the render part and the buckets mean on this thread model.
+static func spike_header(threaded: bool, has_rd: bool) -> String:
+	var out := "# render: draw calls view/shadow, the viewport's measured cpu/gpu ms"
+	out += ", stages cpu/gpu ms (the last frame the GPU finished)" if has_rd else ""
+	out += " (stages need Godot started with --gpu-profile)" if has_rd else " (no renderer here: none)"
+	if threaded:
+		out += "; render thread on: no draw bucket, \"wait for renderer\" is the main thread waiting for the render thread's last frame"
+	return out
 
 
 func _spike_close() -> void:
@@ -579,23 +601,57 @@ func _spike_frame_start(now: int) -> void:
 	_spike_prev_start = now
 	var nodes := int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT))
 	var after := _spike_counters()
+	var threaded := spike_render and RenderStats.threaded()
+	var rs := {}
+	var steps: Array = []
+	if threaded:  # asked every frame: the render thread answers a frame later
+		rs = RenderStats.read(get_viewport().get_viewport_rid() if get_viewport() != null else RID())
+		steps = RenderStats.steps()
 	if prev > 0 and _spike_end > prev and float(now - prev) >= spike_ms * 1000.0:
 		spike_lines += 1
-		_spike_write(spike_line(now - prev, _spike_end - prev, _spike_split(now), _spike_scripts,
-			_spike_deltas(_spike_before, after), nodes - _spike_nodes, (now - _spike_started) / 1000000.0))
+		var render := ""
+		if spike_render:
+			if not threaded:
+				rs = RenderStats.read(get_viewport().get_viewport_rid() if get_viewport() != null else RID())
+				steps = RenderStats.steps()
+			render = spike_render_part(rs, RenderStats.stages(steps[0], steps[1]) if steps.size() >= 2 else [])
+		_spike_write(spike_line(now - prev, _spike_end - prev,
+			spike_split(_spike_end, _spike_deferred, _spike_pre, _spike_post, now, threaded), _spike_scripts,
+			_spike_deltas(_spike_before, after), nodes - _spike_nodes, (now - _spike_started) / 1000000.0, threaded, render))
 	_spike_before = after
 	_spike_nodes = nodes
 	Probing.slowest_message = ["", 0]
 
 
-## [deferred calls and frees, draw, the rest] in µs after the scripts ended; draw -1 when the
-## renderer didn't draw (headless: the frees are then in the rest).
-func _spike_split(now: int) -> Array:
-	var end := _spike_end
-	var deferred_end := _spike_deferred if _spike_deferred > end and _spike_deferred <= now else end
-	if _spike_pre > end and _spike_post > _spike_pre and _spike_post <= now:
-		return [_spike_pre - end, _spike_post - _spike_pre, now - _spike_post]
+## [deferred calls and frees, draw, the rest] in µs after the scripts ended (`end`); draw -1 when the
+## renderer didn't draw (headless: the frees are then in the rest). `threaded` (the render thread on, the
+## spike log's render part on): [deferred calls and frees, wait for renderer, the rest]: the draw runs on the
+## render thread (frame_post_draw comes a frame later), and from the deferred calls' end to frame_pre_draw
+## the main thread waits for the render thread's last frame (RenderingServer.sync); the wait is -1 when
+## nothing was drawn (headless).
+static func spike_split(end: int, deferred: int, pre: int, post: int, now: int, threaded := false) -> Array:
+	var deferred_end := deferred if deferred > end and deferred <= now else end
+	if threaded:
+		if pre >= deferred_end and pre > end and pre <= now:
+			return [deferred_end - end, pre - deferred_end, now - pre]
+		return [deferred_end - end, -1, now - deferred_end]
+	if pre > end and post > pre and post <= now:
+		return [pre - end, post - pre, now - post]
 	return [deferred_end - end, -1, now - deferred_end]
+
+
+## A spike line's render part: `rs` RenderStats.read()'s numbers, `stages` RenderStats.stages() (empty
+## without --gpu-profile).
+static func spike_render_part(rs: Dictionary, stages: Array) -> String:
+	var out := "render draws %d/%d" % [int(rs.get("view_draws", 0)), int(rs.get("shadow_draws", 0))]
+	if rs.has("cpu_ms") or rs.has("gpu_ms"):
+		out += ", viewport %.1f/%.1f" % [float(rs.get("cpu_ms", 0.0)), float(rs.get("gpu_ms", 0.0))]
+	if not stages.is_empty():
+		var parts := PackedStringArray()
+		for st: Array in stages:
+			parts.append("%s %.1f/%.1f" % [st[0], float(st[1]), float(st[2])])
+		out += ", stages " + ", ".join(parts)
+	return out
 
 
 func _spike_deltas(a: Dictionary, b: Dictionary) -> Dictionary:
@@ -612,11 +668,13 @@ func _spike_deltas(a: Dictionary, b: Dictionary) -> Dictionary:
 
 ## One spike's line (static for the tests): times in µs, `scripts` label -> µs, `deltas` the
 ## counters' changes ("chunk.*", "probe.*" counts; "pt.*", "world.*" µs).
+## `threaded`: split's middle is the wait for the renderer (spike_split); `render` the render part, after the
+## counts ("" for none).
 static func spike_line(frame_us: int, scripts_us: int, split: Array, scripts: Dictionary, deltas: Dictionary,
-		nodes: int, at_s: float) -> String:
+		nodes: int, at_s: float, threaded := false, render := "") -> String:
 	var parts := PackedStringArray()
-	parts.append("t %.1fs frame %.1f ms: scripts %.1f, deferred+frees %.1f, draw %s, rest %.1f" % [at_s,
-		frame_us / 1000.0, scripts_us / 1000.0, int(split[0]) / 1000.0,
+	parts.append("t %.1fs frame %.1f ms: scripts %.1f, deferred+frees %.1f, %s %s, rest %.1f" % [at_s,
+		frame_us / 1000.0, scripts_us / 1000.0, int(split[0]) / 1000.0, "wait for renderer" if threaded else "draw",
 		"-" if int(split[1]) < 0 else "%.1f" % (int(split[1]) / 1000.0), int(split[2]) / 1000.0])
 	var top: Array = []
 	var by_addon: Array = []
@@ -666,6 +724,8 @@ static func spike_line(frame_us: int, scripts_us: int, split: Array, scripts: Di
 	var msg := Probing.slowest_message
 	if msg[0] != "":
 		parts.append("slowest message %s %.1f" % [msg[0], int(msg[1]) / 1000.0])
+	if render != "":
+		parts.append(render)
 	return " | ".join(parts)
 
 

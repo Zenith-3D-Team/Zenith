@@ -48,8 +48,14 @@ func _ready() -> void:
 
 
 func _run() -> void:
+	# These two compare paths within a frame, so every icon read at once (--alt-icons-later=off); the
+	# incremental tests below have it on (_inc_settle waits for the workers' reads).
+	var prev_later := AltOverlay.icons_later
+	AltOverlay.icons_later = false
 	await _test_alt_overlay_cache_and_idle()
 	await _test_alt_overlay_flat_batching()
+	AltOverlay.icons_later = prev_later
+	await _test_alt_overlay_incremental()
 	_test_alt_arrows_opt()
 	_test_quality_marks_opt()
 	await get_tree().process_frame
@@ -318,16 +324,14 @@ func _test_alt_overlay_cache_and_idle() -> void:
 	var stale_gone := not overlay._icons.has(stale_tex) and overlay._icons.has(Kit.item_icon("iron-gear-wheel"))
 	var alt_cc_rebuilt: AltOverlay.ChunkCache = overlay._chunk_alt_cache.get(Vector2i(0, 0))
 	var gfx_keys_ok: bool = alt_cc_rebuilt != null and alt_cc_rebuilt.gfx_gen == ModGraphics.generation \
-		and overlay._cached_ac_gfx == ModGraphics.generation and overlay._cached_am_gfx == ModGraphics.generation \
-		and overlay._cached_fl_gfx == ModGraphics.generation and not overlay._moving_machines.is_empty() \
+		and _whole_keys_at(overlay, ModGraphics.generation, 0) and not overlay._moving_machines.is_empty() \
 		and overlay._moving_machines[0].gfx_gen == ModGraphics.generation
 	ModelPacks.icons_version += 1
 	overlay._process(1.0 / 60.0)
 	var packs_redraws := overlay.redraws_queued
 	overlay.collect()
 	var packs_keys_ok: bool = alt_cc_rebuilt.icons_ver == ModelPacks.icons_version \
-		and overlay._cached_ac_icons == ModelPacks.icons_version and overlay._cached_am_icons == ModelPacks.icons_version \
-		and overlay._cached_fl_icons == ModelPacks.icons_version \
+		and _whole_keys_at(overlay, ModelPacks.icons_version, 1) \
 		and overlay._moving_machines[0].icons_ver == ModelPacks.icons_version
 	check(had_stale and stale_gone and gfx_redraws == 1 and packs_redraws == 2 and gfx_keys_ok and packs_keys_ok,
 		"alt_overlay invalidates cached textures and redraws on ModGraphics.generation / ModelPacks.icons_version bump")
@@ -381,6 +385,865 @@ func _test_alt_overlay_cache_and_idle() -> void:
 	holder.free()
 
 
+## --alt-incremental: the per-chunk caches against a whole-map rebuild after every event of a seeded
+## sequence (both the card's path and the CPU path), builds only for the chunks that changed, and the cost of
+## one chunk's change on a big base.
+func _test_alt_overlay_incremental() -> void:
+	var prev_inc := AltOverlay.incremental
+	var prev_mode := AltOverlay.icons_mode
+	var prev_cache := AltOverlay.use_cache
+	var prev_alt_contents: int = Bridge.alt_contents
+	var win_before := get_window().size
+	get_window().size = Vector2i(1280, 720)
+	AltOverlay._read_args()
+	AltOverlay.use_cache = true
+	var prev_native := AltOverlay.native
+	for mode in ["gpu", "cpu"]:
+		AltOverlay.native = false
+		await _inc_parity_run(mode)
+	# --alt-native: the overlay under test sorts and packs in C++, the reference in GDScript.
+	if _native_ready():
+		inc_native = true
+		await _inc_parity_run("gpu")
+		inc_native = false
+	else:
+		print("alt_perf_test: AltIconsNative not loaded, --alt-native parity skipped")
+	AltOverlay.native = prev_native
+	await _inc_on_change_only()
+	await _inc_no_blink()
+	await _inc_relift_counts()
+	await _inc_quiet_counts()
+	await _inc_icons_later()
+	AltOverlay.incremental = prev_inc
+	AltOverlay.icons_mode = prev_mode
+	AltOverlay.use_cache = prev_cache
+	Bridge.set_alt_contents(false)
+	if prev_alt_contents > 0:
+		Bridge.set_alt_contents(true)
+	GroundHeight.clear()
+	get_window().size = win_before
+
+
+const INC_RECIPES := ["iron-gear-wheel", "electronic-circuit", "copper-cable", "pipe"]
+const INC_ITEMS := ["iron-plate", "copper-plate", "coal", "stone", "steel-plate"]
+const INC_FLUIDS := ["water", "crude-oil", "steam"]
+
+
+class IncScene:
+	var holder: Node3D
+	var w
+	var fp
+	var trains
+	var rig: Node3D
+	var player: Node3D
+	var model: Node3D
+	var inc  # the overlay under test (--alt-incremental, and the switches under test on)
+	var ref  # the reference: every cache built again from nothing (--alt-incremental=off)
+	var off  # --alt-incremental with the switches under test off (--alt-relift=off): its buffer to the byte
+
+
+func _inc_scene(grid: int) -> IncScene:
+	var sc := IncScene.new()
+	sc.holder = Node3D.new()
+	add_child(sc.holder)
+	sc.w = WorldMirror.new()
+	sc.holder.add_child(sc.w)
+	sc.w.protos.add_entities([
+		[1, "assembling-machine-2", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 150, 150, 150, 3, 3],
+		[2, "fast-inserter", "inserter", -0.4, -0.4, 0.4, 0.4, 80, 80, 80, 1, 1],
+		[3, "wooden-chest", "container", -0.35, -0.35, 0.35, 0.35, 100, 100, 100, 1, 1],
+		[4, "beacon", "beacon", -1.5, -1.5, 1.5, 1.5, 150, 150, 150, 3, 3],
+		[5, "pipe", "pipe", -0.5, -0.5, 0.5, 0.5, 80, 80, 80, 1, 1],
+		[6, "storage-tank", "storage-tank", -1.5, -1.5, 1.5, 1.5, 150, 150, 150, 3, 3],
+		[7, "cargo-wagon", "cargo-wagon", -1.0, -3.0, 1.0, 3.0, 150, 150, 150, 2, 6],
+	])
+	for cy in grid:
+		for cx in grid:
+			sc.w.chunks[Vector2i(cx, cy)] = ChunkView.new()
+	sc.fp = FluidsPower.new()
+	sc.fp.name = "FluidsPower"
+	sc.fp.world = sc.w
+	sc.holder.add_child(sc.fp)
+	sc.fp.set_process(false)
+	sc.trains = MoverLayer.new()
+	sc.trains.protos = sc.w.protos
+	sc.holder.add_child(sc.trains)
+	sc.trains.handle({"t": "mv", "k": 1, "l": [[9001, 7, 20 * 256, 20 * 256, 0]]})
+	sc.trains._process(1.0 / 60.0)
+	var stub_gs := GDScript.new()
+	stub_gs.source_code = "extends Node3D\nvar world\nvar rig\nvar camera: Camera3D\nvar first_person := false\nvar hovered\nvar movers\nvar remote_fog\nvar eprops := {}\n"
+	stub_gs.reload()
+	sc.rig = stub_gs.new()
+	sc.rig.camera = Camera3D.new()
+	sc.rig.add_child(sc.rig.camera)
+	sc.holder.add_child(sc.rig)
+	sc.rig.camera.projection = Camera3D.PROJECTION_PERSPECTIVE
+	sc.rig.camera.fov = 50.0
+	sc.rig.camera.far = 4000.0
+	var mid := grid * 16.0
+	sc.rig.camera.position = Vector3(mid, grid * 32.0 * 0.9, mid + grid * 32.0 * 0.75)
+	sc.rig.camera.look_at(Vector3(mid, 0, mid))
+	sc.player = stub_gs.new()
+	sc.player.world = sc.w
+	sc.player.rig = sc.rig
+	sc.player.movers = sc.trains
+	sc.holder.add_child(sc.player)
+	sc.model = stub_gs.new()
+	sc.model.eprops = {
+		1: {"x": {"ids": [0, -0.2, 1.0], "isq": [["m", 0, 0.7, 0.5, 4, 2, 1.1, -0.1]]}},
+		4: {"x": {"isq": [["m", 0, 0, 0.5, 2, 2, 1.1, -0.3]]}},
+		7: {"x": {"isq": [["c", 0, 0, 0.5, 4, 1, 1.1, -0.1]]}},
+	}
+	sc.holder.add_child(sc.model)
+	for i in 3:
+		var ov := AltOverlay.new()
+		ov.model = sc.model
+		ov.player = sc.player
+		ov.on = true
+		sc.holder.add_child(ov)
+		ov.set_process(false)
+		if i == 0:
+			sc.inc = ov
+		elif i == 1:
+			sc.ref = ov
+		else:
+			sc.off = ov
+	return sc
+
+
+func _inc_free(sc: IncScene) -> void:
+	for ov in [sc.inc, sc.ref, sc.off]:
+		ov.on = false
+		ov._process(0.0)
+	remove_child(sc.holder)
+	sc.holder.free()
+
+
+## Brings `ov` up to date: the card's path until nothing is left to look at, the CPU path's collect() until no
+## chunk in view is left for the next frame.
+func _inc_settle(ov, mode: String) -> void:
+	if mode == "gpu":
+		for _i in 400:
+			_inc_wait_icons(ov)
+			ov._process(1.0 / 60.0)
+			if ov._gpu_check.is_empty() and ov._icon_wait.is_empty() \
+					and not (AltOverlay.incremental and ov._inc_has_news(ov.player.world.get_parent().get_node("FluidsPower"))):
+				break
+	else:
+		for _i in 50:
+			_inc_wait_icons(ov)
+			ov.collect()
+			if not ov._inc_view_left and ov._icon_wait.is_empty():
+				break
+
+
+## --alt-icons-later: the icons `ov` waits for read on their workers and taken (up to 2 s).
+func _inc_wait_icons(ov) -> void:
+	var t0 := Time.get_ticks_msec()
+	while not ov._icon_wait.is_empty() and Time.get_ticks_msec() - t0 < 2000:
+		ov._poll_icons_later()
+		if not ov._icon_wait.is_empty():
+			OS.delay_msec(1)
+
+
+## What `ov` draws, independent of the order icons at one depth were found in (the whole-map caches find them
+## in the bridge's order, the per-chunk ones in the chunk's): the card's instances per chunk with their pictures
+## as textures, or the CPU path's paint list; plus the movers' units.
+func _inc_snapshot(ov, mode: String) -> Array:
+	var out: Array = []
+	if mode == "gpu":
+		var tex_of := {}
+		for t: Texture2D in ov._gpu_layer_of:
+			tex_of[int(ov._gpu_layer_of[t])] = t.get_instance_id()
+		var chunks: Array = []
+		for c: Vector2i in ov._gpu_chunks:
+			var d: PackedFloat32Array = ov._gpu_chunk_data(c)
+			var rows := PackedStringArray()
+			for i in range(0, d.size(), AltOverlay.GPU_FLOATS):
+				var pic := int(d[i + 11])
+				var row := d.slice(i, i + AltOverlay.GPU_FLOATS)
+				row[11] = 0.0
+				rows.append("%s|%d|%d" % [str(row), int(tex_of.get(pic % 4096, -1)), int(tex_of.get(pic / 4096 - 1, -2))])
+			rows.sort()
+			chunks.append("%d,%d:%s" % [c.x, c.y, "/".join(rows)])
+		chunks.sort()
+		out.append(chunks)
+		out.append(ov.gpu_instances)
+	else:
+		var list: Array = []
+		for e: Array in ov.paint_list():  # each overlay has its own shadow texture
+			list.append([e[0], null if str(e[0]) == "s" else e[1], e[2], e[3]])
+		var sig := _paint_signature(list)
+		sig.sort()
+		out.append(sig)
+		out.append(ov.drawn)
+	var units: Array = []
+	for ms in ov._moving_machines:
+		units.append(ms.unit)
+	units.sort()
+	out.append(units)
+	return out
+
+
+var inc_native := false  # the overlay under test with --alt-native (the reference without)
+## The switches perf wave 4 adds, as the overlay under test has them (the `off` overlay has them off).
+var inc_relift := true
+
+
+## Sets perf wave 4's switches on (the overlay under test) or off (the `off` overlay).
+func _w4_switches(v: bool) -> void:
+	AltOverlay.relift = v and inc_relift
+	AltOverlay.quiet_builds = v
+	AltOverlay.icons_later = v
+
+
+## What `ov` draws to the bit, in its own order: the card's joined buffer, each instance's picture and mark as
+## their textures (each overlay numbers its own layers), or the CPU path's paint list with every float's bytes.
+func _exact_sig(ov, mode: String) -> PackedStringArray:
+	var out := PackedStringArray()
+	if mode == "gpu":
+		var tex_of := {}
+		for t: Texture2D in ov._gpu_layer_of:
+			tex_of[int(ov._gpu_layer_of[t])] = t.get_instance_id()
+		var d: PackedFloat32Array = ov._gpu_join()
+		for i in range(0, d.size(), AltOverlay.GPU_FLOATS):
+			var pic := int(d[i + 11])
+			var row := d.slice(i, i + AltOverlay.GPU_FLOATS)
+			row[11] = 0.0
+			out.append("%s|%d|%d" % [row.to_byte_array().hex_encode(), int(tex_of.get(pic % 4096, -1)), int(tex_of.get(pic / 4096 - 1, -2))])
+	else:
+		for e: Array in ov.paint_list():
+			var tex: Texture2D = null if str(e[0]) == "s" else e[1]
+			out.append("%s:%d:%s" % [str(e[0]), tex.get_instance_id() if tex != null else 0,
+				var_to_bytes([e[2], float(e[3])]).hex_encode()])
+	return out
+
+
+static func _native_ready() -> bool:
+	return preload("res://scripts/native_library.gd").ensure() and ClassDB.class_exists(&"AltIconsNative")
+
+
+func _inc_compare(sc: IncScene, mode: String) -> Array:
+	AltOverlay.incremental = true
+	AltOverlay.native = inc_native
+	_w4_switches(true)
+	_inc_settle(sc.inc, mode)
+	var a := _inc_snapshot(sc.inc, mode)
+	var a_exact := _exact_sig(sc.inc, mode)
+	if inc_native:
+		check(sc.inc._gpu_nat_on, "alt_overlay incremental: the overlay under test uses AltIconsNative")
+	_w4_switches(false)
+	_inc_settle(sc.off, mode)
+	var c_exact := _exact_sig(sc.off, mode)
+	_w4_switches(true)
+	if a_exact != c_exact:
+		a.append("differs to the byte from the switches off (%d vs %d rows)" % [a_exact.size(), c_exact.size()])
+	AltOverlay.native = false
+	AltOverlay.incremental = false
+	sc.ref._clear_caches()
+	sc.ref._gpu_global_key = []
+	_inc_settle(sc.ref, mode)
+	var b := _inc_snapshot(sc.ref, mode)
+	AltOverlay.incremental = true
+	return [a, b]
+
+
+func _inc_parity_run(mode: String) -> void:
+	AltOverlay.icons_mode = mode
+	AltOverlay.incremental = true
+	var grid := 4
+	var sc := _inc_scene(grid)
+	var w = sc.w
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 20261126
+	var unit := 100
+	var adds := {}  # unit -> [chunk, add array, kind]
+	var ac := {}  # unit -> ac row (the chests' current contents)
+	var am := {}  # unit -> am row
+	var fluids := {}
+	var unloaded := {}  # chunk -> [add arrays]
+	var used_tiles := {}
+	var last_hill: Variant = null  # [image, origin, step] of the last field set
+	Bridge.set_alt_contents(true)
+	var send := func(msg: Dictionary) -> void:
+		if msg.has("g"):
+			msg["g"] = Bridge.alt_contents
+		w.handle(msg)
+		Bridge.message_received.emit(msg)
+	var free_tile := func(c: Vector2i) -> Vector2i:
+		for _t in 40:
+			var tile := Vector2i(c.x * 32 + 2 + rng.randi_range(0, 7) * 4, c.y * 32 + 2 + rng.randi_range(0, 7) * 4)
+			if not used_tiles.has(tile):
+				used_tiles[tile] = true
+				return tile
+		return Vector2i(-99999, -99999)
+	var loaded := func() -> Array:
+		return w.chunks.keys()
+	# A start: a few of each kind in every chunk.
+	for c: Vector2i in w.chunks.keys():
+		for k in 7:
+			var tile: Vector2i = free_tile.call(c)
+			unit += 1
+			var proto: int = [1, 1, 3, 3, 5, 2, 6][k]
+			var extra := {}
+			if proto == 1:
+				extra = {"ai": ["recipe", INC_RECIPES[rng.randi_range(0, 3)]]}
+			elif proto == 2:
+				extra = {"ai": ["item", INC_ITEMS[rng.randi_range(0, 4)]]}
+			var arr := [unit, proto, tile.x * 256 + 128, tile.y * 256 + 128, 0, extra]
+			w._add(arr)
+			adds[unit] = [c, arr, proto]
+			if proto == 1:
+				am[unit] = [unit, ["speed-module-3", ["productivity-module-3", "rare"]], []]
+			elif proto == 3:
+				ac[unit] = [unit, INC_ITEMS[rng.randi_range(0, 4)], [INC_ITEMS[rng.randi_range(0, 4)]]]
+			elif proto == 5 or proto == 6:
+				fluids[unit] = [{"fluid": INC_FLUIDS[rng.randi_range(0, 2)], "amount": 50, "capacity": 100}]
+		w.entities_changed.emit(c)
+	var beacon_tile: Vector2i = free_tile.call(Vector2i(1, 1))
+	unit += 1
+	var beacon_arr := [unit, 4, beacon_tile.x * 256 + 128, beacon_tile.y * 256 + 128, 0, {}]
+	w._add(beacon_arr)
+	adds[unit] = [Vector2i(1, 1), beacon_arr, 4]
+	am[unit] = [unit, ["speed-module-3", "speed-module-3"], []]
+	am[9001] = [9001, 0, ["iron-plate", "copper-plate"]]
+	sc.fp.fluids = fluids.duplicate()
+	send.call({"t": "ac", "g": 0, "l": ac.values()})
+	send.call({"t": "am", "g": 0, "l": am.values()})
+	send.call({"t": "fl"})
+	var first: Array = _inc_compare(sc, mode)
+	var ok := 0
+	var bad: Array = []
+	check(first[0] == first[1] and int(first[0][1]) > 0,
+		"alt_overlay incremental (%s%s): first sync matches a whole-map build (%d vs %d icons)" % [mode, " native" if inc_native else "", int(first[0][1]), int(first[1][1])])
+	var kinds_seen := {}
+	for step in 200:
+		var ev := rng.randi_range(0, 17)
+		var units: Array = adds.keys()
+		var pick: int = units[rng.randi_range(0, units.size() - 1)] if not units.is_empty() else -1
+		match ev:
+			0, 1, 2:  # a machine, chest or pipe built
+				var chunks: Array = loaded.call()
+				var c: Vector2i = chunks[rng.randi_range(0, chunks.size() - 1)]
+				var tile: Vector2i = free_tile.call(c)
+				if tile.x < -9999:
+					continue
+				unit += 1
+				var proto: int = [1, 3, 5][ev]
+				var extra := {"ai": ["recipe", INC_RECIPES[rng.randi_range(0, 3)]]} if proto == 1 else {}
+				var arr := [unit, proto, tile.x * 256 + 128, tile.y * 256 + 128, 0, extra]
+				w._add(arr)
+				adds[unit] = [c, arr, proto]
+				w.entities_changed.emit(c)
+				if proto == 1 and rng.randf() < 0.7:
+					am[unit] = [unit, ["speed-module-3"], []]
+					send.call({"t": "am", "g": 0, "l": [am[unit]]})
+				elif proto == 3:
+					ac[unit] = [unit, INC_ITEMS[rng.randi_range(0, 4)]]
+					send.call({"t": "ac", "g": 0, "l": [ac[unit]]})
+				elif proto == 5:
+					fluids[unit] = [{"fluid": INC_FLUIDS[rng.randi_range(0, 2)], "amount": 10, "capacity": 100}]
+					sc.fp.fluids = fluids.duplicate()
+					send.call({"t": "fl"})
+			3:  # one removed
+				if pick < 0 or not w.entities.has(pick):
+					continue
+				var c: Vector2i = adds[pick][0]
+				w._remove(pick)
+				adds.erase(pick)
+				w.entities_changed.emit(c)
+				if rng.randf() < 0.5:  # the bridge tells (or not yet)
+					if ac.erase(pick):
+						send.call({"t": "ac", "g": 0, "l": [[pick]]})
+					if am.erase(pick):
+						send.call({"t": "am", "g": 0, "l": [[pick]]})
+			4:  # a chest's contents
+				var chests: Array = ac.keys()
+				if chests.is_empty():
+					continue
+				var u: int = chests[rng.randi_range(0, chests.size() - 1)]
+				if rng.randf() < 0.2:
+					ac.erase(u)
+					send.call({"t": "ac", "g": 0, "l": [[u]]})
+				else:
+					ac[u] = [u, INC_ITEMS[rng.randi_range(0, 4)], [INC_ITEMS[rng.randi_range(0, 4)], INC_ITEMS[rng.randi_range(0, 4)]]]
+					send.call({"t": "ac", "g": 0, "l": [ac[u]]})
+			5:  # a machine's modules (or the wagon's cargo)
+				var machines: Array = am.keys()
+				if machines.is_empty():
+					continue
+				var u: int = machines[rng.randi_range(0, machines.size() - 1)]
+				if rng.randf() < 0.2 and u != 9001:
+					am.erase(u)
+					send.call({"t": "am", "g": 0, "l": [[u]]})
+				else:
+					var list: Array = []
+					for _m in rng.randi_range(1, 4):
+						list.append(["speed-module-3", "productivity-module-3", ["efficiency-module", "rare"]][rng.randi_range(0, 2)])
+					am[u] = [u, 0, list] if u == 9001 else [u, list, []]
+					send.call({"t": "am", "g": 0, "l": [am[u]]})
+			6:  # `aiu`: a recipe changed, or a chest given (or losing) a filter icon of its own
+				if pick < 0 or not w.entities.has(pick):
+					continue
+				var proto: int = adds[pick][2]
+				if proto == 1:
+					send.call({"t": "aiu", "l": [[pick, "recipe", INC_RECIPES[rng.randi_range(0, 3)]]]})
+				elif proto == 3:
+					if rng.randf() < 0.5:
+						send.call({"t": "aiu", "l": [[pick, "item", "coal"]]})
+					else:
+						send.call({"t": "aiu", "l": [[pick, ""]]})
+				else:
+					continue
+			7:  # `fl`: one changed, one emptied, one new, one gone
+				var next := fluids.duplicate()
+				var fu: Array = next.keys()
+				if fu.size() >= 3:
+					next[fu[0]] = [{"fluid": INC_FLUIDS[rng.randi_range(0, 2)], "amount": 40, "capacity": 100}]
+					next[fu[1]] = [{"fluid": "water", "amount": 0, "capacity": 100}]
+					next.erase(fu[2])
+				for u in adds:
+					if (adds[u][2] == 5 or adds[u][2] == 6) and not next.has(u):
+						next[u] = [{"fluid": "steam", "amount": 5, "capacity": 100}]
+						break
+				fluids = next
+				sc.fp.fluids = fluids.duplicate()
+				send.call({"t": "fl"})
+			8:  # `fl` with the same fluids
+				sc.fp.fluids = fluids.duplicate()
+				send.call({"t": "fl"})
+			9:  # a chunk unloaded
+				var chunks: Array = loaded.call()
+				if chunks.size() <= 4:
+					continue
+				var c: Vector2i = chunks[rng.randi_range(0, chunks.size() - 1)]
+				var cv = w.chunks[c]
+				var saved: Array = []
+				for r in cv.entities.values():
+					w.entities.erase(r.key)
+					if adds.has(r.unit):
+						saved.append(adds[r.unit])
+						adds.erase(r.unit)
+				w.chunks.erase(c)
+				unloaded[c] = saved
+				w.entities_changed.emit(c)
+			10:  # a chunk loaded again
+				if unloaded.is_empty():
+					continue
+				var c: Vector2i = unloaded.keys()[rng.randi_range(0, unloaded.size() - 1)]
+				w.chunks[c] = ChunkView.new()
+				for e: Array in unloaded[c]:
+					w._add(e[1])
+					adds[int(e[1][0])] = e
+				unloaded.erase(c)
+				w.entities_changed.emit(c)
+			11:  # Alt-mode off and on (a new g: the bridge sends everything again)
+				Bridge.set_alt_contents(false)
+				Bridge.set_alt_contents(true)
+				send.call({"t": "ac", "g": 0, "l": ac.values()})
+				send.call({"t": "am", "g": 0, "l": am.values()})
+			12:  # the ground's heights (--alt-relift: every format, a fade and its steps, the same field again)
+				var hk := rng.randi_range(0, 7)
+				if hk <= 3 or (hk == 5 and last_hill == null):
+					var fmt: int = [Image.FORMAT_RF, Image.FORMAT_RGF, Image.FORMAT_RGBF, Image.FORMAT_RF][hk % 4]
+					var hill := Image.create(rng.randi_range(9, 40), rng.randi_range(9, 40), false, fmt)
+					for hy in hill.get_height():
+						for hx in hill.get_width():
+							hill.set_pixel(hx, hy, Color(rng.randf_range(-1.0, 4.0), rng.randf_range(-1.0, 3.0), rng.randf(), 1.0))
+					if hk == 3:
+						hill.set_meta(&"fade_in", 3.0)  # faded in from the field before (mix 0)
+					last_hill = [hill, Vector2(rng.randi_range(-20, 90) + 0.25, rng.randi_range(-20, 90)), rng.randf_range(0.5, 3.0)]
+					if rng.randf() < 0.3:  # set while chunks wait to be built
+						var dc: Array = loaded.call()
+						w.entities_changed.emit(dc[rng.randi_range(0, dc.size() - 1)])
+					GroundHeight.set_field(last_hill[0], last_hill[1], last_hill[2])
+				elif hk == 4 and GroundHeight.fading():
+					# The fade a step on: its mix moved, version() with it.
+					GroundHeight._fade_from -= int(GroundHeight._fade_usec * rng.randf_range(0.25, 0.4))
+					GroundHeight._fade_on()
+				elif hk == 5:
+					GroundHeight.set_field(last_hill[0], last_hill[1], last_hill[2])  # the same field again
+				else:
+					GroundHeight.clear()
+			13:  # the wagon moved
+				sc.trains.handle({"t": "mv", "k": 10 + step, "l": [[9001, 7, rng.randi_range(5, 100) * 256, rng.randi_range(5, 100) * 256, 0]]})
+				sc.trains._process(0.1)
+			14:  # world.gd built a chunk again with no record changed (--alt-quiet-builds: nothing to do)
+				var chunks: Array = loaded.call()
+				for _q in rng.randi_range(1, 3):
+					w.entities_changed.emit(chunks[rng.randi_range(0, chunks.size() - 1)])
+			15:  # a record sent again in place (another recipe), its chunk's signal after
+				if pick < 0 or not w.entities.has(pick) or int(adds[pick][2]) != 1:
+					continue
+				var arr: Array = (adds[pick][1] as Array).duplicate(true)
+				arr[5] = {"ai": ["recipe", INC_RECIPES[rng.randi_range(0, 3)]]}
+				w._add(arr)
+				adds[pick][1] = arr
+				w.entities_changed.emit(adds[pick][0])
+			16:  # one removed and another built on its tile in one frame, one signal
+				if pick < 0 or not w.entities.has(pick):
+					continue
+				var c: Vector2i = adds[pick][0]
+				var old: Array = adds[pick][1]
+				var proto: int = adds[pick][2]
+				w._remove(pick)
+				adds.erase(pick)
+				unit += 1
+				var arr := [unit, proto, old[2], old[3], 0, ({"ai": ["recipe", INC_RECIPES[rng.randi_range(0, 3)]]} if proto == 1 else {})]
+				w._add(arr)
+				adds[unit] = [c, arr, proto]
+				if proto == 3:
+					ac[unit] = [unit, INC_ITEMS[rng.randi_range(0, 4)]]
+					send.call({"t": "ac", "g": 0, "l": [ac[unit]]})
+				w.entities_changed.emit(c)
+			17:  # the chunk's tiles only
+				var chunks: Array = loaded.call()
+				var c: Vector2i = chunks[rng.randi_range(0, chunks.size() - 1)]
+				var ids := PackedInt32Array()
+				ids.resize(ChunkView.SIZE * ChunkView.SIZE)
+				ids.fill(rng.randi_range(1, 9))
+				w.chunks[c].set_tiles(ids)
+				w.entities_changed.emit(c)
+		kinds_seen[ev] = true
+		var res: Array = _inc_compare(sc, mode)
+		if res[0] == res[1]:
+			ok += 1
+		elif bad.size() < 3:
+			bad.append("step %d event %d: %d vs %d icons" % [step, ev, int(res[0][1]), int(res[1][1])])
+	check(bad.is_empty() and kinds_seen.size() == 18,
+		"alt_overlay incremental (%s%s): %d of 200 seeded events match a whole-map build (event kinds %d of 18) %s"
+		% [mode, " native" if inc_native else "", ok, kinds_seen.size(), str(bad)])
+	GroundHeight.clear()
+	_inc_free(sc)
+
+
+## The 144-chunk base of the incremental tests (sc from _inc_scene(12)): machines, chests, inserters and pipes in
+## every chunk, their `ac`, `am` and `fl` sent, the camera over its middle. Returns the fluids.
+func _inc_populate(sc: IncScene) -> Dictionary:
+	var w = sc.w
+	Bridge.set_alt_contents(true)
+	var g: int = Bridge.alt_contents
+	var unit := 1000
+	var ac_rows: Array = []
+	var am_rows: Array = []
+	var fluids := {}
+	for c: Vector2i in w.chunks.keys():
+		var ox := c.x * 32
+		var oy := c.y * 32
+		for i in 20:
+			unit += 1
+			w._add([unit, 1, (ox + 2 + (i % 8) * 4) * 256 + 128, (oy + 2 + (i / 8) * 4) * 256 + 128, 0,
+				{"ai": ["recipe", INC_RECIPES[i % 4]]}])
+			am_rows.append([unit, ["speed-module-3", "productivity-module-3"], []])
+		for i in 10:
+			unit += 1
+			w._add([unit, 3, (ox + i) * 256 + 128, (oy + 28) * 256 + 128, 0])
+			ac_rows.append([unit, INC_ITEMS[i % 5], [INC_ITEMS[(i + 1) % 5]]])
+		for i in 5:
+			unit += 1
+			w._add([unit, 2, (ox + i) * 256 + 128, (oy + 30) * 256 + 128, 0, {"ai": ["item", INC_ITEMS[i % 5]]}])
+		for i in 60:
+			unit += 1
+			w._add([unit, 5, (ox + i % 32) * 256 + 128, (oy + 24 + i / 32) * 256 + 128, 0])
+			fluids[unit] = [{"fluid": INC_FLUIDS[(c.x + c.y + 64) % 3], "amount": 50, "capacity": 100}]
+	sc.fp.fluids = fluids
+	for msg in [{"t": "ac", "g": g, "l": ac_rows}, {"t": "am", "g": g, "l": am_rows}, {"t": "fl"}]:
+		w.handle(msg)
+		Bridge.message_received.emit(msg)
+	sc.rig.camera.position = Vector3(192, 110, 262)
+	sc.rig.camera.look_at(Vector3(192, 0, 192))
+	return fluids
+
+
+## The CPU path (first person, remote fog, Compatibility) on the 144-chunk base: a change of an "all" key
+## (the ground's heights, the icons' pictures) keeps the per-chunk stores and builds the chunks again a few a
+## frame, so the first frame after it still draws every icon (before perf-fix-r1: about a third, for 20+ frames).
+func _inc_no_blink() -> void:
+	AltOverlay.icons_mode = "cpu"
+	AltOverlay.incremental = true
+	var sc := _inc_scene(12)
+	var ov = sc.inc
+	_inc_populate(sc)
+	await get_tree().process_frame
+	var hill := Image.create(16, 16, false, Image.FORMAT_RF)
+	hill.fill(Color(1.5, 0, 0))
+	GroundHeight.set_field(hill, Vector2(500, 500), 2.0)  # far off: no icon moves
+	_inc_settle(ov, "cpu")
+	var settled: int = ov.drawn
+	var report := PackedStringArray()
+	var worst := settled
+	for what in ["heights", "pictures"]:
+		if what == "heights":
+			GroundHeight.clear()
+		else:
+			AltOverlay.use_spec = not AltOverlay.use_spec
+		ov.collect()
+		var first: int = ov.drawn
+		var frames := 1
+		while ov._inc_view_left and frames < 60:
+			ov.collect()
+			frames += 1
+		worst = mini(worst, first)
+		report.append("%s: %d of %d icons in the first frame, %d frames to rebuild" % [what, first, settled, frames])
+		if what == "pictures":
+			AltOverlay.use_spec = not AltOverlay.use_spec
+			_inc_settle(ov, "cpu")
+	print("alt_overlay incremental (cpu): ", ", ".join(report))
+	check(settled > 0 and worst == settled,
+		"alt_overlay incremental (cpu): an \"all\" key change keeps every icon drawn while chunks rebuild (%s)" % ", ".join(report))
+	GroundHeight.clear()
+	_inc_free(sc)
+
+
+func _inc_on_change_only() -> void:
+	AltOverlay.icons_mode = "gpu"
+	AltOverlay.incremental = true
+	var sc := _inc_scene(12)
+	var w = sc.w
+	var ov = sc.inc
+	var fluids := _inc_populate(sc)
+	await get_tree().process_frame
+	_inc_settle(ov, "gpu")
+	var chunks: Array = w.chunks.keys()
+	var in_view: Vector2i = Vector2i(6, 6)
+	# One chunk built again: its three kinds, not every chunk's.
+	var b0: int = ov.chunk_builds
+	w.chunks[in_view].content_rev += 1  # a record changed (--alt-quiet-builds leaves a signal with none alone)
+	w.entities_changed.emit(in_view)
+	var t0 := Time.get_ticks_usec()
+	ov._process(1.0 / 60.0)
+	var one_ms := (Time.get_ticks_usec() - t0) / 1000.0
+	_inc_settle(ov, "gpu")
+	var one_builds: int = ov.chunk_builds - b0
+	# `fl` with the same fluids: nothing built or sent.
+	var b1: int = ov.chunk_builds
+	var u1: int = ov.gpu_uploads
+	sc.fp.fluids = fluids.duplicate()
+	var fl_msg := {"t": "fl"}
+	Bridge.message_received.emit(fl_msg)
+	_inc_settle(ov, "gpu")
+	var fl_builds: int = ov.chunk_builds - b1
+	var fl_uploads: int = ov.gpu_uploads - u1
+	# 20 idle frames.
+	var b2: int = ov.chunk_builds
+	var u2: int = ov.gpu_uploads
+	for _f in 20:
+		ov._process(1.0 / 60.0)
+	var idle_builds: int = ov.chunk_builds - b2
+	var idle_uploads: int = ov.gpu_uploads - u2
+	check(one_builds > 0 and one_builds <= 3 and fl_builds == 0 and fl_uploads == 0 and idle_builds == 0 and idle_uploads == 0,
+		"alt_overlay incremental: one chunk changed -> %d builds (of %d chunks), same `fl` -> %d builds %d uploads, 20 idle frames -> %d builds %d uploads"
+		% [one_builds, chunks.size(), fl_builds, fl_uploads, idle_builds, idle_uploads])
+	# Cost guard (loose): one chunk's change on the 144-chunk base, median of 9.
+	var times: Array = []
+	for i in 9:
+		w.chunks[chunks[(i * 7) % chunks.size()]].content_rev += 1
+		w.entities_changed.emit(chunks[(i * 7) % chunks.size()])
+		t0 = Time.get_ticks_usec()
+		ov._process(1.0 / 60.0)
+		times.append((Time.get_ticks_usec() - t0) / 1000.0)
+		_inc_settle(ov, "gpu")
+	times.sort()
+	var med_inc: float = times[4]
+	# The same with the whole-map caches, for the log.
+	AltOverlay.incremental = false
+	ov._clear_caches()
+	ov._gpu_global_key = []
+	_inc_settle(ov, "gpu")
+	var old_times: Array = []
+	for i in 5:
+		w.chunks[chunks[(i * 7) % chunks.size()]].content_rev += 1
+		w.entities_changed.emit(chunks[(i * 7) % chunks.size()])
+		t0 = Time.get_ticks_usec()
+		ov._process(1.0 / 60.0)
+		old_times.append((Time.get_ticks_usec() - t0) / 1000.0)
+		_inc_settle(ov, "gpu")
+	old_times.sort()
+	AltOverlay.incremental = true
+	print("alt_overlay incremental: one chunk event on 144 chunks: %.2f ms (first %.2f), --alt-incremental=off %.2f ms"
+		% [med_inc, one_ms, float(old_times[2])])
+	check(med_inc < 5.0, "alt_overlay incremental: one chunk event's _process on 144 chunks %.2f ms (< 5 ms; whole-map %.2f ms)"
+		% [med_inc, float(old_times[2])])
+	_inc_free(sc)
+
+
+## --alt-relift on the 144-chunk base, the card's path (GDScript, then native when loaded): a new field builds no
+## chunk again (each cache lifted), the same field again sends nothing, and the buffer equals --alt-relift=off's.
+func _inc_relift_counts() -> void:
+	AltOverlay.icons_mode = "gpu"
+	AltOverlay.incremental = true
+	var prev_native := AltOverlay.native
+	var natives := [false, true] if _native_ready() else [false]
+	for nat: bool in natives:
+		AltOverlay.native = nat
+		AltOverlay.relift = true
+		var sc := _inc_scene(12)
+		var ov = sc.inc
+		_inc_populate(sc)
+		await get_tree().process_frame
+		_inc_settle(ov, "gpu")
+		AltOverlay.relift = false
+		_inc_settle(sc.off, "gpu")
+		AltOverlay.relift = true
+		var hill := Image.create(96, 96, false, Image.FORMAT_RGF)
+		var rng := RandomNumberGenerator.new()
+		rng.seed = 7
+		for hy in 96:
+			for hx in 96:
+				hill.set_pixel(hx, hy, Color(rng.randf_range(0.0, 3.0), rng.randf_range(0.0, 2.0), 0, 1))
+		var b0: int = ov.chunk_builds
+		var u0: int = ov.gpu_uploads
+		var l0: int = ov.relifts
+		GroundHeight.set_field(hill, Vector2(-8, -8), 4.0)
+		var t0 := Time.get_ticks_usec()
+		_inc_settle(ov, "gpu")
+		var on_ms := (Time.get_ticks_usec() - t0) / 1000.0
+		var new_builds: int = ov.chunk_builds - b0
+		var new_uploads: int = ov.gpu_uploads - u0
+		var lifted: int = ov.relifts - l0
+		AltOverlay.relift = false
+		var ob0: int = sc.off.chunk_builds
+		t0 = Time.get_ticks_usec()
+		_inc_settle(sc.off, "gpu")
+		var off_ms := (Time.get_ticks_usec() - t0) / 1000.0
+		var off_builds: int = sc.off.chunk_builds - ob0
+		var b := _exact_sig(sc.off, "gpu")
+		AltOverlay.relift = true
+		var a := _exact_sig(ov, "gpu")
+		var b1: int = ov.chunk_builds
+		var u1: int = ov.gpu_uploads
+		GroundHeight.set_field(hill, Vector2(-8, -8), 4.0)  # the same field again
+		t0 = Time.get_ticks_usec()
+		_inc_settle(ov, "gpu")
+		var same_ms := (Time.get_ticks_usec() - t0) / 1000.0
+		var same_builds: int = ov.chunk_builds - b1
+		var same_uploads: int = ov.gpu_uploads - u1
+		var a2 := _exact_sig(ov, "gpu")
+		print("alt_overlay relift (%s): a new field on 144 chunks settled in %.1f ms (%d caches lifted), --alt-relift=off %.1f ms (%d chunk builds); the same field again %.1f ms"
+			% ["native" if nat else "GDScript", on_ms, lifted, off_ms, off_builds, same_ms])
+		check(new_builds == 0 and new_uploads >= 1 and lifted > 0 and same_builds == 0 and same_uploads == 0 and a == b and a2 == a and a.size() > 0,
+			"alt_overlay relift (%s): a new field -> %d chunk builds, %d uploads, %d caches lifted; the same field again -> %d builds %d uploads; buffer equal to --alt-relift=off's: %s (%d instances)"
+			% ["native" if nat else "GDScript", new_builds, new_uploads, lifted, same_builds, same_uploads, a == b, a.size()])
+		GroundHeight.clear()
+		_inc_free(sc)
+	AltOverlay.native = prev_native
+
+
+## --alt-quiet-builds on the 144-chunk base, the card's path: chunks' signals with no record changed build and send
+## nothing and ask no redraw (=off: each builds its chunk again); a record changed in place with its signal builds
+## its chunk and sends it.
+func _inc_quiet_counts() -> void:
+	AltOverlay.icons_mode = "gpu"
+	AltOverlay.incremental = true
+	var sc := _inc_scene(12)
+	var w = sc.w
+	var ov = sc.inc
+	_inc_populate(sc)
+	await get_tree().process_frame
+	_inc_settle(ov, "gpu")
+	var report := {}
+	for quiet: bool in [true, false]:
+		AltOverlay.quiet_builds = quiet
+		_inc_settle(ov, "gpu")
+		var b0: int = ov.chunk_builds
+		var u0: int = ov.gpu_uploads
+		var r0: int = ov._alt_rev
+		for i in 12:
+			w.entities_changed.emit(Vector2i(i, (i * 5) % 12))
+		_inc_settle(ov, "gpu")
+		report[quiet] = [ov.chunk_builds - b0, ov.gpu_uploads - u0, ov._alt_rev - r0]
+	AltOverlay.quiet_builds = true
+	_inc_settle(ov, "gpu")
+	# A machine's recipe sent again in place: its chunk built and sent.
+	var r: WorldMirror.Rec = null
+	for e: WorldMirror.Rec in w.chunks[Vector2i(6, 6)].entities.values():
+		if e.proto_id == 1:
+			r = e
+			break
+	var b1: int = ov.chunk_builds
+	var u1: int = ov.gpu_uploads
+	w._add([r.unit, 1, int(r.pos.x * 256.0), int(r.pos.y * 256.0), 0, {"ai": ["recipe", "pipe" if WorldMirror.alt_icon(r).has("iron-gear-wheel") else "iron-gear-wheel"]}])
+	w.entities_changed.emit(Vector2i(6, 6))
+	_inc_settle(ov, "gpu")
+	var moved_builds: int = ov.chunk_builds - b1
+	var moved_uploads: int = ov.gpu_uploads - u1
+	# A machine whose selection box is off its centre turned in place (as a Zenith-only turn, a predicted turn or its
+	# revert do: world.record_edited, perf-w4-fix B-S1): its icon moves, so its chunk is built and sent again with
+	# --alt-quiet-builds on (before, only cache_gen and a redraw: content_rev unchanged, the signal left alone).
+	var mc := Vector2i(6, 6)
+	w.protos.add_entities([[8, "assembling-machine-3", "assembling-machine", -1.5, -1.5, 1.5, 0.5, 150, 150, 150, 3, 3]])
+	w._add([990001, 8, (mc.x * 32 + 16) * 256 + 128, (mc.y * 32 + 17) * 256 + 128, 0, {"ai": ["recipe", "pipe"]}])
+	w.entities_changed.emit(mc)
+	_inc_settle(ov, "gpu")
+	var tr_rec: WorldMirror.Rec = w.entities.get(990001)
+	var data0: PackedFloat32Array = ov._gpu_chunk_data(mc)
+	var b2: int = ov.chunk_builds
+	var u2: int = ov.gpu_uploads
+	tr_rec.dir = posmod(tr_rec.dir + 4, 16)
+	w.record_edited(tr_rec)
+	w.entities_changed.emit(mc)
+	_inc_settle(ov, "gpu")
+	var turned_builds: int = ov.chunk_builds - b2
+	var turned_uploads: int = ov.gpu_uploads - u2
+	check(turned_builds > 0 and turned_uploads > 0 and ov._gpu_chunk_data(mc) != data0,
+		"alt_overlay quiet builds: a turned machine with an off-centre selection rebuilds its chunk's icons (%d builds %d uploads)" % [turned_builds, turned_uploads])
+	var q: Array = report[true]
+	var o: Array = report[false]
+	print("alt_overlay quiet builds: 12 unchanged signals -> %d builds %d uploads (--alt-quiet-builds=off %d builds); one record changed -> %d builds %d uploads"
+		% [int(q[0]), int(q[1]), int(o[0]), moved_builds, moved_uploads])
+	check(int(q[0]) == 0 and int(q[1]) == 0 and int(q[2]) == 0 and int(o[0]) > 0 and moved_builds > 0 and moved_uploads > 0,
+		"alt_overlay quiet builds: 12 signals with no record changed -> %d builds %d uploads %d redraw revs (--alt-quiet-builds=off: %d builds %d uploads); a record changed in place -> %d builds %d uploads"
+		% [int(q[0]), int(q[1]), int(q[2]), int(o[0]), int(o[1]), moved_builds, moved_uploads])
+	_inc_free(sc)
+
+
+## --alt-icons-later, the card's path: a chest holding a kind whose icon was never read builds without it, reading
+## nothing on the main thread (ItemIcons.is_cached still false after the build); once the worker's read is taken
+## the chunk is built again and the buffer equals --alt-icons-later=off's.
+func _inc_icons_later() -> void:
+	AltOverlay.icons_mode = "gpu"
+	AltOverlay.incremental = true
+	AltOverlay.icons_later = true
+	var sc := _inc_scene(2)
+	var w = sc.w
+	var cold := "f3d-cold-test-icon-%d" % Time.get_ticks_usec()
+	Bridge.set_alt_contents(true)
+	w._add([501, 3, 5 * 256 + 128, 5 * 256 + 128, 0])
+	w._add([502, 3, 9 * 256 + 128, 5 * 256 + 128, 0])
+	w.entities_changed.emit(Vector2i(0, 0))
+	var msg := {"t": "ac", "g": Bridge.alt_contents, "l": [[501, cold, ["iron-plate"]], [502, "iron-plate"]]}
+	w.handle(msg)
+	Bridge.message_received.emit(msg)
+	var ov = sc.inc
+	ov._process(1.0 / 60.0)  # the first build
+	var cached_after := ItemIcons.is_cached(cold)
+	var waiting: bool = ov._icon_wait.has(cold)
+	var before := _exact_sig(ov, "gpu")
+	_inc_settle(ov, "gpu")
+	var after := _exact_sig(ov, "gpu")
+	AltOverlay.icons_later = false
+	_inc_settle(sc.off, "gpu")
+	var ref := _exact_sig(sc.off, "gpu")
+	AltOverlay.icons_later = true
+	print("alt_overlay icons later: cold icon cached after the first build: %s; %d instances, %d after the read, --alt-icons-later=off %d"
+		% [cached_after, before.size(), after.size(), ref.size()])
+	check(not cached_after and waiting and after == ref and after.size() > before.size() and before.size() > 0,
+		"alt_overlay icons later: a cold icon read on a worker (cached on the main thread after the first build: %s), %d instances then %d after its read, equal to --alt-icons-later=off's %d: %s"
+		% [cached_after, before.size(), after.size(), ref.size(), after == ref])
+	_inc_free(sc)
+
+
+## Whether the three whole-map caches (or, --alt-incremental, their per-chunk keys) were built for this
+## ModGraphics.generation (what 0) or ModelPacks.icons_version (what 1).
+static func _whole_keys_at(overlay, v: int, what: int) -> bool:
+	if AltOverlay.incremental:
+		return int(overlay._inc_ac_key[5 + what]) == v and int(overlay._inc_am_key[5 + what]) == v \
+			and int(overlay._inc_fl_key[3 + what]) == v
+	if what == 0:
+		return overlay._cached_ac_gfx == v and overlay._cached_am_gfx == v and overlay._cached_fl_gfx == v
+	return overlay._cached_ac_icons == v and overlay._cached_am_icons == v and overlay._cached_fl_icons == v
+
+
 func _count_texture_runs(list: Array) -> int:
 	var runs := 0
 	var prev_tex: Texture2D = null
@@ -392,6 +1255,16 @@ func _count_texture_runs(list: Array) -> int:
 			runs += 1
 			prev_tex = tex
 	return runs
+
+
+## collect() until no chunk in view is left for the next frame (--alt-incremental builds at most
+## ALT_VIEW_BUDGET_USEC of chunks a frame).
+static func _collect_settled(overlay) -> void:
+	overlay.collect()
+	for _i in 50:
+		if not overlay._inc_view_left:
+			break
+		overlay.collect()
 
 
 func _test_alt_overlay_flat_batching() -> void:
@@ -471,13 +1344,13 @@ func _test_alt_overlay_flat_batching() -> void:
 
 	AltOverlay.flat_batch_tex = false
 	overlay._layers_key = []
-	overlay.collect()
+	_collect_settled(overlay)
 	var unbatched_list := overlay.paint_list()
 	var unbatched_runs := _count_texture_runs(unbatched_list)
 
 	AltOverlay.flat_batch_tex = true
 	overlay._layers_key = []
-	overlay.collect()
+	_collect_settled(overlay)
 	var batched_list := overlay.paint_list()
 	var batched_runs := _count_texture_runs(batched_list)
 
@@ -495,14 +1368,14 @@ func _test_alt_overlay_flat_batching() -> void:
 	for k in 5:
 		rig.camera.position.x += 0.2
 		AltOverlay.use_cache = true
-		overlay.collect()
+		_collect_settled(overlay)
 	var cached_usec := Time.get_ticks_usec() - t0
 
 	t0 = Time.get_ticks_usec()
 	for k in 5:
 		rig.camera.position.x -= 0.2
 		AltOverlay.use_cache = false
-		overlay.collect()
+		_collect_settled(overlay)
 	var uncached_usec := Time.get_ticks_usec() - t0
 
 	print("alt_perf_test _flat (size 140): %d icons, tex runs unbatched=%d -> batched=%d, wrong_occlusion=%d, 5-pan cached=%.2f ms vs uncached=%.2f ms"
@@ -516,11 +1389,11 @@ func _test_alt_overlay_flat_batching() -> void:
 	rig.camera.size = 260.0
 	AltOverlay.flat_batch_tex = false
 	overlay._layers_key = []
-	overlay.collect()
+	_collect_settled(overlay)
 	var far_unbatched := _count_texture_runs(overlay.paint_list())
 	AltOverlay.flat_batch_tex = true
 	overlay._layers_key = []
-	overlay.collect()
+	_collect_settled(overlay)
 	var far_batched_list := overlay.paint_list()
 	var far_batched := _count_texture_runs(far_batched_list)
 	var far_icons: Array = far_batched_list.filter(func(e): return str(e[0]) == "i")

@@ -12,9 +12,14 @@ extends Button
 
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## crafting_queue_slot's pie_progress_color.
 const PIE_COLOR := Color(0.98, 0.66, 0.22, 0.5)
+const HIGHLIGHT_MS := 1000.0
+
+static var slot_flash := not Switches.has("--inv-slot-flash=off")
+var highlight_until := 0
 
 ## Mouse button pressed on the slot (MOUSE_BUTTON_LEFT/RIGHT/MIDDLE), with Shift held or not.
 signal clicked(button_index: int, shift: bool)
@@ -76,6 +81,11 @@ var durability := -1.0
 ## A blueprint's, book's or planner's icons ([[signal type, name], ...]): Factorio draws them over
 ## the item, one big or up to four in a square.
 var record_icons: Array = []
+## Logistic request state: max limit (-1 none), status fulfillment background tint, and quality
+## comparator ("=", "≠", "<", "≤", ">", "≥").
+var max_count := -1
+var status_tint := Color(0, 0, 0, 0)
+var quality_comparator := ""
 
 ## Factorio's quality colours (quality.lua), for names in tooltips.
 const QUALITY_COLORS := {"uncommon": Color8(43, 230, 43), "rare": Color8(25, 128, 255), "epic": Color8(180, 0, 255),
@@ -89,6 +99,25 @@ func _init() -> void:
 	theme_type_variation = "FSlot"
 	custom_minimum_size = Kit.pxv(Kit.SLOT, Kit.SLOT)
 	button_mask = MOUSE_BUTTON_MASK_LEFT | MOUSE_BUTTON_MASK_RIGHT | MOUSE_BUTTON_MASK_MIDDLE
+	set_process(false)
+
+
+func set_highlight(until_ms: int) -> void:
+	var target := until_ms if slot_flash else 0
+	if target <= Time.get_ticks_msec():
+		target = 0
+	if target == highlight_until:
+		return
+	highlight_until = target
+	set_process(highlight_until > 0)
+	queue_redraw()
+
+
+func _process(_delta: float) -> void:
+	if highlight_until <= Time.get_ticks_msec():
+		highlight_until = 0
+		set_process(false)
+	queue_redraw()
 
 
 func set_stack(new_item: String, new_count: int, is_ghost := false) -> void:
@@ -162,6 +191,16 @@ func set_progress(value: float) -> void:
 		queue_redraw()
 
 
+## Updates a logistic request slot's max limit, fulfillment tint, and quality comparator.
+func set_logistic_state(new_max: int, tint: Color, cmp := "") -> void:
+	var clean_cmp := "" if cmp == "=" else cmp
+	if new_max != max_count or not tint.is_equal_approx(status_tint) or clean_cmp != quality_comparator:
+		max_count = new_max
+		status_tint = tint
+		quality_comparator = clean_cmp
+		queue_redraw()
+
+
 func set_tip(title: String, lines: Array = []) -> void:
 	tip_title = title
 	tip_lines = lines
@@ -180,6 +219,13 @@ func _draw() -> void:
 	var rect := Rect2((size - Vector2(icon_size, icon_size)) * 0.5, Vector2(icon_size, icon_size))
 	if blocked:
 		draw_rect(Rect2(Vector2.ZERO, size).grow(-Kit.px(2)), Color(0.75, 0.1, 0.1, 0.55))
+	if status_tint.a > 0.0 and Switches.on("--logistic-status", true):
+		draw_rect(Rect2(Vector2.ZERO, size).grow(-Kit.px(2)), status_tint)
+	if highlight_until > 0:
+		var now := Time.get_ticks_msec()
+		if highlight_until > now:
+			var a := 0.55 * clampf(float(highlight_until - now) / HIGHLIGHT_MS, 0.0, 1.0)
+			draw_rect(Rect2(Vector2.ZERO, size).grow(-Kit.px(2)), Color(Kit.ORANGE, a))
 	if item == "":
 		if filter_item != "":
 			draw_texture_rect(Kit.item_icon(filter_item), rect, false, Color(1, 1, 1, 0.4))
@@ -204,6 +250,13 @@ func _draw() -> void:
 	if q_icon != null:
 		var qs := float(Kit.px(14))
 		draw_texture_rect(q_icon, Rect2(Vector2(Kit.px(2), size.y - qs - Kit.px(2)), Vector2(qs, qs)), false)
+	if quality_comparator != "":
+		var cf := Kit.font("bold")
+		var cfs := Kit.px(11)
+		var cx := float(Kit.px(17)) if q_icon != null else float(Kit.px(3))
+		var cpos := Vector2(cx, size.y - Kit.px(3))
+		draw_string_outline(cf, cpos, quality_comparator, HORIZONTAL_ALIGNMENT_LEFT, -1, cfs, Kit.px(2), Color(0, 0, 0, 0.9))
+		draw_string(cf, cpos, quality_comparator, HORIZONTAL_ALIGNMENT_LEFT, -1, cfs, Color(1.0, 0.88, 0.45))
 	if freshness >= 0.0 and not faded:
 		var bar := Rect2(Vector2(Kit.px(4), Kit.px(3)), Vector2(size.x - Kit.px(8), maxf(2.0, Kit.px(3))))
 		draw_rect(bar, Color(0, 0, 0, 0.6))
@@ -212,6 +265,15 @@ func _draw() -> void:
 	if bar_left >= 0.0 and bar_left < 1.0 and not faded:
 		var full := size.x - Kit.px(6)
 		draw_rect(Rect2(Vector2(Kit.px(3), size.y - Kit.px(5)), Vector2(maxf(1.0, full * bar_left), maxf(2.0, Kit.px(2)))), Color(0, 1, 0))
+	if max_count >= 0 and not faded:
+		var mf := Kit.font("bold")
+		var mfs := Kit.px(11)
+		var mtext := Kit.count_text(max_count)
+		var mw := mf.get_string_size(mtext, HORIZONTAL_ALIGNMENT_LEFT, -1, mfs).x
+		var mpos := Vector2(size.x - mw - Kit.px(3), Kit.px(12))
+		var mcol := Color(1.0, 0.72, 0.35) if max_count == 0 else Color(0.85, 0.9, 0.98)
+		draw_string_outline(mf, mpos, mtext, HORIZONTAL_ALIGNMENT_LEFT, -1, mfs, Kit.px(2), Color(0, 0, 0, 0.9))
+		draw_string(mf, mpos, mtext, HORIZONTAL_ALIGNMENT_LEFT, -1, mfs, mcol)
 	if count >= 0 and not faded:
 		var f := Kit.font("bold")
 		var fs := Kit.px(13)
@@ -290,7 +352,7 @@ func _tip_picture() -> Control:
 
 
 func _get_drag_data(_at_position: Vector2) -> Variant:
-	if drag_item == "" or spreading:
+	if drag_item == "" or spreading or Input.is_key_pressed(KEY_SHIFT):
 		return null
 	var preview := TextureRect.new()
 	preview.texture = Kit.item_icon(drag_item)

@@ -34,6 +34,7 @@ func _initialize() -> void:
 	_packs()
 	_cache_keep()
 	_choices()
+	_default_choices()
 	_bundled()
 	_icons()
 	_sounds()
@@ -286,7 +287,7 @@ func _builtin() -> void:
 		and by_id.has(ModelPacks.FACTORIO_ID), "three built-in packs and Factorio's: %s" % [by_id.keys()])
 	var counts: Array = [int(by_id.get("builtin:wube3dp", {}).get("count", 0)), int(by_id.get("builtin:fue5", {}).get("count", 0)),
 		int(by_id.get("builtin:placeholders", {}).get("count", 0))]
-	check(counts == [94, 142, 377], "Wube3DP 94 models, FUE5 142, Placeholders 377 (613): %s" % [counts])
+	check(counts == [94, 142, 378], "Wube3DP 94 models, FUE5 142, Placeholders 378 (614): %s" % [counts])
 	check(by_id.get("builtin:wube3dp", {}).get("title") == "Wube3DP (Adapted)" and by_id.get("builtin:fue5", {}).get("title") == "FUE5 (Adapted)"
 		and by_id.get("builtin:wube3dp", {}).get("short") == "Wube3DP" and by_id.get("builtin:fue5", {}).get("short") == "FUE5"
 		and by_id.get("builtin:placeholders", {}).get("title") == "Placeholders"
@@ -309,11 +310,18 @@ func _builtin() -> void:
 	# Factorio pack is among them with or without an install (on, no problem); without one (CI) it
 	# has nothing to give: factorio_on() is false, so it draws nothing.
 	ModelPacks._configured = false
-	check(ModelPacks.active().size() == 4 and (ItemIcons.factorio_data_dir() != "" or not ModelPacks.factorio_on()) and ModelPacks.find("assembling-machine-1", true).begins_with(ModelPacks.BUILTIN_DIR + "wube3dp/")
+	check(ModelPacks.active().size() == 4 and (ItemIcons.factorio_data_dir() != "" or not ModelPacks.factorio_on())
+		and ModelPacks.find("assembling-machine-1", true).begins_with(ModelPacks.BUILTIN_DIR + "placeholders/")
+		and ModelPacks.find("stone-furnace", true).begins_with(ModelPacks.BUILTIN_DIR + "fue5/")
 		and ModelPacks.find("wooden-chest", true).begins_with(ModelPacks.BUILTIN_DIR + "fue5/")
 		and ModelPacks.find("locomotive", true).begins_with(ModelPacks.BUILTIN_DIR + "fue5/")
-		and ModelPacks.find("assembling-machine-2", true).begins_with(ModelPacks.BUILTIN_DIR + "placeholders/"),
-		"the default order's winners: FUE5's chest over Wube3DP's, Wube3DP's assembler and FUE5's locomotive over Placeholders'")
+		and ModelPacks.find("assembling-machine-2", true).begins_with(ModelPacks.BUILTIN_DIR + "placeholders/")
+		and ModelPacks.find("assembling-machine-3", true).begins_with(ModelPacks.BUILTIN_DIR + "placeholders/"),
+		"the default order's winners: Placeholders' assembling-machine 1-3, FUE5's furnace, chest & locomotive")
+	ModelPacks.prefer_builtin_assemblers = false
+	check(ModelPacks.find("assembling-machine-1", true).begins_with(ModelPacks.BUILTIN_DIR + "wube3dp/"),
+		"--assembler-models=old restores Wube3DP assembling-machine-1 priority")
+	ModelPacks.prefer_builtin_assemblers = true
 	ModelLibrary._sources.clear()
 	check(ModelLibrary._source("locomotive") == ModelLibrary.GLTF_SOURCE + ModelPacks.BUILTIN_DIR + "fue5/locomotive.glb"
 		and not ModelPacks.owns(ModelPacks.BUILTIN_DIR + "fue5/locomotive.glb"), "the model library reads the built-in packs, not as a modeller's")
@@ -403,6 +411,60 @@ func _choices() -> void:
 	check(ModelLibrary.model_name("boiler", "boiler", {key: "builtin:placeholders"}, 4) == "boiler-east" and ModelLibrary.model_name("boiler", "boiler", {}, 4) == "boiler"
 		and ModelLibrary.turn_dir("boiler", 4, {key: "builtin:placeholders"}, "boiler") == 0 and ModelLibrary.turn_dir("boiler", 4, {}, "boiler") == 4,
 		"a boiler drawn from Placeholders: its east model unturned; the others FUE5's one model turned")
+	ModelLibrary._sources.clear()
+	ModelLibrary._cache.clear()
+	ModelLibrary._parts.clear()
+
+
+## 0.3.1: a settings file without `choices` gets the owner's (Settings.DEFAULT_MODEL_CHOICES), so a new
+## player's big biter is Placeholders' (Wube3DP's by the order); `--default-model-choices=off` gives none
+## (Wube3DP's again); a saved `{}` (the window's reset) and a player's own choices stay theirs.
+func _default_choices() -> void:
+	var settings: Variant = load("res://scripts/menu/settings.gd")
+	var switches: Variant = load("res://scripts/switches.gd")
+	var was_path: String = settings.path
+	var file := ProjectSettings.globalize_path("user://default-choices-settings.cfg")
+	DirAccess.remove_absolute(file)
+	settings.path = file
+	settings._loaded = false
+	ModelPacks.configure("", [], [])
+	ModelLibrary._sources.clear()
+	ModelLibrary._cache.clear()
+	var fresh: Variant = settings.get_value("model_packs", "choices")
+	check(fresh is Dictionary and fresh == settings.DEFAULT_MODEL_CHOICES and (fresh as Dictionary).size() == 5
+		and not (fresh as Dictionary).has("tile:dirt-1"), "a fresh settings file gets the owner's five choices (%s)" % str(fresh))
+	ModelPacks.set_choices(fresh)
+	ModelLibrary.choices_changed(["big-biter", "big-spitter", "biter-spawner", "lab", "pumpjack"])
+	check(ModelPacks.choice("big-biter") == "builtin:placeholders" and ModelLibrary._source("big-biter").contains("/packs/placeholders/"),
+		"fresh settings: big-biter from Placeholders (%s)" % ModelLibrary._source("big-biter"))
+	check(ModelLibrary._source("biter-spawner").contains("/packs/placeholders/") and ModelLibrary._source("big-spitter").contains("/packs/placeholders/"),
+		"fresh settings: spitter and spawner from Placeholders")
+	check(ModelLibrary._source("lab").contains("/packs/fue5/") and ModelLibrary._source("pumpjack").contains("/packs/fue5/"),
+		"fresh settings: FUE5's lab and pumpjack")
+	switches.set_test_args(PackedStringArray(["--default-model-choices=off"]))
+	var off: Variant = settings.get_value("model_packs", "choices")
+	switches.reset_cache()
+	check(off is Dictionary and (off as Dictionary).is_empty(), "--default-model-choices=off: no default choices")
+	ModelPacks.set_choices(off)
+	ModelLibrary.choices_changed(["big-biter", "big-spitter", "biter-spawner", "lab", "pumpjack"])
+	check(ModelPacks.choice("big-biter") == "" and ModelLibrary._source("big-biter").contains("/packs/wube3dp/"),
+		"--default-model-choices=off: big-biter from Wube3DP by the order (%s)" % ModelLibrary._source("big-biter"))
+	# The window's reset saves {}: it is the player's from then on, read back as {} after a restart.
+	settings.set_value("model_packs", "choices", {})
+	settings._loaded = false
+	var kept: Variant = settings.get_value("model_packs", "choices")
+	check(kept is Dictionary and (kept as Dictionary).is_empty(), "a saved {} stays the player's after a restart (%s)" % str(kept))
+	settings.set_value("model_packs", "choices", {"big-biter": "builtin:wube3dp"})
+	settings._loaded = false
+	var own: Variant = settings.get_value("model_packs", "choices")
+	check(own is Dictionary and own == {"big-biter": "builtin:wube3dp"}, "a player's own choices stay theirs, no defaults added")
+	settings.reset_value("model_packs", "choices")
+	check(settings.get_value("model_packs", "choices") == settings.DEFAULT_MODEL_CHOICES, "choices taken out of the file: the defaults again")
+	DirAccess.remove_absolute(file)
+	settings.path = was_path
+	settings._loaded = false  # read its own file again when next asked
+	ModelPacks.set_choices({})
+	ModelLibrary.choices_changed([])
 	ModelLibrary._sources.clear()
 	ModelLibrary._cache.clear()
 	ModelLibrary._parts.clear()
@@ -512,8 +574,8 @@ func _factorio() -> void:
 	ModelLibrary.choices_changed([])
 	check(not ModelLibrary.draws_sprite("assembling-machine-2") and ModelLibrary.mesh_for("assembling-machine-2") != null
 		and ModelPacks.item_model_path("iron-plate") == ItemModels.DIR + "iron-plate.glb", "Placeholders above Factorio: its assembler and iron plate models")
-	check(ModelLibrary.draws_sprite("assembling-machine-1") and ModelLibrary.mesh_for("assembling-machine-1") == null,
-		"an entity no pack in use has a model of (Wube3DP's assembler 1, off) falls to Factorio's picture: no model, its card")
+	check(ModelLibrary.draws_sprite("stone-furnace") and ModelLibrary.mesh_for("stone-furnace") == null,
+		"an entity no pack in use has a model of (stone-furnace, FUE5/Wube3DP off) falls to Factorio's picture: no model, its card")
 	ModelPacks.set_choices({"assembling-machine-2": ModelPacks.FACTORIO_ID})
 	ModelLibrary.choices_changed([])
 	check(ModelLibrary.draws_sprite("assembling-machine-2") and ModelLibrary.mesh_for("assembling-machine-2") == null, "Factorio chosen for a family: its picture")
@@ -1053,11 +1115,11 @@ func _items() -> void:
 			missing.append(f)
 	check(held.size() == 198 and int(placeholders["item_count"]) == 198 and missing.is_empty(),
 		"Placeholders' items/ has the 198 item models the old folder had: %d, missing %s" % [held.size(), missing])
-	check(not (placeholders["models"] as Dictionary).has("iron-plate") and int(placeholders["count"]) == 377
+	check(not (placeholders["models"] as Dictionary).has("iron-plate") and int(placeholders["count"]) == 378
 		and int(placeholders.get("decor_count", 0)) == 0
 		and (placeholders["models"] as Dictionary).has("accumulator") and held.has("accumulator")
 		and str(held["accumulator"]) != str(placeholders["models"]["accumulator"]),
-		"its items aren't entity models (377 still; the accumulator entity and item each its own file)")
+		"its items aren't entity models (378 still; the accumulator entity and item each its own file)")
 	check(ModelPacks.builtin_packs().all(func(p: Dictionary) -> bool: return p["id"] == "builtin:placeholders" or (p["items"] as Dictionary).is_empty()),
 		"only Placeholders has item models built in")
 

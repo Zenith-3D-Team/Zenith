@@ -72,15 +72,37 @@ class InfoMixin:
         elif t == "lnets":
             rp = self.roboport
             x, y = (int(rp.x * 256), int(rp.y * 256)) if rp is not None else (0, 0)
-            self.send_now({"t": "lnets", "l": [[1, 1, "nauvis", [3, 3], [0, 0], 1, 1, 0, 1, x, y, ""],
-                                               [2, 1, "nauvis", [10, 12], [4, 5], 4, 6, 2, 9, 0, 0, "[item=iron-plate] Mall"]]})
+            names = getattr(self, "lnet_names", {})
+            self.send_now({"t": "lnets", "l": [[1, 1, "nauvis", [3, 3], [0, 0], 1, 1, 0, 1, x, y, names.get(1, "")],
+                                               [2, 1, "nauvis", [10, 12], [4, 5], 4, 6, 2, 9, 0, 0, names.get(2, "[item=iron-plate] Mall")]]})
+        elif t == "set_lnet_name":
+            nid = int(msg.get("id", 0)) if isinstance(msg.get("id"), int) else 0
+            if not hasattr(self, "lnet_names"):
+                self.lnet_names = {}
+            self.lnet_names[nid] = str(msg.get("name", ""))[:200]
+            self.info_command("lnets", msg, protos)
+        elif t == "lnet_find":
+            nid = int(msg.get("id", 0)) if isinstance(msg.get("id"), int) else 0
+            rp = self.roboport
+            rx, ry = (int(rp.x * 256), int(rp.y * 256)) if rp is not None else (0, 0)
+            locs = [[rx, ry, "roboport", 3]] if nid == 1 and rp is not None else []
+            self.send_now({"t": "lnet_locs", "id": nid, "si": 1, "l": locs})
         elif t == "lnet":
             nid = int(msg.get("id", 0)) if isinstance(msg.get("id"), int) else 0
             if nid == 1:
-                self.send_now(dict(self.network_summary(True), t="lnet", found=1))
+                net = dict(self.network_summary(True), t="lnet", found=1)
+                net["members"] = [["roboport", 1], ["storage-chest", 1], ["requester-chest", 1]]
+                net["req"] = [["iron-plate", 50, 0]]
+                net["transit"] = []
+                net["ch"] = [0, 0]
+                self.send_now(net)
             elif nid == 2:
                 self.send_now({"t": "lnet", "id": 2, "found": 1, "log": [10, 12], "con": [4, 5],
-                               "items": [["iron-plate", 1200], ["copper-plate", 800], ["electronic-circuit", 400], ["repair-pack", 20]]})
+                               "items": [["iron-plate", 1200], ["copper-plate", 800], ["electronic-circuit", 400], ["repair-pack", 20]],
+                               "members": [["roboport", 4], ["storage-chest", 6], ["passive-provider-chest", 2], ["requester-chest", 9]],
+                               "req": [["iron-plate", 500, 0], ["steel-plate", 200, 200]],
+                               "transit": [["iron-plate", 16]],
+                               "ch": [2, 1]})
             else:
                 self.send_now({"t": "lnet", "id": nid, "found": 0})
 

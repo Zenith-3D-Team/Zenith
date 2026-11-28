@@ -1,7 +1,7 @@
 {
   "id": "cinematic-shaders",
   "name": "Cinematic shaders",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "api": 1.7,
   "entry": "main.gd",
   "author": "Zenith",

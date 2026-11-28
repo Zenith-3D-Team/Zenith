@@ -237,6 +237,28 @@ func count() -> int:
 	return _rigs.size()
 
 
+## Current smoothed world velocity of `unit`, or Vector3.ZERO if not rigged.
+func velocity_of(unit: int) -> Vector3:
+	var rig: Rig = _rigs.get(unit)
+	return rig.velocity if rig != null else Vector3.ZERO
+
+
+## Current world transforms of all animated child parts (`MeshInstance3D` with `"part"` meta)
+## on `unit`, in `ModelLibrary.parts_for` order.
+func part_transforms(unit: int) -> Array:
+	var rig: Rig = _rigs.get(unit)
+	if rig == null or not is_instance_valid(rig.node):
+		return []
+	var in_tree := rig.node.is_inside_tree()
+	var out: Array = []
+	for child in rig.node.get_children():
+		if child is MeshInstance3D and child.has_meta("part"):
+			var part: ModelLibrary.AnimPart = child.get_meta("part") as ModelLibrary.AnimPart
+			var xf: Transform3D = (child as Node3D).global_transform if in_tree else (rig.node.transform * (child as Node3D).transform)
+			out.append({"kind": part.kind if part != null else "", "xform": xf})
+	return out
+
+
 ## Planet data came; only a `legs` makes the feet fresh (`seg`, `pg` and the rest come with the same
 ## signal, and would keep a spider that left the mod's list on its last feet).
 func _on_planet_data() -> void:

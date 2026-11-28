@@ -86,7 +86,7 @@ Key transport constraints: Factorio UDP listens on `127.0.0.1` (`server/relay.py
 
 ## 5. Where it stands
 
-Public `0.2.1` is out and `0.3.0` was a testers' pre-release:
+Public `0.2.1` is out and `0.3.0` is the active dev-channel pre-release:
 
 | Area | Status |
 |---|---|

@@ -30,6 +30,7 @@ const ModelPacks := preload("res://scripts/world/model_packs.gd")
 const Probing := preload("res://scripts/debug/probing.gd")
 const GpuShader := preload("res://shaders/alt_icons.gdshader")
 const Switches := preload("res://scripts/switches.gd")
+const ItemIcons := preload("res://scripts/world/item_icons.gd")
 
 ## The icon is this many tiles across (measured on Factorio's alt-mode over assemblers).
 const ICON_TILES := 1.2
@@ -58,6 +59,9 @@ static var use_spec := true
 ## --alt-ammo-fuel=off: no ammo over turrets, fuel over locomotives or cargo over wagons, as before (isq's "a", "f" and "c" rows unread).
 ## Locomotives' fuel is off by default (owner: only the wagons' cargo matters); --loco-fuel-icons=on (Bridge.loco_fuel_icons) brings it back.
 static var ammo_fuel := true
+## --alt-robot-items=off hides carried-item icons over flying worker robots.
+static var robot_items := true
+const ROBOT_ICON_TILES := 0.55
 ## --alt-icon-order=old: every shadow first, then the icons picture by picture in the order they were
 ## found, whichever is nearer (an icon further off could cover a nearer one: the owner's column of
 ## assemblers' recipes, the farthest in front); in first person a machine's own cells at one depth.
@@ -84,6 +88,42 @@ static var flat_batch_tex := Switches.on("--alt-flat-batch-tex")
 ## Compatibility renderer keep the CPU path. Moving wagons and a hovered beacon stay on the CPU on top.
 ## --alt-icons=cpu: every icon on the CPU as before; --alt-icons=gpu: the card's path even headless.
 static var icons_mode := "auto"
+## Alt-mode's chest contents, machine rows and fluid icons kept per chunk and built again only for the
+## chunks that changed (a chunk built again or unloaded, one chest's or machine's `ac` / `am` / `aiu` row,
+## a unit whose shown fluid changed in `fl`), chunks in view the frame they change and the rest within
+## GPU_BUDGET_USEC; only what truly changes everything (Alt-mode turned on again, the icons' pictures, the
+## ground's heights, `eprops`) starts every chunk over. Before, any of these threw away the whole map's three
+## caches and built them again in one frame (the owner's 21 ms `alt_sync` frames, 4.5 a second while walking).
+## --alt-incremental=off: the three whole-map caches as before.
+static var incremental := Switches.on("--alt-incremental")
+## Chunks in view built again in one frame stop after this long (at least one); the rest the next frame.
+const ALT_VIEW_BUDGET_USEC := 3000
+## The card's path sorts, packs and joins the icons' instances in C++ (AltIconsNative,
+## native/belt_sim/src/alt_icons_native.cpp) when the library is there: a turned view sorts every chunk at once
+## with no GDScript per chunk. --alt-native=off: _gpu_fill, _gpu_sort_chunks and _gpu_join in GDScript as before.
+static var native := Switches.on("--alt-native")
+## With --alt-incremental: the ground's heights changing (an add-on's hills, each step of a fade) lifts the icons
+## already worked out onto the new ground (each anchor's flat height plus GroundHeight.at, in C++ with
+## AltIconsNative.lift when the library has it) where they are looked at, instead of building every chunk's
+## icons again entity by entity; a chunk whose icons stand where they stood costs no hash and no upload.
+## The card path's pictures' layers are kept per cache too (ChunkCache.cell_pic).
+## --alt-relift=off: the heights in the kinds' "all" keys, every chunk built again, as before.
+static var relift := Switches.on("--alt-relift")
+## With --alt-incremental: world.gd says a chunk's entities changed whenever it built the chunk again (a model
+## loaded, a LOD's MultiMeshes), most often with no record changed. A loaded chunk whose records are those its
+## icons were built from (its ChunkView and content_rev as stamped, the recipes' cache too) is left alone: no
+## chunk marked, no redraw asked for. The card path's look for chunks changed under their stamps runs only when
+## the chunks' or records' counts (or what starts every chunk over) changed, in one pass over the loaded chunks.
+## --alt-quiet-builds=off: every such signal marks its chunk to be built again, and every change looks at every
+## chunk's stamps, as before.
+static var quiet_builds := Switches.on("--alt-quiet-builds")
+## An icon not yet read (Alt-mode turned on over a part of the base never seen, a new kind in a chest) is read on a
+## worker thread (Kit.icon_request) while the chunk's icons are built without it; once it is in the caches its
+## chunks are built again, so no frame waits on a file read or a tinted icon composed pixel by pixel. The card's
+## pictures' texture array starts at 256 layers, so a big base doesn't make it again several times as it fills.
+## --alt-icons-later=off: every icon read on the main thread as its chunk is built, the array from 32 layers, as before.
+static var icons_later := Switches.on("--alt-icons-later")
+const NativeLibrary := preload("res://scripts/native_library.gd")
 ## First person: each cell of a machine's icons sorts this much nearer the camera than the one
 ## before (sorting_offset), so the transparent sort puts its lower rows in front.
 const QUAD_STEP := 0.001
@@ -115,6 +155,10 @@ var _fog: Node = null
 
 ## Per-chunk cache of static alt-icon descriptors (rebuilt only when that chunk or its alt data changes).
 class ChunkCache:
+	## Numbers every cache's contents (made, cleared or lifted onto new heights: a new number), so the card
+	## path knows a chunk unchanged without hashing it (--alt-relift).
+	static var serials := 0
+	var serial := 0
 	var cv_id := 0
 	var content_rev := -1
 	var gh_ver := -1
@@ -124,6 +168,7 @@ class ChunkCache:
 	var use_spec := true
 	var ent_anchor := PackedVector3Array()  # (c.x, flat_y + gh, c.y)
 	var ent_flat_y := PackedFloat32Array()
+	var ent_flat_d := PackedFloat64Array()  # flat_y in 64 bits: a relift's sum equals the build's to the bit
 	var ent_ref := PackedFloat32Array()
 	var ent_bound := PackedFloat32Array()  # max cell reach in tiles from anchor
 	var ent_cell_start := PackedInt32Array()
@@ -133,10 +178,24 @@ class ChunkCache:
 	var cell_side := PackedFloat32Array()
 	var cell_tex: Array[Texture2D] = []
 	var cell_mark: Array = []  # Texture2D or null
+	## The card path's picture per cell (layer + 4096 * (mark layer + 1)) for the layers' reset count `pic_rev`.
+	var cell_pic := PackedFloat32Array()
+	var pic_rev := -1
+
+	func _init() -> void:
+		renumber()
+
+	func renumber() -> void:
+		serials += 1
+		serial = serials
 
 	func clear() -> void:
+		renumber()
 		ent_anchor.clear()
 		ent_flat_y.clear()
+		ent_flat_d.clear()
+		cell_pic.clear()
+		pic_rev = -1
 		ent_ref.clear()
 		ent_bound.clear()
 		ent_cell_start.clear()
@@ -219,6 +278,52 @@ var _ac_builds := 0
 var _am_builds := 0
 var _fl_builds := 0
 
+## --alt-incremental: chunks whose contents / machines / fluids icons are to be built again (Vector2i -> true).
+var _ac_dirty := {}
+var _am_dirty := {}
+var _fl_dirty := {}
+## Units an `ac` / `am` (or `aiu`) row named since the last sync (unit -> true): their chunks are marked then.
+var _pending_ac_units := {}
+var _pending_am_units := {}
+## What starts every chunk of a kind over (see incremental); [] = not yet.
+var _inc_ac_key: Array = []
+var _inc_am_key: Array = []
+var _inc_fl_key: Array = []
+## Chunk -> [ChunkView instance id, content_rev] when its three kinds were last built.
+var _inc_stamp := {}
+## Chunk -> units with an `am` entry whose record was there when it was last built (they become movers
+## when their record goes).
+var _inc_am_units := {}
+## Machines with an `am` entry and no record (locomotives, wagons): unit -> MovingSeq.
+var _inc_movers := {}
+var _inc_movers_changed := false
+## `fl`: the dictionary last looked at, and each unit's shown fluid (only units showing one).
+var _inc_fl_ref: Dictionary = {}
+var _inc_fl_size := -1
+var _inc_fl_rebuilds := -1
+var _inc_fl_shown := {}
+## Without bridge messages (tests feeding the world directly): the `ac` / `am` entries last seen, unit -> list.
+var _inc_ac_refs := {}
+var _inc_am_refs := {}
+## Chunks unloaded since the last sync (Vector2i -> true).
+var _inc_gone := {}
+## --alt-relift: loaded chunks whose caches may stand on an older field (Vector2i -> true), the
+## GroundHeight.version() last seen, and the C++ twin of the lift (AltIconsNative with `lift`) with the
+## version its field was given for.
+var _gh_dirty := {}
+var _gh_seen := -1
+var _lift_nat: Object = null
+var _lift_nat_tried := false
+var _lift_nat_ver := -1
+## Caches lifted onto new heights (tests).
+var relifts := 0
+## --alt-icons-later: icons being read, name -> {chunk: true} (chunks built without them, built again when ready).
+var _icon_wait := {}
+## collect(): chunks in view left for the next frame by ALT_VIEW_BUDGET_USEC.
+var _inc_view_left := false
+## Per-chunk builder runs (contents, machines, fluids; tests).
+var chunk_builds := 0
+
 ## Idle state tracked in _process() to skip queue_redraw() when nothing changed.
 var _was_on := false
 var _idle_valid_world := false
@@ -249,6 +354,8 @@ var _idle_fl_rebuilds := -1
 var _idle_eprops_size := -1
 var _idle_fog_key: Array = []
 var _idle_flags := []
+var _idle_rc_rev := -1
+var _last_robot_pos := {}  # unit -> Vector3 / null
 ## Redraw requests issued by _process() (tests).
 var redraws_queued := 0
 
@@ -301,20 +408,82 @@ func _on_bridge_message(msg: Dictionary) -> void:
 			for row in list:
 				if row is Array and not (row as Array).is_empty():
 					_pending_aiu_units[int((row as Array)[0])] = true
+					if incremental:  # a chest gaining or losing its own icon changes whether its contents show
+						_pending_ac_units[int((row as Array)[0])] = true
 		_contents_dirty = true
 		_alt_rev += 1
 	elif t == "ac":
 		_bridge_alt_active = true
 		_contents_dirty = true
+		if incremental:
+			_pending_units_of(msg, _pending_ac_units)
 		_alt_rev += 1
 	elif t == "am":
 		_bridge_alt_active = true
 		_machines_dirty = true
+		if incremental:
+			_pending_units_of(msg, _pending_am_units)
 		_alt_rev += 1
 	elif t == "fl":
 		_bridge_alt_active = true
 		_fluids_dirty = true
+		if not incremental:  # incremental: bumped only when a shown fluid changed (_inc_fl_diff)
+			_alt_rev += 1
+
+
+## --alt-relift in effect (it lifts --alt-incremental's per-chunk caches).
+static func _relift_on() -> bool:
+	return relift and incremental
+
+
+## The heights' part of the "all" keys: none with --alt-relift (a new field lifts the caches instead).
+static func _gh_key(gh_ver: int) -> int:
+	return -1 if _relift_on() else gh_ver
+
+
+## A builder's icon (Kit.item_icon); --alt-icons-later: null while it is read on a worker (the cell left out), its
+## chunk `c` noted to be built again when it is ready (_poll_icons_later).
+func _icon_of(name: String, c: Vector2i) -> Texture2D:
+	if not icons_later or Kit.icon_request(name):
+		return Kit.item_icon(name)
+	var chunks: Dictionary = _icon_wait.get(name, {})
+	if chunks.is_empty():
+		_icon_wait[name] = chunks
+		Probing.count("alt_cold_icons")
+	chunks[c] = true
+	return null
+
+
+## --alt-icons-later: the icons read since (Kit.poll_icons); the chunks built without them marked to be built again.
+func _poll_icons_later() -> void:
+	if _icon_wait.is_empty():
+		return
+	Kit.poll_icons()
+	var ready: Array = []
+	for name: String in _icon_wait:
+		if ItemIcons.any_ready(name):
+			ready.append(name)
+	for name: String in ready:
+		var chunks: Dictionary = _icon_wait[name]
+		_icon_wait.erase(name)
+		for c: Vector2i in chunks:
+			_dirty_alt_chunks[c] = true
+			if incremental:
+				_inc_mark(c)
+			else:
+				_contents_dirty = true
+				_machines_dirty = true
+				_fluids_dirty = true
 		_alt_rev += 1
+
+
+static func _pending_units_of(msg: Dictionary, into: Dictionary) -> void:
+	var list = msg.get("l")
+	if not (list is Array):
+		return
+	for row in list:
+		if row is Array and not (row as Array).is_empty():
+			into[int((row as Array)[0])] = true
 
 
 func _disconnect_world() -> void:
@@ -338,7 +507,15 @@ func _sync_world(world: WorldMirror) -> void:
 
 
 func _on_world_entities_changed(c: Vector2i) -> void:
+	if incremental and quiet_builds and _inc_unchanged(c):
+		return
 	_dirty_alt_chunks[c] = true
+	if incremental:
+		_inc_mark(c)
+		if is_instance_valid(_wired_world) and not _wired_world.chunks.has(c):
+			_inc_gone[c] = true  # its caches dropped at the next sync, wherever the camera is
+		_alt_rev += 1
+		return
 	if _chunk_contents_cache.has(c) or _ac_missing:
 		_contents_dirty = true
 	if _chunk_machines_cache.has(c) or _am_missing:
@@ -350,6 +527,9 @@ func _on_world_entities_changed(c: Vector2i) -> void:
 
 func _on_world_alt_changed(c: Vector2i) -> void:
 	_dirty_alt_chunks[c] = true
+	if incremental:
+		_ac_dirty[c] = true  # a chest's own icon hides its contents
+		_gpu_check[c] = true
 	_alt_rev += 1
 
 
@@ -384,14 +564,56 @@ func _clear_caches() -> void:
 	_cached_ac_size = -1
 	_cached_am_size = -1
 	_cached_fl_size = -1
+	_ac_dirty.clear()
+	_am_dirty.clear()
+	_fl_dirty.clear()
+	_pending_ac_units.clear()
+	_pending_am_units.clear()
+	_inc_ac_key = []
+	_inc_am_key = []
+	_inc_fl_key = []
+	_inc_stamp.clear()
+	_inc_am_units.clear()
+	_inc_movers.clear()
+	_inc_movers_changed = false
+	_inc_fl_ref = {}
+	_inc_fl_size = -1
+	_inc_fl_rebuilds = -1
+	_inc_fl_shown.clear()
+	_inc_ac_refs.clear()
+	_inc_am_refs.clear()
+	_inc_view_left = false
+	_inc_gone.clear()
+	_gh_dirty.clear()
+	_gh_seen = -1
+	_gpu_sweep_key = []
+	_icon_wait.clear()
+	_lift_off()
 	_alt_rev += 1
+
+
+## The C++ lift handed an off field (it held a copy of the height field) and asked for the field again on its next
+## use: when the caches are cleared and when Alt-mode turns off.
+func _lift_off() -> void:
+	if _lift_nat != null and _lift_nat_ver != -1:
+		_lift_nat.call("set_field", [false, PackedByteArray(), Image.FORMAT_RF, Vector2.ZERO, 1.0, Vector2i.ZERO,
+			PackedByteArray(), Image.FORMAT_RF, Vector2.ZERO, 1.0, Vector2i.ZERO])
+	_lift_nat_ver = -1
+
+
+static func _shown_proto_id(world, r: WorldMirror.Rec) -> int:
+	if r.extra.has("gh"):
+		var p = world.protos.entity(r.proto_id)
+		if p != null and p.type == "entity-ghost":
+			return int(r.extra["gh"])
+	return r.proto_id
 
 
 static func _is_hover_only(world, hovered: Variant) -> Variant:
 	if hovered == null or not (hovered is WorldMirror.Rec) or world == null:
 		return null
 	var r: WorldMirror.Rec = hovered
-	var proto = world.protos.entity(r.proto_id)
+	var proto = world.protos.entity(_shown_proto_id(world, r))
 	if proto != null and HOVER_ONLY_TYPES.has(proto.type):
 		return r
 	return null
@@ -411,6 +633,7 @@ func _process(_delta: float) -> void:
 		_gpu_set_live(false)
 		if _was_on:
 			_was_on = false
+			_lift_off()
 			if is_inside_tree():
 				redraws_queued += 1
 				queue_redraw()
@@ -418,6 +641,7 @@ func _process(_delta: float) -> void:
 			_quads_used = 0
 			_hide_quads()
 		return
+	_poll_icons_later()
 	if not use_cache:
 		_gpu_set_live(false)
 		_was_on = true
@@ -455,7 +679,10 @@ func _process(_delta: float) -> void:
 	var fl_rebuilds: int = int(fluids_layer.window_rebuilds) if fluids_layer != null else 0
 	var ac_g := int(world.get("_alt_contents_g"))
 	var am_g := int(world.get("_alt_machines_g"))
-	var flags := [use_spec, ammo_fuel, icon_order, layer_cap, flat_batch_marks, flat_batch_tex, use_cache, gfx_gen, icons_ver, _tex_rev]
+	var flags := [use_spec, ammo_fuel, robot_items, icon_order, layer_cap, flat_batch_marks, flat_batch_tex, use_cache, gfx_gen, icons_ver, _tex_rev]
+	var rc_dict := _robot_cargo_dict()
+	var rc_rev := int(model.get("robot_cargo_rev")) if "robot_cargo_rev" in model else 0
+	var has_rc := not rc_dict.is_empty()
 	var gpu := _gpu_wanted(fp, fog_key)
 	var switched := gpu != _gpu_live
 	if switched:
@@ -464,7 +691,7 @@ func _process(_delta: float) -> void:
 		var t_sync := Time.get_ticks_usec()
 		_gpu_camera = camera
 		_gpu_sync(world, camera, fluids_layer, gh_ver, gfx_gen, icons_ver, eprops_size, [world, _alt_rev, _tex_rev,
-			gh_ver, Bridge.alt_contents, Bridge.loco_fuel_icons, world.chunks.size(), world.entities.size(),
+			_gh_key(gh_ver), Bridge.alt_contents, Bridge.loco_fuel_icons, world.chunks.size(), world.entities.size(),
 			world.alt_contents.size(), ac_g, world.alt_machines.size(), am_g, fluids_layer, fl_size, fl_rebuilds,
 			eprops_size, flags])
 		Probing.add("alt_sync", t_sync)
@@ -472,7 +699,7 @@ func _process(_delta: float) -> void:
 		# all _process, where the CPU path's _draw ran), on the main thread whatever the thread model.
 		_gpu_pre_draw.call_deferred()
 	# On the card the camera is the shader's: a moved camera redraws only what stays on the CPU.
-	var cpu_moves := (not gpu) or hovered_beacon != null or not _moving_machines.is_empty()
+	var cpu_moves := (not gpu) or hovered_beacon != null or not _moving_machines.is_empty() or has_rc
 	var dirty := (not _was_on) or (not _idle_valid_world) or switched
 	if not dirty:
 		if fp != _idle_first_person or (cpu_moves and (camera.global_transform != _idle_cam_xform \
@@ -488,7 +715,9 @@ func _process(_delta: float) -> void:
 				or world.alt_contents.size() != _idle_ac_size or ac_g != _idle_ac_g \
 				or world.alt_machines.size() != _idle_am_size or am_g != _idle_am_g \
 				or fluids_layer != _idle_fl_layer or fl_size != _idle_fl_size or fl_rebuilds != _idle_fl_rebuilds \
-				or eprops_size != _idle_eprops_size or flags != _idle_flags:
+				or eprops_size != _idle_eprops_size or flags != _idle_flags or rc_rev != _idle_rc_rev:
+			dirty = true
+		elif incremental and (_inc_view_left or _inc_has_news(fluids_layer)):
 			dirty = true
 	if not dirty and not _moving_machines.is_empty():
 		var movers = player.get("movers")
@@ -500,6 +729,23 @@ func _process(_delta: float) -> void:
 				if pid != ms.proto_id or pos != ms.last_pos or fogged != ms.last_fogged:
 					dirty = true
 					break
+	if not dirty and has_rc:
+		var rc_movers = player.get("movers")
+		if rc_movers != null and rc_movers.has_method("position_of"):
+			if rc_dict.size() != _last_robot_pos.size():
+				dirty = true
+			else:
+				for u_k in rc_dict:
+					var unit := int(u_k)
+					if not _last_robot_pos.has(unit):
+						dirty = true
+						break
+					var pos: Variant = rc_movers.position_of(unit)
+					if rc_movers.has_method("is_fogged") and rc_movers.is_fogged(unit):
+						pos = null
+					if pos != _last_robot_pos.get(unit):
+						dirty = true
+						break
 	_was_on = true
 	if dirty:
 		redraws_queued += 1
@@ -619,12 +865,15 @@ func collect() -> void:
 			if _chunk_in_view_lift(c, planes, lift):
 				_in_view_chunks.append(c)
 	_resolve_pending_aiu(world)
-	_ensure_contents_cache(world, gh_ver, eprops_size, gfx_gen, icons_ver)
-	_ensure_machines_cache(world, gh_ver, eprops_size, gfx_gen, icons_ver)
 	var parent: Node = world.get_parent()
 	var fluids_layer = parent.get_node_or_null("FluidsPower") if parent != null else null
-	if fluids_layer != null:
-		_ensure_fluids_cache(world, fluids_layer, gh_ver, gfx_gen, icons_ver)
+	if incremental:
+		_inc_sync(world, fluids_layer, gh_ver, eprops_size, gfx_gen, icons_ver)
+	else:
+		_ensure_contents_cache(world, gh_ver, eprops_size, gfx_gen, icons_ver)
+		_ensure_machines_cache(world, gh_ver, eprops_size, gfx_gen, icons_ver)
+		if fluids_layer != null:
+			_ensure_fluids_cache(world, fluids_layer, gh_ver, gfx_gen, icons_ver)
 	var hovered: Variant = player.get("hovered")
 	var hovered_beacon: Variant = _is_hover_only(world, hovered)
 	var fog_node: Node = _fog if (_fog != null and _fog.has_method("hiding") and bool(_fog.hiding())) else null
@@ -636,18 +885,34 @@ func collect() -> void:
 	if _gpu_live and hovered_beacon != null:
 		# On the card everything but the hovered beacon's modules (and the movers below).
 		var hb: WorldMirror.Rec = hovered_beacon
+		if incremental and _inc_chunk_needs(world, hb.chunk):
+			_inc_build_chunk(world, hb.chunk, fluids_layer)
+		if _relift_on() and _gh_dirty.has(hb.chunk):
+			_relift_chunk(hb.chunk, gh_ver)
 		var hb_cc: ChunkCache = _chunk_machines_cache.get(hb.chunk)
 		if hb_cc != null:
 			_emit_chunk_cache(world, camera, hb_cc, hovered, fog_node, cam_pos, cam_right, cam_fwd, min_px, max_px,
 				vp_w, vp_h, true)
+	_inc_view_left = false
+	var t_inc := Time.get_ticks_usec()
+	var inc_built := false
+	var rl := _relift_on()  # the recipes' caches too lifted below, not built again, on new heights
 	for c: Vector2i in _in_view_chunks:
 		var cv = world.chunks[c]
+		var late := false
+		if incremental and _inc_chunk_needs(world, c):
+			if inc_built and Time.get_ticks_usec() - t_inc > ALT_VIEW_BUDGET_USEC:
+				_inc_view_left = true  # the rest next frame (_process asks for it)
+				late = true
+			else:
+				_inc_build_chunk(world, c, fluids_layer)
+				inc_built = true
 		var alt_cc: ChunkCache = _chunk_alt_cache.get(c)
 		if _dirty_alt_chunks.has(c) or alt_cc == null or alt_cc.cv_id != cv.get_instance_id() \
-				or alt_cc.content_rev != cv.content_rev or alt_cc.gh_ver != gh_ver \
+				or alt_cc.content_rev != cv.content_rev or (not rl and alt_cc.gh_ver != gh_ver) \
 				or alt_cc.gfx_gen != gfx_gen or alt_cc.icons_ver != icons_ver \
 				or alt_cc.use_spec != use_spec or alt_cc.eprops_size != eprops_size:
-			if alt_cc != null and alt_cc.content_rev != cv.content_rev:
+			if not incremental and alt_cc != null and alt_cc.content_rev != cv.content_rev:
 				if _chunk_contents_cache.has(c) or _ac_missing:
 					_contents_dirty = true
 				if _chunk_machines_cache.has(c) or _am_missing:
@@ -659,6 +924,12 @@ func collect() -> void:
 				if fluids_layer != null:
 					_ensure_fluids_cache(world, fluids_layer, gh_ver, gfx_gen, icons_ver)
 			alt_cc = _build_chunk_alt_cache(world, c, cv, gh_ver, eprops_size, gfx_gen, icons_ver)
+		if rl and _gh_dirty.has(c):
+			if late or (inc_built and Time.get_ticks_usec() - t_inc > ALT_VIEW_BUDGET_USEC):
+				_inc_view_left = true  # drawn where they stood until the next frame
+			else:
+				_relift_chunk(c, gh_ver)
+				inc_built = true
 		if alt_cc != null:
 			_emit_chunk_cache(world, camera, alt_cc, hovered, fog_node, cam_pos, cam_right, cam_fwd, min_px, max_px, vp_w, vp_h)
 		var ac_cc: ChunkCache = _chunk_contents_cache.get(c)
@@ -676,7 +947,13 @@ func collect() -> void:
 		for c_old in _chunk_alt_cache.keys():
 			if not world.chunks.has(c_old):
 				_chunk_alt_cache.erase(c_old)
+	# --alt-incremental on the CPU path: chunks gone (out of view, so not built above) drop their caches.
+	if incremental and _inc_stamp.size() > world.chunks.size() + 16:
+		for c_old in _inc_stamp.keys():
+			if not world.chunks.has(c_old):
+				_inc_build_chunk(world, c_old, fluids_layer)
 	_emit_moving_machines(world, camera, planes, lift, fog_node, cam_pos, cam_right, cam_fwd, min_px, max_px, vp_w, vp_h, gfx_gen, icons_ver)
+	_emit_robot_cargo(world, camera, planes, lift, fog_node, cam_pos, cam_right, cam_fwd, min_px, max_px, vp_w, vp_h)
 	if icon_order and not _in_3d:
 		_build_layers(camera)
 	drawn = _e_count + _quads_used - _marks_3d + (gpu_instances if _gpu_live else 0)
@@ -710,7 +987,8 @@ func collect() -> void:
 	_idle_fl_rebuilds = int(fluids_layer.window_rebuilds) if fluids_layer != null else 0
 	_idle_eprops_size = eprops_size
 	_idle_fog_key = _fog_state_key(_fog)
-	_idle_flags = [use_spec, ammo_fuel, icon_order, layer_cap, flat_batch_marks, flat_batch_tex, use_cache, gfx_gen, icons_ver, _tex_rev]
+	_idle_flags = [use_spec, ammo_fuel, robot_items, icon_order, layer_cap, flat_batch_marks, flat_batch_tex, use_cache, gfx_gen, icons_ver, _tex_rev]
+	_idle_rc_rev = int(model.get("robot_cargo_rev")) if (model != null and "robot_cargo_rev" in model) else 0
 
 
 func _collect_uncached(world, camera: Camera3D, planes: Array[Plane]) -> void:
@@ -740,6 +1018,11 @@ func _collect_uncached(world, camera: Camera3D, planes: Array[Plane]) -> void:
 	var fluids_layer = parent.get_node_or_null("FluidsPower") if parent != null else null
 	if fluids_layer != null:
 		_draw_fluids(world, camera, fluids_layer, planes, _in_view_dict)
+	var vp_rect := get_viewport_rect() if is_inside_tree() else Rect2()
+	var fog_node: Node = _fog if (_fog != null and _fog.has_method("hiding") and bool(_fog.hiding())) else null
+	_emit_robot_cargo(world, camera, planes, GroundHeight.lift_range(), fog_node,
+		camera.global_position, camera.global_basis.x, -camera.global_basis.z,
+		float(Kit.px(4)), float(Kit.px(40)), vp_rect.size.x, vp_rect.size.y)
 	if icon_order and not _in_3d:
 		_build_layers(camera)
 	drawn = _e_count + _quads_used - _marks_3d
@@ -754,6 +1037,448 @@ func _resolve_pending_aiu(world) -> void:
 		if r != null:
 			_dirty_alt_chunks[r.chunk] = true
 	_pending_aiu_units.clear()
+
+
+# ---- --alt-incremental: the contents, machines and fluids caches per chunk, built again on change only ----
+
+
+## --alt-quiet-builds: whether loaded chunk `c`'s records are those its icons were last built from (its stamp, and
+## the recipes' cache's, or no recipes' icons and no cache), so a signal for it changes nothing.
+func _inc_unchanged(c: Vector2i) -> bool:
+	if not is_instance_valid(_wired_world):
+		return false
+	var cv = _wired_world.chunks.get(c)
+	if cv == null:
+		return false
+	var id: int = cv.get_instance_id()
+	var rev := int(cv.content_rev)
+	var st: Variant = _inc_stamp.get(c)
+	if _stamp_moved(st, cv, _wired_world):
+		return false
+	var alt_cc: ChunkCache = _chunk_alt_cache.get(c)
+	if alt_cc == null:
+		return cv.alt.is_empty() and not _dirty_alt_chunks.has(c)
+	return alt_cc.cv_id == id and alt_cc.content_rev == rev
+
+
+## A chunk's _inc_stamp: its ChunkView, its content_rev and the prototypes' version (a new welcome clears and
+## refills world.protos in place: the same records may then be other prototypes).
+static func _stamp_of(cv, world) -> Array:
+	var protos = world.get("protos") if world != null else null
+	return [cv.get_instance_id(), int(cv.content_rev), int(protos.version) if protos != null else 0]
+
+
+## Whether stamp `st` (_stamp_of, or null) no longer matches chunk view `cv` in `world`.
+static func _stamp_moved(st: Variant, cv, world) -> bool:
+	if not (st is Array) or (st as Array).size() < 3:
+		return true
+	var now := _stamp_of(cv, world)
+	return int(st[0]) != now[0] or int(st[1]) != now[1] or int(st[2]) != now[2]
+
+
+## Chunk `c` changed: its three kinds to be built again (and looked at on the card).
+func _inc_mark(c: Vector2i) -> void:
+	_ac_dirty[c] = true
+	_am_dirty[c] = true
+	_fl_dirty[c] = true
+	_gpu_check[c] = true
+
+
+## Whether chunk `c` has a kind to build again (a chunk whose records changed under its stamp is marked here).
+func _inc_chunk_needs(world, c: Vector2i) -> bool:
+	var cv = world.chunks.get(c)
+	if cv != null:
+		var st: Variant = _inc_stamp.get(c)
+		if _stamp_moved(st, cv, world):
+			_inc_mark(c)
+	return _ac_dirty.has(c) or _am_dirty.has(c) or _fl_dirty.has(c)
+
+
+func _inc_has_dirty(c: Vector2i) -> bool:
+	return _ac_dirty.has(c) or _am_dirty.has(c) or _fl_dirty.has(c)
+
+
+## Whether a sync has anything new to look at (rows named since the last, a new `fl`).
+func _inc_has_news(fluids_layer) -> bool:
+	if not _pending_ac_units.is_empty() or not _pending_am_units.is_empty() or not _inc_gone.is_empty():
+		return true
+	if fluids_layer != null:
+		var fluids: Dictionary = fluids_layer.fluids
+		return not is_same(fluids, _inc_fl_ref) or fluids.size() != _inc_fl_size
+	return false
+
+
+## What changed since the last sync: the kinds' "all" keys (Alt-mode turned on again, pictures, heights,
+## eprops: every loaded chunk marked, nothing built here), the units `ac` / `am` / `aiu` named, and `fl`'s
+## shown fluids. Marks chunks only; they are built where they are looked at (_inc_build_chunk).
+## The per-chunk stores are emptied only for a new world or Alt-mode's `g` (INC_HARD_KEY first entries); on
+## pictures, heights or eprops they are kept and every chunk marked, so the CPU path draws the old icons
+## until each chunk is built again instead of none for a few frames (perf-fix-r1).
+func _inc_sync(world, fluids_layer, gh_ver: int, eprops_size: int, gfx_gen: int, icons_ver: int) -> void:
+	var t_inc := Time.get_ticks_usec()
+	_gh_note(world, gh_ver)
+	var gh_key := _gh_key(gh_ver)
+	var has_ac: bool = world.has_method("alt_contents_now")
+	var contents: Dictionary = world.alt_contents_now() if has_ac else {}
+	var ac_key := [world, has_ac, int(world.get("_alt_contents_g")), Bridge.alt_contents, gh_key, gfx_gen,
+		icons_ver, use_spec, eprops_size]
+	if ac_key != _inc_ac_key:
+		if _inc_hard_change(ac_key, _inc_ac_key, INC_HARD_KEY):
+			_chunk_contents_cache.clear()
+		else:
+			_inc_prune(_chunk_contents_cache, world)
+		_inc_ac_key = ac_key
+		_pending_ac_units.clear()
+		_ac_builds += 1
+		Probing.count("alt_all")
+		for c in world.chunks:
+			_ac_dirty[c] = true
+			_gpu_check[c] = true
+		_inc_ac_refs.clear()
+		if not _bridge_alt_active:
+			_inc_ac_refs.merge(contents)
+	elif not _bridge_alt_active:
+		_inc_diff_refs(contents, _inc_ac_refs, _pending_ac_units)
+	var has_am: bool = world.has_method("alt_machines_now")
+	var shown: Dictionary = world.alt_machines_now() if has_am else {}
+	var am_key := [world, has_am, int(world.get("_alt_machines_g")), Bridge.alt_contents, gh_key, gfx_gen,
+		icons_ver, use_spec, ammo_fuel, Bridge.loco_fuel_icons, eprops_size]
+	if am_key != _inc_am_key:
+		if _inc_hard_change(am_key, _inc_am_key, INC_HARD_KEY):
+			_chunk_machines_cache.clear()
+		else:
+			_inc_prune(_chunk_machines_cache, world)
+		_inc_am_key = am_key
+		_pending_am_units.clear()
+		_inc_am_units.clear()
+		_am_builds += 1
+		Probing.count("alt_all")
+		for c in world.chunks:
+			_am_dirty[c] = true
+			_gpu_check[c] = true
+		_inc_movers.clear()
+		_inc_movers_changed = true
+		for unit in shown:
+			if world.entities.get(unit) == null:
+				_inc_mover_set(world, int(unit), shown[unit])
+		_inc_am_refs.clear()
+		if not _bridge_alt_active:
+			_inc_am_refs.merge(shown)
+	elif not _bridge_alt_active:
+		_inc_diff_refs(shown, _inc_am_refs, _pending_am_units)
+	if not _pending_ac_units.is_empty():
+		for unit in _pending_ac_units:
+			var r: WorldMirror.Rec = world.entities.get(unit)
+			if r != null:
+				_ac_dirty[r.chunk] = true
+				_gpu_check[r.chunk] = true
+		_pending_ac_units.clear()
+	if not _pending_am_units.is_empty():
+		for unit in _pending_am_units:
+			var r: WorldMirror.Rec = world.entities.get(unit)
+			if r != null:
+				_am_dirty[r.chunk] = true
+				_gpu_check[r.chunk] = true
+				if _inc_movers.erase(unit):
+					_inc_movers_changed = true
+			elif shown.has(unit):
+				_inc_mover_set(world, int(unit), shown[unit])
+			elif _inc_movers.erase(unit):
+				_inc_movers_changed = true
+		_pending_am_units.clear()
+	if fluids_layer == null:
+		if not _inc_fl_key.is_empty():
+			_inc_fl_key = []
+			_chunk_fluids_cache.clear()
+			_fl_dirty.clear()
+			_inc_fl_shown.clear()
+			_inc_fl_ref = {}
+			_inc_fl_size = -1
+	else:
+		var fl_key := [world, fluids_layer, gh_key, gfx_gen, icons_ver]
+		if fl_key != _inc_fl_key:
+			if _inc_hard_change(fl_key, _inc_fl_key, 2):
+				_chunk_fluids_cache.clear()
+			else:
+				_inc_prune(_chunk_fluids_cache, world)
+			_inc_fl_key = fl_key
+			_fl_builds += 1
+			Probing.count("alt_all")
+			for c in world.chunks:
+				_fl_dirty[c] = true
+				_gpu_check[c] = true
+			_inc_fl_shown.clear()
+			_inc_fl_ref = {}
+			_inc_fl_size = -1
+		_inc_fl_diff(world, fluids_layer)
+	if not _inc_gone.is_empty():
+		for c: Vector2i in _inc_gone:
+			if not world.chunks.has(c):
+				_inc_build_chunk(world, c, fluids_layer)
+		_inc_gone.clear()
+	_inc_movers_flush()
+	Probing.add("alt_inc", t_inc)
+
+
+## --alt-relift: a new field (GroundHeight.version()) puts every loaded chunk to be lifted where it is looked at
+## (and on the card looked at again), with no "all" key changed.
+func _gh_note(world, gh_ver: int) -> void:
+	if not _relift_on() or gh_ver == _gh_seen:
+		return
+	_gh_seen = gh_ver
+	for c in world.chunks:
+		_gh_dirty[c] = true
+		_gpu_check[c] = true
+
+
+## --alt-relift: chunk `c`'s four caches lifted onto the field of `gh_ver` where they stand on another; whether
+## any anchor moved.
+func _relift_chunk(c: Vector2i, gh_ver: int) -> bool:
+	_gh_dirty.erase(c)
+	var moved := false
+	for cc: ChunkCache in [_chunk_alt_cache.get(c), _chunk_contents_cache.get(c), _chunk_machines_cache.get(c),
+			_chunk_fluids_cache.get(c)]:
+		if cc != null and cc.gh_ver != gh_ver and _relift_cache(cc, gh_ver):
+			moved = true
+	return moved
+
+
+## One cache's anchors set to their flat heights plus the ground under them now: the builders' own sum
+## (flat_y + GroundHeight.at(x, z), flat_y kept in 64 bits), so the anchors equal a build's to the bit. In C++
+## (AltIconsNative.lift) when the library has it. Whether any moved (then the cache is numbered anew).
+func _relift_cache(cc: ChunkCache, gh_ver: int) -> bool:
+	cc.gh_ver = gh_ver
+	var n := cc.ent_anchor.size()
+	if n == 0:
+		return false
+	relifts += 1
+	Probing.count("alt_relifts")
+	var now: PackedVector3Array
+	var nat := _lift_native()
+	if nat != null and cc.ent_flat_d.size() == n:
+		if _lift_nat_ver != gh_ver:
+			_lift_nat_ver = gh_ver
+			nat.call("set_field", GroundHeight.sample_state())
+		now = nat.call("lift", cc.ent_anchor, cc.ent_flat_d, GroundHeight.mix_now())
+	else:
+		now = relift_anchors(cc.ent_anchor, cc.ent_flat_d)
+	if now == cc.ent_anchor:
+		return false
+	cc.ent_anchor = now
+	cc.renumber()
+	return true
+
+
+## The GDScript lift: each anchor's y its flat height plus GroundHeight.at under its x, z (tests compare the C++).
+static func relift_anchors(anchors: PackedVector3Array, flat_d: PackedFloat64Array) -> PackedVector3Array:
+	var now := anchors.duplicate()
+	for i in mini(now.size(), flat_d.size()):
+		var a := now[i]
+		a.y = flat_d[i] + GroundHeight.at(a.x, a.z)
+		now[i] = a
+	return now
+
+
+## The C++ lift (--alt-native and a library with AltIconsNative.lift), or null for the GDScript loop.
+func _lift_native() -> Object:
+	if not native:
+		return null
+	if not _lift_nat_tried:
+		_lift_nat_tried = true
+		if NativeLibrary.ensure() and ClassDB.class_exists(&"AltIconsNative") \
+				and ClassDB.class_has_method(&"AltIconsNative", &"lift"):
+			_lift_nat = ClassDB.instantiate(&"AltIconsNative")
+			_lift_nat_ver = -1
+	return _lift_nat
+
+
+## How many of the contents' and machines' "all" keys' first entries (world, its alt_*_now, Alt-mode's `g`
+## twice) empty the stores when they change; the fluids' key: world and fluids layer (2).
+const INC_HARD_KEY := 4
+
+
+static func _inc_hard_change(key: Array, was: Array, hard: int) -> bool:
+	return was.size() != key.size() or key.slice(0, hard) != was.slice(0, hard)
+
+
+## Kept stores: chunks no longer loaded leave them (their unload may not have been seen yet).
+static func _inc_prune(store: Dictionary, world) -> void:
+	for c: Vector2i in store.keys():
+		if not world.chunks.has(c):
+			store.erase(c)
+
+
+func _inc_movers_flush() -> void:
+	if not _inc_movers_changed:
+		return
+	_inc_movers_changed = false
+	_moving_machines.clear()
+	for unit in _inc_movers:
+		_moving_machines.append(_inc_movers[unit])
+
+
+## Without bridge messages: units whose `ac` / `am` entry is new, changed or gone into `pending`.
+static func _inc_diff_refs(now: Dictionary, refs: Dictionary, pending: Dictionary) -> void:
+	if now.size() == refs.size():
+		var same := true
+		for unit in now:
+			if not is_same(refs.get(unit), now[unit]):
+				same = false
+				break
+		if same:
+			return
+	for unit in now:
+		if not is_same(refs.get(unit), now[unit]):
+			pending[unit] = true
+	for unit in refs:
+		if not now.has(unit):
+			pending[unit] = true
+	refs.clear()
+	refs.merge(now)
+
+
+## A machine with an `am` entry and no record: its MovingSeq (made or given the new lists).
+func _inc_mover_set(world, unit: int, lists: Array) -> void:
+	var ms: MovingSeq = _inc_movers.get(unit)
+	if ms == null:
+		ms = MovingSeq.new()
+		ms.unit = unit
+		_inc_movers[unit] = ms
+	ms.lists = lists
+	var movers = player.get("movers") if player != null else null
+	if movers != null and movers.has_method("proto_id_of"):
+		_populate_moving_seq(world, movers, ms, _last_gfx_gen, _last_icons_ver)
+	_inc_movers_changed = true
+
+
+## `fl`: one pass over the units when its dictionary changed; a unit whose shown fluid changed (new, emptied,
+## another, gone) marks its chunk. _alt_rev only moves when one did.
+func _inc_fl_diff(world, fluids_layer) -> void:
+	var fluids: Dictionary = fluids_layer.fluids
+	var rebuilds := int(fluids_layer.window_rebuilds)
+	if is_same(fluids, _inc_fl_ref) and fluids.size() == _inc_fl_size \
+			and (_bridge_alt_active or (rebuilds == _inc_fl_rebuilds and fluids.size() > 64)):
+		return
+	_inc_fl_ref = fluids
+	_inc_fl_size = fluids.size()
+	_inc_fl_rebuilds = rebuilds
+	var changed := false
+	for unit in fluids:
+		var now := _shown_fluid(fluids[unit])
+		var was: String = _inc_fl_shown.get(unit, "")
+		if now == was:
+			continue
+		if now == "":
+			_inc_fl_shown.erase(unit)
+		else:
+			_inc_fl_shown[unit] = now
+		changed = true
+		var r: WorldMirror.Rec = world.entities.get(unit)
+		if r != null:
+			_fl_dirty[r.chunk] = true
+			_gpu_check[r.chunk] = true
+	var gone: Array = []
+	for unit in _inc_fl_shown:
+		if not fluids.has(unit):
+			gone.append(unit)
+	for unit in gone:
+		_inc_fl_shown.erase(unit)
+		changed = true
+		var r: WorldMirror.Rec = world.entities.get(unit)
+		if r != null:
+			_fl_dirty[r.chunk] = true
+			_gpu_check[r.chunk] = true
+	if changed:
+		_alt_rev += 1
+
+
+## Chunk `c`'s dirty kinds built again from its own records (one scan of them); a chunk no longer loaded
+## loses its caches, and its machines with an `am` entry and no record left become movers.
+func _inc_build_chunk(world, c: Vector2i, fluids_layer) -> void:
+	var need_ac := _ac_dirty.erase(c)
+	var need_am := _am_dirty.erase(c)
+	var need_fl := _fl_dirty.erase(c)
+	var cv = world.chunks.get(c)
+	var shown: Dictionary = world.alt_machines_now() if world.has_method("alt_machines_now") else {}
+	if cv == null:
+		_chunk_contents_cache.erase(c)
+		_chunk_machines_cache.erase(c)
+		_chunk_fluids_cache.erase(c)
+		_inc_stamp.erase(c)
+		_gh_dirty.erase(c)
+		_inc_am_left(world, c, {}, shown)
+		_inc_movers_flush()
+		return
+	_inc_stamp[c] = _stamp_of(cv, world)
+	var contents: Dictionary = world.alt_contents_now() if (need_ac and world.has_method("alt_contents_now")) else {}
+	var fluids: Dictionary = fluids_layer.fluids if (need_fl and fluids_layer != null) else {}
+	if not need_am:
+		shown = {}
+	var ac_cc: ChunkCache = null
+	var am_cc: ChunkCache = null
+	var fl_cc: ChunkCache = null
+	var am_units := {}
+	var any := not contents.is_empty() or not shown.is_empty() or not fluids.is_empty()
+	if any:
+		for r: WorldMirror.Rec in cv.entities.values():
+			var unit := r.unit
+			var in_ac := contents.has(unit)
+			var in_am := shown.has(unit)
+			var in_fl := fluids.has(unit)
+			if not (in_ac or in_am or in_fl) or not is_same(world.entities.get(unit), r):
+				continue
+			if in_ac:
+				ac_cc = _contents_entity(world, r, contents[unit], ac_cc)
+			if in_am:
+				am_units[unit] = true
+				am_cc = _machines_entity(world, r, shown[unit], am_cc)
+			if in_fl:
+				fl_cc = _fluids_entity(world, r, fluids[unit], fl_cc)
+	var gh_ver := GroundHeight.version()  # what the builders' anchors stand on (--alt-relift)
+	if need_ac:
+		chunk_builds += 1
+		Probing.count("alt_builds")
+		if ac_cc != null:
+			ac_cc.gh_ver = gh_ver
+		_inc_put(_chunk_contents_cache, c, ac_cc)
+	if need_am:
+		chunk_builds += 1
+		Probing.count("alt_builds")
+		if am_cc != null:
+			am_cc.gh_ver = gh_ver
+		_inc_put(_chunk_machines_cache, c, am_cc)
+		_inc_am_left(world, c, am_units, shown)
+	if need_fl:
+		chunk_builds += 1
+		Probing.count("alt_builds")
+		if fl_cc != null:
+			fl_cc.gh_ver = gh_ver
+		_inc_put(_chunk_fluids_cache, c, fl_cc)
+	_inc_movers_flush()
+
+
+static func _inc_put(store: Dictionary, c: Vector2i, cc: ChunkCache) -> void:
+	if cc == null:
+		store.erase(c)
+	else:
+		store[c] = cc
+
+
+## Chunk `c`'s machines with an `am` entry are now `units`: those found here leave the movers, those that were
+## here and have no record left join them (as the whole-map cache made a MovingSeq of every unit with no record).
+func _inc_am_left(world, c: Vector2i, units: Dictionary, shown: Dictionary) -> void:
+	var before: Dictionary = _inc_am_units.get(c, {})
+	for unit in units:
+		if _inc_movers.erase(unit):
+			_inc_movers_changed = true
+	for unit in before:
+		if units.has(unit) or not shown.has(unit) or world.entities.get(unit) != null:
+			continue
+		_inc_mover_set(world, int(unit), shown[unit])
+	if units.is_empty():
+		_inc_am_units.erase(c)
+	else:
+		_inc_am_units[c] = units
 
 
 func _build_chunk_alt_cache(world, c: Vector2i, cv, gh_ver: int, eprops_size: int, gfx_gen: int, icons_ver: int) -> ChunkCache:
@@ -780,7 +1505,7 @@ func _build_chunk_alt_cache(world, c: Vector2i, cv, gh_ver: int, eprops_size: in
 		var icon := WorldMirror.alt_icon(r)
 		if icon.is_empty():
 			continue
-		var proto = world.protos.entity(r.proto_id)
+		var proto = world.protos.entity(_shown_proto_id(world, r))
 		if proto == null:
 			continue
 		var spec := _spec_for(r)
@@ -795,7 +1520,7 @@ func _build_chunk_alt_cache(world, c: Vector2i, cv, gh_ver: int, eprops_size: in
 		var n_items := icon.size() - 1
 		var grid_cells := grid(n_items)
 		for gi in n_items:
-			var tex := Kit.item_icon(str(icon[1 + gi]))
+			var tex := _icon_of(str(icon[1 + gi]), c)
 			if tex == null:
 				continue
 			var gc: Array = grid_cells[gi]
@@ -812,6 +1537,7 @@ func _build_chunk_alt_cache(world, c: Vector2i, cv, gh_ver: int, eprops_size: in
 			continue
 		cc.ent_anchor.append(anchor)
 		cc.ent_flat_y.append(flat_y)
+		cc.ent_flat_d.append(flat_y)
 		cc.ent_ref.append(tiles)
 		cc.ent_bound.append(max_reach)
 		cc.ent_cell_start.append(start)
@@ -858,50 +1584,56 @@ func _ensure_contents_cache(world, gh_ver: int, eprops_size: int, gfx_gen: int, 
 		if r == null:
 			_ac_missing = true
 			continue
-		if not WorldMirror.alt_icon(r).is_empty():
-			continue
-		var proto = world.protos.entity(r.proto_id)
-		if proto == null:
-			continue
-		var items: Array = contents[unit]
-		if items.is_empty():
-			continue
-		var spec := _spec_for(r)
-		var tiles: float = ICON_TILES * float(spec[1]) if not spec.is_empty() else CHEST_TILES
-		var shift: Vector2 = spec[0] if not spec.is_empty() else Vector2.ZERO
-		var world_c := WorldMirror.selection_rect(proto, r.pos, r.dir).get_center()
-		var flat_y := Visuals.height_for(proto)
-		var anchor := Vector3(world_c.x, flat_y + GroundHeight.at(world_c.x, world_c.y), world_c.y)
 		var cc: ChunkCache = _chunk_contents_cache.get(r.chunk)
-		if cc == null:
-			cc = ChunkCache.new()
-			_chunk_contents_cache[r.chunk] = cc
-		var start := cc.cell_tex.size()
-		var count := 0
-		var max_reach := 0.0
-		var grid_cells := grid(items.size())
-		for gi in items.size():
-			var tex := Kit.item_icon(str(items[gi]))
-			if tex == null:
-				continue
-			var gc: Array = grid_cells[gi]
-			var side_share := float(gc[1])
-			var cell_side := side_share * tiles
-			var cell_off: Vector2 = shift + ((gc[0] as Vector2) + Vector2(side_share, side_share) * 0.5 - Vector2(0.5, 0.5)) * tiles
-			cc.cell_offset.append(cell_off)
-			cc.cell_side.append(cell_side)
-			cc.cell_tex.append(tex)
-			cc.cell_mark.append(null)
-			max_reach = maxf(max_reach, maxf(absf(cell_off.x), absf(cell_off.y)) + cell_side * 0.65)
-			count += 1
-		if count > 0:
-			cc.ent_anchor.append(anchor)
-			cc.ent_flat_y.append(flat_y)
-			cc.ent_ref.append(tiles)
-			cc.ent_bound.append(max_reach)
-			cc.ent_cell_start.append(start)
-			cc.ent_cell_count.append(count)
-			cc.ent_hover_rec.append(null)
+		var nc := _contents_entity(world, r, contents[unit], cc)
+		if nc != cc:
+			_chunk_contents_cache[r.chunk] = nc
+
+
+## One chest's contents (`ac` items) as cells into `cc` (made when null; the one used is returned). Shared
+## by the whole-map cache and the per-chunk one (--alt-incremental), so the two cannot drift.
+func _contents_entity(world, r: WorldMirror.Rec, items: Array, cc: ChunkCache) -> ChunkCache:
+	if not WorldMirror.alt_icon(r).is_empty():
+		return cc
+	var proto = world.protos.entity(r.proto_id)
+	if proto == null or items.is_empty():
+		return cc
+	var spec := _spec_for(r)
+	var tiles: float = ICON_TILES * float(spec[1]) if not spec.is_empty() else CHEST_TILES
+	var shift: Vector2 = spec[0] if not spec.is_empty() else Vector2.ZERO
+	var world_c := WorldMirror.selection_rect(proto, r.pos, r.dir).get_center()
+	var flat_y := Visuals.height_for(proto)
+	var anchor := Vector3(world_c.x, flat_y + GroundHeight.at(world_c.x, world_c.y), world_c.y)
+	if cc == null:
+		cc = ChunkCache.new()
+	var start := cc.cell_tex.size()
+	var count := 0
+	var max_reach := 0.0
+	var grid_cells := grid(items.size())
+	for gi in items.size():
+		var tex := _icon_of(str(items[gi]), r.chunk)
+		if tex == null:
+			continue
+		var gc: Array = grid_cells[gi]
+		var side_share := float(gc[1])
+		var cell_side := side_share * tiles
+		var cell_off: Vector2 = shift + ((gc[0] as Vector2) + Vector2(side_share, side_share) * 0.5 - Vector2(0.5, 0.5)) * tiles
+		cc.cell_offset.append(cell_off)
+		cc.cell_side.append(cell_side)
+		cc.cell_tex.append(tex)
+		cc.cell_mark.append(null)
+		max_reach = maxf(max_reach, maxf(absf(cell_off.x), absf(cell_off.y)) + cell_side * 0.65)
+		count += 1
+	if count > 0:
+		cc.ent_anchor.append(anchor)
+		cc.ent_flat_y.append(flat_y)
+		cc.ent_flat_d.append(flat_y)
+		cc.ent_ref.append(tiles)
+		cc.ent_bound.append(max_reach)
+		cc.ent_cell_start.append(start)
+		cc.ent_cell_count.append(count)
+		cc.ent_hover_rec.append(null)
+	return cc
 
 
 func _ensure_machines_cache(world, gh_ver: int, eprops_size: int, gfx_gen: int, icons_ver: int) -> void:
@@ -955,59 +1687,67 @@ func _ensure_machines_cache(world, gh_ver: int, eprops_size: int, gfx_gen: int, 
 			_moving_machines.append(ms)
 			_am_missing = true
 			continue
-		var proto = world.protos.entity(r.proto_id)
-		if proto == null:
+		var cc: ChunkCache = _chunk_machines_cache.get(r.chunk)
+		var nc := _machines_entity(world, r, lists, cc)
+		if nc != cc:
+			_chunk_machines_cache[r.chunk] = nc
+
+
+## One machine's rows (`am` modules, packs, ammo, fuel, cargo) as cells into `cc` (made when needed; the one
+## used is returned). Shared by the whole-map cache and the per-chunk one (--alt-incremental).
+func _machines_entity(world, r: WorldMirror.Rec, lists: Array, cc: ChunkCache) -> ChunkCache:
+	var pid := _shown_proto_id(world, r)
+	var proto = world.protos.entity(pid)
+	if proto == null:
+		return cc
+	var isq = _overlay_of(pid).get("isq")
+	if not (isq is Array):
+		return cc
+	var spec := _spec_for(r)
+	var ref: float = ICON_TILES * (float(spec[1]) if not spec.is_empty() else 1.0)
+	var world_c := WorldMirror.selection_rect(proto, r.pos, r.dir).get_center()
+	var flat_y := Visuals.height_for(proto)
+	var anchor := Vector3(world_c.x, flat_y + GroundHeight.at(world_c.x, world_c.y), world_c.y)
+	var hover_rec: Variant = r if HOVER_ONLY_TYPES.has(proto.type) else null
+	for row in isq:
+		if not (row is Array) or (row as Array).size() < 8:
 			continue
-		var isq = _overlay_of(r.proto_id).get("isq")
-		if not (isq is Array):
+		var kind := str(row[0])
+		if not KIND_LIST.has(kind) or (STOCK_KINDS.has(kind) and not ammo_fuel) or (kind == "f" and not Bridge.loco_fuel_icons):
 			continue
-		var spec := _spec_for(r)
-		var ref: float = ICON_TILES * (float(spec[1]) if not spec.is_empty() else 1.0)
-		var world_c := WorldMirror.selection_rect(proto, r.pos, r.dir).get_center()
-		var flat_y := Visuals.height_for(proto)
-		var anchor := Vector3(world_c.x, flat_y + GroundHeight.at(world_c.x, world_c.y), world_c.y)
-		var hover_rec: Variant = r if HOVER_ONLY_TYPES.has(proto.type) else null
-		var cc: ChunkCache = null
-		for row in isq:
-			if not (row is Array) or (row as Array).size() < 8:
+		var items: Array = lists[int(KIND_LIST[kind])]
+		if items.is_empty():
+			continue
+		var cells := sequence_cells(items.size(), row)
+		if cc == null:
+			cc = ChunkCache.new()
+		var start := cc.cell_tex.size()
+		var count := 0
+		var max_reach := 0.0
+		for ci in cells.size():
+			var tex := _icon_of(str(items[ci][0]), r.chunk)
+			if tex == null:
 				continue
-			var kind := str(row[0])
-			if not KIND_LIST.has(kind) or (STOCK_KINDS.has(kind) and not ammo_fuel) or (kind == "f" and not Bridge.loco_fuel_icons):
-				continue
-			var items: Array = lists[int(KIND_LIST[kind])]
-			if items.is_empty():
-				continue
-			var cells := sequence_cells(items.size(), row)
-			if cc == null:
-				cc = _chunk_machines_cache.get(r.chunk)
-				if cc == null:
-					cc = ChunkCache.new()
-					_chunk_machines_cache[r.chunk] = cc
-			var start := cc.cell_tex.size()
-			var count := 0
-			var max_reach := 0.0
-			for ci in cells.size():
-				var tex := Kit.item_icon(str(items[ci][0]))
-				if tex == null:
-					continue
-				var c_entry: Array = cells[ci]
-				var cell_off: Vector2 = c_entry[0]
-				var cell_side := float(c_entry[1])
-				var mark: Texture2D = Slot.quality_icon(str(items[ci][1]))
-				cc.cell_offset.append(cell_off)
-				cc.cell_side.append(cell_side)
-				cc.cell_tex.append(tex)
-				cc.cell_mark.append(mark)
-				max_reach = maxf(max_reach, maxf(absf(cell_off.x), absf(cell_off.y)) + cell_side * 0.65)
-				count += 1
-			if count > 0:
-				cc.ent_anchor.append(anchor)
-				cc.ent_flat_y.append(flat_y)
-				cc.ent_ref.append(ref)
-				cc.ent_bound.append(max_reach)
-				cc.ent_cell_start.append(start)
-				cc.ent_cell_count.append(count)
-				cc.ent_hover_rec.append(hover_rec)
+			var c_entry: Array = cells[ci]
+			var cell_off: Vector2 = c_entry[0]
+			var cell_side := float(c_entry[1])
+			var mark: Texture2D = Slot.quality_icon(str(items[ci][1]))
+			cc.cell_offset.append(cell_off)
+			cc.cell_side.append(cell_side)
+			cc.cell_tex.append(tex)
+			cc.cell_mark.append(mark)
+			max_reach = maxf(max_reach, maxf(absf(cell_off.x), absf(cell_off.y)) + cell_side * 0.65)
+			count += 1
+		if count > 0:
+			cc.ent_anchor.append(anchor)
+			cc.ent_flat_y.append(flat_y)
+			cc.ent_flat_d.append(flat_y)
+			cc.ent_ref.append(ref)
+			cc.ent_bound.append(max_reach)
+			cc.ent_cell_start.append(start)
+			cc.ent_cell_count.append(count)
+			cc.ent_hover_rec.append(hover_rec)
+	return cc
 
 
 func _populate_moving_seq(world, movers, ms: MovingSeq, gfx_gen: int, icons_ver: int) -> void:
@@ -1084,42 +1824,54 @@ func _ensure_fluids_cache(world, fluids_layer, gh_ver: int, gfx_gen: int, icons_
 		if r == null:
 			_fl_missing = true
 			continue
-		var proto = world.protos.entity(r.proto_id)
-		if proto == null or not FLUID_TYPES.has(proto.type):
-			continue
-		if SPARSE_FLUID_TYPES.has(proto.type) and not pipe_shows_icon(Vector2i(r.pos.floor())):
-			continue
-		var boxes: Array = fluids[unit]
-		var fluid_name := ""
-		for b in boxes:
-			var f := str(b.get("fluid", ""))
-			if f != "" and float(b.get("amount", 0.0)) > 0.0:
-				fluid_name = f
-				break
-		if fluid_name == "":
-			continue
-		var tex := Kit.item_icon(fluid_name)
-		if tex == null:
-			continue
-		var world_c := WorldMirror.selection_rect(proto, r.pos, r.dir).get_center()
-		var flat_y := Visuals.height_for(proto)
-		var anchor := Vector3(world_c.x, flat_y + GroundHeight.at(world_c.x, world_c.y), world_c.y)
 		var cc: ChunkCache = _chunk_fluids_cache.get(r.chunk)
-		if cc == null:
-			cc = ChunkCache.new()
-			_chunk_fluids_cache[r.chunk] = cc
-		var start := cc.cell_tex.size()
-		cc.cell_offset.append(Vector2.ZERO)
-		cc.cell_side.append(FLUID_TILES)
-		cc.cell_tex.append(tex)
-		cc.cell_mark.append(null)
-		cc.ent_anchor.append(anchor)
-		cc.ent_flat_y.append(flat_y)
-		cc.ent_ref.append(FLUID_TILES)
-		cc.ent_bound.append(FLUID_TILES * 0.65)
-		cc.ent_cell_start.append(start)
-		cc.ent_cell_count.append(1)
-		cc.ent_hover_rec.append(null)
+		var nc := _fluids_entity(world, r, fluids[unit], cc)
+		if nc != cc:
+			_chunk_fluids_cache[r.chunk] = nc
+
+
+## The fluid Alt-mode shows for a unit's boxes: the first with any in it ("" for none).
+static func _shown_fluid(boxes: Array) -> String:
+	for b in boxes:
+		var f := str(b.get("fluid", ""))
+		if f != "" and float(b.get("amount", 0.0)) > 0.0:
+			return f
+	return ""
+
+
+## One pipe's, pump's or tank's fluid icon into `cc` (made when needed; the one used is returned). Shared by
+## the whole-map cache and the per-chunk one (--alt-incremental).
+func _fluids_entity(world, r: WorldMirror.Rec, boxes: Array, cc: ChunkCache) -> ChunkCache:
+	var proto = world.protos.entity(r.proto_id)
+	if proto == null or not FLUID_TYPES.has(proto.type):
+		return cc
+	if SPARSE_FLUID_TYPES.has(proto.type) and not pipe_shows_icon(Vector2i(r.pos.floor())):
+		return cc
+	var fluid_name := _shown_fluid(boxes)
+	if fluid_name == "":
+		return cc
+	var tex := _icon_of(fluid_name, r.chunk)
+	if tex == null:
+		return cc
+	var world_c := WorldMirror.selection_rect(proto, r.pos, r.dir).get_center()
+	var flat_y := Visuals.height_for(proto)
+	var anchor := Vector3(world_c.x, flat_y + GroundHeight.at(world_c.x, world_c.y), world_c.y)
+	if cc == null:
+		cc = ChunkCache.new()
+	var start := cc.cell_tex.size()
+	cc.cell_offset.append(Vector2.ZERO)
+	cc.cell_side.append(FLUID_TILES)
+	cc.cell_tex.append(tex)
+	cc.cell_mark.append(null)
+	cc.ent_anchor.append(anchor)
+	cc.ent_flat_y.append(flat_y)
+	cc.ent_flat_d.append(flat_y)
+	cc.ent_ref.append(FLUID_TILES)
+	cc.ent_bound.append(FLUID_TILES * 0.65)
+	cc.ent_cell_start.append(start)
+	cc.ent_cell_count.append(1)
+	cc.ent_hover_rec.append(null)
+	return cc
 
 
 func _emit_chunk_cache(world, camera: Camera3D, cc: ChunkCache, hovered: Variant, fog_node: Node,
@@ -1235,6 +1987,75 @@ func _emit_moving_machines(world, camera: Camera3D, planes: Array[Plane], lift: 
 				_push_icon(depth, mid, side, s, texs[ci], marks[ci], key)
 
 
+func _robot_cargo_dict() -> Dictionary:
+	if not robot_items or model == null:
+		return {}
+	var v: Variant = model.get("robot_cargo")
+	return v as Dictionary if v is Dictionary else {}
+
+
+func _emit_robot_cargo(world, camera: Camera3D, planes: Array[Plane], lift: Vector2, fog_node: Node,
+		cam_pos: Vector3, cam_right: Vector3, cam_fwd: Vector3,
+		min_px: float, max_px: float, vp_w: float, vp_h: float) -> void:
+	_last_robot_pos.clear()
+	var rc := _robot_cargo_dict()
+	if rc.is_empty() or world == null or world.protos == null:
+		return
+	var movers = player.get("movers")
+	if movers == null or not movers.has_method("position_of"):
+		return
+	var cull_vp := (not _in_3d) and vp_w > 0.0 and vp_h > 0.0
+	for u_k in rc:
+		var unit := int(u_k)
+		var entry_v: Variant = rc[u_k]
+		if not (entry_v is Dictionary):
+			continue
+		var entry := entry_v as Dictionary
+		var item_id := int(entry.get("item_id", 0))
+		if item_id <= 0:
+			continue
+		var item_name := str(world.protos.item_name(item_id))
+		if item_name.is_empty():
+			continue
+		var tex := Kit.item_icon(item_name)
+		if tex == null:
+			continue
+		var moving: Variant = movers.position_of(unit)
+		var fogged: bool = movers.is_fogged(unit) if movers.has_method("is_fogged") else false
+		_last_robot_pos[unit] = moving if not fogged else null
+		if not (moving is Vector3) or fogged:
+			continue
+		var pos3: Vector3 = moving
+		var chunk := Vector2i(floori(pos3.x / 32.0), floori(pos3.z / 32.0))
+		if not _chunk_in_view_lift(chunk, planes, lift):
+			continue
+		if fog_node != null and not fog_node.seen(Vector2(pos3.x, pos3.z)):
+			continue
+		var q_name := str(entry.get("quality", "normal"))
+		var at := Vector3(pos3.x, pos3.y + 0.15, pos3.z)
+		if _in_3d:
+			var q_texs: Array[Texture2D] = [tex]
+			var q_names: Array[String] = [q_name]
+			_place_quads(world, camera, at, q_texs, [[Vector2.ZERO, ROBOT_ICON_TILES]], q_names)
+			continue
+		at.y += GroundHeight.at(at.x, at.z)
+		if camera.is_position_behind(at):
+			continue
+		var p := camera.unproject_position(at)
+		var edge := camera.unproject_position(at + cam_right * 0.5)
+		var half := clampf(p.distance_to(edge), min_px, max_px)
+		var side := half * 2.0 * ROBOT_ICON_TILES
+		if side < MIN_ICON_PX:
+			continue
+		var s := side * 0.65
+		if cull_vp and (p.x + s < 0.0 or p.x - s > vp_w or p.y + s < 0.0 or p.y - s > vp_h):
+			continue
+		var depth := cam_fwd.dot(at - cam_pos)
+		var key := _order_key(cam_fwd, at)
+		var mark: Variant = Slot.quality_icon(q_name)
+		_push_icon(depth, p, side, s, tex, mark, key)
+
+
 ## The sort key of an icon at `at` (stable_order): its depth along the view from the world's origin,
 ## worked out in 64-bit floats from the components, so it doesn't change as the camera only moves.
 static func _order_key(fwd: Vector3, at: Vector3) -> float:
@@ -1296,6 +2117,7 @@ static func _read_args() -> void:
 	_args_read = true
 	use_spec = Switches.on("--alt-icon-spec")
 	ammo_fuel = Switches.on("--alt-ammo-fuel")
+	robot_items = Switches.on("--alt-robot-items")
 	icon_order = not Switches.has("--alt-icon-order=old")
 	flat_batch_marks = Switches.on("--alt-flat-batch")
 	use_cache = Switches.on("--alt-cache")
@@ -1312,7 +2134,8 @@ static func _read_args() -> void:
 func _spec_for(r: WorldMirror.Rec) -> Array:
 	if not use_spec or model == null:
 		return []
-	var ids = (_overlay_of(r.proto_id)).get("ids")
+	var pid := int(r.extra["gh"]) if r.extra.has("gh") else r.proto_id
+	var ids = (_overlay_of(pid)).get("ids")
 	if not (ids is Array) or ids.size() < 3:
 		return []
 	return [Vector2(float(ids[0]), float(ids[1])), maxf(float(ids[2]), 0.05)]
@@ -1347,7 +2170,7 @@ static func _chunk_in_view_lift(c: Vector2i, planes: Array[Plane], lift: Vector2
 
 ## A chest's icons are smaller than a machine's (CHEST_TILES).
 static func _tiles_for(world, r: WorldMirror.Rec) -> float:
-	var proto = world.protos.entity(r.proto_id)
+	var proto = world.protos.entity(_shown_proto_id(world, r))
 	return CHEST_TILES if proto != null and CHEST_TYPES.has(proto.type) else ICON_TILES
 
 
@@ -1393,7 +2216,7 @@ func _draw_sequences(world, camera: Camera3D, planes: Array[Plane], in_view: Dic
 		var chunk := Vector2i.ZERO
 		var moving = null  # a mover's place as drawn (Vector3)
 		if r != null:
-			proto_id = r.proto_id
+			proto_id = _shown_proto_id(world, r)
 			chunk = r.chunk
 		elif movers != null and movers.has_method("proto_id_of"):
 			proto_id = movers.proto_id_of(unit)
@@ -1529,7 +2352,7 @@ func _draw_cells(world, camera: Camera3D, r: WorldMirror.Rec, textures: Array[Te
 		qualities: Array[String] = []) -> void:
 	if r == null or textures.is_empty():
 		return
-	var proto = world.protos.entity(r.proto_id)
+	var proto = world.protos.entity(_shown_proto_id(world, r))
 	if proto == null:
 		return
 	_draw_cells_at(world, camera, WorldMirror.selection_rect(proto, r.pos, r.dir).get_center(), Visuals.height_for(proto),
@@ -2154,6 +2977,7 @@ const GPU_BUDGET_USEC := 1500
 class GpuChunk:
 	var sig := 0
 	var fwd_rev := -1
+	var src := PackedInt64Array()  # its caches' serials when last sent (--alt-relift)
 	var data := PackedFloat32Array()
 
 
@@ -2179,12 +3003,18 @@ var _gpu_prev_fwd := Vector3.ZERO
 var _gpu_data_key: Array = []
 var _gpu_global_key: Array = []
 var _gpu_builds_key: Array = []
+var _gpu_sweep_key: Array = []  # --alt-quiet-builds: what _gpu_sweep last looked at
 var _gpu_check := {}  # Vector2i -> true: chunks to look at again
 var _gpu_camera: Camera3D = null
 var _gpu_uniforms: Array = []
 ## Instances on the card, and how many times the buffer was sent (tests, the debug overlay).
 var gpu_instances := 0
 var gpu_uploads := 0
+## --alt-native: this overlay's AltIconsNative, whether this frame's card path uses it, and the layers' reset
+## count (a chunk's pictures sent again after _gpu_reset_layers).
+var _gpu_nat: Object = null
+var _gpu_nat_on := false
+var _gpu_layers_rev := 0
 
 
 ## Whether this frame's icons go on the card (icons_mode).
@@ -2210,6 +3040,7 @@ func _gpu_set_live(v: bool) -> void:
 		_gpu_data_key = []
 		_gpu_global_key = []
 		_gpu_builds_key = []
+		_gpu_sweep_key = []
 		_gpu_uniforms = []
 	if _gpu_ci.is_valid():
 		RenderingServer.canvas_item_set_visible(_gpu_ci, v)
@@ -2268,12 +3099,18 @@ func _gpu_sync(world, camera: Camera3D, fluids_layer, gh_ver: int, gfx_gen: int,
 		if not _gpu_ci.is_valid():
 			return
 	var fwd := (-camera.global_basis.z).normalized()
-	var global_key := [world, gh_ver, gfx_gen, icons_ver, eprops_size, use_spec]
+	var nat_on := _gpu_native_wanted()
+	if nat_on != _gpu_nat_on:  # --alt-native switched: every chunk sent again the other way
+		_gpu_nat_on = nat_on
+		_gpu_global_key = []
+	var global_key := [world, _gh_key(gh_ver), gfx_gen, icons_ver, eprops_size, use_spec]
 	if global_key != _gpu_global_key:
 		if _gpu_global_key.size() == global_key.size() and (_gpu_global_key[2] != gfx_gen or _gpu_global_key[3] != icons_ver):
 			_gpu_reset_layers()
 		if _gpu_global_key.is_empty() or _gpu_global_key[0] != world:
 			_gpu_chunks.clear()
+			if _gpu_nat != null:
+				_gpu_nat.call("clear")
 			_gpu_order_dirty = true
 		_gpu_global_key = global_key
 		for c in world.chunks:
@@ -2281,20 +3118,30 @@ func _gpu_sync(world, camera: Camera3D, fluids_layer, gh_ver: int, gfx_gen: int,
 		for c in _gpu_chunks:
 			_gpu_check[c] = true
 		_gpu_data_key = []
-	if data_key != _gpu_data_key or not _dirty_alt_chunks.is_empty() or not _pending_aiu_units.is_empty():
+	_gh_note(world, gh_ver)
+	if data_key != _gpu_data_key or not _dirty_alt_chunks.is_empty() or not _pending_aiu_units.is_empty() \
+			or (incremental and _inc_has_news(fluids_layer)):
 		_gpu_data_key = data_key
 		_resolve_pending_aiu(world)
 		_gpu_ensure(world, fluids_layer, gh_ver, eprops_size, gfx_gen, icons_ver)
 		for c in _dirty_alt_chunks:
 			_gpu_check[c] = true
-		for c in _chunk_alt_cache:
-			var cc: ChunkCache = _chunk_alt_cache[c]
-			var cv = world.chunks.get(c)
-			if cv == null or cc.cv_id != cv.get_instance_id() or cc.content_rev != cv.content_rev:
-				_gpu_check[c] = true
-		for c in _gpu_chunks:
-			if not world.chunks.has(c):
-				_gpu_check[c] = true
+		if incremental and quiet_builds:
+			_gpu_sweep(world)
+		else:
+			for c in _chunk_alt_cache:
+				var cc: ChunkCache = _chunk_alt_cache[c]
+				var cv = world.chunks.get(c)
+				if cv == null or cc.cv_id != cv.get_instance_id() or cc.content_rev != cv.content_rev:
+					_gpu_check[c] = true
+			if incremental:
+				for c in _inc_stamp:
+					var cv = world.chunks.get(c)
+					if cv == null or _stamp_moved(_inc_stamp[c], cv, world):
+						_gpu_check[c] = true
+			for c in _gpu_chunks:
+				if not world.chunks.has(c):
+					_gpu_check[c] = true
 	# The view turned: sort again.
 	var turned := _gpu_fwd == Vector3.ZERO or fwd.angle_to(_gpu_fwd) > deg_to_rad(GPU_RESORT_DEG) \
 		or (fwd == _gpu_prev_fwd and fwd.angle_to(_gpu_fwd) > 0.0001)
@@ -2303,8 +3150,9 @@ func _gpu_sync(world, camera: Camera3D, fluids_layer, gh_ver: int, gfx_gen: int,
 		_gpu_fwd = fwd
 		_gpu_fwd_rev += 1
 		_gpu_order_dirty = true
-		for c in _gpu_chunks:
-			_gpu_check[c] = true
+		if not _gpu_nat_on:  # --alt-native: build() sorts every chunk again for the new view
+			for c in _gpu_chunks:
+				_gpu_check[c] = true
 	if not _gpu_check.is_empty():
 		var planes := camera.get_frustum()
 		var lift := GroundHeight.lift_range()
@@ -2312,27 +3160,84 @@ func _gpu_sync(world, camera: Camera3D, fluids_layer, gh_ver: int, gfx_gen: int,
 		var keys: Array = _gpu_check.keys()
 		for c: Vector2i in keys:
 			if _chunk_in_view_lift(c, planes, lift):
+				# --alt-incremental: chunks in view to build again (or, --alt-relift, to lift) stop after
+				# ALT_VIEW_BUDGET_USEC (at least one); the rest the next frame.
+				if incremental and Time.get_ticks_usec() - t0 > ALT_VIEW_BUDGET_USEC and (_inc_has_dirty(c) or _gh_dirty.has(c)):
+					continue
 				_gpu_check.erase(c)
 				_gpu_update_chunk(world, c, fluids_layer, gh_ver, eprops_size, gfx_gen, icons_ver)
+		var t_far := Time.get_ticks_usec()
+		Probing.add("alt_view", t0)
 		for c: Vector2i in keys:
 			if Time.get_ticks_usec() - t0 > GPU_BUDGET_USEC:
 				break
 			if _gpu_check.has(c):
 				_gpu_check.erase(c)
 				_gpu_update_chunk(world, c, fluids_layer, gh_ver, eprops_size, gfx_gen, icons_ver)
+		Probing.add("alt_far", t_far)
+	var t_layers := Time.get_ticks_usec()
 	_gpu_flush_layers()
+	Probing.add("alt_layers", t_layers)
 	if _gpu_order_dirty:
 		_gpu_order_dirty = false
 		_gpu_buffer_dirty = true
-		_gpu_sort_chunks()
+		if not _gpu_nat_on:
+			_gpu_sort_chunks()
 	if _gpu_buffer_dirty:
 		_gpu_buffer_dirty = false
+		var t_up := Time.get_ticks_usec()
 		_gpu_upload()
+		Probing.add("alt_upload", t_up)
+
+
+## --alt-quiet-builds: chunks changed under their stamps (the recipes' cache's, the kinds') or gone looked at again,
+## in one pass over the loaded chunks, only when the chunks' or records' count or the "all" key moved since the last
+## (a record changed in place comes with its chunk's signal, which marks it). Those gone are looked for only when
+## fewer loaded chunks than stamps or card chunks were found.
+func _gpu_sweep(world) -> void:
+	var key := [world.chunks.size(), world.entities.size(), _gpu_global_key]
+	if key == _gpu_sweep_key:
+		return
+	_gpu_sweep_key = key
+	var n_alt := 0
+	var n_st := 0
+	var n_gpu := 0
+	for c in world.chunks:
+		var cv = world.chunks[c]
+		var id: int = cv.get_instance_id()
+		var rev := int(cv.content_rev)
+		var cc: ChunkCache = _chunk_alt_cache.get(c)
+		if cc != null:
+			n_alt += 1
+			if cc.cv_id != id or cc.content_rev != rev:
+				_gpu_check[c] = true
+		var st: Variant = _inc_stamp.get(c)
+		if st != null:
+			n_st += 1
+			if int(st[0]) != id or int(st[1]) != rev:
+				_gpu_check[c] = true
+		if _gpu_chunks.has(c):
+			n_gpu += 1
+	if n_alt < _chunk_alt_cache.size():
+		for c in _chunk_alt_cache:
+			if not world.chunks.has(c):
+				_gpu_check[c] = true
+	if n_st < _inc_stamp.size():
+		for c in _inc_stamp:
+			if not world.chunks.has(c):
+				_gpu_check[c] = true
+	if n_gpu < _gpu_chunks.size():
+		for c in _gpu_chunks:
+			if not world.chunks.has(c):
+				_gpu_check[c] = true
 
 
 ## The three whole-map caches (they rebuild only when their lists changed); their chunks looked at again
 ## after a rebuild.
 func _gpu_ensure(world, fluids_layer, gh_ver: int, eprops_size: int, gfx_gen: int, icons_ver: int) -> void:
+	if incremental:  # only the chunks that changed (their marks go into _gpu_check)
+		_inc_sync(world, fluids_layer, gh_ver, eprops_size, gfx_gen, icons_ver)
+		return
 	_ensure_contents_cache(world, gh_ver, eprops_size, gfx_gen, icons_ver)
 	_ensure_machines_cache(world, gh_ver, eprops_size, gfx_gen, icons_ver)
 	if fluids_layer != null:
@@ -2353,13 +3258,14 @@ func _gpu_ensure(world, fluids_layer, gh_ver: int, eprops_size: int, gfx_gen: in
 func _gpu_update_chunk(world, c: Vector2i, fluids_layer, gh_ver: int, eprops_size: int, gfx_gen: int, icons_ver: int) -> void:
 	var cv = world.chunks.get(c)
 	var caches: Array = []
+	var rl := _relift_on()
 	if cv != null:
 		var alt_cc: ChunkCache = _chunk_alt_cache.get(c)
 		if _dirty_alt_chunks.has(c) or alt_cc == null or alt_cc.cv_id != cv.get_instance_id() \
-				or alt_cc.content_rev != cv.content_rev or alt_cc.gh_ver != gh_ver \
+				or alt_cc.content_rev != cv.content_rev or (not rl and alt_cc.gh_ver != gh_ver) \
 				or alt_cc.gfx_gen != gfx_gen or alt_cc.icons_ver != icons_ver \
 				or alt_cc.use_spec != use_spec or alt_cc.eprops_size != eprops_size:
-			if alt_cc != null and alt_cc.content_rev != cv.content_rev:
+			if not incremental and alt_cc != null and alt_cc.content_rev != cv.content_rev:
 				if _chunk_contents_cache.has(c) or _ac_missing:
 					_contents_dirty = true
 				if _chunk_machines_cache.has(c) or _am_missing:
@@ -2368,11 +3274,26 @@ func _gpu_update_chunk(world, c: Vector2i, fluids_layer, gh_ver: int, eprops_siz
 					_fluids_dirty = true
 				_gpu_ensure(world, fluids_layer, gh_ver, eprops_size, gfx_gen, icons_ver)
 			alt_cc = _build_chunk_alt_cache(world, c, cv, gh_ver, eprops_size, gfx_gen, icons_ver)
+		if incremental and _inc_chunk_needs(world, c):
+			_inc_build_chunk(world, c, fluids_layer)
+		if rl and _gh_dirty.has(c):
+			_relift_chunk(c, gh_ver)
 		caches = [alt_cc, _chunk_contents_cache.get(c), _chunk_machines_cache.get(c),
 			_chunk_fluids_cache.get(c) if fluids_layer != null else null]
 	else:
 		_chunk_alt_cache.erase(c)
 		_dirty_alt_chunks.erase(c)
+		if incremental:
+			_inc_build_chunk(world, c, fluids_layer)
+	var gc: GpuChunk = _gpu_chunks.get(c)
+	# --alt-relift: the same caches as when this chunk was last sent (none built again, none lifted to anywhere
+	# new) and the same pictures' layers or view: nothing to hash.
+	var src := PackedInt64Array()
+	if rl:
+		for cc: ChunkCache in caches:
+			src.append(cc.serial if cc != null else 0)
+		if gc != null and gc.src == src and gc.fwd_rev == (_gpu_layers_rev if _gpu_nat_on else _gpu_fwd_rev):
+			return
 	var sig := 0
 	var parts: Array = []
 	for cc: ChunkCache in caches:
@@ -2382,10 +3303,11 @@ func _gpu_update_chunk(world, c: Vector2i, fluids_layer, gh_ver: int, eprops_siz
 		parts.append([cc.ent_anchor, cc.ent_ref, cc.ent_cell_start, cc.ent_cell_count, cc.ent_hover_rec,
 			cc.cell_offset, cc.cell_side, cc.cell_tex, cc.cell_mark].hash())
 		sig = 1
-	var gc: GpuChunk = _gpu_chunks.get(c)
 	if sig == 0:
 		if gc != null:
 			_gpu_chunks.erase(c)
+			if _gpu_nat_on:
+				_gpu_nat.call("erase_chunk", c)
 			_gpu_order_dirty = true
 		return
 	sig = parts.hash()
@@ -2393,6 +3315,18 @@ func _gpu_update_chunk(world, c: Vector2i, fluids_layer, gh_ver: int, eprops_siz
 		gc = GpuChunk.new()
 		_gpu_chunks[c] = gc
 		_gpu_order_dirty = true
+	if _gpu_nat_on:
+		# --alt-native: the chunk's icons to AltIconsNative when they changed (or their pictures' layers did);
+		# the view's direction is build()'s.
+		gc.src = src
+		if gc.sig == sig and gc.fwd_rev == _gpu_layers_rev:
+			return
+		gc.sig = sig
+		gc.fwd_rev = _gpu_layers_rev
+		if _gpu_nat_set(c, caches):
+			_gpu_buffer_dirty = true
+		return
+	gc.src = src
 	if gc.sig == sig and gc.fwd_rev == _gpu_fwd_rev:
 		return
 	gc.sig = sig
@@ -2473,14 +3407,93 @@ func _gpu_sort_chunks() -> void:
 		_gpu_order.append(Vector2i(int(e[1]), int(e[2])))
 
 
-func _gpu_upload() -> void:
-	if not _gpu_mm.is_valid():
-		return
+## Every chunk's instances, farthest chunk first (--alt-native: AltIconsNative's build()).
+func _gpu_join() -> PackedFloat32Array:
+	if _gpu_nat_on:
+		return _gpu_nat.call("build", _gpu_fwd)
 	var buf := PackedFloat32Array()
 	for c: Vector2i in _gpu_order:
 		var gc: GpuChunk = _gpu_chunks.get(c)
 		if gc != null:
 			buf.append_array(gc.data)
+	return buf
+
+
+## One chunk's instances as they go on the card (tests).
+func _gpu_chunk_data(c: Vector2i) -> PackedFloat32Array:
+	if _gpu_nat_on:
+		return _gpu_nat.call("chunk_data", c, _gpu_fwd)
+	var gc: GpuChunk = _gpu_chunks.get(c)
+	return gc.data if gc != null else PackedFloat32Array()
+
+
+## Whether the card's path uses AltIconsNative (--alt-native and the library loaded); made on first use.
+func _gpu_native_wanted() -> bool:
+	if not native:
+		return false
+	if _gpu_nat == null:
+		if not NativeLibrary.ensure() or not ClassDB.class_exists(&"AltIconsNative"):
+			return false
+		_gpu_nat = ClassDB.instantiate(&"AltIconsNative")
+	return _gpu_nat != null
+
+
+## A chunk's four caches joined in _gpu_fill's order for AltIconsNative.set_chunk: per entity its anchor, ref,
+## cells and whether it stays off the card (a beacon's modules), per cell its offset, side and picture (layers
+## asked for in _gpu_fill's order, so both paths number them alike). Whether the chunk's icons changed.
+func _gpu_nat_set(c: Vector2i, caches: Array) -> bool:
+	var rl := _relift_on()
+	var anchors := PackedVector3Array()
+	var refs := PackedFloat32Array()
+	var starts := PackedInt32Array()
+	var counts := PackedInt32Array()
+	var skip := PackedByteArray()
+	var offs := PackedVector2Array()
+	var sides := PackedFloat32Array()
+	var pics := PackedFloat32Array()
+	for cc: ChunkCache in caches:
+		if cc == null or cc.ent_anchor.is_empty():
+			continue
+		var base := offs.size()
+		anchors.append_array(cc.ent_anchor)
+		refs.append_array(cc.ent_ref)
+		offs.append_array(cc.cell_offset)
+		sides.append_array(cc.cell_side)
+		# --alt-relift: the cache's pictures kept from its last send while the layers stand (asked for in the
+		# same order the first time, so the layers are numbered alike).
+		var kept := rl and cc.pic_rev == _gpu_layers_rev and cc.cell_pic.size() == cc.cell_offset.size()
+		var pic := PackedFloat32Array()
+		if not kept:
+			pic.resize(cc.cell_offset.size())
+		for ei in cc.ent_anchor.size():
+			var start := cc.ent_cell_start[ei]
+			var count := cc.ent_cell_count[ei]
+			starts.append(start + base)
+			counts.append(count)
+			if cc.ent_hover_rec[ei] != null:
+				skip.append(1)
+				continue
+			skip.append(0)
+			if kept:
+				continue
+			for ci in range(start, start + count):
+				var mark: Variant = cc.cell_mark[ci]
+				var mark_layer := _gpu_layer(mark) if mark is Texture2D else -1
+				pic[ci] = float(_gpu_layer(cc.cell_tex[ci]) + 4096 * (mark_layer + 1))
+		if kept:
+			pics.append_array(cc.cell_pic)
+		else:
+			if rl:
+				cc.cell_pic = pic
+				cc.pic_rev = _gpu_layers_rev
+			pics.append_array(pic)
+	return bool(_gpu_nat.call("set_chunk", c, anchors, refs, starts, counts, skip, offs, sides, pics))
+
+
+func _gpu_upload() -> void:
+	if not _gpu_mm.is_valid():
+		return
+	var buf := _gpu_join()
 	var n := buf.size() / GPU_FLOATS
 	if n != _gpu_alloc:
 		RenderingServer.multimesh_allocate_data(_gpu_mm, n, RenderingServer.MULTIMESH_TRANSFORM_2D, true, true)
@@ -2603,7 +3616,7 @@ func _gpu_flush_layers() -> void:
 	if _gpu_tex_from >= n:
 		return
 	if _gpu_tex == null or n > _gpu_tex_cap:
-		var cap := 32
+		var cap := 256 if icons_later else 32
 		while cap < n:
 			cap *= 2
 		cap = mini(cap, maxi(_gpu_layer_limit(), n))
@@ -2631,6 +3644,7 @@ func _gpu_reset_layers() -> void:
 	_gpu_tex = null
 	_gpu_tex_cap = 0
 	_gpu_fwd_rev += 1
+	_gpu_layers_rev += 1
 
 
 ## The camera, after every script moved it this frame, into the shader (only what changed).

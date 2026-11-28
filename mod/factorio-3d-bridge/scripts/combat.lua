@@ -497,12 +497,13 @@ end
 
 ---------------------------------------------------------------------------------------------
 
--- The damageable entity of another force closest to the aim point, within AIM_RADIUS tiles.
+-- The damageable entity of an enemy of the character's force (LuaForce::is_enemy, as the game
+-- targets: not a neutral or friendly force's) closest to the aim point, within AIM_RADIUS tiles.
 local AIM_RADIUS = 1.5
 local function aim_target(c, x, y)
   local best, best_d
   for _, e in pairs(c.surface.find_entities_filtered({ position = { x, y }, radius = AIM_RADIUS })) do
-    if e.valid and e ~= c and e.force ~= c.force and e.force.name ~= "neutral" and e.health then
+    if e.valid and e ~= c and e.force ~= c.force and c.force.is_enemy(e.force) and e.health then
       local p = e.position
       local d = (p.x - x) ^ 2 + (p.y - y) ^ 2
       if not best_d or d < best_d then
@@ -672,16 +673,28 @@ end
 
 -- Every damaged entity near the camera with its health, as a full list each time; an entity
 -- that healed, died or left the area drops out.
+local MAX_DAMAGED = 1500 -- damaged entities remembered (trees and walls never heal): past it the far ones go
 local function send_health(s)
   local flat = {}
+  local kept, far = 0, {}
   for unit, e in pairs(s.damaged) do
-    local ratio = e.valid and near_focus(e) and e.get_health_ratio()
+    -- Kept while it is still damaged, near the focus or not: one the camera left and came back to
+    -- still shows its bar (Factorio draws a damaged entity's bar whenever it is on screen).
+    local ratio = e.valid and e.get_health_ratio()
     if ratio and ratio < 1 then
-      flat[#flat + 1] = unit
-      flat[#flat + 1] = math.floor(ratio * 1000 + 0.5)
+      kept = kept + 1
+      if near_focus(e) then
+        flat[#flat + 1] = unit
+        flat[#flat + 1] = math.floor(ratio * 1000 + 0.5)
+      else
+        far[#far + 1] = unit
+      end
     else
       s.damaged[unit] = nil
     end
+  end
+  for i = 1, math.min(#far, kept - MAX_DAMAGED) do
+    s.damaged[far[i]] = nil
   end
   local per = PAIRS_PER_MESSAGE * 2
   local parts = math.max(1, math.ceil(#flat / per))

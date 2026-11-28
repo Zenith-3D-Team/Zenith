@@ -48,11 +48,20 @@ func _ih_quick() -> void:
 		quick_layer.handle({"t": "ih", "k": k, "p": 6, "l": [801, 5 * 256 + 128 + 200, 5 * 256 + 128, 0]})
 	next.call(200)
 	var kept: bool = arm.placed == marker  # the same record: not looked up again
-	(w.entities[801] as WorldMirror.Rec).dir = 4
+	# Turned in place as predicted.gd turns one (record_edited), its chunk built again (entities_changed): the
+	# native ingest drops that chunk's binds then, the GDScript one sees the new direction.
+	var turned_rec: WorldMirror.Rec = w.entities[801]
+	turned_rec.dir = 4
+	w.record_edited(turned_rec)
+	w.entities_changed.emit(turned_rec.chunk)
 	next.call(206)
 	var turned: bool = arm.placed != marker and arm.dir == 4  # rotated: bound again
 	arm.placed = marker
-	ModelLibrary.generation += 1
+	# The models' stamp a bind is good for: the layout's (--arm-bind-layout), or any model finishing (=off).
+	if Arms.bind_layout:
+		ModelLibrary.layout_generation += 1
+	else:
+		ModelLibrary.generation += 1
 	next.call(212)
 	var models: bool = arm.placed != marker  # models changed: bound again
 	Arms.quick_apply = was
@@ -479,6 +488,18 @@ func _signal_lights() -> void:
 	lamps.world = w
 	lamps.far_chunks = fc
 	holder.add_child(lamps)
+	var prev_omni := SignalLights.omni_lights_enabled
+	if not prev_omni:
+		var default_sigs := SignalLights.new()
+		default_sigs.protos = w.protos
+		default_sigs.world = w
+		default_sigs.far_chunks = fc
+		holder.add_child(default_sigs)
+		check(default_sigs._lights.is_empty(),
+			"rail signals: OmniLight3Ds disabled by default (lights=%d)" % default_sigs._lights.size())
+		holder.remove_child(default_sigs)
+		default_sigs.free()
+	SignalLights.omni_lights_enabled = true
 	var sigs := SignalLights.new()
 	sigs.protos = w.protos
 	sigs.world = w
@@ -508,29 +529,34 @@ func _signal_lights() -> void:
 	var night_colors_ok: bool = green_light.visible and green_light.light_color.is_equal_approx(SignalLights.STATE_COLORS[1]) \
 		and yellow_light.visible and yellow_light.light_color.is_equal_approx(SignalLights.STATE_COLORS[2]) \
 		and not sigs._lights[2].visible
-	var blue_splat := false
-	for g_var in sigs.far_glows():
-		if g_var is Array and (g_var as Array).size() >= 4 and (g_var[1] as Color).is_equal_approx(SignalLights.STATE_COLORS[4]):
-			blue_splat = float(g_var[3]) > 0.0
-			break
-	check(night_colors_ok and blue_splat and lamps._map_active and lamps._map_splat_count >= 1,
-		"rail signals: night lights match green/yellow st, live overrides sg, distant blue chain splats into lightmap (%s, %s, splats=%d)"
-		% [night_colors_ok, blue_splat, lamps._map_splat_count])
+	var blue_glow := sigs.lit_count() >= 3 and sigs.far_glows().is_empty() \
+		and sigs._tints[2].b > sigs._tints[2].r * 2.0 and sigs._tints[2].b > sigs._tints[2].g
+	check(night_colors_ok and blue_glow,
+		"rail signals: night lights match green/yellow st, live overrides sg, distant blue chain uses SignalGlows (%s, %s, far_glows=%d)"
+		% [night_colors_ok, blue_glow, sigs.far_glows().size()])
 
-	# LOD tiers (16/32/64 and scaled detail distance).
+	# LOD tiers (24/48/96 lights since the stronger signal lighting, and scaled detail distance: 0.6/0.95/1.25).
 	sigs.apply_lod_quality("low")
 	sigs._process(SignalLights.REFRESH)
-	var sig_low_ok: bool = sigs.max_lights == 16 and is_equal_approx(sigs._detail_distance, 128.0 * 0.55)
+	var sig_low_ok: bool = sigs.max_lights == 24 and is_equal_approx(sigs._detail_distance, 128.0 * 0.6)
 	sigs.apply_lod_quality("high")
 	sigs._process(SignalLights.REFRESH)
-	var sig_high_ok: bool = sigs.max_lights == 64 and is_equal_approx(sigs._detail_distance, 128.0 * 1.15)
+	var sig_high_ok: bool = sigs.max_lights == 96 and is_equal_approx(sigs._detail_distance, 128.0 * 1.25)
 	sigs.apply_lod_quality("medium")
 	sigs._process(SignalLights.REFRESH)
-	var sig_med_ok: bool = sigs.max_lights == 32 and is_equal_approx(sigs._detail_distance, 128.0 * 0.85)
+	var sig_med_ok: bool = sigs.max_lights == 48 and is_equal_approx(sigs._detail_distance, 128.0 * 0.95)
 	check(sig_low_ok and sig_med_ok and sig_high_ok,
-		"rail signals: LOD tiers scale budget (16/32/64) and detail distance (%.1f)" % sigs._detail_distance)
+		"rail signals: LOD tiers scale budget (24/48/96) and detail distance (%.1f)" % sigs._detail_distance)
 
 	# Smooth fade band inside DETAIL_DIST * 0.85 (108.8 tiles: fade 81.6..108.8).
+	# Seen by a camera of its own: a camera another section left current may not have it in view, and with
+	# --tight-cull a light out of view has none (bucket 1), whatever its distance.
+	var cam_was := get_viewport().get_camera_3d()
+	var fade_cam := Camera3D.new()
+	fade_cam.far = 2000.0
+	add_child(fade_cam)
+	fade_cam.look_at_from_position(Vector3(50.0, 80.0, 60.0), Vector3(60.0, 0.0, 4.5))
+	fade_cam.make_current()
 	w._add([1065, 6, 95 * 256 + 128, 4 * 256 + 128, 0, {"sg": 3}])
 	sigs._on_entities_changed(Vector2i(2, 0))
 	sigs._process(SignalLights.REFRESH)
@@ -539,6 +565,9 @@ func _signal_lights() -> void:
 		if sigs._spots[i].x > 80.0 and sigs._spots[i].x < 110.0:
 			fade_rw = sigs._real_weights[i]
 			break
+	fade_cam.queue_free()
+	if cam_was != null and is_instance_valid(cam_was):
+		cam_was.make_current()
 	check(fade_rw > 0.01 and fade_rw < 0.99, "rail signals: smooth 25%% fade across detail boundary (rw=%.2f)" % fade_rw)
 
 	# Hill lift: signal glow & light rise with ground height.
@@ -585,6 +614,7 @@ func _signal_lights() -> void:
 	sigs._process(SignalLights.REFRESH)
 	check(sigs.lit_count() == 0 and not sigs._lights[0].visible and sigs.far_glows().is_empty(),
 		"rail signals: turning far lights off clears glows, lights, and splats")
+	SignalLights.omni_lights_enabled = prev_omni
 	lamps._exit_tree()
 	holder.queue_free()
 
@@ -1854,6 +1884,10 @@ func _post_hotfix() -> void:
 	check(flat is Rect2i and (flat as Rect2i).has_point(Vector2i(0, 0)) and (flat as Rect2i).size.x <= 8,
 		"smog: Factorio's flat view reads the chunks under its square: %s" % [flat])
 	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
+	# Smog is off by default since the settings' new defaults (graphics/smog 0.0: no pass at all); its pass is
+	# checked with the player's slider up, then put back.
+	var smog_was: Variant = Settings.get_value("graphics", "smog")
+	Settings.set_value("graphics", "smog", 0.5)
 	var pol: Node3D = PollutionScript.new()
 	add_child(pol)
 	var smog: MeshInstance3D = pol.get_node("Smog")
@@ -2031,6 +2065,7 @@ func _post_hotfix() -> void:
 	gr.free()
 	remove_child(pol)
 	pol.free()
+	Settings.set_value("graphics", "smog", smog_was)
 	check(gr_mat.get_shader_parameter("cloud_shape") == null and gr_mat.get_shader_parameter("look_cloud_field") == null
 		and smog_mat.get_shader_parameter("cloud_shape") == null and smog_mat.get_shader_parameter("look_cloud_field") == null
 		and smog_mat.get_shader_parameter("smog_noise") == null,

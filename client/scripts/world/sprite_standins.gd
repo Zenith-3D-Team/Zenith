@@ -30,6 +30,7 @@ extends RefCounted
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
+const RenderReads := preload("res://scripts/world/render_reads.gd")
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
 
 const PX := 64.0  # pixels a tile in the composed picture (Factorio's high-resolution 0.5 scale)
@@ -529,7 +530,7 @@ static func _icon_card(name: String, size: Vector2) -> Mesh:
 		tex = ItemIcons.texture_for_kind("entity", name)
 	var mesh: Mesh = null
 	if tex != null:
-		var img := tex.get_image()
+		var img := RenderReads.image(tex)  # the icon's CPU copy (item_icons.gd): no renderer read
 		if img != null and not img.is_empty():
 			img = img.duplicate()
 			img.clear_mipmaps()
@@ -580,9 +581,9 @@ static func _card_mesh(image: Image, centre: Vector2, anim, px: float) -> Mesh:
 
 
 ## The transform a card is drawn with: at the entity's centre, turned to face Factorio's camera
-## whatever the entity's direction (the direction picks the picture).
-static func transform(pos: Vector2) -> Transform3D:
-	return Transform3D(Basis(Vector3.RIGHT, -deg_to_rad(FACTORIO_PITCH)), Vector3(pos.x, 0.0, pos.y))
+## whatever the entity's direction (the direction picks the picture), lifted by `y` for flyers.
+static func transform(pos: Vector2, y := 0.0) -> Transform3D:
+	return Transform3D(Basis(Vector3.RIGHT, -deg_to_rad(FACTORIO_PITCH)), Vector3(pos.x, y, pos.y))
 
 
 ## Whether a card steps through frames (chunk_view.gd tells it when, per instance).

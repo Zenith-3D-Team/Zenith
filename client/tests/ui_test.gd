@@ -66,6 +66,7 @@ const SECTION_ORDER: PackedStringArray = [
 	"_build_spend",
 	"_turned_previews",
 	"_pipe_fluid_icons",
+	"_stop_labels",
 	"_pipe_end",
 	"_pipe_end_edges",
 	"_pipe_windows",
@@ -80,6 +81,7 @@ const SECTION_ORDER: PackedStringArray = [
 	"_mod_windows",
 	"_window_bounds",
 	"_wires",
+	"_logistics_parity",
 	"_build_tools",
 	"_wall_drag",
 	"_blueprint_preview",
@@ -106,11 +108,13 @@ const SECTION_ORDER: PackedStringArray = [
 	"_alt_stock",
 	"_alt_icon_order",
 	"_alt_icon_order_kept",
+	"_alt_robot_items",
 	"_turrets",
 	"_turrets_far",
 	"_turret_lights",
 	"_collectors",
 	"_asteroid_chunks",
+	"_rocket_launch_vfx",
 	"_ride_before_silo",
 	"_belt_end_rules",
 	"_belt_line_ends",
@@ -429,6 +433,7 @@ func _ready() -> void:
 	var ui = hud.ui
 	ui.player = player
 	ui.auto_sort = false  # J12's `sort`s would land among the commands the sections count (_ninth_list turns it on)
+	ui.auto_sort_containers = false
 	hud.set_inventory([["iron-plate", 60], ["transport-belt", 50]])
 	hud.set_recipes(["iron-gear-wheel", "transport-belt"])
 	check(hud.count_of("iron-plate") == 60, "count_of")
@@ -565,6 +570,7 @@ func _ready() -> void:
 	await area_build._build_spend(hud)
 	await area_build._turned_previews(hud)
 	area_pipes_ores._pipe_fluid_icons()
+	area_pipes_ores._stop_labels()
 	area_pipes_ores._pipe_end()
 	area_pipes_ores._pipe_end_edges()
 	await area_pipes_ores._pipe_windows()
@@ -579,6 +585,7 @@ func _ready() -> void:
 	await area_hud._mod_windows(hud)
 	await area_hud._window_bounds(hud)
 	await area_parity._wires(hud)
+	await area_parity._logistics_parity(hud, player)
 	await area_build._build_tools(hud)
 	area_build._wall_drag(hud)
 	await area_build._blueprint_preview(hud)
@@ -605,11 +612,13 @@ func _ready() -> void:
 	area_hud._alt_stock()
 	area_hud._alt_icon_order()
 	area_hud._alt_icon_order_kept()
+	area_hud._alt_robot_items()
 	area_combat_debug._turrets()
 	area_combat_debug._turrets_far()
 	area_combat_debug._turret_lights()
 	area_combat_debug._collectors()
 	area_combat_debug._asteroid_chunks()
+	area_combat_debug._rocket_launch_vfx()
 	area_combat_debug._ride_before_silo()
 	area_combat_debug._belt_end_rules()
 	area_combat_debug._belt_line_ends()

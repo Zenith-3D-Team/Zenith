@@ -162,6 +162,19 @@
 -- events_enqueue: game events about a watched entity (built, marked, cancelled, flipped, rotated, recoloured) tell
 -- the listeners and queue the entity; its record and the reads round it go from on_tick, nearest first, under the
 -- work budget (tracker.lua). Off: all of it in the event, as before.
+-- robot_opt: cache force robot modifiers (60t), throttle static roboport scans (120t / 16-tile move) and cache
+-- logistic_cell handles, scale scan/charge cadences with rate, use inv.is_empty() + module-local pcall helpers +
+-- reused scratch/swap tables to cut LuaObject/closure GC churn, and cap robot checks/round-robin under budget/rate.
+-- Off: original robot_sim cadences and per-tick reads/allocations, as before.
+-- gc_lean: reuse cached entity/inventory/transport-line handles when valid, avoid redundant find_entities_filtered
+-- rescans when focus/area hasn't shifted, guard inventory contents reads with is_empty(), respect budget.left()
+-- on alerts sweeps, scale gate/animated-entity scan cadences with rate, and reuse scratch buffers to cut Lua 5.2
+-- LuaObject/closure GC churn outside belt_sim and robots. Off: original per-cycle scans and reads, as before.
+-- alt_fluid_range: send Alt-mode pipe/fluid markers up to the full focus radius instead of clamping to detail radius.
+-- turret_ammo_check: only report turret shots on ammo drop when the turret had a target or fired recently
+-- (artillery and vehicle guns, which name no target firing by themselves: while one of their force's
+-- projectiles flies near them).
+-- paste_reach_limit: enforce character reach on copy/paste entity settings (off by default = unlimited reach).
 
 local M = {}
 
@@ -171,19 +184,20 @@ M.OPTIONS = { chunk_text = true, far_lanes = true, wire_strips = true, lightning
   alt_machines = true, mined_tell = true, research_chain = true, zenith_join = true,
   no_crash_site = true, fluid_icons = true, pipe_alerts = true, under_clear = true, alt_ammo_fuel = true,
   pickup_stop = true, fast_take = true, vehicle_ammo = true, mined_neighbours = true, enemy_sight = true,
-  drop_put = true, robot_sim = true, prio_queue = true, flush_end = true, near_first = true, near_rate = true,
-  nack_ring = true, mover_move_scan = true, st_working_slice = true, splitter_throttle = true,
+  drop_put = true, robot_sim = true, robot_opt = true, gc_lean = true, prio_queue = true, flush_end = true, near_first = true,
+  near_rate = true, nack_ring = true, mover_move_scan = true, st_working_slice = true, splitter_throttle = true,
   inserter_look_budget = true, fluids_budget = true, alt_cadence = true, prio_cap = true,
   map_trains_slice = true, alerts_topk = true, events_enqueue = true, gc_pace = true, enemy_sight_vehicle = true,
-  gate_state = true }
+  gate_state = true, alt_fluid_range = true, turret_ammo_check = true, paste_reach_limit = false }
 M.ORDER = { "chunk_text", "far_lanes", "wire_strips", "lightning_planets", "states_near", "requeue_slices",
   "records_by_prototype", "alerts_quiet", "one_search", "dec_distance", "chart_same", "status_near", "mined_now",
   "put_lanes", "belts_last", "belt_pickup", "alt_machines", "mined_tell", "research_chain", "zenith_join",
   "no_crash_site", "fluid_icons", "pipe_alerts", "under_clear", "alt_ammo_fuel", "pickup_stop", "fast_take",
-  "vehicle_ammo", "mined_neighbours", "enemy_sight", "drop_put", "robot_sim", "prio_queue", "flush_end",
-  "near_first", "near_rate", "nack_ring", "mover_move_scan", "st_working_slice", "splitter_throttle",
+  "vehicle_ammo", "mined_neighbours", "enemy_sight", "drop_put", "robot_sim", "robot_opt", "gc_lean", "prio_queue",
+  "flush_end", "near_first", "near_rate", "nack_ring", "mover_move_scan", "st_working_slice", "splitter_throttle",
   "inserter_look_budget", "fluids_budget", "alt_cadence", "prio_cap", "map_trains_slice",
-  "alerts_topk", "events_enqueue", "gc_pace", "enemy_sight_vehicle", "gate_state" }
+  "alerts_topk", "events_enqueue", "gc_pace", "enemy_sight_vehicle", "gate_state",
+  "alt_fluid_range", "turret_ammo_check", "paste_reach_limit" }
 
 -- Numeric settings (`/f3d-perf <name> <number>|default`), kept in storage.f3d_perf_num: name -> { default, min, max }.
 -- shots_radius: how far from the focus shots.lua sends projectiles, streams (flamethrowers), beams, explosions and

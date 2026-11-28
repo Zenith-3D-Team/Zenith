@@ -10,6 +10,7 @@ extends SceneTree
 ##   godot --headless --path client -s res://tests/model_load_test.gd [-- name ...]
 ## Prints "MODEL LOAD FAILS: 0" when all match; quits with 1 otherwise.
 
+const Anim := preload("res://scripts/world/anim.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
@@ -638,6 +639,109 @@ static func _height_at(a: Vector3, b: Vector3, c: Vector3, at: Vector3) -> float
 	return u * a.y + v * b.y + (1.0 - u - v) * c.y
 
 
+class _AnimWorld:
+	extends Node
+	var chunks := {}
+	var working := {}
+	var entities := {}
+
+
+class _AnimChunk:
+	extends RefCounted
+	var anim_groups: Array = []
+
+
+class _AnimRec:
+	extends RefCounted
+	var chunk := Vector2i.ZERO
+	var key := 999
+
+
+## All three assembling machines resolve to rebuilt Placeholders PBR models, expose CYCLES parts with valid
+## swept custom_aabb, bind PBR maps + status glow, and toggle working state 0 -> 1 via Anim.
+func _assembling_machines_anim_check() -> void:
+	var expected := {
+		"assembling-machine-1": [8, ModelLibrary.ModelPacks.BUILTIN_DIR + "placeholders/assembling-machine-1.glb"],
+		"assembling-machine-2": [9, ModelLibrary.ModelPacks.BUILTIN_DIR + "placeholders/assembling-machine-2.glb"],
+		"assembling-machine-3": [10, ModelLibrary.ModelPacks.BUILTIN_DIR + "placeholders/assembling-machine-3.glb"],
+	}
+	var fake_world := _AnimWorld.new()
+	var fake_chunk := _AnimChunk.new()
+	fake_world.chunks[Vector2i.ZERO] = fake_chunk
+	var anim := Anim.new()
+	anim.world = fake_world
+	var host := Node3D.new()
+	host.add_child(anim)
+	get_root().add_child(host)
+	var rec := _AnimRec.new()
+	for name: String in expected.keys():
+		var spec: Array = expected[name]
+		var min_parts := int(spec[0])
+		var want_path := str(spec[1])
+		var resolved := ModelLibrary.ModelPacks.find(name, true)
+		if resolved != want_path:
+			_fail("%s: default pack resolved to %s, expected %s" % [name, resolved, want_path])
+		var mesh := ModelLibrary.mesh_for(name)
+		if mesh == null:
+			_fail("%s: mesh_for returned null" % name)
+			continue
+		var has_glow := false
+		var has_pbr := false
+		for i in mesh.get_surface_count():
+			var mat := mesh.surface_get_material(i) as ShaderMaterial
+			if mat == null:
+				continue
+			if mat.get_shader_parameter("activity_glow") == true:
+				has_glow = true
+			if mat.get_shader_parameter("use_albedo_tex") == true and mat.get_shader_parameter("use_orm_tex") == true and mat.get_shader_parameter("use_normal_tex") == true and mat.get_shader_parameter("modeller_tex") == true:
+				has_pbr = true
+		if not has_glow:
+			_fail("%s: missing activity_glow status light surface" % name)
+		if not has_pbr:
+			_fail("%s: missing full PBR texture uniforms (albedo/orm/normal/modeller_tex)" % name)
+		var parts := ModelLibrary.parts_for(name)
+		if parts.size() != min_parts:
+			_fail("%s: expected %d moving parts, got %d" % [name, min_parts, parts.size()])
+		fake_chunk.anim_groups.clear()
+		fake_world.working[999] = 0
+		anim.reset()
+		for pi in parts.size():
+			var p: ModelLibrary.AnimPart = parts[pi]
+			Anim.setup_part(p)
+			if p.motion != Anim.MOTION_CYCLE or p.rate <= 0.0:
+				_fail("%s: part %s has motion=%d rate=%.3f (expected MOTION_CYCLE)" % [name, p.kind, p.motion, p.rate])
+			if not (p.mesh is ArrayMesh) or (p.mesh as ArrayMesh).custom_aabb.get_volume() <= 0.0:
+				_fail("%s: part %s missing swept custom_aabb" % [name, p.kind])
+			var mm := MultiMesh.new()
+			mm.transform_format = MultiMesh.TRANSFORM_3D
+			mm.use_custom_data = true
+			mm.mesh = p.mesh
+			mm.instance_count = 1
+			mm.set_instance_transform(0, p.turned(0.0))
+			mm.set_instance_custom_data(0, Color.BLACK)
+			var g := Anim.Group.new()
+			g.mm = mm
+			g.part = p
+			g.keys = [999]
+			g.units = PackedInt64Array([999])
+			g.bases = [p.turned(0.0)]
+			g.stateful = PackedByteArray([1])
+			g.customs = PackedColorArray([Color.BLACK])
+			fake_chunk.anim_groups.append(g)
+			Anim.place(g, anim, fake_world.working)
+		fake_world.working[999] = 1
+		anim.state_changed(rec)
+		for g: Anim.Group in fake_chunk.anim_groups:
+			var custom := g.mm.get_instance_custom_data(0)
+			var flags := int(floor(-custom.b - 1.0))
+			if (flags & 1) == 0:
+				_fail("%s: anim.state_changed did not enable working bit on part %s (custom=%s)" % [name, g.part.kind, str(custom)])
+				break
+	anim.reset()
+	host.queue_free()
+	fake_world.queue_free()
+
+
 ## ready() starts a job and returns at once; poll() finishes it; the mesh is the one mesh_for gives.
 func _async_check() -> void:
 	var name := "assembling-machine-2"
@@ -682,6 +786,7 @@ func _async_check() -> void:
 	# A tier made from a ready base, and a model with no file: ready at once.
 	if not ModelLibrary.ready("no-such-model-anywhere"):
 		_fail("a model with no file wasn't ready at once")
+	_assembling_machines_anim_check()
 	print("MODEL LOAD checked %d models | surfaces %d -> %d | ready() %d us | job done after %d polls | FAILS: %d"
 		% [_checked, _surfaces_before, _surfaces_after, asked_usec, frames, _fails])
 	print("MODEL LOAD FAILS: %d" % _fails)

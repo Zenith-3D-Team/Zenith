@@ -52,6 +52,7 @@ const SpriteStandins := preload("res://scripts/world/sprite_standins.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const PackCheck := preload("res://scripts/world/pack_check.gd")
 const Looks := preload("res://scripts/world/looks.gd")
+const PipeCovers := preload("res://scripts/world/pipe_covers.gd")
 
 ## world.gd while a game runs (its drawn chunks are built again on a change), else null.
 var world = null
@@ -77,6 +78,9 @@ var _available_frame: Control  # Available's list, hidden while every pack is in
 var _available_none: Label  # what to do for more packs, in its place
 var _shown_pack := ""  # whose version of the family the preview shows
 var _variant := ""  # the family's variant the preview shows ("" its main model); display only
+var _wet_base_pending := ""  # base model to composite under a `-wet` variant preview
+var _wet_cover_pending := ""  # cover model to composite onto a `-wet` mining drill preview
+var _wet_cover_entity := ""  # entity family name for the pending wet cover preview
 var _play_button: Button  # the preview's corner: Play animation / Stop animation
 var _speaker_button: Button  # and the building's sound
 static var sound_choice := true  # the speaker: on by default, the player's off kept for the session (not saved)
@@ -387,6 +391,7 @@ func _process(_delta: float) -> void:
 	_load_factorio_icons()
 	_load_factorio_tiles()
 	_load_factorio_decor()
+	_composite_wet_preview()
 	_update_play_row()
 	if not _packs.any(func(p: Dictionary) -> bool: return bool(p["unpacking"]) or bool(p["checking"])):
 		return
@@ -1967,7 +1972,14 @@ func _fill_family_tab(p: Dictionary, filter: String) -> void:
 		return
 	var names: Array = []
 	for fam: String in families:
-		if filter == "" or fam.contains(filter) or _family_name(fam).to_lower().contains(filter):
+		var matches := filter == "" or fam.contains(filter) or _family_name(fam).to_lower().contains(filter)
+		if not matches:
+			for m: Variant in families[fam]:
+				var ms := str(m).to_lower()
+				if ms.contains(filter) or variant_label(fam, ms).to_lower().contains(filter):
+					matches = true
+					break
+		if matches:
 			names.append(fam)
 	names.sort()
 	if names.is_empty():
@@ -2038,9 +2050,20 @@ func _family_button(p: Dictionary, families: Dictionary, fam: String) -> Button:
 	b.tooltip_text = "%s\n%s" % [", ".join(families[fam]), ("In use: %s's" % using.get("short", using["title"])) if not using.is_empty() else ""]
 	# From a pack's list the preview shows that pack's version (the one in use is marked on its button).
 	var listed := str(p["id"])
-	b.pressed.connect(func() -> void:
+	var matched_variant := ""
+	var filter := _search.text.strip_edges().to_lower() if _search != null else ""
+	if filter != "" and not fam.contains(filter) and not _family_name(fam).to_lower().contains(filter):
+		for m: Variant in families[fam]:
+			var ms := str(m)
+			if ms.to_lower().contains(filter) or variant_label(fam, ms).to_lower().contains(filter):
+				matched_variant = ms
+				break
+	var on_press := func() -> void:
 		Sfx.play_ui("gui-click")
-		select_family(fam, listed))
+		if matched_variant != "":
+			_variant = matched_variant
+		select_family(fam, listed)
+	b.pressed.connect(on_press)
 	return b
 
 
@@ -2336,7 +2359,11 @@ static func _pack_in_use(fam: String) -> Dictionary:
 
 ## Shows a family turning: `pack`'s version (a pack's list passes its own), else the one in use.
 func select_family(fam: String, pack := "") -> void:
-	if fam != selected_family:
+	if fam != selected_family and not fam.is_empty():
+		var keep := _variant != "" and _variant.begins_with(fam + "-")
+		if not keep:
+			_variant = ""
+	elif fam == "":
 		_variant = ""
 	selected_family = fam
 	selected_item = ""
@@ -2347,7 +2374,62 @@ func select_family(fam: String, pack := "") -> void:
 	_show_family()
 
 
+func _composite_wet_preview() -> void:
+	if (_wet_base_pending == "" and _wet_cover_pending == "") or _preview == null or _preview.shown_mesh == null:
+		return
+	if ModelLibrary.polled_frame < Engine.get_process_frames() - 1:
+		ModelLibrary.poll()
+	var changed := false
+	if _wet_base_pending != "" and ModelLibrary.ready(_wet_base_pending):
+		var base_mesh := ModelLibrary.mesh_for(_wet_base_pending)
+		if base_mesh != null:
+			var holder := _preview._holder
+			var base_body := MeshInstance3D.new()
+			base_body.name = "WetBaseBody"
+			base_body.mesh = base_mesh
+			holder.add_child(base_body)
+			for part: ModelLibrary.AnimPart in ModelLibrary.parts_for(_wet_base_pending):
+				if part.mesh != null and not part.lit:
+					holder.add_child(_preview.part_node(part.mesh, Transform3D.IDENTITY, part))
+			changed = true
+		_wet_base_pending = ""
+	if _wet_cover_pending != "":
+		var cover_ready := ModelLibrary.ready(_wet_cover_pending)
+		if cover_ready and _wet_cover_pending.begins_with(PipeCovers.ENDING + "@"):
+			cover_ready = ModelLibrary.ready(PipeCovers.STRAIGHT + _wet_cover_pending.substr(PipeCovers.ENDING.length()))
+		if cover_ready:
+			var made := PipeCovers.cover(_wet_cover_pending, func(n: String) -> Mesh: return ModelLibrary.mesh_for(n))
+			if not made.is_empty():
+				var cap_mesh: Mesh = made[0]
+				var fb: Variant = PipeCovers.WET_DRILL_PORTS
+				if world != null and world.protos != null and _wet_cover_entity != "":
+					var ep: Variant = world.protos.entities_by_name.get(_wet_cover_entity)
+					if ep != null and world._fluid_ports.has(ep.id):
+						fb = world._fluid_ports[ep.id]
+				var port_list := PipeCovers.ports(fb, "mining-drill", 1)
+				var mask := 0
+				for p: Array in port_list:
+					mask |= 1 << int(p[2])
+				var holder := _preview._holder
+				var idx := 0
+				for xf: Transform3D in PipeCovers.places(port_list, mask, Transform3D.IDENTITY):
+					var cap_node := _preview.part_node(cap_mesh, xf, null)
+					cap_node.name = "WetPipeCover%d" % idx
+					holder.add_child(cap_node)
+					idx += 1
+				if idx > 0:
+					changed = true
+			_wet_cover_pending = ""
+			_wet_cover_entity = ""
+	if changed:
+		_preview._frame()
+		_preview._wake_render(2)
+
+
 func _show_family() -> void:
+	_wet_base_pending = ""
+	_wet_cover_pending = ""
+	_wet_cover_entity = ""
 	for c in _info.get_children():
 		_info.remove_child(c)
 		c.queue_free()
@@ -2422,6 +2504,19 @@ func _show_family() -> void:
 			model = str(variants[0])
 		_preview.entity = fam
 		_preview.show_model(model + "@" + shown if shown != "" else model)
+		if model.ends_with("-wet"):
+			var base_name := model.trim_suffix("-wet")
+			var base_model := (base_name + "@" + shown) if (shown != "" and ModelPacks.find_in(shown, base_name) != "") else base_name
+			_wet_base_pending = base_model
+			ModelLibrary.ready(base_model)
+			var cover_name := PipeCovers.model_for(shown_pack)
+			if cover_name != "":
+				_wet_cover_pending = cover_name
+				_wet_cover_entity = base_name
+				ModelLibrary.ready(cover_name)
+				if cover_name.begins_with(PipeCovers.ENDING + "@"):
+					ModelLibrary.ready(PipeCovers.STRAIGHT + cover_name.substr(PipeCovers.ENDING.length()))
+			_composite_wet_preview()
 	var title := Kit.label(_family_name(fam), "FHeading")
 	title.name = "Family"
 	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -2463,6 +2558,20 @@ func _show_family() -> void:
 	_info.add_child(order)
 	if variants.size() > 1:
 		_info.add_child(_variant_picker(fam, variants, model))
+	var wet_name := fam + "-wet"
+	if variants.has(wet_name):
+		var showing_wet := model == wet_name
+		var wet_btn := MenuKit.button("Dry (main model)" if showing_wet else "Wet (fluid): " + wet_name)
+		wet_btn.name = "WetVariantButton"
+		wet_btn.custom_minimum_size.x = 0
+		wet_btn.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+		wet_btn.tooltip_text = "Preview the base model without fluid pipes" if showing_wet else "Preview the full drill with its wet fluid attachment (%s)" % wet_name
+		var target_var := fam if showing_wet else wet_name
+		var on_wet := func() -> void:
+			Sfx.play_ui("gui-click")
+			select_variant(target_var)
+		wet_btn.pressed.connect(on_wet)
+		_info.add_child(wet_btn)
 
 
 ## The Factorio pack's picture of a family: the entity of its name, else its first with a picture;
@@ -2678,6 +2787,8 @@ static func variant_label(fam: String, name: String) -> String:
 	if shape != "":
 		return shape
 	match rest:
+		"wet":
+			return "Wet (fluid)"
 		"start":
 			return "Start piece"
 		"end":

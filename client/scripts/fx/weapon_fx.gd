@@ -100,8 +100,17 @@ const FLAME_ARC_LIFT := 1.35
 const FLAME_ARC_MIN := 0.12
 const GROUND_CARDS := 600
 const ATLAS_MAX := 4096
+const EX_MERGE_RANGE_SQ := EX_MERGE_RANGE * EX_MERGE_RANGE
+const STREAM_LIGHT_MERGE_SQ := 9.0
+const TRAIL_NEAR_SQ := 55.0 * 55.0
+const TRAIL_MID_SQ := 90.0 * 90.0
+const TRAIL_FAR_SQ := 140.0 * 140.0
+const TRAIL_VIEW_MARGIN := 6.0
 const CAPSULES := ["grenade", "cluster-grenade", "poison-capsule", "slowdown-capsule", "defender-capsule",
 	"distractor-capsule", "destroyer-capsule", "cliff-explosives"]
+
+## `--fx-opt=off`: disables culling, trail throttling, and ring-buffer overwrites for exact legacy behaviour.
+static var fx_opt := Switches.on("--fx-opt")
 
 
 class Flyer:
@@ -118,6 +127,17 @@ class Flyer:
 	var landing := 0.0  # how far it goes, when known (the character's thrown capsules)
 	var smoke_due := 0.0
 	var seen := 0
+	var smk: Array = []
+	var has_smk := false
+	var smk_checked := false
+	var light_col := Color.WHITE
+	var light_energy := 0.0
+	var light_range := 0.0
+	var light_checked := false
+	var has_light := false
+	var hills := 0.0
+	var hills_v := -1
+	var hills_pos := Vector2(1e9, 1e9)
 
 
 ## A stream entity stays where the game made it while its particles fly inside it, and the API
@@ -142,6 +162,23 @@ class Stream:
 	var turret_lit := false  # its turret's or tank's nozzle found: turrets.gd lights it and its landing
 	var lead := true  # the newest stream of its shooter: only it feeds particles (`--flame-streams=old`: all)
 	var owner_key := ""  # its shooter, for one drawn stream a shooter ("" none known)
+	var layer: Array = []
+	var pool := ""
+	var width := 1.0
+	var alpha := 1.0
+	var hs := 0.25
+	var va := 0.003
+	var ss := 1.0
+	var sa := 1.0
+	var psi := 2.0
+	var pst := 2.0
+	var continuous := false
+	var rec_cached := false
+	var hills_v := -1
+	var land_hills := 0.0
+	var mid_hills := 0.0
+	var land_at := Vector2(1e9, 1e9)
+	var mid_at := Vector2(1e9, 1e9)
 
 
 class Beam:
@@ -153,6 +190,13 @@ class Beam:
 	var to := Vector3.ZERO
 	var cards: Array = []
 	var seen := 0
+	var cached := false
+	var seg_width := 0.25
+	var start_specs: Array = []
+	var head_specs: Array = []
+	var body_specs: Array = []
+	var tail_specs: Array = []
+	var ending_specs: Array = []
 
 
 class Ground:
@@ -213,21 +257,45 @@ var _pending := {}
 static var _images := {}
 static var _opaque := {}
 static var _images_lock := Mutex.new()
+static var _world_script: GDScript
+static var _capsule_aim_script: GDScript
 var _flying := {}  # id -> Flyer
 var _streams := {}  # id -> Stream
 var _flame_lead := {}  # shooter key -> id of its newest stream (the one drawn feeding)
 var _beams := {}  # id -> Beam
 var _ground := {}  # id -> Ground
 var _recent: Array = []  # [name, Vector2, msec]: explosions played here, to skip the game's own
+var _recent_cells := {}  # Vector2i -> Array of recent entries for O(1) spatial dedup
 var _casings: Array = []  # [Card, resting]
+var _casing_cursor := 0
 var _flashes: Array = []  # [position, colour, energy, range, age, life, fast fade, shooter (0: an explosion)]
+var _muzzle_flashes := {}  # shooter unit -> flash entry in _flashes
+var _ex_flashes: Array = []  # recent explosion flashes (shooter == 0)
 var _fire_cells := {}  # Vector2i -> index in the frame's wants: fires merged (combat lights)
+var _stream_cells := {}  # Vector2i -> Array of indices in the frame's wants: stream lights merged
+var _want_pool: Array = []  # reusable 6-element entries for _light_wants
+var _light_wants: Array = []
+var _dead_ids: Array = []
 var _by_score := func(a: Array, b: Array) -> bool: return float(a[5]) < float(b[5])
 var _lights: Array = []
 var _sounds := {}  # file -> msec last played
 var _pj_tick := -1
 var _mark := 0
 var _clock := 0.0
+var _cam: Camera3D = null
+var _cam_pos := Vector3.ZERO
+var _cam_bx := Vector3.RIGHT
+var _cam_by := Vector3.UP
+var _cam_bz := Vector3.BACK
+var _cam_planes: Array[Plane] = []
+var _cam_ready := false
+var _cached_sprites: SpriteFx = null
+var _smoke_cache := {}
+var _ex_cache := {}
+var _scorch_cache := {}
+var _casing_cache := {}
+var _turret_layer_cached: Node = null
+var _turret_layer_world: Node = null
 ## How many times each explosion prototype was played (weapons_demo.gd prints it).
 var played := {}
 
@@ -252,6 +320,7 @@ const TRACER_COLOURS := {
 const TRACER_DEFAULT := Color(1.0, 0.8, 0.35)
 var _tracer_mmi: MultiMeshInstance3D
 var _tracers: Array = []  # [from, to, age, colour], the oldest first
+var _tracer_cursor := 0
 var _tracer_last := {}  # shooter -> _clock of its last tracer
 var tracers_drawn := 0  # tracers started (for tests)
 
@@ -278,19 +347,33 @@ func tracer(from: Vector3, to: Vector3, ammo := "", shooter := 0, pellets := 1) 
 		if _tracer_last.size() > 512:
 			_tracer_last.clear()
 	var colour: Color = TRACER_COLOURS.get(ammo, TRACER_DEFAULT)
-	var a := from + Vector3(0.0, GroundHeight.at(from.x, from.z), 0.0)
+	var hills_on := GroundHeight.is_on()
+	var a := Vector3(from.x, from.y + GroundHeight.at(from.x, from.z), from.z) if hills_on else from
 	var flat := Vector2(to.x - from.x, to.z - from.z)
+	var flat_len := flat.length()
+	var side_dir := Vector2(-flat.y, flat.x) / flat_len if flat_len > 0.0001 else Vector2.ZERO
+	var to_h := GroundHeight.at(to.x, to.z) if hills_on else 0.0
 	for i in maxi(1, pellets):
 		var end := to
 		if pellets > 1:
-			var side := Vector2(-flat.y, flat.x).normalized() * randf_range(-1.0, 1.0) * TRACER_SPREAD * flat.length()
-			end = to + Vector3(side.x, randf_range(-0.15, 0.15), side.y)
-		var b := end + Vector3(0.0, GroundHeight.at(end.x, end.z), 0.0)
+			var side := side_dir * randf_range(-1.0, 1.0) * TRACER_SPREAD * flat_len
+			end = Vector3(to.x + side.x, to.y + randf_range(-0.15, 0.15), to.z + side.y)
+		var b := Vector3(end.x, end.y + (GroundHeight.at(end.x, end.z) if pellets > 1 else to_h), end.z) if hills_on else end
 		if a.distance_squared_to(b) < 0.25:
 			continue
 		if _tracers.size() >= MAX_TRACERS:
-			_tracers.pop_front()
-		_tracers.append([a, b, 0.0, colour])
+			if fx_opt:
+				if _tracer_cursor >= _tracers.size():
+					_tracer_cursor = 0
+				_tracers[_tracer_cursor] = [a, b, 0.0, colour]
+				_tracer_cursor += 1
+				if _tracer_cursor >= MAX_TRACERS:
+					_tracer_cursor = 0
+			else:
+				_tracers.pop_front()
+				_tracers.append([a, b, 0.0, colour])
+		else:
+			_tracers.append([a, b, 0.0, colour])
 		tracers_drawn += 1
 
 
@@ -301,7 +384,7 @@ func _update_tracers(delta: float) -> void:
 		if _tracer_mmi != null and _tracer_mmi.multimesh.visible_instance_count != 0:
 			_tracer_mmi.multimesh.visible_instance_count = 0
 		return
-	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+	var cam := _cam if _cam_ready else (get_viewport().get_camera_3d() if is_inside_tree() else null)
 	if _tracer_mmi == null:
 		_tracer_mmi = MultiMeshInstance3D.new()
 		_tracer_mmi.name = "Tracers"
@@ -325,14 +408,22 @@ func _update_tracers(delta: float) -> void:
 		_tracer_mmi.global_transform = Transform3D.IDENTITY
 	var mm := _tracer_mmi.multimesh
 	var n := 0
-	var keep: Array = []
 	var step := minf(delta, 1.0 / 30.0)  # a slow frame doesn't end a streak before it is seen
-	for t: Array in _tracers:
-		t[2] = float(t[2]) + step
-		var age: float = t[2]
-		if age >= TRACER_LIFE + TRACER_FADE:
+	var life_total := TRACER_LIFE + TRACER_FADE
+	var i := 0
+	var count := _tracers.size()
+	var cam_pos := cam.global_position if cam != null else Vector3.ZERO
+	while i < count:
+		var t: Array = _tracers[i]
+		var age: float = float(t[2]) + step
+		t[2] = age
+		if age >= life_total:
+			count -= 1
+			if i < count:
+				_tracers[i] = _tracers[count]
+			_tracers.pop_back()
 			continue
-		keep.append(t)
+		i += 1
 		if cam == null:
 			continue
 		var a: Vector3 = t[0]
@@ -352,7 +443,7 @@ func _update_tracers(delta: float) -> void:
 			continue
 		var mid := (head + tail) * 0.5
 		var x := along / length
-		var view := cam.global_position - mid
+		var view := cam_pos - mid
 		var y := x.cross(view).normalized()
 		if y.length_squared() < 0.001:
 			y = Vector3.UP
@@ -361,7 +452,6 @@ func _update_tracers(delta: float) -> void:
 		var colour: Color = t[3]
 		mm.set_instance_color(n, Color(colour.r, colour.g, colour.b, 1.0))
 		n += 1
-	_tracers = keep
 	mm.visible_instance_count = n
 
 
@@ -397,10 +487,20 @@ func reset() -> void:
 	_beams.clear()
 	_ground.clear()
 	_recent.clear()
+	_recent_cells.clear()
 	_tracers.clear()
+	_tracer_cursor = 0
 	_tracer_last.clear()
 	_casings.clear()
+	_casing_cursor = 0
 	_flashes.clear()
+	_muzzle_flashes.clear()
+	_ex_flashes.clear()
+	_stream_cells.clear()
+	_light_wants.clear()
+	_dead_ids.clear()
+	_turret_layer_cached = null
+	_turret_layer_world = null
 	for light: OmniLight3D in _lights:
 		light.visible = false
 		light.shadow_enabled = false
@@ -478,6 +578,15 @@ func gun_cooldown(gun: String) -> float:
 
 ## One round: the ammo's source effects at the muzzle (the flash), an instant hit's effects at
 ## the target, the railgun's beam along its line, and the gun's shell casing.
+func _sync_sprite_caches() -> void:
+	if _cached_sprites != sprites:
+		_cached_sprites = sprites
+		_smoke_cache.clear()
+		_ex_cache.clear()
+		_scorch_cache.clear()
+		_casing_cache.clear()
+
+
 func _on_shot(msg: Dictionary) -> void:
 	var unit := int(msg.get("u", 0))
 	var target := Vector3(int(msg.get("x", 0)) / 256.0, HIT_HEIGHT, int(msg.get("y", 0)) / 256.0)
@@ -491,26 +600,27 @@ func _on_shot(msg: Dictionary) -> void:
 			return
 		var at: Vector3 = p
 		muzzle = at + Vector3(0, MUZZLE_HEIGHT, 0)
-	var ammo: Dictionary = data.get("ammo", {}).get(str(msg.get("a", "")), {})
+	var ammo_name := str(msg.get("a", ""))
+	var ammo: Dictionary = data.get("ammo", {}).get(ammo_name, {})
 	var gun: Dictionary = data.get("gun", {}).get(str(msg.get("g", "")), {})
 	var dir := target - muzzle
 	dir.y = 0.0
 	dir = dir.normalized() if dir.length() > 0.01 else Vector3.FORWARD
 	for pair in ammo.get("src", []):
 		explode(str(pair[0]), muzzle, dir)
-	var ammo_name := str(msg.get("a", ""))
 	if not CombatLights.old:
 		var light_offset := 0.3 if from_avatar else 0.75
 		_muzzle_light(unit, muzzle + dir * light_offset, ammo)
-	if str(ammo.get("k", "")) == "instant":
+	var ammo_kind := str(ammo.get("k", ""))
+	if ammo_kind == "instant":
 		var hit := target + Vector3(randf_range(-0.5, 0.5), 0.0, randf_range(-0.5, 0.5))
 		for pair in ammo.get("tgt", []):
 			explode(str(pair[0]), hit)
 		if TRACER_COLOURS.has(ammo_name) or ammo_name.ends_with("-magazine"):
 			tracer(muzzle + dir * 0.1, hit, ammo_name, unit)
-	elif str(ammo.get("k", "")) == "projectile" and int(ammo.get("n", 0)) > 1:
+	elif ammo_kind == "projectile" and int(ammo.get("n", 0)) > 1:
 		tracer(muzzle + dir * 0.1, target, ammo_name, unit, mini(int(ammo.get("n", 0)), TRACER_PELLETS))
-	elif str(ammo.get("k", "")) == "line" and str(ammo.get("line", "")) != "":
+	elif ammo_kind == "line" and str(ammo.get("line", "")) != "":
 		_line_explosion(str(ammo["line"]), muzzle, muzzle + dir * float(gun.get("r", 40.0)))
 	var shell = gun.get("shell")
 	if shell is Array and shell.size() >= 4:
@@ -534,18 +644,25 @@ func _muzzle_light(unit: int, at: Vector3, ammo: Dictionary) -> void:
 		spec = MUZZLE_HEAVY
 	elif kind != "instant":
 		return  # streams and beams have their own
-	var pos := GroundHeight.lift(at)
+	var pos := GroundHeight.lift(at) if GroundHeight.is_on() else at
+	if _flashes.is_empty():
+		_muzzle_flashes.clear()
+		_ex_flashes.clear()
 	if unit != 0:
-		for fl: Array in _flashes:
-			if int(fl[7]) == unit:
-				fl[0] = pos
-				fl[2] = maxf(float(fl[2]), float(spec[0]))
-				fl[3] = maxf(float(fl[3]), float(spec[1]))
-				fl[4] = 0.0
-				fl[5] = maxf(float(fl[5]), float(spec[2]))
-				return
+		var existing = _muzzle_flashes.get(unit)
+		if existing != null:
+			var fl: Array = existing
+			fl[0] = pos
+			fl[2] = maxf(float(fl[2]), float(spec[0]))
+			fl[3] = maxf(float(fl[3]), float(spec[1]))
+			fl[4] = 0.0
+			fl[5] = maxf(float(fl[5]), float(spec[2]))
+			return
 	if _flashes.size() < MAX_FLASHES:
-		_flashes.append([pos, MUZZLE_COLOUR, float(spec[0]), float(spec[1]), 0.0, float(spec[2]), false, unit])
+		var fl := [pos, MUZZLE_COLOUR, float(spec[0]), float(spec[1]), 0.0, float(spec[2]), false, unit]
+		_flashes.append(fl)
+		if unit != 0:
+			_muzzle_flashes[unit] = fl
 
 
 ## Factorio's shell particle: thrown out sideways from beside the gun, spinning (5 frames), and
@@ -556,88 +673,168 @@ func emit_casing(particle: String, muzzle: Vector3, dir: Vector3, creation := 0.
 
 
 func _casing(particle: String, muzzle: Vector3, dir: Vector3, creation: float, speed: float, vspeed: float) -> void:
-	var rec: Dictionary = data.get("pa", {}).get(particle, {})
-	var layer := _pick_layer(rec.get("a", []))
-	if layer.is_empty():
-		return
-	var pool := _pool(layer, true, false, CASING_LIMIT + 8)
+	_sync_sprite_caches()
+	var entries: Array = _casing_cache.get(particle, [])
+	if entries.is_empty():
+		var rec: Dictionary = data.get("pa", {}).get(particle, {})
+		for v in rec.get("a", []):
+			if v is Array and not v.is_empty() and v[0] is Array:
+				var layer: Array = v[0]
+				entries.append(["", layer, _width(layer)])
+		if entries.is_empty():
+			return
+		_casing_cache[particle] = entries
+	var e: Array = entries[0] if entries.size() == 1 else entries[randi() % entries.size()]
+	var pool: String = e[0]
 	if pool == "":
-		return
+		pool = _pool(e[1], true, false, CASING_LIMIT + 8)
+		if pool == "":
+			return
+		e[0] = pool
 	var side := dir.cross(Vector3.UP).normalized()
 	var at := muzzle + dir * creation * 0.5 - Vector3(0, 0.15, 0)
-	var c := sprites.emit(pool, at, _width(layer), CASING_SECONDS)
+	var c := sprites.emit(pool, at, float(e[2]), CASING_SECONDS)
 	if c == null:
 		return
 	c.vel = (side * randf_range(0.35, 0.55) * speed + dir * randf_range(-0.01, 0.01)) * TICKS + Vector3(0, maxf(vspeed, 0.03) * TICKS * 0.5, 0)
 	c.rise = -CASING_GRAVITY
 	c.fps = 15.0
+	if _casings.size() >= CASING_LIMIT:
+		if fx_opt:
+			if _casing_cursor >= _casings.size():
+				_casing_cursor = 0
+			var old: Array = _casings[_casing_cursor]
+			sprites.kill(old[0])
+			_casings[_casing_cursor] = [c, false]
+			_casing_cursor += 1
+			if _casing_cursor >= CASING_LIMIT:
+				_casing_cursor = 0
+			return
+		_casings.append([c, false])
+		while _casings.size() > CASING_LIMIT:
+			var old: Array = _casings.pop_front()
+			sprites.kill(old[0])
+		return
 	_casings.append([c, false])
-	while _casings.size() > CASING_LIMIT:
-		var old: Array = _casings.pop_front()
-		sprites.kill(old[0])
 
 
 func _update_casings() -> void:
-	for i in range(_casings.size() - 1, -1, -1):
+	var n := _casings.size()
+	var i := 0
+	while i < n:
 		var entry: Array = _casings[i]
 		var c: SpriteFx.Card = entry[0]
 		if c.age >= c.life:
-			_casings.remove_at(i)
-		elif not entry[1] and c.pos.y <= 0.04 and c.vel.y < 0.0:
+			n -= 1
+			if i < n:
+				_casings[i] = _casings[n]
+			_casings.pop_back()
+			continue
+		if not entry[1] and c.pos.y <= 0.04 and c.vel.y < 0.0:
 			# Lands, skids a little, and lies there.
 			c.pos.y = 0.04
 			c.vel = Vector3.ZERO
 			c.rise = 0.0
 			c.fps = 0.0
 			entry[1] = true
+		i += 1
 
 
 # --- Explosions -------------------------------------------------------------------------------------
 
+func _recent_cell(at2: Vector2) -> Vector2i:
+	return Vector2i(floori(at2.x / DEDUP_RANGE), floori(at2.y / DEDUP_RANGE))
+
+
+func _record_recent(name: String, at2: Vector2, now: int) -> void:
+	var entry := [name, at2, now]
+	_recent.append(entry)
+	var cell := _recent_cell(at2)
+	var bucket = _recent_cells.get(cell)
+	if bucket == null:
+		_recent_cells[cell] = [entry]
+	else:
+		(bucket as Array).append(entry)
+
+
 ## Plays explosion prototype `name` at `at` (y is how high above the ground it happens). `dir`
 ## turns explosions that rotate (Factorio's `rotate`), such as the railgun's beam.
 func explode(name: String, at: Vector3, dir := Vector3.ZERO) -> void:
-	var rec: Dictionary = data.get("ex", {}).get(name, {})
-	var variations: Array = rec.get("v", [])
-	if variations.is_empty():
-		return
-	_recent.append([name, Vector2(at.x, at.z), Time.get_ticks_msec()])
+	_sync_sprite_caches()
+	var cached = _ex_cache.get(name)
+	if cached == null:
+		var rec: Dictionary = data.get("ex", {}).get(name, {})
+		var variations: Array = rec.get("v", [])
+		if variations.is_empty():
+			return
+		var parsed_vars: Array = []
+		for layers: Array in variations:
+			var parsed_layers: Array = []
+			var max_w := 0.0
+			for layer: Array in layers:
+				var w := _width(layer)
+				var h := _height(layer)
+				max_w = maxf(max_w, w)
+				var shift: Array = layer[7]
+				var lift := -float(shift[1])
+				var sx := float(shift[0])
+				var frames := int(layer[3])
+				var speed := maxf(float(layer[5]), 0.01)
+				var l := clampf(frames / (speed * TICKS), 0.05, 6.0)
+				parsed_layers.append(["", layer, w, h, lift, sx, l, _tint(layer)])
+			parsed_vars.append([parsed_layers, max_w])
+		cached = {
+			"vars": parsed_vars,
+			"rot": rec.has("rot"),
+			"light": rec.get("l"),
+			"sm": rec.get("sm"),
+			"snd": rec.get("snd"),
+		}
+		_ex_cache[name] = cached
+	var info: Dictionary = cached
+	var parsed_vars: Array = info["vars"]
+	var now := Time.get_ticks_msec()
+	_record_recent(name, Vector2(at.x, at.z), now)
 	played[name] = int(played.get(name, 0)) + 1
-	var layers: Array = variations[randi() % variations.size()]
+	var v_pick: Array = parsed_vars[randi() % parsed_vars.size()]
+	var layers: Array = v_pick[0]
+	var max_w: float = float(v_pick[1])
 	var life := 0.1
-	for layer: Array in layers:
-		var pool := _pool(layer, false, false, 48)
+	var has_rot := bool(info["rot"]) and dir != Vector3.ZERO
+	var rot_spin := _screen_angle(dir, true) if has_rot else 0.0
+	for le: Array in layers:
+		var pool: String = le[0]
 		if pool == "":
-			continue
-		var w := _width(layer)
-		var h := _height(layer)
-		var shift: Array = layer[7]
-		var lift := -float(shift[1])
+			pool = _pool(le[1], false, false, 48)
+			if pool == "":
+				continue
+			le[0] = pool
+		var h: float = float(le[3])
+		var lift: float = float(le[4])
 		var y := at.y + lift if at.y > 0.1 else maxf(lift, h * 0.4)
-		var frames := int(layer[3])
-		var speed := maxf(float(layer[5]), 0.01)
-		var l := clampf(frames / (speed * TICKS), 0.05, 6.0)
+		var l: float = float(le[6])
 		life = maxf(life, l)
-		var c := sprites.emit(pool, Vector3(at.x + float(shift[0]), y, at.z), w, l, _tint(layer))
-		if c != null and rec.has("rot") and dir != Vector3.ZERO:
-			c.spin = _screen_angle(dir, true)
-	var light = rec.get("l")
+		var c := sprites.emit(pool, Vector3(at.x + float(le[5]), y, at.z), float(le[2]), l, le[7])
+		if c != null and has_rot:
+			c.spin = rot_spin
+	var light = info["light"]
 	if not CombatLights.old:
-		_explosion_light(name, at, layers, light, life)
+		_explosion_light(name, at, max_w, light, life)
 	elif light is Array and light.size() >= 3:
 		var col: Array = light[2]
-		_flashes.append([GroundHeight.lift(at + Vector3(0, 0.5, 0)), Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 3.0,
+		var lpos := at + Vector3(0, 0.5, 0)
+		_flashes.append([GroundHeight.lift(lpos) if GroundHeight.is_on() else lpos, Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 3.0,
 			clampf(float(light[1]) * 0.5, 2.0, 16.0), 0.0, life, false, 0])
-	var smoke = rec.get("sm")
+	var smoke = info["sm"]
 	if smoke is Array and smoke.size() >= 2:
+		var sm_name := str(smoke[0])
 		for i in mini(int(smoke[1]), 6):
-			_smoke(str(smoke[0]), at + Vector3(randf_range(-0.3, 0.3), 0.3, randf_range(-0.3, 0.3)),
+			_smoke(sm_name, at + Vector3(randf_range(-0.3, 0.3), 0.3, randf_range(-0.3, 0.3)),
 				Vector3(randf_range(-0.4, 0.4), randf_range(0.2, 0.6), randf_range(-0.4, 0.4)))
-	var snd = rec.get("snd")
+	var snd = info["snd"]
 	if snd is Array and not snd.is_empty() and sfx != null:
 		var pick: Array = snd[randi() % snd.size()]
 		var file := str(pick[0])
-		var now := Time.get_ticks_msec()
 		if now - int(_sounds.get(file, -1000)) > 60 or Sfx.pool:
 			_sounds[file] = now
 			sfx.play_at(file, at, float(pick[1]), 0.05, 1.0, "Explosions", "explosion/" + name)
@@ -657,30 +854,35 @@ func _line_explosion(name: String, from: Vector3, to: Vector3) -> void:
 	var n := clampi(ceili(length / maxf(step, 0.5)), 1, 12)
 	var dir := (to - from).normalized()
 	var life := clampf(int(layer[3]) / (maxf(float(layer[5]), 0.01) * TICKS), 0.05, 2.0)
+	var w := _width(layer)
+	var tint := _tint(layer)
+	var spin := _screen_angle(dir, true)
 	for i in n:
-		var c := sprites.emit(pool, from + dir * (length * (i + 0.5) / n), _width(layer), life, _tint(layer))
+		var c := sprites.emit(pool, from + dir * (length * (i + 0.5) / n), w, life, tint)
 		if c != null:
-			c.spin = _screen_angle(dir, true)
-	_recent.append([name, Vector2(from.x, from.z), Time.get_ticks_msec()])
+			c.spin = spin
+	_record_recent(name, Vector2(from.x, from.z), Time.get_ticks_msec())
 	played[name] = int(played.get(name, 0)) + 1
 	var light = rec.get("l")
 	if light is Array and light.size() >= 3:
 		var col: Array = light[2]
+		var lpos := from.lerp(to, 0.2)
+		if GroundHeight.is_on():
+			lpos = GroundHeight.lift(lpos)
 		if CombatLights.old:
-			_flashes.append([GroundHeight.lift(from.lerp(to, 0.2)), Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 2.0, 10.0, 0.0, life, false, 0])
+			_flashes.append([lpos, Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 2.0, 10.0, 0.0, life, false, 0])
 		elif _flashes.size() < MAX_FLASHES:
-			_flashes.append([GroundHeight.lift(from.lerp(to, 0.2)), Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 3.0, 16.0, 0.0,
-				maxf(life, 0.25), true, 0])
+			var fl := [lpos, Color(float(col[0]), float(col[1]), float(col[2])), float(light[0]) * 3.0, 16.0, 0.0,
+				maxf(life, 0.25), true, 0]
+			_flashes.append(fl)
+			_ex_flashes.append(fl)
 
 
 ## An explosion's light (combat lights), by its size; a prototype light (`l`) keeps its colour and
 ## gets at least that size's brightness. Explosions close together at once share one light.
-func _explosion_light(name: String, at: Vector3, layers: Array, light, life: float) -> void:
+func _explosion_light(name: String, at: Vector3, size: float, light, life: float) -> void:
 	if CombatLights.strength <= 0.0 or name in EX_DARK or name.contains("blood"):
 		return
-	var size := 0.0
-	for layer: Array in layers:
-		size = maxf(size, _width(layer))
 	var energy := clampf(0.8 + size * 0.9, 1.0, 10.0)
 	var reach := clampf(3.0 + size * 2.2, 4.0, 28.0)
 	var secs := clampf(life * 0.8, 0.2, 2.0)
@@ -697,49 +899,115 @@ func _explosion_light(name: String, at: Vector3, layers: Array, light, life: flo
 		energy = maxf(energy, float(NUKE_LIGHT[0]))
 		reach = maxf(reach, float(NUKE_LIGHT[1]))
 		secs = maxf(secs, float(NUKE_LIGHT[2]))
-	var pos := GroundHeight.lift(at + Vector3(0, 0.5 + minf(size * 0.15, 3.0), 0))
-	for fl: Array in _flashes:
-		if int(fl[7]) == 0 and float(fl[4]) < EX_MERGE_SECONDS and (fl[0] as Vector3).distance_to(pos) < EX_MERGE_RANGE:
+	var raw_pos := at + Vector3(0, 0.5 + minf(size * 0.15, 3.0), 0)
+	var pos := GroundHeight.lift(raw_pos) if GroundHeight.is_on() else raw_pos
+	if _flashes.is_empty():
+		_ex_flashes.clear()
+		_muzzle_flashes.clear()
+	var en := _ex_flashes.size()
+	var i := 0
+	while i < en:
+		var fl: Array = _ex_flashes[i]
+		if float(fl[4]) >= EX_MERGE_SECONDS or float(fl[4]) >= float(fl[5]):
+			en -= 1
+			if i < en:
+				_ex_flashes[i] = _ex_flashes[en]
+			_ex_flashes.pop_back()
+			continue
+		if (fl[0] as Vector3).distance_squared_to(pos) < EX_MERGE_RANGE_SQ:
 			fl[2] = maxf(float(fl[2]), energy)
 			fl[3] = maxf(float(fl[3]), reach)
 			fl[5] = maxf(float(fl[5]), secs)
 			return
+		i += 1
 	if _flashes.size() < MAX_FLASHES:
-		_flashes.append([pos, colour, energy, reach, 0.0, secs, true, 0])
+		var fl := [pos, colour, energy, reach, 0.0, secs, true, 0]
+		_flashes.append(fl)
+		_ex_flashes.append(fl)
 
 
 ## A puff of a trivial smoke prototype (smoke-fast behind rockets, soft-fire-smoke over fires).
 func _smoke(name: String, at: Vector3, vel: Vector3) -> void:
-	var rec: Dictionary = data.get("ts", {}).get(name, {})
-	var layer := _pick_layer(rec.get("a", []))
-	if layer.is_empty():
-		return
-	var dur := maxf(float(rec.get("dur", 60)), 1.0)
-	var pool := _pool(layer, true, false, 400, 0.0, clampf(float(rec.get("fade", 0)) / dur, 0.1, 0.9))
+	_sync_sprite_caches()
+	var entries: Array = _smoke_cache.get(name, [])
+	if entries.is_empty():
+		var rec: Dictionary = data.get("ts", {}).get(name, {})
+		var vars: Array = rec.get("a", [])
+		if vars.is_empty():
+			return
+		var dur := maxf(float(rec.get("dur", 60)), 1.0)
+		var dur_sec := dur / TICKS
+		var fade_out := clampf(float(rec.get("fade", 0)) / dur, 0.1, 0.9)
+		var s0 := float(rec.get("s0", 1.0))
+		var s1 := float(rec.get("s1", 1.0))
+		var col = rec.get("c")
+		var tint := Color(float(col[0]), float(col[1]), float(col[2]), float(col[3])) if col is Array and col.size() >= 4 else Color.WHITE
+		entries = []
+		for v in vars:
+			if v is Array and not v.is_empty() and v[0] is Array:
+				var layer: Array = v[0]
+				var w := _width(layer)
+				var fps := maxf(float(layer[5]), 0.05) * TICKS
+				entries.append(["", layer, w * s0, w * s1, dur_sec, tint, fps, fade_out])
+		if entries.is_empty():
+			return
+		_smoke_cache[name] = entries
+	var e: Array = entries[0] if entries.size() == 1 else entries[randi() % entries.size()]
+	var pool: String = e[0]
 	if pool == "":
-		return
-	var col = rec.get("c")
-	var tint := Color(float(col[0]), float(col[1]), float(col[2]), float(col[3])) if col is Array and col.size() >= 4 else Color.WHITE
-	var c := sprites.emit(pool, at, _width(layer) * float(rec.get("s0", 1.0)), dur / TICKS, tint)
+		pool = _pool(e[1], true, false, 400, 0.0, float(e[7]))
+		if pool == "":
+			return
+		e[0] = pool
+	var c := sprites.emit(pool, at, float(e[2]), float(e[4]), e[5])
 	if c != null:
-		c.size1 = _width(layer) * float(rec.get("s1", 1.0))
+		c.size1 = float(e[3])
 		c.vel = vel
-		c.fps = maxf(float(layer[5]), 0.05) * TICKS
+		c.fps = float(e[6])
 
 
 func _played_recently(name: String, at: Vector2) -> bool:
+	if _recent.is_empty():
+		_recent_cells.clear()
+		return false
 	var now := Time.get_ticks_msec()
-	for r: Array in _recent:
-		if r[0] == name and now - int(r[2]) < DEDUP_SECONDS * 1000.0 and (r[1] as Vector2).distance_to(at) < DEDUP_RANGE:
-			return true
+	var cutoff := now - int(DEDUP_SECONDS * 1000.0)
+	var range_sq := DEDUP_RANGE * DEDUP_RANGE
+	if _recent.size() <= 8:
+		for r: Array in _recent:
+			if r[0] == name and int(r[2]) > cutoff and (r[1] as Vector2).distance_squared_to(at) < range_sq:
+				return true
+		return false
+	var cx := floori(at.x / DEDUP_RANGE)
+	var cy := floori(at.y / DEDUP_RANGE)
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			var cell := Vector2i(cx + dx, cy + dy)
+			var bucket = _recent_cells.get(cell)
+			if bucket == null:
+				continue
+			var arr: Array = bucket
+			for i in range(arr.size() - 1, -1, -1):
+				var r: Array = arr[i]
+				if int(r[2]) <= cutoff:
+					var last := arr.size() - 1
+					if i < last:
+						arr[i] = arr[last]
+					arr.pop_back()
+					continue
+				if r[0] == name and (r[1] as Vector2).distance_squared_to(at) < range_sq:
+					return true
+			if arr.is_empty():
+				_recent_cells.erase(cell)
 	return false
 
 
 ## Where a projectile ended: its target's explosions and scorch marks.
 func _impact(effects: Array, at: Vector2) -> void:
+	var sc_data: Dictionary = data.get("sc", {})
 	for pair in effects:
 		var name := str(pair[0])
-		if data.get("sc", {}).has(name):
+		if sc_data.has(name):
 			_scorch(name, Vector3(at.x, 0.03, at.y))
 		elif not _played_recently(name, at):
 			explode(name, Vector3(at.x, 0.0, at.y))
@@ -748,15 +1016,26 @@ func _impact(effects: Array, at: Vector2) -> void:
 func _scorch(name: String, at: Vector3) -> void:
 	if in_space:
 		return
-	var rec: Dictionary = data.get("sc", {}).get(name, {})
-	var layer := _pick_layer(rec.get("a", []))
-	if layer.is_empty():
-		return
-	var pool := _pool(layer, false, true, 120, 0.0, 0.1)
+	_sync_sprite_caches()
+	var entries: Array = _scorch_cache.get(name, [])
+	if entries.is_empty():
+		var rec: Dictionary = data.get("sc", {}).get(name, {})
+		for v in rec.get("a", []):
+			if v is Array and not v.is_empty() and v[0] is Array:
+				var layer: Array = v[0]
+				entries.append(["", layer, _width(layer)])
+		if entries.is_empty():
+			return
+		_scorch_cache[name] = entries
+	var e: Array = entries[0] if entries.size() == 1 else entries[randi() % entries.size()]
+	var pool: String = e[0]
 	if pool == "":
-		return
+		pool = _pool(e[1], false, true, 120, 0.0, 0.1)
+		if pool == "":
+			return
+		e[0] = pool
 	# A tintable patch takes the ground's colour in Factorio; a dark brown reads on every tile.
-	var c := sprites.emit(pool, at, _width(layer), SCORCH_SECONDS, Color(0.42, 0.36, 0.3, 0.7))
+	var c := sprites.emit(pool, at, float(e[2]), SCORCH_SECONDS, Color(0.42, 0.36, 0.3, 0.7))
 	if c != null:
 		c.angle = randf() * TAU
 
@@ -769,17 +1048,20 @@ func _on_flying(msg: Dictionary) -> void:
 	_pj_tick = k
 	_mark += 1
 	var mark := _mark
+	var now := Time.get_ticks_msec()
+	var st_data: Dictionary = data.get("st", {})
 	var p := _items(msg.get("p"))
 	var i := 0
 	while i + 3 < p.size():
 		var id := int(p[i])
+		var pname := str(p[i + 1])
 		var at := Vector2(int(p[i + 2]), int(p[i + 3])) / 256.0
-		if data.get("st", {}).has(str(p[i + 1])):
+		if st_data.has(pname):
 			var st: Stream = _streams.get(id)
 			if st == null:
 				st = Stream.new()
-				st.name = str(p[i + 1])
-				st.rec = data["st"][st.name]
+				st.name = pname
+				st.rec = st_data[pname]
 				st.pos = at
 				_streams[id] = st
 				_place_stream(st)
@@ -809,14 +1091,14 @@ func _on_flying(msg: Dictionary) -> void:
 			continue
 		var f: Flyer = _flying.get(id)
 		if f == null:
-			f = _new_flyer(str(p[i + 1]), at)
+			f = _new_flyer(pname, at, now)
 			if f != null:
 				_flying[id] = f
 		else:
 			f.vel = (at - f.pos) / dt
 		if f != null:
 			f.pos = at
-			f.at_msec = Time.get_ticks_msec()
+			f.at_msec = now
 			f.seen = mark
 		i += 4
 	var e := _items(msg.get("e"))
@@ -831,16 +1113,22 @@ func _on_flying(msg: Dictionary) -> void:
 				extra_sounds.projectile_end(f.name, Vector3(end.x, 0.5, end.y))
 			_remove_flyer(id)
 		i += 3
-	for id in _flying.keys():
-		var f: Flyer = _flying[id]
-		if f.seen != mark:
+	if not _flying.is_empty():
+		_dead_ids.clear()
+		for id in _flying:
+			var f: Flyer = _flying[id]
+			if f.seen != mark:
+				_dead_ids.append(id)
+		for id in _dead_ids:
 			_remove_flyer(id)  # left the area
-	for st: Stream in _streams.values():
+	for id in _streams:
+		var st: Stream = _streams[id]
 		if st.seen != mark:
 			if st.alive and extra_sounds != null:
 				extra_sounds.stream_end(st.name, Vector3(st.pos.x, 0.3, st.pos.y))
 			st.alive = false  # its particles still land
 	var b := _items(msg.get("b"))
+	var bm_data: Dictionary = data.get("bm", {})
 	i = 0
 	while i + 5 < b.size():
 		var id := int(b[i])
@@ -848,7 +1136,7 @@ func _on_flying(msg: Dictionary) -> void:
 		if beam == null:
 			beam = Beam.new()
 			beam.name = str(b[i + 1])
-			beam.rec = data.get("bm", {}).get(beam.name, {})
+			beam.rec = bm_data.get(beam.name, {})
 			_beams[id] = beam
 		var s := Vector2(int(b[i + 2]), int(b[i + 3])) / 256.0
 		var t := Vector2(int(b[i + 4]), int(b[i + 5])) / 256.0
@@ -858,55 +1146,78 @@ func _on_flying(msg: Dictionary) -> void:
 		beam.to = Vector3(t.x, HIT_HEIGHT, t.y)
 		beam.seen = mark
 		i += 6
-	for id in _beams.keys():
-		var beam: Beam = _beams[id]
-		if beam.seen != mark:
-			_drop_cards(beam.cards)
+	if not _beams.is_empty():
+		_dead_ids.clear()
+		for id in _beams:
+			var beam: Beam = _beams[id]
+			if beam.seen != mark:
+				_drop_cards(beam.cards)
+				_dead_ids.append(id)
+		for id in _dead_ids:
 			_beams.erase(id)
 	var x := _items(msg.get("x"))
+	var ex_data: Dictionary = data.get("ex", {})
 	i = 0
 	while i + 2 < x.size():
 		var name := str(x[i])
 		var at := Vector2(int(x[i + 1]), int(x[i + 2])) / 256.0
 		if not _played_recently(name, at):
-			var rec: Dictionary = data.get("ex", {}).get(name, {})
+			var rec: Dictionary = ex_data.get(name, {})
 			explode(name, Vector3(at.x, float(rec.get("h", 0.0)) * HIT_HEIGHT, at.y))
 		i += 3
 
 
-func _new_flyer(name: String, at: Vector2) -> Flyer:
+func _new_flyer(name: String, at: Vector2, now := -1) -> Flyer:
+	var pr_data: Dictionary = data.get("pr", {})
+	if not pr_data.has(name):
+		return null
 	var f := Flyer.new()
 	f.name = name
 	f.pos = at
 	f.first = at
-	f.at_msec = Time.get_ticks_msec()
-	var layers: Array
-	if data.get("pr", {}).has(name):
-		f.rec = data["pr"][name]
-		f.kind = 2 if f.rec.has("art") else (3 if name in CAPSULES else 0)
-		layers = _first_variation(f.rec.get("a", []))
-	else:
-		return null
+	f.at_msec = now if now >= 0 else Time.get_ticks_msec()
+	f.rec = pr_data[name]
+	f.kind = 2 if f.rec.has("art") else (3 if name in CAPSULES else 0)
+	var smk = f.rec.get("smk")
+	if smk is Array and not smk.is_empty():
+		f.smk = smk
+		f.has_smk = true
+	f.smk_checked = true
+	_cache_flyer_light(f)
+	var layers := _first_variation(f.rec.get("a", []))
 	if avatar != null:
-		f.near_shooter = Vector2(avatar.position.x, avatar.position.z).distance_to(at) < NEAR_SHOOTER
+		f.near_shooter = Vector2(avatar.position.x, avatar.position.z).distance_squared_to(at) < NEAR_SHOOTER * NEAR_SHOOTER
 	if f.kind == 3 and extra_sounds != null:
 		extra_sounds.throw(name, Vector3(at.x, FLY_HEIGHT, at.y))
 	if f.near_shooter and f.kind == 3:
-		var capsule_aim: GDScript = load(CAPSULE_AIM_SCRIPT)
-		if Time.get_ticks_msec() - int(capsule_aim.get("last_msec")) < 2000:
-			f.landing = at.distance_to(capsule_aim.get("last_target"))
+		if _capsule_aim_script == null:
+			_capsule_aim_script = load(CAPSULE_AIM_SCRIPT)
+		if f.at_msec - int(_capsule_aim_script.get("last_msec")) < 2000:
+			f.landing = at.distance_to(_capsule_aim_script.get("last_target"))
 	for layer: Array in layers:
 		var pool := _pool(layer, true, false, 256, 0.0, 0.0)
 		if pool == "":
 			continue
-		var c := sprites.emit(pool, Vector3(at.x, FLY_HEIGHT, at.y), _width(layer), 3600.0, _tint(layer))
+		var w := _width(layer)
+		var c := sprites.emit(pool, Vector3(at.x, FLY_HEIGHT, at.y), w, 3600.0, _tint(layer))
 		if c != null:
 			c.fps = maxf(float(layer[5]), 0.0) * TICKS
 			c.frame = 0.0
-			f.cards.append([c, _width(layer), layer[7]])
+			f.cards.append([c, w, layer[7]])
 	if f.kind == 2 or f.kind == 3:
 		f.shadow = _shadow_card(at)
 	return f
+
+
+func _cache_flyer_light(f: Flyer) -> void:
+	f.light_checked = true
+	var l = f.rec.get("l")
+	if l is Array and l.size() >= 3:
+		var col: Array = l[2]
+		f.light_col = Color(float(col[0]), float(col[1]), float(col[2]))
+		f.light_energy = float(l[0])
+		f.light_range = float(l[1])
+		f.has_light = true
 
 
 func _remove_flyer(id: int) -> void:
@@ -934,31 +1245,92 @@ func _flyer_height(f: Flyer, d: float) -> float:
 	return FLY_HEIGHT
 
 
-func _update_flyers(delta: float) -> void:
-	var now := Time.get_ticks_msec()
-	for f: Flyer in _flying.values():
-		var ahead := clampf((now - f.at_msec) / 1000.0, 0.0, 0.1)
-		var at := f.pos + f.vel * ahead
-		var d := at.distance_to(f.first)
+func _trail_scale(p3: Vector3) -> float:
+	if _cam != null and not _cam_planes.is_empty():
+		var hr := GroundHeight.lift_range()
+		var margin := TRAIL_VIEW_MARGIN + maxf(absf(hr.x), absf(hr.y))
+		for pl in _cam_planes:
+			if pl.distance_to(p3) > margin:
+				return 0.0
+		var d_sq := _cam_pos.distance_squared_to(p3)
+		if d_sq <= TRAIL_NEAR_SQ:
+			return 1.0
+		if d_sq <= TRAIL_MID_SQ:
+			return 0.5
+		if d_sq <= TRAIL_FAR_SQ:
+			return 0.25
+		return 0.0
+	if avatar != null:
+		var d_sq := avatar.position.distance_squared_to(p3)
+		if d_sq <= TRAIL_NEAR_SQ:
+			return 1.0
+		if d_sq <= TRAIL_MID_SQ:
+			return 0.5
+		if d_sq <= TRAIL_FAR_SQ:
+			return 0.25
+		return 0.0
+	return 1.0
+
+
+func _update_flyers(delta: float, now := -1) -> void:
+	if _flying.is_empty():
+		return
+	if now < 0:
+		now = Time.get_ticks_msec()
+	var has_cam := _cam != null
+	var cam_bx := _cam_bx
+	var cam_by := _cam_by
+	var opt := fx_opt
+	for id in _flying:
+		var f: Flyer = _flying[id]
+		var ahead := clampf((now - f.at_msec) * 0.001, 0.0, 0.1)
+		var vx := f.vel.x
+		var vy := f.vel.y
+		var ax := f.pos.x + vx * ahead
+		var ay := f.pos.y + vy * ahead
+		var dx := ax - f.first.x
+		var dy := ay - f.first.y
+		var d := sqrt(dx * dx + dy * dy)
 		var h := _flyer_height(f, d)
-		var p3 := Vector3(at.x, h, at.y)
-		var dir := Vector3(f.vel.x, 0.0, f.vel.y)
-		for entry: Array in f.cards:
-			var c: SpriteFx.Card = entry[0]
-			c.pos = p3
-			if f.kind == 0 and dir.length() > 0.01:
-				c.spin = _screen_angle(dir, false)
+		var p3 := Vector3(ax, h, ay)
+		var vel_sq := vx * vx + vy * vy
+		var cards := f.cards
+		if f.kind == 0 and vel_sq > 0.0001 and has_cam:
+			var sx := vx * cam_bx.x + vy * cam_bx.z
+			var sy := vx * cam_by.x + vy * cam_by.z
+			var spin := atan2(-sx, sy)
+			for entry: Array in cards:
+				var c: SpriteFx.Card = entry[0]
+				c.pos = p3
+				c.spin = spin
+		else:
+			for entry: Array in cards:
+				(entry[0] as SpriteFx.Card).pos = p3
 		if f.shadow != null:
-			f.shadow.pos = Vector3(at.x, 0.02, at.y)
-		var smk = f.rec.get("smk")
-		if smk is Array:
-			for s in smk:
-				f.smoke_due += float(s[1]) * delta * TICKS
+			f.shadow.pos = Vector3(ax, 0.02, ay)
+		if not f.smk_checked:
+			f.smk_checked = true
+			var raw_smk = f.rec.get("smk")
+			if raw_smk is Array and not raw_smk.is_empty():
+				f.smk = raw_smk
+				f.has_smk = true
+		if f.has_smk:
+			var trail_scale := _trail_scale(p3) if opt else 1.0
+			if trail_scale <= 0.0:
+				f.smoke_due = 0.0
+				continue
+			var inv_v := -0.3 / sqrt(vel_sq) if vel_sq > 0.0001 else 0.0
+			var back_x := vx * inv_v
+			var back_z := vy * inv_v
+			for s in f.smk:
+				f.smoke_due += float(s[1]) * delta * TICKS * trail_scale
 				var dev: Array = s[2] if s.size() > 2 and s[2] is Array else [0.0, 0.0]
+				var dev_x := float(dev[0])
+				var dev_z := float(dev[1])
+				var smk_name := str(s[0])
 				while f.smoke_due >= 1.0:
 					f.smoke_due -= 1.0
-					var back := -dir.normalized() * 0.3 if dir.length() > 0.01 else Vector3.ZERO
-					_smoke(str(s[0]), p3 + back + Vector3(randf_range(-1, 1) * float(dev[0]), 0.0, randf_range(-1, 1) * float(dev[1])),
+					_smoke(smk_name, Vector3(p3.x + back_x + randf_range(-1.0, 1.0) * dev_x, p3.y, p3.z + back_z + randf_range(-1.0, 1.0) * dev_z),
 						Vector3(randf_range(-0.1, 0.1), 0.15, randf_range(-0.1, 0.1)))
 		f.smoke_due = minf(f.smoke_due, 4.0)
 
@@ -1004,7 +1376,7 @@ func _place_stream(st: Stream) -> void:
 	var src: Vector3 = st.shooter if st.shooter != null else p3
 	st.from = src
 	var target = null
-	if st.name.begins_with("acid"):
+	if st.name.begins_with("acid") or st.name.contains("acid-stream"):
 		if acid_aim_real:
 			target = _acid_target(st.shooter_unit)
 		if target == null and avatar != null and avatar.position.distance_to(src) < 30.0:
@@ -1150,11 +1522,16 @@ static func _tip(from: Vector3, to: Vector3, step: float) -> Vector3:
 func _turret_layer() -> Node:
 	if world == null:
 		return null
+	if _turret_layer_world == world and _turret_layer_cached != null and is_instance_valid(_turret_layer_cached):
+		return _turret_layer_cached
 	var anim = world.get("animator")
 	if anim == null:
 		return null
 	var layer = anim.get("turrets")
-	return layer as Node if layer is Node and (layer as Node).has_method("flame_nozzle") else null
+	var valid := layer as Node if layer is Node and (layer as Node).has_method("flame_nozzle") else null
+	_turret_layer_world = world
+	_turret_layer_cached = valid
+	return valid
 
 
 ## Where a spitter's or worm's acid lands: the point its `en` says it attacks, or the mover (a car, a
@@ -1195,9 +1572,10 @@ func _stream_shooter(at: Vector2, reach := 4.0, types: Array = STREAM_SHOOTERS) 
 	# Only the chunks the 4-tile search reaches: this went through every entity in the world,
 	# for each stream four times a second, and a spitter's acid (no building shoots it) never
 	# stopped looking: 15-50 ms a frame in a 300-enemy attack on a 16,000-entity map.
-	var world_script: GDScript = load(WORLD_SCRIPT)
-	var lo: Vector2i = world_script.chunk_of(at - Vector2(best_d, best_d))
-	var hi: Vector2i = world_script.chunk_of(at + Vector2(best_d, best_d))
+	if _world_script == null:
+		_world_script = load(WORLD_SCRIPT)
+	var lo: Vector2i = _world_script.chunk_of(at - Vector2(best_d, best_d))
+	var hi: Vector2i = _world_script.chunk_of(at + Vector2(best_d, best_d))
 	for cy in range(lo.y, hi.y + 1):
 		for cx in range(lo.x, hi.x + 1):
 			var cv = world.chunks.get(Vector2i(cx, cy))
@@ -1226,64 +1604,99 @@ func _stream_shooter(at: Vector2, reach := 4.0, types: Array = STREAM_SHOOTERS) 
 	return [best, best_unit]
 
 
+func _cache_stream_rec(st: Stream) -> void:
+	st.rec_cached = true
+	st.hs = maxf(float(st.rec.get("hs", 0.25)), 0.01)
+	st.va = float(st.rec.get("va", 0.003))
+	st.ss = float(st.rec.get("ss", 1.0))
+	st.sa = float(st.rec.get("sa", 1.0))
+	st.psi = maxf(float(st.rec.get("psi", 2)), 1.0)
+	st.pst = float(st.rec.get("pst", 2))
+	st.continuous = st.name.contains("flamethrower")
+	var layer := _pick_layer(st.rec.get("p", []), 0)
+	st.layer = layer
+	if not layer.is_empty():
+		st.width = _width(layer)
+		st.alpha = _tint(layer).a
+
+
 func _update_streams(delta: float) -> void:
-	for id in _streams.keys():
+	if _streams.is_empty():
+		return
+	_sync_sprite_caches()
+	_dead_ids.clear()
+	for id in _streams:
 		var st: Stream = _streams[id]
 		st.age += delta
 		if st.custom:
 			if not st.alive:
 				if on_stream_hook.is_valid():
 					on_stream_hook.call({"event": "end", "id": id, "name": st.name})
-				_streams.erase(id)
-				if st.owner_key != "" and int(_flame_lead.get(st.owner_key, -1)) == int(id):
-					_flame_lead.erase(st.owner_key)
+				_dead_ids.append(id)
 			continue
+		if not st.rec_cached:
+			_cache_stream_rec(st)
 		st.placed -= delta
 		if st.placed <= 0.0:
 			st.placed = 0.25
 			_place_stream(st)
-		var hs := maxf(float(st.rec.get("hs", 0.25)), 0.01)
-		var va := float(st.rec.get("va", 0.003))
-		# Flamethrowers keep feeding their stream while they fire; acid is one burst.
-		var continuous := st.name.contains("flamethrower")
-		var spawning := st.alive and st.lead and (continuous or st.age * TICKS <= float(st.rec.get("pst", 2)))
-		var layer := _pick_layer(st.rec.get("p", []), 0)
-		var pool := _pool(layer, true, false, 512, 0.0, 0.0) if not layer.is_empty() else ""
+		var spawning := st.alive and st.lead and (st.continuous or st.age * TICKS <= st.pst)
+		if st.pool == "" and not st.layer.is_empty():
+			st.pool = _pool(st.layer, true, false, 512, 0.0, 0.0)
+		var pool := st.pool
 		if spawning and pool != "":
-			st.spawn_due += delta * TICKS / maxf(float(st.rec.get("psi", 2)), 1.0)
+			var layer := st.layer
+			st.spawn_due += delta * TICKS / st.psi
+			var tint := _tint(layer)
+			var fps := maxf(float(layer[5]), 0.05) * TICKS
 			while st.spawn_due >= 1.0 and st.particles.size() < STREAM_PARTICLES:
 				st.spawn_due -= 1.0
-				var ticks := Vector2(st.to.x - st.from.x, st.to.z - st.from.z).length() / hs
-				var c := sprites.emit(pool, st.from, _width(layer), 60.0, _tint(layer))
+				var dx := st.to.x - st.from.x
+				var dz := st.to.z - st.from.z
+				var ticks := sqrt(dx * dx + dz * dz) / st.hs
+				var c := sprites.emit(pool, st.from, st.width, 60.0, tint)
 				if c != null:
-					c.fps = maxf(float(layer[5]), 0.05) * TICKS
+					c.fps = fps
 					# A parabola under the stream's vertical acceleration: va * T² / 8 at the top.
-					st.particles.append([c, 0.0, maxf(ticks / TICKS, 0.05), st.from, st.to, _arc_top(st, ticks) if continuous else va * ticks * ticks / 8.0])
+					st.particles.append([c, 0.0, maxf(ticks / TICKS, 0.05), st.from, st.to, _arc_top(st, ticks) if st.continuous else st.va * ticks * ticks / 8.0])
 			st.spawn_due = minf(st.spawn_due, 2.0)
-		var ss := float(st.rec.get("ss", 1.0))
-		var sa := float(st.rec.get("sa", 1.0))
-		var w := _width(layer) if not layer.is_empty() else 1.0
-		var alpha := _tint(layer).a if not layer.is_empty() else 1.0
-		for i in range(st.particles.size() - 1, -1, -1):
-			var part: Array = st.particles[i]
+		var ss := st.ss
+		var sa := st.sa
+		var w := st.width
+		var alpha := st.alpha
+		var parts := st.particles
+		var pi := 0
+		var pn := parts.size()
+		while pi < pn:
+			var part: Array = parts[pi]
 			var c: SpriteFx.Card = part[0]
-			part[1] = float(part[1]) + delta
-			var t := float(part[1]) / float(part[2])
+			var age := float(part[1]) + delta
+			part[1] = age
+			var t := age / float(part[2])
 			if t >= 1.0:
 				sprites.kill(c)
-				st.particles.remove_at(i)
+				pn -= 1
+				if pi < pn:
+					parts[pi] = parts[pn]
+				parts.pop_back()
 				continue
 			var a: Vector3 = part[3]
 			var b: Vector3 = part[4]
-			c.pos = a.lerp(b, t) + Vector3(0, float(part[5]) * 4.0 * t * (1.0 - t), 0)
+			var p := a.lerp(b, t)
+			p.y += float(part[5]) * 4.0 * t * (1.0 - t)
+			c.pos = p
 			# Particles grow from particle_start_scale and brighten from particle_start_alpha.
 			c.size0 = w * lerpf(ss, 1.0, t)
 			c.size1 = c.size0
 			c.color.a = alpha * lerpf(sa, 1.0, t)
-		if not st.alive and st.particles.is_empty():
-			_streams.erase(id)
-			if st.owner_key != "" and int(_flame_lead.get(st.owner_key, -1)) == int(id):
-				_flame_lead.erase(st.owner_key)
+			pi += 1
+		if not st.alive and parts.is_empty():
+			_dead_ids.append(id)
+	for id in _dead_ids:
+		var st: Stream = _streams.get(id)
+		_streams.erase(id)
+		if st != null and st.owner_key != "" and int(_flame_lead.get(st.owner_key, -1)) == int(id):
+			_flame_lead.erase(st.owner_key)
 
 
 # --- Beams ------------------------------------------------------------------------------------------
@@ -1330,10 +1743,69 @@ func _beam_end(at: Vector2, source: bool) -> Vector3:
 	return Vector3(at.x, 1.2 if source else HIT_HEIGHT, at.y)
 
 
+func _beam_part_specs(parts) -> Array:
+	var out: Array = []
+	if not (parts is Array):
+		return out
+	for v in parts:
+		if v is Array and not v.is_empty() and v[0] is Array:
+			var layer: Array = v[0]
+			out.append([layer, _width(layer), _tint(layer), maxf(float(layer[5]), 0.1) * TICKS, ""])
+		else:
+			out.append([])
+	return out
+
+
+func _cache_beam(beam: Beam) -> void:
+	beam.cached = true
+	var body: Array = beam.rec.get("body", [])
+	if body.is_empty():
+		return
+	var seg_layer := _pick_layer([body[0]])
+	if not seg_layer.is_empty():
+		beam.seg_width = maxf(_width(seg_layer), 0.25)
+	beam.start_specs = _beam_part_specs(beam.rec.get("start", []))
+	beam.head_specs = _beam_part_specs(beam.rec.get("head", []))
+	beam.body_specs = _beam_part_specs(body)
+	beam.tail_specs = _beam_part_specs(beam.rec.get("tail", []))
+	beam.ending_specs = _beam_part_specs(beam.rec.get("ending", []))
+
+
+func _beam_step_card(beam: Beam, card_idx: int, spec: Array, pos: Vector3, override_width: float, angle: float) -> bool:
+	if spec.is_empty():
+		return false
+	var pool: String = spec[4]
+	if pool == "":
+		pool = _pool(spec[0], true, false, 256, 0.0, 0.0)
+		if pool == "":
+			return false
+		spec[4] = pool
+	var width := override_width if override_width > 0.0 else float(spec[1])
+	if card_idx >= beam.cards.size() or beam.cards[card_idx][1] != pool:
+		var c := sprites.emit(pool, pos, width, 3600.0, spec[2])
+		if c == null:
+			return false
+		c.fps = float(spec[3])
+		if card_idx < beam.cards.size():
+			sprites.kill(beam.cards[card_idx][0])
+			beam.cards[card_idx] = [c, pool]
+		else:
+			beam.cards.append([c, pool])
+	var card: SpriteFx.Card = beam.cards[card_idx][0]
+	card.pos = pos
+	card.size0 = width
+	card.size1 = width
+	card.spin = angle
+	return true
+
+
 ## A beam as Factorio lays it: its start at the source, body segments end to end (the head first
 ## and the tail last), and its ending at the target, flickering through their frames.
 func _update_beams() -> void:
-	for beam: Beam in _beams.values():
+	if _beams.is_empty():
+		return
+	for id in _beams:
+		var beam: Beam = _beams[id]
 		if beam.src > 0:
 			var p = null
 			if beam.src_turret:
@@ -1343,55 +1815,45 @@ func _update_beams() -> void:
 				p = movers.position_of(beam.src)
 			if p is Vector3:
 				beam.from = p  # follows the head as it turns, the robot as it flies
-		var body: Array = beam.rec.get("body", [])
-		if body.is_empty():
+		if not beam.cached:
+			_cache_beam(beam)
+		if beam.body_specs.is_empty():
 			continue
-		var seg_layer := _pick_layer([body[0]])
-		if seg_layer.is_empty():
-			continue
-		var seg := maxf(_width(seg_layer), 0.25)
 		var span := beam.to - beam.from
 		var length := _projected(span).length()
-		var n := clampi(ceili(length / seg), 1, 40)
-		var plan: Array = []  # [layer, position, width]
-		if beam.rec.has("start"):
-			plan.append([_pick_layer(beam.rec["start"]), beam.from, -1.0])
-		for i in n:
-			var parts: Array = body
-			if i == 0 and beam.rec.has("head"):
-				parts = beam.rec["head"]
-			elif i == n - 1 and n > 1 and beam.rec.has("tail"):
-				parts = beam.rec["tail"]
-			plan.append([_pick_layer(parts, i), beam.from + span * ((i + 0.5) / n), length / n])
-		if beam.rec.has("ending"):
-			plan.append([_pick_layer(beam.rec["ending"]), beam.to, -1.0])
-		while beam.cards.size() > plan.size():
-			sprites.kill(beam.cards.pop_back()[0])
+		var n := clampi(ceili(length / beam.seg_width), 1, 40)
+		var seg_w := length / n
 		var angle := _screen_angle(span, true)
-		for i in plan.size():
-			var item: Array = plan[i]
-			var layer: Array = item[0]
-			if layer.is_empty():
-				continue
-			var pool := _pool(layer, true, false, 256, 0.0, 0.0)
-			if pool == "":
-				continue
-			var width := float(item[2]) if float(item[2]) > 0.0 else _width(layer)
-			if i >= beam.cards.size() or beam.cards[i][1] != pool:
-				var c := sprites.emit(pool, item[1], width, 3600.0, _tint(layer))
-				if c == null:
-					continue
-				c.fps = maxf(float(layer[5]), 0.1) * TICKS
-				if i < beam.cards.size():
-					sprites.kill(beam.cards[i][0])
-					beam.cards[i] = [c, pool]
-				else:
-					beam.cards.append([c, pool])
-			var card: SpriteFx.Card = beam.cards[i][0]
-			card.pos = item[1]
-			card.size0 = width
-			card.size1 = width
-			card.spin = angle
+		var card_idx := 0
+		var bcards := beam.cards
+		if not beam.start_specs.is_empty():
+			var s_spec: Array = beam.start_specs[randi() % beam.start_specs.size()]
+			if _beam_step_card(beam, card_idx, s_spec, beam.from, -1.0, angle):
+				card_idx += 1
+		var has_head := not beam.head_specs.is_empty()
+		var has_tail := not beam.tail_specs.is_empty()
+		for i in n:
+			var specs: Array = beam.body_specs
+			if i == 0 and has_head:
+				specs = beam.head_specs
+			elif i == n - 1 and n > 1 and has_tail:
+				specs = beam.tail_specs
+			var spec: Array = specs[i % specs.size()]
+			if not spec.is_empty() and card_idx < bcards.size() and bcards[card_idx][1] == spec[4]:
+				var card: SpriteFx.Card = bcards[card_idx][0]
+				card.pos = beam.from + span * ((i + 0.5) / n)
+				card.size0 = seg_w
+				card.size1 = seg_w
+				card.spin = angle
+				card_idx += 1
+			elif _beam_step_card(beam, card_idx, spec, beam.from + span * ((i + 0.5) / n), seg_w, angle):
+				card_idx += 1
+		if not beam.ending_specs.is_empty():
+			var e_spec: Array = beam.ending_specs[randi() % beam.ending_specs.size()]
+			if _beam_step_card(beam, card_idx, e_spec, beam.to, -1.0, angle):
+				card_idx += 1
+		while bcards.size() > card_idx:
+			sprites.kill(bcards.pop_back()[0])
 
 
 # --- On the ground ----------------------------------------------------------------------------------
@@ -1414,7 +1876,7 @@ func _on_ground(msg: Dictionary) -> void:
 			if int(l[i + 4]) >= 0:
 				g.ttl = int(l[i + 4]) / TICKS
 		i += 5
-	for id in _ground.keys():
+	for id in _ground:
 		var g: Ground = _ground[id]
 		if g.seen != mark and g.gone < 0.0:
 			g.gone = 0.0
@@ -1497,8 +1959,12 @@ func _new_ground(name: String, at: Vector3, id := 0) -> Ground:
 
 
 func _update_ground(delta: float) -> void:
+	if _ground.is_empty():
+		return
 	var smoke_rate := 1.5
-	for id in _ground.keys():
+	var opt := fx_opt
+	_dead_ids.clear()
+	for id in _ground:
 		var g: Ground = _ground[id]
 		var a := clampf((_clock - g.born) / maxf(g.fade_in, 0.01), 0.0, 1.0)
 		if g.ttl >= 0.0:
@@ -1509,17 +1975,40 @@ func _update_ground(delta: float) -> void:
 			a *= clampf(1.0 - g.gone / g.fade_out, 0.0, 1.0)
 			if g.gone >= g.fade_out:
 				_drop_cards(g.cards)
-				_ground.erase(id)
+				_dead_ids.append(id)
 				continue
 		for entry: Array in g.cards:
 			var c: SpriteFx.Card = entry[0]
 			c.color.a = float(entry[1]) * a
-			c.age = minf(c.age, 3000.0)
+			if c.age > 3000.0:
+				c.age = 3000.0
 		if g.fire and a > 0.3 and randf() < delta * smoke_rate:
-			_smoke("soft-fire-smoke", g.pos + Vector3(randf_range(-0.2, 0.2), 1.0, randf_range(-0.2, 0.2)), Vector3(0.1, 0.5, 0.05))
+			var tscale := _trail_scale(g.pos) if opt else 1.0
+			if tscale > 0.0 and (tscale >= 1.0 or randf() < tscale):
+				_smoke("soft-fire-smoke", g.pos + Vector3(randf_range(-0.2, 0.2), 1.0, randf_range(-0.2, 0.2)), Vector3(0.1, 0.5, 0.05))
+	for id in _dead_ids:
+		_ground.erase(id)
 
 
 # --- Lights -----------------------------------------------------------------------------------------
+
+func _push_want(pos: Vector3, col: Color, energy: float, r: float) -> int:
+	var idx := _light_wants.size()
+	var w: Array
+	if idx < _want_pool.size():
+		w = _want_pool[idx]
+		w[0] = pos
+		w[1] = col
+		w[2] = energy
+		w[3] = r
+		w[4] = false
+		w[5] = 0.0
+	else:
+		w = [pos, col, energy, r, false, 0.0]
+		_want_pool.append(w)
+	_light_wants.append(w)
+	return idx
+
 
 ## The nearest few of everything that lights its surroundings: explosions as they burn out,
 ## rockets and grenades in flight, fires.
@@ -1527,36 +2016,60 @@ func _update_lights(delta: float) -> void:
 	if not CombatLights.old:
 		_update_combat_lights(delta)
 		return
-	var wants: Array = []  # [position, colour, energy, range, whether the hills are still to be added]
-	for i in range(_flashes.size() - 1, -1, -1):
+	var wants := _light_wants
+	wants.clear()
+	var fn := _flashes.size()
+	var i := 0
+	while i < fn:
 		var fl: Array = _flashes[i]
-		fl[4] = float(fl[4]) + delta
-		if float(fl[4]) >= float(fl[5]):
-			_flashes.remove_at(i)
+		var age := float(fl[4]) + delta
+		fl[4] = age
+		if age >= float(fl[5]):
+			fn -= 1
+			if i < fn:
+				_flashes[i] = _flashes[fn]
+			_flashes.pop_back()
+			if int(fl[7]) != 0:
+				_muzzle_flashes.erase(int(fl[7]))
 			continue
-		var t := float(fl[4]) / float(fl[5])
-		wants.append([fl[0], fl[1], float(fl[2]) * (1.0 - t), maxf(float(fl[3]), FLASH_MIN_RANGE), false])
-	for f: Flyer in _flying.values():
-		var l = f.rec.get("l")
-		if l is Array and l.size() >= 3 and not f.cards.is_empty():
-			var col: Array = l[2]
-			wants.append([(f.cards[0][0] as SpriteFx.Card).pos, Color(float(col[0]), float(col[1]), float(col[2])), float(l[0]) * 1.5, clampf(float(l[1]) * 0.5, 1.5, 8.0), true])
-	for g: Ground in _ground.values():
+		var t := age / float(fl[5])
+		_push_want(fl[0], fl[1], float(fl[2]) * (1.0 - t), maxf(float(fl[3]), FLASH_MIN_RANGE))
+		i += 1
+	var hills_on := GroundHeight.is_on()
+	var hills_v := GroundHeight.version()
+	for id in _flying:
+		var f: Flyer = _flying[id]
+		if not f.light_checked:
+			_cache_flyer_light(f)
+		if f.has_light and not f.cards.is_empty():
+			var pos: Vector3 = (f.cards[0][0] as SpriteFx.Card).pos
+			if hills_on:
+				var pxz := Vector2(pos.x, pos.z)
+				if f.hills_v != hills_v or f.hills_pos.distance_squared_to(pxz) >= 0.25:
+					f.hills_v = hills_v
+					f.hills_pos = pxz
+					f.hills = GroundHeight.at(pos.x, pos.z)
+				pos = Vector3(pos.x, pos.y + f.hills, pos.z)
+			_push_want(pos, f.light_col, f.light_energy * 1.5, clampf(f.light_range * 0.5, 1.5, 8.0))
+	for id in _ground:
+		var g: Ground = _ground[id]
 		if g.fire and not g.cards.is_empty():
 			var c: SpriteFx.Card = g.cards[0][0]
-			if g.hills_v != GroundHeight.version():
-				g.hills_v = GroundHeight.version()
-				g.hills = GroundHeight.at(g.pos.x, g.pos.z)
-			wants.append([g.pos + Vector3(0, 0.8 + g.hills, 0), Color(1.0, 0.55, 0.2), 2.0 * c.color.a, 7.0, false])
+			if g.hills_v != hills_v:
+				g.hills_v = hills_v
+				g.hills = GroundHeight.at(g.pos.x, g.pos.z) if hills_on else 0.0
+			_push_want(Vector3(g.pos.x, g.pos.y + 0.8 + g.hills, g.pos.z), Color(1.0, 0.55, 0.2), 2.0 * c.color.a, 7.0)
 	var centre := avatar.position if avatar != null else Vector3.ZERO
 	if wants.size() > MAX_LIGHTS:
-		wants.sort_custom(func(a, b): return (a[0] as Vector3).distance_squared_to(centre) < (b[0] as Vector3).distance_squared_to(centre))
-	for i in MAX_LIGHTS:
-		var light: OmniLight3D = _lights[i]
+		for w: Array in wants:
+			w[5] = (w[0] as Vector3).distance_squared_to(centre)
+		wants.sort_custom(_by_score)
+	for li in MAX_LIGHTS:
+		var light: OmniLight3D = _lights[li]
 		light.shadow_enabled = false
-		if i < wants.size():
-			var w: Array = wants[i]
-			light.position = GroundHeight.lift(w[0]) if w[4] else w[0]
+		if li < wants.size():
+			var w: Array = wants[li]
+			light.position = w[0]
 			light.light_color = w[1]
 			light.light_energy = w[2]
 			light.omni_range = w[3]
@@ -1577,44 +2090,111 @@ func _flicker(phase: float) -> float:
 ## the screen (brightness and reach against the distance to the camera).
 func _update_combat_lights(delta: float) -> void:
 	var gain := CombatLights.strength
-	var wants: Array = []  # [position (lifted), colour, energy, range, unused, score]
-	for i in range(_flashes.size() - 1, -1, -1):
-		var fl: Array = _flashes[i]
-		fl[4] = float(fl[4]) + delta
-		if float(fl[4]) >= float(fl[5]):
-			_flashes.remove_at(i)
+	var wants := _light_wants
+	wants.clear()
+	var fn := _flashes.size()
+	var fi := 0
+	while fi < fn:
+		var fl: Array = _flashes[fi]
+		var age := float(fl[4]) + delta
+		fl[4] = age
+		if age >= float(fl[5]):
+			fn -= 1
+			if fi < fn:
+				_flashes[fi] = _flashes[fn]
+			_flashes.pop_back()
+			if int(fl[7]) != 0:
+				_muzzle_flashes.erase(int(fl[7]))
 			continue
-		var k := 1.0 - float(fl[4]) / float(fl[5])
+		var k := 1.0 - age / float(fl[5])
 		if bool(fl[6]):
 			k *= k  # an explosion: a bright flash, then a long dim tail
-		wants.append([fl[0], fl[1], float(fl[2]) * k * gain, maxf(float(fl[3]), FLASH_MIN_RANGE), false, 0.0])
-	for f: Flyer in _flying.values():
-		var l = f.rec.get("l")
-		if l is Array and l.size() >= 3 and not f.cards.is_empty():
-			var col: Array = l[2]
-			wants.append([GroundHeight.lift((f.cards[0][0] as SpriteFx.Card).pos), Color(float(col[0]), float(col[1]), float(col[2])),
-				float(l[0]) * 2.5 * gain, clampf(float(l[1]) * 0.8, 3.0, 10.0), false, 0.0])
-	var flames := wants.size()
-	for st: Stream in _streams.values():
-		if not st.alive or not st.lead or st.custom or not st.name.contains("flamethrower") or st.from == Vector3.ZERO:
-			continue
-		var phase := float(st.shooter_unit % 97) * 0.37 + st.pos.x * 0.3
-		var land := GroundHeight.lift(st.to + Vector3(0, 1.5, 0))
-		# Over the middle of the drawn arc (its top), a little under it.
-		var arc := 0.0 if flame_streams_old else _arc_top(st, Vector2(st.to.x - st.from.x, st.to.z - st.from.z).length() / maxf(float(st.rec.get("hs", 0.25)), 0.01))
-		var mid := GroundHeight.lift(st.from.lerp(st.to, 0.5) + Vector3(0, 0.8 + maxf(arc - 0.6, 0.0), 0))
-		var near := false
-		for j in range(flames, wants.size()):
-			if (wants[j][0] as Vector3).distance_squared_to(mid) < 9.0:
-				near = true
-				break
-		if near:
-			continue
-		wants.append([mid, FIRE_COLOUR, float(STREAM_MID_LIGHT[0]) * gain * _flicker(phase), float(STREAM_MID_LIGHT[1]), false, 0.0])
-		if not st.turret_lit:
-			wants.append([land, FIRE_COLOUR, float(STREAM_LAND_LIGHT[0]) * gain * _flicker(phase + 1.7), float(STREAM_LAND_LIGHT[1]), false, 0.0])
+		_push_want(fl[0], fl[1], float(fl[2]) * k * gain, maxf(float(fl[3]), FLASH_MIN_RANGE))
+		fi += 1
+	var hills_on := GroundHeight.is_on()
+	var hills_v := GroundHeight.version()
+	for id in _flying:
+		var f: Flyer = _flying[id]
+		if not f.light_checked:
+			_cache_flyer_light(f)
+		if f.has_light and not f.cards.is_empty():
+			var pos: Vector3 = (f.cards[0][0] as SpriteFx.Card).pos
+			if hills_on:
+				var pxz := Vector2(pos.x, pos.z)
+				if f.hills_v != hills_v or f.hills_pos.distance_squared_to(pxz) >= 0.25:
+					f.hills_v = hills_v
+					f.hills_pos = pxz
+					f.hills = GroundHeight.at(pos.x, pos.z)
+				pos = Vector3(pos.x, pos.y + f.hills, pos.z)
+			_push_want(pos, f.light_col, f.light_energy * 2.5 * gain, clampf(f.light_range * 0.8, 3.0, 10.0))
+	if not _streams.is_empty():
+		_stream_cells.clear()
+		for id in _streams:
+			var st: Stream = _streams[id]
+			if not st.alive or not st.lead or st.custom or not st.name.contains("flamethrower") or st.from == Vector3.ZERO:
+				continue
+			if not st.rec_cached:
+				_cache_stream_rec(st)
+			var phase := float(st.shooter_unit % 97) * 0.37 + st.pos.x * 0.3
+			var dx := st.to.x - st.from.x
+			var dz := st.to.z - st.from.z
+			var arc := 0.0 if flame_streams_old else _arc_top(st, sqrt(dx * dx + dz * dz) / st.hs)
+			var mid_x := (st.from.x + st.to.x) * 0.5
+			var mid_y := (st.from.y + st.to.y) * 0.5 + 0.8 + maxf(arc - 0.6, 0.0)
+			var mid_z := (st.from.z + st.to.z) * 0.5
+			var land_x := st.to.x
+			var land_y := st.to.y + 1.5
+			var land_z := st.to.z
+			if hills_on:
+				var l2 := Vector2(land_x, land_z)
+				var m2 := Vector2(mid_x, mid_z)
+				if st.hills_v != hills_v or st.land_at.distance_squared_to(l2) >= 0.25 or st.mid_at.distance_squared_to(m2) >= 0.25:
+					st.hills_v = hills_v
+					st.land_at = l2
+					st.mid_at = m2
+					st.land_hills = GroundHeight.at(land_x, land_z)
+					st.mid_hills = GroundHeight.at(mid_x, mid_z)
+				land_y += st.land_hills
+				mid_y += st.mid_hills
+			var mid := Vector3(mid_x, mid_y, mid_z)
+			var cx := floori(mid_x / 3.0)
+			var cz := floori(mid_z / 3.0)
+			var near := false
+			if not _stream_cells.is_empty():
+				for oz in range(-1, 2):
+					for ox in range(-1, 2):
+						var bucket = _stream_cells.get(Vector2i(cx + ox, cz + oz))
+						if bucket == null:
+							continue
+						for j: int in bucket:
+							if (wants[j][0] as Vector3).distance_squared_to(mid) < STREAM_LIGHT_MERGE_SQ:
+								near = true
+								break
+						if near:
+							break
+					if near:
+						break
+			if near:
+				continue
+			var mid_idx := _push_want(mid, FIRE_COLOUR, float(STREAM_MID_LIGHT[0]) * gain * _flicker(phase), float(STREAM_MID_LIGHT[1]))
+			var scell := Vector2i(cx, cz)
+			var sbucket = _stream_cells.get(scell)
+			if sbucket == null:
+				_stream_cells[scell] = [mid_idx]
+			else:
+				(sbucket as Array).append(mid_idx)
+			if not st.turret_lit:
+				var land := Vector3(land_x, land_y, land_z)
+				var land_idx := _push_want(land, FIRE_COLOUR, float(STREAM_LAND_LIGHT[0]) * gain * _flicker(phase + 1.7), float(STREAM_LAND_LIGHT[1]))
+				var lcell := Vector2i(floori(land_x / 3.0), floori(land_z / 3.0))
+				var lbucket = _stream_cells.get(lcell)
+				if lbucket == null:
+					_stream_cells[lcell] = [land_idx]
+				else:
+					(lbucket as Array).append(land_idx)
 	_fire_cells.clear()
-	for g: Ground in _ground.values():
+	for id in _ground:
+		var g: Ground = _ground[id]
 		if not g.fire or g.cards.is_empty():
 			continue
 		var c: SpriteFx.Card = g.cards[0][0]
@@ -1627,14 +2207,13 @@ func _update_combat_lights(delta: float) -> void:
 			w[2] = minf(float(w[2]) + float(FIRE_LIGHT[0]) * 0.35 * a * gain, float(FIRE_LIGHT_MAX[0]) * gain)
 			w[3] = minf(float(w[3]) + 0.5, float(FIRE_LIGHT_MAX[1]))
 			continue
-		if g.hills_v != GroundHeight.version():
-			g.hills_v = GroundHeight.version()
-			g.hills = GroundHeight.at(g.pos.x, g.pos.z)
-		_fire_cells[cell] = wants.size()
-		wants.append([g.pos + Vector3(0, 1.2 + g.hills, 0), FIRE_COLOUR, float(FIRE_LIGHT[0]) * a * gain * _flicker(g.pos.x * 1.3 + g.pos.z * 0.7),
-			float(FIRE_LIGHT[1]), false, 0.0])
+		if g.hills_v != hills_v:
+			g.hills_v = hills_v
+			g.hills = GroundHeight.at(g.pos.x, g.pos.z) if hills_on else 0.0
+		_fire_cells[cell] = _push_want(Vector3(g.pos.x, g.pos.y + 1.2 + g.hills, g.pos.z), FIRE_COLOUR,
+			float(FIRE_LIGHT[0]) * a * gain * _flicker(g.pos.x * 1.3 + g.pos.z * 0.7), float(FIRE_LIGHT[1]))
 	var count := _lights.size()
-	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+	var cam := _cam if _cam_ready else (get_viewport().get_camera_3d() if is_inside_tree() else null)
 	var eye := cam.global_position if cam != null else (avatar.position if avatar != null else Vector3.ZERO)
 	if wants.size() > count:
 		for w: Array in wants:
@@ -1662,23 +2241,70 @@ func _update_combat_lights(delta: float) -> void:
 var process_usec := 0
 
 
+func _refresh_cam() -> void:
+	var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+	_cam = cam
+	_cam_ready = true
+	if cam != null:
+		_cam_pos = cam.global_position
+		var b := cam.global_transform.basis
+		_cam_bx = b.x
+		_cam_by = b.y
+		_cam_bz = b.z.normalized()
+		if fx_opt:
+			var raw := cam.get_frustum()
+			_cam_planes.clear()
+			for idx in raw.size():
+				if idx != 1:
+					_cam_planes.append(raw[idx])
+		else:
+			_cam_planes.clear()
+	else:
+		_cam_planes.clear()
+
+
 func _process(delta: float) -> void:
 	_clock += delta
 	if sprites == null:
 		return
 	var t0 := Time.get_ticks_usec()
+	_refresh_cam()
 	if not _pending.is_empty():
 		_finish_pools()
 	var now := Time.get_ticks_msec()
-	while not _recent.is_empty() and now - int(_recent[0][2]) > DEDUP_SECONDS * 1000.0:
-		_recent.pop_front()
-	_update_flyers(delta)
+	if not _recent.is_empty():
+		var cutoff := now - int(DEDUP_SECONDS * 1000.0)
+		var keep := 0
+		var rsize := _recent.size()
+		while keep < rsize and int(_recent[keep][2]) <= cutoff:
+			keep += 1
+		if keep >= rsize:
+			_recent.clear()
+			_recent_cells.clear()
+		elif keep > 0:
+			for idx in range(keep):
+				var exp_entry: Array = _recent[idx]
+				var cell := _recent_cell(exp_entry[1] as Vector2)
+				var bucket = _recent_cells.get(cell)
+				if bucket is Array:
+					var barr := bucket as Array
+					var bpos := barr.find(exp_entry)
+					if bpos >= 0:
+						var blast := barr.size() - 1
+						if bpos < blast:
+							barr[bpos] = barr[blast]
+						barr.pop_back()
+						if barr.is_empty():
+							_recent_cells.erase(cell)
+			_recent = _recent.slice(keep)
+	_update_flyers(delta, now)
 	_update_streams(delta)
 	_update_beams()
 	_update_tracers(delta)
 	_update_ground(delta)
 	_update_casings()
 	_update_lights(delta)
+	_cam_ready = false
 	process_usec = Time.get_ticks_usec() - t0
 
 
@@ -1916,19 +2542,30 @@ func _drop_cards(cards: Array) -> void:
 ## `dir` (world) as seen on screen, as a card's spin: so the sprite's up (`along_x` false: rockets,
 ## pellets) or its width (`along_x`: beams) points along it.
 func _screen_angle(dir: Vector3, along_x: bool) -> float:
-	var cam := get_viewport().get_camera_3d()
-	if cam == null:
+	var bx := _cam_bx
+	var by := _cam_by
+	if not _cam_ready:
+		var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+		if cam == null:
+			return 0.0
+		var b := cam.global_transform.basis
+		bx = b.x
+		by = b.y
+	elif _cam == null:
 		return 0.0
-	var b := cam.global_transform.basis
-	var sx := dir.dot(b.x)
-	var sy := dir.dot(b.y)
+	var sx := dir.dot(bx)
+	var sy := dir.dot(by)
 	return atan2(sy, sx) if along_x else atan2(-sx, sy)
 
 
 ## `v` with the part along the camera's view taken out: its length is how long it looks.
 func _projected(v: Vector3) -> Vector3:
-	var cam := get_viewport().get_camera_3d()
-	if cam == null:
+	var view := _cam_bz
+	if not _cam_ready:
+		var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
+		if cam == null:
+			return v
+		view = cam.global_transform.basis.z.normalized()
+	elif _cam == null:
 		return v
-	var view := cam.global_transform.basis.z.normalized()
 	return v - view * v.dot(view)

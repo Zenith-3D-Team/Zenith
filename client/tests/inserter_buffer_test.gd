@@ -260,7 +260,7 @@ func _test_dispatch_caching_and_scratch() -> void:
 	var cached_mode: int = arm.mode
 	check(cached_mode != InserterArmsScript.Arm.Mode.NONE, "arm dispatch mode cached after frame 1 (mode %d)" % cached_mode)
 	check(arm.mode_pack_ver == ModelLibrary.ModelPacks.version, "arm pack version cached")
-	var current_gen: int = ModelLibrary.generation
+	var current_gen: int = arms._model_ver()  # (--arm-model-watch: the layer's own stamp)
 	check(arm.mode_model_ver == current_gen, "arm model version cached")
 
 	# Process frame 2: mode stays identical
@@ -290,11 +290,14 @@ func _test_dispatch_caching_and_scratch() -> void:
 	check(not arms._scratch_held_yaws.has(999), "_scratch_held_yaws cleared at start of _process()")
 	check(not arms._scratch_live.has(999), "_scratch_live cleared at start of _process()")
 
-	# Test invalidation on model generation bump
+	# Test invalidation on model generation bump (--arm-model-watch: taken by the safety net here, nothing watched)
 	ModelLibrary.generation += 1
+	arms._watch_pending = true
+	arms._watch_pend_msec = Time.get_ticks_msec() - InserterArmsScript.WATCH_NET_MSEC  # (unaccepted for 2 s)
+	arms._ver_frame = -1  # (a new frame for the per-frame latch)
 	arms._process(1.0 / 60.0)
-	var new_gen: int = ModelLibrary.generation
-	check(arm.mode_model_ver == new_gen, "arm dispatch re-evaluated on generation bump")
+	var new_gen: int = arms._model_ver()
+	check(arm.mode_model_ver == new_gen and new_gen > current_gen, "arm dispatch re-evaluated on generation bump (arm %d, now %d, before %d)" % [arm.mode_model_ver, new_gen, current_gen])
 
 	# Test reset()
 	arms.reset()

@@ -123,6 +123,123 @@ local function on_rail(surface, position, direction)
   return { x = best.position.x, y = best.position.y }, facing
 end
 
+-- Rail signals and train stops snap to the track as a player's cursor does: Factorio puts a signal
+-- on the side of the rail the cursor is on, facing along it, and turns a stop to the rail, whatever
+-- direction the client holds (create_entity takes the position and direction as given and refuses
+-- all but one side and way). The spots round the cursor are tried nearest first with the game's
+-- own placement check; a stop must also join a rail when one is near (it stands free otherwise).
+local RAIL_SNAP = { ["rail-signal"] = true, ["rail-chain-signal"] = true, ["train-stop"] = true }
+local ALL_RAIL_TYPE_LIST = {
+  "straight-rail", "half-diagonal-rail", "curved-rail-a", "curved-rail-b",
+  "legacy-straight-rail", "legacy-curved-rail",
+  "elevated-straight-rail", "elevated-half-diagonal-rail", "elevated-curved-rail-a", "elevated-curved-rail-b",
+  "rail-ramp",
+}
+local cached_all_rail_types
+local function all_rail_types()
+  if cached_all_rail_types then
+    return cached_all_rail_types
+  end
+  local present = {}
+  for _, p in pairs(prototypes.entity) do
+    present[p.type] = true
+  end
+  local list = {}
+  for _, t in ipairs(ALL_RAIL_TYPE_LIST) do
+    if present[t] then
+      list[#list + 1] = t
+    end
+  end
+  cached_all_rail_types = list
+  return list
+end
+
+local function can_snap_spot(surface, proto, x, y, d, force, check_type, stop, ghost)
+  if not surface.can_place_entity({ name = proto.name, position = { x = x, y = y },
+      direction = d, force = force, build_check_type = check_type }) then
+    return false
+  end
+  if not stop then
+    return true
+  end
+  if ghost then
+    local g = surface.create_entity({ name = "entity-ghost", inner_name = proto.name,
+      position = { x = x, y = y }, direction = d, force = force })
+    if not g then
+      return false
+    end
+    local ok, rail = pcall(function() return g.connected_rail end)
+    g.destroy()
+    return ok and rail ~= nil
+  end
+  local e = surface.create_entity({ name = proto.name, position = { x = x, y = y }, direction = d, force = force })
+  if not e then
+    return false
+  end
+  local ok, rail = pcall(function() return e.connected_rail end)
+  e.destroy()
+  return ok and rail ~= nil
+end
+
+local STOP_DIRS = { 0, 4, 8, 12 }
+local SIGNAL_DIRS = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }
+
+local function snap_to_rail(surface, proto, at, wanted, force, ghost)
+  local stop = proto.type == "train-stop"
+  local types = stop and registry.rail_types() or all_rail_types()
+  if #types == 0 then
+    return nil
+  end
+  local near = surface.find_entities_filtered({
+    area = { { at.x - 4, at.y - 4 }, { at.x + 4, at.y + 4 } }, type = types, limit = 1,
+  })
+  if #near == 0 then
+    if not ghost then
+      return nil
+    end
+    local near_ghost = surface.find_entities_filtered({
+      area = { { at.x - 4, at.y - 4 }, { at.x + 4, at.y + 4 } }, type = "entity-ghost", limit = 1,
+    })
+    if #near_ghost == 0 then
+      return nil
+    end
+  end
+  local check_type = ghost and defines.build_check_type.manual_ghost or defines.build_check_type.manual
+  local ex, ey = snap(at.x, proto.tile_width, 1), snap(at.y, proto.tile_height, 1)
+  if can_snap_spot(surface, proto, ex, ey, wanted, force, check_type, stop, ghost) then
+    return { x = ex, y = ey }, wanted
+  end
+  local spots = {}
+  local r = stop and 3 or 2
+  local dirs = stop and STOP_DIRS or SIGNAL_DIRS
+  for dx = -r, r do
+    for dy = -r, r do
+      local x, y = snap(at.x + dx, proto.tile_width, 1), snap(at.y + dy, proto.tile_height, 1)
+      for _, d in ipairs(dirs) do
+        local dist = distance(at, { x = x, y = y }) + (d == wanted and 0 or 0.01)
+        spots[#spots + 1] = { x = x, y = y, d = d, dist = dist }
+      end
+    end
+  end
+  table.sort(spots, function(a, b)
+    if a.dist ~= b.dist then return a.dist < b.dist end
+    if a.x ~= b.x then return a.x < b.x end
+    if a.y ~= b.y then return a.y < b.y end
+    return a.d < b.d
+  end)
+  local seen = {}
+  for _, sp in ipairs(spots) do
+    local key = sp.x .. "," .. sp.y .. "," .. sp.d
+    if not seen[key] then
+      seen[key] = true
+      if can_snap_spot(surface, proto, sp.x, sp.y, sp.d, force, check_type, stop, ghost) then
+        return { x = sp.x, y = sp.y }, sp.d
+      end
+    end
+  end
+  return nil
+end
+
 -- The entity of the same prototype standing exactly there, if any.
 local function same_entity(surface, proto, position)
   for _, e in pairs(surface.find_entities_filtered({
@@ -386,6 +503,32 @@ local function refusal(surface, proto, position, force)
   return "Can't place that there"
 end
 
+local function footprint_box(proto, position, direction)
+  local w, h = proto.tile_width, proto.tile_height
+  if direction == defines.direction.east or direction == defines.direction.west then
+    w, h = h, w
+  end
+  local hx, hy = math.max(w / 2 - 0.05, 0.05), math.max(h / 2 - 0.05, 0.05)
+  return { { position.x - hx, position.y - hy }, { position.x + hx, position.y + hy } }
+end
+
+local function destroy_colliding_ghosts(surface, proto, position, direction, force)
+  if string.sub(proto.type or "", 1, 9) == "elevated-" or (proto.tile_width or 0) <= 0 or (proto.tile_height or 0) <= 0 then
+    return
+  end
+  local box = footprint_box(proto, position, direction)
+  for _, g in pairs(surface.find_entities_filtered({ area = box, type = "entity-ghost", force = force })) do
+    if g.valid and string.sub(g.ghost_type or "", 1, 9) ~= "elevated-" then
+      local removal = tracker.removal_message(g)
+      local gp = g.position
+      g.destroy()
+      if removal then
+        transport.send_reliable_priority(removal, math.floor(gp.x / 32), math.floor(gp.y / 32))
+      end
+    end
+  end
+end
+
 -- A ghost of the entity for robots to build (Shift+click, or a pipette with none in the
 -- inventory), like a player's; no reach limit and no item needed. Super-forced (Ctrl+Shift+click)
 -- marks what stands in the way for deconstruction and puts the ghost there anyway, as 2.x does.
@@ -406,18 +549,26 @@ local function build_ghost(c, proto, position, direction, mirror, super)
     spec.type = underground_type(surface, proto, position, direction)
   end
   if super and not can_place(surface, proto, position, direction, c.force, defines.build_check_type.manual_ghost) then
-    local w, h = proto.tile_width, proto.tile_height
+    local w, h = proto.tile_width or 0, proto.tile_height or 0
     if direction == defines.direction.east or direction == defines.direction.west then
       w, h = h, w
     end
-    surface.deconstruct_area({ area = { { position.x - w / 2 + 0.1, position.y - h / 2 + 0.1 },
-      { position.x + w / 2 - 0.1, position.y + h / 2 - 0.1 } }, force = c.force })
+    if w > 0 and h > 0 then
+      local area = { { position.x - w / 2 + 0.1, position.y - h / 2 + 0.1 },
+        { position.x + w / 2 - 0.1, position.y + h / 2 - 0.1 } }
+      tracker.deconstructing(surface, area, c.force, function()
+        surface.deconstruct_area({ area = area, force = c.force })
+      end)
+    end
     if surface.create_entity(spec) then
       return
     end
   end
-  if not can_place(surface, proto, position, direction, c.force, defines.build_check_type.manual)
-      or not surface.create_entity(spec) then
+  if not can_place(surface, proto, position, direction, c.force, defines.build_check_type.manual) then
+    return puppet.message(refusal(surface, proto, position, c.force))
+  end
+  destroy_colliding_ghosts(surface, proto, position, direction, c.force)
+  if not surface.create_entity(spec) then
     puppet.message(refusal(surface, proto, position, c.force))
   end
 end
@@ -459,6 +610,12 @@ function M.build(cmd)
     position, direction = on_rail(surface, { x = fx / 256, y = fy / 256 }, direction)
     if not position then
       return puppet.message("Rolling stock goes on rails")
+    end
+  end
+  if RAIL_SNAP[proto.type] then
+    local at, facing = snap_to_rail(surface, proto, { x = fx / 256, y = fy / 256 }, direction, c.force, cmd.ghost == 1)
+    if at then
+      position, direction = at, facing
     end
   end
   if cmd.ghost == 1 then
@@ -510,22 +667,24 @@ function M.build(cmd)
     return
   end
 
-  local spec = { name = proto.name, position = position, direction = direction, force = c.force, raise_built = true }
+  local olds = replaced_entities(surface, proto, position, w, h)
+  local build_dir = direction
+
+  local spec = { name = proto.name, position = position, direction = build_dir, force = c.force, raise_built = true }
   if cmd.m == 1 then
     spec.mirror = true
   end
   if proto.type == "underground-belt" then
-    spec.type = underground_type(surface, proto, position, direction)
+    spec.type = underground_type(surface, proto, position, build_dir)
   end
   if quality ~= "normal" then
     spec.quality = quality
   end
   -- Fast-replace first: can_place_entity also answers true where the entity would replace what
   -- stands there (2.1), but create_entity without fast_replace then builds nothing.
-  local olds = replaced_entities(surface, proto, position, w, h)
   local entity
   local upgrade = false
-  if #olds > 0 and surface.can_fast_replace({ name = proto.name, position = position, direction = direction, force = c.force }) then
+  if #olds > 0 and surface.can_fast_replace({ name = proto.name, position = position, direction = build_dir, force = c.force }) then
     -- Fast-replace without a player: the old entities' items are ours to hand back, and their
     -- removal ours to report (the game raises no destroy event for them).
     local gone = {}
@@ -543,6 +702,7 @@ function M.build(cmd)
     else
       spec.spill = false
     end
+    destroy_colliding_ghosts(surface, proto, position, build_dir, c.force)
     entity = surface.create_entity(spec)
     if entity then
       for _, g in ipairs(gone) do
@@ -563,9 +723,10 @@ function M.build(cmd)
       end
     end
   elseif surface.can_place_entity({
-    name = proto.name, position = position, direction = direction, force = c.force,
+    name = proto.name, position = position, direction = build_dir, force = c.force,
     build_check_type = defines.build_check_type.manual,
   }) then
+    destroy_colliding_ghosts(surface, proto, position, build_dir, c.force)
     entity = surface.create_entity(spec)
   else
     -- Space Age: the planet's pressure, gravity or magnetic field may be what forbids it.

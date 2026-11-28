@@ -12,6 +12,7 @@ const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const Looks := preload("res://scripts/world/looks.gd")
 const NatureLooks := preload("res://scripts/world/nature_looks.gd")
 const Wire := preload("res://scripts/util/wire.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 const CHUNK := 32
 
@@ -98,7 +99,7 @@ class LodChunk extends RefCounted:
 		## Returns Vector3i(cat, prio, glow).
 		if proto_type == "" and proto_name == "":
 			return Vector3i(CAT_NONE, 0, 0)
-		if _SKIP_TYPES.has(proto_type) or ProtoDB.NEVER_PLACED.has(proto_type) or ModelLibrary.hidden(proto_name):
+		if _SKIP_TYPES.has(proto_type) or (proto_type != "resource" and ProtoDB.NEVER_PLACED.has(proto_type)) or ModelLibrary.hidden(proto_name):
 			return Vector3i(CAT_NONE, 0, 0)
 		var cat := CAT_BUILDING
 		var prio := 5
@@ -142,8 +143,74 @@ class LodChunk extends RefCounted:
 			glow = 1
 		return Vector3i(cat, prio, glow)
 
+	## `--native-lod-decode=off`: a `lod` message's runs decoded by the GDScript below (as before), even
+	## when the C++ library has WireDecodeNative.lod_cells (the default; same cells and refusals,
+	## tests/lod_decode_native_test.gd). On, MessageDecode.prepare decodes them on the parse thread
+	## (`_lod`); without that (`--decode-thread=off`, the LOD cache) from_msg calls it here.
+	static var native_enabled := Switches.on("--native-lod-decode")
+	static var _native: RefCounted = null
+
+	## The C++ decoder, or null (switched off or the extension not loaded). Stateless: one per thread.
+	static func native_decoder() -> RefCounted:
+		if not native_enabled:
+			return null
+		if _native == null and ClassDB.class_exists("WireDecodeNative"):
+			_native = ClassDB.instantiate("WireDecodeNative")
+		return _native
+
+	## `_lod` (MessageDecode.prepare) when it is three lists of `total` cells, else [].
+	static func _predecoded(msg: Dictionary, total: int) -> Array:
+		var pre_v: Variant = msg.get("_lod")
+		if not (pre_v is Array):
+			return []
+		var pre: Array = pre_v
+		if pre.size() != 3 or not (pre[0] is PackedInt32Array and pre[1] is PackedInt32Array and pre[2] is PackedByteArray):
+			return []
+		var t: PackedInt32Array = pre[0]
+		var p: PackedInt32Array = pre[1]
+		var f: PackedByteArray = pre[2]
+		if t.size() != total or p.size() != total or f.size() != total:
+			return []
+		return pre
+
 	## Decodes a JSON/binary `lod` chunk message (`{"cx","cy","res","rv","tl","el"}`).
 	static func from_msg(msg: Dictionary) -> LodChunk:
+		var none_v: Variant = msg.get("none", false)
+		if none_v:
+			return null
+		var res_v: Variant = msg.get("res", 0)
+		if not _is_num(res_v):
+			return null
+		var r := int(res_v)
+		if not _valid_res(r):
+			return null
+		var cx_v: Variant = msg.get("cx", 0)
+		var cy_v: Variant = msg.get("cy", 0)
+		var rv_v: Variant = msg.get("rv", 0)
+		if not (_is_num(cx_v) and _is_num(cy_v) and _is_num(rv_v)):
+			return null
+		var n := CHUNK / r
+		var total := n * n
+		var cells := _predecoded(msg, total)
+		if cells.is_empty():
+			var nat := native_decoder()
+			if nat == null:
+				return from_msg_gd(msg)
+			cells = nat.lod_cells(msg.get("tl"), msg.get("el"), total)
+			if cells.is_empty():
+				return null
+		var c := LodChunk.new()
+		c.cx = int(cx_v)
+		c.cy = int(cy_v)
+		c.res = r
+		c.rev = int(rv_v)
+		c.tiles = cells[0]
+		c.protos = cells[1]
+		c.flags = cells[2]
+		return c
+
+	## from_msg as it was: the runs decoded in GDScript (`--native-lod-decode=off`, or no extension).
+	static func from_msg_gd(msg: Dictionary) -> LodChunk:
 		var none_v: Variant = msg.get("none", false)
 		if none_v:
 			return null

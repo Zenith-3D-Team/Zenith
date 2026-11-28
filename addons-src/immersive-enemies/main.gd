@@ -86,10 +86,14 @@ func addon_start(a) -> void:
 	_anim = BiterAnim.new(api)
 	_acid = AcidGoo.new(api, _root)
 
-	var on_bounce_fn := func(pos: Vector3, speed: float, scale: float) -> void:
+	var on_bounce_fn := func(pos: Vector3, speed: float, scale: float, is_gleba := false) -> void:
 		if _gore != null and _gore_on:
-			_gore.spawn_smear(pos, speed, scale)
+			_gore.spawn_smear(pos, speed, scale, is_gleba)
 	_ragdoll.on_bounce = on_bounce_fn
+	var on_gleba_puddle_fn := func(pos: Vector3, scale: float) -> void:
+		if _gore != null and _gore_on:
+			_gore.spawn_gleba_puddle(pos, scale)
+	_ragdoll.on_gleba_puddle = on_gleba_puddle_fn
 	var on_decay_dust_fn := func(pos: Vector3, scale: float) -> void:
 		if _gore != null and _gore_on:
 			_gore.spawn_decay_dust(pos, scale)
@@ -243,6 +247,11 @@ func _is_supported(proto: String) -> bool:
 		or proto.ends_with("-worm-turret")
 		or proto == "biter-spawner"
 		or proto == "spitter-spawner"
+		or proto.contains("-wriggler-pentapod")
+		or proto.ends_with("-strafer-pentapod")
+		or proto.ends_with("-stomper-pentapod")
+		or proto == "gleba-spawner"
+		or proto == "gleba-spawner-small"
 	)
 
 
@@ -513,7 +522,7 @@ func _declare_settings() -> void:
 	var s = api.settings
 	s.add("ragdolls", "bool", true, "Enemy ragdolls", {
 		"section": "Ragdolls",
-		"note": "Replace standard biter, spitter, worm, and nest death collapses with 3D rigid-body ragdolls, spring legs, and burning-to-ash corpses.",
+		"note": "Replace standard biter, spitter, worm, nest, and Gleba pentapod / egg-raft death collapses with 3D rigid-body ragdolls, spring/articulated legs, and burning-to-ash corpses.",
 	})
 	s.add("ragdoll_force", "number", 1.0, "Launch force", {
 		"min": 0.5, "max": 2.0, "step": 0.05,
@@ -536,11 +545,11 @@ func _declare_settings() -> void:
 
 	s.add("gore", "bool", true, "Blood & splatter", {
 		"section": "Blood & Gore",
-		"note": "Directional ichor spray on hit/death for biters, spitters, worms, and nests, live & corpse wounds, ground splatter decals, and ragdoll bounce smears.",
+		"note": "Directional ichor/hemolymph spray on hit/death for Nauvis & Gleba enemies, live & corpse wounds, ground splatter decals, and ragdoll bounce smears.",
 	})
 	s.add("gibs", "bool", true, "Explosive gibs", {
 		"section": "Blood & Gore",
-		"note": "Split biters, spitters, worms, and nests on explosive/overkill kills, detach legs by damage intensity, and spawn 3D bouncing chitin and gore shards.",
+		"note": "Split biters, spitters, worms, nests, wrigglers, strafers, and egg rafts on explosive/overkill kills, detach legs/egg sacs by damage intensity, and spawn 3D bouncing chitin and gore shards.",
 	})
 	s.add("gore_level", "choice", "standard", "Gore level", {
 		"choices": [["Low", "low"], ["Standard", "standard"], ["High", "high"]],
@@ -555,12 +564,12 @@ func _declare_settings() -> void:
 
 	s.add("acid_goo", "bool", true, "Slimy acid goo", {
 		"section": "Acid & Fluids",
-		"note": "Replace flat spitter & worm acid particles with 3D wobbling slime globs, splash crowns, and bubbling swamp-green ground pools.",
+		"note": "Replace flat spitter, worm & stomper acid particles with 3D wobbling slime globs, splash crowns, and bubbling swamp-green ground pools.",
 	})
 
-	s.add("animations", "bool", true, "Reworked biter & spitter animations", {
+	s.add("animations", "bool", true, "Reworked enemy animations", {
 		"section": "Animations",
-		"note": "Tier-weighted gait speed, turn banking, acceleration/lunge pitch, attack boost, and directional hit-flinch for biters and spitters.",
+		"note": "Tier-weighted gait speed, turn banking, acceleration/lunge pitch, attack boost, and directional hit-flinch for biters, spitters, and Gleba wrigglers.",
 	})
 
 	s.add("use_reworked_biters", "bool", true, "Reworked enemy models", {

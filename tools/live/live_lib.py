@@ -15,6 +15,19 @@ if str(TOOLS) not in sys.path:
 import protocol  # noqa: E402
 import rcon  # noqa: E402
 
+
+def utf8_output():
+    """Prints never fail on a character the console's code page lacks (`≥`, `→` under cp1252
+    when stdout is redirected on Windows): UTF-8, anything unencodable replaced."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # not a text stream that can change (a test's capture): left as it is
+
+
+utf8_output()
+
 MOD = "__factorio-3d-bridge__"
 FACTORIO_PORT, CLIENT_PORT = 34200, 34201
 SECOND_CLIENT_PORT = 0

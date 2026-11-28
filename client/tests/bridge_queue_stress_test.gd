@@ -6,6 +6,8 @@ extends Node
 ## 4) Selective NACK recovery (gap send, out-of-order retransmit hit, NACK_MAX_GAP fallback, 250ms timeout + late drop grace, welcome/disconnect clear, --nack=off, --coalesce-updates=off)
 ## 5) WorldMirror _dirty_live preemption, synchronous <512 build, --fast-edit-rebuild=off, and >128 near-first _apply_states_waiting()
 ## 6) belt_items.gd out-of-order near_spool protection (k0 < k square/period and per-lane lm/sl/dl/of guards)
+## 8) --replay-kinds: kept messages (requeue_front) handled in the same order with the switch on and off, the budget's
+##    estimate keyed `replay:<t>` only when on, and the fast lanes' --stutter-probe parts (br_me/br_prio/br_live/br_belt)
 ## 7) --resync-guard: no handshake-stall resync while `ready` waits in the queue, full resyncs back off and
 ##    wait for their welcome, the old session's messages dropped at a new welcome (the second PC's resync loop)
 
@@ -53,6 +55,9 @@ func _run() -> void:
 	await _test_world_dirty_live_and_states_slicing()
 	_test_belt_items_near_spool_guard()
 	_test_resync_guard()
+	_test_replay_kinds()
+	_test_requeue_while_running()
+	_test_drain_head_again()
 
 	Bridge.capture = cap_was
 	TestEnv.clean()
@@ -143,6 +148,24 @@ func _int_array(raw: Variant) -> Array:
 
 
 func _test_route_and_drain_order() -> void:
+	# The order under test, not the frame's clock: the first `chunk` of a fresh process (the 2 ms sleep below plus
+	# its first-time work) took 7-9 ms here, past the 4 ms messages budget, so the drain stopped after it (this PC
+	# 4 runs in 5, CI-style too; a runner's speed decides it there). No deadline and the boosted budget (24 ms).
+	var no_dead_was: bool = FrameBudget.test_no_deadline
+	var shared_was: bool = FrameBudget.shared
+	var boost_was: bool = FrameBudget.boost
+	FrameBudget.test_no_deadline = true
+	FrameBudget.shared = false
+	FrameBudget.boost = true
+	FrameBudget.reset()
+	_route_and_drain_order()
+	FrameBudget.test_no_deadline = no_dead_was
+	FrameBudget.shared = shared_was
+	FrameBudget.boost = boost_was
+	FrameBudget.reset()
+
+
+func _route_and_drain_order() -> void:
 	var b: Node = _make_bridge()
 	b.server_tick = 50
 	var order: Array = []
@@ -945,3 +968,117 @@ func _test_resync_guard() -> void:
 			w6 = int((m as Dictionary).get("w", -1))
 	check(not b6.connected and w6 == 0, "hello w 0 again after the client's timeout (connected %s, w %d)" % [b6.connected, w6])
 	b6.queue_free()
+
+
+## (--replay-kinds) The same stream (fast lanes, bulk, kept messages put in front, more put in front by a message,
+## slow handlers so the slice splits) drained with the switch on and off: the same order of handled messages; on, the estimates are by type.
+func _test_replay_kinds() -> void:
+	const Probing := preload("res://scripts/debug/probing.gd")
+	var probe_was := Probing.on
+	var predict_was := FrameBudget.predict
+	FrameBudget.predict = true
+	Probing.on = true
+	var orders: Array = []
+	for mode in [true, false]:
+		Probing.prof.clear()
+		FrameBudget._item_ema.erase("messages:replay")
+		FrameBudget._item_ema.erase("messages:replay:ents")
+		FrameBudget._item_ema.erase("messages:replay:cq")
+		var b: Node = _make_bridge()
+		b.replay_kinds = mode
+		b.server_tick = 50
+		var order: Array = []
+		var on_replay := func(m: Dictionary) -> void:
+			order.append("R:" + str(m.get("t", "")) + ":" + str(m.get("i", "")))
+			if str(m.get("t", "")) == "ents":
+				OS.delay_usec(1500)
+		var on_msg := func(m: Dictionary) -> void:
+			order.append(str(m.get("t", "")) + ":" + str(m.get("k", "")))
+			if int(m.get("k", 0)) == 57:  # (as world.gd's `same` does: kept messages put in front by a message)
+				b.requeue_front([[on_replay, {"t": "ents", "i": 100}], [on_replay, {"t": "cq", "i": 101}],
+					[on_replay, {"t": "ents", "i": 102}]])
+		b.message_received.connect(on_msg)
+		var msgs: Array = [{"t": "me", "k": 51}, {"t": "inv", "r": 1, "k": 51, "l": []},
+			{"t": "rb", "k": 52, "part": 1, "parts": 1, "u": []}, {"t": "bs", "k": 52, "part": 1, "parts": 1, "lm": []}]
+		for i in 12:
+			msgs.append({"t": "add", "r": 2 + i, "k": 53 + i, "e": [2000 + i, 1, 6 * 32 * 256 * (i + 2), 0, 0]})
+		b._route(msgs, PackedInt32Array(), Time.get_ticks_usec())
+		var kept: Array = []
+		for i in 10:
+			kept.append([on_replay, {"t": "ents" if i % 3 == 0 else "cq", "i": i}])
+		b.requeue_front(kept)
+		var frames := 0
+		while b.waiting_count() > 0 and frames < 200:
+			FrameBudget.test_next_frame()
+			b._drain()
+			frames += 1
+		check(b.waiting_count() == 0, "replay kinds %s: everything drained in %d frames" % [mode, frames])
+		var keyed: bool = FrameBudget._item_ema.has("messages:replay:ents") and FrameBudget._item_ema.has("messages:replay:cq")
+		var plain: bool = FrameBudget._item_ema.has("messages:replay")
+		check(keyed == mode and plain != mode, "replay kinds %s: replay estimates keyed by type %s, one `replay` %s" % [mode, keyed, plain])
+		var parts_ok: bool = Probing.prof.has("br_me") and Probing.prof.has("br_prio") and Probing.prof.has("br_live") 			and Probing.prof.has("br_belt")
+		check(parts_ok, "replay kinds %s: fast lanes' probe parts br_me/br_prio/br_live/br_belt kept (%s)" % [mode, Probing.prof.keys()])
+		orders.append(order)
+		b.queue_free()
+	check(not (orders[0] as Array).is_empty() and orders[0] == orders[1],
+		"--replay-kinds on/off handle the same messages in the same order (%d handled)" % (orders[0] as Array).size())
+	Probing.on = probe_was
+	Probing.prof.clear()
+	FrameBudget.predict = predict_was
+
+
+## A kept entry that calls requeue_front while it runs (perf-w4-fix): the new entries run next, in order, and the entry
+## itself isn't run again (it was: A, D, A, B, the first new entry skipped and A run twice).
+func _test_requeue_while_running() -> void:
+	FrameBudget.reset()
+	FrameBudget._item_ema.erase("messages:replay")
+	var b: Node = _make_bridge()
+	var order: Array = []
+	var on_entry := func(m: Dictionary) -> void:
+		order.append(str(m.get("i", "")))
+	var on_a := func(m: Dictionary) -> void:
+		order.append(str(m.get("i", "")))
+		b.requeue_front([[on_entry, {"i": "C"}], [on_entry, {"i": "D"}]])
+	b.requeue_front([[on_a, {"i": "A"}], [on_entry, {"i": "B"}]])
+	var frames := 0
+	while b.waiting_count() > 0 and frames < 50:
+		FrameBudget.test_next_frame()
+		b._drain()
+		frames += 1
+	check(order == ["A", "C", "D", "B"], "requeue_front from a running entry: A, C, D, B in order (got %s)" % [order])
+	b.queue_free()
+
+
+## --drain-head-again (perf-w4-fix S3): a waiting message that puts entries in front has them run in the same drain
+## while time is left; off, they wait for the next one, as before.
+func _test_drain_head_again() -> void:
+	for mode in [true, false]:
+		FrameBudget.reset()
+		for k in ["messages:replay", "messages:same"]:
+			FrameBudget._item_ema.erase(k)  # (an earlier test's slow kept entries: the slice would stop before them)
+		var b: Node = _make_bridge()
+		b.drain_head_again = mode
+		b.server_tick = 50
+		var order: Array = []
+		var on_entry := func(m: Dictionary) -> void:
+			order.append("R" + str(m.get("i", "")))
+		var on_msg := func(m: Dictionary) -> void:
+			order.append(str(m.get("t", "")))
+			if str(m.get("t", "")) == "same":  # (a bulk message, as a live `ents` message is)
+				b.requeue_front([[on_entry, {"i": 1}], [on_entry, {"i": 2}]])
+		b.message_received.connect(on_msg)
+		b._route([{"t": "same", "cx": 3, "cy": 0}], PackedInt32Array(), Time.get_ticks_usec())
+		FrameBudget.test_next_frame()
+		b._drain()
+		var first: Array = order.duplicate()
+		var frames := 0
+		while b.waiting_count() > 0 and frames < 20:
+			FrameBudget.test_next_frame()
+			b._drain()
+			frames += 1
+		if mode:
+			check(first == ["same", "R1", "R2"], "drain head again on: the message's kept entries run in its drain (%s)" % [first])
+		else:
+			check(first == ["same"], "drain head again off: the kept entries wait for the next drain, as before (%s)" % [first])
+		check(order == ["same", "R1", "R2"], "drain head again %s: everything handled once, in order (%s)" % [mode, order])
+		b.queue_free()

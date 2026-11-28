@@ -293,9 +293,52 @@ func _test_spike_log() -> void:
 	var text := FileAccess.get_file_as_string(DebugOverlay.SPIKE_PATH)
 	check(text.contains("# spike log on") and text.contains("top World 3.0, Hud 0.5") and text.contains("item_models 1")
 		and text.contains("# spike log off (1 frames)"), "the log file: %s" % text.right(300))
+	check(not DebugOverlay.spike_render or (text.contains("# render: draw calls") and text.contains("| render draws ")),
+		"the log file: the render header and part (--spike-render on by default)")
 	overlay.free()
 	world.free()
 	main.free()
+
+
+## The spike line's render part (--spike-render): the split with the render thread, the renderer's stages from
+## made-up step tables, the part's and the header's text.
+func _test_spike_render() -> void:
+	const RenderStats := preload("res://scripts/debug/render_stats.gd")
+	# One thread: scripts end 1000, deferred end 3000, frame_pre_draw 4000, frame_post_draw 14000, next start 20000.
+	var one := DebugOverlay.spike_split(1000, 3000, 4000, 14000, 20000, false)
+	check(one == [3000, 10000, 6000], "split, one thread: deferred+frees to the draw, the draw, the rest: %s" % str(one))
+	# Render thread: the draw is a push, frame_post_draw arrives a frame later (here: none since).
+	var two := DebugOverlay.spike_split(1000, 3000, 12000, 0, 20000, true)
+	check(two == [2000, 9000, 8000], "split, render thread: deferred+frees, the wait for the renderer to frame_pre_draw, the rest: %s" % str(two))
+	check(DebugOverlay.spike_split(1000, 3000, 0, 0, 20000, true) == [2000, -1, 17000], "split, render thread headless: no wait known")
+	var line := DebugOverlay.spike_line(40000, 20000, two, {"World": 20000}, {}, 0, 2.0, true, "render draws 10/2")
+	check(line.begins_with("t 2.0s frame 40.0 ms: scripts 20.0, deferred+frees 2.0, wait for renderer 9.0, rest 8.0"),
+		"spike line, render thread: the wait named, no draw bucket: %s" % line)
+	check(line.ends_with(" | render draws 10/2"), "spike line: the render part last")
+	check(not DebugOverlay.spike_line(40000, 20000, one, {"World": 20000}, {}, 0, 2.0).contains("render"),
+		"spike line without a render part (--spike-render=off) as before")
+	var gpu := {"Render Directional/SpotLight Shadows": 2.0, "Render GI + Render Directional/SpotLight Shadows (Parallel)": 0.5,
+		"Render Depth Pre-Pass": 1.5, "Resolve Depth Pre-Pass (MSAA)": 0.1, "Render Opaque Pass": 4.0, "Render Motion Pass": 0.8,
+		"Render 3D Transparent Pass": 0.6, "Tonemap": 0.3, "FSR2": 0.9, "Setup 3D Scene": 0.2, "vp_begin_1234": 0.05}
+	var cpu := {"Render Directional/SpotLight Shadows": 1.0, "Render Opaque Pass": 3.0, "Setup 3D Scene": 0.4}
+	var st := RenderStats.stages(gpu, cpu)
+	var by := {}
+	for e: Array in st:
+		by[e[0]] = "%.2f/%.2f" % [float(e[1]), float(e[2])]
+	check(st.size() == RenderStats.STAGES.size() and str(st[0][0]) == "shadows" and str(st[-1][0]) == "rest", "stages: all, in order")
+	check(by["shadows"] == "1.00/2.50" and by["pre-pass"] == "0.00/1.60" and by["opaque"] == "3.00/4.00"
+		and by["motion"] == "0.00/0.80" and by["transparent"] == "0.00/0.60" and by["post"] == "0.00/1.20"
+		and by["rest"] == "0.40/0.25", "stages: each step summed into its stage (cpu/gpu): %s" % str(by))
+	var part := DebugOverlay.spike_render_part({"view_draws": 4317, "shadow_draws": 1353, "cpu_ms": 9.14, "gpu_ms": 12.0}, st)
+	check(part.begins_with("render draws 4317/1353, viewport 9.1/12.0, stages shadows 1.0/2.5, pre-pass 0.0/1.6, opaque 3.0/4.0"),
+		"render part: draws, viewport, stages: %s" % part)
+	check(DebugOverlay.spike_render_part({}, []) == "render draws 0/0", "render part before any numbers")
+	var head := DebugOverlay.spike_header(true, true)
+	check(head.contains("--gpu-profile") and head.contains("wait for renderer"), "header, render thread: %s" % head)
+	check(not DebugOverlay.spike_header(false, false).contains("wait for renderer"), "header, one thread: no wait")
+	var threaded := RenderStats.threaded()
+	check(not threaded or RenderStats.steps() is Array, "steps() answers on any thread model")
+	check(RenderStats.steps().is_empty(), "steps(): none headless (no RenderingDevice, no --gpu-profile)")
 
 
 ## The Addons bucket split by add-on: the spike line's "addons" part, and real marks round add-on nodes.
@@ -375,6 +418,7 @@ func _run() -> void:
 	_test_top_scripts_and_sum()
 	_test_profiler_text_and_belt_items()
 	_test_spike_log()
+	_test_spike_render()
 	await _test_addon_split()
 
 	await process_frame

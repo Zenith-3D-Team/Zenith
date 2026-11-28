@@ -8,10 +8,13 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const SafeDelete := preload("res://scripts/safe_delete.gd")
 const WireDecode := preload("res://scripts/net/wire_decode.gd")
 const Switches := preload("res://scripts/switches.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 
 const REGION := 16
 const MAGIC := "ZCHK"
-const VERSION := 1
+## 2: copies from v1 dropped once, as the bridge's chunk counts now go by tick (world.lua next_rev): a v1 copy
+## may hold another play of the save that matched by count (a mined pole drawn as a stick, inserter-stick).
+const VERSION := 2
 const HEADER_BYTES := 26
 const MAX_REGION_UNCOMPRESSED := 32 * 1024 * 1024
 const TILES_COUNT := 1024
@@ -50,6 +53,16 @@ var _snap_regions: Array = []  # the dirty regions when the flush started
 var _snap_ri := 0
 var _snap_cur: Array = []  # [region, keys, next index, entries] or empty
 var _snap_out: Array = []  # finished [abs_path, rx, ry, entries]
+## The sliced flush's clock checked after every chunk (it was every 8: a busy region's eight chunks of 500 extras each
+## were 12-24 ms, x_disk_cache in the owner's mega base) and a chunk's extras deep-copied FLUSH_XE_BATCH at a time, the
+## copy carried on next frame (_snap_xe); the flush's snapshots let go on the write worker (it empties st.snapshots and
+## st.items), not in the frame poll() sees it done. `--stutter-probe` parts `dc_snap` (the copies) and `dc_free`.
+## --disk-flush-fine=off: the clock every 8 chunks, each chunk's extras in one copy and freed on the main thread, as before.
+static var flush_fine := Switches.on("--disk-flush-fine")
+const FLUSH_XE_BATCH := 64
+var _snap_xe: Array = []  # a chunk's extras part-way copied: [snap, source xe, copied so far] or empty
+## For tests: what the last _snap_step did ([chunks, extras copied]).
+var snap_last := [0, 0]
 
 
 class ReadResult:
@@ -70,6 +83,7 @@ class WriteResult:
 	var base_dir := ""
 	var max_bytes := DEFAULT_MAX_BYTES
 	var written := 0
+	var free_here := false  # (flush_fine) the task empties items and snapshots itself
 
 
 static func from_args() -> int:
@@ -223,7 +237,10 @@ func poll(delta: float) -> Array[Vector2i]:
 	if _write_task >= 0 and WorkerThreadPool.is_task_completed(_write_task):
 		WorkerThreadPool.wait_for_task_completion(_write_task)
 		_write_task = -1
-		_write_state = null
+		var tf := Time.get_ticks_usec() if Probing.on else 0
+		_write_state = null  # (flush_fine: its snapshots already let go on the worker)
+		if tf > 0:
+			Probing.add("dc_free", tf)
 	if _snapping:
 		flush_async()  # the snapshots' next slice
 	elif is_configured():
@@ -359,6 +376,10 @@ func _prepare_write_snapshots() -> Array:
 ## The snapshots' next slice of `usec`; true when every region the flush started with is copied.
 func _snap_step(usec: int) -> bool:
 	var t0 := Time.get_ticks_usec()
+	snap_last = [0, 0]
+	if flush_fine and not _snap_xe.is_empty():
+		if not _snap_xe_step(t0, usec) or Time.get_ticks_usec() - t0 > usec:
+			return false  # (one batch past the slice at most)
 	var n := 0
 	while true:
 		if _snap_cur.is_empty():
@@ -385,18 +406,58 @@ func _snap_step(usec: int) -> bool:
 			var d_v: Variant = reg.get(keys[i])
 			i += 1
 			n += 1
+			snap_last[0] += 1
 			if d_v is Dictionary:
 				var snap := (d_v as Dictionary).duplicate(false)
 				var xe_v: Variant = snap.get("xe")
+				var copying := false
 				if str(snap.get("xt", "")) == "" and xe_v is Array and not (xe_v as Array).is_empty():
-					snap["xe"] = (xe_v as Array).duplicate(true)
-				entries.append(snap)
-			if (n & 7) == 0 and Time.get_ticks_usec() - t0 > usec:
+					if flush_fine:
+						# Its extras copied FLUSH_XE_BATCH at a time, the clock checked between batches; it joins the
+						# entries once copied (_snap_xe_step).
+						_snap_xe = [snap, xe_v, []]
+						_snap_cur[2] = i
+						if not _snap_xe_step(t0, usec):
+							return false
+						copying = true
+					else:
+						snap["xe"] = (xe_v as Array).duplicate(true)
+				if not copying:
+					entries.append(snap)
+			if (flush_fine or (n & 7) == 0) and Time.get_ticks_usec() - t0 > usec:
 				_snap_cur[2] = i
 				return false
 		if not entries.is_empty():
 			_snap_out.append([ProjectSettings.globalize_path(_region_path(r2.x, r2.y)), r2.x, r2.y, entries])
 		_snap_cur = []
+	return true
+
+
+## The chunk whose extras are part-way copied (_snap_xe) carried on; false when the slice ran out first. Done, it joins
+## its region's entries. Each extra copied as Array.duplicate(true) copies it (a Dictionary or Array deep, else as is).
+func _snap_xe_step(t0: int, usec: int) -> bool:
+	var src: Array = _snap_xe[1]
+	var out: Array = _snap_xe[2]
+	var j := out.size()
+	while j < src.size():
+		var j0 := j
+		var end := mini(j + FLUSH_XE_BATCH, src.size())
+		while j < end:
+			var v: Variant = src[j]
+			if v is Dictionary:
+				out.append((v as Dictionary).duplicate(true))
+			elif v is Array:
+				out.append((v as Array).duplicate(true))
+			else:
+				out.append(v)
+			j += 1
+		snap_last[1] += end - j0
+		if j < src.size() and Time.get_ticks_usec() - t0 > usec:
+			return false
+	var snap: Dictionary = _snap_xe[0]
+	snap["xe"] = out
+	(_snap_cur[3] as Array).append(snap)
+	_snap_xe = []
 	return true
 
 
@@ -412,6 +473,7 @@ func _snap_abort() -> void:
 
 
 func _snap_reset() -> void:
+	_snap_xe = []
 	_snapping = false
 	_snap_regions = []
 	_snap_ri = 0
@@ -432,12 +494,19 @@ func flush_async() -> void:
 			_snap_ri = 0
 			_snap_cur = []
 			_snap_out = []
-		if not _snap_step(FLUSH_SLICE_USEC):
+		var ts := Time.get_ticks_usec() if Probing.on else 0
+		var done := _snap_step(FLUSH_SLICE_USEC)
+		if ts > 0:
+			Probing.add("dc_snap", ts)
+		if not done:
 			return
 		snapshots = _snap_out
 		_snap_reset()
 	elif async_encode:
+		var ts2 := Time.get_ticks_usec() if Probing.on else 0
 		snapshots = _prepare_write_snapshots()
+		if ts2 > 0:
+			Probing.add("dc_snap", ts2)
 	else:
 		items = _prepare_write_items(false)
 	var do_prune := _needs_prune or not items.is_empty() or not snapshots.is_empty()
@@ -465,6 +534,12 @@ func flush_async() -> void:
 				st.written += 1
 		if st.prune and st.max_bytes > 0:
 			prune_disk_dir(st.base_dir, st.max_bytes)
+		if st.free_here:
+			st.snapshots = []  # the copies let go here, not on the main thread (poll's _write_state = null)
+			st.items = []
+	st.free_here = flush_fine
+	snapshots = []
+	items = []
 	_write_task = WorkerThreadPool.add_task(task_fn, false, "chunk_disk_write")
 
 

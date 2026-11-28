@@ -595,6 +595,22 @@ static func at(x: float, z: float) -> float:
 	return h
 
 
+## What at() reads, for a native twin (AltIconsNative.set_field): [on, data, format, origin, step, size, prev data,
+## prev format, prev origin, prev step, prev size] (prev data empty when there is no field faded from). The mix
+## goes with each read (mix_now()), as it moves every frame of a fade without version() moving.
+static func sample_state() -> Array:
+	var on := _on and _image != null
+	var prev := on and _prev_image != null
+	return [on, _image.get_data() if on else PackedByteArray(), _image.get_format() if on else Image.FORMAT_RF,
+		_origin, _step, _size, _prev_image.get_data() if prev else PackedByteArray(),
+		_prev_image.get_format() if prev else Image.FORMAT_RF, _prev_origin, _prev_step, _prev_size]
+
+
+## The fade's mix now (1 when no fade runs): at() blends the field faded from by it.
+static func mix_now() -> float:
+	return _mix
+
+
 ## The field's three channels under a world point, as the shaders' ground3_of: (the ground, the
 ## ground without its cliffs' terraces, how near a cliff 0-1). A field of one channel gives its
 ## height twice; one of one or two channels 0 for the third.

@@ -280,7 +280,7 @@ func _filter_clicked(key: String, i: int, button_index: int) -> void:
 	if button_index == MOUSE_BUTTON_RIGHT:
 		set_filter(key, i, "")
 	elif button_index == MOUSE_BUTTON_LEFT and picker != null:
-		picker.choose(["item"], func(_type: String, name: String) -> void: set_filter(key, i, name),
+		picker.choose(["map_entity"] if key == "entity_filters" else ["tile"], func(_type: String, name: String) -> void: set_filter(key, i, name),
 			"Choose an entity" if key == "entity_filters" else "Choose a tile")
 
 

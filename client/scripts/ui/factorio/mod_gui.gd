@@ -45,11 +45,21 @@ var display: Array = []
 var forwarded: Array = []
 ## Buttons the bridge was asked to press (`mpress`), by element index (for tests).
 var pressed_by_bridge: Array = []
+## What the player changed in a window here, sent as `mset` {ix, v} (for tests).
+var sets_sent: Array = []
+## Texts typed here lately, by element index: {texts, msec}. The bridge's next reading of the window comes back
+## with the text it had when it heard (a letter or two behind a fast typist), which must not undo it.
+var _typed := {}
+const TYPED_KEEP_MSEC := 2000
 ## Windows' newer trees that came while the player was dragging them: index -> entry.
 var _held := {}
 ## Screen windows just closed, by name: {pos, msec}; a new window of that name takes the place.
 var _gone := {}
 const GONE_KEEP_MSEC := 5000
+## Zenith's item picker (factorio_ui.gd sets it): what a mod's choose-elem-button opens.
+var picker: Node
+## The picker's kinds for the elem types it can choose.
+const PICKABLE := {"item": ["item"], "fluid": ["fluid"], "signal": ["item", "fluid", "virtual"], "entity": ["entity"]}
 var _top: HBoxContainer
 var _left: VBoxContainer
 var _center: CenterContainer
@@ -117,9 +127,11 @@ func handle(msg: Dictionary) -> void:
 ## Builds window `index` again from its entry, keeping where the player dragged it.
 func _apply(index: int, entry: Dictionary) -> void:
 	var dragged := Vector2.ZERO
+	var focus := {}
 	if _windows.has(index):
 		var old: Control = _windows[index]["node"]
 		dragged = old.get_meta("drag_offset", Vector2.ZERO)
+		focus = _focused_input(old)
 		old.queue_free()
 	var root := str(entry.get("r", "screen"))
 	var node := build(entry.get("e", {}), 0)
@@ -147,9 +159,52 @@ func _apply(index: int, entry: Dictionary) -> void:
 		_:
 			add_child(node)
 			node.top_level = false
+	_restore_input(node, focus)
+
+
+## The text field with the keyboard focus in `node`: {ix, text, caret}, or empty.
+func _focused_input(node: Control) -> Dictionary:
+	var f := node.get_viewport().gui_get_focus_owner() if node.is_inside_tree() else null
+	if f == null or not node.is_ancestor_of(f) or not f.has_meta("mod_ix"):
+		return {}
+	return {"ix": int(f.get_meta("mod_ix")), "text": f.get("text"), "caret": f.get("caret_column")}
+
+
+## Gives the focus (and the caret) back to the field being typed in after its window was built
+## again. Its text stays what was typed while the bridge's reading is just what it heard of it.
+func _restore_input(node: Control, focus: Dictionary) -> void:
+	if focus.is_empty():
+		return
+	for c in node.find_children("*", "LineEdit", true, false):
+		if int(c.get_meta("mod_ix", -1)) != int(focus["ix"]):
+			continue
+		var typed: Dictionary = _typed.get(int(focus["ix"]), {})
+		if (c as LineEdit).text != str(focus["text"]) and (typed.get("texts", []) as Array).has((c as LineEdit).text) 				and Time.get_ticks_msec() - int(typed.get("msec", 0)) < TYPED_KEEP_MSEC:
+			(c as LineEdit).text = str(focus["text"])
+		(c as LineEdit).grab_focus()
+		(c as LineEdit).caret_column = mini(int(focus["caret"]), (c as LineEdit).text.length())
+		return
+
+
+## The player changed element `ix` here: the bridge sets it on the mod's element and raises the
+## event (mod_gui.lua set).
+func _typed_text(ix: int, text: String) -> void:
+	var texts: Array = (_typed.get(ix, {}) as Dictionary).get("texts", []) if Time.get_ticks_msec() - int((_typed.get(ix, {}) as Dictionary).get("msec", 0)) < TYPED_KEEP_MSEC else []
+	texts.append(text)
+	_typed[ix] = {"texts": texts.slice(-20), "msec": Time.get_ticks_msec()}
+	send_set(ix, text.substr(0, 2000))
+
+
+func send_set(ix: int, value: Variant) -> void:
+	sets_sent.append([ix, value])
+	Bridge.send({"t": "mset", "ix": ix, "v": value})
 
 
 func _dragging(node: Control) -> bool:
+	# A drop-down's list open: the window isn't rebuilt under it.
+	for pick in node.find_children("*", "OptionButton", true, false):
+		if (pick as OptionButton).get_popup().visible:
+			return true
 	if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		return false
 	for handle in node.find_children("*", "Control", true, false):
@@ -159,11 +214,12 @@ func _dragging(node: Control) -> bool:
 
 
 func _process(_delta: float) -> void:
-	if not _held.is_empty() and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
-		for index in _held:
-			if _windows.has(index):
-				_apply(index, _held[index])
-		_held.clear()
+	for index in _held.keys():
+		if not _windows.has(index):
+			_held.erase(index)
+		elif not _dragging(_windows[index]["node"]):
+			_apply(index, _held[index])
+			_held.erase(index)
 	if not _windows.is_empty():
 		_place()
 	if FactorioClicks.waiting > 0:
@@ -291,12 +347,32 @@ func build(e: Dictionary, depth: int) -> Control:
 			var c := CheckBox.new()
 			c.text = caption
 			c.button_pressed = bool(e.get("s", false))
-			node = _clickable(c, e)
+			if e.get("ix") != null:
+				# Checking it here is the mod's checkbox checked (on_gui_checked_state_changed, mod_gui.lua).
+				var cix := int(e.get("ix"))
+				var radio := ty == "radiobutton"
+				c.focus_mode = Control.FOCUS_NONE
+				c.mouse_filter = Control.MOUSE_FILTER_STOP
+				c.toggle_mode = true
+				c.toggled.connect(func(on: bool) -> void:
+					if radio and not on:
+						c.set_pressed_no_signal(true)  # a click never switches a radio button off
+						return
+					send_set(cix, on))
+				node = c
+			else:
+				node = _clickable(c, e)
 		"textfield":
 			var f := LineEdit.new()
 			f.text = str(e.get("tx", ""))
 			f.editable = false
 			f.custom_minimum_size.x = Kit.px(160)
+			if e.get("ix") != null:
+				# Typing sets the mod's textfield (on_gui_text_changed, mod_gui.lua).
+				var fix := int(e.get("ix"))
+				f.editable = e.get("en", true) != false
+				f.set_meta("mod_ix", fix)
+				f.text_changed.connect(func(t: String) -> void: _typed_text(fix, t))
 			node = f
 		"text-box":
 			var t := TextEdit.new()
@@ -314,30 +390,86 @@ func build(e: Dictionary, depth: int) -> Control:
 		"slider":
 			var s := HSlider.new()
 			s.editable = false
-			s.max_value = 1000000.0
+			s.step = 0.0
+			s.min_value = float(e.get("mn", 0.0))
+			s.max_value = float(e.get("mx", maxf(1000000.0, float(e.get("v", 0.0)))))
 			s.value = float(e.get("v", 0.0))
 			s.custom_minimum_size.x = Kit.px(160)
+			if e.get("ix") != null:
+				# Moving it sets the mod's slider (on_gui_value_changed); its window isn't rebuilt under the handle.
+				var six := int(e.get("ix"))
+				s.editable = e.get("en", true) != false
+				s.step = float(e.get("stp", 0.0))
+				s.value = float(e.get("v", 0.0))
+				s.focus_mode = Control.FOCUS_NONE
+				s.drag_started.connect(func() -> void: s.set_meta("dragging", true))
+				s.drag_ended.connect(func(_changed: bool) -> void: s.set_meta("dragging", false))
+				s.value_changed.connect(func(v: float) -> void: send_set(six, v))
 			node = s
 		"drop-down":
 			var items := UiModel._array(e.get("it"))
 			var i := int(e.get("si", 0)) - 1
-			var d := Button.new()
-			d.text = (LocaleNames.localise(items[i]) if i >= 0 and i < items.size() else "") + "  ▾"
-			node = _clickable(d, e)
+			if e.get("ix") != null:
+				# Picking one sets the mod's drop-down (on_gui_selection_state_changed, mod_gui.lua).
+				var dix := int(e.get("ix"))
+				var pick := OptionButton.new()
+				pick.focus_mode = Control.FOCUS_NONE
+				pick.custom_minimum_size.x = Kit.px(160)
+				for k in items.size():
+					pick.add_item(LocaleNames.localise(items[k]), k)
+				pick.selected = i if i >= 0 and i < items.size() else -1
+				pick.item_selected.connect(func(k: int) -> void: send_set(dix, k + 1))
+				node = pick
+			else:
+				var d := Button.new()
+				d.text = (LocaleNames.localise(items[i]) if i >= 0 and i < items.size() else "") + "  ▾"
+				node = _clickable(d, e)
 		"list-box":
-			var list := _box("vertical")
 			var items := UiModel._array(e.get("it"))
-			for k in items.size():
-				var row := Kit.label(LocaleNames.localise(items[k]), "FHeading" if k == int(e.get("si", 0)) - 1 else "")
-				list.add_child(row)
-			node = list
+			if e.get("ix") != null:
+				# Clicking a row sets the mod's list box (on_gui_selection_state_changed, mod_gui.lua).
+				var lix := int(e.get("ix"))
+				var rows := ItemList.new()
+				rows.focus_mode = Control.FOCUS_NONE
+				rows.auto_height = true
+				rows.custom_minimum_size.x = Kit.px(160)
+				for k in items.size():
+					rows.add_item(LocaleNames.localise(items[k]))
+				var chosen := int(e.get("si", 0)) - 1
+				if chosen >= 0 and chosen < items.size():
+					rows.select(chosen)
+				rows.item_selected.connect(func(k: int) -> void: send_set(lix, k + 1))
+				if e.get("en", true) == false:
+					rows.mouse_filter = Control.MOUSE_FILTER_IGNORE  # a disabled list box takes no clicks
+					rows.modulate.a = 0.5
+				node = rows
+			else:
+				var list := _box("vertical")
+				for k in items.size():
+					var row := Kit.label(LocaleNames.localise(items[k]), "FHeading" if k == int(e.get("si", 0)) - 1 else "")
+					list.add_child(row)
+				node = list
 		"line":
 			node = HSeparator.new() if str(e.get("d", "horizontal")) == "horizontal" else VSeparator.new()
 		"switch":
 			var sw := _box("horizontal")
-			sw.add_child(Kit.label(LocaleNames.localise(e.get("lc")), "FHeading" if str(e.get("s", "")) == "left" else ""))
-			sw.add_child(Kit.label("⇄"))
-			sw.add_child(Kit.label(LocaleNames.localise(e.get("rc")), "FHeading" if str(e.get("s", "")) == "right" else ""))
+			if e.get("ix") != null:
+				# Clicking a side puts the mod's switch there (on_gui_switch_state_changed, mod_gui.lua).
+				var wix := int(e.get("ix"))
+				for side in ["left", "right"]:
+					var sb := Button.new()
+					var label := LocaleNames.localise(e.get("lc" if side == "left" else "rc"))
+					sb.text = label if label != "" else side.capitalize()
+					sb.focus_mode = Control.FOCUS_NONE
+					sb.toggle_mode = true
+					sb.button_pressed = str(e.get("s", "")) == side
+					sb.disabled = e.get("en", true) == false
+					sb.pressed.connect(func() -> void: send_set(wix, side))
+					sw.add_child(sb)
+			else:
+				sw.add_child(Kit.label(LocaleNames.localise(e.get("lc")), "FHeading" if str(e.get("s", "")) == "left" else ""))
+				sw.add_child(Kit.label("⇄"))
+				sw.add_child(Kit.label(LocaleNames.localise(e.get("rc")), "FHeading" if str(e.get("s", "")) == "right" else ""))
 			node = sw
 		"tabbed-pane":
 			node = _tabs(e, depth)
@@ -437,7 +569,11 @@ func _sprite_button(e: Dictionary, ty: String, caption: String) -> Control:
 	b.custom_minimum_size = Kit.pxv(40, 40)
 	var path := str(e.get("sp", ""))
 	if ty == "choose-elem-button":
-		path = "%s/%s" % [str(e.get("et", "item")), str(e.get("ev", ""))] if e.get("ev") != null else ""
+		# A signal's value says what it is (evt: item, fluid, virtual...): its picture is that kind's.
+		var kind := str(e.get("et", "item"))
+		if e.has("evt"):
+			kind = "virtual-signal" if str(e.get("evt")) == "virtual" else str(e.get("evt"))
+		path = "%s/%s" % [kind, str(e.get("ev", ""))] if e.get("ev") != null else ""
 	var tex := sprite(path)
 	if tex != null:
 		b.icon = tex
@@ -453,7 +589,27 @@ func _sprite_button(e: Dictionary, ty: String, caption: String) -> Control:
 		n.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 		b.add_child(n)
 	b.button_pressed = bool(e.get("tg", false))
+	if ty == "choose-elem-button" and e.get("ix") != null and PICKABLE.has(str(e.get("et", "item"))):
+		return _elem_button(b, e)
 	return _clickable(b, e)
+
+
+## A mod's choose-elem-button: click opens the item picker, right click clears it; the choice goes
+## to the bridge (on_gui_elem_changed, mod_gui.lua: a name, {type, name} for a signal, false to clear).
+func _elem_button(b: Button, e: Dictionary) -> Button:
+	var eix := int(e.get("ix"))
+	var elem := str(e.get("et", "item"))
+	b.focus_mode = Control.FOCUS_NONE
+	b.mouse_filter = Control.MOUSE_FILTER_STOP
+	b.pressed.connect(func() -> void:
+		if picker == null or not picker.has_method("choose"):
+			return
+		picker.choose(PICKABLE[elem], func(type_name: String, item_name: String) -> void:
+			send_set(eix, {"type": "virtual" if type_name == "virtual" else type_name, "name": item_name} if elem == "signal" else item_name)))
+	b.gui_input.connect(func(ev: InputEvent) -> void:
+		if ev is InputEventMouseButton and ev.pressed and ev.button_index == MOUSE_BUTTON_RIGHT:
+			send_set(eix, false))
+	return b
 
 
 ## A SpritePath ("item/iron-plate", "entity/...", "technology/...", "utility/...") as a texture, or

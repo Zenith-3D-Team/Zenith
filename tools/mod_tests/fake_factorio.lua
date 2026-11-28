@@ -98,6 +98,9 @@ F = {
   networks = setmetatable({}, { __mode = "k" }), -- entity -> {connector id -> LuaCircuitNetwork-like {network_id}}
   lamp_signal_colors = setmetatable({}, { __mode = "k" }), -- lamp -> the Color its circuit network gives it (K10)
   stop_trains = setmetatable({}, { __mode = "k" }), -- train stop -> {LuaTrain-like, ...} (get_train_stop_trains)
+  rail_segments = setmetatable({}, { __mode = "k" }), -- rail entity -> {rail, ...}
+  rail_overlaps = setmetatable({}, { __mode = "k" }), -- rail entity -> {rail, ...}
+  rail_blocks = setmetatable({}, { __mode = "k" }), -- rail entity -> block id
   decon_marks = setmetatable({}, { __mode = "k" }), -- entity -> true when marked for deconstruction
   upgrade_marks = setmetatable({}, { __mode = "k" }), -- entity -> target prototype
   blueprint = {}, -- what the blueprint item holds: {{name, x, y}, ...} relative to its centre
@@ -185,6 +188,7 @@ defines = strict("defines", {
   signal_state = strict("defines.signal_state", { open = 0, closed = 1, reserved = 2, reserved_by_circuit_network = 3 }),
   chain_signal_state = strict("defines.chain_signal_state", { none = 0, all_open = 1, partially_open = 2, none_open = 3 }),
   rail_layer = strict("defines.rail_layer", { ground = 0, elevated = 1 }),
+  rail_direction = strict("defines.rail_direction", { front = 0, back = 1 }),
   wire_type = strict("defines.wire_type", { red = 1, green = 2, copper = 3 }),
   -- A combinator's input connectors share the ids of everything else's red and green ones.
   wire_connector_id = strict("defines.wire_connector_id", { circuit_red = 1, circuit_green = 2, combinator_input_red = 1,
@@ -204,7 +208,10 @@ defines = strict("defines", {
   build_check_type = strict("defines.build_check_type", { script = 0, manual = 1, manual_ghost = 2 }),
   build_mode = strict("defines.build_mode", { normal = 0, forced = 1, superforced = 2 }),
   gui_type = strict("defines.gui_type", { none = 0, entity = 1, custom = 13 }),
-  logistic_member_index = strict("defines.logistic_member_index", { logistic_container = 0, logistic_container_trash_provider = 1 }),
+  logistic_member_index = strict("defines.logistic_member_index", {
+    logistic_container = 0, logistic_container_trash_provider = 1,
+    roboport_requester = 2, spidertron_requester = 3, cargo_landing_pad_requester = 4, rocket_silo_requester = 5,
+  }),
   flow_precision_index = strict("defines.flow_precision_index", {
     five_seconds = 0, one_minute = 1, ten_minutes = 2, one_hour = 3, ten_hours = 4, fifty_hours = 5,
     two_hundred_fifty_hours = 6, one_thousand_hours = 7,
@@ -230,7 +237,7 @@ defines = strict("defines", {
     -- Module slots (modules.lua).
     crafter_modules = 4, lab_modules = 3, mining_drill_modules = 2, beacon_modules = 1,
     -- Vehicles' trunks and fuel (ui_actions.lua's fast transfer, N2).
-    car_trunk = 2, spider_trunk = 2, fuel = 1, burnt_result = 6,
+    car_trunk = 2, spider_trunk = 2, spider_trash = 8, fuel = 1, burnt_result = 6,
   }),
   rocket_silo_status = strict("defines.rocket_silo_status", {
     building_rocket = 0, create_rocket = 1, lights_blinking_open = 2, doors_opening = 3, doors_opened = 4,
@@ -293,7 +300,9 @@ script = strict("LuaBootstrap", {
     assert(type(data) == "table", "raise_event(event, data table)")
     local function plain(v, depth)
       assert(depth < 64, "raise_event: data nested too deep")
-      if type(v) == "table" then
+      if type(v) == "table" and v.valid == true and v.index and v.get_mod then
+        return  -- a LuaGuiElement (a valid LuaObject: events carry them, as on_gui_text_changed's element)
+      elseif type(v) == "table" then
         assert(getmetatable(v) == nil, "raise_event: data holds a LuaObject")
         for k, x in pairs(v) do
           plain(k, depth + 1)
@@ -350,6 +359,7 @@ settings = strict("LuaSettings", {
     ["f3d-detail-interval"] = { value = 6 },
     ["f3d-spread-jobs"] = { value = true },
     ["f3d-binary-messages"] = { value = true },
+    ["f3d-rev-ticks"] = { value = true },
     ["f3d-starter-kit"] = { value = true },
     ["f3d-character-corpses"] = { value = true },
     ["f3d-player"] = { value = "" },
@@ -423,7 +433,7 @@ local function entity_proto(name, type, w, h, extra)
     infinite_resource = false, mining_speed = nil, crafting_categories = nil,
     unit_numbered = true, rotatable = false, build_grid_size = 1,
     items_to_place_this = { { name = name, count = 1 } },
-    max_health = 100,
+    max_health = 100, selection_priority = 50, selectable_in_game = true,
   }
   for k, v in pairs(extra or {}) do
     p[k] = v
@@ -502,6 +512,11 @@ local entity_protos = {
     unit_numbered = false,
     mineable_properties = { minable = true, mining_time = 0.3, products = { { type = "item", name = "wood", amount = 4 } } },
   }),
+  ["huge-rock"] = entity_proto("huge-rock", "simple-entity", 3, 3, {
+    unit_numbered = false,
+    mineable_properties = { minable = true, mining_time = 3, products = {
+      { type = "item", name = "stone", amount_min = 24, amount_max = 50 }, { type = "item", name = "coal", amount_min = 24, amount_max = 50 } } },
+  }),
   ["iron-ore"] = entity_proto("iron-ore", "resource", 1, 1, {
     unit_numbered = false,
     mineable_properties = { minable = true, mining_time = 1, products = { { type = "item", name = "iron-ore", amount = 1 } } },
@@ -540,6 +555,7 @@ local entity_protos = {
   ["shotgun-pellet"] = entity_proto("shotgun-pellet", "projectile", 0.2, 0.5, { unit_numbered = false }),
   grenade = entity_proto("grenade", "projectile", 0.2, 0.5, { unit_numbered = false }),
   ["rocket"] = entity_proto("rocket", "projectile", 0.2, 0.5, { unit_numbered = false }),
+  ["artillery-projectile"] = entity_proto("artillery-projectile", "artillery-projectile", 0, 0, { unit_numbered = false }),
   ["handheld-flamethrower-fire-stream"] = entity_proto("handheld-flamethrower-fire-stream", "stream", 0, 0, { unit_numbered = false }),
   ["chain-tesla-gun-beam-start"] = entity_proto("chain-tesla-gun-beam-start", "beam", 0, 0, { unit_numbered = false }),
   ["grenade-explosion"] = entity_proto("grenade-explosion", "explosion", 0, 0, { unit_numbered = false }),
@@ -553,6 +569,7 @@ local entity_protos = {
   ["item-on-ground"] = entity_proto("item-on-ground", "item-entity", 0.3, 0.3, { unit_numbered = false }),
   ["stone-wall"] = entity_proto("stone-wall", "wall", 1, 1),
   ["cargo-wagon"] = entity_proto("cargo-wagon", "cargo-wagon", 2, 6),
+  ["fluid-wagon"] = entity_proto("fluid-wagon", "fluid-wagon", 2, 6),
   radar = entity_proto("radar", "radar", 3, 3, { max_distance_of_nearby_sector_revealed = 3 }),
   spidertron = entity_proto("spidertron", "spider-vehicle", 3, 3),
   ["artillery-turret"] = entity_proto("artillery-turret", "artillery-turret", 3, 3),
@@ -700,7 +717,7 @@ end
 
 local item_protos = {}
 for _, n in pairs({ "transport-belt", "fast-transport-belt", "underground-belt", "assembling-machine-1", "stone-furnace", "locomotive", "splitter",
-    "pipe", "pipe-to-ground" }) do
+    "pipe", "pipe-to-ground", "rail-signal" }) do
   item_protos[n] = { name = n, place_result = entity_protos[n] }
 end
 -- 2.x: the rail item is a rail planner; its place_result is empty and `rails` lists what it builds.
@@ -732,12 +749,15 @@ for item, tile in pairs({ concrete = "concrete", ["stone-brick"] = "stone-path" 
   }) }
 end
 item_protos.grenade = { name = "grenade", place_result = nil, capsule_action = ({
-  type = "throw", attack_parameters = { range = 15 }, uses_stack = true }) }
+  type = "throw", attack_parameters = { range = 15, cooldown = 30 }, uses_stack = true }) }
 item_protos["cliff-explosives"] = { name = "cliff-explosives", place_result = nil, capsule_action = ({
-  type = "destroy-cliffs", attack_parameters = { range = 10 }, radius = 1.5, timeout = 0 }) }
+  type = "destroy-cliffs", attack_parameters = { range = 10, cooldown = 30 }, radius = 1.5, timeout = 0 }) }
+item_protos["artillery-targeting-remote"] = { name = "artillery-targeting-remote", place_result = nil, capsule_action = ({
+  type = "artillery-remote", flare = "artillery-flare" }) }
 item_protos["burner-inserter"] = { name = "burner-inserter", place_result = entity_protos["burner-inserter"] }
 -- Ammo named like the projectile it fires, which it doesn't build (issue #2).
 item_protos.rocket = { name = "rocket", type = "ammo", place_result = nil }
+item_protos["artillery-shell"] = { name = "artillery-shell", type = "ammo", place_result = nil }
 entity_protos["burner-inserter"].items_to_place_this = { { name = "burner-inserter", count = 1 } }
 -- The electric drill's item builds it (placing one over uranium ore: the "Uranium mining" research's rule).
 item_protos["electric-mining-drill"] = { name = "electric-mining-drill", place_result = entity_protos["electric-mining-drill"] }
@@ -751,6 +771,13 @@ item_protos["pistol"].attack_parameters = { type = "projectile", range = 15, coo
 item_protos["firearm-magazine"].type = "ammo"
 item_protos["firearm-magazine"].ammo_category = { name = "bullet" }
 item_protos["firearm-magazine"].magazine_size = 10
+item_protos["firearm-magazine"].get_ammo_type = function()
+  return { action = { { type = "direct", action_delivery = { { type = "instant", target_effects = {
+    { type = "create-entity", entity_name = "explosion-hit" }, { type = "damage", damage = { amount = 5, type = "physical" } } } } } } } }
+end
+item_protos["heavy-armor"] = { name = "heavy-armor", type = "armor", place_result = nil, inventory_size_bonus = 0,
+  resistances = { fire = { type = "fire", decrease = 0, percent = 0.3 }, physical = { type = "physical", decrease = 6, percent = 0.3 },
+    explosion = { type = "explosion", decrease = 20, percent = 0.3 } } }
 -- N3: vehicles' guns (LuaEntityPrototype.indexed_guns, in slot order), as in the game's data.
 for _, n in pairs({ "vehicle-machine-gun", "tank-machine-gun", "tank-cannon", "tank-flamethrower", "spidertron-rocket-launcher-1",
   "spidertron-rocket-launcher-2", "spidertron-rocket-launcher-3", "spidertron-rocket-launcher-4" }) do
@@ -836,6 +863,7 @@ end
 
 -- Remnants: corpses buildings leave (LuaEntityPrototype.corpses: name -> prototype). The
 -- assembler's are its own; the chest and the lab share small-remnants.
+entity_protos["artillery-flare"] = entity_proto("artillery-flare", "artillery-flare", 1, 1, { unit_numbered = false })
 entity_protos["linked-belt"] = entity_proto("linked-belt", "linked-belt", 1, 1, { rotatable = true })
 entity_protos["lane-splitter"] = entity_proto("lane-splitter", "lane-splitter", 1, 1, { rotatable = true })
 -- Belts' speeds in tiles a tick, as 2.1.23's prototypes.
@@ -977,7 +1005,7 @@ end
 local function make_recipe(name, enabled, category, extra)
   -- 2.1 shape: `categories`; reading `category` is an error, like the real 2.1 API.
   local r = {
-    name = name, enabled = enabled, hidden = false, categories = { category }, energy = 0.5, order = "a",
+    name = name, enabled = enabled, hidden = false, hide_from_player_crafting = false, categories = { category }, energy = 0.5, order = "a",
     group = group("intermediate-products", "c"), subgroup = group("intermediate-product", "a"),
     ingredients = {}, products = { { type = "item", name = name, amount = 1 } },
     object_name = "LuaRecipe", prototype = { parameter = false },
@@ -1119,6 +1147,11 @@ forces.player = setmetatable({
       ingredients = { { type = "fluid", name = "crude-oil", amount = 100 } },
       products = { { type = "fluid", name = "petroleum-gas", amount = 45 } } }),
     ["laser-turret"] = make_recipe("laser-turret", false, "crafting"),
+    -- A recipe with chances (2.1 gives each product its probability) and a mined thing with amount ranges.
+    ["uranium-processing"] = make_recipe("uranium-processing", false, "centrifuging", {
+      ingredients = { { type = "item", name = "uranium-ore", amount = 10 } },
+      products = { { type = "item", name = "uranium-235", amount = 1, probability = 0.007 },
+        { type = "item", name = "uranium-238", amount = 1, probability = 0.993 } } }),
     ["iron-plate"] = make_recipe("iron-plate", true, "smelting"),
     -- Factorio's parameter recipes (blueprint parameters): crafting category, not hidden, never made.
     ["parameter-0"] = make_recipe("parameter-0", true, "crafting", { prototype = { parameter = true } }),
@@ -1249,6 +1282,13 @@ forces.enemy = strict("LuaForce", { name = "enemy",
   get_evolution_factor_by_pollution = function(surface) return 0.05 end,
   get_evolution_factor_by_killing_spawners = function(surface) return 0.05 end,
 })
+-- LuaForce::is_enemy (combat.lua's aim point): the player force is at war with "enemy" only; "ally" is a
+-- second player-side force (a friend, cease fire on), and neutral is nobody's enemy.
+forces.ally = strict("LuaForce", { name = "ally" })
+rawset(forces.player, "is_enemy", function(other)
+  assert(other and other.name, "is_enemy(force)")
+  return other.name == "enemy"
+end)
 -- Repair packs (repair.lua): friends' buildings may be mended too; the fake's forces have none.
 rawset(forces.player, "get_friend", function(other)
   assert(other and other.name, "get_friend(force)")
@@ -1461,7 +1501,22 @@ local function item_stack(slots, i)
     local h = spec and stack_handles[spec]
     if h then -- another LuaItemStack: a copy of it, blueprint and all
       local from = h[1][h[2]]
-      slots[i] = from and { name = from.name, count = from.count, quality = from.quality, bp = from.bp } or nil
+      if from then
+        local copy = {}
+        for k, v in pairs(from) do
+          copy[k] = v
+        end
+        if from.bp then
+          local bp_copy = {}
+          for idx, ent in ipairs(from.bp) do
+            bp_copy[idx] = ent
+          end
+          copy.bp = bp_copy
+        end
+        slots[i] = copy
+      else
+        slots[i] = nil
+      end
       return true
     end
     slots[i] = spec and { name = spec.name, count = spec.count or 1, quality = spec.quality } or nil
@@ -1514,7 +1569,7 @@ local INVENTORY_ROLES = {
   ["construction-robot"] = { "robot_cargo" },
   ["cargo-wagon"] = { "cargo" },
   car = { "fuel", "trunk", "vehicle_ammo" },
-  ["spider-vehicle"] = { nil, "trunk", "vehicle_ammo" },
+  ["spider-vehicle"] = { nil, "trunk", "vehicle_ammo", nil, nil, nil, nil, "spider_trash" },
   locomotive = { "fuel" },
   ["ammo-turret"] = { "turret_ammo" },
   ["artillery-turret"] = { "vehicle_ammo" },
@@ -1627,6 +1682,15 @@ local function make_inventory(size)
       end
     end
     return nil
+  end
+  inv.count_empty_stacks = function()
+    local empty = 0
+    for i = 1, size do
+      if not slots[i] then
+        empty = empty + 1
+      end
+    end
+    return empty
   end
   -- Slot filters (the character's middle click): an ItemFilter by slot. A name alone means normal
   -- quality, "=" (2.1's ItemFilter); a table without a quality matches any quality.
@@ -1928,6 +1992,7 @@ end
 local function make_train(carriages)
   F.next_train = F.next_train + 1
   local sched = { current = 1, records = {}, group = "" }
+  local td
   local schedule = setmetatable({}, {
     __index = function(_, k)
       if k == "current" or k == "group" then
@@ -1953,12 +2018,13 @@ local function make_train(carriages)
             end
           end
           sched.records = records
-          sched.current = math.min(math.max(sched.current, 1), math.max(#records, 1))
+          sched.current = 1 -- the real game sends the train back to the first record (checked live)
         end
       elseif k == "go_to_station" then
         return function(i)
           assert(i >= 1 and i <= #sched.records, "go_to_station: no record " .. tostring(i))
           sched.current = i
+          td.manual_mode = false -- as the real go_to_station (checked live)
         end
       elseif k == "get_record_count" then
         return function() return #sched.records end
@@ -1989,7 +2055,7 @@ local function make_train(carriages)
       error("LuaSchedule doesn't contain key " .. tostring(k), 2)
     end,
   })
-  local td = {
+  td = {
     id = F.next_train, state = defines.train_state.no_schedule, manual_mode = false, speed = 0, valid = true,
     carriages = carriages, get_schedule = function() return schedule end, group = "",
   }
@@ -2057,9 +2123,9 @@ end
 -- A section in a group shares its filters with every other section of that group
 -- (F.logistic_groups[name]).
 F.logistic_groups = {}
-local function make_section(group)
+local function make_section(group, is_manual)
   local filters = group and (F.logistic_groups[group] or {}) or {}
-  local fields = { active = true, multiplier = 1, group = group or "" }
+  local fields = { active = true, multiplier = 1, group = group or "", is_manual = is_manual ~= false }
   return setmetatable({}, {
     __index = function(_, k)
       if k == "filters" then
@@ -2105,7 +2171,7 @@ end
 -- requester LuaLogisticPoint (which also has enabled and trash_not_requested).
 local function make_sections(point)
   local sections = {}
-  local fields = { enabled = true, trash_not_requested = false }
+  local fields = { enabled = true, trash_not_requested = false, targeted_items_deliver = {}, targeted_items_pickup = {} }
   return setmetatable({}, {
     __index = function(_, k)
       if k == "get_section" then
@@ -2130,6 +2196,8 @@ local function make_sections(point)
         return copy
       elseif k == "sections_count" then
         return #sections
+      elseif point and k == "logistic_network" then
+        return F.network
       elseif point and fields[k] ~= nil then
         return fields[k]
       end
@@ -2154,6 +2222,8 @@ function F.make_cell(owner, logistic_radius, construction_radius)
     valid = true, owner = owner, logistic_radius = logistic_radius, construction_radius = construction_radius,
     mobile = owner.type ~= "roboport",
     charging_robots = {}, to_charge_robots = {},
+    stationed_logistic_robot_count = 0, stationed_construction_robot_count = 0,
+    charging_robot_count = 0, to_charge_robot_count = 0,
     is_in_construction_range = function(position) return in_square(owner, construction_radius, position) end,
   })
 end
@@ -2162,7 +2232,12 @@ end
 -- `cells` (optional): its LuaLogisticCells (F.make_cell).
 function F.make_network(id, robots, contents, cells)
   local own_cells = cells or F.network_cells or {}
-  return strict("LuaLogisticNetwork", {
+  local fields = {
+    valid = true, network_id = id,
+    available_logistic_robots = robots[1], all_logistic_robots = robots[2],
+    available_construction_robots = robots[3], all_construction_robots = robots[4],
+    cells = own_cells, storages = {}, providers = {}, active_providers = {}, requesters = {},
+    construction_robots = {}, logistic_robots = {}, custom_name = "",
     find_cell_closest_to = function(position)
       assert(type(position) == "table", "find_cell_closest_to(position)")
       local x, y = position.x or position[1], position.y or position[2]
@@ -2175,13 +2250,10 @@ function F.make_network(id, robots, contents, cells)
       end
       return best
     end,
-    valid = true, network_id = id,
-    available_logistic_robots = robots[1], all_logistic_robots = robots[2],
-    available_construction_robots = robots[3], all_construction_robots = robots[4],
     get_contents = function()
       local out = {}
       for _, c in ipairs(contents) do
-        out[#out + 1] = { name = c[1], count = c[2], quality = "normal" }
+        out[#out + 1] = { name = c[1], count = c[2], quality = c[3] or "normal" }
       end
       return out
     end,
@@ -2195,7 +2267,18 @@ function F.make_network(id, robots, contents, cells)
       end
       return n
     end,
-    cells = own_cells, storages = {}, providers = {}, requesters = {}, custom_name = "",
+  }
+  return setmetatable({}, {
+    __index = function(_, k)
+      if fields[k] ~= nil then
+        return fields[k]
+      end
+      error("LuaLogisticNetwork doesn't contain key " .. tostring(k), 2)
+    end,
+    __newindex = function(_, k, v)
+      assert(k == "custom_name", "LuaLogisticNetwork: can't write " .. tostring(k))
+      fields.custom_name = tostring(v)
+    end,
   })
 end
 
@@ -2267,8 +2350,56 @@ local function make_entity(surface, params)
     data.ghost_name = params.inner_name
     data.ghost_prototype = entity_protos[params.inner_name]
     data.ghost_type = entity_protos[params.inner_name].type
+    local ghost_recipe = params.recipe
+    local ghost_recipe_quality = qualities.normal
+    if data.ghost_type == "assembling-machine" or data.ghost_type == "furnace" then
+      data.get_recipe = function()
+        return ghost_recipe and forces.player.recipes[ghost_recipe] or nil, ghost_recipe and ghost_recipe_quality or nil
+      end
+    end
+    if data.ghost_type == "assembling-machine" then
+      data.set_recipe = function(name, quality)
+        assert(quality == nil or (name ~= nil and qualities[quality]), "set_recipe(name, quality?)")
+        ghost_recipe_quality = qualities[quality or "normal"]
+        if name ~= nil and not forces.player.recipes[name] then
+          error("Unknown recipe " .. tostring(name))
+        end
+        ghost_recipe = name
+        return {}
+      end
+    end
+    data.item_requests = params.item_requests
     if data.ghost_type == "underground-belt" then
       data.belt_to_ground_type = params.type or "input"
+    elseif data.ghost_type == "linked-belt" then
+      data.linked_belt_type = params.type or "input"
+    elseif data.ghost_type == "logistic-container" or data.ghost_type == "roboport" then
+      local gm = data.ghost_prototype.logistic_mode
+      local sections = make_sections(true)
+      data.get_logistic_sections = function() return sections end
+      data.get_logistic_point = function(i) return sections end
+      if gm == "requester" then
+        data.request_from_buffers = false
+      elseif gm == "storage" then
+        local gfilter = nil
+        data.get_filter = function(i)
+          assert(i == 1, "a storage chest has one filter")
+          return gfilter and { name = item_protos[gfilter.name], quality = { name = gfilter.quality or "normal" } } or nil
+        end
+        data.set_filter = function(...)
+          local i, item = ...
+          assert(i == 1 and (select("#", ...) == 1 or item ~= nil), "set_filter(1) clears; set_filter(1, item) sets")
+          if item == nil then
+            gfilter = nil
+          elseif type(item) == "table" then
+            assert(item_protos[item.name], "unknown item " .. tostring(item.name))
+            gfilter = { name = item.name, quality = item.quality or "normal" }
+          else
+            assert(item_protos[item], "unknown item " .. tostring(item))
+            gfilter = { name = item, quality = "normal" }
+          end
+        end
+      end
     end
     -- A rolling stock ghost faces its way by orientation; its direction reads north (issue #13: the
     -- client drew every train ghost facing one way). Reviving it builds the carriage turned so.
@@ -2387,6 +2518,10 @@ local function make_entity(surface, params)
     -- What it mines now (LuaEntity.mining_target), nil until the harness sets it.
     optional.drop_target, optional.mining_target = true, true
     writable.drop_target, writable.mining_target = "harness", "harness"
+  elseif proto.type == "entity-ghost" then
+    optional.item_requests = true
+    writable.item_requests = "harness"
+    writable.request_from_buffers = true
   end
   -- Where an inserter takes from and puts, and where a drill drops (pickup_position, drop_position): nil until
   -- the harness sets them (the real ones always have one; a test world's default spot would land on belts the
@@ -2398,7 +2533,10 @@ local function make_entity(surface, params)
     data.robot_order_queue = params.robot_order_queue or {}
     data.energy = params.energy ~= nil and params.energy or (proto.type == "construction-robot" and 3000000 or 1500000)
     data.orientation = params.orientation or 0
+    data.logistic_network = params.logistic_network
+    optional.logistic_network = true
     writable.robot_order_queue = "harness"
+    writable.logistic_network = "harness"
   elseif proto.type == "mining-drill" then
     optional.drop_position = true
     data.mining_progress, data.bonus_mining_progress = 0, 0
@@ -2628,7 +2766,7 @@ local function make_entity(surface, params)
     data.linked_belt_type = params.linked_belt_type or "input"
   elseif t == "resource" then
     data.amount = params.amount or 3
-  elseif t == "car" or t == "locomotive" or t == "cargo-wagon" then
+  elseif t == "car" or t == "locomotive" or t == "cargo-wagon" or t == "fluid-wagon" then
     -- A vehicle: a driver's seat (and a car's passenger seat), a burner, speed. Getting in moves
     -- the character to the vehicle; getting out puts it two tiles east of it.
     data.orientation = 0.25
@@ -2683,6 +2821,14 @@ local function make_entity(surface, params)
     data.set_passenger = function(who) seat("passenger", who) end
     local targeting = { auto_target_without_gunner = true, auto_target_with_gunner = false }
     local waypoints = {}
+    local spider_logistics_moving = true
+    local spider_sections = make_sections(true)
+    data.logistic_network = F.network
+    data.get_logistic_sections = function() return spider_sections end
+    data.get_logistic_point = function(i)
+      assert(i == defines.logistic_member_index.spidertron_requester, "get_logistic_point(spidertron_requester)")
+      return spider_sections
+    end
     data.add_autopilot_destination = function(p)
       assert(type(p) == "table" and type(p.x or p[1]) == "number", "add_autopilot_destination(MapPosition)")
       waypoints[#waypoints + 1] = { x = p.x or p[1], y = p.y or p[2] }
@@ -2693,6 +2839,8 @@ local function make_entity(surface, params)
         if k == "vehicle_automatic_targeting_parameters" then
           return { auto_target_without_gunner = targeting.auto_target_without_gunner,
             auto_target_with_gunner = targeting.auto_target_with_gunner }
+        elseif k == "enable_logistics_while_moving" then
+          return spider_logistics_moving
         elseif k == "autopilot_destinations" then
           local out = {}
           for i, w in ipairs(waypoints) do
@@ -2708,6 +2856,10 @@ local function make_entity(surface, params)
           assert(type(v) == "table" and type(v.auto_target_with_gunner) == "boolean"
             and type(v.auto_target_without_gunner) == "boolean", "VehicleAutomaticTargetingParameters")
           targeting = { auto_target_without_gunner = v.auto_target_without_gunner, auto_target_with_gunner = v.auto_target_with_gunner }
+          return true
+        elseif k == "enable_logistics_while_moving" then
+          assert(type(v) == "boolean", "enable_logistics_while_moving is boolean")
+          spider_logistics_moving = v
           return true
         elseif k == "autopilot_destination" then
           waypoints = v and { { x = v.x or v[1], y = v.y or v[2] } } or {}
@@ -2786,9 +2938,19 @@ local function make_entity(surface, params)
       local r = proto.logistic_radius or 25
       local cell_charging = params.charging_robots or {}
       local cell_to_charge = params.to_charge_robots or {}
+      local robo_sections = make_sections(true)
+      data.get_logistic_sections = function() return robo_sections end
+      data.get_logistic_point = function(i)
+        assert(i == defines.logistic_member_index.roboport_requester, "get_logistic_point(roboport_requester)")
+        return robo_sections
+      end
       data.logistic_cell = setmetatable({ valid = true, object_name = "LuaLogisticCell", logistic_radius = r,
         construction_radius = proto.construction_radius or 55, logistics_connection_distance = r,
-        charging_robots = cell_charging, to_charge_robots = cell_to_charge }, {
+        mobile = false, charging_robots = cell_charging, to_charge_robots = cell_to_charge,
+        stationed_logistic_robot_count = params.stationed_logistic_robot_count or 0,
+        stationed_construction_robot_count = params.stationed_construction_robot_count or 0,
+        charging_robot_count = #cell_charging,
+        to_charge_robot_count = #cell_to_charge }, {
         __index = function(_, k)
           if k == "owner" then
             return data.self
@@ -2806,7 +2968,7 @@ local function make_entity(surface, params)
         end,
       })
     end
-    if proto.logistic_mode == "requester" then
+    if proto.logistic_mode == "requester" or proto.logistic_mode == "buffer" then
       -- The requester point carries the sections and "trash unrequested" (machine_info.lua).
       local sections = make_sections(true)
       data.get_logistic_sections = function() return sections end
@@ -2815,18 +2977,26 @@ local function make_entity(surface, params)
         return sections
       end
       data.request_from_buffers = false
+      writable.request_from_buffers = true
     elseif proto.logistic_mode == "storage" then
       local filter = nil
       data.get_filter = function(i)
         assert(i == 1, "a storage chest has one filter")
         -- 2.1 gives prototypes, not names (seen in 2.1.23).
-        return filter and { name = item_protos[filter], quality = { name = "normal" } } or nil
+        return filter and { name = item_protos[filter.name], quality = { name = filter.quality or "normal" } } or nil
       end
       data.set_filter = function(...)
         local i, item = ...
         assert(i == 1 and (select("#", ...) == 1 or item ~= nil), "set_filter(1) clears; set_filter(1, item) sets")
-        assert(item == nil or item_protos[item], "unknown item " .. tostring(item))
-        filter = item
+        if item == nil then
+          filter = nil
+        elseif type(item) == "table" then
+          assert(item_protos[item.name], "unknown item " .. tostring(item.name))
+          filter = { name = item.name, quality = item.quality or "normal" }
+        else
+          assert(item_protos[item], "unknown item " .. tostring(item))
+          filter = { name = item, quality = "normal" }
+        end
       end
     end
   elseif t == "cliff" then
@@ -2916,6 +3086,23 @@ local function make_entity(surface, params)
       assert(select("#", ...) == 2, "set_filter(i, nil) clears")
       assert(f == nil or asteroid_chunks[f], "set_filter: an asteroid chunk name")
       filters[i] = f
+    end
+  elseif t == "straight-rail" or t == "half-diagonal-rail" or t == "curved-rail-a" or t == "curved-rail-b"
+      or t == "legacy-straight-rail" or t == "legacy-curved-rail" or t == "elevated-straight-rail"
+      or t == "elevated-half-diagonal-rail" or t == "elevated-curved-rail-a" or t == "elevated-curved-rail-b"
+      or t == "rail-ramp" then
+    data.get_rail_segment_rails = function(_dir)
+      return F.rail_segments[data.self] or { data.self }
+    end
+    data.get_rail_segment_overlaps = function(_dir)
+      return F.rail_overlaps[data.self] or {}
+    end
+    data.is_rail_in_same_rail_block_as = function(other)
+      if other == data.self then
+        return true
+      end
+      local b1, b2 = F.rail_blocks[data.self], F.rail_blocks[other]
+      return b1 ~= nil and b1 == b2
     end
   elseif t == "train-stop" then
     data.backer_name = params.backer_name or "Stop"
@@ -3043,7 +3230,7 @@ local function make_entity(surface, params)
     -- An empty hand resting over the pickup side.
     local d = data.direction / 16 * 2 * math.pi
     data.held_stack_position = { x = data.position.x - math.sin(d), y = data.position.y + math.cos(d) }
-    data.held_stack = strict("LuaItemStack", { valid_for_read = false })
+    data.held_stack = item_stack({}, 1)
     -- No control behaviour until it is wired or asked for (get_or_create_control_behavior).
     local behavior = nil
     local function check_condition(c)
@@ -3186,6 +3373,9 @@ local function make_entity(surface, params)
   if t == "car" or t == "spider-vehicle" then
     invs.trunk = make_inventory(F.trunk_size or 20)
   end
+  if t == "spider-vehicle" then
+    invs.spider_trash = make_inventory(10)
+  end
   if (t == "car" or t == "locomotive") and data.burner then
     invs.fuel = data.burner.inventory
   end
@@ -3213,10 +3403,14 @@ local function make_entity(surface, params)
   if t == "car" or t == "spider-vehicle" then
     data.driver_is_gunner = true
     data.selected_gun_index = 1
+    optional.logistic_cell, optional.logistic_network = true, true
+    writable.logistic_cell, writable.logistic_network = "harness", "harness"
+    data.logistic_cell = params.logistic_cell
+    data.logistic_network = params.logistic_network
   end
   data.self = e
   F.datas[e] = data
-  if t == "car" or t == "spider-vehicle" or t == "locomotive" or t == "cargo-wagon" then
+  if t == "car" or t == "spider-vehicle" or t == "locomotive" or t == "cargo-wagon" or t == "fluid-wagon" then
     F.by_unit[data.unit_number] = e
   end
   F.inventories[e] = invs
@@ -3339,7 +3533,7 @@ local function make_entity(surface, params)
       return target.insert(stack)
     end
     data.can_insert = function(stack) return true end
-  elseif t == "car" or t == "spider-vehicle" or t == "locomotive" or t == "cargo-wagon" then
+  elseif t == "car" or t == "spider-vehicle" or t == "locomotive" or t == "cargo-wagon" or t == "fluid-wagon" then
     -- As the game's LuaEntity.insert on a vehicle: fuel into the fuel slot, ammo into the ammo
     -- slots, what doesn't fit there (and anything else) into the trunk; a locomotive takes only
     -- fuel, a wagon everything into its cargo.
@@ -3484,6 +3678,10 @@ local function make_entity(surface, params)
 
   if t == "character" then
     local requester = make_sections(true)
+    optional.logistic_cell, optional.logistic_network = true, true
+    writable.logistic_cell, writable.logistic_network = "harness", "harness"
+    data.logistic_cell = params.logistic_cell
+    data.logistic_network = params.logistic_network
     data.color = { r = 1, g = 0.63, b = 0.26, a = 1 }  -- the default player colour
     -- Only once the force has researched character logistics (2.1.23: nil before).
     data.get_requester_point = function()
@@ -4469,8 +4667,15 @@ F.stack_blueprint = {
       if q.x >= a1[1] and q.x <= a2[1] and q.y >= a1[2] and q.y <= a2[2] and e.type ~= "character"
           and e.type ~= "resource" and e.type ~= "tile-ghost" and e.unit_number and e.force == p.force then
         -- Ghosts are copied as the entity they stand for (2.1.23).
-        slot.bp[#slot.bp + 1] = { entity_number = #slot.bp + 1, name = e.type == "entity-ghost" and e.ghost_name or e.name, position = { x = q.x, y = q.y },
+        local bp_ent = { entity_number = #slot.bp + 1, name = e.type == "entity-ghost" and e.ghost_name or e.name, position = { x = q.x, y = q.y },
           direction = e.direction }
+        if e.type == "assembling-machine" or e.type == "furnace" or (e.type == "entity-ghost" and (e.ghost_type == "assembling-machine" or e.ghost_type == "furnace")) then
+          local okr, rec = pcall(e.get_recipe)
+          if okr and rec then
+            bp_ent.recipe = rec.name
+          end
+        end
+        slot.bp[#slot.bp + 1] = bp_ent
       end
     end
     return {}
@@ -4501,7 +4706,7 @@ F.stack_blueprint = {
       made[#made + 1] = p.surface.create_entity({
         name = "entity-ghost", inner_name = b.name, force = p.force, raise_built = p.raise_built,
         position = { x = p.position[1] + (b.position.x or b.position[1]) - cx, y = p.position[2] + (b.position.y or b.position[2]) - cy },
-        direction = b.direction,
+        direction = b.direction, recipe = b.recipe,
       })
       if #made == 1 then F.last_built = {} end
       F.last_built[#made] = b
@@ -4988,12 +5193,27 @@ function F.make_player(character)
       end
       local place = prototypes.item[cursor.name].place_result
       raise("on_pre_build", { player_index = 1, position = p.position, direction = p.direction or 0 })
-      local built = character.surface.create_entity({ name = place.name, position = p.position,
+      local w, h = place.tile_width, place.tile_height
+      if p.direction == 4 or p.direction == 12 then
+        w, h = h, w
+      end
+      local x, y = p.position.x or p.position[1], p.position.y or p.position[2]
+      for _, g in ipairs(character.surface.find_entities_filtered({
+        area = { { x - w / 2 + 0.05, y - h / 2 + 0.05 }, { x + w / 2 - 0.05, y + h / 2 - 0.05 } },
+        type = "entity-ghost",
+      })) do
+        g.destroy()
+      end
+      local fast = character.surface.can_fast_replace({ name = place.name, position = p.position,
         direction = p.direction or 0, force = character.force })
+      local built = character.surface.create_entity({ name = place.name, position = p.position,
+        direction = p.direction or 0, force = character.force, fast_replace = fast or nil,
+        character = fast and character or nil })
       if built then
-        cursor.count = cursor.count - 1
-        if cursor.count == 0 then
+        if cursor.count <= 1 then
           cursor.clear()
+        else
+          cursor.count = cursor.count - 1
         end
         F.player_events[#F.player_events + 1] = "on_built_entity"
         raise("on_built_entity", { entity = built, player_index = 1 })

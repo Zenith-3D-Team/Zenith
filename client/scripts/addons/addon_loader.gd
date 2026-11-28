@@ -32,8 +32,9 @@ const API_VERSION := 1
 ## dependencies, api.addons, api.sound, reload and script errors, a look's shadow_edge; 1.8: api.weather,
 ## api.sound.loop / update_loop / stop_loop; 1.9: api.creatures; 1.91: api.world.tick, smooth_tick and cue_tick,
 ## the game's tick for timed scenes; levels are numbers, so the one after 1.9 is 1.91, not 1.10; 1.92: api.cue_changed
-## and a cue the game sets while running; 1.93: api.native_class). An addon.json may ask for 1.1 to 1.93; 1 means any 1.x.
-const API_LEVEL := 1.93
+## and a cue the game sets while running; 1.93: api.native_class; 1.94: api.world.prepare_view, release_view and mark_cut;
+## 1.95: api.creatures.make_ragdoll_part_nodes). An addon.json may ask for 1.1 to 1.95; 1 means any 1.x.
+const API_LEVEL := 1.95
 const MANIFEST := "addon.json"
 ## Ids are folder-like names: lower case letters, digits, - and _.
 const ID_CHARS := "abcdefghijklmnopqrstuvwxyz0123456789-_"

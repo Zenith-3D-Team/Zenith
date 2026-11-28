@@ -54,12 +54,15 @@ var _roar_id := 0
 var _rush_id := 0
 var _last_usec := 0
 var _forced_old := false
+var _forced_original := false
+var _tone_original := false  # the tone in use (the setting, unless --weather-sounds=original)
 var _opts := {"volume": 0.0, "pitch": 1.0}  # update_loop's options, reused every frame
 
 
 func _init(a) -> void:
 	api = a
 	_forced_old = wind_arg(OS.get_cmdline_user_args()) == "old"
+	_forced_original = sounds_arg(OS.get_cmdline_user_args()) == "original"
 	storm = StormWind.new()
 
 
@@ -79,8 +82,30 @@ func new_wind() -> bool:
 	return v == null or str(v) != "classic"
 
 
+## `--weather-sounds=original` (the unsoftened rain and wind loops whatever the setting), else "".
+static func sounds_arg(args: PackedStringArray) -> String:
+	for a: String in args:
+		if a.begins_with("--weather-sounds="):
+			return a.substr(17).strip_edges()
+	return ""
+
+
+## The original Weather Elements loops are in use (the setting, or --weather-sounds=original).
+func original_tone() -> bool:
+	if _forced_original:
+		return true
+	var v: Variant = api.settings.value("sound_tone")
+	return v != null and str(v) == "original"
+
+
+## A rain or wind loop's path in the tone in use ("sounds/x.ogg" soft, "sounds/original/x.ogg" original).
+func tone_path(path: String) -> String:
+	return path.replace("sounds/", "sounds/original/") if _tone_original else path
+
+
 func preload_all() -> void:
-	api.sound.preload_sounds([GENTLE_PATH, GUSTY_PATH, RAIN_LIGHT_PATH, RAIN_STEADY_PATH, RAIN_HEAVY_PATH])
+	_tone_original = original_tone()
+	api.sound.preload_sounds([tone_path(GENTLE_PATH), tone_path(GUSTY_PATH), tone_path(RAIN_LIGHT_PATH), tone_path(RAIN_STEADY_PATH), tone_path(RAIN_HEAVY_PATH)])
 	api.sound.preload_sounds(THUNDER_CRACK_PATHS)
 	api.sound.preload_sounds(THUNDER_ROLL_PATHS)
 	_preload_factorio()
@@ -115,6 +140,10 @@ func update(active_on_nauvis: bool, spec: Dictionary, delta := -1.0) -> void:
 	if not enabled:
 		stop_all()
 		return
+	if original_tone() != _tone_original:
+		# The tone setting changed: stop the loops, load the other files; they restart below.
+		stop_all()
+		preload_all()
 	var master := _setting_float("audio_volume", 1.0)
 	_update_wind(master, spec, delta)
 	_update_rain(master, spec)
@@ -128,7 +157,7 @@ func _update_wind(master: float, spec: Dictionary, frame_delta := -1.0) -> void:
 	var gentle_v := clampf(wind_amt * 1.1 * (1.0 - smoothstep(0.45, 0.95, wind_amt)) * base_gain, 0.0, 0.85)
 	var gusty_v := clampf(smoothstep(0.32, 0.95, wind_amt) * 0.8 * base_gain, 0.0, 0.85)
 
-	_gentle_id = _drive_loop(_gentle_id, GENTLE_PATH, gentle_v, 0.95 + 0.1 * wind_amt)
+	_gentle_id = _drive_loop(_gentle_id, tone_path(GENTLE_PATH), gentle_v, 0.95 + 0.1 * wind_amt)
 
 	var now := Time.get_ticks_usec()
 	var delta := clampf(float(now - _last_usec) / 1000000.0, 0.0, 0.1) if _last_usec > 0 else 0.0
@@ -142,12 +171,12 @@ func _update_wind(master: float, spec: Dictionary, frame_delta := -1.0) -> void:
 		storm.step(delta, wind_amt, base_gain)
 		_roar_id = _drive_stream(_roar_id, storm.roar, storm.roar_vol, storm.roar_pitch)
 		_rush_id = _drive_stream(_rush_id, storm.rush, storm.rush_vol, storm.rush_pitch)
-		_gusty_id = _drive_loop(_gusty_id, GUSTY_PATH, storm.whistle_vol, 1.0)
+		_gusty_id = _drive_loop(_gusty_id, tone_path(GUSTY_PATH), storm.whistle_vol, 1.0)
 		return
 	# Classic (or the new layers still being made at the game's start).
 	_roar_id = _drive_stream(_roar_id, null, 0.0, 1.0)
 	_rush_id = _drive_stream(_rush_id, null, 0.0, 1.0)
-	_gusty_id = _drive_loop(_gusty_id, GUSTY_PATH, gusty_v, 0.92 + 0.16 * wind_amt)
+	_gusty_id = _drive_loop(_gusty_id, tone_path(GUSTY_PATH), gusty_v, 0.92 + 0.16 * wind_amt)
 
 
 func _update_rain(master: float, spec: Dictionary) -> void:
@@ -176,9 +205,9 @@ func _update_rain(master: float, spec: Dictionary) -> void:
 	var own := 0.0 if factorio_live else 1.0
 	var base := clampf(gain * 0.9, 0.0, 1.0) * own
 	var pitch := 0.97 + 0.06 * rain_amt
-	_rain_light_id = _drive_loop(_rain_light_id, RAIN_LIGHT_PATH, clampf(light * base, 0.0, 1.0), pitch)
-	_rain_steady_id = _drive_loop(_rain_steady_id, RAIN_STEADY_PATH, clampf(steady * base, 0.0, 1.0), pitch)
-	_rain_heavy_id = _drive_loop(_rain_heavy_id, RAIN_HEAVY_PATH, clampf(heavy * base, 0.0, 1.0), pitch)
+	_rain_light_id = _drive_loop(_rain_light_id, tone_path(RAIN_LIGHT_PATH), clampf(light * base, 0.0, 1.0), pitch)
+	_rain_steady_id = _drive_loop(_rain_steady_id, tone_path(RAIN_STEADY_PATH), clampf(steady * base, 0.0, 1.0), pitch)
+	_rain_heavy_id = _drive_loop(_rain_heavy_id, tone_path(RAIN_HEAVY_PATH), clampf(heavy * base, 0.0, 1.0), pitch)
 
 
 ## Keeps Factorio's rain loop going; true when it is playing. Retries (not every frame) while absent.

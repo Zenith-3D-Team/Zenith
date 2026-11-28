@@ -37,6 +37,7 @@ const BOUNDS := AABB(Vector3(-100000.0, -100.0, -100000.0), Vector3(200000.0, 40
 ## construction robots for work.
 const CARGO_SLICE := 64
 const WORK_LOOK := 0.1
+const CHARGE_SPARK_EVERY := 0.22
 
 
 class Bot:
@@ -48,6 +49,8 @@ class Bot:
 	var hidden := false  # movers.gd: the remote view's fog hides it (no sparks)
 	var cargo := false
 	var spark := 0.0
+	var charging := false
+	var charge_fx := 0.0
 
 
 class Batch:
@@ -57,11 +60,15 @@ class Batch:
 	var parts: Array[MultiMeshInstance3D] = []
 	var shadows: Array[MultiMeshInstance3D] = []
 	var bots: Array[Bot] = []
+	## M3: each bot's record by its slot, kept as bots are added, placed and removed (bots[i].record).
+	var slots := PackedInt32Array()
 	var capacity := 0
 	var buffer := PackedFloat32Array()
 	var dirty := false
 	var shown := -1
 	var sweep := 0  # where the cargo check got to
+	var mv_settle := 0
+	var charging_count := 0
 
 
 ## ui_model.gd's robot_cargo and sprite_fx.gd's sparks, through vehicle_anim.gd (main.gd sets them there).
@@ -71,8 +78,20 @@ var records: MoverRecords
 
 ## False with --robot-nodes: robots are drawn the old way, a node each (for comparing).
 static var enabled := not Switches.has("--robot-nodes")
+## `--mv-skip-idle=off`: always re-write and re-upload batch buffers under FSR 2.2 / TAA.
+static var mv_skip_idle := Switches.on("--mv-skip-idle")
+## --mm-bounds=engine: the MultiMesh's own box left unset, as before; Godot then works its bounds out over
+## every instance of its capacity at each buffer upload (perf-render R6). The node's box culls either way.
+static var mm_own_bounds := not Switches.has("--mm-bounds=engine")
+## M3 (--native-mover-sweep=off: each frame's record list rebuilt from the bots and the idle check in
+## GDScript, as before): the batch's kept slots go to write_xforms and MoversNative.any_active.
+static var native_sweep := not Switches.has("--native-mover-sweep=off")
+## --robot-charge-sparks=off disables electric arcs and spark bursts on charging worker robots.
+static var charge_sparks_default := Switches.on("--robot-charge-sparks")
+var charge_sparks_enabled := charge_sparks_default
 ## The last frame's draw time, microseconds (--robot-probe).
 var draw_usec := 0
+var mv_uploads := 0
 
 var _batches := {}  # proto name -> Batch
 var _shadow_material: ShaderMaterial
@@ -99,6 +118,7 @@ func add(unit: int, proto_name: String) -> Bot:
 	bot.phase = float(posmod(unit * 7919, 1000)) / 1000.0 * TAU
 	bot.cargo = _cargo().has(unit)
 	batch.bots.append(bot)
+	batch.slots.push_back(bot.record)
 	return bot
 
 
@@ -120,6 +140,8 @@ func place(bot: Bot, record: int) -> void:
 	var batch := bot.batch
 	if batch == null:
 		return
+	if bot.slot < batch.slots.size():
+		batch.slots[bot.slot] = record
 	if batch.bots.size() > batch.capacity:
 		_grow(batch, batch.bots.size())
 	_write_instance(batch, bot.slot, record)
@@ -148,14 +170,31 @@ static func _write_instance(batch: Batch, i: int, record: int) -> void:
 	b[o + 15] = 0.0
 
 
+func set_charging(bot: Bot, on: bool) -> void:
+	if bot == null or bot.charging == on:
+		return
+	bot.charging = on
+	if on:
+		bot.charge_fx = randf_range(0.0, 0.08)
+	var batch := bot.batch
+	if batch != null:
+		batch.charging_count = maxi(0, batch.charging_count + (1 if on else -1))
+
+
 func remove(bot: Bot) -> void:
 	var batch := bot.batch
 	if batch == null or bot.slot >= batch.bots.size() or batch.bots[bot.slot] != bot:
 		return
+	if bot.charging:
+		bot.charging = false
+		batch.charging_count = maxi(0, batch.charging_count - 1)
 	var last: Bot = batch.bots[batch.bots.size() - 1]
 	batch.bots[bot.slot] = last
 	last.slot = bot.slot
 	batch.bots.resize(batch.bots.size() - 1)
+	if last.slot < batch.slots.size():
+		batch.slots[last.slot] = last.record
+	batch.slots.resize(batch.bots.size())
 	if last != bot:
 		_write_instance(batch, last.slot, last.record)
 	batch.dirty = true
@@ -167,8 +206,11 @@ func clear() -> void:
 		_free_batch(batch)
 		# Bots and their batch point at each other: let go of both, or neither is ever freed.
 		for bot in batch.bots:
+			bot.charging = false
 			bot.batch = null
 		batch.bots.clear()
+		batch.slots.clear()
+		batch.charging_count = 0
 	_batches.clear()
 	_mv_active = false
 
@@ -226,6 +268,7 @@ func refresh(usec := 0) -> bool:
 		_free_batch(batch)
 		var fresh := _make_batch(name)
 		fresh.bots = bots
+		fresh.slots = batch.slots
 		for bot in bots:
 			bot.batch = fresh
 		_grow(fresh, bots.size())
@@ -267,27 +310,43 @@ func _draw(delta: float) -> void:
 			_grow(batch, n)
 		if want_mv and n > 0:
 			var nat := MoverRecords.native()
-			if nat != null:
-				var slots := PackedInt32Array()
-				slots.resize(n)
-				for i in n:
-					slots[i] = (batch.bots[i] as Bot).record
-				batch.buffer = nat.write_xforms(records.data, slots, n, batch.buffer, c_even, c_odd, inv_rate, 0)
-				if nat.skipped() > 0:
+			var kept := native_sweep and nat != null and batch.slots.size() == n and nat.has_method("any_active")
+			var active_now := true
+			if mv_skip_idle:
+				active_now = nat.call("any_active", records.data, batch.slots, n, c_even, c_odd, inv_rate) if kept \
+						else _any_bot_active(batch, c_even, c_odd, inv_rate)
+			var need_mv := not mv_skip_idle or not _mv_active or batch.dirty or batch.mv_settle > 0 or active_now
+			if need_mv:
+				if active_now:
+					batch.mv_settle = 2
+				elif batch.dirty or not _mv_active:
+					batch.mv_settle = maxi(batch.mv_settle, 1)
+				else:
+					batch.mv_settle -= 1
+				if nat != null:
+					var slots := batch.slots
+					if not kept:
+						slots = PackedInt32Array()
+						slots.resize(n)
+						for i in n:
+							slots[i] = (batch.bots[i] as Bot).record
+					batch.buffer = nat.write_xforms(records.data, slots, n, batch.buffer, c_even, c_odd, inv_rate, 0)
+					if nat.skipped() > 0:
+						for i in n:
+							if slots[i] < 0:
+								_write_instance(batch, i, slots[i])
+				else:
 					for i in n:
-						if slots[i] < 0:
-							_write_instance(batch, i, slots[i])
-			else:
-				for i in n:
-					var bot: Bot = batch.bots[i]
-					if bot.record >= 0:
-						records.write_xform(bot.record, batch.buffer, i * STRIDE, c_even, c_odd, inv_rate)
-						batch.buffer[i * STRIDE + 12] = float(bot.record)
-						batch.buffer[i * STRIDE + 13] = 1.0
-					else:
-						_write_instance(batch, i, bot.record)
-			batch.dirty = true
+						var bot: Bot = batch.bots[i]
+						if bot.record >= 0:
+							records.write_xform(bot.record, batch.buffer, i * STRIDE, c_even, c_odd, inv_rate)
+							batch.buffer[i * STRIDE + 12] = float(bot.record)
+							batch.buffer[i * STRIDE + 13] = 1.0
+						else:
+							_write_instance(batch, i, bot.record)
+				batch.dirty = true
 		elif _mv_active and not want_mv and n > 0:
+			batch.mv_settle = 0
 			for i in n:
 				_write_instance(batch, i, batch.bots[i].record)
 			batch.dirty = true
@@ -297,6 +356,7 @@ func _draw(delta: float) -> void:
 				RenderingServer.multimesh_set_buffer(mmi.multimesh.get_rid(), batch.buffer)
 			for mmi in batch.shadows:
 				RenderingServer.multimesh_set_buffer(mmi.multimesh.get_rid(), batch.buffer)
+			mv_uploads += 1
 		if n != batch.shown:
 			batch.shown = n
 			for mmi in batch.parts:
@@ -318,14 +378,64 @@ func _draw(delta: float) -> void:
 					bot.cargo = has
 					records.set_flag(bot.record, MoverRecords.CARGO, has)
 			batch.sweep = end if end < n else 0
-		if look and batch.kind == "construction":
-			_sparks(batch, WORK_LOOK)
+		if look and batch.kind != "":
+			if batch.kind == "construction":
+				_sparks(batch, WORK_LOOK)
+			if charge_sparks_enabled and batch.charging_count > 0:
+				_charge_sparks(batch, WORK_LOOK)
 	_mv_active = want_mv
 
 
 ## Construction robots standing still for VehicleAnim.WORK_STILL work: sparks fly from their nozzle
 ## now and then, as vehicle_anim.gd threw them. A robot stands once the clock is past its record's
 ## last point (robots are drawn stopping there until the next comes).
+func _any_bot_active(batch: Batch, c_even: float, c_odd: float, inv_rate: float) -> bool:
+	for bot in batch.bots:
+		if _slot_active(records, bot.record, c_even, c_odd, inv_rate):
+			return true
+	return false
+
+
+static func _slot_active(recs: MoverRecords, slot: int, c_even: float, c_odd: float, inv_rate: float) -> bool:
+	if slot < 0:
+		return false
+	var d := recs.data
+	var o := slot * MoverRecords.FLOATS
+	if o + 28 >= d.size():
+		return true
+	var flags := int(d[o + 12])
+	var now := c_odd if (flags & MoverRecords.ODD) != 0 else c_even
+	var after := maxf(now - d[o + 15], 0.0)
+	if after < 2.0:
+		return true
+	if (flags & MoverRecords.SIMULATED) != 0:
+		if (flags & MoverRecords.SIM_ORBIT) != 0:
+			return true
+		if now < maxf(d[o + 9], d[o + 10]):
+			return true
+		var since := after * inv_rate
+		if absf(d[o + 6]) + absf(d[o + 7]) > 1e-4 and exp(-d[o + 24] * since) > 1e-4:
+			return true
+		var had_leg2 := d[o + 10] > d[o + 9] + 1e-4
+		var since_yaw := maxf(now - maxf(d[o + 15], d[o + 9]), 0.0) * inv_rate if had_leg2 else since
+		var yaw_from := d[o + 14] if had_leg2 else d[o + 16]
+		var yaw_to := d[o + 17] if had_leg2 else d[o + 14]
+		return absf(wrapf(yaw_from - yaw_to, -PI, PI)) * exp(-MoverRecords.TURN_RATE * since_yaw) > 1e-4
+	var since3 := after * inv_rate
+	if absf(wrapf(d[o + 16] - d[o + 17], -PI, PI)) * exp(-MoverRecords.TURN_RATE * since3) > 1e-4:
+		return true
+	var l0: float = d[o + 24]
+	var g0: float = d[o + 25]
+	var gg: float = d[o + 26]
+	var gap := move_toward(g0, gg, after * (d[o + 28] if gg > g0 else 1.0))
+	var want := maxf(2.0 * gap, d[o + 27] + gap)
+	var lag := minf(l0 + 0.5 * after, want) if want >= l0 else maxf(l0 - after, want)
+	var drawn := now - lag
+	var span3: float = d[o + 11] - d[o + 10]
+	var end_drawn: float = d[o + 10] + d[o + 23] * span3 if span3 > 1e-4 else d[o + 11]
+	return drawn < end_drawn
+
+
 func _sparks(batch: Batch, step: float) -> void:
 	var sprites: Node = vehicles.get("sprites") if vehicles != null else null
 	if sprites == null:
@@ -354,6 +464,44 @@ func _sparks(batch: Batch, step: float) -> void:
 			yaw = d[o + 17]
 			at = Vector3(d[o + 6], d[o + 13], d[o + 7])
 		sprites.call("emit", "sparks", at + Vector3(-0.35 * sin(yaw), 0.0, -0.35 * cos(yaw)), 0.45, 0.35)
+
+
+static func emit_charge_sparks(sprites: Node, at: Vector3) -> void:
+	if sprites == null:
+		return
+	var w_arc := randf_range(0.78, 0.96)
+	var arc: Variant = sprites.call("emit", "roboport-charge",
+		at + Vector3(randf_range(-0.12, 0.12), -0.18, randf_range(-0.12, 0.12)),
+		w_arc, 0.36, Color(0.85, 0.96, 1.0, 0.95))
+	if arc is Object:
+		var arc_obj: Object = arc
+		arc_obj.set("fps", 30.0)
+		arc_obj.set("size1", w_arc * 1.12)
+	var spk: Variant = sprites.call("emit", "sparks",
+		at + Vector3(randf_range(-0.14, 0.14), -0.12, randf_range(-0.14, 0.14)),
+		randf_range(0.34, 0.46), randf_range(0.22, 0.32), Color(0.55, 0.88, 1.0, 0.95))
+	if spk is Object:
+		var spk_obj: Object = spk
+		var ang := randf() * TAU
+		var spd := randf_range(0.25, 0.65)
+		spk_obj.set("vel", Vector3(cos(ang) * spd, randf_range(0.15, 0.55), sin(ang) * spd))
+		spk_obj.set("rise", -2.4)
+
+
+func _charge_sparks(batch: Batch, step: float) -> void:
+	if batch.charging_count <= 0:
+		return
+	var sprites: Node = vehicles.get("sprites") if vehicles != null else null
+	if sprites == null:
+		return
+	for bot: Bot in batch.bots:
+		if not bot.charging or bot.hidden or bot.record < 0:
+			continue
+		bot.charge_fx -= step
+		if bot.charge_fx > 0.0:
+			continue
+		bot.charge_fx = CHARGE_SPARK_EVERY * randf_range(0.7, 1.3)
+		emit_charge_sparks(sprites, records.position(bot.record))
 
 
 func _cargo() -> Dictionary:
@@ -413,6 +561,8 @@ func _instance(mesh: Mesh, material: Material) -> MultiMeshInstance3D:
 	mmi.multimesh = mm
 	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF  # the drop shadow is the shadow
 	mmi.custom_aabb = BOUNDS
+	if mm_own_bounds:
+		mm.custom_aabb = BOUNDS
 	if material != null:
 		mmi.material_override = material
 	add_child(mmi)

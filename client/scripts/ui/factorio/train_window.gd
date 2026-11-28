@@ -30,7 +30,7 @@ const GROUP_COUNT := Color8(128, 206, 240)
 const STATE_TEXT := {
 	"on_the_path": "On the way", "path_lost": "Path lost", "no_schedule": "No schedule", "no_path": "No path",
 	"arrive_signal": "Arriving at signal", "wait_signal": "Waiting at signal", "arrive_station": "Arriving at station",
-	"wait_station": "Waiting at station", "manual_control_stop": "Manual control", "manual_control": "Manual control",
+	"wait_station": "Waiting at station", "manual_control_stop": "Manually stopped", "manual_control": "Manually driving",
 	"destination_full": "Destination full",
 }
 
@@ -70,6 +70,13 @@ static func locomotive(screen, last: Dictionary, body: VBoxContainer) -> void:
 	body.add_child(strip)
 	body.move_child(strip, 0)
 	body.add_child(camera(screen, tr, 396, 150))
+	if tr.has("ctc"):
+		# Factorio's checkbox under the colour: the locomotive takes the colour of the stop it is bound for.
+		var copy := EntityPanels.checkbox("Use destination train stop color", int(tr["ctc"]) == 1,
+			func(on: bool) -> void: screen.model.set_train_copy_color(screen.unit, on))
+		copy.name = "UseStopColor"
+		copy.tooltip_text = "The train will copy its color from the destination train stop, updated each time the train leaves a station."
+		body.add_child(copy)
 	var drive := MenuKit.button("Drive remotely", "FGreenButton")
 	drive.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	drive.disabled = true
@@ -293,7 +300,7 @@ static func stop(screen, st: Dictionary, body: VBoxContainer) -> void:
 	field.text_submitted.connect(func(t: String) -> void:
 		field.release_focus()
 		if t.strip_edges() != "":
-			screen.model.set_stop(screen.unit, t.strip_edges()))
+			screen.model.set_stop(screen.unit, t.strip_edges(), -2, Input.is_key_pressed(KEY_CTRL)))
 	head.add_child(field)
 	var rename := LogicKit.rename_button("Rename", func() -> void:
 		title.visible = false
@@ -312,6 +319,12 @@ static func stop(screen, st: Dictionary, body: VBoxContainer) -> void:
 		body.remove_child(c)
 		left.add_child(c)
 	var limit := int(st.get("limit", -1))
+	# Factorio greys the limit and the priority out while the circuit network sets them ("Set train limit",
+	# "Set priority" with a wire on the stop); the circuit's signal rules there.
+	var cb: Dictionary = st.get("cb") if st.get("cb") is Dictionary else {}
+	var wired := int(cb.get("wired", 0)) == 1
+	var circuit_limit := wired and int(cb.get("limit", 0)) == 1
+	var circuit_pri := wired and int(cb.get("pri", 0)) == 1
 	var lim_row := EntityPanels.row(8)
 	var lim_slider := LogicKit.notched(0, maxi(10, limit), maxi(0, limit), limit >= 0,
 		func(v: int) -> void: screen.model.set_stop(screen.unit, "", maxi(0, v)))
@@ -320,16 +333,21 @@ static func stop(screen, st: Dictionary, body: VBoxContainer) -> void:
 	var limited := EntityPanels.checkbox("Enable train limit", limit >= 0, func(on: bool) -> void:
 		screen.model.set_stop(screen.unit, "", maxi(1, lim_slider.value) if on else -1))
 	limited.custom_minimum_size.x = Kit.px(130)
+	if circuit_limit:
+		lim_slider.set_enabled(false)
+		limited.disabled = true
 	lim_row.add_child(limited)
 	lim_row.add_child(lim_slider)
 	left.add_child(lim_row)
 	var pri_row := EntityPanels.row(8)
-	var pri_label := LogicKit.info_label("Priority", "Trains go to the stop with the highest priority first (0-255)")
+	var pri_label := LogicKit.info_label("Priority", "Higher priority train stop will be served first.\n(0 is the lowest, 255 the highest)")
 	pri_label.custom_minimum_size.x = Kit.px(130)
 	pri_row.add_child(pri_label)
 	var pri := LogicKit.notched(0, 255, int(st.get("pri", 50)), true,
 		func(v: int) -> void: screen.model.set_stop_settings(screen.unit, {"pri": clampi(v, 0, 255)}))
 	pri.name = "Priority"
+	if circuit_pri:
+		pri.set_enabled(false)
 	pri.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	pri_row.add_child(pri)
 	left.add_child(pri_row)

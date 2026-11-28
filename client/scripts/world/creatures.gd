@@ -47,6 +47,7 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const MoverShader := preload("res://shaders/factorio_material_mover.gdshader")
 const MoverAlphaShader := preload("res://shaders/factorio_material_mover_alpha.gdshader")
 const Wire := preload("res://scripts/util/wire.gd")
+const Switches := preload("res://scripts/switches.gd")
 
 ## Tiles walked per loop of the run animation (Factorio's distance_per_frame x 16 frames).
 const LOOP_DISTANCE := {
@@ -174,6 +175,7 @@ class Layer:
 	var cast := -1
 	var lods := false  # its mesh is the copy with view LODs (nothing more to swap)
 	var still := false  # walkers only, nothing changed: _flush looks at it again when the focus moves
+	var mv_settle := 0
 
 
 class Corpse:
@@ -250,6 +252,12 @@ const WARM_MODEL := "small-biter-corpse"
 var _puddle_task := -1  # loading the puddles' sheet on a worker thread; -2 once done
 var _puddle_images: Array = []  # what that task made, one per variation
 var _mv_active := false
+## `--mv-skip-idle=off`: always re-write and re-upload walker layers under FSR 2.2 / TAA.
+static var mv_skip_idle := Switches.on("--mv-skip-idle")
+## --mm-bounds=engine: the MultiMesh's own box left unset, as before; Godot then works its bounds out over
+## every instance of its capacity at each buffer upload (perf-render R6). The node's box culls either way.
+static var mm_own_bounds := not Switches.has("--mm-bounds=engine")
+var mv_uploads := 0
 ## Optional hook called when a creature dies (addon_host.gd / api.creatures.died):
 ## receives mutable Dictionary {unit, name, pos, yaw, vel, scale, phase, cause_pos, damage_type, dmg, src, handled}.
 ## If a listener sets info["handled"] = true, _collapse and the default corpse are skipped.
@@ -324,9 +332,13 @@ func placed(unit: int, at: Vector3) -> void:
 	if c == null:
 		return
 	c.at = at
-	if c.walker != null and _cell_of(at) != c.walker.cell:
-		_unwalk(c)
-		_walk(c)
+	if c.walker != null:
+		if _cell_of(at) != c.walker.cell:
+			_unwalk(c)
+			_walk(c)
+		else:
+			c.walker.still = false
+			c.walker.mv_settle = maxi(c.walker.mv_settle, 2)
 
 
 static func _cell_of(at: Vector3) -> Vector2i:
@@ -368,6 +380,7 @@ func _walk(c: Creature) -> void:
 	b[o + 14] = float(c.slot + 1)
 	b[o + 15] = 1.0
 	layer.dirty = true
+	layer.mv_settle = maxi(layer.mv_settle, 1)
 
 
 ## Takes a creature's walking instance out of its layer (the last one moves into its place).
@@ -385,6 +398,7 @@ func _unwalk(c: Creature) -> void:
 			b[c.index * 16 + k] = b[last * 16 + k]
 	layer.walkers.resize(last)
 	layer.dirty = true
+	layer.mv_settle = maxi(layer.mv_settle, 1)
 	c.walker = null
 	c.index = -1
 
@@ -725,6 +739,42 @@ func died_at(name: String, at: Vector3, cause_pos: Variant = null, damage_type :
 	_add_corpse(name + "-corpse", Transform3D(Basis.IDENTITY, at))
 
 
+## A spider-unit (Gleba strafer or stomper) died: fires `on_died_hook` with its live leg
+## transforms and pending damage metadata before `movers.gd` frees its node.
+func died_spider(unit: int, proto_name: String, pos: Vector3, yaw: float, vel: Vector3, parts: Array = []) -> void:
+	var cause_pos: Variant = null
+	var damage_type := ""
+	var dmg := 0
+	var src := ""
+	if _pending_death.has(unit):
+		var pd: Array = _pending_death[unit]
+		_pending_death.erase(unit)
+		cause_pos = pd[0]
+		damage_type = str(pd[1])
+		if pd.size() > 2:
+			dmg = int(pd[2])
+		if pd.size() > 3:
+			src = str(pd[3])
+	_wounds.erase(unit)
+	if on_died_hook.is_valid():
+		var info := {
+			"unit": unit,
+			"name": proto_name,
+			"pos": pos,
+			"yaw": yaw,
+			"vel": vel,
+			"scale": _scale_of(proto_name),
+			"phase": 0.0,
+			"cause_pos": cause_pos,
+			"damage_type": damage_type,
+			"dmg": dmg,
+			"src": src,
+			"parts": parts,
+			"handled": false,
+		}
+		on_died_hook.call(info)
+
+
 func _add_corpse(model: String, xform: Transform3D, puddle := -1, size := 1.0, life := CORPSE_SECONDS) -> void:
 	var corpse := Corpse.new()
 	corpse.model = model
@@ -962,6 +1012,8 @@ func _build_cell(cell: CorpseCell, key: Vector2i) -> void:
 		if mmi == null:
 			mmi = _new_layer(model)
 			mmi.custom_aabb = bounds
+			if mm_own_bounds:
+				mmi.multimesh.custom_aabb = bounds
 			cell.layers[model] = mmi
 		_fill(mmi.multimesh, by_model[model], 16)
 	if cell.puddles.is_empty() and not _puddle_meshes.is_empty() and puddles.any(func(b: PackedFloat32Array) -> bool: return not b.is_empty()):
@@ -973,6 +1025,8 @@ func _build_cell(cell: CorpseCell, key: Vector2i) -> void:
 			mmi.multimesh = mm
 			mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 			mmi.custom_aabb = bounds
+			if mm_own_bounds:
+				mm.custom_aabb = bounds
 			add_child(mmi)
 			cell.puddles.append(mmi)
 	for v in cell.puddles.size():
@@ -1350,7 +1404,14 @@ func _smooth01(value: float) -> float:
 
 func _scale_of(name: String) -> float:
 	var alias = CreatureModels.ALIASES.get(name)
-	return float(alias[1]) if alias != null else 1.0
+	if alias != null:
+		return float(alias[1])
+	if name.ends_with("-strafer-pentapod") or name.ends_with("-stomper-pentapod"):
+		if name.begins_with("small-"):
+			return 0.5625
+		if name.begins_with("medium-"):
+			return 0.75
+	return 1.0
 
 
 func _has_model(model: String) -> bool:
@@ -1537,13 +1598,15 @@ func _flush(focus: Vector3, delta := 0.0) -> void:
 			var layer: Layer = layers[cell]
 			var posed := layer.posed.size() / 16
 			var walkers := layer.walkers.size()
-			if layer.still and posed == 0 and not layer.dirty and not moved and not sweep and (layer.lods or not lod_beat) and not ((want_mv or _mv_active) and walkers > 0):
+			var mv_wake := (not mv_skip_idle and want_mv and walkers > 0) or (_mv_active and not want_mv and walkers > 0) or (want_mv and not _mv_active and walkers > 0)
+			if layer.still and posed == 0 and not layer.dirty and not moved and not sweep and (layer.lods or not lod_beat) and not mv_wake:
 				continue
 			layers_seen += 1
 			var mm := layer.mmi.multimesh
 			var total := walkers + posed
 			if total == 0:
 				layer.dirty = false
+				layer.mv_settle = 0
 				if layer.shown != 0:
 					mm.visible_instance_count = 0
 					layer.shown = 0
@@ -1553,26 +1616,38 @@ func _flush(focus: Vector3, delta := 0.0) -> void:
 					gone.append([layers, cell])
 				continue
 			_ensure(layer, total)
+			var mv_busy := false
 			if want_mv and walkers > 0:
-				var nat := MoverRecords.native()
-				if nat != null:
-					var slots := PackedInt32Array()
-					slots.resize(walkers)
-					for i in walkers:
-						slots[i] = (layer.walkers[i] as Creature).slot
-					layer.buffer = nat.write_xforms(records.data, slots, walkers, layer.buffer, c_even, c_odd, inv_rate, 1)
-				else:
-					var wb := layer.buffer
-					for i in walkers:
-						var w: Creature = layer.walkers[i]
-						var wo := i * 16
-						records.write_xform(w.slot, wb, wo, c_even, c_odd, inv_rate)
-						wb[wo + 12] = 0.0
-						wb[wo + 13] = 1.0
-						wb[wo + 14] = float(w.slot + 1)
-						wb[wo + 15] = 1.0
-				layer.dirty = true
+				var active_now := _any_walker_active(layer, c_even, c_odd, inv_rate) if mv_skip_idle else true
+				var need_mv := not mv_skip_idle or not _mv_active or layer.dirty or layer.mv_settle > 0 or active_now
+				if need_mv:
+					if active_now:
+						layer.mv_settle = 2
+					elif layer.dirty or not _mv_active:
+						layer.mv_settle = maxi(layer.mv_settle, 1)
+					else:
+						layer.mv_settle -= 1
+					var nat := MoverRecords.native()
+					if nat != null:
+						var slots := PackedInt32Array()
+						slots.resize(walkers)
+						for i in walkers:
+							slots[i] = (layer.walkers[i] as Creature).slot
+						layer.buffer = nat.write_xforms(records.data, slots, walkers, layer.buffer, c_even, c_odd, inv_rate, 1)
+					else:
+						var wb := layer.buffer
+						for i in walkers:
+							var w: Creature = layer.walkers[i]
+							var wo := i * 16
+							records.write_xform(w.slot, wb, wo, c_even, c_odd, inv_rate)
+							wb[wo + 12] = 0.0
+							wb[wo + 13] = 1.0
+							wb[wo + 14] = float(w.slot + 1)
+							wb[wo + 15] = 1.0
+					layer.dirty = true
+				mv_busy = not mv_skip_idle or layer.mv_settle > 0 or active_now
 			elif _mv_active and not want_mv and walkers > 0:
+				layer.mv_settle = 0
 				var wb := layer.buffer
 				var centre := (Vector2(layer.cell) + Vector2(0.5, 0.5)) * LIVE_CELL
 				for i in walkers:
@@ -1600,9 +1675,11 @@ func _flush(focus: Vector3, delta := 0.0) -> void:
 				b.append_array(layer.posed)
 				b.resize(mm.instance_count * 16)
 				RenderingServer.multimesh_set_buffer(mm.get_rid(), b)
+				mv_uploads += 1
 				layer.dirty = false
 			elif layer.dirty:
 				RenderingServer.multimesh_set_buffer(mm.get_rid(), layer.buffer)
+				mv_uploads += 1
 				layer.dirty = false
 			if layer.shown != total:
 				mm.visible_instance_count = total
@@ -1625,9 +1702,11 @@ func _flush(focus: Vector3, delta := 0.0) -> void:
 			if box != layer.box:
 				layer.box = box
 				layer.mmi.custom_aabb = box
+				if mm_own_bounds:
+					layer.mmi.multimesh.custom_aabb = box
 			if not layer.lods:
 				layer.lods = _use_lods(layer.mmi)
-			layer.still = posed == 0 and not (want_mv and walkers > 0)
+			layer.still = posed == 0 and not mv_busy
 			var centre := (Vector2(cell) + Vector2(0.5, 0.5)) * LIVE_CELL
 			var near := centre.distance_to(Vector2(focus.x, focus.z)) <= LIVE_SHADOW_RANGE + LIVE_CELL * 0.71
 			var cast := GeometryInstance3D.SHADOW_CASTING_SETTING_ON if near else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
@@ -1639,3 +1718,35 @@ func _flush(focus: Vector3, delta := 0.0) -> void:
 		var layers: Dictionary = g[0]
 		(layers[g[1]] as Layer).mmi.queue_free()
 		layers.erase(g[1])
+
+
+func _any_walker_active(layer: Layer, c_even: float, c_odd: float, inv_rate: float) -> bool:
+	var d := records.data
+	var d_size := d.size()
+	for w in layer.walkers:
+		var slot: int = w.slot
+		if slot < 0:
+			continue
+		var o := slot * MoverRecords.FLOATS
+		if o + 28 >= d_size:
+			return true
+		var flags := int(d[o + 12])
+		var now := c_odd if (flags & MoverRecords.ODD) != 0 else c_even
+		var after := maxf(now - d[o + 15], 0.0)
+		if after < 2.0:
+			return true
+		var since3 := after * inv_rate
+		if absf(wrapf(d[o + 16] - d[o + 17], -PI, PI)) * exp(-MoverRecords.TURN_RATE * since3) > 1e-4:
+			return true
+		var l0: float = d[o + 24]
+		var g0: float = d[o + 25]
+		var gg: float = d[o + 26]
+		var gap := move_toward(g0, gg, after * (d[o + 28] if gg > g0 else 1.0))
+		var want := maxf(2.0 * gap, d[o + 27] + gap)
+		var lag := minf(l0 + 0.5 * after, want) if want >= l0 else maxf(l0 - after, want)
+		var drawn := now - lag
+		var span3: float = d[o + 11] - d[o + 10]
+		var end_drawn: float = d[o + 10] + d[o + 23] * span3 if span3 > 1e-4 else d[o + 11]
+		if drawn < end_drawn:
+			return true
+	return false

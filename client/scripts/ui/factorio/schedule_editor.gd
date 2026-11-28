@@ -164,7 +164,10 @@ static func records(screen, list: VBoxContainer, recs: Array, current: int, kind
 		var remove := delete_button("Remove this station", func() -> void:
 			var l := recs.duplicate(true)
 			l.remove_at(index)
-			on_change.call(l))
+			on_change.call(l)
+			# The records after it move up: the train keeps heading for the stop it was going to.
+			if can_go and index + 1 < current:
+				screen.model.train_go(screen.unit, current - 1))
 		remove.name = "Remove%d" % (i + 1)
 		r.add_child(remove)
 		list.add_child(bar)
@@ -266,8 +269,10 @@ static func condition(screen, w: Dictionary, kind: Dictionary, on_change: Callab
 		c[key] = value
 		on_change.call(c)
 	if t == "time" or t == "inactivity":
-		r.add_child(EntityPanels.dark_number_box(int(w.get("ticks", 0)) / 60, func(v: int) -> void: set_field.call("ticks", maxi(0, v) * 60), 56))
-		r.add_child(_word("s passed" if t == "time" else "s of inactivity"))
+		var secs := int(w.get("ticks", 0)) / 60
+		r.add_child(EntityPanels.dark_number_box(secs, func(v: int) -> void: set_field.call("ticks", maxi(0, v) * 60), 56))
+		# core.cfg's time-condition / inactivity-condition: "__1__ second(s) passed" / "second(s) of inactivity".
+		r.add_child(_word(("second" if secs == 1 else "seconds") + (" passed" if t == "time" else " of inactivity")))
 		return r
 	r.add_child(_word(str(WAIT_WORDS.get(t, _name_of(kind, t)))))
 	if t in EntityPanels.CONDITION_WAITS:
@@ -401,6 +406,13 @@ static func interrupts(screen, list: VBoxContainer, all: Array, kind: Dictionary
 		field.release_focus()
 		if t.strip_edges() == "":
 			return
+		# Factorio's "Interrupt names must be unique." (gui-interrupts.name-already-used): refused, the name kept to edit.
+		for other in all:
+			if other is Dictionary and str(other.get("name", "")) == t.strip_edges():
+				field.tooltip_text = "Interrupt names must be unique."
+				if field.is_visible_in_tree():
+					field.grab_focus()
+				return
 		var l := all.duplicate(true)
 		l.append({"name": t.strip_edges(), "conditions": [], "targets": [], "inside_interrupt": false})
 		send.call(l))

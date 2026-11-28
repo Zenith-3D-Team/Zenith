@@ -27,6 +27,7 @@ local NEAR_CHUNK_FLOOR = 150  -- minimum budget floor (units) for near chunk sna
 local DECORATIVES_PER_MESSAGE = 1000 -- 4 numbers each
 local MAX_DECORATIVES = 8000       -- per chunk; a lush Nauvis chunk has a few hundred
 local DECORATIVE_INTERVAL = 30     -- ticks between resending chunks whose decoratives changed
+local DECORATIVE_DEBOUNCE = 15     -- ticks after the last decorative change in a chunk before sending
 
 -- Positions are sent as integers in 1/256 tile, the engine's own resolution.
 function M.fixed(v)
@@ -99,6 +100,23 @@ end
 -- same on every peer). A snapshot carries its chunk's count (`rv`) and entity count (`n`); a client
 -- that kept a chunk lists it when it subscribes again (`sub` h), and a chunk whose counts still
 -- match is answered with `same` instead of being read and sent (the client draws its own copy).
+-- A count is raised to the tick of the change (next_rev, still always larger): the client keeps its
+-- copies on disk (chunk_disk_cache.gd) across sessions, and two plays of one save (loaded, changed,
+-- left unsaved, loaded again and changed otherwise) counted 1, 2, 3 alike, so a copy of the other
+-- play matched and was drawn (a mined pole standing on as a tall stick by an inserter, inserter-stick).
+-- `f3d-rev-ticks` off (map setting): counted by one, as before.
+local function next_rev(old)
+  old = old or 0
+  if not settings.global["f3d-rev-ticks"].value then
+    return old + 1
+  end
+  local t = game.tick
+  if t >= 1073741824 then -- map.lua's chart stamps hold counts below 2^30
+    return old + 1
+  end
+  return math.max(old + 1, t)
+end
+
 local function rev_table(si)
   local s = storage.f3d
   s.revs = s.revs or {}
@@ -139,7 +157,7 @@ end
 function M.bump_region(si, rx, ry)
   local rt = lod_rev_table(si)
   local rk = key(rx, ry)
-  rt[rk] = (rt[rk] or 0) + 1
+  rt[rk] = next_rev(rt[rk])
 end
 
 -- Raises the counts of the chunk at `position` and of neighbours within 2 tiles (a belt's or pipe's
@@ -163,11 +181,11 @@ function M.bump(si, position)
     for dx = x0, x1 do
       local ncx, ncy = cx + dx, cy + dy
       local k = key(ncx, ncy)
-      t[k] = (t[k] or 0) + 1
+      t[k] = next_rev(t[k])
       local rk = key(math.floor(ncx / M.REGION), math.floor(ncy / M.REGION))
       if not seen_regions[rk] then
         seen_regions[rk] = true
-        rt[rk] = (rt[rk] or 0) + 1
+        rt[rk] = next_rev(rt[rk])
       end
       if counted then
         counted[k] = nil -- an event changed it: the client was told, so count_check starts again from here
@@ -1121,7 +1139,7 @@ function M.decoratives_changed(surface, position)
   local k = key(math.floor(position.x / CHUNK), math.floor(position.y / CHUNK))
   if s.subs[k] then
     s.dec_dirty = s.dec_dirty or {}
-    s.dec_dirty[k] = true
+    s.dec_dirty[k] = game.tick
   end
 end
 
@@ -1200,10 +1218,24 @@ local function send_dirty_decoratives(surface)
   if not dirty or not next(dirty) then
     return
   end
-  s.dec_dirty = {}
+  local now = game.tick
+  local ready, waiting = {}, {}
+  local has_ready = false
+  for k, v in pairs(dirty) do
+    if type(v) ~= "number" or (now - v) >= DECORATIVE_DEBOUNCE then
+      ready[k] = true
+      has_ready = true
+    else
+      waiting[k] = v
+    end
+  end
+  s.dec_dirty = waiting
+  if not has_ready then
+    return
+  end
   if perf.on("prio_queue") then
     local keys, rank = {}, {}
-    for k in pairs(dirty) do
+    for k in pairs(ready) do
       keys[#keys + 1] = k
       rank[k] = rank_of(s, k)
     end
@@ -1221,7 +1253,7 @@ local function send_dirty_decoratives(surface)
     end
     return
   end
-  for k in pairs(dirty) do
+  for k in pairs(ready) do
     local c = s.subs[k]
     if c and not s.queued[k] then
       send_decoratives(surface, c[1], c[2])
@@ -1604,7 +1636,7 @@ function M.tick()
     count_check(surface, s)
   end
   kept_step(surface, s)
-  if game.tick % DECORATIVE_INTERVAL == 0 then
+  if game.tick % DECORATIVE_INTERVAL == 0 or (s.dec_dirty and next(s.dec_dirty)) then
     send_dirty_decoratives(surface)
   end
   -- At most f3d-chunks-per-tick chunks start a tick, and each is read in slices while the work

@@ -18,6 +18,7 @@ func _belt_stand_ins() -> void:
 		var mesh := ModelLibrary.mesh_for_entity(k[0], k[1], k[2], 0)
 		meshes.append(mesh)
 		BeltLods.stand_in(mesh, BeltLods.kind_of(k[1], k[2]))
+		BeltLods.mid_stand_in(mesh, BeltLods.kind_of(k[1], k[2]))
 	BeltLods.finish_all()
 	for i in kinds.size():
 		var k: Array = kinds[i]
@@ -51,8 +52,9 @@ func _belt_stand_ins() -> void:
 	var belt := ModelLibrary.mesh_for_entity("transport-belt", "transport-belt", {"s": "s", ModelLibrary.PACK_KEY: "builtin:wube3dp"}, 0)
 	var full: MultiMeshInstance3D = cv._nodes.get(belt)
 	var flat_mmi: MultiMeshInstance3D = cv._nodes.get([belt, BeltLods.FLAT])
+	var mid_mmi: MultiMeshInstance3D = cv._nodes.get([belt, BeltLods.MID])
 	var parts: Array = cv._nodes.keys().filter(func(key) -> bool: return key is Array and key[1] is int)
-	check(full != null and flat_mmi != null and BeltLods._chunks.has(cv) and parts.size() > 0,
+	check(full != null and flat_mmi != null and (not BeltLods.mid_enabled or mid_mmi != null) and BeltLods._chunks.has(cv) and parts.size() > 0,
 		"a chunk with belts draws each belt model and its stand-in, and is watched (%d moving parts)" % parts.size())
 	var cam := Camera3D.new()
 	cam.fov = 50.0
@@ -65,13 +67,20 @@ func _belt_stand_ins() -> void:
 		cam.global_position = Vector3(cv.belt_bounds.get_center().x, cv.belt_bounds.end.y + d, cv.belt_bounds.get_center().z)
 		BeltLods.update(w, cam, 1.0)
 	var whole := func() -> bool:
-		return full.visible and not flat_mmi.visible and cv._nodes.keys().all(func(key) -> bool:
+		return full.visible and not flat_mmi.visible and (mid_mmi == null or not mid_mmi.visible) and cv._nodes.keys().all(func(key) -> bool:
 			return not (key is Array and key[1] is int) or (cv._nodes[key] as MultiMeshInstance3D).visible)
-	var flat_now := func() -> bool:
-		return not full.visible and flat_mmi.visible and cv._nodes.keys().all(func(key) -> bool:
+	var mid_now := func() -> bool:
+		return not full.visible and mid_mmi != null and mid_mmi.visible and not flat_mmi.visible and cv._nodes.keys().all(func(key) -> bool:
 			return not (key is Array and key[1] is int) or not (cv._nodes[key] as MultiMeshInstance3D).visible)
-	at.call(40.0)
-	check(not cv.belt_flat and whole.call(), "near the camera (40 px a tile) the belts are drawn whole")
+	var flat_now := func() -> bool:
+		return not full.visible and (mid_mmi == null or not mid_mmi.visible) and flat_mmi.visible and cv._nodes.keys().all(func(key) -> bool:
+			return not (key is Array and key[1] is int) or not (cv._nodes[key] as MultiMeshInstance3D).visible)
+	at.call(60.0)
+	check(not cv.belt_flat and whole.call(), "near the camera (60 px a tile) the belts are drawn whole")
+	if BeltLods.mid_enabled:
+		at.call(40.0)
+		check(not cv.belt_flat and cv.belt_lod == BeltLods.TIER_MID and mid_now.call(),
+			"at mid zoom (40 px a tile) the 3D mid-detail belt LOD is drawn with moving parts hidden")
 	at.call(10.0)
 	var proxies_off: bool = cv._shadows.values().all(func(m: MultiMeshInstance3D) -> bool: return not m.visible)
 	var flat_casts := flat_mmi.cast_shadow == (GeometryInstance3D.SHADOW_CASTING_SETTING_OFF if cv.shadow_tier == ChunkView.SHADOWS_NONE else GeometryInstance3D.SHADOW_CASTING_SETTING_ON)
@@ -80,16 +89,20 @@ func _belt_stand_ins() -> void:
 	at.call(22.0)
 	check(cv.belt_flat and flat_now.call(), "between the two thresholds (22 px) they stay flat")
 	at.call(26.0)
-	check(not cv.belt_flat and whole.call(), "and are whole again above %d px a tile" % int(BeltLods.FULL_ABOVE))
+	var above_ok: bool = (cv.belt_lod == BeltLods.TIER_MID and mid_now.call()) if BeltLods.mid_enabled else whole.call()
+	check(not cv.belt_flat and above_ok, "and leave flat above %d px a tile" % int(BeltLods.FULL_ABOVE))
+	if BeltLods.mid_enabled:
+		at.call(60.0)
+		check(cv.belt_lod == BeltLods.TIER_FULL and whole.call(), "and are whole again above %d px a tile" % int(BeltLods.MID_FULL_ABOVE))
 	at.call(22.0)
-	check(not cv.belt_flat, "and stay whole coming back to 22 px")
+	check(not cv.belt_flat, "and stay non-flat coming back to 22 px")
 	cam.projection = Camera3D.PROJECTION_ORTHOGONAL
 	cam.size = pixels / 12.0
 	BeltLods.update(w, cam, 1.0)
 	var ortho_flat: bool = cv.belt_flat and flat_now.call()
-	cam.size = pixels / 32.0
+	cam.size = pixels / (60.0 if BeltLods.mid_enabled else 32.0)
 	BeltLods.update(w, cam, 1.0)
-	check(ortho_flat and not cv.belt_flat and whole.call(), "an orthographic view goes by its size: flat at 12 px a tile, whole at Factorio's 32")
+	check(ortho_flat and not cv.belt_flat and whole.call(), "an orthographic view goes by its size: flat at 12 px a tile, whole near Factorio's zoom")
 	# A build keeps the choice: the stand-ins stay drawn in place of the models.
 	cam.size = pixels / 12.0
 	BeltLods.update(w, cam, 1.0)
@@ -421,20 +434,24 @@ func _belts_always_run() -> void:
 	# The renderer behind a headless run keeps no instance data, so what was written is read from the list.
 	var stopped := func(unit: int) -> Array:
 		return (cv._switches.get(unit, []) as Array).map(func(s: Array) -> bool: return s[2])
-	check(full.multimesh.use_custom_data and flat != null and flat.multimesh.use_custom_data and stopped.call(951) == [false, false]
+	# Every form the belt is drawn in: the model and its flat stand-in, and the 3D mid-detail one when an
+	# earlier section has made it (--belt-mid-lod): all of them run, or all stand still.
+	var forms := func(states: Array, v: bool) -> bool:
+		return states.size() >= 2 and states.size() <= 3 and states.all(func(b: bool) -> bool: return b == v)
+	check(full.multimesh.use_custom_data and flat != null and flat.multimesh.use_custom_data and forms.call(stopped.call(951), false)
 		and not cv._switches.has(952), "a belt with a wire is drawn ready to stop (the model and its stand-in), and runs")
 	var dirty_before := w._dirty.has(c)
 	w._on_states([951, AnimScript.SWITCHED_OFF])
-	check(stopped.call(951) == [true, true] and w._dirty.has(c) == dirty_before,
+	check(forms.call(stopped.call(951), true) and w._dirty.has(c) == dirty_before,
 		"switched off (`st` 5): that belt stands still, model and stand-in, with no rebuild")
 	cv.build_entities(w.protos, w.working)
-	check(stopped.call(951) == [true, true], "a rebuild keeps it stopped")
+	check(forms.call(stopped.call(951), true), "a rebuild keeps it stopped")
 	w._on_states([951, 0])
-	check(stopped.call(951) == [false, false], "and `st` 0 starts it again")
+	check(forms.call(stopped.call(951), false), "and `st` 0 starts it again")
 	w._on_states([952, AnimScript.SWITCHED_OFF])
 	check(w._dirty.has(c), "a belt with no wire (a logistic condition) that stops is drawn again, ready to")
 	cv.build_entities(w.protos, w.working)
-	check(stopped.call(952) == [true, true], "and then stands still")
+	check(forms.call(stopped.call(952), true), "and then stands still")
 	w.queue_free()
 	# A roller's motion: its loop running, frozen dead while switched off, and running on from there.
 	var anim := AnimScript.new()
@@ -522,7 +539,15 @@ func _sun_shadows(cam: Camera3D, sun: DirectionalLight3D) -> void:
 		and not SunShadows.reaches_far(Vector2(40.0, 150.0), 150.0, false), "one shadow map for the angled view, cascades looking far")
 	# Fitted, the chunks that cast are those round the view, not 90 tiles ahead under the ground.
 	var ahead := Rect2(-70, -70, 16, 16)
-	check(WorldMirror._rect_meets_hull(ahead, WorldMirror.shadow_region(cam, sun)), "at a fixed 150 tiles, chunks far ahead cast shadows")
+	# (--tight-cull, the default since the close-up culling: the region is the ground slab in view, so the chunks far
+	# ahead under the ground cast at no reach; the old corner-grown region, checked with it off, takes them in.)
+	var tight_was := ViewPriority.tight_cull
+	ViewPriority.tight_cull = false
+	check(WorldMirror._rect_meets_hull(ahead, WorldMirror.shadow_region(cam, sun)), "at a fixed 150 tiles, chunks far ahead cast shadows (--tight-cull=off)")
+	ViewPriority.tight_cull = true
+	check(not WorldMirror._rect_meets_hull(ahead, WorldMirror.shadow_region(cam, sun)) and WorldMirror._rect_meets_hull(Rect2(-16, -16, 32, 32), WorldMirror.shadow_region(cam, sun)),
+		"--tight-cull: at a fixed 150 tiles the chunks far ahead under the ground don't cast, the ground round the focus does")
+	ViewPriority.tight_cull = tight_was
 	var fitter := SunShadows.new()
 	fitter.sun = sun
 	add_child(fitter)
@@ -1011,7 +1036,12 @@ func _lod_level_checks(model: Mesh, surfaces: int) -> void:
 		% [d_new.size(), d_px0, d_old.size(), o_px0])
 	if levels.is_empty():
 		return
-	# A chunk switches its model's level with its MultiMesh's instances kept, cross-fading.
+	# A chunk switches its model's level with its MultiMesh's instances kept, cross-fading. This MultiMesh is filled
+	# here, not by a chunk's apply, so it has no CPU copy of its instances: the default (no renderer reads) switches
+	# it at once, checked below; the cross-fade from what it reads back is --render-reads=old's, checked here. (The
+	# CPU copies' cross-fade: "LOD cross-fade copies CPU-cached data" further on.)
+	var readback_was := ChunkView.lod_no_readback
+	ChunkView.lod_no_readback = false
 	var cv := ChunkView.new()
 	add_child(cv)
 	var w := ChunkView.Want.new()
@@ -1024,7 +1054,7 @@ func _lod_level_checks(model: Mesh, surfaces: int) -> void:
 	ChunkView._fill(mmi.multimesh, cv._lod_mesh(mmi, w), w.xforms, [], true)
 	mmi.multimesh.set_instance_custom_data(1, Color(0.25, 0.5, 0.75, 1.0))
 	var state := mmi.multimesh.get_instance_custom_data(1)
-	var e1 := float(levels[0][1])
+	var e1 := ModelLods.switch_error(levels[0])  # (its error as picked: the untextured scaled by distance_scale)
 	var top := ChunkView.LOD_HEIGHT
 	cv.update_lods(Vector3(16, top + e1 * 0.9, 16), 1.0, -1.0, 0.0)
 	var near_whole: bool = mmi.multimesh.mesh == model
@@ -1047,6 +1077,13 @@ func _lod_level_checks(model: Mesh, surfaces: int) -> void:
 	check(near_whole and switched and fading and halfway and faded and held and back and mmi.multimesh.mesh == model,
 		"a chunk's model takes a coarser level far off (same instances and states), the level before dithered out over %.1f s, holds it a little nearer, and is whole again near (%s %s %s %s %s %s %s)"
 		% [ModelLods.FADE_SECONDS, near_whole, switched, fading, halfway, faded, held, back])
+	ChunkView.lod_no_readback = true
+	cv.update_lods(Vector3(16, top + e1 * 1.3, 16), 1.0, -1.0, 0.0)
+	var at_once: bool = st != null and st.level == 1 and st.fade == null and mmi.multimesh.mesh == levels[0][0] and mmi.multimesh.instance_count == 2
+	cv.update_lods(Vector3(16, top + e1 * 0.9, 16), 1.0, -1.0, 0.0)
+	at_once = at_once and st.level == 0 and st.fade == null and mmi.multimesh.mesh == model
+	check(at_once, "with no CPU copy of its instances and no renderer reads (the default), the level switches at once, both ways, nothing read back")
+	ChunkView.lod_no_readback = readback_was
 	# Switch budget stops mid-chunk and resumes cleanly on the next call.
 	var mmi2 := cv._new_mmi(null)
 	cv._nodes[w] = mmi2
@@ -1163,23 +1200,112 @@ func _performance() -> void:
 	check(WorldMirror._rect_meets_hull(Rect2(-16, -16, 32, 32), region) and not WorldMirror._rect_meets_hull(Rect2(320, 320, 32, 32), region),
 		"the shadow region holds the ground round the focus, not chunks 300 tiles behind the camera")
 	_sun_shadows(cam, sun)
-	# A world's chunks: near ones cast at full detail, far ones simplified, ones behind none.
-	var world := WorldMirror.new()
-	world.sun = sun
-	add_child(world)
-	for c in [Vector2i(0, 0), Vector2i(-3, -3), Vector2i(9, 9)]:
-		var cv := ChunkView.new()
-		cv.coord = c
-		world.chunks[c] = cv
-		world.add_child(cv)
-	world.shadow_usec = 1 << 40  # all three in one call, whatever the frame's budget has left
-	world._update_shadow_casters()
-	check(world.chunks[Vector2i(0, 0)].shadow_tier == ChunkView.SHADOWS_NEAR and world.chunks[Vector2i(-3, -3)].shadow_tier == ChunkView.SHADOWS_FAR
-		and world.chunks[Vector2i(9, 9)].shadow_tier == ChunkView.SHADOWS_NONE and world.shadow_casters == 2,
-		"shadow tiers: near the focus full, further out simplified, behind the camera none: %s" % [world.chunks.values().map(func(cv): return cv.shadow_tier)])
-	world.queue_free()
+	# A world's chunks: near ones cast at full detail, far ones simplified, ones behind none. (--tight-cull=off: the
+	# old region reaches (-3, -3), 64-96 tiles ahead under the ground; --tight-cull's ground slab doesn't, so it casts none.)
+	var tight_on := ViewPriority.tight_cull
+	for tight: bool in [false, true]:
+		ViewPriority.tight_cull = tight
+		var world := WorldMirror.new()
+		world.sun = sun
+		add_child(world)
+		for c in [Vector2i(0, 0), Vector2i(-3, -3), Vector2i(9, 9)]:
+			var cv := ChunkView.new()
+			cv.coord = c
+			world.chunks[c] = cv
+			world.add_child(cv)
+		world.shadow_usec = 1 << 40  # all three in one call, whatever the frame's budget has left
+		world._update_shadow_casters()
+		var ahead_tier := ChunkView.SHADOWS_NONE if tight else ChunkView.SHADOWS_FAR
+		check(world.chunks[Vector2i(0, 0)].shadow_tier == ChunkView.SHADOWS_NEAR and world.chunks[Vector2i(-3, -3)].shadow_tier == ahead_tier
+			and world.chunks[Vector2i(9, 9)].shadow_tier == ChunkView.SHADOWS_NONE and world.shadow_casters == (1 if tight else 2),
+			"shadow tiers%s: near the focus full, further out simplified, behind the camera none: %s" % ["" if tight else " (--tight-cull=off)", world.chunks.values().map(func(cv): return cv.shadow_tier)])
+		world.queue_free()
+	ViewPriority.tight_cull = tight_on
 	sun.queue_free()
 	cam.queue_free()
+	# Batch 2 #5: Inserter LOD scaling, far-chunk keep, shadow retention, and Ultra lod_quality preset.
+	check(str(Settings.PRESETS.get("ultra", {}).get("lod_quality", "")) == "ultra",
+		"B2#5: Ultra preset sets lod_quality='ultra'")
+	var was_dist_scale := ModelLods.distance_scale
+	var was_scale_untex := ModelLods.scale_untextured
+	var was_qual := ModelLods.quality_name
+	var was_far_keep := FarChunks.keep_inserters
+	var was_ins_shad := ChunkView.keep_inserter_shadows
+	ModelLods.distance_scale = 2.0
+	ModelLods.scale_untextured = true
+	var err_scaled := ModelLods.switch_error([null, 0.5])
+	ModelLods.scale_untextured = false
+	var err_old := ModelLods.switch_error([null, 0.5])
+	check(is_equal_approx(err_scaled, 1.0) and is_equal_approx(err_old, 0.5),
+		"B2#5: untextured LOD error scales with distance_scale (%.2f) unless --inserter-lod-scale=old (%.2f)" % [err_scaled, err_old])
+	ModelLods.quality_name = "high"
+	FarChunks.keep_inserters = true
+	var far_kept_high := FarChunks._kept_type("inserter")
+	ModelLods.quality_name = "ultra"
+	var far_kept_ultra := FarChunks._kept_type("inserter")
+	ModelLods.quality_name = "medium"
+	var far_kept_med := FarChunks._kept_type("inserter")
+	ModelLods.quality_name = "high"
+	FarChunks.keep_inserters = false
+	var far_kept_off := FarChunks._kept_type("inserter")
+	check(far_kept_high and far_kept_ultra and not far_kept_med and not far_kept_off,
+		"B2#5: FarChunks keeps inserters on High/Ultra unless --inserter-far-keep=off (high=%s ultra=%s med=%s off=%s)" % [far_kept_high, far_kept_ultra, far_kept_med, far_kept_off])
+	var small_box := BoxMesh.new()
+	small_box.size = Vector3(0.2, 0.2, 0.2)
+	ModelLods.quality_name = "high"
+	ChunkView.keep_inserter_shadows = true
+	var culled_high := ChunkView.too_low_to_cast(small_box, ChunkView.SHADOWS_FAR, "inserter")
+	ModelLods.quality_name = "medium"
+	var culled_med := ChunkView.too_low_to_cast(small_box, ChunkView.SHADOWS_FAR, "inserter")
+	ModelLods.quality_name = "high"
+	ChunkView.keep_inserter_shadows = false
+	var culled_old := ChunkView.too_low_to_cast(small_box, ChunkView.SHADOWS_FAR, "inserter")
+	check(not culled_high and culled_med and culled_old,
+		"B2#5: inserter shadows kept beyond near rings on High/Ultra unless --inserter-shadows=old (culled high=%s med=%s old=%s)" % [culled_high, culled_med, culled_old])
+	ChunkView._tops.erase(small_box.get_instance_id())
+	ModelLods.distance_scale = was_dist_scale
+	ModelLods.scale_untextured = was_scale_untex
+	ModelLods.quality_name = was_qual
+	FarChunks.keep_inserters = was_far_keep
+	ChunkView.keep_inserter_shadows = was_ins_shad
+
+	# Batch 3 C7: Near-tree real shadows skip tree stand-ins on SHADOWS_NEAR (--near-tree-real-shadows=off).
+	var crown_proxy := ArrayMesh.new()
+	var c_verts := PackedVector3Array([Vector3(0, 1, 0), Vector3(1, 1, 0), Vector3(0, 2, 0)])
+	var c_arr := []
+	c_arr.resize(Mesh.ARRAY_MAX)
+	c_arr[Mesh.ARRAY_VERTEX] = c_verts
+	crown_proxy.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, c_arr)
+	crown_proxy.surface_set_material(0, ModelLods.leaf_material())
+	var plain_proxy := ArrayMesh.new()
+	plain_proxy.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, c_arr)
+	check(ModelLods.has_crown(crown_proxy) and not ModelLods.has_crown(plain_proxy),
+		"C7: ModelLods.has_crown detects leaf-material tree proxies")
+	ModelLods._ready[crown_proxy] = true
+	var tree_cv := ChunkView.new()
+	var tree_mmi := MultiMeshInstance3D.new()
+	var proxy_mmi := MultiMeshInstance3D.new()
+	tree_cv.add_child(tree_mmi)
+	tree_cv.add_child(proxy_mmi)
+	tree_cv._shadow_pairs.append([tree_mmi, proxy_mmi, crown_proxy])
+	add_child(tree_cv)
+	var was_near_tree := ChunkView.near_tree_real_shadows
+	ChunkView.near_tree_real_shadows = true
+	tree_cv.shadow_tier = ChunkView.SHADOWS_NEAR
+	tree_cv._apply_shadows()
+	var near_standin_hidden := not proxy_mmi.visible
+	tree_cv.shadow_tier = ChunkView.SHADOWS_FAR
+	tree_cv._apply_shadows()
+	var far_standin_shown := proxy_mmi.visible
+	ChunkView.near_tree_real_shadows = false
+	tree_cv.shadow_tier = ChunkView.SHADOWS_NEAR
+	tree_cv._apply_shadows()
+	var off_standin_shown := proxy_mmi.visible
+	check(near_standin_hidden and far_standin_shown and off_standin_shown,
+		"C7: SHADOWS_NEAR keeps real tree shadows (stand-in hidden=%s), FAR uses stand-in (%s), --near-tree-real-shadows=off restores stand-in (%s)" % [near_standin_hidden, far_standin_shown, off_standin_shown])
+	ChunkView.near_tree_real_shadows = was_near_tree
+	ModelLods._ready.erase(crown_proxy)
+	tree_cv.queue_free()
 	# Picking what's under the mouse uses an index of selection boxes: the same answers as testing
 	# every entity, and it follows entities coming and going.
 	var pw := WorldMirror.new()

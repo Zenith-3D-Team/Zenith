@@ -26,6 +26,8 @@ const MAP := {
 	"sound/explosions-volume": ["sound", "explosions", "volume"],
 	"sound/enemies-volume": ["sound", "enemies", "volume"],
 	"sound/world-ambient-volume": ["sound", "ambient", "volume"],
+	"sound/wind-volume": ["sound", "wind", "volume"],
+	"sound/alerts-volume": ["sound", "alerts", "volume"],
 	"graphics/v-sync": ["graphics", "vsync", "bool"],
 	"graphics/minimize-on-focus-loss": ["graphics", "minimize_on_focus_loss", "bool"],
 	"graphics/show-clouds": ["graphics", "clouds", "bool"],

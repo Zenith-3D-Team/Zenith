@@ -31,6 +31,9 @@ const Switches := preload("res://scripts/switches.gd")
 ## and its rollers half one.
 const FLAT_BELOW := 20.0
 const FULL_ABOVE := 24.0
+## Mid-detail 3D belt LOD thresholds (pixels per tile at a chunk's nearest belt, scaled by lod_scale).
+const MID_BELOW := 44.0
+const MID_FULL_ABOVE := 52.0
 const LOD_QUALITY_SCALE := {"low": 1.9, "medium": 1.0, "high": 0.85, "ultra": 0.70}
 static var lod_scale := 1.0
 ## The tallest picture these thresholds count, in lines: a taller one is measured as if this tall,
@@ -40,8 +43,13 @@ static var lod_scale := 1.0
 const MAX_LINES := 1080.0
 ## Entity types drawn with stand-ins far away.
 const TYPES := {"transport-belt": true, "underground-belt": true, "linked-belt": true, "splitter": true, "lane-splitter": true}
-## The key of a stand-in's MultiMesh in chunk_view.gd (_nodes[[model, FLAT]]).
+## The keys of stand-in MultiMeshes in chunk_view.gd (_nodes[[model, MID / FLAT]]).
+const MID := &"mid"
 const FLAT := &"flat"
+## Chunk belt LOD tiers (chunk_view.gd belt_lod).
+const TIER_FULL := 0
+const TIER_MID := 1
+const TIER_FLAT := 2
 ## Jobs at once on worker threads.
 const JOBS := 2
 ## Seconds between looks when the camera hasn't moved.
@@ -53,12 +61,15 @@ const SLICE_MIN_CHUNKS := 64
 
 ## --no-belt-stand-ins: full belts everywhere (for comparing).
 static var enabled := not (Switches.has("--no-belt-stand-ins"))
+## --belt-mid-lod=off: disable 3D mid-detail belt LOD and restore 2-tier Full/Flat behavior.
+static var mid_enabled := Switches.on("--belt-mid-lod")
 ## --belt-lods-every-frame: re-check belt stand-ins on every transform change instead of quantizing position.
 static var move_deadband := not (Switches.has("--belt-lods-every-frame"))
 ## --belt-lods-slice=off: check every tracked belt chunk in a single frame instead of time-slicing.
 static var slice_enabled := Switches.on("--belt-lods-slice")
 ## Mesh -> its stand-in (ArrayMesh, empty until its job is done), or null: none (not a mesh it can make).
 static var _stand_ins := {}
+static var _mid_stand_ins := {}
 static var _ready := {}  # stand-in -> true once it has its shape
 static var _queue: Array = []  # [Job, stand-in, source mesh]
 static var _running: Array = []  # [task id, Job, stand-in, source mesh]
@@ -92,24 +103,45 @@ static func kind_of(proto_type: String, extra: Dictionary) -> String:
 static func stand_in(mesh: Mesh, kind: String) -> ArrayMesh:
 	if not enabled or mesh == null:
 		return null
-	if _stand_ins.has(mesh):
-		var out: ArrayMesh = _stand_ins[mesh]
+	return _get_or_queue(mesh, kind, FLAT, _stand_ins)
+
+
+## The 3D mid-detail stand-in for `mesh`, or null while it is being made (coming_mid()) or disabled.
+static func mid_stand_in(mesh: Mesh, kind: String) -> ArrayMesh:
+	if not enabled or not mid_enabled or mesh == null:
+		return null
+	return _get_or_queue(mesh, kind, MID, _mid_stand_ins)
+
+
+static func _get_or_queue(mesh: Mesh, kind: String, detail: StringName, cache: Dictionary) -> ArrayMesh:
+	if cache.has(mesh):
+		var out: ArrayMesh = cache[mesh]
 		if out == null or not _ready.has(out):
 			return null
 		_same_materials(out, mesh as ArrayMesh)
 		return out
-	var job := _job_for(mesh as ArrayMesh, kind)
+	var job := _job_for(mesh as ArrayMesh, kind, detail)
 	var out: ArrayMesh = null
 	if job != null:
 		out = ArrayMesh.new()
 		_queue.append([job, out, mesh])
-	_stand_ins[mesh] = out
+	cache[mesh] = out
 	return null
 
 
 ## Whether a stand-in for `mesh` is still to come (asked, not made yet).
 static func coming(mesh: Mesh) -> bool:
 	var out: ArrayMesh = _stand_ins.get(mesh)
+	if out != null and not _ready.has(out):
+		return true
+	return coming_mid(mesh)
+
+
+## Whether a mid-detail stand-in for `mesh` is still to come (asked, not made yet).
+static func coming_mid(mesh: Mesh) -> bool:
+	if not mid_enabled:
+		return false
+	var out: ArrayMesh = _mid_stand_ins.get(mesh)
 	return out != null and not _ready.has(out)
 
 
@@ -175,17 +207,17 @@ static func update(world, cam: Camera3D, delta: float) -> void:
 			var cam_d := ViewPriority.camera_zoom_distance(cam, f)
 			if cam_d >= 48.0:
 				zoom_q = floorf(cam_d / 8.0) * 8.0
-		view = [(at / DEADBAND_TILES).round(), size, scale, enabled, false, lod_scale, ViewPriority.char_lod_zoom, zoom_q]
+		view = [(at / DEADBAND_TILES).round(), size, scale, enabled, mid_enabled, false, lod_scale, ViewPriority.char_lod_zoom, zoom_q]
 		if zoom_q > 0.0 and cam != null:
 			view.append_array([cam.projection, roundi(cam.fov * 10.0), roundi(cam.size * 10.0)])
 	elif move_deadband:
 		at = cam.global_position
 		var step := clampf(floorf(at.y * 0.08 / 2.0) * 2.0, DEADBAND_TILES, 12.0)
 		view = [(at / step).round(), step, cam.projection, roundi(cam.fov * 10.0), roundi(cam.size * 10.0),
-			cam.keep_aspect, size, scale, enabled, true, lod_scale]
+			cam.keep_aspect, size, scale, enabled, mid_enabled, true, lod_scale]
 	else:
 		at = cam.global_position
-		view = [cam.global_transform, cam.projection, cam.fov, cam.size, size, scale, enabled, true, lod_scale]
+		view = [cam.global_transform, cam.projection, cam.fov, cam.size, size, scale, enabled, mid_enabled, true, lod_scale]
 	var slicing := _pass_next < _pass_todo.size()
 	if not slicing and not _dirty and _timer < CHECK_INTERVAL and view == _last_view:
 		return
@@ -239,7 +271,7 @@ static func update(world, cam: Camera3D, delta: float) -> void:
 			if not is_instance_valid(_pass_cam):
 				break
 			px = tile_pixels(_pass_cam, _pass_at, _pass_pixels, cv.belt_bounds)
-		cv.set_belt_flat(enabled and flat_at(px, cv.belt_flat, _pass_ortho))
+		cv.set_belt_lod(lod_at(px, cv.belt_lod, _pass_ortho) if enabled else TIER_FULL)
 		did += 1
 	if _pass_next >= _pass_todo.size():
 		_pass_todo = []
@@ -272,6 +304,34 @@ static func flat_at(px: float, was_flat: bool, orthographic: bool, scale := -1.0
 	return px < fb or was_flat
 
 
+## Which belt LOD tier (0=full, 1=mid, 2=flat) to draw at `px` pixels a tile, from `was_tier`.
+## Orthographic views use no hysteresis gap (matching flat_at). When `mid_enabled` is false,
+## collapses to 2-tier Full/Flat via flat_at().
+static func lod_at(px: float, was_tier: int, orthographic: bool, scale := -1.0) -> int:
+	if not mid_enabled:
+		return TIER_FLAT if flat_at(px, was_tier == TIER_FLAT, orthographic, scale) else TIER_FULL
+	var s := lod_scale if scale <= 0.0 else clampf(scale, 0.4, 3.2)
+	var fb := FLAT_BELOW * s
+	var fa := FULL_ABOVE * s
+	var mb := MID_BELOW * s
+	var mfa := MID_FULL_ABOVE * s
+	if orthographic:
+		if px < fb:
+			return TIER_FLAT
+		if px < mb:
+			return TIER_MID
+		return TIER_FULL
+	if px < fb:
+		return TIER_FLAT
+	if px > mfa:
+		return TIER_FULL
+	if was_tier == TIER_FLAT:
+		return TIER_MID if px > fa else TIER_FLAT
+	if was_tier == TIER_MID:
+		return TIER_MID
+	return TIER_MID if px < mb else TIER_FULL
+
+
 ## How many pixels tall one tile is drawn at the nearest point of `box`, for `pixels` from
 ## view_pixels().
 static func tile_pixels(cam: Camera3D, at: Vector3, pixels: float, box: AABB) -> float:
@@ -300,7 +360,10 @@ static func _poll(world) -> void:
 		return
 	for cv in _chunks.keys():
 		if is_instance_valid(cv) and cv.belt_waiting:
-			world.redraw(cv.coord)
+			if world.has_method("redraw_view"):
+				world.redraw_view(cv.coord)  # the stand-ins are read after the records' pass (chunk_view.gd)
+			else:
+				world.redraw(cv.coord)
 
 
 ## Quitting or leaving a game (main.gd _exit_tree): waits for the stand-ins being made on workers and puts them in
@@ -338,7 +401,7 @@ static func _commit(job: Job, out: ArrayMesh, mesh: ArrayMesh) -> void:
 		out.surface_set_material(out.get_surface_count() - 1, mesh.surface_get_material(s))
 		from.append(s)
 	out.set_meta(&"f3d_from", from)
-	out.resource_name = mesh.resource_name + " (far)"
+	out.resource_name = mesh.resource_name + (" (mid)" if job.detail == MID else " (far)")
 	_ready[out] = true
 
 
@@ -346,11 +409,12 @@ static func _commit(job: Job, out: ArrayMesh, mesh: ArrayMesh) -> void:
 ## A modeller's textured belt gets none: a cell's corners copying the nearest vertex's UV smeared its
 ## texture over the steps, and its own models (a few hundred triangles a tile, not Wube's 1,450)
 ## have their own textured levels (model_lods.gd), which keep UV seams.
-static func _job_for(mesh: ArrayMesh, kind: String) -> Job:
+static func _job_for(mesh: ArrayMesh, kind: String, detail := FLAT) -> Job:
 	if mesh == null or not mesh.has_meta(ModelLods.ARRAYS_META) or ModelLods.textured(mesh):
 		return null
 	var job := Job.new()
 	job.kind = kind
+	job.detail = detail
 	job.box = mesh.get_aabb()
 	for i in mesh.get_surface_count():
 		if mesh.surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
@@ -373,6 +437,7 @@ static func _job_for(mesh: ArrayMesh, kind: String) -> Job:
 ## Builds one stand-in on a worker thread.
 class Job:
 	var kind := "s"
+	var detail := FLAT
 	var box := AABB()
 	## Per source surface: its arrays, its custom formats, which of its rows are belt surface.
 	var surfaces: Array = []
@@ -383,26 +448,30 @@ class Job:
 
 	## The model's triangles in a coarse grid over the ground, to find what is on top quickly.
 	const BUCKETS := 12
-	var _tris: Array = []  # [a, b, c, surface, row]
+	var _tris: Array = []  # [a, b, c, surface, row, uva, uvb, uvc] (uvs null when none)
 	var _buckets: Array = []
+	var _corner_cache := {}  # [ci, cj, s, row] -> [height, uv_or_null]
 
 	func run() -> void:
 		_index()
+		if detail == MID:
+			_run_mid()
+		else:
+			_run_flat()
+		surfaces = []
+		_tris = []
+		_buckets = []
+		_corner_cache = {}
+
+	func _run_flat() -> void:
 		var grid := _grid()
 		var corners: Array = grid[0]
 		var nx := corners.size() - 1
 		var nz: int = (corners[0] as Array).size() - 1
 		var walls_along: bool = grid[1]
 		# Each cell: [height, surface, row] or null (nothing there).
-		var cells: Array = []
-		for i in nx:
-			var col: Array = []
-			for j in nz:
-				col.append(_sample_cell(corners[i][j], corners[i + 1][j], corners[i + 1][j + 1], corners[i][j + 1]))
-			cells.append(col)
-		var builders: Array = []
-		for s in surfaces.size():
-			builders.append(Builder.new(surfaces[s]))
+		var cells := _sample_grid(corners, nx, nz)
+		var builders := _make_builders()
 		for i in nx:
 			for j in nz:
 				var cell = cells[i][j]
@@ -424,11 +493,70 @@ class Job:
 					_wall(b, cell, p00, p10, mid, cells, i, j - 1)
 				if walls_along or j < nz - 1:
 					_wall(b, cell, p01, p11, mid, cells, i, j + 1)
+		_finish_builders(builders)
+
+	func _run_mid() -> void:
+		var grid := _mid_grid()
+		var corners: Array = grid[0]
+		var nx := corners.size() - 1
+		var nz: int = (corners[0] as Array).size() - 1
+		var walls_along: bool = grid[1]
+		var cells := _sample_grid(corners, nx, nz)
+		var builders := _make_builders()
+		for i in nx:
+			for j in nz:
+				var cell = cells[i][j]
+				if cell == null:
+					continue
+				var s: int = cell[1]
+				var row: int = cell[2]
+				var fallback: float = cell[0]
+				var b: Builder = builders[s]
+				var p00: Vector2 = corners[i][j]
+				var p10: Vector2 = corners[i + 1][j]
+				var p11: Vector2 = corners[i + 1][j + 1]
+				var p01: Vector2 = corners[i][j + 1]
+				var c00 := _corner_sample(i, j, s, row, p00, fallback, cells)
+				var c10 := _corner_sample(i + 1, j, s, row, p10, fallback, cells)
+				var c11 := _corner_sample(i + 1, j + 1, s, row, p11, fallback, cells)
+				var c01 := _corner_sample(i, j + 1, s, row, p01, fallback, cells)
+				var v00 := _v3(p00, c00[0])
+				var v10 := _v3(p10, c10[0])
+				var v11 := _v3(p11, c11[0])
+				var v01 := _v3(p01, c01[0])
+				var n := (v10 - v00).cross(v01 - v00).normalized()
+				if n.length_squared() < 0.5:
+					n = Vector3.UP
+				elif n.y < 0.0:
+					n = -n
+				b.quad([v00, v10, v11, v01], n, row, [c00[1], c10[1], c11[1], c01[1]])
+				var mid := (p00 + p10 + p11 + p01) * 0.25
+				_wall_mid(b, cell, p00, p01, mid, c00[0], c01[0], i, j, i, j + 1, cells, i - 1, j)
+				_wall_mid(b, cell, p10, p11, mid, c10[0], c11[0], i + 1, j, i + 1, j + 1, cells, i + 1, j)
+				if walls_along or j > 0:
+					_wall_mid(b, cell, p00, p10, mid, c00[0], c10[0], i, j, i + 1, j, cells, i, j - 1)
+				if walls_along or j < nz - 1:
+					_wall_mid(b, cell, p01, p11, mid, c01[0], c11[0], i, j + 1, i + 1, j + 1, cells, i, j + 1)
+		_finish_builders(builders)
+
+	func _sample_grid(corners: Array, nx: int, nz: int) -> Array:
+		var cells: Array = []
+		for i in nx:
+			var col: Array = []
+			for j in nz:
+				col.append(_sample_cell(corners[i][j], corners[i + 1][j], corners[i + 1][j + 1], corners[i][j + 1]))
+			cells.append(col)
+		return cells
+
+	func _make_builders() -> Array:
+		var builders: Array = []
+		for s in surfaces.size():
+			builders.append(Builder.new(surfaces[s]))
+		return builders
+
+	func _finish_builders(builders: Array) -> void:
 		for s in surfaces.size():
 			out.append((builders[s] as Builder).arrays())
-		surfaces = []
-		_tris = []
-		_buckets = []
 
 	func _wall(b: Builder, cell: Array, e0: Vector2, e1: Vector2, mid: Vector2, cells: Array, ni: int, nj: int) -> void:
 		var low := 0.0
@@ -442,6 +570,85 @@ class Job:
 		if out2.dot((e0 + e1) * 0.5 - mid) < 0.0:
 			out2 = -out2
 		b.quad([_v3(e0, low), _v3(e1, low), _v3(e1, h), _v3(e0, h)], Vector3(out2.x, 0.0, out2.y), cell[2])
+
+	func _wall_mid(b: Builder, cell: Array, e0: Vector2, e1: Vector2, mid: Vector2,
+			ha0: float, ha1: float, ci0: int, cj0: int, ci1: int, cj1: int,
+			cells: Array, ni: int, nj: int) -> void:
+		var hb0 := 0.0
+		var hb1 := 0.0
+		if ni >= 0 and ni < cells.size() and nj >= 0 and nj < (cells[0] as Array).size() and cells[ni][nj] != null:
+			var ncell: Array = cells[ni][nj]
+			if int(ncell[1]) == int(cell[1]) and int(ncell[2]) == int(cell[2]):
+				return  # Same surface and row share corners: watertight without an internal wall.
+			hb0 = float(_corner_sample(ci0, cj0, ncell[1], ncell[2], e0, float(ncell[0]), cells)[0])
+			hb1 = float(_corner_sample(ci1, cj1, ncell[1], ncell[2], e1, float(ncell[0]), cells)[0])
+		if hb0 >= ha0 - 0.005 and hb1 >= ha1 - 0.005:
+			return
+		var low0 := minf(hb0, ha0)
+		var low1 := minf(hb1, ha1)
+		var edge := e1 - e0
+		var out2 := Vector2(edge.y, -edge.x).normalized()
+		if out2.dot((e0 + e1) * 0.5 - mid) < 0.0:
+			out2 = -out2
+		var n3 := Vector3(out2.x, 0.0, out2.y)
+		if ha0 - low0 > 0.002 and ha1 - low1 > 0.002:
+			b.quad([_v3(e0, low0), _v3(e1, low1), _v3(e1, ha1), _v3(e0, ha0)], n3, cell[2])
+		elif ha0 - low0 > 0.002:
+			b.tri([_v3(e0, low0), _v3(e1, ha1), _v3(e0, ha0)], n3, cell[2])
+		elif ha1 - low1 > 0.002:
+			b.tri([_v3(e0, ha0), _v3(e1, low1), _v3(e1, ha1)], n3, cell[2])
+
+	## Cached [height, uv_or_null] at grid corner `(ci, cj)` for material `(s, row)`.
+	func _corner_sample(ci: int, cj: int, s: int, row: int, p: Vector2, fallback: float, cells: Array) -> Array:
+		var key := [ci, cj, s, row]
+		if _corner_cache.has(key):
+			return _corner_cache[key]
+		var is_b := _is_belt(s, row)
+		var direct := _top_matching(p, s, row)
+		var uv: Variant = direct[1] if not direct.is_empty() else null
+		var h := NAN
+		if is_b:
+			var best_h := float(direct[0]) if not direct.is_empty() else -INF
+			for off: Vector2 in [Vector2(0.025, 0.0), Vector2(-0.025, 0.0), Vector2(0.0, 0.025), Vector2(0.0, -0.025)]:
+				var q := Vector2(clampf(p.x + off.x, box.position.x, box.end.x), clampf(p.y + off.y, box.position.z, box.end.z))
+				var hit := _top_matching(q, s, row)
+				if not hit.is_empty() and float(hit[0]) > best_h:
+					best_h = float(hit[0])
+					if uv == null:
+						uv = hit[1]
+			if best_h > -INF:
+				h = best_h
+		elif not direct.is_empty():
+			h = float(direct[0])
+		else:
+			var hits: Array = []
+			for off: Vector2 in [Vector2(0.035, 0.0), Vector2(-0.035, 0.0), Vector2(0.0, 0.035), Vector2(0.0, -0.035),
+					Vector2(0.035, 0.035), Vector2(-0.035, 0.035), Vector2(0.035, -0.035), Vector2(-0.035, -0.035)]:
+				var q := Vector2(clampf(p.x + off.x, box.position.x, box.end.x), clampf(p.y + off.y, box.position.z, box.end.z))
+				var hit := _top_matching(q, s, row)
+				if not hit.is_empty():
+					hits.append(float(hit[0]))
+					if uv == null:
+						uv = hit[1]
+			if not hits.is_empty():
+				hits.sort()
+				h = float(hits[hits.size() / 2])
+		if is_nan(h):
+			var sum := 0.0
+			var n := 0
+			for di in [-1, 0]:
+				for dj in [-1, 0]:
+					var ii: int = ci + di
+					var jj: int = cj + dj
+					if ii >= 0 and ii < cells.size() and jj >= 0 and jj < (cells[0] as Array).size():
+						var c = cells[ii][jj]
+						if c != null and int(c[1]) == s and int(c[2]) == row:
+							sum += float(c[0])
+							n += 1
+			h = sum / float(n) if n > 0 else fallback
+		var res := [h, uv]
+		_corner_cache[key] = res
+		return res
 
 	static func _v3(p: Vector2, y: float) -> Vector3:
 		return Vector3(p.x, y, p.y)
@@ -481,6 +688,51 @@ class Job:
 			xs.append(lerpf(x0, x1, float(k) / n))
 		var zs: Array = []
 		var m := maxi(2, int(round((z1 - z0) / 0.25)))
+		for k in m + 1:
+			zs.append(lerpf(z0, z1, float(k) / m))
+		return [_rect(xs, zs), true]
+
+	## Higher-resolution 3D mid-detail grid [corners, walls_along] preserving rails, curves, hoods, and splitter housing.
+	func _mid_grid() -> Array:
+		var x0 := box.position.x
+		var x1 := box.end.x
+		var z0 := box.position.z
+		var z1 := box.end.z
+		match kind:
+			"s":
+				var bed := _belt_half_width(0.415)
+				var rail_l := lerpf(x0, -bed, 0.5)
+				var rail_r := lerpf(bed, x1, 0.5)
+				var xs := [x0, rail_l, -bed, 0.0, bed, rail_r, x1]
+				var zs: Array = []
+				for k in 9:
+					zs.append(lerpf(z0, z1, float(k) / 8.0))
+				return [_rect(xs, zs), false]
+			"l", "r":
+				var side := 1.0 if kind == "l" else -1.0
+				var centre := Vector2(-0.5 * side, -0.5)
+				var bed := _belt_half_width(0.415)
+				var r_out := maxf(x1 - x0, z1 - z0)
+				var radii := [0.02, 0.5 - bed, 0.5, 0.5 + bed, lerpf(0.5 + bed, r_out, 0.5), r_out]
+				var cols: Array = []
+				for r in radii:
+					var col: Array = []
+					for k in 13:
+						var a := float(k) / 12.0 * PI * 0.5
+						col.append(centre + Vector2(cos(a) * side, sin(a)) * float(r))
+					cols.append(col)
+				return [cols, false]
+			"u":
+				var cheek := 0.13
+				var xs := [x0, x0 + cheek, -0.24, 0.0, 0.24, x1 - cheek, x1]
+				var zs := [z0, -0.40, -0.28, -0.15, -0.02, 0.12, 0.26, 0.36, 0.44, z1]
+				return [_rect(xs, zs), true]
+		var xs: Array = []
+		var n := clampi(int(round((x1 - x0) / 0.20)), 4, 10)
+		for k in n + 1:
+			xs.append(lerpf(x0, x1, float(k) / n))
+		var zs: Array = []
+		var m := clampi(int(round((z1 - z0) / 0.20)), 3, 5)
 		for k in m + 1:
 			zs.append(lerpf(z0, z1, float(k) / m))
 		return [_rect(xs, zs), true]
@@ -538,12 +790,23 @@ class Job:
 
 	## The highest triangle over a point: [height, surface, row], or [].
 	func _top(p: Vector2) -> Array:
+		var hit := _top_ex(p)
+		return [hit[0], hit[1], hit[2]] if not hit.is_empty() else []
+
+	## The highest triangle of material `(filter_s, filter_row)` over `p`: [height, uv_or_null], or [].
+	func _top_matching(p: Vector2, filter_s: int, filter_row: int) -> Array:
+		var hit := _top_ex(p, filter_s, filter_row)
+		return [hit[0], hit[3]] if not hit.is_empty() else []
+
+	func _top_ex(p: Vector2, filter_s := -1, filter_row := -1) -> Array:
 		var bucket := _bucket_of(p)
 		if bucket < 0:
 			return []
 		var best: Array = []
 		for t: int in _buckets[bucket]:
 			var tri: Array = _tris[t]
+			if filter_s >= 0 and (int(tri[3]) != filter_s or int(tri[4]) != filter_row):
+				continue
 			var a: Vector3 = tri[0]
 			var b: Vector3 = tri[1]
 			var c: Vector3 = tri[2]
@@ -556,7 +819,13 @@ class Job:
 				continue
 			var y := a.y + l1 * (b.y - a.y) + l2 * (c.y - a.y)
 			if best.is_empty() or y > float(best[0]):
-				best = [y, tri[3], tri[4]]
+				var uv: Variant = null
+				if tri[5] != null:
+					var w1 := clampf(l1, 0.0, 1.0)
+					var w2 := clampf(l2, 0.0, 1.0 - w1)
+					var w0 := 1.0 - w1 - w2
+					uv = (tri[5] as Vector2) * w0 + (tri[6] as Vector2) * w1 + (tri[7] as Vector2) * w2
+				best = [y, tri[3], tri[4], uv]
 		return best
 
 	func _bucket_of(p: Vector2) -> int:
@@ -574,6 +843,7 @@ class Job:
 			var arrays: Array = surfaces[s]
 			var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
 			var idx = arrays[Mesh.ARRAY_INDEX]
+			var uvs = arrays[Mesh.ARRAY_TEX_UV]
 			var rows := Builder.row_of(arrays)
 			var count: int = (idx as PackedInt32Array).size() if idx != null else verts.size()
 			for t in range(0, count - 2, 3):
@@ -588,7 +858,11 @@ class Job:
 					continue
 				var row := int(rows[ia]) if not rows.is_empty() else 0
 				var n := _tris.size()
-				_tris.append([a, b, c, s, row])
+				if uvs != null:
+					var uv_arr: PackedVector2Array = uvs
+					_tris.append([a, b, c, s, row, uv_arr[ia], uv_arr[ib], uv_arr[ic]])
+				else:
+					_tris.append([a, b, c, s, row, null, null, null])
 				var lo := Vector2(minf(a.x, minf(b.x, c.x)), minf(a.z, minf(b.z, c.z)))
 				var hi := Vector2(maxf(a.x, maxf(b.x, c.x)), maxf(a.z, maxf(b.z, c.z)))
 				var u0 := clampi(int((lo.x - box.position.x) / maxf(box.size.x, 0.001) * BUCKETS), 0, BUCKETS - 1)
@@ -612,6 +886,7 @@ class Builder:
 	## a top's is the average over the model's vertices under it, rails' crevices and rollers' gaps
 	## and all, which a single vertex (often a bright ridge) doesn't stand for.
 	var shading := PackedColorArray()
+	var interp_uvs := PackedVector2Array()
 	var indices := PackedInt32Array()
 
 	func _init(arrays: Array) -> void:
@@ -633,22 +908,40 @@ class Builder:
 			out[k] = float(c2[k * stride])
 		return out
 
-	## A quad (corners in order round it) facing `normal`, of material row `row`.
-	func quad(p: Array, normal: Vector3, row: int) -> void:
+	func _emit_verts(p: Array, normal: Vector3, row: int, uvs_in: Array) -> int:
 		var base := verts.size()
 		var mean := _mean_shading(p, row) if normal.y > 0.5 else Color(-1, -1, -1, -1)
-		for k in 4:
+		var src_uv = src[Mesh.ARRAY_TEX_UV]
+		for k in p.size():
 			verts.append(p[k])
 			normals.append(normal)
 			var pick := _nearest(p[k], normal, row)
 			picks.append(pick)
 			shading.append(mean if mean.a >= 0.0 else _shading_of(pick))
+			if src_uv != null:
+				if k < uvs_in.size() and uvs_in[k] is Vector2:
+					interp_uvs.append(uvs_in[k] as Vector2)
+				else:
+					interp_uvs.append((src_uv as PackedVector2Array)[pick])
+		return base
+
+	## A quad (corners in order round it) facing `normal`, of material row `row`.
+	func quad(p: Array, normal: Vector3, row: int, uvs_in: Array = []) -> void:
+		var base := _emit_verts(p, normal, row, uvs_in)
 		# Godot's front faces wind clockwise seen from the front.
 		var flip: bool = ((p[1] as Vector3) - p[0]).cross((p[2] as Vector3) - p[0]).dot(normal) > 0.0
 		for t in [[0, 1, 2], [0, 2, 3]]:
 			indices.append(base + t[0])
 			indices.append(base + (t[2] if flip else t[1]))
 			indices.append(base + (t[1] if flip else t[2]))
+
+	## A single triangle facing `normal`, of material row `row`.
+	func tri(p: Array, normal: Vector3, row: int, uvs_in: Array = []) -> void:
+		var base := _emit_verts(p, normal, row, uvs_in)
+		var flip: bool = ((p[1] as Vector3) - p[0]).cross((p[2] as Vector3) - p[0]).dot(normal) > 0.0
+		indices.append(base)
+		indices.append(base + (2 if flip else 1))
+		indices.append(base + (1 if flip else 2))
 
 	func _shading_of(k: int) -> Color:
 		var c = src[Mesh.ARRAY_COLOR]
@@ -722,4 +1015,6 @@ class Builder:
 			out[a] = to
 		if out[Mesh.ARRAY_COLOR] != null:
 			out[Mesh.ARRAY_COLOR] = shading
+		if out[Mesh.ARRAY_TEX_UV] != null and interp_uvs.size() == verts.size():
+			out[Mesh.ARRAY_TEX_UV] = interp_uvs
 		return out

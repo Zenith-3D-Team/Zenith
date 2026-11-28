@@ -1,0 +1,124 @@
+Zenith patch 0003: inputs for a custom upscaler (RenderData.get_upscale_inputs).
+
+During a ViewportUpscaler's render callback, RenderData.get_upscale_inputs() returns what Godot's FSR 2.2 gets
+and no bound API exposes: the colour, depth, velocity, output and exposure textures, render and output size,
+jitter (render pixels and NDC), a reset flag (new or resized buffers), near/far, vertical FOV, orthogonal,
+delta time and the reprojection matrix. Zenith's own work, vendor-free, MIT like Godot.
+
+diff --git a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
+index 3b65755..a961919 100644
+--- a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
++++ b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
+@@ -2469,8 +2469,47 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 
+ 	if (rb_data.is_valid() && (using_upscaling || using_taa)) {
+ 		if (scale_type == SCALE_CUSTOM) {
++			RID exposure;
++			if (RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_render_data->camera_attributes)) {
++				exposure = luminance->get_current_luminance_buffer(rb);
++			}
++			real_t fov = p_render_data->scene_data->cam_projection.get_fov();
++			real_t aspect = p_render_data->scene_data->cam_projection.get_aspect();
++			Projection correction;
++			correction.set_depth_correction(true, true, false);
++			const Projection &prev_proj = p_render_data->scene_data->prev_cam_projection;
++			const Projection &cur_proj = p_render_data->scene_data->cam_projection;
++			const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
++			const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
++
++			Dictionary inputs;
++			// View 0's textures (an upscaler for stereo reads the layers from the render buffers).
++			inputs["color"] = rb->get_internal_texture(0);
++			inputs["depth"] = rb->get_depth_texture(0);
++			inputs["velocity"] = rb->has_velocity_buffer(false) ? rb->get_velocity_buffer(false, 0) : RID();
++			inputs["output"] = rb->get_upscaled_layer(0);
++			inputs["exposure"] = exposure;
++			inputs["render_size"] = rb->get_internal_size();
++			inputs["output_size"] = rb->get_target_size();
++			// Jitter in render pixels as FSR 2.2 gets it, and Godot's own (NDC) value.
++			inputs["jitter"] = p_render_data->scene_data->taa_jitter * Vector2(rb->get_internal_size()) * 0.5f;
++			inputs["jitter_ndc"] = p_render_data->scene_data->taa_jitter;
++			inputs["jitter_phase_count"] = RSG::viewport->viewport_upscaler_get_jitter_phase_count(custom_upscaler);
++			inputs["reset"] = rb->custom_upscale_reset;
++			inputs["z_near"] = p_render_data->scene_data->z_near;
++			inputs["z_far"] = p_render_data->scene_data->z_far;
++			inputs["fovy"] = p_render_data->scene_data->cam_projection.get_fovy(fov, 1.0 / aspect);
++			inputs["orthogonal"] = p_render_data->scene_data->cam_projection.is_orthogonal();
++			inputs["delta_time"] = float(time_step);
++			inputs["reprojection"] = (correction * prev_proj) * prev_transform.affine_inverse() * cur_transform * (correction * cur_proj).inverse();
++			rb->custom_upscale_reset = false;
++
++			p_render_data->upscale_inputs = inputs;
++			RD::get_singleton()->draw_command_begin_label("Custom Upscaler");
+ 			Callable callback = RSG::viewport->viewport_upscaler_get_render_callback(custom_upscaler);
+ 			callback.call(p_render_data);
++			RD::get_singleton()->draw_command_end_label();
++			p_render_data->upscale_inputs = Dictionary();
+ 		} else if (scale_type == SCALE_FSR2) {
+ 			rb_data->ensure_fsr2(fsr2_effect);
+ 
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_data_rd.h b/servers/rendering/renderer_rd/storage_rd/render_data_rd.h
+index b11ed36..ebdd15b 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_data_rd.h
++++ b/servers/rendering/renderer_rd/storage_rd/render_data_rd.h
+@@ -45,6 +45,9 @@ public:
+ 
+ 	virtual RID get_environment() const override { return environment; }
+ 	virtual RID get_camera_attributes() const override { return camera_attributes; }
++	virtual Dictionary get_upscale_inputs() const override { return upscale_inputs; }
++
++	Dictionary upscale_inputs;
+ 
+ 	// Members are publicly accessible within the render engine.
+ 	Ref<RenderSceneBuffersRD> render_buffers;
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
+index 8b6cfc3..8863463 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
++++ b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.cpp
+@@ -171,6 +171,7 @@ void RenderSceneBuffersRD::configure(const RenderSceneBuffersConfiguration *p_co
+ 
+ 	scaling_3d_mode = p_config->get_scaling_3d_mode();
+ 	scaling_3d_custom_upscaler = p_config->get_scaling_3d_custom_upscaler();
++	custom_upscale_reset = true;
+ 	msaa_3d = p_config->get_msaa_3d();
+ 	screen_space_aa = p_config->get_screen_space_aa();
+ 
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
+index 2eb4967..e431548 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
++++ b/servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h
+@@ -85,6 +85,12 @@ private:
+ 	RSE::ViewportScaling3DMode scaling_3d_mode = RSE::VIEWPORT_SCALING_3D_MODE_OFF;
+ 	RID scaling_3d_custom_upscaler;
+ 	float fsr_sharpness = 0.2f;
++
++public:
++	// A custom upscaler's history is invalid (new or resized buffers).
++	bool custom_upscale_reset = true;
++
++private:
+ 	float texture_mipmap_bias = 0.0f;
+ 	RSE::ViewportAnisotropicFiltering anisotropic_filtering_level = RSE::VIEWPORT_ANISOTROPY_4X;
+ 
+diff --git a/servers/rendering/storage/render_data.cpp b/servers/rendering/storage/render_data.cpp
+index 188530a..6e6b7eb 100644
+--- a/servers/rendering/storage/render_data.cpp
++++ b/servers/rendering/storage/render_data.cpp
+@@ -37,4 +37,5 @@ void RenderData::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_render_scene_data"), &RenderData::get_render_scene_data);
+ 	ClassDB::bind_method(D_METHOD("get_environment"), &RenderData::get_environment);
+ 	ClassDB::bind_method(D_METHOD("get_camera_attributes"), &RenderData::get_camera_attributes);
++	ClassDB::bind_method(D_METHOD("get_upscale_inputs"), &RenderData::get_upscale_inputs);
+ }
+diff --git a/servers/rendering/storage/render_data.h b/servers/rendering/storage/render_data.h
+index 25bddc2..b9ec68e 100644
+--- a/servers/rendering/storage/render_data.h
++++ b/servers/rendering/storage/render_data.h
+@@ -46,4 +46,7 @@ public:
+ 
+ 	virtual RID get_environment() const = 0;
+ 	virtual RID get_camera_attributes() const = 0;
++
++	// Inputs for a custom upscaler (ViewportUpscaler), filled only during its render callback.
++	virtual Dictionary get_upscale_inputs() const { return Dictionary(); }
+ };

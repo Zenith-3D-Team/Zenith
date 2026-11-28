@@ -72,6 +72,36 @@ func _turrets() -> void:
 	check(layer.game_beams, "turrets: another surface keeps the game's beams")
 	layer.reset()
 	check(not layer.game_beams, "turrets: a new game waits for its own `pj` before leaving beams to it")
+	# Batch 2 #2: folded turret ammo-take false-fire guard (--turret-ammo-guard=off).
+	var was_guard := TurretLayer.ammo_fire_guard
+	TurretLayer.ammo_fire_guard = true
+	layer.handle_states({"t": "ts", "l": [[701, 0, 4, 0]]})
+	var st_idle = layer.state_of(701)
+	check(st_idle != null and st_idle.shots.is_empty(),
+		"B2#2: folded turret without recent target suppresses uncorroborated ammo-delta shots")
+	layer.handle_states({"t": "ts", "l": [[702, 0, 0, 0, 20 * 256, 10 * 256]]})
+	layer._process(0.05)
+	layer.handle_states({"t": "ts", "l": [[702, 0, 2, 0]]})
+	var st_recent = layer.state_of(702)
+	check(st_recent != null and st_recent.shots.size() == 2,
+		"B2#2: turret with recent target still queues shots (%d)" % (st_recent.shots.size() if st_recent != null else -1))
+	# Artillery never names a target (2.1.x) and a spidertron's rockets fire by themselves: the
+	# mod counts those only with their projectile in flight, so the guard lets them through.
+	var art_st = layer._state(704)
+	art_st.name = "artillery-turret"
+	art_st.cfg = TurretLayer.TURRETS["artillery-turret"]
+	layer.handle_states({"t": "ts", "l": [[704, 500, 1, 0]]})
+	check(art_st.shots.size() == 1, "rel-031-live: an artillery turret's shell queued without a target (%d)" % art_st.shots.size())
+	layer.handle_states({"t": "ts", "l": [[705, 375, 1, 1]]})
+	var spider_st = layer.state_of(705)
+	check(spider_st != null and spider_st.shots.size() == 1,
+		"rel-031-live: a spidertron's rocket (gun 1) queued without a target (%d)" % (spider_st.shots.size() if spider_st != null else -1))
+	TurretLayer.ammo_fire_guard = false
+	layer.handle_states({"t": "ts", "l": [[703, 0, 3, 0]]})
+	var st_old = layer.state_of(703)
+	check(st_old != null and st_old.shots.size() == 3,
+		"B2#2: --turret-ammo-guard=off restores queueing ammo-delta shots without target (%d)" % (st_old.shots.size() if st_old != null else -1))
+	TurretLayer.ammo_fire_guard = was_guard
 	w.free()
 	layer.queue_free()
 
@@ -513,9 +543,13 @@ func _asteroid_chunks() -> void:
 	silo_movers.fogged = false
 	layer._hide_flying_rockets()
 	check(hidden_first and hidden_in_fog and waiting.visible, "a rocket seen before its silo's chunk comes back when the silo arrives, not under the fog")
+	# (Since the launch VFX overhaul a rocket is measured from where world.gd says its silo stands, not where it was
+	# first seen: --rocket-vfx=old as well.)
+	silo_movers.world.silo_positions[77] = Vector2(50, 50)
 	waiting.position = Vector3(50, 0, 40)
 	layer._hide_flying_rockets()
 	check(not waiting.visible, "a rocket that has moved off its silo stays hidden")
+	silo_movers.world.silo_positions.clear()
 	# H16: a silo's rocket follows its `st`: down the shaft while the doors open, rising, then waiting.
 	var rising := Node3D.new()
 	rising.position = Vector3(60, 0, 60)
@@ -533,7 +567,9 @@ func _asteroid_chunks() -> void:
 	var half := rising.position.y
 	layer._update_silos(4.0)
 	layer._hide_flying_rockets()
-	check(is_equal_approx(deep, -Visuals.ROCKET_SINK - RocketsScript.RISE_DEPTH) and half > deep + 2.0 and half < -Visuals.ROCKET_SINK - 2.0
+	# (The launch VFX's 26-tile shaft lifts its rocket from RISE_DEPTH_3D down; --rocket-vfx=old from RISE_DEPTH.)
+	var rise_depth: float = RocketsScript.RISE_DEPTH_3D if ModelLibrary.rocket_vfx_enhanced else RocketsScript.RISE_DEPTH
+	check(is_equal_approx(deep, -Visuals.ROCKET_SINK - rise_depth) and half > deep + 2.0 and half < -Visuals.ROCKET_SINK - 2.0
 		and is_equal_approx(rising.position.y, -Visuals.ROCKET_SINK), "a silo's rocket waits down the shaft while the doors open, then rises over 7 s (H16): %.1f, %.1f, %.1f" % [deep, half, rising.position.y])
 	# The launch: engines over 5.5 s, held in the shaft until it lets go, then Factorio's climb.
 	check(RocketsScript.ignition_at(0.0) == 0.0 and is_equal_approx(RocketsScript.ignition_at(RocketsScript.IGNITE_AFTER + RocketsScript.ENGINE_START), 1.0)
@@ -580,6 +616,331 @@ func _asteroid_chunks() -> void:
 	silo_movers.world.free()
 	layer.movers = null
 	layer.queue_free()
+
+
+func _rocket_launch_vfx() -> void:
+	var RocketVfxScript := preload("res://scripts/world/rocket_vfx.gd")
+	var TerrainMesherScript := preload("res://scripts/world/terrain_mesher.gd")
+	var CameraRigScript := preload("res://scripts/player/camera_rig.gd")
+	var ModelLodsScript := preload("res://scripts/world/model_lods.gd")
+	var FxSettingsScript := preload("res://scripts/fx/fx_settings.gd")
+	var ContactShadeScript := preload("res://scripts/world/contact_shade.gd")
+	var SwitchesScript := preload("res://scripts/switches.gd")
+	var VisualsScript := preload("res://scripts/world/visuals.gd")
+
+	var was_enhanced := ModelLibrary.rocket_vfx_enhanced
+	var was_fx := FxSettingsScript.effects_enabled
+	ModelLibrary.rocket_vfx_enhanced = true
+	FxSettingsScript.effects_enabled = true
+
+	var rig_inst: Node = CameraRigScript.new()
+	check(not SwitchesScript.REGISTRY.has("--rocket-shake") and not rig_inst.has_method("add_rumble"),
+		"rocket camera shake switch and rumble helpers are removed")
+	rig_inst.free()
+
+	# 1. Door slide vectors are pure +-X with slight dip (zero Z shear).
+	var de: Vector3 = ModelLibrary.HATCHES["door_silo_e"]["slide"]
+	var dw: Vector3 = ModelLibrary.HATCHES["door_silo_w"]["slide"]
+	check(absf(de.z) < 0.001 and absf(dw.z) < 0.001 and de.x >= 2.6 and dw.x <= -2.6,
+		"rocket silo doors retract cleanly along +-X without diagonal Z shear")
+
+	# 2. Both default (fue5) and placeholders rocket-silo models strip blocking pit caps, clip doors, and retain contact masks.
+	var check_silo_model := func(model_name: String, label: String) -> void:
+		var mesh := ModelLibrary.mesh_for(model_name)
+		var parts := ModelLibrary.parts_for(model_name)
+		var spec := ModelLibrary.silo_hole_spec(model_name)
+		var door_part: ModelLibrary.AnimPart = null
+		for p: ModelLibrary.AnimPart in parts:
+			if p.kind == "door_silo_e":
+				door_part = p
+				break
+		var flat_blocking := 0
+		var total_tris := 0
+		if mesh is ArrayMesh:
+			var am := mesh as ArrayMesh
+			for si in am.get_surface_count():
+				var arrays: Array = ModelLodsScript.arrays_of(am, si)
+				var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+				var idx: PackedInt32Array = arrays[Mesh.ARRAY_INDEX]
+				total_tris += idx.size() / 3
+				var t := 0
+				while t + 2 < idx.size():
+					var v0: Vector3 = verts[idx[t]]
+					var v1: Vector3 = verts[idx[t + 1]]
+					var v2: Vector3 = verts[idx[t + 2]]
+					t += 3
+					var ymax := maxf(v0.y, maxf(v1.y, v2.y))
+					var ymin := minf(v0.y, minf(v1.y, v2.y))
+					var n := (v1 - v0).cross(v2 - v0)
+					if ymax < 0.08 and ymin > -0.55 and n.length_squared() > 1e-12 and absf(n.normalized().y) > 0.90:
+						var c_xz := Vector2((v0.x + v1.x + v2.x) / 3.0, (v0.z + v1.z + v2.z) / 3.0)
+						if c_xz.distance_to(Vector2(spec.x, spec.y)) < spec.z * 0.85:
+							flat_blocking += 1
+		var clip_set := false
+		if door_part != null:
+			AnimScript.setup_part(door_part)
+			var mat := door_part.mesh.surface_get_material(0) as ShaderMaterial
+			if mat != null:
+				var clip_v: Variant = mat.get_shader_parameter("anim_clip_center")
+				clip_set = clip_v is Vector3 and (clip_v as Vector3).z > 2.0
+		var rings_out: Array = []
+		ContactShadeScript.collect(rings_out, "rocket-silo", "rocket-silo", mesh,
+			Transform3D(Basis.IDENTITY, Vector3(24.0, 0.0, 24.0)), Vector2(-4.5, -4.5), Vector2(4.5, 4.5), Vector2(9.0, 9.0))
+		var kept_mask := mesh != null and mesh.has_meta(ContactShadeScript.META) and mesh.has_meta(ContactShadeScript.MASK_META)
+		var ring_is_mask := rings_out.size() == 1 and (rings_out[0] as Array).size() > 8
+		var hole_dark_texels := 0
+		var outer_dark_texels := 0
+		if kept_mask and ContactShadeScript._atlas != null:
+			var mask_meta: Array = mesh.get_meta(ContactShadeScript.MASK_META)
+			var region: Rect2 = mask_meta[0]
+			var slot: int = int(mask_meta[1])
+			var msize: int = ContactShadeScript.MASK_SIZE
+			var ox: int = (slot % ContactShadeScript.MASK_COLS) * msize
+			var oy: int = (slot / ContactShadeScript.MASK_COLS) * msize
+			var cell: Vector2 = region.size / float(msize)
+			var img: Image = ContactShadeScript._atlas
+			for my in msize:
+				var wz := region.position.y + (float(my) + 0.5) * cell.y
+				for mx in msize:
+					var wx := region.position.x + (float(mx) + 0.5) * cell.x
+					var mr := Vector2(wx - spec.x, wz - spec.y).length()
+					var mv := int(round(img.get_pixel(ox + mx, oy + my).r * 255.0))
+					if mr < spec.z:
+						if mv < 255:
+							hole_dark_texels += 1
+					elif mr > spec.z + 0.25 and mv < 128:
+						outer_dark_texels += 1
+		check(spec.z >= 2.0 and spec.z <= 3.0 and flat_blocking == 0 and total_tris > 1000 and clip_set
+			and kept_mask and ring_is_mask and hole_dark_texels == 0 and outer_dark_texels > 40,
+			"%s rocket-silo opens shaft cleanly & keeps clear-hole contact mask (spec=%s, blocking=%d, tris=%d, clip=%s, hole_dark=%d, outer_dark=%d)" % [
+				label, spec, flat_blocking, total_tris, clip_set, hole_dark_texels, outer_dark_texels])
+	check_silo_model.call("rocket-silo", "default")
+	check_silo_model.call("rocket-silo@builtin:placeholders", "placeholders")
+
+	# 3. 3D shaft, elevator, and clamp arm meshes all have strictly front-facing winding matching vertex normals.
+	var count_bad_winding := func(am: ArrayMesh) -> int:
+		var arr := am.surface_get_arrays(0)
+		var verts: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+		var norms: PackedVector3Array = arr[Mesh.ARRAY_NORMAL]
+		var bad := 0
+		var k := 0
+		while k + 2 < verts.size():
+			var fn := (verts[k + 2] - verts[k]).cross(verts[k + 1] - verts[k])
+			if fn.dot(norms[k]) <= 0.0:
+				bad += 1
+			k += 3
+		return bad
+	var shaft_mesh: ArrayMesh = RocketVfxScript._build_shaft_mesh()
+	var elev_mesh: ArrayMesh = RocketVfxScript._build_elevator_mesh()
+	var clamp_mesh: ArrayMesh = RocketVfxScript._build_clamp_arm_mesh()
+	var shaft_tris := (shaft_mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() / 3
+	var bad_shaft: int = count_bad_winding.call(shaft_mesh)
+	var bad_elev: int = count_bad_winding.call(elev_mesh)
+	var bad_clamp: int = count_bad_winding.call(clamp_mesh)
+	check(shaft_tris > 100 and bad_shaft == 0 and bad_elev == 0 and bad_clamp == 0,
+		"3D launch shaft, elevator & clamps have valid front-facing winding (tris=%d, bad=%d/%d/%d)" % [
+			shaft_tris, bad_shaft, bad_elev, bad_clamp])
+
+	# 4. TerrainMesher circular cutout leaves zero edges protruding inside the shaft and zero inverted tris.
+	var make_terrain_job := func(holes: PackedVector3Array):
+		var job = TerrainMesherScript.new()
+		job.coord = Vector2i.ZERO
+		job.tile_ids = PackedInt32Array()
+		job.tile_ids.resize(32 * 32)
+		job.tile_ids.fill(0)
+		var around_arr: Array[PackedInt32Array] = []
+		for _k in 9:
+			around_arr.append(job.tile_ids)
+		job.around = around_arr
+		job.colors = PackedColorArray([Color(0.3, 0.4, 0.2)])
+		job.kind_of = PackedByteArray([0])
+		job.gfx_of = [null]
+		job.silo_holes = holes
+		job.run()
+		return job
+	var plain_job = make_terrain_job.call(PackedVector3Array())
+	check(plain_job.land.verts.size() == 1024 * 4, "plain terrain keeps 1024 tiles without holes")
+	for hole_pt: Vector2 in [Vector2(16.0, 16.0), Vector2(16.5, 16.5)]:
+		var cut_r := 2.66
+		var holed_job = make_terrain_job.call(PackedVector3Array([Vector3(hole_pt.x, hole_pt.y, cut_r)]))
+		var hidxs: PackedInt32Array = holed_job.land.indices
+		var hverts: PackedVector3Array = holed_job.land.verts
+		var min_edge_r := INF
+		var inverted_tris := 0
+		var holed_area := 0.0
+		var hidx := 0
+		while hidx + 2 < hidxs.size():
+			var a := Vector2(hverts[hidxs[hidx]].x, hverts[hidxs[hidx]].z)
+			var b := Vector2(hverts[hidxs[hidx + 1]].x, hverts[hidxs[hidx + 1]].z)
+			var c := Vector2(hverts[hidxs[hidx + 2]].x, hverts[hidxs[hidx + 2]].z)
+			var cross_y := (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+			if cross_y < -1e-6:
+				inverted_tris += 1
+			holed_area += 0.5 * absf(cross_y)
+			var tri := [a, b, c]
+			for ei in 3:
+				var ea: Vector2 = tri[ei]
+				var eb: Vector2 = tri[(ei + 1) % 3]
+				var ab := eb - ea
+				var t := clampf((hole_pt - ea).dot(ab) / maxf(ab.length_squared(), 1e-9), 0.0, 1.0)
+				min_edge_r = minf(min_edge_r, (ea + ab * t).distance_to(hole_pt))
+			hidx += 3
+		check(min_edge_r >= cut_r - 0.001 and inverted_tris == 0 and holed_area < 1024.0 - 20.0 and holed_area > 990.0,
+			"terrain cutout at %s has zero protrusion & zero inverted tris (min_edge=%.3f>=%.2f, inv=%d, area=%.1f)" % [
+				hole_pt, min_edge_r, cut_r, inverted_tris, holed_area])
+
+	# 4b. Decoratives uses an octagonal silo mask instead of a sharp 9x9 square border.
+	var DecorScript := preload("res://scripts/world/decoratives.gd")
+	var djob = DecorScript.BuildJob.new()
+	djob.chunk = Vector2i.ZERO
+	djob.foot = {1: Vector4(9, 9, 0, 0)}
+	djob.silos = {1: true}
+	var rec_stub_script := GDScript.new()
+	rec_stub_script.source_code = "extends RefCounted\nvar proto_id := 1\nvar pos := Vector2(16.5, 16.5)\nvar dir := 0\n"
+	rec_stub_script.reload()
+	djob.recs = [rec_stub_script.new()]
+	DecorScript._mask_of(djob)
+	var bit_at := func(tx: int, ty: int) -> int:
+		return (int(djob.mask[ty]) >> tx) & 1
+	check(bit_at.call(16, 16) == 1 and bit_at.call(14, 14) == 1 and bit_at.call(18, 18) == 1
+		and bit_at.call(12, 12) == 0 and bit_at.call(20, 12) == 0 and bit_at.call(12, 20) == 0
+		and bit_at.call(20, 20) == 0 and bit_at.call(16, 20) == 0,
+		"decoratives mask blocks silo octagon/hole while keeping outer corners natural")
+
+	# 5. AnimScript initializes silo doors already open when chunk loads at SILO_UP.
+	var door_e: ModelLibrary.AnimPart = null
+	for p: ModelLibrary.AnimPart in ModelLibrary.parts_for("rocket-silo"):
+		if p.kind == "door_silo_e":
+			door_e = p
+			break
+	if door_e != null:
+		AnimScript.setup_part(door_e)
+		var anim_test := AnimScript.new()
+		add_child(anim_test)
+		var g_up := AnimScript.Group.new()
+		g_up.mm = MultiMesh.new()
+		g_up.mm.transform_format = MultiMesh.TRANSFORM_3D
+		g_up.mm.use_custom_data = true
+		g_up.mm.mesh = door_e.mesh
+		g_up.mm.instance_count = 1
+		g_up.part = door_e
+		g_up.keys = [8801]
+		g_up.units = PackedInt64Array([8801])
+		g_up.bases = [Transform3D(Basis.IDENTITY, Vector3(20.0, 0.0, 20.0))]
+		g_up.stateful = PackedByteArray([1])
+		g_up.customs = PackedColorArray([Color.WHITE])
+		AnimScript.place(g_up, anim_test, {8801: RocketsScript.SILO_UP})
+		var open_init := anim_test._linear(anim_test._state(8801), door_e, false, false)
+		check(bool(open_init[2]) == true and is_equal_approx(float(open_init[1]), door_e.phase),
+			"silo doors initialize already open when chunk loads at SILO_UP")
+		anim_test.queue_free()
+
+	# 6. Non-launching silos emit zero idle smoke; full reload sequence animates elevator & clamps; launch & cooldown work cleanly.
+	var sw_script := GDScript.new()
+	sw_script.source_code = "extends Node\nvar silo := true\nvar working := {}\nvar silo_positions := {}\nfunc has_near(_t: String, _a: Vector2, _r: float) -> bool:\n\treturn silo\nfunc unit_near(_t: String, _a: Vector2, _r: float) -> int:\n\treturn 77 if silo else 0\n"
+	sw_script.reload()
+	var world_stub: Node = sw_script.new()
+	world_stub.silo_positions = {77: Vector2(24.0, 24.0)}
+	world_stub.working[77] = RocketsScript.SILO_OPENING
+
+	var sm_script := GDScript.new()
+	sm_script.source_code = "extends Node\nvar world: Variant = null\nvar pairs: Array = []\nfunc units_of_type(t: String) -> Array:\n\treturn pairs if t == \"rocket-silo-rocket\" else []\nfunc is_fogged(_u: int) -> bool:\n\treturn false\n"
+	sm_script.reload()
+	var sm: Node = sm_script.new()
+	sm.world = world_stub
+
+	var rocket_mover := Node3D.new()
+	rocket_mover.position = Vector3(24.0, -VisualsScript.ROCKET_SINK, 27.5)
+	sm.pairs = [[999, rocket_mover]]
+
+	var cm2 := ChunkModel.new()
+	var rlayer := RocketsScript.new()
+	rlayer.model = cm2
+	rlayer.movers = sm
+	add_child(rlayer)
+
+	# Opening doors: shaft exists, 0 smoke, clamps stowed strictly below y=-0.10.
+	rlayer._process(0.1)
+	for _k in 8:
+		rlayer._process(0.25)
+	var vfx: Variant = rlayer.get("_vfx")
+	var shaft_obj: Variant = vfx.get_shaft(77) if vfx != null else null
+	var stowed_clear := true
+	if shaft_obj != null:
+		for arm: MeshInstance3D in shaft_obj.clamp_arms:
+			var tip_world := arm.transform * Vector3(0.0, 0.10, -1.06)
+			if tip_world.y >= -0.10:
+				stowed_clear = false
+	check(vfx != null and vfx.shaft_count() == 1 and vfx.smoke_count() == 0 and shaft_obj.lift == 0.0 and stowed_clear,
+		"SILO_OPENING builds 3D shaft with zero spurious smoke and stowed clamps below closed doors")
+
+	# Rising phase: mover simulates Factorio's +3.5 -> -2.8 Y shift and stays visible, centered, and rising cleanly.
+	world_stub.working[77] = RocketsScript.SILO_RISING
+	rlayer._process(0.1)
+	var y_start := rocket_mover.position.y
+	rocket_mover.position.z = 25.0
+	rlayer._process(3.5)
+	var y_mid := rocket_mover.position.y
+	var mid_lift: float = shaft_obj.lift
+	rocket_mover.position.z = 21.2
+	rlayer._process(3.5)
+	var y_end := rocket_mover.position.y
+	var end_lift: float = shaft_obj.lift
+	var hole_spec := ModelLibrary.silo_hole_spec("rocket-silo")
+	var centered := absf(rocket_mover.position.x - (24.0 + hole_spec.x)) < 0.02 and absf(rocket_mover.position.z - (24.0 + hole_spec.y)) < 0.02
+	check(rocket_mover.visible and centered and y_start < y_mid and y_mid < y_end
+		and is_equal_approx(y_end, -VisualsScript.ROCKET_SINK) and mid_lift > 0.3 and end_lift > 0.99 and vfx.smoke_count() == 0,
+		"SILO_RISING smoothly elevates & centers rocket and cradle without vanishing or smoking (y %.1f->%.1f->%.1f, lift=%.2f)" % [
+			y_start, y_mid, y_end, end_lift])
+
+	# Idle SILO_UP: clamps lock onto rocket, zero idle smoke, zero pit light glare.
+	world_stub.working[77] = RocketsScript.SILO_UP
+	for _k in 12:
+		rlayer._process(0.25)
+	var clamped_up := false
+	for arm: MeshInstance3D in shaft_obj.clamp_arms:
+		if (arm.transform * Vector3(0.0, 0.0, -1.06)).y > 0.05:
+			clamped_up = true
+	check(shaft_obj.clamps >= 0.99 and clamped_up and rocket_mover.visible and vfx.smoke_count() == 0 and not shaft_obj.pit_light.visible,
+		"SILO_UP engages hold-down clamps silently with zero idle smoke or idle light")
+
+	# Launch sequence: clamps retract, 5-act plume + sparks + pyroclastic smoke + blast ring fire cleanly.
+	rlayer._on_launch(77, Vector2(24.0, 24.0), "")
+	for _step in 30:
+		rlayer._process(0.25)
+	var pre_liftoff_smoke: int = vfx.smoke_count()
+	var pre_liftoff_sparks: int = vfx.spark_count()
+	var launch_dict: Dictionary = rlayer._launches[0]
+	var plume: Variant = launch_dict.get("plume")
+	var plume_on: bool = plume != null and plume.root.visible
+	var shaft_lit: bool = shaft_obj.fire_glow > 0.5 and shaft_obj.pit_light.visible and shaft_obj.ring.visible and shaft_obj.clamps < 0.05
+	for _step in 10:
+		rlayer._process(0.25)
+	var lifted := bool(launch_dict.get("lifted", false))
+	world_stub.working[77] = RocketsScript.SILO_CLOSING
+	for _step in 12:
+		rlayer._process(0.25)
+	check(pre_liftoff_smoke > 20 and pre_liftoff_sparks > 0 and plume_on and shaft_lit and lifted and shaft_obj.lift < 0.5,
+		"5-act launch retracts clamps, drives plume/sparks/smoke/ring, and SILO_CLOSING lowers cradle")
+
+	rlayer.reset()
+	check(vfx.shaft_count() == 0 and vfx.smoke_count() == 0 and vfx.spark_count() == 0 and rlayer._launches.is_empty(),
+		"rocket layer reset() clears all shafts, smoke, sparks, and active launches")
+
+	# Legacy switch check: --rocket-vfx=old skips RocketVfx creation.
+	ModelLibrary.rocket_vfx_enhanced = false
+	var legacy_layer := RocketsScript.new()
+	legacy_layer.model = cm2
+	add_child(legacy_layer)
+	check(legacy_layer.get("_vfx") == null, "--rocket-vfx=old disables RocketVfx creation")
+
+	legacy_layer.queue_free()
+	rlayer.queue_free()
+	rocket_mover.free()
+	sm.free()
+	world_stub.free()
+	ModelLibrary.rocket_vfx_enhanced = was_enhanced
+	FxSettingsScript.effects_enabled = was_fx
 
 
 ## Asteroid collectors' arms (collectors.gd, F3) from `acol` and the chunks (`ach`): the head flies
@@ -1344,7 +1705,7 @@ func _debug_menu_over_camera(hud: Hud) -> void:
 	var stand: Node = stand_gs.new()
 	stand.rig = rig
 	stand.hud = hud
-	stand._game = self
+	stand._game = hud.get_parent()  # the layers the host hides live under the test root, not this area node
 	holder.add_child(stand)
 	var api_gs := GDScript.new()
 	api_gs.source_code = "extends RefCounted\nvar id := \"stand-in\"\nvar camera := Cam.new()\nvar keys := Keys.new()\n" \

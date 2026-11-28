@@ -89,7 +89,28 @@ static func native_enabled() -> bool:
 
 
 ## Builds the section mesh (safe to execute on WorkerThreadPool).
+## (--dh-sample-worker, on by default) The section's chunks as distant_horizon.gd gathered them on the
+## main thread: `sample_side` x `sample_side` slots (row-major by chunk offset in the section), each null
+## or [tiles, protos, flags]. When set, run() samples the grid from them first (sample_grid), on the worker.
+var sample_src: Array = []
+var sample_side := 0
+var sample_sec_chunks := 0
+var sample_level := 0
+## The worker's time sampling the grid (µs), 0 when the main thread sampled it.
+var sample_usec := 0
+
+
 func run() -> void:
+	if not sample_src.is_empty():
+		var ts := Time.get_ticks_usec()
+		var ec: PackedByteArray = palette.ent_cat if palette != null else PackedByteArray()
+		var grid := sample_grid(grid_n, sample_sec_chunks, cell_tiles, sample_level, ec, sample_src, sample_side)
+		tiles = grid[0]
+		protos = grid[1]
+		flags = grid[2]
+		chunk_mask = int(grid[3])
+		sample_src = []
+		sample_usec = Time.get_ticks_usec() - ts
 	var t0 := Time.get_ticks_usec()
 	mesh = null
 	solid_arrays = []
@@ -827,3 +848,189 @@ static func _emit_water_top(wv: PackedVector3Array, wc: PackedColorArray, wi: Pa
 ## A box's kind flag: KIND_CLIFF for Factorio's cliffs (the palette's ent_seat), else KIND_NORMAL.
 func _box_kind(pid: int) -> float:
 	return KIND_CLIFF if pid > 0 and pid < _seat.size() and _seat[pid] != 0 else KIND_NORMAL
+
+
+# --- section grid sampling (distant_horizon.gd's _sample_section_grid, on the worker) ----------
+
+## The section grid (n x n cells) from its chunks' tile, entity and flag rows: [tiles, protos, flags,
+## chunk_mask]. The same cells as distant_horizon.gd `_sample_section_grid` (kept there for
+## --dh-sample-worker=off); `src` as `sample_src`. Pure: reads only its arguments, so it runs on a worker.
+static func sample_grid(n: int, sec_chunks: int, cell_tiles: float, level: int, ent_cat: PackedByteArray,
+		src: Array, side: int) -> Array:
+	var total := n * n
+	var out_tiles := PackedInt32Array()
+	out_tiles.resize(total)
+	out_tiles.fill(-1)
+	var out_protos := PackedInt32Array()
+	out_protos.resize(total)
+	var out_flags := PackedByteArray()
+	out_flags.resize(total)
+	var chunk_mask := 0
+	const CHUNK := 32
+	if cell_tiles <= float(CHUNK):
+		var cells_per_chunk := maxi(1, roundi(float(CHUNK) / cell_tiles))
+		for cy_off in sec_chunks:
+			for cx_off in sec_chunks:
+				var slot := cy_off * side + cx_off
+				if cx_off >= side or cy_off >= side or src[slot] == null:
+					continue
+				var row: Array = src[slot]
+				var ctiles: PackedInt32Array = row[0]
+				var cprotos: PackedInt32Array = row[1]
+				var cflags: PackedByteArray = row[2]
+				var src_side := roundi(sqrt(float(ctiles.size())))
+				if src_side <= 0:
+					continue
+				if level == 0:
+					chunk_mask |= 1 << (cy_off * 4 + cx_off)
+				if src_side <= cells_per_chunk:
+					for ly in cells_per_chunk:
+						var sy_src := mini(src_side - 1, (ly * src_side) / cells_per_chunk)
+						var dst_row := (cy_off * cells_per_chunk + ly) * n + cx_off * cells_per_chunk
+						var src_row := sy_src * src_side
+						for lx in cells_per_chunk:
+							var si := src_row + mini(src_side - 1, (lx * src_side) / cells_per_chunk)
+							var di := dst_row + lx
+							out_tiles[di] = ctiles[si]
+							if si < cprotos.size():
+								out_protos[di] = cprotos[si]
+							if si < cflags.size():
+								out_flags[di] = cflags[si]
+				else:
+					var block := maxi(1, src_side / cells_per_chunk)
+					var tcounts := {}
+					for ly in cells_per_chunk:
+						var dst_row := (cy_off * cells_per_chunk + ly) * n + cx_off * cells_per_chunk
+						for lx in cells_per_chunk:
+							var di := dst_row + lx
+							var first_tile := -1
+							var first_count := 0
+							var uniform := true
+							var best_tile := -1
+							var best_pid := 0
+							var best_prio := -1
+							var best_flag := 0
+							var y_start := ly * block
+							var x_start := lx * block
+							for by in range(y_start, mini(src_side, y_start + block)):
+								for bx in range(x_start, mini(src_side, x_start + block)):
+									var si := by * src_side + bx
+									var tid := ctiles[si]
+									if tid >= 0:
+										if uniform:
+											if first_tile < 0:
+												first_tile = tid
+												first_count = 1
+												best_tile = tid
+											elif tid == first_tile:
+												first_count += 1
+											else:
+												uniform = false
+												tcounts.clear()
+												tcounts[first_tile] = first_count
+												best_tile = _majority_tile(tcounts, best_tile, tid)
+										else:
+											best_tile = _majority_tile(tcounts, best_tile, tid)
+									if si < cprotos.size():
+										var pid := cprotos[si]
+										if pid > 0:
+											var prio := cat_priority(ent_cat, pid)
+											if prio > best_prio:
+												best_prio = prio
+												best_pid = pid
+												best_flag = cflags[si] if si < cflags.size() else 15
+							out_tiles[di] = best_tile
+							out_protos[di] = best_pid
+							out_flags[di] = best_flag
+	else:
+		var chunks_per_cell := maxi(1, roundi(cell_tiles / float(CHUNK)))
+		var tcounts := {}
+		for gy in n:
+			for gx in n:
+				var di := gy * n + gx
+				var first_tile := -1
+				var first_count := 0
+				var uniform := true
+				var best_tile := -1
+				var best_pid := 0
+				var best_prio := -1
+				var best_flag := 0
+				for dy in chunks_per_cell:
+					for dx in chunks_per_cell:
+						var ox := gx * chunks_per_cell + dx
+						var oy := gy * chunks_per_cell + dy
+						if ox >= side or oy >= side or src[oy * side + ox] == null:
+							continue
+						var row: Array = src[oy * side + ox]
+						var ctiles: PackedInt32Array = row[0]
+						var cprotos: PackedInt32Array = row[1]
+						var cflags: PackedByteArray = row[2]
+						var csize := ctiles.size()
+						var step := maxi(1, csize / 16)
+						var si := 0
+						while si < csize:
+							var tid := ctiles[si]
+							if tid >= 0:
+								if uniform:
+									if first_tile < 0:
+										first_tile = tid
+										first_count = 1
+										best_tile = tid
+									elif tid == first_tile:
+										first_count += 1
+									else:
+										uniform = false
+										tcounts.clear()
+										tcounts[first_tile] = first_count
+										best_tile = _majority_tile(tcounts, best_tile, tid)
+								else:
+									best_tile = _majority_tile(tcounts, best_tile, tid)
+							if si < cprotos.size():
+								var pid := cprotos[si]
+								if pid > 0:
+									var prio := cat_priority(ent_cat, pid)
+									if prio > best_prio:
+										best_prio = prio
+										best_pid = pid
+										best_flag = cflags[si] if si < cflags.size() else 15
+							si += step
+				out_tiles[di] = best_tile
+				out_protos[di] = best_pid
+				out_flags[di] = best_flag
+	return [out_tiles, out_protos, out_flags, chunk_mask]
+
+
+## As distant_horizon.gd `_pick_majority_tile`.
+static func _majority_tile(tcounts: Dictionary, best_tile: int, tid: int) -> int:
+	if tid < 0:
+		return best_tile
+	var cnt := int(tcounts.get(tid, 0)) + 1
+	tcounts[tid] = cnt
+	if best_tile < 0:
+		return tid
+	var best_cnt := int(tcounts.get(best_tile, 0))
+	if cnt > best_cnt:
+		return tid
+	if cnt == best_cnt:
+		if best_tile <= 0 and tid > 0:
+			return tid
+		if (tid > 0 or best_tile <= 0) and tid < best_tile:
+			return tid
+	return best_tile
+
+
+## As distant_horizon.gd `_cat_priority`: which entity wins a cell (buildings and cliffs first).
+static func cat_priority(ent_cat: PackedByteArray, pid: int) -> int:
+	if pid <= 0 or pid >= ent_cat.size():
+		return 0
+	var c := ent_cat[pid]
+	match c:
+		CAT_BUILDING, CAT_CLIFF:
+			return 4
+		CAT_TREE:
+			return 3
+		CAT_LOW:
+			return 2
+		CAT_ORE:
+			return 1
+	return 0

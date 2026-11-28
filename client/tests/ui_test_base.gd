@@ -41,6 +41,7 @@ const GhostShader := preload("res://shaders/ghost.gdshader")
 const Controls := preload("res://scripts/player/controls.gd")
 const ControlsInfo := preload("res://scripts/menu/controls_info.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
+const Switches := preload("res://scripts/switches.gd")
 const SettingsWindow := preload("res://scripts/menu/settings_window.gd")
 const ModelPacksWindow := preload("res://scripts/menu/model_packs_window.gd")
 const LooksScript := preload("res://scripts/world/looks.gd")
@@ -188,6 +189,7 @@ class ChunkModel:
 
 class SiloWorld extends Node:
 	var silo := false
+	var silo_positions := {}  # unit -> Vector2, as world.gd's (rockets.gd reads where the silo is)
 	var working := {}
 
 	func has_near(_type: String, _at: Vector2, _radius: float) -> bool:
@@ -217,6 +219,22 @@ class SiloMovers:
 
 
 ## The little of camera_rig.gd that ride.gd moves.
+
+
+## Alt-mode's collect() as the next frames give it in play: an icon not yet read (--alt-icons-later) is read on a
+## worker while its chunk is built without it, then its chunk is built again. This waits for those reads and
+## collects again, so a check sees what the player sees a frame or a few later; an overlay whose icons were all
+## read already is collected once, as before.
+func alt_collect(overlay) -> void:
+	overlay.collect()
+	for _round in 8:
+		if (overlay.get("_icon_wait") as Dictionary).is_empty():
+			return
+		for job: Array in Kit._icon_jobs.values():
+			while not WorkerThreadPool.is_task_completed(job[0]):
+				OS.delay_usec(200)
+		overlay._poll_icons_later()
+		overlay.collect()
 
 
 func check(cond: bool, what: String) -> void:

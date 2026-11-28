@@ -89,6 +89,8 @@ import sys
 TOOLS = pathlib.Path(__file__).resolve().parent
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
+# (importing live.live_lib below makes stdout and stderr UTF-8, errors replaced: a redirected run on
+# Windows' cp1252 console never dies on a print of `≥`.)
 
 import protocol  # noqa: E402
 import rcon  # noqa: E402
@@ -102,6 +104,7 @@ from live import (  # noqa: E402
     space_and_planets,
     world_and_multi,
 )
+from live.planner_diff import check_plannerdiff  # noqa: E402
 from live.building_and_planners import (  # noqa: E402
     PIPE_STEPS,
     bp_record,
@@ -112,6 +115,7 @@ from live.building_and_planners import (  # noqa: E402
     check_alt_stock,
     check_belt_switch,
     check_build_tools,
+    check_build_rules,
     check_flips,
     check_pipe_end,
     check_pipe_vis,
@@ -168,6 +172,15 @@ from live.machines_and_vehicles import (  # noqa: E402
     check_vehicle_items,
     check_vehicles,
 )
+from live.combat_diff import check_combat_diff  # noqa: E402
+from live.circuit_diff import check_circuit_diff  # noqa: E402
+from live.research_diff import check_research_diff  # noqa: E402
+from live.crafting_diff import check_crafting_diff  # noqa: E402
+from live.inventory_diff import check_inventory_diff  # noqa: E402
+from live.info_diff import check_info_diff  # noqa: E402
+from live.logistics_diff import check_logistics_diff  # noqa: E402
+from live.trains_diff import check_trains_diff  # noqa: E402
+from live.trains_ui import check_trains_ui  # noqa: E402
 from live.player_and_ui import (  # noqa: E402
     check_build_marks,
     check_gear,
@@ -225,8 +238,8 @@ def parse_args():
     parser.add_argument("--second-client-port", type=int, default=0, help="the two-client check's second client (default: the client port + 1)")
     parser.add_argument("--server-log", help="the server's factorio-current.log, for the barrier check (default: server/data's, "
                                              "when it is this server's)")
-    parser.add_argument("--only", choices=["platforms", "planets", "space", "ride", "collectors", "ui", "input", "cliffs", "save", "gear", "planners", "circuits", "build", "info",
-                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "pickup", "states", "repair", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx", "beltswitch", "barrier", "research", "join", "underclear", "vehitems", "pipeend", "pipevis", "link", "sprint", "steps", "enemysight", "enemysightfix"], help="run just these checks after the handshake")
+    parser.add_argument("--only", choices=["platforms", "planets", "space", "ride", "collectors", "ui", "input", "cliffs", "save", "gear", "planners", "circuits", "build", "buildrules", "info",
+                                           "alerts", "multi", "remnants", "machines", "logic", "vehicles", "hud", "turrets", "weapons", "enemies", "console", "remote", "walk", "pickup", "states", "repair", "mapinfo", "triggers", "minevehicles", "alt", "asplayer", "modgfx", "beltswitch", "barrier", "research", "join", "underclear", "vehitems", "pipeend", "pipevis", "link", "sprint", "steps", "enemysight", "enemysightfix", "invdiff", "infodiff", "infodiff", "craftdiff", "plannerdiff", "logidiff", "traindiff", "trainui", "combdiff", "circdiff", "resdiff"], help="run just these checks after the handshake")
     parser.add_argument("--binary", action="store_true", help="every hello asks for binary frames (bin): the checks read "
                         "them as the client does (protocol.py), and the end says how many datagrams came binary")
     args = parser.parse_args()
@@ -284,6 +297,8 @@ def main():
         "save": check_save,
         "gear": check_gear,
         "build": check_build_tools,
+        "buildrules": check_build_rules,
+        "plannerdiff": check_plannerdiff,
         "alerts": check_alerts,
         "multi": check_multi,
         "remnants": check_remnants,
@@ -319,6 +334,15 @@ def main():
         "logic": check_logic,
         "vehicles": check_vehicles,
         "hud": check_hud,
+        "invdiff": check_inventory_diff,
+        "infodiff": check_info_diff,
+        "logidiff": check_logistics_diff,
+        "traindiff": check_trains_diff,
+        "trainui": check_trains_ui,
+        "craftdiff": check_crafting_diff,
+        "combdiff": check_combat_diff,
+        "circdiff": check_circuit_diff,
+        "resdiff": check_research_diff,
     }
     if args.only:
         if handshake(c):

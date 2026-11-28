@@ -2,6 +2,18 @@
 
 Newest first. Versions before 0.3.2 are in Zenith's history.
 
+## 0.3.5
+
+Softer rain and wind (`sounds/`, `scripts/weather_audio.gd`, `main.gd`).
+
+- The three rain loops and the two wind loops are tilted down from about 1.5 kHz (-6 dB at 4 kHz, -11 dB
+  at 8 kHz and above), a little body kept at 300-600 Hz, and set so every loop's peaks are at -6.5 dB or
+  lower (they were at -1.3 to -4.9 dB), made circularly so the loops stay seamless, and encoded at Vorbis
+  quality 7 (about 224 kbps, they were 82-112 kbps).
+- Setting **Audio > Rain and wind tone** (Soft / Original) and `--weather-sounds=original` play the files as
+  first bundled (`sounds/original/`).
+- The generated storm wind (0.3.2) is unchanged: its roar is under 500 Hz and its rush under 2.6 kHz.
+
 ## 0.3.4
 
 Vehicle puddle splashes, terrain puddle wakes, procedural splash audio, and driver-seat shudder (`scripts/weather_puddles.gd`, `shaders/vehicle_splashes.gdshader`, `scripts/puddle_audio.gd`, `scripts/weather_lightning.gd`, `main.gd`).

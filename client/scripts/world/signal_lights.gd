@@ -1,9 +1,9 @@
 extends Node3D
-## Rail signal and chain signal distance glows and ground lighting.
+## Rail signal and chain signal distance glows.
 ## Gives every active `rail-signal` and `rail-chain-signal` (green/yellow/red/blue, from live
 ## `st` or chunk-snapshot `extra.sg` hints past `focus.r`) an additive billboard glow card drawn
-## after screen-space grading, pooled LOD-tied real `OmniLight3D`s near the camera with frustum
-## prioritization, and 2D HDR lightmap splats (`far_glows()`) into `lamp_lights.gd`.
+## after screen-space grading (`SignalGlows` MultiMesh). Real `OmniLight3D`s are off by default
+## (`--signal-omni-lights=on` restores the pooled LOD-tied real `OmniLight3D`s).
 
 const ProtoDB := preload("res://scripts/world/protos.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
@@ -33,9 +33,6 @@ const FULL_GLOWS := 32768
 const LIGHT_RANGE := 2.2
 const LIGHT_ATTENUATION := 2.0
 const LIGHT_ENERGY := 0.15
-const FAR_SPLAT_RANGE := 0.0
-const FAR_SPLAT_ENERGY := 0.0
-const NEAR_GROUND_SPREAD := 0.0
 
 const STATE_COLORS := {
 	1: Color(0.22, 1.0, 0.25),   # green
@@ -53,6 +50,14 @@ const CHAIN_SIGNAL_OFFSET := Vector3(-0.19, 0.28, -0.02)
 
 ## `--signal-lights=off`: disable signal distance glows and lights.
 static var disabled_by_arg := not Switches.on("--signal-lights")
+## `--signal-omni-lights=on`: restore the 48-128 pooled real `OmniLight3D`s near the camera.
+static var omni_lights_enabled := Switches.on("--signal-omni-lights", false)
+## `--signal-skip-same=off`: every refresh walks every signal again, as before. On: a refresh whose inputs
+## (signal states, signals added or gone, focus, darkness, camera, detail distance, hills, caps) are all as
+## last time keeps the glows it has; one in SKIP_MAX_IN_A_ROW + 1 is still done in full, so anything not in
+## that list (fog seen, the behind-cull) is at most that many refreshes late.
+static var skip_same := Switches.on("--signal-skip-same")
+const SKIP_MAX_IN_A_ROW := 4
 
 var protos: ProtoDB
 var world: Node3D
@@ -73,6 +78,13 @@ var _full_detail := false
 var _detail_distance := DETAIL_DIST_MIN
 var _timer := 0.25
 var _lit := 0
+## The kept refresh (skip_same): the inputs of the last full refresh, how many were kept since, a count of
+## signals' chunks changed (entities_changed), and refreshes done in full or kept (tests and probes).
+var _last_inputs: Array = []
+var _skipped := 0
+var _sig_serial := 0
+var refreshes := 0
+var refreshes_kept := 0
 
 class SigRec:
 	var unit := 0
@@ -100,7 +112,6 @@ var _cand_d2 := PackedFloat32Array()
 var _cand_bucket := PackedInt32Array()
 var _near_order: Array[int] = []
 var _far_order: Array[int] = []
-var _far_glows: Array = []
 
 
 func _ensure_linear_colors() -> void:
@@ -126,7 +137,8 @@ func _ready() -> void:
 	_glows.material_override = mat
 	_glows.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_glows)
-	_add_lights(MAX_LIGHTS)
+	if omni_lights_enabled:
+		_add_lights(MAX_LIGHTS)
 	if world != null and world.has_signal("entities_changed"):
 		world.entities_changed.connect(_on_entities_changed)
 
@@ -154,7 +166,8 @@ func apply_lod_quality(quality: String, custom_distance := 0.0) -> void:
 		_base_max_lights = int(tier[1])
 	if not _full_detail:
 		max_lights = _base_max_lights
-		_add_lights(max_lights)
+		if omni_lights_enabled:
+			_add_lights(max_lights)
 		_timer = REFRESH * 0.5
 
 
@@ -169,7 +182,8 @@ func set_full_detail(on: bool) -> void:
 	_full_detail = on
 	max_lights = FULL_LIGHTS if on else _base_max_lights
 	max_glows = FULL_GLOWS if on else MAX_GLOWS
-	_add_lights(max_lights)
+	if omni_lights_enabled:
+		_add_lights(max_lights)
 	_timer = REFRESH if on else REFRESH * 0.5
 
 
@@ -186,13 +200,13 @@ func reset() -> void:
 
 
 func _clear_outputs() -> void:
+	_last_inputs.clear()  # (--signal-skip-same) what was drawn is gone: the next refresh draws again
 	_lit = 0
 	_spots = PackedVector3Array()
 	_tints = PackedColorArray()
 	_real_weights = PackedFloat32Array()
 	_near_order.clear()
 	_far_order.clear()
-	_far_glows.clear()
 	if _glows != null and _glows.multimesh != null:
 		_glows.multimesh.visible_instance_count = 0
 		_glows.multimesh.custom_aabb = AABB()
@@ -204,8 +218,9 @@ func lit_count() -> int:
 	return _lit
 
 
+## Kept as an empty stub for `lamp_lights.gd` (`far_glows()` caller).
 func far_glows() -> Array:
-	return _far_glows
+	return []
 
 
 func _compute_detail_distance() -> float:
@@ -242,6 +257,7 @@ func _signal_kind(proto_id: int) -> int:
 func _on_entities_changed(c: Vector2i) -> void:
 	if world == null:
 		return
+	_sig_serial += 1
 	var cv = world.chunks.get(c)
 	if cv == null:
 		_signals.erase(c)
@@ -275,6 +291,22 @@ func _on_entities_changed(c: Vector2i) -> void:
 		_chunk_hills[c] = -1
 
 
+## What a refresh draws from, to compare with the last full one's (skip_same); empty when it can't tell
+## (a fogged remote view: what has been seen changes with no other sign).
+func _inputs_now(cam: Camera3D) -> Array:
+	if world == null or protos == null or (fog != null and fog.hiding()):
+		return []
+	var anim: Variant = world.get("animator")
+	var serial: int = int(anim.state_serial) if anim != null and "state_serial" in anim else -1
+	var bc: Variant = world.get("behind_cull")
+	var bc_on: bool = bc != null and is_instance_valid(bc) and bc.is_active()
+	return [serial, _sig_serial, world.chunks.size(), _signals.size(), focus, darkness, _detail_distance,
+		GroundHeight.version(), GroundHeight.lift_range(), max_glows, max_lights, _full_detail,
+		ViewPriority.tight_cull, bc_on, omni_lights_enabled, LampLights.legacy_lights,
+		cam.global_transform if cam != null else Transform3D(),
+		cam.get_frustum() if cam != null and cam.is_inside_tree() else []]
+
+
 static func _lens_offset(kind: int, state: int) -> Vector3:
 	if kind == 1:
 		return RAIL_SIGNAL_OFFSETS.get(state, RAIL_SIGNAL_OFFSETS[3]) as Vector3
@@ -295,7 +327,7 @@ func _process(delta: float) -> void:
 		return
 	_timer = 0.0
 	if disabled_by_arg or not far_lights_enabled:
-		if _lit > 0 or not _far_glows.is_empty():
+		if _lit > 0:
 			_clear_outputs()
 		return
 	_ensure_linear_colors()
@@ -308,6 +340,15 @@ func _process(delta: float) -> void:
 	var light_share := lerpf(DAY_LIGHT, 1.0, night)
 	_detail_distance = _compute_detail_distance()
 	var cam := get_viewport().get_camera_3d() if is_inside_tree() and get_viewport() != null else null
+	if skip_same:
+		var inputs := _inputs_now(cam)
+		if _skipped < SKIP_MAX_IN_A_ROW and not inputs.is_empty() and inputs == _last_inputs:
+			_skipped += 1
+			refreshes_kept += 1
+			return
+		_last_inputs = inputs
+		_skipped = 0
+	refreshes += 1
 	var use_frustum := not LampLights.legacy_lights and not _full_detail and cam != null
 	var fctx := LampLights.frustum_context(cam) if use_frustum else {}
 	var use_planes := use_frustum and not fctx.is_empty()
@@ -437,6 +478,13 @@ func _process(delta: float) -> void:
 	else:
 		mm.custom_aabb = AABB()
 	mm.visible_instance_count = _lit
+	if not omni_lights_enabled:
+		for l in _lights:
+			if l.visible:
+				l.visible = false
+		return
+	if _lights.size() < max_lights:
+		_add_lights(max_lights)
 	var in_view_cut := _detail_distance
 	if not LampLights.legacy_lights and not _full_detail and _lit > max_lights and max_lights > 0:
 		var last_idx := mini(_lit, max_lights) - 1
@@ -468,4 +516,3 @@ func _process(delta: float) -> void:
 		light.position = wpos + Vector3(0.0, 0.18, 0.0)
 		light.light_color = col
 		light.light_energy = LIGHT_ENERGY * light_share * rw
-	_far_glows.clear()

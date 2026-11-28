@@ -31,18 +31,33 @@ local function cursor_stack()
   return s.lib_cursor[1]
 end
 
--- The stack at `i` (main inventory slot, or -1 for the library one); with `empty`, also an empty one.
+-- The clipboard's blueprint (i = -2): what Ctrl+C / Ctrl+X copied (ui_actions.lua).
+local function clipboard_stack()
+  local s = storage.f3d
+  if s and s.clipboard and s.clipboard.valid then
+    return s.clipboard[1]
+  end
+  return nil
+end
+
+-- The stack at `i` (main inventory slot, -1 for the library one, or -2 for the clipboard); with
+-- `empty`, also an empty one.
 local function stack_at(c, i, empty)
   i = math.floor(tonumber(i) or 0)
   local stack
   if i == -1 then
     stack = cursor_stack()
+  elseif i == -2 then
+    stack = clipboard_stack()
   else
     local inventory = c.get_main_inventory()
     if not inventory or i < 1 or i > #inventory then
       return nil
     end
     stack = inventory[i]
+  end
+  if not stack then
+    return nil
   end
   if empty or stack.valid_for_read then
     return stack
@@ -338,8 +353,12 @@ end
 -- {i}: the planner window's delete button: the blueprint, book or planner at slot `i` (-1 the
 -- library one) is destroyed, as Factorio's red trash button does.
 function M.delete(cmd)
+  local i = math.floor(tonumber(cmd.i) or 0)
+  if i == -2 then
+    return
+  end
   local c = puppet.get()
-  local stack = c and stack_at(c, cmd.i)
+  local stack = c and stack_at(c, i)
   if stack and (stack.is_blueprint or stack.is_blueprint_book or stack.is_deconstruction_item or stack.is_upgrade_item) then
     stack.clear()
   end
@@ -383,19 +402,81 @@ local function send_string(q, data, item, i, extra)
   end
 end
 
--- {q, i}: the blueprint, book or planner at slot `i` (-1 the library one) as an exchange string.
+local function is_planner_stack(stack)
+  if not (stack and stack.valid_for_read) then
+    return false
+  end
+  local ok, is_p = pcall(function()
+    return stack.is_blueprint or stack.is_blueprint_book or stack.is_deconstruction_item or stack.is_upgrade_item
+  end)
+  return ok and is_p == true
+end
+
+-- {q, i, to?}: the blueprint, book or planner at slot `i` (-1 the library one, -2 the clipboard)
+-- as an exchange string (`bp`), or with `to` copied straight into main inventory slot `to`
+-- (0: first empty main slot, -1: the library cursor stack) and answered with `bp_ok`.
 function M.get(cmd)
   local c = puppet.get()
-  local stack = c and stack_at(c, cmd.i)
+  local src_i = math.floor(tonumber(cmd.i) or 0)
+  local stack = c and stack_at(c, src_i)
   local q = math.floor(tonumber(cmd.q) or 0)
-  local ok, data = false, nil
-  if stack and (stack.is_blueprint or stack.is_blueprint_book or stack.is_deconstruction_item or stack.is_upgrade_item) then
-    ok, data = pcall(function() return stack.export_stack() end)
+  if not is_planner_stack(stack) then
+    return send_string(q, "", "", src_i, { err = src_i == -2 and "The clipboard is empty" or "Nothing to export there" })
   end
+  if src_i == -2 then
+    local ok_setup, setup = pcall(function() return stack.is_blueprint and stack.is_blueprint_setup() end)
+    if not (ok_setup and setup) then
+      return send_string(q, "", "", src_i, { err = "The clipboard is empty" })
+    end
+  end
+  if cmd.to ~= nil then
+    local raw_to = tonumber(cmd.to)
+    if not raw_to then
+      return send_string(q, "", "", src_i, { err = "Invalid slot" })
+    end
+    local to = math.floor(raw_to)
+    local dst, dst_slot = nil, to
+    if to == 0 then
+      local inventory = c.get_main_inventory()
+      if inventory then
+        dst, dst_slot = inventory.find_empty_stack()
+      end
+      if not dst then
+        puppet.message("Inventory full")
+        return send_string(q, "", "", src_i, { err = "Inventory full" })
+      end
+    elseif to == -1 then
+      dst = cursor_stack()
+    elseif to >= 1 then
+      dst = stack_at(c, to, true)
+      if not dst then
+        return send_string(q, "", "", src_i, { err = "Invalid slot" })
+      end
+      if dst.valid_for_read then
+        return send_string(q, "", "", src_i, { err = "That slot isn't empty" })
+      end
+    else
+      return send_string(q, "", "", src_i, { err = "Invalid slot" })
+    end
+    if not (src_i == -1 and dst_slot == -1) then
+      local ok_set, copied = pcall(function() return dst.set_stack(stack) end)
+      if not ok_set or copied == false or not dst.valid_for_read then
+        return send_string(q, "", "", src_i, { err = "Couldn't save blueprint there" })
+      end
+    end
+    local ok_name, item_name = pcall(function() return dst.name end)
+    if dst_slot ~= -1 then
+      puppet.send_inventory_now()
+    end
+    transport.send_reliable_priority({ t = "bp_ok", q = q, i = dst_slot, item = ok_name and item_name or "" })
+    return
+  end
+  local ok, data = pcall(function() return stack.export_stack() end)
   if not ok or type(data) ~= "string" or data == "" then
-    return send_string(q, "", "", math.floor(tonumber(cmd.i) or 0), { err = "Nothing to export there" })
+    return send_string(q, "", "", src_i, { err = "Nothing to export there" })
   end
-  send_string(q, data, stack.name, math.floor(tonumber(cmd.i)))
+  local ok_name, item_name = pcall(function() return stack.name end)
+  send_string(q, data, ok_name and item_name or "", src_i)
 end
 
 -- Parts of a string the client sends (`bp_set` with id, part, parts, d): kept until all have arrived.
@@ -432,6 +513,9 @@ end
 -- library one (-1). Returns the slot it went to, or nil.
 local function import_into(c, i, data)
   i = math.floor(tonumber(i) or 0)
+  if i == -2 then
+    return nil
+  end
   local stack, slot = nil, i
   if i == 0 then
     local inventory = c.get_main_inventory()

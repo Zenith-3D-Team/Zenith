@@ -876,6 +876,8 @@ func _show_host(host: Dictionary) -> void:
 	_on(row[1], _pop_overlay, "gui-back")
 	(row[2] as Button).name = "HostConfirm"
 	_on(row[2], func() -> void:
+		port.apply()  # a port typed and not confirmed with Enter
+		players.apply()
 		var spec := {"name": name_edit.text.strip_edges(), "description": desc_edit.text.strip_edges(),
 			"port": int(port.value), "max_players": int(players.value), "lan": lan.button_pressed}
 		Settings.set_value("new_game", "host", JSON.stringify(spec))
@@ -1080,7 +1082,7 @@ func _record_backdrop() -> void:
 	var called := BackdropList.default_name(save, now)
 	var info := {"save": save, "name": called, "puppet": int(avatar.unit) if avatar != null else 0}
 	# On a space platform: the menu draws space behind it, with the planet it is stopped at (menu_background.gd).
-	if bool(main.get("_space")):
+	if main.get("_space") == true:  # (null on a main without it: not in space)
 		info["space"] = true
 		info["planet"] = str(main.get("_sky_planet")).strip_edges()
 	if not rec.done.is_connected(_on_backdrop_done):

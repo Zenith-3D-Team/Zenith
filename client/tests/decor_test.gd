@@ -7,6 +7,7 @@ extends Node3D
 
 const Decoratives := preload("res://scripts/world/decoratives.gd")
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
+const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const DecorSheetBaker := preload("res://scripts/world/decor_sheet_baker.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
@@ -467,12 +468,23 @@ func _mask_checks() -> void:
 		for x in 32:
 			blocked[Vector2i(x, y)] = true
 	blocked[Vector2i(28, 28)] = true
-	for y in range(12, 21):
-		for x in range(12, 21):
-			blocked[Vector2i(x, y)] = true
-	for y in range(6, 15):
-		for x in range(27, 36):
-			blocked[Vector2i(x, y)] = true
+	var add_silo := func(cx: int, cy: int) -> int:
+		var rects: Array = [
+			Rect2i(cx - 2, cy - 4, 5, 8),
+			Rect2i(cx - 3, cy - 3, 7, 6),
+			Rect2i(cx - 4, cy - 2, 9, 4),
+		] if ModelLibrary.rocket_vfx_enhanced else [Rect2i(cx - 4, cy - 4, 9, 9)]
+		var added := 0
+		for rect: Rect2i in rects:
+			for y in range(rect.position.y, rect.end.y):
+				for x in range(rect.position.x, rect.end.x):
+					var tile := Vector2i(x, y)
+					if not blocked.has(tile):
+						blocked[tile] = true
+						added += 1
+		return added
+	var silo_count: int = add_silo.call(16, 16)
+	add_silo.call(31, 10)
 	var mask_ok := true
 	for x in range(0, 64):
 		for y in range(0, 32):
@@ -518,7 +530,7 @@ func _mask_checks() -> void:
 	d.finish_jobs()
 	roots = _roots(d, full)
 	check(not d.blocked_at(16, 16) and roots.has(Vector2i(16, 16)) and d.blocked_at(5, 25) and not roots.has(Vector2i(5, 25))
-		and _instances(d) == 2048 - blocked.size() + 81 - 1,
+		and _instances(d) == 2048 - blocked.size() + silo_count - 1,
 		"mining a building or laying concrete changes the chunk's mask and what grows there: %d instances" % _instances(d))
 	# A change that leaves the ground as it was (an inserter turned) builds the mask, not the nodes.
 	var node: Node3D = d._chunks[Vector2i(0, 0)]

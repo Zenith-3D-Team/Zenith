@@ -10,6 +10,7 @@ local budget = require("scripts.budget")
 local profile = require("scripts.profile")
 local perf = require("scripts.perf")
 local robots = require("scripts.robots")
+local tracker = require("scripts.tracker")
 
 local M = {}
 
@@ -73,11 +74,82 @@ local SCAN_JUMP = 32
 local SCAN_PRICE = 0.02  -- units per entity found, beside SCAN_BASE for the area searched
 local SCAN_BASE = 380  -- ~7.8 ms a search on the owner's save, most of it the area
 -- Module-local counters for tests/probes (never in storage).
-M.counts = { mv_scans = 0, st_refreshes = 0, splitter_checks = 0, splitter_bs_skips = 0, splitter_throttled = 0, gate_reads = 0 }
+M.counts = { mv_scans = 0, st_refreshes = 0, splitter_checks = 0, splitter_bs_skips = 0, splitter_throttled = 0,
+  gate_reads = 0, gate_scans = 0, st_scans = 0, live_reuses = 0 }
 -- The list found, per client (its state table, weak: a state loaded from a save is a new table and
 -- searches again): with two clients one list for both gave each the other's movers, or searched
 -- again every tick.
 local scans = setmetatable({}, { __mode = "k" })
+-- (gc_lean) Reusable scratch arrays (the cached animated-entity lists live in storage, s.st_scan).
+local animated_set
+local mv_live = {}
+local found_live = {}
+local ST_RESCAN_NEAR = 60
+local ST_RESCAN_FAR = 240
+local GATE_LOOK_LEAN = 120
+
+local function clear_trailing(t, from)
+  for i = #t, from, -1 do
+    t[i] = nil
+  end
+end
+
+local function clear_map(t)
+  for k in pairs(t) do
+    t[k] = nil
+  end
+  return t
+end
+
+-- Module-local pcall/sort helpers so hot loops allocate zero closures.
+local function get_signal_state(e) return e.signal_state end
+local function get_chain_signal_state(e) return e.chain_signal_state end
+local function get_always_on(e) return e.always_on end
+local function get_control_behavior(e) return e.get_control_behavior() end
+local function get_cb_color(cb) return cb.use_colors and cb.color or nil end
+local function get_entity_color(e) return e.color end
+local function color_part(v, scale) return math.max(0, math.min(255, math.floor(v * scale + 0.5))) end
+local function cmp_splitter_todo(a, b)
+  if a[3] ~= b[3] then
+    return a[3] < b[3]
+  end
+  return a[1] < b[1]
+end
+
+local function is_animated_type(t)
+  if not animated_set then
+    animated_set = {}
+    for _, ty in ipairs(registry.animated_types()) do
+      animated_set[ty] = true
+    end
+  end
+  return animated_set[t] == true
+end
+
+tracker.listeners[#tracker.listeners + 1] = function(entity)
+  if not (entity and entity.valid) then
+    return
+  end
+  local t = entity.type
+  local si = entity.surface.index
+  if t == "gate" then
+    local s = storage.f3d
+    if s and s.gate_scan then
+      s.gate_dirty = true
+    end
+  end
+  if is_animated_type(t) then
+    local s = storage.f3d
+    local scan = s and s.st_scan
+    if scan then
+      for _, meta in pairs(scan) do
+        if meta.si == si then
+          meta.dirty = true
+        end
+      end
+    end
+  end
+end
 
 -- The search is most of what movers cost (6-12 ms every 8 ticks at -62,-26, where it finds the same
 -- few movers each time: the perfbridge2 round). While two searches running find the same movers (by
@@ -239,6 +311,18 @@ local function movers_in_focus(surface, s)
       scan.by = by_kind(scan.list)
     end
   end
+  if perf.on("gc_lean") then
+    local n = 0
+    for _, e in pairs(scan.list) do
+      if e.valid then
+        n = n + 1
+        mv_live[n] = e
+      end
+    end
+    clear_trailing(mv_live, n + 1)
+    M.counts.live_reuses = M.counts.live_reuses + 1
+    return mv_live
+  end
   local list = {}
   for _, e in pairs(scan.list) do
     if e.valid then
@@ -293,13 +377,30 @@ function M.found(kind, surface)
   local scan = scans[s]
   local list = scan and scan.tick == m.tick and scan.by and scan.by[kind] or nil
   if list then
-    local live = {}
-    for _, e in pairs(list) do
-      if e.valid then
-        live[#live + 1] = e
+    if perf.on("gc_lean") then
+      local live = found_live[kind]
+      if not live then
+        live = {}
+        found_live[kind] = live
       end
+      local n = 0
+      for _, e in pairs(list) do
+        if e.valid then
+          n = n + 1
+          live[n] = e
+        end
+      end
+      clear_trailing(live, n + 1)
+      list = live
+    else
+      local live = {}
+      for _, e in pairs(list) do
+        if e.valid then
+          live[#live + 1] = e
+        end
+      end
+      list = live
     end
-    list = live
   end
   return list, m.kinds[kind] or 0
 end
@@ -318,8 +419,11 @@ end
 function M.reset()
   if storage.f3d then
     scans[storage.f3d] = nil
+    storage.f3d.st_scan = nil
     storage.f3d.mv_scan = nil
     storage.f3d.mv_near_tick = nil
+    storage.f3d.gate_scan = nil
+    storage.f3d.gate_dirty = nil
   end
 end
 
@@ -457,14 +561,16 @@ local signal_states, chain_states  -- from defines, on first use
 local function signal_colour(e)
   signal_states = signal_states or names(defines.signal_state)
   local states = signal_states
-  local ok, state = pcall(function() return states[e.signal_state] end)
+  local ok, sig = pcall(get_signal_state, e)
+  local state = ok and states[sig] or nil
   if ok and state == "reserved" then
     return 2
   end
   if e.type == "rail-chain-signal" then
     chain_states = chain_states or names(defines.chain_signal_state)
     local chains = chain_states
-    local ok2, chain = pcall(function() return chains[e.chain_signal_state] end)
+    local ok2, csig = pcall(get_chain_signal_state, e)
+    local chain = ok2 and chains[csig] or nil
     if ok2 and chain == "partially_open" then
       return 4
     elseif ok2 and chain == "none_open" then
@@ -500,7 +606,7 @@ end
 -- K20: whether a lamp is set to Always on (LuaEntity.always_on, the checkbox in its window), lit by day
 -- as well. Lamps only (other types throw); under pcall in case a version lacks it.
 local function lamp_always_on(e)
-  local ok, on = pcall(function() return e.always_on end)
+  local ok, on = pcall(get_always_on, e)
   return ok and on == true
 end
 
@@ -552,26 +658,33 @@ local SPLITTER_PER_PASS = 16
 local WORKING_SLICES_NEAR = 10
 local WORKING_SLICES_FAR = 2
 
+local spl_parts = {}
+local spl_todo_buf = {}
+local spl_pre_buf = {}
+local spl_pick_buf = {}
+
 local function splitter_moving(e, sig)
   M.counts.splitter_checks = M.counts.splitter_checks + 1
-  local parts = {}
+  local parts = perf.on("gc_lean") and spl_parts or {}
+  local pn = 0
   local front
   for i = 1, e.get_max_transport_line_index() do
     local line = e.get_transport_line(i)
     local n = #line
     if n > 0 then
-      parts[#parts + 1] = i .. ":" .. n .. ":" .. line.get_item_position(1) .. ":" .. line.get_item_position(n)
+      pn = pn + 1
+      parts[pn] = i .. ":" .. n .. ":" .. line.get_item_position(1) .. ":" .. line.get_item_position(n)
       if not front then
         local items = line.get_detailed_contents()
         front = items[1] and items[1].unique_id
       end
     end
   end
-  if #parts == 0 then
+  if pn == 0 then
     sig[e.unit_number] = nil
     return 0
   end
-  local now = table.concat(parts, ",") .. "|" .. tostring(front)
+  local now = table.concat(parts, ",", 1, pn) .. "|" .. tostring(front)
   local was = sig[e.unit_number]
   sig[e.unit_number] = now
   return (was ~= nil and was ~= now) and 1 or 0
@@ -585,20 +698,22 @@ local function bs_splitter_moving(bs, unit, sig, bs_sig)
     return nil
   end
   local lanes = bs.lanes
-  local parts = {}
+  local parts = perf.on("gc_lean") and spl_parts or {}
+  local pn = 0
   for i = 1, 8 do
     local lr = lanes[unit * 8 + i]
     if lr and lr[1] > 0 then
-      parts[#parts + 1] = i .. ":" .. lr[1] .. ":" .. lr[2] .. ":" .. lr[3] .. ":" .. tostring(lr[10] or 0)
+      pn = pn + 1
+      parts[pn] = i .. ":" .. lr[1] .. ":" .. lr[2] .. ":" .. lr[3] .. ":" .. tostring(lr[10] or 0)
     end
   end
-  if #parts == 0 then
+  if pn == 0 then
     sig[unit] = nil
     bs_sig[unit] = nil
     M.counts.splitter_bs_skips = M.counts.splitter_bs_skips + 1
     return 0
   end
-  local now = table.concat(parts, ",")
+  local now = table.concat(parts, ",", 1, pn)
   local was = bs_sig[unit]
   bs_sig[unit] = now
   if was ~= nil and was ~= now then
@@ -613,7 +728,7 @@ local function bs_splitter_moving(bs, unit, sig, bs_sig)
   return nil
 end
 
--- Selects up to SPLITTER_PER_PASS splitters from `todo` ({{unit, entity}, ...}) deterministically
+-- Selects up to SPLITTER_PER_PASS splitters from `todo` ({{unit, entity, last_tick}, ...}) deterministically
 -- by oldest last-checked tick (`s.st_spl_tick[unit]`) so alternating regions/strips never starve.
 local function pick_splitters(s, todo)
   local n = #todo
@@ -626,14 +741,8 @@ local function pick_splitters(s, todo)
     end
     return nil
   end
-  table.sort(todo, function(a, b)
-    local ta, tb = st[a[1]] or -1, st[b[1]] or -1
-    if ta ~= tb then
-      return ta < tb
-    end
-    return a[1] < b[1]
-  end)
-  local pick = {}
+  table.sort(todo, cmp_splitter_todo)
+  local pick = perf.on("gc_lean") and clear_map(spl_pick_buf) or {}
   for i = 1, SPLITTER_PER_PASS do
     local unit = todo[i][1]
     pick[unit] = true
@@ -644,18 +753,25 @@ end
 
 -- Collects splitter pre-checks from belt_sim and selects up to SPLITTER_PER_PASS remaining splitters.
 local function prepare_splitters(s, found_lists, sig, bs_sig)
-  local spl_todo, spl_pre = {}, {}
+  local lean = perf.on("gc_lean")
+  local spl_todo = lean and clear_map(spl_todo_buf) or {}
+  local spl_pre = lean and clear_map(spl_pre_buf) or {}
+  local st = s.st_spl_tick
   local bs = s.bs
+  local tn = 0
   for _, found in ipairs(found_lists) do
     for _, e in pairs(found) do
-      local unit = e.unit_number
-      if unit and SPLITTER_TYPES[e.type] and spl_pre[unit] == nil then
-        local v = bs_splitter_moving(bs, unit, sig, bs_sig)
-        if v ~= nil then
-          spl_pre[unit] = v
-        else
-          spl_pre[unit] = false
-          spl_todo[#spl_todo + 1] = { unit, e }
+      if e.valid then
+        local unit = e.unit_number
+        if unit and SPLITTER_TYPES[e.type] and spl_pre[unit] == nil then
+          local v = bs_splitter_moving(bs, unit, sig, bs_sig)
+          if v ~= nil then
+            spl_pre[unit] = v
+          else
+            spl_pre[unit] = false
+            tn = tn + 1
+            spl_todo[tn] = { unit, e, st and st[unit] or -1 }
+          end
         end
       end
     end
@@ -690,13 +806,13 @@ end
 -- version that differs: read under pcall, white then.
 local function lamp_color(e)
   local c
-  local okb, cb = pcall(function() return e.get_control_behavior() end)
+  local okb, cb = pcall(get_control_behavior, e)
   if okb and cb then
-    local okc, v = pcall(function() return cb.use_colors and cb.color or nil end)
+    local okc, v = pcall(get_cb_color, cb)
     c = okc and v or nil
   end
   if type(c) ~= "table" then
-    local okc, v = pcall(function() return e.color end)
+    local okc, v = pcall(get_entity_color, e)
     c = okc and v or nil
   end
   if type(c) ~= "table" then
@@ -705,10 +821,7 @@ local function lamp_color(e)
   local r, g, b = tonumber(c.r or c[1]) or 1, tonumber(c.g or c[2]) or 1, tonumber(c.b or c[3]) or 1
   -- (A Color is 0-1, or 0-255 when any part is over 1.)
   local scale = (r > 1 or g > 1 or b > 1) and 1 or 255
-  local function part(v)
-    return math.max(0, math.min(255, math.floor(v * scale + 0.5)))
-  end
-  local R, G, B = part(r), part(g), part(b)
+  local R, G, B = color_part(r, scale), color_part(g, scale), color_part(b, scale)
   if R == 255 and G == 255 and B == 255 then
     return -1
   end
@@ -763,6 +876,45 @@ local function send_state_changes(changes, lc, ao, priority)
   end
 end
 
+-- (gc_lean) The found lists are kept in storage with their scan (s.st_scan[key].lists), so every peer,
+-- a joiner included, walks the same list in the same order: storage writes depend only on storage and
+-- events. An entity made with no event shows up at the next rescan on every peer alike.
+local function cached_animated_lists(surface, s, key, boxes, types, rescan_ticks)
+  if not perf.on("gc_lean") then
+    s.st_scan = nil
+    local lists, read = {}, 0
+    for b_i, area in ipairs(boxes) do
+      local found = surface.find_entities_filtered({ area = area, type = types })
+      lists[b_i] = found
+      read = read + #found
+      M.counts.st_scans = M.counts.st_scans + 1
+    end
+    return lists, read, nil
+  end
+  s.st_scan = s.st_scan or {}
+  local f = s.focus
+  local meta = s.st_scan[key]
+  local factor = (key == 0 and perf.on("near_rate")) and 1 or rate.factor("mv")
+  local limit = rescan_ticks * factor
+  if meta and not meta.dirty and meta.lists and meta.si == surface.index and meta.r == f.r
+      and math.abs(f.x - meta.fx) < SCAN_MOVE and math.abs(f.y - meta.fy) < SCAN_MOVE
+      and (game.tick - meta.tick) < limit then
+    M.counts.live_reuses = M.counts.live_reuses + 1
+    return meta.lists, meta.read, meta
+  end
+  local lists, read = {}, 0
+  for b_i, area in ipairs(boxes) do
+    local found = surface.find_entities_filtered({ area = area, type = types })
+    lists[b_i] = found
+    read = read + #found
+    M.counts.st_scans = M.counts.st_scans + 1
+  end
+  meta = { si = surface.index, fx = f.x, fy = f.y, r = f.r, tick = game.tick, read = read, dirty = false,
+    lists = lists }
+  s.st_scan[key] = meta
+  return lists, read, meta
+end
+
 -- Sends only machines whose working state changed since the last report. `strip` (1..STATE_STRIPS,
 -- f3d-spread-jobs): only that horizontal strip of the area, the rest on the ticks after; nil: all.
 local function send_states(surface, s, strip)
@@ -786,8 +938,9 @@ local function send_states(surface, s, strip)
     local h = (y1 - y0) / STATE_STRIPS
     area = { { area[1][1], y0 + (strip - 1) * h }, { area[2][1], strip == STATE_STRIPS and y1 or y0 + strip * h } }
   end
-  local found = surface.find_entities_filtered({ area = area, type = registry.animated_types() })
-  local read = #found
+  local found_lists, read, rc = cached_animated_lists(surface, s, 100 + (strip or 0), { area },
+    registry.animated_types(), ST_RESCAN_NEAR)
+  local found = found_lists[1]
   local working = defines.entity_status.working
   local changes, lc, ao = {}, {}, {}
   local seen = s.st_seen or {}
@@ -799,10 +952,12 @@ local function send_states(surface, s, strip)
   local lcol, lao = s.lamp_col, s.lamp_ao
   local spl_pre, spl_pick
   if throttle_on then
-    spl_pre, spl_pick = prepare_splitters(s, { found }, sig, bs_sig)
+    spl_pre, spl_pick = prepare_splitters(s, found_lists, sig, bs_sig)
   end
   for _, e in pairs(found) do
-    local unit = e.unit_number
+    -- (N3) An invalid one in the cached list is skipped, not a reason to rescan: storage's dirty
+    -- flag is the tracker's alone.
+    local unit = e.valid and e.unit_number
     if unit then
       local state_of = STATE_OF[e.type]
       local on
@@ -921,21 +1076,18 @@ local function state_region(surface, s, region)
   end
   local mine = {}
   local changes, lc, ao = {}, {}, {}
-  local read = 0
   local boxes = region_areas(s, region)
-  local found_lists = {}
-  for b_i, area in ipairs(boxes) do
-    local found = surface.find_entities_filtered({ area = area, type = types })
-    found_lists[b_i] = found
-    read = read + #found
-  end
+  local rescan_t = region == 0 and ST_RESCAN_NEAR or ST_RESCAN_FAR
+  local found_lists, read, rc = cached_animated_lists(surface, s, region, boxes, types, rescan_t)
   local spl_pre, spl_pick
   if throttle_on then
     spl_pre, spl_pick = prepare_splitters(s, found_lists, sig, bs_sig)
   end
   for _, found in ipairs(found_lists) do
     for _, e in pairs(found) do
-      local unit = e.unit_number
+      -- (N3) Skipped only: rc.dirty comes from the tracker (storage), not from the list.
+      local valid = e.valid
+      local unit = valid and e.unit_number
       -- (One on the edge of two boxes is found by both: once is enough.)
       if unit and not mine[unit] then
         mine[unit] = true
@@ -1066,18 +1218,47 @@ end
 
 local function send_gates(surface, s)
   if not perf.on("gate_state") then
-    s.gates, s.gate_sent = nil, nil
+    s.gates, s.gate_sent, s.gate_scan, s.gate_dirty = nil, nil, nil, nil
     return
   end
   local t = game.tick
   local looked = false
-  if not s.gates or t % GATE_LOOK == 0 then
+  if perf.on("gc_lean") then
     local f = s.focus
     local n = math.min(GATE_NEAR, f.r)
-    s.gates = surface.find_entities_filtered({ area = { { f.x - n, f.y - n }, { f.x + n, f.y + n } }, type = "gate" })
-    looked = true
-    if not s.gate_sent or t % GATE_REFRESH == 0 then
+    local factor = rate.factor("mv")
+    local gs = s.gate_scan
+    local look_every = (s.gates and #s.gates > 0) and GATE_LOOK_LEAN or GATE_LOOK
+    local need_scan = not s.gates or not gs or s.gate_dirty
+      or gs.si ~= surface.index or gs.n ~= n
+      or math.max(math.abs(f.x - gs.x), math.abs(f.y - gs.y)) >= SCAN_MOVE_WIDE
+      or (t - gs.tick) >= look_every * factor
+    if need_scan then
+      s.gates = surface.find_entities_filtered({ area = { { f.x - n, f.y - n }, { f.x + n, f.y + n } }, type = "gate" })
+      M.counts.gate_scans = M.counts.gate_scans + 1
+      s.gate_dirty = nil
+      local ref = gs and gs.refresh or t
+      if not s.gate_sent or t - ref >= GATE_REFRESH then
+        s.gate_sent = {}
+        ref = t
+      end
+      s.gate_scan = { si = surface.index, x = f.x, y = f.y, n = n, tick = t, refresh = ref }
+      looked = true
+    elseif not s.gate_sent or t - (gs.refresh or -GATE_REFRESH) >= GATE_REFRESH then
       s.gate_sent = {}
+      gs.refresh = t
+    end
+  else
+    s.gate_scan, s.gate_dirty = nil, nil
+    if not s.gates or t % GATE_LOOK == 0 then
+      local f = s.focus
+      local n = math.min(GATE_NEAR, f.r)
+      s.gates = surface.find_entities_filtered({ area = { { f.x - n, f.y - n }, { f.x + n, f.y + n } }, type = "gate" })
+      M.counts.gate_scans = M.counts.gate_scans + 1
+      looked = true
+      if not s.gate_sent or t % GATE_REFRESH == 0 then
+        s.gate_sent = {}
+      end
     end
   end
   local gates = s.gates
@@ -1093,8 +1274,13 @@ local function send_gates(surface, s)
   local sent = s.gate_sent
   local now = looked and {} or nil
   local changes = {}
+  local lean = perf.on("gc_lean")
   for _, e in pairs(gates) do
-    local unit = e.valid and e.unit_number
+    local valid = e.valid
+    if not valid and lean then
+      s.gate_dirty = true
+    end
+    local unit = valid and e.unit_number
     if unit then
       local ok, v = pcall(gate_state, e)
       if ok then

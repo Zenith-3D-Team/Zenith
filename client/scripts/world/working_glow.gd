@@ -32,6 +32,9 @@ const FAR_RADIUS_MAX := 180.0
 const FAR_SPLAT_RANGE := 4.5
 const FADE_FRAC := 0.25
 static var legacy_lights := Switches.has("--far-lights=old")
+## --mm-bounds=engine: the MultiMesh's own box left unset, as before; Godot then works its bounds out over
+## every instance of its capacity at each buffer upload (perf-render R6). The node's box culls either way.
+static var mm_own_bounds := not Switches.has("--mm-bounds=engine")
 const FADE_IN := 0.4
 const FADE_OUT := 1.2
 
@@ -112,6 +115,8 @@ func _ready() -> void:
 		mmi.material_override = material
 		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		mmi.custom_aabb = AABB(Vector3(-1e5, -10, -1e5), Vector3(2e5, 20, 2e5))
+		if mm_own_bounds:
+			mm.custom_aabb = mmi.custom_aabb
 		add_child(mmi)
 		_sheets[name] = [mmi, float(spec[2]) / float(spec[1]), int(spec[3]), float(spec[5])]
 	_add_lights(MAX_LIGHTS)

@@ -21,6 +21,11 @@ docs/tracker/usage.json
 client/native/godot-cpp/
 client/native/belt_sim/**/*.obj
 client/native/belt_sim/.sconsign*.dblite
+client/native/upscalers/**/*.obj
+client/native/upscalers/.sconsign*.dblite
+client/native/upscalers/*.pdb
+# The upscalers DLL is built, not committed (docs/RUNNING.md, "Vendor upscalers").
+client/native/bin/upscalers.*.dll
 client/native/bin/*.exp
 client/native/bin/*.lib
 client/native/bin/*.pdb

@@ -207,9 +207,10 @@ AREAS: list[tuple[str, tuple[str, ...], str, bool]] = [
      "_map,_map_layers_cache,_minimap_alerts,_map_title", False),
     ("ui_test space", ("client/scripts/ui/factorio/space_*.gd", "client/scripts/ui/factorio/planet_*.gd",
                        "client/scripts/ui/factorio/platform_*.gd", "client/scripts/world/planet_spin.gd",
-                       "client/scripts/world/rockets.gd", "client/scripts/world/collectors.gd",
-                       "client/shaders/space_sky*", "client/shaders/planet_sky*"),
-     "_space,_modded_planets", False),
+                       "client/scripts/world/rockets.gd", "client/scripts/world/rocket_vfx.gd",
+                       "client/scripts/world/collectors.gd", "client/shaders/space_sky*",
+                       "client/shaders/planet_sky*", "client/shaders/rocket_*", "client/shaders/silo_shaft*"),
+     "_space,_modded_planets,_asteroid_chunks,_rocket_launch_vfx", False),
     ("ui_test planners", ("client/scripts/ui/factorio/bp_*.gd", "client/scripts/ui/factorio/blueprint_*.gd",
                           "client/scripts/ui/factorio/book_window.gd", "client/scripts/ui/factorio/planner_*.gd",
                           "client/scripts/ui/factorio/library_window.gd", "client/scripts/player/blueprint_preview.gd",
@@ -264,12 +265,25 @@ TESTS: list[TestEntry] = [
     # package.py's Zenith.zip: a pack's items/ folder goes in.
     TestEntry("test_package", "py", "tools/release/test_package.py", suite="fast",
               triggers=("tools/release/*.py",)),
+    # leak_scan.py: private dot-paths match, public lines carry no generic worktree path.
+    TestEntry("test_leak_scan", "py", "tools/release/test_leak_scan.py", suite="fast",
+              triggers=("tools/release/leak_scan.py", "tools/release/test_leak_scan.py",
+                        "client/scripts/menu/game_swap.gd", "tools/models/review.py")),
     # Deleting a folder that holds a junction (a linked mod) never empties the junction's target.
     TestEntry("test_safe_delete", "py", "tools/test_safe_delete.py", suite="fast",
               triggers=("tools/safe_delete.py", "tools/test_safe_delete.py", "tools/belt_view_check.py",
                         "tools/bench/hybrid_cost.py", "tools/look/factorio_reference.py")),
     TestEntry("test_code_health", "py", "tools/test_code_health.py", suite="fast",
               triggers=("tools/code_health.py", "tools/test_code_health.py")),
+    # CI's Linux (GCC) build of belt_sim: MSVC-only C++ found by pattern (0.3.0's std::cosf), plus the lint's own test.
+    TestEntry("test_native_portability_check", "py", "tools/test_native_portability_check.py", suite="fast",
+              triggers=("client/native/belt_sim/src/*", "tools/native_portability_check.py",
+                        "tools/test_native_portability_check.py")),
+    # Linux is case-sensitive: every res:// path in the client's scripts, scenes and resources as on disk. (Not
+    # triggered by .gd files: that would mark every script covered and skip the UI test's areas; --all fast has it.)
+    TestEntry("test_res_path_case", "py", "tools/test_res_path_case.py", suite="fast",
+              triggers=("client/*.tscn", "client/*.tres", "client/project.godot", "tools/res_path_case.py",
+                        "tools/test_res_path_case.py")),
     TestEntry("test_check", "py", "tools/test_check.py", suite="fast",
               triggers=("tools/check.py", "tools/test_check.py", "client/tests/*_test.gd", "tools/*test_*.py")),
     TestEntry("test_protocol_sync", "py", "tools/test_protocol_sync.py", suite="fast",
@@ -315,9 +329,28 @@ TESTS: list[TestEntry] = [
                         "client/tests/chunk_streaming*")),
     TestEntry("decor_test", "godot_scene", "decor_test.tscn", suite="godot",
               triggers=("client/scripts/world/decorative*", "client/shaders/decorative*", "client/tests/decor*")),
+    TestEntry("mover_skip_still_test", "godot_script", "mover_skip_still_test.gd", suite="godot",
+              triggers=("client/scripts/world/movers.gd", "client/tests/mover_skip_still_test*")),
+    TestEntry("rail_height_native_test", "godot_script", "rail_height_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/movers.gd", "client/native/belt_sim/src/movers_native*",
+                        "client/tests/rail_height_native_test*")),
+    TestEntry("movers_native_test", "godot_script", "movers_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/movers.gd", "client/scripts/world/robot_swarm.gd",
+                        "client/scripts/world/mover_records.gd", "client/native/belt_sim/src/movers_native*",
+                        "client/tests/movers_native_test*")),
+    TestEntry("fluids_burner_scan_test", "godot_script", "fluids_burner_scan_test.gd", suite="godot",
+              triggers=("client/scripts/world/fluids_power.gd", "client/scripts/fx/burner_fx.gd",
+                        "client/scripts/fx/fx.gd", "client/tests/fluids_burner_scan_test*")),
     TestEntry("decor_native_test", "godot_script", "decor_native_test.gd", suite="godot",
               triggers=("client/scripts/world/decorative*", "client/shaders/decorative*",
                         "client/native/belt_sim/src/decor_native*", "client/tests/decor*")),
+    TestEntry("alt_icons_native_test", "godot_scene", "alt_icons_native_test.tscn", suite="godot",
+              triggers=("client/scripts/ui/factorio/alt_overlay.gd",
+                        "client/native/belt_sim/src/alt_icons_native*", "client/tests/alt_icons_native*")),
+    TestEntry("upscalers_test", "godot_script", "upscalers_test.gd", suite="godot",
+              triggers=("client/scripts/menu/upscalers.gd", "client/scripts/menu/settings.gd",
+                        "client/scripts/menu/settings_window.gd", "client/native/upscalers*",
+                        "client/tests/upscalers_test*")),
     TestEntry("terrain_decor_opt_test", "godot_script", "terrain_decor_opt_test.gd", suite="godot",
               triggers=("client/scripts/world/terrain_mesher.gd", "client/scripts/world/chunk_view.gd",
                         "client/scripts/world/visuals.gd", "client/scripts/world/decoratives.gd",
@@ -374,6 +407,9 @@ TESTS: list[TestEntry] = [
     TestEntry("wire_decode_native_test", "godot_script", "wire_decode_native_test.gd", suite="godot",
               triggers=("client/scripts/net/wire_decode.gd", "client/native/belt_sim/src/wire_decode_native*",
                         "client/tests/wire_decode_native*")),
+    TestEntry("lod_decode_native_test", "godot_script", "lod_decode_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/lod_data.gd", "client/scripts/net/message_decode.gd",
+                        "client/native/belt_sim/src/wire_decode_native*", "client/tests/lod_decode_native*")),
     TestEntry("nature_looks_test", "godot_script", "nature_looks_test.gd", suite="godot",
               triggers=("client/scripts/world/nature_looks.gd", "client/data/nature_looks.json",
                         "client/tests/nature_looks*", "client/shaders/factorio_material*",
@@ -392,6 +428,8 @@ TESTS: list[TestEntry] = [
     TestEntry("icons_later_test", "godot_script", "icons_later_test.gd", suite="godot",
               triggers=("client/scripts/world/item_icons.gd", "client/scripts/ui/factorio/kit.gd",
                         "client/scripts/ui/factorio/entity_info.gd", "client/tests/icons_later*")),
+    TestEntry("settings_wind_test", "godot_script", "settings_wind_test.gd", suite="godot",
+              triggers=("client/scripts/menu/settings.gd", "client/tests/settings_wind*")),
     TestEntry("sound_decode_test", "godot_script", "sound_decode_test.gd", suite="godot",
               triggers=("client/scripts/fx/sound_bank.gd", "client/tests/sound_decode*")),
     TestEntry("sound_cache_test", "godot_script", "sound_cache_test.gd", suite="godot",
@@ -415,6 +453,9 @@ TESTS: list[TestEntry] = [
     TestEntry("boot_screen_test", "godot_script", "boot_screen_test.gd", suite="godot",
               triggers=("client/scenes/boot.tscn", "client/scripts/menu/boot.gd",
                         "client/scripts/main.gd", "client/tests/boot_screen*")),
+    TestEntry("boot_skip_real_test", "godot_script", "boot_skip_real_test.gd", suite="godot",
+              triggers=("client/scenes/boot.tscn", "client/scripts/menu/boot.gd",
+                        "client/scripts/world/shader_warmup.gd", "client/tests/boot_skip_real*")),
     TestEntry("item_materials_test", "godot_script", "item_materials_test.gd", suite="godot",
               triggers=("client/scripts/world/item_models.gd", "client/scripts/world/model_textures.gd",
                         "client/shaders/item*", "client/tests/item_materials*")),
@@ -451,9 +492,25 @@ TESTS: list[TestEntry] = [
     TestEntry("lod_mesher_test", "godot_script", "lod_mesher_test.gd", suite="godot",
               triggers=("client/scripts/world/lod_*.gd", "client/scripts/world/distant_horizon.gd",
                         "client/shaders/lod_*", "client/tests/lod_*")),
+    TestEntry("dh_sample_worker_test", "godot_script", "dh_sample_worker_test.gd", suite="godot",
+              triggers=("client/scripts/world/lod_mesher.gd", "client/scripts/world/distant_horizon.gd",
+                        "client/tests/dh_sample_worker_test.gd")),
+    TestEntry("dh_sections_test", "godot_script", "dh_sections_test.gd", suite="godot",
+              triggers=("client/scripts/world/distant_horizon.gd", "client/tests/dh_sections_test.gd")),
     TestEntry("lod_mesher_native_test", "godot_script", "lod_mesher_native_test.gd", suite="godot",
               triggers=("client/scripts/world/lod_mesher.gd", "client/scripts/world/far_chunks.gd",
                         "client/native/belt_sim/src/lod_mesher_native*", "client/tests/lod_mesher_native*")),
+    TestEntry("acid_goo_native_test", "godot_script", "acid_goo_native_test.gd", suite="godot",
+              triggers=("addons-src/immersive-enemies/**", "client/native/belt_sim/src/acid_goo_native*",
+                        "client/scripts/native_library.gd", "client/tests/acid_goo_native*")),
+    TestEntry("biter_gore_native_test", "godot_script", "biter_gore_native_test.gd", suite="godot",
+              triggers=("addons-src/immersive-enemies/**", "client/native/belt_sim/src/biter_gore_native*",
+                        "client/scripts/native_library.gd", "client/tests/biter_gore_native*")),
+    TestEntry("biter_ragdoll_native_test", "godot_script", "biter_ragdoll_native_test.gd", suite="godot",
+              triggers=("addons-src/immersive-enemies/**", "client/native/belt_sim/src/biter_ragdoll_native*",
+                        "client/scripts/native_library.gd", "client/tests/biter_ragdoll_native*")),
+    TestEntry("update_check_test", "godot_script", "update_check_test.gd", suite="godot",
+              triggers=("client/scripts/menu/update_check.gd", "client/tests/update_check*")),
     TestEntry("far_nature_merge_test", "godot_script", "far_nature_merge_test.gd", suite="godot",
               triggers=("client/scripts/world/far_chunks.gd", "client/tests/far_nature_merge*")),
     TestEntry("cliff_low_shadow_test", "godot_script", "cliff_low_shadow_test.gd", suite="godot",
@@ -467,11 +524,40 @@ TESTS: list[TestEntry] = [
     TestEntry("inserter_arms_native_test", "godot_script", "inserter_arms_native_test.gd", suite="godot",
               triggers=("client/scripts/world/inserter_arms.gd", "client/scripts/world/model_rig.gd",
                         "client/native/belt_sim/src/inserter_arms_native*", "client/tests/inserter_arms_native*")),
+    TestEntry("mm_buffer_writes_test", "godot_script", "mm_buffer_writes_test.gd", suite="godot",
+              triggers=("client/scripts/world/chunk_view.gd", "client/scripts/world/robot_swarm.gd",
+                        "client/tests/mm_buffer_writes*")),
     TestEntry("inserter_buffer_test", "godot_script", "inserter_buffer_test.gd", suite="godot",
               triggers=("client/scripts/world/inserter_arms.gd", "client/scripts/world/model_library.gd",
                         "client/tests/inserter_buffer*")),
+    TestEntry("inserter_rest_index_test", "godot_script", "inserter_rest_index_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/tests/inserter_rest_index*")),
+    TestEntry("inserter_rest_look_test", "godot_script", "inserter_rest_look_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/tests/inserter_rest_look*")),
     TestEntry("inserter_swing_test", "godot_script", "inserter_swing_test.gd", suite="godot",
               triggers=("client/scripts/world/inserter_swing.gd", "client/tests/inserter_swing*")),
+    TestEntry("inserter_swing_native_test", "godot_script", "inserter_swing_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_swing.gd", "client/native/belt_sim/src/inserter_swing*",
+                        "client/tests/inserter_swing_native*")),
+    TestEntry("inserter_pose_native_test", "godot_script", "inserter_pose_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/scripts/world/inserter_swing.gd",
+                        "client/native/belt_sim/src/inserter_swing*", "client/native/belt_sim/src/inserter_pose*",
+                        "client/tests/inserter_pose_native*")),
+    TestEntry("inserter_loop_native_test", "godot_script", "inserter_loop_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/native/belt_sim/src/inserter_pose*",
+                        "client/native/belt_sim/src/inserter_arms_native*", "client/tests/inserter_loop_native*")),
+    TestEntry("inserter_ingest_native_test", "godot_script", "inserter_ingest_native_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/native/belt_sim/src/inserter_ingest*",
+                        "client/native/belt_sim/src/inserter_pose*", "client/tests/inserter_ingest_native*")),
+    TestEntry("inserter_hand_stack_test", "godot_script", "inserter_hand_stack_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/native/belt_sim/src/inserter_pose*",
+                        "client/tests/inserter_hand_stack*")),
+    TestEntry("inserter_bind_stamp_test", "godot_script", "inserter_bind_stamp_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/scripts/world/model_library.gd",
+                        "client/native/belt_sim/src/inserter_ingest*", "client/tests/inserter_bind_stamp*")),
+    TestEntry("inserter_model_watch_test", "godot_script", "inserter_model_watch_test.gd", suite="godot",
+              triggers=("client/scripts/world/inserter_arms.gd", "client/native/belt_sim/src/inserter_pose*",
+                        "client/tests/inserter_model_watch*")),
     TestEntry("wheel_roll_test", "godot_script", "wheel_roll_test.gd", suite="godot",
               triggers=("client/scripts/world/vehicle_anim.gd", "client/scripts/world/vehicle_lights.gd",
                         "client/scripts/world/movers.gd", "client/scripts/world/turrets.gd",
@@ -512,12 +598,59 @@ TESTS: list[TestEntry] = [
                         "client/scripts/world/far_chunks.gd", "client/scripts/world/ao_zoom.gd",
                         "client/scripts/world/model_lods.gd", "client/scripts/world/world.gd",
                         "client/tests/char_lod_zoom*")),
+    TestEntry("cut_lods_test", "godot_script", "cut_lods_test.gd", suite="godot",
+              triggers=("client/scripts/world/view_ahead.gd", "client/scripts/world/world.gd",
+                        "client/scripts/world/far_chunks.gd", "client/scripts/world/cliff_wall.gd",
+                        "client/scripts/world/chunk_view.gd", "client/scripts/addons/addon_world.gd",
+                        "client/tests/cut_lods*")),
     TestEntry("cliff_fit_test", "godot_script", "cliff_fit_test.gd", suite="godot",
               triggers=("client/scripts/world/ground_height.gd", "client/shaders/ground_height*",
                         "client/scripts/addons/addon_terrain.gd", "client/tests/cliff_fit*")),
     TestEntry("profiler_overlay_test", "godot_script", "profiler_overlay_test.gd", suite="godot",
               triggers=("client/scripts/debug/debug_overlay.gd", "client/scripts/debug/probing.gd",
                         "client/tests/profiler_overlay*")),
+    TestEntry("tree_lod_perf_test", "godot_script", "tree_lod_perf_test.gd", suite="godot",
+              triggers=("client/scripts/world/model_lods.gd", "client/shaders/shadow_stand_in_leaf.gdshader",
+                        "client/tests/tree_lod_perf_test.gd")),
+    TestEntry("weapon_fx_perf_test", "godot_script", "weapon_fx_perf_test.gd", suite="godot",
+              triggers=("client/scripts/fx/sprite_fx.gd", "client/scripts/fx/weapon_fx.gd",
+                        "client/tests/weapon_fx_perf_test.gd")),
+    TestEntry("anim_sweep_perf_test", "godot_script", "anim_sweep_perf_test.gd", suite="godot",
+              triggers=("client/scripts/world/anim.gd", "client/scripts/world/signal_lights.gd",
+                        "client/tests/anim_sweep_perf_test.gd")),
+    TestEntry("render_cleanup_perf_test", "godot_script", "render_cleanup_perf_test.gd", suite="godot",
+              triggers=("client/scripts/world/signal_lights.gd", "client/scripts/world/frame_budget.gd",
+                        "client/scripts/world/item_cards.gd", "client/scripts/world/robot_swarm.gd",
+                        "client/scripts/world/creatures.gd", "client/scripts/menu/settings.gd",
+                        "client/scripts/player/player_input.gd", "client/tests/render_cleanup_perf_test.gd")),
+    TestEntry("belt_mid_lod_test", "godot_script", "belt_mid_lod_test.gd", suite="godot",
+              triggers=("client/scripts/world/belt_lods.gd", "client/scripts/world/chunk_view.gd",
+                        "client/tests/belt_mid_lod_test.gd")),
+    TestEntry("texture_compress_native_test", "godot_script", "texture_compress_native_test.gd", suite="godot",
+              triggers=("client/native/belt_sim/src/texture_compress_native.h",
+                        "client/native/belt_sim/src/texture_compress_native.cpp",
+                        "client/native/belt_sim/src/register_types.cpp",
+                        "client/scripts/world/terrain_textures.gd",
+                        "client/scripts/world/decoratives.gd",
+                        "client/scripts/world/decor_sheet_baker.gd",
+                        "client/tests/texture_compress_native_test.gd")),
+    TestEntry("mv_shader_perf_test", "godot_script", "mv_shader_perf_test.gd", suite="godot",
+              triggers=("client/scripts/world/belt_mv.gd", "client/shaders/ghost_card.gdshader",
+                        "client/shaders/sprite_card.gdshaderinc", "client/shaders/factorio_material.gdshaderinc",
+                        "addons-src/cinematic-shaders/shaders/cinematic_grade.gdshader",
+                        "addons-src/cinematic-shaders/main.gd", "client/tests/mv_shader_perf_test.gd")),
+    # perf-w3-render (R1): no direct renderer read in the scripts that had them (static, fast), and the client
+    # headless on the editor build with the render thread: no per-frame main-thread wait (starts its own Godot).
+    TestEntry("render_sync_check --static", "py", "tools/render_sync_check.py", args=("--static",), suite="fast",
+              triggers=("client/scripts/ui/factorio/model_preview.gd", "client/scripts/world/ghosts.gd",
+                        "client/scripts/world/pipe_covers.gd", "client/scripts/world/decoratives.gd",
+                        "client/scripts/world/sprite_standins.gd", "client/scripts/world/model_library.gd",
+                        "client/scripts/world/terrain_textures.gd", "client/scripts/world/chunk_view.gd",
+                        "client/scripts/world/render_reads.gd", "tools/render_sync_check.py")),
+    TestEntry("render_sync_check --run", "py", "tools/render_sync_check.py", args=("--run",), suite="godot",
+              triggers=("tools/render_sync_check.py",)),
+    TestEntry("render_reads_test", "godot_script", "render_reads_test.gd", suite="godot",
+              triggers=("client/scripts/world/render_reads.gd", "client/tests/render_reads_test.gd")),
     # Starts one Godot test itself, as above: the player's own Godot logs left alone.
     TestEntry("test_godot_logs", "py", "tools/test_godot_logs.py", suite="godot",
               triggers=("tools/check.py", "tools/test_godot_logs.py")),
@@ -621,6 +754,33 @@ def all_checks(which: str) -> list[Check]:
     return checks
 
 
+def no_factorio_env(logs: pathlib.Path) -> None:
+    """--no-factorio: the children's environment as on a CI runner (paths.gd no_factorio). A fresh home and
+    APPDATA (so Godot's user:// starts empty, as on a runner, and no %APPDATA%/Factorio or ~/.factorio is found)."""
+    # A home of this run's own (two runs at once never share or delete each other's), removed at exit
+    # through safe_delete (the junction rule: links inside go as links, never their targets).
+    import atexit
+    import tempfile
+    sys.path.insert(0, str(REPO / "tools"))
+    import safe_delete
+    logs.mkdir(parents=True, exist_ok=True)
+    home = pathlib.Path(tempfile.mkdtemp(prefix="no-factorio-home-", dir=logs)).resolve()
+    atexit.register(safe_delete.remove_tree, home)
+    (home / "AppData" / "Roaming").mkdir(parents=True)
+    # Godot found before the home moves (the ~/Tools/Godot lookup would miss it after), handed to the children
+    # that look for it themselves (render_sync_check --run), as $GODOT is on CI.
+    godot = godot_path()
+    if godot and not CHILD_ENV.get("GODOT"):
+        CHILD_ENV["GODOT"] = godot
+    CHILD_ENV["ZENITH_NO_FACTORIO"] = "1"
+    CHILD_ENV["HOME"] = str(home)
+    CHILD_ENV["USERPROFILE"] = str(home)
+    CHILD_ENV["APPDATA"] = str(home / "AppData" / "Roaming")
+    CHILD_ENV["XDG_DATA_HOME"] = str(home / ".local" / "share")
+    CHILD_ENV["XDG_CONFIG_HOME"] = str(home / ".config")
+    print(f"--no-factorio: ZENITH_NO_FACTORIO=1, home {home}", flush=True)
+
+
 def run_once(check: Check, godot: str | None, logs: pathlib.Path | None = None) -> tuple[bool, str, str]:
     """(passed, why not, the whole output)."""
     command = check.command
@@ -717,7 +877,12 @@ def main() -> int:
     ap.add_argument("--all", nargs="?", const="fast", choices=["fast", "godot", "both"],
                     help="every suite of that kind, whatever changed, each run once, then a table")
     ap.add_argument("--logs", type=pathlib.Path, help="with --all: where each check's whole output goes")
+    ap.add_argument("--no-factorio", action="store_true",
+                    help="run the tests as CI's runners see this PC: no Factorio install, Steam library or "
+                         "Factorio folders found (ZENITH_NO_FACTORIO=1) and a fresh home/APPDATA for each run")
     args = ap.parse_args()
+    if args.no_factorio:
+        no_factorio_env(args.logs or main_checkout() / "art-src" / "check-logs")
 
     if args.all:
         if args.list:

@@ -33,6 +33,7 @@ const EquipmentGrid := preload("res://scripts/ui/factorio/equipment_grid.gd")
 const LogicWindows := preload("res://scripts/ui/factorio/logic_windows.gd")
 const PlanetInfo := preload("res://scripts/ui/factorio/planet_info.gd")
 const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.gd")
+const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 
 ## A slot of one of the character's inventories was clicked ("main", "guns", "ammo", "armor").
 signal slot_clicked(role: String, index: int, button_index: int, shift: bool, ctrl: bool)
@@ -334,6 +335,8 @@ func _ready() -> void:
 	if model.has_signal("logistics_changed"):
 		model.connect("logistics_changed", _refresh_logistics)
 		model.connect("logistics_changed", _update_tabs)
+	if model.has_signal("inventory_changed"):
+		model.connect("inventory_changed", _refresh_logistics)
 	_refresh()
 	_refresh_equipment()
 	_update_visibility()
@@ -652,6 +655,22 @@ func _fit_logistics() -> void:
 	_logistics_scroll.custom_minimum_size = Vector2(want.x + bar, minf(want.y, cap))
 
 
+func _has_active_editor(node: Node) -> bool:
+	if node is Control and node.name == "RequestEditor" and (node as Control).visible:
+		return true
+	for child in node.get_children():
+		if _has_active_editor(child):
+			return true
+	return false
+
+
+func _logistics_editing() -> bool:
+	var focus: Control = get_viewport().gui_get_focus_owner() if is_inside_tree() else null
+	if focus is LineEdit and _logistics.is_ancestor_of(focus):
+		return true
+	return _has_active_editor(_logistics)
+
+
 ## The character's logistic requests (`clog`) and its network (`ln`), when the mod sends them.
 func _refresh_logistics() -> void:
 	if _color_swatch != null and _color_swatch.color != model.char_color and not _color_swatch.get_popup().visible:
@@ -659,9 +678,16 @@ func _refresh_logistics() -> void:
 		(_color_swatch.get_node("Fill") as ColorRect).color = model.char_color
 	if not _logistics.is_visible_in_tree():
 		return
+	if _logistics_editing():
+		return
 	var requests = model.get("char_requests")
+	var inv_slots := model.shown_main_slots()
 	var sig := JSON.stringify([requests, model.get("char_requests_on"), model.get("char_trash_unrequested"), model.get("network"),
-		model.get("char_sections"), model.get("logistic_groups")])
+		model.get("char_sections"), model.get("logistic_groups"), model.get("char_deliver"), model.get("char_pickup"),
+		inv_slots.size()])
+	for st in inv_slots:
+		if st is Dictionary and not (st as Dictionary).is_empty():
+			sig += "|%s:%s:%d" % [str(st.get("item", "")), str(st.get("quality", "")), int(st.get("count", 0))]
 	if sig == _logistics_sig:
 		return
 	_logistics_sig = sig
@@ -683,8 +709,18 @@ func _refresh_logistics() -> void:
 		for x in l:
 			dicts.append({"item": x[0], "min": x[1], "max": x[2]})
 		model.call("set_character_requests", dicts, new_on, new_trash)
-	var set_on := func(v: bool) -> void: send.call(list, v, trash)
-	var set_trash := func(v: bool) -> void: send.call(list, on, v)
+	# With sections the switches alone are sent: the flat list merges an item two sections request.
+	var by_sections: bool = model.get("char_sections") is Array
+	var set_on := func(v: bool) -> void:
+		if by_sections:
+			model.call("set_character_switches", v, trash)
+		else:
+			send.call(list, v, trash)
+	var set_trash := func(v: bool) -> void:
+		if by_sections:
+			model.call("set_character_switches", on, v)
+		else:
+			send.call(list, on, v)
 	var set_list := func(l: Array) -> void: send.call(l, on, trash)
 	var net = model.get("network")
 	var in_network: bool = net is Dictionary and not (net as Dictionary).is_empty()
@@ -707,27 +743,21 @@ func _refresh_logistics() -> void:
 	top.add_child(dot)
 	_logistics.add_child(top)
 	if model.get("char_sections") is Array:
-		# Factorio's logistic sections, each with its group, on/off box, rename and delete, its
-		# requests 10 wide, then "Add section" (production_panels.gd, as the hub's and chests').
+		# Factorio's logistic sections, each with its group, on/off box, multiplier, rename and delete,
+		# its requests 10 wide with quality/comparator/fulfillment, then "Add section".
 		var holder := CharacterSections.new()
+		holder.model = model
 		holder.picker = screen.picker
 		holder.held_item = screen.held_item if screen.get("held_item") is Callable else Callable()
-		holder._last = {"lgs": model.get("logistic_groups"), "ql": []}
+		var quals: Array = model.planners.unlocked_qualities() if model.get("planners") != null else []
+		holder._last = {"lgs": model.get("logistic_groups"), "ql": quals}
 		_logistics.add_child(holder)
-		var slots := func(sec: Dictionary, filters: Array, send: Callable) -> Control:
-			# Each row keeps its quality as a fourth value (the grid edits the first three): one
-			# item may be requested at two qualities, which a lookup by name turned into one.
-			var plain: Array = []
-			for f in filters:
-				if f is Array and f.size() >= 6:
-					plain.append([str(f[0]), int(f[2]), int(f[3]), str(f[1])])
-			var back := func(l: Array) -> void:
-				var out: Array = []
-				for r in l:
-					out.append([str(r[0]), str(r[3]) if r.size() >= 4 else "normal", int(r[1]), int(r[2]), "", -1])
-				send.call(out)
-			return EntityPanels.request_grid(holder, plain, back, Kit.COLUMNS)
-		var secs := ProductionPanels.sections(holder, (model.get("char_sections") as Array).duplicate(true), slots)
+		var status_ctx := SpacePanels.build_status_context(inv_slots, model.char_deliver, model.char_pickup)
+		var secs := SpacePanels.sections(holder, (model.get("char_sections") as Array).duplicate(true), [], false, status_ctx)
+		if secs.get_child_count() > 0:
+			var heading := secs.get_child(0)
+			secs.remove_child(heading)
+			heading.queue_free()
 		secs.name = "Sections"
 		holder.add_child(secs)
 		return
@@ -756,6 +786,7 @@ func _refresh_logistics() -> void:
 ## the item chooser.
 class CharacterSections extends VBoxContainer:
 	var unit := 0
+	var model: UiModel = null
 	var _last := {}
 	var held_item := Callable()
 	var picker = null
@@ -895,6 +926,7 @@ func _refresh() -> void:
 
 
 func _show(s: Slot, role: String, index: int, stack: Dictionary) -> void:
+	s.set_highlight(model.main_highlight_until(index) if role == "main" else 0)
 	var in_hand: bool = hand_slot.size() >= 2 and hand_slot[0] == role and int(hand_slot[1]) == index and not stack.is_empty()
 	s.set_hand(in_hand, Slot.hand_left_of(hand_slot, stack))
 	var filter: String = model.main_filters.get(index, "") if role == "main" else ""

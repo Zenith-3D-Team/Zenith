@@ -99,7 +99,7 @@ M.options = O
 
 -- What has been read and sent since loading: /f3d-ih says, and tests read them.
 M.counts = { checks = 0, ticks = 0, events = 0, sends = 0, bytes = 0, searches = 0, syncs = 0, probes = 0, carried = 0,
-  look_slices = 0 }
+  look_slices = 0, line_gets = 0, look_skips = 0 }
 
 -- --- module state (see the top: nothing in storage) ----------------------------------------------
 
@@ -116,6 +116,16 @@ local client_seen       -- storage.f3d.client the state was made for
 local events_were = false
 local last_heartbeat = 0
 local status_codes      -- defines.entity_status value -> code
+-- (gc_lean) Cached drop belt LuaTransportLine handles and reusable scratch arrays.
+local belt_lines = {}   -- belt unit -> { e = belt, lines = { line1, ... } }
+local ih_flat = {}
+local placed_found = {}
+
+local function clear_trailing(t, from)
+  for i = #t, from, -1 do
+    t[i] = nil
+  end
+end
 
 local function code_of(status)
   if not status_codes then
@@ -129,6 +139,7 @@ end
 
 local function reset()
   S, chunks, dirty, due, events, inside, order, square, look_job = {}, {}, {}, {}, {}, {}, {}, nil, nil
+  belt_lines = {}
 end
 M.reset = reset
 
@@ -195,22 +206,50 @@ local function chunk_list(surface, cx, cy, now)
   return list
 end
 
--- tracker.listeners: an inserter built or removed (the listener runs while it is still valid):
--- its chunk is searched again, and a removed one is said gone at once.
+local schedule
+
+-- tracker.listeners: an inserter or belt built or removed (the listener runs while it is still valid):
+-- its chunk is searched again, and nearby inserters recheck targets immediately when a belt changes.
 local function touched(entity)
-  if not (entity and entity.valid and entity.type == "inserter") then
+  if not (entity and entity.valid) then
     return
   end
-  local p = entity.position
-  dirty[entity.surface.index .. ":" .. chunk_key(p.x, p.y)] = true
-  local u = entity.unit_number
-  if u and S[u] then
-    S[u].recheck = true
+  if entity.type == "inserter" then
+    local p = entity.position
+    dirty[entity.surface.index .. ":" .. chunk_key(p.x, p.y)] = true
+    local u = entity.unit_number
+    if u and S[u] then
+      S[u].recheck = true
+    end
+  elseif BELTISH[entity.type] then
+    local p = entity.position
+    local si = entity.surface.index
+    local px, py = p.x, p.y
+    local cx0, cy0 = math.floor((px - 3) / 32), math.floor((py - 3) / 32)
+    local cx1, cy1 = math.floor((px + 3) / 32), math.floor((py + 3) / 32)
+    local now = game and game.tick or 0
+    for cy = cy0, cy1 do
+      for cx = cx0, cx1 do
+        local c = chunks[si .. ":" .. chunk_key(cx * 32, cy * 32)]
+        if c then
+          for _, entry in ipairs(c.list) do
+            local st = S[entry[2]]
+            if st and math.abs(entry[3] - px) <= 3.5 and math.abs(entry[4] - py) <= 3.5 then
+              st.recheck = true
+              st.target_dirty = true
+              if st.next and st.next > now + 1 then
+                schedule(st, now + 1)
+              end
+            end
+          end
+        end
+      end
+    end
   end
 end
 tracker.listeners[#tracker.listeners + 1] = touched
 
-local function schedule(st, tick)
+schedule = function(st, tick)
   local now = game.tick
   if tick <= now then
     tick = now + 1
@@ -237,6 +276,66 @@ local function belt_unit(target)
   return 0, false
 end
 
+-- Module-local pcall/sort helpers so describe()/look_over()/placed_on() allocate zero closures.
+local function read_positions(e, st)
+  local pp, dp = e.pickup_position, e.drop_position
+  st.pa, st.pr = turns_of(pp.x - st.x, pp.y - st.y), math.sqrt((pp.x - st.x) ^ 2 + (pp.y - st.y) ^ 2)
+  st.da, st.dr = turns_of(dp.x - st.x, dp.y - st.y), math.sqrt((dp.x - st.x) ^ 2 + (dp.y - st.y) ^ 2)
+  st.ppx, st.ppy, st.dpx, st.dpy = pp.x, pp.y, dp.x, dp.y
+end
+
+local function get_entity_quality(e)
+  return e.quality
+end
+
+local function read_speeds(e, st)
+  local proto = e.prototype
+  local okq, q = pcall(get_entity_quality, e)
+  if not okq then
+    q = nil
+  end
+  st.rs = proto.get_inserter_rotation_speed(q)
+  st.es = proto.get_inserter_extension_speed(q)
+end
+
+local function read_targets(e, st)
+  local pu, du
+  if not st.target_dirty then
+    pu, du = belt_sim.actor_belts(st.u)
+  end
+  st.target_dirty = nil
+  if pu == nil then
+    pu = belt_unit(e.pickup_target)
+    local dt = e.drop_target
+    du = belt_unit(dt)
+    if perf.on("gc_lean") and dt and dt.valid and BELTISH[dt.type] then
+      st.drop_ent = dt
+    else
+      st.drop_ent = nil
+    end
+  elseif perf.on("gc_lean") and du and du ~= 0 then
+    local dt = e.drop_target
+    st.drop_ent = (dt and dt.valid and BELTISH[dt.type]) and dt or nil
+  else
+    st.drop_ent = nil
+  end
+  st.pu, st.du = pu or 0, du or 0
+end
+
+local function read_pickup_cap(e)
+  return e.inserter_target_pickup_count
+end
+
+local function cmp_chunk_dist(a, b)
+  if a[3] ~= b[3] then return a[3] < b[3] end
+  if a[2] ~= b[2] then return a[2] < b[2] end
+  return a[1] < b[1]
+end
+
+local function cmp_placed_desc(a, b)
+  return a[1] > b[1]
+end
+
 -- What a hand reaches for: its ends (from pickup_position / drop_position), speeds at its quality,
 -- whether each end is a belt (belt_sim's actors know their belts; else the targets are read) and
 -- its hand's size. Read once when the hand is found and again at each resync (a belt built later).
@@ -244,28 +343,13 @@ local function describe(st)
   local e = st.e
   -- (Each read on its own: a modded inserter without one still gets the others; a failed one
   -- keeps the base inserter's numbers.)
-  pcall(function()
-    local pp, dp = e.pickup_position, e.drop_position
-    st.pa, st.pr = turns_of(pp.x - st.x, pp.y - st.y), math.sqrt((pp.x - st.x) ^ 2 + (pp.y - st.y) ^ 2)
-    st.da, st.dr = turns_of(dp.x - st.x, dp.y - st.y), math.sqrt((dp.x - st.x) ^ 2 + (dp.y - st.y) ^ 2)
-    st.ppx, st.ppy, st.dpx, st.dpy = pp.x, pp.y, dp.x, dp.y
-  end)
-  pcall(function()
-    local proto = e.prototype
-    local q
-    pcall(function() q = e.quality end)
-    st.rs = proto.get_inserter_rotation_speed(q)
-    st.es = proto.get_inserter_extension_speed(q)
-  end)
-  pcall(function()
-    local pu, du = belt_sim.actor_belts(st.u)
-    if pu == nil then
-      pu = belt_unit(e.pickup_target)
-      du = belt_unit(e.drop_target)
-    end
-    st.pu, st.du = pu or 0, du or 0
-  end)
-  pcall(function() st.cap = e.inserter_target_pickup_count end)
+  pcall(read_positions, e, st)
+  pcall(read_speeds, e, st)
+  pcall(read_targets, e, st)
+  local okc, cap = pcall(read_pickup_cap, e)
+  if okc then
+    st.cap = cap
+  end
   if not st.rs or st.rs <= 0 or not st.es or st.es <= 0 then
     st.rs, st.es = 0.014, 0.035
   end
@@ -317,12 +401,34 @@ local function finish_look(now_inside, new_order, visited, now)
   inside, order = now_inside, new_order
 end
 
+local function look_due(surface, fx, fy, r, now)
+  if not square or square.si ~= surface.index or square.r ~= r or next(dirty) then
+    return true
+  end
+  local dx, dy = math.abs(square.fx - fx), math.abs(square.fy - fy)
+  if perf.on("gc_lean") then
+    if dx < 0.5 and dy < 0.5 then
+      if now - square.tick < CHUNK_REFRESH then
+        M.counts.look_skips = M.counts.look_skips + 1
+        return false
+      end
+      return true
+    end
+    if dx < 4 and dy < 4 and now - square.tick < SQUARE_TICKS then
+      M.counts.look_skips = M.counts.look_skips + 1
+      return false
+    end
+    return true
+  end
+  local moved = dx >= 0.5 or dy >= 0.5
+  return moved or now - square.tick >= SQUARE_TICKS
+end
+
 local function look_over(surface, f, r, now)
   local fx, fy = f.x, f.y
   if not perf.on("inserter_look_budget") then
     look_job = nil
-    local moved = not square or square.si ~= surface.index or math.abs(square.fx - fx) >= 0.5 or math.abs(square.fy - fy) >= 0.5 or square.r ~= r
-    if square and not moved and now - square.tick < SQUARE_TICKS and not next(dirty) then
+    if not look_due(surface, fx, fy, r, now) then
       return
     end
     square = { fx = fx, fy = fy, r = r, si = surface.index, tick = now }
@@ -356,8 +462,7 @@ local function look_over(surface, f, r, now)
     end
   end
   if not look_job then
-    local moved = not square or square.si ~= surface.index or math.abs(square.fx - fx) >= 0.5 or math.abs(square.fy - fy) >= 0.5 or square.r ~= r
-    if square and not moved and now - square.tick < SQUARE_TICKS and not next(dirty) then
+    if not look_due(surface, fx, fy, r, now) then
       return
     end
     local clist = {}
@@ -367,11 +472,7 @@ local function look_over(surface, f, r, now)
         clist[#clist + 1] = { cx, cy, dist }
       end
     end
-    table.sort(clist, function(a, b)
-      if a[3] ~= b[3] then return a[3] < b[3] end
-      if a[2] ~= b[2] then return a[2] < b[2] end
-      return a[1] < b[1]
-    end)
+    table.sort(clist, cmp_chunk_dist)
     look_job = { fx = fx, fy = fy, r = r, si = surface.index, list = clist, ci = 1, ei = 1,
       now_inside = {}, new_order = {}, seen_u = {}, visited = {} }
   end
@@ -464,6 +565,36 @@ end
 -- counting stacks), found on the belt now: those nearest the hand at (px, py) with the newest ids (an
 -- item gets its unique_id when it comes onto a belt: the one just dropped is the newest there), within
 -- PLACE_NEAR. A few reads of the drop belt's lines a drop: only for a client that asked (`ho`).
+local function belt_line_handles(belt, unit)
+  if not perf.on("gc_lean") then
+    belt_lines = {}
+    local lines = {}
+    for i = 1, belt.get_max_transport_line_index() do
+      lines[i] = belt.get_transport_line(i)
+      M.counts.line_gets = M.counts.line_gets + 1
+    end
+    return lines
+  end
+  local c = belt_lines[unit]
+  if c and c.e == belt and belt.valid then
+    return c.lines
+  end
+  if game.tick % 300 == 0 and next(belt_lines) ~= nil then
+    for u, entry in pairs(belt_lines) do
+      if not (entry.e and entry.e.valid) then
+        belt_lines[u] = nil
+      end
+    end
+  end
+  local lines = {}
+  for i = 1, belt.get_max_transport_line_index() do
+    lines[i] = belt.get_transport_line(i)
+    M.counts.line_gets = M.counts.line_gets + 1
+  end
+  belt_lines[unit] = { e = belt, lines = lines }
+  return lines
+end
+
 local function placed_on(belt, st, now, px, py, n)
   if not (belt and belt.valid and BELTISH[belt.type]) then
     return 0
@@ -472,26 +603,35 @@ local function placed_on(belt, st, now, px, py, n)
   if not unit then
     return 0
   end
-  local found = {}
-  for i = 1, belt.get_max_transport_line_index() do
-    local line = belt.get_transport_line(i)
-    for _, it in pairs(line.get_detailed_contents()) do
-      local g = line.get_line_item_position(it.position)
-      if math.abs(g.x - px) <= PLACE_NEAR and math.abs(g.y - py) <= PLACE_NEAR then
-        found[#found + 1] = { it.unique_id, i, it.position, it.stack }
+  local lean = perf.on("gc_lean")
+  local found = lean and placed_found or {}
+  local fn = 0
+  local lines = belt_line_handles(belt, unit)
+  for i, line in ipairs(lines) do
+    if line and line.valid then
+      for _, it in pairs(line.get_detailed_contents()) do
+        local g = line.get_line_item_position(it.position)
+        if g and math.abs(g.x - px) <= PLACE_NEAR and math.abs(g.y - py) <= PLACE_NEAR then
+          fn = fn + 1
+          found[fn] = { it.unique_id, i, it.position, it.stack }
+        end
       end
     end
   end
-  table.sort(found, function(a, b) return a[1] > b[1] end)
+  if lean then
+    clear_trailing(found, fn + 1)
+  end
+  table.sort(found, cmp_placed_desc)
   local got = 0
   for _, f in ipairs(found) do
     if got >= n then
       break
     end
     local stack = f[4]
-    local cnt = stack.valid_for_read and stack.count or 1
+    local valid_stack = stack ~= nil and stack.valid_for_read
+    local cnt = valid_stack and stack.count or 1
     -- (The record's hand x, y carry the item and its stack.)
-    emit(st, PLACED, now, unit * 8 + f[2], world.fixed(f[3]), f[1], stack.valid_for_read and registry.item_id(stack.name) or 0,
+    emit(st, PLACED, now, unit * 8 + f[2], world.fixed(f[3]), f[1], valid_stack and registry.item_id(stack.name) or 0,
       cnt, unit)
     got = got + math.max(cnt, 1)
   end
@@ -499,7 +639,16 @@ local function placed_on(belt, st, now, px, py, n)
 end
 
 local function placed(st, now, px, py, n)
-  placed_on(st.e.drop_target, st, now, px, py, n)
+  if perf.on("gc_lean") then
+    local dt = st.drop_ent
+    if not (dt and dt.valid) then
+      dt = st.e.drop_target
+      st.drop_ent = (dt and dt.valid and BELTISH[dt.type]) and dt or nil
+    end
+    placed_on(dt, st, now, px, py, n)
+  else
+    placed_on(st.e.drop_target, st, now, px, py, n)
+  end
 end
 
 -- The hand set off for an end: checked when it should arrive (the drop end, holding; the pickup,
@@ -527,8 +676,8 @@ local function set_off(st, now, hx, hy)
 end
 
 -- Waiting at an end: at a belt, checked every O.chase ticks (an item or room comes any tick; one
--- that has waited BELT_LONG ticks a tick less often, twice that two less); elsewhere less and less
--- often, up to O.idle.
+-- that has waited BELT_LONG ticks a tick less often, capped at 3 ticks to match TAKE_LEAD); elsewhere
+-- less and less often, up to O.idle.
 local BELT_LONG = 120
 local function wait(st, now, at_pick)
   st.mode = at_pick and "pick_wait" or "drop_wait"
@@ -537,7 +686,7 @@ local function wait(st, now, at_pick)
   st.since = st.since or now
   if belt then
     local waited = now - st.since
-    st.idle_gap = O.chase + (waited >= 2 * BELT_LONG and 2 or waited >= BELT_LONG and 1 or 0)
+    st.idle_gap = math.min(3, O.chase + (waited >= 2 * BELT_LONG and 2 or waited >= BELT_LONG and 1 or 0))
   else
     st.idle_gap = math.min(O.idle, math.max(2, st.idle_gap * 2))
   end
@@ -690,7 +839,14 @@ local function check(st, now)
     sync = false
   elseif cnt > was then
     hx, hy, px, py = hand_fixed(e)
-    emit(st, PICKED, now, cnt, item, unc, hx, hy, st.pu)
+    local emit_hx, emit_hy = hx, hy
+    if st.ppx and st.ppy then
+      local dx, dy = px - st.ppx, py - st.ppy
+      if unc > 0 or dx * dx + dy * dy > 0.25 then
+        emit_hx, emit_hy = world.fixed(st.ppx), world.fixed(st.ppy)
+      end
+    end
+    emit(st, PICKED, now, cnt, item, unc, emit_hx, emit_hy, st.pu)
   elseif cnt < was then
     hx, hy, px, py = hand_fixed(e)
     emit(st, DROPPED, now, cnt, was_item, unc, hx, hy, st.du)
@@ -771,17 +927,23 @@ end
 
 -- `ih`: every hand inside the square, its position and held item (the older clients' samples).
 local function collect()
-  local flat = {}
+  local lean = perf.on("gc_lean")
+  local flat = lean and ih_flat or {}
+  local n = 0
   for _, u in ipairs(order) do
     local st = S[u]
     if st and st.e.valid then
       local p = st.e.held_stack_position
       local stack = st.e.held_stack
-      flat[#flat + 1] = u
-      flat[#flat + 1] = world.fixed(p.x)
-      flat[#flat + 1] = world.fixed(p.y)
-      flat[#flat + 1] = stack.valid_for_read and registry.item_id(stack.name) or 0
+      flat[n + 1] = u
+      flat[n + 2] = world.fixed(p.x)
+      flat[n + 3] = world.fixed(p.y)
+      flat[n + 4] = stack.valid_for_read and registry.item_id(stack.name) or 0
+      n = n + 4
     end
+  end
+  if lean then
+    clear_trailing(flat, n + 1)
   end
   return flat
 end
@@ -855,12 +1017,30 @@ M.wants = wants
 -- that gets the events. Returns how many were told (0 or 1).
 local DROP_HAND = { u = 0 }
 function M.put_by_hand(belt, x, y)
-  local client = storage.f3d.client
+  local s = storage.f3d
+  local client = s and s.client
   if not (client and client.ho and wants()) then
     return 0
   end
-  local ok, got = pcall(placed_on, belt, DROP_HAND, game.tick, x, y, 1)
-  return ok and got or 0
+  if not (belt and belt.valid) then
+    return 0
+  end
+  local now = game.tick
+  local ok, got = pcall(placed_on, belt, DROP_HAND, now, x, y, 1)
+  if not (ok and got and got > 0) then
+    return 0
+  end
+  -- Flush `ie` immediately so hand-dropped items don't wait for the periodic timer flush.
+  local window = O.every * O["repeat"]
+  local n = #events
+  local ok_send, bytes = pcall(send_events, now, window)
+  local tr = s and s.ih_trace
+  if tr and ok_send and bytes and bytes > 0 then
+    tr.ie_sends = (tr.ie_sends or 0) + 1
+    tr.ie_events = (tr.ie_events or 0) + n
+    tr.ie_bytes = (tr.ie_bytes or 0) + bytes
+  end
+  return got
 end
 
 -- --- the debug trace (tools/inserter_check.py) ---------------------------------------------------
@@ -882,26 +1062,37 @@ local function num(v)
   return math.floor((v or 0) * 1000 + 0.5) / 1000
 end
 
+local function get_mirroring(e)
+  return e.mirroring
+end
+
+local function read_proto_speeds(proto, q)
+  return proto.get_inserter_rotation_speed(q), proto.get_inserter_extension_speed(q)
+end
+
+local function build_trace_desc(e)
+  local proto = e.prototype
+  local pp, dp = e.pickup_position, e.drop_position
+  local q = e.quality
+  local pt, dt = e.pickup_target, e.drop_target
+  local okm, mirror = pcall(get_mirroring, e)
+  if not okm then
+    mirror = false
+  end
+  local oks, rs, es = pcall(read_proto_speeds, proto, q)
+  if not oks then
+    rs, es = 0, 0
+  end
+  return {
+    u = e.unit_number, n = e.name, x = num(e.position.x), y = num(e.position.y), d = e.direction,
+    pp = { num(pp.x), num(pp.y) }, dp = { num(dp.x), num(dp.y) }, rs = rs, es = es,
+    q = q and q.name or "normal", m = mirror and 1 or 0,
+    pt = pt and pt.valid and pt.type or "", dt = dt and dt.valid and dt.type or "",
+  }
+end
+
 local function describe_trace(e)
-  local ok, rec = pcall(function()
-    local proto = e.prototype
-    local pp, dp = e.pickup_position, e.drop_position
-    local q = e.quality
-    local pt, dt = e.pickup_target, e.drop_target
-    local mirror = false
-    pcall(function() mirror = e.mirroring end)
-    local rs, es = 0, 0
-    pcall(function()
-      rs = proto.get_inserter_rotation_speed(q)
-      es = proto.get_inserter_extension_speed(q)
-    end)
-    return {
-      u = e.unit_number, n = e.name, x = num(e.position.x), y = num(e.position.y), d = e.direction,
-      pp = { num(pp.x), num(pp.y) }, dp = { num(dp.x), num(dp.y) }, rs = rs, es = es,
-      q = q and q.name or "normal", m = mirror and 1 or 0,
-      pt = pt and pt.valid and pt.type or "", dt = dt and dt.valid and dt.type or "",
-    }
-  end)
+  local ok, rec = pcall(build_trace_desc, e)
   if not ok then
     return { u = e.unit_number, n = e.name, x = num(e.position.x), y = num(e.position.y), d = e.direction, err = tostring(rec) }
   end
@@ -1049,13 +1240,29 @@ function M.command(param)
     or "[Zenith] inserter hand trace off: /f3d-ih trace [ticks] [radius] starts one", status_text() }
 end
 
+-- How far round the focus hands are live (`ih`/`ie`, moving arms): the map setting f3d-detail-radius
+-- raised to the client's `ir` (focus: its camera's visible ground, --live-inserter-radius), never past
+-- the focus radius; 0 turns them off. A client that sends no `ir` (before 0.3.1's view radius) keeps
+-- 0.3.1's 64-tile floor (Bug #5: arms past 24 tiles moved, not resting); `ir` 0 is the setting alone.
+local DEFAULT_LIVE_FLOOR = 64
+
+function M.live_radius()
+  local s = storage.f3d
+  local r_detail = settings.global["f3d-detail-radius"].value
+  if r_detail <= 0 then
+    return 0
+  end
+  local ir = s.focus.ir or DEFAULT_LIVE_FLOOR
+  return math.min(s.focus.r, math.max(r_detail, ir))
+end
+
 function M.tick()
   local s = storage.f3d
   local tr = s.ih_trace
   if tr then
     trace_tick(tr)
   end
-  local r = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
+  local r = M.live_radius()
   if r <= 0 then
     if next(S) then
       reset()

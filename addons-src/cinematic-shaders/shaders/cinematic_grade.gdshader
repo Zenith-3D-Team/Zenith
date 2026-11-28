@@ -49,6 +49,7 @@ uniform float cloud_period = 16.0;
 uniform float fast_night_clouds = 1.0;
 uniform float cloud_volumetric = 1.0;
 uniform float cloud_steps = 40.0;
+uniform float cloud_ray_opt = 1.0;
 uniform sampler3D cloud_shape_3d : filter_linear, repeat_enable;
 uniform sampler3D cloud_detail_3d : filter_linear, repeat_enable;
 global uniform vec4 f3d_weather_clouds;
@@ -286,6 +287,9 @@ vec4 sky_clouds_volumetric(vec3 from, vec3 dir, float night, float jitter, vec3 
 	float silver = pow(max(cos_th, 0.0), 10.0) * (0.45 + 0.85 * look_twilight) * sun_gate * (1.0 - 0.78 * dark);
 
 	float base_dt = (t1 - t0) / float(max_steps);
+	bool opt_on = cloud_ray_opt > 0.5;
+	float empty_dt = opt_on ? base_dt * 2.0 : base_dt * 1.85;
+	float back_dt = opt_on ? base_dt : base_dt * 0.85;
 	float t = t0 + jitter * base_dt;
 	bool in_cloud = false;
 	int empty_run = 0;
@@ -300,20 +304,20 @@ vec4 sky_clouds_volumetric(vec3 from, vec3 dir, float night, float jitter, vec3 
 		if (t >= t1) {
 			break;
 		}
-		float step_dt = in_cloud ? base_dt : base_dt * 1.85;
 		vec3 p = from + dir * t;
 		float h = cloud_alt_norm(p, from, PLANET_R);
 		if (!in_cloud) {
 			if (volumetric_cloud_density(p, h, false) > 0.001) {
-				t = max(t0, t - base_dt * 0.85);
+				t = max(t0, t - back_dt);
 				in_cloud = true;
 				empty_run = 0;
 				continue;
 			}
-			t += step_dt;
+			t += empty_dt;
 			continue;
 		}
-		float d = volumetric_cloud_density(p, h, !fast_night);
+		bool use_detail = !fast_night && (!opt_on || (trans > 0.22 && t < 2400.0));
+		float d = volumetric_cloud_density(p, h, use_detail);
 		if (d > 0.001) {
 			empty_run = 0;
 			float sun_od = 0.0;

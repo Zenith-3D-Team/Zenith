@@ -15,11 +15,17 @@ const ICONS := ["iron-ore", "copper-ore", "coal", "stone", "uranium-ore", "iron-
 
 var text_field := LineEdit.new()
 var icon_name := ""
+## The icon's type ("item" for the row's; a tag made in the game may have a signal, fluid...): kept when editing.
+var icon_type := ""
 var editing := false
+## Opens Factorio's signal chooser: (callback(type, name)); set by factorio_ui.gd (item_picker.gd). Factorio
+## lets a tag take any item, fluid or virtual signal; the row has the usual ones, the last slot any other.
+var choose_icon := Callable()
 
 var _title := Label.new()
 var _delete := Button.new()
 var _icon_buttons: Array = []
+var _custom := Button.new()
 
 
 func _ready() -> void:
@@ -29,7 +35,7 @@ func _ready() -> void:
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", Kit.px(8))
 	add_child(box)
-	var bar := Kit.title_bar("Create tag", true)
+	var bar := Kit.title_bar("New tag", true)
 	_title = bar.get_child(0) as Label
 	(bar.get_child(bar.get_child_count() - 1) as Button).pressed.connect(close)
 	box.add_child(bar)
@@ -59,8 +65,20 @@ func _ready() -> void:
 		b.pressed.connect(_pick.bind(item))
 		icons.add_child(b)
 		_icon_buttons.append(b)
+	_custom.theme_type_variation = "FSlotButton"
+	_custom.toggle_mode = true
+	_custom.focus_mode = Control.FOCUS_NONE
+	_custom.custom_minimum_size = Kit.pxv(Kit.SLOT, Kit.SLOT)
+	_custom.expand_icon = true
+	_custom.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_custom.add_theme_constant_override("icon_max_width", Kit.px(32))
+	_custom.texture_filter = Kit.ICON_FILTER
+	_custom.text = "..."
+	_custom.tooltip_text = "Choose any signal"
+	_custom.pressed.connect(_pick_custom)
+	icons.add_child(_custom)
 	rows.add_child(Kit.label("Name", "FHeading"))
-	text_field.custom_minimum_size = Vector2(Kit.px(Kit.SLOT * ICONS.size()), Kit.px(28))
+	text_field.custom_minimum_size = Vector2(Kit.px(Kit.SLOT * (ICONS.size() + 1)), Kit.px(28))
 	text_field.max_length = 200
 	text_field.placeholder_text = "Tag name"
 	_style_textbox(text_field)
@@ -130,10 +148,11 @@ static func _textbox_style(active: bool) -> StyleBox:
 ## Shows the dialog at a screen point (kept inside the window), filled from `tag` when editing.
 func open_at(at: Vector2, tag: Dictionary) -> void:
 	editing = not tag.is_empty()
-	_title.text = "Edit tag" if editing else "Create tag"
+	_title.text = "Tag properties" if editing else "New tag"
 	_delete.visible = editing
 	text_field.text = str(tag.get("text", ""))
 	_pick_quietly(str(tag.get("icon_name", "")))
+	icon_type = str(tag.get("icon_type", "")) if icon_name != "" else ""
 	visible = true
 	reset_size()
 	var screen := get_viewport_rect().size
@@ -161,12 +180,31 @@ func close() -> void:
 
 func _pick(item: String) -> void:
 	_pick_quietly("" if icon_name == item else item)
+	icon_type = "item" if icon_name != "" else ""
+
+
+## The last slot: a signal that is not in the row (pressed again: none), else the chooser.
+func _pick_custom() -> void:
+	if icon_name != "" and not ICONS.has(icon_name):
+		_pick_quietly("")
+		icon_type = ""
+		return
+	_custom.set_pressed_no_signal(false)
+	if choose_icon.is_valid():
+		choose_icon.call(func(type_name: String, name: String) -> void:
+			_pick_quietly(name)
+			icon_type = type_name if name != "" else "")
 
 
 func _pick_quietly(item: String) -> void:
 	icon_name = item
 	for b in _icon_buttons:
 		(b as Button).set_pressed_no_signal(str((b as Button).get_meta("item")) == item)
+	var other := item != "" and not ICONS.has(item)
+	_custom.set_pressed_no_signal(other)
+	_custom.icon = Kit.item_icon(item) if other else null
+	_custom.text = "" if other else "..."
+	_custom.tooltip_text = Kit.pretty(item) if other else "Choose any signal"
 
 
 func _confirm() -> void:

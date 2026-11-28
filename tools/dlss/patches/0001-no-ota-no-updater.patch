@@ -1,0 +1,134 @@
+Zenith patch 0001 for NVIDIA Streamline v2.14.16 (625db07d, MIT): no OTA, no updater, no downloaded plugins.
+
+- pluginManager.cpp loadPlugins(): the readServerManifest() + checkForOTA() calls are removed (checkForOTA starts
+  NVIDIA's updater nvngx_update.exe on any PC with an NVIDIA GPU, whatever eAllowOTA says), and the block that
+  loads OTA-downloaded plugins (eLoadDownloadedPlugins or the driver's OTA override key) is compiled out.
+- ota.cpp invokeNGXUpdater(): never starts a process (belt and braces: nothing can reach CreateProcessW);
+  the unused wininet/urlmon links are dropped.
+- commonEntry.cpp updateNGXFeature(): NGX's NVSDK_NGX_UpdateFeature is never called.
+
+diff --git a/source/core/sl.ota/ota.cpp b/source/core/sl.ota/ota.cpp
+index 9f74fbf..8e3b012 100644
+--- a/source/core/sl.ota/ota.cpp
++++ b/source/core/sl.ota/ota.cpp
+@@ -45,10 +45,7 @@
+ #include "nvapi.h"
+ 
+ #include <ShlObj.h>
+-#include <wininet.h>
+ #pragma comment(lib,"shlwapi.lib")
+-#pragma comment(lib, "Urlmon.lib")
+-#pragma comment(lib, "Wininet.lib")
+ 
+ namespace
+ {
+@@ -231,19 +228,9 @@ bool OTA::findNGXUpdater()
+ 
+ bool OTA::invokeNGXUpdater(const std::wstring& args)
+ {
+-    if (!findNGXUpdater())
+-    {
+-        SL_LOG_ERROR("NGX Updater not available. OTA downloads are disabled.");
+-        return false;
+-    }
+-
+-    std::wstring command = m_updaterExe.wstring() + L" " + args;
+-
+-    SL_LOG_VERBOSE("Invoking NGX Updater: %ls", command.c_str());
+-    std::thread execThread(execThreadProc, command);
+-    execThread.detach();
+-
+-    return true;
++    // Zenith build: the NGX updater (nvngx_update.exe) is never started.
++    SL_LOG_INFO("Zenith build: NGX updater not started (OTA removed): %ls", args.c_str());
++    return false;
+ }
+ 
+ bool OTA::getNGXPath(std::filesystem::path& ngxPath) const
+diff --git a/source/core/sl.plugin-manager/pluginManager.cpp b/source/core/sl.plugin-manager/pluginManager.cpp
+index a04b968..6407c22 100644
+--- a/source/core/sl.plugin-manager/pluginManager.cpp
++++ b/source/core/sl.plugin-manager/pluginManager.cpp
+@@ -958,15 +958,8 @@ Result PluginManager::loadPlugins()
+ 
+     s_status = PluginManagerStatus::ePluginsLoaded;
+ 
+-#if defined(SL_PRODUCTION) || defined(SL_UNITTEST_ONLY_CODE)
+-    // On production builds kickoff OTA update, this function internally will
+-    // check OTA preferences
+-    m_ota->readServerManifest();
+-#endif
+-#if defined(SL_PRODUCTION)
+-    bool requestOptionalUpdates = (m_pref.flags & PreferenceFlags::eAllowOTA);
+-    m_ota->checkForOTA(m_api, requestOptionalUpdates);
+-#endif
++    // Zenith build: no OTA. The update check (readServerManifest + checkForOTA, which starts the
++    // NGX updater nvngx_update.exe) is removed whatever the preference flags say.
+ 
+     //! Now let's enumerate SL plugins!
+     //!
+@@ -989,7 +982,7 @@ Result PluginManager::loadPlugins()
+         }
+     }
+ 
+-#if defined(SL_PRODUCTION) || defined(SL_UNITTEST_ONLY_CODE)
++#if 0 // Zenith build: never load downloaded (OTA) plugins, whatever the flags or the driver's OTA override key.
+     // Only load plugins from OTA on production builds.
+     bool loadDownloadedPlugins = (m_pref.flags & PreferenceFlags::eLoadDownloadedPlugins);
+     bool otaOverride = m_ota->isOTAOverrideEnabled();
+@@ -1048,7 +1041,7 @@ Result PluginManager::loadPlugins()
+         SL_LOG_INFO("eLoadDownloadedPlugins flag not passed to preferences, OTA'd plugins will not be loaded!");
+     }
+ #else
+-    SL_LOG_INFO("SL_PRODUCTION not defined at build-time, OTA'd plugins will not be loaded!");
++    SL_LOG_INFO("Zenith build: OTA'd plugins are never loaded");
+ #endif
+ 
+     if (pluginList.empty())
+diff --git a/source/plugins/sl.common/commonEntry.cpp b/source/plugins/sl.common/commonEntry.cpp
+index 5144232..7cc4f6f 100644
+--- a/source/plugins/sl.common/commonEntry.cpp
++++ b/source/plugins/sl.common/commonEntry.cpp
+@@ -819,40 +819,8 @@ bool releaseNGXFeature(NVSDK_NGX_Handle* handle, const char* id)
+ 
+ void updateNGXFeature(NVSDK_NGX_Feature feature)
+ {
+-    auto& ctx = (*common::getContext());
+-
+-    PreferenceFlags preferenceFlags{};
+-    api::getContext()->parameters->get(sl::param::global::kPreferenceFlags, (uint64_t*)&preferenceFlags);
+-    if (preferenceFlags & PreferenceFlags::eAllowOTA)
+-    {
+-        //! Plugin manager gives us the device type and the application id
+-        json& config = *(json*)api::getContext()->loaderConfig;
+-        int appId = config.at("appId");
+-        EngineType engineType{};
+-        std::string engineVersion{};
+-        std::string projectId{};
+-        if (config.contains("ngx"))
+-        {
+-            engineType = config.at("ngx").at("engineType");
+-            engineVersion = config.at("ngx").at("engineVersion");
+-            projectId = config.at("ngx").at("projectId");
+-        }
+-
+-        NVSDK_NGX_Application_Identifier applicationId;
+-        if (projectId.empty() && engineVersion.empty())
+-        {
+-            applicationId.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
+-            applicationId.v.ApplicationId = appId;
+-        }
+-        else
+-        {
+-            applicationId.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
+-            applicationId.v.ProjectDesc.EngineType = (NVSDK_NGX_EngineType)engineType;
+-            applicationId.v.ProjectDesc.EngineVersion = engineVersion.c_str();
+-            applicationId.v.ProjectDesc.ProjectId = projectId.c_str();
+-        }
+-        CHECK_NGX(NVSDK_NGX_UpdateFeature(&applicationId, feature));
+-    }
++    // Zenith build: NGX's per-feature update (NVSDK_NGX_UpdateFeature) is never called, whatever eAllowOTA says.
++    (void)feature;
+ }
+ 
+ bool getNGXFeatureRequirements(NVSDK_NGX_Feature feature, common::PluginInfo& pluginInfo)

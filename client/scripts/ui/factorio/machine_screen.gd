@@ -33,12 +33,15 @@ const LogicWindows := preload("res://scripts/ui/factorio/logic_windows.gd")
 const CircuitWindow := preload("res://scripts/ui/factorio/circuit_window.gd")
 const SmoothBar := preload("res://scripts/ui/factorio/smooth_bar.gd")
 const LogicKit := preload("res://scripts/ui/factorio/logic_kit.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## Shown or hidden (the window lays itself out around it).
 signal opened_changed(open: bool)
 ## A slot of the machine was clicked. `index` is 1-based, or 0 without slot data (then `item` and
 ## `count` are the total of that item in `role`).
 signal slot_clicked(role: String, index: int, item: String, count: int, button_index: int, shift: bool, ctrl: bool)
+signal slots_updated
+signal open_network_requested(id: int)
 
 const ROLE_TITLES := {
 	"chest": "Contents", "input": "Ingredients", "output": "Products", "fuel": "Fuel",
@@ -117,6 +120,9 @@ var _last_msec := 0
 var _last: Dictionary = {}
 ## Setting the chest's limit: the next slot click moves the bar there.
 var _setting_bar := false
+## Hovered 1-based slot index while _setting_bar is true (0 when not hovering a slot).
+var _bar_hover := 0
+var _bar_slots: Array[Slot] = []
 ## The circuit and logistic connection windows docked on the right (circuit_window.gd).
 var circuit_dock = CircuitWindow.new()
 
@@ -202,7 +208,10 @@ func request(target_unit: int, cmd: Dictionary) -> void:
 	_pick_group = ""
 	_picking = false
 	_setting_bar = false
+	_bar_hover = 0
+	_bar_slots.clear()
 	set_meta("chooser_search", "")
+	set_meta("storage_filter_q", "normal")
 	_last = {}
 	_set_open(false)
 	Bridge.send(cmd)
@@ -316,8 +325,13 @@ func module_requests() -> Array:
 	return out
 
 
-## The machine's inventories come slot by slot (`gui.slots`).
+## The machine's inventories come slot by slot (`gui.slots`), plus virtual slots for an inserter's
+## hand and a transport belt's lanes.
 func knows_slots(role: String) -> bool:
+	if role == "hand":
+		return _last.get("ins") is Dictionary
+	if role == "belt_1" or role == "belt_2":
+		return _last.get("bl") is Array
 	var slots = _last.get("slots")
 	return slots is Dictionary and slots.get(role) is Array
 
@@ -362,6 +376,8 @@ func handle(msg: Dictionary) -> void:
 	var kind := str(msg.get("kind", "other"))
 	var proto: ProtoDB.EntityProto = protos.entity(int(msg.get("p", 0))) if protos != null else null
 	_title.text = Kit.entity_name(proto.name) if proto != null else "Machine"
+	if int(msg.get("gh", 0)) == 1:
+		_title.text = "Ghost: %s" % _title.text
 	if choosing_recipe():
 		_title.text = "Select a recipe for assembling"
 	_title.set_meta("proto", proto.name if proto != null else "")
@@ -393,6 +409,8 @@ func handle(msg: Dictionary) -> void:
 	if alone != _was_alone:
 		_was_alone = alone
 		opened_changed.emit(true)
+	if msg.has("slots") and msg["slots"] is Dictionary:
+		slots_updated.emit()
 
 
 ## The train window's camera keeps above the train as it moves (entity_panels.gd's _train_camera).
@@ -489,6 +507,9 @@ func _set_open(open: bool) -> void:
 		visible = open
 		opened_changed.emit(open)
 	if not open:
+		_setting_bar = false
+		_bar_hover = 0
+		_bar_slots.clear()
 		circuit_dock.refresh({}, "")
 		# The train window's "Change train group" popup hangs off the screen itself, not its body:
 		# left behind, it showed over the next screen and moved that one's train.
@@ -546,6 +567,7 @@ func _keep_scrolls(scrolls: Array, kept: Array) -> void:
 
 
 func _build_screen(kind: String, recipe: String, inv: Dictionary) -> void:
+	_bar_slots.clear()
 	for child in _body.get_children():
 		_body.remove_child(child)
 		if child != _preview:  # the preview's 3D view is kept across rebuilds of the same entity
@@ -612,7 +634,9 @@ func _build_screen(kind: String, recipe: String, inv: Dictionary) -> void:
 			_body.add_child(ProductionPanels.chest_grid(self, "chest", _bar_button() if _last.has("bar") else null, SCROLL_ROWS))
 			var col := _column()
 			var hub_sec: Array = (_last["hub"].get("sec") as Array).duplicate(true) if _last.get("hub") is Dictionary and _last["hub"].get("sec") is Array else []
-			col.add_child(SpacePanels.sections(self, hub_sec, (_last["hub"].get("dest", []) as Array) if _last.get("hub") is Dictionary else [], true))
+			var hub_lc: Dictionary = _last.get("lc") if _last.get("lc") is Dictionary else {}
+			var hub_ctx := SpacePanels.build_status_context(_slot_list("chest"), Wire.array(hub_lc.get("del")), Wire.array(hub_lc.get("pick")))
+			col.add_child(SpacePanels.sections(self, hub_sec, (_last["hub"].get("dest", []) as Array) if _last.get("hub") is Dictionary else [], true, hub_ctx))
 			if knows_slots("trash"):
 				col.add_child(ProductionPanels.trash_slots(self))
 			if _last.get("hub") is Dictionary:
@@ -654,15 +678,39 @@ func _build_chest(_inv: Dictionary) -> void:
 	var mode := str(lg.get("mode", ""))
 	if mode == "storage":
 		_body.add_child(ProductionPanels.line())
-		var set_filter := func(_t: String, item: String) -> void: Bridge.send({"t": "set_storage_filter", "u": unit, "item": item})
-		var choose := func() -> Control: return EntityPanels.choose_slot(self, str(lg.get("filter", "")), ["item"], set_filter, "Anything")
-		_body.add_child(ProductionPanels.storage_filter(self, lg, choose))
+		var cur_item := str(lg.get("filter", ""))
+		var raw_q := str(lg.get("filter_q", ""))
+		var cur_q := raw_q if raw_q != "" else (str(get_meta("storage_filter_q", "normal")) if cur_item == "" else "normal")
+		var set_filter := func(_t: String, item: String) -> void:
+			var cmd := {"t": "set_storage_filter", "u": unit, "item": item}
+			if item != "" and cur_q != "" and cur_q != "normal":
+				cmd["q"] = cur_q
+			Bridge.send(cmd)
+		var choose := func() -> Control:
+			var s := EntityPanels.choose_slot(self, cur_item, ["item"], set_filter, "Anything")
+			if cur_item != "" and raw_q != "" and raw_q != "normal":
+				s.set_extra({"quality": raw_q})
+				s.set_tip(Kit.pretty(cur_item), Slot.extra_lines({"quality": raw_q}) + [["Click: choose · Right click: clear", "", Kit.DISABLED_TEXT]])
+			return s
+		var quals := SpacePanels._unlocked_qualities(self)
+		var q_row: Control = null
+		if quals.size() > 1:
+			var on_q := func(q: String) -> void:
+				set_meta("storage_filter_q", q)
+				if cur_item != "":
+					Bridge.send({"t": "set_storage_filter", "u": unit, "item": cur_item, "q": q})
+				else:
+					_rebuild_now()
+			q_row = SpacePanels.quality_row(quals, cur_q, on_q)
+		_body.add_child(ProductionPanels.storage_filter(self, lg, choose, q_row))
 	elif mode == "requester" or mode == "buffer":
 		_body.add_child(ProductionPanels.line())
 		var lc = _last.get("lc")
 		var secs: Control
 		if lc is Dictionary:
-			secs = SpacePanels.sections(self, (lc.get("sec") as Array).duplicate(true) if lc.get("sec") is Array else [], [], false)
+			var lc_dict: Dictionary = lc
+			var status_ctx := SpacePanels.build_status_context(_slot_list("chest"), Wire.array(lc_dict.get("del")), Wire.array(lc_dict.get("pick")))
+			secs = SpacePanels.sections(self, (lc_dict.get("sec") as Array).duplicate(true) if lc_dict.get("sec") is Array else [], [], false, status_ctx)
 			# The sections' own heading is the chest's "Logistic requests" here.
 			var heading := secs.get_child(0)
 			secs.remove_child(heading)
@@ -672,8 +720,11 @@ func _build_chest(_inv: Dictionary) -> void:
 			var set_requests := func(l: Array) -> void: Bridge.send({"t": "set_requests", "u": unit, "l": l})
 			secs = EntityPanels.request_grid(self, list, set_requests)
 		_body.add_child(ProductionPanels.chest_requests(self, lg, lc if lc is Dictionary else {}, secs))
-		if knows_slots("trash") or (_last.get("inv", {}) as Dictionary).has("trash"):
+		if int(_last.get("gh", 0)) != 1 and (knows_slots("trash") or (_last.get("inv", {}) as Dictionary).has("trash")):
 			_body.add_child(ProductionPanels.trash_slots(self))
+	elif mode == "passive-provider" or mode == "active-provider":
+		_body.add_child(ProductionPanels.line())
+		_body.add_child(ProductionPanels.network_heading("Logistic network", lg.get("net") is Dictionary))
 
 
 ## Another column of the window, right of the first (a shallow frame like it), for the silo's,
@@ -713,7 +764,7 @@ func _scrolled(labelled: Control) -> Control:
 func _add_panels(kind: String) -> void:
 	if _last.get("eff") is Dictionary:
 		_body.add_child(SpacePanels.effects(_last["eff"]))
-	if _last.get("lg") is Dictionary and kind != "container":
+	if _last.get("lg") is Dictionary and kind != "container" and kind != "roboport" and kind != "vehicle":
 		_body.add_child(EntityPanels.logistics(self, _last["lg"]))
 
 
@@ -726,8 +777,8 @@ func _requests_column(col: VBoxContainer, heading: String) -> void:
 		secs = (lc["sec"] as Array).duplicate(true)
 	elif _last.get("pad") is Dictionary and _last["pad"].get("sec") is Array:
 		secs = (_last["pad"]["sec"] as Array).duplicate(true)
-	if heading != "":
-		col.add_child(Kit.label(heading, "FHeading"))
+	var in_net := int(lc.get("in_net", 0)) == 1 or (_last.get("lg") is Dictionary and (_last["lg"] as Dictionary).get("net") is Dictionary)
+	col.add_child(ProductionPanels.network_heading(heading if heading != "" else "Logistic requests", in_net))
 	var tu := func(on: bool) -> void: Bridge.send({"t": "set_chest_logistics", "u": unit, "tu": 1 if on else 0})
 	var head := HBoxContainer.new()
 	var box := MenuKit.checkbox("Trash unrequested", int(lc.get("tu", 0)) == 1)
@@ -735,7 +786,9 @@ func _requests_column(col: VBoxContainer, heading: String) -> void:
 	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	head.add_child(box)
 	col.add_child(head)
-	var sections := SpacePanels.sections(self, secs, [], false)
+	var inv_role := "rocket" if str(_last.get("kind", "")) == "silo" else "chest"
+	var status_ctx := SpacePanels.build_status_context(_slot_list(inv_role), Wire.array(lc.get("del")), Wire.array(lc.get("pick")))
+	var sections := SpacePanels.sections(self, secs, [], false, status_ctx)
 	var title := sections.get_child(0)  # its own "Requests" heading: the column has its header
 	sections.remove_child(title)
 	title.queue_free()
@@ -759,15 +812,82 @@ func _bar_button() -> Slot:
 		["Click, then click a slot: machines use only the slots before it", "", Kit.DISABLED_TEXT],
 		["Right click: no limit", "", Kit.DISABLED_TEXT]])
 	var on_click := func(button_index: int, _shift: bool) -> void:
+		var cur_size := _slot_list(_bar_role()).size()
+		var cur_bar := int(_last.get("bar", cur_size))
 		if button_index == MOUSE_BUTTON_RIGHT:
 			_setting_bar = false
+			_bar_hover = 0
 			if model != null:
-				model.set_bar(unit, _slot_list(_bar_role()).size())
+				model.set_bar(unit, cur_size)
+			_last["bar"] = cur_size
+			_rebuild_now()
 		elif button_index == MOUSE_BUTTON_LEFT:
-			_setting_bar = not _setting_bar
-		_rebuild_now()
+			if _setting_bar:
+				_setting_bar = false
+				_bar_hover = 0
+				if cur_bar < cur_size:
+					if model != null:
+						model.set_bar(unit, cur_size)
+					_last["bar"] = cur_size
+			else:
+				if cur_bar < cur_size:
+					if model != null:
+						model.set_bar(unit, cur_size)
+					_last["bar"] = cur_size
+				_setting_bar = true
+				_bar_hover = 0
+			_rebuild_now()
 	b.clicked.connect(on_click)
+	b.mouse_entered.connect(func() -> void: set_bar_hover(0))
+	b.mouse_exited.connect(func() -> void: set_bar_hover(0))
 	return b
+
+
+## Cancels chest limit-bar selection without changing the limit.
+func cancel_bar_setting() -> bool:
+	if not _setting_bar:
+		return false
+	_setting_bar = false
+	_bar_hover = 0
+	_refresh_bar_preview()
+	_rebuild_now()
+	return true
+
+
+## Updates the live red-slot preview while setting the chest limit bar.
+func set_bar_hover(index: int) -> void:
+	var next := index if _setting_bar else 0
+	if _bar_hover == next:
+		return
+	_bar_hover = next
+	_refresh_bar_preview()
+
+
+func _refresh_bar_preview() -> void:
+	var size := _slot_list(_bar_role()).size()
+	var bar := int(_last.get("bar", size))
+	var preview := _setting_bar and _bar_hover > 0
+	for s in _bar_slots:
+		if not is_instance_valid(s):
+			continue
+		var want: bool = (s.slot_index >= _bar_hover) if preview else (_last.has("bar") and s.slot_index > bar)
+		if s.blocked != want:
+			s.blocked = want
+			s.queue_redraw()
+
+
+func _gui_input(event: InputEvent) -> void:
+	var mb := event as InputEventMouseButton
+	if _setting_bar and mb != null and mb.pressed and mb.button_index == MOUSE_BUTTON_RIGHT:
+		cancel_bar_setting()
+		accept_event()
+
+
+func _unhandled_key_input(event: InputEvent) -> void:
+	var key := event as InputEventKey
+	if visible and _setting_bar and key != null and key.pressed and key.physical_keycode == KEY_ESCAPE:
+		cancel_bar_setting()
+		get_viewport().set_input_as_handled()
 
 
 ## The inventory with the limit bar: a chest's, or a cargo wagon's.
@@ -878,6 +998,30 @@ func _labelled_grid(title: String, role: String, inv: Dictionary, columns: int) 
 
 ## The slots of one inventory: [{"item", "count"} or {}] from `gui.slots`, or the totals from `inv`.
 func _slot_list(role: String) -> Array:
+	if role == "hand":
+		var ins = _last.get("ins")
+		if ins is Dictionary:
+			var h = ins.get("h")
+			if h is Array and h.size() >= 2 and str(h[0]) != "" and int(h[1]) > 0:
+				return [{"item": str(h[0]), "count": int(h[1])}]
+		return [{}]
+	if role == "belt_1" or role == "belt_2":
+		var bl = _last.get("bl")
+		var lane_idx := 0 if role == "belt_1" else 1
+		var lane_out: Array = []
+		if bl is Array and lane_idx < (bl as Array).size() and (bl as Array)[lane_idx] is Array:
+			for entry in (bl as Array)[lane_idx]:
+				if entry is Dictionary and str(entry.get("name", "")) != "" and int(entry.get("count", 0)) > 0:
+					var d := {"item": str(entry["name"]), "count": int(entry["count"])}
+					if entry.has("quality"):
+						d["quality"] = str(entry["quality"])
+					lane_out.append(d)
+				elif entry is Array and (entry as Array).size() >= 2 and str(entry[0]) != "" and int(entry[1]) > 0:
+					var d := {"item": str(entry[0]), "count": int(entry[1])}
+					if (entry as Array).size() >= 3:
+						d["quality"] = str(entry[2])
+					lane_out.append(d)
+		return lane_out
 	var out: Array = []
 	if knows_slots(role):
 		for entry in _last["slots"][role]:
@@ -921,13 +1065,38 @@ func _grid_frame(role: String, _inv: Dictionary, columns: int) -> Control:
 	return frame
 
 
+## The open cargo wagon's filter on slot `index` ("" none): `wfl` is [[slot, item], ...].
+func wagon_filter(index: int) -> String:
+	var list = _last.get("wfl")
+	if list is Array:
+		for f in list:
+			if f is Array and f.size() >= 2 and int(f[0]) == index:
+				return str(f[1])
+	return ""
+
+
 func _stack_slot(role: String, index: int, stack: Dictionary) -> Slot:
 	var s := Slot.new()
 	s.slot_role = role if index > 0 else ""
 	s.slot_index = index
 	s.set_extra(stack)
-	if role == _bar_role() and _last.has("bar") and index > int(_last["bar"]):
-		s.blocked = true
+	var bar_slot := role == _bar_role() and index > 0 and _last.has("bar")
+	if bar_slot:
+		if _setting_bar and _bar_hover > 0:
+			s.blocked = index >= _bar_hover
+		elif index > int(_last["bar"]):
+			s.blocked = true
+		_bar_slots.append(s)
+		var on_enter := func() -> void:
+			if _setting_bar:
+				set_bar_hover(index)
+		var on_exit := func() -> void:
+			if _setting_bar and _bar_hover == index:
+				set_bar_hover(0)
+		s.mouse_entered.connect(on_enter)
+		s.mouse_exited.connect(on_exit)
+	if role == "cargo" and index > 0:
+		s.filter_item = wagon_filter(index)
 	if stack.is_empty():
 		if role == "fuel":
 			s.empty_icon = GuiAssets.core_sprite("icons/mip/empty-fuel-slot.png")
@@ -942,8 +1111,13 @@ func _stack_slot(role: String, index: int, stack: Dictionary) -> Slot:
 			["Click: pick up · Right click: half", "", Kit.DISABLED_TEXT],
 			["Shift click: into your inventory", "", Kit.DISABLED_TEXT]])
 	var on_click := func(button_index: int, shift: bool) -> void:
-		if _setting_bar and role == _bar_role() and index > 0 and button_index == MOUSE_BUTTON_LEFT:
+		if _setting_bar and button_index == MOUSE_BUTTON_RIGHT:
+			cancel_bar_setting()
+			return
+		if bar_slot and _setting_bar and button_index == MOUSE_BUTTON_LEFT:
 			_setting_bar = false
+			_bar_hover = 0
+			_last["bar"] = index - 1
 			if model != null:
 				model.set_bar(unit, index - 1)
 			_rebuild_now()

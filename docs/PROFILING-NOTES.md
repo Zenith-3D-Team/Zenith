@@ -27,8 +27,11 @@ freed nodes after the scripts), **draw** (the renderer's frame on the main threa
 `RenderingServer.frame_pre_draw` to `frame_post_draw`; `-` headless, where nothing is drawn and the
 frees fall into the rest) and **rest** (presenting, input, physics, the next frame's start), then the
 5 slowest scripts (`top`), world.gd's and the probes' parts over 1 ms (`parts`: `x_optimistic` chunks
-filled from the disk cache, `dh_palette` Distant Horizon's colour table, `gi_model_load` item models and
-the rest of world.gd's timers), the frame's counts (`counts`: `new_chunk` chunks built, `hydrated`
+filled from the disk cache, `dh_palette` Distant Horizon's colour table, `gi_model_load` item models,
+main.gd's `main_sky`, `main_planet`, `main_pollution`, `main_godrays`, `main_dh` and `main_status`, the
+bridge's `br_route` (datagrams queued), `br_fast` (the unbudgeted drains), `br_drain` (the budgeted loop,
+handlers included) and `br_coalesce`, `_add_fields`' `add_rec`, `add_pick` and `add_joins`, and the
+rest of world.gd's timers), the frame's counts (`counts`: `new_chunk` chunks built, `hydrated`
 filled from the disk cache, `dh_palette` palette refreshes, `item_models` read, `far_merges`, `nodes`
 made or freed) and the slowest message handled. `Addons` in `top` is the whole add-on host (its own
 `_process` and every add-on's node under it); `addons <id> <ms>, ...` after it names the three slowest
@@ -39,6 +42,20 @@ its `_physics_process` in `rest`). While it runs it turns the client's own timer
 (peak y)` is now the scripts' own slowest frame of the last second by the same marks; `Main thread peak`
 beside it is Godot's process monitor, the main thread's whole frame (scripts, deferred calls and, with
 `thread_model=1`, the renderer's draw), which the overlay used to show as the scripts' peak.
+
+**The spike log's render part** (perf-w3-render, R3; `--spike-render=off` leaves the line as before): each slow
+line ends `| render draws V/S, viewport C/G, stages shadows c/g, pre-pass c/g, opaque c/g, motion c/g,
+transparent c/g, post c/g, rest c/g`: the view's and shadow passes' draw calls, the viewport's measured render
+CPU/GPU ms (measuring is on while the log runs), and, when Godot was started with the engine's `--gpu-profile`
+(before `--`; it also prints Godot's own GPU profile to the console every second), the renderer's stages in CPU/GPU
+ms, from the RenderingDevice's captured timestamps (Godot's RENDER_TIMESTAMP marks, as its visual profiler; the last
+frame the GPU finished, a frame or two behind the slow one): `rest` is setup, sky, GI, SSAO/SSIL/SSR, the 2D canvas.
+(Godot 4.7's `RenderingServer.get_frame_profile()` and `set_frame_profiling_enabled` are not exposed to scripts,
+so `--gpu-profile` is the only way to turn the marks on from outside the editor.) With "Render on a separate thread"
+(thread model 2) the renderer's numbers are read on the render thread (`render_stats.gd`), the line has no **draw**
+bucket (the draw is only queued on the main thread; `frame_post_draw` comes a frame later) and the bucket after
+the deferred calls is **wait for renderer**: up to `frame_pre_draw`, the main thread waiting at
+`RenderingServer.sync()` for the render thread's last frame. The log's second line (`# render: ...`) says which.
 
 
 `-- --stutter-probe=<out.json>[@route]` (client/scripts/debug/stutter_probe.gd) records every
@@ -1500,7 +1517,7 @@ behind a switch that puts back what was there before, for comparing:
 - `--decor-nodes=<n>`: at most about n new decorative MultiMeshes put in a frame, a whole chunk at a time, the first chunk of a frame always (default 96; `0` no cap, only the time slice, as before).
 - `--alt-marks-sliced=off`: Alt-mode's arrows (`alt_arrows.gd`) and quality marks (`quality_marks.gd`) work out every changed chunk in the frame Alt-mode comes on, as before (58 + 38 ms in one frame on the owner's base). On (default): 2 ms (arrows, nearest chunks first) and 1.5 ms (quality marks) a frame while Alt-mode is on, and 0.3 ms a frame each while it is off, so turning it on finds them ready; arrows of far chunks may come a few frames late.
 - `--ground-walk=old`: when the hills' range grows (a new field from Terrain Elevation), the whole scene tree searched and every drawn node given room in that frame, as before (39 ms in one frame on the owner's base, and a long draw after it). On (default): the nodes known since the hills came (found once, then each one added) walked 3 ms a frame; nodes not reached yet may be culled at the screen's edge for a few frames.
-- `--render-reads=old` (and the setting Graphics > "Render on a separate thread", on by default, off = the main thread draws as before; needs a restart): with the separate render thread every read from the RenderingServer waits for it (15 -> 76 ms frames). By default item models keep their surfaces' arrays and pictures on the CPU (`f3d_arrays`, `f3d_cpu_image`: no `surface_get_arrays`, `ArrayMesh.duplicate()` or `get_image()` readbacks), icons keep their picture for Alt-mode's icons on the card, a LOD switch with no CPU copy switches without the cross-fade instead of reading `MultiMesh.buffer` back, and the debug overlay, debug menu and Settings' Recommend read the renderer's numbers on the render thread (`render_stats.gd`, a frame or two old); quitting waits for belt stand-in and cliff-wall workers and one drawn frame, and `exit_guard.gd` ends a quit stuck past 8 s. `--render-reads=old` reads the renderer directly again, as before.
+- `--render-reads=old` (and the setting Graphics > "Render on a separate thread", on by default, off = the main thread draws as before; needs a restart): with the separate render thread every read from the RenderingServer waits for it (15 -> 76 ms frames). By default item models keep their surfaces' arrays and pictures on the CPU (`f3d_arrays`, `f3d_cpu_image`: no `surface_get_arrays`, `ArrayMesh.duplicate()` or `get_image()` readbacks), icons keep their picture for Alt-mode's icons on the card, a LOD switch with no CPU copy switches without the cross-fade instead of reading `MultiMesh.buffer` back, and the debug overlay, debug menu and Settings' Recommend read the renderer's numbers on the render thread (`render_stats.gd`, a frame or two old); quitting waits for belt stand-in and cliff-wall workers and one drawn frame, and `exit_guard.gd` ends a quit stuck past 8 s. Also (perf-w3-render, R1) a LOD cross-fade copies the paint its apply gave (`LodState.paint`) instead of `get_instance_shader_parameter`, an open 3D preview sets each piece's seed point only when it moved (a meta, not a renderer read every frame), and ghosts' baked parts, wheel radii, the preview's rest boxes, pipe covers, decoratives' triangle counts and sprite stand-ins' icon cards read the CPU copies (`render_reads.gd`; an ArrayMesh's own index count); only a pack's res:// pictures at load stay renderer reads. `tools/render_sync_check.py` checks it: `--static` (fast suite) fails on a new direct read in those scripts, `--run` (godot suite) runs the client headless on the editor build with `--render-thread separate` (Alt-mode, a belt in hand, a machine's 3D preview, the probe's short walk) and fails on Godot's "causing RenderingServer synchronizations" warning (per-frame reads only). `--render-reads=old` reads the renderer directly again, as before.
 - `--item-models-later=off`: an item model (items on belts, the ground, in hands) is read on the main thread the first time it is asked for, as before. On (default): a pack's `.glb`/`.gltf` item model not read yet is read on a worker thread (GLTFDocument, as buildings' models are; not ResourceLoader's threaded loads, which once deadlocked at start), a new item kind shows once the read is in, usually a frame or a few later (item_cards.gd already held a kind back so while its icon was read; the icon card is not shown in between); Zenith's own imported `res://` scenes are still read on the main thread; `mesh_for` never waits for a worker (it reads at once and drops the worker's result).
 - `--icons-later=off`: the entity info panel (the hover panel) reads an icon that isn't cached yet at once,
   on the main thread, as before. On (`Kit.icon_into`): read on a worker thread and filled in a frame or

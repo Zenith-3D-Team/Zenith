@@ -49,13 +49,57 @@ local CIRCUIT_SET = {
   ["lane-splitter"] = true, ["mining-drill"] = true, ["logistic-container"] = true,
 }
 
+-- Module-local pcall/sort helpers so hot loops allocate zero closures.
+local function get_name_field(obj) return obj.name end
+local function get_filter_slot_count(e) return e.filter_slot_count end
+local function get_filter_at(e, i) return e.get_filter(i) end
+local function get_logistic_sections(e) return e.get_logistic_sections() end
+local function get_sections(point) return point.sections end
+local function get_section_active(section) return section.active end
+local function get_recipe(e) return e.get_recipe() end
+local function get_previous_recipe(e) return e.previous_recipe end
+local function get_force_recipe(e, name) return e.force.recipes[name] end
+local function get_splitter_filter(e) return e.splitter_filter end
+local function get_first_filter(e) return e.filter_slot_count > 0 and e.get_filter(1) end
+local function get_fluids_count(e) return e.fluids_count end
+local function get_fluid_filter(e, i) return e.get_fluid_filter(i) end
+local function get_fluid_at(e, i) return e.get_fluid(i) end
+local function get_fluid_box_conns(e, i) return e.get_fluid_box_pipe_connections(i) end
+local function get_ghost_prototype(e) return e.ghost_prototype end
+local function get_prototype(e) return e.prototype end
+local function get_mining_drill_radius(proto) return proto.mining_drill_radius end
+local function get_resource_categories(proto) return proto.resource_categories end
+local function get_fluidbox_prototypes(proto) return proto.fluidbox_prototypes end
+local function get_production_type(box) return box.production_type end
+local function get_pipe_connections(box) return box.pipe_connections end
+local function get_required_fluid(proto) return proto.mineable_properties.required_fluid end
+local function get_resource_category(proto) return proto.resource_category end
+local function find_resources(surface, area) return surface.find_entities_filtered({ area = area, type = "resource" }) end
+local function get_define_inv(name) return defines.inventory[name] end
+local function get_selection_box(proto) return proto.selection_box end
+local function get_icon_draw_spec(proto) return proto.icon_draw_specification end
+local function get_icons_pos(proto) return proto.icons_positioning end
+local function get_module_inv_size(proto) return proto.module_inventory_size end
+local function get_entity_inv(e, inv_id) return e.get_inventory(inv_id) end
+local function get_module_inv(e) return e.get_module_inventory() end
+local function inv_is_empty(inv) return inv.is_empty() end
+local function get_inv_contents(inv) return inv.get_contents() end
+
+local sort_counts
+local function cmp_top_names(a, b)
+  if sort_counts[a] ~= sort_counts[b] then
+    return sort_counts[a] > sort_counts[b]
+  end
+  return a < b
+end
+
 local function signal_name(f)
   if type(f) ~= "table" then
     return nil
   end
   local name = f.name
   if type(name) ~= "string" and name ~= nil then -- a prototype (LuaObjects aren't tables)
-    local ok, n = pcall(function() return name.name end)
+    local ok, n = pcall(get_name_field, name)
     name = ok and n or nil
   end
   return type(name) == "string" and name or nil
@@ -64,9 +108,9 @@ end
 -- Every filter set on the entity, in slot order: Alt-mode shows them all, shrunk to fit.
 local function filter_names(e)
   local names = {}
-  local ok, n = pcall(function() return e.filter_slot_count end)
+  local ok, n = pcall(get_filter_slot_count, e)
   for i = 1, ok and n or 0 do
-    local ok_f, f = pcall(function() return e.get_filter(i) end)
+    local ok_f, f = pcall(get_filter_at, e, i)
     local name = ok_f and signal_name(f)
     if name then
       names[#names + 1] = name
@@ -81,13 +125,13 @@ end
 local function requested_names(e, n)
   local names, seen = {}, {}
   -- A chest's LuaLogisticSections (logistics.lua reads chests the same way).
-  local ok, point = pcall(function() return e.get_logistic_sections() end)
+  local ok, point = pcall(get_logistic_sections, e)
   if not (ok and point) then
     return names
   end
-  local ok2, sections = pcall(function() return point.sections end)
+  local ok2, sections = pcall(get_sections, point)
   for _, section in pairs(ok2 and sections or {}) do
-    local ok3, active = pcall(function() return section.active end)
+    local ok3, active = pcall(get_section_active, section)
     if not ok3 or active ~= false then
       for _, f in pairs(section.filters or {}) do
         local v = f.value
@@ -105,32 +149,45 @@ local function requested_names(e, n)
   return names
 end
 
+local function entity_type(e)
+  return e.type == "entity-ghost" and e.ghost_type or e.type
+end
+
+local function entity_proto(e)
+  if e.type == "entity-ghost" then
+    local ok, p = pcall(get_ghost_prototype, e)
+    return ok and p or nil
+  end
+  local ok, p = pcall(get_prototype, e)
+  return ok and p or nil
+end
+
 -- The recipe a crafting machine shows: its own, or for a furnace with none (it picks its recipe from
 -- what is put in, and drops it whenever the input runs out between crafts) the last one it made.
 -- Factorio's Alt-mode keeps that icon until the furnace takes another recipe (owner's J2; its
 -- changelog: "Fixed that furnace alt-mode didn't show the last recipe, same as map view "Recipe
 -- Icons" option"). 2.x: previous_recipe is {name, quality}, each a prototype or its name.
 local function shown_recipe(e)
-  local ok, recipe = pcall(function() return e.get_recipe() end)
+  local ok, recipe = pcall(get_recipe, e)
   if ok and recipe then
     return recipe
   end
   if e.type ~= "furnace" then
     return nil
   end
-  local ok_p, prev = pcall(function() return e.previous_recipe end)
+  local ok_p, prev = pcall(get_previous_recipe, e)
   if not (ok_p and type(prev) == "table") then
     return nil
   end
   local name = prev.name
   if type(name) ~= "string" then
-    local ok_n, n = pcall(function() return name.name end)
+    local ok_n, n = pcall(get_name_field, name)
     name = ok_n and n or nil
   end
   if type(name) ~= "string" then
     return nil
   end
-  local ok_r, r = pcall(function() return e.force.recipes[name] end)
+  local ok_r, r = pcall(get_force_recipe, e, name)
   return ok_r and r or nil
 end
 M.shown_recipe = shown_recipe
@@ -138,7 +195,7 @@ M.shown_recipe = shown_recipe
 -- [icon type, name, more?] for an entity's Alt-mode icon (more: the other filters' item names),
 -- or nil.
 function M.icon(e)
-  local t = e.type
+  local t = entity_type(e)
   if t == "assembling-machine" or t == "furnace" or t == "rocket-silo" then
     local recipe = shown_recipe(e)
     if recipe then
@@ -151,19 +208,39 @@ function M.icon(e)
       return { "item", first, #names > 0 and names or nil }
     end
   elseif t == "splitter" or t == "lane-splitter" then
-    local ok, f = pcall(function() return e.splitter_filter end)
+    local ok, f = pcall(get_splitter_filter, e)
     local name = ok and signal_name(f)
     if name then
       return { "item", name }
     end
   elseif t == "logistic-container" or t == "mining-drill" then
-    local ok, f = pcall(function() return e.filter_slot_count > 0 and e.get_filter(1) end)
+    local ok, f = pcall(get_first_filter, e)
     local name = ok and signal_name(f)
     if name then
       return { "item", name }
     end
     if t == "logistic-container" then
       local names = requested_names(e, 4)
+      if #names > 0 then
+        local first = table.remove(names, 1)
+        return { "item", first, #names > 0 and names or nil }
+      end
+    end
+  end
+  if e.type == "entity-ghost" then
+    local ok, reqs = pcall(function() return e.item_requests end)
+    if ok and type(reqs) == "table" then
+      local names, seen = {}, {}
+      for k, v in pairs(reqs) do
+        local name = type(k) == "string" and k or (type(v) == "table" and v.name)
+        if type(name) == "string" and not seen[name] then
+          seen[name] = true
+          names[#names + 1] = name
+          if #names >= 4 then
+            break
+          end
+        end
+      end
       if #names > 0 then
         local first = table.remove(names, 1)
         return { "item", first, #names > 0 and names or nil }
@@ -182,13 +259,84 @@ end
 local CRAFTERS = { ["assembling-machine"] = true, furnace = true }
 M.CRAFTERS = CRAFTERS
 
+-- Whether a mining drill prototype has a fluid input (electric mining drill yes; pumpjack output-only and
+-- burner drill none).
+local function drill_has_fluid_input(proto)
+  if not proto then
+    return false
+  end
+  local okb, boxes = pcall(get_fluidbox_prototypes, proto)
+  if not (okb and type(boxes) == "table") then
+    return false
+  end
+  for _, box in pairs(boxes) do
+    local okp, ptype = pcall(get_production_type, box)
+    if not (okp and ptype == "output") then
+      local okc, conns = pcall(get_pipe_connections, box)
+      if okc and type(conns) == "table" and next(conns) ~= nil then
+        for _, conn in pairs(conns) do
+          if conn.flow_direction ~= "output" then
+            return true
+          end
+        end
+      else
+        return true
+      end
+    end
+  end
+  return false
+end
+
+-- A ghost mining drill has no live fluidbox (`fluids_count` 0), so detect whether its mining area holds a
+-- resource requiring fluid (uranium ore's sulfuric acid), matching building.lua's refusal rule.
+local function ghost_drill_fluid(e)
+  local proto = entity_proto(e)
+  if not drill_has_fluid_input(proto) then
+    return nil
+  end
+  local okr, r = pcall(get_mining_drill_radius, proto)
+  if not (okr and type(r) == "number" and r > 0) then
+    return nil
+  end
+  local okc, cats = pcall(get_resource_categories, proto)
+  if not (okc and type(cats) == "table") then
+    return nil
+  end
+  local surface = e.surface
+  local pos = e.position
+  if not (surface and surface.valid and pos) then
+    return nil
+  end
+  local area = { { pos.x - r, pos.y - r }, { pos.x + r, pos.y + r } }
+  local okf, resources = pcall(find_resources, surface, area)
+  if not (okf and type(resources) == "table") then
+    return nil
+  end
+  for _, res in pairs(resources) do
+    local okrp, rp = pcall(get_prototype, res)
+    if okrp and rp then
+      local okm, fluid = pcall(get_required_fluid, rp)
+      if okm and fluid then
+        local okcat, rcat = pcall(get_resource_category, rp)
+        if okcat and cats[rcat] then
+          return type(fluid) == "string" and fluid or true
+        end
+      end
+    end
+  end
+  return nil
+end
+
 -- A mining drill takes fluid in while it has a fluid box (uranium ore's sulfuric acid; Factorio draws the electric
 -- drill's three fluid connectors with its `wet_mining_graphics_set`): `fa` 1, as a crafter whose recipe takes fluid,
 -- so the client draws its `-wet` model (model_library.gd wet_model). Read from the drill's own box, as the game keeps
 -- it (2.1.24: `fluids_count` 1 over uranium, kept when the ore runs out and with one uranium tile in an iron drill's
--- area; 0 over iron alone), not guessed from what it mines.
+-- area; 0 over iron alone), and for ghost drills from fluid-requiring resources in their mining area.
 local function drill_arrows(e)
-  local ok, count = pcall(function() return e.fluids_count end)
+  if e.type == "entity-ghost" then
+    return ghost_drill_fluid(e) and 1 or nil
+  end
+  local ok, count = pcall(get_fluids_count, e)
   if ok and type(count) == "number" and count > 0 then
     return 1
   end
@@ -196,10 +344,11 @@ local function drill_arrows(e)
 end
 
 function M.arrows(e)
-  if e.type == "mining-drill" then
+  local t = entity_type(e)
+  if t == "mining-drill" then
     return drill_arrows(e)
   end
-  if not CRAFTERS[e.type] then
+  if not CRAFTERS[t] then
     return nil
   end
   local recipe = shown_recipe(e)
@@ -236,27 +385,142 @@ local function hundredths(v)
   return math.floor(v * 100 + 0.5) / 100
 end
 
+local function ghost_connections(e)
+  local proto = entity_proto(e)
+  if not proto then
+    return nil
+  end
+  local okb, boxes = pcall(function() return proto.fluidbox_prototypes end)
+  if not (okb and type(boxes) == "table") then
+    return nil
+  end
+  local t = entity_type(e)
+  local is_crafter = CRAFTERS[t] == true
+  local drill_fluid = t == "mining-drill" and ghost_drill_fluid(e) or nil
+  if t == "mining-drill" and drill_has_fluid_input(proto) and not drill_fluid then
+    return nil
+  end
+  local recipe = shown_recipe(e)
+  local ing_fluids, prod_fluids = {}, {}
+  if recipe then
+    for _, ing in pairs(recipe.ingredients or {}) do
+      if ing.type == "fluid" and ing.name then
+        ing_fluids[#ing_fluids + 1] = ing.name
+      end
+    end
+    for _, prod in pairs(recipe.products or {}) do
+      if prod.type == "fluid" and prod.name then
+        prod_fluids[#prod_fluids + 1] = prod.name
+      end
+    end
+  end
+  local has_in = #ing_fluids > 0
+  local has_out = #prod_fluids > 0
+  if is_crafter and not has_in and not has_out then
+    return nil
+  end
+  local dir = e.direction or 0
+  local q = math.floor(dir / 4) % 4
+  local okm, mir = pcall(function() return e.mirroring == true end)
+  local mirror = okm and mir == true
+  local out = {}
+  local in_i, out_i = 0, 0
+  for _, box in pairs(boxes) do
+    local okf, bf = pcall(function() return box.filter end)
+    local fixed_fluid = okf and bf and bf.name or nil
+    local okpt, ptype = pcall(function() return box.production_type end)
+    local box_fluid = fixed_fluid
+    if not box_fluid and okpt then
+      if ptype == "input" or ptype == "input-output" then
+        in_i = in_i + 1
+        box_fluid = ing_fluids[in_i] or ing_fluids[1]
+        if not box_fluid and ptype == "input-output" then
+          out_i = out_i + 1
+          box_fluid = prod_fluids[out_i] or prod_fluids[1]
+        end
+      elseif ptype == "output" then
+        out_i = out_i + 1
+        box_fluid = prod_fluids[out_i] or prod_fluids[1]
+      end
+    end
+    for _, conn in pairs(box.pipe_connections or {}) do
+      local pos = conn.positions and conn.positions[1] or conn.position
+      if conn.connection_type == "normal" and not conn.hide_connection_info and pos then
+        local flow = FLOW_LETTER[conn.flow_direction] or "b"
+        local used = not is_crafter
+          or (flow == "i" and has_in)
+          or (flow == "o" and has_out)
+          or (flow == "b" and (has_in or has_out))
+        if used then
+          local ox = type(pos) == "table" and (pos.x or pos[1] or 0) or 0
+          local oy = type(pos) == "table" and (pos.y or pos[2] or 0) or 0
+          local cd = conn.direction or 0
+          if mirror then
+            ox = -ox
+            cd = (16 - cd) % 16
+          end
+          if q == 1 then
+            ox, oy = -oy, ox
+          elseif q == 2 then
+            ox, oy = -ox, -oy
+          elseif q == 3 then
+            ox, oy = oy, -ox
+          end
+          local way = (cd + q * 4) % 16
+          local fname = box_fluid
+          if not fname then
+            if type(drill_fluid) == "string" then
+              fname = drill_fluid
+            elseif conn.flow_direction == "input" then
+              fname = ing_fluids[1]
+            elseif conn.flow_direction == "output" then
+              fname = prod_fluids[1]
+            else
+              fname = ing_fluids[1] or prod_fluids[1]
+            end
+          end
+          out[#out + 1] = { hundredths(ox), hundredths(oy), way, flow, fname or "" }
+        end
+      end
+    end
+  end
+  return #out > 0 and out or nil
+end
+
 function M.connections(e)
   if not perf.on("fluid_icons") then
     return nil
   end
-  local ok, n = pcall(function() return e.fluids_count end)
+  if e.type == "entity-ghost" then
+    return ghost_connections(e)
+  end
+  local t = entity_type(e)
+  local fa = CRAFTERS[t] and M.arrows(e) or nil
+  if CRAFTERS[t] and not fa then
+    return nil
+  end
+  local ok, n = pcall(get_fluids_count, e)
   if not (ok and type(n) == "number") then
     return nil
   end
   local p = e.position
   local out = {}
   for i = 1, n do
-    local okf, filter = pcall(function() return e.get_fluid_filter(i) end)
+    local okf, filter = pcall(get_fluid_filter, e, i)
     local name = okf and filter and filter.name or nil
     if not name then
-      local okg, fluid = pcall(function() return e.get_fluid(i) end)
+      local okg, fluid = pcall(get_fluid_at, e, i)
       name = okg and fluid and fluid.name or nil
     end
-    local okc, conns = pcall(function() return e.get_fluid_box_pipe_connections(i) end)
+    local okc, conns = pcall(get_fluid_box_conns, e, i)
     for _, c in pairs(okc and conns or {}) do
       local at, to = c.position, c.target_position
-      if c.connection_type == "normal" and at and to then
+      local flow = FLOW_LETTER[c.flow_direction] or "b"
+      local used = not fa
+        or (flow == "i" and bit32.band(fa, 1) ~= 0)
+        or (flow == "o" and bit32.band(fa, 2) ~= 0)
+        or (flow == "b" and fa ~= 0)
+      if c.connection_type == "normal" and at and to and used then
         local dx, dy = to.x - at.x, to.y - at.y
         local way
         if math.abs(dx) > math.abs(dy) then
@@ -264,7 +528,7 @@ function M.connections(e)
         else
           way = dy > 0 and 8 or 0
         end
-        out[#out + 1] = { hundredths(at.x - p.x), hundredths(at.y - p.y), way, FLOW_LETTER[c.flow_direction] or "b", name or "" }
+        out[#out + 1] = { hundredths(at.x - p.x), hundredths(at.y - p.y), way, flow, name or "" }
       end
     end
   end
@@ -288,14 +552,23 @@ end
 
 -- What Alt-mode shows over the entity: its icon and its arrows (either may be nil), and their signature.
 function M.state(e)
-  local icon = TYPES[e.type] and M.icon(e) or nil
-  local arrows = (CRAFTERS[e.type] or e.type == "mining-drill") and M.arrows(e) or nil
+  local t = entity_type(e)
+  local icon = TYPES[t] and M.icon(e) or nil
+  local arrows = (CRAFTERS[t] or t == "mining-drill") and M.arrows(e) or nil
   return icon, arrows, M.signature(icon, arrows)
 end
 
 local function chunk_key(p)
   return math.floor(p.x / CHUNK) .. "," .. math.floor(p.y / CHUNK)
 end
+
+-- (gc_lean) Forward declaration so M.recorded can mark the cached list dirty without global lookup.
+-- inv_cache is a module-local read cache only (inventory handles, never decides what goes in storage);
+-- the cached entity list lives in storage (altc.lc_meta.list) so every peer reuses the same one.
+local inv_cache = {}
+local inv_cache_si, inv_cache_client
+local ALT_RESCAN_TICKS = 180
+local mark_list_dirty
 
 -- world.record calls this for each record it makes of an Alt-mode type, with its icon and extra
 -- (wires in r / g): a furnace, or one a circuit network may set, is watched from then on. Only
@@ -311,6 +584,9 @@ function M.recorded(e, icon, extra, arrows)
     s.altw[unit] = { e = e, v = M.signature(icon, arrows), k = chunk_key(e.position) }
   elseif s.altw and s.altw[unit] then
     s.altw[unit] = nil -- its wires went: an event or the chunk's next sending tells the rest
+  end
+  if mark_list_dirty then
+    mark_list_dirty(s, e, unit)
   end
 end
 
@@ -335,7 +611,7 @@ end
 -- signature the caller kept, or nil to send it whatever it was.
 function M.check(e, known)
   local s = storage.f3d
-  if not (s and s.client and e and e.valid and e.unit_number and TYPES[e.type]) then
+  if not (s and s.client and e and e.valid and e.unit_number and TYPES[entity_type(e)]) then
     return known
   end
   -- world.is_subscribed, here: world requires this module, and `require` at run time stops the game.
@@ -389,7 +665,7 @@ local MODULE_INVENTORIES = {
 }
 
 local function define_of(name)
-  local ok, v = pcall(function() return defines.inventory[name] end)
+  local ok, v = pcall(get_define_inv, name)
   return ok and v or nil
 end
 
@@ -410,7 +686,7 @@ local function vec_xy(v)
 end
 
 local function box_width(proto)
-  local ok, b = pcall(function() return proto.selection_box end)
+  local ok, b = pcall(get_selection_box, proto)
   if not (ok and type(b) == "table") then
     return 0
   end
@@ -437,7 +713,7 @@ function M.draw_spec(proto)
   if not SPEC_TYPES[proto.type] then
     return nil
   end
-  local ok, s = pcall(function() return proto.icon_draw_specification end)
+  local ok, s = pcall(get_icon_draw_spec, proto)
   if not (ok and type(s) == "table") then
     return nil
   end
@@ -471,7 +747,7 @@ local function stock_sequences(proto, stock)
       box_width(proto)) }
   end
   local index = define_of(stock[2])
-  local ok, list = pcall(function() return proto.icons_positioning end)
+  local ok, list = pcall(get_icons_pos, proto)
   if index and ok and type(list) == "table" then
     for _, p in ipairs(list) do
       if type(p) == "table" and p.inventory_index == index then
@@ -493,7 +769,7 @@ local function sequences(proto)
   if not SEQUENCE_TYPES[t] then
     return nil
   end
-  local ok_m, slots = pcall(function() return proto.module_inventory_size end)
+  local ok_m, slots = pcall(get_module_inv_size, proto)
   local has_modules = ok_m and type(slots) == "number" and slots > 0
   if not has_modules and t ~= "lab" then
     return nil
@@ -507,22 +783,19 @@ local function sequences(proto)
   end
   local lab_input = t == "lab" and define_of("lab_input") or nil
   local width = box_width(proto)
-  local function entry(kind, p)
-    return sequence_entry(kind, p, width)
-  end
   local out = {}
-  local ok, list = pcall(function() return proto.icons_positioning end)
+  local ok, list = pcall(get_icons_pos, proto)
   if ok and type(list) == "table" then
     for _, p in ipairs(list) do
       local index = type(p) == "table" and p.inventory_index or nil
       if has_modules and index and modules[index] then
-        out[#out + 1] = entry("m", p)
+        out[#out + 1] = sequence_entry("m", p, width)
       elseif lab_input and index == lab_input then
-        out[#out + 1] = entry("l", p)
+        out[#out + 1] = sequence_entry("l", p, width)
       end
     end
   elseif has_modules then
-    out[1] = entry("m", {})
+    out[1] = sequence_entry("m", {}, width)
   end
   return #out > 0 and out or nil
 end
@@ -541,7 +814,14 @@ end
 -- a stack (a module slot holds one in the game). Up to 32.
 local function shown_items(inv, each)
   local out = {}
-  if not inv or inv.is_empty() then
+  if not inv then
+    return out
+  end
+  local oke, empty = pcall(inv_is_empty, inv)
+  if oke and empty then
+    M.counts.empty_skips = M.counts.empty_skips + 1
+    return out
+  elseif not oke and inv.is_empty() then
     return out
   end
   for i = 1, #inv do
@@ -561,6 +841,63 @@ local function shown_items(inv, each)
   return out
 end
 
+-- (gc_lean) Module-local inventory handle cache and entity list cache helpers.
+-- Called only from commands and events (every peer the same): empties the read cache and the
+-- storage list. contents_tick's own module-state checks call clear_inv_cache, which leaves storage be.
+local function clear_inv_cache()
+  inv_cache = {}
+end
+
+local function clear_caches(s)
+  clear_inv_cache()
+  local target = s or storage.f3d
+  if target and target.altc then
+    target.altc.lc_meta = nil
+  end
+end
+
+local function prune_inv_cache()
+  for _, bucket in pairs(inv_cache) do
+    for unit, c in pairs(bucket) do
+      if not (c.e and c.e.valid and c.inv and c.inv.valid) then
+        bucket[unit] = nil
+      end
+    end
+  end
+end
+
+local function cached_inv(e, key, getter, arg)
+  if not perf.on("gc_lean") then
+    inv_cache = {}
+    M.counts.inv_gets = M.counts.inv_gets + 1
+    local ok, inv = pcall(getter, e, arg)
+    return ok and inv or nil
+  end
+  local unit = e.unit_number
+  if unit then
+    local bucket = inv_cache[key]
+    if not bucket then
+      bucket = {}
+      inv_cache[key] = bucket
+    end
+    local c = bucket[unit]
+    if c and c.e == e and e.valid and c.inv and c.inv.valid then
+      return c.inv
+    end
+    M.counts.inv_gets = M.counts.inv_gets + 1
+    local ok, inv = pcall(getter, e, arg)
+    if ok and inv and inv.valid then
+      bucket[unit] = { e = e, inv = inv }
+      return inv
+    end
+    bucket[unit] = nil
+    return ok and inv or nil
+  end
+  M.counts.inv_gets = M.counts.inv_gets + 1
+  local ok, inv = pcall(getter, e, arg)
+  return ok and inv or nil
+end
+
 -- What Alt-mode shows in a machine (K1, K2): its modules and its other inventory (a lab's science
 -- packs, a turret's ammo, a locomotive's fuel: one icon a filled slot), each a list as shown_items
 -- makes it (empty for none), or nil, nil for an entity without such icons.
@@ -571,13 +908,12 @@ function M.machine_icons(e)
   end
   local stock = STOCK_TYPES[e.type]
   if stock then
-    local ok, held = pcall(function()
-      local inv = e.get_inventory(defines.inventory[stock[2]])
-      if stock[1] == "c" then
-        return M.top_names(inv, WAGON_SHOWN) or {}
-      end
-      return shown_items(inv, false)
-    end)
+    local inv_id = define_of(stock[2])
+    local inv = inv_id and cached_inv(e, stock[2], get_entity_inv, inv_id) or nil
+    if stock[1] == "c" then
+      return {}, inv and M.top_names(inv, WAGON_SHOWN) or {}
+    end
+    local ok, held = pcall(shown_items, inv, false)
     return {}, ok and held or {}
   end
   local want_m, want_l
@@ -585,15 +921,22 @@ function M.machine_icons(e)
     want_m = want_m or s[1] == "m"
     want_l = want_l or s[1] == "l"
   end
-  local ok, m, l = pcall(function()
-    local mods = want_m and shown_items(e.get_module_inventory(), true) or {}
-    local packs = want_l and shown_items(e.get_inventory(defines.inventory.lab_input), false) or {}
-    return mods, packs
-  end)
-  if not ok then
-    return {}, {}
+  local mods, packs = {}, {}
+  if want_m then
+    local minv = cached_inv(e, "mod", get_module_inv)
+    local ok, m = pcall(shown_items, minv, true)
+    if ok and m then
+      mods = m
+    end
   end
-  return m, l
+  if want_l then
+    local linv = cached_inv(e, "lab", get_entity_inv, defines.inventory.lab_input)
+    local ok, l = pcall(shown_items, linv, false)
+    if ok and l then
+      packs = l
+    end
+  end
+  return mods, packs
 end
 
 local function items_sig(list)
@@ -631,6 +974,20 @@ local CONTAINER_SET = {}
 for _, t in ipairs(CONTAINER_TYPES) do
   CONTAINER_SET[t] = true
 end
+mark_list_dirty = function(s, e, unit, any_unit)
+  local lc = s and s.altc and s.altc.lc_meta
+  if lc and (CONTAINER_SET[e.type] or SEQUENCE_TYPES[e.type] or STOCK_TYPES[e.type]) then
+    if any_unit or not (unit and lc.units and lc.units[unit]) then
+      lc.dirty = true
+    end
+  end
+end
+
+function M.on_entity_changed(entity)
+  if entity and entity.valid then
+    mark_list_dirty(storage.f3d, entity, entity.unit_number, true)
+  end
+end
 local CONTENTS_SHOWN = 4
 local CONTENTS_PER_TICK = 32
 -- A chest's read: its inventory's contents, about a record's worth (budget.lua's units).
@@ -643,7 +1000,7 @@ local CONTENTS_ROUND = 60
 local CONTENTS_ROUND_MOVE = 120
 local MOVE_CADENCE_TILES = 4
 -- Module-local counters for tests/probes (never in storage).
-M.counts = { container_scans = 0, machine_scans = 0, rounds = 0 }
+M.counts = { container_scans = 0, machine_scans = 0, rounds = 0, inv_gets = 0, empty_skips = 0, entity_reuses = 0 }
 local container_types
 local machine_names
 
@@ -692,8 +1049,8 @@ end
 -- The names of the kinds the chest holds most of (qualities together), most first, ties by name;
 -- nil when it is empty.
 function M.contents(e)
-  local ok, inv = pcall(function() return e.get_inventory(defines.inventory.chest) end)
-  return ok and M.top_names(inv, CONTENTS_SHOWN) or nil
+  local inv = cached_inv(e, "chest", get_entity_inv, defines.inventory.chest)
+  return inv and M.top_names(inv, CONTENTS_SHOWN) or nil
 end
 
 -- The `n` kinds an inventory holds most of, most first (the chests' and the cargo wagons' icons).
@@ -701,7 +1058,14 @@ function M.top_names(inv, n)
   if not inv then
     return nil
   end
-  local ok_c, list = pcall(function() return inv.get_contents() end)
+  if perf.on("gc_lean") then
+    local oke, empty = pcall(inv_is_empty, inv)
+    if oke and empty == true then
+      M.counts.empty_skips = M.counts.empty_skips + 1
+      return nil
+    end
+  end
+  local ok_c, list = pcall(get_inv_contents, inv)
   if not (ok_c and type(list) == "table") then
     return nil
   end
@@ -709,8 +1073,8 @@ function M.top_names(inv, n)
   for _, it in pairs(list) do
     local name = it.name
     if type(name) ~= "string" then
-      local ok_n, n = pcall(function() return name.name end)
-      name = ok_n and n or nil
+      local ok_n, nn = pcall(get_name_field, name)
+      name = ok_n and nn or nil
     end
     if type(name) == "string" and (it.count or 0) > 0 then
       if not counts[name] then
@@ -723,12 +1087,9 @@ function M.top_names(inv, n)
   if #names == 0 then
     return nil
   end
-  table.sort(names, function(a, b)
-    if counts[a] ~= counts[b] then
-      return counts[a] > counts[b]
-    end
-    return a < b
-  end)
+  sort_counts = counts
+  table.sort(names, cmp_top_names)
+  sort_counts = nil
   for i = #names, n + 1, -1 do
     names[i] = nil
   end
@@ -745,18 +1106,25 @@ function M.contents_cmd(cmd)
     if perf.on("alt_cadence") and s.altc and s.altc.g == g and s.altc.lf == lf then
       return
     end
+    clear_caches()
     s.altc = { g = g, sent = {}, msent = {}, due = game.tick, lf = lf }
   else
+    clear_caches()
     s.altc = nil
   end
 end
 
 -- The client's world was dropped (a resync, another surface): everything is sent again.
 function M.contents_forget()
+  clear_caches()
   local c = storage.f3d.altc
   if c then
     c.sent, c.msent, c.round, c.due, c.last_fx, c.last_fy = {}, {}, nil, game.tick, nil, nil
   end
+end
+
+function M.reset()
+  clear_caches()
 end
 
 local function machine_row(unit, modules, packs)
@@ -816,6 +1184,18 @@ local function contents_tick()
   if not c then
     return
   end
+  local lean = perf.on("gc_lean")
+  -- (M1) Module state (nil on a peer that just joined) only clears the module's read cache: storage
+  -- is never written from it. The storage list is checked against storage (lc.si, lc.client).
+  if lean then
+    if s.surface_index ~= inv_cache_si or s.client ~= inv_cache_client then
+      clear_inv_cache()
+      inv_cache_si, inv_cache_client = s.surface_index, s.client
+    end
+  elseif inv_cache_si ~= nil or next(inv_cache) ~= nil then
+    clear_inv_cache()
+    inv_cache_si, inv_cache_client = nil, nil
+  end
   local cadence = perf.on("alt_cadence")
   local round = c.round
   if not cadence and round and round.searches then
@@ -830,47 +1210,66 @@ local function contents_tick()
     if not (surface and surface.valid and #types > 0 and s.focus) then
       return
     end
-    local machines = perf.on("alt_machines") and present_machine_names(perf.on("alt_ammo_fuel"), c.lf) or {}
+    local am_on = perf.on("alt_machines")
+    local af_on = perf.on("alt_ammo_fuel")
     local f = s.focus
-    if not cadence then
-      local price = CONTENTS_FIND_PRICE * (#machines > 0 and 2 or 1)
-      if not budget.can(price, "altc", 0.1) then
-        return
-      end
-      budget.spend(price, "altc")
-      local area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } }
-      round = { i = 1, seen = {}, list = surface.find_entities_filtered({ area = area, type = types }) }
-      M.counts.container_scans = M.counts.container_scans + 1
-      if #machines > 0 then
-        -- After the chests, in the same round.
-        for _, e in ipairs(surface.find_entities_filtered({ area = area, name = machines })) do
-          round.list[#round.list + 1] = e
-        end
-        M.counts.machine_scans = M.counts.machine_scans + 1
-      end
+    local lc = lean and c.lc_meta or nil
+    if not lean then
+      c.lc_meta = nil
+    end
+    if lc and not lc.dirty and lc.list and lc.si == surface.index and lc.client == s.client and lc.r == f.r
+        and lc.lf == c.lf and lc.am_on == am_on and lc.af_on == af_on and lc.cadence == cadence
+        and math.max(math.abs(f.x - lc.fx), math.abs(f.y - lc.fy)) < MOVE_CADENCE_TILES
+        and (game.tick - lc.tick) < ALT_RESCAN_TICKS * rate.factor("ac") then
+      -- (M1) The list kept in storage: the same on every peer, a joiner's included.
+      local reuse_list = lc.list
+      M.counts.entity_reuses = M.counts.entity_reuses + 1
+      round = { i = 1, seen = {}, list = reuse_list, moved = 0, r = f.r, reused = true }
       c.round = round
     else
-      local strips, find_price = area_strips(f)
-      if not budget.can(find_price, "altc", 0.1) then
-        return
-      end
-      budget.spend(find_price, "altc")
-      local moved = c.last_fx and math.max(math.abs(f.x - c.last_fx), math.abs(f.y - c.last_fy)) or 0
-      c.last_fx, c.last_fy = f.x, f.y
-      local searches = {}
-      for _, box in ipairs(strips) do
-        searches[#searches + 1] = { "container", box }
-      end
-      if #machines > 0 then
-        for _, box in ipairs(strips) do
-          searches[#searches + 1] = { "machine", box }
+      local machines = am_on and present_machine_names(af_on, c.lf) or {}
+      if not cadence then
+        local price = CONTENTS_FIND_PRICE * (#machines > 0 and 2 or 1)
+        if not budget.can(price, "altc", 0.1) then
+          return
         end
+        budget.spend(price, "altc")
+        local area = { { f.x - f.r, f.y - f.r }, { f.x + f.r, f.y + f.r } }
+        round = { i = 1, seen = {}, list = surface.find_entities_filtered({ area = area, type = types }),
+          si = surface.index, fx = f.x, fy = f.y, r = f.r, lf = c.lf, am_on = am_on, af_on = af_on, cadence = cadence }
+        M.counts.container_scans = M.counts.container_scans + 1
+        if #machines > 0 then
+          -- After the chests, in the same round.
+          for _, e in ipairs(surface.find_entities_filtered({ area = area, name = machines })) do
+            round.list[#round.list + 1] = e
+          end
+          M.counts.machine_scans = M.counts.machine_scans + 1
+        end
+        c.round = round
+      else
+        local strips, find_price = area_strips(f)
+        if not budget.can(find_price, "altc", 0.1) then
+          return
+        end
+        budget.spend(find_price, "altc")
+        local moved = c.last_fx and math.max(math.abs(f.x - c.last_fx), math.abs(f.y - c.last_fy)) or 0
+        c.last_fx, c.last_fy = f.x, f.y
+        local searches = {}
+        for _, box in ipairs(strips) do
+          searches[#searches + 1] = { "container", box }
+        end
+        if #machines > 0 then
+          for _, box in ipairs(strips) do
+            searches[#searches + 1] = { "machine", box }
+          end
+        end
+        round = { i = 1, seen = {}, list = {}, added = {}, searches = searches, si = 2, find_tick = game.tick,
+          find_price = find_price, moved = moved, r = f.r, surf_i = surface.index, fx = f.x, fy = f.y,
+          lf = c.lf, am_on = am_on, af_on = af_on, cadence = cadence }
+        append_unique(round, surface.find_entities_filtered({ area = searches[1][2], type = types }))
+        M.counts.container_scans = M.counts.container_scans + 1
+        c.round = round
       end
-      round = { i = 1, seen = {}, list = {}, added = {}, searches = searches, si = 2, find_tick = game.tick,
-        find_price = find_price, moved = moved, r = f.r }
-      append_unique(round, surface.find_entities_filtered({ area = searches[1][2], type = types }))
-      M.counts.container_scans = M.counts.container_scans + 1
-      c.round = round
     end
   elseif cadence and round.si and round.si <= #round.searches and game.tick > (round.find_tick or -1) then
     local surface = game.get_surface(s.surface_index)
@@ -919,6 +1318,34 @@ local function contents_tick()
           mout[#mout + 1] = { unit }
         end
       end
+      if lean and not round.reused then
+        local units = round.added
+        if not units then
+          units = {}
+          for _, ent in ipairs(round.list) do
+            if ent.valid and ent.unit_number then
+              units[ent.unit_number] = true
+            end
+          end
+        end
+        local meta = {
+          si = round.surf_i or round.si,
+          fx = round.fx,
+          fy = round.fy,
+          r = round.r,
+          lf = round.lf,
+          am_on = round.am_on,
+          af_on = round.af_on,
+          cadence = round.cadence,
+          tick = game.tick,
+          units = units,
+          client = s.client,
+          list = round.list,
+          dirty = false,
+        }
+        c.lc_meta = meta
+      end
+      prune_inv_cache()
       local interval = CONTENTS_ROUND
       if cadence and (round.moved or 0) >= MOVE_CADENCE_TILES and (round.moved or 0) < (round.r or math.huge) then
         interval = CONTENTS_ROUND_MOVE
@@ -928,14 +1355,18 @@ local function contents_tick()
       M.counts.rounds = M.counts.rounds + 1
       break
     end
-    local chest = not e.valid or CONTAINER_SET[e.type]
+    local valid = e.valid
+    if not valid and lean and c.lc_meta then
+      c.lc_meta.dirty = true
+    end
+    local chest = not valid or CONTAINER_SET[e.type]
     local price = chest and CONTENTS_PRICE or MACHINE_PRICE
     if not budget.can(price, "altc", 0.1) then
       break
     end
     budget.spend(price, "altc")
     round.i = round.i + 1
-    local unit = e.valid and e.unit_number
+    local unit = valid and e.unit_number
     if unit and s.subs[chunk_key(e.position)] then
       if chest then
         local names = M.contents(e)

@@ -698,6 +698,25 @@ rcon.print(table.concat(out, " "))
     c.pump(0.4, every=hello)
     live_lib.report(live_lib.inv_count("automation-science-pack") == 10, "fast with an empty hand on a lab takes its science packs (lab_input)",
            str(live_lib.inv_count("automation-science-pack")))
+    # A machine's output slots take nothing from the hand (Factorio: products can only be taken out);
+    # transfer_stack on a furnace's result slot would take anything.
+    main(("iron-plate", 20))
+    live_lib.mod_lua(f"{entity(furnace)}.get_output_inventory().clear() rcon.print('ok')")
+    c.send({"t": "open", **ident(furnace)})
+    c.pump(0.4, every=hello)
+    c.send({"t": "move", "from": "main", "fi": 1, "to": "output", "ti": 1, "u": furnace})
+    msgs = c.pump(0.4, every=hello)
+    res = live_lib.mod_lua(f"local st = {entity(furnace)}.get_output_inventory()[1] rcon.print(st.valid_for_read and (st.name .. ':' .. st.count) or '-')").split()
+    live_lib.report(res == ["-"] and slots()[0] == "iron-plate:20",
+           "move into a furnace's output slot is refused (the hand's stack stays)", f"result {res} main {slots()} {[m.get('text') for m in live_lib.of_type(msgs, 'msg')]}")
+    # ...nor by swapping: a stack taken from the output slot onto a different one in the inventory.
+    main(("copper-plate", 20))
+    live_lib.mod_lua(f"local o = {entity(furnace)}.get_output_inventory() o.clear() o.insert({{ name = 'iron-plate', count = 5 }}) rcon.print('ok')")
+    c.send({"t": "move", "from": "output", "fi": 1, "to": "main", "ti": 1, "u": furnace})
+    c.pump(0.4, every=hello)
+    res = live_lib.mod_lua(f"local st = {entity(furnace)}.get_output_inventory()[1] rcon.print(st.valid_for_read and (st.name .. ':' .. st.count) or '-')").split()
+    live_lib.report(res == ["iron-plate:5"] and slots()[0] == "copper-plate:20",
+           "move from a furnace's output slot onto a different stack does not swap it into the output", f"result {res} main {slots()}")
     live_lib.destroy_units(units)
     check_hand_stack(c, hello, x, y)
 

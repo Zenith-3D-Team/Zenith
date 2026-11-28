@@ -230,8 +230,8 @@ static func mesh_for(item: String, variant := 0) -> Mesh:
 				return _cache[key]
 		else:
 			# A read still running on a worker is not waited for: read here as before, its result dropped
-			# (ready() waits for the finished task later).
-			_orphans.append(int((_jobs[key] as Array)[0]))
+			# (ready() waits for the finished task later; its holder kept till then, _hold_off).
+			_orphans.append(_hold_off(_jobs[key]))
 			_jobs.erase(key)
 	var path := ModelPacks.item_model_path(item, maxi(variant, 0)) if item != "" else ""
 	var mesh: Mesh = null
@@ -1796,9 +1796,10 @@ static func ready(item: String) -> bool:
 		_follow_packs()
 	if not _orphans.is_empty():
 		for i in range(_orphans.size() - 1, -1, -1):
-			if WorkerThreadPool.is_task_completed(_orphans[i]):
-				WorkerThreadPool.wait_for_task_completion(_orphans[i])
-				_orphans.remove_at(i)
+			var orphan: Array = _orphans[i]
+			if WorkerThreadPool.is_task_completed(int(orphan[0])):
+				WorkerThreadPool.wait_for_task_completion(int(orphan[0]))
+				_orphans.remove_at(i)  # (its mesh freed with `orphan` here, outside the pool's lock)
 	if _all_ready.has(item):
 		return true
 	var all := true
@@ -1818,8 +1819,18 @@ static var _jobs := {}
 static var reads_later := 0
 ## Items whose model and variants are all in (ready()'s answer without asking the packs again); emptied with the cache.
 static var _all_ready := {}
-## Worker reads overtaken by a read on the main thread (mesh_for): their tasks, waited for once finished.
-static var _orphans: Array[int] = []
+## Worker reads overtaken by a read on the main thread (mesh_for): [task id, its result's holder], waited for once
+## finished (_hold_off: the holder kept here so the mesh isn't freed inside the wait).
+static var _orphans: Array = []
+
+
+## [task id, holder] of a job (_jobs' [task id, [mesh], path, is_pbr]) to wait for later. The worker's lambda holds the
+## holder too: were it the last, waiting for the finished task would free the read mesh (and its resources) inside
+## WorkerThreadPool's lock, where it can wait for the render thread or the resource cache while they wait for the
+## pool: the test runs hung there (model_packs_test's wait_all, spikes_b_test's overtaken read). So the holder lives
+## here until after the wait, and the mesh goes when it is dropped, on this thread, outside the lock.
+static func _hold_off(job: Array) -> Array:
+	return [int(job[0]), job[1]]
 
 
 static func _ready_key(item: String, v: int) -> bool:
@@ -1849,14 +1860,16 @@ static func _ready_key(item: String, v: int) -> bool:
 ## wait for the main thread's rendering server to sync (a frame), so it is synced while waiting: a plain
 ## wait_for_task_completion here would never return.
 static func wait_all() -> void:
-	var tasks: Array[int] = []
+	# Each with its result's holder (_hold_off), kept till every wait is done: dropped here, outside the pool's lock.
+	var waits: Array = []
 	for key: String in _jobs.keys():
-		tasks.append(int((_jobs[key] as Array)[0]))
-	tasks.append_array(_orphans)
+		waits.append(_hold_off(_jobs[key]))
+	waits.append_array(_orphans)
 	_jobs.clear()
 	_orphans.clear()
 	var t0 := Time.get_ticks_msec()
-	for task in tasks:
+	for w: Array in waits:
+		var task := int(w[0])
 		while not WorkerThreadPool.is_task_completed(task) and Time.get_ticks_msec() - t0 < 10000:
 			RenderingServer.force_sync()
 			OS.delay_msec(1)
@@ -1864,6 +1877,7 @@ static func wait_all() -> void:
 			WorkerThreadPool.wait_for_task_completion(task)
 		else:
 			push_warning("[items] an item model's read still running at quit: not waited for")
+	waits.clear()
 
 
 ## A worker's read is done: its mesh cached, unless the packs gave the item another file meanwhile (read again then,

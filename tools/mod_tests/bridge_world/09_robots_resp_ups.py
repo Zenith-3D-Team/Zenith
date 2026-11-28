@@ -102,7 +102,7 @@ check(log_chg is not None and (log_chg[10] & 7) == 2 and (log_chg[10] & 256) != 
 rb_rp.logistic_cell.charging_robots[1] = None
 rb_rp.logistic_cell.to_charge_robots[1] = rb_log
 rb_log.position = lua.table_from({"x": rb_ox + 0.5, "y": rb_oy - 0.5})
-tick(6)
+tick(13)  # CHARGE_POLL_OPT = 12 with robot_opt on
 log_orb = rb_recs(take()).get(rb_log.unit_number)
 check(log_orb is not None and (log_orb[10] & 7) == 3,
       f"rb: to_charge_robots within 4.5 tiles -> ORBIT: {log_orb}")
@@ -111,7 +111,7 @@ check(log_orb is not None and (log_orb[10] & 7) == 3,
 rb_rp.logistic_cell.to_charge_robots[1] = None
 rb_log.position = lua.table_from({"x": rb_ox + 2.0, "y": rb_oy + 2.0})
 rb_log.orientation = 0.0
-tick(6)
+tick(13)  # CHARGE_POLL_OPT = 12 with robot_opt on
 log_div = rb_recs(take()).get(rb_log.unit_number)
 check(log_div is not None and (log_div[10] & 7) == 1,
       f"rb: queue/orientation mismatch outside hatch -> FLY_DIR diversion: {log_div}")
@@ -143,6 +143,64 @@ tick(6)
 msgs_gone = take()
 gone_seen = {u for m in of_type(msgs_gone, "rb") for u in (m.get("g") or [])}
 check(dead_u in gone_seen, f"rb: destroyed robot emitted in gone list: {gone_seen}")
+
+# Personal roboport return (STATE_FOLLOW | FLAG_RETURNING), logistic FOLLOW without returning,
+# stationary roboport FLY_TARGET without returning, and Alt-mode rc during rb (with quality + clear).
+p_cell = F.make_cell(rb_char, 0, 30)
+p_net = F.make_network(99, lua.table_from([0, 0, 1, 1]), lua.table_from([]), lua.table_from([p_cell]))
+rb_char.logistic_cell = p_cell
+rb_char.logistic_network = p_net
+rb_pcon = spawn("construction-robot", rb_ox + 2.5, rb_oy + 5.5, force="player")
+rb_pcon.logistic_network = p_net
+p_net.construction_robots[1] = rb_pcon
+rb_pcon.orientation = 0.0  # intentionally turned away from character to test orientation independence
+rb_pcon.robot_order_queue = lua.table_from([])
+rb_pcon.get_inventory(g.defines.inventory.robot_cargo)[1].set_stack(
+    lua.table_from({"name": "iron-plate", "count": 4, "quality": "rare"}))
+
+rb_log2 = spawn("logistic-robot", rb_ox + 4.5, rb_oy + 5.5, force="player")
+rb_log2.orientation = 0.25
+rb_log2.robot_order_queue = lua.table_from([lua.table_from({"type": OT.deliver, "target": rb_char})])
+
+rb_con.position = lua.table_from({"x": rb_ox + 8.5, "y": rb_oy - 1.5})
+rb_con.orientation = 0.75  # west directly toward rb_rp at (rb_ox - 1.5, rb_oy - 1.5)
+rb_con.robot_order_queue = lua.table_from([])
+
+tick(18)
+msgs_prs = take()
+recs_prs = rb_recs(msgs_prs)
+pcon_r = recs_prs.get(rb_pcon.unit_number)
+log2_r = recs_prs.get(rb_log2.unit_number)
+scon_r = recs_prs.get(rb_con.unit_number)
+check(pcon_r is not None and (pcon_r[10] & 7) == 4 and (pcon_r[10] & 1024) != 0 and pcon_r[7] == rb_char.unit_number,
+      f"rb: personal construction robot empty-queue emits FOLLOW | FLAG_RETURNING (1024): {pcon_r}")
+check(log2_r is not None and (log2_r[10] & 7) == 4 and (log2_r[10] & 1024) == 0 and log2_r[7] == rb_char.unit_number,
+      f"rb: logistic delivery FOLLOW does NOT set FLAG_RETURNING: {log2_r}")
+check(scon_r is not None and (scon_r[10] & 7) == 0 and (scon_r[10] & 1024) == 0,
+      f"rb: stationary construction robot empty-queue returns FLY_TARGET without FLAG_RETURNING: {scon_r}")
+check(not of_type(msgs_prs, "rc"), "rb: rc stays suppressed while altc is off even when robot carries cargo")
+
+# Turn Alt-mode on -> rc emitted with rare quality; turn Alt-mode off -> single empty clear, then silent.
+send({"t": "altc", "on": 1, "g": 1})
+tick(12)
+rc_on = of_type(take(), "rc")
+rc_hit = next((m for m in rc_on if rb_pcon.unit_number in (m.get("l") or [])), None)
+check(rc_hit is not None and rc_hit.get("l") and rc_hit.get("q") and rb_pcon.unit_number in rc_hit["q"] and "rare" in rc_hit["q"],
+      f"rb + altc on: emits rc with carried item and non-normal quality q: {rc_on}")
+send({"t": "altc", "on": 0})
+tick(4)
+rc_clr = of_type(take(), "rc")
+check(len(rc_clr) == 1 and rc_clr[0].get("l") == [],
+      f"rb + altc off: emits single empty rc clear: {rc_clr}")
+tick(12)
+check(not of_type(take(), "rc"), "rb + altc off: emits no further rc after clear")
+
+rb_pcon.destroy()
+rb_log2.destroy()
+rb_char.logistic_cell = None
+rb_char.logistic_network = None
+tick(4)
+take()
 
 # /f3d-perf robot_sim off sends snap=1 empty u and restores construction-robot to mv + rc.
 F.commands["f3d-perf"](lua.table_from({"name": "f3d-perf", "parameter": "robot_sim off"}))
@@ -542,7 +600,7 @@ ins_mod.reset()
 tick(1)
 take()
 
-# robots.lua near_first: > MAX_CHECKS (250) due robots prioritize <=48 ahead of outer, and NEAR_SCAN_TICKS=4 catches new near robot.
+# robots.lua near_first: > MAX_CHECKS (250) due robots prioritize <=48 ahead of outer, and NEAR_SCAN_TICKS catches new near robot.
 rb_outer, rb_near = [], []
 for idx in range(260):
     rb_outer.append(spawn("construction-robot", 60.0 + (idx % 20) * 2.0, 60.0 + (idx // 20) * 2.0, force="player"))
@@ -552,8 +610,8 @@ rb_near_ids = {int(e.unit_number) for e in rb_near}
 rb_mod = g.package.loaded["scripts.robots"]
 rb_mod.reset()
 set_perf(near_first=True)
-# Run full 8-strip sweep so all 275 robots are tracked (16 ticks).
-tick(18)
+# Run full 8-strip sweep so all 275 robots are tracked (16 ticks), then reach 60-tick mod cache boundary.
+tick(60)
 take()
 # Force all 275 robots due at once by changing worker_robots_speed_modifier!
 g.game.forces["player"].worker_robots_speed_modifier = 0.25
@@ -564,28 +622,43 @@ check(rb_near_ids <= rb_on_units,
       f"near_first robots (on): all {len(rb_near_ids)} near robots checked & sent ahead of >250 outer backlog (got {len(rb_near_ids & rb_on_units)})")
 tick(2)
 take()
-set_perf(near_first=False)
+set_perf(near_first=False, robot_opt=False)
 g.game.forces["player"].worker_robots_speed_modifier = 0.50
 tick(1)
 rb_t1_off = of_type(take(), "rb")
 rb_off_units = {m["u"][i] for m in rb_t1_off for i in range(0, len(m.get("u", [])), 11)}
-check(len(rb_off_units) == 250 and len(rb_near_ids & rb_off_units) < len(rb_near_ids) or True,
-      "near_first robots (off): runs unprioritized MAX_CHECKS=250 loop")
-# NEAR_SCAN_TICKS=4: spawn a new near robot right after near scan and confirm it appears in rb within 4 ticks (vs full 16t sweep).
+check(len(rb_off_units) == 250 and len(rb_near_ids & rb_off_units) < len(rb_near_ids),
+      f"near_first robots (off): runs unprioritized MAX_CHECKS=250 loop (got {len(rb_off_units)}, near={len(rb_near_ids & rb_off_units)})")
+# NEAR_SCAN_OPT=8 (robot_opt on): detects new <=48 near robot within 8-9 ticks (vs 32t full sweep).
 set_perf(near_first=True)
 rb_mod.reset()
 tick(18)
 take()
 rb_fresh = spawn("construction-robot", 4.5, 4.5, force="player")
 fresh_seen = False
-for _ in range(5):
+for _ in range(9):
     tick(1)
     for m in of_type(take(), "rb"):
         u = m.get("u", [])
         if any(u[i] == int(rb_fresh.unit_number) for i in range(0, len(u), 11)):
             fresh_seen = True
-check(fresh_seen, "near_first robots: NEAR_SCAN_TICKS=4 detects new <=48 near robot within 4-5 ticks")
+check(fresh_seen, "near_first robots: NEAR_SCAN_OPT=8 detects new <=48 near robot within 8-9 ticks")
 rb_fresh.destroy()
+# NEAR_SCAN_TICKS=4 (robot_opt off): detects new <=48 near robot within 4-5 ticks.
+set_perf(near_first=True, robot_opt=False)
+rb_mod.reset()
+tick(18)
+take()
+rb_fresh_off = spawn("construction-robot", 4.5, 4.5, force="player")
+fresh_seen_off = False
+for _ in range(5):
+    tick(1)
+    for m in of_type(take(), "rb"):
+        u = m.get("u", [])
+        if any(u[i] == int(rb_fresh_off.unit_number) for i in range(0, len(u), 11)):
+            fresh_seen_off = True
+check(fresh_seen_off, "near_first robots (robot_opt off): NEAR_SCAN_TICKS=4 detects new <=48 near robot within 4-5 ticks")
+rb_fresh_off.destroy()
 for e in rb_outer + rb_near:
     e.destroy()
 g.game.forces["player"].worker_robots_speed_modifier = 0.0
@@ -1154,7 +1227,7 @@ take()
 # Verify all new switches appear in command listings (default ON) and can be toggled cleanly.
 ups_perf_cmd = str(ups_perf_mod.command("")[1])
 for sw in ("mover_move_scan", "st_working_slice", "splitter_throttle",
-           "inserter_look_budget", "fluids_budget", "alt_cadence"):
+           "inserter_look_budget", "fluids_budget", "alt_cadence", "robot_opt"):
     check(f"{sw} on" in ups_perf_cmd, f"/f3d-perf lists {sw} on by default: {ups_perf_cmd}")
 F.commands["f3d-perf"](lua.table_from({"name": "f3d-perf", "parameter": "alt_cadence off"}))
 check("alt_cadence off (set)" in str(ups_perf_mod.command("")[1]), "/f3d-perf toggles alt_cadence off")
@@ -2033,3 +2106,360 @@ send({"t": "budget", "u": ups_budget0})
 alive(3)
 take()
 
+# --- Worker Track 1: robot_opt (force_mods cache, roboport scan throttle, logistic_cell cache, is_empty(), rate scaling, budget cap) ---
+ro_mod = g.package.loaded["scripts.robots"]
+ro_ox, ro_oy = 4200, 4200
+ro_hello = {"t": "hello", "v": 1, "sid": "rb-opt", "w": 0, "b": 1, "rb": 1}
+ro_keepalive = {"t": "hello", "v": 1, "sid": "rb-opt", "w": 1, "b": 1, "rb": 1}
+
+
+def ro_tick(n=1):
+    for _ in range(n):
+        if int(g.game.tick) % 200 == 0:
+            send(ro_keepalive)
+        tick(1)
+
+
+send({"t": "bye"})
+tick(1)
+send(ro_hello)
+send({"t": "focus", "x": ro_ox * 256, "y": ro_oy * 256, "r": 64})
+send({"t": "rate", "l": 0})
+ro_tick(10)
+take()
+
+ro_chest_a = spawn("wooden-chest", ro_ox + 6.5, ro_oy + 0.5, force="player")
+ro_chest_b = spawn("wooden-chest", ro_ox + 22.5, ro_oy + 0.5, force="player")
+ro_rp = spawn("roboport", ro_ox - 2.5, ro_oy - 2.5, force="player")
+ro_log = spawn("logistic-robot", ro_ox - 4.5, ro_oy + 0.5, force="player")
+ro_log.orientation = 0.25
+ro_log.energy = 1500000
+ro_log.robot_order_queue = lua.table_from([
+    lua.table_from({"type": OT.pickup, "target": ro_chest_a}),
+    lua.table_from({"type": OT.deliver, "target": ro_chest_b}),
+])
+ro_log.get_inventory(g.defines.inventory.robot_cargo).insert(lua.table_from({"name": "iron-plate", "count": 1}))
+ro_con = spawn("construction-robot", ro_ox + 22.4, ro_oy + 0.5, force="player")
+ro_con.orientation = 0.25
+ro_con.robot_order_queue = lua.table_from([lua.table_from({"type": OT.construct, "target": ro_chest_b})])
+
+
+def ro_snapshot(opt_on):
+    set_perf(robot_opt=opt_on)
+    ro_mod.reset()
+    ro_tick(18)
+    recs = rb_recs(take())
+    out = {}
+    for u in (ro_log.unit_number, ro_con.unit_number):
+        r = recs.get(u)
+        if r is not None:
+            # Ignore tick timestamp r[2] since sweep duration differs slightly; compare everything else.
+            out[u] = [r[0], r[1]] + list(r[3:])
+    return out
+
+
+ro_snap_on = ro_snapshot(True)
+ro_snap_off = ro_snapshot(False)
+check(ro_log.unit_number in ro_snap_on and ro_con.unit_number in ro_snap_on and ro_snap_on == ro_snap_off,
+      f"robot_opt on vs off parity: identical rb leg records (on={ro_snap_on}, off={ro_snap_off})")
+check((ro_snap_on[ro_log.unit_number][-1] & 8) != 0 and (ro_snap_on[ro_con.unit_number][-1] & 128) != 0,
+      f"robot_opt parity: FLAG_CARGO and FLAG_WORKING preserved: {ro_snap_on}")
+
+# is_empty() cargo read & pcall fallback:
+set_perf(robot_opt=True)
+# Bind ro_log's real robot_cargo inventory to spy on is_empty() vs inv[1] without mutating LuaEntity.
+lua.eval("""function(robot)
+  F_ro_is_empty_calls = 0
+  F_ro_slot1_reads = 0
+  F_ro_throw_is_empty = false
+  local real_inv = robot.get_inventory(defines.inventory.robot_cargo)
+  F_ro_real_inv = real_inv
+  F_ro_orig_is_empty = real_inv.is_empty
+  F_ro_inv_orig_mt = getmetatable(real_inv)
+  real_inv.is_empty = function()
+    if F_ro_throw_is_empty then error("is_empty missing") end
+    F_ro_is_empty_calls = F_ro_is_empty_calls + 1
+    return F_ro_orig_is_empty()
+  end
+  setmetatable(real_inv, {
+    __index = function(t, k)
+      if k == 1 then F_ro_slot1_reads = F_ro_slot1_reads + 1 end
+      return F_ro_inv_orig_mt.__index(t, k)
+    end,
+    __len = F_ro_inv_orig_mt.__len,
+  })
+end""")(ro_log)
+ro_mod.reset()
+ro_tick(18)
+recs_cargo = rb_recs(take())
+check(int(g.F_ro_is_empty_calls) > 0 and int(g.F_ro_slot1_reads) == 0
+      and (recs_cargo[ro_log.unit_number][10] & 8) != 0,
+      f"robot_opt is_empty(): uses inv.is_empty() ({g.F_ro_is_empty_calls} calls) without inv[1] ({g.F_ro_slot1_reads} reads)")
+ro_log.get_inventory(g.defines.inventory.robot_cargo).remove(lua.table_from({"name": "iron-plate", "count": 1}))
+ro_tick(65)
+recs_empty = rb_recs(take())
+check(recs_empty.get(ro_log.unit_number) is not None and (recs_empty[ro_log.unit_number][10] & 8) == 0,
+      f"robot_opt is_empty(): clears FLAG_CARGO when cargo removed: {recs_empty.get(ro_log.unit_number)}")
+# Fallback when is_empty throws:
+ro_log.get_inventory(g.defines.inventory.robot_cargo).insert(lua.table_from({"name": "iron-plate", "count": 1}))
+g.F_ro_throw_is_empty = True
+ro_tick(65)
+recs_fb = rb_recs(take())
+check(int(g.F_ro_slot1_reads) > 0 and recs_fb.get(ro_log.unit_number) is not None
+      and (recs_fb[ro_log.unit_number][10] & 8) != 0,
+      f"robot_opt is_empty() fallback: pcall falls back to inv[1] ({g.F_ro_slot1_reads} reads) and sets FLAG_CARGO")
+lua.execute("""
+F_ro_real_inv.is_empty = F_ro_orig_is_empty
+setmetatable(F_ro_real_inv, F_ro_inv_orig_mt)
+""")
+
+# force_mods 60-tick caching & reset invalidation:
+set_perf(robot_opt=True)
+ro_mod.reset()
+ro_tick(1)
+take()
+m0 = int(ro_mod.counts.mod_reads)
+ro_tick(58)
+m1 = int(ro_mod.counts.mod_reads)
+check(m1 == m0, f"robot_opt force_mods cache: 0 extra mod reads over 58 ticks ({m0} -> {m1})")
+ro_tick(2)
+m2 = int(ro_mod.counts.mod_reads)
+check(m2 == m0 + 1, f"robot_opt force_mods cache: refreshes at 60 ticks ({m1} -> {m2})")
+ro_mod.reset()
+ro_tick(1)
+m3 = int(ro_mod.counts.mod_reads)
+check(m3 == m2 + 1, f"robot_opt force_mods cache: reset() invalidates cache ({m2} -> {m3})")
+send({"t": "focus", "x": (ro_ox + 40) * 256, "y": ro_oy * 256, "r": 64})
+ro_tick(1)
+m4 = int(ro_mod.counts.mod_reads)
+check(m4 == m3 + 1, f"robot_opt force_mods cache: focus jump invalidates cache ({m3} -> {m4})")
+set_perf(robot_opt=False)
+m_off0 = int(ro_mod.counts.mod_reads)
+ro_tick(10)
+m_off1 = int(ro_mod.counts.mod_reads)
+check(m_off1 == m_off0 + 10, f"robot_opt off force_mods: reads every tick ({m_off1 - m_off0}/10)")
+
+# Roboport scan throttling (120t / >= 16-tile move) + logistic_cell handle caching + empty-roboport skip:
+set_perf(robot_opt=True)
+send({"t": "focus", "x": ro_ox * 256, "y": ro_oy * 256, "r": 64})
+ro_mod.reset()
+ro_tick(1)
+take()
+rp0 = int(ro_mod.counts.rp_scans)
+ro_tick(100)
+rp1 = int(ro_mod.counts.rp_scans)
+check(rp1 == rp0, f"robot_opt roboport throttle: 0 extra scans standing still for 100 ticks ({rp0} -> {rp1})")
+send({"t": "focus", "x": (ro_ox + 8) * 256, "y": ro_oy * 256, "r": 64})
+ro_tick(1)
+rp2 = int(ro_mod.counts.rp_scans)
+check(rp2 == rp0, f"robot_opt roboport throttle: moving 8 tiles (<16) does not rescan ({rp0} -> {rp2})")
+send({"t": "focus", "x": (ro_ox + 17) * 256, "y": ro_oy * 256, "r": 64})
+ro_tick(1)
+rp3 = int(ro_mod.counts.rp_scans)
+check(rp3 == rp0 + 1, f"robot_opt roboport throttle: moving 17 tiles (>=16) rescans immediately ({rp0} -> {rp3})")
+ro_tick(120)
+rp4 = int(ro_mod.counts.rp_scans)
+check(rp4 == rp3 + 1, f"robot_opt roboport throttle: rescans at 120-tick interval ({rp3} -> {rp4})")
+set_perf(robot_opt=False)
+rp_off0 = int(ro_mod.counts.rp_scans)
+ro_tick(64)
+rp_off1 = int(ro_mod.counts.rp_scans)
+check(rp_off1 - rp_off0 >= 3, f"robot_opt off roboport: rescans every 16t strip-1 sweep ({rp_off1 - rp_off0} scans in 64t)")
+
+# logistic_cell handle caching & .valid revalidation:
+set_perf(robot_opt=True)
+send({"t": "focus", "x": ro_ox * 256, "y": ro_oy * 256, "r": 64})
+lua.eval("""function(rp)
+  F_ro_rp = rp
+  F_ro_rp_orig_mt = getmetatable(rp)
+  F_ro_orig_cell = rp.logistic_cell
+  F_ro_cell_override = nil
+  F_ro_cell_gets = 0
+  setmetatable(rp, {
+    __index = function(t, k)
+      if k == "logistic_cell" then
+        F_ro_cell_gets = F_ro_cell_gets + 1
+        if F_ro_cell_override then return F_ro_cell_override end
+      end
+      return F_ro_rp_orig_mt.__index(t, k)
+    end,
+    __newindex = F_ro_rp_orig_mt.__newindex,
+  })
+end""")(ro_rp)
+ro_mod.reset()
+ro_tick(1)
+take()
+cg1 = int(g.F_ro_cell_gets)
+ro_tick(36)  # 3 more 12-tick charge polls
+cg2 = int(g.F_ro_cell_gets)
+check(cg1 == 1 and cg2 == 1, f"robot_opt logistic_cell cache: fetched once and reused across polls ({cg1} -> {cg2})")
+lua.execute("""
+F_ro_orig_cell.valid = false
+F_ro_cell_override = { valid = true, object_name = "LuaLogisticCell", charging_robots = {}, to_charge_robots = {} }
+""")
+ro_tick(13)
+cg3 = int(g.F_ro_cell_gets)
+check(cg3 == 2, f"robot_opt logistic_cell cache: revalidates when cached cell.valid becomes false ({cg2} -> {cg3})")
+lua.execute("""
+F_ro_orig_cell.valid = true
+setmetatable(F_ro_rp, F_ro_rp_orig_mt)
+""")
+
+# Empty roboport fast-skip:
+send({"t": "focus", "x": 6200 * 256, "y": 6200 * 256, "r": 64})
+ro_mod.reset()
+ro_tick(1)
+take()
+ch_empty0 = int(ro_mod.counts.ch_polls)
+ro_tick(30)
+ch_empty1 = int(ro_mod.counts.ch_polls)
+check(ch_empty1 == ch_empty0, f"robot_opt empty roboport skip: 0 charge polls when roboports is empty ({ch_empty0} -> {ch_empty1})")
+set_perf(robot_opt=False)
+ch_off_e0 = int(ro_mod.counts.ch_polls)
+ro_tick(16)
+ch_off_e1 = int(ro_mod.counts.ch_polls)
+check(ch_off_e1 - ch_off_e0 == 4, f"robot_opt off empty roboport: still polls every 4t ({ch_off_e1 - ch_off_e0} in 16t)")
+
+# Rate scaling (rate 0 -> 1 -> 2 -> 3):
+set_perf(robot_opt=True)
+send({"t": "focus", "x": ro_ox * 256, "y": ro_oy * 256, "r": 64})
+ro_mod.reset()
+ro_tick(10)
+take()
+
+
+def measure_rate_counts(lvl, ticks=96):
+    send({"t": "rate", "l": lvl})
+    ro_tick(1)
+    s0 = int(ro_mod.counts.strip_scans)
+    n0 = int(ro_mod.counts.near_scans)
+    c0 = int(ro_mod.counts.ch_polls)
+    ro_tick(ticks)
+    take()
+    return (int(ro_mod.counts.strip_scans) - s0,
+            int(ro_mod.counts.near_scans) - n0,
+            int(ro_mod.counts.ch_polls) - c0)
+
+
+r0_c = measure_rate_counts(0)
+r1_c = measure_rate_counts(1)
+r2_c = measure_rate_counts(2)
+r3_c = measure_rate_counts(3)
+check(r0_c[0] > r1_c[0] > r2_c[0] > r3_c[0]
+      and r0_c[1] > r1_c[1] > r2_c[1] >= r3_c[1]
+      and r0_c[2] > r1_c[2] > r2_c[2] >= r3_c[2]
+      and r0_c == (24, 12, 8) and r1_c == (12, 6, 4) and r2_c == (6, 3, 2) and r3_c[0] == 3,
+      f"robot_opt rate scaling: r0={r0_c}, r1={r1_c}, r2={r2_c}, r3={r3_c}")
+set_perf(robot_opt=False)
+r2_off = measure_rate_counts(2, 32)
+check(r2_off == (16, 8, 8), f"robot_opt off ignores rate scaling at rate 2: {r2_off}")
+send({"t": "rate", "l": 0})
+
+# Budget & rate capping of robot_checks and rr_budget:
+set_perf(robot_opt=True)
+ro_bx, ro_by = 6400, 6400
+send({"t": "focus", "x": ro_bx * 256, "y": ro_by * 256, "r": 64})
+ro_swarm = [spawn("construction-robot", ro_bx - 20 + (i % 12) * 3, ro_by - 20 + (i // 12) * 3, force="player") for i in range(120)]
+ro_mod.reset()
+send({"t": "budget", "u": 300})
+ro_tick(60)  # complete sweep and hit 60-tick mod cache boundary
+take()
+send({"t": "budget", "u": 50})
+g.game.forces["player"].worker_robots_speed_modifier = 0.25
+rc0 = int(ro_mod.counts.robot_checks)
+ro_tick(1)
+rc1 = int(ro_mod.counts.robot_checks)
+check((rc1 - rc0) == 50,
+      f"robot_opt budget cap: 120 due robots capped to 50 under budget=50 (got {rc1 - rc0})")
+ro_tick(4)
+take()
+send({"t": "budget", "u": 300})
+send({"t": "rate", "l": 2})
+ro_mod.reset()
+ro_tick(60)
+take()
+g.game.forces["player"].worker_robots_speed_modifier = 0.50
+rc2 = int(ro_mod.counts.robot_checks)
+ro_tick(1)
+rc3 = int(ro_mod.counts.robot_checks)
+check((rc3 - rc2) == 62,
+      f"robot_opt rate=2 cap: 120 due robots capped to 62 (MAX_CHECKS/4) (got {rc3 - rc2})")
+set_perf(robot_opt=False)
+send({"t": "budget", "u": 50})
+send({"t": "rate", "l": 0})
+g.game.forces["player"].worker_robots_speed_modifier = 0.75
+rc_off0 = int(ro_mod.counts.robot_checks)
+ro_tick(1)
+rc_off1 = int(ro_mod.counts.robot_checks)
+check((rc_off1 - rc_off0) == 120,
+      f"robot_opt off ignores budget=50 cap: checked all 120 in 1 tick (got {rc_off1 - rc_off0})")
+
+# Cleanup robot_opt tests:
+for e in [ro_chest_a, ro_chest_b, ro_rp, ro_log, ro_con] + ro_swarm:
+    if e.valid:
+        e.destroy()
+g.game.forces["player"].worker_robots_speed_modifier = 0.0
+send({"t": "rate", "l": 0})
+send({"t": "budget", "u": ups_budget0})
+send({"t": "focus", "x": fixed(saved_ups_focus[0]), "y": fixed(saved_ups_focus[1]), "r": saved_ups_focus[2]})
+set_perf()
+ro_mod.reset()
+ro_tick(3)
+take()
+
+
+
+# Renaming a train stop with all = 1 (Ctrl while submitting, Factorio's "rename all stops with this name")
+# renames every stop of that name; without it only the one. (Last, so no unit numbers shift under the others.)
+rn_a = spawn("train-stop", 3, 3, force="player", backer_name="Rn")
+rn_b = spawn("train-stop", 5, 3, force="player", backer_name="Rn")
+send(open_cmd(rn_a))
+tick(2)
+send({"t": "set_stop", "u": rn_a.unit_number, "name": "Rn2"})
+tick(2)
+check(rn_a.backer_name == "Rn2" and rn_b.backer_name == "Rn", "set_stop renames only that stop without all")
+rn_a.backer_name = "Rn"
+send({"t": "set_stop", "u": rn_a.unit_number, "name": "Rn3", "all": 1})
+tick(2)
+check(rn_a.backer_name == "Rn3" and rn_b.backer_name == "Rn3", "set_stop with all: 1 renames every stop with that name (Ctrl while submitting)")
+take()
+
+# Editing a train's schedule keeps it heading for the record it was going to (the game's set_records sends
+# it back to the first one).
+rn_loco = spawn("locomotive", 9, 9, force="player")
+send(open_cmd(rn_loco))
+tick(2)
+rn_w = [{"type": "time", "compare_type": "or", "ticks": 600}]
+send({"t": "set_schedule", "u": rn_loco.unit_number, "records": [{"station": "A", "wait_conditions": rn_w}, {"station": "B", "wait_conditions": rn_w}, {"station": "C", "wait_conditions": rn_w}]})
+send({"t": "train_go", "u": rn_loco.unit_number, "i": 3})
+tick(2)
+rn_sched = rn_loco.train.get_schedule()
+check(rn_sched.current == 3, f"train_go sets the record the train heads for: {rn_sched.current}")
+send({"t": "set_schedule", "u": rn_loco.unit_number, "records": [{"station": "A", "wait_conditions": rn_w}, {"station": "B", "wait_conditions": rn_w}, {"station": "C", "wait_conditions": [{"type": "time", "compare_type": "or", "ticks": 1200}]}]})
+tick(2)
+check(rn_sched.current == 3, f"set_schedule (a wait condition changed) keeps the train heading for record 3: {rn_sched.current}")
+rn_loco.train.manual_mode = True
+send({"t": "set_schedule", "u": rn_loco.unit_number, "records": [{"station": "A", "wait_conditions": rn_w}, {"station": "B", "wait_conditions": rn_w}, {"station": "C", "wait_conditions": rn_w}]})
+tick(2)
+check(rn_sched.current == 3 and rn_loco.train.manual_mode is True, f"a manual train stays manual when its schedule is edited: {rn_sched.current}")
+send({"t": "set_schedule", "u": rn_loco.unit_number, "records": [{"station": "A", "wait_conditions": rn_w}]})
+tick(2)
+check(rn_sched.current == 1, f"and a shorter schedule clamps it: {rn_sched.current}")
+take()
+
+# A stop's "Trains on the way" counts a train standing at it too (path_end_stop is nil once it has arrived).
+F.train_data[rn_loco.train].station = rn_a
+F.stop_trains[rn_a] = lua.table_from({rn_loco.train})
+send(open_cmd(rn_a))
+tick(2)
+rn_gui = [m for m in take() if m.get("t") == "gui" and m.get("u") == rn_a.unit_number]
+rn_trs = rn_gui[-1]["stop"]["trs"] if rn_gui else None
+check(rn_trs and rn_trs[0][2] == 1, f"a train standing at the stop is counted as heading there in the stop's trs: {rn_trs}")
+# Clean up, so the stops and the train don't count in the scans of the tests after this one.
+F.stop_trains[rn_a] = None
+F.train_data[rn_loco.train].station = None
+for e in (rn_a, rn_b, rn_loco):
+    if e.valid:
+        e.destroy()
+tick(2)
+take()

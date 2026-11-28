@@ -37,6 +37,7 @@ extends Node3D
 
 const NativeLibrary := preload("res://scripts/native_library.gd")
 const FreeLater := preload("res://scripts/world/free_later.gd")
+const RenderReads := preload("res://scripts/world/render_reads.gd")
 const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ItemModels := preload("res://scripts/world/item_models.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
@@ -50,6 +51,7 @@ const DecorSheetBaker := preload("res://scripts/world/decor_sheet_baker.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const WeatherState := preload("res://scripts/world/weather_state.gd")
 const ModelLods := preload("res://scripts/world/model_lods.gd")
+const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const SHADER := preload("res://shaders/decorative.gdshader")
 const SHADER_FLAT := preload("res://shaders/decorative_flat.gdshader")
 const SHADER_SHEET := preload("res://shaders/decorative_sheet.gdshader")
@@ -252,9 +254,78 @@ static var native_decor := Switches.on("--native-decor")
 static var _decor_native: Object = null
 ## --decor-sheet=off: keeps flat decoratives as overlapping MultiMeshInstance3Ds per chunk.
 static var sheet_enabled := Switches.on("--decor-sheet")
-## Block-compress baked decorative sheets only when opted in via --decor-sheet-compress=on in
-## editor builds (Image.compress S3TC fans across all WorkerThreadPool threads).
-static var sheet_compress := OS.has_feature("editor") and (Switches.has("--decor-sheet-compress=on"))
+## Block-compress baked decorative sheets when --decor-sheet-compress=on in editor builds or when
+## TextureCompressNative (BC3 / FORMAT_DXT5) is active (--native-bc-compress=on/force).
+static var _tex_compress_native: Object = null
+static var _tex_compress_checked := false
+static var sheet_compress := _init_sheet_compress()
+
+
+static func _native_bc_mode() -> String:
+	if not Switches.on("--native-bc-compress"):
+		return "off"
+	if Switches.has("--native-bc-compress=force"):
+		return "force"
+	return "on"
+
+
+static func _native_tex_compressor() -> Object:
+	if _native_bc_mode() == "off":
+		return null
+	if _tex_compress_native == null and not _tex_compress_checked:
+		if OS.get_thread_caller_id() == OS.get_main_thread_id():
+			_tex_compress_checked = true
+			if NativeLibrary.ensure() and ClassDB.class_exists(&"TextureCompressNative"):
+				_tex_compress_native = ClassDB.instantiate(&"TextureCompressNative")
+		elif ClassDB.class_exists(&"TextureCompressNative"):
+			_tex_compress_native = ClassDB.instantiate(&"TextureCompressNative")
+	return _tex_compress_native
+
+
+static func _use_native_bc3() -> bool:
+	var mode := _native_bc_mode()
+	if mode == "off":
+		return false
+	if mode == "force":
+		return _native_tex_compressor() != null
+	return not OS.has_feature("editor") and _native_tex_compressor() != null
+
+
+static func _init_sheet_compress() -> bool:
+	if not Switches.has("--decor-sheet-compress=on"):
+		return false
+	if _use_native_bc3():
+		return true
+	return OS.has_feature("editor")
+
+
+static func refresh_compress_mode() -> bool:
+	_tex_compress_checked = false
+	if _native_bc_mode() == "off":
+		_tex_compress_native = null
+	sheet_compress = _init_sheet_compress()
+	return sheet_compress
+
+
+## Compresses a baked RGBA8 decorative sheet Image to BC3 (Image.FORMAT_DXT5) via
+## TextureCompressNative when active, or Godot's S3TC compressor in editor builds.
+static func compress_sheet_image(img: Image) -> Image:
+	if img == null or img.is_empty():
+		return null
+	if _use_native_bc3():
+		var comp := _native_tex_compressor()
+		if comp != null:
+			var out: Image = comp.call(&"compress_image", img, true, not img.has_mipmaps()) as Image
+			if out != null and not out.is_empty():
+				return out
+	if OS.has_feature("editor"):
+		var copy := img.duplicate() as Image
+		if copy != null and not copy.is_empty():
+			if not copy.has_mipmaps():
+				copy.generate_mipmaps()
+			if copy.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_GENERIC) == OK:
+				return copy
+	return null
 
 
 ## One decorative's pictures, ready to draw (made on the main thread from its KindData).
@@ -290,6 +361,7 @@ class BuildJob:
 	var floors := PackedByteArray()
 	var recs: Array = []
 	var foot := {}
+	var silos := {}
 	var spill_in := PackedInt32Array()
 	var near := {}
 	## Only the mask may have changed (a build, a tile): the nodes stay unless it or the flat tufts did.
@@ -384,6 +456,7 @@ var _floor_names := {}
 var _floor_gen := 0  # raised by each `iuse`
 var _floors := PackedByteArray()  # per tile id: 1 a floor
 var _foot := {}  # proto id -> Vector4(tiles across, down, box centre x, y): buildings only
+var _silos := {}  # proto id -> true: rocket-silo prototypes (octagonal footprint)
 var _rules_key := Vector3i(-1, -1, -1)  # tile names, entity protos and floor names they were made from
 var _masks := {}  # Vector2i -> PackedInt32Array, a row of bits per tile row
 var _spills := {}  # Vector2i -> PackedInt32Array: its buildings' footprints reaching out of it
@@ -748,10 +821,13 @@ func _refresh_rules() -> bool:
 	_floors = floors
 	# A new table each time: jobs on worker threads read the one they were given.
 	var foot := {}
+	var silos := {}
 	for id in entities:
 		var p = entities[id]
 		if NOT_BUILDINGS.has(p.type):
 			continue
+		if p.type == "rocket-silo":
+			silos[id] = true
 		var tiles: Vector2i = p.tile_size
 		var size: Vector2 = p.size()
 		var w := tiles.x if tiles.x > 0 else maxi(1, roundi(size.x))
@@ -759,6 +835,7 @@ func _refresh_rules() -> bool:
 		var centre: Vector2 = p.center()
 		foot[id] = Vector4(w, h, centre.x, centre.y)
 	_foot = foot
+	_silos = silos
 	return true
 
 
@@ -1229,6 +1306,7 @@ func _mask_inputs(c: Vector2i, job: BuildJob) -> void:
 	_refresh_rules()
 	job.floors = _floors
 	job.foot = _foot
+	job.silos = _silos
 	var cv = world.chunks.get(c) if world != null and is_instance_valid(world) else null
 	if cv is Object:
 		var tiles = cv.get("tile_ids")
@@ -1714,6 +1792,18 @@ static func _mask_of(job: BuildJob) -> void:
 			mask[y] = row
 	var area := Rect2i(c * CHUNK, Vector2i(CHUNK, CHUNK))
 	for r in job.recs:
+		if ModelLibrary.rocket_vfx_enhanced and job.silos.has(r.proto_id):
+			var cx := floori(r.pos.x)
+			var cy := floori(r.pos.y)
+			for oct: Rect2i in [
+				Rect2i(cx - 2, cy - 4, 5, 8),
+				Rect2i(cx - 3, cy - 3, 7, 6),
+				Rect2i(cx - 4, cy - 2, 9, 4),
+			]:
+				_fill(mask, oct, area)
+				if not area.encloses(oct):
+					job.spill.append_array([oct.position.x, oct.position.y, oct.end.x, oct.end.y])
+			continue
 		var f = job.foot.get(r.proto_id)
 		if f == null:
 			continue
@@ -1816,12 +1906,7 @@ static func _mesh_tris(mesh: Mesh) -> int:
 		return 0
 	var total := 0
 	for s in mesh.get_surface_count():
-		var arrays := mesh.surface_get_arrays(s)
-		var idx: Variant = arrays[Mesh.ARRAY_INDEX]
-		if idx is PackedInt32Array and not (idx as PackedInt32Array).is_empty():
-			total += (idx as PackedInt32Array).size() / 3
-		elif arrays[Mesh.ARRAY_VERTEX] is PackedVector3Array:
-			total += (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() / 3
+		total += RenderReads.triangles(mesh, s)  # the mesh's own counts or CPU copy: no renderer read
 	return total
 
 
@@ -1995,6 +2080,9 @@ static func _load_pack_image(path: String) -> Image:
 	if path.begins_with("res://") and not FileAccess.file_exists(path):
 		var tex := load(path) as Texture2D
 		if tex != null:
+			# A renderer read (waits for the render thread when it runs on its own), but only while a pack's
+			# pictures load or its swatch is drawn in the packs list, once per picture (an imported res:// picture
+			# keeps no CPU copy): left as it is.
 			img = tex.get_image()
 	else:
 		img = Image.load_from_file(path)
@@ -2763,7 +2851,8 @@ func _step_sheets(delta: float) -> void:
 		_apply_sheet(best_c, gen, 0, null, true)
 		return
 	var want := sheet_size_for(best_c, _culled_at, int(_sheet_size.get(best_c, 0)))
-	_baker.start_bake(best_c, gen, want, sources, sheet_compress, texture_thread)
+	var nat_comp: Object = _native_tex_compressor() if _use_native_bc3() else null
+	_baker.start_bake(best_c, gen, want, sources, sheet_compress, texture_thread, nat_comp)
 
 
 func _apply_sheet(c: Vector2i, gen: int, size: int, texture: ImageTexture, empty: bool) -> void:

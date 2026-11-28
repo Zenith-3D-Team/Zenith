@@ -281,6 +281,19 @@ func _iw_storm_wind(node: Node, sfx: Node, st) -> void:
 	st.set_value("storm_wind", "new", false)
 	check(audio.wind_arg(PackedStringArray(["--x", "--weather-wind=old"])) == "old" and audio.wind_arg(PackedStringArray()) == "",
 		"storm wind: --weather-wind=old is read")
+	# Rain and wind tone (0.3.5): Soft files by default, the originals in sounds/original/.
+	check(audio.tone_path("sounds/rain-heavy.ogg") == "sounds/rain-heavy.ogg" and not audio.original_tone(), "weather tone: soft files by default")
+	st.set_value("sound_tone", "original", false)
+	check(audio.original_tone(), "weather tone: the setting picks the originals")
+	_iw_run(node, 1.0)
+	check(audio.tone_path("sounds/rain-heavy.ogg") == "sounds/original/rain-heavy.ogg", "weather tone: original files are under sounds/original/")
+	st.set_value("sound_tone", "soft", false)
+	_iw_run(node, 1.0)
+	check(audio.sounds_arg(PackedStringArray(["--weather-sounds=original"])) == "original" and audio.sounds_arg(PackedStringArray()) == "",
+		"weather tone: --weather-sounds=original is read")
+	var soft_s := SoundBank.stream("addon:immersive-weather/sounds/rain-heavy.ogg", true)
+	var orig_s := SoundBank.stream("addon:immersive-weather/sounds/original/rain-heavy.ogg", true)
+	check(soft_s != null and orig_s != null and absf(soft_s.get_length() - 18.0) < 0.1 and absf(orig_s.get_length() - 18.0) < 0.1, "weather tone: both rain-heavy files load, 18 s")
 
 
 func _iw_run(node: Node, secs: float, step := 0.5) -> void:
@@ -840,7 +853,7 @@ func _immersive_weather_timeline(node: Node) -> void:
 	Bridge._set_cue(-1)
 	check(world.cue_tick() == -1 and heard == [7000, -1], "1.92: the cue cleared, cue_tick() falls back to --cue-tick (none: -1)")
 	Bridge.cue_changed.disconnect(on_cue)
-	check(node.api.has_signal("cue_changed") and is_equal_approx(node.api.level, 1.93), "1.92: api.cue_changed is there")
+	check(node.api.has_signal("cue_changed") and node.api.level >= 1.93, "1.92: api.cue_changed is there")
 
 	check(d.timeline_arg(PackedStringArray(["--x", "--weather-timeline=t.json"])) == "t.json" and d.timeline_arg(PackedStringArray()) == "",
 		"weather timeline: --weather-timeline=<file> read from the command line")
@@ -1400,6 +1413,10 @@ func _immersive_enemies(fake) -> void:
 	# all-at-once path (0.1.2 would spread the third onwards over frames; tests/enemies_burst_probe.gd).
 	check(bool(node.burst_spread), "immersive enemies: spreads death bursts over frames by default (0.1.2)")
 	node.burst_spread = false
+	# These checks read the GDScript loops' arrays (_droplets, _gibs, _globs, _pools); the C++ ones are
+	# held by their own tests (biter_gore_native_test, acid_goo_native_test, biter_ragdoll_native_test).
+	for sys: Object in [node._ragdoll, node._gore, node._acid]:
+		sys.use_native = false
 	check(cr.on_died_hook.is_valid() and fake_fx.on_damaged_hook.is_valid()
 		and fake_weapons.on_stream_hook.is_valid() and fake_weapons.on_ground_hook.is_valid()
 		and cr._anim_enabled,
@@ -1457,17 +1474,17 @@ func _immersive_enemies(fake) -> void:
 	add_child(b5_node)
 	cr.add(1005, "big-biter", b5_node, -1)
 
-	# Non-Nauvis creature (Gleba wriggler) damage & death should NOT be intercepted.
-	var wrig_dmg := {"unit": 1099, "name": "small-wriggler-pentapod", "pos": Vector3(8.0, 0.0, 8.0),
+	# Unsupported creature (Vulcanus demolisher) damage & death should NOT be intercepted.
+	var demo_dmg := {"unit": 1099, "name": "small-demolisher", "pos": Vector3(8.0, 0.0, 8.0),
 		"cause_pos": Vector3(2.0, 0.0, 8.0), "damage_type": "physical", "fx": "blood",
 		"dmg": 120, "hp": 880, "src": "firearm-magazine"}
-	fake_fx.on_damaged_hook.call(wrig_dmg)
-	var wrig_die := {"unit": 1099, "name": "small-wriggler-pentapod", "pos": Vector3(8.0, 0.0, 8.0),
-		"yaw": 0.0, "vel": Vector3.ZERO, "scale": 0.5, "phase": 0.0,
+	fake_fx.on_damaged_hook.call(demo_dmg)
+	var demo_die := {"unit": 1099, "name": "small-demolisher", "pos": Vector3(8.0, 0.0, 8.0),
+		"yaw": 0.0, "vel": Vector3.ZERO, "scale": 1.0, "phase": 0.0,
 		"cause_pos": Vector3(2.0, 0.0, 8.0), "damage_type": "physical", "dmg": 120, "src": "", "handled": false}
-	cr.on_died_hook.call(wrig_die)
-	check(not bool(wrig_die.get("handled", false)),
-		"immersive enemies: leaves unsupported creatures (small-wriggler-pentapod) untouched")
+	cr.on_died_hook.call(demo_die)
+	check(not bool(demo_die.get("handled", false)),
+		"immersive enemies: leaves unsupported creatures (small-demolisher) untouched")
 
 	# Live biter hit -> hit-flinch override, gore droplets, live set_unit_wounds state, and ragdoll wound inheritance.
 	fake_fx.on_damaged_hook.call({"unit": 1001, "name": "small-biter", "pos": b1_node.position,
@@ -1582,7 +1599,8 @@ func _immersive_enemies(fake) -> void:
 	check(split_parts.has("head") and split_parts.has("thorax") and split_parts.has("abdomen")
 		and split_parts.size() == 3 and grenade_legs >= 3 and grenade_legs <= 5
 		and min_part_blood >= 0.85 and node._gore._droplets.size() > 0 and node._gore._gibs.size() > 0,
-		"immersive enemies: grenade splits body into head/thorax/abdomen + %d legs with min_blood=%.2f" % [grenade_legs, min_part_blood])
+		"immersive enemies: grenade splits body into head/thorax/abdomen + %d legs with min_blood=%.2f (parts %s, %d droplets, %d gibs)"
+		% [grenade_legs, min_part_blood, split_parts.keys(), node._gore._droplets.size(), node._gore._gibs.size()])
 
 	# 4) Spitter, worm & spawner support:
 	# Spitter grenade split -> 3 parts + 4..6 detached legs.
@@ -1758,6 +1776,7 @@ func _immersive_enemies(fake) -> void:
 		and str(ModelLib.addon_pack_overrides.get("biter-spawner", "")) == "builtin:placeholders",
 		"immersive enemies: toggling use_reworked_biters back on restores builtin:placeholders overrides")
 
+	node._acid.use_native = false  # a settings change above re-applied the add-on setting (native on)
 	# Slimy swamp-green acid goo: intercept spitter & worm acid streams and ground pools, ignore flamethrower & fire-flame.
 	fake_weapons.handle({
 		"t": "pj", "k": 10,
@@ -1820,6 +1839,192 @@ func _immersive_enemies(fake) -> void:
 	check(fallback_no_fire,
 		"immersive enemies: disabling acid_goo clears pools/globs and keeps vanilla acid pools free of fire smoke/glow")
 	node.api.settings.set_value("acid_goo", true)
+	node.burst_spread = false
+	for sys: Object in [node._ragdoll, node._gore, node._acid]:
+		sys.use_native = false
+
+	# 5) Gleba support: wrigglers, strafers, stompers, gleba-spawner, and stomper acid goo.
+	var gleba_meshes_ready := true
+	for gproto in ["big-wriggler-pentapod", "small-wriggler-pentapod-premature",
+			"small-strafer-pentapod", "big-strafer-pentapod",
+			"big-stomper-pentapod", "gleba-spawner", "gleba-spawner-corpse", "gleba-spawner-small"]:
+		var gm: Mesh = ModelLib.mesh_for(gproto)
+		if not ModelLib.ready(gproto) or gm == null:
+			gleba_meshes_ready = false
+	check(gleba_meshes_ready, "immersive enemies: Gleba pentapod & spawner Placeholders meshes load synchronously")
+
+	# Wriggler live hit (BiterAnim override + green hemolymph droplets + live wound) -> 5-limb ragdoll + Gleba bile puddle (no Nauvis purple puddle).
+	node._ragdoll.clear()
+	node._gore.clear()
+	var wrig_node := Node3D.new()
+	wrig_node.position = Vector3(16.0, 0.0, 20.0)
+	add_child(wrig_node)
+	cr.add(2001, "big-wriggler-pentapod", wrig_node, -1)
+	var drops_before_wrig: int = node._gore._droplets.size()
+	fake_fx.on_damaged_hook.call({"unit": 2001, "name": "big-wriggler-pentapod", "pos": wrig_node.position,
+		"cause_pos": Vector3(12.0, 0.0, 20.0), "damage_type": "physical", "fx": "blood",
+		"dmg": 180, "hp": 820, "src": "piercing-rounds-magazine"})
+	node._process(0.05)
+	var wrig_drop_green := false
+	if node._gore._droplets.size() > drops_before_wrig:
+		var wd_col: Color = (node._gore._droplets.back() as Dictionary)["color"] as Color
+		wrig_drop_green = wd_col.g > wd_col.r and wd_col.g > wd_col.b
+	var wrig_ov: bool = cr._overrides.has(2001)
+	var wrig_wnd: bool = cr._wounds.has(2001)
+	var wrig_anim_ok: bool = wrig_ov and wrig_wnd and wrig_drop_green
+
+	var before_wrig_rag: int = node._ragdoll._active.size()
+	cr.remove(2001, true, Vector3(12.0, 0.0, 20.0), "physical", 180, "piercing-rounds-magazine")
+	var wrig_body_ok := false
+	var wrig_blood_col_ok := false
+	if node._ragdoll._active.size() > before_wrig_rag:
+		var wr_rec: Dictionary = node._ragdoll._active[before_wrig_rag] as Dictionary
+		var wr_n: MeshInstance3D = wr_rec["node"] as MeshInstance3D
+		var wr_m: ShaderMaterial = wr_n.get_surface_override_material(0) as ShaderMaterial
+		var rbc: Variant = wr_m.get_shader_parameter("rig_blood_color") if wr_m != null else null
+		wrig_blood_col_ok = rbc is Vector3 and (rbc as Vector3).y > (rbc as Vector3).x and (rbc as Vector3).y > (rbc as Vector3).z
+		wrig_body_ok = int(wr_rec.get("limb_count", 0)) == 5 and bool(wr_rec.get("is_gleba", false))
+	var nauvis_corpses_before: int = cr._corpses.size()
+	var decals_before_settle: int = node._gore._decal_active
+	for _ws in 95:
+		node._process(0.05)
+	check(wrig_anim_ok and wrig_body_ok and wrig_blood_col_ok
+		and cr._corpses.size() == nauvis_corpses_before and node._gore._decal_active > decals_before_settle,
+		"immersive enemies: wriggler gets live anim/wounds, 5-limb olive-blood ragdoll, and Gleba bile puddle (ov=%s wnd=%s drop_g=%s body=%s col=%s corpses=%d->%d decals=%d->%d)" % [
+			wrig_ov, wrig_wnd, wrig_drop_green, wrig_body_ok, wrig_blood_col_ok,
+			nauvis_corpses_before, cr._corpses.size(), decals_before_settle, node._gore._decal_active])
+
+	# Premature wriggler explosive split -> 3 gleba_inner_meat chunks + 2..4 detached legs.
+	var before_prem: int = node._ragdoll._active.size()
+	cr.on_died_hook.call({"unit": 2002, "name": "small-wriggler-pentapod-premature", "pos": Vector3(20.0, 0.0, 22.0),
+		"yaw": 0.0, "vel": Vector3.ZERO, "scale": 0.6, "phase": 0.0,
+		"cause_pos": Vector3(16.0, 0.0, 22.0), "damage_type": "explosion", "dmg": 1000, "src": "grenade", "handled": false})
+	var prem_parts := 0
+	var prem_legs := 0
+	var prem_meat_ok := false
+	for idx in range(before_prem, node._ragdoll._active.size()):
+		var pr_rec: Dictionary = node._ragdoll._active[idx] as Dictionary
+		if bool(pr_rec.get("is_leg", false)):
+			prem_legs += 1
+		elif bool(pr_rec.get("is_part", false)):
+			prem_parts += 1
+			var pm_node: MeshInstance3D = pr_rec["node"] as MeshInstance3D
+			for si in pm_node.mesh.get_surface_count():
+				var sm: Material = pm_node.mesh.surface_get_material(si)
+				if sm != null and sm.resource_name == "gleba_inner_meat":
+					prem_meat_ok = true
+	check(prem_parts == 3 and prem_legs >= 2 and prem_legs <= 4 and prem_meat_ok,
+		"immersive enemies: premature wriggler grenade death splits into %d gleba_inner_meat chunks + %d legs" % [prem_parts, prem_legs])
+
+	# Strafer fire death via died_spider -> burning torso + detached articulated spider legs at unit scale.
+	node._ragdoll.clear()
+	var strafer_live_parts: Array = []
+	for k in 10:
+		strafer_live_parts.append({"kind": "leg_upper" if (k % 2) == 0 else "leg_lower",
+			"xform": Transform3D(Basis.from_scale(Vector3(1.0, 1.0, 1.35)), Vector3(44.0 + float(k) * 0.2, 0.0, 12.0))})
+	cr.set_pending_death(2003, Vector3(40.0, 0.0, 12.0), "fire", 150, "flamethrower-ammo")
+	var before_straf: int = node._ragdoll._active.size()
+	cr.died_spider(2003, "big-strafer-pentapod", Vector3(44.0, 0.0, 12.0), 0.3, Vector3(1.0, 0.0, 0.0), strafer_live_parts)
+	var straf_torsos := 0
+	var straf_legs := 0
+	var straf_burn := false
+	var straf_unit_scale := true
+	for idx in range(before_straf, node._ragdoll._active.size()):
+		var st_rec: Dictionary = node._ragdoll._active[idx] as Dictionary
+		var st_n: Node3D = st_rec["node"] as Node3D
+		if not st_n.transform.basis.get_scale().is_equal_approx(Vector3.ONE):
+			straf_unit_scale = false
+		if bool(st_rec.get("is_leg", false)):
+			straf_legs += 1
+		elif not bool(st_rec.get("is_part", false)):
+			straf_torsos += 1
+			straf_burn = bool(st_rec.get("burning", false))
+	# Explosive small-strafer split -> 3 torso chunks.
+	var before_straf_ex: int = node._ragdoll._active.size()
+	cr.set_pending_death(2004, Vector3(40.0, 0.0, 16.0), "explosion", 1200, "rocket")
+	cr.died_spider(2004, "small-strafer-pentapod", Vector3(46.0, 0.0, 16.0), 0.0, Vector3.ZERO, [])
+	var straf_chunks := 0
+	for idx in range(before_straf_ex, node._ragdoll._active.size()):
+		if bool((node._ragdoll._active[idx] as Dictionary).get("is_part", false)):
+			straf_chunks += 1
+	check(straf_torsos == 1 and straf_legs == 10 and straf_burn and straf_unit_scale and straf_chunks == 3,
+		"immersive enemies: strafer spawns burning torso + %d unit-scale spider legs and splits on explosion (%d chunks)" % [straf_legs, straf_chunks])
+
+	# Stomper death via died_spider -> articulated leg ragdolls only (no torso over Factorio's stomper shell).
+	node._ragdoll.clear()
+	var stomper_live_parts: Array = []
+	for k in 10:
+		stomper_live_parts.append({"kind": "leg_upper" if (k % 2) == 0 else "leg_lower",
+			"xform": Transform3D(Basis.from_scale(Vector3(1.0, 1.0, 1.25)), Vector3(52.0 + float(k) * 0.3, 0.0, 14.0))})
+	cr.set_pending_death(2005, Vector3(48.0, 0.0, 14.0), "explosion", 2000, "artillery-shell")
+	var before_stomp: int = node._ragdoll._active.size()
+	cr.died_spider(2005, "big-stomper-pentapod", Vector3(52.0, 0.0, 14.0), 0.0, Vector3.ZERO, stomper_live_parts)
+	var stomp_torsos := 0
+	var stomp_legs := 0
+	var stomp_unit_scale := true
+	for idx in range(before_stomp, node._ragdoll._active.size()):
+		var sm_rec: Dictionary = node._ragdoll._active[idx] as Dictionary
+		var sm_n: Node3D = sm_rec["node"] as Node3D
+		if not sm_n.transform.basis.get_scale().is_equal_approx(Vector3.ONE):
+			stomp_unit_scale = false
+		if bool(sm_rec.get("is_leg", false)):
+			stomp_legs += 1
+		else:
+			stomp_torsos += 1
+	check(stomp_torsos == 0 and stomp_legs == 10 and stomp_unit_scale,
+		"immersive enemies: stomper spawns %d unit-scale leg ragdolls without duplicating torso over shell" % stomp_legs)
+
+	# Gleba spawner (egg raft) live wounds -> grounded gleba-spawner-corpse + 3 membrane chunks + popped egg sacs.
+	node._ragdoll.clear()
+	fake_fx.on_damaged_hook.call({"unit": 2006, "name": "gleba-spawner", "pos": Vector3(60.0, 0.0, 14.0),
+		"cause_pos": Vector3(54.0, 0.0, 14.0), "damage_type": "physical", "fx": "blood",
+		"dmg": 300, "hp": 700, "src": "piercing-rounds-magazine"})
+	var gspawn_live: bool = node._ragdoll._wounds.has(2006) and anim._wounds.has(2006)
+	var before_gs_active: int = node._ragdoll._active.size()
+	var before_gs_settled: int = node._ragdoll._settled.size()
+	var gs_die := {"unit": 2006, "name": "gleba-spawner", "pos": Vector3(60.0, 0.0, 14.0),
+		"yaw": 0.0, "vel": Vector3.ZERO, "scale": 1.0, "phase": 0.0,
+		"cause_pos": Vector3(54.0, 0.0, 14.0), "damage_type": "explosion", "dmg": 1500, "src": "grenade", "handled": false}
+	cr.on_died_hook.call(gs_die)
+	var gs_chunks := 0
+	var gs_sacs := 0
+	for idx in range(before_gs_active, node._ragdoll._active.size()):
+		var gsr: Dictionary = node._ragdoll._active[idx] as Dictionary
+		if bool(gsr.get("is_leg", false)):
+			gs_sacs += 1
+		elif bool(gsr.get("is_part", false)):
+			gs_chunks += 1
+	check(gspawn_live and not node._ragdoll._wounds.has(2006) and not anim._wounds.has(2006)
+		and bool(gs_die.get("handled", false)) and node._ragdoll._settled.size() == before_gs_settled + 1
+		and gs_chunks == 3 and gs_sacs >= 3 and gs_sacs <= 5,
+		"immersive enemies: gleba-spawner clears live wounds and spawns crater + %d chunks + %d popped egg sacs" % [gs_chunks, gs_sacs])
+
+	# Stomper acid goo streams & ground pools intercepted with tier scaling.
+	node._acid.use_native = false
+	node._acid.clear()
+	fake_weapons.handle({
+		"t": "pj", "k": 20,
+		"p": [
+			8001, "small-acid-stream-stomper", 20 * 256, 20 * 256,
+			8002, "big-acid-stream-stomper", 24 * 256, 20 * 256,
+		],
+		"e": [], "b": [], "x": [],
+	})
+	var stomper_stream_ok: bool = (
+		fake_weapons._streams.has(8001) and fake_weapons._streams[8001].custom
+		and fake_weapons._streams.has(8002) and fake_weapons._streams[8002].custom
+		and node._acid._globs.size() >= 2
+		and float((node._acid._globs[-1] as Dictionary)["tier_scale"]) > float((node._acid._globs[0] as Dictionary)["tier_scale"])
+	)
+	fake_weapons.handle({
+		"t": "gf",
+		"l": [8003, "big-acid-splash-fire-stomper", 24 * 256, 20 * 256, 300],
+	})
+	node._process(0.05)
+	check(stomper_stream_ok and fake_weapons._ground.has(8003) and fake_weapons._ground[8003].custom and node._acid._pools.has(8003),
+		"immersive enemies: stomper acid streams and ground pools intercepted with tier scaling")
+	node._acid.clear()
+	wrig_node.queue_free()
 
 	# Toggling animations off disables live override path without errors; wound remaining walker & static worm units to test disable cleanup.
 	fake_fx.on_damaged_hook.call({"unit": 1005, "name": "big-biter", "pos": b5_node.position,

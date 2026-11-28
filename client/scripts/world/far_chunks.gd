@@ -35,6 +35,7 @@ const CrownShader := preload("res://shaders/far_tree_crown.gdshader")
 const FactorioAlphaShader := preload("res://shaders/factorio_material_alpha.gdshader")
 const FactorioLeafShader := preload("res://shaders/factorio_material_leaf.gdshader")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const ViewAhead := preload("res://scripts/world/view_ahead.gd")
 const Switches := preload("res://scripts/switches.gd")
 const LEAF_MEAN := 0.85
 
@@ -92,6 +93,8 @@ const NEAR_FOCUS := 40.0
 const KEEP_TYPES := {"train-stop": true, "resource": true, "fish": true, "unit-spawner": true,
 	"turret": true, "spider-leg": true}
 static var far_trees := Switches.on("--far-trees")
+## `--inserter-far-keep=off`: allow inserters to merge into far chunk voxel meshes on High/Ultra LOD.
+static var keep_inserters := not (Switches.has("--inserter-far-keep=off"))
 ## How simple each model is merged (tiles): the simplifier's coarsest level within SIMPLIFY_ERROR, then
 ## its vertices clustered in CELL-sized cubes (Bake): about two pixels at MERGE_FROM in a 900-pixel
 ## window. Times the square root of the Level of detail setting's pixels of error (model_lods.gd
@@ -100,6 +103,10 @@ const SIMPLIFY_ERROR := 0.25
 const CELL := 0.2
 ## Coarser second HLOD tier far out (`--far-coarse=off` keeps only the primary `CELL = 0.2` merge).
 static var far_coarse := Switches.on("--far-coarse")
+## --collect-cache=off: every chunk build walks its records and the far gather reads them one by one,
+## as before. On: chunk_view.gd keeps a build's lists (DrawLists) for a build of the view alone and for
+## this gather (fill_from_lists), which also takes a record's model from the near build's cache.
+static var collect_cache := Switches.on("--collect-cache")
 const CELL_COARSE := 0.8
 const COARSE_BELOW_PX := 3.5
 const COARSE_ABOVE_PX := 4.8
@@ -235,6 +242,8 @@ class State:
 	var next := 0
 	## Gathered: Mesh -> Array of Transform3D, and placeholders [Mesh, Transform3D, Color].
 	var groups := {}
+	## Meshes whose `groups` Array is the chunk's kept list's own (fill_from_lists): copied before adding to it.
+	var shared := {}
 	var tinted: Array = []
 	## Meshes of trees and plants (their solid parts merge into a surface of their own, matte: far_merged_nature).
 	var nature := {}
@@ -1024,7 +1033,13 @@ static func skips(cv) -> bool:
 
 
 static func _kept_type(proto_type: String) -> bool:
-	return KEEP_TYPES.has(proto_type) or (not far_trees and (proto_type == "tree" or proto_type == "plant"))
+	if KEEP_TYPES.has(proto_type):
+		return true
+	if not far_trees and (proto_type == "tree" or proto_type == "plant"):
+		return true
+	if keep_inserters and proto_type == "inserter" and (ModelLods.quality_name == "high" or ModelLods.quality_name == "ultra"):
+		return true
+	return false
 
 
 ## Whether an entity of this type drawn with `mesh` (null: a placeholder) goes in a merged mesh. With
@@ -1110,7 +1125,8 @@ static func bakeable(mesh: Mesh) -> bool:
 		var kind := 1 if (mesh is PrimitiveMesh or (mesh is ArrayMesh and mesh.has_meta(ModelLods.ARRAYS_META))) else 0
 		if kind != 0:
 			for i in mesh.get_surface_count():
-				if mesh.surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
+				# (Only an ArrayMesh says its primitive; a PrimitiveMesh's surfaces are triangles.)
+				if mesh is ArrayMesh and (mesh as ArrayMesh).surface_get_primitive_type(i) != Mesh.PRIMITIVE_TRIANGLES:
 					kind = 0
 					break
 				var sm := mesh.surface_get_material(i) as ShaderMaterial
@@ -1264,11 +1280,29 @@ static func screen_distances(cam: Camera3D, vp: Viewport, scale := 1.0) -> Vecto
 	return Vector2(focal / (MERGE_BELOW_PX * s), focal / (FULL_ABOVE_PX * s))
 
 
+## A cut (view_ahead.gd, world.gd): the look under way dropped and a new one made through every chunk now,
+## without the budget, so chunks near the new view unmerge (their MultiMeshes shown again) this frame.
+## Chunks that must be built again for it (redraw) still come under world.gd's budget: announcing the
+## viewpoint ahead covers those.
+func settle_now() -> void:
+	if world == null:
+		return
+	_pass_next = _pass_todo.size()
+	_check_timer = CHECK_INTERVAL
+	_decide_prev_valid = false
+	_decide(0.0, false)
+	while _pass_next < _pass_todo.size():
+		_decide_slice(0, false)
+
+
 func detail_distance() -> float:
 	return _pass_from
 
 
 func reset_decide() -> void:
+	_pass_points = []
+	_pass_looks = []
+	_ahead_gen = -1
 	_far_count = 0
 	_decide_count = 0
 	_decide_incremental = false
@@ -1407,7 +1441,10 @@ func _decide(delta: float, use_budget := false) -> void:
 	var by_cam: bool = true if world == null or world.get("lod_by_camera") == null else bool(world.get("lod_by_camera"))
 	var focus_pt: Vector2 = world.focus()
 	var at := (cam.global_position if cam != null else Vector3(focus_pt.x, 30.0, focus_pt.y)) if by_cam else Vector3(focus_pt.x, 0.0, focus_pt.y)
-	if _check_timer < CHECK_INTERVAL and enabled == _last_enabled and at.distance_to(_last_camera) < 8.0:
+	var ahead_gen := ViewAhead.generation
+	if ViewAhead.active() == _pass_points.is_empty():
+		ahead_gen = -2  # ran out since the last look
+	if _check_timer < CHECK_INTERVAL and enabled == _last_enabled and at.distance_to(_last_camera) < 8.0 and ahead_gen == _ahead_gen:
 		if use_budget:
 			FrameBudget.waiting(&"far_decide", 0)
 		return
@@ -1428,6 +1465,11 @@ func _decide(delta: float, use_budget := false) -> void:
 	_last_enabled = enabled
 	_pass_at = at
 	_pass_focus = focus_pt
+	# Viewpoints announced ahead (view_ahead.gd): chunks measured to the nearest of them too. The row runs
+	# follow one circle, so a look with them (and the one after) goes through every chunk.
+	_ahead_gen = ViewAhead.generation
+	_pass_points = ViewAhead.points()
+	_pass_looks = ViewAhead.looks()
 	_pass_ortho = false
 	_pass_ortho_far = false
 	if merge_from > 0.0:
@@ -1479,7 +1521,8 @@ func _decide(delta: float, use_budget := false) -> void:
 	var use_rows: bool = decide_row_runs and enabled and not _pass_ortho and _decide_prev_valid \
 		and close_merge == _decide_prev_close and far_coarse == _decide_prev_coarse and by_cam == _decide_prev_by_cam \
 		and is_equal_approx(_pass_from, _decide_prev_from) and is_equal_approx(_pass_full, _decide_prev_full) \
-		and is_equal_approx(_pass_near_focus, _decide_prev_near_focus) and world.chunks.size() == _decide_count
+		and is_equal_approx(_pass_near_focus, _decide_prev_near_focus) and world.chunks.size() == _decide_count \
+		and _pass_points.is_empty()
 	if use_rows:
 		_decide_incremental = true
 		_pass_todo = []
@@ -1511,7 +1554,7 @@ func _decide(delta: float, use_budget := false) -> void:
 		_decide_count = world.chunks.size()
 		_decide_added.clear()
 		_decide_queued.clear()
-		_decide_prev_valid = decide_row_runs and enabled and not _pass_ortho
+		_decide_prev_valid = decide_row_runs and enabled and not _pass_ortho and _pass_points.is_empty()
 		_decide_prev_close = close_merge
 		_decide_prev_coarse = far_coarse
 		_decide_prev_by_cam = by_cam
@@ -1558,6 +1601,10 @@ var _pass_full := MERGE_FROM - SLACK
 var _pass_coarse_from := MERGE_FROM * 2.8
 var _pass_coarse_full := MERGE_FROM * 2.2
 var _pass_near_focus := NEAR_FOCUS
+## The viewpoints announced ahead (cameras, and their look points on the ground) when the look started.
+var _pass_points: Array[Vector3] = []
+var _pass_looks: Array[Vector2] = []
+var _ahead_gen := -1
 var _pass_near_slack := SLACK * 0.5
 var _pass_ortho := false
 var _pass_ortho_far := false
@@ -1588,6 +1635,10 @@ func _decide_slice(until_usec := 0, use_budget := false, t0 := 0) -> void:
 		var d := at.distance_to(at.clamp(lo, lo + Vector3(CHUNK, 8.0, CHUNK)))
 		var far := s.far
 		var near_focus := focus.distance_to(focus.clamp(rect.position, rect.end))
+		for pp: Vector3 in _pass_points:
+			d = minf(d, pp.distance_to(pp.clamp(lo, lo + Vector3(CHUNK, 8.0, CHUNK))))
+		for pl: Vector2 in _pass_looks:
+			near_focus = minf(near_focus, pl.distance_to(pl.clamp(rect.position, rect.end)))
 		if merge_from > 0.0 and merge_from < NEAR_FOCUS:
 			near_focus = INF  # --far-merge-from under NEAR_FOCUS: merged up close, for screenshots
 		if not enabled or near_focus < _pass_near_focus:
@@ -1627,8 +1678,8 @@ func _decide_slice(until_usec := 0, use_budget := false, t0 := 0) -> void:
 			s.phase = IDLE
 			if cv.building or (prep_guard and world.has_method("cancel_merged_prep") and world.cancel_merged_prep(c)):
 				# A build under way (yielded or a merged worker prep) decided to leave the merged
-				# entities out: built again whole after it.
-				world.redraw(c)
+				# entities out: built again whole after it (its view alone: the kept lists serve).
+				world.redraw_view(c)
 			if not s.hidden.is_empty():
 				# Its MultiMeshes are still there: shown again, no build.
 				for hm in s.hidden:  # untyped: a typed loop variable errors on a freed element
@@ -1639,7 +1690,12 @@ func _decide_slice(until_usec := 0, use_budget := false, t0 := 0) -> void:
 				if s.node != null:
 					_drop_merged(s)
 			elif not s.full:
-				world.redraw(c)  # its MultiMeshes are made again; the merged mesh goes once they are in
+				world.redraw_view(c)  # its MultiMeshes are made again; the merged mesh goes once they are in
+			elif ViewAhead.on and s.node != null and cv.pending.is_empty() and not cv.building:
+				# Whole, nothing hidden behind the merge (a chunk of cliffs alone: the cliff wall draws them, no
+				# MultiMesh) and nothing still to add: the merged mesh goes now. It stood for good before
+				# (--cut-lods=old), the wall hidden behind it.
+				_drop_merged(s)
 	if use_budget and not ModelLods.full_detail:
 		FrameBudget.spent(&"far_decide", Time.get_ticks_usec() - start_usec, maxi(_pass_todo.size() - _pass_next, 0))
 
@@ -1679,9 +1735,14 @@ func _collect() -> void:
 			if is_instance_valid(cv) and world.chunks.get(cv.coord) == cv and cv.far.phase == ASKED and not cv.is_incomplete():
 				var s: State = cv.far
 				s.phase = GATHERING
-				s.recs = cv.entities.values()
-				s.next = 0
+				if collect_cache:
+					s.recs = []
+					s.next = -1  # read when its turn comes: the chunk's kept lists, else its records
+				else:
+					s.recs = cv.entities.values()
+					s.next = 0
 				s.groups = {}
+				s.shared = {}
 				s.tinted = []
 				fresh.append([cv, s.serial])
 		_asked.clear()
@@ -1724,6 +1785,16 @@ func _collect() -> void:
 			continue
 		var cv = entry[0]
 		var s: State = cv.far
+		if s.next < 0:
+			s.next = 0
+			var tf := Time.get_ticks_usec()
+			if fill_from_lists(cv, s):
+				s.recs = cv.draw_lists.far_slow
+				cv.count("far_from_lists")
+			else:
+				s.recs = cv.entities.values()
+			cv.count("us_far_fill", Time.get_ticks_usec() - tf)
+			looked += 16
 		while s.next < s.recs.size():
 			if looked >= 16 and (looked & 15) == 0 and Time.get_ticks_usec() - started > allow:
 				FrameBudget.spent(&"far_collect", Time.get_ticks_usec() - started, _collecting.size())
@@ -1733,6 +1804,7 @@ func _collect() -> void:
 			looked += 1
 		_collecting.pop_front()
 		s.recs = []
+		s.shared = {}
 		s.phase = WAITING
 		s.checked = false
 		_waiting.append(entry)
@@ -1750,6 +1822,41 @@ func _current(entry: Array, phase: int) -> bool:
 	return s.far and s.serial == int(entry[1]) and s.phase == phase
 
 
+## The chunk's groups from what its last build kept (chunk_view.gd DrawLists, collect_cache): its records
+## drawn with a model of their own, a model at a time; those it lists in `far_slow` are read one by one
+## after (_gather). False when it has no kept lists or they are out of date: every record read.
+func fill_from_lists(cv, s: State) -> bool:
+	var lists = cv.get("draw_lists")
+	if lists == null or cv.building or world == null:
+		return false
+	# Built again for a change it holds, not yet done (world.gd _dirty true): its records, not the lists.
+	var dirty = world.get("_dirty")
+	if dirty is Dictionary and (dirty as Dictionary).get(cv.coord, false) == true:
+		return false
+	if not cv.lists_valid(world.protos, null):
+		return false
+	for mesh: Mesh in lists.far_xf:
+		var ptype: String = lists.far_type[mesh]
+		if _kept_type(ptype) or not bakeable(mesh):
+			continue
+		var xforms: Array = lists.far_xf[mesh]
+		if s.groups.has(mesh):
+			for x: Transform3D in xforms:
+				_add(s, mesh, x)
+		else:
+			s.groups[mesh] = xforms  # (shared: copied before anything is added to it)
+			s.shared[mesh] = true
+		if ptype == "tree" or ptype == "plant":
+			s.nature[mesh] = true
+		for part: ModelLibrary.AnimPart in lists.far_parts[mesh]:
+			# Parts at rest; lit parts (signal lenses) show only by state.
+			if part.lit or part.mesh == null or not bakeable(part.mesh):
+				continue
+			for x: Transform3D in xforms:
+				_add(s, part.mesh, Transform3D(Basis.IDENTITY, x.origin) if part.upright else x)
+	return true
+
+
 ## One entity into its chunk's groups, as chunk_view.gd build_entities would draw it (merges() true).
 func _gather(cv, s: State, rec) -> void:
 	var protos = world.protos
@@ -1763,9 +1870,25 @@ func _gather(cv, s: State, rec) -> void:
 		if not remnant.is_empty() and bakeable(remnant[0]):
 			_add(s, remnant[0], remnant[1])
 		return
-	if not ModelLibrary.entity_ready(proto.name, proto.type, rec.extra, rec.dir):
+	if collect_cache and "cache_gen" in rec and int(rec.cache_gen) == ModelLibrary.generation and rec.cache_mesh != null \
+			and not rec.extra.has("cb") and rec.belt_ends == 0:
+		# The model the near build resolved for it (chunk_view.gd's record cache), not asked again.
+		var cmesh: Mesh = rec.cache_mesh
+		if not bakeable(cmesh):
+			return
+		var cxform: Transform3D = rec.cache_xform
+		_add(s, cmesh, cxform)
+		if proto.type == "tree" or proto.type == "plant":
+			s.nature[cmesh] = true
+		for part: ModelLibrary.AnimPart in rec.cache_parts:
+			if part.lit or part.mesh == null or not bakeable(part.mesh):
+				continue
+			_add(s, part.mesh, Transform3D(Basis.IDENTITY, cxform.origin) if part.upright else cxform)
 		return
-	var mesh := ModelLibrary.mesh_for_entity(proto.name, proto.type, rec.extra, rec.dir)
+	var resolved := ModelLibrary.resolve_entity(proto.name, proto.type, rec.extra, rec.dir)
+	if not resolved[0]:
+		return
+	var mesh: Mesh = resolved[1]
 	if mesh == null:
 		if not merges(proto.type, null):
 			return  # a card (sprite_standins.gd), drawn by the chunk itself
@@ -1779,7 +1902,7 @@ func _gather(cv, s: State, rec) -> void:
 	_add(s, mesh, xform)
 	if proto.type == "tree" or proto.type == "plant":
 		s.nature[mesh] = true
-	var parts := ModelLibrary.parts_for_entity(proto.name, proto.type, rec.extra, rec.dir)
+	var parts: Array = resolved[2]
 	for part: ModelLibrary.AnimPart in parts:
 		# Parts at rest; lit parts (signal lenses) show only by state.
 		if part.lit or part.mesh == null or not bakeable(part.mesh):
@@ -1811,6 +1934,9 @@ func _gather(cv, s: State, rec) -> void:
 static func _add(s: State, mesh: Mesh, xform: Transform3D) -> void:
 	if not s.groups.has(mesh):
 		s.groups[mesh] = []
+	elif not s.shared.is_empty() and s.shared.has(mesh):
+		s.groups[mesh] = (s.groups[mesh] as Array).duplicate()
+		s.shared.erase(mesh)
 	(s.groups[mesh] as Array).append(xform)
 
 

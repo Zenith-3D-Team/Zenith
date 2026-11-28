@@ -53,6 +53,8 @@ var kind_of := PackedByteArray()  # per tile id: 0 land, 1 water, 2 void (ProtoD
 var gfx_of: Array = []  # per tile id: TerrainTextures.TileGfx, or null while its picture isn't loaded
 var textured := false
 var slots := PackedInt32Array()  # cached variant slots (x + 64 * y), empty: work them out
+## Circular cutouts for rocket silo launch shafts: Vector3(cx, cz, radius) in world tiles.
+var silo_holes := PackedVector3Array()
 ## Far ground (world.gd COARSE_FROM): one quad per COARSE x COARSE tiles in the block's most common
 ## tile, without transitions, banks or shores. A chunk's full ground is about 300 KB of vertices,
 ## which at view distance 50 (10,201 chunks) would be 3 GB; this is 64 quads instead of 1,024 and up.
@@ -160,8 +162,11 @@ func _mesh() -> void:
 			var wet := _mask(kinds, pi, WATER) if textured else 0
 			# A tile with water beside it is cut back raggedly by its shader: the coast's surface.
 			var ground_surface: TerrainSurface = coast_surface if wet != 0 else land
-			ground_surface.quad(Vector3(x, 0.0, z), Vector3(x + 1.0, 0.0, z), Vector3(x + 1.0, 0.0, z + 1.0), Vector3(x, 0.0, z + 1.0), Vector3.UP,
-				color, color, color, color, uv, spread, Color(wet, 0.0, _floor(g), g.surface))
+			if silo_holes.is_empty():
+				ground_surface.quad(Vector3(x, 0.0, z), Vector3(x + 1.0, 0.0, z), Vector3(x + 1.0, 0.0, z + 1.0), Vector3(x, 0.0, z + 1.0), Vector3.UP,
+					color, color, color, color, uv, spread, Color(wet, 0.0, _floor(g), g.surface))
+			else:
+				_emit_holed_tile(ground_surface, x, z, color, uv, spread, Color(wet, 0.0, _floor(g), g.surface), silo_holes)
 			var plain := Color(g.layer, -1.0, -1.0, 0.0)
 			if wet != 0:
 				# The ground's edge is cut back raggedly along the water (terrain.gdshader); this
@@ -231,6 +236,51 @@ func _mesh_coarse(kinds: PackedByteArray, slot: Vector2) -> void:
 			var color := Color.WHITE if g.layer >= 0 else _color(id)
 			land.quad(Vector3(x, 0.0, z), Vector3(x + w, 0.0, z), Vector3(x + w, 0.0, z + w), Vector3(x, 0.0, z + w), Vector3.UP,
 				color, color, color, color, uv, Color(g.layer, -1.0, -1.0, 0.0), Color(0.0, 0.0, _floor(g), g.surface))
+
+
+## Emits a 1x1 land tile, subdividing into a 4x4 grid around circular rocket-silo shaft holes cleanly
+## without shader `discard`, inverted triangles, or ground protruding into the shaft.
+static func _emit_holed_tile(surface: TerrainSurface, x: float, z: float, color: Color, uv: Rect2,
+		spread: Color, masks: Color, holes: PackedVector3Array) -> void:
+	var touched := false
+	for h: Vector3 in holes:
+		var nx := clampf(h.x, x, x + 1.0)
+		var nz := clampf(h.y, z, z + 1.0)
+		var dx := nx - h.x
+		var dz := nz - h.y
+		if dx * dx + dz * dz < h.z * h.z:
+			touched = true
+			break
+	if not touched:
+		surface.quad(Vector3(x, 0.0, z), Vector3(x + 1.0, 0.0, z), Vector3(x + 1.0, 0.0, z + 1.0), Vector3(x, 0.0, z + 1.0), Vector3.UP,
+			color, color, color, color, uv, spread, masks)
+		return
+	var tile_origin := Vector2(x, z)
+	for sz in 4:
+		var za := z + sz * 0.25
+		var zb := za + 0.25
+		for sx in 4:
+			var xa := x + sx * 0.25
+			var xb := xa + 0.25
+			var omitted := false
+			for h: Vector3 in holes:
+				var nx := clampf(h.x, xa, xb)
+				var nz := clampf(h.y, za, zb)
+				var dx := nx - h.x
+				var dz := nz - h.y
+				if dx * dx + dz * dz < h.z * h.z:
+					omitted = true
+					break
+			if omitted:
+				continue
+			var ua := uv.position + Vector2((xa - x) * uv.size.x, (za - z) * uv.size.y)
+			var ub := uv.position + Vector2((xb - x) * uv.size.x, (za - z) * uv.size.y)
+			var uc := uv.position + Vector2((xb - x) * uv.size.x, (zb - z) * uv.size.y)
+			var ud := uv.position + Vector2((xa - x) * uv.size.x, (zb - z) * uv.size.y)
+			surface.quad_pts(
+				Vector3(xa, 0.0, za), Vector3(xb, 0.0, za),
+				Vector3(xb, 0.0, zb), Vector3(xa, 0.0, zb),
+				ua, ub, uc, ud, tile_origin, Vector3.UP, color, spread, masks)
 
 
 ## The graphics of tile `id`, or a plain stand-in (map colour, no transitions) while its picture
@@ -480,6 +530,36 @@ class TerrainSurface:
 			custom0.append(c0.r)
 			custom0.append(c0.g)
 			custom0.append(c0.b if plain else shares[k])
+			custom0.append(c0.a)
+			custom1.append(c1.r)
+			custom1.append(c1.g)
+			custom1.append(c1.b)
+			custom1.append(c1.a)
+		indices.append(v)
+		indices.append(v + 1)
+		indices.append(v + 2)
+		indices.append(v)
+		indices.append(v + 2)
+		indices.append(v + 3)
+
+	func quad_pts(a: Vector3, b: Vector3, c: Vector3, d: Vector3, ua: Vector2, ub: Vector2, uc: Vector2, ud: Vector2,
+			tile_origin: Vector2, normal: Vector3, col: Color, c0: Color, c1: Color) -> void:
+		var v := verts.size()
+		verts.append(a)
+		verts.append(b)
+		verts.append(c)
+		verts.append(d)
+		uvs.append(ua)
+		uvs.append(ub)
+		uvs.append(uc)
+		uvs.append(ud)
+		for k in 4:
+			colors.append(col)
+			normals.append(normal)
+			origins.append(tile_origin)
+			custom0.append(c0.r)
+			custom0.append(c0.g)
+			custom0.append(c0.b)
 			custom0.append(c0.a)
 			custom1.append(c1.r)
 			custom1.append(c1.g)

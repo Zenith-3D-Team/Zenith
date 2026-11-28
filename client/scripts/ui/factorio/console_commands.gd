@@ -68,7 +68,7 @@ const COMMANDS := {
 	"reply": [GAME, ["r"], "/reply <message>: to whoever whispered to you"],
 	"open": [GAME, ["o"], "/open <player>: another player's inventory"],
 	"admin": [GAME, [], "/admin: the player management window"],
-	"alerts": [GAME, [], "/alerts <enable | disable | mute | unmute> <alert>: a player's alert settings"],
+	"alerts": [CLIENT, [], "/alerts <enable | disable | mute | unmute> <alert>: a player's alert settings"],
 	"perf-avg-frames": [GAME, [], "/perf-avg-frames <n>: the game window's performance counters"],
 	"mute-programmable-speaker": [GAME, [], "/mute-programmable-speaker <mute | unmute> <local | everyone>"],
 	"toggle-action-logging": [GAME, [], "/toggle-action-logging: logs the game window's input actions"],
@@ -95,6 +95,8 @@ var rcon := Callable()
 var has_rcon := Callable()
 ## Callable(name: String): opens one of the HUD's windows (/permissions).
 var open_window := Callable()
+## (action, alert) -> the answer: alerts_config.gd's `command`, set by factorio_ui.gd.
+var alert_command := Callable()
 ## ui_model.gd: the bridge (command, set_char_color, say).
 var model
 ## The console (chat_window.gd): clear(), ignored.
@@ -268,9 +270,14 @@ func _client(name: String, args: String) -> String:
 					chat.ignored[args] = true
 				else:
 					chat.ignored.erase(args)
-			return ("Hiding %s's chat" if name == "ignore" else "Showing %s's chat again") % args
+			return ("%s ignored." if name == "ignore" else "%s unignored.") % args  # core locale: player-ignored / player-unignored
 		"ignores":
 			return "Ignored: " + (", ".join(PackedStringArray(chat.ignored.keys())) if chat != null and not chat.ignored.is_empty() else "nobody")
+		"alerts":
+			var w := args.split(" ", false)
+			if w.size() != 2 or not alert_command.is_valid():
+				return COMMANDS["alerts"][2]
+			return alert_command.call(w[0], w[1])
 		"permissions":
 			if open_window.is_valid():
 				open_window.call("permissions")

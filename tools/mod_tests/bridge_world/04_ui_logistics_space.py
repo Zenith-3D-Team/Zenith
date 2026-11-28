@@ -674,7 +674,12 @@ send({"t": "pedia", "kind": "recipe", "name": "iron-gear-wheel"})
 send({"t": "pedia", "kind": "technology", "name": "automation"})
 send({"t": "pedia", "kind": "planet", "name": "nauvis"})
 send({"t": "pedia", "kind": "item", "name": "no-such-item"})
-tick(6)  # answered under the work budget (requests.lua), a few a tick
+send({"t": "pedia", "kind": "recipe", "name": "uranium-processing"})
+send({"t": "pedia", "kind": "entity", "name": "huge-rock"})
+send({"t": "pedia", "kind": "recipe", "name": "transport-belt"})
+for n in ("firearm-magazine", "pistol", "grenade", "heavy-armor"):
+    send({"t": "pedia", "kind": "item", "name": n})
+tick(12)  # answered under the work budget (requests.lua), a few a tick
 pages = {(m["kind"], m["name"]): m for m in of_type(take(), "pedia")}
 belt = pages.get(("item", "transport-belt"), {}).get("d", {})
 check(belt.get("made") == ["transport-belt"] and belt.get("entity", {}).get("type") == "transport-belt"
@@ -690,6 +695,19 @@ nauvis = pages.get(("planet", "nauvis"), {}).get("d", {})
 check(["vulcanus", 15000] in nauvis.get("links", []) and ["solar-system-edge", 100000] in nauvis.get("links", []),
       f"a planet's page: its connections: {nauvis}")
 check(pages.get(("item", "no-such-item"), {}).get("found") == 0, "an unknown page answers found 0")
+magazine = pages.get(("item", "firearm-magazine"), {}).get("d", {})
+pistol = pages.get(("item", "pistol"), {}).get("d", {})
+armor = pages.get(("item", "heavy-armor"), {}).get("d", {})
+check(magazine.get("mag") == 10 and magazine.get("ammo") == "bullet" and magazine.get("dmg") == [["physical", 5]]
+      and pistol.get("arange") == 15 and pistol.get("arate") == 4
+      and pages.get(("item", "grenade"), {}).get("d", {}).get("arange") == 15
+      and armor.get("res") == [["physical", 6, 30], ["explosion", 20, 30], ["fire", 0, 30]],
+      f"ammo: magazine size, category, damage; a gun's and a capsule's range; armour's resistances in order: {magazine} {pistol} {armor.get('res')}")
+uran = pages.get(("recipe", "uranium-processing"), {}).get("d", {})
+rock = pages.get(("entity", "huge-rock"), {}).get("d", {})
+check(uran.get("prod_detail") == [[0.007, 1, 1], [0.993, 1, 1]] and rock.get("mine_detail") == [[1, 24, 50], [1, 24, 50]]
+      and "prod_detail" not in pages.get(("recipe", "transport-belt"), {}).get("d", {}),
+      f"a recipe's chances and a rock's amount ranges come with its products, plain amounts without: {uran.get('prod_detail')} {rock.get('mine_detail')}")
 
 # The logistic networks window (L).
 F.lnets = lua.table_from({"nauvis": lua.table_from([F.make_network(7, lua.table_from([1, 2, 3, 4]),
@@ -2290,4 +2308,449 @@ welcome = of_type(take(), "welcome")
 check(welcome and welcome[-1]["u"] != old_unit and welcome[-1]["u"] == g.storage.f3d.puppet.unit_number,
       "a new character after the old one died starts over with a welcome naming it")
 puppet = g.storage.f3d.puppet
+
+# --- Logistics parity (Phases 1-4) ------------------------------------------------------------------
+# Helper for clean open/close and reading `gui` / `clog` / `lnet` / `hinfo` / `al`.
+send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
+tick(2)
+take()
+g.game.forces.player.character_logistic_requests = True
+F.network = F.make_network(7, lua.table_from([4, 6, 2, 3]), lua.table_from([
+    lua.table_from(["iron-plate", 120]),
+    lua.table_from(["iron-plate", 15, "rare"]),
+]))
+lp_x, lp_y = puppet.position.x, puppet.position.y
+
+# 1. Quality comparators (=, !=/≠, <, <=/≤, >, >=/≥) round-trip via set_section and set_requests,
+#    plus inline section multiplier (set_section "m") and ql / in_net / del / pick on lc & clog.
+lp_req = spawn("requester-chest", lp_x + 2.5, lp_y + 1.5, force="player")
+send(open_cmd(lp_req))
+tick(2)
+take()
+send({"t": "set_section", "u": lp_req.unit_number, "i": 0, "m": 2.5, "f": [
+    ["iron-plate", "normal", 10, 20, "", -1, "="],
+    ["iron-plate", "uncommon", 5, -1, "", -1, "!="],
+    ["iron-plate", "rare", 3, 12, "", -1, "<"],
+    ["copper-plate", "uncommon", 8, 16, "", -1, "<="],
+    ["copper-plate", "rare", 2, -1, "", -1, ">"],
+    ["wood", "normal", 4, 8, "", -1, ">="],
+    ["iron-gear-wheel", "normal", 1, -1, "", -1, "badcmp"],
+]})
+tick(2)
+gs = guis(take(), lp_req)
+lc = gs[-1].get("lc", {}) if gs else {}
+sec0 = (lc.get("sec") or [{}])[0]
+check(sec0.get("m") == 2.5 and sec0.get("man") == 1 and lc.get("in_net") == 1
+      and gs[-1].get("ql") == ["normal", "uncommon", "rare"],
+      f"set_section multiplier, man, in_net and ql on requester chest: {sec0} ql={gs[-1].get('ql')}")
+check(sec0.get("f") == [
+    ["iron-plate", "normal", 10, 20, "", -1],
+    ["iron-plate", "uncommon", 5, -1, "", -1, "≠"],
+    ["iron-plate", "rare", 3, 12, "", -1, "<"],
+    ["copper-plate", "uncommon", 8, 16, "", -1, "≤"],
+    ["copper-plate", "rare", 2, -1, "", -1, ">"],
+    ["wood", "normal", 4, 8, "", -1, "≥"],
+    ["iron-gear-wheel", "normal", 1, -1, "", -1],
+], f"quality comparators round-trip via set_section (ASCII normalized, = omitted): {sec0.get('f')}")
+
+send({"t": "set_section", "u": lp_req.unit_number, "i": 1, "m": 0})
+tick(2)
+gs = guis(take(), lp_req)
+check(gs[-1]["lc"]["sec"][0]["m"] == 0, f"set_section allows m=0: {gs[-1]['lc']['sec'][0]}")
+send({"t": "set_section", "u": lp_req.unit_number, "i": 1, "m": 1})
+tick(2)
+take()
+
+# set_requests comparator round-trip & separate keys per comparator
+send({"t": "set_requests", "u": lp_req.unit_number, "l": [
+    ["iron-plate", 10, 30, "normal", "="],
+    ["iron-plate", 20, -1, "rare", "!="],
+    ["iron-plate", 30, -1, "rare", ">="],
+    ["wood", 5, 10, "normal", "<="],
+]})
+tick(2)
+gs = guis(take(), lp_req)
+lg_reqs = gs[-1].get("lg", {}).get("requests", [])
+check(lg_reqs == [
+    ["iron-plate", 10, 30],
+    ["iron-plate", 20, -1, "rare", "≠"],
+    ["iron-plate", 30, -1, "rare", "≥"],
+    ["wood", 5, 10, "normal", "≤"],
+], f"set_requests comparator round-trip & distinct comparator keys: {lg_reqs}")
+
+# del / pick transfer counts on requester chest point (`lc.del`, `lc.pick`) and in_net = 0 outside network
+lua.execute("""local e = ...
+  local pt = e.get_logistic_point(defines.logistic_member_index.logistic_container)
+  pt.targeted_items_deliver = {
+    [{name = "iron-plate", quality = "normal"}] = 12,
+    [{name = "iron-plate", quality = "rare"}] = 4,
+  }
+  pt.targeted_items_pickup = {
+    {name = "wood", quality = "normal", count = 7},
+    {name = "coal", quality = "uncommon", count = 3},
+  }""", lp_req)
+tick(31)
+gs = guis(take(), lp_req)
+lc = gs[-1].get("lc", {}) if gs else {}
+check(lc.get("del") == [["iron-plate", 12], ["iron-plate", 4, "rare"]]
+      and lc.get("pick") == [["coal", 3, "uncommon"], ["wood", 7]],
+      f"lc.del and lc.pick read point_transfers with quality: del={lc.get('del')} pick={lc.get('pick')}")
+F.network = None
+tick(31)
+gs = guis(take(), lp_req)
+check(gs[-1].get("lc", {}).get("in_net") == 0, f"lc.in_net is 0 outside a network: {gs[-1].get('lc')}")
+F.network = F.make_network(7, lua.table_from([4, 6, 2, 3]), lua.table_from([
+    lua.table_from(["iron-plate", 120]),
+    lua.table_from(["iron-plate", 15, "rare"]),
+]))
+send({"t": "close"})
+
+# 2. Non-manual (man == 0) section: read-only flag in sections_list & protection in write_section
+space_mod = lua.eval('package.loaded["scripts.space"]')
+ro_probe = lua.eval("""function(space)
+  local filters = {{ value = { type = "item", name = "iron-plate", quality = "rare", comparator = "≥" }, min = 15, max = 30 }}
+  local sec = setmetatable({}, {
+    __index = function(_, k)
+      if k == "active" then return true
+      elseif k == "multiplier" then return 2
+      elseif k == "group" then return "Auto"
+      elseif k == "is_manual" then return false
+      elseif k == "filters" then return filters
+      end
+    end,
+    __newindex = function(_, k, _)
+      error("non-manual section is read-only: " .. tostring(k), 2)
+    end,
+  })
+  local secs = {
+    sections = { sec },
+    get_section = function(i) return i == 1 and sec or nil end,
+    remove_section = function(_) return false end,
+    add_section = function() return nil end,
+  }
+  local listed = space.sections_list(secs)
+  local ok_f, err_f = pcall(space.write_section, secs, { i = 1, f = { { "wood", "normal", 5, -1, "", -1 } } })
+  local ok_m, err_m = pcall(space.write_section, secs, { i = 1, m = 5 })
+  local ok_del, err_del = pcall(space.write_section, secs, { i = 1, del = 1 })
+  return { listed = listed, ok_f = ok_f, err_f = tostring(err_f or ""), ok_m = ok_m, err_m = tostring(err_m or ""), ok_del = ok_del }
+end""")(space_mod)
+ro_py = to_py(ro_probe)
+check(ro_py["listed"][0]["man"] == 0 and ro_py["listed"][0]["m"] == 2
+      and ro_py["listed"][0]["f"] == [["iron-plate", "rare", 15, 30, "", -1, "≥"]],
+      f"sections_list encodes non-manual section as man=0: {ro_py['listed']}")
+check(ro_py["ok_f"] and ro_py["ok_m"] and ro_py["ok_del"],
+      f"write_section refuses non-manual (man=0) edits without throwing: {ro_py}")
+
+# 3. Character clog.del, clog.pick, and xfer with trash=1
+lua.execute("""local c = ...
+  local pt = c.get_requester_point()
+  pt.targeted_items_deliver = { ["iron-plate"] = 25, [{name = "copper-plate", quality = "rare"}] = 5 }
+  pt.targeted_items_pickup = { ["wood"] = 9 }""", puppet)
+send({"t": "set_section", "u": 0, "i": 0, "m": 3, "f": [["iron-plate", "rare", 20, -1, "", -1, ">="]]})
+tick(1)
+clog = of_type(take(), "clog")
+check(clog and clog[-1].get("del") == [["copper-plate", 5, "rare"], ["iron-plate", 25]]
+      and clog[-1].get("pick") == [["wood", 9]]
+      and clog[-1]["sec"][0]["m"] == 3
+      and clog[-1]["sec"][0]["f"] == [["iron-plate", "rare", 20, -1, "", -1, "≥"]],
+      f"clog carries del, pick, section multiplier and comparator: {clog[-1:]}")
+lua.execute("""local c = ...
+  local pt = c.get_requester_point()
+  pt.targeted_items_deliver = {}
+  pt.targeted_items_pickup = {}""", puppet)
+
+# Character xfer trash=1
+clear_inv = lua.eval("function(inv) for i = 1, #inv do inv[i].set_stack(nil) end end")
+clear_inv(puppet.get_main_inventory())
+trash_inv = puppet.get_inventory(g.defines.inventory.character_trash)
+clear_inv(trash_inv)
+puppet.get_main_inventory().insert(lua.table_from({"name": "iron-plate", "count": 40}))
+puppet.get_main_inventory().insert(lua.table_from({"name": "wood", "count": 10}))
+send({"t": "xfer", "from": "main", "fi": 1, "k": "half", "trash": 1})
+tick(1)
+take()
+check(trash_inv.get_item_count("iron-plate") == 20 and puppet.get_main_inventory().get_item_count("iron-plate") == 20,
+      f"xfer with trash=1 half moves half stack to character_trash: trash={trash_inv.get_item_count('iron-plate')}")
+send({"t": "xfer", "from": "main", "fi": 1, "k": "all", "trash": 1})
+tick(1)
+take()
+check(trash_inv.get_item_count("iron-plate") == 40 and puppet.get_main_inventory().get_item_count("iron-plate") == 0,
+      "xfer with trash=1 all moves remaining stacks to character_trash")
+# Fill remaining trash slots and verify "Trash slots full"
+for _ in range(9):
+    trash_inv.insert(lua.table_from({"name": "copper-plate", "count": 100}))
+send({"t": "xfer", "from": "main", "fi": 2, "k": "stack", "trash": 1})
+tick(1)
+check("Trash slots full" in texts(take()), "xfer with trash=1 into full trash reports Trash slots full")
+clear_inv(puppet.get_main_inventory())
+clear_inv(trash_inv)
+
+# 4. Spidertron logistics (spidertron_requester, on/mv/tu, spider_trash)
+spider = spawn("spidertron", lp_x + 4.0, lp_y - 3.0, force="player")
+F.inventories[spider]["spider_trash"].insert(lua.table_from({"name": "wood", "count": 6}))
+send(open_cmd(spider))
+tick(2)
+gs = guis(take(), spider)
+slc = gs[-1].get("lc", {}) if gs else {}
+check(gs and gs[-1]["kind"] == "vehicle" and gs[-1].get("lg", {}).get("mode") == "requester"
+      and "trash" in gs[-1].get("slots", {}) and slc.get("on") == 1 and slc.get("mv") == 1
+      and slc.get("tu") == 0 and slc.get("in_net") == 1 and gs[-1]["inv"].get("trash") == [["wood", 6]],
+      f"spidertron screen has requester lg, lc (on/mv/tu/in_net) and spider_trash: {gs[-1:]}")
+send({"t": "set_chest_logistics", "u": spider.unit_number, "on": 0, "mv": 0, "tu": 1})
+send({"t": "set_section", "u": spider.unit_number, "i": 0, "m": 2, "f": [["rocket", "uncommon", 20, 40, "", -1, "<="]]})
+tick(2)
+gs = guis(take(), spider)
+slc = gs[-1].get("lc", {}) if gs else {}
+check(slc.get("on") == 0 and slc.get("mv") == 0 and slc.get("tu") == 1
+      and spider.enable_logistics_while_moving == False
+      and slc.get("sec", [{}])[0].get("f") == [["rocket", "uncommon", 20, 40, "", -1, "≤"]]
+      and slc.get("sec", [{}])[0].get("m") == 2,
+      f"spidertron set_chest_logistics (on/mv/tu) and set_section update state: {slc}")
+send({"t": "close"})
+
+# 5. Roboport robot requests (roboport_requester, lg.cell counts, no_tu)
+lp_port = spawn("roboport", lp_x + 8.0, lp_y + 4.0, force="player",
+                stationed_logistic_robot_count=12, stationed_construction_robot_count=5)
+lua.execute("""local p = ...
+  p.logistic_cell.charging_robots = { { valid = true }, { valid = true } }
+  p.logistic_cell.to_charge_robots = { { valid = true } }
+  p.logistic_cell.charging_robot_count = 2
+  p.logistic_cell.to_charge_robot_count = 1""", lp_port)
+send(open_cmd(lp_port))
+tick(2)
+gs = guis(take(), lp_port)
+plg = gs[-1].get("lg", {}) if gs else {}
+plc = gs[-1].get("lc", {}) if gs else {}
+check(plg.get("mode") == "roboport" and plg.get("cell") == {"sl": 12, "sc": 5, "ch": 2, "tc": 1}
+      and plc.get("no_tu") == 1 and plc.get("on") == 1 and plc.get("tu") == 0 and plc.get("in_net") == 1,
+      f"roboport screen includes lg.cell and lc.no_tu/on/in_net: lg={plg} lc={plc}")
+send({"t": "set_section", "u": lp_port.unit_number, "i": 0, "f": [["iron-gear-wheel", "normal", 25, 50, "", -1]]})
+send({"t": "set_chest_logistics", "u": lp_port.unit_number, "on": 0, "tu": 1})
+tick(2)
+gs = guis(take(), lp_port)
+plc = gs[-1].get("lc", {}) if gs else {}
+check(plc.get("on") == 0 and plc.get("tu") == 0 and plc.get("no_tu") == 1
+      and plc.get("sec", [{}])[0].get("f") == [["iron-gear-wheel", "normal", 25, 50, "", -1]],
+      f"roboport set_section adds robot request and set_chest_logistics keeps tu=0: {plc}")
+send({"t": "close"})
+
+# 6. Storage chest filter quality (set_storage_filter / filter_q)
+lp_sto = spawn("storage-chest", lp_x + 3.5, lp_y + 2.5, force="player")
+send(open_cmd(lp_sto))
+send({"t": "set_storage_filter", "u": lp_sto.unit_number, "item": "iron-plate", "q": "rare"})
+tick(2)
+gs = guis(take(), lp_sto)
+check(gs[-1].get("lg", {}).get("filter") == "iron-plate" and gs[-1]["lg"].get("filter_q") == "rare"
+      and gs[-1].get("ql") == ["normal", "uncommon", "rare"],
+      f"storage chest filter quality sets filter_q and sends ql: {gs[-1].get('lg')}")
+send({"t": "set_storage_filter", "u": lp_sto.unit_number, "item": "iron-plate", "q": "normal"})
+tick(2)
+gs = guis(take(), lp_sto)
+check(gs[-1].get("lg", {}).get("filter") == "iron-plate" and "filter_q" not in gs[-1]["lg"],
+      f"storage chest normal quality omits filter_q: {gs[-1].get('lg')}")
+send({"t": "set_storage_filter", "u": lp_sto.unit_number, "item": ""})
+tick(2)
+gs = guis(take(), lp_sto)
+check(gs[-1].get("lg", {}).get("filter") == "" and "filter_q" not in gs[-1]["lg"],
+      f"clearing storage chest filter clears filter and filter_q: {gs[-1].get('lg')}")
+send({"t": "close"})
+
+# 7. Ghost logistic chests & ghost roboports
+gh_req = None
+try:
+    gh_req = F.surface.create_entity(lua.table_from({
+        "name": "entity-ghost", "inner_name": "requester-chest",
+        "position": {"x": lp_x + 1.5, "y": lp_y - 3.5}, "force": "player",
+    }, recursive=True))
+except Exception as exc:
+    check(False, f"fake_factorio spawns requester-chest ghost cleanly: {exc}")
+gh_sto = F.surface.create_entity(lua.table_from({
+    "name": "entity-ghost", "inner_name": "storage-chest",
+    "position": {"x": lp_x + 2.5, "y": lp_y - 3.5}, "force": "player",
+}, recursive=True))
+gh_port = F.surface.create_entity(lua.table_from({
+    "name": "entity-ghost", "inner_name": "roboport",
+    "position": {"x": lp_x + 12.0, "y": lp_y - 4.0}, "force": "player",
+}, recursive=True))
+if gh_req is not None:
+    send(open_cmd(gh_req))
+    send({"t": "set_section", "u": gh_req.unit_number, "i": 0, "f": [["copper-plate", "uncommon", 30, -1, "", -1, ">="]]})
+    send({"t": "set_chest_logistics", "u": gh_req.unit_number, "rb": 1, "tu": 1})
+    tick(2)
+    gs = guis(take(), gh_req)
+    check(gs and gs[-1].get("gh") == 1 and gs[-1].get("lg", {}).get("mode") == "requester"
+          and gs[-1].get("lc", {}).get("rb") == 1 and gs[-1]["lc"].get("tu") == 1
+          and gs[-1]["lc"].get("sec", [{}])[0].get("f") == [["copper-plate", "uncommon", 30, -1, "", -1, "≥"]],
+          f"ghost requester chest opens and edits sections/rb/tu: {gs[-1:]}")
+send(open_cmd(gh_sto))
+send({"t": "set_storage_filter", "u": gh_sto.unit_number, "item": "iron-gear-wheel", "q": "uncommon"})
+tick(2)
+gs = guis(take(), gh_sto)
+check(gs and gs[-1].get("gh") == 1 and gs[-1].get("lg", {}).get("mode") == "storage"
+      and gs[-1]["lg"].get("filter") == "iron-gear-wheel" and gs[-1]["lg"].get("filter_q") == "uncommon",
+      f"ghost storage chest opens and sets quality filter: {gs[-1:]}")
+send(open_cmd(gh_port))
+send({"t": "set_section", "u": gh_port.unit_number, "i": 0, "f": [["transport-belt", "normal", 10, -1, "", -1]]})
+tick(2)
+gs = guis(take(), gh_port)
+check(gs and gs[-1].get("gh") == 1 and gs[-1].get("lg", {}).get("mode") == "roboport"
+      and gs[-1].get("lc", {}).get("no_tu") == 1
+      and gs[-1]["lc"].get("sec", [{}])[0].get("f") == [["transport-belt", "normal", 10, -1, "", -1]],
+      f"ghost roboport opens and edits robot requests: {gs[-1:]}")
+send({"t": "close"})
+
+# 8. Constant combinator group, multiplier, and signal quality
+cc_ent = spawn("constant-combinator", lp_x - 2.5, lp_y - 2.5, force="player")
+send(open_cmd(cc_ent))
+send({"t": "set_cb", "u": cc_ent.unit_number, "cb": {
+    "enabled": True,
+    "sections": [{"g": "CCGroup", "on": 1, "m": 4.5, "s": []}],
+}})
+send({"t": "set_cb", "u": cc_ent.unit_number, "cb": {
+    "enabled": True,
+    "sections": [{"g": "CCGroup", "on": 1, "m": 4.5, "s": [["item", "iron-plate", 12, "rare"], ["virtual", "signal-A", -3]]}],
+}})
+tick(2)
+gs = guis(take(), cc_ent)
+cc_cb = gs[-1].get("cb", {}) if gs else {}
+cc_sec = (cc_cb.get("sections") or [{}])[0]
+check(cc_sec.get("g") == "CCGroup" and cc_sec.get("m") == 4.5 and cc_sec.get("on") == 1
+      and cc_sec.get("s") == [["item", "iron-plate", 12, "rare"], ["virtual", "signal-A", -3]]
+      and gs[-1].get("ql") == ["normal", "uncommon", "rare"],
+      f"constant combinator round-trips group, multiplier, signal quality and ql: {cc_cb}")
+send({"t": "close"})
+
+# 9. set_lnet_name, rich lnet payload (members, req, transit, ch, <58KB guard), lnet_find -> lnet_locs
+F.inventories[lp_sto]["chest"].insert(lua.table_from({"name": "iron-plate", "count": 50}))
+lua.execute("""local sto, req, port = ...
+  local net = port.logistic_network
+  net.cells[1] = port.logistic_cell
+  net.storages[1] = sto
+  net.requesters[1] = req
+  local pt = req.get_logistic_point(defines.logistic_member_index.logistic_container)
+  pt.targeted_items_deliver = { ["iron-plate"] = 18 }""", lp_sto, lp_req, lp_port)
+F.lnets = lua.table_from({"nauvis": lua.table_from([lp_port.logistic_network])})
+send({"t": "set_lnet_name", "id": 7, "name": "Main Base"})
+tick(1)
+msgs = take()
+lnets_m = of_type(msgs, "lnets")
+check(lnets_m and lnets_m[-1]["l"][0][11] == "Main Base" and lnets_m[-1]["l"][0][5] == 1
+      and lnets_m[-1]["l"][0][6] == 1 and lnets_m[-1]["l"][0][8] == 1,
+      f"set_lnet_name renames network and broadcasts lnets: {lnets_m[-1:]}")
+send({"t": "lnet", "id": 7})
+tick(1)
+lnet_m = of_type(take(), "lnet")[-1]
+check(lnet_m.get("found") == 1 and lnet_m.get("ch") == [2, 1]
+      and sorted(lnet_m.get("members", [])) == [["requester-chest", 1], ["roboport", 1], ["storage-chest", 1]]
+      and lnet_m.get("transit") == [["iron-plate", 18]]
+      and any(r[0] == "iron-plate" and r[1] == 10 and r[2] == 0 for r in lnet_m.get("req", []))
+      and any(r[0] == "iron-plate" and r[1] == 50 and r[2] == 35 and r[3] == "rare" for r in lnet_m.get("req", [])),
+      f"rich lnet payload includes members, ch, transit, req with missing & quality: {lnet_m}")
+
+locs_msgs = []
+for q_cmd in [
+    {"t": "lnet_find", "id": 7, "item": "iron-plate", "q": "normal"},
+    {"t": "lnet_find", "id": 7, "item": "iron-plate", "q": "rare", "role": "req"},
+    {"t": "lnet_find", "id": 7, "item": "iron-plate", "q": "normal", "role": "transit"},
+    {"t": "lnet_find", "id": 7, "proto": "roboport"},
+    {"t": "lnet_find", "id": 999, "proto": "roboport"},
+]:
+    send(q_cmd)
+    tick(12)
+    locs_msgs.extend(of_type(take(), "lnet_locs"))
+check(len(locs_msgs) == 5
+      and locs_msgs[0]["l"] == [[fixed(lp_sto.position.x), fixed(lp_sto.position.y), "storage-chest", 50]]
+      and locs_msgs[1]["l"] == [[fixed(lp_req.position.x), fixed(lp_req.position.y), "requester-chest", 50]]
+      and locs_msgs[2]["l"] == [[fixed(lp_req.position.x), fixed(lp_req.position.y), "requester-chest", 18]]
+      and locs_msgs[3]["l"] == [[fixed(lp_port.position.x), fixed(lp_port.position.y), "roboport", 1]]
+      and locs_msgs[4]["l"] in ([], {}),
+      f"lnet_find returns lnet_locs for item, req, transit, proto, and empty for missing net: {locs_msgs}")
+
+# LNET_MAX_ITEMS (400) & <58KB payload guard
+huge_contents = lua.table_from([
+    lua.table_from([f"huge-logistic-test-item-with-a-very-long-prototype-name-{k:04d}-padding-extra-text", k + 1])
+    for k in range(500)
+])
+huge_net = F.make_network(77, lua.table_from([1, 2, 1, 2]), huge_contents)
+lua.execute("""local net, req = ...
+  net.requesters[1] = req""", huge_net, lp_req)
+F.lnets = lua.table_from({"nauvis": lua.table_from([F.network, huge_net])})
+tick(12)
+send({"t": "lnet", "id": 77})
+tick(12)
+huge_lnet = of_type(take(), "lnet")
+check(bool(huge_lnet), "lnet response received for large network 77")
+huge_msg = huge_lnet[-1] if huge_lnet else {}
+huge_bytes = len(g.helpers.table_to_json(lua.table_from(huge_msg, recursive=True)))
+check(len(huge_msg.get("items", [])) <= 400 and huge_bytes <= 58000,
+      f"lnet caps items at LNET_MAX_ITEMS (400) and trims payload under 58KB: items={len(huge_msg.get('items', []))} bytes={huge_bytes}")
+
+# 10. hinfo.ln on roboport, logistic container, and ghost
+send(open_cmd(lp_sto))
+send({"t": "set_storage_filter", "u": lp_sto.unit_number, "item": "copper-plate", "q": "rare"})
+tick(2)
+send({"t": "close"})
+take()
+send({"t": "hinfo", "q": 30, "u": lp_port.unit_number, "p": 0, "x": fixed(lp_port.position.x), "y": fixed(lp_port.position.y)})
+send({"t": "hinfo", "q": 31, "u": lp_sto.unit_number, "p": 0, "x": fixed(lp_sto.position.x), "y": fixed(lp_sto.position.y)})
+send({"t": "hinfo", "q": 32, "u": lp_req.unit_number, "p": 0, "x": fixed(lp_req.position.x), "y": fixed(lp_req.position.y)})
+send({"t": "hinfo", "q": 33, "u": gh_sto.unit_number, "p": 0, "x": fixed(gh_sto.position.x), "y": fixed(gh_sto.position.y)})
+send({"t": "hinfo", "q": 34, "u": gh_port.unit_number, "p": 0, "x": fixed(gh_port.position.x), "y": fixed(gh_port.position.y)})
+tick(5)
+hmap = {m["q"]: m for m in of_type(take(), "hinfo")}
+check(hmap.get(30, {}).get("ln") == {"id": 7, "name": "Main Base", "log": [4, 6], "con": [2, 3], "ch": [2, 1]},
+      f"hinfo.ln on connected roboport: {hmap.get(30)}")
+check(hmap.get(31, {}).get("ln") == {"id": 7, "name": "Main Base", "mode": "storage", "f": "copper-plate", "fq": "rare"},
+      f"hinfo.ln on storage chest with quality filter: {hmap.get(31)}")
+check(hmap.get(32, {}).get("ln", {}).get("mode") == "requester" and len(hmap[32]["ln"].get("req", [])) >= 1,
+      f"hinfo.ln on requester chest with requests: {hmap.get(32)}")
+check(hmap.get(33, {}).get("ln") == {"id": 0, "name": "", "mode": "storage", "f": "iron-gear-wheel", "fq": "uncommon"}
+      and hmap.get(34, {}).get("ln") == {"id": 0},
+      f"hinfo.ln on ghost storage chest and ghost roboport: {hmap.get(33)} {hmap.get(34)}")
+
+# 11. no_storage and no_roboport_storage alerts
+ap_chest = spawn("wooden-chest", lp_x + 5.5, lp_y + 1.5, force="player")
+F.inventories[ap_chest]["chest"].insert(lua.table_from({"name": "iron-plate", "count": 10}))
+lua.execute("""local port = ...
+  local rinv = port.get_inventory(defines.inventory.roboport_robot)
+  for i = 1, #rinv do
+    rinv[i].set_stack({ name = "iron-plate", count = 50 })
+  end""", lp_port)
+# Force network all_logistic_robots > 350 capacity (7 * 50)
+al_net = F.make_network(7, lua.table_from([0, 400, 0, 0]), lua.table_from([]), lua.table_from([lp_port.logistic_cell]))
+lua.execute("""local net, ap = ...
+  net.active_providers[1] = ap""", al_net, ap_chest)
+F.lnets = lua.table_from({"nauvis": lua.table_from([al_net])})
+g.package.loaded["scripts.alerts"].reset()
+tick(130)
+al_msgs = of_type(take(), "al")
+al_kinds = {a[0]: a for a in al_msgs[-1]["l"]} if al_msgs else {}
+check("no_storage" in al_kinds and al_kinds["no_storage"][2][0][4] == ap_chest.unit_number,
+      f"no_storage alert fires for non-empty active provider with no storage room: {al_kinds.get('no_storage')}")
+check("no_roboport_storage" in al_kinds and al_kinds["no_roboport_storage"][2][0][4] == lp_port.unit_number,
+      f"no_roboport_storage alert fires when all roboports are full and robots > capacity: {al_kinds.get('no_roboport_storage')}")
+# Clear both conditions and verify alerts clear
+lua.execute("""local net, sto, port = ...
+  net.storages[1] = sto
+  local rinv = port.get_inventory(defines.inventory.roboport_robot)
+  rinv[1].set_stack(nil)""", al_net, lp_sto, lp_port)
+g.package.loaded["scripts.alerts"].reset()
+tick(130)
+al_msgs2 = of_type(take(), "al")
+al_kinds2 = {a[0]: a for a in al_msgs2[-1]["l"]} if al_msgs2 else {}
+check("no_storage" not in al_kinds2 and "no_roboport_storage" not in al_kinds2,
+      f"no_storage and no_roboport_storage clear once space returns: {list(al_kinds2)}")
+
+# Clean up logistics parity test state
+for e in (lp_req, lp_sto, lp_port, spider, gh_req, gh_sto, gh_port, cc_ent, ap_chest):
+    if e and e.valid:
+        e.destroy()
+F.network = None
+F.lnets = lua.table()
+lua.execute("""local c = ...
+  local pt = c.get_requester_point()
+  for i = pt.sections_count, 1, -1 do pt.remove_section(i) end
+  pt.add_section()""", puppet)
+tick(2)
+take()
 

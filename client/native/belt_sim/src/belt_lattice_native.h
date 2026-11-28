@@ -266,8 +266,10 @@ private:
 	static constexpr i64 OPEN_TOL = 4;
 	void _open_ends(const std::unordered_map<i64, i64> &front_at, i64 tick);
 	bool sim_full = true;
+	bool take_sync = true;
 	static constexpr i64 CLOSE_MORE = 4;
 	void set_close(bool v) { close = v; }
+	void set_take_sync(bool v) { take_sync = v; }
 	void set_mask_inner(bool v) { mask_inner = v; }
 	void set_mask_own(bool v) { mask_own = v; }
 	void set_mask_open(bool v) { mask_open = v; }

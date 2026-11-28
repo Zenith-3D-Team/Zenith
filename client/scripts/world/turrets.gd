@@ -33,6 +33,8 @@ const FlameSound := preload("res://scripts/fx/flame_sound.gd")
 const Switches := preload("res://scripts/switches.gd")
 ## `--flame-streams=old`: the stream drawn here (no `pj` from the mod) arcs as low as before.
 static var flame_streams_old := Switches.has("--flame-streams=old")
+## `--turret-ammo-guard=off`: queue ammo-delta shots even when a folded turret has no target.
+static var ammo_fire_guard := not (Switches.has("--turret-ammo-guard=off"))
 
 ## A target counts as current this long after a report names it (reports come every 6 ticks).
 const TARGET_HOLD := 0.4
@@ -49,11 +51,11 @@ const CATCH_UP := 1.3
 ## folded pose (`drop`, `back` and `squeeze` as fractions of the head's size, `pitch` in radians,
 ## nose up), recoil (tiles, seconds), the firing, raising and folding sounds.
 const TURRETS := {
-	"gun-turret": {"rot": 0.015, "prep": 0.08, "fold": 0.08, "cooldown": 6, "kind": "bullet",
+	"gun-turret": {"rot": 0.015, "prep": 0.08, "fold": 0.08, "cooldown": 6, "kind": "bullet", "omni": true,
 		"pose": {"drop": -0.06, "pitch": -0.18}, "recoil": [0.05, 0.08],
 		"sound": "base/sound/fight/gun-turret-gunshot", "up": "base/sound/fight/gun-turret-activate",
 		"down": "base/sound/fight/gun-turret-deactivate"},
-	"laser-turret": {"rot": 0.01, "prep": 0.05, "fold": 0.05, "cooldown": 40, "kind": "laser",
+	"laser-turret": {"rot": 0.01, "prep": 0.05, "fold": 0.05, "cooldown": 40, "kind": "laser", "omni": true,
 		"pose": {"drop": -0.55}, "recoil": [0.0, 0.1], "sound": "base/sound/fight/laser-beam",
 		"up": "base/sound/fight/laser-turret-activate", "down": "base/sound/fight/laser-turret-deactivate"},
 	"flamethrower-turret": {"rot": 0.015, "prep": 0.08, "fold": 0.08, "cooldown": 4, "kind": "flame",
@@ -61,12 +63,12 @@ const TURRETS := {
 		"sound": "base/sound/fight/flamethrower-turret-mid", "start": "base/sound/fight/flamethrower-turret-start",
 		"end": "base/sound/fight/flamethrower-turret-end",
 		"up": "base/sound/fight/flamethrower-turret-activate", "down": "base/sound/fight/flamethrower-turret-deactivate"},
-	"rocket-turret": {"rot": 0.005, "prep": 0.08, "fold": 0.08, "cooldown": 120, "kind": "rocket",
+	"rocket-turret": {"rot": 0.005, "prep": 0.08, "fold": 0.08, "cooldown": 120, "kind": "rocket", "omni": true,
 		"pose": {"squeeze": 0.55, "drop": -0.2}, "recoil": [0.05, 0.2], "launchers": 6,
 		"sound": "space-age/sound/ammo/rocket-turret-launcher",
 		"up": "space-age/sound/entity/rocket-turret/rocket-turret-activate",
 		"down": "space-age/sound/entity/rocket-turret/rocket-turret-deactivate"},
-	"tesla-turret": {"rot": 0.005, "prep": 0.1, "fold": 0.1, "cooldown": 120, "kind": "tesla",
+	"tesla-turret": {"rot": 0.005, "prep": 0.1, "fold": 0.1, "cooldown": 120, "kind": "tesla", "omni": true,
 		"pose": {"drop": -0.5}, "recoil": [0.0, 0.1], "sound": "space-age/sound/entity/tesla-turret/tesla-turret-beam",
 		"up": "space-age/sound/entity/tesla-turret/tesla-turret-activate",
 		"down": "space-age/sound/entity/tesla-turret/tesla-turret-deactivate"},
@@ -75,7 +77,7 @@ const TURRETS := {
 		"sound": "space-age/sound/entity/railgun-turret/railgun-turret-gunshot",
 		"up": "space-age/sound/entity/railgun-turret/railgun-turret-activate",
 		"down": "space-age/sound/entity/railgun-turret/railgun-turret-deactivate"},
-	"artillery-turret": {"rot": 0.001, "prep": 0.0, "fold": 0.0, "cooldown": 200, "kind": "artillery",
+	"artillery-turret": {"rot": 0.001, "prep": 0.0, "fold": 0.0, "cooldown": 200, "kind": "artillery", "omni": true,
 		"pose": {}, "recoil": [0.3, 0.7], "sound": "base/sound/fight/artillery-shoots"},
 	"artillery-wagon": {"rot": 0.001, "prep": 0.0, "fold": 0.0, "cooldown": 200, "kind": "artillery",
 		"pose": {}, "recoil": [0.3, 0.7], "sound": "base/sound/fight/artillery-shoots", "vehicle": true},
@@ -241,10 +243,20 @@ func handle_states(msg: Dictionary) -> void:
 			st.yaw = st.goal
 			st.seen = true
 		st.gun = maxi(1, int(rec[3]))
-		if rec.size() >= 6:
+		var has_target: bool = rec.size() >= 6
+		if has_target:
 			st.target = Vector3(int(rec[4]) / 256.0, 0.45, int(rec[5]) / 256.0)
 			st.target_seen = _clock
-		var n := mini(int(rec[2]), MAX_QUEUED)
+		var raw_shots := int(rec[2])
+		if ammo_fire_guard and raw_shots > 0 and not has_target:
+			var target_recent := _clock - st.target_seen <= TARGET_HOLD + FOLD_DELAY
+			var is_vehicle := st.vehicle or int(rec[3]) > 0
+			# Artillery never names a target (no shooting_target in 2.1.x) and doesn't fold: the
+			# mod only counts its shots with its shell in flight (turrets.lua projectile_near).
+			var never_targets := str(st.cfg.get("kind", "")) == "artillery"
+			if not target_recent and not never_targets and (not is_vehicle or raw_shots > 4):
+				raw_shots = 0
+		var n := mini(raw_shots, MAX_QUEUED)
 		for i in n:
 			if st.shots.size() < MAX_QUEUED:
 				st.shots.append(_clock + REPORT_SECONDS * i / maxf(1.0, n))
@@ -272,15 +284,18 @@ func head_transform(unit: int, part: ModelLibrary.AnimPart, base: Transform3D, d
 	if st == null:
 		var cfg0: Dictionary = TURRETS.get(part.model, {})
 		return _pose(part, 0.0, 1.0 if float(cfg0.get("prep", 1.0)) == 0.0 else 0.0, cfg0, 100.0)
+	var base_turns := -base.basis.get_euler().y / TAU
 	if st.cfg.is_empty():
 		st.name = part.model
 		st.cfg = TURRETS.get(part.model, TURRETS["gun-turret"])
 		st.vehicle = bool(st.cfg.get("vehicle", false))
 		if float(st.cfg["prep"]) == 0.0:
 			st.fold = 1.0
-	_advance(st, delta)
-	var base_turns := -base.basis.get_euler().y / TAU
-	var local_yaw := -(st.yaw - base_turns) * TAU
+		if bool(st.cfg.get("omni", false)) and _clock - st.target_seen >= TARGET_HOLD and st.shots.is_empty() and absf(wrapf(st.goal, -0.5, 0.5)) < 0.002:
+			st.yaw = wrapf(base_turns, 0.0, 1.0)
+	_advance(st, delta, base_turns)
+	var relative := bool(st.cfg.get("relative", false))
+	var local_yaw := -st.yaw * TAU if relative else -(st.yaw - base_turns) * TAU
 	var xf := _pose(part, local_yaw, st.fold, st.cfg, st.since_shot)
 	var world := base * xf
 	st.at = Vector2(base.origin.x, base.origin.z)
@@ -336,17 +351,23 @@ func _state(unit: int) -> TurretState:
 
 
 ## Turning, raising and folding, the cooldown.
-func _advance(st: TurretState, delta: float) -> void:
+func _advance(st: TurretState, delta: float, base_turns := 0.0) -> void:
 	var cfg := st.cfg
-	var rate := float(cfg["rot"]) * 60.0 * delta * CATCH_UP
-	var diff := wrapf(st.goal - st.yaw, -0.5, 0.5)
-	st.yaw = wrapf(st.yaw + clampf(diff, -rate, rate), 0.0, 1.0)
+	var wants := _clock - st.target_seen < TARGET_HOLD or not st.shots.is_empty()
+	var idle_omni := bool(cfg.get("omni", false)) and not wants and absf(wrapf(st.goal, -0.5, 0.5)) < 0.002
+	if idle_omni and (st.fold <= 0.001 or float(cfg.get("prep", 0.0)) <= 0.0):
+		# Idle 360-degree turret folded at Factorio's default North: keep head aligned with its base facing.
+		st.yaw = wrapf(base_turns, 0.0, 1.0)
+	else:
+		var goal := wrapf(base_turns, 0.0, 1.0) if idle_omni else st.goal
+		var rate := float(cfg["rot"]) * 60.0 * delta * CATCH_UP
+		var diff := wrapf(goal - st.yaw, -0.5, 0.5)
+		st.yaw = wrapf(st.yaw + clampf(diff, -rate, rate), 0.0, 1.0)
 	st.since_shot += delta
 	var prep := float(cfg["prep"])
 	if prep <= 0.0:
 		st.fold = 1.0
 		return
-	var wants := _clock - st.target_seen < TARGET_HOLD or not st.shots.is_empty()
 	if wants:
 		if st.fold <= 0.0:
 			_sound(st, "up")

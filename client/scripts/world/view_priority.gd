@@ -280,3 +280,46 @@ static func ground_view_rect(cam: Camera3D, max_far: float, pad := 0.0, y_pad_lo
 	if pad != 0.0:
 		r = r.grow(pad)
 	return r
+
+
+## The live inserter radius a view wants (focus `ir`, world.gd --live-inserter-radius=view): margin, step,
+## bounds (tiles), and how far from the camera its ground is looked for (past the furthest zoom, 400; the
+## result is cut to LIVE_IR_MAX: 64, 0.3.1's old fixed square, so zoomed out and first person never track more).
+const LIVE_IR_MARGIN := 8.0
+const LIVE_IR_STEP := 8
+const LIVE_IR_MIN := 16
+const LIVE_IR_MAX := 64
+const LIVE_IR_FAR := 1000.0
+## Seconds a smaller `ir` must stay wanted before it is sent (a larger one goes at once), so first person
+## turning its head doesn't flip the bridge's square back and forth (GONE/SYNC churn).
+const LIVE_IR_SHRINK_HOLD := 1.0
+
+
+## `ir` for `cam` round `focus`: live_ir_for_rect of its visible ground; -1 with no camera or no ground.
+static func live_ir(cam: Camera3D, focus: Vector2) -> int:
+	if cam == null:
+		return -1
+	return live_ir_for_rect(focus, ground_view_rect(cam, LIVE_IR_FAR, 0.0, -4.0, 16.0))
+
+
+## `ir` for a view showing `rect` (ground, tiles) round `focus`: the square (Chebyshev) distance to its
+## farthest corner, as the bridge's live square is one, plus the margin, a step up, clamped; -1 for no rect.
+static func live_ir_for_rect(focus: Vector2, rect: Rect2) -> int:
+	if rect.size.x <= 0.0 and rect.size.y <= 0.0:
+		return -1
+	var d := maxf(maxf(absf(rect.position.x - focus.x), absf(rect.end.x - focus.x)),
+		maxf(absf(rect.position.y - focus.y), absf(rect.end.y - focus.y)))
+	var stepped := int(ceilf((d + LIVE_IR_MARGIN) / float(LIVE_IR_STEP))) * LIVE_IR_STEP
+	return clampi(stepped, LIVE_IR_MIN, LIVE_IR_MAX)
+
+
+## Hysteresis on the `ir` sent: `sent` the last sent, `want` the view's now, `low_for` how long a smaller one
+## has been wanted, `dt` the time since the last call. Returns [ir to send, new low_for]: a larger (or the
+## first, or none) at once; a smaller only once it has been wanted LIVE_IR_SHRINK_HOLD in a row.
+static func live_ir_settle(sent: int, want: int, low_for: float, dt: float) -> Array:
+	if sent < 0 or want < 0 or want >= sent:
+		return [want, 0.0]
+	var t := low_for + dt
+	if t >= LIVE_IR_SHRINK_HOLD - 1e-4:
+		return [want, 0.0]
+	return [sent, t]

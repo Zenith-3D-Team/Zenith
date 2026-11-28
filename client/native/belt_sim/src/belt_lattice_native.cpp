@@ -396,7 +396,8 @@ Dictionary BeltLatticeNative::update(i64 tick, const Rect2 &view, bool view_all,
 		i64 obs = standing_obs ? _obs_front(key) : -1;
 		int st = (ln == nullptr || replan || heard.count(key)) ? _stack_of(key) : ln->stack;
 		bool short_ = (i64)fr[q * 3 + 2] < std::max<i64>(1, (i64)m[1] / GAP);
-		if ((sim_full && ln != nullptr && ln->v > 0 && has && short_ && fed_gone.count(key) && tick - fed_gone[key] <= FED_GONE_TICKS)
+		if ((sim_full && ln != nullptr && ((ln->v > 0 && has && short_) || (take_sync && (!has || (ln->v > 0 && short_))))
+					&& fed_gone.count(key) && tick - fed_gone[key] <= FED_GONE_TICKS)
 				|| (tail && q < (i64)tails.size() && tails[q] == 1 && (!has || (short_ && (ln == nullptr || ln->v > 0))))) {
 			// (sim_full) Moving, and the simulation has it short of full; (tail) or a packed block's tail went onto it
 			// (or past it) with nothing close behind (belt_lattice.gd).
@@ -1869,6 +1870,21 @@ Dictionary BeltLatticeNative::hole(i64 key, i64 at, i64 pos, bool dump) {
 			dirty.set(key, true);
 		}
 		pln = drawn.get(key);
+	} else if (take_sync && close && settle && pln != nullptr && (*pln)->v > 0) {
+		Info *e = info.get(key);
+		if (e != nullptr) {
+			e->full = false;
+		}
+		dirty.set(key, true);
+		if (sim_full) {
+			fed_gone[key] = at;
+			i64 nx = (*pln)->next;
+			for (int guard = 0; nx != 0 && nx != key && guard < 256; guard++) {
+				fed_gone[nx] = at;
+				Lane **pnx = drawn.get(nx);
+				nx = (pnx != nullptr) ? (*pnx)->next : 0;
+			}
+		}
 	}
 	if (pln != nullptr && base >= 0.0) {
 		Lane *ln = *pln;
@@ -2014,6 +2030,7 @@ void BeltLatticeNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_creep_flow", "on"), &BeltLatticeNative::set_creep_flow);
 	ClassDB::bind_method(D_METHOD("set_creep_step", "on"), &BeltLatticeNative::set_creep_step);
 	ClassDB::bind_method(D_METHOD("set_close", "on"), &BeltLatticeNative::set_close);
+	ClassDB::bind_method(D_METHOD("set_take_sync", "on"), &BeltLatticeNative::set_take_sync);
 	ClassDB::bind_method(D_METHOD("set_mask_inner", "on"), &BeltLatticeNative::set_mask_inner);
 	ClassDB::bind_method(D_METHOD("set_mask_own", "on"), &BeltLatticeNative::set_mask_own);
 	ClassDB::bind_method(D_METHOD("set_mask_open", "on"), &BeltLatticeNative::set_mask_open);

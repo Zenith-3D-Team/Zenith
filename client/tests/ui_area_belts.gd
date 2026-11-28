@@ -5,22 +5,30 @@ func _belt_drop_show() -> void:
 	const Arms := preload("res://scripts/world/inserter_arms.gd")
 	var was_cull: bool = BeltItemsScript.Job.view_cull
 	var was_gd: bool = BeltItemsScript.State.force_gd
+	var was_dn: bool = BeltItemsScript.State.draw_native
 	var was_show: bool = BeltItemsScript.drop_show_now
+	var was_glide: bool = BeltItemsScript.drop_glide
 	var was_ev: bool = Arms.events
 	var was_ho: bool = Arms.handoff
 	Arms.events = true
 	Arms.handoff = true
 	BeltItemsScript.Job.view_cull = false
-	var sims := [true]
+	var twins: Array = [[true, false]]
 	if ClassDB.class_exists("BeltSimNative"):
-		sims.append(false)
-	for force_gd in sims:
-		var what := "belt_sim.gd" if force_gd else "BeltSimNative"
+		twins.append([false, false])
+		twins.append([false, true])
+	var show_at_by_twin: Array = []
+	for tw: Array in twins:
+		var force_gd: bool = bool(tw[0])
+		var draw_nat: bool = bool(tw[1])
+		var what := "%s/%s" % ["belt_sim.gd" if force_gd else "BeltSimNative", "BeltDrawNative" if draw_nat else "GDScript"]
 		BeltItemsScript.State.force_gd = force_gd
+		BeltItemsScript.State.draw_native = draw_nat
+		BeltItemsScript.drop_glide = true
 		var items = BeltItemsScript.new()
 		add_child(items)
 		items._sync = true
-		# One lane along x, its exit at (2, 10), moving 8/256 a tick; nothing on it.
+		# One lane along +x, its exit at (2, 10), moving 8/256 a tick; nothing on it.
 		_bs_feed(items, 1990, {"lm": _bs_lane(9, 1, 256, 8, 2.0, 10.0, 1.0, 10.0)})
 		for k in range(1991, 2000):
 			_bs_feed(items, k, {}, 1)
@@ -28,42 +36,172 @@ func _belt_drop_show() -> void:
 		items.predict_drop(3, 1.5, 14.0)  # (off the belts: nothing)
 		_bs_feed(items, 2000, {}, 1)
 		var shown: Array = items.drops_shown().duplicate(true)
-		var at: Vector3 = shown[0][1] if shown.size() == 1 else Vector3.INF
-		var drawn0: float = items._drawn
-		check(shown.size() == 1 and absf(at.x - 1.5) < 0.02 and absf(at.z - 10.0) < 0.02 and int(shown[0][2]) == -1
-			and drawn0 < 2001.0 and not items.has_item(777),
-			"drop show (%s): Z over a belt shows the item at once on the lane under it (%s), ahead of the drawn clock (%.1f); none off the belts: %s" % [what, at, drawn0, shown])
+		var at0: Vector3 = shown[0][1] if shown.size() == 1 else Vector3.INF
+		var t_start: float = items._drawn
+		check(shown.size() == 1 and absf(at0.x - 1.5) < 0.02 and absf(at0.z - 10.0) < 0.02 and int(shown[0][2]) == -1
+			and t_start < 2001.0 and not items.has_item(777),
+			"drop show (%s): Z over a belt shows the item at once on the lane under it (%s), ahead of the drawn clock (%.1f); none off the belts: %s" % [what, at0, t_start, shown])
+		# Step two ticks before `ie` arrives: drop card glides forward along +x immediately.
+		_bs_feed(items, 2001, {}, 1)
+		_bs_feed(items, 2002, {}, 1)
+		var mid_shown: Array = items.drops_shown()
+		var mid_x: float = (mid_shown[0][1] as Vector3).x if mid_shown.size() == 1 else -INF
+		check(mid_shown.size() == 1 and mid_x > at0.x + 0.01,
+			"Other #1 (%s): drop card glides forward immediately before ie arrives (x %.4f -> %.4f)" % [what, at0.x, mid_x])
 		# The bridge's put: on tick 2003, at the lane's middle (line position 128), the game's id 777.
-		items.handle({"t": "ie", "k": 2003, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [6, 0, 2003, 9, 128, 777, 3, 1, 1]})
+		var put_tick := 2003
+		var lag_ticks := maxf(0.0, float(put_tick) - t_start)
+		var want_handoff := put_tick + mini(ceili(lag_ticks * BeltItemsScript.DROP_GLIDE_ALPHA / (1.0 - BeltItemsScript.DROP_GLIDE_ALPHA)), BeltItemsScript.DROP_MAX_CATCHUP)
+		items.handle({"t": "ie", "k": put_tick, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [6, 0, put_tick, 9, 128, 777, 3, 1, 1]})
 		var both := false
 		var gap := false
 		var gone_at := -1.0
-		for k in range(2001, 2016):
+		var recorded_show := -1.0
+		var last_drop_x := -INF
+		var snap_err := INF
+		for k in range(2003, 2024):
+			var pre_shown: Array = items.drops_shown()
+			if pre_shown.size() == 1:
+				last_drop_x = (pre_shown[0][1] as Vector3).x
 			_bs_feed(items, k, {}, 1)
+			var sh_now: float = items.show_of(777)
+			if sh_now >= 0.0 and recorded_show < 0.0:
+				recorded_show = sh_now
 			var still: bool = not items.drops_shown().is_empty()
-			var real: bool = items.has_item(777) and items._drawn >= 2003.0
+			var real: bool = items.has_item(777) and items._drawn >= float(want_handoff)
+			if not still and real and snap_err > 1.0e8 and last_drop_x > -1.0e8:
+				var rpos: Variant = items.position_of(777)
+				if rpos is Vector3:
+					snap_err = absf((rpos as Vector3).x - (last_drop_x + 8.0 / 256.0))
 			both = both or (still and real)
 			gap = gap or (not still and not real)
 			if not still and gone_at < 0.0:
 				gone_at = items._drawn
-		check(not both and not gap and gone_at >= 2003.0 and items.has_item(777) and items.drops_shown().is_empty(),
-			"drop show (%s): the shown item goes when the drawn clock reaches the bridge's put (%.1f, put 2003), the simulated one showing from then: never both (%s), no gap (%s)" % [what, gone_at, both, gap])
+		show_at_by_twin.append(recorded_show)
+		check(not both and not gap and gone_at >= float(want_handoff) and is_equal_approx(recorded_show, float(want_handoff))
+			and snap_err <= 0.04 and items.has_item(777) and items.drops_shown().is_empty(),
+			"Other #1 (%s): glide hands off at put + capped catchup (show_of=%.1f want=%d gone=%.1f snap=%.4f both=%s gap=%s)" % [what, recorded_show, want_handoff, gone_at, snap_err, both, gap])
 		# Never told (out of reach, the belt full there): it goes after DROP_SHOW_MSEC.
 		items.predict_drop(3, 1.2, 10.1)
-		_bs_feed(items, 2016, {}, 1)
+		_bs_feed(items, 2024, {}, 1)
 		var n_before: int = items.drops_shown().size()
 		for d: Array in items.drops_shown():
 			d[3] = int(d[3]) - BeltItemsScript.DROP_SHOW_MSEC - 1
 		items._process(1.0 / 60.0)
 		check(n_before == 1 and items.drops_shown().is_empty(),
 			"drop show (%s): one the bridge never confirms goes after %d ms (%d shown before)" % [what, BeltItemsScript.DROP_SHOW_MSEC, n_before])
+		# --belt-drop-glide=off: legacy static drop card hands off at put (2003.0) with show_of == put.
+		BeltItemsScript.drop_glide = false
+		var off_items = BeltItemsScript.new()
+		add_child(off_items)
+		off_items._sync = true
+		_bs_feed(off_items, 1990, {"lm": _bs_lane(9, 1, 256, 8, 2.0, 10.0, 1.0, 10.0)})
+		for k in range(1991, 2000):
+			_bs_feed(off_items, k, {}, 1)
+		off_items.predict_drop(3, 1.5, 10.1)
+		_bs_feed(off_items, 2000, {}, 1)
+		var off_at0: Vector3 = off_items.drops_shown()[0][1] if off_items.drops_shown().size() == 1 else Vector3.INF
+		_bs_feed(off_items, 2001, {}, 1)
+		var off_at1: Vector3 = off_items.drops_shown()[0][1] if off_items.drops_shown().size() == 1 else Vector3.INF
+		off_items.handle({"t": "ie", "k": 2003, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [6, 0, 2003, 9, 128, 778, 3, 1, 1]})
+		var off_both := false
+		var off_gap := false
+		var off_gone := -1.0
+		var off_show := -1.0
+		for k in range(2002, 2016):
+			_bs_feed(off_items, k, {}, 1)
+			var osh: float = off_items.show_of(778)
+			if osh >= 0.0 and off_show < 0.0:
+				off_show = osh
+			var ostill: bool = not off_items.drops_shown().is_empty()
+			var oreal: bool = off_items.has_item(778) and off_items._drawn >= 2003.0
+			off_both = off_both or (ostill and oreal)
+			off_gap = off_gap or (not ostill and not oreal)
+			if not ostill and off_gone < 0.0:
+				off_gone = off_items._drawn
+		check(off_at0.is_equal_approx(off_at1) and not off_both and not off_gap and off_gone >= 2003.0
+			and (off_show < 0.0 or is_equal_approx(off_show, 2003.0)) and off_items.has_item(778) and off_items.drops_shown().is_empty(),
+			"Other #1 (%s): --belt-drop-glide=off keeps static drop card and hands off at put 2003 (show=%.1f gone=%.1f both=%s gap=%s)" % [what, off_show, off_gone, off_both, off_gap])
+		off_items.queue_free()
+		BeltItemsScript.drop_glide = true
 		BeltItemsScript.drop_show_now = false
 		items.predict_drop(3, 1.5, 10.1)
-		_bs_feed(items, 2017, {}, 1)
+		_bs_feed(items, 2025, {}, 1)
 		check(items.drops_shown().is_empty(), "drop show (%s): --belt-drop-show-now=off shows nothing ahead, as before" % what)
 		BeltItemsScript.drop_show_now = was_show
+		# Bug batch 4 #4 (Z-drop desync regressions):
+		# (a) High-lag cap: lag=36 caps handoff <= put_tick + DROP_MAX_CATCHUP.
+		items.predict_drop(3, 1.5, 10.1)
+		_bs_feed(items, 2026, {}, 1)
+		for k in range(2027, 2061):
+			_bs_feed(items, k, {}, 1)
+		items.handle({"t": "ie", "k": 2061, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [6, 0, 2061, 9, 128, 779, 3, 1, 1]})
+		var lag_show := -1.0
+		for k in range(2061, 2068):
+			_bs_feed(items, k, {}, 1)
+			if items.show_of(779) >= 0.0 and lag_show < 0.0:
+				lag_show = items.show_of(779)
+		check(lag_show >= 2061.0 and lag_show <= float(2061 + BeltItemsScript.DROP_MAX_CATCHUP),
+			"Z-drop (%s): high-lag catchup is capped at +%d ticks (show_of=%.1f)" % [what, BeltItemsScript.DROP_MAX_CATCHUP, lag_show])
+		for k in range(2068, 2080):
+			_bs_feed(items, k, {}, 1)
+		# (b) Pickup cancel: picked up (EV_PICKED) before handoff clears drop card immediately.
+		items.predict_drop(3, 1.5, 10.1)
+		_bs_feed(items, 2080, {}, 1)
+		items.handle({"t": "ie", "k": 2086, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [6, 0, 2086, 9, 128, 780, 3, 1, 1]})
+		items.handle({"t": "ie", "k": 2087, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [1, 50, 2087, 1, 3, 0, roundi(1.53125 * 256.0), roundi(10.0 * 256.0), 1]})
+		for k in range(2081, 2096):
+			_bs_feed(items, k, {}, 1)
+		check(items.drops_shown().is_empty() and not items.has_item(780) and items._drawn < 2091.0,
+			"Z-drop (%s): item gone/picked up before handoff clears drop card cleanly (%d left, drawn=%.1f)" % [what, items.drops_shown().size(), items._drawn])
+		for k in range(2096, 2100):
+			_bs_feed(items, k, {}, 1)
+		# (c) Stop cancel: item hitting dead end / v==0 before handoff clears drop card & shows real item immediately.
+		items.predict_drop(3, 1.9, 10.1)
+		_bs_feed(items, 2100, {}, 1)
+		items.handle({"t": "ie", "k": 2101, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [6, 0, 2101, 9, 4, 781, 3, 1, 1]})
+		for k in range(2101, 2109):
+			_bs_feed(items, k, {}, 1)
+		check(items.drops_shown().is_empty() and items.has_item(781) and items.show_of(781) < 0.0,
+			"Z-drop (%s): dead-end/stopped item clears extra glide delay and shows immediately (shown=%d has=%s show_of=%.1f)" % [what, items.drops_shown().size(), items.has_item(781), items.show_of(781)])
+		# (d) Already-loaded sl before ie (HAND_HAD): item already in sim clears drop card cleanly without double items.
+		_bs_feed(items, 2110, {"sl": [9, 2110, 0]}, 1)
+		items.predict_drop(3, 1.5, 10.1)
+		_bs_feed(items, 2112, {}, 1)
+		_bs_feed(items, 2113, {"sl": [9, 2113, 1, 782, 3, 128, 1]}, 1)
+		items.handle({"t": "ie", "k": 2116, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [6, 0, 2116, 9, 128, 782, 3, 1, 1]})
+		for k in range(2114, 2124):
+			_bs_feed(items, k, {}, 1)
+		check(items.drops_shown().is_empty() and items.has_item(782),
+			"Z-drop (%s): already-loaded sl item before ie clears drop card via HAND_HAD (shown=%d has=%s)" % [what, items.drops_shown().size(), items.has_item(782)])
 		items.queue_free()
+	# Verify GDScript and BeltDrawNative agree on show_of(uid).
+	if show_at_by_twin.size() >= 2:
+		check(is_equal_approx(float(show_at_by_twin[0]), float(show_at_by_twin[-1])),
+			"Other #1: GDScript and BeltDrawNative show_of(uid) agree (%s)" % [show_at_by_twin])
+	# Verify predict_drop does NOT pull job.fold_tick backwards and stalls/desyncs belts,
+	# while draining _job.drops immediately on completion when fold_tick waits.
+	BeltItemsScript.State.force_gd = true
+	BeltItemsScript.State.draw_native = false
+	BeltItemsScript.drop_show_now = true
+	var zp_items = BeltItemsScript.new()
+	add_child(zp_items)
+	zp_items._sync = true
+	_bs_feed(zp_items, 2100, {"lm": _bs_lane(9, 1, 256, 8, 2.0, 10.0, 1.0, 10.0)})
+	zp_items._job_ticks = 8.0
+	zp_items._sync = false
+	zp_items.predict_drop(3, 1.5, 10.1)
+	var zp_drawn_before: float = zp_items._drawn
+	zp_items._start(0.016)
+	var zp_job = zp_items._job
+	check(zp_job != null and float(zp_job.fold_tick) >= zp_drawn_before + 8.0 - 0.001,
+		"Z-drop: predict_drop keeps normal fold_tick advance without pulling belts backwards (fold=%.2f drawn=%.2f)" % [
+			zp_job.fold_tick if zp_job != null else -1.0, zp_drawn_before])
+	zp_items._wait()
+	zp_items.queue_free()
 	BeltItemsScript.State.force_gd = was_gd
+	BeltItemsScript.State.draw_native = was_dn
+	BeltItemsScript.drop_glide = was_glide
 	BeltItemsScript.Job.view_cull = was_cull
 	Arms.events = was_ev
 	Arms.handoff = was_ho
@@ -2196,7 +2334,15 @@ func _track2b_streaming_and_prep() -> void:
 	pw.add_child(ucv)
 	for j in 64:
 		pw._add([8000 + j, 1, 64 * 256 + (j % 8) * 256 + 128, (j / 8) * 256 + 128, 0])
+	# A build off the worker pool is what is cancelled here: taken as a live edit (--fast-edit-rebuild, the adds
+	# counted live when a live message's marking is on) a chunk under 512 instances is built on the main thread.
+	pw._dirty_live.erase(Vector2i(2, 0))
+	pw._live_prep.erase(Vector2i(2, 0))
+	# (A frame of its own, as the first build above: the frame's build budget may be spent by now.)
+	await get_tree().process_frame
 	pw._rebuild_dirty()
+	if not pw._prep_jobs.has(Vector2i(2, 0)):
+		print("ChunkPrepJob cancel: not on a worker: dirty %s, partial %s, jobs %s, building %s" % [pw._dirty.keys(), pw._partial, pw._prep_jobs.keys(), ucv.building])
 	var cancelled_ok := pw._prep_jobs.has(Vector2i(2, 0))
 	if cancelled_ok:
 		pw._unload(Vector2i(2, 0))
@@ -2342,17 +2488,29 @@ func _track3_gpu_opts() -> void:
 	crown_arrs[Mesh.ARRAY_VERTEX] = cv
 	crown_arrs[Mesh.ARRAY_TEX_UV] = cuv
 	crown_arrs[Mesh.ARRAY_INDEX] = cidx
-	ModelLods.tree_shadow_decimate = false
-	var out_v_full := PackedVector3Array()
-	var out_uv_full := PackedVector2Array()
-	ModelLods.Job.crown_arrays(crown_arrs, false, out_v_full, out_uv_full)
-	ModelLods.tree_shadow_decimate = true
-	var out_v_dec := PackedVector3Array()
-	var out_uv_dec := PackedVector2Array()
-	ModelLods.Job.crown_arrays(crown_arrs, false, out_v_dec, out_uv_dec)
-	check(out_v_full.size() == 102 and out_v_dec.size() == 54,
-		"tree shadow decimate: full %d verts (34 tris), decimated %d verts (18 tris = 50%% cards + 100%% core)" % [
-			out_v_full.size(), out_v_dec.size()])
+	# Counted with --tree-shadow-shape=old's card quads (two triangles a card); the rounded shadows' polygons (the
+	# default, 6 or 7 sides a card) after it.
+	var quads_was: bool = ModelLods.Job.quad_shadows
+	var counts := {}
+	for quads: bool in [true, false]:
+		ModelLods.Job.quad_shadows = quads
+		ModelLods.tree_shadow_decimate = false
+		var out_v_full := PackedVector3Array()
+		var out_uv_full := PackedVector2Array()
+		ModelLods.Job.crown_arrays(crown_arrs, false, out_v_full, out_uv_full)
+		ModelLods.tree_shadow_decimate = true
+		var out_v_dec := PackedVector3Array()
+		var out_uv_dec := PackedVector2Array()
+		ModelLods.Job.crown_arrays(crown_arrs, false, out_v_dec, out_uv_dec)
+		counts[quads] = [out_v_full.size(), out_v_dec.size()]
+	ModelLods.Job.quad_shadows = quads_was
+	check(counts[true] == [102, 54],
+		"tree shadow decimate (--tree-shadow-shape=old): full %d verts (34 tris), decimated %d verts (18 tris = 50%% cards + 100%% core)" % counts[true])
+	# Rounded: 16 cards of 4-5 triangles and the 2 core ones; decimated, every other card of them and the core.
+	var round_full: int = counts[false][0]
+	var round_dec: int = counts[false][1]
+	check(round_full >= (16 * 4 + 2) * 3 and round_full <= (16 * 5 + 2) * 3 and round_dec >= (8 * 4 + 2) * 3 and round_dec <= (8 * 5 + 2) * 3,
+		"tree shadow decimate (rounded shadows): full %d verts, decimated %d verts (half the cards, every core triangle)" % [round_full, round_dec])
 
 	# 7. FarChunks 2nd coarse HLOD tier & annulus parity
 	var sphere := SphereMesh.new()

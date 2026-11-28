@@ -123,6 +123,59 @@ func _predictions(hud: Hud) -> void:
 		"J23: R on an underground's entrance shows its exit turned with it (entrance and exit swapped), one rotate sent: %s" % [rotates])
 	check(UndergroundPairs.partner(world, ug_out, 5) == ug_in and UndergroundPairs.partner(world, world.entities[86], 5) == null,
 		"J23: the pair is still a pair the other way round; a lone exit has no partner")
+	# Bug #1: entities_overlapping, incremental _pick_grid_add/_pick_grid_remove, and _dirty_live burst coalescing.
+	world.protos.add_entities([[7, "assembling-machine-1", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 100, 140, 200, 3, 3]])
+	var overlap := world.entities_overlapping(Rect2(Vector2(24.0, 12.0), Vector2(1.0, 1.0)))
+	check(overlap.any(func(r: WorldMirror.Rec) -> bool: return r.unit == 84),
+		"#1: entities_overlapping finds entity intersecting rect via pick_grid: %s" % [overlap.size()])
+	var cv0: ChunkView = world.chunks[Vector2i.ZERO]
+	check(cv0.pick_grid.size() == 2, "#1: pick_grid built on chunk 0")
+	world._add([200, 3, 18 * 256 + 128, 18 * 256 + 128, 4])
+	check(cv0.pick_grid.size() == 2 and world.entities_overlapping(Rect2(Vector2(18.1, 18.1), Vector2(0.8, 0.8))).size() == 1,
+		"#1: _add updates pick_grid incrementally without invalidating")
+	var hid_rec: WorldMirror.Rec = world.entities[200]
+	hid_rec.extra["hid"] = true
+	check(world.entities_overlapping(Rect2(Vector2(18.1, 18.1), Vector2(0.8, 0.8))).is_empty(),
+		"#1: entities_overlapping ignores hidden predicted entities")
+	hid_rec.extra.erase("hid")
+	world._remove(200)
+	check(cv0.pick_grid.size() == 2 and world.entities_overlapping(Rect2(Vector2(18.1, 18.1), Vector2(0.8, 0.8))).is_empty(),
+		"#1: _remove updates pick_grid incrementally and leaves rect empty")
+	check(WorldMirror.fast_edit_coalesce == (not Switches.has("--fast-edit-coalesce=off")),
+		"#1: fast_edit_coalesce defaults true unless --fast-edit-coalesce=off")
+	world._dirty.clear()
+	world._dirty_live.clear()
+	world._live_prep.clear()
+	world._live_built_msec.clear()
+	world._live_prep[Vector2i.ZERO] = true
+	world._built(Vector2i.ZERO, cv0, Time.get_ticks_usec())
+	check(world._live_built_msec.has(Vector2i.ZERO), "#1: _built records _live_built_msec for live chunk edits")
+	world._dirty[Vector2i.ZERO] = true
+	world._dirty_live[Vector2i.ZERO] = true
+	world._rebuild_dirty()
+	check(world._dirty.has(Vector2i.ZERO) and not world._live_prep.has(Vector2i.ZERO),
+		"#1: burst coalescing defers immediate second live rebuild within LIVE_COALESCE_MSEC")
+	# Bug #21: adding a multi-tile real entity removes colliding ghosts across its footprint (even across chunks).
+	var had_c10 := world.chunks.has(Vector2i(1, 0))
+	if not had_c10:
+		world.chunks[Vector2i(1, 0)] = ChunkView.new()
+	world._add([301, 1, 31 * 256 + 128, 4 * 256 + 128, 0, {"gh": 2}])
+	world._add([302, 1, 32 * 256 + 128, 4 * 256 + 128, 0, {"gh": 2}])
+	world._add([303, 1, 35 * 256 + 128, 4 * 256 + 128, 0, {"gh": 2}])
+	world._add([304, 7, 32 * 256 + 128, 4 * 256 + 128, 0])
+	check(not world.entities.has(301) and not world.entities.has(302) and world.entities.has(303),
+		"#21: world._clear_overlapping_ghosts removes footprint-overlapping ghosts across chunks and keeps non-overlapping ones")
+	world._add([305, 1, 36 * 256 + 128, 4 * 256 + 128, 0, {"gh": 2}])
+	world._add([306, 1, 36 * 256 + 128, 4 * 256 + 128, 0, {"tg": 1}])
+	check(world.entities.has(305) and world.entities.has(306),
+		"#21: tile-ghost at same fixed spot keeps entity-ghost intact")
+	world._remove(305)
+	world._remove(306)
+	world._remove(303)
+	world._remove(304)
+	if not had_c10:
+		world.chunks[Vector2i(1, 0)].queue_free()
+		world.chunks.erase(Vector2i(1, 0))
 	input.hovered = null
 	if had_under == null:
 		m.eprops.erase(3)
@@ -769,6 +822,8 @@ func _turned_previews(hud: Hud) -> void:
 	check(am1.size() == 1 and am1[0].dir == 4, "K21: an assembler Factorio can't turn is predicted turned")
 	world.handle({"t": "add", "e": [331, 7, 26 * 256 + 128, 4 * 256 + 128, 0]})
 	check((world.entities[331] as WorldMirror.Rec).dir == 4 and VisualTurns.quarters(sid, 331) == 1, "K21: and placed turned")
+	check(input._blocked(world.protos.entity(7), Vector2(27.5, 4.5), Vector2i(3, 3)) and not input._blocked(world.protos.entity(7), Vector2(26.5, 4.5), Vector2i(3, 3)),
+		"an assembler overlapping another one a tile along is in the way, over the same spot it replaces")
 
 	# What Factorio turns itself gets its direction from the game, with no look-only turn.
 	input.cursor_item = "inserter"
@@ -784,11 +839,65 @@ func _turned_previews(hud: Hud) -> void:
 	input.drag.end()
 	builds.call()
 	check(not VisualTurns.expecting(), "an assembler with fluid boxes (Factorio turns it) gets no look-only turn")
-	# Ghosts are the game's: none waits. A build the game refused long ago doesn't turn one put there later.
+	# Item #5: Shift-placed ghosts of VisualTurns buildings keep the cursor's turn, and ghost->revive
+	# preserves it in both `add`-before-`del` and `del`-before-`add` orders.
+	world.protos.add_entities([[9, "entity-ghost", "entity-ghost", -0.5, -0.5, 0.5, 0.5, 100, 100, 100, 1, 1]])
 	input.cursor_item = "stone-furnace"
+	input.build_dir = 4
 	input.drag.begin("stone-furnace", furnace, Vector2(4.0, 4.0), true)
 	input.drag.end()
-	check(not VisualTurns.expecting(), "a ghost turned in the cursor waits for nothing")
+	builds.call()
+	check(VisualTurns.expecting(), "Item #5: a Shift-placed VisualTurns ghost waits for its ghost add")
+	world.handle({"t": "add", "e": [345, 9, 4 * 256, 4 * 256, 0, {"gh": 2}]})
+	var gh_rec: WorldMirror.Rec = world.entities.get(345)
+	check(gh_rec != null and gh_rec.dir == 4 and VisualTurns.quarters(sid, 345) == 1 and not VisualTurns.expecting(),
+		"Item #5: Shift-placed furnace ghost claims cursor turn (dir=%d, q=%d)" % [gh_rec.dir if gh_rec != null else -1, VisualTurns.quarters(sid, 345)])
+	# Ghost -> revive (add-before-del): real building arrives while rotated ghost is still in world.
+	world.handle({"t": "add", "e": [346, 2, 4 * 256, 4 * 256, 0]})
+	var rev_a: WorldMirror.Rec = world.entities.get(346)
+	check(rev_a != null and rev_a.dir == 4 and VisualTurns.quarters(sid, 346) == 1 and VisualTurns.quarters(sid, 345) == 0,
+		"Item #5: ghost->revive (add-before-del) preserves VisualTurns (dir=%d, q=%d)" % [rev_a.dir if rev_a != null else -1, VisualTurns.quarters(sid, 346)])
+	# Ghost -> revive (del-before-add): ghost del arrives before real building add.
+	input.build_dir = 8
+	input.drag.begin("stone-furnace", furnace, Vector2(8.0, 4.0), true)
+	input.drag.end()
+	builds.call()
+	world.handle({"t": "add", "e": [347, 9, 8 * 256, 4 * 256, 0, {"gh": 2}]})
+	var gh_b: WorldMirror.Rec = world.entities.get(347)
+	check(gh_b != null and gh_b.dir == 8 and VisualTurns.quarters(sid, 347) == 2,
+		"Item #5: second Shift-placed ghost claims 2 quarters before del")
+	world.handle({"t": "del", "u": 347})
+	check(VisualTurns.has_revives() and VisualTurns.quarters(sid, 347) == 0,
+		"Item #5: ghost del records pending revive turn and forgets ghost unit")
+	world.handle({"t": "add", "e": [348, 2, 8 * 256, 4 * 256, 0]})
+	var rev_b: WorldMirror.Rec = world.entities.get(348)
+	check(rev_b != null and rev_b.dir == 8 and VisualTurns.quarters(sid, 348) == 2 and not VisualTurns.has_revives(),
+		"Item #5: ghost->revive (del-before-add) preserves VisualTurns (dir=%d, q=%d)" % [rev_b.dir if rev_b != null else -1, VisualTurns.quarters(sid, 348)])
+	# Placed ghost R rotation and copy/paste unwrap extra["gh"].
+	world.handle({"t": "add", "e": [349, 9, 12 * 256, 4 * 256, 0, {"gh": 2}]})
+	var gh_rot: WorldMirror.Rec = world.entities.get(349)
+	input.cursor_item = ""
+	input.cursor_tool = ""
+	input.hovered = gh_rot
+	input.has_ground = true
+	input.ground = Vector2(12.0, 4.0)
+	input._rotate(false)
+	check(gh_rot.dir == 4 and VisualTurns.quarters(sid, 349) == 1,
+		"Item #5: R over placed VisualTurns ghost turns it locally (dir=%d, q=%d)" % [gh_rot.dir, VisualTurns.quarters(sid, 349)])
+	input._copy_settings()
+	world.handle({"t": "add", "e": [350, 9, 16 * 256, 4 * 256, 0, {"gh": 2}]})
+	var gh_dst: WorldMirror.Rec = world.entities.get(350)
+	input._paste_settings(gh_dst)
+	check(gh_dst.dir == 4 and VisualTurns.quarters(sid, 350) == 1,
+		"Item #5: Shift+RMB/LMB copy/paste unwraps ghost gh and copies VisualTurns (dir=%d, q=%d)" % [gh_dst.dir, VisualTurns.quarters(sid, 350)])
+	input.hovered = null
+	input.has_ground = false
+	for u_gh in [345, 346, 347, 348, 349, 350]:
+		VisualTurns.forget(sid, u_gh)
+	VisualTurns._revives.clear()
+	# A build the game refused long ago doesn't turn one put there later.
+	input.cursor_item = "stone-furnace"
+	input.build_dir = 4
 	input.drag.begin("stone-furnace", furnace, Vector2(10.0, 30.0), false)
 	input.drag.end()
 	builds.call()
@@ -1612,6 +1721,256 @@ func _blueprint_preview(hud: Hud) -> void:
 		if n != null:
 			n.queue_free()
 
+	# --- Bugs #3, #6, #7, #16, #19, #20 ---
+	const GhostsScript := preload("res://scripts/world/ghosts.gd")
+	# #3: Ghosts.ghost_pieces includes sub-pieces (inserter arms, belt caps, wet/animated drills, cargo bays).
+	var until_g := Time.get_ticks_msec() + 8000
+	while Time.get_ticks_msec() < until_g and (
+		not GhostsScript.ghost_pieces_ready("inserter", "inserter", {}, 0, Vector2(0.5, 0.5))
+		or not GhostsScript.ghost_pieces_ready("transport-belt", "transport-belt", {"s": "s"}, 4, Vector2(0.5, 0.5), 3)
+		or not GhostsScript.ghost_pieces_ready("electric-mining-drill", "mining-drill", {"fa": 1}, 0, Vector2(1.5, 1.5))
+		or not GhostsScript.ghost_pieces_ready("cargo-bay", "cargo-bay", {}, 0, Vector2(2.0, 2.0), 0, 0)):
+		ModelLibrary.poll()
+		await get_tree().process_frame
+	var gp_ins := GhostsScript.ghost_pieces("inserter", "inserter", {}, 0, Vector2(0.5, 0.5))
+	var gp_belt := GhostsScript.ghost_pieces("transport-belt", "transport-belt", {"s": "s"}, 4, Vector2(0.5, 0.5), 3)
+	var gp_drill := GhostsScript.ghost_pieces("electric-mining-drill", "mining-drill", {"fa": 1}, 0, Vector2(1.5, 1.5))
+	var gp_bay := GhostsScript.ghost_pieces("cargo-bay", "cargo-bay", {}, 0, Vector2(2.0, 2.0), 0, Basis.IDENTITY, 0)
+	var wet_name := ModelLibrary.wet_model("electric-mining-drill", "mining-drill", {"fa": 1}, 0)
+	var drill_min := 2 if wet_name.is_empty() else 3
+	check(gp_ins.size() > 1 and gp_belt.size() > 1 and gp_drill.size() >= drill_min and gp_bay.size() > 1,
+		"#3: Ghosts.ghost_pieces builds multi-part assemblies (ins=%d, belt=%d, drill=%d, bay=%d)" % [
+			gp_ins.size(), gp_belt.size(), gp_drill.size(), gp_bay.size()])
+
+	# #7: PlannerUI.held_preview preserves recipe/filters/items; BlueprintPreview renders alt-mode overlays;
+	# AltArrows + AltOverlay resolve entity-ghost inner prototype.
+	world.protos.add_entities([
+		[9007, "assembling-machine-2", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 100, 140, 200, 3, 3],
+		[9008, "entity-ghost", "entity-ghost", -0.5, -0.5, 0.5, 0.5, 100, 140, 200, 1, 1],
+		[9009, "solar-panel", "solar-panel", -1.5, -1.5, 1.5, 1.5, 50, 100, 200, 3, 3],
+	])
+	world.protos.fluid_colors["crude-oil"] = Color8(30, 30, 30)
+	world.protos.fluid_colors["petroleum-gas"] = Color8(180, 120, 180)
+	var had_eprops7: Variant = m.eprops.get(9007)
+	m.eprops[9007] = {"x": {"fb": [[0, -1, 0, "i"], [0, 1, 8, "o"]]}}
+	var had_alt_flag: Variant = Settings.get_value("interface", "alt_mode")
+	Settings.set_value("interface", "alt_mode", true, false)
+	var had_hc7 := m.hand_categories.duplicate()
+	var had_rdet7 := m._rdet.duplicate()
+	m.handle({"t": "rdet", "part": 1, "parts": 1, "hc": ["crafting"], "l": [
+		["oil-processing", 5.0, ["oil-processing"], "intermediate-products", "d", "fluid-recipes", "a", "b",
+			[["fluid", "crude-oil", 100]], [["fluid", "petroleum-gas", 55]]],
+	]})
+	var alt_rec := {
+		"blueprint": {
+			"entities": [
+				{"name": "assembling-machine-2", "position": {"x": 0.0, "y": 0.0}, "direction": 0, "recipe": "oil-processing"},
+				{"name": "inserter", "position": {"x": 3.0, "y": 0.0}, "direction": 4, "filters": [{"name": "iron-plate"}]},
+			],
+			"tiles": [],
+		}
+	}
+	pl.held_record = alt_rec
+	var preview_list: Array = pl.held_preview(world.protos)
+	check(preview_list.size() == 2 and preview_list[0].get("x", {}).get("recipe") == "oil-processing"
+		and preview_list[1].get("x", {}).get("filters") is Array,
+		"#7: PlannerUI.held_preview preserves recipe and filters in preview extra: %s" % [preview_list])
+	bp.show_blueprint(["bp", 99], preview_list, [], Vector2(10.0, 10.0), 0, false, 1)
+	var until_alt := Time.get_ticks_msec() + 5000
+	while Time.get_ticks_msec() < until_alt and not bp.settled():
+		ModelLibrary.poll()
+		bp.show_blueprint(["bp", 99], preview_list, [], Vector2(10.0, 10.0), 0, false, 1)
+		await get_tree().process_frame
+	bp._rebuild_alt()
+	check(bp._alt_root != null and bp._alt_root.get_child_count() > 0,
+		"#7: BlueprintPreview builds AltOverlay MultiMesh children for recipe & fluid arrows")
+	# Clipboard 5th dict preservation in ui_model + AltArrows discovery as _game child + Variant key type switch.
+	var clip_was_bp := m.clipboard.duplicate()
+	m.handle({"t": "clip", "l": [[9007, 0, 0, 0, {"ai": ["recipe", "oil-processing"], "fa": 3,
+		"fc": [[0, -1, 0, "i", "crude-oil"], [0, 1, 8, "o", "petroleum-gas"]], "f": 1}]]})
+	check(m.clipboard.size() == 1 and m.clipboard[0].get("f") == true
+		and m.clipboard[0].get("x", {}).get("ai") == ["recipe", "oil-processing"],
+		"#7: UiModel clip handler preserves 5th extra dict and mirror flag: %s" % [m.clipboard])
+	var fake_game := Node3D.new()
+	var aa_child := AltArrowsScript.new()
+	aa_child.name = "AltArrows"
+	aa_child.world = world
+	aa_child.model = m
+	aa_child.alt_mode = true
+	fake_game.add_child(aa_child)
+	fake_game.add_child(world)
+	bp.show_blueprint("clip_str_key", m.clipboard, [], Vector2(10.0, 10.0), 0, false, 1)
+	var until_clip := Time.get_ticks_msec() + 5000
+	while Time.get_ticks_msec() < until_clip and not bp.settled():
+		ModelLibrary.poll()
+		bp.show_blueprint("clip_str_key", m.clipboard, [], Vector2(10.0, 10.0), 0, false, 1)
+		await get_tree().process_frame
+	bp._rebuild_alt()
+	check(bool(bp._alt_context()[0]) and bp._alt_context()[1] == m
+		and bp._alt_root != null and bp._alt_root.get_child_count() > 0,
+		"#7: BlueprintPreview handles Variant key change, discovers AltArrows child, and renders clipboard alt overlays")
+	fake_game.remove_child(world)
+	fake_game.free()
+	m.clipboard = clip_was_bp
+	# Placed entity-ghost alt arrows & AltOverlay._shown_proto_id.
+	world._add([401, 9008, 5 * 256 + 128, 5 * 256 + 128, 0, {"gh": 9007, "ai": ["recipe", "oil-processing"], "fa": 3, "fc": [[0, -1, 0, "i", "crude-oil"]]}])
+	var g_rec: WorldMirror.Rec = world.entities[401]
+	var aa := AltArrowsScript.new()
+	aa.world = world
+	aa.model = m
+	aa.alt_mode = true
+	var g_arrows := aa.chunk_arrows(world.chunks[Vector2i.ZERO])
+	check(not g_arrows[0].is_empty() or not g_arrows[1].is_empty() or not g_arrows[2].is_empty() or not g_arrows[3].is_empty(),
+		"#7: AltArrows.chunk_arrows generates fluid arrows/icons for placed entity-ghost")
+	check(AltOverlay._shown_proto_id(world, g_rec) == 9007, "#7: AltOverlay._shown_proto_id resolves entity-ghost to gh proto id")
+	var marks_g := input.hover_marks(world.protos.entity(9008), g_rec.pos, g_rec.dir, [], world.protos.entity(9007))
+	check(marks_g.size() > 1, "#3/#7: hover_marks resolves ghost_proto eprops marks")
+	aa.free()
+	bp.clear()
+	pl.held_record = {}
+	world._remove(401)
+	Settings.set_value("interface", "alt_mode", had_alt_flag, false)
+	if had_eprops7 == null:
+		m.eprops.erase(9007)
+	else:
+		m.eprops[9007] = had_eprops7
+	m.hand_categories = had_hc7
+	m._rdet = had_rdet7
+	m._apply_recipe_details()
+
+	# #16: _cursor_is_buildable returns false for raw items (plates, coal) and true for buildings/tools/modules.
+	input.capsule_aim.pi = input
+	input.rail_planner.pi = input
+	var had_speed_use: Variant = m.item_uses.get("speed-module")
+	m.item_uses["speed-module"] = {"m": 1}
+	input.cursor_tool = ""
+	input.hold("iron-plate")
+	check(not input._cursor_is_buildable(), "#16: iron-plate is not buildable so clicking opens buildings")
+	input.hold("transport-belt")
+	check(input._cursor_is_buildable(), "#16: transport-belt is buildable")
+	input.hold("speed-module")
+	check(input._cursor_is_buildable(), "#16: speed-module is buildable/usable on machines")
+	if had_speed_use == null:
+		m.item_uses.erase("speed-module")
+	else:
+		m.item_uses["speed-module"] = had_speed_use
+
+	# #19: PlayerInput.cursor_icon_world keeps cursor icon visible over world by default.
+	check(PlayerInput.cursor_icon_world == (not Switches.has("--cursor-icon-world=old")),
+		"#19: PlayerInput.cursor_icon_world matches --cursor-icon-world switch")
+	var had_ciw := PlayerInput.cursor_icon_world
+	PlayerInput.cursor_icon_world = true
+	check(true if PlayerInput.cursor_icon_world else false, "#19: cursor_icon_world enabled")
+	PlayerInput.cursor_icon_world = had_ciw
+
+	# #6 & #20: VisualTurns.set_quarters + _copy_settings / _paste_settings on eligible entities.
+	world.pick_build_usec = 1 << 40  # the whole pick index at once (see _predictions): after the sections before, the chunk is busy
+	var sid := Bridge.save_id
+	check(VisualTurns.set_quarters(sid, 99901, 2) and VisualTurns.quarters(sid, 99901) == 2
+		and not VisualTurns.set_quarters(sid, 99901, 2) and VisualTurns.set_quarters(sid, 99901, 0),
+		"#6: VisualTurns.set_quarters sets, deduplicates, and clears quarter turns")
+	world._add([99902, 9009, 10 * 256 + 128, 10 * 256 + 128, 0])
+	world._add([99903, 9009, 14 * 256 + 128, 10 * 256 + 128, 0])
+	world._add([99904, 9007, 18 * 256 + 128, 10 * 256 + 128, 0])
+	world.protos.add_entities([[9010, "beacon", "beacon", -1.5, -1.5, 1.5, 1.5, 100, 100, 200, 3, 3]])
+	world._add([99905, 9010, 22 * 256 + 128, 10 * 256 + 128, 0])
+	world._add([99906, 9010, 26 * 256 + 128, 10 * 256 + 128, 0])
+	var sp1: WorldMirror.Rec = world.entities[99902]
+	var sp2: WorldMirror.Rec = world.entities[99903]
+	var am1: WorldMirror.Rec = world.entities[99904]
+	var bc1: WorldMirror.Rec = world.entities[99905]
+	var bc2: WorldMirror.Rec = world.entities[99906]
+	VisualTurns.set_quarters(sid, 99902, 1)
+	sp1.dir = 4
+	input.has_ground = true
+	input.ground = sp1.pos
+	input.hovered = sp1
+	input._copy_settings()
+	input._paste_settings(sp2)
+	check(VisualTurns.quarters(sid, 99903) == 1 and sp2.dir == 4,
+		"#6: Shift+RMB / Shift+LMB copies VisualTurns orientation between solar panels (q=%d, dir=%d)" % [
+			VisualTurns.quarters(sid, 99903), sp2.dir])
+	# Cross-type paste from non-VT assembler must NOT reset solar panel's VisualTurns rotation.
+	input.ground = am1.pos
+	input.hovered = am1
+	input._copy_settings()
+	input._paste_settings(sp2)
+	check(VisualTurns.quarters(sid, 99903) == 1 and sp2.dir == 4,
+		"#6: cross-type Shift+LMB from assembler preserves solar panel VisualTurns orientation")
+	# Beacon paste still sends paste_settings for module requests.
+	sent()
+	input.ground = bc1.pos
+	input.hovered = bc1
+	input._copy_settings()
+	input._paste_settings(bc2)
+	var bc_paste := sent_one("paste_settings")
+	check(not bc_paste.is_empty() and int(bc_paste.get("u", 0)) == 99906,
+		"#6: beacon Shift+LMB sends paste_settings to server: %s" % [bc_paste])
+	# Batch 3 C6: BlueprintPreview._blueprint_connections filters out unused output ports when fa=1.
+	const BlueprintPreview := preload("res://scripts/player/blueprint_preview.gd")
+	var bp_conns_in := BlueprintPreview._blueprint_connections(
+		{"fb": [[0, -1, 0, "i"], [0, 1, 8, "o"]]}, 0, ["water"], [], 1)
+	check(bp_conns_in.size() == 1 and str(bp_conns_in[0][3]) == "i" and str(bp_conns_in[0][4]) == "water",
+		"C6: BlueprintPreview._blueprint_connections omits unused output ports when fa=1: %s" % [bp_conns_in])
+	# Batch 3 C3: effective_build_dir clamps non-rotatables/x.fo/VT-ghosts to 0, tank to 0/4; _rotate invalidates cache_gen.
+	world.protos.add_entities([
+		[9011, "stone-wall", "wall", -0.5, -0.5, 0.5, 0.5, 100, 100, 100, 1, 1],
+		[9012, "storage-tank", "storage-tank", -1.5, -1.5, 1.5, 1.5, 100, 100, 100, 3, 3],
+		[9013, "tree-01", "tree", -0.5, -0.5, 0.5, 0.5, 100, 100, 100, 1, 1],
+	])
+	input.build_dir = 8
+	check(input.effective_build_dir(world.protos.entity(9011), false) == 0
+		and input.effective_build_dir(world.protos.entity(9012), false) == 0
+		and input.effective_build_dir(world.protos.entity(9009), true) == 8,
+		"C3 / Item #5: effective_build_dir clamps wall to 0, storage-tank to 0/4, and allows VisualTurns ghosts")
+	input.build_dir = 12
+	check(input.effective_build_dir(world.protos.entity(9012), false) == 4,
+		"C3: storage-tank effective_build_dir clamps 12->4")
+	input.build_dir = 0
+	sp2.cache_gen = 99
+	input.hovered = sp2
+	input.cursor_item = ""
+	input.cursor_tool = ""
+	input._rotate(false)
+	check(sp2.cache_gen == -1, "C3: rotating a VisualTurns entity resets cache_gen to -1")
+	# Batch 3 C9: copy/paste skips NON_CONFIGURABLE_PASTE_TYPES and doesn't spam SFX on identical VT paste.
+	const Sfx := preload("res://scripts/fx/sfx.gd")
+	var sfx_c9 := GDScript.new()
+	sfx_c9.source_code = "extends Node\nvar played := []\nfunc play_flat(path: String, volume: float, kind := \"\", bus := \"UI\") -> void:\n\tplayed.append(path)\n"
+	sfx_c9.reload()
+	var sfx_c9_node: Node = sfx_c9.new()
+	var was_sfx_c9 = Sfx.instance
+	Sfx.instance = sfx_c9_node
+	world._add([99907, 9013, 30 * 256 + 128, 10 * 256 + 128, 0])
+	var tree_rec: WorldMirror.Rec = world.entities[99907]
+	input.ground = sp1.pos
+	input.hovered = sp1
+	input._copy_settings()
+	sent()
+	sfx_c9_node.played.clear()
+	input._paste_settings(tree_rec)
+	check(sent().is_empty() and sfx_c9_node.played.is_empty(),
+		"C9: paste onto tree (NON_CONFIGURABLE_PASTE_TYPES) sends nothing and plays no SFX")
+	VisualTurns.set_quarters(sid, 99903, 0)
+	sp2.dir = 0
+	sfx_c9_node.played.clear()
+	input._paste_settings(sp2, false)
+	var first_paste_sfx: int = sfx_c9_node.played.size()
+	sfx_c9_node.played.clear()
+	input._paste_settings(sp2, true)
+	var repeat_paste_sfx: int = sfx_c9_node.played.size()
+	check(first_paste_sfx == 1 and repeat_paste_sfx == 0,
+		"C9: VT paste plays SFX on change (%d) and suppresses spam on identical repeat (%d)" % [first_paste_sfx, repeat_paste_sfx])
+	Sfx.instance = was_sfx_c9
+	sfx_c9_node.free()
+	world._remove(99907)
+	input.has_ground = false
+	input.hovered = null
+	VisualTurns.set_quarters(sid, 99902, 0)
+	VisualTurns.set_quarters(sid, 99903, 0)
+	for u_rm in [99902, 99903, 99904, 99905, 99906]:
+		world._remove(u_rm)
+
 	input.hold("")
 	input._update_paste_preview()
 	check(not bp.visible, "K11: put away, the preview goes")
@@ -1639,6 +1998,8 @@ func _wall_drag(hud: Hud) -> void:
 	world.protos.add_entities([
 		[1, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
 		[2, "stone-wall", "wall", -0.5, -0.5, 0.5, 0.5, 200, 200, 200, 1, 1],
+		[3, "pipe", "pipe", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1],
+		[4, "heat-pipe", "heat-pipe", -0.5, -0.5, 0.5, 0.5, 200, 100, 60, 1, 1],
 	])
 	var input := PlayerInput.new()
 	input.world = world
@@ -1698,6 +2059,40 @@ func _wall_drag(hud: Hud) -> void:
 	Settings.set_value("interface", "lock_belt_straight", lock_was, false)
 	check(belts == [Vector2i(10, 10), Vector2i(11, 10), Vector2i(12, 10), Vector2i(13, 10)],
 		"N5: a belt drag still holds its line: %s" % [belts])
+	# Bug #8: pipe and heat-pipe drags follow the cursor round corners without locking to an axis.
+	var pipe_p: ProtoDB.EntityProto = world.protos.entity(3)
+	var heat_p: ProtoDB.EntityProto = world.protos.entity(4)
+	input.drag.begin("pipe", pipe_p, Vector2(5.5, 5.5), true)
+	input.drag.update(Vector2(8.5, 5.5))
+	input.drag.update(Vector2(8.5, 8.5))
+	var pipe_path: Array = tiles.call()
+	input.drag.end()
+	check(pipe_path == [Vector2i(5, 5), Vector2i(6, 5), Vector2i(7, 5), Vector2i(8, 5), Vector2i(8, 6), Vector2i(8, 7), Vector2i(8, 8)],
+		"#8: pipe drag follows L-shaped path without straight-axis lock: %s" % [pipe_path])
+	DragBuildScript.pipes_follow = false
+	input.drag.begin("pipe", pipe_p, Vector2(5.5, 5.5), true)
+	input.drag.update(Vector2(8.5, 5.5))
+	input.drag.update(Vector2(8.5, 8.5))
+	var pipe_line: Array = tiles.call()
+	input.drag.end()
+	DragBuildScript.pipes_follow = true
+	check(pipe_line == [Vector2i(5, 5), Vector2i(6, 5), Vector2i(7, 5), Vector2i(8, 5)],
+		"#8: --pipe-drag=line holds pipe drag to its straight line: %s" % [pipe_line])
+	input.drag.begin("heat-pipe", heat_p, Vector2(15.5, 5.5), true)
+	input.drag.update(Vector2(17.5, 5.5))
+	input.drag.update(Vector2(17.5, 7.5))
+	var heat_path: Array = tiles.call()
+	input.drag.end()
+	check(heat_path == [Vector2i(15, 5), Vector2i(16, 5), Vector2i(17, 5), Vector2i(17, 6), Vector2i(17, 7)],
+		"#8: heat-pipe drag follows L-shaped path: %s" % [heat_path])
+	# Bug #1 & #8: MAX_STEPS_PER_FRAME caps steps within one frame and flushes queued targets on end().
+	input.drag.begin("pipe", pipe_p, Vector2(40.5, 5.5), true)
+	input.drag.update(Vector2(50.5, 5.5), DragBuildScript.MAX_STEPS_PER_FRAME)
+	var capped_count := input.drag.sent.size()
+	input.drag.end()
+	var final_path: Array = tiles.call()
+	check(capped_count == 1 + DragBuildScript.MAX_STEPS_PER_FRAME and final_path.size() == 11 and final_path[-1] == Vector2i(50, 5),
+		"#1: MAX_STEPS_PER_FRAME caps steps per frame (%d) and end() flushes queued path (%d): %s" % [capped_count, final_path.size(), final_path])
 	input.free()
 	sent()
 
@@ -1918,6 +2313,17 @@ func _build_tools(hud: Hud) -> void:
 	var picked: WorldMirror.Rec = world.pick(Vector2(7.7, 6.4))
 	check(picked != null and picked.unit == 95 and world.pick(Vector2(8.2, 7.0)) == null, "a ghost is picked by its entity's box (F6)")
 	world._remove(95)
+	# Belts and rails are Factorio's selection_priority 45, under a machine's 50: where their boxes
+	# overlap the bigger machine's, the machine is what the mouse picks (not the smaller belt).
+	world.protos.add_entities([[40, "test-prio-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1],
+		[41, "test-prio-box", "container", -1, -1, 1, 1, 0, 0, 0, 2, 2]])
+	world._add([96, 40, 20 * 256 + 128, 20 * 256 + 128, 0, {}])
+	world._add([97, 41, 21 * 256 + 128, 20 * 256 + 128, 0, {}])
+	var over_belt: WorldMirror.Rec = world.pick(Vector2(20.7, 20.5))
+	check(over_belt != null and over_belt.unit == 97 and (world.pick(Vector2(20.2, 20.5)) as WorldMirror.Rec).unit == 96,
+		"a machine's box wins over a belt's where they overlap, the belt elsewhere (selection_priority)")
+	world._remove(96)
+	world._remove(97)
 	# G12: hovering a beacon asks the mod about it (hinfo); the entity info then lists its modules,
 	# effectivity, the machines it reaches and what it hands on; a machine its beacons and effects.
 	world.protos.add_entities([[10, "beacon", "beacon", -1.5, -1.5, 1.5, 1.5, 130, 120, 130, 3, 3],
@@ -2074,6 +2480,49 @@ func _build_tools(hud: Hud) -> void:
 	input.tile_brush.update_preview("transport-belt", true, Vector2(8.5, 3.5), false, false)
 	check(not input.tile_brush.visible, "and not for other items")
 
+	# Zero-footprint flying robot (tile_size 0x0, cb [0,0,0,0]): dragging does not infinite-loop or trigger negative Rect2 errors.
+	world.protos.add_entities([[42, "construction-robot", "construction-robot", -0.5, -0.5, 0.5, 0.5, 220, 220, 220, 0, 0]])
+	world._add([98, 6, 4 * 256 + 128, 4 * 256 + 128, 0, {}])
+	m.eprops[42] = {"x": {"cb": [0, 0, 0, 0]}}
+	world.protos.item_places["construction-robot"] = "construction-robot"
+	var robot_proto: ProtoDB.EntityProto = world.protos.placed_entity("construction-robot")
+	check(not input._blocked(robot_proto, Vector2(4.5, 4.5), Vector2i.ZERO) and world.entities_overlapping(Rect2(4.5, 4.5, -0.1, -0.1)).is_empty(),
+		"0-footprint robot is not blocked and negative Rect2 returns empty without error")
+	input.hold("construction-robot")
+	sent()
+	input.drag.begin("construction-robot", robot_proto, Vector2(3.5, 4.5), true)
+	input.drag.update(Vector2(6.5, 4.5), input.drag.MAX_STEPS_PER_FRAME)
+	input.drag.end()
+	await get_tree().process_frame
+	var robot_builds := sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "build" and c.get("item") == "construction-robot")
+	check(robot_builds.size() == 4, "dragging 0-footprint robot across 4 tiles sends 4 builds without hanging: %d" % robot_builds.size())
+	input.hold("")
+	world._remove(98)
+
+	# Clicking on a belt with a belt facing another direction rotates it; dragging a line skips perpendicular belts.
+	world._add([99, 1, 2 * 256 + 128, 6 * 256 + 128, 0, {}])
+	var belt_proto: ProtoDB.EntityProto = world.protos.placed_entity("transport-belt")
+	input.hold("transport-belt")
+	input.build_dir = 4
+	sent()
+	input.drag.begin("transport-belt", belt_proto, Vector2(2.5, 6.5), false)
+	input.drag.end()
+	await get_tree().process_frame
+	var click_rot := sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "build" and c.get("item") == "transport-belt")
+	check(click_rot.size() == 1 and int(click_rot[0].get("d", -1)) == 4,
+		"clicking a north belt with east belt in hand sends build with direction 4 to rotate it: %s" % [click_rot])
+	input.drag.begin("transport-belt", belt_proto, Vector2(1.5, 6.5), false)
+	input.drag.update(Vector2(3.5, 6.5), input.drag.MAX_STEPS_PER_FRAME)
+	input.drag.end()
+	await get_tree().process_frame
+	var drag_cross := sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "build")
+	var drag_xs := drag_cross.map(func(c: Dictionary) -> int: return int(c.get("x", 0)))
+	check(drag_cross.size() >= 2 and not drag_xs.has(2 * 256 + 128),
+		"dragging an east belt line across a north belt skips the perpendicular belt tile: %s" % [drag_cross])
+	input.hold("")
+	input.build_dir = 0
+	world._remove(99)
+
 	# --- capsules -----------------------------------------------------------------------------------
 	input.capsule_aim.hold("grenade", Vector2(3, 3), 0.016)
 	await get_tree().process_frame
@@ -2082,6 +2531,10 @@ func _build_tools(hud: Hud) -> void:
 	input.capsule_aim.hold("grenade", Vector2(3, 3), 0.1)
 	await get_tree().process_frame
 	check(sent_one("throw").is_empty(), "held, it throws again only after the capsule's cooldown")
+	input.capsule_aim.release()
+	input.capsule_aim.hold("grenade", Vector2(3, 3), 0.016)
+	await get_tree().process_frame
+	check(sent_one("throw").is_empty(), "letting go and clicking again does not skip the cooldown")
 
 	# --- the rail planner ---------------------------------------------------------------------------
 	world._add([60, 7, 1 * 256, 1 * 256, 0])  # a north-south straight rail on (1, 1): ends (1, 0) north, (1, 2) south
@@ -2441,6 +2894,47 @@ func _build_tools(hud: Hud) -> void:
 		"J9: belts under a splitter don't turn the build cursor red (it replaces them); the drag's checks still see them")
 	world._remove(68)
 	world._remove(69)
+	# A logistic chest over a chest and a gate over a wall fast-replace them (2.1's "container" and "wall" groups).
+	world.protos.add_entities([[9914, "test-chest", "container", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1],
+		[9915, "test-logi-chest", "logistic-container", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1],
+		[9916, "test-wall", "wall", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1], [9917, "test-gate", "gate", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1]])
+	world._add([70, 9914, 22 * 256 + 128, 2 * 256 + 128, 0])
+	world._add([71, 9916, 23 * 256 + 128, 2 * 256 + 128, 0])
+	check(not input._blocked(world.protos.entity(9915), Vector2(22.5, 2.5), Vector2i.ONE, true) and input._blocked(world.protos.entity(9915), Vector2(23.5, 2.5), Vector2i.ONE, true)
+		and not input._blocked(world.protos.entity(9917), Vector2(23.5, 2.5), Vector2i.ONE, true),
+		"a logistic chest over a chest, a gate over a wall: fast-replace, not red; a chest over a wall is")
+	world._remove(70)
+	world._remove(71)
+	# bughunt build2: the game's own rules from eprops (fg, cb, wb): fast_replaceable_group and size, the collision
+	# box, water.
+	world.protos.add_entities([[9930, "t-pole-s", "electric-pole", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1],
+		[9931, "t-pole-b", "electric-pole", -1, -1, 1, 1, 0, 0, 0, 2, 2], [9932, "t-ins", "inserter", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1],
+		[9933, "t-ins-long", "inserter", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1], [9934, "t-tree", "tree", -0.9, -2.2, 0.9, 0.6, 0, 0, 0, 1, 1],
+		[9935, "t-chest2", "container", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1], [9936, "t-pole-m", "electric-pole", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1]])
+	for row in [[9930, {"fg": "electric-pole"}], [9931, {"fg": "big-electric-pole"}], [9932, {"fg": "inserter"}], [9933, {"fg": "long-handed-inserter"}],
+			[9934, {"cb": [-0.4, -0.4, 0.4, 0.4]}], [9935, {"fg": "container", "wb": 1, "cb": [-0.35, -0.35, 0.35, 0.35]}], [9936, {"fg": "electric-pole"}]]:
+		m.eprops[int(row[0])] = {"under": 0.0, "wire": 0.0, "supply": 0.0, "x": row[1]}
+	world._add([200, 9930, 10 * 256 + 128, 6 * 256 + 128, 0])
+	world._add([201, 9932, 12 * 256 + 128, 6 * 256 + 128, 0])
+	world._add([202, 9934, 14 * 256 + 128, 6 * 256 + 128, 0])
+	check(input._blocked(world.protos.entity(9931), Vector2(11, 7), Vector2i(2, 2), true) and not input._blocked(world.protos.entity(9936), Vector2(10.5, 6.5), Vector2i.ONE, true),
+		"a big pole over a small one is red (not the same fast-replace group), a medium pole over it is not")
+	check(input._blocked(world.protos.entity(9933), Vector2(12.5, 6.5), Vector2i.ONE, true) and not input._blocked(world.protos.entity(9932), Vector2(12.5, 6.5), Vector2i.ONE, true),
+		"a long-handed inserter over an inserter is red, an inserter over it is not (the type isn't the group)")
+	check(not input._blocked(world.protos.entity(9935), Vector2(14.5, 5.5), Vector2i.ONE, true) and input._blocked(world.protos.entity(9935), Vector2(14.5, 6.5), Vector2i.ONE, true),
+		"a chest a tile from a tree isn't blocked by its crown (its collision box, not its selection box), on the tree it is")
+	check(input._blocked(world.protos.entity(9935), Vector2(5.5, 3.5), Vector2i.ONE, true) and not input._blocked(world.protos.entity(9935), Vector2(6.5, 3.5), Vector2i.ONE, true)
+		and not input._blocked(world.protos.entity(9914), Vector2(5.5, 3.5), Vector2i.ONE, true),
+		"an entity whose collision mask has water can't go on a water tile (red), a bridge without `wb` isn't asked")
+	for id in [200, 201, 202]:
+		world._remove(id)
+	# Q over ore holds nothing: the resource's name is the ore item's, and it isn't a building.
+	world.protos.add_entities([[9918, "test-ore", "resource", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1]])
+	world.protos.item_names[99918] = "test-ore"
+	world._add([72, 9918, 24 * 256 + 128, 2 * 256 + 128, 0])
+	check(input.item_for(world.entities[72]) == "" and input.item_for_proto(world.protos.entity(9918)) == "test-ore",
+		"the pipette over ore picks nothing up")
+	world._remove(72)
 	# J9 (the splitter one tile over): the mod snaps what is sent (in 1/256 tile) exactly where the preview
 	# snapped the cursor's point, on both sides of zero, for odd and even sizes. Cut towards zero, a point
 	# just under a tile's edge or middle at negative coordinates was sent as the edge itself: one tile over.
@@ -2564,12 +3058,568 @@ func _build_tools(hud: Hud) -> void:
 	input.ground_items = null
 	gi_layer.queue_free()
 	sent()
+	# Batch 3 C4: NEVER_PLACED["resource"] and "use-on-self" capsules are non-buildable so clicking opens buildings.
+	check(ProtoDB.NEVER_PLACED.has("resource"), "C4: ProtoDB.NEVER_PLACED includes 'resource'")
+	world.protos.add_entities([[9910, "iron-ore", "resource", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1]])
+	world.protos.add_items([[9911, "iron-ore", "iron-ore"], [9912, "raw-fish", ""]])
+	var had_fish_use: Variant = m.item_uses.get("raw-fish")
+	m.handle({"t": "iuse", "part": 2, "parts": 2, "l": [["raw-fish", "c", "use-on-self", 0]]})
+	input.cursor_tool = ""
+	input.hold("iron-ore")
+	var ore_not_build := world.protos.placed_entity("iron-ore") == null and not input._cursor_is_buildable()
+	input.hold("raw-fish")
+	var fish_not_build := not input._cursor_is_buildable()
+	world._add([9915, 6, 8 * 256 + 128, 8 * 256 + 128, 0])
+	input.hovered = world.entities[9915]
+	input.has_ground = true
+	input.ground = Vector2(8.5, 8.5)
+	var click_c4 := InputEventMouseButton.new()
+	click_c4.button_index = MOUSE_BUTTON_LEFT
+	click_c4.pressed = true
+	input._mouse_button(click_c4)
+	var opened_c4 := sent_one("open")
+	check(ore_not_build and fish_not_build and int(opened_c4.get("u", 0)) == 9915,
+		"C4: clicking chest with resource or use-on-self item opens chest: ore=%s fish=%s open=%s" % [ore_not_build, fish_not_build, opened_c4])
+	world._remove(9915)
+	input.hovered = null
+	input.hold("")
+	if had_fish_use == null:
+		m.item_uses.erase("raw-fish")
+	else:
+		m.item_uses["raw-fish"] = had_fish_use
+	hud.screen.close_local()
+	sent()
+
+	# Batch 2 #11: HOVER_MOVERS includes fluid-wagon, MoverLayer.pick_ray skips box.has_point, mover_pick_3d priority.
+	const MoversScript := preload("res://scripts/world/movers.gd")
+	check(PlayerInput.HOVER_MOVERS.has("fluid-wagon"), "B2#11: HOVER_MOVERS includes fluid-wagon")
+	var pm := MoversScript.new()
+	pm.protos = world.protos
+	add_child(pm)
+	world.protos.add_entities([[9920, "test-car", "car", -1, -1.5, 1, 1.5, 0, 0, 0, 2, 3]])
+	pm.handle({"t": "mv", "k": 1, "l": [[9921, 9920, 10 * 256 + 128, 10 * 256 + 128, 0]]})
+	var hit_out := pm.pick_ray(Vector3(10.5, 5.0, 10.5), Vector3(0.0, -1.0, 0.0), PlayerInput.HOVER_MOVERS)
+	var hit_in := pm.pick_ray(Vector3(10.5, 0.3, 10.5), Vector3(0.0, -1.0, 0.0), PlayerInput.HOVER_MOVERS)
+	check(not hit_out.is_empty() and hit_in.is_empty(),
+		"B2#11: MoverLayer.pick_ray hits from outside (%s) and ignores ray starting inside box (%s)" % [not hit_out.is_empty(), hit_in.is_empty()])
+	var rig_stub := GDScript.new()
+	rig_stub.source_code = "extends \"res://scripts/player/camera_rig.gd\"\nvar _ground: Variant = Vector3(10.5, 0.0, 10.5)\nfunc aims_center() -> bool:\n\treturn false\nfunc ground_point(_s: Vector2):\n\treturn _ground\nfunc ray(_s: Vector2) -> Array:\n\treturn [Vector3(10.5, 5.0, 10.5), Vector3(0.0, -1.0, 0.0)]\nfunc modifier_reach() -> float:\n\treturn 0.0\n"
+	rig_stub.reload()
+	var rig_node: CameraRig = rig_stub.new()
+	add_child(rig_node)
+	var old_rig = input.rig
+	var was_mp3d := PlayerInput.mover_pick_3d
+	input.rig = rig_node
+	input.movers = pm
+	world._add([9922, 6, 10 * 256 + 128, 10 * 256 + 128, 0])  # openable chest on the ground under the car
+	PlayerInput.mover_pick_3d = true
+	input._update_ground()
+	var won_3d := not input.hovered_mover.is_empty() and input.hovered == null
+	rig_node._ground = null  # looking level (no ground intersection)
+	input._update_ground()
+	var level_ground_ok := not input.hovered_mover.is_empty() and input.has_ground
+	rig_node._ground = Vector3(10.5, 0.0, 10.5)
+	PlayerInput.mover_pick_3d = false
+	input._update_ground()
+	var old_floor_won := input.hovered_mover.is_empty() and input.hovered != null
+	check(won_3d and level_ground_ok and old_floor_won,
+		"B2#11: mover_pick_3d gives 3D mover priority (%s) and level-aim ground (%s); --mover-pick-3d=off restores floor priority (%s)" % [won_3d, level_ground_ok, old_floor_won])
+	PlayerInput.mover_pick_3d = was_mp3d
+	input.rig = old_rig
+	input.movers = null
+	input.hovered_mover = []
+	input.hovered = null
+	world._remove(9922)
+	rig_node.queue_free()
+	pm.queue_free()
+
+	# Batch 3 C1: RailBlocks straight client-side blocks (0 rblk), junction rblk + cache, --rail-signal-blocks=off, stop/elevated.
+	const RailBlocksScript := preload("res://scripts/player/rail_blocks.gd")
+	world.protos.add_entities([
+		[9930, "rail-signal", "rail-signal", -0.5, -0.5, 0.5, 0.5, 0, 0, 0, 1, 1],
+		[9931, "train-stop", "train-stop", -1, -1, 1, 1, 0, 0, 0, 2, 2],
+		[9932, "elevated-straight-rail", "elevated-straight-rail", -1, -1, 1, 1, 0, 0, 0, 2, 2],
+		[9933, "curved-rail-a", "curved-rail-a", -2, -2, 2, 2, 0, 0, 0, 4, 4],
+	])
+	var rb := RailBlocksScript.new()
+	var was_rb := RailBlocksScript.enabled
+	RailBlocksScript.enabled = true
+	# Two N-S straight-rail segments at x=15, y=11 and y=13, separated by a rail-signal at (16.5, 12.5).
+	world._add([9940, 7, 15 * 256, 11 * 256, 0])
+	world._add([9941, 7, 15 * 256, 13 * 256, 0])
+	world._add([9942, 9930, 16 * 256 + 128, 12 * 256 + 128, 0])
+	sent()
+	var res_simple: Dictionary = rb.snap_and_marks(world, world.protos.entity(9930), Vector2(13.6, 12.3), 8, false)
+	var sent_simple: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "rblk")
+	var line_cols := {}
+	for mk: Dictionary in (res_simple["marks"] as Array):
+		if str(mk.get("k", "")) == "line":
+			line_cols[(mk["c"] as Color).to_html()] = true
+	check(bool(res_simple["snapped"]) and bool(res_simple["valid"]) and sent_simple.is_empty() and line_cols.size() >= 2,
+		"C1: straight run snaps, separates 2 block colors client-side with 0 rblk sent (cols=%d rblk=%d)" % [line_cols.size(), sent_simple.size()])
+	# Occupied spot refusal: occupy all spots around a lone rail so best_free is empty and best_occ is returned.
+	world._add([9950, 7, 5 * 256, 25 * 256, 0])
+	world._add([9951, 9930, 6 * 256 + 128, 24 * 256 + 128, 0])
+	world._add([9952, 9930, 6 * 256 + 128, 25 * 256 + 128, 0])
+	world._add([9953, 9930, 3 * 256 + 128, 24 * 256 + 128, 8])
+	world._add([9954, 9930, 3 * 256 + 128, 25 * 256 + 128, 8])
+	var res_occ: Dictionary = rb.snap_and_marks(world, world.protos.entity(9930), Vector2(6.5, 24.5), 0, false)
+	check(bool(res_occ["snapped"]) and not bool(res_occ["valid"]) and str(res_occ["refusal"]) == "Spot is occupied",
+		"C1: occupied signal spot reports invalid with 'Spot is occupied': %s" % [res_occ.get("refusal")])
+	for u_occ in [9950, 9951, 9952, 9953, 9954]:
+		world._remove(u_occ)
+	# Train-stop snap on straight rail.
+	var res_stop: Dictionary = rb.snap_and_marks(world, world.protos.entity(9931), Vector2(16.8, 11.2), 0, false)
+	check(bool(res_stop["snapped"]) and bool(res_stop["valid"]) and (res_stop["pos"] as Vector2) == Vector2(17.0, 11.0),
+		"C1: train-stop snaps 2 tiles off straight rail: %s" % [res_stop.get("pos")])
+	# Elevated straight rail snap sets el=1.
+	world._add([9943, 9932, 23 * 256, 11 * 256, 0])
+	var res_el: Dictionary = rb.snap_and_marks(world, world.protos.entity(9930), Vector2(24.4, 12.3), 0, false)
+	check(bool(res_el["snapped"]) and int(res_el["el"]) == 1,
+		"C1: signal next to elevated-straight-rail snaps with el=1: %s" % [res_el.get("el")])
+	# Crossing / non-connected curve triggers rblk, caches by content_rev, invalidates on rev change.
+	world._add([9944, 9933, 15 * 256, 11 * 256, 0])
+	sent()
+	rb.snap_and_marks(world, world.protos.entity(9930), Vector2(13.6, 12.3), 8, false)
+	var q1: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "rblk")
+	rb._on_message({"t": "rblk", "b": [[9940, 1], [9941, 2], [9944, 1]]})
+	var v_before: int = rb.version
+	rb.snap_and_marks(world, world.protos.entity(9930), Vector2(13.6, 12.3), 8, false)
+	var q2: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "rblk")
+	cv.content_rev += 1
+	rb.snap_and_marks(world, world.protos.entity(9930), Vector2(13.6, 12.3), 8, false)
+	var q3: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "rblk")
+	check(q1.size() == 1 and v_before > 0 and q2.is_empty() and q3.size() == 1,
+		"C1: junction sends rblk (%d), caches on same rev (%d), re-queries on content_rev change (%d)" % [q1.size(), q2.size(), q3.size()])
+	# (rel-031-fix3, Should 2) Stable ids across queries: answered rails of each cached block go first in
+	# the next batch (anchors); a reply renaming an anchor renames every cached rail of its old id.
+	var q3_units: Array = (q3[0] as Dictionary).get("u", []) if not q3.is_empty() else []
+	var q3_rows: Array = []
+	for u_q3 in q3_units:
+		q3_rows.append([int(u_q3), 1 if int(u_q3) != 9941 else 2])
+	rb._on_message({"t": "rblk", "b": q3_rows})
+	var sig_now: Variant = (rb._bridge_cache[9940] as Array)[1] if rb._bridge_cache.has(9940) else null
+	rb._bridge_cache[99990] = [1, sig_now]  # another rail of block 1, out of this view
+	rb._bridge_cache.erase(9944)  # still to ask
+	sent()
+	rb._last_query_msec = 0
+	rb.snap_and_marks(world, world.protos.entity(9930), Vector2(13.6, 12.3), 8, false)
+	var q4: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "rblk")
+	var q4_units: Array = (q4[0] as Dictionary).get("u", []) if not q4.is_empty() else []
+	var anchors_first: bool = q4_units.size() >= 3 and int(q4_units[0]) == 9940 and int(q4_units[1]) == 9941 		and int(q4_units[q4_units.size() - 1]) == 9944
+	rb._on_message({"t": "rblk", "b": [[9940, 7], [9941, 2], [9944, 7]]})
+	var id_far: int = int((rb._bridge_cache[99990] as Array)[0])
+	var id_41: int = int((rb._bridge_cache[9941] as Array)[0])
+	check(anchors_first and id_far == 7 and id_41 == 2,
+		"C1: rblk anchors one answered rail per cached block first (%s) and a renamed anchor renames its block's cached rails (far %d, other block %d)" % [q4_units, id_far, id_41])
+	rb._bridge_cache.erase(99990)
+	# --rail-signal-blocks=off disables block line overlays & rblk while keeping attachment outlines.
+	RailBlocksScript.enabled = false
+	rb.clear()
+	sent()
+	var res_off: Dictionary = rb.snap_and_marks(world, world.protos.entity(9930), Vector2(13.6, 12.3), 8, false)
+	var q_off: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "rblk")
+	var has_lines := (res_off["marks"] as Array).any(func(mk: Dictionary) -> bool: return str(mk.get("k", "")) == "line")
+	var has_areas := (res_off["marks"] as Array).any(func(mk: Dictionary) -> bool: return str(mk.get("k", "")) == "area")
+	check(q_off.is_empty() and not has_lines and has_areas,
+		"C1: --rail-signal-blocks=off suppresses rblk and block lines while keeping outlines")
+	RailBlocksScript.enabled = was_rb
+	if Bridge.message_received.is_connected(rb._on_message):
+		Bridge.message_received.disconnect(rb._on_message)
+	for u_rb in [9940, 9941, 9942, 9943, 9944]:
+		world._remove(u_rb)
+
+	# --- Item #1: Robot ghost/standin/blueprint height ----------------------------------------------
+	const GhostsScript := preload("res://scripts/world/ghosts.gd")
+	const SpriteStandinsScript := preload("res://scripts/world/sprite_standins.gd")
+	const GroundHeightScript := preload("res://scripts/world/ground_height.gd")
+	check(is_equal_approx(Visuals.flight_lift("construction-robot"), 2.2)
+		and is_equal_approx(Visuals.flight_lift("logistic-robot"), 2.2)
+		and is_equal_approx(Visuals.flight_lift("combat-robot"), 2.4)
+		and is_equal_approx(Visuals.flight_lift("capture-robot"), 2.6)
+		and is_equal_approx(Visuals.flight_lift("rocket-silo-rocket"), 0.0)
+		and is_equal_approx(Visuals.flight_lift("container"), 0.0),
+		"Item #1: Visuals.flight_lift lifts flying robots (2.2/2.2/2.4/2.6) and clamps sunken rockets/ground to 0")
+	world.protos.add_entities([
+		[9960, "construction-robot", "construction-robot", -0.25, -0.25, 0.25, 0.25, 180, 180, 180, 1, 1],
+	])
+	var bot_p: ProtoDB.EntityProto = world.protos.entity(9960)
+	var bot_card_xf: Transform3D = SpriteStandinsScript.transform(Vector2(4.0, 5.0), Visuals.flight_lift(bot_p.type))
+	var bot_box_xf: Transform3D = Visuals.placeholder_transform(bot_p, Vector2(4.0, 5.0), 0, Visuals.height_for(bot_p), Visuals.flight_lift(bot_p.type))
+	check(is_equal_approx(bot_card_xf.origin.y, 2.2) and is_equal_approx(bot_box_xf.origin.y, 2.4),
+		"Item #1: SpriteStandins and placeholder_transform lift robot ghosts to flight_lift (card=%.2f, box=%.2f)" % [bot_card_xf.origin.y, bot_box_xf.origin.y])
+	var bot_wait := Time.get_ticks_msec() + 15000
+	while Time.get_ticks_msec() < bot_wait and not ModelLibrary.entity_ready("construction-robot", "construction-robot", {}, 0):
+		ModelLibrary.poll()
+		await get_tree().process_frame
+	var bot_pieces: Array = GhostsScript.ghost_pieces("construction-robot", "construction-robot", {}, 0, Vector2(4.0, 5.0))
+	var bot_piece_y: float = (bot_pieces[0][1] as Transform3D).origin.y if not bot_pieces.is_empty() else -1.0
+	check(not bot_pieces.is_empty() and is_equal_approx(bot_piece_y, 2.2),
+		"Item #1: Ghosts.ghost_pieces lifts construction-robot mesh to y=2.2 (got %.2f, pieces=%d)" % [bot_piece_y, bot_pieces.size()])
+	check(Predicted.NOT_PREDICTED.has("logistic-robot") and Predicted.NOT_PREDICTED.has("construction-robot")
+		and Predicted.NOT_PREDICTED.has("combat-robot") and Predicted.NOT_PREDICTED.has("capture-robot"),
+		"Item #1: Predicted.NOT_PREDICTED excludes all 4 flying robot types")
+
+	# --- Item #3: 3D mover pick (GroundHeight lift, 1st-person close-up, hover_y, _is_rail_or_ground, EntityInfo fluid-wagon) ---
+	world.protos.add_entities([
+		[9961, "locomotive", "locomotive", -1.0, -3.0, 1.0, 3.0, 120, 120, 120, 2, 6],
+		[9962, "fluid-wagon", "fluid-wagon", -1.0, -3.0, 1.0, 3.0, 120, 120, 120, 2, 6],
+		[9963, "rail-ramp", "rail-ramp", -2.0, -8.0, 2.0, 8.0, 120, 120, 120, 4, 16],
+		[9964, "rail-support", "rail-support", -1.5, -1.5, 1.5, 1.5, 120, 120, 120, 3, 3],
+		[9965, "legacy-straight-rail", "legacy-straight-rail", -1.0, -1.0, 1.0, 1.0, 120, 120, 120, 2, 2],
+		[9966, "small-remnants", "corpse", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1],
+		[9967, "tile-ghost", "tile-ghost", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1],
+		[9968, "item-on-ground", "item-entity", -0.25, -0.25, 0.25, 0.25, 120, 120, 120, 1, 1],
+		[9969, "entity-ghost", "entity-ghost", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1],
+	])
+	var pm3 := MoverLayer.new()
+	pm3.protos = world.protos
+	add_child(pm3)
+	pm3.handle({"t": "mv", "k": 2, "l": [[9970, 9961, 10 * 256 + 128, 10 * 256 + 128, 0]]})
+	var h_img := Image.create(4, 4, false, Image.FORMAT_RF)
+	h_img.fill(Color(4.0, 0.0, 0.0, 1.0))
+	GroundHeightScript.set_field(h_img, Vector2(0.0, 0.0), 8.0)
+	var hit_hill: Array = pm3.pick_ray(Vector3(10.5, 4.5, 16.0), Vector3(0.0, 0.0, -1.0), PlayerInput.HOVER_MOVERS)
+	var hit_flat: Array = pm3.pick_ray(Vector3(10.5, 0.5, 16.0), Vector3(0.0, 0.0, -1.0), PlayerInput.HOVER_MOVERS)
+	GroundHeightScript.clear()
+	check(not hit_hill.is_empty() and int(hit_hill[0]) == 9970 and hit_flat.is_empty(),
+		"Item #3: pick_ray applies GroundHeight lift even with empty lift_meshes (hill=%s flat=%s)" % [not hit_hill.is_empty(), hit_flat.is_empty()])
+	# Close-up 1st-person pick inside box looking toward centre succeeds unless driven; looking away misses.
+	var fp_toward: Array = pm3.pick_ray(Vector3(10.5, 0.3, 10.5), Vector3(0.0, 1.0, 0.0), PlayerInput.HOVER_MOVERS)
+	var fp_away: Array = pm3.pick_ray(Vector3(10.5, 0.3, 10.5), Vector3(0.0, -1.0, 0.0), PlayerInput.HOVER_MOVERS)
+	pm3.driven = 9970
+	var fp_driven: Array = pm3.pick_ray(Vector3(10.5, 0.3, 10.5), Vector3(0.0, 1.0, 0.0), PlayerInput.HOVER_MOVERS)
+	pm3.driven = 0
+	check(not fp_toward.is_empty() and fp_away.is_empty() and fp_driven.is_empty(),
+		"Item #3: close-up 1st-person pick hits toward centre (%s), skips away (%s) and driven vehicle (%s)" % [not fp_toward.is_empty(), fp_away.is_empty(), fp_driven.is_empty()])
+	# Elevated hover_y lift returned in pick_ray[7] and exposed via MoverLayer.hover_y / PlayerInput.hovered_mover_lift.
+	var loco_node: Node3D = pm3.node_of(9970)
+	var ground_y_val: float = MoverLayer.hover_y(fp_toward)
+	loco_node.position.y = 3.0
+	var elev_hit: Array = pm3.pick_ray(Vector3(10.5, 3.5, 16.0), Vector3(0.0, 0.0, -1.0), PlayerInput.HOVER_MOVERS)
+	input.hovered_mover = elev_hit
+	var elev_lift: float = input.hovered_mover_lift()
+	input.hovered_mover = []
+	check(is_equal_approx(ground_y_val, 0.0) and not elev_hit.is_empty() and is_equal_approx(elev_lift, 3.0),
+		"Item #3: MoverLayer.hover_y / hovered_mover_lift returns 0 on ground (%.2f) and 3.0 on elevated rail (%.2f)" % [ground_y_val, elev_lift])
+	# _is_rail_or_ground matches rails/ramps/supports/belts/resources/ghosts/items/remnants, excludes real machines.
+	var mk_rec := func(pid: int) -> WorldMirror.Rec:
+		var r := WorldMirror.Rec.new()
+		r.proto_id = pid
+		return r
+	check(input._is_rail_or_ground(mk_rec.call(7)) and input._is_rail_or_ground(mk_rec.call(9932))
+		and input._is_rail_or_ground(mk_rec.call(9963)) and input._is_rail_or_ground(mk_rec.call(9964))
+		and input._is_rail_or_ground(mk_rec.call(9966)) and input._is_rail_or_ground(mk_rec.call(9967))
+		and input._is_rail_or_ground(mk_rec.call(9968)) and input._is_rail_or_ground(mk_rec.call(9969))
+		and input._is_rail_or_ground(mk_rec.call(9910)) and not input._is_rail_or_ground(mk_rec.call(6)),
+		"Item #3: _is_rail_or_ground covers rails/ramps/supports/ghosts/remnants/resources and excludes real chests")
+	# EntityInfo fluid-wagon readout + synthetic mover _current validity.
+	pm3.handle({"t": "mv", "k": 3, "l": [[9971, 9962, 14 * 256 + 128, 10 * 256 + 128, 0]]})
+	var fw_hit: Array = pm3.pick_ray(Vector3(14.5, 5.0, 10.5), Vector3(0.0, -1.0, 0.0), PlayerInput.HOVER_MOVERS)
+	var fw_rec: WorldMirror.Rec = PlayerInput._mover_to_rec(fw_hit)
+	var ei := EntityInfoScript.new()
+	ei.model = m
+	var old_in_movers = input.movers
+	input.movers = pm3
+	ei.player = input
+	add_child(ei)
+	var cur_alive: Variant = ei._current(fw_rec)
+	var had_hover_info: Dictionary = m.hover_info
+	m.ask_hover_info(9971, 9962, Vector2i(14 * 256 + 128, 10 * 256 + 128))
+	m.handle({"t": "hinfo", "q": m._hinfo_q, "u": 9971, "fl": [{"fluid": "water", "amount": 12500, "capacity": 50000, "temperature": 90}]})
+	ei.show_entity(fw_rec)
+	var fw_joined: String = "".join(PackedStringArray(_texts(ei)))
+	var has_water: bool = fw_joined.contains("Water:") and fw_joined.contains("12.5k / 50k") and fw_joined.contains("90")
+	m.hover_info = {"u": 9971, "fl": []}
+	ei.show_entity(fw_rec)
+	var fw_empty_joined: String = "".join(PackedStringArray(_texts(ei)))
+	var has_empty: bool = fw_empty_joined.contains("Fluid:") and fw_empty_joined.contains("Empty")
+	pm3.reset()
+	var cur_gone: Variant = ei._current(fw_rec)
+	check(cur_alive == fw_rec and cur_gone == null and has_water and has_empty,
+		"Item #3: EntityInfo fluid-wagon keeps synthetic mover valid while alive, formats hinfo.fl via UiModel (%s) & empty (%s)" % [has_water, has_empty])
+	m.hover_info = had_hover_info
+	input.movers = old_in_movers
+	ei.queue_free()
+	pm3.queue_free()
+
+	# --- Item #4: Rail signal/stop overlays (3.4x1.6 rail, x.cb, elevated, ramp, legacy, CursorOverlay) ---
+	world.protos.add_entities([
+		[9972, "straight-rail-21", "straight-rail", -1.7, -0.8, 1.7, 0.8, 120, 120, 120, 2, 2],
+		[9973, "cb-box", "container", -1.5, -1.5, 1.5, 1.5, 120, 120, 120, 3, 3],
+	])
+	var rb4 := RailBlocksScript.new()
+	var was_rb4 := RailBlocksScript.enabled
+	RailBlocksScript.enabled = true
+	# 3.4x1.6 Factorio 2.1 straight-rail at (5, 5) facing N must NOT false-block adjacent signal or stop spots.
+	world._add([9974, 9972, 5 * 256, 5 * 256, 0])
+	var res21_sig: Dictionary = rb4.snap_and_marks(world, world.protos.entity(9930), Vector2(6.5, 4.5), 0, false, m.eprops)
+	var res21_stop: Dictionary = rb4.snap_and_marks(world, world.protos.entity(9931), Vector2(7.0, 5.0), 0, false, m.eprops)
+	var sig_areas: Array = (res21_sig["marks"] as Array).filter(func(mk: Dictionary) -> bool: return str(mk.get("k", "")) == "area")
+	check(bool(res21_sig["snapped"]) and bool(res21_sig["valid"]) and bool(res21_stop["snapped"]) and bool(res21_stop["valid"])
+		and not sig_areas.is_empty() and bool(sig_areas[0].get("over", false)),
+		"Item #4: 3.4x1.6 Factorio 2.1 rail selection_rect does not false-block adjacent signal/stop spots and sets area over=true")
+	# Non-rail obstacle with narrower eprops x.cb allows adjacent spot outside cb while blocking inside cb.
+	world._add([9975, 9973, 7 * 256 + 128, 4 * 256 + 128, 0])
+	var had_cb: Variant = m.eprops.get(9973)
+	m.eprops[9973] = {"x": {"cb": [-0.3, -0.3, 0.3, 0.3]}}
+	var st_narrow: int = rb4._spot_status(world, Vector2(6.5, 4.5), false, 0, false, m.eprops)
+	m.eprops[9973] = {"x": {"cb": [-1.2, -1.2, 1.2, 1.2]}}
+	var st_wide: int = rb4._spot_status(world, Vector2(6.5, 4.5), false, 0, false, m.eprops)
+	if had_cb == null:
+		m.eprops.erase(9973)
+	else:
+		m.eprops[9973] = had_cb
+	world._remove(9975)
+	check(st_narrow == 0 and st_wide == 2,
+		"Item #4: RailBlocks respects eprops x.cb on non-rail obstacles (narrow=%d wide=%d)" % [st_narrow, st_wide])
+	# Elevated straight rail marks lift to ModelLibrary.ELEVATED_TRACK.
+	world._add([9976, 9932, 13 * 256, 5 * 256, 0])
+	var res_el4: Dictionary = rb4.snap_and_marks(world, world.protos.entity(9930), Vector2(14.5, 4.5), 0, false, m.eprops)
+	var el_areas: Array = (res_el4["marks"] as Array).filter(func(mk: Dictionary) -> bool: return str(mk.get("k", "")) == "area" and is_equal_approx(float(mk.get("y", 0.0)), ModelLibrary.ELEVATED_TRACK))
+	var el_lines: Array = (res_el4["marks"] as Array).filter(func(mk: Dictionary) -> bool: return str(mk.get("k", "")) == "line" and is_equal_approx(float(mk.get("y", 0.0)), ModelLibrary.ELEVATED_TRACK))
+	check(bool(res_el4["snapped"]) and int(res_el4["el"]) == 1 and not el_areas.is_empty() and not el_lines.is_empty(),
+		"Item #4: elevated-straight-rail outlines & block lines lift to ELEVATED_TRACK (areas=%d lines=%d)" % [el_areas.size(), el_lines.size()])
+	# rail-ramp emits sloped line (y=0 -> y2=ELEVATED_TRACK) and blocks overlapping spots.
+	world._add([9977, 9963, 25 * 256, 15 * 256, 0])
+	var ramp_res: Dictionary = rb4.snap_and_marks(world, world.protos.entity(9930), Vector2(26.5, 15.5), 0, false, m.eprops)
+	var ramp_lines: Array = (ramp_res["marks"] as Array).filter(func(mk: Dictionary) -> bool:
+		return str(mk.get("k", "")) == "line" and (mk.has("y2") or is_equal_approx(float(mk.get("y", 0.0)), ModelLibrary.ELEVATED_TRACK)))
+	var ramp_blk_in: bool = RailBlocksScript._ramp_blocks_spot(world.entities[9977], Vector2(25.0, 15.0), Vector2(0.45, 0.45))
+	var ramp_blk_out: bool = RailBlocksScript._ramp_blocks_spot(world.entities[9977], Vector2(27.5, 15.0), Vector2(0.45, 0.45))
+	check(not ramp_lines.is_empty() and ramp_blk_in and not ramp_blk_out,
+		"Item #4: rail-ramp produces sloped block line (n=%d) and blocks only its footprint (in=%s out=%s)" % [ramp_lines.size(), ramp_blk_in, ramp_blk_out])
+	# legacy-straight-rail snaps both signals and train-stops.
+	world._add([9978, 9965, 5 * 256, 21 * 256, 0])
+	var leg_sig: Dictionary = rb4.snap_and_marks(world, world.protos.entity(9930), Vector2(6.5, 20.5), 0, false, m.eprops)
+	var leg_stop: Dictionary = rb4.snap_and_marks(world, world.protos.entity(9931), Vector2(7.0, 21.0), 0, false, m.eprops)
+	check(bool(leg_sig["snapped"]) and bool(leg_sig["valid"]) and bool(leg_stop["snapped"]) and bool(leg_stop["valid"]),
+		"Item #4: legacy-straight-rail supports both signal and train-stop snaps")
+	# CursorOverlay area/line/brackets elevation & top/ground priority split.
+	var mk_ov_area := CursorOverlay.area(Rect2(0, 0, 1, 1), Color.GREEN, Color.WHITE, 3.0, true)
+	var mk_ov_line := CursorOverlay.line(Vector2.ZERO, Vector2(0, 8), Color.CYAN, 0.4, 0.0, 3.0)
+	var mk_ov_brk := CursorOverlay.brackets(Vector2(2, 2), Vector2(1, 3), 0.0, Color.YELLOW, 3.0)
+	check(bool(mk_ov_area.get("over", false)) and is_equal_approx(float(mk_ov_area.get("y", 0.0)), 3.0)
+		and is_equal_approx(float(mk_ov_line.get("y2", -1.0)), 3.0)
+		and is_equal_approx(float(mk_ov_brk.get("y", 0.0)), 3.0),
+		"Item #4: CursorOverlay area/line/brackets carry over/y/y2 metadata")
+	var co_test := CursorOverlay.new()
+	add_child(co_test)
+	co_test.show_marks([CursorOverlay.area(Rect2(0, 0, 1, 1), Color.GREEN, Color.WHITE, 0.0, true)])
+	var top_has_surf: bool = co_test._mesh.get_surface_count() > 0 and co_test._areas_mesh.get_surface_count() == 0
+	co_test.show_marks([CursorOverlay.area(Rect2(0, 0, 1, 1), Color.GREEN, Color.WHITE, 0.0, false)])
+	var ground_has_surf: bool = co_test._mesh.get_surface_count() == 0 and co_test._areas_mesh.get_surface_count() > 0
+	check(top_has_surf and ground_has_surf,
+		"Item #4: CursorOverlay routes over=true area to top _mesh (%s) and over=false y=0 area to _areas (%s)" % [top_has_surf, ground_has_surf])
+	co_test.queue_free()
+	# Bug batch 4 #2: placing a rail signal keeps the ghost on the now-occupied spot (not jumping to the next
+	# free neighbor) and DragBuild does not double-place from micro-jitter while LMB is held.
+	world._add([9979, 9930, 6 * 256 + 128, 4 * 256 + 128, 0])
+	var res_stay_occ: Dictionary = rb4.snap_and_marks(world, world.protos.entity(9930), Vector2(6.5, 4.5), 0, false, m.eprops)
+	var res_move_free: Dictionary = rb4.snap_and_marks(world, world.protos.entity(9930), Vector2(6.5, 5.4), 0, false, m.eprops)
+	check(bool(res_stay_occ["snapped"]) and not bool(res_stay_occ["valid"])
+		and (res_stay_occ["pos"] as Vector2) == Vector2(6.5, 4.5) and str(res_stay_occ["refusal"]) == "Spot is occupied"
+		and bool(res_move_free["valid"]) and (res_move_free["pos"] as Vector2) == Vector2(6.5, 5.5),
+		"RailBlocks keeps cursor on closer occupied spot (6.5,4.5 -> %s valid=%s; free=%s valid=%s) instead of jumping to free neighbor" % [res_stay_occ.get("pos"), res_stay_occ.get("valid"), res_move_free.get("pos"), res_move_free.get("valid")])
+	world._remove(9979)
+	var prev_in_rb = input.rail_blocks
+	input.rail_blocks = rb4
+	input.hold("rail-signal")
+	input.build_dir = 0
+	sent()
+	input.drag.begin("rail-signal", world.protos.entity(9930), Vector2(6.5, 4.5), true)
+	var sig_click := sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "build")
+	world._add([9979, 9930, 6 * 256 + 128, 4 * 256 + 128, 0])
+	input.drag.update(Vector2(6.5, 4.5))
+	input.drag.update(Vector2(6.5, 4.7))
+	var sig_jitter := sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "build")
+	input.drag.update(Vector2(6.5, 5.5))
+	var sig_drag := sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "build")
+	input.drag.end()
+	input.hold("")
+	input.rail_blocks = prev_in_rb
+	world._remove(9979)
+	check(sig_click.size() == 1 and sig_jitter.is_empty() and sig_drag.size() == 1
+		and int(sig_drag[0].get("y", 0)) == 5 * 256 + 128,
+		"DragBuild places once on click (%d), ignores post-place jitter (%d), and places next spot when dragged (%d)" % [sig_click.size(), sig_jitter.size(), sig_drag.size()])
+	RailBlocksScript.enabled = was_rb4
+	if Bridge.message_received.is_connected(rb4._on_message):
+		Bridge.message_received.disconnect(rb4._on_message)
+	for u_rb4 in [9974, 9976, 9977, 9978]:
+		world._remove(u_rb4)
+
+	# --- Item #5: 360-deg turrets, Turrets.head_transform (artillery relative & omni idle), Ghosts turret_head alignment, NON_ROTATABLE_TYPES ---
+	world.protos.add_entities([
+		[9980, "gun-turret", "ammo-turret", -1.0, -1.0, 1.0, 1.0, 120, 120, 120, 2, 2],
+		[9981, "laser-turret", "electric-turret", -1.0, -1.0, 1.0, 1.0, 120, 120, 120, 2, 2],
+		[9982, "artillery-turret", "artillery-turret", -1.5, -1.5, 1.5, 1.5, 120, 120, 120, 3, 3],
+		[9983, "railgun-turret", "ammo-turret", -1.5, -1.5, 1.5, 1.5, 120, 120, 120, 3, 3],
+		[9984, "flamethrower-turret", "fluid-turret", -1.0, -1.5, 1.0, 1.5, 120, 120, 120, 2, 3],
+		[9985, "linked-chest", "linked-container", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1],
+		[9986, "thruster", "thruster", -2.0, -2.5, 2.0, 2.5, 120, 120, 120, 4, 5],
+		[9987, "crusher", "crusher", -1.0, -1.5, 1.0, 1.5, 120, 120, 120, 2, 3],
+		[9988, "infinity-pipe", "infinity-pipe", -0.5, -0.5, 0.5, 0.5, 120, 120, 120, 1, 1],
+		[9989, "heat-interface", "heat-interface", -1.0, -1.0, 1.0, 1.0, 120, 120, 120, 2, 2],
+		[9990, "space-platform-hub", "space-platform-hub", -4.0, -4.0, 4.0, 4.0, 120, 120, 120, 8, 8],
+		[9991, "electric-furnace-fo", "furnace", -1.5, -1.5, 1.5, 1.5, 120, 120, 120, 3, 3],
+	])
+	check(VisualTurns.eligible(world.protos.entity(9980), {}) and VisualTurns.eligible(world.protos.entity(9981), {})
+		and VisualTurns.eligible(world.protos.entity(9982), {}) and VisualTurns.eligible(world.protos.entity(9985), {})
+		and not VisualTurns.eligible(world.protos.entity(9983), {})
+		and not VisualTurns.eligible(world.protos.entity(9980), {"tbd": 1})
+		and not VisualTurns.eligible(world.protos.entity(9984), {}),
+		"Item #5: VisualTurns.eligible includes 360-deg square turrets + linked-container and excludes railgun/tbd/flamethrower")
+	input.build_dir = 8
+	var had_fo: Variant = m.eprops.get(9991)
+	m.eprops[9991] = {"x": {"fb": [[0, -1, 0, "i"]], "fo": 1}}
+	var non_rot_ok: bool = PlayerInput.NON_ROTATABLE_TYPES.has("thruster") and PlayerInput.NON_ROTATABLE_TYPES.has("crusher") \
+		and PlayerInput.NON_ROTATABLE_TYPES.has("infinity-pipe") and PlayerInput.NON_ROTATABLE_TYPES.has("heat-interface") \
+		and PlayerInput.NON_ROTATABLE_TYPES.has("space-platform-hub") \
+		and input.effective_build_dir(world.protos.entity(9986), false) == 0 \
+		and input.effective_build_dir(world.protos.entity(9987), false) == 0 \
+		and input.effective_build_dir(world.protos.entity(9988), false) == 0 \
+		and input.effective_build_dir(world.protos.entity(9989), false) == 0 \
+		and input.effective_build_dir(world.protos.entity(9990), false) == 0 \
+		and input.effective_build_dir(world.protos.entity(9991), false) == 0
+	if had_fo == null:
+		m.eprops.erase(9991)
+	else:
+		m.eprops[9991] = had_fo
+	check(non_rot_ok, "Item #5: NON_ROTATABLE_TYPES and furnace x.fo clamp effective_build_dir to 0")
+	# Turrets.head_transform: artillery-turret (relative) keeps base turn; omni gun-turret idle aligns to rotated base.
+	var tl := TurretLayer.new()
+	add_child(tl)
+	var art_part := ModelLibrary.AnimPart.new()
+	art_part.model = "artillery-turret"
+	art_part.kind = "turret_head"
+	art_part.pivot = Transform3D.IDENTITY
+	art_part.mesh = Visuals.box_mesh()
+	var gun_part := ModelLibrary.AnimPart.new()
+	gun_part.model = "gun-turret"
+	gun_part.kind = "turret_head"
+	gun_part.pivot = Transform3D.IDENTITY
+	gun_part.mesh = Visuals.box_mesh()
+	var base_east := Transform3D(Basis(Vector3.UP, -PI * 0.5), Vector3(5.0, 0.0, 5.0))
+	tl.handle_states({"t": "ts", "l": [[7001, 0, 0, 0], [7002, 0, 0, 0]]})
+	var art_xf: Transform3D = tl.head_transform(7001, art_part, base_east, 0.016)
+	var gun_xf: Transform3D = tl.head_transform(7002, gun_part, base_east, 0.016)
+	var art_world_fwd: Vector3 = ((base_east * art_xf).basis * Vector3.FORWARD).normalized()
+	var gun_world_fwd: Vector3 = ((base_east * gun_xf).basis * Vector3.FORWARD).normalized()
+	var gun_horiz: Vector2 = Vector2(gun_world_fwd.x, gun_world_fwd.z).normalized()
+	# Must-fix #1: visually East-rotated omni artillery firing South (yaw=500 -> 0.5) must aim world South (+Z), not West.
+	tl.handle_states({"t": "ts", "l": [[7001, 500, 1, 1]]})
+	for _tick in range(10):
+		tl.head_transform(7001, art_part, base_east, 0.5)
+	var art_fire_xf: Transform3D = tl.head_transform(7001, art_part, base_east, 0.5)
+	var art_fire_fwd: Vector3 = ((base_east * art_fire_xf).basis * Vector3.FORWARD).normalized()
+	check(art_world_fwd.is_equal_approx(Vector3.RIGHT) and gun_horiz.is_equal_approx(Vector2(1.0, 0.0))
+		and art_fire_fwd.is_equal_approx(Vector3.BACK),
+		"Item #5: omni artillery-turret & idle gun-turret align East idle (art=%s gun=%s) and artillery aims world South when firing (%s)" % [
+			art_world_fwd, gun_world_fwd, art_fire_fwd])
+	tl.queue_free()
+	# Ghost vs live Turrets.head_front alignment on fue5 gun-turret (whose head mesh faces Vector3.LEFT).
+	var gt_wait := Time.get_ticks_msec() + 15000
+	while Time.get_ticks_msec() < gt_wait and not ModelLibrary.entity_ready("gun-turret", "ammo-turret", {}, 0):
+		ModelLibrary.poll()
+		await get_tree().process_frame
+	var gt_pieces: Array = GhostsScript.ghost_pieces("gun-turret", "ammo-turret", {}, 0, Vector2.ZERO)
+	var gt_resolved: String = GhostsScript._resolved_entity_model("gun-turret", "ammo-turret", {}, 0)[0]
+	var gt_aligned_ok := true
+	if gt_resolved != "":
+		var gt_parts: Array = ModelLibrary.parts_for(gt_resolved)
+		var piece_idx := 1
+		for p_gt: ModelLibrary.AnimPart in gt_parts:
+			if p_gt.mesh == null or p_gt.lit:
+				continue
+			if p_gt.kind == "turret_head" and TurretLayer.head_front(p_gt) == Vector3.LEFT and piece_idx < gt_pieces.size():
+				var pxf: Transform3D = gt_pieces[piece_idx][1]
+				var gt_fwd: Vector3 = (pxf.basis * Vector3.LEFT).normalized()
+				gt_aligned_ok = gt_aligned_ok and gt_fwd.is_equal_approx(Vector3.FORWARD)
+			piece_idx += 1
+	check(not gt_pieces.is_empty() and gt_aligned_ok,
+		"Item #5: Ghosts.ghost_pieces aligns turret_head with Turrets.head_front == Vector3.LEFT to face North")
+
+	# --- Item #6: should_click_open_held and --click-open-held=off ----------------------------------
+	world.protos.add_entities([
+		[9992, "fast-transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 180, 50, 50, 1, 1],
+		[9993, "iron-chest", "container", -0.5, -0.5, 0.5, 0.5, 180, 180, 180, 1, 1],
+	])
+	world.protos.item_places["transport-belt"] = "transport-belt"
+	world.protos.item_places["fast-transport-belt"] = "fast-transport-belt"
+	world.protos.item_places["wooden-chest"] = "wooden-chest"
+	world.protos.item_places["iron-chest"] = "iron-chest"
+	world._add([9994, 6, 4 * 256 + 128, 4 * 256 + 128, 0])  # wooden-chest
+	world._add([9995, 1, 6 * 256 + 128, 4 * 256 + 128, 0])  # transport-belt facing north
+	world._add([9996, 9969, 8 * 256 + 128, 4 * 256 + 128, 0, {"gh": 6}])  # wooden-chest ghost
+	var r_chest: WorldMirror.Rec = world.entities[9994]
+	var r_belt: WorldMirror.Rec = world.entities[9995]
+	var r_ghost: WorldMirror.Rec = world.entities[9996]
+	var p_belt: ProtoDB.EntityProto = world.protos.entity(1)
+	var p_fbelt: ProtoDB.EntityProto = world.protos.entity(9992)
+	var p_wchest: ProtoDB.EntityProto = world.protos.entity(6)
+	var p_ichest: ProtoDB.EntityProto = world.protos.entity(9993)
+	input.cursor_quality = "normal"
+	input.build_dir = 0
+	var open_other: bool = input.should_click_open_held(p_belt, r_chest)
+	var no_fast_belt: bool = not input.should_click_open_held(p_fbelt, r_belt)
+	var no_fast_chest: bool = not input.should_click_open_held(p_ichest, r_chest)
+	var no_ghost: bool = not input.should_click_open_held(p_wchest, r_ghost)
+	var open_same_dir_belt: bool = input.should_click_open_held(p_belt, r_belt)
+	input.build_dir = 4
+	var no_rot_belt: bool = not input.should_click_open_held(p_belt, r_belt)
+	input.build_dir = 0
+	input.cursor_quality = "rare"
+	var no_qual_upgrade: bool = not input.should_click_open_held(p_wchest, r_chest)
+	input.cursor_quality = "normal"
+	check(open_other and no_fast_belt and no_fast_chest and no_ghost and open_same_dir_belt and no_rot_belt and no_qual_upgrade,
+		"Item #6: should_click_open_held opens real openable (%s,%s) and yields to fast-replace (%s,%s), ghost (%s), dir-rotate (%s), quality upgrade (%s)" % [
+			open_other, open_same_dir_belt, no_fast_belt, no_fast_chest, no_ghost, no_rot_belt, no_qual_upgrade])
+	# Verify _try_click_open_held honors Shift/Ctrl and --click-open-held=off.
+	var was_coh: bool = PlayerInput.click_open_held
+	PlayerInput.click_open_held = true
+	input.hold("transport-belt")
+	input.has_ground = true
+	input.ground = Vector2(4.5, 4.5)
+	var mb_plain := InputEventMouseButton.new()
+	mb_plain.button_index = MOUSE_BUTTON_LEFT
+	mb_plain.pressed = true
+	sent()
+	var opened_held: bool = input._try_click_open_held(mb_plain)
+	var open_cmd_6 := sent_one("open")
+	var mb_shift := InputEventMouseButton.new()
+	mb_shift.button_index = MOUSE_BUTTON_LEFT
+	mb_shift.pressed = true
+	mb_shift.shift_pressed = true
+	var mb_ctrl := InputEventMouseButton.new()
+	mb_ctrl.button_index = MOUSE_BUTTON_LEFT
+	mb_ctrl.pressed = true
+	mb_ctrl.ctrl_pressed = true
+	var shift_skips: bool = not input._try_click_open_held(mb_shift)
+	var ctrl_skips: bool = not input._try_click_open_held(mb_ctrl)
+	PlayerInput.click_open_held = false
+	var off_skips: bool = not input._try_click_open_held(mb_plain)
+	PlayerInput.click_open_held = true
+	world.protos.item_places["rail-signal"] = "rail-signal"
+	input.hold("rail-signal")
+	var sig_skips: bool = not input._try_click_open_held(mb_plain)
+	PlayerInput.click_open_held = was_coh
+	check(opened_held and int(open_cmd_6.get("u", 0)) == 9994 and shift_skips and ctrl_skips and off_skips and sig_skips,
+		"Item #6: _try_click_open_held opens on plain click (u=%d), skips Shift (%s) / Ctrl (%s) / --click-open-held=off (%s) / rail-signal (%s)" % [
+			int(open_cmd_6.get("u", 0)), shift_skips, ctrl_skips, off_skips, sig_skips])
+	input.hold("")
+	input.has_ground = false
+	hud.screen.close_local()
+	for u_6 in [9994, 9995, 9996]:
+		world._remove(u_6)
+	sent()
 	m.has_slots = had_slots
 	for tool in [input.tile_brush, input.rail_planner, input.capsule_aim]:
 		tool.queue_free()
 	# PlayerInput's own previews, made before _ready (which a test doesn't run) adds them anywhere.
 	for n in [input._ghost, input._drag_box, input._reach_lines, input._ghost_model, input._overlay]:
 		n.free()
+	if input.rail_blocks != null and Bridge.message_received.is_connected(input.rail_blocks._on_message):
+		Bridge.message_received.disconnect(input.rail_blocks._on_message)
 	input.free()
 	cv.free()
 	world.free()

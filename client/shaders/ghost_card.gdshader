@@ -13,7 +13,7 @@ uniform vec4 tint : source_color = vec4(0.58, 0.68, 1.0, 0.42);
 void vertex() {
 	float h = ground_h(MODEL_MATRIX[3].xz);
 	if (h != 0.0) {
-		VERTEX += inverse(mat3(MODEL_MATRIX)) * vec3(0.0, h, 0.0);
+		VERTEX += ground_up_in(MODEL_MATRIX, h);
 	}
 }
 

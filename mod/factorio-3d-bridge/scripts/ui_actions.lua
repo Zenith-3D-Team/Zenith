@@ -352,6 +352,30 @@ function M.fast(cmd)
     remove_held(main, hs, item, inserted, quality)
   else
     local moved = 0
+    if e.type == "inserter" then
+      local okh, held = pcall(function() return e.held_stack end)
+      if okh and held and held.valid_for_read then
+        local n = half and math.ceil(held.count / 2) or held.count
+        local okq, q = pcall(function() return held.quality end)
+        local qname = okq and (type(q) == "string" and q or (q and q.name)) or nil
+        local stack = { name = held.name, count = n }
+        if qname and qname ~= "normal" then
+          stack.quality = qname
+        end
+        local inserted = c.insert(stack)
+        if inserted > 0 then
+          if inserted >= held.count then
+            local okc = pcall(function() held.clear() end)
+            if not okc then
+              pcall(function() e.held_stack = { valid_for_read = false } end)
+            end
+          else
+            pcall(function() held.count = held.count - inserted end)
+          end
+          moved = moved + inserted
+        end
+      end
+    end
     for _, inv in ipairs(take_inventories(e)) do
       for _, entry in pairs(inv.get_contents()) do
         local n = half and math.ceil(entry.count / 2) or entry.count
@@ -380,6 +404,206 @@ end
 ---------------------------------------------------------------------------------------------
 -- Entity settings (Shift+right click copies, Shift+left click pastes) and flipping (H / V)
 
+local function inner_type(e)
+  return e.type == "entity-ghost" and e.ghost_type or e.type
+end
+
+local function inner_proto(e)
+  return e.type == "entity-ghost" and e.ghost_prototype or e.prototype
+end
+
+local NON_PASTE_TYPES = {
+  tree = true, ["simple-entity"] = true, resource = true, cliff = true, plant = true,
+  corpse = true, ["character-corpse"] = true, ["rail-remnants"] = true, character = true,
+}
+
+local function paste_compatible(source, dest)
+  local st, dt = inner_type(source), inner_type(dest)
+  if NON_PASTE_TYPES[st] or NON_PASTE_TYPES[dt] then
+    return false
+  end
+  if st == dt then
+    return true
+  end
+  if st == "assembling-machine" and dt == "logistic-container" then
+    return true
+  end
+  if (st == "container" or st == "logistic-container") and (dt == "container" or dt == "logistic-container") then
+    return true
+  end
+  return false
+end
+
+local function try_read(fn)
+  local ok, v = pcall(fn)
+  if ok then
+    return v
+  end
+  return nil
+end
+
+local function paste_sig(e)
+  local parts = { tostring(e.direction or 0) }
+  parts[#parts + 1] = try_read(function() return e.mirroring end) and "1" or "0"
+  local rec, rq = try_read(function() return e.get_recipe() end)
+  if rec then
+    parts[#parts + 1] = "r:" .. tostring(rec.name) .. ":" .. tostring(rq and rq.name or "")
+  end
+  local col = try_read(function() return e.color end)
+  if type(col) == "table" then
+    parts[#parts + 1] = "c:" .. tostring(col.r) .. "," .. tostring(col.g) .. "," .. tostring(col.b) .. "," .. tostring(col.a)
+  end
+  local bn = try_read(function() return e.backer_name end)
+  if bn ~= nil then
+    parts[#parts + 1] = "bn:" .. tostring(bn)
+  end
+  local tl = try_read(function() return e.trains_limit end)
+  if tl ~= nil then
+    parts[#parts + 1] = "tl:" .. tostring(tl)
+  end
+  local tp = try_read(function() return e.train_stop_priority end)
+  if tp ~= nil then
+    parts[#parts + 1] = "tp:" .. tostring(tp)
+  end
+  local desc = try_read(function() return e.combinator_description end)
+  if desc ~= nil then
+    parts[#parts + 1] = "d:" .. tostring(desc)
+  end
+  local ao = try_read(function() return e.always_on end)
+  if ao ~= nil then
+    parts[#parts + 1] = "ao:" .. (ao and "1" or "0")
+  end
+  local sf = try_read(function() return e.splitter_filter end)
+  parts[#parts + 1] = "sf:" .. tostring(type(sf) == "table" and sf.name or sf or "") .. ":"
+    .. tostring(try_read(function() return e.splitter_input_priority end) or "") .. ":"
+    .. tostring(try_read(function() return e.splitter_output_priority end) or "")
+  local uf = try_read(function() return e.use_filters end)
+  if uf ~= nil then
+    local fl = {
+      uf and "1" or "0",
+      tostring(try_read(function() return e.inserter_filter_mode end) or ""),
+      tostring(try_read(function() return e.inserter_stack_size_override end) or ""),
+    }
+    for i = 1, 5 do
+      local f = try_read(function() return e.get_filter(i) end)
+      fl[#fl + 1] = tostring(type(f) == "table" and f.name or f or "")
+    end
+    parts[#parts + 1] = "in:" .. table.concat(fl, ",")
+  end
+  local stf = try_read(function() return e.storage_filter end)
+  if stf ~= nil then
+    parts[#parts + 1] = "stf:" .. tostring(type(stf) == "table" and stf.name or stf or "")
+  end
+  local fsc = try_read(function() return e.filter_slot_count end)
+  if uf == nil and type(fsc) == "number" and fsc > 0 then
+    local ef = {}
+    for i = 1, math.min(fsc, 40) do
+      local f = try_read(function() return e.get_filter(i) end)
+      ef[#ef + 1] = tostring(type(f) == "table" and f.name or f or "")
+    end
+    parts[#parts + 1] = "ef:" .. table.concat(ef, ",")
+  end
+  local bar = try_read(function()
+    local inv = e.get_inventory(1)
+    return inv and inv.supports_bar() and inv.get_bar() or nil
+  end)
+  if bar ~= nil then
+    parts[#parts + 1] = "b:" .. tostring(bar)
+  end
+  local rf = try_read(function() return e.request_from_buffers end)
+  if rf ~= nil then
+    parts[#parts + 1] = "rb:" .. (rf and "1" or "0")
+  end
+  local secs = try_read(function() return e.get_logistic_sections() end)
+  if secs and secs.sections_count then
+    local sp = {}
+    for i = 1, secs.sections_count do
+      local sec = secs.get_section(i)
+      if sec then
+        sp[#sp + 1] = tostring(sec.group or "") .. "/" .. (sec.active and "1" or "0") .. "/" .. tostring(sec.multiplier or 1)
+        for _, f in pairs(sec.filters or {}) do
+          local v = f.value
+          sp[#sp + 1] = tostring(type(v) == "table" and v.name or v or "") .. "=" .. tostring(f.min or "") .. ":" .. tostring(f.max or "")
+        end
+      end
+    end
+    parts[#parts + 1] = "ls:" .. table.concat(sp, ";")
+  end
+  local cb = try_read(function() return e.get_control_behavior() end)
+  if cb then
+    local ok_j, j = pcall(helpers.table_to_json, {
+      en = try_read(function() return cb.enabled end),
+      p = try_read(function() return cb.parameters end),
+      cc = try_read(function() return cb.circuit_condition end),
+      lc = try_read(function() return cb.logistic_condition end),
+      con = try_read(function() return cb.connect_to_logistic_network end),
+      m = try_read(function() return cb.circuit_mode_of_operation end),
+      r = try_read(function() return cb.circuit_read_contents end),
+      rh = try_read(function() return cb.circuit_read_hand_contents end),
+    })
+    if ok_j and j then
+      parts[#parts + 1] = "cb:" .. j
+    end
+    local cb_sc = try_read(function() return cb.sections_count end)
+    if cb_sc then
+      local sp = {}
+      for i = 1, cb_sc do
+        local sec = try_read(function() return cb.get_section(i) end)
+        if sec then
+          local ok_s, sj = pcall(helpers.table_to_json, { g = sec.group, a = sec.active, m = sec.multiplier, f = sec.filters })
+          sp[#sp + 1] = ok_s and sj or tostring(i)
+        end
+      end
+      parts[#parts + 1] = "cbs:" .. table.concat(sp, ";")
+    end
+  end
+  local plan = try_read(function() return e.insert_plan end)
+  if type(plan) == "table" then
+    local ok_j, j = pcall(helpers.table_to_json, plan)
+    if ok_j and j then
+      parts[#parts + 1] = "ip:" .. j
+    end
+  end
+  return table.concat(parts, "|")
+end
+
+local function paste_compatible_rotation(source, dest)
+  local sp, dp = inner_proto(source), inner_proto(dest)
+  if sp and dp and sp.name == dp.name then
+    return true
+  end
+  return sp and dp and sp.tile_width == sp.tile_height and dp.tile_width == dp.tile_height and sp.tile_width == dp.tile_width
+end
+
+local NON_COLLIDING_ROTATE = { resource = true, ["entity-ghost"] = true, ["tile-ghost"] = true, character = true,
+  ["item-entity"] = true, corpse = true, ["rail-remnants"] = true, ["construction-robot"] = true,
+  ["logistic-robot"] = true, ["combat-robot"] = true, ["smoke-with-trigger"] = true, particle = true, decorative = true }
+
+local function rotation_collides(dest, prev_dir)
+  local dp = inner_proto(dest)
+  if not dp or dp.tile_width == dp.tile_height or (prev_dir % 8) == (dest.direction % 8) then
+    return false
+  end
+  local surf = dest.surface
+  if not (surf and surf.find_entities_filtered) then
+    return false
+  end
+  local w, h = dp.tile_width, dp.tile_height
+  if dest.direction == defines.direction.east or dest.direction == defines.direction.west then
+    w, h = h, w
+  end
+  local p = dest.position
+  local hx, hy = math.max(w / 2 - 0.05, 0.05), math.max(h / 2 - 0.05, 0.05)
+  local area = { { p.x - hx, p.y - hy }, { p.x + hx, p.y + hy } }
+  for _, other in pairs(surf.find_entities_filtered({ area = area })) do
+    if other ~= dest and other.valid and not NON_COLLIDING_ROTATE[other.type]
+        and string.sub(other.type or "", 1, 9) ~= "elevated-" then
+      return true
+    end
+  end
+  return false
+end
+
 -- {f = [u, p, x, y] (the source), u, p, x, y (the target)}: LuaEntity.copy_settings, which copies
 -- recipes, filters, requests, combinator settings and the rest the game knows how to.
 function M.paste_settings(cmd)
@@ -391,8 +615,28 @@ function M.paste_settings(cmd)
   local source = target(c, { u = f[1], p = f[2], x = f[3], y = f[4] })
   local dest = target(c, cmd)
   if not (source and dest) then
-    return puppet.message("Nothing to paste to")
+    if cmd.drag ~= 1 then
+      transport.send_now({ t = "ui_sfx", s = "cannot-build" })
+      puppet.message("Nothing to paste to")
+    end
+    return
   end
+  -- Unlimited reach by default (like Factorio 2.0/2.1); restore old reach check with paste_reach_limit.
+  if perf.on("paste_reach_limit") == true then
+    for _, e in ipairs({ source, dest }) do
+      if e.type ~= "entity-ghost" and not puppet.remote_view(c) and not puppet.can_reach(c, e) then
+        return puppet.message("Out of reach")
+      end
+    end
+  end
+  if not paste_compatible(source, dest) then
+    if cmd.drag ~= 1 then
+      transport.send_now({ t = "ui_sfx", s = "cannot-build" })
+      puppet.message("Can't paste those settings here")
+    end
+    return
+  end
+  local before_sig = paste_sig(dest)
   -- As the player when there is one, so mods get on_entity_settings_pasted (as_player.lua).
   local by = as_player.by(c)
   local ok, removed = pcall(function()
@@ -401,15 +645,40 @@ function M.paste_settings(cmd)
     end
     return dest.copy_settings(source)
   end)
-  if not ok then
-    return puppet.message("Can't paste those settings here")
+  local rotated = false
+  if (ok or inner_type(source) == inner_type(dest)) and dest.rotatable and source.direction ~= dest.direction
+      and paste_compatible_rotation(source, dest) then
+    local prev_dir = dest.direction
+    local ok_rot = pcall(function()
+      dest.direction = source.direction
+      if dest.direction ~= source.direction or rotation_collides(dest, prev_dir) then
+        dest.direction = prev_dir
+      end
+    end)
+    if ok_rot and dest.direction == source.direction then
+      rotated = true
+    else
+      pcall(function() dest.direction = prev_dir end)
+    end
+  end
+  if not ok and not rotated then
+    if cmd.drag ~= 1 then
+      transport.send_now({ t = "ui_sfx", s = "cannot-build" })
+      puppet.message("Can't paste those settings here")
+    end
+    return
+  end
+  local has_removed = type(removed) == "table" and next(removed) ~= nil
+  if not rotated and not has_removed and paste_sig(dest) == before_sig then
+    return
   end
   -- Items the old settings held (an assembler's ingredients) come back to the character.
-  for _, stack in pairs(removed or {}) do
+  for _, stack in pairs(ok and removed or {}) do
     give(c, { name = stack.name, count = stack.count, quality = stack.quality })
   end
   tracker.changed(dest)
   screens.refresh()
+  transport.send_now({ t = "ui_sfx", s = "entity-settings-pasted" })
 end
 
 -- {u, p, x, y, v}: flips an entity (2.x `mirroring`); a vertical flip also turns it half way.
@@ -418,6 +687,9 @@ function M.flip(cmd)
   local e = c and target(c, cmd)
   if not e then
     return
+  end
+  if e.type ~= "entity-ghost" and not puppet.remote_view(c) and not puppet.can_reach(c, e) then
+    return puppet.message("Out of reach")
   end
   local ok = pcall(function()
     local before = e.mirroring
@@ -451,7 +723,144 @@ local function area_of(cmd)
   return world.area_in(cmd)
 end
 
--- The clipboard's entities for the client to draw while pasting: [[proto id, x, y, d], ...],
+local fluid_connections
+
+local function clip_signal_name(f)
+  if type(f) ~= "table" then
+    return type(f) == "string" and f ~= "" and f or nil
+  end
+  local v = f.value or f
+  if type(v) == "table" then
+    local name = v.name
+    if type(name) == "string" and name ~= "" then
+      return name
+    end
+  end
+  local name = f.name
+  return type(name) == "string" and name ~= "" and name or nil
+end
+
+local function clip_extra(b, proto)
+  local x = {}
+  local t = proto.type
+  if t == "underground-belt" or t == "linked-belt" then
+    x.u = b.type == "output" and "o" or "i"
+  end
+  if b.mirror then
+    x.f = 1
+  end
+  local rname = type(b.recipe) == "table" and b.recipe.name or b.recipe
+  if type(rname) == "string" and rname ~= "" then
+    x.ai = { "recipe", rname }
+    if t == "assembling-machine" or t == "furnace" then
+      local ok_r, rec_proto = pcall(function() return prototypes.recipe[rname] end)
+      if ok_r and rec_proto then
+        local mask = 0
+        local in_fluids, out_fluids = {}, {}
+        for _, ing in pairs(rec_proto.ingredients or {}) do
+          if ing.type == "fluid" then
+            mask = bit32.bor(mask, 1)
+            in_fluids[#in_fluids + 1] = ing.name
+          end
+        end
+        for _, prod in pairs(rec_proto.products or {}) do
+          if prod.type == "fluid" then
+            mask = bit32.bor(mask, 2)
+            out_fluids[#out_fluids + 1] = prod.name
+          end
+        end
+        if mask > 0 then
+          x.fa = mask
+          local conns = fluid_connections and fluid_connections(proto) or nil
+          if conns then
+            local fc = {}
+            local ii, oi = 1, 1
+            for _, c in ipairs(conns) do
+              if not ((c[4] == "i" and bit32.band(mask, 1) == 0) or (c[4] == "o" and bit32.band(mask, 2) == 0)) then
+                local fl = ""
+                if c[4] == "i" and in_fluids[ii] then
+                  fl = in_fluids[ii]
+                  ii = ii + 1
+                elseif c[4] == "o" and out_fluids[oi] then
+                  fl = out_fluids[oi]
+                  oi = oi + 1
+                elseif c[4] == "b" then
+                  fl = in_fluids[1] or out_fluids[1] or ""
+                end
+                fc[#fc + 1] = { c[1], c[2], c[3], c[4], fl }
+              end
+            end
+            if #fc > 0 then
+              x.fc = fc
+            end
+          end
+        end
+      end
+    end
+  elseif type(b.filters) == "table" then
+    local names = {}
+    for _, f in pairs(b.filters) do
+      local name = clip_signal_name(f)
+      if name then
+        names[#names + 1] = name
+      end
+    end
+    if #names > 0 then
+      local first = table.remove(names, 1)
+      x.ai = { "item", first, #names > 0 and names or nil }
+    end
+  elseif b.filter ~= nil then
+    local fname = clip_signal_name(b.filter)
+    if fname then
+      x.ai = { "item", fname }
+    end
+  elseif type(b.request_filters) == "table" then
+    local names, seen = {}, {}
+    local rf = b.request_filters
+    local sections = rf.sections or { { filters = rf } }
+    for _, sec in pairs(sections) do
+      if type(sec) == "table" and sec.active ~= false then
+        for _, f in pairs(sec.filters or {}) do
+          local name = clip_signal_name(f)
+          if name and not seen[name] then
+            seen[name] = true
+            names[#names + 1] = name
+            if #names >= 4 then
+              break
+            end
+          end
+        end
+      end
+      if #names >= 4 then
+        break
+      end
+    end
+    if #names > 0 then
+      local first = table.remove(names, 1)
+      x.ai = { "item", first, #names > 0 and names or nil }
+    end
+  end
+  if not x.ai and type(b.items) == "table" then
+    local names, seen = {}, {}
+    for k, v in pairs(b.items) do
+      local name = type(k) == "string" and k or (type(v) == "table" and ((v.id and v.id.name) or v.name))
+      if type(name) == "string" and name ~= "" and not seen[name] then
+        seen[name] = true
+        names[#names + 1] = name
+        if #names >= 4 then
+          break
+        end
+      end
+    end
+    if #names > 0 then
+      local first = table.remove(names, 1)
+      x.ai = { "item", first, #names > 0 and names or nil }
+    end
+  end
+  return next(x) and x or nil
+end
+
+-- The clipboard's entities for the client to draw while pasting: [[proto id, x, y, d, extra?], ...],
 -- positions relative to the blueprint's centre in 1/256 tiles.
 -- The blueprint keeps the copied entities at their map positions (2.1.23), so they are moved to
 -- be around the middle of their footprints, where Factorio holds a blueprint at the cursor.
@@ -469,7 +878,12 @@ local function send_clip(bp)
       end
       x1, x2 = math.min(x1, b.position.x - w / 2), math.max(x2, b.position.x + w / 2)
       y1, y2 = math.min(y1, b.position.y - h / 2), math.max(y2, b.position.y + h / 2)
-      l[#l + 1] = { id, b.position.x, b.position.y, b.direction or 0 }
+      local entry = { id, b.position.x, b.position.y, b.direction or 0 }
+      local extra = clip_extra(b, proto)
+      if extra then
+        entry[5] = extra
+      end
+      l[#l + 1] = entry
     end
   end
   local cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -862,7 +1276,7 @@ end
 -- Fluid connections drawn as arrows on hover (`fb`), or nil. Pipes, tanks, valves and fluid wagons show none.
 local NO_FLUID_ARROWS = { pipe = true, ["pipe-to-ground"] = true, ["infinity-pipe"] = true, ["storage-tank"] = true,
   valve = true, ["fluid-wagon"] = true }
-local function fluid_connections(proto)
+fluid_connections = function(proto)
   if NO_FLUID_ARROWS[proto.type] then
     return nil
   end
@@ -1011,6 +1425,28 @@ local function overlay(proto)
   -- The tiles it must stand on and keep off (tile_buildability_rules: an offshore pump's water in
   -- front and land under it), for the build cursor's red and green tiles (I10).
   x.tb = tile_rules(proto)
+  -- What the build cursor needs to colour a placement as the game does (bughunt build2): its fast-replace group
+  -- (a big pole isn't a small pole's, a long-handed inserter isn't an inserter's, a rail chain signal is a rail signal's),
+  -- its collision box when it isn't its selection box (a tree's crown is selectable, not solid), and whether water
+  -- under it stops it (a chest on a lake).
+  local okg, fg = pcall(function() return proto.fast_replaceable_group end)
+  x.fg = okg and type(fg) == "string" and fg ~= "" and fg or nil
+  local okb, cbx, sbx = pcall(function() return proto.collision_box, proto.selection_box end)
+  if okb and cbx and cbx.left_top and cbx.right_bottom and (cbx.right_bottom.x - cbx.left_top.x) > 0 then
+    local sb = sbx and sbx.left_top and sbx.right_bottom and (sbx.right_bottom.x - sbx.left_top.x) > 0 and sbx or nil
+    if sb and (math.abs(cbx.left_top.x - sb.left_top.x) > 0.05 or math.abs(cbx.left_top.y - sb.left_top.y) > 0.05
+      or math.abs(cbx.right_bottom.x - sb.right_bottom.x) > 0.05 or math.abs(cbx.right_bottom.y - sb.right_bottom.y) > 0.05) then
+      local function r2(v) return math.floor(v * 100 + 0.5) / 100 end
+      x.cb = { r2(cbx.left_top.x), r2(cbx.left_top.y), r2(cbx.right_bottom.x), r2(cbx.right_bottom.y) }
+    end
+  end
+  local okm, mask = pcall(function() return proto.collision_mask end)
+  if okm and type(mask) == "table" and type(mask.layers) == "table" and mask.layers.water_tile and t ~= "tree" and t ~= "cliff" then
+    local oki, items = pcall(function() return proto.items_to_place_this end)
+    if oki and items and #items > 0 then
+      x.wb = 1
+    end
+  end
   -- Its own mining sound, the one each swing of the character's hand plays (J11, mining_sounds.lua).
   x.ms = mining_sounds.of(proto.name)
   -- Where Alt-mode draws its own icon and the rows of its modules and a lab's science packs (K1, K2).
@@ -1029,6 +1465,12 @@ local function overlay(proto)
   end
   if x.fb and ((ok and off) or drill_input) then
     x.fo = 1
+  end
+  if t == "ammo-turret" or t == "electric-turret" or t == "fluid-turret" or t == "artillery-turret" then
+    local okt, tbd = pcall(function() return proto.turret_base_has_direction end)
+    if okt and tbd == true then
+      x.tbd = 1
+    end
   end
   return next(x) and x or nil
 end

@@ -35,17 +35,20 @@ func _run() -> void:
 
 	var shaders_was: Array[Shader] = ShaderWarmup.shaders.duplicate()
 	var mode_was := ShaderWarmup.mode
+	var compile_mode_was := ShaderWarmup.compile_mode
 	var msec_was := ShaderWarmup.warmed_msec
 	var boot_was := ShaderWarmup.handled_by_boot
 	var render_done_was := RenderWarm.done
 
 	_test_collect_paths()
+	_test_weights_and_interleave()
 	await _test_shader_warmup_staged(holder)
 	await _test_shader_warmup_legacy(holder)
 	await _test_render_warm(holder)
 
 	ShaderWarmup.shaders = shaders_was
 	ShaderWarmup.mode = mode_was
+	ShaderWarmup.compile_mode = compile_mode_was
 	ShaderWarmup.warmed_msec = msec_was
 	ShaderWarmup.handled_by_boot = boot_was
 	RenderWarm.done = render_done_was
@@ -118,7 +121,47 @@ func _test_collect_paths() -> void:
 		"collect_paths(false) does not scan extra_dirs")
 
 
+func _test_weights_and_interleave() -> void:
+	var inc_cache := {}
+	var fm_info := ShaderWarmup._estimate_shader_info("res://shaders/factorio_material.gdshader", inc_cache)
+	var wire_info := ShaderWarmup._estimate_shader_info("res://shaders/wire.gdshader", inc_cache)
+	var fm_w := float(fm_info.get("weight", 0.0))
+	var wire_w := float(wire_info.get("weight", 0.0))
+	_check(bool(fm_info.get("heavy", false)) and fm_w >= ShaderWarmup.HEAVY_WEIGHT_THRESHOLD,
+		"factorio_material.gdshader is flagged heavy (weight=%.1f)" % fm_w)
+	_check(not bool(wire_info.get("heavy", true)) and wire_w < fm_w,
+		"wire.gdshader is light and lighter than factorio_material (%.1f < %.1f)" % [wire_w, fm_w])
+
+	var canvas_tmp := "user://staged_warmup_weight_canvas.gdshader"
+	_write_text(canvas_tmp, "shader_type canvas_item;\nvoid fragment() { COLOR = vec4(1.0); }\n")
+	var canvas_info := ShaderWarmup._estimate_shader_info(canvas_tmp, inc_cache)
+	_check(not bool(canvas_info.get("heavy", true)) and float(canvas_info.get("weight", 1.0)) <= 0.2,
+		"canvas_item shader gets minimal weight (%.2f)" % float(canvas_info.get("weight", 1.0)))
+
+	# Interleaving spreads heavy shaders out instead of clustering them consecutively.
+	var items: Array[ShaderWarmup._WorkItem] = []
+	for i in 12:
+		items.append(ShaderWarmup._WorkItem.new(ShaderWarmup._ItemKind.SHADER, "res://a%d.gdshader" % i, "a%d" % i, 2.0, false))
+	for i in 4:
+		items.append(ShaderWarmup._WorkItem.new(ShaderWarmup._ItemKind.SHADER, "res://h%d.gdshader" % i, "h%d" % i, 50.0, true))
+	var mixed := ShaderWarmup._interleave_heavy(items)
+	var max_consec_heavy := 0
+	var cur_consec := 0
+	var first_heavy_idx := -1
+	for i in mixed.size():
+		if mixed[i].is_heavy:
+			if first_heavy_idx == -1:
+				first_heavy_idx = i
+			cur_consec += 1
+			max_consec_heavy = maxi(max_consec_heavy, cur_consec)
+		else:
+			cur_consec = 0
+	_check(mixed.size() == items.size() and max_consec_heavy == 1 and first_heavy_idx >= 0 and first_heavy_idx <= 5,
+		"interleave spreads heavy items (first=%d, max_consec=%d, total=%d)" % [first_heavy_idx, max_consec_heavy, mixed.size()])
+
+
 func _test_shader_warmup_staged(holder: Node3D) -> void:
+	ShaderWarmup.compile_mode = "safe"
 	ShaderWarmup.shaders.clear()
 	ShaderWarmup.warmed_msec = -1
 	ShaderWarmup.handled_by_boot = false
@@ -135,16 +178,20 @@ func _test_shader_warmup_staged(holder: Node3D) -> void:
 	_check(staged.done_count == 0, "begin_staged starts with done_count == 0")
 	_check(staged.total_count == expected_paths.size() + 2,
 		"begin_staged total_count matches collected paths + 2 (%d vs %d)" % [staged.total_count, expected_paths.size() + 2])
+	_check(staged.total_weight > float(staged.total_count),
+		"begin_staged computes weighted total_weight > total_count (%.1f > %d)" % [staged.total_weight, staged.total_count])
+	_check(is_equal_approx(staged.progress_fraction(), 0.0), "begin_staged starts with progress_fraction() == 0.0")
 	_check(staged.get_child_count() == 0, "begin_staged does not synchronously create children in _ready()")
 	_check(ShaderWarmup.shaders.is_empty(), "begin_staged does not synchronously load shaders in _ready()")
 	_check(ShaderWarmup.warmed_msec == -1, "warmed_msec stays -1 until staged warmup finishes")
 
 	var frames := 0
 	var max_batches := 0
+	var max_heavy_concurrent := 0
 	var prev_done := 0
+	var prev_frac := 0.0
 	var monotonic := true
-	var saw_standard := false
-	var saw_special := false
+	var frac_monotonic := true
 	while not staged.is_done() and frames < 1000:
 		await process_frame
 		frames += 1
@@ -152,23 +199,28 @@ func _test_shader_warmup_staged(holder: Node3D) -> void:
 		if dc < prev_done:
 			monotonic = false
 		prev_done = dc
+		var pf := staged.progress_fraction()
+		if pf + 0.0001 < prev_frac:
+			frac_monotonic = false
+		prev_frac = pf
 		var ch := staged.get_child_count()
 		if ch > max_batches:
 			max_batches = ch
-		var lbl := staged.current_label
-		if lbl == "Standard materials":
-			saw_standard = true
-		elif lbl == "Terrain & far chunks":
-			saw_special = true
+		var active_heavy := 0
+		for b in staged._active_batches:
+			if b.is_heavy:
+				active_heavy += 1
+		max_heavy_concurrent = maxi(max_heavy_concurrent, active_heavy)
 
 	_check(staged.is_done(), "begin_staged reaches is_done() == true within frame limit (%d frames)" % frames)
 	_check(frames > ShaderWarmup.STAGED_WARM_FRAMES + 1, "begin_staged steps across multiple frames (%d frames)" % frames)
-	_check(staged.max_active_batches >= ShaderWarmup.COLD_MAX_ACTIVE_MIN,
-		"cold begin_staged scales max_active_batches (%d >= %d)" % [staged.max_active_batches, ShaderWarmup.COLD_MAX_ACTIVE_MIN])
+	_check(staged.max_active_batches >= ShaderWarmup.COLD_MAX_ACTIVE_MIN and staged.max_active_batches <= ShaderWarmup.COLD_MAX_ACTIVE_MAX,
+		"safe cold begin_staged caps max_active_batches (%d in %d..%d)" % [staged.max_active_batches, ShaderWarmup.COLD_MAX_ACTIVE_MIN, ShaderWarmup.COLD_MAX_ACTIVE_MAX])
 	_check(max_batches <= staged.max_active_batches,
 		"begin_staged keeps active batches within max_active_batches (%d <= %d)" % [max_batches, staged.max_active_batches])
-	_check(monotonic, "begin_staged done_count advances monotonically")
-	_check(saw_standard and saw_special, "begin_staged updates current_label for standard materials and terrain/far chunks")
+	_check(max_heavy_concurrent <= 1, "safe cold begin_staged serializes heavy shaders (%d <= 1)" % max_heavy_concurrent)
+	_check(monotonic and frac_monotonic and is_equal_approx(staged.progress_fraction(), 1.0),
+		"begin_staged done_count and progress_fraction() advance monotonically to 1.0")
 	_check(staged.done_count == staged.total_count,
 		"begin_staged finishes with done_count == total_count (%d/%d)" % [staged.done_count, staged.total_count])
 	_check(staged.get_child_count() == 0, "begin_staged frees all temporary batch nodes on completion (%d left)" % staged.get_child_count())
@@ -189,15 +241,38 @@ func _test_shader_warmup_staged(holder: Node3D) -> void:
 	staged.queue_free()
 	await process_frame
 
+	# Verify background_throttle = true completes cleanly without stalling.
+	ShaderWarmup.warmed_msec = -1
+	var bg: ShaderWarmup = ShaderWarmup.begin_staged(holder, true, [], 16) as ShaderWarmup
+	bg.background_throttle = true
+	var bg_frames := 0
+	while not bg.is_done() and bg_frames < 1000:
+		await process_frame
+		bg_frames += 1
+	_check(bg.is_done() and bg.done_count == bg.total_count and bg.get_child_count() == 0,
+		"background_throttle=true finishes cleanly without starving (%d frames)" % bg_frames)
+	bg.queue_free()
+	await process_frame
+
 	# Verify budget_ms = 0 still guarantees progress (>= 1 item/frame) and completes cleanly.
 	ShaderWarmup.warmed_msec = -1
 	var tight: ShaderWarmup = ShaderWarmup.begin_staged(holder, false, [], 0) as ShaderWarmup
 	var tight_frames := 0
+	# One item a frame here, so the label read each frame is every item's: with a budget, the last few
+	# items (standard materials, then terrain & far chunks) can share a frame and the first is never seen.
+	var saw_standard := false
+	var saw_special := false
 	while not tight.is_done() and tight_frames < 500:
 		await process_frame
 		tight_frames += 1
+		var lbl := tight.current_label
+		if lbl == "Standard materials":
+			saw_standard = true
+		elif lbl == "Terrain & far chunks":
+			saw_special = true
 	_check(tight.is_done() and tight.get_child_count() == 0 and tight.done_count == tight.total_count,
 		"begin_staged with budget_ms=0 still advances >= 1 item/frame and frees batches (%d frames)" % tight_frames)
+	_check(saw_standard and saw_special, "begin_staged updates current_label for standard materials and terrain/far chunks")
 	tight.queue_free()
 	await process_frame
 
@@ -213,6 +288,20 @@ func _test_shader_warmup_staged(holder: Node3D) -> void:
 	_check(warm.is_done() and warm.get_child_count() == 0 and warm.done_count == warm.total_count,
 		"warm begin_staged finishes cleanly and frees batches (%d frames)" % warm_frames)
 	warm.queue_free()
+	await process_frame
+
+	# Verify --shader-compile=fast restores legacy concurrency limits.
+	ShaderWarmup.compile_mode = "fast"
+	var fast_cold: ShaderWarmup = ShaderWarmup.begin_staged(holder, true, [], 35) as ShaderWarmup
+	var fast_warm: ShaderWarmup = ShaderWarmup.begin_staged(holder, false, [], 50) as ShaderWarmup
+	_check(fast_cold.max_active_batches >= ShaderWarmup.FAST_COLD_MAX_ACTIVE_MIN
+		and fast_cold.max_active_batches <= ShaderWarmup.FAST_COLD_MAX_ACTIVE_MAX,
+		"--shader-compile=fast uses legacy cold concurrency (%d)" % fast_cold.max_active_batches)
+	_check(fast_warm.max_active_batches == ShaderWarmup.FAST_WARM_MAX_ACTIVE,
+		"--shader-compile=fast uses FAST_WARM_MAX_ACTIVE (%d == %d)" % [fast_warm.max_active_batches, ShaderWarmup.FAST_WARM_MAX_ACTIVE])
+	fast_cold.queue_free()
+	fast_warm.queue_free()
+	ShaderWarmup.compile_mode = "safe"
 	await process_frame
 
 

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 using namespace godot;
@@ -164,6 +165,10 @@ Array result(Out *outs, int count, const PackedFloat32Array &wr, const PackedFlo
 } // namespace
 
 Array InserterArmsNative::sprite_arms(const PackedFloat32Array &inp, const PackedInt32Array &caps, const PackedFloat32Array &params) const {
+	return sprite_arms_impl(inp, caps, params);
+}
+
+Array InserterArmsNative::sprite_arms_impl(const PackedFloat32Array &inp, const PackedInt32Array &caps, const PackedFloat32Array &params) {
 	const int n = inp.size() / 6;
 	Out outs[3];
 	for (int i = 0; i < 3; i++) {
@@ -228,6 +233,10 @@ Array InserterArmsNative::sprite_arms(const PackedFloat32Array &inp, const Packe
 }
 
 Array InserterArmsNative::model_arms(const PackedFloat32Array &inp, const PackedInt32Array &caps, const PackedFloat32Array &params) const {
+	return model_arms_impl(inp, caps, params);
+}
+
+Array InserterArmsNative::model_arms_impl(const PackedFloat32Array &inp, const PackedInt32Array &caps, const PackedFloat32Array &params) {
 	const int n = inp.size() / 5;
 	Out outs[3];
 	for (int i = 0; i < 3; i++) {
@@ -275,6 +284,10 @@ Array InserterArmsNative::model_arms(const PackedFloat32Array &inp, const Packed
 }
 
 Array InserterArmsNative::basic_arms(const PackedFloat32Array &inp, const PackedInt32Array &caps, const PackedFloat32Array &params) const {
+	return basic_arms_impl(inp, caps, params);
+}
+
+Array InserterArmsNative::basic_arms_impl(const PackedFloat32Array &inp, const PackedInt32Array &caps, const PackedFloat32Array &params) {
 	const int n = inp.size() / 8;
 	Out outs[6];
 	for (int i = 0; i < 6; i++) {
@@ -324,6 +337,10 @@ Array InserterArmsNative::basic_arms(const PackedFloat32Array &inp, const Packed
 }
 
 Array InserterArmsNative::rig_arms(const PackedFloat32Array &inp, const PackedInt32Array &caps, const PackedFloat32Array &params) const {
+	return rig_arms_impl(inp, caps, params);
+}
+
+Array InserterArmsNative::rig_arms_impl(const PackedFloat32Array &inp, const PackedInt32Array &caps, const PackedFloat32Array &params) {
 	const int n = inp.size() / 17;
 	Out outs[5];
 	for (int i = 0; i < 5; i++) {

@@ -40,6 +40,20 @@ const TIER_SCALE := {
 	"behemoth-worm-turret": 1.90,
 	"biter-spawner": 2.1,
 	"spitter-spawner": 2.1,
+	"small-wriggler-pentapod": 0.65,
+	"medium-wriggler-pentapod": 0.85,
+	"big-wriggler-pentapod": 1.10,
+	"small-wriggler-pentapod-premature": 0.65,
+	"medium-wriggler-pentapod-premature": 0.85,
+	"big-wriggler-pentapod-premature": 1.10,
+	"small-strafer-pentapod": 1.05,
+	"medium-strafer-pentapod": 1.35,
+	"big-strafer-pentapod": 1.70,
+	"small-stomper-pentapod": 1.55,
+	"medium-stomper-pentapod": 2.00,
+	"big-stomper-pentapod": 2.50,
+	"gleba-spawner": 2.15,
+	"gleba-spawner-small": 1.25,
 }
 const TIER_CHITIN := {
 	"small-biter": Color(0.28, 0.22, 0.18),
@@ -56,6 +70,20 @@ const TIER_CHITIN := {
 	"behemoth-worm-turret": Color(0.27, 0.21, 0.13),
 	"biter-spawner": Color(0.34, 0.22, 0.20),
 	"spitter-spawner": Color(0.38, 0.22, 0.24),
+	"small-wriggler-pentapod": Color(0.36, 0.42, 0.18),
+	"medium-wriggler-pentapod": Color(0.42, 0.34, 0.18),
+	"big-wriggler-pentapod": Color(0.38, 0.28, 0.18),
+	"small-wriggler-pentapod-premature": Color(0.36, 0.42, 0.18),
+	"medium-wriggler-pentapod-premature": Color(0.42, 0.34, 0.18),
+	"big-wriggler-pentapod-premature": Color(0.38, 0.28, 0.18),
+	"small-strafer-pentapod": Color(0.42, 0.39, 0.28),
+	"medium-strafer-pentapod": Color(0.44, 0.40, 0.30),
+	"big-strafer-pentapod": Color(0.48, 0.44, 0.32),
+	"small-stomper-pentapod": Color(0.44, 0.38, 0.39),
+	"medium-stomper-pentapod": Color(0.48, 0.42, 0.43),
+	"big-stomper-pentapod": Color(0.52, 0.46, 0.47),
+	"gleba-spawner": Color(0.48, 0.42, 0.22),
+	"gleba-spawner-small": Color(0.46, 0.40, 0.20),
 }
 const GORE_MULT := {
 	"low": 0.45,
@@ -98,6 +126,7 @@ var batch_decals := true
 var _decals_dirty := false
 var _nat: Object = null
 var _nat_tried := false
+var _last_meat_gleba := false
 
 
 func _init(a, root: Node3D) -> void:
@@ -142,6 +171,16 @@ func _emit_droplet(d: Dictionary) -> void:
 	_droplets.append(d)
 
 
+func _is_gleba(proto: String) -> bool:
+	return (
+		proto.contains("-wriggler-pentapod")
+		or proto.ends_with("-strafer-pentapod")
+		or proto.ends_with("-stomper-pentapod")
+		or proto == "gleba-spawner"
+		or proto == "gleba-spawner-small"
+	)
+
+
 func _is_supported(proto: String) -> bool:
 	return (
 		proto.ends_with("-biter")
@@ -149,11 +188,12 @@ func _is_supported(proto: String) -> bool:
 		or proto.ends_with("-worm-turret")
 		or proto == "biter-spawner"
 		or proto == "spitter-spawner"
+		or _is_gleba(proto)
 	)
 
 
 func _is_spawner(proto: String) -> bool:
-	return proto == "biter-spawner" or proto == "spitter-spawner"
+	return proto == "biter-spawner" or proto == "spitter-spawner" or proto == "gleba-spawner" or proto == "gleba-spawner-small"
 
 
 func on_damaged(info: Dictionary) -> void:
@@ -181,7 +221,7 @@ func on_damaged(info: Dictionary) -> void:
 	var count: int = maxi(1, int(roundf(base_count * mult)))
 	var gh: float = float(api.creatures.ground_height(pos.x, pos.z))
 	var origin: Vector3 = Vector3(pos.x, maxf(pos.y, gh) + 0.40 * t_scale, pos.z)
-	_spawn_droplet_burst(origin, dir, count, 3.2, 6.8, t_scale, 0.65)
+	_spawn_droplet_burst(origin, dir, count, 3.2, 6.8, t_scale, 0.65, _is_gleba(proto))
 
 
 func on_died(info: Dictionary) -> void:
@@ -213,7 +253,9 @@ func on_died(info: Dictionary) -> void:
 		or damage_type == "laser"
 		or damage_type == "electric"
 	)
+	var is_gleba: bool = _is_gleba(proto)
 	var is_spawner: bool = _is_spawner(proto)
+	var is_stomper: bool = proto.ends_with("-stomper-pentapod")
 	var is_split: bool = is_explosive_src or (not is_non_dismember and dmg >= 850)
 	var is_heavy: bool = not is_non_dismember and (damage_type == "impact" or dmg >= 450 or src.contains("shotgun"))
 
@@ -223,7 +265,7 @@ func on_died(info: Dictionary) -> void:
 	var base_drops: float = 14.0
 	var speed_hi: float = 8.5
 	var splat_mul: float = 0.75
-	if is_spawner:
+	if is_spawner or is_stomper:
 		base_drops = 34.0 if is_split else 28.0
 		speed_hi = 12.2
 		splat_mul = 1.10
@@ -251,13 +293,13 @@ func on_died(info: Dictionary) -> void:
 	var origin: Vector3 = Vector3(pos.x, maxf(pos.y, gh) + 0.45 * t_scale, pos.z)
 	if blood_amount > 0.001:
 		var count: int = maxi(1, int(roundf(base_drops * b_mult * lite_mul)))
-		var spread: float = 1.45 if is_spawner else (0.95 if is_split else 0.85)
-		_spawn_droplet_burst(origin, dir, count, 3.0, speed_hi, t_scale, spread)
+		var spread: float = 1.45 if (is_spawner or is_stomper) else (0.95 if is_split else 0.85)
+		_spawn_droplet_burst(origin, dir, count, 3.0, speed_hi, t_scale, spread, is_gleba)
 
-		# Immediate ground splatter under the kill point (plus radial splatters on nests and explosive splits).
+		# Immediate ground splatter under the kill point (plus radial splatters on nests, stompers and explosive splits).
 		var decal_scale: float = clampf(0.5 + 0.5 * blood_amount, 0.4, 1.5)
-		_add_decal(Vector3(pos.x, gh, pos.z), splat_mul * t_scale * decal_scale, 1.0 + _rng.randf_range(0.0, 0.45), _rng.randf_range(0.0, TAU), _ichor_color(0.85))
-		if is_spawner:
+		_add_decal(Vector3(pos.x, gh, pos.z), splat_mul * t_scale * decal_scale, 1.0 + _rng.randf_range(0.0, 0.45), _rng.randf_range(0.0, TAU), _ichor_color(0.85, is_gleba))
+		if is_spawner or is_stomper:
 			var radial_n: int = _rng.randi_range(3, 4)
 			for si in radial_n:
 				var sa: float = (TAU * float(si) / float(radial_n)) + _rng.randf_range(-0.35, 0.35)
@@ -265,7 +307,7 @@ func on_died(info: Dictionary) -> void:
 				var sx: float = pos.x + cos(sa) * sr
 				var sz: float = pos.z + sin(sa) * sr
 				var sgh: float = float(api.creatures.ground_height(sx, sz))
-				_add_decal(Vector3(sx, sgh, sz), _rng.randf_range(0.55, 0.88) * t_scale * decal_scale, 1.2 + _rng.randf_range(0.0, 0.6), sa, _ichor_color(0.84))
+				_add_decal(Vector3(sx, sgh, sz), _rng.randf_range(0.55, 0.88) * t_scale * decal_scale, 1.2 + _rng.randf_range(0.0, 0.6), sa, _ichor_color(0.84, is_gleba))
 		elif is_split:
 			for _si in 2:
 				var sa: float = _rng.randf_range(0.0, TAU)
@@ -273,24 +315,33 @@ func on_died(info: Dictionary) -> void:
 				var sx: float = pos.x + cos(sa) * sr
 				var sz: float = pos.z + sin(sa) * sr
 				var sgh: float = float(api.creatures.ground_height(sx, sz))
-				_add_decal(Vector3(sx, sgh, sz), _rng.randf_range(0.45, 0.72) * t_scale * decal_scale, 1.2 + _rng.randf_range(0.0, 0.6), sa, _ichor_color(0.82))
+				_add_decal(Vector3(sx, sgh, sz), _rng.randf_range(0.45, 0.72) * t_scale * decal_scale, 1.2 + _rng.randf_range(0.0, 0.6), sa, _ichor_color(0.82, is_gleba))
 
-	# Explosive / overkill / heavy / spawner gib shards.
-	if gibs_enabled and (is_split or is_heavy or is_spawner):
-		var base_gibs: float = (14.0 + 3.0 * t_scale) if is_spawner else ((9.0 + 3.0 * t_scale) if is_split else (6.0 + 2.5 * t_scale))
+	# Explosive / overkill / heavy / spawner / stomper gib shards.
+	if gibs_enabled and (is_split or is_heavy or is_spawner or is_stomper):
+		var base_gibs: float = (14.0 + 3.0 * t_scale) if (is_spawner or is_stomper) else ((9.0 + 3.0 * t_scale) if is_split else (6.0 + 2.5 * t_scale))
 		var gib_count: int = maxi(2, int(roundf(base_gibs * mult * lite_mul)))
 		var chitin: Color = TIER_CHITIN.get(proto, Color(0.22, 0.17, 0.16)) as Color
-		_spawn_gibs(origin, dir, gib_count, t_scale, chitin, is_split or is_spawner)
+		_spawn_gibs(origin, dir, gib_count, t_scale, chitin, is_split or is_spawner or is_stomper, is_gleba)
 
 
-func spawn_smear(pos: Vector3, impact_speed: float, scale: float) -> void:
+func spawn_smear(pos: Vector3, impact_speed: float, scale: float, is_gleba := false) -> void:
 	if not gore_enabled or blood_amount <= 0.001 or api == null:
 		return
 	var strength: float = clampf(impact_speed / 8.0, 0.35, 1.4)
 	var size: float = (0.45 + 0.35 * strength) * clampf(scale, 0.65, 1.8) * clampf(0.5 + 0.5 * blood_amount, 0.4, 1.5)
 	var stretch: float = 1.4 + strength * 0.9
 	var yaw: float = _rng.randf_range(0.0, TAU)
-	_add_decal(pos, size, stretch, yaw, _ichor_color(0.75))
+	_add_decal(pos, size, stretch, yaw, _ichor_color(0.75, is_gleba))
+
+
+func spawn_gleba_puddle(pos: Vector3, scale: float) -> void:
+	if not gore_enabled or blood_amount <= 0.001 or api == null:
+		return
+	var decal_scale: float = clampf(0.5 + 0.5 * blood_amount, 0.4, 1.5)
+	var size: float = clampf(scale * 1.15 * decal_scale, 0.55, 2.8)
+	var yaw: float = _rng.randf_range(0.0, TAU)
+	_add_decal(pos, size, _rng.randf_range(1.05, 1.35), yaw, _ichor_color(0.82, true))
 
 
 func spawn_decay_dust(pos: Vector3, scale: float) -> void:
@@ -988,7 +1039,7 @@ func _make_splatter_texture() -> ImageTexture:
 	return ImageTexture.create_from_image(img)
 
 
-func _spawn_droplet_burst(origin: Vector3, dir: Vector3, count: int, speed_lo: float, speed_hi: float, t_scale: float, spread: float) -> void:
+func _spawn_droplet_burst(origin: Vector3, dir: Vector3, count: int, speed_lo: float, speed_hi: float, t_scale: float, spread: float, is_gleba := false) -> void:
 	for _i in count:
 		var cone := Vector3(
 			dir.x + _rng.randf_range(-spread, spread),
@@ -1006,7 +1057,7 @@ func _spawn_droplet_burst(origin: Vector3, dir: Vector3, count: int, speed_lo: f
 			"vel": cone * spd,
 			"size": sz,
 			"age": 0.0,
-			"color": _ichor_color(1.0),
+			"color": _ichor_color(1.0, is_gleba),
 			"decal_chance": 0.45,
 		})
 	_droplets_mmi.visible = true
@@ -1135,7 +1186,8 @@ func _step_decals(dt: float) -> void:
 		_decals_mmi.visible = false
 
 
-func _spawn_gibs(origin: Vector3, dir: Vector3, count: int, t_scale: float, chitin: Color, explosive: bool) -> void:
+func _spawn_gibs(origin: Vector3, dir: Vector3, count: int, t_scale: float, chitin: Color, explosive: bool, is_gleba := false) -> void:
+	_last_meat_gleba = is_gleba
 	var scale_mul: float = clampf(t_scale, 0.7, 1.75)
 	for i in count:
 		var spread: float = 1.25 if explosive else 0.75
@@ -1159,7 +1211,7 @@ func _spawn_gibs(origin: Vector3, dir: Vector3, count: int, t_scale: float, chit
 		var col: Color
 		var sz: Vector3
 		if kind == GIB_MEAT:
-			col = _meat_color()
+			col = _meat_color(is_gleba)
 			sz = Vector3(
 				_rng.randf_range(0.16, 0.28),
 				_rng.randf_range(0.14, 0.25),
@@ -1198,6 +1250,7 @@ func _spawn_gibs(origin: Vector3, dir: Vector3, count: int, t_scale: float, chit
 			"ang": Vector3(_rng.randf_range(-12.0, 12.0), _rng.randf_range(-12.0, 12.0), _rng.randf_range(-12.0, 12.0)),
 			"size": sz,
 			"color": col,
+			"is_gleba": is_gleba,
 			"age": 0.0,
 			"bounces": 0,
 			"settled": false,
@@ -1255,7 +1308,7 @@ func _apply_native_events(ev: PackedFloat32Array) -> void:
 		if ev[k] < 0.5:
 			_add_decal(pos, ev[k + 4], ev[k + 5], yaw, Color(ev[k + 7], ev[k + 8], ev[k + 9], ev[k + 10]))
 		else:
-			_add_decal(pos, ev[k + 4], ev[k + 5], yaw, _ichor_color(0.68))
+			_add_decal(pos, ev[k + 4], ev[k + 5], yaw, _ichor_color(0.68, _last_meat_gleba))
 		k += 11
 
 
@@ -1310,7 +1363,7 @@ func _step_gibs(dt: float) -> void:
 				if kind == GIB_MEAT and bounces == 0 and absf(vel.y) > 1.4 and blood_amount > 0.001:
 					var smear_sz: float = clampf(maxf(sz.x, sz.z) * 1.45 * clampf(0.5 + 0.5 * blood_amount, 0.4, 1.5), 0.22, 0.52)
 					var smear_yaw: float = atan2(vel.x, vel.z) if (vel.x * vel.x + vel.z * vel.z) > 0.04 else _rng.randf_range(0.0, TAU)
-					_add_decal(Vector3(pos.x, gh, pos.z), smear_sz, 1.45, smear_yaw, _ichor_color(0.68))
+					_add_decal(Vector3(pos.x, gh, pos.z), smear_sz, 1.45, smear_yaw, _ichor_color(0.68, bool(g.get("is_gleba", false))))
 				var bounce_e: float = 0.20 if kind == GIB_MEAT else (0.34 if kind == GIB_SPIKE else 0.30)
 				var h_fric: float = 0.42 if kind == GIB_MEAT else (0.54 if kind == GIB_SPIKE else 0.50)
 				var a_damp: float = 0.40 if kind == GIB_MEAT else 0.48
@@ -1404,7 +1457,13 @@ func _away_dir(pos: Vector3, cause_pos: Variant) -> Vector3:
 	return Vector3(cos(a), 0.0, sin(a))
 
 
-func _ichor_color(brightness: float) -> Color:
+func _ichor_color(brightness: float, is_gleba := false) -> Color:
+	if is_gleba:
+		# Glossy olive-chartreuse Gleba pentapod hemolymph (sRGB).
+		var gr: float = clampf((0.28 + _rng.randf_range(-0.04, 0.08)) * brightness, 0.14, 0.42)
+		var gg: float = clampf((0.48 + _rng.randf_range(-0.06, 0.09)) * brightness, 0.24, 0.62)
+		var gb: float = clampf((0.09 + _rng.randf_range(-0.03, 0.04)) * brightness, 0.03, 0.18)
+		return Color(gr, gg, gb, 1.0)
 	# Deep, rich crimson-violet / dark purple biter ichor (sRGB).
 	var r: float = clampf((0.38 + _rng.randf_range(-0.07, 0.09)) * brightness, 0.16, 0.52)
 	var g: float = clampf((0.055 + _rng.randf_range(-0.02, 0.025)) * brightness, 0.015, 0.10)
@@ -1412,7 +1471,14 @@ func _ichor_color(brightness: float) -> Color:
 	return Color(r, g, b, 1.0)
 
 
-func _meat_color() -> Color:
+func _meat_color(is_gleba := false) -> Color:
+	if is_gleba:
+		return Color(
+			_rng.randf_range(0.20, 0.34),
+			_rng.randf_range(0.34, 0.48),
+			_rng.randf_range(0.08, 0.16),
+			1.0
+		)
 	# Wet dark crimson-violet organic flesh chunk tint (multiplied by crevice AO in COLOR_0).
 	return Color(
 		_rng.randf_range(0.30, 0.46),

@@ -19,6 +19,10 @@ const PlatformInfo := preload("res://scripts/ui/factorio/platform_info.gd")
 signal close_requested
 ## Reset: back to the character.
 signal reset_requested
+## Search: the map's tag search (map_view.gd).
+signal search_requested
+## Top-bar 2D/3D toggle button pressed.
+signal view_mode_toggled
 
 const BORDER := 4
 const TITLE_HEIGHT := 40
@@ -47,6 +51,7 @@ var left_bottom := 0.0
 var title_bar := PanelContainer.new()
 ## "Remote view", the title bar's caption.
 var title_label: Label
+var view_toggle: Button
 
 
 func _ready() -> void:
@@ -61,7 +66,19 @@ func _ready() -> void:
 	var bar := Kit.title_bar("Remote view", true)
 	title_label = bar.get_child(0) as Label
 	(bar.get_child(bar.get_child_count() - 1) as Button).pressed.connect(func() -> void: close_requested.emit())
-	for spec in [["Search", "icons/search.png", "Search the map", false], ["Reset", "icons/mip/reset-white.png", "Back to the character", true],
+	view_toggle = Button.new()
+	view_toggle.name = "ViewToggle"
+	view_toggle.theme_type_variation = "FFrameAction"
+	view_toggle.custom_minimum_size = Kit.pxv(68, 24)
+	view_toggle.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	view_toggle.focus_mode = Control.FOCUS_NONE
+	view_toggle.add_theme_color_override("font_color", Kit.WHITE)
+	view_toggle.add_theme_color_override("font_hover_color", Kit.BLACK)
+	view_toggle.add_theme_color_override("font_pressed_color", Kit.BLACK)
+	view_toggle.pressed.connect(func() -> void: view_mode_toggled.emit())
+	bar.add_child(view_toggle)
+	bar.move_child(view_toggle, bar.get_child_count() - 2)
+	for spec in [["Search", "icons/search.png", "Search the map", true], ["Reset", "icons/mip/reset-white.png", "Back to the character", true],
 			["Back", "icons/mip/backward-arrow.png", "Back", false], ["Forward", "icons/mip/forward-arrow.png", "Forward", false]]:
 		var b := Kit.close_button()
 		b.name = spec[0]
@@ -72,9 +89,12 @@ func _ready() -> void:
 		b.disabled = not spec[3]
 		if spec[0] == "Reset":
 			b.pressed.connect(func() -> void: reset_requested.emit())
+		elif spec[0] == "Search":
+			b.pressed.connect(func() -> void: search_requested.emit())
 		bar.add_child(b)
 		bar.move_child(b, bar.get_child_count() - 2)
 	title_bar.add_child(bar)
+	_sync_view_toggle()
 
 	info_panel.visible = false
 	add_child(info_panel)
@@ -96,11 +116,25 @@ func show_for(what: String) -> void:
 	visible = what != ""
 	if what != "":
 		mode = what
+	_sync_view_toggle()
+
+
+func _sync_view_toggle() -> void:
+	if view_toggle == null:
+		return
+	view_toggle.visible = not networks_open and mode != "space"
+	if mode == "map":
+		view_toggle.text = "3D view"
+		view_toggle.tooltip_text = "Switch to 3D remote view"
+	else:
+		view_toggle.text = "2D map"
+		view_toggle.tooltip_text = "Switch to 2D map view"
 
 
 func _process(_delta: float) -> void:
 	if not visible:
 		return
+	_sync_view_toggle()
 	var view := size
 	title_bar.size = Vector2(view.x, Kit.px(TITLE_HEIGHT))
 	title_bar.position = Vector2.ZERO
@@ -116,6 +150,8 @@ func _process(_delta: float) -> void:
 		var tb := title_bar.find_child(b, true, false) as Control
 		if tb != null:
 			tb.visible = not networks_open
+			if b == "Search":
+				(tb as Button).disabled = mode != "map"
 	if map_view != null and map_view.surfaces_panel.get_parent() == self:
 		map_view.surfaces_panel.visible = not networks_open and not map_view.model.map_surfaces.is_empty()
 		map_view.surfaces_panel.position = Vector2(Kit.px(BORDER) + Kit.px(4), maxf(Kit.px(TITLE_HEIGHT) + Kit.px(4), left_top))

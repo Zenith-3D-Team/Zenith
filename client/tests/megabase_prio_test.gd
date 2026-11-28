@@ -11,9 +11,24 @@ const MoversScript := preload("res://scripts/world/movers.gd")
 const FluidsPowerScript := preload("res://scripts/world/fluids_power.gd")
 const AltOverlayScript := preload("res://scripts/ui/factorio/alt_overlay.gd")
 const FxScript := preload("res://scripts/fx/fx.gd")
+const Kit := preload("res://scripts/ui/factorio/kit.gd")
 
 var passes := 0
 var fails := 0
+
+
+## Alt-mode's collect() as the next frames give it in play: icons not yet read (--alt-icons-later) are read on
+## workers, then their chunks built again (ui_test_base.gd's alt_collect).
+func alt_collect(overlay) -> void:
+	overlay.collect()
+	for _round in 8:
+		if (overlay.get("_icon_wait") as Dictionary).is_empty():
+			return
+		for job: Array in Kit._icon_jobs.values():
+			while not WorkerThreadPool.is_task_completed(job[0]):
+				OS.delay_usec(200)
+		overlay._poll_icons_later()
+		overlay.collect()
 
 
 func check(cond: bool, msg: String) -> void:
@@ -179,8 +194,12 @@ func _test_quality_marks_cache() -> void:
 func _test_inserter_arms_chunked() -> void:
 	var prev_rest: bool = InserterArmsScript.rest_arms
 	var prev_chunked: bool = InserterArmsScript.rest_arms_chunked
+	var prev_basic: bool = InserterArmsScript.rest_basic_live
 	InserterArmsScript.rest_arms = true
 	InserterArmsScript.rest_arms_chunked = true
+	# (The stick arms' per-chunk uploads: rel-031-restarms draws a model-less arm as its live placeholder arm by
+	# default, in the 3D rest MultiMeshes; --rest-arm-basic=stick keeps these.)
+	InserterArmsScript.rest_basic_live = false
 
 	var w := WorldMirror.new()
 	add_child(w)
@@ -215,6 +234,7 @@ func _test_inserter_arms_chunked() -> void:
 
 	InserterArmsScript.rest_arms = prev_rest
 	InserterArmsScript.rest_arms_chunked = prev_chunked
+	InserterArmsScript.rest_basic_live = prev_basic
 	arms.queue_free()
 	w.queue_free()
 
@@ -367,11 +387,19 @@ func _test_alt_overlay_cull_and_batch() -> void:
 
 	AltOverlayScript.icon_order = true
 	AltOverlayScript.flat_batch_marks = true
-	overlay.collect()
+	alt_collect(overlay)
 	check(overlay.drawn == 1,
 		"alt_overlay: frustum-culls off-screen fluid tank at (20,20), drawing %d in-view fluid" % overlay.drawn)
 
 	# Add a lab with mixed-rarity quality marks and force _flat mode via layer_cap = 1.
+	# The marks' pictures are Factorio's (quality/graphics/icons): without an install (CI's runners) two stand-ins,
+	# since what is checked is their order and batching, not their looks.
+	var SlotScript := preload("res://scripts/ui/factorio/slot.gd")
+	var stand_in_marks: Array[String] = []
+	for q in ["rare", "epic"]:
+		if SlotScript.quality_icon(q) == null:
+			SlotScript._quality_icons[q] = ImageTexture.create_from_image(Image.create(8, 8, false, Image.FORMAT_RGBA8))
+			stand_in_marks.append(q)
 	Bridge.set_alt_contents(true)
 	w._add([210, 42, 5 * 256, 5 * 256, 0])
 	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [
@@ -379,7 +407,7 @@ func _test_alt_overlay_cull_and_batch() -> void:
 	]})
 	AltOverlayScript.layer_cap = 1
 	overlay._layers_key = []
-	overlay.collect()
+	alt_collect(overlay)
 	var batched: Array = overlay.paint_list()
 	var last_i := -1
 	var first_m := 1000000
@@ -403,7 +431,7 @@ func _test_alt_overlay_cull_and_batch() -> void:
 
 	AltOverlayScript.flat_batch_marks = false
 	overlay._layers_key = []
-	overlay.collect()
+	alt_collect(overlay)
 	var unbatched: Array = overlay.paint_list()
 	var interleaved := false
 	var last_i2 := -1
@@ -420,6 +448,8 @@ func _test_alt_overlay_cull_and_batch() -> void:
 		"alt_overlay: --alt-flat-batch=off interleaves marks after each icon (first_m=%d < last_i=%d)"
 		% [first_m2, last_i2])
 
+	for q in stand_in_marks:
+		SlotScript._quality_icons.erase(q)
 	Bridge.set_alt_contents(false)
 	if prev_alt_contents > 0:
 		Bridge.set_alt_contents(true)

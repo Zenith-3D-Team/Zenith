@@ -79,7 +79,7 @@ MAX_EXTRA_CLIENTS = 7
 # What each client has of its own (MockGame.serving swaps these); the rest is the shared world.
 PER_CLIENT = ("client", "rseq", "outbox", "nack_ring", "subs", "queue", "focus", "player", "guns_sig", "inv_sig", "layout",
               "slots_sig", "craftable_sig", "quickbar", "queue_sent", "queue_empty_tick", "screen", "char_logistics", "char_color", "map_queue", "map_have",
-              "map_res", "tags_dirty", "map_si", "alt", "altc", "filters", "clipboard", "remote_view", "work_budget",
+              "map_res", "tags_dirty", "map_si", "alt", "altc", "filters", "clipboard", "remote_view", "live_ir", "work_budget",
               "lod_queue", "lod_res", "lod_si")
 EQUIPMENT_SHAPES = {"solar-panel-equipment": (1, 1), "battery-equipment": (1, 2), "energy-shield-equipment": (2, 2),
                     "personal-roboport-equipment": (2, 2)}
@@ -252,9 +252,11 @@ TILE_ITEMS = {"stone-brick": ("stone-path", "", False), "concrete": ("concrete",
               "hazard-concrete": ("hazard-concrete-left", "hazard-concrete-right", False),
               "landfill": ("landfill", "", True)}
 WATER_TILES = {"water", "deepwater", "oil-ocean-shallow", "ammoniacal-ocean"}
-# Capsules (`iuse` "c"): item -> (action type, range, radius), as Factorio 2.1.23 has them.
+# Capsules (`iuse` "c"): item -> (action type, range, radius), as Factorio 2.1.23 has them; every
+# one sent with the 30-tick cooldown they all have there (`CAPSULE_COOLDOWN`).
 CAPSULES = {"grenade": ("throw", 15, 6.5), "cliff-explosives": ("destroy-cliffs", 10, 1.5), "raw-fish": ("use-on-self", 0, 0)}
 CAPSULES.update({name: ("throw", 25 if "capsule" in name else 20, 0) for name in mock_shots.CAPSULES if name not in CAPSULES})
+CAPSULE_COOLDOWN = 30
 # Rails each rail planner piece costs.
 RAIL_COST = {"straight-rail": 1, "half-diagonal-rail": 2, "curved-rail-a": 3, "curved-rail-b": 3}
 # The mock's space platform: where it can go, how long a trip takes, its deck (rectangles of
@@ -885,6 +887,7 @@ class MockGame(mock_info.InfoMixin):
         self.batches = {}  # client address -> [datagrams waiting to be joined, bytes] (send_raw)
         self.subs, self.queue, self.kept_queue = {}, [], []
         self.focus = (0.0, 0.0, 48.0)
+        self.live_ir = None  # focus ir: the live inserter radius the client's view wants (None: none sent)
         self.remote_view = False  # focus rv = 1: movers only where radars or the character see
         self.generated = set()
         self.entities = {}  # key -> Entity
@@ -2180,11 +2183,14 @@ class MockGame(mock_info.InfoMixin):
         if self.die_after is not None:
             self.die_at, self.die_after = self.tick + self.die_after, None
 
-    def send_parts(self, kind, records):
+    def send_parts(self, kind, records, extra=None):
         parts = max(1, math.ceil(len(records) / RECORDS_PER_MESSAGE))
         for i in range(parts):
-            self.send_reliable({"t": kind, "part": i + 1, "parts": parts,
-                                "l": records[i * RECORDS_PER_MESSAGE:(i + 1) * RECORDS_PER_MESSAGE]})
+            msg = {"t": kind, "part": i + 1, "parts": parts,
+                   "l": records[i * RECORDS_PER_MESSAGE:(i + 1) * RECORDS_PER_MESSAGE]}
+            if extra:
+                msg.update(extra)
+            self.send_reliable(msg)
 
     def chunk_content(self, cx, cy):
         """(tiles run-length, records, surface index, rv) of a generated chunk."""
@@ -2398,6 +2404,9 @@ class MockGame(mock_info.InfoMixin):
         elif t == "focus":
             # As session.lua: 8 to f3d-max-focus-radius (192 by default).
             self.focus = (msg.get("x", 0) / 256, msg.get("y", 0) / 256, max(8.0, min(float(msg.get("r", 32)), 192.0)))
+            # ir (live inserter radius, optional): kept as session.lua does; the mock's hands ignore it.
+            ir = msg.get("ir")
+            self.live_ir = ir if isinstance(ir, int) and not isinstance(ir, bool) and 0 <= ir <= 128 else None
             was = self.remote_view
             self.remote_view = msg.get("rv") == 1
             if self.remote_view and not was:
@@ -2550,6 +2559,15 @@ class MockGame(mock_info.InfoMixin):
             # mod_gui.lua presses a button of a mod with a remote interface (ck); the mock's turns the page.
             if int(msg.get("ix", 0)) == 918:
                 self.mgui_page = getattr(self, "mgui_page", 1) + 1
+        elif t == "mset":
+            # mod_gui.lua sets a mod's element the player changed: the mock's checkbox (919, true/false)
+            # and textfield (920, text); a wrong kind of value changes nothing, as in the bridge.
+            ix, v = msg.get("ix"), msg.get("v")
+            values = self.__dict__.setdefault("mgui_values", {919: False, 920: ""})
+            if ix == 919 and isinstance(v, bool):
+                values[919] = v
+            elif ix == 920 and isinstance(v, str):
+                values[920] = v[:200]
         elif t == "unghost":
             x, y = msg.get("x", 0) / 256, msg.get("y", 0) / 256
             hit = next((e for e in list(self.entities.values()) if e.type == "entity-ghost"
@@ -2557,6 +2575,18 @@ class MockGame(mock_info.InfoMixin):
             if hit is not None:
                 self.remove(hit)
             self.send_now({"t": "unghost", "q": int(msg.get("q", 0)), "n": 1 if hit is not None else 0})
+        elif t == "pick":
+            # map.lua's pick: the entity under a point of the map (nearest centre; the mock has no
+            # selection priorities), or nothing.
+            x, y = msg.get("x", 0) / 256, msg.get("y", 0) / 256
+            r = min(3.0, max(0.05, msg.get("r", 0) / 256))
+            hits = [e for e in list(self.entities.values()) if e.unit and e.type not in ("entity-ghost", "resource")
+                    and e.box()[0] <= x + r and x - r <= e.box()[2] and e.box()[1] <= y + r and y - r <= e.box()[3]]
+            hit = min(hits, key=lambda e: (e.x - x) ** 2 + (e.y - y) ** 2, default=None)
+            out = {"t": "pick", "q": int(msg.get("q", 0))}
+            if hit is not None:
+                out.update({"u": hit.unit, "p": EID[hit.name], "x": fixed(hit.x), "y": fixed(hit.y)})
+            self.send_now(out)
         elif t == "hinfo":
             self.send_now(self.hover_info(msg))
         elif t == "rpatch":
@@ -2699,7 +2729,7 @@ class MockGame(mock_info.InfoMixin):
                 self.send_train_list()
             else:
                 self.message("No such train")
-        elif t in ("pedia_index", "pedia", "lnets", "lnet"):
+        elif t in ("pedia_index", "pedia", "lnets", "lnet", "lnet_find", "set_lnet_name"):
             self.info_command(t, msg, (ENTITY_PROTOS, ITEM_PROTOS, FLUID_PROTOS, TILE_PROTOS, RECIPES, TECHS, PLANETS))
         elif t in ("drop", "fast", "paste_settings", "flip", "copy", "paste", "alt", "altc", "chat", "stats", "tile", "tile_mine", "throw", "rails"):
             self.world_control(t, msg)
@@ -2738,11 +2768,22 @@ class MockGame(mock_info.InfoMixin):
         elif t in ("eq_put", "eq_take", "eq_move", "eq_toggle", "respawn"):
             self.gear_command(t, msg)
         elif t == "sort":
-            if msg.get("inv", "main") == "main":
+            role = str(msg.get("inv", "main"))
+            if role == "main":
                 self.layout = [None] * MAIN_SLOTS
                 inv = self.player["inventory"]
                 self.player["inventory"] = dict(sorted(inv.items()))
                 self.send_slots()
+            elif role in ("chest", "cargo", "trunk", "trash") and self.screen and int(msg.get("u", 0)) == self.screen["unit"]:
+                entity = self.entities.get(self.screen["unit"])
+                m = self.machine(entity) if entity is not None else None
+                if m is not None and role in m["inv"]:
+                    m["inv"][role] = dict(sorted(m["inv"][role].items()))
+                    self.screen["due"] = self.tick
+        elif t == "rblk":
+            units = msg.get("u") or []
+            rows = [[int(u), 1] for u in (units[:256] if isinstance(units, list) else []) if isinstance(u, (int, float))]
+            self.send_now({"t": "rblk", "b": rows})
         elif t == "inv_filter":
             i, item = int(msg.get("i", 0)), str(msg.get("item", ""))
             if 1 <= i <= MAIN_SLOTS:
@@ -2955,7 +2996,7 @@ class MockGame(mock_info.InfoMixin):
             on = sorted(TID[n] for n, _ in TILE_PROTOS if n != tile and (n in WATER_TILES) == water)
             uses.append([item, "t", tile, other, on])
         for item, (kind, rng, radius) in sorted(CAPSULES.items()):
-            uses.append([item, "c", kind, rng, radius])
+            uses.append([item, "c", kind, rng, radius, CAPSULE_COOLDOWN])
         uses += [["rail", "r", "rail-support", 1], ["transport-belt", "b", "underground-belt"],
                  ["fast-transport-belt", "b", "underground-belt"], ["pipe", "p", "pipe-to-ground"]]
         uses += [[item, "m", cat] for item, cat in sorted(MODULES.items())]
@@ -3204,9 +3245,18 @@ class MockGame(mock_info.InfoMixin):
     # --- exchange strings, the blueprint library, undo (planners.lua, history.lua) -----------
 
     def planner_string(self, i):
-        """The exchange string of the planner at slot i (-1: the library one in the cursor)."""
+        """The exchange string of the planner at slot i (-1: library cursor, -2: clipboard)."""
         if i == -1:
             return self.lib_cursor
+        if i == -2:
+            if not self.clipboard:
+                return None
+            ents = [{"entity_number": n + 1, "name": ENTITY_PROTOS[row[0] - 1][0],
+                     "position": {"x": row[1] / 256, "y": row[2] / 256}, "direction": row[3]}
+                    for n, row in enumerate(self.clipboard) if 1 <= row[0] <= len(ENTITY_PROTOS)]
+            if not ents:
+                return None
+            return bp_encode({"blueprint": {"item": "blueprint", "version": GAME_VERSION, "entities": ents}})
         slots = self.main_slots()
         item = slots[i - 1][0] if 1 <= i <= len(slots) and slots[i - 1] else ""
         if item not in PLANNER_KEYS:
@@ -3258,8 +3308,32 @@ class MockGame(mock_info.InfoMixin):
             i = int(msg.get("i", 0))
             data = self.planner_string(i)
             if not data:
-                return self.send_string(q, "", "", i, err="Nothing to export there")
-            self.send_string(q, data, PLANNER_ITEMS[bp_kind(bp_decode(data))], i)
+                return self.send_string(q, "", "", i, err="The clipboard is empty" if i == -2 else "Nothing to export there")
+            item = PLANNER_ITEMS[bp_kind(bp_decode(data))]
+            if "to" in msg and msg["to"] is not None:
+                to = int(msg["to"])
+                if to == -1:
+                    self.lib_cursor = data
+                    return self.send_reliable({"t": "bp_ok", "q": q, "i": -1, "item": item})
+                slots = self.main_slots()
+                inv = self.player["inventory"]
+                if to == 0:
+                    free = next((k + 1 for k, s in enumerate(slots) if not s), 0)
+                    if not free:
+                        self.message("Inventory full")
+                        return self.send_string(q, "", "", i, err="Inventory full")
+                    to = free
+                elif not 1 <= to <= len(slots):
+                    return self.send_string(q, "", "", i, err="Invalid slot")
+                elif slots[to - 1]:
+                    return self.send_string(q, "", "", i, err="That slot isn't empty")
+                self.layout[to - 1] = [item, 1]
+                inv[item] = inv.get(item, 0) + 1
+                self.planner_data[to] = data
+                self.send_inventory()
+                self.send_slots()
+                return self.send_reliable({"t": "bp_ok", "q": q, "i": to, "item": item})
+            self.send_string(q, data, item, i)
         elif t == "bp_set":
             if isinstance(msg.get("s"), str):
                 data = msg["s"]
@@ -3488,7 +3562,9 @@ class MockGame(mock_info.InfoMixin):
             pass
         elif entity.name in ("burner-mining-drill", "boiler"):
             m["inv"] = {"fuel": {"coal": 5}}
-        elif entity.type in ("lamp", "pump", "programmable-speaker", "display-panel", "power-switch", "transport-belt",
+        elif entity.type == "transport-belt":
+            m["bl"] = [[{"name": "iron-plate", "count": 1}], [{"name": "copper-plate", "count": 1}]]
+        elif entity.type in ("lamp", "pump", "programmable-speaker", "display-panel", "power-switch",
                              "pipe", "pipe-to-ground", "heat-pipe", "land-mine", "storage-tank"):
             pass
         else:
@@ -3767,8 +3843,35 @@ class MockGame(mock_info.InfoMixin):
                 m["inv"][role] = {}
             m["recipe"], m["progress"] = recipe or None, 0
         elif t == "take":
+            inv_role = msg.get("inv")
+            if inv_role in (None, "hand") and "ins" in m and isinstance(m["ins"].get("h"), list) and len(m["ins"]["h"]) >= 2:
+                h = m["ins"]["h"]
+                if (not item or h[0] == item) and n > 0:
+                    moved = min(n, int(h[1]))
+                    if moved > 0:
+                        self.give(h[0], moved)
+                        n -= moved
+                        rem = int(h[1]) - moved
+                        if rem > 0:
+                            h[1] = rem
+                        else:
+                            m["ins"].pop("h", None)
+            if inv_role in (None, "belt_1", "belt_2") and "bl" in m:
+                lanes = [0] if inv_role == "belt_1" else ([1] if inv_role == "belt_2" else [0, 1])
+                for li in lanes:
+                    kept = []
+                    for entry in m["bl"][li]:
+                        ename, ecnt = entry.get("name", ""), int(entry.get("count", 0))
+                        if (not item or ename == item) and ecnt > 0 and n > 0:
+                            moved = min(n, ecnt)
+                            self.give(ename, moved)
+                            n -= moved
+                            ecnt -= moved
+                        if ecnt > 0:
+                            kept.append({"name": ename, "count": ecnt})
+                    m["bl"][li] = kept
             for role, contents in m["inv"].items():
-                if msg.get("inv") in (None, role) and contents.get(item, 0) > 0 and n > 0:
+                if inv_role in (None, role) and contents.get(item, 0) > 0 and n > 0:
                     moved = min(n, contents[item])
                     contents[item] -= moved
                     if not contents[item]:
@@ -3848,7 +3951,7 @@ class MockGame(mock_info.InfoMixin):
         msg["status"] = "low_power" if entity is self.low_power and self.low_power_now() else "working"
         if "cb" in m:
             msg["cb"] = m["cb"]
-        for field in ("ins", "spl", "bar", "col", "pf", "spk", "dp", "sw", "tgt", "ao", "bu", "guns", "desc", "veh", "art", "pl"):
+        for field in ("ins", "spl", "bar", "col", "pf", "spk", "dp", "sw", "tgt", "ao", "bu", "guns", "desc", "veh", "art", "pl", "bl"):
             if field in m:
                 msg[field] = m[field]
         if any(m.get("mrq", [])):
@@ -3952,10 +4055,17 @@ class MockGame(mock_info.InfoMixin):
             source = self.find({"u": f[0], "p": f[1], "x": f[2], "y": f[3]}) if isinstance(f, list) and len(f) == 4 else None
             target = self.find(msg)
             if source is None or target is None:
-                return self.message("Nothing to paste to")
+                if msg.get("drag") != 1:
+                    self.send_now({"t": "ui_sfx", "s": "cannot-build"})
+                    self.message("Nothing to paste to")
+                return
             ms, mt = self.machine(source), self.machine(target)
             if ms is not None and mt is not None and SCREEN_KINDS.get(source.type) == SCREEN_KINDS.get(target.type) == "crafter":
                 mt["recipe"], mt["progress"] = ms["recipe"], 0
+            if source.type == target.type and source.dir != target.dir:
+                target.dir = source.dir
+                self.send_reliable({"t": "upd", "e": target.record()})
+            self.send_now({"t": "ui_sfx", "s": "entity-settings-pasted"})
             self.message("Settings pasted")
         elif t == "flip":
             target = self.find(msg)
@@ -4012,7 +4122,8 @@ class MockGame(mock_info.InfoMixin):
                 return self.message("The clipboard is empty")
             x, y, d = msg.get("x", 0) / 256, msg.get("y", 0) / 256, int(msg.get("d", 0)) % 16
             turned = []
-            for pid, dx, dy, ed in self.clipboard:
+            for row in self.clipboard:
+                pid, dx, dy, ed = row[:4]
                 ox, oy = dx / 256, dy / 256
                 for _ in range(d // 4):
                     ox, oy = -oy, ox
@@ -4031,8 +4142,14 @@ class MockGame(mock_info.InfoMixin):
             self.alt = msg.get("on") == 1
         elif t == "altc":
             # J6: the chests' contents while Alt-mode is on (alt_mode.lua's contents rounds).
+            was_on = self.altc is not None
             self.altc = ({"g": int(msg.get("g", 0)), "sent": {}, "msent": {}, "lf": msg.get("lf") == 1}
                          if msg.get("on") == 1 else None)
+            if self.client.get("rb"):
+                if self.altc is not None and not was_on:
+                    self._send_robot_cargo()
+                elif self.altc is None and was_on:
+                    self.send_now({"t": "rc", "l": []})
         elif t == "chat":
             text = str(msg.get("text", ""))[:500]
             if text:
@@ -4399,7 +4516,12 @@ class MockGame(mock_info.InfoMixin):
             entity = self.entities.get(sc["unit"]) if sc and int(msg.get("u", 0)) == sc["unit"] else None
             machine = self.machine(entity) if entity else None
             role = dst_role if src_role == "main" else src_role
-            if machine is None or role not in machine["inv"]:
+            has_role = (
+                (role in machine["inv"])
+                or (role == "hand" and "ins" in machine)
+                or (role in ("belt_1", "belt_2") and "bl" in machine)
+            ) if machine is not None else False
+            if machine is None or not has_role:
                 return
         if src_role == "main":
             if not (0 <= fi < MAIN_SLOTS) or layout[fi] is None:
@@ -4418,6 +4540,30 @@ class MockGame(mock_info.InfoMixin):
                         layout[fi] = None
                 elif n == count:
                     layout[fi], layout[ti] = layout[ti], layout[fi]
+            elif dst_role == "hand":
+                if ti != 0:
+                    return
+                h = machine["ins"].get("h")
+                if h is None:
+                    moved = min(n, stack_size(item))
+                    if moved > 0:
+                        machine["ins"]["h"] = [item, moved]
+                elif isinstance(h, list) and len(h) >= 2 and h[0] == item:
+                    moved = min(n, stack_size(item) - int(h[1]))
+                    if moved > 0:
+                        h[1] = int(h[1]) + moved
+                else:
+                    return
+                if moved <= 0:
+                    return
+                inv[item] -= moved
+                layout[fi][1] -= moved
+                if layout[fi][1] == 0:
+                    layout[fi] = None
+                if self.screen:
+                    self.screen["due"] = self.tick
+            elif dst_role in ("belt_1", "belt_2"):
+                return
             else:
                 contents = machine["inv"][dst_role]
                 contents[item] = contents.get(item, 0) + n
@@ -4425,6 +4571,52 @@ class MockGame(mock_info.InfoMixin):
                 layout[fi][1] -= n
                 if layout[fi][1] == 0:
                     layout[fi] = None
+        elif src_role == "hand":
+            h = machine["ins"].get("h")
+            if fi != 0 or not (isinstance(h, list) and len(h) >= 2) or not 0 <= ti < MAIN_SLOTS:
+                return
+            item, count = h[0], int(h[1])
+            n = count if n <= 0 or n > count else n
+            dst = layout[ti]
+            if dst is not None and dst[0] != item:
+                return
+            moved = min(n, stack_size(item) - (dst[1] if dst else 0))
+            if moved <= 0:
+                return
+            layout[ti] = [item, (dst[1] if dst else 0) + moved]
+            inv[item] = inv.get(item, 0) + moved
+            rem = count - moved
+            if rem > 0:
+                h[1] = rem
+            else:
+                machine["ins"].pop("h", None)
+            if self.screen:
+                self.screen["due"] = self.tick
+        elif src_role in ("belt_1", "belt_2"):
+            li = 0 if src_role == "belt_1" else 1
+            lane = machine["bl"][li]
+            if not (0 <= fi < len(lane)) or not 0 <= ti < MAIN_SLOTS:
+                return
+            entry = lane[fi]
+            item, count = entry.get("name", ""), int(entry.get("count", 0))
+            if not item or count <= 0:
+                return
+            n = count if n <= 0 or n > count else n
+            dst = layout[ti]
+            if dst is not None and dst[0] != item:
+                return
+            moved = min(n, stack_size(item) - (dst[1] if dst else 0))
+            if moved <= 0:
+                return
+            layout[ti] = [item, (dst[1] if dst else 0) + moved]
+            inv[item] = inv.get(item, 0) + moved
+            rem = count - moved
+            if rem > 0:
+                entry["count"] = rem
+            else:
+                lane.pop(fi)
+            if self.screen:
+                self.screen["due"] = self.tick
         else:
             shown = fill_slots(machine["inv"][src_role], SLOT_SIZES.get(src_role, 4))
             if not (0 <= fi < len(shown)) or shown[fi] == 0 or not 0 <= ti < MAIN_SLOTS:
@@ -4463,16 +4655,39 @@ class MockGame(mock_info.InfoMixin):
         else:
             entity = self.entities.get(self.screen["unit"])
             m = self.machine(entity) if entity is not None else None
-            if m is None or role not in m["inv"]:
+            if m is None:
                 return
-            shown = fill_slots(m["inv"][role], SLOT_SIZES.get(role, 4))
-            if not 0 <= fi < len(shown):
+            if role == "hand":
+                h = m.get("ins", {}).get("h")
+                if fi != 0 or not (isinstance(h, list) and len(h) >= 2):
+                    return
+                n = max(1, int(h[1]) // 2) if half else int(h[1])
+                self.screen_command("take", {"u": msg["u"], "inv": "hand", "item": h[0], "n": n})
+            elif role in ("belt_1", "belt_2"):
+                if "bl" not in m:
+                    return
+                li = 0 if role == "belt_1" else 1
+                lane = m["bl"][li]
+                if not 0 <= fi < len(lane):
+                    return
+                first_name = lane[fi].get("name", "")
+                if not first_name:
+                    return
+                targets = [lane[fi]] if kind in ("stack", "half") else [e for e in lane if e.get("name") == first_name]
+                for st in list(targets):
+                    n = max(1, int(st["count"]) // 2) if half else int(st["count"])
+                    self.screen_command("take", {"u": msg["u"], "inv": role, "item": first_name, "n": n})
+            elif role not in m["inv"]:
                 return
-            first = shown[fi] or None
-            stacks = [shown[fi]] if kind in ("stack", "half") else [s for s in shown if s and (first is None or s[0] == first[0])]
-            for st in [s for s in stacks if s]:
-                n = max(1, st[1] // 2) if half else st[1]
-                self.screen_command("take", {"u": msg["u"], "inv": role, "item": st[0], "n": n})
+            else:
+                shown = fill_slots(m["inv"][role], SLOT_SIZES.get(role, 4))
+                if not 0 <= fi < len(shown):
+                    return
+                first = shown[fi] or None
+                stacks = [shown[fi]] if kind in ("stack", "half") else [s for s in shown if s and (first is None or s[0] == first[0])]
+                for st in [s for s in stacks if s]:
+                    n = max(1, st[1] // 2) if half else st[1]
+                    self.screen_command("take", {"u": msg["u"], "inv": role, "item": st[0], "n": n})
         self.send_slots()
         self.send_inventory()
 
@@ -4503,7 +4718,7 @@ class MockGame(mock_info.InfoMixin):
             group, gorder, sub, sorder = RECIPE_GROUPS.get(name, ("intermediate-products", "d", "intermediate-product", "a"))
             recs.append([name, 0.5, ["crafting"], group, gorder, sub, sorder, "a[%s]" % name,
                          [["item", k, v] for k, v in needs.items()], [["item", product, count]]])
-        self.send_parts("rdet", recs)
+        self.send_parts("rdet", recs, {"hc": ["crafting"], "cm": {"crafting": ["assembling-machine-1", "assembling-machine-2"]}})
 
     def send_craftable(self):
         inv = self.player["inventory"]
@@ -4944,6 +5159,7 @@ class MockGame(mock_info.InfoMixin):
                 # as Informatron's menu: `mpress` turns the page), and the page's text is a label
                 # Factorio wraps (ml, at mw pixels).
                 page = getattr(self, "mgui_page", 1)
+                values = getattr(self, "mgui_values", {919: False, 920: ""})
                 windows = [{"i": 901, "r": "screen", "at": [240, 160], "e": {"t": "frame", "ix": 901, "d": "vertical", "a": [
                     {"t": "flow", "ix": 910, "dr": True, "a": [{"t": "label", "ix": 911, "c": "Mock mod", "st": "frame_title"},
                                                                {"t": "empty-widget", "ix": 912, "st": "draggable_space_header"}]},
@@ -4951,7 +5167,9 @@ class MockGame(mock_info.InfoMixin):
                     {"t": "label", "ix": 914, "ml": True, "mw": 400, "c": "Page %d. " % page + "A long paragraph that Factorio wraps at the label's width, as Informatron's pages do. " * 3},
                     {"t": "table", "ix": 915, "cc": 3, "a": [{"t": "sprite-button", "ix": 916, "sp": "item/iron-plate", "nu": 50},
                                                              {"t": "button", "ix": 917, "c": "Do the thing"},
-                                                             {"t": "button", "ix": 918, "c": "Next page", "ck": True}]}]}}]
+                                                             {"t": "button", "ix": 918, "c": "Next page", "ck": True}]},
+                    {"t": "flow", "ix": 921, "a": [{"t": "checkbox", "ix": 919, "c": "Mock option", "s": values[919]},
+                                                   {"t": "textfield", "ix": 920, "tx": values[920]}]}]}}]
                 if self.tick % 300 == 0 or not getattr(self, "mgui_button_sent", False):
                     self.mgui_button_sent = True
                     windows.append({"i": 902, "r": "top", "e": {"t": "sprite-button", "ix": 902, "sp": "item/iron-gear-wheel"}})
@@ -5524,6 +5742,8 @@ class MockGame(mock_info.InfoMixin):
             if beacons:
                 out["b"] = len(beacons)
                 out["eff"] = {k: v * 3 // 2 * len(beacons) for k, v in self.BEACON_EFFECT.items()}
+        elif e.type == "fluid-wagon" and isinstance(e.extra.get("fl"), list) and e.extra["fl"]:
+            out["fl"] = e.extra["fl"]
         return out
 
     def tick_kept(self):
@@ -6016,7 +6236,7 @@ class MockGame(mock_info.InfoMixin):
                 "station": "", "dest": current.get("station", ""), "name": "Mock train",
                 "sched": {"current": tr["current"], "records": tr["records"], "group": "", "interrupts": tr.get("interrupts", [])},
                 "cargo": [["iron-plate", 400]], "fluids": [], "fuel": [["coal", 20]], "stops": stops,
-                "speed": 0 if tr["manual"] else int(TRAIN_SPEED * 1000)}
+                "speed": 0 if tr["manual"] else int(TRAIN_SPEED * 1000), "ctc": tr.get("ctc", 0)}
         if front is not None:
             info["pos"] = [fixed(front.x), fixed(front.y)]
         mock_vehicles.train_fields(self, info)
@@ -6055,8 +6275,12 @@ class MockGame(mock_info.InfoMixin):
             if 1 <= i <= len(secs):
                 sec = secs[i - 1]
                 if isinstance(msg.get("f"), list):
-                    sec["f"] = [[str(f[0]), str(f[1] or "normal"), int(f[2]), int(f[3]), str(f[4]), int(f[5])]
-                                for f in msg["f"] if isinstance(f, list) and len(f) == 6 and f[0] in ITEM_PROTOS]
+                    def _clean_filter(f):
+                        out = [str(f[0]), str(f[1] or "normal"), int(f[2]), int(f[3]), str(f[4]), int(f[5])]
+                        if len(f) >= 7 and isinstance(f[6], str) and f[6] and f[6] != "=":
+                            out.append(f[6])
+                        return out
+                    sec["f"] = [_clean_filter(f) for f in msg["f"] if isinstance(f, list) and len(f) >= 6 and f[0] in ITEM_PROTOS]
                 if isinstance(msg.get("g"), str) and int(msg.get("i", 0)):
                     sec["g"] = msg["g"]
                     if msg["g"] and msg["g"] not in self.char_logistics["lgs"]:
@@ -6091,24 +6315,32 @@ class MockGame(mock_info.InfoMixin):
             item = str(msg.get("item", ""))
             if item == "" or item in ITEM_PROTOS:
                 lg["filter"] = item
+                q = str(msg.get("q", "")) if item else ""
+                if q and q != "normal":
+                    lg["filter_q"] = q
+                else:
+                    lg.pop("filter_q", None)
         sc["due"] = self.tick
+
+    def _send_robot_cargo(self):
+        fx, fy, fr = self.focus
+        r = min(BELT_ITEM_RADIUS, fr)
+        flat = []
+        # The shuttling robots carry plates on the way out (a to b) and come back empty.
+        for m in self.movers:
+            if m["kind"] == "shuttle" and ((self.tick + m["phase"]) % 240) < 120:
+                x, y, _ = self.mover_state(m)
+                if abs(x - fx) <= r and abs(y - fy) <= r:
+                    flat += [m["unit"], IID["iron-plate"], 4]
+        self.send_now({"t": "rc", "l": flat})
 
     def tick_logistics(self):
         p = self.player
         if self.tick % NETWORK_INTERVAL == 0:
             inside = self.roboport is not None and abs(p["x"] - self.roboport.x) <= LOGISTIC_REACH and abs(p["y"] - self.roboport.y) <= LOGISTIC_REACH
             self.send_now(dict(self.network_summary(False), t="ln") if inside else {"t": "ln", "id": 0})
-        if self.tick % CARGO_INTERVAL == 0 and not self.client.get("rb"):
-            fx, fy, fr = self.focus
-            r = min(BELT_ITEM_RADIUS, fr)
-            flat = []
-            # The shuttling robots carry plates on the way out (a to b) and come back empty.
-            for m in self.movers:
-                if m["kind"] == "shuttle" and ((self.tick + m["phase"]) % 240) < 120:
-                    x, y, _ = self.mover_state(m)
-                    if abs(x - fx) <= r and abs(y - fy) <= r:
-                        flat += [m["unit"], IID["iron-plate"], 4]
-            self.send_now({"t": "rc", "l": flat})
+        if self.tick % CARGO_INTERVAL == 0 and (not self.client.get("rb") or self.altc is not None):
+            self._send_robot_cargo()
 
     def tick_robots(self):
         fx, fy, fr = self.focus
@@ -6204,7 +6436,10 @@ class MockGame(mock_info.InfoMixin):
                 return self.message("Can't go there: no such record")
             self.train["current"] = i
         elif t == "train_mode":
-            self.train["manual"] = msg.get("auto") not in (1, True)
+            if "auto" in msg:
+                self.train["manual"] = msg.get("auto") not in (1, True)
+            if "ctc" in msg:
+                self.train["ctc"] = 1 if msg.get("ctc") in (1, True) else 0
         elif t == "set_interrupts":
             ints = msg.get("interrupts")
             if not (isinstance(ints, list) and all(isinstance(i, dict) and isinstance(i.get("name", ""), str) for i in ints)):

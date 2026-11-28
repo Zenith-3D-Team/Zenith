@@ -1,10 +1,10 @@
 extends PanelContainer
 ## Factorio's tool bar in the bottom left corner: the character button (tool_bar_open_button, 52
-## wide: opens the inventory) over the armour slot with the character's health as a vertical bar
-## beside it, then the three gun slots over their ammo (tool_equip_ammo_slot), the gun in use and
-## its ammo drawn green. Clicking a gun with nothing held uses it (Tab cycles); other clicks go to
-## factorio_ui.gd like the inventory's slots (`slot_clicked`: put the held gun, ammo or armour in,
-## take it out). From the mod's `guns` (or the `slots` of the guns and ammo inventories when it
+## wide: opens the inventory) over the armour slot with the armour's battery charge as a vertical
+## bar beside it, then the three gun slots over their ammo (tool_equip_ammo_slot), the gun in use
+## and its ammo drawn green. Clicking a gun with nothing held uses it (Tab cycles); other clicks go
+## to factorio_ui.gd like the inventory's slots (`slot_clicked`: put the held gun, ammo or armour
+## in, take it out). From the mod's `guns` (or the `slots` of the guns and ammo inventories when it
 ## sends them). In a car, tank or spidertron (`guns` with `v`, N3) it shows the vehicle's guns over
 ## their ammo instead, one column a gun (a spidertron's four), as Factorio's tool bar does; a click
 ## on a gun uses it, one on an ammo slot with a stack held puts it in the vehicle (`vammo`).
@@ -14,6 +14,7 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const UiModel := preload("res://scripts/ui/factorio/ui_model.gd")
 const TipButton := preload("res://scripts/ui/factorio/tip_button.gd")
+const EquipmentGrid := preload("res://scripts/ui/factorio/equipment_grid.gd")
 const Controls := preload("res://scripts/player/controls.gd")
 
 ## A slot was clicked: role "guns", "ammo", "armor" or "vammo" (the vehicle's ammo), 1-based index.
@@ -23,7 +24,7 @@ signal open_requested
 
 const GUN_SLOTS := 3
 const OPEN_WIDTH := 52  # tool_bar_open_button
-const HEALTH_GREEN := Color(0.0, 0.8, 0.0)
+const ENERGY_GREEN := Color(0.0, 0.8, 0.0)
 
 var model: UiModel
 ## Whether a click on a gun slot should go to slot_clicked (something is held) rather than use it.
@@ -31,7 +32,7 @@ var holding := func() -> bool: return false
 var _guns: Array[Slot] = []
 var _ammo: Array[Slot] = []
 var _armor: Slot
-var _health := ProgressBar.new()
+var _energy := ProgressBar.new()
 var _grid: GridContainer
 ## The vehicle whose guns the slots show (0: the character's).
 var shown_vehicle := 0
@@ -73,15 +74,16 @@ func _ready() -> void:
 	for side in ["top", "bottom"]:
 		bar_box.add_theme_constant_override("margin_" + side, Kit.px(3))
 	armour_row.add_child(bar_box)
-	_health.fill_mode = ProgressBar.FILL_BOTTOM_TO_TOP
-	_health.show_percentage = false
-	_health.max_value = 1.0
-	_health.step = 0.0
-	_health.value = 1.0
-	_health.add_theme_stylebox_override("fill", Kit.bar_style(HEALTH_GREEN))
-	_health.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_health.mouse_filter = Control.MOUSE_FILTER_PASS
-	bar_box.add_child(_health)
+	_energy.fill_mode = ProgressBar.FILL_BOTTOM_TO_TOP
+	_energy.show_percentage = false
+	_energy.max_value = 1.0
+	_energy.step = 0.0
+	_energy.value = 0.0
+	_energy.visible = false
+	_energy.add_theme_stylebox_override("fill", Kit.bar_style(ENERGY_GREEN))
+	_energy.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_energy.mouse_filter = Control.MOUSE_FILTER_PASS
+	bar_box.add_child(_energy)
 	_armor = Slot.new()
 	_armor.theme_type_variation = "FSlot"
 	_armor.empty_icon = GuiAssets.core_sprite("icons/mip/empty-armor-slot.png")
@@ -137,10 +139,24 @@ func _build_slots(n: int) -> void:
 		_ammo.append(s)
 
 
-## The character's health, shown as the bar beside the armour slot.
+## The armour's battery charge, shown as the vertical bar beside the armour slot.
+func set_energy(now: float, full: float) -> void:
+	if full <= 0.0:
+		_energy.visible = false
+		_energy.value = 0.0
+		_energy.tooltip_text = ""
+		return
+	var f := clampf(now / full, 0.0, 1.0)
+	_energy.visible = true
+	_energy.value = f
+	_energy.tooltip_text = "Energy: %d%% (%s / %s)" % [roundi(f * 100.0), EquipmentGrid.energy_text(maxf(0.0, now)), EquipmentGrid.energy_text(full)]
+
+
+## Legacy fallback (`--power-bar=middle`): the character's health beside the armour slot.
 func set_health(hp: float, max_hp: float) -> void:
-	_health.value = clampf(hp / maxf(1.0, max_hp), 0.0, 1.0)
-	_health.tooltip_text = "Health: %d / %d" % [roundi(hp), roundi(max_hp)]
+	_energy.visible = true
+	_energy.value = clampf(hp / maxf(1.0, max_hp), 0.0, 1.0)
+	_energy.tooltip_text = "Health: %d / %d" % [roundi(hp), roundi(max_hp)]
 
 
 func refresh() -> void:

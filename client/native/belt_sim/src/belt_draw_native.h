@@ -204,6 +204,8 @@ private:
 
 	std::unordered_map<i64, i64> last_i;  // (coalesce) kept between jobs for its buckets
 	std::unordered_map<i64, i64> puts;  // (--inserter-handoff) belt_items.gd Job._puts
+	std::unordered_map<i64, i64> put_show;  // (--belt-drop-glide) uid -> show_at tick (handoff for Z-drop, put for inserter)
+	std::unordered_map<i64, i64> drop_handoffs;  // (--belt-drop-glide) uid -> handoff tick (put + ceili(lag))
 	std::map<std::pair<i64, i64>, std::vector<i64>> peeks;  // (inserter, tick) -> uids: belt_items.gd State.peeks
 	Ordered<Item *, Vector2i> kept;
 	std::unordered_set<i64> held_chunks;  // packed chunk coordinates
@@ -287,7 +289,11 @@ private:
 	int ask_mode = 0;  // --belt-sim-ask: 0 all (every failing lane every 3 s, as before), 1 view
 	bool ask_near = true;  // --belt-sim-ask-near: a job's asks nearest the view first
 	bool dumping = false;
+	bool removed_now = true;
+	bool drop_glide = true;
 	std::unordered_set<i64> dropped;  // lanes dropped in this job's messages
+	std::unordered_set<i64> rm_set;  // (removed_now) lanes removed by brm in this job
+	std::unordered_set<i64> brm_gone;  // (removed_now) uids dropped by brm in this job
 	int plan_depth = 0;
 	// Results
 	Array written;
@@ -329,6 +335,8 @@ private:
 	void _drain(i64 uid, i64 now, bool all);
 	void _ask_mismatches(const Dictionary &ch);
 	void _gauges();
+	void _purge_waiting(i64 uid, std::unordered_set<i64> *held = nullptr);
+	void _brm_cleanup();
 	void _go_or_hold(i64 uid, i64 t, i64 now, std::unordered_set<i64> &held);
 	void _go(i64 uid);
 	void _apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, i64 t0, i64 v, i64 reach, i64 run);
@@ -377,6 +385,11 @@ public:
 	double hide_of(i64 uid) {
 		Item **it = items.get(uid);
 		return it == nullptr ? -1.0 : (*it)->hide_at;
+	}
+	// An item's show_at (the tick its record shows from on the drawn clock), -1 none or no such item (tests).
+	double show_of(i64 uid) {
+		Item **it = items.get(uid);
+		return it == nullptr ? -1.0 : (*it)->show_at;
 	}
 	Dictionary stats() const;
 

@@ -35,6 +35,7 @@ const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const VehicleAnim := preload("res://scripts/world/vehicle_anim.gd")
 const VehicleTracks := preload("res://scripts/fx/vehicle_tracks.gd")
 const Switches := preload("res://scripts/switches.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
 
 const SCAN_INTERVAL := 0.25
 ## Machines and vehicles further than this from the listener (tiles) are not considered.
@@ -306,6 +307,10 @@ func handle(msg: Dictionary) -> void:
 		"sky":
 			_night = clampf(int(msg.get("n", 0)) / 850.0, 0.0, 1.0)
 			sfx.ambience.darkness = int(msg.get("n", 0)) / 1000.0
+		"ui_sfx":
+			var s := str(msg.get("s", ""))
+			if s != "":
+				Sfx.play_ui(s)
 
 
 func _process(delta: float) -> void:
@@ -352,6 +357,8 @@ func _scan(elapsed: float) -> void:
 	var protos := world.protos
 	var states := {}
 	var accents := {}
+	# (--stutter-probe) The scan's parts in the spike log: fx_machines, fx_burners, fx_movers, fx_loops.
+	var tp := Time.get_ticks_usec() if Probing.on else 0
 	for unit in world.working_near(focus, SMOKE_RANGE):
 		var working := int(world.working.get(unit, 0)) == 1
 		var r: WorldMirror.Rec = world.entities.get(unit)
@@ -380,8 +387,16 @@ func _scan(elapsed: float) -> void:
 			emitters[unit] = e
 	_emitters = emitters
 	_states = states
+	if Probing.on:
+		Probing.add("fx_machines", tp)
+		tp = Time.get_ticks_usec()
+	if BurnerFx.near_scan:
+		burners.follow(world)
 	burners.scan(world.entities, world.animator.arm_working, focus, HEARING, sources,
-		_drawn_mesh, func(r) -> Vector3: return BurnerFx.vent_at(r.pos, Visuals.direction_yaw(r.dir)))
+		_drawn_mesh, _burner_vent, world if BurnerFx.near_scan else null)
+	if Probing.on:
+		Probing.add("fx_burners", tp)
+		tp = Time.get_ticks_usec()
 	_accents = accents
 	# Vehicles, from their movement since the last scan.
 	var stale := Time.get_ticks_msec() - 1000
@@ -421,8 +436,13 @@ func _scan(elapsed: float) -> void:
 			var robot := CombatSounds.robot_loop(proto.name, int(unit), Vector3(t.pos.x, 1.5, t.pos.y))
 			if not robot.is_empty():
 				sources.append(robot)
+	if Probing.on:
+		Probing.add("fx_movers", tp)
+		tp = Time.get_ticks_usec()
 	sfx.set_loops(sources)
 	_biter_chatter(biters, elapsed)
+	if Probing.on:
+		Probing.add("fx_loops", tp)
 
 
 ## A machine near the listener: its working loop (or its idle sound while it isn't working), with
@@ -461,6 +481,11 @@ func _update_accents(delta: float) -> void:
 			if (before < f and after >= f) or (after >= frames and f < after - frames):
 				sfx.play_def(accent[0], a[1], "Environment")
 		a[2] = fmod(after, frames)
+
+
+## Where a burner inserter's wisp leaves (burner_fx.gd scan).
+func _burner_vent(r) -> Vector3:
+	return BurnerFx.vent_at(r.pos, Visuals.direction_yaw(r.dir))
 
 
 ## The mesh an inserter is drawn with (chunk_view.gd's), for burner_fx.gd: whether its burner burns.

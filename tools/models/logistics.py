@@ -33,9 +33,10 @@ MATERIALS.update({
     "heater": ("ff7a1a", 0.8, 0.0, "ff6010", 2.5),      # glowing heater coils
     "copper_coil": ("9a5a32", 0.45, 0.85, None, 0),     # beacon's coiled cables
     "beacon_light": ("9fd8ff", 0.4, 0.0, "6fc0ff", 2.0),
-    "paint_am2": ("3c5f8f", 0.55, 0.45, None, 0),       # assembler 2: blue
-    "paint_am3": ("7d9a35", 0.55, 0.45, None, 0),       # assembler 3: green
-    "rust_machine": ("7d5a3a", 0.75, 0.5, None, 0),     # the assemblers' brown machinery
+    "paint_am1": ("585e4c", 0.60, 0.40, None, 0),       # assembler 1: weathered olive-grey steel
+    "paint_am2": ("223c58", 0.58, 0.45, None, 0),       # assembler 2: deep weathered slate-steel blue
+    "paint_am3": ("4d521a", 0.60, 0.42, None, 0),       # assembler 3: deep weathered olive-moss green
+    "rust_machine": ("6c4e32", 0.76, 0.50, None, 0),    # the assemblers' weathered brown/bronze machinery
     "soot_oil": ("1c1915", 0.3, 0.0, None, 0),          # crude oil: glossy black
     "stone_oil": ("3a3129", 0.95, 0.0, None, 0),
     "charge_spark": ("bfd6ff", 0.3, 0.0, "8fb4ff", 3.0),  # roboport charging glow
@@ -452,12 +453,9 @@ def beacon():
 
 
 # ---------------------------------------------------------------------------------------------
-# Assembling machines 2 and 3: an open-topped box with battered walls in the tier's colour
-# (riveted panels on every face, chamfered front corners) packed with brown machinery: a spoked
-# wheel at the west, big gears at the front, a chain beam across the back, a motor block in the
-# tier's colour and a gear (`anim_spin_arms`) that turns while it works. Measured on the HR
-# sprites (the base layer with the animation layer drawn over it): the walls lean in from about
-# 2.75 x 2.5 tiles at the ground to 2.3 x 2.15 at the rim, 1 tile up.
+# Assembling machines 1, 2, and 3: an open-topped box with battered armor walls in the tier's
+# colour (riveted panels on every face, chamfered front corners, rear corner ears, SE gusset
+# ladder) packed with heavy machinery matching Factorio's HR sprites and 64-frame animations.
 
 def _loft(p, bottom, top, mat):
     """A closed solid between two 3D outlines with the same corner count (counter-clockwise
@@ -496,154 +494,409 @@ def _panels(p, q, count, paint, u_pad=0.04, v0=0.12, v1=0.9):
         pts = [_quad_at(q, u, v) for u, v in ((u0, v0), (u1, v0), (u1, v1), (u0, v1))]
         p.poly([tuple(c + o for c, o in zip(pt, off)) for pt in pts], paint, thick=0.035)
         for u in (u0 + 0.12 * (u1 - u0), u1 - 0.12 * (u1 - u0)):
-            for v in (v0 + 0.1, (v0 + v1) / 2, v1 - 0.1):
+            for v in (v0 + 0.1, v1 - 0.1):
                 c = _quad_at(q, u, v)
-                p.cyl(tuple(x + o * 0.06 for x, o in zip(c, n)), 0.02, 0.025, "steel_light", segs=6, axis=axis)
+                p.cyl(tuple(x + o * 0.06 for x, o in zip(c, n)), 0.022, 0.026, "steel_light", segs=6, axis=axis)
 
 
-def _gear(p, centre, radius, width, teeth, mat, axis="Z", hub="steel_dark", yaw=0.0):
-    """A toothed wheel lying flat (axis "Z") or standing up with its axle east-west ("X"), then
-    turned `yaw` degrees about the vertical."""
+def _gear(p, centre, radius, width, teeth, mat, axis="Z", hub="steel_dark", yaw=0.0, spokes=0):
+    """A toothed wheel lying flat (axis "Z") or standing up with its axle east-west ("X"), or
+    north-south ("Y"), then turned `yaw` degrees about the vertical."""
     g = Part()
-    g.cyl((0, 0, 0), radius, width, mat, segs=max(12, teeth), axis=axis, bevel=0.01)
-    g.cyl((0, 0, 0), radius * 0.3, width * 1.6, hub, segs=8, axis=axis)
+    if spokes > 0 and radius >= 0.16:
+        # Spoked wheel: outer rim ring + contrasting dark hub + spokes + deep crisp teeth.
+        r_segs = max(12, teeth)
+        if axis == "Z":
+            g.ring_band((0, 0), radius * 0.66, radius, -width / 2, width / 2, 0, 360, mat, segs=r_segs)
+        else:
+            ring = Part()
+            ring.ring_band((0, 0), radius * 0.66, radius, -width / 2, width / 2, 0, 360, mat, segs=r_segs)
+            g.add_part(ring, R("Y", 90) if axis == "X" else R("X", 90))
+        g.cyl((0, 0, 0), radius * 0.30, width * 1.45, hub, segs=8, axis=axis)
+        for k in range(spokes):
+            a = 2 * math.pi * k / spokes
+            c, s = math.cos(a) * radius * 0.70, math.sin(a) * radius * 0.70
+            if axis == "Z":
+                g.beam((0, 0, 0), (c, s, 0), width * 0.56, width * 0.78, hub if k % 2 else mat)
+            elif axis == "X":
+                g.beam((0, 0, 0), (0, c, s), width * 0.56, width * 0.78, hub if k % 2 else mat, up=(1, 0, 0))
+            else:
+                g.beam((0, 0, 0), (c, 0, s), width * 0.56, width * 0.78, hub if k % 2 else mat, up=(0, 1, 0))
+    else:
+        g.cyl((0, 0, 0), radius, width, mat, segs=max(10, teeth), axis=axis, bevel=0.008)
+        g.cyl((0, 0, 0), radius * 0.34, width * 1.5, hub, segs=8, axis=axis)
+    tooth_l = max(0.055, radius * 0.26)
+    tooth_w = max(0.042, 2 * math.pi * radius / max(teeth, 8) * 0.44)
     for k in range(teeth):
         a = 2 * math.pi * k / teeth
-        c, s = math.cos(a) * (radius + 0.03), math.sin(a) * (radius + 0.03)
+        c, s = math.cos(a) * (radius + tooth_l * 0.35), math.sin(a) * (radius + tooth_l * 0.35)
         if axis == "Z":
-            g.box((c, s, 0), (0.07, 0.06, width), mat, rz=math.degrees(a))
+            g.box((c, s, 0), (tooth_l, tooth_w, width * 0.94), mat, rz=math.degrees(a))
+        elif axis == "X":
+            g.box((0, 0, 0), (width * 0.94, tooth_w, tooth_l), mat, matrix=T(0, c, s) @ R("X", math.degrees(a)))
         else:
-            g.box((0, 0, 0), (width, 0.07, 0.06), mat, matrix=T(0, c, s) @ R("X", math.degrees(a)))
+            g.box((0, 0, 0), (tooth_w, width * 0.94, tooth_l), mat, matrix=T(c, 0, s) @ R("Y", -math.degrees(a)))
     p.add_part(g, T(*centre) @ R("Z", yaw))
 
 
-ASSEMBLER_TIERS = {
-    # Where the big pieces sit differs a little between the two sprites.
-    2: {"wheel": (-0.78, 0.2, 1.0, 0.19), "motor": (0.25, -0.3, 0.45, 0.4, 1.12),
-        "chain": ((-0.25, 0.25, 1.12), (0.95, 0.5, 1.12)),
-        "gears": ((-0.62, -0.55, 0.26), (-0.18, -0.45, 0.2)), "top": 1.0,
-        # Standing gears along the front-west, their teeth showing over the rim.
-        "row": ((-0.85, -0.72, 0.24), (-0.45, -0.75, 0.2))},
-    3: {"wheel": (-0.72, 0.05, 1.12, 0.28), "motor": (0.28, -0.1, 0.6, 0.5, 1.25),
-        "chain": ((-0.6, 0.55, 1.15), (1.0, 0.75, 1.15)),
-        "gears": ((-0.55, -0.45, 0.24), (0.05, -0.55, 0.2)), "top": 1.05,
-        "row": ((-0.95, -0.75, 0.26), (-0.62, -0.5, 0.26), (-0.3, -0.25, 0.24), (-0.25, -0.75, 0.2))},
-}
+def _chain_track(p, a, b, width=0.14, mat="steel", link_mat="steel_dark", links=9):
+    """Heavy drive chain rail between 3D points a and b with individual cross-links."""
+    p.beam(a, b, width, 0.055, mat)
+    for k in range(links):
+        t = k / max(links - 1, 1)
+        x = a[0] + (b[0] - a[0]) * t
+        y = a[1] + (b[1] - a[1]) * t
+        z = a[2] + (b[2] - a[2]) * t
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        ang = math.degrees(math.atan2(dy, dx))
+        p.box((x, y, z + 0.034), (0.045, width * 1.05, 0.022), link_mat, rz=ang)
 
 
-def assembler(paint, accent, tier=2):
-    cfg = ASSEMBLER_TIERS[tier]
-    p = Part()
-    h = cfg["top"]
-    # Outline at the ground and at the rim (counter-clockwise from the front-right corner).
-    bottom = [(1.12, -1.22), (1.3, -1.02), (1.36, -0.7), (1.36, 1.0), (1.12, 1.28), (-1.12, 1.28), (-1.36, 1.0),
-              (-1.36, -0.7), (-1.3, -1.02), (-1.12, -1.22)]
-    top = [(0.98, -1.08), (1.1, -0.95), (1.13, -0.7), (1.13, 0.8), (0.92, 1.06), (-0.92, 1.06), (-1.13, 0.8),
-           (-1.13, -0.7), (-1.1, -0.95), (-0.98, -1.08)]
-    B = [(x, y, 0.1) for x, y in bottom]
-    Tp = [(x, y, h) for x, y in top]
-    # A dark plinth under the walls (the dark strip below the front panels).
-    p.prism(bottom, 0.0, 0.12, "steel_black")
-    # The walls: a shell leaning in, with an inner face so the rim has thickness.
-    inner = [(x * 0.88, y * 0.9 + 0.02) for x, y in top]
+def _am_shell(p, paint, tier):
+    """Shared battered armor hull, ear-walls, riveted plates, SE ladder strut, dense cast
+    bedplate, west copper plumbing, fan bezel, and status lamp housing for AM1, AM2, and AM3."""
+    h = 0.98 if tier == 1 else (1.02 if tier == 2 else 1.05)
+    ear_h = 1.20 if tier == 1 else (1.32 if tier == 2 else 1.36)
+    # Ground outline and rim outline (counter-clockwise from front-right corner).
+    bottom = [(1.12, -1.24), (1.32, -1.04), (1.38, -0.70), (1.38, 1.02), (1.14, 1.28),
+              (-1.14, 1.28), (-1.38, 1.02), (-1.38, -0.70), (-1.32, -1.04), (-1.12, -1.24)]
+    top = [(0.98, -1.08), (1.11, -0.95), (1.15, -0.70), (1.15, 0.84), (0.94, 1.08),
+           (-0.94, 1.08), (-1.15, 0.84), (-1.15, -0.70), (-1.11, -0.95), (-0.98, -1.08)]
+    # Rear corners step up into Factorio's signature sloped NW & NE corner ears.
+    top_z = [h, h, h, ear_h, ear_h, ear_h, ear_h, h, h, h]
+    B = [(x, y, 0.12) for x, y in bottom]
+    Tp = [(x, y, z) for (x, y), z in zip(top, top_z)]
+
+    # Dark recessed plinth & 6 chunky front feet.
+    p.prism(bottom, 0.0, 0.14, "steel_black")
+    inner = [(x * 0.87, y * 0.89 + 0.02) for x, y in top]
     n = len(B)
     for i in range(n):
         j = (i + 1) % n
-        _loft(p, [B[i], B[j], (inner[j][0], inner[j][1], 0.1), (inner[i][0], inner[i][1], 0.1)],
+        _loft(p, [B[i], B[j], (inner[j][0], inner[j][1], 0.12), (inner[i][0], inner[i][1], 0.12)],
               [Tp[i], Tp[j], (inner[j][0], inner[j][1], h), (inner[i][0], inner[i][1], h)], paint)
-        # A brown lip along the rim.
-        a, b = Tp[i], Tp[j]
-        p.beam((a[0], a[1], h + 0.02), (b[0], b[1], h + 0.02), 0.08, 0.05, "rust_machine")
-    # Riveted panels: four on the front, one on each chamfer, more down each side.
+        # Rusty weathered top rim lip.
+        p.beam((Tp[i][0], Tp[i][1], Tp[i][2] + 0.015), (Tp[j][0], Tp[j][1], Tp[j][2] + 0.015), 0.075, 0.045, "rust_machine")
+
+    # Riveted exterior armor plates (front 4 plates over 6 feet, chamfer plates, side plates).
     for i in range(n):
         j = (i + 1) % n
-        count = 4 if i in (n - 1, 4) else max(1, round(math.dist(B[i][:2], B[j][:2]) / 0.45))
+        count = 4 if i in (n - 1, 4) else max(1, round(math.dist(B[i][:2], B[j][:2]) / 0.50))
         q = (B[i], B[j], Tp[j], Tp[i])
         if i == n - 1:
-            # The front's panels sit over a row of dark feet.
-            _panels(p, q, count, paint, v0=0.3, v1=0.9)
+            _panels(p, q, count, paint, v0=0.28, v1=0.90)
             n_out = _face_normal(q)
             for k in range(6):
-                pts = [_quad_at(q, u, v) for u, v in ((k / 6 + 0.01, 0.0), ((k + 1) / 6 - 0.01, 0.0),
-                                                     ((k + 1) / 6 - 0.01, 0.27), (k / 6 + 0.01, 0.27))]
-                p.poly([tuple(c + o * 0.04 for c, o in zip(pt, n_out)) for pt in pts], "steel_dark", thick=0.04)
+                pts = [_quad_at(q, u, v) for u, v in ((k / 6 + 0.012, 0.0), ((k + 1) / 6 - 0.012, 0.0),
+                                                     ((k + 1) / 6 - 0.012, 0.25), (k / 6 + 0.012, 0.25))]
+                p.poly([tuple(c + o * 0.045 for c, o in zip(pt, n_out)) for pt in pts], "steel_dark", thick=0.045)
+        elif i == 0:
+            # SE chamfered corner holds the signature angled ladder/gusset strut instead of a plain plate.
+            for t_side in (-0.09, 0.09):
+                p.beam((1.22 + t_side * 0.7, -1.14 - t_side * 0.7, 0.08),
+                       (1.045 + t_side * 0.7, -1.015 - t_side * 0.7, h + 0.04), 0.055, 0.075, "steel_dark")
+            for rz in (0.28, 0.54, 0.80):
+                u = (rz - 0.08) / (h - 0.04)
+                cx = 1.22 + (1.045 - 1.22) * u
+                cy = -1.14 + (-1.015 + 1.14) * u
+                p.box((cx, cy, rz), (0.22, 0.06, 0.045), "steel", rz=-42)
         else:
-            _panels(p, q, count, paint, v0=0.06, v1=0.88)
-    # Inside: a floor of machinery just under the rim.
-    p.prism([(x * 0.86, y * 0.88) for x, y in top], 0.1, h - 0.12, "rust_machine")
-    # A big tan elbow housing from under the wheel down to the front gears.
-    p.pipe([(-0.8, 0.1, h - 0.05), (-0.6, -0.25, h), (-0.25, -0.45, h - 0.08)], 0.2, "rust_machine", segs=10)
-    for x, y in ((-0.72, -0.1), (-0.5, -0.32)):
-        p.bolts_ring((x, y, h + 0.19), 0.08, 4, radius=0.02)
-    # The spoked wheel over a big brown housing at the west.
-    wx, wy, wz, wr = cfg["wheel"]
-    p.slab(-1.0, wy - 0.7, h - 0.25, -0.35, wy + 0.25, wz - 0.1, "rust_machine", bevel=0.05)
-    p.cyl((wx, wy, wz - 0.05), wr * 0.55, 0.12, "steel_dark", segs=10)
-    p.cyl((wx, wy, wz + 0.04), wr, 0.08, "steel_light", segs=20, bevel=0.015)
-    p.cyl((wx, wy, wz + 0.09), wr * 0.78, 0.03, "steel_dark", segs=16)
-    spokes = 5 if tier == 3 else 4
-    for k in range(spokes):
-        a = 2 * math.pi * k / spokes
-        p.beam((wx, wy, wz + 0.11), (wx + wr * 0.78 * math.cos(a), wy + wr * 0.78 * math.sin(a), wz + 0.11), 0.05,
-               0.03, "steel_light")
-    p.cyl((wx, wy, wz + 0.12), wr * 0.22, 0.05, "steel_light", segs=8)
-    # A copper pipe down the west wall, and a tank lying across the back-west corner.
-    p.pipe([(-1.02, -0.75, h - 0.1), (-1.02, 0.45, h - 0.1), (-0.9, 0.55, h)], 0.045, "copper_dull", segs=6)
-    p.cyl((-0.85, 0.58, h + 0.05), 0.12, 0.42, "rust_machine", segs=10, axis="X", bevel=0.02)
-    # A lever arm across the back-west on a post, and pulleys at the back corners.
-    p.cyl((-0.85, 0.8, h + 0.05), 0.07, 0.3, "steel_dark", segs=8)
-    p.beam((-0.95, 0.8, h + 0.18), (-0.1, 0.92, h + 0.18), 0.12, 0.06, "steel_dark")
-    for sx in (-1, 1):
-        p.cyl((sx * 1.02, 1.0, h + 0.06), 0.1, 0.07, "steel_light", segs=10, axis="X")
-    # Machinery across the back: a big tan housing with bolted bumps on top.
-    p.cyl((0.08, 0.85, h + 0.02), 0.22, 0.8, "rust_machine", segs=12, axis="X", bevel=0.03)
-    for x in (-0.18, 0.05, 0.28, 0.45):
-        p.cyl((x, 0.9, h + 0.24), 0.045, 0.1, "steel_light", segs=6)
-    p.slab(0.45, 0.55, h - 0.2, 1.05, 1.05, h + 0.08, "steel_dark", bevel=0.03)
-    # The chain beam with gears at its east end.
-    (cx0, cy0, cz0), (cx1, cy1, cz1) = cfg["chain"]
-    p.beam((cx0, cy0, cz0), (cx1, cy1, cz1), 0.14, 0.06, "steel")
-    for k in range(12):
-        t = k / 11
-        x, y = cx0 + (cx1 - cx0) * t, cy0 + (cy1 - cy0) * t
-        p.slab(x - 0.025, y - 0.08, cz0 + 0.03, x + 0.025, y + 0.08, cz0 + 0.05, "steel_dark")
-    _gear(p, (cx1 - 0.15, cy1 - 0.25, cz1 - 0.12), 0.2, 0.07, 12, "steel", axis="X")
-    _gear(p, (cx1 - 0.3, cy1 - 0.3, cz1 - 0.2), 0.15, 0.06, 10, "steel_dark", axis="X")
-    # The motor block in the tier's colour, with a coiled drum on top.
-    mx, my, mw, md, mz = cfg["motor"]
-    p.slab(mx, my, h - 0.25, mx + mw * 0.75, my + md, mz, accent, bevel=0.04)
-    p.slab(mx + mw * 0.75, my + 0.05, h - 0.25, mx + mw, my + md - 0.05, mz - 0.2, accent, bevel=0.03)
-    p.cyl((mx + 0.17, my + md / 2, mz + 0.06), 0.14, 0.12, "steel", segs=14, bevel=0.02)
-    p.cyl((mx + 0.17, my + md / 2, mz + 0.13), 0.08, 0.03, "rust_machine", segs=10)
-    p.pipe([(mx + mw * 0.75, my + 0.1, mz - 0.05), (mx + mw + 0.12, my, mz - 0.15),
-            (mx + mw + 0.15, my - 0.3, h - 0.1)], 0.025, "hazard", segs=6)
-    # A piston rod reaching down to a housing in the south-east corner.
-    p.slab(0.5, -0.82, h - 0.3, 0.98, -0.4, h - 0.05, "rust_machine", bevel=0.03)
-    p.tube((0.62, -0.6, h - 0.02), (0.85, -0.15, h + 0.12), 0.035, "steel_light", segs=6)
-    p.cyl((0.9, 0.1, h - 0.1), 0.09, 0.45, "steel_light", segs=10, bevel=0.01)
-    # The big gears at the front: one turns (`anim_spin_arms`), the other is an idler.
-    (g1x, g1y, g1r), (g2x, g2y, g2r) = cfg["gears"]
-    gz = h - 0.12
-    _gear(p, (g2x, g2y, gz), g2r, 0.08, 12, "steel")
-    for x, y, r in cfg["row"]:
-        _gear(p, (x, y, h - 0.02), r, 0.09, 12, "steel", axis="X", yaw=-35)
-    gears = Part("anim_spin_arms", pivot=(g1x, g1y, gz + 0.02))
-    _gear(gears, (g1x, g1y, gz + 0.02), g1r, 0.08, 14, "steel")
-    return [p, gears]
+            _panels(p, q, count, paint, v0=0.08, v1=0.88)
+
+    # AM3 front-center green arched rim collar framing the center gear.
+    if tier == 3:
+        p.slab(-0.34, -1.14, h - 0.03, 0.34, -1.01, h + 0.09, paint, bevel=0.025)
+        p.cyl((0.0, -1.075, h + 0.07), 0.20, 0.13, paint, segs=12, axis="Y", bevel=0.015)
+
+    # Multi-level dark cast-iron interior bedplate, ribs, and under-machinery (zero bare floor).
+    p.prism([(x * 0.86, y * 0.88 + 0.02) for x, y in top], 0.12, h - 0.34, "steel_black")
+    p.slab(-0.92, -0.82, h - 0.34, 0.92, 0.88, h - 0.22, "steel_dark")
+    for ry in (-0.52, -0.10, 0.36):
+        p.slab(-0.92, ry - 0.04, h - 0.24, 0.92, ry + 0.04, h - 0.12, "rust_machine")
+    for rx in (-0.52, 0.05, 0.56):
+        p.slab(rx - 0.04, -0.82, h - 0.24, rx + 0.04, 0.84, h - 0.13, "steel_dark")
+
+    # Rear cast-brown gearbox housing & upper manifolds across north edge.
+    p.cyl((-0.02, 0.84, h + 0.02), 0.25, 0.90, "rust_machine", segs=12, axis="X", bevel=0.03)
+    for rx in (-0.34, -0.10, 0.14, 0.36):
+        p.cyl((rx, 0.84, h + 0.02), 0.27, 0.04, "steel_dark", segs=12, axis="X")
+        p.cyl((rx, 0.88, h + 0.26), 0.04, 0.07, "steel_light", segs=6)
+    p.slab(0.44, 0.56, h - 0.16, 1.00, 1.02, h + 0.10, "steel_dark", bevel=0.025)
+
+    # NW horizontal pressure cylinder & west copper pipe with mounting collars.
+    p.cyl((-0.82, 0.58, h + 0.05), 0.145, 0.44, "rust_machine", segs=10, axis="X", bevel=0.025)
+    for cx in (-0.96, -0.68):
+        p.cyl((cx, 0.58, h + 0.05), 0.155, 0.035, "steel_dark", segs=10, axis="X")
+    p.pipe([(-1.02, 0.44, h + 0.02), (-1.04, -0.32, h - 0.02), (-0.94, -0.44, h - 0.16), (-0.80, -0.48, h - 0.16)],
+           0.046, "copper_dull", segs=8)
+    for py in (0.28, -0.14):
+        p.cyl((-1.03, py, h - 0.01), 0.062, 0.04, "steel_dark", segs=8, axis="Y")
+
+    # West circular fan shroud (housing + deep black inner well; bright raised impeller is animated).
+    fx, fy, fr = (-0.80, 0.18, 0.22) if tier in (1, 2) else (-0.78, 0.20, 0.25)
+    p.cyl((fx, fy, h - 0.04), fr + 0.035, 0.18, "steel_dark", segs=14, bevel=0.015)
+    p.ring_band((fx, fy), fr - 0.02, fr + 0.045, h, h + 0.11, 0, 360, "steel_light", segs=16)
+    p.cyl((fx, fy, h + 0.02), fr - 0.02, 0.04, "steel_black", segs=14)
+
+    # Diagonal heavy bolted bronze/copper-brown gearbox drum from west fan toward center-front.
+    p.pipe([(-0.74, 0.02, h - 0.04), (-0.42, -0.22, h), (-0.12, -0.44, h - 0.10)], 0.21, "rust_machine", segs=10)
+    for bx, by in ((-0.62, -0.08), (-0.44, -0.21), (-0.26, -0.34)):
+        p.cyl((bx, by, h), 0.23, 0.045, "copper_dull" if bx == -0.44 else "steel_dark", segs=10)
+        p.bolts_ring((bx, by, h + 0.17), 0.08, 4, radius=0.018)
+    # Central mechanical bay support frame.
+    p.slab(-0.42, -0.02, h - 0.22, 0.16, 0.56, h - 0.04, "rust_machine", bevel=0.02)
+    p.beam((-0.52, 0.44, h + 0.04), (0.04, 0.44, h + 0.04), 0.08, 0.05, "steel_dark")
+
+    # SW working status lamp bezel (bright dome goes into anim_glow_am_status).
+    sx, sy, sz = -0.98, -0.52, h - 0.01
+    p.cyl((sx, sy, sz - 0.03), 0.080, 0.09, "steel_dark", segs=10, bevel=0.01)
+    p.cyl((sx, sy, sz + 0.01), 0.068, 0.03, "steel_light", segs=10)
+    lamp = Part("anim_glow_am_status")
+    lamp.sphere((sx, sy, sz + 0.03), 0.052, "lamp_green", segs=10, rings=5, scale=(1.0, 1.0, 0.85))
+    return h, (fx, fy, h + 0.075, fr), lamp
+
+
+@model("assembling-machine-1")
+def assembling_machine_1():
+    """Factorio's assembling machine 1: weathered olive-grey riveted armor shell with compact
+    rear ears, SE ladder strut, prominent dual central horizontal meshing steel gears, east
+    vertical steel stamper head, west fan impeller, SW & NE spoked gears, NW rocker arm,
+    north drive bar, and working green status light."""
+    p = Part()
+    h, (fx, fy, fz, fr), lamp = _am_shell(p, "paint_am1", 1)
+
+    # Interior static density: chain beam, SE guide housing, static cradle under east head.
+    _chain_track(p, (-0.18, 0.34, h + 0.04), (0.84, 0.62, h + 0.10), width=0.13, links=8)
+    p.slab(0.36, -0.78, h - 0.24, 0.94, -0.26, h - 0.02, "rust_machine", bevel=0.025)
+    p.cyl((0.52, -0.02, h - 0.18), 0.22, 0.28, "steel_dark", segs=12)
+    p.cyl((-0.78, 0.88, h + 0.05), 0.075, 0.30, "steel_dark", segs=8)
+    p.cyl((0.18, 0.88, h + 0.12), 0.08, 0.20, "steel_dark", segs=8, axis="X")
+
+    # 1 & 2. Prominent central dual meshing horizontal spoked bright-steel gears (AM1 signature).
+    c1_at = (-0.24, 0.18, h + 0.09)
+    gear_cw = Part("anim_am1_gear_cw", pivot=c1_at)
+    _gear(gear_cw, c1_at, 0.28, 0.09, 12, "steel_light", axis="Z", hub="copper_dull", spokes=5)
+
+    c2_at = (0.14, 0.16, h + 0.09)
+    gear_ce = Part("anim_am1_gear_ce", pivot=c2_at)
+    _gear(gear_ce, c2_at, 0.22, 0.09, 10, "steel_light", axis="Z", hub="steel_dark", spokes=4)
+
+    # 3. Prominent SW angled spoked drive gear.
+    sw_at = (-0.64, -0.58, h - 0.08)
+    gear_sw = Part("anim_am1_gear_sw", pivot=sw_at)
+    _gear(gear_sw, sw_at, 0.30, 0.13, 14, "steel_light", axis="X", yaw=-35, hub="rust_machine", spokes=5)
+
+    # 4. High-contrast 4-blade west impeller raised clearly inside the dark well.
+    fan_at = (fx, fy, fz)
+    fan_w = Part("anim_am1_fan_w", pivot=fan_at)
+    fan_w.cyl(fan_at, 0.06, 0.06, "copper_dull", segs=8)
+    for k in range(4):
+        a = k * math.pi / 2.0 + 0.25
+        fan_w.beam(fan_at, (fx + (fr - 0.025) * math.cos(a), fy + (fr - 0.025) * math.sin(a), fz),
+                   0.068, 0.028, "steel_light")
+
+    # 5. NW bold swinging overhead linkage arm & hammer head.
+    nw_piv = (-0.78, 0.88, h + 0.22)
+    arm_nw = Part("anim_am1_arm_nw", pivot=nw_piv)
+    arm_nw.cyl(nw_piv, 0.08, 0.10, "steel_dark", segs=10)
+    arm_nw.beam(nw_piv, (-0.16, 0.60, h + 0.14), 0.11, 0.06, "steel_light", bevel=0.008)
+    arm_nw.cyl((-0.16, 0.60, h + 0.14), 0.07, 0.09, "copper_dull", segs=8)
+
+    # 6. East heavy vertical stamping head & brass ram plunging deeply into its cradle.
+    px, py = 0.52, -0.02
+    press_e = Part("anim_am1_press_e", pivot=(px, py, h + 0.16))
+    press_e.cyl((px, py, h + 0.16), 0.20, 0.38, "steel_light", segs=12, bevel=0.02)
+    press_e.slab(px + 0.10, py - 0.10, h - 0.02, px + 0.26, py + 0.10, h + 0.28, "paint_am1", bevel=0.015)
+    press_e.cyl((px, py, h + 0.37), 0.13, 0.07, "copper_dull", segs=10, bevel=0.01)
+
+    # 7. Prominent NE sprocket wheel.
+    ne_at = (0.76, 0.58, h + 0.08)
+    gear_ne = Part("anim_am1_gear_ne", pivot=ne_at)
+    _gear(gear_ne, ne_at, 0.22, 0.09, 12, "steel_light", axis="X", yaw=-15, hub="rust_machine", spokes=4)
+
+    # 8. North sliding steel crosshead carriage along top rail.
+    bar_piv = (0.12, 0.88, h + 0.17)
+    bar_n = Part("anim_am1_bar_n", pivot=bar_piv)
+    bar_n.tube((-0.20, 0.88, h + 0.17), (0.48, 0.88, h + 0.17), 0.036, "steel_light", segs=8)
+    bar_n.box((0.12, 0.88, h + 0.17), (0.18, 0.15, 0.14), "paint_am1", bevel=0.015)
+    bar_n.box((0.12, 0.88, h + 0.17), (0.09, 0.17, 0.16), "steel_light", bevel=0.01)
+
+    return [p, lamp, gear_cw, gear_ce, gear_sw, fan_w, arm_nw, press_e, gear_ne, bar_n]
 
 
 @model("assembling-machine-2")
 def assembling_machine_2():
-    """Factorio's assembling machine 2: blue walls round a box of brown machinery (a spoked
-    wheel, a chain beam, gears, a blue motor block)."""
-    return assembler("paint_am2", "paint_am2", 2)
+    """Factorio's assembling machine 2: blue riveted armor shell with tall rear corner ears,
+    SE ladder strut, dense brown/copper works, prominent blue vertical actuator press, central
+    horizontal steel gear, west fan, meshing front gears, SE rocking piston, NW rocker arm,
+    NE chain sprocket, north drive bar, and working green status light."""
+    p = Part()
+    h, (fx, fy, fz, fr), lamp = _am_shell(p, "paint_am2", 2)
+
+    # Interior static density: idler gear, chain beam, SE crank housing, yellow hydraulic cable.
+    _gear(p, (-0.12, -0.44, h - 0.16), 0.18, 0.07, 10, "steel_dark")
+    _gear(p, (0.34, 0.36, h - 0.06), 0.16, 0.06, 10, "steel_dark", axis="X", yaw=-15)
+    _chain_track(p, (-0.16, 0.32, h + 0.07), (0.86, 0.62, h + 0.12), width=0.14, links=9)
+    p.slab(0.46, -0.84, h - 0.24, 0.96, -0.36, h - 0.02, "rust_machine", bevel=0.025)
+    p.cyl((0.72, -0.58, h - 0.02), 0.12, 0.14, "steel_dark", segs=10)
+    p.pipe([(0.54, 0.02, h + 0.08), (0.72, -0.02, h + 0.02), (0.76, -0.26, h - 0.08)], 0.024, "hazard", segs=6)
+    p.cyl((-0.78, 0.90, h + 0.06), 0.075, 0.32, "steel_dark", segs=8)
+    p.cyl((0.18, 0.90, h + 0.14), 0.08, 0.22, "steel_dark", segs=8, axis="X")
+    # Deep static cradle under the blue press so large vertical plunge shows zero gap.
+    p.cyl((0.38, -0.10, h - 0.18), 0.22, 0.32, "steel_dark", segs=12)
+
+    # 1 & 2. Front-left meshing angled spoked bright-steel spur gears.
+    g1_at = (-0.76, -0.64, h - 0.10)
+    gear_sw1 = Part("anim_am2_gear_swa", pivot=g1_at)
+    _gear(gear_sw1, g1_at, 0.29, 0.13, 14, "steel_light", axis="X", yaw=-35, hub="rust_machine", spokes=5)
+    _gear(p, (-0.64, -0.56, h - 0.16), 0.22, 0.07, 10, "steel_dark", axis="X", yaw=-35)
+
+    g2_at = (-0.36, -0.54, h - 0.08)
+    gear_sw2 = Part("anim_am2_gear_swb", pivot=g2_at)
+    _gear(gear_sw2, g2_at, 0.24, 0.12, 12, "steel_light", axis="X", yaw=-35, hub="copper_dull", spokes=4)
+
+    # 3. Prominent central horizontal spoked gear in the open bay.
+    gc_at = (-0.16, 0.16, h + 0.10)
+    gear_c = Part("anim_am2_gear_c", pivot=gc_at)
+    _gear(gear_c, gc_at, 0.26, 0.085, 12, "steel_light", axis="Z", hub="copper_dull", spokes=5)
+
+    # 4. West vent 4-blade bright impeller raised cleanly inside shroud.
+    fan_at = (fx, fy, fz)
+    fan_w = Part("anim_am2_fan_w", pivot=fan_at)
+    fan_w.cyl(fan_at, 0.06, 0.06, "copper_dull", segs=8)
+    for k in range(4):
+        a = k * math.pi / 2.0 + 0.3
+        fan_w.beam(fan_at, (fx + (fr - 0.025) * math.cos(a), fy + (fr - 0.025) * math.sin(a), fz),
+                   0.068, 0.028, "steel_light")
+
+    # 5. NW slotted rocker arm pivoting boldly.
+    nw_piv = (-0.78, 0.90, h + 0.22)
+    arm_nw = Part("anim_am2_arm_nw", pivot=nw_piv)
+    arm_nw.cyl(nw_piv, 0.08, 0.10, "steel_dark", segs=10)
+    arm_nw.beam(nw_piv, (-0.16, 0.60, h + 0.12), 0.11, 0.06, "steel_light", bevel=0.008)
+    arm_nw.beam((-0.66, 0.84, h + 0.23), (-0.28, 0.65, h + 0.14), 0.04, 0.07, "steel_black")
+    arm_nw.cyl((-0.16, 0.60, h + 0.12), 0.065, 0.08, "copper_dull", segs=8)
+
+    # 6. Blue vertical cylindrical press/actuator unit with tall visible stroke.
+    px, py = 0.38, -0.10
+    press_e = Part("anim_am2_press_e", pivot=(px, py, h + 0.16))
+    press_e.cyl((px, py, h + 0.16), 0.21, 0.38, "paint_am2", segs=14, bevel=0.02)
+    press_e.slab(px + 0.12, py - 0.10, h - 0.02, px + 0.27, py + 0.10, h + 0.28, "paint_am2", bevel=0.015)
+    press_e.cyl((px, py, h + 0.37), 0.16, 0.08, "steel_light", segs=12, bevel=0.012)
+    press_e.cyl((px, py, h + 0.42), 0.09, 0.045, "copper_dull", segs=10)
+
+    # 7. SE diagonal chrome piston rod & clevis swinging boldly beside the press.
+    se_piv = (0.74, -0.56, h - 0.02)
+    piston_se = Part("anim_am2_piston_se", pivot=se_piv)
+    piston_se.cyl(se_piv, 0.07, 0.10, "copper_dull", segs=8)
+    piston_se.tube(se_piv, (0.42, -0.18, h + 0.12), 0.04, "steel_light", segs=8)
+
+    # 8. NE chain drive sprocket wheel.
+    ne_at = (0.78, 0.58, h + 0.08)
+    sprocket_ne = Part("anim_am2_sprocket_ne", pivot=ne_at)
+    _gear(sprocket_ne, ne_at, 0.22, 0.085, 12, "steel_light", axis="X", yaw=-15, hub="rust_machine", spokes=4)
+
+    # 9. Upper-north wide reciprocating crosshead carriage.
+    bar_piv = (0.14, 0.90, h + 0.19)
+    bar_n = Part("anim_am2_bar_n", pivot=bar_piv)
+    bar_n.tube((-0.20, 0.90, h + 0.19), (0.48, 0.90, h + 0.19), 0.038, "steel_light", segs=8)
+    bar_n.box((0.14, 0.90, h + 0.19), (0.18, 0.15, 0.14), "paint_am2", bevel=0.015)
+    bar_n.box((0.14, 0.90, h + 0.19), (0.09, 0.17, 0.16), "steel_light", bevel=0.01)
+
+    return [p, lamp, gear_sw1, gear_sw2, gear_c, fan_w, arm_nw, press_e, piston_se, sprocket_ne, bar_n]
 
 
 @model("assembling-machine-3")
 def assembling_machine_3():
-    """Factorio's assembling machine 3: the same box with green walls, a bigger green motor
-    block, a bigger wheel and gears."""
-    return assembler("paint_am3", "paint_am3", 3)
+    """Factorio's assembling machine 3: green riveted armor shell with front rim arch and
+    tall rear corner ears, SE gantry guide frame + slamming plunger, green actuator turret,
+    central horizontal gear, wide 5-blade west impeller, triple front gears, NW & NE crank arms,
+    NE sprocket, and working green status light."""
+    p = Part()
+    h, (fx, fy, fz, fr), lamp = _am_shell(p, "paint_am3", 3)
+
+    # Interior static density: lower idler gears, diagonal chain track, SE tall guide gantry.
+    _gear(p, (-0.16, -0.44, h - 0.16), 0.18, 0.07, 10, "steel_dark")
+    _gear(p, (0.34, 0.44, h - 0.02), 0.17, 0.06, 10, "steel_dark", axis="X", yaw=-15)
+    _chain_track(p, (-0.22, 0.46, h + 0.10), (0.90, 0.72, h + 0.14), width=0.14, links=9)
+
+    # SE twin vertical guide rails, anvil block, & cast housing for vertical stamping crosshead.
+    p.slab(0.48, -0.82, h - 0.24, 0.98, -0.22, h - 0.02, "rust_machine", bevel=0.025)
+    p.cyl((0.76, -0.34, h - 0.02), 0.14, 0.12, "steel_dark", segs=10)
+    for dx in (-0.13, 0.13):
+        p.beam((0.76 + dx, -0.34, h - 0.06), (0.76 + dx, -0.34, h + 0.58), 0.06, 0.06, "steel_light")
+    p.box((0.76, -0.34, h + 0.60), (0.34, 0.14, 0.075), "paint_am3", bevel=0.012)
+    p.cyl((0.42, 0.10, h - 0.18), 0.24, 0.34, "steel_dark", segs=12)
+    p.pipe([(0.64, 0.12, h + 0.06), (0.82, 0.08, h + 0.00), (0.82, -0.14, h - 0.06)], 0.024, "hazard", segs=6)
+    p.cyl((-0.78, 0.88, h + 0.06), 0.075, 0.32, "steel_dark", segs=8)
+    p.cyl((0.86, 0.92, h + 0.08), 0.075, 0.34, "steel_dark", segs=8)
+
+    # 1 & 2. Front-left twin-row heavy angled spoked gears.
+    g1_at = (-0.82, -0.64, h - 0.09)
+    gear_sw1 = Part("anim_am3_gear_swa", pivot=g1_at)
+    _gear(gear_sw1, g1_at, 0.28, 0.12, 14, "steel_light", axis="X", yaw=-35, hub="rust_machine", spokes=5)
+    _gear(gear_sw1, (-0.70, -0.56, h - 0.11), 0.23, 0.09, 10, "steel", axis="X", yaw=-35)
+
+    g2_at = (-0.46, -0.52, h - 0.07)
+    gear_sw2 = Part("anim_am3_gear_swb", pivot=g2_at)
+    _gear(gear_sw2, g2_at, 0.25, 0.12, 12, "steel_light", axis="X", yaw=-35, hub="copper_dull", spokes=4)
+
+    # 3. Prominent front-center upright spur gear peeking over the green arched rim.
+    sc_at = (0.02, -0.82, h - 0.06)
+    gear_sc = Part("anim_am3_gear_sc", pivot=sc_at)
+    _gear(gear_sc, sc_at, 0.24, 0.09, 12, "steel_light", axis="Y", hub="copper_dull", spokes=4)
+
+    # 4. Central horizontal spoked gear in the middle bay.
+    gc_at = (-0.16, 0.18, h + 0.12)
+    gear_c = Part("anim_am3_gear_c", pivot=gc_at)
+    _gear(gear_c, gc_at, 0.26, 0.085, 12, "steel_light", axis="Z", hub="copper_dull", spokes=5)
+
+    # 5. Larger 5-blade bright impeller inside the wide west bezel.
+    fan_at = (fx, fy, fz)
+    fan_w = Part("anim_am3_fan_w", pivot=fan_at)
+    fan_w.cyl(fan_at, 0.065, 0.065, "copper_dull", segs=10)
+    for k in range(5):
+        a = 2 * math.pi * k / 5 + 0.2
+        fan_w.beam(fan_at, (fx + (fr - 0.025) * math.cos(a), fy + (fr - 0.025) * math.sin(a), fz),
+                   0.062, 0.028, "steel_light")
+
+    # 6. Sculpted green vertical motor/press turret (bold stroke into deep cradle).
+    px, py = 0.42, 0.10
+    press_e = Part("anim_am3_press_e", pivot=(px, py, h + 0.20))
+    press_e.cyl((px, py, h + 0.20), 0.23, 0.42, "paint_am3", segs=14, bevel=0.025)
+    press_e.slab(px + 0.14, py - 0.14, h + 0.02, px + 0.30, py + 0.14, h + 0.34, "paint_am3", bevel=0.02)
+    press_e.cyl((px, py, h + 0.42), 0.18, 0.085, "steel_light", segs=12, bevel=0.015)
+    press_e.cyl((px, py, h + 0.47), 0.095, 0.045, "copper_dull", segs=10)
+    press_e.cyl((px + 0.22, py, h + 0.18), 0.10, 0.16, "steel_dark", segs=10, axis="X")
+
+    # 7. SE high-stroke vertical stamping crosshead & plunger sliding between twin rails.
+    st_at = (0.76, -0.34, h + 0.34)
+    stamp_se = Part("anim_am3_stamp_se", pivot=st_at)
+    stamp_se.box(st_at, (0.30, 0.16, 0.16), "steel_light", bevel=0.015)
+    stamp_se.box(st_at, (0.20, 0.18, 0.10), "paint_am3", bevel=0.01)
+    stamp_se.cyl((0.76, -0.34, h + 0.16), 0.065, 0.32, "copper_dull", segs=10)
+
+    # 8. NW slotted linkage arm.
+    nw_piv = (-0.78, 0.88, h + 0.24)
+    arm_nw = Part("anim_am3_arm_nw", pivot=nw_piv)
+    arm_nw.cyl(nw_piv, 0.08, 0.10, "steel_dark", segs=10)
+    arm_nw.beam(nw_piv, (-0.16, 0.62, h + 0.14), 0.11, 0.06, "steel_light", bevel=0.008)
+    arm_nw.beam((-0.66, 0.83, h + 0.25), (-0.28, 0.67, h + 0.16), 0.04, 0.07, "steel_black")
+    arm_nw.cyl((-0.16, 0.62, h + 0.14), 0.065, 0.08, "copper_dull", segs=8)
+
+    # 9. NE heavy top crank arm with roller hub.
+    ne_arm_piv = (0.86, 0.92, h + 0.28)
+    arm_ne = Part("anim_am3_arm_ne", pivot=ne_arm_piv)
+    arm_ne.cyl(ne_arm_piv, 0.085, 0.10, "steel_dark", segs=10)
+    arm_ne.beam(ne_arm_piv, (0.26, 0.80, h + 0.20), 0.115, 0.065, "steel_light", bevel=0.008)
+    arm_ne.cyl((0.26, 0.80, h + 0.20), 0.075, 0.10, "copper_dull", segs=10)
+
+    # 10. NE diagonal drive chain sprocket wheel.
+    ne_at = (0.82, 0.72, h + 0.11)
+    sprocket_ne = Part("anim_am3_sprocket_ne", pivot=ne_at)
+    _gear(sprocket_ne, ne_at, 0.22, 0.085, 12, "steel_light", axis="X", yaw=-15, hub="rust_machine", spokes=5)
+
+    return [p, lamp, gear_sw1, gear_sw2, gear_sc, gear_c, fan_w, press_e, stamp_se, arm_nw, arm_ne, sprocket_ne]
 
 
 # ---------------------------------------------------------------------------------------------

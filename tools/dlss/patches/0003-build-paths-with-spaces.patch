@@ -1,0 +1,47 @@
+Zenith patch 0003 for NVIDIA Streamline v2.14.16 (625db07d, MIT): build from a folder whose path has spaces.
+
+- premake.lua: the custom build steps (gitVersion.bat, slang shader compiles, bin2cheader.ps1 for shaders and
+  JSON) quote their paths, so the generated projects build under a folder with a space in its name. Build only: nothing
+  in the DLLs changes.
+
+diff --git a/premake.lua b/premake.lua
+index 3212f26..52b81e5 100644
+--- a/premake.lua
++++ b/premake.lua
+@@ -215,11 +215,11 @@ workspace "streamline"
+ 		buildmessage 'Compiling shader %{file.relpath} to DXBC/SPIRV with slang'
+ 		local shaders_output = out_dir() .. "shaders/"
+         buildcommands {
+-			path.translate(EXTERNAL .. "slang/bin/windows-x64/release/") .. 'slangc.exe "%{file.relpath}" -entry main -target spirv -o "' .. shaders_output .. '%{file.basename}.spv"',
+-			path.translate(EXTERNAL .. "slang/bin/windows-x64/release/") .. 'slangc.exe "%{file.relpath}" -profile sm_5_0 -entry main -target dxbc -o "' .. shaders_output .. '%{file.basename}.cs"',
+-			'pushd ' .. path.translate(shaders_output),
+-			'powershell.exe -NoProfile -ExecutionPolicy Bypass ' .. path.translate(TOOLS) .. 'bin2cheader.ps1 -i "%{file.basename}.spv" -o "%{file.basename}_spv.h"',
+-			'powershell.exe -NoProfile -ExecutionPolicy Bypass ' .. path.translate(TOOLS) .. 'bin2cheader.ps1 -i "%{file.basename}.cs" -o "%{file.basename}_cs.h"',
++			'"' .. path.translate(EXTERNAL .. "slang/bin/windows-x64/release/") .. 'slangc.exe" "%{file.relpath}" -entry main -target spirv -o "' .. shaders_output .. '%{file.basename}.spv"',
++			'"' .. path.translate(EXTERNAL .. "slang/bin/windows-x64/release/") .. 'slangc.exe" "%{file.relpath}" -profile sm_5_0 -entry main -target dxbc -o "' .. shaders_output .. '%{file.basename}.cs"',
++			'pushd "' .. path.translate(shaders_output) .. '"',
++			'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' .. path.translate(TOOLS) .. 'bin2cheader.ps1" -i "%{file.basename}.spv" -o "%{file.basename}_spv.h"',
++			'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' .. path.translate(TOOLS) .. 'bin2cheader.ps1" -i "%{file.basename}.cs" -o "%{file.basename}_cs.h"',
+ 			'popd'
+ 		 }
+ 		 buildoutputs { shaders_output .. "%{file.basename}.spv", shaders_output .. "%{file.basename}.cs" }
+@@ -229,8 +229,8 @@ workspace "streamline"
+ 		local json_output = out_dir() .. "json/"
+ 		buildcommands {
+ 			'copy "%{file.relpath}" "' .. json_output .. '%{file.name}"',
+-			'pushd ' .. path.translate(json_output),
+-			'powershell.exe -NoProfile -ExecutionPolicy Bypass ' .. path.translate(TOOLS) .. 'bin2cheader.ps1 -i "%{file.basename}.json" -o "%{file.basename}_json.h"',
++			'pushd "' .. path.translate(json_output) .. '"',
++			'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' .. path.translate(TOOLS) .. 'bin2cheader.ps1" -i "%{file.basename}.json" -o "%{file.basename}_json.h"',
+ 			'popd'
+ 		}
+ 		-- One or more outputs resulting from the build (required)
+@@ -256,7 +256,7 @@ group "core"
+ project "gitversion"
+ 	kind "Utility"
+ 	targetdir (out_dir())
+-	prebuildcommands { 'pushd ' .. path.translate(out_dir()), path.translate(TOOLS) .. "gitVersion.bat", 'popd' }
++	prebuildcommands { 'pushd "' .. path.translate(out_dir()) .. '"', 'call "' .. path.translate(TOOLS) .. 'gitVersion.bat"', 'popd' }
+ 
+ project "sl.interposer"
+ 	kind "SharedLib"

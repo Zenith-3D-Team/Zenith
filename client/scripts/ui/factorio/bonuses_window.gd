@@ -28,6 +28,14 @@ const LABELS := {
 	"artillery_range_modifier": ["Range", "%"],
 	"beacon_distribution_modifier": ["Distribution effectivity", "%"],
 	"character_reach_distance_bonus": ["Reach distance", "+n"],
+	"character_running_speed_modifier": ["Walking speed", "%"],
+	"character_build_distance_bonus": ["Build distance", "+n"],
+	"character_resource_reach_distance_bonus": ["Resource reach distance", "+n"],
+	"character_item_pickup_distance_bonus": ["Item pickup distance", "+n"],
+	"character_item_drop_distance_bonus": ["Item drop distance", "+n"],
+	"character_loot_pickup_distance_bonus": ["Loot pickup distance", "+n"],
+	"character_trash_slot_count": ["Logistic trash slots", "+n"],
+	"maximum_following_robot_count": ["Follower robot count", "+n"],
 }
 
 var _grid := GridContainer.new()
@@ -93,6 +101,9 @@ func rebuild() -> void:
 			continue
 		_grid.add_child(_cell(cell["icons"], text))
 		shown += 1
+	if shown == 0 and search == "" and model.bonuses.is_empty():
+		_grid.add_child(_cell([], "No bonuses researched yet."))
+		shown = 1
 	for i in (COLUMNS - shown % COLUMNS) % COLUMNS + (COLUMNS if shown == 0 else 0):
 		_grid.add_child(_cell([], ""))
 

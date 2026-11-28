@@ -168,10 +168,13 @@ function M.place(c, bp, position, direction, mode)
   local r = reach_of(bp)
   local area = { { position[1] - r, position[2] - r }, { position[1] + r, position[2] + r } }
   local before = M.unmarked(puppet.surface(c), area, false)
-  local ghosts = bp.build_blueprint({
-    surface = puppet.surface(c), force = c.force, position = position, direction = direction,
-    build_mode = mode, raise_built = true,
-  })
+  local ghosts
+  tracker.deconstructing(puppet.surface(c), area, c.force, function()
+    ghosts = bp.build_blueprint({
+      surface = puppet.surface(c), force = c.force, position = position, direction = direction,
+      build_mode = mode, raise_built = true,
+    })
+  end)
   local marked = {}
   for _, e in pairs(before) do
     if e.valid and e.to_be_deconstructed() then

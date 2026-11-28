@@ -65,6 +65,14 @@ const RB_NEXT_CARGO := 64
 const RB_WORKING := 128
 const RB_CHARGING := 256
 const RB_SNAP := 512
+const RB_RETURNING := 1024
+const DOCK_HOVER_H := 2.35
+const DOCK_HOVER_S := 0.22
+const DOCK_DIVE_S := 0.28
+const DOCK_MAX_DIST := 16.0
+const DOCK_ARC_LIFT := 0.55
+const DOCK_END_SCALE := 0.14
+const MAX_DOCK_ANIMS := 48
 const SIM_BLEND_DECAY := 8.0
 const SIM_BLEND_MAX := 16.0
 const SIM_EXPIRE_TICKS := 360.0
@@ -150,6 +158,8 @@ class Mover:
 	var sim := false
 	var sim_state := 0
 	var sim_flags := 0
+	var sim_charging := false
+	var charge_fx := 0.0
 	var sim_t0 := 0.0
 	var sim_start := Vector2.ZERO
 	var sim_end1 := Vector2.ZERO
@@ -166,6 +176,14 @@ class Mover:
 	var sim_err := Vector2.ZERO
 	var sim_t_write := 0.0
 	var sim_hover_still := 0.0
+	## M1 (--mover-skip-still): a node mover that a whole frame left where it was, at its facing, on its rails'
+	## height and pitch, its wheels unsteered: its node, rails, wheels, shadow and lift aren't worked out
+	## again until something changes (_unsettle). `still_from`: the drawn tick from which _drawn_at stays put.
+	var settled := false
+	var still_from := 0.0
+	## M1: the process frame before which rails changed near it may still answer from world.gd's old rail
+	## grid (rebuilt at most every RAIL_REBUILD_FRAMES): it doesn't settle before then (perf-fix-r1).
+	var rails_until := 0
 
 
 ## --mover-pick-all: scan GPU-drawn movers too in pick/pick_ray/units_of_type/set_night instead of _node_movers alone.
@@ -175,8 +193,16 @@ var protos: ProtoDB
 ## Types that ride rails, drawn at the rails' height (elevated rails, ramps).
 const ROLLING_STOCK := {"locomotive": true, "cargo-wagon": true, "fluid-wagon": true, "artillery-wagon": true,
 	"infinity-cargo-wagon": true}
-## The world mirror (world.gd), for the rails under rolling stock (rail_height). Untyped.
-var world
+## The world mirror (world.gd), for the rails under rolling stock (rail_height). Untyped. Its
+## entities_changed wakes the settled rolling stock over a chunk whose rails changed (M1).
+var world:
+	set(value):
+		if world is Object and is_instance_valid(world) and world.has_signal("entities_changed") \
+				and world.is_connected("entities_changed", _on_entities_changed):
+			world.disconnect("entities_changed", _on_entities_changed)
+		world = value
+		if value is Object and value.has_signal("entities_changed"):
+			value.connect("entities_changed", _on_entities_changed)
 ## The character the client controls is drawn by the avatar instead.
 var puppet_unit := 0
 ## The vehicle that character sits in (Avatar.vehicle), or 0: its lights shine at night (N1).
@@ -196,6 +222,29 @@ var eprops := {}
 var robot_speed_mult := 1.0
 ## Live character position updated by main.gd so `FOLLOW` toward puppet_unit tracks smoothly.
 var avatar_pos := Vector3.ZERO
+## Character avatar node (avatar.gd) for personal roboport docking height and back attach point.
+var avatar: Avatar = null
+## --robot-dock-anim=off restores instant vanish on personal construction robot return instead of hover + shrink.
+static var dock_anim_default := Switches.on("--robot-dock-anim")
+var dock_anim_enabled := dock_anim_default
+var _docking: Array = []  # Array[DockAnim]
+
+
+class DockAnim:
+	var proto_id := 0
+	var proto_name := ""
+	var node: Node3D
+	var shadow: Node3D
+	var lift_meshes: Array[MeshInstance3D] = []
+	var thrusters: Array[MeshInstance3D] = []
+	var owner_unit := 0
+	var elapsed := 0.0
+	var hover_dur := DOCK_HOVER_S
+	var dive_dur := DOCK_DIVE_S
+	var yaw := 0.0
+	var start_pos := Vector3.ZERO
+	var hover_pos := Vector3.ZERO
+	var end_pos := Vector3.ZERO
 ## How many movers of each type there are (type -> count), so units_of_type() needn't go through
 ## every mover when there are none of that type (rockets.gd asks twice a frame).
 var _type_counts := {}
@@ -238,6 +287,32 @@ var process_usec := 0
 ## dressing every one in the frame the model came was a 150-180 ms frame at -62,-26.
 ## --movers-dress-usec=N (1500; 0: all at once, as before).
 static var dress_usec := 1500
+## M1: node movers that stand still skip their per-frame work (Mover.settled); --mover-skip-still=off: every
+## node mover worked out every frame, as before. Per layer (tests run both side by side).
+static var skip_still_default := not Switches.has("--mover-skip-still=off")
+var skip_still := skip_still_default
+## world.gd RAIL_REBUILD_FRAMES + 1: how long rails changing near a parked train keep it awake (M1).
+const RAILS_WAKE_FRAMES := 121
+## How many settled node movers the last frame skipped (tests, probes).
+var still_skipped := 0
+## How close to its goal a settled mover's yaw, pitch and steering must be (radians).
+const SETTLE_ANGLE := 0.0001
+## M2: rolling stock's bogie points go to MoversNative.rail_heights in one call a frame, over its copy
+## of world.gd's per-chunk rail index (_rail_grid, copied again whenever world.gd builds a new one);
+## --native-rail-height=off: world.rail_height twice per mover in GDScript, as before. Per layer (tests).
+static var native_rail_default := not Switches.has("--native-rail-height=off")
+var native_rail := native_rail_default
+## M3: the simulated robots' grid sweep takes its slice's positions in one MoversNative.positions call;
+## --native-mover-sweep=off: MoverRecords.position per robot, as before. Per layer (tests).
+static var native_sweep_default := not Switches.has("--native-mover-sweep=off")
+var native_sweep := native_sweep_default
+## How often chunks no train has needed are dropped from the native rail copy (frames).
+const RAIL_PRUNE_FRAMES := 600
+var _rail_nat: RefCounted  # this layer's own MoversNative (it holds the rail copy)
+var _rail_nat_tried := false
+var _rail_known := {}  # chunk -> the _rail_grid Dictionary copied into _rail_nat
+var _rail_used := {}  # chunk -> the frame a train last needed it
+var _rail_pruned := 0
 static var _dress_arg_read := false
 var _to_dress := {}  # unit -> true: waiting movers whose model is ready, dressed within dress_usec a frame
 var _refresh_due := false  # robots' batches still to be made again on a new mesh (robots.refresh)
@@ -261,6 +336,7 @@ func _ready() -> void:
 func reset() -> void:
 	for m in _movers.values():
 		_free(m)
+	_free_docking()
 	_movers.clear()
 	_sim_movers.clear()
 	_follow_movers.clear()
@@ -284,6 +360,10 @@ func reset() -> void:
 	vehicles.reset()
 	robots.clear()
 	_grid.clear()
+	_rail_known.clear()
+	_rail_used.clear()
+	if _rail_nat != null:
+		_rail_nat.call("clear_rails")
 
 
 func count() -> int:
@@ -296,6 +376,7 @@ func _notification(what: int) -> void:
 		for m: Mover in _movers.values():
 			if is_instance_valid(m.node) and not m.node.is_inside_tree():
 				m.node.free()
+		_free_docking()
 
 
 ## Movers still waiting for their model (--robot-probe waits for none).
@@ -391,6 +472,8 @@ func _update(unit: int, proto_id: int, x: int, y: int, orient: int) -> void:
 			m.from = m.target
 		m.to_tick = tick
 		return
+	if m != null:
+		m.settled = false
 	if m == null or m.proto_id != proto_id:
 		var proto: ProtoDB.EntityProto = protos.entity(proto_id)
 		if proto == null:
@@ -561,6 +644,7 @@ func _fog_check(m: Mover) -> void:
 		records.set_flag(m.slot, MoverRecords.HIDDEN, hide)
 		if m.bot != null:
 			m.bot.hidden = hide
+		_sync_sim_charging(m)
 
 
 ## GPU-drawn movers and the remote view's fog: all of them when it comes or goes, else a slice a
@@ -606,8 +690,13 @@ static func _drawn_at(m: Mover, drawn: float) -> Vector3:
 
 
 ## Night from 0 to 1 (main.gd, with the sky): locomotives' headlights come on above 0.3.
+## Runs every frame: it leaves settled movers settled (the skip path lifts the headlights itself, the energy is set
+## here) and returns at once while the beam is unchanged (perf-fix-r1; before, it woke every mover every frame).
 func set_night(n: float) -> void:
-	_beam = Avatar.beam(n)
+	var beam := Avatar.beam(n)
+	if beam == _beam:
+		return
+	_beam = beam
 	var src: Dictionary = _node_movers if pick_node_movers else _movers
 	for m in src.values():
 		for h: SpotLight3D in m.headlights:
@@ -682,6 +771,13 @@ func _light_vehicles() -> void:
 func remove(unit: int) -> void:
 	var m: Mover = _movers.get(unit)
 	if m != null:
+		if m.type == "spider-unit" and creatures != null:
+			var proto_name := proto_name_of(unit)
+			var pos := _drawn_now(m)
+			var yw := yaw_of(unit)
+			var vel: Vector3 = vehicles.velocity_of(unit) if vehicles != null else Vector3.ZERO
+			var parts: Array = vehicles.part_transforms(unit) if vehicles != null else []
+			creatures.died_spider(unit, proto_name, pos, yw, vel, parts)
 		creatures.remove(unit, true)  # first: a GPU-drawn one falls where its record has it
 		_free(m)
 		_count_type(m.type, -1)
@@ -879,11 +975,14 @@ func pick(point: Vector2, radius: float, types: Array) -> Array:
 
 ## The mover of one of these types that the mouse ray (`from`, `dir`, world space) hits first:
 ## [unit, proto id, fixed position, centre (Vector2 tiles), half size (Vector2), yaw, distance along
-## the ray], or [].
+## the ray, world hover Y lift above terrain], or [].
 ## Each mover is hit within its selection box turned by its orientation, as tall as its model
 ## (and anywhere on the model, where that sticks out of the box), so a click anywhere on a train,
 ## car, tank or spidertron opens it, not the rail or ground behind it.
 func pick_ray(from: Vector3, dir: Vector3, types: Array) -> Array:
+	if dir.length_squared() < 1e-12:
+		return []
+	var ray_dir := dir.normalized()
 	var best: Array = []
 	var best_distance := INF
 	var wanted := {}
@@ -892,23 +991,46 @@ func pick_ray(from: Vector3, dir: Vector3, types: Array) -> Array:
 	var src: Dictionary = _node_movers if (pick_node_movers and not _has_gpu_type(types)) else _movers
 	for unit in src:
 		var m: Mover = src[unit]
-		if not wanted.has(m.type):
+		if m.fogged or not wanted.has(m.type):
 			continue
 		var proto: ProtoDB.EntityProto = protos.entity(m.proto_id)
 		if proto == null:
 			continue
 		var box := pick_box(m.node, proto)
+		# All mover shaders lift by GroundHeight while m.node.position.y holds rail_h / flight height
+		# (rolling stock and spidertrons have empty lift_meshes because they lift per-vertex, not rigid).
+		var lift := GroundHeight.at(m.node.position.x, m.node.position.z)
+		var ray_from := from - Vector3(0.0, lift, 0.0)
 		var inv := m.node.global_transform.affine_inverse()
-		var hit = box.intersects_ray(inv * from, inv.basis * dir)
-		if hit == null:
-			continue
-		var d := (m.node.global_transform * (hit as Vector3)).distance_to(from)
+		var local_from := inv * ray_from
+		var local_dir := inv.basis * ray_dir
+		var d := INF
+		if box.has_point(local_from):
+			# Never block 1st-person view with the vehicle we are driving, or a mover behind the gaze;
+			# allow close-up 1st-person picks when looking into the mover's box toward its centre.
+			if unit == driven:
+				continue
+			var to_center := box.get_center() - local_from
+			var along := to_center.dot(local_dir)
+			if along <= 0.0:
+				continue
+			d = maxf(0.0, along / maxf(local_dir.length_squared(), 1e-6))
+		else:
+			var hit = box.intersects_ray(local_from, local_dir)
+			if hit == null:
+				continue
+			d = (m.node.global_transform * (hit as Vector3)).distance_to(ray_from)
 		if d < best_distance:
 			best_distance = d
 			var c := proto.center()
 			var at := m.node.global_transform * Vector3(c.x, 0.0, c.y)
-			best = [unit, m.proto_id, m.fixed, Vector2(at.x, at.z), proto.size() * 0.5, m.node.rotation.y, d]
+			best = [unit, m.proto_id, m.fixed, Vector2(at.x, at.z), proto.size() * 0.5, m.node.rotation.y, d, at.y]
 	return best
+
+
+## World hover Y lift above terrain for a `pick_ray` result (e.g. elevated train rail height, 0 on ground).
+static func hover_y(pick_result: Array) -> float:
+	return float(pick_result[7]) if pick_result.size() > 7 else 0.0
 
 
 ## A mover's box for picking, in its node's space: the selection box (x east, z south when facing
@@ -1010,6 +1132,7 @@ func _process_movers(delta: float) -> void:
 	if _model_generation != ModelLibrary.generation:
 		_model_generation = ModelLibrary.generation
 		_refresh_due = true
+		_unsettle_all()
 		var t0 := Time.get_ticks_usec()
 		for unit in _waiting.keys():
 			var m: Mover = _movers.get(unit)
@@ -1033,13 +1156,23 @@ func _process_movers(delta: float) -> void:
 	var fogging: bool = fog != null and fog.hiding()
 	_fog_records(fogging)
 	_sim_grid_sweep()
-	if _frame % 4 == 0 and not _follow_movers.is_empty():
+	if not _follow_movers.is_empty():
 		_update_follow_movers()
+	if not _docking.is_empty():
+		_step_docking(delta)
 	var behind := clock.gap * GameClock.DELAY_SENDS
 	var now := clock.tick
 	var focus := Vector2.INF
 	if creatures.target != null:
 		focus = Vector2(creatures.target.position.x, creatures.target.position.z)
+	still_skipped = 0
+	# M2: rolling stock waiting for its rails' heights (one native call after the loop).
+	var rail_batch := world != null and _rail_native_ready()
+	var rail_ms: Array[Mover] = []
+	var rail_was := PackedVector3Array()
+	var rail_yaw := PackedFloat64Array()
+	var rail_pts := PackedVector2Array()
+	var rail_h := PackedFloat64Array()
 	for m: Mover in _node_movers.values():
 		if m.sim:
 			if fogging or m.fogged:
@@ -1058,6 +1191,11 @@ func _process_movers(delta: float) -> void:
 			if m.shadow != null:
 				m.shadow.position = Vector3(m.node.position.x, 0.03, m.node.position.z) + SHADOW_OFFSET
 				m.shadow.rotation.y = m.node.rotation.y
+			if m.sim_charging and not m.fogged and robots.charge_sparks_enabled and vehicles != null and vehicles.sprites != null:
+				m.charge_fx -= delta
+				if m.charge_fx <= 0.0:
+					m.charge_fx = RobotSwarm.CHARGE_SPARK_EVERY * randf_range(0.7, 1.3)
+					RobotSwarm.emit_charge_sparks(vehicles.sprites, m.node.position)
 			continue
 		if m.creature and focus != Vector2.INF and not m.fogged:
 			var away := focus.distance_squared_to(Vector2(m.node.position.x, m.node.position.z))
@@ -1082,23 +1220,39 @@ func _process_movers(delta: float) -> void:
 		else:
 			m.lag = move_toward(m.lag, want, delta * clock.rate * (0.5 if want > m.lag else 1.0))
 		var lag := m.lag
+		if m.settled:
+			# Still drawn past its last step (the clock may step back): nothing of it would change.
+			if drawn >= 0.0 and now - lag >= m.still_from:
+				still_skipped += 1
+				if _beam > 0.01 and not m.headlights.is_empty():
+					_lift_headlights(m)
+				continue
+			m.settled = false
 		var was: Vector3 = m.node.position
 		var yaw_was: float = m.node.rotation.y
 		m.node.position = _drawn_at(m, now - lag) if drawn >= 0.0 else m.node.position
 		m.node.rotation.y = lerp_angle(m.node.rotation.y, m.yaw_goal, t)
+		if m.on_rails and rail_batch:
+			var at := Vector2(m.node.position.x, m.node.position.z)
+			var fwd := _bogie_offset(m.node.rotation.y)
+			rail_ms.append(m)
+			rail_was.append(was)
+			rail_yaw.append(yaw_was)
+			rail_pts.append(at + fwd)
+			rail_pts.append(at - fwd)
+			rail_h.append(m.rail_h)
+			rail_h.append(m.rail_h)
+			continue
+		var rails_still := true
 		if m.on_rails and world != null:
-			_ride_rails(m, delta, t)
-		if _beam > 0.01 and not m.headlights.is_empty():
-			_lift_headlights(m)
-		if m.card != null:
-			_update_card(m, null, m.node.position.distance_squared_to(was) > CARD_STILL * CARD_STILL)
-		if not m.wheels.is_empty():
-			_roll_wheels(m, m.node.position - was, wrapf(m.node.rotation.y - yaw_was, -PI, PI), delta)
-		if m.shadow != null:
-			m.shadow.position = Vector3(m.node.position.x, 0.03, m.node.position.z) + SHADOW_OFFSET
-			m.shadow.rotation.y = m.node.rotation.y
-		if not m.lift_meshes.is_empty():
-			_lift_at(m)
+			rails_still = _ride_rails(m, delta, t)
+		_finish_move(m, was, yaw_was, rails_still, drawn, now, delta)
+	if not rail_ms.is_empty():
+		var heights := _rail_heights_native(rail_pts, rail_h)
+		for i in rail_ms.size():
+			var m := rail_ms[i]
+			var rails_still := _ride_rails_at(m, heights[i * 2], heights[i * 2 + 1], delta, t)
+			_finish_move(m, rail_was[i], rail_yaw[i], rails_still, drawn, now, delta)
 	_light_vehicles()
 	Probing.add("mv_move", t0_move)
 	var t0_draw := Time.get_ticks_usec()
@@ -1110,27 +1264,160 @@ func _process_movers(delta: float) -> void:
 const BOGIE := 2.0
 
 
+## The rest of a node mover's frame once its position, yaw and rails' height are in: lights, card, wheels,
+## shadow, lift, and whether it settled (M1).
+func _finish_move(m: Mover, was: Vector3, yaw_was: float, rails_still: bool, drawn: float, now: float, delta: float) -> void:
+	if _beam > 0.01 and not m.headlights.is_empty():
+		_lift_headlights(m)
+	if m.card != null:
+		_update_card(m, null, m.node.position.distance_squared_to(was) > CARD_STILL * CARD_STILL)
+	if not m.wheels.is_empty():
+		_roll_wheels(m, m.node.position - was, wrapf(m.node.rotation.y - yaw_was, -PI, PI), delta)
+	if m.shadow != null:
+		m.shadow.position = Vector3(m.node.position.x, 0.03, m.node.position.z) + SHADOW_OFFSET
+		m.shadow.rotation.y = m.node.rotation.y
+	if not m.lift_meshes.is_empty():
+		_lift_at(m)
+	if skip_still and rails_still and drawn >= 0.0 and m.card == null and not m.creature \
+			and Engine.get_process_frames() >= m.rails_until \
+			and m.node.position == was and absf(angle_difference(m.node.rotation.y, m.yaw_goal)) < SETTLE_ANGLE \
+			and absf(m.steer) < SETTLE_ANGLE:
+		var from := _still_from(m)
+		if now - m.lag >= from:
+			m.settled = true
+			m.still_from = from
+
+
 ## Rolling stock at the rails' height under it (world.gd rail_height): the height under its front and
 ## back bogies, so up a ramp it climbs and pitches with the slope as Factorio's do. A jump between the
 ## levels (spawned on a bridge, a level decided anew) eases in at 20 tiles a second; on the rails it
 ## follows them exactly (easing at 6 a second, as before, left fast trains under a ramp's top).
 ## --elevated-trains=old: the height under its centre, eased, no pitch.
-func _ride_rails(m: Mover, delta: float, t: float) -> void:
+func _ride_rails(m: Mover, delta: float, t: float) -> bool:
 	var at := Vector2(m.node.position.x, m.node.position.z)
 	if ModelLibrary.elevated_old:
 		var goal_old: float = world.rail_height(at, m.rail_h)
 		m.rail_h = move_toward(m.rail_h, goal_old, delta * 6.0)
 		m.node.position.y = m.rail_h
-		return
-	var yaw := m.node.rotation.y
-	var fwd := Vector2(-sin(yaw), -cos(yaw)) * BOGIE
+		return m.rail_h == goal_old
+	var fwd := _bogie_offset(m.node.rotation.y)
 	var front: float = world.rail_height(at + fwd, m.rail_h)
 	var back: float = world.rail_height(at - fwd, m.rail_h)
+	return _ride_rails_at(m, front, back, delta, t)
+
+
+## From its front and back bogie's rails' height (_ride_rails, or MoversNative.rail_heights for a batch).
+func _ride_rails_at(m: Mover, front: float, back: float, delta: float, t: float) -> bool:
 	var goal := (front + back) * 0.5
 	m.rail_h = goal if absf(goal - m.rail_h) <= 1.0 else move_toward(m.rail_h, goal, delta * 20.0)
 	m.node.position.y = m.rail_h
 	var pitch := atan2(front - back, 2.0 * BOGIE) if absf(goal - m.rail_h) < 0.01 else 0.0
 	m.node.rotation.x = lerp_angle(m.node.rotation.x, pitch, t)
+	# Settled (M1) once on the rails' height and at its pitch.
+	return m.rail_h == goal and absf(angle_difference(m.node.rotation.x, pitch)) < SETTLE_ANGLE
+
+
+static func _bogie_offset(yaw: float) -> Vector2:
+	return Vector2(-sin(yaw), -cos(yaw)) * BOGIE
+
+
+## M2: this layer's MoversNative with rail_heights, or null (--native-rail-height=off, --elevated-trains=old,
+## the class or method missing, or a world without world.gd's _rail_grid, as the tests' stub worlds).
+func _rail_native_ready() -> bool:
+	if not native_rail or ModelLibrary.elevated_old or not world.has_method("_rail_grid"):
+		return false
+	if not _rail_nat_tried:
+		_rail_nat_tried = true
+		if MoverRecords.NativeLibrary.ensure() and ClassDB.class_exists(&"MoversNative"):
+			var nat: RefCounted = ClassDB.instantiate(&"MoversNative")
+			if nat != null and nat.has_method("rail_heights"):
+				nat.call("set_rail_params", world.RAMP_LENGTH, ModelLibrary.ELEVATION, ModelLibrary.ELEVATED_TRACK,
+						world.RAIL_CELL, float(world.CHUNK))
+				_rail_nat = nat
+	return _rail_nat != null
+
+
+## M2: world.rail_height for every point (was: the height each one's stock was at) in one native call. The
+## chunks it reads are brought up to date first: copied again whenever world.gd's _rail_grid hands back
+## another index than the one copied (it builds one when its chunk's entities changed, as rail_height
+## would see it), dropped when the chunk is gone.
+func _rail_heights_native(points: PackedVector2Array, was: PackedFloat64Array) -> PackedFloat64Array:
+	var nat := _rail_nat
+	var need: PackedInt32Array = nat.call("rail_chunks_for", points)
+	var frame := Engine.get_process_frames()
+	var chunks: Dictionary = world.chunks
+	for i in range(0, need.size(), 2):
+		var c := Vector2i(need[i], need[i + 1])
+		_rail_used[c] = frame
+		var cv: Object = chunks.get(c)
+		var had: Variant = _rail_known.get(c)
+		if cv == null:
+			if had != null:
+				nat.call("clear_rail_chunk", c)
+				_rail_known.erase(c)
+			continue
+		var grid: Dictionary = world._rail_grid(cv)
+		if had == null or not is_same(had, grid):
+			_upload_rail_chunk(nat, c, grid)
+			_rail_known[c] = grid
+	if frame - _rail_pruned >= RAIL_PRUNE_FRAMES:
+		_rail_pruned = frame
+		for c: Vector2i in _rail_used.keys():
+			if frame - int(_rail_used[c]) >= RAIL_PRUNE_FRAMES:
+				_rail_used.erase(c)
+				if _rail_known.has(c):
+					_rail_known.erase(c)
+					nat.call("clear_rail_chunk", c)
+	return nat.call("rail_heights", points, was)
+
+
+## One chunk's _rail_grid ({cell: [[kind, position, reach squared | direction]]}) into the native copy,
+## each cell's entries in their order (the first ramp found decides, as in rail_height).
+static func _upload_rail_chunk(nat: RefCounted, c: Vector2i, grid: Dictionary) -> void:
+	var cells := PackedInt32Array()
+	var entries := PackedFloat64Array()
+	for cell: Vector2i in grid:
+		var list: Array = grid[cell]
+		cells.push_back(cell.x)
+		cells.push_back(cell.y)
+		cells.push_back(entries.size() / 4)
+		cells.push_back(list.size())
+		for e: Array in list:
+			var at: Vector2 = e[1]
+			entries.push_back(float(e[0]))
+			entries.push_back(at.x)
+			entries.push_back(at.y)
+			entries.push_back(float(e[2]))
+	nat.call("set_rail_chunk", c, cells, entries)
+
+
+## M1: the drawn tick from which _drawn_at gives its last place for good (its newest step run on as far
+## as it goes), or -INF when it has a single place.
+static func _still_from(m: Mover) -> float:
+	var n := m.ticks.size()
+	if n < 2:
+		return -INF
+	var span := m.ticks[n - 1] - m.ticks[n - 2]
+	return m.ticks[n - 2] + span * (1.5 if m.key_gap <= 4.0 else 1.0)
+
+
+## M1: every settled mover worked out again (a model change, night).
+func _unsettle_all() -> void:
+	for m: Mover in _node_movers.values():
+		m.settled = false
+
+
+## M1: rails changed in `chunk` (world.gd entities_changed): the rolling stock over it and its neighbours
+## (rail_height reads 9 chunks) find their height again.
+## It stays awake for RAILS_WAKE_FRAMES: world.gd's _rail_grid may answer from the old grid until then.
+func _on_entities_changed(chunk: Vector2i) -> void:
+	for m: Mover in _node_movers.values():
+		if not m.on_rails:
+			continue
+		var c := Vector2i(floori(m.node.position.x / 32.0), floori(m.node.position.z / 32.0))
+		if absi(c.x - chunk.x) <= 1 and absi(c.y - chunk.y) <= 1:
+			m.settled = false
+			m.rails_until = Engine.get_process_frames() + RAILS_WAKE_FRAMES
 
 
 ## Dresses the waiting movers whose model is ready (_to_dress), within dress_usec (at least one).
@@ -1190,12 +1477,14 @@ func _paint(unit: int, m: Mover) -> void:
 ## Gives a mover its model: biters and the like go to creatures.gd (their node stays empty), the
 ## rest get the model's mesh and moving parts under their node, or a mod's picture on a card.
 func _dress(unit: int, m: Mover, proto: ProtoDB.EntityProto) -> void:
+	m.settled = false
 	if m.robot and RobotSwarm.handles(proto.name, proto.type):
 		var tr := Time.get_ticks_usec()
 		m.bot = robots.add(unit, proto.name)
 		remove_child(m.node)  # nothing under it to draw or move
 		_to_record(m, Vector4(m.bot.phase, 0.0, 0.0, 0.0), robots.flags_for(m.bot))
 		robots.place(m.bot, m.slot)
+		_sync_sim_charging(m)
 		Probing.add("mv_d_robot", tr)
 		return
 	var creature := CreatureModels.walks(proto.name) and ModelLibrary.mesh_for(proto.name) != null
@@ -1494,7 +1783,7 @@ func handle_robots(msg: Dictionary) -> void:
 	var g_list: Variant = msg.get("g")
 	if WireDecode.packed(g_list) or g_list is Array:
 		for u in g_list:
-			_remove_sim(int(u))
+			_remove_sim(int(u), true)
 	var u_list: Variant = msg.get("u")
 	var stride := WireDecode.RB_STRIDE
 	var present := {}
@@ -1514,7 +1803,7 @@ func handle_robots(msg: Dictionary) -> void:
 				i += stride
 		for unit in _sim_movers.keys():
 			if not present.has(unit):
-				_remove_sim(int(unit))
+				_remove_sim(int(unit), false)
 	if WireDecode.packed(u_list):
 		var n_u: int = u_list.size() - stride + 1
 		var i := 0
@@ -1534,11 +1823,38 @@ func handle_robots(msg: Dictionary) -> void:
 			i += stride
 
 
-func _remove_sim(unit: int) -> void:
+func _remove_sim(unit: int, allow_dock := true) -> void:
 	var m: Mover = _sim_movers.get(unit)
 	if m == null:
 		return
+	var may_dock := allow_dock and dock_anim_enabled and m.robot and m.type == "construction-robot" \
+		and (m.sim_flags & RB_RETURNING) != 0 and not m.fogged and m.sim_follow_unit != 0
+	if may_dock:
+		_start_dock_anim(m)
 	remove(unit)
+
+
+func docking_count() -> int:
+	return _docking.size()
+
+
+func _free_dock_anim(d: DockAnim) -> void:
+	if is_instance_valid(d.node):
+		if d.node.is_inside_tree():
+			d.node.queue_free()
+		else:
+			d.node.free()
+	if is_instance_valid(d.shadow):
+		if d.shadow.is_inside_tree():
+			d.shadow.queue_free()
+		else:
+			d.shadow.free()
+
+
+func _free_docking() -> void:
+	for d: DockAnim in _docking:
+		_free_dock_anim(d)
+	_docking.clear()
 
 
 func _sim_speed_for(proto_id: int, proto_type: String, flags: int) -> float:
@@ -1602,6 +1918,10 @@ func _update_sim(unit: int, proto_id: int, t0: int, sx_i: int, sy_i: int,
 		m.type = proto.type
 		m.height = Visuals.flying_height(proto.type)
 		m.proto_id = proto_id
+	if state == RB_FOLLOW and (flags & RB_RETURNING) != 0 and _is_self_owner(nx_i) and avatar != null and avatar.vehicle == 0:
+		m.height = Visuals.flying_height(m.type) + avatar.drawn_lift()
+	else:
+		m.height = Visuals.flying_height(m.type)
 	var v := _sim_speed_for(proto_id, m.type, flags)
 	var start := Vector2(sx, sy)
 	var end1 := Vector2(tx, ty)
@@ -1624,6 +1944,7 @@ func _update_sim(unit: int, proto_id: int, t0: int, sx_i: int, sy_i: int,
 	m.sim_ori = Visuals.orientation_yaw(float(ori_i) / 1000.0)
 	m.fixed = Vector2i(sx_i, sy_i)
 	m.sim_heard_tick = heard_k
+	var follow_t0 := float(t0)
 	if state == RB_FOLLOW:
 		m.sim_follow_unit = nx_i
 		_follow_movers[unit] = m
@@ -1631,6 +1952,11 @@ func _update_sim(unit: int, proto_id: int, t0: int, sx_i: int, sy_i: int,
 		if follow_tgt != Vector2.INF:
 			end1 = follow_tgt
 		end2 = end1
+		if had_prev and not is_new and not rec_snap and prev_state == RB_FOLLOW:
+			start = Vector2(prev_pos.x, prev_pos.z)
+			if now >= 0.0:
+				follow_t0 = now
+			had_prev = false
 	else:
 		m.sim_follow_unit = 0
 		_follow_movers.erase(unit)
@@ -1648,6 +1974,7 @@ func _update_sim(unit: int, proto_id: int, t0: int, sx_i: int, sy_i: int,
 			m.sim_hover_still = 0.0
 	elif state == RB_ORBIT:
 		m.sim_hover_still = 0.0
+		m.sim_follow_unit = nx_i
 		m.sim_end1 = end1
 		m.sim_end2 = end1
 		if not is_new and not rec_snap and prev_state == RB_ORBIT and end1.distance_to(prev_end1) < 0.25:
@@ -1671,12 +1998,12 @@ func _update_sim(unit: int, proto_id: int, t0: int, sx_i: int, sy_i: int,
 			m.sim_orbit_rate = clampf(v / r_orb, 0.01, 0.15) * dir_sgn
 	else:
 		m.sim_hover_still = 0.0
-		m.sim_t0 = float(t0)
+		m.sim_t0 = follow_t0 if state == RB_FOLLOW else float(t0)
 		m.sim_start = start
 		m.sim_end1 = end1
 		m.sim_end2 = end2
 		var d1 := start.distance_to(end1)
-		m.sim_t_arr1 = float(t0) + (d1 / v if d1 > 1e-4 else 0.0)
+		m.sim_t_arr1 = m.sim_t0 + (d1 / v if d1 > 1e-4 else 0.0)
 		if (flags & RB_HAS_NEXT) != 0 and state == RB_FLY_TARGET:
 			var d2 := end1.distance_to(end2)
 			m.sim_t_arr2 = m.sim_t_arr1 + (d2 / v if d2 > 1e-4 else 0.0)
@@ -1694,6 +2021,8 @@ func _update_sim(unit: int, proto_id: int, t0: int, sx_i: int, sy_i: int,
 	m.target = Vector3(new_pos2.x + err.x, m.height, new_pos2.y + err.y)
 	if m.slot >= 0:
 		_write_sim(m, is_new or rec_snap)
+	else:
+		_sync_sim_charging(m)
 
 
 func _eval_sim_pos_at(m: Mover, at_tick: float) -> Vector2:
@@ -1774,6 +2103,26 @@ func _write_sim(m: Mover, snap_yaw: bool) -> void:
 		_place_in_grid(m)
 	if _fogging:
 		_fog_check(m)
+	_sync_sim_charging(m)
+
+
+func _is_sim_charging(m: Mover) -> bool:
+	if not m.sim or m.fogged or (m.sim_flags & RB_CHARGING) == 0:
+		return false
+	if m.sim_state == RB_HOVER:
+		return true
+	if m.sim_state == RB_FOLLOW:
+		return m.sim_start.distance_to(m.sim_end1) <= 2.2
+	return false
+
+
+func _sync_sim_charging(m: Mover) -> void:
+	var chg := _is_sim_charging(m)
+	if chg and not m.sim_charging:
+		m.charge_fx = randf_range(0.0, 0.08)
+	m.sim_charging = chg
+	if m.bot != null:
+		robots.set_charging(m.bot, chg)
 
 
 func _eval_sim_node(m: Mover, at_tick: float, rate_val: float, delta: float, turn_t: float) -> Array:
@@ -1809,6 +2158,10 @@ func _sim_grid_sweep() -> void:
 		_sim_sweep_at = 0
 	var end := mini(_sim_sweep_at + SIM_GRID_SLICE, _sim_sweep_list.size())
 	var latest := clock.newest
+	var nat: RefCounted = MoverRecords.native() if native_sweep else null
+	if nat != null and nat.has_method("positions"):
+		_sim_grid_sweep_native(nat, end, latest)
+		return
 	for i in range(_sim_sweep_at, end):
 		var unit: int = _sim_sweep_list[i]
 		var m: Mover = _sim_movers.get(unit)
@@ -1826,16 +2179,205 @@ func _sim_grid_sweep() -> void:
 	_sim_sweep_at = end
 
 
+## M3: _sim_grid_sweep's slice with its positions from one MoversNative.positions call (MoverRecords.position
+## for each), the grid touched only for robots whose cell changed.
+func _sim_grid_sweep_native(nat: RefCounted, end: int, latest: float) -> void:
+	var ms: Array[Mover] = []
+	var slots := PackedInt32Array()
+	for i in range(_sim_sweep_at, end):
+		var unit: int = _sim_sweep_list[i]
+		var m: Mover = _sim_movers.get(unit)
+		if m == null:
+			continue
+		if latest > 0.0 and latest - m.sim_heard_tick > SIM_EXPIRE_TICKS:
+			_remove_sim(unit)
+			continue
+		if m.slot >= 0 and m.recorded:
+			ms.append(m)
+			slots.push_back(m.slot)
+	_sim_sweep_at = end
+	if ms.is_empty():
+		return
+	var cl := records.clocks()
+	var at: PackedVector3Array = nat.call("positions", records.data, slots, slots.size(), cl.x, cl.y, records.rate)
+	for j in ms.size():
+		var m := ms[j]
+		var p := at[j]
+		m.target = p
+		if m.bot != null and Vector2i(floori(p.x / GRID), floori(p.z / GRID)) != m.cell:
+			_place_in_grid(m)
+		if _fogging:
+			_fog_check(m)
+
+
+func _is_self_owner(owner_unit: int) -> bool:
+	return owner_unit != 0 and (owner_unit == puppet_unit or (driven != 0 and owner_unit == driven))
+
+
 func _follow_target_pos(m: Mover) -> Vector2:
 	if m.sim_follow_unit == 0:
 		return Vector2.INF
-	if m.sim_follow_unit == puppet_unit and avatar_pos != Vector3.ZERO:
-		return Vector2(avatar_pos.x, avatar_pos.z)
+	if _is_self_owner(m.sim_follow_unit):
+		if avatar != null:
+			return Vector2(avatar.position.x, avatar.position.z)
+		if avatar_pos != Vector3.ZERO:
+			return Vector2(avatar_pos.x, avatar_pos.z)
 	var tp: Variant = position_of(m.sim_follow_unit)
 	if tp is Vector3:
 		var v: Vector3 = tp
 		return Vector2(v.x, v.z)
 	return Vector2.INF
+
+
+func _owner_dock_points(owner_unit: int, fallback_pos: Vector3) -> Dictionary:
+	var hover := Vector3(fallback_pos.x, maxf(fallback_pos.y, Visuals.flying_height("construction-robot") + 0.35), fallback_pos.z)
+	var end := Vector3(fallback_pos.x, 0.95, fallback_pos.z)
+	if _is_self_owner(owner_unit):
+		if avatar == null and avatar_pos == Vector3.ZERO:
+			return {"hover": hover, "end": end}
+		var base: Vector3 = avatar.position if avatar != null else avatar_pos
+		var h_base: float = base.y + DOCK_HOVER_H
+		var on_foot := avatar != null and avatar.vehicle == 0
+		if on_foot:
+			var mech_extra: float = avatar.drawn_lift() + (0.45 if avatar.is_mech() else 0.0)
+			h_base = maxf(h_base, base.y + DOCK_HOVER_H + mech_extra)
+		elif owner_unit != puppet_unit:
+			var vp: Variant = position_of(owner_unit)
+			if vp is Vector3:
+				base = vp
+				h_base = maxf(base.y + DOCK_HOVER_H, Visuals.flying_height("construction-robot") + 0.4)
+		hover = Vector3(base.x, maxf(h_base, Visuals.flying_height("construction-robot") + 0.3), base.z)
+		var back_v: Variant = avatar.frame_of("back") if on_foot else null
+		if back_v is Transform3D:
+			var back_tf: Transform3D = back_v
+			var bo := back_tf.origin - Vector3(0.0, avatar.lift, 0.0)
+			end = Vector3(bo.x, maxf(bo.y, 0.35), bo.z)
+		else:
+			end = Vector3(base.x, base.y + 0.95, base.z)
+		return {"hover": hover, "end": end}
+	var tp: Variant = position_of(owner_unit)
+	if tp is Vector3:
+		var v: Vector3 = tp
+		var top_h: float = top_of(owner_unit)
+		var body_h: float = top_h if top_h > 0.0 else 1.4
+		hover = Vector3(v.x, maxf(v.y + body_h + 0.75, DOCK_HOVER_H), v.z)
+		end = Vector3(v.x, v.y + body_h * 0.6, v.z)
+	return {"hover": hover, "end": end}
+
+
+func _start_dock_anim(m: Mover) -> void:
+	if protos == null:
+		return
+	var proto: ProtoDB.EntityProto = protos.entity(m.proto_id)
+	if proto == null:
+		return
+	var cur := _drawn_now(m)
+	if cur.y <= 0.01:
+		cur.y = m.height
+	var pts := _owner_dock_points(m.sim_follow_unit, cur)
+	var hover_p := pts["hover"] as Vector3
+	var end_p := pts["end"] as Vector3
+	var horiz := Vector2(hover_p.x - cur.x, hover_p.z - cur.z).length()
+	if horiz > DOCK_MAX_DIST:
+		return
+	if _docking.size() >= MAX_DOCK_ANIMS:
+		var old_d: DockAnim = _docking[0]
+		_free_dock_anim(old_d)
+		_docking.remove_at(0)
+	var d := DockAnim.new()
+	d.proto_id = proto.id
+	d.proto_name = proto.name
+	d.owner_unit = m.sim_follow_unit
+	d.start_pos = cur
+	d.hover_pos = hover_p
+	d.end_pos = end_p
+	d.hover_dur = clampf(horiz / 5.5, 0.14, 0.32) if horiz > 0.35 else 0.12
+	d.dive_dur = DOCK_DIVE_S
+	var now := clock.tick if clock.tick >= 0.0 else m.sim_t0
+	d.yaw = records.yaw_at(m.slot, now) if (m.slot >= 0 and m.recorded) else m.node.rotation.y
+	var node := _make_node(proto)
+	node.position = cur
+	node.rotation.y = d.yaw
+	add_child(node)
+	d.node = node
+	d.lift_meshes = _lift_meshes_of(node)
+	d.shadow = _make_shadow(node)
+	if d.shadow != null:
+		d.shadow.position = Vector3(cur.x, 0.02, cur.z) + SHADOW_OFFSET
+		d.shadow.rotation.y = d.yaw
+		add_child(d.shadow)
+	for child in node.get_children():
+		var mi := child as MeshInstance3D
+		if mi == null:
+			continue
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		if mi.has_meta("part"):
+			var part_v: Variant = mi.get_meta("part")
+			if part_v is ModelLibrary.AnimPart and (part_v as ModelLibrary.AnimPart).kind == "thrusters":
+				d.thrusters.append(mi)
+	var lift_v := Vector3(cur.x, 1.0, cur.z)
+	for mi in d.lift_meshes:
+		mi.set_instance_shader_parameter(&"f3d_lift_at", lift_v)
+	_docking.append(d)
+
+
+func _step_docking(delta: float) -> void:
+	var dt := maxf(delta, 0.0)
+	var i := _docking.size() - 1
+	while i >= 0:
+		var d: DockAnim = _docking[i]
+		d.elapsed += dt
+		var pts := _owner_dock_points(d.owner_unit, d.end_pos)
+		d.hover_pos = pts["hover"] as Vector3
+		d.end_pos = pts["end"] as Vector3
+		if d.elapsed >= d.hover_dur + d.dive_dur:
+			if vehicles != null and vehicles.sprites != null:
+				vehicles.sprites.emit("sparks", d.end_pos, 0.45, 0.25, Color(0.55, 0.85, 1.0, 0.9))
+			_free_dock_anim(d)
+			_docking.remove_at(i)
+			i -= 1
+			continue
+		var pos := d.hover_pos
+		var scale_val := 1.0
+		var thr_pitch := 0.0
+		var goal_vec := Vector2(d.hover_pos.x - d.start_pos.x, d.hover_pos.z - d.start_pos.z)
+		if d.elapsed < d.hover_dur:
+			var u := smoothstep(0.0, 1.0, d.elapsed / maxf(d.hover_dur, 0.001))
+			pos = d.start_pos.lerp(d.hover_pos, u)
+			thr_pitch = -0.22 * (1.0 - u)
+		else:
+			var t2 := clampf((d.elapsed - d.hover_dur) / maxf(d.dive_dur, 0.001), 0.0, 1.0)
+			var u2 := t2 * t2 * (3.0 - 2.0 * t2)
+			var mid := (d.hover_pos + d.end_pos) * 0.5 + Vector3(0.0, DOCK_ARC_LIFT, 0.0)
+			pos = d.hover_pos.lerp(mid, u2).lerp(mid.lerp(d.end_pos, u2), u2)
+			scale_val = lerpf(1.0, DOCK_END_SCALE, pow(u2, 1.4))
+			thr_pitch = 0.9 * u2
+			goal_vec = Vector2(d.end_pos.x - pos.x, d.end_pos.z - pos.z)
+		if goal_vec.length_squared() > 1e-4:
+			var goal_yaw := atan2(-goal_vec.x, -goal_vec.y)
+			d.yaw = lerp_angle(d.yaw, goal_yaw, clampf(dt * 12.0, 0.0, 1.0))
+		if is_instance_valid(d.node):
+			d.node.position = pos
+			d.node.rotation.y = d.yaw
+			d.node.scale = Vector3.ONE * scale_val
+			for mi in d.thrusters:
+				if is_instance_valid(mi):
+					var part_v: Variant = mi.get_meta("part")
+					if part_v is ModelLibrary.AnimPart:
+						mi.transform = VehicleAnim._pitched(part_v as ModelLibrary.AnimPart, thr_pitch)
+		var lift_v := Vector3(pos.x, 1.0, pos.z)
+		for mi in d.lift_meshes:
+			if is_instance_valid(mi):
+				mi.set_instance_shader_parameter(&"f3d_lift_at", lift_v)
+		if is_instance_valid(d.shadow):
+			if scale_val < 0.12:
+				d.shadow.visible = false
+			else:
+				d.shadow.visible = true
+				d.shadow.position = Vector3(pos.x, 0.02, pos.z) + SHADOW_OFFSET
+				d.shadow.rotation.y = d.yaw
+				d.shadow.scale = Vector3.ONE * scale_val
+		i -= 1
 
 
 func _update_follow_movers() -> void:
@@ -1848,8 +2390,15 @@ func _update_follow_movers() -> void:
 			_follow_movers.erase(unit)
 			continue
 		var tgt := _follow_target_pos(m)
-		if tgt == Vector2.INF or tgt.distance_to(m.sim_end1) <= 0.5:
+		var base_h := Visuals.flying_height(m.type)
+		var want_h := base_h
+		if (m.sim_flags & RB_RETURNING) != 0 and _is_self_owner(m.sim_follow_unit) and avatar != null and avatar.vehicle == 0:
+			want_h = base_h + avatar.drawn_lift()
+		var h_changed := not is_equal_approx(want_h, m.height)
+		var deadband := 0.04 if (m.sim_flags & RB_RETURNING) != 0 else 0.15
+		if tgt == Vector2.INF or (tgt.distance_to(m.sim_end1) <= deadband and not h_changed):
 			continue
+		m.height = want_h
 		var cur3 := _drawn_now(m)
 		var cur2 := Vector2(cur3.x, cur3.z)
 		m.sim_start = cur2
@@ -1864,3 +2413,5 @@ func _update_follow_movers() -> void:
 		m.target = Vector3(cur2.x, m.height, cur2.y)
 		if m.slot >= 0:
 			_write_sim(m, false)
+		else:
+			_sync_sim_charging(m)

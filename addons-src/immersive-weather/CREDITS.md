@@ -13,13 +13,13 @@ All sound effects in `sounds/` come from **Weather Elements** (`FREE WEATHER SFX
 - **Source:** https://heltonyan.itch.io/weatherelements
 - **Author:** Helton Yan
 - **Licence:** Creative Commons Attribution 4.0 International (**CC BY 4.0**) — https://creativecommons.org/licenses/by/4.0/
-- **Changes made:** Selected stereo 44.1 kHz WAV recordings were trimmed (2 s equal-power crossfades into 18 s loops for wind and rain; trimmed trailing silence and cosine fade-outs for thunder one-shots), loudness-normalized, and encoded to Ogg Vorbis. The audio files remain under **CC BY 4.0**.
+- **Changes made:** Selected stereo 44.1 kHz WAV recordings were trimmed (2 s equal-power crossfades into 18 s loops for wind and rain; trimmed trailing silence and cosine fade-outs for thunder one-shots), loudness-normalized, and encoded to Ogg Vorbis. **Further changes (0.3.4), rain and wind loops only:** a gentle low-pass tilt (flat to 1.5 kHz, -6 dB at 4 kHz, -11 dB at 8 kHz and above, +1 dB at 300-600 Hz), applied circularly so the loops stay seamless, a level trim of up to 5 dB so peaks sit at -6.5 dB, and re-encoded to Ogg Vorbis quality 7. The files as before these changes are kept in `sounds/original/` (selectable with the setting **Audio > Rain and wind tone**). Thunder is unchanged. The audio files remain under **CC BY 4.0**.
 
 ### Source File Mapping
 
 | Bundled File | Original File in Weather Elements | Type |
 | --- | --- | --- |
-| `sounds/wind-gentle.ogg` | `WE Light Wind Whistle 4.wav` | 18 s seamless loop |
+| `sounds/wind-gentle.ogg` (also `sounds/original/`) | `WE Light Wind Whistle 4.wav` | 18 s seamless loop |
 | `sounds/wind-gusty.ogg` | `WE Heavy Wind Whistle 7.wav` | 18 s seamless loop |
 | `sounds/rain-light.ogg` | `WE Light Outside Rain 1.wav` | 18 s seamless loop |
 | `sounds/rain-steady.ogg` | `WE Light Outside Rain 5.wav` | 18 s seamless loop |

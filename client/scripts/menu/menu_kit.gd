@@ -287,6 +287,8 @@ static func slider(from: float, to: float, step: float, value: float) -> HSlider
 	s.value = value
 	s.custom_minimum_size = Kit.pxv(200, 20)
 	s.focus_mode = Control.FOCUS_NONE
+	# The wheel would change the value without drag_ended, so a setting shown changed was never saved or applied.
+	s.scrollable = false
 	return s
 
 

@@ -12,6 +12,8 @@ signal confirmed
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const Settings := preload("res://scripts/menu/settings.gd")
+const DlssHost := preload("res://scripts/menu/dlss_host.gd")
+const Upscalers := preload("res://scripts/menu/upscalers.gd")
 const RenderStats := preload("res://scripts/debug/render_stats.gd")
 const Paths := preload("res://scripts/menu/paths.gd")
 const FxSettings := preload("res://scripts/fx/fx_settings.gd")
@@ -30,12 +32,12 @@ const RenderDistance := preload("res://scripts/world/render_distance.gd")
 
 const TABS := ["Graphics", "Sound", "Controls", "Interface", "Other", "Mod settings", "Camera", "Factorio"]
 ## Factorio's sound sliders ([gui-sound-settings]) the client has a bus for, in its order (Master,
-## Music, Game effects, GUI effects, Walking, Environment, Ambient), then the client's own three.
-## Factorio's Alerts, Wind and Simulations have no bus here (the client's alerts are silent, wind is
-## in Ambient, there are no tips simulations).
+## Music, Game effects, GUI effects, Walking, Environment, Alerts, Ambient, Wind), then the client's own
+## three. Factorio's Simulations has no bus here (there are no tips simulations).
 const SOUND := [
 	["Master", "master"], ["Music", "music"], ["Game effects", "effects"], ["GUI effects", "ui"], ["Walking", "walking"],
-	["Environment", "environment", "Sounds of machines and vehicles."], ["Ambient", "ambient", "Wind and the planet's background sounds."],
+	["Environment", "environment", "Sounds of machines and vehicles."], ["Ambient", "ambient", "Local ambient sounds of entities and terrain."],
+	["Wind", "wind", "Global persistent and semi-persistent ambient sounds."], ["Alerts", "alerts"],
 	["Weapons", "weapons"], ["Explosions", "explosions"], ["Enemies", "enemies"],
 ]
 ## The bridge mod's runtime-global settings (mod/factorio-3d-bridge/settings.lua):
@@ -43,12 +45,16 @@ const SOUND := [
 const MOD_SETTINGS := [
 	["f3d-surface", "Surface to stream", "string", "nauvis"],
 	["f3d-chunks-per-tick", "Chunk snapshots per tick", "int", 1, 1, 16],
-	["f3d-bytes-per-tick", "Bytes sent per tick", "int", 32768, 4096, 1048576],
+	["f3d-bytes-per-tick", "Bytes sent per tick", "int", 131072, 4096, 1048576],
 	["f3d-max-focus-radius", "Max live-update radius", "int", 192, 16, 256],
 	["f3d-mover-interval", "Moving entity update interval (ticks)", "int", 2, 1, 30],
+	["f3d-mover-rescan", "Longest wait between searches for movers (ticks)", "int", 32, 8, 300],
 	["f3d-detail-radius", "Detail radius (belt items, hands)", "int", 24, 0, 64],
 	["f3d-detail-interval", "Detail update interval (ticks)", "int", 6, 1, 60],
+	["f3d-spread-jobs", "Spread the periodic jobs over several ticks", "bool", true],
+	["f3d-binary-messages", "Binary messages", "bool", true],
 	["f3d-starter-kit", "Starter kit for the bridge's character", "bool", true],
+	["f3d-character-corpses", "Character corpses", "bool", true],
 	["f3d-player", "Player to play as", "string", ""],
 	["f3d-act-as-player", "Act as the player for other mods", "bool", true],
 ]
@@ -89,6 +95,7 @@ static func use_old_graphics_layout() -> bool:
 func _ready() -> void:
 	theme_type_variation = "FFrame"
 	Settings.listen(_on_setting)
+	add_to_group(DlssHost.SCALE_WATCHERS)
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", Kit.px(8))
 	add_child(box)
@@ -207,6 +214,9 @@ func _unhandled_input(event: InputEvent) -> void:
 	var key := event as InputEventKey
 	if key != null and key.pressed and not key.echo and key.physical_keycode == KEY_ESCAPE:
 		get_viewport().set_input_as_handled()
+		if is_instance_valid(_dlss_prompt):
+			_dlss_prompt_answer("", false)  # Esc on DLSS's prompt is Cancel
+			return
 		_close()
 
 
@@ -301,6 +311,7 @@ func _on_setting(section: String, key: String) -> void:
 	# The upscaler or the scale it works at changed: Anti-aliasing greys out for FSR 2.2 (or comes back).
 	if key in ["upscaler", "render_scale", "resolution", "window_mode"]:
 		_refresh_look_overrides()
+		_show_used_scale.call_deferred()
 	var now := Settings.preset_now()
 	for i in _preset.item_count:
 		if str(_preset.get_item_metadata(i)) == now:
@@ -483,9 +494,11 @@ func _graphics() -> void:
 		"Syncs frames with your monitor refresh rate to prevent tearing.", true)
 	_card_dropdown(dp, "FPS limit", "graphics", "fps_cap", [["Unlimited", 0], ["30", 30], ["60", 60], ["120", 120], ["144", 144], ["240", 240]],
 		"Caps the client frame rate.", true)
-	_card_slider(dp, "Game render scaling", "graphics", "render_scale", 0.5, 2.0, 0.05, pct, true, false,
+	_card_slider(dp, "Game render scaling", "graphics", "render_scale", 0.33, 2.0, 0.01, pct, true, false,
 		"Scales the 3D world resolution while keeping menus and UI sharp.", Callable(), 100.0)
-	_card_dropdown(dp, "Upscaling", "graphics", "upscaler", UPSCALER_ITEMS, UPSCALER_NOTE, true)
+	_ask_before_dlss(_card_dropdown(dp, "Upscaling", "graphics", "upscaler", UPSCALER_ITEMS, UPSCALER_NOTE, true))
+	_upscaling_quality(dp, true)
+	_dlss_consent_row(dp)
 	var screens: Array = [["Primary screen (%d)" % (DisplayServer.get_primary_screen() + 1), -1]]
 	for i in DisplayServer.get_screen_count():
 		var s := DisplayServer.screen_get_size(i)
@@ -494,6 +507,7 @@ func _graphics() -> void:
 		"Chooses which monitor the game window opens and fullscreens on.", true).item_selected.connect(reopen)
 	_card_slider(da, "Upscaler sharpness", "graphics", "upscaler_sharpness", 0.0, 1.0, 0.05, pct, true, false,
 		UPSCALER_SHARPNESS_NOTE, Callable(), 100.0)
+	_grey_upscaler_rows()
 	_card_check(da, "Minimize on focus loss", "graphics", "minimize_on_focus_loss",
 		"Minimizes fullscreen windows when switching to another app.")
 	_finish_category_card(c_display)
@@ -541,6 +555,8 @@ func _graphics() -> void:
 		"Caches visited 16×16 chunk regions on disk so revisiting areas loads faster.")
 	_card_check(pa, "Render on a separate thread", "graphics", "render_thread",
 		"Godot's renderer on its own thread: smoother on busy bases. Off: the main thread draws, as before. Needs restart.")
+	if OS.get_name() == "Windows":
+		_card_dropdown(pa, "Renderer", "graphics", "renderer", RENDERER_ITEMS, _renderer_note())
 	_finish_category_card(c_perf)
 
 	# Column 1: View & Distances + World & Atmosphere
@@ -718,11 +734,14 @@ func _graphics_legacy() -> void:
 		"Syncs frames with your monitor refresh rate to prevent tearing.", true)
 	_dropdown(grid, "FPS limit", "graphics", "fps_cap", [["Unlimited", 0], ["30", 30], ["60", 60], ["120", 120], ["144", 144], ["240", 240]],
 		"Caps the client frame rate.", true)
-	_slider(grid, "Game render scaling", "graphics", "render_scale", 0.5, 2.0, 0.05, func(v: float) -> String: return "%d%%" % roundi(v * 100.0), true, false,
+	_slider(grid, "Game render scaling", "graphics", "render_scale", 0.33, 2.0, 0.01, func(v: float) -> String: return "%d%%" % roundi(v * 100.0), true, false,
 		"Scales the 3D world resolution while keeping menus and UI sharp.", Callable(), 100.0)
-	_dropdown(grid, "Upscaling", "graphics", "upscaler", UPSCALER_ITEMS, UPSCALER_NOTE, true)
+	_ask_before_dlss(_dropdown(grid, "Upscaling", "graphics", "upscaler", UPSCALER_ITEMS, UPSCALER_NOTE, true))
+	_upscaling_quality(grid, false)
+	_dlss_consent_row(grid)
 	_slider(grid, "Upscaler sharpness", "graphics", "upscaler_sharpness", 0.0, 1.0, 0.05, func(v: float) -> String: return "%d%%" % roundi(v * 100.0), true, false,
 		UPSCALER_SHARPNESS_NOTE, Callable(), 100.0)
+	_grey_upscaler_rows()
 	var lod_items := [["Low", "low"], ["Medium", "medium"], ["High", "high"], ["Ultra", "ultra"]]
 	var lod_note := "Controls how quickly distant 3D models, shadows, and merged chunks simplify."
 	var view_tiles := float(maxi(32, int(Settings.get_value("graphics", "view_radius")) * 32))
@@ -847,6 +866,8 @@ func _graphics_legacy() -> void:
 		"Ties detailed 3D lamp and furnace/lab lights to Level of detail and draws a cheap 2D lightmap for distant lamps out to View distance. Off: fewer detailed lights with no far light pools.")
 	_check(grid, "Render on a separate thread", "graphics", "render_thread",
 		"Godot's renderer on its own thread: smoother on busy bases. Off: the main thread draws, as before. Needs restart.")
+	if OS.get_name() == "Windows":
+		_dropdown(grid, "Renderer", "graphics", "renderer", RENDERER_ITEMS, _renderer_note())
 
 	_heading("Accessibility")
 	grid = _grid()
@@ -1123,6 +1144,10 @@ func _interface() -> void:
 		"dragged belts keep to the held belt's line, as in Factorio (R turns it); off, they follow the cursor round corners")
 	_check(grid, "Vehicle: opposite key brakes and holds", "interface", "vehicle_brake_hold",
 		"driving: S while going forward (W while reversing) brakes to a stop and stays stopped until let go|Not Factorio's way: there the opposite key brakes and then reverses. With this on, the key brakes the car, tank or locomotive to a stop and holds it there until you let go; pressing it again from a stop drives that way. Off by default; --vehicle-brake-hold=on|off sets it for one run.")
+	_check(grid, "Always keep player's main inventory sorted", "interface", "auto_sort_inventory",
+		"sorts and merges stacks in the character's main inventory automatically")
+	_check(grid, "Always keep other inventories sorted", "interface", "auto_sort_containers",
+		"sorts and merges stacks in open chests, cargo wagons, vehicle trunks and trash slots")
 
 	_heading("UI scale")
 	grid = _grid()
@@ -1137,7 +1162,7 @@ func _interface() -> void:
 
 	_heading("Other")
 	grid = _grid()
-	_slider(grid, "Chat message delay", "interface", "message_delay", 1.0, 20.0, 0.5, func(v: float) -> String: return "%d s" % roundi(v))
+	_slider(grid, "Chat message delay", "interface", "message_delay", 1.0, 20.0, 0.5, func(v: float) -> String: return ("%d s" % roundi(v)) if is_equal_approx(v, roundf(v)) else "%.1f s" % v)
 
 	_heading("3D client")
 	grid = _grid()
@@ -1171,6 +1196,11 @@ func _other() -> void:
 	var intervals: Array = [["Never", 0]]
 	for m in [1, 2, 5, 10, 15, 20, 30, 60]:
 		intervals.append(["%d min" % m, m])
+	# An interval set in Factorio's own settings (use_factorio_settings) may be none of these: show it, not "Never".
+	var interval := int(Settings.get_value("factorio", "autosave_interval"))
+	if interval > 0 and not [1, 2, 5, 10, 15, 20, 30, 60].has(interval):
+		intervals.append(["%d min" % interval, interval])
+		intervals.sort_custom(func(a: Array, b: Array) -> bool: return int(a[1]) < int(b[1]))
 	_dropdown(grid, "Autosave interval", "factorio", "autosave_interval", intervals, "servers started from the menu")
 	_slider(grid, "Autosave slots", "factorio", "autosave_slots", 1, 20, 1, func(v: float) -> String: return "%d" % int(v))
 	_check(grid, "Verbose logging", "factorio", "verbose_logging", "the server's factorio-current.log")
@@ -1228,7 +1258,15 @@ func _mod_settings() -> void:
 				control = spin
 			_:
 				var e := MenuKit.textbox(str(current))
-				e.text_submitted.connect(func(t: String) -> void: _set_mod_setting(name, JSON.stringify(t.strip_edges())))
+				e.set_meta("sent", str(current))
+				var send_text := func() -> void:
+					var t := e.text.strip_edges()
+					if t != str(e.get_meta("sent")):
+						e.set_meta("sent", t)
+						_set_mod_setting(name, JSON.stringify(t))
+				e.text_submitted.connect(func(_t: String) -> void: send_text.call())
+				# Leaving the box applies it too (Factorio applies a text setting when you confirm).
+				e.focus_exited.connect(send_text)
 				control = e
 		control.name = "mod-" + name
 		_row(grid, m[1], control, "default %s" % str(m[3]))
@@ -1246,6 +1284,7 @@ func _camera() -> void:
 	_dropdown(grid, "Projection on the map", "camera", "map_orthographic", [["Perspective", false], ["Orthographic", true]], "the remote view, zoomed in from the map; F7 there switches it")
 	_dropdown(grid, "Projection in first person", "camera", "first_person_orthographic", [["Perspective", false], ["Orthographic", true]], "F7 in first person switches it")
 	_slider(grid, "Furthest zoom", "camera", "max_zoom", 60.0, 400.0, 10.0, func(v: float) -> String: return "%d tiles" % int(v), false, false, "the default is 140; far out, more of the world must be drawn")
+	_check(grid, "Auto-swap map between 2D and 3D on zoom", "camera", "map_auto_swap", "zooming all the way in on the 2D map drops into 3D, and zooming out past the distance below goes back to 2D; off uses the 2D/3D button in the top bar")
 	_slider(grid, "Zoom out to the map at", "camera", "map_zoom_out", 80.0, 480.0, 10.0, func(v: float) -> String: return "%d tiles" % int(v), false, false, "the view zoomed in from the map goes back to the map when zoomed out this far; the default is 240")
 	_slider(grid, "Mouse sensitivity", "camera", "look_sensitivity", 0.25, 3.0, 0.05, func(v: float) -> String: return "%.2f×" % v)
 	_check(grid, "Invert mouse look", "camera", "invert_y", "first person and middle-drag tilt")
@@ -1534,19 +1573,235 @@ func _grey_for_look(name: String, what: String, where: String) -> void:
 ## Settings > Graphics > Upscaling's choices and tooltips (Settings.scaling_mode_for). FSR 2.2 is AMD's
 ## temporal upscaler: Godot 4.7 ships it as Viewport.SCALING_3D_MODE_FSR2, the upgraded drop-in
 ## successor of FSR 2.1 (so --upscaler=fsr2.1 is the same thing).
-const UPSCALER_ITEMS := [["Bilinear", "bilinear"], ["FSR 1.0", "fsr1"], ["FSR 2.2 (Temporal)", "fsr2"]]
-const UPSCALER_NOTE := "Scales 3D rendering to your monitor. FSR 1.0 is fast spatial sharpening; FSR 2.2 is sharper temporal reconstruction (at 100% it runs as Native AA, lower Game render scaling below 100% for FPS gains; replaces TAA/MSAA, and falls back in orthographic views)."
-const UPSCALER_SHARPNESS_NOTE := "Sharpening strength for FSR 1.0 and FSR 2.2."
+## AMD FSR 4.1, AMD FSR 3.1 and NVIDIA DLSS come from the vendors' runtimes (upscalers.gd): greyed out with the
+## reason where this PC or build can't run them, never hidden.
+const UPSCALER_ITEMS := [["Bilinear", "bilinear"], ["FSR 1.0", "fsr1"], ["FSR 2.2 (Temporal)", "fsr2"],
+	["AMD FSR 4.1", "fsr4"], ["AMD FSR 3.1", "fsr3"], ["NVIDIA DLSS", "dlss"], ["Automatic", "auto"]]
+const UPSCALER_NOTE := "Scales 3D rendering to your monitor. FSR 1.0 is fast spatial sharpening; FSR 2.2 is sharper temporal reconstruction (at 100% it runs as Native AA, lower Game render scaling below 100% for FPS gains; replaces TAA/MSAA, and falls back in orthographic views). AMD FSR 4.1 (Radeon RX 6000 or newer), AMD FSR 3.1 (any GPU) and NVIDIA DLSS need Direct3D 12 and their runtime; Automatic picks the best this PC can run."
+const UPSCALER_SHARPNESS_NOTE := "Sharpening strength for FSR 1.0, FSR 2.2, AMD FSR 4.1 and AMD FSR 3.1."
+const UPSCALER_QUALITY_NOTE := "Sets Game render scaling for AMD FSR 4.1, AMD FSR 3.1 and NVIDIA DLSS. Custom keeps the slider's own value."
+const UPSCALER_NAMES := {"bilinear": "Bilinear", "fsr1": "FSR 1.0", "fsr2": "FSR 2.2", "fsr4": "AMD FSR 4.1", "fsr3": "AMD FSR 3.1",
+	"dlss": "NVIDIA DLSS", "auto": "Automatic"}
 
 
-## FSR 2.2 (Upscaling, at Game render scaling 100% or below) does its own temporal anti-aliasing, so the
-## Anti-aliasing row greys out while it is on, its tooltip saying why. The saved choice stays for when
+## Upscaling's entries this PC or build can't run, greyed out, each saying why (Upscalers.unavailable_reason).
+## The button says what runs instead when the saved choice can't run, or what Automatic picked.
+func _grey_upscalers(o: OptionButton) -> void:
+	if o == null:
+		return
+	for i in o.item_count:
+		var why := Upscalers.unavailable_reason(str(o.get_item_metadata(i)))
+		# Only the player's OK missing: not greyed, picking it asks first (_ask_dlss_consent).
+		var asks := why == Upscalers.REASON_CONSENT
+		o.set_item_disabled(i, why != "" and not asks)
+		o.set_item_tooltip(i, wrap_tooltip(DLSS_ASKS_TIP if asks else (why + ".")) if why != "" else "")
+	var choice := Settings.upscaler_choice()
+	var now := Settings.upscaler_in_effect()
+	var tip := str(o.get_meta(&"base_tooltip", ""))
+	var why_not := Upscalers.unavailable_reason(choice)
+	if why_not != "":
+		tip = wrap_tooltip("%s: %s. %s is drawing instead; the choice stays for when it can run."
+			% [UPSCALER_NAMES.get(choice, choice), why_not, UPSCALER_NAMES.get(now, now)])
+	elif choice == "auto":
+		tip = wrap_tooltip("Automatic picks %s on this PC. %s" % [UPSCALER_NAMES.get(now, now), UPSCALER_NOTE])
+	o.tooltip_text = tip
+	var title_lbl := o.get_meta(&"row_title", null) as Label
+	if title_lbl != null:
+		title_lbl.tooltip_text = tip
+
+
+## NVIDIA DLSS's prompt (alt/dlss-s7c, the owner's decision: no hidden traffic). NVIDIA's graphics driver starts its
+## own updater as soon as DLSS asks it anything, and Zenith can't turn that off, so the player is told and asked
+## before anything of NVIDIA's is loaded (Upscalers.REASON_CONSENT, DlssHost). Plain words, both ways.
+const DLSS_PROMPT_TITLE := "NVIDIA DLSS"
+const DLSS_PROMPT_TEXT := "NVIDIA DLSS uses your NVIDIA graphics driver. When DLSS starts, the driver runs NVIDIA's own updater (nvngx_update.exe), which may connect to NVIDIA's servers to check for DLSS updates. Zenith sends nothing itself and can't turn this off.\n\nYou can withdraw this later under Settings > Graphics > Upscaling.\n\nUse DLSS?"
+const DLSS_ASKS_TIP := "Asks first: NVIDIA's graphics driver runs NVIDIA's own updater (nvngx_update.exe) when DLSS starts, which may connect to NVIDIA's servers."
+const DLSS_CONSENT_NOTE := "You allowed NVIDIA DLSS, so NVIDIA's graphics driver may run NVIDIA's updater (nvngx_update.exe), which may connect to NVIDIA's servers. Withdraw turns DLSS off (FSR 3.1 or FSR 2.2 draws instead) and Zenith asks again next time DLSS is picked. NVIDIA's files already loaded stay loaded until Zenith closes."
+
+## The prompt while it is open (Esc cancels it).
+var _dlss_prompt: CanvasLayer = null
+
+
+## Upscaling's dropdown asks before NVIDIA DLSS (or Automatic, when it would pick DLSS) is saved without the player's
+## OK; every other choice saves and applies as any dropdown does. Greys its entries (_grey_upscalers).
+func _ask_before_dlss(o: OptionButton) -> void:
+	if o == null:
+		return
+	for c: Dictionary in o.item_selected.get_connections():
+		o.item_selected.disconnect(c["callable"])
+	var on_selected := func(i: int) -> void:
+		Sfx.play_ui("gui-click")
+		var value := str(o.get_item_metadata(i))
+		if Upscalers.needs_consent(value):
+			_ask_dlss_consent(value)
+			return
+		Settings.set_value("graphics", "upscaler", value)
+		Settings.apply_window(get_tree().root)
+	o.item_selected.connect(on_selected)
+	_grey_upscalers(o)
+
+
+## The prompt: "Use DLSS" saves the OK and the choice; Cancel (or Esc) keeps the previous choice.
+func _ask_dlss_consent(value: String) -> void:
+	_close_dlss_prompt()
+	var layer := CanvasLayer.new()
+	layer.layer = 110  # over the menus and the game's UI
+	layer.name = "DlssConsentPrompt"
+	var o := MenuKit.overlay(0.35)
+	layer.add_child(o)
+	var parts := MenuKit.window(DLSS_PROMPT_TITLE)
+	MenuKit.overlay_center(o).add_child(parts[0])
+	var box: VBoxContainer = parts[1]
+	box.add_child(MenuKit.paragraph(DLSS_PROMPT_TEXT, 460))
+	var row: Array = MenuKit.dialog_buttons("Cancel", "Use DLSS")
+	box.add_child(row[0])
+	(row[1] as Button).name = "Cancel"
+	(row[2] as Button).name = "UseDlss"
+	(row[1] as Button).pressed.connect(_dlss_prompt_answer.bind(value, false))
+	(row[2] as Button).pressed.connect(_dlss_prompt_answer.bind(value, true))
+	add_child(layer)
+	_dlss_prompt = layer
+
+
+## The prompt's answer: yes saves the OK, then the choice (both applied); no puts the dropdown back.
+func _dlss_prompt_answer(value: String, yes: bool) -> void:
+	Sfx.play_ui("gui-click" if yes else "gui-back")
+	_close_dlss_prompt()
+	if yes:
+		Settings.set_dlss_consent(true)
+		Settings.set_value("graphics", "upscaler", value)
+		Settings.apply_window(get_tree().root)
+		_open_tab.call_deferred(_tab)  # the "NVIDIA updater: allowed" row shows
+	else:
+		_show_choice("graphics", "upscaler")
+		_grey_upscaler_rows()
+
+
+func _close_dlss_prompt() -> void:
+	if is_instance_valid(_dlss_prompt):
+		_dlss_prompt.queue_free()
+	_dlss_prompt = null
+
+
+## Under Upscaling, once the player said yes to NVIDIA's updater: "NVIDIA updater: allowed" and Withdraw, which
+## clears the OK and turns DLSS off (the saved choice then falls back as any it can't run). Not there before the OK.
+## With --dlss-consent on the command line the switch decides for the run: the button is greyed.
+func _dlss_consent_row(parent: Container) -> void:
+	if not Upscalers.dlss_consent():
+		return
+	var b := MenuKit.button("Withdraw")
+	b.name = "graphics-dlss_consent"
+	var from_switch := Upscalers.dlss_consent_from_switch()
+	b.disabled = from_switch
+	if from_switch:
+		b.tooltip_text = wrap_tooltip("Set by --dlss-consent for this run.")
+	b.pressed.connect(func() -> void:
+		Sfx.play_ui("gui-click")
+		Settings.set_dlss_consent(false)
+		_open_tab.call_deferred(_tab))
+	if parent is VBoxContainer:
+		_card_row(parent as VBoxContainer, "NVIDIA updater: allowed", b, DLSS_CONSENT_NOTE)
+	else:
+		_row(parent as GridContainer, "NVIDIA updater: allowed", b, DLSS_CONSENT_NOTE)
+
+
+## Upscaling quality (for AMD FSR 4.1, AMD FSR 3.1 and NVIDIA DLSS): a choice sets Game render scaling; it shows
+## the one the slider matches, Custom when none does. It saves nothing of its own.
+func _upscaling_quality(parent: Control, card: bool) -> OptionButton:
+	var o := MenuKit.dropdown(Upscalers.quality_items(), Upscalers.quality_for_scale(float(Settings.get_value("graphics", "render_scale"))))
+	o.name = "graphics-upscaler_quality"
+	if card:
+		o.fit_to_longest_item = false
+		o.clip_text = true
+		o.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+		o.custom_minimum_size = Kit.pxv(140, 26)
+		o.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		o.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var on_selected := func(i: int) -> void:
+		Sfx.play_ui("gui-click")
+		var scale := Upscalers.quality_scale(str(o.get_item_metadata(i)))
+		if scale > 0.0:
+			Settings.set_value("graphics", "render_scale", scale)
+			Settings.apply_window(get_tree().root)
+			_open_tab.call_deferred(_tab)  # the Game render scaling slider shows it
+	o.item_selected.connect(on_selected)
+	if card:
+		_card_row(parent as VBoxContainer, "Upscaling quality", o, UPSCALER_QUALITY_NOTE)
+	else:
+		_row(parent as GridContainer, "Upscaling quality", o, UPSCALER_QUALITY_NOTE)
+	return o
+
+
+## Upscaling's rows after a change: its greyed entries, Upscaling quality (only for AMD FSR 4.1/3.1, NVIDIA
+## DLSS and Automatic; it follows the slider) and Upscaler sharpness (greyed under DLSS, which sharpens itself).
+func _grey_upscaler_rows() -> void:
+	if not is_instance_valid(_pane):
+		return
+	_grey_upscalers(_pane.find_child("graphics-upscaler", true, false) as OptionButton)
+	var choice := Settings.upscaler_choice()
+	var q := _pane.find_child("graphics-upscaler_quality", true, false) as OptionButton
+	if q != null:
+		var want := Upscalers.quality_for_scale(float(Settings.get_value("graphics", "render_scale")))
+		for i in q.item_count:
+			if str(q.get_item_metadata(i)) == want and q.selected != i:
+				q.select(i)
+		var off := not (Upscalers.VENDOR.has(choice) or choice == "auto")
+		q.disabled = off
+		var tip := wrap_tooltip("Only for AMD FSR 4.1, AMD FSR 3.1 and NVIDIA DLSS: use Game render scaling with the other upscalers." if off else UPSCALER_QUALITY_NOTE)
+		q.tooltip_text = tip
+		var title_lbl := q.get_meta(&"row_title", null) as Label
+		if title_lbl != null:
+			title_lbl.tooltip_text = tip
+	var sharp := _pane.find_child("graphics-upscaler_sharpness", true, false) as HSlider
+	if sharp != null:
+		if not sharp.has_meta(&"own_tooltip"):
+			sharp.set_meta(&"own_tooltip", sharp.tooltip_text)
+		var dlss := Settings.upscaler_in_effect() == "dlss"
+		sharp.editable = not dlss
+		sharp.tooltip_text = wrap_tooltip("Off under NVIDIA DLSS: it does its own sharpening.") if dlss else str(sharp.get_meta(&"own_tooltip"))
+	_show_used_scale()
+
+
+## Beside Game render scaling: the scale NVIDIA DLSS really draws at when it fits the asked one to its mode's size
+## (DlssHost.fit_scale, e.g. a Custom 80% drawn at DLSS Quality's 67%); hidden otherwise. DlssHost calls it again
+## when it refits (DlssHost.SCALE_WATCHERS).
+func _show_used_scale() -> void:
+	if not is_instance_valid(_pane) or not is_inside_tree():
+		return
+	var slider := _pane.find_child("graphics-render_scale", true, false) as Control
+	if slider == null or slider.get_parent() == null:
+		return
+	var holder := slider.get_parent()
+	var lbl := holder.get_node_or_null("graphics-render_scale-used") as Label
+	var root := get_tree().root
+	var text := ""
+	if DlssHost.running(root):
+		var asked := clampf(float(Settings.get_value("graphics", "render_scale")), 0.25, 2.0)
+		text = DlssHost.scale_note(asked, root.scaling_3d_scale / maxf(Settings.full_screen_ratio(), 0.0001))
+	if text == "":
+		if lbl != null:
+			lbl.visible = false
+		return
+	if lbl == null:
+		lbl = Label.new()
+		lbl.name = "graphics-render_scale-used"
+		lbl.mouse_filter = Control.MOUSE_FILTER_PASS
+		lbl.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		lbl.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+		lbl.tooltip_text = wrap_tooltip("NVIDIA DLSS takes only its own render sizes for each quality mode, so the 3D world is drawn at this scale. The slider keeps the one you set for the other upscalers.")
+		holder.add_child(lbl)
+	lbl.text = text
+	lbl.visible = true
+
+
+## A temporal upscaler (FSR 2.2, AMD FSR 4.1/3.1 or NVIDIA DLSS, at Game render scaling 100% or below) does
+## its own temporal anti-aliasing, so the Anti-aliasing row greys out while it is on, its tooltip saying why. The saved choice stays for when
 ## another upscaler (or a scale above 100%) is picked.
 func _grey_aa_for_fsr2(o: OptionButton) -> void:
 	if o == null:
 		return
 	var title_lbl := o.get_meta(&"row_title", null) as Label
-	if not Settings.fsr2_wanted():
+	if not Settings.temporal_upscaler_wanted():
 		o.disabled = false
 		var base_tip := str(o.get_meta(&"base_tooltip", ""))
 		o.tooltip_text = base_tip
@@ -1554,7 +1809,8 @@ func _grey_aa_for_fsr2(o: OptionButton) -> void:
 			title_lbl.tooltip_text = base_tip
 		return
 	o.disabled = true
-	var tip := wrap_tooltip("Off while FSR 2.2 is the upscaler: it does its own temporal anti-aliasing, replacing TAA, SMAA, FXAA and MSAA. Pick Bilinear or FSR 1.0 in Upscaling (or Game render scaling above 100%) to use these again.")
+	var now := Settings.upscaler_in_effect()
+	var tip := wrap_tooltip("Off while %s is the upscaler: it does its own temporal anti-aliasing, replacing TAA, SMAA, FXAA and MSAA. Pick Bilinear or FSR 1.0 in Upscaling (or Game render scaling above 100%%) to use these again." % str(UPSCALER_NAMES.get(now, now)))
 	o.tooltip_text = tip
 	if title_lbl != null:
 		title_lbl.tooltip_text = tip
@@ -2116,6 +2372,17 @@ func _card_dropdown(parent: VBoxContainer, text: String, section: String, key: S
 	return o
 
 
+## Settings > Graphics > Renderer (Windows only): Godot's rendering driver for the next start.
+const RENDERER_ITEMS := [["Direct3D 12", "d3d12"], ["Vulkan", "vulkan"]]
+
+
+func _renderer_note() -> String:
+	var now := RenderingServer.get_current_rendering_driver_name()
+	var names := {"d3d12": "Direct3D 12", "vulkan": "Vulkan", "opengl3": "OpenGL", "dummy": "none (headless)"}
+	return ("Direct3D 12 (default) used about half the memory of Vulkan on big bases; Vulkan draws as before 0.3.1. "
+		+ "Falls back to Vulkan if Direct3D 12 can't start. Drawing now with: %s. Needs restart.") % str(names.get(now, now))
+
+
 func _addons_host() -> Variant:
 	if addons != null:
 		return addons
@@ -2136,6 +2403,7 @@ func _refresh_look_overrides() -> void:
 	if aa != null:
 		_grey_msaa(aa)
 		_grey_aa_for_fsr2(aa)
+	_grey_upscaler_rows()
 
 
 static func _slug(text: String) -> String:

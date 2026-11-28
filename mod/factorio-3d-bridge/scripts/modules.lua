@@ -272,12 +272,113 @@ end
 -- distribution effectivity, as 2.1.23 reports it), m? (its modules
 -- [[name, count, quality?], ...]), b? (beacons reaching a machine), n? (machines a beacon reaches),
 -- de? (a beacon's distribution effectivity, thousandths), el? (its electricity, M.electricity),
--- rn? (a roboport's links to other roboports, M.roboport_links), inv? (what is inside,
+-- rn? (a roboport's links to other roboports, M.roboport_links), ln? (a roboport's or logistic
+-- chest's logistic network, filter or active requests), inv? (what is inside,
 -- M.hover_inventories), pr? ps? (a crafter's progress and its rate), bn? (the burning fuel left,
 -- thousandths), io? (a crafter's ingredients and products a second, M.rates), pl? ([extent, limit] of a
 -- pipe's, pipe to ground's or storage tank's pipeline, tiles: Factorio's "Pipeline extent: 333/320", L11),
 -- ox? (1: that pipeline is overextended), ra? (a resource's amount now, L6)}.
 -- Reads only.
+local function proto_name(v)
+  if type(v) == "table" or type(v) == "userdata" then
+    return try(function() return v.name end)
+  end
+  return type(v) == "string" and v or nil
+end
+
+local function logistic_requests(e)
+  local secs = try(function() return e.get_logistic_sections() end)
+  if not secs then
+    return nil
+  end
+  local list = try(function() return secs.sections end)
+  if type(list) ~= "table" then
+    local first = try(function() return secs.get_section(1) end)
+    list = first and { first } or {}
+  end
+  local req = {}
+  for _, sec in ipairs(list) do
+    local active = try(function() return sec.active end)
+    if active ~= false then
+      local mult = tonumber(try(function() return sec.multiplier end)) or 1
+      for _, flt in pairs(try(function() return sec.filters end) or {}) do
+        local v = flt and flt.value
+        local vtype = v and v.type
+        local iname = v and (vtype == nil or vtype == "item") and proto_name(v.name)
+        if iname and iname ~= "" then
+          local min_c = math.max(0, math.floor((tonumber(flt.min) or 0) * mult + 0.5))
+          local max_v = tonumber(flt.max)
+          local max_c = max_v and math.floor(max_v * mult + 0.5) or -1
+          local rec = { iname, min_c, max_c }
+          local q = proto_name(v.quality)
+          if q and q ~= "" and q ~= "normal" then
+            rec[4] = q
+          end
+          req[#req + 1] = rec
+          if #req >= 12 then
+            return req
+          end
+        end
+      end
+    end
+  end
+  return #req > 0 and req or nil
+end
+
+local function logistic_hover_info(e)
+  local is_ghost = e.type == "entity-ghost"
+  local etype = is_ghost and try(function() return e.ghost_prototype.type end) or e.type
+  if etype ~= "roboport" and etype ~= "logistic-container" then
+    return nil
+  end
+  local net = not is_ghost and try(function() return e.logistic_network end) or nil
+  local valid_net = net and try(function() return net.valid end)
+  local id = valid_net and (try(function() return net.network_id end) or 0) or 0
+  if etype == "roboport" then
+    if id == 0 then
+      return { id = 0 }
+    end
+    local net_name = try(function() return net.custom_name end) or ""
+    local cell = try(function() return e.logistic_cell end)
+    local charging = cell and (try(function() return cell.charging_robot_count end)
+      or try(function() return #cell.charging_robots end)) or 0
+    local to_charge = cell and (try(function() return cell.to_charge_robot_count end)
+      or try(function() return #cell.to_charge_robots end)) or 0
+    return {
+      id = id,
+      name = net_name,
+      log = {
+        try(function() return net.available_logistic_robots end) or 0,
+        try(function() return net.all_logistic_robots end) or 0,
+      },
+      con = {
+        try(function() return net.available_construction_robots end) or 0,
+        try(function() return net.all_construction_robots end) or 0,
+      },
+      ch = { charging, to_charge },
+    }
+  end
+  local mode = is_ghost and try(function() return e.ghost_prototype.logistic_mode end)
+    or try(function() return e.prototype.logistic_mode end)
+    or ""
+  local net_name = id ~= 0 and (try(function() return net.custom_name end) or "") or ""
+  local ln = { id = id, name = net_name, mode = mode }
+  if mode == "storage" then
+    local flt = try(function() return e.get_filter(1) end)
+    local fname = flt and proto_name(try(function() return flt.name end))
+    if fname and fname ~= "" then
+      ln.f = fname
+      local fq = proto_name(try(function() return flt.quality end))
+      if fq and fq ~= "" and fq ~= "normal" then
+        ln.fq = fq
+      end
+    end
+  elseif mode == "requester" or mode == "buffer" then
+    ln.req = logistic_requests(e)
+  end
+  return ln
+end
+
 function M.hover(cmd)
   local q = math.floor(tonumber(cmd.q) or 0)
   local e = puppet.find_target(world.surface(), cmd)
@@ -290,6 +391,8 @@ function M.hover(cmd)
       msg.pl = { extent, pipelines.limit() }
     end
     msg.ox = pipelines.overextended(e) and 1 or nil
+  elseif e and e.valid and e.type == "entity-ghost" then
+    msg.ln = logistic_hover_info(e)
   elseif e and e.valid and e.type ~= "entity-ghost" then
     msg.el = M.electricity(e)
     msg.eff = M.effects_of(e)
@@ -310,7 +413,26 @@ function M.hover(cmd)
     end
     if e.type == "roboport" then
       msg.rn = M.roboport_links(e)
+    elseif e.type == "fluid-wagon" then
+      local fl = {}
+      local n = try(function() return e.fluids_count end) or 0
+      for i = 1, n do
+        local fluid = try(function() return e.get_fluid(i) end)
+        local cap = try(function() return e.get_fluid_capacity(i) end)
+        if fluid and fluid.name then
+          fl[#fl + 1] = {
+            fluid = fluid.name,
+            amount = math.floor((fluid.amount or 0) + 0.5),
+            capacity = type(cap) == "number" and math.floor(cap + 0.5) or 0,
+            temperature = math.floor((fluid.temperature or 15) + 0.5),
+          }
+        end
+      end
+      if #fl > 0 then
+        msg.fl = fl
+      end
     end
+    msg.ln = logistic_hover_info(e)
     msg.inv = M.hover_inventories(e)
     crafting(msg, e)
     msg.io = M.rates(e)

@@ -22,6 +22,10 @@ const RichText := preload("res://scripts/ui/factorio/rich_text.gd")
 const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
+const ModelPreview := preload("res://scripts/ui/factorio/model_preview.gd")
+const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const InserterArms := preload("res://scripts/world/inserter_arms.gd")
+const AnimLayer := preload("res://scripts/world/anim.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const CraftingPanel := preload("res://scripts/ui/factorio/crafting_panel.gd")
 const Controls := preload("res://scripts/player/controls.gd")
@@ -187,6 +191,185 @@ static func bare_row(screen, role: String, columns := Kit.COLUMNS, ghosts: Array
 
 # --- the entity preview ------------------------------------------------------------------------------
 
+class _PreviewView:
+	extends SubViewportContainer
+
+	var vp: SubViewport
+	var world_root: Node3D
+	var holder: Node3D
+	var cam: Camera3D
+	var sun: DirectionalLight3D
+	var proto_name := ""
+	var proto_type := ""
+	var footprint := Vector2.ONE
+	var base_mesh: Mesh
+	var resolved := ""
+	var pending_pieces := false
+	var renders_left := 2
+	var apart_version := -1
+	var rendered_size := Vector2i.ZERO
+
+	static func _apart_pos() -> Vector3:
+		var field := GroundHeight.area()
+		var x := maxf(1e5, field.end.x + ModelPreview.APART) if field.has_area() else 1e5
+		return Vector3(roundf(x), 0.0, 1e5)
+
+	static func _part_node(mesh: Mesh, xf: Transform3D, part: ModelLibrary.AnimPart) -> GeometryInstance3D:
+		if part == null or part.kind != "baked" or part.bake.is_empty():
+			var mi := MeshInstance3D.new()
+			mi.mesh = mesh
+			mi.transform = xf
+			return mi
+		AnimLayer.setup_part(part)
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.use_custom_data = true
+		mm.mesh = mesh
+		mm.instance_count = 1
+		mm.set_instance_transform(0, Transform3D.IDENTITY)
+		mm.set_instance_custom_data(0, ModelPreview.PART_AT_REST)
+		var mmi := MultiMeshInstance3D.new()
+		mmi.multimesh = mm
+		mmi.transform = xf
+		mmi.set_meta("rest_box", ModelPreview.baked_rest_box(part))
+		return mmi
+
+	func _pin_seeds() -> void:
+		var pin := Vector3(world_root.position.x, 1.0, world_root.position.z)
+		for child in holder.get_children():
+			var g := child as GeometryInstance3D
+			if g != null:
+				g.set_instance_shader_parameter(&"f3d_seed_at", pin)
+
+	func _merged_box() -> AABB:
+		var box := AABB()
+		var first := true
+		for child in holder.get_children():
+			var b: AABB
+			var mi := child as MeshInstance3D
+			if mi != null and mi.mesh != null:
+				b = mi.transform * mi.mesh.get_aabb()
+			elif child is MultiMeshInstance3D and child.has_meta("rest_box"):
+				b = (child as Node3D).transform * (child.get_meta("rest_box") as AABB)
+			else:
+				continue
+			box = b if first else box.merge(b)
+			first = false
+		return box if not first else base_mesh.get_aabb()
+
+	func _fit_camera() -> void:
+		var box := _merged_box()
+		var centre := box.get_center()
+		var dir_to_eye := Vector3(0.0, 25.0, 30.0).normalized()
+		var eye_offset := dir_to_eye * maxf(box.size.length() * 2.0 + 10.0, 39.0)
+		var look := Basis.looking_at(-dir_to_eye, Vector3.UP)
+		var span_x := 0.0
+		var span_y := 0.0
+		for i in 8:
+			var rel := box.get_endpoint(i) - centre
+			span_x = maxf(span_x, absf(look.x.dot(rel)) * 2.0)
+			span_y = maxf(span_y, absf(look.y.dot(rel)) * 2.0)
+		var aspect := 400.0 / float(PREVIEW_HEIGHT)
+		if vp.size.y > 0 and vp.size.x > 0:
+			aspect = float(vp.size.x) / float(vp.size.y)
+		var fit := maxf(span_y, span_x / aspect)
+		var min_fit := maxf(maxf(footprint.y, box.size.z) * 0.64 + maxf(box.size.y, 0.5) * 0.77, footprint.x / aspect)
+		cam.size = maxf(PREVIEW_HEIGHT / PREVIEW_TILE, maxf(fit, min_fit) * 1.15)
+		cam.near = 0.1
+		cam.far = eye_offset.length() + box.size.length() + 50.0
+		cam.transform = Transform3D(look, centre + eye_offset)
+		sun.directional_shadow_max_distance = eye_offset.length() + box.size.length() * 2.0 + 10.0
+
+	func build_pieces() -> void:
+		apart_version = GroundHeight.version()
+		world_root.position = _apart_pos()
+		for c in holder.get_children():
+			holder.remove_child(c)
+			c.queue_free()
+		var model := MeshInstance3D.new()
+		model.mesh = base_mesh
+		holder.add_child(model)
+		# The moving parts (a pumpjack's beam, a drill's head, a splitter's gears) at rest in model space.
+		for part: ModelLibrary.AnimPart in ModelLibrary.parts_for_entity(proto_name, proto_type, {}, 0):
+			if part.mesh == null or part.lit:
+				continue
+			holder.add_child(_part_node(part.mesh, Transform3D.IDENTITY, part))
+		var wait := false
+		var check_name := resolved if resolved != "" else proto_name
+		var arm: Variant = InserterArms.resting_pieces(check_name)
+		if arm == null:
+			wait = true
+		elif arm is Array:
+			for p: Array in (arm as Array):
+				holder.add_child(_part_node(p[0], p[1], null))
+		var pieces: Variant = ModelLibrary.lone_belt_pieces(check_name)
+		if pieces == null:
+			wait = true
+		elif pieces is Array:
+			for p: Array in (pieces as Array):
+				holder.add_child(_part_node(p[0], p[1], p[2] if p.size() > 2 else null))
+		var stubs: Variant = ModelLibrary.lone_pipe_pieces(check_name)
+		if stubs == null:
+			wait = true
+		elif stubs is Array:
+			for p: Array in (stubs as Array):
+				holder.add_child(_part_node(p[0], p[1], null))
+		pending_pieces = wait
+		_pin_seeds()
+		_fit_camera()
+		renders_left = 2
+		vp.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
+		set_process(true)
+
+	func _process(_delta: float) -> void:
+		if apart_version != GroundHeight.version():
+			apart_version = GroundHeight.version()
+			world_root.position = _apart_pos()
+			_pin_seeds()
+			renders_left = maxi(renders_left, 2)
+			vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+		if pending_pieces:
+			if ModelLibrary.polled_frame < Engine.get_process_frames() - 1:
+				ModelLibrary.poll()
+			var check_name := resolved if resolved != "" else proto_name
+			if InserterArms.resting_pieces(check_name) != null \
+					and ModelLibrary.lone_belt_pieces(check_name) != null \
+					and ModelLibrary.lone_pipe_pieces(check_name) != null:
+				build_pieces()
+				vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+			return
+		if not is_visible_in_tree():
+			vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+			set_process(false)
+			return
+		if renders_left > 0:
+			renders_left -= 1
+			rendered_size = vp.size
+			vp.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
+		else:
+			rendered_size = vp.size
+			vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+			set_process(false)
+
+	func _notification(what: int) -> void:
+		if vp == null:
+			return
+		if what == NOTIFICATION_RESIZED:
+			_fit_camera()
+			if not pending_pieces and is_visible_in_tree():
+				renders_left = maxi(renders_left, 2)
+				vp.render_target_update_mode = SubViewport.UPDATE_ONCE
+				set_process(true)
+		elif what == NOTIFICATION_VISIBILITY_CHANGED:
+			if is_visible_in_tree():
+				if pending_pieces or renders_left > 0 or rendered_size != vp.size:
+					renders_left = maxi(renders_left, 2)
+					vp.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
+					set_process(true)
+				else:
+					vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+
+
 ## The entity on Factorio's checkerboard: its 3D model, seen from the game's angle, in a world of its
 ## own (only the model and a light), or its icon without a model.
 static func preview(proto_name: String, proto_type: String, footprint: Vector2) -> Control:
@@ -205,13 +388,20 @@ static func preview(proto_name: String, proto_type: String, footprint: Vector2) 
 				holder.draw_rect(Rect2(Vector2(x, y) * cell, Vector2(cell, cell)), CHECKER[(x + y) % 2])
 	holder.draw.connect(checker)
 	frame.add_child(holder)
-	var mesh: Mesh = ModelLibrary.mesh_for_entity(proto_name, proto_type, {}) if proto_name != "" else null
+	var mesh: Mesh = null
+	var resolved := ""
+	if proto_name != "":
+		for candidate: String in ModelLibrary.entity_models(proto_name, proto_type, {}, 0):
+			mesh = ModelLibrary.mesh_for(candidate)
+			if mesh != null:
+				resolved = candidate
+				break
 	if mesh == null:
 		var t := icon(Kit.item_icon(proto_name), 48)
 		t.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
 		holder.add_child(t)
 		return frame
-	var view := SubViewportContainer.new()
+	var view := _PreviewView.new()
 	view.stretch = true
 	view.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	view.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -220,17 +410,14 @@ static func preview(proto_name: String, proto_type: String, footprint: Vector2) 
 	vp.transparent_bg = true
 	vp.msaa_3d = Viewport.MSAA_4X
 	vp.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
-	var model := MeshInstance3D.new()
-	model.mesh = mesh
-	vp.add_child(model)
-	# The moving parts (a pumpjack's beam, a drill's head) are separate meshes in model space.
-	for part in ModelLibrary.parts_for_entity(proto_name, proto_type, {}):
-		var piece := MeshInstance3D.new()
-		piece.mesh = part.mesh
-		vp.add_child(piece)
+	var world_root := Node3D.new()
+	var model_holder := Node3D.new()
+	world_root.add_child(model_holder)
+	vp.add_child(world_root)
 	var sun := DirectionalLight3D.new()
 	sun.light_energy = 1.5
 	sun.shadow_enabled = true
+	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_ORTHOGONAL
 	# From the upper left, as the game's sprites are lit (their shadows fall to the right).
 	sun.rotation_degrees = Vector3(-50, -40, 0)
 	vp.add_child(sun)
@@ -243,17 +430,20 @@ static func preview(proto_name: String, proto_type: String, footprint: Vector2) 
 	vp.add_child(env)
 	var cam := Camera3D.new()
 	cam.projection = Camera3D.PROJECTION_ORTHOGONAL
-	var aabb := mesh.get_aabb()
-	var tall := maxf(aabb.size.y, 0.5)
-	# 32 pixels a tile like the sprites, smaller when the entity wouldn't fit.
-	var fit := maxf(maxf(footprint.y, aabb.size.z) * 0.71 + tall * 0.71, maxf(footprint.x, aabb.size.x) * PREVIEW_HEIGHT / 400.0)
-	cam.size = maxf(PREVIEW_HEIGHT / PREVIEW_TILE, fit * 1.2)
-	var centre := Vector3(aabb.get_center().x, tall * 0.4, aabb.get_center().z)
-	var eye := centre + Vector3(0, 25, 30)  # about 40 degrees up, like the game's sprites
-	cam.transform = Transform3D(Basis.looking_at(centre - eye, Vector3.UP), eye)
 	cam.current = true
-	vp.add_child(cam)
+	world_root.add_child(cam)
+	view.vp = vp
+	view.world_root = world_root
+	view.holder = model_holder
+	view.cam = cam
+	view.sun = sun
+	view.proto_name = proto_name
+	view.proto_type = proto_type
+	view.footprint = footprint
+	view.base_mesh = mesh
+	view.resolved = resolved
 	view.add_child(vp)
+	view.build_pieces()
 	holder.add_child(view)
 	return frame
 
@@ -646,23 +836,22 @@ static func lab(screen, body: Control) -> void:
 
 # --- chests -------------------------------------------------------------------------------------------
 
-## The chest's slots, 10 wide, with Factorio's red X limit button in the cell at the bar (slots past
-## it red), faint cells to the end of the row.
+## The chest's slots, 10 wide, with Factorio's red X limit button in the cell after the last slot
+## (slots past the bar red), faint cells to the end of the row.
 static func chest_grid(screen, role: String, x_button: Control, scroll_rows := 0) -> Control:
 	var grid := Kit.slot_grid(Kit.COLUMNS)
 	var stacks: Array = screen._slot_list(role)
 	var exact: bool = screen.knows_slots(role)
-	var bar := int(screen._last.get("bar", stacks.size()))
 	var cells := 0
 	for i in stacks.size():
-		if x_button != null and i == bar:
-			grid.add_child(x_button)
-			cells += 1
 		grid.add_child(screen._stack_slot(role, i + 1 if exact else 0, stacks[i]))
 		cells += 1
-	if x_button != null and bar >= stacks.size():
+	if x_button != null:
 		grid.add_child(x_button)
 		cells += 1
+		if screen.has_method("set_bar_hover"):
+			var on_grid_exit := func() -> void: screen.set_bar_hover(0)
+			grid.mouse_exited.connect(on_grid_exit)
 	while cells == 0 or cells % Kit.COLUMNS != 0:
 		grid.add_child(faint_cell())
 		cells += 1
@@ -744,14 +933,16 @@ static func network_heading(text: String, connected: bool) -> Control:
 	return r
 
 
-## A storage chest's "Logistic filters" and its one filter slot.
-static func storage_filter(screen, lg: Dictionary, choose: Callable) -> Control:
+## A storage chest's "Logistic filters" and its one filter slot (plus optional quality row).
+static func storage_filter(_screen, lg: Dictionary, choose: Callable, q_row: Control = null) -> Control:
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", Kit.px(8))
 	box.add_child(network_heading("Logistic filters", lg.get("net") is Dictionary))
 	var slot: Control = choose.call()
 	slot.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 	box.add_child(slot)
+	if q_row != null:
+		box.add_child(q_row)
 	return box
 
 
@@ -859,8 +1050,9 @@ static func group_editor(screen, index: int, current: String) -> Control:
 
 
 ## Factorio's logistic sections: a header per section (on/off box, its group or "[No group
-## assigned]", the rename pencil, the red delete button), its request slots 10 wide, then the
-## full-width "Add section" button. `slots(section, filters, send)` draws a section's slots.
+## assigned]", the rename pencil, editable multiplier, the red delete button), its request slots 10
+## wide, then the full-width "Add section" button. `slots(section, filters, send)` draws a
+## section's slots (`send` is invalid for non-manual/automatic sections, which are read-only).
 static func sections(screen, secs: Array, slots: Callable) -> Control:
 	var box := VBoxContainer.new()
 	box.add_theme_constant_override("separation", Kit.px(4))
@@ -869,62 +1061,99 @@ static func sections(screen, secs: Array, slots: Callable) -> Control:
 		if not (sec is Dictionary):
 			continue
 		var i := int(sec.get("i", 0))
+		var manual := int(sec.get("man", 1)) == 1
 		var head := Kit.panel("FSubheader")
 		var hr := _row(8)
 		head.add_child(hr)
-		var on := MenuKit.checkbox("", int(sec.get("on", 1)) == 1)
-		var set_on := func(v: bool) -> void: Bridge.send({"t": "set_section", "u": unit, "i": i, "on": 1 if v else 0})
-		on.toggled.connect(set_on)
-		hr.add_child(on)
 		var group := str(sec.get("g", ""))
+		var editor: Control = null
+		if manual:
+			var on := MenuKit.checkbox("", int(sec.get("on", 1)) == 1)
+			var set_on := func(v: bool) -> void: Bridge.send({"t": "set_section", "u": unit, "i": i, "on": 1 if v else 0})
+			on.toggled.connect(set_on)
+			hr.add_child(on)
 		if group != "":
 			var group_title := RichText.text_label(group, "FHeading", Kit.CAPTION)
 			group_title.name = "GroupTitle"
 			hr.add_child(group_title)
 		else:
-			hr.add_child(bold("[No group assigned]", Kit.CAPTION))
-		var pencil := Button.new()
-		pencil.focus_mode = Control.FOCUS_NONE
-		pencil.theme_type_variation = "FFrameAction"
-		pencil.custom_minimum_size = Kit.pxv(20, 20)
-		pencil.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-		pencil.tooltip_text = "Group"
-		var pen := GuiAssets.core_sprite("rename-icon.png")
-		if pen != null:
-			pencil.icon = pen
-			pencil.expand_icon = true
-		pencil.name = "GroupButton"
-		var editor := group_editor(screen, i, group)
-		var toggle_editor := func() -> void:
-			editor.visible = not editor.visible
-			if editor.visible:
-				(editor.find_child("GroupName", true, false) as LineEdit).grab_focus()
-		pencil.pressed.connect(toggle_editor)
-		hr.add_child(pencil)
-		if float(sec.get("m", 1)) != 1.0:
-			hr.add_child(Kit.label("× %s" % _num(float(sec.get("m", 1)))))
+			hr.add_child(bold("[No group assigned]" if manual else "Automatic requests", Kit.CAPTION))
+		if manual:
+			var pencil := Button.new()
+			pencil.focus_mode = Control.FOCUS_NONE
+			pencil.theme_type_variation = "FFrameAction"
+			pencil.custom_minimum_size = Kit.pxv(20, 20)
+			pencil.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+			pencil.tooltip_text = "Group"
+			var pen := GuiAssets.core_sprite("rename-icon.png")
+			if pen != null:
+				pencil.icon = pen
+				pencil.expand_icon = true
+			pencil.name = "GroupButton"
+			editor = group_editor(screen, i, group)
+			var toggle_editor := func() -> void:
+				editor.visible = not editor.visible
+				if editor.visible:
+					(editor.find_child("GroupName", true, false) as LineEdit).grab_focus()
+			pencil.pressed.connect(toggle_editor)
+			hr.add_child(pencil)
+			hr.add_child(Kit.label("×"))
+			var mult_val := float(sec.get("m", 1.0))
+			var mult_box := MenuKit.textbox(_num(mult_val), "1")
+			mult_box.name = "SectionMultiplier"
+			mult_box.custom_minimum_size = Kit.pxv(52, 24)
+			mult_box.alignment = HORIZONTAL_ALIGNMENT_CENTER
+			mult_box.tooltip_text = "Section multiplier"
+			var sent_mult := [mult_val]
+			var send_mult := func(raw: String) -> void:
+				var cleaned := raw.strip_edges()
+				if cleaned.is_valid_float():
+					var val := clampf(float(cleaned), 0.0, 10000.0)
+					if not is_equal_approx(val, float(sent_mult[0])):
+						sent_mult[0] = val
+						Bridge.send({"t": "set_section", "u": unit, "i": i, "m": val})
+				else:
+					mult_box.text = _num(float(sent_mult[0]))
+			var on_mult_submit := func(t: String) -> void:
+				send_mult.call(t)
+				mult_box.release_focus()
+			var on_mult_exit := func() -> void:
+				send_mult.call(mult_box.text)
+			mult_box.text_submitted.connect(on_mult_submit)
+			mult_box.focus_exited.connect(on_mult_exit)
+			hr.add_child(mult_box)
+		else:
+			var auto_lbl := Kit.label("Circuit / Automatic")
+			auto_lbl.add_theme_color_override("font_color", Kit.DISABLED_TEXT)
+			hr.add_child(auto_lbl)
+			if float(sec.get("m", 1)) != 1.0:
+				hr.add_child(Kit.label("× %s" % _num(float(sec.get("m", 1)))))
 		var fill := Kit.panel("FDraggable")
 		fill.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		fill.custom_minimum_size.y = Kit.px(24)
 		fill.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 		hr.add_child(fill)
-		var del := Button.new()
-		del.theme_type_variation = "FRedButton"
-		del.focus_mode = Control.FOCUS_NONE
-		del.custom_minimum_size = Kit.pxv(28, 28)
-		del.tooltip_text = "Delete section"
-		var trash := GuiAssets.core_sprite("icons/mip/trash-white.png")
-		if trash != null:
-			del.icon = trash
-			del.expand_icon = true
-		else:
-			del.text = "✕"
-		del.pressed.connect(func() -> void: Bridge.send({"t": "set_section", "u": unit, "i": i, "del": 1}))
-		hr.add_child(del)
+		if manual:
+			var del := Button.new()
+			del.theme_type_variation = "FRedButton"
+			del.focus_mode = Control.FOCUS_NONE
+			del.custom_minimum_size = Kit.pxv(28, 28)
+			del.tooltip_text = "Delete section"
+			var trash := GuiAssets.core_sprite("icons/mip/trash-white.png")
+			if trash != null:
+				del.icon = trash
+				del.expand_icon = true
+			else:
+				del.text = "✕"
+			del.pressed.connect(func() -> void: Bridge.send({"t": "set_section", "u": unit, "i": i, "del": 1}))
+			hr.add_child(del)
 		box.add_child(head)
-		box.add_child(editor)
+		if editor != null:
+			box.add_child(editor)
 		var filters: Array = (sec.get("f") as Array).duplicate(true) if sec.get("f") is Array else []
-		var send := func(l: Array) -> void: Bridge.send({"t": "set_section", "u": unit, "i": i, "f": l})
+		var send := Callable()
+		if manual:
+			send = func(l: Array) -> void: Bridge.send({"t": "set_section", "u": unit, "i": i, "f": l})
 		box.add_child(slots.call(sec, filters, send))
 	var add := MenuKit.button("Add section")
 	add.size_flags_horizontal = Control.SIZE_EXPAND_FILL

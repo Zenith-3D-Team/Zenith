@@ -36,7 +36,7 @@ func _resolution_scaling() -> void:
 	var window_list: Array = Settings.resolution_choices(fhd, false).map(func(c: Array) -> Variant: return c[1])
 	check(window_list == ["", "1280x720", "1600x900", "1920x1080"], "windowed: the sizes that fit on the monitor")
 	var full: Array = Settings.resolution_choices(uhd, true)
-	check(str(full[0][0]) == "Monitor's own (3840 × 2160)" and full[0][1] == "", "full screen starts with the monitor's own")
+	check(str(full[0][0]) == "3840 × 2160 (default)" and full[0][1] == "", "full screen starts with the monitor's own")
 	check(full.map(func(c: Array) -> Variant: return c[1]) == ["", "1280x720", "1600x900", "1920x1080", "2560x1440"], "then the common sizes below it")
 	check(Settings.resolution_choices(Vector2i(1920, 1200), true).map(func(c: Array) -> Variant: return c[1]) == ["", "1280x720", "1600x900"],
 		"a size that would draw at the monitor's own isn't offered twice")
@@ -583,7 +583,7 @@ func _hotfix_021() -> void:
 	lw.queue_free()
 
 	# BehindCull shows newly in-view chunks immediately on a camera turn while slicing off-view hides
-	# across frames (HIDE_PER_FRAME), and turning back cancels pending hides without toggling visible.
+	# across frames (HIDE_PER_FRAME, HIDE_PER_FRAME_TIGHT with --tight-cull), and turning back cancels pending hides without toggling visible.
 	# (The sliced path, --unload-fast=off; chunk_streaming_test _test_unload_fast has the time-sliced one.)
 	var bc_fast_was: bool = WorldMirror.BehindCull.unload_fast
 	WorldMirror.BehindCull.unload_fast = false
@@ -634,7 +634,7 @@ func _hotfix_021() -> void:
 	bcam.look_at_from_position(Vector3(16.0, 20.0, 0.0), Vector3(16.0, 0.0, 120.0))
 	bcw.behind_cull._process(0.016)
 	var kept_visible := not cancelled_candidates.is_empty() and cancelled_candidates.all(func(c: Vector2i) -> bool: return (bcw.chunks[c] as ChunkView).visible)
-	check(settled_south and shown_now and pending_first > 0 and step2_delta == WorldMirror.BehindCull.HIDE_PER_FRAME and kept_visible,
+	check(settled_south and shown_now and pending_first > 0 and step2_delta == (WorldMirror.BehindCull.HIDE_PER_FRAME_TIGHT if ViewPriority.tight_cull else WorldMirror.BehindCull.HIDE_PER_FRAME) and kept_visible,
 		"BehindCull shows turned-to chunks at once (%s), slices off-view hides (%d queued, +%d/frame), and cancels pending hides cleanly (%s)"
 		% [shown_now, pending_first, step2_delta, kept_visible])
 	WorldMirror.BehindCull.unload_fast = bc_fast_was
@@ -1025,6 +1025,7 @@ func _working_near() -> void:
 
 
 func _stream_spread() -> void:
+	const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 	# The nearest-first order of a square of chunks, worked out without sorting.
 	var order := WorldMirror.ring_order(14)
 	var square := {}
@@ -1256,7 +1257,9 @@ func _stream_spread() -> void:
 			bw._add([i * 10000 + j + 1, 1 + j % 2, (i * 32 + j % 32) * 256 + 128, (j / 32 % 32) * 256 + 128, 0])
 	var frames := 0
 	var went_partial := false
+	# Each turn of these loops is a frame: FrameBudget's per-frame totals (the floor cap's) start again.
 	while (not bw._dirty.is_empty() or not bw._partial.is_empty() or not bw._pending.is_empty() or not bw._prep_jobs.is_empty()) and frames < 500:
+		FrameBudget.test_next_frame()
 		bw._rebuild_dirty()
 		went_partial = went_partial or not bw._partial.is_empty()
 		if not bw._prep_jobs.is_empty() and bw._dirty.is_empty() and bw._partial.is_empty():
@@ -1340,6 +1343,7 @@ func _stream_spread() -> void:
 	bw._add([10001, 1, 32 * 256 + 128, 128, 0])
 	var free_frames := 0
 	while not bw._unloaded.is_empty() and free_frames < 1000:
+		FrameBudget.test_next_frame()
 		bw._free_unloaded()
 		free_frames += 1
 	check(kept_at_first and not bw.entities.has(1) and not bw.entities.has(1500) and bw.entities.has(10001)
@@ -1638,6 +1642,10 @@ func _distant_horizon_integration() -> void:
 
 	var was_shots := bool(Settings.get_value("graphics", "distant_horizon_shots"))
 	var was_vr := int(Settings.get_value("graphics", "view_radius"))
+	# The unified Render distance (view_radius the whole distance, full detail capped): the manual split, the
+	# default now, reads view_radius as full detail's own radius (clamped to REAL_RADIUS_MAX) instead.
+	var was_manual: Variant = Settings.get_value("graphics", "distant_horizon_manual")
+	Settings.set_value("graphics", "distant_horizon_manual", false)
 	Settings.set_value("graphics", "distant_horizon_shots", true)
 	dh.enabled = false
 	dh.radius_chunks = 0
@@ -1654,11 +1662,28 @@ func _distant_horizon_integration() -> void:
 	FullDetail.cover(fm, true)
 	var rect_switch_off: Rect2i = fw.get("last_rect")
 
+	# (rel-031-fix3, review nit 7) The manual split (the default): view_radius is full detail's own radius,
+	# clamped to REAL_RADIUS_MAX, so 500 covers as REAL_RADIUS_MAX does: between the unified cap and COVER_REACH.
+	const RenderDistanceT := preload("res://scripts/world/render_distance.gd")
+	Settings.set_value("graphics", "distant_horizon_manual", true)
+	Settings.set_value("graphics", "distant_horizon_shots", true)
+	Settings.set_value("graphics", "view_radius", 500)
+	FullDetail.cover(fm, true)
+	var rect_manual: Rect2i = fw.get("last_rect")
+	var manual_real := int(RenderDistanceT.from_settings()["real_radius"])
+	Settings.set_value("graphics", "view_radius", RenderDistanceT.REAL_RADIUS_MAX)
+	FullDetail.cover(fm, true)
+	var rect_manual_max: Rect2i = fw.get("last_rect")
+
 	FullDetail.cover(fm, false)
 	Settings.set_value("graphics", "view_radius", was_vr)
 	Settings.set_value("graphics", "distant_horizon_shots", was_shots)
+	Settings.set_value("graphics", "distant_horizon_manual", was_manual)
 	check(rect_off.size.x >= 90 and rect_off.size.y >= 80 and rect_dh.size.x <= 30 and rect_dh.size.y <= 30 and rect_switch_off == rect_off,
 		"FullDetail.cover uses reduced reach with DistantHorizon on even at view_radius=500 (%s) and preserves COVER_REACH when off/switched (%s, %s)" % [rect_dh, rect_off, rect_switch_off])
+	check(manual_real == RenderDistanceT.REAL_RADIUS_MAX and rect_manual == rect_manual_max
+		and rect_manual.size.x > rect_dh.size.x and rect_manual.size.x <= rect_off.size.x,
+		"FullDetail.cover in the manual split (default): view_radius=500 clamps to real radius %d and covers as %d does (%s vs %s; unified %s, off %s)" % [manual_real, RenderDistanceT.REAL_RADIUS_MAX, rect_manual, rect_manual_max, rect_dh, rect_off])
 	sv.free()
 	await get_tree().process_frame
 
@@ -1985,7 +2010,9 @@ func _ups_governor() -> void:
 	for st: Array in g3.steps:
 		if st[0] != "far" and st[0] != "updates":
 			others += 1
-	for i in others:
+	# Every other step that changes something for these settings (a step the player's own values already meet is
+	# passed over, so `others` single steps would run on into the belts' steps).
+	while g3._next_down() >= 0 and g3._next_down() < others:
 		g3._step(1)
 	var far_kept: float = g3.limit("far", 160.0)
 	var view_then: float = g3.limit("view", 10.0)

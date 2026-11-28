@@ -27,6 +27,31 @@ local MAX_ELEMENTS = 1500
 local MAX_DEPTH = 24
 local ROOTS = { "top", "left", "center", "screen", "relative" }
 
+-- Made in the main chunk, unconditionally, so every peer makes the same ids in the same order on
+-- each load (link.lua does the same). A script can't raise Factorio's own on_gui_text_changed and
+-- the like (LuaBootstrap.raise_event takes custom events only), so what the player did in Zenith's
+-- copy of a mod's window is raised as these, with the same field names Factorio's events have;
+-- a mod that wants to hear it asks for the ids: remote.call("zenith", "gui_events").
+local GUI_EVENTS = {
+  on_gui_text_changed = script.generate_event_name(),
+  on_gui_checked_state_changed = script.generate_event_name(),
+  on_gui_selection_state_changed = script.generate_event_name(),
+  on_gui_value_changed = script.generate_event_name(),
+  on_gui_switch_state_changed = script.generate_event_name(),
+  on_gui_elem_changed = script.generate_event_name(),
+}
+-- A textfield's text sent is cut to this many bytes (a datagram holds about 64 KB; the client cuts too).
+local MAX_TEXT = 4000
+
+-- {event name -> id}, a copy (the zenith remote interface).
+function M.events()
+  local copy = {}
+  for name, id in pairs(GUI_EVENTS) do
+    copy[name] = id
+  end
+  return copy
+end
+
 local function get(obj, key)
   local ok, v = pcall(function() return obj[key] end)
   if ok then
@@ -163,9 +188,28 @@ local function read(e, depth, count)
     local v = get(e, key)
     if v ~= nil and v ~= "" then
       if key == "elem_value" and type(v) == "table" then
+        -- A signal's value is {type, name}: the type tells an item from a fluid or a virtual signal.
+        if type(v.type) == "string" then
+          r.evt = v.type
+        end
         v = v.name or v[1]
       end
       r[SHORT[key]] = v
+    end
+  end
+  if ty == "slider" then
+    -- The range the slider's handle moves in (the client draws the value in it).
+    local ok_min, lo = pcall(function() return e.get_slider_minimum() end)
+    local ok_max, hi = pcall(function() return e.get_slider_maximum() end)
+    if ok_min and type(lo) == "number" then
+      r.mn = lo
+    end
+    if ok_max and type(hi) == "number" then
+      r.mx = hi
+    end
+    local ok_step, step = pcall(function() return e.get_slider_value_step() end)
+    if ok_step and type(step) == "number" and step > 0 then
+      r.stp = step
     end
   end
   if ty == "tabbed-pane" then
@@ -312,6 +356,135 @@ function M.press(cmd)
     if not (ok and done) then
       transport.send_now({ t = "msg", text = "That button didn't work from Zenith: use it in Factorio (Ctrl+F9)" })
     end
+    soon = true
+  end
+end
+
+-- What the player may change in a mod's window from Zenith, by element type: each sets the value
+-- the way a click would have, fills in the event's own fields and returns the event's name, or
+-- nil to refuse (the wrong kind of value, out of range). The mod finds the new value on the
+-- element (e.text, e.state, e.selected_index, e.slider_value) whenever it reads it, and hears
+-- GUI_EVENTS where it listens.
+local function set_text(e, v, data)
+  if type(v) ~= "string" then
+    return nil
+  end
+  if #v > MAX_TEXT then
+    v = v:sub(1, MAX_TEXT)
+  end
+  e.text = v
+  data.text = get(e, "text") or v
+  return "on_gui_text_changed"
+end
+
+local function set_checked(e, v, data)
+  if type(v) ~= "boolean" then
+    return nil
+  end
+  -- A radio button is switched on by a click, never off (its mod switches the others off).
+  if get(e, "type") == "radiobutton" and not v then
+    return nil
+  end
+  e.state = v
+  data.state = get(e, "state")
+  return "on_gui_checked_state_changed"
+end
+
+local function set_selected(e, v, data)
+  v = tonumber(v)
+  local items = get(e, "items")
+  if not v or v % 1 ~= 0 or type(items) ~= "table" or v < 1 or v > #items then
+    return nil
+  end
+  e.selected_index = v
+  data.selected_index = get(e, "selected_index")
+  return "on_gui_selection_state_changed"
+end
+
+local function set_slider(e, v, data)
+  v = tonumber(v)
+  if not v or v ~= v then
+    return nil
+  end
+  local _, lo = pcall(function() return e.get_slider_minimum() end)
+  local _, hi = pcall(function() return e.get_slider_maximum() end)
+  local _, step = pcall(function() return e.get_slider_value_step() end)
+  lo = type(lo) == "number" and lo or 0
+  hi = type(hi) == "number" and hi or lo
+  if type(step) == "number" and step > 0 then
+    v = lo + math.floor((v - lo) / step + 0.5) * step
+  end
+  v = math.max(lo, math.min(hi, v))
+  e.slider_value = v
+  data.value = get(e, "slider_value")
+  return "on_gui_value_changed"
+end
+
+local function set_switch(e, v, data)
+  if v ~= "left" and v ~= "right" and not (v == "none" and get(e, "allow_none_state") == true) then
+    return nil
+  end
+  e.switch_state = v
+  data.switch_state = get(e, "switch_state")
+  return "on_gui_switch_state_changed"
+end
+
+-- The value a choose-elem-button's picker gave: a name (item, fluid, entity...), {type, name} for a
+-- signal, false to clear it. Factorio refuses what the element can't hold (its elem_filters, a name
+-- that isn't one), and so does the assignment.
+local function set_elem(e, v, data)
+  if v ~= false and type(v) ~= "string" and not (type(v) == "table" and type(v.name) == "string" and type(v.type) == "string") then
+    return nil
+  end
+  if v == false then
+    v = nil
+  elseif type(v) == "table" then
+    v = { type = v.type, name = v.name }
+  end
+  if not pcall(function() e.elem_value = v end) then
+    return nil
+  end
+  local now = get(e, "elem_value")
+  if type(now) == "table" then
+    now = { type = now.type, name = now.name }
+  end
+  data.element_value = now
+  return "on_gui_elem_changed"
+end
+
+local SETTERS = {
+  ["choose-elem-button"] = set_elem,
+  ["switch"] = set_switch,
+  textfield = set_text, ["text-box"] = set_text,
+  checkbox = set_checked, radiobutton = set_checked,
+  ["drop-down"] = set_selected, ["list-box"] = set_selected,
+  slider = set_slider,
+}
+
+-- `mset` {ix, v}: the player changed the value of a textfield, checkbox, drop-down, list-box or
+-- slider in the copy of a mod's window; set it on the element and raise the event for the mod.
+function M.set(cmd)
+  local p = the_player()
+  local index = tonumber(cmd.ix)
+  if not (p and index) then
+    return
+  end
+  local e
+  for _, root in ipairs(ROOTS) do
+    e = find(p.gui[root], index, 0)
+    if e then
+      break
+    end
+  end
+  local setter = e and SETTERS[get(e, "type") or ""]
+  -- Not what the player can't use in Factorio either: a disabled element, one ignoring interaction.
+  if not setter or get(e, "enabled") == false or get(e, "ignored_by_interaction") or own(e) then
+    return
+  end
+  local data = { element = e, player_index = p.index }
+  local name = setter(e, cmd.v, data)
+  if name then
+    pcall(script.raise_event, GUI_EVENTS[name], data)
     soon = true
   end
 end

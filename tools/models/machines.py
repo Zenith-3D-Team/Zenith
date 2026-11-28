@@ -257,45 +257,6 @@ def electric_mining_drill():
     return [p, head]
 
 
-@model("assembling-machine-1")
-def assembling_machine_1():
-    p = Part()
-    p.prism(octagon(1.4, 0.3), 0.0, 0.2, "steel_dark", bevel=0.03)
-    p.prism(octagon(1.3, 0.3), 0.2, 1.0, "paint_green", bevel=0.04)
-    p.prism(octagon(1.36, 0.32), 1.0, 1.1, "paint_grey", bevel=0.02)
-    # Panels on each face, with vents and bolts.
-    for rot in (0, 90, 180, 270):
-        m = R("Z", rot)
-        p.slab(-0.55, -1.33, 0.32, 0.55, -1.3, 0.88, "paint_grey", matrix=m)
-        for z in (0.45, 0.6, 0.75):
-            p.slab(-0.42, -1.345, z, 0.42, -1.33, z + 0.06, "steel_black", matrix=m)
-        for x in (-0.48, 0.48):
-            for z in (0.38, 0.82):
-                p.cyl((x, -1.34, z), 0.022, 0.02, "steel_light", segs=6, axis="Y", matrix=m)
-    p.hazard_stripes(-0.8, 0.8, -1.3, 0.22, 0.3, depth=0.012, count=10)
-    # Corner columns.
-    for a in (45, 135, 225, 315):
-        r = math.radians(a)
-        p.cyl((1.12 * math.cos(r), 1.12 * math.sin(r), 0.65), 0.1, 0.9, "steel", segs=8, bevel=0.02)
-    # Top deck: a round work table under a crane-like arm cluster.
-    p.cyl((0, 0, 1.18), 0.85, 0.16, "steel_light", segs=20, bevel=0.03)
-    p.cyl((0, 0, 1.28), 0.7, 0.04, "steel_black", segs=20)
-    for a in (0, 90, 180, 270):
-        r = math.radians(a + 45)
-        p.box((1.0 * math.cos(r), 1.0 * math.sin(r), 1.2), (0.3, 0.3, 0.2), "steel_dark", bevel=0.03, rz=a + 45)
-    # A pipe feeding the table from the north-east corner.
-    p.cyl((0.85, 0.85, 1.35), 0.07, 0.5, "copper", segs=8)
-    arms = Part("anim_spin_arms", pivot=(0.0, 0.0, 1.3))
-    arms.cyl((0, 0, 1.55), 0.16, 0.5, "steel_dark", segs=10, bevel=0.02)
-    for a in (0, 120, 240):
-        m = R("Z", a)
-        arms.box((0.3, 0, 1.72), (0.5, 0.1, 0.1), "paint_grey", matrix=m, bevel=0.02)
-        arms.box((0.52, 0, 1.55), (0.08, 0.08, 0.32), "steel", matrix=m)
-        arms.box((0.52, 0, 1.38), (0.14, 0.14, 0.06), "hazard", matrix=m)
-    arms.cyl((0, 0, 1.84), 0.1, 0.08, "steel", segs=10)
-    return [p, arms]
-
-
 def geodesic_dome(radius, squash=1.0, turn=0.0):
     """A two-frequency geodesic hemisphere: (vertices, triangles, edges), the equator on z=0."""
     bm = bmesh.new()

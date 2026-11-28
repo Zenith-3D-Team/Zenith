@@ -1,6 +1,88 @@
 extends "res://tests/ui_test_base.gd"
 ## UI test sections: pbr_looks.
 
+## alt/dlss-s7c: on a PC where DLSS could run but the player hasn't said yes to NVIDIA's updater (faked), NVIDIA DLSS
+## isn't greyed; picking it (or Automatic) opens the prompt; Cancel keeps the previous choice, Use DLSS saves the OK
+## and the choice; the "NVIDIA updater: allowed" row's Withdraw clears the OK (the choice kept, DLSS off).
+func _dlss_prompt() -> void:
+	var Upscalers: GDScript = load("res://scripts/menu/upscalers.gd")
+	var caps_was: Dictionary = Upscalers.fake_caps
+	var upscaler_was: Variant = Settings.get_value("graphics", "upscaler")
+	Upscalers.fake_caps = {"extension": true, "renderer": "d3d12", "vendor": "nvidia", "rtx": true, "amd_files": true,
+		"nvidia_files": true, "engine_hook": true, "dlss_build": true}
+	Settings.set_value("graphics", "dlss_consent", false)
+	Settings.set_value("graphics", "upscaler", "fsr2")
+	var w: Node = SettingsWindow.new()
+	add_child(w)
+	await get_tree().process_frame
+	var up := w.find_child("graphics-upscaler", true, false) as OptionButton
+	var dlss_i := -1
+	var auto_i := -1
+	for i in (up.item_count if up != null else 0):
+		if str(up.get_item_metadata(i)) == "dlss":
+			dlss_i = i
+		if str(up.get_item_metadata(i)) == "auto":
+			auto_i = i
+	check(dlss_i >= 0 and not up.is_item_disabled(dlss_i) and up.get_item_tooltip(dlss_i).contains("nvngx_update.exe"),
+		"no OK yet: NVIDIA DLSS open, its tooltip says it asks about NVIDIA's updater")
+	if dlss_i < 0:
+		w.queue_free()
+		Upscalers.fake_caps = caps_was
+		return
+	# Cancel: nothing saved, the dropdown back on FSR 2.2.
+	up.select(dlss_i)
+	up.item_selected.emit(dlss_i)
+	var prompt := w.find_child("DlssConsentPrompt", true, false)
+	var text := ""
+	if prompt != null:
+		for l: Node in prompt.find_children("*", "Label", true, false):
+			text += (l as Label).text + " "
+	check(prompt != null and text.contains("nvngx_update.exe") and text.contains("may connect to NVIDIA's servers")
+		and text.contains("Zenith sends nothing itself") and text.contains("Use DLSS?"), "picking DLSS opens the prompt, in plain words: %s" % text)
+	check(str(Settings.get_value("graphics", "upscaler")) == "fsr2" and not bool(Settings.get_value("graphics", "dlss_consent")),
+		"while it asks nothing is saved")
+	var cancel: Button = (prompt.find_child("Cancel", true, false) as Button) if prompt != null else null
+	if cancel != null:
+		cancel.pressed.emit()
+	await get_tree().process_frame
+	check(str(Settings.get_value("graphics", "upscaler")) == "fsr2" and not bool(Settings.get_value("graphics", "dlss_consent"))
+		and str(up.get_item_metadata(up.selected)) == "fsr2" and w.find_child("DlssConsentPrompt", true, false) == null,
+		"Cancel keeps the previous choice (FSR 2.2), no OK saved, the prompt gone")
+	# Automatic would pick DLSS: it asks too.
+	up.select(auto_i)
+	up.item_selected.emit(auto_i)
+	prompt = w.find_child("DlssConsentPrompt", true, false)
+	check(prompt != null, "Automatic (which would pick DLSS) asks too")
+	if prompt != null:
+		w.call("_dlss_prompt_answer", "", false)  # what Esc does
+	await get_tree().process_frame
+	check(str(Settings.get_value("graphics", "upscaler")) == "fsr2", "Esc / Cancel on Automatic's prompt keeps FSR 2.2")
+	# Use DLSS: the OK and the choice saved, the window shows the Withdraw row.
+	up.select(dlss_i)
+	up.item_selected.emit(dlss_i)
+	prompt = w.find_child("DlssConsentPrompt", true, false)
+	var use: Button = (prompt.find_child("UseDlss", true, false) as Button) if prompt != null else null
+	if use != null:
+		use.pressed.emit()
+	await get_tree().process_frame
+	await get_tree().process_frame
+	check(bool(Settings.get_value("graphics", "dlss_consent")) and str(Settings.get_value("graphics", "upscaler")) == "dlss"
+		and Settings.upscaler_in_effect() == "dlss", "Use DLSS saves the OK and DLSS")
+	var withdraw := w.find_child("graphics-dlss_consent", true, false) as Button
+	check(withdraw != null and not withdraw.disabled, "with the OK: \"NVIDIA updater: allowed\" with Withdraw under Upscaling")
+	if withdraw != null:
+		withdraw.pressed.emit()
+	await get_tree().process_frame
+	await get_tree().process_frame
+	check(not bool(Settings.get_value("graphics", "dlss_consent")) and Settings.upscaler_in_effect() == "fsr3"
+		and str(Settings.get_value("graphics", "upscaler")) == "dlss", "Withdraw clears the OK: DLSS off (FSR 3.1 here), the choice kept")
+	check(w.find_child("graphics-dlss_consent", true, false) == null, "withdrawn: the row is gone")
+	w.queue_free()
+	Upscalers.fake_caps = caps_was
+	Settings.set_value("graphics", "dlss_consent", false)
+	Settings.set_value("graphics", "upscaler", upscaler_was)
+
+
 func _antialiasing_look() -> void:
 	check(Settings.DEFAULTS["graphics"]["antialiasing"] == "smaa", "SMAA is the default anti-aliasing")
 	var upscaler_was: Variant = Settings.get_value("graphics", "upscaler")
@@ -99,7 +181,29 @@ func _antialiasing_look() -> void:
 	for i in box.item_count:
 		any_grey = any_grey or box.is_item_disabled(i)
 	check(not any_grey, "under Zenith's own look every choice is open")
+	# FSR 4 step 3: AMD FSR 4.1, AMD FSR 3.1 and NVIDIA DLSS are in Upscaling, greyed "Not in this build" on stock Godot
+	# (never hidden); Upscaling quality is there, greyed under FSR 1.0 (this section's upscaler).
+	var up := w.find_child("graphics-upscaler", true, false) as OptionButton
+	var vendor_grey: Array = []
+	var up_open: Array = []
+	if up != null:
+		for i in up.item_count:
+			if up.is_item_disabled(i) and up.get_item_tooltip(i).contains("Not in this build"):
+				vendor_grey.append(str(up.get_item_metadata(i)))
+			elif not up.is_item_disabled(i):
+				up_open.append(str(up.get_item_metadata(i)))
+	var names: Array = []
+	if up != null:
+		for i in up.item_count:
+			names.append(up.get_item_text(i))
+	check(names == ["Bilinear", "FSR 1.0", "FSR 2.2 (Temporal)", "AMD FSR 4.1", "AMD FSR 3.1", "NVIDIA DLSS", "Automatic"], "Upscaling's entries: %s" % [names])
+	check(vendor_grey == ["fsr4", "fsr3", "dlss"] and up_open == ["bilinear", "fsr1", "fsr2", "auto"],
+		"Upscaling: the vendor entries greyed with their reason, the rest open: %s %s" % [vendor_grey, up_open])
+	var uq := w.find_child("graphics-upscaler_quality", true, false) as OptionButton
+	check(uq != null and uq.item_count == 6 and uq.disabled, "Upscaling quality is there, greyed under FSR 1.0")
+	check(w.find_child("graphics-dlss_consent", true, false) == null, "no \"NVIDIA updater: allowed\" row before the player's OK")
 	w.queue_free()
+	await _dlss_prompt()
 	LooksScript.looks.erase(id)
 	LooksScript.order.erase(id)
 	LooksScript.active = active_was

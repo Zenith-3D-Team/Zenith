@@ -6,7 +6,8 @@ extends Node3D
 
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 
-## Seconds between throws while the button is held (a grenade's cooldown is 30 ticks).
+## Seconds between throws when the capsule names no cooldown (a grenade's is 30 ticks); the capsule's own
+## (`iuse` "c" 6th value, ticks) otherwise: a defender capsule's is 15.
 const REPEAT := 0.5
 const SEGMENTS := 64
 
@@ -22,7 +23,8 @@ var _mi := MeshInstance3D.new()
 ## The rings ride on an add-on's hills (ground_height.gd), as the ground does.
 var _ok_mat := GroundHeight.mark_material(Color(1.0, 1.0, 1.0, 0.55), false, GroundHeight.AREA_PRIORITY)
 var _bad_mat := GroundHeight.mark_material(Color(1.0, 0.3, 0.25, 0.6), false, GroundHeight.AREA_PRIORITY)
-var _timer := 0.0
+## msec before which nothing is thrown: the cooldown holds across clicks, not only while held.
+var _next_msec := 0
 
 
 func _ready() -> void:
@@ -71,11 +73,13 @@ func _ring(c: Vector2, r: float) -> void:
 
 
 ## While the left button is held: throws now and then every REPEAT.
-func hold(item: String, ground: Vector2, delta: float) -> void:
-	_timer -= delta
-	if _timer > 0.0:
+func hold(item: String, ground: Vector2, _delta: float) -> void:
+	var now := Time.get_ticks_msec()
+	if now < _next_msec:
 		return
-	_timer = REPEAT
+	var use := use_of(item)
+	var ticks := float(use[3]) if use.size() > 3 and float(use[3]) > 0.0 else REPEAT * 60.0
+	_next_msec = now + int(ticks / 60.0 * 1000.0)
 	if not in_range(item, ground):
 		pi.hud.show_message("Out of range")
 		return
@@ -89,4 +93,4 @@ func hold(item: String, ground: Vector2, delta: float) -> void:
 
 
 func release() -> void:
-	_timer = 0.0
+	pass

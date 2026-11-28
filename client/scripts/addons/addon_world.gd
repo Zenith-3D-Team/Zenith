@@ -14,6 +14,7 @@ const TRAIN_TYPES := ["locomotive", "cargo-wagon", "fluid-wagon", "artillery-wag
 const ROBOT_TYPES := ["logistic-robot", "construction-robot", "combat-robot", "capture-robot"]
 const StandHeight := preload("res://scripts/world/stand_height.gd")
 const Switches := preload("res://scripts/switches.gd")
+const ViewAhead := preload("res://scripts/world/view_ahead.gd")
 
 var _host
 ## The add-on this copy belongs to (each add-on has its own, for hold_chunks); null for the host's.
@@ -187,6 +188,29 @@ func holding_chunks() -> bool:
 func held_chunks() -> int:
 	var w = _host.game_node("world")
 	return int(w.held_count()) if w != null and w.has_method("held_count") else 0
+
+
+## (API 1.94) Announces where the camera will cut to, so what is drawn there is at its levels of detail
+## when it does (models' levels, far chunks merged or whole, the cliff wall's levels), made under the
+## usual budgets meanwhile, with no hitch at the cut. `position` is the camera, `look` what it looks at
+## (Godot's axes: x east, y up, z south, in tiles). Kept `seconds` (at most 30) unless announced again
+## (each frame for a moving one is fine: it is looked at again once it moves 8 tiles) or let go with
+## release_view(); about a second ahead is enough. One viewpoint per add-on; switching the add-on off
+## lets it go. Nothing with `--cut-lods=old`. Chunks must be loaded there: see hold_chunks().
+func prepare_view(position: Vector3, look: Vector3, seconds := 2.0) -> void:
+	ViewAhead.prepare(_api.id if _api != null else "?", position, look, seconds)
+
+
+## (API 1.94) Lets the viewpoint announced with prepare_view go (after the cut).
+func release_view() -> void:
+	ViewAhead.release(_api.id if _api != null else "?")
+
+
+## (API 1.94) Says the next frame is a cut: its levels of detail are picked without the frame budget and
+## without cross-fades (one slower frame, hidden by the cut). A camera moving more than 32 tiles in one
+## frame counts as a cut anyway.
+func mark_cut() -> void:
+	ViewAhead.mark_cut()
 
 
 ## The point the world is loaded round (tiles).

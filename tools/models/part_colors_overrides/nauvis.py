@@ -89,4 +89,11 @@ OVERRIDES = {
     # The rail signal's bent mounting plates are bright bare steel in the sprite (its brightest
     # grey pixels), the housings dark; the plates are thin and sampled the shadow under them.
     "rail-signal": {"sprite_colors": {"steel_light": "#bdbeb9"}},
+    # Assembling machines 1, 2 & 3: weathered olive-grey/blue/green armor plates with dark grime & warm bronze works.
+    "assembling-machine-1": {"two_tone": "*", "two_tone_blur": 0.08, "saturation": 1.0,
+                             "sprite_colors": {"paint_am1": "#585e4c", "rust_machine": "#6c4e32", "copper_dull": "#9b643b", "hazard": "#b8902c"}},
+    "assembling-machine-2": {"two_tone": "*", "two_tone_blur": 0.08, "saturation": 1.0,
+                             "sprite_colors": {"paint_am2": "#223c58", "rust_machine": "#6c4e32", "copper_dull": "#9b643b", "hazard": "#b8902c"}},
+    "assembling-machine-3": {"two_tone": "*", "two_tone_blur": 0.08, "saturation": 1.0,
+                             "sprite_colors": {"paint_am3": "#4d521a", "rust_machine": "#6c4e32", "copper_dull": "#9b643b", "hazard": "#b8902c"}},
 }

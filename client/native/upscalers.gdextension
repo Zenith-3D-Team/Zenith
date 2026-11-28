@@ -1,0 +1,10 @@
+; ZenithUpscalerCaps (native/upscalers/src): capability checks for AMD FSR 4.1, AMD FSR 3.1 and NVIDIA DLSS, its own
+; library (never part of belt_sim). Loaded by scripts/menu/upscalers.gd when the library is there, not by
+; Godot at start-up (this folder's .gdignore); without it Zenith runs the same, the vendor entries greyed out.
+[configuration]
+entry_symbol = "upscalers_library_init"
+compatibility_minimum = "4.7"
+
+[libraries]
+windows.debug.x86_64 = "res://native/bin/upscalers.windows.template_release.x86_64.dll"
+windows.release.x86_64 = "res://native/bin/upscalers.windows.template_release.x86_64.dll"

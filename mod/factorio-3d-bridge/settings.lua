@@ -90,6 +90,13 @@ data:extend({
   },
   {
     type = "bool-setting",
+    name = "f3d-rev-ticks",
+    setting_type = "runtime-global",
+    default_value = true,
+    order = "e6",
+  },
+  {
+    type = "bool-setting",
     name = "f3d-starter-kit",
     setting_type = "runtime-global",
     default_value = true,

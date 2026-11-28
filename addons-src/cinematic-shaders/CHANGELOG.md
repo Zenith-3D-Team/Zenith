@@ -2,6 +2,18 @@
 
 Newest first. Versions before 0.4.5 are summarised from Zenith's history.
 
+## 0.6.3 (with Zenith 0.3.1)
+
+Cheaper volumetric clouds and no needless look re-registers (`main.gd`, `shaders/cinematic_grade.gdshader`).
+
+- The cloud raymarch strides empty air at twice its step (was 1.85x), steps back one step on entering a
+  cloud, and skips the detail noise once the ray is mostly hidden (transmittance under 0.22) or beyond
+  2,400 units; `--cloud-ray-opt=off` brings back 0.6.2's march.
+- The look is registered again only when its settings changed, and put on at start only if it isn't
+  already the look.
+
+Headless only; not yet seen in a window.
+
 ## 0.6.2
 
 Lightning no longer whites out the sky (`shaders/cinematic_grade.gdshader`).

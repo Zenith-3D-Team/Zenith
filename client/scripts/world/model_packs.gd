@@ -261,6 +261,13 @@ static var fue5_pbr := Switches.on("--fue5-pbr")
 static var wube3dp_pbr := Switches.on("--wube3dp-pbr")
 ## --placeholder-pbr=off: draw Placeholders with Factorio shading instead of its pack.json PBR shading.
 static var placeholder_pbr := Switches.on("--placeholder-pbr")
+## Built-in assembling machines 1-3 prefer rebuilt Placeholders over Wube3DP/FUE5 unless --assembler-models=old.
+const PREFERRED_PLACEHOLDERS := {
+	"assembling-machine-1": true,
+	"assembling-machine-2": true,
+	"assembling-machine-3": true,
+}
+static var prefer_builtin_assemblers := not Switches.has("--assembler-models=old")
 ## The packs chosen for model families whatever the order (the Model packs window): family -> pack
 ## id. Replaced, never changed in place (read on workers); set_choices().
 static var choices := {}
@@ -887,11 +894,30 @@ static func active() -> Array:
 	return out
 
 
+## Returns the built-in Placeholders pack when `file` prefers it over FUE5/Wube3DP and it is active & replacing.
+static func preferred_placeholder_pack(file: String) -> Dictionary:
+	var key := file.to_lower()
+	if not prefer_builtin_assemblers or not PREFERRED_PLACEHOLDERS.has(key):
+		return {}
+	for p: Dictionary in active():
+		if str(p["id"]) == LAST_ID and bool(p["replaces"]) and (p["models"] as Dictionary).has(key):
+			return p
+	return {}
+
+
 ## The file of model `file` (a prototype's name, or a piece's as "transport-belt-start") in the
 ## highest pack in use that has one, among those that go by the order (`replacing`) or those that
 ## only fill in; "" if none has it.
 static func find(file: String, replacing: bool) -> String:
 	var key := file.to_lower()
+	var pref := preferred_placeholder_pack(key) if replacing else {}
+	if not pref.is_empty():
+		for p: Dictionary in active():
+			if bool(p["replaces"]) and not is_builtin(p):
+				var custom: String = (p["models"] as Dictionary).get(key, "")
+				if custom != "":
+					return custom
+		return str((pref["models"] as Dictionary).get(key, ""))
 	for p: Dictionary in active():
 		if bool(p["replaces"]) == replacing:
 			var path: String = (p["models"] as Dictionary).get(key, "")
@@ -1389,6 +1415,19 @@ static func in_use() -> Dictionary:
 			for name: String in p["models"]:
 				if choice(name) == p["id"]:
 					out[name] = p
+	if prefer_builtin_assemblers:
+		for name: String in PREFERRED_PLACEHOLDERS:
+			if out.has(name):
+				continue
+			var pref := preferred_placeholder_pack(name)
+			if pref.is_empty():
+				continue
+			for p: Dictionary in active():
+				if bool(p["replaces"]) and not is_builtin(p) and (p["models"] as Dictionary).has(name):
+					out[name] = p
+					break
+			if not out.has(name):
+				out[name] = pref
 	for replacing in [true, false]:
 		for p: Dictionary in active():
 			if bool(p["replaces"]) != replacing:

@@ -20,9 +20,13 @@ const CircuitPanel := preload("res://scripts/ui/factorio/circuit_panel.gd")
 const EntitySettings := preload("res://scripts/ui/factorio/entity_settings.gd")
 const TrainWindow := preload("res://scripts/ui/factorio/train_window.gd")
 const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.gd")
+const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
+const Wire := preload("res://scripts/util/wire.gd")
 
 ## The red bar beside a burner's fuel slot.
 const BURNER_COLOR := Color8(230, 60, 40)
+## Maximum items shown per lane on a transport belt window.
+const BELT_SLOTS := 8
 ## Kinds and entity types whose fluid boxes Factorio doesn't show as our generic rows.
 const OWN_FLUIDS := ["pump", "storage-tank", "pipe", "pipe-to-ground"]
 ## The entities whose window shows their own contents, the pipeline's and the flush buttons.
@@ -45,7 +49,7 @@ static func entity_type(screen) -> String:
 static func build(screen, kind: String, inv: Dictionary, body: VBoxContainer) -> bool:
 	var last: Dictionary = screen._last
 	var t := entity_type(screen)
-	for key in ["hand_slot", "burner_bars"]:
+	for key in ["hand_slot", "burner_bars", "belt_lanes"]:
 		if screen.has_meta(key):
 			screen.remove_meta(key)
 	match kind:
@@ -108,7 +112,10 @@ static func build(screen, kind: String, inv: Dictionary, body: VBoxContainer) ->
 			return true
 		"land-mine":
 			return true  # the status line and preview only
-		"rail-signal", "rail-chain-signal", "transport-belt", "lane-splitter":
+		"transport-belt":
+			_transport_belt(screen, last, body)
+			return true
+		"rail-signal", "rail-chain-signal", "lane-splitter":
 			return true  # the status line only; their circuit settings are in the docked window
 	return false
 
@@ -135,11 +142,49 @@ static func refresh(screen, msg: Dictionary) -> void:
 		if is_instance_valid(hand) and ins is Dictionary:
 			var h = ins.get("h")
 			if h is Array and h.size() >= 2:
+				var stack := {"item": str(h[0]), "count": int(h[1])}
 				hand.set_stack(str(h[0]), int(h[1]))
-				hand.set_tip(Kit.pretty(str(h[0])), [["In the inserter's hand", "", Kit.DISABLED_TEXT]])
+				hand.set_hand(screen.hand_slot.size() >= 2 and str(screen.hand_slot[0]) == "hand" and int(screen.hand_slot[1]) == 1,
+					Slot.hand_left_of(screen.hand_slot, stack))
+				hand.set_tip(Kit.pretty(str(h[0])), [["In the inserter's hand", "", Kit.DISABLED_TEXT],
+					["Click: pick up · Shift click: into your inventory", "", Kit.DISABLED_TEXT]])
 			else:
 				hand.set_stack("", -1)
+				hand.set_hand(false)
 				hand.set_tip("Inserter hand", [["Empty", "", Kit.DISABLED_TEXT]])
+	if screen.has_meta("belt_lanes") and msg.has("bl"):
+		var lanes: Array = screen.get_meta("belt_lanes")
+		var bl := Wire.array(msg.get("bl"))
+		for li in mini(2, lanes.size()):
+			var row_slots: Array = lanes[li]
+			var items: Array = Wire.array(bl[li]) if li < bl.size() else []
+			var role := "belt_1" if li == 0 else "belt_2"
+			for i in row_slots.size():
+				var s: Slot = row_slots[i]
+				if not is_instance_valid(s):
+					continue
+				var idx := i + 1
+				var entry: Dictionary = items[i] if i < items.size() and items[i] is Dictionary else {}
+				var item_name := str(entry.get("name", ""))
+				var item_count := int(entry.get("count", 0))
+				if item_name != "" and item_count > 0:
+					var stack := {"item": item_name, "count": item_count}
+					if entry.has("quality"):
+						stack["quality"] = str(entry["quality"])
+					s.set_extra(stack)
+					s.set_stack(item_name, item_count)
+					s.set_hand(screen.hand_slot.size() >= 2 and str(screen.hand_slot[0]) == role and int(screen.hand_slot[1]) == idx,
+						Slot.hand_left_of(screen.hand_slot, stack))
+					s.set_tip(Kit.pretty(item_name), Slot.extra_lines(stack) + [
+						["%d on the belt lane" % item_count],
+						["Click: pick up · Shift click: into your inventory", "", Kit.DISABLED_TEXT],
+					])
+				else:
+					s.set_extra({})
+					s.set_stack("", -1)
+					s.set_hand(false)
+					s.set_tip("", [])
+					s.tooltip_text = ""
 	if screen.has_meta("burner_bars") and msg.has("bu"):
 		for bar in screen.get_meta("burner_bars"):
 			if is_instance_valid(bar):
@@ -181,7 +226,12 @@ static func _inserter(screen, last: Dictionary, body: VBoxContainer) -> void:
 	hand.theme_type_variation = "FSlotButton"
 	hand.empty_icon = GuiAssets.core_sprite("icons/mip/empty-inserter-hand-slot.png")
 	hand.name = "Hand"
+	hand.slot_role = "hand"
+	hand.slot_index = 1
 	hand.mouse_filter = Control.MOUSE_FILTER_PASS
+	var on_hand_click := func(button_index: int, shift: bool) -> void:
+		screen.slot_clicked.emit("hand", 1, hand.item, hand.count, button_index, shift, hand.ctrl)
+	hand.clicked.connect(on_hand_click)
 	hand_row.add_child(hand)
 	screen.set_meta("hand_slot", hand)
 	for i in Kit.COLUMNS - 1:
@@ -195,6 +245,36 @@ static func _inserter(screen, last: Dictionary, body: VBoxContainer) -> void:
 		body.add_child(LogicKit.fuel_row(screen))
 	body.add_child(LogicKit.line())
 	body.add_child(inserter(screen, ins))
+
+
+## A transport belt's two lanes (`gui.bl`), each as clickable slots to take items off the belt.
+static func _transport_belt(screen, last: Dictionary, body: VBoxContainer) -> void:
+	var lanes: Array = []
+	for lane in [["Left lane", "belt_1"], ["Right lane", "belt_2"]]:
+		var title: String = lane[0]
+		var role: String = lane[1]
+		body.add_child(Kit.label(title, "FHeading"))
+		var frame := Kit.panel("FDeepFrame")
+		frame.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+		var grid := Kit.slot_grid(BELT_SLOTS)
+		frame.add_child(grid)
+		var row_slots: Array = []
+		for i in BELT_SLOTS:
+			var s := Slot.new()
+			var idx := i + 1
+			s.name = "%s_%d" % [role, idx]
+			s.theme_type_variation = "FSlotButton"
+			s.slot_role = role
+			s.slot_index = idx
+			var on_click := func(button_index: int, shift: bool) -> void:
+				screen.slot_clicked.emit(role, idx, s.item, s.count, button_index, shift, s.ctrl)
+			s.clicked.connect(on_click)
+			grid.add_child(s)
+			row_slots.append(s)
+		body.add_child(frame)
+		lanes.append(row_slots)
+	screen.set_meta("belt_lanes", lanes)
+	refresh(screen, {"bl": last.get("bl", [])})
 
 
 ## The settings part of an inserter's window (also used without the hand row).
@@ -235,6 +315,10 @@ static func inserter(screen, ins: Dictionary) -> Control:
 	var slider := LogicKit.notched(1, maxi(2, most), stack if stack > 0 else most, stack > 0,
 		func(v: int) -> void: screen.model.set_inserter(screen.unit, null, "", -1, v))
 	slider.name = "HandSize"
+	# No capacity bonus (a plain inserter at 1): nothing above 1 to pick, as the game ignores an override over the force's limit.
+	slider.max_value = most
+	slider.value = clampi(slider.value, 1, most)
+	slider.box.text = str(slider.value)
 	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var override := func(on: bool) -> void: screen.model.set_inserter(screen.unit, null, "", -1, slider.value if on else 0)
 	size_row.add_child(EntityPanels.checkbox("Override hand size", stack > 0, override))
@@ -251,7 +335,7 @@ static func spoil_priority(screen, sp: String) -> Control:
 	var r := EntityPanels.row(8)
 	var on := sp != "none"
 	var send := func(v: String) -> void: screen.model.set_inserter(screen.unit, null, "", -1, -1, v)
-	r.add_child(LogicKit.info_checkbox("Spoiled priority", "Take spoiled (or the freshest) items first", on,
+	r.add_child(LogicKit.info_checkbox("Spoiled priority", "Selects items based on spoiled percentage.\n\nOnly takes effect when taking items from an inventory.", on,
 		func(v: bool) -> void: send.call("spoiled-first" if v else "none")))
 	var radios := EntityPanels.radios([["spoiled-first", "Spoiled first"], ["fresh-first", "Fresh first"]], sp if on else "spoiled-first", send)
 	_radios_enabled(radios, on)
@@ -319,7 +403,7 @@ static func _lamp(screen, last: Dictionary, body: VBoxContainer) -> void:
 	if last.get("col") is Array:
 		_right(status, LogicKit.color_buttons(screen, last["col"]))
 	if last.has("ao"):
-		body.add_child(LogicKit.info_checkbox("Always on", "The lamp stays on during the day", int(last["ao"]) == 1,
+		body.add_child(LogicKit.info_checkbox("Always on", "Lamp will be always on (unless disabled by control behavior).", int(last["ao"]) == 1,
 			func(on: bool) -> void: Bridge.send({"t": "set_lamp", "u": screen.unit, "ao": 1 if on else 0})))
 
 
@@ -406,9 +490,9 @@ static func _speaker(screen, last: Dictionary, body: VBoxContainer) -> void:
 static func display_panel(screen, dp: Dictionary) -> Control:
 	var box := EntityPanels.column(8)
 	var send := func(settings: Dictionary) -> void: screen.model.set_panel(screen.unit, settings)
-	box.add_child(LogicKit.info_checkbox("Always show in \"Alt-mode\"", "Show the text over the panel in Alt-mode too", int(dp.get("show", 0)) == 1,
+	box.add_child(LogicKit.info_checkbox("Always show in \"Alt-mode\"", "Always show the first line of the display panel's text in \"Alt-mode\" even when not selected.", int(dp.get("show", 0)) == 1,
 		func(on: bool) -> void: send.call({"show": 1 if on else 0})))
-	box.add_child(LogicKit.info_checkbox("Show tag in chart", "Show the icon and text on the map", int(dp.get("chart", 0)) == 1,
+	box.add_child(LogicKit.info_checkbox("Show tag in chart", "Show the chosen icon and the first line of text in the map charts.", int(dp.get("chart", 0)) == 1,
 		func(on: bool) -> void: send.call({"chart": 1 if on else 0})))
 	var icon_row := EntityPanels.row(8)
 	var il := Kit.label("Icon")
@@ -576,7 +660,7 @@ static func _turret(screen, last: Dictionary, body: VBoxContainer) -> void:
 ## "Target priorities (i)": ten slots of what it shoots first, and "Ignore unlisted targets (i)".
 static func turret_targets(screen, tgt: Dictionary) -> Control:
 	var box := EntityPanels.column(6)
-	box.add_child(LogicKit.info_label("Target priorities", "The turret shoots these first, in this order", "FHeading"))
+	box.add_child(LogicKit.info_label("Target priorities", "Gives an explicit order in which targets will be picked if multiple are in range.", "FHeading"))
 	var list: Array = (tgt.get("l") as Array).duplicate() if tgt.get("l") is Array else []
 	var frame := Kit.panel("FDeepFrame")
 	var grid := Kit.slot_grid(Kit.COLUMNS)
@@ -601,16 +685,82 @@ static func turret_targets(screen, tgt: Dictionary) -> Control:
 		grid.add_child(EntityPanels.choose_slot(screen, str(list[i]) if i < list.size() else "", ["entity"], set_target, "Add a priority target"))
 	box.add_child(frame)
 	box.add_child(LogicKit.line())
-	box.add_child(LogicKit.info_checkbox("Ignore unlisted targets", "Shoot only the targets in the list", int(tgt.get("ign", 0)) == 1,
+	box.add_child(LogicKit.info_checkbox("Ignore unlisted targets", "If set, targets not appearing in the priority list will never be targeted. Otherwise they come after all listed targets.", int(tgt.get("ign", 0)) == 1,
 		func(on: bool) -> void: screen.model.set_targets(screen.unit, null, 1 if on else 0)))
 	return box
 
 
-## Factorio's roboport: the robot slots and the repair pack slots, two rows of seven.
+## Factorio's roboport: network header strip, robot and repair pack slots (7 each), and robot requests.
 static func _roboport(screen, body: VBoxContainer) -> void:
+	var last: Dictionary = screen._last
+	var lg: Dictionary = last.get("lg") if last.get("lg") is Dictionary else {}
+	var net = lg.get("net")
+	var in_net: bool = net is Dictionary
+	var net_box := EntityPanels.column(4)
+	var net_top := EntityPanels.row(6)
+	var dot_tex := GuiAssets.status_dot("green" if in_net else "red")
+	if dot_tex != null:
+		var dot := TextureRect.new()
+		dot.texture = dot_tex
+		dot.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		dot.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		dot.custom_minimum_size = Kit.pxv(14, 14)
+		dot.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		dot.texture_filter = Kit.ICON_FILTER
+		net_top.add_child(dot)
+	var net_title := "Not in a logistic network"
+	if in_net:
+		var net_dict: Dictionary = net
+		var net_name := str(net_dict.get("name", ""))
+		net_title = net_name if net_name != "" else "Network #%d" % int(net_dict.get("id", 0))
+	var title_lbl := Kit.label(net_title, "FHeading")
+	title_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	net_top.add_child(title_lbl)
+	if in_net:
+		var net_id := int((net as Dictionary).get("id", 0))
+		var open_net := func() -> void:
+			screen.open_network_requested.emit(net_id)
+		var btn := MenuKit.button("Open logistic network")
+		btn.name = "OpenNetwork"
+		btn.pressed.connect(open_net)
+		net_top.add_child(btn)
+	net_box.add_child(net_top)
+	if in_net:
+		var net_dict: Dictionary = net
+		var log_r: Array = net_dict.get("log", [0, 0]) if net_dict.get("log") is Array else [0, 0]
+		var con_r: Array = net_dict.get("con", [0, 0]) if net_dict.get("con") is Array else [0, 0]
+		if log_r.size() >= 2 and con_r.size() >= 2:
+			var bots_lbl := Kit.label("Logistic: %d / %d · Construction: %d / %d" % [
+				int(log_r[0]), int(log_r[1]), int(con_r[0]), int(con_r[1])])
+			bots_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			net_box.add_child(bots_lbl)
+	var cell = lg.get("cell")
+	if cell is Dictionary:
+		var cell_dict: Dictionary = cell
+		var cell_lbl := Kit.label("Stationed: %d logistic, %d construction · Charging: %d (%d waiting)" % [
+			int(cell_dict.get("sl", 0)), int(cell_dict.get("sc", 0)),
+			int(cell_dict.get("ch", 0)), int(cell_dict.get("tc", 0))])
+		cell_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		net_box.add_child(cell_lbl)
+	body.add_child(net_box)
+	body.add_child(LogicKit.line())
 	body.add_child(LogicKit.slot_row(screen, "robots", "icons/mip/empty-robot-slot.png", 7))
 	body.add_child(LogicKit.line())
 	body.add_child(LogicKit.slot_row(screen, "repair", "icons/mip/empty-robot-material-slot.png", 7))
+	var lc = last.get("lc")
+	if lc is Dictionary:
+		var lc_dict: Dictionary = lc
+		body.add_child(LogicKit.line())
+		body.add_child(ProductionPanels.network_heading("Logistic requests", in_net or int(lc_dict.get("in_net", 0)) == 1))
+		var secs_data: Array = (lc_dict.get("sec") as Array).duplicate(true) if lc_dict.get("sec") is Array else []
+		var status_ctx := SpacePanels.build_status_context(screen._slot_list("robots"), Wire.array(lc_dict.get("del")), Wire.array(lc_dict.get("pick")))
+		var secs := SpacePanels.sections(screen, secs_data, [], false, status_ctx)
+		if secs.get_child_count() > 0:
+			var heading := secs.get_child(0)
+			secs.remove_child(heading)
+			heading.queue_free()
+		body.add_child(secs)
 
 
 ## Artillery's "Auto targeting" checkbox (`gui.art`, set_artillery).
@@ -624,11 +774,12 @@ static func auto_targeting(screen, last: Dictionary) -> Control:
 
 ## Factorio's car, tank and spidertron: a spidertron's name strip (rename, colour), the fuel and its
 ## bar, each gun over its ammo slot with the equipment grid button after them (a spidertron's "Auto
-## targeting" boxes at the right), the trunk.
+## targeting" boxes at the right), the trunk and (for spidertron) its Inventory / Logistics tabs.
 static func _vehicle(screen, last: Dictionary, body: VBoxContainer) -> void:
 	var inv: Dictionary = last.get("inv") if last.get("inv") is Dictionary else {}
 	var veh: Dictionary = last.get("veh") if last.get("veh") is Dictionary else {}
-	if entity_type(screen) == "spider-vehicle":
+	var is_spider := entity_type(screen) == "spider-vehicle"
+	if is_spider:
 		var strip := _name_strip(screen, str(veh.get("lbl", "")), Kit.entity_name(str(screen.proto_name)), "Rename",
 			func(t: String) -> void: Bridge.send({"t": "set_vehicle", "u": screen.unit, "lbl": t}))
 		body.add_child(strip)
@@ -673,7 +824,56 @@ static func _vehicle(screen, last: Dictionary, body: VBoxContainer) -> void:
 			_right(r, _spider_targeting(screen, veh["at"]))
 		body.add_child(r)
 		body.add_child(LogicKit.line())
-	if screen.knows_slots("trunk") or inv.has("trunk"):
+	var lc = last.get("lc")
+	if is_spider and lc is Dictionary:
+		var lc_dict: Dictionary = lc
+		var unit: int = screen.unit
+		var tab := str(screen.get_meta("spider_tab", "Inventory")) if int(screen.get_meta("spider_tab_unit", 0)) == unit else "Inventory"
+		var tabs := HBoxContainer.new()
+		tabs.add_theme_constant_override("separation", 0)
+		for t_name in ["Inventory", "Logistics"]:
+			var b := Button.new()
+			b.text = t_name
+			b.name = "SpiderTab_" + t_name
+			b.theme_type_variation = "FTab"
+			b.toggle_mode = true
+			b.button_pressed = t_name == tab
+			b.focus_mode = Control.FOCUS_NONE
+			b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			b.custom_minimum_size = Kit.pxv(110, 28)
+			b.add_theme_font_override("font", Kit.font("bold"))
+			var picked: String = t_name
+			var on_pick := func() -> void:
+				screen.set_meta("spider_tab", picked)
+				screen.set_meta("spider_tab_unit", unit)
+				screen._rebuild_now()
+			b.pressed.connect(on_pick)
+			tabs.add_child(b)
+		body.add_child(tabs)
+		if tab == "Logistics":
+			var lg = last.get("lg")
+			var in_net := int(lc_dict.get("in_net", 0)) == 1 or (lg is Dictionary and (lg as Dictionary).get("net") is Dictionary)
+			body.add_child(ProductionPanels.network_heading("Logistic requests", in_net))
+			var set_on := func(v: bool) -> void: Bridge.send({"t": "set_chest_logistics", "u": unit, "on": 1 if v else 0})
+			body.add_child(EntityPanels.checkbox("Enable logistics", int(lc_dict.get("on", 1)) == 1, set_on))
+			var set_mv := func(v: bool) -> void: Bridge.send({"t": "set_chest_logistics", "u": unit, "mv": 1 if v else 0})
+			body.add_child(EntityPanels.checkbox("Enable logistics while moving", int(lc_dict.get("mv", 1)) == 1, set_mv))
+			var set_tu := func(v: bool) -> void: Bridge.send({"t": "set_chest_logistics", "u": unit, "tu": 1 if v else 0})
+			body.add_child(EntityPanels.checkbox("Trash unrequested", int(lc_dict.get("tu", 0)) == 1, set_tu))
+			var secs_data: Array = (lc_dict.get("sec") as Array).duplicate(true) if lc_dict.get("sec") is Array else []
+			var status_ctx := SpacePanels.build_status_context(screen._slot_list("trunk"), Wire.array(lc_dict.get("del")), Wire.array(lc_dict.get("pick")))
+			var secs := SpacePanels.sections(screen, secs_data, [], false, status_ctx)
+			if secs.get_child_count() > 0:
+				var heading := secs.get_child(0)
+				secs.remove_child(heading)
+				heading.queue_free()
+			body.add_child(secs)
+			if screen.knows_slots("trash") or inv.has("trash"):
+				body.add_child(ProductionPanels.trash_slots(screen))
+		elif screen.knows_slots("trunk") or inv.has("trunk"):
+			body.add_child(Kit.label("Trunk", "FHeading"))
+			body.add_child(screen._grid_frame("trunk", inv, Kit.COLUMNS))
+	elif screen.knows_slots("trunk") or inv.has("trunk"):
 		body.add_child(Kit.label("Trunk", "FHeading"))
 		body.add_child(screen._grid_frame("trunk", inv, Kit.COLUMNS))
 

@@ -9,19 +9,19 @@ RELIABLE = {"cmdr", "welcome", "protos", "tprotos", "iprotos", "fprotos", "ready
             "bp", "bp_ok", "bpl", "hist", "quals", "iuse", "pidx", "dprotos", "dec", "ccol", "kept", "ac", "am", "steps", "cue"}
 IMMEDIATE = {"me", "mv", "bi", "ih", "ie", "gi", "sky", "msg", "gui", "hp", "tf", "ts", "afx", "atk", "died", "cq", "rs", "fl", "pw", "ht", "chart", "tags", "tr", "ln", "rc", "rb", "plat",
              "ai", "clip", "chat", "stats", "trl", "seg", "lt", "legs", "cp", "pg", "sp", "fz", "rk", "pst", "bf",
-             "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "bonus", "perms", "spd", "unghost", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui", "bs", "dg", "pol",
-             "mnd", "pku", "rpatch", "ext", "pols", "lodm", "lodr", "lod"}
+             "eq", "cinfo", "dead", "pl", "ach", "bq", "smap", "al", "pedia", "lnets", "lnet", "lnet_locs", "bonus", "perms", "spd", "unghost", "pick", "hinfo", "terr", "mtr", "mrp", "lpad", "cov", "bfar", "raise", "pj", "gf", "shot", "en", "acol", "wb", "gfx", "mgui", "bs", "dg", "pol",
+             "mnd", "pku", "rpatch", "ext", "pols", "lodm", "lodr", "lod", "ui_sfx", "rblk"}
 CLIENT = {
     "alt", "altc", "bfar", "blueprint", "bonuses", "bp_del", "bp_get", "bp_lib", "bp_page", "bp_rec", "bp_set",
     "bre", "budget", "build", "bye", "cancel_craft", "chat", "close", "cmd", "copy", "craft", "decon", "drive",
     "drop", "enter", "eq_move", "eq_put", "eq_take", "eq_toggle", "ext", "fast", "flip", "flush", "focus", "gfx",
-    "gun", "hello", "hinfo", "inv_filter", "land", "lnet", "lnets", "lod_sub", "lpad", "map", "mine", "mine_stop",
-    "modreq", "move", "mpress", "mrp", "mtr", "nack", "open", "paste", "paste_settings", "pedia", "pedia_index",
+    "gun", "hello", "hinfo", "inv_filter", "land", "lnet", "lnet_find", "lnets", "lod_sub", "lpad", "map", "mine", "mine_stop",
+    "modreq", "move", "mpress", "mrp", "mset", "mtr", "nack", "open", "paste", "paste_settings", "pedia", "pedia_index",
     "perms", "photo", "pickup", "pickup_stop", "plat_board", "plat_go", "plat_new", "plat_pause", "plat_sched",
-    "put", "qb_page", "qb_sel", "qb_set", "rails", "rate", "redo", "repair", "research", "research_cancel",
-    "respawn", "resync", "ride", "rotate", "rpatch", "set_artillery", "set_bar", "set_cb", "set_cc",
+    "put", "qb_page", "qb_sel", "qb_set", "rails", "rate", "rblk", "redo", "repair", "research", "research_cancel",
+    "pick", "respawn", "resync", "ride", "rotate", "rpatch", "set_artillery", "set_bar", "set_cb", "set_cc",
     "set_char_color", "set_char_requests", "set_chest_logistics", "set_collector", "set_color", "set_desc",
-    "set_hub", "set_inserter", "set_interrupts", "set_lamp", "set_pad", "set_panel", "set_pump", "set_recipe",
+    "set_hub", "set_inserter", "set_interrupts", "set_lamp", "set_lnet_name", "set_pad", "set_panel", "set_pump", "set_recipe",
     "set_requests", "set_schedule", "set_section", "set_silo", "set_speaker", "set_splitter", "set_stop",
     "set_storage_filter", "set_switch", "set_targets", "set_train_group", "set_vehicle", "shoot", "silo_launch",
     "smap", "sort", "spider_go", "spider_q", "stats", "sub", "tag_add", "tag_del", "take", "throw", "tile",
@@ -43,7 +43,8 @@ RECORD_TYPES = {"blueprint", "blueprint-book", "deconstruction-planner", "upgrad
 STATS_KINDS = {"item", "fluid", "kill", "electric", "build", "pollution"}
 ALERT_KINDS = {"destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "train_fuel", "train_path",
                "platform_path", "platform_storage", "collector", "launch", "pipeline", "unplugged", "no_fuel", "output_full",
-               "depleted"}
+               "depleted", "no_storage", "no_roboport_storage"}
+QUALITY_COMPARATORS = {"=", "≠", "!=", "<", "≤", "<=", ">", "≥", ">="}
 PEDIA_KINDS = {"item", "fluid", "entity", "recipe", "technology", "tile", "planet", "space-location", "quality"}
 
 
@@ -777,7 +778,7 @@ def eprops_overlay_problems(x):
     for k, v in x.items():
         if k in ("ip", "id", "vp"):
             ok = vec(v)
-        elif k in ("fo", "rr", "hl", "rf"):
+        elif k in ("fo", "rr", "hl", "rf", "tbd"):
             ok = v == 1
         elif k == "rk":
             ok = (isinstance(v, str) and v != "") or (isinstance(v, list) and v and all(isinstance(c, str) and c for c in v))
@@ -806,6 +807,15 @@ def eprops_overlay_problems(x):
             ok = isinstance(v, list) and 0 < len(v) <= 4 and all(
                 isinstance(c, list) and len(c) == 8 and c[0] in ("m", "l", "a", "f", "c") and all(_num(n) for n in c[1:4]) and c[3] > 0
                 and _int(c[4]) and c[4] >= 1 and _int(c[5]) and c[5] >= 1 and _num(c[6]) and c[6] > 0 and _num(c[7]) for c in v)
+        elif k == "fg":
+            # fast_replaceable_group (build cursor: what a held entity replaces).
+            ok = isinstance(v, str) and v != ""
+        elif k == "cb":
+            # collision_box [x1, y1, x2, y2] from its centre facing north, when not its selection box.
+            ok = isinstance(v, list) and len(v) == 4 and all(_num(n) for n in v) and v[2] > v[0] and v[3] > v[1]
+        elif k == "wb":
+            # 1: water under it stops it being built (collision_mask has water_tile).
+            ok = v == 1
         elif k == "tb":
             # Tile rules: [x1, y1, x2, y2, need, avoid], need / avoid "w" water, "g" ground, "" none.
             ok = isinstance(v, list) and 0 < len(v) <= 8 and all(
@@ -890,6 +900,11 @@ def pedia_problems(msg):
     for k in ("ing", "prod", "mine", "rocket"):
         if k in d and not _amounts(d[k]):
             out.append(f"pedia: {k} must be [[type, name, amount], ...]: {d[k]!r}")
+    if "dmg" in d and not (_list(d["dmg"]) and all(isinstance(a, list) and len(a) == 2 and isinstance(a[0], str) and _num(a[1]) for a in _items(d["dmg"]))):
+        out.append(f"pedia: dmg must be [[damage type, amount], ...]: {d['dmg']!r}")
+    for k in ("prod_detail", "mine_detail"):
+        if k in d and not (_list(d[k]) and all(isinstance(a, list) and len(a) == 3 and all(_num(v) for v in a) for a in _items(d[k]))):
+            out.append(f"pedia: {k} must be [[probability, lowest, highest], ...]: {d[k]!r}")
     for k in ("stack", "fuel", "hp", "energy", "power", "craft", "time", "modules", "level"):
         if k in d and not _num(d[k]):
             out.append(f"pedia: {k} must be a number: {d[k]!r}")
@@ -993,7 +1008,7 @@ def gui_problems(msg):
     if "ag" in msg and not (isinstance(msg["ag"], dict) and _int(msg["ag"].get("plants")) and _int(msg["ag"].get("ready"))):
         out.append(f"gui: ag (agricultural tower) is {{plants, ready}}: {msg['ag']!r}")
     if "lg" in msg:
-        out += logistics_problems(msg["lg"]) if kind in ("container", "roboport") else [f"gui: only logistic chests and roboports have lg: {msg!r}"]
+        out += logistics_problems(msg["lg"]) if kind in ("container", "roboport", "vehicle") else [f"gui: only logistic chests, roboports and vehicles have lg: {msg!r}"]
     if "stop" in msg:
         stop = msg["stop"]
         if kind != "stop":
@@ -1165,6 +1180,15 @@ def entity_ui_problems(msg, kind):
             out.append(f"gui: spk must be {{vol, mode, poly, vctl, vsig, inst, note, pitch, stop, al, il}}: {spk!r}")
     if "bar" in msg and not (_int(msg["bar"]) and msg["bar"] >= 0):
         out.append(f"gui: bar must be the usable slot count: {msg['bar']!r}")
+    if "gh" in msg and msg["gh"] not in (0, 1):
+        out.append(f"gui: gh must be 0 or 1: {msg['gh']!r}")
+    if "bl" in msg:
+        bl = msg["bl"]
+        if not (isinstance(bl, list) and len(bl) == 2 and all(
+                _list(lane) and all(isinstance(it, dict) and isinstance(it.get("name"), str)
+                                    and _int(it.get("count")) and isinstance(it.get("quality", ""), str)
+                                    for it in _items(lane)) for lane in bl)):
+            out.append(f"gui: bl must be [lane1, lane2] of {{name, count, quality?}}: {bl!r}")
     return out
 
 
@@ -1172,6 +1196,14 @@ def entity_ui_problems(msg, kind):
 def _amounts_ok(v):
     return _list(v) and all(isinstance(x, list) and len(x) == 3 and x[0] in ("item", "fluid", "research-progress")
                             and isinstance(x[1], str) and _num(x[2]) for x in _items(v))
+
+
+def _transfers_problems(v, where):
+    if not (_list(v) and all(
+            isinstance(r, list) and len(r) in (2, 3) and isinstance(r[0], str) and _int(r[1]) and r[1] >= 0
+            and (len(r) == 2 or isinstance(r[2], str)) for r in _items(v))):
+        return [f"{where}: transfers must be [[item, count, quality?], ...]: {v!r}"]
+    return []
 
 
 def machine_info_problems(msg, kind):
@@ -1215,14 +1247,20 @@ def machine_info_problems(msg, kind):
             out.append(f"gui: rg must match rl: {msg!r}")
     lc = msg.get("lc")
     if lc is not None:
-        if not (isinstance(lc, dict) and lc.get("tu") in (0, 1) and lc.get("rb", 0) in (0, 1)):
-            out.append(f"gui: lc is {{tu, rb?, sec}}: {lc!r}")
+        if not (isinstance(lc, dict) and lc.get("tu") in (0, 1) and lc.get("rb", 0) in (0, 1)
+                and lc.get("on", 0) in (0, 1) and lc.get("mv", 0) in (0, 1)
+                and lc.get("no_tu", 0) in (0, 1) and lc.get("in_net", 0) in (0, 1)):
+            out.append(f"gui: lc is {{tu, rb?, on?, mv?, no_tu?, in_net?, del?, pick?, sec}}: {lc!r}")
         else:
             out += sections_problems(lc.get("sec", []), "gui lc.sec")
+            if "del" in lc:
+                out += _transfers_problems(lc["del"], "gui lc.del")
+            if "pick" in lc:
+                out += _transfers_problems(lc["pick"], "gui lc.pick")
     return out
 
 def sections_problems(v, where):
-    """Logistic sections (space.lua): [{i, g, on, m, man, f: [[item, quality, min, max, from, mdc]]}]"""
+    """Logistic sections (space.lua): [{i, g, on, m, man, f: [[item, quality, min, max, from, mdc, cmp?]]}]"""
     if not _list(v):
         return [f"{where}: sections must be a list: {v!r}"]
     out = []
@@ -1232,9 +1270,10 @@ def sections_problems(v, where):
             out.append(f"{where}: a section is {{i, g, on, m, man, f}}: {sec!r}")
             continue
         for f in _items(sec["f"]):
-            if not (isinstance(f, list) and len(f) == 6 and isinstance(f[0], str) and isinstance(f[1], str) and _int(f[2])
-                    and _int(f[3]) and f[3] >= -1 and isinstance(f[4], str) and _int(f[5]) and f[5] >= -1):
-                out.append(f"{where}: a filter is [item, quality, min, max (-1), import from, min delivery (-1)]: {f!r}")
+            if not (isinstance(f, list) and len(f) in (6, 7) and isinstance(f[0], str) and isinstance(f[1], str) and _int(f[2])
+                    and _int(f[3]) and f[3] >= -1 and isinstance(f[4], str) and _int(f[5]) and f[5] >= -1
+                    and (len(f) == 6 or f[6] in QUALITY_COMPARATORS)):
+                out.append(f"{where}: a filter is [item, quality, min, max (-1), import from, min delivery (-1), cmp?]: {f!r}")
     return out
 
 
@@ -1296,9 +1335,10 @@ def requests_problems(v, where):
         return [f"{where}: requests must be a list: {v!r}"]
     out = []
     for r in _items(v):
-        if not (isinstance(r, list) and len(r) in (3, 4) and isinstance(r[0], str) and _int(r[1]) and r[1] >= 0
-                and _int(r[2]) and r[2] >= -1 and (len(r) == 3 or isinstance(r[3], str))):
-            out.append(f"{where}: request must be [item, min, max (-1 none), quality?]: {r!r}")
+        if not (isinstance(r, list) and len(r) in (3, 4, 5) and isinstance(r[0], str) and _int(r[1]) and r[1] >= 0
+                and _int(r[2]) and r[2] >= -1 and (len(r) < 4 or isinstance(r[3], str))
+                and (len(r) < 5 or r[4] in QUALITY_COMPARATORS)):
+            out.append(f"{where}: request must be [item, min, max (-1 none), quality?, cmp?]: {r!r}")
     return out
 
 
@@ -1309,6 +1349,19 @@ def network_problems(net, where):
     if "items" in net and not (_list(net["items"]) and all(
             isinstance(r, list) and len(r) in (2, 3) and isinstance(r[0], str) and _int(r[1]) for r in _items(net["items"]))):
         return [f"{where}: items must be [[item, count, quality?], ...]: {net['items']!r}"]
+    if "members" in net and not (_list(net["members"]) and all(
+            isinstance(r, list) and len(r) == 2 and isinstance(r[0], str) and _int(r[1]) and r[1] >= 0 for r in _items(net["members"]))):
+        return [f"{where}: members must be [[proto, count], ...]: {net['members']!r}"]
+    if "req" in net and not (_list(net["req"]) and all(
+            isinstance(r, list) and len(r) in (3, 4) and isinstance(r[0], str) and _int(r[1]) and _int(r[2])
+            and (len(r) == 3 or isinstance(r[3], str)) for r in _items(net["req"]))):
+        return [f"{where}: req must be [[item, requested, missing, quality?], ...]: {net['req']!r}"]
+    if "transit" in net:
+        out = _transfers_problems(net["transit"], f"{where}.transit")
+        if out:
+            return out
+    if "ch" in net and not (isinstance(net["ch"], list) and len(net["ch"]) == 2 and all(_int(v) and v >= 0 for v in net["ch"])):
+        return [f"{where}: ch must be [charging, to_charge]: {net['ch']!r}"]
     return []
 
 
@@ -1320,6 +1373,12 @@ def logistics_problems(lg):
         out += requests_problems(lg["requests"], "gui lg")
     if "filter" in lg and not isinstance(lg["filter"], str):
         out.append(f"gui: lg.filter is an item name or \"\": {lg!r}")
+    if "filter_q" in lg and not isinstance(lg["filter_q"], str):
+        out.append(f"gui: lg.filter_q is a quality name: {lg!r}")
+    if "cell" in lg:
+        cell = lg["cell"]
+        if not (isinstance(cell, dict) and all(cell.get(k) is None or (_int(cell[k]) and cell[k] >= 0) for k in ("sl", "sc", "ch", "tc"))):
+            out.append(f"gui: lg.cell is {{sl, sc, ch, tc}}: {cell!r}")
     if "net" in lg:
         out += network_problems(lg["net"], "gui lg.net")
     return out
@@ -1467,8 +1526,9 @@ def item_use_problems(rec):
     if kind == "t" and not (len(rec) == 5 and isinstance(rec[2], str) and isinstance(rec[3], str) and _list(rec[4])
                             and all(_int(v) for v in _items(rec[4]))):
         return [f"tile entry must be [item, \"t\", tile, other direction or \"\", [tile ids]]: {rec!r}"]
-    if kind == "c" and not (len(rec) == 5 and isinstance(rec[2], str) and _num(rec[3]) and _num(rec[4])):
-        return [f"capsule entry must be [item, \"c\", action type, range, radius]: {rec!r}"]
+    if kind == "c" and not (len(rec) in (5, 6) and isinstance(rec[2], str) and _num(rec[3]) and _num(rec[4])
+                            and (len(rec) == 5 or (_num(rec[5]) and rec[5] >= 0))):
+        return [f"capsule entry must be [item, \"c\", action type, range, radius, cooldown ticks]: {rec!r}"]
     if kind == "r" and not (len(rec) == 4 and isinstance(rec[2], str) and rec[3] in (0, 1)):
         return [f"rail planner entry must be [item, \"r\", support, elevated 0|1]: {rec!r}"]
     if kind in ("b", "p") and not (len(rec) == 3 and isinstance(rec[2], str)):
@@ -1644,6 +1704,14 @@ def client_problems(msg):
         l = msg.get("l")
         if not (isinstance(l, list) and len(l) <= 512 and all(_int(v) and v > 0 for v in l)):
             out.append(f"bre: l must be up to 512 positive integer lane keys: {l!r}")
+    elif t == "focus":
+        if "ir" in msg and not (_int(msg["ir"]) and 0 <= msg["ir"] <= 128):
+            out.append(f"focus: ir is the live inserter radius, a whole number of tiles 0..128: {msg['ir']!r}")
+    elif t == "bp_get":
+        if "i" in msg and not _int(msg["i"]):
+            out.append(f"bp_get: i must be an integer: {msg['i']!r}")
+        if "to" in msg and not (_int(msg["to"]) and msg["to"] >= -1):
+            out.append(f"bp_get: to must be -1, 0, or a main inventory slot: {msg['to']!r}")
     return out
 
 
@@ -2238,6 +2306,11 @@ def problems(msg):
         l = msg.get("l")
         if not (_list(l) and len(_items(l)) % 3 == 0 and all(_int(v) for v in _items(l))):
             out.append(f"rc: l must be flat [unit, item id, count, ...]: {l!r}")
+        if "q" in msg:
+            q = msg["q"]
+            qi = _items(q) if _list(q) else []
+            if not (_list(q) and len(qi) % 2 == 0 and all(_int(qi[i]) and isinstance(qi[i + 1], str) for i in range(0, len(qi), 2))):
+                out.append(f"rc: q must be flat [unit, quality, ...]: {q!r}")
     elif t == "clog":
         if not (msg.get("on") in (0, 1) and msg.get("trash") in (0, 1)):
             out.append(f"clog: on and trash are 0 or 1: {msg!r}")
@@ -2246,6 +2319,10 @@ def problems(msg):
             out += sections_problems(msg["sec"], "clog.sec")
         if "lgs" in msg and not (_list(msg["lgs"]) and all(isinstance(g, str) for g in _items(msg["lgs"]))):
             out.append(f"clog: lgs are group names: {msg['lgs']!r}")
+        if "del" in msg:
+            out += _transfers_problems(msg["del"], "clog.del")
+        if "pick" in msg:
+            out += _transfers_problems(msg["pick"], "clog.pick")
     elif t == "ccol":
         c = msg.get("c")
         if not (isinstance(c, list) and len(c) == 3 and all(_int(v) and 0 <= v <= 255 for v in c)):
@@ -2281,6 +2358,10 @@ def problems(msg):
                            f"(both \"\" for another surface): {rec!r}")
     elif t == "unghost":
         need("q", "n")
+    elif t == "pick":
+        need("q")
+        if "u" in msg:
+            need("u", "p", "x", "y")
     elif t == "rpatch":
         need("q")
         if "n" in msg:
@@ -2335,6 +2416,27 @@ def problems(msg):
                     and all(_list(r) and len(r) == 3 and r[0] in ("item", "fluid") and isinstance(r[1], str) and _int(r[2]) and r[2] >= 0
                             for k in ("i", "o") for r in rows(k))):
                 out.append(f"hinfo: io is {{i, o}}: [[item or fluid, name, thousandths a second], ...] each: {msg!r}")
+        if "fl" in msg:
+            fl = msg["fl"]
+            if not (_list(fl) and all(
+                isinstance(b, dict) and isinstance(b.get("fluid"), str) and b["fluid"] != ""
+                and _num(b.get("amount")) and b["amount"] >= 0
+                and _num(b.get("capacity")) and b["capacity"] >= 0
+                and ("temperature" not in b or _num(b["temperature"]))
+                for b in _items(fl)
+            )):
+                out.append(f"hinfo: fl is [{{fluid, amount, capacity, temperature?}}, ...]: {msg!r}")
+        if "ln" in msg:
+            ln = msg["ln"]
+            if not (isinstance(ln, dict) and _int(ln.get("id")) and ln["id"] >= 0
+                    and ("name" not in ln or isinstance(ln["name"], str))
+                    and ("mode" not in ln or isinstance(ln["mode"], str))
+                    and ("f" not in ln or isinstance(ln["f"], str))
+                    and ("fq" not in ln or isinstance(ln["fq"], str))
+                    and all(k not in ln or (isinstance(ln[k], list) and len(ln[k]) == 2 and all(_int(v) and v >= 0 for v in ln[k]))
+                            for k in ("log", "con", "ch"))
+                    and ("req" not in ln or requests_problems(ln["req"], "hinfo.ln.req") == [])):
+                out.append(f"hinfo: ln is {{id, name?, mode?, log?, con?, ch?, f?, fq?, req?}}: {ln!r}")
     elif t == "cmdr":
         need("id")
         need("l", check=_list)
@@ -2481,6 +2583,12 @@ def problems(msg):
     elif t == "rdet":
         need("part", "parts")
         need("l", check=_list)
+        if "hc" in msg and not _strs(msg["hc"]):
+            out.append(f"rdet: hc must be category names: {msg['hc']!r}")
+        if "cm" in msg:
+            cm = msg["cm"]
+            if not isinstance(cm, dict) or any(not isinstance(k, str) or not _strs(v) for k, v in cm.items()):
+                out.append(f"rdet: cm must map category name to entity name lists: {cm!r}")
         for rec in _items(msg.get("l")):
             out += recipe_detail_problems(rec)
     elif t == "craftable":
@@ -2549,8 +2657,11 @@ def problems(msg):
     elif t == "clip":
         need("l", check=_list)
         for rec in _items(msg.get("l")):
-            if not (isinstance(rec, list) and len(rec) == 4 and all(_int(v) for v in rec)):
-                out.append(f"clip: entry must be [proto id, x, y, direction]: {rec!r}")
+            if not (isinstance(rec, list) and len(rec) in (4, 5) and all(_int(v) for v in rec[:4])
+                    and (len(rec) == 4 or isinstance(rec[4], dict))):
+                out.append(f"clip: entry must be [proto id, x, y, direction, extra?]: {rec!r}")
+    elif t == "ui_sfx":
+        need("s", check=lambda v: isinstance(v, str) and v != "")
     elif t == "bp":
         need("q", "part", "parts", "i")
         need("s", check=lambda v: isinstance(v, str))
@@ -2610,6 +2721,13 @@ def problems(msg):
             out += network_problems(msg, "lnet")
         elif msg.get("found") != 0:
             out.append(f"lnet: found must be 0 or 1: {msg!r}")
+    elif t == "lnet_locs":
+        need("id", "si")
+        need("l", check=_list)
+        for rec in _items(msg.get("l")):
+            if not (isinstance(rec, list) and len(rec) == 4 and _int(rec[0]) and _int(rec[1])
+                    and isinstance(rec[2], str) and _int(rec[3]) and rec[3] >= 0):
+                out.append(f"lnet_locs: entry must be [x, y, proto, count]: {rec!r}")
     elif t == "stats":
         need("prec")
         need("kind", check=lambda v: v in STATS_KINDS)
@@ -2634,6 +2752,12 @@ def problems(msg):
         need("pr")
         need("cur", check=lambda v: isinstance(v, str))
         need("q", check=_strs)
+    elif t == "rblk":
+        need("b", check=_list)
+        for rec in _items(msg.get("b")):
+            if not (isinstance(rec, list) and len(rec) == 2 and _int(rec[0]) and _int(rec[1])):
+                out.append(f"rblk: entry must be [rail_unit, block_id]: {rec!r}")
+                break
     elif t == "steps":
         out += steps_problems(msg)
     elif t == "lodm":

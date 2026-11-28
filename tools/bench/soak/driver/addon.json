@@ -1,0 +1,9 @@
+{
+	"id": "soak-driver",
+	"name": "Soak driver",
+	"version": "1.0.0",
+	"api": 1,
+	"entry": "main.gd",
+	"author": "Zenith perf soak (tools/bench/soak)",
+	"description": "Test tool only: plays a soak's phases (synthetic keys, camera moves, console commands) and records every frame's time, the renderer's times and memory to a JSONL file. Never shipped."
+}

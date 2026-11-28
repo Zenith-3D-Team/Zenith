@@ -156,6 +156,98 @@ func _robot_sim() -> void:
 	var m_fast: MoverLayer.Mover = layer._movers.get(600)
 	check(m_fast != null and m_fast.ticks.size() >= 2,
 		"legacy mv TELEPORT fix preserves history on 18-tile limbo jump: ticks=%d" % (m_fast.ticks.size() if m_fast else -1))
+
+	# 5. Personal roboport return FOLLOW (RB_RETURNING) tracking + 2-stage hover/shrink DockAnim + opt-outs.
+	layer.puppet_unit = 999
+	layer.avatar_pos = Vector3(12.0, 0.0, 4.0)
+	layer.handle_robots({"t": "rb", "k": 540, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [700, 6, 540, 6 * 256, 4 * 256, 12 * 256, 4 * 256, 999, 0, 250, 4 | 1024]})
+	layer._process(1.0 / 60.0)
+	layer.avatar_pos = Vector3(14.0, 0.0, 5.0)
+	layer._process(1.0 / 60.0)
+	var m_ret: MoverLayer.Mover = layer._movers.get(700)
+	check(m_ret != null and m_ret.sim_follow_unit == 999 and m_ret.sim_end1.distance_to(Vector2(14.0, 5.0)) < 0.05,
+		"rb personal return FOLLOW updates target per frame toward moving avatar: end1=%s" % [m_ret.sim_end1 if m_ret else Vector2.ZERO])
+	layer.handle_robots({"t": "rb", "k": 545, "part": 1, "parts": 1, "p": 20, "sm": 1000, "u": [], "g": [700]})
+	check(layer.docking_count() == 1 and not layer._movers.has(700),
+		"rb gone while RB_FOLLOW | RB_RETURNING spawns DockAnim: count=%d" % layer.docking_count())
+	for _s in 3:
+		layer._process(0.05)  # hover stage
+	var d_hover: MoverLayer.DockAnim = layer._docking[0] if layer.docking_count() == 1 else null
+	var h_scale: float = d_hover.node.scale.x if d_hover != null and is_instance_valid(d_hover.node) else -1.0
+	var h_y: float = d_hover.node.position.y if d_hover != null and is_instance_valid(d_hover.node) else -1.0
+	check(d_hover != null and h_scale > 0.95 and h_y > 1.8,
+		"DockAnim stage 1 lifts to hover above character before shrinking: scale=%.2f y=%.2f" % [h_scale, h_y])
+	for _s in 6:
+		layer._process(0.05)  # into dive + shrink stage (0.15 + 0.30 = 0.45s)
+	var d_dive: MoverLayer.DockAnim = layer._docking[0] if layer.docking_count() == 1 else null
+	var d_scale: float = d_dive.node.scale.x if d_dive != null and is_instance_valid(d_dive.node) else 99.0
+	check(d_dive != null and d_scale < 0.85,
+		"DockAnim stage 2 shrinks robot diving into character back: scale=%.2f" % d_scale)
+	for _s in 8:
+		layer._process(0.05)
+	check(layer.docking_count() == 0, "DockAnim cleans up after finishing: count=%d" % layer.docking_count())
+
+	# Negative cases: logistic robot without RB_RETURNING, snap=1 removal, and --robot-dock-anim=off.
+	layer.handle_robots({"t": "rb", "k": 550, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [701, 5, 550, 12 * 256, 4 * 256, 14 * 256, 5 * 256, 999, 0, 250, 4]})
+	layer._process(1.0 / 60.0)
+	layer.handle_robots({"t": "rb", "k": 551, "part": 1, "parts": 1, "p": 20, "sm": 1000, "u": [], "g": [701]})
+	check(layer.docking_count() == 0, "logistic FOLLOW without RB_RETURNING does NOT spawn DockAnim")
+	layer.handle_robots({"t": "rb", "k": 552, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [702, 6, 552, 12 * 256, 4 * 256, 14 * 256, 5 * 256, 999, 0, 250, 4 | 1024]})
+	layer._process(1.0 / 60.0)
+	layer.handle_robots({"t": "rb", "k": 553, "part": 1, "parts": 1, "p": 20, "sm": 1000, "snap": 1, "u": []})
+	check(layer.docking_count() == 0, "snap=1 eviction does NOT spawn DockAnim")
+	layer.dock_anim_enabled = false
+	layer.handle_robots({"t": "rb", "k": 554, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [703, 6, 554, 12 * 256, 4 * 256, 14 * 256, 5 * 256, 999, 0, 250, 4 | 1024]})
+	layer._process(1.0 / 60.0)
+	layer.handle_robots({"t": "rb", "k": 555, "part": 1, "parts": 1, "p": 20, "sm": 1000, "u": [], "g": [703]})
+	check(layer.docking_count() == 0, "dock_anim_enabled=false disables DockAnim")
+	layer.dock_anim_enabled = true
+
+	# 6. Charging sparks (`RB_CHARGING`): logistic & construction robots emit roboport-charge arcs and cyan sparks when hovering/docked.
+	var fx_sprites := SpriteFx.new()
+	holder.add_child(fx_sprites)
+	layer.vehicles.sprites = fx_sprites
+	layer.handle_robots({"t": "rb", "k": 560, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [
+			710, 5, 560, 8 * 256, 8 * 256, 8 * 256, 8 * 256, 0, 0, 250, 2 | 256,
+			711, 6, 560, 10 * 256, 8 * 256, 10 * 256, 8 * 256, 0, 0, 250, 2 | 256,
+		]})
+	for _s in 3:
+		layer._process(0.12)
+	fx_sprites._process(0.016)
+	var arc_pool = fx_sprites._pools["roboport-charge"]
+	var spk_pool = fx_sprites._pools["sparks"]
+	check(arc_pool.cards.size() > 0 and spk_pool.cards.size() > 0,
+		"RB_CHARGING HOVER emits roboport-charge arcs and sparks: arcs=%d sparks=%d" % [arc_pool.cards.size(), spk_pool.cards.size()])
+
+	fx_sprites.clear()
+	layer.handle_robots({"t": "rb", "k": 562, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [
+			710, 5, 562, 8 * 256, 8 * 256, 12 * 256, 8 * 256, 0, 0, 250, 1 | 256,
+			711, 6, 562, 10 * 256, 8 * 256, 10 * 256, 8 * 256, 0, 0, 250, 3,
+		]})
+	for _s in 3:
+		layer._process(0.12)
+	check(fx_sprites.count() == 0, "FLY_DIR | RB_CHARGING and ORBIT without CHARGING emit no sparks: count=%d" % fx_sprites.count())
+
+	layer.handle_robots({"t": "rb", "k": 564, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [710, 5, 564, 8 * 256, 8 * 256, 8 * 256, 8 * 256, 0, 0, 250, 2]})
+	for _s in 3:
+		layer._process(0.12)
+	check(fx_sprites.count() == 0, "Clearing RB_CHARGING stops charging sparks: count=%d" % fx_sprites.count())
+
+	layer.robots.charge_sparks_enabled = false
+	layer.handle_robots({"t": "rb", "k": 566, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [710, 5, 566, 8 * 256, 8 * 256, 8 * 256, 8 * 256, 0, 0, 250, 2 | 256]})
+	for _s in 3:
+		layer._process(0.12)
+	check(fx_sprites.count() == 0, "charge_sparks_enabled=false disables charging sparks")
+	layer.robots.charge_sparks_enabled = true
+	layer.vehicles.sprites = null
 	holder.queue_free()
 
 
@@ -902,17 +994,28 @@ func _tree_crowns() -> void:
 	square[Mesh.ARRAY_INDEX] = PackedInt32Array([0, 1, 2, 0, 2, 3])
 	ModelLods.Job.crown_arrays(square, false, card, card_uv)
 	var expected_scale := ModelLods.Job.CARD_SHADOW_DECIMATED if ModelLods.tree_shadow_decimate else ModelLods.Job.CARD_SHADOW
-	check(card.size() == 6 and card[0].is_equal_approx(Vector3(0.5, 0.5, 0) + Vector3(-0.5, -0.5, 0) * expected_scale)
+	var expected_verts := 6 if ModelLods.Job.quad_shadows else 15
+	var rad_dist := card[0].distance_to(Vector3(0.5, 0.5, 0)) if not card.is_empty() else 0.0
+	check(card.size() == expected_verts and (ModelLods.Job.quad_shadows or (rad_dist >= 0.41 * expected_scale and rad_dist <= 0.50 * expected_scale))
 		and is_equal_approx(card_uv[0].x, 0.25) and card_uv[0].y == 0.0,
-		"a card's stand-in is drawn in to its spray's share round its middle, with its seed (%s)" % [card[0]])
+		"a card's stand-in emits rounded polygon fan around its middle with its seed (%d, %s)" % [card.size(), card[0]])
+	var was_quad := ModelLods.Job.quad_shadows
+	ModelLods.Job.quad_shadows = true
+	var qcard := PackedVector3Array()
+	var qcard_uv := PackedVector2Array()
+	ModelLods.Job.crown_arrays(square, false, qcard, qcard_uv)
+	check(qcard.size() == 6 and qcard[0].is_equal_approx(Vector3(0.5, 0.5, 0) + Vector3(-0.5, -0.5, 0) * expected_scale)
+		and is_equal_approx(qcard_uv[0].x, 0.25) and qcard_uv[0].y == 0.0,
+		"with --tree-shadow-shape=old, a card's stand-in is drawn in as a quad (%s)" % [qcard[0]])
 	var was_dec := ModelLods.tree_shadow_decimate
 	ModelLods.tree_shadow_decimate = false
 	var card_full := PackedVector3Array()
 	var card_full_uv := PackedVector2Array()
 	ModelLods.Job.crown_arrays(square, false, card_full, card_full_uv)
 	ModelLods.tree_shadow_decimate = was_dec
+	ModelLods.Job.quad_shadows = was_quad
 	check(card_full.size() == 6 and card_full[0].is_equal_approx(Vector3(0.5, 0.5, 0) + Vector3(-0.5, -0.5, 0) * ModelLods.Job.CARD_SHADOW),
-		"a card's stand-in uses CARD_SHADOW when decimation is disabled (%s)" % [card_full[0]])
+		"a card's quad stand-in uses CARD_SHADOW when decimation is disabled (%s)" % [card_full[0]])
 	check(load("res://shaders/shadow_stand_in_leaf.gdshader") is Shader and ModelLods.leaf_material().shader != ModelLods.material().shader,
 		"the crown's stand-in has a shader of its own that drops what pollution took")
 	# tree-06's strands: the leaves' shader, UV -2, solid leaves in the stand-in.
@@ -934,6 +1037,19 @@ func _tree_crowns() -> void:
 	var include_text := FileAccess.get_file_as_string("res://shaders/factorio_material.gdshaderinc")
 	check(include_text.contains("float leaf_kind = leaf_core ? 1.0 : (UV.x < -1.5 ? 2.0 : (UV.x < -0.5 ? 1.0 : 0.0));"),
 		"the leaves' shader tells cores and solid leaves from cards by their UV")
+	# Bug #22 (double-arm inserter): _update_rest duplicates `live` instead of aliasing the caller's map.
+	var ArmsScript := preload("res://scripts/world/inserter_arms.gd")
+	var arms_w := WorldMirror.new()
+	var arms := ArmsScript.new()
+	arms.world = arms_w
+	add_child(arms)
+	var live_map := {42: Vector2i.ZERO}
+	arms._update_rest(live_map, 0.016)
+	live_map.clear()
+	check(arms._rest_live.has(42) and arms._rest_live.get(42) == Vector2i.ZERO,
+		"#22: InserterArms._update_rest duplicates live map so mutating caller's dict preserves _rest_live")
+	arms.queue_free()
+	arms_w.free()
 
 
 func _creature_motion() -> void:
@@ -1285,8 +1401,11 @@ func _gpu_anim() -> void:
 	add_child(anim)
 	var dt := 1.0 / 1000.0  # the old per-frame sums at a fine step, so they meet the exact sums
 	# [model, part kind, working from, working until]
+	# Assembling machine 1: the rebuilt Placeholders model is drawn first (its own gears), Wube3DP's with
+	# --assembler-models=old.
+	var am1_gear := "am1_gear_cw" if ModelPacksScript.prefer_builtin_assemblers else "gear_am1_w"
 	var cases := [["burner-mining-drill", "spin_drill", 0.5, 2.5], ["steam-engine", "spin_flywheel", 0.3, 1.6],
-		["assembling-machine-1", "gear_am1_w", 0.2, 2.0], ["oil-refinery", "yoke_refinery", 0.4, 2.2],
+		["assembling-machine-1", am1_gear, 0.2, 2.0], ["oil-refinery", "yoke_refinery", 0.4, 2.2],
 		["recycler", "slide_recycler_panel", 0.5, 1.5], ["pumpjack", "rock_beam", 0.25, 2.0],
 		["offshore-pump", "bob_b", 0.5, 2.5], ["power-switch", "switch", 0.5, 0.8],
 		["rocket-silo", "door_silo_e", 0.2, 3.0], ["rail-signal", "lit_green", 0.5, 2.0]]

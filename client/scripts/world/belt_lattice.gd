@@ -697,7 +697,7 @@ func update(job_state, sim, tick: int, view: Rect2, view_all: bool, known: Dicti
 		var obs := _obs_front(key) if standing_obs else -1
 		var st := _stack_of(key) if ln == null or replan or heard.has(key) else ln.stack
 		var short := fronts[q * 3 + 2] < maxi(1, m[1] / GAP)
-		if ln != null and ln.v > 0 and short and has and sim_full and fed_gone.has(key) \
+		if ln != null and ((ln.v > 0 and short and has) or (BeltSim.take_sync and (not has or (ln.v > 0 and short)))) and sim_full and fed_gone.has(key) \
 				and tick - int(fed_gone[key]) <= FED_GONE_TICKS \
 				or tail and tails.size() > q and tails[q] == 1 and (not has or short and (ln == null or ln.v > 0)):
 			# (sim_full) Moving, and the simulation has it short of full: the line behind it ended or is gone;
@@ -1864,6 +1864,22 @@ func hole(key: int, at: int, pos: int, dump: bool) -> Dictionary:
 			if not e.is_empty():
 				e[0] = false
 			dirty[key] = true
+	elif BeltSim.take_sync and close and settle and ln != null and ln.v > 0:
+		# (take_sync) A take on a moving packed lane exits it from the lattice and propagates fed_gone downstream
+		# so the lane and those ahead don't refill the taken gap with phantoms until pc.
+		var e: Array = info.get(key, [])
+		if not e.is_empty():
+			e[0] = false
+		dirty[key] = true
+		if sim_full:
+			fed_gone[key] = at
+			var nx: int = ln.next
+			var guard := 0
+			while nx != 0 and nx != key and guard < 256:
+				fed_gone[nx] = at
+				var nln: Lane = drawn.get(nx)
+				nx = nln.next if nln != null else 0
+				guard += 1
 	if ln == null or records.base < 0.0:
 		return res
 	var kd: LKind = kinds.get(ln.kind_key)

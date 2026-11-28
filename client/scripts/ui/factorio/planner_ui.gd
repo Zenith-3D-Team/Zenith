@@ -359,8 +359,14 @@ func held_preview(protos) -> Array:
 	for f in found:
 		var e: Dictionary = f[3]
 		var entry := {"p": f[0].id, "at": (f[1] as Vector2) - mid, "d": f[2]}
+		var extra := {}
 		if f[0].type == "underground-belt" or f[0].type == "linked-belt":
-			entry["x"] = {"u": "o" if str(e.get("type", "input")) == "output" else "i"}
+			extra["u"] = "o" if str(e.get("type", "input")) == "output" else "i"
+		for key: String in ["recipe", "filters", "filter", "request_filters", "items"]:
+			if e.has(key) and e[key] != null:
+				extra[key] = e[key]
+		if not extra.is_empty():
+			entry["x"] = extra
 		if bool(e.get("mirror", false)):
 			entry["f"] = true
 		_preview.append(entry)
@@ -576,11 +582,18 @@ func _with_upgrade_planner(then: Callable) -> void:
 			then.call(r))
 
 
-## The slot of the planner in the cursor: the library's (-1), the one picked up, or the first of
-## that item; 0 for none.
+## The slot of the planner in the cursor: the clipboard (-2), the library's (-1), the one picked
+## up, or the first of that item; 0 for none.
 func cursor_slot() -> int:
 	var p = ui.player
-	if p == null or not PLANNER_ITEMS.has(str(p.cursor_item)):
+	if p == null:
+		return 0
+	var tool = p.get("cursor_tool")
+	if tool != null and str(tool) == "paste":
+		return -2
+	if tool != null and str(tool) != "":
+		return 0
+	if not PLANNER_ITEMS.has(str(p.cursor_item)):
 		return 0
 	var held = p.get("cursor_slot")
 	if held != null and int(held) != 0:
@@ -593,24 +606,51 @@ func cursor_slot() -> int:
 	return 0
 
 
+## Saves the clipboard's copied selection (Ctrl+C) into main inventory slot `to` (0: first empty
+## slot) as a blueprint item, playing the inventory sound and clearing the cursor.
+func save_clipboard(to := 0) -> bool:
+	if cursor_slot() != -2:
+		return false
+	var on_saved := func(_r: Dictionary, _t: String, info: Dictionary) -> void:
+		var err := str(info.get("err", ""))
+		if err != "":
+			ui.hud_message(err)
+	model.save_stack(-2, to, on_saved)
+	ui._play_move_sfx("blueprint")
+	ui._drop_hand()
+	return true
+
+
 ## A click on the library's grid: the held planner is added there (a copy).
 func add_held(path: Array) -> void:
 	var slot := cursor_slot()
 	if slot == 0:
 		return
-	model.export_stack(slot, func(r: Dictionary, _t: String, _info: Dictionary) -> void:
+	var was_paste := slot == -2
+	var on_exported := func(r: Dictionary, _t: String, _info: Dictionary) -> void:
 		if not r.is_empty():
 			library.add(path, r)
-			ui.hud_message("Added %s to the library" % BpString.title(r)))
+			ui.hud_message("Added %s to the library" % BpString.title(r))
+			if was_paste:
+				ui._play_move_sfx("blueprint")
+				if ui.player != null and str(ui.player.get("cursor_tool")) == "paste":
+					ui._drop_hand()
+	model.export_stack(slot, on_exported)
 
 
 func _add_held_page() -> void:
 	var slot := cursor_slot()
-	if slot == 0 or str(ui.player.cursor_item) != "blueprint":
+	if slot == 0 or (slot != -2 and str(ui.player.cursor_item) != "blueprint"):
 		return
-	model.export_stack(slot, func(r: Dictionary, _t: String, _info: Dictionary) -> void:
+	var was_paste := slot == -2
+	var on_exported := func(r: Dictionary, _t: String, _info: Dictionary) -> void:
 		if BpString.kind(r) == "blueprint":
-			book_window.add_page(r))
+			book_window.add_page(r)
+			if was_paste:
+				ui._play_move_sfx("blueprint")
+				if ui.player != null and str(ui.player.get("cursor_tool")) == "paste":
+					ui._drop_hand()
+	model.export_stack(slot, on_exported)
 
 
 # --- import and export strings ----------------------------------------------------------------

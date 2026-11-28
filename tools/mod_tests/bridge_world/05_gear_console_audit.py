@@ -106,6 +106,15 @@ welcome = of_type(msgs, "welcome")
 check(new and new.valid and new.unit_number != dead_unit and new.position.x == 0 and new.position.y == 0
       and welcome and welcome[-1]["u"] == new.unit_number, "after the respawn time a new character at the spawn, with a welcome")
 check(g.storage.f3d.respawn is None and g.storage.f3d.death is None, "and the death is forgotten")
+new_main = new.get_main_inventory()
+new_guns = new.get_inventory(g.defines.inventory.character_guns)
+new_ammo = new.get_inventory(g.defines.inventory.character_ammo)
+check(new_main.get_item_count("iron-plate") == 0 and new_main.get_item_count("burner-mining-drill") == 0
+      and new_main.get_item_count("stone-furnace") == 0 and new_main.get_item_count("wood") == 0
+      and new_guns.get_item_count("pistol") + new_main.get_item_count("pistol") == 1
+      and new_ammo.get_item_count("firearm-magazine") + new_main.get_item_count("firearm-magazine") == 10,
+      "the respawned character gets freeplay's respawn items (a pistol, 10 magazines), not the new player's kit")
+new.insert(lua.table_from({"name": "iron-plate", "count": 8}))  # (the takeover below carries it over)
 puppet = new
 
 # --- taking over a save's character (a single-player save on a server) -----------------------------
@@ -325,8 +334,14 @@ r = console("/time", 3)
 check(r and r["l"] == ["1 hour, 2 minutes and 5 seconds"], f"cmd /time in Factorio's words: {r}")
 r = console("/evolution", 4)
 check(r and "Evolution factor: 0.2500. (Time 60%) (Pollution 20%) (Spawner kills 20%)" in r["l"][0], f"cmd /evolution: {r}")
+r = console("/evolution nowhere", 53)
+check(r and r["l"] == ['Surface "nowhere" does not exist.'], f"cmd /evolution with an unknown surface says so, not the character's: {r}")
 r = console("/players", 5)
 check(r and r["l"][0].startswith("Players ("), f"cmd /players: {r}")
+r = console("/players online count", 51)
+check(r and len(r["l"]) == 1 and r["l"][0].startswith("Online players ("), f"cmd /players online count: header only, 'Online players (n):': {r}")
+r = console("/players c", 52)
+check(r and len(r["l"]) == 1 and r["l"][0].startswith("Players ("), f"cmd /players c: the count only: {r}")
 r = console("/f3d-status", 6)
 check(r and any(str(l).startswith("[Zenith] client on port") for l in r["l"]), f"cmd /f3d-status: its lines come back, not to RCON: {r}")
 # With /f3d-profile on its lines carry profilers, which can't go into a JSON message: text only.
@@ -578,6 +593,16 @@ close_b = info.add(lua.table_from({"type": "sprite-button", "name": "close", "sp
                                    "tags": lua.table_from({"root": "informatron", "action": "close-gui"})}))
 close_b.get_mod = lambda *a: "informatron"
 other_b = info.add(lua.table_from({"type": "button", "name": "other", "caption": "Not Informatron's"}))
+slide = info.add(lua.table_from({"type": "slider", "name": "slide", "slider_value": 3}))
+slide.get_slider_minimum = lambda *a: 1
+slide.get_slider_maximum = lambda *a: 10
+slide.get_slider_value_step = lambda *a: 1
+field = info.add(lua.table_from({"type": "textfield", "name": "field", "text": "ab"}))
+box = info.add(lua.table_from({"type": "checkbox", "name": "box", "state": False, "caption": "Tick"}))
+radio = info.add(lua.table_from({"type": "radiobutton", "name": "radio", "state": False}))
+drop = info.add(lua.table_from({"type": "drop-down", "name": "drop", "items": lua.table_from(["a", "b", "c"]), "selected_index": 1}))
+sw = info.add(lua.table_from({"type": "switch", "name": "sw", "switch_state": "left", "allow_none_state": False}))
+pick = info.add(lua.table_from({"type": "choose-elem-button", "name": "pick", "elem_type": "signal", "elem_value": lua.table_from({"type": "virtual", "name": "signal-A"})}))
 para = info.add(lua.table_from({"type": "label", "name": "para", "caption": "A long paragraph"}))
 para.style.single_line = False
 para.style.maximal_width = 888
@@ -591,9 +616,78 @@ kids = {k["n"]: k for k in mg[-1]["l"][0]["e"]["a"]} if mg else {}
 check(kids.get("menu-informatron", {}).get("ck") is True and kids.get("close", {}).get("ck") is True and "ck" not in kids.get("other", {})
       and kids["menu-informatron"].get("ix") == menu_b.index,
       f"mgui: Informatron's tagged buttons are marked ck with their index, another mod's button isn't: {kids}")
+check(kids.get("slide", {}).get("v") == 3 and kids["slide"].get("mn") == 1 and kids["slide"].get("mx") == 10,
+      f"mgui: a slider carries its value and range: {kids.get('slide')}")
 check(kids.get("para", {}).get("ml") is True and kids["para"].get("mw") == 888, f"mgui: a label Factorio wraps carries ml and mw: {kids.get('para')}")
 check(mg[-1]["l"][0]["e"].get("sz") == [0, 0, 800, 800] and kids["menu-informatron"].get("hs") is True and "sz" not in kids.get("other", {}),
       f"mgui: style sizes (sz) and stretching (hs) as Factorio lays the window out: {mg[-1]['l'][0]['e'].get('sz')}")
+# What the player does to a mod's textfield, checkbox, drop-down or slider in Zenith (`mset`): set on the
+# element, as a click would, and raised as the bridge's own events (a script can't raise Factorio's) with
+# Factorio's field names, for a mod that listens (remote zenith gui_events).
+lua.execute("""GUIEV = {}
+for name, id in pairs(remote.call("zenith", "gui_events")) do
+  F.companion_on(id, function(e) GUIEV[#GUIEV + 1] = { name = name, element = e.element, player_index = e.player_index, text = e.text, state = e.state, selected_index = e.selected_index, value = e.value, switch_state = e.switch_state, element_value = e.element_value } end)
+end""")
+guiev = lambda: [dict(e) for e in lua.eval("GUIEV").values()]
+ev_names = sorted(dict(F.remote["zenith"].gui_events()).keys())
+check(ev_names == ["on_gui_checked_state_changed", "on_gui_elem_changed", "on_gui_selection_state_changed", "on_gui_switch_state_changed", "on_gui_text_changed", "on_gui_value_changed"],
+      f"mset: the zenith interface names the events: {ev_names}")
+send({"t": "mset", "ix": field.index, "v": "abc"})
+tick(1)
+ev = guiev()
+check(field.text == "abc" and len(ev) == 1 and ev[0]["name"] == "on_gui_text_changed" and ev[0]["text"] == "abc"
+      and ev[0]["player_index"] == 1 and ev[0]["element"].index == field.index,
+      f"mset: typing in a textfield sets its text and raises on_gui_text_changed (element, player_index, text): {field.text} {ev}")
+check(any(m["l"] and m["l"][0]["i"] == info.index for m in of_type(take(), "mgui")), "mset: the window is read again at once, so the client sees the mod's value")
+send({"t": "mset", "ix": box.index, "v": True})
+send({"t": "mset", "ix": radio.index, "v": True})
+send({"t": "mset", "ix": radio.index, "v": False})  # a click never switches a radio button off
+tick(1)
+ev = guiev()[1:]
+check(box.state is True and radio.state is True and [e["name"] for e in ev] == ["on_gui_checked_state_changed"] * 2
+      and ev[0]["state"] is True and ev[0]["element"].index == box.index and ev[1]["element"].index == radio.index,
+      f"mset: a checkbox and a radio button are checked (on_gui_checked_state_changed with state), a radio never unchecked: {box.state} {radio.state} {ev}")
+send({"t": "mset", "ix": box.index, "v": False})
+send({"t": "mset", "ix": drop.index, "v": 3})
+send({"t": "mset", "ix": drop.index, "v": 4})  # past the items
+send({"t": "mset", "ix": drop.index, "v": 0})
+send({"t": "mset", "ix": slide.index, "v": 7.4})
+send({"t": "mset", "ix": slide.index, "v": 99})  # past the maximum: clamped
+tick(1)
+ev = guiev()[3:]
+check(box.state is False and drop.selected_index == 3 and slide.slider_value == 10
+      and [e["name"] for e in ev] == ["on_gui_checked_state_changed", "on_gui_selection_state_changed", "on_gui_value_changed", "on_gui_value_changed"]
+      and ev[1]["selected_index"] == 3 and ev[2]["value"] == 7 and ev[3]["value"] == 10,
+      f"mset: a drop-down's index within its items (else refused), a slider's value at its step and within its range: {drop.selected_index} {slide.slider_value} {ev}")
+send({"t": "mset", "ix": sw.index, "v": "right"})
+send({"t": "mset", "ix": sw.index, "v": "none"})  # not allowed without allow_none_state
+send({"t": "mset", "ix": sw.index, "v": "middle"})
+tick(1)
+ev = guiev()[7:]
+check(sw.switch_state == "right" and len(ev) == 1 and ev[0]["name"] == "on_gui_switch_state_changed" and ev[0]["switch_state"] == "right",
+      f"mset: a switch goes to left or right (none only with allow_none_state), raising on_gui_switch_state_changed: {sw.switch_state} {ev}")
+mg = [m for m in of_type(take(), "mgui") if m["l"] and m["l"][0]["i"] == info.index]
+pk = {k["n"]: k for k in mg[-1]["l"][0]["e"]["a"]}["pick"] if mg else {}
+check(pk.get("ev") == "signal-A" and pk.get("evt") == "virtual" and pk.get("et") == "signal", f"mgui: a choose-elem-button's signal keeps its type: {pk}")
+send({"t": "mset", "ix": pick.index, "v": {"type": "item", "name": "iron-plate"}})
+send({"t": "mset", "ix": pick.index, "v": 12})  # not a value
+tick(1)
+ev = guiev()[8:]
+check(len(ev) == 1 and ev[0]["name"] == "on_gui_elem_changed" and ev[0]["element_value"]["name"] == "iron-plate" and ev[0]["element_value"]["type"] == "item"
+      and pick.elem_value["name"] == "iron-plate", f"mset: a choose-elem-button's picked signal is set, with on_gui_elem_changed (element_value): {ev}")
+send({"t": "mset", "ix": pick.index, "v": False})
+tick(1)
+ev = guiev()[9:]
+check(len(ev) == 1 and ev[0].get("element_value") is None and pick.elem_value is None, f"mset: right click clears it: {ev}")
+n_ev = len(guiev())
+send({"t": "mset", "ix": field.index, "v": 5})  # the wrong kind of value
+send({"t": "mset", "ix": para.index, "v": "x"})  # a label can't be set
+send({"t": "mset", "ix": 987654, "v": "x"})  # no such element
+field.enabled = False
+send({"t": "mset", "ix": field.index, "v": "nope"})
+field.enabled = True
+tick(1)
+check(len(guiev()) == n_ev and field.text == "abc", f"mset: wrong values, other elements, unknown or disabled ones change and raise nothing: {len(guiev())} {field.text}")
 send({"t": "mpress", "ix": menu_b.index})
 tick(1)
 check(opened_pages == [(1, "informatron", "informatron")], f"mpress on a menu button opens its page through Informatron's interface: {opened_pages}")

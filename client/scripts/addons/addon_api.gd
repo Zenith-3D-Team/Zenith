@@ -54,7 +54,7 @@ signal cue_changed(tick: int)
 var version := AddonLoader.API_VERSION
 ## The add-on API with its additions within the version (1.1: settings, view.keep_drawing; 1.2:
 ## terrain; 1.3: shaders; 1.6: world.hold_chunks, view.full_detail, view.screenshot; 1.7: character,
-## camera.mode, game, addons, sound; 1.8: weather; 1.9: creatures; 1.91: world.tick, smooth_tick, cue_tick; 1.92: cue_changed, a cue set by the game). Check it before using a newer call to keep working on a Zenith with 1.0:
+## camera.mode, game, addons, sound; 1.8: weather; 1.9: creatures; 1.91: world.tick, smooth_tick, cue_tick; 1.92: cue_changed, a cue set by the game; 1.93: native_class; 1.94: world.prepare_view, release_view, mark_cut; 1.95: creatures.make_ragdoll_part_nodes). Check it before using a newer call to keep working on a Zenith with 1.0:
 ## `if api.get("level") != null and api.level >= 1.1`.
 var level := AddonLoader.API_LEVEL
 ## Zenith's own version, for messages.
@@ -128,6 +128,7 @@ func _teardown() -> void:
 	updates.clear()
 	view._release()
 	_host.hold_chunks(self, false)
+	world.release_view()
 	settings._remove_all()
 	terrain.clear()
 	shaders.clear()

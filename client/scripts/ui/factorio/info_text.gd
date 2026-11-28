@@ -7,6 +7,17 @@ extends RefCounted
 const Kit := preload("res://scripts/ui/factorio/kit.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 
+## Technology effects whose value is a count, not a percentage ("Bulk inserter capacity: +1").
+const EFFECT_COUNTS := ["bulk-inserter-capacity-bonus", "inserter-stack-size-bonus", "worker-robot-storage",
+	"maximum-following-robots-count", "character-logistic-trash-slots", "character-inventory-slots-bonus",
+	"character-health-bonus", "character-build-distance", "character-reach-distance", "character-resource-reach-distance",
+	"character-item-pickup-distance", "character-item-drop-distance", "character-loot-pickup-distance",
+	"max-failed-attempts-per-tick-per-construction-queue", "max-successful-attempts-per-tick-per-construction-queue",
+	"deconstruction-time-to-live", "beacon-distribution", "max-cargo-bay-unloading-distance"]
+## core's [modifier-description] lines for the effects with no value (core's locale isn't read).
+const EFFECT_WORDS := {"unlock-circuit-network": "Unlocks circuit network.",
+	"cliff-deconstruction-enabled": "Allows the deconstruction planner, rail planner and forced building mode to mark cliffs for deconstruction.",
+	"mining-with-fluid": "Allows the usage of fluid in mining drills.", "vehicle-logistics": "Unlocks vehicle logistics."}
 const STAT := Color(0.85, 0.85, 0.85)
 const ROBOT_EFFECTS := {"speed": "Speed", "productivity": "Productivity", "consumption": "Energy consumption",
 	"pollution": "Pollution", "quality": "Quality"}
@@ -29,6 +40,22 @@ static func num(v: float) -> String:
 	if s.contains("."):
 		s = s.rstrip("0").rstrip(".")
 	return s
+
+
+## A product's amount in a Factoriopedia row: "2 × ", "24-50 × ", "0.7% × " (a chance; the 1 left out).
+## fine: [probability, lowest, highest] from the mod when the amount isn't a plain fixed one.
+static func amount_text(amount: float, fine: Array = []) -> String:
+	if fine.size() < 3:
+		return num(amount) + " × "
+	var chance := float(fine[0])
+	var lo := float(fine[1])
+	var hi := float(fine[2])
+	var text := "%s%% × " % num(chance * 100.0) if chance < 1.0 else ""
+	if hi != lo:
+		return text + "%s-%s × " % [num(lo), num(hi)]
+	if chance < 1.0 and lo == 1.0:
+		return text
+	return text + num(lo) + " × "
 
 
 static func watts(w: float) -> String:
@@ -144,6 +171,11 @@ static func item_lines(d: Dictionary) -> Array:
 	var lines: Array = []
 	if d.has("fuel"):
 		lines.append(["Fuel value: %s" % joules(float(d["fuel"]))])
+		# Factorio's "Vehicle acceleration: 180%" (rocket fuel); left out at the plain 100%.
+		if d.has("facc") and not is_equal_approx(float(d["facc"]), 1.0):
+			lines.append(["Vehicle acceleration: %s%%" % num(float(d["facc"]) * 100.0)])
+		if d.has("ftop") and not is_equal_approx(float(d["ftop"]), 1.0):
+			lines.append(["Vehicle top speed: %s%%" % num(float(d["ftop"]) * 100.0)])
 	if d.has("module"):
 		var fx: Dictionary = d["module"]
 		for k in ["speed", "productivity", "consumption", "pollution", "quality"]:
@@ -151,6 +183,21 @@ static func item_lines(d: Dictionary) -> Array:
 				var v := float(fx[k]) * (10.0 if k == "quality" else 100.0)
 				lines.append(["%s: %s%s%%" % [ROBOT_EFFECTS[k], "+" if v > 0 else "", num(v)], "",
 					Kit.GREEN_TEXT if (v > 0) != (k in ["consumption", "pollution"]) else Kit.RED_TEXT])
+	if d.has("ammo"):
+		lines.append(["Ammo category: %s" % Kit.pretty(str(d["ammo"]))])
+	if d.has("mag"):
+		lines.append(["Magazine size: %d" % int(d["mag"])])
+	for hit in d.get("dmg", []):
+		if hit is Array and hit.size() >= 2:
+			lines.append(["Damage: %s %s" % [num(float(hit[1])), Kit.pretty(str(hit[0]))]])
+	if d.has("arange"):
+		lines.append(["Range: %s" % num(float(d["arange"]))])
+	if d.has("arate"):
+		lines.append(["Shooting speed: %s/s" % num(float(d["arate"]))])
+	if d.has("bonus"):
+		lines.append(["Inventory bonus: +%d slots" % int(d["bonus"])])
+	if d.get("grid") is Array and (d["grid"] as Array).size() == 2:
+		lines.append(["Equipment grid: %d×%d" % [int(d["grid"][0]), int(d["grid"][1])]])
 	if d.has("spoil"):
 		lines.append(["Spoil time: %s" % seconds(float(d["spoil"]) / 60.0)])
 		if d.has("spoil_to"):
@@ -159,6 +206,9 @@ static func item_lines(d: Dictionary) -> Array:
 		lines.append(["Stack size: %d" % int(d["stack"])])
 	if d.has("weight") and float(d["weight"]) > 0.0:
 		lines.append(["Weight: %s kg" % num(float(d["weight"]) / 1000.0)])
+	for r in d.get("res", []):
+		if r is Array and r.size() >= 3:
+			lines.append(["  %s: %s/%s%%" % [Kit.pretty(str(r[0])), num(float(r[1])), num(float(r[2]))], "", STAT])
 	if d.get("entity") is Dictionary:
 		lines.append_array(entity_lines(d["entity"]))
 	return lines
@@ -196,10 +246,21 @@ static func effect_line(e: Array) -> Array:
 	if t == "unlock-recipe":
 		return [Kit.recipe_name(str(e[1])), str(e[1])]
 	var v := float(e[2]) if e.size() > 2 else 0.0
+	var target := str(e[1])
+	# Factorio's [modifier-description] keys: an ammo category, gun or turret names its own.
+	var key := {"ammo-damage": "%s-damage-bonus" % target, "gun-speed": "%s-shooting-speed-bonus" % target,
+		"turret-attack": "%s-attack-bonus" % target}.get(t, t) as String
+	LocaleNames._load()
+	var phrase := str(EFFECT_WORDS.get(t, LocaleNames._lookup("modifier-description", key)))
+	if phrase != "":
+		if not phrase.contains("__1__"):
+			return [phrase, ""]
+		var shown := "%s%%" % num(v * 100.0) if not EFFECT_COUNTS.has(t) else num(v)
+		return [phrase.replace("+__1__", ("+" if v >= 0.0 else "") + shown).replace("__1__", shown), ""]
 	var words := t.replace("-", " ")
 	var text := words.substr(0, 1).to_upper() + words.substr(1)
-	if str(e[1]) != "":
-		text += " (%s)" % Kit.pretty(str(e[1]))
+	if target != "":
+		text += " (%s)" % Kit.pretty(target)
 	if v != 0.0:
 		text += ": %s%s%%" % ["+" if v > 0 else "", num(v * 100.0)]
 	return [text, ""]

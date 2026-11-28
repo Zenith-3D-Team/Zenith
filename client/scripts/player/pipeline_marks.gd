@@ -34,6 +34,9 @@ const Settings := preload("res://scripts/menu/settings.gd")
 const Switches := preload("res://scripts/switches.gd")
 
 static var on := Switches.on("--pipeline-vis")
+static var show_pipe_joints := Switches.has("--pipeline-joints=old")
+## `--alt-pipe-range=old`: limit Alt-mode pipeline scanning to the old RADIUS := 2 chunk box.
+static var wide_range := not (Switches.has("--alt-pipe-range=old"))
 
 ## What a pipeline is made of in the client; anything else with fluid (pumps, machines) ends it.
 const PIPE_TYPES := ["pipe", "infinity-pipe", "pipe-to-ground", "storage-tank"]
@@ -210,7 +213,8 @@ static func step(f: Flood, deadline: int) -> bool:
 						_quad_into(f, true, r.pos + axis * k, axis, UNDER_SIZE * 0.5)
 				else:
 					f.joints.append([n[2], n[3]])
-					_quad_into(f, false, n[2], (n[3] as Vector2).normalized(), JOINT_SIZE * 0.5)
+					if show_pipe_joints:
+						_quad_into(f, false, n[2], (n[3] as Vector2).normalized(), JOINT_SIZE * 0.5)
 			if not f.queued.has(o.key):
 				f.queued[o.key] = true
 				f.queue.append(o)
@@ -527,15 +531,28 @@ func update(hovered: WorldMirror.Rec, held: ProtoDB.EntityProto, alt_mode: bool,
 	FrameBudget.spent(&"pipelines", last_usec, _roots.size() + (1 if _job != null else 0))
 
 
+func _in_wide_window(c: Vector2i, cursor_chunk: Vector2i, focus_chunk: Vector2i, radius: int) -> bool:
+	return (absi(c.x - cursor_chunk.x) <= radius and absi(c.y - cursor_chunk.y) <= radius) \
+		or (absi(c.x - focus_chunk.x) <= radius and absi(c.y - focus_chunk.y) <= radius)
+
+
 ## Each chunk the shown pipelines and the Alt-mode window read, as [instance id, content_rev] (-1 not loaded).
 func _chunks_sig(cursor_chunk) -> Array:
 	var out: Array = []
 	var look := _watch
 	if cursor_chunk is Vector2i:
 		look = _watch.duplicate()
-		for dy in range(-RADIUS, RADIUS + 1):
-			for dx in range(-RADIUS, RADIUS + 1):
-				look[cursor_chunk + Vector2i(dx, dy)] = true
+		var cc: Vector2i = cursor_chunk
+		if wide_range:
+			var r := maxi(RADIUS, int(world.view_radius))
+			var fc := WorldMirror.chunk_of(world.focus())
+			for c: Vector2i in world.chunks:
+				if _in_wide_window(c, cc, fc, r):
+					look[c] = true
+		else:
+			for dy in range(-RADIUS, RADIUS + 1):
+				for dx in range(-RADIUS, RADIUS + 1):
+					look[cc + Vector2i(dx, dy)] = true
 	for c: Vector2i in look:
 		var cv: ChunkView = world.chunks.get(c)
 		out.append(cv.get_instance_id() if cv != null else -1)
@@ -719,21 +736,30 @@ func _window_pipes(at: Vector2) -> Array:
 	var c := WorldMirror.chunk_of(at)
 	var out: Array = []
 	var kept := {}
-	for dy in range(-RADIUS, RADIUS + 1):
-		for dx in range(-RADIUS, RADIUS + 1):
-			var at_c := c + Vector2i(dx, dy)
-			var cv: ChunkView = world.chunks.get(at_c)
-			if cv == null:
-				continue
-			var seen: Array = _window.get(at_c, [])
-			if seen.is_empty() or int(seen[0]) != cv.get_instance_id() or int(seen[1]) != int(cv.content_rev):
-				var pipes: Array = []
-				for r: WorldMirror.Rec in cv.entities.values():
-					if is_pipe(world, r):
-						pipes.append(r)
-				seen = [cv.get_instance_id(), cv.content_rev, pipes]
-			kept[at_c] = seen
-			out.append_array(seen[2])
+	var chunks_in_win: Array[Vector2i] = []
+	if wide_range:
+		var r := maxi(RADIUS, int(world.view_radius))
+		var fc := WorldMirror.chunk_of(world.focus())
+		for at_c: Vector2i in world.chunks:
+			if _in_wide_window(at_c, c, fc, r):
+				chunks_in_win.append(at_c)
+	else:
+		for dy in range(-RADIUS, RADIUS + 1):
+			for dx in range(-RADIUS, RADIUS + 1):
+				chunks_in_win.append(c + Vector2i(dx, dy))
+	for at_c: Vector2i in chunks_in_win:
+		var cv: ChunkView = world.chunks.get(at_c)
+		if cv == null:
+			continue
+		var seen: Array = _window.get(at_c, [])
+		if seen.is_empty() or int(seen[0]) != cv.get_instance_id() or int(seen[1]) != int(cv.content_rev):
+			var pipes: Array = []
+			for r: WorldMirror.Rec in cv.entities.values():
+				if is_pipe(world, r):
+					pipes.append(r)
+			seen = [cv.get_instance_id(), cv.content_rev, pipes]
+		kept[at_c] = seen
+		out.append_array(seen[2])
 	_window = kept
 	return out
 

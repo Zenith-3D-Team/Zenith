@@ -40,6 +40,12 @@ static var tree_shadow_decimate: bool:
 		return Job.decimate_cards
 	set(v):
 		Job.decimate_cards = v
+## --tree-impostor=off: restore legacy 3-tier card LODs and decimated card shadow stand-ins.
+static var tree_impostor: bool:
+	get:
+		return Job.impostor
+	set(v):
+		Job.impostor = v
 ## Surfaces smaller than this keep their own shadow and get no LODs: they would save next to nothing.
 const MIN_TRIANGLES := 200
 ## Jobs at once (terrain meshing shares the worker pool).
@@ -108,12 +114,20 @@ static var heavy_lods: bool:
 ## Each entry is [keep every Nth card, scale factor, High pixel switch height, Med/Low pixel floor,
 ## bark/core max error share of longest side].
 ## --tree-lod=off keeps tree crowns whole in view as before.
+## --tree-impostor=off restores LEGACY_TREE_LOD_TIERS (3 tiers).
 const TREE_LOD_TIERS := [
+	[2, 1.25, 190.0, 260.0, 0.08],
+	[4, 1.45, 125.0, 185.0, 0.15],
+	[8, 1.65, 80.0, 130.0, 0.25],
+	[16, 2.00, 48.0, 95.0, 0.55],
+]
+const LEGACY_TREE_LOD_TIERS := [
 	[2, 1.25, 190.0, 260.0, 0.08],
 	[4, 1.45, 100.0, 150.0, 0.15],
 	[8, 1.65, 55.0, 85.0, 0.25],
 ]
 const TREE_MIN_CARDS := 8
+const TREE_SHADOW_WOOD_ERR := 0.55
 static var tree_lods := Switches.on("--tree-lod")
 ## The custom channel formats in a surface's format, which add_surface_from_arrays needs again.
 const CUSTOM_FORMATS := 0xFFF << Mesh.ARRAY_FORMAT_CUSTOM_BASE
@@ -218,11 +232,17 @@ class Job:
 				surface_lods.append(ModelLodsMath.surface_lods(s[0], s[1], s[2], s[3]))
 			return
 		var wood: Array = []
+		var crown_input: Array = []
 		for i in surfaces.size():
 			if crown.has(i):
-				crown_arrays(surfaces[i][4], bool(crown[i]), crown_vertices, crown_uvs)
+				if Job.impostor:
+					crown_input.append([surfaces[i][4], bool(crown[i])])
+				else:
+					crown_arrays(surfaces[i][4], bool(crown[i]), crown_vertices, crown_uvs)
 			else:
 				wood.append(surfaces[i])
+		if Job.impostor and not crown_input.is_empty():
+			crown_hull(crown_input, crown_vertices, crown_uvs)
 		if wood.is_empty():
 			proxy_done = true
 			return
@@ -236,6 +256,15 @@ class Job:
 		normals = ModelLodsMath.smooth_normals(vertices, indices, sign)
 		var simplified := ModelLodsMath.simplify(vertices, normals, indices)
 		indices = simplified[0]
+		if tree_cards and Job.impostor:
+			var wood_parts := Parts.new(vertices, indices)
+			var wood_lods: Dictionary = simplified[1]
+			var best_err := -1.0
+			for sz in wood_lods:
+				var err := float(sz)
+				if err <= TREE_SHADOW_WOOD_ERR and err > best_err and wood_parts.kept_by(wood_lods[sz], err):
+					best_err = err
+					indices = wood_lods[sz]
 		lods = simplified[1] if proxy_lods else {}
 		if not view_lods:
 			proxy_done = true
@@ -251,8 +280,10 @@ class Job:
 			if tree_cards and crown.has(i) and not bool(crown[i]):
 				surface_lods.append({})
 				continue
-			var uv: Variant = (s[4] as Array)[Mesh.ARRAY_TEX_UV] if textured and s.size() > 4 else null
-			surface_lods.append(ModelLodsMath.surface_lods(s[0], s[1], s[2], s[3], uv, min_floor))
+			var use_uv := textured and s.size() > 4 and not (Job.impostor and crown.has(i))
+			var uv: Variant = (s[4] as Array)[Mesh.ARRAY_TEX_UV] if use_uv else null
+			var min_tris := 100 if (Job.impostor and tree_cards and crown.has(i)) else MIN_TRIANGLES
+			surface_lods.append(ModelLodsMath.surface_lods(s[0], s[1], s[2], s[3], uv, min_floor, min_tris))
 		proxy_done = true
 
 	## The second step (poll queues it once the stand-in is shown, so shadows don't wait for it):
@@ -271,11 +302,190 @@ class Job:
 	const CARD_SHADOW_DECIMATED := 0.985
 	static var heavy := Switches.on("--heavy-lods")
 	static var decimate_cards := Switches.on("--tree-shadow-decimate")
+	static var impostor := Switches.on("--tree-impostor")
+	static var quad_shadows := Switches.has("--tree-shadow-shape=old")
+
+	## Solid low-poly crown shadow hull for a tree (when --tree-impostor is on, default): replaces
+	## hundreds of leaf-card and core triangles with compact clustered closed octahedron puffs
+	## (~24-48 tris total) using shadow_stand_in_leaf.gdshader (opaque, no discard, keeping per-tree
+	## pollution crown-dropping via UV = Vector2(seed, kind)).
+	static func crown_hull(crown_surfaces: Array, out_v: PackedVector3Array, out_uv: PackedVector2Array) -> void:
+		var card_map := {}  # Vector3i key -> [mid_sum, half_sum, count, seed]
+		var solid_items: Array = []  # [center, half, seed] for solid leaves (kind 2)
+		var core_lo := Vector3(INF, INF, INF)
+		var core_hi := -core_lo
+		var core_count := 0
+		var core_seed := 0.37
+		for entry: Array in crown_surfaces:
+			var arrays: Array = entry[0]
+			var all_core := bool(entry[1])
+			var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+			var uvs := PackedVector2Array()
+			if arrays[Mesh.ARRAY_TEX_UV] != null:
+				uvs = arrays[Mesh.ARRAY_TEX_UV]
+			var seeds := PackedVector2Array()
+			if arrays[Mesh.ARRAY_TEX_UV2] != null:
+				seeds = arrays[Mesh.ARRAY_TEX_UV2]
+			var index := PackedInt32Array()
+			if arrays[Mesh.ARRAY_INDEX] != null:
+				index = arrays[Mesh.ARRAY_INDEX]
+			else:
+				index.resize(verts.size())
+				for i in verts.size():
+					index[i] = i
+			for t in range(0, index.size() - 2, 3):
+				var i0 := index[t]
+				var i1 := index[t + 1]
+				var i2 := index[t + 2]
+				var kind := 1 if all_core else 0
+				if not all_core and uvs.size() == verts.size():
+					var u0: float = uvs[i0].x
+					kind = 2 if u0 < -1.5 else (1 if u0 < -0.5 else 0)
+				var seed: float = seeds[i0].y if seeds.size() == verts.size() else 0.0
+				var p0 := verts[i0]
+				var p1 := verts[i1]
+				var p2 := verts[i2]
+				if kind == 1:
+					core_lo = core_lo.min(p0).min(p1).min(p2)
+					core_hi = core_hi.max(p0).max(p1).max(p2)
+					if core_count == 0 and absf(seed) > 1e-5:
+						core_seed = seed
+					core_count += 1
+				elif kind == 2:
+					var mid := (p0 + p1 + p2) / 3.0
+					var half := maxf((p1 - p0).length(), maxf((p2 - p0).length(), (p2 - p1).length())) * 0.35
+					solid_items.append([mid, half, seed])
+				else:
+					var mid := (p0 + p1 + p2) / 3.0
+					var half := maxf((p1 - p0).length(), (p2 - p0).length()) * 0.35
+					if uvs.size() == verts.size():
+						var uv0 := uvs[i0]
+						var d1 := uvs[i1] - uv0
+						var d2 := uvs[i2] - uv0
+						var det := d1.x * d2.y - d1.y * d2.x
+						if absf(det) > 1e-8:
+							var ax := ((p1 - p0) * d2.y - (p2 - p0) * d1.y) / det
+							var ay := ((p2 - p0) * d1.x - (p1 - p0) * d2.x) / det
+							mid = p0 - ax * (uv0.x - 0.5) - ay * (uv0.y - 0.5)
+							half = 0.5 * ax.length()
+					var key := Vector3i((mid * 200.0).round())
+					if not card_map.has(key):
+						card_map[key] = [mid, half, 1, seed]
+					else:
+						var g: Array = card_map[key]
+						g[0] = (g[0] as Vector3) + mid
+						g[1] = float(g[1]) + half
+						g[2] = int(g[2]) + 1
+		if not card_map.is_empty():
+			var cards: Array = []
+			for key in card_map:
+				var g: Array = card_map[key]
+				var cnt := float(g[2])
+				cards.append([(g[0] as Vector3) / cnt, float(g[1]) / cnt, float(g[3])])
+			var target := 8 if cards.size() >= 24 else (6 if cards.size() >= 14 else (4 if cards.size() >= 6 else (2 if cards.size() >= 3 else 1)))
+			_cluster_and_emit_puffs(cards, target, 0.45, 0.10, 0.0, out_v, out_uv)
+		if core_count > 0:
+			var cmid := (core_lo + core_hi) * 0.5
+			var crx := maxf((core_hi.x - core_lo.x) * 0.5, 0.12)
+			var cry := maxf((core_hi.y - core_lo.y) * 0.5, 0.12)
+			var crz := maxf((core_hi.z - core_lo.z) * 0.5, 0.12)
+			_emit_octahedron(cmid, crx, cry, crz, 0.3927, core_seed, 1.0, out_v, out_uv)
+		if not solid_items.is_empty():
+			var starget := 8 if solid_items.size() >= 24 else (6 if solid_items.size() >= 14 else (4 if solid_items.size() >= 6 else (2 if solid_items.size() >= 3 else 1)))
+			_cluster_and_emit_puffs(solid_items, starget, 0.50, 0.10, 2.0, out_v, out_uv)
+
+	## Splits `items` ([center, half, seed]) along their widest bounding axis into up to `target`
+	## compact spatial clusters and emits one closed 8-triangle octahedron puff per cluster.
+	static func _cluster_and_emit_puffs(items: Array, target: int, pad_scale: float, min_pad: float, kind: float, out_v: PackedVector3Array, out_uv: PackedVector2Array) -> void:
+		var clusters: Array = [items]
+		while clusters.size() < target:
+			var best_idx := -1
+			var best_span := 0.0
+			var best_axis := 0
+			var best_mid := 0.0
+			for ci in clusters.size():
+				var cl: Array = clusters[ci]
+				if cl.size() < 2:
+					continue
+				var lo := Vector3(INF, INF, INF)
+				var hi := -lo
+				for item: Array in cl:
+					var c: Vector3 = item[0]
+					lo = lo.min(c)
+					hi = hi.max(c)
+				var sz := hi - lo
+				var axis := sz.max_axis_index()
+				var span := sz[axis]
+				if span > best_span:
+					best_span = span
+					best_idx = ci
+					best_axis = axis
+					best_mid = (lo[axis] + hi[axis]) * 0.5
+			if best_idx < 0:
+				break
+			var src: Array = clusters[best_idx]
+			var left: Array = []
+			var right: Array = []
+			for item: Array in src:
+				var c: Vector3 = item[0]
+				if c[best_axis] <= best_mid:
+					left.append(item)
+				else:
+					right.append(item)
+			if left.is_empty() or right.is_empty():
+				var half_n := src.size() / 2
+				left = src.slice(0, half_n)
+				right = src.slice(half_n)
+			clusters[best_idx] = left
+			clusters.append(right)
+		for ci in clusters.size():
+			var cl: Array = clusters[ci]
+			var blo := Vector3(INF, INF, INF)
+			var bhi := -blo
+			var half_sum := 0.0
+			var puff_seed := 0.0
+			for item: Array in cl:
+				var c: Vector3 = item[0]
+				blo = blo.min(c)
+				bhi = bhi.max(c)
+				half_sum += float(item[1])
+				if absf(puff_seed) < 1e-5 and absf(float(item[2])) > 1e-5:
+					puff_seed = float(item[2])
+			if absf(puff_seed) < 1e-5:
+				puff_seed = float(ci + 1) * 0.197
+			var avg_half := half_sum / float(cl.size())
+			var pad := maxf(avg_half * pad_scale, min_pad)
+			var rx := maxf((bhi.x - blo.x) * 0.5 + pad, min_pad)
+			var ry := maxf((bhi.y - blo.y) * 0.5 + pad, min_pad)
+			var rz := maxf((bhi.z - blo.z) * 0.5 + pad, min_pad)
+			_emit_octahedron((blo + bhi) * 0.5, rx, ry, rz, float(ci) * 0.3927, puff_seed, kind, out_v, out_uv)
+
+	## Emits a closed 8-triangle octahedron (clockwise outward winding for Godot front faces).
+	static func _emit_octahedron(mid: Vector3, rx: float, ry: float, rz: float, yaw: float, seed: float, kind: float, out_v: PackedVector3Array, out_uv: PackedVector2Array) -> void:
+		var c := cos(yaw)
+		var s := sin(yaw)
+		var corners: Array[Vector3] = [
+			mid + Vector3(0.0, ry, 0.0),
+			mid + Vector3(0.0, -ry, 0.0),
+			mid + Vector3(rx * c, 0.0, rx * s),
+			mid + Vector3(-rz * s, 0.0, rz * c),
+			mid + Vector3(-rx * c, 0.0, -rx * s),
+			mid + Vector3(rz * s, 0.0, -rz * c),
+		]
+		var faces: PackedInt32Array = PackedInt32Array([
+			0, 2, 3, 0, 3, 4, 0, 4, 5, 0, 5, 2,
+			1, 3, 2, 1, 4, 3, 1, 5, 4, 1, 2, 5,
+		])
+		var uv := Vector2(seed, kind)
+		for idx_i in faces:
+			out_v.append(corners[idx_i])
+			out_uv.append(uv)
 
 	## A crown surface's triangles for its shadow stand-in (Job.run, on a worker): their positions, a
-	## card's corners drawn in to CARD_SHADOW of the way from its middle, and per vertex (the card's
-	## seed, its kind) for shadow_stand_in_leaf.gdshader: 0 a leaf card, 1 a crown's core (UV -1, or a
-	## surface whose material says leaf_core: `all_core`), 2 solid leaves (UV -2: tree-06's strands).
+	## card's corners drawn in to an irregular rounded polygon (or quad with `--tree-shadow-shape=old`),
+	## and per vertex (the card's seed, its kind) for shadow_stand_in_leaf.gdshader: 0 a leaf card,
+	## 1 a crown's core (UV -1, or a surface whose material says leaf_core: `all_core`), 2 solid leaves
+	## (UV -2: tree-06's strands).
 	static func crown_arrays(arrays: Array, all_core: bool, out_v: PackedVector3Array, out_uv: PackedVector2Array) -> void:
 		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
 		var uvs := PackedVector2Array()
@@ -298,8 +508,11 @@ class Job:
 			if not all_core and uvs.size() == verts.size():
 				var u0: float = uvs[k[0]].x
 				kind = 2.0 if u0 < -1.5 else (1.0 if u0 < -0.5 else 0.0)
+			var card_id := 0
+			var tri_in_card := 0
 			if kind == 0.0:
-				var card_id := card_tri / 2
+				card_id = card_tri / 2
+				tri_in_card = card_tri & 1
 				card_tri += 1
 				if decimate_cards and (card_id & 1) == 1:
 					continue
@@ -317,6 +530,28 @@ class Job:
 					var ay := (e2 * d1.x - e1 * d2.x) / det
 					var uv0: Vector2 = uvs[k[0]]
 					var middle: Vector3 = p[0] - ax * (uv0.x - 0.5) - ay * (uv0.y - 0.5)
+					if not quad_shadows:
+						if tri_in_card == 1:
+							continue
+						var sides := 6 + ((card_id + int(floor(seed * 31.0))) & 1)
+						var theta0 := fposmod(seed * 13.37 + float(card_id) * 0.7, TAU)
+						var sign_det := 1.0 if det > 0.0 else -1.0
+						var pts: Array[Vector3] = []
+						pts.resize(sides)
+						for i in sides:
+							var ang := theta0 + float(i) * (TAU / float(sides)) * sign_det
+							var h := fposmod(sin((seed + float(card_id) * 0.13) * 91.7 + float(i) * 37.3) * 43758.5453, 1.0)
+							var rad := (0.42 + 0.07 * h) * scale
+							pts[i] = middle + ax * (cos(ang) * rad) + ay * (sin(ang) * rad)
+						var uv_pair := Vector2(seed, kind)
+						for i in range(1, sides - 1):
+							out_v.append(pts[0])
+							out_v.append(pts[i])
+							out_v.append(pts[i + 1])
+							out_uv.append(uv_pair)
+							out_uv.append(uv_pair)
+							out_uv.append(uv_pair)
+						continue
 					for c in 3:
 						p[c] = middle + (p[c] - middle) * scale
 			for c in 3:
@@ -413,9 +648,9 @@ class ModelLodsMath:
 	## Only those that keep the surface's shape (Parts.kept_by) are kept. `rows`: a merged surface's
 	## material row per vertex (weld). `uv`: a textured surface's UVs, simplified with them
 	## (textured_lods).
-	static func surface_lods(src: PackedVector3Array, src_normals, src_idx, rows: Variant = null, uv: Variant = null, min_floor := -1.0) -> Dictionary:
+	static func surface_lods(src: PackedVector3Array, src_normals, src_idx, rows: Variant = null, uv: Variant = null, min_floor := -1.0, min_tris := MIN_TRIANGLES) -> Dictionary:
 		var triangles := (src_idx as PackedInt32Array).size() / 3 if src_idx != null else src.size() / 3
-		if triangles < MIN_TRIANGLES:
+		if triangles < min_tris:
 			return {}
 		if uv is PackedVector2Array and (uv as PackedVector2Array).size() == src.size():
 			return textured_lods(src, src_normals, src_idx, uv, rows, min_floor)
@@ -863,7 +1098,8 @@ class ModelLodsMath:
 			return []
 		var prev_cards := base_cards
 		var out: Array = []
-		for tier: Array in TREE_LOD_TIERS:
+		var tiers: Array = TREE_LOD_TIERS if Job.impostor else LEGACY_TREE_LOD_TIERS
+		for tier: Array in tiers:
 			var step := int(tier[0])
 			var scale := float(tier[1])
 			var error := longest / float(tier[2])
@@ -957,7 +1193,8 @@ class ModelLodsMath:
 			var c: Vector3 = g[0]
 			cards.append([c, PackedInt32Array(g[2] as Array), int(floor((c.y - ymin) / 0.6)), atan2(c.z, c.x)])
 		cards.sort_custom(_card_less)
-		var core_lods := surface_lods(verts, s[1], non_card, s[3]) if non_card.size() / 3 >= MIN_TRIANGLES else {}
+		var core_min := 100 if Job.impostor else MIN_TRIANGLES
+		var core_lods := surface_lods(verts, s[1], non_card, s[3], null, -1.0, core_min) if non_card.size() / 3 >= core_min else {}
 		return [cards, non_card, core_lods]
 
 	static func _card_less(a: Array, b: Array) -> bool:
@@ -1151,13 +1388,20 @@ static func level_for(model_levels: Array, current: int, allowed: float) -> int:
 	return level
 
 
+## `--inserter-lod-scale=old`: keep untextured LOD thresholds unscaled by distance_scale.
+static var scale_untextured := not (Switches.has("--inserter-lod-scale=old"))
+
+
 ## The error a level counts as when picking it: its own, or for a textured model's level, at least
 ## what the view allows where the model is as small on screen as TEXTURED_PIXELS says (the allowed
 ## error grows with distance as the model shrinks, so the two meet at that size).
 static func switch_error(level: Array) -> float:
 	var error := float(level[1])
-	if level.size() > 2:
+	var has_pixel := level.size() > 2 and float(level[2]) > 0.0
+	if has_pixel:
 		error = maxf(error, float(level[2]) * lod_threshold * distance_scale)
+	elif scale_untextured:
+		error *= distance_scale
 	if level.size() > 3 and heavy_lods:
 		error /= maxf(float(level[3]), 1.0)
 	return error
@@ -1203,6 +1447,7 @@ static var main_usec := 0
 static var _material: ShaderMaterial
 static var _low_material: ShaderMaterial
 static var _leaf_material: ShaderMaterial
+static var _crown_proxies := {}
 ## The stand-ins' GeometryInstance3D.lod_bias away from the character (Level of detail setting,
 ## QUALITY's second value). Godot picks their LOD in the shadow pass by the main camera's distance, in
 ## screen pixels: the error allowed is mesh_lod_threshold / lod_bias pixels. It was 0.25 and 0.15
@@ -1308,6 +1553,19 @@ static func request_view_lods(mesh: ArrayMesh) -> void:
 
 static func is_ready(proxy: ArrayMesh) -> bool:
 	return _ready.has(proxy)
+
+
+## Whether `proxy` carries a tree crown surface (used so SHADOWS_NEAR keeps real leaf-card shadows).
+static func has_crown(proxy: Mesh) -> bool:
+	if proxy == null:
+		return false
+	if _crown_proxies.has(proxy):
+		return true
+	if _leaf_material != null:
+		for i in proxy.get_surface_count():
+			if proxy.surface_get_material(i) == _leaf_material:
+				return true
+	return false
 
 
 ## The stand-ins' material: lifted by the hills as their models are (shaders/shadow_stand_in.gdshader).
@@ -1461,6 +1719,7 @@ static func poll() -> bool:
 				crown[Mesh.ARRAY_TEX_UV] = job.crown_uvs
 				proxy.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, crown)
 				proxy.surface_set_material(proxy.get_surface_count() - 1, leaf_material())
+				_crown_proxies[proxy] = true
 			_ready[proxy] = true
 			done = true
 			kind = "proxy"
@@ -1557,6 +1816,7 @@ static func apply_quality(quality: String, viewport: Viewport, lod_dist := 0.0) 
 	var prev_scale := distance_scale
 	custom_distance = maxf(lod_dist, 0.0)
 	_quality = quality
+	quality_name = quality
 	if custom_distance > 0.0:
 		distance_scale = clampf(custom_distance / LOD_DIST_REF, 0.2, 4.0)
 		lod_threshold = clampf(4.0 / distance_scale, 0.5, 16.0)
@@ -1585,6 +1845,7 @@ static func apply_quality(quality: String, viewport: Viewport, lod_dist := 0.0) 
 ## --lod-lines=<n> sets it whatever the setting (0: every real line, as before 0.2.1).
 static var max_lines := 1440.0
 static var _quality := "medium"
+static var quality_name := "medium"
 
 
 ## `lines` as the levels of detail count them (max_lines), at least 1.

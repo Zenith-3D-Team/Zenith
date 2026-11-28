@@ -15,6 +15,7 @@ Get a release from the [Releases page](../../releases/latest):
 - **`Zenith-<version>-windows.zip`** or **`Zenith-<version>-linux.zip`**: The full client, bundled with the bridge mod and server scripts (`START HERE.txt` inside covers first launch). *(Pre-release `Zenith-0.3.0-dev` builds also include the debug menu and performance benchmark.)*
 - **`factorio-3d-bridge_<version>.zip`**: Standalone bridge mod for dedicated servers or single-player hybrid mode.
 - **Bundled add-ons & packs:** Releases ship with **Cinematic shaders**, **Cinematic camera** ([repo](https://github.com/unjustodin/Zenith-Cinematic-Camera)), **Immersive Weather** (dynamic sky, rain, puddles, lightning), **Immersive Enemies** (ragdolls, gore, acid), and **Terrain Elevation** ([repo](https://github.com/unjustodin/Terrain-Elevation)), all on by default. Builds can also bundle Vasillo's textured PBR **Zenith** model pack (`models/Zenith.zip`).
+- **Vendor upscalers (Windows, `vendor/` beside `Zenith.exe`):** AMD FSR 4.1 / 3.1's libraries come in downloads that include them. **NVIDIA DLSS** files are never shipped: you download `nvngx_dlss.dll` yourself from NVIDIA's [DLSS repository](https://github.com/NVIDIA/DLSS) and put it in `vendor/nvidia/`. DLSS stays off until you say yes in Settings > Graphics > Upscaling, because NVIDIA's graphics driver runs its own updater when DLSS starts ([USER-GUIDE](docs/USER-GUIDE.md)).
 
 ## What works today
 

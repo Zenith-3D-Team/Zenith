@@ -38,6 +38,19 @@ local function hand_recipes(c)
   return list
 end
 
+-- All force-enabled visible recipes (including fluid and machine-only recipes), sorted by name.
+local function all_recipes(c)
+  local recipes = c.force.recipes
+  local list = {}
+  for _, name in ipairs(puppet.all_recipe_names(c)) do
+    local recipe = recipes[name]
+    if recipe and recipe.enabled and not recipe.hidden then
+      list[#list + 1] = recipe
+    end
+  end
+  return list
+end
+
 local function amounts(list)
   local out = {}
   for _, x in pairs(list or {}) do
@@ -70,13 +83,60 @@ function M.record(recipe)
   }
 end
 
-local function send_details(c, s, recipes)
+local cat_machines_cache
+
+local function proto_get(obj, key)
+  local ok, v = pcall(function() return obj[key] end)
+  if ok then
+    return v
+  end
+  return nil
+end
+
+-- Prototype-cached map: crafting category -> non-hidden, non-character crafting entity names
+-- sorted by Factorio order ((e.order or "") .. "|" .. name).
+local function category_machines()
+  if cat_machines_cache then
+    return cat_machines_cache
+  end
+  local entries = {}
+  for name, e in pairs(prototypes.entity) do
+    local cats = proto_get(e, "crafting_categories")
+    if cats and not proto_get(e, "hidden") and proto_get(e, "type") ~= "character" then
+      local order = proto_get(e, "order")
+      entries[#entries + 1] = {
+        name = name,
+        key = (type(order) == "string" and order or "") .. "|" .. name,
+        cats = cats,
+      }
+    end
+  end
+  table.sort(entries, function(a, b) return a.key < b.key end)
+  local out = {}
+  for _, entry in ipairs(entries) do
+    for cat, allowed in pairs(entry.cats) do
+      if allowed then
+        out[cat] = out[cat] or {}
+        out[cat][#out[cat] + 1] = entry.name
+      end
+    end
+  end
+  cat_machines_cache = out
+  return cat_machines_cache
+end
+
+local function send_details(c, s, recipes, hand)
+  local hand_names = {}
+  for i, recipe in ipairs(hand) do
+    hand_names[i] = recipe.name
+  end
+  s.hand_recipes = hand_names
   local names = {}
   for i, recipe in ipairs(recipes) do
     names[i] = recipe.name
   end
-  s.hand_recipes = names
-  local sig = table.concat(names, ",")
+  local hc = puppet.hand_categories(c)
+  local sig = table.concat(names, ",") .. "|" .. table.concat(hc, ",")
   if sig == s.rdet_sig then
     return
   end
@@ -87,7 +147,11 @@ local function send_details(c, s, recipes)
     for i = (part - 1) * RECIPES_PER_MESSAGE + 1, math.min(part * RECIPES_PER_MESSAGE, #recipes) do
       slice[#slice + 1] = M.record(recipes[i])
     end
-    transport.send_reliable({ t = "rdet", part = part, parts = parts, l = slice })
+    local msg = { t = "rdet", part = part, parts = parts, hc = hc, l = slice }
+    if part == 1 then
+      msg.cm = category_machines()
+    end
+    transport.send_reliable(msg)
   end
 end
 
@@ -216,18 +280,24 @@ local function count_crafts(c, s)
   for i, item in ipairs(c.crafting_queue or {}) do
     now[i] = { item.recipe, item.count }
   end
-  if seen and s.craft_unit == c.unit_number and #now <= #seen and not c.player then
-    local done = {}
-    local gone = #seen - #now
-    for i = 1, gone do
-      done[#done + 1] = seen[i]
+  if seen and s.craft_unit == c.unit_number and #now <= #seen then
+    local progressed = #now < #seen or (seen[1] and now[1] and now[1][2] < seen[1][2])
+    if not c.player then
+      local done = {}
+      local gone = #seen - #now
+      for i = 1, gone do
+        done[#done + 1] = seen[i]
+      end
+      local next, left = seen[gone + 1], now[1]
+      if next and left and next[1] == left[1] and left[2] < next[2] then
+        done[#done + 1] = { next[1], next[2] - left[2] }
+      end
+      if #done > 0 then
+        record_crafts(c, done)
+      end
     end
-    local next, left = seen[gone + 1], now[1]
-    if next and left and next[1] == left[1] and left[2] < next[2] then
-      done[#done + 1] = { next[1], next[2] - left[2] }
-    end
-    if #done > 0 then
-      record_crafts(c, done)
+    if progressed then
+      puppet.send_inventory_now()
     end
   end
   s.craft_seen = #now > 0 and now or nil
@@ -264,7 +334,7 @@ function M.tick()
   end
   count_crafts(c, s)
   if game.tick % DETAILS_INTERVAL == 0 or s.rdet_sig == nil then
-    send_details(c, s, hand_recipes(c))
+    send_details(c, s, all_recipes(c), hand_recipes(c))
   end
   if game.tick % CRAFTABLE_INTERVAL == 0 then
     send_craftable(c, s)

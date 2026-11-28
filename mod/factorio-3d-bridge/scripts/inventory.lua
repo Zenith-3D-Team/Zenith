@@ -13,7 +13,7 @@ local screens = require("scripts.screens")
 
 local M = {}
 
-local SLOTS_INTERVAL = 30
+local SLOTS_INTERVAL = 10
 local QUICKBAR_SIZE = 100 -- 10 pages of 10
 
 -- Character inventories by role, with the defines.inventory name of each.
@@ -256,8 +256,21 @@ function M.send_slots_now()
   end
 end
 
+local sending_from_changed = false
+
 -- And after the character mined something (J20: the hand's count and the quickbar follow at once).
 puppet.mined_listeners[#puppet.mined_listeners + 1] = function(c)
+  send_slots(c, storage.f3d)
+end
+
+-- And after send_inventory_now or screens.take (auto-sort sees slot changes without waiting for SLOTS_INTERVAL).
+puppet.inventory_listeners[#puppet.inventory_listeners + 1] = function(c)
+  if not sending_from_changed then
+    send_slots(c, storage.f3d)
+  end
+end
+
+screens.take_listeners[#screens.take_listeners + 1] = function(c)
   send_slots(c, storage.f3d)
 end
 
@@ -268,26 +281,211 @@ local function changed()
   if c then
     send_slots(c, storage.f3d)
   end
-  puppet.send_inventory_now()
+  sending_from_changed = true
+  local ok, err = pcall(puppet.send_inventory_now)
+  sending_from_changed = false
+  if not ok then
+    error(err)
+  end
   screens.refresh()
 end
 
 ---------------------------------------------------------------------------------------------
 -- Commands
 
+local READ_ONLY = { output = true, burnt = true }
+
+local function belt_lane_of(role)
+  if role == "belt_1" then
+    return 1
+  elseif role == "belt_2" then
+    return 2
+  end
+  return nil
+end
+
+local function remove_from_line_stack(line, st, name, q, count, taken)
+  local ok, shrunk = pcall(function()
+    if taken >= count then
+      st.clear()
+      return not st.valid_for_read
+    end
+    st.count = count - taken
+    return st.count == count - taken
+  end)
+  if not (ok and shrunk) then
+    pcall(line.remove_item, { name = name, count = taken, quality = q })
+  end
+end
+
+local function take_from_held_stack(held, before, taken)
+  pcall(function()
+    if taken >= before then
+      held.clear()
+    else
+      held.count = before - taken
+    end
+  end)
+end
+
 -- Moves the stack in slot `fi` of inventory `from` to slot `ti` of inventory `to`, like clicking
 -- in Factorio: into an empty slot or onto the same item (as much as fits), or swapping with a
 -- different item. `n` moves only that many (0 or absent: the whole stack). Roles are the
 -- character's (main, guns, ammo, armor, trash), the ridden vehicle's ammo (vammo) or the open
--- screen's (chest, input, output, fuel, burnt, modules), which also need `u`.
+-- screen's (chest, input, output, fuel, burnt, modules, hand, belt_1, belt_2), which also need `u`.
 function M.move(cmd)
   local c = puppet.get()
   if not c then
     return
   end
-  local from = inventory_for(c, tostring(cmd.from or ""), cmd)
-  local to = inventory_for(c, tostring(cmd.to or ""), cmd)
+  local from_role, to_role = tostring(cmd.from or ""), tostring(cmd.to or "")
   local fi, ti = math.floor(tonumber(cmd.fi) or 0), math.floor(tonumber(cmd.ti) or 0)
+  -- A machine's output and burnt-result slots only give: the script API's transfer_stack would
+  -- fill a furnace's result slot with anything (an assembler's has a filter from its recipe).
+  if READ_ONLY[to_role] then
+    return puppet.message("Can't put that there")
+  end
+  if from_role == "hand" or to_role == "hand" then
+    local e = cmd.u and screens.entity(cmd) or nil
+    if not (e and e.type == "inserter") then
+      return
+    end
+    local okh, held = pcall(function() return e.held_stack end)
+    if not (okh and held) then
+      return
+    end
+    if from_role == "hand" and to_role ~= "hand" then
+      local to = inventory_for(c, to_role, cmd)
+      if not (to and fi == 1 and ti >= 1 and ti <= #to and held.valid_for_read) then
+        return
+      end
+      local dst = to[ti]
+      local before = held.count
+      local n = math.floor(tonumber(cmd.n) or 0)
+      if n <= 0 or n > before then
+        n = before
+      end
+      local moved = false
+      if dst.valid_for_read and not same_item(held, dst) then
+        if n == before then
+          local oks, swapped = pcall(function() return held.swap_stack(dst) end)
+          moved = oks and swapped == true
+        end
+      elseif not dst.valid_for_read then
+        local ok_tr = pcall(transfer, dst, held, n)
+        if ok_tr and (not held.valid_for_read or held.count < before) then
+          moved = true
+        elseif dst.set_stack({ name = held.name, count = n, quality = quality_of(held) }) then
+          take_from_held_stack(held, before, n)
+          moved = true
+        end
+      else
+        local room = math.min(n, dst.prototype.stack_size - dst.count)
+        if room > 0 then
+          local ok_tr = pcall(transfer, dst, held, room)
+          if ok_tr and (not held.valid_for_read or held.count < before) then
+            moved = true
+          else
+            dst.count = dst.count + room
+            take_from_held_stack(held, before, room)
+            moved = true
+          end
+        end
+      end
+      if not moved then
+        puppet.message("Can't put that there")
+      end
+      changed()
+      return
+    elseif to_role == "hand" and from_role ~= "hand" then
+      local from = inventory_for(c, from_role, cmd)
+      if not (from and ti == 1 and fi >= 1 and fi <= #from) then
+        return
+      end
+      local src = from[fi]
+      if not src.valid_for_read then
+        return
+      end
+      local moved = false
+      if not held.valid_for_read then
+        local before = src.count
+        local n = math.floor(tonumber(cmd.n) or 0)
+        if n <= 0 or n > before then
+          n = before
+        end
+        local ok_tr = pcall(transfer, held, src, n)
+        moved = ok_tr and (not src.valid_for_read or src.count < before)
+        if not moved then
+          local q = quality_of(src)
+          if pcall(function() return held.set_stack({ name = src.name, count = n, quality = q }) end) then
+            take_from(src, n)
+            moved = true
+          end
+        end
+      end
+      if not moved then
+        puppet.message("Can't put that there")
+      end
+      changed()
+      return
+    end
+    return
+  end
+  local from_lane = belt_lane_of(from_role)
+  if from_lane then
+    local e = cmd.u and screens.entity(cmd) or nil
+    local to = inventory_for(c, to_role, cmd)
+    if not (e and e.type == "transport-belt" and to and ti >= 1 and ti <= #to) then
+      return
+    end
+    local okl, line = pcall(function() return e.get_transport_line(from_lane) end)
+    if not (okl and line) then
+      return
+    end
+    local okn, len = pcall(function() return #line end)
+    if not (okn and fi >= 1 and fi <= len) then
+      return
+    end
+    local st = line[fi]
+    if not (st and st.valid_for_read) then
+      return
+    end
+    local dst = to[ti]
+    local before = st.count
+    local n = math.floor(tonumber(cmd.n) or 0)
+    if n <= 0 or n > before then
+      n = before
+    end
+    local q = quality_of(st)
+    local name = st.name
+    local moved = false
+    if not dst.valid_for_read then
+      if dst.set_stack({ name = name, count = n, quality = q }) then
+        remove_from_line_stack(line, st, name, q, before, n)
+        moved = true
+      end
+    elseif dst.name == name and quality_of(dst) == q then
+      local room = math.min(n, dst.prototype.stack_size - dst.count)
+      if room > 0 then
+        dst.count = dst.count + room
+        remove_from_line_stack(line, st, name, q, before, room)
+        moved = true
+      end
+    end
+    if moved then
+      screens.belt_lanes_changed(e)
+    else
+      puppet.message("Can't put that there")
+    end
+    changed()
+    return
+  end
+  if belt_lane_of(to_role) then
+    puppet.message("Can't put that there")
+    return
+  end
+  local from = inventory_for(c, from_role, cmd)
+  local to = inventory_for(c, to_role, cmd)
   if not (from and to and fi >= 1 and fi <= #from and ti >= 1 and ti <= #to) then
     return
   end
@@ -302,7 +500,8 @@ function M.move(cmd)
   end
   local moved
   if dst.valid_for_read and not same_item(src, dst) then
-    moved = n == before and src.swap_stack(dst)
+    -- (Not out of an output slot: the other stack would land in it.)
+    moved = n == before and not READ_ONLY[tostring(cmd.from or "")] and src.swap_stack(dst)
   else
     transfer(dst, src, n)
     moved = not src.valid_for_read or src.count < before
@@ -347,20 +546,108 @@ function M.xfer(cmd)
   if not (c and XFER_ACTIONS[kind]) then
     return
   end
+  local fi = math.floor(tonumber(cmd.fi) or 0)
+  if role == "hand" then
+    local e = cmd.u and screens.entity(cmd) or nil
+    if not (e and e.type == "inserter" and fi == 1) then
+      return
+    end
+    local okh, held = pcall(function() return e.held_stack end)
+    if not (okh and held and held.valid_for_read) then
+      return
+    end
+    local before = held.count
+    local n = (kind == "half" or kind == "allhalf") and half_of(before) or before
+    local inserted = c.insert({ name = held.name, count = n, quality = quality_of(held) })
+    if inserted > 0 then
+      take_from_held_stack(held, before, inserted)
+    else
+      puppet.message("Inventory full")
+    end
+    changed()
+    return
+  end
+  local lane_idx = belt_lane_of(role)
+  if lane_idx then
+    local e = cmd.u and screens.entity(cmd) or nil
+    if not (e and e.type == "transport-belt") then
+      return
+    end
+    local okl, line = pcall(function() return e.get_transport_line(lane_idx) end)
+    if not (okl and line) then
+      return
+    end
+    local okn, len = pcall(function() return #line end)
+    local line_len = okn and len or 0
+    local moved, had = 0, false
+    if kind == "stack" or kind == "half" then
+      if fi < 1 or fi > line_len then
+        return
+      end
+      local st = line[fi]
+      if not (st and st.valid_for_read) then
+        return
+      end
+      had = true
+      local count = st.count
+      local n = kind == "half" and half_of(count) or count
+      local q = quality_of(st)
+      local name = st.name
+      local inserted = c.insert({ name = name, count = n, quality = q })
+      if inserted > 0 then
+        remove_from_line_stack(line, st, name, q, count, inserted)
+        moved = inserted
+      end
+    else
+      local target_name, target_q
+      if fi >= 1 and fi <= line_len then
+        local st = line[fi]
+        if st and st.valid_for_read then
+          target_name = st.name
+          target_q = quality_of(st)
+        end
+      end
+      for _, entry in pairs(line.get_contents()) do
+        local eq = entry.quality or "normal"
+        if not target_name or (entry.name == target_name and eq == target_q) then
+          had = true
+          local n = kind == "allhalf" and half_of(entry.count) or entry.count
+          local stack = { name = entry.name, count = n, quality = eq }
+          local inserted = c.insert(stack)
+          if inserted > 0 then
+            stack.count = inserted
+            line.remove_item(stack)
+            moved = moved + inserted
+          end
+        end
+      end
+    end
+    if moved > 0 then
+      screens.belt_lanes_changed(e)
+    elseif had then
+      puppet.message("Inventory full")
+    end
+    changed()
+    return
+  end
   local mine = character_inventory(c, role)
   local from = mine or screens.inventory(role, cmd)
-  local fi = math.floor(tonumber(cmd.fi) or 0)
   if not (from and fi >= 1 and fi <= #from) then
     return
   end
   local e = cmd.u and screens.entity(cmd) or nil
+  local to_trash = cmd.trash == 1 and role == "main" and not e
+  local trash_inv = to_trash and character_inventory(c, "trash") or nil
+  if to_trash and not trash_inv then
+    return
+  end
   if not mine and not e then
     return
   end
   local p = puppet.player_of(c)
   if p then
     local ok, moved = pcall(function()
-      return p.stack_transfers({ source_inventory = from, index = fi, target = (mine and e) or p,
+      return p.stack_transfers({ source_inventory = from, index = fi, target = trash_inv or (mine and e) or p,
         transfer_type = defines.inventory_actions[XFER_ACTIONS[kind]] })
     end)
     if ok then
@@ -386,7 +673,7 @@ function M.xfer(cmd)
   for _, i in ipairs(slots) do
     local st = from[i]
     local n = (kind == "half" or kind == "allhalf") and half_of(st.count) or st.count
-    local dst = (mine and e) or (not mine and c) or nil
+    local dst = (mine and e) or trash_inv or (not mine and c) or nil
     local inserted = 0
     local before = st.count
     local ok = pcall(function()
@@ -407,7 +694,7 @@ function M.xfer(cmd)
     end
   end
   if moved == 0 and #slots > 0 then
-    puppet.message(mine and e and "Can't put that in there" or (mine and "Nowhere to put that" or "Inventory full"))
+    puppet.message(to_trash and "Trash slots full" or (mine and e and "Can't put that in there" or (mine and "Nowhere to put that" or "Inventory full")))
   end
   changed()
 end
@@ -434,13 +721,30 @@ function M.set_filter(cmd)
   changed()
 end
 
--- Sorts and merges an inventory: the character's main one, or the open chest.
+local SORTABLE_ROLES = { main = true, trash = true, chest = true, cargo = true, trunk = true }
+
+-- Sorts and merges an inventory: the character's main/trash, or an open screen's chest/cargo/trunk/trash.
 function M.sort(cmd)
   local c = puppet.get()
-  local inventory = c and inventory_for(c, tostring(cmd.inv or "main"), cmd)
+  local role = tostring(cmd.inv or "main")
+  if not (c and SORTABLE_ROLES[role]) then
+    return
+  end
+  local u = tonumber(cmd.u)
+  local inventory
+  if u and u ~= 0 then
+    inventory = screens.inventory(role, cmd)
+  else
+    inventory = character_inventory(c, role) or screens.inventory(role, cmd)
+  end
   if inventory then
-    inventory.sort_and_merge()
-    changed()
+    local ok = pcall(function() inventory.sort_and_merge() end)
+    if ok then
+      if (not u or u == 0) and (role == "main" or role == "trash") then
+        storage.f3d.slots_sig = nil
+      end
+      changed()
+    end
   end
 end
 

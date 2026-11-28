@@ -19,6 +19,9 @@ const NativeLibrary := preload("res://scripts/native_library.gd")
 const Switches := preload("res://scripts/switches.gd")
 
 const CARD_SIZE := 0.32
+## Stands in `_mv_last_hash` for "uploaded by the fast path without hashing" (BeltMv's change flag):
+## hash() is never negative, so the slow path's own hash check can't match stale data.
+const MV_SENT := -1
 ## A stack on a belt is drawn as a pile (belt_items.gd): each copy this much above the one under it.
 ## Icon cards lie flat, so the step is what shows the pile from the angled camera, as Factorio draws
 ## a stack's icons a little higher each; models and blocks pile by their own height.
@@ -448,6 +451,7 @@ func reset() -> void:
 	_mv_state.clear()
 	_mv_deferred.clear()
 	_needs_identity.clear()
+	_mv_last_hash.clear()
 	_fast_invalidate()
 	mv_mode = false
 	_lod_bounds = AABB()
@@ -565,6 +569,7 @@ func _sync_records_mmi(mmi: MultiMeshInstance3D, base: int, n: int, cap: int, bo
 	var mm := mmi.multimesh
 	if mm.instance_count != cap or _needs_identity.has(mmi):
 		_needs_identity.erase(mmi)
+		_mv_last_hash.erase(mmi)
 		if mm.instance_count != cap:
 			mm.visible_instance_count = 0
 			mm.instance_count = cap
@@ -584,6 +589,7 @@ func _sync_mv_mmi(mmi: MultiMeshInstance3D, buf: PackedFloat32Array, visible_cou
 		mm.visible_instance_count = 0
 		mm.instance_count = cap
 		first_mv = true
+		_mv_last_hash.erase(mmi)
 	if first_mv:
 		mm.custom_aabb = bounds
 		mmi.set_instance_shader_parameter("belt_base", -2)
@@ -592,9 +598,17 @@ func _sync_mv_mmi(mmi: MultiMeshInstance3D, buf: PackedFloat32Array, visible_cou
 		_needs_identity[mmi] = true
 	elif mm.custom_aabb != bounds:
 		mm.custom_aabb = bounds
-	if cap > 0 and buf.size() == cap * STRIDE:
-		RenderingServer.multimesh_set_buffer(mm.get_rid(), buf)
-		mv_uploads += 1
+	var skip_empty := mv_skip_clean and visible_count == 0 and mm.visible_instance_count == 0
+	if not skip_empty and cap > 0 and buf.size() == cap * STRIDE:
+		if not mv_skip_clean:
+			RenderingServer.multimesh_set_buffer(mm.get_rid(), buf)
+			mv_uploads += 1
+		else:
+			var sig := hash(buf)
+			if first_mv or not _mv_last_hash.has(mmi) or int(_mv_last_hash[mmi]) != sig:
+				RenderingServer.multimesh_set_buffer(mm.get_rid(), buf)
+				mv_uploads += 1
+				_mv_last_hash[mmi] = sig
 	if mm.visible_instance_count != visible_count:
 		mm.visible_instance_count = visible_count
 
@@ -613,13 +627,41 @@ func _reapply_mv(item_id: int, mmi: MultiMeshInstance3D) -> void:
 		var src_id := (band_of(item_id) * BAND_STEP + item_of(item_id)) if record_tex == 1 else item_id
 		buf = mv_buf_getter.call(src_id) as PackedFloat32Array
 	_needs_identity.erase(mmi)
+	_mv_last_hash.erase(mmi)
 	_sync_mv_mmi(mmi, buf, int(arr[1]), int(arr[2]), arr[3] as AABB)
 
 
 ## A kind drawn from CPU-evaluated MultiMesh buffers (`belt_base = -2`, BeltMv) for temporal motion vectors.
-func put_mv(item_id: int, buf: PackedFloat32Array, visible_count: int, cap: int, bounds: AABB, ping_pong := false) -> void:
+## `changed` (BeltMv's native change flag): -1 hashes `buf` to find an unchanged one, as before; 0/1 says
+## whether `buf` changed since the last put (no hash: 0 takes the same early return when the kind's buffer
+## was uploaded before, and a fast upload leaves MV_SENT in `_mv_last_hash` so no real hash matches it).
+## Returns 2 when BeltItemsNative's fast path uploaded `buf` (BeltMv's native put may then follow it), else 0.
+func put_mv(item_id: int, buf: PackedFloat32Array, visible_count: int, cap: int, bounds: AABB, ping_pong := false, changed := -1) -> int:
 	mv_mode = true
 	if _fast != null and mv_buf_getter.is_valid():
+		var sig := 0
+		var has_sig := false
+		if mv_skip_clean and visible_count > 0 and cap > 0 and buf.size() == cap * STRIDE and _kinds.has(item_id):
+			var fast_mmi: MultiMeshInstance3D = _kinds[item_id]
+			var same := false
+			if changed < 0:
+				sig = hash(buf)
+				has_sig = true
+				mv_hash_passes += 1
+				same = _mv_last_hash.has(fast_mmi) and int(_mv_last_hash[fast_mmi]) == sig
+			else:
+				same = changed == 0 and _mv_last_hash.has(fast_mmi)
+			if fast_mmi.visible and not _mv_deferred.has(item_id) and same \
+					and fast_mmi.multimesh.instance_count == cap \
+					and fast_mmi.multimesh.custom_aabb == bounds and _mv_buffers.has(item_id):
+				var prev_st: Array = _mv_state.get(item_id, [])
+				var prev_mask := int(prev_st[1]) if prev_st.size() > 1 else -1
+				if prev_st.size() > 0 and bool(prev_st[0]) and (not _dist_lods.has(item_id) or prev_mask == _lod_band_mask):
+					if fast_mmi.multimesh.visible_instance_count != visible_count:
+						fast_mmi.multimesh.visible_instance_count = visible_count
+					_record_counts[item_id] = maxi(visible_count / 2 if ping_pong else visible_count, 0)
+					(_mv_buffers[item_id] as Array)[1] = visible_count
+					return 0
 		var fast: int = _fast.try_put(item_id, buf, visible_count, cap, bounds, _lod_band_mask, _fast_epoch)
 		if fast != 0:
 			# (Steady state, done natively: only the bookkeeping that follows the count is left.)
@@ -627,7 +669,12 @@ func put_mv(item_id: int, buf: PackedFloat32Array, visible_count: int, cap: int,
 			(_mv_buffers[item_id] as Array)[1] = visible_count
 			if fast == 2:
 				mv_uploads += 1
-			return
+				if mv_skip_clean and _kinds.has(item_id):
+					if changed >= 0:
+						_mv_last_hash[_kinds[item_id]] = MV_SENT
+					else:
+						_mv_last_hash[_kinds[item_id]] = sig if has_sig else hash(buf)
+			return fast if changed >= 0 or not mv_skip_clean else 0
 	var logical_n := visible_count / 2 if ping_pong else visible_count
 	_record_counts[item_id] = maxi(logical_n, 0)
 	var stored_buf: Variant = null if mv_buf_getter.is_valid() else buf
@@ -714,6 +761,7 @@ func put_mv(item_id: int, buf: PackedFloat32Array, visible_count: int, cap: int,
 		_fast.register_kind(item_id, mmi.get_instance_id(), cap, _lod_band_mask, vis_nonzero, bounds, _fast_epoch)
 	elif _fast != null:
 		_fast.unregister_kind(item_id)
+	return 0
 
 
 ## Restores one record-drawn kind (and any lattice variants) back to GPU record mode (`belt_base >= 0`).
@@ -742,6 +790,7 @@ func restore_records() -> void:
 	_mv_buffers.clear()
 	_mv_state.clear()
 	_mv_deferred.clear()
+	_mv_last_hash.clear()
 	for id_v in _record_params.keys():
 		var kid := int(id_v)
 		if record_tex == 1 and variant_of(kid) > 0:
@@ -882,6 +931,8 @@ var mv_uploads := 0
 var mv_buf_getter: Callable
 ## (--native-belt-items=off: the old path) BeltItemsNative's steady-state put_mv, or null.
 static var use_native_items := Switches.on("--native-belt-items")
+## --mv-skip-clean=off: always upload MultiMesh buffers even when empty (0->0) or unchanged.
+static var mv_skip_clean := Switches.on("--mv-skip-clean")
 var _fast: Variant = null
 var _fast_epoch := 0
 
@@ -893,6 +944,9 @@ var _mv_buffers := {}
 var _mv_state := {}
 var _mv_deferred := {}
 var _needs_identity := {}
+var _mv_last_hash := {}
+## Test counter: hash(buf) passes made in put_mv's fast path.
+static var mv_hash_passes := 0
 
 
 ## Drops what the native fast path knows (a change it can't see: kinds made again, variants toggled).

@@ -52,8 +52,9 @@ const EFFECT_TYPES := ["beacon", "assembling-machine", "furnace", "mining-drill"
 ## Entities whose contents the mod is asked about (`hinfo` `inv`, I2), besides those above, the
 ## electric ones and those burning fuel.
 const CONTENT_TYPES := ["container", "logistic-container", "linked-container", "infinity-container", "cargo-wagon",
-	"artillery-wagon", "artillery-turret", "ammo-turret", "car", "spider-vehicle", "roboport", "space-platform-hub",
-	"cargo-landing-pad", "locomotive", "boiler", "reactor", "burner-generator"]
+	"fluid-wagon", "artillery-wagon", "infinity-cargo-wagon", "artillery-turret", "ammo-turret", "car",
+	"spider-vehicle", "roboport", "space-platform-hub", "cargo-landing-pad", "locomotive", "boiler", "reactor",
+	"burner-generator"]
 ## The contents' headings by role, in Factorio's words.
 const ROLE_NAMES := {"chest": "Contents", "trash": "Trash", "cargo": "Cargo", "trunk": "Trunk", "ammo": "Ammo",
 	"input": "Input", "output": "Output", "robots": "Robots", "repair": "Repair packs", "fuel": "Fuel",
@@ -97,6 +98,7 @@ var _seen_extra := 0
 var _seen_health := -2.0
 var _seen_working := -2
 var _seen_power := -2
+var _seen_fluids := 0
 var _seen_info: Dictionary = {}
 var _seen_stats := -1
 var _no_info := {}  # (never written: the answer for entities nothing is asked about)
@@ -248,15 +250,19 @@ func show_entity(r, mouse := Vector2.INF, fast := false, running := false) -> vo
 	var working := int(world.working.get(r.unit, -1)) if r.unit > 0 else -1
 	var icon: Array = WorldMirror.alt_icon(r)
 	var inner_name: String = proto.name
-	if proto.type == "entity-ghost" and r.extra.has("gh") and world.protos.entity(int(r.extra["gh"])) != null:
-		inner_name = world.protos.entity(int(r.extra["gh"])).name
+	var inner_type: String = proto.type
+	if proto.type == "entity-ghost" and r.extra.has("gh"):
+		var gp = world.protos.entity(int(r.extra["gh"]))
+		if gp != null:
+			inner_name = gp.name
+			inner_type = gp.type
 	var stats: Dictionary = model.pedia_data("entity", inner_name) if model != null else {}
 	_update_pack(r, world, proto, inner_name)
 	var electric: bool = str(stats.get("etype", "")) == "electric" and proto.type != "entity-ghost"
 	var effects: Dictionary = _no_info
 	var burner: bool = str(stats.get("etype", "")) == "burner" and proto.type != "entity-ghost"
 	if model != null and r.unit > 0 and (proto.type in EFFECT_TYPES or electric or burner or proto.type in CONTENT_TYPES
-			or proto.type in PIPE_TYPES):
+			or proto.type in PIPE_TYPES or inner_type in ["roboport", "logistic-container"]):
 		if not fast:
 			model.ask_hover_info(r.unit, r.proto_id, r.fixed)
 		if int(model.hover_info.get("u", 0)) == r.unit:
@@ -270,9 +276,11 @@ func show_entity(r, mouse := Vector2.INF, fast := false, running := false) -> vo
 			effects = model.hover_info
 	_report_bars(r.unit, effects, working)
 	var power := _power_state(r)
+	var fboxes: Array = _fluid_boxes(r, effects) if proto.type == "fluid-wagon" else []
+	var fluids_hash: int = fboxes.hash()
 	var extra_hash: int = r.extra.hash()
 	if _key != "" and is_same(r, _seen_rec) and extra_hash == _seen_extra and health == _seen_health and working == _seen_working \
-			and power == _seen_power and is_same(effects, _seen_info) and stats.size() == _seen_stats:
+			and power == _seen_power and fluids_hash == _seen_fluids and is_same(effects, _seen_info) and stats.size() == _seen_stats:
 		visible = true
 		_draw_bars()
 		return
@@ -285,14 +293,15 @@ func show_entity(r, mouse := Vector2.INF, fast := false, running := false) -> vo
 	_seen_health = health
 	_seen_working = working
 	_seen_power = power
+	_seen_fluids = fluids_hash
 	_seen_info = effects
 	_seen_stats = stats.size()
 	# Not the bars' values: they move in place every frame (_draw_bars).
 	var shown := effects.duplicate()
 	for k in ["pr", "ps", "bn", "at"]:
 		shown.erase(k)
-	var key := "%s|%s|%s|%s|%s|%d|%s|%d|%s|%s" % [str(r.key), JSON.stringify(r.extra), health, working, JSON.stringify(icon), stats.size(),
-		JSON.stringify(shown), power, effects.has("pr"), effects.has("bn")]
+	var key := "%s|%s|%s|%s|%s|%d|%s|%d|%d|%s|%s" % [str(r.key), JSON.stringify(r.extra), health, working, JSON.stringify(icon), stats.size(),
+		JSON.stringify(shown), power, fluids_hash, effects.has("pr"), effects.has("bn")]
 	visible = true
 	if key == _key:
 		_draw_bars()
@@ -368,6 +377,10 @@ func show_entity(r, mouse := Vector2.INF, fast := false, running := false) -> vo
 		_line("Health: %d%%" % roundi(health * 100.0))
 	if electric:
 		_electricity(stats, effects.get("el", {}))
+	if proto.type == "fluid-wagon":
+		_fluid_lines(fboxes)
+	if effects.get("ln") is Dictionary:
+		_logistic_lines(effects["ln"] as Dictionary, icon)
 	_contents(effects.get("inv", []))
 	_draw_bars()
 	reset_size()
@@ -498,8 +511,13 @@ func _held(r, mouse: Vector2):
 
 
 ## A record as the world holds it now, by its key (a new record when its chunk came again), or null
-## when the world no longer has it.
+## when the world no longer has it. Synthetic mover records stay valid while the mover exists.
 func _current(rec):
+	if str(rec.key).begins_with("mover:"):
+		var movers = player.get("movers") if player != null else null
+		if movers != null and movers.has_method("position_of") and movers.position_of(rec.unit) != null:
+			return rec
+		return null
 	var world = player.get("world") if player != null else null
 	if world == null:
 		return rec
@@ -695,6 +713,65 @@ static func rate_text(thousandths: int) -> String:
 	return text.rstrip("0").rstrip(".") + "/s"
 
 
+## Logistic network summary, roboport robot/charging counts, storage filter, and active
+## requester/buffer requests (`hinfo.ln`).
+func _logistic_lines(ln: Dictionary, icon: Array) -> void:
+	var nid := int(ln.get("id", 0))
+	if nid == 0:
+		_line("Not connected to a logistic network", Kit.RED_TEXT)
+	else:
+		var nname := str(ln.get("name", ""))
+		var label_name := RichText.plain(nname) if nname != "" else "#%d" % nid
+		_line("Logistic network: %s" % label_name)
+	if ln.get("log") is Array and (ln["log"] as Array).size() >= 2:
+		var log_r: Array = ln["log"]
+		_line("Logistic robots: %d / %d" % [int(log_r[0]), int(log_r[1])])
+	if ln.get("con") is Array and (ln["con"] as Array).size() >= 2:
+		var con_r: Array = ln["con"]
+		_line("Construction robots: %d / %d" % [int(con_r[0]), int(con_r[1])])
+	if ln.get("ch") is Array and (ln["ch"] as Array).size() >= 2:
+		var ch: Array = ln["ch"]
+		var charging := int(ch[0])
+		var waiting := int(ch[1])
+		if charging > 0 or waiting > 0:
+			_line("Charging: %d (%d waiting)" % [charging, waiting])
+	var fitem := str(ln.get("f", ""))
+	if fitem != "":
+		var fq := str(ln.get("fq", "normal"))
+		var already := icon.size() >= 2 and str(icon[0]) != "recipe" and str(icon[1]) == fitem and (fq == "" or fq == "normal")
+		if not already:
+			var flabel := Kit.pretty(fitem)
+			if fq != "" and fq != "normal":
+				flabel += " (%s)" % fq.capitalize()
+			_line("Filter: %s" % flabel, Kit.WHITE, fitem)
+	if ln.get("req") is Array and not (ln["req"] as Array).is_empty():
+		var reqs: Array = ln["req"]
+		var head := Kit.label("Logistic requests:")
+		head.add_theme_font_override("font", Kit.font("bold"))
+		_lines.add_child(head)
+		var grid := Kit.slot_grid(CONTENT_COLUMNS)
+		grid.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var shown_count := 0
+		for rq in reqs:
+			if shown_count >= 12:
+				break
+			if not (rq is Array and (rq as Array).size() >= 2):
+				continue
+			var rarr: Array = rq
+			var s := Slot.new()
+			s.custom_minimum_size = Kit.pxv(CONTENT_SLOT, CONTENT_SLOT)
+			s.icon_px = CONTENT_SLOT - 8
+			s.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			s.set_stack(str(rarr[0]), int(rarr[1]))
+			if rarr.size() >= 4 and str(rarr[3]) != "" and str(rarr[3]) != "normal":
+				s.set_extra({"quality": str(rarr[3])})
+			if rarr.size() >= 3 and int(rarr[2]) >= 0:
+				s.max_count = int(rarr[2])
+			grid.add_child(s)
+			shown_count += 1
+		_lines.add_child(grid)
+
+
 ## What is inside (I2): each inventory under its heading as a grid of Factorio's slots, the item's
 ## icon and its count, as the entity info lists them.
 func _contents(inv: Array) -> void:
@@ -811,6 +888,59 @@ func _power_state(r) -> int:
 		return -1
 	var power = player.get_parent().get_node_or_null("FluidsPower")
 	return int(power.power_state(r.unit)) if power != null and power.has_method("power_state") else -1
+
+
+## Fluid contents of a hovered fluid wagon from `hinfo` (`fl`) or FluidsPower (`fl` stream).
+func _fluid_boxes(r, effects: Dictionary) -> Array:
+	var from_info: Variant = effects.get("fl")
+	if from_info is Array and not (from_info as Array).is_empty():
+		return from_info as Array
+	if r.unit == 0 or player == null or player.get_parent() == null:
+		return []
+	var fp = player.get_parent().get_node_or_null("FluidsPower")
+	if fp == null:
+		return []
+	var fl: Variant = fp.get("fluids")
+	if fl is Dictionary and (fl as Dictionary).has(r.unit):
+		var boxes: Variant = (fl as Dictionary)[r.unit]
+		if boxes is Array:
+			return boxes as Array
+	return []
+
+
+func _fluid_lines(boxes: Array) -> void:
+	if boxes.is_empty():
+		_line("Fluid: Empty", Kit.DISABLED_TEXT)
+		return
+	for box in boxes:
+		if box is Dictionary:
+			var fname := str((box as Dictionary).get("fluid", ""))
+			if fname == "":
+				continue
+			var amt := int((box as Dictionary).get("amount", 0))
+			var cap := int((box as Dictionary).get("capacity", 0))
+			var temp := int((box as Dictionary).get("temperature", 15))
+			var text := "%s: %s / %s" % [Kit.pretty(fname), _fluid_amount(amt), _fluid_amount(cap)] if cap > 0 else "%s: %s" % [Kit.pretty(fname), _fluid_amount(amt)]
+			if temp != 15:
+				text += " (%d °C)" % temp
+			_line(text, Kit.WHITE, fname)
+		elif box is Array and (box as Array).size() >= 2:
+			var row: Array = box
+			var fname := str(row[0])
+			if fname == "":
+				continue
+			var amt := int(row[1])
+			var cap := int(row[2]) if row.size() >= 3 else 0
+			var text := "%s: %s / %s" % [Kit.pretty(fname), _fluid_amount(amt), _fluid_amount(cap)] if cap > 0 else "%s: %s" % [Kit.pretty(fname), _fluid_amount(amt)]
+			if row.size() >= 4 and int(row[3]) != 15:
+				text += " (%d °C)" % int(row[3])
+			_line(text, Kit.WHITE, fname)
+
+
+static func _fluid_amount(n: int) -> String:
+	if n < 1000:
+		return str(n)
+	return ("%.1f" % (n / 1000.0)).trim_suffix(".0") + "k"
 
 
 ## What Factorio's entity info adds for modules and beacons (G12): the modules in it, a beacon's

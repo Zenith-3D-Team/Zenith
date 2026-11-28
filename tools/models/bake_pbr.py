@@ -43,6 +43,7 @@ WUBE3DP_EXCLUDED_BELTS = {
 }
 CREATURE_RIGS_JSON = os.path.join(REPO, "client", "data", "creature_rigs.json")
 DEFAULT_ZENITH_ZIP = os.path.join(REPO, "models", "Zenith.zip")
+HIGH_DETAIL_MODELS = {"assembling-machine-1", "assembling-machine-2", "assembling-machine-3"}
 
 # Fallback sets if models/Zenith.zip is absent (kept in sync with Zenith.zip).
 FALLBACK_ZENITH_ENTS = {
@@ -929,7 +930,7 @@ def linear_to_srgb(lin):
     return np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
 
 
-def synthesize_entity_textures(atlas_size, tris_data, mat_specs, seed_offset=0):
+def synthesize_entity_textures(atlas_size, tris_data, mat_specs, seed_offset=0, high_detail=False):
     """Renders Albedo (uint8 RGB/RGBA), ORM (uint8 RGB), and Normal (uint8 RGB) atlases."""
     S = atlas_size
     chart_buf, mat_buf, pos_buf, nrm_buf, col_buf, edg_buf, prt_buf = rasterize_charts(S, tris_data)
@@ -984,8 +985,16 @@ def synthesize_entity_textures(atlas_size, tris_data, mat_specs, seed_offset=0):
     m_neutral = table(lambda ms: 1.0 if ms["mode"] == "neutral" else 0.0, dtype=np.float32)
     m_glow_keep = table(lambda ms: 1.0 if ms["mode"] == "glow_keep" else 0.0, dtype=np.float32)
     m_has_parts = table(lambda ms: 1.0 if ms["has_parts"] else 0.0, dtype=np.float32)
+    m_is_paint = table(lambda ms: 1.0 if ms.get("cls") in ("paint", "wreck_paint") else 0.0, dtype=np.float32)
+    m_is_steel = table(lambda ms: 1.0 if ms.get("cls") in ("steel", "steel_dark", "steel_black") else 0.0, dtype=np.float32)
+    m_is_cast = table(lambda ms: 1.0 if ms.get("cls") in ("rusty", "copper") else 0.0, dtype=np.float32)
 
-    pc_eff = pc * m_has_parts
+    if high_detail:
+        # Preserve sharp metal/copper/paint separation while keeping Factorio's macro-shading.
+        pc_scale = np.where(m_is_paint > 0.5, 0.34, np.where((m_is_steel > 0.5) | (m_is_cast > 0.5), 0.14, 0.55))
+        pc_eff = pc * m_has_parts * pc_scale
+    else:
+        pc_eff = pc * m_has_parts
     col = m_base * (1.0 - pc_eff)[:, None] + part_rgb * pc_eff[:, None]
     col = col * tint
 
@@ -1059,23 +1068,59 @@ def synthesize_entity_textures(atlas_size, tris_data, mat_specs, seed_offset=0):
     metal = metal * (1.0 - d_amt)
     rough = rough * (1.0 - d_amt) + 0.96 * d_amt
 
+    extra_height = np.zeros(len(ys), dtype=np.float32)
+    if high_detail:
+        # High-frequency industrial detail: hammered paint peel, machined metal grain, cast pitting, oil & scratches.
+        peel = vnoise3(np_p * 74.0) * 0.65 + vnoise3(np_p * 142.0 + 9.0) * 0.35
+        machined = vnoise3(aniso_p * 64.0 + 3.1) * 0.6 + vnoise3(aniso_p * 124.0 + 19.0) * 0.4
+        cast_pit = np.clip((0.48 - fbm3(np_p * 29.0)) * 2.5, 0.0, 1.0) * (0.4 + 0.6 * peel)
+
+        # Directional industrial scratches cutting down to bright bare steel.
+        sc1 = np.clip((vnoise3(np.stack([np_p[:, 0] * 36.0, np_p[:, 1] * 125.0, np_p[:, 2] * 36.0], axis=1)) - 0.77) / 0.07, 0.0, 1.0)
+        sc2 = np.clip((vnoise3(np.stack([np_p[:, 0] * 118.0, np_p[:, 1] * 32.0, np_p[:, 2] * 118.0], axis=1)) - 0.78) / 0.07, 0.0, 1.0)
+        sc_gate = np.clip((patches + edge * 0.6 - 0.45) / 0.30, 0.0, 1.0)
+        sc_mask = np.clip((sc1 + sc2) * 0.85 * sc_gate * (m_is_paint + 0.6 * m_is_steel), 0.0, 1.0)
+        sc_col = m_edge_col * (0.95 + 0.15 * fine)[:, None]
+        col = col * (1.0 - 0.75 * sc_mask)[:, None] + sc_col * (0.75 * sc_mask)[:, None]
+        metal = np.maximum(metal, 0.90 * sc_mask)
+        rough = rough * (1.0 - sc_mask) + 0.20 * sc_mask
+
+        # Machined steel polish vs sand-cast iron/copper roughness contrast & glossy oil patches in low interior recesses.
+        rough = np.where(m_is_steel > 0.5, np.clip(rough * 0.74 + 0.12 * (machined - 0.5), 0.14, 0.72), rough)
+        metal = np.where(m_is_steel > 0.5, np.clip(metal + 0.08 * (1.0 - r_amt - g_amt), 0.0, 0.96), metal)
+        metal = np.where(m_is_cast > 0.5, np.clip(metal + 0.14 * (1.0 - cast_pit) * (1.0 - g_amt), 0.0, 0.94), metal)
+        rough = np.where(m_is_cast > 0.5, np.clip(rough * 0.85 + 0.25 * cast_pit, 0.26, 0.92), rough)
+
+        oil_patch = np.clip((occluded * 0.9 + low * 0.5 - 0.68) / 0.22, 0.0, 1.0) * np.clip((patches - 0.42) / 0.25, 0.0, 1.0)
+        col = col * (1.0 - 0.45 * oil_patch)[:, None]
+        rough = rough * (1.0 - 0.70 * oil_patch) + 0.13 * (0.70 * oil_patch)
+
+        extra_height = (
+            m_is_paint * (peel - 0.5) * 0.14
+            + m_is_steel * (machined - 0.5) * 0.22
+            - m_is_cast * cast_pit * 0.28
+            - sc_mask * 0.24
+        )
+
     # Lift dark high-metal steel slightly so sky reflections keep readable charcoal tones.
     dark_met = metal > 0.65
     if np.any(dark_met):
         col[dark_met] = np.maximum(col[dark_met], 0.065)
 
     # Baked AO goes cleanly into ORM.r (mild cavity tint in albedo for deep crevices).
-    ao_val = np.clip(np.power(np.maximum(v_ao, 0.01), m_ao_pow) * (1.0 - 0.28 * g_amt), 0.15, 1.0)
-    col = col * (0.85 + 0.15 * ao_val)[:, None]
+    ao_pow = m_ao_pow * (1.35 if high_detail else 1.0)
+    ao_val = np.clip(np.power(np.maximum(v_ao, 0.01), ao_pow) * (1.0 - (0.34 if high_detail else 0.28) * g_amt), 0.12 if high_detail else 0.15, 1.0)
+    col = col * ((0.76 + 0.24 * ao_val) if high_detail else (0.85 + 0.15 * ao_val))[:, None]
 
     # Scalar height field for tangent-space normal generation.
-    height = (
+    bump_scale = 1.65 if high_detail else 1.0
+    height = ((
         (fine - 0.5) * 0.55
         + (micro - 0.5) * 0.30
         + (mid - 0.5) * 0.25
         + e_amt * 0.28
         - r_amt * 0.35
-    ) * m_bump
+    ) * m_bump + extra_height) * bump_scale
 
     albedo_lin = np.zeros((S, S, 4), dtype=np.float32)
     orm_f = np.zeros((S, S, 3), dtype=np.float32)
@@ -1115,8 +1160,9 @@ def synthesize_entity_textures(atlas_size, tris_data, mat_specs, seed_offset=0):
     dh_dy[only_u] = h_grid[only_u] - np.roll(h_grid, 1, axis=0)[only_u]
 
     # OpenGL tangent frame (+X = +U, +Y = -V = up in image).
-    nx = -dh_dx * 2.2
-    ny = dh_dy * 2.2
+    n_scale = 3.6 if high_detail else 2.2
+    nx = -dh_dx * n_scale
+    ny = dh_dy * n_scale
     nz = np.ones((S, S), dtype=np.float32)
     nl = np.sqrt(nx * nx + ny * ny + nz * nz)
     nrm_f = np.stack([nx / nl * 0.5 + 0.5, ny / nl * 0.5 + 0.5, nz / nl * 0.5 + 0.5], axis=-1)
@@ -1223,10 +1269,10 @@ def synthesize_item_textures(atlas_size, tris_data, item_cls, seed_offset=0):
     return albedo_u8, orm_u8, nrm_u8
 
 
-def encode_image(arr, mime):
+def encode_image(arr, mime, jpeg_quality=88):
     buf = io.BytesIO()
     if mime == "image/jpeg":
-        Image.fromarray(arr[..., :3], mode="RGB").save(buf, format="JPEG", quality=88, subsampling=1)
+        Image.fromarray(arr[..., :3], mode="RGB").save(buf, format="JPEG", quality=jpeg_quality, subsampling=1)
     else:
         mode = "RGBA" if arr.shape[2] == 4 else "RGB"
         Image.fromarray(arr, mode=mode).save(buf, format="PNG", optimize=True)
@@ -1316,12 +1362,16 @@ def _is_already_baked(doc):
     return False
 
 
-def bake_entity_glb(path, adaptive_charts=False):
+def bake_entity_glb(path, adaptive_charts=False, atlas_size=0, high_detail=None):
     """Bakes procedural PBR atlases into an entity .glb in place. Returns stats dict."""
     doc, bin_chunk = read_glb(path)
     if _is_already_baked(doc):
         return {"skipped": "already_baked", "bytes": os.path.getsize(path)}
     model_name = os.path.splitext(os.path.basename(path))[0]
+    if high_detail is None:
+        high_detail = model_name in HIGH_DETAIL_MODELS
+    if high_detail:
+        adaptive_charts = True
     seed_off = sum(ord(c) * (i + 1) for i, c in enumerate(model_name)) % 997
 
     node_xforms = collect_node_transforms(doc)
@@ -1426,6 +1476,7 @@ def bake_entity_glb(path, adaptive_charts=False):
                     "real_name": gkey[3] if len(gkey) > 3 else mname,
                     "base_rgb": tuple(base_rgba[:3]),
                     "base_alpha": float(base_rgba[3]) if len(base_rgba) > 3 else 1.0,
+                    "cls": _cls,
                     "params": params,
                     "mode": mode,
                     "has_parts": has_parts,
@@ -1445,7 +1496,8 @@ def bake_entity_glb(path, adaptive_charts=False):
         return {"skipped": True}
 
     footprint_area = max(float((all_hi[0] - all_lo[0]) * (all_hi[2] - all_lo[2])), 0.0)
-    atlas_size = 256 if footprint_area <= 2.25 else 512
+    if atlas_size <= 0:
+        atlas_size = 1024 if high_detail else (256 if footprint_area <= 2.25 else 512)
 
     # Extract connected planar charts for every baked primitive.
     per_prim_tris = []
@@ -1469,7 +1521,7 @@ def bake_entity_glb(path, adaptive_charts=False):
                 "rec": r,
             })
 
-    margin = 1.5 if (adaptive_charts and len(charts_all) > 400) else 2.5
+    margin = 2.0 if high_detail else (1.5 if (adaptive_charts and len(charts_all) > 400) else 2.5)
     pack_charts(charts_all, atlas_size, margin_px=margin)
 
     # Assemble per-triangle data for rasterizer AND build new per-(mi, target_key) split vertex buffers.
@@ -1532,9 +1584,11 @@ def bake_entity_glb(path, adaptive_charts=False):
         "mat_id": np.concatenate(all_mid, axis=0),
     }
 
-    albedo_u8, orm_u8, nrm_u8 = synthesize_entity_textures(atlas_size, tris_data, mat_specs, seed_offset=seed_off)
+    albedo_u8, orm_u8, nrm_u8 = synthesize_entity_textures(
+        atlas_size, tris_data, mat_specs, seed_offset=seed_off, high_detail=high_detail
+    )
     # Check if any material needs alpha in texture (BLEND materials keep baseColorFactor[3]; JPEG keeps opaque RGB).
-    albedo_bytes = encode_image(albedo_u8, "image/jpeg")
+    albedo_bytes = encode_image(albedo_u8, "image/jpeg", jpeg_quality=92 if high_detail else 88)
     orm_bytes = encode_image(orm_u8, "image/png")
     nrm_bytes = encode_image(nrm_u8, "image/png")
 
@@ -1827,14 +1881,14 @@ def bake_item_glb(path):
     return {"skipped": False, "atlas": atlas_size, "charts": len(charts_all), "mats": 1, "bytes": os.path.getsize(path)}
 
 
-def _worker_job(job):
+def _worker_job(job, atlas_size=0, high_detail=None):
     kind, path = job
     if kind == "item":
         res = bake_item_glb(path)
     elif kind == "wube_entity":
-        res = bake_entity_glb(path, adaptive_charts=True)
+        res = bake_entity_glb(path, adaptive_charts=True, atlas_size=atlas_size, high_detail=high_detail)
     else:
-        res = bake_entity_glb(path)
+        res = bake_entity_glb(path, atlas_size=atlas_size, high_detail=high_detail)
     return kind, os.path.basename(path), res
 
 
@@ -2091,6 +2145,8 @@ def main():
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--update-pack-json", action="store_true")
     ap.add_argument("--fix-imports", action="store_true")
+    ap.add_argument("--atlas-size", type=int, default=0)
+    ap.add_argument("--high-detail", action="store_true", default=None)
     args = ap.parse_args()
 
     z_ents, z_ent_bases, z_items, z_item_bases, rig_bases = load_exclusions(args.zenith_zip)
@@ -2114,13 +2170,15 @@ def main():
     total_bytes = 0
     if args.jobs > 1 and len(targets) > 4:
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
-            for i, (kind, fname, res) in enumerate(pool.map(_worker_job, targets), 1):
+            futs = [pool.submit(_worker_job, job, args.atlas_size, args.high_detail) for job in targets]
+            for i, fut in enumerate(futs, 1):
+                kind, fname, res = fut.result()
                 total_bytes += res.get("bytes", 0)
                 if i <= 10 or i % 50 == 0 or i == len(targets):
                     print(f"[{i}/{len(targets)}] {kind} {fname}: {res}")
     else:
         for i, job in enumerate(targets, 1):
-            kind, fname, res = _worker_job(job)
+            kind, fname, res = _worker_job(job, args.atlas_size, args.high_detail)
             total_bytes += res.get("bytes", 0)
             print(f"[{i}/{len(targets)}] {kind} {fname}: {res}")
 

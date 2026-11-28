@@ -1151,6 +1151,9 @@ for ($i = 0; $i -lt $plan.Count; $i++) {
   $clientArgs.Add("Dummy")
   $clientArgs.Add("--log-file")
   $clientArgs.Add($godotLog)
+  # A build's extra argument starting with "^" is an engine argument (before "--"), the "^" dropped:
+  # -Build "0.3.1-vulkan=<path>|^--rendering-driver ^vulkan".
+  foreach ($ua in @($b.user_args)) { if ($ua -and ([string]$ua).StartsWith("^")) { $clientArgs.Add(([string]$ua).Substring(1)) } }
   $clientArgs.Add("--")
   $clientArgs.Add("--settings-file=$settingsFile")
   $clientArgs.Add("--factorio-port=$udpPort")
@@ -1164,7 +1167,7 @@ for ($i = 0; $i -lt $plan.Count; $i++) {
   if ($lk -eq "cinematic" -and $b.addon_arg -ne "") {
     $clientArgs.Add($b.addon_arg)
   }
-  foreach ($ua in @($b.user_args)) { if ($ua) { $clientArgs.Add([string]$ua) } }
+  foreach ($ua in @($b.user_args)) { if ($ua -and -not ([string]$ua).StartsWith("^")) { $clientArgs.Add([string]$ua) } }
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $clientExitCode = -1

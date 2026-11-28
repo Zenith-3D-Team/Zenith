@@ -1,0 +1,2 @@
+Keeps Godot's editor out of this folder (the sources, the build). scripts/menu/upscalers.gd loads
+upscalers.gdextension where its library is there (docs/RUNNING.md, "Upscaling").

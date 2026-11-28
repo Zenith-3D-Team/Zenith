@@ -61,6 +61,18 @@ const SPLIT_HEAD_Z := -0.42
 const SPLIT_ABDOMEN_Z := 0.36
 const WORM_HEAD_Y := 2.55
 const WORM_ABDOMEN_Y := 1.25
+const NAUVIS_BLOOD_COLOR := Vector3(0.135, 0.014, 0.095)
+const GLEBA_BLOOD_COLOR := Vector3(0.065, 0.145, 0.018)
+
+
+static func _is_gleba_proto(proto: String) -> bool:
+	return (
+		proto.contains("pentapod")
+		or proto.begins_with("gleba-spawner")
+		or proto.contains("stomper")
+		or proto.contains("strafer")
+		or proto.contains("wriggler")
+	)
 
 var _host
 var _api
@@ -96,6 +108,7 @@ func make_ragdoll_node(proto: String) -> MeshInstance3D:
 	zeros.resize(12)
 	zeros.fill(Vector4.ZERO)
 	var zero_holes := _zero_holes()
+	var blood_col := GLEBA_BLOOD_COLOR if _is_gleba_proto(proto) else NAUVIS_BLOOD_COLOR
 	for i in mesh.get_surface_count():
 		var mat := mesh.surface_get_material(i) as ShaderMaterial
 		if mat == null:
@@ -107,6 +120,7 @@ func make_ragdoll_node(proto: String) -> MeshInstance3D:
 		copy.set_shader_parameter("rig_decay", 0.0)
 		copy.set_shader_parameter("rig_decay_floor", 0.0)
 		copy.set_shader_parameter("rig_blood", 0.0)
+		copy.set_shader_parameter("rig_blood_color", blood_col)
 		copy.set_shader_parameter("rig_burn", 0.0)
 		copy.set_shader_parameter("rig_holes", zero_holes)
 		node.set_surface_override_material(i, copy)
@@ -130,6 +144,7 @@ func make_ragdoll_leg_node(proto: String, limb_idx: int) -> MeshInstance3D:
 	node.mesh = leg_mesh
 	node.set_meta(&"leg_centroid", entry.get("centroid", Vector3.ZERO))
 	var zero_holes := _zero_holes()
+	var blood_col := GLEBA_BLOOD_COLOR if _is_gleba_proto(proto) else NAUVIS_BLOOD_COLOR
 	for i in mats.size():
 		var mat := mats[i] as ShaderMaterial
 		if mat != null:
@@ -137,6 +152,7 @@ func make_ragdoll_leg_node(proto: String, limb_idx: int) -> MeshInstance3D:
 			copy.set_shader_parameter("rig_decay", 0.0)
 			copy.set_shader_parameter("rig_decay_floor", 0.0)
 			copy.set_shader_parameter("rig_blood", 0.0)
+			copy.set_shader_parameter("rig_blood_color", blood_col)
 			copy.set_shader_parameter("rig_burn", 0.0)
 			copy.set_shader_parameter("rig_holes", zero_holes)
 			node.set_surface_override_material(i, copy)
@@ -145,7 +161,7 @@ func make_ragdoll_leg_node(proto: String, limb_idx: int) -> MeshInstance3D:
 
 ## Extracts and caches an unparented solid body-chunk MeshInstance3D for `part` ("head", "thorax",
 ## or "abdomen") of `proto`, partitioned along Z relative to tier scale with a closed bloody
-## purple-violet inner-meat cross-section cap fan along cut boundaries. Sets `"part_centroid"`
+## inner-meat cross-section cap fan along cut boundaries. Sets `"part_centroid"`
 ## metadata. Returns null if the model isn't ready or has no triangles for `part`.
 func make_ragdoll_part_node(proto: String, part: String) -> MeshInstance3D:
 	if proto == "" or not PART_IDS.has(part) or not ModelLibrary.ready(proto):
@@ -161,6 +177,7 @@ func make_ragdoll_part_node(proto: String, part: String) -> MeshInstance3D:
 	node.mesh = part_mesh
 	node.set_meta(&"part_centroid", entry.get("centroid", Vector3.ZERO))
 	var zero_holes := _zero_holes()
+	var blood_col := GLEBA_BLOOD_COLOR if _is_gleba_proto(proto) else NAUVIS_BLOOD_COLOR
 	for i in mats.size():
 		var mat := mats[i] as ShaderMaterial
 		if mat != null:
@@ -168,10 +185,49 @@ func make_ragdoll_part_node(proto: String, part: String) -> MeshInstance3D:
 			copy.set_shader_parameter("rig_decay", 0.0)
 			copy.set_shader_parameter("rig_decay_floor", 0.0)
 			copy.set_shader_parameter("rig_blood", 0.0)
+			copy.set_shader_parameter("rig_blood_color", blood_col)
 			copy.set_shader_parameter("rig_burn", 0.0)
 			copy.set_shader_parameter("rig_holes", zero_holes)
 			node.set_surface_override_material(i, copy)
 	return node
+
+
+## (API 1.95) Extracts and caches unparented MeshInstance3Ds for animated sub-parts (`ModelLibrary.parts_for`,
+## e.g. strafer/stomper upper and lower leg segments), each centred around its bounding centroid
+## with cloned RagdollShader materials (`rig_mode = 0`). Returns [{kind, centroid, node}, ...].
+func make_ragdoll_part_nodes(proto: String) -> Array:
+	if proto == "" or not ModelLibrary.ready(proto):
+		return []
+	var key := "%s:anim_parts" % proto
+	var cached: Variant = _slice_cached(key, proto, _extract_anim_parts_entry.bind(proto))
+	if cached == null:
+		return []
+	var entry: Dictionary = cached
+	var built: Array = entry.get("parts", []) as Array
+	var zero_holes := _zero_holes()
+	var blood_col := GLEBA_BLOOD_COLOR if _is_gleba_proto(proto) else NAUVIS_BLOOD_COLOR
+	var out: Array = []
+	for p_obj in built:
+		var pd: Dictionary = p_obj as Dictionary
+		var pmesh := pd["mesh"] as ArrayMesh
+		var mats: Array = pd["mats"] as Array
+		var node := MeshInstance3D.new()
+		node.mesh = pmesh
+		var centroid: Vector3 = pd.get("centroid", Vector3.ZERO) as Vector3
+		node.set_meta(&"leg_centroid", centroid)
+		for i in mats.size():
+			var mat := mats[i] as ShaderMaterial
+			if mat != null:
+				var copy := ModelLods.copy_material(mat)
+				copy.set_shader_parameter("rig_decay", 0.0)
+				copy.set_shader_parameter("rig_decay_floor", 0.0)
+				copy.set_shader_parameter("rig_blood", 0.0)
+				copy.set_shader_parameter("rig_blood_color", blood_col)
+				copy.set_shader_parameter("rig_burn", 0.0)
+				copy.set_shader_parameter("rig_holes", zero_holes)
+				node.set_surface_override_material(i, copy)
+		out.append({"kind": str(pd.get("kind", "")), "centroid": centroid, "node": node})
+	return out
 
 
 ## Sets the per-limb ragdoll pose uniform array `rig_ragdoll[12]` on all ShaderMaterial surfaces
@@ -479,8 +535,9 @@ static func _finish_precut(proto: String) -> void:
 	if ModelLibrary.mesh_for(proto) != mesh:
 		return  # the model changed meanwhile: these cuts are of the old one
 	var plans: Dictionary = job[2]
+	var is_gleba := _is_gleba_proto(proto)
 	for key: String in plans:
-		var made: Variant = _assemble(mesh, plans[key])
+		var made: Variant = _assemble(mesh, plans[key], is_gleba)
 		var rec: Dictionary = made if made is Dictionary else {"none": true}
 		rec["src"] = mesh
 		_leg_cache[key] = rec
@@ -517,7 +574,79 @@ func _extract_leg_entry(proto: String, limb_idx: int) -> Variant:
 	var mesh := ModelLibrary.mesh_for(proto)
 	if mesh == null:
 		return null
-	return _assemble(mesh, _leg_plan(_surfaces_info(mesh), limb_idx))
+	return _assemble(mesh, _leg_plan(_surfaces_info(mesh), limb_idx), _is_gleba_proto(proto))
+
+
+func _extract_anim_parts_entry(proto: String) -> Variant:
+	var anim_parts: Array = ModelLibrary.parts_for(proto)
+	if anim_parts.is_empty():
+		return null
+	var is_gleba := _is_gleba_proto(proto)
+	var blood_col := GLEBA_BLOOD_COLOR if is_gleba else NAUVIS_BLOOD_COLOR
+	var zero_holes := _zero_holes()
+	var built: Array = []
+	for ap_obj in anim_parts:
+		var ap: ModelLibrary.AnimPart = ap_obj as ModelLibrary.AnimPart
+		if ap == null or ap.mesh == null:
+			continue
+		var surfaces := _surfaces_info(ap.mesh)
+		if surfaces.is_empty():
+			continue
+		var vmin := Vector3(INF, INF, INF)
+		var vmax := Vector3(-INF, -INF, -INF)
+		var total_verts := 0
+		var per_surface := []
+		for info_obj in surfaces:
+			var info: Dictionary = info_obj
+			var src: Array = info["src"]
+			var verts: Variant = src[Mesh.ARRAY_VERTEX]
+			if not (verts is PackedVector3Array):
+				continue
+			var v_arr: PackedVector3Array = verts
+			var uv_arr: Variant = src[Mesh.ARRAY_TEX_UV]
+			var raw_idx: Variant = src[Mesh.ARRAY_INDEX]
+			var idx_arr: PackedInt32Array = raw_idx if raw_idx is PackedInt32Array else PackedInt32Array()
+			var n_idx: int = idx_arr.size() if not idx_arr.is_empty() else v_arr.size()
+			var picked := PackedInt32Array()
+			picked.resize(n_idx)
+			for k in n_idx:
+				var vi: int = idx_arr[k] if not idx_arr.is_empty() else k
+				picked[k] = vi
+				var p := v_arr[vi]
+				vmin = vmin.min(p)
+				vmax = vmax.max(p)
+			total_verts += n_idx
+			if not picked.is_empty():
+				per_surface.append({"s": info["s"], "fmt": info["fmt"], "src": src, "v": v_arr, "uv": uv_arr, "picked": picked})
+		if total_verts == 0 or per_surface.is_empty():
+			continue
+		var centroid := (vmin + vmax) * 0.5
+		var pieces := _sliced_arrays(per_surface, centroid)
+		var out_mesh := ArrayMesh.new()
+		var mats: Array = []
+		for piece_obj in pieces:
+			var piece: Dictionary = piece_obj
+			var s: int = int(piece["s"])
+			out_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, piece["arrays"], [], {}, int(piece["fmt"]))
+			var mat := ap.mesh.surface_get_material(s) as ShaderMaterial
+			var m_copy: ShaderMaterial = null
+			if mat != null:
+				m_copy = ModelLods.copy_material(mat)
+				m_copy.shader = RagdollShader
+				m_copy.set_shader_parameter("rig_mode", 0)
+				m_copy.set_shader_parameter("rig_decay", 0.0)
+				m_copy.set_shader_parameter("rig_decay_floor", 0.0)
+				m_copy.set_shader_parameter("rig_blood", 0.0)
+				m_copy.set_shader_parameter("rig_blood_color", blood_col)
+				m_copy.set_shader_parameter("rig_burn", 0.0)
+				m_copy.set_shader_parameter("rig_holes", zero_holes)
+				out_mesh.surface_set_material(out_mesh.get_surface_count() - 1, m_copy)
+			mats.append(m_copy)
+		if out_mesh.get_surface_count() > 0:
+			built.append({"kind": ap.kind, "mesh": out_mesh, "mats": mats, "centroid": centroid})
+	if built.is_empty():
+		return null
+	return {"parts": built}
 
 
 ## The model's triangle surfaces' arrays, read once (main thread): [{s, fmt, src}].
@@ -583,12 +712,21 @@ func _extract_part_entry(proto: String, part: String) -> Variant:
 	var target_part := int(PART_IDS.get(part, -1))
 	if target_part < 0:
 		return null
-	return _assemble(mesh, _part_plan(_surfaces_info(mesh), target_part, _split_scale(proto), proto.contains("worm")))
+	return _assemble(mesh, _part_plan(_surfaces_info(mesh), target_part, _split_scale(proto), proto.contains("worm")), _is_gleba_proto(proto))
 
 
 static func _split_scale(proto: String) -> float:
 	var alias: Variant = CreatureModels.ALIASES.get(proto)
-	return float(alias[1]) if alias is Array else 1.0
+	if alias is Array:
+		return float(alias[1])
+	if proto.ends_with("-strafer-pentapod") or proto.ends_with("-stomper-pentapod"):
+		if proto.begins_with("small-"):
+			return 0.5625
+		if proto.begins_with("medium-"):
+			return 0.75
+	if proto == "gleba-spawner-small":
+		return 0.5
+	return 1.0
 
 
 ## A body part's cut and its cap, as arrays only (pure arithmetic, safe on a worker thread); null when
@@ -682,7 +820,7 @@ static func _sliced_arrays(per_surface: Array, centroid: Vector3) -> Array:
 		var s: int = int(entry["s"])
 		var src: Array = entry["src"]
 		var v_arr: PackedVector3Array = entry["v"]
-		var uv_arr: PackedVector2Array = entry["uv"]
+		var uv_raw: Variant = entry["uv"]
 		var picked: PackedInt32Array = entry["picked"]
 
 		var dst := []
@@ -723,11 +861,13 @@ static func _sliced_arrays(per_surface: Array, centroid: Vector3) -> Array:
 				out_c[i] = sc[picked[i]]
 			dst[Mesh.ARRAY_COLOR] = out_c
 
-		var out_uv := PackedVector2Array()
-		out_uv.resize(picked.size())
-		for i in picked.size():
-			out_uv[i] = uv_arr[picked[i]]
-		dst[Mesh.ARRAY_TEX_UV] = out_uv
+		if uv_raw is PackedVector2Array:
+			var uv_arr: PackedVector2Array = uv_raw
+			var out_uv := PackedVector2Array()
+			out_uv.resize(picked.size())
+			for i in picked.size():
+				out_uv[i] = uv_arr[picked[i]]
+			dst[Mesh.ARRAY_TEX_UV] = out_uv
 
 		if src[Mesh.ARRAY_TEX_UV2] is PackedVector2Array:
 			var suv2: PackedVector2Array = src[Mesh.ARRAY_TEX_UV2]
@@ -749,13 +889,14 @@ static func _sliced_arrays(per_surface: Array, centroid: Vector3) -> Array:
 
 
 ## A cut's mesh and material copies from its plan (main thread); null when it has no surfaces.
-static func _assemble(mesh: Mesh, plan: Variant) -> Variant:
+static func _assemble(mesh: Mesh, plan: Variant, is_gleba := false) -> Variant:
 	if not (plan is Dictionary):
 		return null
 	var pd: Dictionary = plan
 	var out_mesh := ArrayMesh.new()
 	var mats: Array = []
 	var zero_holes := _zero_holes()
+	var blood_col := GLEBA_BLOOD_COLOR if is_gleba else NAUVIS_BLOOD_COLOR
 	for piece_obj in pd["pieces"]:
 		var piece: Dictionary = piece_obj
 		var s: int = int(piece["s"])
@@ -769,6 +910,7 @@ static func _assemble(mesh: Mesh, plan: Variant) -> Variant:
 			m_copy.set_shader_parameter("rig_decay", 0.0)
 			m_copy.set_shader_parameter("rig_decay_floor", 0.0)
 			m_copy.set_shader_parameter("rig_blood", 0.0)
+			m_copy.set_shader_parameter("rig_blood_color", blood_col)
 			m_copy.set_shader_parameter("rig_burn", 0.0)
 			m_copy.set_shader_parameter("rig_holes", zero_holes)
 			out_mesh.surface_set_material(out_mesh.get_surface_count() - 1, m_copy)
@@ -776,7 +918,7 @@ static func _assemble(mesh: Mesh, plan: Variant) -> Variant:
 	var cap: Variant = pd.get("cap")
 	if cap is Array:
 		out_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, cap)
-		var meat_mat := _make_meat_cap_material()
+		var meat_mat := _make_meat_cap_material(is_gleba)
 		out_mesh.surface_set_material(out_mesh.get_surface_count() - 1, meat_mat)
 		mats.append(meat_mat)
 	if out_mesh.get_surface_count() == 0:
@@ -986,11 +1128,11 @@ static func _emit_cap_tri(center: Vector3, pa: Vector3, pb: Vector3, outward: Ve
 	cap_uv.append(Vector2.ZERO)
 
 
-static func _make_meat_cap_material() -> ShaderMaterial:
+static func _make_meat_cap_material(is_gleba := false) -> ShaderMaterial:
 	var mat := ShaderMaterial.new()
-	mat.resource_name = "biter_inner_meat"
+	mat.resource_name = "gleba_inner_meat" if is_gleba else "biter_inner_meat"
 	mat.shader = RagdollShader
-	mat.set_shader_parameter("albedo", Color(0.24, 0.035, 0.19, 1.0))
+	mat.set_shader_parameter("albedo", Color(0.10, 0.22, 0.045, 1.0) if is_gleba else Color(0.24, 0.035, 0.19, 1.0))
 	mat.set_shader_parameter("roughness", 0.22)
 	mat.set_shader_parameter("metallic", 0.0)
 	mat.set_shader_parameter("vertex_data", 1.0)
@@ -1011,6 +1153,7 @@ static func _make_meat_cap_material() -> ShaderMaterial:
 	mat.set_shader_parameter("rig_decay", 0.0)
 	mat.set_shader_parameter("rig_decay_floor", 0.0)
 	mat.set_shader_parameter("rig_blood", 0.0)
+	mat.set_shader_parameter("rig_blood_color", GLEBA_BLOOD_COLOR if is_gleba else NAUVIS_BLOOD_COLOR)
 	mat.set_shader_parameter("rig_burn", 0.0)
 	mat.set_shader_parameter("rig_holes", _zero_holes())
 	return mat

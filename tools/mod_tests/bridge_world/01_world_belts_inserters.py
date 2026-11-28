@@ -38,9 +38,11 @@ check(of_type(msgs, "ready"), "ready marks the end of the handshake")
 eprops = of_type(msgs, "eprops")
 ep = {rec[0]: rec for rec in eprops[0]["l"]} if eprops else {}
 pid = {rec[1]: rec[0] for m in of_type(msgs, "protos") for rec in m["l"]}
-check(ep.get(pid["underground-belt"], [0, 0])[1] == 5 and ep.get(pid["small-electric-pole"], [0, 0, 0, 0])[2:] == [7.5, 2.5],
+check(ep.get(pid["underground-belt"], [0, 0])[1] == 5 and ep.get(pid["small-electric-pole"], [0, 0, 0, 0])[2:4] == [7.5, 2.5],
       f"eprops gives underground reach and pole wire reach and supply area: {eprops[:1]}")
-over = {name: (ep.get(pid[name]) or [0] * 5)[4:] for name in ("inserter", "roboport", "offshore-pump")}
+BUILD_KEYS = ("fg", "cb", "wb")  # the build cursor's own (bughunt build2): tested by tools/live/building_and_planners.py check_build_rules
+strip = lambda rows: [{k: v for k, v in r.items() if k not in BUILD_KEYS} for r in rows]
+over = {name: strip((ep.get(pid[name]) or [0] * 5)[4:]) for name in ("inserter", "roboport", "offshore-pump")}
 check(over["inserter"] == [{"ip": [0, -1], "id": [0, 1.2], "rs": 0.014, "es": 0.035}] and over["roboport"] == [{"lr": 25, "cr": 55}]
       and over["offshore-pump"] == [{"fb": [[0, -0.5, 0, "o"]]}],
       f"eprops' overlay: inserter pickup and drop and hand speeds, roboport areas, fluid connections: {over}")
@@ -51,8 +53,8 @@ pipe_eps = [next((x for x in (ep.get(pid[n]) or [])[4:5] if isinstance(x, dict))
 check(tank_ep.get("fj") == [[-1, -1, 0, "b"], [1, 1, 4, "b"], [1, 1, 8, "b"], [-1, -1, 12, "b"]] and "fb" not in tank_ep
       and all("fj" not in x and "fb" not in x for x in pipe_eps),
       f"N9: eprops' fj: a storage tank's four pipeline joins, no fb; none on a pipe or pipe to ground: {tank_ep} {pipe_eps}")
-ore_ep = (ep.get(pid["iron-ore"]) or [0] * 5)[4:]
-check(ore_ep == [{"ms": "base/sound/axe-mining-test", "rk": "basic-solid"}] and pid["tree-01"] not in ep,
+ore_ep = strip((ep.get(pid["iron-ore"]) or [0] * 5)[4:])
+check(ore_ep == [{"ms": "base/sound/axe-mining-test", "rk": "basic-solid"}] and "ms" not in ((ep.get(pid["tree-01"]) or [0] * 5)[4:] or [{}])[0],
       f"J11: eprops carries an entity's own mining sound (zenith-mining-sounds), none for those without: {ore_ep}")
 # Step 5 task 3a: the steps' sounds (zenith-step-sounds) go after eprops, in parts each well under the
 # smallest byte budget a tick (4096), the sounds first; names become ids, and a name the game hasn't is left out.
@@ -138,7 +140,7 @@ check(iuse.get(("speed-module", "m")) == ["speed-module", "m", "speed"] and ("wo
       f"iuse: modules and their category (F6: the client asks for them by clicking): {iuse.get(('speed-module', 'm'))}")
 # Concrete goes where water doesn't collide: not on water, nor on empty space (it collides like water).
 check(iuse.get(("concrete", "t")) == ["concrete", "t", "concrete", "", sorted(tid[n] for n in ("grass-1", "stone-path", "space-platform-foundation"))]
-      and iuse.get(("grenade", "c")) == ["grenade", "c", "throw", 15, 0] and iuse.get(("cliff-explosives", "c")) == ["cliff-explosives", "c", "destroy-cliffs", 10, 1.5]
+      and iuse.get(("grenade", "c")) == ["grenade", "c", "throw", 15, 0, 30] and iuse.get(("cliff-explosives", "c")) == ["cliff-explosives", "c", "destroy-cliffs", 10, 1.5, 30]
       and iuse.get(("rail", "r")) == ["rail", "r", "rail-support", 0] and iuse.get(("transport-belt", "b")) == ["transport-belt", "b", "underground-belt"],
       f"iuse: tiles (what they may go on), capsules, the rail planner, a belt's underground: {sorted(iuse.values())}")
 inv = of_type(msgs, "inv")
@@ -208,6 +210,7 @@ tick(10)
 again = [m for m in of_type(take(), "chunk") if (m["cx"], m["cy"]) == (0, 0)]
 check(len(again) == 1 and again[0].get("same") == c00.get("rv") and "tiles" not in again[0],
       f"an unchanged chunk offered from the client's cache is answered with same: {again}")
+bump_tick = int(g.game.tick)  # a count goes up to the tick of the change (world.lua next_rev, f3d-rev-ticks)
 lua.eval('package.loaded["scripts.world"]').bump(c00.get("rs"), lua.table_from({"x": 5, "y": 5}))
 send({"t": "sub", "c": [[1, 0], [9, 9]]})
 tick(2)
@@ -215,7 +218,7 @@ take()
 send({"t": "sub", "c": [[0, 0], [1, 0], [9, 9]], "h": [offer]})
 tick(10)
 again = [m for m in of_type(take(), "chunk") if (m["cx"], m["cy"]) == (0, 0)]
-check(len(again) == 1 and "same" not in again[0] and again[0].get("rv") == c00.get("rv") + 1 and again[0].get("tiles"),
+check(len(again) == 1 and "same" not in again[0] and again[0].get("rv") == max(c00.get("rv") + 1, bump_tick) and again[0].get("tiles"),
       f"a chunk changed since the client kept it is sent in full, with its new count: {[{k: v for k, v in m.items() if k != 'tiles'} for m in again]}")
 # I18: a client whose hello says lv is told, a tick or so after a chunk leaves its square, the counts
 # its copy matches (`kept`), so it can offer them later; not when the chunk changed meanwhile.
@@ -410,19 +413,21 @@ lua.eval("function(s, n) local keep = {} for _, d in ipairs(s.decoratives) do if
     F.surface, "green-carpet-grass")
 world_mod = g.package.loaded["scripts.world"]
 rev_before = world_mod.rev(1, "0,0")
+raise_tick = int(g.game.tick)
 F["raise"]("on_player_built_tile", lua.table_from({"surface_index": 1, "tiles": lua.table_from([lua.table_from(
     {"position": lua.table_from({"x": 3, "y": 4}), "old_tile": "grass-1"})])}))
 tick(30)
 dec = [m for m in of_type(take(), "dec")]
 check(len(dec) == 1 and (dec[0]["cx"], dec[0]["cy"]) == (0, 0) and dec[0]["l"] in ([], {}),
       f"a tile placed in a chunk sends its decoratives again (now none): {dec}")
-check(world_mod.rev(1, "0,0") == rev_before + 1, f"and raises its change count once: {rev_before} -> {world_mod.rev(1, '0,0')}")
+check(world_mod.rev(1, "0,0") == max(rev_before + 1, raise_tick), f"and raises its change count once: {rev_before} -> {world_mod.rev(1, '0,0')}")
 rev_before = world_mod.rev(1, "1,0")
+raise_tick = int(g.game.tick)
 F["raise"]("script_raised_built", lua.table_from({"entity": spawn("wooden-chest", 40.5, 5.5, force="player")}))
 tick(30)
 dec = [(m["cx"], m["cy"]) for m in of_type(take(), "dec")]
 check(dec == [(1, 0)], f"building in a chunk sends its decoratives again: {dec}")
-check(world_mod.rev(1, "1,0") == rev_before + 1, f"and raises its change count once: {rev_before} -> {world_mod.rev(1, '1,0')}")
+check(world_mod.rev(1, "1,0") == max(rev_before + 1, raise_tick), f"and raises its change count once: {rev_before} -> {world_mod.rev(1, '1,0')}")
 wide_e = spawn("assembling-machine-1", 31.5, 20.5, force="player")
 F["raise"]("script_raised_built", lua.table_from({"entity": wide_e}))
 tick(30)

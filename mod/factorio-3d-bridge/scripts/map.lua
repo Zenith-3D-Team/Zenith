@@ -1077,6 +1077,53 @@ function M.unghost(cmd)
   transport.send_now({ t = "unghost", q = math.floor(tonumber(cmd.q) or 0), n = n })
 end
 
+-- Entities a click on the map never picks: ground, plants, ghosts and what has no window.
+local PICK_SKIP = { resource = true, character = true, corpse = true, ["entity-ghost"] = true, ["tile-ghost"] = true,
+  ["item-entity"] = true, ["item-request-proxy"] = true, tree = true, ["simple-entity"] = true, ["simple-entity-with-owner"] = true,
+  cliff = true, fish = true, ["highlight-box"] = true, ["deconstructible-tile-proxy"] = true }
+
+-- {x, y, r?, si?, q}: a click or hover on the map. Answers `pick` {q, u?, p?, x?, y?} with the building,
+-- rolling stock or vehicle of the character's force under that point, as the world view's selection
+-- does: the highest selection priority wins, then the nearest centre. `r` is how many 1/256 tiles
+-- round the point count (a map pixel is many tiles when zoomed out). Opening it, and the radar and
+-- roboport coverage rule, are screens.open's (it is then asked with `rv`).
+function M.pick(cmd)
+  local c = puppet.get()
+  local x, y = tonumber(cmd.x), tonumber(cmd.y)
+  if not (c and x and y) then
+    return
+  end
+  local px, py = x / 256, y / 256
+  local r = math.max(0.05, math.min(3, (tonumber(cmd.r) or 0) / 256))
+  local surface = surface_of(cmd, c)
+  local best, best_pri, best_d
+  for _, e in pairs(surface.find_entities_filtered({ area = { { px - r, py - r }, { px + r, py + r } } })) do
+    if e.valid and e.unit_number and not PICK_SKIP[e.type] and e.force == c.force then
+      local ok, pri = pcall(function()
+        local proto = e.prototype
+        if proto.selectable_in_game == false then
+          return nil
+        end
+        return proto.selection_priority or 50
+      end)
+      if ok and pri then
+        local d = (e.position.x - px) ^ 2 + (e.position.y - py) ^ 2
+        if not best or pri > best_pri or (pri == best_pri and d < best_d) then
+          best, best_pri, best_d = e, pri, d
+        end
+      end
+    end
+  end
+  local msg = { t = "pick", q = math.floor(tonumber(cmd.q) or 0) }
+  if best then
+    msg.u = best.unit_number
+    msg.p = registry.entity_id(best.name)
+    msg.x = world.fixed(best.position.x)
+    msg.y = world.fixed(best.position.y)
+  end
+  transport.send_now(msg)
+end
+
 -- {si?}: the trains on the map, which Factorio draws live where radars see them. The client asks
 -- about once a second while its map view or minimap is open, and gets `mtr` {si, part, parts, l:
 -- [x, y, orientation (1/1000 turn), length, width (1/256 tile), colour 0xRRGGBB, ...]}: one

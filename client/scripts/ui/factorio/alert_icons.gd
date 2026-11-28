@@ -23,6 +23,8 @@ const DRAWN := {
 	"train_fuel": ["fuel-icon-red.png", true], "train_path": ["no-path-icon.png", true],
 	"collector": ["asteroid-collector-path-blocked-icon.png", true], "launch": ["destination-full-icon.png", true],
 	"platform_storage": ["no-platform-storage-space-icon.png", true],
+	"no_storage": ["no-storage-space-icon.png", true],
+	"no_roboport_storage": ["no-roboport-storage-space-icon.png", true],
 	# J27: a mining drill whose status is no_minable_resources, Factorio's utility sprite resources_depleted_icon.
 	"depleted": ["resources-depleted-icon.png", true],
 	# L11: a pipeline over the extent limit, Factorio's pipeline_disabled_icon over one entity of it.

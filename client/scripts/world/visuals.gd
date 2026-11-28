@@ -78,6 +78,11 @@ static func flying_height(type: String) -> float:
 	return FLYING.get(type, 0.0)
 
 
+## Positive flight height for hover previews, ghosts, blueprints and sprite stand-ins (excludes sunken rockets).
+static func flight_lift(type: String) -> float:
+	return maxf(0.0, flying_height(type))
+
+
 ## Ore patches: flat at low amounts, taller where the patch is rich.
 static func resource_height(amount: int) -> float:
 	var richness := clampf(log(maxf(amount, 1.0)) / log(10000.0), 0.0, 1.0)
@@ -216,11 +221,11 @@ static func orientation_yaw(orientation: float) -> float:
 	return -orientation * TAU
 
 
-## Transform of a placeholder for `proto` at `pos` (tiles), facing `direction`, `height` tall.
-static func placeholder_transform(proto: ProtoDB.EntityProto, pos: Vector2, direction: int, height: float) -> Transform3D:
+## Transform of a placeholder for `proto` at `pos` (tiles), facing `direction`, `height` tall, lifted by `y`.
+static func placeholder_transform(proto: ProtoDB.EntityProto, pos: Vector2, direction: int, height: float, y := 0.0) -> Transform3D:
 	var yaw := direction_yaw(direction)
 	var size := proto.size() * SHRINK
 	var c := proto.center()
 	var turn := Basis(Vector3.UP, yaw)
-	var origin := Vector3(pos.x, 0.0, pos.y) + turn * Vector3(c.x, height * 0.5, c.y)
+	var origin := Vector3(pos.x, y, pos.y) + turn * Vector3(c.x, height * 0.5, c.y)
 	return Transform3D(turn * Basis.from_scale(Vector3(size.x, height, size.y)), origin)

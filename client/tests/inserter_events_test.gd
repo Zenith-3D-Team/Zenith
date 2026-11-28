@@ -16,6 +16,7 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const BurnerFx := preload("res://scripts/fx/burner_fx.gd")
 const FactorioShader := preload("res://shaders/factorio_material.gdshader")
+const VP := preload("res://scripts/world/view_priority.gd")
 
 var failures := 0
 var verbose := false
@@ -281,12 +282,50 @@ func _init() -> void:
 	# (The turn a step a tick to the read position; the stretch at its own speed, done in 2 ticks.)
 	check(absf(ps[0] - (-PI / 2.0 + 3.0 * 0.014 * TAU)) < 1e-3 and absf(ps[1] - 1.1) < 1e-3, "a position read mid-way is reached straight (%.3f, %.3f at 3 of 6 ticks)" % [ps[0], ps[1]])
 
+	_live_ir()
 	_arms_layer()
 	_held_at_grip()
 	_burner_fx()
 	_sprite_arms()
 	print("inserter_events_test: %s (%d failure(s))" % ["PASS" if failures == 0 else "FAIL", failures])
 	quit(1 if failures > 0 else 0)
+
+
+## rel-031-arms: the focus's `ir` from the view (--live-inserter-radius=view): the visible ground's farthest
+## corner by square distance from the focus, +8, up to a step of 8, within 16..64; no camera or ground: none;
+## a larger one sent at once, a smaller only after it stayed smaller about 1 s (live_ir_settle).
+func _live_ir() -> void:
+	check(VP.live_ir_for_rect(Vector2.ZERO, Rect2(-5, -5, 10, 10)) == 16, "live ir: a small view is the floor, 16")
+	check(VP.live_ir_for_rect(Vector2(100, 100), Rect2(70, 60, 50, 50)) == 48, "live ir: farthest corner 40 tiles (square) + 8 = 48")
+	check(VP.live_ir_for_rect(Vector2.ZERO, Rect2(-30.5, -10, 40, 20)) == 40, "live ir: 30.5 + 8 rounds up to 40")
+	check(VP.live_ir_for_rect(Vector2.ZERO, Rect2(-500, -500, 1000, 1000)) == 64, "live ir: a huge view (zoomed out, first person) is cut to 64")
+	check(VP.live_ir_for_rect(Vector2.ZERO, Rect2(-60, -60, 120, 120)) == 64, "live ir: 60 + 8 = 72 is cut to 64 (0.3.1's old square)")
+	check(VP.live_ir_for_rect(Vector2.ZERO, Rect2()) == -1 and VP.live_ir(null, Vector2.ZERO) == -1, "live ir: no ground or no camera sends none (-1)")
+	# Hysteresis, stepped as world._update_focus does (every 0.25 s).
+	var st: Array = VP.live_ir_settle(-1, 48, 0.0, 0.25)
+	check(int(st[0]) == 48, "live ir: the first goes at once")
+	st = VP.live_ir_settle(48, 64, 0.0, 0.25)
+	check(int(st[0]) == 64 and float(st[1]) == 0.0, "live ir: a larger one goes at once")
+	# A brief dip (0.5 s smaller, then back up): never sent.
+	var sent := 64
+	var low := 0.0
+	var dip_sent := []
+	for want in [56, 56, 64, 64, 56, 56, 56, 64]:
+		st = VP.live_ir_settle(sent, want, low, 0.25)
+		sent = int(st[0])
+		low = float(st[1])
+		dip_sent.append(sent)
+	check(dip_sent == [64, 64, 64, 64, 64, 64, 64, 64], "live ir: brief dips (under 1 s) are not sent (%s)" % [dip_sent])
+	# Staying smaller: sent on the 4th quarter second (1 s), the newest value.
+	var shrink_sent := []
+	for want in [48, 48, 40, 40, 40]:
+		st = VP.live_ir_settle(sent, want, low, 0.25)
+		sent = int(st[0])
+		low = float(st[1])
+		shrink_sent.append(sent)
+	check(shrink_sent == [64, 64, 64, 40, 40] and low == 0.0, "live ir: a smaller one held 1 s is sent then, not before (%s)" % [shrink_sent])
+	st = VP.live_ir_settle(40, -1, 0.5, 0.25)
+	check(int(st[0]) == -1, "live ir: losing the camera (none) goes at once")
 
 
 ## The arms layer fed `ie` messages: a basic inserter (chest to chest, holds 10/4), each event in three
@@ -453,6 +492,7 @@ func _held_at_grip() -> void:
 		for t in range(100, 170):
 			belts.t = float(t)
 			arms._process(1.0 / 60.0)
+			arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
 			var mmi: MultiMeshInstance3D = arms._cards._kinds.get(5)
 			var n: int = mmi.multimesh.visible_instance_count if mmi != null else 0
 			if t < 110:
@@ -519,12 +559,15 @@ func _rest_arms(rig: Dictionary) -> void:
 		world.entities[u] = rec
 		cv.entities[u] = rec
 	Arms.rest_arms = true
+	Arms.rest_box_fallback = false
 	var arms := Arms.new()
 	arms.protos = protos
 	arms.world = world
 	var ends := {"x": {"ip": [0, -1], "id": [0, 1.2], "rs": 0.014, "es": 0.035}}
 	arms.eprops = {1: ends, 2: ends}
 	arms._rigs["test-inserter"] = rig
+	arms._parts_packs = ModelLibrary.ModelPacks.version
+	arms._model_parts["test-arm"] = null
 	var belts := StubBelts.new()
 	belts.t = 100.0
 	arms.belts = belts
@@ -533,28 +576,73 @@ func _rest_arms(rig: Dictionary) -> void:
 		"l": [Swing.Ev.SYNC, 77, 100, 0, 0, 0, roundi(at_pick.x), roundi(at_pick.y), 0]})
 	for f in 3:
 		arms._process(1.0 / 60.0)
-	# The hand boxes (every third instance) over the pickups: 78 faces east, its pickup a tile east; 79 north.
+		arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
+	# Default 3D mode: 78 (no rig) falls back to box arm at east pickup (13.5, 20.5); 79 (rig) draws a 3D rig resting arm.
 	var hands := []
 	for k in arms.rest_count:
 		var o := (k * 3 + 2) * 16
 		hands.append(Vector2(arms.rest_buffer[o + 3], arms.rest_buffer[o + 11]))
-	var want := [Vector2(13.5, 20.5), Vector2(14.5, 19.5)]
-	var at_pickups: bool = hands.size() == 2 and (hands[0] as Vector2).distance_to(want[0]) < 0.01 and (hands[1] as Vector2).distance_to(want[1]) < 0.01
-	check(arms.rest_count == 2 and at_pickups and arms._rest_mmi.visible and arms._rest_mmi.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_OFF,
-		"K12: inserters without a live arm draw one at rest, hands at their pickups (%d resting, hands %s), the live one none" % [arms.rest_count, hands])
+	var want_box := Vector2(13.5, 20.5)
+	var at_pickups: bool = hands.size() == 1 and (hands[0] as Vector2).distance_to(want_box) < 0.01
+	check(arms.rest_count == 1 and arms.rest_rig_count == 1 and arms.rest_3d_count == 1 and at_pickups
+		and arms._rest_mmi.visible and arms._rest_mmi.cast_shadow == GeometryInstance3D.SHADOW_CASTING_SETTING_OFF,
+		"K12: default 3D resting arms draw rig meshes (%d rig) and box fallback for non-rigged (%d box, hands %s)" % [arms.rest_rig_count, arms.rest_count, hands])
 	arms.handle_events({"t": "ie", "k": 110, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [Swing.Ev.GONE, 77, 110, 0, 0, 0, 0, 0, 0]})
 	arms._process(1.0 / 60.0)
-	check(arms.rest_count == 3, "K12: a live arm that goes leaves its inserter resting at once, in the same frame (%d resting)" % arms.rest_count)
+	arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
+	check(arms.rest_count == 2 and arms.rest_rig_count == 1,
+		"K12: a live arm that goes leaves its inserter resting at once, in the same frame (%d box, %d rig)" % [arms.rest_count, arms.rest_rig_count])
+	# rel-031-arms: the live radius follows the view (focus `ir`, --live-inserter-radius), so zooming out and in
+	# hands an arm over live -> resting -> live again and again (the bridge's square shrinking says GONE, growing
+	# says SYNC). Each way in one frame: never both a live and a resting arm, never neither, the rig kept.
+	var handover_ok := true
+	var handover_log := []
+	for cycle in 3:
+		var k_grow := 120 + cycle * 20
+		belts.t = float(k_grow)
+		arms.handle_events({"t": "ie", "k": k_grow, "n": 6, "p": 2, "part": 1, "parts": 1,
+			"l": [Swing.Ev.SYNC, 77, k_grow, 0, 0, 0, roundi(at_pick.x), roundi(at_pick.y), 0]})
+		arms._process(1.0 / 60.0)
+		arms.sync_arms()
+		var grown := [arms.count(), arms.rest_count, arms.rest_rig_count]
+		var k_shrink := k_grow + 10
+		belts.t = float(k_shrink)
+		arms.handle_events({"t": "ie", "k": k_shrink, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [Swing.Ev.GONE, 77, k_shrink, 0, 0, 0, 0, 0, 0]})
+		arms._process(1.0 / 60.0)
+		arms.sync_arms()
+		var shrunk := [arms.count(), arms.rest_count, arms.rest_rig_count]
+		handover_log.append([grown, shrunk])
+		# Grown: 77 live (1 arm), 78 resting box, 79 resting rig. Shrunk: no live arm, 77 and 78 boxes, 79 rig.
+		if grown != [1, 1, 1] or shrunk != [0, 2, 1]:
+			handover_ok = false
+	check(handover_ok, "rel-031-arms: the live radius growing and shrinking hands arms live <-> resting in one frame, none lost or doubled ([live, box, rig] grown/shrunk: %s)" % [handover_log])
+	belts.t = 100.0
 	# A chunk changing (built, mined): its arms worked out again, not every frame.
 	cv.entities.erase(78)
 	world.entities.erase(78)
 	world.entities_changed.emit(Vector2i(0, 0))
 	arms._process(1.0)
-	check(arms.rest_count == 2, "K12: a chunk's change works its resting arms out again (%d resting)" % arms.rest_count)
+	arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
+	check(arms.rest_count == 1 and arms.rest_rig_count == 1,
+		"K12: a chunk's change works its resting arms out again (%d box, %d rig)" % [arms.rest_count, arms.rest_rig_count])
+	# Box fallback mode (--inserter-rest-arms=box): rigged inserter 79 also uses box arms (77 + 79 at their north pickups).
+	Arms.rest_box_fallback = true
+	arms._process(1.0 / 60.0)
+	arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
+	var box_hands := []
+	for k in arms.rest_count:
+		var o := (k * 3 + 2) * 16
+		box_hands.append(Vector2(arms.rest_buffer[o + 3], arms.rest_buffer[o + 11]))
+	var want_both := [Vector2(10.5, 19.5), Vector2(14.5, 19.5)]
+	var both_ok: bool = box_hands.size() == 2 and (box_hands[0] as Vector2).distance_to(want_both[0]) < 0.01 and (box_hands[1] as Vector2).distance_to(want_both[1]) < 0.01
+	check(arms.rest_count == 2 and arms.rest_3d_count == 0 and both_ok,
+		"K12: --inserter-rest-arms=box draws box fallback for rigged inserters too (%d box, %d 3d, hands %s)" % [arms.rest_count, arms.rest_3d_count, box_hands])
 	Arms.rest_arms = false
 	arms._process(1.0 / 60.0)
-	check(not arms._rest_mmi.visible, "K12: --inserter-rest-arms=off draws none")
+	arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
+	check(not arms._rest_mmi.visible and arms.rest_3d_count == 0, "K12: --inserter-rest-arms=off draws none")
 	Arms.rest_arms = true
+	Arms.rest_box_fallback = false
 	for c in arms._cards.get_children():
 		c.free()
 	arms._cards.free()
@@ -624,6 +712,8 @@ func _burner_glow(rig: Dictionary) -> void:
 	var belts := StubBelts.new()
 	arms.belts = belts
 	arms._rigs["test-inserter"] = rig
+	arms._parts_packs = ModelLibrary.ModelPacks.version
+	arms._model_parts["test-arm"] = null
 	var at_pick: Vector2 = (rec.pos + Swing.hand_pos(-PI / 2.0, 1.0)) * 256.0
 	var at_drop: Vector2 = (rec.pos + Swing.hand_pos(PI / 2.0, 1.2)) * 256.0
 	arms.handle_events({"t": "ie", "k": 100, "n": 6, "p": 2, "part": 1, "parts": 1,
@@ -640,6 +730,7 @@ func _burner_glow(rig: Dictionary) -> void:
 	for t in range(100, 330):
 		belts.t = float(t)
 		arms._process(1.0 / 60.0)
+		arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
 		var lit: bool = anim.arm_working.has(77)
 		var arm = arms._arms[77]
 		var home := Swing.hand_pos(arm.angle, arm.reach).distance_to(Swing.hand_pos(-PI / 2.0, 1.0)) < 0.01
@@ -660,10 +751,12 @@ func _burner_glow(rig: Dictionary) -> void:
 	for t in range(330, 352):
 		belts.t = float(t)
 		arms._process(1.0 / 60.0)
+		arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
 	var lit_again: bool = anim.arm_working.has(77) and glowing.call()
 	arms.handle_events({"t": "ie", "k": 352, "n": 6, "p": 2, "part": 1, "parts": 1, "l": [Swing.Ev.GONE, 77, 352, 0, 0, 0, 0, 0, 0]})
 	belts.t = 352.0
 	arms._process(1.0 / 60.0)
+	arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
 	check(lit_again and not anim.arm_working.has(77) and not glowing.call(),
 		"L4: lit again when it swings, dark the frame its live arm goes")
 	# --inserter-glow=always: inserters' glows follow nothing, lit all along (as before).
@@ -887,6 +980,7 @@ func _sprite_arms() -> void:
 		for t in range(100, 170):
 			belts.t = float(t)
 			arms._process(1.0 / 60.0)
+			arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
 			var arm = arms._arms[77]
 			seen.append([arm.angle, arm.reach, arm.item_id])
 			for mmi: MultiMeshInstance3D in arms._parts:
@@ -964,6 +1058,7 @@ func _sprite_arms() -> void:
 	for i in 600:
 		ModelLibrary.poll()
 		arms._process(1.0 / 60.0)
+		arms.sync_arms()  # (--native-inserter-loop: the arms' state copied back to read)
 		drawn = 0
 		for mmi: MultiMeshInstance3D in arms._parts:
 			drawn += mmi.multimesh.visible_instance_count

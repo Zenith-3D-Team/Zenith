@@ -18,6 +18,8 @@
 -- bridge's commands (on_tick) and changes the game only as the player's own action would, so it
 -- stays deterministic in multiplayer.
 
+local tracker = require("scripts.tracker")
+
 local M = {}
 
 local function get(obj, key)
@@ -85,15 +87,27 @@ function M.build(c, item, quality, position, direction, mirror, surface, held)
     return nil
   end
   local before = cursor.count
+  local surf = surface or p.surface
+  local item_proto = prototypes.item[item]
+  local place_proto = item_proto and get(item_proto, "place_result")
+  local build_dir = direction
   -- can_build_from_cursor has no `mirror` (2.1.24); a flipped entity covers the same tiles.
-  local okc, can = pcall(p.can_build_from_cursor, { position = position, direction = direction })
-  local spec = { position = position, direction = direction }
+  local okc, can = pcall(p.can_build_from_cursor, { position = position, direction = build_dir })
+  local spec = { position = position, direction = build_dir }
   if mirror then
     spec.mirror = true
   end
   local built = false
   if okc and can then
-    pcall(p.build_from_cursor, spec)
+    local w, h = place_proto and place_proto.tile_width or 1, place_proto and place_proto.tile_height or 1
+    if build_dir == defines.direction.east or build_dir == defines.direction.west then
+      w, h = h, w
+    end
+    local hx, hy = math.max(w / 2 - 0.05, 0.05), math.max(h / 2 - 0.05, 0.05)
+    local area = { { position.x - hx, position.y - hy }, { position.x + hx, position.y + hy } }
+    tracker.deconstructing(surf, area, c.force, function()
+      pcall(p.build_from_cursor, spec)
+    end)
     built = not cursor.valid_for_read or cursor.count < before
   end
   -- What's left goes back into the inventory (Factorio puts it in the slot it came from).

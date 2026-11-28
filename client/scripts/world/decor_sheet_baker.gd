@@ -37,6 +37,7 @@ class PostJob:
 	var bgra := false
 	var gpu_dilated := false
 	var compress := false
+	var native_compressor: Object = null
 	var upload_on_worker := true
 	var empty := false
 	var image: Image
@@ -60,6 +61,7 @@ var _active_chunk := Vector2i.ZERO
 var _active_gen := 0
 var _active_size := 0
 var _active_compress := false
+var _active_native_compressor: Object = null
 var _active_upload := true
 var _active_swapped_rb := false
 const PROBE_NONE := -1
@@ -98,7 +100,7 @@ func has_pending(c: Vector2i) -> bool:
 	return false
 
 
-func start_bake(c: Vector2i, gen: int, size: int, sources: Array, compress: bool, upload_on_worker: bool) -> bool:
+func start_bake(c: Vector2i, gen: int, size: int, sources: Array, compress: bool, upload_on_worker: bool, native_compressor: Object = null) -> bool:
 	if _state != STATE_IDLE or not gpu_available() or not is_inside_tree():
 		return false
 	_ensure_viewports(size)
@@ -131,6 +133,7 @@ func start_bake(c: Vector2i, gen: int, size: int, sources: Array, compress: bool
 	_active_gen = gen
 	_active_size = size
 	_active_compress = compress
+	_active_native_compressor = native_compressor
 	_active_upload = upload_on_worker
 	_token += 1
 	_idle_sec = 0.0
@@ -193,6 +196,7 @@ func step(delta: float, on_finished: Callable) -> void:
 					job.bgra = bgra
 					job.gpu_dilated = true
 					job.compress = _active_compress
+					job.native_compressor = _active_native_compressor
 					job.upload_on_worker = _active_upload
 					var tid := WorkerThreadPool.add_task(post_process.bind(job), false, "decor_sheet")
 					_post_jobs.append([tid, job])
@@ -259,9 +263,21 @@ static func post_process(job: PostJob) -> void:
 		return
 	if not job.gpu_dilated:
 		img.fix_alpha_edges()
-	img.generate_mipmaps()
 	if job.compress:
-		img.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_GENERIC)
+		if job.native_compressor != null:
+			var comp_img: Image = job.native_compressor.call(&"compress_image", img, true, true) as Image
+			if comp_img != null and not comp_img.is_empty():
+				img = comp_img
+			else:
+				img.generate_mipmaps()
+				if OS.has_feature("editor"):
+					img.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_GENERIC)
+		else:
+			img.generate_mipmaps()
+			if OS.has_feature("editor"):
+				img.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_GENERIC)
+	else:
+		img.generate_mipmaps()
 	if job.upload_on_worker:
 		job.texture = ImageTexture.create_from_image(img)
 	else:

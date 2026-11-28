@@ -1021,7 +1021,8 @@ static func progress_bar(color: Color = BAR_GREEN) -> ProgressBar:
 
 ## A Factorio tooltip: the light title bar, then lines of text, each optionally led by an item
 ## icon and coloured (lines are [text], [text, item] or [text, item or "", Color]; [text, "", null,
-## "keys"] is a control hint, "Middle-click| to clear shortcut." with the keys before | in bold blue).
+## "keys"] is a control hint, "Middle-click| to clear shortcut." with the keys before | in bold blue;
+## [text, icons_array, color, "icons"] shows text followed by 24x24 icons).
 ## The popup around it draws the tooltip frame (theme: TooltipPanel).
 static func tooltip(title: String, lines: Array) -> Control:
 	var box := VBoxContainer.new()
@@ -1035,6 +1036,44 @@ static func tooltip(title: String, lines: Array) -> Control:
 	for line in lines:
 		var row := HBoxContainer.new()
 		row.add_theme_constant_override("separation", px(4))
+		var text := str(line[0]) if line is Array else str(line)
+		var color: Variant = line[2] if line is Array and line.size() > 2 and line[2] is Color else null
+		if line is Array and line.size() > 3 and str(line[3]) == "icons":
+			for l in key_value_labels(text, color):
+				row.add_child(l)
+			var icons: Array = line[1] if line[1] is Array else []
+			var icon_box: Container
+			if icons.size() <= 8:
+				var hb := HBoxContainer.new()
+				hb.add_theme_constant_override("separation", px(2))
+				icon_box = hb
+			else:
+				var gc := GridContainer.new()
+				gc.columns = 8
+				gc.add_theme_constant_override("h_separation", px(2))
+				gc.add_theme_constant_override("v_separation", px(2))
+				icon_box = gc
+			for entry in icons:
+				var mname := str(entry)
+				if mname == "":
+					continue
+				var tex: Texture2D = ItemIcons.texture_for(mname)
+				if tex == null:
+					tex = ItemIcons.texture_for_kind("entity", mname)
+				if tex == null:
+					tex = GuiAssets.core_sprite("icons/entity/%s.png" % mname)
+				if tex == null:
+					tex = item_icon(mname)
+				var icon := TextureRect.new()
+				icon.texture = tex
+				icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+				icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+				icon.custom_minimum_size = pxv(24, 24)
+				icon.texture_filter = ICON_FILTER
+				icon_box.add_child(icon)
+			row.add_child(icon_box)
+			box.add_child(row)
+			continue
 		if line is Array and line.size() > 1 and str(line[1]) != "":
 			var icon := TextureRect.new()
 			icon.texture = item_icon(str(line[1]))
@@ -1043,8 +1082,6 @@ static func tooltip(title: String, lines: Array) -> Control:
 			icon.custom_minimum_size = pxv(24, 24)
 			icon.texture_filter = ICON_FILTER
 			row.add_child(icon)
-		var text := str(line[0]) if line is Array else str(line)
-		var color: Variant = line[2] if line is Array and line.size() > 2 and line[2] is Color else null
 		if line is Array and line.size() > 3 and str(line[3]) == "keys":
 			# A control hint: "Middle-click| to clear shortcut." with the part before | in bold blue.
 			var parts := text.split("|", true, 1)
@@ -1136,11 +1173,27 @@ static func icon_into(rect: TextureRect, name: String) -> void:
 		return
 	rect.texture = null
 	_icon_waiting.append([weakref(rect), name])
+	icon_request(name)
+
+
+## Whether item_icon(name) answers from the caches; if not, its icon read on a worker thread (once; poll_icons()
+## puts it in the caches a frame or a few later). Alt-mode's icons ask with it (--alt-icons-later).
+static func icon_request(name: String) -> bool:
+	if ItemIcons.any_ready(name):
+		return true
 	if not _icon_jobs.has(name):
-		ItemIcons.prepare_for_threads()
-		var holder := [null]
-		var read := func() -> void: holder[0] = ItemIcons.load_any_uncached(name)
-		_icon_jobs[name] = [WorkerThreadPool.add_task(read, false, "ui icon"), holder]
+		_icon_job_start(name)
+	return false
+
+
+## A worker reading `name`'s icon: [task, holder, ModGraphics.generation, ModelPacks.icons_version] (the caches'
+## stamps it read under: a result read before they moved is dropped and read again, poll_icons).
+static func _icon_job_start(name: String) -> void:
+	ItemIcons.prepare_for_threads()
+	var holder := [null]
+	var read := func() -> void: holder[0] = ItemIcons.load_any_uncached(name)
+	_icon_jobs[name] = [WorkerThreadPool.add_task(read, false, "ui icon"), holder, ItemIcons.ModGraphics.generation,
+		ItemIcons.ModelPacks.icons_version]
 
 
 ## Gives icon_into()'s waiting icons the ones read since; called every frame by whoever uses it (cheap
@@ -1154,8 +1207,11 @@ static func poll_icons() -> void:
 			continue
 		WorkerThreadPool.wait_for_task_completion(job[0])
 		_icon_jobs.erase(name)
-		if job[1][0] is Array:
-			ItemIcons.store_any(name, job[1][0])
+		if int(job[2]) != ItemIcons.ModGraphics.generation or int(job[3]) != ItemIcons.ModelPacks.icons_version:
+			_icon_job_start(name)  # read under other graphics or packs: stale, read again
+			continue
+		# (A read that gave nothing usable is stored as nothing found, so its waiting rects get the swatch.)
+		ItemIcons.store_any(name, job[1][0] if job[1][0] is Array else [null, {}])
 	var still: Array = []
 	for w: Array in _icon_waiting:
 		var rect = w[0].get_ref()

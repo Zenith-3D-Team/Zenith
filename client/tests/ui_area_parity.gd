@@ -200,8 +200,6 @@ func _planners(hud: Hud, player: Node) -> void:
 	var changed: int = bk.apply_upgrade(planner)
 	check(changed > 0 and BpString.components(BpString.pages(bk.record)[0][1]).any(func(c): return c[0] == "fast-transport-belt"),
 		"the book's upgrade button maps every page's entities (%d)" % changed)
-	ui.close_all()
-	sent()
 	# The blueprint window's header: Factorio's six buttons; select new contents, upgrade.
 	pl.edit(decoded, {"kind": "slot", "slot": 1})
 	await get_tree().process_frame
@@ -241,10 +239,17 @@ func _planners(hud: Hud, player: Node) -> void:
 		"Trees/rocks only, the Whitelist / Blacklist switch and the Tiles tab")
 	pw.set_filter("entity_filters", 0, "wooden-chest")
 	pw.set_filter("entity_filters", 3, "iron-chest")
+	# Factorio's filters are entity and tile prototypes, not items: the choosers list those (an item like iron-plate has no entity).
+	pw._filter_clicked("entity_filters", 5, MOUSE_BUTTON_LEFT)
+	var entity_kinds: Array = pw.picker._kinds.duplicate()
+	pw.picker.close()
 	_find_button(pw, "Blacklist").pressed.emit()
 	await get_tree().process_frame
 	(pw.find_child("Tab_tiles", true, false) as Button).pressed.emit()
 	check(pw.find_child("TileFilters", true, false) != null and pw.find_child("EntityFilters", true, false) == null, "the Tiles tab: tile filters")
+	pw._filter_clicked("tile_filters", 5, MOUSE_BUTTON_LEFT)
+	check(entity_kinds == ["map_entity"] and pw.picker._kinds == ["tile"], "the filter choosers list entities and tiles, not items: %s, %s" % [entity_kinds, pw.picker._kinds])
+	pw.picker.close()
 	(pw.find_child("TileSelectionMode", true, false) as OptionButton).item_selected.emit(3)
 	check(sent_one("bp_set").is_empty(), "nothing is written while the window is open")
 	pw.close()
@@ -282,11 +287,17 @@ func _planners(hud: Hud, player: Node) -> void:
 		[1, "wooden-chest", "container", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
 		[2, "tree-01", "tree", -0.4, -0.4, 0.4, 0.4, 40, 110, 40, 1, 1],
 		[3, "transport-belt", "transport-belt", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
+		[4, "assembling-machine-1", "assembling-machine", -1.5, -1.5, 1.5, 1.5, 200, 200, 200, 3, 3],
+		[5, "small-electric-pole", "electric-pole", -0.5, -0.5, 0.5, 0.5, 150, 100, 50, 1, 1],
+		[6, "big-electric-pole", "electric-pole", -1.0, -1.0, 1.0, 1.0, 150, 100, 50, 2, 2],
 	])
 	world.chunks[Vector2i.ZERO] = ChunkView.new()
 	world._add([70, 1, 2 * 256 + 128, 2 * 256 + 128, 0])
 	world._add([0, 2, 3 * 256 + 128, 2 * 256 + 128, 0])
 	world._add([71, 3, 4 * 256 + 128, 2 * 256 + 128, 0, {"d": 1}])
+	world._add([72, 4, 8 * 256 + 128, 2 * 256 + 128, 0])
+	world._add([73, 5, 3 * 256 + 128, 8 * 256 + 128, 0])
+	world._add([74, 6, 25 * 256 + 128, 8 * 256 + 128, 0])
 	var input := PlayerInput.new()
 	input.world = world
 	input.hud = hud
@@ -310,6 +321,25 @@ func _planners(hud: Hud, player: Node) -> void:
 	check(input.selected_by("upgrade", area, false).map(func(e): return e.proto_id) == [3], "an upgrade planner: what it maps")
 	check(input.selected_by("blueprint", area, false).map(func(e): return e.proto_id).has(1)
 		and not input.selected_by("blueprint", area, false).map(func(e): return e.proto_id).has(2), "a blueprint selection: buildings, not trees")
+	# What the game takes (live-checked: tools/live_check.py --only plannerdiff): the selection box overlapping the area, a 3x3
+	# machine whose middle is outside it, and a click on a point. (An upgrade planner with no mappings upgrades everything with a
+	# next tier in the game, so it keeps highlighting everything.)
+	pl.held_record = {"deconstruction_planner": {"settings": {}}}
+	check(input.selected_by("decon", Rect2(6.5, 1, 1, 3), false).map(func(e): return e.proto_id) == [4]
+		and input.selected_by("decon", Rect2(8.4, 2.4, 0, 0), false).map(func(e): return e.proto_id) == [4]
+		and input.selected_by("decon", Rect2(6.0, 1, 0.5, 3), false).is_empty(),
+		"a planner's box takes what it overlaps, not only what has its middle inside: a 3x3 machine at its edge, a click on a point")
+	# A held pole's wires go to the poles within the shorter of the two reaches: a big pole (30) held 8.5 tiles from a small
+	# one (7.5) wires only the big pole at 13.5, not the small one.
+	var eprops_was: Dictionary = m.eprops.duplicate()
+	m.eprops[5] = {"under": 0.0, "wire": 7.5, "supply": 2.5, "x": {}}
+	m.eprops[6] = {"under": 0.0, "wire": 30.0, "supply": 2.0, "x": {}}
+	input._update_reach(world.protos.entity(6), Vector2(11.5, 8.5))
+	var big_lines: int = (input._reach_mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+	input._update_reach(world.protos.entity(5), Vector2(8.5, 8.5))
+	var small_lines: int = (input._reach_mesh.surface_get_arrays(0)[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+	check(big_lines == 2 and small_lines == 2, "a pole's build preview wires only to poles within both reaches (vertices: big pole %d, small pole %d)" % [big_lines, small_lines])
+	m.eprops = eprops_was
 	input.hold("wooden-chest")
 	input.cycle_quality(1)
 	check(input.cursor_quality == "uncommon", "Ctrl+wheel: the next quality the force has")
@@ -396,6 +426,71 @@ func _planners(hud: Hud, player: Node) -> void:
 	pl.edit(BpString.empty("deconstruction_planner"), {"kind": "slot", "slot": 2})
 	(pw.find_child("DeleteButton", true, false) as Button).pressed.emit()
 	check(sent_one("bp_del").get("i") == 2 and not pw.is_open(), "the planner's delete button destroys it (bp_del) and closes the window")
+
+	# --- Other #2: Saving Ctrl+C clipboard as blueprint into inventory, library, and books ----------
+	player.cursor_item = ""
+	player.cursor_slot = 0
+	player.cursor_tool = "paste"
+	check(pl.cursor_slot() == -2, "Other #2: PlannerUi.cursor_slot() returns -2 when cursor_tool == 'paste'")
+	player.cursor_tool = "blueprint"
+	check(pl.cursor_slot() == 0, "Other #2: PlannerUi.cursor_slot() returns 0 for non-paste tools")
+	# Clicking an empty main inventory slot while holding clipboard saves clipboard to that slot (bp_get i=-2, to=slot).
+	player.cursor_tool = "paste"
+	ui.hand = {}
+	sent()
+	ui.window.open_crafting(true)
+	click_main(ui, 12, MOUSE_BUTTON_LEFT)
+	var clip_save := sent_one("bp_get")
+	check(int(clip_save.get("i", 0)) == -2 and int(clip_save.get("to", -99)) == 12 and player.cursor_tool == "",
+		"Other #2: clicking empty main slot 12 with clipboard sends bp_get(i=-2, to=12) and clears cursor_tool: %s" % [clip_save])
+	# Direct save_clipboard(0) requests first empty slot.
+	player.cursor_tool = "paste"
+	sent()
+	var saved_ok: bool = pl.save_clipboard(0)
+	var clip_save0 := sent_one("bp_get")
+	check(saved_ok and int(clip_save0.get("i", 0)) == -2 and int(clip_save0.get("to", -99)) == 0 and player.cursor_tool == "",
+		"Other #2: save_clipboard(0) sends bp_get(i=-2, to=0) and drops cursor_tool: %s" % [clip_save0])
+	# Adding clipboard into blueprint library via add_held([]).
+	var lib_before: int = lib.records.size()
+	player.cursor_tool = "paste"
+	sent()
+	pl.add_held([])
+	var clip_lib_get := sent_one("bp_get")
+	check(int(clip_lib_get.get("i", 0)) == -2 and not clip_lib_get.has("to"),
+		"Other #2: add_held([]) with clipboard exports slot -2: %s" % [clip_lib_get])
+	m.handle({"t": "bp", "q": int(clip_lib_get.get("q", 0)), "part": 1, "parts": 1, "s": FACTORIO_STRING, "item": "blueprint", "i": -2})
+	check(lib.records.size() == lib_before + 1 and player.cursor_tool == "",
+		"Other #2: clipboard exported into library adds blueprint (%d -> %d) and clears cursor_tool" % [lib_before, lib.records.size()])
+	# Adding clipboard as a page into an open blueprint book via _add_held_page().
+	var clip_book: Dictionary = m.planners.empty("blueprint_book")
+	pl.edit(clip_book, {"kind": "slot", "slot": 4})
+	await get_tree().process_frame
+	player.cursor_tool = "paste"
+	sent()
+	pl._add_held_page()
+	var clip_page_get := sent_one("bp_get")
+	check(int(clip_page_get.get("i", 0)) == -2, "Other #2: _add_held_page() with clipboard exports slot -2: %s" % [clip_page_get])
+	m.handle({"t": "bp", "q": int(clip_page_get.get("q", 0)), "part": 1, "parts": 1, "s": FACTORIO_STRING, "item": "blueprint", "i": -2})
+	check(BpString.pages(bk.record).size() == 1 and player.cursor_tool == "",
+		"Other #2: clipboard added as book page (pages=%d) and clears cursor_tool" % BpString.pages(bk.record).size())
+	# Must-fix #3: stale non-empty hand + cursor_item='blueprint' + cursor_tool='paste' still saves clipboard to empty main slot.
+	player.cursor_item = "blueprint"
+	player.cursor_tool = "paste"
+	ui.hand = {"role": "main", "index": 1, "n": 1, "unit": 0}
+	ui._check_hand("blueprint")
+	var hand_cleared: bool = ui.hand.is_empty()
+	ui.hand = {"role": "main", "index": 1, "n": 1, "unit": 0}
+	sent()
+	click_main(ui, 12, MOUSE_BUTTON_LEFT)
+	var clip_stale_save := sent_one("bp_get")
+	var clip_stale_move := sent_one("move")
+	check(hand_cleared and int(clip_stale_save.get("i", 0)) == -2 and int(clip_stale_save.get("to", -99)) == 12
+		and clip_stale_move.is_empty() and player.cursor_tool == "",
+		"Other #2: non-empty hand clears under cursor_tool and empty-slot click saves clipboard instead of move: save=%s move=%s" % [
+			clip_stale_save, clip_stale_move])
+	ui.close_all()
+	sent()
+
 	input.hold("")
 	input.free()
 	world.chunks[Vector2i.ZERO].free()
@@ -438,7 +533,8 @@ func _parity(hud: Hud, player: Node) -> void:
 	check(ControlsInfo.name_of("drop_item") == "Drop item" and ControlsInfo.group_of("quickbar_page_3") == "Quickbar"
 		and ControlsInfo.name_of("give_blueprint") == "Blueprint",
 		"actions carry Factorio's names for the Controls tab")
-	var unnamed: Array = ControlsInfo.ACTIONS.keys().filter(func(a: String) -> bool: return not InputMap.has_action(a))
+	# The add-on author's reload key exists only while --addons is given (Settings.apply_bindings drops it otherwise).
+	var unnamed: Array = ControlsInfo.ACTIONS.keys().filter(func(a: String) -> bool: return not InputMap.has_action(a) and not Controls.ADDON_AUTHOR_ONLY.has(a))
 	check(unnamed.is_empty() and ControlsInfo.group_of("toggle_factoriopedia") == "Panels",
 		"every action the Controls tab names exists (F2 under Panels): %s" % [unnamed])
 
@@ -691,7 +787,7 @@ func _parity(hud: Hud, player: Node) -> void:
 	screen.handle({"t": "gui", "u": 900, "p": 14, "kind": "train", "inv": {}, "tr": {"id": 1, "state": "wait_station", "manual": false,
 		"station": "", "dest": "", "sched": {"current": 1, "records": [{"station": "Iron", "wait_conditions": [{"type": "time", "compare_type": "or", "ticks": 600}]}]}}})
 	await get_tree().process_frame
-	check(_texts(screen).has("Iron") and _texts(screen).has("s passed"), "a train's schedule shows its stops and waits, in Factorio's words")
+	check(_texts(screen).has("Iron") and _texts(screen).has("seconds passed"), "a train's schedule shows its stops and waits, in Factorio's words")
 	var go := screen.find_child("Go1", true, false) as Button
 	if go != null:
 		go.pressed.emit()
@@ -705,7 +801,7 @@ func _parity(hud: Hud, player: Node) -> void:
 			"interrupts": [{"name": "Refuel", "conditions": [{"type": "fuel_item_count_any", "compare_type": "and"}],
 				"targets": [{"station": "Copper", "wait_conditions": []}], "inside_interrupt": false}]}}})
 	await get_tree().process_frame
-	check(_texts(screen).has("Cargo") and _texts(screen).has("s of inactivity") and _find_button(screen, "OR") != null,
+	check(_texts(screen).has("Cargo") and _texts(screen).has("seconds of inactivity") and _find_button(screen, "OR") != null,
 		"wait conditions show their words and the AND/OR button")
 	check(_texts(screen).has("Refuel") and not _texts(screen).has("Fuel (any)"), "interrupts start folded to their name")
 	var fold := screen.find_child("Fold1", true, false) as Button
@@ -742,6 +838,22 @@ func _parity(hud: Hud, player: Node) -> void:
 	var ints: Array = sent_one("set_interrupts").get("interrupts", [])
 	check(ints.size() == 2 and ints[1]["name"] == "Depot", "a new interrupt is added by name")
 	sent()
+	if interrupt_field != null and ints.size() == 2:
+		interrupt_field.text_submitted.emit(str(ints[0]["name"]))
+	check(sent_one("set_interrupts").is_empty(), "an interrupt name already in use is refused (Factorio: Interrupt names must be unique)")
+	# Removing a station before the one the train is heading for keeps it heading for that stop.
+	screen.handle({"t": "gui", "u": 900, "p": 14, "kind": "train", "inv": {}, "tr": {"id": 1, "state": "on_the_path", "manual": 0,
+		"station": "", "dest": "Iron", "speed": 0, "stops": ["Copper", "Iron"], "sched": {"current": 2, "group": "", "records": [
+			{"station": "Copper", "wait_conditions": []}, {"station": "Iron", "wait_conditions": []}], "interrupts": []}}})
+	await get_tree().process_frame
+	sent()
+	var remove_first := screen.find_child("Remove1", true, false) as Button
+	if remove_first != null:
+		remove_first.pressed.emit()
+	var removed := sent()
+	check(removed.size() == 2 and removed[0].get("t") == "set_schedule" and removed[0].get("records", [1, 2]).size() == 1
+		and removed[1].get("t") == "train_go" and removed[1].get("i") == 1,
+		"removing a station before the current one sends the train to the same stop at its new place: %s" % [removed])
 	ui.trains_window.open(true)  # the side menu's Trains button
 	check(sent_one("trains_list").get("t") == "trains_list" and ui.trains_window.is_open(),
 		"the train overview opens and asks for the trains at once (it showed none for 3 s)")
@@ -751,6 +863,10 @@ func _parity(hud: Hud, player: Node) -> void:
 	var row2: Node = ui.trains_window.find_child("Train2", true, false)
 	check(ui.trains_window.find_child("Train1", true, false) != null and row2 != null and _texts(ui.trains_window).has("Waiting at Iron"),
 		"the overview lists every train with its state")
+	var texts := [ui.trains_window.state_text({"state": "manual_control", "stop": ""}), ui.trains_window.state_text({"state": "manual_control_stop", "stop": ""}),
+		ui.trains_window.state_text({"state": "no_path", "stop": "Iron"}), ui.trains_window.state_text({"state": "destination_full", "stop": "Iron"})]
+	check(texts == ["Manually driving", "Manually stopped", "No path to Iron", "Destination full Iron"],
+		"the card's state in Factorio's words (gui-train-state): %s" % [texts])
 	var view: Node = row2.find_child("View", true, false) if row2 != null else null
 	check(view != null and view.unit == 710 and _find_button(row2, "Manual") == null and _find_button(row2, "Automatic") == null,
 		"a card shows a live view of the train from above (its locomotive), and no automatic / manual switch (Factorio's has none)")
@@ -808,6 +924,24 @@ func _parity(hud: Hud, player: Node) -> void:
 	var all_card := tw.find_child("Train1", true, false) as Control
 	check(found_all and tw.filter == "All" and all_card != null and tw.find_child("Train2", true, false) == null
 		and all_card.tooltip_text.contains("Water"), "a stop called All filters to its trains; a train's fluid is in its tooltip")
+	# The Stations tab follows the search too: a train-less station that doesn't match is gone.
+	var stops_player := Node.new()  # stands in for the player: stop_names() reads world.entities' names
+	var stops_script := GDScript.new()
+	stops_script.source_code = "extends Node\nvar world := {\"entities\": {1: {\"extra\": {\"n\": \"Idle stop\"}}}}\n"
+	stops_script.reload()
+	stops_player.set_script(stops_script)
+	var old_player = ui.player
+	ui.player = stops_player
+	tw.search = "nomatch"
+	var found_none: Array = tw._entries_for("Stations", tw._trains())
+	tw.search = "iro"
+	var found_iron: Array = tw._entries_for("Stations", tw._trains())
+	tw.search = ""
+	ui.player = old_player
+	stops_player.free()
+	check(found_none.is_empty() and found_iron.any(func(e: Array) -> bool: return e[0] == "Iron")
+		and not found_iron.any(func(e: Array) -> bool: return e[0] == "Idle stop"),
+		"the Stations tab's list follows the search box: %s / %s" % [found_none, found_iron])
 	var ctrl_f := InputEventKey.new()
 	ctrl_f.keycode = KEY_F
 	ctrl_f.ctrl_pressed = true
@@ -1052,10 +1186,29 @@ func _gear(hud: Hud, player: Node) -> void:
 	check(toggles.size() == 2 and toggles[0].get("what") == "roboport" and toggles[0].get("on") == 0
 		and toggles[1].get("what") == "movement" and toggles[1].get("on") == 0, "Alt+F and Alt+E switch the roboport and exoskeletons off")
 	ui._process(0.0)
+	ui.shortcuts.update_unlocks({"personal-roboport-equipment": {"state": 2}, "exoskeleton-equipment": {"state": 2}})
 	check(ui.shortcuts._buttons["roboport"].visible and ui.shortcuts._buttons["roboport"].button_pressed
 		and ui.shortcuts._buttons["exoskeleton"].visible, "the shortcut bar has both switches while the armour has the equipment")
 	ui._on_shortcut("exoskeleton")
 	check(sent_one("eq_toggle").get("what") == "movement", "the exoskeleton shortcut switches it")
+	# The artillery and discharge remotes: the shortcut puts the remote in the cursor, a click uses it (the mod's capsule).
+	ui._on_shortcut("artillery")
+	check(player.cursor_tool == "artillery", "the artillery remote shortcut holds the remote tool")
+	ui._on_shortcut("discharge")
+	check(player.cursor_tool == "discharge", "the discharge remote shortcut holds the remote tool")
+	player.cursor_tool = ""
+	var pi = load("res://scripts/player/player_input.gd").new()
+	pi.cursor_tool = "artillery"
+	pi.ground = Vector2(12.5, -3.0)
+	pi.has_ground = true
+	pi._lmb_down = true
+	var up := InputEventMouseButton.new()
+	up.button_index = MOUSE_BUTTON_LEFT
+	up.pressed = false
+	pi._input(up)
+	var thrown := sent_one("throw")
+	check(thrown.get("item") == "artillery-targeting-remote" and thrown.get("x") == 3200 and thrown.get("y") == -768, "a click with the remote sends its capsule use at the cursor (throw)")
+	pi.free()
 	var cb := _find_checkbox(ui.window, "Personal roboport")
 	check(cb == null or not cb.is_visible_in_tree(), "the armour window has no switches (Factorio has them on the shortcut bar)")
 	# The Character tab.
@@ -1082,9 +1235,26 @@ func _gear(hud: Hud, player: Node) -> void:
 	hud.damage.flash = 0.0
 	m.handle({"t": "eq", "kind": "char", "u": 77, "w": 2, "h": 2, "sh": 0, "msh": 0, "bat": 10, "mbat": 100, "gen": 0, "mv": 0, "inv": 0,
 		"mvon": 1, "nv": 0, "l": [["battery-equipment", 0, 0, 1, 2, "normal", 10, 100, 0, 0, 0]]})
-	check(hud.energy_bar.visible and hud.energy_bar.value == 10, "batteries that aren't full show their charge")
+	check(not hud.energy_bar.visible and ui.weapons._energy.visible and is_equal_approx(ui.weapons._energy.value, 0.1),
+		"batteries show their charge beside the armour slot, not over the quickbar")
+	m.handle({"t": "eq", "kind": "char", "u": 77, "w": 2, "h": 2, "sh": 0, "msh": 0, "bat": 100, "mbat": 100, "gen": 0, "mv": 0, "inv": 0,
+		"mvon": 1, "nv": 0, "l": [["battery-equipment", 0, 0, 1, 2, "normal", 100, 100, 0, 0, 0]]})
+	check(not hud.energy_bar.visible and ui.weapons._energy.visible and is_equal_approx(ui.weapons._energy.value, 1.0),
+		"full batteries stay shown beside the armour slot and hidden over the quickbar")
 	hud.set_health(200, 250)
+	check(hud.health_bar.visible and hud.health_bar.value == 200 and is_equal_approx(ui.weapons._energy.value, 1.0),
+		"losing health shows the middle health bar without changing the armour power bar")
 	check(hud.damage.flash > 0.9 and hud.damage.low == 0.0 and hud.damage.visible, "losing health flashes the screen's edges")
+	m.handle({"t": "eq", "kind": "char", "u": 77, "w": 0, "h": 0, "l": []})
+	check(not ui.weapons._energy.visible and not hud.energy_bar.visible, "without batteries, the armour power bar hides")
+	Switches.set_test_args(PackedStringArray(["--power-bar=middle"]))
+	m.handle({"t": "eq", "kind": "char", "u": 77, "w": 2, "h": 2, "sh": 0, "msh": 0, "bat": 10, "mbat": 100, "gen": 0, "mv": 0, "inv": 0,
+		"mvon": 1, "nv": 0, "l": [["battery-equipment", 0, 0, 1, 2, "normal", 10, 100, 0, 0, 0]]})
+	hud.set_health(125, 250)
+	check(hud.energy_bar.visible and hud.energy_bar.value == 10 and is_equal_approx(ui.weapons._energy.value, 0.5),
+		"--power-bar=middle restores the middle energy bar and health beside the armour")
+	Switches.reset_cache()
+	m.handle({"t": "eq", "kind": "char", "u": 77, "w": 0, "h": 0, "l": []})
 	hud.set_health(25, 250)
 	check(hud.damage.low > 0.5, "low health tints the screen red")
 	hud.set_health(250, 250)
@@ -1195,6 +1365,21 @@ func _circuit_screens(screen: MachineScreen, ui) -> void:
 		const_out.button_pressed = true
 	cb = sent_one("set_cb").get("cb", {})
 	check(cb.get("outputs", [{}])[0].get("copy_count_from_input") == false, "an output switches from the input count to a constant")
+	# Arithmetic: the first operand is a signal or a constant, as the second.
+	gui.call("combinator", {"cb": {"first_constant": 7, "operation": "+", "second_constant": 2, "output_signal": {"type": "virtual", "name": "signal-A"}}})
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var first_op := screen.find_child("FirstOperand", true, false) as Button
+	check(first_op != null and first_op.text == "7", "an arithmetic combinator's first constant shows on its operand button")
+	if first_op != null:
+		first_op.pressed.emit()
+	await get_tree().process_frame
+	var fbox := ui.picker.find_child("ConstantBox", true, false) as LineEdit
+	if fbox != null:
+		fbox.text = "9"
+		fbox.text_submitted.emit("9")
+	cb = sent_one("set_cb").get("cb", {})
+	check(cb.get("first_constant") == 9 and not cb.has("first_signal"), "the first operand's constant is sent")
 	# Selector: every mode.
 	gui.call("combinator", {"cb": {"operation": "select", "select_max": true, "index_constant": 0}})
 	await get_tree().process_frame
@@ -1807,6 +1992,107 @@ func _space(hud: Hud, player: Node) -> void:
 	sent()
 
 
+## The decider conditions the real game was asked (tools/live/circuit_diff.py, section circdiff, on the combinator's real inputs):
+## the green behind a condition (`condition_holds`, worked out from `gui.sig`) is what the game's combinator did.
+func _decider_live_cases() -> void:
+	var f := FileAccess.open("res://tests/fixtures/decider_live_cases.json", FileAccess.READ)
+	check(f != null, "the recorded decider cases fixture opens")
+	if f == null:
+		return
+	var data = JSON.parse_string(f.get_as_text())
+	var cases: Array = data["cases"] if data is Dictionary else []
+	check(not cases.is_empty(), "the recorded decider cases load")
+	var wrong: Array = []
+	for r in cases:
+		var cfg: Dictionary = data["configs"][int(r["i"])]
+		if CircuitPanel.condition_holds(r["c"], cfg["sig"]) != bool(r["g"]):
+			wrong.append("%s | red %s green %s | game %s" % [JSON.stringify(r["c"]), JSON.stringify(cfg["red"]), JSON.stringify(cfg["green"]), r["g"]])
+	check(wrong.is_empty(), "the green behind a decider condition is what the game's combinator did (%d of %d differ): %s" % [wrong.size(), cases.size(), wrong.slice(0, 6)])
+
+
+const ItemPicker := preload("res://scripts/ui/factorio/item_picker.gd")
+const EntityPanels := preload("res://scripts/ui/factorio/entity_panels.gd")
+
+
+## The signal chooser lists the game's whole virtual-signal set in its order (base game: 149 in the Signals tab; tools/live circdiff
+## compares the list with `prototypes.virtual_signal`), each subgroup starting a row, and leaves the hidden items out.
+func _picker_signals() -> void:
+	var names: Array = []
+	for group in ItemPicker.VIRTUAL_GROUPS:
+		names.append_array(group)
+	var seen := {}
+	for n in names:
+		seen[n] = true
+	check(names.size() == 149 and seen.size() == 149, "the chooser lists the base game's 149 virtual signals once each: %d" % names.size())
+	check(names.slice(0, 3) == ["signal-everything", "signal-each", "signal-anything"] and names.has("signal-info") and names.has("signal-heart")
+		and names.has("up-arrow") and names.has("signal-skull"), "Everything, Each, Anything first; the symbols, arrows and pictographs too")
+	var picker := ItemPicker.new()
+	picker.items = func() -> Array: return ["iron-plate", "coin", "loader", "infinity-chest", "copper-plate"]
+	add_child(picker)
+	picker.choose(["item"], func(_t: String, _n: String) -> void: pass)
+	var shown: Array = []
+	for slot in picker._grid.get_children():
+		if slot is Slot:
+			shown.append(slot.item)
+	check(shown == ["copper-plate", "iron-plate"], "the chooser leaves out hidden items (coin, loaders, infinity chests): %s" % [shown])
+	picker.choose(["virtual"], func(_t: String, _n: String) -> void: pass)
+	var cells := 0
+	for slot in picker._grid.get_children():
+		if slot is Slot:
+			cells += 1
+	check(cells == 149, "the chooser's grid holds all of them: %d" % cells)
+	var counts := []
+	for kind in ["virtual:plain", "virtual:each", "virtual:no-anything"]:
+		picker.choose([kind], func(_t: String, _n: String) -> void: pass)
+		var n := 0
+		for slot in picker._grid.get_children():
+			if slot is Slot:
+				n += 1
+		counts.append(n)
+	check(counts == [146, 147, 148], "constant combinators take no Each / Anything / Everything, arithmetic operands Each only: %s" % [counts])
+	var got := []
+	var box := EntityPanels.number_box(0, func(v: int) -> void: got.append(v))
+	add_child(box)
+	box.text_submitted.emit("99999999999")
+	box.text_submitted.emit("-99999999999")
+	check(got == [2147483647, -2147483648], "a signal value clamps to 32 bits, as Factorio's box does (the game refuses more): %s" % [got])
+	box.queue_free()
+	# Batch 2 #10: Factorio-style tabbed ItemPicker + --item-picker-tabs=off.
+	var was_tabs := ItemPicker.use_tabs
+	ItemPicker.use_tabs = true
+	picker.pedia_groups = func() -> Array: return [["logistics", "a"], ["production", "b"]]
+	picker.pedia_index = func() -> Array: return [
+		{"kind": "item", "name": "transport-belt", "group": "logistics", "sub": "belt", "order": "a"},
+		{"kind": "item", "name": "assembling-machine-1", "group": "production", "sub": "asm", "order": "a"},
+	]
+	picker.items = func() -> Array: return ["transport-belt", "assembling-machine-1"]
+	picker.choose(["item"], func(_t: String, _n: String) -> void: pass)
+	var tab_items := func() -> Array:
+		var out: Array = []
+		for slot in picker._grid.get_children():
+			if slot is Slot:
+				out.append(slot.item)
+		return out
+	var log_items: Array = tab_items.call()
+	var tabs_shown := picker._tab_strip.visible and picker._tabs.get_child_count() == 2
+	if picker._tabs.get_child_count() >= 2:
+		(picker._tabs.get_child(1) as Button).pressed.emit()
+	var prod_items: Array = tab_items.call()
+	picker._search.text = "belt"
+	picker._search.text_changed.emit("belt")
+	var search_hides_tabs: bool = not picker._tab_strip.visible and tab_items.call() == ["transport-belt"]
+	picker._search.text = ""
+	ItemPicker.use_tabs = false
+	picker.choose(["item"], func(_t: String, _n: String) -> void: pass)
+	var flat_no_tabs: bool = not picker._tab_strip.visible and tab_items.call() == ["assembling-machine-1", "transport-belt"]
+	check(tabs_shown and log_items == ["transport-belt"] and prod_items == ["assembling-machine-1"]
+		and search_hides_tabs and flat_no_tabs,
+		"B2#10: tabbed ItemPicker groups by tab, searches across tabs, and --item-picker-tabs=off flattens (tabs=%s log=%s prod=%s search=%s flat=%s)"
+		% [tabs_shown, log_items, prod_items, search_hides_tabs, flat_no_tabs])
+	ItemPicker.use_tabs = was_tabs
+	picker.queue_free()
+
+
 func _logic2_windows(screen: MachineScreen, ui) -> void:
 	const LogicWindows := preload("res://scripts/ui/factorio/logic_windows.gd")
 	const SpiderRemote := preload("res://scripts/player/spider_remote.gd")
@@ -1893,6 +2179,8 @@ func _logic2_windows(screen: MachineScreen, ui) -> void:
 		{"r": [["item", "iron-plate", 3], ["item", "coal", 9]]}), "Anything and Everything over the input signals")
 	check(not CircuitPanel.condition_holds({"first_signal": {"type": "item", "name": "coal"}, "comparator": ">", "constant": 5,
 		"first_signal_networks": {"red": false, "green": true}}, {"r": [["item", "coal", 9]]}), "an operand reads only the networks ticked beside it")
+	_decider_live_cases()
+	_picker_signals()
 	# The second operand is one signal-or-constant button: the chooser with its Constant row.
 	var operand := screen.find_child("SecondOperand", true, false) as Button
 	check(operand != null and operand.text == "1.1k", "the constant shows on the operand button, as Factorio writes it: %s" % [operand.text if operand != null else ""])
@@ -2014,6 +2302,15 @@ func _logic_windows(screen: MachineScreen, ui) -> void:
 	if size != null:
 		size.commit(2)
 	check(int(sent_one("set_inserter").get("st", 0)) == 2, "moving the notched slider sends the hand size")
+	# No capacity bonus (max 1): the hand size can't be set above what the force allows.
+	gui.call("inserter", {"p": 21, "ins": {"n": 0, "f": [], "st": 0, "max": 1}})
+	await get_tree().process_frame
+	size = screen.find_child("HandSize", true, false)
+	check(size != null and size.max_value == 1, "the hand size slider goes no higher than the force's capacity (1 with no bonus)")
+	if size != null:
+		size.enabled = true
+		size.commit(2)
+		check(size.value == 1, "a hand size over the force's capacity is clamped")
 	# A power switch: State, Off / On.
 	gui.call("switch", {"p": 25, "sw": 0})
 	await get_tree().process_frame
@@ -2079,9 +2376,23 @@ func _logic_windows(screen: MachineScreen, ui) -> void:
 		rename.pressed.emit()
 		name_field.text_submitted.emit("Copper")
 	check(sent_one("set_stop").get("name") == "Copper", "the pencil renames the stop")
+	check(not sent_one("set_stop").has("all"), "a plain rename renames only this stop")
+	# Wired, with "Set train limit" and "Set priority" on, the circuit rules: Factorio greys both controls out.
+	gui.call("stop", {"p": 17, "col": [242, 0, 0], "stop": {"name": "Iron", "limit": 3, "count": 1, "pri": 70, "train": 0, "trs": [],
+		"cb": {"wired": 1, "limit": 1, "pri": 1}}})
+	await get_tree().process_frame
+	lim = screen.find_child("TrainLimit", true, false)
+	pri = screen.find_child("Priority", true, false)
+	check(lim != null and pri != null and not lim.enabled and not pri.enabled,
+		"a train stop whose limit and priority the circuit network sets has both sliders disabled")
+	gui.call("stop", {"p": 17, "col": [242, 0, 0], "stop": {"name": "Iron", "limit": 3, "count": 1, "pri": 70, "train": 0, "trs": [],
+		"cb": {"wired": 0, "limit": 1, "pri": 1}}})
+	await get_tree().process_frame
+	lim = screen.find_child("TrainLimit", true, false)
+	check(lim != null and lim.enabled, "the circuit flags without a wire change nothing")
 	# Locomotive: alone, its name and colour, the Fuel tab.
 	gui.call("train", {"p": 14, "col": [242, 120, 0], "inv": {"fuel": [["coal", 20]]}, "slots": {"fuel": [["coal", 20], 0, 0]}, "bu": 500,
-		"tr": {"id": 1, "state": "on_the_path", "manual": 0, "station": "", "dest": "Iron", "name": "Copper", "stops": ["Iron"],
+		"tr": {"id": 1, "state": "on_the_path", "manual": 0, "station": "", "dest": "Iron", "name": "Copper", "stops": ["Iron"], "ctc": 0,
 			"sched": {"current": 1, "group": "", "records": [{"station": "Iron", "wait_conditions": []}]}}})
 	await get_tree().process_frame
 	check(not screen.shows_inventory() and _texts(screen).has("Copper") and screen.find_child("ColorPicker", true, false) != null,
@@ -2090,6 +2401,12 @@ func _logic_windows(screen: MachineScreen, ui) -> void:
 	if mode != null:
 		mode.pick("right")
 	check(sent_one("train_mode").get("auto") == 0, "the Automatic / Manual switch sends manual")
+	var use_color := screen.find_child("UseStopColor", true, false) as CheckBox
+	if use_color != null:
+		use_color.button_pressed = true
+	var copy_sent := sent_one("train_mode")
+	check(use_color != null and copy_sent.get("ctc") == 1 and not copy_sent.has("auto"),
+		"a locomotive's \"Use destination train stop color\" sends ctc: %s" % [copy_sent])
 	var fuel_tab := screen.find_child("TabFuel", true, false) as Button
 	if fuel_tab != null:
 		fuel_tab.pressed.emit()
@@ -2143,6 +2460,16 @@ func _logic_windows(screen: MachineScreen, ui) -> void:
 		"a cargo wagon shows its cargo and the limit button, not the train's schedule")
 	_find_slot_tip(screen, "Limit").clicked.emit(MOUSE_BUTTON_RIGHT, false)
 	check(sent_one("set_bar").get("n") == 4, "right click on the red X: no limit on the wagon")
+	# Middle click on a wagon's slot filters it (LuaInventory.set_filter on the wagon), clicking again clears it.
+	ui._on_machine_slot("cargo", 1, "iron-plate", 50, MOUSE_BUTTON_MIDDLE, false, false)
+	var wf := sent_one("inv_filter")
+	check(wf.get("i") == 1 and wf.get("item") == "iron-plate" and int(wf.get("u", 0)) == screen.unit, "middle click on a cargo wagon's slot filters it to its item: %s" % str(wf))
+	gui.call("train", {"p": 15, "inv": {"cargo": [["iron-plate", 50]]}, "slots": {"cargo": [["iron-plate", 50], 0, 0, 0]}, "bar": 4, "wfl": [[1, "iron-plate"]],
+		"tr": {"id": 1, "state": "on_the_path", "manual": 0, "station": "", "dest": "Iron", "sched": {"current": 1, "group": "", "records": []}}})
+	await get_tree().process_frame
+	check(screen.wagon_filter(1) == "iron-plate" and screen.wagon_filter(2) == "", "a cargo wagon's filters (wfl) are read per slot")
+	ui._on_machine_slot("cargo", 1, "iron-plate", 50, MOUSE_BUTTON_MIDDLE, false, false)
+	check(sent_one("inv_filter").get("item") == "", "middle click on the filtered slot clears it")
 	# Car: fuel and its bar, the gun over its ammo slot, the trunk.
 	gui.call("vehicle", {"p": 20, "inv": {"fuel": [["coal", 5]], "trunk": [], "car_ammo": []}, "slots": {"fuel": [["coal", 5]], "car_ammo": [0],
 		"trunk": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}, "guns": ["vehicle-machine-gun"], "bu": 800})
@@ -2170,6 +2497,26 @@ func _logic_windows(screen: MachineScreen, ui) -> void:
 	await get_tree().process_frame
 	check(opened.size() == 1 and opened[0][0] == "electric" and not screen.is_open(), "a pole opens Factorio's electric network info")
 	screen.open_stats = old_stats
+	screen.request(900, {"t": "open", "u": 900, "p": 1, "x": 0, "y": 0})
+	# Batch 3 C5: entity-ghost opens with "Ghost: " title prefix.
+	gui.call("crafter", {"p": 1, "gh": 1, "far": 1, "recipe": "iron-gear-wheel", "slots": {"modules": [0, 0]}})
+	await get_tree().process_frame
+	check(screen._title.text.begins_with("Ghost: "),
+		"C5: entity-ghost gui prefixes title with 'Ghost: ' (%s)" % screen._title.text)
+	screen.close()
+	# Batch 2 #10: MMB on an empty quickbar slot opens the shared ItemPicker and pins the pick.
+	var qb_idx: int = ui.model.quickbar_page * 10 + 4
+	ui.model.unpin(qb_idx)
+	sent()
+	ui._on_quickbar_clicked(4, MOUSE_BUTTON_MIDDLE)
+	var mmb_opened: bool = ui.picker.is_open()
+	if mmb_opened and ui.picker._callback.is_valid():
+		ui.picker._callback.call("item", "iron-plate")
+		ui.picker.close()
+	var qb_cmds: Array = sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "qb_set")
+	check(mmb_opened and not ui.picker.is_open() and qb_cmds.size() == 1 and str(qb_cmds[0].get("item", "")) == "iron-plate",
+		"B2#10: MMB on quickbar slot opens ItemPicker and pins selected item: %s" % [qb_cmds])
+	ui.model.unpin(qb_idx)
 	screen.request(900, {"t": "open", "u": 900, "p": 1, "x": 0, "y": 0})
 	sent()
 
@@ -2220,6 +2567,17 @@ func _wires(hud: Hud) -> void:
 	check(tool.click("copper-wire", e[63], Vector2(20.5, 6.5)) == "Wire can't reach that far" and sent().is_empty(), "a pole out of reach is refused")
 	check(tool.cancel() and tool.from.is_empty() and tool._ring_mesh.get_surface_count() == 0,
 		"right click lets go of the wire and clears its reach ring")
+	# The game measures from one connection point to the other (live: two constant combinators 10 tiles apart take a 9-tile wire,
+	# tools/live circdiff), so a click a little past the reach is the game's to refuse; one nothing could reach is the client's.
+	world._add([65, 1, 2 * 256 + 128, 12 * 256 + 128, 0])
+	world._add([66, 1, 12 * 256 + 128, 12 * 256 + 128, 0])
+	world._add([67, 1, 14 * 256 + 128, 12 * 256 + 128, 0])
+	tool.click("red-wire", e[65], Vector2(2.5, 12.5))
+	check(tool.click("red-wire", e[66], Vector2(12.5, 12.5)) == "" and sent_one("wire").get("b", {}).get("u") == 66, "10 tiles apart: sent to the game to decide")
+	tool.cancel()
+	tool.click("red-wire", e[65], Vector2(2.5, 12.5))
+	check(tool.click("red-wire", e[67], Vector2(14.5, 12.5)) == "Wire can't reach that far" and sent().is_empty(), "12 tiles apart: refused")
+	tool.cancel()
 	tool.clear_cables(e[62])
 	check(sent_one("wire_clear").get("u") == 62, "Shift+click on a pole removes its cables")
 	var input := PlayerInput.new()
@@ -2227,3 +2585,462 @@ func _wires(hud: Hud) -> void:
 	check(input._openable(e[64]), "a wired lamp opens (anything on a circuit network does)")
 	input.free()
 	tool.queue_free()
+
+
+## Phases 1-4 Logistics Network & Logistic Requests parity: character logistics tab, spidertron,
+## roboport robot requests & open-network jump, ghost requester, storage filter quality, constant
+## combinator groups/multiplier/quality, L window (rename/search/tabs/locate), --logistic-status=off,
+## and empty `{}` / malformed array handling.
+func _logistics_parity(hud: Hud, player: Node) -> void:
+	const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
+	const Wire := preload("res://scripts/util/wire.gd")
+	var ui = hud.ui
+	var m: UiModel = ui.model
+	var w = ui.window
+	var screen: MachineScreen = ui.screen
+	ui.close_all()
+	player.cursor_item = ""
+	ui.hand = {}
+	sent()
+
+	# Save state we temporarily adjust.
+	var old_protos = screen.protos
+	var had_quals: Array = m.planners.qualities.duplicate(true)
+	m.handle({"t": "quals", "l": [["normal", 0, 1], ["uncommon", 1, 1], ["rare", 2, 1]]})
+
+	# --- 1. Character Logistics tab: quality, comparator, multiplier, auto-trash, tints, man==0 ---
+	m.handle({"t": "slots", "l": {"main": [["iron-plate", 2, "rare"], ["wood", 5], 0, 0]}})
+	m.handle({
+		"t": "clog", "on": 1, "trash": 0, "lgs": ["Personal", "Mall"],
+		"l": [["iron-plate", 10, 20, "rare", "≥"]],
+		"del": [["iron-plate", 15, "rare"]],
+		"pick": [["wood", 5]],
+		"sec": [
+			{"i": 1, "g": "Personal", "on": 1, "m": 2, "man": 1, "f": [
+				["iron-plate", "rare", 10, 20, "", -1, "≥"],
+				["wood", "normal", 0, 0, "", -1],
+			]},
+			{"i": 2, "g": "", "on": 1, "m": 1.5, "man": 0, "f": [
+				["copper-plate", "uncommon", 5, -1, "", -1, "<"],
+			]},
+		],
+	})
+	m.handle({"t": "ln", "id": 4, "log": [10, 20], "con": [5, 8]})
+	ui.toggle_inventory()
+	await get_tree().process_frame
+	(w._tab_buttons["Logistics"] as Button).pressed.emit()
+	await get_tree().process_frame
+	check(w.current_tab() == "Logistics" and w._logistics.is_visible_in_tree(), "Character Logistics tab opens")
+
+	var char_slots: Array = w._logistics.find_children("*", "Button", true, false).filter(func(b): return b is Slot)
+	var iron_slot: Slot = null
+	var wood_slot: Slot = null
+	var copper_slot: Slot = null
+	for cs in char_slots:
+		var s: Slot = cs
+		if s.item == "iron-plate":
+			iron_slot = s
+		elif s.item == "wood":
+			wood_slot = s
+		elif s.item == "copper-plate":
+			copper_slot = s
+	check(iron_slot != null and iron_slot.quality == "rare" and iron_slot.quality_comparator == "≥"
+		and iron_slot.max_count == 20 and iron_slot.status_tint.is_equal_approx(SpacePanels.TINT_UNSATISFIED),
+		"character request slot shows quality, comparator >=, max count, and unsatisfied tint (2+15 < 20)")
+	check(wood_slot != null and wood_slot.status_tint.is_equal_approx(SpacePanels.TINT_TRASHING),
+		"character 0-0 auto-trash request gets trashing tint")
+	check(copper_slot != null and copper_slot.theme_type_variation == "FSlot" and copper_slot.quality_comparator == "<"
+		and _texts(w._logistics).has("Automatic requests") and _texts(w._logistics).has("Circuit / Automatic"),
+		"non-manual (man=0) section renders read-only FSlot and automatic heading")
+
+	# Non-manual section has no editable controls and ignores clicks.
+	sent()
+	if copper_slot != null:
+		copper_slot.clicked.emit(MOUSE_BUTTON_LEFT, false)
+	await get_tree().process_frame
+	check(sent().is_empty(), "clicking a man=0 read-only request slot sends nothing")
+
+	# On-the-way tint when have + del >= eff_min, and satisfied tint when have >= eff_min.
+	m.handle({"t": "clog", "on": 1, "trash": 0, "lgs": ["Personal", "Mall"], "l": [],
+		"del": [["iron-plate", 18, "rare"]], "pick": [],
+		"sec": [{"i": 1, "g": "Personal", "on": 1, "m": 2, "man": 1, "f": [["iron-plate", "rare", 10, 20, "", -1, "≥"]]}]})
+	await get_tree().process_frame
+	var iron_on_way: Slot = null
+	for cs in w._logistics.find_children("*", "Button", true, false):
+		if cs is Slot and (cs as Slot).item == "iron-plate":
+			iron_on_way = cs as Slot
+			break
+	check(iron_on_way != null and iron_on_way.status_tint.is_equal_approx(SpacePanels.TINT_ON_WAY),
+		"character request turns yellow (on the way) when have + del >= eff_min")
+
+	m.handle({"t": "slots", "l": {"main": [["iron-plate", 25, "rare"], ["wood", 5], 0, 0]}})
+	m.logistics_changed.emit()
+	await get_tree().process_frame
+	await get_tree().process_frame
+	var iron_sat: Slot = null
+	for cs in w._logistics.find_children("*", "Button", true, false):
+		if cs is Slot and not cs.is_queued_for_deletion() and (cs as Slot).item == "iron-plate":
+			iron_sat = cs as Slot
+			break
+	check(iron_sat != null and iron_sat.status_tint.is_equal_approx(SpacePanels.TINT_SATISFIED),
+		"character request turns blue (satisfied) when inventory meets eff_min")
+
+	# Inline section multiplier edit in Character Logistics tab.
+	var char_mult := w._logistics.find_child("SectionMultiplier", true, false) as LineEdit
+	check(char_mult != null and char_mult.text == "2", "character section multiplier box shows 2")
+	if char_mult != null:
+		char_mult.text = "3"
+		char_mult.text_submitted.emit("3")
+	var mult_cmd := sent_one("set_section")
+	check(int(mult_cmd.get("u", -1)) == 0 and int(mult_cmd.get("i", 0)) == 1 and is_equal_approx(float(mult_cmd.get("m", 0)), 3.0),
+		"editing character section multiplier sends set_section u=0 m=3: %s" % [mult_cmd])
+
+	# Open request editor on iron_sat, change comparator and click Auto-trash (0-0).
+	sent()
+	if iron_sat != null:
+		iron_sat.clicked.emit(MOUSE_BUTTON_LEFT, false)
+	await get_tree().process_frame
+	var cmp_pick := w._logistics.find_child("QualityComparator", true, false) as OptionButton
+	var auto_trash_btn := _find_button(w._logistics, "Auto-trash (0–0)")
+	check(cmp_pick != null and auto_trash_btn != null, "request editor shows QualityComparator and Auto-trash (0-0)")
+	if cmp_pick != null:
+		cmp_pick.select(1)  # "≠"
+		cmp_pick.item_selected.emit(1)
+	if auto_trash_btn != null:
+		auto_trash_btn.pressed.emit()
+	var edit_cmd := sent_one("set_section")
+	var edit_f: Array = edit_cmd.get("f", [])
+	check(edit_f.size() >= 1 and int(edit_f[0][2]) == 0 and int(edit_f[0][3]) == 0 and str(edit_f[0][6]) == "≠",
+		"Auto-trash (0-0) with comparator sends min=0, max=0, cmp=≠: %s" % [edit_cmd])
+
+	# Shift+click on main inventory while Logistics tab is open sends xfer trash=1.
+	sent()
+	ui._transfer("main", 2, {"item": "wood", "count": 5}, MOUSE_BUTTON_LEFT, false, 0)
+	var xfer_cmd := sent_one("xfer")
+	check(int(xfer_cmd.get("trash", 0)) == 1 and str(xfer_cmd.get("from", "")) == "main",
+		"Shift+click on main slot while Logistics tab open sends xfer trash=1: %s" % [xfer_cmd])
+	ui.close_all()
+
+	# --- 2. Screen tests: Spidertron, Roboport, Ghost requester, Storage quality, Constant comb ---
+	var p := _logic_protos()
+	p.add_entities([
+		[34, "storage-chest", "logistic-container", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
+		[35, "constant-combinator", "constant-combinator", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
+		[36, "requester-chest", "logistic-container", -0.5, -0.5, 0.5, 0.5, 200, 180, 0, 1, 1],
+	])
+	screen.protos = p
+	screen.request(910, {"t": "open", "u": 910, "p": 1, "x": 0, "y": 0})
+	var gui := func(kind: String, extra: Dictionary) -> void:
+		var msg := {"t": "gui", "u": 910, "p": 1, "kind": kind, "inv": {}}
+		msg.merge(extra, true)
+		screen.handle(msg)
+
+	# 2a. Spidertron Logistics tab (on/mv/tu, requester sections, trunk/trash).
+	sent()
+	gui.call("vehicle", {
+		"p": 29, "col": [229, 113, 0],
+		"inv": {"trunk": [["rocket", 5]], "car_ammo": [], "trash": [["wood", 3]]},
+		"slots": {"car_ammo": [0, 0, 0, 0], "trunk": [["rocket", 5], 0], "trash": [["wood", 3], 0]},
+		"guns": ["spidertron-rocket-launcher-1", "spidertron-rocket-launcher-2", "spidertron-rocket-launcher-3", "spidertron-rocket-launcher-4"],
+		"veh": {"grid": 1, "lbl": "Spider", "at": [1, 0]},
+		"lg": {"mode": "requester", "net": {"id": 4}},
+		"lc": {"on": 1, "mv": 1, "tu": 0, "in_net": 1, "sec": [{"i": 1, "g": "", "on": 1, "m": 1, "man": 1, "f": [["rocket", "normal", 20, 40, "", -1]]}]},
+	})
+	await get_tree().process_frame
+	var tab_inv := screen.find_child("SpiderTab_Inventory", true, false) as Button
+	var tab_log := screen.find_child("SpiderTab_Logistics", true, false) as Button
+	check(tab_inv != null and tab_log != null and _texts(screen).has("Trunk"),
+		"spidertron opens on Inventory tab with Trunk and Logistics tab")
+	if tab_log != null:
+		tab_log.pressed.emit()
+	await get_tree().process_frame
+	var sp_on := _find_checkbox(screen, "Enable logistics")
+	var sp_mv := _find_checkbox(screen, "Enable logistics while moving")
+	var sp_tu := _find_checkbox(screen, "Trash unrequested")
+	check(sp_on != null and sp_mv != null and sp_tu != null and _texts(screen).has("Trash slots"),
+		"spidertron Logistics tab shows on/mv/tu checkboxes, sections, and trash slots")
+	if sp_on != null:
+		sp_on.button_pressed = false
+	check(int(sent_one("set_chest_logistics").get("on", -1)) == 0, "spidertron Enable logistics sends on=0")
+	if sp_mv != null:
+		sp_mv.button_pressed = false
+	check(int(sent_one("set_chest_logistics").get("mv", -1)) == 0, "spidertron Enable logistics while moving sends mv=0")
+	if sp_tu != null:
+		sp_tu.button_pressed = true
+	check(int(sent_one("set_chest_logistics").get("tu", -1)) == 1, "spidertron Trash unrequested sends tu=1")
+
+	# 2b. Roboport robot requests + "Open logistic network" jump to Networks window.
+	var rig_script := GDScript.new()
+	rig_script.source_code = "extends Node3D\nvar target: Node3D = null\n"
+	rig_script.reload()
+	var rp_script := GDScript.new()
+	rp_script.source_code = "extends Node\nvar rig: Node3D = null\nvar avatar: Node3D = null\nvar cursor_item := \"\"\nvar cursor_tool := \"\"\n"
+	rp_script.reload()
+	var real_player = ui.player
+	var rig_player: Node = rp_script.new()
+	var world_holder := Node3D.new()
+	add_child(world_holder)
+	rig_player.rig = rig_script.new()
+	rig_player.avatar = Node3D.new()
+	world_holder.add_child(rig_player.rig)
+	world_holder.add_child(rig_player.avatar)
+	add_child(rig_player)
+	ui.player = rig_player
+
+	sent()
+	gui.call("roboport", {
+		"p": 23,
+		"inv": {"robots": [["logistic-robot", 12]], "repair": []},
+		"slots": {"robots": [["logistic-robot", 12], 0, 0, 0, 0, 0, 0], "repair": [0, 0, 0, 0, 0, 0, 0]},
+		"lg": {"mode": "roboport", "net": {"id": 4, "name": "Main", "log": [10, 20], "con": [5, 8]}, "cell": {"sl": 12, "sc": 4, "ch": 2, "tc": 1}},
+		"lc": {"tu": 0, "no_tu": 1, "on": 1, "in_net": 1, "sec": [{"i": 1, "g": "", "on": 1, "m": 1, "man": 1, "f": [["logistic-robot", "normal", 25, -1, "", -1]]}]},
+	})
+	await get_tree().process_frame
+	var rp_texts := _texts(screen)
+	var open_net_btn := screen.find_child("OpenNetwork", true, false) as Button
+	check(rp_texts.has("Main") and rp_texts.has("Logistic: 10 / 20 · Construction: 5 / 8")
+		and rp_texts.has("Stationed: 12 logistic, 4 construction · Charging: 2 (1 waiting)")
+		and _find_checkbox(screen, "Trash unrequested") == null and open_net_btn != null,
+		"roboport renders network header, cell stats, robot request sections, no Trash unrequested, and OpenNetwork")
+	if open_net_btn != null:
+		open_net_btn.pressed.emit()
+	await get_tree().process_frame
+	var lnet_asks := sent().filter(func(c: Dictionary) -> bool: return c.get("t") == "lnet" and int(c.get("id", 0)) == 4)
+	check(not screen.visible and ui.networks.is_open() and ui.networks.selected == 4 and not lnet_asks.is_empty(),
+		"Open logistic network closes roboport screen, jumps to L window on network 4, and requests lnet")
+	ui.networks.open(false)
+	await get_tree().process_frame
+
+	# 2c. Ghost requester chest.
+	screen.request(910, {"t": "open", "u": 910, "p": 1, "x": 0, "y": 0})
+	sent()
+	gui.call("container", {
+		"p": 36, "gh": 1, "far": 1,
+		"inv": {"chest": [], "trash": []}, "slots": {"chest": [], "trash": []},
+		"lg": {"mode": "requester"},
+		"lc": {"tu": 0, "rb": 1, "in_net": 0, "sec": [{"i": 1, "g": "", "on": 1, "m": 1, "man": 1, "f": [["iron-plate", "uncommon", 50, -1, "", -1, "≥"]]}]},
+	})
+	await get_tree().process_frame
+	check(screen._title.text.begins_with("Ghost: ") and _texts(screen).has("Logistic requests")
+		and not _texts(screen).has("Trash slots"),
+		"ghost requester chest renders Ghost title and requests without trash slots")
+
+	# 2d. Storage chest filter quality.
+	sent()
+	gui.call("container", {
+		"p": 34,
+		"inv": {"chest": []}, "slots": {"chest": [0, 0]},
+		"lg": {"mode": "storage", "filter": "iron-plate", "filter_q": "rare", "net": {"id": 4}},
+		"ql": ["normal", "uncommon", "rare"],
+	})
+	await get_tree().process_frame
+	var sto_slots: Array = screen.find_children("*", "Button", true, false).filter(func(b): return b is Slot and (b as Slot).item == "iron-plate")
+	var unc_btn := screen.find_children("*", "Button", true, false).filter(func(b): return (b as Button).tooltip_text == "Uncommon")
+	check(sto_slots.size() >= 1 and (sto_slots[0] as Slot).quality == "rare" and unc_btn.size() >= 1,
+		"storage chest filter slot shows rare quality and unlocked quality row")
+	if not unc_btn.is_empty():
+		(unc_btn[0] as Button).pressed.emit()
+	var ssf := sent_one("set_storage_filter")
+	check(str(ssf.get("item", "")) == "iron-plate" and str(ssf.get("q", "")) == "uncommon",
+		"clicking quality button on storage chest sends set_storage_filter with q: %s" % [ssf])
+
+	# 2e. Constant combinator group chips, multiplier, and signal quality.
+	sent()
+	gui.call("combinator", {
+		"p": 35,
+		"cb": {"enabled": true, "sections": [{"g": "Mall", "on": 1, "m": 2, "s": [["item", "iron-plate", 10, "rare"]]}]},
+		"lgs": ["Mall", "Science"],
+		"ql": ["normal", "uncommon", "rare"],
+	})
+	await get_tree().process_frame
+	var cc_group_btn := screen.find_child("GroupButton", true, false) as Button
+	var cc_editor := screen.find_child("GroupEditor", true, false) as Control
+	var cc_mult := screen.find_child("SectionMultiplier", true, false) as LineEdit
+	check(cc_group_btn != null and cc_editor != null and cc_mult != null and cc_mult.text == "2",
+		"constant combinator shows GroupButton, GroupEditor, and SectionMultiplier")
+	if cc_group_btn != null:
+		cc_group_btn.pressed.emit()
+	var sci_chip := _find_button(cc_editor, "Science") if cc_editor != null else null
+	check(cc_editor != null and cc_editor.visible and sci_chip != null, "constant combinator GroupEditor shows logistic group chips")
+	if sci_chip != null:
+		sci_chip.pressed.emit()
+	var cb_grp: Dictionary = sent_one("set_cb").get("cb", {})
+	check(cb_grp.get("sections", [{}])[0].get("g") == "Science", "clicking group chip updates constant combinator section group")
+	if cc_mult != null:
+		cc_mult.text = "3.5"
+		cc_mult.text_submitted.emit("3.5")
+	var cb_mult: Dictionary = sent_one("set_cb").get("cb", {})
+	check(is_equal_approx(float(cb_mult.get("sections", [{}])[0].get("m", 0)), 3.5),
+		"editing constant combinator multiplier sends set_cb m=3.5")
+
+	var sig_grid := screen.find_child("Signals", true, false)
+	var sig0: Slot = sig_grid.get_child(0) as Slot if sig_grid != null and sig_grid.get_child_count() > 0 else null
+	check(sig0 != null and sig0.quality == "rare", "constant combinator signal slot renders rare quality")
+	if sig0 != null:
+		sig0.clicked.emit(MOUSE_BUTTON_LEFT, false)
+	await get_tree().process_frame
+	if ui.picker.is_open():
+		ui.picker.close()
+	var q_ed := screen.find_child("SignalQualityEditor", true, false) as Control
+	var sig_unc := q_ed.find_children("*", "Button", true, false).filter(func(b): return (b as Button).tooltip_text == "Uncommon") if q_ed != null else []
+	check(q_ed != null and q_ed.visible and not sig_unc.is_empty(), "clicking constant combinator signal opens SignalQualityEditor")
+	if not sig_unc.is_empty():
+		(sig_unc[0] as Button).pressed.emit()
+	var cb_q: Dictionary = sent_one("set_cb").get("cb", {})
+	var sig_out: Array = cb_q.get("sections", [{}])[0].get("s", [[]])[0]
+	check(sig_out.size() >= 4 and str(sig_out[0]) == "item" and str(sig_out[1]) == "iron-plate"
+		and int(sig_out[2]) == 10 and str(sig_out[3]) == "uncommon",
+		"picking quality in SignalQualityEditor sends updated signal quality in set_cb: %s" % [cb_q])
+	screen.close_local()
+
+	# --- 3. Logistic Networks L window: rename, search, sub-tabs, quality, locate cycling ---
+	sent()
+	ui.networks.open_network(4)
+	m.handle({"t": "lnets", "l": [[4, 1, "nauvis", [10, 12], [5, 6], 2, 1, 1, 2, 2560, 512, "Old Net"]]})
+	m.handle({
+		"t": "lnet", "id": 4, "found": 1, "log": [10, 12], "con": [5, 6],
+		"ch": [3, 2],
+		"members": [["roboport", 2], ["requester-chest", 2], ["storage-chest", 1]],
+		"items": [["iron-plate", 100, "rare"], ["copper-cable", 50]],
+		"req": [["iron-plate", 200, 100, "rare"], ["wood", 10, 0]],
+		"transit": [["iron-plate", 25, "rare"]],
+	})
+	await get_tree().process_frame
+	var ch_lbl := ui.networks.find_child("ChargingLabel", true, false) as Label
+	check(ch_lbl != null and ch_lbl.visible and ch_lbl.text == "Charging: 3, waiting: 2",
+		"L window displays charging and waiting counts")
+
+	# Rename network
+	var ren_btn := ui.networks.find_child("Rename", true, false) as Button
+	var ren_field := ui.networks.find_child("RenameField", true, false) as LineEdit
+	if ren_btn != null:
+		ren_btn.pressed.emit()
+	check(ren_field != null and ren_field.visible, "Rename button reveals RenameField")
+	if ren_field != null:
+		ren_field.text = "Base Alpha"
+		ren_field.text_submitted.emit("Base Alpha")
+	var ren_cmd := sent_one("set_lnet_name")
+	check(int(ren_cmd.get("id", 0)) == 4 and str(ren_cmd.get("name", "")) == "Base Alpha",
+		"RenameField submits set_lnet_name: %s" % [ren_cmd])
+
+	# Search filtering on Contents tab
+	var lnet_search := ui.networks.find_child("SearchBox", true, false) as LineEdit
+	check(lnet_search != null, "L window has SearchBox")
+	if lnet_search != null:
+		lnet_search.text = "iron"
+		lnet_search.text_changed.emit("iron")
+	await get_tree().process_frame
+	var first_item := ui.networks._items.get_child(0) as Slot
+	var second_child: Node = ui.networks._items.get_child(1)
+	check(first_item != null and first_item.item == "iron-plate" and first_item.quality == "rare"
+		and not (second_child is Slot),
+		"L window search filters Contents and keeps quality badge")
+	if lnet_search != null:
+		lnet_search.text = ""
+		lnet_search.text_changed.emit("")
+	await get_tree().process_frame
+
+	# Requests & In transit sub-tabs
+	var req_tab := ui.networks.find_child("RequestsTab", true, false) as Button
+	var tr_tab := ui.networks.find_child("TransitTab", true, false) as Button
+	if req_tab != null:
+		req_tab.pressed.emit()
+	await get_tree().process_frame
+	var req_s0 := ui.networks._items.get_child(0) as Slot
+	var req_s1 := ui.networks._items.get_child(1) as Slot
+	check(req_s0 != null and req_s0.item == "iron-plate" and req_s0.quality == "rare" and req_s0.status_tint.a > 0.0
+		and req_s1 != null and req_s1.item == "wood" and req_s1.status_tint.a == 0.0,
+		"L window Requests tab tints missing requests and leaves fulfilled untinted")
+
+	if tr_tab != null:
+		tr_tab.pressed.emit()
+	await get_tree().process_frame
+	var tr_s0 := ui.networks._items.get_child(0) as Slot
+	check(tr_s0 != null and tr_s0.item == "iron-plate" and tr_s0.count == 25 and tr_s0.quality == "rare",
+		"L window In transit tab shows transit items and quality badge")
+
+	# Click-to-locate + LocateBar cycling
+	sent()
+	if tr_s0 != null:
+		tr_s0.clicked.emit(MOUSE_BUTTON_LEFT, false)
+	var find_cmd := sent_one("lnet_find")
+	check(int(find_cmd.get("id", 0)) == 4 and str(find_cmd.get("item", "")) == "iron-plate"
+		and str(find_cmd.get("q", "")) == "rare" and str(find_cmd.get("role", "")) == "transit",
+		"clicking item in L window sends lnet_find: %s" % [find_cmd])
+
+	var jumped: Array = []
+	var on_jump := func(at: Vector2, si: int) -> void: jumped.append([at, si])
+	ui.networks.show_at.connect(on_jump)
+	m.handle({"t": "lnet_locs", "id": 4, "si": 1, "l": [[512, 256, "requester-chest", 15], [1024, 512, "requester-chest", 10]]})
+	await get_tree().process_frame
+	var loc_bar := ui.networks.find_child("LocateBar", true, false) as Control
+	var loc_cnt := ui.networks.find_child("LocCount", true, false) as Label
+	var loc_next := ui.networks.find_child("LocNext", true, false) as Button
+	var loc_prev := ui.networks.find_child("LocPrev", true, false) as Button
+	check(loc_bar != null and loc_bar.visible and loc_cnt != null and loc_cnt.text == "1 / 2"
+		and jumped == [[Vector2(2, 1), 1]], "lnet_locs shows LocateBar 1 / 2 and jumps to first entity")
+	if loc_next != null:
+		loc_next.pressed.emit()
+	check(loc_cnt != null and loc_cnt.text == "2 / 2" and jumped.size() == 2 and jumped[1] == [Vector2(4, 2), 1],
+		"LocNext cycles to 2 / 2")
+	if loc_prev != null:
+		loc_prev.pressed.emit()
+	check(loc_cnt != null and loc_cnt.text == "1 / 2" and jumped.size() == 3 and jumped[2] == [Vector2(2, 1), 1],
+		"LocPrev cycles back to 1 / 2")
+	m.handle({"t": "lnet_locs", "id": 4, "si": 1, "l": {}})
+	await get_tree().process_frame
+	check(loc_cnt != null and loc_cnt.text == "0 / 0" and loc_prev != null and loc_prev.disabled and loc_next != null and loc_next.disabled,
+		"empty {} lnet_locs shows 0 / 0 and disables cycling buttons")
+	ui.networks.show_at.disconnect(on_jump)
+	ui.networks.open(false)
+	await get_tree().process_frame
+	ui.player = real_player
+	rig_player.queue_free()
+	world_holder.queue_free()
+
+	# --- 4. --logistic-status=off switch fallback ---
+	Switches.set_test_args(PackedStringArray(["--logistic-status=off"]))
+	check(not Switches.on("--logistic-status", true), "--logistic-status=off disables logistic status tint switch")
+	var test_slot := Slot.new()
+	test_slot.custom_minimum_size = Vector2(40, 40)
+	test_slot.size = Vector2(40, 40)
+	test_slot.set_logistic_state(-1, Color(1.0, 0.0, 0.0, 1.0))
+	add_child(test_slot)
+	await get_tree().process_frame
+	Switches.set_test_args(PackedStringArray(["--logistic-status=on"]))
+	check(Switches.on("--logistic-status", true), "--logistic-status=on re-enables logistic status tint switch")
+	test_slot.queue_redraw()
+	await get_tree().process_frame
+	Switches.reset_cache()
+	test_slot.queue_free()
+
+	# --- 5. Edge cases: empty Lua {} dicts & malformed/missing arrays handled cleanly ---
+	m.handle({"t": "clog", "on": 1, "trash": 0, "l": {}, "sec": {}, "lgs": {}, "del": {}, "pick": {}})
+	m.handle({"t": "lnet", "id": 4, "found": 1, "log": {}, "con": {}, "items": {}, "members": {}, "req": {}, "transit": {}, "ch": {}})
+	check(m.char_sections is Array and (m.char_sections as Array).is_empty()
+		and m.char_deliver.is_empty() and m.char_pickup.is_empty() and m.logistic_groups.is_empty()
+		and m.lnet[4]["items"] is Array and (m.lnet[4]["items"] as Array).is_empty()
+		and m.lnet[4]["members"] is Array and m.lnet[4]["req"] is Array and m.lnet[4]["transit"] is Array,
+		"empty Lua {} tables in clog and lnet convert cleanly to empty Arrays")
+	# Malformed/non-array payloads do not crash Wire.array or UI screens.
+	check(Wire.array("bad").is_empty() and Wire.array(123).is_empty() and Wire.array(null).is_empty(),
+		"Wire.array safely rejects malformed non-array values")
+	m.handle({"t": "lnet", "id": 4, "found": 1, "log": "bad", "con": null, "items": [123, ["iron-plate"]],
+		"members": ["bad"], "req": [["only-one"]], "transit": [null], "ch": [1]})
+	ui.networks._refresh_details()
+	screen.request(910, {"t": "open", "u": 910, "p": 1, "x": 0, "y": 0})
+	gui.call("container", {"p": 36, "inv": {}, "slots": {}, "lg": {"mode": "requester"},
+		"lc": {"tu": 0, "rb": 0, "sec": {}, "del": "bad", "pick": null}})
+	await get_tree().process_frame
+	check(screen.is_open(), "malformed/empty lc and lnet payloads render cleanly without crash")
+	screen.close_local()
+
+	# Restore shared test state.
+	ui.close_all()
+	screen.protos = old_protos
+	m.planners.qualities = had_quals
+	m.lnet.erase(4)
+	m.lnets.clear()
+	m.handle({"t": "clog", "on": 1, "trash": 0, "l": []})
+	sent()
+

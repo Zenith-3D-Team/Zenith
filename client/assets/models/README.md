@@ -98,8 +98,9 @@ One order decides which pack's model is drawn: the higher pack wins when two hav
 same name. It is kept in settings.cfg's `[model_packs]` (`order` and `off`, by id: `builtin:<folder>`,
 `loose`, `dir:<folder>`, `zip:<file>`). A new pack of the models folder goes on top, on; a built-in one
 not saved yet goes under the folder's, so by default, from the top (the owner's order): Default (when
-there is one), FUE5 (Adapted), Wube3DP (Adapted), Placeholders, Factorio. Every pack moves and switches
-off, Placeholders too.
+there is one), FUE5 (Adapted), Wube3DP (Adapted), Placeholders, Factorio. Built-in `assembling-machine-1..3`
+prefer Placeholders' rebuilt PBR/animated versions by default (`--assembler-models=old` restores pure pack order).
+Every pack moves and switches off, Placeholders too.
 
 **Factorio** (`builtin:factorio`, `ModelPacks.FACTORIO_ID`) is a built-in pack with no files: its content
 is the player's install, read at run time (nothing of Wube's is committed or shipped). Its picture is the
@@ -290,7 +291,9 @@ it turns.
 | Node name | Turns about | When | Models using it |
 |---|---|---|---|
 | `anim_spin_drill` | node's Y (up) | while the machine works (`st`), clockwise from above | electric and burner mining drill |
-| `anim_spin_arms` | node's Y | while working | assembling machine 1 |
+| `anim_spin_arms` | node's Y | while working | custom pack assembling machines |
+| `anim_gear_am1_*`, `anim_arm_am1_nw`, `anim_head_am1_e`, `anim_fan_am1_w` | `CYCLES` | while working | assembling machine 1 (wube3dp) |
+| `anim_am2_*`, `anim_am3_*` | `CYCLES` | while working | assembling machines 2 & 3 (placeholders) |
 | `anim_spin_flywheel` | node's X (east-west) | while working | steam engine |
 | `anim_turret_head` | node's Y | where the mod says the turret aims (`ts`, `turrets.gd`: turning, raising and folding at the prototype's speeds); barrels point north at rest | every turret, the car, tank and artillery wagon |
 | `anim_spin_crane` | node's Y | while working, slowly (`SPIN_SPEEDS_EXTRA`) | agricultural tower (its crane) |

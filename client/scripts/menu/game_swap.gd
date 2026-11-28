@@ -162,7 +162,9 @@ static func _played_here() -> bool:
 	var cmd := OS.get_cmdline_args()
 	var i := cmd.find("--audio-driver")
 	var muted := i >= 0 and i + 1 < cmd.size() and cmd[i + 1] == "Dummy"
-	return not (DisplayServer.get_name() == "headless" or muted or ProjectSettings.globalize_path("res://").contains("/.claude/worktrees/"))
+	# (A worktree is a source checkout: an exported build ("template") in a folder named so is played.)
+	var worktree := not OS.has_feature("template") and ProjectSettings.globalize_path("res://").contains("/worktrees/")
+	return not (DisplayServer.get_name() == "headless" or muted or worktree)
 
 
 ## Where Zenith keeps the launcher for Factorio's launch options: the same folder on every PC

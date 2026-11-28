@@ -614,6 +614,16 @@ send({"t": "shoot", "m": -1})
 tick(2)
 check(puppet.shooting_state.state == shooting.not_shooting, "shoot m=-1 stops at once")
 take()
+# Only enemies of the character's force are aimed at (LuaForce::is_enemy), not any force but neutral:
+# the biter, once of a friendly force, is not selected.
+g.rawset(biter, "force", g.game.forces.ally)
+send({"t": "shoot", "m": 1, "x": 3 * 256, "y": 0})
+tick(2)
+check(puppet.shooting_state.state == shooting.shooting_enemies, "shoot m=1 on a friendly force's unit does not select it")
+send({"t": "shoot", "m": -1})
+tick(2)
+g.rawset(biter, "force", g.game.forces.enemy)
+take()
 
 enemy_chest = spawn("wooden-chest", 2.5, 2.5, force="enemy")
 biter.health, enemy_chest.health = 6, 50
@@ -627,6 +637,15 @@ enemy_chest.health = 100
 tick(10)
 hp = [m["l"] for m in of_type(take(), "hp")]
 check(hp and hp[-1] == [biter.unit_number, 60], f"an entity back at full health drops out: {hp[-1:]}")
+focus_was = g.storage.f3d.focus
+g.storage.f3d.focus = lua.table_from({"x": 900, "y": 900, "r": 32})
+tick(10)
+hp = [m["l"] for m in of_type(take(), "hp")]
+check(hp and hp[-1] == [], f"hp: a damaged entity out of the focus square isn't sent: {hp[-1:]}")
+g.storage.f3d.focus = focus_was
+tick(10)
+hp = [m["l"] for m in of_type(take(), "hp")]
+check(hp and hp[-1] == [biter.unit_number, 60], f"hp: an entity damaged earlier shows its bar again when the camera comes back: {hp[-1:]}")
 unit = biter.unit_number
 for e in (biter, enemy_chest):
     F["raise"]("on_entity_died", lua.table_from({"entity": e}))
@@ -1029,13 +1048,16 @@ check(puppet.vehicle is None and puppet.position.x >= -40, f"getting out over wa
 car.position = lua.table_from({"x": 3, "y": 3})
 puppet.position = lua.table_from({"x": 0, "y": 0})
 loco = spawn("locomotive", -2.0, 0.0, force="player")  # nearer than the car
+wagon = spawn("cargo-wagon", -0.5, 0.0, force="player")  # nearer still, but a wagon has no seat
 send({"t": "enter"})
 send({"t": "drive", "a": 1, "s": 0})
 tick(2)
-check(same(loco.get_driver(), puppet) and loco.train.manual_mode is True, "driving a locomotive switches its train to manual mode")
+check(same(loco.get_driver(), puppet) and loco.train.manual_mode is True and wagon.get_driver() is None,
+      "driving a locomotive switches its train to manual mode (Enter skips a nearer wagon: no seat)")
 send({"t": "enter"})
 tick(2)
 loco.destroy()
+wagon.destroy()
 puppet.position = lua.table_from({"x": 30, "y": 0})
 send({"t": "enter"})
 tick(2)
@@ -1168,10 +1190,19 @@ take()
 # --- crafting ---------------------------------------------------------------------------------
 send({"t": "craft", "recipe": "iron-gear-wheel", "n": 2})
 send({"t": "craft", "recipe": "laser-turret", "n": 1})
+send({"t": "craft", "recipe": "oil-processing", "n": 1})
 tick(3)
 msgs = take()
 check(any("laser-turret" in m.get("text", "") for m in of_type(msgs, "msg")), "locked recipe is refused")
+check(any("cannot be crafted by hand" in m.get("text", "") for m in of_type(msgs, "msg")), "a recipe of another machine says it can't be crafted by hand")
 check(any(m.get("q") == 2 for m in of_type(msgs, "me")), "crafting queue size is reported")
+send({"t": "craft", "recipe": "iron-gear-wheel", "n": 250})
+tick(3)
+msgs = take()
+check(any(m.get("q") == 252 for m in of_type(msgs, "me")), "Shift+click's craft all is not capped at 100")
+send({"t": "cancel_craft", "i": 2, "n": 250})
+tick(1)
+take()
 
 # --- machine screens --------------------------------------------------------------------------
 def fill(entity, role, name, count):
@@ -1565,6 +1596,20 @@ send({"t": "move", "from": "chest", "fi": 3, "to": "main", "ti": 80, "u": box.un
 tick(2)
 check(of_type(take(), "slots")[-1]["l"]["main"][79] == ["coal", 3], "and back out of it")
 
+# A slot from the chest's limit bar on still accepts manual clicks/moves (the red bar only blocks machines and insert/xfer).
+F.inventories[box]["chest"].set_bar(5)
+send({"t": "move", "from": "main", "fi": 80, "to": "chest", "ti": 5, "u": box.unit_number})
+tick(2)
+msgs = take()
+gui = guis(msgs, box)
+check(F.inventories[box]["chest"][5].valid_for_read is True and F.inventories[box]["chest"][5].name == "coal"
+      and gui and gui[-1]["slots"]["chest"][4] == ["coal", 3],
+      f"manual move onto a slot beyond the chest's limit bar succeeds: {gui[-1:]}")
+send({"t": "move", "from": "chest", "fi": 5, "to": "main", "ti": 80, "u": box.unit_number})
+tick(2)
+take()
+F.inventories[box]["chest"].set_bar(None)
+
 # xfer: Factorio's Shift / Ctrl clicks (stack_transfers' four actions, emulated without a player)
 def chest_slots():
     g.storage.f3d.screen.due = 0
@@ -1644,7 +1689,10 @@ g.storage.f3d.craftable_sig = None
 tick(31)
 msgs = take()
 details = {r[0]: r for m in of_type(msgs, "rdet") for r in m["l"]}
-check(set(details) == {"iron-gear-wheel", "transport-belt"}, f"rdet: enabled hand-craftable recipes only: {sorted(details)}")
+rdet_msgs = of_type(msgs, "rdet")
+check(set(details) == {"iron-gear-wheel", "iron-plate", "oil-processing", "transport-belt"},
+      f"rdet: all enabled visible recipes including fluid/machine-only: {sorted(details)}")
+check(rdet_msgs and rdet_msgs[0].get("hc") == ["crafting"], f"rdet: hc lists hand categories: {rdet_msgs[0].get('hc')}")
 belt_r = details.get("transport-belt", [None] * 10)
 check(belt_r[1] == 0.5 and belt_r[2] == ["crafting"] and belt_r[3:8] == ["logistics", "b", "belt", "b", "a[transport-belt]"]
       and belt_r[8] == [["item", "iron-gear-wheel", 1], ["item", "iron-plate", 1]] and belt_r[9] == [["item", "transport-belt", 2]],

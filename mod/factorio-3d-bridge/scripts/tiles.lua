@@ -243,7 +243,7 @@ end
 
 ---------------------------------------------------------------------------------------------
 
--- What a capsule does when used, for the client's cursor: [type, range, radius].
+-- What a capsule does when used, for the client's cursor: [type, range, radius, cooldown in ticks].
 local function capsule_info(item)
   local ok, action = pcall(function() return item.capsule_action end)
   if not ok or not action then
@@ -268,12 +268,13 @@ local function capsule_info(item)
       end
     end)
   end
-  return { action.type, math.floor(range * 10 + 0.5) / 10, math.floor(radius * 10 + 0.5) / 10 }
+  local cooldown = action.attack_parameters and action.attack_parameters.cooldown or 0
+  return { action.type, math.floor(range * 10 + 0.5) / 10, math.floor(radius * 10 + 0.5) / 10, cooldown }
 end
 
 -- `iuse`: [[item, kind, ...], ...] for the items the client uses other than by building their
 -- entity: "t" tiles [item, "t", tile, other direction's tile or "", [tile ids it may go on]];
--- "c" capsules [item, "c", action type, range, radius]; "r" rail planners [item, "r", support
+-- "c" capsules [item, "c", action type, range, radius, cooldown ticks]; "r" rail planners [item, "r", support
 -- entity or "", elevated rails allowed 0/1]; "b" belts [item, "b", their underground belt's item];
 -- "p" pipes [item, "p", their pipe-to-ground's item]; "m" modules [item, "m", module category];
 -- "h" repair tools [item, "h", health a unit of durability mends, durability at normal quality].
@@ -302,7 +303,7 @@ local function build_item_uses(allow_elevated)
     end
     local cap = capsule_info(item)
     if cap then
-      l[#l + 1] = { name, "c", cap[1], cap[2], cap[3] }
+      l[#l + 1] = { name, "c", cap[1], cap[2], cap[3], cap[4] }
     end
     local okr, rails = pcall(function() return item.rails end)
     if okr and rails and #rails > 0 and registry.place_result(item) and registry.place_result(item).type == "straight-rail" then

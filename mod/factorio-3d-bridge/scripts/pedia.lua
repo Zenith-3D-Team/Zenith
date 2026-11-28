@@ -75,6 +75,20 @@ local function amounts(list)
   return out
 end
 
+-- [[probability, lowest amount, highest amount], ...] beside amounts(): what Factorio's rows show
+-- ("0.7% × Uranium-235", "24-50 × Stone"); nil when every entry is a plain fixed amount.
+local function amount_detail(list)
+  local out, odd = {}, false
+  for _, p in pairs(list or {}) do
+    local lo = p.amount_min or p.amount or 1
+    local hi = p.amount_max or p.amount or lo
+    local prob = p.probability or 1
+    out[#out + 1] = { round(prob, 4), round(lo, 3), round(hi, 3) }
+    odd = odd or prob ~= 1 or lo ~= hi
+  end
+  return odd and out or nil
+end
+
 local function build()
   local l = { made = {}, used = {}, recycled = {}, machines = {}, unlocked = {}, mined = {} }
   for name, r in pairs(table_of("recipe")) do
@@ -274,7 +288,18 @@ local function resistances(proto)
       out[#out + 1] = { damage, round(r.decrease or 0, 2), round((r.percent or 0) * 100, 1) }
     end
   end
-  table.sort(out, function(a, b) return a[1] < b[1] end)
+  -- Factorio lists them in its damage types' order, not by name.
+  local rank = {}
+  for i, t in ipairs({ "physical", "impact", "poison", "explosion", "fire", "laser", "acid", "electric" }) do
+    rank[t] = i
+  end
+  table.sort(out, function(a, b)
+    local ra, rb = rank[a[1]] or 100, rank[b[1]] or 100
+    if ra ~= rb then
+      return ra < rb
+    end
+    return a[1] < b[1]
+  end)
   return #out > 0 and out or nil
 end
 
@@ -309,6 +334,36 @@ local function energy_source(e)
     return "void"
   end
   return nil
+end
+
+-- {damage type = amount} from the "damage" effects in an ammo's action, found by walking the action
+-- tables (the damage of a projectile named by the ammo lives in that projectile, which isn't read).
+local function damage_in(node, out, depth)
+  if type(node) ~= "table" or depth > 8 then
+    return
+  end
+  if node.type == "damage" and type(node.damage) == "table" and node.damage.amount then
+    local t = node.damage.type or "physical"
+    out[t] = (out[t] or 0) + node.damage.amount
+  end
+  for _, v in pairs(node) do
+    if type(v) == "table" then
+      damage_in(v, out, depth + 1)
+    end
+  end
+end
+
+-- [[damage type, amount], ...] sorted by type, nil without any.
+local function ammo_damage(p)
+  local at = call(p, "get_ammo_type") or get(p, "ammo_type")
+  local sum = {}
+  damage_in(type(at) == "table" and at.action or nil, sum, 0)
+  local out = {}
+  for t, a in pairs(sum) do
+    out[#out + 1] = { t, round(a, 2) }
+  end
+  table.sort(out, function(x, y) return x[1] < y[1] end)
+  return #out > 0 and out or nil
 end
 
 local function item_page(name, p, d)
@@ -350,6 +405,22 @@ local function item_page(name, p, d)
   end
   local ammo = get(p, "ammo_category")
   d.ammo = ammo and ammo.name or nil
+  local mag = get(p, "magazine_size")
+  d.mag = type(mag) == "number" and mag > 1 and mag or nil
+  d.dmg = ammo_damage(p)
+  -- A gun's, or a thrown capsule's, attack: range and shots a second.
+  local capsule = get(p, "capsule_action")
+  local attack = get(p, "attack_parameters") or (type(capsule) == "table" and capsule.attack_parameters) or nil
+  if type(attack) == "table" then
+    d.arange = type(attack.range) == "number" and attack.range > 0 and round(attack.range, 2) or nil
+    d.arate = type(attack.cooldown) == "number" and attack.cooldown > 0 and round(60 / attack.cooldown, 2) or nil
+  end
+  -- Armour: resistances and the equipment grid.
+  d.res = resistances(p)
+  local grid = get(p, "equipment_grid")
+  d.grid = type(grid) == "table" and { get(grid, "width"), get(grid, "height") } or nil
+  local bonus = get(p, "inventory_size_bonus")
+  d.bonus = type(bonus) == "number" and bonus > 0 and bonus or nil
   d.made = capped(l.made[key])
   d.used = capped(l.used[key])
   d.recycle = capped(l.recycled[key])
@@ -475,6 +546,7 @@ function M.entity_page(name, e, d)
   local mp = get(e, "mineable_properties")
   if mp and mp.minable then
     d.mine = amounts(mp.products)
+    d.mine_detail = amount_detail(mp.products)
     d.mtime = round(mp.mining_time, 2)
     d.fluid_req = mp.required_fluid
   end
@@ -490,11 +562,16 @@ function M.entity_page(name, e, d)
   if supply and supply > 0 then
     d.supply = round(supply * 2, 1)
   end
-  local range = get(e, "turret_range")
+  local attack = get(e, "attack_parameters")
+  local range = get(e, "turret_range") or (d.type == "unit" and type(attack) == "table" and attack.range or nil)
   d.range = range and range > 0 and range or nil
   local under = get(e, "max_underground_distance")
   d.under = under and under > 0 and under or nil
-  local inv = call(e, "get_inventory_size", defines.inventory.chest)
+  -- "chest" is also the fuel slots' index (a locomotive's 3 are not storage), so only a container's.
+  local trunks = { car = "car_trunk", ["cargo-wagon"] = "cargo_wagon", ["spider-vehicle"] = "spider_trunk", container = "chest",
+    ["logistic-container"] = "chest", ["linked-container"] = "chest", ["infinity-container"] = "chest" }
+  local trunk = trunks[d.type]
+  local inv = trunk and call(e, "get_inventory_size", defines.inventory[trunk])
   d.inv = inv and inv > 0 and inv or nil
   local radius = call(e, "get_mining_drill_radius") or get(e, "mining_drill_radius")
   d.mradius = radius and radius > 0 and round(radius * 2, 1) or nil
@@ -539,8 +616,9 @@ function M.entity_page(name, e, d)
     table.sort(fc)
     d.fuels = fc
   end
-  local max_speed = get(e, "speed")
-  if d.type == "unit" and max_speed then
+  -- tiles a tick: a unit's `speed`, a locomotive's get_max_speed (cars have none in the data)
+  local max_speed = d.type == "unit" and get(e, "speed") or call(e, "get_max_speed")
+  if type(max_speed) == "number" and max_speed > 0 and (d.type == "unit" or d.type == "locomotive") then
     d.speed = round(max_speed * 60, 2)
   end
   return d
@@ -550,6 +628,7 @@ local function recipe_page(name, r, d)
   local l = lookup()
   d.ing = amounts(get(r, "ingredients"))
   d.prod = amounts(get(r, "products"))
+  d.prod_detail = amount_detail(get(r, "products"))
   d.time = round(get(r, "energy"), 3)
   d.cats = get(r, "categories") or { get(r, "category") }
   local made_in, seen = {}, {}

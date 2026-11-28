@@ -86,6 +86,20 @@ func reach(rec: WorldMirror.Rec, kind: String) -> float:
 	return float(x.get("cw", 0.0)) if float(x.get("cw", 0.0)) > 0.0 else float(e.get("wire", 0.0))
 
 
+## How much further than the reach two entities' centres can be and still connect: the game measures from one wire connection
+## point to the other, and those lie anywhere on the entity (an assembler's 12 tiles apart take a 9-tile wire), so the client
+## only refuses what no placement of the points could reach and leaves the rest to the game (wiring.lua, can_wire_reach).
+## Copper wire between poles is measured centre to centre (wire_max_distance), so a pole end adds none; only circuit
+## wires and a power switch's copper wire reach from connection points off the centre.
+func _slack(a: WorldMirror.Rec, b: WorldMirror.Rec, kind := "") -> float:
+	var out := 0.0
+	for rec in [a, b]:
+		var proto: ProtoDB.EntityProto = world.protos.entity(rec.proto_id) if rec != null else null
+		if proto != null and not (kind == "w" and proto.type == "electric-pole"):
+			out += proto.size().length() * 0.5
+	return out
+
+
 ## The reach between two ends: the shorter of the two, as Factorio's.
 func _limit(a: WorldMirror.Rec, b: WorldMirror.Rec, kind: String) -> float:
 	var ra := reach(a, kind)
@@ -122,7 +136,7 @@ func click(tool: String, rec: WorldMirror.Rec, at: Vector2) -> String:
 		cancel()
 		return ""
 	var limit := _limit(a, rec, kind)
-	if limit > 0.0 and a.pos.distance_to(rec.pos) > limit + 0.01:
+	if limit > 0.0 and a.pos.distance_to(rec.pos) > limit + 0.01 + _slack(a, rec, kind):
 		return "Wire can't reach that far"
 	model.wire(kind, from["end"], end_of(rec, at))
 	from = {"rec": rec, "end": end_of(rec, at), "at": _attach(rec, kind)}
@@ -168,7 +182,7 @@ func update(tool: String, hovered: WorldMirror.Rec, at: Vector2, has_ground: boo
 	var end: Vector3 = _attach(target, kind) if target != null else Vector3(at.x, 0.15, at.y)
 	var limit := _limit(a, target, kind)
 	var dist := a.pos.distance_to(target.pos if target != null else at)
-	var color: Color = COLORS[kind] if limit <= 0.0 or dist <= limit + 0.01 else TOO_FAR
+	var color: Color = COLORS[kind] if limit <= 0.0 or dist <= limit + 0.01 + (_slack(a, target, kind) if target != null else 0.0) else TOO_FAR
 	_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
 	_span(start, end, color)
 	_mesh.surface_end()

@@ -34,6 +34,7 @@ const CONTROLS := [
 	["water", "Water", "terrain", "nauvis", false],
 	["trees", "Trees", "terrain", "nauvis", false],
 	["rocks", "Rocks", "terrain", "nauvis", false],
+	["starting_area_moisture", "Starting area moisture", "terrain", "nauvis", false],
 	["vulcanus_volcanism", "Volcanism", "terrain", "vulcanus", false],
 	["gleba_water", "Water", "terrain", "gleba", false],
 	["gleba_plants", "Plants", "terrain", "gleba", false],

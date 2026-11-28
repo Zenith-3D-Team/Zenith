@@ -42,8 +42,12 @@ local registry = require("scripts.registry")
 local fluids_power = require("scripts.fluids_power")
 local pipelines = require("scripts.pipelines")
 local profile = require("scripts.profile")
+local budget = require("scripts.budget")
 
 local M = {}
+
+-- Module-local counters for tests/probes (never in storage).
+M.counts = { chunk_scans = 0, spot_scans = 0, inv_gets = 0, empty_skips = 0, budget_yields = 0 }
 
 local SEND_INTERVAL = 60
 local SCAN_STEP = 40         -- the small scans (repair packs, trains, platforms), one each this often
@@ -75,6 +79,71 @@ local subjects = setmetatable({}, { __mode = "k" })
 local status_names
 local present_types    -- filters out types this game hasn't got (find_entities_filtered rejects unknown types)
 local repair_items
+-- (gc_lean) Cached LuaInventory handles (inv_id -> unit -> {e, inv}) and module-local pcall/sort helpers.
+local inv_cache = {}
+
+local function find_nets(surface, pos, f) return surface.find_logistic_networks_by_construction_area(pos, f) end
+local function proto_get_supply_area(proto) return proto.get_supply_area_distance() end
+local function proto_supply_area(proto) return proto.supply_area_distance end
+local function force_platforms(f) return f.platforms end
+local function force_lnets(f) return f.logistic_networks end
+local function net_active_providers(net) return net.active_providers end
+local function net_storages(net) return net.storages end
+local function net_cells(net) return net.cells end
+local function net_all_log(net) return net.all_logistic_robots end
+local function net_all_con(net) return net.all_construction_robots end
+local function cell_owner(cell) return cell.owner end
+local function cell_mobile(cell) return cell.mobile end
+local function get_entity_inv(e, inv_id) return e.get_inventory(inv_id) end
+local function inv_is_empty(inv) return inv.is_empty() end
+local function inv_is_full(inv) return inv.is_full() end
+local function inv_empty_stacks(inv) return inv.count_empty_stacks(true, false) end
+local function inv_len(inv) return #inv end
+local function inv_contents(inv) return inv.get_contents() end
+local function define_inv(name) return defines.inventory[name] end
+local function item_stack_size(name) return prototypes.item[name].stack_size end
+
+local function cached_inv(e, inv_id)
+  if not perf.on("gc_lean") then
+    inv_cache = {}
+    M.counts.inv_gets = M.counts.inv_gets + 1
+    local ok, inv = pcall(get_entity_inv, e, inv_id)
+    return ok and inv or nil
+  end
+  local unit = e.unit_number
+  if unit then
+    local bucket = inv_cache[inv_id]
+    if not bucket then
+      bucket = {}
+      inv_cache[inv_id] = bucket
+    end
+    local c = bucket[unit]
+    if c and c.e == e and e.valid and c.inv and c.inv.valid then
+      return c.inv
+    end
+    M.counts.inv_gets = M.counts.inv_gets + 1
+    local ok, inv = pcall(get_entity_inv, e, inv_id)
+    if ok and inv and inv.valid then
+      bucket[unit] = { e = e, inv = inv }
+      return inv
+    end
+    bucket[unit] = nil
+    return ok and inv or nil
+  end
+  M.counts.inv_gets = M.counts.inv_gets + 1
+  local ok, inv = pcall(get_entity_inv, e, inv_id)
+  return ok and inv or nil
+end
+
+local function prune_inv_cache()
+  for _, bucket in pairs(inv_cache) do
+    for unit, c in pairs(bucket) do
+      if not (c.e and c.e.valid and c.inv and c.inv.valid) then
+        bucket[unit] = nil
+      end
+    end
+  end
+end
 
 local function force()
   local c = puppet.get()
@@ -214,9 +283,43 @@ local PASS_KINDS = { "no_ammo", "unplugged", "no_fuel", "output_full", "launch",
 -- A pipe-type entity's share of the pass's per-tick budget (a base has many, and most need one status read).
 local PIPE_COST = 0.25
 
+local function is_stationary_network(net, pos)
+  local ok_cells, cells = pcall(function() return net.cells end)
+  if ok_cells and type(cells) == "table" and next(cells) ~= nil then
+    for _, cell in pairs(cells) do
+      if cell and cell.valid then
+        local ok_m, mob = pcall(function() return cell.mobile end)
+        if not (ok_m and mob) then
+          local ok_r, inside = pcall(function() return cell.is_in_construction_range(pos) end)
+          if ok_r and inside then
+            return true
+          end
+        end
+      end
+    end
+    return false
+  end
+  local ok_c, cell = pcall(function() return net.valid and net.find_cell_closest_to(pos) end)
+  if ok_c and cell and cell.valid then
+    local ok_m, mob = pcall(function() return cell.mobile end)
+    return not (ok_m and mob)
+  end
+  return true
+end
+
 local function networks_at(e)
-  local ok, nets = pcall(function() return e.surface.find_logistic_networks_by_construction_area(e.position, e.force) end)
-  return ok and nets or {}
+  local ok, nets = pcall(find_nets, e.surface, e.position, e.force)
+  if not ok or not nets then
+    return {}
+  end
+  local pos = e.position
+  local out = {}
+  for _, net in pairs(nets) do
+    if is_stationary_network(net, pos) then
+      out[#out + 1] = net
+    end
+  end
+  return out
 end
 
 -- A ghost inside a construction area: missing the item to build it, or no robot free to.
@@ -246,9 +349,15 @@ end
 -- What one entity of the pass adds; returns its cost in the per-tick budget.
 local function check_entity(e, found)
   if e.type == "ammo-turret" then
-    local inv = e.get_inventory(defines.inventory.turret_ammo)
-    if inv and inv.is_empty() then
-      table.insert(found.no_ammo, entry(e))
+    local inv = cached_inv(e, defines.inventory.turret_ammo)
+    if inv then
+      local ok, empty = pcall(inv_is_empty, inv)
+      if ok and empty then
+        M.counts.empty_skips = M.counts.empty_skips + 1
+        table.insert(found.no_ammo, entry(e))
+      elseif not ok and inv.is_empty() then
+        table.insert(found.no_ammo, entry(e))
+      end
     end
     return 1
   elseif e.type == "entity-ghost" then
@@ -328,9 +437,9 @@ local function reach()
     local widest = 9
     for _, proto in pairs(prototypes.entity) do
       if proto.type == "electric-pole" then
-        local ok, d = pcall(function() return proto.get_supply_area_distance() end)
+        local ok, d = pcall(proto_get_supply_area, proto)
         if not (ok and type(d) == "number") then
-          ok, d = pcall(function() return proto.supply_area_distance end)
+          ok, d = pcall(proto_supply_area, proto)
         end
         if ok and type(d) == "number" and d > widest then
           widest = d
@@ -476,8 +585,19 @@ end
 -- Which near kind an entity is now (nil: none). A turret by its ammo inventory, as the pass reads it.
 local function near_kind(e)
   if e.type == "ammo-turret" then
-    local inv = e.get_inventory(defines.inventory.turret_ammo)
-    return (inv and inv.is_empty()) and "no_ammo" or nil
+    local inv = cached_inv(e, defines.inventory.turret_ammo)
+    if not inv then
+      return nil
+    end
+    local ok, empty = pcall(inv_is_empty, inv)
+    if ok then
+      if empty then
+        M.counts.empty_skips = M.counts.empty_skips + 1
+        return "no_ammo"
+      end
+      return nil
+    end
+    return inv.is_empty() and "no_ammo" or nil
   end
   local status = e.status
   local name = status_name(status)
@@ -513,14 +633,24 @@ local function look_at_spots()
   for _, field in pairs(NEAR) do
     near[field] = near[field] or {}  -- (a save from J5 has only u)
   end
+  local spot_cap = SPOTS_PER_TICK
+  if perf.on("gc_lean") then
+    local left = budget.left()
+    if left <= 0 then
+      M.counts.budget_yields = M.counts.budget_yields + 1
+      return
+    end
+    spot_cap = math.min(SPOTS_PER_TICK, math.max(1, math.floor(left / 4)))
+  end
   local f = force()
   local done, changed = 0, false
   local rest = {}
   for _, spot in ipairs(spots) do
-    if done < SPOTS_PER_TICK and spot.t < game.tick then
+    if done < spot_cap and spot.t < game.tick then
       done = done + 1
       if surface and surface.valid then
         local d = spot.r or reach()
+        M.counts.spot_scans = M.counts.spot_scans + 1
         local found = surface.find_entities_filtered({ area = { { spot.x - d, spot.y - d }, { spot.x + d, spot.y + d } },
           type = types, force = f })
         for _, e in pairs(found) do
@@ -578,6 +708,15 @@ local function look_at_pipe_spots()
     s.al_pspots = nil
     return
   end
+  local spot_cap = SPOTS_PER_TICK
+  if perf.on("gc_lean") then
+    local left = budget.left()
+    if left <= 0 then
+      M.counts.budget_yields = M.counts.budget_yields + 1
+      return
+    end
+    spot_cap = math.min(SPOTS_PER_TICK, math.max(1, math.floor(left / 4)))
+  end
   local types = pipelines.types()
   local f = force()
   local done, changed = 0, false
@@ -585,9 +724,12 @@ local function look_at_pipe_spots()
   s.al_pipe = s.al_pipe or {}
   local segs = {}
   for _, spot in ipairs(spots) do
-    if done < SPOTS_PER_TICK and spot.t < game.tick then
+    if done < spot_cap and spot.t < game.tick then
       done = done + 1
       local d = PIPE_SPOT_REACH
+      if #types > 0 then
+        M.counts.spot_scans = M.counts.spot_scans + 1
+      end
       local found = #types > 0 and surface.find_entities_filtered({ area = { { spot.x - d, spot.y - d }, { spot.x + d, spot.y + d } },
         type = types, force = f }) or {}
       for _, e in pairs(found) do
@@ -622,27 +764,28 @@ local function look_at_pipe_spots()
   end
 end
 
+local function add_pipeline_entry(out, segs, e, rec)
+  if e and e.valid and pipelines.overextended(e) then
+    local seg = pipelines.segment(e)
+    if seg and not segs[seg] then
+      segs[seg] = true
+      out[#out + 1] = rec or entry(e, "pipeline_overextended")
+    end
+  end
+end
+
 -- The overextended pipelines: the pass's and the spots' entities still overextended, one a segment.
 local function pipeline_list()
   if not perf.on("pipe_alerts") then
     return {}
   end
   local out, segs = {}, {}
-  local function add(e, rec)
-    if e and e.valid and pipelines.overextended(e) then
-      local seg = pipelines.segment(e)
-      if seg and not segs[seg] then
-        segs[seg] = true
-        out[#out + 1] = rec or entry(e, "pipeline_overextended")
-      end
-    end
-  end
   local s = storage.f3d
   for _, e in pairs(s.al_pipe or {}) do
-    add(e)
+    add_pipeline_entry(out, segs, e)
   end
   for _, rec in ipairs(scans.pipeline or {}) do
-    add(subjects[rec], rec)
+    add_pipeline_entry(out, segs, subjects[rec], rec)
   end
   return out
 end
@@ -650,6 +793,9 @@ end
 local function start_pass()
   passes = passes + 1
   next_pass = game.tick + PASS_INTERVAL * rate.factor("al")
+  if perf.on("gc_lean") then
+    prune_inv_cache()
+  end
   local list = {}
   for _, surface in pairs(game.surfaces) do
     list[#list + 1] = surface.index
@@ -700,12 +846,22 @@ local function step_pass(now)
     end
     start_pass()
   end
+  local chunk_cap, entity_cap = CHUNKS_PER_TICK, ENTITIES_PER_TICK
+  if not now and perf.on("gc_lean") then
+    local left = budget.left()
+    if left <= 0 then
+      M.counts.budget_yields = M.counts.budget_yields + 1
+      return
+    end
+    chunk_cap = math.min(CHUNKS_PER_TICK, math.max(1, math.floor(left)))
+    entity_cap = math.min(ENTITIES_PER_TICK, math.max(1, math.floor(left)))
+  end
   local f = force()
   local chunks, cost = 0, 0
   local quiet = perf.on("alerts_quiet")
   local recheck = passes % EMPTY_EVERY == 0
   local inside = perf.on("alerts_topk")
-  while chunks < CHUNKS_PER_TICK and cost < ENTITIES_PER_TICK do
+  while chunks < chunk_cap and cost < entity_cap do
     -- (alerts_topk) A chunk's entities left from the last tick first: a chunk dense with machines or pipes was
     -- read whole in one tick (35-50 ms on the megabase).
     local left = pass.left
@@ -715,7 +871,7 @@ local function step_pass(now)
         pass.left = nil
       else
         local f_at = left.at
-        while f_at <= #left.found and cost < ENTITIES_PER_TICK do
+        while f_at <= #left.found and cost < entity_cap do
           local e = left.found[f_at]
           f_at = f_at + 1
           if e.valid then
@@ -755,6 +911,7 @@ local function step_pass(now)
       chunks = chunks + EMPTY_COST
     else
       chunks = chunks + 1
+      M.counts.chunk_scans = M.counts.chunk_scans + 1
       local found = surface.find_entities_filtered({ area = chunk.area, force = f, type = pass.types })
       if ckey then
         if #found == 0 then
@@ -828,8 +985,14 @@ local function out_of_fuel(train)
         return false
       end
       local inv = burner.inventory
-      if burner.remaining_burning_fuel > 0 or (inv and not inv.is_empty()) then
+      if burner.remaining_burning_fuel > 0 then
         return false
+      end
+      if inv then
+        local ok, empty = pcall(inv_is_empty, inv)
+        if (ok and not empty) or (not ok and not inv.is_empty()) then
+          return false
+        end
       end
     end
   end
@@ -899,16 +1062,19 @@ end
 
 local function scan_platforms()
   local path, storage_full = {}, {}
-  local ok, platforms = pcall(function() return force().platforms end)
+  local ok, platforms = pcall(force_platforms, force())
   for _, p in pairs(ok and platforms or {}) do
     local hub = p.valid and p.hub
     if hub and hub.valid then
       if p.state == defines.space_platform_state.no_path then
         path[#path + 1] = entry(hub, p.name)
       end
-      local inv = hub.get_inventory(defines.inventory.hub_main)
-      if inv and inv.is_full() then
-        storage_full[#storage_full + 1] = entry(hub, p.name)
+      local inv = cached_inv(hub, defines.inventory.hub_main)
+      if inv then
+        local okf, full = pcall(inv_is_full, inv)
+        if (okf and full) or (not okf and inv.is_full()) then
+          storage_full[#storage_full + 1] = entry(hub, p.name)
+        end
       end
     end
   end
@@ -916,14 +1082,164 @@ local function scan_platforms()
   scans.platform_storage = storage_full
 end
 
-local SCANS = { scan_repair, scan_trains, scan_platforms }
-local SCANS_NOW = { scan_repair, scan_trains_all, scan_platforms }
+local robot_stack
+local function robot_stack_size()
+  if not robot_stack then
+    local best = 50
+    for _, name in ipairs({ "logistic-robot", "construction-robot" }) do
+      local ok, s = pcall(item_stack_size, name)
+      if ok and type(s) == "number" and s > 0 then
+        best = math.max(best, s)
+      end
+    end
+    robot_stack = best
+  end
+  return robot_stack
+end
+
+local function scan_logistics(now)
+  if not now and perf.on("gc_lean") and budget.left() <= 0 then
+    M.counts.budget_yields = M.counts.budget_yields + 1
+    return
+  end
+  local no_storage, no_roboport = {}, {}
+  local ok_nets, by_surface = pcall(force_lnets, force())
+  if not ok_nets or type(by_surface) ~= "table" then
+    scans.no_storage = no_storage
+    scans.no_roboport_storage = no_roboport
+    return
+  end
+  local ok_c, chest_inv_id = pcall(define_inv, "chest")
+  if not ok_c then
+    chest_inv_id = nil
+  end
+  local ok_r, robot_inv_id = pcall(define_inv, "roboport_robot")
+  if not ok_r then
+    robot_inv_id = nil
+  end
+  local stack_size = robot_stack_size()
+  for _, nets in pairs(by_surface) do
+    if type(nets) == "table" then
+      for _, net in pairs(nets) do
+        if net and net.valid then
+          -- Active providers waiting for storage when every storage chest is full (or none exist).
+          local ok_ap, active = pcall(net_active_providers, net)
+          if ok_ap and type(active) == "table" and #active > 0 and chest_inv_id then
+            local waiting = nil
+            for _, ap in pairs(active) do
+              if ap and ap.valid then
+                local inv = cached_inv(ap, chest_inv_id)
+                if inv then
+                  local oke, empty_inv = pcall(inv_is_empty, inv)
+                  if (oke and not empty_inv) or (not oke and not inv.is_empty()) then
+                    waiting = ap
+                    break
+                  end
+                end
+              end
+            end
+            if waiting then
+              local ok_st, storages = pcall(net_storages, net)
+              if ok_st and type(storages) == "table" then
+                local room = false
+                for _, st in pairs(storages) do
+                  if st and st.valid then
+                    local inv = cached_inv(st, chest_inv_id)
+                    if inv then
+                      local okf, full = pcall(inv_is_full, inv)
+                      if not (okf and full) then
+                        room = true
+                        break
+                      end
+                    end
+                  end
+                end
+                if not room then
+                  no_storage[#no_storage + 1] = entry(waiting)
+                end
+              end
+            end
+          end
+
+          -- Robots exist and every stationary roboport has zero free robot slots while robots exceed capacity or docked count.
+          local ok_lr, all_log = pcall(net_all_log, net)
+          local ok_cr, all_con = pcall(net_all_con, net)
+          local all_robots = (ok_lr and type(all_log) == "number" and all_log or 0)
+            + (ok_cr and type(all_con) == "number" and all_con or 0)
+          if all_robots > 0 and robot_inv_id then
+            local ok_cells, cells = pcall(net_cells, net)
+            if ok_cells and type(cells) == "table" then
+              local first_owner = nil
+              local any_free = false
+              local total_capacity = 0
+              local docked = 0
+              for _, cell in pairs(cells) do
+                if cell and cell.valid then
+                  local ok_m, mob = pcall(cell_mobile, cell)
+                  if not (ok_m and mob) then
+                    local ok_o, owner = pcall(cell_owner, cell)
+                    if ok_o and owner and owner.valid then
+                      first_owner = first_owner or owner
+                      local inv = cached_inv(owner, robot_inv_id)
+                      if inv then
+                        local ok_len, slots = pcall(inv_len, inv)
+                        if ok_len and type(slots) == "number" and slots > 0 then
+                          total_capacity = total_capacity + slots * stack_size
+                        end
+                        local ok_es, empty_stacks = pcall(inv_empty_stacks, inv)
+                        if ok_es and type(empty_stacks) == "number" then
+                          if empty_stacks > 0 then
+                            any_free = true
+                            break
+                          end
+                        else
+                          local ok_f, full = pcall(inv_is_full, inv)
+                          if ok_f and not full then
+                            any_free = true
+                            break
+                          end
+                        end
+                        local ok_gc, contents = pcall(inv_contents, inv)
+                        if ok_gc and type(contents) == "table" then
+                          for _, it in pairs(contents) do
+                            docked = docked + (it.count or 0)
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+              if first_owner and not any_free and (all_robots > total_capacity or all_robots > docked) then
+                no_roboport[#no_roboport + 1] = entry(first_owner)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  scans.no_storage = no_storage
+  scans.no_roboport_storage = no_roboport
+end
+
+local function scan_logistics_tick()
+  scan_logistics(false)
+end
+
+local function scan_logistics_now()
+  scan_logistics(true)
+end
+
+local SCANS = { scan_repair, scan_trains, scan_platforms, scan_logistics_tick }
+local SCANS_NOW = { scan_repair, scan_trains_all, scan_platforms, scan_logistics_now }
 
 ---------------------------------------------------------------------------------------------
 
 -- The order of Factorio's alert bar, then the machine warnings.
-local ORDER = { "destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "train_fuel", "train_path",
-  "platform_path", "platform_storage", "collector", "launch", "pipeline", "unplugged", "no_fuel", "output_full", "depleted" }
+local ORDER = { "destroyed", "attack", "fire", "no_ammo", "no_material", "no_robots", "no_repair", "no_storage",
+  "train_fuel", "train_path", "platform_path", "platform_storage", "collector", "no_roboport_storage", "launch",
+  "pipeline", "unplugged", "no_fuel", "output_full", "depleted" }
 
 local function from_events(al, kind)
   local list = {}
@@ -962,6 +1278,19 @@ local function near_list(kind)
   return out
 end
 
+local sort_si, sort_fx, sort_fy = 0, 0, 0
+local function cmp_alert_entry(a, b)
+  if (a[3] == sort_si) ~= (b[3] == sort_si) then
+    return a[3] == sort_si
+  end
+  local da = (a[1] - sort_fx) ^ 2 + (a[2] - sort_fy) ^ 2
+  local db = (b[1] - sort_fx) ^ 2 + (b[2] - sort_fy) ^ 2
+  if da ~= db then
+    return da < db
+  end
+  return a[5] < b[5]
+end
+
 local function message_sorted()
   local al = state()
   local here = puppet.get()
@@ -982,20 +1311,8 @@ local function message_sorted()
       -- The character's surface first, nearest the camera first (only PER_KIND are listed, and
       -- the client draws icons over those).
       local f = storage.f3d.focus
-      local fx, fy = world.fixed(f.x), world.fixed(f.y)
-      local function d2(e)
-        return (e[1] - fx) ^ 2 + (e[2] - fy) ^ 2
-      end
-      table.sort(list, function(a, b)
-        if (a[3] == si) ~= (b[3] == si) then
-          return a[3] == si
-        end
-        local da, db = d2(a), d2(b)
-        if da ~= db then
-          return da < db
-        end
-        return a[5] < b[5]
-      end)
+      sort_si, sort_fx, sort_fy = si, world.fixed(f.x), world.fixed(f.y)
+      table.sort(list, cmp_alert_entry)
       local shown = {}
       for i = 1, math.min(#list, PER_KIND) do
         shown[i] = list[i]
@@ -1280,6 +1597,7 @@ end
 
 function M.reset()
   scans = {}
+  inv_cache = {}
   train_scan = nil
   pass = nil
   next_pass = 0

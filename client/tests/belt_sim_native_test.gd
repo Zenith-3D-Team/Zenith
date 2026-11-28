@@ -128,11 +128,15 @@ var take_edge := true
 var ug_guard := true
 ## Reads put back every item they haven't behind or ahead of their own, as before --belt-sim-rescue-seen: a pass.
 var rescue_seen := true
+## Bug #18 fixes, as before --belt-take-sync=old: a pass.
+var take_sync := true
 
 
 func _fresh(edge: int) -> void:
 	gd = BeltSim.new()
 	nat = ClassDB.instantiate("BeltSimNative")
+	BeltSim.take_sync = take_sync
+	nat.take_sync = take_sync
 	gd.edge_mode = edge
 	nat.edge_mode = edge
 	gd.ask_on_link = true
@@ -313,7 +317,16 @@ func _initialize() -> void:
 		print("synthetic world 3, rescue_seen off: %d checks, %d differences" % [checked, fails])
 		rescue_seen = true
 	if fails == 0:
+		take_sync = false
+		_synthetic(1, 1500)
+		print("synthetic world 1, take_sync off: %d checks, %d differences" % [checked, fails])
+		take_sync = true
+	if fails == 0:
+		_take_sync_cases()
+	if fails == 0:
 		_lattice_model_cap_and_bands()
+	if fails == 0:
+		_bug3_and_bug9_cases()
 	print("%s in %d ms: %d checks, %d differences" % ["PASS" if fails == 0 else "FAIL", Time.get_ticks_msec() - t0,
 		checked, fails])
 	quit(1 if fails > 0 else 0)
@@ -775,7 +788,7 @@ func _take_before_read() -> void:
 			gd.rescue_seen = take_first
 			nat.rescue_seen = take_first
 			both("step_to", [0])
-			for u in [1, 2, 3]:
+			for u: int in [1, 2, 3]:
 				var ex := Vector2i((u + 1) * 256, 2560)
 				var en := Vector2i(u * 256, 2560)
 				both("set_lane", [u * 8 + 1, BeltSim.STRAIGHT, 256, 8, ex, (ex + en) / 2, en, 0, 0])
@@ -1405,3 +1418,568 @@ func _lattice_model_cap_and_bands() -> void:
 				break
 	BeltLattice.model_cap_near = was_cap_near
 	print("lattice model_cap & distance bands (GDScript vs C++): %d checks, %d differences" % [checked, fails])
+
+
+func _setup_west_line(n_belts: int) -> void:
+	both("step_to", [0])
+	for u in range(1, n_belts + 1):
+		var ex := Vector2i((u - 1) * 256, 2560)
+		var en := Vector2i(u * 256, 2560)
+		both("set_lane", [u * 8 + 1, BeltSim.STRAIGHT, 256, 8, ex, (ex + en) / 2, en, 0, 0])
+
+
+## Bug #18 regression cases: each run with take_sync on and off, verifying twin parity every tick and that
+## take_sync fixes each race while take_sync off preserves the old behavior.
+func _take_sync_cases() -> void:
+	var was_sync := BeltSim.take_sync
+	for on in [true, false]:
+		take_sync = on
+		# 1a. Multi-tick feeder/pickup reads (ticks 100 & 101): feeder read at 100, pickup read at 101.
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("step_to", [98])
+		both("load_lane", [9, 98, PackedInt64Array([50, 7, 200, 1])])
+		both("step_to", [99])
+		both("load_lane", [17, 100, PackedInt64Array()])
+		both("step_to", [100])
+		if not compare("take_sync multi-tick feeder first t100 (on=%s)" % on):
+			break
+		both("load_lane", [9, 101, PackedInt64Array()])
+		both("step_to", [101])
+		if not compare("take_sync multi-tick feeder first t101 (on=%s)" % on):
+			break
+		var st1a: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_rescue_denied != 1 or st1a.has(50)):
+			_fail("take_sync multi-tick feeder first", "expected item 50 denied, denied=%d items=%s" % [gd.n_rescue_denied, str(st1a)])
+			break
+		if not on and (gd.n_rescue_denied != 0 or not st1a.has(50)):
+			_fail("take_sync=old multi-tick feeder first", "expected old behavior rescuing 50, denied=%d items=%s" % [gd.n_rescue_denied, str(st1a)])
+			break
+
+		# 1b. Multi-tick pickup at 100, feeder queued ahead at 101 (_qload).
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("step_to", [98])
+		both("load_lane", [9, 98, PackedInt64Array([50, 7, 200, 1])])
+		both("step_to", [99])
+		both("load_lane", [9, 100, PackedInt64Array()])
+		both("load_lane", [17, 101, PackedInt64Array()])
+		both("step_to", [100])
+		if not compare("take_sync multi-tick qload t100 (on=%s)" % on):
+			break
+		both("step_to", [101])
+		if not compare("take_sync multi-tick qload t101 (on=%s)" % on):
+			break
+		var st1b: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_rescue_denied != 1 or st1b.has(50)):
+			_fail("take_sync multi-tick qload", "expected item 50 denied via _qload, denied=%d items=%s" % [gd.n_rescue_denied, str(st1b)])
+			break
+		if not on and (gd.n_rescue_denied != 0 or not st1b.has(50)):
+			_fail("take_sync=old multi-tick qload", "expected old behavior rescuing 50, denied=%d items=%s" % [gd.n_rescue_denied, str(st1b)])
+			break
+
+		# 2. Cross-lane l_read abort: lane 1 read at tick 10 does not abort lane 2 take at tick 10.
+		_fresh(BeltSim.EDGE_STOP)
+		both("step_to", [0])
+		both("set_lane", [9, BeltSim.STRAIGHT, 256, 8, Vector2i(0, 2500), Vector2i(128, 2500), Vector2i(256, 2500), 0, 0])
+		both("set_lane", [10, BeltSim.STRAIGHT, 256, 8, Vector2i(0, 2620), Vector2i(128, 2620), Vector2i(256, 2620), 0, 0])
+		both("load_lane", [10, 0, PackedInt64Array([20, 7, 128, 1])])
+		both("step_to", [1])
+		both("load_lane", [9, 10, PackedInt64Array()])
+		both("step_to", [10])
+		if not compare("take_sync cross-lane read t10 (on=%s)" % on):
+			break
+		both("take_at", [10, 1, 7, 1, 56, 2620, 99])
+		both("step_to", [11])
+		if not compare("take_sync cross-lane take t11 (on=%s)" % on):
+			break
+		var st2: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_hand[BeltSim.HAND_TAKEN] != 1 or st2.has(20)):
+			_fail("take_sync cross-lane l_read", "expected lane 2 item 20 taken, n_hand=%s items=%s" % [str(gd.n_hand), str(st2)])
+			break
+		if not on and (gd.n_hand[BeltSim.HAND_READ] != 1 or not st2.has(20)):
+			_fail("take_sync=old cross-lane l_read", "expected HAND_READ abort, n_hand=%s items=%s" % [str(gd.n_hand), str(st2)])
+			break
+
+		# 3. Second read before delayed take_at preserves _rescued[i].
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("load_lane", [9, 0, PackedInt64Array([50, 7, 200, 1])])
+		both("step_to", [9])
+		both("load_lane", [17, 10, PackedInt64Array()])
+		both("load_lane", [9, 10, PackedInt64Array()])
+		both("step_to", [10])
+		if not compare("take_sync second read t10 (on=%s)" % on):
+			break
+		both("load_lane", [9, 12, PackedInt64Array([51, 7, 240, 1])])
+		both("step_to", [12])
+		if not compare("take_sync second read t12 (on=%s)" % on):
+			break
+		both("take_at", [10, 1, 7, 1, 120, 2560, 99])
+		both("step_to", [14])
+		if not compare("take_sync second read t14 (on=%s)" % on):
+			break
+		var st3: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_take_rescued != 1 or gd.n_hand[BeltSim.HAND_TAKEN] != 1 or st3.has(50)):
+			_fail("take_sync second read before delayed take_at", "expected 50 taken from preserved _rescued, rescued=%d n_hand=%s items=%s" % [gd.n_take_rescued, str(gd.n_hand), str(st3)])
+			break
+		if not on and (gd.n_take_rescued != 0 or gd.n_hand[BeltSim.HAND_READ] != 1):
+			_fail("take_sync=old second read", "expected second read to wipe _rescued, rescued=%d n_hand=%s" % [gd.n_take_rescued, str(gd.n_hand)])
+			break
+
+		# 4. _push_back before `before` snapshot tracks pushed-off items in _rescued.
+		_fresh(BeltSim.EDGE_STOP)
+		both("step_to", [0])
+		both("set_lane", [9, BeltSim.STRAIGHT, 256, 16, Vector2i(0, 2560), Vector2i(128, 2560), Vector2i(256, 2560), 0, 0])
+		both("set_lane", [17, BeltSim.STRAIGHT, 256, 8, Vector2i(256, 2560), Vector2i(384, 2560), Vector2i(512, 2560), 0, 0])
+		both("set_lane", [25, BeltSim.STRAIGHT, 256, 8, Vector2i(512, 2560), Vector2i(640, 2560), Vector2i(768, 2560), 0, 0])
+		both("load_lane", [17, 0, PackedInt64Array([60, 7, 8, 1, 50, 7, 128, 1])])
+		both("step_to", [2])
+		both("load_lane", [17, 3, PackedInt64Array([60, 7, 4, 1])])
+		both("step_to", [3])
+		if not compare("take_sync push_back t3 (on=%s)" % on):
+			break
+		both("take_at", [3, 2, 7, 1, 360, 2560, 99])
+		both("step_to", [4])
+		if not compare("take_sync push_back t4 (on=%s)" % on):
+			break
+		var st4: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_take_rescued != 1 or st4.has(50)):
+			_fail("take_sync push_back snapshot", "expected 50 tracked across _push_back, rescued=%d items=%s" % [gd.n_take_rescued, str(st4)])
+			break
+		if not on and (gd.n_take_rescued != 0 or not st4.has(50)):
+			_fail("take_sync=old push_back snapshot", "expected post-_push_back snapshot to miss 50, rescued=%d items=%s" % [gd.n_take_rescued, str(st4)])
+			break
+
+		# 5. at - rt == 4 chase lag (TAKE_LEAD_SYNC = 5 vs old TAKE_LEAD = 3).
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("load_lane", [9, 0, PackedInt64Array([50, 7, 200, 1])])
+		both("step_to", [9])
+		both("load_lane", [17, 10, PackedInt64Array()])
+		both("load_lane", [9, 10, PackedInt64Array()])
+		both("step_to", [10])
+		both("take_at", [14, 1, 7, 1, 120, 2560, 99])
+		both("step_to", [15])
+		if not compare("take_sync chase lag at-rt=4 (on=%s)" % on):
+			break
+		if on and (gd.n_take_rescued != 1 or gd.n_hand[BeltSim.HAND_TAKEN] != 1):
+			_fail("take_sync at-rt=4", "expected 50 taken at at-rt=4, rescued=%d n_hand=%s" % [gd.n_take_rescued, str(gd.n_hand)])
+			break
+		if not on and (gd.n_take_rescued != 0 or gd.n_hand[BeltSim.HAND_NONE] != 1):
+			_fail("take_sync=old at-rt=4", "expected old TAKE_LEAD=3 to miss at-rt=4, rescued=%d n_hand=%s" % [gd.n_take_rescued, str(gd.n_hand)])
+			break
+
+		# 6. Forward rescue guard (j < rmin): item seen far upstream cannot teleport forward across lo.
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("step_to", [9])
+		both("load_lane", [17, 10, PackedInt64Array([50, 7, 140, 1, 51, 7, 204, 1])])
+		both("step_to", [10])
+		both("load_lane", [17, 11, PackedInt64Array([51, 7, 196, 1])])
+		both("step_to", [11])
+		if not compare("take_sync forward rescue guard (on=%s)" % on):
+			break
+		var st6: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_rescue_denied != 1 or st6.has(50) or not st6.has(51)):
+			_fail("take_sync forward rescue guard", "expected 50 forward rescue denied, denied=%d items=%s" % [gd.n_rescue_denied, str(st6)])
+			break
+		if not on and (gd.n_rescue_denied != 0 or not st6.has(50)):
+			_fail("take_sync=old forward rescue guard", "expected old at=-1 to forward-rescue 50, denied=%d items=%s" % [gd.n_rescue_denied, str(st6)])
+			break
+
+		# 7. Empty pc check updates l_seen[i] so downstream read denies bounce-back onto empty feeder.
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("load_lane", [9, 0, PackedInt64Array([50, 7, 200, 1])])
+		both("step_to", [9])
+		both("check_lane", [17, 10, 0, -1, -1])
+		both("step_to", [10])
+		both("load_lane", [9, 11, PackedInt64Array()])
+		both("step_to", [11])
+		if not compare("take_sync empty pc check (on=%s)" % on):
+			break
+		var st7: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_rescue_denied != 1 or st7.has(50)):
+			_fail("take_sync empty pc", "expected 50 denied after empty pc on feeder, denied=%d items=%s" % [gd.n_rescue_denied, str(st7)])
+			break
+		if not on and (gd.n_rescue_denied != 0 or not st7.has(50)):
+			_fail("take_sync=old empty pc", "expected old behavior pushing 50 onto empty feeder, denied=%d items=%s" % [gd.n_rescue_denied, str(st7)])
+			break
+
+		# 8. Moving-belt _take_known skips item that legitimately flowed off belt by read tick e[0].
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(3)
+		both("load_lane", [17, 0, PackedInt64Array([10, 7, 92, 1, 11, 7, 164, 1])])
+		both("step_to", [9])
+		both("take_at", [10, 2, 7, 1, 296, 2560, 99])
+		both("load_lane", [17, 12, PackedInt64Array()])
+		both("step_to", [10])
+		if not compare("take_sync moving _take_known t10 (on=%s)" % on):
+			break
+		var st8_t10: PackedInt64Array = gd.items_state()[0]
+		if on and (not st8_t10.has(10) or st8_t10.has(11)):
+			_fail("take_sync moving _take_known t10", "expected 10 kept and 11 taken at t10, items=%s" % str(st8_t10))
+			break
+		if not on and (st8_t10.has(10) or not st8_t10.has(11)):
+			_fail("take_sync=old moving _take_known t10", "expected old _take_known to mis-pick 10 at t10, items=%s" % str(st8_t10))
+			break
+		both("step_to", [15])
+		if not compare("take_sync moving _take_known t15 (on=%s)" % on):
+			break
+		var st8: PackedInt64Array = gd.items_state()[0]
+		if on and (not st8.has(10) or st8.has(11)):
+			_fail("take_sync moving _take_known", "expected 10 kept (flowed off by t12) and 11 taken, items=%s" % str(st8))
+			break
+
+		# 9. Feeder back-edge: inserter on belt 1 grabs item at pos 0 of feeder belt 2.
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("step_to", [8])
+		both("load_lane", [17, 9, PackedInt64Array([70, 7, 8, 1])])
+		both("step_to", [10])
+		both("take_at", [10, 1, 7, 1, 256, 2560, 99])
+		both("step_to", [11])
+		if not compare("take_sync feeder back-edge (on=%s)" % on):
+			break
+		var st9: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_hand[BeltSim.HAND_TAKEN] != 1 or st9.has(70)):
+			_fail("take_sync feeder back-edge", "expected item 70 at feeder pos 0 taken, n_hand=%s items=%s" % [str(gd.n_hand), str(st9)])
+			break
+		if not on and (gd.n_hand[BeltSim.HAND_NONE] != 1 or not st9.has(70)):
+			_fail("take_sync=old feeder back-edge", "expected HAND_NONE with old behavior, n_hand=%s items=%s" % [str(gd.n_hand), str(st9)])
+			break
+
+		# 10. Empty lane reduces rescue strikes (max 1 rescue on nl == 0, denied on 2nd empty read).
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("load_lane", [9, 0, PackedInt64Array([50, 7, 200, 1])])
+		both("step_to", [9])
+		both("load_lane", [9, 10, PackedInt64Array()])
+		both("step_to", [14])
+		both("load_lane", [9, 15, PackedInt64Array()])
+		both("step_to", [15])
+		if not compare("take_sync empty lane rescue strikes (on=%s)" % on):
+			break
+		var st10: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_rescue_denied != 1 or st10.has(50)):
+			_fail("take_sync empty rescue strikes", "expected 50 denied on 2nd empty read, denied=%d items=%s" % [gd.n_rescue_denied, str(st10)])
+			break
+		if not on and (gd.n_rescue_denied != 0 or not st10.has(50)):
+			_fail("take_sync=old empty rescue strikes", "expected old 2 rescues before deny, denied=%d items=%s" % [gd.n_rescue_denied, str(st10)])
+			break
+	take_sync = true
+	BeltSim.take_sync = was_sync
+	print("take_sync (Bug #18) cases: %d checks, %d differences" % [checked, fails])
+
+
+func _bs_lane_arr(key: int, kind: int, length: int, step: int, ex: float, ey: float, en_x: float, en_y: float, next_key := 0) -> Array:
+	var mx := (ex + en_x) * 0.5
+	var my := (ey + en_y) * 0.5
+	return [key, kind, length, step, roundi(ex * 256.0), roundi(ey * 256.0), roundi(mx * 256.0), roundi(my * 256.0),
+		roundi(en_x * 256.0), roundi(en_y * 256.0), 0, next_key]
+
+
+func _bs_feed_msg(layer: Node3D, k: int, extra: Dictionary, frames := 1) -> void:
+	var m := {"t": "bs", "k": k, "p": 6, "w": 100, "fx": 0, "fy": 10 * 256, "fr": 40}
+	m.merge(extra, true)
+	layer.handle(m)
+	for _f in frames:
+		layer._process(1.0 / 60.0)
+
+
+## Regression tests for Bug #9 (empty-read rescue denial, forward _qload, unc take reach, moving lattice hole exit)
+## and Bug #3 (brm + dl, future waiting purge, active item removal & upstream clipping, immediate fold_tick).
+func _bug3_and_bug9_cases() -> void:
+	var was_sync := BeltSim.take_sync
+	var was_gd := BeltItems.State.force_gd
+	var was_draw_nat := BeltItems.State.draw_native
+	var was_lat_nat := BeltItems.State.lattice_native
+	var was_rm_now := BeltItems.removed_now
+	var was_cull := BeltItems.Job.view_cull
+	BeltItems.Job.view_cull = false
+
+	# --- Bug #9D & #9C (BeltSim vs BeltSimNative) ---
+	for on in [true, false]:
+		take_sync = on
+		# 9D-1: Backward rescue denial when to_back was recently seen empty (> 2 ticks ago, within EMPTY_SEEN_TICKS).
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("load_lane", [17, 0, PackedInt64Array()])
+		both("load_lane", [9, 0, PackedInt64Array([50, 7, 200, 1])])
+		both("step_to", [19])
+		both("load_lane", [9, 20, PackedInt64Array()])
+		both("step_to", [20])
+		if not compare("bug9d empty-read backward rescue denial (on=%s)" % on):
+			break
+		var st9d1: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_rescue_denied != 1 or st9d1.has(50)):
+			_fail("bug9d backward empty rescue denial", "expected 50 denied, denied=%d items=%s" % [gd.n_rescue_denied, str(st9d1)])
+			break
+		if not on and (gd.n_rescue_denied != 0 or not st9d1.has(50)):
+			_fail("bug9d=old backward empty rescue", "expected old behavior rescuing 50, denied=%d items=%s" % [gd.n_rescue_denied, str(st9d1)])
+			break
+
+		# 9D-2: Forward rescue _qload check on to_front (feeder == false).
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(2)
+		both("step_to", [8])
+		both("load_lane", [17, 9, PackedInt64Array([50, 7, 10, 1, 51, 7, 100, 1])])
+		both("step_to", [9])
+		both("load_lane", [9, 11, PackedInt64Array()])  # queued in _qload[to_front=9]
+		both("load_lane", [17, 10, PackedInt64Array([51, 7, 92, 1])])
+		both("step_to", [10])
+		if not compare("bug9d forward rescue _qload (on=%s)" % on):
+			break
+		var st9d2: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_rescue_denied != 1 or st9d2.has(50)):
+			_fail("bug9d forward rescue _qload", "expected 50 forward rescue denied via _qload, denied=%d items=%s" % [gd.n_rescue_denied, str(st9d2)])
+			break
+		if not on and (gd.n_rescue_denied != 0 or not st9d2.has(50)):
+			_fail("bug9d=old forward rescue _qload", "expected old behavior forward-rescuing 50, denied=%d items=%s" % [gd.n_rescue_denied, str(st9d2)])
+			break
+
+		# 9C: Fast-inserter unc take reach (> TAKE_REACH_SYNC 192 when unc == 2).
+		_fresh(BeltSim.EDGE_STOP)
+		_setup_west_line(1)
+		both("load_lane", [9, 0, PackedInt64Array([60, 7, 128, 1])])
+		both("step_to", [9])
+		both("take_at", [10, 1, 7, 1, 128, 2560 + 280, 99, 2])
+		both("step_to", [11])
+		if not compare("bug9c unc take reach (on=%s)" % on):
+			break
+		var st9c: PackedInt64Array = gd.items_state()[0]
+		if on and (gd.n_hand[BeltSim.HAND_TAKEN] != 1 or st9c.has(60)):
+			_fail("bug9c unc take reach", "expected 60 taken with unc=2, n_hand=%s items=%s" % [str(gd.n_hand), str(st9c)])
+			break
+		if not on and (gd.n_hand[BeltSim.HAND_NONE] != 1 or not st9c.has(60)):
+			_fail("bug9c=old unc take reach", "expected HAND_NONE with take_sync=off, n_hand=%s items=%s" % [str(gd.n_hand), str(st9c)])
+			break
+
+	# --- Bug #9E: Moving lattice hole exit (BeltLattice vs BeltLatticeNative) ---
+	if fails == 0 and ClassDB.class_exists("BeltLatticeNative"):
+		for on in [true, false]:
+			take_sync = on
+			BeltSim.take_sync = on
+			_fresh(BeltSim.EDGE_STOP)
+			both("step_to", [0])
+			var lat_gd := BeltLattice.new()
+			var lat_nat: RefCounted = ClassDB.instantiate("BeltLatticeNative")
+			lat_nat.set_sim(nat)
+			lat_nat.set_take_sync(on)
+			var jst := LatJobState.new()
+			jst.records.base = 0.0
+			var known := {1: [Vector3.ZERO, true, 0.07, 1], -2: [Vector3.ZERO, false, 0.07, 1]}
+			for u: int in [1, 2, 3, 4]:
+				var k := u * 8 + 1
+				var en := roundi(float(u) * 256.0)
+				var ex := roundi(float(u + 1) * 256.0)
+				var mx := (ex + en) / 2
+				var y := roundi(10.5 * 256.0)
+				var nx := (u % 4 + 1) * 8 + 1
+				both("set_lane", [k, BeltSim.STRAIGHT, 256, 8, Vector2i(ex, y), Vector2i(mx, y), Vector2i(en, y), 0, nx])
+				var meta := PackedInt32Array([BeltSim.STRAIGHT, 256, 8, ex, y, mx, y, en, y])
+				jst.lanes[k] = meta
+				lat_nat.set_lane(k, meta, PackedFloat64Array())
+				var sl := PackedInt64Array([u * 100 + 1, 1, 0, 1, u * 100 + 2, 1, 64, 1, u * 100 + 3, 1, 128, 1, u * 100 + 4, 1, 192, 1])
+				both("load_lane", [k, 0, sl])
+				lat_gd.note_read(k, 256, sl)
+				lat_nat.note_read(k, 256, sl)
+			var view := Rect2(-5.0, 0.0, 20.0, 20.0)
+			for tk in [1, 18]:
+				both("step_to", [tk])
+				lat_gd.drawn_tick = tk
+				lat_nat.set_drawn_tick(tk)
+				lat_gd.update(jst, gd, tk, view, true, known, -1, false, false)
+				lat_nat.update(tk, view, true, known, -1, false, false, 0.0, 0.16, true, true, true, true, true, true)
+			checked += 1
+			var gd_v17 := int(lat_gd.drawn[17].v) if lat_gd.drawn.has(17) else -1
+			var nat_v17 := int(lat_nat.drawn_speed(17))
+			if gd_v17 != 8 or nat_v17 != 8:
+				_fail("bug9e setup", "expected moving lattice on lane 17: gd_v=%d nat_v=%d" % [gd_v17, nat_v17])
+				break
+			lat_gd.hole(17, 18, 64, false)
+			lat_nat.hole(17, 18, 64, false)
+			both("take_item", [202, true])
+			both("step_to", [19])
+			lat_gd.drawn_tick = 19
+			lat_nat.set_drawn_tick(19)
+			lat_gd.update(jst, gd, 19, view, true, known, -1, false, false)
+			lat_nat.update(19, view, true, known, -1, false, false, 0.0, 0.16, true, true, true, true, true, true)
+			checked += 1
+			var gd_has17 := lat_gd.drawn.has(17)
+			var nat_has17 := int(lat_nat.drawn_speed(17)) >= 0
+			if gd_has17 != nat_has17:
+				_fail("bug9e twin parity", "lane 17 after hole: gd=%s nat=%s" % [gd_has17, nat_has17])
+				break
+			if on and (gd_has17 or bool((lat_gd.info[17] as Array)[0]) or not lat_gd.fed_gone.has(25)):
+				_fail("bug9e moving hole exit", "expected lane 17 exited and fed_gone on 25: has17=%s info=%s fed_gone=%s" % [gd_has17, str(lat_gd.info[17]), str(lat_gd.fed_gone)])
+				break
+			if not on and not gd_has17:
+				_fail("bug9e=old moving hole", "expected lane 17 kept in lattice when take_sync=off")
+				break
+			if on:
+				both("take_item", [301, true])
+				both("step_to", [20])
+				lat_gd.drawn_tick = 20
+				lat_nat.set_drawn_tick(20)
+				lat_gd.update(jst, gd, 20, view, true, known, -1, false, false)
+				lat_nat.update(20, view, true, known, -1, false, false, 0.0, 0.16, true, true, true, true, true, true)
+				checked += 1
+				var gd_has25 := lat_gd.drawn.has(25)
+				var nat_has25 := int(lat_nat.drawn_speed(25)) >= 0
+				if gd_has25 or nat_has25:
+					_fail("bug9e downstream exit", "expected lane 25 to exit when short after fed_gone: gd=%s nat=%s" % [gd_has25, nat_has25])
+					break
+
+	# --- Bug #3: Immediate item removal on belt break (GDScript & Native Draw) ---
+	take_sync = true
+	BeltSim.take_sync = true
+	BeltItems.removed_now = true
+	var draw_modes := [[true, false]]
+	if ClassDB.class_exists("BeltDrawNative"):
+		draw_modes.append([false, true])
+	for dm: Array in draw_modes:
+		if fails > 0:
+			break
+		BeltItems.State.force_gd = bool(dm[0])
+		BeltItems.State.draw_native = bool(dm[1])
+		BeltItems.State.lattice_native = bool(dm[1])
+		var what := "Native" if bool(dm[1]) else "GDScript"
+
+		# 3A + 3C + 3D via BeltItems:
+		# Belts 1 -> 2 -> 3 going east (+x at y=10.0), moving speed 8.
+		# Item 10 starts on belt 1 at pos 156 (reaches pos 244 at tick 1011, heading onto belt 2); item 20 starts on belt 2 at pos 128;
+		# item 30 stands on belt 3 (dead end at x=4.0).
+		var items := BeltItems.new()
+		root.add_child(items)
+		items._sync = true
+		items.watch_all = true
+		var lm3: Array = []
+		for u: int in [1, 2, 3]:
+			lm3.append_array(_bs_lane_arr(u * 8 + 1, 1, 256, 8, float(u + 1), 10.0, float(u), 10.0, (u + 1) * 8 + 1 if u < 3 else 0))
+		_bs_feed_msg(items, 1000, {"lm": lm3, "sl": [9, 1000, 1, 10, 1, 156, 1, 17, 1000, 1, 20, 1, 128, 1, 25, 1000, 1, 30, 1, 10, 1]})
+		for k in range(1001, 1012):
+			_bs_feed_msg(items, k, {})
+		checked += 1
+		if not items.has_item(10) or not items.has_item(20) or not items.has_item(30):
+			_fail("bug3 setup (%s)" % what, "expected 10, 20, 30 drawn before break: 10=%s 20=%s 30=%s" % [items.has_item(10), items.has_item(20), items.has_item(30)])
+			items.queue_free()
+			break
+
+		# 3D: Verify _start sets has_brm and fold_tick = _drawn when belt_removed is queued.
+		items.belt_removed(2, 640, 2560)
+		items._sync = false
+		items._job_ticks = 25.0
+		items._start(0.05)
+		checked += 1
+		if not items._job.has_brm or not is_equal_approx(items._job.fold_tick, items._drawn):
+			_fail("bug3d (%s)" % what, "expected has_brm=true and fold_tick==_drawn (%.2f vs %.2f)" % [items._job.fold_tick, items._drawn])
+			items._wait(false)
+			items.queue_free()
+			break
+		items._wait(true)
+		items._sync = true
+
+		# 3A + 3C: Item 20 on broken belt 2 is gone immediately; item 10 upstream is clipped before entering tile x=[2,3).
+		checked += 1
+		var p10 = items.position_of(10)
+		if items.has_item(20) or not items.has_item(30) or p10 == null or (p10 as Vector3).x > 2.005:
+			_fail("bug3c (%s)" % what, "expected 20 gone, 30 kept, 10 clipped<=2.005: has20=%s has30=%s p10=%s" % [items.has_item(20), items.has_item(30), str(p10)])
+			items.queue_free()
+			break
+		# Advance drawn clock to make sure clipped item 10 doesn't walk over broken belt 2's empty air.
+		for k in range(1012, 1022):
+			_bs_feed_msg(items, k, {"dl": [17]} if k == 1012 else {})
+		checked += 1
+		var p10_later = items.position_of(10)
+		if items.has_item(20) or int(items._state.kept.size()) != 0 or p10_later == null or (p10_later as Vector3).x > 2.005:
+			_fail("bug3a+3c later (%s)" % what, "expected 20 gone, kept=0, 10 stopped<=2.005: has20=%s kept=%d p10=%s" % [items.has_item(20), items._state.kept.size(), str(p10_later)])
+			items.queue_free()
+			break
+		items.queue_free()
+
+		# 3B: Direct future waiting purge on Job (GDScript) / BeltDrawNative (C++).
+		var items_w := BeltItems.new()
+		root.add_child(items_w)
+		items_w._sync = true
+		_bs_feed_msg(items_w, 1000, {"lm": lm3, "sl": [17, 1000, 1, 20, 1, 128, 1]})
+		_bs_feed_msg(items_w, 1001, {})
+		var st_w: Variant = items_w._state
+		var fut_ch := {
+			"uid": PackedInt64Array([20]),
+			"item": PackedInt32Array([1]),
+			"stack": PackedInt32Array([1]),
+			"key": PackedInt64Array([17]),
+			"pos": PackedInt32Array([64]),
+			"tick": PackedInt64Array([1020]),
+			"speed": PackedInt32Array([8]),
+			"reach": PackedInt32Array([64]),
+			"run": PackedInt32Array([64]),
+			"num": PackedInt64Array([0]),
+			"gone": PackedInt64Array(),
+			"gone_tick": PackedInt64Array(),
+			"gone_at": PackedInt32Array(),
+			"mismatch": PackedInt64Array(),
+			"mismatch_n": PackedInt32Array(),
+		}
+		var brm_ch := {
+			"uid": PackedInt64Array(),
+			"item": PackedInt32Array(),
+			"stack": PackedInt32Array(),
+			"key": PackedInt64Array(),
+			"pos": PackedInt32Array(),
+			"tick": PackedInt64Array(),
+			"speed": PackedInt32Array(),
+			"reach": PackedInt32Array(),
+			"run": PackedInt32Array(),
+			"num": PackedInt64Array(),
+			"gone": PackedInt64Array([20]),
+			"gone_tick": PackedInt64Array([1005]),
+			"gone_at": PackedInt32Array([0]),
+			"brm_gone": PackedInt64Array([20]),
+			"mismatch": PackedInt64Array(),
+			"mismatch_n": PackedInt32Array(),
+		}
+		var run_direct := func(ch_d: Dictionary, rm_k: Array) -> Dictionary:
+			var j := BeltItems.Job.new()
+			j.state = st_w
+			j.fold_tick = 1005.0
+			j.lead = 4.0
+			j.now_msec = 1000
+			j.rm_keys_job = rm_k
+			for rk: int in rm_k:
+				j.rm_set[rk] = true
+			if ch_d.has("brm_gone"):
+				for bg: int in (ch_d["brm_gone"] as PackedInt64Array):
+					j.brm_gone[bg] = true
+			if st_w.draw != null:
+				j._run_native(ch_d)
+				return {"later": j.later_n, "waiting": j.waiting_n, "count": j.count}
+			j._set_view()
+			j._apply_changes(ch_d)
+			if not rm_k.is_empty():
+				j._brm_cleanup()
+			return {"later": st_w.later_n, "waiting": st_w.waiting.size(), "count": st_w.items.size()}
+		var r1: Dictionary = run_direct.call(fut_ch, [])
+		checked += 1
+		if int(r1["later"]) != 1 or int(r1["waiting"]) != 1:
+			_fail("bug3b setup (%s)" % what, "expected uid 20 waiting before brm: %s" % str(r1))
+			items_w.queue_free()
+			break
+		var r2: Dictionary = run_direct.call(brm_ch, [17])
+		checked += 1
+		if int(r2["later"]) != 0 or int(r2["waiting"]) != 0 or int(r2["count"]) != 0:
+			_fail("bug3b purge (%s)" % what, "expected waiting purged and item 20 removed immediately: %s" % str(r2))
+			items_w.queue_free()
+			break
+		items_w.queue_free()
+
+	BeltItems.State.force_gd = was_gd
+	BeltItems.State.draw_native = was_draw_nat
+	BeltItems.State.lattice_native = was_lat_nat
+	BeltItems.removed_now = was_rm_now
+	BeltItems.Job.view_cull = was_cull
+	take_sync = true
+	BeltSim.take_sync = was_sync
+	print("Bug #3 & #9 regression cases: %d checks, %d differences" % [checked, fails])

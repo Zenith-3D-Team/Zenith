@@ -8,6 +8,8 @@ extends RefCounted
 const ItemCards := preload("res://scripts/world/item_cards.gd")
 const NativeLibrary := preload("res://scripts/native_library.gd")
 const Switches := preload("res://scripts/switches.gd")
+const Probing := preload("res://scripts/debug/probing.gd")
+const Settings := preload("res://scripts/menu/settings.gd")
 
 const STRIDE := ItemCards.STRIDE  # 16 floats per instance: 3x4 transform + vec4 INSTANCE_CUSTOM
 const HIDE_CLOCK := 1.0e20
@@ -17,6 +19,29 @@ const WORKER_MIN_WORK := 512
 
 static var max_band := _max_band_arg()
 static var use_native := Switches.on("--belt-mv-native")
+static var partial_sync := Switches.on("--belt-mv-partial")
+## The native evaluator says per kind whether its buffer changed since it last emitted it, so neither
+## this file nor ItemCards.put_mv hashes the buffer (`--belt-mv-change-flag=off`: hash as before).
+## The GDScript evaluator (`--belt-mv-native=off`) always hashes.
+static var change_flag := Switches.on("--belt-mv-change-flag")
+## The native evaluator steps its due kinds in parallel on the engine's worker pool, one task a kind,
+## when at least 2 kinds and 4,096 slots are due (`--belt-mv-threads=off`: one kind after another, as before).
+## Turned off by itself on a pool under MIN_POOL_THREADS threads (threads_for, perf-fix-r1): the main thread
+## sleeps while it waits, and on a 1-thread pool a background job holding that thread would stall the frame.
+static var mv_threads := Switches.on("--belt-mv-threads")
+const MIN_POOL_THREADS := 3
+## (perf-w3-belts, native evaluator only) A page update re-evaluates only the slots reading a touched page,
+## not the whole kind (`--belt-mv-page-dirty=off`: whole kinds, as before).
+static var page_dirty := Switches.on("--belt-mv-page-dirty")
+## Motion-vector buffers sized to the kind's items, not its records' capacity: fewer bytes to the renderer
+## a frame (`--belt-mv-tight-cap=off`: the capacity, as before).
+static var tight_cap := Switches.on("--belt-mv-tight-cap")
+## A kind whose last put went through BeltItemsNative's fast path is put (or skipped, unchanged) by
+## BeltMvNative.step itself while its count, size and bounds stay (`--belt-mv-native-put=off`: every
+## changed kind comes back to _emit_put_mv, as before). Needs --belt-mv-partial and --belt-mv-change-flag.
+static var native_put := Switches.on("--belt-mv-native-put")
+## Test counter: hash(buf) passes made in _emit_put_mv.
+static var hash_passes := 0
 
 
 static func _max_band_arg() -> int:
@@ -80,23 +105,88 @@ var _rec_kinds := {}  # item_id -> KindState
 var _lat_kinds := {}  # item_id -> KindState
 var _lat_known_ids := {}  # item_id -> last synced variant count (native path)
 var _last_clock := -1.0e20
+var _last_vrect := Vector4(-1.0e6, -1.0e6, 1.0e6, 1.0e6)
+var _last_bounds := AABB()
+var _has_step_state := false
+var _native_dirty := true
 var _last_max_band := -1
 var _was_active := false
+var _last_partial_sync := partial_sync
+var _last_cards_id := 0
+var _last_cards_epoch := -1
+var _last_lat_id := 0
+var _last_lat_epoch := -1
+var _rec_synced := {}  # item_id -> [target_id, target_epoch, restored, vis, cap, bounds, sig]
+var _lat_synced := {}  # item_id -> [target_id, target_epoch, restored, vis, cap, bounds, sig]
+var sync_calls := 0
+var sync_skips := 0
+## The native object has set_put_targets (a DLL from before perf-w3-belts has not).
+var _has_put := false
+## Test counter: puts BeltMvNative.step did itself (--belt-mv-native-put).
+var native_puts := 0
 
 
 func _init(allow_native := true) -> void:
 	if allow_native and use_native and NativeLibrary.ensure() and ClassDB.class_exists(&"BeltMvNative"):
 		_native = ClassDB.instantiate(&"BeltMvNative")
+		if _native.has_method(&"set_threads"):
+			_native.call("set_threads", threads_for(pool_threads()))
+		if _native.has_method(&"set_page_dirty"):
+			_native.call("set_page_dirty", page_dirty)
+			_native.call("set_tight_cap", tight_cap)
+			_native.call("set_native_put", native_put)
+			_has_put = true
+
+
+## The engine's worker pool threads this run: threading/worker_pool/max_threads as started (-1 = every core),
+## and no more than Settings.worker_threads_cap() (--worker-threads, small PCs) asks.
+static func pool_threads(setting: int = -2, cap: int = -2, cores: int = -1) -> int:
+	if cores <= 0:
+		cores = OS.get_processor_count()
+	if setting == -2:
+		setting = int(ProjectSettings.get_setting("threading/worker_pool/max_threads", -1))
+	if cap == -2:
+		cap = Settings.worker_threads_cap(cores)
+	var pool := cores if setting <= 0 else setting
+	return mini(pool, cores if cap <= 0 else cap)
+
+
+## Whether BeltMvNative.step uses the pool: --belt-mv-threads and a pool of MIN_POOL_THREADS threads or more.
+static func threads_for(pool: int) -> bool:
+	return mv_threads and pool >= MIN_POOL_THREADS
 
 
 func has_native() -> bool:
 	return _native != null
 
 
+func _clear_sync_cache() -> void:
+	_rec_synced.clear()
+	_lat_synced.clear()
+	_has_step_state = false
+	_native_dirty = true
+	_forget_puts()
+
+
+## The native put's copy of the synced state goes with ours (--belt-mv-native-put).
+func _forget_puts() -> void:
+	if _has_put:
+		_native.call("forget_puts")
+
+
 func reset() -> void:
 	_last_clock = -1.0e20
+	_last_vrect = Vector4(-1.0e6, -1.0e6, 1.0e6, 1.0e6)
+	_last_bounds = AABB()
 	_was_active = false
 	_last_max_band = -1
+	_last_cards_id = 0
+	_last_cards_epoch = -1
+	_last_lat_id = 0
+	_last_lat_epoch = -1
+	sync_calls = 0
+	sync_skips = 0
+	_clear_sync_cache()
 	_lat_known_ids.clear()
 	if _native != null:
 		_native.call("reset")
@@ -116,6 +206,7 @@ func reset() -> void:
 
 
 func invalidate_all() -> void:
+	_clear_sync_cache()
 	if _native != null:
 		_native.call("invalidate_all")
 		return
@@ -126,6 +217,13 @@ func invalidate_all() -> void:
 
 
 func invalidate_kind(is_lattice: bool, item_id: int) -> void:
+	if is_lattice:
+		_lat_synced.erase(item_id)
+	else:
+		_rec_synced.erase(item_id)
+	_has_step_state = false
+	_native_dirty = true
+	_forget_puts()
 	if _native != null:
 		_native.call("invalidate_kind", is_lattice, item_id)
 		return
@@ -152,6 +250,8 @@ func get_moving_count(is_lattice: bool, item_id: int) -> int:
 
 
 func update_rec_pages(p: Dictionary) -> void:
+	_has_step_state = false
+	_native_dirty = true
 	if _native != null:
 		_native.call("update_rec_pages", p)
 		return
@@ -159,6 +259,8 @@ func update_rec_pages(p: Dictionary) -> void:
 
 
 func update_lat_pages(p: Dictionary) -> void:
+	_has_step_state = false
+	_native_dirty = true
 	if _native != null:
 		_native.call("update_lat_pages", p)
 		return
@@ -219,6 +321,8 @@ func _update_pages(p: Dictionary, pages: Array[PackedFloat32Array], kinds: Dicti
 func update_paths(img: Image) -> void:
 	if img == null:
 		return
+	_has_step_state = false
+	_native_dirty = true
 	if _native != null:
 		_native.call("update_paths", img)
 		return
@@ -229,6 +333,8 @@ func update_paths(img: Image) -> void:
 
 
 func update_mask(tiles: Array, on: bool) -> void:
+	_has_step_state = false
+	_native_dirty = true
 	if _native != null:
 		_native.call("update_mask", tiles, on)
 		return
@@ -253,6 +359,8 @@ func update_mask(tiles: Array, on: bool) -> void:
 
 
 func set_mask_on(on: bool) -> void:
+	_has_step_state = false
+	_native_dirty = true
 	if _native != null:
 		_native.call("set_mask_on", on)
 		return
@@ -264,6 +372,8 @@ func set_mask_on(on: bool) -> void:
 
 
 func set_rec_kind(item_id: int, base: int, n: int, cap: int) -> void:
+	_has_step_state = false
+	_native_dirty = true
 	if _native != null:
 		_native.call("set_rec_kind", item_id, base, n, cap)
 		return
@@ -271,6 +381,8 @@ func set_rec_kind(item_id: int, base: int, n: int, cap: int) -> void:
 
 
 func set_lat_kind(item_id: int, base: int, n: int, cap: int) -> void:
+	_has_step_state = false
+	_native_dirty = true
 	if _native != null:
 		if not _lat_known_ids.has(item_id):
 			_lat_known_ids[item_id] = -1
@@ -312,9 +424,13 @@ func step(clock: float, vrect: Vector4, cards: Node, lat_cards: Node, bounds: AA
 		cards_ic.mv_buf_getter = func(id: int) -> PackedFloat32Array: return get_buf(false, id)
 	if lat_ic != null and not lat_ic.mv_buf_getter.is_valid():
 		lat_ic.mv_buf_getter = func(id: int) -> PackedFloat32Array: return get_buf(true, id)
+	if _last_partial_sync != partial_sync:
+		_last_partial_sync = partial_sync
+		_clear_sync_cache()
 	if not active:
 		if _was_active:
 			_was_active = false
+			_clear_sync_cache()
 			if cards != null and cards.has_method("restore_records"):
 				cards.restore_records()
 			if lat_cards != null and lat_cards.has_method("restore_records"):
@@ -325,11 +441,35 @@ func step(clock: float, vrect: Vector4, cards: Node, lat_cards: Node, bounds: AA
 		invalidate_all()
 	if _last_max_band != max_band:
 		_last_max_band = max_band
+		_clear_sync_cache()
 		if _native != null:
 			_native.call("set_max_band", max_band)
+	var cid := cards_ic.get_instance_id() if cards_ic != null else 0
+	var cep := cards_ic.epoch if cards_ic != null else -1
+	if cid != _last_cards_id or cep != _last_cards_epoch:
+		_last_cards_id = cid
+		_last_cards_epoch = cep
+		_rec_synced.clear()
+		_has_step_state = false
+		_native_dirty = true
+		_forget_puts()
+	var lid := lat_ic.get_instance_id() if lat_ic != null else 0
+	var lep := lat_ic.epoch if lat_ic != null else -1
+	if lid != _last_lat_id or lep != _last_lat_epoch:
+		_last_lat_id = lid
+		_last_lat_epoch = lep
+		_lat_synced.clear()
+		_has_step_state = false
+		_native_dirty = true
+		_forget_puts()
 	if clock < _last_clock:
 		invalidate_all()
+	var same_step_inputs := partial_sync and _has_step_state and clock == _last_clock \
+		and vrect.is_equal_approx(_last_vrect) and bounds == _last_bounds \
+		and (cards_ic == null or cards_ic.mv_mode) and (lat_ic == null or lat_ic.mv_mode)
 	_last_clock = clock
+	_last_vrect = vrect
+	_last_bounds = bounds
 
 	if _native != null:
 		for kid_v in _lat_known_ids.keys():
@@ -340,7 +480,31 @@ func step(clock: float, vrect: Vector4, cards: Node, lat_cards: Node, bounds: AA
 			if int(_lat_known_ids[kid_v]) != want_vars:
 				_lat_known_ids[kid_v] = want_vars
 				_native.call("set_lat_variants", kid, want_vars)
+				_native_dirty = true
+				same_step_inputs = false
+		if same_step_inputs and not _native_dirty:
+			sync_skips += 1
+			return
+		var put_here := _native_put_ready(cards_ic, lat_ic)
+		if put_here:
+			_native.call("set_put_targets", cards_ic._fast if cards_ic != null else null,
+				cards_ic._lod_band_mask if cards_ic != null else 0, cards_ic._fast_epoch if cards_ic != null else 0,
+				lat_ic._fast if lat_ic != null else null, lat_ic._lod_band_mask if lat_ic != null else 0,
+				lat_ic._fast_epoch if lat_ic != null else 0, bounds)
 		var updates: Array = _native.call("step", clock, vrect) as Array
+		_native_dirty = false
+		_has_step_state = true
+		if put_here:
+			var pc: Array = _native.call("take_put_counts") as Array
+			sync_calls += int(pc[0])
+			sync_skips += int(pc[3])
+			native_puts += int(pc[0])
+			if cards_ic != null:
+				cards_ic.mv_uploads += int(pc[1])
+			if lat_ic != null:
+				lat_ic.mv_uploads += int(pc[2])
+			if Probing.on and int(pc[4]) > 0:
+				Probing.prof["mv_put"] = int(Probing.prof.get("mv_put", 0)) + int(pc[4])
 		for u_v in updates:
 			var u := u_v as Array
 			var kid := int(u[0])
@@ -349,9 +513,12 @@ func step(clock: float, vrect: Vector4, cards: Node, lat_cards: Node, bounds: AA
 			if target == null:
 				continue
 			if bool(u[5]):
-				target.restore_kind(kid)
+				_emit_restore_kind(target, kid, is_lat)
 			else:
-				target.put_mv(kid, u[2] as PackedFloat32Array, int(u[3]), int(u[4]), bounds, is_lat)
+				var changed := -1
+				if change_flag and u.size() > 6:
+					changed = 1 if bool(u[6]) else 0
+				_emit_put_mv(target, kid, is_lat, u[2] as PackedFloat32Array, int(u[3]), int(u[4]), bounds, changed, put_here)
 		return
 
 	var todo: Array = []
@@ -365,12 +532,14 @@ func step(clock: float, vrect: Vector4, cards: Node, lat_cards: Node, bounds: AA
 				ks.on_records = true
 				ks.dirty = true
 				ks.last_visible = -1
-				if cards_ic != null:
-					cards_ic.restore_kind(ks.item_id)
+				_emit_restore_kind(cards_ic, ks.item_id, false)
 			continue
-		if ks.dirty or not ks.moving.is_empty() or ks.last_visible != mini(ks.n, ks.inst_cap):
+		var need_vis := ks.last_visible != mini(ks.n, ks.inst_cap)
+		if ks.dirty or need_vis or (not ks.moving.is_empty() and not same_step_inputs):
 			todo.append(ks)
 			total_work += ks.n if ks.dirty else ks.moving.size()
+		elif not ks.moving.is_empty() and same_step_inputs:
+			sync_skips += 1
 	for ks_v in _lat_kinds.values():
 		var ks := ks_v as KindState
 		if ks.base < 0:
@@ -380,16 +549,18 @@ func step(clock: float, vrect: Vector4, cards: Node, lat_cards: Node, bounds: AA
 				ks.on_records = true
 				ks.dirty = true
 				ks.last_visible = -1
-				if lat_ic != null:
-					lat_ic.restore_kind(ks.item_id)
+				_emit_restore_kind(lat_ic, ks.item_id, true)
 			continue
 		var want_vars := _lat_variants_for(lat_ic, ks.item_id)
 		if ks.variants != want_vars:
 			ks.variants = want_vars
 			ks.dirty = true
-		if ks.dirty or not ks.moving.is_empty() or ks.last_visible != mini(ks.n * 2, ks.inst_cap):
+		var need_vis := ks.last_visible != mini(ks.n * 2, ks.inst_cap)
+		if ks.dirty or need_vis or (not ks.moving.is_empty() and not same_step_inputs):
 			todo.append(ks)
 			total_work += ks.n if ks.dirty else ks.moving.size()
+		elif not ks.moving.is_empty() and same_step_inputs:
+			sync_skips += 1
 
 	if not todo.is_empty():
 		var task := EvalTask.new()
@@ -412,10 +583,80 @@ func step(clock: float, vrect: Vector4, cards: Node, lat_cards: Node, bounds: AA
 			if target == null:
 				continue
 			if ks.restore_to_rec:
-				target.restore_kind(ks.item_id)
+				_emit_restore_kind(target, ks.item_id, ks.is_lattice)
 			else:
 				var vis := mini(ks.n * 2 if ks.is_lattice else ks.n, ks.inst_cap)
-				target.put_mv(ks.item_id, ks.buf, vis, ks.inst_cap, bounds, ks.is_lattice)
+				_emit_put_mv(target, ks.item_id, ks.is_lattice, ks.buf, vis, ks.inst_cap, bounds)
+	_has_step_state = true
+
+
+func _emit_restore_kind(target: ItemCards, kid: int, is_lat: bool) -> void:
+	if target == null:
+		return
+	if partial_sync:
+		var synced: Dictionary = _lat_synced if is_lat else _rec_synced
+		var prev_v: Variant = synced.get(kid)
+		if prev_v is Array:
+			var prev: Array = prev_v as Array
+			if int(prev[0]) == target.get_instance_id() and int(prev[1]) == target.epoch and bool(prev[2]):
+				sync_skips += 1
+				return
+		target.restore_kind(kid)
+		sync_calls += 1
+		synced[kid] = [target.get_instance_id(), target.epoch, true, 0, 0, AABB(), 0]
+		return
+	target.restore_kind(kid)
+	sync_calls += 1
+
+
+## (--belt-mv-native-put) Whether this step's steady puts can be done by BeltMvNative.step: our synced
+## state and the change flag are what it mirrors, and ItemCards must have its native fast path.
+func _native_put_ready(cards_ic: ItemCards, lat_ic: ItemCards) -> bool:
+	if not (_has_put and native_put and partial_sync and change_flag):
+		return false
+	var rec_ok := cards_ic != null and cards_ic._fast != null and cards_ic.mv_mode and cards_ic.mv_buf_getter.is_valid()
+	var lat_ok := lat_ic != null and lat_ic._fast != null and lat_ic.mv_mode and lat_ic.mv_buf_getter.is_valid()
+	return rec_ok and (lat_ic == null or lat_ok)
+
+
+## `changed`: -1 hashes the buffer to find an unchanged one (GDScript evaluator, `--belt-mv-change-flag=off`);
+## 0/1 is the native evaluator's change flag (the buffer did / didn't change since it was last emitted).
+## `put_here`: this step's puts may be done natively, so a put through the fast path is told to it (mark_put).
+func _emit_put_mv(target: ItemCards, kid: int, is_lat: bool, buf: PackedFloat32Array, vis: int, cap: int, bounds: AABB, changed := -1, put_here := false) -> void:
+	if target == null:
+		return
+	var t_put := Time.get_ticks_usec() if Probing.on else 0
+	if partial_sync:
+		var synced: Dictionary = _lat_synced if is_lat else _rec_synced
+		var prev_v: Variant = synced.get(kid)
+		var sig := 0
+		if changed < 0 and vis > 0:
+			sig = hash(buf)
+			hash_passes += 1
+		if prev_v is Array and target.mv_mode:
+			var prev: Array = prev_v as Array
+			if int(prev[0]) == target.get_instance_id() \
+					and int(prev[1]) == target.epoch \
+					and not bool(prev[2]) \
+					and int(prev[3]) == vis \
+					and int(prev[4]) == cap \
+					and (prev[5] as AABB) == bounds \
+					and (vis == 0 or (int(prev[6]) == sig if changed < 0 else changed == 0)):
+				sync_skips += 1
+				return
+		var fast := target.put_mv(kid, buf, vis, cap, bounds, is_lat, changed)
+		sync_calls += 1
+		synced[kid] = [target.get_instance_id(), target.epoch, false, vis, cap, bounds, sig]
+		if put_here and fast == 2:
+			# (The upload left MV_SENT behind, so the next put may skip GDScript: see BeltMvNative.step.)
+			_native.call("mark_put", is_lat, kid, vis, cap)
+		if Probing.on:
+			Probing.add("mv_put", t_put)
+		return
+	target.put_mv(kid, buf, vis, cap, bounds, is_lat, changed)
+	sync_calls += 1
+	if Probing.on:
+		Probing.add("mv_put", t_put)
 
 
 static func _lat_variants_for(lat_cards: ItemCards, item_id: int) -> int:

@@ -1,6 +1,10 @@
 #include "belt_mv_native.h"
+#include "belt_items_native.h"
 #include "belt_native_common.h"
 
+#include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/classes/worker_thread_pool.hpp>
+#include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/packed_byte_array.hpp>
 
@@ -16,43 +20,35 @@ inline int band_of_key(int64_t key) {
 	return key >= 0 ? (int)(key / BeltMvNative::BAND_STEP) : 0;
 }
 
-inline void write_slot(float *dst, float cx, float cy, float px, float py, float pz,
-		float c0, float c1, float c2, float c3) {
-	dst[0] = cx;
-	dst[1] = 0.0f;
-	dst[2] = cy;
-	dst[3] = px;
-	dst[4] = 0.0f;
-	dst[5] = 1.0f;
-	dst[6] = 0.0f;
-	dst[7] = py;
-	dst[8] = -cy;
-	dst[9] = 0.0f;
-	dst[10] = cx;
-	dst[11] = pz;
-	dst[12] = c0;
-	dst[13] = c1;
-	dst[14] = c2;
-	dst[15] = c3;
+// Builds the slot's 16 floats locally and copies them only when they differ from what the buffer
+// holds; returns whether the slot changed (BeltMv's change flag, `--belt-mv-change-flag`).
+inline bool put_slot(float *dst, const float (&v)[BeltMvNative::STRIDE]) {
+	if (std::memcmp(dst, v, sizeof(v)) == 0) {
+		return false;
+	}
+	std::memcpy(dst, v, sizeof(v));
+	return true;
 }
 
-inline void hide_slot(float *dst) {
-	dst[0] = 1.0f;
-	dst[1] = 0.0f;
-	dst[2] = 0.0f;
-	dst[3] = 0.0f;
-	dst[4] = 0.0f;
-	dst[5] = 1.0f;
-	dst[6] = 0.0f;
-	dst[7] = 0.0f;
-	dst[8] = 0.0f;
-	dst[9] = 0.0f;
-	dst[10] = 1.0f;
-	dst[11] = 0.0f;
-	dst[12] = 0.0f;
-	dst[13] = 0.0f;
-	dst[14] = 0.0f;
-	dst[15] = BeltMvNative::HIDE_CLOCK;
+inline bool write_slot(float *dst, float cx, float cy, float px, float py, float pz,
+		float c0, float c1, float c2, float c3) {
+	const float v[BeltMvNative::STRIDE] = {
+		cx, 0.0f, cy, px,
+		0.0f, 1.0f, 0.0f, py,
+		-cy, 0.0f, cx, pz,
+		c0, c1, c2, c3,
+	};
+	return put_slot(dst, v);
+}
+
+inline bool hide_slot(float *dst) {
+	static const float v[BeltMvNative::STRIDE] = {
+		1.0f, 0.0f, 0.0f, 0.0f,
+		0.0f, 1.0f, 0.0f, 0.0f,
+		0.0f, 0.0f, 1.0f, 0.0f,
+		0.0f, 0.0f, 0.0f, BeltMvNative::HIDE_CLOCK,
+	};
+	return put_slot(dst, v);
 }
 
 inline float clamp01(float v) {
@@ -60,15 +56,16 @@ inline float clamp01(float v) {
 }
 
 inline void push_update(Array &out, int64_t item_id, bool is_lattice,
-		const PackedFloat32Array &buf, int vis, int inst_cap, bool restore_to_records) {
+		const PackedFloat32Array &buf, int vis, int inst_cap, bool restore_to_records, bool changed) {
 	Array entry;
-	entry.resize(6);
+	entry.resize(7);
 	entry[0] = item_id;
 	entry[1] = is_lattice;
 	entry[2] = buf;
 	entry[3] = vis;
 	entry[4] = inst_cap;
 	entry[5] = restore_to_records;
+	entry[6] = changed;
 	out.append(entry);
 }
 
@@ -90,6 +87,8 @@ void BeltMvNative::reset() {
 	rec_order.clear();
 	lat_order.clear();
 	last_clock = -1.0e20f;
+	rec_touched.clear();
+	lat_touched.clear();
 }
 
 void BeltMvNative::invalidate_all() {
@@ -126,15 +125,15 @@ void BeltMvNative::set_lat_variants(int64_t item_id, int variants) {
 }
 
 void BeltMvNative::update_rec_pages(const Dictionary &p) {
-	_update_pages(p, rec_pages, rec_kinds, rec_per_page);
+	_update_pages(p, rec_pages, rec_kinds, rec_per_page, rec_touched);
 }
 
 void BeltMvNative::update_lat_pages(const Dictionary &p) {
-	_update_pages(p, lat_pages, lat_kinds, lat_per_page);
+	_update_pages(p, lat_pages, lat_kinds, lat_per_page, lat_touched);
 }
 
-void BeltMvNative::_update_pages(const Dictionary &p, std::vector<std::vector<float>> &pages,
-		std::unordered_map<int64_t, KindState> &kinds, int &per_page) {
+void BeltMvNative::_update_pages(const Dictionary &p, std::vector<Page> &pages,
+		std::unordered_map<int64_t, KindState> &kinds, int &per_page, std::vector<uint8_t> &touched_acc) {
 	Variant list_v = p.get("pages", Array());
 	if (list_v.get_type() != Variant::ARRAY) {
 		return;
@@ -146,6 +145,7 @@ void BeltMvNative::_update_pages(const Dictionary &p, std::vector<std::vector<fl
 	bool all = (bool)p.get("all", false);
 	if (all) {
 		pages.clear();
+		touched_acc.clear();
 	}
 	std::vector<bool> touched;
 	for (int64_t li = 0; li < list.size(); li++) {
@@ -166,15 +166,15 @@ void BeltMvNative::_update_pages(const Dictionary &p, std::vector<std::vector<fl
 		if (p_cap > 0) {
 			per_page = p_cap;
 		}
-		PackedByteArray data = img->get_data();
-		size_t nfloats = (size_t)data.size() / sizeof(float);
 		if ((size_t)idx >= pages.size()) {
 			pages.resize((size_t)idx + 1);
 		}
-		pages[idx].resize(nfloats);
-		if (nfloats > 0) {
-			std::memcpy(pages[idx].data(), data.ptr(), nfloats * sizeof(float));
-		}
+		// The Image's bytes are kept as they are (copy-on-write: a later write to that Image copies
+		// on its side), so a page costs no copy here; steps only read them.
+		Page &pg = pages[idx];
+		pg.bytes = img->get_data();
+		pg.n = (size_t)pg.bytes.size() / sizeof(float);
+		pg.f = pg.n > 0 ? reinterpret_cast<const float *>(pg.bytes.ptr()) : nullptr;
 		if ((size_t)idx >= touched.size()) {
 			touched.resize((size_t)idx + 1, false);
 		}
@@ -187,6 +187,16 @@ void BeltMvNative::_update_pages(const Dictionary &p, std::vector<std::vector<fl
 			}
 		}
 		return;
+	}
+	if (page_dirty_on) {
+		if (touched_acc.size() < touched.size()) {
+			touched_acc.resize(touched.size(), 0);
+		}
+		for (size_t i = 0; i < touched.size(); i++) {
+			if (touched[i]) {
+				touched_acc[i] = 1;
+			}
+		}
 	}
 	for (auto &kv : kinds) {
 		KindState &ks = kv.second;
@@ -201,11 +211,89 @@ void BeltMvNative::_update_pages(const Dictionary &p, std::vector<std::vector<fl
 		int p_hi = (ks.base + ks.n - 1) / per_page;
 		for (int pi = p_lo; pi <= p_hi; pi++) {
 			if (pi >= 0 && (size_t)pi < touched.size() && touched[pi]) {
-				ks.dirty = true;
+				// (A pile's copy points at its item's record in the same kind, so the kind's own pages
+				// cover every record its slots read.)
+				if (page_dirty_on) {
+					ks.page_dirty = true;
+				} else {
+					ks.dirty = true;
+				}
 				break;
 			}
 		}
 	}
+}
+
+// (--belt-mv-page-dirty) Whether slot s reads a record on a page touched since the last step: its own
+// record, or for a pile's copy the item's record it points at.
+bool BeltMvNative::_touched_slot(const KindState &ks, int s) const {
+	const std::vector<Page> &pages = ks.is_lattice ? lat_pages : rec_pages;
+	const std::vector<uint8_t> &touched = ks.is_lattice ? lat_touched : rec_touched;
+	const int per = ks.is_lattice ? lat_per_page : rec_per_page;
+	if (per <= 0) {
+		return true;
+	}
+	int r = ks.base + s;
+	if (r < 0) {
+		return true;
+	}
+	int p0 = r / per;
+	if ((size_t)p0 >= pages.size()) {
+		// (No page there: the slot hides, as a full pass would make it.)
+		return true;
+	}
+	if ((size_t)p0 < touched.size() && touched[(size_t)p0]) {
+		return true;
+	}
+	const Page &pg = pages[(size_t)p0];
+	int ro = (r - p0 * per) * 16;
+	if ((size_t)ro + 16 > pg.size()) {
+		return true;
+	}
+	if (pg.data()[ro + 13] > 0.5f) {
+		int r_src = r + (int)beltn::roundi((double)pg.data()[ro + 12]);
+		if (r_src < 0) {
+			return true;
+		}
+		int ps = r_src / per;
+		return (size_t)ps < touched.size() && touched[(size_t)ps] != 0;
+	}
+	return false;
+}
+
+// (--belt-mv-tight-cap) The instances a kind's buffer holds for `need` drawn: a quarter more, rounded up
+// to TIGHT_STEP, never past the records' capacity.
+int BeltMvNative::_tight_size(const KindState &ks, int need) const {
+	int full = ks.is_lattice ? ks.cap * 2 : ks.cap;
+	if (full <= 0) {
+		return 0;
+	}
+	if (need < 0) {
+		need = 0;
+	}
+	int64_t want = (int64_t)need + need / 4;
+	want = ((want + TIGHT_STEP - 1) / TIGHT_STEP) * TIGHT_STEP;
+	if (want < TIGHT_STEP) {
+		want = TIGHT_STEP;
+	}
+	return (int)std::min<int64_t>(want, full);
+}
+
+void BeltMvNative::_fit_buffer(KindState &ks, int size) {
+	int old_cap = (int)(ks.buf.size() / STRIDE);
+	ks.inst_cap = size;
+	if (old_cap == size) {
+		return;
+	}
+	ks.buf.resize((int64_t)size * STRIDE);
+	if (size > old_cap) {
+		float *dst = ks.buf.ptrw();
+		for (int i = old_cap; i < size; i++) {
+			hide_slot(dst + (int64_t)i * STRIDE);
+		}
+	}
+	ks.dirty = true;
+	ks.changed = true;
 }
 
 void BeltMvNative::update_paths(const Ref<Image> &img) {
@@ -298,6 +386,16 @@ void BeltMvNative::_set_kind(std::unordered_map<int64_t, KindState> &kinds, std:
 		ks.cap = cap;
 		ks.dirty = true;
 	}
+	if (tight_on) {
+		// Grown at once to hold every item (a quarter more), kept while it fits (shrunk in step).
+		int need = std::min(is_lat ? n * 2 : n, inst_cap);
+		if (ks.inst_cap < need || ks.inst_cap > inst_cap || ks.inst_cap <= 0) {
+			inst_cap = _tight_size(ks, need);
+			ks.low_steps = 0;
+		} else {
+			inst_cap = ks.inst_cap;
+		}
+	}
 	if (ks.inst_cap != inst_cap && band_of_key(item_id) <= max_band) {
 		int old_cap = ks.inst_cap;
 		ks.inst_cap = inst_cap;
@@ -309,6 +407,7 @@ void BeltMvNative::_set_kind(std::unordered_map<int64_t, KindState> &kinds, std:
 			}
 		}
 		ks.dirty = true;
+		ks.changed = true;
 	} else {
 		ks.inst_cap = inst_cap;
 	}
@@ -447,14 +546,12 @@ int BeltMvNative::_eval_sim_slot(const KindState &ks, float *buf, int s, float c
 	int bo = s * STRIDE;
 	int per = rec_per_page;
 	if (per <= 0) {
-		hide_slot(buf + bo);
-		return 0;
+		return hide_slot(buf + bo) ? 2 : 0;
 	}
 	int r = ks.base + s;
 	int p0 = r / per;
 	if (r < 0 || (size_t)p0 >= rec_pages.size() || (size_t)((r - p0 * per) * 16 + 16) > rec_pages[(size_t)p0].size()) {
-		hide_slot(buf + bo);
-		return 0;
+		return hide_slot(buf + bo) ? 2 : 0;
 	}
 	const float *pg0 = rec_pages[(size_t)p0].data();
 	int ro0 = (r - p0 * per) * 16;
@@ -474,8 +571,7 @@ int BeltMvNative::_eval_sim_slot(const KindState &ks, float *buf, int s, float c
 		int r_src = r + (int)beltn::roundi((double)dx);
 		int ps = r_src / per;
 		if (r_src < 0 || (size_t)ps >= rec_pages.size() || (size_t)((r_src - ps * per) * 16 + 16) > rec_pages[(size_t)ps].size()) {
-			hide_slot(buf + bo);
-			return 0;
+			return hide_slot(buf + bo) ? 2 : 0;
 		}
 		pg = rec_pages[(size_t)ps].data();
 		ro = (r_src - ps * per) * 16;
@@ -483,8 +579,7 @@ int BeltMvNative::_eval_sim_slot(const KindState &ks, float *buf, int s, float c
 	}
 	float cw = pg[ro + 11];
 	if (cw < -0.5f) {
-		hide_slot(buf + bo);
-		return 0;
+		return hide_slot(buf + bo) ? 2 : 0;
 	}
 	float ax = pg[ro + 0];
 	float ay = pg[ro + 1];
@@ -530,8 +625,8 @@ int BeltMvNative::_eval_sim_slot(const KindState &ks, float *buf, int s, float c
 	if (vis && mask_on && _mask_hit(at_x, at_z)) {
 		vis = false;
 	}
-	write_slot(buf + bo, cx, cy, at_x, at_y + cz, at_z, is_copy ? 128.0f : 0.0f, jit, 0.0f, vis ? SHOW_CLOCK : HIDE_CLOCK);
-	return still_moving ? 1 : 0;
+	bool ch = write_slot(buf + bo, cx, cy, at_x, at_y + cz, at_z, is_copy ? 128.0f : 0.0f, jit, 0.0f, vis ? SHOW_CLOCK : HIDE_CLOCK);
+	return (still_moving ? 1 : 0) | (ch ? 2 : 0);
 }
 
 int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float clock) const {
@@ -539,16 +634,16 @@ int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float c
 	int bo1 = bo0 + STRIDE;
 	int per = lat_per_page;
 	if (per <= 0) {
-		hide_slot(buf + bo0);
-		hide_slot(buf + bo1);
-		return 0;
+		bool ch = hide_slot(buf + bo0);
+		ch = hide_slot(buf + bo1) || ch;
+		return ch ? 2 : 0;
 	}
 	int r = ks.base + s;
 	int p0 = r / per;
 	if (r < 0 || (size_t)p0 >= lat_pages.size() || (size_t)((r - p0 * per) * 16 + 16) > lat_pages[(size_t)p0].size()) {
-		hide_slot(buf + bo0);
-		hide_slot(buf + bo1);
-		return 0;
+		bool ch = hide_slot(buf + bo0);
+		ch = hide_slot(buf + bo1) || ch;
+		return ch ? 2 : 0;
 	}
 	const float *pg0 = lat_pages[(size_t)p0].data();
 	int ro0 = (r - p0 * per) * 16;
@@ -571,9 +666,9 @@ int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float c
 		int r_src = r + (int)beltn::roundi((double)dx);
 		int ps = r_src / per;
 		if (r_src < 0 || (size_t)ps >= lat_pages.size() || (size_t)((r_src - ps * per) * 16 + 16) > lat_pages[(size_t)ps].size()) {
-			hide_slot(buf + bo0);
-			hide_slot(buf + bo1);
-			return 0;
+			bool ch = hide_slot(buf + bo0);
+			ch = hide_slot(buf + bo1) || ch;
+			return ch ? 2 : 0;
 		}
 		pg = lat_pages[(size_t)ps].data();
 		ro = (r_src - ps * per) * 16;
@@ -584,9 +679,9 @@ int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float c
 	}
 	float cw = pg[ro + 11];
 	if (cw < -0.5f) {
-		hide_slot(buf + bo0);
-		hide_slot(buf + bo1);
-		return 0;
+		bool ch = hide_slot(buf + bo0);
+		ch = hide_slot(buf + bo1) || ch;
+		return ch ? 2 : 0;
 	}
 	float ax = pg[ro + 0];
 	float ay = pg[ro + 1];
@@ -621,8 +716,8 @@ int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float c
 			beltn::i64 run = beltn::roundi((double)base_cy);
 			uint32_t lh = beltn::lattice_hash(who, run);
 			float turn = ((float)(lh % 2001u) / 1000.0f - 1.0f) * MAX_YAW + PILE_TURN * (float)pile_k;
-			cx = std::cosf(turn);
-			cy = std::sinf(turn);
+			cx = std::cos(turn);
+			cy = std::sin(turn);
 			if (variants > 1) {
 				ivar = (int)((lh >> 8) % (uint32_t)variants);
 			}
@@ -638,11 +733,11 @@ int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float c
 		if (vis && !lattice && ((ew > 0.0f && clock >= ew) || (ew < 0.0f && clock < -ew))) {
 			vis = false;
 		}
-		write_slot(buf + bo0, cx, cy, at_x, at_y, at_z, (float)ivar + copy_flag, jit, 0.0f, vis ? SHOW_CLOCK : HIDE_CLOCK);
-		hide_slot(buf + bo1);
+		bool ch = write_slot(buf + bo0, cx, cy, at_x, at_y, at_z, (float)ivar + copy_flag, jit, 0.0f, vis ? SHOW_CLOCK : HIDE_CLOCK);
+		ch = hide_slot(buf + bo1) || ch;
 		bool need_mv = (!lattice && ((bw > aw && bw > clock) || (ew > 0.0f && ew > clock) || (ew < 0.0f && -ew > clock)))
 				|| (lattice && ex > 0.0f && ex > clock);
-		return need_mv ? 1 : 0;
+		return (need_mv ? 1 : 0) | (ch ? 2 : 0);
 	}
 
 	bool has_hi = bw > aw && by > 0.0f;
@@ -671,8 +766,8 @@ int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float c
 		beltn::i64 run = beltn::roundi((double)base_cy);
 		uint32_t lh = beltn::lattice_hash(who, run);
 		float turn = ((float)(lh % 2001u) / 1000.0f - 1.0f) * MAX_YAW + PILE_TURN * (float)pile_k;
-		cx = std::cosf(turn);
-		cy = std::sinf(turn);
+		cx = std::cos(turn);
+		cy = std::sin(turn);
 		if (variants > 1) {
 			ivar = (int)((lh >> 8) % (uint32_t)variants);
 		}
@@ -692,11 +787,11 @@ int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float c
 			vis_act = false;
 		}
 	}
-	write_slot(buf + act_bo, cx, cy, at_x, at_y, at_z, (float)ivar + copy_flag, jit, 0.0f, vis_act ? SHOW_CLOCK : HIDE_CLOCK);
+	bool ch = write_slot(buf + act_bo, cx, cy, at_x, at_y, at_z, (float)ivar + copy_flag, jit, 0.0f, vis_act ? SHOW_CLOCK : HIDE_CLOCK);
 
 	if (after_stop) {
-		hide_slot(buf + pre_bo);
-		return (ex > 0.0f && ex > clock) ? 1 : 0;
+		ch = hide_slot(buf + pre_bo) || ch;
+		return ((ex > 0.0f && ex > clock) ? 1 : 0) | (ch ? 2 : 0);
 	}
 
 	int next_slid = slid + 1;
@@ -712,16 +807,171 @@ int BeltMvNative::_eval_lat_slot(const KindState &ks, float *buf, int s, float c
 		beltn::i64 run_p = beltn::roundi((double)base_cy);
 		uint32_t lh_p = beltn::lattice_hash(who_p, run_p);
 		float turn_p = ((float)(lh_p % 2001u) / 1000.0f - 1.0f) * MAX_YAW + PILE_TURN * (float)pile_k;
-		cx_p = std::cosf(turn_p);
-		cy_p = std::sinf(turn_p);
+		cx_p = std::cos(turn_p);
+		cy_p = std::sin(turn_p);
 		if (variants > 1) {
 			ivar_p = (int)((lh_p >> 8) % (uint32_t)variants);
 		}
 		jit_p = (float)((lh_p >> 16) & 65535u) / 32767.5f - 1.0f;
 	}
-	write_slot(buf + pre_bo, cx_p, cy_p, at_pre_x, at_pre_y, at_pre_z, (float)ivar_p + copy_flag, jit_p, 0.0f, HIDE_CLOCK);
-	return 1;
+	ch = write_slot(buf + pre_bo, cx_p, cy_p, at_pre_x, at_pre_y, at_pre_z, (float)ivar_p + copy_flag, jit_p, 0.0f, HIDE_CLOCK) || ch;
+	return 1 | (ch ? 2 : 0);
 }
+
+// One kind's evaluation (phase 2 of step): writes only this kind's buffer, `moving` list and change
+// flag; reads the shared pages, paths and mask, which nothing writes while a step runs. Safe to run
+// for different kinds at once on the engine's worker pool (`--belt-mv-threads`).
+void BeltMvNative::_eval_job(StepJob &j, float clock, float min_x, float max_x, float min_z, float max_z) const {
+	KindState &ks = *j.ks;
+	const int nw = j.nw;
+	if (ks.dirty) {
+		ks.moving.clear();
+		float *dst = j.dst;
+		if (ks.is_lattice) {
+			for (int s = 0; s < nw; s++) {
+				int ev = _eval_lat_slot(ks, dst, s, clock);
+				if (ev & 1) {
+					ks.moving.push_back(s);
+				}
+				if (ev & 2) {
+					ks.changed = true;
+				}
+			}
+		} else {
+			for (int s = 0; s < nw; s++) {
+				int ev = _eval_sim_slot(ks, dst, s, clock);
+				if (ev & 1) {
+					ks.moving.push_back(s);
+				}
+				if (ev & 2) {
+					ks.changed = true;
+				}
+			}
+		}
+		ks.dirty = false;
+		ks.page_dirty = false;
+		ks.has_written = true;
+		if (ks.moving.empty() && ks.n > 0) {
+			j.emit = (!ks.on_records || ks.last_visible != ks.n) ? EMIT_RESTORE : EMIT_NONE;
+			ks.on_records = true;
+			ks.last_visible = ks.n;
+		} else {
+			ks.on_records = false;
+			ks.last_visible = j.target_vis;
+			j.emit = EMIT_PUT;
+		}
+		return;
+	}
+	if (j.page_part) {
+		// (--belt-mv-page-dirty) As a dirty kind's pass, but only for the slots whose records a page
+		// update touched (the rest read what they read when last evaluated); moving slots as every step.
+		// `moving` stays in slot order.
+		ks.page_dirty = false;
+		float *dst = ks.buf.ptrw();
+		std::vector<int> keep;
+		keep.reserve(ks.moving.size() + 64);
+		const std::vector<int> &mv = ks.moving;
+		size_t mi = 0;
+		int evaluated = 0;
+		for (int s = 0; s < nw; s++) {
+			while (mi < mv.size() && mv[mi] < s) {
+				mi++;
+			}
+			bool was_moving = mi < mv.size() && mv[mi] == s;
+			bool touched = _touched_slot(ks, s);
+			if (!touched && !was_moving) {
+				continue;
+			}
+			if (!touched && (ks.is_lattice ? _lat_slot_outside(ks, s, min_x, max_x, min_z, max_z)
+										   : _sim_slot_outside(ks, s, min_x, max_x, min_z, max_z))) {
+				keep.push_back(s);
+				continue;
+			}
+			evaluated++;
+			int ev = ks.is_lattice ? _eval_lat_slot(ks, dst, s, clock) : _eval_sim_slot(ks, dst, s, clock);
+			if (ev & 2) {
+				ks.changed = true;
+			}
+			if (ev & 1) {
+				keep.push_back(s);
+			}
+		}
+		ks.moving.swap(keep);
+		j.evaluated = evaluated;
+		ks.has_written = true;
+		if (ks.moving.empty() && ks.n > 0) {
+			j.emit = (!ks.on_records || ks.last_visible != ks.n) ? EMIT_RESTORE : EMIT_NONE;
+			ks.on_records = true;
+			ks.last_visible = ks.n;
+		} else {
+			ks.on_records = false;
+			ks.last_visible = j.target_vis;
+			j.emit = EMIT_PUT;
+		}
+		return;
+	}
+	float *dst = nullptr;
+	std::vector<int> keep;
+	keep.reserve(ks.moving.size());
+	bool shrunk = false;
+	bool wrote_any = false;
+	for (int s : ks.moving) {
+		if (s < 0 || s >= nw) {
+			shrunk = true;
+			continue;
+		}
+		bool outside = ks.is_lattice ? _lat_slot_outside(ks, s, min_x, max_x, min_z, max_z)
+									 : _sim_slot_outside(ks, s, min_x, max_x, min_z, max_z);
+		if (outside) {
+			keep.push_back(s);
+			continue;
+		}
+		if (dst == nullptr) {
+			// Lazy, as before: a kind whose moving slots are all off-screen keeps its shared buffer
+			// (no copy-on-write). The task owns this kind's array while the step runs.
+			dst = ks.buf.ptrw();
+		}
+		wrote_any = true;
+		int ev = ks.is_lattice ? _eval_lat_slot(ks, dst, s, clock) : _eval_sim_slot(ks, dst, s, clock);
+		if (ev & 2) {
+			ks.changed = true;
+		}
+		if (ev & 1) {
+			keep.push_back(s);
+		} else {
+			shrunk = true;
+		}
+	}
+	if (shrunk) {
+		ks.moving.swap(keep);
+	}
+	if (ks.moving.empty() && ks.n > 0) {
+		j.emit = (!ks.on_records || ks.last_visible != ks.n) ? EMIT_RESTORE : EMIT_NONE;
+		ks.on_records = true;
+		ks.last_visible = ks.n;
+	} else if (wrote_any || ks.on_records || j.need_vis_sync) {
+		ks.on_records = false;
+		ks.last_visible = j.target_vis;
+		j.emit = EMIT_PUT;
+	}
+}
+
+namespace {
+
+struct StepGroupData {
+	const BeltMvNative *self;
+	std::vector<BeltMvNative::StepJob> *jobs;
+	const std::vector<int> *due;
+	float clock, min_x, max_x, min_z, max_z;
+};
+
+void step_group_task(void *p_userdata, uint32_t p_index) {
+	StepGroupData *d = static_cast<StepGroupData *>(p_userdata);
+	BeltMvNative::StepJob &j = (*d->jobs)[(size_t)(*d->due)[p_index]];
+	d->self->_eval_job(j, d->clock, d->min_x, d->max_x, d->min_z, d->max_z);
+}
+
+} // namespace
 
 Array BeltMvNative::step(float clock, const Vector4 &vrect) {
 	if (clock < last_clock) {
@@ -734,29 +984,53 @@ Array BeltMvNative::step(float clock, const Vector4 &vrect) {
 	float max_x = vrect.z + VRECT_MARGIN;
 	float max_z = vrect.w + VRECT_MARGIN;
 
-	Array out;
-	auto process_group = [&](std::unordered_map<int64_t, KindState> &kinds, const std::vector<int64_t> &order) {
+	// Phase 1 (this thread): per kind, in today's order, decide the work, resize, take the buffer.
+	std::vector<StepJob> &jobs = step_jobs;
+	jobs.clear();
+	std::vector<int> &due = step_due;
+	due.clear();
+	int64_t due_slots = 0;
+	auto plan_group = [&](std::unordered_map<int64_t, KindState> &kinds, const std::vector<int64_t> &order) {
 		for (int64_t id : order) {
 			KindState &ks = kinds.at(id);
 			if (ks.base < 0) {
 				continue;
 			}
+			StepJob j;
+			j.ks = &ks;
 			if (band_of_key(id) > max_band) {
 				if (ks.has_written && !ks.on_records) {
 					ks.on_records = true;
 					ks.dirty = true;
 					ks.last_visible = -1;
-					push_update(out, ks.item_id, ks.is_lattice, PackedFloat32Array(), 0, 0, true);
+					j.emit = EMIT_RESTORE;
+					jobs.push_back(j);
 				}
 				continue;
 			}
 			// Never more slots than the buffer holds (a lattice slot is two instances): a caller
 			// passing n past cap must not write or read past the end (the GDScript twin does the same).
-			int target_vis = std::min(ks.is_lattice ? ks.n * 2 : ks.n, ks.inst_cap);
-			int nw = std::min(ks.n, ks.is_lattice ? ks.inst_cap / 2 : ks.inst_cap);
-			bool need_vis_sync = (ks.last_visible != target_vis);
-			if (!ks.dirty && ks.moving.empty() && !need_vis_sync) {
+			j.target_vis = std::min(ks.is_lattice ? ks.n * 2 : ks.n, ks.inst_cap);
+			j.nw = std::min(ks.n, ks.is_lattice ? ks.inst_cap / 2 : ks.inst_cap);
+			j.need_vis_sync = (ks.last_visible != j.target_vis);
+			if (!ks.dirty && !ks.page_dirty && ks.moving.empty() && !j.need_vis_sync) {
 				continue;
+			}
+			if (tight_on && ks.n > 0) {
+				// Shrunk after TIGHT_SHRINK_STEPS steps in a row where the tight size is a quarter smaller.
+				int need = ks.is_lattice ? ks.n * 2 : ks.n;
+				int t = _tight_size(ks, need);
+				if (t >= need && (int64_t)t * 4 <= (int64_t)ks.inst_cap * 3) {
+					if (++ks.low_steps >= TIGHT_SHRINK_STEPS) {
+						ks.low_steps = 0;
+						ks.inst_cap = t;
+						j.target_vis = std::min(need, ks.inst_cap);
+						j.nw = std::min(ks.n, ks.is_lattice ? ks.inst_cap / 2 : ks.inst_cap);
+						j.need_vis_sync = (ks.last_visible != j.target_vis);
+					}
+				} else {
+					ks.low_steps = 0;
+				}
 			}
 			if ((int64_t)ks.buf.size() != (int64_t)ks.inst_cap * STRIDE) {
 				int old_cap = (int)(ks.buf.size() / STRIDE);
@@ -768,123 +1042,251 @@ Array BeltMvNative::step(float clock, const Vector4 &vrect) {
 					}
 				}
 				ks.dirty = true;
+				ks.changed = true;
 			}
 			if (ks.n <= 0) {
 				ks.moving.clear();
 				ks.dirty = false;
+				ks.page_dirty = false;
 				if (ks.last_visible != 0 || !ks.on_records) {
 					ks.last_visible = 0;
 					ks.on_records = true;
-					push_update(out, ks.item_id, ks.is_lattice, ks.buf, 0, ks.inst_cap, false);
+					j.emit = EMIT_EMPTY;
+					jobs.push_back(j);
 				}
 				continue;
 			}
-
-			bool emit = false;
-			bool restore_to_rec = false;
+			j.was_on_records = ks.on_records;
 			if (ks.dirty) {
-				ks.moving.clear();
-				float *dst = ks.buf.ptrw();
-				if (ks.is_lattice) {
-					for (int s = 0; s < nw; s++) {
-						if (_eval_lat_slot(ks, dst, s, clock) != 0) {
-							ks.moving.push_back(s);
-						}
-					}
-				} else {
-					for (int s = 0; s < nw; s++) {
-						if (_eval_sim_slot(ks, dst, s, clock) != 0) {
-							ks.moving.push_back(s);
-						}
-					}
-				}
-				ks.dirty = false;
-				ks.has_written = true;
-				if (ks.moving.empty() && ks.n > 0) {
-					restore_to_rec = true;
-					emit = !ks.on_records || ks.last_visible != ks.n;
-					ks.on_records = true;
-					ks.last_visible = ks.n;
-				} else {
-					ks.on_records = false;
-					ks.last_visible = target_vis;
-					emit = true;
-				}
+				j.dst = ks.buf.ptrw();
+				due_slots += j.nw;
+			} else if (ks.page_dirty) {
+				j.page_part = true;
+				due_slots += (int64_t)ks.moving.size() + j.nw / 8;
 			} else {
-				float *dst = nullptr;
-				std::vector<int> keep;
-				keep.reserve(ks.moving.size());
-				bool shrunk = false;
-				bool wrote_any = false;
-				if (ks.is_lattice) {
-					for (int s : ks.moving) {
-						if (s < 0 || s >= nw) {
-							shrunk = true;
-							continue;
-						}
-						if (_lat_slot_outside(ks, s, min_x, max_x, min_z, max_z)) {
-							keep.push_back(s);
-							continue;
-						}
-						if (dst == nullptr) {
-							dst = ks.buf.ptrw();
-						}
-						wrote_any = true;
-						if (_eval_lat_slot(ks, dst, s, clock) != 0) {
-							keep.push_back(s);
-						} else {
-							shrunk = true;
-						}
-					}
-				} else {
-					for (int s : ks.moving) {
-						if (s < 0 || s >= nw) {
-							shrunk = true;
-							continue;
-						}
-						if (_sim_slot_outside(ks, s, min_x, max_x, min_z, max_z)) {
-							keep.push_back(s);
-							continue;
-						}
-						if (dst == nullptr) {
-							dst = ks.buf.ptrw();
-						}
-						wrote_any = true;
-						if (_eval_sim_slot(ks, dst, s, clock) != 0) {
-							keep.push_back(s);
-						} else {
-							shrunk = true;
-						}
-					}
-				}
-				if (shrunk) {
-					ks.moving.swap(keep);
-				}
-				if (ks.moving.empty() && ks.n > 0) {
-					restore_to_rec = true;
-					emit = !ks.on_records || ks.last_visible != ks.n;
-					ks.on_records = true;
-					ks.last_visible = ks.n;
-				} else if (wrote_any || ks.on_records || need_vis_sync) {
-					ks.on_records = false;
-					ks.last_visible = target_vis;
-					emit = true;
-				}
+				due_slots += (int64_t)ks.moving.size();
 			}
+			due.push_back((int)jobs.size());
+			jobs.push_back(j);
+		}
+	};
+	plan_group(rec_kinds, rec_order);
+	plan_group(lat_kinds, lat_order);
 
-			if (emit) {
-				if (restore_to_rec) {
-					push_update(out, ks.item_id, ks.is_lattice, PackedFloat32Array(), 0, 0, true);
-				} else {
-					push_update(out, ks.item_id, ks.is_lattice, ks.buf, target_vis, ks.inst_cap, false);
+	// Phase 2: evaluate the due kinds, one task a kind on the engine's pool when there is enough work.
+	WorkerThreadPool *pool = threads ? WorkerThreadPool::get_singleton() : nullptr;
+	if (pool != nullptr && (int)due.size() >= THREAD_MIN_KINDS && due_slots >= THREAD_MIN_SLOTS) {
+		StepGroupData d{ this, &jobs, &due, clock, min_x, max_x, min_z, max_z };
+		WorkerThreadPool::GroupID gid = pool->add_native_group_task(&step_group_task, &d, (int)due.size(),
+				-1, true, String("BeltMvNative.step"));
+		pool->wait_for_group_task_completion(gid);
+		threaded_steps++;
+	} else {
+		for (int i : due) {
+			_eval_job(jobs[(size_t)i], clock, min_x, max_x, min_z, max_z);
+		}
+	}
+
+	// Phase 3 (this thread): the result in today's kind order.
+	Array out;
+	BeltItemsNative *fast[2] = { nullptr, nullptr };
+	if (put_ready) {
+		for (int side = 0; side < 2; side++) {
+			if (put_fast_id[side] != 0) {
+				fast[side] = Object::cast_to<BeltItemsNative>(UtilityFunctions::instance_from_id((int64_t)put_fast_id[side]));
+			}
+		}
+	}
+	for (StepJob &j : jobs) {
+		KindState &ks = *j.ks;
+		if (j.page_part) {
+			page_steps++;
+			page_slots += j.evaluated;
+		}
+		switch (j.emit) {
+			case EMIT_RESTORE:
+				ks.put_known = false;
+				push_update(out, ks.item_id, ks.is_lattice, PackedFloat32Array(), 0, 0, true, false);
+				break;
+			case EMIT_EMPTY:
+				ks.put_known = false;
+				push_update(out, ks.item_id, ks.is_lattice, ks.buf, 0, ks.inst_cap, false, true);
+				ks.changed = false;
+				break;
+			case EMIT_PUT: {
+				// Changed: new slot values, a resize, or leaving record mode / a new visible count
+				// (the caller still checks its own synced state; this only replaces the hash).
+				bool changed = ks.changed || j.was_on_records || j.need_vis_sync;
+				int side = ks.is_lattice ? 1 : 0;
+				if (fast[side] != nullptr && ks.put_known && ks.put_vis == j.target_vis && ks.put_cap == ks.inst_cap
+						&& ks.put_bnds == put_bounds && !j.was_on_records) {
+					// (--belt-mv-native-put) What BeltMv._emit_put_mv and ItemCards.put_mv would do with the
+					// same synced state: skip an unchanged buffer, or hand it to the fast path.
+					if (!changed) {
+						put_skips++;
+						break;
+					}
+					uint64_t t0 = Time::get_singleton()->get_ticks_usec();
+					int r = fast[side]->try_put(ks.item_id, ks.buf, j.target_vis, ks.inst_cap, put_bounds, put_mask[side], put_epoch[side]);
+					put_usec += Time::get_singleton()->get_ticks_usec() - t0;
+					if (r != 0) {
+						put_done++;
+						if (r == 2) {
+							put_uploads[side]++;
+						}
+						ks.changed = false;
+						break;
+					}
+				}
+				ks.put_known = false;
+				push_update(out, ks.item_id, ks.is_lattice, ks.buf, j.target_vis, ks.inst_cap, false, changed);
+				ks.changed = false;
+			} break;
+			default:
+				break;
+		}
+	}
+	jobs.clear();
+	due.clear();
+	put_ready = false;
+	if (!rec_touched.empty() || !lat_touched.empty()) {
+		// Every kind a touched page reached was stepped above; one that was not (none expected) falls back
+		// to a whole pass next time rather than losing the touch.
+		for (auto *kinds : { &rec_kinds, &lat_kinds }) {
+			for (auto &kv : *kinds) {
+				if (kv.second.page_dirty) {
+					kv.second.page_dirty = false;
+					kv.second.dirty = true;
 				}
 			}
 		}
-	};
-
-	process_group(rec_kinds, rec_order);
-	process_group(lat_kinds, lat_order);
+		rec_touched.clear();
+		lat_touched.clear();
+	}
 	return out;
+}
+
+void BeltMvNative::set_threads(bool on) {
+	threads = on;
+}
+
+bool BeltMvNative::get_threads() const {
+	return threads;
+}
+
+int BeltMvNative::get_threaded_steps() const {
+	return threaded_steps;
+}
+
+void BeltMvNative::set_page_dirty(bool on) {
+	if (on == page_dirty_on) {
+		return;
+	}
+	page_dirty_on = on;
+	invalidate_all();
+}
+
+bool BeltMvNative::get_page_dirty() const {
+	return page_dirty_on;
+}
+
+Array BeltMvNative::get_page_stats() const {
+	Array a;
+	a.append(page_steps);
+	a.append(page_slots);
+	return a;
+}
+
+void BeltMvNative::set_tight_cap(bool on) {
+	if (on == tight_on) {
+		return;
+	}
+	tight_on = on;
+	// Every kind sized again: the records' capacity (off) or its items (on); buffers fit in the next step.
+	for (auto *kinds : { &rec_kinds, &lat_kinds }) {
+		for (auto &kv : *kinds) {
+			KindState &ks = kv.second;
+			int full = ks.is_lattice ? ks.cap * 2 : ks.cap;
+			ks.inst_cap = on ? _tight_size(ks, std::min(ks.is_lattice ? ks.n * 2 : ks.n, full)) : full;
+			ks.low_steps = 0;
+			ks.dirty = true;
+		}
+	}
+}
+
+bool BeltMvNative::get_tight_cap() const {
+	return tight_on;
+}
+
+int BeltMvNative::get_inst_cap(bool is_lattice, int64_t item_id) const {
+	const auto &kinds = is_lattice ? lat_kinds : rec_kinds;
+	auto it = kinds.find(item_id);
+	return it == kinds.end() ? -1 : it->second.inst_cap;
+}
+
+void BeltMvNative::set_native_put(bool on) {
+	native_put_on = on;
+	if (!on) {
+		forget_puts();
+	}
+}
+
+bool BeltMvNative::get_native_put() const {
+	return native_put_on;
+}
+
+void BeltMvNative::set_put_targets(const Variant &rec_fast, int rec_mask, int64_t rec_epoch,
+		const Variant &lat_fast, int lat_mask, int64_t lat_epoch, const AABB &bounds) {
+	const Variant *v[2] = { &rec_fast, &lat_fast };
+	for (int side = 0; side < 2; side++) {
+		Object *o = v[side]->get_type() == Variant::OBJECT ? (Object *)(*v[side]) : nullptr;
+		put_fast_id[side] = Object::cast_to<BeltItemsNative>(o) != nullptr ? o->get_instance_id() : 0;
+	}
+	put_mask[0] = rec_mask;
+	put_mask[1] = lat_mask;
+	put_epoch[0] = rec_epoch;
+	put_epoch[1] = lat_epoch;
+	put_bounds = bounds;
+	put_ready = native_put_on;
+}
+
+void BeltMvNative::mark_put(bool is_lattice, int64_t item_id, int vis, int cap) {
+	if (!native_put_on) {
+		return;
+	}
+	auto &kinds = is_lattice ? lat_kinds : rec_kinds;
+	auto it = kinds.find(item_id);
+	if (it == kinds.end()) {
+		return;
+	}
+	KindState &ks = it->second;
+	ks.put_known = true;
+	ks.put_vis = vis;
+	ks.put_cap = cap;
+	ks.put_bnds = put_bounds;
+}
+
+void BeltMvNative::forget_puts() {
+	for (auto *kinds : { &rec_kinds, &lat_kinds }) {
+		for (auto &kv : *kinds) {
+			kv.second.put_known = false;
+		}
+	}
+}
+
+Array BeltMvNative::take_put_counts() {
+	Array a;
+	a.append(put_done);
+	a.append(put_uploads[0]);
+	a.append(put_uploads[1]);
+	a.append(put_skips);
+	a.append((int64_t)put_usec);
+	put_done = 0;
+	put_uploads[0] = 0;
+	put_uploads[1] = 0;
+	put_skips = 0;
+	put_usec = 0;
+	return a;
 }
 
 void BeltMvNative::_bind_methods() {
@@ -903,4 +1305,19 @@ void BeltMvNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_buf", "is_lattice", "item_id"), &BeltMvNative::get_buf);
 	ClassDB::bind_method(D_METHOD("get_moving_count", "is_lattice", "item_id"), &BeltMvNative::get_moving_count);
 	ClassDB::bind_method(D_METHOD("step", "clock", "vrect"), &BeltMvNative::step);
+	ClassDB::bind_method(D_METHOD("set_threads", "on"), &BeltMvNative::set_threads);
+	ClassDB::bind_method(D_METHOD("get_threads"), &BeltMvNative::get_threads);
+	ClassDB::bind_method(D_METHOD("get_threaded_steps"), &BeltMvNative::get_threaded_steps);
+	ClassDB::bind_method(D_METHOD("set_page_dirty", "on"), &BeltMvNative::set_page_dirty);
+	ClassDB::bind_method(D_METHOD("get_page_dirty"), &BeltMvNative::get_page_dirty);
+	ClassDB::bind_method(D_METHOD("get_page_stats"), &BeltMvNative::get_page_stats);
+	ClassDB::bind_method(D_METHOD("set_tight_cap", "on"), &BeltMvNative::set_tight_cap);
+	ClassDB::bind_method(D_METHOD("get_tight_cap"), &BeltMvNative::get_tight_cap);
+	ClassDB::bind_method(D_METHOD("get_inst_cap", "is_lattice", "item_id"), &BeltMvNative::get_inst_cap);
+	ClassDB::bind_method(D_METHOD("set_native_put", "on"), &BeltMvNative::set_native_put);
+	ClassDB::bind_method(D_METHOD("get_native_put"), &BeltMvNative::get_native_put);
+	ClassDB::bind_method(D_METHOD("set_put_targets", "rec_fast", "rec_mask", "rec_epoch", "lat_fast", "lat_mask", "lat_epoch", "bounds"), &BeltMvNative::set_put_targets);
+	ClassDB::bind_method(D_METHOD("mark_put", "is_lattice", "item_id", "vis", "cap"), &BeltMvNative::mark_put);
+	ClassDB::bind_method(D_METHOD("forget_puts"), &BeltMvNative::forget_puts);
+	ClassDB::bind_method(D_METHOD("take_put_counts"), &BeltMvNative::take_put_counts);
 }

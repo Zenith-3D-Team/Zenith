@@ -6,8 +6,13 @@ extends Node3D
 
 const SoundBank := preload("res://scripts/fx/sound_bank.gd")
 const MomentHold := preload("res://scripts/world/moment_hold.gd")
+const Switches := preload("res://scripts/switches.gd")
 const MIX_SHADER := preload("res://shaders/fx_sprite.gdshader")
 const ADD_SHADER := preload("res://shaders/fx_sprite_add.gdshader")
+static var _EMPTY_BUF := PackedFloat32Array()
+
+## `--fx-opt=off`: keeps the legacy FIFO pool overwrite and per-frame MomentHold buffer updates.
+static var fx_opt := Switches.on("--fx-opt")
 
 ## name: [file under data/base/graphics/entity, frame width, height, frames, additive, cyclic,
 ## card capacity, flat on the ground, fade-in and fade-out (fractions of the card's life)].
@@ -20,6 +25,7 @@ const SHEETS := {
 	"hit": ["explosion/explosion-1.png", 48, 42, 17, true, false, 48, false, 0.0, 0.2],
 	"muzzle": ["explosion-gunshot/explosion-gunshot.png", 34, 38, 2, true, false, 16, false, 0.0, 0.3],
 	"sparks": ["sparks/sparks-01.png", 39, 34, 19, true, false, 64, false, 0.0, 0.2],
+	"roboport-charge": ["roboport/roboport-recharging.png", 37, 35, 16, true, true, 128, false, 0.08, 0.2],
 	"scorch": ["scorchmark/small-scorchmark.png", 256, 182, 4, false, false, 240, true, 0.02, 0.25],
 	# Turrets and vehicle guns (turrets.gd): a bullet's hit, the artillery's muzzle flash, the
 	# flamethrower's stream particles and the fire at its nozzle.
@@ -59,7 +65,7 @@ class Pool:
 	var mmi := MultiMeshInstance3D.new()
 	var mm := MultiMesh.new()
 	var material := ShaderMaterial.new()
-	var cards: Array = []
+	var cards: Array[Card] = []
 	var frames := 1
 	var aspect := 1.0
 	var cyclic := false
@@ -72,16 +78,21 @@ class Pool:
 	var buffer := PackedFloat32Array()
 	var shown := 0  # cards drawn after the last _step
 	var brightness := -1.0  # the material's brightness as last set
+	var cursor := 0  # O(1) ring overwrite cursor when at capacity
+	var dirty := false
 
 
 var _pools := {}  # name -> Pool
+var _pool_list: Array[Pool] = []
+var _dirty := false
+var _quad: QuadMesh
 ## 0 by day, 1 at night: smoke dims with the light, flashes don't.
 var night := 0.0
 
 
 func _ready() -> void:
-	var quad := QuadMesh.new()
-	quad.size = Vector2.ONE
+	_quad = QuadMesh.new()
+	_quad.size = Vector2.ONE
 	for name in SHEETS:
 		var spec: Array = SHEETS[name]
 		var pool := Pool.new()
@@ -100,25 +111,37 @@ func _ready() -> void:
 		else:
 			texture = _blob(name)
 			pool.aspect = 1.0
-		pool.material.shader = ADD_SHADER if pool.additive else MIX_SHADER
-		pool.material.set_shader_parameter("atlas", texture)
-		pool.material.set_shader_parameter("grid", grid)
-		pool.material.set_shader_parameter("billboard", not pool.flat)
-		# Decals draw before the smoke and flashes above them.
-		pool.material.render_priority = -1 if pool.flat else (1 if pool.additive else 0)
-		pool.mm.transform_format = MultiMesh.TRANSFORM_3D
-		pool.mm.use_colors = true
-		pool.mm.use_custom_data = true
-		pool.mm.mesh = quad
-		pool.mm.instance_count = pool.capacity
-		pool.mm.visible_instance_count = 0
-		pool.mmi.multimesh = pool.mm
-		pool.mmi.material_override = pool.material
-		pool.mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		pool.mmi.name = name
-		pool.buffer.resize(pool.capacity * 20)
-		add_child(pool.mmi)
+		_configure_pool(pool, texture, grid, name)
 		_pools[name] = pool
+		_pool_list.append(pool)
+
+
+func _configure_pool(pool: Pool, texture: Texture2D, grid: Vector2, node_name: String) -> void:
+	if _quad == null:
+		_quad = QuadMesh.new()
+		_quad.size = Vector2.ONE
+	pool.material.shader = ADD_SHADER if pool.additive else MIX_SHADER
+	pool.material.set_shader_parameter("atlas", texture)
+	pool.material.set_shader_parameter("grid", grid)
+	pool.material.set_shader_parameter("billboard", not pool.flat)
+	# Decals draw before the smoke and flashes above them.
+	pool.material.render_priority = -1 if pool.flat else (1 if pool.additive else 0)
+	pool.mm.transform_format = MultiMesh.TRANSFORM_3D
+	pool.mm.use_colors = true
+	pool.mm.use_custom_data = true
+	pool.mm.mesh = _quad
+	pool.mm.instance_count = pool.capacity
+	pool.mm.visible_instance_count = 0
+	pool.mmi.multimesh = pool.mm
+	pool.mmi.material_override = pool.material
+	pool.mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	pool.mmi.name = node_name
+	pool.buffer.resize(pool.capacity * 20)
+	pool.buffer.fill(0.0)
+	var one_idx := 6 if pool.flat else 10
+	for k in pool.capacity:
+		pool.buffer[k * 20 + one_idx] = 1.0
+	add_child(pool.mmi)
 
 
 ## A new card on sheet `sheet` at `pos` (its centre), `width` tiles wide (the sheet's frame
@@ -136,9 +159,21 @@ func emit(sheet: String, pos: Vector3, width: float, life: float, color := Color
 	c.color = color
 	if pool.cyclic:
 		c.frame = randi() % pool.frames
-	if pool.cards.size() >= pool.capacity:
-		pool.cards.pop_front()
-	pool.cards.append(c)
+	var cards: Array[Card] = pool.cards
+	if cards.size() >= pool.capacity:
+		if fx_opt:
+			if pool.cursor >= cards.size():
+				pool.cursor = 0
+			cards[pool.cursor] = c
+			pool.cursor += 1
+			if pool.cursor >= pool.capacity:
+				pool.cursor = 0
+		else:
+			cards.pop_front()
+			cards.append(c)
+	else:
+		cards.append(c)
+	pool.dirty = true
 	return c
 
 
@@ -149,36 +184,19 @@ func add_pool(sheet: String, texture: Texture2D, grid: Vector2, frames: int, asp
 		cyclic: bool, flat: bool, capacity: int, glow := false, fade_in := 0.0, fade_out := 0.15) -> void:
 	if _pools.has(sheet):
 		return
-	var quad := QuadMesh.new()
-	quad.size = Vector2.ONE
 	var pool := Pool.new()
 	pool.additive = additive
 	pool.cyclic = cyclic
 	pool.flat = flat
 	pool.glow = glow
-	pool.capacity = capacity
+	pool.capacity = maxi(capacity, 1)
 	pool.fade_in = fade_in
 	pool.fade_out = fade_out
 	pool.aspect = aspect
 	pool.frames = maxi(frames, 1)
-	pool.material.shader = ADD_SHADER if additive else MIX_SHADER
-	pool.material.set_shader_parameter("atlas", texture)
-	pool.material.set_shader_parameter("grid", grid)
-	pool.material.set_shader_parameter("billboard", not flat)
-	pool.material.render_priority = -1 if flat else (1 if additive else 0)
-	pool.mm.transform_format = MultiMesh.TRANSFORM_3D
-	pool.mm.use_colors = true
-	pool.mm.use_custom_data = true
-	pool.mm.mesh = quad
-	pool.mm.instance_count = capacity
-	pool.mm.visible_instance_count = 0
-	pool.mmi.multimesh = pool.mm
-	pool.mmi.material_override = pool.material
-	pool.mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	pool.mmi.name = sheet.validate_node_name()
-	pool.buffer.resize(capacity * 20)
-	add_child(pool.mmi)
+	_configure_pool(pool, texture, grid, sheet.validate_node_name())
 	_pools[sheet] = pool
+	_pool_list.append(pool)
 
 
 func has_pool(sheet: String) -> bool:
@@ -188,6 +206,7 @@ func has_pool(sheet: String) -> bool:
 ## Takes a card out at once (a projectile that hit, a fire that went out).
 func kill(card: Card) -> void:
 	card.age = card.life
+	_dirty = true
 
 
 func frame_count(sheet: String) -> int:
@@ -197,16 +216,19 @@ func frame_count(sheet: String) -> int:
 
 func count() -> int:
 	var n := 0
-	for pool: Pool in _pools.values():
+	for pool in _pool_list:
 		n += pool.cards.size()
 	return n
 
 
 func clear() -> void:
-	for pool: Pool in _pools.values():
+	for pool in _pool_list:
 		pool.cards.clear()
+		pool.cursor = 0
+		pool.dirty = false
 		pool.mm.visible_instance_count = 0
 		pool.shown = 0
+	_dirty = false
 
 
 ## The last frame's _process time, microseconds (--stutter-probe).
@@ -216,68 +238,128 @@ var process_usec := 0
 func _process(delta: float) -> void:
 	var t0 := Time.get_ticks_usec()
 	var brightness := lerpf(1.0, 0.3, night)
-	for pool: Pool in _pools.values():
+	var held := MomentHold.on
+	var step_delta := 0.0 if held else delta
+	for pool in _pool_list:
 		# Set only when it changes: each set queues the material's uniforms to be sent again.
 		if not pool.additive and not pool.glow and pool.brightness != brightness:
 			pool.brightness = brightness
 			pool.material.set_shader_parameter("brightness", brightness)
-		if pool.cards.is_empty() and pool.shown == 0:
+		if held and fx_opt and not _dirty and not pool.dirty:
 			continue
-		_step(pool, 0.0 if MomentHold.on else delta)  # a screenshot's moment: effects hold where they are
+		if pool.cards.is_empty() and pool.shown == 0:
+			pool.dirty = false
+			continue
+		_step(pool, step_delta)  # a screenshot's moment: effects hold where they are
+		pool.dirty = false
+	_dirty = false
 	process_usec = Time.get_ticks_usec() - t0
 
 
 func _step(pool: Pool, delta: float) -> void:
-	var cards := pool.cards
-	var i := 0
-	while i < cards.size():
-		var c: Card = cards[i]
-		c.age += delta
-		if c.age >= c.life:
-			cards.remove_at(i)
-			continue
-		c.vel.y += c.rise * delta
-		if c.drag > 0.0:
-			c.vel *= maxf(0.0, 1.0 - c.drag * delta)
-		c.pos += c.vel * delta
-		c.spin += c.spin_rate * delta
-		i += 1
-	var buf := pool.buffer
+	var cards: Array[Card] = pool.cards
 	var n := cards.size()
-	for k in n:
-		var c: Card = cards[k]
-		var t := c.age / c.life
+	if n == 0:
+		if pool.shown != 0:
+			pool.mm.visible_instance_count = 0
+			pool.shown = 0
+		return
+	var aspect := pool.aspect
+	var cyclic := pool.cyclic
+	var flat := pool.flat
+	var fade_in := pool.fade_in
+	var fade_in_cut := fade_in if fade_in > 0.0 else -1.0
+	var inv_fade_in := 1.0 / fade_in if fade_in > 0.0 else 0.0
+	var fade_out := pool.fade_out
+	var fade_out_start := 1.0 - fade_out if fade_out > 0.0 else 2.0
+	var inv_fade_out := 1.0 / fade_out if fade_out > 0.0 else 0.0
+	var frames_f := float(pool.frames)
+	var max_frame := frames_f - 1.0
+	var move := delta > 0.0
+	var buf := pool.buffer
+	pool.buffer = _EMPTY_BUF
+	var i := 0
+	var o := 0
+	while i < n:
+		var c: Card = cards[i]
+		var age := c.age + delta
+		var life := c.life
+		if age >= life:
+			c.age = age
+			n -= 1
+			if i < n:
+				cards[i] = cards[n]
+			cards.pop_back()
+			continue
+		c.age = age
+		var pos := c.pos
+		var spin := c.spin
+		if move:
+			var vel := c.vel
+			var rise := c.rise
+			var drag := c.drag
+			if rise != 0.0 or drag > 0.0:
+				if rise != 0.0:
+					vel.y += rise * delta
+				if drag > 0.0:
+					vel *= maxf(0.0, 1.0 - drag * delta)
+				c.vel = vel
+			if vel != Vector3.ZERO:
+				pos += vel * delta
+				c.pos = pos
+			var sr := c.spin_rate
+			if sr != 0.0:
+				spin += sr * delta
+				c.spin = spin
+		var t := age / life
 		var w := lerpf(c.size0, c.size1, t)
-		var h := w * pool.aspect
-		var a := c.color.a
-		if pool.fade_in > 0.0 and t < pool.fade_in:
-			a *= t / pool.fade_in
-		if t > 1.0 - pool.fade_out:
-			a *= (1.0 - t) / pool.fade_out
+		var h := w * aspect
+		var col := c.color
+		var a := col.a
+		if t < fade_in_cut:
+			a *= t * inv_fade_in
+		if t > fade_out_start:
+			a *= (1.0 - t) * inv_fade_out
 		var frame: float
-		if pool.cyclic:
-			frame = fmod(c.frame + c.age * c.fps, pool.frames)
-		elif pool.flat:
+		if cyclic:
+			frame = fmod(c.frame + age * c.fps, frames_f)
+		elif flat:
 			frame = c.frame
 		else:
-			frame = minf(pool.frames - 1, t * pool.frames)
-		var o := k * 20
-		if pool.flat:
-			var cs := cos(c.angle)
-			var sn := sin(c.angle)
-			buf[o] = cs * w; buf[o + 1] = -sn * h; buf[o + 2] = 0.0; buf[o + 3] = c.pos.x
-			buf[o + 4] = 0.0; buf[o + 5] = 0.0; buf[o + 6] = 1.0; buf[o + 7] = c.pos.y
-			buf[o + 8] = -sn * w; buf[o + 9] = -cs * h; buf[o + 10] = 0.0; buf[o + 11] = c.pos.z
+			frame = minf(max_frame, t * frames_f)
+		if flat:
+			var ang := c.angle
+			var cs := cos(ang)
+			var sn := sin(ang)
+			buf[o] = cs * w
+			buf[o + 1] = -sn * h
+			buf[o + 3] = pos.x
+			buf[o + 7] = pos.y
+			buf[o + 8] = -sn * w
+			buf[o + 9] = -cs * h
+			buf[o + 11] = pos.z
 		else:
-			buf[o] = w; buf[o + 1] = 0.0; buf[o + 2] = 0.0; buf[o + 3] = c.pos.x
-			buf[o + 4] = 0.0; buf[o + 5] = h; buf[o + 6] = 0.0; buf[o + 7] = c.pos.y
-			buf[o + 8] = 0.0; buf[o + 9] = 0.0; buf[o + 10] = 1.0; buf[o + 11] = c.pos.z
-		buf[o + 12] = c.color.r; buf[o + 13] = c.color.g; buf[o + 14] = c.color.b; buf[o + 15] = a
-		buf[o + 16] = frame; buf[o + 17] = 0.0; buf[o + 18] = c.spin; buf[o + 19] = 0.0
+			buf[o] = w
+			buf[o + 3] = pos.x
+			buf[o + 5] = h
+			buf[o + 7] = pos.y
+			buf[o + 11] = pos.z
+		buf[o + 12] = col.r
+		buf[o + 13] = col.g
+		buf[o + 14] = col.b
+		buf[o + 15] = a
+		buf[o + 16] = frame
+		buf[o + 18] = spin
+		i += 1
+		o += 20
+	pool.buffer = buf
 	if n > 0:
 		pool.mm.buffer = buf
-	pool.mm.visible_instance_count = n
-	pool.shown = n
+		pool.mm.visible_instance_count = n
+		pool.shown = n
+	elif pool.shown != 0:
+		pool.mm.visible_instance_count = 0
+		pool.shown = 0
 
 
 static func _load_sheet(file: String) -> Texture2D:
@@ -308,6 +390,8 @@ static func _blob(name: String) -> Texture2D:
 			var c := Color(1, 1, 1, a)
 			if hot:
 				c = Color(1.0, lerpf(0.95, 0.45, d), lerpf(0.7, 0.1, d), a)
+			elif name == "roboport-charge":
+				c = Color(lerpf(0.95, 0.25, d), lerpf(1.0, 0.78, d), 1.0, a)
 			elif name == "scorch":
 				c = Color(0.08, 0.07, 0.06, a * 0.8)
 			image.set_pixel(x, y, c)

@@ -1017,9 +1017,10 @@ func _menu_backdrop_list() -> void:
 	var parsed = JSON.parse_string(FileAccess.get_file_as_string(MOCK_MENU_WORLD))
 	var source: Array = parsed["messages"]
 
-	# The default as shipped (the owner's 0.2.2 backdrop, tools/make_menu_backdrop.py): a busy factory
-	# with its camera, nothing typed (no save, time, name or stop names), and the two cuts that change
-	# nothing drawn: no chunk's decoded `_tiles`, every inserter hands' list delta-coded.
+	# The default as shipped (the owner's space platform over Aquilo since 0.3.1, tools/make_menu_backdrop.py):
+	# a busy platform with its camera, space and its planet, nothing typed (no save, time, name or stop names),
+	# and the two cuts that change nothing drawn: no chunk's decoded `_tiles`, every inserter hands' list
+	# delta-coded. (0.2.2's Nauvis factory had over 40 `ents` and 4000 entities; this one 25 and 787.)
 	var shipped: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(MenuBackgroundScript.DATA))
 	var kinds := {}
 	var tiles_left := 0
@@ -1040,8 +1041,9 @@ func _menu_backdrop_list() -> void:
 							typed.append([key, e[5][key]])
 	check(not shipped.has("save") and not shipped.has("taken") and not shipped.has("name") and typed.is_empty()
 		and BackdropRecorderScript.camera_transform(shipped.get("camera")) != null and int(kinds.get("chunk", 0)) == 25
-		and int(kinds.get("ents", 0)) > 40 and int(kinds.get("bs", 0)) > 50 and int(kinds.get("ih", 0)) > 50 and tiles_left == 0 and plain_ih == 0,
-		"backdrop list: the shipped default: 25 chunks, its camera, live belts and hands, no typed text %s, no _tiles (%d), ih delta-coded (%d plain): %s" % [typed, tiles_left, plain_ih, kinds])
+		and int(kinds.get("ents", 0)) >= 25 and int(kinds.get("bs", 0)) > 50 and int(kinds.get("ih", 0)) > 50 and tiles_left == 0 and plain_ih == 0
+		and shipped.get("space") == true and str(shipped.get("planet")) == "aquilo",
+		"backdrop list: the shipped default: 25 chunks, its camera, live belts and hands, space over Aquilo, no typed text %s, no _tiles (%d), ih delta-coded (%d plain): %s" % [typed, tiles_left, plain_ih, kinds])
 	Settings.set_value("interface", "backdrop", "default")
 	var shown_default: Node = MenuBackgroundScript.new()
 	add_child(shown_default)
@@ -1051,7 +1053,7 @@ func _menu_backdrop_list() -> void:
 		arms = shown_default._arms.count()
 		if arms > 0 and shown_default._belt_items.count() > 0:
 			break
-	check(shown_default.source == "default" and shown_default.world.entities.size() > 4000 and arms > 0 and shown_default._belt_items.count() > 0,
+	check(shown_default.source == "default" and shown_default.world.entities.size() >= 700 and arms > 0 and shown_default._belt_items.count() > 0,
 		"backdrop list: the shipped default draws %d entities, %d inserter arms (their delta-coded hands read), %d belt items" % [shown_default.world.entities.size(), arms, shown_default._belt_items.count()])
 	remove_child(shown_default)
 	shown_default.queue_free()

@@ -125,17 +125,48 @@ end
 ---------------------------------------------------------------------------------------------
 -- Logistic sections (the hub's requests from planets, a landing pad's requests from orbit)
 
+local VALID_COMPARATORS = {
+  ["="] = true, ["≠"] = true, ["!="] = true, ["<"] = true, ["≤"] = true, ["<="] = true, [">"] = true, ["≥"] = true, [">="] = true,
+}
+
+local function normalize_comparator(cmp)
+  if type(cmp) ~= "string" then
+    return "="
+  end
+  if cmp == "!=" then return "≠" end
+  if cmp == "<=" then return "≤" end
+  if cmp == ">=" then return "≥" end
+  return VALID_COMPARATORS[cmp] and cmp or "="
+end
+
+local function wire_comparator(cmp)
+  if type(cmp) ~= "string" or cmp == "" or cmp == "=" then
+    return nil
+  end
+  if cmp == "!=" then return "≠" end
+  if cmp == "<=" then return "≤" end
+  if cmp == ">=" then return "≥" end
+  return VALID_COMPARATORS[cmp] and cmp or nil
+end
+
+M.normalize_comparator = normalize_comparator
+
 -- One filter: [item, quality ("" any), min, max (-1 none), import from ("" anywhere), minimum
--- delivery count (-1 the default)].
+-- delivery count (-1 the default), comparator? (only when ~= "=")].
 local function filter_out(f)
   local v = f.value
   if type(v) ~= "table" or not v.name then
     return nil
   end
-  return {
+  local out = {
     name_of(v.name), name_of(v.quality) or "", math.floor(f.min or 0), f.max and math.floor(f.max) or -1,
     name_of(f.import_from) or "", f.minimum_delivery_count and math.floor(f.minimum_delivery_count) or -1,
   }
+  local cmp = wire_comparator(v.comparator)
+  if cmp then
+    out[7] = cmp
+  end
+  return out
 end
 
 -- [{i, g (group), on, m (multiplier), man (can be edited), f = [filter, ...]}, ...]
@@ -176,7 +207,8 @@ local function filter_in(entry)
     return nil
   end
   local quality = quality_ok(entry[2]) and entry[2] or "normal"
-  local f = { value = { type = "item", name = entry[1], quality = quality, comparator = "=" },
+  local cmp = normalize_comparator(entry[7])
+  local f = { value = { type = "item", name = entry[1], quality = quality, comparator = cmp },
     min = math.max(0, math.floor(tonumber(entry[3]) or 0)) }
   local max = tonumber(entry[4])
   if max and max >= 0 then
@@ -191,6 +223,66 @@ local function filter_in(entry)
     f.minimum_delivery_count = math.floor(mdc)
   end
   return f
+end
+
+local MAX_TRANSFERS = 100
+
+local function transfer_entries(tbl)
+  if type(tbl) ~= "table" then
+    return nil
+  end
+  local acc = {}
+  for k, v in pairs(tbl) do
+    local name, q, count
+    if type(k) == "string" and type(v) == "number" then
+      name, count = k, v
+    elseif type(k) == "table" and k.name and type(v) == "number" then
+      name, q, count = name_of(k.name), name_of(k.quality), v
+    elseif type(v) == "table" and v.name and type(v.count) == "number" then
+      name, q, count = name_of(v.name), name_of(v.quality), v.count
+    end
+    if type(name) == "string" and name ~= "" and count and count > 0 then
+      q = (type(q) == "string" and q ~= "") and q or "normal"
+      local key = name .. "/" .. q
+      local entry = acc[key]
+      if entry then
+        entry[2] = entry[2] + math.floor(count + 0.5)
+      else
+        acc[key] = { name, math.floor(count + 0.5), q }
+      end
+    end
+  end
+  local out = {}
+  for _, e in pairs(acc) do
+    if e[3] == "normal" then
+      out[#out + 1] = { e[1], e[2] }
+    else
+      out[#out + 1] = { e[1], e[2], e[3] }
+    end
+  end
+  if #out == 0 then
+    return nil
+  end
+  table.sort(out, function(a, b)
+    if a[1] ~= b[1] then
+      return a[1] < b[1]
+    end
+    return (a[3] or "normal") < (b[3] or "normal")
+  end)
+  for i = MAX_TRANSFERS + 1, #out do
+    out[i] = nil
+  end
+  return out
+end
+
+-- Reads targeted_items_deliver and targeted_items_pickup from a LuaLogisticPoint.
+function M.point_transfers(point)
+  if not point then
+    return nil, nil
+  end
+  local del = transfer_entries(try(function() return point.targeted_items_deliver end))
+  local pick = transfer_entries(try(function() return point.targeted_items_pickup end))
+  return del, pick
 end
 
 -- {u, i (section index, 0 adds one), del? 1, f? [filters], g? group, on? 0/1, m? multiplier}
@@ -224,26 +316,36 @@ function M.write_section(secs, cmd)
       return puppet.message("No such section")
     end
   end
-  if type(cmd.f) == "table" then
-    local list = {}
-    for _, entry in ipairs(cmd.f) do
-      local f = filter_in(entry)
-      if f and #list < MAX_FILTERS then
-        list[#list + 1] = f
+  local ok_man, is_man = pcall(function() return sec.is_manual end)
+  if ok_man and is_man == false then
+    puppet.message("That section is read-only")
+    return
+  end
+  local ok_edit, edit_err = pcall(function()
+    if type(cmd.f) == "table" then
+      local list = {}
+      for _, entry in ipairs(cmd.f) do
+        local f = filter_in(entry)
+        if f and #list < MAX_FILTERS then
+          list[#list + 1] = f
+        end
       end
+      sec.filters = list
     end
-    sec.filters = list
-  end
-  -- A section's group: one of the force's groups or a new name ("" takes it out of its group).
-  if i ~= 0 and type(cmd.g) == "string" and #cmd.g <= 200 then
-    sec.group = cmd.g
-  end
-  if cmd.on == 0 or cmd.on == 1 then
-    sec.active = cmd.on == 1
-  end
-  local m = tonumber(cmd.m)
-  if m and m >= 0 then
-    sec.multiplier = m
+    -- A section's group: one of the force's groups or a new name ("" takes it out of its group).
+    if i ~= 0 and type(cmd.g) == "string" and #cmd.g <= 200 then
+      sec.group = cmd.g
+    end
+    if cmd.on == 0 or cmd.on == 1 then
+      sec.active = cmd.on == 1
+    end
+    local m = tonumber(cmd.m)
+    if m and m >= 0 then
+      sec.multiplier = m
+    end
+  end)
+  if not ok_edit then
+    puppet.message("Can't edit section: " .. tostring(edit_err))
   end
 end
 
@@ -836,7 +938,7 @@ end
 function M.add_handlers(handlers, screens)
   handlers.smap = M.smap_request
   handlers.plat_new = M.new_platform
-  handlers.set_section = screens.space_command({ hub = true, pad = true, container = true, silo = true }, M.set_section, "That has no requests")
+  handlers.set_section = screens.space_command({ hub = true, pad = true, container = true, silo = true, vehicle = true, roboport = true }, M.set_section, "That has no requests")
   handlers.set_hub = screens.space_command({ hub = true }, M.set_hub, "That isn't a platform hub")
   handlers.set_silo = screens.space_command({ silo = true }, M.set_silo, "That isn't a rocket silo")
   handlers.silo_launch = screens.space_command({ silo = true }, M.launch, "That isn't a rocket silo")

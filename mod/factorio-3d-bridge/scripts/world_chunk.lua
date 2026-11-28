@@ -139,10 +139,22 @@ local function extra_of_type(entity, t)
   elseif t == "resource" then
     return { a = entity.amount }
   elseif t == "entity-ghost" then
-    if entity.ghost_type == "underground-belt" then
-      return { gh = registry.entity_id(entity.ghost_name), u = string.sub(entity.belt_to_ground_type, 1, 1) }
+    local out = { gh = registry.entity_id(entity.ghost_name) }
+    local gt = entity.ghost_type
+    if gt == "underground-belt" then
+      out.u = string.sub(entity.belt_to_ground_type, 1, 1)
+    elseif gt == "linked-belt" then
+      local ok, lbt = pcall(function() return entity.linked_belt_type end)
+      if ok and type(lbt) == "string" and lbt ~= "" then
+        out.u = string.sub(lbt, 1, 1)
+      end
+    elseif registry.is_pipe(gt) then
+      local ok, mask = pcall(pipe_mask, entity)
+      if ok and mask then
+        out.pc = mask
+      end
     end
-    return { gh = registry.entity_id(entity.ghost_name) }
+    return out
   elseif t == "tile-ghost" then
     return { tg = registry.tile_id(entity.ghost_name) }
   elseif t == "train-stop" then
@@ -356,8 +368,9 @@ record_of = function(entity, t, id)
     end
   end
   -- Alt-mode's icon (issue #9): with the record, so every loaded machine has it, no scanning.
-  -- and its machine or pump arrows (part 2, extra.fa).
-  if rec[1] ~= 0 and alt_mode.TYPES[t] then
+  -- and its machine or pump arrows (part 2, extra.fa). Ghost drills over fluid-requiring ore also get fa/fc.
+  local alt_t = t == "entity-ghost" and entity.ghost_type or t
+  if (rec[1] ~= 0 or t == "entity-ghost") and alt_mode.TYPES[alt_t] then
     local icon, arrows = alt_mode.state(entity)
     if icon then
       x = x or {}
@@ -369,7 +382,9 @@ record_of = function(entity, t, id)
       -- Which fluid each connection takes or gives (L10).
       x.fc = alt_mode.connections(entity)
     end
-    alt_mode.recorded(entity, icon, x, arrows)
+    if rec[1] ~= 0 and t ~= "entity-ghost" then
+      alt_mode.recorded(entity, icon, x, arrows)
+    end
   end
   if rec[1] ~= 0 and belt_switch.TYPES[t] then
     belt_switch.recorded(entity, x)

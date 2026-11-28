@@ -17,6 +17,7 @@ const ProtoDB := preload("res://scripts/world/protos.gd")
 const ModelLibrary := preload("res://scripts/world/model_library.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
+const Turrets := preload("res://scripts/world/turrets.gd")
 const Switches := preload("res://scripts/switches.gd")
 
 ## Game ticks after the send with no entity: the mod answers on its next tick, so by then it was
@@ -26,11 +27,12 @@ const REFUSED_MSEC := 600
 ## Gone whatever happens after this (a lost message, the chunk never drawn).
 const GIVE_UP_MSEC := 4000
 ## Types whose look the mod decides from what is round them (an underground's entrance or exit,
-## a rail's piece, cargo frames), or that it moves (rolling stock onto rails): not predicted.
+## a rail's piece, cargo frames), or that it moves (rolling stock onto rails, flying robots which
+## spawn as movers and never arrive via `add`): not predicted.
 const NOT_PREDICTED := ["underground-belt", "straight-rail", "curved-rail-a", "curved-rail-b", "half-diagonal-rail",
 	"elevated-straight-rail", "elevated-curved-rail-a", "elevated-curved-rail-b", "elevated-half-diagonal-rail",
 	"rail-ramp", "rail-support", "locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon", "cargo-bay",
-	"space-platform-hub", "cargo-landing-pad"]
+	"space-platform-hub", "cargo-landing-pad", "logistic-robot", "construction-robot", "combat-robot", "capture-robot"]
 
 var world: WorldMirror
 
@@ -257,24 +259,19 @@ func pending_of(proto: ProtoDB.EntityProto) -> int:
 
 ## Something already drawn stands in `rect` (ore, ghosts and tile ghosts don't count).
 func _taken(rect: Rect2) -> bool:
-	var center := WorldMirror.chunk_of(rect.get_center())
-	for dy in range(-1, 2):
-		for dx in range(-1, 2):
-			var cv = world.chunks.get(center + Vector2i(dx, dy))
-			if cv == null:
-				continue
-			for r: WorldMirror.Rec in cv.entities.values():
-				var other: ProtoDB.EntityProto = world.protos.entity(r.proto_id)
-				if other == null or other.type in ["resource", "entity-ghost", "tile-ghost"]:
-					continue
-				if WorldMirror.selection_rect(other, r.pos, r.dir).intersects(rect):
-					return true
+	for r: WorldMirror.Rec in world.entities_overlapping(rect):
+		var other: ProtoDB.EntityProto = world.protos.entity(r.proto_id)
+		if other == null or other.type in ["resource", "entity-ghost", "tile-ghost"]:
+			continue
+		if WorldMirror.selection_rect(other, r.pos, r.dir).intersects(rect):
+			return true
 	return false
 
 
 func _make_node(proto: ProtoDB.EntityProto, pos: Vector2, dir: int) -> Node3D:
 	var root := Node3D.new()
-	var at := Vector3(pos.x, 0.0, pos.y)
+	var lift := Visuals.flight_lift(proto.type)
+	var at := Vector3(pos.x, lift, pos.y)
 	if ModelLibrary.entity_ready(proto.name, proto.type, {}, dir):
 		var mesh := ModelLibrary.mesh_for_entity(proto.name, proto.type, {}, dir)
 		if mesh != null:
@@ -286,12 +283,14 @@ func _make_node(proto: ProtoDB.EntityProto, pos: Vector2, dir: int) -> Node3D:
 			for part: ModelLibrary.AnimPart in ModelLibrary.parts_for_entity(proto.name, proto.type, {}, dir):
 				var part_mi := MeshInstance3D.new()
 				part_mi.mesh = part.mesh
+				if part.kind == "turret_head" and Turrets.head_front(part) == Vector3.LEFT:
+					part_mi.transform = part.pivot * Transform3D(Basis(Vector3.UP, -PI / 2.0), Vector3.ZERO) * part.pivot.affine_inverse()
 				root.add_child(part_mi)
 			return root
 	# No model yet (or none at all): the box the world would draw.
 	var box := MeshInstance3D.new()
 	box.mesh = Visuals.box_mesh()
-	box.transform = Visuals.placeholder_transform(proto, pos, dir, Visuals.height_for(proto))
+	box.transform = Visuals.placeholder_transform(proto, pos, dir, Visuals.height_for(proto), lift)
 	box.material_override = GroundHeight.mark_material(Color(0.6, 0.6, 0.6, 1.0), false)  # on the hills, as models are
 	root.add_child(box)
 	return root
@@ -393,8 +392,7 @@ func turn(rec: WorldMirror.Rec, reverse: bool) -> bool:
 		rec.dir = posmod(rec.dir + 8, 16)
 	else:
 		rec.dir = posmod(rec.dir + (-4 if reverse else 4), 16)
-	rec.cache_gen = -1
-	world.redraw(rec.chunk)
+	world.record_edited(rec)
 	return true
 
 
@@ -523,7 +521,6 @@ func _check_turns(now: int) -> void:
 		elif Bridge.server_tick - t.tick >= REFUSED_TICKS and now - t.msec >= REFUSED_MSEC:
 			t.rec.dir = t.old_dir
 			t.rec.extra = t.old_extra
-			t.rec.cache_gen = -1
-			world.redraw(t.rec.chunk)
+			world.record_edited(t.rec)
 			refused += 1
 			_turns.erase(key)

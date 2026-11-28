@@ -14,6 +14,7 @@ Common fixes for setup, connection, and performance problems. Deep measurement p
 - **Slow UPS on megabases:** Enable **Settings → Graphics → Hold the game at 60 UPS** (default on; automatically throttles bridge `rate`, distances, and FPS cap below ~57 UPS). Otherwise profile bridge modules via `/f3d-profile` then `/f3d-status`, or lower **View distance**, **Entity distance**, **Moving belt items**, and **Belt item distance** (see [PROFILING-NOTES.md](PROFILING-NOTES.md)).
 - **Low FPS on busy bases or forests:** Click **Settings → Graphics → Recommended** or drop **Preset** (`Low`–`Ultra`). Ambient Occlusion (`SSAO`) is enabled in `High`/`Ultra` (~0.7 ms GPU up close and fades out with distance); **Distant horizon**, dense forests, and high **Render scaling** dominate GPU cost.
 - **Hybrid single-player fails to connect:** Start Factorio with `--enable-lua-udp 34200`, load into a save first, confirm the mod is active in Factorio's mods folder, and run `/f3d-selftest` in Factorio's console (`~`).
+- **Black screen, crash at start, or drawing glitches since 0.3.1 (Windows):** Zenith draws with Direct3D 12 by default. Go back to Vulkan (as before 0.3.1) in **Settings → Graphics → Renderer → Vulkan** and restart, or start once with `--rendering-driver vulkan` before `--` (e.g. `Zenith.exe --rendering-driver vulkan`). If Direct3D 12 can't start at all, Godot falls back to Vulkan by itself. To reset by hand, delete the `rendering_device/driver.windows` line from `%APPDATA%\Godot\app_userdata\Zenith\engine.cfg`.
 - **Crash, quit hang, or flicker with "Render on a separate thread":** Untick **Settings → Graphics → Render on a separate thread** and restart, or launch once with `--render-thread safe` before `--`.
 
 ### Test runs' Godot logs (not the player's)
@@ -22,7 +23,7 @@ Godot rotates `user://logs/godot.log` (`%APPDATA%\Godot\app_userdata\Zenith\logs
 
 ### The debug menu (Ctrl+F12)
 
-Available only in dev builds and source runs (`Settings.dev_tools()`, stripped from public releases along with its keybinding). Opens on its own layer over gameplay, add-on cameras (`F8`), and hidden HUD (`F11`):
+Available only in testing builds (`--channel dev`, or a public download started with `--dev-tools`) and source runs (`Settings.dev_tools()`, stripped from public releases along with its keybinding). Opens on its own layer over gameplay, add-on cameras (`F8`), and hidden HUD (`F11`):
 
 - **Time & Pause:** Jump daytime, freeze sun, scale speed (`0.05–16x`), or pause/resume via RCON (admin-restricted in multiplayer).
 - **Benchmarks (`bench_runner.gd`):** In-save standing, lap, flyover, and zoom runs comparing p50/p99 frame time, GPU/render CPU, draw calls, UPS, and bridge costs (`user://benchmarks/`).
@@ -32,7 +33,7 @@ Available only in dev builds and source runs (`Settings.dev_tools()`, stripped f
 
 ### The performance test (main menu)
 
-Available only in dev builds / source runs (`-- --perf-test[=quick|default|extensive]`, [PERFORMANCE-TEST.md](PERFORMANCE-TEST.md)). Spawns an isolated headless Factorio map + child Zenith (`user://perf-tests/`), builds a 2,603-entity benchmark factory over RCON, measures standing/lap performance across presets/looks via `--stutter-probe`, and writes `user://perf-tests/Zenith-perf-<version>-<mode>.txt` without modifying player saves or settings.
+Available only in testing builds (`--channel dev`, or `--dev-tools`) and source runs (`-- --perf-test[=quick|default|extensive]`, [PERFORMANCE-TEST.md](PERFORMANCE-TEST.md)). Spawns an isolated headless Factorio map + child Zenith (`user://perf-tests/`), builds a 2,603-entity benchmark factory over RCON, measures standing/lap performance across presets/looks via `--stutter-probe`, and writes `user://perf-tests/Zenith-perf-<version>-<mode>.txt` without modifying player saves or settings.
 
 ### Profiling probes & deep optimization notes
 

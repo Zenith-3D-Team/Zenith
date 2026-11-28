@@ -30,6 +30,8 @@ const ResearchWindow := preload("res://scripts/ui/factorio/research_window.gd")
 signal close_requested
 ## The page's "Open in the technology screen" (and a click on an Unlocked by card).
 signal open_technology(name: String)
+## The Pin button: pin the shown page to the screen (factorio_ui.gd keeps the pinned panels).
+signal pin_requested(kind: String, name: String)
 
 const COLUMNS := 10
 ## Groups whose icon is one of core's category pictures (base/prototypes/item-groups.lua).
@@ -150,7 +152,9 @@ func _ready() -> void:
 	space_age.button_pressed = true
 	space_age.disabled = true  # the index already lists what the game has
 	var pin := _title_button("Pin", "icons/mip/pin.png", "Pin")
-	pin.disabled = true
+	pin.pressed.connect(func() -> void:
+		if kind != "":
+			pin_requested.emit(kind, thing))
 	_back = _title_button("Back", "icons/mip/backward-arrow.png", "Back")
 	_forward = _title_button("Forward", "icons/mip/forward-arrow.png", "Forward")
 	_back.pressed.connect(func() -> void: _go(_at - 1))
@@ -605,8 +609,11 @@ func _item_page(d: Dictionary) -> void:
 		_stat_box(lines)
 		_energy_box(e)
 	else:
-		lines = Info.item_lines(d.duplicate())
+		var plain := d.duplicate()
+		plain.erase("res")  # listed under "Resistances" below, as an entity's are
+		lines = Info.item_lines(plain)
 		lines.append_array(_rocket_lines(d))
+		lines.append_array(_resistances(d))
 		_stat_box(lines)
 	var made: Array = _list(d.get("made"))
 	var own := thing if made.has(thing) else ""
@@ -654,7 +661,7 @@ func _entity_page(d: Dictionary) -> void:
 	_stat_box(lines)
 	_energy_box(d)
 	if not d.get("mine", []).is_empty():
-		var sec := _amount_rows("Mining results", d["mine"])
+		var sec := _amount_rows("Mining results", d["mine"], d.get("mine_detail", []))
 		if d.has("mtime") and sec != null:
 			_time_line(sec, float(d["mtime"]), "Mining time")
 	_slot_grid("Can craft", "recipe", d.get("recipes", []))
@@ -986,7 +993,7 @@ func _recipe_parts(recipe: String, d: Dictionary) -> void:
 	if ing == null:
 		ing = _section("Ingredients")
 	_time_line(ing, float(d.get("time", 0.5)), "Crafting time")
-	_amount_rows("Products", d.get("prod", []))
+	_amount_rows("Products", d.get("prod", []), d.get("prod_detail", []))
 	_slot_grid("Made in", "entity", d.get("made_in", []))
 
 
@@ -1016,12 +1023,14 @@ func _time_line(sec: VBoxContainer, seconds: float, what: String) -> void:
 
 
 ## A section of [type, name, amount] rows: a slot and "2 × Steel plate". Returns the section.
-func _amount_rows(title: String, rows) -> VBoxContainer:
+func _amount_rows(title: String, rows, detail = []) -> VBoxContainer:
 	var list := _list(rows)
 	if list.is_empty():
 		return null
 	var sec := _section(title)
-	for p in list:
+	var fine := _list(detail)
+	for i in list.size():
+		var p = list[i]
 		if not (p is Array and p.size() >= 3):
 			continue
 		var type := str(p[0])
@@ -1033,7 +1042,7 @@ func _amount_rows(title: String, rows) -> VBoxContainer:
 		b.setup(str(target[0]), n)
 		b.pressed.connect(show_page.bind(str(target[0]), n))
 		row.add_child(b)
-		var amount := Kit.label(Info.num(float(p[2])) + " × ")
+		var amount := Kit.label(Info.amount_text(float(p[2]), fine[i] if i < fine.size() else []))
 		amount.add_theme_font_override("font", Kit.font("bold"))
 		amount.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 		row.add_child(amount)

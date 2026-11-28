@@ -45,6 +45,8 @@ const KINDS := {
 		["%d entity is missing construction robots.", "%d entities are missing construction robots."]],
 	"no_repair": ["not-enough-repair-packs-icon.png", "Not enough repair packs",
 		["%d entity is missing repair packs.", "%d entities are missing repair packs."]],
+	"no_storage": ["no-storage-space-icon.png", "Not enough logistic storage space",
+		["Not enough logistic storage space available.", "%d logistic networks are out of storage space."]],
 	"train_fuel": ["fuel-icon-red.png", "Train out of fuel", ["Train out of fuel.", "%d trains out of fuel."]],
 	"train_path": ["no-path-icon.png", "Train has no path", ["Train cannot find path to destination.", "%d trains cannot find a path to their destination."]],
 	"platform_path": ["no-path-icon.png", "Platform has no path", ["Space platform cannot find a path.", "%d space platforms cannot find a path."]],
@@ -52,6 +54,8 @@ const KINDS := {
 		["Not enough platform hub storage space available.", "%d platform hubs are out of storage space."]],
 	"collector": ["asteroid-collector-path-blocked-icon.png", "Asteroid collector blocked",
 		["%d asteroid collector can't collect.", "%d asteroid collectors can't collect."]],
+	"no_roboport_storage": ["no-roboport-storage-space-icon.png", "Not enough roboport storage",
+		["Not enough empty roboport robot slots.", "%d logistic networks don't have enough empty roboport robot slots."]],
 	"launch": ["destination-full-icon.png", "Rocket can't launch", ["%d rocket silo can't launch.", "%d rocket silos can't launch."]],
 	# L11: Factorio's pipeline_disabled_icon and its alert's words ("Pipeline has been overextended.").
 	"pipeline": ["fluid-icon-red.png", "Pipeline overextended", ["Pipeline has been overextended.", "%d pipelines have been overextended."]],
@@ -126,7 +130,7 @@ static var sound_kinds: Array = SOUND_KINDS_AMMO if Switches.has("--alert-sounds
 ## Kinds muted in the Alerts configuration (alerts_config.gd apply).
 var muted_kinds: Array = []
 ## Plays it (the UI test counts it instead).
-var alert_beep := func() -> void: Sfx.play_ui("alert-destroyed", 0.5)
+var alert_beep := func() -> void: Sfx.play_ui("alert-destroyed", 0.5, "", "Alerts")
 var _sounded := {}  # kind -> {entry key: true}: the entries the last update had
 var _sound_primed := false
 var _sound_msec := -SOUND_GAP_MSEC

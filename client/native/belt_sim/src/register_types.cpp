@@ -1,4 +1,5 @@
 #include "acid_goo_native.h"
+#include "alt_icons_native.h"
 #include "belt_draw_native.h"
 #include "belt_items_native.h"
 #include "belt_lattice_native.h"
@@ -10,8 +11,12 @@
 #include "decor_native.h"
 #include "chunk_build_native.h"
 #include "inserter_arms_native.h"
+#include "inserter_ingest_native.h"
+#include "inserter_pose_native.h"
+#include "inserter_swing_native.h"
 #include "lod_mesher_native.h"
 #include "terrain_field_native.h"
+#include "texture_compress_native.h"
 #include "udp_socket_native.h"
 #include "wire_decode_native.h"
 
@@ -27,6 +32,7 @@ static void initialize_belt_sim(ModuleInitializationLevel p_level) {
 		return;
 	}
 	GDREGISTER_CLASS(AcidGooNative);
+	GDREGISTER_CLASS(AltIconsNative);
 	GDREGISTER_CLASS(BeltSimNative);
 	GDREGISTER_CLASS(BeltDrawNative);
 	GDREGISTER_CLASS(BeltItemsNative);
@@ -40,8 +46,12 @@ static void initialize_belt_sim(ModuleInitializationLevel p_level) {
 	GDREGISTER_CLASS(WireDecodeNative);
 	GDREGISTER_CLASS(ChunkBuildNative);
 	GDREGISTER_CLASS(InserterArmsNative);
+	GDREGISTER_CLASS(InserterSwingNative);
+	GDREGISTER_CLASS(InserterPoseNative);
+	GDREGISTER_CLASS(InserterIngestNative);
 	GDREGISTER_CLASS(LodMesherNative);
 	GDREGISTER_CLASS(TerrainFieldNative);
+	GDREGISTER_CLASS(TextureCompressNative);
 }
 
 static void uninitialize_belt_sim(ModuleInitializationLevel p_level) {

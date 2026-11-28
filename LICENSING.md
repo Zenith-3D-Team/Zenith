@@ -25,10 +25,36 @@ add-on API (`client/scripts/addons/`, described in [docs/ADDONS.md](docs/ADDONS.
 permission doesn't cover add-ons that contain code copied from Zenith, or modified versions of
 Zenith itself, which stay under the GPL.
 
+## Vendor upscaler exception
+
+Additional permission under GNU GPL version 3 section 7:
+
+As a special exception, the copyright holders of Zenith give you permission to combine Zenith with
+the vendor runtime libraries listed below, by loading them at run time through the programming
+interfaces their vendors publish, and to convey the result with those libraries in the unmodified
+binary form their vendors publish. Those libraries are not covered by the GPL, their source code is
+not part of Zenith's Corresponding Source, and they keep their own licences, which are shipped
+beside them:
+
+- AMD FSR SDK signed runtime libraries (`amd_fidelityfx_*.dll`), under AMD's FSR SDK licence
+  (its `license.md` is shipped beside them in `vendor/amd/`);
+- NVIDIA DLSS and NVIDIA Streamline runtime libraries (`nvngx_*.dll`, `sl.*.dll`), under the NVIDIA
+  RTX SDKs License and Streamline's licence. Zenith does not ship these: you get them from NVIDIA
+  and put them in `vendor/nvidia/` yourself, and this permission covers Zenith loading them there.
+
+This permission covers those libraries only. Zenith's own code that calls them stays under the GPL,
+with its full source. Zenith works without them: delete the `vendor` folder and the matching
+Upscaling choices switch off. If you change Zenith you may keep this exception for your version or
+remove it.
+
 ## Not covered by the GPL
 
 These keep their own terms. They are separate works shipped alongside Zenith:
 
+- **A Windows download's `vendor/` folder** (AMD's FSR runtime libraries; NVIDIA's DLSS and
+  Streamline files if you put them there yourself, never shipped by Zenith): © Advanced Micro
+  Devices, Inc. and © NVIDIA Corporation. Closed-source, under their own licences (AMD's
+  `license.md` is in the folder); you may not reverse engineer them or pass them on apart from Zenith.
 - **`client/assets/branding/`** (Zenith's logo and icon, `client/icon.png`, `client/icon.ico`):
   © David (Vasillo). Used in Zenith with his permission; see the folder's README.
 - **A download's `models/Zenith.zip`**, the Zenith model pack (the development builds carry

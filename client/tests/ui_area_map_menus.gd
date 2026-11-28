@@ -397,6 +397,52 @@ func _map(ui) -> void:
 	check(add.get("text") == "Copper" and add.get("icon") == ["item", "copper-ore"]
 		and absf(float(add.get("x", 0)) / 256.0 + 20.0) < 0.5 and absf(float(add.get("y", 0)) / 256.0 - 12.0) < 0.5
 		and not view.dialog.is_open(), "confirm sends tag_add at the clicked spot")
+	# A tag made in the game with a signal icon: editing its text keeps the icon's type (it was sent back as an
+	# item, which the game refuses, and the edit lost the tag).
+	ui.model.map_tags.append({"id": 77, "position": Vector2(40, 40), "text": "sig", "icon_type": "virtual", "icon_name": "signal-A"})
+	view.edit_tag_at(view.tiles_to_screen(Vector2(40, 40)))
+	view.dialog.text_field.text = "sig2"
+	view.dialog._confirm()
+	var sig := sent_one("tag_add")
+	check(sig.get("text") == "sig2" and sig.get("icon") == ["virtual", "signal-A"], "editing a signal-icon tag keeps its icon type: %s" % [sig])
+	ui.model.map_tags.pop_back()
+	# A left click (no drag) on a tag opens its properties; the dialog can pick any signal (Factorio's titles).
+	var press := InputEventMouseButton.new()
+	press.button_index = MOUSE_BUTTON_LEFT
+	press.pressed = true
+	press.position = view.tiles_to_screen(Vector2(5, -2))
+	view._gui_input(press)
+	var release := press.duplicate() as InputEventMouseButton
+	release.pressed = false
+	view._gui_input(release)
+	check(view.dialog.is_open() and view.dialog.editing and view.dialog._title.text == "Tag properties", "a left click on a tag opens Tag properties")
+	var press2 := press.duplicate() as InputEventMouseButton
+	press2.double_click = true
+	view._gui_input(press2)
+	check(view.dialog.is_open(), "the second press of a double click on a tag keeps its dialog open")
+	view.dialog.close()
+	view.settings.set_value("map/show_tags", false)
+	check(view.tag_at(view.tiles_to_screen(Vector2(5, -2))).is_empty(), "a hidden tag (Tags layer off) can't be clicked")
+	view.settings.set_value("map/show_tags", true)
+	view.edit_tag_at(spot)
+	check(view.dialog._title.text == "New tag", "an empty spot opens New tag")
+	var asked := []
+	view.dialog.choose_icon = func(cb: Callable) -> void: asked.append(cb)
+	view.dialog._pick_custom()
+	check(asked.size() == 1, "the last slot asks for the signal chooser")
+	asked[0].call("fluid", "crude-oil")
+	view.dialog.text_field.text = "Oil"
+	view.dialog._confirm()
+	check(sent_one("tag_add").get("icon") == ["fluid", "crude-oil"], "a tag takes any signal: %s" % [sent_one("tag_add")])
+	# The title bar's Search finds tags by name and a click looks at one.
+	ui.remote_frame.search_requested.emit()
+	view.search_field.text = "base"
+	view.refresh_search()
+	check(view.search_panel.visible and view.search_matches().size() == 1 and view.search_matches()[0]["id"] == 3, "Search finds the tag named base")
+	view.centre = Vector2(900, 900)
+	(view._search_list.get_child(0) as Button).pressed.emit()
+	check(view.centre == Vector2(5, -2) and not view.search_panel.visible, "a search result centres the map on the tag")
+	view.centre = Vector2.ZERO
 	# On the existing tag (id 3 at 5, -2): edit, then delete.
 	view.edit_tag_at(view.tiles_to_screen(Vector2(5, -2)))
 	check(view.dialog.editing and view.dialog.text_field.text == "base" and view.dialog.icon_name == "iron-plate", "right click on a tag edits it")
@@ -603,6 +649,31 @@ func _map(ui) -> void:
 	ask = sent_one("unghost")
 	m.handle({"t": "unghost", "q": int(ask.get("q", 0)), "n": 0})
 	check(view.dialog.is_open(), "no ghost there: the right-click opens the tag dialog, as before")
+	view.dialog.close()
+	# A left click on a building opens its window, as the remote view's: the mod picks it, then opens it with `rv`.
+	var picks: Array = []
+	for _i in 2:
+		sent()
+		var left := InputEventMouseButton.new()
+		left.button_index = MOUSE_BUTTON_LEFT
+		left.pressed = true
+		left.position = view.tiles_to_screen(Vector2(5, 6))
+		view._gui_input(left)
+		left = left.duplicate()
+		left.pressed = false
+		view._gui_input(left)
+		picks = sent()
+		var ask_pick: Dictionary = picks[0] if picks.size() == 1 else {}
+		if _i == 0:
+			check(ask_pick.get("t") == "pick" and ask_pick.get("x") == 5 * 256 and ask_pick.get("y") == 6 * 256 and int(ask_pick.get("r", 0)) > 0,
+				"a left click on the map asks the mod for the building there (and opens nothing yet): %s" % [picks])
+			m.handle({"t": "pick", "q": int(ask_pick.get("q", 0)), "u": 0})
+			check(sent_one("open").is_empty(), "nothing there: no window")
+		else:
+			m.handle({"t": "pick", "q": int(ask_pick.get("q", 0)), "u": 42, "p": 3, "x": 5 * 256 + 100, "y": 6 * 256 + 100})
+			var opened := sent_one("open")
+			check(int(opened.get("u", 0)) == 42 and int(opened.get("rv", 0)) == 1 and int(opened.get("x", 0)) == 5 * 256 + 100,
+				"the picked building is opened from afar (rv), for the radar and roboport coverage rule: %s" % [opened])
 	view.dialog.close()
 	key(KEY_ESCAPE)
 	await get_tree().process_frame
@@ -914,6 +985,22 @@ func _menus() -> void:
 	render_thread.button_pressed = false
 	engine.load(Settings.ENGINE_OVERRIDES)
 	check(int(engine.get_value("rendering", "driver/threads/thread_model", 0)) == Settings.THREAD_SAFE, "and off, the main-thread renderer")
+	check(str(project.get_value("rendering", "rendering_device/driver.windows", "")) == "d3d12"
+		and bool(project.get_value("rendering", "rendering_device/fallback_to_vulkan", false))
+		and str(Settings.DEFAULTS["graphics"]["renderer"]) == "d3d12",
+		"Windows draws with Direct3D 12 by default (project.godot and the setting), falling back to Vulkan")
+	if OS.get_name() == "Windows":
+		var renderer_box := find.call("graphics-renderer") as OptionButton
+		check(renderer_box != null and renderer_box.item_count == 2, "Settings > Graphics has the Renderer choice on Windows")
+		if renderer_box != null:
+			for want in ["vulkan", "d3d12"]:
+				for i in renderer_box.item_count:
+					if str(renderer_box.get_item_metadata(i)) == want:
+						renderer_box.select(i)
+						renderer_box.item_selected.emit(i)
+				engine.load(Settings.ENGINE_OVERRIDES)
+				check(str(engine.get_value("rendering", "rendering_device/driver.windows", "")) == want and Settings.renderer() == want,
+					"choosing %s writes it as the next start's Windows driver" % want)
 	if engine_before == "":
 		DirAccess.remove_absolute(Settings.ENGINE_OVERRIDES)
 	else:
@@ -960,6 +1047,15 @@ func _menus() -> void:
 	check(AudioServer.is_bus_mute(bus) and Settings.get_value("sound", "walking_on") == false, "its box mutes it")
 	(find.call("sound-walking_on") as CheckBox).button_pressed = true
 	check(not AudioServer.is_bus_mute(bus), "and unmutes it")
+	for key: String in ["alerts", "wind"]:
+		var sl := find.call("sound-" + key) as HSlider
+		var kb := AudioServer.get_bus_index(key.capitalize())
+		check(sl != null and kb >= 0, "Sound tab: a %s slider with its own bus (Factorio's Alerts and Wind volumes)" % key)
+		if sl != null and kb >= 0:
+			sl.value = 0.25
+			check(absf(AudioServer.get_bus_volume_db(kb) - linear_to_db(0.25)) < 0.01 and Settings.get_value("sound", key) == 0.25,
+				"the %s slider sets its bus and is saved" % key)
+			sl.value = 1.0
 	var pack_sounds := find.call("sound-pack_sounds") as CheckBox
 	check(pack_sounds != null and pack_sounds.button_pressed and packs_mp.sounds_on, "Sounds from model packs: a tick box, on")
 	if pack_sounds != null:
@@ -1046,11 +1142,58 @@ func _menus() -> void:
 	check(server_settings is Dictionary and int(server_settings["autosave_interval"]) == 5 and server_settings["name"] == "Test host"
 		and server_settings["visibility"]["lan"] == true and int(server_settings["max_players"]) == 4, "autosave and host settings reach the server's settings file")
 	launcher.free()
+	# Hunt: hosting on a port inside the range the bridge's ports come from gave two of them the same port.
+	for host_port in [34200, 34198, 34199, 34201, 34197]:
+		var picked: Array = ServerLauncher.pick_ports(34200, host_port)
+		var distinct := {}
+		for q in [picked[0], picked[1], picked[3]]:
+			distinct[q] = true
+		check(picked[1] == host_port and picked[0] > 0 and picked[2] > 0 and distinct.size() == 3,
+			"hosting on %d: the bridge, game and client UDP ports differ: %s" % [host_port, picked])
+	var plain: Array = ServerLauncher.pick_ports(34200)
+	check(plain[0] >= 34200 and plain[1] > plain[0] and plain[2] > plain[1] and plain[3] > plain[2], "without hosting the ports follow each other from the base: %s" % [plain])
+	# Hunt: an interval Factorio's own settings gave (3 min) showed as "Never" while the server used it.
+	Settings.set_value("factorio", "autosave_interval", 3)
+	w.open_tab("Graphics")
+	w.open_tab("Other")
+	await get_tree().process_frame
+	autosave = find.call("factorio-autosave_interval") as OptionButton
+	check(autosave.get_item_text(autosave.selected) == "3 min", "an autosave interval that isn't in the list is shown, not \"Never\": %s" % autosave.get_item_text(autosave.selected))
+	Settings.set_value("factorio", "autosave_interval", 5)
 
 	w.open_tab("Mod settings")
 	await get_tree().process_frame
 	check(w.current_tab() == "Mod settings" and _texts(w).any(func(s: String) -> bool: return s.contains("type them in the server's console")),
 		"mod settings explain where to change them without a launched server")
+
+	# Hunt: the Mod settings page listed 10 of the bridge's 14 runtime-global settings with a wrong default
+	# for bytes-per-tick, and a text setting only applied on Enter. Against a fake RCON:
+	var fake := GDScript.new()
+	fake.source_code = "extends RefCounted\nvar sent: Array = []\nfunc is_open() -> bool:\n\treturn true\nfunc run(_t, cmd: String) -> String:\n\tsent.append(cmd)\n\tif cmd.contains(\"table_to_json\"):\n\t\treturn \"{}\"\n\treturn \"\"\n"
+	fake.reload()
+	var rc = fake.new()
+	var ms: Node = SettingsWindow.new()
+	ms.rcon = rc
+	ms.start_tab = "Mod settings"
+	add_child(ms)
+	for _i in 4:
+		await get_tree().process_frame
+	var lua_names := ["f3d-surface", "f3d-chunks-per-tick", "f3d-bytes-per-tick", "f3d-max-focus-radius", "f3d-mover-interval",
+		"f3d-mover-rescan", "f3d-detail-radius", "f3d-detail-interval", "f3d-spread-jobs", "f3d-binary-messages", "f3d-starter-kit",
+		"f3d-character-corpses", "f3d-player", "f3d-act-as-player"]
+	var absent: Array = lua_names.filter(func(n: String) -> bool: return ms.find_child("mod-" + n, true, false) == null)
+	check(absent.is_empty(), "every runtime-global setting of the bridge is on the Mod settings page; missing: %s" % [absent])
+	var bytes := ms.find_child("mod-f3d-bytes-per-tick", true, false) as SpinBox
+	check(bytes != null and int(bytes.value) == 131072, "bytes per tick shows settings.lua's default 131072 when the server sends no value")
+	var player := ms.find_child("mod-f3d-player", true, false) as LineEdit
+	if player != null:
+		player.text = "Alice"
+		player.focus_exited.emit()
+		player.focus_exited.emit()
+		await get_tree().process_frame
+		var sets: Array = rc.sent.filter(func(c: String) -> bool: return c.begins_with("/sc settings.global[\"f3d-player\""))
+		check(sets.size() == 1 and sets[0].contains("\"Alice\""), "a text setting applies when the box loses focus, once: %s" % [sets])
+	ms.queue_free()
 
 	# Factorio's way in the game: one page at a time from the Settings list, titled "<Page> settings"
 	var page: Node = SettingsWindow.new()
@@ -1259,6 +1402,8 @@ func _menus() -> void:
 	await get_tree().process_frame
 	(gen.find_child("gen-autoplace_controls-water-frequency", true, false) as HSlider).value = 8
 	check(is_equal_approx(float(gen.settings["gen"]["autoplace_controls"]["water"]["frequency"]), 0.5), "water scale 200% is frequency 0.5")
+	check(gen.find_child("gen-autoplace_controls-starting_area_moisture-size", true, false) != null
+		and gen.settings["gen"]["autoplace_controls"].has("starting_area_moisture"), "Terrain has base's Starting area moisture control")
 	gen.open_tab("Enemy")
 	await get_tree().process_frame
 	(gen.find_child("gen-peaceful_mode", true, false) as CheckBox).button_pressed = true
@@ -1277,6 +1422,42 @@ func _menus() -> void:
 	await get_tree().process_frame
 	check(again.settings["gen"]["peaceful_mode"] == true and again.seed_text == "123", "the next new game starts from them")
 	again.queue_free()
+
+	# Hunt: the technology price box showed 1.001 (a SpinBox rounds to its step from its minimum) and typing 4 stored 4.001;
+	# the seed box took any text, which --map-gen-seed ignored; the wheel changed a slider without saving or applying it.
+	Settings.set_value("new_game", "settings", null)
+	Settings.set_value("new_game", "seed", null)
+	var hunt: Node = MapGeneratorWindow.new()
+	add_child(hunt)
+	await get_tree().process_frame
+	hunt.open_tab("Advanced")
+	await get_tree().process_frame
+	var tech := hunt.find_child("map-difficulty_settings-technology_price_multiplier", true, false) as SpinBox
+	# Its 1 is Factorio's map-settings.example.json's: without an install (CI's runners) there is no default to show.
+	if MapGen.get_value(MapGen.defaults(), "map/difficulty_settings/technology_price_multiplier") != null:
+		check(tech != null and is_equal_approx(tech.value, 1.0), "the technology price box shows 1, not 1.001: %s" % [tech.value if tech != null else null])
+	else:
+		print("skip the technology price box shows 1: no Factorio install (its map-settings.example.json)")
+	tech.value = 4
+	check(is_equal_approx(tech.value, 4.0) and is_equal_approx(float(hunt.settings["map"]["difficulty_settings"]["technology_price_multiplier"]), 4.0),
+		"and 4 stays 4: %s" % [tech.value])
+	var hunt_seed := hunt.find_child("Seed", true, false) as LineEdit
+	hunt_seed.text = "ab12c3"
+	hunt_seed.text_changed.emit("ab12c3")
+	check(hunt_seed.text == "123" and hunt.seed_text == "123", "the seed box keeps digits only: %s" % [hunt_seed.text])
+	hunt.open_tab("Resources")
+	await get_tree().process_frame
+	var hunt_rich := hunt.find_child("gen-autoplace_controls-iron-ore-richness", true, false) as HSlider
+	check(not hunt_rich.scrollable, "the wheel doesn't move a menu slider (it would change without saving)")
+	hunt.open_tab("Advanced")
+	await get_tree().process_frame
+	var hunt_width := hunt.find_child("gen-width", true, false) as SpinBox
+	hunt_width.get_line_edit().text = "256"
+	var hunt_played := []
+	hunt.play.connect(func(_n: String, st: Dictionary, _sd: String, _ex: String) -> void: hunt_played.append(int(st["gen"]["width"])))
+	(hunt.find_child("Play", true, false) as Button).pressed.emit()
+	check(hunt_played == [256], "a width typed and not confirmed still reaches the map: %s" % [hunt_played])
+	hunt.queue_free()
 
 	# The mods list keeps the player's choices (mod_choices.gd), with the DLC's dependencies.
 	DirAccess.remove_absolute(ModChoices.path(data))
@@ -1467,7 +1648,7 @@ func _graphics_settings_layout() -> void:
 	dist_btn.button_pressed = false
 	perf_btn.button_pressed = false
 	await get_tree().process_frame
-	var closed_ok := not dist_wrap.visible and not perf_wrap.visible and dist_btn.text == "More (5)" and perf_btn.text == "More (7)"
+	var closed_ok := not dist_wrap.visible and not perf_wrap.visible and dist_btn.text == "More (5)" and perf_btn.text == ("More (8)" if OS.get_name() == "Windows" else "More (7)")
 	check(opened_ok and persisted_ok and closed_ok and cache_changed,
 		"graphics layout: More buttons toggle and persist across rebuilds, chunk_disk_cache updates Setting (%s %s %s %s, buttons %s/%s)" % [
 			opened_ok, persisted_ok, closed_ok, cache_changed, dist_btn.text, perf_btn.text])
@@ -1716,6 +1897,22 @@ func _load_mods() -> void:
 		and chosen == ["alpha", "clash", "hater", "needs-missing", "needs-sa"] and FileAccess.get_file_as_string(list_file) == list_before
 		and FileAccess.file_exists(ModChoices.path(data)),
 		"M5: the Mods window shows a mod once (its highest version) and keeps its changes as the player's choices, the server's mod-list.json untouched: %s" % [chosen])
+	# Hunt: turning a mod on left the mods it needs off (and off, the mods that need it on), unlike Factorio's window.
+	var kept_choices := ModChoices.states()
+	window._mods = [{"name": "lib", "title": "Lib", "version": "1.0.0", "source": "zip", "enabled": false, "deps": [["", "base"]]},
+		{"name": "app", "title": "App", "version": "1.0.0", "source": "zip", "enabled": false, "deps": [["", "base"], ["", "lib"], ["+", "extra"], ["?", "opt"]]},
+		{"name": "extra", "title": "Extra", "version": "1.0.0", "source": "zip", "enabled": false, "deps": []},
+		{"name": "opt", "title": "Opt", "version": "1.0.0", "source": "zip", "enabled": false, "deps": []},
+		{"name": "addon", "title": "Addon", "version": "1.0.0", "source": "zip", "enabled": false, "deps": [["~", "app"]]}]
+	window.set_enabled("addon", true)
+	var on_now: Array = window._mods.filter(func(m: Dictionary) -> bool: return m["enabled"]).map(func(m: Dictionary) -> String: return m["name"])
+	on_now.sort()
+	check(on_now == ["addon", "app", "extra", "lib"], "the Mods window: a mod turned on turns on the mods it needs and recommends (not optional ones): %s" % [on_now])
+	window.set_enabled("lib", false)
+	on_now = window._mods.filter(func(m: Dictionary) -> bool: return m["enabled"]).map(func(m: Dictionary) -> String: return m["name"])
+	on_now.sort()
+	check(on_now == ["extra"], "the Mods window: a mod turned off turns off the mods that need it, and theirs: %s" % [on_now])
+	ModChoices.write(kept_choices)
 	window.queue_free()
 	var in_game: Node = ModsWindow.new()
 	in_game.read_only = true

@@ -16,6 +16,11 @@ extends RefCounted
 ## State file (user://build-stamp.txt):
 ##   stamp=<value>
 ##   warmed=<0|1>
+##   driver=<rendering driver the warm-up ran on: d3d12, vulkan...>
+## Each driver keeps its own pipeline cache (user://d3d12, user://vulkan), so a warm-up on one doesn't
+## warm the other: switching Settings > Graphics > Renderer (or --rendering-driver) runs the staged
+## warm-up once on the new driver without deleting anything. A file with no driver= line was warmed on
+## Vulkan (every build before 0.3.1).
 ## Backward compatibility: an older single-line stamp file ("<stamp>\n", with no "warmed=" line) is
 ## read as that stamp with warmed=0, so upgrading triggers one staged warm-up and records warmed=1.
 ##
@@ -51,6 +56,7 @@ static var template_override := -1
 static var baked_hash_file_override := ""
 static var addon_roots_override: Variant = null
 static var restart_runner_override: Callable = Callable()
+static var driver_override := ""
 
 ## The restarted process this one waits for (0: none).
 static var child_pid := 0
@@ -92,6 +98,13 @@ static func restart_if_new_build() -> bool:
 		var with_path := PackedStringArray(["--path", ProjectSettings.globalize_path("res://")])
 		with_path.append_array(args)
 		args = with_path
+	# The same driver again: Godot keeps --rendering-driver (`--rendering-driver vulkan`, the way back to
+	# Vulkan without the setting) out of get_cmdline_args() too, and the restart would otherwise start on
+	# project.godot's / the Renderer setting's driver, not the one asked for.
+	if not args.has("--rendering-driver") and current_driver() != "" and current_driver() != "dummy":
+		var with_driver := PackedStringArray(["--rendering-driver", current_driver()])
+		with_driver.append_array(args)
+		args = with_driver
 	var user := PackedStringArray()
 	for a in _user_args():
 		if a != "--shader-refresh=force" and a != "--shader-refresh-restarted" and a != "--shader-refresh-clean-failed":
@@ -169,6 +182,8 @@ static func needs_compile() -> bool:
 		return true
 	if int(info.get("warmed", 0)) != 1:
 		return true
+	if str(info.get("driver", "")) != current_driver():
+		return true
 	return not DirAccess.dir_exists_absolute(_shader_cache_dir())
 
 
@@ -178,7 +193,14 @@ static func mark_warmed() -> void:
 		return
 	if _has_user_arg("--shader-refresh-clean-failed"):
 		return
-	_write_build_file(_build_file(), build_stamp(), 1)
+	_write_build_file(_build_file(), build_stamp(), 1, current_driver())
+
+
+## The rendering driver this run draws with ("d3d12", "vulkan", ...).
+static func current_driver() -> String:
+	if driver_override != "":
+		return driver_override
+	return RenderingServer.get_current_rendering_driver_name()
 
 
 ## Returns the build stamp string (see header).
@@ -362,7 +384,7 @@ static func _read_baked_hash() -> String:
 
 
 static func _read_build_file(path: String) -> Dictionary:
-	var out := {"stamp": "", "warmed": 0}
+	var out := {"stamp": "", "warmed": 0, "driver": "vulkan"}
 	if not FileAccess.file_exists(path):
 		return out
 	var text := FileAccess.get_file_as_string(path)
@@ -378,6 +400,8 @@ static func _read_build_file(path: String) -> Dictionary:
 		elif line.begins_with("warmed="):
 			out["warmed"] = 1 if line.substr("warmed=".length()).strip_edges() == "1" else 0
 			has_kv = true
+		elif line.begins_with("driver="):
+			out["driver"] = line.substr("driver=".length()).strip_edges()
 		elif legacy_line == "":
 			legacy_line = line
 	if not has_kv and legacy_line != "":
@@ -386,13 +410,16 @@ static func _read_build_file(path: String) -> Dictionary:
 	return out
 
 
-static func _write_build_file(path: String, stamp: String, warmed: int) -> void:
+static func _write_build_file(path: String, stamp: String, warmed: int, driver := "") -> void:
 	var parent := _globalize(path).get_base_dir()
 	if parent != "" and not parent.ends_with("://") and not DirAccess.dir_exists_absolute(parent):
 		DirAccess.make_dir_recursive_absolute(parent)
 	var f := FileAccess.open(path, FileAccess.WRITE)
 	if f != null:
-		f.store_string("stamp=%s\nwarmed=%d\n" % [stamp, 1 if warmed == 1 else 0])
+		var text := "stamp=%s\nwarmed=%d\n" % [stamp, 1 if warmed == 1 else 0]
+		if driver != "":
+			text += "driver=%s\n" % driver
+		f.store_string(text)
 		f.close()
 
 

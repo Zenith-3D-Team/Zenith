@@ -50,7 +50,8 @@ func _initialize() -> void:
 	_check(files.size() > 50, "scanned res://scripts/ (%d .gd files)" % files.size())
 
 	var re := RegEx.new()
-	re.compile("\"(--[a-zA-Z0-9_-]+)")
+	# A switch starts with a letter after its "--": a rule of dashes ("--- Error ---" in text read back) is no switch.
+	re.compile("\"(--[a-zA-Z][a-zA-Z0-9_-]*)")
 	var missing: Array[String] = []
 	var seen_flags: Dictionary = {}
 	for path: String in files:
@@ -71,6 +72,24 @@ func _initialize() -> void:
 		print("Missing switches in REGISTRY: ", missing)
 	_check(missing.is_empty(), "every non-passthrough switch in res://scripts/ is in Switches.REGISTRY (%d checked)" % seen_flags.size())
 
+	# The bundled add-ons' own switches (addons-src/, outside res://): each is known, so a run with one
+	# logs no "unknown CLI flag" line (main.gd warns before any add-on starts). Skipped without the folder.
+	var addons_dir := ProjectSettings.globalize_path("res://").path_join("../addons-src").simplify_path()
+	var addon_files: Array[String] = []
+	_collect_gd_files(addons_dir, addon_files)
+	if not addon_files.is_empty():
+		var addon_missing: Array[String] = []
+		var addon_flags: Dictionary = {}
+		for path: String in addon_files:
+			for m: RegExMatch in re.search_all(FileAccess.get_file_as_string(path)):
+				var flag: String = m.get_string(1)
+				if not addon_flags.has(flag):
+					addon_flags[flag] = true
+					if not Switches.is_known(flag):
+						addon_missing.append("%s (%s)" % [flag, path.get_file()])
+		_check(addon_missing.is_empty(), "every switch the bundled add-ons read is known (%d checked): %s"
+			% [addon_flags.size(), addon_missing])
+
 	# Known & unknown flag checks
 	var sample := PackedStringArray([
 		"--factorio-port=34200",
@@ -87,6 +106,8 @@ func _initialize() -> void:
 	_check(Switches.is_known("--factorio-port=34200"), "is_known accepts --factorio-port=34200")
 	_check(Switches.is_known("--clean-shot"), "is_known accepts --clean-shot")
 	_check(Switches.is_known("--ui-test"), "is_known accepts --ui-test")
+	_check(Switches.is_known("--click-open-held=off"), "is_known accepts --click-open-held=off")
+	_check(Switches.is_known("--belt-drop-glide=off"), "is_known accepts --belt-drop-glide=off")
 	_check(not Switches.is_known("--definitely-not-a-real-flag"), "is_known rejects --definitely-not-a-real-flag")
 
 	# Add-on registration

@@ -4,6 +4,8 @@ extends Node3D
 ## mask discarding for LOD 0 (keeping Early-Z on LOD 1..4), radial horizon mist fade,
 ## and FrameBudget-sliced mesh installation.
 
+const ViewAhead := preload("res://scripts/world/view_ahead.gd")
+var _cut_seen := -10
 const FreeLater := preload("res://scripts/world/free_later.gd")
 const LodData := preload("res://scripts/world/lod_data.gd")
 const LodCache := preload("res://scripts/world/lod_cache.gd")
@@ -73,6 +75,12 @@ const SCHEDULE_BUDGET_USEC := 1500
 const PALETTE_RECHECK_USEC := 1000
 const SCHED_RESORT_MSEC := 250
 const SUB_SCAN_BUDGET_USEC := 4000
+## (--dh-sub-scan) The want scan's budget, checked every block row (the old one between sections only).
+const SUB_SCAN_ROW_BUDGET_USEC := 1500
+const SCAN_UNSATISFIED := 1
+const SCAN_MISSING_NULL := 2
+const SCAN_PENDING_CACHE := 4
+const SCAN_BATCH_CAP := 8
 
 # --- settings & CLI switches ------------------------------------------------------------------
 var enabled := false
@@ -96,6 +104,10 @@ var _pal_timer := 0.0
 ## --dh-palette=old: the colour table rebuilt on the main thread and every section drawn again, the
 ## sections to build scanned and sorted every frame (as before the run-spikes work).
 var palette_old := false
+## --dh-sample-worker (on by default): a section's grid is sampled from its chunks inside its mesh job on a
+## worker (LodMesher.sample_grid), the main thread only gathering the chunks' rows; =off samples it on the
+## main thread before the job starts (_sample_section_grid), as before. Same grid either way.
+var sample_worker := true
 var _pal_task := -1
 var _pal_job: PaletteJob = null
 var _pal_recheck: Array = []  # section keys still to check against the changed ids
@@ -112,7 +124,13 @@ var _populated_sections := {}  # Vector3i(level, sx, sy) -> true
 var _baked_sig := {}  # Vector2i -> Vector3i(rev, ent_count, tile_hash)
 
 var _sections := {}  # Vector3i -> SectionState
-var _retiring := []  # Array of {node: MeshInstance3D, rect: Rect2i}
+var _retiring := []  # Array of {node: MeshInstance3D, rect: Rect2i, level, chunk_mask, key: Vector3i, blk?: Vector3i}
+## --dh-retire-index (on; =off: every retiring node scans all sections every frame, as before): a
+## retiring node looks up only the sections over its rect, the one that blocked it last first, and only
+## when something could have freed it (_gc_pending); has_mesh_for_chunk finds retiring nodes by key.
+var retire_index := Switches.on("--dh-retire-index")
+var _retire_by_key := {}  # Vector3i section key -> Array of _retiring entries
+var _gc_pending := true
 var _layout_center := Vector2i(0x7fffffff, 0)
 var _layout_radius := -1
 var _layout_inner := -1
@@ -147,6 +165,12 @@ var _mask_dirty := true
 var _mask_force_upload := true
 var _mask_upload_timer := 0.0
 var _lod0_vis_dirty := true
+## --dh-vis-incremental (on; =off: every section looked at each time, as before): _update_lod0_visibility
+## looks only at the level-0 sections whose chunks loaded, unloaded or finished fading, or that got a mesh
+## (_vis_keys); a re-centre, a reset or the fades all ending asks for the whole pass (_vis_full).
+var vis_incremental := Switches.on("--dh-vis-incremental")
+var _vis_keys := {}  # Vector3i(0, sx, sy) -> true
+var _vis_full := true
 var _has_dirty_sections := true
 
 var _solid_mat: ShaderMaterial
@@ -189,6 +213,12 @@ var _charted_known := false
 ## chunk: cy -> PackedInt32Array [x0, x1, ...] half-open, sorted; chunks charted by `lod` since the
 ## last map one by one; whether each section holds a charted chunk, worked out when first asked.
 var map_old := false
+## --dh-sub-scan=old: the want scan looks up the cache and the charted map chunk by chunk and checks its
+## budget only between sections, as before; new (default): _collect_want_batch_rows.
+var sub_scan_old := Switches.value("--dh-sub-scan", "new").to_lower() in ["old", "off"]
+var sub_scan_budget_usec := SUB_SCAN_ROW_BUDGET_USEC
+var sub_scan_old_budget_usec := SUB_SCAN_BUDGET_USEC
+var _scan_resume := {}  # Vector2i(missing_only, fixed_res) -> Vector3i section key the budget stopped at
 var _charted_rows := {}
 var _map_pending_rows := {}
 var _charted_extra := {}
@@ -229,6 +259,16 @@ class SectionState:
 	var grid_tiles := PackedInt32Array()
 	var grid_protos := PackedInt32Array()
 	var grid_pal: Object = null
+	## (--dh-sample-worker) The building job samples its own grid: grid_tiles/grid_protos are the job's
+	## (still empty) until it returns, and the palette recheck skips the section while this is on.
+	var grid_pending := false
+	## (--dh-sub-scan) A want scan its budget stopped inside this section: the block row to go on from (0 =
+	## none), the scan's kind (missing_only, req_res, target_res) and what the rows before it found.
+	var scan_row := 0
+	var scan_mode := Vector3i(-1, 0, 0)
+	var scan_flags := 0  # SCAN_* bits
+	var scan_added := 0
+	var scan_cooldown := 0
 
 
 ## The colour table built on a worker from LodPalette.snapshot(), and what changed from the old one.
@@ -313,6 +353,10 @@ static func cli_override(args: PackedStringArray = Switches.args()) -> Dictionar
 			out["detail_lod_enabled"] = true
 		elif arg == "--dh-palette=old":
 			out["palette_old"] = true
+		elif arg == "--dh-sample-worker=off":
+			out["sample_worker"] = false
+		elif arg == "--dh-sample-worker=on":
+			out["sample_worker"] = true
 		elif arg == "--dh-map=old":
 			out["map_old"] = true
 	return out
@@ -334,6 +378,8 @@ func apply_cli_overrides(args: PackedStringArray = Switches.args()) -> void:
 		detail_lod_enabled = bool(ov["detail_lod_enabled"])
 	if ov.has("palette_old"):
 		palette_old = bool(ov["palette_old"])
+	if ov.has("sample_worker"):
+		sample_worker = bool(ov["sample_worker"])
 	if ov.has("map_old"):
 		map_old = bool(ov["map_old"])
 
@@ -431,6 +477,7 @@ func reset_surface(surface_index: int, protos: Object = null, model_bakes := {})
 	_bake_queue.clear()
 	_bake_queued.clear()
 	_requested_chunks.clear()
+	_scan_resume.clear()
 	_missing_chunks.clear()
 	_stale_chunks.clear()
 	_in_flight.clear()
@@ -465,7 +512,9 @@ func reset_surface(surface_index: int, protos: Object = null, model_bakes := {})
 	_mask_force_upload = true
 	_mask_upload_timer = 0.0
 	_lod0_vis_dirty = true
+	_vis_full = true
 	_has_dirty_sections = true
+	_gc_pending = true
 	_mat_params_dirty = true
 
 	if protos != null:
@@ -595,7 +644,7 @@ func _recheck_palette_sections(budget_usec := PALETTE_RECHECK_USEC) -> void:
 		var st: SectionState = _sections.get(_pal_recheck.pop_back())
 		if st == null or not st.has_data or (st.dirty and not st.building) or st.grid_pal == _palette:
 			continue  # gone, empty, about to be built with the new colours, or built with them
-		if st.grid_pal != null and not section_uses(st.grid_tiles, st.grid_protos, _pal_changed_tiles, _pal_changed_ents):
+		if st.grid_pal != null and not st.grid_pending and not section_uses(st.grid_tiles, st.grid_protos, _pal_changed_tiles, _pal_changed_ents):
 			palette_stats[2] += 1
 			continue
 		st.dirty = true
@@ -665,6 +714,7 @@ func set_chunk_loaded(c: Vector2i, loaded: bool, instant := false, defer_frames 
 				_mask_dirty = true
 				_mask_force_upload = true
 				_lod0_vis_dirty = true
+				_vis_note(c)
 			return
 		if defer_frames > 0 and not instant and handoff_guard:
 			_pending_mask[c] = mini(int(_pending_mask.get(c, defer_frames)), defer_frames)
@@ -676,6 +726,7 @@ func set_chunk_loaded(c: Vector2i, loaded: bool, instant := false, defer_frames 
 		_mask_dirty = true
 		_mask_force_upload = true
 		_lod0_vis_dirty = true
+		_vis_note(c)
 	else:
 		_pending_mask.erase(c)
 		_takeover_ready_frame.erase(c)
@@ -684,6 +735,12 @@ func set_chunk_loaded(c: Vector2i, loaded: bool, instant := false, defer_frames 
 			_mask_dirty = true
 			_mask_force_upload = true
 			_lod0_vis_dirty = true
+			_vis_note(c)
+
+
+## (--dh-vis-incremental) Chunk `c`'s level-0 section looked at by the next visibility pass.
+func _vis_note(c: Vector2i) -> void:
+	_vis_keys[Vector3i(0, floori(float(c.x) / 4.0), floori(float(c.y) / 4.0))] = true  # (as _retire_by_key keys it)
 
 
 func finish_mask_fades() -> void:
@@ -698,6 +755,7 @@ func finish_mask_fades() -> void:
 		_mask_dirty = true
 		_mask_force_upload = true
 		_lod0_vis_dirty = true
+		_vis_full = true
 
 
 func _tick_pending_masks() -> void:
@@ -718,6 +776,7 @@ func _tick_pending_masks() -> void:
 			_mask_dirty = true
 			_mask_force_upload = true
 			_lod0_vis_dirty = true
+			_vis_note(c)
 
 
 func prepare_unload_takeover(c: Vector2i, rev: int = 0, tile_ids: PackedInt32Array = PackedInt32Array(),
@@ -752,21 +811,37 @@ func has_mesh_for_chunk(c: Vector2i) -> bool:
 			var stl: SectionState = _sections[kl]
 			if stl.node != null and is_instance_valid(stl.node) and _get_chunk(c.x, c.y) != null:
 				return true
+	if retire_index:
+		if _retire_by_key.is_empty():
+			return false
+		for l in 5:
+			var sec_r := int(SECTION_CHUNKS[l])
+			var lst: Variant = _retire_by_key.get(Vector3i(l, floori(float(c.x) / float(sec_r)), floori(float(c.y) / float(sec_r))))
+			if lst == null:
+				continue
+			for entry: Dictionary in lst:
+				if _retiree_covers(entry, c):
+					return true
+		return false
 	for entry: Dictionary in _retiring:
-		var rect: Rect2i = entry["rect"]
-		if not rect.has_point(c):
-			continue
-		var node: Variant = entry.get("node")
-		if node == null or not is_instance_valid(node) or not (node as MeshInstance3D).visible:
-			continue
-		if int(entry.get("level", 1)) == 0:
-			var local := c - rect.position
-			var bit := 1 << (local.y * 4 + local.x)
-			if (int(entry.get("chunk_mask", 0)) & bit) != 0:
-				return true
-		elif _get_chunk(c.x, c.y) != null:
+		if _retiree_covers(entry, c):
 			return true
 	return false
+
+
+## Whether retiring node `entry` still draws chunk `c` (visible, and its chunk built in it).
+func _retiree_covers(entry: Dictionary, c: Vector2i) -> bool:
+	var rect: Rect2i = entry["rect"]
+	if not rect.has_point(c):
+		return false
+	var node: Variant = entry.get("node")
+	if node == null or not is_instance_valid(node) or not (node as MeshInstance3D).visible:
+		return false
+	if int(entry.get("level", 1)) == 0:
+		var local := c - rect.position
+		var bit := 1 << (local.y * 4 + local.x)
+		return (int(entry.get("chunk_mask", 0)) & bit) != 0
+	return _get_chunk(c.x, c.y) != null
 
 
 func _is_built_void_chunk(c: Vector2i) -> bool:
@@ -854,6 +929,7 @@ func _tick_mask_fades(dt: float) -> void:
 		var next := minf(1.0, lvl + step)
 		if lvl < 0.999 and next >= 0.999:
 			_lod0_vis_dirty = true
+			_vis_note(c)
 		if next >= 1.0:
 			_mask_levels.erase(c)
 		else:
@@ -1022,6 +1098,7 @@ func handle(msg: Dictionary) -> void:
 				for k in _sections:
 					var st: SectionState = _sections[k]
 					st.complete = false
+					st.scan_row = 0
 					st.needs_missing_scan = true
 			else:
 				for nc in newly_charted:
@@ -1031,6 +1108,7 @@ func handle(msg: Dictionary) -> void:
 						if _sections.has(sk):
 							var sst: SectionState = _sections[sk]
 							sst.complete = false
+							sst.scan_row = 0
 							sst.needs_missing_scan = true
 	elif t == "lodr":
 		var list_v: Variant = msg.get("l")
@@ -1147,6 +1225,7 @@ func update(cam: Camera3D, p_horizon_color: Color, p_night_level: float, p_is_sp
 					_on_cache_regions_loaded(regs_off as Array)
 		return
 	_update_frame += 1
+	var tp := Time.get_ticks_usec() if Probing.on else 0  # (--stutter-probe: dh_* parts of main_dh)
 	if _cache != null:
 		if _cache.has_method("poll_write"):
 			_cache.poll_write()
@@ -1170,31 +1249,57 @@ func update(cam: Camera3D, p_horizon_color: Color, p_night_level: float, p_is_sp
 	visible = not (ViewPriority.tight_cull and allow_hide and _covered_by_inner(cam, cam_chunk))
 	var dt := get_process_delta_time() if is_inside_tree() else 0.016
 
+	if ViewAhead.cut_recent() and _cut_seen != ViewAhead.last_cut_frame:
+		# A cut (view_ahead.gd): the near edge's fades end and the sections' levels are looked at now.
+		_cut_seen = ViewAhead.last_cut_frame
+		finish_mask_fades()
+		_sub_timer = LOD_SUB_INTERVAL
+	tp = _dh_prof("dh_pre", tp)
 	_tick_pending_masks()
 	_tick_mask_fades(dt)
 	_update_mask(cam_chunk, dt)
 	_apply_material_params()
+	tp = _dh_prof("dh_mask", tp)
 	_poll_bake_jobs()
 	_drain_bake_queue()
+	tp = _dh_prof("dh_bake", tp)
 	_sync_sections(cam_chunk)
+	tp = _dh_prof("dh_sync", tp)
+	# (dh_vis + dh_inst + dh_gc: what was one dh_install part.)
 	_update_lod0_visibility()
-	_poll_and_install_meshes()
+	tp = _dh_prof("dh_vis", tp)
+	_poll_and_install_meshes(false)
+	tp = _dh_prof("dh_inst", tp)
+	_gc_retiring()
+	tp = _dh_prof("dh_gc", tp)
 	if _lod0_vis_dirty:
 		_update_lod0_visibility()
+	tp = _dh_prof("dh_vis", tp)
 	_update_takeover_ready()
 	_recheck_palette_sections()
+	tp = _dh_prof("dh_takeover", tp)
 	_schedule_section_builds(center_pos, frustum)
+	tp = _dh_prof("dh_schedule", tp)
 
 	_sub_timer += dt
 	if _sub_timer >= LOD_SUB_INTERVAL:
 		_sub_timer = 0.0
 		_drive_lod_sub(center_pos, frustum)
+		tp = _dh_prof("dh_lod_sub", tp)
 
 	_flush_timer += dt
 	if _flush_timer >= CACHE_FLUSH_INTERVAL:
 		_flush_timer = 0.0
 		_flush_cache_async()
 
+
+
+## A dh_* part of main_dh (Probing.on only): the time since `t0` added to `key`, the next part's start.
+func _dh_prof(key: String, t0: int) -> int:
+	if not Probing.on:
+		return 0
+	Probing.add(key, t0)
+	return Time.get_ticks_usec()
 
 func stats() -> Dictionary:
 	var vis := 0
@@ -1245,6 +1350,7 @@ func finish_all() -> void:
 	for k in _sections:
 		var st: SectionState = _sections[k]
 		st.building = false
+	_gc_pending = true  # sections no longer building may free retiring nodes
 	if _cache != null:
 		if _cache.has_method("wait_reads"):
 			_cache.wait_reads()
@@ -1414,6 +1520,7 @@ func _invalidate_region(rx: int, ry: int, new_rev: int) -> void:
 				if _sections.has(key):
 					var st: SectionState = _sections[key]
 					st.complete = false
+					st.scan_row = 0
 					st.next_sub_msec = 0
 
 
@@ -1619,6 +1726,7 @@ func _sync_sections(cam_chunk: Vector2i) -> void:
 				st.dirty = true
 				_has_dirty_sections = true
 				st.complete = false
+				st.scan_row = 0
 				st.needs_missing_scan = true
 				st.next_sub_msec = 0
 				_bump_serial(st)
@@ -1645,50 +1753,127 @@ func _sync_sections(cam_chunk: Vector2i) -> void:
 			if st.node != null and is_instance_valid(st.node):
 				st.node.position.y = -0.02
 				st.node.visible = true
-				_retiring.append({
+				_retire_add({
 					"node": st.node,
 					"rect": Rect2i(st.sx * st.sec_chunks, st.sy * st.sec_chunks, st.sec_chunks, st.sec_chunks),
 					"level": st.level,
 					"chunk_mask": st.built_chunk_mask,
+					"key": st.key,
 				})
 				st.node = null
 			_sections.erase(k)
 	_lod0_vis_dirty = true
+	_vis_full = true
 	_has_dirty_sections = true
+	_gc_pending = true
 	_gc_retiring()
 
 
+func _retire_add(entry: Dictionary) -> void:
+	_retiring.append(entry)
+	var k: Vector3i = entry["key"]
+	var lst: Variant = _retire_by_key.get(k)
+	if lst == null:
+		_retire_by_key[k] = [entry]
+	else:
+		(lst as Array).append(entry)
+
+
+func _retire_remove_at(i: int) -> void:
+	var entry: Dictionary = _retiring[i]
+	_retiring.remove_at(i)
+	var k: Variant = entry.get("key")
+	var lst: Variant = _retire_by_key.get(k)
+	if lst == null:
+		return
+	var arr := lst as Array
+	for j in arr.size():
+		if is_same(arr[j], entry):
+			arr.remove_at(j)
+			break
+	if arr.is_empty():
+		_retire_by_key.erase(k)
+
+
+## Whether section `st` keeps a retiring node over it alive: no mesh of its own yet but data that will build one.
+static func _section_blocks(st: SectionState) -> bool:
+	if st.node != null and is_instance_valid(st.node):
+		return false
+	if not st.has_data:
+		return false
+	if st.built_empty and not st.dirty and not st.building:
+		return false
+	return true
+
+
+## The old scan (--dh-retire-index=off): every section's rect tested against the retiree's.
+func _retiree_ready_scan(rect: Rect2i) -> bool:
+	for k in _sections:
+		var st: SectionState = _sections[k]
+		var srect := Rect2i(st.sx * st.sec_chunks, st.sy * st.sec_chunks, st.sec_chunks, st.sec_chunks)
+		if not srect.intersects(rect):
+			continue
+		if _section_blocks(st):
+			return false
+	return true
+
+
+## The indexed lookup: the sections over `entry`'s rect at each level by key, the last blocker first.
+func _retiree_ready_indexed(entry: Dictionary) -> bool:
+	var blk: Variant = entry.get("blk")
+	if blk != null:
+		var bst := _sections.get(blk) as SectionState
+		if bst != null and _section_blocks(bst):
+			return false
+	var rect: Rect2i = entry["rect"]
+	for l in 5:
+		var sec := int(SECTION_CHUNKS[l])
+		var sx0 := floori(float(rect.position.x) / float(sec))
+		var sx1 := floori(float(rect.end.x - 1) / float(sec))
+		var sy0 := floori(float(rect.position.y) / float(sec))
+		var sy1 := floori(float(rect.end.y - 1) / float(sec))
+		for sy in range(sy0, sy1 + 1):
+			for sx in range(sx0, sx1 + 1):
+				var st := _sections.get(Vector3i(l, sx, sy)) as SectionState
+				if st != null and _section_blocks(st):
+					entry["blk"] = st.key
+					return false
+	entry.erase("blk")
+	return true
+
+
 func _gc_retiring() -> void:
+	if retire_index:
+		# Only a section built, removed or stopped building can free one (_gc_pending set there).
+		if not _gc_pending:
+			return
+		_gc_pending = false
 	for i in range(_retiring.size() - 1, -1, -1):
 		var entry: Dictionary = _retiring[i]
 		var node: Variant = entry.get("node")
 		if node == null or not is_instance_valid(node):
-			_retiring.remove_at(i)
+			_retire_remove_at(i)
 			continue
-		var rect: Rect2i = entry["rect"]
-		var ready := true
-		for k in _sections:
-			var st: SectionState = _sections[k]
-			var srect := Rect2i(st.sx * st.sec_chunks, st.sy * st.sec_chunks, st.sec_chunks, st.sec_chunks)
-			if not srect.intersects(rect):
-				continue
-			if st.node != null and is_instance_valid(st.node):
-				continue
-			if not st.has_data:
-				continue
-			if st.built_empty and not st.dirty and not st.building:
-				continue
-			ready = false
-			break
+		var ready := _retiree_ready_indexed(entry) if retire_index else _retiree_ready_scan(entry["rect"])
 		if ready:
 			FreeLater.node(node as MeshInstance3D)
-			_retiring.remove_at(i)
+			_retire_remove_at(i)
 
 
 func _update_lod0_visibility() -> void:
 	if not _lod0_vis_dirty:
 		return
 	_lod0_vis_dirty = false
+	# (An empty _vis_keys with the flag set: someone asked without naming a section, the whole pass.)
+	if vis_incremental and not _vis_full and not _vis_keys.is_empty():
+		for k: Vector3i in _vis_keys:
+			var stk := _sections.get(k) as SectionState
+			if stk != null and stk.node != null:
+				_set_lod0_visible(stk)
+		_vis_keys.clear()
+		return
+	_vis_full = false
+	_vis_keys.clear()
 	if _loaded_chunks.is_empty():
 		for k in _sections:
 			var st: SectionState = _sections[k]
@@ -1703,21 +1888,27 @@ func _update_lod0_visibility() -> void:
 			if not st.node.visible:
 				st.node.visible = true
 			continue
-		var cx0 := st.sx * st.sec_chunks
-		var cy0 := st.sy * st.sec_chunks
-		var all_loaded := true
-		for dy in st.sec_chunks:
-			for dx in st.sec_chunks:
-				var cc := Vector2i(cx0 + dx, cy0 + dy)
-				if not _loaded_chunks.has(cc) or float(_mask_levels.get(cc, 1.0)) < 0.999:
-					all_loaded = false
-					break
-			if not all_loaded:
+		_set_lod0_visible(st)
+
+
+## A level-0 section's node hidden while all its chunks are loaded and done fading in.
+func _set_lod0_visible(st: SectionState) -> void:
+	var cx0 := st.sx * st.sec_chunks
+	var cy0 := st.sy * st.sec_chunks
+	var all_loaded := true
+	for dy in st.sec_chunks:
+		for dx in st.sec_chunks:
+			var cc := Vector2i(cx0 + dx, cy0 + dy)
+			if not _loaded_chunks.has(cc) or float(_mask_levels.get(cc, 1.0)) < 0.999:
+				all_loaded = false
 				break
-		st.node.visible = not all_loaded
+		if not all_loaded:
+			break
+	st.node.visible = not all_loaded
 
 
-func _poll_and_install_meshes() -> void:
+## `run_gc` false: the caller frees retired nodes itself (update(), timed apart as dh_gc).
+func _poll_and_install_meshes(run_gc := true) -> void:
 	for i in range(_mesh_jobs.size() - 1, -1, -1):
 		var entry: Array = _mesh_jobs[i]
 		var tid: int = int(entry[0])
@@ -1725,10 +1916,12 @@ func _poll_and_install_meshes() -> void:
 			WorkerThreadPool.wait_for_task_completion(tid)
 			_mesh_jobs.remove_at(i)
 			_ready_meshes.append(entry[1])
+			_note_sampled_grid(entry[1])
 
 	if _ready_meshes.is_empty():
 		_budget_waiting(&"lod_install", 0)
-		_gc_retiring()
+		if run_gc:
+			_gc_retiring()
 		return
 
 	var budget_usec := _budget_grant(&"lod_install")
@@ -1759,8 +1952,10 @@ func _poll_and_install_meshes() -> void:
 
 	if installed > 0:
 		_ready_meshes = _ready_meshes.slice(installed)
+		_gc_pending = true  # a section built (or stopped building) may free a retiring node over it
 
-	_gc_retiring()
+	if run_gc:
+		_gc_retiring()
 	var spent_usec := Time.get_ticks_usec() - t0
 	_budget_spent(&"lod_install", spent_usec, _ready_meshes.size())
 
@@ -1797,6 +1992,8 @@ func _install_section_mesh(st: SectionState, job: LodMesher) -> void:
 	st.tri_count = job.tri_count
 	GroundHeight.hold_mesh(st.node)
 	_lod0_vis_dirty = true
+	if st.level == 0:
+		_vis_keys[st.key] = true  # (a new node of a higher level is visible, as the full pass leaves it)
 
 
 func _schedule_section_builds(cam_pos: Vector3, frustum: Array[Plane]) -> void:
@@ -1880,7 +2077,6 @@ func _dispatch_sections(candidates: Array) -> void:
 			continue  # built meanwhile, or replaced since the list was sorted
 		if _section_has_pending_cache_reads(st):
 			continue
-		var grid := _sample_section_grid(st)
 		var job := LodMesher.new()
 		job.key = st.key
 		job.serial = st.serial
@@ -1888,10 +2084,14 @@ func _dispatch_sections(candidates: Array) -> void:
 		job.section_origin = Vector2(float(st.sx) * span, float(st.sy) * span)
 		job.grid_n = st.grid_n
 		job.cell_tiles = st.cell_tiles
-		job.tiles = grid[0]
-		job.protos = grid[1]
-		job.flags = grid[2]
-		job.chunk_mask = int(grid[3])
+		if sample_worker:
+			_gather_section_rows(st, job)
+		else:
+			var grid := _sample_section_grid(st)
+			job.tiles = grid[0]
+			job.protos = grid[1]
+			job.flags = grid[2]
+			job.chunk_mask = int(grid[3])
 		job.palette = _palette
 		job.detail_tier = st.detail_tier if detail_lod_enabled else LodMesher.DETAIL_FULL
 		job.max_quad_tiles = maxf(GroundHeight.tile_step() * 4.0, 4.0) if GroundHeight.is_on() else INF
@@ -1900,11 +2100,56 @@ func _dispatch_sections(candidates: Array) -> void:
 		st.building = true
 		st.grid_tiles = job.tiles
 		st.grid_protos = job.protos
+		st.grid_pending = sample_worker
 		st.grid_pal = _palette
 		var cb := Callable(job, "run")
 		var tid := WorkerThreadPool.add_task(cb, false, "DH section mesh")
 		_mesh_jobs.append([tid, job])
 		dispatched += 1
+
+
+## (--dh-sample-worker) The section's chunk rows for its job to sample on the worker (LodMesher.sample_grid):
+## the same chunks _sample_section_grid reads (_get_chunk, main-thread state), their arrays taken here and
+## shared by reference, not copied: safe only because a stored LodChunk is never edited in place (lod_data.gd
+## builds new ones), so the main thread may replace a chunk but must never write into one the worker reads.
+func _gather_section_rows(st: SectionState, job: LodMesher) -> void:
+	var side := st.sec_chunks
+	if st.cell_tiles > float(CHUNK):
+		side = maxi(side, st.grid_n * maxi(1, roundi(st.cell_tiles / float(CHUNK))))
+	var src: Array = []
+	src.resize(side * side)
+	var cx0 := st.sx * st.sec_chunks
+	var cy0 := st.sy * st.sec_chunks
+	var any := false
+	for oy in side:
+		for ox in side:
+			var chunk: Variant = _get_chunk(cx0 + ox, cy0 + oy)
+			if chunk == null:
+				continue
+			src[oy * side + ox] = [chunk.tiles, chunk.protos, chunk.flags]
+			any = true
+	job.sample_side = side
+	job.sample_sec_chunks = st.sec_chunks
+	job.sample_level = st.level
+	if any:
+		job.sample_src = src
+	else:
+		# No chunk: the empty grid sample_grid would make, without a worker pass.
+		var grid := LodMesher.sample_grid(st.grid_n, st.sec_chunks, st.cell_tiles, st.level, PackedByteArray(), [], 0)
+		job.tiles = grid[0]
+		job.protos = grid[1]
+		job.flags = grid[2]
+		job.chunk_mask = int(grid[3])
+
+
+## (--dh-sample-worker) A finished job's grid becomes its section's last-built grid (palette rechecks).
+func _note_sampled_grid(job: LodMesher) -> void:
+	var st: SectionState = _sections.get(job.key)
+	if st == null or job.serial != st.serial or not st.grid_pending:
+		return
+	st.grid_tiles = job.tiles
+	st.grid_protos = job.protos
+	st.grid_pending = false
 
 
 static func _pick_majority_tile(tcounts: Dictionary, best_tile: int, tid: int) -> int:
@@ -2313,6 +2558,7 @@ func _finish_map_runs() -> void:
 		for k in _sections:
 			var st: SectionState = _sections[k]
 			st.complete = false
+			st.scan_row = 0
 			st.needs_missing_scan = true
 
 
@@ -2325,6 +2571,7 @@ func _flag_sections_in_run(cy: int, x0: int, x1: int) -> void:
 			var sst: SectionState = _sections.get(Vector3i(l, sx, sy))
 			if sst != null:
 				sst.complete = false
+				sst.scan_row = 0
 				sst.needs_missing_scan = true
 
 
@@ -2376,6 +2623,179 @@ func _rebuild_charted_sections() -> void:
 
 
 func _collect_want_batch(bucket: Array, missing_only: bool, fixed_res: int, now: int) -> Array:
+	if sub_scan_old:
+		return _collect_want_batch_old(bucket, missing_only, fixed_res, now)
+	return _collect_want_batch_rows(bucket, missing_only, fixed_res, now)
+
+
+## (--dh-sub-scan, default) _collect_want_batch_old's picks and flags, with the cache checks and has_method
+## out of the chunk loop, each pending cache region looked up once a call, the charted row fetched once a
+## chunk row, and the budget (SUB_SCAN_ROW_BUDGET_USEC) checked every block row: a section it stops inside
+## keeps its place and what it found (SectionState.scan_*) and goes on from there next time.
+func _collect_want_batch_rows(bucket: Array, missing_only: bool, fixed_res: int, now: int) -> Array:
+	var chosen_res := fixed_res
+	var batch: Array = []
+	var batch_limit := LOD_SUB_BATCH_COARSE if (fixed_res >= 16) else LOD_SUB_BATCH
+	var scan_t0 := Time.get_ticks_usec()
+	var sections_scanned := 0
+	var cache_on := (LodCache.async_io and _cache != null and _cache_configured and not _cached_region_revs.is_empty()
+			and _cache.has_method("is_region_loaded") and _cache.has_method("request_region"))
+	var cache_get := _cache != null and _cache.has_method("get_chunk")
+	var region_pending := {}  # Vector2i -> bool, this call
+	var rows: Array = []
+	# The last call of this kind its budget stopped: this one starts at that section, round to the rest,
+	# so the sections past the budget get their turn (the old scan restarted at the first every time).
+	var call_key := Vector2i(1 if missing_only else 0, fixed_res)
+	var n_bucket := bucket.size()
+	var start := 0
+	var resume_v: Variant = _scan_resume.get(call_key)
+	if resume_v != null:
+		_scan_resume.erase(call_key)
+		for i in n_bucket:
+			if (bucket[i][5] as SectionState).key == resume_v:
+				start = i
+				break
+
+	for bi in n_bucket:
+		var entry: Array = bucket[(start + bi) % n_bucket]
+		if batch.size() >= batch_limit:
+			break
+		if sections_scanned > 0 and Time.get_ticks_usec() - scan_t0 >= sub_scan_budget_usec:
+			_scan_resume[call_key] = (entry[5] as SectionState).key
+			break
+		var st: SectionState = entry[5]
+		if missing_only and not st.needs_missing_scan:
+			continue
+		var target_res := int(entry[3])
+		var req_res := fixed_res if fixed_res > 0 else target_res
+		if not missing_only and chosen_res >= 0 and target_res != chosen_res:
+			continue
+
+		sections_scanned += 1
+		var cx0 := st.sx * st.sec_chunks
+		var cy0 := st.sy * st.sec_chunks
+		var step := _section_cell_step(st)
+		var mode := Vector3i(1 if missing_only else 0, req_res, target_res)
+		var flags := 0
+		var cooldown_skipped := 0
+		var added_from_st := 0
+		var row0 := 0
+		if st.scan_row > 0 and st.scan_mode == mode:
+			row0 = st.scan_row
+			flags = st.scan_flags
+			cooldown_skipped = st.scan_cooldown
+			added_from_st = st.scan_added
+		st.scan_row = 0
+		var stopped := false
+
+		var cy_off := row0
+		while cy_off < st.sec_chunks:
+			if cy_off > row0 and Time.get_ticks_usec() - scan_t0 >= sub_scan_budget_usec:
+				st.scan_row = cy_off
+				st.scan_mode = mode
+				st.scan_flags = flags
+				st.scan_cooldown = cooldown_skipped
+				st.scan_added = added_from_st
+				_scan_resume[call_key] = st.key
+				stopped = true
+				break
+			if _charted_known and not map_old:
+				rows.resize(step)
+				for dy in step:
+					rows[dy] = _charted_rows.get(cy0 + cy_off + dy)
+			for cx_off in range(0, st.sec_chunks, step):
+				var block_has_any := false
+				var block_satisfied := false
+				var block_pending_cache := false
+				var pick := Vector2i(0x7fffffff, 0)
+				for dy in step:
+					var row_v: Variant = rows[dy] if _charted_known and not map_old else null
+					for dx in step:
+						var c := Vector2i(cx0 + cx_off + dx, cy0 + cy_off + dy)
+						if _missing_chunks.has(c):
+							continue
+						if _charted_known:
+							if map_old:
+								if not _charted.has(c):
+									continue
+							elif not _charted_extra.has(c) and (row_v == null or not runs_have(row_v as PackedInt32Array, c.x)):
+								continue
+						if cache_on:
+							var r := LodCache.region_of(c.x, c.y)
+							if _cached_region_revs.has(r):
+								var pv: Variant = region_pending.get(r)
+								if pv == null:
+									pv = false
+									if not _cache.is_region_loaded(r.x, r.y):
+										_cache.request_region(r.x, r.y)
+										pv = not _cache.is_region_loaded(r.x, r.y)
+									region_pending[r] = pv
+								if bool(pv):
+									block_pending_cache = true
+									flags |= SCAN_PENDING_CACHE
+									continue
+						var existing: Variant = _mem_chunks.get(c)
+						if existing == null and cache_get:
+							existing = _cache.get_chunk(c.x, c.y)
+							if existing != null:
+								_mem_chunks[c] = existing
+						if existing != null:
+							block_has_any = true
+							if not _stale_chunks.has(c) and int(existing.res) <= target_res:
+								block_satisfied = true
+								break
+							if pick.x == 0x7fffffff or _stale_chunks.has(c):
+								pick = c
+						elif pick.x == 0x7fffffff:
+							pick = c
+					if block_satisfied:
+						break
+				if block_satisfied:
+					continue
+				if block_pending_cache:
+					flags |= SCAN_UNSATISFIED
+					continue
+				if pick.x == 0x7fffffff:
+					continue
+				flags |= SCAN_UNSATISFIED
+				if not block_has_any:
+					flags |= SCAN_MISSING_NULL
+				if missing_only and block_has_any:
+					continue
+				if batch.size() >= batch_limit:
+					flags |= SCAN_BATCH_CAP
+					continue
+				var last_req := int(_requested_chunks.get(pick, -100000))
+				if now - last_req < 10000:
+					cooldown_skipped += 1
+					continue
+				if chosen_res < 0:
+					chosen_res = req_res
+					batch_limit = LOD_SUB_BATCH_COARSE if chosen_res >= 16 else LOD_SUB_BATCH
+				_requested_chunks[pick] = now
+				_in_flight[pick] = now
+				batch.append([pick.x, pick.y])
+				added_from_st += 1
+			cy_off += step
+
+		if stopped:
+			break
+		var all_satisfied := (flags & SCAN_UNSATISFIED) == 0
+		var any_pending_cache := (flags & SCAN_PENDING_CACHE) != 0
+		if all_satisfied and not any_pending_cache and _charted_known:
+			st.complete = true
+			st.needs_missing_scan = false
+		elif (missing_only and not any_pending_cache and (flags & SCAN_BATCH_CAP) == 0
+				and (flags & SCAN_MISSING_NULL) == 0 and _charted_known):
+			st.needs_missing_scan = false
+		if not missing_only and added_from_st == 0 and cooldown_skipped > 0 and batch.size() < batch_limit:
+			st.next_sub_msec = now + 2000
+
+	return [chosen_res, batch]
+
+
+## The want scan as before (--dh-sub-scan=old).
+func _collect_want_batch_old(bucket: Array, missing_only: bool, fixed_res: int, now: int) -> Array:
 	var chosen_res := fixed_res
 	var batch: Array = []
 	var batch_limit := LOD_SUB_BATCH_COARSE if (fixed_res >= 16) else LOD_SUB_BATCH
@@ -2385,7 +2805,7 @@ func _collect_want_batch(bucket: Array, missing_only: bool, fixed_res: int, now:
 	for entry: Array in bucket:
 		if batch.size() >= batch_limit:
 			break
-		if sections_scanned > 0 and Time.get_ticks_usec() - scan_t0 >= SUB_SCAN_BUDGET_USEC:
+		if sections_scanned > 0 and Time.get_ticks_usec() - scan_t0 >= sub_scan_old_budget_usec:
 			break
 		var st: SectionState = entry[5]
 		if missing_only and not st.needs_missing_scan:
@@ -2619,6 +3039,8 @@ func _clear_sections() -> void:
 		if node != null and is_instance_valid(node):
 			(node as MeshInstance3D).queue_free()
 	_retiring.clear()
+	_retire_by_key.clear()
+	_gc_pending = true
 	for k in _sections:
 		var st: SectionState = _sections[k]
 		_bump_serial(st)
@@ -2626,6 +3048,7 @@ func _clear_sections() -> void:
 			st.node.queue_free()
 	_sections.clear()
 	_lod0_vis_dirty = true
+	_vis_full = true
 
 
 static func _budget_grant(system: StringName) -> int:

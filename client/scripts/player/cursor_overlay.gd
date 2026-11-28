@@ -78,8 +78,11 @@ static func dir_vector(dir: int) -> Vector2:
 	return turn(Vector2(0, -1), dir)
 
 
-static func arrow(at: Vector2, towards: Vector2, both := false, color := YELLOW) -> Dictionary:
-	return {"k": "arrow", "at": at, "dir": towards.normalized(), "both": both, "c": color}
+static func arrow(at: Vector2, towards: Vector2, both := false, color := YELLOW, y := 0.0) -> Dictionary:
+	var m := {"k": "arrow", "at": at, "dir": towards.normalized(), "both": both, "c": color}
+	if y != 0.0:
+		m["y"] = y
+	return m
 
 
 ## A picture lying flat at `at` (tiles), `size` across: an item's or fluid's icon by name.
@@ -87,8 +90,17 @@ static func icon(at: Vector2, name: String, size := FLUID_ICON) -> Dictionary:
 	return {"k": "icon", "at": at, "name": name, "size": size}
 
 
-static func area(rect: Rect2, fill: Color, edge: Color) -> Dictionary:
-	return {"k": "area", "rect": rect, "fill": fill, "edge": edge}
+## A filled + framed rectangle. By default (`over = false, y = 0`) draws on `_areas` at
+## GroundHeight.AREA_PRIORITY (-32) under grass/buildings (drill/roboport ranges). Pass `over = true`
+## or a non-zero `y` (e.g. ModelLibrary.ELEVATED_TRACK) for placement tile outlines drawn over grass,
+## rail ballast, and elevated decks.
+static func area(rect: Rect2, fill: Color, edge: Color, y := 0.0, over := false) -> Dictionary:
+	var m := {"k": "area", "rect": rect, "fill": fill, "edge": edge}
+	if y != 0.0:
+		m["y"] = y
+	if over:
+		m["over"] = true
+	return m
 
 
 ## Areas filled in one colour and no edge, `rects` not overlapping (union_rects), so where several
@@ -187,15 +199,24 @@ static func _merged(spans: Array) -> Array:
 	return out
 
 
-## A straight line on the ground from `a` to `b` (tiles): roboport links.
-static func line(a: Vector2, b: Vector2, color := LINK, width := LINK_WIDTH) -> Dictionary:
-	return {"k": "line", "a": a, "b": b, "c": color, "w": width}
+## A straight line from `a` to `b` (tiles): roboport links, rail block overlays. Optional `y` (and
+## `y_end` for ramps) lifts the line above ground (e.g. ModelLibrary.ELEVATED_TRACK).
+static func line(a: Vector2, b: Vector2, color := LINK, width := LINK_WIDTH, y := 0.0, y_end := NAN) -> Dictionary:
+	var m := {"k": "line", "a": a, "b": b, "c": color, "w": width}
+	if y != 0.0:
+		m["y"] = y
+	if not is_nan(y_end) and y_end != y:
+		m["y2"] = y_end
+	return m
 
 
 ## Corner brackets round a box: `centre` and `half` size in tiles, turned by `yaw` (Godot's, about
-## the up axis: a mover's rotation.y).
-static func brackets(centre: Vector2, half: Vector2, yaw := 0.0, color := SELECTION) -> Dictionary:
-	return {"k": "brackets", "at": centre, "half": half, "yaw": yaw, "c": color}
+## the up axis: a mover's rotation.y), optionally lifted by `y` tiles above ground.
+static func brackets(centre: Vector2, half: Vector2, yaw := 0.0, color := SELECTION, y := 0.0) -> Dictionary:
+	var m := {"k": "brackets", "at": centre, "half": half, "yaw": yaw, "c": color}
+	if y != 0.0:
+		m["y"] = y
+	return m
 
 
 ## The marks for an entity of `type` at `pos` facing `dir`, from its `eprops` overlay `x`; with
@@ -276,27 +297,48 @@ func show_marks(marks: Array) -> void:
 		_clear_areas()
 		return
 	var area_marks: Array = []
+	var top_areas: Array = []
 	var top_marks: Array = []
 	for m: Dictionary in marks:
 		var kind := str(m["k"])
-		if kind == "area" or kind == "cover":
+		if kind == "area":
+			if bool(m.get("over", false)) or not is_zero_approx(float(m.get("y", 0.0))):
+				if (m["rect"] as Rect2).has_area():
+					top_areas.append(m)
+			else:
+				area_marks.append(m)
+		elif kind == "cover":
 			area_marks.append(m)
 		elif kind != "icon":
 			top_marks.append(m)
 	_mesh.clear_surfaces()
-	if not top_marks.is_empty():
+	if not top_areas.is_empty() or not top_marks.is_empty():
+		var hills_on := GroundHeight.is_on()
 		_mesh.surface_begin(Mesh.PRIMITIVE_TRIANGLES)
+		for m: Dictionary in top_areas:
+			var r: Rect2 = m["rect"]
+			var lift := LIFT + float(m.get("y", 0.0))
+			var fill: Color = m["fill"]
+			var edge: Color = m["edge"]
+			_area_rect_on(_mesh, r, fill, lift, hills_on)
+			var w := clampf(r.size.x * 0.004, 0.06, 0.2)
+			_area_frame_on(_mesh, r, w, edge, lift, hills_on)
 		for m: Dictionary in top_marks:
 			match str(m["k"]):
 				"brackets":
-					_brackets(m["at"], m["half"], float(m["yaw"]), m["c"])
+					_brackets(m["at"], m["half"], float(m["yaw"]), m["c"], LIFT + float(m.get("y", 0.0)))
 				"arrow":
-					_arrow(m["at"], m["dir"], bool(m["both"]), m["c"])
+					_arrow(m["at"], m["dir"], bool(m["both"]), m["c"], LIFT + float(m.get("y", 0.0)))
 				"line":
 					var a: Vector2 = m["a"]
 					var b: Vector2 = m["b"]
 					var side := (b - a).normalized().orthogonal() * float(m["w"]) * 0.5
-					_quad(a + side, b + side, b - side, a - side, m["c"])
+					var y0 := LIFT + float(m.get("y", 0.0))
+					var y1 := LIFT + float(m.get("y2", m.get("y", 0.0)))
+					if is_equal_approx(y0, y1):
+						_quad(a + side, b + side, b - side, a - side, m["c"], y0)
+					else:
+						_quad_sloped(a + side, y0, b + side, y1, b - side, y1, a - side, y0, m["c"])
 				"tunnel":
 					_tunnel(m["at"], m["dir"], m["c"], bool(m.get("arrow", true)))
 				"unbuilt":
@@ -407,6 +449,10 @@ func _show_icons(marks: Array) -> void:
 
 
 func _area_rect(r: Rect2, color: Color, lift: float, hills_on: bool) -> void:
+	_area_rect_on(_areas_mesh, r, color, lift, hills_on)
+
+
+static func _area_rect_on(target: ImmediateMesh, r: Rect2, color: Color, lift: float, hills_on: bool) -> void:
 	if not r.has_area():
 		return
 	var nx := 1
@@ -424,22 +470,26 @@ func _area_rect(r: Rect2, color: Color, lift: float, hills_on: bool) -> void:
 		for ix in nx:
 			var x0 := r.position.x + dx * float(ix)
 			var x1 := r.end.x if ix == nx - 1 else r.position.x + dx * float(ix + 1)
-			_quad_on(_areas_mesh, Vector2(x0, y0), Vector2(x1, y0), Vector2(x1, y1), Vector2(x0, y1), color, lift)
+			_quad_on(target, Vector2(x0, y0), Vector2(x1, y0), Vector2(x1, y1), Vector2(x0, y1), color, lift)
 
 
 func _area_frame(r: Rect2, w: float, color: Color, lift: float, hills_on: bool) -> void:
+	_area_frame_on(_areas_mesh, r, w, color, lift, hills_on)
+
+
+static func _area_frame_on(target: ImmediateMesh, r: Rect2, w: float, color: Color, lift: float, hills_on: bool) -> void:
 	var bw := minf(w, minf(r.size.x, r.size.y) * 0.5)
 	if bw <= 0.0:
 		return
-	_area_rect(Rect2(r.position.x, r.position.y, r.size.x, bw), color, lift, hills_on)
-	_area_rect(Rect2(r.position.x, r.end.y - bw, r.size.x, bw), color, lift, hills_on)
+	_area_rect_on(target, Rect2(r.position.x, r.position.y, r.size.x, bw), color, lift, hills_on)
+	_area_rect_on(target, Rect2(r.position.x, r.end.y - bw, r.size.x, bw), color, lift, hills_on)
 	if r.size.y > bw * 2.0:
-		_area_rect(Rect2(r.position.x, r.position.y + bw, bw, r.size.y - bw * 2.0), color, lift, hills_on)
-		_area_rect(Rect2(r.end.x - bw, r.position.y + bw, bw, r.size.y - bw * 2.0), color, lift, hills_on)
+		_area_rect_on(target, Rect2(r.position.x, r.position.y + bw, bw, r.size.y - bw * 2.0), color, lift, hills_on)
+		_area_rect_on(target, Rect2(r.end.x - bw, r.position.y + bw, bw, r.size.y - bw * 2.0), color, lift, hills_on)
 
 
 ## Factorio's selection corners: an L in each corner, a third of the shorter side long at most.
-func _brackets(centre: Vector2, half: Vector2, yaw: float, c: Color) -> void:
+func _brackets(centre: Vector2, half: Vector2, yaw: float, c: Color, lift := LIFT) -> void:
 	var arm := clampf(minf(half.x, half.y) * 0.6, 0.15, 0.5)
 	var w := 0.07
 	var turned := func(p: Vector2) -> Vector2:
@@ -452,25 +502,25 @@ func _brackets(centre: Vector2, half: Vector2, yaw: float, c: Color) -> void:
 			var along_y := Vector2(0.0, -sy * arm)
 			var in_x := Vector2(-sx * w, 0.0)
 			var in_y := Vector2(0.0, -sy * w)
-			_quad(turned.call(corner), turned.call(corner + along_x), turned.call(corner + along_x + in_y), turned.call(corner + in_y), c)
-			_quad(turned.call(corner), turned.call(corner + along_y), turned.call(corner + along_y + in_x), turned.call(corner + in_x), c)
+			_quad(turned.call(corner), turned.call(corner + along_x), turned.call(corner + along_x + in_y), turned.call(corner + in_y), c, lift)
+			_quad(turned.call(corner), turned.call(corner + along_y), turned.call(corner + along_y + in_x), turned.call(corner + in_x), c, lift)
 
 
 ## An arrow centred on `at` pointing along `d` (a unit vector); `both`: a head at each end.
-func _arrow(at: Vector2, d: Vector2, both: bool, c: Color) -> void:
+func _arrow(at: Vector2, d: Vector2, both: bool, c: Color, lift := LIFT) -> void:
 	var side := Vector2(-d.y, d.x)
 	var half_len := ARROW.x * (0.75 if both else 0.5)
 	var head := ARROW.x * (0.4 if both else 0.5)
 	var shaft := ARROW.y * 0.32
 	var tip := at + d * half_len
 	var base := tip - d * head
-	_tri(tip, base + side * ARROW.y * 0.5, base - side * ARROW.y * 0.5, c)
+	_tri(tip, base + side * ARROW.y * 0.5, base - side * ARROW.y * 0.5, c, lift)
 	var tail := at - d * half_len
 	if both:
 		var base2 := tail + d * head
-		_tri(tail, base2 - side * ARROW.y * 0.5, base2 + side * ARROW.y * 0.5, c)
+		_tri(tail, base2 - side * ARROW.y * 0.5, base2 + side * ARROW.y * 0.5, c, lift)
 		tail = base2
-	_quad(tail + side * shaft * 0.5, base + side * shaft * 0.5, base - side * shaft * 0.5, tail - side * shaft * 0.5, c)
+	_quad(tail + side * shaft * 0.5, base + side * shaft * 0.5, base - side * shaft * 0.5, tail - side * shaft * 0.5, c, lift)
 
 
 ## One tile of an underground connection (J24, underground_pairs.gd), as Factorio's
@@ -534,6 +584,17 @@ func _tri(a: Vector2, b: Vector2, c: Vector2, color: Color, lift := LIFT) -> voi
 
 func _quad(a: Vector2, b: Vector2, c: Vector2, d: Vector2, color: Color, lift := LIFT) -> void:
 	_quad_on(_mesh, a, b, c, d, color, lift)
+
+
+func _quad_sloped(a: Vector2, ya: float, b: Vector2, yb: float, c: Vector2, yc: float, d: Vector2, yd: float, color: Color) -> void:
+	_tri_3d(_mesh, Vector3(a.x, ya, a.y), Vector3(b.x, yb, b.y), Vector3(c.x, yc, c.y), color)
+	_tri_3d(_mesh, Vector3(a.x, ya, a.y), Vector3(c.x, yc, c.y), Vector3(d.x, yd, d.y), color)
+
+
+static func _tri_3d(target: ImmediateMesh, a: Vector3, b: Vector3, c: Vector3, color: Color) -> void:
+	for p: Vector3 in [a, b, c]:
+		target.surface_set_color(color)
+		target.surface_add_vertex(p)
 
 
 static func _tri_on(target: ImmediateMesh, a: Vector2, b: Vector2, c: Vector2, color: Color, lift: float) -> void:

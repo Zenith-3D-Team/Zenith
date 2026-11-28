@@ -70,6 +70,25 @@ func _run() -> void:
 		await process_frame
 	Kit.poll_icons()
 	_check(first != null and reused.texture == first, "a reused rect keeps its newer icon")
+	# A read that ends after the graphics changed (ModGraphics.generation) is dropped and read again (perf-w4-fix B-S2).
+	var stale := TextureRect.new()
+	root.add_child(stale)
+	Kit.icon_into(stale, "stale-uncached-one")
+	var job0: Array = Kit._icon_jobs.get("stale-uncached-one", [])
+	_check(job0.size() >= 4, "an icon job keeps the stamps it was read under")
+	ItemIcons.ModGraphics.generation += 1
+	if job0.size() >= 4:
+		for i in 400:
+			if WorkerThreadPool.is_task_completed(job0[0]):
+				break
+			await process_frame
+		Kit.poll_icons()
+		var job1: Array = Kit._icon_jobs.get("stale-uncached-one", [])
+		_check(job1.size() >= 4 and job1[0] != job0[0] and int(job1[2]) == ItemIcons.ModGraphics.generation,
+			"a read under older graphics dropped and started again")
+		_check(stale.texture == null and not ItemIcons.any_ready("stale-uncached-one"), "the stale read not stored")
+	_check(await _wait_for(stale), "the read again arrives")
+	_check(Kit._icon_jobs.is_empty(), "nothing left reading after it")
 	# --icons-later=off's path: read at once, as before.
 	Kit.icons_later = false
 	var now := TextureRect.new()

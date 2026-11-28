@@ -418,6 +418,160 @@ static func mask_of(groups: Array, parts: Array = [], joins := true) -> Array:
 	return out
 
 
+## Rebuilds the rocket-silo contact mask from ground-level triangles only (y >= 0) outside the launch
+## hole, and clears all texels inside `hole_spec.z + 0.12` so pit walls and contact shading never bleed
+## into the open launch shaft.
+static func silo_mask_of(mesh: ArrayMesh, hole_spec: Vector3) -> Array:
+	if mesh == null:
+		return []
+	var hole_c := Vector2(hole_spec.x, hole_spec.y)
+	var clear_r := hole_spec.z + 0.12
+	var low := 0.0
+	var top := MASK_HEIGHT
+	var tris := PackedFloat32Array()
+	var lo := Vector2.INF
+	var hi := -Vector2.INF
+	var meta_arr: Variant = mesh.get_meta(&"f3d_arrays", [])
+	for si in mesh.get_surface_count():
+		var a: Array = meta_arr[si] if meta_arr is Array and si < (meta_arr as Array).size() else mesh.surface_get_arrays(si)
+		if a.is_empty() or not (a[Mesh.ARRAY_VERTEX] is PackedVector3Array):
+			continue
+		var v: PackedVector3Array = a[Mesh.ARRAY_VERTEX]
+		var idx: Variant = a[Mesh.ARRAY_INDEX]
+		var ix: PackedInt32Array = idx if idx is PackedInt32Array else PackedInt32Array(range(v.size()))
+		var near := PackedByteArray()
+		near.resize(v.size())
+		for i in v.size():
+			var p := v[i]
+			if p.y >= -0.08 and p.y <= top:
+				near[i] = 1
+		for t in range(0, ix.size() - 2, 3):
+			var i0 := ix[t]
+			var i1 := ix[t + 1]
+			var i2 := ix[t + 2]
+			if near[i0] + near[i1] + near[i2] == 0:
+				continue
+			var p0 := v[i0]
+			var p1 := v[i1]
+			var p2 := v[i2]
+			if maxf(p0.y, maxf(p1.y, p2.y)) < -0.05:
+				continue
+			var cx := (p0.x + p1.x + p2.x) / 3.0
+			var cz := (p0.z + p1.z + p2.z) / 3.0
+			if Vector2(cx - hole_c.x, cz - hole_c.y).length() < clear_r:
+				continue
+			for p: Vector3 in [p0, p1, p2]:
+				lo.x = minf(lo.x, p.x)
+				lo.y = minf(lo.y, p.z)
+				hi.x = maxf(hi.x, p.x)
+				hi.y = maxf(hi.y, p.z)
+				tris.push_back(p.x)
+				tris.push_back(p.z)
+				tris.push_back(maxf(p.y - low, 0.0))
+	if tris.is_empty():
+		return []
+	var region := Rect2(lo - Vector2(MASK_MARGIN, MASK_MARGIN), hi - lo + Vector2(MASK_MARGIN, MASK_MARGIN) * 2.0)
+	var n := MASK_SIZE
+	var cell := region.size / float(n)
+	var ox := region.position.x
+	var oz := region.position.y
+	var w := PackedFloat32Array()
+	w.resize(n * n)
+	for t in range(0, tris.size(), 9):
+		var ax := (tris[t] - ox) / cell.x - 0.5
+		var az := (tris[t + 1] - oz) / cell.y - 0.5
+		var ah := tris[t + 2]
+		var bx := (tris[t + 3] - ox) / cell.x - 0.5
+		var bz := (tris[t + 4] - oz) / cell.y - 0.5
+		var bh := tris[t + 5]
+		var cx := (tris[t + 6] - ox) / cell.x - 0.5
+		var cz := (tris[t + 7] - oz) / cell.y - 0.5
+		var ch := tris[t + 8]
+		var den := (bz - cz) * (ax - cx) + (cx - bx) * (az - cz)
+		if absf(den) >= 2.0:
+			var x0 := maxi(ceili(minf(ax, minf(bx, cx))), 0)
+			var x1 := mini(floori(maxf(ax, maxf(bx, cx))), n - 1)
+			var y0 := maxi(ceili(minf(az, minf(bz, cz))), 0)
+			var y1 := mini(floori(maxf(az, maxf(bz, cz))), n - 1)
+			var inv := 1.0 / den
+			for y in range(y0, y1 + 1):
+				for x in range(x0, x1 + 1):
+					var b0 := ((bz - cz) * (x - cx) + (cx - bx) * (y - cz)) * inv
+					var b1 := ((cz - az) * (x - cx) + (ax - cx) * (y - cz)) * inv
+					var b2 := 1.0 - b0 - b1
+					if b0 < -1e-4 or b1 < -1e-4 or b2 < -1e-4:
+						continue
+					var i := y * n + x
+					var f := 1.0 - clampf((b0 * ah + b1 * bh + b2 * ch) / MASK_HEIGHT, 0.0, 1.0)
+					w[i] = maxf(w[i], f * f)
+			continue
+		for e in 3:
+			var px := ax if e == 0 else (bx if e == 1 else cx)
+			var pz := az if e == 0 else (bz if e == 1 else cz)
+			var ph := ah if e == 0 else (bh if e == 1 else ch)
+			var qx := bx if e == 0 else (cx if e == 1 else ax)
+			var qz := bz if e == 0 else (cz if e == 1 else az)
+			var qh := bh if e == 0 else (ch if e == 1 else ah)
+			var steps := ceili(maxf(absf(qx - px), absf(qz - pz)) * 2.0) + 1
+			for k in steps + 1:
+				var f := float(k) / float(steps)
+				var x := roundi(lerpf(px, qx, f))
+				var y := roundi(lerpf(pz, qz, f))
+				if x >= 0 and y >= 0 and x < n and y < n:
+					var hh := 1.0 - clampf(lerpf(ph, qh, f) / MASK_HEIGHT, 0.0, 1.0)
+					w[y * n + x] = maxf(w[y * n + x], hh * hh)
+	for y in n:
+		var wz := oz + (float(y) + 0.5) * cell.y
+		for x in n:
+			var wx := ox + (float(x) + 0.5) * cell.x
+			if Vector2(wx - hole_c.x, wz - hole_c.y).length() < clear_r:
+				w[y * n + x] = 0.0
+	var bytes := _distances(w, n, cell, {})
+	for y in n:
+		var wz := oz + (float(y) + 0.5) * cell.y
+		for x in n:
+			var wx := ox + (float(x) + 0.5) * cell.x
+			if Vector2(wx - hole_c.x, wz - hole_c.y).length() < clear_r:
+				bytes[y * n + x] = 255
+	return [region, bytes, PackedByteArray()]
+
+
+## Ground-level outer foot box for the rocket silo (`--contact-shape=box` fallback), ignoring pit walls.
+static func silo_feet_of(mesh: ArrayMesh, hole_spec: Vector3) -> Array:
+	if mesh == null:
+		return []
+	var hole_c := Vector2(hole_spec.x, hole_spec.y)
+	var min_r := hole_spec.z + 0.05
+	var lo := Vector2.INF
+	var hi := -Vector2.INF
+	var pts := PackedVector2Array()
+	var meta_arr: Variant = mesh.get_meta(&"f3d_arrays", [])
+	for si in mesh.get_surface_count():
+		var a: Array = meta_arr[si] if meta_arr is Array and si < (meta_arr as Array).size() else mesh.surface_get_arrays(si)
+		if a.is_empty() or not (a[Mesh.ARRAY_VERTEX] is PackedVector3Array):
+			continue
+		var verts: PackedVector3Array = a[Mesh.ARRAY_VERTEX]
+		for p: Vector3 in verts:
+			if p.y < -0.05 or p.y > 0.15:
+				continue
+			var q := Vector2(p.x, p.z)
+			if q.distance_to(hole_c) < min_r:
+				continue
+			lo = lo.min(q)
+			hi = hi.max(q)
+			pts.append(q)
+	if pts.is_empty():
+		return []
+	var gaps := 0.0
+	for c: Vector2 in [lo, Vector2(hi.x, lo.y), Vector2(lo.x, hi.y), hi]:
+		var nearest := INF
+		for q: Vector2 in pts:
+			nearest = minf(nearest, q.distance_squared_to(c))
+		gaps += sqrt(nearest)
+	var half := (hi - lo) * 0.5
+	return [[Rect2(lo, hi - lo), clampf(gaps * 0.25 / (1.0 - 1.0 / sqrt(2.0)), 0.02, maxf(minf(half.x, half.y), 0.02))]]
+
+
 ## Whether a model file gets a contact map at all: not those whose types never have contact shading (NONE: rails,
 ## trees, rocks, ores, vehicles...), by name, as the loader knows only that. One missed costs only load time; one
 ## wrongly skipped keeps the ring round its feet.

@@ -15,13 +15,13 @@ const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const ARITHMETIC_OPS := ["*", "/", "+", "-", "%", "^", "<<", ">>", "AND", "OR", "XOR"]
 const COMPARATORS := [">", "<", "=", "≥", "≤", "≠"]
 ## Factorio's train wait conditions (WaitConditionType), in the order its menu lists them.
-const WAIT_TYPES := [["time", "Time passed"], ["full", "Full cargo"], ["empty", "Empty cargo"], ["not_empty", "Has cargo"],
+const WAIT_TYPES := [["time", "Time passed"], ["full", "Full cargo"], ["empty", "Empty cargo"], ["not_empty", "Has cargo"], ["robots_inactive", "Robots inactive"],
 	["item_count", "Item count"], ["fuel_item_count_all", "Fuel (all locomotives)"], ["fuel_item_count_any", "Fuel (any locomotive)"],
 	["fuel_full", "Full fuel"], ["circuit", "Circuit condition"], ["inactivity", "Inactivity"], ["fluid_count", "Fluid count"],
 	["destination_full_or_no_path", "Destination full or no path"], ["passenger_present", "Passenger present"],
 	["passenger_not_present", "Passenger not present"], ["specific_destination_full", "Station is full"],
 	["specific_destination_not_full", "Station is not full"], ["at_station", "At specified station"],
-	["not_at_station", "Not at specified station"], ["damage_taken", "Damage taken"]]
+	["not_at_station", "Not at specified station"]]  # "Damage taken" is the space platform's alone (space_panels.gd)
 ## Wait conditions with a circuit condition, and those naming a station.
 const CONDITION_WAITS := ["item_count", "fluid_count", "circuit", "fuel_item_count_all", "fuel_item_count_any"]
 const STATION_WAITS := ["specific_destination_full", "specific_destination_not_full", "at_station", "not_at_station"]
@@ -111,7 +111,8 @@ static func number_box(value: int, on_set: Callable, width := 80) -> LineEdit:
 	e.custom_minimum_size.x = Kit.px(width)
 	var commit := func(text: String) -> void:
 		if text.strip_edges().is_valid_int():
-			on_set.call(int(text.strip_edges()))
+			# The game's signal values are 32-bit: Factorio's boxes stop at +-2147483647, where the API would refuse the number.
+			on_set.call(clampi(int(text.strip_edges()), -2147483648, 2147483647))
 	e.text_submitted.connect(commit)
 	var on_exit := func() -> void: commit.call(e.text)
 	e.focus_exited.connect(on_exit)

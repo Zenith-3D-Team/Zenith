@@ -183,24 +183,33 @@ send({"t": "hello", "v": 1, "sid": "s1", "w": 1})
 take()
 inv = puppet.get_main_inventory()
 belts = inv.get_item_count("transport-belt")
-spot = {"x": new_belt[2], "y": new_belt[3]}  # the belt built and turned south above
+spot = {"x": new_belt[2], "y": new_belt[3]}  # the belt built and turned south (8) above
+# Clicking/building over an existing belt in any different direction (including perpendicular) turns it for free.
 send({"t": "build", "item": "transport-belt", "d": 4, **spot})
 tick(2)
 msgs = take()
 upd = of_type(msgs, "upd")
 check(upd and upd[-1]["e"][4] == 4 and not of_type(msgs, "add") and inv.get_item_count("transport-belt") == belts,
-      f"building a belt over the same belt turns it, for free: {upd[-1:]}")
-send({"t": "build", "item": "transport-belt", "d": 4, **spot})
+      f"building a belt perpendicular over the same belt turns it, for free: {upd[-1:]}")
+# Placing opposite (north=0 over east=4) also turns it for free.
+send({"t": "build", "item": "transport-belt", "d": 0, **spot})
+tick(2)
+msgs = take()
+upd = of_type(msgs, "upd")
+check(upd and upd[-1]["e"][4] == 0 and not of_type(msgs, "add") and inv.get_item_count("transport-belt") == belts,
+      f"building a belt opposite over the same belt turns it, for free: {upd[-1:]}")
+send({"t": "build", "item": "transport-belt", "d": 0, **spot})
 tick(2)
 msgs = take()
 check(not (of_type(msgs, "upd") or of_type(msgs, "add") or of_type(msgs, "msg")), "and over itself facing the same way does nothing")
 puppet.insert(lua.table_from({"name": "fast-transport-belt", "count": 2}))
+# Fast-replacing in a new direction uses the clicked direction (4).
 send({"t": "build", "item": "fast-transport-belt", "d": 4, **spot})
 tick(2)
 msgs = take()
 dels, adds = of_type(msgs, "del"), of_type(msgs, "add")
 check(dels and dels[0]["u"] == new_belt[0] and adds and adds[0]["e"][1] == eid["fast-transport-belt"] and adds[0]["e"][2:5] == [spot["x"], spot["y"], 4],
-      f"a faster belt fast-replaces it: del then add: {dels[:1]} {adds[:1]}")
+      f"a faster belt fast-replaces it in the clicked direction: del then add: {dels[:1]} {adds[:1]}")
 check(inv.get_item_count("fast-transport-belt") == 1 and inv.get_item_count("transport-belt") == belts + 1,
       "the fast belt is used and the old belt comes back")
 # J9: a splitter stands on the tile edge between the two belts it covers: it lands where the cursor
@@ -461,6 +470,11 @@ send({"t": "throw", "item": "cliff-explosives", "x": fixed(puppet.position.x + 3
 tick(2)
 check(len(F.capsules) == 1 and any(m["text"] == "No cliff there" for m in of_type(take(), "msg")),
       "cliff explosives need a cliff in their radius")
+send({"t": "throw", "item": "artillery-targeting-remote", "x": fixed(puppet.position.x + 80), "y": fixed(puppet.position.y + 5)})
+tick(2)
+flares = [e for e in F.surface.entities.values() if e.name == "artillery-flare"]
+check(len(flares) == 1 and abs(flares[0].position.x - (puppet.position.x + 80)) < 0.01 and flares[0].force.name == puppet.force.name,
+      "throw: the artillery targeting remote (never in the inventory) puts a flare at the click, however far")
 
 inv.remove(lua.table_from({"name": "rail", "count": 999}))
 puppet.insert(lua.table_from({"name": "rail", "count": 3}))
@@ -492,6 +506,8 @@ F.connect(pole_a, pole_b, g.defines.wire_type.copper)
 F.connect(pole_a, pole_b, g.defines.wire_type.red)
 pipe = spawn("pipe", 12.5, 6.5, force="player")
 F.set_fluid(pipe, 1, lua.table_from({"name": "water", "amount": 80, "temperature": 15}))
+# Built as the game builds it (an event), so gc_lean's cached fluid search near the camera hears of it.
+F["raise"]("script_raised_built", lua.table_from({"entity": pipe}))
 send({"t": "resync", "full": 0, "c": [[0, 0]]})
 tick(60)
 msgs = take()
@@ -745,10 +761,20 @@ tick(2)
 check(F.upgrade_marks[belt_u] is not None and F.upgrade_marks[belt_u].name == "fast-transport-belt", "redo marks the upgrade again, to the same target")
 # Rotation
 d0 = belt_u.direction
+rot_home = puppet.position
+puppet.teleport(lua.table_from({"x": 44.5, "y": 38.5}))  # R needs the entity in reach
 send({"t": "rotate", "u": belt_u.unit_number, "p": eid["transport-belt"], "x": fixed(44.5), "y": fixed(40.5), "rev": 0})
 tick(2)
+puppet.teleport(rot_home)
 hist = of_type(take(), "hist")
 check(hist and hist[-1]["what"] == "rotation" and belt_u.direction == (d0 + 4) % 16, "a rotation is remembered")
+d1 = belt_u.direction
+puppet.teleport(lua.table_from({"x": 44.5, "y": 70.5}))
+send({"t": "rotate", "u": belt_u.unit_number, "p": eid["transport-belt"], "x": fixed(44.5), "y": fixed(40.5), "rev": 0})
+tick(2)
+puppet.teleport(rot_home)
+take()
+check(belt_u.direction == d1, "R on an entity out of reach turns nothing")
 send({"t": "undo", "h": hist[-1]["h"] if hist else 0})
 tick(2)
 check(belt_u.direction == d0, "undo turns it back")
@@ -1364,6 +1390,36 @@ check(wb_lod and "lod" in wb_lod[-1]["q"], f"dh: budget queue 'lod' reported in 
 # 2. world.lua region revision bumps & REGION = 16.
 W_MOD = g.package.loaded["scripts.world"]
 check(int(W_MOD.REGION) == 16, f"dh: world.REGION is 16: {W_MOD.REGION}")
+
+# inserter-stick: two plays of one save (loaded, a change, left unsaved; loaded again, another change) gave a
+# chunk the same count (rv) by counting up by one, so the client's disk copy of the other play matched by
+# `same` and was drawn (a mined pole by an inserter as a tall stick). By tick (f3d-rev-ticks) they differ.
+def _two_plays(on):
+    lua.execute(f'settings.global["f3d-rev-ticks"].value = {"true" if on else "false"}')
+    r0 = int(W_MOD.rev(1, "5,5"))
+    lr0 = int(W_MOD.region_rev(1, 0, 0))
+    saved_tick = g.game.tick
+    out = []
+    for dt in (10, 25):
+        lua.execute(f'storage.f3d.revs = storage.f3d.revs or {{}}; storage.f3d.revs[1] = storage.f3d.revs[1] or {{}}; '
+                    f'storage.f3d.lod_revs = storage.f3d.lod_revs or {{}}; storage.f3d.lod_revs[1] = storage.f3d.lod_revs[1] or {{}}; '
+                    f'storage.f3d.revs[1]["5,5"] = {r0}; storage.f3d.lod_revs[1]["0,0"] = {lr0}; game.tick = {saved_tick + dt}')
+        W_MOD.bump(1, lua.table_from({"x": 170, "y": 170}))
+        out.append((int(W_MOD.rev(1, "5,5")), int(W_MOD.region_rev(1, 0, 0))))
+    W_MOD.bump(1, lua.table_from({"x": 170, "y": 170}))  # again in the same tick: still one more
+    again = int(W_MOD.rev(1, "5,5"))
+    lua.execute(f"game.tick = {saved_tick}")
+    return r0, out, again
+
+
+r0, plays, again = _two_plays(False)
+check(plays[0][0] == plays[1][0] == r0 + 1,
+      f"rev ticks off: two plays of one save count a chunk alike (the old collision): {r0} {plays}")
+r0, plays, again = _two_plays(True)
+check(plays[0][0] != plays[1][0] and plays[0][1] != plays[1][1] and min(plays[0][0], plays[1][0]) > r0
+      and again == plays[1][0] + 1,
+      f"rev ticks: two plays of one save give a chunk and its region different counts, still rising: {r0} {plays} {again}")
+lua.execute('settings.global["f3d-rev-ticks"].value = false')  # the +1 checks below
 r00_0 = int(W_MOD.region_rev(1, 0, 0))
 rn1_0 = int(W_MOD.region_rev(1, -1, -1))
 W_MOD.bump(1, lua.table_from({"x": 16, "y": 16}))
@@ -1373,6 +1429,7 @@ W_MOD.bump(1, lua.table_from({"x": 0.5, "y": 0.5}))
 check(int(W_MOD.region_rev(1, 0, 0)) == r00_0 + 2 and int(W_MOD.region_rev(1, -1, -1)) == rn1_0 + 1
       and int(W_MOD.all_region_revs(1)["0,0"]) == r00_0 + 2,
       "dh: chunk-corner bump increments each touched region once")
+lua.execute('settings.global["f3d-rev-ticks"].value = true')
 
 # 3. lod_sub map / revs / uncharted omission / invalid surface / empty charted map.
 F.charted["-3,-3"] = None
@@ -1495,11 +1552,11 @@ lua.execute("storage.f3d.lod_revs[1] = F_dh_saved_revs; F_dh_saved_revs = nil")
 # 5. on_chunk_charted & on_chunk_deleted events bump region_rev and invalidate cached map state.
 g.storage.f3d.lod.map_dirty = False
 F["raise"]("on_chunk_charted", lua.table_from({"surface_index": 1, "position": {"x": 2, "y": 3}, "force": g.game.forces.player}, recursive=True))
-check(int(W_MOD.region_rev(1, 0, 0)) == r00_cur + 1 and g.storage.f3d.lod.map_dirty is True,
+check(int(W_MOD.region_rev(1, 0, 0)) == max(r00_cur + 1, int(g.game.tick)) and g.storage.f3d.lod.map_dirty is True,
       "dh: on_chunk_charted bumps region rev and invalidates map state")
 r10_before = int(W_MOD.region_rev(1, 1, 0))
 F["raise"]("on_chunk_deleted", lua.table_from({"surface_index": 1, "positions": [{"x": 16, "y": 0}, {"x": 17, "y": 0}]}, recursive=True))
-check(int(W_MOD.region_rev(1, 1, 0)) == r10_before + 1,
+check(int(W_MOD.region_rev(1, 1, 0)) == max(r10_before + 1, int(g.game.tick)),
       "dh: on_chunk_deleted deduplicates and bumps region rev")
 take()
 
@@ -1525,6 +1582,12 @@ def expand_lod_cells(msg):
     return n, tiles, ents
 
 for res_v in (32, 16, 8, 4, 2):
+    # Ensure puppet's periodic CHART_INTERVAL (120t) auto-explore did not re-chart (-3,-3) since section 3.
+    if (int(g.game.tick) + 1) % 120 == 0 or (int(g.game.tick) + 2) % 120 == 0:
+        tick(2)
+        take()
+    F.charted["-3,-3"] = None
+    lua.execute("if storage.f3d.explored and storage.f3d.explored[1] and storage.f3d.explored[1][-3] then storage.f3d.explored[1][-3][-3] = nil end")
     send({"t": "lod_sub", "si": 1, "res": res_v, "act": "want", "c": [[0, 0], [-3, -3], [9, 9]]})
     got_lods = {}
     for _ in range(30):
@@ -1842,6 +1905,19 @@ check(not map_ghost.valid and [m["n"] for m in of_type(msgs, "unghost")] == [1] 
 send({"t": "unghost", "q": 8, "x": fixed(30.5), "y": fixed(30.5)})
 tick(1)
 check([(m["q"], m["n"]) for m in of_type(take(), "unghost")] == [(8, 0)], "no ghost there: n = 0, so the client adds a tag")
+# A click on the map: `pick` names the building of the force under the point (ghosts and ground are passed over).
+pick_chest = next(e for e in F.surface.entities.values() if e.valid and e.unit_number and e.force.name == "player"
+                  and e.type not in ("character", "entity-ghost", "resource"))
+pk_pos = pick_chest.position
+send({"t": "pick", "q": 4, "x": fixed(pk_pos.x), "y": fixed(pk_pos.y), "r": 32})
+tick(1)
+pk = of_type(take(), "pick")
+check(pk and pk[0]["q"] == 4 and pk[0].get("u") and pk[0]["p"] and "x" in pk[0] and "y" in pk[0],
+      f"pick names a building under the click: {pk}")
+send({"t": "pick", "q": 5, "x": fixed(60.5), "y": fixed(60.5), "r": 128})
+tick(1)
+pk = of_type(take(), "pick")
+check(pk and pk[0]["q"] == 5 and "u" not in pk[0], f"pick with nothing there carries no unit: {pk}")
 send({"t": "tag_add", "x": 5 * 256, "y": 6 * 256, "text": "base", "icon": ["item", "iron-plate"]})
 tick(1)
 tags = of_type(take(), "tags")
@@ -2292,4 +2368,203 @@ for e in (p1, lamp2, lamp3, hot, pa, pb):
     e.destroy()
 tick(2)
 take()
+
+# --- C1/C5/C9 regressions (preserve game.tick % 1200 phase for downstream slices) ----------------
+t0_c = g.game.tick
+
+# --- C1: rblk rail signal blocks query ------------------------------------------------------------
+r_a = spawn("straight-rail", 11.0, 11.0, force="player", direction=0)
+r_b = spawn("straight-rail", 13.0, 11.0, force="player", direction=4)
+r_c = spawn("straight-rail", 19.0, 11.0, force="player", direction=0)
+F.rail_segments[r_a] = lua.table_from([r_a])
+F.rail_overlaps[r_a] = lua.table_from([r_b])
+F.rail_blocks[r_a] = 1
+F.rail_blocks[r_b] = 1
+F.rail_blocks[r_c] = 2
+send({"t": "rblk", "u": [r_b.unit_number, r_a.unit_number, r_b.unit_number, r_c.unit_number]})
+tick(1)
+# Wave 2 adds "rblk" to tools/protocol.py; inspect raw datagrams here so protocol.problems() isn't called on rblk yet.
+rblk_msgs = []
+for item in F.take_sent().values():
+    for msg in protocol.split_datagram(sent_data(item)):
+        if "r" in msg:
+            expected_r = msg["r"] + 1
+        if msg.get("t") == "rblk":
+            rblk_msgs.append(msg)
+check(len(rblk_msgs) == 1 and len(rblk_msgs[0]["b"]) == 3, f"rblk deduplicates and returns block ids: {rblk_msgs}")
+if rblk_msgs:
+    by_u = {row[0]: row[1] for row in rblk_msgs[0]["b"]}
+    check(by_u[r_a.unit_number] == by_u[r_b.unit_number] and by_u[r_a.unit_number] != by_u[r_c.unit_number],
+          f"rblk groups overlapping rails into the same block and separates others: {by_u}")
+# (rel-031-fix3, Should 3) rblk is answered in the packet event, before the tick's budget.begin(): with
+# the previous tick's budget all spent, a query's first step still runs, so the answer isn't empty.
+rb_bud = g.storage.f3d.bud
+rb_bud_used = rb_bud.used if rb_bud else None
+if rb_bud:
+    rb_bud.used = int(rb_bud.limit) * 2
+take()
+send({"t": "rblk", "u": [r_b.unit_number, r_a.unit_number, r_c.unit_number]})
+rblk_full = []
+for item in F.take_sent().values():
+    for msg in protocol.split_datagram(sent_data(item)):
+        if "r" in msg:
+            expected_r = msg["r"] + 1
+        if msg.get("t") == "rblk":
+            rblk_full += msg["b"]
+if rb_bud:
+    rb_bud.used = rb_bud_used
+rb_full_u = {row[0] for row in rblk_full}
+check(rb_bud is not None and r_a.unit_number in rb_full_u and r_b.unit_number in rb_full_u,
+      f"rblk after a tick that spent the whole budget: the first step still answers the seed's block ({rblk_full})")
+for e in (r_a, r_b, r_c):
+    e.destroy()
+
+# --- S1: rblk on a long unsignalled line stays bounded ---------------------------------------------
+# One block of 2,000 rails: before, every rail walked listed its whole segment again and checked all
+# requested rails (hundreds of thousands of engine calls from one packet). Now one call a segment,
+# the group and the query's steps and calls capped, each step paid from the budget.
+lua.execute("""
+function F_rblk_count_calls(on)
+  if on then
+    F.rblk_calls = 0
+    for _, name in ipairs({"rail_segments", "rail_overlaps", "rail_blocks"}) do
+      local back = F[name]
+      F[name .. "_back"] = back
+      F[name] = setmetatable({}, { __index = function(_, k) F.rblk_calls = F.rblk_calls + 1; return back[k] end,
+        __newindex = back })
+    end
+  else
+    for _, name in ipairs({"rail_segments", "rail_overlaps", "rail_blocks"}) do
+      F[name] = F[name .. "_back"]
+      F[name .. "_back"] = nil
+    end
+  end
+end
+""")
+rb_mod = g.package.loaded["scripts.rail_blocks"]
+
+
+def rblk_line(n_rails, per_segment, x0, y0):
+    # (Packed close: the bridge finds asked rails near the player, as the client asks for those.)
+    rails = [spawn("straight-rail", x0 + 0.04 * i, y0, force="player", direction=4) for i in range(n_rails)]
+    segs = [rails[i:i + per_segment] for i in range(0, n_rails, per_segment)]
+    for k, seg in enumerate(segs):
+        seg_t = lua.table_from(seg)
+        for r in seg:
+            F.rail_segments[r] = seg_t
+            F.rail_blocks[r] = 7
+        # A segment overlaps the next one (a junction without a signal): same block.
+        if k + 1 < len(segs):
+            F.rail_overlaps[seg[-1]] = lua.table_from([segs[k + 1][0]])
+    return rails
+
+
+def rblk_ask(rails, every):
+    asked = [int(r.unit_number) for r in rails[::every]][:128]
+    take()
+    g.F_rblk_count_calls(True)
+    send({"t": "rblk", "u": asked})
+    tick(1)
+    g.F_rblk_count_calls(False)
+    rows = []
+    for item in F.take_sent().values():
+        for msg in protocol.split_datagram(sent_data(item)):
+            if "r" in msg:
+                expected_r = msg["r"] + 1
+            if msg.get("t") == "rblk":
+                rows += msg["b"]
+    return asked, rows, int(g.F.rblk_calls)
+
+
+rb_long = rblk_line(2000, 100, -30.0, 30.0)
+rb_asked, rb_rows, rb_calls = rblk_ask(rb_long, 16)
+rb_ids = {row[1] for row in rb_rows}
+check(len(rb_rows) == len(rb_asked) and len(rb_ids) == 1,
+      f"S1 rblk: 20 chained segments (2,000 rails) answered as one block ({len(rb_rows)}/{len(rb_asked)} rows, ids {sorted(rb_ids)[:4]})")
+check(rb_calls <= rb_mod.MAX_CALLS + 4 * rb_mod.MAX_STEPS,
+      f"S1 rblk: engine calls bounded on a 2,000-rail block ({rb_calls} calls, cap {rb_mod.MAX_CALLS})")
+for e in rb_long:
+    e.destroy()
+
+rb_many = rblk_line(2000, 10, -30.0, 34.0)
+rb_steps0 = int(rb_mod.counts.steps)
+rb_asked2, rb_rows2, rb_calls2 = rblk_ask(rb_many, 16)
+rb_steps = int(rb_mod.counts.steps) - rb_steps0
+check(rb_calls2 <= rb_mod.MAX_CALLS + 4 * rb_mod.MAX_STEPS and rb_steps <= rb_mod.MAX_STEPS
+      and 0 < len(rb_rows2) <= len(rb_asked2) and len({row[1] for row in rb_rows2}) == 1,
+      f"S1 rblk: 200 chained segments: the walk stops at the step cap, asked rails still one block from the seed's check ({len(rb_rows2)}/{len(rb_asked2)} rows, {rb_steps} steps, {rb_calls2} calls)")
+for e in rb_many:
+    e.destroy()
+
+# --- C5: open entity-ghost and set_recipe ---------------------------------------------------------
+gh_asm = spawn("entity-ghost", 20.5, 20.5, force="player", inner_name="assembling-machine-1")
+send({"t": "open", "u": gh_asm.unit_number, "p": eid["entity-ghost"], "x": fixed(20.5), "y": fixed(20.5)})
+tick(2)
+gh_guis = [m for m in of_type(take(), "gui") if m.get("u") == gh_asm.unit_number]
+check(gh_guis and gh_guis[-1].get("gh") == 1 and gh_guis[-1].get("far") == 1
+      and gh_guis[-1].get("p") == eid["assembling-machine-1"]
+      and len(gh_guis[-1].get("slots", {}).get("modules", [])) == 2,
+      f"entity-ghost opens out of reach with gh=1, far=1, inner proto, and module slots: {gh_guis[-1:]}")
+send({"t": "set_recipe", "u": gh_asm.unit_number, "recipe": "iron-gear-wheel"})
+tick(3)
+msgs = take()
+gh_guis2 = [m for m in of_type(msgs, "gui") if m.get("u") == gh_asm.unit_number]
+gh_upds = [m["e"] for m in of_type(msgs, "upd") if m["e"][0] == gh_asm.unit_number]
+gh_aius = [row for m in of_type(msgs, "aiu") for row in m.get("l", []) if row[0] == gh_asm.unit_number]
+check(gh_guis2 and gh_guis2[-1].get("recipe") == "iron-gear-wheel"
+      and ((gh_upds and gh_upds[-1][5].get("ai") == ["recipe", "iron-gear-wheel"])
+           or (gh_aius and gh_aius[-1][1] == ["recipe", "iron-gear-wheel"])),
+      f"set_recipe on entity-ghost sets recipe and updates Alt-mode icon: {gh_guis2[-1:]} {gh_upds[-1:]} {gh_aius[-1:]}")
+send({"t": "close"})
+tick(1)
+gh_asm.destroy()
+take()
+
+# --- C9 & unlimited paste_settings reach ----------------------------------------------------------
+ps_src = spawn("assembling-machine-1", 22.5, 20.5, force="player")
+ps_src.set_recipe("iron-gear-wheel")
+ps_dst = spawn("assembling-machine-1", 25.5, 20.5, force="player")
+ps_dst_lim = spawn("assembling-machine-1", 26.5, 20.5, force="player")
+ps_chest = spawn("wooden-chest", 28.5, 20.5, force="player")
+paste_home = puppet.position
+puppet.teleport(lua.table_from({"x": 0.5, "y": 0.5}))
+send({"t": "paste_settings", "f": [ps_src.unit_number, eid["assembling-machine-1"], fixed(22.5), fixed(20.5)],
+      "u": ps_dst.unit_number, "p": eid["assembling-machine-1"], "x": fixed(25.5), "y": fixed(20.5)})
+tick(2)
+msgs = take()
+sfx = [m["s"] for m in of_type(msgs, "ui_sfx")]
+check(ps_dst.get_recipe()[0] and ps_dst.get_recipe()[0].name == "iron-gear-wheel" and "entity-settings-pasted" in sfx,
+      f"paste_settings has unlimited reach by default: recipe={ps_dst.get_recipe()} sfx={sfx}")
+# Pasting unchanged settings or dragging over incompatible entities emits no entity-settings-pasted spam.
+send({"t": "paste_settings", "f": [ps_src.unit_number, eid["assembling-machine-1"], fixed(22.5), fixed(20.5)],
+      "u": ps_dst.unit_number, "p": eid["assembling-machine-1"], "x": fixed(25.5), "y": fixed(20.5), "drag": 1})
+send({"t": "paste_settings", "f": [ps_src.unit_number, eid["assembling-machine-1"], fixed(22.5), fixed(20.5)],
+      "u": ps_chest.unit_number, "p": eid["wooden-chest"], "x": fixed(28.5), "y": fixed(20.5), "drag": 1})
+tick(2)
+spam_sfx = [m["s"] for m in of_type(take(), "ui_sfx")]
+check("entity-settings-pasted" not in spam_sfx and "cannot-build" not in spam_sfx,
+      f"unchanged/incompatible drag paste emits no sfx spam: {spam_sfx}")
+# With paste_reach_limit switch enabled, out-of-reach paste_settings is refused.
+g.storage.f3d_perf = lua.table_from({"paste_reach_limit": True})
+send({"t": "paste_settings", "f": [ps_src.unit_number, eid["assembling-machine-1"], fixed(22.5), fixed(20.5)],
+      "u": ps_dst_lim.unit_number, "p": eid["assembling-machine-1"], "x": fixed(26.5), "y": fixed(20.5)})
+tick(2)
+lim_msgs = [m["text"] for m in of_type(take(), "msg")]
+check(ps_dst_lim.get_recipe()[0] is None and "Out of reach" in lim_msgs,
+      f"paste_reach_limit restores reach refusal when enabled: recipe={ps_dst_lim.get_recipe()} msgs={lim_msgs}")
+g.storage.f3d_perf = None
+puppet.teleport(paste_home)
+for e in (ps_src, ps_dst, ps_dst_lim, ps_chest):
+    e.destroy()
+tick(1)
+take()
+
+rem = (1200 - ((g.game.tick - t0_c) % 1200)) % 1200
+while rem > 0:
+    step = min(60, rem)
+    if g.storage.f3d and g.storage.f3d.client:
+        send({"t": "hello", "v": 1, "sid": str(g.storage.f3d.client.sid), "w": 1})
+    tick(step)
+    take()
+    rem -= step
 

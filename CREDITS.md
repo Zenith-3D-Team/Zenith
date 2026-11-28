@@ -59,6 +59,20 @@ file's source clip mapping is listed in
 [addons-src/immersive-weather/CREDITS.md](addons-src/immersive-weather/CREDITS.md). They keep CC BY 4.0,
 not the GPL.
 
+## Upscaling libraries (Windows downloads)
+
+- **AMD FSR** (FSR SDK): © Advanced Micro Devices, Inc., under the licence in `vendor/amd/license.md`.
+  AMD, Radeon and FSR are trademarks of Advanced Micro Devices, Inc. Zenith is not sponsored or
+  endorsed by AMD.
+- **NVIDIA DLSS** uses NVIDIA's own files, which you install yourself in `vendor/nvidia/`; Zenith does
+  not ship them. NVIDIA, GeForce RTX and DLSS are trademarks of NVIDIA Corporation. Zenith is not
+  sponsored or endorsed by NVIDIA.
+
+These libraries are closed-source, are not part of Zenith and are not under its GPL
+([LICENSING.md](LICENSING.md), vendor upscaler exception). Zenith never asks them to download updates.
+NVIDIA's graphics driver, though, runs its own DLSS updater (`nvngx_update.exe`, which may contact NVIDIA)
+whenever DLSS starts, so Zenith asks the player before turning DLSS on ([docs/USER-GUIDE.md](docs/USER-GUIDE.md)).
+
 ## Tools and libraries
 
 - [Godot Engine](https://godotengine.org) (MIT), the client.

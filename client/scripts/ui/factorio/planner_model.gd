@@ -6,9 +6,9 @@ extends RefCounted
 ## (`quals`). ui_model.gd hands it these messages; the library, editors and player_input.gd use
 ## its calls.
 ##
-## Stacks are named by main inventory slot (1-based), or -1 for the stack taken from the library
+## Stacks are named by main inventory slot (1-based), -1 for the stack taken from the library
 ## into the cursor (the mod keeps it in a script inventory, as a library record in Factorio's
-## cursor isn't in the inventory).
+## cursor isn't in the inventory), or -2 for the clipboard (Ctrl+C / Ctrl+X).
 
 const BpString := preload("res://scripts/ui/factorio/bp_string.gd")
 const Wire := preload("res://scripts/util/wire.gd")
@@ -123,10 +123,17 @@ func _ask(cmd: Dictionary, callback: Callable) -> int:
 	return _next_q
 
 
-## The stack at `slot` as a decoded record: callback(record, text, info). An empty record when
-## there is nothing to export there (info["err"] says why).
+## The stack at `slot` (-1 the cursor's, -2 the clipboard) as a decoded record: callback(record,
+## text, info). An empty record when there is nothing to export there (info["err"] says why).
 func export_stack(slot: int, callback: Callable) -> int:
 	return _ask({"t": "bp_get", "i": slot}, callback)
+
+
+## Copies the stack at `slot` (-1 the cursor's, -2 the clipboard) straight into main inventory
+## slot `to` (0: first empty main slot, -1: the cursor's stack) without an exchange-string round
+## trip; callback({}, "", {"i": slot it went to, "item"}) on `bp_ok` (or `info["err"]` on error).
+func save_stack(slot: int, to: int, callback := Callable()) -> int:
+	return _ask({"t": "bp_get", "i": slot, "to": to}, callback)
 
 
 ## A record of the game's ("game") or the taken-over player's ("player") library, decoded.

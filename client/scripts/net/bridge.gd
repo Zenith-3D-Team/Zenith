@@ -181,6 +181,15 @@ var udp_io_high := true
 ## visible; with this, 1.5-2.2 s, 0-13 and 99%: docs/RUNNING.md). off: as before.
 var message_catchup := true
 var catchup_usec := 250000
+## --replay-kinds=on|off (on): a kept message handed again (Replay, world.gd's kept chunks) carries its message type,
+## so the messages' slice guesses its cost by that type (FrameBudget.item_est `replay:<t>`: a kept chunk's `ents`
+## costs far more than its `cq`) and --stutter-probe names it (`replay:<t>`). off: one `replay` estimate for all of
+## them, as before. The order messages are handled in is the same either way.
+var replay_kinds := true
+## --drain-head-again=on|off (on, perf-w4-fix S3): when a message in the messages' slice puts entries in front
+## (requeue_front: a live `ents` message's slices) and time is left, the slice runs them this frame. off: the
+## slice stopped at them and they waited for the next frame, as before.
+var drain_head_again := true
 ## --resync-guard=on|off (on): a full resync can't loop. The handshake's stall check (HANDSHAKE_STALL_MSEC)
 ## asked for a full resync whenever `ready` had not been *handled* 3 s after the last reliable message was
 ## *read*; a full resync restarts the bridge's handshake (session.lua: the world cleared, lod.reset), and
@@ -235,7 +244,7 @@ var prio_delta_order := true
 const PRIORITY_COMMANDS := {
 	"walk": true, "drive": true, "enter": true, "mine": true, "mine_stop": true, "mine_at": true,
 	"build": true, "blueprint": true, "rails": true, "tile": true, "tile_mine": true, "rotate": true, "flip": true,
-	"open": true, "close": true, "take": true, "put": true, "move": true, "xfer": true, "fast": true,
+	"open": true, "close": true, "pick": true, "take": true, "put": true, "move": true, "xfer": true, "fast": true,
 	"sort": true, "inv_filter": true, "drop": true, "pickup": true, "pickup_stop": true,
 	"shoot": true, "gun": true, "throw": true, "craft": true, "cancel_craft": true,
 	"wire": true, "wire_clear": true, "decon": true, "upgrade": true,
@@ -246,6 +255,7 @@ const PRIORITY_COMMANDS := {
 	"set_desc": true, "set_speaker": true, "set_pump": true, "set_targets": true, "set_vehicle": true,
 	"set_artillery": true, "set_requests": true, "set_storage_filter": true, "set_chest_logistics": true,
 	"set_char_requests": true, "set_section": true, "set_schedule": true, "set_char_color": true,
+	"set_lnet_name": true, "lnet_find": true,
 	"train_go": true, "train_mode": true, "train_mode_id": true, "train_temp": true,
 	"set_stop": true, "set_interrupts": true, "set_train_group": true,
 	"eq_put": true, "eq_take": true, "eq_move": true, "eq_toggle": true,
@@ -254,7 +264,7 @@ const PRIORITY_COMMANDS := {
 	"set_hub": true, "set_pad": true, "set_silo": true, "silo_launch": true, "set_collector": true,
 	"ride": true, "land": true, "plat_board": true, "plat_pause": true, "plat_go": true, "plat_sched": true,
 	"view": true, "research": true, "research_cancel": true, "bp_page": true, "bp_del": true, "bp_set": true,
-	"tag_add": true, "tag_del": true, "mpress": true,
+	"tag_add": true, "tag_del": true, "mpress": true, "mset": true,
 }
 const ME_MESSAGES := {"me": true}
 const PRIO_MESSAGES := {
@@ -412,6 +422,10 @@ func _ready() -> void:
 			udp_io_high = arg.get_slice("=", 1) == "high"
 		elif arg.begins_with("--message-catchup="):
 			message_catchup = arg.get_slice("=", 1) != "off"
+		elif arg.begins_with("--replay-kinds="):
+			replay_kinds = arg.get_slice("=", 1) != "off"
+		elif arg.begins_with("--drain-head-again="):
+			drain_head_again = arg.get_slice("=", 1) != "off"
 		elif arg.begins_with("--resync-guard="):
 			resync_guard = arg.get_slice("=", 1) != "off"
 		elif arg.begins_with("--message-catchup-msec="):
@@ -907,6 +921,7 @@ func _process(delta: float) -> void:
 		_io_mutex.unlock()
 		if not parsed.is_empty():
 			_last_read_msec = Time.get_ticks_msec()
+		var t_route := Time.get_ticks_usec() if Probing.on else 0  # (--stutter-probe: br_route, the parsed datagrams queued)
 		for entry: Array in parsed:
 			stats["packets"] += 1
 			stats["bytes"] += int(entry[0])
@@ -930,6 +945,8 @@ func _process(delta: float) -> void:
 			for answer: Dictionary in entry[5]:
 				answer_read.emit(answer)
 			_count_datagram(int(entry[6]), int(entry[0]), k, int(entry[7]), entry[8])
+		if Probing.on:
+			Probing.add("br_route", t_route)
 	if not _holding and not _hold_kinds.is_empty():
 		_release_held()  # before newer messages, which wait behind these meanwhile
 	_drain()
@@ -1281,7 +1298,9 @@ func _route_one(msg: Variant, length: int, read_at: int) -> void:
 				return
 			if CHUNK_DELTA_MESSAGES.has(t):
 				var dc: Variant = _delta_chunk(d, t)
-				if dc is Vector2i and not _chunk_waiting.has(dc):
+				# Not while the replay head holds anything: an unapplied ents slice there may hold the record this
+				# delta changes (it falls through to _waiting, behind the head, counted by prio_delta_order).
+				if dc is Vector2i and not _chunk_waiting.has(dc) and _replay_at >= _replay_head.size():
 					_prio_waiting.append(d)
 					return
 			if coalesce_updates and LIVE_FAST_MESSAGES.has(t) and not d.has("r") and (t != "ie" or _chunk_waiting.is_empty()):
@@ -1451,6 +1470,15 @@ func _routed_out(msg: Dictionary) -> void:
 
 
 func _coalesce_skips(queue: Array, from_idx: int, stop_at_barrier: bool) -> Dictionary:
+	if Probing.on:
+		var t_co := Time.get_ticks_usec()
+		var out := _coalesce_skips_do(queue, from_idx, stop_at_barrier)
+		Probing.add("br_coalesce", t_co)  # (--stutter-probe: the passes over the waiting queue)
+		return out
+	return _coalesce_skips_do(queue, from_idx, stop_at_barrier)
+
+
+func _coalesce_skips_do(queue: Array, from_idx: int, stop_at_barrier: bool) -> Dictionary:
 	var skips := {}
 	if not coalesce_updates or not world_ready or queue.size() - from_idx <= 1:
 		return skips
@@ -1520,22 +1548,31 @@ func _coalesce_skips(queue: Array, from_idx: int, stop_at_barrier: bool) -> Dict
 	return skips
 
 
-func _drain_fast(queue: Array, stat_key: String) -> Array:
+## (--stutter-probe, Probing.on) Each fast lane's handled messages are timed one by one: the slowest of the frame is
+## Probing.note_message's, and the lanes' totals are Probing parts `br_me`, `br_prio`, `br_live`, `br_belt` (br_fast's
+## shares). Off the probe nothing more is timed.
+func _drain_fast(queue: Array, stat_key: String, probe_key := "") -> Array:
 	if queue.is_empty():
 		return queue
 	var t0 := Time.get_ticks_usec()
 	var skips := _coalesce_skips(queue, 0, false)
 	var ran := 0
+	var probe := Probing.on
 	for i in queue.size():
 		if skips.has(i):
 			stats["coalesced"] += 1
 			continue
 		var msg: Dictionary = queue[i]
+		var tm := Time.get_ticks_usec() if probe else 0
 		_handle(msg, true, false)
+		if probe:
+			Probing.note_message(str(msg.get("t", "")), Time.get_ticks_usec() - tm)
 		ran += 1
 	var spent := Time.get_ticks_usec() - t0
 	stats["handle_usec"] += spent
 	stats[stat_key] = int(stats.get(stat_key, 0)) + ran
+	if probe and probe_key != "":
+		Probing.add(probe_key, t0)
 	return []
 
 
@@ -1547,6 +1584,7 @@ func _drain_live() -> void:
 	_live_waiting = []
 	var skips := _coalesce_skips(msgs, 0, false)
 	var ran := 0
+	var probe := Probing.on
 	for i in msgs.size():
 		if skips.has(i):
 			stats["coalesced"] += 1
@@ -1555,11 +1593,16 @@ func _drain_live() -> void:
 		_last_packet_msec = Time.get_ticks_msec()
 		if not connected:
 			continue
+		var tm := Time.get_ticks_usec() if probe else 0
 		_handle(msg, true, false)
+		if probe:
+			Probing.note_message(str(msg.get("t", "")), Time.get_ticks_usec() - tm)
 		ran += 1
 	var spent := Time.get_ticks_usec() - t0
 	stats["handle_usec"] += spent
 	stats["live_first"] = int(stats.get("live_first", 0)) + ran
+	if probe:
+		Probing.add("br_live", t0)
 
 
 ## (belt_messages_first) The belts' messages read so far, handled before the others: as _handle does for a
@@ -1570,6 +1613,7 @@ func _drain_belts() -> void:
 	var t0 := Time.get_ticks_usec()
 	var msgs := _belt_waiting
 	_belt_waiting = []
+	var probe := Probing.on
 	for msg: Dictionary in msgs:
 		_last_packet_msec = Time.get_ticks_msec()
 		if not connected:
@@ -1578,19 +1622,27 @@ func _drain_belts() -> void:
 		if _hold_kinds.has(t):
 			_held.append(msg)
 			continue
+		var tm := Time.get_ticks_usec() if probe else 0
 		_emit(msg, t)
+		if probe:
+			Probing.note_message(t, Time.get_ticks_usec() - tm)
 	var spent := Time.get_ticks_usec() - t0
 	stats["handle_usec"] += spent
 	stats["belt_first"] = int(stats.get("belt_first", 0)) + msgs.size()
+	if probe:
+		Probing.add("br_belt", t0)
 
 
 func _drain() -> void:
+	var t_fast := Time.get_ticks_usec() if Probing.on else 0  # (--stutter-probe: br_fast, the unbudgeted drains)
 	if not _me_waiting.is_empty():
-		_me_waiting = _drain_fast(_me_waiting, "me_first")
+		_me_waiting = _drain_fast(_me_waiting, "me_first", "br_me")
 	if not _prio_waiting.is_empty():
-		_prio_waiting = _drain_fast(_prio_waiting, "prio_first")
+		_prio_waiting = _drain_fast(_prio_waiting, "prio_first", "br_prio")
 	_drain_live()
 	_drain_belts()
+	if Probing.on:
+		Probing.add("br_fast", t_fast)
 	if _stale_until > _waiting_at:
 		_drop_stale()
 	var start := Time.get_ticks_usec()
@@ -1601,59 +1653,75 @@ func _drain() -> void:
 	_draining = true
 	# (FrameBudget.fits: the next message's typical cost by its type counted before it starts, --budget-predict.)
 	var handled := 0
-	while limit > 0 and _replay_at < _replay_head.size():
-		if not FrameBudget.fits(start, limit, handled, FrameBudget.item_est(&"messages", "replay")):
-			break
-		var tr := Time.get_ticks_usec()
-		(_replay_head[_replay_at] as Replay).run()
-		FrameBudget.note_item(&"messages", Time.get_ticks_usec() - tr, "replay")
-		handled += 1
-		_replay_at += 1
-		if Time.get_ticks_usec() - start > limit:
-			break
-	if _replay_at >= _replay_head.size():
-		_replay_head.clear()
-		_replay_at = 0
-	var wait_skips := _coalesce_skips(_waiting, _waiting_at, true) if (limit > 0 and _replay_at >= _replay_head.size()) else {}
-	while limit > 0 and _replay_at >= _replay_head.size() and _waiting_at < _waiting.size():
-		if Time.get_ticks_usec() - start > limit:
-			break
-		var t0 := Time.get_ticks_usec()
-		var idx := _waiting_at
-		var msg = _waiting[idx]
-		var mt := str((msg as Dictionary).get("t", "")) if msg is Dictionary else "replay"
-		if handled > 0 and not wait_skips.has(idx) and not FrameBudget.fits(start, limit, handled, FrameBudget.item_est(&"messages", mt)):
-			break
-		var length := _waiting_len[idx] if idx < _waiting_len.size() else 0
-		var seq_checked := idx < _waiting_checked.size() and _waiting_checked[idx] != 0
-		_waiting_at += 1
-		if msg is Dictionary:
-			if _belt_barriers > 0 or _belts_behind > 0 or _prio_barriers > 0 or not _chunk_waiting.is_empty():
-				_routed_out(msg)
-			if wait_skips.has(idx):
-				stats["coalesced"] += 1
-				continue
-			var wt := str((msg as Dictionary).get("t", ""))
-			_handle(msg, seq_checked, true)
-			if PRIO_BARRIERS.has(wt):
-				wait_skips = _coalesce_skips(_waiting, _waiting_at, true)
-			var spent := Time.get_ticks_usec() - t0
-			Probing.note_message(wt, spent)
-			FrameBudget.note_item(&"messages", spent, wt)
+	# One outer loop: a message in the waiting loop that puts entries in front (a live `ents` message's slices,
+	# requeue_front) has them run this frame while time is left, not always a frame later (--drain-head-again=off:
+	# they waited for the next frame as before).
+	while true:
+		while limit > 0 and _replay_at < _replay_head.size():
+			var rp := _replay_head[_replay_at] as Replay
+			var rk := rp.kind if replay_kinds else "replay"
+			if not FrameBudget.fits(start, limit, handled, FrameBudget.item_est(&"messages", rk)):
+				break
+			var tr := Time.get_ticks_usec()
+			# Advanced before it runs: an entry calling requeue_front while it runs puts the new entries after
+			# itself (it isn't run again, and the first new one isn't skipped).
+			_replay_at += 1
+			rp.run()
+			var r_spent := Time.get_ticks_usec() - tr
+			FrameBudget.note_item(&"messages", r_spent, rk)
+			Probing.note_message(rk, r_spent)
 			handled += 1
-			if Probing.on and spent > SLOW_MESSAGE_USEC:
-				var st := str(msg.get("t", ""))
-				slow_counts[st] = int(slow_counts.get(st, 0)) + 1
-				if slow_messages.size() < 200:
-					slow_messages.append([spent / 1000.0, st, length])
-		elif msg is Replay:
-			(msg as Replay).run()
-			FrameBudget.note_item(&"messages", Time.get_ticks_usec() - t0, "replay")
-			handled += 1
-		if Time.get_ticks_usec() - start > limit:
+			if Time.get_ticks_usec() - start > limit:
+				break
+		if _replay_at >= _replay_head.size():
+			_replay_head.clear()
+			_replay_at = 0
+		var wait_skips := _coalesce_skips(_waiting, _waiting_at, true) if (limit > 0 and _replay_at >= _replay_head.size()) else {}
+		while limit > 0 and _replay_at >= _replay_head.size() and _waiting_at < _waiting.size():
+			if Time.get_ticks_usec() - start > limit:
+				break
+			var t0 := Time.get_ticks_usec()
+			var idx := _waiting_at
+			var msg = _waiting[idx]
+			var mt := str((msg as Dictionary).get("t", "")) if msg is Dictionary else ((msg as Replay).kind if (msg is Replay and replay_kinds) else "replay")
+			if handled > 0 and not wait_skips.has(idx) and not FrameBudget.fits(start, limit, handled, FrameBudget.item_est(&"messages", mt)):
+				break
+			var length := _waiting_len[idx] if idx < _waiting_len.size() else 0
+			var seq_checked := idx < _waiting_checked.size() and _waiting_checked[idx] != 0
+			_waiting_at += 1
+			if msg is Dictionary:
+				if _belt_barriers > 0 or _belts_behind > 0 or _prio_barriers > 0 or not _chunk_waiting.is_empty():
+					_routed_out(msg)
+				if wait_skips.has(idx):
+					stats["coalesced"] += 1
+					continue
+				var wt := str((msg as Dictionary).get("t", ""))
+				_handle(msg, seq_checked, true)
+				if PRIO_BARRIERS.has(wt):
+					wait_skips = _coalesce_skips(_waiting, _waiting_at, true)
+				var spent := Time.get_ticks_usec() - t0
+				Probing.note_message(wt, spent)
+				FrameBudget.note_item(&"messages", spent, wt)
+				handled += 1
+				if Probing.on and spent > SLOW_MESSAGE_USEC:
+					var st := str(msg.get("t", ""))
+					slow_counts[st] = int(slow_counts.get(st, 0)) + 1
+					if slow_messages.size() < 200:
+						slow_messages.append([spent / 1000.0, st, length])
+			elif msg is Replay:
+				(msg as Replay).run()
+				var rw_spent := Time.get_ticks_usec() - t0
+				FrameBudget.note_item(&"messages", rw_spent, mt)
+				Probing.note_message(mt, rw_spent)
+				handled += 1
+			if Time.get_ticks_usec() - start > limit:
+				break
+		if not drain_head_again or limit <= 0 or _replay_at >= _replay_head.size() or Time.get_ticks_usec() - start > limit:
 			break
 	_draining = false
 	frame_handle_usec = Time.get_ticks_usec() - start
+	if Probing.on:
+		Probing.add("br_drain", start)  # (--stutter-probe: the budgeted loop, handlers included)
 	stats["handle_usec"] += frame_handle_usec
 	FrameBudget.spent(&"messages", frame_handle_usec, (_replay_head.size() - _replay_at) + (_waiting.size() - _waiting_at))
 	if _waiting_at >= _waiting.size():
@@ -1693,6 +1761,8 @@ func _drop_stale() -> void:
 class Replay:
 	var handler: Callable
 	var msg: Dictionary
+	## (--replay-kinds) "replay:<its message type>", the budget's estimate key for it.
+	var kind := "replay"
 
 	func run() -> void:
 		if handler.is_valid():
@@ -1717,6 +1787,9 @@ func requeue_front(entries: Array) -> void:
 		var r := Replay.new()
 		r.handler = e[0]
 		r.msg = e[1]
+		var t := str(r.msg.get("t", ""))
+		if t != "":
+			r.kind = "replay:" + t
 		head.append(r)
 	if _replay_at < _replay_head.size():
 		head.append_array(_replay_head.slice(_replay_at))

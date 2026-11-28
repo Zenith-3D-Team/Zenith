@@ -23,9 +23,14 @@ local map = require("scripts.map")
 local modules = require("scripts.modules")
 local alt_mode = require("scripts.alt_mode")
 local belt_switch = require("scripts.belt_switch")
+local belt_sim = require("scripts.belt_sim")
 local tracker = require("scripts.tracker")
 
 local M = {}
+
+M.take_listeners = {}
+
+local LANE_KEYS = 8
 
 local INTERVAL = 30          -- state twice a second while a screen is open
 local RECIPE_LIST_EVERY = 10 -- check the recipe list every 10th state (~5 s) and send on change or resend
@@ -36,10 +41,43 @@ local CONTAINER_TYPES = {
   container = true, ["logistic-container"] = true, ["linked-container"] = true, ["infinity-container"] = true,
 }
 local KINDS = { ["assembling-machine"] = "crafter", furnace = "furnace", lab = "lab" }
+local GHOST_KINDS = {
+  ["arithmetic-combinator"] = "combinator", ["decider-combinator"] = "combinator",
+  ["selector-combinator"] = "combinator", ["constant-combinator"] = "combinator",
+  inserter = "inserter", splitter = "splitter", ["lane-splitter"] = "splitter",
+  ["power-switch"] = "switch", ["electric-pole"] = "pole", ["rocket-silo"] = "silo",
+  ["display-panel"] = "panel", ["train-stop"] = "stop", roboport = "roboport",
+  locomotive = "train", ["cargo-wagon"] = "train", ["fluid-wagon"] = "train", ["artillery-wagon"] = "train",
+  car = "vehicle", ["spider-vehicle"] = "vehicle",
+  ["ammo-turret"] = "turret", ["electric-turret"] = "turret", ["fluid-turret"] = "turret", ["artillery-turret"] = "turret",
+  ["cargo-landing-pad"] = "pad", ["space-platform-hub"] = "hub", ["asteroid-collector"] = "collector",
+}
+local GHOST_STATUS_OPENABLE = {
+  pipe = true, ["pipe-to-ground"] = true, ["heat-pipe"] = true, ["land-mine"] = true, ["transport-belt"] = true,
+  lamp = true, pump = true, ["offshore-pump"] = true, ["storage-tank"] = true, ["programmable-speaker"] = true,
+  ["mining-drill"] = true, boiler = true, reactor = true, radar = true, accumulator = true, beacon = true,
+  ["rail-signal"] = true, ["rail-chain-signal"] = true,
+}
+
+local function inner_type(e)
+  return e.type == "entity-ghost" and e.ghost_type or e.type
+end
+
+local function inner_proto(e)
+  return e.type == "entity-ghost" and e.ghost_prototype or e.prototype
+end
+
+local function inner_name(e)
+  return e.type == "entity-ghost" and e.ghost_name or e.name
+end
 
 local function kind_of(e)
-  if CONTAINER_TYPES[e.type] then
+  local t = inner_type(e)
+  if CONTAINER_TYPES[t] then
     return "container"
+  end
+  if e.type == "entity-ghost" then
+    return GHOST_KINDS[t] or KINDS[t] or "other"
   end
   if circuits.is_combinator(e) then
     return "combinator"
@@ -53,7 +91,7 @@ local function kind_of(e)
   if logistics.is_roboport(e) then
     return "roboport"
   end
-  return space.kind(e) or entity_ui.kind(e) or KINDS[e.type] or "other"
+  return space.kind(e) or entity_ui.kind(e) or KINDS[t] or "other"
 end
 
 -- defines.inventory names differ between versions (2.0 has assembling_machine_input and
@@ -84,6 +122,9 @@ local WAGON_INVENTORIES = {
 -- {{role, LuaInventory}, ...} in display order. Roles: chest, input, output, fuel, burnt, modules,
 -- cargo, ammo.
 local function inventories(e, kind)
+  if e.type == "entity-ghost" then
+    return {}
+  end
   local out = {}
   local function add(role, inventory)
     if inventory then
@@ -132,7 +173,7 @@ local function current_recipe(e)
 end
 
 local function machine_categories(e)
-  local ok, cats = pcall(function() return e.prototype.crafting_categories end)
+  local ok, cats = pcall(function() return inner_proto(e).crafting_categories end)
   return ok and cats or {}
 end
 
@@ -155,7 +196,8 @@ end
 local machine_candidates = {}
 
 local function candidates_for(e)
-  local pname = e.prototype.name
+  local ip = inner_proto(e)
+  local pname = ip and ip.name or e.name
   local cached = machine_candidates[pname]
   if cached then
     return cached
@@ -293,7 +335,52 @@ local function power_fill(e)
   return math.max(0, math.min(1000, math.floor(e.energy / size * 1000 + 0.5)))
 end
 
+local function list_inventory(list, role)
+  for _, pair in ipairs(list) do
+    if pair[1] == role then
+      return pair[2]
+    end
+  end
+end
+
+-- An inventory's slot filters ([[slot, item], ...]): Factorio's middle click on a slot.
+function M.filter_list(inventory)
+  local out = {}
+  local ok, supports = pcall(function() return inventory.supports_filters() end)
+  if not (ok and supports) then
+    return out
+  end
+  for i = 1, #inventory do
+    local f = inventory.get_filter(i)
+    local name = type(f) == "table" and f.name or f
+    if type(name) == "table" then
+      name = name.name
+    end
+    if type(name) == "string" then
+      out[#out + 1] = { i, name }
+    end
+  end
+  return out
+end
+
+-- {u, i, item}: sets the filter of slot i of the open cargo wagon ("" clears it).
+function M.set_wagon_filter(cmd)
+  local inventory = M.inventory("cargo", cmd)
+  local i = math.floor(tonumber(cmd.i) or 0)
+  if not (inventory and i >= 1 and i <= #inventory) then
+    return
+  end
+  local item = tostring(cmd.item or "")
+  local ok, set = pcall(function() return inventory.set_filter(i, item ~= "" and item or nil) end)
+  if not (ok and set ~= false) then
+    puppet.message("Can't filter that slot")
+  end
+end
+
 local function send_state(c, e, sc)
+  local ghost = e.type == "entity-ghost"
+  local t = inner_type(e)
+  local ip = inner_proto(e)
   local kind = kind_of(e)
   local inv, slots = {}, {}
   local list = inventories(e, kind)
@@ -301,15 +388,34 @@ local function send_state(c, e, sc)
     inv[pair[1]] = puppet.contents(pair[2])
     slots[pair[1]] = M.slot_list(pair[2])
   end
-  local msg = { t = "gui", u = sc.unit, p = registry.entity_id(e.name), kind = kind, inv = inv, slots = slots }
-  if kind == "crafter" or kind == "furnace" then
-    msg.recipe = current_recipe(e)
-    local ok, progress = pcall(function() return e.crafting_progress end)
-    if ok and type(progress) == "number" then
-      msg.pr = math.max(0, math.min(1000, math.floor(progress * 1000 + 0.5)))
+  if ghost and ip then
+    local ok_ms, mod_size = pcall(function() return ip.module_inventory_size end)
+    if ok_ms and type(mod_size) == "number" and mod_size > 0 then
+      local mslots = {}
+      for i = 1, mod_size do
+        mslots[i] = 0
+      end
+      slots.modules = mslots
+      inv.modules = {}
     end
   end
-  msg.status = status_name(e)
+  local msg = { t = "gui", u = sc.unit, p = registry.entity_id(inner_name(e)), kind = kind, inv = inv, slots = slots }
+  if ghost then
+    msg.gh = 1
+    msg.far = 1
+  end
+  if kind == "crafter" or kind == "furnace" then
+    msg.recipe = current_recipe(e)
+    if not ghost then
+      local ok, progress = pcall(function() return e.crafting_progress end)
+      if ok and type(progress) == "number" then
+        msg.pr = math.max(0, math.min(1000, math.floor(progress * 1000 + 0.5)))
+      end
+    end
+  end
+  if not ghost then
+    msg.status = status_name(e)
+  end
   -- Opened from the remote view out of reach (`far`): items can't move, modules are requested
   -- instead (`mrq`, each module slot's requested module or "").
   if sc.remote and not puppet.can_reach(c, e) then
@@ -319,17 +425,21 @@ local function send_state(c, e, sc)
     local okm, requested = pcall(modules.slots, e)
     msg.mrq = okm and requested or nil
   end
-  local ok, boxes = pcall(fluid_boxes, e)
-  if ok and #boxes > 0 then
-    msg.fb = boxes
+  if not ghost then
+    local ok, boxes = pcall(fluid_boxes, e)
+    if ok and #boxes > 0 then
+      msg.fb = boxes
+    end
+    msg.pw = power_fill(e)
   end
-  msg.pw = power_fill(e)
-  if e.type == "agricultural-tower" then
+  if t == "agricultural-tower" and not ghost then
     msg.ag = planets.tower_info(e)
   end
-  local ok_t, temperature = pcall(function() return e.temperature end)
-  if ok_t and type(temperature) == "number" then
-    msg.temp = math.floor(temperature + 0.5)
+  if not ghost then
+    local ok_t, temperature = pcall(function() return e.temperature end)
+    if ok_t and type(temperature) == "number" then
+      msg.temp = math.floor(temperature + 0.5)
+    end
   end
   if kind == "combinator" then
     local ok2, cb = pcall(circuits.settings, e)
@@ -337,14 +447,18 @@ local function send_state(c, e, sc)
     local okd, desc = pcall(function() return e.combinator_description end)
     msg.desc = okd and desc or nil
   end
-  if kind == "train" then
+  if kind == "train" and not ghost then
     local ok3, info = pcall(trains.train_info, e)
     msg.tr = ok3 and info or nil
-  elseif kind == "stop" then
+    -- A cargo wagon's slot filters ([[slot, item], ...]), set with a middle click.
+    if slots.cargo then
+      msg.wfl = M.filter_list(list_inventory(list, "cargo"))
+    end
+  elseif kind == "stop" and not ghost then
     local ok3, info = pcall(trains.stop_info, e)
     msg.stop = ok3 and info or nil
   end
-  if kind == "container" or kind == "roboport" then
+  if kind == "container" or kind == "roboport" or t == "spider-vehicle" then
     local ok4, info = pcall(logistics.screen_info, e)
     msg.lg = ok4 and info or nil
   end
@@ -353,8 +467,13 @@ local function send_state(c, e, sc)
     local ok5, cc = pcall(circuit_settings.info, e)
     msg.cc = ok5 and cc or nil
   end
-  entity_ui.fill(msg, e, kind, list)
-  space.fill(msg, e, kind)
+  if ghost then
+    pcall(entity_ui.fill, msg, e, kind, list)
+    pcall(space.fill, msg, e, kind)
+  else
+    entity_ui.fill(msg, e, kind, list)
+    space.fill(msg, e, kind)
+  end
   machine_info.fill(msg, e, kind, space, sc.sent % RECIPE_LIST_EVERY == 0)
   -- How fast the craft goes, so the client draws the bar on between states (I26).
   if msg.pr then
@@ -388,7 +507,12 @@ local function open_entity(cmd, items)
   if not (sc and c and sc.entity.valid and tonumber(cmd.u) == sc.unit) then
     return nil
   end
-  if not puppet.can_reach(c, sc.entity) then
+  if sc.entity.type == "entity-ghost" then
+    if items then
+      puppet.message("Can't move items into a ghost")
+      return nil
+    end
+  elseif not puppet.can_reach(c, sc.entity) then
     if not remote_ok(c, sc) then
       close(s, "Out of reach")
       return nil
@@ -447,6 +571,22 @@ function M.refresh()
   end
 end
 
+-- Tells belt_sim to re-read a belt's lanes after an item was taken off or put on via the screen.
+function M.belt_lanes_changed(e)
+  if not (e and e.valid and e.unit_number) then
+    return
+  end
+  pcall(belt_sim.wake_unit, e.unit_number)
+  local keys = {}
+  local ok, lines = pcall(function() return e.get_max_transport_line_index() end)
+  for i = 1, ok and lines or 0 do
+    keys[#keys + 1] = e.unit_number * LANE_KEYS + i
+  end
+  if #keys > 0 then
+    belt_sim.resend({ l = keys })
+  end
+end
+
 ---------------------------------------------------------------------------------------------
 -- Commands
 
@@ -473,14 +613,19 @@ function M.open(cmd)
   -- A cargo bay opens its hub's or landing pad's window, as Factorio does (seen in 2.1.23); one on
   -- its own opens nothing.
   e = machine_info.bay_owner(e) or e
-  if entity_ui.NO_WINDOW[e.type] then
+  local t = inner_type(e)
+  local ip = inner_proto(e)
+  local ghost = e.type == "entity-ghost"
+  if entity_ui.NO_WINDOW[t] then
     return -- 2.1.23 opens no window for these
   end
   if e.force ~= c.force then
     return puppet.message("That belongs to another force")
   end
   local remote = false
-  if not puppet.can_reach(c, e) then
+  if ghost then
+    remote = true
+  elseif not puppet.can_reach(c, e) then
     if cmd.rv then
       map.watch_radars(e.surface)  -- from the command, so the same on every peer
     end
@@ -492,13 +637,17 @@ function M.open(cmd)
   local kind = kind_of(e)
   -- (A machine with fluid boxes has a screen even with no inventory: a boiler run on fluid,
   -- Corrundum's red boiler. 2.1 has no LuaEntity.fluidbox, so the prototype says.)
-  local ok_fb, boxes = pcall(function() return e.prototype.fluidbox_prototypes end)
+  local ok_fb, boxes = pcall(function() return ip.fluidbox_prototypes end)
   local fluid = ok_fb and type(boxes) == "table" and #boxes > 0
-  if kind == "other" and #inventories(e, kind) == 0 and not fluid and not circuits.signals(e) and not entity_ui.openable(e) then
+  local ok_ms, mod_size = pcall(function() return ip.module_inventory_size end)
+  local has_mods = ok_ms and type(mod_size) == "number" and mod_size > 0
+  local ghost_openable = ghost and GHOST_STATUS_OPENABLE[t] == true
+  if kind == "other" and #inventories(e, kind) == 0 and not fluid and not has_mods and not circuits.signals(e)
+      and not (not ghost and entity_ui.openable(e)) and not ghost_openable then
     return puppet.message("Nothing to open there")
   end
   s.screen = { entity = e, unit = e.unit_number, sent = 0, due = game.tick, remote = remote or nil,
-    ai = alt_mode.TYPES[e.type] and select(3, alt_mode.state(e)) or nil }
+    ai = alt_mode.TYPES[t] and select(3, alt_mode.state(e)) or nil }
   -- Mods that show their own window for a machine listen for on_gui_opened (as_player.lua).
   if not remote then
     as_player.opened(c, e)
@@ -620,7 +769,7 @@ local function type_command(types, fn, refusal)
     if not e then
       return
     end
-    if not types[e.type] then
+    if not types[inner_type(e)] then
       return puppet.message(refusal)
     end
     local ok, err = pcall(fn, e, cmd)
@@ -667,6 +816,7 @@ function M.set_bar(cmd)
   if not ok then
     puppet.message("This chest has no limit")
   end
+  M.refresh()
 end
 
 M.set_requests = chest_command(logistics.set_requests)
@@ -715,6 +865,13 @@ function M.set_recipe(cmd)
       give(c, k, v)
     end
   end
+  if e.type == "entity-ghost" then
+    tracker.changed(e)
+    local sc = storage.f3d.screen
+    if sc and sc.entity == e then
+      sc.ai = alt_mode.check(e, sc.ai)
+    end
+  end
   puppet.send_inventory_now()
 end
 
@@ -727,6 +884,51 @@ function M.take(cmd)
   local item = tostring(cmd.item or "")
   local want = count_arg(cmd)
   local moved, full = 0, false
+  if e.type == "inserter" and (cmd.inv == nil or cmd.inv == "hand") then
+    local okh, held = pcall(function() return e.held_stack end)
+    if okh and held and held.valid_for_read and (item == "" or held.name == item) and moved < want then
+      local okq, q = pcall(function() return held.quality.name end)
+      local stack = { name = held.name, count = math.min(want - moved, held.count), quality = okq and q or "normal" }
+      local inserted = c.insert(stack)
+      if inserted > 0 then
+        pcall(function()
+          if inserted >= held.count then
+            held.clear()
+          else
+            held.count = held.count - inserted
+          end
+        end)
+        moved = moved + inserted
+      else
+        full = true
+      end
+    end
+  elseif e.type == "transport-belt" and (cmd.inv == nil or cmd.inv == "belt_1" or cmd.inv == "belt_2") then
+    local lanes = cmd.inv == "belt_1" and { 1 } or (cmd.inv == "belt_2" and { 2 } or { 1, 2 })
+    local belt_moved = 0
+    for _, li in ipairs(lanes) do
+      local okl, line = pcall(function() return e.get_transport_line(li) end)
+      if okl and line then
+        for _, entry in pairs(line.get_contents()) do
+          if (item == "" or entry.name == item) and moved < want and not full then
+            local stack = { name = entry.name, count = math.min(want - moved, entry.count), quality = entry.quality }
+            local inserted = c.insert(stack)
+            if inserted > 0 then
+              stack.count = inserted
+              line.remove_item(stack)
+              moved = moved + inserted
+              belt_moved = belt_moved + inserted
+            else
+              full = true
+            end
+          end
+        end
+      end
+    end
+    if belt_moved > 0 then
+      M.belt_lanes_changed(e)
+    end
+  end
   for _, pair in ipairs(inventories(e, kind)) do
     if cmd.inv == nil or cmd.inv == pair[1] then
       local inventory = pair[2]
@@ -752,6 +954,9 @@ function M.take(cmd)
     puppet.message("Inventory full")
   end
   puppet.send_inventory_now()
+  for _, fn in ipairs(M.take_listeners) do
+    fn(c)
+  end
 end
 
 -- Puts up to n of an item from the character's main inventory into the machine, wherever the
@@ -797,7 +1002,7 @@ function M.tick()
   if not (c and sc.entity.valid) then
     return close(s)
   end
-  if not puppet.can_reach(c, sc.entity) and not remote_ok(c, sc) then
+  if sc.entity.type ~= "entity-ghost" and not puppet.can_reach(c, sc.entity) and not remote_ok(c, sc) then
     return close(s, "Out of reach")
   end
   sc.due = game.tick + INTERVAL

@@ -263,7 +263,15 @@ static func find_factorio_exe(search_again := false) -> String:
 	return _found_exe
 
 
+## Tests only: ZENITH_NO_FACTORIO=1 (tools/check.py --no-factorio, what CI's runners have) searches for no
+## Factorio install, Steam library or data folder; --factorio= / --factorio-data= still count. Players never set it.
+static func no_factorio() -> bool:
+	return OS.get_environment("ZENITH_NO_FACTORIO") == "1"
+
+
 static func _search_factorio_exe() -> String:
+	if no_factorio():
+		return ""
 	var candidates: Array[String] = []
 	var data := ItemIcons.factorio_data_dir()
 	if data != "":
@@ -323,6 +331,8 @@ static func _absolute(path: String) -> String:
 ## the other libraries listed in libraryfolders.vdf (Linux's and macOS's own folders elsewhere).
 static func _steam_libraries() -> Array[String]:
 	var out: Array[String] = []
+	if no_factorio():
+		return out
 	if OS.get_name() != "Windows":
 		var home := OS.get_environment("HOME")
 		for steam in [home.path_join(".steam/steam"), home.path_join(".local/share/Steam"),

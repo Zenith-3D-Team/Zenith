@@ -74,6 +74,10 @@ const PICTURE_ZOOM := 3.0
 const BurnerFx := preload("res://scripts/fx/burner_fx.gd")
 const SpriteFx := preload("res://scripts/fx/sprite_fx.gd")
 const Switches := preload("res://scripts/switches.gd")
+const RenderReads := preload("res://scripts/world/render_reads.gd")
+## Meta on a drawn piece: the seed point _pin_seeds gave it last (asking the renderer for the instance
+## parameter waits for the render thread, every frame while a preview is open).
+const PIN_META := &"f3d_seed_pin"
 
 ## Radians a second the model turns.
 const TURN_SPEED := 0.5
@@ -906,7 +910,7 @@ static func baked_rest_box(part: ModelLibrary.AnimPart) -> AABB:
 	var box := AABB()
 	var first := true
 	for s in part.mesh.get_surface_count():
-		var arrays := part.mesh.surface_get_arrays(s)
+		var arrays := RenderReads.arrays(part.mesh, s)
 		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
 		var skin: PackedFloat32Array = arrays[Mesh.ARRAY_CUSTOM3] if arrays[Mesh.ARRAY_CUSTOM3] != null else PackedFloat32Array()
 		for v in verts.size():
@@ -1045,8 +1049,12 @@ func _pin_seeds() -> void:
 	var pin := Vector3(at.x, 1.0, at.z)
 	for mi: Node in _holder.find_children("*", "GeometryInstance3D", true, false):
 		var g := mi as GeometryInstance3D
-		if g.get_instance_shader_parameter(&"f3d_seed_at") != pin:
+		if RenderReads.old:  # --render-reads=old: asked from the renderer, as before
+			if g.get_instance_shader_parameter(&"f3d_seed_at") != pin:
+				g.set_instance_shader_parameter(&"f3d_seed_at", pin)
+		elif not g.has_meta(PIN_META) or g.get_meta(PIN_META) != pin:  # (a null default counts as none)
 			g.set_instance_shader_parameter(&"f3d_seed_at", pin)
+			g.set_meta(PIN_META, pin)
 
 
 func _place(centre: Vector3, dist: float, radius: float) -> void:

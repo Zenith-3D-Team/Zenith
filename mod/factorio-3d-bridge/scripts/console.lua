@@ -9,6 +9,7 @@ local transport = require("scripts.transport")
 local puppet = require("scripts.puppet")
 local platforms = require("scripts.platforms")
 local link = require("scripts.link")
+local mod_gui = require("scripts.mod_gui")
 
 local M = {}
 
@@ -109,9 +110,9 @@ end
 -- part's share of the factor.
 function commands.evolution(words)
   local c = puppet.get()
-  local surface = words[1] and game.surfaces[words[1]] or (c and c.surface) or game.surfaces[1]
+  local surface = words[1] and game.surfaces[words[1]] or (not words[1] and ((c and c.surface) or game.surfaces[1])) or nil
   if not surface then
-    return { "No surface " .. tostring(words[1]) }
+    return { 'Surface "' .. tostring(words[1]) .. '" does not exist.' } -- core locale: surface-name-doesnt-exist
   end
   local enemy = game.forces["enemy"]
   local ok, factor, t, p, k = pcall(function()
@@ -135,15 +136,20 @@ function commands.evolution(words)
 end
 
 function commands.players(words)
-  local only_online = words[1] == "online" or words[1] == "o"
+  -- Factorio takes "online" / "o" and "count" / "c" in either order.
+  local only_online, only_count = false, false
+  for _, w in ipairs(words) do
+    only_online = only_online or w == "online" or w == "o"
+    only_count = only_count or w == "count" or w == "c"
+  end
   local list = {}
   for _, p in pairs(game.players) do
     if p.connected or not only_online then
       list[#list + 1] = "  " .. p.name .. (p.connected and " (online)" or "")
     end
   end
-  local lines = { string.format("Players (%d):", #list) }
-  if words[1] == "count" or words[1] == "c" then
+  local lines = { string.format(only_online and "Online players (%d):" or "Players (%d):", #list) }
+  if only_count then
     return lines
   end
   for _, l in ipairs(list) do
@@ -435,6 +441,12 @@ function M.register_remote()
     on_message = link.on_message,
     -- The event a client coming or going raises: {client, joined, player_index}.
     on_client = link.on_client,
+    -- {on_gui_text_changed, on_gui_checked_state_changed, on_gui_selection_state_changed,
+    -- on_gui_value_changed, on_gui_switch_state_changed, on_gui_elem_changed = event id}: what the player does to a mod's window in Zenith (a
+    -- textfield, checkbox, drop-down, list-box, slider, switch, choose-elem-button), raised with Factorio's field names
+    -- (element, player_index, text / state / selected_index / value / switch_state / element_value). A script can't raise
+    -- Factorio's own events of those names.
+    gui_events = mod_gui.events,
     -- send(client, channel, data): true, or false and why.
     send = link.send,
     -- {{client, player_index}, ...}, the first client first.

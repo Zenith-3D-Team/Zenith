@@ -1,6 +1,6 @@
 # Writing add-ons for Zenith
 
-An add-on is a GDScript program running inside Zenith that extends the camera, visuals, UI, weather, terrain, or sound via the versioned add-on API (**API `1.93`**).
+An add-on is a GDScript program running inside Zenith that extends the camera, visuals, UI, weather, terrain, or sound via the versioned add-on API (**API `1.95`**).
 
 > **Contents:** [Architecture](#architecture) · [Installing](#installing-an-add-on) · [Folder & dependencies](#the-folder) · [Entry script](#the-entry-script) · [The API](#the-api) · [Factorio mod link (`api.game`)](#messages-to-your-factorio-mod) · [Testing & errors](#testing)
 
@@ -10,7 +10,7 @@ An add-on is a GDScript program running inside Zenith that extends the camera, v
 flowchart LR
     PKG["Add-on folder or .zip<br/>addon.json + main.gd + scripts/"] --> LOADER["AddonLoader<br/>version/dependency order"]
     LOADER --> HOST["AddonHost<br/>permission toggle & lifecycle"]
-    HOST --> API["API 1.93 Modules<br/>camera, keys, world, character,<br/>view, ui, settings, terrain, shaders,<br/>sound, weather, creatures, updates, storage"]
+    HOST --> API["API 1.95 Modules<br/>camera, keys, world, character,<br/>view, ui, settings, terrain, shaders,<br/>sound, weather, creatures, updates, storage"]
     HOST <-- "api.game (best-effort 4 KB ext)" --> MOD["Optional Companion Factorio Mod<br/>remote.call('zenith', ...)"]
 ```
 
@@ -51,7 +51,7 @@ Zip `my-addon/` (`my-addon_<version>.zip`) containing `addon.json`, `main.gd`, a
 |---|---|
 | `id` | Lowercase `a-z`, `0-9`, `-`, `_` (`:` forbidden). Keys actions, `api.storage` folder, and node names. |
 | `name`, `version`, `description`, `author` | Displayed in the Add-ons menu, Mods window, and Settings → Controls. |
-| `api` | Minimum required API level (`1`, `1.1`..`1.9`, or `1.91`..`1.93`; note numeric levels: `1.91` follows `1.9`). Zenith refuses add-ons requiring a newer level. |
+| `api` | Minimum required API level (`1`, `1.1`..`1.9`, or `1.91`..`1.95`; note numeric levels: `1.91` follows `1.9`). Zenith refuses add-ons requiring a newer level. |
 | `entry` | Path to the entry `.gd` script inside the add-on folder. |
 | `dependencies` | *(1.7)* Optional array of required/optional/incompatible add-ons and `mod:<name>` Factorio mods. |
 
@@ -243,6 +243,9 @@ returns copies.
 | `cue_tick()` *(1.91)* | The tick a filmed scene starts on, for every add-on to time its part from: *(1.92)* the cue the game set while running (`set_cue`, see "Messages for add-ons and their mods"), else `--cue-tick=<game tick>` from Zenith's command line; `-1` when neither |
 | `stand_height_at(point)` *(1.7)* | How high the character would stand at a ground point (a `Vector2`), in tiles over the ground there: the drawn top of a belt, underground belt, splitter, loader, pipe-to-ground, heat pipe or ground rail (Factorio's character walks over these), the highest where several meet; 0 for bare ground and everything else. The model's top once it is in, else its placeholder's. This is the whole answer, uncapped: Zenith's own belt step-up uses only the belt family (belts, undergrounds, splitters, loaders, linked belts) and stands the body at most 0.3 tiles up. Cheap enough to ask each frame (a few box tests). From the prototype types only: a mod that changes what the character collides with isn't seen |
 | `hold_chunks(on)` *(1.6)* | While on, chunks the camera leaves aren't unloaded: the world keeps everything already drawn, as the bridge last sent it (it no longer updates chunks out of the view), and the chunks round the new focus still come. For a screenshot or a film of a long flight. Capped by memory: at most 1,600 chunks held past the view (a 40 x 40 square, about 1,300 tiles across), and fewer once the computer has under 1 GB of memory free; past either the held chunks farthest from the focus go first, and Zenith's log says so once. Held while any add-on asks; switching the add-on off lets them go |
+| `prepare_view(position, look, seconds = 2.0)` *(1.94)* | Announces where the camera will cut to (`position` the camera, `look` what it looks at, Godot's axes in tiles), so what is drawn there is at its levels of detail when the cut comes: models' levels, far chunks merged or whole, the cliff wall's levels are picked for the nearer of the camera and this viewpoint, made under the usual budgets meanwhile (no hitch at the cut). About a second ahead is enough; announce it again each frame for one that moves (looked at again once it moves 8 tiles). Kept `seconds` (at most 30) or until `release_view()`; one per add-on, let go when the add-on is switched off. The chunks must be loaded there (`hold_chunks`). Nothing with `--cut-lods=old` |
+| `release_view()` *(1.94)* | Lets the announced viewpoint go (after the cut): what was readied there goes back to the camera's levels |
+| `mark_cut()` *(1.94)* | The next frame is a cut: its levels of detail and far merges are picked in that frame without the frame budget and without cross-fades (one slower frame, hidden by the cut). The camera moving more than 32 tiles in one frame counts as a cut anyway |
 | `holding_chunks()`, `held_chunks()` *(1.6)* | Chunks are held now (by any add-on); how many are held past the view |
 | `daytime()`, `darkness()` | The time of day as drawn (0 noon, 0.5 midnight) and how dark it is (0 to 0.85) |
 | `planet()`, `on_platform()` | The planet shown, and whether it's a space platform |
@@ -688,6 +691,7 @@ Client-only enemy damage and death hooks, per-limb ragdoll shader helpers (`rig_
 | `make_ragdoll_leg_node(proto, limb_idx)` | *(1.9)* Extracts and returns an unparented single-limb `MeshInstance3D` centred around limb `limb_idx`'s bounding centroid (with `leg_centroid` metadata and the ragdoll/decay shader at `rig_mode = 0`), or `null` if unavailable |
 | `precut(proto, limbs := 0)` | *(Zenith 0.3.0; optional, check `has_method`)* Cuts `proto`'s three split parts and its first `limbs` legs on a worker thread, ahead of its first explosive death (each cut is 7-25 ms of GDScript). Call again later: `true` once they are cut or the model has none, `false` while the model loads or the cutting runs. Cuts are kept until that proto's model changes |
 | `make_ragdoll_part_node(proto, part)` | *(1.9)* Extracts and caches an unparented solid body-chunk `MeshInstance3D` for `part` (`"head"`, `"thorax"`, or `"abdomen"`) partitioned by Z relative to tier scale, with a closed bloody purple-violet inner-meat cross-section cap fan along cut boundaries, `part_centroid` metadata, and `RagdollShader` (`rig_mode = 0`), or `null` if unavailable |
+| `make_ragdoll_part_nodes(proto)` | *(1.95)* Returns `proto`'s animated sub-parts (`ModelLibrary.parts_for`, e.g. strafer and stomper upper and lower leg segments) as unparented `MeshInstance3D`s, each centred around its bounding centroid with cloned ragdoll `ShaderMaterial`s (`rig_mode = 0`, the planet's blood colour): an `Array` of `{"kind", "centroid", "node"}`, cached per prototype; `[]` until the model is ready or when it has none. Check `api.level >= 1.95` (or `has_method`) to keep working on an older Zenith |
 | `set_ragdoll_limbs(node, limbs, twists = [])` | *(1.9)* Sets `rig_ragdoll[12]` on all `ShaderMaterial` surfaces of `node` from a `PackedVector3Array` of per-limb `(swing, lift, knee)` angles in radians (up to 12 limbs); optional `twists` `PackedFloat32Array` sets `.w` twist radians (values `> 50.0` collapse a severed limb into its socket) |
 | `set_ragdoll_decay(node, decay, floor_y = NAN)` | *(1.9)* Sets `rig_decay` (`0..1`) and optional world ground height `rig_decay_floor` on all `ShaderMaterial` surfaces of `node` to drive organic corpse deflation, desiccation, and noise erosion |
 | `set_ragdoll_wounds(node, blood, holes)` | *(1.9)* Sets `rig_blood` (`0..1`) and up to 6 local mesh-space bullet/shrapnel impact craters (`rig_holes[6]`, each `Vector4(x, y, z, radius)`) on all `ShaderMaterial` surfaces of a ragdoll, detached limb, or split body chunk |
@@ -782,6 +786,7 @@ calls in its `zenith` remote interface. Depend on it optionally (`"? factorio-3d
 |---|---|
 | `on_message()` | The event a message arrives as: `{client, channel, data, player_index, machine}` (and Factorio's `name`, `tick`). `client` names one connected Zenith (a number, the same while it stays connected: key your own state by the character or the player, not by it); `player_index` the player whose character that Zenith plays (nil for the bridge's own character); `machine` the player whose machine the datagram came in on (0 on a server) |
 | `on_client()` | The event a Zenith connecting or leaving raises: `{client, joined, player_index}` |
+| `gui_events()` | `{on_gui_text_changed, on_gui_checked_state_changed, on_gui_selection_state_changed, on_gui_value_changed = event id}`: what the player does to a textfield, checkbox or radio button, drop-down or list-box, or slider of your window in Zenith (Settings > Interface > Show mods' windows; the player's own Factorio events of those names can't be raised by a script). Raised with `{element, player_index, text / state / selected_index / value / switch_state / element_value}`; the element's own `text`, `state`, `selected_index` or `slider_value` is set too, so a mod that reads it on a button press hears it as well |
 | `send(client, channel, data)` | To that Zenith's add-on: `true`, or `false` and why ("no such client", "bad channel", "bad data", "too big", "too many") |
 | `clients()` | `{ {client, player_index}, ... }`, the first one first |
 | `character(client)`, `player(client)`, `name(client)` | That Zenith's character (LuaEntity), its player (LuaPlayer, nil for the bridge's own), the player's name. Without an argument, as before |

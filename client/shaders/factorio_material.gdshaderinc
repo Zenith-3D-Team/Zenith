@@ -282,6 +282,7 @@ uniform float rig_decay_floor = 0.0;
 // Per-ragdoll / split-chunk bloodiness (0..1), charring/ember burn (0..1), and up to 6 model-space
 // bullet/shrapnel holes (xyz = impact pos in mesh-local space, w = radius > 0).
 uniform float rig_blood = 0.0;
+uniform vec3 rig_blood_color = vec3(0.135, 0.014, 0.095);
 uniform float rig_burn = 0.0;
 uniform vec4 rig_holes[6];
 // Factorio's alternative idle: 1 / prepared_alternative_speed (0.014) ticks long, at
@@ -687,6 +688,9 @@ uniform float anim_speed = 1.0;
 uniform float anim_open = 1.0;
 uniform bool anim_flicker = false;
 uniform bool anim_strike = false;
+// Radial pocket clip in model-space XZ for sliding silo blast doors: (cx, cz, radius); z <= 0 disables.
+uniform vec3 anim_clip_center = vec3(0.0);
+varying vec2 anim_pos_xz;
 // anim_mode 8, a modeller's baked (skeletal) animation (model_skin.gd): each bone's 3x4 matrix at each
 // frame, 3 texels a bone and a row a frame; each vertex's four bones and weights in CUSTOM3.
 uniform sampler2D bake_tex : filter_nearest;
@@ -996,6 +1000,7 @@ void vertex() {
 #endif
 	obj_pos = VERTEX;
 	obj_normal = NORMAL;
+	anim_pos_xz = VERTEX.xz;
 	part_col = CUSTOM1;
 	// The table isn't read here (the shadow and depth passes run this for every vertex): the
 	// instance's glow is worked out for the model, and each row takes it or not in fragment().
@@ -1213,6 +1218,7 @@ void vertex() {
 		world_y = (MODEL_MATRIX * vec4(VERTEX, 1.0)).y;
 	} else if (anim_mode > 0 && timed) {
 		anim_vertex(VERTEX, NORMAL, INSTANCE_CUSTOM);
+		anim_pos_xz = VERTEX.xz;
 		world_y = (MODEL_MATRIX * vec4(VERTEX, 1.0)).y;
 	}
 #ifdef ROBOT
@@ -1234,13 +1240,15 @@ void vertex() {
 #endif
 #ifdef RAGDOLL_DECAY
 	if (rig_decay > 0.001) {
-		vec3 wp = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+		float wp_y = (MODEL_MATRIX * vec4(VERTEX, 1.0)).y;
 		float flat_k = smoothstep(0.20, 0.85, rig_decay);
-		wp.y = mix(wp.y, rig_decay_floor + 0.03, flat_k * 0.78);
-		mat4 inv_m = inverse(MODEL_MATRIX);
-		VERTEX = (inv_m * vec4(wp, 1.0)).xyz;
-		vec3 local_up = normalize((inv_m * vec4(0.0, 1.0, 0.0, 0.0)).xyz);
-		NORMAL = normalize(mix(NORMAL, local_up, flat_k * 0.45));
+		float delta_y = mix(wp_y, rig_decay_floor + 0.03, flat_k * 0.78) - wp_y;
+		vec3 up_local = ground_up_in(MODEL_MATRIX, 1.0);
+		VERTEX += up_local * delta_y;
+		float up_len2 = dot(up_local, up_local);
+		if (up_len2 > 1e-12) {
+			NORMAL = normalize(mix(NORMAL, up_local * inversesqrt(up_len2), flat_k * 0.45));
+		}
 	}
 #endif
 	// The ground's height under every vertex (ground_height.gdshaderinc), last, so moving parts, rigs and
@@ -1328,6 +1336,9 @@ void fragment() {
 		if (f3d_lod_fade < 1.5 ? d >= f3d_lod_fade : d < f3d_lod_fade - 2.0) {
 			discard;
 		}
+	}
+	if (anim_clip_center.z > 0.0 && length(anim_pos_xz - anim_clip_center.xy) > anim_clip_center.z) {
+		discard;
 	}
 #ifdef LEAF_CUT
 	float leaf_shade = 1.0;
@@ -1885,7 +1896,7 @@ void fragment() {
 			float blotch = bn1 * 0.56 + bn2 * 0.44;
 			float thresh = mix(0.68, 0.47, b_amt);
 			float bmask = smoothstep(thresh - 0.04, thresh + 0.06, blotch) * clamp(b_amt * 1.15, 0.35, 0.92);
-			vec3 ichor_col = mix(vec3(0.055, 0.005, 0.038), vec3(0.135, 0.014, 0.095), bn2);
+			vec3 ichor_col = mix(rig_blood_color * 0.41, rig_blood_color, bn2);
 			ALBEDO = mix(ALBEDO, ichor_col, bmask * 0.86);
 			ROUGHNESS = mix(ROUGHNESS, f3d_organic_surface > 0.5 ? 0.30 : 0.22, bmask);
 			SPECULAR = mix(SPECULAR, f3d_organic_surface > 0.5 ? 0.42 : 0.52, bmask);
@@ -1906,11 +1917,11 @@ void fragment() {
 			float rim = smoothstep(0.45, 0.62, j_d) * (1.0 - smoothstep(0.82, 1.02, j_d));
 			float halo_env = smoothstep(0.75, 1.05, d) * (1.0 - smoothstep(1.35, 2.1, d));
 			float halo = halo_env * smoothstep(0.35, 0.72, hn + 0.15 * (1.0 - clamp(d / 2.1, 0.0, 1.0)));
-			vec3 halo_col = mix(vec3(0.060, 0.006, 0.042), vec3(0.145, 0.016, 0.105), hn);
+			vec3 halo_col = mix(rig_blood_color * 0.44, rig_blood_color * 1.07, hn);
 			ALBEDO = mix(ALBEDO, halo_col, halo * 0.75);
 			ROUGHNESS = mix(ROUGHNESS, 0.24, halo);
 			SPECULAR = mix(SPECULAR, 0.48, halo);
-			vec3 rim_col = vec3(0.032, 0.004, 0.025);
+			vec3 rim_col = rig_blood_color * 0.24;
 			ALBEDO = mix(ALBEDO, rim_col, rim * 0.85);
 			ROUGHNESS = mix(ROUGHNESS, 0.28, rim);
 			AO = mix(AO, 0.25, rim * 0.7);
@@ -1937,7 +1948,7 @@ void fragment() {
 			float blotch = bn1 * 0.56 + bn2 * 0.44;
 			float thresh = mix(0.68, 0.47, w_blood);
 			float bmask = smoothstep(thresh - 0.04, thresh + 0.06, blotch) * clamp(w_blood * 1.15, 0.35, 0.92);
-			vec3 ichor_col = mix(vec3(0.055, 0.005, 0.038), vec3(0.135, 0.014, 0.095), bn2);
+			vec3 ichor_col = mix(rig_blood_color * 0.41, rig_blood_color, bn2);
 			ALBEDO = mix(ALBEDO, ichor_col, bmask * 0.86);
 			ROUGHNESS = mix(ROUGHNESS, f3d_organic_surface > 0.5 ? 0.30 : 0.22, bmask);
 			SPECULAR = mix(SPECULAR, f3d_organic_surface > 0.5 ? 0.42 : 0.52, bmask);
@@ -2013,11 +2024,11 @@ void fragment() {
 				float rim = smoothstep(0.45, 0.62, j_d) * (1.0 - smoothstep(0.82, 1.02, j_d));
 				float halo_env = smoothstep(0.75, 1.05, d) * (1.0 - smoothstep(1.35, 2.1, d));
 				float halo = halo_env * smoothstep(0.35, 0.72, hn + 0.15 * (1.0 - clamp(d / 2.1, 0.0, 1.0)));
-				vec3 halo_col = mix(vec3(0.060, 0.006, 0.042), vec3(0.145, 0.016, 0.105), hn);
+				vec3 halo_col = mix(rig_blood_color * 0.44, rig_blood_color * 1.07, hn);
 				ALBEDO = mix(ALBEDO, halo_col, halo * 0.75);
 				ROUGHNESS = mix(ROUGHNESS, 0.24, halo);
 				SPECULAR = mix(SPECULAR, 0.48, halo);
-				vec3 rim_col = vec3(0.032, 0.004, 0.025);
+				vec3 rim_col = rig_blood_color * 0.24;
 				ALBEDO = mix(ALBEDO, rim_col, rim * 0.85);
 				ROUGHNESS = mix(ROUGHNESS, 0.28, rim);
 				AO = mix(AO, 0.25, rim * 0.7);

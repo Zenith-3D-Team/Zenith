@@ -30,6 +30,17 @@ godot --headless --audio-driver Dummy --path client --log-file art-src/check-log
 godot --headless --audio-driver Dummy --path client --log-file art-src/check-logs/belt_sim_bench.log -s res://tests/belt_sim_bench.gd -- --native
 ```
 
+CI's `ui` job builds the same sources for Linux with GCC 13 (`.github/workflows/tests.yml`), and there is no Linux
+compiler on the owner's PC. Two checks stand in for it:
+
+```bash
+python tools/native_portability_check.py      # fast suite (test_native_portability_check): std::cosf and the like,
+                                              # MSVC-only keywords/headers, `long`, %ld, exceptions, a std:: name
+                                              # without its own #include, #include case
+python tools/native_strict_check.py --godot-cpp <godot-cpp>   # Windows, by hand after C++ edits: cl /permissive-
+                                              # and Visual Studio's clang-tidy front end with MS compatibility off
+```
+
 *(Desktop `i5-6600K` benchmark on 12,800 items: `belt_sim.gd` 4.4 ms vs `BeltSimNative` 0.17 ms/tick; 80,000 items: 17.9 ms vs 0.16 ms/tick.)*
 
 ---
@@ -53,12 +64,16 @@ blender --background --factory-startup --python tools/models/preview.py -- out.p
 # Releases, repo health & network benchmarks
 python3 tools/code_health.py                     # 100-pt tech-debt & health scorecard
 python3 tools/release/leak_scan.py .             # ASCII + UTF-16LE privacy/path audit
-python3 tools/release/package.py                 # public release zip (--channel dev for a dev build)
+python3 tools/release/package.py                 # public release zip (--channel dev for the testing build)
+# --windows-template <exe>: export Windows with our own Godot template (tools/godot/build_template.ps1)
 python3 tools/release/build_mod_zip.py             # standalone mod zip
 python3 tools/net_cost.py [--port 34200]
 python3 tools/bench/compare_builds.py --before v0.1.2 --after v0.1.3
 powershell tools\bench\run_matrix.ps1 -Build "label=<path>|<args>" -Repeat 3
 python3 tools/bench/hybrid_cost.py
+python3 tools/bench/soak/soak.py --out <dir> --hours 4 --addons <folder of add-on zips> --save main=<zip> --plan default:main,low:main
+                                                 # hours-long windowed soak vs real Factorio: phases, every frame, memory, UPS
+python3 tools/bench/soak/analyze.py <dir> --json summary.json --md tables.md
 
 # UI reference comparison (art-src/ui_reference/) & Sprite gallery (art-src/compare/)
 python3 tools/ui_reference/capture.py [--only names] [--fresh]
@@ -86,6 +101,8 @@ python3 tools/check.py --done          # + full ui_test, model_load_test, model_
 python3 tools/check.py --all fast      # all fast Python/Lua/gdparse/model/code_health checks (~80s)
 python3 tools/check.py --all godot     # headless Godot tests (~2 min)
 python3 tools/check.py --all both      # full CI suite
+python3 tools/check.py --all godot --no-factorio   # as CI's runners see the PC: no Factorio install, Steam library or
+                                       # Factorio folders (ZENITH_NO_FACTORIO=1, tests only) and a fresh home/APPDATA
 ```
 
 `--all` writes full logs to `art-src/check-logs/` (`--logs <dir>`) and exits non-zero on the first failure. Individual suites include:
@@ -95,6 +112,7 @@ python3 tools/check.py --all both      # full CI suite
 | `tools/mod_tests/test_bridge.py` (+ `--binary`) | Bridge Lua 5.2 tests split across `bridge_world/01..09_*.py` vs strict `fake_factorio.lua` |
 | `tools/mod_tests/test_{fuzz,binary,data_stage,events}.py` | Packet fuzzing, binary frame parity, mod `gfx` data stage, duplicate event guards |
 | `tools/test_{mock_server,mock_fuzz,relay,protocol_sync}.py` | Mock UDP server, fuzzing, TCP relay reconnects, `PROTOCOL.md` table/version sync |
+| `tools/test_native_portability_check.py`, `tools/test_res_path_case.py` | C++ CI's GCC would reject; every `res://` / preload path's letter case as on disk (Linux is case-sensitive) |
 | `tools/test_{check,code_health,safe_delete}.py` + `gdparse` | `check.py` `AREAS` & `SECTION_ORDER` checks, health metrics, junction delete safety, GDScript syntax |
 | `tools/models/check.py` + `tools/release/test_package.py` | All 811 `.glb` budgets/origins/footprints; release packaging & dev-block stripping |
 | `client/tests/ui_test.tscn` (`16` `ui_area_*.gd` modules) | UI input/layout verification (`-- --only=<section>`) |

@@ -38,7 +38,7 @@ func _ready() -> void:
 	_music.bus = "Music"
 	_music.finished.connect(func(): _music_wait = randf_range(MUSIC_GAP.x, MUSIC_GAP.y))
 	add_child(_music)
-	_oneshot.bus = "Ambient"
+	_oneshot.bus = "Wind"
 	add_child(_oneshot)
 
 
@@ -87,7 +87,7 @@ func _build() -> void:
 		return
 	for b: Array in _amb.get("base", []):
 		var def: SoundBank.SoundDef = b[0]
-		var p := _loop_player(def)
+		var p := _loop_player(def, "Ambient")
 		if p != null:
 			_base.append([p, def, float(b[1])])
 	_wind_def = _amb.get("wind")
@@ -101,14 +101,14 @@ func _build() -> void:
 		_semi.append([def, float(s[1]), float(s[2]), s[3], randf_range(2.0, maxf(3.0, float(s[1]))), loop, float(s[4])])
 
 
-func _loop_player(def: SoundBank.SoundDef) -> AudioStreamPlayer:
+func _loop_player(def: SoundBank.SoundDef, bus := "Wind") -> AudioStreamPlayer:
 	if def == null or def.files.is_empty():
 		return null
 	var stream := SoundBank.stream(def.files[0], true)
 	if stream == null:
 		return null
 	var p := AudioStreamPlayer.new()
-	p.bus = "Ambient"
+	p.bus = bus
 	p.stream = stream
 	p.volume_db = -80.0
 	add_child(p)

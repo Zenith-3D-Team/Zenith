@@ -868,8 +868,8 @@ func _pipe_covers() -> void:
 	# (Headless, a MultiMesh keeps no transforms: where they go is asked of PipeCovers as chunk_view asks it.)
 	var places := PipeCovers.places(wet_drill.cover_ports, wet_drill.covers, ModelLibrary.placed("x-drill", "mining-drill", 0, {}, Vector3(4.5, 0, 4.5)))
 	var spots: Array = places.map(func(t: Transform3D) -> Vector2: return Vector2(t.origin.x, t.origin.z).snapped(Vector2(0.01, 0.01)))
-	check(cover != null and drawn_covers.size() == 3 and spots.has(Vector2(3.5, 4.5)) and spots.has(Vector2(5.5, 4.5))
-		and spots.has(Vector2(4.5, 5.5)), "three covers, on the connections' own tiles: %s" % [spots])
+	check(cover != null and drawn_covers.size() == 6 and spots.has(Vector2(3.5, 4.5)) and spots.has(Vector2(5.5, 4.5))
+		and spots.has(Vector2(4.5, 5.5)), "six covers (3 on x-drill + 3 fallback on y-drill), on the connections' own tiles: %s" % [spots])
 	var west: Variant = null
 	for t: Transform3D in places:
 		if is_equal_approx(t.origin.x, 3.5):
@@ -877,19 +877,19 @@ func _pipe_covers() -> void:
 	check(west != null and ((west as Transform3D).basis * Vector3(0, 0, -1)).is_equal_approx(Vector3(-1, 0, 0)),
 		"the west one turned to face west (its north edge outwards)")
 	check((world.entities[912] as WorldMirror.Rec).covers == 7 and _drawn(cv).has(ModelLibrary.mesh_for("y-drill")),
-		"a pack without covers draws none (its drill open, only the other's three drawn)")
+		"a pack without its own covers falls back to the active pipe cover pack (both drills covered)")
 	# A pipe west of it whose connections (the bridge's pc) reach east, back to the drill: that cover goes.
 	world._dirty.clear()
 	world._add([0, 73, 2 * 256 + 128, 4 * 256 + 128, 0, {"pc": 2}])
 	check(wet_drill.covers == 6 and world._dirty.has(Vector2i.ZERO), "a pipe connected on the west: its cover gone (%d)" % wet_drill.covers)
-	check((build.call() as Array).size() == 2, "and two covers drawn")
+	check((build.call() as Array).size() == 5, "and five covers drawn")
 	# One whose pc doesn't reach the drill (it runs north) leaves the south cover.
 	world._add([0, 73, 4 * 256 + 128, 6 * 256 + 128, 0, {"pc": 2}])
 	check(wet_drill.covers == 6, "a pipe beside the south connection not connected to it: still covered")
 	world._add([0, 73, 4 * 256 + 128, 6 * 256 + 128, 0, {"pc": 1, "gh": 73}])
 	check(wet_drill.covers == 6, "nor a ghost")
 	world._remove(WorldMirror.static_key(73, 2 * 256 + 128, 4 * 256 + 128))
-	check(wet_drill.covers == 7 and (build.call() as Array).size() == 3, "the pipe taken away: the cover back (%d)" % wet_drill.covers)
+	check(wet_drill.covers == 7 and (build.call() as Array).size() == 6, "the pipe taken away: the cover back (%d)" % wet_drill.covers)
 	# Another machine with a connection back onto the east one: a second drill beside it, west connection to east.
 	world._add([913, 71, 7 * 256 + 128, 4 * 256 + 128, 0, {"fa": 1}])
 	check(wet_drill.covers == 5 and (world.entities[913] as WorldMirror.Rec).covers == 6,
@@ -907,9 +907,9 @@ func _pipe_covers() -> void:
 	world._add([0, 73, 2 * 256 + 128, 4 * 256 + 128, 0, {"pc": 2}])
 	check(wet_drill.covers == 3, "a drill facing east: the pipe on the west meets its (turned) south connection (%d)" % wet_drill.covers)
 	world._remove(WorldMirror.static_key(73, 2 * 256 + 128, 4 * 256 + 128))
-	# The drill going dry (`aiu` fa) takes its covers away.
+	# The drill going dry (`aiu` fa) takes its covers away (y-drill's 3 fallback covers stay).
 	world._on_alt_fluids([[910, 0]])
-	check(wet_drill.covers == 0 and (build.call() as Array).is_empty(), "a drill gone dry: no covers")
+	check(wet_drill.covers == 0 and (build.call() as Array).size() == 3, "a drill gone dry: no covers on wet_drill (%d drawn from y-drill)" % (build.call() as Array).size())
 	world._on_alt_fluids([[910, 1]])
 	check(wet_drill.covers == 7, "wet again: covered again")
 	PipeCovers.enabled = false
@@ -927,7 +927,8 @@ func _pipe_covers() -> void:
 		[Vector3(0.9, 0.9, 0.11), Vector3(0, 0.5, 0.445)]])
 	_boxes_glb(kit.path_join("k-drill.glb"), [[Vector3(2.8, 1.0, 2.8), Vector3(0, 0.5, 0)]])
 	var saved := ModelLibrary.ModelPacks.packs
-	ModelLibrary.ModelPacks.configure(dir, ["dir:Kit"], [])
+	ModelLibrary.ModelPacks.configure(dir, ["dir:Kit"], ["dir:Covers", "dir:Plain"])
+	ModelLibrary.ModelPacks.wait()
 	ModelLibrary.ModelPacks.wait()
 	ModelLibrary.choices_changed([])
 	var pack := ModelLibrary.drawing_pack("k-drill", "mining-drill", {"fa": 1})
@@ -938,8 +939,209 @@ func _pipe_covers() -> void:
 	check(name == "pipe-ending-down@dir:Kit" and cap != null and box.position.z > -0.51 and box.end.z < -0.38
 		and box.size.x > 0.85, "a kit's cap taken off its ending, at the north edge: %s %s" % [name, box])
 	check(PipeCovers.cover(name, func(n: String) -> Mesh: return ModelLibrary.mesh_for(n)) == made, "made once")
+	# Bug #12: PipeInsides.wanted covers pipe endings/underground/covers, add_to_groups works without glass,
+	# and PipeCovers.cap_from falls back to outer-edge triangles when straight shares none.
+	check(PipeInsides.wanted("pipe-ending-down") and PipeInsides.wanted("pipe-straight-vertical-single")
+		and PipeInsides.wanted("pipe-to-ground") and PipeInsides.wanted("pipe-cover")
+		and not PipeInsides.wanted("assembling-machine-1"),
+		"#12: PipeInsides.wanted matches capped/underground pipe pieces")
+	var raw_arr := []
+	raw_arr.resize(Mesh.ARRAY_MAX)
+	raw_arr[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(0, 1, 0)])
+	raw_arr[Mesh.ARRAY_NORMAL] = PackedVector3Array([Vector3.BACK, Vector3.BACK, Vector3.BACK])
+	var ds_mat := StandardMaterial3D.new()
+	ds_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
+	var opaque_groups := [[[[ds_mat]], raw_arr]]
+	var added_tris := PipeInsides.add_to_groups(opaque_groups)
+	check(added_tris == 1 and (raw_arr[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() == 6,
+		"#12: PipeInsides.add_to_groups adds inward back-faces without a glass surface (%d)" % added_tris)
+	var edge_box := ArrayMesh.new()
+	var bmesh := BoxMesh.new()
+	bmesh.size = Vector3(0.4, 0.4, 0.1)
+	edge_box.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, bmesh.get_mesh_arrays())
+	var diff_straight := ArrayMesh.new()
+	var smesh := BoxMesh.new()
+	smesh.size = Vector3(2.0, 2.0, 2.0)
+	diff_straight.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, smesh.get_mesh_arrays())
+	var fb_cap := PipeCovers.cap_from(edge_box, diff_straight)
+	check(fb_cap != null and fb_cap.get_surface_count() > 0,
+		"#12: PipeCovers.cap_from boundary fallback extracts cap when straight shares no triangles")
+	# Batch 3 C8: flush pipe & drill caps (CAP_EDGE_Z = -0.505, --pipe-cap-edge=old, procedural cap).
+	var was_flush := PipeCovers.flush_edge
+	check(was_flush and is_equal_approx(PipeCovers.CAP_EDGE_Z, -0.505),
+		"C8: flush_edge defaults on with CAP_EDGE_Z == -0.505")
+	check(is_equal_approx(box.position.z, PipeCovers.CAP_EDGE_Z),
+		"C8: extracted kit cap front edge sits flush at CAP_EDGE_Z (-0.505, got %.4f)" % box.position.z)
+	var proc_cap := PipeCovers._procedural_cap(edge_box)
+	check(proc_cap != null and is_equal_approx(proc_cap.get_aabb().position.z, PipeCovers.CAP_EDGE_Z),
+		"C8: procedural cap sits flush at CAP_EDGE_Z (-0.505, got %.4f)" % (proc_cap.get_aabb().position.z if proc_cap != null else 0.0))
+	PipeCovers.flush_edge = false
+	var old_made := PipeCovers.cover(name, func(n: String) -> Mesh: return ModelLibrary.mesh_for(n))
+	var old_cap: Mesh = old_made[0] if not old_made.is_empty() else null
+	check(old_cap != null and old_cap != cap and absf(old_cap.get_aabb().position.z - PipeCovers.CAP_EDGE_Z) > 0.002,
+		"C8: --pipe-cap-edge=old invalidates cache and restores unshifted cap (%.4f)" % (old_cap.get_aabb().position.z if old_cap != null else 0.0))
+	PipeCovers.flush_edge = was_flush
 	ModelLibrary.ModelPacks.use(saved)
 	ModelLibrary.choices_changed([])
+
+	# --- Item #16: PipeCovers dominant plate Z, backface subtraction, PipeInsides wet drill, ghost caps, FACING_MODELS covers ---
+	const GhostsScript := preload("res://scripts/world/ghosts.gd")
+	const WireScript := preload("res://scripts/util/wire.gd")
+	check(PipeInsides.wanted("electric-mining-drill-wet") and PipeInsides.wanted("big-mining-drill-wet")
+		and not PipeInsides.wanted("electric-mining-drill"),
+		"Item #16: PipeInsides.wanted matches wet mining drills and excludes dry drills")
+	# Synthetic doubled-backface ending vs single-sided straight: reversed barrel triangles must NOT survive cap_from.
+	var barrel_box := BoxMesh.new()
+	barrel_box.size = Vector3(0.4, 0.4, 1.0)
+	var barrel_arr: Array = barrel_box.get_mesh_arrays()
+	var straight_m := ArrayMesh.new()
+	straight_m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, barrel_arr)
+	var cap_box := BoxMesh.new()
+	cap_box.size = Vector3(0.6, 0.6, 0.1)
+	var cap_arr: Array = cap_box.get_mesh_arrays()
+	var cap_verts: PackedVector3Array = cap_arr[Mesh.ARRAY_VERTEX]
+	for vi in cap_verts.size():
+		cap_verts[vi] += Vector3(0.0, 0.0, 0.5)
+	cap_arr[Mesh.ARRAY_VERTEX] = cap_verts
+	var ending_m := ArrayMesh.new()
+	ending_m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, barrel_arr)
+	# Append reversed barrel triangles (simulating PipeInsides doubled backfaces on ending).
+	var rev_arr: Array = barrel_arr.duplicate(true)
+	var ridx: PackedInt32Array = rev_arr[Mesh.ARRAY_INDEX]
+	for ti in range(0, ridx.size() - 2, 3):
+		var tmp := ridx[ti + 1]
+		ridx[ti + 1] = ridx[ti + 2]
+		ridx[ti + 2] = tmp
+	rev_arr[Mesh.ARRAY_INDEX] = ridx
+	ending_m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, rev_arr)
+	ending_m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, cap_arr)
+	ending_m.set_meta(PipeInsides.META, 12)
+	var sub_cap := PipeCovers.cap_from(ending_m, straight_m)
+	var sub_box := sub_cap.get_aabb() if sub_cap != null else AABB()
+	check(sub_cap != null and sub_box.size.z < 0.25 and is_equal_approx(sub_box.position.z, PipeCovers.CAP_EDGE_Z),
+		"Item #16: cap_from subtracts doubled-backface barrel triangles cleanly and aligns plate to CAP_EDGE_Z (box=%s)" % [sub_box])
+	# Builtin packs (`builtin:fue5` and `builtin:placeholders`): real pipe-ending-down minus pipe-straight-vertical.
+	for pack_id: String in ["builtin:fue5", "builtin:placeholders"]:
+		var end_name := PipeCovers.ENDING + "@" + pack_id
+		var str_name := PipeCovers.STRAIGHT + "@" + pack_id
+		var m_end := ModelLibrary.mesh_for(end_name)
+		var m_str := ModelLibrary.mesh_for(str_name)
+		if m_end != null and m_str != null:
+			var bcap := PipeCovers.cap_from(m_end, m_str)
+			var bbox := bcap.get_aabb() if bcap != null else AABB()
+			var cap_kept: Array = []
+			if bcap != null:
+				for si in bcap.get_surface_count():
+					var sarr: Array = bcap.surface_get_arrays(si)
+					var sidx: PackedInt32Array = sarr[Mesh.ARRAY_INDEX] if sarr[Mesh.ARRAY_INDEX] != null else PackedInt32Array()
+					if sidx.is_empty():
+						var sv: PackedVector3Array = sarr[Mesh.ARRAY_VERTEX]
+						sidx.resize(sv.size())
+						for k_i in sv.size():
+							sidx[k_i] = k_i
+					cap_kept.append([si, sidx])
+			var pz: float = PipeCovers._dominant_plate_z(bcap, cap_kept, Basis.IDENTITY, bbox.position.z, INF) if bcap != null else 0.0
+			check(bcap != null and bcap.get_surface_count() > 0 and bbox.size.z < 0.45
+				and pz <= PipeCovers.CAP_EDGE_Z + 0.01 and pz >= -0.60,
+				"Item #16 (%s): cap_from produces clean plate at target Z without barrel stub (plate_z=%.4f box=%s)" % [pack_id, pz, bbox])
+	# Ghosts.ghost_pieces / PipeCovers.ghost_cap_pieces: wet drill gets 3 caps, dry gets 0; pipe-to-ground gets 1 unless connected.
+	var ppack := ModelLibrary.drawing_pack("electric-mining-drill", "mining-drill", {"fa": 1}, 0)
+	var mesh_fn := func(n: String) -> Mesh:
+		return ModelLibrary.mesh_for(n)
+	var wet_caps := PipeCovers.ghost_cap_pieces("mining-drill", PipeCovers.WET_DRILL_PORTS, {"fa": 1}, 0, Vector2(4.5, 4.5), ppack, mesh_fn)
+	var dry_caps := PipeCovers.ghost_cap_pieces("mining-drill", PipeCovers.WET_DRILL_PORTS, {}, 0, Vector2(4.5, 4.5), ppack, mesh_fn)
+	var ug_open := PipeCovers.ghost_cap_pieces("pipe-to-ground", null, {}, 0, Vector2(4.5, 4.5), ppack, mesh_fn)
+	var ug_conn := PipeCovers.ghost_cap_pieces("pipe-to-ground", null, {"pc": 1}, 0, Vector2(4.5, 4.5), ppack, mesh_fn)
+	check(wet_caps.size() == 3 and dry_caps.is_empty() and ug_open.size() == 1 and ug_conn.is_empty(),
+		"Item #16: ghost_cap_pieces emits 3 caps for wet drill (%d), 0 for dry (%d), 1 for open pipe-to-ground (%d), 0 when pc connected (%d)" % [
+			wet_caps.size(), dry_caps.size(), ug_open.size(), ug_conn.size()])
+	# chunk_view._add_covers uses rec.dir (not base.basis, which stays north on FACING_MODELS entities).
+	var cv16 := ChunkView.new()
+	add_child(cv16)
+	var rec16 := WorldMirror.Rec.new()
+	rec16.pos = Vector2(5.5, 5.5)
+	rec16.dir = 4  # facing east
+	rec16.covers = 1  # port 0 only: [-1, 0, 12, "i"] -> turned east (90 deg CW in Factorio) lands at (0, -1) facing north
+	rec16.cover_ports = PipeCovers.ports(PipeCovers.WET_DRILL_PORTS, "mining-drill", 1)
+	var proto16 := ProtoDB.EntityProto.new()
+	proto16.name = "electric-mining-drill"
+	proto16.type = "mining-drill"
+	var by_m16 := {}
+	var recs_m16 := {}
+	var parts_m16 := {}
+	var north_base := Transform3D(Basis.IDENTITY, Vector3(5.5, 0.0, 5.5))
+	var cover_name16 := PipeCovers.model_for(ModelLibrary.drawing_pack(proto16.name, proto16.type, rec16.extra, rec16.dir))
+	if cover_name16 != "":
+		ModelLibrary.mesh_for(cover_name16)
+		if cover_name16.begins_with(PipeCovers.ENDING + "@"):
+			ModelLibrary.mesh_for(PipeCovers.STRAIGHT + cover_name16.substr(PipeCovers.ENDING.length()))
+		cv16._add_covers(rec16, proto16, north_base, by_m16, recs_m16, parts_m16)
+		var placed16: Array = []
+		for arr16: Array in by_m16.values():
+			placed16.append_array(arr16)
+		if not placed16.is_empty():
+			var xf16: Transform3D = placed16[0]
+			var expected_at := Transform3D(Basis(Vector3.UP, WireScript.direction_yaw(4)), Vector3(5.5, 0.0, 5.5))
+			var want_xf: Transform3D = PipeCovers.places(rec16.cover_ports, 1, expected_at)[0]
+			check(xf16.origin.is_equal_approx(want_xf.origin) and xf16.basis.is_equal_approx(want_xf.basis),
+				"Item #16: chunk_view._add_covers turns covers by rec.dir even when base.basis is north (%s vs %s)" % [xf16.origin, want_xf.origin])
+	cv16.queue_free()
+
+	# Bug batch 4 #3: inward-detail bolt caps (Vasillo Zenith pipe-cap) flip outward past CAP_EDGE_Z,
+	# and active top-priority pipe pack provides covers for buildings in lower-priority packs.
+	var saved_b4 := ModelLibrary.ModelPacks.packs
+	var dir_b4 := _fixture_packs("ui-test-pipe-covers-zenith", {}, [])
+	var top_dir := dir_b4.path_join("TopPipes")
+	var low_dir := dir_b4.path_join("LowerBld")
+	_boxes_glb(top_dir.path_join("pipe-straight-vertical.glb"), [[Vector3(0.9, 0.9, 1.0), Vector3(0.0, 0.5, 0.0)]])
+	# Ending = straight + recessed flat plate at z=-0.45 + bolt boss strictly inward (+Z at z=-0.39).
+	_boxes_glb(top_dir.path_join("pipe-ending-down.glb"), [
+		[Vector3(0.9, 0.9, 1.0), Vector3(0.0, 0.5, 0.0)],
+		[Vector3(0.9, 0.9, 0.002), Vector3(0.0, 0.5, -0.45)],
+		[Vector3(0.15, 0.15, 0.04), Vector3(0.30, 0.5, -0.39)],
+	])
+	_boxes_glb(low_dir.path_join("pipe-straight-vertical.glb"), [[Vector3(0.75, 0.75, 1.0), Vector3(0.0, 0.5, 0.0)]])
+	_boxes_glb(low_dir.path_join("pipe-ending-down.glb"), [
+		[Vector3(0.75, 0.75, 1.0), Vector3(0.0, 0.5, 0.0)],
+		[Vector3(0.75, 0.75, 0.10), Vector3(0.0, 0.5, -0.45)],
+	])
+	_boxes_glb(low_dir.path_join("z-boiler.glb"), [[Vector3(2.8, 1.5, 1.8), Vector3(0.0, 0.75, 0.0)]])
+	ModelLibrary.ModelPacks.configure(dir_b4, ["dir:TopPipes", "dir:LowerBld"], [])
+	ModelLibrary.ModelPacks.wait()
+	ModelLibrary.choices_changed([])
+	var bld_pack := ModelLibrary.drawing_pack("z-boiler", "boiler", {})
+	var was_follow := PipeCovers.follow_pipe_pack
+	PipeCovers.follow_pipe_pack = true
+	var follow_name := PipeCovers.model_for(bld_pack)
+	PipeCovers.follow_pipe_pack = false
+	var own_name := PipeCovers.model_for(bld_pack)
+	PipeCovers.follow_pipe_pack = was_follow
+	check(follow_name == "pipe-ending-down@dir:TopPipes" and own_name == "pipe-ending-down@dir:LowerBld",
+		"PipeCovers.model_for follows active pipe pack (%s) and --pipe-covers=own uses entity pack (%s)" % [follow_name, own_name])
+	var inw_made := PipeCovers.cover(follow_name, func(n: String) -> Mesh: return ModelLibrary.mesh_for(n))
+	var inw_cap: Mesh = inw_made[0] if not inw_made.is_empty() else null
+	var inw_box := inw_cap.get_aabb() if inw_cap != null else AABB()
+	var inw_kept := []
+	if inw_cap != null:
+		var arr0: Array = inw_cap.surface_get_arrays(0)
+		var idx0: Variant = arr0[Mesh.ARRAY_INDEX]
+		if idx0 is PackedInt32Array and not (idx0 as PackedInt32Array).is_empty():
+			inw_kept = [[0, idx0]]
+		else:
+			var v0: PackedVector3Array = arr0[Mesh.ARRAY_VERTEX]
+			inw_kept = [[0, PackedInt32Array(range(v0.size()))]]
+	var inw_pz := PipeCovers._dominant_plate_z(inw_cap, inw_kept, Basis.IDENTITY, inw_box.position.z, INF) if inw_cap != null else 0.0
+	PipeCovers.flush_edge = false
+	var unflip_made := PipeCovers.cover(follow_name, func(n: String) -> Mesh: return ModelLibrary.mesh_for(n))
+	var unflip_cap: Mesh = unflip_made[0] if not unflip_made.is_empty() else null
+	var unflip_box := unflip_cap.get_aabb() if unflip_cap != null else AABB()
+	PipeCovers.flush_edge = was_flush
+	check(inw_cap != null and inw_box.position.z < PipeCovers.CAP_EDGE_Z - 0.05 and absf(inw_pz - PipeCovers.CAP_EDGE_Z) < 0.01
+		and unflip_cap != null and unflip_box.position.z > -0.47,
+		"Inward bolt cap flips outward past CAP_EDGE_Z (box=%s pz=%.4f) while --pipe-cap-edge=old stays unflipped (%s)" % [inw_box, inw_pz, unflip_box])
+	ModelLibrary.ModelPacks.use(saved_b4)
+	ModelLibrary.choices_changed([])
+	_fixture_packs_done()
 
 
 ## A .glb of boxes ([[size, centre], ...]), one mesh each, sharing one material.
@@ -1321,9 +1523,20 @@ func _pipeline_vis(hud: Hud) -> void:
 	vis.update(first, null, false, null, eprops, {}, [])
 	var water := Color8(51, 102, 255)
 	water.a = 0.9
+	var want_surfs := 2 if PipelineMarks.show_pipe_joints else 1
+	check(PipelineMarks.show_pipe_joints == Switches.has("--pipeline-joints=old"),
+		"#10: PipelineMarks.show_pipe_joints is false by default and true with --pipeline-joints=old")
 	check(vis.shown.size() == 1 and (vis.shown[0].color as Color).is_equal_approx(water)
-		and vis.shown[0].mesh.visible and vis.shown[0].mesh.mesh.get_surface_count() == 2,
-		"N9: hovering a pipe shows its pipeline in the water's colour, joints and the underground run: %s" % [vis.shown.map(func(s): return s.color)])
+		and vis.shown[0].mesh.visible and vis.shown[0].mesh.mesh.get_surface_count() == want_surfs,
+		"N9: hovering a pipe shows its pipeline in the water's colour (%d surfaces): %s" % [
+			vis.shown[0].mesh.mesh.get_surface_count() if not vis.shown.is_empty() else -1,
+			vis.shown.map(func(s): return s.color)])
+	if not PipelineMarks.show_pipe_joints:
+		var was_joints := PipelineMarks.show_pipe_joints
+		PipelineMarks.show_pipe_joints = true
+		var f_old := PipelineMarks.segment_from(world, first, eprops)
+		check(f_old.jv.size() > 0, "#10: --pipeline-joints=old restores pipe joint quads (%d verts)" % f_old.jv.size())
+		PipelineMarks.show_pipe_joints = was_joints
 	var seg = vis.shown[0]
 	vis.update(world.entities.get(112), null, false, null, eprops, {}, [])
 	check(vis.shown.size() == 1 and vis.shown[0] == seg, "N9: another pipe of it shows the same pipeline, not found again")
@@ -1337,6 +1550,9 @@ func _pipeline_vis(hud: Hud) -> void:
 	# Alt-mode with a pipe held: every pipeline round the cursor; one with a pipeline alert red.
 	var pipe_proto: ProtoDB.EntityProto = world.protos.entity(61)
 	var alerts := [{"kind": "pipeline", "count": 1, "entities": [{"unit": 141}]}]
+	# Each update below is a frame of its own in the game: FrameBudget's per-frame floor cap starts again
+	# (this section runs in one engine frame after others that used it up).
+	FrameBudget.test_next_frame()
 	vis.update(null, pipe_proto, true, Vector2(5, 5), eprops, {}, alerts)
 	var lone = vis.shown.filter(func(s): return s.flood.units.has(141))
 	check(vis.shown.size() == 4 and lone.size() == 1 and (lone[0].color as Color).is_equal_approx(PipelineMarks.OVEREXTENDED)
@@ -1344,6 +1560,7 @@ func _pipeline_vis(hud: Hud) -> void:
 		"N9: a pipe held in Alt-mode shows every pipeline in view (4), the one with the alert's entity red: %d" % vis.shown.size())
 	vis.update(null, pipe_proto, false, Vector2(5, 5), eprops, {}, alerts)
 	check(vis.shown.is_empty() and vis._segs.all(func(s): return not s.mesh.visible), "N9: not without Alt-mode")
+	FrameBudget.test_next_frame()
 	vis.update(null, world.protos.entity(64), true, Vector2(5, 5), eprops, {}, [])
 	check(vis.shown.size() == 4, "N9: a pump held shows them too (a fluid entity)")
 	Settings.set_value("interface", "fluid_vis", false, false)
@@ -1569,6 +1786,9 @@ func _pipeline_vis_edges() -> void:
 		% [red_on, red_off, ox_on, ox_off, other_ox])
 
 	# The marks ride the hills: Factorio's overlay shader, lifted by ground_lift, just over the ground.
+	# Use w3 (which has an underground pair so marks exist even when show_pipe_joints is false).
+	vis7.world = w3
+	vis7.update(w3.entities.get(400), null, false, null, eprops, {}, [])
 	var mat: ShaderMaterial = vis7.shown[0].materials[0]
 	var lifted: bool = mat.shader.resource_path == "res://shaders/ground_overlay.gdshader" \
 		and mat.shader.code.contains("ground_lift(VERTEX") and mat.shader.code.contains("ground_height.gdshaderinc")
@@ -1790,6 +2010,27 @@ func _pipeline_vis_edges() -> void:
 		"N9 review: a dropped search's entities go back to the pipeline that held them (%s, %s), shown again without a new search" % [taken, back])
 	vo.free()
 
+	# Batch 2 #4: Alt-mode wide pipe range (world.view_radius vs RADIUS=2, --alt-pipe-range=old).
+	var wr_w: WorldMirror = new_world.call([Vector2i(0, 0), Vector2i(3, 0)])
+	wr_w.view_radius = 4
+	wr_w.set_focus(Vector2(16.0, 16.0))
+	wr_w._add([60001, 61, t.call(16.5), t.call(16.5), 0])
+	wr_w._add([60002, 61, t.call(100.5), t.call(16.5), 0])  # chunk (3, 0), outside RADIUS=2
+	var wr_vis := PipelineMarks.new()
+	wr_vis.world = wr_w
+	var was_wide := PipelineMarks.wide_range
+	PipelineMarks.wide_range = true
+	var wide_pipes := wr_vis._window_pipes(Vector2(16.5, 16.5))
+	check(wide_pipes.size() == 2,
+		"B2#4: wide_range includes Alt-mode pipes at chunk (3, 0) within view_radius=4 (%d pipes)" % wide_pipes.size())
+	PipelineMarks.wide_range = false
+	var narrow_pipes := wr_vis._window_pipes(Vector2(16.5, 16.5))
+	check(narrow_pipes.size() == 1,
+		"B2#4: --alt-pipe-range=old clamps Alt-mode pipes to RADIUS=2 chunk window (%d pipes)" % narrow_pipes.size())
+	PipelineMarks.wide_range = was_wide
+	wr_vis.free()
+	wr_w.free()
+
 
 func _pipe_fluid_icons() -> void:
 	var overlay := preload("res://scripts/ui/factorio/alt_overlay.gd")
@@ -1807,6 +2048,42 @@ func _pipe_fluid_icons() -> void:
 		if overlay.pipe_shows_icon(Vector2i(i / 2 + i % 2, i / 2)):
 			stairs += 1
 	check(stairs >= 4, "a staircase of pipes shows icons too: %d of 40" % stairs)
+
+
+## Alt-mode's train stop names (stop_labels.gd): hidden in normal play by default (map mode only);
+## with --stop-labels=alt enabled, shown over each stop near the focus while Alt-mode is on, rich text tags left out.
+func _stop_labels() -> void:
+	const StopLabelsScript := preload("res://scripts/world/stop_labels.gd")
+	var world := WorldMirror.new()
+	world.protos.add_entities([[44, "train-stop", "train-stop", -1, -1, 1, 1, 120, 120, 120, 2, 2]])
+	world.chunks[Vector2i.ZERO] = ChunkView.new()
+	world._add([601, 44, 6 * 256 + 128, 6 * 256 + 128, 0, {"n": "[item=iron-ore] Iron Pickup"}])
+	world._add([602, 44, 10 * 256 + 128, 6 * 256 + 128, 0, {"n": ""}])
+	var was_stop_on: bool = StopLabelsScript.enabled
+	var labels = StopLabelsScript.new()
+	labels.world = world
+	StopLabelsScript.enabled = false
+	labels.alt_mode = true
+	labels._process(1.0)
+	check(labels.shown() == 0, "train stop 3D names stay hidden in normal play by default even with Alt-mode on")
+	StopLabelsScript.enabled = true
+	labels.alt_mode = false
+	labels._process(1.0)
+	check(labels.shown() == 0, "no train stop names while Alt-mode is off (--stop-labels=alt)")
+	labels.alt_mode = true
+	labels._process(1.0)
+	check(labels.shown() == 1 and labels._labels[0].text == "Iron Pickup",
+		"Alt-mode (--stop-labels=alt) names a train stop (rich text tags left out, an unnamed one nothing): %d" % labels.shown())
+	world._add([603, 44, 12 * 256 + 128, 8 * 256 + 128, 0, {"n": "Smelter"}])
+	world.entities_changed.emit(Vector2i.ZERO)
+	labels._process(1.0)
+	check(labels.shown() == 2, "a stop built later is named too: %d" % labels.shown())
+	labels.alt_mode = false
+	labels._process(1.0)
+	check(labels.shown() == 0, "and the names go with Alt-mode")
+	StopLabelsScript.enabled = was_stop_on
+	labels.free()
+	world.free()
 
 
 ## K13: a repair pack (`iuse` "h") held, the left button on a building sends `repair` for it (its unit, the

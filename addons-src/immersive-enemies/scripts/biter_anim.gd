@@ -20,6 +20,12 @@ const TIER_GAIT := {
 	"medium-spitter": 1.12,
 	"big-spitter": 0.96,
 	"behemoth-spitter": 0.86,
+	"small-wriggler-pentapod": 1.30,
+	"medium-wriggler-pentapod": 1.10,
+	"big-wriggler-pentapod": 0.92,
+	"small-wriggler-pentapod-premature": 1.30,
+	"medium-wriggler-pentapod-premature": 1.10,
+	"big-wriggler-pentapod-premature": 0.92,
 }
 const TIER_BITE := {
 	"small-biter": 1.25,
@@ -30,6 +36,12 @@ const TIER_BITE := {
 	"medium-spitter": 1.15,
 	"big-spitter": 1.10,
 	"behemoth-spitter": 1.05,
+	"small-wriggler-pentapod": 1.25,
+	"medium-wriggler-pentapod": 1.15,
+	"big-wriggler-pentapod": 1.08,
+	"small-wriggler-pentapod-premature": 1.25,
+	"medium-wriggler-pentapod-premature": 1.15,
+	"big-wriggler-pentapod-premature": 1.08,
 }
 const TIER_FLINCH_SCALE := {
 	"small-biter": 1.25,
@@ -40,6 +52,12 @@ const TIER_FLINCH_SCALE := {
 	"medium-spitter": 1.10,
 	"big-spitter": 0.85,
 	"behemoth-spitter": 0.65,
+	"small-wriggler-pentapod": 1.35,
+	"medium-wriggler-pentapod": 1.10,
+	"big-wriggler-pentapod": 0.85,
+	"small-wriggler-pentapod-premature": 1.35,
+	"medium-wriggler-pentapod-premature": 1.10,
+	"big-wriggler-pentapod-premature": 0.85,
 }
 
 var api
@@ -68,7 +86,7 @@ func set_enabled(on: bool) -> void:
 
 
 func _is_supported(proto: String) -> bool:
-	return proto.ends_with("-biter") or proto.ends_with("-spitter")
+	return proto.ends_with("-biter") or proto.ends_with("-spitter") or proto.contains("-wriggler-pentapod")
 
 
 func on_damaged(info: Dictionary) -> void:
@@ -144,6 +162,7 @@ func step(dt: float) -> void:
 	var live: Array = []
 	live.append_array(api.creatures.list_live("biter") as Array)
 	live.append_array(api.creatures.list_live("spitter") as Array)
+	live.append_array(api.creatures.list_live("wriggler") as Array)
 	if live.is_empty():
 		if not _units.is_empty():
 			_prune_stale()

@@ -23,17 +23,22 @@ const TYPES := [
 	["Turret out of ammunition", "ammo-icon-red.png", "no_ammo"],
 	["Turret engaged with the enemy", "warning-icon.png", "fire"],
 	["Custom alert", "warning-icon.png", ""],
-	["Not enough logistic network storage", "no-storage-space-icon.png", ""],
+	["Not enough logistic network storage", "no-storage-space-icon.png", "no_storage"],
 	["Train out of fuel", "fuel-icon-red.png", "train_fuel"],
 	["Train cannot find path", "no-path-icon.png", "train_path"],
 	["Not enough platform hub storage", "no-platform-storage-space-icon.png", "platform_storage"],
 	["Asteroid collector blocked", "asteroid-collector-path-blocked-icon.png", "collector"],
 	["Unclaimed items waiting", "unclaimed-cargo-icon.png", ""],
-	["Not enough empty roboport robot slots", "no-roboport-storage-space-icon.png", ""],
+	["Not enough empty roboport robot slots", "no-roboport-storage-space-icon.png", "no_roboport_storage"],
 	["Pipeline overextended", "fluid-icon-red.png", "pipeline"],
 	["Fluids mixed", "fluid-icon-red.png", ""],
 	["Enemy expansion base detected", "biter-base-icon.png", ""],
 ]
+## The game's alert type names (defines.alert_type), in TYPES' order: what `/alerts` takes.
+const KEYS := ["entity_destroyed", "entity_under_attack", "not_enough_construction_robots", "no_material_for_construction",
+	"not_enough_repair_packs", "platform_tile_building_blocked", "turret_out_of_ammo", "turret_fire", "custom", "no_storage",
+	"train_out_of_fuel", "train_no_path", "no_platform_storage", "collector_path_blocked", "unclaimed_cargo",
+	"no_roboport_storage", "pipeline_overextended", "fluid_mixing", "expansion_base_built"]
 const COLUMNS := ["Icon", "Name", "Muted", "Disabled", "Latest"]
 const WIDTHS := [40, 260, 56, 64, 72]
 
@@ -80,6 +85,23 @@ func apply() -> void:
 			silent.append(str(t[2]))
 	alerts.hidden_kinds = hidden
 	alerts.muted_kinds = silent
+
+
+## `/alerts <enable | disable | mute | unmute> <alert>` (core locale: alert-muted, alert-already-muted ...,
+## available-alerts): the same choices as the table's boxes. The answer, "" never.
+func command(action: String, alert: String) -> String:
+	var which := "disabled" if action in ["enable", "disable"] else "muted"
+	var turn_on := action in ["disable", "mute"]
+	var i := KEYS.find(alert)
+	if i < 0 or not action in ["enable", "disable", "mute", "unmute"]:
+		return "Available alerts: %s." % ", ".join(PackedStringArray(KEYS))
+	var name: String = TYPES[i][0]
+	var now: bool = (disabled() if which == "disabled" else muted()).has(name)
+	var done: String = {"mute": "muted", "unmute": "unmuted", "disable": "disabled", "enable": "enabled"}[action]
+	if now == turn_on:
+		return "Alert type %s is already %s." % [alert, "muted" if action == "mute" else "disabled"] if turn_on 			else "Alert type %s isn't %s." % [alert, "muted" if action == "unmute" else "disabled"]
+	set_flag(name, which, turn_on)
+	return "Alert type %s has been %s." % [alert, done]
 
 
 func set_flag(name: String, which: String, on: bool) -> void:

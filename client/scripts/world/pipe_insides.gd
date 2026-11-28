@@ -18,22 +18,31 @@ const META := &"f3d_pipe_insides"
 const WELD := 0.0005
 
 
-## Whether a model of this file name is a windowed pipe piece to check.
+## Whether a model of this file name is a windowed, capped, or wet-drill pipe piece to check.
 static func wanted(file_name: String) -> bool:
-	return enabled and file_name.contains("pipe") and file_name.ends_with("-window")
+	if not enabled:
+		return false
+	if file_name == "electric-mining-drill-wet" or file_name.ends_with("-mining-drill-wet"):
+		return true
+	if not file_name.contains("pipe"):
+		return false
+	return file_name.ends_with("-window") \
+		or file_name.contains("pipe-ending-") \
+		or file_name.ends_with("pipe-straight-vertical-single") \
+		or file_name.contains("pipe-to-ground") \
+		or file_name.ends_with("pipe-cover")
 
 
-## Adds inward faces to every double-sided opaque surface in `groups` when the model also carries a
-## transparent window surface. Returns total back-face triangles added.
+## Adds inward faces to every double-sided opaque surface in `groups` (when a transparent window
+## surface is present, skips the inner cylinder wall inside `glass_box`). Returns total back-face
+## triangles added.
 static func add_to_groups(groups: Array) -> int:
-	var has_glass := false
 	var glass_box := AABB()
 	var any_glass_vert := false
 	for g: Array in groups:
 		var keys: Array = g[0]
 		if not _has_see_through(keys):
 			continue
-		has_glass = true
 		var arrays: Array = g[1]
 		var verts: Variant = arrays[Mesh.ARRAY_VERTEX]
 		if verts is PackedVector3Array:
@@ -43,8 +52,6 @@ static func add_to_groups(groups: Array) -> int:
 				else:
 					glass_box = AABB(v, Vector3.ZERO)
 					any_glass_vert = true
-	if not has_glass:
-		return 0
 	var total := 0
 	for g: Array in groups:
 		var keys: Array = g[0]
@@ -80,7 +87,7 @@ static func _wants_inside(keys: Array) -> bool:
 		if _is_see_through(base):
 			return false
 		var t := base.transparency
-		if t != BaseMaterial3D.TRANSPARENCY_DISABLED:
+		if t != BaseMaterial3D.TRANSPARENCY_DISABLED and t != BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR:
 			return false
 		var name := base.resource_name.to_lower()
 		if name.begins_with("leafcard") or name.begins_with("leaf-shadow") or name.begins_with("leaf-0"):

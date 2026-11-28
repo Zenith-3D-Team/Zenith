@@ -89,12 +89,18 @@ def resolve(spec, work, repo):
         if not zip_path.exists():
             log(f"fetching {spec}'s Windows download")
             subprocess.run(["gh", "release", "download", spec, "-R", repo, "-p", zip_path.name, "-D", str(dl), "--clobber"], check=True)
-    dest = work / "builds" / label
+    dest = work / "builds" / slug(label)
     if not dest.exists():
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(dest)
     inner = next((d for d in dest.iterdir() if (d / "Zenith.exe").exists()), dest)
     return Build(label, inner)
+
+
+def slug(text):
+    """A label as one safe folder name: a path's drive, slashes and colons can't make it absolute."""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._")
+    return s[-60:] or "build"
 
 
 # --- one run --------------------------------------------------------------------------------------
@@ -265,7 +271,7 @@ def main():
     for p in (ports[0], ports[3]):
         if not port_free(p):
             sys.exit(f"port {p} is in use")
-    out = pathlib.Path(a.out) if a.out else ROOT / "art-src" / "bench" / f"{a.before}-vs-{a.after}".replace("/", "_")
+    out = pathlib.Path(a.out) if a.out else ROOT / "art-src" / "bench" / f"{slug(a.before)}-vs-{slug(a.after)}"
     out.mkdir(parents=True, exist_ok=True)
     builds = [resolve(a.before, out, a.repo), resolve(a.after, out, a.repo)]
     labels = [a.before, a.after]
@@ -273,9 +279,11 @@ def main():
     for scenario in a.scenarios.split(","):
         results[scenario] = {labels[0]: [], labels[1]: []}
         for i in range(a.runs):
-            for build, label in zip(builds, labels):
+            for bi, (build, label) in enumerate(zip(builds, labels)):
                 log(f"{scenario} run {i + 1}: {label}")
-                r = run_once(build, scenario, out / scenario / f"{label}-{i + 1}".replace("/", "_"), ports)
+                # Each build + scenario + run its own folder under out (a label that is a path stays a name).
+                run_dir = out / "runs" / f"{bi + 1}-{slug(build.label)}" / f"{scenario}-{i + 1}"
+                r = run_once(build, scenario, run_dir, ports)
                 log("  ", json.dumps({k: round(v, 2) if isinstance(v, float) else v for k, v in r.items()}))
                 results[scenario][label].append(r)
                 (out / "results.json").write_text(json.dumps(results, indent=1))

@@ -6,6 +6,7 @@ local transport = require("scripts.transport")
 local world = require("scripts.world")
 local map = require("scripts.map")
 local rate = require("scripts.rate")
+local perf = require("scripts.perf")
 
 local M = {}
 
@@ -13,19 +14,31 @@ local SWEEP = 6          -- ticks between reports (a gun turret fires every 6)
 local REFRESH = 60       -- ticks between looking for the turrets in range
 local FULL = 120         -- ticks between reports of every turret, idle ones too
 local RECORDS_PER_MESSAGE = 200
+local MAX_AMMO_SHOTS_PER_SWEEP = 8
 -- Ticks between `tf` cues per turret, by what it fires (see M.on_hit).
 local FIRE_INTERVAL = { bullet = 2, laser = 4, flame = 6 }
 local LONGEST_FIRE_INTERVAL = 6
+-- What a gun that never names a target fires (artillery, a vehicle's rockets and shells): an ammo
+-- drop counts as shots (turret_ammo_check) only while one of its force's projectiles flies within
+-- this reach of it, so ammo taken out by hand isn't shown as firing. Tiles a tick since the last
+-- report (artillery and cannon shells start at 1 tile a tick, rockets slower), plus the muzzle's
+-- distance, up to a limit.
+local PROJECTILE_TYPES = { "artillery-projectile", "projectile" }
+local PROJECTILE_REACH_PER_TICK = 1.2
+local PROJECTILE_REACH_BASE = 4
+local PROJECTILE_REACH_MAX = 48
 
 -- Entity type -> how to read it: the inventory with its ammo, and where its weapon points.
 local KINDS = {
   ["ammo-turret"] = { inv = "turret_ammo", aim = "orientation" },
   ["electric-turret"] = { aim = "orientation", hits = true },
   ["fluid-turret"] = { aim = "orientation", hits = true },
-  ["artillery-turret"] = { inv = "artillery_turret_ammo", aim = "relative_turret_orientation" },
-  ["artillery-wagon"] = { inv = "artillery_wagon_ammo", aim = "relative_turret_orientation", vehicle = true },
-  ["car"] = { inv = "car_ammo", aim = "relative_turret_orientation", vehicle = true, gunner = true },
-  ["spider-vehicle"] = { inv = "spider_ammo", aim = "torso_orientation", vehicle = true, gunner = true },
+  -- `projectile`: no target to read when it fires by itself (artillery has no shooting_target in
+  -- 2.1.x; a spidertron's automatic rockets, a vehicle without a shooting gunner), see PROJECTILE_TYPES.
+  ["artillery-turret"] = { inv = "artillery_turret_ammo", aim = "relative_turret_orientation", projectile = true },
+  ["artillery-wagon"] = { inv = "artillery_wagon_ammo", aim = "relative_turret_orientation", vehicle = true, projectile = true },
+  ["car"] = { inv = "car_ammo", aim = "relative_turret_orientation", vehicle = true, gunner = true, projectile = true },
+  ["spider-vehicle"] = { inv = "spider_ammo", aim = "torso_orientation", vehicle = true, gunner = true, projectile = true },
 }
 local TYPES = {}
 for t in pairs(KINDS) do
@@ -140,9 +153,20 @@ local function find(s)
   end
 end
 
+-- Whether one of `e`'s force's projectiles flies near it: shot within the `elapsed` ticks since
+-- its last report (only looked for when its ammo went down without a target).
+local function projectile_near(e, elapsed)
+  local reach = math.min(PROJECTILE_REACH_MAX, PROJECTILE_REACH_BASE + PROJECTILE_REACH_PER_TICK * math.max(SWEEP, elapsed))
+  local ok, found = pcall(function()
+    return e.surface.find_entities_filtered({ position = e.position, radius = reach, type = PROJECTILE_TYPES,
+      force = e.force, limit = 1 })
+  end)
+  return ok and found and #found > 0 or false
+end
+
 -- [unit, orientation (thousandths of a turn), shots since the last report, selected gun,
 --  target x, target y (1/256 tiles; left out without a target)]
-local function record(e, kind, last, hits, full)
+local function record(e, kind, last, hits, fire_ticks, full)
   local unit = e.unit_number
   local o = read(e, kind.aim) or 0
   local o_fixed = math.floor(o * 1000 + 0.5) % 1000
@@ -153,18 +177,31 @@ local function record(e, kind, last, hits, full)
     local t = read(e, "shooting_target")
     target = t and t.valid and t.position or nil
   end
+  local ammo_check = perf.on("turret_ammo_check") ~= false
   local shots = 0
   local now = rounds(e, kind)
   local prev = last[unit]
   if now then
     if prev and prev.rounds and now < prev.rounds then
-      shots = prev.rounds - now
+      local delta = prev.rounds - now
+      if ammo_check then
+        local fired_recently = target ~= nil or prev.had_target == true or hits[unit] == true
+          or (fire_ticks and fire_ticks[unit] and game.tick - fire_ticks[unit] <= SWEEP)
+        if not fired_recently and kind.projectile then
+          fired_recently = projectile_near(e, game.tick - (prev.tick or (game.tick - SWEEP)))
+        end
+        if fired_recently then
+          shots = math.min(delta, MAX_AMMO_SHOTS_PER_SWEEP)
+        end
+      else
+        shots = delta
+      end
     end
   elseif kind.hits and hits[unit] then
     shots = 1
   end
   hits[unit] = nil
-  last[unit] = { rounds = now, o = o_fixed }
+  last[unit] = { rounds = now, o = o_fixed, had_target = target ~= nil, tick = game.tick }
   if not (full or target or shots > 0 or (prev and prev.o ~= o_fixed)) then
     return nil
   end
@@ -196,7 +233,7 @@ function M.tick()
   local seen = map.view_filter()
   for unit, e in pairs(s.turrets) do
     if e.valid and near_focus(e) then
-      local rec = record(e, KINDS[e.type], s.turret_last, s.turret_hits, full)
+      local rec = record(e, KINDS[e.type], s.turret_last, s.turret_hits, s.turret_fire_ticks, full)
       if rec and seen and not seen(e.position.x, e.position.y) then
         rec = nil
       end

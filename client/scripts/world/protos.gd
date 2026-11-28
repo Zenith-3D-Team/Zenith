@@ -88,7 +88,7 @@ var item_places := {}  # item name -> the entity it builds, when that has anothe
 ## instead of opening the turret (issue #2). The mod also says so (iprotos' "" third value).
 const NEVER_PLACED := {"projectile": true, "artillery-projectile": true, "explosion": true, "smoke-with-trigger": true,
 	"sticker": true, "stream": true, "fire": true, "beam": true, "particle-source": true, "corpse": true,
-	"character-corpse": true, "speech-bubble": true, "flying-text": true, "highlight-box": true}
+	"character-corpse": true, "speech-bubble": true, "flying-text": true, "highlight-box": true, "resource": true}
 
 
 func clear() -> void:

@@ -801,12 +801,13 @@ def check_build_tools(c, hello):
     con, land, gren, cliff = (iuse.get(k) for k in (("concrete", "t"), ("landfill", "t"), ("grenade", "c"), ("cliff-explosives", "c")))
     live_lib.report(con and tid["grass-1"] in con[4] and tid["water"] not in con[4] and land and tid["water"] in land[4]
            and tid["grass-1"] not in land[4] and iuse.get(("hazard-concrete", "t"), [0, 0, 0, ""])[3] == "hazard-concrete-right"
-           and gren and gren[2] == "throw" and gren[3] == 15 and cliff and cliff[2:] == ["destroy-cliffs", 10, 1.5]
+           and gren and gren[2] == "throw" and gren[3] == 15 and cliff and cliff[2:5] == ["destroy-cliffs", 10, 1.5]
+           and len(cliff) == 6 and cliff[5] > 0 and len(gren) == 6 and gren[5] > 0
            and iuse.get(("rail", "r"), [0, 0, ""])[2] == "rail-support" and ("rail-ramp", "r") not in iuse
            and iuse.get(("transport-belt", "b"), [0, 0, ""])[2] == "underground-belt"
            and iuse.get(("pipe", "p"), [0, 0, ""])[2] == "pipe-to-ground",
            "iuse: place_as_tile_result (condition, tile_condition), hazard concrete's next_direction, capsule_action, "
-           "the rail planner's support, related_underground_belt", f"{con and con[:4]} {land and land[:4]} {gren} {cliff}")
+           "the rail planner's support, related_underground_belt, capsules' cooldown ticks", f"{con and con[:4]} {land and land[:4]} {gren} {cliff}")
 
     if not live_lib.clean_spot(c, hello, half=16):
         live_lib.report(False, "build tools: no clean spot found", live_lib.SPOT_WHY)
@@ -921,6 +922,33 @@ def check_build_tools(c, hello):
     msgs += c.pump(1.0, every=hello)
     live_lib.report(live_lib.inv_count("grenade") == 2 and any(m["text"] == "Out of range" for m in live_lib.of_type(msgs, "msg")),
            "throw: a grenade at the cursor (LuaItemStack.use_capsule, one used), none out of its range", f"projectiles {proj}, inv {live_lib.inv_count('grenade')}")
+    # The discharge defense remote ("equipment-remote": used from a script inventory's stack, there is none in the inventory):
+    # it fires the worn discharge defense, which spends its charge on an enemy in range.
+    out = live_lib.mod_lua(f"""local c = storage.f3d.puppet local arm = c.get_inventory(defines.inventory.character_armor)[1]
+local had = arm.valid_for_read
+if not had then arm.set_stack({{ name = 'power-armor-mk2' }}) end
+local g = c.grid
+local eq = g.put({{ name = 'discharge-defense-equipment' }})
+local bat = g.put({{ name = 'battery-mk2-equipment' }})
+if not eq then rcon.print('noeq') return end
+eq.energy = eq.max_energy
+local b = c.surface.create_entity({{ name = 'small-biter', position = {{ {x + 5}, {y} }}, force = 'enemy' }})
+storage.f3d_dd = {{ had = had, biter = b }}
+rcon.print('ok ' .. eq.energy)""".replace("\n", " "))
+    if out.startswith("ok"):
+        c.send({"t": "throw", "item": "discharge-defense-remote", "x": fx(x + 5), "y": fx(y)})
+        msgs = c.pump(2.0, every=hello)
+        after = live_lib.mod_lua("local g = storage.f3d.puppet.grid local e for _, q in pairs(g.equipment) do if q.name == 'discharge-defense-equipment' then e = q end end "
+                        "local b = storage.f3d_dd.biter rcon.print((e and e.energy or -1) .. ' ' .. ((b and b.valid) and b.health or 'dead'))")
+        parts = after.split()
+        spent = len(parts) == 2 and float(parts[0]) < float(out.split()[1])
+        live_lib.report(spent and not any(m["text"].startswith("Can't use") for m in live_lib.of_type(msgs, "msg")),
+               "throw: the discharge defense remote fires the worn discharge defense at an enemy (LuaItemStack.use_capsule, equipment-remote)",
+               f"energy {out.split()[1]} -> {parts[:1]}, biter {parts[1:]}, msgs {[m['text'] for m in live_lib.of_type(msgs, 'msg')]}")
+    else:
+        live_lib.report(False, "discharge defense remote: couldn't set up the equipment grid", out[:200])
+    live_lib.mod_lua("local c = storage.f3d.puppet local d = storage.f3d_dd if d then if d.biter and d.biter.valid then d.biter.destroy() end "
+            "c.grid.clear() if not d.had then c.get_inventory(defines.inventory.character_armor)[1].clear() end storage.f3d_dd = nil end")
     out = live_lib.mod_lua(f"local c = storage.f3d.puppet local e = c.surface.create_entity({{ name = 'cliff', position = {{ {bx + 6}, {by + 5} }}, "
                   "cliff_orientation = 'west-to-east' }) rcon.print(e and (e.position.x .. ' ' .. e.position.y) or 'none')")
     if out != "none":
@@ -1602,3 +1630,57 @@ rcon.print(table.concat(r, ' '))""".replace("\n", " "))
               f"(game ids {game[a]} and {game[b]}); the client {'joins' if group.get(a) == group.get(b) else 'stops at'} the boiler")
     print("  INFO N9: game segment ids:", ", ".join(f"{names[u]} {u}={game[u]}" for u in game))
     live_lib.mod_lua("for _, e in ipairs(storage.f3d_n9 or {}) do if e.valid then e.destroy() end end storage.f3d_n9 = nil")
+
+
+def check_build_rules(c, hello):
+    """Differential of the build cursor's rules against the game (bughunt build2): eprops' `fg` (fast_replaceable_group),
+    `cb` (collision box) and `wb` (water stops it) read the way player_input.gd `_blocked` does, against
+    LuaSurface.can_fast_replace / can_place_entity on a scratch lake and tree."""
+    ep = {n: (((c.eprops or {}).get(c.proto_id(n)) or [None] * 4)[3:] or [{}])[0] or {} for n in (
+        "pipe", "pipe-to-ground", "small-electric-pole", "medium-electric-pole", "big-electric-pole", "inserter", "fast-inserter", "long-handed-inserter",
+        "wooden-chest", "steel-chest", "storage-tank", "tree-01", "transport-belt", "splitter", "underground-belt", "stone-wall", "gate",
+        "assembling-machine-1", "assembling-machine-2", "steel-furnace", "electric-furnace", "burner-mining-drill", "electric-mining-drill",
+        "rail-signal", "rail-chain-signal")}
+    fg = lambda n: ep[n].get("fg", "")
+    live_lib.report(fg("small-electric-pole") == fg("medium-electric-pole") != fg("big-electric-pole") and fg("inserter") == fg("fast-inserter") != fg("long-handed-inserter")
+           and fg("wooden-chest") == fg("steel-chest") and fg("rail-signal") == fg("rail-chain-signal") != "" and fg("transport-belt") == fg("splitter") == fg("underground-belt"),
+           "build rules: eprops fg groups poles (small and medium, not big), inserters (not long-handed), chests, rail signals, belts",
+           str({n: fg(n) for n in ep}))
+    live_lib.report(ep["tree-01"].get("cb") and ep["wooden-chest"].get("wb") == 1 and "wb" not in ep["tree-01"],
+           "build rules: eprops cb for a tree (its crown is selectable, not solid) and wb for a chest (water stops it)", str((ep["tree-01"], ep["wooden-chest"])))
+    # The game's answers; the rule the client applies: the same non-empty group and the same tile size (belts: any size).
+    pairs = [("big-electric-pole", "small-electric-pole"), ("medium-electric-pole", "small-electric-pole"), ("small-electric-pole", "medium-electric-pole"),
+             ("long-handed-inserter", "inserter"), ("fast-inserter", "inserter"), ("steel-chest", "wooden-chest"), ("stone-wall", "wooden-chest"),
+             ("gate", "stone-wall"), ("assembling-machine-2", "assembling-machine-1"), ("electric-furnace", "steel-furnace"),
+             ("electric-mining-drill", "burner-mining-drill"), ("burner-mining-drill", "electric-mining-drill"), ("splitter", "transport-belt"),
+             ("underground-belt", "transport-belt"), ("storage-tank", "pipe"), ("pipe-to-ground", "pipe")]
+    sizes = live_lib.mod_lua("local o = {} for _, n in pairs({ " + ", ".join(f'"{n}"' for p in pairs for n in p) + " }) do local p = prototypes.entity[n] "
+                    "o[#o + 1] = n .. '=' .. p.tile_width .. 'x' .. p.tile_height end rcon.print(table.concat(o, ' '))")
+    size = dict(kv.split("=") for kv in sizes.split())
+    out = live_lib.mod_lua(
+        "local s = game.surfaces.nauvis local ox, oy = 100, 100 s.request_to_generate_chunks({ ox, oy }, 3) s.force_generate_chunk_requests() "
+        "local o = {} for _, p in pairs({ " + ", ".join("{ '%s', '%s' }" % pr for pr in pairs) + " }) do "
+        "for _, e in pairs(s.find_entities_filtered({ area = { { ox - 10, oy - 10 }, { ox + 10, oy + 10 } } })) do if e.type ~= 'character' then e.destroy() end end "
+        "local b = s.create_entity({ name = p[2], position = { ox + 0.5, oy + 0.5 }, force = 'player' }) "
+        "local w = prototypes.entity[p[1]].tile_width local pos = { ox + (w % 2 == 1 and 0.5 or 0), oy + (prototypes.entity[p[1]].tile_height % 2 == 1 and 0.5 or 0) } "
+        "o[#o + 1] = p[1] .. '/' .. p[2] .. '=' .. tostring(s.can_fast_replace({ name = p[1], position = pos, direction = 0, force = 'player' })) end rcon.print(table.concat(o, ' '))")
+    game = dict(kv.split("=") for kv in out.split())
+    bad = []
+    for a, b in pairs:
+        want = bool(fg(a)) and fg(a) == fg(b) and (fg(a) == "transport-belt" or size.get(a) == size.get(b))
+        if str(want).lower() != game.get(f"{a}/{b}"):
+            bad.append((a, b, game.get(f"{a}/{b}"), want))
+    live_lib.report(not bad and len(game) == len(pairs), "build rules: the client's fast-replace rule (same fg and size; belts any) matches can_fast_replace for 16 pairs",
+           str(bad) + out[:200])
+    # Water and a tree: collisions are the collision box and the mask, not the selection box.
+    out = live_lib.mod_lua(
+        "local s = game.surfaces.nauvis local ox, oy = 100, 100 "
+        "for _, e in pairs(s.find_entities_filtered({ area = { { ox - 10, oy - 10 }, { ox + 10, oy + 10 } } })) do if e.type ~= 'character' then e.destroy() end end "
+        "local t = {} for x = ox - 3, ox + 3 do for y = oy - 3, oy + 3 do t[#t + 1] = { name = x >= ox + 1 and 'water' or 'grass-1', position = { x, y } } end end s.set_tiles(t) "
+        "s.create_entity({ name = 'tree-01', position = { ox - 2.5, oy - 2.5 } }) "
+        "local function can(n, x, y) return tostring(s.can_place_entity({ name = n, position = { x, y }, direction = 0, force = 'player', build_check_type = defines.build_check_type.manual })) end "
+        "rcon.print(can('wooden-chest', ox + 1.5, oy + 0.5) .. ' ' .. can('wooden-chest', ox - 2.5, oy - 3.5) .. ' ' .. can('wooden-chest', ox - 2.5, oy - 2.5) .. ' ' .. can('wooden-chest', ox - 1.5, oy - 0.5))")
+    live_lib.report(out == "false true false true", "build rules: a chest on water and on a tree is refused, a tile from the tree (inside its crown's selection box) and on grass is allowed",
+           out)
+    live_lib.mod_lua("local s = game.surfaces.nauvis for _, e in pairs(s.find_entities_filtered({ area = { { 90, 90 }, { 110, 110 } } })) do if e.type ~= 'character' then e.destroy() end end "
+            "local t = {} for x = 97, 103 do for y = 97, 103 do t[#t + 1] = { name = 'grass-1', position = { x, y } } end end s.set_tiles(t) rcon.print('ok')")

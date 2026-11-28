@@ -357,6 +357,10 @@ func _model_packs_window() -> void:
 		"with no model chosen, the listed pack's details beside its models: %s" % facts_text)
 	# ▶: on top of Selected, saved and used at once.
 	(row_of.call("Available", "dir:Belts").find_child("add", true, false) as Button).pressed.emit()
+	# A pack turned on is used once its copy check (a worker's) has found it clean, so wait for that.
+	var check_until := Time.get_ticks_msec() + 20000
+	while Time.get_ticks_msec() < check_until and bool(ModelPacks.packs.any(func(dp: Dictionary) -> bool: return bool(dp["checking"]) or bool(dp["unpacking"]))):
+		await get_tree().process_frame
 	check(titles.call("Selected")[0] == "Test belts" and Settings.get_value("model_packs", "off") == []
 		and str(Settings.get_value("model_packs", "order")[0]) == "dir:Belts"
 		and ModelPacks.find("transport-belt", true) == dir.path_join("Belts/belts/transport-belt.glb"),
@@ -1122,6 +1126,68 @@ func _model_packs_window() -> void:
 	ModelLibrary.choices_changed([])
 	for f in ["iron-chest.glb", "pack.json", "Belts/pack.json", "Belts/art/logo.png", "Belts/belts/transport-belt.glb", "Belts/belts/transport-belt-curve-left.glb", "zipped.zip", "later.zip", "Default.zip"]:
 		DirAccess.remove_absolute(dir.path_join(f))
+	# Bug #12: ModelPacksWindow wet variant label & WetVariantButton + composite preview.
+	check(ModelPacksWindow.variant_label("electric-mining-drill", "electric-mining-drill-wet") == "Wet (fluid)",
+		"#12: variant_label names -wet variant 'Wet (fluid)'")
+	write.call(dir.path_join("WetPack/test-drill.glb"), chest)
+	write.call(dir.path_join("WetPack/test-drill-wet.glb"), chest)
+	ModelPacks.configure(dir, ["dir:WetPack"], [])
+	ModelPacks.wait()
+	ModelLibrary.choices_changed([])
+	var ww: Node = ModelPacksWindow.new()
+	(ww as Control).theme = MenuKit.theme()
+	add_child(ww)
+	await get_tree().process_frame
+	ww.select_pack("dir:WetPack")
+	ww.finish_fill()
+	ww.select_family("test-drill", "dir:WetPack")
+	await get_tree().process_frame
+	var wet_btn := ww.find_child("WetVariantButton", true, false) as Button
+	check(wet_btn != null and wet_btn.text.contains("Wet (fluid)"), "#12: ModelPacksWindow exposes WetVariantButton for -wet drill variant")
+	if wet_btn != null:
+		wet_btn.pressed.emit()
+		await get_tree().process_frame
+		var until_wet := Time.get_ticks_msec() + 5000
+		while Time.get_ticks_msec() < until_wet and ww._wet_base_pending != "":
+			ModelLibrary.poll()
+			await get_tree().process_frame
+		check(ww._preview._holder.find_child("WetBaseBody", true, false) != null,
+			"#12: selecting -wet variant composites WetBaseBody under the wet attachment")
+	ww.queue_free()
+	await get_tree().process_frame
+	for f in ["WetPack/test-drill.glb", "WetPack/test-drill-wet.glb"]:
+		DirAccess.remove_absolute(dir.path_join(f))
+	DirAccess.remove_absolute(dir.path_join("WetPack"))
+	ModelPacks.use(saved_packs)
+	ModelPacks.folder = saved_folder
+	ModelPacks.models_dir = saved_dir
+	ModelLibrary.choices_changed([])
+	# Bug #2: ProductionPanels.preview places far from (0,0), includes resting arms/sub-pieces, frames merged AABB, and pauses UPDATE_DISABLED.
+	var until_ins := Time.get_ticks_msec() + 5000
+	while Time.get_ticks_msec() < until_ins and not ModelLibrary.entity_ready("inserter", "inserter", {}, 0):
+		ModelLibrary.poll()
+		await get_tree().process_frame
+	var prev_frame: Control = ProductionPanels.preview("inserter", "inserter", Vector2(1, 1))
+	add_child(prev_frame)
+	var pview = null
+	for c in prev_frame.get_children():
+		for gc in c.get_children():
+			if gc is SubViewportContainer:
+				pview = gc
+	check(pview != null, "#2: ProductionPanels.preview creates _PreviewView SubViewportContainer for inserter")
+	if pview != null:
+		var until_prev := Time.get_ticks_msec() + 5000
+		while Time.get_ticks_msec() < until_prev and (pview.pending_pieces or pview.renders_left > 0 or pview.vp.render_target_update_mode != SubViewport.UPDATE_DISABLED):
+			ModelLibrary.poll()
+			await get_tree().process_frame
+		check(pview.world_root.position.x >= 1e5 and pview.world_root.position.z >= 1e5,
+			"#2: _PreviewView places world_root far from (0,0): %s" % [pview.world_root.position])
+		check(pview.holder.get_child_count() > 1,
+			"#2: _PreviewView includes inserter resting arm sub-pieces (%d children)" % pview.holder.get_child_count())
+		check(pview.vp.render_target_update_mode == SubViewport.UPDATE_DISABLED,
+			"#2: _PreviewView pauses SubViewport to UPDATE_DISABLED after settling")
+	prev_frame.queue_free()
+	await get_tree().process_frame
 
 
 ## The model preview draws a pack's belt, underground and splitter as the world draws a lone one: with
@@ -1323,11 +1389,14 @@ func _model_packs_layout() -> void:
 					var scroll := selected.get_parent() as ScrollContainer
 					var shown := scroll.get_global_rect().grow(0.5)
 					var rows := 0
-					var all_in := scroll.get_v_scroll_bar().max_value <= scroll.size.y + 1.0
+					# The built-in rows have the PBR shading buttons, so with a Factorio install its own (ninth) row is
+					# the one past the list's end at 1080p (11 px): it is the only one allowed to need the scroll.
+					var all_in := true
 					for row in selected.get_children():
 						if row.has_meta("pack"):
 							rows += 1
-							all_in = all_in and shown.encloses((row as Control).get_global_rect())
+							if str(row.get_meta("pack")) != ModelPacks.FACTORIO_ID:
+								all_in = all_in and shown.encloses((row as Control).get_global_rect())
 					check(rows >= 8 and all_in, "every Selected row (%d, five packs over the three built in) in view without scrolling at 1080p" % rows)
 					var grid := w.find_child("Models", true, false) as GridContainer
 					check(grid.columns >= 2, "the models in columns as wide as fit: %d" % grid.columns)

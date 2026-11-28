@@ -2,7 +2,7 @@
 
 Dynamic Nauvis-only weather add-on for Zenith (requires Add-on API `1.8`).
 
-## Included features (version 0.3.4)
+## Included features (version 0.3.5)
 
 - **12 Nauvis weather states** (7 dry/sky + 3 rain + 2 thunderstorms) with smooth transitions and natural progression:
   - **Open Skies** — cloudless deep-blue sky, full crisp sun, brightest stars at night, calm breeze.
@@ -22,7 +22,7 @@ Dynamic Nauvis-only weather add-on for Zenith (requires Add-on API `1.8`).
 - **3D rain, splashes & lightning:** GPU-driven rain volume and surface splashes plus visual-only forked 3D lightning bolts, pooled local strike lighting, cloud/ambient flashes, and speed-of-sound delayed thunder cracks and rolls (zero Factorio damage).
 - **Nauvis-only gating:** Automatically disables on Vulcanus, Fulgora, Gleba, Aquilo, and space platforms, and restores cleanly when switching back to Nauvis.
 - **Storm wind:** overcast skies, rain and storms get a broad wind roar made at start (no files), with gusts at random times and heights that never repeat the same way; the old whistle loop is only a quiet layer at the top of the strongest gusts (**Audio > Storm wind**: New / Classic, or `--weather-wind=old`).
-- **Bundled wind, rain & thunder audio:** Seamless wind and rain ambient loops plus 8 thunder cracks and distant rolls from **Weather Elements** by Helton Yan (CC BY 4.0 — see [CREDITS.md](CREDITS.md)). Optionally uses Factorio Space Age's own rain and thunder sounds from your install when enabled.
+- **Bundled wind, rain & thunder audio (rain and wind softened in 0.3.5; **Audio > Rain and wind tone** or `--weather-sounds=original` brings the files back as recorded):** Seamless wind and rain ambient loops plus 8 thunder cracks and distant rolls from **Weather Elements** by Helton Yan (CC BY 4.0 — see [CREDITS.md](CREDITS.md)). Optionally uses Factorio Space Age's own rain and thunder sounds from your install when enabled.
 - **Weather Control Panel:** Press `Alt+F9` (rebindable in **Settings -> Controls**) to inspect weather, lock any state, trigger instant/smooth transitions, click **Dry now**, or trigger a manual lightning **Strike**.
 
 ## Settings overview

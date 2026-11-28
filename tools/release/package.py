@@ -47,10 +47,33 @@ The native belt simulation (client/native/belt_sim.gdextension, docs/RUNNING.md)
 exported by Godot: client/native/ is hidden from Godot's editor (client/scripts/native_library.gd loads
 it, so platforms without it log no errors). The Windows download gets the .gdextension and
 client/native/bin's DLL beside Zenith.exe when the DLL is there (it is committed; nothing here builds
-it). The other platforms have no library and run belt_sim.gd.
+it). The other platforms have no library and run belt_sim.gd. The upscalers library
+(client/native/upscalers.gdextension and its git-ignored DLL, client/native/upscalers/build.bat; AMD FSR
+3.1/4.1 and NVIDIA DLSS's capability checks and drawing, client/scripts/menu/upscalers.gd) goes beside
+Zenith.exe the same way when the DLL is there; --windows-template or --vendor-runtimes without it is an
+error (those builds are for the vendor upscalers, which would be greyed out without the library).
+
+--windows-template <exe> exports the Windows download with a self-built Godot template
+(tools/godot/build_template.ps1) instead of the official one: the Windows preset's
+custom_template/release is set to it for that export alone and export_presets.cfg put back byte
+for byte after, as with the dev feature, so no build path is ever committed. Without it nothing
+changes: Godot's official template, as before.
+
+--vendor-runtimes <dir>|none puts AMD's FSR runtime libraries into the Windows x86_64 download's
+vendor/amd/ (the two signed DLLs and AMD's license.md, from <dir>/amd/, which
+tools/release/fetch_vendor_runtimes.py fills). Default none: no vendor files, so a release only
+carries them when the owner turns it on. No other platform, and no source archive, ever gets them
+(tools/release/leak_scan.py checks that on every zip).
+
+--ship-nvidia (default off; needs --vendor-runtimes <dir>) also puts Zenith's own Streamline build, from
+<dir>/streamline-built/ (tools/dlss/build_streamline.ps1: sl.interposer.dll, sl.common.dll, sl.dlss.dll and
+zenith-sl-manifest.txt, whose SHA-256s are checked against the manifest), into the Windows x86_64 download's
+vendor/nvidia/, and BUILD.json then says "vendor": "amd+nvidia", the one case leak_scan.py lets vendor/nvidia/
+through. NVIDIA's own nvngx_dlss.dll is never shipped: the player downloads it. Without the flag, no NVIDIA file.
 """
 
 import argparse
+import hashlib
 import io
 import json
 import urllib.error
@@ -63,10 +86,19 @@ import subprocess
 import sys
 import zipfile
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import fetch_vendor_runtimes  # noqa: E402
+import leak_scan  # noqa: E402
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 # BeltSimNative's library and its .gdextension, put beside the program for native_library.gd to load.
 NATIVE_CONFIG = ROOT / "client" / "native" / "belt_sim.gdextension"
 NATIVE_DLL = "belt_sim.windows.template_release.x86_64.dll"
+# The upscalers library (ZenithUpscalerCaps and the vendor upscalers, upscalers.gd), git-ignored: built by
+# client/native/upscalers/build.bat, put beside Zenith.exe when it is there.
+UPSCALERS_CONFIG = ROOT / "client" / "native" / "upscalers.gdextension"
+UPSCALERS_DLL = "upscalers.windows.template_release.x86_64.dll"
+NATIVE_BIN = ROOT / "client" / "native" / "bin"
 MOD = ROOT / "mod" / "factorio-3d-bridge"
 # platform -> (export preset, the program's name in the folder). macOS's export is a .zip holding
 # Zenith.app, whose entries go into the download as they are.
@@ -174,7 +206,7 @@ DEFAULT_PACK = {
     "licence": "\u00a9 David (Vasillo), used in Zenith with his permission; not under Zenith's GPL licence",
     # The Model packs window's line over the preview (pack.json "credit", used as it is).
     "credit": "© Vasillo · used with permission",
-    "description": "Vasillo's textured models made for Zenith: transport belts of every tier with curves, start and end pieces, underground belts, splitters, inserters, mining drills, pipes, ores and item models.",
+    "description": "Vasillo's textured models made for Zenith: transport belts of every tier with curves, start and end pieces, underground belts, splitters, inserters, mining drills, pipes, stone walls, gate, ores, and item models (including science packs, engines, ammo, rockets, and grenades).",
     "icon": "transport-belt-curve-left",
     # Zenith's gear (Vasillo's too, client/assets/branding/README.md), put in the zip by default_zip.
     "icon_image": "zenith.png",
@@ -287,6 +319,44 @@ def with_dev_feature(godot, preset, out_exe, export_fn):
         export_fn(godot, preset, out_exe)
     finally:
         presets.write_bytes(before)
+
+
+def set_preset_option(text, preset, key, value):
+    """export_presets.cfg text with `key` in the options of the preset named `preset` set to `value`."""
+    lines = text.splitlines(keepends=True)
+    section, number, found = None, None, False
+    for i, raw in enumerate(lines):
+        line = raw.rstrip("\r\n")
+        if line.startswith("["):
+            section = line
+            continue
+        if number is None and line == f'name="{preset}"' and re.fullmatch(r"\[preset\.\d+\]", section or ""):
+            number = section[len("[preset."):-1]
+        elif number is not None and section == f"[preset.{number}.options]" and line.startswith(key + "="):
+            quoted = value.replace("\\", "/").replace('"', '\\"')
+            lines[i] = f'{key}="{quoted}"' + raw[len(line):]
+            found = True
+            break
+    if number is None:
+        raise ValueError(f"no export preset named {preset}")
+    if not found:
+        raise ValueError(f"export preset {preset} has no {key} line")
+    return "".join(lines)
+
+
+def with_windows_template(template, export_fn):
+    """export_fn with the preset's custom_template/release set to `template` for that one export,
+    export_presets.cfg put back byte for byte after (no build path committed)."""
+    def run(godot, preset, out_exe):
+        presets = ROOT / "client" / "export_presets.cfg"
+        before = presets.read_bytes()
+        presets.write_text(set_preset_option(before.decode("utf-8"), preset, "custom_template/release", template),
+                           encoding="utf-8", newline="")
+        try:
+            export_fn(godot, preset, out_exe)
+        finally:
+            presets.write_bytes(before)
+    return run
 
 
 def channel_doc(text, channel):
@@ -482,11 +552,61 @@ def default_zip(models, out):
     return sum(1 for p, _ in models if p.suffix.lower() in (".glb", ".gltf"))
 
 
-def build_manifest(version, channel, addons):
-    """Return the BUILD.json payload recording Zenith version, channel, and bundled add-ons."""
+def template_label(template):
+    """BUILD.json's "template": "official", or "our build: <its BUILD.txt's first line>" (beside the exe,
+    tools/godot/build_template.ps1 writes it), or "our build: <exe name>" without one."""
+    if not template:
+        return "official"
+    build_txt = pathlib.Path(template).parent / "BUILD.txt"
+    first = ""
+    if build_txt.is_file():
+        lines = build_txt.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        first = lines[0].strip() if lines else ""
+    return "our build: " + (first or pathlib.Path(template).name)
+
+
+def vendor_label(vendor_runtimes, ship_nvidia=False):
+    """BUILD.json's "vendor": none, amd, or amd+nvidia (NVIDIA's are only with --ship-nvidia)."""
+    parts = (["amd"] if vendor_runtimes else []) + (["nvidia"] if ship_nvidia else [])
+    return "+".join(parts) or "none"
+
+
+def copy_native_libraries(folder, bin_dir=None):
+    """belt_sim's and the upscalers' .gdextension + DLL beside Zenith.exe, each when its DLL is there.
+    Returns {"belt_sim": bool, "upscalers": bool} and prints a line for each."""
+    bin_dir = pathlib.Path(bin_dir) if bin_dir else NATIVE_BIN
+    got = {}
+    for key, config, name, without in (
+            ("belt_sim", NATIVE_CONFIG, NATIVE_DLL, "belt_sim.gd only"),
+            ("upscalers", UPSCALERS_CONFIG, UPSCALERS_DLL, "AMD FSR 3.1/4.1 and DLSS greyed out")):
+        dll = bin_dir / name
+        got[key] = dll.exists()
+        if got[key]:
+            shutil.copy2(config, folder / config.name)
+            shutil.copy2(dll, folder / name)
+    print(f"  native belt simulation: {'in the download' if got['belt_sim'] else 'not in it'}"
+          f"{'' if got['belt_sim'] else ' (no ' + NATIVE_DLL + ' in client/native/bin: belt_sim.gd only)'}")
+    print(f"  upscalers library: {'in the download' if got['upscalers'] else 'not in it'}"
+          f"{'' if got['upscalers'] else ' (no ' + UPSCALERS_DLL + ' in client/native/bin: AMD FSR 3.1/4.1 and DLSS greyed out)'}")
+    return got
+
+
+def require_upscalers(windows_template, vendor_runtimes, bin_dir=None):
+    """Stop when a build meant for the vendor upscalers (--windows-template, --vendor-runtimes) has no upscalers DLL."""
+    bin_dir = pathlib.Path(bin_dir) if bin_dir else NATIVE_BIN
+    asked = [f for f, v in (("--windows-template", windows_template), ("--vendor-runtimes", vendor_runtimes)) if v]
+    if asked and not (bin_dir / UPSCALERS_DLL).is_file():
+        raise SystemExit(f"{' and '.join(asked)} need the upscalers library, but client/native/bin has no {UPSCALERS_DLL}: "
+                         "build it with client/native/upscalers/build.bat (or copy the main checkout's)")
+
+
+def build_manifest(version, channel, addons, template="official", vendor="none"):
+    """Return the BUILD.json payload recording Zenith version, channel, Godot template, vendor runtimes, and bundled add-ons."""
     return {
         "version": version,
         "channel": channel,
+        "template": template,
+        "vendor": vendor,
         "addons": [
             {
                 "id": a["id"],
@@ -518,24 +638,69 @@ def validate_versions(version, project_path=None, presets_path=None):
             )
 
 
-def package(godot, platform, version, addons=(), channel="public", models=()):
+NVIDIA_FILES = leak_scan.VENDOR_NVIDIA_FILES
+NVIDIA_MANIFEST = "zenith-sl-manifest.txt"
+
+
+def copy_nvidia_runtimes(src, folder):
+    """Copy <src>/streamline-built/ (Zenith's Streamline build: three DLLs + zenith-sl-manifest.txt) to
+    <folder>/vendor/nvidia/, all four or an error, each DLL's SHA-256 matching the manifest. Never nvngx_dlss.dll."""
+    built = pathlib.Path(src) / "streamline-built"
+    missing = [n for n in NVIDIA_FILES if not (built / n).is_file()]
+    if missing:
+        raise SystemExit(f"--ship-nvidia: {built} lacks {', '.join(missing)} (tools/dlss/build_streamline.ps1)")
+    pins = {}
+    for line in (built / NVIDIA_MANIFEST).read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and not line.lstrip().startswith("#"):
+            pins[parts[1]] = parts[0].lower()
+    for n in NVIDIA_FILES:
+        if n == NVIDIA_MANIFEST:
+            continue
+        got = hashlib.sha256((built / n).read_bytes()).hexdigest()
+        if pins.get(n) != got:
+            raise SystemExit(f"--ship-nvidia: {n}'s SHA-256 doesn't match {NVIDIA_MANIFEST} (rebuild with tools/dlss/build_streamline.ps1)")
+    (folder / "vendor" / "nvidia").mkdir(parents=True)
+    for n in NVIDIA_FILES:
+        shutil.copy2(built / n, folder / "vendor" / "nvidia" / n)
+    print(f"  vendor/nvidia: {', '.join(NVIDIA_FILES)} (Zenith's Streamline build; no nvngx_dlss.dll)")
+
+
+def copy_vendor_runtimes(src, folder):
+    """Copy <src>/amd/ (AMD's two signed DLLs and license.md) to <folder>/vendor/amd/. All three or an error."""
+    amd = pathlib.Path(src) / "amd"
+    names = list(fetch_vendor_runtimes.AMD_DLLS) + [fetch_vendor_runtimes.AMD_LICENSE]
+    missing = [n for n in names if not (amd / n).is_file()]
+    if missing:
+        raise SystemExit(f"--vendor-runtimes: {amd} lacks {', '.join(missing)} "
+                         "(python tools/release/fetch_vendor_runtimes.py)")
+    (folder / "vendor" / "amd").mkdir(parents=True)
+    for n in names:
+        shutil.copy2(amd / n, folder / "vendor" / "amd" / n)
+    print(f"  vendor/amd: {', '.join(names)}")
+
+
+def package(godot, platform, version, addons=(), channel="public", models=(), windows_template=None,
+            vendor_runtimes=None, ship_nvidia=False):
     preset, exe = PRESETS[platform]
     dev = channel == "dev"
     folder = ROOT / "dist" / f"Zenith-{version}{'-dev' if dev else ''}-{platform}{'-unsupported' if platform in UNSUPPORTED else ''}"
     if folder.exists():
         shutil.rmtree(folder)
     export_fn = export_with_etc2 if platform == "macos" else export
+    if windows_template and platform == "windows":
+        export_fn = with_windows_template(windows_template, export_fn)
+        print(f"  Godot template: self-built ({pathlib.Path(windows_template).name})")
     if dev:
         with_dev_feature(godot, preset, folder / exe, export_fn)
     else:
         export_fn(godot, preset, folder / exe)
     if platform == "windows":
-        dll = ROOT / "client" / "native" / "bin" / NATIVE_DLL
-        if dll.exists():
-            shutil.copy2(NATIVE_CONFIG, folder / NATIVE_CONFIG.name)
-            shutil.copy2(dll, folder / NATIVE_DLL)
-        print(f"  native belt simulation: {'in the download' if dll.exists() else 'not in it'}"
-              f"{'' if dll.exists() else ' (no ' + NATIVE_DLL + ' in client/native/bin: belt_sim.gd only)'}")
+        copy_native_libraries(folder)
+        if vendor_runtimes:
+            copy_vendor_runtimes(vendor_runtimes, folder)
+        if vendor_runtimes and ship_nvidia:
+            copy_nvidia_runtimes(vendor_runtimes, folder)
     shutil.copytree(MOD, folder / "mod" / "factorio-3d-bridge",
                     ignore=shutil.ignore_patterns("__pycache__", ".DS_Store", "Thumbs.db"))
     (folder / "server").mkdir()
@@ -566,7 +731,11 @@ def package(godot, platform, version, addons=(), channel="public", models=()):
         print(f"  bundled add-on {a['filename']}")
     if addons:
         (folder / "addons" / "bundled.json").write_text(json.dumps({a["id"]: a["on"] for a in addons}, indent=1), encoding="utf-8")
-    (folder / "BUILD.json").write_text(json.dumps(build_manifest(version, channel, addons), indent=1) + "\n", encoding="utf-8")
+    windows = platform == "windows"
+    manifest = build_manifest(version, channel, addons, template_label(windows_template if windows else None),
+                              vendor_label(vendor_runtimes if windows else None,
+                                           bool(windows and vendor_runtimes and ship_nvidia)))
+    (folder / "BUILD.json").write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
     out = folder.parent / f"{folder.name}.zip"
     app_zip = folder / exe if platform == "macos" else None
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
@@ -586,6 +755,13 @@ def package(godot, platform, version, addons=(), channel="public", models=()):
                     data = app.read(info)
                     info.filename = f"{folder.name}/{info.filename}"
                     z.writestr(info, data)
+    with zipfile.ZipFile(out) as zf:
+        # (The scan's yes is this run's own --ship-nvidia, never the zip's BUILD.json alone.)
+        problems = leak_scan.vendor_problems(out.name, [i.filename for i in zf.infolist()],
+                                             bool(ship_nvidia) and leak_scan.zip_ships_nvidia(zf))
+    if problems:
+        out.unlink()
+        raise SystemExit("vendor files in the wrong place, zip removed: " + "; ".join(problems))
     print(f"wrote {out} ({out.stat().st_size // (1024 * 1024)} MB)")
 
 
@@ -600,7 +776,33 @@ def main():
     parser.add_argument("--models", help="a folder of a modeller's models to put in the download's models/" + BUNDLED_ZIP)
     parser.add_argument("--zenith-zip", "--default-zip", dest="zenith_zip", metavar="OUT",
                         help="with --models: write that " + BUNDLED_ZIP + " to OUT and nothing else (--default-zip: its old name)")
+    parser.add_argument("--windows-template", metavar="EXE",
+                        help="a self-built Godot Windows release template (tools/godot/build_template.ps1) "
+                             "for the Windows export, instead of the official one")
+    parser.add_argument("--vendor-runtimes", default="none", metavar="DIR|none",
+                        help="a folder holding amd/ (tools/release/fetch_vendor_runtimes.py) to put in the Windows "
+                             "x86_64 download's vendor/amd/; none (default): no vendor files")
+    parser.add_argument("--ship-nvidia", action="store_true",
+                        help="with --vendor-runtimes: also put Zenith's Streamline build (<dir>/streamline-built/) in the "
+                             "Windows x86_64 download's vendor/nvidia/ (never nvngx_dlss.dll); default off")
     args = parser.parse_args()
+    vendor = None
+    if args.vendor_runtimes.lower() != "none":
+        vendor = pathlib.Path(args.vendor_runtimes).resolve()
+        if not vendor.is_dir():
+            sys.exit(f"--vendor-runtimes: no such folder {vendor}")
+    template = None
+    if args.windows_template:
+        template = pathlib.Path(args.windows_template).resolve()
+        if not template.is_file():
+            sys.exit(f"--windows-template: no such file {template}")
+        template = str(template)
+    try:
+        require_upscalers(template, vendor)
+    except SystemExit as exc:
+        sys.exit(str(exc))
+    if args.ship_nvidia and not vendor:
+        sys.exit("--ship-nvidia needs --vendor-runtimes <dir> (its streamline-built/ folder)")
     if args.zenith_zip:
         if not args.models:
             sys.exit("--zenith-zip needs --models <folder>")
@@ -616,7 +818,8 @@ def main():
     models = bundled_models(args.models) if args.models else []
     addons = gather_addons(args)
     for platform in groups.get(args.platform, [args.platform]):
-        package(args.godot, platform, version, addons, args.channel, models)
+        package(args.godot, platform, version, addons, args.channel, models, template,
+                vendor if platform == "windows" else None, args.ship_nvidia)
 
 
 if __name__ == "__main__":

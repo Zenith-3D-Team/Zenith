@@ -20,6 +20,7 @@ const ItemIcons := preload("res://scripts/world/item_icons.gd")
 const ModFiles := preload("res://scripts/world/mod_files.gd")
 const ModGraphics := preload("res://scripts/world/mod_graphics.gd")
 const ModelPacks := preload("res://scripts/world/model_packs.gd")
+const NativeLibrary := preload("res://scripts/native_library.gd")
 const Visuals := preload("res://scripts/world/visuals.gd")
 const Switches := preload("res://scripts/switches.gd")
 
@@ -178,17 +179,56 @@ static var _pbr_array: Texture2DArray
 static var _pbr_room := 0
 static var _pbr_uploaded := 0
 static var _dirty := false
-## Whether the ground's pictures are compressed (S3TC/BC1): 1 yes, 0 no. Only an editor build can:
-## in Godot 4.7.2 etcpak's compressors (BC1-3, ETC) are registered only with TOOLS_ENABLED, and CVTT
-## (BPTC) and Betsy (on the GPU) only in templates built with cvtt_export_templates or
-## betsy_export_templates, which the official ones aren't. Image.compress() has nothing to call in an
-## exported game: it logged `Parameter "_image_compress_bc_func" is null` and failed, so the export
-## is never asked. There each layer is kept as RGBA8, the format Godot's renderer turns RGB8 into on
-## every upload anyway (texture_storage.cpp; 2.8 ms a layer on the main thread, and every layer again
-## when the array grows): 11.2 MB a layer on the GPU with its mipmaps (2048 x 1024) against 1.4 MB
-## compressed, and 11.2 MB in _images against 1.4. A base's 35-45 kinds of ground: about 0.5 GB of
-## video memory and as much RAM, against 70 and 60 MB.
-static var _compress := 1 if OS.has_feature("editor") else 0
+## Whether the ground's pictures are compressed (S3TC/BC1): 1 yes, 0 no. Editor builds can use
+## Godot's built-in etcpak; exported builds use TextureCompressNative (clean-room BC1) when
+## --native-bc-compress=on (default) or =force, else fall back to uncompressed RGBA8 (--native-bc-compress=off).
+static var _native_compressor: Object = null
+static var _native_checked := false
+static var _compress := _detect_compress()
+
+
+static func _native_bc_mode() -> String:
+	if not Switches.on("--native-bc-compress"):
+		return "off"
+	if Switches.has("--native-bc-compress=force"):
+		return "force"
+	return "on"
+
+
+static func _native_compressor_instance() -> Object:
+	if _native_bc_mode() == "off":
+		return null
+	if _native_compressor == null and not _native_checked:
+		if OS.get_thread_caller_id() == OS.get_main_thread_id():
+			_native_checked = true
+			if NativeLibrary.ensure() and ClassDB.class_exists(&"TextureCompressNative"):
+				_native_compressor = ClassDB.instantiate(&"TextureCompressNative")
+		elif ClassDB.class_exists(&"TextureCompressNative"):
+			_native_compressor = ClassDB.instantiate(&"TextureCompressNative")
+	return _native_compressor
+
+
+static func _use_native_bc() -> bool:
+	var mode := _native_bc_mode()
+	if mode == "off":
+		return false
+	if mode == "force":
+		return _native_compressor_instance() != null
+	return not OS.has_feature("editor") and _native_compressor_instance() != null
+
+
+static func _detect_compress() -> int:
+	if _use_native_bc():
+		return 1
+	return 1 if OS.has_feature("editor") else 0
+
+
+static func refresh_compress_mode() -> int:
+	_native_checked = false
+	if _native_bc_mode() == "off":
+		_native_compressor = null
+	_compress = _detect_compress()
+	return _compress
 ## --plain-terrain keeps the procedural ground even with an install (for comparisons).
 static var disabled := Switches.has("--plain-terrain")
 static var disk_cache := Switches.on("--tex-cache")
@@ -306,6 +346,8 @@ static func lookup(tile_name: String) -> TileGfx:
 		_read_defs()
 		block = _defs.get(tile_name, "")
 	var fp := ModGraphics.fingerprint
+	if _compress != 0 and _use_native_bc():
+		_native_compressor_instance()
 	var comp_req := _compress
 	var rec := _record(tile_name)
 	var pack_src := {}
@@ -646,6 +688,9 @@ static func _load_pack_image(path: String) -> Image:
 	if path.begins_with("res://") and not FileAccess.file_exists(path):
 		var tex := load(path) as Texture2D
 		if tex != null:
+			# A renderer read (waits for the render thread when it runs on its own), but only while a pack's
+			# pictures load or its swatch is drawn in the packs list, once per picture (an imported res:// picture
+			# keeps no CPU copy): left as it is.
 			img = tex.get_image()
 	else:
 		img = Image.load_from_file(path)
@@ -1378,7 +1423,7 @@ static func _take_array(array: Texture2DArray, room: int, n: int) -> void:
 	_array = array
 	_room = room
 	_uploaded = n
-	if arrays_made == 1 and _array == array and not OS.has_feature("editor"):
+	if arrays_made == 1 and _array == array and not OS.has_feature("editor") and not _images[0].is_compressed():
 		print("Terrain textures: the ground's pictures are kept uncompressed (this build has no texture compressor): "
 			+ "about 11 MB of video memory a kind of ground")
 
@@ -1391,7 +1436,10 @@ static func _fit(i: int) -> bool:
 		return true
 	if _images[0].is_compressed():
 		if not image.is_compressed():
-			image.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_SRGB)
+			var comp := _compress_layer_image(image)
+			if comp != null:
+				_images[i] = comp
+				image = comp
 		return image.get_format() == format
 	if image.is_compressed():
 		image.decompress()
@@ -1714,20 +1762,39 @@ static func _mean_luma(image: Image) -> float:
 	return total / 4096.0
 
 
-static func _finish_layer(layer: Image) -> Image:
-	layer.convert(Image.FORMAT_RGB8)  # opaque: the sheets' alpha isn't drawn
-	if _compress == 0:
-		layer.convert(Image.FORMAT_RGBA8)  # uncompressed, as the GPU holds it (see _compress)
-	layer.generate_mipmaps()
-	if _compress != 0:
+static func _compress_layer_image(layer: Image) -> Image:
+	if layer == null or layer.is_empty():
+		return null
+	if _use_native_bc():
+		var comp_obj := _native_compressor_instance()
+		if comp_obj != null:
+			var compressed: Image = comp_obj.call(&"compress_image", layer, false, true) as Image
+			if compressed != null and not compressed.is_empty():
+				return compressed
+	if OS.has_feature("editor"):
 		# On the CPU (project.godot: rendering/textures/vram_compression/compress_with_gpu=false).
 		# Godot 4.7.2's GPU compressor (Betsy) runs as a pool task that, while it waits, can run
 		# this very task on its own thread, which then waits for Betsy for ever: the client froze
 		# loading or quitting, no CPU used (on 4 threads all of Zenith's tasks share one slot).
-		var err := layer.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_SRGB)
-		_compress = 1 if err == OK else 0
-		if err != OK:
-			layer.convert(Image.FORMAT_RGBA8)
+		var copy := layer.duplicate() as Image
+		if copy != null and not copy.is_empty():
+			if not copy.has_mipmaps():
+				copy.generate_mipmaps()
+			if copy.compress(Image.COMPRESS_S3TC, Image.COMPRESS_SOURCE_SRGB) == OK:
+				return copy
+	return null
+
+
+static func _finish_layer(layer: Image) -> Image:
+	layer.convert(Image.FORMAT_RGB8)  # opaque: the sheets' alpha isn't drawn
+	if _compress != 0:
+		var compressed := _compress_layer_image(layer)
+		if compressed != null:
+			return compressed
+		_compress = 0
+	layer.convert(Image.FORMAT_RGBA8)  # uncompressed, as the GPU holds it (see _compress)
+	if not layer.has_mipmaps():
+		layer.generate_mipmaps()
 	return layer
 
 

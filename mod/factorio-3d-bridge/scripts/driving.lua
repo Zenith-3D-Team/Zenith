@@ -20,8 +20,16 @@ local function distance(a, b)
   return math.sqrt(dx * dx + dy * dy)
 end
 
+-- Wagons have no seat: Enter never gets into them, even when one is nearer than the locomotive.
+local SEATLESS = { ["cargo-wagon"] = true, ["fluid-wagon"] = true, ["artillery-wagon"] = true }
+
 local function nearest_vehicle(c)
-  local types = registry.vehicle_types()
+  local types = {}
+  for _, t in pairs(registry.vehicle_types()) do
+    if not SEATLESS[t] then
+      types[#types + 1] = t
+    end
+  end
   if #types == 0 then
     return nil
   end

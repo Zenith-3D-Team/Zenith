@@ -27,7 +27,7 @@ void vertex() {
 	card_xz = MODEL_MATRIX[3].xz;
 	float h = ground_h(card_xz);
 	if (h != 0.0) {
-		VERTEX += inverse(mat3(MODEL_MATRIX)) * vec3(0.0, h, 0.0);
+		VERTEX += ground_up_in(MODEL_MATRIX, h);
 	}
 	run = f3d_card_run.x >= 0.0 ? f3d_card_run : COLOR.rg;
 }

@@ -64,6 +64,6 @@ Real Factorio 2.1 (base + Space Age) playable in 3D: model coverage for base + S
 
 Client-side Factorio-accurate belt simulation, Vasillo's textured logistics & drill pack (`Zenith.zip`), Cinematic shaders, contact shading, 3D grass, 8K screenshots, creature hull models, LAN TCP relay (`server/relay.py`), and mod graphics (`gfx`).
 
-### 0.3 (pre-release): Horizon, weather, FSR 2.2 & C++ speedup
+### 0.3 (dev-channel pre-release): Horizon, weather, FSR 2.2 & C++ speedup
 
 Bundled **Immersive Weather**, **Distant Horizon** (`512`-chunk 2.5D terrain & factory silhouettes), **AMD FSR 2.2**, redone card-based Graphics settings, per-pack PBR shading (`108`-model Vasillo PBR support + FUE5/Wube3DP PBR), **Binary Wire `v1–5`** with `nack` ring & `rb` robot sim, **13-class C++ GDExtension**, cargo wagon Alt-mode, and Factorio 2.1 default key bindings.

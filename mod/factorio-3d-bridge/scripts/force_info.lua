@@ -35,6 +35,14 @@ local MODIFIERS = {
   { "artillery_range_modifier", { "artillery-turret", "artillery-wagon" } },
   { "beacon_distribution_modifier", { "beacon" } },
   { "character_reach_distance_bonus", { "steel-axe" } },
+  { "character_running_speed_modifier", { "exoskeleton-equipment" } },
+  { "character_build_distance_bonus", { "steel-axe" } },
+  { "character_resource_reach_distance_bonus", { "steel-axe" } },
+  { "character_item_pickup_distance_bonus", { "steel-axe" } },
+  { "character_item_drop_distance_bonus", { "steel-axe" } },
+  { "character_loot_pickup_distance_bonus", { "steel-axe" } },
+  { "character_trash_slot_count", { "wooden-chest" } },
+  { "maximum_following_robot_count", { "defender-capsule", "distractor-capsule", "destroyer-capsule" } },
 }
 
 local function valid_items(names)

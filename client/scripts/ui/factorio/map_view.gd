@@ -33,6 +33,7 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 const LocaleNames := preload("res://scripts/world/locale_names.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
+const Settings := preload("res://scripts/menu/settings.gd")
 const Switches := preload("res://scripts/switches.gd")
 
 ## The Surfaces panel's list (GUI pixels), as Factorio's.
@@ -43,6 +44,10 @@ const MIN_ZOOM := 0.25
 const MAX_ZOOM := 8.0
 const DEFAULT_ZOOM := 2.0
 const ZOOM_STEP := 1.4142135
+## Scrolling in past MAX_ZOOM fills an orange bar before entering 3D view.
+const ENTER_3D_SCROLLS := 5
+const ENTER_3D_HOLD_SEC := 0.75
+const ENTER_3D_DECAY_PER_SEC := 1.5
 ## Seconds between asking again for the same area.
 const REFRESH := 6.0
 ## L6: how long the mouse rests on a tile before its resource patch is asked for, and the outline's colour and width.
@@ -93,8 +98,24 @@ var following := true
 
 var _hint := Label.new()
 var _dragging := false
+## The title bar's Search (Factorio's "Search the map"): the map's tags by name, a click looks at one.
+var search_panel := PanelContainer.new()
+var search_field := LineEdit.new()
+var _search_list := VBoxContainer.new()
+var _press_at := Vector2.INF  # where the left button went down (a click on a tag edits it)
 var _tag_at := Vector2.ZERO  # where the dialog's new tag goes (tiles)
 var _tag_editing := -1  # id of the tag being edited
+## A left click on a building, train or vehicle opens its window, as in Factorio's remote view: factorio_ui.gd opens
+## it (the mod's open checks the radar and roboport coverage). `proto_name` names a prototype id for the hover tooltip.
+signal entity_picked(unit: int, proto_id: int, fixed: Vector2i)
+var proto_name: Callable = Callable()
+var _click_q := -1
+var _hover_q := -1
+var _pick_tile := Vector2i(1 << 30, 1 << 30)
+var _pick_since := 0
+var _hover_name := ""
+var _tip: PanelContainer = null
+var _tip_label: Label = null
 var _unghost := {}  # unghost request id -> the screen point right-clicked
 var _me := [Vector2.ZERO, 0.0]
 var _redraw := true
@@ -114,6 +135,10 @@ var alerts = null:
 ## The alerts drawn last, [[kind, screen point], ...] (tests).
 var alerts_placed: Array = []
 var _blink_was := false
+var _enter_3d_charge := 0.0
+var _enter_3d_idle := 0.0
+var _enter_3d_panel: PanelContainer = null
+var _enter_3d_bar: ProgressBar = null
 
 
 func _ready() -> void:
@@ -144,6 +169,7 @@ func _ready() -> void:
 	_hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_hint.visible = false  # Factorio's remote view has no such line: F1's help says it
 	add_child(_hint)
+	_build_search()
 	add_child(dialog)
 	dialog.confirmed.connect(_on_tag_confirmed)
 	dialog.deleted.connect(_on_tag_deleted)
@@ -153,10 +179,21 @@ func _ready() -> void:
 	model.territories_changed.connect(func() -> void: _redraw = true)
 	model.roboports_changed.connect(func() -> void: _redraw = true)
 	model.landing_pad_found.connect(_on_landing_pad)
+	model.picked.connect(_on_picked)
+	_tip = PanelContainer.new()
+	_tip.name = "EntityTip"
+	_tip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_tip.visible = false
+	_tip_label = Kit.label("")
+	_tip.add_child(_tip_label)
+	add_child(_tip)
+	_build_enter_3d_bar()
 	model.map_patch_changed.connect(func() -> void:
 		_patch_edges = outline_edges(model.map_patch.get("o", []))
 		_redraw = true)
-	mouse_exited.connect(func() -> void: model.clear_patch())
+	mouse_exited.connect(func() -> void:
+		model.clear_patch()
+		_clear_hover())
 
 
 ## The alert bar changed: draw its alerts again.
@@ -168,11 +205,12 @@ func is_open() -> bool:
 	return visible
 
 
-func open(on: bool) -> void:
+func open(on: bool, keep_surface := false) -> void:
 	if on == visible:
 		return
 	visible = on
 	dialog.close()
+	search_panel.visible = false
 	_dragging = false
 	if on:
 		following = true
@@ -180,10 +218,63 @@ func open(on: bool) -> void:
 		centre = _me[0]
 		_redraw = true
 		_layers_now = true
-	elif model.map_si != 0:
+	elif not keep_surface and model.map_si != 0:
 		model.set_map_surface(0)  # back to the character's surface, as in Factorio
 	if not on:
 		model.clear_patch()
+	_reset_enter_3d()
+
+
+func _build_enter_3d_bar() -> void:
+	_enter_3d_panel = PanelContainer.new()
+	_enter_3d_panel.name = "Enter3DBarPanel"
+	_enter_3d_panel.theme_type_variation = "FFrame"
+	_enter_3d_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_enter_3d_panel.visible = false
+	_enter_3d_panel.anchor_left = 0.5
+	_enter_3d_panel.anchor_right = 0.5
+	_enter_3d_panel.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	_enter_3d_panel.offset_top = Kit.px(52)
+	var box := VBoxContainer.new()
+	box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	box.add_theme_constant_override("separation", Kit.px(4))
+	var lbl := Kit.label("Scroll to enter 3D view", "FSmallLabel")
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	box.add_child(lbl)
+	_enter_3d_bar = Kit.progress_bar(Kit.BAR_ORANGE)
+	_enter_3d_bar.name = "Enter3DBar"
+	_enter_3d_bar.custom_minimum_size = Vector2(Kit.px(160), Kit.px(10))
+	_enter_3d_bar.max_value = 100.0
+	_enter_3d_bar.value = 0.0
+	box.add_child(_enter_3d_bar)
+	_enter_3d_panel.add_child(box)
+	add_child(_enter_3d_panel)
+
+
+func _reset_enter_3d() -> void:
+	_enter_3d_charge = 0.0
+	_enter_3d_idle = 0.0
+	if _enter_3d_bar != null:
+		_enter_3d_bar.value = 0.0
+	if _enter_3d_panel != null:
+		_enter_3d_panel.visible = false
+
+
+func _sync_enter_3d_bar() -> void:
+	if _enter_3d_bar != null:
+		_enter_3d_bar.value = _enter_3d_charge * 100.0
+	if _enter_3d_panel != null:
+		_enter_3d_panel.visible = _enter_3d_charge > 0.0
+		_enter_3d_panel.reset_size()
+
+
+static func map_auto_swap_enabled() -> bool:
+	if Switches.has("--map-auto-swap=on"):
+		return true
+	if Switches.has("--map-auto-swap=off"):
+		return false
+	return bool(Settings.get_value("camera", "map_auto_swap"))
 
 
 ## Screen pixels per tile.
@@ -204,8 +295,20 @@ func zoom_by(factor: float, at: Vector2) -> void:
 	var before := screen_to_tiles(at)
 	if factor > 1.0 and zoom >= MAX_ZOOM - 0.001:
 		# On another surface the mod streams that surface's world for the remote view (`view`).
-		zoom_to_world.emit(before)
+		if map_auto_swap_enabled():
+			_reset_enter_3d()
+			zoom_to_world.emit(before)
+			return
+		_enter_3d_charge = minf(1.0, _enter_3d_charge + 1.0 / float(ENTER_3D_SCROLLS))
+		_enter_3d_idle = 0.0
+		if _enter_3d_charge >= 1.0 - 0.001:
+			_reset_enter_3d()
+			zoom_to_world.emit(before)
+		else:
+			_sync_enter_3d_bar()
 		return
+	if factor < 1.0 and _enter_3d_charge > 0.0:
+		_reset_enter_3d()
 	zoom = clampf(zoom * factor, MIN_ZOOM, MAX_ZOOM)
 	if absf(zoom - 1.0) < 0.01:
 		zoom = 1.0
@@ -221,6 +324,14 @@ func _character() -> Array:
 func _process(delta: float) -> void:
 	if not visible:
 		return
+	if _enter_3d_charge > 0.0:
+		_enter_3d_idle += delta
+		if _enter_3d_idle > ENTER_3D_HOLD_SEC:
+			_enter_3d_charge = maxf(0.0, _enter_3d_charge - delta * ENTER_3D_DECAY_PER_SEC)
+			if _enter_3d_charge <= 0.0:
+				_reset_enter_3d()
+			else:
+				_sync_enter_3d_bar()
 	var me := _character()
 	if me[0] != _me[0] or me[1] != _me[1]:
 		_me = me
@@ -247,6 +358,7 @@ func _process(delta: float) -> void:
 		model.ask_roboports(model.shown_surface())
 	cache.flush()
 	_hover_patch()
+	_hover_entity()
 	texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST if scale >= 0.5 else CanvasItem.TEXTURE_FILTER_LINEAR
 	if _alerts_blinked():
 		_redraw = true
@@ -263,6 +375,56 @@ func _process(delta: float) -> void:
 
 
 ## L6: the resource patch under the mouse, asked for once it rests on a tile outside the one shown.
+## The pick radius, in tiles: a few screen pixels, so a building is easy to hit when zoomed out.
+func pick_radius() -> float:
+	return maxf(0.1, Kit.px(4) / scale_now())
+
+
+## The building under the mouse once it rests on a new tile: its name in a tooltip (Factorio's hover on the map).
+func _hover_entity() -> void:
+	if not Bridge.world_ready:
+		return
+	var mouse := get_local_mouse_position()
+	if _dragging or dialog.is_open() or not Rect2(Vector2.ZERO, size).has_point(mouse) 			or get_viewport().gui_get_hovered_control() != self:
+		_clear_hover()
+		return
+	var t := screen_to_tiles(mouse)
+	var tile := Vector2i(floori(t.x), floori(t.y))
+	var now := Time.get_ticks_msec()
+	if tile != _pick_tile:
+		_pick_tile = tile
+		_pick_since = now
+		_clear_hover()
+		return
+	if _hover_q < 0 and _hover_name == "" and now - _pick_since >= int(PATCH_REST * 1000.0):
+		_hover_q = model.pick(t, pick_radius())
+	if _tip.visible:
+		_tip.position = mouse + Kit.pxv(14, 18)
+
+
+func _clear_hover() -> void:
+	_hover_q = -1
+	_hover_name = ""
+	if _tip != null:
+		_tip.visible = false
+
+
+func _on_picked(q: int, unit: int, proto_id: int, _fixed: Vector2i) -> void:
+	if q == _click_q:
+		_click_q = -1
+		if unit > 0 and is_open():
+			entity_picked.emit(unit, proto_id, _fixed)
+	elif q == _hover_q:
+		_hover_q = -1
+		if unit > 0 and proto_name.is_valid() and is_open():
+			_hover_name = Kit.entity_name(str(proto_name.call(proto_id)))
+			_tip_label.text = _hover_name
+			_tip.visible = _hover_name != ""
+			_tip.position = get_local_mouse_position() + Kit.pxv(14, 18)
+		else:
+			_hover_name = "-"  # nothing there: not asked again on this tile
+
+
 func _hover_patch() -> void:
 	if not patch_info or not Bridge.world_ready:
 		return
@@ -322,7 +484,7 @@ static func _uncovered(run: Vector2i, others: Array) -> Array:
 ## The movement keys (WASD and the arrows unless rebound, as the help says), unless the tag dialog
 ## is being typed in.
 func _pan_input() -> Vector2:
-	if dialog.is_open():
+	if dialog.is_open() or search_field.has_focus():
 		return Vector2.ZERO
 	var v := Vector2.ZERO
 	for a in [["move_left", Vector2.LEFT], ["move_right", Vector2.RIGHT], ["move_up", Vector2.UP], ["move_down", Vector2.DOWN]]:
@@ -565,7 +727,8 @@ func shown_platform() -> Dictionary:
 	return {}
 
 
-func show_surface(si: int) -> void:
+func show_surface(si: int, find_pad := true) -> void:
+	_reset_enter_3d()
 	model.set_map_surface(si)
 	_on_surfaces_changed()
 	dialog.close()
@@ -576,7 +739,7 @@ func show_surface(si: int) -> void:
 	else:
 		following = false
 		centre = Vector2.ZERO  # a platform's hub; a planet's middle until its landing pad is known
-		if str(model.map_surface(model.map_si).get("planet", "")) != "":
+		if find_pad and str(model.map_surface(model.map_si).get("planet", "")) != "":
 			_pad_q = model.ask_landing_pad(model.map_si)
 	_redraw = true
 
@@ -592,16 +755,17 @@ func _on_landing_pad(si: int, q: int, at: Vector2, found: bool) -> void:
 
 
 ## Back from the remote view the map zoomed into (issue #4): the map on that surface (0 the
-## character's), centred where the view was, at its closest zoom.
-func return_from_world(si: int, at: Vector2) -> void:
+## character's), centred where the view was, optionally at its closest zoom.
+func return_from_world(si: int, at: Vector2, set_max_zoom := true) -> void:
 	look_at_on(si, at)
-	zoom = MAX_ZOOM
+	if set_max_zoom:
+		zoom = MAX_ZOOM
 
 
 ## The map on another surface (or the character's, 0), centred on `at` (tiles) and zoomed in: an
 ## alert's entity there.
 func look_at_on(si: int, at: Vector2) -> void:
-	show_surface(si)
+	show_surface(si, false)
 	_pad_q = -1
 	following = false
 	centre = at
@@ -666,6 +830,8 @@ func _build_panel() -> void:
 func tag_at(p: Vector2) -> Dictionary:
 	var best := {}
 	var best_d := float(Kit.px(16)) ** 2
+	if not bool(settings.get_value("map/show_tags")):
+		return best  # hidden tags can't be clicked
 	for tag in model.map_tags:
 		var at := tiles_to_screen(tag["position"])
 		if str(tag.get("icon_name", "")) == "":
@@ -681,7 +847,8 @@ func _gui_input(event: InputEvent) -> void:
 	var mb := event as InputEventMouseButton
 	if mb != null:
 		if mb.pressed and dialog.is_open() and mb.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
-			dialog.close()
+			if not mb.double_click:  # the second press of a double click on a tag must not close what the first opened
+				dialog.close()
 			accept_event()
 			return
 		match mb.button_index:
@@ -693,6 +860,16 @@ func _gui_input(event: InputEvent) -> void:
 					zoom_by(1.0 / ZOOM_STEP, mb.position)
 			MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE:
 				_dragging = mb.pressed
+				if mb.button_index == MOUSE_BUTTON_LEFT:
+					# A click (no drag) on a tag opens its properties, as Factorio's.
+					if mb.pressed:
+						_press_at = mb.position
+					elif _press_at != Vector2.INF and mb.position.distance_to(_press_at) < Kit.px(4) and not tag_at(_press_at).is_empty() and not dialog.is_open():
+						edit_tag_at(_press_at)
+					elif _press_at != Vector2.INF and mb.position.distance_to(_press_at) < Kit.px(4) and not dialog.is_open() and not mb.double_click:
+						click_entity(_press_at)
+					if not mb.pressed:
+						_press_at = Vector2.INF
 				if mb.pressed and mb.double_click and mb.button_index == MOUSE_BUTTON_LEFT:
 					_dragging = false
 					edit_tag_at(mb.position)
@@ -708,6 +885,12 @@ func _gui_input(event: InputEvent) -> void:
 		_pad_q = -1
 		_redraw = true
 		accept_event()
+
+
+## A click on the map: asks the mod for the building, train or vehicle there; entity_picked says which.
+func click_entity(p: Vector2) -> void:
+	_clear_hover()
+	_click_q = model.pick(screen_to_tiles(p), pick_radius())
 
 
 ## Opens the tag dialog for the tag under a screen point, or to create one there.
@@ -738,8 +921,85 @@ func _on_tag_confirmed(text: String, icon_name: String) -> void:
 	# There is no "change tag" command: an edit replaces the tag.
 	if _tag_editing >= 0:
 		model.remove_map_tag(_tag_editing)
-	model.add_map_tag(_tag_at, text, "item" if icon_name != "" else "", icon_name)
+	model.add_map_tag(_tag_at, text, (dialog.icon_type if dialog.icon_type != "" else "item") if icon_name != "" else "", icon_name)
 	_tag_editing = -1
+
+
+func _build_search() -> void:
+	search_panel.theme_type_variation = "FFrame"
+	search_panel.visible = false
+	search_panel.anchor_left = 0.5
+	search_panel.anchor_right = 0.5
+	search_panel.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	search_panel.offset_top = Kit.px(48)
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", Kit.px(6))
+	search_panel.add_child(box)
+	search_field.placeholder_text = "Search tags"
+	search_field.custom_minimum_size = Vector2(Kit.px(320), Kit.px(28))
+	MapTagDialog._style_textbox(search_field)
+	search_field.text_changed.connect(func(_t: String) -> void: refresh_search())
+	search_field.gui_input.connect(func(event: InputEvent) -> void:
+		var key := event as InputEventKey
+		if key != null and key.pressed and key.physical_keycode == KEY_ESCAPE:
+			search_panel.visible = false
+			search_field.release_focus()
+			search_field.accept_event())
+	box.add_child(search_field)
+	box.add_child(_search_list)
+	add_child(search_panel)
+
+
+func toggle_search() -> void:
+	search_panel.visible = visible and not search_panel.visible
+	if search_panel.visible:
+		search_field.text = ""
+		refresh_search()
+		search_field.grab_focus()
+	else:
+		search_field.release_focus()
+
+
+## The tags whose text or icon matches the field, nearest the middle of the view first (at most 12).
+func search_matches() -> Array:
+	var needle := search_field.text.strip_edges().to_lower()
+	var out: Array = []
+	for tag in model.map_tags:
+		var hay := (str(tag.get("text", "")) + " " + Kit.pretty(str(tag.get("icon_name", "")))).to_lower()
+		if needle == "" or hay.contains(needle):
+			out.append(tag)
+	out.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return (a["position"] as Vector2).distance_squared_to(centre) < (b["position"] as Vector2).distance_squared_to(centre))
+	return out.slice(0, 12)
+
+
+func refresh_search() -> void:
+	for c in _search_list.get_children():
+		_search_list.remove_child(c)
+		c.queue_free()
+	var found := search_matches()
+	if found.is_empty():
+		_search_list.add_child(Kit.label("Nothing found", "FSmallLabel"))
+	for tag in found:
+		var b := Button.new()
+		b.theme_type_variation = "FBackButton"
+		b.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		b.focus_mode = Control.FOCUS_NONE
+		var name := str(tag.get("text", ""))
+		b.text = name if name != "" else Kit.pretty(str(tag.get("icon_name", "")))
+		if str(tag.get("icon_name", "")) != "":
+			b.icon = Kit.item_icon(str(tag["icon_name"]))
+			b.expand_icon = true
+			b.add_theme_constant_override("icon_max_width", Kit.px(20))
+		b.pressed.connect(func() -> void:
+			following = false
+			centre = tag["position"]
+			zoom = maxf(zoom, DEFAULT_ZOOM)
+			_redraw = true
+			_layers_now = true
+			search_panel.visible = false)
+		_search_list.add_child(b)
+	search_panel.reset_size()
 
 
 func _on_tag_deleted() -> void:
@@ -750,6 +1010,10 @@ func _on_tag_deleted() -> void:
 
 ## Esc closes the dialog first, then the map. Returns true if it did something.
 func escape() -> bool:
+	if search_panel.visible:
+		search_panel.visible = false
+		search_field.release_focus()
+		return true
 	if dialog.is_open():
 		dialog.close()
 		return true

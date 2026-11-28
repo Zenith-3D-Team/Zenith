@@ -87,9 +87,14 @@ func _hud(hud: Hud, player: Node) -> void:
 	for name in ["import", "book", "green-wire", "red-wire"]:
 		check(bar.button(name) != null, "Factorio's %s shortcut is on the bar" % name)
 	check(not bar.button("spidertron").visible and not bar.button("artillery").visible, "the remotes stay off the bar until researched")
+	check(not bar.button("copy").visible and not bar.button("blueprint").visible and not bar.button("red-wire").visible and not bar.button("copper-wire").visible and bar.button("alt").visible,
+		"shortcuts.lua's technology_to_unlock: copy, blueprints and the wires stay off the bar until their technology is researched, Alt-mode has none")
 	bar.update_unlocks({"spidertron": {"state": 2}})
 	check(bar.button("spidertron").visible, "a researched remote shows")
-	bar.update_unlocks(m.techs)
+	bar.update_unlocks({"construction-robotics": {"state": 2}, "electronics": {"state": 2}, "circuit-network": {"state": 1}})
+	check(bar.button("copy").visible and bar.button("decon").visible and bar.button("copper-wire").visible and not bar.button("red-wire").visible and not bar.button("spidertron").visible,
+		"construction-robotics shows copy and the planners, electronics copper wire, an available circuit-network no wires, an unresearched remote leaves again")
+	bar.update_unlocks({"construction-robotics": {"state": 2}, "electronics": {"state": 2}, "circuit-network": {"state": 2}})
 	bar._expand.button_pressed = true
 	await get_tree().process_frame
 	check(bar.chooser_open() and bar._expand.button_pressed, "the ⋮ button opens the shortcut chooser")
@@ -276,6 +281,18 @@ func _hud(hud: Hud, player: Node) -> void:
 		check(_find_checkbox(w._logistics, "Personal logistics") != null and _find_checkbox(w._logistics, "Trash unrequested") != null,
 			"Personal logistics and Trash unrequested, Factorio's labels")
 		check(_find_button(w._logistics, "Add section") != null and _texts(w._logistics).has("Main"), "the Main section and Add section")
+		# With logistic sections the switches send alone: a flat list would merge an item two sections request.
+		m.set("char_sections", [{"i": 1, "g": "", "on": 1, "m": 1, "man": 1, "f": [["iron-plate", "normal", 100, 200, "", -1]]},
+			{"i": 2, "g": "", "on": 1, "m": 1, "man": 1, "f": [["iron-plate", "normal", 10, -1, "", -1]]}])
+		w._logistics_sig = "-"
+		w._refresh_logistics()
+		sent()
+		var trash_box := _find_checkbox(w._logistics, "Trash unrequested")
+		if trash_box != null:
+			trash_box.button_pressed = true
+		var sw := sent_one("set_char_requests")
+		check(sw.get("trash") == 1 and not sw.has("l"), "Trash unrequested with sections sends the switch only, no flat request list: %s" % [sw])
+		m.set("char_sections", null)
 	ui.close_all()
 
 	# --- recipe tooltips, chat ----------------------------------------------------------------------
@@ -284,6 +301,29 @@ func _hud(hud: Hud, player: Node) -> void:
 	var heads := lines.map(func(l: Array) -> String: return str(l[0]))
 	check(heads.has("Ingredients:") and heads.has("Products:") and heads.any(func(t: String) -> bool: return t.ends_with("Crafting time")),
 		"Factorio's recipe tooltip: ingredients, crafting time, products: %s" % [heads])
+	# Batch 3 C11: recipe "Made in:" machine icon rows from rdet.cm.
+	var saved_cm: Dictionary = m.category_machines.duplicate(true)
+	m.category_machines = {"oil-processing": ["oil-refinery"], "crafting-with-fluid": ["assembling-machine-2", "assembling-machine-3"]}
+	var oil_rec := {"name": "basic-oil-processing", "ingredients": [["crude-oil", 100]], "energy": 5.0,
+		"products": [["petroleum-gas", 45]], "hand": false, "categories": ["oil-processing"]}
+	var made_list: Array = m.made_in(oil_rec)
+	var oil_lines: Array = CraftingPanel.recipe_tip_lines(m, oil_rec, true)
+	var icon_line: Array = []
+	for ln in oil_lines:
+		if ln is Array and ln.size() > 3 and str(ln[3]) == "icons":
+			icon_line = ln
+			break
+	var tip_small := Kit.tooltip("Oil", [icon_line])
+	var small_rects := tip_small.find_children("*", "TextureRect", true, false)
+	var nine_machines := ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9"]
+	var tip_grid := Kit.tooltip("Many", [["Made in:", nine_machines, Kit.DISABLED_TEXT, "icons"]])
+	var grids := tip_grid.find_children("*", "GridContainer", true, false)
+	check(made_list == ["oil-refinery"] and icon_line.size() >= 4 and str(icon_line[0]) == "Made in:"
+		and small_rects.size() == 1 and grids.size() == 1 and (grids[0] as GridContainer).columns == 8,
+		"C11: recipe tooltip renders 'Made in:' machine icon rows (HBox<=8, Grid8>8): made=%s line=%s rects=%d grids=%d" % [made_list, icon_line, small_rects.size(), grids.size()])
+	tip_small.free()
+	tip_grid.free()
+	m.category_machines = saved_cm
 	ui.chat.open()
 	await get_tree().process_frame
 	check(ui.chat.backdrop_shown and ui.chat._input.placeholder_text == "", "the open console: a dark backdrop, a plain input line")
@@ -487,6 +527,7 @@ func _info(hud: Hud, player: Node) -> void:
 	check(not ammo.visible and ui.alerts._icons.shown.get("no_ammo") == 0, "alerts that ended go away")
 
 	# --- Factoriopedia ----------------------------------------------------------------------------
+	m._pedia_index_asked = -10000  # _parity's ItemPicker open may have asked within the 3 s throttle
 	sent()
 	key(KEY_F2)
 	await get_tree().process_frame
@@ -508,6 +549,21 @@ func _info(hud: Hud, player: Node) -> void:
 	ui.open_pedia("entity", "transport-belt")
 	check(ui.pedia.kind == "item" and ui.pedia.thing == "transport-belt" and m._pedia_asked.has("item/transport-belt"),
 		"an entity an item builds opens the item's page (as Factoriopedia does), asked for: %s" % [m._pedia_asked.keys()])
+	var pin_btn := ui.pedia.find_child("Pin", true, false) as Button
+	check(pin_btn != null and not pin_btn.disabled, "Factoriopedia's Pin button is enabled")
+	if pin_btn != null:
+		pin_btn.pressed.emit()
+		pin_btn.pressed.emit()
+		check(ui.pinned_pages.size() == 1 and ui.pinned_pages[0].thing == "transport-belt" and ui.pinned_pages[0].is_inside_tree(),
+			"Pin pins the shown page to the screen as one small panel (pinning it again adds none)")
+		ui.pedia.open(false)
+		check(ui.pinned_pages[0].visible, "the pinned panel stays when Factoriopedia is closed")
+		ui.pinned_pages[0].find_child("Open", true, false).pressed.emit()
+		check(ui.pedia.is_open() and ui.pedia.thing == "transport-belt", "its name opens the full page")
+		var pinned_panel: Control = ui.pinned_pages[0]
+		var xs: Array = pinned_panel.find_children("*", "Button", true, false).filter(func(c) -> bool: return c.name != "Open")
+		xs[xs.size() - 1].pressed.emit()
+		check(ui.pinned_pages.is_empty(), "its close button unpins it")
 	m.handle({"t": "pedia", "kind": "item", "name": "transport-belt", "found": 1, "d": {"stack": 100, "made": ["transport-belt"],
 		"used": ["fast-transport-belt", "underground-belt"], "entity": {"type": "transport-belt", "hp": 150, "belt": 15, "res": [["fire", 0, 90]]}}})
 	m.handle({"t": "pedia", "kind": "recipe", "name": "transport-belt", "found": 1, "d": {"ing": [["item", "iron-plate", 1], ["item", "iron-gear-wheel", 1]],
@@ -532,6 +588,31 @@ func _info(hud: Hud, player: Node) -> void:
 	m.handle({"t": "pedia", "kind": "item", "name": "coal", "found": 1, "d": {"stack": 50, "fuel": 4000000, "fcat": ["chemical"]}})
 	var info: Array = ui.item_info("coal")
 	check(info.has(["Fuel value: 4 MJ"]) and info.has(["Stack size: 50"]), "item tooltips get Factorio's stats (fuel value, stack size): %s" % [info])
+	m.handle({"t": "pedia", "kind": "item", "name": "rocket-fuel", "found": 1, "d": {"stack": 10, "fuel": 100000000, "fcat": ["chemical"], "facc": 1.8, "ftop": 1.15}})
+	info = ui.item_info("rocket-fuel")
+	check(info.has(["Vehicle acceleration: 180%"]) and info.has(["Vehicle top speed: 115%"]) and not ui.item_info("coal").any(func(l) -> bool: return str(l[0]).begins_with("Vehicle")),
+		"a fuel's acceleration and top speed multipliers are listed when not 100%%: %s" % [info])
+	m.handle({"t": "pedia", "kind": "item", "name": "firearm-magazine", "found": 1, "d": {"stack": 200, "ammo": "bullet", "mag": 10, "dmg": [["physical", 5]]}})
+	m.handle({"t": "pedia", "kind": "item", "name": "heavy-armor", "found": 1, "d": {"stack": 1, "res": [["physical", 6, 30], ["fire", 0, 30]], "bonus": 0}})
+	info = ui.item_info("firearm-magazine")
+	check(info.has(["Magazine size: 10"]) and info.has(["Damage: 5 Physical"]) and info.has(["Ammo category: Bullet"]),
+		"ammo's tooltip: category, magazine size, damage: %s" % [info])
+	check(ui.item_info("heavy-armor").any(func(l) -> bool: return str(l[0]).contains("Physical: 6/30%")),
+		"armour's tooltip lists its resistances: %s" % [ui.item_info("heavy-armor")])
+	m.handle({"t": "pedia", "kind": "recipe", "name": "uranium-processing", "found": 1, "d": {"ing": [["item", "uranium-ore", 10]], "time": 12,
+		"prod": [["item", "uranium-235", 0.007], ["item", "uranium-238", 0.993]], "prod_detail": [[0.007, 1, 1], [0.993, 1, 1]], "made_in": ["centrifuge"]}})
+	m.handle({"t": "pedia", "kind": "entity", "name": "huge-rock", "found": 1, "d": {"type": "simple-entity", "hp": 2000, "mtime": 3,
+		"mine": [["item", "stone", 37], ["item", "coal", 37]], "mine_detail": [[1, 24, 50], [1, 24, 50]]}})
+	ui.pedia.show_page("recipe", "uranium-processing")
+	ui.pedia.show_page("entity", "huge-rock")
+	for i in 3:
+		await get_tree().process_frame
+	check(_texts(ui.pedia._page).has("24-50 × "), "a rock's mining results give the amount range, not the average: %s" % [_texts(ui.pedia._page)])
+	ui.pedia.show_page("recipe", "uranium-processing")
+	for i in 3:
+		await get_tree().process_frame
+	check(_texts(ui.pedia._page).has("0.7% × ") and _texts(ui.pedia._page).has("99.3% × "),
+		"a recipe's products give their chance (0.7%% Uranium-235), not the average: %s" % [_texts(ui.pedia._page)])
 	key(KEY_F2)
 	await get_tree().process_frame
 	check(not ui.pedia.is_open(), "F2 again closes it")
@@ -683,6 +764,16 @@ func _info(hud: Hud, player: Node) -> void:
 	check(bt.has("Inserter capacity: +1") and bt.has("Movement speed: +35%\nCargo capacity: +1") and bt.has("Damage: +80%")
 		and bt.has("Damage: +40%\n(Stacks with ammo bonuses)") and ui.bonuses._grid.get_child_count() % 4 == 0,
 		"bonuses in Factorio's words, the same things' bonuses in one cell, four to a row: %s" % [bt])
+	m.handle({"t": "bonus", "l": [["character_running_speed_modifier", 0.2, []], ["character_build_distance_bonus", 2, []], ["maximum_following_robot_count", 5, ["defender-capsule"]],
+		["character_trash_slot_count", 10, []]]})
+	await get_tree().process_frame
+	bt = _texts(ui.bonuses)
+	var joined := "\n".join(PackedStringArray(bt))
+	check(joined.contains("Walking speed: +20%") and joined.contains("Build distance: +2") and joined.contains("Follower robot count: +5") and joined.contains("Logistic trash slots: +10"),
+		"walking speed, build distance, follower robots and trash slots are Bonuses lines as in Factorio: %s" % [bt])
+	m.handle({"t": "bonus", "l": []})
+	await get_tree().process_frame
+	check(_texts(ui.bonuses).has("No bonuses researched yet."), "an empty Bonuses window says so (gui-bonus.no-bonuses)")
 	ui.open_global("bonuses")
 	check(not ui.bonuses.is_open(), "its toggle closes it")
 	ui.open_global("alerts")
@@ -695,6 +786,19 @@ func _info(hud: Hud, player: Node) -> void:
 	check(ui.alerts.hidden_kinds.has("destroyed"), "a disabled alert leaves the alert bar")
 	ac.set_flag("Entity destroyed", "disabled", false)
 	check(not ui.alerts.hidden_kinds.has("destroyed"), "and comes back")
+	# /alerts <enable | disable | mute | unmute> <alert> (core locale alert-muted ... available-alerts) does what the boxes do.
+	var con = ui.chat.console
+	check(ac.KEYS.size() == ac.TYPES.size(), "/alerts: a game name for every alert type")
+	check(await con.run("/alerts disable entity_destroyed") == "Alert type entity_destroyed has been disabled." and ui.alerts.hidden_kinds.has("destroyed"),
+		"/alerts disable hides the alert like the Disabled box")
+	check(await con.run("/alerts disable entity_destroyed") == "Alert type entity_destroyed is already disabled.", "/alerts: already disabled")
+	check(await con.run("/alerts enable entity_destroyed") == "Alert type entity_destroyed has been enabled." and not ui.alerts.hidden_kinds.has("destroyed"), "/alerts enable")
+	check(await con.run("/alerts enable entity_destroyed") == "Alert type entity_destroyed isn't disabled.", "/alerts: isn't disabled")
+	check(await con.run("/alerts mute turret_out_of_ammo") == "Alert type turret_out_of_ammo has been muted." and ui.alerts.muted_kinds.has("no_ammo"), "/alerts mute")
+	check(await con.run("/alerts mute turret_out_of_ammo") == "Alert type turret_out_of_ammo is already muted.", "/alerts: already muted")
+	check(await con.run("/alerts unmute turret_out_of_ammo") == "Alert type turret_out_of_ammo has been unmuted." and not ui.alerts.muted_kinds.has("no_ammo"), "/alerts unmute")
+	check(await con.run("/alerts unmute turret_out_of_ammo") == "Alert type turret_out_of_ammo isn't muted.", "/alerts: isn't muted")
+	check((await con.run("/alerts mute nonsense")).begins_with("Available alerts: entity_destroyed,"), "/alerts with an unknown alert lists them")
 	# The alert sound (Factorio's alert_destroyed beep): when something is destroyed; not when a turret runs out
 	# of ammunition (owner), unless --alert-sounds=ammo, then once; not for what was there already, not for damage,
 	# not when muted or disabled.
@@ -803,9 +907,26 @@ func _info(hud: Hud, player: Node) -> void:
 	await get_tree().process_frame
 	await get_tree().process_frame
 	var rt := _texts(ui.research)
+	# Effects in Factorio's own words come from its locale files; without an install (CI's runners) the plain
+	# fallback is drawn ("Mining drill productivity bonus: +10%"), checked instead.
+	var Locale := preload("res://scripts/world/locale_names.gd")
+	Locale._load()
+	var have_locale := Locale._lookup("modifier-description", "laboratory-speed") != ""
+	var mining_fx := "Mining productivity: +10%" if have_locale else "Mining drill productivity bonus: +10%"
 	check(rt.has("Mining productivity 7 (Available)") and rt.has("Infinite technology: each level costs more") and rt.has("Units: 1000*(L - 2) (L: the level)")
-		and rt.has("25% researched before it was stopped") and rt.any(func(t) -> bool: return str(t).contains("Mining drill productivity bonus")),
+		and rt.has("25% researched before it was stopped") and rt.any(func(t) -> bool: return str(t) == mining_fx),
 		"an infinite technology by its level, its formula, kept progress and bonus: %s" % [rt.filter(func(t) -> bool: return str(t) != "").slice(0, 30)])
+	var fx := func(e: Array) -> String: return str(load("res://scripts/ui/factorio/info_text.gd").effect_line(e)[0])
+	if not have_locale:
+		check(fx.call(["ammo-damage", "bullet", 0.1]) == "Ammo damage (Bullet): +10%" and fx.call(["laboratory-speed", "", 0.2]) == "Laboratory speed: +20%",
+			"technology effects without Factorio's locale: the effect's own words, rates in percent: %s" % [[fx.call(["ammo-damage", "bullet", 0.1]), fx.call(["laboratory-speed", "", 0.2])]])
+		print("skip technology effects in Factorio's [modifier-description] words: no Factorio install (its locale)")
+	else:
+		check(fx.call(["ammo-damage", "bullet", 0.1]) == "Bullet damage: +10%" and fx.call(["turret-attack", "gun-turret", 0.25]) == "Gun turret damage: +25%"
+			and fx.call(["gun-speed", "cannon-shell", 0.2]) == "Cannon shell shooting speed: +20%" and fx.call(["laboratory-speed", "", 0.2]) == "Lab research speed: +20%"
+			and fx.call(["bulk-inserter-capacity-bonus", "", 1.0]) == "Bulk inserter capacity: +1" and fx.call(["maximum-following-robots-count", "", 5.0]) == "Maximum following robots: +5"
+			and fx.call(["unlock-circuit-network", "", 0.0]) == "Unlocks circuit network." and fx.call(["worker-robot-storage", "", 1.0]) == "Worker robot capacity: +1",
+			"technology effects in Factorio's [modifier-description] words: counts plain, rates in percent: %s" % [[fx.call(["ammo-damage", "bullet", 0.1]), fx.call(["turret-attack", "gun-turret", 0.25]), fx.call(["unlock-circuit-network", "", 0.0]), fx.call(["laboratory-speed", "", 0.2])]])
 	ui.research.select("steam-power")
 	await get_tree().process_frame
 	await get_tree().process_frame
@@ -850,6 +971,14 @@ func _find_slot_item(node: Node, item: String) -> Control:
 ## gone when the bridge no longer lists them.
 
 
+## Stands in for Zenith's item picker: choose() says what was asked and picks at once.
+class PickerStub extends Node:
+	var opened: Callable
+
+	func choose(kinds: Array, callback: Callable, _title := "") -> void:
+		opened.call(kinds, callback)
+
+
 func _mod_windows(hud: Hud) -> void:
 	var mg = hud.ui.mod_gui
 	# Off by default (owner: not usable yet): a mod's window isn't drawn.
@@ -885,6 +1014,92 @@ func _mod_windows(hud: Hud) -> void:
 	var want := Vector2(100, 50) * 1.5 + (aim - window.global_position) * (1.5 / zs)
 	check(mg.factorio_point(go).is_equal_approx(want) and mg.display == [1920.0, 1080.0, 1.5],
 		"mod windows: a button's place in Factorio's window (%s, want %s)" % [mg.factorio_point(go), want])
+	mg.handle({"t": "mgui", "ids": [5, 6, 7], "l": [{"i": 7, "r": "screen", "at": [300, 50], "e": {"t": "frame", "a": [{"t": "slider", "v": 3, "mn": 1, "mx": 10}]}}]})
+	await get_tree().process_frame
+	var slider := (mg._windows[7]["node"] as Control).find_children("*", "HSlider", true, false)[0] as HSlider
+	check(slider.min_value == 1.0 and slider.max_value == 10.0 and slider.value == 3.0, "mod windows: a slider shows its value in its range (%s in %s..%s)" % [slider.value, slider.min_value, slider.max_value])
+	# A mod's textfield is typed in here: each change goes to the bridge (`mset`, on_gui_text_changed there), and the
+	# bridge's next reading of the window, a letter behind a fast typist, doesn't undo what was typed or take the focus.
+	mg.handle({"t": "mgui", "ids": [5, 6, 7, 11], "l": [{"i": 11, "r": "screen", "at": [300, 300], "e": {"t": "frame", "ix": 11, "a": [
+		{"t": "textfield", "ix": 12, "n": "field", "tx": "ab"}, {"t": "textfield", "ix": 13, "n": "locked", "tx": "x", "en": false}, {"t": "textfield", "tx": "no index"}]}}]})
+	await get_tree().process_frame
+	var tf := mg._windows[11]["node"].find_children("field", "LineEdit", true, false)[0] as LineEdit
+	var locked := mg._windows[11]["node"].find_children("locked", "LineEdit", true, false)[0] as LineEdit
+	check(tf.editable and not locked.editable and tf.text == "ab", "mod windows: a textfield with an index can be typed in, a disabled one can't")
+	mg.sets_sent.clear()
+	tf.text = "abc"
+	tf.text_changed.emit("abc")
+	check(mg.sets_sent == [[12, "abc"]], "mod windows: typing in a mod's textfield is sent to the bridge: %s" % [mg.sets_sent])
+	tf.text = "abcd"
+	tf.text_changed.emit("abcd")
+	tf.grab_focus()
+	tf.caret_column = 4
+	var focus_ok := tf.has_focus()
+	var seen := tf.is_visible_in_tree()
+	# the bridge read it when it had heard "abc" only
+	mg.handle({"t": "mgui", "ids": [5, 6, 7, 11], "l": [{"i": 11, "r": "screen", "at": [300, 300], "e": {"t": "frame", "ix": 11, "a": [
+		{"t": "textfield", "ix": 12, "n": "field", "tx": "abc"}]}}]})
+	await get_tree().process_frame
+	var tf2 := mg._windows[11]["node"].find_children("field", "LineEdit", true, false)[0] as LineEdit
+	check(tf2 != tf and tf2.text == "abcd" and tf2.has_focus() and tf2.caret_column == 4,
+		"mod windows: the bridge's reading of what it had heard keeps the typed text, the focus and the caret (%s, focus %s, before %s, visible %s)" % [tf2.text, tf2.has_focus(), focus_ok, seen])
+	mg.handle({"t": "mgui", "ids": [5, 6, 7, 11], "l": [{"i": 11, "r": "screen", "at": [300, 300], "e": {"t": "frame", "ix": 11, "a": [
+		{"t": "textfield", "ix": 12, "n": "field", "tx": ""}]}}]})
+	await get_tree().process_frame
+	var tf3 := mg._windows[11]["node"].find_children("field", "LineEdit", true, false)[0] as LineEdit
+	check(tf3.text == "", "mod windows: a text the mod set (not one heard from here) replaces what was typed (%s)" % [tf3.text])
+	# Checkbox, radio button, drop-down, list-box and slider: each change goes to the bridge as the value Factorio's event carries.
+	mg.handle({"t": "mgui", "ids": [5, 6, 7, 14], "l": [{"i": 14, "r": "screen", "at": [500, 300], "e": {"t": "frame", "ix": 14, "a": [
+		{"t": "checkbox", "ix": 15, "n": "box", "c": "Tick", "s": true}, {"t": "radiobutton", "ix": 16, "n": "radio", "s": false},
+		{"t": "drop-down", "ix": 17, "n": "drop", "it": ["a", "b", "c"], "si": 2}, {"t": "list-box", "ix": 18, "n": "list", "it": ["x", "y"], "si": 1},
+		{"t": "slider", "ix": 19, "n": "slide", "v": 2, "mn": 0, "mx": 10, "stp": 1}, {"t": "checkbox", "n": "plain", "s": false}]}}]})
+	await get_tree().process_frame
+	var w14: Control = mg._windows[14]["node"]
+	var box := w14.find_children("box", "CheckBox", true, false)[0] as CheckBox
+	var radio := w14.find_children("radio", "CheckBox", true, false)[0] as CheckBox
+	var drop := w14.find_children("drop", "OptionButton", true, false)[0] as OptionButton
+	var rows := w14.find_children("list", "ItemList", true, false)[0] as ItemList
+	var slide := w14.find_children("slide", "HSlider", true, false)[0] as HSlider
+	check(box.button_pressed and drop.selected == 1 and drop.item_count == 3 and rows.is_selected(0) and slide.value == 2.0 and slide.editable and slide.step == 1.0,
+		"mod windows: checkbox, drop-down, list-box and slider show the mod's values")
+	mg.sets_sent.clear()
+	box.button_pressed = false
+	radio.button_pressed = true
+	radio.button_pressed = false
+	check(mg.sets_sent == [[15, false], [16, true]] and radio.button_pressed, "mod windows: a checkbox and a radio button send their state, a radio button is never switched off: %s" % [mg.sets_sent])
+	mg.sets_sent.clear()
+	drop.select(2)
+	drop.item_selected.emit(2)
+	rows.select(1)
+	rows.item_selected.emit(1)
+	slide.value = 7
+	check(mg.sets_sent == [[17, 3], [18, 2], [19, 7.0]], "mod windows: a drop-down and a list-box send the 1-based index, a slider its value: %s" % [mg.sets_sent])
+	mg.handle({"t": "mgui", "ids": [5, 6, 7, 14, 21], "l": [{"i": 21, "r": "screen", "at": [600, 300], "e": {"t": "frame", "ix": 21, "a": [
+		{"t": "switch", "ix": 22, "n": "sw", "s": "left", "lc": "Off", "rc": "On"}, {"t": "choose-elem-button", "ix": 23, "n": "pick", "et": "signal", "ev": "signal-A", "evt": "virtual"}]}}]})
+	await get_tree().process_frame
+	var sw_buttons := (mg._windows[21]["node"].find_children("sw", "HBoxContainer", true, false)[0] as Control).get_children()
+	mg.sets_sent.clear()
+	(sw_buttons[1] as Button).pressed.emit()
+	check(sw_buttons.size() == 2 and (sw_buttons[0] as Button).button_pressed and mg.sets_sent == [[22, "right"]],
+		"mod windows: a switch's side is clicked to set it: %s" % [mg.sets_sent])
+	# A choose-elem-button opens Zenith's picker; the pick goes to the bridge (a signal as {type, name}).
+	var picked_kinds := []
+	var fake_picker := PickerStub.new()
+	fake_picker.opened = func(kinds: Array, cb: Callable) -> void:
+		picked_kinds.append(kinds)
+		cb.call("virtual", "signal-B")
+	mg.picker = fake_picker
+	var pick_button := mg._windows[21]["node"].find_children("pick", "Button", true, false)[0] as Button
+	mg.sets_sent.clear()
+	pick_button.pressed.emit()
+	fake_picker.free()
+	mg.picker = null
+	check(picked_kinds == [["item", "fluid", "virtual"]] and mg.sets_sent == [[23, {"type": "virtual", "name": "signal-B"}]],
+		"mod windows: a choose-elem-button opens the picker for a signal's kinds: %s %s" % [picked_kinds, mg.sets_sent])
+	# A newer tree held back while the player drags is built when they let go.
+	mg._held[14] = {"i": 14, "r": "screen", "at": [500, 300], "e": {"t": "frame", "ix": 14, "a": [{"t": "slider", "ix": 19, "n": "slide", "v": 4, "mn": 0, "mx": 10}]}}
+	mg._process(0.0)
+	check(mg._windows[14]["node"] != w14 and mg._held.is_empty(), "mod windows: a held window is built once nothing is being dragged")
 	var top_button: Control = mg._windows[6]["node"]
 	check(mg.factorio_point(top_button).x >= 0.0, "mod windows: a top button maps too")
 	Settings.set_value("interface", "mod_clicks", false)
@@ -1505,7 +1720,7 @@ func _alt_sequences() -> void:
 	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [[960, ["speed-module-3", ["speed-module-3", "rare"], "productivity-module-3",
 		"productivity-module-3"]], [961, ["speed-module", "speed-module"], seven], [962, ["speed-module-3", "speed-module-3"]]]})
 	w.handle({"t": "am", "g": Bridge.alt_contents + 5, "l": [[961]]})
-	overlay.collect()
+	alt_collect(overlay)
 	check(overlay.drawn == 1 + 4 + 9 and (w.alt_machines_now().get(961, []) as Array).size() == 2,
 		"K1, K2: the recipe, four modules, seven packs and two modules drawn; the beacon's not while the mouse is off it: %d" % overlay.drawn)
 	var anchor := func(x: float) -> Vector2:
@@ -1526,13 +1741,13 @@ func _alt_sequences() -> void:
 	check(rare == null or (overlay._marks.get(rare, []) as Array).size() == 1,
 		"K1: a rare module carries its quality's mark (when the install has the picture)")
 	fake_player.hovered = w.entities[962]
-	overlay.collect()
+	alt_collect(overlay)
 	check(overlay.drawn == 1 + 4 + 9 + 2, "K1: the beacon's modules with the mouse on it, as Factorio 2.1 draws them: %d" % overlay.drawn)
 	fake_player.hovered = null
 	rig.first_person = true
 	rig.camera.position = Vector3(12.5, 1.6, 14)
 	rig.camera.look_at(Vector3(12.5, 1.0, 5.5))
-	overlay.collect()
+	alt_collect(overlay)
 	var shown_quads := overlay._quads.filter(func(q): return q.visible)
 	check(overlay.drawn == 1 + 4 + 9 and shown_quads.size() == overlay.drawn + overlay._marks_3d,
 		"K1, K2: first person draws them as depth-tested quads (C9), quality marks besides: %d %d" % [overlay.drawn, shown_quads.size()])
@@ -1540,10 +1755,10 @@ func _alt_sequences() -> void:
 	rig.camera.position = Vector3(12.5, 40, 5.5)
 	rig.camera.look_at(Vector3(12.5, 0, 5.5), Vector3(0, 0, -1))
 	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [[960], [961, 0, seven.slice(0, 2)]]})
-	overlay.collect()
+	alt_collect(overlay)
 	var cleared := overlay.drawn
 	Bridge.set_alt_contents(false)
-	overlay.collect()
+	alt_collect(overlay)
 	check(cleared == 1 + 2 and overlay.drawn == 1 and w.alt_machines_now().is_empty(),
 		"K1, K2: [unit] clears a machine's icons, 0 leaves a lab its packs alone, Alt-mode off draws none of them: %d %d" % [cleared, overlay.drawn])
 	if turns_before > 0:
@@ -1552,6 +1767,19 @@ func _alt_sequences() -> void:
 	overlay._process(0.0)
 	overlay.queue_free()
 	holder.queue_free()
+	# Batch 3 C6: Fluid-input-only assembler omits spare output arrow (both from fb and fc, and turns 'b' into inward arrow).
+	var fb_c6 := {"fb": [[0, -1, 0, "i"], [0, 1, 8, "o"]]}
+	var arr_in_fb: Array = AltArrowsScript.arrows_for("assembling-machine", fb_c6, Vector2(5.5, 5.5), 0, 1, [])
+	var fluid_in_fb := arr_in_fb.filter(func(a: Array) -> bool: return int(a[0]) == AltArrowsScript.FLUID or int(a[0]) == AltArrowsScript.FLUID_BOTH)
+	var fc_c6 := [[0, -1, 0, "i", "water"], [0, 1, 8, "o", ""]]
+	var arr_in_fc: Array = AltArrowsScript.arrows_for("assembling-machine", fb_c6, Vector2(5.5, 5.5), 0, 1, fc_c6)
+	var fluid_in_fc := arr_in_fc.filter(func(a: Array) -> bool: return int(a[0]) == AltArrowsScript.FLUID or int(a[0]) == AltArrowsScript.FLUID_BOTH)
+	var arr_both_as_in: Array = AltArrowsScript.arrows_for("assembling-machine", {"fb": [[0, -1, 0, "b"]]}, Vector2(5.5, 5.5), 0, 1, [[0, -1, 0, "b", "water"]])
+	check(fluid_in_fb.size() == 1 and (fluid_in_fb[0][2] as Vector2).is_equal_approx(Vector2(0, 1))
+		and fluid_in_fc.size() == 1 and (fluid_in_fc[0][2] as Vector2).is_equal_approx(Vector2(0, 1))
+		and arr_both_as_in.any(func(a: Array) -> bool: return int(a[0]) == AltArrowsScript.FLUID and (a[2] as Vector2).is_equal_approx(Vector2(0, 1)))
+		and not arr_both_as_in.any(func(a: Array) -> bool: return int(a[0]) == AltArrowsScript.FLUID_BOTH),
+		"C6: fluid-input-only assembler (fa=1) omits spare output arrow and converts 'b' to inward arrow: fb=%s fc=%s both=%s" % [fluid_in_fb, fluid_in_fc, arr_both_as_in])
 
 
 ## K1's leftover: Alt-mode draws an ammo turret's ammo and a locomotive's fuel, one icon a filled
@@ -1613,7 +1841,7 @@ func _alt_stock() -> void:
 	Bridge.loco_fuel_icons = true  # the old way (--loco-fuel-icons=on); off by default, checked below
 	Bridge.set_alt_contents(true)
 	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [[970, 0, ["firearm-magazine"]], [980, 0, ["coal", ["wood", "rare"]]]]})
-	overlay.collect()
+	alt_collect(overlay)
 	var ammo_rects: Array = overlay._icons.get(Kit.item_icon("firearm-magazine"), [])
 	var coal_rects: Array = overlay._icons.get(Kit.item_icon("coal"), [])
 	var wood_rects: Array = overlay._icons.get(Kit.item_icon("wood"), [])
@@ -1641,7 +1869,7 @@ func _alt_stock() -> void:
 	for i in 40:
 		trains.handle({"t": "mv", "k": 2 + i, "l": [[980, 32, (16 * 256) + 26 * (i + 1), 6 * 256, 0]]})
 		trains._process(1.0 / 60.0)
-	overlay.collect()
+	alt_collect(overlay)
 	coal_rects = overlay._icons.get(Kit.item_icon("coal"), [])
 	var moved: Vector3 = trains.position_of(980)
 	var moved_at: Vector2 = rig.camera.unproject_position(moved + Vector3(0, Visuals.height_for(w.protos.entity(32)), 0))
@@ -1652,7 +1880,7 @@ func _alt_stock() -> void:
 	rig.first_person = true
 	rig.camera.position = Vector3(11, 1.6, 16)
 	rig.camera.look_at(Vector3(11, 1.0, 6))
-	overlay.collect()
+	alt_collect(overlay)
 	var shown_quads := overlay._quads.filter(func(q): return q.visible)
 	check(overlay.drawn == 3 and shown_quads.size() == overlay.drawn + overlay._marks_3d,
 		"K1: first person draws them as quads too: %d %d" % [overlay.drawn, shown_quads.size()])
@@ -1661,17 +1889,17 @@ func _alt_stock() -> void:
 	rig.camera.look_at(Vector3(11, 0, 6), Vector3(0, 0, -1))
 	# The switch: neither drawn, whatever the bridge sent.
 	AltOverlay.ammo_fuel = false
-	overlay.collect()
+	alt_collect(overlay)
 	var off_drawn := overlay.drawn
 	AltOverlay.ammo_fuel = true
-	overlay.collect()
+	alt_collect(overlay)
 	check(off_drawn == 0 and overlay.drawn == 3, "K1: --alt-ammo-fuel=off draws no ammo or fuel, as before: %d, on %d" % [off_drawn, overlay.drawn])
 	# Wagon items (owner): a cargo wagon's kinds in one row of half-tile cells, following it; the locomotive's fuel
 	# gone unless --loco-fuel-icons=on.
 	trains.handle({"t": "mv", "k": 60, "l": [[981, 33, 16 * 256, 12 * 256, 0]]})
 	trains._process(1.0 / 60.0)
 	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [[981, 0, ["iron-plate", "coal", "stone"]]]})
-	overlay.collect()
+	alt_collect(overlay)
 	var plate_rects: Array = overlay._icons.get(Kit.item_icon("iron-plate"), [])
 	var wagon_3d: Vector3 = trains.position_of(981)
 	var wagon_at: Vector2 = rig.camera.unproject_position(wagon_3d + Vector3(0, Visuals.height_for(w.protos.entity(33)), 0))
@@ -1679,18 +1907,18 @@ func _alt_stock() -> void:
 		and absf((plate_rects[0] as Rect2).get_center().y - wagon_at.y) < 1.0 and overlay.drawn == 6,
 		"wagon items: a cargo wagon's three kinds drawn in a row over it (with the 3 already there): %d %s at %s" % [overlay.drawn, plate_rects, wagon_at])
 	Bridge.loco_fuel_icons = false
-	overlay.collect()
+	alt_collect(overlay)
 	check(overlay.drawn == 4 and not overlay._icons.has(Kit.item_icon("wood")) and (overlay._icons.get(Kit.item_icon("iron-plate"), []) as Array).size() == 1,
 		"wagon items: with --loco-fuel-icons off (default) the locomotive's fuel icons are gone, the wagon's stay: %d" % overlay.drawn)
 	Bridge.loco_fuel_icons = true
 	trains.remove(981)
 	# A turret that ran out is cleared; the locomotive gone from the movers takes its icons with it.
 	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [[970], [971, 0, [["piercing-rounds-magazine", "rare"]]]]})
-	overlay.collect()
+	alt_collect(overlay)
 	var swapped := overlay.drawn == 3 and (overlay._icons.get(Kit.item_icon("piercing-rounds-magazine"), []) as Array).size() == 1 \
 		and not overlay._icons.has(Kit.item_icon("firearm-magazine"))
 	trains.remove(980)
-	overlay.collect()
+	alt_collect(overlay)
 	check(swapped and trains.proto_id_of(980) == 0 and overlay.drawn == 1,
 		"K1: [unit] clears a turret out of ammo, another's shows; a locomotive that left takes its icons: %d" % overlay.drawn)
 	Bridge.loco_fuel_icons = loco_icons_before
@@ -1751,7 +1979,7 @@ func _alt_icon_order() -> void:
 	w.handle({"t": "am", "g": Bridge.alt_contents, "l": [[997, 0, ["firearm-magazine"]], [996, 0, six]]})
 	# [overlapping pairs of icons at different depths, those drawn with the farther one in front].
 	var judge := func() -> Array:
-		overlay.collect()
+		alt_collect(overlay)
 		var icons := overlay.paint_list().filter(func(e): return e[0] == "i")
 		var pairs := 0
 		var wrong := 0
@@ -1802,7 +2030,7 @@ func _alt_icon_order() -> void:
 		var lab_rows: bool = rows_ok.call()
 		# The layers kept for an unchanged view and icons give the same order.
 		var kept_same: bool = overlay.paint_list() == (func() -> Array:
-			overlay.collect()
+			alt_collect(overlay)
 			return overlay.paint_list()).call()
 		# The turret's ammo overlaps the lab's packs behind it, and is drawn after them.
 		var ammo_over := false
@@ -1829,7 +2057,7 @@ func _alt_icon_order() -> void:
 	rig.camera.projection = Camera3D.PROJECTION_PERSPECTIVE
 	rig.first_person = true
 	var lab_quads := func() -> Array:
-		overlay.collect()
+		alt_collect(overlay)
 		var top_q: MeshInstance3D = null
 		var low_q: MeshInstance3D = null
 		for q: MeshInstance3D in overlay._quads:
@@ -1937,25 +2165,25 @@ func _alt_icon_order_kept() -> void:
 		out.sort()
 		return out
 	var kept_matches := func(what: String) -> void:
-		overlay.collect()
+		alt_collect(overlay)
 		var kept: Array = overlay.paint_list()
 		var kept_set: Array = drawn_set.call()
 		var mine: Array = frame_set.call()
 		overlay._layers_key = []
-		overlay.collect()
+		alt_collect(overlay)
 		var fresh: Array = overlay.paint_list()
 		check(kept_set == mine and kept == fresh and not mine.is_empty(),
 			"alt icon order, kept layers after %s: this frame's icons drawn (%d), none stale or missing, as a fresh layering (%s)"
 			% [what, mine.size(), kept == fresh])
-	overlay.collect()
-	overlay.collect()
+	alt_collect(overlay)
+	alt_collect(overlay)
 	kept_matches.call("nothing changed")
 	w._add([1992, 41, 20 * 256 + 128, 11 * 256 + 128, 0, {"ai": ["recipe", "automation-science-pack"]}])
-	overlay.collect()  # a frame between, so the next is judged against kept layers
+	alt_collect(overlay)  # a frame between, so the next is judged against kept layers
 	kept_matches.call("a recipe changed")
 	w._add([1991, 41, 20 * 256 + 128, 14 * 256 + 128, 0, {"ai": ["recipe", "automation-science-pack"]}])
 	w._add([1992, 41, 20 * 256 + 128, 11 * 256 + 128, 0, {"ai": ["recipe", "logistic-science-pack"]}])
-	overlay.collect()
+	alt_collect(overlay)
 	kept_matches.call("two recipes swapped between neighbours")
 	w._add([1999, 41, 20 * 256 + 128, 20 * 256 + 128, 0, {"ai": ["recipe", "electronic-circuit"]}])
 	kept_matches.call("a machine built")
@@ -1980,7 +2208,7 @@ func _alt_icon_order_kept() -> void:
 	var pitch := deg_to_rad(48.0)
 	rig.camera.position = Vector3(16, 0, 10) + Vector3(0, sin(pitch), cos(pitch)) * 100.0
 	rig.camera.look_at(Vector3(16, 0, 10))
-	overlay.collect()  # the icons loaded from the install first
+	alt_collect(overlay)  # the icons loaded from the install first
 	var icons := overlay.paint_list().filter(func(e): return e[0] == "i")
 	var wrong := 0
 	var pairs := 0
@@ -2002,7 +2230,7 @@ func _alt_icon_order_kept() -> void:
 			if rebuild:
 				overlay._layers_key = []
 			var t0 := Time.get_ticks_usec()
-			overlay.collect()
+			alt_collect(overlay)
 			total += Time.get_ticks_usec() - t0
 		return total / 5000.0
 	for cap in [cap_before, 100000]:
@@ -2016,7 +2244,7 @@ func _alt_icon_order_kept() -> void:
 				rig.camera.projection = Camera3D.PROJECTION_ORTHOGONAL
 				rig.camera.position = Vector3(16, 0, 10) + Vector3(0, sin(pitch), cos(pitch)) * 100.0
 				rig.camera.look_at(Vector3(16, 0, 10))
-			overlay.collect()
+			alt_collect(overlay)
 			var made: float = timed.call(true)
 			var kept: float = timed.call(false)
 			AltOverlay.icon_order = false
@@ -2037,7 +2265,7 @@ func _alt_icon_order_kept() -> void:
 			rig.camera.size = size
 			rig.camera.position = Vector3(16, 0, 10) + Vector3(0, sin(pitch), cos(pitch)) * 100.0
 			rig.camera.look_at(Vector3(16, 0, 10))
-			overlay.collect()
+			alt_collect(overlay)
 			var made: float = timed.call(true)
 			var kept: float = timed.call(false)
 			AltOverlay.icon_order = false
@@ -2064,7 +2292,12 @@ func _alt_icon_order_kept() -> void:
 	rig.camera.look_at(Vector3(16, 0, 10))
 	var marks_over := func() -> int:
 		overlay._layers_key = []
-		overlay.collect()
+		alt_collect(overlay)
+		# --alt-incremental builds at most ALT_VIEW_BUDGET_USEC of chunks in view a frame: settle first.
+		for _f in 50:
+			if not overlay._inc_view_left:
+				break
+			alt_collect(overlay)
 		var list: Array = overlay.paint_list()
 		var owner_depth := {}
 		for i in overlay._e_tex.size():
@@ -2105,7 +2338,7 @@ func _alt_icon_order_kept() -> void:
 	rig.first_person = true
 	rig.camera.position = Vector3(12.5, 9.0, 9.0)
 	rig.camera.look_at(Vector3(12.5, 1.0, 5.5))
-	overlay.collect()
+	alt_collect(overlay)
 	var top_q: MeshInstance3D = null
 	var low_q: MeshInstance3D = null
 	var module_q: MeshInstance3D = null
@@ -2131,6 +2364,95 @@ func _alt_icon_order_kept() -> void:
 	Bridge.set_alt_contents(false)
 	if turns_before > 0:
 		Bridge.set_alt_contents(true)
+	overlay.on = false
+	overlay._process(0.0)
+	overlay.queue_free()
+	holder.queue_free()
+
+
+func _alt_robot_items() -> void:
+	var holder := Node3D.new()
+	add_child(holder)
+	var w := WorldMirror.new()
+	holder.add_child(w)
+	w.protos.add_items([[1, "iron-plate"]])
+	w.protos.add_entities([[5, "logistic-robot", "logistic-robot", -0.2, -0.2, 0.2, 0.2, 1, 1, 1, 1, 1]])
+	var movers := MoverLayer.new()
+	movers.protos = w.protos
+	movers.eprops = {5: {"x": {"spd": 0.05, "low": 0.2}}}
+	holder.add_child(movers)
+	movers.handle_robots({"t": "rb", "k": 100, "part": 1, "parts": 1, "p": 20, "sm": 1000,
+		"u": [800, 5, 100, 12 * 256, 5 * 256, 20 * 256, 5 * 256, 0, 0, 250, 8]})
+	movers._process(1.0 / 60.0)
+
+	var gs := GDScript.new()
+	gs.source_code = "extends Node3D\nvar world\nvar rig\nvar camera: Camera3D\nvar first_person := false\nvar hovered\nvar movers\nvar remote_fog\n"
+	gs.reload()
+	var rig: Node3D = gs.new()
+	rig.camera = Camera3D.new()
+	rig.add_child(rig.camera)
+	holder.add_child(rig)
+	rig.camera.position = Vector3(12.5, 25.0, 15.0)
+	rig.camera.look_at(Vector3(12.5, 1.5, 5.0), Vector3(0, 1, 0))
+
+	var fake_player: Node3D = gs.new()
+	fake_player.world = w
+	fake_player.rig = rig
+	fake_player.movers = movers
+
+	var ui_m := UiModel.new()
+	ui_m.handle({"t": "rc", "l": [800, 1, 4], "q": [800, "rare"]})
+	var rc_entry: Variant = ui_m.robot_cargo.get(800)
+	check(rc_entry is Dictionary and int((rc_entry as Dictionary).get("item_id", 0)) == 1
+		and int((rc_entry as Dictionary).get("count", 0)) == 4
+		and str((rc_entry as Dictionary).get("quality", "")) == "rare"
+		and ui_m.robot_cargo_rev > 0,
+		"UiModel parses rc with item_id, count, quality, and increments robot_cargo_rev: %s" % [rc_entry])
+
+	var mark_standin := false
+	if Slot.quality_icon("rare") == null:
+		var qimg := Image.create(4, 4, false, Image.FORMAT_RGBA8)
+		qimg.fill(Color.CYAN)
+		Slot._quality_icons["rare"] = ImageTexture.create_from_image(qimg)
+		mark_standin = true
+
+	var overlay := AltOverlay.new()
+	overlay.model = ui_m
+	overlay.player = fake_player
+	overlay.on = true
+	add_child(overlay)
+	overlay._process(1.0 / 60.0)
+	alt_collect(overlay)
+	var paint := overlay.paint_list()
+	var has_mark := paint.any(func(e): return e[0] == "m")
+	check(overlay.drawn >= 1 and has_mark,
+		"AltOverlay draws carried item icon and quality mark for flying robot: drawn=%d mark=%s" % [overlay.drawn, has_mark])
+
+	var rq_before := overlay.redraws_queued
+	for _i in 10:
+		movers._process(1.0 / 60.0)
+	overlay._process(1.0 / 60.0)
+	check(overlay.redraws_queued > rq_before,
+		"AltOverlay queues live redraw when robot carrying cargo moves: %d -> %d" % [rq_before, overlay.redraws_queued])
+
+	AltOverlay.robot_items = false
+	alt_collect(overlay)
+	check(overlay.drawn == 0, "AltOverlay hides carried robot icons when --alt-robot-items=off: drawn=%d" % overlay.drawn)
+	AltOverlay.robot_items = true
+
+	rig.first_person = true
+	rig.camera.position = Vector3(12.5, 4.0, 9.0)
+	rig.camera.look_at(Vector3(12.5, 1.5, 5.0))
+	alt_collect(overlay)
+	check(overlay.drawn >= 1, "AltOverlay 3D path places quad for carried robot item: drawn=%d" % overlay.drawn)
+	rig.first_person = false
+
+	ui_m.handle({"t": "rc", "l": []})
+	alt_collect(overlay)
+	check(overlay.drawn == 0, "AltOverlay clears robot cargo icons when empty rc arrives: drawn=%d" % overlay.drawn)
+
+	if mark_standin:
+		Slot._quality_icons.erase("rare")
 	overlay.on = false
 	overlay._process(0.0)
 	overlay.queue_free()

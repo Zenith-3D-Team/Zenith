@@ -37,6 +37,7 @@ func _reset_overrides() -> void:
 	ShaderRefresh.baked_hash_file_override = ""
 	ShaderRefresh.addon_roots_override = null
 	ShaderRefresh.restart_runner_override = Callable()
+	ShaderRefresh.driver_override = ""
 
 
 func _make_link(at: String, to: String) -> bool:
@@ -151,8 +152,9 @@ func _test_stamp_and_compile_state(base: String) -> void:
 	ShaderRefresh.mark_warmed()
 	_check(not FileAccess.file_exists(build_file), "headless mark_warmed does not write build file")
 
-	# Non-headless simulation with missing build file.
+	# Non-headless simulation with missing build file (drawing with Direct3D 12, the Windows default).
 	ShaderRefresh.headless_override = 0
+	ShaderRefresh.driver_override = "d3d12"
 	var stamp := ShaderRefresh.build_stamp()
 	_check(stamp.begins_with(str(Engine.get_version_info().get("string", ""))), "build_stamp starts with Godot version")
 	_check(stamp.ends_with(" addons:none"), "build_stamp appends addons:none when no addon shaders")
@@ -167,8 +169,22 @@ func _test_stamp_and_compile_state(base: String) -> void:
 	# mark_warmed writes two-line key=value format and satisfies needs_compile when cache exists.
 	ShaderRefresh.mark_warmed()
 	var written := FileAccess.get_file_as_string(build_file)
-	_check(written == "stamp=%s\nwarmed=1\n" % stamp, "mark_warmed writes stamp= and warmed=1 lines")
+	_check(written == "stamp=%s\nwarmed=1\ndriver=d3d12\n" % stamp, "mark_warmed writes stamp=, warmed=1 and driver= lines")
 	_check(not ShaderRefresh.needs_compile(), "needs_compile is false when stamp matches, warmed=1, and shader_cache exists")
+
+	# Each driver has its own pipeline cache: warmed on one, the other warms once (nothing deleted, no restart).
+	ShaderRefresh.driver_override = "vulkan"
+	_check(ShaderRefresh.needs_compile(), "switching renderer (warmed on d3d12, now vulkan) triggers one warm-up")
+	_check(not ShaderRefresh.restart_if_new_build() and DirAccess.dir_exists_absolute(cache_shader),
+		"switching renderer neither restarts nor deletes caches")
+	ShaderRefresh.mark_warmed()
+	_check(not ShaderRefresh.needs_compile(), "after the warm-up on vulkan it is warm")
+	# A file written before 0.3.1 (no driver= line) was warmed on Vulkan.
+	_write_text(build_file, "stamp=%s\nwarmed=1\n" % stamp)
+	_check(not ShaderRefresh.needs_compile(), "a file with no driver= line counts as warmed on vulkan")
+	ShaderRefresh.driver_override = "d3d12"
+	_check(ShaderRefresh.needs_compile(), "and on d3d12 that old file triggers one warm-up")
+	ShaderRefresh.mark_warmed()
 
 	# Missing shader_cache directory still forces compile.
 	SafeDelete.remove_tree_checked(cache_shader)
@@ -256,6 +272,7 @@ func _test_restart_and_locking(base: String) -> void:
 	_write_text(cache_vk.path_join("b.bin"), "2")
 	_write_text(build_file, "stamp=%s\nwarmed=1\n" % stamp)
 	ShaderRefresh.user_args_override = PackedStringArray(["--shader-refresh=force", "--foo=bar"])
+	ShaderRefresh.driver_override = "vulkan"
 	_check(ShaderRefresh.restart_if_new_build(), "force refresh with existing caches triggers restart")
 	_check(int(captured["calls"]) == 1, "spawned once")
 	_check(not DirAccess.dir_exists_absolute(cache_shader) and not DirAccess.dir_exists_absolute(cache_vk),
@@ -265,6 +282,10 @@ func _test_restart_and_locking(base: String) -> void:
 	var child_args: PackedStringArray = captured["args"]
 	_check(not child_args.has("--shader-refresh=force") and child_args.has("--shader-refresh-restarted") and child_args.has("--foo=bar"),
 		"child args strip --shader-refresh=force and append --shader-refresh-restarted")
+	var driver_at := child_args.find("--rendering-driver")
+	_check(driver_at >= 0 and driver_at + 1 < child_args.size() and child_args[driver_at + 1] == "vulkan"
+		and driver_at < child_args.find("--"),
+		"the restart starts on the driver this run draws with (--rendering-driver vulkan kept, before --)")
 
 	# 3. --shader-refresh-restarted prevents loop.
 	_write_text(cache_shader.path_join("a.bin"), "1")

@@ -26,6 +26,11 @@ const Switches := preload("res://scripts/switches.gd")
 static var tank_windows := Switches.has("--tank-window=on")
 ## On unless --pipe-fluids=off: fluid shown inside windowed straight pipes.
 static var pipe_fluids := Switches.on("--pipe-fluids")
+## On unless --fluid-windows-index=off (perf-world-8): the units that can show a window (storage tanks,
+## straight pipes with Factorio's window) are kept per chunk from entities_changed, _update_windows walks
+## those instead of every fluid box in view, and a complete `fl` that changes no such unit's first box
+## (fluid, amount, capacity) draws nothing again. The same windows either way.
+static var windows_index := Switches.value("--fluid-windows-index", "on") != "off"
 
 const NO_POWER := 0
 ## Low power: no icon (Factorio draws none), but the entity info's status and dimmer lamps.
@@ -58,6 +63,8 @@ var _icons: MultiMeshInstance3D  # the no-power icons
 var icon_spots: Array[Transform3D] = []
 ## [Transform3D, linear Color, fill] for each drawn pipe fluid column (tests, since headless Dummy drops MultiMesh data).
 var pipe_fluid_spots: Array = []
+## [transforms, colours] of the tank windows last drawn (tests: headless Dummy drops MultiMesh data).
+var window_spots: Array = [[], []]
 var _windows: MultiMeshInstance3D
 var _pipe_fluids: MultiMeshInstance3D
 var _pipe_cavities := {}  # [Mesh, horizontal] -> {"cy", "r", "half_len"}
@@ -70,6 +77,14 @@ var _icon_chunks := {}  # Vector2i chunk -> true (chunks currently contributing 
 var _window_chunks := {}  # Vector2i chunk -> true (chunks currently contributing fluid windows)
 var icon_rebuilds := 0  # (tests) how many times _update_icons ran
 var window_rebuilds := 0  # (tests) how many times _update_windows ran
+var fl_skips := 0  # (tests) complete `fl`s that changed no window (windows_index)
+## (windows_index) chunk -> {unit: true}: its storage tanks and windowed straight pipes (_windowable).
+var _win_units := {}
+var _indexed_world: WorldMirror
+var _kind_of := {}  # (windows_index) proto id -> 0 other, 1 storage tank, 2 pipe
+## (windows_index) chunk -> {unit: [Rec, pc, dir, its column's Transform3D or null]} (_pipe_xform), dropped when the
+## chunk changes, the models do (ModelLibrary.generation) or the world's records are read again.
+var _pipe_xforms := {}
 var _model_generation := -1
 
 static var _core_textures := {}  # path under data/ -> Texture2D or null
@@ -138,6 +153,11 @@ func reset() -> void:
 	_window_chunks.clear()
 	icon_rebuilds = 0
 	window_rebuilds = 0
+	fl_skips = 0
+	_win_units.clear()
+	_kind_of.clear()
+	_pipe_xforms.clear()
+	_indexed_world = null  # read again from the world's chunks on the next frame
 	for t in _frame:
 		_frame[t] = -1
 		_incoming[t] = {}
@@ -161,8 +181,76 @@ func _chunk_has_any(chunk: Vector2i, table: Dictionary) -> bool:
 func _on_entities_changed(chunk: Vector2i) -> void:
 	if _icon_chunks.has(chunk) or _chunk_has_any(chunk, unpowered):
 		_icons_dirty = true
+	if windows_index and _indexed_world == world:
+		_pipe_xforms.erase(chunk)
+		var units := _index_chunk(chunk)
+		if _windows_dirty or _window_chunks.has(chunk):
+			_windows_dirty = true
+			return
+		for unit in units:
+			if fluids.has(unit):
+				_windows_dirty = true
+				return
+		return
 	if _window_chunks.has(chunk) or _chunk_has_any(chunk, fluids):
 		_windows_dirty = true
+
+
+## (windows_index) Whether a record can show a window: a storage tank, or a straight pipe with Factorio's
+## window (world.gd sets `pw`, `pc` its connections), what _update_windows draws from.
+func _windowable(rec: WorldMirror.Rec) -> bool:
+	var kind: Variant = _kind_of.get(rec.proto_id)
+	if kind == null:
+		var proto: ProtoDB.EntityProto = world.protos.entity(rec.proto_id)
+		kind = 0 if proto == null else (1 if proto.type == "storage-tank" else (2 if proto.type == "pipe" else 0))
+		if proto != null:
+			_kind_of[rec.proto_id] = kind
+	if int(kind) == 1:
+		return true
+	return int(kind) == 2 and rec.extra.has("pw") and (int(rec.extra.get("pc", 0)) & 15) in [5, 10]
+
+
+## (windows_index) A chunk's windowable units read again (one pass over its records); returns them.
+func _index_chunk(chunk: Vector2i) -> Dictionary:
+	var units := {}
+	var cv = world.chunks.get(chunk)
+	if cv != null:
+		for rec in cv.entities.values():
+			if _windowable(rec):
+				units[rec.unit] = true
+	if units.is_empty():
+		_win_units.erase(chunk)
+	else:
+		_win_units[chunk] = units
+	return units
+
+
+## (windows_index) Every chunk read (a new world, or after reset()).
+func _index_all() -> void:
+	_win_units.clear()
+	_pipe_xforms.clear()
+	_indexed_world = world
+	for c in world.chunks:
+		_index_chunk(c)
+
+
+## (windows_index) Whether a complete `fl` changes what a window shows: a windowable unit gained or lost
+## its boxes, or its first box's fluid, amount or capacity moved (all _update_windows reads of `fl`).
+func _fl_changes_windows(before: Dictionary, after: Dictionary) -> bool:
+	for c in _win_units:
+		for unit in _win_units[c]:
+			var a: Variant = before.get(unit)
+			var b: Variant = after.get(unit)
+			if a == null and b == null:
+				continue
+			if a == null or b == null:
+				return true
+			var ba: Dictionary = (a as Array)[0]
+			var bb: Dictionary = (b as Array)[0]
+			if int(ba["amount"]) != int(bb["amount"]) or int(ba["capacity"]) != int(bb["capacity"]) \
+					or str(ba["fluid"]) != str(bb["fluid"]):
+				return true
+	return false
 
 
 ## True when the machine has no power or isn't connected (low power counts as powered, dimly).
@@ -205,8 +293,13 @@ func handle(msg: Dictionary) -> void:
 	if int(msg.get("part", 1)) < int(msg.get("parts", 1)):
 		return
 	if t == "fl":
+		var before := fluids
 		fluids = into
-		_windows_dirty = true
+		if not windows_index or world == null or _indexed_world != world or _windows_dirty \
+				or _fl_changes_windows(before, into):
+			_windows_dirty = true
+		else:
+			fl_skips += 1
 	elif t == "ht":
 		heat = into
 		if world != null and world.animator != null:
@@ -227,9 +320,13 @@ func _process(_delta: float) -> void:
 		_wired_world = world
 		if not world.entities_changed.is_connected(_on_entities_changed):
 			world.entities_changed.connect(_on_entities_changed)
+	if windows_index and _indexed_world != world:
+		_index_all()
+		_windows_dirty = true
 	if _model_generation != ModelLibrary.generation:
 		_model_generation = ModelLibrary.generation  # tops of models that were still being made
 		_pipe_cavities.clear()
+		_pipe_xforms.clear()
 		_icons_dirty = true
 		_windows_dirty = true
 	if _visuals_dirty:
@@ -286,57 +383,112 @@ func _update_windows() -> void:
 	var pipe_colors: Array[Color] = []
 	var pipe_custom: Array[Color] = []
 	var want_pipes := pipe_fluids and ModelLibrary.pipe_windows
-	for unit in fluids:
-		var rec: WorldMirror.Rec = world.entities.get(unit)
-		if rec == null:
-			continue
-		var proto: ProtoDB.EntityProto = world.protos.entity(rec.proto_id)
-		if proto == null:
-			continue
-		var box: Dictionary = (fluids[unit] as Array)[0]
-		if proto.type == "storage-tank":
-			if not tank_windows:
+	if windows_index and _indexed_world == world:
+		for c in _win_units:
+			var kept: Dictionary = _pipe_xforms.get(c, {})
+			if kept.is_empty():
+				_pipe_xforms[c] = kept
+			for unit in _win_units[c]:
+				var boxes: Variant = fluids.get(unit)
+				if boxes == null:
+					continue
+				var rec: WorldMirror.Rec = world.entities.get(unit)
+				if rec == null or rec.chunk != c:
+					continue
+				var box: Dictionary = (boxes as Array)[0]
+				if int(_kind_of.get(rec.proto_id, 0)) != 2:
+					_window_of(rec, box, want_pipes, xforms, colors, pipe_xforms, pipe_colors, pipe_custom)
+					continue
+				if not want_pipes:
+					continue
+				# A pipe: where its column stands is kept until its chunk changes or the models do.
+				_window_chunks[rec.chunk] = true
+				var at: Variant = kept.get(unit)
+				var pc := int(rec.extra.get("pc", 0))
+				if at == null or (at as Array)[0] != rec or int((at as Array)[1]) != pc or int((at as Array)[2]) != rec.dir:
+					at = [rec, pc, rec.dir, _pipe_xform(rec, world.protos.entity(rec.proto_id))]
+					kept[unit] = at
+				if (at as Array)[3] != null:
+					_pipe_column((at as Array)[3], box, pipe_xforms, pipe_colors, pipe_custom)
+	else:
+		for unit in fluids:
+			var rec: WorldMirror.Rec = world.entities.get(unit)
+			if rec == null:
 				continue
-			_window_chunks[rec.chunk] = true
-			var fill := clampf(float(box["amount"]) / maxf(float(box["capacity"]), 1.0), 0.0, 1.0)
-			var top := entity_top(rec)
-			var face := _south_face(rec, proto)
-			var middle := top * WINDOW_MIDDLE
-			var size := Vector2(WINDOW_SIZE.x, minf(WINDOW_SIZE.y, top * 0.6))
-			# Over an add-on's hills (ground_height.gd), as the tank's model is lifted in its shader.
-			var at := Vector3(rec.pos.x, middle + GroundHeight.at(rec.pos.x, face), face)
-			xforms.append(Transform3D(Basis.from_scale(Vector3(size.x + 0.08, size.y + 0.08, 0.03)), at))
-			colors.append(Color(0.08, 0.09, 0.1))
-			if fill > 0.0:
-				var h := size.y * fill
-				var fluid_color: Color = world.protos.fluid_colors.get(str(box["fluid"]), Color(0.3, 0.5, 0.8))
-				xforms.append(Transform3D(Basis.from_scale(Vector3(size.x, h, 0.03)), at + Vector3(0.0, (h - size.y) * 0.5, 0.012)))
-				# Dark fluids (crude oil) stay dark but still read against the black glass.
-				colors.append(fluid_color.lerp(Color.WHITE, 0.08))
-		elif want_pipes and proto.type == "pipe" and rec.extra.has("pw"):
-			_window_chunks[rec.chunk] = true
-			var pc := int(rec.extra.get("pc", 0)) & 15
-			if not (pc in [5, 10]):
-				continue
-			if not ModelLibrary.model_name(proto.name, proto.type, rec.extra, rec.dir).ends_with("-window"):
-				continue
-			var mesh := world.ready_mesh(proto, rec)
-			if mesh == null:
-				continue
-			var fluid_name := str(box.get("fluid", ""))
-			if fluid_name == "":
-				continue
-			var amount := float(box["amount"])
-			var capacity := maxf(float(box["capacity"]), 1.0)
-			var fill := clampf(amount / capacity, 0.08, 1.0) if amount > 0.0 else 0.06
-			var horizontal := pc == 10
-			var cav := _pipe_cavity(mesh, horizontal)
-			var rot := Basis(Vector3.UP, PI * 0.5) if horizontal else Basis.IDENTITY
-			var basis := rot * Basis.from_scale(Vector3(float(cav["r"]), float(cav["r"]), float(cav["half_len"]) * 2.0))
-			pipe_xforms.append(Transform3D(basis, Vector3(rec.pos.x, float(cav["cy"]), rec.pos.y)))
-			var fc: Color = world.protos.fluid_colors.get(fluid_name, Color(0.3, 0.5, 0.8))
-			pipe_colors.append(fc.srgb_to_linear())
-			pipe_custom.append(Color(fill, 0.0, 0.0, 0.0))
+			_window_of(rec, (fluids[unit] as Array)[0], want_pipes, xforms, colors, pipe_xforms, pipe_colors, pipe_custom)
+	_draw_windows(xforms, colors, pipe_xforms, pipe_colors, pipe_custom)
+
+
+## One fluid box's window (`box` the unit's first): a tank's level, or a windowed straight pipe's column,
+## into the arrays _draw_windows draws.
+func _window_of(rec: WorldMirror.Rec, box: Dictionary, want_pipes: bool, xforms: Array[Transform3D],
+		colors: Array[Color], pipe_xforms: Array[Transform3D], pipe_colors: Array[Color], pipe_custom: Array[Color]) -> void:
+	var proto: ProtoDB.EntityProto = world.protos.entity(rec.proto_id)
+	if proto == null:
+		return
+	if proto.type == "storage-tank":
+		if not tank_windows:
+			return
+		_window_chunks[rec.chunk] = true
+		var fill := clampf(float(box["amount"]) / maxf(float(box["capacity"]), 1.0), 0.0, 1.0)
+		var top := entity_top(rec)
+		var face := _south_face(rec, proto)
+		var middle := top * WINDOW_MIDDLE
+		var size := Vector2(WINDOW_SIZE.x, minf(WINDOW_SIZE.y, top * 0.6))
+		# Over an add-on's hills (ground_height.gd), as the tank's model is lifted in its shader.
+		var at := Vector3(rec.pos.x, middle + GroundHeight.at(rec.pos.x, face), face)
+		xforms.append(Transform3D(Basis.from_scale(Vector3(size.x + 0.08, size.y + 0.08, 0.03)), at))
+		colors.append(Color(0.08, 0.09, 0.1))
+		if fill > 0.0:
+			var h := size.y * fill
+			var fluid_color: Color = world.protos.fluid_colors.get(str(box["fluid"]), Color(0.3, 0.5, 0.8))
+			xforms.append(Transform3D(Basis.from_scale(Vector3(size.x, h, 0.03)), at + Vector3(0.0, (h - size.y) * 0.5, 0.012)))
+			# Dark fluids (crude oil) stay dark but still read against the black glass.
+			colors.append(fluid_color.lerp(Color.WHITE, 0.08))
+	elif want_pipes and proto.type == "pipe" and rec.extra.has("pw"):
+		_window_chunks[rec.chunk] = true
+		var at: Variant = _pipe_xform(rec, proto)
+		if at != null:
+			_pipe_column(at, box, pipe_xforms, pipe_colors, pipe_custom)
+
+
+## A windowed straight pipe's fluid column where it stands (its glass's cavity), or null: not straight, its
+## model has no window, or no mesh yet. Nothing here reads `fl` (_pipe_xforms keeps it, windows_index).
+func _pipe_xform(rec: WorldMirror.Rec, proto: ProtoDB.EntityProto) -> Variant:
+	var pc := int(rec.extra.get("pc", 0)) & 15
+	if not (pc in [5, 10]):
+		return null
+	if not ModelLibrary.model_name(proto.name, proto.type, rec.extra, rec.dir).ends_with("-window"):
+		return null
+	var mesh := world.ready_mesh(proto, rec)
+	if mesh == null:
+		return null
+	var horizontal := pc == 10
+	var cav := _pipe_cavity(mesh, horizontal)
+	var rot := Basis(Vector3.UP, PI * 0.5) if horizontal else Basis.IDENTITY
+	var basis := rot * Basis.from_scale(Vector3(float(cav["r"]), float(cav["r"]), float(cav["half_len"]) * 2.0))
+	return Transform3D(basis, Vector3(rec.pos.x, float(cav["cy"]), rec.pos.y))
+
+
+## A pipe's column at `at` in its fluid's colour, as full as its box (`box` its first); none without a fluid.
+func _pipe_column(at: Transform3D, box: Dictionary, pipe_xforms: Array[Transform3D], pipe_colors: Array[Color],
+		pipe_custom: Array[Color]) -> void:
+	var fluid_name := str(box.get("fluid", ""))
+	if fluid_name == "":
+		return
+	var amount := float(box["amount"])
+	var capacity := maxf(float(box["capacity"]), 1.0)
+	var fill := clampf(amount / capacity, 0.08, 1.0) if amount > 0.0 else 0.06
+	pipe_xforms.append(at)
+	var fc: Color = world.protos.fluid_colors.get(fluid_name, Color(0.3, 0.5, 0.8))
+	pipe_colors.append(fc.srgb_to_linear())
+	pipe_custom.append(Color(fill, 0.0, 0.0, 0.0))
+
+
+## The windows and pipe columns drawn (_update_windows).
+func _draw_windows(xforms: Array[Transform3D], colors: Array[Color], pipe_xforms: Array[Transform3D],
+		pipe_colors: Array[Color], pipe_custom: Array[Color]) -> void:
+	window_spots = [xforms, colors]
 	var mm := _windows.multimesh
 	mm.instance_count = xforms.size()
 	for i in xforms.size():

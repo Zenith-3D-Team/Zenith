@@ -20,12 +20,13 @@ const BUSES := {
 	"master": ["Master", ""], "effects": ["Effects", "Master"], "music": ["Music", "Master"],
 	"ui": ["UI", "Master"], "walking": ["Walking", "Effects"], "environment": ["Environment", "Effects"],
 	"weapons": ["Weapons", "Effects"], "explosions": ["Explosions", "Effects"], "enemies": ["Enemies", "Effects"],
-	"ambient": ["Ambient", "Effects"],
+	"ambient": ["Ambient", "Effects"], "wind": ["Wind", "Effects"], "alerts": ["Alerts", "Master"],
 }
 
 static var volumes := {
 	"master": 0.8, "effects": 1.0, "music": 0.0, "ui": 1.0,
 	"walking": 1.0, "environment": 1.0, "weapons": 1.0, "explosions": 1.0, "enemies": 1.0, "ambient": 1.0,
+	"wind": 1.0, "alerts": 1.0,
 }
 ## Factorio's box beside each slider: false mutes that bus.
 static var enabled := {}

@@ -232,7 +232,7 @@ from a search each of the same square (3-4 ms each on the owner's base); worms, 
 ticks. How many of each the movers' search found goes into storage on its tick, so what those jobs keep there is the
 same on every peer. A pod or train appearing with nothing else changed shows with the movers' next search (8-32 ticks
 later) unless a rocket launch or a cargo pod setting off or arriving (their events) brings that search forward; a new
-worm shows within 300 ticks. `/f3d-bs two_call` (on by default; `/f3d-bs two_call off` for the four-call check every
+worm shows within 300 ticks. `robot_opt` (on by default; `/f3d-perf robot_opt off` to restore 60 Hz polling) caches force robot speed modifiers for 60 ticks, scales robot/charging/roboport cadences by rate factor and movement distance, uses `inv.is_empty()` for cargo reads, and caps work via the adaptive budget. `/f3d-bs two_call` (on by default; `/f3d-bs two_call off` for the four-call check every
 time, kept in the save, and a save that never set it takes the default): a watched lane's check
 reads its item count and its front item's place first and takes it as unchanged when both are as last seen, the
 four-call check (stacks, back item) only when either differs and every fourth check anyway; not for lanes leading out
@@ -360,8 +360,7 @@ Z puts on a belt is told at once as an inserter's put is (`ie` kind 6 with no in
 unique id; for a client whose hello says `ho`), and the belt's drift checks come every turn again (`quiet_pc`'s
 wake), on top of `put_lanes`' read, which can wait behind other asked lanes. Factorio's own Z onto a belt in the game
 window (hybrid) wakes the belt and reads its lanes, if Factorio raises `on_player_dropped_item_into_entity` for a
-belt (not checked). Off: the lanes' read alone, as before. Zenith's side, `--belt-drop-show-now` (on; off: as
-before): the dropped item shows at once, standing where it lands on the nearest lane drawn, until the drawn clock
+belt (not checked). Off: the lanes' read alone, as before. Zenith's side, `--belt-drop-glide` (on; `--belt-drop-glide=off`: static drop card as before) glides hand-dropped items along the lane immediately rather than holding them static until `put`, and `--belt-drop-show-now` (on; off: as before): the dropped item shows at once, standing where it lands on the nearest lane drawn, until the drawn clock
 (about half a second behind the game) reaches the bridge's put; the simulated item shows there from then. One the
 bridge doesn't confirm (out of reach, the belt full there, an older bridge, `--inserter-handoff=off`) goes after
 1.5 s.
@@ -420,6 +419,7 @@ list the queue as `events`. Off: all of it in the event, as before.
 (`gc_pace.lua`, `gc` in `/f3d-profile`), in small steps up to a budget of work (twice what was allocated) and of memory
 freed (twice that, 1 MB at least), a cycle starting once the heap is twice what is live, with a live sentinel so Lua 5.2's sweep never starts by freeing everything the cycle
 threw away at once; a heap over 4 times the paced base (or 512 MB) restarts the collector until the next tick paces it again (checked each tick, after packets and commands; `rescues` in `/f3d-status`); off: Lua's own collector restarted, its steps landing in whichever module allocates, as before.
+`/f3d-perf gc_lean` (on): eliminates per-loop inline closures, caches valid `LuaEntity`/`LuaInventory`/`LuaTransportLine` handles across ticks, guards inventory scans with `is_empty()`, throttles steady-focus `find_entities_filtered` rescans, and yields to `budget.left()` across `movers`, `alerts`, `inserters`, `fluids_power`, and `alt_mode`; off: restores legacy per-tick scans and closures.
 `/f3d-bs watch_lean` (on): a lane's methods (`get_item_count`, `get_item_position`, `get_detailed_contents`,
 `get_contents`) read off the line once and kept with it (reading a method off a game object makes a new function, 88
 bytes, each time); off: read again at every call, as before. `/f3d-bs scan_incremental` (on): the belt square's scan
@@ -762,14 +762,14 @@ Down, and in dev builds the debug line's F4 and the debug menu's Control + F12),
 | Holding rails | Click a rail end, or anywhere along a line to fork a new one off it, to start the rail planner there: the path of straight and curved rails to the cursor shows, click (or drag from the end) builds it and carries on from its end; ghosts where your rails run out. Alt+R (while holding rails; otherwise it gives red wire): rail layer (a ramp up, elevated rails with supports). Right click lets go |
 | Holding grenades, cliff explosives, capsules | The throw range and blast show; left click throws at the cursor (hold to keep throwing). Fish heal you |
 | R / Shift+R | Rotate the held item (rails by 45°), or the hovered entity: an underground belt turns with its other end, both swapping entrance and exit, as Factorio turns a pair (J23). While dragging belts it bends the line (see Left mouse). Building the same belt over a belt turns it; a faster belt (or anything that fast-replaces) replaces it |
-| Left mouse with nothing held | Open the hovered building's screen (chests, assemblers, furnaces, labs, drills, boilers...) beside your inventory: its name, status (Working, No ingredients, No fuel, No power...), energy, slots and fluid boxes. E, Esc or its × closes it |
+| Left mouse with nothing held | Open the hovered building's screen (chests, assemblers, furnaces, labs, drills, boilers...) beside your inventory: its name, status (Working, No ingredients, No fuel, No power...), energy, slots and fluid boxes. E, Esc or its × closes it. With `--click-open-held` (on; `--click-open-held=off` builds on click as before), plain left-click while holding a placeable entity over a real openable building/mover also opens it unless upgrading/fast-replacing, rotating the same entity type in a new direction, reviving a matching ghost, or holding Shift/Ctrl |
 | Recipe slot in an assembler's screen | Click to pick its recipe from the grid below; right click clears it. Items it was holding come back to you |
 | Q | Put the held item (the cursor stack) away; with nothing held over an entity, a train, wagon or vehicle, the pipette: hold its item, turned the same way (a ghost cursor when you have none) |
 | Z (hold) | Drop one of the held item: into the machine or chest under the mouse, onto a belt, or on the ground |
 | Shift+left click | Holding an item: build a ghost of it for robots. Holding nothing: paste the settings copied with Shift+right click (recipe, filters, requests, combinator settings) |
 | Ctrl+left / Ctrl+right click an entity | Fast transfer: the held stack (half) into it, or with nothing held its output (half) into your inventory. When the held stack empties, the next stack of the item comes into the hand |
 | H / V | Flip the item being built, or the entity under the mouse (machines with fluid boxes) |
-| Alt | Alt-mode: recipe and filter icons over every machine in view (they come with the buildings, issue #9; an idle furnace keeps its last recipe's, J2), over each chest the kinds it holds most of, up to four (the bridge reads the chests round the focus about once a second while Alt-mode is on, J6), over machines the modules in them, over labs their science packs, over ammo turrets their ammo and over locomotives their fuel, in rows where Factorio puts them (its prototypes' icons_positioning; a beacon's only with the mouse on it; read in the same rounds, K1, K2; `--alt-ammo-fuel=off`: no ammo or fuel, as before), each machine's own icon shifted and scaled by its icon_draw_specification (`--alt-icon-spec=off`: centred at one size, as before), where icons overlap the one nearest the camera drawn in front (a north-south line of assemblers' recipes in the angled view, a lab's lower row of packs over its upper, a turret's ammo over the lab behind it; in the angled view, F6 and first person; `--alt-icon-order=old`: in the order found, a farther icon over a nearer one as before; the order kept steady while the camera only moves, so icons at one depth (a row of chests or inserters) no longer swap places and flicker while panning or running; `--alt-depth-order=old`: ordered by depth from the camera as before (the CPU path's: the icons drawn by the graphics card are always in the steady order); the icons are placed and drawn by the graphics card in the angled view and F6, sent to it only when they change, so a moving camera costs the CPU next to nothing (their pictures copied into one texture array, at most 16 new ones a frame, the rest blank for a frame or a few; never more layers than the card allows); first person, the remote view's fog and a headless run stay on the CPU; `--alt-icons=cpu`: every icon worked out and drawn on the CPU each frame as before, `--alt-icons=gpu`: the card even headless), Factorio's fluid arrows on machines and pumps and a recycler's output arrow, inserters' arrows when chosen in Settings → Interface (kept between games; `--alt-cache=off`, `--alt-flat-batch-tex=off`, `--alt-arrows-opt=off`, and `--quality-marks-opt=off` restore uncached/unbatched Alt-mode and mark passes); it toggles when Alt is let go, unless Alt was held for an Alt+click |
+| Alt | Alt-mode: recipe and filter icons over every machine in view (they come with the buildings, issue #9; an idle furnace keeps its last recipe's, J2), over each chest the kinds it holds most of, up to four (the bridge reads the chests round the focus about once a second while Alt-mode is on, J6), over machines the modules in them, over labs their science packs, over ammo turrets their ammo and over locomotives their fuel, in rows where Factorio puts them (its prototypes' icons_positioning; a beacon's only with the mouse on it; read in the same rounds, K1, K2; `--alt-ammo-fuel=off`: no ammo or fuel, as before), each machine's own icon shifted and scaled by its icon_draw_specification (`--alt-icon-spec=off`: centred at one size, as before), where icons overlap the one nearest the camera drawn in front (a north-south line of assemblers' recipes in the angled view, a lab's lower row of packs over its upper, a turret's ammo over the lab behind it; in the angled view, F6 and first person; `--alt-icon-order=old`: in the order found, a farther icon over a nearer one as before; the order kept steady while the camera only moves, so icons at one depth (a row of chests or inserters) no longer swap places and flicker while panning or running; `--alt-depth-order=old`: ordered by depth from the camera as before (the CPU path's: the icons drawn by the graphics card are always in the steady order); the icons are placed and drawn by the graphics card in the angled view and F6, sent to it only when they change, so a moving camera costs the CPU next to nothing (their pictures copied into one texture array, at most 16 new ones a frame, the rest blank for a frame or a few; never more layers than the card allows); first person, the remote view's fog and a headless run stay on the CPU; `--alt-icons=cpu`: every icon worked out and drawn on the CPU each frame as before, `--alt-icons=gpu`: the card even headless; chests' contents, machines' rows and pipes' fluids kept per chunk and built again only for a chunk that changed (a chunk built again or unloaded, one chest's or machine's row, a pipe whose fluid changed), in view the frame it changes (at most 3 ms of chunks a frame, the rest a frame later), so walking no longer rebuilds the whole map's icons several times a second; `--alt-incremental=off`: the whole map's built again as before; the card's icon instances sorted, packed and joined in C++, AltIconsNative, a turned view sorting every chunk at once with no GDScript per chunk; `--alt-native=off`: in GDScript as before), Factorio's fluid arrows on machines and pumps and a recycler's output arrow, inserters' arrows when chosen in Settings → Interface (kept between games; `--alt-cache=off`, `--alt-flat-batch-tex=off`, `--alt-arrows-opt=off`, and `--quality-marks-opt=off` restore uncached/unbatched Alt-mode and mark passes); it toggles when Alt is let go, unless Alt was held for an Alt+click |
 | Alt+click | Factoriopedia's page of the thing under the mouse (in the world, or a slot or technology in a window) |
 | F2 | Factoriopedia |
 | L | Logistic networks: every network of the force, its robots and items |
@@ -1107,7 +1107,7 @@ decor_models=true ; 3D .glb/.gltf models for raised decoratives (Placeholders + 
 
 Command-line options (after `--`) override the file for that run: `--volume=0.5` (master),
 `--sfx-volume=`, `--music-volume=0.3` (turns the soundtrack on), `--ui-volume=`, `--mute`,
-`--max-voices=8`, `--no-fx` (no smoke or explosions), `--pack-sounds=off` (no sounds from model
+`--max-voices=8`, `--no-fx` (no smoke or explosions), `--rocket-vfx=old` (legacy sprite-card rocket launch VFX, diagonal door slide, and no terrain hole or 3D shaft), `--pack-sounds=off` (no sounds from model
 packs, as Settings → Sound's "Sounds from model packs" off, `[sound] pack_sounds`), `--pack-tiles=off`
 (no ground textures from model packs, as Settings → Graphics' "Ground textures from model packs" off,
 `[graphics] pack_tiles`), `--pack-tile-pbr=off` (ignore companion `-normal`/`-height`/`-roughness`
@@ -1218,7 +1218,13 @@ the Factorio sprite pack (`builtin:factorio`) ignores it; FUE5 (`builtin:fue5`) 
 draws FUE5 Factorio's), Wube3DP (`builtin:wube3dp`) uses `"shading": "pbr"` with `"shading_models"` keeping rigged
 creatures, the character, and belts on `"factorio"` (`--wube3dp-pbr=off` draws all of Wube3DP Factorio's), and
 Placeholders (`builtin:placeholders`) uses `"shading": "pbr"` with `"shading_models"` keeping Zenith-covered models, their directional siblings, rigged creatures and Zenith-covered items on
-`"factorio"` (`--placeholder-pbr=off` draws all of Placeholders Factorio's); `--pack-shading=factorio` still draws every model Factorio's.
+`"factorio"` (`--placeholder-pbr=off` draws all of Placeholders Factorio's); `--pack-shading=factorio` still draws every model Factorio's. Rebuilt `placeholders/assembling-machine-{1,2,3}.glb` also win over Wube3DP/FUE5 by default (`--assembler-models=old` restores pack-order priority, letting Wube3DP supply `assembling-machine-1`).
+
+Default model choices (0.3.1): a settings file without `[model_packs] choices` gets the owner's own
+(`settings.gd DEFAULT_MODEL_CHOICES`): `big-biter`, `big-spitter` and `biter-spawner` from Placeholders (its rigged ones,
+over Wube3DP's by the order), `lab` and `pumpjack` from FUE5, so a new player sees what the owner sees. Saved choices,
+`{}` too (the Model packs window's reset saves it), stay the player's; nothing is added to them.
+`--default-model-choices=off` gives a file without `choices` none, the pack order alone, as before 0.3.1.
 
 Packs' own shading (0.2.2): a pack whose pack.json says `"shading": "pbr"` (model_packs.gd `shading()`;
 Vasillo's, written by `tools/models/fix_pack.py` from `fixes/vasillo.json`'s `pack_json`) has its materials
@@ -1401,9 +1407,9 @@ cross-fading across the LOD boundary; `--far-lights=old` restores the fixed 48-l
 lightmap.
 
 Rail signals and chain signals (`signal_lights.gd`) also draw soft additive camera-facing glow beacons
-(`signal_glow.gdshader`), LOD-tied pooled `OmniLight3D`s (16 / 32 / 64 at Low / Medium / High), and
+(`signal_glow.gdshader`) and
 2D lightmap splats in green / yellow / red / blue (from live `st` or snapshot `extra.sg` past
-`focus.r`) under **Far lamp lighting**; `--signal-lights=off` disables rail signal distance glows
+`focus.r`) under **Far lamp lighting**; pooled `OmniLight3D`s (16 / 32 / 64 at Low / Medium / High) are off by default (`--signal-omni-lights=on` restores them), and `--signal-lights=off` disables rail signal distance glows
 and lights.
 
 Cars, tanks and spidertrons have their own headlights (vehicle_lights.gd), Factorio's oriented
@@ -1566,6 +1572,47 @@ area".) Not run in a window or measured yet: only the mod, mock and protocol tes
   governor's limit for 16 s; 40 over 33 ms, 1 over 50 ms, the worst 117 ms) to 601 (6 over 33 ms, 1 over 50,
   the worst 53 ms), and the chunks let go were all hidden 0.3 s after it instead of 28 s.
 
+- **Chunk draw lists kept** (`--collect-cache`, on by default; perf-rd-world task 2). A chunk's build keeps
+  what its records' pass made (chunk_view.gd `DrawLists`: models' transforms, parts, cards, boxes, rings,
+  belts, both what a far merge draws and what it leaves out). A build for the chunk's view alone (far
+  <-> near swap, belt stand-ins ready: world.gd `redraw_view`) uses them while nothing they were made from
+  changed (the chunk's `draw_rev`, its records, `ModelLibrary.generation`, the pictures' generation, LOD
+  quality, the cliff wall and pipeline warm-up switches, and the machine states it read); any other
+  rebuild (`_dirty[c] = true`, `redraw`) walks the records again. The far merge's gather reads the same
+  lists (far_chunks.gd `fill_from_lists`) and only goes record by record for what they can't hold
+  (cargo, belt ends, remnants, ore, placeholders), taking a record's model from the near build's cache.
+  Replay bench (`python tools/bench/world_stream.py`, headless, the mock's busy base, 25,700 entities):
+  a build for the view alone 7.3 -> 0.33 µs an entity, the far gather 17.6 -> 0.40, a far chunk's first
+  build and gather together 27.6 -> 27.4; a near chunk's first build 23.8 -> 27.6 and a build for a change
+  7.1 -> 9.4 (it now also notes what the merge would draw); every hash equal both ways.
+  `--collect-cache=off`: every build walks its records and the gather reads each record, as before.
+- **Records resolved once, native chunk collect** (`--resolve-memo`, `--native-collect`, both on by default;
+  perf-rd-world task 4). `--resolve-memo`: a record's model, its readiness and its moving parts come from one
+  model_library.gd `resolve_entity` call (one `entity_models()` instead of three, kept per `generation` by the
+  model names; only a ready answer is kept), used by the chunk build and the far gather; the record cache also
+  keeps the record's contact rings (world.gd `Rec.cache_rings`), so a build for a change appends them instead of
+  working them out again. `--native-collect`: with `--collect-cache` on, the records the record cache holds are
+  walked in C++ (`ChunkBuildNative.collect_rows`, 512 at a time, the clock checked between) and the rest
+  (first builds, cliffs, remnants, ores, cargo, wet drills, covers, belt ends, open underground pipes, a model
+  not yet known warm) by GDScript (chunk_view.gd `_walk_rec`) as before; the lists hold the same, only the order
+  of a model's instances differs (each still with its own record). `--resolve-memo=off`: the three calls and the
+  rings worked out each build, as before (with `--native-collect` on, the records it walks still append their
+  kept rings: the same rings, so both switches off for the old path in full); `--native-collect=off` (or a DLL without the method): every record in
+  GDScript. Test: `tests/chunk_build_native_test.gd` (collect_rows against `_walk_rec` on random records).
+- **A chunk's first build from shape templates** (`--walk-shape`, on by default; perf-w4-walk). With
+  `--native-collect` on, a record the record cache doesn't hold yet (a chunk coming into view) no longer always
+  goes to `_walk_rec`: a table of shape key -> template (chunk_view.gd `_shapes`) is filled where `_walk_rec`
+  fills the record cache, and `ChunkBuildNative.collect_rows` makes such a record's row from it: the transform
+  in `ModelLibrary.placed`'s order (bit-equal), the contact rings moved from the template's origin (within float
+  rounding), the record cache written as `_walk_rec` writes it. The key (`ChunkBuildNative.shape_key`) packs the
+  prototype id, direction, `s`, `u`, `pc`, `pw`, `wc`, `wg`, `el` and the variant the record's `zv` seed picks;
+  a record with any other extra key except those known not to change the model (`q`, `w`, `r`, `g`, `d`, `up`,
+  `n`, `ai`, `fa`, `fc`, `lp`, `lc`, `sg`), its own pack (`zmp`), a painted train stop, trees, rocks, ores and
+  what `--native-collect` already leaves to GDScript still go to `_walk_rec`. The table is emptied when
+  `ModelLibrary.generation`, the prototypes or `ModelPacks.version` (or the packs' readiness) change.
+  `--walk-shape=off` (or a DLL without `shape_key`): every first build resolved by `_walk_rec`, as before.
+  Test: `tests/chunk_build_native_test.gd` (first walk with shapes against `_walk_rec`).
+
 ## Mod settings
 
 In a game the client's menu started: the client's Settings → Mod settings, sent over RCON at once.
@@ -1604,7 +1651,8 @@ read it with `api.world.cue_tick()` and the game's tick with `api.world.tick()` 
 so what they do repeats the same way each take, held by a pause and slowed with the game. Immersive
 Weather's `--weather-strikes=<file>` times its lightning on it (the add-on's README, "Timed strikes";
 without it the random storm as before). Its storm wind (0.3.2) is a roar with random gusts made at start;
-`--weather-wind=old` (or its setting Audio > Storm wind: Classic) plays 0.3.1's whistle loop instead.
+`--weather-wind=old` (or its setting Audio > Storm wind: Classic) plays 0.3.1's whistle loop instead. Its rain and wind loops are softer from 0.3.4 (top end eased, peaks lower);
+`--weather-sounds=original` (or Audio > Rain and wind tone: Original) plays the files as first bundled.
 
 An add-on is a program running with the player's rights, so one nobody switched yet is off until it is
 switched on (the switch is the consent). A download's own add-ons start as its `addons/bundled.json`
@@ -1694,12 +1742,18 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --aa-probe-shots: `--aa-probe-shots` (with `--ao-probe=`) saves the window under each anti-aliasing choice in turn
 - --all: - `tools/check.py`: `art-src/check-logs/<check>.godot.log` in the main checkout (`--all --logs <folder>`: there);
 - --alt-flat-batch: ...picking instead of node-backed movers; `--alt-flat-batch=off` interleaves each quality mark after its icon in `_flat` Alt-mode instead of drawing icons before t...
+- --alt-native: - `--alt-native=off`: Alt-mode's icon instances on the card sorted farthest first, packed and joined in GDScript (`_gpu_fill`, `_gpu_sort_chunks`), a turned view refilling every chunk within the 1.5 ms budget as before; on (the default, when the native library is loaded) `AltIconsNative` (`client/native/belt_sim/src/alt_icons_native.cpp`) holds each chunk's icons and sorts them, the same buffer byte for byte (`alt_overlay.gd`).
+- --alt-incremental: - `--alt-incremental=off`: Alt-mode's chest contents, machine rows (modules, packs, ammo, cargo) and fluid icons rebuilt for the whole map whenever any chunk, `ac`, `am`, `aiu` or `fl` changes, as before; on (the default) only the chunks that changed are built again, in view the same frame (capped at 3 ms of chunks a frame), the rest within the card path's 1.5 ms budget (`alt_overlay.gd`).
+- --alt-relift: - `--alt-relift=off`: with `--alt-incremental`, a change of the ground's heights (an add-on's hills, each step of a fade) builds every chunk's Alt-mode icons again entity by entity, as before; on (the default) the icons already worked out are lifted onto the new ground where they are looked at (`AltIconsNative.lift` in C++ when the library has it, else GDScript), a chunk whose icons did not move costing no hash and no upload, and the card path keeps each cache's pictures' layers (`alt_overlay.gd`).
+- --alt-quiet-builds: - `--alt-quiet-builds=off`: with `--alt-incremental`, every `entities_changed` world.gd sends after building a chunk again (a model loaded, a LOD's MultiMeshes) marks the chunk's Alt-mode icons to be built again and asks a redraw, and every change looks at every chunk's stamps, as before; on (the default) a loaded chunk whose records are the ones its icons were built from is left alone, and the card path's stamp check runs in one pass over the loaded chunks only when the chunks' or records' counts or an "all" key changed (`alt_overlay.gd`).
+- --alt-icons-later: - `--alt-icons-later=off`: an Alt-mode icon not yet read (Alt-mode turned on over a part of the base never seen, a new kind in a chest) is read and composed on the main thread as its chunk's icons are built, and the card's texture array starts at 32 layers, as before; on (the default) it is read on a worker thread (`Kit.icon_request`, the hover panel's `--icons-later` jobs) while the chunk is built without it, the chunk built again once it is in the caches, and the array starts at 256 layers (`alt_overlay.gd`).
 - --alt-marks-sliced: - `--alt-marks-sliced=off`: Alt-mode's arrows (`alt_arrows.gd`) and quality marks (`quality_marks.gd`) work out every changed chunk in the frame Alt-mode comes ...
 - --analyze: started or reused, and how the recorder sampled (with `--analyze`, from status.txt, settings.cfg and
 - --anim-hud: (`--anim-hud` keeps the HUD), with `--anim-pose=<run|mine|aim|...>` holding the character in one
 - --anim-pose: (`--anim-hud` keeps the HUD), with `--anim-pose=<run|mine|aim|...>` holding the character in one
 - --anim-rate: take-off, hovering and landing every 4 s), `--anim-rate=<x>` playing it at x times its speed (0.1
 - --anim-shots: `--anim-shots=<dir>@<start>,<count>,<step>` saves `count` frames `step` seconds apart
+- --anim-sweep: `--anim-sweep=old` forgets the animator's states of entities gone all in one frame every 5 s, as before (`anim.gd`); by default the pass is spread over frames, about 0.2 ms each.
 - --ao-probe: - `--ao-probe=<out.txt>[@seconds]`: after 20 s (or the seconds given) lists every model MultiMesh
 - --ao-probe-ab: `--ao-probe-ab=<bias>,<normal bias>` saves the window before and after setting the
 - --ao-probe-bias: sun's shadow biases (`<out>-a.png`, `<out>-b.png`), `--ao-probe-bias=` holds them there, and
@@ -1759,6 +1813,13 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --belt-lods-slice: ...-frame` checks every transform change; `--belt-lods-slice=off` runs unbudgeted full-world single-frame `BeltLods` checks.
 - --belt-mask-tiled: - `--belt-mask-tiled=off`: upload all 16 layers of the `f3d_belt_mask` `Texture2DArray` whenever the lattice mask
 - --belt-messages-first: - `--belt-messages-first=on|off` (on): the belt simulation's updates (`bs`) are handed to the belt layer as they are
+- --belt-mid-lod: `--belt-mid-lod=off` disables the 3D mid-detail belt LOD tier (`belt_lods.gd`, `chunk_view.gd`), restoring the 2-tier Full/Flat switch.
+- --belt-mv-change-flag: `--belt-mv-change-flag=off` makes `belt_mv.gd` and `item_cards.gd put_mv` hash every emitted motion-vector buffer again (`hash(buf)` twice a kind a frame) to find unchanged ones, instead of the native evaluator's per-kind change flag (`BeltMvNative` compares each slot as it writes it).
+- --belt-mv-native-put: `--belt-mv-native-put=off` hands every changed belt motion-vector buffer back to GDScript (`belt_mv.gd _emit_put_mv`, `item_cards.gd put_mv`) as before, instead of `BeltMvNative.step` giving a kind whose last put went through `BeltItemsNative`'s fast path with the same count, size and bounds straight to that fast path (and skipping it when unchanged) itself.
+- --belt-mv-page-dirty: `--belt-mv-page-dirty=off` makes a record page update re-evaluate every slot of each belt motion-vector kind whose records it touches, as before, instead of only the slots reading a touched page (their own record, or a pile copy's item record) plus the moving ones (`BeltMvNative`).
+- --belt-mv-partial: `--belt-mv-partial=off` disables `belt_mv.gd` unchanged/off-screen batch upload skipping and restores unconditional `put_mv`/`restore_kind` syncs.
+- --belt-mv-threads: `--belt-mv-threads=off` makes the native belt motion-vector evaluator (`BeltMvNative.step`) evaluate its kinds one after another on the main thread, as before, instead of one task a kind on the engine's worker pool (used when at least 2 kinds and 4,096 slots are due, and only on a worker pool of 3 threads or more: on a smaller one, `Settings.worker_threads_cap()` on 3 cores or fewer or `--worker-threads=1|2`, it is off by itself, since the waiting main thread does no task itself).
+- --belt-mv-tight-cap: `--belt-mv-tight-cap=off` sizes each belt motion-vector MultiMesh buffer to its records' capacity, as before, instead of to its items (a quarter more, in steps of 256, grown at once and shrunk after 120 steps a quarter too big; `BeltMvNative`): fewer bytes sent to the renderer each frame, but a kind that changes size draws one frame without motion vectors.
 - --belt-native-decode: - `--belt-native-decode=off`: decode `bs` message body lists (`sl`, `sh`, `ew`, `pc`, `pu`, `of`) in GDScript instead
 - --belt-path-probe: `-- --belt-path-probe=drawn.json@20` (records 20 s after 10 s, prints belt items' main-thread and worker
 - --belt-return-first: blended surface draws its top run last; `--belt-return-first=off` puts them after, as before.
@@ -1791,13 +1852,16 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --blend-clip: everywhere) stays blended, and built-in packs are unchanged. `--blend-clip=off` keeps it blended.
 - --bridge: server/data/script-output/f3d-ih-trace.jsonl, off by default) `python tools/inserter_check.py --bridge
 - --bs: --bs --capture` instead of Zenith (no Godot, no screenshots: for bridge-only runs; `--stand-in-cap`,
+- --budget-floor-cap: `--budget-floor-cap=off` restores uncapped stacking of non-`messages` `FrameBudget` floors instead of capping them at 3500 us while reserving at least 1500 us for `REDUCERS`.
 - --budget-hard-cap: - `--budget-hard-cap=off`: restore legacy unbounded `FrameBudget` floor stacking across low-priority systems once total work hits the frame ceiling.
 - --budget-predict: - `--budget-predict=off`: sliced systems check only the clock between items. On (default): messages (by type), far belt icons (`lanes`), Distant Horizon section...
 - --budget-spent: - `--budget-spent=off`: grants ignore the frame's other (unbudgeted) scripts' time already spent this frame. On (default): what they spent past their usual shar...
 - --build-apply-deadline: - `--build-apply-deadline=off`: a chunk's build fills all its MultiMeshes in one go once its records
 - --build-parts: - `--build-parts=each`: a chunk is built again on each `ents` part of its snapshot, as before. On:
+- --queue-order: `--queue-order=old`: the build queues (pending, part-way, live and dirty chunks, finished prep jobs) sorted with `sort_custom(nearer)` and the terrain jobs by `[rank, coord]` arrays, as before. On (default): one packed key a chunk (`(live?0:1)<<62 | rank<<20 | index`) sorted natively, the same order but ties by place; dirty chunks that would only be passed over (building, prep job queued, snapshot still coming, replaying) left out before ranking.
 - --build-rec-cache: ...ol` for chunks with `>= 48` instances. `--build-rec-cache=off` and `--chunk-mm-worker=off` restore uncached main-thread builds.
 - --burner-fx: - `--burner-fx=on|off` (on): while a burner inserter whose model has a glowing burner (Vasillo's; the built-in
+- --burner-scan: - `--burner-scan=old`: the burner inserters' wisps and crackle (`burner_fx.gd` `scan`, four times a second from `fx.gd` `_scan`) look at every moving inserter hand loaded, as before. On (default): only the inserters of the chunks within 30 tiles of the listener (a per-chunk list kept from the world's `entities_changed`); the same burners burn (perf-world-8, `client/tests/fluids_burner_scan_test.gd`).
 - --cam: `--cap=N` for an Items in 3D cap of N, and `--cam=x,z` for a drifting camera leading it, so both paths'
 - --camera-cone: ...fault** (it has not been run in play): `--camera-cone=on` tries it; its chunk boxes grow with Terrain Elevation's hills (`GroundHeight.lift_range()`) and it sen...
 - --cap: `--cap=N` for an Items in 3D cap of N, and `--cam=x,z` for a drifting camera leading it, so both paths'
@@ -1816,12 +1880,16 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --cliff-pieces: ... at its cell's edge, so any joins any. `--cliff-pieces=old` draws the first pieces (separate columns on a ridge, kept as `cliff-<piece>-old.glb`, never picked a...
 - --cliff-scree-look: ...492f` and the wall's apron `#7a6040`); `--cliff-scree-look=old`: the even band as before. Terrain Elevation 0.1.7 gives the channel (its setting *Bare ground by...
 - --cliff-wall: ...all** (`cliff_wall.gd`; on by default; `--cliff-wall=off` or Settings → Graphics → *Cliffs as one wall* off gives the pack's pieces, `--cliff-wall=on` forces th...
+- --cloud-ray-opt: `--cloud-ray-opt=off` restores fixed volumetric cloud empty-space raymarch stepping and unconditionally samples 3D detail fetches in `cinematic_grade.gdshader`.
 - --coalesce-updates: - `--coalesce-updates=off`: disables live fast-lane routing (`_live_waiting`: `ie` when `_chunk_waiting` is empty, plus
+- --collect-cache: `--collect-cache=off`: every chunk build walks its records and the far merge's gather reads them one by one, as before (on: a build kept for the view alone and the far gather read the lists the last build kept; [Chunk streaming](#chunk-streaming-the-views-direction-the-area-cache)).
 - --confirm-emu: recorded splitter input whose items at an update are its last read's), `--confirm-emu=split|all` reads such
 - --contact-inner: `--contact-inner=hard`: as before.
 - --contact-patch: drill has none past its body. `--contact-patch=wide`: as before.
 - --contact-rim: `--contact-rim=clamped`: one clamped ring a foot, as the drill-border fix first had it.
 - --contact-shape: time (about 13 ms each, a third of their load), 2.9 MB of atlas. `--contact-shape=box`: the rings for all, as
+- --cut-lods: - `--cut-lods=old`: levels of detail catch up over frames after a camera cut, as before. On (default, `view_ahead.gd`): a viewpoint announced ahead (`api.world.prepare_view`, the Cinematic camera's keyed shots a second before each `"cut": true` key) has its chunks' model levels, far merges and cliff wall levels picked for it under the usual budgets before the camera gets there, and a cut seen (the camera moving more than 32 tiles in one frame, or `api.world.mark_cut`) picks every chunk's levels and far merges in that frame without the frame budget, the 16-switch cap or cross-fades (the Distant Horizon's near-edge fades end and its sections are looked at next frame). Also while announced: behind-the-camera culling keeps the chunks within 3 of the viewpoint drawn (so the Distant Horizon has stepped aside there); at a cut it shows chunks and sends their visibility unsliced, and the chunks within 2 of the camera add their MultiMeshes left for later at once. A chunk come near whose merged far mesh hides nothing (cliffs alone, drawn by the cliff wall) drops that mesh; with `old` it stood, the wall hidden behind it.
+- --cut-shots: - `--cut-shots=<folder>`: a check: saves the first frame drawn after each camera cut and the one 30 frames on (`cut-NN-first|later-new|old.png`) and logs each cut's settle cost and the chunks round the camera (merged, wall levels, Distant Horizon cover), plus each announced viewpoint.
 - --decode-thread: - `--decode-thread=off`: map charts' pictures (`chart`) and chunks' tiles (`chunk`) are decoded on the
 - --decor-composite: `--decor-composite=off` draws every `FlatSheet` as before (also with `--grass-opt=old`, `--grass-backlight=old` and
 - --decor-nodes: - `--decor-nodes=<n>`: at most about n new decorative MultiMeshes put in a frame, a whole chunk at a time, the first chunk of a frame always (default 96; `0` no...
@@ -1833,8 +1901,13 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --dh-handoff: ...r cross-fade at the loaded-chunk seam, `--dh-handoff=off` disables load-underneath mask grace frames, extended DH reveal hold, and unload-takeover holding, and ...
 - --dh-map: `--dh-map=old` keeps one entry a chunk. Region caches live in `user://lod-cache/` (`Zstd`, 256 MB LRU), and `user://pollution-cache/` (`Zstd`, disabled by `--sm...
 - --dh-palette: `--dh-palette=old` rebuilds it on the main thread, draws every section again and scans and sorts every
+- --dh-retire-index: `--dh-retire-index=off`: every retiring Distant Horizon node (a section's old mesh kept until the sections over it are built) scans all sections every frame for one still building, and `has_mesh_for_chunk` walks every retiring node (`distant_horizon.gd` `_gc_retiring`), as before. On (default): a retiring node looks up only the sections over its rect by key, the one that blocked it last first, and only after something could free it (a mesh installed, the layout re-centred, `finish_all`, a reset); retiring nodes indexed by section key; same nodes freed, `tests/dh_sections_test.gd` (perf-w4-dh).
+- --dh-sample-worker: - `--dh-sample-worker=off`: Distant Horizon samples each section's grid from its chunks (the majority tile and the top entity a cell) on the main thread before its mesh job starts (`distant_horizon.gd` `_sample_section_grid`), as before. On (default): the main thread only gathers the section's chunk rows (`_gather_section_rows`) and the mesh job samples them on its worker first (`lod_mesher.gd` `sample_grid`); the same grid, `tests/dh_sample_worker_test.gd` (perf-w3-bridge).
 - --dh-seam-fade: ...turns off the character-anchored LODs. `--dh-seam-fade=off` disables smooth 0.30s Bayer cross-fade at the loaded-chunk seam, `--dh-handoff=off` disables load-un...
+- --dh-sub-scan: `--dh-sub-scan=old`: the chunk-request scan (`_collect_want_batch`) looks up the disk cache and charted map per chunk and checks its 4 ms budget only between sections, as before. New (default): cache checks hoisted out of the chunk loop, each pending cache region looked up once a call, the charted row fetched once a chunk row, and a 1.5 ms budget checked every block row with the section's place kept to resume next time (the next call of that kind starts at the section it stopped at and goes round, so sections past the budget get their turn); same requests and flags once drained, `tests/dh_sections_test.gd` (perf-w4-dh).
+- --dh-vis-incremental: `--dh-vis-incremental=off`: each time a chunk loads, unloads or finishes fading, or a section gets a mesh, Distant Horizon looks at every section to hide the level-0 ones under loaded chunks (`distant_horizon.gd` `_update_lod0_visibility`), as before. On (default): only the level-0 sections of those chunks (and the one that got a mesh) are looked at; a re-centre, a reset or all fades ending still look at all of them; same `visible`, `tests/dh_sections_test.gd` (perf-w4-dh).
 - --disk-flush-sliced: - `--disk-flush-sliced=off`: the chunk disk cache's flush (every 10 s) copies every dirty region's chunks (up to 256 a region) in the frame it starts, as before...
+- --disk-flush-fine: `--disk-flush-fine=off`: the sliced flush checks its clock every 8 chunks, copies each chunk's extras in one go and lets the copies go on the main thread when the write is done, as before. On (default): the clock after every chunk, a chunk's extras deep-copied 64 at a time (carried on next frame), the write task empties its snapshots itself; `--stutter-probe` parts `dc_snap` and `dc_free`.
 - --disk-promote-sliced: - `--disk-promote-sliced=off`: a region read from the disk cache promotes all its waiting chunks into the memory cache in that frame, as before. On (default): 1...
 - --distant-horizon: ...reads and main-thread region encoding. `--distant-horizon=off|<chunks>` (`16..512`) overrides the radius and `hello` `lod` opt-in; `--distant-horizon-quality=mi...
 - --distant-horizon-detail-lod: ...nt-horizon-dropoff=near|balanced|far`, `--distant-horizon-detail-lod=off|on`, and `--lod-night-glow=off|on` tune DH directly. The colour table
@@ -1873,6 +1946,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --feed-loose: Offline (`tools/belt_bursts.py --mode out --open 99999,99999 --shut 1,1 --feed --feed-loose 0.1 --tier yellow
 - --first-bs: [--settle-max 180] [--first-bs 60] [--settings automatic|unlimited] [--hold60 on|off] [--record
 - --fix-imports: ...ools/models/bake_pbr.py --names <names> --fix-imports`.
+- --fluid-windows-index: - `--fluid-windows-index=off`: every complete `fl` draws the fluid windows again, walking every fluid box in view, as before. On (default): `fluids_power.gd` keeps the storage tanks and windowed straight pipes per chunk, draws again only when one of their first boxes' fluid, amount or capacity moved (or their chunk or the models changed), walks only those, and keeps each pipe's column placement until its chunk changes; the same windows (perf-world-8).
 - --flicker-probe: - `--flicker-probe=<folder>[@degrees a frame]`: saves frames while the camera turns slowly;
 - --fly: every worm folded, up or attacking. The mock's `--fly loop|walk` (with `--armor mech-armor`) makes
 - --frame-budget: handed out by priority, with a floor for the near work. `-- --frame-budget=separate` gives every
@@ -1881,6 +1955,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --free-later: - `--free-later=off`: nodes and old meshes the world lets go of (a far chunk's merged mesh when it comes near or is merged again, a chunk's ground, decoratives,...
 - --free-later-leaves: - `--free-later-leaves=off`: a node waiting in `free_later.gd` freed whole with its children in one `free()`, its meshes with it (frame-spikes2's way: one big c...
 - --from-factorio: - `--from-factorio` is what server/factorio-with-zenith.ps1 passes when Ctrl+F9 in Factorio starts
+- --fx-opt: `--fx-opt=off` restores legacy linear FX removal and uncached/uncapped smoke-trail updates in `sprite_fx.gd` and `weapon_fx.gd`.
 - --fronts-trace: every 30 ticks seldom has the simulation's own ticks, which the plain dump needs); `--fronts-trace=K1,K2,...`
 - --gate-by-id: `--gate-by-id on` makes it a gate again, under 90% failing), with the client's own pace (jobs with updates and their ms, updates
 - --gate-model: ...he yellow to the stone wall's colour). `--gate-model=old` draws the model it had before (pale stripes, low rails), kept as `gate-old.glb`. Rebuild: `python tool...
@@ -1908,6 +1983,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --heavy-lods: - `--heavy-lods=off`: old level thresholds for heavy building models. On (default): a model's levels switch in sooner (smaller on screen) by sqrt(triangles / 10...
 - --hold-emu: the live client never got: -62,-26 replayed 91.9% visible with it, 87.5% without). `--hold-emu` makes the bridge's `sh` from the recording (a
 - --hold60: [--settle-max 180] [--first-bs 60] [--settings automatic|unlimited] [--hold60 on|off] [--record
+- --hover-highlight-cache: `--hover-highlight-cache=off` disables caching unchanged hover/build highlight state in `player_input.gd`.
 - --hover-rate: - `--hover-rate=off`: the entity info panel (the hover panel) is rebuilt for every new entity under the cursor while the character runs too, as before. On (defa...
 - --icons-later: - `--icons-later=off`: the entity info panel (the hover panel) reads an icon that isn't cached yet at once,
 - --idle-dims-glow-paint: picture already didn't). `--idle-dims-glow-paint=on` dims it as before 0.2.2.
@@ -1918,6 +1994,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --inserter-fast-upload: ...per-chunk `MultiMeshInstance3D` nodes; `--inserter-fast-upload=off` restores per-instance `set_instance_transform()` uploads for live inserter arms instead of b...
 - --inserter-glow: - `--inserter-glow=hand|always` (hand): an inserter model's glow (a modeller's lit burner, Vasillo's
 - --inserter-grip: - `--inserter-grip=on|off` (on): the item a hand carries is drawn in its grip, from the pick to the drop (owner,
+- --inserter-hand-stack: - `--inserter-hand-stack=on|off` (on): stacks up to 4 held items vertically in an inserter's hand (matching belt piles via `pile_step` and `PILE_TURN`) when it carries more than one; `off` draws a single item as before.
 - --inserter-handoff-margin: `--inserter-handoff-margin=N` (0): the drawn clock held N more jobs behind the game, so the job that learns
 - --inserter-handoff-slack: `--inserter-handoff-slack=N` (3): the simulation is stepped at most N ticks short of the newest update so
 - --inserter-rest-arms: - `--inserter-rest-arms=on|off` (on): an inserter the bridge sends no hand for draws its arm at rest, the hand
@@ -1949,6 +2026,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --lattice-variants: ...texture fetches on far 3D belt items); `--lattice-variants=close|all|off` (default `close`, switches off extra ore/coal/stone variants past `24` tiles); `--latt...
 - --legacy-render: are printed and kept in the JSON's `variants`. `--legacy-render` starts with the shadows and levels
 - --lock: [--json <out>] [--lock <file>] [--keep <dir>] [--replay every-tick|update] [--replay-arg=<arg>] [--tail-wait 30]
+- --live-inserter-radius: - `--live-inserter-radius=detail|view|64` (detail): how far round the focus the bridge sends live inserter hands (`ih`/`ie`, moving arms; past it arms rest, K12), as the focus's `ir`. `view`: arms within the view move, up to 64 tiles: the camera's visible ground, its farthest corner's square distance from the focus plus 8 tiles, up to a step of 8, within 16..64 (about 48 at the default zoom, 64 zoomed out and in first person; a smaller radius is sent only after it stayed smaller about 1 s, so turning the view doesn't flip it; the bridge raises `f3d-detail-radius` to it, never past the Entity distance); `64`: a fixed 64-tile square (0.3.1 before this, Bug #5); `detail`: `f3d-detail-radius` alone (0.3.0, 24 tiles by default).
 - --lod-anchor: ...ng real chunks then backfills with DH. `--lod-anchor=camera` turns off the character-anchored LODs. `--dh-seam-fade=off` disables smooth 0.30s Bayer cross-fade ...
 - --lod-cpu-copy: - `--lod-cpu-copy=off`: reads `MultiMesh.buffer` back from the RenderingServer on LOD cross-fades
 - --lod-fade-moving: - `--lod-fade-moving=off`: keep spawning LOD cross-fade nodes while moving above `12` tiles/s instead of snapping LOD transitions.
@@ -1960,17 +2038,22 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --lod-slice: - `--lod-slice=off`: disables per-chunk ring slicing and the per-frame MultiMesh switch cap
 - --lods-finish-usec: - `--lods-finish-usec=N` (2000): models' levels of detail finished on worker threads are shown
 - --log-file: `--log-file <absolute path>` instead (a relative path is read from the user folder):
+- --logistic-status: `--logistic-status=off` disables the live fulfillment tinting on logistic request slots (restores plain slot look).
 - --logs: - `tools/check.py`: `art-src/check-logs/<check>.godot.log` in the main checkout (`--all --logs <folder>`: there);
 - --lose: --trace=<f3d-ih-trace.jsonl> [--events] [--lose=0.18]` the layer against a real trace, fed samples or
 
 ### Flags M–R
 
 - --main: worktree's mod changed (copied in again); `--stop-server` stops it. `--main <checkout>` runs the same
+- --map-auto-swap: `--map-auto-swap=on` restores automatic 2D/3D map swapping on zoom (zooming all the way in drops to 3D, zooming out past `map_zoom_out` returns to 2D); default `off` uses the 2D/3D toggle button in the Remote view title bar (also configurable in Settings > Camera).
 - --map-surface: rails are held; `--map-surface=<index>` shows that surface on the map after 6 s and
 - --md: tools/join_hitches.py out.json [--windows] [--md]` then gives frame-time percentiles, the frames over 25
+- --mem-log: - `--mem-log[=<seconds>]` (off): prints a `MEM` line every 10 s (or `<seconds>`): Godot's static memory, the renderer's video/texture/buffer memory, objects, nodes, resources, orphan nodes and render pipelines compiled by kind (`debug/mem_log.gd`). Headless shows no renderer memory; run it in a window and compare with the process's RSS to see what the GPU driver holds.
 - --menu-fps: ...ost (lower if the FPS limit is lower); `--menu-fps=<n>` changes it, `--menu-fps=0` leaves it uncapped as before (`settings.gd` `MENU_FPS`, `in_menu`).
 - --message-catchup: - `--message-catchup=on|off` (on): while the oldest message waiting in the bridge's queue (bridge.gd
 - --message-catchup-msec: `_drain`) has waited longer than `--message-catchup-msec=N` (250) since its datagram was read, the
+- --mm-bounds: - `--mm-bounds=engine`: the robot swarm's, creatures' and working glow's MultiMeshes leave their own box unset, as before (perf-render R6); Godot then works their bounds out over every instance of the capacity at each buffer upload. Default: the MultiMesh gets the same box as its node (`custom_aabb`), which culls them either way.
+- --mm-writes: - `--mm-writes=instance`: chunk MultiMeshes as before (perf-render R2): a per-instance write or a `mesh =` swap on one filled from a buffer makes Godot read the buffer back from the graphics card (a stall of the frame so far), and one filled instance by instance keeps the engine's CPU copy, uploaded again with every buffer. Default: changing fill way empties it first, a level-of-detail swap on a buffer-filled one re-sends the kept buffer (`chunk_view.gd`; counters `mm_fill_flips`, `mm_buf_resends`, `mm_buf_mesh_readbacks`, `mm_buf_instance_writes` under the stutter probe).
 - --mod-click-probe: - `--mod-click-probe=<name>[,<name>...]`: presses mods' buttons in Zenith's copies of their windows
 - --mod-click-probe-quit: and logs the windows before and after (no names: lists the buttons); `--mod-click-probe-quit`
 - --mode: fixture must have none); `tools/belt_sim/sim.py rec.json --mode free` is the reference it agrees with.
@@ -1981,9 +2064,22 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --mover-lift: ...ns, pentapods and buildings as before. `--mover-lift=vertex`: every vertex by its own ground, as before.
 - --mover-pick-all: ...tead of bulk MultiMesh buffer uploads; `--mover-pick-all` scans every GPU robot record during entity picking instead of node-backed movers; `--alt-flat-batch=of...
 - --movers-dress-usec: - `--movers-dress-usec=N` (1500; 0 = all at once, as before): movers whose model has just come
+- --msaa-with-smaa: `--msaa-with-smaa=on` restores stacking SMAA post-processing on top of active MSAA (`settings.gd`).
+- --mv-skip-clean: `--mv-skip-clean=off` restores unconditional per-frame `item_cards.gd` motion-vector MultiMesh buffer uploads.
+- --mv-skip-idle: `--mv-skip-idle=off` restores per-frame idle `write_xform` and MV buffer uploads in `robot_swarm.gd` and `creatures.gd`.
 - --nack: - `--nack=off`: disables sending `{"t": "nack", "r": [...]}` requests (1–64 missing `r` sequence numbers) when the reliable
 - --names: ... <names>` and `tools/models/bake_pbr.py --names <names> --fix-imports`.
+- --native-bc-compress: `--native-bc-compress=off|on|force` (`on` default): enables clean-room C++ `TextureCompressNative` BC1/BC3 compression in exported builds (`off` leaves exported terrain/decoratives uncompressed; `force` exercises native BC compression in editor builds too).
 - --native-chunk-build: ...cript stays when the class is missing. `--native-chunk-build=off` forces the GDScript loops. Test: `tests/chunk_build_native_test.gd`.
+- --native-collect: `--native-collect=off`: every record of a chunk build walked in GDScript, as before (on: those the record cache holds walked by `ChunkBuildNative.collect_rows`; [Records resolved once](#chunk-streaming-the-views-direction-the-area-cache)).
+- --native-lod-decode: - `--native-lod-decode=off`: Distant Horizon's `lod` chunk runs (`tl`, `el`) are decoded in GDScript on the main thread (lod_data.gd `from_msg_gd`), as before. On (default, with the C++ library): `WireDecodeNative.lod_cells` decodes them on the bridge's parse thread (message_decode.gd, `_lod`), or in from_msg where that thread is off (`--decode-thread=off`, the LOD cache); same cells and refusals, `tests/lod_decode_native_test.gd`.
+- --native-inserter-loop: - `--native-inserter-loop=on|off` (on): with `--native-inserter-pose`, the rest of the live arms' per-arm loop runs in `InserterPoseNative` too (`frame_check`, `frame_draw`): whether each arm's record is there, the pincers' easing, the hand's moving state for the animator (L4), the held item's grabs, every arm's geometry by batch (`InserterArmsNative`'s functions) and the live set's changes, one call a frame; the GDScript handles only the arms to bind or decide a model for, hands steered onto a belt item, holding arms, and the changes. Not with `--inserter-arms-trace` or an arm without a native slot (that frame runs the GDScript loop). `off`, or a build without `frame_draw`: the GDScript loop as before (the same drawing: `tests/inserter_loop_native_test.gd`).
+- --native-inserter-pose: - `--native-inserter-pose=on|off` (on): the live inserter arms' samples, events, plans and pose are kept and worked out by `InserterPoseNative` (C++, `native/belt_sim/src/inserter_pose_native.cpp`), one call a frame for every arm, the arms' loop reading each pose from its arrays. Belt clock with the pose from the samples only (the default, and `--inserter-events=off|items`); `--inserter-events=on` and `--inserter-arms-clock=wall` stay GDScript. `off`, or a build without the class: the GDScript as before (the same poses: `tests/inserter_pose_native_test.gd`).
+- --native-inserter-swing: - `--native-inserter-swing=on|off` (on): the GDScript pose's plans between two hand samples (`_plan_pair`) come from `InserterSwingNative` (C++ twin of `inserter_swing.gd`, `inserter_swing_core.h`). `off`: `inserter_swing.gd` as before (the same plans: `tests/inserter_swing_native_test.gd`). Only used when `--native-inserter-pose` is off or unavailable.
+- --native-inserter-ingest: - `--native-inserter-ingest=on|off` (on): the `ih` hands and `ie` events of live inserter arms already known and bound are applied by `InserterIngestNative` (C++, `native/belt_sim/src/inserter_ingest_native.cpp`) straight into `InserterPoseNative`, with `_end_frame`'s missing count and the stale sweep's `last_heard`; unknown or unbound arms, a new record and gone events go through the GDScript as before. Only with `--native-inserter-pose` on, the belt clock and `--ih-apply` (quick). `off`, or a build without the class: the GDScript as before (the same arm state: `tests/inserter_ingest_native_test.gd`).
+- --native-inserter-ingest2: - `--native-inserter-ingest2=on|off` (on): with `--native-inserter-ingest`, `inserter_arms.gd`'s `_drop_arm` tells `InserterIngestNative` of every arm it drops (`drop`), so a bound arm's hand checks only its record, not the arms' map too; `_end_frame`'s missing count walks the native's own entries and the few arms it has no entry for (`_unbound`, `end_frame2`) instead of copying every arm's key and value, touching `_missing` only when it must; the once-a-second stale sweep asks the native for its stale entries (`sweep`, `last_heard` synced only for forgotten entries) and walks `_unbound` only. `off`, or a library without `end_frame2`: as before (the same arms: `tests/inserter_ingest_native_test.gd`, with timings at 5,000 arms).
+- --arm-bind-layout: - `--arm-bind-layout=on|off` (on): a live inserter arm's bind (`_bind`: base, direction, colour, model name, `ModelLibrary.placed`, chunk) is redone when the packs' version or `ModelLibrary.layout_generation` (bumped by `choices_changed` and the packs' zips coming in) changes, not whenever any model finishes (`ModelLibrary.generation`, up every frame a model is made while a base loads: each bump sent every arm's next hand through the full bind and `InserterIngestNative.unbind_all`). `--stutter-probe` counts `arm_unbind_all`, `ih_back` (hands handed back to the GDScript) and `arm_new`. `off`: as before (the same arms: `tests/inserter_bind_stamp_test.gd`).
+- --arm-model-watch: - `--arm-model-watch=on|off` (on): the inserter arms' draw modes (`_decide_mode`, `_push_draw`, the native loop's `clear_modes`) and resting arms (their whole rebuild and per-chunk index stamp) follow a stamp of the arms layer's own (`_model_ver`) instead of `ModelLibrary.generation`: the model names the lookups were told "not ready" (rigs, pack rigs, Wube's arm pieces) are kept and asked again when the generation changes, and the stamp goes up only when one became ready; a safety net takes the raw generation once one has stayed untaken for 2 s (trailing), and the stamp is worked out once a frame. While a base loads, models finishing elsewhere no longer re-decide every arm and rebuild every chunk's resting arms each frame. `--stutter-probe` counts `arm_modes_cleared` and `arm_rest_all`. `off`: `ModelLibrary.generation`, as before (the same drawing: `tests/inserter_model_watch_test.gd`).
 - --native-lod-mesher: - `--native-lod-mesher=off`: Distant Horizon's section meshes (lod_mesher.gd) and the far chunks' merged meshes (far_chunks.gd, Merge) are built in GDScript, as...
 - --near: (the High distances by default: `--near 160`, `--cap 6000`, `--units` for Smooth belt items),
 - --night-vision-fx: - `--night-vision-fx=off`: no night vision feedback: no sound as it turns on or off (the equipment's own
@@ -1991,6 +2087,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --opaque-blend: contact shading. `--opaque-blend=off` keeps every BLEND material see-through.
 - --optimistic-cache: - `--optimistic-cache=off`: wait for server `same` before mounting RAM/disk-cached chunks when re-entering an area.
 - --optimistic-slice: - `--optimistic-slice=off`: replay a cached chunk (RAM or disk cache) whole in one call, the clock checked only between chunks, as before. On (default): one ste...
+- --ents-slice: - `--ents-slice=off`: a packed `ents` message (a cache replay's step, or a live one while messages drain) applied whole, as before. On (default): `ENTS_SLICE` (64) records a step, the joins flushed after each, the part noted after the last; the chunk replaying isn't built until its replay is done; a live message's later slices go in front of the waiting messages (not for `same`'s replayed ones). Also joins a multi-part cache entry with `append_array` and sorts the optimistic queue by packed keys only when it or the focus changed.
 - --oracle-at: `tools/bs_offline.py` from a recording serves too.) Experiments: `--oracle-at=TICK` reads every recorded lane
 - --ore-density: `--ore-density=classic`: 0.2.2's first scattering, 2, 4 or 6 rocks (under 400, from 400, from 2900; uranium 270
 - --ore-look: `--ore-look=old`: a "pbr" pack's ore rocks drawn as any model (Burley diffuse, the file's occlusion picture on ambient)
@@ -2000,13 +2097,15 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --perf-warning: - `--perf-warning=off`: starts with the performance warning hidden (until Settings > Interface > Performance
 - --period: --f --takers 2 --takers-from 10 --period 15 --take-window 100,900 --release 300,700`, replayed as below at
 - --persist: `--reads-after=none` then applies no lane reads (the simulation alone), `--persist` says per update
-- --pipe-covers: `--pipe-covers=off`: none.
+- --pipe-covers: `--pipe-covers=off`: none; `--pipe-covers=own`: extract from each entity's own drawing pack ending instead of following the active pipe pack (`pipe_covers.gd`).
+- --covers-batch: `--covers-batch=off`: each machine's pipe covers worked out again as every record of an `ents` message comes (its own, every neighbour's, every machine facing a pipe), as before. On (default): while a message's joins are batched, connections are only noted and the machines whose covers may change are covered once when the joins are flushed (`add_covers` in `--stutter-probe`, inside `add_joins`); connections' turned offsets and `PipeCovers.ports` kept per prototype; `_forget` skips the pipe/wall/belt tables a record's prototype isn't in (with `--world-fast-add`).
 - --pipe-fluids: (`--pipe-insides=off` skips that), and the fluid inside is drawn behind the glass (`--pipe-fluids=off` hides it).
 - --pipe-insides: (`--pipe-insides=off` skips that), and the fluid inside is drawn behind the glass (`--pipe-fluids=off` hides it).
 - --pipe-warm-extra: - `--pipe-warm-extra=off`: the hover marks', Alt-mode's card shader's and the post effects' (SSAO, SSIL, glow, grade, fog, shadowed sun) pipelines are built whe...
 - --pipe-windows: `--pipe-windows=off`: none of the window models, insides or pipe fluids.
 - --pipeline-warm: first fill or another process on the PC. With main's `--pipeline-warm` (pipeline_warm.gd, below) both
 - --ports: --worktree <checkout> --ports <udp>,<game>,<rcon> [--at x,y] [--size 64] [--seconds 10] [--settle 40]
+- --power-bar: `--power-bar=middle` (or `old`): restores the old yellow armour battery bar above the middle quickbar and character health beside the bottom-left armour slot; default shows armour battery power beside the bottom-left armour slot while the middle shows only health and energy shield.
 - --predict-probe: - `--predict-probe=<out.json>[@builds]`: builds a wooden chest beside the character over and over
 - --prio-delta-order: - `--prio-delta-order=off`: a chunk's `add`/`upd`/`del` may take the priority lane while an older delta for the same
 - --priority-queue: - `--priority-queue=on|off` (on): movement commands (`walk`, `drive`, `enter`) send directly on input events and
@@ -2044,7 +2143,14 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --replay: [--json <out>] [--lock <file>] [--keep <dir>] [--replay every-tick|update] [--replay-arg=<arg>] [--tail-wait 30]
 - --replay-arg: [--json <out>] [--lock <file>] [--keep <dir>] [--replay every-tick|update] [--replay-arg=<arg>] [--tail-wait 30]
 - --replay-bre: `--replay-bre` so the client's re-reads are answered, as the bridge answers them live).
+- --drain-head-again: - `--drain-head-again=on|off` (on): when a message the messages' slice handles puts entries in front of the waiting messages (`requeue_front`: a live `ents` message's later slices), the slice runs them in the same drain while its time lasts. `off`: the slice stopped at them and they waited for the next frame, as before (`tests/bridge_queue_stress_test`).
+- --replay-kinds: - `--replay-kinds=on|off` (on): a kept message the bridge hands again (`Replay`, world.gd's kept chunks via `requeue_front`) carries its message type, so the messages' slice guesses its cost by type (`FrameBudget.item_est` `replay:<t>`: a kept chunk's `ents` costs far more than its `cq`) and `--stutter-probe` names it `replay:<t>`; the probe also times the fast lanes one message at a time (the frame's slowest message) with parts `br_me`, `br_prio`, `br_live`, `br_belt` (`br_fast`'s shares). `off`: one `replay` estimate for all kept messages, as before. The handled order is the same either way (`tests/bridge_queue_stress_test`).
+- --rest-arm-basic: - `--rest-arm-basic=live|stick` (live): an inserter with no arm model (a mod's: no rig, no Wube pieces) rests drawn as its live arm is (the placeholder arm: turntable, shoulder post, upper arm, forearm, hand and two fingers in its prototype's colours, `Visuals.instance_material`, casting shadows) in the per-chunk resting MultiMeshes. `stick`: as before 0.3.1, a thin 3-box stick in the rest shader without a shadow (about 7 instances an arm instead of 3, up to 6 MultiMeshes a chunk instead of 1).
+- --rest-arm-shadows: - `--rest-arm-shadows=live|tier` (live): a resting 3D inserter arm casts its shadow wherever a live arm would (live arms always cast): in every chunk whose shadows reach the ground in view, at every Level of detail. `tier`: as before 0.3.1, in chunks past the ring round the character (shadow tier FAR) only on High/Ultra (`--inserter-shadows`). Costs on Low/Medium about one shadow-pass draw per far chunk with resting arms per arm mesh (a rig's 4-5, Wube's pieces 2, the placeholder's 6).
 - --rest-arms-chunked: ...polling/uploads in `quality_marks.gd`; `--rest-arms-chunked=off` rebuilds one global resting-arms `MultiMesh` buffer instead of updating only dirty per-chunk `M...
+- --rest-arms-index: - `--rest-arms-index=on|off` (on): resting inserter arms come from a per-chunk index of its inserters and belts (one walk of the chunk, made again when its entities change), their 3D and picture arms posed by `InserterArmsNative` a model at a time (inputs kept per inserter), a new arm's belt at its pickup looked up in the cells round it, and the resting arms' shadow settings checked 32 chunks a frame. `off`: as before (every entity of the chunk walked, each resting arm posed in GDScript, every chunk's shadow every frame).
+- --rest-arms-region: - `--rest-arms-region=<n>|off` (2): resting 3D inserter arms of n x n chunks (2: 64 x 64 tiles; 4 culls coarsely and drew the most triangles in the bench) are drawn by one `MultiMeshInstance3D` per arm mesh instead of one per chunk (each also one draw in every shadow pass). The per-chunk work is unchanged (worked out when a chunk's entities or live arms change); only the upload joins the region's chunk buffers when any of them changed. Same meshes, layouts, materials, colours and poses; a region casts shadows if any of its chunks would (`--rest-arm-shadows` per chunk as before) and shows if any of its chunks shows; Godot works out its bounds from its instances. `off` (or `1`): one per chunk, as before.
+- --resolve-memo: `--resolve-memo=off`: a record's model, readiness and parts asked of ModelLibrary in three calls and its contact rings worked out every build, as before (on: `resolve_entity`, kept per generation, rings kept on the record); the records `--native-collect` walks still append their kept rings, so turn both off for the old path in full.
 - --resync-guard: - `--resync-guard=on|off` (on): a slow join can't loop. `off`: as before. Why: on a slow PC (the second PC,
 - --reuse-server: updates|tick] [--camera top|free|<yaw,pitch,dist[,ortho]>] [--stand-in] [--reuse-server] [--shots <dir>]
 - --review-aim: tools/models/review.py starts) with `--review-box=<w>,<d>,<h>`, `--review-aim=<height>`,
@@ -2079,6 +2185,8 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --share-textures: kept apart from its smooth use. `--share-textures=off`: every model its own copies.
 - --shots: updates|tick] [--camera top|free|<yaw,pitch,dist[,ortho]>] [--stand-in] [--reuse-server] [--shots <dir>]
 - --shut: Offline (`tools/belt_bursts.py --mode out --open 99999,99999 --shut 1,1 --feed --feed-loose 0.1 --tier yellow
+- --signal-skip-same: `--signal-skip-same=off` refreshes every rail/chain signal glow every 0.5 s as before (`signal_lights.gd`); on, an unchanged refresh keeps its glows.
+- --signal-omni-lights: `--signal-omni-lights=on` restores pooled `OmniLight3D` nodes on rail/chain signals (`signal_lights.gd`; off by default).
 - --sim-dump: the bridge offline; `tests/belt_bs_replay.gd --every-tick --ie-wire=0 --sim-dump= --belt-draw-dump=` replays
 - --sim-dump-near: `draw.bin.apply.jsonl`) came within a point of the live run's frozen and sliding shares. `--sim-dump-near` (with
 - --size: --worktree <checkout> --ports <udp>,<game>,<rcon> [--at x,y] [--size 64] [--seconds 10] [--settle 40]
@@ -2087,6 +2195,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --source: missing (0.8%), and the far end of `tools/belt_build_mine.py --source` flapped every 24 ticks.
 - --spacing: 99.91%; `--scene mine --source --spacing 64` (K22, a packed moving line): phantoms 2.06 -> 0.16% of what is drawn
 - --spike-log: **The spike log** (`-- --spike-log[=ms]`, or the debug menu's Tests → Spike log; off by default;
+- --spike-render: `--spike-render=off`: a spike line without its render part (draw calls, the viewport's measured CPU/GPU ms, the renderer's stages with Godot's `--gpu-profile`) and with the draw bucket even with the render thread on, as before (PROFILING-NOTES, the spike log's render part).
 - --split-reconcile: 5.92% -> 2.83% off on rec80, 6.18% -> 4.20% on rec80b (belt_sim_replay.gd `--split-reconcile=off`).
 - --split-wake: belt_sim_replay.gd `--split-wake=old`, tools/belt_sim/sim.py `--wake-rule r0|r4`). Splitters with a priority
 - --ssil-zoom-fade: ...l-paraboloid on the character lantern; `--ssil-zoom-fade=off` leaves SSIL on across all zooms instead of fading out alongside SSAO.
@@ -2096,6 +2205,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --stand-in-cap: --bs --capture` instead of Zenith (no Godot, no screenshots: for bridge-only runs; `--stand-in-cap`,
 - --stand-in-near: `--stand-in-near` are its `bfar`). `--reuse-server` keeps the server running on its save copy after the
 - --status: run.json beside the stream, or `--status`, `--settings-file`) and how the replay ran. The headline
+- --stop-labels: `--stop-labels=alt` restores floating 3D train station names over stops while Alt-mode is on (default `map`: station names show only in map view).
 - --stop-server: worktree's mod changed (copied in again); `--stop-server` stops it. `--main <checkout>` runs the same
 - --stream-lookahead: - `--stream-lookahead=off`: disable flight-velocity priority biasing along movement direction.
 - --stream-window: - `--stream-window=legacy|<N>`: restore fixed `STREAM_MOVING = 12` / `STREAM_STILL = 32` non-sliding subscription throttling (`legacy`), or force a custom in-fl...
@@ -2121,6 +2231,7 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --tier: `python tools/belt_bursts.py --out <dir> --mode out|take [--tier turbo]` makes the scenes (its header says how
 - --tile: [rec.json] [--bench] [--tile=N]` starts from the recording's first tick, steps on by itself given only what
 - --trace: --trace=<f3d-ih-trace.jsonl> [--events] [--lose=0.18]` the layer against a real trace, fed samples or
+- --tree-impostor: `--tree-impostor=off` disables solid non-discard crown shadow hulls, coarsened wood shadow indices, and the 4th far tree LOD tier in `model_lods.gd`.
 - --tree-lod: - `--tree-lod=off`: disables card-level view LODs on trees, keeping full leaf cards at every distance as before.
 - --tree-shadow-decimate: ...ps vertex-stage lane distance culling; `--tree-shadow-decimate=off` keeps all non-core leaf cards in tree shadow stand-ins; `--far-coarse=off` disables the oute...
 - --tree-sheen: Trees (and rocks with grain): `--tree-sheen=old` (also `--grass-backlight=old`) keeps the 0.2.2 specular 0.5-0.2; default is matte (0.05, roughness 1). `--night...
@@ -2134,8 +2245,10 @@ Full context in [PROFILING-NOTES.md](PROFILING-NOTES.md) and [TROUBLESHOOTING.md
 - --view-dump: replays the capture through that build's belt_items.gd (`tests/belt_bs_replay.gd --view-dump
 - --wake-prio: or a filter stay out of it (tools/belt_sim/sim.py `--wake-prio` shows it worse on one recording).
 - --wake-rule: belt_sim_replay.gd `--split-wake=old`, tools/belt_sim/sim.py `--wake-rule r0|r4`). Splitters with a priority
+- --walk-shape: `--walk-shape=off`: a chunk's first build resolves every record in GDScript (`_walk_rec`), as before (on: records whose shape a build already resolved get their row from the shape's template in `ChunkBuildNative.collect_rows`; [A chunk's first build from shape templates](#chunk-streaming-the-views-direction-the-area-cache)).
 - --warm-rings: ...eps full-detail meshes for far ghosts; `--warm-rings=<n>` sets warm ring retention (`0..12`, default `4`); `--belt-lane-vcull=off` skips vertex-stage lane dista...
 - --warm-shaders: - `--warm-shaders=loaded|all|cold|off` (loaded): shader_warmup.gd uses the world's shaders once while the client starts (`all` or cold start compiles all; warm `loaded` touches cached batches; `cold` skips on warm launches; `off` skips).
+- --worker-threads: - `--worker-threads=all|<n>` (headroom cap in `user://engine.cfg`): caps `threading/worker_pool/max_threads` so background shader/asset jobs leave CPU cores free for the OS and other apps (`all` or `-1` uses Godot's default `-1`).
 - --warmup: `--warmup` seconds (20 by default) and then records the bridge's per-module times, the game's UPS,
 - --watch: `python tools/belt_ring.py --out <dir> [--puts 10,17] [--watch 5,12]` makes a moving ring the same way (replayed with
 - --windows: tools/join_hitches.py out.json [--windows] [--md]` then gives frame-time percentiles, the frames over 25
@@ -2152,7 +2265,8 @@ Flags consolidated from [RUNNING.md](RUNNING.md) so the running guide stays scan
 
 | Switch | Default | Purpose |
 |---|---|---|
-| `--upscaler=bilinear\|fsr1\|fsr2` | `fsr1` | 3D viewport upscaler (`fsr` aliases `fsr1`; `fsr2.1`/`fsr2.2` alias `fsr2` for AMD FSR 2.2 Temporal). |
+| `--rendering-driver d3d12\|vulkan` (Godot's own, before `--`) | `d3d12` on Windows | The renderer for this start, over **Settings → Graphics → Renderer** (`graphics.renderer`, written to `user://engine.cfg` as `rendering/rendering_device/driver.windows`; applies after a restart). Direct3D 12 is the Windows default since 0.3.1 (about half Vulkan's memory in the overnight soak); `project.godot` falls back to Vulkan when Direct3D 12 can't start. Linux and macOS unchanged. The shader refresh's restart keeps it, and the staged shader warm-up runs once per driver (`driver=` in `user://build-stamp.txt`). |
+| `--upscaler=bilinear\|fsr1\|fsr2\|fsr3\|fsr4\|dlss\|auto` | the setting (`fsr2`) | 3D viewport upscaler for one run, over **Settings → Graphics → Upscaling** (`fsr` aliases `fsr1`; `fsr2.1`/`fsr2.2` alias `fsr2` for AMD FSR 2.2 Temporal; `fsr4` is AMD FSR 4.1, Radeon RX 6000 or newer, `fsr3` AMD FSR 3.1, any GPU; `fsr4.x`/`fsr3.x` alias them). `fsr4`, `fsr3`, `dlss` and `auto` need a build with the engine hook and the vendor runtime (none yet, [RUNNING.md](RUNNING.md#upscaling)): until then `fsr4`/`fsr3`/`dlss` draw with FSR 2.2 (`fsr4` on a PC without a supported Radeon: FSR 3.1 where that can run) and `auto` picks FSR 2.2. An unknown value is `fsr1`, as before. |
 | `--fsr2-fixes=old` | current fixes | Restores pre-fix LookPass reactive alpha, sharpening, and orthographic FSR2 fallback behavior. |
 | `--temporal-motion-vectors=on\|off` | `on` | Toggles native MultiMesh per-instance motion vectors for moving belt items, robots, and creatures under TAA / FSR 2.2. |
 | `--temporal-mv-bands=0\|1\|all` | `0` | Belt item bands writing native motion vectors (`0`: close Band 0 only; `1`: +Band 1; `all`: all; Band 2 stays GPU-record). |
@@ -2161,6 +2275,14 @@ Flags consolidated from [RUNNING.md](RUNNING.md) so the running guide stays scan
 | `--no-belt-smear` | smear on | Disables one-frame fast-belt smear (compare cleanly without TAA/motion blur). |
 | `--native-belt-items=off` | native | Forces ItemCards per-frame MultiMesh hand-over back to GDScript instead of `BeltItemsNative`. |
 | `--native-inserters=off` | native | Forces GDScript inserter arm transforms instead of `InserterArmsNative`. |
+| `--native-inserter-loop=off` | native | The live inserter arms' per-arm loop (bind checks, pincers, moving state, batches) in GDScript instead of `InserterPoseNative.frame_draw`. |
+| `--native-inserter-pose=off` | native | Live inserter arms' samples, events and pose kept and worked out in GDScript instead of `InserterPoseNative`. |
+| `--native-inserter-swing=off` | native | The GDScript pose's swing plans from `inserter_swing.gd` instead of `InserterSwingNative`. |
+| `--native-inserter-ingest=off` | native | Inserter arms' `ih` hands and `ie` events taken in GDScript instead of `InserterIngestNative`. |
+| `--native-inserter-ingest2=off` | native 2 | `InserterIngestNative` checks each hand's arm in the arms' map, and `_end_frame` and the stale sweep walk every arm. |
+| `--arm-bind-layout=off` | layout stamp | Inserter arms bind again (base, colour, placement) whenever any model finishes (`ModelLibrary.generation`), and `InserterIngestNative` hands every arm back to the GDScript then. |
+| `--arm-model-watch=off` | watched names | Inserter arms' modes are decided again and every chunk's resting arms rebuilt whenever any model finishes (`ModelLibrary.generation`). |
+| `--rest-arms-index=off` | indexed + native | Resting inserter arms walk every entity of their chunk and are posed in GDScript; `_belt_at` walks the chunk; every chunk's resting-arm shadow is checked every frame. |
 | `--native-movers=off` | native | Forces GDScript motion-vector transforms for robots and walking creatures instead of `MoversNative`. |
 | `--native-decor=off` | native | Forces GDScript per-chunk decoratives build instead of `DecorNative`. |
 | `--weather-rain-zoom=old` | grows | Immersive Weather's rain keeps its 48-tile box round the focus when zoomed out (a dot on screen) instead of growing with the camera's distance. |
@@ -2168,6 +2290,23 @@ Flags consolidated from [RUNNING.md](RUNNING.md) so the running guide stays scan
 | `--enemies-burst=old` | spread | Immersive Enemies draws every death of a frame at once (a grenade into a horde: 25-35 ms for 80 deaths), sprays every hit at once, and api.creatures throws its cut legs/parts away whenever any model finishes loading, as before 0.1.2 (add-on setting *Spread death effects over frames*). |
 | `--static-mv=old` | `f3d_time` | Standing buildings read Godot `TIME` again, putting static geometry into TAA/FSR2 motion vectors. |
 | `--merged-materials` / `--no-merged-materials` | off (auto-on in Recommended) | Draws each model as one surface/material (fewer draw calls, slightly higher GPU cost; takes effect on restart). |
+| `--tree-impostor=off` | on | Restores alpha-tested tree leaf shadow cards and 3-tier tree far LODs (`model_lods.gd`). |
+| `--fx-opt=off` | on | Restores linear array erasures and uncached/unculled trail updates (`sprite_fx.gd`, `weapon_fx.gd`). |
+| `--signal-omni-lights=on` | off | Restores pooled `OmniLight3D`s on rail/chain signals (`signal_lights.gd`). |
+| `--budget-floor-cap=off` | on | Restores uncapped stacking of non-`messages` `FrameBudget` floors (`frame_budget.gd`). |
+| `--mv-skip-clean=off` | on | Restores unconditional per-frame `item_cards.gd` motion-vector MultiMesh uploads. |
+| `--mv-skip-idle=off` | on | Restores per-frame idle `write_xform` and MV buffer uploads in `robot_swarm.gd` and `creatures.gd`. |
+| `--msaa-with-smaa=on` | off | Restores stacking SMAA post-processing on top of active MSAA (`settings.gd`). |
+| `--hover-highlight-cache=off` | on | Restores rebuilding hover/build highlights every frame even when unchanged (`player_input.gd`). |
+| `--belt-mid-lod=off` | on | Disables the 3D mid-detail belt LOD tier (`belt_lods.gd`, `chunk_view.gd`), restoring Full/Flat only. |
+| `--native-bc-compress=off\|on\|force` | `on` | Controls C++ `TextureCompressNative` BC1/BC3 compression in exported builds (`force` uses it in editor too). |
+| `--belt-mv-change-flag=off` | on | Hashes every emitted belt motion-vector buffer again (`belt_mv.gd`, `item_cards.gd put_mv`) instead of the native evaluator's change flag. |
+| `--belt-mv-partial=off` | on | Restores unconditional `BeltMv` MultiMesh buffer syncs even on settled/off-screen frames (`belt_mv.gd`). |
+| `--belt-mv-threads=off` | on | Evaluates the belt motion-vector kinds one after another on the main thread (`BeltMvNative.step`) instead of in parallel on the worker pool. |
+| `--belt-mv-tight-cap=off` | on | Sizes belt motion-vector buffers to the records' capacity instead of the items (`BeltMvNative`). |
+| `--belt-mv-page-dirty=off` | on | A record page update re-evaluates whole belt motion-vector kinds instead of the touched pages' slots (`BeltMvNative`). |
+| `--belt-mv-native-put=off` | on | Hands every changed belt motion-vector buffer to GDScript's `put_mv` instead of putting steady kinds from `BeltMvNative.step`. |
+| `--cloud-ray-opt=off` | on | Disables 2x empty-space stepping and far/opaque detail skip in volumetric clouds (`cinematic_grade.gdshader`). |
 | `--ssao=on\|off` | preset / High | Overrides Ambient Occlusion for a single run. |
 | `--model-look=palette` | standard | Draws built-in models in their unweathered palette colours for visual comparison. |
 | `--item-models=off` | `on` | Draws every belt/ground/hand item as its 2D icon instead of 3D item meshes. |
@@ -2177,6 +2316,40 @@ Flags consolidated from [RUNNING.md](RUNNING.md) so the running guide stays scan
 | `--ups-probe=<out.json[@walk\|@governed=s]>` | off | Steps client distance/LOD knobs during a run to measure per-knob UPS gain. |
 | `--update-check=off\|test` | button, no automatic check (Settings > Interface) | `off`: no "Check for updates" button and no request. `test`: the button and popup work with a made-up newer version, no request. |
 | `--combat-shadows=off` | budgeted shadows (6) | Disables budgeted dual-paraboloid shadows on combat and turret `OmniLight3D`s (restores unshadowed combat lights). |
+| `--fast-edit-coalesce=off` | 35 ms coalescing | Disables burst coalescing on repeated live edits to the same chunk in `world.gd`. |
+| `--pipe-drag=line` | follows cursor | Holds dragged pipes (`pipe`, `heat-pipe`) to a straight line instead of following the cursor path round corners. |
+| `--cursor-icon-world=old` | icon shown | Hides the held building's icon by the cursor over the world when a build ghost is visible. |
+| `--tree-shadow-shape=old` | rounded polygons | Restores 2-triangle quad leaf-card shadows in `ModelLods.Job.crown_arrays`. |
+| `--pipeline-joints=old` | hidden | Restores white/tinted joint chevron arrows on pipes and tanks in `PipelineMarks`. |
+| `--auto-sort-open=old` | sorts while open | Waits until the character/machine window closes before auto-sorting main inventory. |
+| `--belt-take-sync=old` | synced take/read | Restores pre-fix inserter-take vs belt-read/rescue synchronization in `BeltSim` / `BeltSimNative`. |
+| `--inv-move-sfx=off` | UI item sounds | Disables inventory/slot/equipment move and pickup UI sounds. |
+| `--inv-slot-flash=off` | orange flash | Disables the 1 s orange highlight on newly added inventory stacks. |
+| `--item-picker-tabs=off` | tabbed picker | Restores the flat ungrouped item picker grid instead of Factorio item-group tabs. |
+| `--turret-ammo-guard=off` | guarded firing | Disables client guard against waking folded turrets on uncorroborated ammo drops (artillery, which never names a target, is never held back; the bridge's `turret_ammo_check` counts its shells, and vehicles' untargeted shots, only while one of its force's projectiles flies near it). |
+| `--alt-pipe-range=old` | full loaded range | Restores the 2-chunk radius cap on Alt-mode pipeline marks. |
+| `--alt-robot-items=off` | robot cargo shown | Hides Alt-mode carried-item icons on flying worker robots (`AltOverlay`). |
+| `--robot-dock-anim=off` | hover + shrink dock | Disables the personal-roboport robot return hover and shrink-into-back docking animation in `Movers`. |
+| `--robot-charge-sparks=off` | charging sparks | Disables electric arc and spark effects on charging worker robots (`RobotSwarm`, `Movers`). |
+| `--inserter-lod-scale=old` | scaled untextured | Stops applying `High`/`Ultra` LOD distance scaling to untextured models. |
+| `--inserter-far-keep=off` | kept on High/Ultra | Allows `FarChunks` to merge inserter bases into static voxel meshes on `High`/`Ultra`. |
+| `--inserter-shadows=old` | kept on High/Ultra | Drops inserter shadows outside `NEAR_SHADOW_RINGS` on `High`/`Ultra`. |
+| `--inserter-rest-arms=box\|off` | 3D resting arms | `box` restores 3-`BoxMesh` stick resting arms; `off` hides resting inserter arms. |
+| `--rest-arm-shadows=tier` | live | Resting inserter arms in far shadow-tier chunks cast no shadow on Low/Medium again (before 0.3.1); by default they cast as a live arm does. |
+| `--rest-arm-basic=stick` | live | An inserter with no arm model rests as the thin 3-box stick without a shadow again (before 0.3.1); by default it rests as its live placeholder arm. |
+| `--inserter-hand-stack=off` | stacked held items | Draws a single item per inserter hand instead of stacking up to 4 held items vertically. |
+| `--mover-pick-3d=off` | 3D mover pick | Restores 3rd-person floor-entity priority over 3D vehicle/train bounding-box picking. |
+| `--anim-sweep=old` | spread cleanup | Forgets the animator's states of entities gone in one frame every 5 s again (`anim.gd`, a 4-6 ms frame on a big base); by default the pass walks about 0.2 ms a frame until done. |
+| `--signal-skip-same=off` | kept refresh | Walks every rail/chain signal at every 0.5 s glow refresh again (`signal_lights.gd`); by default a refresh whose inputs (reported states, signals added or gone, focus, darkness, camera, detail distance, hills, caps) are all as last time keeps its glows, with one in five done in full anyway. |
+| `--mover-skip-still=off` | settled movers skipped | Works out every node mover (trains, cars) every frame again; by default one that stands still skips its position, rails, wheels, shadow and lift until a new position, rails changed under it (then awake for 121 frames, as world.gd may answer from its old rail grid that long), the headlights' beam or a model change. |
+| `--native-rail-height=off` | native | Rolling stock finds the rails' height with world.gd's `rail_height` twice per mover in GDScript again; by default the bogie points of every moving train go to `MoversNative.rail_heights` in one call a frame, over its copy of each chunk's rail index (`--elevated-trains=old` always uses GDScript). It makes its own `MoversNative`, so `--native-movers=off` leaves it on: use this switch. |
+| `--native-mover-sweep=off` | native | Simulated robots' grid sweep calls `MoverRecords.position` per robot again and robot batches rebuild their record list every frame; by default `MoversNative.positions` takes the sweep's 128 in one call, each batch keeps its record list, and the motion-vector idle check is one `MoversNative.any_active` call. |
+| `--rail-signal-blocks=off` | outlines + blocks | Disables rail signal/train-stop placement tile outlines and signal-block overlays. |
+| `--live-inserter-radius=view\|64` | detail | `view`: live inserter hands within the camera's view, up to 64 tiles (about 48 at the default zoom); `64`: within a fixed 64-tile square round the focus (0.3.1 before the view radius, Bug #5). The default `detail` is `f3d-detail-radius` alone (0.3.0). |
+| `--rblk-anchors=off` | anchors | Rail block queries (`rblk`) without anchors: each query's ids as replied, so one block asked about in two queries can show as two colours. |
+| `--near-tree-real-shadows=off` | real near shadows | Uses `ModelLods` stand-in hull shadows on near `SHADOWS_NEAR` tree chunks too. |
+| `--pipe-cap-edge=old` | flush edge caps | Restores inset `cap_from` extraction without translating pipe caps flush to `z = -0.505`. |
+| `--recipe-made-in=off` | machine icons | Restores crafting-category text (`Made in: ...`) instead of machine icon rows in recipe tooltips. |
 | `--wet-metal=old` | damped wet metal | Restores the previous rain wetness on metallic models (no metallic dampening, lower wet roughness/pool/drip floors). |
 | `--wet-rock=old` | current wet rock | Restores the older cliff and rock wetness appearance instead of matching rough stone. |
 | `--organic-surface=old` | current organic surface | Disables procedural micro-bump, roughness breakup, and damp-organic rain wetness on creatures (chitin/flesh). |
@@ -2188,6 +2361,9 @@ Flags consolidated from [RUNNING.md](RUNNING.md) so the running guide stays scan
 |---|---|---|
 | `--no-menu` | menu enabled | Skips the menu on startup and connects directly on `--factorio-port` (auto-enabled by in-game flags like `--open`, `--ui...`, `--camera`). |
 | `--boot-screen=off` | boot screen on | Skips the staged startup boot/shader warmup screen and enters directly. |
+| `--boot-skip=off` | Skip button on | Hides the boot screen's **Skip** button (shown beside Cancel while shaders/renderer warm; the first press warns about stutters with Wait (ETA) / Skip, the second starts the game and leaves the rest to compile while you play; the next start warms again). |
+| `--shader-compile=safe\|fast\|old` | `safe` | Controls boot shader compilation pacing (`safe` caps cold concurrency to 1–2, serializes heavy shaders, keeps VSync + 30/15 FPS cap, and runs cold compile at below-normal process priority; `fast` / `old` restores uncapped aggressive compilation). |
+| `--worker-threads=all\|<n>` | headroom cap | Caps `threading/worker_pool/max_threads` in `user://engine.cfg` (leaving cores free for the OS/DWM and other apps); `all` / `-1` restores Godot's uncapped `-1`. |
 | `--shader-refresh=build\|off\|force` | `build` | Controls first-run shader cache refresh on new builds (`build` refreshes on a new build stamp; `off` skips; `force` refreshes this start). |
 | `--dev-tools` | off | A public download with the testing tools a dev build has (the performance test, the debug menu; the update check stays off, as in a dev build). |
 | `--shader-refresh-parent=wait` | exit | After a new build's shader refresh restart, the first process stays hidden and waits for the restarted one (ending with its exit code) instead of ending at once; for launchers that follow the first process id. The waiting window could stay visible, frozen on Godot's start screen. |

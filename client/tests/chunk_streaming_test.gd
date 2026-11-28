@@ -46,7 +46,12 @@ func _run() -> void:
 	_test_double_buffered_refresh()
 	_test_optimistic_ram_cache()
 	_test_optimistic_slice()
+	_test_ents_slice()
+	_test_delta_behind_slices()
+	_test_covers_batch()
+	_test_queue_order()
 	await _test_chunk_disk_cache()
+	_test_disk_flush_fine()
 	_test_adaptive_window_and_lookahead()
 	await _test_far_chunks_freed_queue_safety()
 	_test_far_hidden_dropped_mmi()
@@ -353,6 +358,617 @@ func _test_optimistic_slice() -> void:
 	WorldMirror.optimistic_slice = slice_was
 	WorldMirror.optimistic_cache = opt_was
 	w.queue_free()
+
+
+## Perf wave 4 task 1: a packed `ents` message applied ENTS_SLICE records at a time, from the cache (_hydrate_step)
+## and live while the bridge drains (Bridge.requeue_front), ends as the whole message leaves it; --ents-slice=off.
+const ENTS_C := Vector2i(4, 4)
+
+
+func _ents_world() -> WorldMirror:
+	var w := _make_world(1)
+	# [id, name, type, box min x, y, max x, y, r, g, b, tiles w, h]
+	w.protos.add_entities([[2, "wooden-chest", "container", -0.4, -0.4, 0.4, 0.4, 1, 1, 1, 1, 1],
+		[3, "pipe", "pipe", -0.4, -0.4, 0.4, 0.4, 1, 1, 1, 1, 1],
+		[4, "transport-belt", "transport-belt", -0.4, -0.4, 0.4, 0.4, 1, 1, 1, 1, 1],
+		[5, "stone-wall", "wall", -0.4, -0.4, 0.4, 0.4, 1, 1, 1, 1, 1],
+		[6, "storage-tank", "storage-tank", -0.4, -0.4, 0.4, 0.4, 1, 1, 1, 1, 1],
+		[7, "pipe-to-ground", "pipe-to-ground", -0.4, -0.4, 0.4, 0.4, 1, 1, 1, 1, 1]])
+	# Connections on the tank's own tile, as a real one's are inside its box: no two records' on one tile.
+	w.fluid_ports_from({6: {"x": {"fb": [[0.0, 0.0, 0], [0.0, 0.0, 4], [0.0, 0.0, 8]]}}})
+	w._belt_ends_on = 1
+	var cv := ChunkView.new()
+	cv.coord = ENTS_C
+	w.chunks[ENTS_C] = cv
+	w.add_child(cv)
+	return w
+
+
+## [packed e, xi, xe] of `n` random records over the chunk's tiles (seeded).
+func _ents_records(n: int, seed_v: int) -> Array:
+	var rng := RandomNumberGenerator.new()
+	rng.seed = seed_v
+	var e := PackedInt32Array()
+	var xi := PackedInt32Array()
+	var xe: Array = []
+	for i in n:
+		var tx := i % 32
+		var ty := (i / 32) % 32
+		var proto := rng.randi_range(2, 7)
+		e.append_array([10000 + i, proto, (ENTS_C.x * 32 + tx) * 256 + 128, (ENTS_C.y * 32 + ty) * 256 + 128, 4 * rng.randi_range(0, 3)])
+		var ex := {}
+		if proto == 3 and rng.randf() < 0.5:
+			ex["pc"] = rng.randi_range(0, 15)
+		elif proto == 6:
+			ex["fa"] = 3
+		elif proto == 5 and rng.randf() < 0.5:
+			ex["wc"] = rng.randi_range(0, 15)
+		elif proto == 2 and rng.randf() < 0.3:
+			ex["x"] = i
+		if not ex.is_empty():
+			xi.append(i)
+			xe.append(ex)
+	return [e, xi, xe]
+
+
+func _ents_msgs(recs: Array, rv: int) -> Array:
+	return [{"t": "chunk", "cx": ENTS_C.x, "cy": ENTS_C.y, "rs": 1, "rv": rv, "n": 1, "parts": 1, "tiles": [0, 1024]},
+		{"t": "ents", "cx": ENTS_C.x, "cy": ENTS_C.y, "part": 1, "parts": 1, "e": recs[0], "xi": recs[1], "xe": recs[2]}]
+
+
+static func _sorted_pairs(d: Dictionary) -> Array:
+	var out: Array = []
+	for k in d:
+		out.append([str(k), str(d[k])])
+	out.sort()
+	return out
+
+
+## What the world holds after the records: every record's fields, covers and extras, the join tables, the dirty set.
+func _ents_state(w: WorldMirror) -> Array:
+	var rows: Array = []
+	for key in w.entities:
+		var r = w.entities[key]
+		rows.append([str(key), r.proto_id, r.fixed, r.dir, r.covers, str(r.cover_ports), r.belt_ends,
+			str(r.extra.get("pc", "-")), str(r.extra.get("pw", "-")), str(r.extra.get("wc", "-")), r.extra.size(), r.chunk])
+	rows.sort()
+	var dirty: Array = []
+	for c in w._dirty:
+		dirty.append(str(c))
+	dirty.sort()
+	return [rows, _sorted_pairs(w._pipes), _sorted_pairs(w._belts), _sorted_pairs(w._walls), dirty,
+		_sorted_pairs(w._port_tiles), _sorted_pairs(w._port_targets)]
+
+
+## Hydrates ENTS_C from the RAM cache one step a call: [calls it took, most records one step added, part noted only
+## at the end].
+func _ents_hydrate(w: WorldMirror, n: int) -> Array:
+	var msgs := _ents_msgs(_ents_records(n, 11), 9)
+	for m: Dictionary in msgs:
+		w.handle(m)
+	w._unload(ENTS_C)
+	for i in n:
+		w._remove(10000 + i)
+	w._dirty.clear()
+	var have: Array = []
+	w._spawn_chunk(ENTS_C, have)
+	w.hydrate_test_usec = 1
+	var calls := 0
+	var most := 0
+	var mid_ok := true
+	var cv: ChunkView = w.chunks.get(ENTS_C)
+	while calls < 200:
+		var before := cv.entities.size()
+		w._process_optimistic()
+		calls += 1
+		most = maxi(most, cv.entities.size() - before)
+		if not w._hyd.is_empty() and cv.entities.size() > 0 and cv.entities.size() < n and not cv.parts_got.is_empty():
+			mid_ok = false
+		if w._hyd.is_empty() and w._optimistic_queue.is_empty():
+			break
+	return [calls, most, mid_ok]
+
+
+func _test_ents_slice() -> void:
+	var opt_was := WorldMirror.optimistic_cache
+	var slice_was := WorldMirror.optimistic_slice
+	var ents_was := WorldMirror.ents_slice
+	WorldMirror.optimistic_cache = true
+	WorldMirror.optimistic_slice = true
+	var n := 1000
+	# A 1,000-record cached chunk replayed one step a call, sliced vs --ents-slice=off.
+	WorldMirror.ents_slice = true
+	var ws := _ents_world()
+	var hs := _ents_hydrate(ws, n)
+	var state_s := _ents_state(ws)
+	WorldMirror.ents_slice = false
+	var wo := _ents_world()
+	var ho := _ents_hydrate(wo, n)
+	var state_o := _ents_state(wo)
+	var expect_calls := 1 + ceili(n / float(WorldMirror.ENTS_SLICE))
+	print("ents slice: sliced %d calls (most %d records a step), off %d calls (%d records)" % [hs[0], hs[1], ho[0], ho[1]])
+	check(int(hs[0]) == expect_calls and int(hs[1]) <= WorldMirror.ENTS_SLICE and bool(hs[2]),
+		"ents slice: a 1,000-record cached chunk replays <= %d records a step (%d calls, most %d a step)" % [WorldMirror.ENTS_SLICE, hs[0], hs[1]])
+	check(int(ho[0]) == 2 and int(ho[1]) == n, "--ents-slice=off: the whole message in one step (%d calls)" % ho[0])
+	check((state_s[0] as Array).size() == n and state_s == state_o,
+		"ents slice: records, covers, extras (pc, pw, wc), pipes/belts/walls, ports and the dirty set as unsliced (%d records)" % (state_s[0] as Array).size())
+	var cvs: ChunkView = ws.chunks.get(ENTS_C)
+	check(cvs.optimistic and ws._optimistic_rv.get(ENTS_C, []) == [1, 9, 1] and cvs.parts_got.has(1),
+		"ents slice: the chunk left as a whole replay leaves it (rv, part noted)")
+	ws.queue_free()
+	wo.queue_free()
+	# A live `ents` while the bridge drains: the first slice now, the rest in front of the waiting messages.
+	var head_was: Array = Bridge._replay_head
+	var at_was: int = Bridge._replay_at
+	var drain_was: bool = Bridge._draining
+	Bridge._replay_head = []
+	Bridge._replay_at = 0
+	WorldMirror.ents_slice = true
+	var wl := _ents_world()
+	var live_msgs := _ents_msgs(_ents_records(n, 23), 4)
+	wl.handle(live_msgs[0])
+	Bridge._draining = true
+	wl.handle(live_msgs[1])
+	Bridge._draining = drain_was
+	var cvl: ChunkView = wl.chunks.get(ENTS_C)
+	var first := cvl.entities.size()
+	var queued: int = Bridge._replay_head.size() - Bridge._replay_at
+	while Bridge._replay_at < Bridge._replay_head.size():
+		var rp = Bridge._replay_head[Bridge._replay_at]
+		Bridge._replay_at += 1
+		rp.run()
+	Bridge._replay_head = head_was
+	Bridge._replay_at = at_was
+	WorldMirror.ents_slice = false
+	var ww := _ents_world()
+	ww.handle(live_msgs[0])
+	ww.handle(live_msgs[1])
+	check(first == WorldMirror.ENTS_SLICE and queued == expect_calls - 2,
+		"ents slice live: %d records at once, %d slices queued in front" % [first, queued])
+	check(_ents_state(wl) == _ents_state(ww) and cvl.parts_got.has(1), "ents slice live: ends as the whole message does")
+	wl.queue_free()
+	ww.queue_free()
+	# _xi_cursors as _add_packed's own cursor, also with xi repeated or out of order.
+	var odd := {"e": PackedInt32Array(), "xi": PackedInt32Array([3, 70, 70, 200, 130]), "xe": [{}, {}, {}, {}, {}]}
+	var cur := WorldMirror._xi_cursors(odd, 300)
+	check(cur == PackedInt32Array([0, 1, 2, 2, 2]), "ents slice: xi cursors stop at a repeated or behind index (%s)" % [cur])
+	# _pack_cache_entry: parts joined with append_array vs record by record, on random entries.
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 5
+	var same := true
+	for trial in 20:
+		var msgs: Array = [{"t": "chunk", "parts": 3}]
+		var wide := trial % 5 == 4
+		for part in rng.randi_range(2, 5):
+			var recs := _ents_records(rng.randi_range(0, 150), trial * 10 + part)
+			var e: Variant = recs[0]
+			if wide:
+				var e64 := PackedInt64Array(Array(recs[0]))
+				if part == 0 and e64.size() > 0:
+					e64[0] = 1099511627776
+				e = e64
+			msgs.append({"e": e, "xi": recs[1], "xe": recs[2]})
+		WorldMirror.ents_slice = false
+		var old_a := WorldMirror._pack_cache_entry({"msgs": msgs})
+		var old_b := WorldMirror._pack_cache_entry({"msgs": msgs}, false)
+		WorldMirror.ents_slice = true
+		var new_a := WorldMirror._pack_cache_entry({"msgs": msgs})
+		var new_b := WorldMirror._pack_cache_entry({"msgs": msgs}, false)
+		if old_a != new_a or str(old_b) != str(new_b) or typeof(old_a[0]) != typeof(new_a[0]):
+			same = false
+	check(same, "ents slice: multi-part cache pack joined with append_array equals the record-by-record copy")
+	# The optimistic queue sorted by packed keys: the same ranks in order as sort_custom.
+	var wq := _make_world(1)
+	wq._focus = Vector2(40, -70)
+	var center := wq.chunk_of(wq._focus)
+	for i in 300:
+		wq._optimistic_queue.append(Vector2i(rng.randi_range(-30, 30), rng.randi_range(-30, 30)))
+	wq._opt_queue_gen += 1
+	var ref: Array = wq._optimistic_queue.duplicate()
+	var cmp := func(a: Vector2i, b: Vector2i) -> bool:
+		return wq._build_rank(a, center) < wq._build_rank(b, center)
+	ref.sort_custom(cmp)
+	wq._sort_optimistic_queue()
+	var ranks_ok := ref.size() == wq._optimistic_queue.size()
+	for i in ref.size():
+		if wq._build_rank(ref[i], center) != wq._build_rank(wq._optimistic_queue[i], center):
+			ranks_ok = false
+	var key_was: Array = wq._opt_sorted_key
+	wq._optimistic_queue.pop_front()
+	wq._sort_optimistic_queue()
+	check(ranks_ok and wq._opt_sorted_key == key_was, "ents slice: optimistic queue ranks as sort_custom's, not sorted again after a pop")
+	wq.queue_free()
+	WorldMirror.ents_slice = ents_was
+	WorldMirror.optimistic_slice = slice_was
+	WorldMirror.optimistic_cache = opt_was
+
+
+## perf-w4-fix M2: a `del` and an `upd` for records in a live `ents` message's unapplied slices (the replay head),
+## routed and handled through the real Bridge's _drain: neither takes the priority lane ahead of the slices, so the
+## deleted record isn't added back (a ghost) and the update isn't overwritten by the slice's older record.
+func _test_delta_behind_slices() -> void:
+	var ents_was := WorldMirror.ents_slice
+	WorldMirror.ents_slice = true
+	var saved := {}
+	for k in ["priority_queue", "coalesce_updates", "belt_messages_first", "connected", "world_ready", "_seq_connected",
+			"_seq_world_ready", "drain_head_again", "prio_delta_order", "_replay_head", "_replay_at", "_waiting", "_waiting_at",
+			"_waiting_len", "_waiting_usec", "_waiting_checked", "_prio_waiting", "_chunk_waiting", "_prio_barriers"]:
+		saved[k] = Bridge.get(k)
+	Bridge.priority_queue = true
+	Bridge.coalesce_updates = true
+	Bridge.belt_messages_first = true
+	Bridge.connected = true
+	Bridge.world_ready = true
+	Bridge._seq_connected = true
+	Bridge._seq_world_ready = true
+	Bridge.drain_head_again = false  # (the slices left in the head after the first drain: the window under test)
+	Bridge.prio_delta_order = true
+	Bridge._replay_head = []
+	Bridge._replay_at = 0
+	Bridge._waiting = []
+	Bridge._waiting_at = 0
+	Bridge._waiting_len = PackedInt32Array()
+	Bridge._waiting_usec = PackedInt64Array()
+	Bridge._waiting_checked = PackedByteArray()
+	Bridge._prio_waiting = []
+	Bridge._chunk_waiting = {}
+	Bridge._prio_barriers = 0
+	var n := 1000
+	var recs := _ents_records(n, 23)
+	var e: PackedInt32Array = recs[0]
+	var gone := 600  # (records in the 10th and 8th slices)
+	var turned := 500
+	var w := _ents_world()
+	Bridge.message_received.connect(w.handle)
+	Bridge._route(_ents_msgs(recs, 4), PackedInt32Array(), Time.get_ticks_usec())
+	var frames := 0
+	while Bridge._replay_head.size() - Bridge._replay_at == 0 and Bridge.waiting_count() > 0 and frames < 50:
+		FrameBudget.test_next_frame()
+		Bridge._drain()
+		frames += 1
+	var head_left: int = Bridge._replay_head.size() - Bridge._replay_at
+	var b := gone * 5
+	var del_msg := {"t": "del", "u": e[b], "p": e[b + 1], "x": e[b + 2], "y": e[b + 3]}
+	var t := turned * 5
+	var new_dir := (e[t + 4] + 4) % 16
+	var upd_msg := {"t": "upd", "e": [e[t], e[t + 1], e[t + 2], e[t + 3], new_dir]}
+	Bridge._route([del_msg, upd_msg], PackedInt32Array(), Time.get_ticks_usec())
+	var prio_now: int = Bridge._prio_waiting.size()
+	frames = 0
+	while Bridge.waiting_count() > 0 and frames < 200:
+		FrameBudget.test_next_frame()
+		Bridge._drain()
+		frames += 1
+	Bridge.message_received.disconnect(w.handle)
+	var ghost: bool = w.entities.has(e[b])
+	var r_t = w.entities.get(e[t])
+	check(head_left > 0 and prio_now == 0,
+		"delta behind slices: the del/upd wait behind %d queued slices, not in the priority lane (%d there)" % [head_left, prio_now])
+	check(not ghost, "delta behind slices: a record deleted while its slice waited stays deleted (no ghost)")
+	check(r_t != null and int(r_t.dir) == new_dir,
+		"delta behind slices: an upd for a record in a waiting slice is not overwritten (dir %s, want %d)" % [str(r_t.dir) if r_t != null else "none", new_dir])
+	w.queue_free()
+	for k in saved:
+		Bridge.set(k, saved[k])
+	WorldMirror.ents_slice = ents_was
+
+
+## Perf wave 4 task 3: pipe covers worked out once a message (_join_covers) with memoised connections, vs
+## --covers-batch=off: random machines, pipes and pipes to ground added, moved and added again in one message.
+## `n` records of `units` on free tiles of the two chunks (`at`: tile -> unit, unit -> tile, kept across messages): a
+## unit sent again leaves its old tile (as _add_fields' _remove does), so no two records ever share a tile.
+func _covers_records(rng: RandomNumberGenerator, units: Array, n: int, at: Dictionary) -> Array:
+	var e := PackedInt32Array()
+	var xi := PackedInt32Array()
+	var xe: Array = []
+	for i in n:
+		var unit: int = units[rng.randi_range(0, units.size() - 1)]
+		var tile := Vector2i(rng.randi_range(0, 63), rng.randi_range(0, 31))
+		while at.has(tile):
+			tile = Vector2i(rng.randi_range(0, 63), rng.randi_range(0, 31))
+		if at.has(unit):
+			at.erase(at[unit])
+		at[unit] = tile
+		at[tile] = unit
+		var pick := rng.randi_range(0, 9)
+		var proto := 3 if pick < 4 else (7 if pick < 6 else (6 if pick < 8 else 8))
+		e.append_array([unit, proto, (ENTS_C.x * 32 + tile.x) * 256 + 128, (ENTS_C.y * 32 + tile.y) * 256 + 128, 4 * rng.randi_range(0, 3)])
+		var ex := {}
+		if proto == 3 and rng.randf() < 0.6:
+			ex["pc"] = rng.randi_range(0, 15)
+		elif proto == 8:
+			ex["fa"] = rng.randi_range(0, 3)
+		if not ex.is_empty():
+			xi.append(i)
+			xe.append(ex)
+	return [e, xi, xe]
+
+
+func _covers_world(batch: bool) -> WorldMirror:
+	var was := WorldMirror.covers_batch
+	WorldMirror.covers_batch = batch
+	var w := _ents_world()
+	w.protos.add_entities([[8, "assembling-machine-2", "assembling-machine", -0.4, -0.4, 0.4, 0.4, 1, 1, 1, 1, 1]])
+	w.fluid_ports_from({6: {"x": {"fb": [[0.0, 0.0, 0], [0.0, 0.0, 4], [0.0, 0.0, 8]]}},
+		8: {"x": {"fb": [[0.0, 0.0, 0, "i"], [0.0, 0.0, 8, "o"], [0.0, 0.0, 12, "b"]]}}})
+	var c2 := ENTS_C + Vector2i(1, 0)
+	var cv2 := ChunkView.new()
+	cv2.coord = c2
+	w.chunks[c2] = cv2
+	w.add_child(cv2)
+	WorldMirror.covers_batch = was
+	return w
+
+
+func _covers_state(w: WorldMirror) -> Array:
+	var rows: Array = []
+	for key in w.entities:
+		var r = w.entities[key]
+		rows.append([str(key), r.proto_id, r.fixed, r.dir, r.covers, str(r.cover_ports),
+			str(r.extra.get("pc", "-")), str(r.extra.get("pw", "-"))])
+	rows.sort()
+	var dirty: Array = []
+	for c in w._dirty:
+		dirty.append(str(c))
+	dirty.sort()
+	return [rows, dirty, _sorted_pairs(w._pipes), _sorted_pairs(w._port_tiles), _sorted_pairs(w._port_targets)]
+
+
+func _diff_dbg(a: Array, b: Array) -> void:
+	for i in a.size():
+		if a[i] != b[i]:
+			var x: Array = a[i]
+			var y: Array = b[i]
+			print("DBG part %d sizes %d %d" % [i, x.size(), y.size()])
+			for j in mini(x.size(), y.size()):
+				if x[j] != y[j]:
+					print("DBG  a ", x[j])
+					print("DBG  b ", y[j])
+					break
+			return
+
+
+func _test_covers_batch() -> void:
+	var was := WorldMirror.covers_batch
+	var all_same := true
+	var covered := 0
+	var cover_checks := 0
+	var usec := [0, 0]
+	for trial in 6:
+		var states: Array = []
+		for batch in [true, false]:
+			WorldMirror.covers_batch = batch
+			var w := _covers_world(batch)
+			var rng := RandomNumberGenerator.new()
+			rng.seed = 900 + trial
+			var first: Array = []
+			for u in 500:
+				first.append(30000 + u)
+			var again: Array = first.slice(0, 250)
+			for u in 250:
+				again.append(31000 + u)
+			w.handle({"t": "chunk", "cx": ENTS_C.x, "cy": ENTS_C.y, "rs": 1, "rv": 1, "n": 1, "parts": 2, "tiles": [0, 1024]})
+			w.handle({"t": "chunk", "cx": ENTS_C.x + 1, "cy": ENTS_C.y, "rs": 1, "rv": 1, "n": 1, "parts": 1, "tiles": [0, 1024]})
+			var at := {}
+			var r1 := _covers_records(rng, first, 500, at)
+			w.handle({"t": "ents", "cx": ENTS_C.x, "cy": ENTS_C.y, "part": 1, "parts": 2, "e": r1[0], "xi": r1[1], "xe": r1[2]})
+			w._dirty.clear()
+			# One message adding new records, moving and adding again old ones (each _remove'd first), some twice.
+			var r2 := _covers_records(rng, again, 400, at)
+			var t_msg := Time.get_ticks_usec()
+			w.handle({"t": "ents", "cx": ENTS_C.x, "cy": ENTS_C.y, "part": 2, "parts": 2, "e": r2[0], "xi": r2[1], "xe": r2[2]})
+			usec[0 if batch else 1] += Time.get_ticks_usec() - t_msg
+			check(w._join_covers.is_empty(), "covers batch: nothing left to cover after the message")
+			states.append(_covers_state(w))
+			if batch:
+				for key in w.entities:
+					var r = w.entities[key]
+					if r.proto_id == 6 or r.proto_id == 8:
+						cover_checks += 1
+						if r.covers != 0:
+							covered += 1
+			w.queue_free()
+		if states[0] != states[1]:
+			all_same = false
+			_diff_dbg(states[0], states[1])
+	check(all_same and cover_checks > 0 and covered > 0 and covered < cover_checks,
+		"covers batch: every record's covers, cover_ports, pc/pw, ports and the dirty set as --covers-batch=off (%d machines, %d with covers)" % [cover_checks, covered])
+	WorldMirror.covers_batch = was
+	print("covers batch: %d machines (%d with covers); 6 messages of 400 records %.1f ms batched vs %.1f ms off" % [cover_checks, covered, usec[0] / 1000.0, usec[1] / 1000.0])
+
+
+## Perf wave 4 task 5: the build queues put in order by packed keys (_rank_order) as sort_custom(nearer) did, ties
+## aside; dirty chunks that can't be built yet left out before ranking; --queue-order=old.
+func _test_queue_order() -> void:
+	var was := WorldMirror.queue_order_old
+	WorldMirror.queue_order_old = false
+	var w := _make_world(1)
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 77
+	var all_ok := true
+	for trial in 8:
+		w._dirty_live.clear()
+		w._live_prep.clear()
+		w._wanted_f = [Vector2i.ZERO, Vector2i(1, 0), Vector2i(-1, 1), Vector2i(0, -1)][trial % 4]
+		var center := Vector2i(rng.randi_range(-20, 20), rng.randi_range(-20, 20))
+		var cs: Array = []
+		for i in rng.randi_range(1, 600):
+			var c := Vector2i(rng.randi_range(-40, 40), rng.randi_range(-40, 40))
+			cs.append(c)
+			if rng.randf() < 0.1:
+				w._dirty_live[c] = true
+			elif rng.randf() < 0.05:
+				w._live_prep[c] = true
+		var nearer := func(a: Vector2i, b: Vector2i) -> bool:
+			var a_live := WorldMirror.fast_edit_rebuild and (w._dirty_live.has(a) or w._live_prep.has(a))
+			var b_live := WorldMirror.fast_edit_rebuild and (w._dirty_live.has(b) or w._live_prep.has(b))
+			if a_live != b_live:
+				return a_live
+			return w._build_rank(a, center) < w._build_rank(b, center)
+		var ref: Array = cs.duplicate()
+		ref.sort_custom(nearer)
+		var got: Array = w._build_order(cs.duplicate(), center, nearer)
+		var key_of := func(c: Vector2i) -> Array:
+			return [w._dirty_live.has(c) or w._live_prep.has(c), w._build_rank(c, center)]
+		if got.size() != ref.size():
+			all_ok = false
+			continue
+		for i in ref.size():
+			if key_of.call(ref[i]) != key_of.call(got[i]):
+				all_ok = false
+				break
+		var sorted_a := cs.duplicate()
+		sorted_a.sort()
+		var sorted_b := got.duplicate()
+		sorted_b.sort()
+		if sorted_a != sorted_b:
+			all_ok = false
+	check(all_ok, "queue order: packed ranks in sort_custom(nearer)'s order (live first, then _build_rank) on random queues")
+	# How long each takes on 1,000 chunks waiting (headless, this PC).
+	var big: Array = []
+	for i in 1000:
+		big.append(Vector2i(rng.randi_range(-40, 40), rng.randi_range(-40, 40)))
+	var cz := Vector2i.ZERO
+	var nearer_t := func(a: Vector2i, b: Vector2i) -> bool:
+		var a_live := WorldMirror.fast_edit_rebuild and (w._dirty_live.has(a) or w._live_prep.has(a))
+		var b_live := WorldMirror.fast_edit_rebuild and (w._dirty_live.has(b) or w._live_prep.has(b))
+		if a_live != b_live:
+			return a_live
+		return w._build_rank(a, cz) < w._build_rank(b, cz)
+	var t_a := Time.get_ticks_usec()
+	big.duplicate().sort_custom(nearer_t)
+	var t_b := Time.get_ticks_usec()
+	w._rank_order(big, cz)
+	var t_c := Time.get_ticks_usec()
+	print("queue order: 1,000 chunks sort_custom %.2f ms vs packed ranks %.2f ms" % [(t_b - t_a) / 1000.0, (t_c - t_b) / 1000.0])
+	# Dirty chunks that would only be passed over aren't ranked: one building, one with a prep job, one gone stays in.
+	w._dirty_live.clear()
+	w._live_prep.clear()
+	w._dirty.clear()
+	var ready := ChunkView.new()
+	var busy := ChunkView.new()
+	busy.building = true
+	var prepped := ChunkView.new()
+	for pair in [[Vector2i(1, 1), ready], [Vector2i(2, 1), busy], [Vector2i(3, 1), prepped]]:
+		w.chunks[pair[0]] = pair[1]
+		w.add_child(pair[1])
+		w._dirty[pair[0]] = true
+	w._prep_jobs[Vector2i(3, 1)] = null
+	w._dirty[Vector2i(9, 9)] = true
+	var can := w._buildable_dirty(Time.get_ticks_msec())
+	can.sort()
+	check(can == [Vector2i(1, 1), Vector2i(9, 9)], "queue order: a building chunk and one with a prep job left out of the ranking (%s)" % [can])
+	w._prep_jobs.clear()
+	busy.building = false
+	# --queue-order=old: sort_custom as before.
+	WorldMirror.queue_order_old = true
+	var cmp_called := [0]
+	var nearer_old := func(a: Vector2i, b: Vector2i) -> bool:
+		cmp_called[0] += 1
+		return a.x < b.x
+	var old_order: Array = w._build_order([Vector2i(3, 0), Vector2i(1, 0), Vector2i(2, 0)], Vector2i.ZERO, nearer_old)
+	check(cmp_called[0] > 0 and old_order == [Vector2i(1, 0), Vector2i(2, 0), Vector2i(3, 0)], "--queue-order=old: sort_custom(nearer)")
+	WorldMirror.queue_order_old = was
+	w.queue_free()
+
+
+## Perf wave 4 task 4: the disk cache's sliced flush checks the clock after every chunk and copies a chunk's extras
+## FLUSH_XE_BATCH at a time, its copies let go on the write worker; byte-equal region files to --disk-flush-fine=off.
+func _fine_cache(dir: String, ph: int, chunks_n: int, extras: int) -> ChunkDiskCache:
+	var dc := ChunkDiskCache.new()
+	dc.configure("save_fine", 1, ph, dir)
+	dc.clear_disk()
+	dc.configure("save_fine", 1, ph, dir)
+	var tiles := PackedInt32Array()
+	tiles.resize(1024)
+	tiles.fill(0)
+	for k in chunks_n:
+		var e := PackedInt32Array()
+		var xi := PackedInt32Array()
+		var xe: Array = []
+		for i in extras:
+			e.append_array([50000 + k * extras + i, 1, (k % 20) * 8192 + i, (k / 20) * 8192, 0])
+			xi.append(i)
+			xe.append({"pc": (i + k) % 16, "n": "x%d" % i, "l": [i, {"d": k}]})
+		dc.put_chunk(k % 20, k / 20, 3, 1, tiles, e, xi, "", xe)
+	for r in dc._regions:
+		for ck in dc._regions[r]:
+			dc._regions[r][ck]["saved"] = 1  # the same on both caches
+	return dc
+
+
+func _test_disk_flush_fine() -> void:
+	var fine_was := ChunkDiskCache.flush_fine
+	var async_was := ChunkDiskCache.async_encode
+	var sliced_was := ChunkDiskCache.flush_sliced
+	ChunkDiskCache.async_encode = true
+	ChunkDiskCache.flush_sliced = true
+	var p := ProtoDB.new()
+	p.add_tiles([[0, "grass-1", 80, 120, 60]])
+	var ph := ChunkDiskCache.compute_proto_hash(p)
+	var results: Array = []
+	for fine in [true, false]:
+		ChunkDiskCache.flush_fine = fine
+		var dc := _fine_cache("user://test-zchk-fine-%s" % ("on" if fine else "off"), ph, 300, 500)
+		var steps := 0
+		var most_us := 0
+		var t := Time.get_ticks_usec()
+		dc.flush_async()
+		most_us = Time.get_ticks_usec() - t
+		steps += 1
+		while dc._snapping and steps < 100000:
+			t = Time.get_ticks_usec()
+			dc.flush_async()
+			most_us = maxi(most_us, Time.get_ticks_usec() - t)
+			steps += 1
+		var st = dc._write_state
+		dc.wait_writes()
+		var files: Array = []
+		var decoded: Array = []
+		for r in [Vector2i(0, 0), Vector2i(1, 0)]:
+			var abs_path := ProjectSettings.globalize_path(dc._region_path(r.x, r.y))
+			files.append(FileAccess.get_file_as_bytes(abs_path))
+			decoded.append(str(ChunkDiskCache._read_region_file(abs_path, r.x, r.y, ph)))
+		results.append([files, decoded, steps, most_us, st != null and st.snapshots.is_empty() and int(st.written) == 2])
+		dc.clear_disk()
+	print("disk flush fine: 300 chunks x 500 extras, %d steps (longest %.2f ms) vs =off %d steps (longest %.2f ms)" % [
+		results[0][2], results[0][3] / 1000.0, results[1][2], results[1][3] / 1000.0])
+	var bytes_ok: bool = (results[0][0] as Array).size() == 2 and not ((results[0][0] as Array)[0] as PackedByteArray).is_empty()
+	check(bytes_ok and results[0][0] == results[1][0] and results[0][1] == results[1][1],
+		"disk flush fine: byte-equal region files and equal decode vs --disk-flush-fine=off")
+	check(bool(results[0][4]), "disk flush fine: the write task let its snapshots go itself (2 regions written)")
+	# A step with no time left: at most one chunk begun and one batch of extras copied.
+	ChunkDiskCache.flush_fine = true
+	var dz := _fine_cache("user://test-zchk-fine-step", ph, 30, 200)
+	dz._snapping = true
+	dz._snap_regions = dz._dirty.keys()
+	dz._snap_ri = 0
+	dz._snap_cur = []
+	dz._snap_out = []
+	var bounded := true
+	var n_steps := 0
+	while n_steps < 10000:
+		var done := dz._snap_step(0)
+		n_steps += 1
+		if int(dz.snap_last[0]) > 1 or int(dz.snap_last[1]) > ChunkDiskCache.FLUSH_XE_BATCH:
+			bounded = false
+		if done:
+			break
+	var copied := 0
+	var deep_ok := true
+	for snap: Array in dz._snap_out:
+		for d: Dictionary in snap[3]:
+			copied += 1
+			var src: Dictionary = dz._regions[ChunkDiskCache.region_of(int(d["cx"]), int(d["cy"]))][Vector2i(int(d["cx"]), int(d["cy"]))]
+			if d["xe"] != src["xe"] or is_same(d["xe"], src["xe"]) or is_same((d["xe"] as Array)[0], (src["xe"] as Array)[0]):
+				deep_ok = false
+	check(bounded and copied == 30 and deep_ok and n_steps >= 30 * ceili(200.0 / ChunkDiskCache.FLUSH_XE_BATCH),
+		"disk flush fine: no step past its slice plus one batch (%d steps), every chunk's extras deep-copied" % n_steps)
+	dz._snap_reset()
+	dz.clear_disk()
+	ChunkDiskCache.flush_fine = fine_was
+	ChunkDiskCache.async_encode = async_was
+	ChunkDiskCache.flush_sliced = sliced_was
 
 
 func _test_chunk_disk_cache() -> void:

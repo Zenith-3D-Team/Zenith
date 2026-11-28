@@ -210,6 +210,10 @@ function M.train_info(e)
   info.speed = math.floor(train.speed * 1000 + 0.5)
   local okn, name = pcall(function() return e.backer_name end)
   info.name = okn and name or nil
+  if e.type == "locomotive" then
+    local okc, copy = pcall(function() return e.copy_color_from_train_stop end)
+    info.ctc = okc and copy and 1 or 0
+  end
   -- The force's train groups with their train counts ([[name, count], ...]): Factorio's "[2]" after
   -- the group's name and its "Change train group" list.
   local okg, groups = pcall(M.groups, e.force)
@@ -253,7 +257,8 @@ function M.stop_info(e)
     if #info.trs >= MAX_STOP_TRAINS then
       break
     end
-    local here = t.path_end_stop and t.path_end_stop == e
+    -- Heading here, or standing here (path_end_stop is nil once it has arrived): what trains_count counts.
+    local here = (t.path_end_stop and t.path_end_stop == e) or (t.station and t.station == e)
     local front = t.front_stock
     info.trs[#info.trs + 1] = { t.id, state_name(t), here and 1 or 0, front and front.unit_number or 0 }
   end
@@ -354,7 +359,22 @@ function M.set_schedule(e, cmd)
       records[#records + 1] = record_in(e.surface, rec)
     end
   end
-  local ok, err = pcall(function() e.train.get_schedule().set_records(records) end)
+  local ok, err = pcall(function()
+    local schedule = e.train.get_schedule()
+    local current = schedule.current
+    schedule.set_records(records)
+    -- set_records sends the train back to the first record: editing a wait condition (or anything)
+    -- must leave it heading for the record it was going to.
+    local want = math.max(1, math.min(current, #records))
+    if #records > 0 and schedule.current ~= want then
+      -- (go_to_station also puts the train in automatic: a manual one stays manual.)
+      local manual = e.train.manual_mode
+      schedule.go_to_station(want)
+      if manual then
+        e.train.manual_mode = true
+      end
+    end
+  end)
   if not ok then
     puppet.message("Can't set the schedule: " .. tostring(err))
   end
@@ -402,14 +422,30 @@ function M.set_group(e, cmd)
   end
 end
 
--- {auto}: 1 automatic (follow the schedule), 0 manual.
+-- {auto?, ctc?}: auto 1 automatic (follow the schedule), 0 manual; ctc 1 / 0: the locomotive copies
+-- its colour from the stop it is bound for ("Use destination train stop color").
 function M.set_mode(e, cmd)
-  e.train.manual_mode = not (cmd.auto == 1 or cmd.auto == true)
+  if cmd.auto ~= nil then
+    e.train.manual_mode = not (cmd.auto == 1 or cmd.auto == true)
+  end
+  if cmd.ctc ~= nil and e.type == "locomotive" then
+    e.copy_color_from_train_stop = cmd.ctc == 1 or cmd.ctc == true
+  end
 end
 
 -- {name?, limit? (-1 for none)}: rename a train stop or change its trains limit.
 function M.set_stop(e, cmd)
   if type(cmd.name) == "string" and cmd.name ~= "" then
+    -- all = 1 (Ctrl while submitting, Factorio's "rename all stops with this name"): every stop of
+    -- the force that has this one's name.
+    local old = e.backer_name
+    if cmd.all == 1 and old ~= cmd.name then
+      for _, stop in pairs(game.train_manager.get_train_stops({ force = e.force })) do
+        if stop.valid and stop.backer_name == old and stop ~= e then
+          stop.backer_name = cmd.name
+        end
+      end
+    end
     e.backer_name = cmd.name
   end
   local limit = tonumber(cmd.limit)
@@ -502,6 +538,20 @@ local function overview_record(train)
   end
   local okg, group = pcall(function() return train.group end)
   local here = stop_name(train.station)
+  if here == "" and stop_name(train.path_end_stop) == "" then
+    -- Factorio's "No path to X" / "Destination full X" name the stop it is bound for, which has no
+    -- path (path_end_stop is nil): the current record's.
+    local state = state_name(train)
+    if state == "no_path" or state == "destination_full" then
+      local okr, rec = pcall(function()
+        local schedule = train.get_schedule()
+        return schedule.get_record({ schedule_index = schedule.current })
+      end)
+      if okr and rec and rec.station then
+        here = rec.station
+      end
+    end
+  end
   return {
     train.id, state_name(train), train.manual_mode and 1 or 0, here ~= "" and here or stop_name(train.path_end_stop),
     okg and group or "", #train.carriages, front and front.unit_number or 0, world.fixed(p.x), world.fixed(p.y),

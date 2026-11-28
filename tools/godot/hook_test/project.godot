@@ -1,0 +1,24 @@
+; The upscaler hook's window test (tools/godot/hook_window_test.ps1): a tiny project exported with Zenith's
+; patched Godot template, so the hook is tested apart from Zenith. Nothing here ships.
+config_version=5
+
+[application]
+
+config/name="Zenith hook test"
+run/main_scene="res://hook_test.tscn"
+config/features=PackedStringArray("4.7")
+
+[audio]
+
+driver/driver="Dummy"
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/size/resizable=false
+
+[rendering]
+
+renderer/rendering_method="forward_plus"
+rendering_device/driver.windows="d3d12"

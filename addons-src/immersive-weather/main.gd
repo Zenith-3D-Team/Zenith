@@ -422,6 +422,11 @@ func _declare_settings() -> void:
 		"section": "Audio",
 		"note": "New: a broad roar made at start, with gusts that never repeat the same way. Classic: the 0.3.1 whistle loop. --weather-wind=old forces Classic.",
 	})
+	s.add("sound_tone", "choice", "soft", "Rain and wind tone", {
+		"choices": [["Soft (tilted down, more headroom)", "soft"], ["Original (Weather Elements as recorded)", "original"]],
+		"section": "Audio",
+		"note": "Soft: the rain and wind loops with their top end eased and the loudest peaks 5 dB lower. Original: the files as first bundled. --weather-sounds=original forces Original.",
+	})
 	s.add("rain_volume", "number", 0.8, "Rain volume", {
 		"min": 0.0, "max": 1.0, "step": 0.05,
 		"section": "Audio",

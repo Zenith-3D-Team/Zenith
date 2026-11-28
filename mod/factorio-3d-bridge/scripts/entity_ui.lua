@@ -87,6 +87,10 @@ function M.add_inventories(e, kind, add)
     local trunk, ammo = define_index(names[1]), define_index(names[2])
     add("trunk", trunk and e.get_inventory(trunk))
     add("car_ammo", ammo and e.get_inventory(ammo))
+    if e.type == "spider-vehicle" then
+      local trash = define_index("spider_trash")
+      add("trash", trash and e.get_inventory(trash))
+    end
   elseif kind == "silo" then
     local index = define_index("crafter_input") or define_index("assembling_machine_input")
     add("input", index and e.get_inventory(index))
@@ -264,6 +268,30 @@ function M.pipeline_info(e)
   return { f and f.name or "", f and math.floor(f.amount + 0.5) or 0, math.floor(e.get_fluid_segment_capacity(1) + 0.5) }
 end
 
+local function belt_lane(e, index)
+  local out = {}
+  local ok, line = pcall(function() return e.get_transport_line(index) end)
+  if not (ok and line) then
+    return out
+  end
+  local okn, count = pcall(function() return #line end)
+  local n = math.min(okn and tonumber(count) or 0, 8)
+  for i = 1, n do
+    pcall(function()
+      local st = line[i]
+      if st and st.valid_for_read then
+        local entry = { name = st.name, count = st.count }
+        local okq, q = pcall(function() return st.quality.name end)
+        if okq and type(q) == "string" and q ~= "" and q ~= "normal" then
+          entry.quality = q
+        end
+        out[#out + 1] = entry
+      end
+    end)
+  end
+  return out
+end
+
 -- Adds the kind's own fields to a `gui` message.
 function M.fill(msg, e, kind, inventories)
   local okb, left = pcall(M.burner_left, e)
@@ -326,6 +354,10 @@ function M.fill(msg, e, kind, inventories)
     if ok then
       msg.pf = f and f.name or ""
     end
+  elseif t == "transport-belt" then
+    local ok1, l1 = pcall(belt_lane, e, 1)
+    local ok2, l2 = pcall(belt_lane, e, 2)
+    msg.bl = { ok1 and l1 or {}, ok2 and l2 or {} }
   end
   -- A chest's or cargo wagon's limit bar: how many slots machines may use.
   if kind == "container" or kind == "train" then

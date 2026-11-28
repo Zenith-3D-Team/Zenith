@@ -375,8 +375,9 @@ static func _find_data_dir() -> String:
 	for lib: String in paths._steam_libraries():
 		candidates.append(lib.path_join("steamapps/common/Factorio/data"))
 		candidates.append(lib.path_join("steamapps/common/Factorio/factorio.app/Contents/data"))
-	candidates.append("C:/Program Files/Factorio/data")
-	candidates.append(home.path_join("factorio/data"))
+	if not paths.no_factorio():  # tests as CI sees them: only --factorio= / the setting (no Steam either)
+		candidates.append("C:/Program Files/Factorio/data")
+		candidates.append(home.path_join("factorio/data"))
 	for dir in candidates:
 		if DirAccess.dir_exists_absolute(dir.path_join("base/graphics/icons")):
 			return dir

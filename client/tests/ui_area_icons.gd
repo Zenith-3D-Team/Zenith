@@ -201,7 +201,7 @@ func _icons(hud: Hud) -> void:
 	add_child(overlay)
 	fp_rig.camera.position = Vector3(5.5, 1.6, 14)
 	fp_rig.camera.look_at(Vector3(5.5, 1.0, 5.5))
-	overlay.collect()
+	alt_collect(overlay)
 	var shown_quads := overlay._quads.filter(func(q): return q.visible)
 	check(shown_quads.size() == 2 and (shown_quads[0].material_override as ShaderMaterial).shader == load("res://shaders/billboard_icon_depth.gdshader")
 		and shown_quads[0].position.y > 1.0, "first person: Alt-mode icons are depth-tested quads over the building (C9)")
@@ -213,20 +213,20 @@ func _icons(hud: Hud) -> void:
 	w3._add([951, 8, 40 * 32 * 256 + 128, 40 * 32 * 256 + 128, 0, {"ai": ["recipe", "iron-gear-wheel"]}])
 	fp_rig.camera.position = Vector3(5.5, 30, 12)
 	fp_rig.camera.look_at(Vector3(5.5, 0, 5.5))
-	overlay.collect()
+	alt_collect(overlay)
 	check(overlay.drawn == 2 and AltOverlay._chunk_in_view(Vector2i.ZERO, fp_rig.camera.get_frustum())
 		and not AltOverlay._chunk_in_view(Vector2i(40, 40), fp_rig.camera.get_frustum()),
 		"Alt-mode draws the icons in view (an inserter's two filters) and skips chunks out of view: %d" % overlay.drawn)
 	# On an add-on's hills (ground_height.gd) the icons sit over the lifted building, not on the flat ground.
 	fp_rig.camera.position = Vector3(5.5, 12, 30)
 	fp_rig.camera.look_at(Vector3(5.5, 0, 5.5))
-	overlay.collect()
+	alt_collect(overlay)
 	var flat_icon: Rect2 = (overlay._icons.values()[0] as Array)[0]
 	var hill := Image.create(16, 16, false, Image.FORMAT_RF)
 	hill.fill(Color(6.0, 0, 0))
 	var GroundHeightT := preload("res://scripts/world/ground_height.gd")
 	GroundHeightT.set_field(hill, Vector2(-8, -8), 2.0)
-	overlay.collect()
+	alt_collect(overlay)
 	var hill_icon: Rect2 = (overlay._icons.values()[0] as Array)[0]
 	var lifted: float = fp_rig.camera.unproject_position(Vector3(5.5, 6.0, 5.5)).y - fp_rig.camera.unproject_position(Vector3(5.5, 0.0, 5.5)).y
 	GroundHeightT.clear()
@@ -241,18 +241,18 @@ func _icons(hud: Hud) -> void:
 	Bridge.set_alt_contents(true)
 	w3.handle({"t": "ac", "g": Bridge.alt_contents, "l": [[952, "stone"], [950, "wood"]]})
 	w3.handle({"t": "ac", "g": Bridge.alt_contents + 7, "l": [[952, "copper-plate"]]})
-	overlay.collect()
+	alt_collect(overlay)
 	var chest_tiles: float = AltOverlay._tiles_for(w3, w3.entities[952])
 	var machine_tiles: float = AltOverlay._tiles_for(w3, w3.entities[950])
 	check(overlay.drawn == 3 and w3.alt_contents_now().get(952) == ["stone"] and overlay._icons.has(Kit.item_icon("stone"))
 		and not overlay._icons.has(Kit.item_icon("wood")) and is_equal_approx(chest_tiles, 0.84) and is_equal_approx(machine_tiles, 1.2),
 		"J6: a chest shows what it holds (ac) at a chest's icon size, a machine keeps its own icon: %d drawn, %.2f / %.2f tiles" % [overlay.drawn, chest_tiles, machine_tiles])
 	w3.handle({"t": "ac", "g": Bridge.alt_contents, "l": [[952]]})
-	overlay.collect()
+	alt_collect(overlay)
 	var cleared := overlay.drawn
 	w3.handle({"t": "ac", "g": Bridge.alt_contents, "l": [[952, "coal", ["stone", "wood"]]]})
 	Bridge.set_alt_contents(false)
-	overlay.collect()
+	alt_collect(overlay)
 	check(cleared == 2 and overlay.drawn == 2 and w3.alt_contents_now().is_empty(),
 		"J6: [unit] clears a chest's icons, and Alt-mode off draws none: %d %d" % [cleared, overlay.drawn])
 	if turns_before > 0:
@@ -1030,10 +1030,61 @@ func _icons(hud: Hud) -> void:
 	ui.end_remote_view()
 	check(dropped and not cam_rig.in_factorio_view() and not cam_rig.orthographic and cam_rig.target == walker,
 		"zooming the map in drops into the world at Factorio's angle, leaving puts the camera back (owner's #6)")
-	# Issue #4: zooming back out of that view goes to the map there, at the distance set in Settings >
-	# Camera (past Furthest zoom).
+	# By default, 2D/3D auto-swap on zoom is off and the top-bar button switches between 2D map and 3D view,
+	# preserving the viewed surface even after Factorio sends the character's surface back.
+	var map_auto_was = Settings.get_value("camera", "map_auto_swap")
+	var char_si_was: int = ui.model.character_si
+	var charts_was: Dictionary = ui.model.map_charts.duplicate()
+	var tags_was: Array = ui.model.map_tags.duplicate()
+	var cache_si_was: int = ui.map_cache._si
+	ui.model.set_character_surface(1)
+	ui.open_map(true)
+	ui.map_view.show_surface(2)
+	ui.map_view.zoom = ui.map_view.MAX_ZOOM
+	ui.map_view.zoom_by(ui.map_view.ZOOM_STEP, Vector2(100, 100))
+	var stayed_2d_on_zoom: bool = not ui.remote and ui.map_view.is_open()
+	var orange_bar_shown: bool = ui.map_view._enter_3d_panel != null and ui.map_view._enter_3d_panel.visible \
+		and ui.map_view._enter_3d_bar != null and ui.map_view._enter_3d_bar.value > 0.0
+	ui.map_view.zoom_by(1.0 / ui.map_view.ZOOM_STEP, Vector2(100, 100))
+	var orange_bar_cleared: bool = not ui.map_view._enter_3d_panel.visible and is_zero_approx(ui.map_view._enter_3d_bar.value)
+	ui.map_view.zoom = ui.map_view.MAX_ZOOM
+	for _s in ui.map_view.ENTER_3D_SCROLLS:
+		ui.map_view.zoom_by(ui.map_view.ZOOM_STEP, Vector2(100, 100))
+	var entered_3d_after_scrolls: bool = ui.remote and not ui.map_view.is_open() and ui.viewing_si == 2 \
+		and not ui.map_view._enter_3d_panel.visible
+	ui.remote_frame.show_for("world")
+	ui.remote_frame.view_mode_toggled.emit()
+	ui.remote_frame.show_for("map")
+	var btn_to_3d: bool = ui.remote_frame.view_toggle != null and ui.remote_frame.view_toggle.visible \
+		and ui.remote_frame.view_toggle.text == "3D view"
+	ui.remote_frame.view_mode_toggled.emit()
+	var toggled_to_3d: bool = ui.remote and not ui.map_view.is_open() and ui.viewing_si == 2 \
+		and cam_rig.map_handoff_distance == INF
+	for i in 60:
+		cam_rig.zoom(1.1)
+	var stayed_3d_on_zoom: bool = ui.remote and is_equal_approx(cam_rig._distance_goal, cam_rig.max_distance)
+	ui.remote_frame.show_for("world")
+	var btn_to_2d: bool = ui.remote_frame.view_toggle != null and ui.remote_frame.view_toggle.visible \
+		and ui.remote_frame.view_toggle.text == "2D map"
+	ui.remote_frame.view_mode_toggled.emit()
+	ui.model.set_character_surface(1)
+	var kept_surface_after_toggle: bool = not ui.remote and ui.map_view.is_open() \
+		and ui.model.map_si == 2 and ui.model.shown_surface() == 2
+	ui.open_map(false)
+	var reset_on_close: bool = ui.model.map_si == 0
+	check(stayed_2d_on_zoom and orange_bar_shown and orange_bar_cleared and entered_3d_after_scrolls \
+		and btn_to_3d and toggled_to_3d and stayed_3d_on_zoom and btn_to_2d \
+		and kept_surface_after_toggle and reset_on_close,
+		"2D/3D auto-swap defaults off; scrolling past max zoom fills orange bar into 3D; top-bar toggle switches 2D<->3D and keeps the viewed surface")
+
+	# Issue #4: with auto-swap enabled, zooming back out of that view goes to the map there, at the
+	# distance set in Settings > Camera (past Furthest zoom), keeping the viewed surface.
 	var map_out_was = Settings.get_value("camera", "map_zoom_out")
+	Settings.set_value("camera", "map_auto_swap", true)
 	Settings.set_value("camera", "map_zoom_out", 320)
+	ui.open_map(true)
+	ui.map_view.show_surface(2)
+	ui.map_view.centre = Vector2(40, 12)
 	ui._zoom_into_world(Vector2(40, 12))
 	var handoff: float = cam_rig.map_handoff_distance
 	var map_reached := 0.0
@@ -1042,10 +1093,23 @@ func _icons(hud: Hud) -> void:
 		map_reached = maxf(map_reached, cam_rig._distance_goal)
 		cam_rig.zoom(1.1)
 		out_steps += 1
+	ui.model.set_character_surface(1)
 	Settings.set_value("camera", "map_zoom_out", map_out_was)
+	Settings.set_value("camera", "map_auto_swap", map_auto_was)
 	var back_on_map: bool = not ui.remote and ui.map_view.is_open() and ui.map_view.centre.distance_to(Vector2(40, 12)) < 0.01 \
-		and is_equal_approx(ui.map_view.zoom, 8.0) and cam_rig.map_handoff_distance == INF
+		and is_equal_approx(ui.map_view.zoom, 8.0) and cam_rig.map_handoff_distance == INF \
+		and ui.model.map_si == 2 and ui.model.shown_surface() == 2
 	ui.open_map(false)
+	ui.model.set_character_surface(char_si_was)
+	if cache_si_was == 0 and ui.map_cache._stash.has(1):
+		var back: Array = ui.map_cache._stash[1]
+		ui.map_cache._stash.erase(1)
+		ui.map_cache._pages = back[0]
+		ui.map_cache._charted = back[1]
+		ui.map_cache._uncharted = back[2]
+		ui.map_cache._si = 0
+	ui.model.map_charts = charts_was.duplicate()
+	ui.model.map_tags = tags_was.duplicate()
 	ui.remote_view(Vector2(5, 5))  # a remote view not from the map (an alert) zooms out as before
 	for i in 60:
 		cam_rig.zoom(1.1)
@@ -1053,7 +1117,7 @@ func _icons(hud: Hud) -> void:
 	ui.end_remote_view()
 	check(is_equal_approx(handoff, 320.0) and is_equal_approx(map_reached, 320.0) and map_reached > cam_rig.max_distance
 		and out_steps > 1 and out_steps < 200 and back_on_map and alert_stays,
-		"issue #4: the map's remote view zooms out to the setting's distance (%d tiles, past Furthest zoom), then the map comes back at its closest zoom" % int(map_reached))
+		"issue #4: with auto-swap on, the map's remote view zooms out to the setting's distance (%d tiles, past Furthest zoom), then the map comes back on the same surface at its closest zoom" % int(map_reached))
 	# The projection is a setting (Settings > Camera), no longer the O key; Factorio's view stays
 	# orthographic and leaving it returns to the setting.
 	var ortho_was = Settings.get_value("camera", "orthographic")
@@ -1200,6 +1264,8 @@ func _icons(hud: Hud) -> void:
 		and view_back.get("si") == 0 and ui.viewing_si == 0,
 		"zooming into another surface's map views that surface, and leaving goes back (#5): %s %s" % [view_ask, view_back])
 	ui.model.map_si = 0
+	ui.model.map_charts = charts_was.duplicate()
+	ui.model.map_tags = tags_was.duplicate()
 	await _check_ride(cam_rig, viewer, ui)
 	ui.player = player_was
 	viewer.free()

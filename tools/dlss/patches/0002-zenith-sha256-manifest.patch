@@ -1,0 +1,172 @@
+Zenith patch 0002 for NVIDIA Streamline v2.14.16 (625db07d, MIT): load our own unsigned build by SHA-256.
+
+- secureLoadLibrary.cpp security::loadLibrary(): in Production builds a module loads only when its SHA-256 and
+  file name are in zenith-sl-manifest.txt beside the calling module (written by tools/dlss/build_streamline.ps1),
+  in place of the NVIDIA-signer check (verifyEmbeddedSignature). The file is held open without write sharing
+  from hashing to LoadLibraryW. include/sl_security.h is untouched. NVIDIA's own nvngx_dlss.dll isn't loaded
+  here (NGX in the driver loads it); Zenith checks its NVIDIA Corporation Authenticode signature first.
+
+diff --git a/source/core/sl.security/secureLoadLibrary.cpp b/source/core/sl.security/secureLoadLibrary.cpp
+index 2f7c6dd..13e39bb 100644
+--- a/source/core/sl.security/secureLoadLibrary.cpp
++++ b/source/core/sl.security/secureLoadLibrary.cpp
+@@ -22,21 +22,157 @@
+ 
+ #include "include/sl_security.h"
+ 
++#include <bcrypt.h>
++#include <fstream>
++#include <string>
++#include <vector>
++#pragma comment(lib, "bcrypt.lib")
++
+ namespace sl
+ {
+ 
+ namespace security
+ {
+ 
++// Zenith build: this Streamline is built from source (tools/dlss/build_streamline.ps1 in Zenith), so its DLLs carry
++// no NVIDIA signature. In place of the NVIDIA-signer check, a module loads only when its SHA-256 and file name are
++// listed in zenith-sl-manifest.txt beside this module, the list the build script wrote ("<sha256 hex>  <file name>"
++// per line, '#' comments). The file is held open without write sharing from hashing to LoadLibrary, so it can't be
++// swapped in between. NVIDIA's own nvngx_dlss.dll is loaded by NGX in the driver, not here.
++static const wchar_t* kZenithManifest = L"zenith-sl-manifest.txt";
++
++static bool sha256OfHandle(HANDLE file, std::string& hex)
++{
++    BCRYPT_ALG_HANDLE alg{};
++    BCRYPT_HASH_HANDLE hash{};
++    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
++    {
++        return false;
++    }
++    bool ok = BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0));
++    std::vector<unsigned char> buffer(1 << 16);
++    while (ok)
++    {
++        DWORD got = 0;
++        if (!ReadFile(file, buffer.data(), (DWORD)buffer.size(), &got, nullptr))
++        {
++            ok = false;
++            break;
++        }
++        if (got == 0)
++        {
++            break;
++        }
++        ok = BCRYPT_SUCCESS(BCryptHashData(hash, buffer.data(), got, 0));
++    }
++    unsigned char digest[32]{};
++    if (ok)
++    {
++        ok = BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof(digest), 0));
++    }
++    if (hash)
++    {
++        BCryptDestroyHash(hash);
++    }
++    BCryptCloseAlgorithmProvider(alg, 0);
++    if (ok)
++    {
++        static const char* digits = "0123456789abcdef";
++        hex.clear();
++        for (unsigned char c : digest)
++        {
++            hex += digits[c >> 4];
++            hex += digits[c & 15];
++        }
++    }
++    return ok;
++}
++
++static std::string lowerAscii(std::string s)
++{
++    for (auto& c : s)
++    {
++        if (c >= 'A' && c <= 'Z')
++        {
++            c = char(c - 'A' + 'a');
++        }
++    }
++    return s;
++}
++
++static bool listedInZenithManifest(const wchar_t* path, const std::string& hex)
++{
++    HMODULE self{};
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&kZenithManifest, &self))
++    {
++        return false;
++    }
++    std::vector<wchar_t> selfPath(32768);
++    DWORD len = GetModuleFileNameW(self, selfPath.data(), (DWORD)selfPath.size());
++    if (len == 0 || len >= selfPath.size())
++    {
++        return false;
++    }
++    std::wstring dir(selfPath.data(), len);
++    dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
++
++    // The loaded file's own name, ASCII only (Streamline's are).
++    std::wstring wide(path);
++    wide = wide.substr(wide.find_last_of(L"\\/") + 1);
++    std::string name;
++    for (wchar_t c : wide)
++    {
++        if (c > 127)
++        {
++            return false;
++        }
++        name += char(c);
++    }
++    name = lowerAscii(name);
++
++    std::ifstream manifest(dir + kZenithManifest);
++    std::string line;
++    while (std::getline(manifest, line))
++    {
++        if (!line.empty() && line.back() == '\r')
++        {
++            line.pop_back();
++        }
++        if (line.size() < 66 || line[0] == '#' || line[64] != ' ')
++        {
++            continue;
++        }
++        auto at = line.find_first_not_of(" *", 64);
++        if (at == std::string::npos)
++        {
++            continue;
++        }
++        if (lowerAscii(line.substr(0, 64)) == hex && lowerAscii(line.substr(at)) == name)
++        {
++            return true;
++        }
++    }
++    return false;
++}
++
+ HMODULE loadLibrary(const wchar_t* path)
+ {
+     HMODULE mod = {};
+ #ifdef SL_PRODUCTION
+-    if (verifyEmbeddedSignature(path))
+-#endif
++    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        return mod;
++    }
++    std::string hex;
++    if (sha256OfHandle(file, hex) && listedInZenithManifest(path, hex))
+     {
+         mod = LoadLibraryW(path);
+     }
++    CloseHandle(file);
++#else
++    mod = LoadLibraryW(path);
++#endif
+     return mod;
+ }
+ 

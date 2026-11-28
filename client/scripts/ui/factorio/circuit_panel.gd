@@ -23,8 +23,16 @@ const Slot := preload("res://scripts/ui/factorio/slot.gd")
 const MenuKit := preload("res://scripts/menu/menu_kit.gd")
 const EntityPanels := preload("res://scripts/ui/factorio/entity_panels.gd")
 const LogicKit := preload("res://scripts/ui/factorio/logic_kit.gd")
+const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
+const ProductionPanels := preload("res://scripts/ui/factorio/production_panels.gd")
+const SpacePanels := preload("res://scripts/ui/factorio/space_panels.gd")
 
 const SIGNAL_KINDS := ["item", "fluid", "virtual"]
+## What the game takes where it isn't every signal: a second operand and a constant combinator's signals are plain ones, an
+## arithmetic combinator's operands may be Each, a decider's output not Anything.
+const PLAIN_KINDS := ["item", "fluid", "virtual:plain"]
+const EACH_KINDS := ["item", "fluid", "virtual:each"]
+const OUTPUT_KINDS := ["item", "fluid", "virtual:no-anything"]
 const ENABLE := ["b", "circuit_enable_disable", "Enable if", [["c", "circuit_condition"]]]
 const CRAFTER := [
 	["b", "circuit_read_contents", "Read contents", [["b", "include_in_crafting", "Include in crafting"]]],
@@ -50,7 +58,7 @@ const SPECS := {
 		["b", "circuit_set_filters", "Set filters"],
 		ENABLE,
 		["b", "circuit_read_hand_contents", "Read hand contents", [["e", "circuit_hand_read_mode", [["pulse", "Pulse"], ["hold", "Hold"]]]]],
-		["b", "circuit_set_stack_size", "Set stack size", [["s", "circuit_stack_control_signal"]]],
+		["b", "circuit_set_stack_size", "Set hand size", [["s", "circuit_stack_control_signal"]]],
 	],
 	"transport_belt": [
 		ENABLE,
@@ -62,24 +70,24 @@ const SPECS := {
 	"lamp": [
 		ENABLE,
 		["b", "use_colors", "Use colors", [
-			["e", "color_mode", [["color_mapping", "Color mapping"], ["components", "Components (RGB)"], ["packed_rgb", "Packed RGB"]]],
+			["e", "color_mode", [["color_mapping", "Color mapping"], ["components", "Color components"], ["packed_rgb", "Packed RGB"]]],
 			["s", "red_signal", "Red", {"color_mode": "components"}], ["s", "green_signal", "Green", {"color_mode": "components"}],
 			["s", "blue_signal", "Blue", {"color_mode": "components"}], ["s", "rgb_signal", "RGB", {"color_mode": "packed_rgb"}],
 		]],
 	],
 	"mining_drill": [
 		ENABLE,
-		["b", "circuit_read_resources", "Read resources", [["e", "resource_read_mode", [["this_miner", "This miner"], ["entire_patch", "Entire patch"]]]]],
+		["b", "circuit_read_resources", "Read resources", [["e", "resource_read_mode", [["this_miner", "This mining drill"], ["entire_patch", "Entire resource patch"]]]]],
 	],
 	"pump": [ENABLE, ["b", "set_filter", "Set filter"]],
 	"train_stop": [],  # the stop's own window has the rest (entity_panels.gd)
 	"turret": [
 		ENABLE,
-		["b", "read_ammo", "Read ammo"],
+		["b", "read_ammo", "Read ammunition"],
 		["b", "set_priority_list", "Set priority list"],
 		["b", "set_ignore_unlisted_targets", "Set ignore unlisted targets", [["c", "ignore_unlisted_targets_condition"]]],
 	],
-	"artillery_turret": [ENABLE, ["b", "read_ammo", "Read ammo"]],
+	"artillery_turret": [ENABLE, ["b", "read_ammo", "Read ammunition"]],
 	"boiler": [ENABLE, ["b", "read_fuel", "Read fuel"]],
 	"loader": [["b", "circuit_set_filters", "Set filters"], ENABLE, ["b", "circuit_read_transfers", "Read transfers"]],
 	"agricultural_tower": [
@@ -100,14 +108,14 @@ const SPECS := {
 		["b", "read_empty_slots", "Read empty slots", [["s", "empty_slots_signal"]]],
 	],
 	"roboport": [
-		["e", "read_items_mode", [["none", "None"], ["logistics", "Read logistic network contents"], ["missing_requests", "Read missing requests"]]],
+		["e", "read_items_mode", [["none", "None"], ["logistics", "Read logistic network contents"], ["missing_requests", "Read logistic network requests"]]],
 		["b", "read_robot_stats", "Read robot statistics", [
-			["s", "available_logistic_output_signal", "Available logistic robots"], ["s", "total_logistic_output_signal", "Total logistic robots"],
-			["s", "available_construction_output_signal", "Available construction robots"],
-			["s", "total_construction_output_signal", "Total construction robots"], ["s", "roboport_count_output_signal", "Roboports"],
+			["s", "available_logistic_output_signal", "Available logistic bots"], ["s", "total_logistic_output_signal", "Total logistic bots"],
+			["s", "available_construction_output_signal", "Available construction bots"],
+			["s", "total_construction_output_signal", "Total construction bots"], ["s", "roboport_count_output_signal", "Roboports in network"],
 		]],
 	],
-	"accumulator": [["b", "read_charge", "Read charge"], ["s", "output_signal", "Output signal"]],
+	"accumulator": [["b", "read_charge", "Read charge level"], ["s", "output_signal", "Output signal"]],
 	"wall": [["b", "open_gate", "Open gate", [["c", "circuit_condition"]]], ["b", "read_sensor", "Read sensor", [["s", "output_signal"]]]],
 	"programmable_speaker": [],  # the speaker's own window has its condition (logic_windows.gd)
 	"reactor": [["b", "read_fuel", "Read fuel"], ["b", "read_temperature", "Read temperature", [["s", "temperature_signal"]]]],
@@ -339,8 +347,8 @@ static func stop_sections(screen, cb: Dictionary) -> Array:
 	input.add_child(EntityPanels.checkbox("Send to train", int(cb.get("send", 0)) == 1, func(on: bool) -> void: set_key.call("send", 1 if on else 0)))
 	var output := EntityPanels.column(6)
 	output.add_child(EntityPanels.checkbox("Read train contents", int(cb.get("read", 0)) == 1, func(on: bool) -> void: set_key.call("read", 1 if on else 0)))
-	for spec in [["stopped", "stopped_sig", "Read stopped train", output], ["limit", "limit_sig", "Set trains limit", input],
-			["count", "count_sig", "Read trains count", output], ["pri", "pri_sig", "Set priority", input]]:
+	for spec in [["stopped", "stopped_sig", "Read stopped train", output], ["limit", "limit_sig", "Set train limit", input],
+			["count", "count_sig", "Read train count", output], ["pri", "pri_sig", "Set priority", input]]:
 		var r := EntityPanels.row(8)
 		var flag: String = spec[0]
 		var sig_key: String = spec[1]
@@ -456,15 +464,15 @@ static func _sig_value(type_name: String, name: String):
 ## The second operand as Factorio's one "signal or constant" button: the signal's icon, or the
 ## constant written on a dark button ("1.1k"). A click opens the signal chooser with its Constant
 ## box (item_picker.gd choose_or_constant); right click clears the signal back to a constant.
-static func _operand(screen, sig, constant, on_signal: Callable, on_constant: Callable) -> Control:
+static func _operand(screen, sig, constant, on_signal: Callable, on_constant: Callable, node_name := "SecondOperand", kinds := PLAIN_KINDS) -> Control:
 	var name := _signal(sig)
 	var value := int(constant) if constant != null else 0
 	var open := func() -> void:
 		if screen.picker != null:
-			screen.picker.choose_or_constant(SIGNAL_KINDS, on_signal, value, on_constant)
+			screen.picker.choose_or_constant(kinds, on_signal, value, on_constant)
 	if name != "":
 		var s := Slot.new()
-		s.name = "SecondOperand"
+		s.name = node_name
 		s.theme_type_variation = "FSlotButton"
 		s.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 		s.set_stack(name, -1)
@@ -476,7 +484,7 @@ static func _operand(screen, sig, constant, on_signal: Callable, on_constant: Ca
 				open.call())
 		return s
 	var b := Button.new()
-	b.name = "SecondOperand"
+	b.name = node_name
 	b.text = ("-" if value < 0 else "") + Kit.count_text(absi(value))
 	b.custom_minimum_size = Kit.pxv(Kit.SLOT, Kit.SLOT)
 	b.size_flags_vertical = Control.SIZE_SHRINK_CENTER
@@ -532,7 +540,12 @@ static func arithmetic(screen, cb: Dictionary) -> Control:
 	input.add_child(Kit.label("Input", "FHeading"))
 	var line := EntityPanels.row(6)
 	line.add_child(LogicKit.wire_checks(cb.get("first_signal_networks"), func(n: Dictionary) -> void: with.call("first_signal_networks", n)))
-	line.add_child(EntityPanels.choose_slot(screen, _signal(cb.get("first_signal")), SIGNAL_KINDS, signal_setter.call("first_signal", "first_constant"), "Signal"))
+	line.add_child(_operand(screen, cb.get("first_signal"), cb.get("first_constant"), signal_setter.call("first_signal", "first_constant"),
+		func(v: int) -> void:
+			var c := cb.duplicate(true)
+			c.erase("first_signal")
+			c["first_constant"] = v
+			send.call(c), "FirstOperand", EACH_KINDS))
 	var ops := MenuKit.dropdown(EntityPanels.ARITHMETIC_OPS.map(func(o): return [o, o]), str(cb.get("operation", "*")))
 	ops.name = "Operation"
 	ops.custom_minimum_size.x = Kit.px(56)
@@ -544,13 +557,13 @@ static func arithmetic(screen, cb: Dictionary) -> Control:
 			var c := cb.duplicate(true)
 			c.erase("second_signal")
 			c["second_constant"] = v
-			send.call(c)))
+			send.call(c), "SecondOperand", EACH_KINDS))
 	input.add_child(line)
 	cols.add_child(input)
 	var output := EntityPanels.column(4)
 	output.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	output.add_child(Kit.label("Output", "FHeading"))
-	output.add_child(EntityPanels.choose_slot(screen, _signal(cb.get("output_signal")), SIGNAL_KINDS, signal_setter.call("output_signal", ""), "Output"))
+	output.add_child(EntityPanels.choose_slot(screen, _signal(cb.get("output_signal")), EACH_KINDS, signal_setter.call("output_signal", ""), "Output"))
 	cols.add_child(output)
 	return cols
 
@@ -617,6 +630,9 @@ static func condition_holds(c: Dictionary, sig: Dictionary) -> bool:
 	var second := _signal(c.get("second_signal"))
 	var b := _value_of(_input_values(sig, c.get("second_signal_networks")), second) if second != "" else int(c.get("constant", 0))
 	var cmp := str(c.get("comparator", "<"))
+	# Anything and Everything leave out the second operand's own signal (Each doesn't): the game compares the others to it.
+	if second != "" and (first == "signal-anything" or first == "signal-everything"):
+		a_vals.erase(second)
 	match first:
 		"signal-anything", "signal-each":
 			for v in a_vals.values():
@@ -643,7 +659,14 @@ static func _input_values(sig: Dictionary, nets) -> Dictionary:
 			for s in list:
 				if s is Array and s.size() >= 3 and int(s[2]) != 0:
 					out[str(s[1])] = int(out.get(str(s[1]), 0)) + int(s[2])
-	return out
+	# A signal's value is 32-bit and one that adds up to 0 is not on the network (Factorio's networks hold no zeros).
+	var kept := {}
+	for name in out:
+		var v := int(out[name])
+		v = ((v + 2147483648) & 0xFFFFFFFF) - 2147483648
+		if v != 0:
+			kept[name] = v
+	return kept
 
 
 static func _value_of(vals: Dictionary, name: String) -> int:
@@ -955,26 +978,130 @@ static func _section(screen, sec: Dictionary, index: int, sections: Array, send:
 	title.add_theme_color_override("font_color", Kit.WHITE)
 	title.set("vertical_alignment", VERTICAL_ALIGNMENT_CENTER)
 	head.add_child(title)
-	var field := MenuKit.textbox(group, "Group name")
-	field.custom_minimum_size.x = Kit.px(180)
-	field.visible = false
+	var editor := EntityPanels.column(4)
+	editor.name = "GroupEditor"
+	editor.visible = false
+	var set_group := func(g: String) -> void:
+		sec["g"] = g.strip_edges()
+		editor.visible = false
+		send.call()
+	var er := EntityPanels.row(6)
+	var field := MenuKit.textbox(group, "Group name ([No group assigned] when empty)")
+	field.name = "GroupName"
+	field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	field.tooltip_text = "Logistic group: sections with the same group share their signals"
-	field.text_submitted.connect(func(t: String) -> void:
+	var on_submit_group := func(t: String) -> void:
 		field.release_focus()
-		sec["g"] = t.strip_edges()
-		send.call())
-	head.add_child(field)
-	head.add_child(LogicKit.rename_button("Set the group", func() -> void:
-		title.visible = false
-		field.visible = true
-		field.grab_focus()))
+		set_group.call(t)
+	field.text_submitted.connect(on_submit_group)
+	var on_key := func(ev: InputEvent) -> void:
+		var k := ev as InputEventKey
+		if k != null and k.pressed and k.physical_keycode == KEY_ESCAPE:
+			editor.visible = false
+			field.release_focus()
+			field.accept_event()
+	field.gui_input.connect(on_key)
+	er.add_child(field)
+	var ok_btn := Button.new()
+	ok_btn.theme_type_variation = "FGreenButton"
+	ok_btn.focus_mode = Control.FOCUS_NONE
+	ok_btn.custom_minimum_size = Kit.pxv(28, 28)
+	ok_btn.tooltip_text = "Confirm"
+	var tick := GuiAssets.core_sprite("icons/mip/check-mark-white.png")
+	if tick != null:
+		ok_btn.icon = tick
+		ok_btn.expand_icon = true
+	else:
+		ok_btn.text = "✓"
+	ok_btn.pressed.connect(func() -> void: set_group.call(field.text))
+	er.add_child(ok_btn)
+	editor.add_child(er)
+	var groups := ProductionPanels.logistic_groups(screen)
+	if not groups.is_empty():
+		var chips := HFlowContainer.new()
+		chips.add_theme_constant_override("h_separation", Kit.px(4))
+		chips.add_theme_constant_override("v_separation", Kit.px(4))
+		for g in groups:
+			var gname := str(g)
+			var chip := MenuKit.button(gname)
+			RichText.decorate_button(chip, gname)
+			chip.toggle_mode = true
+			chip.button_pressed = gname == group
+			chip.pressed.connect(func() -> void: set_group.call(gname))
+			chips.add_child(chip)
+		editor.add_child(chips)
+	var toggle_editor := func() -> void:
+		editor.visible = not editor.visible
+		if editor.visible:
+			field.grab_focus()
+			field.select_all()
+	var rename_btn := LogicKit.rename_button("Set the group", toggle_editor)
+	rename_btn.name = "GroupButton"
+	head.add_child(rename_btn)
+	head.add_child(Kit.label("×"))
+	var mult_val := float(sec.get("m", 1.0))
+	var sent_mult := [mult_val]
+	var mult_box := MenuKit.textbox(ProductionPanels._num(mult_val), "1")
+	mult_box.name = "SectionMultiplier"
+	mult_box.custom_minimum_size = Kit.pxv(52, 24)
+	mult_box.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	mult_box.tooltip_text = "Section multiplier"
+	var send_mult := func(raw: String) -> void:
+		var cleaned := raw.strip_edges()
+		if cleaned.is_valid_float():
+			var val := clampf(float(cleaned), 0.0, 10000.0)
+			if not is_equal_approx(val, sent_mult[0]):
+				sent_mult[0] = val
+				sec["m"] = val
+				send.call()
+		else:
+			mult_box.text = ProductionPanels._num(sent_mult[0])
+	var on_mult_submit := func(t: String) -> void:
+		mult_box.release_focus()
+		send_mult.call(t)
+	var on_mult_exit := func() -> void:
+		send_mult.call(mult_box.text)
+	mult_box.text_submitted.connect(on_mult_submit)
+	mult_box.focus_exited.connect(on_mult_exit)
+	head.add_child(mult_box)
 	var trash := LogicKit.tool_button("icons/mip/trash.png", "Delete this section", func() -> void:
 		sections.remove_at(index)
 		send.call(), "FRedButton")
 	LogicKit.push_right(head, trash)
 	col.add_child(bar)
+	col.add_child(editor)
 	var list: Array = sec.get("s") if sec.get("s") is Array else []
 	sec["s"] = list
+	var qualities := SpacePanels._unlocked_qualities(screen)
+	var q_panel := EntityPanels.row(6)
+	q_panel.name = "SignalQualityEditor"
+	q_panel.visible = false
+	var fill_q_panel := func(k: int) -> void:
+		for c in q_panel.get_children():
+			q_panel.remove_child(c)
+			c.queue_free()
+		if qualities.size() <= 1 or k < 0 or k >= list.size() or not (list[k] is Array) or (list[k] as Array).size() < 3:
+			q_panel.visible = false
+			return
+		var entry_k: Array = list[k]
+		var cur_q := str(entry_k[3]) if entry_k.size() >= 4 and str(entry_k[3]) != "" else "normal"
+		q_panel.add_child(Kit.label(Kit.pretty(str(entry_k[1]))))
+		var on_pick_q := func(q: String) -> void:
+			var updated := [entry_k[0], entry_k[1], int(entry_k[2])]
+			if q != "" and q != "normal":
+				updated.append(q)
+			list[k] = updated
+			send.call()
+		q_panel.add_child(SpacePanels.quality_row(qualities, cur_q, on_pick_q))
+		var close_q := Kit.close_button()
+		close_q.tooltip_text = "Done"
+		var on_close_q := func() -> void:
+			screen.remove_meta("cc_edit_sec")
+			screen.remove_meta("cc_edit_sig")
+			q_panel.visible = false
+		close_q.pressed.connect(on_close_q)
+		LogicKit.push_right(q_panel, close_q)
+		q_panel.visible = true
 	var grid := Kit.slot_grid(Kit.COLUMNS)
 	grid.name = "Signals"
 	for i in ceili((list.size() + 1) / float(Kit.COLUMNS)) * Kit.COLUMNS:
@@ -983,32 +1110,53 @@ static func _section(screen, sec: Dictionary, index: int, sections: Array, send:
 		var s := Slot.new()
 		s.theme_type_variation = "FSlotButton"
 		if entry.size() >= 3:
+			var q := str(entry[3]) if entry.size() >= 4 else ""
+			if q != "" and q != "normal":
+				s.set_extra({"quality": q})
 			s.set_stack(str(entry[1]), int(entry[2]))
-			s.set_tip(Kit.pretty(str(entry[1])), [["%d" % int(entry[2])], ["Click: the signal and its value · Right click: remove", "", Kit.DISABLED_TEXT]])
+			var lines := Slot.extra_lines({"quality": q}) if q != "" and q != "normal" else []
+			lines.append(["%d" % int(entry[2])])
+			lines.append(["Click: the signal and its value · Right click: remove", "", Kit.DISABLED_TEXT])
+			s.set_tip(Kit.pretty(str(entry[1])), lines)
 		else:
 			s.set_tip("Add a signal", [["Click: choose a signal", "", Kit.DISABLED_TEXT]])
-		s.clicked.connect(func(button_index: int, _shift: bool) -> void:
+		var on_slot_click := func(button_index: int, _shift: bool) -> void:
 			if k < list.size():
 				if button_index == MOUSE_BUTTON_RIGHT:
 					list.remove_at(k)
+					if int(screen.get_meta("cc_edit_sec", -1)) == index and int(screen.get_meta("cc_edit_sig", -1)) == k:
+						screen.remove_meta("cc_edit_sec")
+						screen.remove_meta("cc_edit_sig")
 					send.call()
 				elif button_index == MOUSE_BUTTON_LEFT and screen.picker != null:
+					if qualities.size() > 1:
+						screen.set_meta("cc_edit_sec", index)
+						screen.set_meta("cc_edit_sig", k)
+						fill_q_panel.call(k)
 					# Factorio's "Set request" popup: swap the signal, or set its value below.
 					var swap := func(type_name: String, name: String) -> void:
 						if name != "":
-							list[k] = [type_name, name, int(list[k][2])]
+							var cur_q := str(list[k][3]) if (list[k] as Array).size() >= 4 else ""
+							var next := [type_name, name, int(list[k][2])]
+							if cur_q != "" and cur_q != "normal":
+								next.append(cur_q)
+							list[k] = next
 							send.call()
 					var set_value := func(v: int) -> void:
 						list[k][2] = v
 						send.call()
-					screen.picker.choose_with_value(SIGNAL_KINDS, swap, int(list[k][2]), set_value)
+					screen.picker.choose_with_value(PLAIN_KINDS, swap, int(list[k][2]), set_value)
 			elif button_index == MOUSE_BUTTON_LEFT and screen.picker != null:
-				screen.picker.choose(SIGNAL_KINDS, func(type_name: String, name: String) -> void:
+				screen.picker.choose(PLAIN_KINDS, func(type_name: String, name: String) -> void:
 					if name != "":
 						list.append([type_name, name, 1])
-						send.call()))
+						send.call())
+		s.clicked.connect(on_slot_click)
 		grid.add_child(s)
 	col.add_child(grid)
+	if qualities.size() > 1 and int(screen.get_meta("cc_edit_sec", -1)) == index:
+		fill_q_panel.call(int(screen.get_meta("cc_edit_sig", -1)))
+	col.add_child(q_panel)
 	return col
 
 

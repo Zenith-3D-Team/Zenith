@@ -22,6 +22,12 @@ public:
 	Array read(const PackedByteArray &packet, int max_version);
 	// MessageDecode.packet_text: a datagram's text, invalid UTF-8 bytes read as "?".
 	String packet_text(const PackedByteArray &packet);
+	// LodChunk._decode_tile_rle + _decode_ent_rle (lod_data.gd) in one: a Distant Horizon `lod` message's
+	// `tl` ([tile, count, ...]) and `el` ([proto, flags, count, ...]) runs as one value per cell:
+	// [tiles: PackedInt32Array, protos: PackedInt32Array, flags: PackedByteArray], or [] where the GDScript
+	// refuses (odd sizes, counts past `total` or short of it, negative ids, flags past 255, non-numbers).
+	// `tl`/`el`: PackedInt32Array, PackedInt64Array or an Array (JSON); anything else counts as empty.
+	Array lod_cells(const Variant &tl, const Variant &el, int total);
 
 protected:
 	static void _bind_methods();

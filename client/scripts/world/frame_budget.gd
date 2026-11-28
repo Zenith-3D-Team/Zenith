@@ -92,6 +92,13 @@ const REDUCERS := {&"lods": 600, &"belt_lods": 300, &"shadows": 300, &"far_decid
 const REDUCE_TOTAL := 2500
 static var _reduce_used := 0
 static var _starve_granted_frame := -1
+## Combined floor cap when normal grants hit 0 on slow frames: caps non-`messages` normal floors
+## + `REDUCERS` combined at `FLOOR_TOTAL_MAX` while preserving `messages` floor and at least
+## `REDUCER_RESERVE_MIN` µs for `REDUCERS` so P4 unloading never starves. `--budget-floor-cap=off`: off.
+static var floor_cap := Switches.on("--budget-floor-cap")
+const FLOOR_TOTAL_MAX := 3500
+const REDUCER_RESERVE_MIN := 1500
+static var _floor_used := 0
 ## Spikes part B (R&D run-spikes, step 6). `--budget-spent=off`: grants don't take off the frame's other scripts'
 ## time already spent past their usual share (_other_over).
 static var spent_aware := Switches.on("--budget-spent")
@@ -178,6 +185,8 @@ static func _check_arg() -> void:
 			belts_first = arg.get_slice("=", 1) != "off"
 		elif arg.begins_with("--budget-hard-cap="):
 			hard_cap = arg.get_slice("=", 1) != "off"
+		elif arg.begins_with("--budget-floor-cap="):
+			floor_cap = arg.get_slice("=", 1) != "off"
 
 
 ## Starts a new frame's books when the frame changed (the first system to ask in a frame).
@@ -212,6 +221,7 @@ static func _roll() -> void:
 	_last_frame_used = used_total
 	used_total = 0
 	_reduce_used = 0
+	_floor_used = 0
 	used.clear()
 	granted.clear()
 
@@ -248,6 +258,12 @@ static func grant(system: StringName, scale := 1, behind := false) -> int:
 	if spent_aware:
 		left -= _other_over()
 	var g := mini(left, own)
+	var base_g := g if g >= MIN_SLICE else 0
+	var cap_floors := floor_cap and hard_cap and not behind and system != &"messages"
+	var norm_floor_left := 0
+	if cap_floors:
+		var red_reserve := maxi(REDUCER_RESERVE_MIN - _reduce_used, 0) if reduce_floors else 0
+		norm_floor_left = maxi(FLOOR_TOTAL_MAX - _floor_used - red_reserve, 0)
 	var is_starved := false
 	if g < MIN_SLICE:
 		g = 0
@@ -261,7 +277,7 @@ static func grant(system: StringName, scale := 1, behind := false) -> int:
 	if hard_cap and not behind and prio > 4 and system != &"pipelines":
 		var cap_left := maxi(pool - used_total, 0)
 		if is_starved and g >= MIN_SLICE:
-			if _starve_granted_frame == _frame or used_total >= pool + MIN_SLICE:
+			if _starve_granted_frame == _frame or used_total >= pool + MIN_SLICE or (cap_floors and norm_floor_left < MIN_SLICE):
 				g = 0
 			else:
 				_starve_granted_frame = _frame
@@ -272,14 +288,28 @@ static func grant(system: StringName, scale := 1, behind := false) -> int:
 			if g > cap_left:
 				g = cap_left if cap_left >= MIN_SLICE else 0
 	else:
-		g = maxi(g, int(_sys(system)[2]) * scale)
+		var fl := int(_sys(system)[2]) * scale
+		if cap_floors and fl > g:
+			fl = g + mini(fl - g, norm_floor_left)
+		g = maxi(g, fl)
+	if cap_floors and g > base_g:
+		var norm_add := g - base_g
+		if norm_add > norm_floor_left:
+			g = base_g + norm_floor_left
+			norm_add = norm_floor_left
+		_floor_used += norm_add
 	if reducer:
 		# Never less than the old floors: raised after them to its floor whatever the pool and the deadline
 		# say (REDUCERS), within REDUCE_TOTAL for them all (only what the raise added counts).
-		var rf := mini(int(REDUCERS[system]) * scale, REDUCE_TOTAL - _reduce_used)
+		var red_left := REDUCE_TOTAL - _reduce_used
+		if cap_floors:
+			red_left = mini(red_left, maxi(FLOOR_TOTAL_MAX - _floor_used, 0))
+		var rf := mini(int(REDUCERS[system]) * scale, red_left)
 		var add := maxi(rf - g, 0)
 		g += add
 		_reduce_used += add
+		if cap_floors:
+			_floor_used += add
 	if behind:
 		var slice := int(_sys(system)[1]) * (BOOST if boost else 1)
 		if g < slice:
@@ -375,11 +405,18 @@ static func snapshot() -> Dictionary:
 	return out
 
 
+## For tests that step their own "frames" inside one engine frame: the next grant starts a new frame, as
+## the engine's next frame would (the pool worked out again; used, floors and the floor cap's total from 0).
+static func test_next_frame() -> void:
+	_frame = -1
+
+
 ## For tests: everything back to its start.
 static func reset() -> void:
 	_frame = -1
 	_starve_granted_frame = -1
 	_reduce_used = 0
+	_floor_used = 0
 	far_urgent = false
 	used.clear()
 	granted.clear()

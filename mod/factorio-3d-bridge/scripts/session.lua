@@ -37,6 +37,7 @@ local players = require("scripts.players")
 local tiles = require("scripts.tiles")
 local capsules = require("scripts.capsules")
 local rail_planner = require("scripts.rail_planner")
+local rail_blocks = require("scripts.rail_blocks")
 local space = require("scripts.space")
 local alerts = require("scripts.alerts")
 local pedia = require("scripts.pedia")
@@ -742,7 +743,13 @@ function handlers.focus(msg)
   local x, y, r = world.fixed_in(msg.x), world.fixed_in(msg.y), tonumber(msg.r)
   if x and y then
     local max_r = settings.global["f3d-max-focus-radius"].value
-    s.focus = { x = x / 256, y = y / 256, r = math.max(8, math.min(r or 32, max_r)) }
+    -- ir, optional: the live inserter radius the client's view wants (whole tiles, 0..128; 0 = the
+    -- detail radius alone; inserters.live_radius). Anything else, or none, is no `ir` (64-tile floor).
+    local ir = msg.ir
+    if not (type(ir) == "number" and ir == math.floor(ir) and ir >= 0 and ir <= 128) then
+      ir = nil
+    end
+    s.focus = { x = x / 256, y = y / 256, r = math.max(8, math.min(r or 32, max_r)), ir = ir }
   end
   -- rv = 1: the 3D remote view, which shows moving things only where radars see (map.view_filter).
   s.remote_view = tonumber(msg.rv) == 1 or nil
@@ -841,7 +848,12 @@ handlers.land = planets.land
 handlers.move = inventory.move
 handlers.xfer = inventory.xfer
 handlers.sort = inventory.sort
-handlers.inv_filter = inventory.set_filter
+handlers.inv_filter = function(cmd)
+  if cmd.u then
+    return screens.set_wagon_filter(cmd)
+  end
+  return inventory.set_filter(cmd)
+end
 handlers.qb_set = inventory.qb_set
 handlers.qb_sel = inventory.qb_sel
 handlers.qb_page = inventory.qb_page
@@ -852,6 +864,7 @@ handlers.map = map.request
 handlers.tag_add = map.add_tag
 handlers.tag_del = map.remove_tag
 handlers.unghost = map.unghost
+handlers.pick = map.pick
 handlers.mtr = map.trains
 handlers.mrp = map.roboports
 handlers.lpad = map.landing_pad
@@ -894,7 +907,7 @@ for _, t in ipairs({ "mine", "pickup", "shoot", "drop", "fast", "wire", "wire_cl
 end
 local REMOTE_OK = {}
 for _, t in ipairs({ "build", "blueprint", "decon", "upgrade", "rotate", "undo", "redo", "paste_settings",
-                     "flip", "copy", "paste", "tile", "tile_mine", "rails", "unghost", "modreq" }) do
+                     "flip", "copy", "paste", "tile", "tile_mine", "rails", "unghost", "modreq", "rblk" }) do
   REMOTE_OK[t] = true
 end
 local GHOST_ONLY = { build = true, tile = true, rails = true }
@@ -947,6 +960,7 @@ handlers.tile = tiles.place
 handlers.tile_mine = tiles.mine
 handlers.throw = capsules.throw
 handlers.rails = rail_planner.build
+handlers.rblk = rail_blocks.query
 space.add_handlers(handlers, screens)
 -- set_section with u = 0 is the character's own sections; any other u is the open entity's.
 local entity_section = handlers.set_section
@@ -969,12 +983,16 @@ requests.add("lnets", logistics.networks, 300)
 handlers.lnets = requests.handler("lnets")
 requests.add("lnet", logistics.network, 150)
 handlers.lnet = requests.handler("lnet")
+handlers.set_lnet_name = logistics.set_network_name
+requests.add("lnet_find", logistics.find_in_network, 150)
+handlers.lnet_find = requests.handler("lnet_find")
 requests.add("bonuses", force_info.bonuses, 300)
 handlers.bonuses = requests.handler("bonuses")
 requests.add("perms", force_info.permissions, 100)
 handlers.perms = requests.handler("perms")
 handlers.cmd = console.run
 handlers.mpress = mod_gui.press
+handlers.mset = mod_gui.set
 handlers.modreq = modules.request
 requests.add("hinfo", modules.hover, 50)
 handlers.hinfo = requests.handler("hinfo")

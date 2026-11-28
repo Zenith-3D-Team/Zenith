@@ -29,14 +29,15 @@ M.OPTIONS = { feed_edges = true, full_area = true, inputs_first = true, line_rer
   far_tier = false, far_ring = 96, far_units = 1200, target_spots = true, drill_tails = true, built_now = true,
   lane_next = true, near_spool = true,
   ins_driven = false, ins_ho = true, ins_window = 20, quiet_pc = true, quiet_pc_max = 3600,
-  two_call_full = 16, settled_flow_only = true, watch_lean = true, scan_incremental = true }
+  two_call_full = 16, settled_flow_only = true, watch_lean = true, scan_incremental = true, wake_strict = true }
 M.OPTION_ORDER = { "feed_edges", "full_area", "inputs_first", "line_rereads", "bound", "actor_backoff", "drift_far",
   "bre_cap", "quiet_backoff", "pc_ids", "hold_inputs", "area", "trace_near", "trace_hops", "trace_down",
   "checkpoints", "crossings", "own_rate", "period_max", "drift_watched", "walk_load", "walk_near", "send_cap",
   "extra_spread", "quiet_first", "watch_nosort", "scan_step", "scan_step_wide", "scan_step_min", "drop_margin",
   "take_slice", "load_budget", "edge_budget", "far_load_cap", "two_call", "far_tier", "far_ring",
   "far_units", "target_spots", "drill_tails", "built_now", "lane_next", "near_spool", "ins_driven", "ins_ho",
-  "ins_window", "quiet_pc", "quiet_pc_max", "two_call_full", "settled_flow_only", "watch_lean", "scan_incremental" }
+  "ins_window", "quiet_pc", "quiet_pc_max", "two_call_full", "settled_flow_only", "watch_lean", "scan_incremental",
+  "wake_strict" }
 -- The values a word switch takes.
 M.OPTION_VALUES = { area = { square = true, trace = true }, crossings = { sim = true, game = true, hints = true } }
 

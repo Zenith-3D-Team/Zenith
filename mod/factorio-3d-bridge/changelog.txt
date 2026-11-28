@@ -1,4 +1,30 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.1
+Date: 2026-11-27
+  Features:
+    - Logistic requests as Factorio's: one list for the character, entities, ghosts and combinators, sections with multipliers (set_section), quality comparators, read-only automatic sections, and each slot's live status.
+    - Logistic networks: rename a network (set_lnet_name), find an item in it (lnet_find), its contents, requests and items in transit; a hovered entity's network in its hover info.
+    - Robots: personal construction robots returning to their owner are flagged as such, and flying robots' cargo is sent for alt-mode (rc).
+    - Rail signal blocks: the client asks for the block of a junction or crossing rail (rblk); rail signals and train stops snap to the track as a player's cursor does.
+    - Alerts: no storage and no roboport storage for logistic robots, as Factorio's.
+    - Mod windows: textfields, checkboxes, radio buttons, drop-downs, list-boxes, sliders (with their range), switches and choose-elem-buttons can be used from Zenith (mset).
+    - Cargo wagon slot filters; a locomotive's "Use destination train stop color"; the train overview and stop windows in Factorio's wording; editing a schedule keeps the train's current stop.
+    - The 2D map: a click on a building or train opens its window (pick).
+    - Copy (Ctrl+C) saves the selection as a blueprint into the inventory, the library or a book.
+    - Factoriopedia: ammo, gun, capsule and armour stats, vehicle speed, product chances and amount ranges, fuel multipliers, resistances in Factorio's order; the Bonuses window's distances, trash slots and follower robots.
+  Changes:
+    - New map setting f3d-rev-ticks (on): a chunk's change count goes up to the tick of the change, so another play of the same save can't match Zenith's saved copy of a chunk (the stick by an inserter on old saves). Off: counted up by one, as before.
+    - Building follows the game's placement rules (fast-replace group, collision box, water); rotate, flip and paste settings need the entity in reach; hand mining reach is measured to the entity's edge.
+  Optimisations:
+    - Worker robots: force modifiers cached, roboport scans and polls scaled, fewer LuaObjects and closures made (/f3d-perf robot_opt, gc_lean).
+  Bugfixes:
+    - Logistic requests with an unknown quality no longer wipe the list.
+    - Craft all (Shift+click) is no longer capped at 100 crafts; machine output and burnt-result slots take nothing from the hand; a stack taken from an output slot no longer swaps into it; moves respect a chest's limit bar.
+    - A belt broken under items clears them at once; an inserter's take and the belt's read no longer race; inserter events are sent at once.
+    - Damaged entities keep their health bars when the camera leaves and returns.
+    - Enter no longer boards a cargo, fluid or artillery wagon; the artillery and discharge defense remote shortcuts work; the bridge's own character respawns with freeplay's respawn items only.
+    - Console: /evolution with an unknown surface errors, /players prints Factorio's lines.
+---------------------------------------------------------------------------------------------------
 Version: 0.3.0
 Date: 2026-11-21
   Features:

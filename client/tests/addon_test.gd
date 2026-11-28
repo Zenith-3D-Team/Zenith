@@ -153,7 +153,7 @@ func _ready() -> void:
 	_write(DISK + "/refcounted/main.gd", "extends RefCounted\n")
 	_write(DISK + "/level-addon/addon.json", JSON.stringify({"id": "level-addon", "name": "Needs 1.1", "version": "1", "api": 1.1, "entry": "main.gd"}))
 	_write(DISK + "/level-addon/main.gd", "extends Node\n")
-	_write(DISK + "/later-addon/addon.json", JSON.stringify({"id": "later-addon", "name": "Needs 1.95", "version": "1", "api": 1.95, "entry": "main.gd"}))
+	_write(DISK + "/later-addon/addon.json", JSON.stringify({"id": "later-addon", "name": "Needs 1.96", "version": "1", "api": 1.96, "entry": "main.gd"}))
 	_write(DISK + "/later-addon/main.gd", "extends Node\n")
 	_write(DISK + "/level17-addon/addon.json", JSON.stringify({"id": "level17-addon", "name": "Needs 1.7", "version": "1", "api": 1.7, "entry": "main.gd"}))
 	_write(DISK + "/level17-addon/main.gd", "extends Node\n")
@@ -198,8 +198,8 @@ func _ready() -> void:
 	check(AddonLoader.compare_versions("1.10.0", "1.9.2") == 1 and AddonLoader.compare_versions("2", "2.0.0") == 0, "versions compare by number")
 	check(by_id.has("level17-addon") and by_id["level17-addon"]["ok"] and by_id.has("level18-addon") and by_id["level18-addon"]["ok"] and by_id.has("level19-addon") and by_id["level19-addon"]["ok"],
 		"1.9: add-ons asking for API 1.7, 1.8 and 1.9 all load")
-	check(by_id.has("later-addon") and not by_id["later-addon"]["ok"] and str(by_id["later-addon"]["problem"]).contains("needs a newer Zenith (add-on API 1.95; this Zenith has 1.93)"),
-		"1.9: one asking for 1.95 is refused with the newer-Zenith message: " + str(by_id.get("later-addon", {}).get("problem", "")))
+	check(by_id.has("later-addon") and not by_id["later-addon"]["ok"] and str(by_id["later-addon"]["problem"]).contains("needs a newer Zenith (add-on API 1.96; this Zenith has 1.95)"),
+		"1.9: one asking for 1.96 is refused with the newer-Zenith message: " + str(by_id.get("later-addon", {}).get("problem", "")))
 
 	area_api_author._trust(where, by_id)
 	# The add-ons the rest of the test starts, switched on as a player would (new ones are off); dup-two
@@ -248,7 +248,18 @@ func _ready() -> void:
 	check(node != null and node.started == 1 and node.api != null, "the entry script was started with its API")
 	var api = node.api if node != null else null
 	check(api != null and api.version == AddonLoader.API_VERSION and api.id == "test-addon", "the API says its version and the add-on's id")
-	check(api != null and is_equal_approx(api.level, 1.93), "and its level, 1.93")
+	check(api != null and is_equal_approx(api.level, 1.95), "and its level, 1.95")
+	if api != null:
+		# 1.94: a viewpoint announced ahead of a cut, by this add-on's id, let go with release_view.
+		var ViewAhead := preload("res://scripts/world/view_ahead.gd")
+		api.world.prepare_view(Vector3(500, 30, 0), Vector3(520, 0, 0), 2.0)
+		var announced := ViewAhead.active() == ViewAhead.on and (not ViewAhead.on or ViewAhead._points.has("test-addon"))
+		api.world.release_view()
+		check(announced and not ViewAhead.active(), "1.94: api.world.prepare_view announces a viewpoint ahead, release_view lets it go")
+		# 1.95: the animated sub-parts' ragdoll nodes (Immersive Enemies 0.1.3's strafer and stomper legs).
+		check(api.creatures != null and api.creatures.has_method("make_ragdoll_part_nodes")
+			and (api.creatures.make_ragdoll_part_nodes("") as Array).is_empty(),
+			"1.95: api.creatures.make_ragdoll_part_nodes is there ([] for no model)")
 	var disk := host.find("disk-addon")
 	check(disk.has("node") and int(disk["node"].answer) == 42, "a .gd loaded from user:// runs, with its relative preload")
 	check(not host.find("future-addon").has("node") and not host.find("refcounted").has("node"), "refused add-ons aren't started")

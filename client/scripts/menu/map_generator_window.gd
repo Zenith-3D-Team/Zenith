@@ -87,7 +87,18 @@ func _ready() -> void:
 	_seed_edit = MenuKit.textbox(seed_text, "Random")
 	_seed_edit.name = "Seed"
 	_seed_edit.custom_minimum_size.x = Kit.px(140)
-	_seed_edit.text_changed.connect(func(t: String) -> void: seed_text = t)
+	_seed_edit.text_changed.connect(func(t: String) -> void:
+		# Factorio's seed box takes digits only; other text would be ignored by --map-gen-seed (a random map
+		# while the preview note names the typed text).
+		var digits := ""
+		for ch in t:
+			if ch >= "0" and ch <= "9":
+				digits += ch
+		if digits != t:
+			var caret := _seed_edit.caret_column - (t.length() - digits.length())
+			_seed_edit.text = digits
+			_seed_edit.caret_column = maxi(0, caret)
+		seed_text = digits)
 	top.add_child(_seed_edit)
 	var dice := MenuKit.button("Random seed")
 	dice.pressed.connect(func() -> void:
@@ -191,6 +202,9 @@ func _load_last() -> void:
 
 
 func _play() -> void:
+	# A number typed into a box and not confirmed with Enter isn't applied until the box loses focus.
+	for box in _pane.find_children("*", "SpinBox", true, false):
+		(box as SpinBox).apply()
 	var save_name := Saves.clean_name(_name_edit.text)
 	Settings.set_value("new_game", "settings", JSON.stringify(settings))
 	Settings.set_value("new_game", "seed", seed_text)
@@ -331,7 +345,7 @@ func _advanced() -> void:
 	_spin(grid, "Absorbed per damaged tree", "map/pollution/pollution_restored_per_tree_damage", 0, 9999, 1, 1.0, "")
 	_heading("Recipes, technology, spoiling, asteroids")
 	grid = _grid()
-	_spin(grid, "Technology price multiplier", "map/difficulty_settings/technology_price_multiplier", 0.001, 1000, 0.5, 1.0, "×")
+	_spin(grid, "Technology price multiplier", "map/difficulty_settings/technology_price_multiplier", 0.25, 1000, 0.25, 1.0, "×")
 	var spoil := SpinBox.new()
 	spoil.name = "map-difficulty_settings-spoil_time_modifier"
 	spoil.min_value = 0.01

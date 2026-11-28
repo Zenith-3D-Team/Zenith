@@ -23,6 +23,7 @@ extends Node
 
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const ViewPriority := preload("res://scripts/world/view_priority.gd")
+const ViewAhead := preload("res://scripts/world/view_ahead.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const Switches := preload("res://scripts/switches.gd")
 
@@ -72,6 +73,11 @@ var _runs := {}  # chunk row -> Vector2i(first, last) chunk x drawn under _hull 
 var _hull := PackedVector2Array()
 var _on := false
 var _full := true
+## Chunks kept drawn round viewpoints announced ahead (view_ahead.gd): within AHEAD_RINGS of each, so the
+## Distant Horizon has handed them back (its grace frames and seam fade) before the camera cuts there.
+const AHEAD_RINGS := 3
+var _ahead_keep := {}
+var _ahead_gen := -1
 var _cam_at := Vector3(INF, INF, INF)
 var _cam_back := Vector3.ZERO
 var _cam_key: Array = []
@@ -185,6 +191,15 @@ func _process(_delta: float) -> void:
 		return
 	if not _on:
 		_on = true
+		_full = true
+	if ViewAhead.generation != _ahead_gen or (not _ahead_keep.is_empty() and not ViewAhead.active()):
+		_ahead_gen = ViewAhead.generation
+		_ahead_keep.clear()
+		for p: Vector3 in ViewAhead.points():
+			var pc := Vector2i(floori(p.x / CHUNK), floori(p.z / CHUNK))
+			for dy in range(-AHEAD_RINGS, AHEAD_RINGS + 1):
+				for dx in range(-AHEAD_RINGS, AHEAD_RINGS + 1):
+					_ahead_keep[pc + Vector2i(dx, dy)] = true
 		_full = true
 	var at := cam.global_position
 	var back := cam.global_transform.basis.z
@@ -357,6 +372,8 @@ func _is_near_collar(c: Vector2i) -> bool:
 func _set_drawn(c: Vector2i, cv: Node3D, drawn: bool) -> void:
 	if not is_instance_valid(cv):
 		return
+	if not drawn and _ahead_keep.has(c):
+		drawn = true
 	if drawn:
 		_to_hide.erase(c)
 		if _hidden.has(c):
@@ -420,7 +437,7 @@ func _drain_show() -> void:
 			_vis_show_queued[c] = true
 			_vis_show_queue.append(c)
 		n += 1
-		if slice_show and n >= limit:
+		if slice_show and n >= limit and not ViewAhead.cut_recent():
 			break
 	if idx >= _show_order.size():
 		_show_order.clear()
@@ -445,7 +462,7 @@ func _drain_vis_signals() -> void:
 			continue
 		chunk_visibility_changed.emit(c, true)
 		sent += 1
-		if slice_show and sent >= VIS_SIGNALS_PER_FRAME:
+		if slice_show and sent >= VIS_SIGNALS_PER_FRAME and not ViewAhead.cut_recent():
 			break
 	if idx >= _vis_show_queue.size():
 		_vis_show_queue.clear()

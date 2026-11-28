@@ -13,6 +13,7 @@ local world = require("scripts.world")
 local rate = require("scripts.rate")
 local budget = require("scripts.budget")
 local perf = require("scripts.perf")
+local tracker = require("scripts.tracker")
 
 local M = {}
 
@@ -21,8 +22,139 @@ local read_n = 0  -- entities read this run (rate.read)
 local BOXES_PER_MESSAGE = 200
 local SLICE_PRICE = 40
 local MAX_SLICES_PER_TICK = 2
+local FP_RESCAN_TICKS = 240
+local FP_MOVE_THRESH = 4
 -- Module-local counters for tests/probes (never in storage).
-M.counts = { runs = 0, slices = 0 }
+M.counts = { runs = 0, slices = 0, searches = 0, inv_gets = 0, empty_skips = 0 }
+
+-- (gc_lean) Module-local entity/inventory handle caches & pcall helpers (never in storage).
+local inv_cache = {}
+local heat_set
+
+local function get_temperature(e) return e.temperature end
+local function get_unplugged(st) return st.not_plugged_in_electric_network end
+local function get_no_ore() return defines.entity_status.no_minable_resources end
+local function get_entity_inv(e, inv_id) return e.get_inventory(inv_id) end
+local function inv_is_empty(inv) return inv.is_empty() end
+
+local function is_heat_type(t)
+  if not heat_set then
+    heat_set = {}
+    for _, ht in ipairs(registry.heat_types()) do
+      heat_set[ht] = true
+    end
+  end
+  return heat_set[t] == true
+end
+
+tracker.listeners[#tracker.listeners + 1] = function(entity)
+  if not (entity and entity.valid) then
+    return
+  end
+  local si = entity.surface.index
+  local t = entity.type
+  local fl_dirty = registry.is_fluid(t)
+  local ht_dirty = is_heat_type(t)
+  if not (fl_dirty or ht_dirty) then
+    return
+  end
+  local s = storage.f3d
+  local fm = s and s.fp_meta
+  if fm and fm.si == si then
+    if fl_dirty and fm.fl then
+      for _, entry in pairs(fm.fl) do
+        entry.dirty = true
+      end
+    end
+    if ht_dirty and fm.ht then
+      for _, entry in pairs(fm.ht) do
+        entry.dirty = true
+      end
+    end
+  end
+end
+
+local function prune_inv_cache()
+  if next(inv_cache) ~= nil then
+    for unit, c in pairs(inv_cache) do
+      if not (c.e and c.e.valid and c.inv and c.inv.valid) then
+        inv_cache[unit] = nil
+      end
+    end
+  end
+end
+
+local function cached_inv(e, inv_id)
+  if not perf.on("gc_lean") then
+    inv_cache = {}
+    M.counts.inv_gets = M.counts.inv_gets + 1
+    local ok, inv = pcall(get_entity_inv, e, inv_id)
+    return ok and inv or nil
+  end
+  local unit = e.unit_number
+  if unit then
+    local c = inv_cache[unit]
+    if c and c.e == e and e.valid and c.inv and c.inv.valid then
+      return c.inv
+    end
+    M.counts.inv_gets = M.counts.inv_gets + 1
+    local ok, inv = pcall(get_entity_inv, e, inv_id)
+    if ok and inv and inv.valid then
+      inv_cache[unit] = { e = e, inv = inv }
+      return inv
+    end
+    inv_cache[unit] = nil
+    return ok and inv or nil
+  end
+  M.counts.inv_gets = M.counts.inv_gets + 1
+  local ok, inv = pcall(get_entity_inv, e, inv_id)
+  return ok and inv or nil
+end
+
+-- (gc_lean) The storage bucket for this focus (s.fp_meta.fl / .ht): each search's found list is kept in
+-- it (m.list), so every peer, a joiner included, walks the same list and storage writes depend only on
+-- storage and events.
+local function fp_cache_for(s, surface, fx, fy, dr)
+  if not perf.on("gc_lean") then
+    s.fp_meta = nil
+    return nil
+  end
+  local fm = s.fp_meta
+  if not fm or fm.si ~= surface.index or fm.dr ~= dr or fm.client ~= s.client
+      or math.abs(fx - fm.fx) >= FP_MOVE_THRESH or math.abs(fy - fm.fy) >= FP_MOVE_THRESH then
+    if fm and (fm.si ~= surface.index or fm.client ~= s.client) then
+      inv_cache = {}
+    end
+    fm = { si = surface.index, fx = fx, fy = fy, dr = dr, client = s.client, fl = {}, ht = {} }
+    s.fp_meta = fm
+  end
+  return fm
+end
+
+local function cached_area_search(meta_bucket, key, surface, box, types, skip_if_empty)
+  if not meta_bucket then
+    M.counts.searches = M.counts.searches + 1
+    local found = surface.find_entities_filtered({ area = box, type = types })
+    return found, nil, #found
+  end
+  local m = meta_bucket[key]
+  local limit = FP_RESCAN_TICKS * rate.factor("fp")
+  if m and not m.dirty and m.list and (not skip_if_empty or m.count > 0) and (game.tick - m.tick) < limit then
+    return m.list, m, m.count
+  end
+  M.counts.searches = M.counts.searches + 1
+  local found = surface.find_entities_filtered({ area = box, type = types })
+  m = { tick = game.tick, count = #found, dirty = false, list = found }
+  meta_bucket[key] = m
+  return found, m, #found
+end
+
+function M.reset()
+  inv_cache = {}
+  if storage.f3d then
+    storage.f3d.fp_meta = nil
+  end
+end
 
 local function area(f, r)
   return { { f.x - r, f.y - r }, { f.x + r, f.y + r } }
@@ -60,28 +192,44 @@ function M.storages(e)
 end
 
 -- [unit, box, fluid id, amount, capacity, temperature, ...] for every box with fluid in it.
-local function collect_fluids_area(surface, box, flat, seen)
+local function collect_fluids_area(surface, box, flat, seen, meta_bucket, cache_key)
   local types = registry.fluid_types()
   if #types == 0 then
     return 0
   end
-  local found = surface.find_entities_filtered({ area = box, type = types })
-  local rn = #found
+  local found, entry, rn = cached_area_search(meta_bucket, cache_key, surface, box, types, true)
+  local lean = perf.on("gc_lean")
   for _, e in pairs(found) do
-    local unit = e.unit_number
+    -- (N3) Skipped only: entry.dirty comes from the tracker (storage), not from the list.
+    local valid = e.valid
+    local unit = valid and e.unit_number
     if unit and (not seen or not seen[unit]) then
       if seen then
         seen[unit] = true
       end
-      for i, b in ipairs(M.storages(e)) do
-        local fluid = b.fluid
-        if fluid then
-          flat[#flat + 1] = unit
-          flat[#flat + 1] = i
-          flat[#flat + 1] = registry.fluid_id(fluid.name)
-          flat[#flat + 1] = math.floor(fluid.amount + 0.5)
-          flat[#flat + 1] = math.floor(b.capacity + 0.5)
-          flat[#flat + 1] = math.floor((fluid.temperature or 0) + 0.5)
+      if lean then
+        for i = 1, e.fluids_count do
+          local fluid = e.get_fluid(i)
+          if fluid then
+            flat[#flat + 1] = unit
+            flat[#flat + 1] = i
+            flat[#flat + 1] = registry.fluid_id(fluid.name)
+            flat[#flat + 1] = math.floor(fluid.amount + 0.5)
+            flat[#flat + 1] = math.floor(e.get_fluid_capacity(i) + 0.5)
+            flat[#flat + 1] = math.floor((fluid.temperature or 0) + 0.5)
+          end
+        end
+      else
+        for i, b in ipairs(M.storages(e)) do
+          local fluid = b.fluid
+          if fluid then
+            flat[#flat + 1] = unit
+            flat[#flat + 1] = i
+            flat[#flat + 1] = registry.fluid_id(fluid.name)
+            flat[#flat + 1] = math.floor(fluid.amount + 0.5)
+            flat[#flat + 1] = math.floor(b.capacity + 0.5)
+            flat[#flat + 1] = math.floor((fluid.temperature or 0) + 0.5)
+          end
         end
       end
     end
@@ -90,20 +238,21 @@ local function collect_fluids_area(surface, box, flat, seen)
 end
 
 -- [unit, temperature (whole degrees), ...] for every entity with a heat buffer.
-local function collect_heat_area(surface, box, flat, seen)
+local function collect_heat_area(surface, box, flat, seen, meta_bucket, cache_key)
   local types = registry.heat_types()
   if #types == 0 then
     return 0
   end
-  local found = surface.find_entities_filtered({ area = box, type = types })
-  local rn = #found
+  local found, entry, rn = cached_area_search(meta_bucket, cache_key, surface, box, types, true)
   for _, e in pairs(found) do
-    local unit = e.unit_number
+    -- (N3) Skipped only: entry.dirty comes from the tracker (storage), not from the list.
+    local valid = e.valid
+    local unit = valid and e.unit_number
     if unit and (not seen or not seen[unit]) then
       if seen then
         seen[unit] = true
       end
-      local ok, temperature = pcall(function() return e.temperature end)
+      local ok, temperature = pcall(get_temperature, e)
       if ok and temperature then
         flat[#flat + 1] = unit
         flat[#flat + 1] = math.floor(temperature + 0.5)
@@ -119,7 +268,7 @@ local function power_states()
   if not POWER_STATES then
     local st = defines.entity_status
     POWER_STATES = { [st.no_power] = 0, [st.low_power] = 1 }
-    local ok, unplugged = pcall(function() return st.not_plugged_in_electric_network end)
+    local ok, unplugged = pcall(get_unplugged, st)
     if ok and unplugged then
       POWER_STATES[unplugged] = 2
     end
@@ -148,7 +297,7 @@ local NO_FUEL, NO_ORE
 local function statuses()
   if NO_FUEL == nil then
     NO_FUEL = defines.entity_status.no_fuel
-    local ok, v = pcall(function() return defines.entity_status.no_minable_resources end)
+    local ok, v = pcall(get_no_ore)
     NO_ORE = ok and v or false
   end
   return NO_FUEL, NO_ORE
@@ -186,6 +335,7 @@ local function collect_power_area(surface, box, flat, unplugged, warn, seen)
   local types = registry.electric_types()
   local no_fuel, no_ore = statuses()
   if #types > 0 then
+    M.counts.searches = M.counts.searches + 1
     local found = surface.find_entities_filtered({ area = box, type = types })
     rn = rn + #found
     for _, e in pairs(found) do
@@ -212,6 +362,7 @@ local function collect_power_area(surface, box, flat, unplugged, warn, seen)
   end
   local extra = M.status_types()
   if #extra > 0 then
+    M.counts.searches = M.counts.searches + 1
     local more = surface.find_entities_filtered({ area = box, type = extra })
     rn = rn + #more
     local ammo = defines.inventory.turret_ammo
@@ -222,9 +373,15 @@ local function collect_power_area(surface, box, flat, unplugged, warn, seen)
           seen[unit] = true
         end
         if e.type == "ammo-turret" then
-          local inv = e.get_inventory(ammo)
-          if inv and inv.is_empty() then
-            warn.no_ammo[#warn.no_ammo + 1] = e
+          local inv = cached_inv(e, ammo)
+          if inv then
+            local ok, empty = pcall(inv_is_empty, inv)
+            if (ok and empty) or (not ok and inv.is_empty()) then
+              if ok then
+                M.counts.empty_skips = M.counts.empty_skips + 1
+              end
+              warn.no_ammo[#warn.no_ammo + 1] = e
+            end
           end
         elseif e.status == no_fuel then
           warn.no_fuel[#warn.no_fuel + 1] = e
@@ -235,13 +392,26 @@ local function collect_power_area(surface, box, flat, unplugged, warn, seen)
   return rn
 end
 
-local function make_job(surface, f, dr)
+local function fluid_radius(s, base_dr)
+  if base_dr <= 0 then
+    return 0
+  end
+  if perf.on("alt_fluid_range") ~= false and (s.altc ~= nil or s.alt == true) then
+    return s.focus.r
+  end
+  return math.min(base_dr, s.focus.r)
+end
+
+local function make_job(surface, f, dr, fl_r)
   local steps = {}
-  if dr > 0 then
-    local fl_strips = (#registry.fluid_types() > 0 and dr > 32) and 2 or 1
+  local fl_rad = fl_r or dr
+  if fl_rad > 0 then
+    local fl_strips = (#registry.fluid_types() > 0 and fl_rad > 32) and (fl_rad > 64 and 4 or 2) or 1
     for k = 1, fl_strips do
       steps[#steps + 1] = { "fl", k, fl_strips }
     end
+  end
+  if dr > 0 then
     steps[#steps + 1] = { "ht", 1, 1 }
   end
   local pw_strips = f.r > 32 and 4 or 2
@@ -254,6 +424,7 @@ local function make_job(surface, f, dr)
     fy = f.y,
     r = f.r,
     dr = dr,
+    fl_r = fl_rad,
     steps = steps,
     i = 1,
     read_n = 0,
@@ -268,17 +439,21 @@ local function make_job(surface, f, dr)
   }
 end
 
-local function run_job_step(surface, job)
+local function run_job_step(surface, s, job)
   local step = job.steps[job.i]
   local kind, strip, strips = step[1], step[2], step[3]
   local rn = 0
   if kind == "fl" then
-    rn = collect_fluids_area(surface, strip_area(job.fx, job.fy, job.dr, strip, strips), job.fl, job.seen_fl)
+    local fm = fp_cache_for(s, surface, job.fx, job.fy, job.fl_r)
+    rn = collect_fluids_area(surface, strip_area(job.fx, job.fy, job.fl_r, strip, strips), job.fl, job.seen_fl,
+      fm and fm.fl, strips * 10 + strip)
     if strip == strips then
       send_parts("fl", job.fl, 6)
     end
   elseif kind == "ht" then
-    rn = collect_heat_area(surface, strip_area(job.fx, job.fy, job.dr, strip, strips), job.ht, job.seen_ht)
+    local fm = fp_cache_for(s, surface, job.fx, job.fy, job.fl_r)
+    rn = collect_heat_area(surface, strip_area(job.fx, job.fy, job.dr, strip, strips), job.ht, job.seen_ht,
+      fm and fm.ht, 1)
     if strip == strips then
       send_parts("ht", job.ht, 2)
     end
@@ -300,13 +475,20 @@ function M.tick()
     if not rate.due("fp", INTERVAL) then
       return
     end
-    local r = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
+    local base_dr = settings.global["f3d-detail-radius"].value
+    local r = math.min(base_dr, s.focus.r)
+    local fl_r = fluid_radius(s, base_dr)
+    local fm = fp_cache_for(s, surface, s.focus.x, s.focus.y, fl_r)
+    prune_inv_cache()
     read_n = 0
-    if r > 0 then
-      local fl, ht = {}, {}
-      read_n = read_n + collect_fluids_area(surface, area(s.focus, r), fl, nil)
+    if fl_r > 0 then
+      local fl = {}
+      read_n = read_n + collect_fluids_area(surface, area(s.focus, fl_r), fl, nil, fm and fm.fl, 0)
       send_parts("fl", fl, 6)
-      read_n = read_n + collect_heat_area(surface, area(s.focus, r), ht, nil)
+    end
+    if r > 0 then
+      local ht = {}
+      read_n = read_n + collect_heat_area(surface, area(s.focus, r), ht, nil, fm and fm.ht, 0)
       send_parts("ht", ht, 2)
     end
     local flat, unplugged, warn = {}, {}, { no_fuel = {}, no_ammo = {}, depleted = {} }
@@ -329,15 +511,18 @@ function M.tick()
     if not rate.due("fp", INTERVAL) then
       return
     end
-    local dr = math.min(settings.global["f3d-detail-radius"].value, s.focus.r)
-    job = make_job(surface, s.focus, dr)
+    local base_dr = settings.global["f3d-detail-radius"].value
+    local dr = math.min(base_dr, s.focus.r)
+    local fl_r = fluid_radius(s, base_dr)
+    prune_inv_cache()
+    job = make_job(surface, s.focus, dr, fl_r)
     s.fp_job = job
     started_now = true
   end
 
   local did = 0
   while job.i <= #job.steps do
-    local rn = run_job_step(surface, job)
+    local rn = run_job_step(surface, s, job)
     did = did + 1
     if not started_now and rn > 0 then
       budget.spend(math.max(1, math.floor(rn * 0.14)), "fp")

@@ -17,6 +17,14 @@ local function try(fn)
   return nil
 end
 
+local function inner_type(e)
+  return e.type == "entity-ghost" and e.ghost_type or e.type
+end
+
+local function inner_proto(e)
+  return e.type == "entity-ghost" and e.ghost_prototype or e.prototype
+end
+
 local function thousandths(v)
   return math.max(0, math.min(1000, math.floor(v * 1000 + 0.5)))
 end
@@ -98,18 +106,21 @@ end
 -- The requester point that carries "trash unrequested", by entity type.
 local REQUESTER_POINTS = {
   ["logistic-container"] = "logistic_container", ["cargo-landing-pad"] = "cargo_landing_pad_requester",
-  ["rocket-silo"] = "rocket_silo_requester",
+  ["rocket-silo"] = "rocket_silo_requester", ["spider-vehicle"] = "spidertron_requester",
+  roboport = "roboport_requester",
 }
 
--- {tu (trash unrequested), rb? (request from buffers), sec} for requester and buffer chests, landing
--- pads and rocket silos.
+-- {tu (trash unrequested), no_tu?, on?, mv?, rb? (request from buffers), sec, del?, pick?, in_net?}
+-- for requester and buffer chests, landing pads, rocket silos, spidertrons and roboports.
 local function chest_logistics(e, space)
-  local point_name = REQUESTER_POINTS[e.type]
+  local t = inner_type(e)
+  local point_name = REQUESTER_POINTS[t]
   if not point_name then
     return nil
   end
-  if e.type == "logistic-container" then
-    local mode = try(function() return e.prototype.logistic_mode end)
+  local proto = inner_proto(e)
+  if t == "logistic-container" then
+    local mode = try(function() return proto.logistic_mode end)
     if mode ~= "requester" and mode ~= "buffer" then
       return nil
     end
@@ -120,9 +131,34 @@ local function chest_logistics(e, space)
   end
   local info = { sec = sec }
   local point = try(function() return e.get_logistic_point(defines.logistic_member_index[point_name]) end)
-  local trash = point and try(function() return point.trash_not_requested end)
-  info.tu = trash and 1 or 0
-  if e.type == "logistic-container" and try(function() return e.prototype.logistic_mode end) == "requester" then
+  if t == "roboport" then
+    info.tu = 0
+    info.no_tu = 1
+  else
+    local trash = point and try(function() return point.trash_not_requested end)
+    info.tu = trash and 1 or 0
+  end
+  if point then
+    local enabled = try(function() return point.enabled end)
+    if enabled ~= nil then
+      info.on = enabled and 1 or 0
+    end
+    local del, pick = space.point_transfers(point)
+    if del then
+      info.del = del
+    end
+    if pick then
+      info.pick = pick
+    end
+    info.in_net = try(function() return point.logistic_network ~= nil end) and 1 or 0
+  end
+  if t == "spider-vehicle" then
+    local mv = try(function() return e.enable_logistics_while_moving end)
+    if mv ~= nil then
+      info.mv = mv and 1 or 0
+    end
+  end
+  if t == "logistic-container" and try(function() return proto.logistic_mode end) == "requester" then
     info.rb = try(function() return e.request_from_buffers end) and 1 or 0
   end
   return info
@@ -171,6 +207,8 @@ local function lab_durability(e)
 end
 
 function M.fill(msg, e, kind, space, with_lists)
+  local t = inner_type(e)
+  local proto = inner_proto(e)
   if kind == "crafter" or kind == "furnace" or kind == "silo" then
     local recipe = try(function() return e.get_recipe() end)
     if not recipe and kind == "furnace" then
@@ -189,16 +227,16 @@ function M.fill(msg, e, kind, space, with_lists)
       end
     end
     -- A fixed recipe (the captive biter spawner's) has no "change recipe" button.
-    if kind == "crafter" and try(function() return e.prototype.fixed_recipe end) then
+    if kind == "crafter" and try(function() return proto.fixed_recipe end) then
       msg.fixed = 1
     end
   end
-  if kind == "crafter" or kind == "furnace" or e.type == "mining-drill" or kind == "silo" then
+  if kind == "crafter" or kind == "furnace" or t == "mining-drill" or kind == "silo" then
     local bonus = try(function() return e.productivity_bonus end)
     if type(bonus) == "number" and bonus > 0 then
       msg.pb = math.floor(bonus * 1000 + 0.5)
       local progress = try(function() return e.bonus_progress end)
-      if e.type == "mining-drill" then
+      if t == "mining-drill" then
         local target = try(function() return e.mining_target end)
         local raw = try(function() return e.bonus_mining_progress end)
         local time = target and try(function() return target.prototype.mineable_properties.mining_time end)
@@ -209,7 +247,7 @@ function M.fill(msg, e, kind, space, with_lists)
       end
     end
   end
-  if e.type == "mining-drill" then
+  if t == "mining-drill" then
     drill_fields(msg, e)
   end
   -- The burning fuel left: the same value as entity_ui's `bu`, under the name the production
@@ -218,12 +256,12 @@ function M.fill(msg, e, kind, space, with_lists)
   local temperature = try(function() return e.temperature end)
   if type(temperature) == "number" then
     msg.tc = math.floor(temperature * 100 + 0.5)
-    msg.tmax = try(function() return e.prototype.heat_buffer_prototype.max_temperature end)
+    msg.tmax = try(function() return proto.heat_buffer_prototype.max_temperature end)
   end
-  if with_lists and (e.type == "lab") then
-    msg.li = try(function() return e.prototype.lab_inputs end)
+  if with_lists and (t == "lab") then
+    msg.li = try(function() return proto.lab_inputs end)
   end
-  if e.type == "lab" then
+  if t == "lab" then
     local ld = lab_durability(e)
     if ld and #ld > 0 then
       msg.ld = ld
@@ -234,30 +272,42 @@ function M.fill(msg, e, kind, space, with_lists)
     msg.rw = rocket_weight(e)
   end
   -- The force's logistic groups, for the section header's group picker (with the recipe list).
-  if with_lists and try(function() return e.get_logistic_sections() end) then
+  if with_lists and (t == "constant-combinator" or try(function() return e.get_logistic_sections() end)) then
     msg.lgs = try(function() return e.force.get_logistic_groups() end)
+  end
+  if (msg.lc or msg.lg or t == "constant-combinator") and not msg.ql then
+    local q = space.qualities(e.force)
+    if q and #q > 1 then
+      msg.ql = q
+    end
   end
 end
 
 -- The hub or landing pad a cargo bay is part of (nil for anything else, or a loose bay).
 function M.bay_owner(e)
-  if e.type ~= "cargo-bay" then
+  if inner_type(e) ~= "cargo-bay" then
     return nil
   end
   local owner = try(function() return e.cargo_bay_connection_owner end)
   return owner and owner.valid and owner.unit_number and owner or nil
 end
 
--- {u, tu? 0/1, rb? 0/1}: a requester or buffer chest's "Trash unrequested" and "Request from buffer
--- chests" boxes.
+-- {u, tu? 0/1, on? 0/1, mv? 0/1, rb? 0/1}: logistic requester point and spidertron toggles.
 function M.set_chest_logistics(e, cmd)
-  local point_name = REQUESTER_POINTS[e.type]
+  local t = inner_type(e)
+  local point_name = REQUESTER_POINTS[t]
   if not point_name then
     error("nothing with requests")
   end
-  if cmd.tu ~= nil then
-    local point = e.get_logistic_point(defines.logistic_member_index[point_name])
+  local point = (cmd.tu ~= nil or cmd.on ~= nil) and e.get_logistic_point(defines.logistic_member_index[point_name]) or nil
+  if cmd.tu ~= nil and t ~= "roboport" then
     point.trash_not_requested = cmd.tu == 1
+  end
+  if cmd.on ~= nil then
+    point.enabled = cmd.on == 1
+  end
+  if cmd.mv ~= nil and t == "spider-vehicle" then
+    e.enable_logistics_while_moving = cmd.mv == 1
   end
   if cmd.rb ~= nil then
     e.request_from_buffers = cmd.rb == 1

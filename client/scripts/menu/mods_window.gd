@@ -97,7 +97,7 @@ static func scan(running := false) -> Array:
 static func _entry(name: String, info: Dictionary, source: String, choices: Dictionary, running: bool) -> Dictionary:
 	var on := bool(choices.get(name, true)) if running else ModChoices.is_on(name, choices)
 	return {"name": name, "title": str(info.get("title", name)), "version": str(info.get("version", "")),
-		"source": source, "enabled": name == BRIDGE or on}
+		"source": source, "enabled": name == BRIDGE or on, "deps": ModChoices.dependencies(info)}
 
 
 ## The server's mod-list.json as name -> enabled: what the server last ran.
@@ -122,7 +122,8 @@ static func write_states(mods: Array) -> void:
 	ModChoices.write(choices)
 
 
-## Turns a mod on or off, with the DLC that go with it.
+## Turns a mod on or off, with the mods that go with it: on, the mods it needs and recommends ("+"),
+## off, the mods that need it (Factorio's Mods window does the same), and the DLC (NEEDS).
 func set_enabled(name: String, on: bool) -> void:
 	var change := {name: on}
 	if on:
@@ -132,6 +133,22 @@ func set_enabled(name: String, on: bool) -> void:
 		for other in NEEDS:
 			if (NEEDS[other] as Array).has(name):
 				change[other] = false
+	var known := {}
+	for m in _mods:
+		known[m["name"]] = m
+	var grew := true
+	while grew:
+		grew = false
+		for m in _mods:
+			var n: String = m["name"]
+			for d in m.get("deps", []):
+				var wanted: bool = d[0] in ["", "~", "+"] if on else d[0] in ["", "~"]
+				if on and change.get(n, false) == true and wanted and known.has(d[1]) and not change.has(d[1]):
+					change[d[1]] = true
+					grew = true
+				elif not on and wanted and change.get(d[1], true) == false and bool(m["enabled"]) and not change.has(n):
+					change[n] = false
+					grew = true
 	for m in _mods:
 		if change.has(m["name"]) and m["name"] != BRIDGE and m["name"] != "base":
 			m["enabled"] = change[m["name"]]

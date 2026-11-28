@@ -51,6 +51,20 @@ const TIER_MASS := {
 	"behemoth-worm-turret": 4.0,
 	"biter-spawner": 5.0,
 	"spitter-spawner": 5.0,
+	"small-wriggler-pentapod": 0.35,
+	"medium-wriggler-pentapod": 0.55,
+	"big-wriggler-pentapod": 0.85,
+	"small-wriggler-pentapod-premature": 0.35,
+	"medium-wriggler-pentapod-premature": 0.55,
+	"big-wriggler-pentapod-premature": 0.85,
+	"small-strafer-pentapod": 1.1,
+	"medium-strafer-pentapod": 1.6,
+	"big-strafer-pentapod": 2.3,
+	"small-stomper-pentapod": 2.6,
+	"medium-stomper-pentapod": 3.8,
+	"big-stomper-pentapod": 5.4,
+	"gleba-spawner": 4.5,
+	"gleba-spawner-small": 2.0,
 }
 const TIER_RADIUS := {
 	"small-biter": 0.36,
@@ -67,6 +81,20 @@ const TIER_RADIUS := {
 	"behemoth-worm-turret": 1.25,
 	"biter-spawner": 1.6,
 	"spitter-spawner": 1.6,
+	"small-wriggler-pentapod": 0.32,
+	"medium-wriggler-pentapod": 0.44,
+	"big-wriggler-pentapod": 0.58,
+	"small-wriggler-pentapod-premature": 0.32,
+	"medium-wriggler-pentapod-premature": 0.44,
+	"big-wriggler-pentapod-premature": 0.58,
+	"small-strafer-pentapod": 0.65,
+	"medium-strafer-pentapod": 0.85,
+	"big-strafer-pentapod": 1.15,
+	"small-stomper-pentapod": 1.1,
+	"medium-stomper-pentapod": 1.5,
+	"big-stomper-pentapod": 2.0,
+	"gleba-spawner": 1.7,
+	"gleba-spawner-small": 0.85,
 }
 const TIER_HALF_HEIGHT := {
 	"small-biter": 0.22,
@@ -83,6 +111,20 @@ const TIER_HALF_HEIGHT := {
 	"behemoth-worm-turret": 0.95,
 	"biter-spawner": 0.65,
 	"spitter-spawner": 0.65,
+	"small-wriggler-pentapod": 0.16,
+	"medium-wriggler-pentapod": 0.22,
+	"big-wriggler-pentapod": 0.28,
+	"small-wriggler-pentapod-premature": 0.16,
+	"medium-wriggler-pentapod-premature": 0.22,
+	"big-wriggler-pentapod-premature": 0.28,
+	"small-strafer-pentapod": 0.45,
+	"medium-strafer-pentapod": 0.60,
+	"big-strafer-pentapod": 0.80,
+	"small-stomper-pentapod": 0.65,
+	"medium-stomper-pentapod": 0.85,
+	"big-stomper-pentapod": 1.15,
+	"gleba-spawner": 0.65,
+	"gleba-spawner-small": 0.38,
 }
 const TIER_MODEL_SCALE := {
 	"small-biter": 0.5,
@@ -99,6 +141,20 @@ const TIER_MODEL_SCALE := {
 	"behemoth-worm-turret": 1.2,
 	"biter-spawner": 1.0,
 	"spitter-spawner": 1.0,
+	"small-wriggler-pentapod": 0.6,
+	"medium-wriggler-pentapod": 0.8,
+	"big-wriggler-pentapod": 1.0,
+	"small-wriggler-pentapod-premature": 0.6,
+	"medium-wriggler-pentapod-premature": 0.8,
+	"big-wriggler-pentapod-premature": 1.0,
+	"small-strafer-pentapod": 0.5625,
+	"medium-strafer-pentapod": 0.75,
+	"big-strafer-pentapod": 1.0,
+	"small-stomper-pentapod": 0.5625,
+	"medium-stomper-pentapod": 0.75,
+	"big-stomper-pentapod": 1.0,
+	"gleba-spawner": 1.0,
+	"gleba-spawner-small": 0.55,
 }
 
 var api
@@ -125,6 +181,7 @@ var blood_amount := 1.0
 var on_bounce: Callable = Callable()
 var on_decay_dust: Callable = Callable()
 var on_burn_flame: Callable = Callable()
+var on_gleba_puddle: Callable = Callable()
 
 
 func _init(a, root: Node3D) -> void:
@@ -218,6 +275,7 @@ func _is_supported(proto: String) -> bool:
 		or proto.ends_with("-worm-turret")
 		or proto == "biter-spawner"
 		or proto == "spitter-spawner"
+		or _is_gleba(proto)
 	)
 
 
@@ -225,13 +283,35 @@ func _is_worm(proto: String) -> bool:
 	return proto.ends_with("-worm-turret")
 
 
+func _is_wriggler(proto: String) -> bool:
+	return proto.contains("-wriggler-pentapod")
+
+
+func _is_strafer(proto: String) -> bool:
+	return proto.ends_with("-strafer-pentapod")
+
+
+func _is_stomper(proto: String) -> bool:
+	return proto.ends_with("-stomper-pentapod")
+
+
+func _is_gleba_spawner(proto: String) -> bool:
+	return proto == "gleba-spawner" or proto == "gleba-spawner-small"
+
+
+func _is_gleba(proto: String) -> bool:
+	return _is_wriggler(proto) or _is_strafer(proto) or _is_stomper(proto) or _is_gleba_spawner(proto)
+
+
 func _is_spawner(proto: String) -> bool:
-	return proto == "biter-spawner" or proto == "spitter-spawner"
+	return proto == "biter-spawner" or proto == "spitter-spawner" or _is_gleba_spawner(proto)
 
 
 func _limb_count_for(proto: String) -> int:
-	if _is_worm(proto) or _is_spawner(proto):
+	if _is_worm(proto) or _is_spawner(proto) or _is_strafer(proto) or _is_stomper(proto):
 		return 0
+	if _is_wriggler(proto):
+		return 5
 	return mini(12 if proto.ends_with("-spitter") else LIMB_COUNT, MAX_LIMB_COUNT)
 
 
@@ -331,6 +411,10 @@ func spawn(info: Dictionary) -> bool:
 
 	var is_worm: bool = _is_worm(proto)
 	var is_spawner: bool = _is_spawner(proto)
+	var is_wriggler: bool = _is_wriggler(proto)
+	var is_strafer: bool = _is_strafer(proto)
+	var is_stomper: bool = _is_stomper(proto)
+	var is_gleba: bool = _is_gleba(proto)
 	var unit: int = int(info.get("unit", 0))
 	var wound_rec: Variant = _wounds.get(unit, null) if unit != 0 else null
 	if unit != 0:
@@ -408,7 +492,7 @@ func spawn(info: Dictionary) -> bool:
 	if should_split:
 		blood = maxf(blood, 0.88)
 		if limb_count > 0:
-			detach_want = _rng.randi_range(4, 6) if is_spitter else _rng.randi_range(3, 5)
+			detach_want = _rng.randi_range(4, 6) if is_spitter else (_rng.randi_range(2, 4) if is_wriggler else _rng.randi_range(3, 5))
 	elif is_non_dismember:
 		blood = maxf(blood, 0.25)
 		detach_want = 0
@@ -459,6 +543,7 @@ func spawn(info: Dictionary) -> bool:
 			"is_part": false,
 			"is_worm": false,
 			"is_spawner": true,
+			"is_gleba": is_gleba,
 			"part_name": "",
 			"limb_count": 0,
 			"pos": Vector3(pos.x, gh + 0.35 * scale, pos.z),
@@ -472,6 +557,11 @@ func spawn(info: Dictionary) -> bool:
 		if (should_split or is_heavy) and gibs_enabled and not lite:
 			var nest_com := Vector3(pos.x, maxf(pos.y, gh) + 0.75 * scale, pos.z)
 			_spawn_split_body(proto, 0, crater_pos, nest_com, quat, h_init, dir_xz, mass, radius, scale, maxf(blood, 0.85), holes, 0, was_burning)
+			if _is_gleba_spawner(proto):
+				var sac_total: int = 10 if proto == "gleba-spawner" else 2
+				var sac_want: int = _rng.randi_range(3, 5) if proto == "gleba-spawner" else _rng.randi_range(1, 2)
+				var sac_vel: Vector3 = h_init + dir_xz * 3.5 + Vector3.UP * 4.5
+				_detach_legs(proto, sac_want, sac_total, crater_pos, quat, sac_vel, mass, radius, scale, maxf(blood, 0.85), PackedFloat32Array(), PackedByteArray(), was_burning)
 		return true
 
 	var impulse_dt: String = "explosion" if is_explosive_src else damage_type
@@ -487,9 +577,19 @@ func spawn(info: Dictionary) -> bool:
 		if topple_axis.length_squared() > 0.0001:
 			ang_vel += topple_axis.normalized() * _rng.randf_range(3.2, 4.8)
 
-	var com_local := Vector3(0.0, (1.6 if is_worm else COM_Y) * scale, 0.0)
+	var com_y: float = 1.6 if is_worm else (0.38 if is_wriggler else (1.65 if is_strafer else COM_Y))
+	var com_local := Vector3(0.0, com_y * scale, 0.0)
 	var com_world := Vector3(pos.x, maxf(pos.y, gh) + com_local.y, pos.z)
 	var mesh_origin: Vector3 = com_world - (quat * com_local)
+
+	if is_stomper:
+		var live_parts_stomp: Array = info.get("parts", []) as Array
+		_spawn_spider_legs(proto, live_parts_stomp, mesh_origin, quat, lin_vel, dir_xz, mass, radius, scale, blood, was_burning, is_explosive_src or should_split, is_heavy, lite)
+		return true
+
+	if is_strafer:
+		var live_parts_straf: Array = info.get("parts", []) as Array
+		_spawn_spider_legs(proto, live_parts_straf, mesh_origin, quat, lin_vel, dir_xz, mass, radius, scale, blood, was_burning, is_explosive_src or should_split, is_heavy, lite)
 
 	# Grenades / explosions / overkill split the creature into 3 solid body chunks + severed legs.
 	if should_split and gibs_enabled and not lite:
@@ -552,6 +652,8 @@ func spawn(info: Dictionary) -> bool:
 		"is_leg": false,
 		"is_part": false,
 		"is_worm": is_worm,
+		"is_wriggler": is_wriggler,
+		"is_gleba": is_gleba,
 		"part_name": "",
 		"limb_count": limb_count,
 		"pos": com_world,
@@ -689,6 +791,8 @@ func _step_active(dt: float) -> void:
 		var is_leg: bool = bool(body.get("is_leg", false))
 		var is_part: bool = bool(body.get("is_part", false))
 		var is_worm: bool = bool(body.get("is_worm", false))
+		var is_wriggler: bool = bool(body.get("is_wriggler", false))
+		var is_gleba: bool = bool(body.get("is_gleba", false))
 		var has_limbs: bool = not is_leg and not is_part and int(body.get("limb_count", 0)) > 0
 		var com_local: Vector3 = body.get("com_local", Vector3.ZERO) as Vector3
 		var up_dot: float = (quat * Vector3.UP).dot(normal)
@@ -699,6 +803,13 @@ func _step_active(dt: float) -> void:
 			rest_clear = half_h
 		elif is_worm:
 			rest_clear = lerpf(half_h, com_local.y, absf(up_dot))
+		elif is_wriggler:
+			if up_dot > 0.35:
+				rest_clear = 0.22 * scale
+			elif up_dot < -0.35:
+				rest_clear = 0.32 * scale
+			else:
+				rest_clear = 0.28 * scale
 		elif up_dot > 0.35:
 			rest_clear = 0.54 * scale
 		elif up_dot < -0.35:
@@ -721,7 +832,7 @@ func _step_active(dt: float) -> void:
 				bounce_kick = clampf(impact_speed * 0.7, 0.0, 8.0)
 				if impact_speed >= BOUNCE_SMEAR_SPEED and on_bounce.is_valid():
 					var smear_scale: float = scale * 0.75 if is_part else scale
-					on_bounce.call(Vector3(next_pos.x, gh, next_pos.z), impact_speed, smear_scale)
+					on_bounce.call(Vector3(next_pos.x, gh, next_pos.z), impact_speed, smear_scale, is_gleba)
 			elif vn < 0.0:
 				vel -= vn * normal
 
@@ -739,7 +850,7 @@ func _step_active(dt: float) -> void:
 				var skid_count: int = int(body.get("skid_count", 0))
 				if skid_cd <= 0.0 and skid_count < 2:
 					var skid_scale: float = scale * 0.65 if is_part else scale * 0.85
-					on_bounce.call(Vector3(next_pos.x, gh, next_pos.z), tan_speed * 0.65, skid_scale)
+					on_bounce.call(Vector3(next_pos.x, gh, next_pos.z), tan_speed * 0.65, skid_scale, is_gleba)
 					skid_cd = 0.14
 					skid_count += 1
 				body["skid_cd"] = skid_cd
@@ -972,6 +1083,7 @@ func _settle_body(body: Dictionary, gh: float) -> void:
 	var scale: float = float(body["scale"])
 	var is_leg: bool = bool(body.get("is_leg", false))
 	var is_part: bool = bool(body.get("is_part", false))
+	var is_gleba: bool = bool(body.get("is_gleba", false))
 	var has_limbs: bool = not is_leg and not is_part and int(body.get("limb_count", 0)) > 0
 	var burning: bool = bool(body.get("burning", false))
 	if not is_leg and not burning and gore_enabled and blood_amount > 0.001:
@@ -979,7 +1091,11 @@ func _settle_body(body: Dictionary, gh: float) -> void:
 		if is_part:
 			var pname: String = str(body.get("part_name", ""))
 			puddle_scale *= (0.85 if pname == "thorax" else 0.50)
-		api.creatures.add_blood_puddle(Vector3(pos.x, gh, pos.z), puddle_scale)
+		if is_gleba:
+			if on_gleba_puddle.is_valid():
+				on_gleba_puddle.call(Vector3(pos.x, gh, pos.z), puddle_scale)
+		else:
+			api.creatures.add_blood_puddle(Vector3(pos.x, gh, pos.z), puddle_scale)
 
 	while _settled.size() >= MAX_SETTLED:
 		var oldest: Dictionary = _settled.pop_front() as Dictionary
@@ -1124,13 +1240,15 @@ func _spawn_split_body(proto: String, limb_count: int, mesh_origin: Vector3, com
 
 	var is_worm: bool = _is_worm(proto)
 	var is_spawner: bool = _is_spawner(proto)
+	var is_wriggler: bool = _is_wriggler(proto)
+	var is_gleba: bool = _is_gleba(proto)
 	var inv_m: float = clampf(force_mul / maxf(mass, 0.35), 0.55, 1.55)
 	for c in created:
 		var cd: Dictionary = c as Dictionary
 		var part_name: String = str(cd["part"])
 		var pnode: MeshInstance3D = cd["node"] as MeshInstance3D
 
-		var fallback_c := Vector3(0.0, 1.15 * scale, 0.0)
+		var fallback_c := Vector3(0.0, (0.38 if is_wriggler else 1.15) * scale, 0.0)
 		var part_rad_mul := 0.50
 		var part_hh_mul := 0.35
 		var part_mass_mul := 0.33
@@ -1260,6 +1378,7 @@ func _spawn_split_body(proto: String, limb_count: int, mesh_origin: Vector3, com
 			"proto": proto,
 			"is_leg": false,
 			"is_part": true,
+			"is_gleba": is_gleba,
 			"part_name": part_name,
 			"pos": part_world,
 			"com_local": Vector3.ZERO,
@@ -1311,6 +1430,8 @@ func _detach_legs(proto: String, detach_want: int, limb_count: int, mesh_origin:
 		order[k] = order[swap_i]
 		order[swap_i] = tmp
 
+	var is_gleba: bool = _is_gleba(proto)
+	var is_wriggler: bool = _is_wriggler(proto)
 	var spawned := 0
 	for li in order:
 		if spawned >= budget:
@@ -1324,7 +1445,13 @@ func _detach_legs(proto: String, detach_want: int, limb_count: int, mesh_origin:
 			twists[li] = SEVERED_SENTINEL
 
 		var fallback_c: Vector3
-		if clamped_limbs > 6:
+		if _is_gleba_spawner(proto):
+			var sa: float = TAU * float(li) / float(maxi(clamped_limbs, 1))
+			fallback_c = Vector3(cos(sa) * 0.65 * scale, 0.55 * scale, sin(sa) * 0.65 * scale)
+		elif is_wriggler:
+			var wa: float = TAU * float(li) / 5.0
+			fallback_c = Vector3(sin(wa) * 0.85 * scale, 0.25 * scale, -cos(wa) * 0.85 * scale)
+		elif clamped_limbs > 6:
 			var side_x: float = -0.45 if li < 6 else 0.45
 			var p_idx: int = li % 6
 			fallback_c = Vector3(side_x * scale, (0.95 - float(p_idx) * 0.12) * scale, (-0.8 + float(p_idx) * 0.4) * scale)
@@ -1362,6 +1489,7 @@ func _detach_legs(proto: String, detach_want: int, limb_count: int, mesh_origin:
 			"proto": proto,
 			"is_leg": true,
 			"is_part": false,
+			"is_gleba": is_gleba,
 			"part_name": "",
 			"pos": leg_world,
 			"com_local": Vector3.ZERO,
@@ -1382,6 +1510,115 @@ func _detach_legs(proto: String, detach_want: int, limb_count: int, mesh_origin:
 			"holes": [],
 		})
 		spawned += 1
+
+
+func _spawn_spider_legs(proto: String, live_parts: Array, mesh_origin: Vector3, quat: Quaternion,
+		torso_vel: Vector3, dir_xz: Vector3, mass: float, radius: float, scale: float,
+		blood: float, was_burning: bool, is_explosive: bool, is_heavy: bool, lite: bool) -> void:
+	if not api.creatures.has_method("make_ragdoll_part_nodes"):
+		return
+	var part_nodes: Array = api.creatures.make_ragdoll_part_nodes(proto) as Array
+	if part_nodes.is_empty():
+		return
+	var leg_active := 0
+	for b in _active:
+		if bool((b as Dictionary).get("is_leg", false)):
+			leg_active += 1
+	var max_want: int = 4 if lite else part_nodes.size()
+	var budget: int = mini(max_want, maxi(0, MAX_DETACHED_LEGS - leg_active))
+	if budget <= 0:
+		for pn_obj in part_nodes:
+			var pnode: Variant = (pn_obj as Dictionary).get("node", null)
+			if pnode is Node and is_instance_valid(pnode):
+				(pnode as Node).queue_free()
+		return
+
+	var indices: Array[int] = []
+	for k in part_nodes.size():
+		indices.append(k)
+	if budget < part_nodes.size():
+		for k in range(indices.size() - 1, 0, -1):
+			var sw: int = _rng.randi_range(0, k)
+			var tmp: int = indices[k]
+			indices[k] = indices[sw]
+			indices[sw] = tmp
+	var keep_set := {}
+	for k in budget:
+		keep_set[indices[k]] = true
+
+	var is_gleba: bool = _is_gleba(proto)
+	var inv_m: float = clampf(force_mul / maxf(mass * 0.35, 0.4), 0.5, 1.8)
+	var blast_mult: float = 1.35 if is_explosive else (1.05 if is_heavy else 0.55)
+	for idx in part_nodes.size():
+		var pd: Dictionary = part_nodes[idx] as Dictionary
+		var leg_node: MeshInstance3D = pd.get("node", null) as MeshInstance3D
+		if leg_node == null:
+			continue
+		if not keep_set.has(idx):
+			leg_node.queue_free()
+			continue
+		var centroid: Vector3 = pd.get("centroid", Vector3.ZERO) as Vector3
+		var leg_world: Vector3 = mesh_origin + (quat * centroid)
+		var leg_quat: Quaternion = quat
+		if idx < live_parts.size() and live_parts[idx] is Dictionary:
+			var lp: Dictionary = live_parts[idx] as Dictionary
+			var xf_var: Variant = lp.get("xform", null)
+			if xf_var is Transform3D:
+				var lxf: Transform3D = xf_var as Transform3D
+				leg_world = lxf * centroid
+				leg_quat = lxf.basis.orthonormalized().get_rotation_quaternion()
+
+		var radial := Vector3(leg_world.x - mesh_origin.x, 0.0, leg_world.z - mesh_origin.z)
+		if radial.length_squared() > 0.001:
+			radial = radial.normalized()
+		else:
+			var ra: float = _rng.randf_range(0.0, TAU)
+			radial = Vector3(cos(ra), 0.0, sin(ra))
+		var fling_dir: Vector3 = radial * 0.75 + dir_xz * 0.45 + Vector3(
+			_rng.randf_range(-0.3, 0.3), 0.0, _rng.randf_range(-0.3, 0.3))
+		if fling_dir.length_squared() > 0.001:
+			fling_dir = fling_dir.normalized()
+		else:
+			fling_dir = radial
+		var h_spd: float = _rng.randf_range(2.6, 6.2) * blast_mult * inv_m
+		var u_spd: float = _rng.randf_range(2.2, 5.4) * blast_mult * inv_m
+		var leg_vel: Vector3 = torso_vel * 0.5 + fling_dir * h_spd + Vector3.UP * u_spd
+		var leg_ang := Vector3(
+			_rng.randf_range(-8.0, 8.0),
+			_rng.randf_range(-6.0, 6.0),
+			_rng.randf_range(-8.0, 8.0)
+		) * blast_mult
+		var leg_blood: float = clampf(blood * 0.72, 0.25, 0.75)
+		_container.add_child(leg_node)
+		leg_node.transform = Transform3D(Basis(leg_quat), leg_world)
+		_apply_ragdoll_wounds(leg_node, leg_blood, [])
+		if was_burning:
+			_apply_ragdoll_burn(leg_node, 0.25)
+		_active.append({
+			"node": leg_node,
+			"proto": proto,
+			"is_leg": true,
+			"is_part": false,
+			"is_gleba": is_gleba,
+			"part_name": "",
+			"pos": leg_world,
+			"com_local": Vector3.ZERO,
+			"vel": leg_vel,
+			"quat": leg_quat,
+			"ang": leg_ang,
+			"scale": scale * 0.75,
+			"mass": maxf(mass * 0.14, 0.16),
+			"radius": clampf(radius * 0.28, 0.14, 0.48),
+			"half_h": clampf(0.22 * scale, 0.10, 0.38),
+			"age": 0.0,
+			"still": 0.0,
+			"grounded": false,
+			"burning": was_burning,
+			"burn_age": 0.0,
+			"flame_cd": 0.0,
+			"blood": leg_blood,
+			"holes": [],
+		})
 
 
 func _launch_dir(pos: Vector3, vel: Vector3, cause_pos: Variant) -> Vector3:
@@ -1520,6 +1757,14 @@ func _make_torso_hole_from_dir(incoming_world_xz: Vector3, has_cause: bool, yaw:
 		lx = clampf(local_dir.x * (1.35 * scale) + _rng.randf_range(-0.35, 0.35) * scale, -1.75 * scale, 1.75 * scale)
 		lz = clampf(local_dir.z * (1.35 * scale) + _rng.randf_range(-0.35, 0.35) * scale, -1.75 * scale, 1.75 * scale)
 		ly = _rng.randf_range(0.25 * scale, 1.45 * scale)
+	elif _is_wriggler(proto):
+		lx = clampf(local_dir.x * (0.35 * scale) + _rng.randf_range(-0.10, 0.10) * scale, -0.45 * scale, 0.45 * scale)
+		lz = clampf(local_dir.z * (0.35 * scale) + _rng.randf_range(-0.10, 0.10) * scale, -0.45 * scale, 0.45 * scale)
+		ly = _rng.randf_range(0.15 * scale, 0.60 * scale)
+	elif _is_strafer(proto) or _is_stomper(proto):
+		lx = clampf(local_dir.x * (0.95 * scale) + _rng.randf_range(-0.25, 0.25) * scale, -1.2 * scale, 1.2 * scale)
+		lz = clampf(local_dir.z * (0.95 * scale) + _rng.randf_range(-0.25, 0.25) * scale, -1.2 * scale, 1.2 * scale)
+		ly = _rng.randf_range(0.8 * scale, 2.6 * scale)
 	else:
 		lx = clampf(local_dir.x * (0.42 * scale) + _rng.randf_range(-0.14, 0.14) * scale, -0.46 * scale, 0.46 * scale)
 		lz = clampf(-0.05 * scale + local_dir.z * (0.92 * scale) + _rng.randf_range(-0.26, 0.26) * scale, -1.32 * scale, 1.22 * scale)
@@ -1546,12 +1791,12 @@ func _lookup_live_yaw(unit: int) -> float:
 	if _clock - _last_yaw_refresh >= LIVE_YAW_REFRESH:
 		_last_yaw_refresh = _clock
 		_live_yaw.clear()
-		for fam in ["biter", "spitter"]:
+		for fam in ["biter", "spitter", "wriggler"]:
 			var live: Array = api.creatures.list_live(str(fam)) as Array
 			for item in live:
 				var entry: Dictionary = item as Dictionary
 				var proto: String = str(entry.get("name", ""))
-				if not (proto.ends_with("-biter") or proto.ends_with("-spitter")):
+				if not (proto.ends_with("-biter") or proto.ends_with("-spitter") or _is_wriggler(proto)):
 					continue
 				var u: int = int(entry.get("unit", 0))
 				if u != 0:

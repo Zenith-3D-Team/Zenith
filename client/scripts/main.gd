@@ -93,6 +93,7 @@ const GuiAssets := preload("res://scripts/ui/factorio/gui_assets.gd")
 const QualityMarks := preload("res://scripts/world/quality_marks.gd")
 const NightVisionOverlay := preload("res://scripts/ui/night_vision_overlay.gd")
 const AltArrows := preload("res://scripts/world/alt_arrows.gd")
+const StopLabels := preload("res://scripts/world/stop_labels.gd")
 const SunShadows := preload("res://scripts/world/sun_shadows.gd")
 const AddonHost := preload("res://scripts/addons/addon_host.gd")
 const InterfaceState := preload("res://scripts/ui/interface_state.gd")
@@ -132,6 +133,9 @@ const PLANET_COLORS := {
 static var planet_clouds_old := Switches.has("--planet-clouds=old")
 ## True once `scenes/boot.tscn` (`boot.gd`) already ran `ShaderRefresh` and staged warm-up.
 static var booted_from_screen := false
+## True when `boot.gd` lowered process priority for safe cold shader compilation; `Main._ready()` restores it.
+static var boot_priority_lowered := false
+static var boot_priority_was := ""
 const PLANET_CLOUDS := {
 	"nauvis": {"cover": Vector4(0.6, 1.0, 0.88, 0.55), "tint": Vector4(1.12, 1.12, 1.15, 1.0), "style": Vector4(0.4, 0.006, 0.9, 0.45)},
 	"vulcanus": {"cover": Vector4(0.42, 0.9, 0.78, 0.6), "tint": Vector4(0.88, 0.85, 0.82, 0.3), "style": Vector4(0.35, 0.008, 1.0, 0.4)},
@@ -281,6 +285,11 @@ func _ready() -> void:
 	Settings.reload_factorio_settings()
 	Settings.apply_startup(DisplayServer.window_get_size().y)
 	Settings.apply_window(get_tree().root)
+	_restore_boot_priority()
+	# --upscaler=<name> given: say what draws (apply_window does the same in a window; headless it returns first),
+	# e.g. --upscaler=dlss without the player's OK for NVIDIA's updater -> FSR 3.1 / 2.2 and why (upscalers.gd).
+	if Settings.arg_value("--upscaler=") != "":
+		print("Upscaling: --upscaler=%s asked, %s draws" % [Settings.arg_value("--upscaler="), Settings.upscaler_in_effect()])
 	FxSettings.load_settings()
 	# Movers (the character, vehicles, creatures, robots) lifted whole onto the hills, by the ground under
 	# their origin, so they don't bend over a cliff's step (factorio_material.gdshaderinc ground_rigid);
@@ -549,6 +558,11 @@ func start_game() -> void:
 			quitter.main = self
 			quitter.seconds = float(arg.get_slice("=", 1))
 			add_child(quitter)
+		elif arg == "--mem-log" or arg.begins_with("--mem-log="):
+			var mem_log: Node = preload("res://scripts/debug/mem_log.gd").new()
+			if arg.contains("="):
+				mem_log.every = maxf(1.0, float(arg.get_slice("=", 1)))
+			add_child(mem_log)
 		elif arg.begins_with("--soak-probe="):
 			var soak: Node = preload("res://scripts/debug/soak_probe.gd").new()
 			var spec := arg.get_slice("=", 1).split("@")
@@ -654,6 +668,7 @@ func start_game() -> void:
 	avatar.name = "Avatar"
 	avatar.world = world  # the belt step-up's stand height (stand_height.gd)
 	_game.add_child(avatar)
+	movers.avatar = avatar
 
 	combat = CombatLayer.new()
 	combat.name = "Combat"
@@ -732,6 +747,12 @@ func start_game() -> void:
 	alt_arrows.alt_mode = hud.ui.alt_mode
 	hud.ui.alt_mode_changed.connect(func(on: bool) -> void: alt_arrows.alt_mode = on)
 	_game.add_child(alt_arrows)
+	var stop_labels := StopLabels.new()
+	stop_labels.name = "StopLabels"
+	stop_labels.world = world
+	stop_labels.alt_mode = hud.ui.alt_mode
+	hud.ui.alt_mode_changed.connect(func(on: bool) -> void: stop_labels.alt_mode = on)
+	_game.add_child(stop_labels)
 
 	platform_panel = PlatformPanel.new()
 	platform_panel.name = "PlatformPanel"
@@ -1236,6 +1257,23 @@ func _apply_priority() -> void:
 		% ("below normal" if want else "back to normal"))
 
 
+func _restore_boot_priority() -> void:
+	if not boot_priority_lowered:
+		return
+	boot_priority_lowered = false
+	if boot_priority_was != "" and _priority_was == "":
+		_priority_was = boot_priority_was
+	boot_priority_was = ""
+	if DisplayServer.get_name() == "headless":
+		return
+	_priority_low = false
+	if OS.get_name() == "Windows":
+		if _priority_job.is_empty():
+			_set_priority_windows()
+		return
+	OS.create_process("renice", ["-n", "0", "-p", str(OS.get_process_id())], false)
+
+
 ## Asks Windows for the priority class _priority_low says, then again if the setting changed meanwhile.
 func _set_priority_windows() -> void:
 	var low := _priority_low
@@ -1318,6 +1356,9 @@ func _on_welcome(msg: Dictionary) -> void:
 		distant_horizon.configure(sid, maxi(1, int(msg.get("si", 1))), null)
 	world.replay_dec = decoratives.handle
 	movers.reset()
+	if hud != null:
+		hud.ui.model.robot_cargo.clear()
+		hud.ui.model.robot_cargo_rev += 1
 	belt_items.reset()
 	_early_bs.clear()
 	belt_lanes.reset()
@@ -1373,6 +1414,9 @@ func _on_surface(msg: Dictionary) -> void:
 	if distant_horizon != null:
 		distant_horizon.reset_surface(maxi(1, int(msg.get("si", 1))), world.protos if Bridge.world_ready else null, FarChunks._bakes)
 	movers.reset()
+	if hud != null:
+		hud.ui.model.robot_cargo.clear()
+		hud.ui.model.robot_cargo_rev += 1
 	belt_items.reset()
 	belt_lanes.reset()
 	ground_items.reset()
@@ -1398,6 +1442,7 @@ func _on_surface(msg: Dictionary) -> void:
 	var at := Vector2(int(msg.get("x", 0)), int(msg.get("y", 0))) / 256.0
 	# `view`: the remote view looks at another surface; the character stays where it is, unseen.
 	var viewing := int(msg.get("view", 0)) == 1
+	var was_viewing := _viewing_away
 	avatar.visible = not viewing
 	_viewing_away = viewing
 	if viewing:
@@ -1419,7 +1464,8 @@ func _on_surface(msg: Dictionary) -> void:
 	_set_space(pf > 0)
 	if not _space and hud.ui.model.shown_surface() == world.surface_index:
 		pollution.sync_map_pollution(hud.ui.model.map_pollution)
-	hud.show_message("Now on %s" % (str(msg.get("surface", "?")) if pf > 0 else LocaleNames.space_location(str(msg.get("planet", msg.get("surface", "?"))))))
+	if not (was_viewing and not viewing and hud.ui.map_open()):
+		hud.show_message("Now on %s" % (str(msg.get("surface", "?")) if pf > 0 else LocaleNames.space_location(str(msg.get("planet", msg.get("surface", "?"))))))
 
 
 func _on_map_pollution_changed(chunk: Vector2i) -> void:
@@ -1625,6 +1671,7 @@ func _process(delta: float) -> void:
 	var char_focus := rig.focus_point()
 	var cam_lod := ViewPriority.lod_by_camera(rig)
 	world.set_focus(char_focus)
+	movers.avatar_pos = avatar.position
 	# Gates open for the character, not for the focus an add-on's camera moves (anim.gd, --gate-open=old).
 	world.animator.character_at = avatar.ground_position() if avatar.unit != 0 and not _viewing_away else Vector2.INF
 	world.lod_by_camera = cam_lod
@@ -1637,8 +1684,11 @@ func _process(delta: float) -> void:
 	# Factorio's remote view: dark fog where no radar sees, and nothing drawn there.
 	world.set_remote_view(hud.ui.remote)
 	remote_fog.update(hud.ui.remote, char_focus)
+	var tm := Time.get_ticks_usec() if Probing.on else 0  # (--stutter-probe: main_* parts in world.gd's prof)
 	_update_sky(delta)
+	tm = _main_prof("main_sky", tm)
 	_update_planet(delta)
+	tm = _main_prof("main_planet", tm)
 	_sync_sky_view()
 	var atmo := _planet_sky.atmosphere()
 	var look_clouds := looks.cloud_source()
@@ -1647,8 +1697,11 @@ func _process(delta: float) -> void:
 	atmo["ambient_color"] = _env.ambient_light_color if _env != null else Color(0.75, 0.78, 0.82)
 	atmo["space"] = _space
 	atmo["scene_light"] = looks.scene_now
+	tm = _main_prof("main_sky", tm)
 	pollution.update(char_focus, _sky_darkness, delta, atmo)
+	tm = _main_prof("main_pollution", tm)
 	god_rays.update(atmo, pollution.strength())
+	tm = _main_prof("main_godrays", tm)
 	if distant_horizon != null:
 		distant_horizon.set_pollution_far(pollution.far_texture(), pollution.far_rect(), pollution.far_version())
 		if Bridge.world_ready and distant_horizon.enabled and distant_horizon.radius_chunks > 0:
@@ -1674,15 +1727,27 @@ func _process(delta: float) -> void:
 				and not (dh_vp != null and dh_vp.use_xr)
 		distant_horizon.update(dh_cam, _env.background_color, dh_night, _space,
 			Vector3.INF if cam_lod else Vector3(char_focus.x, 0.0, char_focus.y), dh_hide_ok)
+	tm = _main_prof("main_dh", tm)
 	_status_timer += delta
 	if _status_timer >= 0.5:
 		_update_status(_status_timer)
 		_status_timer = 0.0
+	tm = _main_prof("main_status", tm)
 	# Headless runs have no HUD to look at, so the status goes to stdout instead.
 	_log_timer += delta
 	if _headless and _log_timer >= 5.0:
 		_log_timer = 0.0
 		print(hud.status.text.replace("\n", " | "))
+
+
+## (--stutter-probe, Probing.on) The time since `t0` to world.gd's prof as `key` (the spike log's parts);
+## returns now, the next part's start.
+func _main_prof(key: String, t0: int) -> int:
+	if not Probing.on or world == null:
+		return 0
+	if t0 > 0:  # (0: the probe started part-way through this frame)
+		world._prof(key, t0)
+	return Time.get_ticks_usec()
 
 
 ## --ups-overlay[=note]: the game's UPS (as the F4 line measures it) in big bold type at the top left, for recording

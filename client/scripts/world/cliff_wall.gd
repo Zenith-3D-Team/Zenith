@@ -27,6 +27,7 @@ const ModelLods := preload("res://scripts/world/model_lods.gd")
 const GroundHeight := preload("res://scripts/world/ground_height.gd")
 const FrameBudget := preload("res://scripts/world/frame_budget.gd")
 const Switches := preload("res://scripts/switches.gd")
+const ViewAhead := preload("res://scripts/world/view_ahead.gd")
 
 ## The wall instead of the pieces: on by default (the setting, set_on()); `--cliff-wall=off` gives the
 ## pieces whatever the setting says, `--cliff-wall=on` the wall.
@@ -354,7 +355,9 @@ static func _install(job: Job) -> void:
 static func _update(camera: Camera3D) -> void:
 	if _drawn.is_empty():
 		return
-	var at := camera.global_position if camera != null else Vector3.INF
+	var cam_at := camera.global_position if camera != null else Vector3.INF
+	var at := cam_at
+	var ahead := ViewAhead.active()
 	var scale := maxf(ModelLods.distance_scale, 0.05)
 	for st: State in _drawn.keys():
 		var cv = _drawn[st]
@@ -369,6 +372,8 @@ static func _update(camera: Camera3D) -> void:
 			continue
 		var level := 0
 		if at != Vector3.INF:
+			# The nearer of the camera and a viewpoint announced ahead (view_ahead.gd): ready before a cut.
+			at = ViewAhead.nearest(cam_at, st.aabb.position, st.aabb.end) if ahead else cam_at
 			var near := Vector3(clampf(at.x, st.aabb.position.x, st.aabb.end.x), clampf(at.y, st.aabb.position.y, st.aabb.end.y),
 				clampf(at.z, st.aabb.position.z, st.aabb.end.z))
 			var d := at.distance_to(near) / scale

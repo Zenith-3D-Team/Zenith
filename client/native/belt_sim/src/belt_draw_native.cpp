@@ -596,13 +596,25 @@ bool BeltDrawNative::_stand_dropped(Item *it, i64 now) {
 void BeltDrawNative::_apply_changes(const Dictionary &ch) {
 	PackedInt64Array uids = ch["uid"];
 	puts.clear();
+	put_show.clear();
 	if (ch.has("hand_why")) {
 		PackedInt32Array hw = ch["hand_why"];
 		PackedInt64Array hu = ch["hand_uid"];
 		PackedInt64Array ht = ch["hand_tick"];
+		PackedInt64Array hi = ch.has("hand_ins") ? (PackedInt64Array)ch["hand_ins"] : PackedInt64Array();
 		for (int64_t j = 0; j < hw.size(); j++) {
 			if (hw[j] == 3) {
-				puts[hu[j]] = ht[j];
+				i64 uid = hu[j];
+				i64 pt = ht[j];
+				puts[uid] = pt;
+				i64 st = pt;
+				if (drop_glide && (j >= hi.size() || hi[j] == 0)) {
+					auto hf = drop_handoffs.find(uid);
+					if (hf != drop_handoffs.end()) {
+						st = hf->second;
+					}
+				}
+				put_show[uid] = st;
 			}
 		}
 	}
@@ -961,9 +973,37 @@ void BeltDrawNative::_ask_mismatches(const Dictionary &ch) {
 	}
 }
 
-void BeltDrawNative::_go_or_hold(i64 uid, i64 t, i64 now, std::unordered_set<i64> &held) {
-	if (t > now && !dropped.empty()) {
+void BeltDrawNative::_purge_waiting(i64 uid, std::unordered_set<i64> *held) {
+	if (later_tick) {
+		auto wf = waiting.find(uid);
+		if (wf != waiting.end()) {
+			later_n -= (i64)(wf->second.q.size() - wf->second.head);
+			waiting.erase(wf);
+		}
 		Item **pit = items.get(uid);
+		if (pit != nullptr) {
+			(*pit)->waits = false;
+		}
+	} else {
+		if (held != nullptr) {
+			held->erase(uid);
+		}
+		if (!later.empty()) {
+			later.erase(std::remove_if(later.begin(), later.end(),
+					[uid](const Later &e) { return e.uid == uid; }), later.end());
+			later_n = (i64)later.size();
+		}
+	}
+}
+
+void BeltDrawNative::_go_or_hold(i64 uid, i64 t, i64 now, std::unordered_set<i64> &held) {
+	Item **pit = items.get(uid);
+	if (removed_now && (brm_gone.count(uid) || (pit != nullptr && rm_set.count((*pit)->lane)))) {
+		_purge_waiting(uid, &held);
+		_go(uid);
+		return;
+	}
+	if (t > now && !dropped.empty()) {
 		if (pit != nullptr && dropped.count((*pit)->lane)) {
 			t = now;
 		}
@@ -988,7 +1028,8 @@ void BeltDrawNative::_go(i64 uid) {
 	Vector3 at = _at(it, fold_tick);
 	Vector3 sq = square;
 	bool outside = sq.z >= 0.0f && (std::fabs((double)at.x - (double)sq.x) > (double)sq.z || std::fabs((double)at.z - (double)sq.y) > (double)sq.z);
-	if ((dropped.count(it->lane) || outside) && far_given) {
+	bool keep_far = removed_now ? outside : (dropped.count(it->lane) || outside);
+	if (keep_far && !(removed_now && (brm_gone.count(uid) || rm_set.count(it->lane))) && far_given) {
 		int cx = (int)std::floor((double)at.x / 32.0);
 		int cz = (int)std::floor((double)at.z / 32.0);
 		if (!far_built.count(_chunk_key(cx, cz))) {
@@ -1009,6 +1050,182 @@ void BeltDrawNative::_go(i64 uid) {
 	_remove(uid);
 }
 
+void BeltDrawNative::_brm_cleanup() {
+	if (!removed_now || rm_set.empty()) {
+		return;
+	}
+	struct Tile {
+		int x, z;
+	};
+	std::vector<Tile> rm_tiles;
+	std::unordered_set<i64> rm_tile_keys;
+	for (i64 key : rm_set) {
+		auto lf = lanes.find(key);
+		if (lf == lanes.end()) {
+			continue;
+		}
+		const int32_t *m = lf->second.m;
+		double mx = (double)(m[3] + m[7]) / 512.0;
+		double mz = (double)(m[4] + m[8]) / 512.0;
+		double cx = (double)m[5] / 256.0;
+		double cz = (double)m[6] / 256.0;
+		for (auto [px, pz] : { std::make_pair(mx, mz), std::make_pair(cx, cz) }) {
+			int tx = (int)std::floor(px);
+			int tz = (int)std::floor(pz);
+			i64 tk = _chunk_key(tx, tz);
+			if (rm_tile_keys.insert(tk).second) {
+				rm_tiles.push_back(Tile{ tx, tz });
+			}
+		}
+	}
+	auto in_rm_tile = [&](double x, double z) -> bool {
+		int tx = (int)std::floor(x);
+		int tz = (int)std::floor(z);
+		if (!rm_tile_keys.count(_chunk_key(tx, tz))) {
+			return false;
+		}
+		return x > (double)tx + 0.002 && x < (double)tx + 0.998 && z > (double)tz + 0.002 && z < (double)tz + 0.998;
+	};
+	auto clip_seg = [&](double p0x, double p0z, double p1x, double p1z) -> double {
+		double dx = p1x - p0x;
+		double dz = p1z - p0z;
+		double best = 2.0;
+		for (const Tile &t : rm_tiles) {
+			double x0 = (double)t.x + 0.002;
+			double x1 = (double)t.x + 0.998;
+			double z0 = (double)t.z + 0.002;
+			double z1 = (double)t.z + 0.998;
+			double tmin = 0.0;
+			double tmax = 1.0;
+			if (std::fabs(dx) < 1e-9) {
+				if (p0x < x0 || p0x > x1) {
+					continue;
+				}
+			} else {
+				double a = (x0 - p0x) / dx;
+				double b = (x1 - p0x) / dx;
+				if (a > b) {
+					std::swap(a, b);
+				}
+				tmin = std::max(tmin, a);
+				tmax = std::min(tmax, b);
+				if (tmin > tmax) {
+					continue;
+				}
+			}
+			if (std::fabs(dz) < 1e-9) {
+				if (p0z < z0 || p0z > z1) {
+					continue;
+				}
+			} else {
+				double a = (z0 - p0z) / dz;
+				double b = (z1 - p0z) / dz;
+				if (a > b) {
+					std::swap(a, b);
+				}
+				tmin = std::max(tmin, a);
+				tmax = std::min(tmax, b);
+				if (tmin > tmax) {
+					continue;
+				}
+			}
+			if (tmin >= 0.0 && tmin <= 1.0) {
+				best = std::min(best, tmin);
+			}
+		}
+		return best;
+	};
+	std::vector<i64> uids = items.key_list();
+	for (i64 uid : uids) {
+		Item **pit = items.get(uid);
+		if (pit == nullptr) {
+			continue;
+		}
+		Item *it = *pit;
+		if (rm_set.count(it->lane)) {
+			_purge_waiting(uid);
+			_remove(uid);
+			continue;
+		}
+		if (it->parked || kept.has(it) || rm_tiles.empty()) {
+			continue;
+		}
+		Vector3 at = _at(it, fold_tick);
+		if (in_rm_tile((double)at.x, (double)at.z)) {
+			_purge_waiting(uid);
+			_remove(uid);
+			continue;
+		}
+		if (it->t_to <= fold_tick) {
+			continue;
+		}
+		if (it->path.empty()) {
+			if (it->step == Vector3()) {
+				continue;
+			}
+			double g0 = it->t_to <= it->t_from ? 0.0 : clampd((fold_tick - it->t_from) / (it->t_to - it->t_from), 0.0, 1.0);
+			Vector3 p0 = it->from + it->step * (float)g0;
+			Vector3 p1 = it->from + it->step;
+			double s = clip_seg((double)p0.x, (double)p0.z, (double)p1.x, (double)p1.z);
+			if (s <= 1.0) {
+				double g_hit = g0 + s * (1.0 - g0);
+				double t_hit = it->t_from + (it->t_to - it->t_from) * g_hit;
+				if (g_hit <= 0.0001 || t_hit <= fold_tick) {
+					it->from = at;
+					it->step = Vector3();
+					it->t_from = fold_tick;
+					it->t_to = fold_tick;
+				} else {
+					it->step = it->step * (float)g_hit;
+					it->t_to = t_hit;
+				}
+				it->renew = -1.0;
+				renewing.erase(it);
+				_mark(it);
+				_touch(it);
+			}
+		} else {
+			int n_pts = (int)(it->path.size() / 4);
+			if (n_pts < 2) {
+				continue;
+			}
+			double g0 = it->t_to <= it->t_from ? 0.0 : clampd((fold_tick - it->t_from) / (it->t_to - it->t_from), 0.0, 1.0);
+			for (int j = 0; j < n_pts - 1; j++) {
+				double sg1 = (double)(j + 1) / (double)(n_pts - 1);
+				if (sg1 <= g0) {
+					continue;
+				}
+				double sg0 = std::max(g0, (double)j / (double)(n_pts - 1));
+				Vector3 q0 = _at(it, it->t_from + (it->t_to - it->t_from) * sg0);
+				Vector3 q1 = _at(it, it->t_from + (it->t_to - it->t_from) * sg1);
+				double s = clip_seg((double)q0.x, (double)q0.z, (double)q1.x, (double)q1.z);
+				if (s <= 1.0) {
+					double g_hit = sg0 + s * (sg1 - sg0);
+					Vector3 p_hit = q0 + (q1 - q0) * (float)s;
+					double t_hit = it->t_from + (it->t_to - it->t_from) * g_hit;
+					it->from = at;
+					if (g_hit <= g0 + 0.0001 || t_hit <= fold_tick) {
+						it->step = Vector3();
+						it->t_to = fold_tick;
+					} else {
+						it->step = p_hit - at;
+						it->t_to = t_hit;
+					}
+					it->t_from = fold_tick;
+					it->path.clear();
+					pathed.erase(it);
+					_free_path(it);
+					it->renew = -1.0;
+					renewing.erase(it);
+					_mark(it);
+					_touch(it);
+					break;
+				}
+			}
+		}
+	}
+}
+
 // belt_items.gd's _apply_early: a change after the drawn tick taken now when nothing shows early (a start
 // of a standing item, or a continuation of a moving item's record across a line's end). Not taken only for
 // want of time (a start whose item stands there from a later tick): `retry_at` says that tick.
@@ -1016,7 +1233,8 @@ bool BeltDrawNative::_apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos
 		i64 *retry_at) {
 	Item **pit = items.get(uid);
 	if (pit == nullptr) {
-		// (--inserter-handoff) An item a hand puts on its belt: made now, hidden till the put's tick.
+		// (--inserter-handoff / --belt-drop-glide) An item a hand or Z-drop puts on its belt:
+		// made now, hidden till the put's (or Z-drop glide handoff's) tick.
 		auto pf = puts.find(uid);
 		if (pf == puts.end() || pf->second != t0) {
 			return false;
@@ -1024,7 +1242,8 @@ bool BeltDrawNative::_apply_early(i64 uid, i64 item, i64 stack, i64 key, i64 pos
 		_apply_one(uid, item, stack, key, pos, t0, v, reach, run);
 		Item **nit = items.get(uid);
 		if (nit != nullptr) {
-			(*nit)->show_at = (double)t0;
+			auto sf = put_show.find(uid);
+			(*nit)->show_at = sf != put_show.end() ? (double)sf->second : (double)t0;
 			_mark(*nit);
 		}
 		early_n++;
@@ -1191,6 +1410,21 @@ void BeltDrawNative::_apply_one(i64 uid, i64 item, i64 stack, i64 key, i64 pos, 
 	it->reach = reach;
 	it->run = run;
 	_touch(it);
+	if (fresh_item) {
+		double st = -1.0;
+		auto sf = put_show.find(uid);
+		if (sf != put_show.end()) {
+			st = (double)sf->second;
+		} else if (drop_glide) {
+			auto hf = drop_handoffs.find(uid);
+			if (hf != drop_handoffs.end()) {
+				st = (double)hf->second;
+			}
+		}
+		if (st > fold_tick) {
+			it->show_at = st;
+		}
+	}
 	int why = _hide_why(key, pos, reach, v);
 	if (why != 0) {
 		if (!it->parked) {
@@ -1905,7 +2139,7 @@ void BeltDrawNative::_records(const std::vector<SlotRef> &batch, int writing) {
 			s = std::sin(a);
 		}
 		double code = 0.0;
-		if (it->hidden) {
+		if (it->hidden || (it->hide_at >= 0.0 && it->show_at >= 0.0 && it->hide_at <= it->show_at)) {
 			code = (double)HIDDEN;
 		} else if (!it->path.empty()) {
 			code = it->code;
@@ -2026,6 +2260,43 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	turn_id = (bool)params.get("turn_id", false);
 	ask_mode = (int)params.get("ask", 0);
 	ask_near = (bool)params.get("ask_near", true);
+	removed_now = (bool)params.get("removed_now", true);
+	drop_glide = (bool)params.get("drop_glide", true);
+	drop_handoffs.clear();
+	if (drop_glide && params.has("drop_handoff_uid") && params.has("drop_handoff_tick")) {
+		PackedInt64Array dhu = params["drop_handoff_uid"];
+		PackedInt64Array dht = params["drop_handoff_tick"];
+		int64_t dn = std::min(dhu.size(), dht.size());
+		for (int64_t j = 0; j < dn; j++) {
+			drop_handoffs[dhu[j]] = dht[j];
+		}
+	}
+	if (params.has("drop_cancel_uid")) {
+		PackedInt64Array dcu = params["drop_cancel_uid"];
+		for (int64_t j = 0; j < dcu.size(); j++) {
+			i64 uid = dcu[j];
+			drop_handoffs.erase(uid);
+			Item **pit = items.get(uid);
+			if (pit != nullptr && (*pit)->show_at >= 0.0) {
+				(*pit)->show_at = -1.0;
+				_mark(*pit);
+			}
+		}
+	}
+	rm_set.clear();
+	brm_gone.clear();
+	if (removed_now) {
+		PackedInt64Array rmk = params.get("rm_keys", PackedInt64Array());
+		for (i64 i = 0; i < rmk.size(); i++) {
+			rm_set.insert(rmk[i]);
+		}
+		if (ch.has("brm_gone")) {
+			PackedInt64Array bg = ch["brm_gone"];
+			for (i64 i = 0; i < bg.size(); i++) {
+				brm_gone.insert(bg[i]);
+			}
+		}
+	}
 	// The kinds' looks and the far icons' chunks are given only when they changed (belt_items.gd, A4):
 	// otherwise those of the last job stand.
 	known_given = params.has("known");
@@ -2078,6 +2349,7 @@ Dictionary BeltDrawNative::run_job(const Dictionary &ch, const Dictionary &param
 	PackedInt64Array lat_del = params.get("lat_del", PackedInt64Array());
 	_relattice(lat_add, lat_del, graph_now);
 	_apply_changes(ch);
+	_brm_cleanup();
 	// (--inserter-handoff) belt_items.gd Job._hands: an item a take still to come was guessed to take (peek)
 	// and a taken item's record hide on the take's tick; a guess the take didn't make is shown again.
 	// (Only a take after the drawn tick hides a record: belt_items.gd Job._hands.)
@@ -2433,5 +2705,6 @@ void BeltDrawNative::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("has_item", "uid"), &BeltDrawNative::has_item);
 	ClassDB::bind_method(D_METHOD("key_of", "uid"), &BeltDrawNative::key_of);
 	ClassDB::bind_method(D_METHOD("hide_of", "uid"), &BeltDrawNative::hide_of);
+	ClassDB::bind_method(D_METHOD("show_of", "uid"), &BeltDrawNative::show_of);
 	ClassDB::bind_method(D_METHOD("stats"), &BeltDrawNative::stats);
 }

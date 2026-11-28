@@ -35,6 +35,10 @@ extends RefCounted
 
 const Switches := preload("res://scripts/switches.gd")
 const Wire := preload("res://scripts/util/wire.gd")
+const RenderReads := preload("res://scripts/world/render_reads.gd")
+## `--rocket-vfx=old`: restores legacy sprite-card rocket launch VFX, legacy diagonal door slide,
+## and disables the circular terrain cutout / 3D launch shaft.
+static var rocket_vfx_enhanced: bool = Switches.on("--rocket-vfx")
 
 ## Prototype name prefix -> [prototype whose model to use, colour for its tier_paint]. Each colour
 ## is the paint's median in that tier's own sprite sheet, picked the way the yellow tier's part
@@ -125,10 +129,39 @@ const CYCLES := {
 	"gear_bmd_r_ns": {"axis": Vector3(0, 0, 1), "angle": -TAU * 0.25 * 0.17 / 0.13, "period": 2.133, "wave": "swing"},
 	"gear_bmd_r_ew": {"axis": Vector3(1, 0, 0), "angle": -TAU * 0.25 * 0.17 / 0.13, "period": 2.133, "wave": "swing"},
 	"slide_bmd_rod": {"slide": Vector3(0, 0.06, 0), "period": 1.067},
-	# Assembling machine 1, 64 frames at 1: its two meshing gears. Oil refinery, 40 and 20 frames
-	# at 0.75: three gears (speeds by radius) and the rocking yoke.
+	# Assembling machine 1, 64 frames at 1: dual central gears, SW spoked gear, west fan, NW rocker, east stamper, NE sprocket, north crosshead (plus Wube3DP gears).
+	"am1_gear_cw": {"axis": Vector3.UP, "angle": TAU, "period": 1.067, "wave": "spin"},
+	"am1_gear_ce": {"axis": Vector3.UP, "angle": -TAU * 1.2, "period": 1.067, "wave": "spin"},
+	"am1_gear_sw": {"axis": Vector3(0.819152, 0.0, 0.573576), "angle": TAU, "period": 1.067, "wave": "spin"},
+	"am1_fan_w": {"axis": Vector3.UP, "angle": -TAU * 2.0, "period": 1.067, "wave": "spin"},
+	"am1_arm_nw": {"axis": Vector3(0.411509, 0.0, -0.911405), "angle": 0.42, "period": 1.067, "wave": "swing"},
+	"am1_press_e": {"slide": Vector3(0, -0.28, 0), "period": 1.067},
+	"am1_gear_ne": {"axis": Vector3(0.965926, 0.0, 0.258819), "angle": -TAU * 2.0, "period": 1.067, "wave": "spin"},
+	"am1_bar_n": {"slide": Vector3(0.26, 0, 0), "period": 1.067},
 	"gear_am1_w": {"axis": Vector3.UP, "angle": -TAU, "period": 1.067, "wave": "spin"},
 	"gear_am1_e": {"axis": Vector3.UP, "angle": TAU * 0.9, "period": 1.067, "wave": "spin"},
+	# Assembling machine 2: meshing front gears, central horizontal gear, west impeller, NW rocker, blue vertical press, SE piston, NE sprocket, north drive bar.
+	"am2_gear_swa": {"axis": Vector3(0.819152, 0.0, 0.573576), "angle": TAU, "period": 1.067, "wave": "spin"},
+	"am2_gear_swb": {"axis": Vector3(0.819152, 0.0, 0.573576), "angle": -TAU * 0.29 / 0.24, "period": 1.067, "wave": "spin"},
+	"am2_gear_c": {"axis": Vector3.UP, "angle": TAU, "period": 1.067, "wave": "spin"},
+	"am2_fan_w": {"axis": Vector3.UP, "angle": -TAU * 2.0, "period": 1.067, "wave": "spin"},
+	"am2_arm_nw": {"axis": Vector3(0.434873, 0.0, -0.900492), "angle": 0.42, "period": 1.067, "wave": "swing"},
+	"am2_press_e": {"slide": Vector3(0, -0.30, 0), "period": 1.067},
+	"am2_piston_se": {"axis": Vector3(-0.768221, 0.0, 0.640184), "angle": 0.38, "period": 1.067, "wave": "swing", "phase": 0.25},
+	"am2_sprocket_ne": {"axis": Vector3(0.965926, 0.0, 0.258819), "angle": -TAU * 2.0, "period": 1.067, "wave": "spin"},
+	"am2_bar_n": {"slide": Vector3(0.30, 0, 0), "period": 1.067},
+	# Assembling machine 3: meshing front gears, front-center arch gear, central horizontal gear, west impeller, green press turret, SE stamp, NW/NE crank arms, NE sprocket.
+	"am3_gear_swa": {"axis": Vector3(0.819152, 0.0, 0.573576), "angle": TAU, "period": 0.853, "wave": "spin"},
+	"am3_gear_swb": {"axis": Vector3(0.819152, 0.0, 0.573576), "angle": -TAU * 0.28 / 0.25, "period": 0.853, "wave": "spin"},
+	"am3_gear_sc": {"axis": Vector3(0, 0, 1), "angle": TAU, "period": 0.853, "wave": "spin"},
+	"am3_gear_c": {"axis": Vector3.UP, "angle": -TAU, "period": 0.853, "wave": "spin"},
+	"am3_fan_w": {"axis": Vector3.UP, "angle": -TAU * 2.0, "period": 0.853, "wave": "spin"},
+	"am3_press_e": {"slide": Vector3(0, -0.32, 0), "period": 0.853},
+	"am3_stamp_se": {"slide": Vector3(0, -0.34, 0), "period": 0.853, "phase": 0.5},
+	"am3_arm_nw": {"axis": Vector3(0.371391, 0.0, -0.928477), "angle": 0.46, "period": 0.853, "wave": "swing"},
+	"am3_arm_ne": {"axis": Vector3(0.175791, 0.0, 0.984428), "angle": 0.42, "period": 0.853, "wave": "swing", "phase": 0.5},
+	"am3_sprocket_ne": {"axis": Vector3(0.965926, 0.0, 0.258819), "angle": -TAU * 2.0, "period": 0.853, "wave": "spin"},
+	# Oil refinery, 40 and 20 frames at 0.75: three gears (speeds by radius) and the rocking yoke.
 	"gear_refinery_a": {"axis": Vector3(0, 0, 1), "angle": TAU, "period": 0.889, "wave": "spin"},
 	"gear_refinery_b": {"axis": Vector3(0, 0, 1), "angle": -TAU * 0.2 / 0.15, "period": 0.889, "wave": "spin"},
 	"gear_refinery_c": {"axis": Vector3(0, 0, 1), "angle": -TAU * 0.2 / 0.13, "period": 0.889, "wave": "spin"},
@@ -185,8 +218,8 @@ const HATCHES := {
 	"lid_hub_lower_ne": {"axis": Vector3(0.7071, 0, 0.7071), "angle": 1.2, "types": ["cargo-pod"], "reach": 5.0, "time": 0.35},
 	"lid_hub_lower_sw": {"axis": Vector3(-0.7071, 0, -0.7071), "angle": 1.2, "types": ["cargo-pod"], "reach": 5.0, "time": 0.35},
 	"lid_pad": {"axis": Vector3(-0.7071, 0, -0.7071), "angle": 1.6, "types": ["cargo-pod"], "reach": 5.0, "time": 0.35},
-	"door_silo_e": {"slide": Vector3(2.3, -0.1, -0.95), "types": ["rocket-silo-rocket"], "reach": 2.0, "time": 4.25},
-	"door_silo_w": {"slide": Vector3(-2.3, -0.1, 0.95), "types": ["rocket-silo-rocket"], "reach": 2.0, "time": 4.25},
+	"door_silo_e": {"slide": Vector3(2.75, -0.14, 0.0), "types": ["rocket-silo-rocket"], "reach": 2.0, "time": 4.25},
+	"door_silo_w": {"slide": Vector3(-2.75, -0.14, 0.0), "types": ["rocket-silo-rocket"], "reach": 2.0, "time": 4.25},
 }
 ## Glow styles (factorio_material's glow_* uniforms) by `anim_glow_<style>` node name. Emissive
 ## materials whose name says fire, flame or molten flicker as "fire".
@@ -253,7 +286,7 @@ class AnimPart:
 			var hi := -INF
 			if mesh is ArrayMesh:
 				for i in mesh.get_surface_count():
-					for v: Vector3 in mesh.surface_get_arrays(i)[Mesh.ARRAY_VERTEX]:
+					for v: Vector3 in RenderReads.vertices(mesh, i):  # the CPU copy: no renderer read
 						lo = minf(lo, v.y)
 						hi = maxf(hi, v.y)
 			if lo > hi and mesh != null:
@@ -271,7 +304,7 @@ class AnimPart:
 			return Transform3D.IDENTITY
 		if slide != Vector3.ZERO:
 			return Transform3D(Basis.IDENTITY, slide * angle)
-		return pivot * Transform3D(Basis(axis, angle), Vector3.ZERO) * pivot.affine_inverse()
+		return pivot * Transform3D(Basis(axis.normalized(), angle), Vector3.ZERO) * pivot.affine_inverse()
 
 const ModelLods := preload("res://scripts/world/model_lods.gd")
 const MaterialRows := preload("res://scripts/world/material_rows.gd")
@@ -442,6 +475,7 @@ static var _parts := {}  # name -> Array of AnimPart (empty for models without m
 static var _glowing := {}  # Mesh -> true when it has surfaces that glow while working
 static var _rigs := {}  # name -> an inserter rig's parts and numbers (rig_for)
 static var _tops := {}  # name -> highest drawn Y (tiles) over body, moving parts and arm rig
+static var _silo_holes := {}  # rocket-silo model name -> Vector3(cx, cz, radius) in model space
 static var _factorio_cache := {}  # [imported material, has COLOR, UV2, CUSTOM0] -> ShaderMaterial
 
 
@@ -1072,6 +1106,12 @@ static func variant_pack(name: String) -> Dictionary:
 	var chosen := ModelPacks.choice(name)
 	if chosen != "":
 		return ModelPacks.pack(chosen)
+	var pref := ModelPacks.preferred_placeholder_pack(name)
+	if not pref.is_empty():
+		for p: Dictionary in ModelPacks.active():
+			if bool(p["replaces"]) and not ModelPacks.is_builtin(p) and ModelPacks.provides(p, name):
+				return p
+		return pref
 	for replacing in [true, false]:
 		for p: Dictionary in ModelPacks.active():
 			if bool(p["replaces"]) == replacing and ModelPacks.provides(p, name):
@@ -1380,6 +1420,48 @@ static func mesh_for_entity(proto_name: String, proto_type: String, extra: Dicti
 	return null
 
 
+## entity_ready, mesh_for_entity and parts_for_entity in one: [ready, Mesh or null, parts], from one
+## entity_models() call instead of three, kept per `generation` by the record's model names
+## (`--resolve-memo=off`: each asked as before; only a ready answer is kept, so a model made outside
+## poll() is never missed). perf-rd-world task 4a.
+static var resolve_memo := Switches.on("--resolve-memo")
+static var _resolved := {}  # "|"-joined entity_models() -> [true, Mesh or null, parts]
+static var _resolved_gen := -1
+const _NOT_READY := [false, null, []]
+
+
+static func resolve_entity(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> Array:
+	if not resolve_memo:
+		if not entity_ready(proto_name, proto_type, extra, dir):
+			return _NOT_READY
+		return [true, mesh_for_entity(proto_name, proto_type, extra, dir), parts_for_entity(proto_name, proto_type, extra, dir)]
+	var names := entity_models(proto_name, proto_type, extra, dir)
+	if _resolved_gen != generation:
+		_resolved.clear()
+		_resolved_gen = generation
+	var key: String = names[0] if names.size() == 1 else "|".join(names)
+	var hit: Variant = _resolved.get(key)
+	if hit != null:
+		return hit
+	var drawn := ""
+	for name: String in names:
+		if not ready(name):
+			return _NOT_READY
+		if _cache[name] != null:
+			drawn = name
+			break
+	var gen := generation
+	var out: Array = [true, null, []]
+	if drawn != "":
+		out[1] = mesh_for(drawn)
+		out[2] = parts_for(drawn)
+	else:
+		out[2] = parts_for(names[-1])
+	if gen == generation and _resolved_gen == gen:
+		_resolved[key] = out
+	return out
+
+
 ## The moving parts drawn with an entity record's mesh (mesh_for_entity).
 static func parts_for_entity(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> Array:
 	var names := entity_models(proto_name, proto_type, extra, dir)
@@ -1481,6 +1563,8 @@ static func _make(name: String) -> Mesh:
 			_rigs[name] = _rigs[alias]
 		if _tops.has(alias):
 			_tops[name] = _tops[alias]
+		if _silo_holes.has(alias):
+			_silo_holes[name] = _silo_holes[alias]
 		return drawn
 	var mesh: Mesh = null
 	var parts: Array = []
@@ -1519,6 +1603,19 @@ static func _make(name: String) -> Mesh:
 		mesh = _tier_variant(name)
 		parts = _parts.get(_tier_base(name), [])
 	if mesh != null:
+		if file == "rocket-silo":
+			var hole_spec := _compute_silo_hole_spec(parts)
+			_silo_holes[name] = hole_spec
+			if name != file and not _silo_holes.has(file):
+				_silo_holes[file] = hole_spec
+			if rocket_vfx_enhanced and mesh is ArrayMesh:
+				mesh = _strip_silo_pit_cap(mesh as ArrayMesh, hole_spec)
+				var s_mask := ContactShade.silo_mask_of(mesh as ArrayMesh, hole_spec)
+				if not s_mask.is_empty():
+					mesh.set_meta(ContactShade.MASK_META, ContactShade.commit_mask(s_mask))
+				var s_feet := ContactShade.silo_feet_of(mesh as ArrayMesh, hole_spec)
+				if not s_feet.is_empty():
+					mesh.set_meta(ContactShade.META, s_feet)
 		_setup_belt(mesh as ArrayMesh, file)
 		NatureLooks.prepare(mesh, file)
 		if is_wet_rock(file):
@@ -1750,6 +1847,9 @@ static var _jobs := {}  # name -> [task id (-1 while queued), Load]
 static var _job_order: Array[String] = []
 ## Goes up whenever models become ready, so whatever skipped them can be drawn again.
 static var generation := 0
+## Goes up only when a model's placement can change without ModelPacks.version (choices_changed, the packs' zips in):
+## what reads only placed()/turn_dir() (inserter_arms.gd's _bind, --arm-bind-layout) needn't redo it as models finish.
+static var layout_generation := 0
 ## The process frame poll() last ran in (model_preview.gd polls when no world does: the main menu).
 static var polled_frame := -1
 
@@ -2437,6 +2537,17 @@ static func pick_variant(name: String, extra: Dictionary) -> String:
 	return name if list.is_empty() else str(list[ModelPacks.variant_pick(list.size(), int(extra[VARIANT_KEY]))])
 
 
+## How many variants an entity record's model picks among (pick_variant on entity_models' name): 0 when none
+## is picked (no seed, variants off, the packs not ready, or ores). chunk_view.gd's shape keys (--walk-shape).
+static func variant_count(proto_name: String, proto_type: String, extra: Dictionary, dir := 0) -> int:
+	if not model_variants or not extra.has(VARIANT_KEY) or not ModelPacks.is_ready():
+		return 0
+	if proto_type == "resource" and ORE_STAGES.has(proto_name):
+		return 0
+	var pack := entity_pack(extra)
+	return variants_of(model_name(proto_name, proto_type, extra, dir) + ("@" + pack if pack != "" else "")).size()
+
+
 ## Model `name`'s variants as `<variant>@<pack>` in the pack that draws them, [] when it has none but
 ## the plain model (that is drawn as before).
 static func variants_of(name: String) -> Array:
@@ -2463,6 +2574,7 @@ static func variants_of(name: String) -> Array:
 ## also clears `name@pack` entries matching that pack (all `@pack` entries for "*"). Jobs reading them
 ## are waited for first (it is the player's click).
 static func choices_changed(families: Array, pack_id := "") -> bool:
+	layout_generation += 1  # (its sources found again: placed()'s single_model may answer otherwise)
 	var all := families.is_empty()
 	var target_pack := "" if pack_id == "" else ("*" if pack_id == "*" else ModelPacks.canonical_id(pack_id))
 	var wanted := {}
@@ -2500,6 +2612,7 @@ static func choices_changed(families: Array, pack_id := "") -> bool:
 		_parts.erase(name)
 		_rigs.erase(name)
 		_tops.erase(name)
+		_silo_holes.erase(name)
 		if not _remnant_jobs.has(name):
 			_remnant_cache.erase(name)  # its wreck, broken from the model it was (one being broken finishes as it is)
 	if hit:
@@ -2590,6 +2703,7 @@ static func poll() -> bool:
 	if ModelPacks.is_ready() and _packs_version != ModelPacks.version:
 		_packs_version = ModelPacks.version
 		generation += 1
+		layout_generation += 1
 		packs_in = true
 	var running := 0
 	for name in _job_order:
@@ -2876,6 +2990,11 @@ static func _new_part(node_name: String, xform: Transform3D) -> AnimPart:
 	var moves: Dictionary = CYCLES.get(part.kind, HATCHES.get(part.kind, {}))
 	if moves.has("slide"):
 		part.slide = moves["slide"]
+	if not rocket_vfx_enhanced:
+		if part.kind == "door_silo_e":
+			part.slide = Vector3(2.3, -0.1, -0.95)
+		elif part.kind == "door_silo_w":
+			part.slide = Vector3(-2.3, -0.1, 0.95)
 	if moves.has("axis"):
 		part.axis = moves["axis"]
 	part.lit = part.kind.begins_with(LIT_PREFIX)
@@ -2886,6 +3005,118 @@ static func _new_part(node_name: String, xform: Transform3D) -> AnimPart:
 ## duplicates "anim_spin_drill2" and Blender "anim_spin_drill.001": both drop the number.
 static func anim_kind(node_name: String) -> String:
 	return Load.kind(node_name)
+
+
+## Returns Vector3(hole_cx, hole_cz, hole_radius) in model space for a rocket silo's launch shaft,
+## derived from its door parts (falls back to (0, 0, 2.60) before the silo loads).
+static func silo_hole_spec(name := "rocket-silo") -> Vector3:
+	if _silo_holes.has(name):
+		return _silo_holes[name]
+	if _silo_holes.has("rocket-silo"):
+		return _silo_holes["rocket-silo"]
+	return Vector3(0.0, 0.0, 2.60)
+
+
+static func _compute_silo_hole_spec(parts: Array) -> Vector3:
+	var lo := Vector3(INF, INF, INF)
+	var hi := Vector3(-INF, -INF, -INF)
+	var found := false
+	for p_var: Variant in parts:
+		var part: AnimPart = p_var as AnimPart
+		if part == null or not part.kind.begins_with("door_silo") or not (part.mesh is ArrayMesh):
+			continue
+		var am := part.mesh as ArrayMesh
+		for si in am.get_surface_count():
+			var arrays: Array = ModelLods.arrays_of(am, si)
+			if arrays.is_empty() or not (arrays[Mesh.ARRAY_VERTEX] is PackedVector3Array):
+				continue
+			var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+			for v in verts:
+				lo = lo.min(v)
+				hi = hi.max(v)
+				found = true
+	if not found:
+		return Vector3(0.0, 0.0, 2.60)
+	var cx := (lo.x + hi.x) * 0.5
+	var cz := (lo.z + hi.z) * 0.5
+	var radius := clampf(maxf(hi.x - lo.x, hi.z - lo.z) * 0.5, 2.0, 3.2)
+	return Vector3(cx, cz, radius)
+
+
+## Strips the flat blocking floor disc inside the silo's launch shaft so the deep 3D shaft and
+## subterranean rocket are visible cleanly through the open hatch (keeps funnel walls intact).
+static func _strip_silo_pit_cap(mesh: ArrayMesh, spec: Vector3) -> ArrayMesh:
+	var hole_xz := Vector2(spec.x, spec.y)
+	var r_cent := spec.z * 0.94
+	var r_vert := spec.z + 0.18
+	var any_dropped := false
+	var new_surfaces: Array = []
+	for si in mesh.get_surface_count():
+		var arrays: Array = ModelLods.arrays_of(mesh, si)
+		if arrays.is_empty() or not (arrays[Mesh.ARRAY_VERTEX] is PackedVector3Array):
+			new_surfaces.append([arrays, si])
+			continue
+		var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+		var idx_var: Variant = arrays[Mesh.ARRAY_INDEX]
+		var src_idx := PackedInt32Array()
+		if idx_var is PackedInt32Array and not (idx_var as PackedInt32Array).is_empty():
+			src_idx = idx_var
+		else:
+			src_idx.resize(verts.size())
+			for vi in verts.size():
+				src_idx[vi] = vi
+		var kept_idx := PackedInt32Array()
+		var n_idx := src_idx.size()
+		var t := 0
+		while t + 2 < n_idx:
+			var i0 := src_idx[t]
+			var i1 := src_idx[t + 1]
+			var i2 := src_idx[t + 2]
+			t += 3
+			var v0: Vector3 = verts[i0]
+			var v1: Vector3 = verts[i1]
+			var v2: Vector3 = verts[i2]
+			var ymax := maxf(v0.y, maxf(v1.y, v2.y))
+			var ymin := minf(v0.y, minf(v1.y, v2.y))
+			if ymax < 0.09 and ymin > -0.56:
+				var n := (v1 - v0).cross(v2 - v0)
+				if n.length_squared() > 1e-12 and absf(n.normalized().y) > 0.90:
+					var c_xz := Vector2((v0.x + v1.x + v2.x) / 3.0, (v0.z + v1.z + v2.z) / 3.0)
+					if c_xz.distance_to(hole_xz) < r_cent:
+						var r0 := Vector2(v0.x, v0.z).distance_to(hole_xz)
+						var r1 := Vector2(v1.x, v1.z).distance_to(hole_xz)
+						var r2 := Vector2(v2.x, v2.z).distance_to(hole_xz)
+						if maxf(r0, maxf(r1, r2)) < r_vert:
+							any_dropped = true
+							continue
+			kept_idx.append(i0)
+			kept_idx.append(i1)
+			kept_idx.append(i2)
+		if kept_idx.is_empty():
+			any_dropped = true
+			continue
+		var copy_arrays := arrays.duplicate()
+		copy_arrays[Mesh.ARRAY_INDEX] = kept_idx
+		new_surfaces.append([copy_arrays, si])
+	if not any_dropped:
+		return mesh
+	var out := ArrayMesh.new()
+	var kept_meta: Array = []
+	for entry_var: Variant in new_surfaces:
+		var entry: Array = entry_var
+		var copy_arrays: Array = entry[0]
+		var si := int(entry[1])
+		var out_idx := out.get_surface_count()
+		out.add_surface_from_arrays(mesh.surface_get_primitive_type(si), copy_arrays, [], {},
+			mesh.surface_get_format(si) & ModelLods.CUSTOM_FORMATS)
+		out.surface_set_material(out_idx, mesh.surface_get_material(si))
+		out.surface_set_name(out_idx, mesh.surface_get_name(si))
+		kept_meta.append(copy_arrays)
+	for meta_key: StringName in mesh.get_meta_list():
+		if meta_key != ModelLods.ARRAYS_META:
+			out.set_meta(meta_key, mesh.get_meta(meta_key))
+	out.set_meta(ModelLods.ARRAYS_META, kept_meta)
+	return out
 
 
 ## Models wet like rough stone in the rain (factorio_material.gdshaderinc wet_rock): cliffs, rocks

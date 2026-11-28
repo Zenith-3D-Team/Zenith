@@ -44,6 +44,10 @@ const MAX_SOUNDS := 3
 const SOUND_GROUP := "burner-inserter-fire"
 
 static var on := true
+## On unless --burner-scan=old: scan() walks only the inserters in the chunks within SMOKE_RANGE of the
+## listener (chunk_inserters, kept up from the world's entities_changed), not every moving hand loaded
+## (perf-world-8: one walk over thousands of inserters four times a second). Same burners either way.
+static var near_scan := Switches.value("--burner-scan", "near") != "old"
 static var _read_args := false
 ## The meshes whose burner burns (prepare()), each its vent.
 static var _burners := {}
@@ -127,35 +131,103 @@ static func vent_at(pos: Vector2, yaw: float, ground := 0.0) -> Vector3:
 var burning := {}
 ## Wisps made (tests and probes).
 var wisps := 0
+## (near_scan) chunk -> the inserters in it (units), made when a scan first needs the chunk and dropped
+## when the world says it changed (chunk_changed); `inserter_types` names the prototype ids that are
+## inserters (`world.protos`). Units the scans looked at last time (tests and probes).
+var chunk_inserters := {}
+var looked := 0
+## The world whose entities_changed keeps chunk_inserters (fx.gd connects it).
+var _wired: Object = null
+
+
+## The world says a chunk's entities changed (built, rebuilt or unloaded): its inserters are read again
+## when a scan next needs them.
+func chunk_changed(chunk: Vector2i) -> void:
+	chunk_inserters.erase(chunk)
+
+
+## (near_scan) Keeps chunk_inserters following `w`'s entities_changed.
+func follow(w: Object) -> void:
+	if w == _wired:
+		return
+	if is_instance_valid(_wired) and _wired.is_connected("entities_changed", chunk_changed):
+		_wired.disconnect("entities_changed", chunk_changed)
+	_wired = w
+	chunk_inserters.clear()
+	if w != null and not w.is_connected("entities_changed", chunk_changed):
+		w.connect("entities_changed", chunk_changed)
 
 
 ## Every SCAN_INTERVAL (fx.gd _scan): the inserters whose hand moves (anim.gd arm_working) within
 ## SMOKE_RANGE whose model burns (`mesh_of(rec)` its drawn mesh) are the burning ones; their crackles,
 ## the nearest MAX_SOUNDS within `hearing`, are added to `sources` (sfx.gd set_loops' form). `vent_of(rec)`
-## gives a burner's vent in the world.
+## gives a burner's vent in the world. With `w` (the world: its chunks and prototypes) and near_scan, only
+## the inserters of the chunks within SMOKE_RANGE are looked at; without, every moving hand (as before).
 func scan(entities: Dictionary, working: Dictionary, focus: Vector2, hearing: float, sources: Array,
-		mesh_of: Callable, vent_of: Callable) -> void:
+		mesh_of: Callable, vent_of: Callable, w: Object = null) -> void:
 	var now := {}
 	if not enabled() or not any():
 		burning = now
 		return
 	var heard: Array = []
-	for unit in working:
-		var rec = entities.get(unit)
-		if rec == null:
-			continue
-		var d: float = (rec.pos as Vector2).distance_to(focus)
-		if d > SMOKE_RANGE or not burns(mesh_of.call(rec)):
-			continue
-		var was: Array = burning.get(unit, [])
-		var vent: Vector3 = vent_of.call(rec)
-		now[unit] = [vent, float(was[1]) if was.size() > 1 else randf() / SMOKE_RATE]
-		if d < hearing:
-			heard.append([d, unit, vent])
+	if near_scan and w != null:
+		looked = 0
+		var lo: Vector2i = w.chunk_of(focus - Vector2(SMOKE_RANGE, SMOKE_RANGE))
+		var hi: Vector2i = w.chunk_of(focus + Vector2(SMOKE_RANGE, SMOKE_RANGE))
+		for cy in range(lo.y, hi.y + 1):
+			for cx in range(lo.x, hi.x + 1):
+				var c := Vector2i(cx, cy)
+				var units: Variant = chunk_inserters.get(c)
+				if units == null:
+					units = _inserters_in(w, c)
+					chunk_inserters[c] = units
+				for unit in (units as PackedInt64Array):
+					if not working.has(unit):
+						continue
+					looked += 1
+					var rec = entities.get(unit)
+					if rec == null or rec.chunk != c:
+						continue
+					_consider(unit, rec, focus, hearing, mesh_of, vent_of, now, heard)
+	else:
+		looked = working.size()
+		for unit in working:
+			var rec = entities.get(unit)
+			if rec == null:
+				continue
+			_consider(unit, rec, focus, hearing, mesh_of, vent_of, now, heard)
 	burning = now
 	heard.sort_custom(func(a, b): return a[0] < b[0])
 	for k in mini(heard.size(), MAX_SOUNDS):
 		sources.append(crackle_source("burner%d" % int(heard[k][1]), heard[k][2]))
+
+
+## One moving hand: burning if within SMOKE_RANGE and its model burns (into `now`, and `heard` if within
+## `hearing`).
+func _consider(unit: Variant, rec: Variant, focus: Vector2, hearing: float, mesh_of: Callable, vent_of: Callable,
+		now: Dictionary, heard: Array) -> void:
+	var d: float = (rec.pos as Vector2).distance_to(focus)
+	if d > SMOKE_RANGE or not burns(mesh_of.call(rec)):
+		return
+	var was: Array = burning.get(unit, [])
+	var vent: Vector3 = vent_of.call(rec)
+	now[unit] = [vent, float(was[1]) if was.size() > 1 else randf() / SMOKE_RATE]
+	if d < hearing:
+		heard.append([d, unit, vent])
+
+
+## The inserters (units) in chunk `c` of world `w`, one pass over its records.
+static func _inserters_in(w: Object, c: Vector2i) -> PackedInt64Array:
+	var out := PackedInt64Array()
+	var cv: Variant = w.chunks.get(c)
+	if cv == null:
+		return out
+	var protos: Variant = w.protos
+	for rec in (cv.entities as Dictionary).values():
+		var proto: Variant = protos.entity(rec.proto_id)
+		if proto != null and proto.type == "inserter":
+			out.append(int(rec.unit))
+	return out
 
 
 ## A crackle loop at `at`, in sfx.gd set_loops' form.
@@ -178,3 +250,4 @@ func step(sprites: Object, delta: float, wind := Vector3.ZERO) -> void:
 
 func clear() -> void:
 	burning.clear()
+	chunk_inserters.clear()

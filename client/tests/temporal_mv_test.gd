@@ -320,6 +320,9 @@ func _test_belt_mv_and_item_cards() -> void:
 	_test_belt_mv_parity_and_pan()
 	_test_belt_mv_bounds()
 	_test_hidden_mv_defer_and_prof()
+	_test_belt_mv_change_flag()
+	_test_belt_mv_threads()
+	_test_belt_mv_wave3()
 	BeltMv.max_band = orig_band
 
 
@@ -589,6 +592,576 @@ func _test_hidden_mv_defer_and_prof() -> void:
 	bi.set_prof_detail(false)
 	check(bi.prof_breakdown() == "", "BeltItems.prof_breakdown() clears when disabled")
 	bi.queue_free()
+
+
+## --belt-mv-change-flag: the native change flag replaces both hash(buf) passes (belt_mv.gd, item_cards.gd
+## put_mv) with the same uploads, sync calls/skips and bit-identical buffers as hashing (=off).
+func _test_belt_mv_change_flag() -> void:
+	if not BeltMv.new(true).has_native():
+		print("SKIP: change flag needs BeltMvNative")
+		return
+	var orig_flag := BeltMv.change_flag
+	var orig_partial := BeltMv.partial_sync
+	var orig_clean := ItemCards.mv_skip_clean
+	BeltMv.partial_sync = true
+	ItemCards.mv_skip_clean = true
+	BeltMv.change_flag = true
+	BeltMv.hash_passes = 0
+	ItemCards.mv_hash_passes = 0
+	var with_flag := _run_change_flag_sequence()
+	check(BeltMv.hash_passes == 0 and ItemCards.mv_hash_passes == 0,
+		"change flag: no hash(buf) passes (belt_mv %d, item_cards %d)" % [BeltMv.hash_passes, ItemCards.mv_hash_passes])
+	BeltMv.change_flag = false
+	BeltMv.hash_passes = 0
+	ItemCards.mv_hash_passes = 0
+	var hashed := _run_change_flag_sequence()
+	check(BeltMv.hash_passes > 0 and ItemCards.mv_hash_passes > 0,
+		"--belt-mv-change-flag=off hashes as before (belt_mv %d, item_cards %d)" % [BeltMv.hash_passes, ItemCards.mv_hash_passes])
+	check(with_flag.size() == hashed.size(), "change flag: same number of steps logged")
+	check(not with_flag.is_empty() and int((with_flag.back() as Array)[3]) > 0, "change flag: the sequence skips unchanged kinds (sync_skips > 0)")
+	for i in mini(with_flag.size(), hashed.size()):
+		var a: Array = with_flag[i]
+		var b: Array = hashed[i]
+		check(a[0] == b[0], "change flag: step %d names match ('%s' vs '%s')" % [i, a[0], b[0]])
+		check(a.slice(1, 4) == b.slice(1, 4),
+			"change flag step '%s': uploads/sync_calls/sync_skips %s match hashing %s" % [a[0], str(a.slice(1, 4)), str(b.slice(1, 4))])
+		var same := true
+		for j in range(4, a.size()):
+			same = same and (a[j] as PackedFloat32Array) == (b[j] as PackedFloat32Array)
+		check(same and a.size() == b.size(), "change flag step '%s': MultiMesh buffers bit-identical to hashing" % a[0])
+	BeltMv.change_flag = orig_flag
+	BeltMv.partial_sync = orig_partial
+	ItemCards.mv_skip_clean = orig_clean
+
+
+## One scripted run: a moving and a standing simulated item (kind 7), a far moving item that is out
+## of the view rect, then in it (kind 9), a moving lattice lane (kind 12). Returns per step
+## [name, uploads, sync_calls, sync_skips, buffers...].
+func _run_change_flag_sequence() -> Array:
+	var mv := BeltMv.new(true)
+	var cards := ItemCards.new()
+	var lat_cards := ItemCards.new()
+	cards.mv_mode = true
+	cards.mv_max_band = BeltMv.max_band
+	lat_cards.mv_mode = true
+	lat_cards.mv_max_band = BeltMv.max_band
+	lat_cards.record_tex = 1
+	root.add_child(cards)
+	root.add_child(lat_cards)
+	var bounds := AABB(Vector3(-600.0, -4.0, -600.0), Vector3(1200.0, 32.0, 1200.0))
+	var near := Vector4(-100.0, -100.0, 100.0, 100.0)
+	var far := Vector4(490.0, -50.0, 520.0, 50.0)
+	var sim_img := _make_rgba_page(1024, 1, {
+		0: [1.0, 0.2, 2.0, 0.0,  4.0, 0.0, 0.0, 10.0,  1.0, 0.0, 0.0, 0.0,  0.0, 0.0, 0.0, 0.0],
+		1: [8.0, 0.2, 2.0, 0.0,  0.0, 0.0, 0.0, 0.0,   1.0, 0.0, 0.0, 0.0,  0.0, 0.0, 0.0, 0.0],
+		2: [500.0, 0.2, 6.0, 0.0, 2.0, 0.0, 0.0, 10.0, 1.0, 0.0, 0.0, 0.0,  0.0, 0.0, 0.0, 0.0],
+	})
+	var lat_img := _make_rgba_page(1024, 1, {
+		0: [10.0, 0.2, 20.0, 0.0,  1.0, 0.0, 0.0, 0.0,  0.0, 7.0, 0.0, 0.0,  0.0, 0.0, 2.0, 2.0],
+	})
+	mv.update_rec_pages({"pages": [[0, sim_img]], "all": true})
+	mv.update_lat_pages({"pages": [[0, lat_img]], "all": true})
+	cards.put_records(7, 0, 2, 4, bounds)
+	mv.set_rec_kind(7, 0, 2, 4)
+	cards.put_records(9, 2, 1, 2, bounds)
+	mv.set_rec_kind(9, 2, 1, 2)
+	lat_cards.put_records(12, 0, 1, 2, bounds)
+	mv.set_lat_kind(12, 0, 1, 2)
+	var rows: Array = []
+	var take := func(name: String) -> void:
+		var row: Array = [name, cards.mv_uploads + lat_cards.mv_uploads, mv.sync_calls, mv.sync_skips]
+		for k in [7, 9]:
+			row.append(RenderingServer.multimesh_get_buffer((cards._kinds[k] as MultiMeshInstance3D).multimesh.get_rid()))
+		row.append(RenderingServer.multimesh_get_buffer((lat_cards._kinds[12] as MultiMeshInstance3D).multimesh.get_rid()))
+		rows.append(row)
+	mv.step(1.0, near, cards, lat_cards, bounds, true)
+	take.call("first")
+	mv.step(2.0, near, cards, lat_cards, bounds, true)
+	take.call("moving")
+	mv.step(2.0, near, cards, lat_cards, bounds, true)
+	take.call("same clock")
+	mv.update_rec_pages({"pages": [[0, sim_img]], "all": true})
+	mv.update_lat_pages({"pages": [[0, lat_img]], "all": true})
+	mv.step(2.0, near, cards, lat_cards, bounds, true)
+	take.call("same page data")
+	mv._clear_sync_cache()
+	mv.invalidate_all()
+	mv.step(2.0, near, cards, lat_cards, bounds, true)
+	take.call("sync cache cleared, buffers unchanged")
+	mv.step(3.0, far, cards, lat_cards, bounds, true)
+	take.call("pan to the far item")
+	mv.step(4.0, near, cards, lat_cards, bounds, true)
+	take.call("far item leaves the view rect")
+	mv.step(12.0, near, cards, lat_cards, bounds, true)
+	take.call("simulated items settle")
+	mv.step(13.0, near, cards, lat_cards, bounds, true)
+	take.call("lattice still moving")
+	var lat_stand := _make_rgba_page(1024, 1, {
+		0: [10.0, 0.2, 20.0, 0.0,  0.0, 0.0, 0.0, 0.0,  0.0, 7.0, 0.0, 0.0,  0.0, 0.0, 2.0, 0.0],
+	})
+	mv.update_lat_pages({"pages": [[0, lat_stand]], "all": true})
+	mv.step(14.0, near, cards, lat_cards, bounds, true)
+	take.call("lattice stops")
+	mv.update_lat_pages({"pages": [[0, lat_img]], "all": true})
+	mv.step(15.0, near, cards, lat_cards, bounds, true)
+	take.call("lattice moves again")
+	cards.queue_free()
+	lat_cards.queue_free()
+	return rows
+
+
+## --belt-mv-threads: BeltMvNative.step evaluates its due kinds on the engine's worker pool. 32 kinds x
+## 2,000 slots (24 simulated, 8 lattice) stepped 200 times with threads on and off must give the same
+## results in the same order and bit-identical buffers; pans, partial page updates, a kind growing,
+## emptying and leaving the band keep every path of the step in play.
+func _test_belt_mv_threads() -> void:
+	if not BeltMv.new(true).has_native() or not ClassDB.class_has_method(&"BeltMvNative", &"set_threads"):
+		print("SKIP: --belt-mv-threads needs BeltMvNative with set_threads")
+		return
+	var on: Object = ClassDB.instantiate(&"BeltMvNative")
+	var off: Object = ClassDB.instantiate(&"BeltMvNative")
+	on.call("set_threads", true)
+	off.call("set_threads", false)
+	check(bool(on.call("get_threads")) and not bool(off.call("get_threads")), "--belt-mv-threads: set_threads round-trips")
+	const PER := 2000
+	const SIM_KINDS := 24
+	const LAT_KINDS := 8
+	const PAGE_W := 1024
+	const PAGE_H := 16
+	var per_page := PAGE_W * PAGE_H / 4
+	var rec_pages := _threads_pages(SIM_KINDS * PER, per_page, false, 0)
+	var lat_pages := _threads_pages(LAT_KINDS * PER, per_page, true, 0)
+	var band1 := (1 << 28) + 77
+	for nat in [on, off]:
+		var o := nat as Object
+		o.call("set_max_band", 1)
+		o.call("update_rec_pages", {"pages": rec_pages, "all": true})
+		o.call("update_lat_pages", {"pages": lat_pages, "all": true})
+		for k in SIM_KINDS:
+			var id := band1 if k == 5 else 100 + k
+			o.call("set_rec_kind", id, k * PER, PER, PER + 64)
+		for k in LAT_KINDS:
+			o.call("set_lat_kind", 500 + k, k * PER, PER, PER * 2 + 64)
+	var same_steps := 0
+	var first_bad := ""
+	var t_on := 0
+	var t_off := 0
+	for step in 200:
+		var clock := 1.0 + float(step) * 0.25
+		var pan := float(step % 40) * 4.0
+		var vrect := Vector4(-20.0 + pan, -20.0, 120.0 + pan, 220.0)
+		if step == 40 or step == 120:
+			var touched := _threads_pages(SIM_KINDS * PER, per_page, false, step)
+			var one: Array = [touched[1]]
+			for nat in [on, off]:
+				(nat as Object).call("update_rec_pages", {"pages": one, "all": false})
+		if step == 60:
+			for nat in [on, off]:
+				(nat as Object).call("set_rec_kind", 103, 3 * PER, PER, PER * 2)
+				(nat as Object).call("set_rec_kind", 104, 4 * PER, 0, PER + 64)
+		if step == 80:
+			for nat in [on, off]:
+				(nat as Object).call("set_max_band", 0)
+		if step == 150:
+			for nat in [on, off]:
+				(nat as Object).call("set_max_band", 1)
+				(nat as Object).call("invalidate_all")
+		var t0 := Time.get_ticks_usec()
+		var ra: Array = on.call("step", clock, vrect)
+		var t1 := Time.get_ticks_usec()
+		var rb: Array = off.call("step", clock, vrect)
+		t_on += t1 - t0
+		t_off += Time.get_ticks_usec() - t1
+		var why := _threads_diff(ra, rb)
+		if why == "":
+			same_steps += 1
+		elif first_bad == "":
+			first_bad = "step %d: %s" % [step, why]
+	check(same_steps == 200, "--belt-mv-threads: 200 steps of 32 kinds x 2,000 slots match threads off (%d/200 %s)" % [same_steps, first_bad])
+	var bufs_same := true
+	for k in SIM_KINDS:
+		var id := band1 if k == 5 else 100 + k
+		bufs_same = bufs_same and (on.call("get_buf", false, id) as PackedFloat32Array).to_byte_array() == (off.call("get_buf", false, id) as PackedFloat32Array).to_byte_array()
+	for k in LAT_KINDS:
+		bufs_same = bufs_same and (on.call("get_buf", true, 500 + k) as PackedFloat32Array).to_byte_array() == (off.call("get_buf", true, 500 + k) as PackedFloat32Array).to_byte_array()
+	check(bufs_same, "--belt-mv-threads: final buffers of all 32 kinds bit-identical")
+	var threaded := int(on.call("get_threaded_steps"))
+	check(threaded > 0 and int(off.call("get_threaded_steps")) == 0,
+		"--belt-mv-threads: on steps on the pool (%d of 200 steps), off never" % threaded)
+	print("belt-mv-threads: 200 steps, threads on %.2f ms/step, off %.2f ms/step" % [t_on / 200000.0, t_off / 200000.0])
+
+	# Below the floor (one kind, few slots) the step stays inline.
+	var small: Object = ClassDB.instantiate(&"BeltMvNative")
+	small.call("update_rec_pages", {"pages": rec_pages, "all": true})
+	small.call("set_rec_kind", 100, 0, 100, 128)
+	small.call("set_rec_kind", 101, PER, 100, 128)
+	small.call("step", 1.0, Vector4(-20.0, -20.0, 120.0, 220.0))
+	check(int(small.call("get_threaded_steps")) == 0, "--belt-mv-threads: 2 kinds x 100 slots run inline (under 4,096 slots)")
+
+	# Freed right after a threaded step (the step waits for its tasks; nothing may outlive the object).
+	var gone: Object = ClassDB.instantiate(&"BeltMvNative")
+	gone.call("update_rec_pages", {"pages": rec_pages, "all": true})
+	for k in 8:
+		gone.call("set_rec_kind", 100 + k, k * PER, PER, PER)
+	gone.call("step", 1.0, Vector4(-20.0, -20.0, 120.0, 220.0))
+	var gone_threaded := int(gone.call("get_threaded_steps"))
+	gone = null
+	small = null
+	on = null
+	off = null
+	check(gone_threaded == 1, "--belt-mv-threads: object freed straight after a threaded step (no hang)")
+
+	# The switch reaches the native object through BeltMv.
+	var orig := BeltMv.mv_threads
+	BeltMv.mv_threads = false
+	var mv_off := BeltMv.new(true)
+	BeltMv.mv_threads = true
+	var mv_on := BeltMv.new(true)
+	check(not bool(mv_off._native.call("get_threads")) and bool(mv_on._native.call("get_threads")),
+		"--belt-mv-threads=off reaches BeltMvNative.set_threads")
+	# A pool under 3 threads (Settings.worker_threads_cap on <= 3 cores, --worker-threads=1|2) steps inline:
+	# the waiting main thread doesn't run tasks itself (perf-fix-r1).
+	check(BeltMv.pool_threads(-1, 1, 3) == 1 and BeltMv.pool_threads(-1, -1, 8) == 8 and BeltMv.pool_threads(2, 6, 8) == 2 			and BeltMv.pool_threads(-1, 5, 8) == 5, "--belt-mv-threads: pool_threads = min(pool setting, worker_threads_cap)")
+	check(not BeltMv.threads_for(1) and not BeltMv.threads_for(2) and BeltMv.threads_for(3) and BeltMv.threads_for(12),
+		"--belt-mv-threads: off by itself on a pool under 3 threads")
+	BeltMv.mv_threads = false
+	check(not BeltMv.threads_for(12), "--belt-mv-threads=off: off on any pool")
+	BeltMv.mv_threads = orig
+
+
+## Pages of records for the threads test: simulated items alternate moving (speed varies) and standing,
+## spread over 200 x 400 tiles so pans move slots in and out of the view rect; lattice lanes mostly move.
+## `salt` changes the moving items' speeds (a page update with new data).
+func _threads_pages(count: int, per_page: int, lattice: bool, salt: int) -> Array:
+	var pages: Array = []
+	var npages := ceili(float(count) / float(per_page))
+	for pi in npages:
+		var floats := PackedFloat32Array()
+		floats.resize(per_page * 16)
+		for j in per_page:
+			var r := pi * per_page + j
+			if r >= count:
+				break
+			var bo := j * 16
+			var x := float(r % 200)
+			var z := float((r / 200) % 400) * 0.5
+			floats[bo] = x
+			floats[bo + 1] = 0.2
+			floats[bo + 2] = z
+			if lattice:
+				floats[bo + 4] = 1.0 if r % 7 != 0 else 0.0
+				floats[bo + 9] = float(r % 11)
+				floats[bo + 14] = 2.0
+				floats[bo + 15] = 2.0 if r % 7 != 0 else 0.0
+			elif r % 2 == 0:
+				floats[bo + 4] = 1.0 + float((r + salt) % 5) * 0.5
+				floats[bo + 7] = 30.0 + float(r % 13)
+				floats[bo + 8] = 1.0
+			else:
+				floats[bo + 8] = 0.7
+				floats[bo + 9] = 0.7
+		pages.append([pi, Image.create_from_data(per_page * 4 / 16, 16, false, Image.FORMAT_RGBAF, floats.to_byte_array())])
+	return pages
+
+
+## perf-w3-belts: --belt-mv-page-dirty, --belt-mv-tight-cap, --belt-mv-native-put.
+func _test_belt_mv_wave3() -> void:
+	if not BeltMv.new(true).has_native() or not ClassDB.class_has_method(&"BeltMvNative", &"set_page_dirty"):
+		print("SKIP: perf-w3-belts switches need BeltMvNative with set_page_dirty")
+		return
+	_test_belt_mv_page_dirty()
+	_test_belt_mv_tight_cap()
+	_test_belt_mv_native_put()
+
+
+## Records for the wave-3 tests: kind k owns PER records from k * PER; every 10th record (from the 3rd) is a
+## pile copy pointing at a moving item 1,501 records back (another page), so touching only the item's page must
+## still re-evaluate the copy. `salt` changes the moving items' speeds; `stop` stands every item.
+func _w3_pages(count: int, per_page: int, lattice: bool, salt: int, stop := false) -> Array:
+	var pages: Array = []
+	var npages := ceili(float(count) / float(per_page))
+	for pi in npages:
+		var floats := PackedFloat32Array()
+		floats.resize(per_page * 16)
+		for j in per_page:
+			var r := pi * per_page + j
+			if r >= count:
+				break
+			var bo := j * 16
+			if r % 10 == 3 and (r % 3000) >= 1500:
+				floats[bo + 8] = 0.6
+				floats[bo + 9] = 0.8
+				floats[bo + 12] = -1501.0
+				floats[bo + 13] = 2.0
+				floats[bo + 14] = 0.1
+				continue
+			floats[bo] = float(r % 60)
+			floats[bo + 1] = 0.2
+			floats[bo + 2] = float((r / 60) % 50)
+			if lattice:
+				floats[bo + 4] = 0.0 if stop or r % 7 == 0 else 1.0
+				floats[bo + 9] = float(r % 11)
+				floats[bo + 14] = 2.0
+				floats[bo + 15] = 0.0 if stop or r % 7 == 0 else 2.0
+			elif r % 2 == 0 and not stop:
+				floats[bo + 4] = 1.0 + float((r + salt) % 5) * 0.5
+				floats[bo + 7] = 30.0 + float((r + salt) % 13)
+				floats[bo + 8] = 1.0
+			else:
+				floats[bo + 3] = float(salt)
+				floats[bo + 8] = 0.7
+				floats[bo + 9] = 0.7
+		pages.append([pi, Image.create_from_data(per_page * 4 / 16, 16, false, Image.FORMAT_RGBAF, floats.to_byte_array())])
+	return pages
+
+
+## A page update re-evaluates only the slots that read a touched page: 150 steps of 4 simulated and 2
+## lattice kinds x 3,000 slots with one page (or one copy's item page) rewritten every few steps must give
+## the same results and bit-identical buffers as re-evaluating every touched kind whole (=off).
+func _test_belt_mv_page_dirty() -> void:
+	var on: Object = ClassDB.instantiate(&"BeltMvNative")
+	var off: Object = ClassDB.instantiate(&"BeltMvNative")
+	on.call("set_page_dirty", true)
+	off.call("set_page_dirty", false)
+	check(bool(on.call("get_page_dirty")) and not bool(off.call("get_page_dirty")), "--belt-mv-page-dirty: set_page_dirty round-trips")
+	const PER := 3000
+	const SIM := 4
+	const LAT := 2
+	var per_page := 256 * 16 / 4
+	var all_v := Vector4(-1.0e6, -1.0e6, 1.0e6, 1.0e6)
+	for nat in [on, off]:
+		var o := nat as Object
+		o.call("set_threads", false)
+		o.call("update_rec_pages", {"pages": _w3_pages(SIM * PER, per_page, false, 0), "all": true})
+		o.call("update_lat_pages", {"pages": _w3_pages(LAT * PER, per_page, true, 0), "all": true})
+		for k in SIM:
+			o.call("set_rec_kind", 100 + k, k * PER, PER, PER + 512)
+		for k in LAT:
+			o.call("set_lat_kind", 500 + k, k * PER, PER, PER * 2 + 512)
+	var same := 0
+	var first_bad := ""
+	for step in 150:
+		var clock := 1.0 + float(step) * 0.3
+		if step % 5 == 2:
+			# One page of new data: a page holding items whose copies live on another page, then plain ones.
+			var salt := step
+			var rp := _w3_pages(SIM * PER, per_page, false, salt, step >= 100)
+			var lp := _w3_pages(LAT * PER, per_page, true, salt, step >= 100)
+			var pick := (step / 5) % rp.size()
+			for nat in [on, off]:
+				(nat as Object).call("update_rec_pages", {"pages": [rp[pick]], "all": false})
+				if step % 10 == 2:
+					(nat as Object).call("update_lat_pages", {"pages": [lp[pick % lp.size()]], "all": false})
+		var ra: Array = on.call("step", clock, all_v)
+		var rb: Array = off.call("step", clock, all_v)
+		var why := _threads_diff(ra, rb)
+		if why == "":
+			same += 1
+		elif first_bad == "":
+			first_bad = "step %d: %s" % [step, why]
+	check(same == 150, "--belt-mv-page-dirty: 150 steps with page updates match whole-kind passes (%d/150 %s)" % [same, first_bad])
+	var bufs := true
+	for k in SIM:
+		bufs = bufs and (on.call("get_buf", false, 100 + k) as PackedFloat32Array) == (off.call("get_buf", false, 100 + k) as PackedFloat32Array)
+	for k in LAT:
+		bufs = bufs and (on.call("get_buf", true, 500 + k) as PackedFloat32Array) == (off.call("get_buf", true, 500 + k) as PackedFloat32Array)
+	check(bufs, "--belt-mv-page-dirty: final buffers bit-identical")
+	var st: Array = on.call("get_page_stats")
+	var st_off: Array = off.call("get_page_stats")
+	print("belt-mv-page-dirty: %d page passes, %.0f slots a pass of %d" % [int(st[0]), float(int(st[1])) / maxf(1.0, float(int(st[0]))), PER])
+	check(int(st[0]) > 0 and int(st_off[0]) == 0, "--belt-mv-page-dirty: on takes the page path (%d kind steps), off never" % int(st[0]))
+	check(int(st[0]) > 0 and float(int(st[1])) / float(int(st[0])) < float(PER) * 0.75,
+		"--belt-mv-page-dirty: a page pass evaluates fewer slots than the kind (%.0f of %d a pass)" % [float(int(st[1])) / maxf(1.0, float(int(st[0]))), PER])
+
+	# Only the copies' item page touched: the copies (on another page) follow their item.
+	var a: Object = ClassDB.instantiate(&"BeltMvNative")
+	var b: Object = ClassDB.instantiate(&"BeltMvNative")
+	for nat in [a, b]:
+		var o := nat as Object
+		o.call("set_page_dirty", nat == a)
+		o.call("update_rec_pages", {"pages": _w3_pages(PER, per_page, false, 0, true), "all": true})
+		o.call("set_rec_kind", 100, 0, PER, PER)
+		o.call("step", 1.0, all_v)
+		# Page 0 holds the copies' items (records 0..1023); the copies are on pages 1-2.
+		o.call("update_rec_pages", {"pages": [_w3_pages(PER, per_page, false, 7, false)[0]], "all": false})
+	var r1: Array = a.call("step", 2.0, all_v)
+	var r2: Array = b.call("step", 2.0, all_v)
+	check(_threads_diff(r1, r2) == "" and (a.call("get_buf", false, 100) as PackedFloat32Array) == (b.call("get_buf", false, 100) as PackedFloat32Array),
+		"--belt-mv-page-dirty: copies on untouched pages follow their item's touched page (%s)" % _threads_diff(r1, r2))
+
+	# The switch reaches the native object through BeltMv.
+	var orig := BeltMv.page_dirty
+	BeltMv.page_dirty = false
+	var mv_off := BeltMv.new(true)
+	BeltMv.page_dirty = orig
+	check(not bool(mv_off._native.call("get_page_dirty")), "--belt-mv-page-dirty=off reaches BeltMvNative")
+
+
+## Buffers sized to the items: same results as the records' capacity except the size, the buffer the
+## capacity one's first instances; grows at once, shrinks after 120 steps a quarter too big.
+func _test_belt_mv_tight_cap() -> void:
+	var on: Object = ClassDB.instantiate(&"BeltMvNative")
+	var off: Object = ClassDB.instantiate(&"BeltMvNative")
+	on.call("set_tight_cap", true)
+	off.call("set_tight_cap", false)
+	check(bool(on.call("get_tight_cap")) and not bool(off.call("get_tight_cap")), "--belt-mv-tight-cap: set_tight_cap round-trips")
+	var per_page := 256 * 16 / 4
+	var pages := _w3_pages(4 * 3000, per_page, false, 0)
+	var lpages := _w3_pages(3000, per_page, true, 0)
+	for nat in [on, off]:
+		var o := nat as Object
+		o.call("update_rec_pages", {"pages": pages, "all": true})
+		o.call("update_lat_pages", {"pages": lpages, "all": true})
+		o.call("set_rec_kind", 100, 0, 1800, 4096)
+		o.call("set_lat_kind", 500, 0, 1800, 4096)
+	var all_v := Vector4(-1.0e6, -1.0e6, 1.0e6, 1.0e6)
+	check(int(on.call("get_inst_cap", false, 100)) == 2304 and int(off.call("get_inst_cap", false, 100)) == 4096,
+		"--belt-mv-tight-cap: 1,800 items in a 4,096 kind get 2,304 instances (%d), off the capacity (%d)" % [int(on.call("get_inst_cap", false, 100)), int(off.call("get_inst_cap", false, 100))])
+	check(int(on.call("get_inst_cap", true, 500)) == 4608 and int(off.call("get_inst_cap", true, 500)) == 8192,
+		"--belt-mv-tight-cap: a lattice kind (two instances a slot) 4,608 of 8,192 (%d)" % int(on.call("get_inst_cap", true, 500)))
+	var ok := true
+	var why := ""
+	var grew := false
+	var shrank_at := -1
+	for step in 200:
+		if step == 20:
+			for nat in [on, off]:
+				(nat as Object).call("set_rec_kind", 100, 0, 2900, 4096)
+			grew = int(on.call("get_inst_cap", false, 100)) == 3840
+		if step == 40:
+			for nat in [on, off]:
+				(nat as Object).call("set_rec_kind", 100, 0, 1000, 4096)
+		var ra: Array = on.call("step", 1.0 + float(step) * 0.2, all_v)
+		var rb: Array = off.call("step", 1.0 + float(step) * 0.2, all_v)
+		if shrank_at < 0 and int(on.call("get_inst_cap", false, 100)) < 3840 and step > 40:
+			shrank_at = step
+		if ra.size() != rb.size():
+			ok = false
+			why = "step %d: %d vs %d updates" % [step, ra.size(), rb.size()]
+			continue
+		for i in ra.size():
+			var ea: Array = ra[i]
+			var eb: Array = rb[i]
+			for f in [0, 1, 3, 5, 6]:
+				if ea[f] != eb[f] and ok:
+					# (Field 6, changed: a resized tight buffer counts as changed where the full one may not.)
+					if f == 6 and bool(ea[6]):
+						continue
+					ok = false
+					why = "step %d entry %d field %d" % [step, i, f]
+			var ba := ea[2] as PackedFloat32Array
+			var bb := eb[2] as PackedFloat32Array
+			if not bool(ea[5]) and ok:
+				var n_inst := int(ea[4])
+				if ba.size() != n_inst * 16 or ba != bb.slice(0, n_inst * 16) or int(ea[3]) > n_inst:
+					ok = false
+					why = "step %d kind %d: buffer not the full one's first %d instances" % [step, int(ea[0]), n_inst]
+	check(ok, "--belt-mv-tight-cap: 200 steps match the capacity-sized buffers but for their size (%s)" % why)
+	print("belt-mv-tight-cap: shrank at step %d" % shrank_at)
+	check(grew, "--belt-mv-tight-cap: grows at once to 3,840 for 2,900 items")
+	check(shrank_at >= 150 and int(on.call("get_inst_cap", false, 100)) == 1280,
+		"--belt-mv-tight-cap: shrinks to 1,280 after 120 steps a quarter too big (step %d, %d)" % [shrank_at, int(on.call("get_inst_cap", false, 100))])
+	on.call("set_tight_cap", false)
+	check(int(on.call("get_inst_cap", false, 100)) == 4096, "--belt-mv-tight-cap: turned off, back to the capacity")
+	var orig := BeltMv.tight_cap
+	BeltMv.tight_cap = false
+	var mv_off := BeltMv.new(true)
+	BeltMv.tight_cap = orig
+	check(not bool(mv_off._native.call("get_tight_cap")), "--belt-mv-tight-cap=off reaches BeltMvNative")
+
+
+## BeltMvNative.step putting steady kinds itself: the same uploads, sync counts and MultiMesh buffers as
+## every changed kind going through _emit_put_mv / put_mv, over a run with moving items, a pan, a page
+## update, a kind growing and the sync cache dropped.
+func _test_belt_mv_native_put() -> void:
+	var orig := BeltMv.native_put
+	var orig_partial := BeltMv.partial_sync
+	var orig_flag := BeltMv.change_flag
+	BeltMv.partial_sync = true
+	BeltMv.change_flag = true
+	BeltMv.native_put = true
+	var with_put := _run_native_put_sequence()
+	BeltMv.native_put = false
+	var without := _run_native_put_sequence()
+	BeltMv.native_put = orig
+	BeltMv.partial_sync = orig_partial
+	BeltMv.change_flag = orig_flag
+	var n_on := int((with_put.back() as Array)[4])
+	var n_off := int((without.back() as Array)[4])
+	print("belt-mv-native-put: %d of 40 steps' puts done natively" % n_on)
+	check(n_on > 10 and n_off == 0, "--belt-mv-native-put: steady kinds put natively (%d puts), off none (%d)" % [n_on, n_off])
+	var bad := ""
+	for i in mini(with_put.size(), without.size()):
+		var a: Array = with_put[i]
+		var b: Array = without[i]
+		if a.slice(0, 4) != b.slice(0, 4) and bad == "":
+			bad = "step %s: uploads/sync_calls/sync_skips %s vs %s" % [a[0], str(a.slice(1, 4)), str(b.slice(1, 4))]
+		for j in range(5, a.size()):
+			if (a[j] as PackedFloat32Array) != (b[j] as PackedFloat32Array) and bad == "":
+				bad = "step %s: MultiMesh buffer %d differs" % [a[0], j - 5]
+	check(bad == "" and with_put.size() == without.size(), "--belt-mv-native-put: same uploads, syncs and buffers as GDScript's put_mv (%s)" % bad)
+
+
+func _run_native_put_sequence() -> Array:
+	var mv := BeltMv.new(true)
+	var cards := ItemCards.new()
+	var lat_cards := ItemCards.new()
+	for c in [cards, lat_cards]:
+		(c as ItemCards).mv_mode = true
+		(c as ItemCards).mv_max_band = BeltMv.max_band
+	lat_cards.record_tex = 1
+	root.add_child(cards)
+	root.add_child(lat_cards)
+	var bounds := AABB(Vector3(-600.0, -4.0, -600.0), Vector3(1200.0, 32.0, 1200.0))
+	var per_page := 256 * 16 / 4
+	var rp := _w3_pages(3 * 3000, per_page, false, 0)
+	var lp := _w3_pages(3000, per_page, true, 0)
+	mv.update_rec_pages({"pages": rp, "all": true})
+	mv.update_lat_pages({"pages": lp, "all": true})
+	for k in 3:
+		cards.put_records(100 + k, k * 3000, 2000, 3000, bounds)
+		mv.set_rec_kind(100 + k, k * 3000, 2000, 3000)
+	lat_cards.put_records(500, 0, 2000, 3000, bounds)
+	mv.set_lat_kind(500, 0, 2000, 3000)
+	var rows: Array = []
+	var near := Vector4(-100.0, -100.0, 100.0, 100.0)
+	for step in 40:
+		var vr := near if step < 25 or step > 30 else Vector4(5000.0, 5000.0, 5100.0, 5100.0)
+		if step == 12:
+			var np := _w3_pages(3 * 3000, per_page, false, 5)
+			mv.update_rec_pages({"pages": [np[2]], "all": false})
+		if step == 18:
+			cards.put_records(101, 3000, 2600, 3000, bounds)
+			mv.set_rec_kind(101, 3000, 2600, 3000)
+		if step == 33:
+			mv._clear_sync_cache()
+			mv.invalidate_all()
+		mv.step(1.0 + float(step) * 0.25, vr, cards, lat_cards, bounds, true)
+		var row: Array = [str(step), cards.mv_uploads + lat_cards.mv_uploads, mv.sync_calls, mv.sync_skips, mv.native_puts]
+		for k in 3:
+			row.append(RenderingServer.multimesh_get_buffer((cards._kinds[100 + k] as MultiMeshInstance3D).multimesh.get_rid()))
+		row.append(RenderingServer.multimesh_get_buffer((lat_cards._kinds[500] as MultiMeshInstance3D).multimesh.get_rid()))
+		rows.append(row)
+	cards.queue_free()
+	lat_cards.queue_free()
+	return rows
+
+
+func _threads_diff(a: Array, b: Array) -> String:
+	if a.size() != b.size():
+		return "%d vs %d updates" % [a.size(), b.size()]
+	for i in a.size():
+		var ea: Array = a[i]
+		var eb: Array = b[i]
+		if ea.size() != eb.size():
+			return "entry %d size" % i
+		for f in ea.size():
+			if f == 2:
+				if (ea[2] as PackedFloat32Array).to_byte_array() != (eb[2] as PackedFloat32Array).to_byte_array():
+					return "entry %d (kind %d) buffer differs" % [i, int(ea[0])]
+			elif ea[f] != eb[f]:
+				return "entry %d field %d: %s vs %s" % [i, f, str(ea[f]), str(eb[f])]
+	return ""
 
 
 func _test_belt_reactive_and_shaders() -> void:

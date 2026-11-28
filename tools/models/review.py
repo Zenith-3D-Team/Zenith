@@ -34,7 +34,7 @@ GODOT = os.environ.get("GODOT", os.path.expandvars(
     r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\GodotEngine.GodotEngine_Microsoft.Winget.Source_8wekyb3d8bbwe"
     r"\Godot_v4.7.2-stable_win64.exe"))
 # The owner's review folder is in the main checkout (shared by every worktree).
-# A worktree under <main>/.claude/worktrees/<name> finds it three levels up.
+# A session worktree (three folders below the main checkout) finds it three levels up.
 _MAIN = REPO.split(os.sep + ".claude" + os.sep + "worktrees" + os.sep)[0]
 OUT = os.environ.get("F3D_SHOTS", os.path.join(_MAIN, "art-src", "shots"))
 

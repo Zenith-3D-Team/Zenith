@@ -30,6 +30,8 @@ extends Node
 ## Factorio's own colour lookup per planet and time of day stays on. On a space platform Zenith turns
 ## the haze off (looks.gd's SPACE_ENV) and the grade leaves the black backdrop and its stars alone.
 
+const Switches := preload("res://scripts/switches.gd")
+
 const LOOK := "cinematic-shaders/cinematic"
 ## How much of SSAO darkens the sun's light (Godot's ssao_light_affect) unless "Occlusion in sunlight too" is on.
 const AO_SUNLIGHT := 0.15
@@ -53,6 +55,8 @@ static var volumetric_arg_off: bool = "--volumetric-clouds=off" in OS.get_cmdlin
 ## --cinematic-flash=old: lightning adds a fixed 0.75-0.8 to the clouds (and Zenith's sky its own), as
 ## before 0.6.2: under this look's exposure, AgX and film curve a strike at night turned the sky white.
 static var flash_arg_old: bool = "--cinematic-flash=old" in OS.get_cmdline_user_args()
+## --cloud-ray-opt=off: restores pre-opt volumetric cloud raymarching (1.85x empty stride + full detail fetches).
+static var cloud_ray_opt: bool = Switches.on("--cloud-ray-opt")
 ## The grade's lightning on a cloud (cinematic_grade.gdshader's flash_light, its defaults): in proportion
 ## to the cloud's own brightness `base`, plus a little, capped.
 const FLASH_LIFT := 1.6
@@ -72,6 +76,7 @@ var api
 var _field: SubViewport
 var _shape_3d: ImageTexture3D
 var _detail_3d: ImageTexture3D
+var _registered_look: Dictionary = {}
 
 
 func addon_start(a) -> void:
@@ -122,18 +127,21 @@ func addon_start(a) -> void:
 		_register()
 	s.changed.connect(on_change)
 	_register()
-	api.shaders.use_look(LOOK)
+	if not api.shaders.has_method("current_look") or str(api.shaders.current_look()) != LOOK:
+		api.shaders.use_look(LOOK)
 
 
 ## Switched off, Zenith takes the look away and puts back the one it replaced.
 func addon_stop() -> void:
 	_shape_3d = null
 	_detail_3d = null
+	_registered_look.clear()
 
 
 func _exit_tree() -> void:
 	_shape_3d = null
 	_detail_3d = null
+	_registered_look.clear()
 
 
 ## The look from the settings now (registered again when one changes; Zenith puts it on again if
@@ -224,6 +232,7 @@ func _register() -> void:
 			"clouds": clouds_amt, "cloud_cover": float(s.value("cloud_cover")),
 			"cloud_volumetric": 1.0 if vol_on else 0.0,
 			"cloud_steps": steps,
+			"cloud_ray_opt": 1.0 if cloud_ray_opt else 0.0,
 			"cloud_low": CLOUD_LOW_VOL if vol_on else CLOUD_LOW_OLD,
 			"cloud_high": CLOUD_HIGH_VOL if vol_on else CLOUD_HIGH_OLD,
 			"flash_old": 1.0 if flash_arg_old else 0.0,
@@ -246,6 +255,9 @@ func _register() -> void:
 		if vol_on and _ensure_cloud_volumes():
 			params["cloud_shape_3d"] = _shape_3d
 			params["cloud_detail_3d"] = _detail_3d
+	if _registered_look == look:
+		return
+	_registered_look = look.duplicate(true)
 	api.shaders.add_look(LOOK, look)
 
 
